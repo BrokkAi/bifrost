@@ -429,6 +429,7 @@ impl<'plan> BackwardValueFlowProblem<'plan> {
                 call,
                 edge.boundary(),
                 edge.kind(),
+                edge.caller_conversion_may_run_user_code(),
                 input,
                 |transfer| {
                     if transfer.target == demand.carrier {
@@ -743,6 +744,17 @@ impl BackwardSnapshotProblem for BackwardValueFlowProblem<'_> {
 }
 
 fn is_weak_update(rule: &LocalRuleView) -> bool {
+    // Same-event alternatives into one target are simultaneous, so none of
+    // them removes what another one demands. For a kind this walk treats as a
+    // kill (an assignment, parameter or receiver between distinct carriers, a
+    // strong store), the killing alternative is first in application order,
+    // hence last in this reverse walk, and drops the target only after every
+    // alternative has contributed its source. Every other kind, NormalReturn
+    // included, is weak here and never drops demand: the backward preimage
+    // can then be a superset of the forward answer, never a subset.
+    if rule.joins_same_event_alternative {
+        return true;
+    }
     match rule.kind {
         ValueFlowRelationKind::Assignment
         | ValueFlowRelationKind::Parameter
@@ -755,6 +767,10 @@ fn is_weak_update(rule: &LocalRuleView) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::{
+        joins_same_event_alternatives, same_event_rule,
+    };
+    use brokk_bifrost_test_macros::hardwon;
     fn demand(carrier: usize) -> Demand {
         Demand {
             sink: ValueFlowSinkId::try_from_index(0).expect("sink id"),
@@ -780,6 +796,7 @@ mod tests {
             policy_local: false,
             strong_update,
             direct_cell_overwrite: false,
+            joins_same_event_alternative: false,
         }
     }
 
@@ -792,6 +809,157 @@ mod tests {
                 operation: crate::analyzer::semantic::TransferOperation::None,
             }),
             ..rule(source, target, ValueFlowRelationKind::Assignment, false)
+        }
+    }
+
+    /// Apply `rules` (forward event order) to a set of carrier facts the way the
+    /// forward client does: a killing rule drops the target's prior fact, and a
+    /// rule whose source was live before the rule adds the target.
+    fn forward_facts(rules: &[LocalRuleView], start: &[u32]) -> Vec<u32> {
+        let mut facts = start.to_vec();
+        for rule in rules {
+            let had_source = facts.contains(&rule.source.get());
+            if super::super::client::kills_target(rule) {
+                facts.retain(|fact| *fact != rule.target.get());
+            }
+            if had_source && !facts.contains(&rule.target.get()) {
+                facts.push(rule.target.get());
+            }
+        }
+        facts.sort_unstable();
+        facts
+    }
+
+    /// Flag a forward-ordered event the way the plan does: the shared helper
+    /// decides each target's group from its kinds.
+    fn mark_joins(rules: &mut [LocalRuleView]) {
+        let event = rules
+            .iter()
+            .map(|rule| {
+                same_event_rule(
+                    rule.kind,
+                    rule.source,
+                    rule.target,
+                    rule.strong_update,
+                    rule.direct_cell_overwrite,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (rule, joins) in rules.iter_mut().zip(joins_same_event_alternatives(&event)) {
+            rule.joins_same_event_alternative = joins;
+        }
+    }
+
+    /// Demand through `forward` (application order), the way the reverse walk
+    /// takes it.
+    fn backward_preimage(forward: &[LocalRuleView], from: usize) -> Vec<u32> {
+        let reverse = forward.iter().rev().copied().collect::<Vec<_>>();
+        let mut preimages = Vec::new();
+        inverse_local_demands(demand(from), &reverse, &mut preimages);
+        preimages
+            .iter()
+            .map(|demand| demand.carrier.get())
+            .collect()
+    }
+
+    /// A container collapse at the assignment's event and target adds members
+    /// to the assigned value; it does not preserve the old target. The
+    /// assignment still kills, forward and backward, wherever the supplement
+    /// sits in the event (the plan sorts it last).
+    #[hardwon("#10539: a container-collapse supplement cancelled the assignment's kill")]
+    #[test]
+    fn collapse_supplement_does_not_cancel_the_assignment_kill() {
+        // Y(1) is assigned to X(2); the collapse brings member M(0) into X.
+        let mut forward = [
+            rule(1, 2, ValueFlowRelationKind::Assignment, false),
+            rule(0, 2, ValueFlowRelationKind::ContainerCollapse, false),
+        ];
+        mark_joins(&mut forward);
+        // The old fact on X is gone, and both Y and M reach X.
+        assert!(!forward_facts(&forward, &[2]).contains(&2));
+        assert!(forward_facts(&forward, &[1]).contains(&2));
+        assert!(forward_facts(&forward, &[0]).contains(&2));
+        // Backward agrees: X's preimage is Y and M, and not X itself.
+        assert_eq!(backward_preimage(&forward, 2), [0, 1]);
+        // The assignment keeps its kill; the collapse joins.
+        assert!(!forward[0].joins_same_event_alternative);
+        assert!(forward[1].joins_same_event_alternative);
+    }
+
+    /// A lone rule that reads its own target joins: the new value includes the
+    /// old one, so the target keeps its facts forward and backward.
+    #[test]
+    fn lone_self_sourced_strong_store_keeps_the_target_facts() {
+        let mut forward = [rule(2, 2, ValueFlowRelationKind::MemoryStore, true)];
+        mark_joins(&mut forward);
+        assert!(forward[0].joins_same_event_alternative);
+        assert_eq!(forward_facts(&forward, &[2]), [2]);
+        assert_eq!(backward_preimage(&forward, 2), [2]);
+    }
+
+    #[hardwon("#10539: same-event strong alternatives into one target killed each other backward")]
+    #[test]
+    fn backward_demand_reaches_every_same_event_alternative() {
+        // One event writes X(2) from Y(1) and from Z(0). The killer is first in
+        // application order; the other alternative joins.
+        let killer = rule(1, 2, ValueFlowRelationKind::Assignment, false);
+        let joining = LocalRuleView {
+            joins_same_event_alternative: true,
+            ..rule(0, 2, ValueFlowRelationKind::Assignment, false)
+        };
+        let forward = [killer, joining];
+        let reverse = [joining, killer];
+        let mut preimages = Vec::new();
+        inverse_local_demands(demand(2), &reverse, &mut preimages);
+        let backward = preimages
+            .iter()
+            .map(|demand| demand.carrier.get())
+            .collect::<Vec<_>>();
+        assert_eq!(backward, [0, 1]);
+        // Forward agrees: exactly the carriers in the preimage reach X, and the
+        // prior fact on X does not survive the group's single kill.
+        for start in 0..3u32 {
+            assert_eq!(
+                forward_facts(&forward, &[start]).contains(&2),
+                backward.contains(&start),
+                "start {start}"
+            );
+        }
+    }
+
+    /// The group is decided as a whole: with a weak alternative nothing kills,
+    /// so the prior fact survives forward and the demand survives backward.
+    #[test]
+    fn backward_mixed_group_keeps_the_prior_demand_in_both_orders() {
+        for weak_first in [false, true] {
+            let weak = LocalRuleView {
+                joins_same_event_alternative: true,
+                ..rule(0, 2, ValueFlowRelationKind::MemoryStore, false)
+            };
+            let strong = LocalRuleView {
+                joins_same_event_alternative: true,
+                ..rule(1, 2, ValueFlowRelationKind::Assignment, false)
+            };
+            let forward = if weak_first {
+                [weak, strong]
+            } else {
+                [strong, weak]
+            };
+            let reverse = [forward[1], forward[0]];
+            let mut preimages = Vec::new();
+            inverse_local_demands(demand(2), &reverse, &mut preimages);
+            let backward = preimages
+                .iter()
+                .map(|demand| demand.carrier.get())
+                .collect::<Vec<_>>();
+            assert_eq!(backward, [0, 1, 2], "weak_first {weak_first}");
+            for start in 0..3u32 {
+                assert_eq!(
+                    forward_facts(&forward, &[start]).contains(&2),
+                    backward.contains(&start),
+                    "weak_first {weak_first} start {start}"
+                );
+            }
         }
     }
 

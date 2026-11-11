@@ -29,10 +29,14 @@ use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
 use brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes;
 
 use crate::analyzer::semantic::common::bounded_message;
+use sha2::{Digest, Sha256};
+
+const EXACT_SOURCE_SET_V1_PREFIX: &[u8] = b"bifrost.exact-source-set.v1\0";
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 pub use crate::analyzer::semantic_model::ArtifactExtractionKind as ExternalArtifactKind;
 
@@ -167,7 +171,11 @@ pub fn finish_authored_pack_production(
             request.artifact_kind,
             artifact_sha256,
         )),
-        schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+        schema_version: if request.provenance.rust_artifact_approximation.is_some() {
+            crate::analyzer::semantic_model::model::RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION
+        } else {
+            crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
+        },
         pack_id: request.pack_id.clone(),
         version: request.pack_version.clone(),
         producer: Producer {
@@ -184,6 +192,9 @@ pub fn finish_authored_pack_production(
         carried_sources,
         cpp_portability: None,
         python_correspondence: None,
+        rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
         shards,
     });
     ArtifactProduction {
@@ -241,12 +252,49 @@ pub struct ExactArtifact {
     bytes: Vec<u8>,
     source_entries: Vec<ExactSourceEntry>,
     sha256: String,
+    raw_len: u64,
 }
+
+#[derive(Debug, Clone)]
+struct CapturedSource(Arc<tempfile::NamedTempFile>);
+
+impl PartialEq for CapturedSource {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CapturedSource {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactSourceEntry {
     relative_path: String,
     bytes: Vec<u8>,
+    captured: Option<CapturedSource>,
+    raw_len: u64,
+}
+
+pub enum ExactSourceReader<'a> {
+    Memory(Cursor<&'a [u8]>),
+    Captured(File),
+}
+
+impl Read for ExactSourceReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Memory(reader) => reader.read(buffer),
+            Self::Captured(reader) => reader.read(buffer),
+        }
+    }
+}
+
+impl Seek for ExactSourceReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Memory(reader) => reader.seek(position),
+            Self::Captured(reader) => reader.seek(position),
+        }
+    }
 }
 
 impl ExactSourceEntry {
@@ -255,7 +303,19 @@ impl ExactSourceEntry {
     }
 
     pub fn bytes(&self) -> &[u8] {
+        assert!(self.captured.is_none(), "captured source must use reader()");
         &self.bytes
+    }
+
+    pub fn reader(&self) -> io::Result<ExactSourceReader<'_>> {
+        match &self.captured {
+            Some(captured) => captured.0.reopen().map(ExactSourceReader::Captured),
+            None => Ok(ExactSourceReader::Memory(Cursor::new(&self.bytes))),
+        }
+    }
+
+    pub fn raw_len(&self) -> u64 {
+        self.raw_len
     }
 }
 
@@ -278,7 +338,9 @@ impl ExactArtifact {
                     normalize_source_set_path(Path::new(&path), max_path_depth, limits)?;
                 Ok(ExactSourceEntry {
                     relative_path: normalized,
+                    raw_len: bytes.len() as u64,
                     bytes,
+                    captured: None,
                 })
             })
             .collect::<Result<Vec<_>, ProducerDiagnostic>>()?;
@@ -317,6 +379,7 @@ impl ExactArtifact {
         let sha256 = lower_hex_string(&sha256_bytes(&bytes));
         Ok(Self {
             path,
+            raw_len: bytes.len() as u64,
             bytes,
             source_entries: normalized,
             sha256,
@@ -328,11 +391,23 @@ impl ExactArtifact {
     }
 
     pub fn bytes(&self) -> &[u8] {
+        assert!(
+            self.source_entries
+                .iter()
+                .all(|entry| entry.captured.is_none()),
+            "captured source set must use source_entries() readers"
+        );
         &self.bytes
     }
 
     #[doc(hidden)]
     pub fn into_bytes(self) -> Vec<u8> {
+        assert!(
+            self.source_entries
+                .iter()
+                .all(|entry| entry.captured.is_none()),
+            "captured source set must use source_entries() readers"
+        );
         self.bytes
     }
 
@@ -342,6 +417,10 @@ impl ExactArtifact {
 
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    pub fn raw_len(&self) -> u64 {
+        self.raw_len
     }
 }
 
@@ -553,20 +632,21 @@ pub fn read_exact_artifact_while(
     Ok(ExactArtifact {
         path: path.to_path_buf(),
         sha256: lower_hex_string(&sha256_bytes(&bytes)),
+        raw_len: bytes.len() as u64,
         bytes,
         source_entries: Vec::new(),
     })
 }
 
-#[doc(hidden)]
-pub fn read_exact_source_set_while(
+/// Both materialized and seekable source sets use this admission decision.
+/// Keep root, path spelling, ordering and duplicate checks in one place.
+fn selected_source_set_paths(
     root: &Path,
     relative_paths: &[PathBuf],
     max_files: usize,
     max_path_depth: usize,
     limits: &ArtifactProducerLimits,
-    mut is_cancelled: impl FnMut() -> bool,
-) -> Result<ExactArtifact, ProducerDiagnostic> {
+) -> Result<(PathBuf, Vec<(String, PathBuf)>), ProducerDiagnostic> {
     if relative_paths.is_empty() {
         return Err(source_set_diagnostic(
             "artifact.source_set_empty",
@@ -607,16 +687,12 @@ pub fn read_exact_source_set_while(
             limits,
         )
     })?;
-
-    let mut normalized_paths = relative_paths
+    let mut paths = relative_paths
         .iter()
         .map(|path| normalize_source_set_path(path, max_path_depth, limits))
         .collect::<Result<Vec<_>, _>>()?;
-    normalized_paths.sort_by(|left, right| left.0.cmp(&right.0));
-    if normalized_paths
-        .windows(2)
-        .any(|paths| paths[0].0 == paths[1].0)
-    {
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    if paths.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(source_set_diagnostic(
             "artifact.source_set_duplicate",
             root,
@@ -624,7 +700,63 @@ pub fn read_exact_source_set_while(
             limits,
         ));
     }
+    Ok((canonical_root, paths))
+}
 
+fn selected_source_file_metadata(
+    root: &Path,
+    canonical_root: &Path,
+    relative: &Path,
+    limits: &ArtifactProducerLimits,
+) -> Result<(PathBuf, std::fs::Metadata), ProducerDiagnostic> {
+    let path = root.join(relative);
+    source_set_path_exists(root, relative, limits)?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        source_set_diagnostic(
+            "artifact.metadata",
+            &path,
+            format!("could not inspect exact source file: {error}"),
+            limits,
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(source_set_diagnostic(
+            "artifact.source_file",
+            &path,
+            "selected source path must be a real regular file",
+            limits,
+        ));
+    }
+    let canonical_path = path.canonicalize().map_err(|error| {
+        source_set_diagnostic(
+            "artifact.canonicalize",
+            &path,
+            format!("could not canonicalize selected source file: {error}"),
+            limits,
+        )
+    })?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err(source_set_diagnostic(
+            "artifact.path_escape",
+            &path,
+            "selected source path escapes the exact source-set root",
+            limits,
+        ));
+    }
+    Ok((path, metadata))
+}
+
+#[doc(hidden)]
+pub fn read_exact_source_set_while(
+    root: &Path,
+    relative_paths: &[PathBuf],
+    max_files: usize,
+    max_path_depth: usize,
+    limits: &ArtifactProducerLimits,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<ExactArtifact, ProducerDiagnostic> {
+    let (canonical_root, normalized_paths) =
+        selected_source_set_paths(root, relative_paths, max_files, max_path_depth, limits)?;
     let selected_path_count = normalized_paths.len();
     let mut entries = Vec::with_capacity(selected_path_count);
     for (normalized, relative) in normalized_paths {
@@ -636,40 +768,8 @@ pub fn read_exact_source_set_while(
                 limits,
             ));
         }
-        let path = root.join(&relative);
-        source_set_path_exists(root, &relative, limits)?;
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-            source_set_diagnostic(
-                "artifact.metadata",
-                &path,
-                format!("could not inspect exact source file: {error}"),
-                limits,
-            )
-        })?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(source_set_diagnostic(
-                "artifact.source_file",
-                &path,
-                "selected source path must be a real regular file",
-                limits,
-            ));
-        }
-        let canonical_path = path.canonicalize().map_err(|error| {
-            source_set_diagnostic(
-                "artifact.canonicalize",
-                &path,
-                format!("could not canonicalize selected source file: {error}"),
-                limits,
-            )
-        })?;
-        if !canonical_path.starts_with(&canonical_root) {
-            return Err(source_set_diagnostic(
-                "artifact.path_escape",
-                &path,
-                "selected source path escapes the exact source-set root",
-                limits,
-            ));
-        }
+        let (path, metadata) =
+            selected_source_file_metadata(root, &canonical_root, &relative, limits)?;
         let consumed = entries
             .iter()
             .map(|entry: &ExactSourceEntry| {
@@ -678,7 +778,7 @@ pub fn read_exact_source_set_while(
                     .saturating_add(entry.bytes.len() as u64)
             })
             .sum::<u64>()
-            .saturating_add(36);
+            .saturating_add(EXACT_SOURCE_SET_V1_PREFIX.len() as u64 + 8);
         let framing_bytes = 16_u64.saturating_add(normalized.len() as u64);
         let remaining = limits
             .max_artifact_bytes
@@ -739,7 +839,9 @@ pub fn read_exact_source_set_while(
         }
         entries.push(ExactSourceEntry {
             relative_path: normalized,
+            raw_len: bytes.len() as u64,
             bytes,
+            captured: None,
         });
     }
 
@@ -756,7 +858,7 @@ pub fn read_exact_source_set_while(
 
 fn canonical_source_set_bytes(entries: &[ExactSourceEntry]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"bifrost.exact-source-set.v1\0");
+    bytes.extend_from_slice(EXACT_SOURCE_SET_V1_PREFIX);
     bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     for entry in entries {
         bytes.extend_from_slice(&(entry.relative_path.len() as u64).to_le_bytes());
@@ -765,6 +867,211 @@ fn canonical_source_set_bytes(entries: &[ExactSourceEntry]) -> Vec<u8> {
         bytes.extend_from_slice(&entry.bytes);
     }
     bytes
+}
+
+/// Begin the unchanged v1 exact-source-set digest frame.
+pub fn source_set_hasher(count: usize) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(EXACT_SOURCE_SET_V1_PREFIX);
+    hasher.update((count as u64).to_le_bytes());
+    hasher
+}
+
+fn hash_source_header(hasher: &mut Sha256, path: &str, size: u64) {
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path.as_bytes());
+    hasher.update(size.to_le_bytes());
+}
+
+/// Stream one already-open source member into the unchanged capture frame.
+/// The member must yield exactly `size` bytes: a file that changed between
+/// its metadata and this read has no digest, exactly as capture refuses it.
+pub fn hash_source_member(
+    hasher: &mut Sha256,
+    relative_path: &str,
+    size: u64,
+    reader: &mut impl Read,
+) -> std::io::Result<()> {
+    hash_source_header(hasher, relative_path, size);
+    if hash_reader(hasher, &mut reader.take(size.saturating_add(1)))? != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("source member {relative_path} changed size while it was read"),
+        ));
+    }
+    Ok(())
+}
+
+/// Stream an already-open exact file; its digest is the SHA-256 of the raw
+/// bytes with no frame, the digest `read_exact_artifact_while` reports.
+pub fn hash_exact_file(
+    hasher: &mut Sha256,
+    size: u64,
+    reader: &mut impl Read,
+) -> std::io::Result<()> {
+    if hash_reader(hasher, &mut reader.take(size.saturating_add(1)))? != size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "exact file changed size while it was read",
+        ));
+    }
+    Ok(())
+}
+
+/// Finish a digest started by [`source_set_hasher`] or `Sha256::new` for an
+/// exact file.
+pub fn finish_digest(hasher: Sha256) -> [u8; 32] {
+    hasher.finalize().into()
+}
+
+fn hash_reader(hasher: &mut Sha256, reader: &mut impl Read) -> std::io::Result<u64> {
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+}
+
+/// Capture an exact source set for a seekable producer without retaining its
+/// raw files or canonical framing in memory. The caller supplies an aggregate
+/// raw-byte budget, separate from the materializing producer limit.
+pub fn read_exact_source_set_seekable_while(
+    root: &Path,
+    relative_paths: &[PathBuf],
+    max_files: usize,
+    max_path_depth: usize,
+    max_raw_bytes: u64,
+    limits: &ArtifactProducerLimits,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<ExactArtifact, ProducerDiagnostic> {
+    let (canonical_root, paths) =
+        selected_source_set_paths(root, relative_paths, max_files, max_path_depth, limits)?;
+    // Metadata preflight uses the already selected and normalized paths. The
+    // copy below still enforces the bound and exact length against races.
+    let mut selected = Vec::with_capacity(paths.len());
+    let mut raw_len = EXACT_SOURCE_SET_V1_PREFIX.len() as u64 + 8;
+    for (normalized, relative) in paths {
+        if is_cancelled() {
+            return Err(source_set_diagnostic(
+                "artifact.cancelled",
+                root,
+                "exact source-set read was cancelled",
+                limits,
+            ));
+        }
+        let (path, metadata) =
+            selected_source_file_metadata(root, &canonical_root, &relative, limits)?;
+        raw_len = raw_len
+            .checked_add(16)
+            .and_then(|n| n.checked_add(normalized.len() as u64))
+            .and_then(|n| n.checked_add(metadata.len()))
+            .ok_or_else(|| {
+                source_set_diagnostic(
+                    "limit.total_artifact_bytes",
+                    &path,
+                    "exact source-set length overflowed",
+                    limits,
+                )
+            })?;
+        if raw_len > max_raw_bytes {
+            return Err(source_set_diagnostic(
+                "limit.total_artifact_bytes",
+                &path,
+                format!("exact source set exceeds {max_raw_bytes} raw bytes"),
+                limits,
+            ));
+        }
+        selected.push((normalized, path, metadata.len()));
+    }
+    let mut hasher = source_set_hasher(selected.len());
+    let mut entries = Vec::with_capacity(selected.len());
+    for (normalized, path, size) in selected {
+        hash_source_header(&mut hasher, &normalized, size);
+        let mut input = File::open(&path).map_err(|error| {
+            source_set_diagnostic(
+                "artifact.open",
+                &path,
+                format!("could not open exact source file: {error}"),
+                limits,
+            )
+        })?;
+        let mut capture = tempfile::NamedTempFile::new().map_err(|error| {
+            source_set_diagnostic(
+                "artifact.capture",
+                &path,
+                format!("could not create private exact source capture: {error}"),
+                limits,
+            )
+        })?;
+        let mut copied = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if is_cancelled() {
+                return Err(source_set_diagnostic(
+                    "artifact.cancelled",
+                    &path,
+                    "exact source-set read was cancelled",
+                    limits,
+                ));
+            }
+            let read = input.read(&mut buffer).map_err(|error| {
+                source_set_diagnostic(
+                    "artifact.read",
+                    &path,
+                    format!("could not read exact source file: {error}"),
+                    limits,
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            copied = copied.saturating_add(read as u64);
+            if copied > size {
+                return Err(source_set_diagnostic(
+                    "artifact.changed",
+                    &path,
+                    "selected source size changed during capture",
+                    limits,
+                ));
+            }
+            capture.write_all(&buffer[..read]).map_err(|error| {
+                source_set_diagnostic(
+                    "artifact.capture",
+                    &path,
+                    format!("could not capture exact source file: {error}"),
+                    limits,
+                )
+            })?;
+            hasher.update(&buffer[..read]);
+        }
+        if copied != size {
+            return Err(source_set_diagnostic(
+                "artifact.changed",
+                &path,
+                "selected source size changed during capture",
+                limits,
+            ));
+        }
+        entries.push(ExactSourceEntry {
+            relative_path: normalized,
+            bytes: Vec::new(),
+            captured: Some(CapturedSource(Arc::new(capture))),
+            raw_len: size,
+        });
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(ExactArtifact {
+        path: root.to_owned(),
+        bytes: Vec::new(),
+        source_entries: entries,
+        sha256: lower_hex_string(&digest),
+        raw_len,
+    })
 }
 
 fn normalize_source_set_path(
@@ -1077,6 +1384,23 @@ impl BoundedProducerDiagnostics {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#9559: growing members allowed unbounded hashing reads")]
+    fn hashing_refuses_size_changes_with_bounded_reads() {
+        for source in [false, true] {
+            let mut reader = std::io::Cursor::new(vec![0; 100]);
+            let mut hasher = Sha256::new();
+            let result = if source {
+                hash_source_member(&mut hasher, "member", 4, &mut reader)
+            } else {
+                hash_exact_file(&mut hasher, 4, &mut reader)
+            };
+            assert!(result.is_err());
+            assert_eq!(reader.position(), 5);
+        }
+        assert!(hash_exact_file(&mut Sha256::new(), 4, &mut &b"abc"[..]).is_err());
+    }
+
     use crate::analyzer::semantic_model::producer::*;
     use brokk_bifrost_test_macros::hardwon;
     use std::cell::Cell;
@@ -1179,6 +1503,71 @@ mod tests {
             ["pkg/a.go", "pkg/b.go"]
         );
         assert_ne!(first.path(), second.path());
+    }
+
+    #[test]
+    fn seekable_exact_source_set_keeps_v1_identity_and_captured_input() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.jmod"), b"old raw bytes").unwrap();
+        let paths = [PathBuf::from("a.jmod")];
+        let limits = ArtifactProducerLimits {
+            max_artifact_bytes: 128,
+            ..ArtifactProducerLimits::default()
+        };
+        let old = read_exact_source_set(root.path(), &paths, 1, 8, &limits).unwrap();
+        let captured =
+            read_exact_source_set_seekable_while(root.path(), &paths, 1, 8, 128, &limits, || false)
+                .unwrap();
+        assert_eq!(captured.sha256(), old.sha256());
+        assert_eq!(captured.raw_len(), old.bytes().len() as u64);
+        std::fs::write(root.path().join("a.jmod"), b"new raw bytes").unwrap();
+        let mut bytes = Vec::new();
+        captured.source_entries()[0]
+            .reader()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"old raw bytes");
+        let changed =
+            read_exact_source_set_seekable_while(root.path(), &paths, 1, 8, 128, &limits, || false)
+                .unwrap();
+        assert_ne!(captured.sha256(), changed.sha256());
+        let bounded =
+            read_exact_source_set_seekable_while(root.path(), &paths, 1, 8, 40, &limits, || false)
+                .unwrap_err();
+        assert_eq!(bounded.code, "limit.total_artifact_bytes");
+        let cancelled =
+            read_exact_source_set_seekable_while(root.path(), &paths, 1, 8, 128, &limits, || true)
+                .unwrap_err();
+        assert_eq!(cancelled.code, "artifact.cancelled");
+        let duplicate = read_exact_source_set_seekable_while(
+            root.path(),
+            &[paths[0].clone(), paths[0].clone()],
+            2,
+            8,
+            128,
+            &limits,
+            || false,
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.code, "artifact.source_set_duplicate");
+        std::fs::write(root.path().join("a.jmod"), vec![0_u8; 128 * 1024]).unwrap();
+        let checks = Cell::new(0);
+        let during_copy = read_exact_source_set_seekable_while(
+            root.path(),
+            &paths,
+            1,
+            8,
+            256 * 1024,
+            &limits,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+        )
+        .unwrap_err();
+        assert_eq!(during_copy.code, "artifact.cancelled");
+        assert!(checks.get() > 3);
     }
 
     #[test]

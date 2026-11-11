@@ -678,6 +678,7 @@ impl PolicyRegistry {
         let mut fixed_selectors = BTreeMap::new();
         let mut dependency_selectors = BTreeMap::new();
         let mut candidate_dependencies = Vec::new();
+        let mut resolved_without_flow = None;
 
         let (resolved_taint, resolved_typestate, catalogs, dependencies, manifests, precedence) =
             match &definition.analysis {
@@ -782,6 +783,24 @@ impl PolicyRegistry {
                         &mut retained_bytes,
                         locators,
                     )?;
+                    let secondary_spec = spec
+                        .without_flow
+                        .as_ref()
+                        .map(|without| without.as_taint_spec(spec));
+                    if let Some(secondary) = &secondary_spec {
+                        self.build_local_taint_inputs(
+                            parsed,
+                            &definition,
+                            secondary,
+                            WITHOUT_FLOW_SET_SEGMENTS,
+                            &mut fixed_selectors,
+                            &mut dependency_selectors,
+                            &mut candidate_dependencies,
+                            &mut retained_bytes,
+                            locators,
+                            imports,
+                        )?;
+                    }
                     let uses = taint_match_uses(spec)?;
                     let match_inputs = self.build_match_inputs(
                         &uses,
@@ -804,6 +823,25 @@ impl PolicyRegistry {
                         self.composition_limits()?,
                         imports.deferred,
                     )?;
+                    if let Some(secondary) = &secondary_spec {
+                        let secondary_composed = compose_taint_policy(
+                            &definition.metadata.id,
+                            secondary,
+                            WITHOUT_FLOW_SET_SEGMENTS,
+                            &self.catalogs,
+                            &candidate_dependencies,
+                            &[],
+                            self.composition_limits()?,
+                            // B borrows A's sink binding during the Output solve.
+                            // The composition helper's deferred flag permits
+                            // this deliberately empty authored sink set.
+                            true,
+                        )?;
+                        composed
+                            .endpoint_dependencies
+                            .extend(secondary_composed.endpoint_dependencies);
+                        resolved_without_flow = Some(secondary_composed.spec);
+                    }
                     imports
                         .attach_origins(&mut composed.spec, &mut composed.endpoint_dependencies)?;
                     let catalogs = composed.spec.catalogs.clone();
@@ -943,6 +981,7 @@ impl PolicyRegistry {
             imports.dependencies.clone(),
             precedence,
             resolved_taint,
+            resolved_without_flow,
             resolved_typestate,
         )?;
         Ok(PolicyBuild {

@@ -21,9 +21,12 @@ use std::path::Path;
 use std::process::Child;
 
 use brokk_bifrost_analysis::Language;
-use brokk_bifrost_mcp::benchmark_api::{
-    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
-};
+// The analysis and store libraries reach their language tables through
+// link-time externs. This target only builds a fixture project in-process and
+// never calls those tables, so without this import the linker omits the crate
+// that defines them. MSVC resolves the externs before /OPT:REF and fails;
+// GNU ld drops the dead sections. Keep the production assembly in the link.
+use brokk_bifrost_tools as _;
 use common::InlineTestProject;
 use serde_json::{Value, json};
 
@@ -39,13 +42,15 @@ fn fixture_file(root: &Path, relative: &str) -> String {
 }
 
 fn spawn_server(root: &Path) -> Child {
-    let request_budget = BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string();
-    common::mcp_server::spawn_mcp_server(
+    // `run_policy` keeps its production fallback budget (four minutes). The
+    // 60-second interactive benchmark budget is a latency contract this test
+    // does not assert: on a loaded merge host the cold policy preparation for
+    // this fixture took 55 s of it (13 s alone) and the run was cut short at
+    // its deadline with no findings (#9953).
+    common::mcp_server::spawn_mcp_server_at_production_budget(
         common::mcp_server::mcp_server_binary(),
         root,
         "extended",
-        &[],
-        &[(MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV, &request_budget)],
     )
     .expect("spawn the bifrost MCP server")
 }
@@ -105,10 +110,10 @@ fn mcp_run_policy_reports_the_stored_flow_and_the_missing_validators() {
     let structured =
         run_policies_over_mcp(project.root(), &[TAINT_POLICY_PATH, VALIDATION_POLICY_PATH]);
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 6, "{report}");
+    assert_eq!(report["schema_version"], 7, "{report}");
 
     let taint = run_object(report, TAINT_POLICY_ID);
-    assert_eq!(taint["completion"]["type"], "inconclusive", "{taint}");
+    assert_eq!(taint["completion"]["type"], "complete", "{taint}");
     let taint_findings = taint["findings"].as_array().expect("taint findings");
     assert_eq!(
         taint_findings.len(),

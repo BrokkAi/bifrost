@@ -19,6 +19,15 @@ pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
 pub const DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS: usize = 1_024;
 pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS: usize = DEFAULT_RECEIVER_MAX_SCOPE_NODES;
+/// Session allowance for C3 hierarchy-order work: cold order steps plus the order cost charged when
+/// a relation is replayed into a later consumer. Each preset uses its own scope allowance, the
+/// allowance order work shared before it had its own axis (#8704). On Django (2026-11-01) no
+/// session stopped on this axis and the highest observed admitted use was 51% of an allowance, so
+/// the rule leaves headroom there; it is not shown to be optimal. Sessions stopped on other axes
+/// remain censored observations. Replay pressure was not exercised by that corpus, and the Go
+/// definition budget follows the rule without measurement. RQL does not use this rule: its fact
+/// budget gives order work only what scope and summary leave.
+pub const DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK: usize = DEFAULT_RECEIVER_MAX_SCOPE_NODES;
 
 /// Budget for one interactive `get_type_by_location` request.
 ///
@@ -34,6 +43,7 @@ pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnaly
     max_summary_expansions: 256,
     max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
     max_scope_nodes: 200_000,
+    max_hierarchy_order_work: 200_000,
     max_hierarchy_order_steps: 200_000,
 };
 
@@ -41,22 +51,42 @@ pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnaly
 pub enum ReceiverAnalysisOutcome<T> {
     Precise(Vec<T>),
     Ambiguous(Vec<T>),
+    /// Possible candidates from an incomplete lookup; never closed targets.
+    Incomplete {
+        candidates: Vec<T>,
+    },
     Unknown,
-    Unsupported { reason: &'static str },
-    ExceededBudget { limit: &'static str },
+    Unsupported {
+        reason: &'static str,
+    },
+    ExceededBudget {
+        limit: &'static str,
+    },
 }
 
 impl<T> ReceiverAnalysisOutcome<T> {
     pub fn values(&self) -> Option<&[T]> {
         match self {
             Self::Precise(values) | Self::Ambiguous(values) => Some(values),
-            Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => None,
+            Self::Incomplete { .. }
+            | Self::Unknown
+            | Self::Unsupported { .. }
+            | Self::ExceededBudget { .. } => None,
+        }
+    }
+
+    /// Candidates suitable for presentation, without asserting exact dispatch.
+    pub fn possible_candidates(&self) -> Option<&[T]> {
+        match self {
+            Self::Incomplete { candidates } => Some(candidates),
+            _ => None,
         }
     }
 
     fn truncate_values(&mut self, limit: usize) {
         match self {
             Self::Precise(values) | Self::Ambiguous(values) => values.truncate(limit),
+            Self::Incomplete { candidates } => candidates.truncate(limit),
             Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => {}
         }
     }
@@ -76,6 +106,7 @@ impl<T> ReceiverAnalysisOutcome<T> {
         match self {
             Self::Precise(values) => Some(values),
             Self::Ambiguous(_)
+            | Self::Incomplete { .. }
             | Self::Unknown
             | Self::Unsupported { .. }
             | Self::ExceededBudget { .. } => None,
@@ -140,6 +171,7 @@ where
     ) -> Self {
         let mut values = Vec::new();
         let mut saw_non_precise = false;
+        let mut saw_incomplete = false;
         for outcome in outcomes {
             match outcome {
                 Self::Precise(mut precise) => values.append(&mut precise),
@@ -148,9 +180,25 @@ where
                     values.append(&mut ambiguous);
                 }
                 Self::Unknown => saw_non_precise = true,
+                Self::Incomplete { candidates } => {
+                    saw_incomplete = true;
+                    values.extend(candidates);
+                }
                 Self::Unsupported { reason } => return Self::Unsupported { reason },
                 Self::ExceededBudget { limit } => return Self::ExceededBudget { limit },
             }
+        }
+        if saw_incomplete {
+            let mut candidates = Vec::new();
+            for value in values {
+                if !candidates.contains(&value) {
+                    candidates.push(value);
+                }
+            }
+            // Keep one overflow witness so the report layer can record that
+            // presentation was capped without changing Incomplete to Ambiguous.
+            candidates.truncate(budget.max_targets.saturating_add(1));
+            return Self::Incomplete { candidates };
         }
         if values.is_empty() {
             return Self::Unknown;
@@ -206,6 +254,7 @@ pub struct ReceiverAnalysisBudget {
     /// Typed convergence and lexical frontier iterations within one query.
     pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
+    pub max_hierarchy_order_work: usize,
     /// Optional hierarchy discharge ordering; exhaustion never stops aggregate resolution.
     pub max_hierarchy_order_steps: usize,
 }
@@ -218,12 +267,37 @@ impl Default for ReceiverAnalysisBudget {
             max_summary_expansions: DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS,
             max_resolution_rounds: DEFAULT_RECEIVER_MAX_RESOLUTION_ROUNDS,
             max_scope_nodes: DEFAULT_RECEIVER_MAX_SCOPE_NODES,
+            max_hierarchy_order_work: DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK,
             max_hierarchy_order_steps: DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS,
         }
     }
 }
 
 impl ReceiverAnalysisBudget {
+    /// Allowance left after a preceding phase of the same request.
+    pub fn remaining_after(&self, work: &ReceiverAnalysisWork) -> Self {
+        let Self {
+            context_depth,
+            max_targets,
+            max_summary_expansions,
+            max_resolution_rounds,
+            max_scope_nodes,
+            max_hierarchy_order_work,
+            max_hierarchy_order_steps,
+        } = *self;
+        Self {
+            context_depth,
+            max_targets,
+            max_scope_nodes: max_scope_nodes.saturating_sub(work.scope_nodes),
+            max_summary_expansions: max_summary_expansions.saturating_sub(work.summary_expansions),
+            max_resolution_rounds: max_resolution_rounds.saturating_sub(work.resolution_rounds),
+            max_hierarchy_order_work: max_hierarchy_order_work
+                .saturating_sub(work.hierarchy_order_steps),
+            // The per-order cap limits one computation, not session work.
+            max_hierarchy_order_steps,
+        }
+    }
+
     pub fn tiny() -> Self {
         Self {
             context_depth: 0,
@@ -231,6 +305,7 @@ impl ReceiverAnalysisBudget {
             max_summary_expansions: 1,
             max_resolution_rounds: 1,
             max_scope_nodes: 1,
+            max_hierarchy_order_work: 1,
             max_hierarchy_order_steps: 1,
         }
     }
@@ -287,6 +362,7 @@ pub struct ReceiverAnalysisCacheKey {
     pub max_summary_expansions: usize,
     pub max_resolution_rounds: usize,
     pub max_scope_nodes: usize,
+    pub max_hierarchy_order_work: usize,
     pub max_hierarchy_order_steps: usize,
 }
 
@@ -307,6 +383,7 @@ impl ReceiverAnalysisCacheKey {
             max_summary_expansions: query.budget.max_summary_expansions,
             max_resolution_rounds: query.budget.max_resolution_rounds,
             max_scope_nodes: query.budget.max_scope_nodes,
+            max_hierarchy_order_work: query.budget.max_hierarchy_order_work,
             max_hierarchy_order_steps: query.budget.max_hierarchy_order_steps,
         }
     }
@@ -325,9 +402,42 @@ pub struct ReceiverAnalysisWork {
     pub summary_expansions: usize,
     pub resolution_rounds: usize,
     pub scope_nodes: usize,
+    pub hierarchy_order_steps: usize,
 }
 
 impl ReceiverAnalysisWork {
+    /// Work charged to a resolution session after setup.
+    pub fn charged_total(&self) -> usize {
+        let Self {
+            // Setup precedes the resolution session and has no session axis.
+            setup_nodes: _,
+            scope_nodes,
+            summary_expansions,
+            resolution_rounds,
+            hierarchy_order_steps,
+        } = *self;
+        scope_nodes
+            .saturating_add(summary_expansions)
+            .saturating_add(resolution_rounds)
+            .saturating_add(hierarchy_order_steps)
+    }
+
+    /// All receiver analysis work, including setup before the session.
+    pub fn total_with_setup(&self) -> usize {
+        let Self {
+            setup_nodes,
+            scope_nodes,
+            summary_expansions,
+            resolution_rounds,
+            hierarchy_order_steps,
+        } = *self;
+        setup_nodes
+            .saturating_add(scope_nodes)
+            .saturating_add(summary_expansions)
+            .saturating_add(resolution_rounds)
+            .saturating_add(hierarchy_order_steps)
+    }
+
     /// Combine independently measured work without charging or clamping budgets.
     pub fn saturating_add(self, other: Self) -> Self {
         Self {
@@ -339,6 +449,9 @@ impl ReceiverAnalysisWork {
                 .resolution_rounds
                 .saturating_add(other.resolution_rounds),
             scope_nodes: self.scope_nodes.saturating_add(other.scope_nodes),
+            hierarchy_order_steps: self
+                .hierarchy_order_steps
+                .saturating_add(other.hierarchy_order_steps),
         }
     }
 }
@@ -388,6 +501,7 @@ impl<T> ReceiverAnalysisReport<T> {
     ) -> Self {
         let candidates_truncated = outcome
             .values()
+            .or_else(|| outcome.possible_candidates())
             .is_some_and(|values| values.len() > budget.max_targets);
         if candidates_truncated {
             crate::analyzer::carried_context::mark_execution_dependent();
@@ -444,12 +558,14 @@ impl ReceiverAnalysisBudgetTracker {
             summary_expansions: self.summary_expansions,
             resolution_rounds: 0,
             scope_nodes: self.scope_nodes,
+            hierarchy_order_steps: 0,
         }
     }
 
     pub fn report<T>(&self, mut outcome: ReceiverAnalysisOutcome<T>) -> ReceiverAnalysisReport<T> {
         let candidates_truncated = outcome
             .values()
+            .or_else(|| outcome.possible_candidates())
             .is_some_and(|values| values.len() > self.budget.max_targets);
         if candidates_truncated {
             crate::analyzer::carried_context::mark_execution_dependent();
@@ -468,6 +584,7 @@ pub enum ReceiverBudgetLimit {
     SummaryExpansions,
     ResolutionRounds,
     ScopeNodes,
+    HierarchyOrderSteps,
     TotalWork,
 }
 
@@ -477,6 +594,7 @@ impl ReceiverBudgetLimit {
             ReceiverBudgetLimit::SummaryExpansions => "summary_expansions",
             ReceiverBudgetLimit::ResolutionRounds => "resolution_rounds",
             ReceiverBudgetLimit::ScopeNodes => "scope_nodes",
+            ReceiverBudgetLimit::HierarchyOrderSteps => "hierarchy_order_steps",
             ReceiverBudgetLimit::TotalWork => "total_work",
         }
     }

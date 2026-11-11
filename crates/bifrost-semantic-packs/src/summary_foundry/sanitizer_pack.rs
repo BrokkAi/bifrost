@@ -586,6 +586,8 @@ fn build_summary(
         concurrency_effects: Vec::new(),
         returned_callables: Vec::new(),
         declared_effects: Vec::new(),
+        subject_effects: Vec::new(),
+        lifecycle_coverage: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
         result_use_obligations: Vec::new(),
@@ -726,6 +728,7 @@ impl PackIdentity {
                 toolchains: self.toolchains.clone(),
             },
             Provenance {
+                rust_artifact_approximation: None,
                 source: self.provenance_source.clone(),
                 revision: Some("k3-sanitizers".to_owned()),
             },

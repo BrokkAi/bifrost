@@ -14,6 +14,9 @@ pub(crate) mod fixture {
         >,
     );
     impl LanguageAdapter for SourceStorageFixtureAdapter {
+        fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            JavaAdapter.line_data_kinds()
+        }
         fn query_directory(&self) -> &'static str {
             JavaAdapter.query_directory()
         }

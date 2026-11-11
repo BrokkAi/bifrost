@@ -163,6 +163,45 @@ impl TaintFindingEntry {
 }
 
 impl TaintOriginStatus {
+    /// Fold paths from distinct composed sources that resolve to one durable
+    /// origin, as happens when several sources cross the same store read.
+    pub(crate) fn composed_merged(
+        mut evidence: Vec<TaintOriginFindingEvidence>,
+        witness_unavailable: bool,
+    ) -> Result<Self, TaintFindingError> {
+        evidence.sort_by(|left, right| left.origin.cmp(&right.origin));
+        let mut origins: Vec<TaintOriginFindingEvidence> = Vec::new();
+        for origin in evidence {
+            if let Some(existing) = origins.last_mut()
+                && existing.origin == origin.origin
+            {
+                if existing.frontier_source != origin.frontier_source {
+                    return Err(TaintFindingError::InvalidResult);
+                }
+                existing.classes = existing.classes.union(&origin.classes);
+                existing.reached_classes = existing.reached_classes.union(&origin.reached_classes);
+                existing.certain_path |= origin.certain_path;
+                let mut witnesses = Vec::from(std::mem::take(&mut existing.witnesses));
+                for witness in origin.witnesses {
+                    if !witnesses.contains(&witness) {
+                        witnesses.push(witness);
+                    }
+                }
+                existing.witnesses = witnesses.into_boxed_slice();
+                let mut closures = Vec::from(std::mem::take(&mut existing.authored_arm_closures));
+                for closure in origin.authored_arm_closures {
+                    if !closures.contains(&closure) {
+                        closures.push(closure);
+                    }
+                }
+                existing.authored_arm_closures = closures.into_boxed_slice();
+            } else {
+                origins.push(origin);
+            }
+        }
+        Ok(Self::composed(origins, witness_unavailable))
+    }
+
     pub const fn origins(&self) -> &[SourceEventKey] {
         &self.origins
     }
@@ -195,6 +234,7 @@ impl TaintOriginStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintFinding {
+    model_receipt: crate::model_attribution::ModelReceipt,
     key: TaintFindingKey,
     sink: ValueFlowSinkId,
     classes: TaintClassSet,
@@ -206,6 +246,18 @@ pub struct TaintFinding {
 }
 
 impl TaintFinding {
+    pub fn model_receipt(&self) -> &crate::model_attribution::ModelReceipt {
+        &self.model_receipt
+    }
+
+    pub fn merge_model_receipt(&mut self, receipt: &crate::model_attribution::ModelReceipt) {
+        self.model_receipt = crate::model_attribution::model_receipt_merge(
+            &self.model_receipt,
+            receipt,
+            crate::model_attribution::SUMMARY_RECEIPT_CAP,
+        );
+    }
+
     pub const fn key(&self) -> &TaintFindingKey {
         &self.key
     }
@@ -272,7 +324,7 @@ impl TaintAttributionWork {
 
 /// One query's attribution allowance, shared across collections and charged
 /// at reconstruction, including when later projection or refinement fails.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaintAttributionBudget {
     limits: (usize, usize),
     work: TaintAttributionWork,
@@ -288,6 +340,24 @@ impl TaintAttributionBudget {
 
     pub const fn work(&self) -> TaintAttributionWork {
         self.work
+    }
+
+    /// Admit the work of a stored, complete Output unit before the next anchor.
+    pub fn replay_fits(&self, work: TaintAttributionWork) -> bool {
+        !work.run_exhausted
+            && self.work.steps.saturating_add(work.steps) <= self.limits.0
+            && self.work.expansions.saturating_add(work.expansions) <= self.limits.1
+    }
+
+    pub fn replay(&mut self, work: TaintAttributionWork) {
+        assert!(self.replay_fits(work), "stored attribution work must fit");
+        self.work.attempts = self.work.attempts.saturating_add(work.attempts);
+        self.work.steps += work.steps;
+        self.work.expansions += work.expansions;
+        self.work.candidate_exhaustions = self
+            .work
+            .candidate_exhaustions
+            .saturating_add(work.candidate_exhaustions);
     }
 }
 
@@ -305,6 +375,23 @@ pub struct TaintFindingReport {
 }
 
 impl TaintFindingReport {
+    /// One reported site from a composed batch, for the stable Output product.
+    /// Per-site execution uses the selected-sink search; this extraction lets
+    /// the existing batch route use the same row projector during migration.
+    pub(crate) fn composed_site(&self, site: &SemanticLocator) -> Self {
+        let findings = self
+            .findings
+            .iter()
+            .filter(|finding| finding.key.sink.site() == site)
+            .cloned()
+            .collect();
+        let mut site_report = Self::composed(self.result.clone(), findings);
+        site_report.collection_truncated = self.collection_truncated;
+        site_report.omitted_findings_lower_bound = self.omitted_findings_lower_bound;
+        site_report.attribution = self.attribution;
+        site_report
+    }
+
     pub const fn result(&self) -> &TaintSummaryResult {
         &self.result
     }
@@ -383,6 +470,9 @@ impl TaintFindingReport {
                             )
                             .saturating_add(semantic_locator_heap_bytes(&finding.key.meeting_site))
                             .saturating_add(finding.classes.retained_heap_bytes())
+                            .saturating_add(crate::model_attribution::model_receipt_heap_bytes(
+                                &finding.model_receipt,
+                            ))
                             .saturating_add(size_of_val(&*finding.origins.origins))
                             .saturating_add(size_of_val(&*finding.origins.evidence))
                             .saturating_add(
@@ -665,6 +755,7 @@ impl TaintFinding {
             meeting_uncertain: !path_qualities.has_proven_complete_path(),
         };
         Ok(Self {
+            model_receipt: Default::default(),
             key,
             sink,
             classes,
@@ -682,6 +773,86 @@ impl TaintFinding {
 }
 
 impl TaintFindingReport {
+    /// Combine independently composed complete output sites before policy
+    /// projection. A repeated event is one public finding with all origins.
+    pub fn merge_complete_composed(
+        plan: &TaintAnalysisPlan,
+        reports: impl IntoIterator<Item = Self>,
+    ) -> Result<Self, TaintFindingError> {
+        let mut findings = Vec::new();
+        let mut attribution = TaintAttributionWork::default();
+        let mut derived_complete = true;
+        let mut authored = Vec::new();
+        for report in reports {
+            if !report.belongs_to(plan)
+                || !(report.is_complete() || report.is_proven_by_authored_summaries())
+                || report
+                    .findings
+                    .iter()
+                    .any(|finding| !finding.complete || !finding.origins.is_complete())
+            {
+                return Err(TaintFindingError::InvalidResult);
+            }
+            if report.is_proven_by_authored_summaries() {
+                derived_complete = false;
+                for closure in report.authored_arm_closures() {
+                    if !authored.contains(closure) {
+                        authored.push(closure.clone());
+                    }
+                }
+            }
+            attribution.attempts = attribution
+                .attempts
+                .saturating_add(report.attribution.attempts);
+            attribution.steps = attribution.steps.saturating_add(report.attribution.steps);
+            attribution.expansions = attribution
+                .expansions
+                .saturating_add(report.attribution.expansions);
+            attribution.candidate_exhaustions = attribution
+                .candidate_exhaustions
+                .saturating_add(report.attribution.candidate_exhaustions);
+            attribution.run_exhausted |= report.attribution.run_exhausted;
+            findings.extend(report.findings);
+        }
+        findings.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut merged: Vec<TaintFinding> = Vec::with_capacity(findings.len());
+        for finding in findings {
+            if let Some(previous) = merged.last_mut()
+                && previous.key == finding.key
+            {
+                if previous.sink != finding.sink || previous.entry != finding.entry {
+                    return Err(TaintFindingError::InvalidResult);
+                }
+                previous.merge_model_receipt(&finding.model_receipt);
+                previous.classes = previous.classes.union(&finding.classes);
+                for quality in finding.path_qualities.iter() {
+                    previous.path_qualities.insert(quality);
+                }
+                previous.proven |= finding.proven;
+                previous.complete &= finding.complete;
+                previous.origins.witness_unavailable |= finding.origins.witness_unavailable;
+                let mut evidence = Vec::from(std::mem::take(&mut previous.origins.evidence));
+                evidence.extend(finding.origins.evidence);
+                previous.origins = TaintOriginStatus::composed_merged(
+                    evidence,
+                    previous.origins.witness_unavailable,
+                )?;
+            } else {
+                merged.push(finding);
+            }
+        }
+        let result = TaintSummaryResult::composed(
+            plan,
+            vec![super::TaintFact::zero()],
+            crate::dataflow::SolverTermination::FixedPoint,
+            derived_complete,
+            (!derived_complete).then_some(authored),
+        );
+        let mut report = Self::composed(result, merged);
+        report.attribution = attribution;
+        Ok(report)
+    }
+
     /// Per-pair envelopes retain the first collection's incompleteness without
     /// copying its complete IDE graph for every source/sink pair.
     pub(crate) fn refined_pair(
@@ -789,6 +960,47 @@ pub fn collect_taint_findings_with_attribution_budget(
     collection_limits: TaintFindingCollectionLimits,
     attribution: &mut TaintAttributionBudget,
 ) -> Result<TaintFindingReport, TaintFindingError> {
+    collect_taint_findings_internal(
+        plan,
+        result,
+        max_origins_per_finding,
+        witness_limits,
+        collection_limits,
+        attribution,
+        None,
+    )
+}
+
+pub fn collect_taint_findings_with_model_receipts(
+    plan: &TaintAnalysisPlan,
+    result: TaintSummaryResult,
+    max_origins_per_finding: usize,
+    witness_limits: WitnessReconstructionLimits,
+    collection_limits: TaintFindingCollectionLimits,
+    attribution: &mut TaintAttributionBudget,
+    receipts: &crate::model_attribution::TaintModelReceiptInputs,
+) -> Result<TaintFindingReport, TaintFindingError> {
+    collect_taint_findings_internal(
+        plan,
+        result,
+        max_origins_per_finding,
+        witness_limits,
+        collection_limits,
+        attribution,
+        Some(receipts),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_taint_findings_internal(
+    plan: &TaintAnalysisPlan,
+    result: TaintSummaryResult,
+    max_origins_per_finding: usize,
+    witness_limits: WitnessReconstructionLimits,
+    collection_limits: TaintFindingCollectionLimits,
+    attribution: &mut TaintAttributionBudget,
+    receipts: Option<&crate::model_attribution::TaintModelReceiptInputs>,
+) -> Result<TaintFindingReport, TaintFindingError> {
     if max_origins_per_finding == 0 {
         return Err(TaintFindingError::InvalidOriginLimit);
     }
@@ -826,10 +1038,15 @@ pub fn collect_taint_findings_with_attribution_budget(
         if classes.is_empty() {
             continue;
         }
-        if findings.len() == budget.limits.max_findings {
-            omitted_findings_lower_bound = omitted_findings_lower_bound.saturating_add(1);
-            budget.truncated = true;
-            continue;
+        let mut model_receipt = result
+            .model_receipt(point_value.value(), &classes)
+            .ok_or(TaintFindingError::InvalidResult)?;
+        if let Some(sink_receipt) = receipts.and_then(|inputs| inputs.sinks.get(&sink)) {
+            model_receipt = crate::model_attribution::model_receipt_merge(
+                &model_receipt,
+                sink_receipt,
+                crate::model_attribution::SUMMARY_RECEIPT_CAP,
+            );
         }
         let sink_spec = plan
             .value_flow()
@@ -872,6 +1089,18 @@ pub fn collect_taint_findings_with_attribution_budget(
             meeting_site: sink_spec.key().site().clone(),
             meeting_uncertain: fact.is_uncertain(),
         };
+        if findings.len() == budget.limits.max_findings {
+            if let Some(existing) = findings
+                .iter_mut()
+                .find(|finding: &&mut TaintFinding| finding.key == key)
+            {
+                existing.merge_model_receipt(&model_receipt);
+            } else {
+                omitted_findings_lower_bound = omitted_findings_lower_bound.saturating_add(1);
+            }
+            budget.truncated = true;
+            continue;
+        }
         let origins = reconstruct_origins(
             plan,
             &result,
@@ -890,6 +1119,7 @@ pub fn collect_taint_findings_with_attribution_budget(
                 .iter()
                 .all(|origin| origin.has_certain_path());
         let finding = TaintFinding {
+            model_receipt,
             key,
             sink,
             classes,
@@ -915,7 +1145,17 @@ pub fn collect_taint_findings_with_attribution_budget(
         // Distinct summary entries can reach one sink with identical facts --
         // the resolved-call continuation edges (#1952) make that routine --
         // and an identical finding carries no additional information.
-        if findings.contains(&finding) {
+        if let Some(existing) = findings.iter_mut().find(|existing: &&mut TaintFinding| {
+            existing.key == finding.key
+                && existing.sink == finding.sink
+                && existing.classes == finding.classes
+                && existing.entry == finding.entry
+                && existing.path_qualities == finding.path_qualities
+                && existing.proven == finding.proven
+                && existing.complete == finding.complete
+                && existing.origins == finding.origins
+        }) {
+            existing.merge_model_receipt(&finding.model_receipt);
             continue;
         }
         findings.push(finding);
@@ -1128,7 +1368,8 @@ fn reconstruct_origins(
     let mut witness_truncation_cause = None::<TaintWitnessTruncationCause>;
     let mut pending_callers = Vec::<PendingCallerContext>::new();
     let mut candidate = TaintAttributionWork::default();
-    let problem = super::TaintFlowProblem::new(plan);
+    let problem = super::TaintFlowProblem::new(plan)
+        .with_caller_conversions(result.fact_result().caller_conversions());
     for quality in point_value.path_qualities().iter() {
         // One reached fact is routinely derived along several paths, and two
         // paths can generate it from different sources, so the origin set is

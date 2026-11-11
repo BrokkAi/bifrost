@@ -90,6 +90,16 @@ pub trait SelectedRustReverseQueries {
         )>,
     >;
 
+    /// The value-namespace reference at a call's callee range in this
+    /// selected inventory: the one a forward call edge at that range resolved.
+    /// None stops publication.
+    fn call_reference_in_file(
+        &mut self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<Option<SemanticId>>;
+
     /// Resolve canonical occurrences in request order, one slot per reference.
     /// None stops publication; the enclosing operation retains its terminal.
     fn resolve_references(

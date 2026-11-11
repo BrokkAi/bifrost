@@ -185,6 +185,8 @@ effect_enum! {
     ///   could be built for it, so no pack declaration can be looked up.
     /// - `ModelConflict`: several activated packs disagree about the callee, so
     ///   the runtime resolved the lookup to `Conflict` and nothing is claimed.
+    /// - `ModelInputUnavailable`: the activated models could not be read in
+    ///   full for the callee, so the lookup is open and nothing is claimed.
     /// - `CalleeUnmodeled`: the callee resolves outside the workspace and no
     ///   activated pack models it, so its effects are unknown.
     /// - `ProcedureBudgetExhausted`: the fixpoint reached its procedure,
@@ -200,6 +202,7 @@ effect_enum! {
         DispatchInterrupted => "dispatch_interrupted",
         CalleeUnkeyable => "callee_unkeyable",
         ModelConflict => "model_conflict",
+        ModelInputUnavailable => "model_input_unavailable",
         CalleeUnmodeled => "callee_unmodeled",
         ProcedureBudgetExhausted => "procedure_budget_exhausted",
         EffectBudgetExhausted => "effect_budget_exhausted",
@@ -600,12 +603,14 @@ pub fn project_modeled_call_target_lookup(
                 let has_receiver = exact.and_then(|proof| match proof.call_application() {
                     CallApplicationKind::PackageFunction => Some(false),
                     CallApplicationKind::BoundReceiver => Some(true),
-                    CallApplicationKind::ReceiverBindingUnknown | CallApplicationKind::Unknown => {
-                        None
-                    }
+                    CallApplicationKind::ReceiverBindingUnknown
+                    | CallApplicationKind::ExtensionArgument
+                    | CallApplicationKind::Unknown => None,
                 });
-                if identity.language() == language_for_file(&shape.outcome.file)
-                    && let (Some(proof), Some(has_receiver)) = (exact, has_receiver)
+                if crate::analyzer::languages::calls_external_declarations_of(
+                    language_for_file(&shape.outcome.file),
+                    identity.language(),
+                ) && let (Some(proof), Some(has_receiver)) = (exact, has_receiver)
                 {
                     arms.push(ModeledCallTargetArm {
                         key: ModeledProcedureKey {
@@ -640,9 +645,9 @@ pub fn project_modeled_call_target_lookup(
                 let has_receiver = exact.and_then(|proof| match proof.call_application() {
                     CallApplicationKind::PackageFunction => Some(false),
                     CallApplicationKind::BoundReceiver => Some(true),
-                    CallApplicationKind::ReceiverBindingUnknown | CallApplicationKind::Unknown => {
-                        None
-                    }
+                    CallApplicationKind::ReceiverBindingUnknown
+                    | CallApplicationKind::ExtensionArgument
+                    | CallApplicationKind::Unknown => None,
                 });
                 match (
                     exact,
@@ -686,14 +691,15 @@ pub fn project_modeled_call_target_lookup(
                             })
                         }
                         CallApplicationKind::ReceiverBindingUnknown
+                        | CallApplicationKind::ExtensionArgument
                         | CallApplicationKind::Unknown => false,
                     });
                 let has_receiver = exact.and_then(|proof| match proof.call_application() {
                     CallApplicationKind::PackageFunction => Some(false),
                     CallApplicationKind::BoundReceiver => Some(true),
-                    CallApplicationKind::ReceiverBindingUnknown | CallApplicationKind::Unknown => {
-                        None
-                    }
+                    CallApplicationKind::ReceiverBindingUnknown
+                    | CallApplicationKind::ExtensionArgument
+                    | CallApplicationKind::Unknown => None,
                 });
                 match (exact, has_receiver, external_callee_identity.as_ref()) {
                     (Some(proof), Some(has_receiver), Some(identity))
@@ -830,7 +836,11 @@ pub fn project_modeled_call_target_lookup(
             CallApplicationKind::ReceiverBindingUnknown => {
                 ModeledCallApplication::ReceiverBindingUnknown
             }
-            CallApplicationKind::Unknown => ModeledCallApplication::Unknown,
+            // Modeled effects bind formal 0 to the first written argument,
+            // which a reduced-form extension call writes as its receiver.
+            CallApplicationKind::ExtensionArgument | CallApplicationKind::Unknown => {
+                ModeledCallApplication::Unknown
+            }
         },
         coverage,
     }
@@ -931,6 +941,9 @@ pub enum ArmLookup {
     Unkeyable,
     /// Several activated summaries disagree about the callee.
     Conflict,
+    /// The activated models could not be read in full for the callee, so the
+    /// lookup is open. It fails closed like a conflict, with its own reason.
+    InputUnavailable,
     /// A key exists and no activated pack declares anything for it. Whether
     /// this is a coverage gap depends on `analyzable`: a workspace procedure
     /// with a body is covered by propagation, an external callee is not.
@@ -1063,6 +1076,10 @@ pub fn call_effect_report(
             }
             ArmLookup::Conflict => {
                 gap = gap.or(Some(EffectReason::ModelConflict));
+                coverage = coverage.meet(EffectCoverage::Open);
+            }
+            ArmLookup::InputUnavailable => {
+                gap = gap.or(Some(EffectReason::ModelInputUnavailable));
                 coverage = coverage.meet(EffectCoverage::Open);
             }
             ArmLookup::Unmodeled { analyzable } => {

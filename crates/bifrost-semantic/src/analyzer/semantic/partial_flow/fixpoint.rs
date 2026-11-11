@@ -17,16 +17,22 @@ use crate::analyzer::semantic::partial_flow::ports::PortId;
 use crate::analyzer::semantic::partial_flow::ports::PortTable;
 
 use crate::analyzer::semantic::partial_flow::ports::call_port_values;
+use crate::analyzer::semantic::partial_flow::ports::canonical_field_member_matches;
 
+use crate::analyzer::semantic::partial_flow::ports::heap_ports_overlap;
 use crate::analyzer::semantic::partial_flow::ports::heap_selectors;
 
+use crate::analyzer::semantic::partial_flow::file_local_procedure_relations;
 use crate::analyzer::semantic::partial_flow::ports::port_of_endpoint;
+use crate::analyzer::semantic::partial_flow::ports::written_heap_ports;
 
 use crate::analyzer::semantic::partial_flow::rules::{GuardEdgeKill, guard_edge_kills};
 
 use crate::analyzer::semantic::partial_flow::rules::invalidates_source;
 
-use crate::analyzer::semantic::partial_flow::rules::kills_target;
+use crate::analyzer::semantic::partial_flow::rules::{
+    is_same_event_supplement, joins_same_event_alternatives, kills_target, same_event_rule,
+};
 
 use crate::analyzer::semantic::partial_flow::rules::procedure_infeasible_points;
 
@@ -99,6 +105,7 @@ use crate::analyzer::semantic::SemanticArtifact;
 use crate::analyzer::semantic::SemanticBudget;
 
 use crate::analyzer::semantic::SemanticExecutionBudget;
+use crate::analyzer::semantic::provider::BudgetRefusal;
 
 use crate::analyzer::semantic::SemanticCallSite;
 
@@ -222,16 +229,75 @@ pub struct ProcedurePartialFlows {
     pub ports: Vec<PartialFlowPort>,
     pub flows: Vec<PartialFlow>,
     /// Some value-flow gap that is not discharged remains in the procedure.
-    pub open: bool,
+    open: bool,
     /// Every present relation is proven and every live boundary member has
     /// a representable port. The ICFG engine treats a procedure with an unproven
     /// relation as an incomplete snapshot before it looks at any gap, so
     /// composition checks this fact first. `false` when projection failed.
-    pub relations_complete: bool,
+    relations_complete: bool,
     pub discharged_gaps: Vec<SemanticGapId>,
 }
 
 impl ProcedurePartialFlows {
+    /// A head with the given facts. `open` and `relations_complete` are
+    /// private so that a reader asks [`Self::may_omit_flows`] instead of
+    /// pairing the two by hand (#10466).
+    pub fn new(
+        outcome: PartialFlowOutcome,
+        detail: Option<String>,
+        ports: Vec<PartialFlowPort>,
+        flows: Vec<PartialFlow>,
+        open: bool,
+        relations_complete: bool,
+        discharged_gaps: Vec<SemanticGapId>,
+    ) -> Self {
+        Self {
+            outcome,
+            detail,
+            ports,
+            flows,
+            open,
+            relations_complete,
+            discharged_gaps,
+        }
+    }
+
+    /// Whether `flows` may be a strict subset of the procedure's flows: a
+    /// value-flow gap that is not discharged remains, or a relation is
+    /// unproven or missing (including a return-port member relation the
+    /// workspace guard dropped, #10466). Every reader that treats an absent
+    /// flow as evidence of no flow asks this question, so a new reason to
+    /// omit flows lands here once.
+    pub fn may_omit_flows(&self) -> bool {
+        self.open || !self.relations_complete
+    }
+
+    /// Some value-flow gap that is not discharged remains. This is the
+    /// `open` column and answers a different question from
+    /// [`Self::may_omit_flows`]: whether a gap needs refining by call
+    /// dispatch.
+    pub fn has_undischarged_gap(&self) -> bool {
+        self.open
+    }
+
+    /// Every present relation is proven and every live boundary member has a
+    /// representable port: the `relations_complete` column. It answers a
+    /// different question from [`Self::may_omit_flows`]: whether the relation
+    /// proofs and boundary ports hold, regardless of remaining gaps.
+    pub fn relations_proven(&self) -> bool {
+        self.relations_complete
+    }
+
+    /// This head after a projection of it failed with `detail`: its flows
+    /// are kept, but it is open and its relations are unproven.
+    pub fn with_failed_projection(mut self, detail: String) -> Self {
+        self.outcome = PartialFlowOutcome::Error;
+        self.detail = Some(detail);
+        self.open = true;
+        self.relations_complete = false;
+        self
+    }
+
     /// The head of a procedure whose relations were not projected. Its
     /// openness is unknown, so it is open.
     pub(crate) fn without_flows(outcome: PartialFlowOutcome) -> Self {
@@ -606,9 +672,15 @@ impl Carriers {
 #[derive(Debug, Clone, Copy)]
 struct RelationStep {
     event_index: u32,
+    kind: ValueFlowRelationKind,
     source: u32,
     target: u32,
+    strong_update: bool,
+    direct_cell_overwrite: bool,
     kill_target: bool,
+    /// The relation adds to its target instead of being a way the event
+    /// writes it (see `is_same_event_supplement`).
+    supplement: bool,
     invalidate_source: bool,
     uncertain: bool,
     /// The relation carries a captured source into a child's capture slot.
@@ -846,8 +918,6 @@ struct Fixpoint<'a, 'r, F> {
     traversal: SemanticExecutionBudget,
     filter: &'a mut F,
     semantics: &'a ProcedureSemantics,
-    /// Dense reverse-postorder rank for each program point.
-    point_ranks: Vec<usize>,
     /// The crossed calls of a seed: one path class that crossed nothing.
     start: Crossed,
     carriers: Carriers,
@@ -882,13 +952,84 @@ struct Fixpoint<'a, 'r, F> {
     edge_kills: HashMap<(ProgramPointId, ProgramPointId, ControlEdgeKind), Vec<u32>>,
     infeasible: Vec<bool>,
     in_states: Vec<Facts>,
+    worklist: Worklist,
+    taken_subtree_sizes: Vec<usize>,
+}
+
+/// The points of one fixpoint that still owe a transfer, and the seeds each
+/// must transfer.
+///
+/// Retained joins keep their reverse-postorder waves in a rank heap; taken
+/// trees drain eagerly from a stack, so the stack is empty whenever the heap
+/// pops. A point's dirty seeds accumulate until it is taken, whichever way
+/// it was reached.
+struct Worklist {
+    /// Dense reverse-postorder rank for each program point.
+    ranks: Vec<usize>,
     /// The seed keys whose facts changed in each point's entry state, or
     /// whose seeds the point has not applied yet, since it last transferred.
     dirty: Vec<Vec<u32>>,
+    /// Whether the point has a pending heap entry. Taking the point clears
+    /// it, so an entry the stack overtook is skipped when it pops.
     queued: Vec<bool>,
     heap: BinaryHeap<Reverse<(usize, usize)>>,
-    taken_subtree_sizes: Vec<usize>,
     stack: Vec<usize>,
+}
+
+impl Worklist {
+    fn new(ranks: Vec<usize>) -> Self {
+        let point_count = ranks.len();
+        Self {
+            ranks,
+            dirty: vec![Vec::new(); point_count],
+            queued: vec![false; point_count],
+            heap: BinaryHeap::new(),
+            stack: Vec::new(),
+        }
+    }
+
+    fn mark_dirty(&mut self, index: usize, seeds: impl IntoIterator<Item = u32>) {
+        self.dirty[index].extend(seeds);
+    }
+
+    /// Queue a retained point in the rank heap, once while it is pending.
+    fn schedule(&mut self, index: usize) {
+        if !self.queued[index] {
+            self.queued[index] = true;
+            self.heap.push(Reverse((self.ranks[index], index)));
+        }
+    }
+
+    /// Queue taken points to drain before the heap pops again; the last one
+    /// pushed is taken first.
+    fn push_taken(&mut self, indices: impl IntoIterator<Item = usize>) {
+        self.stack.extend(indices);
+    }
+
+    /// The next point to transfer, and whether it came from the taken stack.
+    fn next(&mut self) -> Option<(usize, bool)> {
+        if let Some(index) = self.stack.pop() {
+            return Some((index, true));
+        }
+        while let Some(Reverse((_, index))) = self.heap.pop() {
+            if self.queued[index] {
+                return Some((index, false));
+            }
+            #[cfg(feature = "test-support")]
+            record_fixpoint_test_metrics(|metrics| metrics.stale_heap_entries += 1);
+        }
+        None
+    }
+
+    /// Take a point for transfer: it is no longer pending, and its dirty
+    /// seeds, sorted and deduplicated, are returned.
+    fn take(&mut self, index: usize) -> Vec<u32> {
+        self.queued[index] = false;
+        let mut seeds = std::mem::take(&mut self.dirty[index]);
+        seeds.sort_unstable();
+        seeds.dedup();
+        seeds
+    }
 }
 
 /// Join one fact into a map. A fact already present keeps its derivation
@@ -1271,7 +1412,7 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
     /// Push the point's output along each feasible successor edge, minus the
     /// guard kills of that edge, and re-queue every successor whose entry
     /// state grew. Refuse before a fact visit would exceed a traversal ledger.
-    fn propagate(&mut self, point: ProgramPointId, out: &Facts) -> bool {
+    fn propagate(&mut self, point: ProgramPointId, out: &Facts) -> Result<(), BudgetRefusal> {
         let semantics = self.semantics;
         let call = invoked_call(semantics, point);
         let successors = semantics
@@ -1281,11 +1422,21 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
                 // replaces by its continuation edges; any other edge of the
                 // call's point stays an ordinary local edge there.
                 let crossed = call.filter(|call| is_call_scaffolding(edge, call));
-                (edge.target_point, edge.kind, crossed.map(|call| call.id))
+                let uncertain =
+                    !crate::analyzer::semantic::statement_entries::control_edge_proves_route(
+                        semantics,
+                        edge.evidence,
+                    );
+                (
+                    edge.target_point,
+                    edge.kind,
+                    crossed.map(|call| call.id),
+                    uncertain,
+                )
             })
             .collect::<Vec<_>>();
         let mut changed_taken = Vec::new();
-        for (target, kind, crossed_call) in successors {
+        for (target, kind, crossed_call, edge_uncertain) in successors {
             if self.infeasible[target.index()] {
                 continue;
             }
@@ -1298,11 +1449,8 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
             // Keep replaying every edge visit: widening can discard an
             // incoming class at the cap, so a later visit must join it again.
             for (&key, fact) in out {
-                if !self.request.charge_execution_traversal(1)
-                    || !self.traversal.charge_traversal(1)
-                {
-                    return false;
-                }
+                self.request.try_charge_execution_traversal(1)?;
+                self.traversal.try_charge_traversal(1)?;
                 if killed.is_some_and(|carriers| carriers.contains(&key.0)) {
                     continue;
                 }
@@ -1314,12 +1462,12 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
                 if join(
                     &mut self.in_states[target.index()],
                     key,
-                    fact.uncertain,
+                    fact.uncertain || edge_uncertain,
                     crossed,
                     || fact.witness.clone(),
                 ) {
                     changed = true;
-                    self.dirty[target.index()].push(key.1);
+                    self.worklist.mark_dirty(target.index(), [key.1]);
                 }
             }
             #[cfg(feature = "test-support")]
@@ -1336,11 +1484,7 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
             }
             if changed {
                 if self.retain_entry[target.index()] {
-                    if !self.queued[target.index()] {
-                        self.queued[target.index()] = true;
-                        self.heap
-                            .push(Reverse((self.point_ranks[target.index()], target.index())));
-                    }
+                    self.worklist.schedule(target.index());
                 } else {
                     // A taken point has one predecessor, but several edges
                     // from it can contribute facts with different edge kills.
@@ -1353,8 +1497,8 @@ impl<F: ObservationFilter> Fixpoint<'_, '_, F> {
         // Dense point IDs break size ties; neither hashes nor addresses choose order.
         changed_taken
             .sort_unstable_by_key(|&index| Reverse((self.taken_subtree_sizes[index], index)));
-        self.stack.extend(changed_taken);
-        true
+        self.worklist.push_taken(changed_taken);
+        Ok(())
     }
 }
 
@@ -1543,6 +1687,13 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         "a value-flow snapshot is computed for the procedure it describes"
     );
     let semantics = procedure.semantics();
+    // A use-site field spelling is a canonical member only when its field
+    // identity gap has been discharged. Otherwise even different anchors
+    // cannot certify that two member paths are disjoint.
+    let caller_field_identity_open = semantics.gaps().iter().any(|gap| {
+        gap.capability == crate::analyzer::semantic::SemanticCapability::FieldMemory
+            && !snapshot.gap_is_discharged(gap.id)
+    });
     let point_count = semantics.points().len();
     let traversal = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
     // Refuse before the uninterruptible CFG ordering and relation indexing.
@@ -1655,14 +1806,18 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         let target = carriers.intern(&relation.target);
         steps[relation.point.id().index()].push(RelationStep {
             event_index: relation.event_index,
+            kind: relation.kind,
             source,
             target,
+            strong_update: relation.strong_update,
+            direct_cell_overwrite: relation.direct_cell_overwrite,
             kill_target: kills_target(
                 relation.kind,
                 relation.source != relation.target,
                 relation.strong_update,
                 relation.direct_cell_overwrite,
             ),
+            supplement: is_same_event_supplement(relation.kind),
             invalidate_source: invalidates_source(relation.transfer),
             uncertain: !relation.is_proven_complete(),
             captures: relation.kind == ValueFlowRelationKind::Capture,
@@ -1677,7 +1832,33 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         });
     }
     for point_steps in &mut steps {
-        point_steps.sort_by_key(|step| (step.event_index, !step.before_call));
+        point_steps.sort_by_key(|step| (step.event_index, step.supplement, !step.before_call));
+        // The relations of one event that write one target are alternatives of
+        // one transfer: the group kills once or not at all.
+        for event in point_steps.chunk_by_mut(|left, right| left.event_index == right.event_index) {
+            debug_assert!(
+                event.is_sorted_by_key(|step| step.supplement),
+                "an event's supplements follow its alternatives"
+            );
+            let event_targets = event
+                .iter()
+                .map(|step| {
+                    same_event_rule(
+                        step.kind,
+                        step.source,
+                        step.target,
+                        step.strong_update,
+                        step.direct_cell_overwrite,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (step, joins) in event
+                .iter_mut()
+                .zip(joins_same_event_alternatives(&event_targets))
+            {
+                step.kill_target &= !joins;
+            }
+        }
     }
 
     // Seeds live before a point's events: `(point, seed, carrier, uncertain)`.
@@ -1814,10 +1995,40 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                         let direct_fields = callee_formal
                             .as_ref()
                             .map(|(callee, formal)| direct_formal_store_fields(callee, formal));
+                        let written_ports = callee_formal.as_ref().and_then(|(callee, _)| {
+                            let outcome = file_local_procedure_relations(
+                                callee,
+                                &OracleCallContext::empty(),
+                                request,
+                            );
+                            // This producer has no error channel. A failed projection
+                            // cannot certify absence of writes, so retain the open path.
+                            outcome
+                                .ok()
+                                .and_then(|outcome| written_heap_ports(&outcome))
+                        });
+                        // A member the callee provably never writes keeps its
+                        // pre-call value, so it gets no post-call seed.
+                        let unwritten = |selectors: &[HeapSelector], tail| {
+                            callee_formal
+                                .as_ref()
+                                .zip(written_ports.as_ref())
+                                .is_some_and(|((_, callee_port), written)| {
+                                    let output = PartialFlowPort::Heap {
+                                        root: Box::new(callee_port.clone()),
+                                        selectors: Box::from(selectors),
+                                        tail,
+                                    };
+                                    !caller_field_identity_open
+                                        && !written
+                                            .iter()
+                                            .any(|port| heap_ports_overlap(&output, port))
+                                })
+                        };
                         let written_member = |selectors: &[HeapSelector], tail| {
                             if tail == AccessPathTail::Exact
                                 && matches!(selectors, [HeapSelector::Field(field)]
-                                    if direct_fields.as_ref().is_some_and(|fields| fields.contains(field)))
+                                    if !caller_field_identity_open && direct_fields.as_ref().is_some_and(|fields| fields.iter().any(|written| canonical_field_member_matches(field, written))))
                             {
                                 CallWrittenMember::DirectField
                             } else {
@@ -1846,6 +2057,9 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                             .into_iter()
                             .flatten()
                         {
+                            if unwritten(selectors, *tail) {
+                                continue;
+                            }
                             let sharing = sharing_of(written_member(selectors, *tail));
                             if sharing == CallStorageSharing::Isolated {
                                 continue;
@@ -1948,6 +2162,9 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                                 continue;
                             }
                             let tail = location.path().tail();
+                            if unwritten(&selectors, tail) {
+                                continue;
+                            }
                             let sharing = sharing_of(written_member(&selectors, tail));
                             if sharing == CallStorageSharing::Isolated {
                                 continue;
@@ -2220,7 +2437,6 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         traversal,
         filter,
         semantics,
-        point_ranks,
         start: Crossed::start(semantics.call_sites().len().div_ceil(64)),
         carriers,
         ports,
@@ -2240,25 +2456,16 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         observation_only,
         infeasible,
         in_states: vec![Facts::new(); point_count],
-        dirty: vec![Vec::new(); point_count],
-        queued: vec![false; point_count],
-        heap: BinaryHeap::new(),
+        worklist: Worklist::new(point_ranks),
         taken_subtree_sizes,
-        stack: Vec::new(),
     };
     for (point, seed, carrier, uncertain) in before_seeds {
         if fixpoint.infeasible[point.index()] {
             continue;
         }
         fixpoint.before_seeds[point.index()].push((seed, carrier, uncertain));
-        fixpoint.dirty[point.index()].push(seed);
-        if !fixpoint.queued[point.index()] {
-            fixpoint.queued[point.index()] = true;
-            fixpoint.heap.push(Reverse((
-                fixpoint.point_ranks[point.index()],
-                point.index(),
-            )));
-        }
+        fixpoint.worklist.mark_dirty(point.index(), [seed]);
+        fixpoint.worklist.schedule(point.index());
     }
     // Continuation seeds join when their point is processed, and a point is
     // processed only when its entry state changes. A point that no fact
@@ -2269,89 +2476,62 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         }
         let seeds = fixpoint.continuation_seeds[index]
             .iter()
-            .map(|(seed, ..)| *seed)
-            .collect::<Vec<_>>();
-        fixpoint.dirty[index].extend(seeds);
-        if !fixpoint.queued[index] {
-            fixpoint.queued[index] = true;
-            fixpoint
-                .heap
-                .push(Reverse((fixpoint.point_ranks[index], index)));
-        }
+            .map(|(seed, ..)| *seed);
+        fixpoint.worklist.mark_dirty(index, seeds);
+        fixpoint.worklist.schedule(index);
     }
     // Retained joins keep their RPO waves; taken trees drain eagerly with
     // the smallest child first. A pending frontier holds at most
     // (fan-out - 1) * floor(log2(taken subtree size)) + 1 taken maps.
-    // the stack is empty whenever the heap pops; `queued` marks a pending heap entry, and stack processing clears it so the entry is skipped.
-    while let Some(Reverse((_, index))) = fixpoint.heap.pop() {
-        debug_assert!(fixpoint.stack.is_empty());
-        if !fixpoint.queued[index] {
-            #[cfg(feature = "test-support")]
-            record_fixpoint_test_metrics(|metrics| metrics.stale_heap_entries += 1);
-            continue;
-        }
-        let mut current = (index, false);
-        loop {
-            let (index, _from_stack) = current;
-            fixpoint.queued[index] = false;
-            let point = ProgramPointId::try_from_index(index).expect("a point index fits u32");
-            #[cfg(feature = "test-support")]
-            record_fixpoint_test_metrics(|metrics| {
-                metrics
-                    .transfers
-                    .push((point, fixpoint.in_states[index].len(), _from_stack));
-                if !fixpoint.retain_entry[index] && !fixpoint.in_states[index].is_empty() {
-                    metrics.pending_taken_maps -= 1;
-                }
+    // Propagation finishes every edge of a point, including parallel Normal
+    // and Exceptional edges, before a successor consumes its input.
+    while let Some((index, _from_stack)) = fixpoint.worklist.next() {
+        // Facts of different seeds never meet, so only the seeds whose
+        // entry facts changed since the last transfer can change the
+        // output; the other seeds' facts were already propagated. A
+        // taken entry holds only facts its predecessor just propagated.
+        // Transferring every seed on every visit made a loop with many
+        // post-call heap seeds quadratic (#9246). Re-joining an unchanged
+        // fact could only add classes that reduction had dropped as
+        // dominated to a widened union, so widened crossed sets may be
+        // smaller than with full replay; schedule and other facts agree.
+        let seeds = fixpoint.worklist.take(index);
+        let point = ProgramPointId::try_from_index(index).expect("a point index fits u32");
+        #[cfg(feature = "test-support")]
+        record_fixpoint_test_metrics(|metrics| {
+            metrics
+                .transfers
+                .push((point, fixpoint.in_states[index].len(), _from_stack));
+            if !fixpoint.retain_entry[index] && !fixpoint.in_states[index].is_empty() {
+                metrics.pending_taken_maps -= 1;
+            }
+        });
+        let live = if fixpoint.retain_entry[index] {
+            fixpoint.in_states[index]
+                .iter()
+                .filter(|((_, seed), _)| seeds.binary_search(seed).is_ok())
+                .map(|(&key, fact)| (key, fact.clone()))
+                .collect()
+        } else {
+            std::mem::take(&mut fixpoint.in_states[index])
+        };
+        debug_assert!(
+            live.keys()
+                .all(|(_, seed)| seeds.binary_search(seed).is_ok())
+        );
+        let out = fixpoint.transfer(point, live, &seeds)?;
+        if let Err(_refusal) = fixpoint.propagate(point, &out) {
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "partial_flows.fixpoint outcome=ExceededBudget facts_visited={} flows=0 procedure={:?}",
+                    fixpoint.traversal.work().traversal_steps,
+                    procedure.semantics().locator(),
+                )
             });
-            // Facts of different seeds never meet, so only the seeds whose
-            // entry facts changed since the last transfer can change the
-            // output; the other seeds' facts were already propagated. A
-            // taken entry holds only facts its predecessor just propagated.
-            // Transferring every seed on every visit made a loop with many
-            // post-call heap seeds quadratic (#9246). Re-joining an unchanged
-            // fact could only add classes that reduction had dropped as
-            // dominated to a widened union, so widened crossed sets may be
-            // smaller than with full replay; schedule and other facts agree.
-            let mut seeds = std::mem::take(&mut fixpoint.dirty[index]);
-            seeds.sort_unstable();
-            seeds.dedup();
-            let live = if fixpoint.retain_entry[index] {
-                fixpoint.in_states[index]
-                    .iter()
-                    .filter(|((_, seed), _)| seeds.binary_search(seed).is_ok())
-                    .map(|(&key, fact)| (key, fact.clone()))
-                    .collect()
-            } else {
-                std::mem::take(&mut fixpoint.in_states[index])
-            };
-            debug_assert!(
-                live.keys()
-                    .all(|(_, seed)| seeds.binary_search(seed).is_ok())
-            );
-            let out = fixpoint.transfer(point, live, &seeds)?;
-            if !fixpoint.propagate(point, &out) {
-                brokk_bifrost_core::profiling::note_with(|| {
-                    format!(
-                        "partial_flows.fixpoint outcome=ExceededBudget facts_visited={} flows=0 procedure={:?}",
-                        fixpoint.traversal.work().traversal_steps,
-                        procedure.semantics().locator(),
-                    )
-                });
-                return Ok(ExtendedPartialFlows {
-                    partial: ProcedurePartialFlows::without_flows(
-                        PartialFlowOutcome::ExceededBudget,
-                    ),
-                    flows: Vec::new(),
-                });
-            }
-            // Finish every edge of propagate before a successor consumes its
-            // input, including parallel Normal and Exceptional edges.
-            if let Some(index) = fixpoint.stack.pop() {
-                current = (index, true);
-            } else {
-                break;
-            }
+            return Ok(ExtendedPartialFlows {
+                partial: ProcedurePartialFlows::without_flows(PartialFlowOutcome::ExceededBudget),
+                flows: Vec::new(),
+            });
         }
     }
 
@@ -2550,6 +2730,9 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                         return_values.push((source, kind));
                     }
                     ValueFlowKind::Transfer(transfer) if !transfer.preserves_member_contents() => {}
+                    // The field value flows, but its storage and member contents
+                    // are not known to survive this binding.
+                    ValueFlowKind::OwnershipUnknown => {}
                     ValueFlowKind::IntegerOffset { .. } => {}
                     _ => value_sources.entry(target).or_default().push(source),
                 },
@@ -2589,7 +2772,10 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
                     }
                 }
                 SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local | ValueFlowKind::LanguageDefined,
+                    kind:
+                        ValueFlowKind::Local
+                        | ValueFlowKind::LanguageDefined
+                        | ValueFlowKind::ByValueCapture,
                     source,
                     target,
                 } => {
@@ -2778,6 +2964,7 @@ fn compute_partial_flows_filtered_impl<F: ObservationFilter, const RETAIN_ALL: b
         open,
         relations_complete: !indirect_formal_store
             && !post_call_storage_unknown
+            && !snapshot.relations_may_be_missing()
             && snapshot
                 .relations()
                 .iter()
@@ -3347,6 +3534,19 @@ pub fn parse_time_partial_flows(
     syntax: &PreparedSyntaxTree,
     cancellation: &CancellationToken,
 ) -> Option<Vec<ProcedurePartialFlows>> {
+    parse_time_partial_flows_with_limits(artifact, syntax, cancellation, OracleLimits::default())
+}
+
+/// [`parse_time_partial_flows`] under explicit oracle limits. Production uses
+/// the defaults; tests pass small limits to reach a real capacity truncation
+/// without a procedure of thousands of relations.
+#[doc(hidden)]
+pub fn parse_time_partial_flows_with_limits(
+    artifact: &Arc<SemanticArtifact>,
+    syntax: &PreparedSyntaxTree,
+    cancellation: &CancellationToken,
+    limits: OracleLimits,
+) -> Option<Vec<ProcedurePartialFlows>> {
     let host = FileLocalProjectionHost {
         syntax: Some(syntax),
     };
@@ -3361,7 +3561,7 @@ pub fn parse_time_partial_flows(
             &host,
             &handle,
             &context,
-            OracleLimits::default(),
+            limits,
             &mut SemanticRequest::new(&mut budget, cancellation),
         );
         let execution = SemanticExecutionBudget::for_fixpoint(MAX_PARTIAL_FLOW_FACT_VISITS);
@@ -3381,10 +3581,22 @@ pub fn parse_time_partial_flows(
             Ok(outcome) => match outcome.available_value() {
                 Some(snapshot) => {
                     let mut result = compute_partial_flows(&handle, snapshot, &mut request);
-                    if result.outcome != PartialFlowOutcome::ExceededBudget {
-                        result.outcome = PartialFlowOutcome::Complete;
-                        result.open = true;
-                        result.detail = Some(outcome.label().to_owned());
+                    match result.outcome {
+                        // A budget stop records no flows and no label.
+                        PartialFlowOutcome::ExceededBudget => {}
+                        // The snapshot's candidate set was cut by a constant
+                        // limit, so the relations are not all present. The head
+                        // stays Truncated, which readers re-project. A Truncated
+                        // head carries no text (the stored-head decoder rejects
+                        // it); the outcome names the cause.
+                        PartialFlowOutcome::Truncated => result.open = true,
+                        PartialFlowOutcome::Complete => {
+                            result.open = true;
+                            result.detail = Some(outcome.label().to_owned());
+                        }
+                        PartialFlowOutcome::Error => {
+                            unreachable!("a solved snapshot never yields an error head")
+                        }
                     }
                     result
                 }
@@ -3392,6 +3604,11 @@ pub fn parse_time_partial_flows(
             },
             Err(error) => ProcedurePartialFlows::failed(error.to_string()),
         });
+    }
+    // compute_partial_flows reports a cancellation as an ExceededBudget head,
+    // which is a different cause. A cancelled preparation holds no heads.
+    if cancellation.is_cancelled() {
+        return None;
     }
     brokk_bifrost_core::profiling::note_with(|| {
         let exceeded = artifact
@@ -3401,7 +3618,14 @@ pub fn parse_time_partial_flows(
             .filter(|(_, partial)| partial.outcome == PartialFlowOutcome::ExceededBudget)
             .map(|(procedure, _)| procedure.locator())
             .collect::<Vec<_>>();
-        format!("partial_flows.heads exceeded_budget={exceeded:?}")
+        let truncated = artifact
+            .procedures()
+            .iter()
+            .zip(&flows)
+            .filter(|(_, partial)| partial.outcome == PartialFlowOutcome::Truncated)
+            .map(|(procedure, _)| procedure.locator())
+            .collect::<Vec<_>>();
+        format!("partial_flows.heads exceeded_budget={exceeded:?} truncated={truncated:?}")
     });
     Some(flows)
 }

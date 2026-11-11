@@ -112,8 +112,16 @@ pub fn derive_jvm_summaries(
         error,
     })?;
     let project: Arc<dyn Project> = Arc::new(project);
-    let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-        .map_err(|error| FoundryError::Derivation {
+    // A one-shot derivation owns its retention budget.
+    let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
+        AnalyzerConfig::default().retention_budget_bytes(),
+    );
+    let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun_with_budget(
+        project,
+        AnalyzerConfig::default(),
+        &budget,
+    )
+    .map_err(|error| FoundryError::Derivation {
         detail: format!(
             "cannot build an analyzer over {}: {error}",
             sources.display()

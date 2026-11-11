@@ -347,7 +347,7 @@ fn external_predicate_refinement(
     atoms: &[&ClassIdentity],
 ) -> Option<CallGuardOutcome> {
     let overlay = workspace.analyzer().semantic_model_overlay()?;
-    let symbols = overlay.symbols_named(canonical);
+    let symbols = overlay.symbols_named_for(canonical, "python");
     if semantic_model_callable_family_id(&symbols.records).is_none()
         || symbols.records.iter().any(|symbol| {
             symbol.qualified_name != canonical
@@ -713,7 +713,7 @@ fn predicate_target_symbol<'target>(
     };
     let records = match id {
         Some(id) => overlay
-            .symbols_with_id(id)
+            .symbols_with_id_in_family(id, "python")
             .records
             .into_iter()
             .filter(|symbol| {
@@ -722,7 +722,7 @@ fn predicate_target_symbol<'target>(
             })
             .collect::<Vec<_>>(),
         None => overlay
-            .symbols_named(name?)
+            .symbols_named_in_family(name?, "python")
             .records
             .into_iter()
             .filter(|symbol| Some(symbol.qualified_name.as_str()) == name)

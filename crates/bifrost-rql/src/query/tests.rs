@@ -111,6 +111,42 @@ fn capture_anchor_step_round_trips_and_requires_a_declared_capture() {
 }
 
 #[test]
+fn identical_captures_round_trips_and_requires_both_positive_captures() {
+    let json_query = parse_ok(json!({
+        "languages": ["python"],
+        "match": {
+            "kind": "assignment",
+            "left": { "capture": "lhs" },
+            "right": { "capture": "rhs" }
+        },
+        "steps": [{ "op": "identical_captures", "left": "lhs", "right": "rhs" }]
+    }));
+    assert_eq!(
+        json_query.plan.steps,
+        vec![QueryStep::IdenticalCaptures {
+            left: "lhs".to_owned(),
+            right: "rhs".to_owned(),
+        }]
+    );
+    let rql_query = CodeQuery::from_sexp(
+        r#"(identical-captures :left "lhs" :right "rhs"
+             (language python (assignment :left (capture "lhs") :right (capture "rhs"))))"#,
+    )
+    .expect("identical capture RQL should lower");
+    assert_eq!(
+        rql_query.to_canonical_json(),
+        json_query.to_canonical_json()
+    );
+    let missing = error_of(json!({
+        "languages": ["python"],
+        "match": { "kind": "assignment", "left": { "capture": "lhs" } },
+        "steps": [{ "op": "identical_captures", "left": "lhs", "right": "rhs" }]
+    }));
+    assert_eq!(missing.path, "steps[0].right");
+    assert!(missing.message.contains("not declared"));
+}
+
+#[test]
 fn statement_fact_steps_and_language_rules_round_trip_across_json_and_rql() {
     let json_query = parse_ok(json!({
         "languages": ["csharp"],
@@ -745,6 +781,7 @@ fn parses_and_canonicalizes_reference_traversal_filters() {
         query.plan.steps[1],
         QueryStep::ReferencesOf(ReferenceTraversalFilter {
             reference_kinds: vec![ReferenceKind::FieldWrite, ReferenceKind::MethodCall],
+            enclosing: None,
             proof: Some(UsageProof::Proven),
             surface: UsageHitSurface::LspReferences,
         })
@@ -897,6 +934,7 @@ fn receiver_steps_parse_canonically_and_validate_capture_domains() {
         query.plan.steps[0],
         QueryStep::ReceiverTargets(ReceiverTraversalFilter {
             capture: Some("service".to_string()),
+            ..Default::default()
         })
     );
     assert_eq!(
@@ -932,6 +970,40 @@ fn receiver_steps_parse_canonically_and_validate_capture_domains() {
             "steps": steps
         }));
         assert_eq!(error.path, path);
+    }
+}
+
+#[test]
+fn member_targets_options_parse_from_json_and_rql_and_only_for_member_targets() {
+    let json_query = parse_ok(json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "member_targets", "member_form": ["field", "property"], "trivial_property": true }
+        ]
+    }));
+    assert_eq!(
+        json_query.plan.steps,
+        vec![QueryStep::MemberTargets(ReceiverTraversalFilter {
+            capture: None,
+            member_form: vec!["field", "property"],
+            trivial_property: Some(true),
+        })]
+    );
+    let rql = CodeQuery::from_sexp(
+        "(member-targets :member-form [field property] :trivial-property true (call))",
+    )
+    .expect("member-targets RQL options");
+    assert_eq!(rql.to_canonical_json(), json_query.to_canonical_json());
+
+    for step in [
+        json!({ "op": "member_targets", "member_form": [] }),
+        json!({ "op": "member_targets", "member_form": ["constructor"] }),
+        json!({ "op": "member_targets", "trivial_property": "yes" }),
+        json!({ "op": "receiver_targets", "member_form": ["field"] }),
+        json!({ "op": "points_to", "trivial_property": false }),
+    ] {
+        let error = error_of(json!({ "match": { "kind": "call" }, "steps": [step] }));
+        assert!(error.path.starts_with("steps[0]"), "{}", error.path);
     }
 }
 
@@ -3556,6 +3628,35 @@ fn canonical_json_round_trips() {
     );
     let reparsed = parse_ok(canonical.clone());
     assert_eq!(reparsed.to_canonical_json(), canonical);
+
+    let absence = json!({
+        "configuration_facts": {"formats": ["xml"]},
+        "steps": [{"op": "configuration_absence", "scope": "subtree",
+                   "xml_parent_keys": ["system.web"]}]
+    });
+    let canonical = parse_ok(absence).to_canonical_json();
+    assert_eq!(
+        canonical["steps"][0]["xml_parent_keys"],
+        json!(["system.web"])
+    );
+    assert_eq!(parse_ok(canonical.clone()).to_canonical_json(), canonical);
+    assert!(
+        canonical["configuration_facts"]
+            .get("value_regex")
+            .is_none()
+    );
+    assert!(canonical["steps"][0].get("value_regex").is_none());
+}
+
+#[test]
+fn configuration_value_regex_round_trips_and_rejects_invalid_pattern() {
+    let source = r#"(configuration-absence :scope subtree :value/regex "(?i)^\\s*true\\s*$" (configuration-facts :format xml :value/regex "^.*$"))"#;
+    let query = CodeQuery::from_sexp(source).expect("valid configuration regex");
+    let canonical = query.to_canonical_json();
+    assert_eq!(canonical["configuration_facts"]["value_regex"], "^.*$");
+    assert_eq!(canonical["steps"][0]["value_regex"], r"(?i)^\s*true\s*$");
+    assert_eq!(parse_ok(canonical.clone()).to_canonical_json(), canonical);
+    assert!(CodeQuery::from_sexp(r#"(configuration-facts :value/regex "[")"#).is_err());
 }
 
 #[test]
@@ -3939,6 +4040,59 @@ fn parses_arity_ranges_from_json_and_rql() {
             min: Some(1),
             max: None,
         })
+    );
+}
+
+#[test]
+fn count_forms_and_decoder_contract() {
+    for source in [
+        "(method :count [:parameters (parameter :modifier \"ref\") :min 3])",
+        "(method (count :parameters (parameter :modifier \"ref\") :max 2))",
+    ] {
+        let query = CodeQuery::from_sexp(source).expect(source);
+        let count = query
+            .seed()
+            .expect("seed")
+            .root
+            .count
+            .as_ref()
+            .expect("count");
+        assert_eq!(count.role.label(), "parameters");
+    }
+    let cases = [
+        (json!(3), "match.count"),
+        (
+            json!({"role":"name","pattern":{},"min":0}),
+            "match.count.role",
+        ),
+        (
+            json!({"role":"parameters","pattern":{},"min":-1}),
+            "match.count.min",
+        ),
+        (
+            json!({"role":"parameters","pattern":{},"min":1.5}),
+            "match.count.min",
+        ),
+        (
+            json!({"role":"parameters","pattern":{},"max":4294967296u64}),
+            "match.count.max",
+        ),
+        (json!({"role":"parameters","pattern":{}}), "match.count"),
+        (
+            json!({"role":"parameters","pattern":{},"min":3,"max":2}),
+            "match.count",
+        ),
+        (
+            json!({"role":"parameters","pattern":{},"min":0,"other":1}),
+            "match.count.other",
+        ),
+    ];
+    for (count, path) in cases {
+        let error = error_of(json!({"match":{"kind":"method","count":count}}));
+        assert_eq!(error.path, path, "{count}: {error}");
+    }
+    assert!(
+        CodeQuery::from_sexp("(method :count [:parameters (parameter) :min 1 :min 2])").is_err()
     );
 }
 
@@ -4419,4 +4573,85 @@ fn unsafe_context_call_property_round_trips_and_rejects_non_calls() {
         assert!(CodeQuery::from_sexp(&format!("({kind} :unsafe-context true)")).is_err());
     }
     assert!(CodeQuery::from_sexp("(call :unsafe-context 1)").is_err());
+}
+
+#[test]
+fn quantified_pattern_predicates_round_trip_and_omit_when_absent() {
+    let old = parse_ok(json!({
+        "languages": ["csharp"],
+        "match": { "kind": "assignment", "has": { "kind": "identifier" } }
+    }));
+    let old_json = old.to_canonical_json();
+    for field in ["each", "argument_mode"] {
+        assert!(old_json["match"].get(field).is_none());
+    }
+
+    let json_query = parse_ok(json!({
+        "languages": ["csharp"],
+        "match": {
+            "kind": "assignment",
+            "each": { "kind": "identifier", "argument_mode": ["ref", "out"], "capture": "arg" }
+        }
+    }));
+    let rql_query = CodeQuery::from_sexp(
+        r#"(language csharp (assignment (each (identifier (argument-mode ref out) (capture "arg")))))"#,
+    )
+    .expect("new predicates should lower");
+    assert_eq!(
+        json_query.to_canonical_json(),
+        rql_query.to_canonical_json()
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10229: an IR built directly could bind one label inside and outside each and pass validate_steps"
+)]
+fn validate_steps_rejects_a_label_shared_with_an_each() {
+    let mut query = parse_ok(json!({
+        "languages": ["python"],
+        "match": { "kind": "call", "each": { "kind": "identifier", "capture": "x" } }
+    }));
+    assert!(query.validate_steps().is_ok());
+    // An embedder edits the public IR: the root now binds the `each` label.
+    let CodeQueryPlanSource::Seed(seed) = &mut query.plan.source else {
+        panic!("a match query has a structural seed");
+    };
+    seed.root.capture = Some("x".to_owned());
+    let error = query
+        .validate_steps()
+        .expect_err("a label bound inside and outside each must not validate");
+    assert!(
+        error.message.contains("inside and outside an each"),
+        "{error:?}"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10229: guaranteed-label intersection leaked into plain patterns and rejected queries that load on master"
+)]
+fn only_each_restricts_its_exported_labels_to_guaranteed_ones() {
+    // Outside `each`, `any` still binds the union: this loaded before `each`.
+    parse_ok(json!({
+        "languages": ["python"],
+        "match": { "kind": "call", "any": [{ "capture": "x" }, { "kind": "call" }] },
+        "steps": [{ "op": "anchor", "capture": "x" }]
+    }));
+    // Inside `each`, a label only one alternative binds is not exported.
+    parse_ok(json!({
+        "languages": ["python"],
+        "match": { "kind": "call", "each": { "any": [{ "capture": "x" }, { "capture": "x", "kind": "call" }] } },
+        "steps": [{ "op": "anchor", "capture": "x" }]
+    }));
+    let unguaranteed = error_of(json!({
+        "languages": ["python"],
+        "match": { "kind": "call", "each": { "any": [{ "capture": "x" }, { "kind": "call" }] } },
+        "steps": [{ "op": "anchor", "capture": "x" }]
+    }));
+    assert_eq!(unguaranteed.path, "steps[0].capture");
+    assert!(
+        unguaranteed.message.contains("not declared"),
+        "{unguaranteed:?}"
+    );
 }

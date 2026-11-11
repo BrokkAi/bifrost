@@ -23,6 +23,7 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::analyzer::query_token::{QueryScope, QueryToken};
 
+use crate::analyzer::jvm::external::QueryGapRecorder;
 use crate::analyzer::jvm::external::{JvmExternalDeclarationSource, JvmExternalTypeKind};
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use brokk_bifrost_core::hash::HashSet;
@@ -526,11 +527,12 @@ fn external_route_resolution(
         );
     }
     let external = java.external_declarations(overlay);
+    let recorder = QueryGapRecorder::new(java);
     let fq_name = route.join(".");
-    let declared = external.get(&fq_name);
+    let declared = external.get(&recorder, &fq_name);
     if declared.is_none()
         && let Some(owner) =
-            (1..route.len()).find_map(|length| external.get(&route[..length].join(".")))
+            (1..route.len()).find_map(|length| external.get(&recorder, &route[..length].join(".")))
     {
         return JavaAnnotationTypeResolution::gap(
             Status::Incomplete,
@@ -564,6 +566,7 @@ fn external_route_resolution(
             JvmExternalDeclarationSource::SemanticPack {
                 pack_id,
                 declaration_id,
+                ..
             } => JavaAnnotationArtifact::SemanticPack {
                 pack_id: pack_id.clone(),
                 declaration_id: declaration_id.clone(),

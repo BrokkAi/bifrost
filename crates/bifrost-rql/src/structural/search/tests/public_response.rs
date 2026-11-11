@@ -135,9 +135,13 @@ impl CodeUnitIndex for MissingFactsAnalyzer {
 }
 
 impl IAnalyzer for MissingFactsAnalyzer {
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         Self {
-            inner: IAnalyzer::update(&self.inner, changed_files),
+            inner: IAnalyzer::update_with_listing(&self.inner, changed_files, listing),
             outcome: self.outcome,
         }
     }
@@ -186,6 +190,18 @@ impl crate::analyzer::structural::StructuralFactProvider for MissingFactsAnalyze
     }
     fn structural_supports_kind(&self, value: NormalizedKind) -> bool {
         self.inner.structural_fact_providers()[0].structural_supports_kind(value)
+    }
+
+    fn structural_emitted_kinds(&self) -> Vec<NormalizedKind> {
+        self.inner.structural_fact_providers()[0].structural_emitted_kinds()
+    }
+
+    fn structural_supports_declaration_modifiers(&self, kind: NormalizedKind) -> bool {
+        self.inner.structural_fact_providers()[0].structural_supports_declaration_modifiers(kind)
+    }
+
+    fn structural_supports_declaration_type_kind(&self, kind: NormalizedKind) -> bool {
+        self.inner.structural_fact_providers()[0].structural_supports_declaration_type_kind(kind)
     }
     fn structural_supports_role(&self, value: Role) -> bool {
         self.inner.structural_fact_providers()[0].structural_supports_role(value)

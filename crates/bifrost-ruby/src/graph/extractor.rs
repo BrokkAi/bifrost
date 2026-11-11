@@ -9,11 +9,10 @@ use crate::graph::resolver::{
     ReceiverMode, ReceiverType, RubyMethodLookupMode, RubySemanticIndex, RubyTargetKind,
     RubyTargetSpec, resolve_constant_reference, ruby_method_lookup_mode_matches,
 };
-use crate::graph::scope::{RubyScopeExit, exit_scope, ruby_type_body_declaration};
+use crate::graph::scope::{RubyScopeStack, ruby_type_body_declaration};
 use crate::graph::syntax::{
     constant_hit_node, dynamic_dispatch_target_argument, is_bare_method_reference_identifier,
-    is_dynamic_dispatch_method, method_receiver_mode, node_text, ruby_call_is_same_owner,
-    symbol_or_string_value,
+    is_dynamic_dispatch_method, node_text, ruby_call_is_same_owner, symbol_or_string_value,
 };
 use crate::syntax::ruby_parameter_binding_name_nodes;
 use brokk_bifrost_core::analyzer::memo_attribution::MemoAttribution;
@@ -48,10 +47,7 @@ impl<A: MemoAttribution> RubyFileScan<'_, A> {
         let mut state = RubyWalkState {
             scan: self,
             locals: LocalInferenceEngine::new(LocalInferenceConfig::default()),
-            lexical_stack: Vec::new(),
-            method_stack: Vec::new(),
-            receiver_context: Vec::new(),
-            exits: Vec::new(),
+            scope: RubyScopeStack::default(),
         };
         walk_tree_iterative(
             root,
@@ -65,47 +61,32 @@ impl<A: MemoAttribution> RubyFileScan<'_, A> {
 struct RubyWalkState<'a, 'b, A: MemoAttribution> {
     scan: &'a mut RubyFileScan<'b, A>,
     locals: LocalInferenceEngine<String>,
-    lexical_stack: Vec<String>,
-    method_stack: Vec<ReceiverMode>,
-    receiver_context: Vec<ReceiverMode>,
-    exits: Vec<RubyScopeExit>,
+    scope: RubyScopeStack<LocalInferenceEngine<String>>,
 }
 
 impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
         if let Some(declaration) = ruby_type_body_declaration(node) {
             let owner = self.type_owner(declaration);
-            if let Some(owner) = owner.as_ref() {
-                self.lexical_stack.push(owner.clone());
-            }
-            self.receiver_context.push(ReceiverMode::Instance);
-            self.exits.push(RubyScopeExit::Type {
-                has_lexical_owner: owner.is_some(),
-                locals: std::mem::take(&mut self.locals),
-            });
+            self.scope
+                .enter_type(owner, std::mem::take(&mut self.locals));
             return TreeWalkAction::DescendWithExit;
         }
         match node.kind() {
             "method" | "singleton_method" => {
                 let locals = std::mem::take(&mut self.locals);
                 self.seed_parameter_shadows(node);
-                self.method_stack.push(method_receiver_mode(
-                    node,
-                    self.receiver_context.last().copied(),
-                ));
-                self.exits.push(RubyScopeExit::Method { locals });
+                self.scope.enter_method(node, locals);
                 return TreeWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 let locals = std::mem::take(&mut self.locals);
-                self.method_stack.push(ReceiverMode::Class);
-                self.receiver_context.push(ReceiverMode::Class);
-                self.exits.push(RubyScopeExit::SingletonClass { locals });
+                self.scope.enter_singleton_class(locals);
                 return TreeWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
                 self.locals.enter_scope();
-                self.exits.push(RubyScopeExit::LocalScope);
+                self.scope.enter_block();
                 return TreeWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -116,13 +97,10 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
     }
 
     fn exit(&mut self) {
-        exit_scope(
-            self.exits.pop(),
-            &mut self.receiver_context,
-            &mut self.lexical_stack,
-            &mut self.method_stack,
-            &mut self.locals,
-        );
+        match self.scope.exit().into_saved() {
+            Some(enclosing) => self.locals = enclosing,
+            None => self.locals.exit_scope(),
+        }
     }
 
     fn type_owner(&self, node: Node<'_>) -> Option<String> {
@@ -130,7 +108,7 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             node,
             self.scan.source,
         )
@@ -151,9 +129,11 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
         if name != self.scan.spec.member_name || self.is_target_field_declaration_site(node) {
             return;
         }
-        let Some((owner, scope)) =
-            ruby_field_reference_owner_and_scope(&self.lexical_stack, &self.method_stack, node)
-        else {
+        let Some((owner, scope)) = ruby_field_reference_owner_and_scope(
+            self.scope.lexical(),
+            self.scope.method_mode(),
+            node,
+        ) else {
             return;
         };
         if self.field_reference_matches_target(&owner, scope) {
@@ -206,7 +186,7 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             node,
             self.scan.source,
         ) else {
@@ -260,8 +240,8 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
                 owner_fq_name: String::new(),
                 mode: ReceiverMode::TopLevel,
             });
-            if let Some(mode) = self.receiver_context.last() {
-                receiver.mode = *mode;
+            if let Some(mode) = self.scope.receiver_context() {
+                receiver.mode = mode;
             }
             self.record_bare_method_hit_for_receiver(&receiver, aliased_method, true);
             return;
@@ -373,16 +353,16 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             &self.locals,
-            &self.method_stack,
+            self.scope.method_mode(),
             node,
             self.scan.source,
         )
     }
 
     fn enclosing_receiver(&self) -> Option<ReceiverType> {
-        ruby_enclosing_receiver(&self.lexical_stack, &self.method_stack)
+        ruby_enclosing_receiver(self.scope.lexical(), self.scope.method_mode())
     }
 
     fn seed_assignment(&mut self, node: Node<'_>) {
@@ -390,8 +370,8 @@ impl<A: MemoAttribution> RubyWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
-            &self.method_stack,
+            self.scope.lexical(),
+            self.scope.method_mode(),
             &mut self.locals,
             node,
             self.scan.source,
@@ -490,7 +470,7 @@ pub fn ruby_receiver_type<A: MemoAttribution>(
     visible_files: &HashSet<ProjectFile>,
     lexical_stack: &[String],
     locals: &LocalInferenceEngine<String>,
-    method_stack: &[ReceiverMode],
+    method_mode: Option<ReceiverMode>,
     node: Node<'_>,
     source: &str,
 ) -> Option<ReceiverType> {
@@ -498,9 +478,31 @@ pub fn ruby_receiver_type<A: MemoAttribution>(
     let mut methods = Vec::new();
     while current.kind() == "call" {
         methods.push(node_text(current.child_by_field_name("method")?, source));
-        current = current.child_by_field_name("receiver")?;
+        match current.child_by_field_name("receiver") {
+            Some(receiver) => current = receiver,
+            // A call without a receiver (`new(path)`, `build(x).run`) is sent
+            // to the enclosing `self`, like a bare identifier call below.
+            None => {
+                let mut receiver = ruby_enclosing_receiver(lexical_stack, method_mode)?;
+                let innermost = methods.pop()?;
+                if innermost == "new" {
+                    if receiver.mode != ReceiverMode::Class {
+                        return None;
+                    }
+                    receiver.mode = ReceiverMode::Instance;
+                } else {
+                    receiver = ruby_method_return_receiver_type(
+                        semantic,
+                        visible_files,
+                        &receiver,
+                        innermost,
+                    )?;
+                }
+                return ruby_apply_receiver_methods(semantic, visible_files, receiver, methods);
+            }
+        }
     }
-    let mut receiver = match current.kind() {
+    let receiver = match current.kind() {
         "constant" | "scope_resolution" => {
             let unit =
                 semantic.resolve_constant(file, visible_files, lexical_stack, current, source)?;
@@ -520,13 +522,24 @@ pub fn ruby_receiver_type<A: MemoAttribution>(
                 // An unknown local is not an implicit-self method call.
                 None
             } else {
-                let enclosing = ruby_enclosing_receiver(lexical_stack, method_stack)?;
+                let enclosing = ruby_enclosing_receiver(lexical_stack, method_mode)?;
                 ruby_method_return_receiver_type(semantic, visible_files, &enclosing, name)
             }
         }
-        "self" => ruby_enclosing_receiver(lexical_stack, method_stack),
+        "self" => ruby_enclosing_receiver(lexical_stack, method_mode),
         _ => None,
     }?;
+    ruby_apply_receiver_methods(semantic, visible_files, receiver, methods)
+}
+
+/// Apply a call chain's methods, innermost last in `methods`, to the type of
+/// the chain's receiver.
+fn ruby_apply_receiver_methods<A: MemoAttribution>(
+    semantic: &RubySemanticIndex<'_, A>,
+    visible_files: &HashSet<ProjectFile>,
+    mut receiver: ReceiverType,
+    methods: Vec<&str>,
+) -> Option<ReceiverType> {
     for method in methods.into_iter().rev() {
         if method == "new" {
             if receiver.mode != ReceiverMode::Class {
@@ -894,7 +907,7 @@ fn ruby_lexical_stack_for_owner(owner_fq_name: &str) -> Vec<String> {
 
 pub fn ruby_enclosing_receiver(
     lexical_stack: &[String],
-    method_stack: &[ReceiverMode],
+    method_mode: Option<ReceiverMode>,
 ) -> Option<ReceiverType> {
     if lexical_stack.is_empty() {
         return Some(ReceiverType {
@@ -904,7 +917,7 @@ pub fn ruby_enclosing_receiver(
     }
 
     let owner_fq_name = lexical_stack.last()?.clone();
-    let mode = method_stack.last().copied().unwrap_or(ReceiverMode::Class);
+    let mode = method_mode.unwrap_or(ReceiverMode::Class);
     Some(ReceiverType {
         owner_fq_name,
         mode,
@@ -913,7 +926,7 @@ pub fn ruby_enclosing_receiver(
 
 pub fn ruby_field_reference_owner_and_scope(
     lexical_stack: &[String],
-    method_stack: &[ReceiverMode],
+    method_mode: Option<ReceiverMode>,
     node: Node<'_>,
 ) -> Option<(String, RubyFieldScope)> {
     match node.kind() {
@@ -923,7 +936,7 @@ pub fn ruby_field_reference_owner_and_scope(
             .map(|owner| (owner, RubyFieldScope::ClassVariable)),
         "instance_variable" => {
             let owner = lexical_stack.last()?.clone();
-            let scope = match method_stack.last().copied() {
+            let scope = match method_mode {
                 Some(ReceiverMode::Instance) => RubyFieldScope::Instance,
                 Some(ReceiverMode::Class | ReceiverMode::TopLevel) | None => {
                     RubyFieldScope::SingletonClass
@@ -941,7 +954,7 @@ pub fn ruby_seed_assignment<A: MemoAttribution>(
     file: &ProjectFile,
     visible_files: &HashSet<ProjectFile>,
     lexical_stack: &[String],
-    method_stack: &[ReceiverMode],
+    method_mode: Option<ReceiverMode>,
     locals: &mut LocalInferenceEngine<String>,
     node: Node<'_>,
     source: &str,
@@ -965,7 +978,7 @@ pub fn ruby_seed_assignment<A: MemoAttribution>(
                 visible_files,
                 lexical_stack,
                 locals,
-                method_stack,
+                method_mode,
                 right,
                 source,
             )

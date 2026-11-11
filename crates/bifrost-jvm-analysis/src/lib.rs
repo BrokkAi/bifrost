@@ -21,6 +21,10 @@ pub mod analyzer {
         JavaLocalAssignmentConversionProver, JavaLocalAssignmentEvidence,
         java_call_result_use_site, java_plain_string_literal, resolve_java_annotation_type,
     };
+    pub use jvm::dependency_evidence::{
+        JVM_TOOLCHAIN_ECOSYSTEM, MAVEN_ECOSYSTEM, MavenVersion, MavenVersionRange,
+        maven_dependency_version_matches,
+    };
     pub use jvm::external::{
         JdkVersion, JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies,
     };

@@ -624,7 +624,7 @@ pub mod operation_fixture_support {
     };
     use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
     use crate::analyzer::{Language, Project, ProjectFile, TestProject};
-    use brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent;
+    use brokk_bifrost_core::analyzer::project::{WorkspaceFileOmission, WorkspaceOverlayContent};
     use brokk_bifrost_core::analyzer::resolution_facts::{
         FileResolutionFacts, ResolutionIdentifierRole, ResolutionNamespace, ResolutionSiteId,
     };
@@ -718,7 +718,10 @@ pub mod operation_fixture_support {
         store: &'store AnalyzerStore,
         input: SelectedResolutionOperationInput<'project, 'selection>,
         cancellation: &CancellationToken,
-    ) -> SelectedResolutionOperation<'store, 'project> {
+    ) -> SelectedResolutionOperation<'store, 'project>
+    where
+        'store: 'project,
+    {
         match store
             .open_selected_resolution_operation(input, cancellation)
             .expect("open selected resolution test operation")
@@ -762,6 +765,11 @@ pub mod operation_fixture_support {
         delegate: TestProject,
         generation: Arc<AtomicU64>,
         overlay_content: Arc<Mutex<Option<Arc<WorkspaceOverlayContent>>>>,
+        /// The listing's omissions when a test sets them. Unset, the project
+        /// uses `TestProject`'s real enumeration.
+        omissions: Arc<Mutex<Option<Arc<Vec<WorkspaceFileOmission>>>>>,
+        /// Make the cached-omission lookup of a point update fail.
+        omissions_fail: Arc<std::sync::atomic::AtomicBool>,
     }
     impl MutableGenerationProject {
         #[doc(hidden)]
@@ -772,7 +780,36 @@ pub mod operation_fixture_support {
                     brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
                 generation: Arc::new(AtomicU64::new(0)),
                 overlay_content: Arc::new(Mutex::new(None)),
+                omissions: Arc::new(Mutex::new(None)),
+                omissions_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        /// Report `omissions` from the listing, as a project with a listing
+        /// cache does for both a whole listing and a point update.
+        #[doc(hidden)]
+        pub fn set_omissions(&self, omissions: Vec<WorkspaceFileOmission>) {
+            *self
+                .omissions
+                .lock()
+                .expect("operation test omissions lock") = Some(Arc::new(omissions));
+        }
+
+        /// Make `cached_omissions_if_available` return an I/O error.
+        #[doc(hidden)]
+        pub fn fail_cached_omissions(&self) {
+            self.omissions_fail
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Report no cached listing, as a project without a listing cache does
+        /// for a point update.
+        #[doc(hidden)]
+        pub fn clear_omissions(&self) {
+            *self
+                .omissions
+                .lock()
+                .expect("operation test omissions lock") = None;
         }
 
         #[doc(hidden)]
@@ -846,6 +883,41 @@ pub mod operation_fixture_support {
 
         fn analysis_generation(&self) -> u64 {
             self.generation.load(Ordering::SeqCst)
+        }
+
+        fn cached_omissions_if_available(
+            &self,
+        ) -> std::io::Result<Option<Arc<Vec<WorkspaceFileOmission>>>> {
+            let _project_read = self.project_reads.inventory(self.as_project());
+            if self
+                .omissions_fail
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("injected omission lookup failure"));
+            }
+            Ok(self
+                .omissions
+                .lock()
+                .expect("operation test omissions lock")
+                .clone())
+        }
+
+        fn all_files_with_omissions(
+            &self,
+        ) -> std::io::Result<brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>
+        {
+            let omissions = self
+                .omissions
+                .lock()
+                .expect("operation test omissions lock")
+                .clone();
+            match omissions {
+                Some(omissions) => Ok((self.all_files_shared()?, omissions)),
+                None => {
+                    let _project_read = self.project_reads.inventory(self.as_project());
+                    self.delegate.all_files_with_omissions()
+                }
+            }
         }
 
         fn overlay_content(&self) -> Option<Arc<WorkspaceOverlayContent>> {

@@ -292,6 +292,10 @@ pub struct ProjectIoCounts {
     pub walks: usize,
     pub rule_reads: usize,
     pub source_reads: usize,
+    /// Symlink omissions that an update rechecked against the filesystem.
+    pub symlink_rechecks: usize,
+    /// In-workspace symlinks that the changed-path index offered for a recheck.
+    pub symlink_candidates: usize,
     pub recording_io: usize,
 }
 #[cfg(any(test, feature = "test-support"))]
@@ -304,6 +308,8 @@ pub(crate) enum ProjectIo {
     Walk,
     Rule,
     Source,
+    SymlinkRecheck,
+    SymlinkCandidate,
 }
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn count_project_io(kind: ProjectIo) {
@@ -313,6 +319,8 @@ pub(crate) fn count_project_io(kind: ProjectIo) {
             ProjectIo::Walk => value.walks += 1,
             ProjectIo::Rule => value.rule_reads += 1,
             ProjectIo::Source => value.source_reads += 1,
+            ProjectIo::SymlinkRecheck => value.symlink_rechecks += 1,
+            ProjectIo::SymlinkCandidate => value.symlink_candidates += 1,
         }
         value.recording_io += usize::from(RECORDING.with(Cell::get));
         counts.set(value);
@@ -329,6 +337,8 @@ pub fn measure_project_io<T>(read: impl FnOnce() -> T) -> (T, ProjectIoCounts) {
             walks: after.walks - before.walks,
             rule_reads: after.rule_reads - before.rule_reads,
             source_reads: after.source_reads - before.source_reads,
+            symlink_rechecks: after.symlink_rechecks - before.symlink_rechecks,
+            symlink_candidates: after.symlink_candidates - before.symlink_candidates,
             recording_io: after.recording_io - before.recording_io,
         },
     )
@@ -347,8 +357,7 @@ pub trait ErasedReadAttribution: Send + Sync {
     fn replay(
         &self,
         receipts: &[OpaqueReadReceipt],
-        unattributed_reads: usize,
-        execution_dependences: usize,
+        channels: super::memo_attribution::ReadChannels,
     );
 }
 
@@ -375,8 +384,7 @@ impl OpaqueReadReceipt {
 
 pub struct ErasedCapturedReads {
     pub receipt: OpaqueReadReceipt,
-    pub unattributed_reads: usize,
-    pub execution_dependences: usize,
+    pub channels: super::memo_attribution::ReadChannels,
     pub first_refusal: Option<crate::profiling::ReadRefusal>,
     pub first_execution_refusal: Option<crate::profiling::ReadRefusal>,
     pub forwarded_to: Option<super::memo_attribution::CaptureIdentity>,
@@ -429,7 +437,7 @@ pub(crate) fn project_getter_in_progress() -> bool {
 /// the read depth starts at 1, so a getter on the worker is nested into a
 /// fresh receipt that is thrown away. For unrelated work it starts at 0, so
 /// the worker's getter is outermost and records as usual.
-pub(crate) fn with_project_read_suppression<T>(suppressed: bool, build: impl FnOnce() -> T) -> T {
+pub fn with_project_read_suppression<T>(suppressed: bool, build: impl FnOnce() -> T) -> T {
     struct Restore {
         depth: usize,
         suppression_depth: usize,
@@ -566,16 +574,16 @@ impl ProjectReadSlot {
         self.enter(Some(project), ProjectRead::Overlays)
     }
 
-    pub fn cached_inventory(
+    pub fn cached_inventory<T>(
         &self,
         root: &std::path::Path,
-        read: impl FnOnce() -> io::Result<Arc<std::collections::BTreeSet<ProjectFile>>>,
-    ) -> io::Result<Arc<std::collections::BTreeSet<ProjectFile>>> {
+        read: impl FnOnce() -> io::Result<(Arc<std::collections::BTreeSet<ProjectFile>>, T)>,
+    ) -> io::Result<(Arc<std::collections::BTreeSet<ProjectFile>>, T)> {
         let mut guard = self.enter(None, ProjectRead::Unattributed);
         let files = read();
         if guard.outermost {
             match &files {
-                Ok(files) => {
+                Ok((files, _)) => {
                     let source =
                         super::project::FilesystemProject::from_listing(root, Arc::clone(files));
                     self.record(&source, || ProjectRead::Inventory);
@@ -783,11 +791,7 @@ impl super::memo_attribution::MemoAttribution for ErasedMemoAttribution {
         let _refusal = crate::profiling::read_refusal_scope(reads.first_refusal.clone());
         let _execution_refusal =
             crate::profiling::read_execution_refusal_scope(reads.first_execution_refusal.clone());
-        self.0.0.replay(
-            &reads.keys,
-            reads.unattributed_reads,
-            reads.execution_dependences,
-        );
+        self.0.0.replay(&reads.keys, reads.channels);
     }
 }
 impl ErasedMemoAttribution {
@@ -811,9 +815,9 @@ impl ErasedMemoAttribution {
         (
             value.expect("capture invokes its builder"),
             super::memo_attribution::CapturedMemoReads {
+                runtime_cache_touched: false,
                 keys: Arc::from([reads.receipt]),
-                unattributed_reads: reads.unattributed_reads,
-                execution_dependences: reads.execution_dependences,
+                channels: reads.channels,
                 first_refusal: reads.first_refusal,
                 first_execution_refusal: reads.first_execution_refusal,
             },

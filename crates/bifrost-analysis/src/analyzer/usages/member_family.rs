@@ -33,6 +33,9 @@
 
 use std::collections::VecDeque;
 
+use brokk_bifrost_core::analyzer::capabilities::{
+    MemberFamilyParameterType, MemberFamilySupertypeArguments,
+};
 use brokk_bifrost_core::analyzer::model::CallableOverrideModifier;
 use brokk_bifrost_core::analyzer::structural::resolution::{
     DeclaredVisibility, MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason,
@@ -160,10 +163,10 @@ pub struct MemberFamilyEdge {
     /// Hierarchy hops between the two owners on the route that found this
     /// edge. Always at least one: a member never overrides its own sibling.
     pub depth: usize,
-    /// Whether the ancestor's candidate set singled the target out on
-    /// structure alone (one member of that name and arity), rather than
-    /// needing the weaker parameter-spelling discriminator.
-    pub arity_unique: bool,
+    /// Whether structure singled the target out -- it was the ancestor's only
+    /// member of that name and arity, or the only one whose resolved parameter
+    /// types agree -- rather than the weaker parameter-spelling discriminator.
+    pub structurally_unique: bool,
 }
 
 /// One member's family answer.
@@ -304,7 +307,7 @@ pub fn proven_member_family_answer(
             owner,
             relation: MethodFamilyRelation::Implements,
             depth: 1,
-            arity_unique: true,
+            structurally_unique: true,
         })
         .chain(
             implemented_by
@@ -314,7 +317,7 @@ pub fn proven_member_family_answer(
                     owner,
                     relation: MethodFamilyRelation::ImplementedBy,
                     depth: 1,
-                    arity_unique: true,
+                    structurally_unique: true,
                 }),
         )
         .collect();
@@ -552,9 +555,11 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
     let mut unread_ancestors = Vec::new();
     let mut hierarchy_incomplete = false;
     let mut hierarchy_ambiguous = false;
+    // Read once: every ancestor candidate is compared against these.
+    let member_types = walk.hierarchy.member_family_parameter_types(member);
     let mut seen = vec![owner.clone()];
-    let mut frontier = VecDeque::from([(owner.clone(), 0_usize)]);
-    while let Some((type_unit, depth)) = frontier.pop_front() {
+    let mut frontier = VecDeque::from([(owner.clone(), 0_usize, Substitution::Identity)]);
+    while let Some((type_unit, depth, substitution)) = frontier.pop_front() {
         hierarchy_incomplete |= !walk.query.direct_ancestors(&type_unit).is_complete();
         let ancestors = walk.query.member_family_ancestors(&type_unit);
         hierarchy_ambiguous |= !ancestors.ambiguous.is_empty();
@@ -579,8 +584,26 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
                 ));
             }
             seen.push(ancestor.clone());
-            match matching_member(walk.rules, walk.analyzer, &ancestor, &facts) {
-                AncestorMatch::None => frontier.push_back((ancestor, depth + 1)),
+            // Only a structurally read parameter list can name an owner type
+            // parameter, so only then is the supertype clause worth reading.
+            let ancestor_substitution =
+                if member_types.as_ref().is_some_and(|types| !types.is_empty()) {
+                    substitution.through(
+                        walk.hierarchy
+                            .member_family_supertype_arguments(&type_unit, &ancestor),
+                    )
+                } else {
+                    Substitution::Unknown
+                };
+            let candidate = ParameterEvidence {
+                hierarchy: walk.hierarchy,
+                member_types: member_types.as_deref(),
+                substitution: &ancestor_substitution,
+            };
+            match matching_member(walk.rules, walk.analyzer, &ancestor, &facts, &candidate) {
+                AncestorMatch::None => {
+                    frontier.push_back((ancestor, depth + 1, ancestor_substitution))
+                }
                 AncestorMatch::Unproven(reason) => {
                     return ForwardStep::Answer(MemberFamilyAnswer::incomplete_with_edges(
                         capability,
@@ -592,13 +615,13 @@ fn forward_edges(walk: &mut FamilyWalk<'_>, member: &CodeUnit) -> ForwardStep {
                 AncestorMatch::One {
                     target,
                     relation,
-                    arity_unique,
+                    structurally_unique,
                 } => edges.push(MemberFamilyEdge {
                     target,
                     owner: ancestor,
                     relation,
                     depth: depth + 1,
-                    arity_unique,
+                    structurally_unique,
                 }),
             }
         }
@@ -799,7 +822,7 @@ fn inverse_edges(
                         owner: descendant.clone(),
                         relation: edge.relation.inverse(),
                         depth: edge.depth,
-                        arity_unique: edge.arity_unique,
+                        structurally_unique: edge.structurally_unique,
                     });
                 }
                 if let Some(reason) = stopped
@@ -1285,7 +1308,7 @@ enum AncestorMatch {
     One {
         target: CodeUnit,
         relation: MethodFamilyRelation,
-        arity_unique: bool,
+        structurally_unique: bool,
     },
     Unproven(MemberFamilyReason),
 }
@@ -1297,16 +1320,22 @@ enum AncestorMatch {
 /// inheritable (not a constructor, not static, not private), and the same
 /// recorded [`CallableArity`]. The language's own rule then decides which of
 /// those survive -- for C#, that the redeclaration opted in with `override`.
-/// If exactly one survives, the edge is proven on structure alone. If more
-/// than one does -- a genuine overload set at the same arity -- the recorded
-/// parameter-type spellings are used as a discriminator, and anything other
-/// than exactly one match is reported as
-/// [`MemberFamilyReason::OverloadIdentityUnproven`] rather than guessed.
+///
+/// Arity is not a signature, so every survivor is then compared parameter by
+/// parameter (JLS 8.4.2: same types after substituting the route's type
+/// arguments and erasing). A candidate whose parameters differ is a sibling
+/// overload, not the redefined member, and drops out; the walk then continues
+/// past this ancestor as if it declared nothing (#9900). Exactly one agreeing
+/// candidate is the edge. With none agreeing, a sole candidate the evidence
+/// cannot decide (an unresolved type, an unknown substitution) is an edge that
+/// is not structurally unique, so it renders `unproven`; several are
+/// [`MemberFamilyReason::OverloadIdentityUnproven`], never a guess.
 fn matching_member(
     rules: &dyn NominalFamilyRules,
     analyzer: &dyn IAnalyzer,
     ancestor: &CodeUnit,
     facts: &MemberFacts,
+    evidence: &ParameterEvidence<'_>,
 ) -> AncestorMatch {
     let Some(relation) = rules.relation(analyzer, ancestor) else {
         return AncestorMatch::Unproven(MemberFamilyReason::OwnerKindUnrecorded);
@@ -1333,29 +1362,216 @@ fn matching_member(
             Admission::Unproven(reason) => return AncestorMatch::Unproven(reason),
         }
     }
-    if candidates.is_empty() {
-        return AncestorMatch::None;
+    let arity_unique = candidates.len() == 1;
+    let mut agreeing = Vec::new();
+    let mut undecided = Vec::new();
+    for (candidate, candidate_facts) in candidates {
+        match evidence.agreement(facts, &candidate, &candidate_facts) {
+            Agreement::Same => agreeing.push((candidate, true)),
+            Agreement::SameSpelling => agreeing.push((candidate, arity_unique)),
+            Agreement::Different => {}
+            Agreement::Unknown => undecided.push((candidate, false)),
+        }
     }
-    if candidates.len() == 1 {
-        return AncestorMatch::One {
-            target: candidates.remove(0).0,
-            relation,
-            arity_unique: true,
+    // The one candidate nothing refutes is a possible edge, as strong as a
+    // spelling pick: dropping it would hide a real implementor from dispatch.
+    if agreeing.is_empty() && undecided.len() == 1 {
+        agreeing = undecided;
+    }
+    let (target, structurally_unique) = match agreeing.len() {
+        0 => return AncestorMatch::None,
+        1 => agreeing.remove(0),
+        _ => return AncestorMatch::Unproven(MemberFamilyReason::OverloadIdentityUnproven),
+    };
+    AncestorMatch::One {
+        target,
+        relation,
+        structurally_unique,
+    }
+}
+
+/// How the walked member's owner sees one ancestor's type parameters, along
+/// the route the breadth-first walk took to that ancestor.
+#[derive(Debug, Clone)]
+enum Substitution {
+    /// The owner itself: its type parameters stand for themselves.
+    Identity,
+    /// Reached through a raw supertype, so every member is erased (JLS 4.8).
+    Raw,
+    /// The ancestor's type parameters, by index, in the owner's scope.
+    Arguments(Vec<MemberFamilyParameterType>),
+    Unknown,
+}
+
+impl Substitution {
+    /// The substitution for a direct supertype that `self`'s type names with
+    /// `arguments`, which are written in that type's scope.
+    fn through(&self, arguments: MemberFamilySupertypeArguments) -> Self {
+        match (self, arguments) {
+            (Self::Raw, _) | (_, MemberFamilySupertypeArguments::Raw) => Self::Raw,
+            (Self::Unknown, _) | (_, MemberFamilySupertypeArguments::Unknown) => Self::Unknown,
+            (_, MemberFamilySupertypeArguments::Arguments(arguments)) => arguments
+                .iter()
+                .map(|argument| self.apply(argument))
+                .collect::<Option<Vec<_>>>()
+                .map_or(Self::Unknown, Self::Arguments),
+        }
+    }
+
+    /// `ty`, written in the scope this substitution maps from, in the owner's
+    /// scope. `None` when the route's arguments are unknown.
+    fn apply(&self, ty: &MemberFamilyParameterType) -> Option<MemberFamilyParameterType> {
+        Some(match ty {
+            MemberFamilyParameterType::OwnerTypeParameter { index, erasure } => match self {
+                Self::Identity => ty.clone(),
+                Self::Raw => (**erasure).clone(),
+                Self::Arguments(arguments) => arguments.get(*index)?.clone(),
+                Self::Unknown => return None,
+            },
+            MemberFamilyParameterType::Array(element) => {
+                MemberFamilyParameterType::Array(Box::new(self.apply(element)?))
+            }
+            _ => ty.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Agreement {
+    Same,
+    /// Equal recorded spellings, without structured types to compare.
+    SameSpelling,
+    Different,
+    Unknown,
+}
+
+/// Whether two parameter types, both already in the owner's scope, are the
+/// same type after erasure.
+fn erased_agreement(
+    member: &MemberFamilyParameterType,
+    ancestor: &MemberFamilyParameterType,
+) -> Agreement {
+    fn erased(ty: &MemberFamilyParameterType) -> &MemberFamilyParameterType {
+        match ty {
+            MemberFamilyParameterType::OwnerTypeParameter { erasure, .. } => {
+                debug_assert!(
+                    !matches!(
+                        **erasure,
+                        MemberFamilyParameterType::OwnerTypeParameter { .. }
+                    ),
+                    "a bound's erasure is never itself a type variable: {erasure:?}"
+                );
+                erasure
+            }
+            _ => ty,
+        }
+    }
+    let (mut member, mut ancestor) = (erased(member), erased(ancestor));
+    loop {
+        return match (member, ancestor) {
+            // A type the language could not read at all decides nothing.
+            (MemberFamilyParameterType::Unresolved(candidates), _)
+            | (_, MemberFamilyParameterType::Unresolved(candidates))
+                if candidates.is_empty() =>
+            {
+                Agreement::Unknown
+            }
+            (MemberFamilyParameterType::Array(left), MemberFamilyParameterType::Array(right)) => {
+                (member, ancestor) = (erased(left), erased(right));
+                continue;
+            }
+            (
+                MemberFamilyParameterType::Primitive(left),
+                MemberFamilyParameterType::Primitive(right),
+            )
+            | (
+                MemberFamilyParameterType::Nominal(left),
+                MemberFamilyParameterType::Nominal(right),
+            ) => {
+                if left == right {
+                    Agreement::Same
+                } else {
+                    Agreement::Different
+                }
+            }
+            (
+                MemberFamilyParameterType::Unresolved(left),
+                MemberFamilyParameterType::Unresolved(right),
+            ) if left == right => Agreement::Same,
+            // An unresolved type is one of its candidates, so two whose
+            // candidates are disjoint differ: `String` and `Long` with no
+            // indexed JDK. Overlapping candidates decide nothing.
+            (
+                MemberFamilyParameterType::Unresolved(left),
+                MemberFamilyParameterType::Unresolved(right),
+            ) => {
+                if left.iter().any(|candidate| right.contains(candidate)) {
+                    Agreement::Unknown
+                } else {
+                    Agreement::Different
+                }
+            }
+            (
+                MemberFamilyParameterType::Unresolved(candidates),
+                MemberFamilyParameterType::Nominal(name),
+            )
+            | (
+                MemberFamilyParameterType::Nominal(name),
+                MemberFamilyParameterType::Unresolved(candidates),
+            ) => {
+                if candidates.contains(name) {
+                    Agreement::Unknown
+                } else {
+                    Agreement::Different
+                }
+            }
+            _ => Agreement::Different,
         };
     }
-    let Some(parameter_types) = facts.parameter_types.as_deref() else {
-        return AncestorMatch::Unproven(MemberFamilyReason::OverloadIdentityUnproven);
-    };
-    let mut by_spelling = candidates.into_iter().filter(|(_, candidate_facts)| {
-        candidate_facts.parameter_types.as_deref() == Some(parameter_types)
-    });
-    match (by_spelling.next(), by_spelling.next()) {
-        (Some((target, _)), None) => AncestorMatch::One {
-            target,
-            relation,
-            arity_unique: false,
-        },
-        _ => AncestorMatch::Unproven(MemberFamilyReason::OverloadIdentityUnproven),
+}
+
+/// The parameter evidence one ancestor's candidates are compared against.
+struct ParameterEvidence<'a> {
+    hierarchy: &'a dyn TypeHierarchyProvider,
+    member_types: Option<&'a [MemberFamilyParameterType]>,
+    substitution: &'a Substitution,
+}
+
+impl ParameterEvidence<'_> {
+    fn agreement(
+        &self,
+        facts: &MemberFacts,
+        candidate: &CodeUnit,
+        candidate_facts: &MemberFacts,
+    ) -> Agreement {
+        if let Some(member_types) = self.member_types
+            && let Some(candidate_types) = self.hierarchy.member_family_parameter_types(candidate)
+        {
+            if member_types.len() != candidate_types.len() {
+                return Agreement::Unknown;
+            }
+            let mut result = Agreement::Same;
+            for (member_type, candidate_type) in member_types.iter().zip(&candidate_types) {
+                let agreement = match self.substitution.apply(candidate_type) {
+                    Some(candidate_type) => erased_agreement(member_type, &candidate_type),
+                    None => Agreement::Unknown,
+                };
+                match agreement {
+                    Agreement::Different => return Agreement::Different,
+                    Agreement::Unknown => result = Agreement::Unknown,
+                    Agreement::Same | Agreement::SameSpelling => {}
+                }
+            }
+            return result;
+        }
+        // A language without structured parameter types: equal spellings
+        // confirm the override, and anything else stays undecided, because a
+        // spelling is not resolved (`Int` and `scala.Int`) and not substituted
+        // (`T` in a generic supertype).
+        match (&facts.parameter_types, &candidate_facts.parameter_types) {
+            (Some(left), Some(right)) if left == right => Agreement::SameSpelling,
+            _ => Agreement::Unknown,
+        }
     }
 }
 

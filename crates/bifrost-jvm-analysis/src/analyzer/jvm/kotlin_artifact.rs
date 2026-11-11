@@ -521,6 +521,8 @@ fn entry_facts(
             signature_limit_hit,
         );
         types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -766,6 +768,8 @@ fn entry_facts(
 
 fn package_fact(entry: &str, name: &str) -> TypeFact {
     TypeFact {
+        alias_target: None,
+        tuple_fields: None,
         implemented_traits_complete: false,
         generic_trait_impls_complete: false,
         jvm_inventory: None,
@@ -2121,6 +2125,7 @@ private fun hidden(): Unit = Unit
             "2.2.0",
             vec!["jvm".to_owned()],
             Provenance {
+                rust_artifact_approximation: None,
                 source: "test".to_owned(),
                 revision: Some("2.2.0".to_owned()),
             },

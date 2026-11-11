@@ -187,7 +187,12 @@ invariants appear at the client boundary.
 
 The policy coordinator evaluates the requested policies against a workspace
 and, for `--diff-base`, a base revision. It applies the diff join, suppressions,
-scope, and reporting after evaluation. Reuse must produce the same canonical
+inline comment directives, scope, the baseline, and reporting after
+evaluation, in that order of precedence, so a finding carries the most
+specific decision that accepted it. Inline directives are read from the
+analyzer's comment facts only in files that hold an unclaimed finding, so
+their cost follows the findings and the directive prefix is a report-time
+input that no cached product depends on. Reuse must produce the same canonical
 report and exit status as a fresh full evaluation. Execution timings, reuse
 measurements, and work counters describe the run and are excluded from that
 comparison; finding identities, ordering, evidence, diagnostics, completeness,
@@ -224,18 +229,23 @@ Only exhaustive, diagnostic-free units with complete dependency evidence may
 replace full execution. The coordinator checks cumulative budgets after
 merging. A failed proof widens the query to full execution.
 
-### Ordered union composition
+### Set composition within seed files
 
-A full union visits branches in authored order and rows within each branch in
-that branch's execution order. A repeated row key keeps its first value and
-appends later provenance traces, retaining the first sixteen traces and the
-truncation indication. These rules are observable in policy evidence and in
-relational assertions that choose a representative row.
+A full set expression visits branches in authored order. An eligible seed
+partition executes that same expression within each file, preserving the
+representative of a repeated key and its evidence. The first value
+for a repeated key is retained, and later provenance traces are appended up to
+the sixteen-trace bound with a truncation indication. These per-key semantics
+are observable in policy evidence and relational assertions.
 
-Branch order cannot be exchanged with seed-file order. In particular,
-deduplicating all branches inside each file and then concatenating files can
-choose a different first writer. Sorting the final findings cannot repair that
-lost evidence.
+Across files, result order is not a contract. Seed enumeration is deterministic
+for fresh and incremental execution. An except with a union minuend may be
+partitioned only when every intermediate key, the set-difference key and the unit merge key
+identify the producing file; then two files cannot choose different first
+writers for the same key. A reached cumulative cap widens to full execution.
+An intersect anywhere in a newly admitted union-minuend except tree, including
+a subtrahend, stays whole: a complete empty operand can skip later work in one
+seed even though the whole execution evaluates it.
 
 Sliceable union trees therefore retain each leaf branch's contribution in each
 file unit until the global merge. Each row carries its authored branch path in

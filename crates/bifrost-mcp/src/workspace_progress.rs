@@ -17,12 +17,23 @@ pub(crate) struct BuildCounter {
     total: Option<usize>,
 }
 
+/// The wire `status` of a build snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BuildStatus {
+    Running,
+    Completed,
+    /// The observation was dropped without `complete`: the build returned an
+    /// error or panicked.
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct BuildSnapshot {
     pub generation: u64,
     pub workspace_generation: u64,
     pub revision: u64,
-    pub status: &'static str,
+    pub status: BuildStatus,
     pub counters: Vec<BuildCounter>,
     // One real intermediate observation per language/phase survives a build
     // faster than the polling interval. This is bounded, not an event history.
@@ -40,7 +51,7 @@ impl WorkspaceBuildProgress {
             generation,
             workspace_generation,
             revision: 1,
-            status: "running",
+            status: BuildStatus::Running,
             counters: Vec::new(),
             intermediate: Vec::new(),
         });
@@ -89,10 +100,9 @@ impl BuildObservation {
                 total: (event.total != 0).then_some(event.total),
             };
             let mut state = progress.0.lock().expect("workspace progress lock poisoned");
-            let Some(state) = state
-                .as_mut()
-                .filter(|state| state.generation == generation && state.status == "running")
-            else {
+            let Some(state) = state.as_mut().filter(|state| {
+                state.generation == generation && state.status == BuildStatus::Running
+            }) else {
                 return;
             };
             if counter.completed > 0
@@ -124,10 +134,10 @@ impl BuildObservation {
     }
 
     pub fn complete(mut self) {
-        self.finish("completed");
+        self.finish(BuildStatus::Completed);
     }
 
-    fn finish(&mut self, status: &'static str) {
+    fn finish(&mut self, status: BuildStatus) {
         if let Some(state) = self
             .progress
             .0
@@ -146,7 +156,7 @@ impl BuildObservation {
 impl Drop for BuildObservation {
     fn drop(&mut self) {
         if !self.finished {
-            self.finish("failed");
+            self.finish(BuildStatus::Failed);
         }
     }
 }
@@ -192,7 +202,7 @@ mod tests {
         assert!(progress.snapshot(1).is_none());
         assert!(progress.snapshot(2).unwrap().counters.is_empty());
         drop(new);
-        assert_eq!(progress.snapshot(2).unwrap().status, "failed");
+        assert_eq!(progress.snapshot(2).unwrap().status, BuildStatus::Failed);
     }
 
     #[test]

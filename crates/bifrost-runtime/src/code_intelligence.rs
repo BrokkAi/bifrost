@@ -153,6 +153,7 @@ impl<'a> CodeIntelligenceRuntime<'a> {
         root: &Path,
         policy_inputs: &[PolicyEvaluationInput],
         options: &PolicyEvaluationOptions,
+        retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
         evaluate_policy_inputs_for_host_session(
             root,
@@ -160,6 +161,7 @@ impl<'a> CodeIntelligenceRuntime<'a> {
             self.workspace,
             options,
             self.cancellation,
+            retention_budget,
         )
     }
 
@@ -171,6 +173,7 @@ impl<'a> CodeIntelligenceRuntime<'a> {
         policy_inputs: &[PolicyEvaluationInput],
         options: &PolicyEvaluationOptions,
         suppression_preflight: PolicySuppressionPreflight,
+        retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
         evaluate_policy_inputs_for_host_session_with_suppression_preflight(
             root,
@@ -179,6 +182,7 @@ impl<'a> CodeIntelligenceRuntime<'a> {
             options,
             suppression_preflight,
             self.cancellation,
+            retention_budget,
         )
     }
 
@@ -189,11 +193,13 @@ impl<'a> CodeIntelligenceRuntime<'a> {
         source_identity: PolicySourceIdentity,
         source: &str,
         options: &PolicyEvaluationOptions,
+        retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
         self.evaluate_policy_inputs(
             root,
             &[PolicyEvaluationInput::embedded(source_identity, source)],
             options,
+            retention_budget,
         )
     }
 }

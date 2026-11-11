@@ -28,7 +28,7 @@ use brokk_bifrost_core::analyzer::model::Range;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
-use brokk_bifrost_core::analyzer::model::StructuredTypeNodeView;
+use brokk_bifrost_core::analyzer::model::{StructuredTypeIdentity, StructuredTypeNodeView};
 use brokk_bifrost_core::analyzer::structural::native_obligation::{
     NativeResultObligation, NativeResultObligationBasis,
 };
@@ -119,34 +119,67 @@ pub fn go_native_error_result_obligation(
 /// value flow has a known indexed result type but no declaration dispatch arm.
 /// The callee expression is resolved through the structured Go definition
 /// resolver; unresolved values and modeled-only values abstain.
-pub fn go_native_error_function_value_obligation(
+/// The outer `None` means the application result inventory is unavailable.
+/// An empty vector proves zero results; an inner `None` leaves that port open.
+/// This reads the applied value's explicit type, never a callee body signature.
+pub fn go_native_error_function_value_obligations(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     range: Range,
-    result_ordinal: u32,
     cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-) -> Option<NativeResultObligation> {
-    let identity =
-        crate::analyzer::usages::get_definition::go::go_function_value_result_type_identity(
+) -> Option<Vec<Option<NativeResultObligation>>> {
+    let identities =
+        crate::analyzer::usages::get_definition::go::go_function_value_result_type_identities(
             analyzer,
             file,
             range,
-            usize::try_from(result_ordinal).ok()?,
             cancellation,
         )?;
-    let Some(StructuredTypeNodeView::Named(name)) = identity.view(identity.root_id()) else {
-        return None;
-    };
-    if name.is_absolute()
-        || !name.lexical_scope().is_empty()
-        || name.path() != [String::from("error")]
-    {
-        return None;
-    }
-    Some(NativeResultObligation::fallible_status(
-        result_ordinal,
-        NativeResultObligationBasis::StaticSignature,
-    ))
+    go_native_error_application_obligations(identities)
+}
+
+pub fn go_native_error_bound_function_value_obligations(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    exact_source: &str,
+    range: Range,
+    binding: &brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalDefinition,
+    callable_range: Range,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> Option<Vec<Option<NativeResultObligation>>> {
+    let identities = crate::analyzer::usages::get_definition::go::go_bound_function_value_result_type_identities(
+        analyzer, file, exact_source, range, binding, callable_range, cancellation,
+    )?;
+    go_native_error_application_obligations(identities)
+}
+
+fn go_native_error_application_obligations(
+    identities: Vec<Option<StructuredTypeIdentity>>,
+) -> Option<Vec<Option<NativeResultObligation>>> {
+    identities
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, identity)| {
+            let Some(identity) = identity else {
+                return Some(None);
+            };
+            let Some(StructuredTypeNodeView::Named(name)) = identity.view(identity.root_id())
+            else {
+                return Some(None);
+            };
+            let proved = !name.is_absolute()
+                && name.lexical_scope().is_empty()
+                && name.path() == [String::from("error")];
+            if proved {
+                Some(Some(NativeResultObligation::fallible_status(
+                    u32::try_from(ordinal).ok()?,
+                    NativeResultObligationBasis::StaticSignature,
+                )))
+            } else {
+                Some(None)
+            }
+        })
+        .collect::<Option<Vec<_>>>()
 }
 
 /// Return the reviewed standard-library identities whose Go documentation
@@ -210,31 +243,66 @@ fn go_target_declaration_node<'tree>(root: Node<'tree>, ranges: Vec<Range>) -> O
 }
 
 pub(crate) fn go_result_type_node(declaration: Node<'_>, ordinal: usize) -> Option<Node<'_>> {
-    let result = declaration.child_by_field_name("result")?;
-    if result.kind() != "parameter_list" {
-        return (ordinal == 0).then_some(result);
+    go_result_type_nodes(declaration)?.get(ordinal).copied()
+}
+
+/// Complete result inventory, including grouped names and unsupported types.
+/// Missing result syntax is an affirmative zero; malformed syntax abstains.
+pub(crate) fn go_result_type_nodes(declaration: Node<'_>) -> Option<Vec<Node<'_>>> {
+    go_result_type_nodes_with_scope(declaration, &mut || true)
+}
+
+pub(crate) fn go_result_type_nodes_with_scope<'tree>(
+    declaration: Node<'tree>,
+    scope_step: &mut dyn FnMut() -> bool,
+) -> Option<Vec<Node<'tree>>> {
+    if !scope_step() || declaration.has_error() || declaration.is_missing() {
+        return None;
     }
-    let mut current_ordinal = 0usize;
+    let Some(result) = declaration.child_by_field_name("result") else {
+        return Some(Vec::new());
+    };
+    if !scope_step() || result.has_error() || result.is_missing() {
+        return None;
+    }
+    if result.kind() != "parameter_list" {
+        return Some(vec![result]);
+    }
+    let mut types = Vec::new();
     let mut cursor = result.walk();
     for parameter in result.named_children(&mut cursor) {
-        if !matches!(
-            parameter.kind(),
-            "parameter_declaration" | "variadic_parameter_declaration"
-        ) {
+        if !scope_step() {
+            return None;
+        }
+        if parameter.is_extra() {
             continue;
         }
-        let mut names = parameter.walk();
-        let named_count = parameter
-            .named_children(&mut names)
-            .filter(|child| child.kind() == "identifier")
-            .count()
-            .max(1);
-        if ordinal < current_ordinal.saturating_add(named_count) {
-            return parameter.child_by_field_name("type");
+        if parameter.kind() != "parameter_declaration"
+            || parameter.has_error()
+            || parameter.is_missing()
+        {
+            return None;
         }
-        current_ordinal = current_ordinal.saturating_add(named_count);
+        let type_node = parameter.child_by_field_name("type")?;
+        if type_node.has_error() || type_node.is_missing() {
+            return None;
+        }
+        let mut names = parameter.walk();
+        let mut named_count = 0;
+        for _ in parameter.children_by_field_name("name", &mut names) {
+            if !scope_step() {
+                return None;
+            }
+            named_count += 1;
+        }
+        for _ in 0..named_count.max(1) {
+            if !scope_step() {
+                return None;
+            }
+            types.push(type_node);
+        }
     }
-    None
+    Some(types)
 }
 
 fn go_type_parameter_binds_error(declaration: Node<'_>, source: &str) -> bool {
@@ -272,6 +340,23 @@ pub(crate) fn go_predeclared_type_name_is_exact(
     type_node: Node<'_>,
     name: &str,
 ) -> Option<bool> {
+    go_predeclared_type_name_is_exact_bounded(analyzer, file, source, root, type_node, name, || {
+        true
+    })
+}
+
+pub(crate) fn go_predeclared_type_name_is_exact_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    type_node: Node<'_>,
+    name: &str,
+    mut step: impl FnMut() -> bool,
+) -> Option<bool> {
+    if !step() {
+        return None;
+    }
     if !is_predeclared_go_type(name) {
         return Some(false);
     }
@@ -287,12 +372,13 @@ pub(crate) fn go_predeclared_type_name_is_exact(
     if !dot_imports.is_empty() || imports.contains_key(name) {
         return Some(false);
     }
-    match go_name_shadowed_at_with_scope(root, source, type_node.start_byte(), name, || true) {
+    match go_name_shadowed_at_with_scope(root, source, type_node.start_byte(), name, &mut step) {
         Some(true) => return Some(false),
         Some(false) => {}
         None => return None,
     }
-    match go.predeclared_builtin_shadow_status_limited(&rel_path_string(file), name, 256, || true) {
+    match go.predeclared_builtin_shadow_status_limited(&rel_path_string(file), name, 256, &mut step)
+    {
         Some(true) => Some(false),
         Some(false) => Some(true),
         None => None,
@@ -314,9 +400,105 @@ pub fn go_explicit_binding_type_identity(
         .map(|selected| selected.canonical)
 }
 
+/// Both sides must have a selected canonical identity before the conversion
+/// can carry the original value's identity.
+pub fn go_assignment_conversion_types_identical(
+    result: Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+    binding: Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+) -> bool {
+    result.is_some() && result == binding
+}
+
+/// Select the emitted call result slot at the requested ordinal for exact type proof.
+pub fn go_call_result_type_identity(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    call: Range,
+    ordinal: u32,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+    Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
+> {
+    use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+    use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+    let unknown = || BoundedResolution::Complete {
+        value: None,
+        work: Default::default(),
+    };
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return unknown();
+    };
+    let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+        Ok(scope) => scope,
+        Err(_) => {
+            analyzer.mark_execution_dependent();
+            return unknown();
+        }
+    };
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let Some(syntax) = go.inner.prepared_syntax(scope.token(), file) else {
+        return unknown();
+    };
+    if syntax.source() != source {
+        return unknown();
+    }
+    let Some(text) = source.get(call.start_byte..call.end_byte) else {
+        return unknown();
+    };
+    let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+        path: rel_path_string(file),
+        text: text.into(),
+        range: call,
+        focus_start_byte: call.start_byte,
+        focus_end_byte: call.end_byte,
+    };
+    let opened = match GoNativePointRequest::open_for_file(
+        go,
+        file,
+        analyzer.semantic_model_overlay(),
+        cancellation,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            analyzer.record_query_failure(error);
+            return unknown();
+        }
+    };
+    match opened {
+        GoNativePointRequestOpen::Ready(mut native) => native.call_result_type_identity(
+            brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file,
+                source,
+                tree: Some(syntax.tree()),
+                site: &site,
+                budget: Default::default(),
+                cancellation: Some(cancellation),
+            },
+            call,
+            ordinal,
+        ),
+        GoNativePointRequestOpen::Cancelled => BoundedResolution::Cancelled {
+            work: Default::default(),
+        },
+        GoNativePointRequestOpen::Unavailable { .. } => {
+            analyzer.mark_execution_dependent();
+            unknown()
+        }
+    }
+}
+
 pub(crate) struct GoExplicitBindingDeclaredType {
     pub canonical: Option<brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity>,
     pub nominal: Option<CodeUnit>,
+    pub application_source: Option<GoSelectedApplicationSource>,
+}
+
+/// Exact declaration and bytes read under the selected declared-type operation.
+pub(crate) struct GoSelectedApplicationSource {
+    pub source: std::sync::Arc<str>,
+    pub declaration: Range,
 }
 
 pub(crate) fn go_explicit_binding_declared_type(
@@ -328,12 +510,57 @@ pub(crate) fn go_explicit_binding_declared_type(
 ) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
     GoExplicitBindingDeclaredType,
 > {
+    go_explicit_binding_declared_type_with_source(
+        analyzer,
+        file,
+        source,
+        binding,
+        cancellation,
+        super::native_points::no_application_source,
+    )
+}
+
+pub(crate) fn go_explicit_binding_application_type(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    binding: Range,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+    GoExplicitBindingDeclaredType,
+> {
+    go_explicit_binding_declared_type_with_source(
+        analyzer,
+        file,
+        source,
+        binding,
+        cancellation,
+        super::native_points::read_application_source,
+    )
+}
+
+fn go_explicit_binding_declared_type_with_source(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    binding: Range,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    source_read: fn(
+        &mut super::native_points::GoNativePointRequest<'_>,
+        &CodeUnit,
+        &ProjectFile,
+        &str,
+    ) -> Option<GoSelectedApplicationSource>,
+) -> brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution<
+    GoExplicitBindingDeclaredType,
+> {
     use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
     use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
     let unknown = || BoundedResolution::Complete {
         value: GoExplicitBindingDeclaredType {
             canonical: None,
             nominal: None,
+            application_source: None,
         },
         work: Default::default(),
     };
@@ -344,6 +571,13 @@ pub(crate) fn go_explicit_binding_declared_type(
     }
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return unknown();
+    };
+    let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+        Ok(scope) => scope,
+        Err(_) => {
+            analyzer.mark_execution_dependent();
+            return unknown();
+        }
     };
     let scope = AnalyzerQueryScope::new(analyzer);
     let Some(syntax) = go.inner.prepared_syntax(scope.token(), file) else {
@@ -386,6 +620,7 @@ pub(crate) fn go_explicit_binding_declared_type(
                 cancellation: Some(cancellation),
             },
             binding,
+            source_read,
         ),
         GoNativePointRequestOpen::Cancelled => BoundedResolution::Cancelled {
             work: Default::default(),
@@ -410,6 +645,13 @@ pub fn go_selected_callable_result_type_identities(
 )> {
     use super::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+        Ok(scope) => scope,
+        Err(_) => {
+            analyzer.mark_execution_dependent();
+            return None;
+        }
+    };
     let opened = GoNativePointRequest::open_for_file(
         go,
         file,
@@ -666,6 +908,9 @@ pub(super) fn go_observed_value_type(answer: &SelectedNativeReferenceTypes) -> O
                 }
                 FactProjectedTypeNodeForm::Map { .. } => {
                     return Type(ObservedValueType::NonNamed(ValueShape::Map));
+                }
+                FactProjectedTypeNodeForm::Channel { .. } => {
+                    return Type(ObservedValueType::NonNamed(ValueShape::Channel));
                 }
                 FactProjectedTypeNodeForm::Unsupported => {
                     return Type(ObservedValueType::Undecided(UnknownType));

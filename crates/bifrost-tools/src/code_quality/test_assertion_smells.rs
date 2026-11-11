@@ -197,7 +197,8 @@ pub fn report_test_assertion_smells(
             break;
         }
     }
-    let detection_reads_complete = detection.read_completion().is_ok();
+    let detection_reads_complete =
+        crate::result_incomplete::query_read_incomplete(&detection).is_empty();
     drop(detection);
 
     let mut filtered: Vec<TestAssertionSmell> = findings

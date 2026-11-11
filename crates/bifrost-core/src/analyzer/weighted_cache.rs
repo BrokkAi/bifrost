@@ -11,6 +11,7 @@
 use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ReexportStar};
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::HashSet;
+use crate::retention_budget::RetainedBytes;
 use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -43,6 +44,10 @@ pub fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFi
 }
 
 pub fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) -> u32 {
+    export_index_bytes(value).min(u32::MAX as usize) as u32
+}
+
+fn export_index_bytes(value: &ExportIndex) -> usize {
     let exports_size = value
         .exports_by_name
         .iter()
@@ -67,10 +72,14 @@ pub fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) -> u32 
         .iter()
         .map(|star| star.module_specifier.len() + size_of::<ReexportStar>())
         .sum::<usize>();
-    (exports_size + reexport_stars_size + size_of::<ExportIndex>()).min(u32::MAX as usize) as u32
+    exports_size + reexport_stars_size + size_of::<ExportIndex>()
 }
 
 pub fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+    weight_code_unit_set_ref(value)
+}
+
+pub fn weight_code_unit_set_ref(value: &HashSet<CodeUnit>) -> u32 {
     let size = value
         .iter()
         .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
@@ -83,6 +92,49 @@ pub fn weight_code_unit_vec_by_unit(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>)
     weight_bytes(
         (size_of::<Vec<CodeUnit>>() + value.iter().map(estimate_code_unit).sum::<usize>()) as u128,
     )
+}
+
+// Retention-budget estimates for the common analyzer value shapes, so a cache
+// moving onto a budget region keys and stores these types directly. Each uses
+// the same estimate as the weigher above for the same shape.
+impl RetainedBytes for ProjectFile {
+    fn retained_bytes(&self) -> usize {
+        // The root is interned and shared by every file of the project.
+        size_of::<Self>() + self.rel_path().as_os_str().len()
+    }
+}
+impl RetainedBytes for CodeUnit {
+    fn retained_bytes(&self) -> usize {
+        estimate_code_unit(self)
+    }
+}
+impl RetainedBytes for ExportIndex {
+    fn retained_bytes(&self) -> usize {
+        export_index_bytes(self)
+    }
+}
+impl<T: RetainedBytes, S> RetainedBytes for std::collections::HashSet<T, S> {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.capacity() * size_of::<T>()
+            + self
+                .iter()
+                .map(|item| item.retained_bytes().saturating_sub(size_of::<T>()))
+                .sum::<usize>()
+    }
+}
+impl<K: RetainedBytes, V: RetainedBytes, S> RetainedBytes for std::collections::HashMap<K, V, S> {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.capacity() * (size_of::<K>() + size_of::<V>())
+            + self
+                .iter()
+                .map(|(key, value)| {
+                    key.retained_bytes().saturating_sub(size_of::<K>())
+                        + value.retained_bytes().saturating_sub(size_of::<V>())
+                })
+                .sum::<usize>()
+    }
 }
 
 fn estimate_code_unit(code_unit: &CodeUnit) -> usize {

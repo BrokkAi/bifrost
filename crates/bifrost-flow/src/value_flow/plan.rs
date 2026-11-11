@@ -31,7 +31,10 @@ use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_analysis::analyzer::semantic::ids::{
     push_declaration_shape, push_evidence_completeness, push_proof_status,
 };
-use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::procedure_infeasible_points;
+use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::{
+    is_same_event_supplement, joins_same_event_alternatives, procedure_infeasible_points,
+    same_event_rule,
+};
 
 use crate::analyzer::semantic::workspace_oracle::{GapOpenness, classify_gap_openness};
 
@@ -48,11 +51,13 @@ use super::{
 pub struct SummaryCallBinding<'a> {
     actual_to_formal: Option<&'a [u32]>,
     has_receiver: bool,
+    receiver_adjustment: bool,
 }
 
 impl<'a> SummaryCallBinding<'a> {
     pub fn new(target: &SemanticLocator, actual_to_formal: Option<&'a [u32]>) -> Self {
         Self {
+            receiver_adjustment: false,
             actual_to_formal,
             has_receiver: target
                 .declaration()
@@ -60,6 +65,20 @@ impl<'a> SummaryCallBinding<'a> {
                 .last()
                 .is_some_and(|segment| segment.kind() == DeclarationSegmentKind::Method),
         }
+    }
+
+    /// Bind an admitted Identity receiver call to the original owned version.
+    /// The transfer itself is still applied by the ordinary summary interpreter.
+    pub fn receiver_adjustment() -> Self {
+        Self {
+            actual_to_formal: None,
+            has_receiver: true,
+            receiver_adjustment: true,
+        }
+    }
+
+    pub fn is_receiver_adjustment(self) -> bool {
+        self.receiver_adjustment
     }
 
     pub fn parameter_index(self, call: &CallSiteHandle, formal: u32) -> Option<usize> {
@@ -218,6 +237,10 @@ pub(crate) struct LocalFlowRule {
     pub strong_update: bool,
     /// Independent native proof of a direct, unexposed lexical-cell overwrite.
     pub direct_cell_overwrite: bool,
+    /// Another rule of the same event already writes `target`, so this rule is
+    /// a simultaneous alternative that joins instead of killing it again.
+    /// Derived from the sorted rule list by `mark_same_event_joins`.
+    pub joins_same_event_alternative: bool,
 }
 
 /// One point-local rule as the flow clients read it.
@@ -236,6 +259,8 @@ pub(crate) struct LocalRuleView {
     pub strong_update: bool,
     /// Independent native proof of a direct, unexposed lexical-cell overwrite.
     pub direct_cell_overwrite: bool,
+    /// The rule is a same-event alternative that joins at `target`.
+    pub joins_same_event_alternative: bool,
 }
 
 fn local_rule_view(rule: &LocalFlowRule) -> LocalRuleView {
@@ -250,6 +275,7 @@ fn local_rule_view(rule: &LocalFlowRule) -> LocalRuleView {
         policy_local: rule.policy_local,
         strong_update: rule.strong_update,
         direct_cell_overwrite: rule.direct_cell_overwrite,
+        joins_same_event_alternative: rule.joins_same_event_alternative,
     }
 }
 
@@ -275,6 +301,7 @@ pub(crate) struct ValueFlowLocalSummaryRule {
     /// kills its target do not compute the same summary.
     strong_update: bool,
     direct_cell_overwrite: bool,
+    joins_same_event_alternative: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -503,6 +530,7 @@ impl ValueFlowCarrierSummaryIdentity {
             }
             push_summary_bool(&mut digest, rule.strong_update);
             push_summary_bool(&mut digest, rule.direct_cell_overwrite);
+            push_summary_bool(&mut digest, rule.joins_same_event_alternative);
         }
 
         push_summary_len(&mut digest, self.call_rules.len());
@@ -841,6 +869,7 @@ fn push_summary_event(
 fn push_relation_kind(digest: &mut LengthDelimitedDigest, kind: ValueFlowRelationKind) {
     digest.push(match kind {
         ValueFlowRelationKind::Assignment => b"assignment",
+        ValueFlowRelationKind::OwnershipUnknown => b"ownership_unknown",
         ValueFlowRelationKind::Parameter => b"parameter",
         ValueFlowRelationKind::Receiver => b"receiver",
         ValueFlowRelationKind::NormalReturn => b"normal_return",
@@ -976,6 +1005,12 @@ fn classify_snapshot_openness<'snapshot>(
     // The snapshot's workspace host already ran the bounded Go package proof.
     // A shadowed or undecided builtin cannot be refined into a complete call.
     if snapshot.has_unproven_go_builtin_assumptions() {
+        return SnapshotOpenness::Blocked(None);
+    }
+    // A relation may be missing from the list (a stored member of a returned
+    // join), and no gap names it, so refining the gaps cannot make the
+    // relations complete.
+    if snapshot.relations_may_be_missing() {
         return SnapshotOpenness::Blocked(None);
     }
     if crate::analyzer::semantic::workspace_oracle::value_flow_capabilities_are_open(procedure) {
@@ -1448,6 +1483,8 @@ pub(crate) struct BoundaryTransferApplication {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundBoundaryTransfer {
     pub target: ValueFlowCarrierId,
+    /// Exact selected summary/model record fingerprint at transfer binding time.
+    pub model_fingerprint: Option<StableDigest>,
     pub proven_complete: bool,
     /// A complete, exactly bound authored summary closes this transfer. It
     /// is an authored claim, never source-derived proof.
@@ -1888,6 +1925,10 @@ pub struct ValueFlowPlan {
     infeasible_points: ConstantInfeasiblePoints,
     binding_pairs: Box<[(CallSiteHandle, ProcedureHandle)]>,
     resolved_external_calls: Box<[CallSiteHandle]>,
+    /// Calls whose snapshot bound a collection contract to container cells
+    /// (#10989); their summaries' receiver transfers do not apply at the
+    /// normal continuation.
+    collection_cell_calls: Box<[CallSiteHandle]>,
     discovery_status: SemanticInputStatus,
     first_incomplete_cause: Option<ValueFlowIncompleteCause>,
     snapshot_discoveries: Box<[SnapshotDiscovery]>,
@@ -1937,6 +1978,7 @@ fn same_plan_structure(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
         && left.summary_location_bindings == right.summary_location_bindings
         && left.sinks == right.sinks
         && left.resolved_external_calls == right.resolved_external_calls
+        && left.collection_cell_calls == right.collection_cell_calls
         && left.first_incomplete_cause == right.first_incomplete_cause
         && left.snapshot_discoveries == right.snapshot_discoveries
         && left.non_snapshot_discovery_complete == right.non_snapshot_discovery_complete
@@ -2013,6 +2055,7 @@ impl Hash for ValueFlowPlan {
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.resolved_external_calls.hash(state);
+        self.collection_cell_calls.hash(state);
         self.discovery_status.hash(state);
         self.first_incomplete_cause.hash(state);
         self.snapshot_discoveries.hash(state);
@@ -2348,6 +2391,9 @@ impl ValueFlowPlan {
             );
         }
         for call in &self.resolved_external_calls {
+            digest.push(format!("{:?}", public_local_key(call)).as_bytes());
+        }
+        for call in &self.collection_cell_calls {
             digest.push(format!("{:?}", public_local_key(call)).as_bytes());
         }
         digest.push(
@@ -2880,6 +2926,13 @@ impl ValueFlowPlan {
                 return Err(ValueFlowPlanError::StaleExternalCallResolution);
             }
         }
+        let mut collection_cell_calls = snapshots
+            .iter()
+            .flat_map(|input| input.value().collection_cells())
+            .map(|binding| binding.call().clone())
+            .collect::<Vec<_>>();
+        collection_cell_calls.sort_by(compare_calls);
+        collection_cell_calls.dedup_by(|left, right| compare_calls(left, right) == Ordering::Equal);
         let resolved_external_call_set = resolved_external_calls
             .iter()
             .cloned()
@@ -3252,11 +3305,13 @@ impl ValueFlowPlan {
                     policy_local: false,
                     strong_update: relation.strong_update,
                     direct_cell_overwrite: relation.direct_cell_overwrite,
+                    joins_same_event_alternative: false,
                 });
             }
         }
         local_rules.sort_by(compare_local_rules);
         local_rules.dedup();
+        mark_same_event_joins(&mut local_rules);
 
         let mut call_rules = Vec::new();
         for input in &bindings {
@@ -3364,6 +3419,7 @@ impl ValueFlowPlan {
             snapshot_procedures: snapshot_procedures.into_boxed_slice(),
             binding_pairs: binding_pairs.into_boxed_slice(),
             resolved_external_calls: resolved_external_calls.into_boxed_slice(),
+            collection_cell_calls: collection_cell_calls.into_boxed_slice(),
             discovery_status,
             first_incomplete_cause,
             snapshot_discoveries: snapshot_discoveries.into_boxed_slice(),
@@ -3394,6 +3450,9 @@ impl ValueFlowPlan {
             visit(callee.artifact());
         }
         for call in &self.resolved_external_calls {
+            visit(call.procedure().artifact());
+        }
+        for call in &self.collection_cell_calls {
             visit(call.procedure().artifact());
         }
         for carrier in &self.carriers {
@@ -3559,6 +3618,7 @@ impl ValueFlowPlan {
             .saturating_add(size_of_val(self.snapshot_procedures.as_ref()))
             .saturating_add(size_of_val(self.binding_pairs.as_ref()))
             .saturating_add(size_of_val(self.resolved_external_calls.as_ref()))
+            .saturating_add(size_of_val(self.collection_cell_calls.as_ref()))
             // Account for the plan-ownership Arc allocation and reference counts.
             .saturating_add(
                 std::mem::size_of::<usize>()
@@ -3798,6 +3858,7 @@ impl ValueFlowPlan {
                 policy_local: true,
                 strong_update: false,
                 direct_cell_overwrite: false,
+                joins_same_event_alternative: false,
             });
         }
         bound.sort_by(compare_local_rules);
@@ -3823,6 +3884,7 @@ impl ValueFlowPlan {
         let mut local_rules = self.local_rules.into_vec();
         local_rules.extend(bound);
         local_rules.sort_by(compare_local_rules);
+        mark_same_event_joins(&mut local_rules);
         let carrier_components = build_carrier_components(self.carriers.len(), &local_rules);
         self.fallback_locations =
             build_fallback_location_index(&self.carriers, &self.carrier_ids, &carrier_components);
@@ -3941,6 +4003,7 @@ impl ValueFlowPlan {
             }
             rule.strong_update.hash(state);
             rule.direct_cell_overwrite.hash(state);
+            rule.joins_same_event_alternative.hash(state);
         }
         self.contextual_bindings.hash(state);
         for rule in &self.call_rules {
@@ -3997,6 +4060,7 @@ impl ValueFlowPlan {
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.resolved_external_calls.hash(state);
+        self.collection_cell_calls.hash(state);
         self.discovery_status.hash(state);
         self.discovery_complete.hash(state);
         self.structural_discovery_complete.hash(state);
@@ -4009,6 +4073,7 @@ impl ValueFlowPlan {
             && same_summary_location_bindings(self, other)
             && same_conditional_source_specs(self, other)
             && self.resolved_external_calls == other.resolved_external_calls
+            && self.collection_cell_calls == other.collection_cell_calls
     }
 
     /// Compare immutable inputs through stable source keys. A caller may keep
@@ -4098,6 +4163,9 @@ impl ValueFlowPlan {
             rule.source = remap(rule.source)?;
             rule.target = remap(rule.target)?;
         }
+        // Dropping descriptor field stores can remove the rule that carried a
+        // group's kill.
+        mark_same_event_joins(&mut local_rules);
         let mut call_rules = self.call_rules.to_vec();
         for rule in &mut call_rules {
             rule.source = remap(rule.source)?;
@@ -4178,6 +4246,7 @@ impl ValueFlowPlan {
             snapshot_procedures: self.snapshot_procedures.clone(),
             binding_pairs: self.binding_pairs.clone(),
             resolved_external_calls: self.resolved_external_calls.clone(),
+            collection_cell_calls: self.collection_cell_calls.clone(),
             discovery_status: self.discovery_status,
             first_incomplete_cause: self.first_incomplete_cause.clone(),
             snapshot_discoveries: self.snapshot_discoveries.clone(),
@@ -4385,6 +4454,7 @@ impl ValueFlowPlan {
             snapshot_procedures: first.snapshot_procedures.clone(),
             binding_pairs: first.binding_pairs.clone(),
             resolved_external_calls: first.resolved_external_calls.clone(),
+            collection_cell_calls: first.collection_cell_calls.clone(),
             discovery_status: first.discovery_status,
             first_incomplete_cause: plans
                 .iter()
@@ -4537,7 +4607,8 @@ impl ValueFlowPlan {
                             point.events.iter().all(|event| match event.effect {
                                 SemanticEffect::Invoke { call_site } => {
                                     procedure.call_site_handle(call_site).is_some_and(|call| {
-                                        self.has_binding_for_call(&call)
+                                        (self.has_binding_for_call(&call)
+                                            && !result.caller_conversions().contains(&call))
                                             || self.call_boundaries_are_fully_modeled(
                                                 result,
                                                 &call,
@@ -4686,6 +4757,9 @@ impl ValueFlowPlan {
         context: &OracleCallContext,
         requirement: SummaryProofRequirement,
     ) -> bool {
+        if result.caller_conversions().contains(call) {
+            return false;
+        }
         let mut saw_dispatch = false;
         let allocation_call =
             crate::analyzer::semantic::workspace_oracle::allocation_call_is_dischargeable(
@@ -4874,6 +4948,9 @@ impl ValueFlowPlan {
         let Some(call) = boundary.origin() else {
             return false;
         };
+        if result.caller_conversions().contains(call) {
+            return false;
+        }
         let SummaryBoundaryKind::Dispatch(kind) = boundary.kind() else {
             return false;
         };
@@ -5065,6 +5142,9 @@ impl ValueFlowPlan {
             .iter()
             .chain(sink.dispatch_obligations())
         {
+            if result.caller_conversions().contains(call) {
+                return None;
+            }
             let context = OracleCallContext::empty();
             let has_open_boundary = result.coverage().boundaries().iter().any(|boundary| {
                 boundary.origin() == Some(call) && boundary.call_context() == &context
@@ -5116,6 +5196,12 @@ impl ValueFlowPlan {
             }
         }
         for step in &witness.steps()[first..] {
+            if step
+                .origin()
+                .is_some_and(|call| result.caller_conversions().contains(call))
+            {
+                return None;
+            }
             if matches!(step.kind(), SummaryWitnessStepKind::EndSummaryGap(_)) {
                 return None;
             }
@@ -5409,6 +5495,7 @@ impl ValueFlowPlan {
                     policy_local: rule.policy_local,
                     strong_update: rule.strong_update,
                     direct_cell_overwrite: rule.direct_cell_overwrite,
+                    joins_same_event_alternative: rule.joins_same_event_alternative,
                 });
         }
         for rule in &self.call_rules {
@@ -5739,6 +5826,22 @@ impl ValueFlowPlan {
             .map(|(summary, mapping)| (summary, SummaryCallBinding::new(target, mapping)))
     }
 
+    /// Call-scoped implicit receiver summaries. A step is never inferred from
+    /// the final target's locator, which can be shared by adjusted and direct calls.
+    pub fn receiver_adjustment_summaries<'a>(
+        &'a self,
+        call: &CallSiteHandle,
+    ) -> impl Iterator<Item = &'a SemanticProcedureSummary> + 'a {
+        self.external_summaries
+            .receiver_adjustments_for_call(call)
+            .iter()
+            .map(move |step| {
+                self.external_summaries
+                    .summary_for(&step.summary_locator())
+                    .expect("the summary set validates every admitted adjustment")
+            })
+    }
+
     pub fn curated_model_for_call(&self, call: &CallSiteHandle) -> Option<&CuratedCallModel> {
         self.curated_call_models
             .binary_search_by(|candidate| compare_calls(&candidate.call, call))
@@ -5752,6 +5855,13 @@ impl ValueFlowPlan {
         port: &SummaryPort,
         actual_to_formal: SummaryCallBinding<'_>,
     ) -> Option<ValueFlowCarrierId> {
+        let port = if actual_to_formal.is_receiver_adjustment()
+            && matches!(port, SummaryPort::NormalReturn)
+        {
+            &SummaryPort::Receiver
+        } else {
+            port
+        };
         if matches!(
             port,
             SummaryPort::Receiver | SummaryPort::Capture(_) | SummaryPort::Heap(_)
@@ -5805,6 +5915,43 @@ impl ValueFlowPlan {
             })
             .ok()
             .is_some_and(|index| self.summary_location_bindings[index].carrier.is_none())
+    }
+
+    fn is_collection_cell_call(&self, call: &CallSiteHandle) -> bool {
+        self.collection_cell_calls
+            .binary_search_by(|candidate| compare_calls(candidate, call))
+            .is_ok()
+    }
+
+    /// The model transfers that still apply at `call` (#10989).
+    ///
+    /// When the snapshot bound the call's collection contract to the closed
+    /// container's cells, those cells carry the container's contents across
+    /// the call's normal continuation. The model's transfers into or out of
+    /// the receiver would collapse every entry back onto the container
+    /// object, so they are dropped there; every other transfer, and the
+    /// whole exceptional continuation, still applies.
+    fn collection_cell_transfers<'t>(
+        &self,
+        call: &CallSiteHandle,
+        kind: IcfgEdgeKind,
+        transfers: &'t [SummaryTransfer],
+    ) -> std::borrow::Cow<'t, [SummaryTransfer]> {
+        if !matches!(kind, IcfgEdgeKind::CallToNormalContinuation)
+            || !self.is_collection_cell_call(call)
+        {
+            return std::borrow::Cow::Borrowed(transfers);
+        }
+        std::borrow::Cow::Owned(
+            transfers
+                .iter()
+                .filter(|transfer| {
+                    !matches!(transfer.input(), SummaryPort::Receiver)
+                        && !matches!(transfer.exit().port(), SummaryPort::Receiver)
+                })
+                .cloned()
+                .collect(),
+        )
     }
 
     fn is_resolved_external_call(&self, call: &CallSiteHandle) -> bool {
@@ -5874,25 +6021,63 @@ impl ValueFlowPlan {
         call: &CallSiteHandle,
         boundary: Option<&DispatchBoundaryKind>,
         kind: IcfgEdgeKind,
+        caller_conversion_may_run_user_code: bool,
         input: ValueFlowCarrierId,
         mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
     ) -> BoundaryTransferApplication {
+        // Apply each implicit call with the same interpreter as an ordinary
+        // external call. Its declared same-object result binds to the owned
+        // receiver's port. No propagation rule is synthesized for Identity.
+        // The resulting self-transfer need not be emitted a second time: it
+        // denotes this exact input carrier and has no label effects.
+        for summary in self.receiver_adjustment_summaries(call) {
+            let binding = SummaryCallBinding::receiver_adjustment();
+            let receiver = self.summary_port_carrier(call, &SummaryPort::Receiver, binding);
+            let mut applied = receiver != Some(input);
+            let mut same_carrier = true;
+            let result = self.visit_modeled_transfers(
+                call,
+                IcfgEdgeKind::CallToNormalContinuation,
+                input,
+                summary.transfers(),
+                summary.effects(),
+                binding,
+                summary.completeness().is_complete(),
+                |transfer| {
+                    same_carrier &= transfer.target == input && transfer.removed_labels.is_empty();
+                    applied = true;
+                    true
+                },
+            );
+            if !result.complete || !applied || !same_carrier {
+                return BoundaryTransferApplication {
+                    modeled: false,
+                    complete: false,
+                    abstained: true,
+                };
+            }
+        }
         if let Some((summary, actual_to_formal)) =
             boundary.and_then(|boundary| self.external_summary_for_boundary(boundary))
         {
+            let transfers = self.collection_cell_transfers(call, kind, summary.transfers());
             return self.visit_modeled_transfers(
                 call,
                 kind,
                 input,
-                summary.transfers(),
+                &transfers,
                 summary.effects(),
                 actual_to_formal,
-                summary.completeness().is_complete(),
+                summary.completeness().is_complete() && !caller_conversion_may_run_user_code,
                 |mut transfer| {
-                    transfer.authored_complete = matches!(
-                        summary.key().identity().origin(),
-                        SummaryOrigin::External(_)
-                    ) && summary.completeness().is_complete()
+                    transfer.model_fingerprint = Some(summary.key().fingerprint());
+                    transfer.proven_complete &= !caller_conversion_may_run_user_code;
+                    transfer.authored_complete = !caller_conversion_may_run_user_code
+                        && matches!(
+                            summary.key().identity().origin(),
+                            SummaryOrigin::External(_)
+                        )
+                        && summary.completeness().is_complete()
                         && self.model_is_fully_bindable(
                             call,
                             summary.transfers(),
@@ -5904,15 +6089,21 @@ impl ValueFlowPlan {
             );
         }
         if let Some(model) = self.curated_model_for_call(call) {
+            let transfers = self.collection_cell_transfers(call, kind, model.transfers());
             return self.visit_modeled_transfers(
                 call,
                 kind,
                 input,
-                model.transfers(),
+                &transfers,
                 model.effects(),
                 SummaryCallBinding::default(),
-                true,
-                visitor,
+                !caller_conversion_may_run_user_code,
+                |mut transfer| {
+                    transfer.model_fingerprint = Some(model.fingerprint().digest());
+                    transfer.proven_complete &= !caller_conversion_may_run_user_code;
+                    transfer.authored_complete &= !caller_conversion_may_run_user_code;
+                    visitor(transfer)
+                },
             );
         }
 
@@ -5923,7 +6114,7 @@ impl ValueFlowPlan {
         if boundary.is_none() && self.has_binding_for_call(call) {
             return BoundaryTransferApplication {
                 modeled: true,
-                complete: true,
+                complete: !caller_conversion_may_run_user_code,
                 abstained: false,
             };
         }
@@ -5932,6 +6123,7 @@ impl ValueFlowPlan {
             self.visit_fallback_outputs(call, kind, |target| {
                 visitor(BoundBoundaryTransfer {
                     target,
+                    model_fingerprint: None,
                     proven_complete: false,
                     authored_complete: false,
                     removed_labels: Vec::new(),
@@ -6067,6 +6259,7 @@ impl ValueFlowPlan {
             removed_labels.dedup();
             if !visitor(BoundBoundaryTransfer {
                 target: *target,
+                model_fingerprint: None,
                 proven_complete: summary_evidence_is_proven_complete(transfer.evidence()),
                 authored_complete: false,
                 removed_labels,
@@ -6556,6 +6749,206 @@ mod tests {
         trace.0
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9947: a source-limit refusal during gap discharge left the snapshot unmarked"
+    )]
+    fn execution_marker_survives_gap_discharge_source_limit() {
+        let source = "pub fn run(value: Option<()>) -> Option<()> { value?; None }";
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"marker\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file("src/lib.rs", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("src/lib.rs"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .expect("fixture declares run");
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("fixture procedure remains live");
+
+        for (limit, marked) in [(1, true), (100000, false)] {
+            let mut limits = SemanticBudget::default().limits();
+            limits.source_bytes = limit;
+            let mut budget = SemanticBudget::new(limits).expect("positive limits");
+            let outcome = workspace
+                .semantic_oracle_provider()
+                .procedure_relations(
+                    &root,
+                    &OracleCallContext::empty(),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("projection");
+            let snapshot = outcome.available_value().expect("outer snapshot survives");
+            assert_eq!(snapshot.is_execution_dependent(), marked, "limit {limit}");
+        }
+    }
+
+    #[test]
+    fn execution_marker_survives_nested_budget_stop() {
+        let source = "package fixture\nfunc helper(input string) string { return input }\nfunc run(input string) string { return helper(input) }\n";
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("flow.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .expect("fixture declares run");
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("fixture procedure remains live");
+
+        for (limit, marked) in [(1, true), (100000, false)] {
+            let mut limits = SemanticBudget::default().limits();
+            limits.nested_entries = limit;
+            let mut budget = SemanticBudget::new(limits).expect("positive limits");
+            let outcome = workspace
+                .semantic_oracle_provider()
+                .procedure_relations(
+                    &root,
+                    &OracleCallContext::empty(),
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("projection");
+            let snapshot = outcome.available_value().expect("outer snapshot survives");
+            assert_eq!(snapshot.is_execution_dependent(), marked, "limit {limit}");
+            assert_eq!(
+                matches!(
+                    SemanticInputStatus::from_outcome(&outcome),
+                    SemanticInputStatus::Complete
+                ),
+                !marked,
+                "limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_marker_does_not_change_plan_bytes() {
+        let source = "package fixture\nfunc run(input string) string { return input }\n";
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("flow.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize")
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .expect("fixture declares run");
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("fixture procedure remains live");
+
+        let mut budget = SemanticBudget::default();
+        let outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&outcome);
+        let snapshot = outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        assert!(
+            !snapshot.is_execution_dependent(),
+            "fixture must start unmarked"
+        );
+        let mut marked = snapshot.clone();
+        marked.mark_execution_dependent();
+        assert_ne!(snapshot, marked);
+        let build = |snapshot| {
+            ValueFlowPlan::try_new(
+                root.clone(),
+                vec![ValueFlowInput::new(snapshot, status)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("fixture plan")
+        };
+        let clear = build(snapshot);
+        let marked = build(marked);
+        let bytes = |plan: &ValueFlowPlan| {
+            let mut trace = HashTrace::default();
+            plan.hash(&mut trace);
+            trace.0
+        };
+        assert_eq!(bytes(&clear), bytes(&marked));
+        assert_eq!(
+            propagation_hash_trace(&clear),
+            propagation_hash_trace(&marked)
+        );
+        assert_eq!(clear.public_fingerprint(), marked.public_fingerprint());
+    }
+
     fn value_flow_plan_from_source(source: &str) -> ValueFlowPlan {
         let project = InlineTestProject::with_language(Language::Go)
             .file("flow.go", source)
@@ -6936,6 +7329,7 @@ mod tests {
                         policy_local: rule.policy_local,
                         strong_update: rule.strong_update,
                         direct_cell_overwrite: rule.direct_cell_overwrite,
+                        joins_same_event_alternative: rule.joins_same_event_alternative,
                     })
                     .collect::<Vec<_>>();
                 (point.clone(), expected_rules, expected_views)
@@ -7565,6 +7959,9 @@ fn call_port_value(
             row.arguments
                 .get(actual_to_formal.parameter_index(call, *formal)?)?
                 .value
+        }
+        SummaryPort::NormalReturn if actual_to_formal.is_receiver_adjustment() => {
+            actual_to_formal.receiver_value(call).or(row.receiver)?
         }
         SummaryPort::NormalReturn => row.result?,
         SummaryPort::IndexedNormalReturn(index) => row.normal_result(*index as usize)?,
@@ -9329,9 +9726,47 @@ fn compare_call_contexts(left: &[CallSiteHandle], right: &[CallSiteHandle]) -> O
         .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
+/// Flag every rule that joins at its target instead of killing it, deciding
+/// each (point, event, target) group with `joins_same_event_alternatives`.
+/// `rules` is sorted by `compare_local_rules`, so one event's rules are
+/// contiguous and its supplements come last.
+fn mark_same_event_joins(rules: &mut [LocalFlowRule]) {
+    for event in rules.chunk_by_mut(|left, right| {
+        left.point == right.point && left.event_index == right.event_index
+    }) {
+        debug_assert!(
+            event.is_sorted_by_key(|rule| is_same_event_supplement(rule.kind)),
+            "an event's supplements follow its alternatives"
+        );
+        let targets = event
+            .iter()
+            .map(|rule| {
+                same_event_rule(
+                    rule.kind,
+                    rule.source,
+                    rule.target,
+                    rule.strong_update,
+                    rule.direct_cell_overwrite,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (rule, joins) in event
+            .iter_mut()
+            .zip(joins_same_event_alternatives(&targets))
+        {
+            rule.joins_same_event_alternative = joins;
+        }
+    }
+}
+
 fn compare_local_rules(left: &LocalFlowRule, right: &LocalFlowRule) -> Ordering {
     compare_points(&left.point, &right.point)
         .then_with(|| left.event_index.cmp(&right.event_index))
+        // A supplement follows the event's alternatives, so a kill among them
+        // cannot erase what it adds.
+        .then_with(|| {
+            is_same_event_supplement(left.kind).cmp(&is_same_event_supplement(right.kind))
+        })
         .then_with(|| left.source.cmp(&right.source))
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| relation_kind_rank(left.kind).cmp(&relation_kind_rank(right.kind)))
@@ -9399,6 +9834,8 @@ fn same_local_rules(left: &ValueFlowPlan, right: &ValueFlowPlan) -> bool {
                     && left_rule.policy_local == right_rule.policy_local
                     && left_rule.strong_update == right_rule.strong_update
                     && left_rule.direct_cell_overwrite == right_rule.direct_cell_overwrite
+                    && left_rule.joins_same_event_alternative
+                        == right_rule.joins_same_event_alternative
             })
 }
 
@@ -9534,6 +9971,7 @@ fn relation_kind_rank(kind: ValueFlowRelationKind) -> u8 {
         ValueFlowRelationKind::LanguageDefined => 9,
         ValueFlowRelationKind::HandlerBinding => 10,
         ValueFlowRelationKind::ContainerCollapse => 11,
+        ValueFlowRelationKind::OwnershipUnknown => 12,
     }
 }
 

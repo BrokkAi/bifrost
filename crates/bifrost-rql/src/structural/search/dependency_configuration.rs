@@ -91,7 +91,7 @@ pub(super) fn execute_dependency_configuration(
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return cancelled_plan_execution();
+            return PlanExecution::cancelled(Vec::new());
         }
         if let Some(reason) =
             super::cross_domain::declared_document_gap(path, configuration_seeds, state)
@@ -129,7 +129,7 @@ pub(super) fn execute_dependency_configuration(
                 .cancellation
                 .is_some_and(CancellationToken::is_cancelled)
             {
-                return cancelled_plan_execution();
+                return PlanExecution::cancelled(Vec::new());
             }
             if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
                 contributions.len(),
@@ -206,7 +206,7 @@ pub(super) fn execute_dependency_configuration(
             ));
         }
     }
-    if configuration.truncated || code.truncated {
+    if configuration.is_truncated() || code.is_truncated() {
         reasons.push(ConfigurationIncompleteReason::ParserLimitation);
     }
     let mut input = ConfigurationResolutionInput::new(
@@ -307,7 +307,7 @@ pub(super) fn execute_dependency_configuration(
     let desired_rows = plan_rows_budget(terminal_cap, state, limits);
     let mut rows = Vec::new();
     let mut indexes = HashMap::default();
-    let mut truncated = code.truncated || configuration.truncated;
+    let mut truncated = code.is_truncated() || configuration.is_truncated();
     let supports_version = super::dependency_evidence::mitigation_version_predicate(
         &relation.ecosystem,
         &relation.version_ranges,
@@ -320,7 +320,7 @@ pub(super) fn execute_dependency_configuration(
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return cancelled_plan_execution();
+            return PlanExecution::cancelled(Vec::new());
         }
         if rows.len() >= desired_rows {
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
@@ -349,7 +349,9 @@ pub(super) fn execute_dependency_configuration(
                 match lease.admit(projected) {
                     FairSeedBudgetAdmission::Admitted => {}
                     FairSeedBudgetAdmission::Rejected(_) => retain_proof = false,
-                    FairSeedBudgetAdmission::Cancelled => return cancelled_plan_execution(),
+                    FairSeedBudgetAdmission::Cancelled => {
+                        return PlanExecution::cancelled(Vec::new());
+                    }
                 }
             }
             if retain_proof {
@@ -406,10 +408,5 @@ pub(super) fn execute_dependency_configuration(
             CodeQueryDiagnosticImpact::Incomplete,
             format!("dependency configuration mitigation is unproved; affected witnesses remain with mitigated=false: {gaps:?}")));
     }
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }

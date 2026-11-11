@@ -6,7 +6,8 @@ use super::{DerivationExecutionCause, Incompleteness};
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::structural::analysis_context::{
-    QueryAnalysisContext, QueryAnalysisContextError, TaintResultRef,
+    QueryAnalysisContext, QueryAnalysisContextError, RegisteredTaintResult, TaintBudgetStop,
+    TaintBudgetStopLane, TaintResultRef,
 };
 
 #[derive(Default)]
@@ -88,7 +89,10 @@ impl TaintQueryState {
         remaining_limits.max_projected_bytes = limits
             .max_projected_bytes
             .saturating_sub(self.projected_bytes);
-        let retained_limits = result.projection_limits();
+        let retained_limits = match &result {
+            RegisteredTaintResult::Live(result) => result.projection_limits(),
+            RegisteredTaintResult::Output(result) => result.projection_limits,
+        };
         let projection_limits = super::CodeQueryTaintProjectionLimits::new(
             remaining_limits
                 .max_origins_per_finding
@@ -103,16 +107,33 @@ impl TaintQueryState {
                 .max_witness_bytes
                 .min(retained_limits.max_witness_bytes),
         );
-        let projection = match super::project_taint_finding_report_bounded(
-            workspace,
-            result.plan(),
-            result.report(),
-            result.projection_scope(),
-            projection_limits,
-            remaining_limits.max_findings,
-            remaining_limits.max_projected_bytes,
-            Some(cancellation),
-        ) {
+        if let RegisteredTaintResult::Output(output) = &result {
+            self.push_budget_stops(workspace, &output.budget_stops);
+        }
+        let projected = match result {
+            RegisteredTaintResult::Live(result) => super::project_taint_finding_report_bounded(
+                workspace,
+                result.plan(),
+                result.report(),
+                result.projection_scope(),
+                projection_limits,
+                remaining_limits.max_findings,
+                remaining_limits.max_projected_bytes,
+                Some(cancellation),
+            )
+            .map_err(|error| error.to_string()),
+            RegisteredTaintResult::Output(result) => {
+                Ok(super::witness_projection::project_output_reports_bounded(
+                    workspace,
+                    result,
+                    projection_limits,
+                    remaining_limits.max_findings,
+                    remaining_limits.max_projected_bytes,
+                    Some(cancellation),
+                ))
+            }
+        };
+        let projection = match projected {
             Ok(projected) => projected,
             Err(error) => {
                 self.push_diagnostic(
@@ -155,6 +176,123 @@ impl TaintQueryState {
                 byte_span: projected.byte_span,
             })
             .collect()
+    }
+
+    /// A stopped anchor's row says nothing about its flows, or only some, so the
+    /// findings of a result may be missing some. Report each limit that stopped
+    /// anchors, with the limit to raise and the anchors it stopped. The semantic
+    /// budget keeps its own code; the truncation of findings, witnesses and
+    /// attribution is a truncated finding projection; a limit of the composition
+    /// itself and an undecided barrier check are a partial analysis.
+    fn push_budget_stops(&mut self, workspace: &WorkspaceAnalyzer, stops: &[TaintBudgetStop]) {
+        const NAMED_ANCHORS: usize = 16;
+        const MAX_FAILURE_CHARS: usize = 240;
+        for lane in [
+            TaintBudgetStopLane::Semantic,
+            TaintBudgetStopLane::CompositionProcedures,
+            TaintBudgetStopLane::CompositionHops,
+            TaintBudgetStopLane::CompositionCallersPerProcedure,
+            TaintBudgetStopLane::FindingLimit,
+            TaintBudgetStopLane::WitnessLimit,
+            TaintBudgetStopLane::BarrierUndecided,
+            TaintBudgetStopLane::ProviderFailed,
+        ] {
+            let failure = stops
+                .iter()
+                .find(|stop| stop.lane == lane && !stop.detail.is_empty())
+                .map(|stop| {
+                    stop.detail
+                        .chars()
+                        .take(MAX_FAILURE_CHARS)
+                        .collect::<String>()
+                });
+            let anchors = stops
+                .iter()
+                .filter(|stop| stop.lane == lane)
+                .map(|stop| {
+                    let locator = stop
+                        .anchor
+                        .clone()
+                        .decode()
+                        .expect("validated Output anchor");
+                    let file = crate::path_utils::rel_path_string(
+                        &super::witness_projection::locator_file(workspace, &locator),
+                    );
+                    format!("{file}@{}", locator.anchor().span().start_byte())
+                })
+                .collect::<Vec<_>>();
+            if anchors.is_empty() {
+                continue;
+            }
+            let consequence_failure;
+            let (code, effect, consequence) = match lane {
+                TaintBudgetStopLane::Semantic => (
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    "stopped taint composition",
+                    "the findings of those anchors are not in this result",
+                ),
+                TaintBudgetStopLane::CompositionProcedures
+                | TaintBudgetStopLane::CompositionHops
+                | TaintBudgetStopLane::CompositionCallersPerProcedure => (
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    "stopped taint composition",
+                    "the findings of those anchors are not in this result",
+                ),
+                TaintBudgetStopLane::FindingLimit => (
+                    CodeQueryDiagnosticCode::TaintFindingTruncated,
+                    "omitted findings",
+                    "this result lacks the omitted findings of those anchors",
+                ),
+                TaintBudgetStopLane::WitnessLimit => (
+                    CodeQueryDiagnosticCode::TaintFindingTruncated,
+                    "truncated witnesses or attribution",
+                    "the witnesses or attribution of those anchors are partial",
+                ),
+                TaintBudgetStopLane::BarrierUndecided => (
+                    CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    "left barrier checks omitted or undecided",
+                    "the barrier decisions of those anchors are incomplete",
+                ),
+                TaintBudgetStopLane::ProviderFailed => {
+                    consequence_failure = format!(
+                        "their findings may be suppressed by a flow the search did not decide (first failure: {})",
+                        failure.as_deref().unwrap_or("not recorded"),
+                    );
+                    (
+                        CodeQueryDiagnosticCode::SemanticProviderFailed,
+                        "failed a secondary taint search",
+                        consequence_failure.as_str(),
+                    )
+                }
+            };
+            // A provider failure is not a budget: raising a limit does not help.
+            let cause = if lane == TaintBudgetStopLane::ProviderFailed {
+                DerivationExecutionCause::Provider
+            } else {
+                DerivationExecutionCause::Budget
+            };
+            let shown = anchors
+                .iter()
+                .take(NAMED_ANCHORS)
+                .cloned()
+                .collect::<Vec<_>>();
+            let more = anchors.len().saturating_sub(NAMED_ANCHORS);
+            self.push_diagnostic(
+                code,
+                Incompleteness::Operational(cause),
+                format!(
+                    "the {} {effect} at {} anchors ({}{}); {consequence}",
+                    lane.limit_name(),
+                    anchors.len(),
+                    shown.join(", "),
+                    if more == 0 {
+                        String::new()
+                    } else {
+                        format!(", and {more} more")
+                    },
+                ),
+            );
+        }
     }
 
     pub(super) fn take_diagnostics(&mut self) -> Vec<CodeQueryDiagnostic> {

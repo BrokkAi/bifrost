@@ -596,7 +596,7 @@ SELECT units.lang, files.generation, files.rel_path, live.blob_oid,
        'content' AS source_kind, '' AS prefix,
        units.exact_fqn_tail AS tail,
        units.normalized_fqn_tail AS normalized_tail
-FROM main.code_units AS units INDEXED BY idx_code_units_lang_identifier_lookup
+FROM main.code_units AS units INDEXED BY idx_code_units_lang_identifier
 CROSS JOIN main.live_parsed_blobs AS live
   ON live.blob_id = units.blob_id
 CROSS JOIN selected_workspace_revisions AS selected
@@ -623,7 +623,7 @@ SELECT units.lang, files.generation, files.rel_path, live.blob_oid,
        'anchored' AS source_kind, anchors.package_name AS prefix,
        units.exact_fqn_tail AS tail,
        units.normalized_fqn_tail AS normalized_tail
-FROM main.code_units AS units INDEXED BY idx_code_units_lang_identifier_lookup
+FROM main.code_units AS units INDEXED BY idx_code_units_lang_identifier
 CROSS JOIN main.live_parsed_blobs AS live
   ON live.blob_id = units.blob_id
 CROSS JOIN selected_workspace_revisions AS selected
@@ -823,6 +823,17 @@ CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_topology
 -- MODULES' detached check seeks the selected workspace before its contexts.
 CREATE INDEX IF NOT EXISTS temp.selected_rust_unit_summaries_workspace
  ON selected_rust_unit_summaries(workspace_id, generation, unit_key);
+-- The function increments a connection-local Rust counter outside SQLite's
+-- transaction state. A rollback must never restore an earlier memo key.
+CREATE TEMP TRIGGER IF NOT EXISTS selected_rust_unit_summaries_insert_generation
+AFTER INSERT ON selected_rust_unit_summaries
+BEGIN SELECT bifrost_selected_summary_bump(); END;
+CREATE TEMP TRIGGER IF NOT EXISTS selected_rust_unit_summaries_update_generation
+AFTER UPDATE ON selected_rust_unit_summaries
+BEGIN SELECT bifrost_selected_summary_bump(); END;
+CREATE TEMP TRIGGER IF NOT EXISTS selected_rust_unit_summaries_delete_generation
+AFTER DELETE ON selected_rust_unit_summaries
+BEGIN SELECT bifrost_selected_summary_bump(); END;
 
 -- Workspace dependency reachability, including each root itself. UNION in
 -- the fill makes cyclic and diamond graphs produce one row per root and unit.

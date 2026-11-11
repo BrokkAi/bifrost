@@ -181,6 +181,13 @@ pub struct BindingRow {
     /// binder whose local name is not spelled by a classified token.
     pub node: Option<u32>,
     pub range: Range,
+    /// File-local logical binder anchor. For Rust or-pattern alternatives this
+    /// is the first source-byte occurrence. None keeps identity proof open.
+    pub logical_anchor: Option<(usize, usize)>,
+    /// Index of the first row for this logical binder after source-byte
+    /// normalization. Distinct or-pattern occurrences share this index.
+    pub logical_index: usize,
+    pub syntax: Option<brokk_bifrost_core::analyzer::structural::spec::BindingSyntax>,
     pub name: String,
     pub kind: BindingKind,
     pub hoisting: HoistingClass,
@@ -274,6 +281,8 @@ pub enum EnvironmentIncompleteReason {
     /// The file's source did not parse, so no binder token could be located in
     /// the syntax the adapter reads intervals from.
     SyntaxUnavailable,
+    /// The binder alternatives do not prove one name and binding mode.
+    BindingIdentityUnknown,
     /// The adapter could not state an activation interval for at least one
     /// binder, so the binding set is missing rows rather than complete.
     BindingActivationUnknown,
@@ -317,7 +326,8 @@ impl EnvironmentCompleteness {
                         EnvironmentIncompleteReason::AxisUnsupported(unsupported) => {
                             *unsupported == axis
                         }
-                        EnvironmentIncompleteReason::BindingActivationUnknown => {
+                        EnvironmentIncompleteReason::BindingActivationUnknown
+                        | EnvironmentIncompleteReason::BindingIdentityUnknown => {
                             axis == EnvironmentAxis::BindingIntervals
                         }
                         EnvironmentIncompleteReason::ImportTargetUnstructured => {
@@ -331,6 +341,9 @@ impl EnvironmentCompleteness {
         }
     }
 }
+
+/// Unknown Rust binders keyed by spelling and their possible activation.
+type UnknownBindingIntervals = HashMap<Box<str>, Vec<Option<Range>>>;
 
 /// One file's lexical environment.
 #[derive(Debug, Clone)]
@@ -353,6 +366,10 @@ pub struct EnvironmentFileResult {
     /// candidate list a lookup returns is the same set the linear filter kept,
     /// in the same order.
     bindings_by_name: HashMap<Box<str>, Vec<usize>>,
+    /// Rust binder candidates omitted by an Open verdict. Each known interval
+    /// is where that candidate could bind; None for one name means its interval
+    /// could not be proven. An absent map means absence is unprovable for all.
+    unknown_binding_names: Option<UnknownBindingIntervals>,
     type_parameter_barriers: Vec<Range>,
 }
 
@@ -383,6 +400,7 @@ impl EnvironmentFileResult {
             package,
             completeness,
             bindings_by_name,
+            unknown_binding_names: None,
             type_parameter_barriers: Vec::new(),
         }
     }
@@ -399,6 +417,27 @@ impl EnvironmentFileResult {
         self.bindings_by_name
             .get(name)
             .map_or(&[][..], Vec::as_slice)
+    }
+
+    pub fn binding_intervals_cover_name(&self, name: &str, position_byte: usize) -> bool {
+        self.completeness.covers(EnvironmentAxis::BindingIntervals)
+            || (self.completeness.covers(EnvironmentAxis::Scopes)
+                && self.unknown_binding_names.as_ref().is_some_and(|names| {
+                    names.get(name).is_none_or(|intervals| {
+                        intervals.iter().all(|interval| {
+                            interval.as_ref().is_some_and(|range| {
+                                position_byte < range.start_byte || range.end_byte <= position_byte
+                            })
+                        })
+                    })
+                })
+                && matches!(&self.completeness, EnvironmentCompleteness::Incomplete { reasons, unsupported_axes }
+                    if !unsupported_axes.contains(&EnvironmentAxis::BindingIntervals)
+                    && reasons.iter().all(|reason| matches!(reason,
+                        EnvironmentIncompleteReason::BindingIdentityUnknown
+                        | EnvironmentIncompleteReason::BindingActivationUnknown
+                        | EnvironmentIncompleteReason::AxisUnsupported(EnvironmentAxis::ImportBinders)
+                        | EnvironmentIncompleteReason::ImportTargetUnstructured))))
     }
 
     /// The innermost scope containing `position_byte`.
@@ -477,13 +516,17 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
 
     let mut bindings = Vec::new();
     let mut type_parameter_barriers = Vec::new();
+    let mut unknown_binding_names = None;
     if support.is_supported(EnvironmentAxis::BindingIntervals) && !scopes.is_empty() {
         match parse_tree_for_language(file, language, facts.source()) {
             Some(tree) => {
-                let (rows, barriers) =
+                let (rows, barriers, unknown_names) =
                     binding_rows(spec, file, &facts, &scopes, tree.root_node(), &mut reasons);
                 bindings.extend(rows);
                 type_parameter_barriers = barriers;
+                if language == Language::Rust {
+                    unknown_binding_names = unknown_names;
+                }
             }
             None => reasons.push(EnvironmentIncompleteReason::SyntaxUnavailable),
         }
@@ -505,6 +548,7 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
     let completeness = completeness(support, reasons);
     let mut environment = EnvironmentFileResult::new(scopes, bindings, package, completeness);
     environment.type_parameter_barriers = type_parameter_barriers;
+    environment.unknown_binding_names = unknown_binding_names;
     environment
 }
 
@@ -613,7 +657,7 @@ fn binding_rows(
     scopes: &[ScopeRow],
     root: tree_sitter::Node<'_>,
     reasons: &mut Vec<EnvironmentIncompleteReason>,
-) -> (Vec<BindingRow>, Vec<Range>) {
+) -> (Vec<BindingRow>, Vec<Range>, Option<UnknownBindingIntervals>) {
     let content_identity = facts.source_identity();
     let source = facts.source();
     let mut scope_of_node: Vec<Option<u32>> = vec![None; facts.nodes().len()];
@@ -646,6 +690,9 @@ fn binding_rows(
             content_identity,
             node: Some(node),
             range: normalized.range,
+            logical_anchor: Some((normalized.range.start_byte, normalized.range.end_byte)),
+            logical_index: 0,
+            syntax: None,
             name,
             kind: activation.kind,
             hoisting: activation.hoisting,
@@ -659,6 +706,7 @@ fn binding_rows(
     // Index only binding candidates. The syntax walk below also collects
     // barriers, including owners such as static fields that have no scope row.
     let mut candidates_by_syntax: HashMap<_, Vec<_>> = HashMap::new();
+    let mut anchor_candidates = Vec::new();
     for (index, normalized) in facts.nodes().iter().enumerate() {
         let node = u32::try_from(index).expect("facts arena node count fits in u32");
         let roles = facts.occurrence_roles(node);
@@ -673,13 +721,37 @@ fn binding_rows(
                 super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
                 continue;
             };
+            if roles.contains(&OccurrenceRole::Binder) {
+                anchor_candidates.push(binder);
+            }
             candidates_by_syntax
                 .entry(binder.id())
                 .or_default()
                 .push(node);
         }
     }
+    let anchor_answers = spec.logical_binding_anchors(&anchor_candidates, source);
+    debug_assert_eq!(anchor_answers.len(), anchor_candidates.len());
+    let anchors_by_syntax: HashMap<_, _> = anchor_candidates
+        .iter()
+        .zip(anchor_answers)
+        .map(|(binder, anchor)| (binder.id(), anchor))
+        .collect();
     let mut rows = Vec::new();
+    let mut unknown_names = Some(UnknownBindingIntervals::new());
+    let note_unknown =
+        |names: &mut Option<UnknownBindingIntervals>, node: u32, interval: Option<Range>| {
+            if let Some(names) = names {
+                let range = facts.node(node).range;
+                let raw = &source[range.start_byte..range.end_byte];
+                let name = spec.decode_spelling(raw).unwrap_or_else(|| raw.to_owned());
+                let intervals = names.entry(name.into_boxed_str()).or_default();
+                // An uncertain binder is uncertain at its own written token,
+                // even when its activation begins after the enclosing pattern.
+                intervals.push(Some(range));
+                intervals.push(interval);
+            }
+        };
     let mut barriers = Vec::new();
     let mut pending = vec![root];
     while let Some(syntax) = pending.pop() {
@@ -700,6 +772,13 @@ fn binding_rows(
             let roles = facts.occurrence_roles(node);
             let is_binder = roles.contains(&OccurrenceRole::Binder);
             let binder = syntax;
+            if is_binder && spec.binding_candidate_excluded(binder) {
+                continue;
+            }
+            // The collector already published the extraction verdict as roles:
+            // Binder alone is decided; Binder plus PatternPosition is Open.
+            // Reclassifying the main-tree token would lose embedded syntax.
+            let open_binder = is_binder && roles.contains(&OccurrenceRole::PatternPosition);
             let type_owner = spec.type_parameter_owner(binder);
             let mut candidate_index = enclosing_scope(facts, &scope_of_node, node);
             let declaring_scope = loop {
@@ -734,6 +813,7 @@ fn binding_rows(
                     reasons,
                     EnvironmentIncompleteReason::BindingActivationUnknown,
                 );
+                note_unknown(&mut unknown_names, node, None);
                 continue;
             };
             if type_owner.is_none()
@@ -761,10 +841,25 @@ fn binding_rows(
                         reasons,
                         EnvironmentIncompleteReason::BindingActivationUnknown,
                     );
+                    note_unknown(&mut unknown_names, node, None);
                 }
                 continue;
             };
-            rows.push(make_row(node, declaring_scope, activation));
+            if open_binder {
+                super::note_once(reasons, EnvironmentIncompleteReason::BindingIdentityUnknown);
+                note_unknown(&mut unknown_names, node, Some(activation.activation));
+                continue;
+            }
+            let mut row = make_row(node, declaring_scope, activation);
+            if is_binder {
+                row.logical_anchor = anchors_by_syntax.get(&binder.id()).copied().flatten();
+                row.syntax = spec.binding_syntax(binder);
+                if row.logical_anchor.is_none() {
+                    super::note_once(reasons, EnvironmentIncompleteReason::BindingIdentityUnknown);
+                    note_unknown(&mut unknown_names, node, Some(row.activation));
+                }
+            }
+            rows.push(row);
         }
     }
     debug_assert!(
@@ -791,6 +886,7 @@ fn binding_rows(
                 reasons,
                 EnvironmentIncompleteReason::BindingActivationUnknown,
             );
+            unknown_names = None;
             continue;
         };
         for binder in binders {
@@ -798,6 +894,7 @@ fn binding_rows(
                 binder_nodes_by_range.get(&(binder.name.start_byte(), binder.name.end_byte()))
             else {
                 super::note_once(reasons, EnvironmentIncompleteReason::SyntaxUnavailable);
+                unknown_names = None;
                 continue;
             };
             let Some(activation) = spec.binding_activation(binder.name, scope.range) else {
@@ -805,12 +902,20 @@ fn binding_rows(
                     reasons,
                     EnvironmentIncompleteReason::BindingActivationUnknown,
                 );
+                note_unknown(&mut unknown_names, node, None);
                 continue;
             };
-            rows.push(make_row(node, scope.index, activation));
+            let mut row = make_row(node, scope.index, activation);
+            row.logical_anchor = spec.logical_binding_anchor(binder.name, source);
+            row.syntax = spec.binding_syntax(binder.name);
+            if row.logical_anchor.is_none() {
+                super::note_once(reasons, EnvironmentIncompleteReason::BindingIdentityUnknown);
+                note_unknown(&mut unknown_names, node, Some(row.activation));
+            }
+            rows.push(row);
         }
     }
-    (rows, barriers)
+    (rows, barriers, unknown_names)
 }
 
 /// The local names this file's imports introduce.
@@ -881,6 +986,9 @@ fn import_binder_rows(
             content_identity,
             node,
             range,
+            logical_anchor: Some((range.start_byte, range.end_byte)),
+            logical_index: 0,
+            syntax: None,
             name: local_name.to_owned(),
             kind: BindingKind::ImportBinder,
             hoisting: activation.hoisting,
@@ -1028,6 +1136,32 @@ fn import_binder_node(
 /// Number each scope's binders in source order, so a consumer can tell a
 /// re-binding of the same name from its predecessor without re-deriving order.
 fn assign_source_order(bindings: &mut [BindingRow]) {
+    let mut first_by_anchor = HashMap::new();
+    let mut in_source_order: Vec<usize> = (0..bindings.len()).collect();
+    in_source_order.sort_by_key(|&index| bindings[index].range.start_byte);
+    for index in in_source_order {
+        let row = &bindings[index];
+        let first = row.logical_anchor.and_then(|anchor| {
+            first_by_anchor
+                .get(&(anchor, row.name.clone(), row.kind.label()))
+                .copied()
+        });
+        if let Some(first) = first {
+            bindings[index].logical_index = first;
+        } else {
+            bindings[index].logical_index = index;
+            if let Some(anchor) = bindings[index].logical_anchor {
+                first_by_anchor.insert(
+                    (
+                        anchor,
+                        bindings[index].name.clone(),
+                        bindings[index].kind.label(),
+                    ),
+                    index,
+                );
+            }
+        }
+    }
     let mut order: Vec<usize> = (0..bindings.len()).collect();
     order.sort_by_key(|&index| {
         (
@@ -1132,7 +1266,7 @@ pub fn binding_of(
     if !env.completeness.covers(EnvironmentAxis::Scopes) {
         return BindingOfOutcome::Incomplete(EnvironmentAxis::Scopes);
     }
-    if !env.completeness.covers(EnvironmentAxis::BindingIntervals) {
+    if !env.binding_intervals_cover_name(name, position_byte) {
         return BindingOfOutcome::Incomplete(EnvironmentAxis::BindingIntervals);
     }
     let Some(innermost) = env.innermost_scope(position_byte) else {
@@ -1175,6 +1309,14 @@ pub fn binding_of(
     if candidates.is_empty() {
         return BindingOfOutcome::NoBinding;
     }
+    // Alternative tokens of one or-pattern are one logical binder. Rank the
+    // canonical row once, or a binding would appear to shadow itself.
+    candidates = candidates
+        .into_iter()
+        .map(|index| env.bindings[index].logical_index)
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
     // Nearest scope first, then latest activation, then latest binder.
     candidates.sort_by_key(|&index| {
         let binding = &env.bindings[index];
@@ -1237,6 +1379,12 @@ pub fn binding_of_occurrence(
             introduced.next().is_none(),
             "one binder token introduces one binding"
         );
+        if env.bindings[index].logical_index != index {
+            // An or-pattern alternative is a selected declaring token of the
+            // same logical binding. Keep that physical row for a following
+            // binding-occurrence step even when the arm is already active.
+            return BindingOfOutcome::Reached(index);
+        }
         if occurrence.range.start_byte < env.bindings[index].activation.start_byte {
             return BindingOfOutcome::Reached(index);
         }
@@ -1271,7 +1419,7 @@ mod tests {
         }
         let scopes = scope_rows(spec, &file, &facts);
         let mut reasons = vec![];
-        let (mut bindings, _) =
+        let (mut bindings, _, _) =
             binding_rows(spec, &file, &facts, &scopes, tree.root_node(), &mut reasons);
         let query = AnalyzerQueryScope::new(&analyzer);
         bindings.extend(import_binder_rows(

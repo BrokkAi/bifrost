@@ -204,7 +204,10 @@ pub fn run_selected_worker<'store, 'project, A: WorkerAnswer>(
     work: impl FnOnce(
         &mut SelectedResolutionOperation<'store, 'project>,
     ) -> Result<SelectedResolutionOperationOutcome<A>>,
-) -> Result<SelectedResolutionOperationOutcome<TransportedAnswer<A>>> {
+) -> Result<SelectedResolutionOperationOutcome<TransportedAnswer<A>>>
+where
+    'store: 'project,
+{
     assert!(
         !store.uses_single_connection_reads(),
         "workers require independent readers"

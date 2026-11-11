@@ -87,6 +87,7 @@ pub(crate) type PythonDefiningBindingResolver = fn(
     crate::analyzer::python::runtime_binding::PythonRuntimeBindingError,
 >;
 
+#[derive(Clone, Debug)]
 pub(crate) enum PythonRuntimeBindingFailure {
     Binding(crate::analyzer::python::runtime_binding::PythonRuntimeBindingError),
     ProviderIncomplete(String),
@@ -131,6 +132,8 @@ pub(crate) fn python_runtime_binding_failure_parts(
     }
 }
 
+// No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn python_runtime_binding_failure_diagnostic(
     failure: PythonRuntimeBindingFailure,
 ) -> DefinitionLookupDiagnostic {
@@ -140,41 +143,6 @@ pub(crate) fn python_runtime_binding_failure_diagnostic(
         message,
         claim: None,
     }
-}
-
-pub(crate) fn python_class_resolution_incomplete_diagnostic(
-    message: impl Into<String>,
-) -> DefinitionLookupDiagnostic {
-    DefinitionLookupDiagnostic {
-        kind: "python_imported_class_resolution_incomplete".to_owned(),
-        message: message.into(),
-        claim: None,
-    }
-}
-
-pub(crate) fn python_incomplete_class_value(
-    mut outcome: DefinitionLookupOutcome,
-    status: DefinitionLookupStatus,
-    diagnostic: DefinitionLookupDiagnostic,
-) -> DefinitionLookupOutcome {
-    if status == DefinitionLookupStatus::Ambiguous {
-        // no candidates: the binding resolver proves competing native class
-        // declarations but withholds their identities, so there is no exact
-        // modeled symbol this outcome can safely publish.
-        let mut ambiguous = ambiguous_without_candidates(
-            "the imported Python class binding has multiple native declarations",
-        );
-        ambiguous.reference = outcome.reference.take();
-        ambiguous.diagnostics.append(&mut outcome.diagnostics);
-        ambiguous.diagnostics.push(diagnostic);
-        return ambiguous;
-    }
-    outcome.status = status;
-    outcome.definitions.clear();
-    outcome.modeled_definitions.clear();
-    outcome.lexical_definition = None;
-    outcome.diagnostics.push(diagnostic);
-    outcome
 }
 
 pub(crate) enum PythonRuntimeBindingAttempt {
@@ -219,6 +187,8 @@ pub fn resolve_python_runtime_binding_for_test(
 
 // Keep staged import evidence behind the runtime attempt's terminal outcome.
 // The same boundary is exercised by the imported-call cancellation regression.
+// No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn finish_python_imported_call_binding(
     outcome: &mut DefinitionLookupOutcome,
     evidence: &mut CallEvidence,
@@ -269,6 +239,8 @@ pub(crate) fn finish_python_imported_call_binding(
     }
 }
 
+// No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_python_runtime_binding(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -319,23 +291,28 @@ pub(crate) fn resolve_python_runtime_binding(
 }
 
 #[derive(Clone)]
-struct EnvironmentBindingFact {
-    subject: brokk_bifrost_analysis::analyzer::FactSubject,
-    answer: brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest,
-    complete: bool,
+enum EnvironmentBindingFact {
+    Proven {
+        subject: brokk_bifrost_analysis::analyzer::FactSubject,
+        answer: brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest,
+    },
+    /// Installed provider or launch evidence could not be verified. A Models
+    /// key alone does not cover these non-source inputs, so there is no answer
+    /// to name.
+    Unproven,
 }
 
 impl EnvironmentBindingFact {
     fn inputs(&self) -> brokk_bifrost_analysis::analyzer::AuthorityInputs<'static> {
-        if !self.complete {
-            // Installed provider or launch evidence could not be verified. A
-            // Models key alone does not cover these non-source inputs.
-            return brokk_bifrost_analysis::analyzer::AuthorityInputs::Unnamed;
-        }
-        brokk_bifrost_analysis::analyzer::AuthorityInputs::Fact {
-            language: brokk_bifrost_analysis::analyzer::Language::Python,
-            subject: self.subject.clone(),
-            answer: self.answer,
+        match self {
+            Self::Proven { subject, answer } => {
+                brokk_bifrost_analysis::analyzer::AuthorityInputs::Fact {
+                    language: brokk_bifrost_analysis::analyzer::Language::Python,
+                    subject: subject.clone(),
+                    answer: *answer,
+                }
+            }
+            Self::Unproven => brokk_bifrost_analysis::analyzer::AuthorityInputs::Unnamed,
         }
     }
 }
@@ -443,8 +420,11 @@ fn environment_binding_fact(
     } else {
         digest.value(b"no-model-snapshot");
     }
+    if !complete {
+        return EnvironmentBindingFact::Unproven;
+    }
     let path = brokk_bifrost_core::path_utils::rel_path_string(file);
-    EnvironmentBindingFact {
+    EnvironmentBindingFact::Proven {
         subject: FactSubject::FileNamedMember {
             rel_path: path.into(),
             owner: module.join(".").into(),
@@ -452,7 +432,6 @@ fn environment_binding_fact(
             environment: Some(environment),
         },
         answer: StableDigest::from_array(digest.finish()),
-        complete,
     }
 }
 
@@ -467,15 +446,19 @@ pub(super) fn environment_binding_answer(
     // The question already contains a semantic module identity, not source
     // syntax. Components here are values supplied by the structured binder.
     let module = owner.split('.').map(str::to_owned).collect::<Vec<_>>();
-    let fact = environment_binding_fact(analyzer, &file, &module, member);
+    let EnvironmentBindingFact::Proven { subject, answer } =
+        environment_binding_fact(analyzer, &file, &module, member)
+    else {
+        return None;
+    };
     let brokk_bifrost_analysis::analyzer::FactSubject::FileNamedMember {
         environment: selected,
         ..
-    } = fact.subject
+    } = subject
     else {
         unreachable!("binding fact subject");
     };
-    (fact.complete && selected == environment).then_some(fact.answer)
+    (selected == environment).then_some(answer)
 }
 
 fn resolve_python_runtime_binding_in_snapshot(
@@ -486,100 +469,156 @@ fn resolve_python_runtime_binding_in_snapshot(
     resolve_binding: PythonDefiningBindingResolver,
     active_snapshot: &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
 ) -> PythonRuntimeBindingAttempt {
-    let Some(publication) = active_snapshot.python_runtime() else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
-    let Some(python_analyzer) = resolve_analyzer::<crate::analyzer::PythonAnalyzer>(analyzer)
-    else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
-    let Some((store, current_snapshot)) = python_analyzer.python_runtime_store_snapshot() else {
-        return PythonRuntimeBindingAttempt::Unavailable;
-    };
+    resolve_python_runtime_binding_with_environment_in_snapshot(
+        analyzer,
+        file,
+        imported,
+        cancellation,
+        resolve_binding,
+        active_snapshot,
+    )
+    .attempt
+}
 
-    let selected = store.with_python_runtime_acquisition(
-        publication.acquisition_id,
-        &publication.snapshot,
-        |tx| {
-            crate::analyzer::python::runtime_provider::python_runtime_provider_lookup(
-                tx,
-                publication.acquisition_id,
-                &publication.snapshot,
-                file.rel_path(),
-                &imported.module.join("."),
-            )
-        },
-    );
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return PythonRuntimeBindingAttempt::Cancelled;
-    }
-    let candidate = match selected {
-        Ok(rows)
-            if current_snapshot == publication.snapshot
-                && !rows.has_scope_ambiguity
-                && rows.unresolved_scopes.is_empty()
-                && rows.candidates.len() == 1 =>
-        {
-            rows.candidates.into_iter().next().expect("one provider")
-        }
-        Ok(rows) => {
-            return PythonRuntimeBindingAttempt::Failed(
-                PythonRuntimeBindingFailure::ProviderIncomplete(format!("{rows:?}")),
-            );
-        }
-        Err(error) => {
-            return PythonRuntimeBindingAttempt::Failed(
-                PythonRuntimeBindingFailure::ProviderStale(error.to_string()),
-            );
-        }
-    };
-    let selected_evidence =
-        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence {
-            language: "python".into(),
-            ecosystem: "python".into(),
-            package: candidate.purl.as_ref().map(|purl| {
-                brokk_bifrost_analysis::analyzer::semantic_model::CatalogCoordinate {
-                    name: purl.clone(),
-                    version: None,
-                }
-            }),
-            module: None,
-            toolchain: None,
-            target: None,
-            configuration: None,
-            artifact_sha256: candidate.archive_sha256.clone(),
+/// Metadata from the existing verifier, without a second verification pass.
+enum PythonRuntimeEnvironmentCheck {
+    Unselected,
+    Checked {
+        environment_id: i64,
+        project_config: brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiArtifactDigest,
+    },
+    Refused {
+        environment_id: i64,
+    },
+}
+
+struct PythonRuntimeBindingOperation {
+    attempt: PythonRuntimeBindingAttempt,
+    environment: PythonRuntimeEnvironmentCheck,
+}
+
+fn resolve_python_runtime_binding_with_environment_in_snapshot(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    imported: PythonImportedMember<'_>,
+    cancellation: Option<&CancellationToken>,
+    resolve_binding: PythonDefiningBindingResolver,
+    active_snapshot: &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+) -> PythonRuntimeBindingOperation {
+    let mut environment = PythonRuntimeEnvironmentCheck::Unselected;
+    let attempt = (|| {
+        let Some(publication) = active_snapshot.python_runtime() else {
+            return PythonRuntimeBindingAttempt::Unavailable;
         };
-    let fallback_cancellation = CancellationToken::default();
-    let provider_limits =
-        brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default();
-    let provider_context =
-        crate::analyzer::python::runtime_provider::PythonRuntimeProviderContext {
-            store: &store,
-            publication,
-            workspace_root: analyzer.project().root(),
-            limits: &provider_limits,
-            cancellation: cancellation.unwrap_or(&fallback_cancellation),
+        let Some(python_analyzer) = resolve_analyzer::<crate::analyzer::PythonAnalyzer>(analyzer)
+        else {
+            return PythonRuntimeBindingAttempt::Unavailable;
         };
-    let binding = match provider_context.checked_environment(candidate.environment_id) {
-        Ok(checked) => resolve_binding(
-            active_snapshot.active_models(),
-            &selected_evidence,
-            imported.module,
-            imported.member,
-            file.rel_path(),
+        let Some((store, current_snapshot)) = python_analyzer.python_runtime_store_snapshot()
+        else {
+            return PythonRuntimeBindingAttempt::Unavailable;
+        };
+
+        let selected = store.with_python_runtime_acquisition(
+            publication.acquisition_id,
             &publication.snapshot,
-            Some(&checked.condition_snapshot()),
-        ),
-        Err(error) => Err(
+            |tx| {
+                crate::analyzer::python::runtime_provider::python_runtime_provider_lookup(
+                    tx,
+                    publication.acquisition_id,
+                    &publication.snapshot,
+                    file.rel_path(),
+                    &imported.module.join("."),
+                )
+            },
+        );
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PythonRuntimeBindingAttempt::Cancelled;
+        }
+        let candidate = match selected {
+            Ok(rows)
+                if current_snapshot == publication.snapshot
+                    && !rows.has_scope_ambiguity
+                    && rows.unresolved_scopes.is_empty()
+                    && rows.candidates.len() == 1 =>
+            {
+                rows.candidates.into_iter().next().expect("one provider")
+            }
+            Ok(rows) => {
+                return PythonRuntimeBindingAttempt::Failed(
+                    PythonRuntimeBindingFailure::ProviderIncomplete(format!("{rows:?}")),
+                );
+            }
+            Err(error) => {
+                return PythonRuntimeBindingAttempt::Failed(
+                    PythonRuntimeBindingFailure::ProviderStale(error.to_string()),
+                );
+            }
+        };
+        let selected_evidence =
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvidence {
+                language: "python".into(),
+                ecosystem: "python".into(),
+                package: candidate.purl.as_ref().map(|purl| {
+                    brokk_bifrost_analysis::analyzer::semantic_model::CatalogCoordinate {
+                        name: purl.clone(),
+                        version: None,
+                    }
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: candidate.archive_sha256.clone(),
+            };
+        let fallback_cancellation = CancellationToken::default();
+        let provider_limits =
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits::default();
+        let provider_context =
+            crate::analyzer::python::runtime_provider::PythonRuntimeProviderContext {
+                store: &store,
+                publication,
+                workspace_root: analyzer.project().root(),
+                limits: &provider_limits,
+                cancellation: cancellation.unwrap_or(&fallback_cancellation),
+            };
+        let binding =
+            match provider_context.checked_environment(candidate.environment_id) {
+                Ok(checked) => {
+                    environment = PythonRuntimeEnvironmentCheck::Checked {
+                        environment_id: candidate.environment_id,
+                        project_config: checked.project_config().clone(),
+                    };
+                    #[cfg(any(test, feature = "test-support"))]
+                    native::observe_verified_environment();
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return PythonRuntimeBindingAttempt::Cancelled;
+                    }
+                    resolve_binding(
+                        active_snapshot.active_models(),
+                        &selected_evidence,
+                        imported.module,
+                        imported.member,
+                        file.rel_path(),
+                        &publication.snapshot,
+                        Some(&checked.condition_snapshot()),
+                    )
+                }
+                Err(error) => {
+                    environment = PythonRuntimeEnvironmentCheck::Refused {
+                        environment_id: candidate.environment_id,
+                    };
+                    Err(
             crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::Incomplete(vec![
                 crate::analyzer::python::runtime_binding::PythonRuntimeBindingDiagnostic {
                     code: "python.runtime_binding.environment_incomplete",
                     message: format!("{error:?}"),
                 },
             ]),
-        ),
-    };
-    let binding = match binding {
+        )
+                }
+            };
+        let binding = match binding {
         Ok(_) if cancellation.is_some_and(CancellationToken::is_cancelled) => {
             return PythonRuntimeBindingAttempt::Cancelled;
         }
@@ -597,59 +636,67 @@ fn resolve_python_runtime_binding_in_snapshot(
         }
     };
 
-    let mut provider = Err(
-        brokk_bifrost_analysis::analyzer::store::StoreError::stale_resolution(
-            "Python defining binding touched no import module",
-        ),
-    );
-    let mut provider_environment = None;
-    for module in binding.touched_modules() {
-        let checked = provider_context.verify_selected_provider(
-            file.rel_path(),
-            module,
-            &binding,
-            &selected_evidence,
+        let mut provider = Err(
+            brokk_bifrost_analysis::analyzer::store::StoreError::stale_resolution(
+                "Python defining binding touched no import module",
+            ),
         );
-        match checked {
-            Ok(checked)
-                if provider_environment
-                    .is_none_or(|environment| environment == checked.environment_id()) =>
-            {
-                provider_environment = Some(checked.environment_id());
-                provider = Ok(checked);
-            }
-            Ok(checked) => {
-                provider = Err(
-                    brokk_bifrost_analysis::analyzer::store::StoreError::stale_resolution(format!(
-                        "Python touched modules resolved through different environments: {} and {}",
-                        provider_environment.expect("an earlier touched module was checked"),
-                        checked.environment_id()
-                    )),
-                );
-                break;
-            }
-            Err(error) => {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return PythonRuntimeBindingAttempt::Cancelled;
+        let mut provider_environment = None;
+        for module in binding.touched_modules() {
+            let checked = provider_context.verify_selected_provider(
+                file.rel_path(),
+                module,
+                &binding,
+                &selected_evidence,
+            );
+            match checked {
+                Ok(checked)
+                    if provider_environment
+                        .is_none_or(|environment| environment == checked.environment_id()) =>
+                {
+                    provider_environment = Some(checked.environment_id());
+                    provider = Ok(checked);
                 }
-                provider = Err(error);
-                break;
+                Ok(checked) => {
+                    provider = Err(
+                        brokk_bifrost_analysis::analyzer::store::StoreError::stale_resolution(
+                            format!(
+                                "Python touched modules resolved through different environments: {} and {}",
+                                provider_environment
+                                    .expect("an earlier touched module was checked"),
+                                checked.environment_id()
+                            ),
+                        ),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return PythonRuntimeBindingAttempt::Cancelled;
+                    }
+                    provider = Err(error);
+                    break;
+                }
             }
         }
-    }
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return PythonRuntimeBindingAttempt::Cancelled;
-    }
-    match provider {
-        Ok(provider) => {
-            PythonRuntimeBindingAttempt::Resolved(Box::new(PythonRuntimeBindingAndProvider {
-                binding,
-                provider,
-            }))
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return PythonRuntimeBindingAttempt::Cancelled;
         }
-        Err(error) => PythonRuntimeBindingAttempt::Failed(
-            PythonRuntimeBindingFailure::ProviderVerification(error.to_string()),
-        ),
+        match provider {
+            Ok(provider) => {
+                PythonRuntimeBindingAttempt::Resolved(Box::new(PythonRuntimeBindingAndProvider {
+                    binding,
+                    provider,
+                }))
+            }
+            Err(error) => PythonRuntimeBindingAttempt::Failed(
+                PythonRuntimeBindingFailure::ProviderVerification(error.to_string()),
+            ),
+        }
+    })();
+    PythonRuntimeBindingOperation {
+        attempt,
+        environment,
     }
 }
 
@@ -688,7 +735,7 @@ pub(crate) fn python_class_symbol_from_binding(
     let Some(overlay) = active_snapshot.semantic_model_overlay() else {
         return Err("active Python declaration overlay is unavailable".to_owned());
     };
-    let modeled = overlay.symbols_with_id(identity.native_declaration_id());
+    let modeled = overlay.symbols_with_id_in_family(identity.native_declaration_id(), "python");
     if modeled.disposition
         != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
         || modeled.records.len() != 1
@@ -813,7 +860,7 @@ pub(crate) fn python_module_value_symbol_from_binding(
     let Some(overlay) = active_snapshot.semantic_model_overlay() else {
         return Err("active Python declaration overlay is unavailable".to_owned());
     };
-    let modeled = overlay.symbols_with_id(identity.native_declaration_id());
+    let modeled = overlay.symbols_with_id_in_family(identity.native_declaration_id(), "python");
     if modeled.disposition
         != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
         || modeled.records.len() != 1
@@ -967,10 +1014,31 @@ pub fn python_imported_callee_shape<'tree>(
     focus_end: usize,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<(Vec<tree_sitter::Node<'tree>>, tree_sitter::Node<'tree>)> {
+    let (callee, call) =
+        python_selected_callee_call(tree, focus_start, focus_end, &mut scope_step)?;
+    let focused_chain = call.child_by_field_name("function")?;
+    let path = brokk_bifrost_python::syntax::python_static_attribute_path_bounded(
+        focused_chain,
+        &mut scope_step,
+    )?;
+    if path.last()?.id() != callee.id() {
+        return None;
+    }
+    Some((path, call))
+}
+
+/// Select the call containing the exact focused callee, including value receivers.
+#[doc(hidden)]
+pub fn python_selected_callee_call<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    focus_start: usize,
+    focus_end: usize,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<(tree_sitter::Node<'tree>, tree_sitter::Node<'tree>)> {
     let callee = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
         tree.root_node(), focus_start, focus_end, &mut scope_step,
     )?;
-    if !scope_step() || callee.kind() != "identifier" {
+    if !scope_step() {
         return None;
     }
     let parent = callee.parent()?;
@@ -983,19 +1051,10 @@ pub fn python_imported_callee_shape<'tree>(
     if call.kind() != "call" || call.child_by_field_name("function") != Some(focused_chain) {
         return None;
     }
-    let path = brokk_bifrost_python::syntax::python_static_attribute_path_bounded(
-        focused_chain,
-        &mut scope_step,
-    )?;
-    if path.last()?.id() != callee.id() {
-        return None;
-    }
-    Some((path, call))
+    Some((callee, call))
 }
 
-/// Native import identity is exercised directly until the point-dispatch
-/// adapter owns product refinement. No incumbent resolver calls this service.
-#[cfg(any(test, feature = "test-support"))]
+/// Request-local admission of bindings selected by the native Python operation.
 #[doc(hidden)]
 pub mod native {
     use super::*;
@@ -1016,6 +1075,23 @@ pub mod native {
             .collect()
     }
 
+    /// Authored imported spelling only; this is not checked provider identity.
+    pub fn imported_spelling(
+        boundary: &PythonSelectedImportBoundary,
+        continuation: &[String],
+    ) -> Vec<String> {
+        let bound_segments = boundary.binding_segment_count as usize;
+        assert!(
+            bound_segments <= boundary.route.len(),
+            "retained binding prefix is inside its route"
+        );
+        boundary.route[..bound_segments]
+            .iter()
+            .chain(continuation)
+            .cloned()
+            .collect()
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PythonExternalIdentityKind {
         Callable,
@@ -1025,6 +1101,7 @@ pub mod native {
 
     pub struct PythonCheckedExternalIdentity {
         checked: Box<PythonRuntimeBindingAndProvider>,
+        context: Box<PythonExternalRefusalContext>,
     }
 
     impl PythonCheckedExternalIdentity {
@@ -1059,21 +1136,220 @@ pub mod native {
         pub fn model_symbol(
             &self,
             analyzer: &dyn IAnalyzer,
-        ) -> Result<Arc<SemanticModelSymbol>, String> {
+        ) -> Result<Arc<SemanticModelSymbol>, PythonExternalRefusal> {
+            if self.kind() == PythonExternalIdentityKind::Callable {
+                let fail = |message: String| PythonExternalRefusal {
+                    kind: PythonExternalRefusalKind::ProviderStale,
+                    message,
+                    context: self.context.clone(),
+                };
+                let Some(active) = analyzer.active_semantic_model_snapshot() else {
+                    return Err(fail("active declaration snapshot is unavailable".into()));
+                };
+                let Some(overlay) = active.semantic_model_overlay() else {
+                    return Err(fail("active declaration overlay is unavailable".into()));
+                };
+                let matched =
+                    overlay.symbols_named_in_family(&self.canonical().join("."), "python");
+                let candidates = matched.records.into_iter().filter(|symbol| {
+                    active.active_models().shards().iter().any(|shard| {
+                        shard.manifest.content_sha256 == self.checked.binding.model_manifest_sha256()
+                            && shard.manifest.semantic_sha256 == symbol.provenance.pack_digest
+                            && shard.manifest.pack_id == symbol.provenance.pack_id
+                            && shard.source_id == symbol.provenance.activation.source_id
+                    }) && !symbol.provenance.ambiguous
+                        && symbol.provenance.proof == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProof::ExactArtifact
+                }).collect::<Vec<_>>();
+                let [symbol] = candidates.as_slice() else {
+                    return Err(fail(format!(
+                        "checked callable has no unique composed symbol: {candidates:?}"
+                    )));
+                };
+                return Ok(symbol.clone());
+            }
             python_class_symbol_from_binding(
                 analyzer,
                 &self.checked.binding,
                 &self.checked.provider,
             )
+            .map_err(|message| PythonExternalRefusal {
+                kind: PythonExternalRefusalKind::ProviderStale,
+                message,
+                context: self.context.clone(),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum PythonExternalRefusalKind {
+        BindingIncomplete,
+        ProviderIncomplete,
+        ProviderStale,
+        ApplicabilityIncomplete,
+    }
+    impl PythonExternalRefusalKind {
+        pub fn code(self) -> &'static str {
+            match self {
+                Self::BindingIncomplete => "python_runtime_binding_incomplete",
+                Self::ProviderIncomplete => "python_runtime_provider_incomplete",
+                Self::ProviderStale => "python_runtime_provider_stale",
+                Self::ApplicabilityIncomplete => "python_runtime_applicability_incomplete",
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum PythonRuntimePublicationContext {
+        Acquired(PythonRuntimeProviderPublication),
+        NoRuntimeEnvironmentAcquired,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct PythonExternalEnvironmentContext {
+        pub scope: brokk_bifrost_analysis::analyzer::store::python_runtime::PythonRuntimeScopeRow,
+        pub project_config:
+            Option<brokk_bifrost_semantic::analyzer::semantic_model::csmi::CsmiArtifactDigest>,
+        pub checked: bool,
+    }
+
+    /// One typed authority context, rendered only at the shared reason projection.
+    #[derive(Clone, Debug)]
+    pub struct PythonExternalRefusalContext {
+        pub native_snapshot: Option<brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId>,
+        pub summary_authority: brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryAuthority,
+        pub active_model_set: Option<String>,
+        pub publication: PythonRuntimePublicationContext,
+        pub caller_source: std::path::PathBuf,
+        pub environments: Vec<PythonExternalEnvironmentContext>,
+        pub candidates: Vec<brokk_bifrost_analysis::analyzer::store::python_runtime::PythonRuntimeProviderCandidateRow>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct PythonExternalRefusal {
+        pub kind: PythonExternalRefusalKind,
+        pub message: String,
+        pub context: Box<PythonExternalRefusalContext>,
+    }
+    impl PythonExternalRefusal {
+        pub fn unacquired(
+            file: &ProjectFile,
+            snapshot: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+        ) -> Self {
+            Self { kind: PythonExternalRefusalKind::ProviderIncomplete, message: "no runtime environment acquired".into(), context: Box::new(PythonExternalRefusalContext {
+                native_snapshot: Some(snapshot.clone()),
+                summary_authority: brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryAuthority::Workspace,
+                active_model_set: None,
+                publication: PythonRuntimePublicationContext::NoRuntimeEnvironmentAcquired,
+                caller_source: file.rel_path().to_owned(), environments: Vec::new(), candidates: Vec::new(),
+            }) }
+        }
+    }
+
+    impl std::fmt::Display for PythonExternalRefusal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{}; environment context: {:?}",
+                self.message, self.context
+            )
+        }
+    }
+
+    /// Admission provenance distinguishes model identity from installed bytes.
+    pub enum PythonExternalIdentity {
+        Runtime(PythonCheckedExternalIdentity),
+        GenericModel {
+            canonical: Vec<String>,
+            symbol: Arc<SemanticModelSymbol>,
+            kind: PythonExternalIdentityKind,
+        },
+    }
+
+    impl PythonExternalIdentity {
+        pub fn canonical(&self) -> &[String] {
+            match self {
+                Self::Runtime(identity) => identity.canonical(),
+                Self::GenericModel { canonical, .. } => canonical,
+            }
+        }
+
+        pub fn kind(&self) -> PythonExternalIdentityKind {
+            match self {
+                Self::Runtime(identity) => identity.kind(),
+                Self::GenericModel { kind, .. } => *kind,
+            }
+        }
+
+        pub fn call_proof(&self, parameter_count: u32) -> Option<ExactExternalCallProof> {
+            match self {
+                Self::Runtime(identity) => identity.call_proof(parameter_count),
+                Self::GenericModel {
+                    canonical,
+                    kind: PythonExternalIdentityKind::Callable,
+                    ..
+                } => Some(ExactExternalCallProof::python_imported_call(
+                    canonical.join("."),
+                    parameter_count,
+                )),
+                Self::GenericModel { .. } => None,
+            }
+        }
+
+        pub fn model_symbol(
+            &self,
+            analyzer: &dyn IAnalyzer,
+        ) -> Result<Arc<SemanticModelSymbol>, PythonExternalRefusal> {
+            match self {
+                Self::Runtime(identity) => identity.model_symbol(analyzer),
+                Self::GenericModel { symbol, .. } => Ok(symbol.clone()),
+            }
         }
     }
 
     pub enum PythonExternalAuthorityResult {
-        Checked(PythonCheckedExternalIdentity),
-        Open(String),
-        Ambiguous(String),
-        Stale(String),
+        Checked(PythonExternalIdentity),
+        Open(PythonExternalRefusal),
+        Ambiguous(PythonExternalRefusal),
+        Stale(PythonExternalRefusal),
         Cancelled,
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    thread_local! {
+        static VERIFICATION_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_verification_observer<T>(
+        observer: impl FnOnce() + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                VERIFICATION_OBSERVER.with(|observer| {
+                    observer.borrow_mut().take();
+                });
+            }
+        }
+        VERIFICATION_OBSERVER.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "one verification observer per request"
+            );
+            *slot.borrow_mut() = Some(Box::new(observer));
+        });
+        let _reset = Reset;
+        run()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn observe_verified_environment() {
+        VERIFICATION_OBSERVER.with(|slot| {
+            if let Some(observer) = slot.borrow_mut().take() {
+                observer();
+            }
+        });
     }
 
     type PythonExternalAnswers =
@@ -1085,6 +1361,7 @@ pub mod native {
         analyzer: &'a dyn IAnalyzer,
         file: &'a ProjectFile,
         snapshot: &'a ActiveSemanticModelSnapshot,
+        selected_snapshot: Option<brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId>,
         publication: Option<&'a PythonRuntimeProviderPublication>,
         cancellation: &'a CancellationToken,
         answers: brokk_bifrost_analysis::analyzer::WorkspaceAuthorityMemo<
@@ -1104,6 +1381,12 @@ pub mod native {
                 analyzer,
                 file,
                 snapshot,
+                selected_snapshot: resolve_analyzer::<crate::analyzer::PythonAnalyzer>(analyzer)
+                    .and_then(|python| {
+                        python
+                            .python_runtime_store_snapshot()
+                            .map(|(_, snapshot)| snapshot)
+                    }),
                 publication,
                 cancellation,
                 answers: brokk_bifrost_analysis::analyzer::WorkspaceAuthorityMemo::new(
@@ -1111,6 +1394,14 @@ pub mod native {
                     std::sync::Mutex::new(HashMap::default()),
                 ),
             }
+        }
+
+        pub fn with_selected_snapshot(
+            mut self,
+            snapshot: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+        ) -> Self {
+            self.selected_snapshot = Some(snapshot.clone());
+            self
         }
 
         /// `path` is the full structured attribute chain, including its bound
@@ -1126,25 +1417,39 @@ pub mod native {
                 return Arc::new(Cancelled);
             }
             if boundary.relative_level != 0 || path.is_empty() {
-                return Arc::new(Open("relative or empty import route".into()));
+                return Arc::new(Open(self.refusal(
+                    PythonExternalRefusalKind::ProviderIncomplete,
+                    "relative or empty import route",
+                )));
             }
             if boundary.form != PythonNativeImportForm::Star
                 && boundary.bound_name.as_ref() != path.first()
             {
-                return Arc::new(Open(
-                    "the supplied member chain does not start at this binding".into(),
-                ));
+                return Arc::new(Open(self.refusal(
+                    PythonExternalRefusalKind::ProviderIncomplete,
+                    "the supplied member chain does not start at this binding",
+                )));
             }
-            let bound_segments = boundary.binding_segment_count as usize;
-            assert!(
-                bound_segments <= boundary.route.len(),
-                "retained binding prefix is inside its route"
-            );
-            let mut canonical = boundary.route[..bound_segments].to_vec();
-            if boundary.form == PythonNativeImportForm::Star {
-                canonical.extend_from_slice(path);
+            let continuation = if boundary.form == PythonNativeImportForm::Star {
+                path
             } else {
-                canonical.extend_from_slice(&path[1..]);
+                &path[1..]
+            };
+            let canonical = imported_spelling(boundary, continuation);
+            let generic = self
+                .publication
+                .is_none()
+                .then(|| Arc::new(self.resolve_generic_model(&canonical)));
+            if self.publication.is_none() {
+                let declared_class = generic.as_ref().is_some_and(|answer| matches!(answer.as_ref(), Checked(identity) if identity.kind() == PythonExternalIdentityKind::Class));
+                // Validate every attribute receiver as a module before consulting
+                // the canonical memo: different imports can reach the same name.
+                let first = boundary.binding_segment_count as usize;
+                for end in first..canonical.len() {
+                    if self.generic_model_symbol(&canonical[..end].join("."), None).is_none_or(|symbol| symbol.kind != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Module)  && !(declared_class && self.generic_namespace_is_external(&canonical[..end].join("."))) {
+                        return Arc::new(Open(self.refusal(PythonExternalRefusalKind::ProviderIncomplete, "no runtime environment acquired")));
+                    }
+                }
             }
             self.answers
                 .read(
@@ -1160,7 +1465,9 @@ pub mod native {
                         {
                             return answer;
                         }
-                        let answer = Arc::new(self.resolve(&canonical));
+                        let answer = generic
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(self.resolve(&canonical)));
                         let (member, module) =
                             canonical.split_last().expect("nonempty canonical import");
                         let mut fact =
@@ -1176,7 +1483,7 @@ pub mod native {
                                 .and_then(|snapshot| snapshot.python_runtime())
                                 != self.publication
                         {
-                            fact.complete = false;
+                            fact = EnvironmentBindingFact::Unproven;
                         }
                         let entry = (answer, fact);
                         memo.lock()
@@ -1189,62 +1496,253 @@ pub mod native {
                 .0
         }
 
+        fn context(&self) -> PythonExternalRefusalContext {
+            PythonExternalRefusalContext {
+                native_snapshot: self.selected_snapshot.clone(),
+                summary_authority: brokk_bifrost_analysis::analyzer::store::python_unit_summaries::PythonSummaryAuthority::Workspace,
+                active_model_set: Some(self.snapshot.active_models().active_model_set_hash().to_owned()),
+                publication: self.publication.cloned().map_or(PythonRuntimePublicationContext::NoRuntimeEnvironmentAcquired, PythonRuntimePublicationContext::Acquired),
+                caller_source: self.file.rel_path().to_owned(),
+                environments: Vec::new(),
+                candidates: Vec::new(),
+            }
+        }
+
+        fn refusal(
+            &self,
+            kind: PythonExternalRefusalKind,
+            message: impl Into<String>,
+        ) -> PythonExternalRefusal {
+            PythonExternalRefusal {
+                kind,
+                message: message.into(),
+                context: Box::new(self.context()),
+            }
+        }
+
+        fn generic_namespace_is_external(&self, name: &str) -> bool {
+            let Some(python) = resolve_analyzer::<crate::analyzer::PythonAnalyzer>(self.analyzer)
+            else {
+                return false;
+            };
+            // Existence queries are capped at one row; an interrupted empty
+            // query cannot prove that a workspace namespace is absent.
+            let modules = python
+                .module_candidates_by_fqn_limited(name, 1, || !self.cancellation.is_cancelled());
+            let declarations = python.declaration_candidates_by_fqn_limited(name, 1, || {
+                !self.cancellation.is_cancelled()
+            });
+            if !modules.complete
+                || !modules.rows.is_empty()
+                || !declarations.complete
+                || !declarations.rows.is_empty()
+            {
+                return false;
+            }
+            let support = brokk_bifrost_analysis::analyzer::AnalyzerDefinitionLookup::new(
+                self.analyzer,
+                brokk_bifrost_core::analyzer::Language::None,
+            );
+            if crate::analyzer::python::lookup_helpers::python_workspace_module_exists(
+                python, &support, name,
+            ) {
+                return false;
+            }
+            true
+        }
+
+        /// Select one exact model identity without borrowing installed-artifact authority.
+        fn generic_model_symbol(
+            &self,
+            name: &str,
+            member: Option<&str>,
+        ) -> Option<Arc<SemanticModelSymbol>> {
+            use brokk_bifrost_analysis::analyzer::semantic::{
+                SemanticLanguage, UnmaterializedExternalTarget,
+            };
+            use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition;
+            use brokk_bifrost_analysis::analyzer::store::active_models::python_shard_requires_distribution_artifact;
+            if !self.generic_namespace_is_external(name) {
+                return None;
+            }
+            let overlay = self.snapshot.semantic_model_overlay()?;
+            let matched = overlay.symbols_named_for(name, "python");
+            let [symbol] = matched.records.as_slice() else {
+                return None;
+            };
+            if matched.disposition != SemanticModelOverlayDisposition::Unique
+                || symbol.language != "python"
+                || (symbol.qualified_name != name
+                    && !symbol.aliases.iter().any(|alias| alias == name))
+                || symbol.provenance.ambiguous
+                || symbol.provenance.active_model_set_hash
+                    != self.snapshot.active_models().active_model_set_hash()
+            {
+                return None;
+            }
+            // Apply the same selector rule as the shared summary matcher. A
+            // PyPI model cannot gain generic authority merely by being active.
+            let target = UnmaterializedExternalTarget::new_modeled(
+                name,
+                member.unwrap_or("__module__"),
+                SemanticLanguage::Standard(brokk_bifrost_core::analyzer::Language::Python),
+                0,
+                false,
+            )?;
+            let shards = self.snapshot.active_models().shards();
+            let providers = shards
+                .iter()
+                .filter(|shard| {
+                    shard.manifest.pack_id == symbol.provenance.pack_id
+                        && shard.manifest.semantic_sha256 == symbol.provenance.pack_digest
+                        && shard.manifest.version == symbol.provenance.pack_version
+                        && shard.source_id == symbol.provenance.activation.source_id
+                })
+                .collect::<Vec<_>>();
+            if providers.is_empty()
+                || providers.iter().any(|provider| {
+                    python_shard_requires_distribution_artifact(provider, &target)
+                        || provider
+                            .selectors
+                            .iter()
+                            .any(|selector| selector.artifact_sha256.is_some())
+                })
+            {
+                return None;
+            }
+            Some(symbol.clone())
+        }
+
+        fn resolve_generic_model(&self, canonical: &[String]) -> PythonExternalAuthorityResult {
+            use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind;
+            let refused = || {
+                PythonExternalAuthorityResult::Open(self.refusal(
+                    PythonExternalRefusalKind::ProviderIncomplete,
+                    "no runtime environment acquired",
+                ))
+            };
+            let Some((member, module)) = canonical
+                .split_last()
+                .filter(|(_, module)| !module.is_empty())
+            else {
+                return refused();
+            };
+            let Some(symbol) = self.generic_model_symbol(&canonical.join("."), Some(member)) else {
+                return refused();
+            };
+            if symbol.kind == SemanticModelSymbolKind::Class {
+                // A declared class admits its own namespace only for this
+                // selected member, including explicitly authored aliases.
+                if symbol.owner_id.is_some()
+                    || !self.generic_namespace_is_external(&module.join("."))
+                {
+                    return refused();
+                }
+            } else {
+                let Some(owner) = self.generic_model_symbol(&module.join("."), Some(member)) else {
+                    return refused();
+                };
+                if owner.kind != SemanticModelSymbolKind::Module
+                    || symbol.owner_id.as_deref() != Some(owner.id.as_str())
+                {
+                    return refused();
+                }
+            }
+            let kind = match symbol.kind {
+                SemanticModelSymbolKind::Function if symbol.callable_family_complete => {
+                    PythonExternalIdentityKind::Callable
+                }
+                SemanticModelSymbolKind::Class => PythonExternalIdentityKind::Class,
+                SemanticModelSymbolKind::Field | SemanticModelSymbolKind::Constant => {
+                    PythonExternalIdentityKind::ModuleValue
+                }
+                _ => return refused(),
+            };
+            PythonExternalAuthorityResult::Checked(PythonExternalIdentity::GenericModel {
+                canonical: symbol
+                    .qualified_name
+                    .split('.')
+                    .map(str::to_owned)
+                    .collect(),
+                symbol,
+                kind,
+            })
+        }
+
         fn resolve(&self, canonical: &[String]) -> PythonExternalAuthorityResult {
             use PythonExternalAuthorityResult::*;
+            use PythonExternalRefusalKind::*;
             let Some(publication) = self.publication else {
-                return Open("active runtime publication is unavailable".into());
+                if self.snapshot.python_runtime().is_some() {
+                    return Stale(self.refusal(
+                        ProviderStale,
+                        "active model snapshot and runtime publication disagree",
+                    ));
+                }
+                return self.resolve_generic_model(canonical);
             };
             if self.snapshot.python_runtime() != Some(publication) {
-                return Stale("active model snapshot and runtime publication disagree".into());
+                return Stale(self.refusal(
+                    ProviderStale,
+                    "active model snapshot and runtime publication disagree",
+                ));
             }
             let Some(python) = resolve_analyzer::<crate::analyzer::PythonAnalyzer>(self.analyzer)
             else {
-                return Open("Python analyzer is unavailable".into());
+                return Open(self.refusal(ProviderIncomplete, "Python analyzer is unavailable"));
             };
             let Some((store, current)) = python.python_runtime_store_snapshot() else {
-                return Open("selected Python snapshot is unavailable".into());
+                return Open(self.refusal(
+                    ProviderIncomplete,
+                    "selected Python snapshot is unavailable",
+                ));
             };
-            if current != publication.snapshot {
-                return Stale("selected Python snapshot changed".into());
+            if current != publication.snapshot
+                || self.selected_snapshot.as_ref() != Some(&publication.snapshot)
+            {
+                return Stale(self.refusal(ProviderStale, "selected Python snapshot changed"));
             }
-            let mut reason = "no artifact module prefix selects this member".to_owned();
-            // Module continuation belongs to the artifact authority. A shorter
-            // prefix with multiple remaining attributes is receiver identity,
-            // which this import bridge deliberately leaves open.
+            let mut refusal = self.refusal(
+                ProviderIncomplete,
+                "no artifact module prefix selects this member",
+            );
+            // Admission stops at a provider-qualified binding. Shared external
+            // owner/member inventory is the separate stage tracked by #7857.
             for split in (1..canonical.len()).rev() {
                 if self.cancellation.is_cancelled() {
                     return Cancelled;
                 }
                 let module = &canonical[..split];
                 let selection = store.with_python_runtime_acquisition(
-                    publication.acquisition_id,
-                    &publication.snapshot,
-                    |tx| {
-                        crate::analyzer::python::runtime_provider::python_runtime_provider_lookup(
-                            tx,
-                            publication.acquisition_id,
-                            &publication.snapshot,
-                            self.file.rel_path(),
-                            &module.join("."),
-                        )
-                    },
-                );
+                    publication.acquisition_id, &publication.snapshot, |tx| {
+                        let rows = crate::analyzer::python::runtime_provider::python_runtime_provider_lookup(
+                            tx, publication.acquisition_id, &publication.snapshot, self.file.rel_path(), &module.join("."))?;
+                        let environments = rows.scopes.iter().map(|scope| {
+                            let project_config = brokk_bifrost_analysis::analyzer::store::python_runtime::python_runtime_declared_environment(tx, publication.acquisition_id.get(), scope.environment_id)?.map(|(_, digest)| digest);
+                            Ok(PythonExternalEnvironmentContext { scope: scope.clone(), project_config, checked: false })
+                        }).collect::<Result<Vec<_>, brokk_bifrost_analysis::analyzer::store::StoreError>>()?;
+                        Ok((rows, environments))
+                    });
                 if self.cancellation.is_cancelled() {
                     return Cancelled;
                 }
-                let rows = match selection {
+                let (rows, environments) = match selection {
                     Ok(rows) => rows,
-                    Err(error) => return Stale(error.to_string()),
+                    Err(error) => return Stale(self.refusal(ProviderStale, error.to_string())),
                 };
+                refusal.context.environments = environments;
+                refusal.context.candidates = rows.candidates.clone();
                 if rows.has_scope_ambiguity || rows.candidates.len() > 1 {
-                    return Ambiguous(format!("{rows:?}"));
+                    refusal.message = format!("{rows:?}");
+                    return Ambiguous(refusal);
                 }
                 if !rows.unresolved_scopes.is_empty() || rows.candidates.len() != 1 {
-                    reason = format!("{rows:?}");
+                    refusal.message = format!("{rows:?}");
                     continue;
                 }
                 if canonical.len() - split != 1 {
-                    return Open("attributes after the longest artifact module prefix require receiver identity".into());
+                    refusal.message = "attributes after the longest artifact module prefix require receiver identity".into();
+                    return Open(refusal);
                 }
                 let member = &canonical[split];
                 for resolver in [
@@ -1252,21 +1750,82 @@ pub mod native {
                         as PythonDefiningBindingResolver,
                     crate::analyzer::python::runtime_binding::resolve_python_defining_class_binding,
                 ] {
-                    match resolve_python_runtime_binding_in_snapshot(self.analyzer, self.file,
-                        PythonImportedMember { module, member }, Some(self.cancellation), resolver, self.snapshot) {
-                        PythonRuntimeBindingAttempt::Resolved(checked) => return Checked(PythonCheckedExternalIdentity { checked }),
+                    let operation = resolve_python_runtime_binding_with_environment_in_snapshot(
+                        self.analyzer,
+                        self.file,
+                        PythonImportedMember { module, member },
+                        Some(self.cancellation),
+                        resolver,
+                        self.snapshot,
+                    );
+                    let environment_refused = matches!(
+                        &operation.environment,
+                        PythonRuntimeEnvironmentCheck::Refused { .. }
+                    );
+                    match operation.environment {
+                        PythonRuntimeEnvironmentCheck::Checked {
+                            environment_id,
+                            project_config,
+                        } => {
+                            for environment in &mut refusal.context.environments {
+                                if environment.scope.environment_id == environment_id {
+                                    environment.project_config = Some(project_config.clone());
+                                    environment.checked = true;
+                                }
+                            }
+                        }
+                        PythonRuntimeEnvironmentCheck::Refused { environment_id } => {
+                            for environment in &mut refusal.context.environments {
+                                if environment.scope.environment_id == environment_id {
+                                    environment.checked = false;
+                                }
+                            }
+                        }
+                        PythonRuntimeEnvironmentCheck::Unselected => {}
+                    }
+                    match operation.attempt {
+                        PythonRuntimeBindingAttempt::Resolved(checked) => {
+                            if self.cancellation.is_cancelled() {
+                                return Cancelled;
+                            }
+                            return Checked(PythonExternalIdentity::Runtime(PythonCheckedExternalIdentity {
+                                checked,
+                                context: Box::new(refusal.context.as_ref().clone()),
+                            }));
+                        }
                         PythonRuntimeBindingAttempt::Cancelled => return Cancelled,
-                        PythonRuntimeBindingAttempt::Unavailable => {},
-                        PythonRuntimeBindingAttempt::Failed(PythonRuntimeBindingFailure::ProviderStale(reason)
-                            | PythonRuntimeBindingFailure::ProviderVerification(reason)) => return Stale(reason),
-                        PythonRuntimeBindingAttempt::Failed(PythonRuntimeBindingFailure::Binding(
-                            crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::Ambiguous(reasons))) => return Ambiguous(format!("{reasons:?}")),
-                        PythonRuntimeBindingAttempt::Failed(failure) => reason = python_runtime_binding_failure_parts(failure).2,
+                        PythonRuntimeBindingAttempt::Unavailable => {}
+                        PythonRuntimeBindingAttempt::Failed(PythonRuntimeBindingFailure::Binding(crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::NotClassOrModuleValue)) => {}
+                        PythonRuntimeBindingAttempt::Failed(failure) => {
+                            let ambiguous = matches!(&failure, PythonRuntimeBindingFailure::Binding(crate::analyzer::python::runtime_binding::PythonRuntimeBindingError::Ambiguous(_)));
+                            let stale = environment_refused || matches!(
+                                &failure,
+                                PythonRuntimeBindingFailure::ProviderStale(_)
+                                    | PythonRuntimeBindingFailure::ProviderVerification(_)
+                            );
+                            refusal.kind = match &failure {
+                                PythonRuntimeBindingFailure::Binding(_) => BindingIncomplete,
+                                PythonRuntimeBindingFailure::ProviderIncomplete(_) => {
+                                    ProviderIncomplete
+                                }
+                                PythonRuntimeBindingFailure::ProviderStale(_) => ProviderStale,
+                                PythonRuntimeBindingFailure::ProviderVerification(_) => {
+                                    ApplicabilityIncomplete
+                                }
+                            };
+                            refusal.message = python_runtime_binding_failure_parts(failure).2;
+                            if ambiguous {
+                                return Ambiguous(refusal);
+                            }
+                            if stale {
+                                return Stale(refusal);
+                            }
+                        }
                     }
                 }
-                return Open(reason);
+                return Open(refusal);
             }
-            Open(reason)
+            Open(refusal)
         }
     }
 }

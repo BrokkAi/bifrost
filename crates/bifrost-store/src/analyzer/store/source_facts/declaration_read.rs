@@ -7,11 +7,11 @@ use brokk_bifrost_core::analyzer::source_facts::{
     SourceDeclaration, SourceDeclarationId, SourceFactRows, SourceLexicalDeclarationFact,
     SourceOccurrence, SourceOccurrenceId,
 };
-use rusqlite::Transaction;
+use rusqlite::Connection;
 
 #[doc(hidden)]
 pub fn read_source_identity_rows(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     expected_occurrences: usize,
     expected_declarations: usize,

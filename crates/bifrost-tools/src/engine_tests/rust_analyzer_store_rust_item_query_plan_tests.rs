@@ -203,7 +203,9 @@ wrap! { pub mod embedded { pub struct Embedded; } }
                 Value::Text(oid.to_owned()),
                 Value::Integer(generation),
                 Value::Integer(brokk_bifrost_analysis::analyzer::store::source_facts::SOURCE_FACTS_VERSION),
-                Value::Integer(1),
+                Value::Integer(
+                    brokk_bifrost_analysis::analyzer::store::source_facts::rust_items::RUST_ITEM_SOURCE_FACTS_VERSION,
+                ),
             ],
         },
         QueryPlanCase {
@@ -473,7 +475,7 @@ wrap! { pub mod embedded { pub struct Embedded; } }
         let mut oids = Vec::new();
         for (index, source) in sources.iter().enumerate() {
             let path = format!("src/plan_{index}.rs");
-            let mut state = parse_state(&RustAdapter, &fixture.file(path));
+            let mut state = parse_state(&RustAdapter::for_tests(), &fixture.file(path));
             // Rust's current AST projection legitimately leaves lexical prefixes
             // empty.  Exercise the shared canonical import storage shape as well,
             // so the prefix reader has a populated blob-scoped row to pin.
@@ -493,7 +495,7 @@ wrap! { pub mod embedded { pub struct Embedded; } }
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .unwrap_or_else(|error| panic!("populate Rust item plan fixture {index}: {error}"));
@@ -505,7 +507,7 @@ wrap! { pub mod embedded { pub struct Embedded; } }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/plan_0.rs"),
                 &|| true,
             )

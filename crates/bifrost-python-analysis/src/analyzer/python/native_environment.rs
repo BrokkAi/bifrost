@@ -1,24 +1,37 @@
 //! Explicit native validation assembly. Store derivation stays below language
 //! parsing and analyzer publication; production does not call this entry.
+#[cfg(any(test, feature = "test-support"))]
 use super::PythonAdapter;
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::store::Result;
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
-    PythonEnvironmentPublication, PythonEnvironmentSnapshotInputs, PythonSummaryProfile,
-    PythonSummaryReceipt,
+    PythonEnvironmentPublication, PythonSummaryProfile, PythonSummaryReceipt,
 };
+use brokk_bifrost_analysis::analyzer::store::python_unit_summaries::{
+    PythonEnvironmentSnapshotInputs, PythonWorkspaceRoot,
+};
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::store_bridge::PythonEnvironmentPublicationEngineExt;
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::Language;
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::model::ProjectFile;
+#[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::project::Project;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 /// Owns a validation store, never a retained index of Python modules.
+#[cfg(any(test, feature = "test-support"))]
 pub struct PythonNativeEnvironment {
     pub(crate) publication: PythonEnvironmentPublication,
     workspace_root: PathBuf,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl PythonNativeEnvironment {
     pub fn open(path: &Path, workspace_root: &Path, profile: PythonSummaryProfile) -> Result<Self> {
         let parser = brokk_bifrost_analysis::analyzer::parser_language_for(Language::Python)
@@ -121,6 +134,7 @@ impl PythonNativeEnvironment {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PythonNativeEnvironment {
     /// Read retained source inputs under this selected native environment.
     pub fn render_binding_inputs(&self, revision: i64) -> Result<String> {
@@ -143,7 +157,8 @@ impl PythonNativeEnvironment {
 /// Captures only a root path; all membership and bytes come from the snapshot.
 pub fn python_environment_root(
     root: PathBuf,
-) -> impl Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PathBuf> + Send + 'static {
+) -> impl Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PythonWorkspaceRoot> + Send + 'static
+{
     struct Inputs<'a>(&'a PythonEnvironmentSnapshotInputs);
     impl brokk_bifrost_python::declarations::PythonImportRootInputs for Inputs<'_> {
         fn contains(&self, path: &Path) -> bool {
@@ -160,13 +175,16 @@ pub fn python_environment_root(
         }
     }
     move |path, inputs| {
-        Ok(
-            brokk_bifrost_python::declarations::python_import_root_with_inputs(
+        let (canonical, declared) =
+            brokk_bifrost_python::declarations::python_import_root_selection_with_inputs(
                 &root,
                 path,
                 &Inputs(inputs),
-            )?,
-        )
+            )?;
+        Ok(PythonWorkspaceRoot {
+            canonical,
+            declared,
+        })
     }
 }
 

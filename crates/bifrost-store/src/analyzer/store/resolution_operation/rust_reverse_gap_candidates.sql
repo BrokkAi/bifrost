@@ -6,10 +6,11 @@
 -- the references and qualified routes that confirmation accounted for.
 --
 -- Parameters: ?1 target key, ?2 target names (JSON), ?3 qualified-reference gap
--- origin, ?4 local semantic base, ?5 member-reference site kind, ?6 accounted
--- reference sites (JSON), ?7 target owner is a type scope, ?8 callable-reference
--- site kind, ?9 closed qualified reference sites (JSON), ?10 generated-item gap
--- origin, ?11 call-applicability gap origin.
+-- origin, ?4 local semantic base, ?5 accounted reference sites (JSON),
+-- ?6 target owner is a type scope, ?7 callable-reference site kind,
+-- ?8 closed qualified reference sites (JSON), ?9 generated-item gap origin,
+-- ?10 call-applicability gap origin. The initial locator projection also binds
+-- ?11 argument-coercion rule, ?12 primary provenance, ?13 member-reference kind.
 WITH raw_gaps(host,reason_key,origin,blob_id,source_site) AS (
   -- The reason and gap joins are CROSS JOIN so the candidate sites drive the
   -- loop: each site seeks its reasons, and each reason seeks its gap rows. A
@@ -39,7 +40,7 @@ WITH raw_gaps(host,reason_key,origin,blob_id,source_site) AS (
   -- gap row is read only when its covers value can qualify. An OR in the join
   -- predicate kept the planner from seeking on covers.
   WHERE candidate.target_key=?1
-    AND NOT (reason.origin=?10 AND gap.covers=3)
+    AND NOT (reason.origin=?9 AND gap.covers=3)
     AND (gap.covers<>6 OR reason.origin=?3)
   UNION
   SELECT candidate.host,
@@ -56,114 +57,18 @@ WITH raw_gaps(host,reason_key,origin,blob_id,source_site) AS (
   WHERE candidate.target_key=?1
     AND NOT EXISTS (
     SELECT 1
-    FROM json_each(?6) AS confirmed
+    FROM json_each(?5) AS confirmed
     WHERE confirmed.value->>0=candidate.host
       AND confirmed.value->>1=reason.site
   )
 ),
--- effective_gaps probes qualified_routes, external_roots and
--- out_of_scope_local_alias_roots once per raw gap. Inlined, each probe re-ran
--- the whole CTE as a correlated co-routine, so one execution cost the square of
--- the target's gaps; the alias CTE also started from resolution_sites by role,
--- reading every reference site in the workspace each time. MATERIALIZED
--- computes each once per execution, and the CROSS JOIN after raw_gaps keeps
--- the target's bounded gaps driving the loop.
-qualified_routes(host,reason_key,path_key,blob_id,source_site,root_name,topology_id,module_path,scope_ordinal) AS MATERIALIZED (
-  SELECT gap.host,gap.reason_key,terminal.path_key,gap.blob_id,gap.source_site,root.segment,
-         placement.topology_id,placement.container_path,placement.scope_ordinal
-  FROM raw_gaps AS gap
-  CROSS JOIN main.resolution_sites AS reference_site
-    ON reference_site.blob_id=gap.blob_id
-   AND reference_site.site=gap.source_site
-   AND reference_site.role=0
-   AND reference_site.site_kind IS NOT ?5
-  JOIN main.resolution_root_route_segments AS terminal
-    INDEXED BY resolution_root_route_segments_reference
-    ON terminal.blob_id=gap.blob_id
-   AND terminal.reference_source_site=gap.source_site
-   AND terminal.terminal_spelling IS NOT NULL
-  JOIN main.resolution_root_route_segments AS root
-    ON root.blob_id=terminal.blob_id
-   AND root.path_key=terminal.path_key
-   AND root.position=0
-  JOIN main.resolution_rust_reference_contexts AS context
-    ON context.blob_id=gap.blob_id
-   AND context.source_site=gap.source_site
-  JOIN temp.selected_rust_container_placements AS placement
-    ON placement.mount_ordinal=gap.host
-   AND placement.blob_id=gap.blob_id
-   AND placement.module_declaration IS context.module_declaration
-  WHERE gap.origin=?3
-),
-external_roots(host,reason_key,path_key) AS MATERIALIZED (
-  SELECT DISTINCT route.host,route.reason_key,route.path_key
-  FROM qualified_routes AS route
-  WHERE EXISTS (
-    SELECT 1
-    FROM rust_crate_dependencies AS dependency
-    WHERE dependency.topology_id=route.topology_id
-      AND dependency.extern_name=route.root_name
-      AND dependency.boundary IN ('external','std')
-  ) OR EXISTS (
-    SELECT 1
-    FROM rust_crate_topologies AS topology
-    WHERE topology.topology_id=route.topology_id
-      AND ((route.root_name='std' AND topology.prelude='std')
-        OR (route.root_name='core' AND topology.prelude IN ('std','core'))
-        OR (route.root_name='alloc' AND topology.prelude='std'))
-  ) OR EXISTS (
-    SELECT 1
-    FROM source_rust_import_targets AS imported
-    WHERE imported.blob_id=route.blob_id
-      AND imported.module_path=route.module_path
-      AND imported.bound_name=route.root_name
-      AND imported.is_glob=0
-      AND EXISTS (
-        SELECT 1
-        FROM rust_crate_dependencies AS dependency
-        WHERE dependency.topology_id=route.topology_id
-          AND dependency.extern_name=COALESCE(
-            (SELECT segment.segment
-             FROM source_rust_import_module_segments AS segment
-             WHERE segment.blob_id=imported.blob_id
-               AND segment.import_ordinal=imported.ordinal
-               AND segment.ordinal=0),
-            imported.imported_name
-          )
-          AND dependency.boundary IN ('external','std')
-      )
-  )
-  AND NOT EXISTS (
-    SELECT 1
-    FROM source_rust_module_inventory AS module
-    WHERE module.blob_id=route.blob_id
-      AND module.parent_scope_ordinal=route.scope_ordinal
-      AND module.module_name=route.root_name
-  )
-  AND NOT EXISTS (
-    SELECT 1
-    FROM source_rust_import_targets AS shadow
-    WHERE shadow.blob_id=route.blob_id
-      AND shadow.module_path=route.module_path
-      AND shadow.bound_name=route.root_name
-      AND NOT (
-        shadow.is_glob=0 AND EXISTS (
-          SELECT 1
-          FROM rust_crate_dependencies AS dependency
-          WHERE dependency.topology_id=route.topology_id
-            AND dependency.extern_name=COALESCE(
-              (SELECT segment.segment
-               FROM source_rust_import_module_segments AS segment
-               WHERE segment.blob_id=shadow.blob_id
-                 AND segment.import_ordinal=shadow.ordinal
-                 AND segment.ordinal=0),
-              shadow.imported_name
-            )
-            AND dependency.boundary IN ('external','std')
-        )
-      )
-  )
-),
+-- #11173 removed external_roots: qualified paths with an external root are
+-- not discharged. Such gaps stay open, so answers can be incomplete where
+-- they could have been complete. No candidate site had an external root on
+-- the measured corpora.
+-- effective_gaps probes out_of_scope_local_alias_roots once per raw gap.
+-- MATERIALIZED computes it once per execution instead of rerunning it as a
+-- correlated co-routine; CROSS JOIN keeps the bounded raw gaps driving it.
 out_of_scope_local_alias_roots(host,blob_id,source_site,reason_key,origin) AS MATERIALIZED (
   -- A local `use` alias only closes a route inside its lexical extent. A
   -- same-spelled path outside that extent cannot name the imported target.
@@ -194,13 +99,13 @@ out_of_scope_local_alias_roots(host,blob_id,source_site,reason_key,origin) AS MA
         -- Invocation applicability cannot make an out-of-scope module alias
         -- name this free function. Close only that exact call reason; macro,
         -- activation and source-inventory obligations remain independent.
-        gap.origin=?11
-        AND ?7=0 AND json_extract(?2,'$[0][1]')='callable'
+        gap.origin=?10
+        AND ?6=0 AND json_extract(?2,'$[0][1]')='callable'
         AND NOT EXISTS (
           SELECT 1 FROM json_each(?2) AS seed
           WHERE seed.value->>1<>'callable'
         )
-        AND reference_site.site_kind=?8
+        AND reference_site.site_kind=?7
         AND NOT EXISTS (
           SELECT 1 FROM main.resolution_gaps AS obligation
             INDEXED BY resolution_gaps_reason_covers
@@ -238,7 +143,7 @@ effective_gaps AS (
   -- Complete empty applicability alone cannot close an unresolved route.
   -- Macro, binder and enumeration gaps remain independent below.
   WHERE NOT (g.origin=?3 AND EXISTS (
-    SELECT 1 FROM json_each(?9) AS resolved
+    SELECT 1 FROM json_each(?8) AS resolved
     WHERE resolved.value->>0=g.host AND resolved.value->>1=g.source_site
   ))
     AND NOT EXISTS (
@@ -254,21 +159,7 @@ effective_gaps AS (
       AND outside.origin=g.origin
   )
     AND (
-      (g.origin=?3 AND (
-        NOT EXISTS (
-          SELECT 1 FROM qualified_routes AS route
-          WHERE route.host=g.host AND route.reason_key=g.reason_key
-        ) OR EXISTS (
-          SELECT 1 FROM qualified_routes AS route
-          WHERE route.host=g.host AND route.reason_key=g.reason_key
-            AND NOT EXISTS (
-              SELECT 1 FROM external_roots AS external
-              WHERE external.host=route.host
-                AND external.reason_key=route.reason_key
-                AND external.path_key=route.path_key
-          )
-        )
-      ))
+      g.origin=?3
       OR (g.origin<>?3 AND ({effective_gap_remains}))
     )
 )

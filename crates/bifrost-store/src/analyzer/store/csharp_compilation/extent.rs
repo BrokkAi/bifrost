@@ -15,6 +15,22 @@ pub(in crate::analyzer::store) const UNMARK_SQL: &str =
     "DELETE FROM csharp_using_publications WHERE blob_id=?1 RETURNING blob_id";
 pub(in crate::analyzer::store) const RETIRE_MARK_SQL: &str = "DELETE FROM csharp_using_publications WHERE blob_id=?1 AND producer_epoch<>?2 RETURNING producer_epoch";
 
+// #10342: only the dedicated compilation import enumeration origin (append-only
+// ResolutionGapOriginKind code 29) prevents certification of global directives.
+pub(in crate::analyzer::store) const SOURCE_ENUMERATION_SQL: &str = "SELECT m.rel_path
+ FROM csharp_compilation_members m INDEXED BY idx_csharp_members_snapshot
+ JOIN workspace_file_versions f ON f.file_version_id=m.file_version_id
+ JOIN blobs b ON b.blob_oid=f.blob_oid AND b.lang='csharp' AND b.generation=m.generation
+ AND b.parse_variant=COALESCE((SELECT decision_digest FROM csharp_file_version_decisions d
+ WHERE d.file_version_id=f.file_version_id),x'')
+ WHERE m.workspace_id=?1 AND m.lang='csharp' AND m.generation=?2 AND m.compilation_id=?3
+ AND m.valid_from<=?4 AND (m.valid_until IS NULL OR m.valid_until>?4)
+ AND EXISTS(SELECT 1 FROM resolution_gaps g JOIN resolution_gap_reasons r ON r.blob_id=g.blob_id AND r.reason=g.reason WHERE g.blob_id=b.id AND g.covers=1 AND r.origin=29)";
+pub(in crate::analyzer::store) const BLOB_COVERING_GAP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM resolution_gaps g JOIN resolution_gap_reasons r ON r.blob_id=g.blob_id AND r.reason=g.reason WHERE g.blob_id=?1 AND g.covers=1 AND r.origin=29)";
+pub(in crate::analyzer::store) const STORED_SOURCE_ENUMERATION_SQL: &str = "SELECT coalesce((
+ SELECT json_extract(j.value,'$.paths') FROM json_each(reasons) j WHERE json_extract(j.value,'$.kind')='source_enumeration'),'[]')
+ FROM csharp_compilation_using_coverage WHERE workspace_id=?1 AND compilation_id=?2 AND valid_from=?3";
+
 pub(in crate::analyzer::store) const FILES_SQL: &str = "SELECT file_version_id,rel_path,blob_oid
  FROM workspace_file_versions WHERE workspace_id=?1 AND lang='csharp' AND generation=?2
  AND input_kind='source' AND valid_from<=?3 AND (valid_until IS NULL OR valid_until>?3)";
@@ -56,11 +72,43 @@ pub(in crate::analyzer::store) fn affected_certificates_sql() -> &'static str {
         GROUP BY v.workspace_id,v.compilation_id,v.valid_from"))
 }
 
-fn epoch() -> &'static str {
-    crate::analyzer::store::resolution::resolution_bundle_epoch(Language::CSharp)
+pub(in crate::analyzer::store) fn path_source_enumeration_sql() -> &'static str {
+    static SQL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SQL.get_or_init(|| {
+        format!(
+            "SELECT EXISTS({})",
+            SOURCE_ENUMERATION_SQL
+                .replace("idx_csharp_members_snapshot", "idx_csharp_members_path")
+                + " AND m.rel_path=?5 AND b.id<>?6"
+        )
+    })
 }
 
-fn coverage_reasons(membership: bool, metadata: bool, expected: i64, installed: i64) -> String {
+fn installed_epoch(tx: &Transaction<'_>) -> Result<Option<String>> {
+    let epoch: Option<String> = tx
+        .query_row(
+            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='csharp'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(epoch) = &epoch {
+        assert!(
+            epoch == crate::analyzer::store::resolution::resolution_bundle_epoch(Language::CSharp)
+                || epoch == crate::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+            "installed C# producer epoch is code-owned"
+        );
+    }
+    Ok(epoch)
+}
+
+pub(super) fn coverage_reasons(
+    membership: bool,
+    metadata: bool,
+    expected: i64,
+    installed: i64,
+    source_enumeration: &[String],
+) -> String {
     let mut reasons = Vec::new();
     if !membership {
         reasons.push(serde_json::json!({"kind":"membership"}));
@@ -71,7 +119,31 @@ fn coverage_reasons(membership: bool, metadata: bool, expected: i64, installed: 
     if installed != expected {
         reasons.push(serde_json::json!({"kind":"publications"}));
     }
+    if !source_enumeration.is_empty() {
+        reasons.push(serde_json::json!({"kind":"source_enumeration","paths":source_enumeration}));
+    }
     serde_json::to_string(&reasons).expect("coverage diagnostics serialize")
+}
+
+/// Sorted relative paths of the compilation's members at `revision` whose
+/// directive enumeration is incomplete.
+pub(super) fn source_enumeration_paths(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    generation: i64,
+    compilation: i64,
+    revision: i64,
+) -> Result<Vec<String>> {
+    #[cfg(any(test, feature = "test-support"))]
+    SOURCE_ENUMERATION_RECOMPUTES.with(|count| count.set(count.get() + 1));
+    let mut paths = tx
+        .prepare_cached(SOURCE_ENUMERATION_SQL)?
+        .query_map(params![workspace, generation, compilation, revision], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    paths.sort_unstable();
+    Ok(paths)
 }
 
 fn refresh(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId, compilation: i64) -> Result<()> {
@@ -82,7 +154,7 @@ fn refresh(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId, compilation: i6
             snapshot.generation.0,
             compilation,
             snapshot.revision,
-            epoch(),
+            installed_epoch(tx)?,
             0
         ],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -94,7 +166,20 @@ fn refresh(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId, compilation: i6
         params![compilation, serde_json::to_string(&super::MEMBERSHIP_CAP_CODES).expect("codes serialize")],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let reasons = coverage_reasons(membership, metadata, expected, installed);
+    let source_enumeration = source_enumeration_paths(
+        tx,
+        snapshot.workspace_id.as_str(),
+        snapshot.generation.0,
+        compilation,
+        snapshot.revision,
+    )?;
+    let reasons = coverage_reasons(
+        membership,
+        metadata,
+        expected,
+        installed,
+        &source_enumeration,
+    );
     let same: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM csharp_compilation_using_coverage
         WHERE workspace_id=?1 AND generation=?2 AND compilation_id=?3 AND valid_until IS NULL
@@ -215,12 +300,12 @@ fn install_path(
         if let Some(blob) = tx
             .query_row(
                 PUBLICATION_SQL,
-                params![oid, snapshot.generation.0, epoch(), variant],
+                params![oid, snapshot.generation.0, installed_epoch(tx)?, variant],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?
         {
-            tx.execute(MARK_SQL, params![blob, epoch()])?;
+            tx.execute(MARK_SQL, params![blob, installed_epoch(tx)?])?;
             for &compilation in &members {
                 install_imports(tx, snapshot, compilation, path, blob, None)?;
             }
@@ -372,10 +457,13 @@ pub(in crate::analyzer::store) fn content_available(
     let Some((oid, generation, variant)) = identity else {
         return Ok(());
     };
+    let Some(epoch) = installed_epoch(tx)? else {
+        return Ok(());
+    };
     if tx
         .query_row(
             PUBLICATION_SQL,
-            params![oid, generation, epoch(), variant],
+            params![oid, generation, epoch, variant],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
@@ -384,12 +472,12 @@ pub(in crate::analyzer::store) fn content_available(
         return Ok(());
     }
     let previous: Option<String> = tx
-        .query_row(RETIRE_MARK_SQL, params![blob, epoch()], |r| r.get(0))
+        .query_row(RETIRE_MARK_SQL, params![blob, epoch], |r| r.get(0))
         .optional()?;
     if previous.is_some() {
         adjust_certificates(tx, blob, -1)?;
     }
-    if tx.execute(MARK_SQL, params![blob, epoch()])? == 0 {
+    if tx.execute(MARK_SQL, params![blob, epoch])? == 0 {
         return Ok(());
     }
     adjust_certificates(tx, blob, 1)?;
@@ -430,6 +518,7 @@ pub(in crate::analyzer::store) fn content_available(
 
 struct Certificate {
     workspace: String,
+    generation: i64,
     compilation: i64,
     revision: i64,
     membership: bool,
@@ -438,14 +527,117 @@ struct Certificate {
 }
 
 fn adjust_certificates(tx: &Transaction<'_>, blob: i64, direction: i64) -> Result<()> {
-    for c in certificates(tx, blob)? {
+    let covering_gap: bool = tx.query_row(BLOB_COVERING_GAP_SQL, [blob], |r| r.get(0))?;
+    // Sweep the changed blob's intervals once in certificate revision order.
+    // Indexing by owner avoids repeating unrelated aliases or retained history.
+    #[derive(Default)]
+    struct MemberChanges {
+        events: std::collections::BTreeMap<i64, Vec<(String, bool)>>,
+        active: std::collections::BTreeSet<String>,
+    }
+    let mut members =
+        brokk_bifrost_core::hash::HashMap::<(String, i64, i64), MemberChanges>::default();
+    for member in tx
+        .prepare_cached(PUBLICATION_MEMBERS_SQL)?
+        .query_map([blob], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+            ))
+        })?
+    {
+        let (workspace, generation, compilation, path, from, until) = member?;
+        let changes = members
+            .entry((workspace, generation, compilation))
+            .or_default();
+        changes
+            .events
+            .entry(from)
+            .or_default()
+            .push((path.clone(), true));
+        if let Some(until) = until {
+            changes.events.entry(until).or_default().push((path, false));
+        }
+    }
+    let mut affected = certificates(tx, blob)?;
+    affected.sort_unstable_by(|a, b| {
+        (&a.workspace, a.generation, a.compilation, a.revision).cmp(&(
+            &b.workspace,
+            b.generation,
+            b.compilation,
+            b.revision,
+        ))
+    });
+    for c in affected {
+        let changes = members
+            .get_mut(&(c.workspace.clone(), c.generation, c.compilation))
+            .expect("affected certificates have publication members");
+        while changes
+            .events
+            .first_key_value()
+            .is_some_and(|(revision, _)| *revision <= c.revision)
+        {
+            let (_, mut events) = changes.events.pop_first().expect("pending member event");
+            // Half-open intervals retire before their replacements start.
+            events.sort_unstable_by_key(|(_, present)| *present);
+            for (path, present) in events {
+                if present {
+                    changes.active.insert(path);
+                } else {
+                    changes.active.remove(&path);
+                }
+            }
+        }
+
         let (expected, installed): (i64, i64) = tx.query_row(
             CERTIFICATE_COUNTS_SQL,
             params![c.workspace, c.compilation, c.revision],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let installed = installed + direction * c.multiplicity;
-        let reasons = coverage_reasons(c.membership, c.metadata, expected, installed);
+        let encoded: String = tx.query_row(
+            STORED_SOURCE_ENUMERATION_SQL,
+            params![c.workspace, c.compilation, c.revision],
+            |r| r.get(0),
+        )?;
+        let mut source_enumeration: Vec<String> = serde_json::from_str(&encoded)
+            .expect("stored source enumeration paths are a JSON array");
+        for path in &changes.active {
+            let present = source_enumeration.binary_search(path);
+            if !covering_gap && present.is_err() {
+                continue;
+            }
+            let gapped: bool = tx.query_row(
+                path_source_enumeration_sql(),
+                params![
+                    c.workspace,
+                    c.generation,
+                    c.compilation,
+                    c.revision,
+                    path,
+                    if direction < 0 { blob } else { -1 }
+                ],
+                |r| r.get(0),
+            )?;
+            match (present, gapped) {
+                (Err(index), true) => source_enumeration.insert(index, path.clone()),
+                (Ok(index), false) => {
+                    source_enumeration.remove(index);
+                }
+                _ => {}
+            }
+        }
+        let reasons = coverage_reasons(
+            c.membership,
+            c.metadata,
+            expected,
+            installed,
+            &source_enumeration,
+        );
         tx.execute(
             UPDATE_INSTALLED_SQL,
             params![c.workspace, c.compilation, c.revision, installed, reasons],
@@ -460,6 +652,7 @@ fn certificates(tx: &Transaction<'_>, blob: i64) -> Result<Vec<Certificate>> {
         .query_map([blob], |r| {
             Ok(Certificate {
                 workspace: r.get(0)?,
+                generation: r.get(1)?,
                 compilation: r.get(2)?,
                 revision: r.get(3)?,
                 membership: r.get(4)?,
@@ -509,9 +702,12 @@ pub(in crate::analyzer::store) const OVERLAY_AFFECTED_SQL: &str =
  WHERE mask.storage_language='csharp'
  UNION SELECT compilation_id FROM temp.selected_csharp_overlay_members";
 
+// The third column lists the members whose published blob has a covering gap.
 pub(in crate::analyzer::store) const OVERLAY_COUNTS_SQL: &str =
-    "SELECT count(*),coalesce(sum(blob_id IS NOT NULL),0)
- FROM temp.selected_csharp_compilation_members WHERE compilation_id=?1";
+    "SELECT count(*),coalesce(sum(m.blob_id IS NOT NULL),0),
+ json_group_array(m.rel_path) FILTER (WHERE m.blob_id IS NOT NULL
+ AND EXISTS(SELECT 1 FROM main.resolution_gaps g JOIN main.resolution_gap_reasons r ON r.blob_id=g.blob_id AND r.reason=g.reason WHERE g.blob_id=m.blob_id AND g.covers=1 AND r.origin=29))
+ FROM temp.selected_csharp_compilation_members m WHERE m.compilation_id=?1";
 
 // Only overlay deltas are staged. Base rows stay in SQLite and are anti-masked
 // through indexed paths. Context deletion cascades even on a retained reader.
@@ -678,10 +874,13 @@ pub(in crate::analyzer::store) fn stage(
             return Ok(false);
         }
         let compilation: i64 = row.get(0)?;
-        let (expected, installed): (i64, i64) =
+        let (expected, installed, source_enumeration): (i64, i64, String) =
             tx.query_row(OVERLAY_COUNTS_SQL, [compilation], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
+        let mut source_enumeration: Vec<String> =
+            serde_json::from_str(&source_enumeration).expect("SQLite returns a valid JSON array");
+        source_enumeration.sort_unstable();
         let metadata: bool = tx.query_row(
             "SELECT global_usings_complete FROM csharp_compilations WHERE compilation_id=?1",
             [compilation],
@@ -689,7 +888,13 @@ pub(in crate::analyzer::store) fn stage(
         )?;
         let membership: bool = tx.query_row("SELECT membership_complete AND NOT inventory_open FROM csharp_compilation_membership_coverage JOIN csharp_compilations USING(compilation_id) WHERE compilation_id=?1", [compilation], |r|r.get(0))?;
         let membership = membership && !open && !view.membership_capped;
-        let reasons = coverage_reasons(membership, !open && metadata, expected, installed);
+        let reasons = coverage_reasons(
+            membership,
+            !open && metadata,
+            expected,
+            installed,
+            &source_enumeration,
+        );
         tx.execute("INSERT INTO temp.selected_csharp_overlay_coverage
             (compilation_id,membership_complete,publications_expected,publications_installed,metadata_complete,reasons)
             VALUES(?1,?2,?3,?4,?5,jsonb(?6))",params![compilation,membership,expected,installed,metadata && !open,

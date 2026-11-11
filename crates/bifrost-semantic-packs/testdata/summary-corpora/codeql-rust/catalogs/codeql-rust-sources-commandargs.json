@@ -1,0 +1,60 @@
+{
+  "categories": [
+    "commandargs"
+  ],
+  "external_models": [],
+  "name": "codeql-rust-sources-commandargs",
+  "sanitizers": [],
+  "schema_version": 1,
+  "sinks": [],
+  "sources": [
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "commandargs"
+      ],
+      "display_name": "std.path.absolute",
+      "evidence": null,
+      "id": "codeql-4bfe83522d2f695d9078d647b14a118b9ba4402fcfc63f447e18c94a7c21a44f",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "absolute"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.7cc6e921ce162db66bd6417ccd3cfe21adbb06d6c57205669fe3119270c3d2f2"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "commandargs"
+    }
+  ],
+  "transforms": [],
+  "version": 1
+}

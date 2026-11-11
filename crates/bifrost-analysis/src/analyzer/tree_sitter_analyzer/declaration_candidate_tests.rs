@@ -21,6 +21,13 @@ impl StoreLanguageAdapter for TestAdapter {
 }
 
 impl LanguageAdapter for TestAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[],
+            interpolations: &[],
+            composites: &[],
+        }
+    }
     fn query_directory(&self) -> &'static str {
         "python"
     }

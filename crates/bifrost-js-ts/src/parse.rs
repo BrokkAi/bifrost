@@ -149,20 +149,18 @@ pub(crate) fn parse_with_language(
 pub const JS_TS_NUL_PAYLOAD_KINDS: &[&str] =
     &["string_fragment", "comment", "html_comment", "jsx_text"];
 
-/// String literals, including JSX attribute strings, and template literals
-/// without substitutions are data that may occupy a long physical line, such
-/// as an inlined SVG path. A substitution remains executable structure.
-pub fn is_string_line_data(
-    node: Node<'_>,
-    should_stop: &mut dyn FnMut() -> bool,
-) -> std::ops::ControlFlow<(), bool> {
-    brokk_bifrost_core::analyzer::tree_walk::is_uninterpolated_literal(
-        node,
-        &["string", "template_string"],
-        &["template_substitution"],
-        should_stop,
-    )
-}
+/// String literals, including JSX attribute strings, template literals without
+/// substitutions, and numbers are data that may occupy a long physical line,
+/// such as an inlined SVG path. A substitution remains executable structure.
+pub const JS_TS_LINE_DATA_KINDS: brokk_bifrost_core::analyzer::tree_walk::LineDataKinds =
+    brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        literals: &["string", "template_string", "number"],
+        interpolations: &["template_substitution"],
+        composites: &[
+            ("array", &["[", "]", ","]),
+            ("unary_expression", &["-", "+"]),
+        ],
+    };
 
 #[cfg(test)]
 mod grammar_upgrade_tests {

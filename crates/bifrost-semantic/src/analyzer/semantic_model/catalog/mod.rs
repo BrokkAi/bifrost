@@ -246,7 +246,26 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 // #8523: brokk-tree-sitter-kotlin 0.4.7 parses empty collection literals, so
 // Kotlin source-jar productions change for unchanged artifacts.
 // #8591: re-produce Kotlin source jars with context-parameter function types.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 78;
+// #9171: JMOD class output now charges module-info and actual decoded bytes to
+// the 128 MiB class budget, charges enclosing rereads to its remainder, and
+// fails closed on an invalid seekable directory. An unchanged input SHA can
+// produce different output, so installed productions must not be reused.
+// #8672: re-produce Kotlin source jars with brokk-tree-sitter-kotlin 0.4.9, which
+// parses a line comment before an annotated primary constructor without recovery.
+// #9431 changes generated procedure-summary claim carriage; coordinator-reserved
+// v85 above master's v84.
+// #9901: JVM class-file productions resolve local and anonymous classes' type
+// variables through EnclosingMethod, so an unchanged JDK or jar that was
+// Partial on java.class.unresolved_type_parameter is now Complete.
+// #9995: Scala source-jar productions publish owner inventories, an object's
+// inherited terms as static forwarders, and qualified signature types, so an
+// unchanged scala-library sources jar produces different declaration facts.
+// #10690: JDK src.zip productions certify complete callable families, so an
+// unchanged src.zip produces members with different family claims.
+// JVM-1: Java class-jar productions record an outer class that cannot be
+// reread, report it, and certify no callable family of its nested classes, so
+// an unchanged jar with such an entry produces different facts.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 89;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -996,6 +1015,8 @@ pub enum CatalogError {
         max_source_bytes: u64,
     },
     Unavailable,
+    /// The question's JVM-family part is open; see [`FamilyOpen`].
+    FamilyOpen(crate::analyzer::semantic_model::runtime::FamilyOpen),
 }
 
 impl CatalogError {
@@ -1057,6 +1078,11 @@ impl fmt::Display for CatalogError {
                 "exact Go source reader budget exhausted (max_files={max_files}, max_source_bytes={max_source_bytes})"
             ),
             Self::Unavailable => formatter.write_str("catalog candidate is unavailable"),
+            Self::FamilyOpen(open) => write!(
+                formatter,
+                "semantic question JVM-family part is open: {}",
+                open.reason
+            ),
         }
     }
 }
@@ -1578,6 +1604,25 @@ pub fn validate_pack_with_census(
             decoded,
             census: shard_census,
         });
+    }
+    let types = shards
+        .iter()
+        .flat_map(|shard| match shard.decoded.payload() {
+            crate::analyzer::semantic_model::artifact::CompiledPayload::DeclarationFacts {
+                types,
+                ..
+            } => types.as_slice(),
+            _ => &[],
+        })
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>();
+    if let Some(diagnostic) =
+        crate::analyzer::semantic_model::validate::validate_alias_target_types(&types)
+            .or_else(|| crate::analyzer::semantic_model::validate::validate_alias_cycles(&types))
+    {
+        return Err(CatalogError::Integrity(format!(
+            "compiled pack alias targets: {diagnostic:?}"
+        )));
     }
     if manifest.language == "python" {
         let authored = crate::analyzer::semantic_model::artifact::authored_pack_from_decoded_shards(
@@ -2748,6 +2793,7 @@ pub fn open_session_semantic_catalog() -> Result<SessionSemanticCatalog, Catalog
 pub fn open_session_semantic_catalog_in(
     parent: &Path,
 ) -> Result<SessionSemanticCatalog, CatalogError> {
+    brokk_bifrost_core::cache_db::disable_sqlite_memory_statistics();
     let root = tempfile::Builder::new()
         .prefix("bifrost-session-callable-values-")
         .tempdir_in(parent)

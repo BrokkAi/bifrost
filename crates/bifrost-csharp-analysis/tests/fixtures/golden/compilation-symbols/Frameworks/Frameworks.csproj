@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework></TargetFramework><TargetFrameworks>net6.0;net8.0;net8.0;net8.0-windows</TargetFrameworks><DefineConstants Condition="'$(TargetFramework)'=='net8.0'">$(DefineConstants);MODERN</DefineConstants></PropertyGroup></Project>

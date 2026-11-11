@@ -1,0 +1,116 @@
+{
+  "categories": [
+    "alloc-layout"
+  ],
+  "external_models": [],
+  "name": "codeql-rust-sinks-alloc-layout",
+  "sanitizers": [],
+  "schema_version": 1,
+  "sinks": [
+    {
+      "accepts": [
+        "attacker-controlled"
+      ],
+      "categories": [
+        "alloc-layout"
+      ],
+      "dangerous_operand": {
+        "index": 0,
+        "type": "argument_index"
+      },
+      "display_name": "alloc.alloc.alloc",
+      "id": "codeql-41b735aceab85ea61c2ea91f10663007b15513bbfd8548f0e9dba355326ea7f1",
+      "impacts": [],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "alloc"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.4ca1a1ee98731775d794dfcd9b02d05222d5a99af9d2dba1ba485f5dbfb72a5d"
+              }
+            },
+            {
+              "formal_index": 0,
+              "op": "call_argument"
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "tags": []
+    },
+    {
+      "accepts": [
+        "attacker-controlled"
+      ],
+      "categories": [
+        "alloc-layout"
+      ],
+      "dangerous_operand": {
+        "index": 0,
+        "type": "argument_index"
+      },
+      "display_name": "alloc.alloc.alloc_zeroed",
+      "id": "codeql-83847bdf56bc7d1c2795d77a205f0f65733d1d8b79ee87a7c7d80e9a6f7f5d7a",
+      "impacts": [],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "alloc_zeroed"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.d245d8498544aa5115e538558324995c96bd6a50e6d719fd21f442b414c2ba21"
+              }
+            },
+            {
+              "formal_index": 0,
+              "op": "call_argument"
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "tags": []
+    }
+  ],
+  "sources": [],
+  "transforms": [],
+  "version": 1
+}

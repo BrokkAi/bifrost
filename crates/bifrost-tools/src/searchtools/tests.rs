@@ -311,7 +311,11 @@ impl CodeUnitIndex for CountingAnalyzer {
 }
 
 impl IAnalyzer for CountingAnalyzer {
-    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        _changed_files: &BTreeSet<ProjectFile>,
+        _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         Self {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             unanalyzed: self.unanalyzed.clone(),
@@ -845,7 +849,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         None,
     ));
     assert_eq!(ScanUsagesStatus::Found, found_full.status);
-    assert!(found_full.complete);
+    assert!(found_full.completion.is_complete());
 
     let found_truncated = classify_scan_usages_entry(&usage_work_entry(
         "target",
@@ -856,10 +860,10 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         None,
     ));
     assert_eq!(ScanUsagesStatus::Found, found_truncated.status);
-    assert!(!found_truncated.complete);
+    assert!(!found_truncated.completion.is_complete());
     assert_eq!(
         Some(ScanUsagesIncompleteReason::CandidateFiles),
-        found_truncated.incomplete_reason
+        found_truncated.completion.incomplete_reason()
     );
     assert!(found_truncated.absence_caveats.is_empty());
     assert!(found_truncated.candidate_files_sample.is_some());
@@ -873,7 +877,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         None,
     ));
     assert_eq!(ScanUsagesStatus::Found, found_with_unproven.status);
-    assert!(found_with_unproven.complete);
+    assert!(found_with_unproven.completion.is_complete());
     assert!(found_with_unproven.absence_caveats.is_empty());
 
     let found_lines_entry = usage_work_entry(
@@ -903,7 +907,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
     let found_lines = classify_scan_usages_entry(&found_lines_entry);
     assert_eq!(ScanUsagesStatus::Found, found_lines.status);
     assert_eq!(Some(UsageRendering::Lines), found_lines.rendering);
-    assert!(found_lines.complete);
+    assert!(found_lines.completion.is_complete());
     assert!(
         !crate::searchtools::scan_usages::build_scan_usages_summary(std::slice::from_ref(
             &found_lines
@@ -920,7 +924,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         None,
     ));
     assert_eq!(ScanUsagesStatus::VerifiedAbsent, verified_absent.status);
-    assert!(verified_absent.complete);
+    assert!(verified_absent.completion.is_complete());
 
     let unproven_absent = classify_scan_usages_entry(&usage_work_entry(
         "target",
@@ -931,7 +935,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         None,
     ));
     assert_eq!(ScanUsagesStatus::UnverifiedAbsent, unproven_absent.status);
-    assert!(unproven_absent.complete);
+    assert!(unproven_absent.completion.is_complete());
     assert!(
         unproven_absent
             .absence_caveats
@@ -947,10 +951,10 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         None,
     ));
     assert_eq!(ScanUsagesStatus::UnverifiedAbsent, truncated_absent.status);
-    assert!(!truncated_absent.complete);
+    assert!(!truncated_absent.completion.is_complete());
     assert_eq!(
         Some(ScanUsagesIncompleteReason::CandidateFiles),
-        truncated_absent.incomplete_reason
+        truncated_absent.completion.incomplete_reason()
     );
     assert!(
         truncated_absent
@@ -968,7 +972,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         Some("workspace contains .razor files; absence not verified".to_string()),
     ));
     assert_eq!(ScanUsagesStatus::UnverifiedAbsent, sibling_absent.status);
-    assert!(sibling_absent.complete);
+    assert!(sibling_absent.completion.is_complete());
     assert!(
         sibling_absent
             .absence_caveats
@@ -987,7 +991,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         ScanUsagesStatus::UnverifiedAbsent,
         unproven_sibling_absent.status
     );
-    assert!(unproven_sibling_absent.complete);
+    assert!(unproven_sibling_absent.completion.is_complete());
     assert!(
         unproven_sibling_absent
             .absence_caveats
@@ -1011,7 +1015,7 @@ fn scan_usages_classification_matrix_keeps_status_and_completeness_separate() {
         ScanUsagesStatus::UnverifiedAbsent,
         truncated_sibling_absent.status
     );
-    assert!(!truncated_sibling_absent.complete);
+    assert!(!truncated_sibling_absent.completion.is_complete());
     assert!(
         truncated_sibling_absent
             .absence_caveats
@@ -1048,10 +1052,10 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
         target_is_method: false,
     });
     assert_eq!(ScanUsagesStatus::TooManyCallsites, too_many.status);
-    assert!(!too_many.complete);
+    assert!(!too_many.completion.is_complete());
     assert_eq!(
         Some(ScanUsagesIncompleteReason::Callsites),
-        too_many.incomplete_reason
+        too_many.completion.incomplete_reason()
     );
     assert_eq!(Some(1001), too_many.total_callsites);
 
@@ -1069,7 +1073,7 @@ fn scan_usages_classifies_callsite_cap_and_graph_failure_rows() {
         incomplete_reason: Some(ScanUsagesIncompleteReason::CandidateFiles),
     });
     assert_eq!(ScanUsagesStatus::Failure, failure.status);
-    assert!(!failure.complete);
+    assert!(!failure.completion.is_complete());
     assert_eq!(Some("no_graph_seed"), failure.reason_kind.as_deref());
 }
 
@@ -1118,9 +1122,9 @@ fn issue_1228_source_budget_never_reports_verified_absence() {
     assert!(result.summary.partial, "{result:#?}");
     assert_eq!(result.summary.verified_absent, 0, "{result:#?}");
     assert_eq!(result.results.len(), 1, "{result:#?}");
-    assert!(!result.results[0].complete, "{result:#?}");
+    assert!(!result.results[0].completion.is_complete(), "{result:#?}");
     assert_eq!(
-        result.results[0].incomplete_reason,
+        result.results[0].completion.incomplete_reason(),
         Some(ScanUsagesIncompleteReason::SourceBytes),
         "{result:#?}"
     );
@@ -1170,7 +1174,7 @@ fn issue_3041_c_label_usage_respects_source_and_callsite_budgets() {
     assert!(result.summary.partial, "{result:#?}");
     assert_eq!(result.results[0].status, ScanUsagesStatus::Failure);
     assert_eq!(
-        result.results[0].incomplete_reason,
+        result.results[0].completion.incomplete_reason(),
         Some(ScanUsagesIncompleteReason::SourceBytes),
         "{result:#?}"
     );
@@ -1245,9 +1249,9 @@ fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
     assert!(result.summary.partial, "{result:#?}");
     assert_eq!(result.summary.verified_absent, 0, "{result:#?}");
     assert_eq!(result.results.len(), 1, "{result:#?}");
-    assert!(!result.results[0].complete, "{result:#?}");
+    assert!(!result.results[0].completion.is_complete(), "{result:#?}");
     assert_eq!(
-        result.results[0].incomplete_reason,
+        result.results[0].completion.incomplete_reason(),
         Some(ScanUsagesIncompleteReason::TimeBudget),
         "{result:#?}"
     );
@@ -1515,7 +1519,7 @@ fn terminal_navigation_status_cannot_be_resolved_by_semantic_overlay() {
 
     assert_eq!(result.status, "cancelled", "{result:#?}");
     assert!(result.definitions.is_empty(), "{result:#?}");
-    assert!(!result.complete, "{result:#?}");
+    assert!(!result.completion.is_complete(), "{result:#?}");
 }
 
 /// A refusal must never read as a proved absence. `complete: true` with no
@@ -1549,7 +1553,7 @@ fn a_refusing_definition_status_is_never_reported_as_complete() {
     ] {
         assert_eq!(
             crate::searchtools::definitions::definition_result_completion(status, &unknown_kind),
-            (false, Some(expected)),
+            crate::searchtools::Completion::incomplete(expected),
             "{status}"
         );
     }
@@ -1558,7 +1562,7 @@ fn a_refusing_definition_status_is_never_reported_as_complete() {
     for status in ["resolved", "no_definition", "not_found", "invalid_location"] {
         assert_eq!(
             crate::searchtools::definitions::definition_result_completion(status, &[]),
-            (true, None),
+            crate::searchtools::Completion::COMPLETE,
             "{status}"
         );
     }
@@ -1571,7 +1575,7 @@ fn a_refusing_definition_status_is_never_reported_as_complete() {
     }];
     assert_eq!(
         crate::searchtools::definitions::definition_result_completion("unavailable", &cancelled),
-        (false, Some(DefinitionLookupIncompleteReason::Cancelled))
+        crate::searchtools::Completion::incomplete(DefinitionLookupIncompleteReason::Cancelled)
     );
 }
 

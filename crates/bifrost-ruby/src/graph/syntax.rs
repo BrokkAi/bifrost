@@ -142,6 +142,100 @@ pub fn symbol_or_string_value(node: Node<'_>, source: &str) -> Option<String> {
 
 pub use brokk_bifrost_core::analyzer::common::node_source_text_trimmed as node_text;
 
+/// The positional parameters of `block` (`{ |a, b| ... }`), in order, when
+/// each one is a plain name that binds one yielded value. Optional, splat,
+/// keyword, block and destructured parameters, and a trailing comma
+/// (`|a,|`, which splats a single yielded array), return `None`. Block-local
+/// names after `;` are not parameters.
+pub fn block_positional_parameters<'tree>(block: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    let Some(parameters) = block.child_by_field_name("parameters") else {
+        return Some(Vec::new());
+    };
+    let mut names = Vec::new();
+    let mut after_comma = false;
+    for index in 0..parameters.child_count() {
+        let child = parameters.child(index)?;
+        match child.kind() {
+            "identifier" if child.is_named() => {
+                names.push(child);
+                after_comma = false;
+            }
+            "," => after_comma = true,
+            ";" => break,
+            "|" => {}
+            _ => return None,
+        }
+    }
+    (!after_comma).then_some(names)
+}
+
+/// The `yield` expressions in `method`'s own body, or `None` when the block
+/// passed to `method` can be called some other way: captured by a `&block`
+/// parameter, forwarded by `...`, or passed on implicitly by `super`. Nested
+/// definitions own their own `yield`s; blocks and lambdas inside the body
+/// yield to `method`'s block.
+pub fn method_yield_sites<'tree>(method: Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    if let Some(parameters) = method.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        if parameters
+            .named_children(&mut cursor)
+            .any(|parameter| matches!(parameter.kind(), "block_parameter" | "forward_parameter"))
+        {
+            return None;
+        }
+    }
+    let mut yields = Vec::new();
+    let mut pending: Vec<_> = method.child_by_field_name("body").into_iter().collect();
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "method" | "singleton_method" | "class" | "module" | "singleton_class" => continue,
+            "super" => return None,
+            "yield" => yields.push(node),
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    Some(yields)
+}
+
+/// The argument of `yield_node` that binds positional block parameter `index`
+/// of `count`, by Ruby's proc argument rules: one parameter takes the first
+/// value, and several parameters take one value each, except that a single
+/// yielded value splats across them. `None` when the parameter binds `nil`,
+/// an element of a splatted value, or an argument whose position the syntax
+/// does not fix (`*args`, `**opts`, `&blk`, `key: value`).
+pub fn yield_argument_for_block_parameter<'tree>(
+    yield_node: Node<'tree>,
+    count: usize,
+    index: usize,
+) -> Option<Node<'tree>> {
+    debug_assert!(index < count, "block parameter {index} of {count}");
+    let arguments = match yield_node.named_child(0) {
+        Some(list) => {
+            let mut cursor = list.walk();
+            list.named_children(&mut cursor).collect::<Vec<_>>()
+        }
+        None => Vec::new(),
+    };
+    if arguments.iter().any(|argument| {
+        matches!(
+            argument.kind(),
+            "splat_argument"
+                | "hash_splat_argument"
+                | "block_argument"
+                | "forward_argument"
+                | "pair"
+        )
+    }) {
+        return None;
+    }
+    if count > 1 && arguments.len() == 1 {
+        return None;
+    }
+    arguments.get(index).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

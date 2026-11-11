@@ -34,6 +34,23 @@ impl LogicalQueryNodeId {
     }
 }
 
+pub(crate) fn depth_bound_traversal_key(
+    plan: &CodeQueryPlan,
+    position: usize,
+    path: &[usize],
+) -> String {
+    use sha2::Digest as _;
+    let mut selector = plan.clone();
+    selector.steps.truncate(position + 1);
+    let digest = sha2::Sha256::digest(
+        serde_json::to_vec(&crate::query::plan_to_json(&selector))
+            .expect("query selector serializes"),
+    );
+    let path = serde_json::to_string(path).expect("authored plan path serializes");
+    let digest = brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest.into());
+    format!("depth:{path}:{position}:{digest}")
+}
+
 /// One operation in the storage-neutral logical query DAG.
 #[derive(Debug, Clone)]
 pub(crate) enum LogicalQueryOperator {
@@ -133,9 +150,14 @@ impl LogicalQueryOperator {
 pub(crate) struct LogicalQueryNode {
     operator: LogicalQueryOperator,
     output_kind: QueryValueKind,
+    depth_bound_key: Option<String>,
 }
 
 impl LogicalQueryNode {
+    pub(crate) fn depth_bound_key(&self) -> Option<&str> {
+        self.depth_bound_key.as_deref()
+    }
+
     pub(crate) fn operator(&self) -> &LogicalQueryOperator {
         &self.operator
     }
@@ -263,9 +285,23 @@ impl fmt::Display for LogicalPlanValidationError {
 struct LogicalQueryPlanBuilder {
     nodes: Vec<LogicalQueryNode>,
     interned_seeds: HashMap<String, LogicalQueryNodeId>,
+    authored_path: Vec<usize>,
 }
 
 impl LogicalQueryPlanBuilder {
+    fn lower_child_plan(
+        &mut self,
+        plan: &CodeQueryPlan,
+        index: usize,
+    ) -> (LogicalQueryNodeId, QueryValueKind) {
+        // These are authored AST child indices, never arena IDs or visit counters.
+        self.authored_path.push(index);
+        let result = self.lower_authored_plan(plan);
+        let popped = self.authored_path.pop();
+        debug_assert_eq!(popped, Some(index));
+        result
+    }
+
     fn lower_authored_plan(
         &mut self,
         plan: &CodeQueryPlan,
@@ -381,7 +417,8 @@ impl LogicalQueryPlanBuilder {
             CodeQueryPlanSource::Set { op, branches } => {
                 let lowered = branches
                     .iter()
-                    .map(|branch| self.lower_authored_plan(branch))
+                    .enumerate()
+                    .map(|(index, branch)| self.lower_child_plan(branch, index))
                     .collect::<Vec<_>>();
                 // A union may combine branches of different row kinds
                 // (#5352); its rows keep their own kinds, and the node reports
@@ -398,8 +435,8 @@ impl LogicalQueryPlanBuilder {
                 (id, output_kind)
             }
             CodeQueryPlanSource::Correlate(correlation) => {
-                let (code, _) = self.lower_authored_plan(&correlation.code);
-                let (configuration, _) = self.lower_authored_plan(&correlation.configuration);
+                let (code, _) = self.lower_child_plan(&correlation.code, 0);
+                let (configuration, _) = self.lower_child_plan(&correlation.configuration, 1);
                 let mut configuration_seeds = Vec::new();
                 let mut pending = vec![&correlation.configuration];
                 while let Some(plan) = pending.pop() {
@@ -419,8 +456,8 @@ impl LogicalQueryPlanBuilder {
                 (id, QueryValueKind::CrossDomain)
             }
             CodeQueryPlanSource::RequireBoth(requirement) => {
-                let (code, _) = self.lower_authored_plan(&requirement.code);
-                let (configuration, _) = self.lower_authored_plan(&requirement.configuration);
+                let (code, _) = self.lower_child_plan(&requirement.code, 0);
+                let (configuration, _) = self.lower_child_plan(&requirement.configuration, 1);
                 let id = self.push_node(
                     LogicalQueryOperator::RequireBoth {
                         inputs: [code, configuration],
@@ -443,6 +480,13 @@ impl LogicalQueryPlanBuilder {
                 },
                 step_output,
             );
+            if matches!(step, QueryStep::Callers(_) | QueryStep::Callees(_)) {
+                self.nodes[input.index()].depth_bound_key = Some(depth_bound_traversal_key(
+                    plan,
+                    step_index,
+                    &self.authored_path,
+                ));
+            }
             output_kind = step_output;
         }
         (input, output_kind)
@@ -464,6 +508,7 @@ impl LogicalQueryPlanBuilder {
         self.nodes.push(LogicalQueryNode {
             operator,
             output_kind,
+            depth_bound_key: None,
         });
         id
     }
@@ -773,6 +818,19 @@ impl PhysicalQueryPlan {
     /// so a per-node counter is a vector of this length.
     pub(crate) fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Sequential set operators consult the analyzed language inventory to
+    /// divide their branch budgets. Other operators never read that inventory.
+    pub(crate) fn needs_scanned_languages(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            matches!(
+                node.operator(),
+                PhysicalQueryOperator::SequentialUnion
+                    | PhysicalQueryOperator::SequentialIntersection
+                    | PhysicalQueryOperator::SequentialExcept
+            )
+        })
     }
 
     pub(crate) fn node(&self, id: PhysicalQueryNodeId) -> &PhysicalQueryNode {

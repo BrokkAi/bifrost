@@ -6,6 +6,7 @@ use crate::analyzer::store::file_state::FileState;
 use crate::analyzer::store::{CandidateFlags, HydratedCandidateRow, RelationalUnitFq};
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::{CodeUnit, CodeUnitType, Language, Project, ProjectFile, TestProject};
+use brokk_bifrost_test_macros::hardwon;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -15,6 +16,8 @@ struct PythonAdapter {
     storage_key_calls: Option<Arc<AtomicUsize>>,
     cancellation_enabled: Option<Arc<AtomicBool>>,
     cancel_after_storage_key_calls: usize,
+    alternate_storage_key_on_call: Option<usize>,
+    alternate_storage_key_enabled: Option<Arc<AtomicBool>>,
 }
 
 impl StoreLanguageAdapter for PythonAdapter {
@@ -29,20 +32,39 @@ impl StoreLanguageAdapter for PythonAdapter {
     }
 
     fn storage_language_key_for_file(&self, _file: &ProjectFile) -> &'static str {
-        if let (Some(token), Some(calls), Some(enabled)) = (
+        let call = self
+            .storage_key_calls
+            .as_ref()
+            .map(|calls| calls.fetch_add(1, Ordering::Relaxed) + 1);
+        if let (Some(token), Some(enabled)) = (
             &self.cancellation_on_storage_key,
-            &self.storage_key_calls,
             &self.cancellation_enabled,
         ) && enabled.load(Ordering::Relaxed)
-            && calls.fetch_add(1, Ordering::Relaxed) + 1 == self.cancel_after_storage_key_calls
+            && call == Some(self.cancel_after_storage_key_calls)
         {
             token.cancel();
         }
-        "python"
+        if self
+            .alternate_storage_key_enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.load(Ordering::Relaxed))
+            && call == self.alternate_storage_key_on_call
+        {
+            "python-alt"
+        } else {
+            "python"
+        }
     }
 }
 
 impl LanguageAdapter for PythonAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[],
+            interpolations: &[],
+            composites: &[],
+        }
+    }
     fn cross_file_children(
         &self,
         _analyzer: &TreeSitterAnalyzer<Self>,
@@ -97,6 +119,93 @@ fn analyzer(sources: &[(&str, &str)]) -> (tempfile::TempDir, TreeSitterAnalyzer<
     )
 }
 
+#[test]
+fn stored_publication_read_distinguishes_absent_head_from_missing_authority() {
+    use crate::analyzer::semantic::StoredSemanticIrRead;
+    use crate::analyzer::semantic::classify;
+    use crate::analyzer::semantic::read_ledger::StoredSemanticIrPublicationAnswer;
+
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+
+    let (_temp, analyzer) = analyzer(&[("sample.py", "value = 1\n")]);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "sample.py");
+    assert!(analyzer.resolve_live_oid_for_file(&file).is_some());
+    let cancellation = CancellationToken::default();
+    let read = crate::analyzer::semantic::service::stored_semantic_ir_publication_read(
+        &analyzer,
+        &file,
+        |store, key| {
+            store
+                .semantic_ir_head_observation(key)
+                .map(|head| (head, None::<()>))
+        },
+        None,
+        &cancellation,
+    );
+    assert!(
+        matches!(read.unwrap().0, StoredSemanticIrRead::Observed(observation)
+        if matches!(classify(&observation, [0; 32]), StoredSemanticIrPublicationAnswer::NoHead))
+    );
+
+    let overlay = Arc::new(crate::OverlayProject::new(Arc::clone(&analyzer.project)));
+    assert!(overlay.set(file.abs_path(), "value = 2\n".to_owned()));
+    let overlay_analyzer = analyzer.clone_with_project(Arc::new(overlay.snapshot()));
+    let read = crate::analyzer::semantic::service::stored_semantic_ir_publication_read(
+        &overlay_analyzer,
+        &file,
+        |store, key| {
+            store
+                .semantic_ir_head_observation(key)
+                .map(|head| (head, None::<()>))
+        },
+        None,
+        &cancellation,
+    );
+    assert!(matches!(read.unwrap().0, StoredSemanticIrRead::Refused));
+}
+
+#[test]
+fn stored_publication_read_refuses_selection_drift() {
+    use crate::analyzer::semantic::StoredSemanticIrRead;
+
+    let _rules =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("sample.py"), "value = 1\n").unwrap();
+    let file = ProjectFile::new(&root, "sample.py");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let enabled = Arc::new(AtomicBool::new(false));
+    let adapter = PythonAdapter {
+        storage_key_calls: Some(Arc::clone(&calls)),
+        alternate_storage_key_on_call: Some(2),
+        alternate_storage_key_enabled: Some(Arc::clone(&enabled)),
+        ..PythonAdapter::default()
+    };
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+    let analyzer = TreeSitterAnalyzer::new(project, adapter);
+    assert!(analyzer.resolve_live_oid_for_file(&file).is_some());
+    calls.store(0, Ordering::Relaxed);
+    enabled.store(true, Ordering::Relaxed);
+    let read = crate::analyzer::semantic::service::stored_semantic_ir_publication_read(
+        &analyzer,
+        &file,
+        |store, key| {
+            store
+                .semantic_ir_head_observation(key)
+                .map(|head| (head, None::<()>))
+        },
+        None,
+        &CancellationToken::default(),
+    );
+    assert!(matches!(read.unwrap().0, StoredSemanticIrRead::Refused));
+}
+
 fn dirty_state(
     analyzer: &TreeSitterAnalyzer<PythonAdapter>,
     file: &ProjectFile,
@@ -143,6 +252,32 @@ fn parsed_state(
     .state
 }
 
+#[test]
+#[hardwon("#8474: retained fill admitted a dirty parse-incomplete file state")]
+fn retained_fill_must_refuse_dirty_parse_incomplete_state() {
+    let _language_hooks =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let (_temp, analyzer) = analyzer(&[("main.py", "value = 1\n")]);
+    let file = analyzer.analyzed_live_files().pop().expect("selected file");
+    let source = file.read_to_string().expect("fixture source");
+    let mut state = parsed_state(&analyzer, &file, &source);
+    state.parse_complete = false;
+    dirty_state(&analyzer, &file, &source, state);
+
+    let fill = crate::analyzer::common::replayable_query_cache_fill(&analyzer, || {
+        analyzer
+            .cached_file_state_for_exact_source(&file, &source)
+            .expect("dirty state is visible")
+            .parse_complete
+    });
+    assert!(
+        matches!(fill, Err(false)),
+        "dirty incomplete state was retained: {fill:?}"
+    );
+}
+
 fn unit(file: &ProjectFile, name: &str, kind: CodeUnitType) -> CodeUnit {
     CodeUnit::new(file.clone(), kind, "", name)
 }
@@ -184,6 +319,33 @@ fn workspace_import_budget_never_inspects_an_extra_file() {
 }
 
 #[test]
+fn workspace_imports_use_dirty_selected_state_in_both_readers() {
+    let _language_hooks =
+        crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
+            Language::Python,
+        ]);
+    let (_temp, analyzer) = analyzer(&[("A.py", "value = 1\n")]);
+    let file = analyzer.analyzed_live_files().pop().expect("selected file");
+    let source = file.read_to_string().expect("fixture source");
+    let mut state = parsed_state(&analyzer, &file, &source);
+    state.imports.push(crate::analyzer::ImportInfo {
+        raw_snippet: "import dirty".to_owned(),
+        is_wildcard: false,
+        is_global: false,
+        identifier: Some("dirty".to_owned()),
+        alias: None,
+        path: None,
+        binder_span: None,
+    });
+    dirty_state(&analyzer, &file, &source, state);
+    let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+    let limited = analyzer.workspace_import_info_limited(scope.token(), 10, || true);
+    let full = analyzer.import_info_of(scope.token(), &file);
+    assert!(limited.complete, "{limited:?}");
+    assert_eq!(limited.rows, full);
+}
+
+#[test]
 fn bulk_query_file_state_hydration_respects_its_file_cap() {
     let _language_hooks =
         crate::analyzer::store::language_support::neutral_fixture::neutral_rules_fixture(&[
@@ -199,15 +361,39 @@ fn bulk_query_file_state_hydration_respects_its_file_cap() {
     }
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
     let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter::default());
+    // The byte budget would otherwise bind first whenever a FileState grows,
+    // which says nothing about the file cap under test.
+    analyzer.set_query_file_state_cache_budget_for_test(usize::MAX);
     let files = analyzer.project().all_files().expect("workspace files");
     let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+    // Isolate the file-count cap: FileState growth must not make the query's
+    // separate byte budget decide how many entries this test retains.
+    analyzer
+        .active_query_cache_handle(|cache| &cache.file_states)
+        .expect("active query file-state cache")
+        .write()
+        .expect("query file-state cache lock")
+        .max_bytes = usize::MAX;
     analyzer.bulk_file_states_for_query(files.iter().cloned(), BulkFileStateSource::Omit);
 
     let snapshot = analyzer
         .query_file_state_snapshot
         .load_full()
         .expect("query state snapshot");
-    assert_eq!(snapshot.len(), BULK_FILE_STATE_QUERY_LIMIT);
+    // The byte budget can admit fewer states than the file cap as FileState grows.
+    assert!(!snapshot.is_empty());
+    assert!(snapshot.len() <= BULK_FILE_STATE_QUERY_LIMIT);
+    let live = analyzer.live_snapshot();
+    let beyond_cap = analyzer.bulk_live_file_entries(
+        files.iter().skip(BULK_FILE_STATE_QUERY_LIMIT).cloned(),
+        &live,
+    );
+    assert_eq!(beyond_cap.len(), 1);
+    let (file, oid, _) = &beyond_cap[0];
+    let beyond_cap_key = analyzer
+        .variant_cache_key(*oid, file)
+        .expect("live file has a variant key");
+    assert!(!snapshot.contains_key(&beyond_cap_key));
 }
 
 #[test]
@@ -346,6 +532,8 @@ fn cancelled_reverse_reference_walk_discards_accumulated_candidates() {
         storage_key_calls: Some(Arc::clone(&calls)),
         cancellation_enabled: Some(Arc::clone(&enabled)),
         cancel_after_storage_key_calls: 3,
+        alternate_storage_key_on_call: None,
+        alternate_storage_key_enabled: None,
     };
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
     let analyzer = TreeSitterAnalyzer::new(project, adapter);

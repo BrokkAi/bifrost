@@ -26,15 +26,16 @@ const HIERARCHY_FACT_BATCH_SIZE: usize = 4_096;
 
 /// Why a bounded external-root hierarchy walk could not prove its descendant
 /// set complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JavaExternalRootHierarchyIncompleteReason {
     HierarchyFactsUnavailable,
     AmbiguousSupertype,
+    UnresolvedSupertype(String),
 }
 
 /// Completion status of a workspace hierarchy walk rooted at one exact
 /// external JVM type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JavaExternalRootHierarchyStatus {
     Complete,
     Incomplete(JavaExternalRootHierarchyIncompleteReason),
@@ -48,6 +49,14 @@ pub struct JavaExternalRootHierarchyAnswer {
     pub status: JavaExternalRootHierarchyStatus,
     pub descendants: Vec<CodeUnit>,
     pub visited: usize,
+    /// Every written supertype of a workspace type that resolved to neither a
+    /// workspace type nor the root: the declaration and the name as written.
+    /// Such a supertype may be another external type (a JDK class) or a type no
+    /// surface can name; the walk cannot tell which, because it reads the
+    /// workspace only. A caller that can ask the external surface decides
+    /// whether one of them might be an intermediate that overrides a member of
+    /// the root. Empty unless the status is `Complete`.
+    pub unmatched_supertypes: Vec<(CodeUnit, String)>,
 }
 
 impl JavaExternalRootHierarchyAnswer {
@@ -57,6 +66,7 @@ impl JavaExternalRootHierarchyAnswer {
             status,
             descendants: Vec::new(),
             visited,
+            unmatched_supertypes: Vec::new(),
         }
     }
 }
@@ -317,108 +327,177 @@ where
     ))
 }
 
-/// Enumerate every workspace Java type below one exact external root.
+/// Every admitted workspace Java type, hydrated with the facts its supertype
+/// spellings resolve against, ready to answer which types lie below one exact
+/// external root.
 ///
 /// This is the external-root counterpart to
 /// [`build_java_direct_descendant_index`]. It consumes the same persisted,
-/// AST-derived hierarchy facts, but retains an edge when Java's type-name
-/// tiers resolve a raw supertype to `external_root_fqn`. The root itself is not
-/// represented by a fabricated [`CodeUnit`]. Instead, direct external edges
-/// seed an iterative walk over the ordinary workspace-to-workspace edges.
-///
-/// `external_root_fqn` is the resolver-owned canonical identity at the
-/// dispatch boundary. Scanning every admitted declaration is required even
-/// for a complete-empty answer, so `max_visits` is checked before the
-/// candidate index is built.
-pub fn build_java_external_root_hierarchy<F, H>(
-    mut candidates: Vec<F>,
-    hydrate: H,
-    external_root_fqn: &str,
-    max_visits: usize,
-    cancellation: Option<&CancellationToken>,
-) -> JavaExternalRootHierarchyAnswer
-where
-    F: JavaHierarchyFact,
-    H: Fn(&mut Vec<F>) -> bool,
-{
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return JavaExternalRootHierarchyAnswer::stopped(
-            JavaExternalRootHierarchyStatus::Cancelled,
-            0,
-        );
-    }
-    if candidates.len() > max_visits {
-        return JavaExternalRootHierarchyAnswer::stopped(
-            JavaExternalRootHierarchyStatus::BudgetExhausted,
-            0,
-        );
-    }
-    let visited = candidates.len();
-    candidates.sort_by(|left, right| {
-        left.declaration()
-            .source()
-            .cmp(right.declaration().source())
-            .then_with(|| left.declaration().cmp(right.declaration()))
-    });
-    let mut types_by_fq_name: HashMap<String, JavaHierarchyTypeBucket> = HashMap::default();
-    for (index, facts) in candidates.iter().enumerate() {
-        let candidate = facts.declaration();
-        let fq_name = candidate.fq_name();
-        if let Some(bucket) = types_by_fq_name.get_mut(&fq_name) {
-            let winner = &candidates[bucket.winner];
-            if java_definition_sort_key(candidate, facts.primary_range())
-                < java_definition_sort_key(winner.declaration(), winner.primary_range())
-            {
-                bucket.winner = index;
+/// AST-derived hierarchy facts. Nothing in it depends on the root, so one
+/// index answers every root of a snapshot: preparing it reads every class's
+/// hierarchy facts once, and [`Self::descendants_of`] is an in-memory pass.
+pub struct JavaExternalRootHierarchyIndex<F> {
+    candidates: Vec<F>,
+    types_by_fq_name: HashMap<String, JavaHierarchyTypeBucket>,
+}
+
+impl<F: JavaHierarchyFact> JavaExternalRootHierarchyIndex<F> {
+    /// Sort and hydrate `candidates`. `hydrate` fills one batch in place and
+    /// reports whether it could; a batch it cannot fill refuses the index,
+    /// because a missing supertype edge would silently shrink a family.
+    pub fn prepare<H>(
+        mut candidates: Vec<F>,
+        hydrate: H,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Self, JavaExternalRootHierarchyStatus>
+    where
+        H: Fn(&mut Vec<F>) -> bool,
+    {
+        candidates.sort_by(|left, right| {
+            left.declaration()
+                .source()
+                .cmp(right.declaration().source())
+                .then_with(|| left.declaration().cmp(right.declaration()))
+        });
+        let mut types_by_fq_name: HashMap<String, JavaHierarchyTypeBucket> = HashMap::default();
+        for (index, facts) in candidates.iter().enumerate() {
+            let candidate = facts.declaration();
+            let fq_name = candidate.fq_name();
+            if let Some(bucket) = types_by_fq_name.get_mut(&fq_name) {
+                let winner = &candidates[bucket.winner];
+                if java_definition_sort_key(candidate, facts.primary_range())
+                    < java_definition_sort_key(winner.declaration(), winner.primary_range())
+                {
+                    bucket.winner = index;
+                }
+                bucket.declarations.push(index);
+            } else {
+                types_by_fq_name.insert(
+                    fq_name,
+                    JavaHierarchyTypeBucket {
+                        winner: index,
+                        declarations: vec![index],
+                    },
+                );
             }
-            bucket.declarations.push(index);
-        } else {
-            types_by_fq_name.insert(
-                fq_name,
-                JavaHierarchyTypeBucket {
-                    winner: index,
-                    declarations: vec![index],
-                },
-            );
         }
-    }
-    if types_by_fq_name.contains_key(external_root_fqn) {
-        return JavaExternalRootHierarchyAnswer::stopped(
-            JavaExternalRootHierarchyStatus::Incomplete(
-                JavaExternalRootHierarchyIncompleteReason::AmbiguousSupertype,
-            ),
-            visited,
-        );
+        for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(JavaExternalRootHierarchyStatus::Cancelled);
+            }
+            let batch_end = (batch_start + HIERARCHY_FACT_BATCH_SIZE).min(candidates.len());
+            let mut batch = candidates[batch_start..batch_end].to_vec();
+            if !hydrate(&mut batch) {
+                return Err(JavaExternalRootHierarchyStatus::Incomplete(
+                    JavaExternalRootHierarchyIncompleteReason::HierarchyFactsUnavailable,
+                ));
+            }
+            assert_eq!(
+                batch.len(),
+                batch_end - batch_start,
+                "hydration keeps its batch"
+            );
+            for (slot, facts) in candidates[batch_start..batch_end].iter_mut().zip(batch) {
+                *slot = facts;
+            }
+        }
+        Ok(Self {
+            candidates,
+            types_by_fq_name,
+        })
     }
 
-    let mut workspace_edges = vec![Vec::new(); candidates.len()];
-    let mut external_descendants = Vec::new();
-    for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
+    /// The hydrated declarations, for callers that weigh a retained index.
+    pub fn candidates(&self) -> &[F] {
+        &self.candidates
+    }
+
+    /// Enumerate every workspace Java type below one exact external root.
+    ///
+    /// An edge is retained when Java's type-name tiers resolve a raw supertype
+    /// to `external_root_fqn`. The root itself is not represented by a
+    /// fabricated [`CodeUnit`]. Instead, direct external edges seed an
+    /// iterative walk over the ordinary workspace-to-workspace edges. Those
+    /// edges are recomputed for each root: a tier that names the root before a
+    /// workspace type binds the root, so the workspace edges depend on it.
+    ///
+    /// `external_root_fqn` is the resolver-owned canonical identity at the
+    /// dispatch boundary. A complete answer, even an empty one, covers every
+    /// admitted declaration, so `max_visits` must admit all of them.
+    pub fn descendants_of(
+        &self,
+        external_root_fqn: &str,
+        max_visits: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> JavaExternalRootHierarchyAnswer {
+        self.descendants_of_with_external(external_root_fqn, max_visits, cancellation, |_, _, _| {
+            Ok(crate::ExternalSupertypeClosureAnswer::default())
+        })
+    }
+
+    /// Resolve unmatched workspace edges against a query-local external closure.
+    pub fn descendants_of_with_external(
+        &self,
+        external_root_fqn: &str,
+        max_visits: usize,
+        cancellation: Option<&CancellationToken>,
+        mut external_reaches_root: impl FnMut(
+            &CodeUnit,
+            &str,
+            &mut usize,
+        ) -> Result<
+            crate::ExternalSupertypeClosureAnswer,
+            crate::ExternalSupertypeClosureStop,
+        >,
+    ) -> JavaExternalRootHierarchyAnswer {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return JavaExternalRootHierarchyAnswer::stopped(
                 JavaExternalRootHierarchyStatus::Cancelled,
-                visited,
+                0,
             );
         }
-        let batch_end = (batch_start + HIERARCHY_FACT_BATCH_SIZE).min(candidates.len());
-        let mut batch = candidates[batch_start..batch_end].to_vec();
-        if !hydrate(&mut batch) {
+        let candidates = &self.candidates;
+        if candidates.len() > max_visits {
+            return JavaExternalRootHierarchyAnswer::stopped(
+                JavaExternalRootHierarchyStatus::BudgetExhausted,
+                0,
+            );
+        }
+        let mut visited = candidates.len();
+        let types_by_fq_name = &self.types_by_fq_name;
+        if types_by_fq_name.contains_key(external_root_fqn) {
             return JavaExternalRootHierarchyAnswer::stopped(
                 JavaExternalRootHierarchyStatus::Incomplete(
-                    JavaExternalRootHierarchyIncompleteReason::HierarchyFactsUnavailable,
+                    JavaExternalRootHierarchyIncompleteReason::AmbiguousSupertype,
                 ),
                 visited,
             );
         }
-        for (offset, facts) in batch.iter().enumerate() {
-            let descendant_index = batch_start + offset;
+
+        let mut workspace_edges = vec![Vec::new(); candidates.len()];
+        let mut external_descendants = Vec::new();
+        let mut unmatched_supertypes = Vec::new();
+        // The first external closure that could not be completed. The scan
+        // goes on so every unmatched workspace supertype is still collected
+        // for the independent unresolved-supertype report. Later external closures
+        // may still prove more descendants.
+        let mut incomplete = None;
+        for (descendant_index, facts) in candidates.iter().enumerate() {
+            if descendant_index % HIERARCHY_FACT_BATCH_SIZE == 0
+                && cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
+                return JavaExternalRootHierarchyAnswer::stopped(
+                    JavaExternalRootHierarchyStatus::Cancelled,
+                    visited,
+                );
+            }
             let descendant = facts.declaration();
             for raw in facts.raw_supertypes() {
                 let resolved = resolve_external_root_hierarchy_type(
                     raw,
                     descendant,
                     facts.imports(),
-                    &types_by_fq_name,
+                    types_by_fq_name,
                     external_root_fqn,
                 );
                 match resolved {
@@ -426,15 +505,43 @@ where
                         let ancestor = same_source_hierarchy_identity(
                             ancestor,
                             descendant,
-                            &candidates,
-                            &types_by_fq_name,
+                            candidates,
+                            types_by_fq_name,
                         );
                         workspace_edges[ancestor].push(descendant_index);
                     }
                     ExternalRootHierarchyResolution::ExternalRoot => {
                         external_descendants.push(descendant_index);
                     }
-                    ExternalRootHierarchyResolution::NoMatch => {}
+                    ExternalRootHierarchyResolution::NoMatch => {
+                        unmatched_supertypes.push((descendant.clone(), raw.clone()));
+                        match external_reaches_root(descendant, raw, &mut visited) {
+                            Ok(answer) => {
+                                if answer.reaches_root {
+                                    external_descendants.push(descendant_index);
+                                }
+                                if let Some(identity) = answer.unresolved_supertype {
+                                    incomplete.get_or_insert(JavaExternalRootHierarchyStatus::Incomplete(
+                                        JavaExternalRootHierarchyIncompleteReason::UnresolvedSupertype(identity),
+                                    ));
+                                }
+                            }
+                            Err(stop) => {
+                                let status = match stop {
+                                    crate::ExternalSupertypeClosureStop::Cancelled => {
+                                        JavaExternalRootHierarchyStatus::Cancelled
+                                    }
+                                    crate::ExternalSupertypeClosureStop::BudgetExhausted => {
+                                        JavaExternalRootHierarchyStatus::BudgetExhausted
+                                    }
+                                };
+                                let mut answer =
+                                    JavaExternalRootHierarchyAnswer::stopped(status, visited);
+                                answer.unmatched_supertypes = unmatched_supertypes;
+                                return answer;
+                            }
+                        }
+                    }
                     ExternalRootHierarchyResolution::Ambiguous => {
                         return JavaExternalRootHierarchyAnswer::stopped(
                             JavaExternalRootHierarchyStatus::Incomplete(
@@ -446,24 +553,28 @@ where
                 }
             }
         }
-    }
 
-    let Some(descendants) = crate::hierarchy_descendants_from_edges(
-        &candidates,
-        &workspace_edges,
-        external_descendants,
-        cancellation,
-        JavaHierarchyFact::declaration,
-    ) else {
-        return JavaExternalRootHierarchyAnswer::stopped(
-            JavaExternalRootHierarchyStatus::Cancelled,
+        let Some(descendants) = crate::hierarchy_descendants_from_edges(
+            candidates,
+            &workspace_edges,
+            external_descendants,
+            cancellation,
+            JavaHierarchyFact::declaration,
+        ) else {
+            return JavaExternalRootHierarchyAnswer::stopped(
+                JavaExternalRootHierarchyStatus::Cancelled,
+                visited,
+            );
+        };
+        // An unresolved supertype leaves the answer incomplete, but the
+        // descendants already proven are still descendants: a consumer keeps
+        // them as targets while the family stays open.
+        JavaExternalRootHierarchyAnswer {
+            status: incomplete.unwrap_or(JavaExternalRootHierarchyStatus::Complete),
+            descendants,
             visited,
-        );
-    };
-    JavaExternalRootHierarchyAnswer {
-        status: JavaExternalRootHierarchyStatus::Complete,
-        descendants,
-        visited,
+            unmatched_supertypes,
+        }
     }
 }
 

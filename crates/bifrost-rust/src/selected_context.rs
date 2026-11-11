@@ -33,8 +33,108 @@ use crate::cargo_routes::{
     inferred_cargo_target_paths, normalize_crate_name,
 };
 
+mod broad_discovery;
 mod crate_inventory;
+mod target_discovery;
+pub use broad_discovery::{
+    rust_broad_target_discovery_complete, rust_directory_omission_affects_cargo,
+};
 pub use crate_inventory::{RustCrateDependency, RustCrateTarget, rust_crate_targets};
+
+pub fn cargo_dependency_tables_with_kind(
+    manifest: &RustCargoManifestDocument,
+) -> Vec<(
+    crate::cargo_routes::RustCargoDependencyKind,
+    Option<&str>,
+    &toml::map::Map<String, toml::Value>,
+)> {
+    let mut tables = Vec::new();
+    for (table_name, kind) in cargo_dependency_table_kinds(
+        crate::cargo_routes::RustCargoDependencyKind::Normal,
+        crate::cargo_routes::RustCargoDependencyKind::Development,
+        crate::cargo_routes::RustCargoDependencyKind::Build,
+    ) {
+        if let Some(table) = manifest.get(table_name).and_then(toml::Value::as_table) {
+            tables.push((kind, None, table));
+        }
+    }
+    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
+        for (predicate, target) in targets {
+            let Some(target) = target.as_table() else {
+                continue;
+            };
+            for (table_name, kind) in cargo_dependency_table_kinds(
+                crate::cargo_routes::RustCargoDependencyKind::Normal,
+                crate::cargo_routes::RustCargoDependencyKind::Development,
+                crate::cargo_routes::RustCargoDependencyKind::Build,
+            ) {
+                if let Some(table) = target.get(table_name).and_then(toml::Value::as_table) {
+                    tables.push((kind, Some(predicate.as_str()), table));
+                }
+            }
+        }
+    }
+    tables
+}
+
+fn validate_dependency_tables(manifest: &RustCargoManifestDocument) -> Result<(), String> {
+    let mut tables = Vec::new();
+    for name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(table) = manifest.get(name) {
+            tables.push((name, table));
+        }
+    }
+    if let Some(targets) = manifest.get("target") {
+        let targets = targets.as_table().ok_or("Cargo target must be a table")?;
+        for target in targets.values() {
+            let target = target
+                .as_table()
+                .ok_or("Cargo target predicate must contain a table")?;
+            for name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                if let Some(table) = target.get(name) {
+                    tables.push((name, table));
+                }
+            }
+        }
+    }
+    for (name, table) in tables {
+        let table = table
+            .as_table()
+            .ok_or_else(|| format!("{name} must be a table"))?;
+        for (name, value) in table {
+            if !value.is_str() && !value.is_table() {
+                return Err(format!("unsupported dependency entry {name}: {value:?}"));
+            }
+            if let Some(table) = value.as_table() {
+                for key in [
+                    "workspace",
+                    "optional",
+                    "default-features",
+                    "default_features",
+                ] {
+                    if table.get(key).is_some_and(|value| !value.is_bool()) {
+                        return Err(format!("dependency {name} has invalid {key}: {value:?}"));
+                    }
+                }
+                if table.get("features").is_some_and(|features| {
+                    features
+                        .as_array()
+                        .is_none_or(|features| features.iter().any(|feature| !feature.is_str()))
+                }) {
+                    return Err(format!("dependency {name} has invalid features: {value:?}"));
+                }
+                for key in [
+                    "path", "package", "version", "git", "registry", "branch", "tag", "rev",
+                ] {
+                    if table.get(key).is_some_and(|value| !value.is_str()) {
+                        return Err(format!("dependency {name} has invalid {key}: {value:?}"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub const RUST_CARGO_MANIFEST_FACT_VERSION: u16 = 7;
 
@@ -79,7 +179,10 @@ pub struct RustCargoPackageFact {
     pub automatic_targets: RustCargoAutomaticTargetFacts,
     pub explicit_targets: Box<[RustCargoTargetFact]>,
     pub build_script: Option<PathBuf>,
-    pub has_custom_target_configuration: bool,
+    /// Target settings this manifest declares in a form target discovery
+    /// cannot read, such as a non-boolean `autobins`. Each one leaves the
+    /// target inventory incomplete and names why.
+    pub target_configuration_gaps: Box<[String]>,
     pub edition: RustCargoPackageEdition,
     pub workspace_path: Option<PathBuf>,
 }
@@ -126,9 +229,34 @@ pub enum RustCargoPackageEdition {
 pub struct RustCargoDependencyFact {
     pub manifest_name: String,
     pub exposed_name: String,
-    pub package_name: String,
+    pub package_name: Option<String>,
+    pub workspace_inherited: bool,
+    pub target_predicate: Option<String>,
     pub relative_path: Option<PathBuf>,
     pub kind: RustCargoDependencyKind,
+}
+
+impl RustCargoDependencyFact {
+    fn source_value<'a>(&self, manifest: &'a RustCargoManifestDocument) -> &'a toml::Value {
+        let table = match self.kind {
+            RustCargoDependencyKind::Normal => "dependencies",
+            RustCargoDependencyKind::Development => "dev-dependencies",
+            RustCargoDependencyKind::Build => "build-dependencies",
+        };
+        let scope = match &self.target_predicate {
+            Some(predicate) => manifest
+                .get("target")
+                .and_then(|targets| targets.get(predicate)),
+            None => None,
+        };
+        let table = match scope {
+            Some(scope) => scope.get(table),
+            None => manifest.get(table),
+        };
+        table
+            .and_then(|table| table.get(&self.manifest_name))
+            .expect("Cargo dependency fact retains its source table")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,33 +306,33 @@ impl RustCargoManifestFacts {
             let fact = (|| -> Result<RustCargoPackageFact, String> {
                 let library = manifest.get("lib");
                 let has_explicit_target = cargo_manifest_has_explicit_target(manifest);
-                let mut target_configuration_complete = true;
+                let mut target_configuration_gaps = Vec::new();
                 let automatic_targets = RustCargoAutomaticTargetFacts {
                     library_explicit: library.is_some(),
                     library: cargo_package_boolean(
                         package,
                         "autolib",
-                        &mut target_configuration_complete,
+                        &mut target_configuration_gaps,
                     ),
                     binaries: cargo_package_boolean(
                         package,
                         "autobins",
-                        &mut target_configuration_complete,
+                        &mut target_configuration_gaps,
                     ),
                     examples: cargo_package_boolean(
                         package,
                         "autoexamples",
-                        &mut target_configuration_complete,
+                        &mut target_configuration_gaps,
                     ),
                     tests: cargo_package_boolean(
                         package,
                         "autotests",
-                        &mut target_configuration_complete,
+                        &mut target_configuration_gaps,
                     ),
                     benches: cargo_package_boolean(
                         package,
                         "autobenches",
-                        &mut target_configuration_complete,
+                        &mut target_configuration_gaps,
                     ),
                     has_explicit_target,
                 };
@@ -214,8 +342,8 @@ impl RustCargoManifestFacts {
                     .unwrap_or_else(|| normalize_crate_name(package_name));
                 let library_path = manifest
                     .library_path()
-                    .unwrap_or_else(|_| {
-                        target_configuration_complete = false;
+                    .unwrap_or_else(|error| {
+                        target_configuration_gaps.push(error.to_string());
                         Path::new("src/lib.rs")
                     })
                     .to_path_buf();
@@ -235,15 +363,14 @@ impl RustCargoManifestFacts {
                     Some(_) => Err("invalid Cargo package edition fact".to_string()),
                 }?;
                 if library.is_some_and(|library| library.as_table().is_none()) {
-                    target_configuration_complete = false;
+                    target_configuration_gaps.push("lib is not a table".to_string());
                 }
                 let explicit_targets = cargo_explicit_target_facts(
                     manifest,
                     package_name,
-                    &mut target_configuration_complete,
+                    &mut target_configuration_gaps,
                 );
-                let build_script =
-                    cargo_build_script_fact(package, &mut target_configuration_complete);
+                let build_script = cargo_build_script_fact(package, &mut target_configuration_gaps);
                 Ok(RustCargoPackageFact {
                     package_name: package_name.to_string(),
                     library_name,
@@ -251,7 +378,7 @@ impl RustCargoManifestFacts {
                     automatic_targets,
                     explicit_targets: explicit_targets.into_boxed_slice(),
                     build_script,
-                    has_custom_target_configuration: !target_configuration_complete,
+                    target_configuration_gaps: target_configuration_gaps.into_boxed_slice(),
                     edition,
                     workspace_path: package
                         .get("workspace")
@@ -264,15 +391,25 @@ impl RustCargoManifestFacts {
             None
         };
         let mut dependencies = Vec::new();
-        for (table_name, kind) in cargo_dependency_table_kinds(
-            RustCargoDependencyKind::Normal,
-            RustCargoDependencyKind::Development,
-            RustCargoDependencyKind::Build,
-        ) {
-            let Some(table) = manifest.get(table_name).and_then(toml::Value::as_table) else {
-                continue;
+        validate_dependency_tables(manifest)?;
+        for (kind, predicate, table) in cargo_dependency_tables_with_kind(manifest) {
+            let kind = match kind {
+                crate::cargo_routes::RustCargoDependencyKind::Normal => {
+                    RustCargoDependencyKind::Normal
+                }
+                crate::cargo_routes::RustCargoDependencyKind::Development => {
+                    RustCargoDependencyKind::Development
+                }
+                crate::cargo_routes::RustCargoDependencyKind::Build => {
+                    RustCargoDependencyKind::Build
+                }
             };
             for (exposed_name, value) in table {
+                let workspace_inherited = value
+                    .as_table()
+                    .and_then(|table| table.get("workspace"))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true);
                 let package_name = value
                     .as_table()
                     .and_then(|dependency| dependency.get("package"))
@@ -284,9 +421,11 @@ impl RustCargoManifestFacts {
                     .and_then(toml::Value::as_str)
                     .map(PathBuf::from);
                 dependencies.push(RustCargoDependencyFact {
+                    target_predicate: predicate.map(str::to_string),
                     manifest_name: exposed_name.clone(),
                     exposed_name: normalize_crate_name(exposed_name),
-                    package_name: package_name.to_string(),
+                    package_name: (!workspace_inherited).then(|| package_name.to_string()),
+                    workspace_inherited,
                     relative_path,
                     kind,
                 });
@@ -312,12 +451,12 @@ impl RustCargoManifestFacts {
 fn cargo_package_boolean(
     package: &toml::Value,
     key: &str,
-    target_configuration_complete: &mut bool,
+    target_configuration_gaps: &mut Vec<String>,
 ) -> Option<bool> {
     match package.get(key) {
         Some(toml::Value::Boolean(value)) => Some(*value),
         Some(_) => {
-            *target_configuration_complete = false;
+            target_configuration_gaps.push(format!("package.{key} is not a boolean"));
             None
         }
         None => None,
@@ -327,7 +466,7 @@ fn cargo_package_boolean(
 fn cargo_explicit_target_facts(
     manifest: &RustCargoManifestDocument,
     package_name: &str,
-    target_configuration_complete: &mut bool,
+    target_configuration_gaps: &mut Vec<String>,
 ) -> Vec<RustCargoTargetFact> {
     let mut facts = Vec::new();
     for (table_name, kind, cargo_kind) in [
@@ -356,39 +495,48 @@ fn cargo_explicit_target_facts(
             continue;
         };
         let Some(targets) = value.as_array() else {
-            *target_configuration_complete = false;
+            target_configuration_gaps.push(format!("{table_name} is not an array of tables"));
             continue;
         };
-        for target in targets {
+        for (index, target) in targets.iter().enumerate() {
             let Some(target) = target.as_table() else {
-                *target_configuration_complete = false;
+                target_configuration_gaps.push(format!("{table_name}[{index}] is not a table"));
                 continue;
             };
             let candidate_paths = match target.get("path") {
                 Some(toml::Value::String(path)) => vec![PathBuf::from(path)],
                 Some(_) => {
-                    *target_configuration_complete = false;
+                    target_configuration_gaps
+                        .push(format!("{table_name}[{index}].path is not a string"));
                     Vec::new()
                 }
                 None => match target.get("name") {
                     Some(toml::Value::String(name)) => {
-                        inferred_cargo_target_paths(cargo_kind, name, package_name)
+                        let inferred = inferred_cargo_target_paths(cargo_kind, name, package_name);
+                        if inferred.is_empty() {
+                            target_configuration_gaps.push(format!(
+                                "{table_name}[{index}] has no path Cargo can infer from its name"
+                            ));
+                        }
+                        inferred
                     }
                     Some(_) | None => {
-                        *target_configuration_complete = false;
+                        target_configuration_gaps.push(format!(
+                            "{table_name}[{index}] has neither a string path nor a string name"
+                        ));
                         Vec::new()
                     }
                 },
             };
             if candidate_paths.is_empty() {
-                *target_configuration_complete = false;
                 continue;
             }
             let test_profile_enabled = if kind == RustCallerTargetKind::Binary {
                 match target.get("test") {
                     Some(toml::Value::Boolean(enabled)) => *enabled,
                     Some(_) => {
-                        *target_configuration_complete = false;
+                        target_configuration_gaps
+                            .push(format!("{table_name}[{index}].test is not a boolean"));
                         true
                     }
                     None => true,
@@ -408,13 +556,13 @@ fn cargo_explicit_target_facts(
 
 fn cargo_build_script_fact(
     package: &toml::Value,
-    target_configuration_complete: &mut bool,
+    target_configuration_gaps: &mut Vec<String>,
 ) -> Option<PathBuf> {
     match cargo_build_script_path_state(package.get("build")) {
         CargoBuildScriptPathState::Path(path) => Some(path),
         CargoBuildScriptPathState::Disabled => None,
         CargoBuildScriptPathState::Invalid => {
-            *target_configuration_complete = false;
+            target_configuration_gaps.push("package.build is invalid".to_string());
             None
         }
     }
@@ -1170,6 +1318,8 @@ impl RustCallerTargetProfile {
 pub struct RustSelectedWorkspaceProfiles {
     pub profiles: Box<[RustCallerTargetProfile]>,
     pub target_inventory_complete: bool,
+    /// Manifest-local causes that prevented complete target discovery.
+    pub incomplete_reasons: Box<[String]>,
 }
 
 /// Enumerate every supported Cargo target from retained manifest facts.
@@ -1218,7 +1368,16 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
 ) -> Result<RustSelectedBuildOutcome<RustSelectedWorkspaceProfiles>, String> {
     let mut source_paths = BTreeSet::new();
     let mut sources_by_target_directory = HashMap::<&Path, Vec<&RustSelectedSourceMount>>::new();
-    let mut target_inventory_complete = true;
+    let source_paths_for_check: BTreeSet<&Path> = input
+        .sources
+        .values()
+        .map(|s| s.relative_path.as_path())
+        .collect();
+    let reasons =
+        target_discovery::target_discovery_reasons(&input.manifests, &source_paths_for_check);
+    // The inventory is complete exactly when nothing names a gap, so every
+    // way to leave it incomplete has to say why.
+    let mut incomplete_reasons = reasons;
     for source in input.sources.values() {
         if !progress(RustSelectedContextWork::ScopeNode) {
             return Ok(RustSelectedBuildOutcome::Stopped);
@@ -1270,42 +1429,45 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
         if cargo_library_target_enabled(package) {
             add_selected_target_profiles(
                 &mut profiles,
-                &mut target_inventory_complete,
                 &source_paths,
                 &manifest.relative_path,
-                RustCallerTargetKind::Library,
-                &package.library_path,
-                true,
+                TargetCandidate {
+                    kind: RustCallerTargetKind::Library,
+                    path: &package.library_path,
+                    test_profile_enabled: true,
+                },
             );
         }
-        if package.has_custom_target_configuration {
-            target_inventory_complete = false;
+        for gap in &package.target_configuration_gaps {
+            incomplete_reasons.insert(format!("{}: {gap}", manifest.relative_path.display()));
         }
         for target in &package.explicit_targets {
-            for candidate in &target.candidate_paths {
+            for candidate in target.candidate_paths.iter() {
                 if !progress(RustSelectedContextWork::ScopeNode) {
                     return Ok(RustSelectedBuildOutcome::Stopped);
                 }
                 add_selected_target_profiles(
                     &mut profiles,
-                    &mut target_inventory_complete,
                     &source_paths,
                     &manifest.relative_path,
-                    target.kind,
-                    candidate,
-                    target.test_profile_enabled,
+                    TargetCandidate {
+                        kind: target.kind,
+                        path: candidate,
+                        test_profile_enabled: target.test_profile_enabled,
+                    },
                 );
             }
         }
         if let Some(build_script) = package.build_script.as_deref() {
             add_selected_target_profiles(
                 &mut profiles,
-                &mut target_inventory_complete,
                 &source_paths,
                 &manifest.relative_path,
-                RustCallerTargetKind::Build,
-                build_script,
-                false,
+                TargetCandidate {
+                    kind: RustCallerTargetKind::Build,
+                    path: build_script,
+                    test_profile_enabled: false,
+                },
             );
         }
         let auto_bins = cargo_automatic_target_enabled(
@@ -1379,7 +1541,8 @@ pub fn rust_selected_workspace_profiles_from_prepared_with_progress(
     Ok(RustSelectedBuildOutcome::Ready(
         RustSelectedWorkspaceProfiles {
             profiles: profiles.into_boxed_slice(),
-            target_inventory_complete,
+            target_inventory_complete: incomplete_reasons.is_empty(),
+            incomplete_reasons: incomplete_reasons.into_iter().collect(),
         },
     ))
 }
@@ -1420,31 +1583,32 @@ fn cargo_library_target_enabled(package: &RustCargoPackageFact) -> bool {
         || cargo_library_autodiscovery_enabled(package.automatic_targets.library)
 }
 
+struct TargetCandidate<'a> {
+    kind: RustCallerTargetKind,
+    path: &'a Path,
+    test_profile_enabled: bool,
+}
+
 fn add_selected_target_profiles(
     profiles: &mut Vec<RustCallerTargetProfile>,
-    target_inventory_complete: &mut bool,
     source_paths: &BTreeSet<&Path>,
     manifest_path: &Path,
-    kind: RustCallerTargetKind,
-    candidate: &Path,
-    test_profile_enabled: bool,
+    candidate: TargetCandidate<'_>,
 ) {
     let directory = manifest_path.parent().unwrap_or(Path::new(""));
-    let Some(target_root) = normalize_selected_path(directory, candidate) else {
-        *target_inventory_complete = false;
+    let Some(target_root) = normalize_selected_path(directory, candidate.path) else {
         return;
     };
     let Ok(profile_target_root) = target_root.strip_prefix(directory) else {
-        *target_inventory_complete = false;
         return;
     };
     if source_paths.contains(target_root.as_path()) {
         add_default_workspace_profiles(
             profiles,
             manifest_path,
-            kind,
+            candidate.kind,
             profile_target_root.to_path_buf(),
-            test_profile_enabled,
+            candidate.test_profile_enabled,
         );
     }
 }
@@ -2178,17 +2342,7 @@ fn build_rust_selected_context_from_maps_with_progress(
             if !available {
                 continue;
             }
-            let table_name = match dependency.kind {
-                RustCargoDependencyKind::Normal => "dependencies",
-                RustCargoDependencyKind::Development => "dev-dependencies",
-                RustCargoDependencyKind::Build => "build-dependencies",
-            };
-            let raw_dependency = manifest
-                .document
-                .get(table_name)
-                .and_then(toml::Value::as_table)
-                .and_then(|dependencies| dependencies.get(&dependency.manifest_name))
-                .expect("every selected Cargo dependency fact retains its source value");
+            let raw_dependency = dependency.source_value(&manifest.document);
             // A selected profile is a host profile with no Cargo
             // configuration input; configured patches reach the persisted
             // crate rows through `rust_crate_targets`.
@@ -2253,7 +2407,7 @@ fn build_rust_selected_context_from_maps_with_progress(
                 &cargo_manifests,
             )
             .and_then(|(value, _)| value.get("package").and_then(toml::Value::as_str))
-            .unwrap_or(&dependency.package_name);
+            .unwrap_or(&dependency.manifest_name);
             if package.package_name != effective_package_name {
                 external_dependencies
                     .entry(source_crate_root.clone())
@@ -4129,7 +4283,7 @@ fn module_candidates(
     )
 }
 
-fn normalize_selected_path(base: &Path, path: &Path) -> Option<PathBuf> {
+pub fn normalize_selected_path(base: &Path, path: &Path) -> Option<PathBuf> {
     brokk_bifrost_core::path_utils::normalize_relative_path_from(base, path)
 }
 
@@ -4140,7 +4294,6 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
-    use crate::declarations::parse_rust_file;
     use crate::resolution_spike_fixture::M6A_RUST_WORKSPACE_FILES;
 
     fn rust_files_below(root: &Path, relative: &Path, files: &mut Vec<PathBuf>) {
@@ -4181,7 +4334,14 @@ mod tests {
             root.to_path_buf(),
             relative_path.clone(),
         );
-        let parsed = parse_rust_file(&file, source, tree);
+        let parsed = crate::declarations::parse_rust_file_with(
+            &crate::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            tree,
+        );
         RustSelectedSourceMount {
             relative_path,
             content_oid: Oid::hash_object(ObjectType::Blob, source.as_bytes())
@@ -4246,7 +4406,13 @@ mod tests {
                 Path::new("src").join("outer").join("inline"),
             ),
         ] {
-            let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+            let tree = crate::lexical_scope::parse_rust_tree_with(
+                &crate::lexical_scope::RustLexicalCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                source,
+            )
+            .unwrap();
             assert!(!tree.root_node().has_error());
             let mount = source_mount_from_tree(&root, file.clone(), source, &tree);
             let facts = &mount.facts.module_routes;
@@ -4556,6 +4722,110 @@ mod tests {
             .expect("retain an escaping library target boundary");
         assert!(!inventory.target_inventory_complete);
         assert!(inventory.profiles.is_empty());
+    }
+
+    #[test]
+    #[hardwon(
+        "#10042: a target root missing from the selected sources was dropped while the inventory stayed complete"
+    )]
+    fn missing_targets_and_invalid_workspace_entries_close_target_inventory() {
+        for (label, manifest, expected_reason) in [
+            (
+                "explicit library",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='src/missing.rs'\n",
+                "target path src/missing.rs",
+            ),
+            (
+                "explicit binary",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[[bin]]\nname='other'\npath='src/missing.rs'\n",
+                "target path src/missing.rs",
+            ),
+            (
+                "build script",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\nbuild='missing.rs'\n",
+                "target path missing.rs",
+            ),
+            (
+                "invalid member entry",
+                "[workspace]\nmembers=['app', 3]\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+                "workspace.members[1]",
+            ),
+            (
+                "invalid exclude entry",
+                "[workspace]\nexclude=[3]\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+                "workspace.exclude[0]",
+            ),
+            (
+                "missing literal member",
+                "[workspace]\nmembers=['missing']\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+                "workspace.members missing",
+            ),
+            (
+                "missing implicit member",
+                "[workspace]\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[target.'cfg(unix)'.build-dependencies]\nmissing={path='missing'}\n",
+                "path dependency missing",
+            ),
+            (
+                "unresolved workspace pointer",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\nworkspace='missing'\n",
+                "package.workspace missing",
+            ),
+            (
+                "unmatched member glob",
+                "[workspace]\nmembers=['missing-*']\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+                "workspace.members missing-*",
+            ),
+            (
+                "invalid member glob",
+                "[workspace]\nmembers=['[']\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+                "workspace.members[0]",
+            ),
+            // Unreadable target settings used to close the inventory without
+            // naming any reason.
+            (
+                "non-boolean automatic target flag",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\nautobins='yes'\n",
+                "package.autobins is not a boolean",
+            ),
+            (
+                "non-string library path",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[lib]\npath=3\n",
+                "lib.path must be a string",
+            ),
+        ] {
+            let (sources, manifests) =
+                inputs_from_files(&[("Cargo.toml", manifest), ("src/main.rs", "fn main() {}")]);
+            let inventory =
+                rust_selected_workspace_profiles(&topology_sources(sources), &manifests).unwrap();
+            assert!(
+                !inventory.target_inventory_complete,
+                "{label}: {inventory:?}"
+            );
+            assert!(inventory.incomplete_reasons.iter().any(|reason| reason.contains("Cargo.toml") && reason.contains(expected_reason)), "{label}: {inventory:?}");
+            let targets = crate_inventory::rust_crate_targets(
+                [(PathBuf::from("src/main.rs"), Oid::zero())],
+                manifests,
+                &RustCargoConfiguration::default(),
+            )
+            .unwrap();
+            assert!(
+                targets.iter().any(|target| !target.inventory_complete),
+                "{label}: {targets:?}"
+            );
+        }
+        let (sources, manifests) = inputs_from_files(&[
+            (
+                "Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+            ),
+            ("src/main.rs", "fn main() {}"),
+        ]);
+        let inventory =
+            rust_selected_workspace_profiles(&topology_sources(sources), &manifests).unwrap();
+        assert!(
+            inventory.target_inventory_complete,
+            "missing optional src/lib.rs: {inventory:?}"
+        );
     }
 
     #[test]
@@ -5808,11 +6078,12 @@ mod tests {
         )
         .expect("parse explicit binary target");
         assert!(
-            !explicit
+            explicit
                 .facts
                 .package
                 .expect("package facts")
-                .has_custom_target_configuration
+                .target_configuration_gaps
+                .is_empty()
         );
 
         let disabled = RustSelectedManifestMount::from_source(

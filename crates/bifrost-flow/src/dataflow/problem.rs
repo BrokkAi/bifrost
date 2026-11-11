@@ -64,6 +64,7 @@ pub trait DataflowOutput<T> {
 /// identify contextual summary capture associations.
 #[derive(Debug, Clone, Copy)]
 pub struct DataflowEdge<'graph, Fact = ()> {
+    caller_conversion_may_run_user_code: bool,
     kind: IcfgEdgeKind,
     origin: Option<&'graph CallSiteHandle>,
     source: &'graph ProgramPointHandle,
@@ -87,6 +88,7 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
         completeness: &'graph EvidenceCompleteness,
     ) -> Self {
         Self {
+            caller_conversion_may_run_user_code: false,
             kind,
             origin,
             source,
@@ -99,6 +101,15 @@ impl<'graph, Fact> DataflowEdge<'graph, Fact> {
             call_context: None,
             snapshot_edge: None,
         }
+    }
+
+    pub(crate) const fn with_caller_conversion(mut self, may_run_user_code: bool) -> Self {
+        self.caller_conversion_may_run_user_code = may_run_user_code;
+        self
+    }
+
+    pub(crate) const fn caller_conversion_may_run_user_code(&self) -> bool {
+        self.caller_conversion_may_run_user_code
     }
 
     pub const fn with_boundary(mut self, boundary: &'graph DispatchBoundaryKind) -> Self {

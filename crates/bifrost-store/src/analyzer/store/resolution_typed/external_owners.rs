@@ -1,5 +1,7 @@
 //! Durable external inventories selected by the request's exact provider identities.
-use super::super::resolution_operation::nominal_rules::jvm_external_owner_relations;
+use super::super::resolution_operation::nominal_rules::{
+    ExternalOwnerRelations, jvm_external_owner_relations,
+};
 use super::*;
 use crate::analyzer::resolution::ExternalOwnerIdentity;
 use brokk_bifrost_core::analyzer::resolution_facts::{
@@ -8,7 +10,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
 };
 use std::sync::Arc;
 
-pub(in crate::analyzer::store) const EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL: &str = "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal=?3 AND member.provider_id IN (SELECT value FROM json_each(?4))";
+pub(in crate::analyzer::store) const EXTERNAL_MEMBER_OWNER_BY_DEFINITION_SQL: &str = "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static,CASE WHEN member.member_kind IN ('method','function') AND member.is_static=0 AND member.signature_present=1 AND json_array_length(member.parameters_jsonb)=0 AND member.return_type_jsonb IS NOT NULL AND NOT (json_extract(member.return_type_jsonb,'$.kind')='named' AND json_extract(member.return_type_jsonb,'$.name')='void') THEN 1 ELSE 0 END FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal=?3 AND member.provider_id IN (SELECT value FROM json_each(?4))";
 
 pub(in crate::analyzer::store) const INTRINSIC_MEMBER_OWNER_INDEXED_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2)";
@@ -59,6 +61,14 @@ fn decode_external_member_visibility(label: &str) -> StoreResult<DeclaredVisibil
 }
 
 impl SelectedResolutionTypedSource<'_, '_> {
+    fn external_owner_adapter(
+        &self,
+        owner: &ExternalOwnerIdentity,
+    ) -> Option<&'static ExternalOwnerRelations> {
+        self.is_jvm_external_provider(&owner.provider_id)
+            .then(jvm_external_owner_relations)
+    }
+
     pub(super) fn external_argument_proof_reasons(
         &self,
         definitions: &[SemanticId],
@@ -97,6 +107,15 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 && !receiver_reasons.contains(&reason)
             {
                 reasons.push(reason);
+            }
+            // Class (ii) for the binding only: a formal with a known nominal
+            // head and unproven type arguments, such as ProcessBuilder's
+            // List<String>, leaves applicability open. Java's conversion
+            // prover compares every actual with that declared formal (a type
+            // parameter in it returns Unknown), so its proof closes the
+            // applicability this identity holds open (#9532).
+            if let Some(formal) = memo.formal_nominal_argument_reasons.get(definition) {
+                reasons.extend(formal.iter().copied());
             }
         }
         Ok(Some(reasons))
@@ -143,6 +162,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
             if let Some((owner, ordinal)) =
                 self.context_identities.external_member_identity(definition)
             {
+                if self.external_owner_adapter(&owner).is_none() {
+                    continue;
+                }
                 requested.insert(
                     (
                         owner.provider_id.to_string(),
@@ -217,6 +239,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
     ) -> StoreResult<
         Option<Option<&'static [crate::analyzer::resolution::universe::IntrinsicMember]>>,
     > {
+        if self.external_owner_adapter(owner).is_none() {
+            return Ok(Some(None));
+        }
         self.read_statement(cancellation, |connection| {
             let Some(inventory) =
                 crate::analyzer::resolution::universe::intrinsic_member_inventory(&owner.owner_fqn)
@@ -241,7 +266,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
     fn visit_external_rows<T>(
         &self,
         definitions: &[SemanticId],
-        sql: &str,
+        sql: fn(&ExternalOwnerRelations) -> &'static str,
         cancellation: &CancellationToken,
         visitor: &mut TypedFactPageVisitor<'_, T>,
         decode: impl Fn(&ExternalOwnerIdentity, SemanticId, &Row<'_>) -> StoreResult<T>,
@@ -250,6 +275,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .map_err(|error| StoreError::new(error.to_string()))?;
         for &definition in definitions {
             let Some(owner) = self.context_identities.external_owner_identity(definition) else {
+                continue;
+            };
+            let Some(adapter) = self.external_owner_adapter(&owner) else {
                 continue;
             };
             let Some(intrinsic) =
@@ -266,7 +294,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     return cancelled();
                 }
                 let Some(page) = self.read_statement(cancellation, |conn| {
-                    let mut statement = conn.prepare_cached(sql)?;
+                    let mut statement = conn.prepare_cached(sql(adapter))?;
                     let mut rows = statement.query(rusqlite::params![
                         owner.provider_id.as_ref(),
                         owner.owner_fqn.as_ref(),
@@ -319,10 +347,11 @@ impl SelectedResolutionTypedSource<'_, '_> {
         // scope query is restricted to those providers. Answer without a
         // read for every other destination, which is every destination when
         // no JVM inventory is selected.
-        if !self
-            .external_providers
-            .iter()
-            .any(|provider| provider == owner.provider_id.as_ref())
+        if !self.is_jvm_external_provider(&owner.provider_id)
+            || !self
+                .external_providers
+                .iter()
+                .any(|provider| provider == owner.provider_id.as_ref())
             || !self.external_owner_family_is_enumerated(owner)
         {
             return Ok(false);
@@ -386,6 +415,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
             let Some(owner) = self.context_identities.external_owner_identity(definition) else {
                 continue;
             };
+            if self.external_owner_adapter(&owner).is_none() {
+                continue;
+            }
             let Some(intrinsic) =
                 self.intrinsic_member_inventory_for_owner(&owner, cancellation)?
             else {
@@ -422,7 +454,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         }
         self.visit_external_rows(
             definitions,
-            jvm_external_owner_relations().owner_scopes,
+            |adapter| adapter.owner_scopes,
             cancellation,
             visitor,
             |owner, definition, row| {
@@ -462,6 +494,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
             let Some(owner) = self.context_identities.external_owner_identity(definition) else {
                 continue;
             };
+            if self.external_owner_adapter(&owner).is_none() {
+                continue;
+            }
             let Some(intrinsic) =
                 self.intrinsic_member_inventory_for_owner(&owner, cancellation)?
             else {
@@ -476,6 +511,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                         member.name,
                         "method",
                         member.visibility,
+                        false,
                         false,
                         &names,
                     )?;
@@ -493,7 +529,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         }
         self.visit_external_rows(
             definitions,
-            jvm_external_owner_relations().members,
+            |adapter| adapter.members,
             cancellation,
             visitor,
             |owner, definition, row| {
@@ -523,6 +559,9 @@ impl SelectedResolutionTypedSource<'_, '_> {
             else {
                 continue;
             };
+            let Some(adapter) = self.external_owner_adapter(&owner) else {
+                continue;
+            };
             let owner_definition = self
                 .context_identities
                 .external_owner_semantic(&owner, &names);
@@ -541,6 +580,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     "method",
                     member.visibility,
                     false,
+                    false,
                     &names,
                 )?;
                 let keep_going = visitor.visit_page(std::slice::from_ref(&row))?;
@@ -555,8 +595,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 continue;
             }
             let Some(row) = self.read_statement(cancellation, |conn| {
-                let mut statement =
-                    conn.prepare_cached(jvm_external_owner_relations().member_by_definition)?;
+                let mut statement = conn.prepare_cached(adapter.member_by_definition)?;
                 let mut rows = statement.query(rusqlite::params![
                     owner.provider_id.as_ref(),
                     owner.owner_fqn.as_ref(),
@@ -608,6 +647,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         let kind: String = row.get(2)?;
         let visibility: String = row.get(3)?;
         let is_static: bool = row.get(4)?;
+        let property_getter: bool = row.get(5)?;
         self.external_member_owner_row(
             owner,
             definition,
@@ -616,6 +656,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             &kind,
             &visibility,
             is_static,
+            property_getter,
             names,
         )
     }
@@ -630,6 +671,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
         kind: &str,
         visibility: &str,
         is_static: bool,
+        property_getter: bool,
         names: &dyn SharedNameInterner,
     ) -> StoreResult<SelectedTypedRow<LoweredMemberOwnerProperty>> {
         let kind = match kind {
@@ -648,7 +690,10 @@ impl SelectedResolutionTypedSource<'_, '_> {
             ResolutionNamespace::Type,
             ResolutionNamespace::Type,
         ];
-        let languages = jvm_external_owner_relations().languages;
+        let languages = self
+            .external_owner_adapter(owner)
+            .expect("external member has a selected inventory adapter")
+            .languages;
         let lookups = std::array::from_fn(|i| {
             crate::analyzer::resolution::lookup_semantic(
                 names,
@@ -657,30 +702,47 @@ impl SelectedResolutionTypedSource<'_, '_> {
                 name,
             )
         });
+        // Kotlin reads an instance `getX()` that returns a value as the
+        // property `x`; no other caller language has synthetic properties.
+        let property_lookup = (property_getter && languages.contains(&Language::Kotlin))
+            .then(|| brokk_bifrost_jvm::kotlin::resolution::kotlin_synthetic_property_name(name))
+            .flatten()
+            .map(|property| {
+                crate::analyzer::resolution::lookup_semantic(
+                    names,
+                    Language::Kotlin,
+                    ResolutionNamespace::Value,
+                    &property,
+                )
+            });
         let member = self
             .context_identities
             .external_member_semantic(owner, ordinal, names);
+        let property = LoweredMemberOwnerProperty::external(
+            member,
+            definition,
+            name,
+            kind,
+            if is_static || kind == ResolutionMemberKind::NestedType {
+                ResolutionMemberAccess::Type
+            } else {
+                ResolutionMemberAccess::Instance
+            },
+            if is_static || kind == ResolutionMemberKind::NestedType {
+                ResolutionMemberQualifierCompatibility::RuntimeOrType
+            } else {
+                ResolutionMemberQualifierCompatibility::RuntimeOnly
+            },
+            lookups,
+            visibility,
+        );
         Ok(SelectedTypedRow::external_member(
             owner.clone(),
             ordinal,
-            LoweredMemberOwnerProperty::external(
-                member,
-                definition,
-                name,
-                kind,
-                if is_static || kind == ResolutionMemberKind::NestedType {
-                    ResolutionMemberAccess::Type
-                } else {
-                    ResolutionMemberAccess::Instance
-                },
-                if is_static || kind == ResolutionMemberKind::NestedType {
-                    ResolutionMemberQualifierCompatibility::RuntimeOrType
-                } else {
-                    ResolutionMemberQualifierCompatibility::RuntimeOnly
-                },
-                lookups,
-                visibility,
-            ),
+            match property_lookup {
+                Some(lookup) => property.with_external_property_lookup(lookup),
+                None => property,
+            },
         ))
     }
 
@@ -696,7 +758,7 @@ impl SelectedResolutionTypedSource<'_, '_> {
             .interner(self.selection.connection());
         self.visit_external_rows(
             definitions,
-            jvm_external_owner_relations().supertypes,
+            |adapter| adapter.supertypes,
             cancellation,
             visitor,
             |owner, definition, row| {
@@ -741,6 +803,7 @@ pub(super) struct ExternalSignatureMemo {
     pub(super) seeds: crate::hash::HashMap<SemanticId, SelectedTypedRow<LoweredIntrinsicSeed>>,
     parameter_slots: crate::hash::HashSet<SemanticId>,
     nominal_argument_reasons: crate::hash::HashSet<SemanticId>,
+    formal_nominal_argument_reasons: crate::hash::HashMap<SemanticId, Vec<SemanticId>>,
     result_only_generic_reasons: crate::hash::HashMap<SemanticId, SemanticId>,
     pub(super) components:
         crate::hash::HashMap<SemanticId, Vec<SelectedTypedRow<LoweredTypeComponent>>>,
@@ -1025,6 +1088,33 @@ impl SelectedResolutionTypedSource<'_, '_> {
                     // formals so ordinary applicability can compare them.
                     memo.materialize_value_seed(slot);
                     memo.parameter_slots.insert(slot);
+                    if let ResolutionCompletion::Incomplete(reasons) = memo
+                        .seeds
+                        .get(&slot)
+                        .expect("lowered formal type has a seed")
+                        .row()
+                        .frontier()
+                        .completion()
+                    {
+                        let formal_reasons = reasons
+                            .iter()
+                            .filter_map(|reason| match reason {
+                                ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                                | ResolutionIncompleteReason::ReceiverSubclassObligation(reason)
+                                    if memo.nominal_argument_reasons.contains(reason) =>
+                                {
+                                    Some(*reason)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if !formal_reasons.is_empty() {
+                            memo.formal_nominal_argument_reasons
+                                .entry(definition)
+                                .or_default()
+                                .extend(formal_reasons);
+                        }
+                    }
                     properties.push(LoweredCallableParameterProperty::new(
                         position,
                         slot,
@@ -1651,7 +1741,9 @@ pub(super) fn lower_type_term(
             && let ResolutionCompletion::Incomplete(reasons) = &completion
         {
             for reason in reasons.iter() {
-                if let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason {
+                if let ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(reason) = reason
+                {
                     memo.nominal_argument_reasons.insert(*reason);
                 }
             }

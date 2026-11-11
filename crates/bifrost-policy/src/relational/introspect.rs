@@ -109,12 +109,18 @@ fn published_schema(domain: DetailedCodeQueryDomain) -> RelationDomainSchema {
                 nullable: field.nullable,
                 stable_join_key: super::ir::is_stable_key(field.scalar_type),
                 values: match field.value_domain {
-                    Some(CodeQueryEnumDomain::Labels(labels)) => Some(labels),
+                    Some(
+                        CodeQueryEnumDomain::Labels(labels)
+                        | CodeQueryEnumDomain::Undecided { labels, .. },
+                    ) => Some(labels),
                     Some(CodeQueryEnumDomain::Unenumerable(_)) | None => None,
                 },
                 unenumerable_reason: match field.value_domain {
                     Some(CodeQueryEnumDomain::Unenumerable(reason)) => Some(reason),
-                    Some(CodeQueryEnumDomain::Labels(_)) | None => None,
+                    Some(
+                        CodeQueryEnumDomain::Labels(_) | CodeQueryEnumDomain::Undecided { .. },
+                    )
+                    | None => None,
                 },
             })
             .collect(),

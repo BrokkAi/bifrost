@@ -6,6 +6,7 @@
 //! operation's ordinary base source, so every answer is still composed from
 //! persisted candidates and the base's own coverage.
 
+use super::demand_closure::RootFrame;
 use super::*;
 use crate::analyzer::resolution::ClosedQueryScope;
 
@@ -96,6 +97,20 @@ impl LanguageClosure {
 /// Language-specific root selection and context preparation used by the
 /// shared request-scoped demand provider.
 pub(crate) trait DemandLanguage {
+    fn root_frame<'a>(&self, _question: &'a Self::RootQuestion) -> Option<&'a RootFrame> {
+        None
+    }
+    fn begin_close_attempt(&mut self, _relation: &DemandRelationKey, _epoch: u64) {}
+    fn certify_external_owner(
+        &self,
+        _reference: SemanticId,
+        _slot: SemanticId,
+        _semantic: SemanticId,
+        _kind: Option<crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind>,
+        _retained: &dyn RetainedFrame,
+    ) -> Option<crate::analyzer::resolution::selected_context::ValidatedOwner> {
+        None
+    }
     fn root_has_receipt(&self, endpoint: &EndpointSignature) -> bool;
     fn finalize_closure(
         &mut self,
@@ -262,11 +277,23 @@ struct PreparedContext<D> {
 
 struct PendingRoot<Q, K> {
     question: Q,
+    /// Advanced before each close attempt; receipts from earlier attempts are stale.
+    attempt_epoch: u64,
+    /// The epoch whose closure finalized successfully without cancellation.
+    certification_ready_epoch: Option<u64>,
     context_key: Option<K>,
     prefixes: Vec<DemandReferenceKey>,
     completion: ResolutionCompletion,
     closed: bool,
     closed_completion: Option<ResolutionCompletion>,
+    /// Operation-local logical order cost replay receipt. A task that reuses
+    /// a shared relation inside one operation pays the relation's logical
+    /// order cost under a bounded session, the same as the task that built
+    /// it. A bounded session can still run out and change the returned
+    /// subset or status. The completed-root memo retains completed answers,
+    /// including content-incomplete ones, with execution-stop causes rejected
+    /// throughout the retained payload; its hits need no cross-operation charge.
+    order_cost: usize,
 }
 
 /// The common demand lifecycle. Its maps are owned by the selected operation
@@ -290,6 +317,21 @@ impl<L: DemandLanguage> DemandProvider<L> {
         }
     }
 
+    fn begin_close(&mut self, endpoint: &DemandRelationKey) {
+        let root = self
+            .pending
+            .get_mut(endpoint)
+            .expect("only discovered roots may close");
+        root.attempt_epoch = root
+            .attempt_epoch
+            .checked_add(1)
+            .expect("close attempt epoch overflow");
+        // The new epoch invalidates all receipts from prior attempts.
+        root.certification_ready_epoch = None;
+        self.language
+            .begin_close_attempt(endpoint, root.attempt_epoch);
+    }
+
     fn finish_closure(
         &mut self,
         endpoint: &DemandRelationKey,
@@ -307,6 +349,7 @@ impl<L: DemandLanguage> DemandProvider<L> {
         if root.closed {
             debug_assert!(self.language.root_has_receipt(endpoint));
             root.closed_completion = Some(closure.outcome.completion().clone());
+            root.certification_ready_epoch = Some(root.attempt_epoch);
         }
         // Query scope describes consumed evidence even when cancellation prevents
         // publication. Closure proof receipts require a closed root.
@@ -335,7 +378,58 @@ impl<L: DemandLanguage> DemandProvider<L> {
     }
 }
 
+pub(crate) trait RetainedFrame {
+    fn retained_frame_and_attempt(
+        &self,
+        relation: &DemandRelationKey,
+    ) -> Option<(&RootFrame, u64, bool)>;
+
+    fn attempt_is_current(&self, relation: &DemandRelationKey, epoch: u64) -> bool;
+}
+
+impl<L: DemandLanguage> RetainedFrame for DemandProvider<L> {
+    fn attempt_is_current(&self, relation: &DemandRelationKey, epoch: u64) -> bool {
+        self.pending.get(relation).is_some_and(|root| {
+            root.attempt_epoch == epoch && root.certification_ready_epoch == Some(epoch)
+        })
+    }
+    /// The retained question and currency of one relation in this operation.
+    fn retained_frame_and_attempt(
+        &self,
+        relation: &DemandRelationKey,
+    ) -> Option<(&RootFrame, u64, bool)> {
+        self.pending.get(relation).and_then(|root| {
+            let frame = self.language.root_frame(&root.question)?;
+            Some((
+                frame,
+                root.attempt_epoch,
+                root.certification_ready_epoch == Some(root.attempt_epoch),
+            ))
+        })
+    }
+}
+
 impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
+    fn certify_external_owner(
+        &self,
+        reference: SemanticId,
+        slot: SemanticId,
+        semantic: SemanticId,
+        kind: Option<crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind>,
+    ) -> Option<crate::analyzer::resolution::selected_context::ValidatedOwner> {
+        self.language
+            .certify_external_owner(reference, slot, semantic, kind, self)
+    }
+    fn order_cost(&self, endpoint: &DemandRelationKey) -> usize {
+        self.pending.get(endpoint).map_or(0, |root| root.order_cost)
+    }
+
+    fn record_order_cost(&mut self, endpoint: &DemandRelationKey, cost: usize) {
+        if let Some(root) = self.pending.get_mut(endpoint) {
+            root.order_cost = cost;
+        }
+    }
+
     fn qualified_members(
         &mut self,
     ) -> Option<&mut dyn crate::analyzer::resolution::QualifiedMemberProvider> {
@@ -343,6 +437,9 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
     }
 
     fn cancel_close(&mut self, endpoint: &DemandRelationKey) {
+        if let Some(root) = self.pending.get_mut(endpoint) {
+            root.certification_ready_epoch = None;
+        }
         self.language.cancel_close_root(endpoint);
     }
 
@@ -355,6 +452,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         provenance: HierarchyProvenanceView<'_>,
         resume: CloseResume<'_>,
     ) -> Result<CloseProgress<RootClosure>> {
+        self.begin_close(endpoint);
         let root = self
             .pending
             .get(endpoint)
@@ -527,11 +625,14 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         }
         let root = PendingRoot {
             question,
+            attempt_epoch: 0,
+            certification_ready_epoch: None,
             context_key,
             prefixes: prefixes.references,
             completion: evidence,
             closed: false,
             closed_completion: None,
+            order_cost: 0,
         };
         let plan = Self::plan(&root);
         assert!(self.pending.insert(endpoint.clone(), root).is_none());
@@ -552,6 +653,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         member_completion: &ResolutionCompletion,
     ) -> Result<RootClosure> {
+        self.begin_close(endpoint);
         let root = self
             .pending
             .get_mut(endpoint)
@@ -595,6 +697,7 @@ impl<L: DemandLanguage> RootProvider for DemandProvider<L> {
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
         selection: &DemandMemberSelection,
     ) -> Result<RootClosure> {
+        self.begin_close(endpoint);
         let root = self
             .pending
             .get(endpoint)
@@ -1232,6 +1335,16 @@ impl ClosedForwardSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
+    fn root_reference_token(
+        &self,
+        reference: SemanticId,
+        candidate: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        self.base
+            .root_reference_token(reference, candidate, cancellation)
+    }
+
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -1341,6 +1454,15 @@ impl BatchResolutionFragmentSource for ClosedForwardSource<'_> {
     ) -> Result<bool> {
         self.base
             .supports_direct_type_shapes(reference, cancellation)
+    }
+
+    fn supports_exact_type_argument_links(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        self.base
+            .supports_exact_type_argument_links(reference, cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {

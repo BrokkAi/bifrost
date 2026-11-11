@@ -406,7 +406,8 @@ fn argument_value_node<'tree>(
     (0..argument.named_child_count())
         .filter_map(|index| argument.named_child(index))
         .find(|child| {
-            keyword.is_none_or(|keyword| child.id() != keyword.id())
+            !child.is_extra()
+                && keyword.is_none_or(|keyword| child.id() != keyword.id())
                 && !matches!(child.kind(), "reference_modifier" | "variadic_unpacking")
         })
         .map(expression_target_node)
@@ -842,6 +843,11 @@ impl StructuralSpec for PhpStructuralSpec {
         php_integer_literal_value(node, source)
     }
 
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::Constructor]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         PHP_KIND_TABLE
     }
@@ -1101,6 +1107,9 @@ impl StructuralSpec for PhpStructuralSpec {
             NormalizedKind::Decorator => {
                 if let Some(name) = first_named_child(node) {
                     attach_terminal_callee(sink, name, expression_name_node(name));
+                }
+                if let Some(arguments) = node.child_by_field_name("parameters") {
+                    attach_argument_roles(sink, arguments);
                 }
             }
             NormalizedKind::Identifier => match expression_name_node(node) {

@@ -876,7 +876,7 @@ pub(crate) const DEPENDENCY_SOURCES_SQL: &str =
      WHERE summary_id=?1 ORDER BY dependency_ordinal,source_ordinal";
 pub(crate) const READS_SQL: &str =
     "SELECT key_digest,kind,family,languages,rel_path,name,index_key,
-        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),read_ordinal
+        blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,json(fact_names),NULL AS copy_owning_unit,NULL AS copy_target_unit,NULL AS copy_module_path,NULL AS copy_target_identity_digest,NULL AS copy_census_version,NULL AS copy_config_digest,NULL AS copy_producer_digest,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword,read_ordinal
      FROM class_set_summary_reads WHERE summary_id=?1 ORDER BY read_ordinal";
 pub(crate) const CHARGES_SQL: &str = "SELECT charge_kind,amount
      FROM class_set_summary_charges WHERE summary_id=?1 ORDER BY charge_kind";
@@ -1002,7 +1002,7 @@ impl AnalyzerStore {
         lookup_digest: ClassSetSummaryDigest,
     ) -> Result<Option<ClassSetSummaryRow>> {
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tx = conn.transaction()?;
         let summary = load_summary_for_digest(&tx, lookup_digest)?;
         tx.commit()?;
         Ok(summary)
@@ -1465,12 +1465,12 @@ fn insert_summary(
     }
     for row in &summary.reads {
         ensure_not_cancelled(cancellation)?;
-        let columns = ReadKeyColumns::of(&row.key);
+        let columns = ReadKeyColumns::of(&row.key)?;
         conn.execute(
             "INSERT INTO class_set_summary_reads(
                 summary_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
-                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,jsonb(?20))",
+                index_key,blob_oid,subject,start_byte,end_byte,digest,site_ordinal,decl_kind,decl_signature,workspace_fact_family,fact_member,fact_names,parse_variant_kind,parse_variant_digest,structural_role,structural_keyword
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,jsonb(?20),?21,?22,?23,?24)",
             params![
                 id,
                 row.ordinal,
@@ -1492,6 +1492,10 @@ fn insert_summary(
                 columns.workspace_fact_family,
             columns.fact_member,
             columns.fact_names,
+            columns.parse_variant_kind,
+            columns.parse_variant_digest,
+            columns.structural_role,
+            columns.structural_keyword,
             ],
         )?;
     }
@@ -1841,7 +1845,7 @@ fn load_reads(conn: &rusqlite::Connection, id: i64) -> Result<Vec<ClassSetSummar
     let mut reads = Vec::new();
     while let Some(row) = rows.next()? {
         reads.push(ClassSetSummaryReadRow {
-            ordinal: row.get(18)?,
+            ordinal: row.get(29)?,
             key: decode_read_key(row)?,
         });
     }
@@ -2357,18 +2361,18 @@ mod tests {
         }
         // Exercise the same FK cascade that blob GC uses. Deleting the other
         // decision row must retain both products attached to the selected row.
+        let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
         assert_eq!(
-            store
-                .conn
-                .lock()
-                .unwrap()
-                .execute(
-                    "DELETE FROM blobs WHERE blob_oid=?1 AND lang='csharp' AND parse_variant=?2",
-                    rusqlite::params![BLOB, variants[0]],
-                )
-                .unwrap(),
+            conn.execute(
+                "DELETE FROM blobs WHERE blob_oid=?1 AND lang='csharp' AND parse_variant=?2",
+                rusqlite::params![BLOB, variants[0]],
+            )
+            .unwrap(),
             1
         );
+        drop(_fixture);
+        drop(conn);
         for (index, (surface, summary)) in variant_products.into_iter().enumerate() {
             assert_eq!(
                 store
@@ -2682,6 +2686,34 @@ mod tests {
                     digest_byte(2),
                     &crate::analyzer::semantic::StorageLanguageKey::from_adapter("python"),
                 )
+                .unwrap()
+        );
+        assert_eq!(
+            store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn an_external_selection_read_round_trips_through_the_summary_ledger() {
+        use crate::analyzer::read_ledger::{LookupKind, LookupQuestion};
+        use crate::analyzer::semantic::ids::StableDigest;
+        let store = store_with_blob();
+        let mut expected = row(1);
+        expected.reads.push(ClassSetSummaryReadRow {
+            ordinal: u32::try_from(expected.reads.len()).unwrap(),
+            key: ReadKey::lookup(
+                LookupKind::ExternalSelection,
+                LookupQuestion::ExternalSelection {
+                    question_digest: *StableDigest::sha256(b"question").as_bytes(),
+                },
+                StableDigest::sha256(b"answer"),
+            ),
+        });
+        expected.content_digest = expected.canonical_content_digest();
+        assert!(
+            store
+                .publish_class_set_summary(expected.clone(), &CancellationToken::new())
                 .unwrap()
         );
         assert_eq!(
@@ -3472,15 +3504,15 @@ mod tests {
                 &CancellationToken::new(),
             )
             .unwrap();
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
+        {
+            let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            conn.execute(
                 "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'python'",
                 params![BLOB],
             )
             .unwrap();
+        }
         assert_eq!(
             store.class_set_summary_for_digest(digest_byte(1)).unwrap(),
             None

@@ -3,8 +3,7 @@
 //! and the inverted walk resolve through.
 
 use crate::bindings::{
-    PythonLexicalNameResolution, python_comprehension_binds_name_at,
-    python_is_type_parameter_binder, python_name_resolution_at,
+    PythonLexicalNameResolution, python_comprehension_binds_name_at, python_name_resolution_at,
     python_type_parameter_binds_name_at,
 };
 use crate::graph::PythonGraphSource;
@@ -26,7 +25,7 @@ use crate::imports::{
     resolve_python_relative_module,
 };
 use crate::syntax::{
-    attribute_chain, leftmost_identifier, python_plain_string_literal,
+    attribute_chain, is_declaration_identifier, leftmost_identifier, python_plain_string_literal,
     python_reference_is_deferred_function_body,
 };
 use crate::usage_index::{
@@ -2081,46 +2080,6 @@ fn member_receiver_match_is_unproven(
         "attribute" => true,
         _ => false,
     }
-}
-
-pub fn is_declaration_identifier(node: Node<'_>) -> bool {
-    let contains = |container: Node<'_>| {
-        container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
-    };
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "class_definition" | "function_definition" => {
-                return parent
-                    .child_by_field_name("name")
-                    .is_some_and(|name| name.id() == node.id())
-                    || python_is_type_parameter_binder(node);
-            }
-            "parameters"
-            | "lambda_parameters"
-            | "list_splat_pattern"
-            | "dictionary_splat_pattern" => return true,
-            "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
-                return parent.child_by_field_name("name").is_some_and(contains);
-            }
-            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
-                return parent.child_by_field_name("left").is_some_and(contains);
-            }
-            "named_expression" => {
-                return parent.child_by_field_name("name").is_some_and(contains);
-            }
-            "aliased_import" | "import_from_statement" | "import_statement" => return true,
-            "pattern_list"
-            | "tuple_pattern"
-            | "list_pattern"
-            | "parenthesized_expression"
-            | "type"
-            | "type_parameter"
-            | "constrained_type" => current = parent,
-            _ => return false,
-        }
-    }
-    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

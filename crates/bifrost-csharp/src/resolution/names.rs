@@ -57,9 +57,11 @@ impl Producer<'_, '_> {
                         self.source,
                     )) != "global"
                     {
-                        return None;
+                        stack.push(node.child_by_field_name("name")?);
+                        stack.push(alias);
+                    } else {
+                        stack.push(node.child_by_field_name("name")?);
                     }
-                    stack.push(node.child_by_field_name("name")?);
                 }
                 _ => return None,
             }
@@ -108,17 +110,57 @@ impl Producer<'_, '_> {
         site
     }
 
-    pub(super) fn absolute_path(node: Node<'_>) -> bool {
+    pub(super) fn path_anchor(node: Node<'_>, source: &str) -> ResolutionRootImportAnchor {
         let mut pending = vec![node];
         while let Some(node) = pending.pop() {
             if node.kind() == "alias_qualified_name" {
-                return true;
+                let alias = node
+                    .child_by_field_name("alias")
+                    .expect("alias-qualified name has alias");
+                return if crate::syntax::csharp_lookup_identifier(csharp_identifier_text(
+                    alias, source,
+                )) == "global"
+                {
+                    ResolutionRootImportAnchor::Absolute
+                } else {
+                    ResolutionRootImportAnchor::AliasQualified
+                };
             }
             if node.kind() != "generic_name" {
                 pending.extend(named_children(node));
             }
         }
-        false
+        ResolutionRootImportAnchor::Lexical
+    }
+
+    // Accept interned path segments independently of source nodes: predefined
+    // keyword aliases have one source token but a two-segment absolute path.
+    pub(super) fn rooted_type_path_reference(
+        &mut self,
+        reference: ResolutionSiteId,
+        root_scope: ResolutionScopeId,
+        anchor: ResolutionRootImportAnchor,
+        prefix_reference: Option<ResolutionSiteId>,
+        names: &[ResolutionNameId],
+    ) {
+        self.facts
+            .root_references
+            .push(ResolutionRootReferenceFact {
+                reference,
+                root_scope,
+                anchor,
+                prefix_reference,
+                owner_continued: false,
+            });
+        for (position, &name) in names.iter().enumerate() {
+            self.facts
+                .root_reference_segments
+                .push(ResolutionRootReferenceSegmentFact {
+                    reference,
+                    position: dense_ordinal(position, "root reference segment"),
+                    name,
+                });
+        }
     }
 
     pub(super) fn reference_path(&mut self, node: Node<'_>, ctx: Context) {
@@ -129,7 +171,8 @@ impl Producer<'_, '_> {
             return;
         }
         let namespace = reference_namespace(node);
-        let absolute = Self::absolute_path(node);
+        let anchor = Self::path_anchor(node, self.source);
+        let absolute = anchor != ResolutionRootImportAnchor::Lexical;
         if parts.len() == 1 && !absolute {
             let reference = self.reference(parts[0], ctx, namespace);
             // ECMA-334 14.7: free namespace members supply types, not methods.
@@ -194,7 +237,10 @@ impl Producer<'_, '_> {
                 });
         }
         let start = usize::from(prefix.is_some());
-        for index in start..parts.len() {
+        for index in start.max(usize::from(
+            anchor == ResolutionRootImportAnchor::AliasQualified,
+        ))..parts.len()
+        {
             let terminal_namespace = if index + 1 == parts.len() {
                 namespace
             } else if namespace == ResolutionNamespace::Type {
@@ -207,29 +253,11 @@ impl Producer<'_, '_> {
                 self.facts
                     .add_gap(reference, ResolutionGapKind::AmbiguousQualifiedType);
             }
-            self.facts
-                .root_references
-                .push(ResolutionRootReferenceFact {
-                    reference,
-                    root_scope: ctx.package,
-                    anchor: if absolute {
-                        ResolutionRootImportAnchor::Absolute
-                    } else {
-                        ResolutionRootImportAnchor::Lexical
-                    },
-                    prefix_reference: prefix,
-                    owner_continued: false,
-                });
-            for (position, &part) in parts[..index].iter().enumerate() {
-                let name = self.name(part);
-                self.facts
-                    .root_reference_segments
-                    .push(ResolutionRootReferenceSegmentFact {
-                        reference,
-                        position: dense_ordinal(position, "root reference segment"),
-                        name,
-                    });
-            }
+            let names = parts[..index]
+                .iter()
+                .map(|&part| self.name(part))
+                .collect::<Vec<_>>();
+            self.rooted_type_path_reference(reference, ctx.package, anchor, prefix, &names);
         }
         // Claim only the path spine: type arguments must still be visited.
         let mut pending = vec![node];

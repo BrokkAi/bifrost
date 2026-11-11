@@ -94,7 +94,8 @@ use serde::Serialize;
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_rql::structural::search::{
-    execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
+    CodeQueryExecutionScope, execute_code_query_detailed_eager_index_in_scope,
+    execute_code_query_detailed_eager_index_workspace_in_scope,
 };
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCompletion, CodeQueryResultDetail};
 use brokk_bifrost_rql::{CodeQueryPlanSource, CodeQuerySeed, Pattern};
@@ -947,25 +948,27 @@ fn execute_rung(
 
     let executed = match (rung.execution, context.workspace) {
         (PrefixExecution::PreferWorkspace, Some(workspace)) => {
-            execute_code_query_detailed_eager_index_workspace(
+            execute_code_query_detailed_eager_index_workspace_in_scope(
                 workspace,
                 context.flow_resources(),
                 &query,
                 budget.query_limits(),
                 context.cancellation,
+                CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
             )
         }
-        _ => execute_code_query_detailed_eager_index(
+        _ => execute_code_query_detailed_eager_index_in_scope(
             context.analyzer,
             context.flow_resources(),
             &query,
             budget.query_limits(),
             context.cancellation,
+            CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
         ),
     };
     let completion = executed.result.completion();
     let exhaustive = matches!(completion, CodeQueryCompletion::Complete);
-    let reasons = absence_reasons(&completion, executed.result.truncated);
+    let reasons = absence_reasons(&completion);
 
     let mut rows: HashMap<String, Vec<Option<Range<usize>>>> = HashMap::new();
     let mut ordered = Vec::new();

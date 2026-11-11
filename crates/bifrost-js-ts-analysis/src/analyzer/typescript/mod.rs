@@ -102,16 +102,8 @@ impl brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter for
         brokk_bifrost_js_ts::parse::JS_TS_NUL_PAYLOAD_KINDS
     }
 
-    fn supports_structural_line_data(&self) -> bool {
-        true
-    }
-
-    fn is_structural_line_data(
-        &self,
-        node: tree_sitter::Node<'_>,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> std::ops::ControlFlow<(), bool> {
-        brokk_bifrost_js_ts::parse::is_string_line_data(node, should_stop)
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_js_ts::parse::JS_TS_LINE_DATA_KINDS
     }
 
     fn query_directory(&self) -> &'static str {
@@ -384,10 +376,12 @@ impl TypescriptAnalyzer {
         clone
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config(project, TypescriptAdapter, config);
@@ -429,6 +423,7 @@ impl TypescriptAnalyzer {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
@@ -495,10 +490,15 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        providers::imported_code_units_of(self, token, file)
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let scope = AnalyzerQueryScope::new(self);
+            let token = scope.token();
+            providers::imported_code_units_of(self, token, file)
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -858,9 +858,13 @@ impl IAnalyzer for TypescriptAnalyzer {
         fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let inner = self.inner.update(changed_files);
+            let inner = self.inner.update_with_listing(changed_files, listing);
             // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
             let alias_resolver = crate::analyzer::js_ts::providers::alias_resolver(&inner);
             Self {
@@ -1118,8 +1122,9 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Type
     fn update(
         &self,
         changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
-        Box::new(IAnalyzer::update(self, changed_files))
+        Box::new(IAnalyzer::update_with_listing(self, changed_files, listing))
     }
 
     fn read_configuration_file(&self, file: &ProjectFile) -> bool {

@@ -924,9 +924,6 @@ fn is_jvm_language(language: Language) -> bool {
 #[derive(Clone, Debug, Default)]
 #[doc(hidden)]
 pub struct SelectedContextIdentities {
-    // #7314 6b: per-operation oracle registration provenance, never persisted.
-    #[cfg(any(test, feature = "test-support"))]
-    oracle_trace: Arc<std::sync::Mutex<(Option<String>, Vec<String>)>>,
     unindexed_go_imports:
         Arc<std::sync::Mutex<HashMap<SemanticId, super::UnindexedExternalFrontier>>>,
     numbers: Arc<std::sync::Mutex<super::CanonicalIdentityNumbers>>,
@@ -948,6 +945,8 @@ pub struct SelectedContextIdentities {
     /// closed by complete selected package/type rows. This set is request-local
     /// and each entry names one exact source import site.
     java_import_route_gap_reasons: Arc<std::sync::Mutex<BTreeSet<SemanticId>>>,
+    java_selected_import_proofs:
+        Arc<std::sync::Mutex<BTreeSet<(BindingFragmentId, ResolutionSiteId, SemanticId)>>>,
 
     java_import_member_scopes: Arc<std::sync::Mutex<JavaImportMemberScopes>>,
 
@@ -955,6 +954,8 @@ pub struct SelectedContextIdentities {
     /// they establish. The language tag keeps inventory classification separate.
     jvm_external_type_identities:
         Arc<std::sync::Mutex<HashMap<SemanticId, (ExternalOwnerLanguage, SemanticId)>>>,
+    /// Go model-owner selections are per source reference, projected slot and binder.
+    go_external_type_witnesses: Arc<std::sync::Mutex<GoExternalTypeWitnesses>>,
 
     /// Bare TypeIdentity references whose unindexed implicit roots establish
     /// the same external type identity despite a complete-empty name answer.
@@ -985,6 +986,26 @@ type ExternalTypeBoundaries = (ExternalOwnerLanguage, Vec<SemanticId>);
 pub enum ExternalOwnerLanguage {
     Jvm,
     Go,
+}
+
+/// One request can select the same (reference, slot, binder) question under
+/// more than one authority, for example in two prepared source contexts; each
+/// authority keeps its own witness.
+type GoExternalTypeWitnesses = HashMap<
+    (SemanticId, SemanticId, SemanticId),
+    Vec<crate::analyzer::store::resolution_operation::go_demand::GoExternalTypeWitness>,
+>;
+
+/// A recorded Go type owner that validated under a consumer-supplied current
+/// authority. It is nominal identity only: it says nothing about members,
+/// dispatch or absence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedOwner {
+    pub reference: SemanticId,
+    pub semantic: SemanticId,
+    pub declaration_kind: crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind,
+    pub source_node: super::BindingNodeId,
+    pub authority: crate::analyzer::store::resolution_operation::go_demand::GoTerminalAuthority,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1055,6 +1076,72 @@ enum JvmExternalTypeIdentityClaim {
 struct SelectedJvmContextIdentities {
     jvm_supertype_names: Arc<std::sync::Mutex<HashMap<SemanticId, Arc<str>>>>,
     jvm_external_members: Arc<std::sync::Mutex<JvmExternalMemberMap>>,
+    /// Java references whose simple-type-name decision selected a single-type
+    /// import with no workspace source declaration, by reference.
+    java_explicit_import_boundaries:
+        Arc<std::sync::Mutex<HashMap<SemanticId, SelectedExplicitImportBoundary>>>,
+    java_type_name_owners: Arc<std::sync::Mutex<HashMap<SemanticId, JavaTypeNameOwnerState>>>,
+    java_type_name_owner_notices: Arc<std::sync::Mutex<BTreeSet<SemanticId>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum JavaTypeNameOwnerState {
+    Absent,
+    Present(SelectedJavaTypeNameOwner),
+    Conflicted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedJavaTypeNameWinner {
+    ExplicitImport(SemanticId),
+    OnDemand {
+        fqn: Arc<str>,
+        source: SelectedJavaOnDemandSource,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedJavaOnDemandSource {
+    AuthoredImport(SemanticId),
+    Default,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SelectedJavaTypeNameOwner {
+    pub winner: SelectedJavaTypeNameWinner,
+    pub owner: SemanticId,
+    pub authority:
+        crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority,
+    pub proposal: Option<ExplicitImportAdmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExplicitImportAdmission {
+    pub(crate) token: SemanticId,
+    pub(crate) lookup: SemanticId,
+    pub(crate) blob: i64,
+    pub(crate) fragment: BindingFragmentId,
+    pub(crate) certificate:
+        crate::analyzer::resolution::fact_resolution::demand_scheduler::SelectedExternalOwner,
+    pub(crate) proved_sites: BTreeSet<u32>,
+}
+
+/// A Java single-type import that wins a simple type name, when the import's
+/// own proof found no workspace source declaration. The projection renders it
+/// as the imported-type external boundary when the selected answer has no
+/// target. It answers the type-name question only: an ambiguous `N.member`
+/// prefix is a different question (JLS 6.5.2) and never reads this record,
+/// and the import declaration's own target name is not linked to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct SelectedExplicitImportBoundary {
+    /// The imported canonical name, from the binder's selected route.
+    pub imported_fqn: Arc<str>,
+    /// The simple name the import binds, as written.
+    pub simple_name: Arc<str>,
+    /// The selected external declaration, when the operation selected one.
+    pub external_target: Option<Arc<str>>,
 }
 
 type JavaImportMemberScopes = HashMap<SemanticId, (SemanticId, Arc<str>)>;
@@ -1085,12 +1172,15 @@ pub enum PreparedContextIdentityField {
     JavaImportRouteGapReasons,
     JavaImportMemberScopes,
     JvmExternalTypeIdentities,
+    GoExternalTypeWitnesses,
     JvmExternalTypeIdentitiesByReference,
     JvmExternalTypeBoundaries,
     JvmExternalOwners,
     ModelMembers,
     JvmSupertypeNames,
     JvmExternalMembers,
+    JavaExplicitImportBoundaries,
+    JavaTypeNameOwners,
 }
 
 /// Allowed fields contain stable values or context-local numbers. Remapped
@@ -1264,9 +1354,19 @@ impl SelectedContextIdentities {
                 .expect("the selected context's Java import reason set is not poisoned")
                 .is_empty()
             && self
+                .java_selected_import_proofs
+                .lock()
+                .expect("Java selected import proofs are not poisoned")
+                .is_empty()
+            && self
                 .jvm_external_type_identities
                 .lock()
                 .expect("the selected context's JVM external type identities are not poisoned")
+                .is_empty()
+            && self
+                .go_external_type_witnesses
+                .lock()
+                .expect("Go external type witnesses are not poisoned")
                 .is_empty()
             && self
                 .jvm_external_type_identities_by_reference
@@ -1295,6 +1395,18 @@ impl SelectedContextIdentities {
                 .lock()
                 .expect("external member coordinates are not poisoned")
                 .is_empty()
+            && self
+                .jvm
+                .java_explicit_import_boundaries
+                .lock()
+                .expect("Java explicit import boundaries are not poisoned")
+                .is_empty()
+            && self
+                .jvm
+                .java_type_name_owners
+                .lock()
+                .expect("Java type name owners are not poisoned")
+                .is_empty()
     }
 
     /// Make an isolated snapshot, preserving every context-local number and
@@ -1302,10 +1414,6 @@ impl SelectedContextIdentities {
     /// own identity table independently.
     pub(crate) fn isolated_clone(&self) -> Self {
         Self {
-            #[cfg(any(test, feature = "test-support"))]
-            oracle_trace: Arc::new(std::sync::Mutex::new(
-                self.oracle_trace.lock().unwrap().clone(),
-            )),
             unindexed_go_imports: Arc::new(std::sync::Mutex::new(
                 self.unindexed_go_imports
                     .lock()
@@ -1348,10 +1456,22 @@ impl SelectedContextIdentities {
                     .expect("the selected context's Java import reason set is not poisoned")
                     .clone(),
             )),
+            java_selected_import_proofs: Arc::new(std::sync::Mutex::new(
+                self.java_selected_import_proofs
+                    .lock()
+                    .expect("Java selected import proofs are not poisoned")
+                    .clone(),
+            )),
             jvm_external_type_identities: Arc::new(std::sync::Mutex::new(
                 self.jvm_external_type_identities
                     .lock()
                     .expect("the selected context's JVM external type identities are not poisoned")
+                    .clone(),
+            )),
+            go_external_type_witnesses: Arc::new(std::sync::Mutex::new(
+                self.go_external_type_witnesses
+                    .lock()
+                    .expect("Go external type witnesses are not poisoned")
                     .clone(),
             )),
             jvm_external_type_identities_by_reference: Arc::new(std::sync::Mutex::new(
@@ -1395,6 +1515,21 @@ impl SelectedContextIdentities {
                         .expect("external member coordinates are not poisoned")
                         .clone(),
                 )),
+                java_explicit_import_boundaries: Arc::new(std::sync::Mutex::new(
+                    self.jvm
+                        .java_explicit_import_boundaries
+                        .lock()
+                        .expect("Java explicit import boundaries are not poisoned")
+                        .clone(),
+                )),
+                java_type_name_owners: Arc::new(std::sync::Mutex::new(
+                    self.jvm
+                        .java_type_name_owners
+                        .lock()
+                        .expect("Java type name owners are not poisoned")
+                        .clone(),
+                )),
+                java_type_name_owner_notices: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             }),
         }
     }
@@ -1472,12 +1607,28 @@ impl SelectedContextIdentities {
             .expect("the cached context's Java import reason set is not poisoned")
             .clone();
         *self
+            .java_selected_import_proofs
+            .lock()
+            .expect("Java selected import proofs are not poisoned") = other
+            .java_selected_import_proofs
+            .lock()
+            .expect("cached Java selected import proofs are not poisoned")
+            .clone();
+        *self
             .jvm_external_type_identities
             .lock()
             .expect("the selected JVM external type identities are not poisoned") = other
             .jvm_external_type_identities
             .lock()
             .expect("the cached JVM external type identities are not poisoned")
+            .clone();
+        *self
+            .go_external_type_witnesses
+            .lock()
+            .expect("Go external type witnesses are not poisoned") = other
+            .go_external_type_witnesses
+            .lock()
+            .expect("cached Go external type witnesses are not poisoned")
             .clone();
         *self
             .jvm_external_type_identities_by_reference
@@ -1523,6 +1674,26 @@ impl SelectedContextIdentities {
             .lock()
             .expect("cached external member coordinates are not poisoned")
             .clone();
+        *self
+            .jvm
+            .java_explicit_import_boundaries
+            .lock()
+            .expect("Java explicit import boundaries are not poisoned") = other
+            .jvm
+            .java_explicit_import_boundaries
+            .lock()
+            .expect("cached Java explicit import boundaries are not poisoned")
+            .clone();
+        *self
+            .jvm
+            .java_type_name_owners
+            .lock()
+            .expect("Java type name owners are not poisoned") = other
+            .jvm
+            .java_type_name_owners
+            .lock()
+            .expect("cached Java type name owners are not poisoned")
+            .clone();
     }
 
     pub(crate) fn shares_identity_space(&self, other: &Self) -> bool {
@@ -1546,8 +1717,16 @@ impl SelectedContextIdentities {
                 &other.java_import_route_gap_reasons,
             )
             && Arc::ptr_eq(
+                &self.java_selected_import_proofs,
+                &other.java_selected_import_proofs,
+            )
+            && Arc::ptr_eq(
                 &self.jvm_external_type_identities,
                 &other.jvm_external_type_identities,
+            )
+            && Arc::ptr_eq(
+                &self.go_external_type_witnesses,
+                &other.go_external_type_witnesses,
             )
             && Arc::ptr_eq(
                 &self.jvm_external_type_identities_by_reference,
@@ -1565,6 +1744,14 @@ impl SelectedContextIdentities {
             && Arc::ptr_eq(
                 &self.jvm.jvm_external_members,
                 &other.jvm.jvm_external_members,
+            )
+            && Arc::ptr_eq(
+                &self.jvm.java_explicit_import_boundaries,
+                &other.jvm.java_explicit_import_boundaries,
+            )
+            && Arc::ptr_eq(
+                &self.jvm.java_type_name_owners,
+                &other.jvm.java_type_name_owners,
             )
     }
 
@@ -1794,6 +1981,28 @@ impl SelectedContextIdentities {
             .clone()
     }
 
+    pub(crate) fn record_java_selected_import_proof(
+        &self,
+        fragment: BindingFragmentId,
+        site: ResolutionSiteId,
+        reason: SemanticId,
+    ) {
+        assert_eq!(reason.ordinal(), Some(fragment.ordinal()));
+        self.java_selected_import_proofs
+            .lock()
+            .expect("Java selected import proofs are not poisoned")
+            .insert((fragment, site, reason));
+    }
+
+    pub(crate) fn java_selected_import_proofs(
+        &self,
+    ) -> BTreeSet<(BindingFragmentId, ResolutionSiteId, SemanticId)> {
+        self.java_selected_import_proofs
+            .lock()
+            .expect("Java selected import proofs are not poisoned")
+            .clone()
+    }
+
     pub(crate) fn record_jvm_supertype_name(&self, reference: SemanticId, name: &str) {
         let mut names = self
             .jvm
@@ -1806,6 +2015,116 @@ impl SelectedContextIdentities {
                 name,
                 "one supertype reference or source gap has one structured name"
             );
+        }
+    }
+
+    pub(crate) fn record_java_explicit_import_boundary(
+        &self,
+        reference: SemanticId,
+        boundary: SelectedExplicitImportBoundary,
+    ) {
+        let mut boundaries = self
+            .jvm
+            .java_explicit_import_boundaries
+            .lock()
+            .expect("Java explicit import boundaries are not poisoned");
+        if let Some(previous) = boundaries.insert(reference, boundary.clone()) {
+            assert_eq!(
+                previous, boundary,
+                "one Java reference has one explicit import boundary"
+            );
+        }
+    }
+
+    pub(crate) fn java_explicit_import_boundary(
+        &self,
+        reference: SemanticId,
+    ) -> Option<SelectedExplicitImportBoundary> {
+        self.jvm
+            .java_explicit_import_boundaries
+            .lock()
+            .expect("Java explicit import boundaries are not poisoned")
+            .get(&reference)
+            .cloned()
+    }
+
+    pub(crate) fn record_java_type_name_owner(
+        &self,
+        reference: SemanticId,
+        selected: SelectedJavaTypeNameOwner,
+    ) {
+        let mut owners = self
+            .jvm
+            .java_type_name_owners
+            .lock()
+            .expect("Java type name owners are not poisoned");
+        let changed = match owners.get(&reference) {
+            Some(JavaTypeNameOwnerState::Present(previous)) => {
+                debug_assert_eq!(
+                    previous, &selected,
+                    "one Java reference selected conflicting owners"
+                );
+                if previous == &selected {
+                    false
+                } else {
+                    owners.insert(reference, JavaTypeNameOwnerState::Conflicted);
+                    true
+                }
+            }
+            Some(JavaTypeNameOwnerState::Conflicted) => false,
+            Some(JavaTypeNameOwnerState::Absent) => unreachable!("absent owners are not stored"),
+            None => {
+                owners.insert(reference, JavaTypeNameOwnerState::Present(selected));
+                true
+            }
+        };
+        if changed {
+            self.jvm
+                .java_type_name_owner_notices
+                .lock()
+                .expect("Java owner notices are not poisoned")
+                .insert(reference);
+        }
+    }
+
+    pub(crate) fn java_type_name_owner_state(
+        &self,
+        reference: SemanticId,
+    ) -> JavaTypeNameOwnerState {
+        self.jvm
+            .java_type_name_owners
+            .lock()
+            .expect("Java type name owners are not poisoned")
+            .get(&reference)
+            .cloned()
+            .unwrap_or(JavaTypeNameOwnerState::Absent)
+    }
+
+    pub(crate) fn drain_java_type_name_owner_notices(&self) -> BTreeSet<SemanticId> {
+        std::mem::take(
+            &mut *self
+                .jvm
+                .java_type_name_owner_notices
+                .lock()
+                .expect("Java owner notices are not poisoned"),
+        )
+    }
+
+    pub(crate) fn java_type_name_owner_notices_empty(&self) -> bool {
+        self.jvm
+            .java_type_name_owner_notices
+            .lock()
+            .expect("Java owner notices are not poisoned")
+            .is_empty()
+    }
+
+    pub(crate) fn java_type_name_owner(
+        &self,
+        reference: SemanticId,
+    ) -> Option<SelectedJavaTypeNameOwner> {
+        match self.java_type_name_owner_state(reference) {
+            JavaTypeNameOwnerState::Present(record) => Some(record),
+            JavaTypeNameOwnerState::Absent | JavaTypeNameOwnerState::Conflicted => None,
         }
     }
 
@@ -1857,47 +2176,6 @@ impl SelectedContextIdentities {
         );
     }
 
-    // #7314 6b: oracle-only authority and observations of actual registrations.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn java_oracle_reference_association(
-        &self,
-        reference: SemanticId,
-    ) -> serde_json::Value {
-        let claim = self
-            .jvm_external_type_identities_by_reference
-            .lock()
-            .unwrap()
-            .get(&reference)
-            .copied();
-        let identity = match claim {
-            Some(
-                JvmExternalTypeIdentityClaim::Provider(_, id)
-                | JvmExternalTypeIdentityClaim::ImplicitFallback(id),
-            ) => Some(id),
-            None => None,
-        };
-        let owner = identity.and_then(|id| self.external_owner_identity(id));
-        let boundaries = identity.map(|id| self.jvm_external_provider_type_boundaries(id));
-        serde_json::json!({"claim": format!("{claim:?}"), "owner": owner.map(|owner| serde_json::json!({"fqn": owner.owner_fqn.as_ref(), "provider_id": owner.provider_id.as_ref()})), "boundaries": format!("{boundaries:?}"), "has_boundary": boundaries.as_ref().is_some_and(|b| !b.is_empty())})
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_java_oracle_authority(&self, authority: String) {
-        let mut trace = self.oracle_trace.lock().unwrap();
-        assert!(trace.0.as_ref().is_none_or(|old| old == &authority));
-        trace.0 = Some(authority);
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    fn trace_java_oracle_registration(&self, value: String) {
-        let mut trace = self.oracle_trace.lock().unwrap();
-        if let Some(authority) = trace.0.clone() {
-            trace.1.push(format!("{authority}/{value}"));
-        }
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn java_oracle_registration_trace(&self) -> Vec<String> {
-        self.oracle_trace.lock().unwrap().1.clone()
-    }
-
     pub(crate) fn external_owner_identity(
         &self,
         semantic: SemanticId,
@@ -1918,6 +2196,18 @@ impl SelectedContextIdentities {
             .expect("external owner coordinates are not poisoned")
             .get(&semantic)
             .map(|(language, _)| *language)
+    }
+
+    /// Every typed external nominal identity, including an implicit fallback
+    /// with a boundary but no provider coordinates. This is broader than the
+    /// route certificate's publication eligibility.
+    pub(crate) fn is_external_nominal_identity(&self, semantic: SemanticId) -> bool {
+        self.external_owner_language(semantic).is_some()
+            || self
+                .jvm_external_type_boundaries
+                .lock()
+                .expect("external type boundaries are not poisoned")
+                .contains_key(&semantic)
     }
 
     pub(crate) fn record_external_hierarchy_reference(
@@ -1965,10 +2255,6 @@ impl SelectedContextIdentities {
         hash.field("owner-fqn", owner.owner_fqn.as_bytes());
         hash.field("member-ordinal", &ordinal.to_be_bytes());
         let semantic = SemanticId::shared_name(names.intern(hash.finish()));
-        #[cfg(any(test, feature = "test-support"))]
-        self.trace_java_oracle_registration(format!(
-            "member-inventory {owner:?}/{ordinal} -> {semantic:?}"
-        ));
         let coordinates = (owner.clone(), ordinal);
         let mut members = self
             .jvm
@@ -2075,11 +2361,65 @@ impl SelectedContextIdentities {
             "one provider boundary names one tagged external type identity"
         );
         self.record_provider_type_reference(language, source_reference, identity);
-        #[cfg(any(test, feature = "test-support"))]
-        self.trace_java_oracle_registration(format!(
-            "boundary-reference {source_reference:?} -> {identity:?}"
-        ));
         self.record_external_provider_type_boundary(language, identity, enumeration_boundary);
+    }
+
+    /// Record one Complete-path Go type owner selection for its exact
+    /// (reference, slot, binder) question.
+    pub(crate) fn record_go_external_type_witness(
+        &self,
+        reference: SemanticId,
+        slot: SemanticId,
+        binder: SemanticId,
+        witness: crate::analyzer::store::resolution_operation::go_demand::GoExternalTypeWitness,
+    ) {
+        assert!(witness.kind.is_type_declaration());
+        let mut witnesses = self
+            .go_external_type_witnesses
+            .lock()
+            .expect("Go external type witnesses are not poisoned");
+        let recorded = witnesses.entry((reference, slot, binder)).or_default();
+        if let Some(prior) = recorded
+            .iter()
+            .find(|prior| prior.authority == witness.authority)
+        {
+            assert_eq!(
+                prior, &witness,
+                "one Go type owner question under one authority has one selected owner"
+            );
+        } else {
+            recorded.push(witness);
+        }
+    }
+
+    /// The recorded owner for exactly this (reference, slot, binder) question,
+    /// if its recorded authority equals `current`. The caller establishes the
+    /// key and the current authority itself; nothing here searches recorded
+    /// witnesses for them.
+    pub(crate) fn validated_external_owner(
+        &self,
+        key: &(SemanticId, SemanticId, SemanticId),
+        current: &crate::analyzer::store::resolution_operation::go_demand::GoTerminalAuthority,
+    ) -> Option<ValidatedOwner> {
+        // Recording keeps at most one witness per authority for a key.
+        let witness = self
+            .go_external_type_witnesses
+            .lock()
+            .expect("Go external type witnesses are not poisoned")
+            .get(key)?
+            .iter()
+            .find(|witness| witness.authority == *current)
+            .cloned()?;
+        let owner = self.external_owner_identity(witness.owner_semantic)?;
+        (owner.provider_id.as_ref() == witness.owner_provider.pack_digest
+            && owner.owner_fqn.as_ref() == witness.qualified_name)
+            .then_some(ValidatedOwner {
+                reference: key.0,
+                semantic: witness.owner_semantic,
+                declaration_kind: witness.kind,
+                source_node: witness.source_node,
+                authority: witness.authority,
+            })
     }
 
     /// A JVM provider claim for a reference whose boundary is recorded
@@ -2098,10 +2438,6 @@ impl SelectedContextIdentities {
         source_reference: SemanticId,
         identity: SemanticId,
     ) {
-        #[cfg(any(test, feature = "test-support"))]
-        self.trace_java_oracle_registration(format!(
-            "provider-reference {source_reference:?} -> {identity:?}"
-        ));
         assert!(identity.shared_name_id().is_some());
         let previous = self
             .jvm_external_type_identities_by_reference
@@ -2305,18 +2641,18 @@ impl SelectedContextIdentities {
         classify: impl Fn(PreparedContextIdentityField) -> PreparedContextIdentityPolicy,
     ) {
         let Self {
-            #[cfg(any(test, feature = "test-support"))]
-                oracle_trace: _,
             unindexed_go_imports,
             numbers,
             named_reasons,
             rust_prelude_references,
             external_type_import_paths,
             java_import_route_gap_reasons,
+            java_selected_import_proofs,
 
             java_import_member_scopes,
 
             jvm_external_type_identities,
+            go_external_type_witnesses,
 
             jvm_external_type_identities_by_reference,
             jvm_external_type_boundaries,
@@ -2327,6 +2663,9 @@ impl SelectedContextIdentities {
         let SelectedJvmContextIdentities {
             jvm_supertype_names,
             jvm_external_members,
+            java_explicit_import_boundaries,
+            java_type_name_owners,
+            java_type_name_owner_notices: _,
         } = &**jvm;
         macro_rules! classify_field {
             ($field:ident, $variant:ident, $label:literal) => {
@@ -2366,6 +2705,11 @@ impl SelectedContextIdentities {
             "Java import route reasons"
         );
         classify_field!(
+            java_selected_import_proofs,
+            JavaImportRouteGapReasons,
+            "Java selected import proofs"
+        );
+        classify_field!(
             java_import_member_scopes,
             JavaImportMemberScopes,
             "Java import member scopes"
@@ -2374,6 +2718,11 @@ impl SelectedContextIdentities {
             jvm_external_type_identities,
             JvmExternalTypeIdentities,
             "external provider type identities"
+        );
+        classify_field!(
+            go_external_type_witnesses,
+            GoExternalTypeWitnesses,
+            "Go external type witnesses"
         );
         classify_field!(
             jvm_external_type_identities_by_reference,
@@ -2396,6 +2745,16 @@ impl SelectedContextIdentities {
             jvm_external_members,
             JvmExternalMembers,
             "JVM external members"
+        );
+        classify_field!(
+            java_explicit_import_boundaries,
+            JavaExplicitImportBoundaries,
+            "Java explicit import boundaries"
+        );
+        classify_field!(
+            java_type_name_owners,
+            JavaTypeNameOwners,
+            "Java type name owners"
         );
     }
 
@@ -2506,6 +2865,24 @@ pub struct SelectedResolutionContextInputs {
     identities: SelectedContextIdentities,
 }
 
+impl SelectedResolutionContextInputs {
+    /// Whether these are the contexts the Rust demand path builds: no carried
+    /// bridges, callable import boundaries or context-owned gaps, and a complete
+    /// reverse inventory. A certifying Rust forward build requires this shape,
+    /// so the bridge compilers, whose SQL is not classified, never run in one.
+    pub(crate) fn is_empty_demand_context(&self) -> bool {
+        self.root_bridges.is_empty()
+            && self.callable_import_boundaries.is_empty()
+            && self.package_bridges.is_empty()
+            && self.go_import_bindings.is_empty()
+            && self.context_owned_gap_identities.is_empty()
+            && matches!(
+                self.root_reverse_inventory_completion,
+                ResolutionCompletion::Complete
+            )
+    }
+}
+
 /// Request-owned metadata for paths already published under one explicit token.
 /// Candidate bodies and indexes remain in the selected request's SQL rows.
 #[derive(Clone)]
@@ -2582,167 +2959,7 @@ impl SelectedResolutionContextInputs {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn java_snapshot_completion(
-    completion: &ResolutionCompletion,
-    canonical: &impl Fn(String) -> String,
-) -> serde_json::Value {
-    match completion {
-        ResolutionCompletion::Complete => serde_json::json!("Complete"),
-        ResolutionCompletion::Incomplete(reasons) => {
-            let mut reasons = reasons
-                .iter()
-                .map(|reason| canonical(format!("{reason:?}")))
-                .collect::<Vec<_>>();
-            reasons.sort();
-            serde_json::json!({"set": reasons})
-        }
-    }
-}
-
 impl SelectedResolutionContextSet {
-    // Temporary M1f equality surface. Sequences retain order; maps and sets
-    // compare canonical contents, never their runtime allocation order.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn java_assembly_snapshot(
-        &self,
-        canonical: &impl Fn(String) -> String,
-    ) -> std::collections::BTreeMap<String, serde_json::Value> {
-        use serde_json::json;
-        let mut fields = std::collections::BTreeMap::new();
-        macro_rules! sequence {
-            ($name:ident) => {
-                fields.insert(
-                    stringify!($name).into(),
-                    json!(
-                        self.$name
-                            .iter()
-                            .map(|value| canonical(format!("{value:?}")))
-                            .collect::<Vec<_>>()
-                    ),
-                );
-            };
-        }
-        sequence!(root_bridges);
-        sequence!(package_bridges);
-        sequence!(go_import_bindings);
-        fields.insert(
-            "selected_mount_count".into(),
-            json!(self.selected_mount_count),
-        );
-        fields.insert(
-            "mounts".into(),
-            json!(
-                self.mounts
-                    .iter()
-                    .map(|mount| {
-                        json!([
-                            canonical(format!("{:?}", mount.fragment)),
-                            mount.semantic_language.config_label(),
-                            mount
-                                .root_bridges
-                                .iter()
-                                .map(|value| canonical(format!("{value:?}")))
-                                .collect::<Vec<_>>(),
-                            mount
-                                .package_bridges
-                                .iter()
-                                .map(|value| canonical(format!("{value:?}")))
-                                .collect::<Vec<_>>(),
-                            mount
-                                .go_import_bindings
-                                .iter()
-                                .map(|value| canonical(format!("{value:?}")))
-                                .collect::<Vec<_>>(),
-                            java_snapshot_completion(
-                                &mount.root_reverse_inventory_completion,
-                                canonical
-                            )
-                        ])
-                    })
-                    .collect::<Vec<_>>()
-            ),
-        );
-        macro_rules! set { ($name:ident) => {
-            let mut entries = self.$name.iter().map(|value| canonical(format!("{value:?}"))).collect::<Vec<_>>();
-            entries.sort(); fields.insert(stringify!($name).into(), json!({"set": entries}));
-        }; }
-        set!(callable_import_boundaries);
-        set!(context_owned_gap_identities);
-        fields.insert(
-            "root_reverse_inventory_completion".into(),
-            java_snapshot_completion(&self.root_reverse_inventory_completion, canonical),
-        );
-        fields.insert(
-            "declaration_access".into(),
-            json!(
-                self.declaration_access_source
-                    .as_ref()
-                    .map(|source| canonical(format!("{:?}", source.identity())))
-            ),
-        );
-        macro_rules! map { ($($part:ident).+) => {
-            let mut entries = self.identities.$($part).+.lock().expect("identity map not poisoned").iter()
-                .map(|(key, value)| (canonical(format!("{key:?}")), canonical(format!("{value:?}")))).collect::<Vec<_>>();
-            entries.sort(); fields.insert(stringify!($($part).+).into(), json!({"map": entries}));
-        }; }
-        map!(unindexed_go_imports);
-        map!(rust_prelude_references);
-        map!(external_type_import_paths);
-        map!(jvm_external_type_identities);
-        map!(jvm_external_type_identities_by_reference);
-        map!(jvm_external_type_boundaries);
-        map!(jvm_external_owners);
-        map!(model_members);
-        map!(jvm.jvm_supertype_names);
-        map!(jvm.jvm_external_members);
-        let digests = {
-            let numbers = self
-                .identities
-                .numbers
-                .lock()
-                .expect("identity numbers not poisoned");
-            (0..)
-                .map_while(|index| numbers.digest(index))
-                .collect::<Vec<_>>()
-        };
-        let digest_text = |number: usize| {
-            format!(
-                "digest:{}",
-                brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digests[number])
-            )
-        };
-        let mut reasons = self
-            .identities
-            .named_reasons
-            .lock()
-            .expect("named reasons not poisoned")
-            .iter()
-            .map(|(number, reason)| {
-                (
-                    digest_text(usize::try_from(*number).unwrap()),
-                    canonical(format!("{reason:?}")),
-                )
-            })
-            .collect::<Vec<_>>();
-        reasons.sort();
-        fields.insert("named_reasons".into(), json!({"map": reasons}));
-        let mut digests = (0..digests.len()).map(digest_text).collect::<Vec<_>>();
-        digests.sort();
-        fields.insert("zz_canonical_identities".into(), json!({"set": digests}));
-        let mut gaps = self
-            .identities
-            .java_import_route_gap_reasons
-            .lock()
-            .expect("identity set not poisoned")
-            .iter()
-            .map(|value| canonical(format!("{value:?}")))
-            .collect::<Vec<_>>();
-        gaps.sort();
-        fields.insert("java_import_route_gap_reasons".into(), json!({"set": gaps}));
-        fields
-    }
-
     /// Publish all authored import binders before lazy member closure begins.
     pub(crate) fn with_callable_imports<'a>(
         mut self,
@@ -4198,6 +4415,22 @@ impl SelectedRootBridgeDescriptor {
         self
     }
 
+    /// A model declaration is a query coordinate registered by the selected
+    /// model provider, not an authored definition in the route's mount.
+    pub(crate) fn with_selected_model_member_definition(
+        mut self,
+        definition: BindingNodeId,
+    ) -> Self {
+        assert_eq!(definition.ordinal(), None);
+        assert_eq!(self.target_export_token.ordinal(), None);
+        assert_ne!(definition, BindingNodeId::universal_root());
+        assert!(self.target_member_scope.is_none());
+        assert!(self.jvm_evidence.is_none());
+        self.target_definition = Some(definition);
+        self.target_kind = SelectedBridgeTargetKind::Member;
+        self
+    }
+
     /// Land this route in a member scope instead of at a root export.
     ///
     /// The scope head is the destination blob's own, so it cannot be the
@@ -4929,6 +5162,7 @@ fn bridge_digest(
         CanonicalIdentityPart::Content(match bridge.anchor() {
             ResolutionRootImportAnchor::Lexical => b"lexical",
             ResolutionRootImportAnchor::Absolute => b"absolute",
+            ResolutionRootImportAnchor::AliasQualified => b"alias_qualified",
         }),
     )?;
     hasher.field(
@@ -6309,6 +6543,13 @@ impl SelectedContextIdentities {
         heap.arc(&self.java_import_route_gap_reasons, |reasons, heap| {
             heap.btree_set(&reasons.lock().expect("Java reasons are not poisoned"));
         });
+        heap.arc(&self.java_selected_import_proofs, |proofs, heap| {
+            heap.btree_set(
+                &proofs
+                    .lock()
+                    .expect("Java selected proofs are not poisoned"),
+            );
+        });
         heap.arc(&self.model_members, |values, heap| {
             let values = values.lock().expect("model members are not poisoned");
             heap.map(&values);
@@ -6323,6 +6564,60 @@ impl SelectedContextIdentities {
         heap.add(std::mem::size_of_val(&**jvm));
         heap.arc(&self.jvm_external_type_identities, |values, heap| {
             heap.map(&values.lock().expect("external types are not poisoned"))
+        });
+        heap.arc(&self.go_external_type_witnesses, |values, heap| {
+            let values = values
+                .lock()
+                .expect("Go external type witnesses are not poisoned");
+            heap.map(&values);
+            for witnesses in values.values() {
+                heap.vec(witnesses);
+            }
+            for witness in values.values().flatten() {
+                heap.add(witness.owner_provider.pack_id.capacity());
+                heap.add(witness.owner_provider.pack_version.capacity());
+                heap.add(witness.owner_provider.pack_digest.capacity());
+                heap.add(witness.qualified_name.capacity());
+                let authority = &witness.authority;
+                heap.add(authority.active_model_set_hash.capacity());
+                match &authority.demand {
+                    crate::analyzer::store::resolution_operation::go_demand::GoTerminalDemand::Prepared(key) => {
+                        heap.add(key.heap_bytes());
+                    }
+                    crate::analyzer::store::resolution_operation::go_demand::GoTerminalDemand::Caller {
+                        preparation,
+                        ..
+                    } => {
+                        heap.add(preparation.as_ref().map_or(0, |key| key.heap_bytes()));
+                    }
+                }
+                let import = &authority.binder_import;
+                heap.add(import.source_spelling.capacity());
+                heap.add(import.import_path.capacity());
+                heap.add(import.package_name.capacity());
+                match &import.provenance {
+                    crate::analyzer::store::resolution_operation::go_named::GoExternalPackageProvenance::GoTool {
+                        provider_kind,
+                        module_path,
+                        module_version,
+                    } => {
+                        heap.add(provider_kind.capacity());
+                        heap.add(module_path.as_ref().map_or(0, String::capacity));
+                        heap.add(module_version.as_ref().map_or(0, String::capacity));
+                    }
+                    crate::analyzer::store::resolution_operation::go_named::GoExternalPackageProvenance::SemanticModel {
+                        symbol_id,
+                        pack_id,
+                        pack_digest,
+                        record_id,
+                    } => {
+                        heap.add(symbol_id.capacity());
+                        heap.add(pack_id.capacity());
+                        heap.add(pack_digest.capacity());
+                        heap.add(record_id.capacity());
+                    }
+                }
+            }
         });
         heap.arc(
             &self.jvm_external_type_identities_by_reference,
@@ -6363,6 +6658,26 @@ impl SelectedContextIdentities {
                 heap.arc(&value.provider_id, |_, _| {});
                 heap.arc(&value.owner_fqn, |_, _| {});
                 heap.map(reasons);
+            }
+        });
+        heap.arc(&jvm.java_type_name_owners, |values, heap| {
+            heap.map(
+                &values
+                    .lock()
+                    .expect("Java type name owners are not poisoned"),
+            );
+        });
+        heap.arc(&jvm.java_explicit_import_boundaries, |values, heap| {
+            let values = values
+                .lock()
+                .expect("Java explicit import boundaries are not poisoned");
+            heap.map(&values);
+            for value in values.values() {
+                heap.arc(&value.imported_fqn, |_, _| {});
+                heap.arc(&value.simple_name, |_, _| {});
+                if let Some(target) = &value.external_target {
+                    heap.arc(target, |_, _| {});
+                }
             }
         });
     }

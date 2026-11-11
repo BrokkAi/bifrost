@@ -47,22 +47,29 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        super::read_memo(
-            self,
-            &self.imported_code_units,
-            file.clone(),
-            || {
-                Arc::new(
-                    resolve_import_bindings(self, token, file)
-                        .into_values()
-                        .collect(),
-                )
-            },
-            super::weight_code_unit_set,
-        )
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let scope = AnalyzerQueryScope::new(self);
+            let token = scope.token();
+            super::read_memo(
+                self,
+                &self.imported_code_units,
+                file.clone(),
+                || {
+                    Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                        resolve_import_bindings(self, token, file)
+                            .into_values()
+                            .collect(),
+                    ))
+                },
+                |_file, units| {
+                    brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(units)
+                },
+            )
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

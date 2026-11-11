@@ -1033,6 +1033,7 @@ pub enum ResolvedTypestateBinding {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTypestateAutomatonSpec {
+    pub event_set: Option<TypestateEventSetSpec>,
     pub states: Vec<TypestateStateId>,
     pub initial: TypestateStateId,
     pub accepting_states: Vec<TypestateStateId>,
@@ -1062,6 +1063,7 @@ impl ResolvedTypestateAutomatonSpec {
 #[derive(Debug, Clone)]
 pub struct ResolvedTypestateEventSpec {
     pub id: TypestateEventId,
+    pub semantic_effect: Option<String>,
     pub trigger: ResolvedTypestateEventTrigger,
     pub applies_to_subjects: Vec<ResolvedEndpointIdentity>,
     pub supersedes: Vec<TypestateEventId>,
@@ -1078,10 +1080,16 @@ impl ResolvedTypestateEventSpec {
         sort_dedup(&mut supersedes);
         Self {
             id,
+            semantic_effect: None,
             trigger,
             applies_to_subjects,
             supersedes,
         }
+    }
+
+    pub fn with_semantic_effect(mut self, effect: Option<String>) -> Self {
+        self.semantic_effect = effect;
+        self
     }
 }
 
@@ -1242,6 +1250,7 @@ pub struct LoadedPolicy {
     endpoint_set_dependencies: Vec<ResolvedEndpointSetDependency>,
     precedence_manifest: PolicyPrecedenceManifest,
     resolved_taint: Option<ResolvedTaintPolicySpec>,
+    resolved_without_flow: Option<ResolvedTaintPolicySpec>,
     resolved_typestate: Option<ResolvedTypestatePolicySpec>,
 }
 
@@ -1262,12 +1271,20 @@ impl LoadedPolicy {
         mut endpoint_set_dependencies: Vec<ResolvedEndpointSetDependency>,
         mut precedence_manifest: PolicyPrecedenceManifest,
         resolved_taint: Option<ResolvedTaintPolicySpec>,
+        resolved_without_flow: Option<ResolvedTaintPolicySpec>,
         resolved_typestate: Option<ResolvedTypestatePolicySpec>,
     ) -> Result<Self, LoadedModelError> {
         if definition.schema_version.version != schema_resolution.version {
             return Err(LoadedModelError::DefinitionSchemaMismatch);
         }
         validate_resolved_analysis(&definition.analysis, &resolved_taint, &resolved_typestate)?;
+        let authored_without_flow = match &definition.analysis {
+            PolicyAnalysis::Taint { spec } => spec.without_flow.is_some(),
+            _ => false,
+        };
+        if authored_without_flow != resolved_without_flow.is_some() {
+            return Err(LoadedModelError::ResolvedAnalysisMismatch);
+        }
 
         resolved_selectors.sort_by(|left, right| left.path.cmp(&right.path));
         if resolved_selectors
@@ -1313,6 +1330,7 @@ impl LoadedPolicy {
             &resolved_selectors,
             &endpoint_dependencies,
             resolved_taint.as_ref(),
+            resolved_without_flow.as_ref(),
         )?;
         validate_loaded_policy_model(
             &definition,
@@ -1323,6 +1341,7 @@ impl LoadedPolicy {
             &endpoint_set_dependencies,
             &precedence_manifest,
             resolved_taint.as_ref(),
+            resolved_without_flow.as_ref(),
             resolved_typestate.as_ref(),
         )?;
 
@@ -1346,6 +1365,7 @@ impl LoadedPolicy {
             &match_directory_manifests,
             &endpoint_set_dependencies,
             &precedence_manifest,
+            resolved_without_flow.as_ref(),
         )?;
         Ok(Self {
             definition,
@@ -1360,6 +1380,7 @@ impl LoadedPolicy {
             endpoint_set_dependencies,
             precedence_manifest,
             resolved_taint,
+            resolved_without_flow,
             resolved_typestate,
         })
     }
@@ -1410,6 +1431,10 @@ impl LoadedPolicy {
 
     pub const fn resolved_taint(&self) -> Option<&ResolvedTaintPolicySpec> {
         self.resolved_taint.as_ref()
+    }
+
+    pub const fn resolved_without_flow(&self) -> Option<&ResolvedTaintPolicySpec> {
+        self.resolved_without_flow.as_ref()
     }
 
     pub const fn resolved_typestate(&self) -> Option<&ResolvedTypestatePolicySpec> {
@@ -1546,6 +1571,7 @@ fn validate_loaded_policy_model(
     endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
     precedence: &PolicyPrecedenceManifest,
     resolved_taint: Option<&ResolvedTaintPolicySpec>,
+    resolved_without_flow: Option<&ResolvedTaintPolicySpec>,
     resolved_typestate: Option<&ResolvedTypestatePolicySpec>,
 ) -> Result<(), LoadedModelError> {
     for selector in selectors {
@@ -1706,6 +1732,7 @@ fn validate_loaded_policy_model(
                 dependencies,
                 manifests,
                 endpoint_set_dependencies,
+                resolved_without_flow,
             )?;
         }
         (PolicyAnalysis::Typestate { spec: authored }, None, Some(resolved)) => {
@@ -1724,6 +1751,7 @@ fn validate_loaded_policy_model(
     validate_precedence(precedence, dependencies, resolved_taint, resolved_typestate)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_resolved_taint(
     definition: &PolicyDefinition,
     authored: &TaintPolicySpec,
@@ -1732,6 +1760,7 @@ fn validate_resolved_taint(
     dependencies: &[ResolvedEndpointDependency],
     manifests: &[ResolvedMatchDirectoryManifest],
     endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
+    resolved_without_flow: Option<&ResolvedTaintPolicySpec>,
 ) -> Result<(), LoadedModelError> {
     let policy_id = &definition.metadata.id;
     let segments = definition.analysis.set_segments();
@@ -1844,6 +1873,12 @@ fn validate_resolved_taint(
                 .iter()
                 .map(|endpoint| endpoint.identity.clone()),
         )
+        .chain(resolved_without_flow.into_iter().flat_map(|secondary| {
+            secondary
+                .sources
+                .iter()
+                .map(|endpoint| endpoint.identity.clone())
+        }))
         .collect::<Vec<_>>();
     if contains_duplicates(endpoint_identities.iter().cloned()) {
         return invalid("resolved taint source/sink identities must be globally unique");
@@ -1865,6 +1900,131 @@ fn validate_resolved_taint(
     }
     for endpoint in &resolved.sinks {
         validate_resolved_taint_sink(endpoint, &dependencies_by_identity)?;
+    }
+    if let Some(secondary) = resolved_without_flow {
+        let authored_secondary = authored
+            .without_flow
+            .as_ref()
+            .ok_or(LoadedModelError::ResolvedAnalysisMismatch)?;
+        if secondary.mode != authored.mode
+            || secondary.call_modeling != authored.call_modeling
+            || secondary.threat_models != resolved.threat_models
+            || !secondary.sinks.is_empty()
+            || !secondary.entry_points.is_empty()
+            || !secondary.store_writes.is_empty()
+            || !secondary.store_reads.is_empty()
+            || secondary.sources.len() != authored_secondary.sources.entries.len()
+            || secondary.sanitizers.len() != authored_secondary.sanitizers.entries.len()
+            || secondary.barriers.len() != authored_secondary.barriers.entries.len()
+            || secondary.transforms.len() != authored_secondary.transforms.entries.len()
+            || secondary.external_models.len() != authored_secondary.external_models.entries.len()
+        {
+            return invalid("resolved without-flow plan differs from the authored clause");
+        }
+        for endpoint in &secondary.sources {
+            validate_resolved_taint_source(endpoint, &dependencies_by_identity)?;
+        }
+        for source in &authored_secondary.sources.entries {
+            let identity = ResolvedEndpointIdentity::Local {
+                policy_id: policy_id.clone(),
+                entry_id: source.id.clone(),
+            };
+            let endpoint = secondary
+                .sources
+                .iter()
+                .find(|endpoint| endpoint.identity == identity)
+                .ok_or(LoadedModelError::InvalidResolvedModel {
+                    reason: "authored without-flow source is absent from the resolved plan",
+                })?;
+            let path = selector_path(&taint_entry_selector_path(
+                WITHOUT_FLOW_SET_SEGMENTS.sources,
+                source.id.as_str(),
+            ))?;
+            if endpoint.definition.display_name != source.display_name
+                || !same_set(&endpoint.definition.categories, &source.categories)
+                || endpoint.definition.selector_path != path
+                || endpoint.definition.bind != source.bind
+                || !same_set(&endpoint.definition.labels, &source.labels)
+                || endpoint.definition.threat_model != source.threat_model
+                || endpoint.definition.evidence != source.evidence
+            {
+                return invalid(
+                    "resolved without-flow source differs from its authored definition",
+                );
+            }
+        }
+        for sanitizer in &authored_secondary.sanitizers.entries {
+            let identity = ResolvedEndpointIdentity::Local {
+                policy_id: policy_id.clone(),
+                entry_id: sanitizer.id.clone(),
+            };
+            let entry = secondary
+                .sanitizers
+                .iter()
+                .find(|entry| entry.identity == identity)
+                .ok_or(LoadedModelError::InvalidResolvedModel {
+                    reason: "authored without-flow sanitizer is absent from the resolved plan",
+                })?;
+            if crate::canonical::sanitizer_kind_to_json(&entry.definition.kind)
+                != crate::canonical::sanitizer_kind_to_json(&sanitizer.kind)
+                || !same_set(&entry.definition.removes, &sanitizer.removes)
+            {
+                return invalid(
+                    "resolved without-flow sanitizer differs from its authored definition",
+                );
+            }
+        }
+        for barrier in &authored_secondary.barriers.entries {
+            if !secondary
+                .barriers
+                .iter()
+                .any(|entry| entry.id == barrier.id && entry.value_type == barrier.value_type)
+            {
+                return invalid(
+                    "resolved without-flow barrier differs from its authored definition",
+                );
+            }
+        }
+        for transform in &authored_secondary.transforms.entries {
+            let identity = ResolvedEndpointIdentity::Local {
+                policy_id: policy_id.clone(),
+                entry_id: transform.id.clone(),
+            };
+            let entry = secondary
+                .transforms
+                .iter()
+                .find(|entry| entry.identity == identity)
+                .ok_or(LoadedModelError::InvalidResolvedModel {
+                    reason: "authored without-flow transform is absent from the resolved plan",
+                })?;
+            if entry.definition.input != transform.input
+                || entry.definition.output != transform.output
+                || !same_set(&entry.definition.removes, &transform.removes)
+                || !same_set(&entry.definition.adds, &transform.adds)
+            {
+                return invalid(
+                    "resolved without-flow transform differs from its authored definition",
+                );
+            }
+        }
+        for model in &authored_secondary.external_models.entries {
+            let identity = ResolvedEndpointIdentity::Local {
+                policy_id: policy_id.clone(),
+                entry_id: model.id.clone(),
+            };
+            let entry = secondary
+                .external_models
+                .iter()
+                .find(|entry| entry.identity == identity)
+                .ok_or(LoadedModelError::InvalidResolvedModel {
+                    reason: "authored without-flow external model is absent from the resolved plan",
+                })?;
+            if !same_unordered(&entry.definition.transfers, &model.transfers) {
+                return invalid(
+                    "resolved without-flow external model differs from its authored definition",
+                );
+            }
+        }
     }
     for endpoint in &resolved.entry_points {
         validate_resolved_taint_source(endpoint, &dependencies_by_identity)?;
@@ -2420,6 +2580,9 @@ fn validate_typestate_automaton(
     {
         return invalid("resolved typestate state graph differs from the authored graph");
     }
+    if resolved.event_set != authored.event_set {
+        return invalid("resolved typestate event set differs from the authored declaration");
+    }
 
     let event_ids = resolved
         .events
@@ -2453,6 +2616,7 @@ fn validate_typestate_automaton(
             .find(|candidate| candidate.id == event.id)
             .expect("resolved event ID closure checked above");
         if !same_set(&event.supersedes, &authored_event.supersedes)
+            || event.semantic_effect != authored_event.semantic_effect
             || !event_trigger_matches_authored(
                 &event.trigger,
                 &authored_event.trigger,
@@ -2959,6 +3123,42 @@ fn validate_authored_policy_selectors(
                     selectors,
                 )?;
             }
+            if let Some(without) = &spec.without_flow {
+                let segments = WITHOUT_FLOW_SET_SEGMENTS;
+                for source in &without.sources.entries {
+                    validate_authored_selector_at(
+                        &taint_entry_selector_path(segments.sources, source.id.as_str()),
+                        &source.selector,
+                        selectors,
+                    )?;
+                }
+                for sanitizer in &without.sanitizers.entries {
+                    let base =
+                        taint_entry_selector_path(segments.sanitizers, sanitizer.id.as_str());
+                    validate_authored_selector_at(&base, &sanitizer.selector, selectors)?;
+                    for (index, selector) in sanitizer.kind.requirement_selectors() {
+                        validate_authored_selector_at(
+                            &sanitizer_requirement_selector_path(&base, index),
+                            selector,
+                            selectors,
+                        )?;
+                    }
+                }
+                for transform in &without.transforms.entries {
+                    validate_authored_selector_at(
+                        &taint_entry_selector_path(segments.transforms, transform.id.as_str()),
+                        &transform.selector,
+                        selectors,
+                    )?;
+                }
+                for model in &without.external_models.entries {
+                    validate_authored_selector_at(
+                        &taint_entry_selector_path(segments.external_models, model.id.as_str()),
+                        &model.selector,
+                        selectors,
+                    )?;
+                }
+            }
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {
@@ -3330,6 +3530,7 @@ fn validate_selector_closure(
     selectors: &[ResolvedPolicySelector],
     dependencies: &[ResolvedEndpointDependency],
     resolved_taint: Option<&ResolvedTaintPolicySpec>,
+    resolved_without_flow: Option<&ResolvedTaintPolicySpec>,
 ) -> Result<(), LoadedModelError> {
     let mut expected = expected_selector_paths(definition)?;
     expected.extend(
@@ -3368,6 +3569,31 @@ fn validate_selector_closure(
         );
         expected.extend(
             spec.store_reads
+                .iter()
+                .map(|entry| entry.selector_path.clone()),
+        );
+    }
+    if let Some(spec) = resolved_without_flow {
+        expected.extend(
+            spec.sanitizers
+                .iter()
+                .map(|entry| entry.selector_path.clone()),
+        );
+        for entry in &spec.sanitizers {
+            for (index, _) in entry.definition.kind.requirement_selectors() {
+                expected.push(selector_path(&sanitizer_requirement_selector_path(
+                    entry.selector_path.as_str(),
+                    index,
+                ))?);
+            }
+        }
+        expected.extend(
+            spec.transforms
+                .iter()
+                .map(|entry| entry.selector_path.clone()),
+        );
+        expected.extend(
+            spec.external_models
                 .iter()
                 .map(|entry| entry.selector_path.clone()),
         );
@@ -3453,6 +3679,25 @@ fn expected_selector_paths(
             )?;
             extend_taint_paths(&mut paths, segments.stores, &spec.store_writes)?;
             extend_taint_paths(&mut paths, segments.stores, &spec.store_reads)?;
+            if let Some(without) = &spec.without_flow {
+                let segments = WITHOUT_FLOW_SET_SEGMENTS;
+                extend_taint_paths(&mut paths, segments.sources, &without.sources.entries)?;
+                extend_taint_paths(&mut paths, segments.sanitizers, &without.sanitizers.entries)?;
+                for entry in &without.sanitizers.entries {
+                    let base = taint_entry_selector_path(segments.sanitizers, entry.id.as_str());
+                    for (index, _) in entry.kind.requirement_selectors() {
+                        paths.push(selector_path(&sanitizer_requirement_selector_path(
+                            &base, index,
+                        ))?);
+                    }
+                }
+                extend_taint_paths(&mut paths, segments.transforms, &without.transforms.entries)?;
+                extend_taint_paths(
+                    &mut paths,
+                    segments.external_models,
+                    &without.external_models.entries,
+                )?;
+            }
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {
@@ -3546,6 +3791,7 @@ mod tests {
             PolicyPrecedenceManifest::default(),
             None,
             None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -3636,6 +3882,7 @@ mod tests {
             vec![first, second],
             Vec::new(),
             PolicyPrecedenceManifest::default(),
+            None,
             None,
             None,
         )

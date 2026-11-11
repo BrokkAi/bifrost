@@ -104,6 +104,23 @@ struct RubyWork<'tree> {
     parent: Option<CodeUnit>,
 }
 
+/// The per-subtree state the declaration walk carries from a node to its
+/// children. [`RubyVisitor::descend`] computes the lexical, mixin and module
+/// transitions on entry; `fields` changes only after the node's own statement
+/// has been visited, because that visit registers the field contexts.
+#[derive(Clone, Copy, Default)]
+struct RubyBodyContext {
+    /// The field-declaring context assignments under this node belong to.
+    fields: Option<usize>,
+    /// Index into the walk's lexical scope table.
+    lexical_scope: usize,
+    /// The innermost directly enclosing module, until a class, a method or a
+    /// `module_function` call cuts it.
+    module: Option<usize>,
+    /// The mixin container whose `include`/`extend` calls this node may add to.
+    mixin: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct RubyMixinContainer {
     owner: Option<(CodeUnit, Vec<(String, String)>)>,
@@ -179,104 +196,9 @@ impl RubyVisitor<'_> {
             .map(|work| (work.node.id(), work))
             .collect();
         let mut lexical_scopes = vec![Vec::<String>::new()];
-        let mut walk = vec![(
-            root,
-            None,
-            None::<usize>,
-            root_bindings,
-            0usize,
-            None::<usize>,
-            None::<usize>,
-        )];
-        while let Some((
-            node,
-            parent,
-            mut fields,
-            inherited_bindings,
-            mut lexical_scope,
-            mut module,
-            mut mixin,
-        )) = walk.pop()
-        {
-            if matches!(node.kind(), "class" | "module")
-                && let Some(name) = node.child_by_field_name("name")
-            {
-                let path = extract_name_path(name, self.source);
-                let mut segments = if path.absolute {
-                    Vec::new()
-                } else {
-                    lexical_scopes[lexical_scope].clone()
-                };
-                segments.extend(path.segments);
-                lexical_scope = lexical_scopes.len();
-                lexical_scopes.push(segments);
-            }
-            if let Some(root) = self.mixin_roots.remove(&node.id()) {
-                mixin = Some(root);
-            } else if let Some(container) = mixin {
-                if node.kind() == "call" {
-                    self.mixin_containers[container].relations.extend(
-                        mixin_specs_for_call(node, self.source)
-                            .into_iter()
-                            .map(|spec| {
-                                let encoded = encode_mixin_relation(&spec);
-                                (spec.raw_target, encoded)
-                            }),
-                    );
-                    if namespace_call_block(node, self.source).is_some() {
-                        let child = self.mixin_containers.len();
-                        self.mixin_containers.push(RubyMixinContainer::default());
-                        self.mixin_containers[container].children.push(child);
-                        mixin = Some(child);
-                    } else {
-                        mixin = None;
-                    }
-                } else if is_descendable_container(node.kind()) {
-                    let child = self.mixin_containers.len();
-                    self.mixin_containers.push(RubyMixinContainer::default());
-                    self.mixin_containers[container].children.push(child);
-                    mixin = Some(child);
-                } else {
-                    mixin = None;
-                }
-            }
-            self.current_module = module;
-            match node.kind() {
-                "module" => {
-                    module = Some(node.id());
-                }
-                "class" | "method" | "singleton_method" => {
-                    module = None;
-                }
-                _ => {}
-            }
-            if let Some(owner) = module {
-                let names = if node.kind() == "call"
-                    && node.child_by_field_name("method").is_some_and(|method| {
-                        ruby_node_text(method, self.source).trim() == "module_function"
-                    }) {
-                    Some(module_function_names(node, self.source).collect::<Vec<_>>())
-                } else if node.kind() == "identifier"
-                    && ruby_node_text(node, self.source).trim() == "module_function"
-                {
-                    Some(Vec::new())
-                } else {
-                    None
-                };
-                if let Some(names) = names {
-                    let facts = self.module_functions.entry(owner).or_default();
-                    if names.is_empty() && crate::syntax::ruby_first_call_argument(node).is_none() {
-                        facts.bare_start = Some(
-                            facts
-                                .bare_start
-                                .map_or(node.start_byte(), |start| start.min(node.start_byte())),
-                        );
-                    } else {
-                        facts.names.extend(names);
-                    }
-                    module = None;
-                }
-            }
+        let mut walk = vec![(root, None, root_bindings, RubyBodyContext::default())];
+        while let Some((node, parent, inherited_bindings, enclosing)) = walk.pop() {
+            let mut body = self.descend(node, enclosing, &mut lexical_scopes);
             let load_syntax = parse_ruby_load_syntax(node, self.source);
             self.ruby.has_parse_errors |= node.is_error() || node.is_missing();
             if let Some(boundary) = crate::diagnostics::runtime_boundary_for_node(
@@ -314,7 +236,7 @@ impl RubyVisitor<'_> {
                     kind: syntax.kind,
                     has_receiver: syntax.has_receiver,
                     autoload_constant: syntax.constant.map(|constant| {
-                        let mut name = lexical_scopes[lexical_scope].clone();
+                        let mut name = lexical_scopes[body.lexical_scope].clone();
                         name.push(constant);
                         name
                     }),
@@ -367,11 +289,11 @@ impl RubyVisitor<'_> {
                 node.kind(),
                 "class" | "module" | "method" | "singleton_method" | "singleton_class"
             ) {
-                fields = None;
+                body.fields = None;
             }
-            let field_assignment =
-                matches!(node.kind(), "assignment" | "operator_assignment") && fields.is_some();
-            if let Some(index) = fields.filter(|_| field_assignment) {
+            let field_assignment = matches!(node.kind(), "assignment" | "operator_assignment")
+                && body.fields.is_some();
+            if let Some(index) = body.fields.filter(|_| field_assignment) {
                 let context = self.field_owners[index].clone();
                 self.visit_assignment(
                     node,
@@ -387,24 +309,16 @@ impl RubyVisitor<'_> {
                 statements.extend(pending.drain(..).map(|work| (work.node.id(), work)));
             }
             if let Some(context) = self.field_contexts.remove(&node.id()) {
-                fields = Some(context);
+                body.fields = Some(context);
             }
             // A field assignment is one declaration; its expression children
             // do not introduce additional field declarations in this projection.
             if matches!(node.kind(), "assignment" | "operator_assignment") {
-                fields = None;
+                body.fields = None;
             }
             for index in (0..node.named_child_count()).rev() {
                 if let Some(child) = node.named_child(index) {
-                    walk.push((
-                        child,
-                        structural_parent,
-                        fields,
-                        binding_scope,
-                        lexical_scope,
-                        module,
-                        mixin,
-                    ));
+                    walk.push((child, structural_parent, binding_scope, body));
                 }
             }
         }
@@ -487,6 +401,94 @@ impl RubyVisitor<'_> {
             imports: self.imports,
             rust_import_contexts: Vec::new(),
         });
+    }
+
+    /// The body context `node` and its children see, given the context its
+    /// parent passed down. Records a `module_function` it finds on the way.
+    fn descend(
+        &mut self,
+        node: Node<'_>,
+        enclosing: RubyBodyContext,
+        lexical_scopes: &mut Vec<Vec<String>>,
+    ) -> RubyBodyContext {
+        let mut body = enclosing;
+        if matches!(node.kind(), "class" | "module")
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            let path = extract_name_path(name, self.source);
+            let mut segments = if path.absolute {
+                Vec::new()
+            } else {
+                lexical_scopes[body.lexical_scope].clone()
+            };
+            segments.extend(path.segments);
+            body.lexical_scope = lexical_scopes.len();
+            lexical_scopes.push(segments);
+        }
+        if let Some(root) = self.mixin_roots.remove(&node.id()) {
+            body.mixin = Some(root);
+        } else if let Some(container) = body.mixin {
+            body.mixin = if node.kind() == "call" {
+                self.mixin_containers[container].relations.extend(
+                    mixin_specs_for_call(node, self.source)
+                        .into_iter()
+                        .map(|spec| {
+                            let encoded = encode_mixin_relation(&spec);
+                            (spec.raw_target, encoded)
+                        }),
+                );
+                namespace_call_block(node, self.source)
+                    .is_some()
+                    .then(|| self.child_mixin_container(container))
+            } else if is_descendable_container(node.kind()) {
+                Some(self.child_mixin_container(container))
+            } else {
+                None
+            };
+        }
+        // A method declared directly at this node belongs to the module that
+        // encloses it, before this node's own kind cuts or opens one.
+        self.current_module = body.module;
+        match node.kind() {
+            "module" => body.module = Some(node.id()),
+            "class" | "method" | "singleton_method" => body.module = None,
+            _ => {}
+        }
+        if let Some(owner) = body.module {
+            let names = if node.kind() == "call"
+                && node.child_by_field_name("method").is_some_and(|method| {
+                    ruby_node_text(method, self.source).trim() == "module_function"
+                }) {
+                Some(module_function_names(node, self.source).collect::<Vec<_>>())
+            } else if node.kind() == "identifier"
+                && ruby_node_text(node, self.source).trim() == "module_function"
+            {
+                Some(Vec::new())
+            } else {
+                None
+            };
+            if let Some(names) = names {
+                let facts = self.module_functions.entry(owner).or_default();
+                if names.is_empty() && crate::syntax::ruby_first_call_argument(node).is_none() {
+                    facts.bare_start = Some(
+                        facts
+                            .bare_start
+                            .map_or(node.start_byte(), |start| start.min(node.start_byte())),
+                    );
+                } else {
+                    facts.names.extend(names);
+                }
+                body.module = None;
+            }
+        }
+        body
+    }
+
+    fn child_mixin_container(&mut self, parent: usize) -> usize {
+        let child = self.mixin_containers.len();
+        self.mixin_containers.push(RubyMixinContainer::default());
+        self.mixin_containers[parent].children.push(child);
+        child
     }
 
     fn record_declaration(
@@ -572,8 +574,12 @@ impl RubyVisitor<'_> {
             short_name,
             ruby_type_chain_fq(&new_segments),
         );
+        // Ruby classes and modules are open: a second `module M` block in the
+        // same file adds to the first one's namespace. Merge the occurrence
+        // (one more range, the same unit and children) instead of replacing
+        // the unit, which would drop everything the earlier block declared.
         self.parsed
-            .replace_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
+            .add_code_unit(code_unit.clone(), node, self.source, parent.cloned(), None);
         self.record_declaration(node, Some(name_node), code_unit.clone());
         self.parsed
             .add_signature(code_unit.clone(), first_line(node, self.source));

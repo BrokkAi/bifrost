@@ -18,20 +18,12 @@ use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, m
 use brokk_bifrost_analysis::analyzer::{WorkspaceAnalyzer, resolve_analyzer};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_csharp_analysis::{CSharpAnalyzer, csharp_catch_facts};
-use brokk_bifrost_go_analysis::{
-    go_failure_handler_body_shapes, go_failure_handler_file_body_shapes,
+use brokk_bifrost_go_analysis::go_failure_handler_file_body_shapes;
+use brokk_bifrost_rust_analysis::analyzer::{
+    RustFailureIdentities, rust_failure_handler_body_shapes, rust_failure_handler_identities,
 };
-use brokk_bifrost_rust_analysis::analyzer::rust_failure_handler_body_shapes;
 
 const MAX_HANDLER_SOURCE_BYTES: usize = 1024 * 1024;
-
-type NativeFailureHook = fn(
-    &WorkspaceAnalyzer,
-    &ProjectFile,
-    &PreparedSyntaxTree,
-    Range,
-    &CancellationToken,
-) -> Vec<NativeFailureBranch>;
 
 #[derive(Default)]
 pub(super) struct FailureHandlerStateCache {
@@ -40,6 +32,9 @@ pub(super) struct FailureHandlerStateCache {
     uncancelled: CancellationToken,
     syntax: CaptureScopedMemo<HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>>,
     go_branches: CaptureScopedMemo<HashMap<ProjectFile, HashMap<Range, Vec<NativeFailureBranch>>>>,
+    // One file's Result identity proofs share one selected resolution
+    // operation; proving per callable reopened it at every constructor (#8853).
+    rust_identities: CaptureScopedMemo<HashMap<ProjectFile, RustFailureIdentities>>,
     regions: CaptureScopedMemo<
         HashMap<
             ProjectFile,
@@ -229,14 +224,8 @@ pub(super) fn failure_handler_state_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     let seed_kind = seed.facts.node(seed.fact_match.node).kind;
-    let native_hook: Option<NativeFailureHook> = match seed.language {
-        Language::Rust => Some(|workspace, file, syntax, range, _cancellation| {
-            rust_failure_handler_body_shapes(workspace, file, syntax, range)
-        }),
-        Language::Go => Some(go_failure_handler_body_shapes),
-        _ => None,
-    };
-    let native_seed = native_hook.is_some() && seed_kind.satisfies(NormalizedKind::Callable);
+    let native_seed = matches!(seed.language, Language::Rust | Language::Go)
+        && seed_kind.satisfies(NormalizedKind::Callable);
     let throw_seed = seed_kind == NormalizedKind::Throw;
     if !native_seed && seed_kind != NormalizedKind::Catch && !throw_seed {
         return Vec::new();
@@ -486,13 +475,15 @@ pub(super) fn failure_handler_state_expansions(
                         .unwrap_or_default()
                 })
         } else {
-            native_hook.expect("native hook exists for native seed")(
-                workspace,
-                &seed.file,
-                &syntax,
-                handler_seed,
-                cancellation,
-            )
+            cache
+                .rust_identities
+                .read_mut(&memo_attribution(analyzer), |rust_identities| {
+                    let identities =
+                        rust_identities.entry(seed.file.clone()).or_insert_with(|| {
+                            rust_failure_handler_identities(workspace, &seed.file, &syntax)
+                        });
+                    rust_failure_handler_body_shapes(identities, &syntax, handler_seed)
+                })
         };
         let callable_ast_id = crate::analyzer::structural::occurrence_rows::ast_id(
             seed.facts.source_identity(),

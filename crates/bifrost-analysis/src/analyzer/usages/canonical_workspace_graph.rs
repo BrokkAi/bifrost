@@ -26,6 +26,7 @@ use crate::analyzer::structural::reference_edges::{
 };
 use crate::analyzer::structural::{EdgeAxis, EdgeProvenance};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceKind;
+use brokk_bifrost_core::analyzer::usages::model::ReferenceFacets;
 
 /// Canonical-only metadata layered over the unchanged legacy graph catalog.
 ///
@@ -834,6 +835,12 @@ impl CanonicalWorkspaceUsageGraphAccumulator {
 /// non-graph declaration remains unchanged.
 #[doc(hidden)]
 pub struct SelectedWorkspaceUsageGraphProjection {
+    pub scope_obligations: Vec<WorkspaceUsageGraphScopeObligation>,
+    /// Relative import route evidence. An unused route has no graph gap but
+    /// its source operand sites still explain forward projection openness.
+    #[doc(hidden)]
+    pub relative_import_routes:
+        Vec<brokk_bifrost_core::analyzer::usages::inverted_edges::RelativeImportRouteEvidence>,
     #[doc(hidden)]
     pub nodes: Vec<WorkspaceUsageNode>,
     #[doc(hidden)]
@@ -1431,6 +1438,16 @@ pub fn aggregate_disjoint_workspace_usage_projections(
         .into_iter()
         .partition(|edge| edge.sites.is_empty() && edge.unproven_sites.is_empty());
     let projection = SelectedWorkspaceUsageGraphProjection {
+        relative_import_routes: projections
+            .iter()
+            .flat_map(|projection| projection.relative_import_routes.iter().cloned())
+            .collect(),
+        scope_obligations: projections
+            .iter()
+            .flat_map(|projection| projection.scope_obligations.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         nodes,
         edges,
         same_owner_edges,
@@ -1767,6 +1784,8 @@ impl NativeWorkspaceUsageGraphAccumulator {
                 }
             };
         let projection = SelectedWorkspaceUsageGraphProjection {
+            relative_import_routes: Vec::new(),
+            scope_obligations: Vec::new(),
             nodes: projection.nodes,
             edges: projection.edges,
             same_owner_edges: projection.same_owner_edges,
@@ -1800,6 +1819,13 @@ impl NativeWorkspaceUsageGraphAccumulator {
     }
 }
 
+/// An assumption bounding a graph's completeness, rather than a missing edge.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorkspaceUsageGraphScopeObligation {
+    pub code: String,
+    pub message: String,
+}
+
 /// Query-owned native graph collection shared by language providers. Language
 /// rules classify rows before submission; this builder owns catalog growth,
 /// incompleteness, revalidation and the canonical accumulator.
@@ -1812,6 +1838,7 @@ pub struct NativeWorkspaceGraphBuilder {
     unresolved_names_complete: bool,
     withheld_references: Vec<WithheldReference>,
     reasons: Vec<EdgeIncompleteReason>,
+    scope_obligations: BTreeSet<WorkspaceUsageGraphScopeObligation>,
     reference_count: usize,
     batch_count: usize,
     generation: u64,
@@ -1853,6 +1880,7 @@ impl NativeWorkspaceGraphBuilder {
             unresolved_names_complete: true,
             withheld_references: Vec::new(),
             reasons: Vec::new(),
+            scope_obligations: BTreeSet::new(),
             reference_count: 0,
             batch_count: 0,
             generation: analyzer.project().analysis_generation(),
@@ -1864,6 +1892,11 @@ impl NativeWorkspaceGraphBuilder {
         if !self.reasons.contains(&reason) {
             self.reasons.push(reason);
         }
+    }
+
+    /// State a completeness assumption without changing graph completeness.
+    pub fn note_scope_obligation(&mut self, obligation: WorkspaceUsageGraphScopeObligation) {
+        self.scope_obligations.insert(obligation);
     }
 
     pub fn stage_batch(
@@ -1911,6 +1944,86 @@ impl NativeWorkspaceGraphBuilder {
         true
     }
 
+    /// Join exact upward relations with Open base references. All temporary
+    /// indexes belong to this graph request. Count original physical sites;
+    /// never manufacture a declaration-site usage or a proven call target.
+    pub fn nominate_overrides(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        provider: &dyn crate::analyzer::languages::NativeWorkspaceGraphProvider,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        use crate::analyzer::languages::NativeMethodOverride;
+        use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
+        let mut open_inbound = HashMap::<CodeUnit, Vec<usize>>::default();
+        for (index, row) in self.rows.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            if row.dispatch_extensibility == Some(DispatchExtensibility::Open) {
+                open_inbound
+                    .entry(row.target.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut nominations = Vec::new();
+        let mut failures = Vec::new();
+        for (method, _) in &self.declarations {
+            if !method.is_function() {
+                continue;
+            }
+            let mut current = method.clone();
+            let mut visited = HashSet::default();
+            visited.insert(current.clone());
+            loop {
+                if cancellation.is_cancelled() {
+                    return false;
+                }
+                match provider.method_override(analyzer, &current, cancellation) {
+                    NativeMethodOverride::NoOverride => break,
+                    NativeMethodOverride::Incomplete {
+                        reason_kind,
+                        reason,
+                    } => {
+                        failures.push(EdgeIncompleteReason::UsageAnalysisFailed {
+                            reason_kind: reason_kind.into(),
+                            reason: format!("{}: {reason}", method.fq_name()),
+                        });
+                        break;
+                    }
+                    NativeMethodOverride::Overrides(base) => {
+                        assert!(
+                            visited.insert(base.clone()),
+                            "upward override relation must be acyclic: {visited:?}"
+                        );
+                        for &index in open_inbound.get(&base).into_iter().flatten() {
+                            let mut row = self.rows[index].clone();
+                            row.target = method.clone();
+                            row.proof = UsageProof::Unproven;
+                            row.ambiguous_candidate = false;
+                            row.usage_kind = UsageHitKind::Reference;
+                            row.owner_relation = crate::analyzer::structural::reference_edges::classify_owner_relation(analyzer, row.site.enclosing.as_ref(), method);
+                            row.dispatch_extensibility = None;
+                            nominations.push(row);
+                        }
+                        current = base;
+                    }
+                }
+            }
+        }
+        self.rows.extend(nominations);
+        if !failures.is_empty() {
+            // UsageAnalysisFailed alone only opens inverse completeness. The
+            // missing override relation can hide a forward nomination too.
+            self.note_incomplete_reason(EdgeIncompleteReason::ForwardResolutionIncomplete);
+        }
+        for reason in failures {
+            self.note_incomplete_reason(reason);
+        }
+        true
+    }
+
     pub fn finish(
         self,
         operation: &mut crate::analyzer::store::resolution_operation::SelectedResolutionOperation<
@@ -1927,6 +2040,7 @@ impl NativeWorkspaceGraphBuilder {
             mut declarations,
             rows,
             mut reasons,
+            scope_obligations,
             unresolved_names,
             unresolved_names_complete,
             withheld_references,
@@ -1996,7 +2110,14 @@ impl NativeWorkspaceGraphBuilder {
         ) {
             return Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Cancelled);
         }
-        let projection = accumulator.finish(&completeness, &summary, rows.len(), cancellation);
+        let mut projection = accumulator.finish(&completeness, &summary, rows.len(), cancellation);
+        match &mut projection {
+            SelectedWorkspaceUsageGraphProjectionOutcome::Complete(graph)
+            | SelectedWorkspaceUsageGraphProjectionOutcome::Incomplete(graph) => {
+                graph.scope_obligations = scope_obligations.into_iter().collect();
+            }
+            _ => {}
+        }
         Ok(projection)
     }
 }
@@ -2269,6 +2390,8 @@ where
         resolved_ecosystems,
     } = projection;
     let projection = SelectedWorkspaceUsageGraphProjection {
+        relative_import_routes: Vec::new(),
+        scope_obligations: Vec::new(),
         nodes,
         edges,
         same_owner_edges,
@@ -2433,8 +2556,9 @@ pub fn reduce_canonical_reference_edge_rows_to_workspace_usage_graph(
 /// Missing kinds have the same limitation. Both contribute `Other` as
 /// best-effort positive evidence and make the result ineligible for a complete
 /// graph/cache until the row layer publishes the finer distinction.
-fn usage_reference_kind(kind: Option<ReferenceKind>) -> (UsageReferenceKind, bool) {
-    match kind {
+fn usage_reference_kind(facets: ReferenceFacets) -> (UsageReferenceKind, bool) {
+    let kind = facets.known().iter().next();
+    let (projection, known_exact) = match kind {
         Some(
             ReferenceKind::MethodCall | ReferenceKind::ConstructorCall | ReferenceKind::SuperCall,
         ) => (UsageReferenceKind::Call, true),
@@ -2447,5 +2571,29 @@ fn usage_reference_kind(kind: Option<ReferenceKind>) -> (UsageReferenceKind, boo
             | ReferenceKind::Inheritance,
         ) => (UsageReferenceKind::Type, true),
         Some(ReferenceKind::StaticReference) | None => (UsageReferenceKind::Other, false),
-    }
+    };
+    // A possible call/member/type kind can change the legacy weight category.
+    // StaticReference is an access form, so its uncertainty alone does not.
+    let possible_categories = facets
+        .known()
+        .iter()
+        .chain(facets.undecided().iter())
+        .filter(|kind| *kind != ReferenceKind::StaticReference)
+        .map(|kind| match kind {
+            ReferenceKind::MethodCall
+            | ReferenceKind::ConstructorCall
+            | ReferenceKind::SuperCall => UsageReferenceKind::Call,
+            ReferenceKind::FieldRead | ReferenceKind::FieldWrite => UsageReferenceKind::Member,
+            ReferenceKind::TypeReference
+            | ReferenceKind::SelfTypeAlias
+            | ReferenceKind::Inheritance => UsageReferenceKind::Type,
+            ReferenceKind::StaticReference => unreachable!(),
+        });
+    (
+        projection,
+        known_exact
+            && possible_categories
+                .into_iter()
+                .all(|kind| kind == projection),
+    )
 }

@@ -22,7 +22,9 @@ use crate::CancellationToken;
 use crate::analyzer::semantic_model::csmi::{CsmiArtifactDigest, CsmiDigestAlgorithm};
 
 use super::workspace_inputs::{self, WorkspaceInputKind};
-use super::{AnalyzerStore, Result, StoreError, WorkspaceConfigurationInput, WorkspaceSnapshotId};
+use super::{
+    AnalyzerStore, Connection, Result, StoreError, WorkspaceConfigurationInput, WorkspaceSnapshotId,
+};
 
 const MAX_PUBLICATION_ROWS: usize = 250_000;
 const MAX_CELL_BYTES: usize = 1 << 20;
@@ -449,7 +451,7 @@ pub const PYTHON_RUNTIME_DECLARED_ARCHIVE_VERIFIED_INSTALLED_ROOTS_SQL: &str =
 /// The returned rows belong to the caller's query.
 #[doc(hidden)]
 pub fn python_runtime_declared_archive_verified_installed_roots(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     acquisition_id: PythonRuntimeAcquisitionId,
 ) -> Result<Vec<PathBuf>> {
     let mut statement =
@@ -668,13 +670,13 @@ impl PythonRuntimeDeclaredEnvironmentRow {
 /// declaration row and ordered by their persisted ordinals.
 #[doc(hidden)]
 pub fn python_runtime_declared_environment(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     acquisition_id: i64,
     environment_id: i64,
 ) -> Result<Option<(PythonDeclaredEnvironmentConfig, CsmiArtifactDigest)>> {
     let Some(row) = tx
+        .prepare_cached(PYTHON_RUNTIME_DECLARED_ENVIRONMENT_SQL)?
         .query_row(
-            PYTHON_RUNTIME_DECLARED_ENVIRONMENT_SQL,
             params![acquisition_id, environment_id],
             PythonRuntimeDeclaredEnvironmentRow::from_row,
         )
@@ -907,9 +909,8 @@ impl AnalyzerStore {
                 )));
             }
             super::require_current_generation(&tx, &base_snapshot.lang, base_snapshot.generation)?;
-            let revision_exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workspace_revisions
-                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND revision = ?4)",
+            let revision_exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM workspace_revisions
+                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND revision = ?4)")?.query_row(
                 params![
                     base_snapshot.workspace_id.as_str(),
                     base_snapshot.lang,
@@ -927,10 +928,8 @@ impl AnalyzerStore {
                     base_snapshot.revision,
                 )));
             }
-            let head: Option<i64> = tx
-                .query_row(
-                    "SELECT revision FROM workspace_heads
-                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+            let head: Option<i64> = tx.prepare_cached("SELECT revision FROM workspace_heads
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3")?.query_row(
                     params![
                         base_snapshot.workspace_id.as_str(),
                         base_snapshot.lang,
@@ -949,12 +948,10 @@ impl AnalyzerStore {
             let mut snapshot = base_snapshot.clone();
             if let Some(configuration) = configuration_input {
                 configuration.retain(&tx)?;
-                let old: Option<(i64, String)> = tx
-                    .query_row(
-                        "SELECT file_version_id, blob_oid FROM workspace_file_versions
+                let old: Option<(i64, String)> = tx.prepare_cached("SELECT file_version_id, blob_oid FROM workspace_file_versions
                          WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
                            AND input_kind = 'configuration' AND rel_path = ?4
-                           AND valid_until IS NULL",
+                           AND valid_until IS NULL")?.query_row(
                         params![
                             base_snapshot.workspace_id.as_str(),
                             base_snapshot.lang,
@@ -988,10 +985,9 @@ impl AnalyzerStore {
             if cancellation.is_cancelled() {
                 return Err(StoreError::new("Python runtime provider publication cancelled"));
             }
-            let inserted = tx.execute(
-                "INSERT OR IGNORE INTO python_runtime_acquisitions(
+            let inserted = tx.prepare_cached("INSERT OR IGNORE INTO python_runtime_acquisitions(
                    workspace_id, lang, generation, revision, evidence_digest
-                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)")?.execute(
                 params![
                     snapshot.workspace_id.as_str(),
                     snapshot.lang,
@@ -1000,10 +996,9 @@ impl AnalyzerStore {
                     evidence_digest.as_slice(),
                 ],
             )?;
-            let acquisition_id = tx.query_row(
-                "SELECT acquisition_id FROM python_runtime_acquisitions
+            let acquisition_id = tx.prepare_cached("SELECT acquisition_id FROM python_runtime_acquisitions
                  WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
-                   AND revision = ?4 AND evidence_digest = ?5",
+                   AND revision = ?4 AND evidence_digest = ?5")?.query_row(
                 params![
                     snapshot.workspace_id.as_str(),
                     snapshot.lang,
@@ -1037,7 +1032,7 @@ impl AnalyzerStore {
         &self,
         acquisition_id: PythonRuntimeAcquisitionId,
         selected_snapshot: &WorkspaceSnapshotId,
-        read: impl FnOnce(&Transaction<'_>) -> Result<T>,
+        read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         if selected_snapshot.lang != "python" {
             return Err(StoreError::stale_resolution(format!(
@@ -1046,31 +1041,35 @@ impl AnalyzerStore {
             )));
         }
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
+        conn.with_read_transaction(|tx| {
         super::require_current_generation(
-            &tx,
+            tx,
             &selected_snapshot.lang,
             selected_snapshot.generation,
         )?;
-        let snapshot_exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workspace_revisions
+        let snapshot_exists: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM workspace_revisions
              WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3 AND revision = ?4)",
-            params![
-                selected_snapshot.workspace_id.as_str(),
-                selected_snapshot.lang,
-                selected_snapshot.generation.0,
-                selected_snapshot.revision,
-            ],
-            |row| row.get(0),
-        )?;
+            )?
+            .query_row(
+                params![
+                    selected_snapshot.workspace_id.as_str(),
+                    selected_snapshot.lang,
+                    selected_snapshot.generation.0,
+                    selected_snapshot.revision,
+                ],
+                |row| row.get(0),
+            )?;
         if !snapshot_exists {
             return Err(StoreError::stale_generation(format!(
                 "selected Python workspace snapshot revision {} was reclaimed",
                 selected_snapshot.revision
             )));
         }
-        let acquisition_matches: bool = tx.query_row(
-            "SELECT EXISTS(
+        let acquisition_matches: bool = tx
+            .prepare_cached(
+                "SELECT EXISTS(
                SELECT 1 FROM python_runtime_acquisitions AS acquisition
                JOIN workspace_revisions AS revision
                  ON revision.workspace_id = acquisition.workspace_id
@@ -1081,24 +1080,26 @@ impl AnalyzerStore {
                  AND acquisition.workspace_id = ?2 AND acquisition.lang = ?3
                  AND acquisition.generation = ?4 AND acquisition.revision = ?5
              )",
-            params![
-                acquisition_id.0,
-                selected_snapshot.workspace_id.as_str(),
-                selected_snapshot.lang,
-                selected_snapshot.generation.0,
-                selected_snapshot.revision,
-            ],
-            |row| row.get(0),
-        )?;
+            )?
+            .query_row(
+                params![
+                    acquisition_id.0,
+                    selected_snapshot.workspace_id.as_str(),
+                    selected_snapshot.lang,
+                    selected_snapshot.generation.0,
+                    selected_snapshot.revision,
+                ],
+                |row| row.get(0),
+            )?;
         if !acquisition_matches {
             return Err(StoreError::stale_resolution(format!(
                 "Python runtime acquisition {} does not belong to the selected workspace snapshot",
                 acquisition_id.0
             )));
         }
-        let value = read(&tx)?;
-        tx.commit()?;
+        let value = read(tx)?;
         Ok(value)
+        })
     }
 }
 
@@ -1152,19 +1153,19 @@ fn insert_environments(
         };
         check_cell(&original_scope)?;
         check_optional_cell(environment.diagnostic.as_deref())?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO python_runtime_environments(
                acquisition_id, source_scope, scope_path, scope_depth, status, diagnostic
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                acquisition_id,
-                original_scope,
-                scope_path,
-                scope_depth,
-                status.as_sql(),
-                environment.diagnostic,
-            ],
-        )?;
+        )?
+        .execute(params![
+            acquisition_id,
+            original_scope,
+            scope_path,
+            scope_depth,
+            status.as_sql(),
+            environment.diagnostic,
+        ])?;
         let environment_id = tx.last_insert_rowid();
         if let Some(config) = &environment.declared_environment {
             let digest = environment
@@ -1211,7 +1212,7 @@ fn insert_declared_environment(
         .canonicalization
         .as_deref()
         .expect("project-config canonicalization was validated before publication");
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO python_runtime_declared_environments(
            environment_id, acquisition_id, producer_version, resolver_version,
            interpreter_path, interpreter_sha256, interpreter_implementation,
@@ -1226,35 +1227,35 @@ fn insert_declared_environment(
            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
          )",
-        params![
-            environment_id,
-            acquisition_id,
-            config.producer_version,
-            config.resolver_version,
-            interpreter_path,
-            config.interpreter.sha256,
-            config.interpreter.implementation,
-            config.interpreter.python_version,
-            config.interpreter.abi,
-            config.interpreter.platform,
-            declared_isolation_mode_sql(config.launch.isolation),
-            declared_site_startup_mode_sql(config.launch.site_startup),
-            declared_environment_mode_sql(config.launch.environment),
-            declared_import_path_mode_sql(config.launch.import_path),
-            declared_finder_mode_sql(config.launch.finder),
-            declared_editable_mode_sql(config.launch.editable_installs),
-            declared_native_extensions_mode_sql(config.launch.native_extensions),
-            declared_entry_mode_sql(config.entry_point.mode),
-            config.entry_point.root_slot_id,
-            entry_relative_path,
-            config.entry_point.working_directory_root_slot_id,
-            working_directory,
-            declared_digest_algorithm_sql(digest.algorithm),
-            digest.coverage,
-            canonicalization,
-            digest.value,
-        ],
-    )?;
+    )?
+    .execute(params![
+        environment_id,
+        acquisition_id,
+        config.producer_version,
+        config.resolver_version,
+        interpreter_path,
+        config.interpreter.sha256,
+        config.interpreter.implementation,
+        config.interpreter.python_version,
+        config.interpreter.abi,
+        config.interpreter.platform,
+        declared_isolation_mode_sql(config.launch.isolation),
+        declared_site_startup_mode_sql(config.launch.site_startup),
+        declared_environment_mode_sql(config.launch.environment),
+        declared_import_path_mode_sql(config.launch.import_path),
+        declared_finder_mode_sql(config.launch.finder),
+        declared_editable_mode_sql(config.launch.editable_installs),
+        declared_native_extensions_mode_sql(config.launch.native_extensions),
+        declared_entry_mode_sql(config.entry_point.mode),
+        config.entry_point.root_slot_id,
+        entry_relative_path,
+        config.entry_point.working_directory_root_slot_id,
+        working_directory,
+        declared_digest_algorithm_sql(digest.algorithm),
+        digest.coverage,
+        canonicalization,
+        digest.value,
+    ])?;
     let declared_environment_id = tx.last_insert_rowid();
 
     for slot in &config.root_slots {
@@ -1264,19 +1265,19 @@ fn insert_declared_environment(
             ));
         }
         let path = declared_path(&slot.path)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO python_runtime_declared_roots(
                declared_environment_id, ordinal, semantic_id, role, path, artifact_index
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                declared_environment_id,
-                i64::from(slot.ordinal),
-                slot.slot_id,
-                declared_root_role_sql(slot.role),
-                path,
-                slot.artifact_index.map(i64::from),
-            ],
-        )?;
+        )?
+        .execute(params![
+            declared_environment_id,
+            i64::from(slot.ordinal),
+            slot.slot_id,
+            declared_root_role_sql(slot.role),
+            path,
+            slot.artifact_index.map(i64::from),
+        ])?;
     }
 
     for input in &config.config_inputs {
@@ -1286,19 +1287,19 @@ fn insert_declared_environment(
             ));
         }
         let path = declared_path(&input.path)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO python_runtime_declared_inputs(
                declared_environment_id, ordinal, input_id, role, path, sha256
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                declared_environment_id,
-                i64::from(input.ordinal),
-                input.input_id,
-                declared_input_role_sql(input.role),
-                path,
-                input.sha256,
-            ],
-        )?;
+        )?
+        .execute(params![
+            declared_environment_id,
+            i64::from(input.ordinal),
+            input.input_id,
+            declared_input_role_sql(input.role),
+            path,
+            input.sha256,
+        ])?;
     }
 
     for (ordinal, extra) in config.extras.iter().enumerate() {
@@ -1307,16 +1308,16 @@ fn insert_declared_environment(
                 "Python runtime provider publication cancelled",
             ));
         }
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO python_runtime_declared_extras(
                declared_environment_id, ordinal, extra
              ) VALUES(?1, ?2, ?3)",
-            params![
-                declared_environment_id,
-                i64::try_from(ordinal).expect("declared extras count is bounded"),
-                extra,
-            ],
-        )?;
+        )?
+        .execute(params![
+            declared_environment_id,
+            i64::try_from(ordinal).expect("declared extras count is bounded"),
+            extra,
+        ])?;
     }
     Ok(())
 }
@@ -1347,23 +1348,23 @@ fn insert_artifacts(
         let installed_root = stored_path(&artifact.installed_root)?;
         check_cell(&archive_path)?;
         check_cell(&installed_root)?;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO python_runtime_artifacts(
                environment_id, acquisition_id, purl, raw_version, archive_sha256,
                archive_path, installed_root, status, diagnostic
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                environment_id,
-                acquisition_id,
-                artifact.purl,
-                artifact.raw_version,
-                artifact.archive_sha256,
-                archive_path,
-                installed_root,
-                artifact.status.as_sql(),
-                artifact.diagnostic,
-            ],
-        )?;
+        )?
+        .execute(params![
+            environment_id,
+            acquisition_id,
+            artifact.purl,
+            artifact.raw_version,
+            artifact.archive_sha256,
+            archive_path,
+            installed_root,
+            artifact.status.as_sql(),
+            artifact.diagnostic,
+        ])?;
         let artifact_id = tx.last_insert_rowid();
         let mut member_ids = Vec::with_capacity(artifact.members.len());
         for member in &artifact.members {
@@ -1384,26 +1385,26 @@ fn insert_artifacts(
                 .transpose()?;
             check_cell(&archive_member_path)?;
             check_optional_cell(installed_path.as_deref())?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO python_runtime_artifact_members(
                    artifact_id, environment_id, acquisition_id, archive_member_path,
                    installed_path, member_sha256, installed_sha256,
                    installed_bytes_match, member_role, status, diagnostic
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    artifact_id,
-                    environment_id,
-                    acquisition_id,
-                    archive_member_path,
-                    installed_path,
-                    member_sha256,
-                    member.installed_sha256,
-                    member.installed_bytes_match,
-                    member.role.as_sql(),
-                    member.status.as_sql(),
-                    member.diagnostic,
-                ],
-            )?;
+            )?
+            .execute(params![
+                artifact_id,
+                environment_id,
+                acquisition_id,
+                archive_member_path,
+                installed_path,
+                member_sha256,
+                member.installed_sha256,
+                member.installed_bytes_match,
+                member.role.as_sql(),
+                member.status.as_sql(),
+                member.diagnostic,
+            ])?;
             member_ids.push(tx.last_insert_rowid());
         }
         for provider in &artifact.providers {
@@ -1423,20 +1424,20 @@ fn insert_artifacts(
                     })
                 })
                 .transpose()?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO python_runtime_import_providers(
                    acquisition_id, environment_id, artifact_id, member_id,
                    import_name, binding_status
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    acquisition_id,
-                    environment_id,
-                    artifact_id,
-                    member_id,
-                    provider.import_name,
-                    provider.status.as_sql(),
-                ],
-            )?;
+            )?
+            .execute(params![
+                acquisition_id,
+                environment_id,
+                artifact_id,
+                member_id,
+                provider.import_name,
+                provider.status.as_sql(),
+            ])?;
         }
         for frontier in &environment.frontiers {
             if cancellation.is_cancelled() {
@@ -1450,21 +1451,21 @@ fn insert_artifacts(
             check_optional_cell(path.as_deref())?;
             check_optional_cell(frontier.import_name.as_deref())?;
             check_cell(&frontier.message)?;
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO python_runtime_scope_frontiers(
                    acquisition_id, environment_id, kind, root_path, path,
                    import_name, message
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    acquisition_id,
-                    environment_id,
-                    frontier.kind.as_sql(),
-                    root_path,
-                    path,
-                    frontier.import_name,
-                    frontier.message,
-                ],
-            )?;
+            )?
+            .execute(params![
+                acquisition_id,
+                environment_id,
+                frontier.kind.as_sql(),
+                root_path,
+                path,
+                frontier.import_name,
+                frontier.message,
+            ])?;
         }
     }
     Ok(())

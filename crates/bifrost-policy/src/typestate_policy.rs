@@ -10,12 +10,13 @@ use std::fmt;
 use std::ops::Range as ByteRange;
 use std::sync::{Arc, Mutex};
 
+use crate::PolicyFindingId;
 use crate::budget::PolicyBudget;
 use crate::composition::PrecedenceGraph;
 use crate::definition::{
-    EndpointObservationPhase, MayMode, PolicyEndpointBinding, PolicyReportOptions,
+    EndpointObservationPhase, MayMode, PolicyEndpointBinding, PolicyId, PolicyReportOptions,
     PolicySelectorPath, PolicySemanticEvent, TypestateArgumentCondition, TypestateCallBinding,
-    TypestateEventId as PolicyTypestateEventId,
+    TypestateEventId as PolicyTypestateEventId, TypestateEventSetSpec,
     TypestateExpectationId as PolicyTypestateExpectationId,
     TypestateStateId as PolicyTypestateStateId,
 };
@@ -28,6 +29,11 @@ use crate::finding::{
     PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
     PolicyLocationRelationship, PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
     PolicyWorkUnit, ProofMetadata, ProofReason, ProofState, WitnessStepKind,
+};
+use crate::finding::{
+    FindingLocationBound, FurtherFindingsAbsent, PolicyByteSpan, PolicySourceLocation,
+    PolicySubjectVerdict, PolicySubjectVerdicts, SubjectEnumeration, SubjectSelectorEnumeration,
+    SubjectVerdict,
 };
 use crate::finding_identity::{
     AnalysisFindingId, AnalysisSubjectRef, StableSemanticIdentity, TypestateScenarioId, WitnessId,
@@ -52,16 +58,17 @@ use crate::unit_execution::{
     UnitAttempt, UnitDecodeError, UnitReuse, UnitSlice, evaluate_reusable_slice,
 };
 use crate::units::{
-    PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, RootProduct, RootWork,
+    PolicyIncrementalContext, PolicyUnitKey, PolicyUnitProduct, RootProduct, RootWork, StagedUnits,
     UnitPartition, WidenReason,
 };
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
+use brokk_bifrost_analysis::analyzer::semantic::SemanticLanguage;
 use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, forward_reachability_avoiding,
 };
-use brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest;
+use brokk_bifrost_analysis::analyzer::semantic::ids::{LengthDelimitedDigest, StableDigest};
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_in_artifact,
 };
@@ -71,46 +78,58 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     CallSiteId, CallTransferSet, CandidateCoverage, DispatchOracle, DispatchResult,
     EvidenceCompleteness, FreshObjectPublicationKind, FreshObjectPublicationQuery, HeapOracle,
     IcfgExitProfile, IcfgProvider, IcfgProviderBehaviorIdentity, IcfgSnapshot, IcfgSnapshotLimits,
-    ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedurePortHandle,
-    ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus, SemanticArtifact,
-    SemanticArtifactCollector, SemanticArtifactLeaseChild, SemanticArtifactLeaseError,
-    SemanticBudget, SemanticBudgetDimension, SemanticBudgetScopeSnapshot, SemanticExecutionBudget,
-    SemanticExecutionWork, SemanticLocator, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticValueKind, SemanticWork, ValueAtPoint, ValueFlowEndpoint,
-    ValueFlowOracle, ValueFlowRelationKind, ValueHandle, WorkspaceIcfgProvider,
+    ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle, ProcedureId,
+    ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProgramPointId, ProofStatus,
+    SemanticArtifact, SemanticArtifactCollector, SemanticArtifactKey, SemanticArtifactLeaseChild,
+    SemanticArtifactLeaseError, SemanticBudget, SemanticBudgetDimension,
+    SemanticBudgetScopeSnapshot, SemanticEffect, SemanticExecutionBudget, SemanticExecutionWork,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
+    SemanticWork, ValueAtPoint, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind,
+    ValueHandle, WorkspaceIcfgProvider,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    ActiveSemanticModelSnapshot, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
-    CompiledProcedureSummary, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryOutput, Completeness, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
+    ActivatedProcedureSummary, ActiveSemanticModelSnapshot, AuthoredCoverageSubject,
+    AuthoredSummaryExitKind, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
+    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryOutput,
+    Completeness, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
     SemanticModelMatchDisposition,
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, Range, ReadKey, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
+use brokk_bifrost_flow::composition::{
+    TypestateCompositionProvider, WorkspaceCompositionDiscovery,
+};
 use brokk_bifrost_flow::dataflow::{
     DataflowRequest, SolverBudget, SolverTermination, SummaryReadRecorder, SummaryWitnessStepKind,
     WitnessReconstructionLimits,
 };
+use brokk_bifrost_flow::taint::compose::{CompositionBudget, ObjectAnchor, search_object_roots};
 use brokk_bifrost_flow::typestate::{
-    BoundTypestateSubjectSpec, CompiledProtocol, DirectScalarSource, PROTOCOL_SCHEMA_VERSION,
+    BoundTypestateSubjectSpec, CompiledProtocol, CoverageCandidateGroupSpec,
+    CoverageCandidatePhase, CoverageCandidateSpec, CoverageDecisionKind, CoverageDecisionSpec,
+    CoverageRecordKey, CoverageRefusalReason, DirectScalarSource, PROTOCOL_SCHEMA_VERSION,
     ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
     ProductionTypestateSummaryRepository, ProtocolAnalysisMode, ProtocolEventKey,
     ProtocolEventOccurrence, ProtocolEventSpec, ProtocolExpectationKey, ProtocolGuardSpec,
     ProtocolObservationPhase, ProtocolObservationSpec, ProtocolProcedureExitKind,
     ProtocolSemantics, ProtocolSpec, ProtocolStateKey, ProtocolTerminalExpectationSpec,
     ProtocolTerminalObservationSpec, ProtocolTransitionSpec, ProtocolUncertaintyBehavior,
-    ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, TypestateBindingContext,
-    TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingQuality,
-    TypestateCallNonInterferenceSpec, TypestateEventBindingId, TypestateEventBindingSpec,
-    TypestateEventCondition, TypestateFinding, TypestateFindingCertainty, TypestateFindingKind,
-    TypestateFindingLimits, TypestateFlowProblemError, TypestateInitialSeedSpec,
-    TypestateObjectKey, TypestateObjectRole, TypestateObservationSite,
-    TypestateProductionCacheStatus, TypestateSubjectClassKey, TypestateSubjectKey,
+    ProtocolUncertaintySemantics, ProtocolUnmatchedEventBehavior, RootCallClosure,
+    RootCallClosureIncompleteReason, TypestateBindingContext, TypestateBindingMultiplicity,
+    TypestateBindingPlan, TypestateBindingQuality, TypestateCallNonInterferenceSpec,
+    TypestateCoverageEventSet, TypestateCoverageSpec, TypestateEventBindingId,
+    TypestateEventBindingSpec, TypestateEventBindings, TypestateEventCondition, TypestateEventPort,
+    TypestateFinding, TypestateFindingCertainty, TypestateFindingKind, TypestateFindingLimits,
+    TypestateFlowProblemError, TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole,
+    TypestateObservationSite, TypestateProductionCacheStatus, TypestateSelectedOperand,
+    TypestateSubjectClassKey, TypestateSubjectKey, TypestateSummaryResult,
     TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
-    collect_summary_findings_with_limits, direct_scalar_source,
-    solve_typestate_with_production_summaries,
+    UnprovenEventRelation, collect_summary_findings_with_limits, direct_scalar_source,
+    project_workspace_root_call_closure, solve_typestate_with_production_summaries,
 };
+use brokk_bifrost_flow::typestate::{TypestateComposeLabels, judge_object_roots};
+use brokk_bifrost_flow::value_flow::{ValueFlowCache, WorkspaceValueFlowProvider};
 use brokk_bifrost_rql::structural::CodeQueryTypestateLimits;
 use brokk_bifrost_rql::structural::search::CodeQueryExecutionScope;
 use brokk_bifrost_rql::structural::{
@@ -139,6 +158,7 @@ fn internal_escape_event_key<'a>(
 
 #[derive(Debug)]
 pub(crate) enum TypestatePolicyCompileError {
+    InvalidEventSet(&'static str),
     Protocol(brokk_bifrost_flow::typestate::ProtocolCompileError),
     MissingWorkspace,
     MissingSelector(String),
@@ -178,6 +198,9 @@ impl TypestatePolicyCompileFailure {
 impl fmt::Display for TypestatePolicyCompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidEventSet(reason) => {
+                write!(formatter, "invalid typestate event set: {reason}")
+            }
             Self::Protocol(error) => {
                 write!(formatter, "typestate protocol compilation failed: {error}")
             }
@@ -236,6 +259,7 @@ impl std::error::Error for TypestatePolicyCompileError {
             Self::BindingPlan(error) => Some(error),
             Self::SemanticProvider(error) => Some(error),
             Self::MissingWorkspace
+            | Self::InvalidEventSet(_)
             | Self::MissingSelector(_)
             | Self::QueryIncomplete { .. }
             | Self::SemanticUnavailable(_)
@@ -264,6 +288,10 @@ pub(crate) struct CompiledTypestateSubject {
     /// subject: a store or call between acquisition and validation can still
     /// publish the eventual live resource.
     publication_starts: Vec<ProgramPointHandle>,
+    /// The selected syntax sites this subject was bound from: a subject
+    /// verdict is reported at the site its selector chose, never at an
+    /// observation point inside it.
+    selected_sites: Vec<(ProjectFile, ByteRange<usize>)>,
     /// Activation sources where publication was proven before the subject's
     /// success-conditioned activation edge.
     escape_starts: Vec<ProgramPointHandle>,
@@ -274,8 +302,94 @@ struct CompiledCallNonInterference {
     proven_pairs: HashSet<(TypestateSubjectKey, CallSiteHandle)>,
 }
 
+/// One compile chooses a single engine. Composition is admitted only for the
+/// Rust lifecycle rule on complete stored IR; an incomplete composition must
+/// report incomplete rather than restart with the ICFG engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypestateEngine {
+    Composition,
+    Icfg { reason: Box<str> },
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypestateEngineOverride {
+    Composition,
+    Icfg,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TYPESTATE_ENGINE_OVERRIDE: std::cell::Cell<Option<TypestateEngineOverride>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force either evaluator for one thread and restore its previous selection.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_typestate_engine_for_test<T>(
+    engine: TypestateEngineOverride,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<TypestateEngineOverride>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TYPESTATE_ENGINE_OVERRIDE.set(self.0);
+        }
+    }
+    let restore = Restore(TYPESTATE_ENGINE_OVERRIDE.replace(Some(engine)));
+    let result = run();
+    drop(restore);
+    result
+}
+
+fn select_typestate_engine(
+    policy_id: &PolicyId,
+    roots: &[ProcedureHandle],
+    workspace: &WorkspaceAnalyzer,
+) -> Result<TypestateEngine, TypestatePolicyCompileError> {
+    #[cfg(any(test, feature = "test-support"))]
+    match TYPESTATE_ENGINE_OVERRIDE.get() {
+        Some(TypestateEngineOverride::Composition) => return Ok(TypestateEngine::Composition),
+        Some(TypestateEngineOverride::Icfg) => {
+            return Ok(TypestateEngine::Icfg {
+                reason: "test override".into(),
+            });
+        }
+        None => {}
+    }
+    let icfg = |reason: &str| TypestateEngine::Icfg {
+        reason: reason.into(),
+    };
+    if policy_id.as_str() != "bifrost.correctness.resource-lifecycle" {
+        return Ok(icfg("policy"));
+    }
+    if roots.is_empty() {
+        return Ok(icfg("no-roots"));
+    }
+    let mut seen = HashSet::new();
+    for root in roots {
+        let key = root.artifact().key();
+        if !seen.insert(key) {
+            continue;
+        }
+        if key.language() != SemanticLanguage::Standard(Language::Rust) {
+            return Ok(icfg("language"));
+        }
+        if !workspace
+            .has_complete_semantic_ir_rows(key)
+            .map_err(|error| TypestatePolicyCompileError::SemanticUnavailable(error.to_string()))?
+        {
+            return Ok(icfg("no-complete-rows"));
+        }
+    }
+    Ok(TypestateEngine::Composition)
+}
+
 #[derive(Debug)]
 pub(crate) struct CompiledTypestatePolicy {
+    /// Number of compiler runs in this policy evaluation.
+    compilations: u64,
+    engine: TypestateEngine,
     pub(crate) protocol: Arc<CompiledProtocol>,
     pub(crate) bindings: Arc<TypestateBindingPlan>,
     pub(crate) roots: Box<[ProcedureHandle]>,
@@ -294,6 +408,13 @@ pub(crate) struct CompiledTypestatePolicy {
     artifact_leases: super::selector_compiler::PolicyArtifactLeases,
     result_contract_artifact_leases: usize,
     binding_omissions: Box<[String]>,
+    /// Every site each subject selector selected, as (selector, file, span),
+    /// recorded before binding. A site an omission, a resolution without a
+    /// subject, or precedence reduction left without a subject of its own
+    /// selector still has to be accounted for in the verdicts.
+    selected_subject_sites: Vec<(String, ProjectFile, ByteRange<usize>)>,
+    selection_fingerprint: Vec<String>,
+    undecided_sites: Vec<UndecidedSelectorSite>,
     binding_omission_subjects: HashSet<TypestateSubjectKey>,
     /// Why a workspace helper did not discharge one subject's obligation.
     /// Keyed by subject so a finding can name the helpers it called.
@@ -324,14 +445,42 @@ struct TypestateWorkMeasurements {
     retained_findings: u64,
 }
 
+/// A structural site whose semantic selection could not be decided. It has no binding.
+#[derive(Debug)]
+struct UndecidedSelectorSite {
+    selector: String,
+    file: ProjectFile,
+    span: ByteRange<usize>,
+    reasons: Vec<super::selector_compiler::candidate_enumeration::CandidateReason>,
+}
+
+impl std::fmt::Display for UndecidedSelectorSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{:?}: {:?} ({:?})",
+            self.selector,
+            rel_path_string(&self.file),
+            self.span,
+            self.reasons
+                .iter()
+                .map(|reason| reason.label())
+                .collect::<Vec<_>>(),
+            self.reasons
+        )
+    }
+}
+
 pub(crate) struct TypestatePolicyCompiler<'a> {
     selectors: super::selector_compiler::PolicySelectorSession<'a>,
+    subject_scope: CodeQueryExecutionScope<'a>,
     /// The immutable activation whose model member and procedure identities
     /// the selector rows name. A compile retains only this bounded snapshot;
     /// it does not build a workspace-sized summary index.
     active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
     syntax_trees: HashMap<ProjectFile, tree_sitter::Tree>,
     formal_names: HashMap<FormalPortKey, Box<[String]>>,
+    selected_template_targets: HashMap<TemplateCallKey, Option<TemplateTarget>>,
     /// Close contracts already computed, keyed by the formal they answer for
     /// and the recursion depth that was still available when they were asked.
     ///
@@ -344,6 +493,10 @@ pub(crate) struct TypestatePolicyCompiler<'a> {
     /// recursing forever.
     close_contract_stack: Vec<FormalPortKey>,
     binding_omissions: Vec<String>,
+    selected_subject_sites: Vec<(String, ProjectFile, ByteRange<usize>)>,
+    selection_fingerprint: Vec<String>,
+    undecided_sites: Vec<UndecidedSelectorSite>,
+    unproven_relations: Vec<UnprovenEventRelation>,
     binding_omission_procedures: HashSet<SemanticLocator>,
 }
 
@@ -456,6 +609,7 @@ struct ArgumentFormReleaseEvent {
     phase: EndpointObservationPhase,
     event: ProtocolEventKey,
     policy_event: PolicyTypestateEventId,
+    semantic_effect: Option<Arc<str>>,
     order: u32,
 }
 
@@ -504,14 +658,24 @@ impl DispatchOracle for PolicyIcfgProvider<'_> {
         call: &CallSiteHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
+        let execution_budget = request
+            .execution_budget()
+            .cloned()
+            .unwrap_or_else(|| self.execution_budget.clone());
         let mut request = request
-            .staged_with_execution_budget(&self.execution_budget)
+            .staged_with_execution_budget(&execution_budget)
             .with_artifact_collector(&self.artifact_collector);
         self.inner.resolve_call(call, &mut request)
     }
 }
 
 impl IcfgProvider for PolicyIcfgProvider<'_> {
+    fn memo_dependency_reacquirer(
+        &self,
+    ) -> Option<&dyn brokk_bifrost_analysis::analyzer::semantic::MemoDependencyReacquirer> {
+        self.inner.memo_dependency_reacquirer()
+    }
+
     fn memo_attribution(
         &self,
     ) -> brokk_bifrost_analysis::analyzer::workspace_authority::OwnedMemoCapability {
@@ -528,8 +692,12 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
         call: CallSiteId,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
+        let execution_budget = request
+            .execution_budget()
+            .cloned()
+            .unwrap_or_else(|| self.execution_budget.clone());
         let mut request = request
-            .staged_with_execution_budget(&self.execution_budget)
+            .staged_with_execution_budget(&execution_budget)
             .with_artifact_collector(&self.artifact_collector);
         self.inner.call_transfers(caller, call, &mut request)
     }
@@ -540,8 +708,12 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
         limits: IcfgSnapshotLimits,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<IcfgSnapshot>, SemanticProviderError> {
+        let execution_budget = request
+            .execution_budget()
+            .cloned()
+            .unwrap_or_else(|| self.execution_budget.clone());
         let mut request = request
-            .staged_with_execution_budget(&self.execution_budget)
+            .staged_with_execution_budget(&execution_budget)
             .with_artifact_collector(&self.artifact_collector);
         self.inner.snapshot(root, limits, &mut request)
     }
@@ -552,8 +724,12 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
         callee_exit: &ProgramPointHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
+        let execution_budget = request
+            .execution_budget()
+            .cloned()
+            .unwrap_or_else(|| self.execution_budget.clone());
         let mut request = request
-            .staged_with_execution_budget(&self.execution_budget)
+            .staged_with_execution_budget(&execution_budget)
             .with_artifact_collector(&self.artifact_collector);
         self.inner
             .exit_profile(callee_entry, callee_exit, &mut request)
@@ -616,6 +792,7 @@ impl ProductionTypestatePolicyEvaluator {
             context,
             budget,
             active_semantic_model_snapshot,
+            CodeQueryExecutionScope::whole_workspace(),
             None,
         )
         .0
@@ -624,6 +801,7 @@ impl ProductionTypestatePolicyEvaluator {
 
     /// The compile, optionally sliced into per-seed selector units, and what
     /// those units did.
+    #[allow(clippy::too_many_arguments)]
     fn compile_with_units(
         policy: &LoadedPolicy,
         spec: &ResolvedTypestatePolicySpec,
@@ -631,6 +809,7 @@ impl ProductionTypestatePolicyEvaluator {
         context: &PolicyEvaluationContext<'_>,
         budget: &PolicyBudget,
         active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+        subject_scope: CodeQueryExecutionScope<'_>,
         incremental: Option<&PolicyIncrementalContext<'_>>,
     ) -> (
         Result<CompiledTypestatePolicy, Box<TypestatePolicyCompileFailure>>,
@@ -645,7 +824,8 @@ impl ProductionTypestatePolicyEvaluator {
             budget.max_selector_results(),
             cancellation,
             active_semantic_model_snapshot,
-        );
+        )
+        .with_subject_scope(subject_scope);
         match incremental {
             Some(incremental) => compiler
                 .with_units(policy, incremental, budget)
@@ -663,8 +843,13 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
         policy: &LoadedPolicy,
         spec: &ResolvedTypestatePolicySpec,
         context: &PolicyEvaluationContext<'_>,
+        subject_scope: CodeQueryExecutionScope<'_>,
         budget: &PolicyBudget,
     ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
+        assert!(
+            subject_scope.seed_files().is_none() || context.incremental.is_none(),
+            "scoped typestate compilation cannot replay or publish units"
+        );
         let workspace = context.workspace.ok_or_else(|| {
             TypestateCompilationFailure::failed(
                 PolicyFailureReason::InternalInvariant,
@@ -678,6 +863,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             context,
             budget,
             self.active_semantic_model_snapshot.clone(),
+            subject_scope.clone(),
             context.incremental,
         );
         let (compiled, units) = match compiled {
@@ -700,12 +886,12 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                     context,
                     budget,
                     self.active_semantic_model_snapshot.clone(),
+                    subject_scope,
                     None,
                 );
-                (
-                    recompiled.map_err(|failure| compile_failure(*failure))?,
-                    Some(units),
-                )
+                let mut recompiled = recompiled.map_err(|failure| compile_failure(*failure))?;
+                recompiled.compilations += 1;
+                (recompiled, Some(units))
             }
         };
         let hashes =
@@ -786,13 +972,30 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                 authority, policy, spec, workspace, context, budget, &compiled, &summaries, None,
             );
         }
+        let compilation =
+            TypestateCompilationHashes::new(compiled.protocol.hash(), compiled.bindings.hash());
+        // Engine selection depends on roots and semantic row completeness, which can differ for equal binding hashes.
+        let mut selection_digest = LengthDelimitedDigest::new(b"typestate-selection-outcomes-v1");
+        selection_digest.push(compilation.unit_digest().as_bytes());
+        for site in &compiled.selection_fingerprint {
+            selection_digest.push(site.as_bytes());
+        }
+        let selection_digest = selection_digest.finish();
+        let root_digest = match &compiled.engine {
+            TypestateEngine::Icfg { .. } => selection_digest,
+            TypestateEngine::Composition => {
+                let mut digest = LengthDelimitedDigest::new(COMPOSITION_ROOT_ENGINE_DOMAIN);
+                digest.push(selection_digest.as_bytes());
+                digest.finish()
+            }
+        };
         let mut units = RootUnits::new(
             policy,
             incremental,
             budget,
             workspace,
             selectors,
-            TypestateCompilationHashes::new(compiled.protocol.hash(), compiled.bindings.hash()),
+            root_digest,
             &context.flow_resources(),
         );
         let sliced = self.evaluate_pass(
@@ -806,15 +1009,16 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             &summaries,
             Some(&mut units),
         );
-        let (keys, attempt) = units.into_parts();
+        let (keys, attempt, staged) = units.into_parts();
         match sliced {
             RootsPass::Complete(payload) => {
                 // Every root of this policy is published and merged, so this
                 // list is what another run replays to reproduce the product
                 // without solving anything. It is empty when any root was not
-                // published, and an empty list names nothing.
+                // published, and an empty list names nothing; its staged units
+                // are discarded with it.
                 if !keys.is_empty() {
-                    incremental.record_units(policy.definition().metadata.id.clone(), keys);
+                    incremental.commit_units(policy.definition().metadata.id.clone(), staged, keys);
                 }
                 self.attempt
                     .lock()
@@ -834,7 +1038,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                     .lock()
                     .expect("typestate unit attempts mutex poisoned")
                     .insert(policy_id.clone(), (attempt, Some(reason)));
-                let recompiled = match Self::compile(
+                let mut recompiled = match Self::compile(
                     policy,
                     spec,
                     workspace,
@@ -850,6 +1054,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                         );
                     }
                 };
+                recompiled.compilations += compiled.compilations;
                 assert_eq!(
                     (recompiled.protocol.hash(), recompiled.bindings.hash()),
                     (compiled.protocol.hash(), compiled.bindings.hash()),
@@ -945,6 +1150,7 @@ fn typestate_work_report(
 ) -> PolicyWorkReport {
     let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
     let mut metrics: Vec<PolicyWorkMetric> = [
+        ("typestate.compilations", compiled.compilations as usize),
         ("typestate.roots", compiled.roots.len()),
         ("typestate.subjects", compiled.bindings.subjects().len()),
         (
@@ -1233,6 +1439,11 @@ enum RootsPass {
 /// One of these is built per evaluation that holds an incremental context. It
 /// owns the shared reuse decision, the key of every root the compile produced,
 /// and the count of what the attempt did with them.
+const COMPOSITION_ROOT_ENGINE_DOMAIN: &[u8] = b"bifrost-policy-typestate-composition-root/v1";
+
+type TemplateTarget = (SemanticArtifactKey, ProcedureId);
+type TemplateCallKey = (TemplateTarget, CallSiteId);
+
 struct RootUnits<'a> {
     reuse: UnitReuse<'a>,
     policy: &'a LoadedPolicy,
@@ -1264,7 +1475,7 @@ impl<'a> RootUnits<'a> {
         budget: &'a PolicyBudget,
         workspace: &WorkspaceAnalyzer,
         selectors: super::selector_compiler::SelectorUnitOutcome,
-        compilation: TypestateCompilationHashes,
+        compilation: StableDigest,
         flow: &brokk_bifrost_flow::FlowWorkspaceState,
     ) -> Self {
         let files_by_rel = workspace
@@ -1274,13 +1485,13 @@ impl<'a> RootUnits<'a> {
             .map(|file| (rel_path_string(&file), file))
             .collect();
         Self {
-            reuse: UnitReuse::new(policy, incremental, budget, flow),
+            reuse: UnitReuse::continuing(policy, incremental, budget, flow, selectors.staged),
             policy,
             incremental,
             files_by_rel,
             keys: Vec::new(),
             selector_keys: selectors.keys,
-            compilation: compilation.unit_digest(),
+            compilation,
             attempt: selectors.attempt,
             all_published: selectors.all_published,
         }
@@ -1324,14 +1535,16 @@ impl<'a> RootUnits<'a> {
         self.reuse.prefetch(&self.keys, None)
     }
 
-    /// The keys this attempt asked about and what it did with them, with the
-    /// keys empty when any root is missing from the store.
-    fn into_parts(mut self) -> (Vec<PolicyUnitKey>, UnitAttempt) {
+    /// The keys this attempt asked about, what it did with them, and the
+    /// units both halves staged, with the keys empty when any root is missing
+    /// from the store.
+    fn into_parts(mut self) -> (Vec<PolicyUnitKey>, UnitAttempt, StagedUnits) {
+        let staged = self.reuse.take_staged();
         if self.all_published && self.attempt.all_recomputed_published() {
             self.selector_keys.append(&mut self.keys);
-            (self.selector_keys, self.attempt)
+            (self.selector_keys, self.attempt, staged)
         } else {
-            (Vec::new(), self.attempt)
+            (Vec::new(), self.attempt, staged)
         }
     }
 }
@@ -1379,6 +1592,7 @@ fn charge_reused_root_lanes(
 }
 
 struct RootPassInputs<'a> {
+    engine: TypestateEngine,
     authority: &'a TypestateProjectionAuthority<'a>,
     policy: &'a LoadedPolicy,
     spec: &'a ResolvedTypestatePolicySpec,
@@ -1389,6 +1603,265 @@ struct RootPassInputs<'a> {
     summaries: &'a ProductionTypestateSummaryRepository,
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     limits: CodeQueryTypestateLimits,
+}
+
+/// One gap that kept a typestate evaluation from concluding.
+///
+/// Every place that makes the run inconclusive records the gap it hit rather
+/// than a bare [`PolicyIncompleteReason`]. The completion's reasons and the
+/// run's diagnostics both derive from the same list, so an inconclusive run
+/// always says what was incomplete (#10001). A root's gaps are part of its
+/// stored unit product, so a reused root reports what a solved one reports.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "gap", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum TypestateGap {
+    Cancelled,
+    SolverBudgetExhausted,
+    FindingBudgetExhausted,
+    FindingAnalysisIncomplete,
+    ExecutionBudgetExhausted,
+    SemanticArtifactCapacity,
+    CallClosureBudgetStop,
+    CallControlCoverageRefused,
+    SummaryProjectionRefused,
+    BindingsIncomplete,
+    /// Solved facts carry uncertainty, named by their stable typestate codes,
+    /// or abstained.
+    SolveUncertain {
+        uncertainty: Vec<String>,
+        abstained: bool,
+    },
+    SolveResultIncomplete,
+    /// An event relation the compile could not prove may observe the subject
+    /// in a procedure this root's call closure does not exclude.
+    UnprovenEventRelation {
+        event: String,
+        phase: String,
+        reason: String,
+    },
+    CompositionJudgmentIncomplete,
+    CompositionAdmissionIncomplete,
+    /// A selected endpoint the compile could not bind to a subject.
+    BindingOmitted {
+        omission: String,
+    },
+}
+
+impl TypestateGap {
+    /// A gap of a shared budget or of the whole request: no root's own solve
+    /// can be complete while it stands.
+    fn is_evaluation_wide(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled
+                | Self::SolverBudgetExhausted
+                | Self::FindingBudgetExhausted
+                | Self::ExecutionBudgetExhausted
+                | Self::SemanticArtifactCapacity
+        )
+    }
+
+    /// The stable label a subject verdict names this gap by.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::SolverBudgetExhausted => "solver_budget_exhausted",
+            Self::FindingBudgetExhausted => "finding_budget_exhausted",
+            Self::FindingAnalysisIncomplete => "finding_analysis_incomplete",
+            Self::ExecutionBudgetExhausted => "execution_budget_exhausted",
+            Self::SemanticArtifactCapacity => "semantic_artifact_capacity",
+            Self::CallClosureBudgetStop => "call_closure_budget_stop",
+            Self::CallControlCoverageRefused => "call_control_coverage_refused",
+            Self::SummaryProjectionRefused => "summary_projection_refused",
+            Self::BindingsIncomplete => "bindings_incomplete",
+            Self::SolveUncertain { .. } => "solve_uncertain",
+            Self::SolveResultIncomplete => "solve_result_incomplete",
+            Self::UnprovenEventRelation { .. } => "unproven_event_relation",
+            Self::CompositionJudgmentIncomplete => "composition_judgment_incomplete",
+            Self::CompositionAdmissionIncomplete => "composition_admission_incomplete",
+            Self::BindingOmitted { .. } => "binding_omitted",
+        }
+    }
+
+    fn reason(&self) -> PolicyIncompleteReason {
+        match self {
+            Self::Cancelled => PolicyIncompleteReason::Cancelled,
+            _ => PolicyIncompleteReason::PartialDiscovery,
+        }
+    }
+
+    fn diagnostic_code(&self) -> CodeQueryDiagnosticCode {
+        match self {
+            Self::Cancelled => CodeQueryDiagnosticCode::Cancelled,
+            Self::SolverBudgetExhausted => CodeQueryDiagnosticCode::TypestateSolverBudgetExhausted,
+            Self::FindingBudgetExhausted => {
+                CodeQueryDiagnosticCode::TypestateFindingBudgetExhausted
+            }
+            Self::ExecutionBudgetExhausted => CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+            Self::SemanticArtifactCapacity | Self::CallClosureBudgetStop => {
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted
+            }
+            Self::BindingOmitted { .. } => CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+            Self::FindingAnalysisIncomplete
+            | Self::CallControlCoverageRefused
+            | Self::SummaryProjectionRefused
+            | Self::BindingsIncomplete
+            | Self::SolveUncertain { .. }
+            | Self::SolveResultIncomplete
+            | Self::UnprovenEventRelation { .. }
+            | Self::CompositionJudgmentIncomplete
+            | Self::CompositionAdmissionIncomplete => {
+                CodeQueryDiagnosticCode::TypestateAnalysisPartial
+            }
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Cancelled => "typestate evaluation was cancelled".to_owned(),
+            Self::SolverBudgetExhausted => {
+                "typestate solver work budget was exhausted before a fixed point".to_owned()
+            }
+            Self::FindingBudgetExhausted => {
+                "typestate finding budget was exhausted, so findings were omitted".to_owned()
+            }
+            Self::FindingAnalysisIncomplete => {
+                "typestate finding collection could not complete its analysis".to_owned()
+            }
+            Self::ExecutionBudgetExhausted => {
+                "typestate semantic execution budget was exhausted".to_owned()
+            }
+            Self::SemanticArtifactCapacity => {
+                "typestate semantic artifact capacity was exhausted".to_owned()
+            }
+            Self::CallClosureBudgetStop => {
+                "typestate root call closure stopped at the semantic budget".to_owned()
+            }
+            Self::CallControlCoverageRefused => {
+                "scoped call/control coverage was refused, so the summaries a root consumes are \
+                 not proven complete"
+                    .to_owned()
+            }
+            Self::SummaryProjectionRefused => {
+                "typestate summary projection was refused at a call/control boundary".to_owned()
+            }
+            Self::BindingsIncomplete => {
+                "typestate subject or event bindings did not cover every candidate".to_owned()
+            }
+            Self::SolveUncertain {
+                uncertainty,
+                abstained,
+            } => {
+                let mut message = "typestate solve kept uncertain facts".to_owned();
+                if !uncertainty.is_empty() {
+                    message.push_str(&format!(": {}", uncertainty.join(", ")));
+                }
+                if *abstained {
+                    message.push_str(" (some facts abstained)");
+                }
+                if uncertainty.iter().any(|code| {
+                    code == "typestate-unknown-call" || code == "typestate-external-call"
+                }) {
+                    message.push_str(
+                        "; an unmodeled or unresolved call needs a complete summary or model \
+                         before the solve can be complete",
+                    );
+                }
+                message
+            }
+            Self::SolveResultIncomplete => {
+                "typestate solve did not cover its result, and no reviewed binding closed it"
+                    .to_owned()
+            }
+            Self::UnprovenEventRelation {
+                event,
+                phase,
+                reason,
+            } => format!(
+                "event `{event}` ({phase}) may observe the subject in a procedure the root's call \
+                 closure does not exclude: {reason}"
+            ),
+            Self::CompositionJudgmentIncomplete => {
+                "typestate composition could not judge every terminal root".to_owned()
+            }
+            Self::CompositionAdmissionIncomplete => {
+                "typestate composition could not admit every composed finding".to_owned()
+            }
+            Self::BindingOmitted { omission } => {
+                format!("typestate endpoint binding omitted: {omission}")
+            }
+        }
+    }
+
+    /// The gaps a finished solve left, one per independent cause.
+    fn of_solve(solved: &TypestateSummaryResult) -> Vec<Self> {
+        let mut gaps = Vec::new();
+        if !solved.bindings_complete() {
+            gaps.push(Self::BindingsIncomplete);
+        }
+        if !solved.execution_complete() {
+            let facts = solved.result().facts();
+            let uncertainty = TYPESTATE_UNCERTAINTY_CODES
+                .iter()
+                .filter(|(cause, _)| facts.iter().any(|fact| fact.uncertainty().contains(*cause)))
+                .map(|(_, code)| (*code).to_owned())
+                .collect();
+            gaps.push(Self::SolveUncertain {
+                uncertainty,
+                abstained: facts.iter().any(|fact| fact.abstained()),
+            });
+        }
+        if !solved.result_complete() {
+            gaps.push(Self::SolveResultIncomplete);
+        }
+        debug_assert_eq!(gaps.is_empty(), solved.is_complete());
+        gaps
+    }
+}
+
+/// Each typestate uncertainty cause and its stable code. A finding carries the
+/// code as its certainty reason, except ambiguous dispatch, which has a typed
+/// certainty reason of its own.
+const TYPESTATE_UNCERTAINTY_CODES: [(TypestateUncertainty, &str); 7] = [
+    (
+        TypestateUncertainty::AmbiguousDispatch,
+        "typestate-ambiguous-dispatch",
+    ),
+    (TypestateUncertainty::UnknownCall, "typestate-unknown-call"),
+    (
+        TypestateUncertainty::ExternalCall,
+        "typestate-external-call",
+    ),
+    (TypestateUncertainty::Escape, "typestate-escape"),
+    (
+        TypestateUncertainty::IncompleteAnalysis,
+        "typestate-incomplete-analysis",
+    ),
+    (
+        TypestateUncertainty::UnmatchedEvent,
+        "typestate-unmatched-event",
+    ),
+    (
+        TypestateUncertainty::ConditionalAlias,
+        "typestate-conditional-alias",
+    ),
+];
+
+/// One gap per unproven event relation whose observing procedure the root's
+/// call closure does not exclude.
+fn unproven_relation_gaps<'a>(
+    bindings: &'a TypestateBindingPlan,
+    closure: &'a RootCallClosure,
+) -> impl Iterator<Item = TypestateGap> + 'a {
+    bindings
+        .unproven_relations()
+        .iter()
+        .filter(|relation| !closure.excludes(&relation.observation_procedure))
+        .map(|relation| TypestateGap::UnprovenEventRelation {
+            event: relation.event.clone(),
+            phase: relation.phase.clone(),
+            reason: relation.reason.clone(),
+        })
 }
 
 struct RootPassState {
@@ -1402,7 +1875,8 @@ struct RootPassState {
     replayed_artifact_leases: usize,
     replayed_artifact_lease_bytes: usize,
     projections: Vec<TypestateProjectedFinding>,
-    incomplete_reasons: Vec<PolicyIncompleteReason>,
+    gaps: Vec<TypestateGap>,
+    root_gaps: HashMap<ProcedureHandle, Vec<TypestateGap>>,
     reached_rows: u64,
     subject_rows: u64,
     terminal_rows: u64,
@@ -1414,6 +1888,54 @@ struct RootPassState {
     remaining_finding_witness_bytes: usize,
     evaluation_error: Option<String>,
     shared_lane_reached: bool,
+}
+
+struct RootExecutionBoundary {
+    solver_refusals: usize,
+    semantic_refusals: Option<usize>,
+    generation: u64,
+}
+
+impl RootExecutionBoundary {
+    fn before(state: &RootPassState, inputs: &RootPassInputs<'_>) -> Self {
+        Self {
+            solver_refusals: state.solver_budget.refusal_count(),
+            semantic_refusals: state
+                .semantic_budget
+                .as_ref()
+                .map(SemanticBudget::refusal_count),
+            generation: inputs.workspace.analyzer().project().analysis_generation(),
+        }
+    }
+
+    fn execution_dependent(&self, state: &RootPassState, inputs: &RootPassInputs<'_>) -> bool {
+        let cancelled = inputs.cancellation.is_cancelled();
+        let solver = state.solver_budget.refusal_count() > self.solver_refusals;
+        let semantic = state
+            .semantic_budget
+            .as_ref()
+            .map(SemanticBudget::refusal_count)
+            != self.semantic_refusals;
+        let execution = state.evaluation_execution_budget.work().exhausted;
+        let snapshot =
+            inputs.workspace.analyzer().project().analysis_generation() != self.generation;
+        let dependent = cancelled || solver || semantic || execution || snapshot;
+        if dependent {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!(
+                    "policy.units unbounded origin={}:{} cause=root_boundary cancelled={} solver={} semantic={} execution={} snapshot={}",
+                    file!(),
+                    line!(),
+                    cancelled,
+                    solver,
+                    semantic,
+                    execution,
+                    snapshot
+                )
+            });
+        }
+        dependent
+    }
 }
 
 // Keep the root product inline: this transient result crosses one root boundary.
@@ -1437,7 +1959,7 @@ impl RootPassState {
         let semantic_budget = if inputs.compiled.roots.is_empty() {
             None
         } else {
-            Some(SemanticBudget::new_child(
+            Some(SemanticBudget::new_carved_child(
                 inputs.compiled.semantic_remaining,
                 &inputs.compiled.semantic_scope,
             ))
@@ -1460,7 +1982,7 @@ impl RootPassState {
         let replayed_artifact_leases = 0_usize;
         let replayed_artifact_lease_bytes = 0_usize;
         let projections = Vec::new();
-        let incomplete_reasons = Vec::new();
+        let gaps = Vec::new();
         let reached_rows = 0_u64;
         let subject_rows = 0_u64;
         let terminal_rows = 0_u64;
@@ -1488,7 +2010,8 @@ impl RootPassState {
             replayed_artifact_leases,
             replayed_artifact_lease_bytes,
             projections,
-            incomplete_reasons,
+            gaps,
+            root_gaps: HashMap::new(),
             reached_rows,
             subject_rows,
             terminal_rows,
@@ -1510,16 +2033,14 @@ impl RootPassState {
     }
 
     fn solve_root(&mut self, inputs: &RootPassInputs<'_>, root: &ProcedureHandle) -> RootStep {
+        if matches!(inputs.engine, TypestateEngine::Composition) {
+            return self.solve_root_composition(inputs, root);
+        }
         let mut root_work = RootWork::default();
-        let mut root_reasons = Vec::new();
+        let mut root_gaps = Vec::new();
         // What this root's own solve takes out of the shared lanes, measured
         // here so the reuse path above can replay exactly it.
-        let solver_refusals_before = self.solver_budget.refusal_count();
-        let semantic_refusals_before = self
-            .semantic_budget
-            .as_ref()
-            .map(SemanticBudget::refusal_count);
-        let root_generation_before = inputs.workspace.analyzer().project().analysis_generation();
+        let execution_boundary = RootExecutionBoundary::before(self, inputs);
         let solver_before = self.solver_budget.used();
         let semantic_before = self
             .semantic_budget
@@ -1551,6 +2072,7 @@ impl RootPassState {
             &[],
             &icfg_provider,
             &icfg_provider,
+            Some(inputs.workspace),
             ProductionTypestateExecutionContext::Policy(&icfg_provider.execution_budget),
             &inputs.compiled.protocol,
             &inputs.compiled.bindings,
@@ -1582,23 +2104,35 @@ impl RootPassState {
                 return RootStep::Failed;
             }
         };
+        root_gaps.extend(unproven_relation_gaps(
+            &inputs.compiled.bindings,
+            production.root_call_closure(),
+        ));
         // A result-cache hit returns before the ICFG provider and the summary
         // funnel are touched and records nothing, so its ledger names none of
         // the inputs the result depends on and the root is not publishable.
         let cache_status = production.cache_status();
         let solved = production.result();
+        root_gaps.extend(TypestateGap::of_solve(solved));
+        if production.projection_refused() {
+            root_gaps.push(TypestateGap::SummaryProjectionRefused);
+        }
+        if !production
+            .root_call_closure()
+            .summary_completeness_justified()
+        {
+            root_gaps.push(TypestateGap::CallControlCoverageRefused);
+        }
         let fixed_point = match solved.result().termination() {
             SolverTermination::FixedPoint => true,
             SolverTermination::Cancelled => {
                 self.shared_lane_reached = true;
-                self.incomplete_reasons
-                    .push(PolicyIncompleteReason::Cancelled);
+                self.gaps.push(TypestateGap::Cancelled);
                 false
             }
             SolverTermination::ExceededBudget(_) => {
                 self.shared_lane_reached = true;
-                self.incomplete_reasons
-                    .push(PolicyIncompleteReason::PartialDiscovery);
+                self.gaps.push(TypestateGap::SolverBudgetExhausted);
                 false
             }
         };
@@ -1631,8 +2165,7 @@ impl RootPassState {
             || self.remaining_finding_witness_bytes == 0
         {
             self.shared_lane_reached = true;
-            self.incomplete_reasons
-                .push(PolicyIncompleteReason::PartialDiscovery);
+            self.gaps.push(TypestateGap::FindingBudgetExhausted);
             self.omitted_analysis_findings = self.omitted_analysis_findings.saturating_add(1);
             drop(production);
             drop(icfg_provider);
@@ -1675,8 +2208,7 @@ impl RootPassState {
             Ok(findings) => findings,
             Err(TypestateFlowProblemError::FindingCancelled) => {
                 self.shared_lane_reached = true;
-                self.incomplete_reasons
-                    .push(PolicyIncompleteReason::Cancelled);
+                self.gaps.push(TypestateGap::Cancelled);
                 drop(production);
                 drop(icfg_provider);
                 artifact_window.discard();
@@ -1684,8 +2216,7 @@ impl RootPassState {
             }
             Err(TypestateFlowProblemError::FindingBudgetExceeded) => {
                 self.shared_lane_reached = true;
-                self.incomplete_reasons
-                    .push(PolicyIncompleteReason::PartialDiscovery);
+                self.gaps.push(TypestateGap::FindingBudgetExhausted);
                 self.omitted_analysis_findings = self.omitted_analysis_findings.saturating_add(1);
                 drop(production);
                 drop(icfg_provider);
@@ -1708,9 +2239,18 @@ impl RootPassState {
             // the root alone: a run that reused an earlier root would have had
             // more allowance left and might have omitted nothing.
             self.shared_lane_reached = true;
-            root_reasons.push(PolicyIncompleteReason::PartialDiscovery);
-            self.incomplete_reasons
-                .push(PolicyIncompleteReason::PartialDiscovery);
+            for (incomplete, gap) in [
+                (
+                    !findings.analysis_complete(),
+                    TypestateGap::FindingAnalysisIncomplete,
+                ),
+                (findings.omitted() > 0, TypestateGap::FindingBudgetExhausted),
+            ] {
+                if incomplete {
+                    root_gaps.push(gap.clone());
+                    self.gaps.push(gap);
+                }
+            }
         }
         let finding_work = findings.work();
         let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
@@ -1802,34 +2342,7 @@ impl RootPassState {
                 self.retained_analysis_findings = self
                     .retained_analysis_findings
                     .saturating_add(root_retained_analysis_findings);
-                let execution_dependent = inputs.cancellation.is_cancelled()
-                    || self.solver_budget.refusal_count() > solver_refusals_before
-                    || self
-                        .semantic_budget
-                        .as_ref()
-                        .map(SemanticBudget::refusal_count)
-                        != semantic_refusals_before
-                    || self.evaluation_execution_budget.work().exhausted
-                    || inputs.workspace.analyzer().project().analysis_generation()
-                        != root_generation_before;
-                if execution_dependent {
-                    brokk_bifrost_analysis::profiling::note_with(|| {
-                        format!(
-                            "policy.units unbounded origin={}:{} cause=root_boundary cancelled={} solver={} semantic={} execution={} snapshot={}",
-                            file!(),
-                            line!(),
-                            inputs.cancellation.is_cancelled(),
-                            self.solver_budget.refusal_count() > solver_refusals_before,
-                            self.semantic_budget
-                                .as_ref()
-                                .map(SemanticBudget::refusal_count)
-                                != semantic_refusals_before,
-                            self.evaluation_execution_budget.work().exhausted,
-                            inputs.workspace.analyzer().project().analysis_generation()
-                                != root_generation_before
-                        )
-                    });
-                }
+                let execution_dependent = execution_boundary.execution_dependent(self, inputs);
                 #[cfg(any(test, feature = "test-support"))]
                 inputs
                     .workspace
@@ -1839,7 +2352,7 @@ impl RootPassState {
                 RootStep::Solved {
                     product: RootProduct {
                         findings: root_projections,
-                        incomplete_reasons: root_reasons,
+                        gaps: root_gaps,
                         work: root_work,
                     },
                     cache_status,
@@ -1851,8 +2364,7 @@ impl RootPassState {
                 | SemanticArtifactLeaseError::RetainedBytesOverflow,
             ) => {
                 self.shared_lane_reached = true;
-                self.incomplete_reasons
-                    .push(PolicyIncompleteReason::PartialDiscovery);
+                self.gaps.push(TypestateGap::SemanticArtifactCapacity);
                 self.omitted_analysis_findings = self
                     .omitted_analysis_findings
                     .saturating_add(root_retained_analysis_findings.max(1));
@@ -1864,6 +2376,193 @@ impl RootPassState {
                 ));
                 RootStep::Failed
             }
+        }
+    }
+
+    fn solve_root_composition(
+        &mut self,
+        inputs: &RootPassInputs<'_>,
+        root: &ProcedureHandle,
+    ) -> RootStep {
+        let execution_boundary = RootExecutionBoundary::before(self, inputs);
+        let mut composition_execution_dependent = false;
+        let composition_budget = CompositionBudget {
+            max_procedures: inputs.budget.max_composition_procedures(),
+            max_hops: inputs.budget.max_composition_hops(),
+            max_callers_per_procedure: inputs.budget.max_composition_callers_per_procedure(),
+        };
+        let mut projections = Vec::new();
+        let mut root_gaps = Vec::new();
+        let closure = {
+            let provider = WorkspaceIcfgProvider::new(inputs.workspace);
+            let mut request = SemanticRequest::new(
+                self.semantic_budget
+                    .as_mut()
+                    .expect("a compiled root retains a semantic budget"),
+                inputs.cancellation,
+            );
+            project_workspace_root_call_closure(root, &provider, inputs.workspace, &mut request)
+        };
+        let closure = match closure {
+            Ok(closure) => closure,
+            Err(error) => {
+                self.evaluation_error = Some(error.to_string());
+                return RootStep::Failed;
+            }
+        };
+        if closure
+            .incomplete_reasons()
+            .contains(&RootCallClosureIncompleteReason::BudgetStop)
+        {
+            // The semantic allowance is shared by all roots in this pass.
+            self.shared_lane_reached = true;
+            root_gaps.push(TypestateGap::CallClosureBudgetStop);
+        }
+        if !closure.summary_completeness_justified() {
+            root_gaps.push(TypestateGap::CallControlCoverageRefused);
+        }
+        root_gaps.extend(unproven_relation_gaps(&inputs.compiled.bindings, &closure));
+        let mut root_work = RootWork::default();
+        for subject in inputs.compiled.bindings.subjects() {
+            let rooted_here = inputs.compiled.bindings.initial_seeds().iter().any(|seed| {
+                seed.subject() == subject.id()
+                    && match seed.site() {
+                        TypestateObservationSite::ProgramPoint { point, .. } => {
+                            point.procedure().durable_key() == root.durable_key()
+                        }
+                        TypestateObservationSite::CallSite { call, .. } => {
+                            call.procedure().durable_key() == root.durable_key()
+                        }
+                    }
+            });
+            if !rooted_here {
+                continue;
+            }
+            let discovery = WorkspaceCompositionDiscovery::new(
+                inputs.workspace,
+                WorkspaceValueFlowProvider::new(
+                    inputs.workspace,
+                    ValueFlowCache::new(
+                        inputs.budget.query_limits().semantic.max_retained_bytes as u64,
+                    ),
+                ),
+            );
+            let provider = TypestateCompositionProvider::new(
+                discovery,
+                self.evaluation_execution_budget.clone(),
+                composition_budget,
+                &inputs.compiled.protocol,
+                &inputs.compiled.bindings,
+                subject,
+                TypestateBindingContext::root(),
+                inputs.budget.query_limits().semantic.max_retained_bytes,
+            );
+            let mut seen = HashSet::new();
+            let roots: Vec<ObjectAnchor> = provider
+                .terminal_roots()
+                .into_iter()
+                .map(|(_, anchor)| anchor)
+                .filter(|anchor| seen.insert(anchor.clone()))
+                .collect();
+            if roots.is_empty() {
+                continue;
+            }
+            let mut request = SemanticRequest::new(
+                self.semantic_budget
+                    .as_mut()
+                    .expect("a compiled root retains a semantic budget"),
+                inputs.cancellation,
+            );
+            let outcome = match search_object_roots(
+                roots,
+                TypestateComposeLabels::new(&inputs.compiled.protocol, &inputs.compiled.bindings),
+                &provider,
+                composition_budget,
+                &mut request,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.evaluation_error = Some(format!("typestate composition: {error:?}"));
+                    return RootStep::Failed;
+                }
+            };
+            composition_execution_dependent |= provider
+                .execution_observation(&outcome)
+                .execution_dependent();
+            let judgments = judge_object_roots(
+                &provider.terminal_roots(),
+                &outcome,
+                &inputs.compiled.protocol,
+                &inputs.compiled.bindings,
+            );
+            if judgments.iter().any(|judgment| !judgment.complete) {
+                root_gaps.push(TypestateGap::CompositionJudgmentIncomplete);
+                self.gaps.push(TypestateGap::CompositionJudgmentIncomplete);
+            }
+            let (findings, admission_complete) =
+                match provider.composed_findings(&outcome, &mut request) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.evaluation_error = Some(error.to_string());
+                        return RootStep::Failed;
+                    }
+                };
+            if !admission_complete {
+                root_gaps.push(TypestateGap::CompositionAdmissionIncomplete);
+                self.gaps.push(TypestateGap::CompositionAdmissionIncomplete);
+            }
+            root_work.reached_rows = root_work
+                .reached_rows
+                .saturating_add(u64::try_from(outcome.object_reaches.len()).unwrap_or(u64::MAX));
+            for finding in &findings {
+                let Some(bound_subject) = inputs.compiled.bindings.subject(finding.subject())
+                else {
+                    self.evaluation_error = Some("composed finding has no subject".into());
+                    return RootStep::Failed;
+                };
+                if inputs
+                    .compiled
+                    .binding_omission_subjects
+                    .contains(bound_subject.key())
+                {
+                    continue;
+                }
+                match project_finding(
+                    inputs.authority,
+                    inputs.policy,
+                    inputs.spec,
+                    inputs.workspace,
+                    inputs.budget,
+                    inputs.compiled,
+                    root,
+                    finding,
+                ) {
+                    Ok(rows) => projections.extend(rows),
+                    Err(error) => {
+                        self.evaluation_error = Some(error);
+                        return RootStep::Failed;
+                    }
+                }
+            }
+            root_work.retained_analysis_findings = root_work
+                .retained_analysis_findings
+                .saturating_add(u64::try_from(findings.len()).unwrap_or(u64::MAX));
+        }
+        self.reached_rows = self.reached_rows.saturating_add(root_work.reached_rows);
+        self.retained_analysis_findings = self
+            .retained_analysis_findings
+            .saturating_add(root_work.retained_analysis_findings);
+        let boundary_execution_dependent = execution_boundary.execution_dependent(self, inputs);
+        let computed_execution_dependent =
+            composition_execution_dependent || boundary_execution_dependent;
+        RootStep::Solved {
+            product: RootProduct {
+                findings: projections,
+                gaps: root_gaps,
+                work: root_work,
+            },
+            cache_status: TypestateProductionCacheStatus::MissIncomplete,
+            execution_dependent: computed_execution_dependent,
         }
     }
 
@@ -1944,12 +2643,40 @@ impl RootPassState {
             .saturating_sub(self.initial_evaluation_execution_work.traversal_steps);
         let completed_evaluation = self.evaluation_error.is_none();
         if completed_evaluation && final_evaluation_execution_work.exhausted {
-            self.incomplete_reasons
-                .push(PolicyIncompleteReason::PartialDiscovery);
+            self.gaps.push(TypestateGap::ExecutionBudgetExhausted);
         }
-        if completed_evaluation && !inputs.compiled.binding_omissions.is_empty() {
-            self.incomplete_reasons
-                .push(PolicyIncompleteReason::PartialDiscovery);
+        // The gaps no single root owns, which every subject site depends on:
+        // cancellation and the shared budgets always, and any other gap no
+        // recorded root names. A root's gaps reach the evaluation's list more
+        // than once (the solve and the product merge both add them), so
+        // ownership is by value, not by count. Undecided candidates and
+        // binding omissions are added below and enter the verdicts per site.
+        let global_gaps = self
+            .gaps
+            .iter()
+            .filter(|gap| {
+                gap.is_evaluation_wide() || !self.root_gaps.values().any(|gaps| gaps.contains(gap))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Unproven event relations are decided per root: each engine records
+        // an unproven-relation gap unless the root's complete call closure
+        // excludes the relation's observing procedure. A policy-wide check
+        // here would override that exclusion for relations every root rules
+        // out.
+        if completed_evaluation {
+            self.gaps
+                .extend(inputs.compiled.undecided_sites.iter().map(|site| {
+                    TypestateGap::BindingOmitted {
+                        omission: site.to_string(),
+                    }
+                }));
+            self.gaps
+                .extend(inputs.compiled.binding_omissions.iter().map(|omission| {
+                    TypestateGap::BindingOmitted {
+                        omission: omission.clone(),
+                    }
+                }));
         }
         let semantic_evaluation_work = self
             .semantic_budget
@@ -2004,29 +2731,36 @@ impl RootPassState {
         if let Some(message) = self.evaluation_error {
             return RootsPass::Failed(TypestateEvaluationFailure { message, work });
         }
-        self.incomplete_reasons.sort();
-        self.incomplete_reasons.dedup();
-        let completion = if self.incomplete_reasons.is_empty() {
+        self.gaps.sort();
+        self.gaps.dedup();
+        let mut reasons = self
+            .gaps
+            .iter()
+            .map(TypestateGap::reason)
+            .collect::<Vec<_>>();
+        reasons.sort();
+        reasons.dedup();
+        let completion = if reasons.is_empty() {
             PolicyRunCompletion::Complete
         } else {
-            PolicyRunCompletion::inconclusive(self.incomplete_reasons)
+            PolicyRunCompletion::inconclusive(reasons)
                 .expect("deduplicated typestate incomplete reasons are canonical")
         };
-        let diagnostics_truncated =
-            inputs.compiled.binding_omissions.len() > inputs.budget.max_diagnostics();
-        let diagnostics = inputs
-            .compiled
-            .binding_omissions
+        // Every gap is a diagnostic, so an inconclusive run names what it
+        // could not conclude.
+        let diagnostics_truncated = self.gaps.len() > inputs.budget.max_diagnostics();
+        let diagnostics = self
+            .gaps
             .iter()
             .take(inputs.budget.max_diagnostics())
-            .map(|omission| {
+            .map(|gap| {
                 PolicyDiagnostic::try_new(
                     PolicyDiagnosticCode::CodeQuery {
-                        code: CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                        code: gap.diagnostic_code(),
                     },
                     PolicyDiagnosticSeverity::Warning,
                     PolicyDiagnosticImpact::RunIncomplete,
-                    format!("typestate endpoint binding omitted: {omission}"),
+                    gap.message(),
                     None,
                     Vec::new(),
                 )
@@ -2042,14 +2776,249 @@ impl RootPassState {
                 });
             }
         };
+        let subjects =
+            match subject_verdicts(inputs, &self.root_gaps, &global_gaps, &self.projections) {
+                Ok(subjects) => subjects,
+                Err(message) => {
+                    return RootsPass::Failed(TypestateEvaluationFailure {
+                        message,
+                        work: work.clone(),
+                    });
+                }
+            };
         RootsPass::Complete(TypestateProjectionPayload {
             projections: self.projections,
             completion,
             diagnostics,
             diagnostics_truncated,
             work,
+            subjects: Some(subjects),
         })
     }
+}
+
+/// One completed evaluation's verdict for every subject site (#10985).
+///
+/// A Selected site groups the subjects bound from one selected syntax site of
+/// one selector, the same location an undecided candidate is reported at. Its
+/// further findings are absent only if every root serving those subjects was
+/// solved without a gap, no gap belongs to the whole evaluation, and no
+/// subject at the site had a binding omitted.
+/// An undecided candidate never binds, so it contaminates a selected site only
+/// through the gaps its roots recorded.
+fn subject_verdicts(
+    inputs: &RootPassInputs<'_>,
+    root_gaps: &HashMap<ProcedureHandle, Vec<TypestateGap>>,
+    global_gaps: &[TypestateGap],
+    projections: &[TypestateProjectedFinding],
+) -> Result<PolicySubjectVerdicts, String> {
+    use super::selector_compiler::candidate_enumeration::WhitelistedCallSelector;
+    let compiled = inputs.compiled;
+    let policy_id = &inputs.policy.definition().metadata.id;
+    // The enumeration status follows the selector's shape, never a unit, so
+    // a warm run reports what a cold run does.
+    let mut selectors: Vec<SubjectSelectorEnumeration> = Vec::new();
+    for subject in &inputs.spec.subjects {
+        let selector = inputs
+            .policy
+            .resolved_selectors()
+            .iter()
+            .find(|selector| selector.path == subject.selector_path)
+            .ok_or_else(|| {
+                "typestate subject selector is absent from the loaded policy".to_owned()
+            })?;
+        let name = selector.path.to_string();
+        if selectors.iter().any(|known| known.selector == name) {
+            continue;
+        }
+        let certified = selector
+            .as_query()
+            .is_some_and(|(_, query)| WhitelistedCallSelector::check(query).is_some());
+        // Only the certified shape proves its candidate universe; any other
+        // selection may keep a proven subset of an incomplete query.
+        let enumeration = if certified {
+            SubjectEnumeration::Certified
+        } else {
+            SubjectEnumeration::Uncertified
+        };
+        selectors.push(SubjectSelectorEnumeration {
+            selector: name,
+            enumeration,
+        });
+    }
+    let mut findings_by_subject: HashMap<&AnalysisSubjectRef, Vec<PolicyFindingId>> =
+        HashMap::new();
+    for projection in projections {
+        findings_by_subject
+            .entry(&projection.subject)
+            .or_default()
+            .push(PolicyFindingId::from_typestate_anchor(
+                policy_id,
+                &projection.anchor,
+            ));
+    }
+    type SiteKey = (String, String, Option<PolicyByteSpan>);
+    struct SiteGroup<'c> {
+        location: PolicySourceLocation,
+        subjects: Vec<&'c CompiledTypestateSubject>,
+    }
+    let mut locations = super::semantic_identity::FileSpanLocations::default();
+    let mut groups: HashMap<SiteKey, SiteGroup<'_>> = HashMap::new();
+    // A subject selected at several sites reports its findings at the first.
+    let mut subject_sites: HashMap<&TypestateSubjectKey, SiteKey> = HashMap::new();
+    for subject in compiled.subjects.iter() {
+        let spec_subject = inputs
+            .spec
+            .subjects
+            .iter()
+            .find(|candidate| candidate.identity == subject.endpoint)
+            .ok_or_else(|| "typestate subject is absent from the loaded policy".to_owned())?;
+        for (file, span) in &subject.selected_sites {
+            let location = locations.location(inputs.workspace, file, span)?;
+            let key = (
+                spec_subject.selector_path.to_string(),
+                location.path().to_owned(),
+                location.byte_span(),
+            );
+            subject_sites
+                .entry(&subject.key)
+                .and_modify(|first| {
+                    if key < *first {
+                        *first = key.clone();
+                    }
+                })
+                .or_insert_with(|| key.clone());
+            let group = groups.entry(key).or_insert_with(|| SiteGroup {
+                location,
+                subjects: Vec::new(),
+            });
+            if !group.subjects.iter().any(|known| known.key == subject.key) {
+                group.subjects.push(subject);
+            }
+        }
+    }
+    let mut entries = Vec::with_capacity(groups.len() + compiled.undecided_sites.len());
+    for (key, group) in groups {
+        let mut findings = Vec::new();
+        let mut reasons: Vec<String> = global_gaps
+            .iter()
+            .map(|gap| gap.label().to_owned())
+            .collect();
+        let mut roots: Vec<&ProcedureHandle> = Vec::new();
+        // An omitted event, terminal or result-contract binding can hide a
+        // transition from any subject, so no site can claim complete absence.
+        if !compiled.binding_omissions.is_empty() {
+            reasons.push("binding_incomplete".to_owned());
+        }
+        for subject in &group.subjects {
+            if subject_sites.get(&subject.key) != Some(&key) {
+                // This subject's findings are reported at its first site.
+                reasons.push("subject_shared_with_other_site".to_owned());
+            } else {
+                // The same reference project_finding mints for this subject.
+                let subject_ref = AnalysisSubjectRef::try_new(
+                    "bifrost",
+                    super::semantic_identity::stable_hex(
+                        subject.key.public_canonical_rendering().as_bytes(),
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+                findings.extend(
+                    findings_by_subject
+                        .get(&subject_ref)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
+            }
+            if compiled.binding_omission_subjects.contains(&subject.key) {
+                reasons.push("binding_incomplete".to_owned());
+            }
+            if !roots.contains(&&subject.root) {
+                roots.push(&subject.root);
+            }
+        }
+        for root in roots {
+            match root_gaps.get(root) {
+                Some(gaps) => reasons.extend(gaps.iter().map(|gap| gap.label().to_owned())),
+                None => reasons.push("root_unfinished".to_owned()),
+            }
+        }
+        findings.sort_unstable();
+        findings.dedup();
+        let partial = !reasons.is_empty();
+        entries.push(PolicySubjectVerdict {
+            selector: key.0,
+            location: group.location,
+            verdict: SubjectVerdict::Selected {
+                bindings: u32::try_from(group.subjects.len()).unwrap_or(u32::MAX),
+                findings,
+                further_findings_absent: if partial {
+                    FurtherFindingsAbsent::partial(reasons)
+                } else {
+                    FurtherFindingsAbsent::Complete
+                },
+                finding_location_bound: partial.then_some(FindingLocationBound::Unbounded),
+            },
+        });
+    }
+    // Two subjects that share a selector classify its candidates twice.
+    let mut undecided_seen = HashSet::new();
+    for site in &compiled.undecided_sites {
+        if !undecided_seen.insert((&site.selector, &site.file, site.span.clone())) {
+            continue;
+        }
+        let mut reasons = site
+            .reasons
+            .iter()
+            .map(|reason| reason.label())
+            .collect::<Vec<_>>();
+        reasons.sort();
+        reasons.dedup();
+        entries.push(PolicySubjectVerdict {
+            selector: site.selector.clone(),
+            location: locations.location(inputs.workspace, &site.file, &site.span)?,
+            verdict: SubjectVerdict::Undecided {
+                reasons,
+                finding_location_bound: FindingLocationBound::Unbounded,
+            },
+        });
+    }
+    // A selected site with no subject of its own selector (its binding was
+    // omitted, it resolved to no subject, or precedence reduction gave its
+    // object to another selector's subject) has no entry. Count it as an
+    // omitted selected entry so no reader takes its location for a
+    // non-selection.
+    let bound_sites = compiled
+        .subjects
+        .iter()
+        .flat_map(|subject| {
+            let selector = inputs
+                .spec
+                .subjects
+                .iter()
+                .find(|candidate| candidate.identity == subject.endpoint)
+                .map(|candidate| candidate.selector_path.to_string());
+            subject
+                .selected_sites
+                .iter()
+                .map(move |(file, span)| (selector.clone(), file, span))
+        })
+        .collect::<HashSet<_>>();
+    let unbound_selected_sites = compiled
+        .selected_subject_sites
+        .iter()
+        .filter(|(selector, file, span)| {
+            !bound_sites.contains(&(Some(selector.clone()), file, span))
+        })
+        .collect::<HashSet<_>>()
+        .len();
+    let mut verdicts = PolicySubjectVerdicts::new(selectors, entries);
+    verdicts.omitted.selected = verdicts
+        .omitted
+        .selected
+        .saturating_add(u64::try_from(unbound_selected_sites).unwrap_or(u64::MAX));
+    Ok(verdicts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2065,8 +3034,10 @@ fn evaluate_compiled_typestate(
     active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     units: Option<&mut RootUnits<'_>>,
 ) -> RootsPass {
+    let engine = compiled.engine.clone();
     let uncancelled = CancellationToken::default();
     let inputs = RootPassInputs {
+        engine,
         authority,
         policy,
         spec,
@@ -2103,7 +3074,11 @@ fn evaluate_compiled_typestate(
     for root in &compiled.roots {
         state.begin_root();
         match state.solve_root(&inputs, root) {
-            RootStep::Solved { product, .. } => state.projections.extend(product.findings),
+            RootStep::Solved { product, .. } => {
+                state.root_gaps.insert(root.clone(), product.gaps.clone());
+                state.gaps.extend(product.gaps);
+                state.projections.extend(product.findings);
+            }
             RootStep::Unfinished => continue,
             RootStep::Stopped | RootStep::Failed => break,
         }
@@ -2118,8 +3093,9 @@ struct TypestateRootSlice<'a, 'b, 'r> {
 }
 
 enum RootOutcome {
-    Reused(RootProduct),
+    Reused(ProcedureHandle, RootProduct),
     Solved {
+        root: ProcedureHandle,
         product: RootProduct,
         cache_status: TypestateProductionCacheStatus,
         execution_dependent: bool,
@@ -2152,9 +3128,7 @@ impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
             || state.remaining_finding_witness_bytes == 0
         {
             state.shared_lane_reached = true;
-            state
-                .incomplete_reasons
-                .push(PolicyIncompleteReason::PartialDiscovery);
+            state.gaps.push(TypestateGap::FindingBudgetExhausted);
             state.omitted_analysis_findings = state.omitted_analysis_findings.saturating_add(1);
             return Err(WidenReason::MergedLimitReached);
         }
@@ -2175,6 +3149,7 @@ impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
                 cache_status,
                 execution_dependent,
             } => Ok(RootOutcome::Solved {
+                root: (*seed).clone(),
                 product,
                 cache_status,
                 execution_dependent,
@@ -2186,25 +3161,25 @@ impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
     }
     fn decode(
         &self,
-        _: &Self::Seed,
+        seed: &Self::Seed,
         product: PolicyUnitProduct,
         _: &[ReadKey],
     ) -> Result<Self::Prefix, UnitDecodeError> {
         product
             .into_root()
-            .map(RootOutcome::Reused)
+            .map(|product| RootOutcome::Reused((*seed).clone(), product))
             .ok_or(UnitDecodeError::Widen(WidenReason::ProductLoadFailed))
     }
     fn encode(&self, prefix: &Self::Prefix) -> PolicyUnitProduct {
         match prefix {
-            RootOutcome::Solved { product, .. } | RootOutcome::Reused(product) => {
+            RootOutcome::Solved { product, .. } | RootOutcome::Reused(_, product) => {
                 PolicyUnitProduct::Root(product.clone())
             }
             RootOutcome::Unfinished => unreachable!("unfinished roots are not published"),
         }
     }
     fn charge(&self, _: &mut (), prefix: &Self::Prefix) {
-        if let RootOutcome::Reused(product) = prefix {
+        if let RootOutcome::Reused(_, product) = prefix {
             self.state
                 .borrow_mut()
                 .as_mut()
@@ -2215,7 +3190,7 @@ impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
     }
     fn fits(&self, _: &(), prefix: &Self::Prefix) -> bool {
         match prefix {
-            RootOutcome::Reused(product) => self
+            RootOutcome::Reused(_, product) => self
                 .state
                 .borrow()
                 .as_ref()
@@ -2268,11 +3243,16 @@ impl<'r> UnitSlice for TypestateRootSlice<'_, '_, 'r> {
         let state = state.as_mut().expect("root state available");
         for product in products {
             match product {
-                RootOutcome::Reused(product) => {
-                    state.incomplete_reasons.extend(product.incomplete_reasons);
+                RootOutcome::Reused(root, product) => {
+                    state.root_gaps.insert(root, product.gaps.clone());
+                    state.gaps.extend(product.gaps);
                     state.projections.extend(product.findings);
                 }
-                RootOutcome::Solved { product, .. } => state.projections.extend(product.findings),
+                RootOutcome::Solved { root, product, .. } => {
+                    state.root_gaps.insert(root, product.gaps.clone());
+                    state.gaps.extend(product.gaps);
+                    state.projections.extend(product.findings);
+                }
                 RootOutcome::Unfinished => {}
             }
         }
@@ -2435,6 +3415,7 @@ fn project_finding(
                 .map_err(|error| error.to_string())?,
             witness_refs,
             witness_refs_truncated: witnesses_truncated,
+            model_attribution: None,
             report,
         });
     }
@@ -2646,6 +3627,9 @@ fn projected_report(
             retained_byte_limit,
             |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "typestate seed"),
+                SummaryWitnessStepKind::ModeledReceiver => {
+                    (WitnessStepKind::Propagation, "receiver operand")
+                }
                 SummaryWitnessStepKind::Edge(_) => {
                     (WitnessStepKind::Propagation, "typestate propagation")
                 }
@@ -2679,6 +3663,17 @@ fn projected_report(
     let related_limit = budget
         .max_related_locations_per_finding()
         .min(report_options.origins_per_finding);
+    for (_, locator) in finding.relation_sites() {
+        let location = super::semantic_identity::policy_location(workspace, locator)?;
+        super::projection::retain_related_location(
+            &mut related,
+            &primary,
+            PolicyLocationRelationship::Evidence,
+            location,
+            related_limit,
+            &mut omitted_related_locations,
+        )?;
+    }
     for (relationship, locators) in [
         (PolicyLocationRelationship::Source, acquisitions),
         (PolicyLocationRelationship::Subject, spellings),
@@ -2725,26 +3720,32 @@ fn certainty_reasons(
     if uncertainty.contains(TypestateUncertainty::AmbiguousDispatch) {
         reasons.push(CertaintyReason::AmbiguousDispatch);
     }
-    for (cause, code) in [
-        (TypestateUncertainty::UnknownCall, "typestate-unknown-call"),
-        (
-            TypestateUncertainty::ExternalCall,
-            "typestate-external-call",
-        ),
-        (TypestateUncertainty::Escape, "typestate-escape"),
-        (
-            TypestateUncertainty::IncompleteAnalysis,
-            "typestate-incomplete-analysis",
-        ),
-        (
-            TypestateUncertainty::UnmatchedEvent,
-            "typestate-unmatched-event",
-        ),
-    ] {
-        if uncertainty.contains(cause) {
+    for (cause, code) in TYPESTATE_UNCERTAINTY_CODES {
+        if cause != TypestateUncertainty::AmbiguousDispatch && uncertainty.contains(cause) {
             reasons.push(
                 CertaintyReason::analyzer_ambiguity(code).map_err(|error| error.to_string())?,
             );
+        }
+    }
+    for (kind, _) in finding.relation_sites() {
+        let code = match kind {
+            brokk_bifrost_flow::typestate::FirstUnprovenRelationKind::Handoff => {
+                "typestate-unproven-handoff"
+            }
+            brokk_bifrost_flow::typestate::FirstUnprovenRelationKind::UnresolvedCall => {
+                "typestate-unresolved-call"
+            }
+            brokk_bifrost_flow::typestate::FirstUnprovenRelationKind::UnprovenConversion => {
+                "typestate-unproven-conversion"
+            }
+            brokk_bifrost_flow::typestate::FirstUnprovenRelationKind::Guard => {
+                "typestate-unproven-guard"
+            }
+        };
+        let reason =
+            CertaintyReason::analyzer_ambiguity(code).map_err(|error| error.to_string())?;
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
         }
     }
     if reasons.is_empty() {
@@ -2775,6 +3776,7 @@ fn failed_projection_payload(message: &str, work: PolicyWorkReport) -> Typestate
         diagnostics: vec![super::projection::failed_projection_diagnostic(message)],
         diagnostics_truncated: false,
         work,
+        subjects: None,
     }
 }
 
@@ -2798,7 +3800,7 @@ fn compile_failure(failure: TypestatePolicyCompileFailure) -> TypestateCompilati
             completion: completion @ CodeQueryCompletion::ProvenSubset { .. },
             ..
         } => {
-            let mut reasons = super::evaluator::incomplete_reasons(&completion, false);
+            let mut reasons = super::evaluator::incomplete_reasons(&completion);
             if reasons.is_empty() {
                 reasons.push(PolicyIncompleteReason::PartialDiscovery);
             }
@@ -2824,6 +3826,7 @@ fn compile_failure(failure: TypestatePolicyCompileFailure) -> TypestateCompilati
             ..
         }
         | TypestatePolicyCompileError::Protocol(_)
+        | TypestatePolicyCompileError::InvalidEventSet(_)
         | TypestatePolicyCompileError::MissingSelector(_)
         | TypestatePolicyCompileError::UnsupportedBinding(_)
         | TypestatePolicyCompileError::BindingPlan(_) => {
@@ -2948,6 +3951,7 @@ fn argument_form_release_events(
             phase: *phase,
             event: event_key,
             policy_event: event.id.clone(),
+            semantic_effect: event.semantic_effect.as_deref().map(Arc::from),
             order,
         });
     }
@@ -3054,22 +4058,31 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 query_limits,
                 max_selector_results,
                 cancellation,
-                // The seed scope every selector of this compile enumerates
-                // over. A compile that holds units narrows it per unit
-                // instead; a compile that does not runs one whole-workspace
-                // scan per selector, exactly as it always has.
+                // Auxiliary event and terminal selectors stay global, even when
+                // the same query also selects scoped starting subjects.
                 CodeQueryExecutionScope::whole_workspace(),
             ),
+            subject_scope: CodeQueryExecutionScope::whole_workspace(),
             active_semantic_models: active_semantic_model_snapshot
                 .as_ref()
                 .map(|snapshot| Arc::clone(snapshot.active_models())),
             syntax_trees: HashMap::new(),
             formal_names: HashMap::new(),
+            selected_template_targets: HashMap::new(),
             close_contracts: HashMap::new(),
             close_contract_stack: Vec::new(),
             binding_omissions: Vec::new(),
+            selected_subject_sites: Vec::new(),
+            selection_fingerprint: Vec::new(),
+            undecided_sites: Vec::new(),
+            unproven_relations: Vec::new(),
             binding_omission_procedures: HashSet::new(),
         }
+    }
+
+    fn with_subject_scope(mut self, subject_scope: CodeQueryExecutionScope<'a>) -> Self {
+        self.subject_scope = subject_scope;
+        self
     }
 
     /// Compile each of this policy's selectors one seed file at a time,
@@ -3131,14 +4144,28 @@ impl<'a> TypestatePolicyCompiler<'a> {
         for subject in &spec.subjects {
             let selector = selector(&selectors, &subject.selector_path)?;
             let binding = SelectorBinding::from_subject(&subject.binding);
-            let selections = self.select(selector, &binding)?;
+            let selections = self.select_subject(selector, &binding)?;
             let class =
                 TypestateSubjectClassKey::new(format!("endpoint.{}", subject.semantic_hash))
                     .map_err(|error| {
                         TypestatePolicyCompileError::UnsupportedBinding(error.to_string())
                     })?;
             for selection in selections {
-                for resolved in self.resolve_selection(selection, &binding, None)? {
+                let selected_site = (selection.file.clone(), selection.subject_span.clone());
+                let inactive = selection.has_no_result_activation();
+                let resolved_selections = self.resolve_selection(selection, &binding, None)?;
+                // Binding validation still runs for a proven inactive result.
+                // It has no lifecycle subject, rather than a missing binding.
+                if inactive {
+                    debug_assert!(resolved_selections.is_empty());
+                    continue;
+                }
+                self.selected_subject_sites.push((
+                    subject.selector_path.to_string(),
+                    selected_site.0.clone(),
+                    selected_site.1.clone(),
+                ));
+                for resolved in resolved_selections {
                     let seed_site = TypestateObservationSite::program_point(
                         resolved.observation_point.clone(),
                         TypestateBindingContext::root(),
@@ -3229,6 +4256,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 endpoint: subject.identity.clone(),
                                 root: resolved.procedure.clone(),
                                 site: seed_site.clone(),
+                                selected_site: selected_site.clone(),
                                 activation_edge: activation_edge
                                     .map(|activation| activation.edge.clone()),
                                 role: resolved.role,
@@ -3272,6 +4300,14 @@ impl<'a> TypestatePolicyCompiler<'a> {
             });
             if let Some(index) = subject_indexes.get(&key).copied() {
                 if !subjects[index]
+                    .selected_sites
+                    .contains(&subject.selected_site)
+                {
+                    subjects[index]
+                        .selected_sites
+                        .push(subject.selected_site.clone());
+                }
+                if !subjects[index]
                     .publication_starts
                     .contains(&publication_start)
                 {
@@ -3301,6 +4337,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     member_contracts: subject.member_contracts,
                     fresh_result: subject.fresh_result,
                     publication_starts: vec![publication_start.clone()],
+                    selected_sites: vec![subject.selected_site.clone()],
                     escape_starts: escape_start.into_iter().collect(),
                 });
             }
@@ -3344,6 +4381,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
         // from an event name, so a policy that spells its close differently
         // still gets an interprocedural contract for as long as the close
         // event is what leaves the obligation satisfied.
+        let engine = select_typestate_engine(
+            &policy.definition().metadata.id,
+            &roots,
+            self.selectors.workspace(),
+        )?;
         let release_events = release_event_keys(&protocol);
         let argument_form_releases = argument_form_release_events(spec, &release_events)?;
         // Every close call this compile resolves in a workspace body, kept
@@ -3351,6 +4393,11 @@ impl<'a> TypestatePolicyCompiler<'a> {
         // which caller happened to name it.
         let mut close_sites: Vec<CloseSiteFact> = Vec::new();
         let mut events = Vec::new();
+        let mut event_templates = Vec::new();
+        let mut coverage_selections = HashMap::<
+            (TypestateSubjectKey, CallSiteHandle),
+            Option<(ActivatedProcedureSummary, String)>,
+        >::new();
         for (event_order, event) in spec.automaton.events.iter().enumerate() {
             let order = u32::try_from(event_order).map_err(|_| {
                 TypestatePolicyCompileError::UnsupportedBinding(
@@ -3384,8 +4431,10 @@ impl<'a> TypestatePolicyCompiler<'a> {
                             quality,
                             endpoint: None,
                             modeled_external_effect: None,
+                            semantic_effect: event.semantic_effect.as_deref().map(Arc::from),
                             condition: None,
                             alias_derived: false,
+                            selected_operand: None,
                         });
                     }
                 }
@@ -3417,6 +4466,68 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     if release_event && !matches!(condition_matches, Some(None | Some(false))) {
                         self.note_close_sites(&resolved, &mut close_sites)?;
                     }
+                    // A selected formal may name a different caller subject.
+                    // Keep the selector's event as an inert, subject-specific
+                    // template; only a guarded summary can use it.
+                    if engine == TypestateEngine::Composition
+                        && trigger.phase != EndpointObservationPhase::AtMatch
+                        && let Some(selected_operand) = &resolved.selected_operand
+                        && resolved.objects.len() == 1
+                        && resolved.modeled_target_origin.is_none()
+                    {
+                        let object = &resolved.objects[0];
+                        let eligible_subjects = subjects
+                            .iter()
+                            .filter(|subject| {
+                                event.applies_to_subjects.contains(&subject.endpoint)
+                                    && self
+                                        .modeled_external_effect_id(
+                                            subject,
+                                            &resolved,
+                                            trigger.phase,
+                                        )
+                                        .is_none()
+                                    && subject.key.object()
+                                        != TypestateSubjectKey::for_object(
+                                            subject.key.class().clone(),
+                                            &object.object,
+                                        )
+                                        .object()
+                            })
+                            .collect::<Vec<_>>();
+                        if !eligible_subjects.is_empty()
+                            && let Some(selected_target) =
+                                self.selected_template_target(selected_operand.call())?
+                        {
+                            for subject in eligible_subjects {
+                                let (site, role) = event_site(&resolved, trigger.phase)?;
+                                event_templates.push(PendingEventBinding {
+                                    event: event_key.clone(),
+                                    policy_event: event.id.clone(),
+                                    subject: subject.key.clone(),
+                                    site,
+                                    phase: EventObservationPhase::Endpoint(trigger.phase),
+                                    order,
+                                    role,
+                                    quality: if condition_unknown {
+                                        condition_incomplete_quality(object.quality.clone())
+                                    } else {
+                                        object.quality.clone()
+                                    },
+                                    endpoint: endpoint.clone(),
+                                    modeled_external_effect: None,
+                                    semantic_effect: None,
+                                    condition: flow_condition,
+                                    alias_derived: false,
+                                    selected_operand: Some(
+                                        selected_operand
+                                            .clone()
+                                            .with_selected_target(selected_target.clone()),
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     for object in &resolved.objects {
                         for subject in subjects.iter().filter(|subject| {
                             event.applies_to_subjects.contains(&subject.endpoint)
@@ -3428,6 +4539,21 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                     .object()
                         }) {
                             let (site, role) = event_site(&resolved, trigger.phase)?;
+                            if spec.automaton.event_set.is_some()
+                                && let Some(call) = resolved.call.as_ref()
+                            {
+                                let selected = self
+                                    .authored_external_summary(&resolved)
+                                    .zip(resolved.modeled_member_id.clone());
+                                coverage_selections
+                                    .entry((subject.key.clone(), call.clone()))
+                                    .and_modify(|prior| {
+                                        if !same_coverage_selection(prior, &selected) {
+                                            *prior = None;
+                                        }
+                                    })
+                                    .or_insert(selected);
+                            }
                             let modeled_external_effect =
                                 self.modeled_external_effect_id(subject, &resolved, trigger.phase);
                             let quality = if modeled_external_effect.is_some()
@@ -3454,16 +4580,43 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 quality,
                                 endpoint: endpoint.clone(),
                                 modeled_external_effect,
+                                semantic_effect: event.semantic_effect.as_deref().map(Arc::from),
                                 condition: flow_condition,
                                 alias_derived: false,
+                                selected_operand: (trigger.phase
+                                    != EndpointObservationPhase::AtMatch)
+                                    .then(|| resolved.selected_operand.clone())
+                                    .flatten(),
                             });
                         }
                     }
                     let unnamed = subjects_absent_from(&resolved, &subjects, |subject| {
                         event.applies_to_subjects.contains(&subject.endpoint)
                     });
-                    for aliased in self.alias_bound_subjects(&resolved, &unnamed)? {
+                    let (absence_site, _) = event_site(&resolved, trigger.phase)?;
+                    for aliased in self.alias_bound_subjects(
+                        &resolved,
+                        &unnamed,
+                        event_key.as_str(),
+                        format!("{:?}", trigger.phase).as_str(),
+                        &absence_site,
+                    )? {
                         let (site, role) = event_site(&resolved, trigger.phase)?;
+                        if spec.automaton.event_set.is_some()
+                            && let Some(call) = resolved.call.as_ref()
+                        {
+                            let selected = self
+                                .authored_external_summary(&resolved)
+                                .zip(resolved.modeled_member_id.clone());
+                            coverage_selections
+                                .entry((aliased.clone(), call.clone()))
+                                .and_modify(|prior| {
+                                    if !same_coverage_selection(prior, &selected) {
+                                        *prior = None;
+                                    }
+                                })
+                                .or_insert(selected);
+                        }
                         let modeled_external_effect = subjects
                             .iter()
                             .find(|subject| subject.key == aliased)
@@ -3487,8 +4640,12 @@ impl<'a> TypestatePolicyCompiler<'a> {
                             quality,
                             endpoint: endpoint.clone(),
                             modeled_external_effect,
+                            semantic_effect: event.semantic_effect.as_deref().map(Arc::from),
                             condition: flow_condition,
                             alias_derived: true,
+                            selected_operand: (trigger.phase != EndpointObservationPhase::AtMatch)
+                                .then(|| resolved.selected_operand.clone())
+                                .flatten(),
                         });
                     }
                 }
@@ -3569,7 +4726,14 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                     subjects_absent_from(&resolved, &subjects, |subject| {
                                         expectation.applies_to_subjects.contains(&subject.endpoint)
                                     });
-                                for aliased in self.alias_bound_subjects(&resolved, &unnamed)? {
+                                let (absence_site, _) = event_site(&resolved, *phase)?;
+                                for aliased in self.alias_bound_subjects(
+                                    &resolved,
+                                    &unnamed,
+                                    expectation_key.as_str(),
+                                    format!("{:?}", phase).as_str(),
+                                    &absence_site,
+                                )? {
                                     let (site, role) = event_site(&resolved, *phase)?;
                                     terminals.push(PendingTerminalBinding {
                                         expectation: expectation_key.clone(),
@@ -3612,7 +4776,17 @@ impl<'a> TypestatePolicyCompiler<'a> {
         roots.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
         roots.dedup_by(|left, right| left == right);
         subjects.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut coverage_candidates =
+            HashMap::<EventObservationGroupKey, Vec<CoverageCandidateSpec>>::new();
+        for binding in &events {
+            record_coverage_candidate(&mut coverage_candidates, binding);
+        }
         let mut events = reduce_event_bindings(events, &endpoint_precedence, &event_precedence)?;
+        let event_templates = reduce_event_template_bindings(
+            event_templates,
+            &endpoint_precedence,
+            &event_precedence,
+        );
         let mut terminals =
             reduce_terminal_bindings(terminals, &endpoint_precedence, &expectation_precedence)?;
         let trusted_modeled_calls = events
@@ -3669,7 +4843,79 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 injection.site.clone(),
             ))
         });
+        for injection in &close_discharges {
+            record_coverage_candidate(&mut coverage_candidates, injection);
+        }
         events.extend(close_discharges);
+        let coverage_candidate_groups = coverage_candidates
+            .into_iter()
+            .map(|(key, candidates)| CoverageCandidateGroupSpec {
+                subject: key.subject,
+                site: key.site,
+                phase: coverage_candidate_phase(key.phase),
+                candidates,
+            })
+            .collect::<Vec<_>>();
+        let mut coverage_decisions = Vec::new();
+        if let Some(event_set) = spec.automaton.event_set.as_ref() {
+            for ((subject, call), selected) in coverage_selections {
+                let site = TypestateObservationSite::call_site(
+                    call.clone(),
+                    TypestateBindingContext::root(),
+                );
+                for (phase, exit) in [
+                    (
+                        CoverageCandidatePhase::AfterNormalReturn,
+                        AuthoredSummaryExitKind::Normal,
+                    ),
+                    (
+                        CoverageCandidatePhase::AfterExceptionalReturn,
+                        AuthoredSummaryExitKind::Exceptional,
+                    ),
+                ] {
+                    let candidates = coverage_candidate_groups.iter().find(|group| {
+                        group.subject == subject && group.site == site && group.phase == phase
+                    });
+                    let record = selected.as_ref().map(|(summary, member_id)| {
+                        let shard = &summary.shard;
+                        CoverageRecordKey {
+                            active_model_set_hash: self
+                                .active_semantic_models
+                                .as_ref()
+                                .expect("selected summary has an active model set")
+                                .active_model_set_hash()
+                                .to_owned(),
+                            pack_id: shard.manifest.pack_id.clone(),
+                            pack_digest: shard.manifest.content_sha256.clone(),
+                            shard_id: shard.descriptor.shard_id.clone(),
+                            shard_digest: shard.descriptor.content_sha256.clone(),
+                            record_id: summary.record.id.clone(),
+                            model_id: summary.record.model_id.clone(),
+                            record_digest: summary.record.content_sha256.clone(),
+                            selected_member_id: member_id.clone(),
+                            context: site.context().key().clone(),
+                            claim_id: None,
+                            witness_ids: Vec::new(),
+                        }
+                    });
+                    let kind = adjudicate_lifecycle_coverage(
+                        &call,
+                        &site,
+                        selected.as_ref().map(|(summary, _)| summary),
+                        record,
+                        event_set,
+                        exit,
+                        candidates,
+                    );
+                    coverage_decisions.push(CoverageDecisionSpec {
+                        subject: subject.clone(),
+                        site: site.clone(),
+                        phase,
+                        kind,
+                    });
+                }
+            }
+        }
         let escape_event =
             internal_escape_event_key(spec.automaton.events.iter().map(|event| event.id.as_str()));
         let escape_order = u32::try_from(spec.automaton.events.len()).map_err(|_| {
@@ -3693,6 +4939,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .collect::<Vec<_>>();
         let mut event_provenance = events
             .iter()
+            .chain(event_templates.iter())
             .map(|binding| {
                 (
                     EventProvenanceKey {
@@ -3701,6 +4948,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         site: binding.site.clone(),
                         order: binding.order,
                         role: binding.role,
+                        selected_operand: binding.selected_operand.clone(),
                     },
                     binding.endpoint.clone(),
                 )
@@ -3714,6 +4962,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     site: site.clone(),
                     order: escape_order,
                     role: TypestateObjectRole::EscapedObject,
+                    selected_operand: None,
                 },
                 None,
             )
@@ -3736,6 +4985,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .into_iter()
             .map(|binding| {
                 let condition = binding.condition;
+                let selected_operand = binding.selected_operand;
                 let spec = match binding.modeled_external_effect {
                     Some(effect_id) => TypestateEventBindingSpec::new_modeled_external_effect(
                         binding.event,
@@ -3755,8 +5005,13 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         binding.quality,
                     ),
                 };
-                match condition {
+                let spec = spec.with_semantic_effect(binding.semantic_effect);
+                let spec = match condition {
                     Some(condition) => spec.with_condition(condition),
+                    None => spec,
+                };
+                match selected_operand {
+                    Some(operand) => spec.with_selected_operand(operand),
                     None => spec,
                 }
             })
@@ -3770,6 +5025,27 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     TypestateBindingQuality::proven_unique(),
                 )
             }))
+            .collect();
+        let template_specs = event_templates
+            .into_iter()
+            .map(|binding| {
+                let mut spec = TypestateEventBindingSpec::new(
+                    binding.event,
+                    binding.subject,
+                    binding.site,
+                    binding.order,
+                    binding.role,
+                    binding.quality,
+                );
+                if let Some(condition) = binding.condition {
+                    spec = spec.with_condition(condition);
+                }
+                spec.with_selected_operand(
+                    binding
+                        .selected_operand
+                        .expect("selected template has an operand"),
+                )
+            })
             .collect();
         let terminal_specs = terminals
             .into_iter()
@@ -3807,19 +5083,35 @@ impl<'a> TypestatePolicyCompiler<'a> {
             }
         }
         let bindings = Arc::new(
-            TypestateBindingPlan::try_new_with_call_noninterference(
+            TypestateBindingPlan::try_new_with_coverage(
                 &protocol,
                 subject_specs,
                 seeds,
-                event_specs,
+                TypestateEventBindings {
+                    events: event_specs,
+                    templates: template_specs,
+                },
                 call_noninterference.specs,
                 terminal_specs,
+                TypestateCoverageSpec {
+                    event_set: spec.automaton.event_set.as_ref().map(|set| {
+                        TypestateCoverageEventSet {
+                            name: set.name.clone(),
+                            version: set.version,
+                            effects: set.effects.clone(),
+                        }
+                    }),
+                    candidate_groups: coverage_candidate_groups,
+                    decisions: coverage_decisions,
+                    unproven_relations: std::mem::take(&mut self.unproven_relations),
+                },
             )
             .map_err(TypestatePolicyCompileError::BindingPlan)?,
         );
         let event_endpoints = bindings
             .event_bindings()
             .iter()
+            .chain(bindings.event_templates().iter())
             .map(|binding| {
                 let event = protocol
                     .event(binding.event())
@@ -3838,6 +5130,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         site: binding.site().clone(),
                         order: binding.order(),
                         role: binding.role(),
+                        selected_operand: binding.selected_operand().cloned(),
                     })
                     .cloned()
                     .ok_or_else(|| {
@@ -3911,6 +5204,10 @@ impl<'a> TypestatePolicyCompiler<'a> {
             });
         }
         Ok(CompiledTypestatePolicy {
+            selection_fingerprint: std::mem::take(&mut self.selection_fingerprint),
+            undecided_sites: std::mem::take(&mut self.undecided_sites),
+            compilations: 1,
+            engine,
             protocol,
             bindings,
             roots: roots.into_boxed_slice(),
@@ -3929,6 +5226,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             artifact_leases,
             result_contract_artifact_leases,
             binding_omissions: std::mem::take(&mut self.binding_omissions).into_boxed_slice(),
+            selected_subject_sites: std::mem::take(&mut self.selected_subject_sites),
             binding_omission_subjects: incomplete_subjects,
             close_contract_reasons,
         })
@@ -3989,6 +5287,63 @@ impl<'a> TypestatePolicyCompiler<'a> {
         Ok(selected)
     }
 
+    fn select_subject(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        binding: &SelectorBinding,
+    ) -> Result<Vec<SelectedSite>, TypestatePolicyCompileError> {
+        // A selector without a certified candidate inventory keeps the
+        // ordinary whole-selector answer. Only a certified selector has
+        // undecided candidates whose identities and reason classes extend the
+        // compilation fingerprint.
+        if !self
+            .selectors
+            .subject_uses_candidate_enumeration(selector)
+            .map_err(typestate_selector_error)?
+        {
+            return self.select(selector, binding);
+        }
+        use super::selector_compiler::candidate_enumeration::CandidateReason;
+        let selection = if self.subject_scope.seed_files().is_some() {
+            self.selectors
+                .select_subject_candidates_in_scope(selector, self.subject_scope.clone())
+        } else {
+            self.selectors.select_subject_candidates(selector)
+        }
+        .map_err(typestate_selector_error)?;
+        // Selected subjects already enter the compilation through the
+        // canonical bindings hash; the undecided candidates do not, so their
+        // identities and reason classes extend the fingerprint roots key on.
+        for candidate in selection.undecided {
+            let mut classes = candidate
+                .reasons
+                .iter()
+                .map(|reason| match reason {
+                    CandidateReason::Read(_) => "read",
+                    CandidateReason::SilentDrop => "silent_drop",
+                    CandidateReason::IncompleteQuery(_) => "incomplete_query",
+                    CandidateReason::Disagreement { .. } => "disagreement",
+                })
+                .collect::<Vec<_>>();
+            classes.sort_unstable();
+            classes.dedup();
+            self.selection_fingerprint.push(format!(
+                "undecided:{}:{}:{:?}:{classes:?}",
+                selector.path, candidate.file, candidate.span
+            ));
+            self.undecided_sites.push(UndecidedSelectorSite {
+                selector: selector.path.to_string(),
+                file: candidate.file,
+                span: candidate.span,
+                reasons: candidate.reasons,
+            });
+        }
+        Ok(Self::bound_selected_sites(selection.sites, binding))
+    }
+
+    // An undecided transition can change a selected subject's history. Until
+    // that uncertainty can be attributed to subjects, retain whole-selector
+    // failure for event and terminal discovery rather than inventing findings.
     fn select(
         &mut self,
         selector: &ResolvedPolicySelector,
@@ -3998,9 +5353,20 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .selectors
             .select_with_artifact_continuation(selector)
             .map_err(typestate_selector_error)?;
-        Ok(sites
+        Ok(Self::bound_selected_sites(sites, binding))
+    }
+
+    fn bound_selected_sites(
+        sites: Vec<super::selector_compiler::PolicySelectedSite>,
+        binding: &SelectorBinding,
+    ) -> Vec<SelectedSite> {
+        sites
             .into_iter()
             .map(|site| SelectedSite {
+                subject_span: site
+                    .call_binding
+                    .as_ref()
+                    .map_or_else(|| site.span.clone(), |binding| binding.call_span.clone()),
                 file: site.file,
                 span: site.span,
                 require_exact_call: matches!(binding, SelectorBinding::MatchedValue),
@@ -4013,7 +5379,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 retained_incomplete_result_contract_query: site
                     .retained_incomplete_result_contract_query,
             })
-            .collect())
+            .collect()
     }
 
     fn resolve_selection(
@@ -4034,9 +5400,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                     contract.result_ordinal
                 )));
             }
-            if contract.success_guard_coverage.is_exhaustive()
-                && contract.success_guard_edges.is_empty()
-            {
+            if selection.has_no_result_activation() {
                 return Ok(Vec::new());
             }
             if !contract.success_guard_coverage.is_exhaustive()
@@ -4174,6 +5538,18 @@ impl<'a> TypestatePolicyCompiler<'a> {
         }
         let (value, observation_point, role) =
             select_value(&procedure, &call, &selection.span, effective_binding, phase)?;
+        let selected_port = match effective_binding {
+            SelectorBinding::Receiver => Some(TypestateEventPort::Receiver),
+            SelectorBinding::ArgumentIndex(ordinal) => {
+                Some(TypestateEventPort::Argument { ordinal: *ordinal })
+            }
+            SelectorBinding::ReturnValue => Some(TypestateEventPort::Result { ordinal: None }),
+            SelectorBinding::ResultIndex(ordinal) => Some(TypestateEventPort::Result {
+                ordinal: Some(*ordinal),
+            }),
+            SelectorBinding::MatchedValue => None,
+            SelectorBinding::ArgumentName(_) => unreachable!("formal-name bindings resolve first"),
+        };
         let oracle = self.selectors.workspace().semantic_oracle_provider();
         let at_point = ValueAtPoint::new(
             value,
@@ -4186,77 +5562,147 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 error.to_string(),
             ))
         })?;
-        let continuation = self
-            .selectors
-            .continue_semantic(|request| oracle.pointees(&at_point, request))
-            .map_err(typestate_selector_error)?;
-        require_uninterrupted_semantic_outcome(continuation.outcome(), "heap analysis")?;
-        self.selectors
-            .require_execution_budget("heap analysis")
-            .map_err(typestate_selector_error)?;
-        let result = continuation.outcome().available_value().ok_or_else(|| {
-            TypestatePolicyCompileError::SemanticUnavailable(
-                "heap analysis produced no object candidates".to_owned(),
+        let owned_receiver_query = matches!(effective_binding, SelectorBinding::Receiver)
+            && matches!(
+                phase,
+                Some(
+                    EndpointObservationPhase::AfterNormalReturn
+                        | EndpointObservationPhase::AfterExceptionalReturn
+                )
             )
-        })?;
-        if result.objects().candidates().is_empty() {
-            return Err(TypestatePolicyCompileError::SemanticUnavailable(
-                "selected value has no structured abstract object".to_owned(),
-            ));
-        }
-        let multiplicity = TypestateBindingMultiplicity::new(
-            result.objects().coverage(),
-            result.objects().candidates().len(),
-        )
-        .map_err(TypestatePolicyCompileError::BindingPlan)?;
-        let reviewed_fresh_result = selection
-            .result_contract
+            && procedure.artifact().key().language() == SemanticLanguage::Standard(Language::Rust);
+        let mut owned_continuation = if owned_receiver_query {
+            let workspace = self.selectors.workspace();
+            let discovery = WorkspaceCompositionDiscovery::new(
+                workspace,
+                WorkspaceValueFlowProvider::new(workspace, ValueFlowCache::default()),
+            );
+            Some(
+                self.selectors
+                    .continue_semantic(|request| {
+                        let value = brokk_bifrost_flow::typestate::ordered::selected_owned_receiver_event_object(
+                            &discovery,
+                            &procedure,
+                            &call,
+                            at_point.context(),
+                            request,
+                        )?;
+                        Ok(SemanticOutcome::Complete {
+                            value,
+                            work: SemanticWork::default(),
+                        })
+                    })
+                    .map_err(typestate_selector_error)?,
+            )
+        } else {
+            None
+        };
+        let owned_receiver = owned_continuation
             .as_ref()
-            .is_some_and(|contract| contract.fresh_allocation);
-        let exact_call_result_identity = result.objects().candidates().len() == 1
-            && result.objects().candidates()[0].value().identity()
-                == &AccessPathRoot::Value(at_point.value().clone());
-        let modeled_fresh_result =
-            self.authored_external_summary_fresh_result_for_call(selection, &call);
-        let fresh_result_identity = (reviewed_fresh_result || modeled_fresh_result)
-            && matches!(&selection.proof, ProofStatus::Proven)
-            && matches!(&selection.completeness, EvidenceCompleteness::Complete)
-            && exact_call_result_identity;
-        if reviewed_fresh_result && !fresh_result_identity {
-            if !selection.retained_incomplete_result_contract_query {
-                self.binding_omissions.push(format!(
-                    "{}:{}..{} reviewed fresh-allocation result does not have Proven+Complete evidence for one exact call-result identity",
-                    selection.file, selection.span.start, selection.span.end
+            .and_then(|continuation| continuation.outcome().available_value())
+            .and_then(Option::as_ref)
+            .cloned();
+        if owned_receiver.is_none()
+            && let Some(continuation) = owned_continuation.take()
+        {
+            continuation
+                .finish_scalar((), "selected receiver event object")
+                .map_err(typestate_selector_error)?;
+        }
+        let mut heap_continuation = None;
+        let (objects, coverage, multiplicity, fresh_result_identity) = if let Some((
+            object,
+            quality,
+        )) = owned_receiver
+        {
+            let quality = TypestateBindingQuality::new(
+                conjoin_proof(&selection.proof, quality.proof()),
+                conjoin_completeness(&selection.completeness, quality.completeness()),
+                quality.multiplicity(),
+            );
+            let multiplicity = quality.multiplicity();
+            (
+                vec![ResolvedObject { object, quality }],
+                CandidateCoverage::Exhaustive,
+                multiplicity,
+                false,
+            )
+        } else {
+            let continuation = self
+                .selectors
+                .continue_semantic(|request| oracle.pointees(&at_point, request))
+                .map_err(typestate_selector_error)?;
+            require_uninterrupted_semantic_outcome(continuation.outcome(), "heap analysis")?;
+            self.selectors
+                .require_execution_budget("heap analysis")
+                .map_err(typestate_selector_error)?;
+            let result = continuation.outcome().available_value().ok_or_else(|| {
+                TypestatePolicyCompileError::SemanticUnavailable(
+                    "heap analysis produced no object candidates".to_owned(),
+                )
+            })?;
+            if result.objects().candidates().is_empty() {
+                return Err(TypestatePolicyCompileError::SemanticUnavailable(
+                    "selected value has no structured abstract object".to_owned(),
                 ));
             }
-            continuation
-                .finish_scalar((), "heap analysis")
-                .map_err(typestate_selector_error)?;
-            return Ok(None);
-        }
-        let effective_multiplicity = if fresh_result_identity {
-            TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1)
-                .expect("one exact fresh result is valid multiplicity")
-        } else {
-            multiplicity
+            let multiplicity = TypestateBindingMultiplicity::new(
+                result.objects().coverage(),
+                result.objects().candidates().len(),
+            )
+            .map_err(TypestatePolicyCompileError::BindingPlan)?;
+            let reviewed_fresh_result = selection
+                .result_contract
+                .as_ref()
+                .is_some_and(|contract| contract.fresh_allocation);
+            let exact_call_result_identity = result.objects().candidates().len() == 1
+                && result.objects().candidates()[0].value().identity()
+                    == &AccessPathRoot::Value(at_point.value().clone());
+            let modeled_fresh_result =
+                self.authored_external_summary_fresh_result_for_call(selection, &call);
+            let fresh_result_identity = (reviewed_fresh_result || modeled_fresh_result)
+                && matches!(&selection.proof, ProofStatus::Proven)
+                && matches!(&selection.completeness, EvidenceCompleteness::Complete)
+                && exact_call_result_identity;
+            if reviewed_fresh_result && !fresh_result_identity {
+                if !selection.retained_incomplete_result_contract_query {
+                    self.binding_omissions.push(format!(
+                            "{}:{}..{} reviewed fresh-allocation result does not have Proven+Complete evidence for one exact call-result identity",
+                            selection.file, selection.span.start, selection.span.end
+                        ));
+                }
+                continuation
+                    .finish_scalar((), "heap analysis")
+                    .map_err(typestate_selector_error)?;
+                return Ok(None);
+            }
+            let effective_multiplicity = if fresh_result_identity {
+                TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1)
+                    .expect("one exact fresh result is valid multiplicity")
+            } else {
+                multiplicity
+            };
+            let objects = result
+                .objects()
+                .candidates()
+                .iter()
+                .map(|candidate| ResolvedObject {
+                    object: candidate.value().clone(),
+                    quality: if fresh_result_identity {
+                        TypestateBindingQuality::proven_unique()
+                    } else {
+                        TypestateBindingQuality::new(
+                            conjoin_proof(&selection.proof, candidate.proof()),
+                            conjoin_completeness(&selection.completeness, candidate.completeness()),
+                            effective_multiplicity,
+                        )
+                    },
+                })
+                .collect();
+            let coverage = result.objects().coverage();
+            heap_continuation = Some(continuation);
+            (objects, coverage, multiplicity, fresh_result_identity)
         };
-        let objects = result
-            .objects()
-            .candidates()
-            .iter()
-            .map(|candidate| ResolvedObject {
-                object: candidate.value().clone(),
-                quality: if fresh_result_identity {
-                    TypestateBindingQuality::proven_unique()
-                } else {
-                    TypestateBindingQuality::new(
-                        conjoin_proof(&selection.proof, candidate.proof()),
-                        conjoin_completeness(&selection.completeness, candidate.completeness()),
-                        effective_multiplicity,
-                    )
-                },
-            })
-            .collect();
         let mut activation_edges = Vec::new();
         if let Some(contract) = &selection.result_contract {
             let resolve_edge =
@@ -4294,12 +5740,14 @@ impl<'a> TypestatePolicyCompiler<'a> {
         }
         let resolved = ResolvedSelection {
             procedure,
+            selected_operand: selected_port
+                .map(|port| TypestateSelectedOperand::new(call.clone(), port)),
             call: Some(call),
             observation_point,
             role,
             objects,
             observation: at_point,
-            coverage: result.objects().coverage(),
+            coverage,
             multiplicity,
             activation_edges,
             member_contracts: selection
@@ -4314,16 +5762,31 @@ impl<'a> TypestatePolicyCompiler<'a> {
             retained_incomplete_result_contract_query: selection
                 .retained_incomplete_result_contract_query,
         };
-        if !resolved.retained_artifact_coverage(|artifact| continuation.contains_exact(artifact)) {
+        if !resolved.retained_artifact_coverage(|artifact| {
+            owned_continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.contains_exact(artifact))
+                || heap_continuation
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.contains_exact(artifact))
+        }) {
             return Err(TypestatePolicyCompileError::SemanticUnavailable(
                 "heap analysis produced identity-bearing handles outside its bounded complete-artifact window"
                     .to_owned(),
             ));
         }
-        let outcome = continuation
-            .commit(&mut self.selectors, "heap analysis")
-            .map_err(typestate_selector_error)?;
-        drop(outcome);
+        if let Some(continuation) = owned_continuation {
+            let outcome = continuation
+                .commit(&mut self.selectors, "selected receiver event object")
+                .map_err(typestate_selector_error)?;
+            drop(outcome);
+        }
+        if let Some(continuation) = heap_continuation {
+            let outcome = continuation
+                .commit(&mut self.selectors, "heap analysis")
+                .map_err(typestate_selector_error)?;
+            drop(outcome);
+        }
         Ok(Some(resolved))
     }
 
@@ -4387,6 +5850,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
         let resolved = ResolvedSelection {
             procedure: observation.query().point().procedure().clone(),
             call: None,
+            selected_operand: None,
             observation_point: observation.query().point().clone(),
             role: TypestateObjectRole::MatchedValue,
             objects,
@@ -4717,6 +6181,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
         &mut self,
         resolved: &ResolvedSelection,
         subjects: &[&CompiledTypestateSubject],
+        event: &str,
+        phase: &str,
+        site: &TypestateObservationSite,
     ) -> Result<Vec<TypestateSubjectKey>, TypestatePolicyCompileError> {
         if resolved.coverage.is_exhaustive() || subjects.is_empty() {
             return Ok(Vec::new());
@@ -4737,6 +6204,15 @@ impl<'a> TypestatePolicyCompiler<'a> {
             let Some(candidate) =
                 access_path_at_observation(resolved, subject.object.identity().clone(), limits)
             else {
+                self.unproven_relations.push(UnprovenEventRelation {
+                    subject: subject.key.clone(),
+                    site: site.clone(),
+                    event: event.to_owned(),
+                    phase: phase.to_owned(),
+                    exit: None,
+                    observation_procedure: resolved.procedure.semantics().locator().clone(),
+                    reason: "subject access path unavailable at observation".to_owned(),
+                });
                 continue;
             };
             let query = AliasQuery::new(observed.clone(), candidate)
@@ -4758,6 +6234,15 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 .available_value()
                 .map(|result| *result.answer().value())
             else {
+                self.unproven_relations.push(UnprovenEventRelation {
+                    subject: subject.key.clone(),
+                    site: site.clone(),
+                    event: event.to_owned(),
+                    phase: phase.to_owned(),
+                    exit: None,
+                    observation_procedure: resolved.procedure.semantics().locator().clone(),
+                    reason: "alias answer unavailable".to_owned(),
+                });
                 continue;
             };
             let answer = continuation
@@ -5494,10 +6979,55 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         let CallArgumentEndpoint::Value(actual) = mapping.value().actual() else {
                             continue;
                         };
+                        // An Address names the borrow value, while this close
+                        // contract asks which resource was borrowed. Use its
+                        // unique, proven structured source. A missing or
+                        // competing association cannot discharge an object.
+                        let referent = if call
+                            .procedure()
+                            .semantics()
+                            .value(actual.id())
+                            .is_some_and(|row| row.kind == SemanticValueKind::Address)
+                        {
+                            let mut associations = call
+                                .procedure()
+                                .semantics()
+                                .points()
+                                .iter()
+                                .flat_map(|point| &point.events)
+                                .filter(|event| {
+                                    matches!(event.effect, SemanticEffect::Assignment { target, .. } if target == actual.id())
+                                });
+                            match (associations.next(), associations.next()) {
+                                (Some(event), None)
+                                    if call
+                                        .procedure()
+                                        .semantics()
+                                        .evidence_row(event.evidence)
+                                        .is_some_and(|evidence| {
+                                            evidence.proof.establishes_complete_evidence(
+                                                &evidence.completeness,
+                                            )
+                                        }) =>
+                                {
+                                    let SemanticEffect::Assignment { value, .. } = event.effect
+                                    else {
+                                        unreachable!("selected assignment has an assignment effect")
+                                    };
+                                    call.procedure().value_handle(value)
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            Some(actual.clone())
+                        };
+                        let Some(referent) = referent else {
+                            continue;
+                        };
                         let same_formal = formal_parameter.as_ref().is_some_and(|parameter| {
-                            (actual.procedure() == parameter.procedure()
-                                && actual.id() == parameter.id())
-                                || forwarded_formal_values.contains(actual)
+                            (referent.procedure() == parameter.procedure()
+                                && referent.id() == parameter.id())
+                                || forwarded_formal_values.contains(&referent)
                         });
                         let exact = if same_formal {
                             // A complete call binding that forwards this exact
@@ -5507,7 +7037,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                             true
                         } else {
                             let at_point = ValueAtPoint::new(
-                                actual.clone(),
+                                referent,
                                 point.clone(),
                                 ObservationPhase::BeforeEffects,
                                 OracleCallContext::empty(),
@@ -5630,8 +7160,10 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                 quality: TypestateBindingQuality::proven_unique(),
                                 endpoint: None,
                                 modeled_external_effect: None,
+                                semantic_effect: release.semantic_effect.clone(),
                                 condition: None,
                                 alias_derived: false,
+                                selected_operand: None,
                             });
                         }
                     } else if let Some(reason) = close_contract_reason(&binding.formal, &contract) {
@@ -5708,6 +7240,9 @@ impl SelectorBinding {
 struct SelectedSite {
     file: ProjectFile,
     span: ByteRange<usize>,
+    /// The selected call's whole span when the row binds an argument of it,
+    /// so a subject verdict names the call, as an undecided candidate does.
+    subject_span: ByteRange<usize>,
     require_exact_call: bool,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
@@ -5718,6 +7253,15 @@ struct SelectedSite {
     /// This row came from a query that already contributes the selector-level
     /// run-incomplete diagnostic for retained result-contract evidence.
     retained_incomplete_result_contract_query: bool,
+}
+
+impl SelectedSite {
+    fn has_no_result_activation(&self) -> bool {
+        self.result_contract.as_ref().is_some_and(|contract| {
+            contract.success_guard_coverage.is_exhaustive()
+                && contract.success_guard_edges.is_empty()
+        })
+    }
 }
 
 fn conjoin_proof(left: &ProofStatus, right: &ProofStatus) -> ProofStatus {
@@ -5801,6 +7345,7 @@ struct PendingSubjectBinding {
     endpoint: ResolvedEndpointIdentity,
     root: ProcedureHandle,
     site: TypestateObservationSite,
+    selected_site: (ProjectFile, ByteRange<usize>),
     activation_edge: Option<brokk_bifrost_analysis::analyzer::semantic::ControlEdgeHandle>,
     role: TypestateObjectRole,
     object: AbstractObject,
@@ -5850,6 +7395,7 @@ fn reduce_subject_bindings(
     Ok(reduced)
 }
 
+#[derive(Clone)]
 struct PendingEventBinding {
     event: ProtocolEventKey,
     policy_event: PolicyTypestateEventId,
@@ -5861,11 +7407,55 @@ struct PendingEventBinding {
     quality: TypestateBindingQuality,
     endpoint: Option<ResolvedEndpointIdentity>,
     modeled_external_effect: Option<String>,
+    semantic_effect: Option<Arc<str>>,
     condition: Option<TypestateEventCondition>,
     alias_derived: bool,
+    selected_operand: Option<TypestateSelectedOperand>,
 }
 
 impl<'a> TypestatePolicyCompiler<'a> {
+    fn selected_template_target(
+        &mut self,
+        call: &CallSiteHandle,
+    ) -> Result<Option<(SemanticArtifactKey, ProcedureId)>, TypestatePolicyCompileError> {
+        let key = call.durable_key();
+        if let Some(target) = self.selected_template_targets.get(&key) {
+            return Ok(target.clone());
+        }
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
+        let continuation = self
+            .selectors
+            .continue_semantic(|request| oracle.resolve_call(call, request))
+            .map_err(typestate_selector_error)?;
+        require_uninterrupted_semantic_outcome(
+            continuation.outcome(),
+            "typestate template dispatch",
+        )?;
+        self.selectors
+            .require_execution_budget("typestate template dispatch")
+            .map_err(typestate_selector_error)?;
+        let target = continuation
+            .outcome()
+            .is_complete()
+            .then(|| continuation.outcome().available_value())
+            .flatten()
+            .filter(|dispatch| {
+                dispatch.coverage() == CandidateCoverage::Exhaustive
+                    && dispatch.boundaries().is_empty()
+            })
+            .and_then(|dispatch| match dispatch.candidates() {
+                [candidate] if matches!(candidate.proof(), ProofStatus::Proven) => {
+                    Some(candidate.target().durable_key())
+                }
+                _ => None,
+            });
+        continuation
+            .finish_scalar((), "typestate template dispatch")
+            .map_err(typestate_selector_error)?;
+        self.selected_template_targets.insert(key, target.clone());
+        Ok(target)
+    }
+
     fn modeled_external_effect_id(
         &self,
         subject: &CompiledTypestateSubject,
@@ -5873,6 +7463,12 @@ impl<'a> TypestatePolicyCompiler<'a> {
         phase: EndpointObservationPhase,
     ) -> Option<String> {
         if phase != EndpointObservationPhase::AfterNormalReturn {
+            return None;
+        }
+        if self
+            .authored_external_summary(selection)
+            .is_some_and(|selected| !selected.record.lifecycle_coverage().is_empty())
+        {
             return None;
         }
         if let Some(effect_id) = self.authored_external_summary_effect(selection) {
@@ -5906,7 +7502,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
     fn authored_external_summary(
         &self,
         selection: &ResolvedSelection,
-    ) -> Option<Arc<CompiledProcedureSummary>> {
+    ) -> Option<ActivatedProcedureSummary> {
         let call = selection.call.as_ref()?;
         self.authored_external_summary_for_call(
             selection.modeled_target_origin,
@@ -5920,28 +7516,37 @@ impl<'a> TypestatePolicyCompiler<'a> {
         modeled_target_origin: Option<&'static str>,
         modeled_member_id: Option<&str>,
         call: &CallSiteHandle,
-    ) -> Option<Arc<CompiledProcedureSummary>> {
+    ) -> Option<ActivatedProcedureSummary> {
         if modeled_target_origin != Some("semantic_model") {
             return None;
         }
         let member_id = modeled_member_id?;
         let active = self.active_semantic_models.as_deref()?;
-        let members = active.members_with_id(member_id);
-        let [member] = members.records.as_slice() else {
-            return None;
-        };
-        let owners = active.types_with_id(&member.record.owner);
-        let [owner] = owners.records.as_slice() else {
-            return None;
-        };
-        let semantic_call = call.procedure().semantics().call_site(call.id())?;
-        let parameter_count = u32::try_from(semantic_call.arguments.len()).ok()?;
         let language = call
             .procedure()
             .artifact()
             .key()
             .language()
             .semantic_pack_label();
+        let realm = brokk_bifrost_analysis::analyzer::semantic_pack_realm(language);
+        let mut members = active.members_with_id(member_id);
+        members.records.retain(|record| {
+            brokk_bifrost_analysis::analyzer::semantic_pack_realm(&record.shard.manifest.language)
+                == realm
+        });
+        let [member] = members.records.as_slice() else {
+            return None;
+        };
+        let mut owners = active.types_with_id(&member.record.owner);
+        owners.records.retain(|record| {
+            brokk_bifrost_analysis::analyzer::semantic_pack_realm(&record.shard.manifest.language)
+                == realm
+        });
+        let [owner] = owners.records.as_slice() else {
+            return None;
+        };
+        let semantic_call = call.procedure().semantics().call_site(call.id())?;
+        let parameter_count = u32::try_from(semantic_call.arguments.len()).ok()?;
         let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
             language,
             &owner.record.name,
@@ -5960,7 +7565,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
         {
             return None;
         }
-        Some(Arc::clone(&summary.record))
+        Some(summary.clone())
     }
 
     fn authored_external_summary_fresh_result_for_call(
@@ -5974,7 +7579,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             call,
         )
         .is_some_and(|summary| {
-            summary.effects.iter().any(|effect| {
+            summary.record.effects.iter().any(|effect| {
                 matches!(
                     effect,
                     CompiledSummaryEffect::Allocation {
@@ -5991,6 +7596,13 @@ impl<'a> TypestatePolicyCompiler<'a> {
     /// behavior.
     fn authored_external_summary_effect(&self, selection: &ResolvedSelection) -> Option<String> {
         let summary = self.authored_external_summary(selection)?;
+        // A participating record must be checked per exit against its claim.
+        // The legacy marker closes a whole boundary and is valid only for a
+        // record with no lifecycle coverage claims at all.
+        if !summary.record.lifecycle_coverage().is_empty() {
+            return None;
+        }
+        let summary = &summary.record;
         let receiver_identity = summary.transfers.iter().any(|transfer| {
             transfer.exit_kind == CompiledSummaryExitKind::Normal
                 && matches!(transfer.input, CompiledSummaryInput::Receiver {})
@@ -6006,6 +7618,141 @@ impl<'a> TypestatePolicyCompiler<'a> {
     }
 }
 
+fn same_coverage_selection(
+    left: &Option<(ActivatedProcedureSummary, String)>,
+    right: &Option<(ActivatedProcedureSummary, String)>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some((left, left_member)), Some((right, right_member))) => {
+            left_member == right_member
+                && left.record.id == right.record.id
+                && left.record.model_id == right.record.model_id
+                && left.record.content_sha256 == right.record.content_sha256
+                && left.shard.manifest.pack_id == right.shard.manifest.pack_id
+                && left.shard.manifest.content_sha256 == right.shard.manifest.content_sha256
+                && left.shard.descriptor.shard_id == right.shard.descriptor.shard_id
+                && left.shard.descriptor.content_sha256 == right.shard.descriptor.content_sha256
+        }
+        _ => false,
+    }
+}
+
+/// Compile-root adjudication of one selected call, subject, and exit. S4-R
+/// must supply a full #9378 selected-receiver reference certificate before a
+/// participating record can ever close uncertainty; this slice produces only
+/// named refusals. The order below is stable so the first failed obligation
+/// is the published reason.
+fn adjudicate_lifecycle_coverage(
+    call: &CallSiteHandle,
+    site: &TypestateObservationSite,
+    selected: Option<&ActivatedProcedureSummary>,
+    record: Option<CoverageRecordKey>,
+    event_set: &TypestateEventSetSpec,
+    exit: AuthoredSummaryExitKind,
+    group: Option<&CoverageCandidateGroupSpec>,
+) -> CoverageDecisionKind {
+    use CoverageRefusalReason as Reason;
+    let Some(selected) = selected else {
+        return CoverageDecisionKind::Refused {
+            reason: Reason::MissingSelectedRecord,
+            record,
+        };
+    };
+    let mut record = record.expect("selected summary has record provenance");
+    if site.context() != &TypestateBindingContext::root() || site.context().was_truncated() {
+        return CoverageDecisionKind::Refused {
+            reason: Reason::MissingContext,
+            record: Some(record),
+        };
+    }
+    if selected.record.lifecycle_coverage().is_empty() {
+        return CoverageDecisionKind::Unclaimed { record };
+    }
+    let Some(claim) = selected
+        .record
+        .lifecycle_coverage()
+        .iter()
+        .find(|claim| {
+            claim.exit == exit
+                && claim.event_set.name == event_set.name
+                && claim.event_set.version == event_set.version
+                && claim.event_set.effects == event_set.effects
+        })
+        .or_else(|| {
+            selected
+                .record
+                .lifecycle_coverage()
+                .iter()
+                .find(|claim| claim.exit == exit)
+        })
+    else {
+        return CoverageDecisionKind::Refused {
+            reason: Reason::MissingClaim,
+            record: Some(record),
+        };
+    };
+    record.claim_id = Some(claim.id.clone());
+    record.witness_ids = claim.witnesses.clone();
+    let reason = if claim.event_set.name != event_set.name
+        || claim.event_set.version != event_set.version
+        || claim.event_set.effects != event_set.effects
+    {
+        Some(Reason::EventSetMismatch)
+    } else if claim.subject != AuthoredCoverageSubject::Receiver {
+        Some(Reason::SubjectMismatch)
+    } else {
+        let semantic_call = call.procedure().semantics().call_site(call.id());
+        if semantic_call.is_none_or(|call| call.receiver.is_none() || !call.arguments.is_empty()) {
+            Some(Reason::ExtraActual)
+        } else {
+            let candidates = group.map_or(&[][..], |group| group.candidates.as_slice());
+            if candidates.len() > 1 {
+                Some(Reason::MultipleCandidates)
+            } else if candidates
+                .first()
+                .is_some_and(|candidate| !candidate.is_definitive())
+            {
+                Some(Reason::CandidateUnproven)
+            } else if candidates
+                .first()
+                .is_some_and(|candidate| candidate.semantic_effect.is_none())
+            {
+                Some(Reason::UnmappedCandidate)
+            } else if candidates.len() != claim.witnesses.len() {
+                Some(Reason::WitnessCountMismatch)
+            } else if let (Some(candidate), Some(witness_id)) =
+                (candidates.first(), claim.witnesses.first())
+            {
+                let witness = selected
+                    .record
+                    .subject_effects()
+                    .iter()
+                    .find(|witness| &witness.id == witness_id)
+                    .expect("validated claim witness resolves");
+                if candidate.semantic_effect.as_deref() != Some(witness.effect.as_str())
+                    || witness.subject != AuthoredCoverageSubject::Receiver
+                    || witness.exit != exit
+                {
+                    Some(Reason::WitnessEffectMismatch)
+                } else if witness.certainty != CompiledDeclaredEffectCertainty::Definite
+                    || witness.timing != CompiledDeclaredEffectTiming::Immediate
+                {
+                    Some(Reason::WitnessNotDefinite)
+                } else {
+                    Some(Reason::ReceiverTransportUnproven)
+                }
+            } else {
+                Some(Reason::ReceiverTransportUnproven)
+            }
+        }
+    };
+    CoverageDecisionKind::Refused {
+        reason: reason.expect("participating record cannot be Covered before S4-R"),
+        record: Some(record),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum EventObservationPhase {
     AnalysisRoot(PolicySemanticEvent),
@@ -6017,6 +7764,51 @@ struct EventObservationGroupKey {
     subject: TypestateSubjectKey,
     site: TypestateObservationSite,
     phase: EventObservationPhase,
+    selected_operand: Option<TypestateSelectedOperand>,
+}
+
+fn coverage_candidate_phase(phase: EventObservationPhase) -> CoverageCandidatePhase {
+    match phase {
+        EventObservationPhase::Endpoint(EndpointObservationPhase::AtMatch) => {
+            CoverageCandidatePhase::AtMatch
+        }
+        EventObservationPhase::Endpoint(EndpointObservationPhase::BeforeCall) => {
+            CoverageCandidatePhase::BeforeCall
+        }
+        EventObservationPhase::Endpoint(EndpointObservationPhase::AfterNormalReturn) => {
+            CoverageCandidatePhase::AfterNormalReturn
+        }
+        EventObservationPhase::Endpoint(EndpointObservationPhase::AfterExceptionalReturn) => {
+            CoverageCandidatePhase::AfterExceptionalReturn
+        }
+        EventObservationPhase::AnalysisRoot(PolicySemanticEvent::NormalProcedureExit {
+            ..
+        }) => CoverageCandidatePhase::NormalProcedureExit,
+        EventObservationPhase::AnalysisRoot(PolicySemanticEvent::ExceptionalProcedureExit {
+            ..
+        }) => CoverageCandidatePhase::ExceptionalProcedureExit,
+        EventObservationPhase::AnalysisRoot(PolicySemanticEvent::SuspensionBoundary { .. }) => {
+            CoverageCandidatePhase::SuspensionBoundary
+        }
+    }
+}
+
+fn record_coverage_candidate(
+    groups: &mut HashMap<EventObservationGroupKey, Vec<CoverageCandidateSpec>>,
+    binding: &PendingEventBinding,
+) {
+    let key = EventObservationGroupKey {
+        subject: binding.subject.clone(),
+        site: binding.site.clone(),
+        phase: binding.phase,
+        selected_operand: None,
+    };
+    groups.entry(key).or_default().push(CoverageCandidateSpec {
+        event: binding.policy_event.as_str().to_owned(),
+        semantic_effect: binding.semantic_effect.clone(),
+        quality: binding.quality.clone(),
+        alias_derived: binding.alias_derived,
+    });
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -6026,6 +7818,7 @@ struct EventProvenanceKey {
     site: TypestateObservationSite,
     order: u32,
     role: TypestateObjectRole,
+    selected_operand: Option<TypestateSelectedOperand>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -6244,6 +8037,7 @@ fn reduce_event_bindings(
             subject: candidate.subject.clone(),
             site: candidate.site.clone(),
             phase: candidate.phase,
+            selected_operand: candidate.selected_operand.clone(),
         },
         |candidate| candidate.policy_event.clone(),
         |candidate| candidate.endpoint.clone(),
@@ -6264,6 +8058,50 @@ fn reduce_event_bindings(
         },
         "precedence winner belongs to the reduced event candidates",
     )
+}
+
+/// A template with undecidable same-site authority is absent. Its guarded
+/// consumer then keeps the old uncertain bypass instead of choosing a peer.
+fn reduce_event_template_bindings(
+    candidates: Vec<PendingEventBinding>,
+    endpoint_precedence: &PrecedenceGraph<ResolvedEndpointIdentity>,
+    event_precedence: &PrecedenceGraph<PolicyTypestateEventId>,
+) -> Vec<PendingEventBinding> {
+    let mut groups = HashMap::<EventObservationGroupKey, Vec<PendingEventBinding>>::new();
+    for candidate in candidates {
+        groups
+            .entry(EventObservationGroupKey {
+                subject: candidate.subject.clone(),
+                site: candidate.site.clone(),
+                phase: candidate.phase,
+                selected_operand: candidate.selected_operand.clone(),
+            })
+            .or_default()
+            .push(candidate);
+    }
+    groups
+        .into_values()
+        .filter_map(|group| {
+            let winner =
+                reduce_event_bindings(group.clone(), endpoint_precedence, event_precedence)
+                    .ok()
+                    .and_then(|mut winners| winners.pop())?;
+            // Precedence chooses an event and endpoint, not one of several
+            // incompatible evidence qualities for that same meaning.
+            let consistent = group
+                .iter()
+                .filter(|candidate| {
+                    candidate.policy_event == winner.policy_event
+                        && candidate.endpoint == winner.endpoint
+                })
+                .all(|candidate| {
+                    candidate.quality == winner.quality
+                        && candidate.condition == winner.condition
+                        && candidate.modeled_external_effect == winner.modeled_external_effect
+                });
+            consistent.then_some(winner)
+        })
+        .collect()
 }
 
 fn reduce_terminal_bindings(
@@ -6370,6 +8208,7 @@ fn may_alias_quality(multiplicity: TypestateBindingMultiplicity) -> TypestateBin
 struct ResolvedSelection {
     procedure: ProcedureHandle,
     call: Option<CallSiteHandle>,
+    selected_operand: Option<TypestateSelectedOperand>,
     observation_point: ProgramPointHandle,
     role: TypestateObjectRole,
     objects: Vec<ResolvedObject>,
@@ -6466,7 +8305,25 @@ fn select_calls(
                 .source_mapping(call.source)
                 .expect("validated semantic call has a source mapping");
             let span = mapping.locator.anchor().span();
-            let call_range = span.start_byte() as usize..span.end_byte() as usize;
+            let mut call_range = span.start_byte() as usize..span.end_byte() as usize;
+            // A deferred implicit call can have a narrower dispatch anchor than
+            // its structural cleanup point. ResourceRelease selectors still
+            // identify that point, including every close in a multi-resource try.
+            if call.member_selection.is_some() {
+                let point = procedure
+                    .semantics()
+                    .point(call.point)
+                    .expect("validated semantic call has a program point");
+                let point_mapping = procedure
+                    .semantics()
+                    .source_mapping(point.source)
+                    .expect("validated semantic point has a source mapping");
+                let point_span = point_mapping.locator.anchor().span();
+                let point_range = point_span.start_byte() as usize..point_span.end_byte() as usize;
+                if point_range == selection.span {
+                    call_range = point_range;
+                }
+            }
             let exact = call_range == selection.span;
             let enclosing =
                 call_range.start <= selection.span.start && call_range.end >= selection.span.end;
@@ -6687,6 +8544,65 @@ pub(crate) fn compile_protocol(
     spec: &ResolvedTypestatePolicySpec,
 ) -> Result<CompiledProtocol, TypestatePolicyCompileError> {
     let automaton = &spec.automaton;
+    if let Some(set) = &automaton.event_set {
+        if !valid_coverage_effect_id(&set.name)
+            || set.version == 0
+            || set.effects.is_empty()
+            || set
+                .effects
+                .iter()
+                .any(|effect| !valid_coverage_effect_id(effect))
+        {
+            return Err(TypestatePolicyCompileError::InvalidEventSet(
+                "invalid-event-set-identity",
+            ));
+        }
+        if !automaton
+            .events
+            .iter()
+            .any(|event| event.semantic_effect.is_some())
+        {
+            return Err(TypestatePolicyCompileError::InvalidEventSet(
+                "event-set-without-mapped-event",
+            ));
+        }
+        for event in &automaton.events {
+            if let Some(effect) = &event.semantic_effect {
+                if !valid_coverage_effect_id(effect) {
+                    return Err(TypestatePolicyCompileError::InvalidEventSet(
+                        "invalid-semantic-effect-id",
+                    ));
+                }
+                if !set.effects.contains(effect) {
+                    return Err(TypestatePolicyCompileError::InvalidEventSet(
+                        "semantic-effect-outside-event-set",
+                    ));
+                }
+            }
+        }
+    } else if automaton
+        .events
+        .iter()
+        .any(|event| event.semantic_effect.is_some())
+    {
+        return Err(TypestatePolicyCompileError::InvalidEventSet(
+            "missing-event-set",
+        ));
+    }
+    if automaton.events.iter().any(|event| {
+        event.semantic_effect.is_some()
+            && matches!(
+                &event.trigger,
+                ResolvedTypestateEventTrigger::Calls {
+                    argument_condition: Some(_),
+                    ..
+                }
+            )
+    }) {
+        return Err(TypestatePolicyCompileError::InvalidEventSet(
+            "conditional-semantic-effect",
+        ));
+    }
     let escape_event =
         internal_escape_event_key(automaton.events.iter().map(|event| event.id.as_str()));
     let protocol = ProtocolSpec {
@@ -6766,6 +8682,12 @@ pub(crate) fn compile_protocol(
     protocol
         .compile()
         .map_err(TypestatePolicyCompileError::Protocol)
+}
+
+fn valid_coverage_effect_id(value: &str) -> bool {
+    value.len() <= 256
+        && value.contains('.')
+        && crate::definition::is_valid_namespaced_identifier(value)
 }
 
 fn event_occurrence(trigger: &ResolvedTypestateEventTrigger) -> ProtocolEventOccurrence {
@@ -6925,6 +8847,377 @@ mod tests {
     use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
     use brokk_bifrost_test_macros::hardwon;
 
+    #[derive(Debug, Clone, Copy)]
+    enum CoverageCompileCase {
+        Baseline,
+        ExtraActual,
+        SetMismatch,
+        MissingClaim,
+        UnmappedCandidate,
+        PrecedenceDropped,
+    }
+
+    struct CoverageCompileObservation {
+        candidates: Vec<(String, Option<String>, TypestateBindingQuality)>,
+        reason: CoverageRefusalReason,
+        retained_bindings: usize,
+        plan_hash: String,
+    }
+
+    fn compile_reviewed_coverage_case(case: CoverageCompileCase) -> CoverageCompileObservation {
+        use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+            SemanticModelActivationEvidence, SemanticModelActivationRequest,
+            SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+            SessionPackSource, SessionPackSourceKind, SourceFormat, acquire_active_semantic_models,
+            compile_source,
+        };
+        use serde_json::{Value, json};
+
+        const POLICY_PATH: &str = "policies/coverage.rqlp";
+        const POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "bifrost.test.coverage-compile"
+  :name "Coverage compile"
+  :message "Resource remains open"
+  :severity error
+  :analysis (analysis
+    :type typestate
+    :mode may
+    :call-modeling (call-modeling :unmodeled paranoid)
+    :subjects (subject-set :entries [
+      (subject :id resource
+        :selector (rql :schema-version 1 (language go
+          (resolved-call :resolves-to "example.test/wire.Conn.Close" :proof declared
+            (call-bindings (call-shape (call :callee (name "Close")))))))
+        :subject receiver)])
+    :uncertainty (uncertainty :escape inconclusive)
+    :automaton (automaton
+      :states [open closed violated]
+      :initial open
+      :accepting-states [closed]
+      :error-states [violated]
+      :event-set (event-set :name "bifrost.resource-lifecycle" :version 1
+        :effects ["bifrost.resource.release"])
+      :events [
+        (event :id close :semantic-effect "bifrost.resource.release"
+          :calls (calls
+            :selector (rql :schema-version 1
+              (language go
+                (resolved-call :resolves-to "example.test/wire.Conn.Close" :proof declared
+                  (call-bindings (call-shape (call :callee (name "Close")))))))
+            :subject receiver :phase after-normal-return))]
+      :transitions [
+        (transition :from open :on close :to closed)
+        (transition :from closed :on close :to violated)]
+      :terminal-expectations [
+        (terminal-expectation :id normal-exit
+          :on (normal-procedure-exit :scope analysis-root)
+          :expected-states [closed])])))"#;
+        const GO_MOD: &str = "module example.test/network\n\ngo 1.23\n";
+        const APP: &str = "package network\nimport \"example.test/wire\"\nfunc run() {\n    conn, _ := wire.Dial(\"tcp\", \"local\")\n    conn.Close()\n}\n";
+        // Copies of the synthetic #9053 `example.test/wire` models; a public crate
+        // test must not include the private root fixture corpus.
+        let mut declarations: Value = serde_json::from_str(include_str!(
+            "../testdata/lifecycle-coverage-go/declarations.json"
+        ))
+        .unwrap();
+        let mut summaries: Value = serde_json::from_str(include_str!(
+            "../testdata/lifecycle-coverage-go/summaries.json"
+        ))
+        .unwrap();
+        summaries["schema_version"] = json!(26);
+        summaries["pack_id"] = json!("test.lifecycle-coverage-go-summaries");
+        summaries["provenance"]["source"] = json!("test-only #9431 review controls");
+        let close = summaries["shards"][0]["payload"]["summaries"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|summary| summary["id"] == "test.wire.conn.close")
+            .unwrap();
+        close["transfers"] = json!([{
+            "input":{"kind":"receiver"}, "exit_kind":"normal", "output":{"kind":"receiver"}
+        }]);
+        close["subject_effects"] = json!([{
+            "id":"release", "effect":"bifrost.resource.release",
+            "subject":"receiver", "exit":"normal", "condition":"always",
+            "timing":"immediate", "certainty":"definite"
+        }]);
+        close["lifecycle_coverage"] = json!([{
+            "id":"normal-lifecycle",
+            "event_set":{"name":"bifrost.resource-lifecycle", "version":1,
+                "effects":["bifrost.resource.release"]},
+            "subject":"receiver", "exit":"normal", "witnesses":["release"]
+        }]);
+        if matches!(case, CoverageCompileCase::SetMismatch) {
+            close["lifecycle_coverage"][0]["event_set"]["version"] = json!(2);
+        }
+        if matches!(case, CoverageCompileCase::ExtraActual) {
+            close["target"]["parameter_count"] = json!(1);
+            let member = declarations["shards"][0]["payload"]["members"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|member| member["name"] == "Close")
+                .unwrap();
+            member["signature"]["parameters"] = json!([{
+                "name":"flag", "type":{"kind":"named", "name":"int", "arguments":[], "nullable":false},
+                "optional":false, "variadic":false
+            }]);
+        }
+        let second = "(event :id close-again :semantic-effect \"bifrost.resource.release\" :calls (calls :selector (rql :schema-version 1 (language go (resolved-call :resolves-to \"example.test/wire.Conn.Close\" :proof declared (call-bindings (call-shape (call :callee (name \"Close\"))))))) :subject receiver :phase after-normal-return))";
+        let mut policy = POLICY.to_owned();
+        match case {
+            CoverageCompileCase::MissingClaim => {
+                policy = policy.replace("after-normal-return", "after-exceptional-return");
+            }
+            CoverageCompileCase::PrecedenceDropped => {
+                policy = policy.replace(
+                    ":phase after-normal-return))]",
+                    &format!(":phase after-normal-return)) {second}]"),
+                );
+                if matches!(case, CoverageCompileCase::PrecedenceDropped) {
+                    policy = policy.replace(
+                        ":phase after-normal-return)) (event :id close-again",
+                        ":phase after-normal-return) :supersedes [close-again]) (event :id close-again",
+                    );
+                }
+            }
+            CoverageCompileCase::UnmappedCandidate => {
+                policy = policy
+                    .replace(":semantic-effect \"bifrost.resource.release\"", "")
+                    .replace(
+                        ":phase after-normal-return))]",
+                        ":phase after-normal-return)) (event :id mapped-dial :semantic-effect \"bifrost.resource.release\" :calls (calls :selector (rql :schema-version 1 (language go (resolved-call :resolves-to \"example.test/wire.Dial\" :proof declared (call-bindings (call-shape (call :callee (name \"Dial\"))))))) :subject (result :index 0) :phase after-normal-return))]",
+                    )
+                    .replace(":transitions [", ":transitions [(transition :from open :on mapped-dial :to open) ");
+            }
+            CoverageCompileCase::Baseline
+            | CoverageCompileCase::ExtraActual
+            | CoverageCompileCase::SetMismatch => {}
+        }
+        let app = if matches!(case, CoverageCompileCase::ExtraActual) {
+            APP.replace("conn.Close()", "conn.Close(1)")
+        } else {
+            APP.to_owned()
+        };
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", GO_MOD)
+            .file("main.go", app)
+            .file(POLICY_PATH, policy)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        for (id, value) in [
+            ("test:coverage-declarations", declarations),
+            ("test:coverage-summaries", summaries),
+        ] {
+            let source = serde_json::to_vec(&value).unwrap();
+            let pack = compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
+                .unwrap_or_else(|diagnostics| panic!("{case:?}: {diagnostics:#?}"));
+            catalog
+                .register_session_pack(
+                    &pack,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: id.into(),
+                    },
+                )
+                .unwrap();
+        }
+        let request = SemanticModelActivationRequest {
+            approximate_standard_libraries: Vec::new(),
+            bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".into(),
+                ecosystem: "go-stdlib".into(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: [
+                "test.go-model-interface-dispatch-declarations",
+                "test.lifecycle-coverage-go-summaries",
+            ]
+            .into_iter()
+            .map(|pack_id| SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: pack_id.into(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            })
+            .collect(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let activation = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &request,
+            &CancellationToken::default(),
+        );
+        let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = activation else {
+            panic!("{case:?}: activation failed: {activation:#?}");
+        };
+        let _scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            workspace.analyzer(),
+            Some(Arc::clone(&snapshot)),
+        );
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry = PolicyRegistry::new_for_workspace(
+            project.root().to_path_buf(),
+            catalogs,
+            PolicyRegistryLimits::default(),
+        )
+        .unwrap();
+        let loaded = registry
+            .load_policy_path_with_analyzer(POLICY_PATH, workspace.analyzer())
+            .unwrap();
+        let spec = loaded.resolved_typestate().unwrap();
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let compiled = TypestatePolicyCompiler::new(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            budget.query_limits(),
+            budget.max_selector_results(),
+            &cancellation,
+            Some(snapshot),
+        )
+        .compile_with_units(loaded, spec)
+        .0
+        .unwrap_or_else(|failure| panic!("{case:?}: policy compile: {}", failure.error));
+        let binding = compiled
+            .bindings
+            .event_bindings()
+            .iter()
+            .find(|binding| {
+                compiled
+                    .protocol
+                    .event(binding.event())
+                    .unwrap()
+                    .key()
+                    .as_str()
+                    == "close"
+            })
+            .unwrap_or_else(|| panic!("{case:?}: close binding absent"));
+        let phase = if matches!(case, CoverageCompileCase::MissingClaim) {
+            CoverageCandidatePhase::AfterExceptionalReturn
+        } else {
+            CoverageCandidatePhase::AfterNormalReturn
+        };
+        let group =
+            compiled
+                .bindings
+                .coverage_candidate_group(binding.subject(), binding.site(), phase);
+        let decision = compiled
+            .bindings
+            .coverage_decision(binding.subject(), binding.site(), phase)
+            .unwrap_or_else(|| panic!("{case:?}: decision absent"));
+        let CoverageDecisionKind::Refused { reason, .. } = decision.kind() else {
+            panic!("{case:?}: expected refusal, got {:?}", decision.kind());
+        };
+        CoverageCompileObservation {
+            candidates: group
+                .map(|group| {
+                    group
+                        .candidates()
+                        .iter()
+                        .map(|candidate| {
+                            (
+                                candidate.event.clone(),
+                                candidate.semantic_effect.as_ref().map(ToString::to_string),
+                                candidate.quality.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            reason: *reason,
+            retained_bindings: compiled
+                .bindings
+                .event_bindings()
+                .iter()
+                .filter(|other| {
+                    other.subject() == binding.subject() && other.site() == binding.site()
+                })
+                .count(),
+            plan_hash: format!("{:?}", compiled.bindings.hash()),
+        }
+    }
+
+    #[test]
+    #[hardwon("#9431: handcrafted candidate groups masked a dropped real policy binding")]
+    fn compiled_coverage_groups_and_refusals_keep_the_full_candidate_set() {
+        let baseline = compile_reviewed_coverage_case(CoverageCompileCase::Baseline);
+        assert_eq!(baseline.candidates.len(), 1, "{:?}", baseline.candidates);
+        assert_eq!(baseline.reason, CoverageRefusalReason::CandidateUnproven);
+
+        let dropped = compile_reviewed_coverage_case(CoverageCompileCase::PrecedenceDropped);
+        assert_eq!(dropped.retained_bindings, 1);
+        assert_eq!(dropped.candidates.len(), 2, "{:?}", dropped.candidates);
+        assert_eq!(
+            dropped
+                .candidates
+                .iter()
+                .map(|row| row.0.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["close", "close-again"]),
+        );
+        assert!(dropped.candidates.iter().all(|row| {
+            row.1.as_deref() == Some("bifrost.resource.release")
+                && matches!(row.2.proof(), ProofStatus::Unproven(_))
+                && matches!(row.2.completeness(), EvidenceCompleteness::Partial(_))
+                && row.2.multiplicity().coverage() == CandidateCoverage::Open
+                && row.2.multiplicity().retained() == 1
+        }));
+        assert_eq!(dropped.reason, CoverageRefusalReason::MultipleCandidates);
+        assert_ne!(dropped.plan_hash, baseline.plan_hash);
+
+        for (case, expected) in [
+            (
+                CoverageCompileCase::ExtraActual,
+                CoverageRefusalReason::ExtraActual,
+            ),
+            (
+                CoverageCompileCase::SetMismatch,
+                CoverageRefusalReason::EventSetMismatch,
+            ),
+            (
+                CoverageCompileCase::MissingClaim,
+                CoverageRefusalReason::MissingClaim,
+            ),
+            (
+                CoverageCompileCase::UnmappedCandidate,
+                CoverageRefusalReason::CandidateUnproven,
+            ),
+        ] {
+            let observed = compile_reviewed_coverage_case(case);
+            assert_eq!(
+                observed.reason, expected,
+                "{case:?}: {:?}",
+                observed.candidates
+            );
+            if matches!(case, CoverageCompileCase::UnmappedCandidate) {
+                assert_eq!(observed.candidates.len(), 1);
+                assert_eq!(observed.candidates[0].1, None);
+            }
+        }
+    }
+
     /// A sliced compile mints the compile a whole compile mints.
     ///
     /// The four things a later stage of the evaluation reads out of a compile:
@@ -6934,6 +9227,7 @@ mod tests {
     /// moved any of them differently would hand the solve a different
     /// evaluation, not the same one computed a cheaper way.
     #[test]
+    #[hardwon("#9550: an unproven event relation must survive cold and replayed policy evaluation")]
     fn a_sliced_selector_compile_produces_the_compile_a_whole_one_produces() {
         const POLICY_PATH: &str = "policies/sliced-lifecycle.rqlp";
         // Two selectors over the same seed files -- the subject's and the
@@ -6963,8 +9257,17 @@ mod tests {
           :initial open
           :accepting-states [closed]
           :error-states [violated]
+          :event-set (event-set :name "test.resource-lifecycle" :version 1
+            :effects ["test.release"])
           :events [
-            (event :id close
+            (event :id close :semantic-effect "test.release"
+              :calls (calls
+                :selector (rql :schema-version 1
+                  (language go (call :callee (name "CloseRes"))))
+                :subject (argument :index 0)
+                :phase after-normal-return)
+              :supersedes [close-shadow])
+            (event :id close-shadow :semantic-effect "test.release"
               :calls (calls
                 :selector (rql :schema-version 1
                   (language go (call :callee (name "CloseRes"))))
@@ -6972,7 +9275,8 @@ mod tests {
                 :phase after-normal-return))]
           :transitions [
             (transition :from open :on close :to closed)
-            (transition :from closed :on close :to violated)]
+            (transition :from closed :on close :to violated)
+            (transition :from open :on close-shadow :to closed)]
           :terminal-expectations [
             (terminal-expectation :id normal-exit
               :on (normal-procedure-exit :scope analysis-root)
@@ -7053,6 +9357,7 @@ mod tests {
                     .analyzer()
                     .active_semantic_model_snapshot()
                     .as_deref(),
+                None,
             ),
             crate::units::IncrementalBaseState::Evaluated,
             crate::units::UnitSnapshots::of(
@@ -7097,16 +9402,345 @@ mod tests {
             ),
             "a sliced compile retains the artifact allocations a whole compile retains"
         );
+
+        // These are production selector bindings. The ordinary reduction
+        // retained the superseding close, while the coverage group retains
+        // both same-effect candidates, so a duplicate cannot look unique.
+        let close = whole
+            .bindings
+            .event_bindings()
+            .iter()
+            .find(|binding| {
+                whole
+                    .protocol
+                    .event(binding.event())
+                    .unwrap()
+                    .key()
+                    .as_str()
+                    == "close"
+            })
+            .expect("the superseding close survives reduction");
+        let group = whole
+            .bindings
+            .coverage_candidate_group(
+                close.subject(),
+                close.site(),
+                CoverageCandidatePhase::AfterNormalReturn,
+            )
+            .expect("real compile records the pre-reduction call group");
+        assert_eq!(group.candidates().len(), 2, "{:#?}", group.candidates());
+        assert!(group.candidates().iter().all(|candidate| {
+            candidate.semantic_effect.as_deref() == Some("test.release")
+                && candidate.is_definitive()
+        }));
+        assert_eq!(
+            group
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.event.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["close", "close-shadow"]),
+        );
+        assert_eq!(
+            whole
+                .bindings
+                .event_bindings()
+                .iter()
+                .filter(|binding| {
+                    binding.subject() == close.subject() && binding.site() == close.site()
+                })
+                .count(),
+            1,
+            "ordinary event reduction still keeps only its precedence winner"
+        );
+
+        // Build a competing pre-reduction group on the real call site. The
+        // reducer still chooses the same event, while the plan retains every
+        // alternative for the later coverage certificate.
+        let bound = whole
+            .bindings
+            .event_bindings()
+            .first()
+            .expect("close call is bound");
+        let subject = whole
+            .bindings
+            .subjects()
+            .iter()
+            .find(|subject| subject.id() == bound.subject())
+            .unwrap();
+        let winner = PolicyTypestateEventId::new("close").unwrap();
+        let alias = PolicyTypestateEventId::new("alias").unwrap();
+        let uncertain = PolicyTypestateEventId::new("uncertain").unwrap();
+        let unmapped = PolicyTypestateEventId::new("unmapped").unwrap();
+        let ids = [
+            winner.clone(),
+            alias.clone(),
+            uncertain.clone(),
+            unmapped.clone(),
+        ];
+        let event_graph = PrecedenceGraph::try_new(
+            ids.to_vec(),
+            [alias.clone(), uncertain.clone(), unmapped.clone()]
+                .into_iter()
+                .map(|loser| (winner.clone(), loser)),
+        )
+        .unwrap();
+        let endpoint_graph =
+            PrecedenceGraph::try_new(Vec::<ResolvedEndpointIdentity>::new(), Vec::new()).unwrap();
+        let candidates = ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| PendingEventBinding {
+                event: if index == 0 {
+                    whole.protocol.event(bound.event()).unwrap().key().clone()
+                } else {
+                    ProtocolEventKey::new(id.as_str()).unwrap()
+                },
+                policy_event: id,
+                subject: subject.key().clone(),
+                site: bound.site().clone(),
+                phase: EventObservationPhase::Endpoint(EndpointObservationPhase::AfterNormalReturn),
+                order: bound.order(),
+                role: bound.role(),
+                quality: match index {
+                    2 => TypestateBindingQuality::new(
+                        ProofStatus::Unproven("uncertain".into()),
+                        EvidenceCompleteness::Complete,
+                        TypestateBindingMultiplicity::new(CandidateCoverage::Exhaustive, 1)
+                            .unwrap(),
+                    ),
+                    _ => TypestateBindingQuality::proven_unique(),
+                },
+                endpoint: None,
+                modeled_external_effect: None,
+                semantic_effect: (index != 3).then(|| Arc::from("test.release")),
+                condition: None,
+                alias_derived: index == 1,
+                selected_operand: None,
+            })
+            .collect::<Vec<_>>();
+        let mut groups = HashMap::new();
+        for candidate in &candidates {
+            record_coverage_candidate(&mut groups, candidate);
+        }
+        let reduced = reduce_event_bindings(candidates, &endpoint_graph, &event_graph).unwrap();
+        assert_eq!(reduced.len(), 1);
+        assert_eq!(reduced[0].policy_event, winner);
+        let candidate_groups = groups
+            .into_iter()
+            .map(|(key, candidates)| CoverageCandidateGroupSpec {
+                subject: key.subject,
+                site: key.site,
+                phase: coverage_candidate_phase(key.phase),
+                candidates,
+            })
+            .collect();
+        let subject_spec = BoundTypestateSubjectSpec::new(
+            subject.key().class().clone(),
+            subject.object().clone(),
+            subject.quality().clone(),
+        );
+        let event_spec = TypestateEventBindingSpec::new(
+            reduced[0].event.clone(),
+            reduced[0].subject.clone(),
+            reduced[0].site.clone(),
+            reduced[0].order,
+            reduced[0].role,
+            reduced[0].quality.clone(),
+        )
+        .with_semantic_effect(reduced[0].semantic_effect.clone());
+        let plan = TypestateBindingPlan::try_new_with_coverage(
+            &whole.protocol,
+            vec![subject_spec.clone()],
+            Vec::new(),
+            TypestateEventBindings {
+                events: vec![event_spec.clone()],
+                templates: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+            TypestateCoverageSpec {
+                event_set: Some(TypestateCoverageEventSet {
+                    name: "test.resource".into(),
+                    version: 1,
+                    effects: vec!["test.release".into()],
+                }),
+                candidate_groups,
+                decisions: Vec::new(),
+                unproven_relations: Vec::new(),
+            },
+        )
+        .unwrap();
+        let group = plan
+            .coverage_candidate_group(
+                plan.subjects()[0].id(),
+                bound.site(),
+                CoverageCandidatePhase::AfterNormalReturn,
+            )
+            .unwrap();
+        assert_eq!(group.candidates().len(), 4);
+        assert!(
+            group
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.alias_derived && !candidate.is_definitive())
+        );
+        assert!(
+            group
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.event == "uncertain" && !candidate.is_definitive())
+        );
+        assert!(
+            group
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.semantic_effect.is_none())
+        );
+        assert_eq!(
+            plan.event_bindings()[0].semantic_effect(),
+            Some("test.release")
+        );
+        let without_group = TypestateBindingPlan::try_new_with_coverage(
+            &whole.protocol,
+            vec![subject_spec.clone()],
+            Vec::new(),
+            TypestateEventBindings {
+                events: vec![event_spec.clone()],
+                templates: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+            TypestateCoverageSpec {
+                event_set: Some(TypestateCoverageEventSet {
+                    name: "test.resource".into(),
+                    version: 1,
+                    effects: vec!["test.release".into()],
+                }),
+                candidate_groups: Vec::new(),
+                decisions: Vec::new(),
+                unproven_relations: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_ne!(plan.hash(), without_group.hash());
+        let marker_site = bound.site().clone();
+        let procedure = match &marker_site {
+            TypestateObservationSite::ProgramPoint { point, .. } => point.procedure(),
+            TypestateObservationSite::CallSite { call, .. } => call.procedure(),
+        };
+        let artifact = procedure.artifact().key().clone();
+        let declaration = procedure.semantics().locator().declaration().clone();
+        let observation_procedure = procedure.semantics().locator().clone();
+        let with_marker = TypestateBindingPlan::try_new_with_coverage(
+            &whole.protocol,
+            vec![subject_spec],
+            Vec::new(),
+            TypestateEventBindings {
+                events: vec![event_spec],
+                templates: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+            TypestateCoverageSpec {
+                event_set: Some(TypestateCoverageEventSet {
+                    name: "test.resource".into(),
+                    version: 1,
+                    effects: vec!["test.release".into()],
+                }),
+                candidate_groups: Vec::new(),
+                decisions: Vec::new(),
+                unproven_relations: vec![UnprovenEventRelation {
+                    subject: subject.key().clone(),
+                    site: marker_site,
+                    event: "close".into(),
+                    phase: "AfterNormalReturn".into(),
+                    exit: None,
+                    observation_procedure,
+                    reason: "alias answer unavailable".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_ne!(without_group.hash(), with_marker.hash());
+        assert_ne!(
+            without_group.summary_hash_for(&artifact, &declaration),
+            with_marker.summary_hash_for(&artifact, &declaration)
+        );
+
+        // Exercise the marker through the policy evaluator, including its
+        // exact-result cache. Each compile gets a fresh execution allowance;
+        // the repository is shared across cold, warm, and replayed solves.
+        let marked_bindings = Arc::new(with_marker);
+        let summaries = ProductionTypestateSummaryRepository::new(
+            brokk_bifrost_analysis::analyzer::workspace_authority::workspace_memo_attribution(
+                &workspace,
+            ),
+        );
+        let mut cold_answer = None;
+        for phase in ["cold", "warm", "replayed"] {
+            let (mut compiled, _) = compile(None);
+            compiled.bindings = Arc::clone(&marked_bindings);
+            let authority = TypestateProjectionAuthority::from_loaded_compilation(
+                policy,
+                compiled.protocol.hash(),
+                compiled.bindings.hash(),
+            )
+            .expect("marked compile mints projection authority");
+            let RootsPass::Complete(payload) = evaluate_compiled_typestate(
+                &authority,
+                policy,
+                spec,
+                &workspace,
+                Some(&cancellation),
+                &budget,
+                &compiled,
+                &summaries,
+                None,
+                None,
+            ) else {
+                panic!("{phase}: marked policy evaluation must return a report");
+            };
+            assert!(
+                matches!(&payload.completion, PolicyRunCompletion::Inconclusive { reasons, .. }
+                    if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)),
+                "{phase}: a reached unproven event relation cannot be Complete: {:?}",
+                payload.completion
+            );
+            if phase == "cold" {
+                assert!(
+                    work_metric(&payload.work, "typestate.summary_misses") > 0,
+                    "cold marked solve must compute a result: {:#?}",
+                    payload.work
+                );
+            } else {
+                assert!(
+                    work_metric(&payload.work, "typestate.summary_hits") > 0,
+                    "{phase}: expired source sessions must be re-acquired: {:#?}",
+                    payload.work
+                );
+            }
+            if phase == "cold" {
+                cold_answer = Some((payload.projections, payload.completion));
+            } else {
+                let (projections, completion) = cold_answer.as_ref().unwrap();
+                assert_eq!(
+                    &payload.projections, projections,
+                    "{phase}: findings agree with cold"
+                );
+                assert_eq!(
+                    &payload.completion, completion,
+                    "{phase}: completion agrees with cold"
+                );
+            }
+        }
     }
 
     /// A selector whose plan is not partitionable by seed asks to be compiled
     /// again rather than being sliced anyway.
     ///
-    /// A set node gives each branch a fair share of the live budget and
-    /// re-runs a starved branch, so a branch's rows depend on what earlier
-    /// branches consumed and no per-seed execution reproduces them
-    /// (`PlanPartitioning::classify`). The compile says so with the typed
-    /// reason instead of publishing units that do not partition anything.
+    /// Cross-seed intersection needs the complete membership relation. It
+    /// remains a Whole compile even when its leaves are seed-local.
     #[test]
     fn a_selector_whose_plan_crosses_seeds_widens_the_compile() {
         const POLICY_PATH: &str = "policies/set-source-lifecycle.rqlp";
@@ -7125,7 +9759,7 @@ mod tests {
           :entries [
             (subject :id res
               :selector (rql :schema-version 1
-                (union
+                (intersect
                   (language go (call :callee (name "OpenRes")))
                   (language go (call :callee (name "OpenOther")))))
               :subject return-value)])
@@ -7197,6 +9831,7 @@ mod tests {
                     .analyzer()
                     .active_semantic_model_snapshot()
                     .as_deref(),
+                None,
             ),
             crate::units::IncrementalBaseState::Evaluated,
             crate::units::UnitSnapshots::of(
@@ -7286,6 +9921,7 @@ mod tests {
                 escape: InconclusivePolicy::Inconclusive,
             },
             ResolvedTypestateAutomatonSpec {
+                event_set: None,
                 states: vec![open.clone()],
                 initial: open.clone(),
                 accepting_states: vec![open],
@@ -7717,6 +10353,78 @@ func MissingClose() {
         let hidden = ProtocolEventKey::new("bifrost-internal-escape-2").unwrap();
         assert!(protocol.event_id(&hidden).is_some());
         assert_eq!(protocol.events().len(), 3);
+    }
+
+    #[test]
+    fn compile_protocol_rejects_invalid_semantic_effect_mappings() {
+        let mut spec = minimal_resolved_spec(UnmodeledCallBehavior::Paranoid);
+        let event_id = PolicyTypestateEventId::new("close").unwrap();
+        spec.automaton.events = vec![
+            ResolvedTypestateEventSpec::new(
+                event_id,
+                ResolvedTypestateEventTrigger::SemanticEvent {
+                    event: PolicySemanticEvent::NormalProcedureExit {
+                        scope: TypestateExitScope::AnalysisRoot,
+                    },
+                },
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_semantic_effect(Some("test.release".into())),
+        ];
+        spec.automaton.event_set = Some(crate::definition::TypestateEventSetSpec {
+            name: "test.resource".into(),
+            version: 1,
+            effects: vec!["test.release".into()],
+        });
+        assert!(compile_protocol(&spec).is_ok());
+
+        let mut invalid = spec.clone();
+        invalid.automaton.event_set.as_mut().unwrap().effects = vec!["test.other".into()];
+        assert!(matches!(
+            compile_protocol(&invalid),
+            Err(TypestatePolicyCompileError::InvalidEventSet(
+                "semantic-effect-outside-event-set"
+            ))
+        ));
+
+        let mut invalid = spec.clone();
+        invalid.automaton.events[0].semantic_effect = None;
+        assert!(matches!(
+            compile_protocol(&invalid),
+            Err(TypestatePolicyCompileError::InvalidEventSet(
+                "event-set-without-mapped-event"
+            ))
+        ));
+
+        let mut invalid = spec.clone();
+        invalid.automaton.events[0].trigger = ResolvedTypestateEventTrigger::Calls {
+            selector_path: PolicySelectorPath::new(
+                "/analysis/automaton/events/close/calls/selector",
+            )
+            .unwrap(),
+            subject: TypestateCallBinding::Receiver,
+            phase: EndpointObservationPhase::AfterNormalReturn,
+            argument_condition: Some(TypestateArgumentCondition {
+                index: 0,
+                equals: true,
+            }),
+        };
+        assert!(matches!(
+            compile_protocol(&invalid),
+            Err(TypestatePolicyCompileError::InvalidEventSet(
+                "conditional-semantic-effect"
+            ))
+        ));
+
+        let mut invalid = spec;
+        invalid.automaton.event_set = None;
+        assert!(matches!(
+            compile_protocol(&invalid),
+            Err(TypestatePolicyCompileError::InvalidEventSet(
+                "missing-event-set"
+            ))
+        ));
     }
 
     #[test]

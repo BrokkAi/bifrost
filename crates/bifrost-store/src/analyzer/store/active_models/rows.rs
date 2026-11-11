@@ -1,16 +1,33 @@
 //! Query-local merge of decoded postings and catalog rows in publication order.
 
 use super::*;
-use crate::analyzer::store::model_catalog::semantic_catalog_question;
-use rusqlite::{Row, named_params};
+use crate::analyzer::store::model_catalog::{OwnedCatalogRow, semantic_catalog_question};
+use rusqlite::named_params;
 
-pub(super) fn record_json<T: serde::de::DeserializeOwned>(row: &Row<'_>) -> rusqlite::Result<T> {
+pub fn shard_record_order_key(
+    shard: &ActiveSemanticModelShard,
+    record_key: i64,
+) -> (&str, &str, &str, Option<u8>, Option<i64>, i64) {
+    (
+        &shard.manifest.pack_id,
+        &shard.descriptor.shard_id,
+        &shard.manifest.semantic_sha256,
+        shard.row_store.map(|identity| match identity.database {
+            super::CatalogShardDatabase::Durable => 0,
+            super::CatalogShardDatabase::Session => 1,
+        }),
+        shard.row_store.map(|identity| identity.shard_key),
+        record_key,
+    )
+}
+
+pub(super) fn record_json<T: serde::de::DeserializeOwned>(
+    row: &OwnedCatalogRow<'_>,
+) -> rusqlite::Result<T> {
     let json: String = row.get("record_json")?;
     serde_json::from_str(&json).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
-            row.as_ref()
-                .column_index("record_json")
-                .expect("record JSON column"),
+            row.column_index("record_json").expect("record JSON column"),
             rusqlite::types::Type::Text,
             Box::new(error),
         )
@@ -29,35 +46,45 @@ impl ResolvedActiveSemanticModels {
         &self,
         statement_name: &str,
         statement: &str,
+        owners: RowOwners,
         key: impl std::fmt::Debug,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
         posting: Option<&Vec<RecordAddress>>,
         decoded: impl Fn(&ActiveSemanticModelShard, usize) -> Option<&Arc<T>>,
-        decode: impl Fn(&Row<'_>) -> rusqlite::Result<T>,
-    ) -> Vec<ActivatedSemanticModelRecord<T>> {
-        let reader = self
-            .source_reader
-            .as_ref()
-            .expect("row-backed active set has its reader");
-        let rows = semantic_catalog_question(
-            statement_name,
-            key,
-            reader.raw_rows(statement, bindings, &self.shards, |row| {
-                Ok((row.get::<_, i64>("record_key")?, Arc::new(decode(row)?)))
-            }),
-        );
+        decode: impl Fn(&OwnedCatalogRow<'_>) -> rusqlite::Result<T>,
+    ) -> FamilyRows<Vec<ActivatedSemanticModelRecord<T>>> {
+        let mut fetched = Vec::new();
+        let mut jvm_open = owners.jvm_open;
+        for reader in &owners.readers {
+            match semantic_catalog_question(
+                statement_name,
+                &key,
+                (reader.as_ref() as &dyn CatalogRowReader).raw_rows(
+                    statement,
+                    bindings,
+                    &self.shards,
+                    |row| Ok((row.get::<_, i64>("record_key")?, Arc::new(decode(row)?))),
+                ),
+            ) {
+                Ok(rows) => fetched.extend(rows),
+                Err(open) => {
+                    let previous = jvm_open.get_or_insert(open);
+                    *previous = previous.merge(open);
+                }
+            }
+        }
+        let rows = fetched;
         let mut rows = rows
             .into_iter()
             .filter_map(|row| {
-                let index = self
+                let shard = self
                     .shards
                     .iter()
-                    .position(|s| Arc::ptr_eq(&s.metadata, &row.shard))
+                    .find(|s| Arc::ptr_eq(&s.metadata, &row.shard))
                     .expect("active row metadata belongs to this publication");
-                let shard = &self.shards[index];
                 shard.decoded.is_none().then(|| {
                     (
-                        (index, row.record.0),
+                        shard_record_order_key(shard, row.record.0),
                         ActivatedSemanticModelRecord {
                             shard: Arc::clone(shard),
                             record: Arc::clone(&row.record.1),
@@ -66,8 +93,8 @@ impl ResolvedActiveSemanticModels {
                 })
             })
             .collect::<Vec<_>>();
-        rows.sort_by_key(|(key, _)| *key);
-        rows.dedup_by_key(|(key, _)| *key);
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.dedup_by(|a, b| a.0 == b.0);
         let decoded = posting.into_iter().flatten().map(|address| {
             let shard = &self.shards[address.shard as usize];
             debug_assert!(
@@ -75,7 +102,7 @@ impl ResolvedActiveSemanticModels {
                 "only decoded shards have matcher postings"
             );
             (
-                (address.shard as usize, i64::from(address.record)),
+                shard_record_order_key(shard, i64::from(address.record)),
                 ActivatedSemanticModelRecord {
                     record: Arc::clone(
                         decoded(shard, address.record as usize)
@@ -85,58 +112,72 @@ impl ResolvedActiveSemanticModels {
                 },
             )
         });
-        merge_ordered_semantic_results(decoded, rows, |a, b| a.0.cmp(&b.0))
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect()
+        let mut decoded = decoded.collect::<Vec<_>>();
+        decoded.sort_by(|a, b| a.0.cmp(&b.0));
+        FamilyRows {
+            rows: merge_ordered_semantic_results(decoded, rows, |a, b| a.0.cmp(&b.0))
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect(),
+            jvm_open,
+        }
     }
 
     pub(super) fn type_question(
         &self,
+        owners: RowOwners,
         statement_name: &str,
         statement: &str,
         key: &str,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
         posting: Option<&Vec<RecordAddress>>,
-    ) -> Vec<ActivatedSemanticModelRecord<TypeFact>> {
+    ) -> FamilyRows<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
         self.merged_question(
             statement_name,
             statement,
+            owners,
             key,
             bindings,
             posting,
             |shard, index| shard.decoded().payload().declaration_facts()?.0.get(index),
             record_json,
         )
-        .into_iter()
-        .filter(|r| !r.shard.guard_excludes(r.record.guard.as_ref()))
-        .collect()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| !r.shard.guard_excludes(r.record.guard.as_ref()))
+                .collect()
+        })
     }
 
     pub(super) fn member_question(
         &self,
+        owners: RowOwners,
         statement_name: &str,
         statement: &str,
         key: impl std::fmt::Debug,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
         posting: Option<&Vec<RecordAddress>>,
-    ) -> Vec<ActivatedSemanticModelRecord<MemberFact>> {
+    ) -> FamilyRows<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
         self.merged_question(
             statement_name,
             statement,
+            owners,
             key,
             bindings,
             posting,
             |shard, index| shard.decoded().payload().declaration_facts()?.1.get(index),
             record_json,
         )
-        .into_iter()
-        .filter(|r| !r.shard.guard_excludes(r.record.guard.as_ref()))
-        .collect()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| !r.shard.guard_excludes(r.record.guard.as_ref()))
+                .collect()
+        })
     }
 
     pub(super) fn relation_question(
         &self,
+        owners: RowOwners,
         statement_name: &str,
         statement: &str,
         id: &str,
@@ -145,6 +186,7 @@ impl ResolvedActiveSemanticModels {
         resolve_records(self.merged_question(
             statement_name,
             statement,
+            owners,
             id,
             named_params! { ":id": id },
             posting,
@@ -159,8 +201,7 @@ impl ResolvedActiveSemanticModels {
                     ))
                     .map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            row.as_ref()
-                                .column_index("relation_kind")
+                            row.column_index("relation_kind")
                                 .expect("relation kind column"),
                             rusqlite::types::Type::Text,
                             Box::new(error),
@@ -171,23 +212,53 @@ impl ResolvedActiveSemanticModels {
         ))
     }
 
+    /// Generator rules live only in generator-rule shards, which the activation
+    /// always owns (`request_owned` excludes their payload kind). So the
+    /// activation reader alone answers every rule question, at overlay build
+    /// and at request time, and an open JVM request owner never makes a rule
+    /// lookup open.
     pub(super) fn rule_question(
         &self,
         statement_name: &str,
         statement: &str,
         key: impl std::fmt::Debug,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
         posting: Option<&Vec<RecordAddress>>,
     ) -> SemanticModelMatch<GeneratorRule> {
-        resolve_records(self.merged_question(
-            statement_name,
-            statement,
-            key,
-            bindings,
-            posting,
-            |shard, index| shard.decoded().payload().generator_rules()?.get(index),
-            record_json,
-        ))
+        self.rule_question_for_realm(None, statement_name, statement, key, bindings, posting)
+    }
+
+    pub(super) fn rule_question_for_realm(
+        &self,
+        realm: Option<&str>,
+        statement_name: &str,
+        statement: &str,
+        key: impl std::fmt::Debug,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
+        posting: Option<&Vec<RecordAddress>>,
+    ) -> SemanticModelMatch<GeneratorRule> {
+        resolve_records(
+            self.merged_question(
+                statement_name,
+                statement,
+                self.activation_row_owners(),
+                key,
+                bindings,
+                posting,
+                |shard, index| shard.decoded().payload().generator_rules()?.get(index),
+                record_json,
+            )
+            .map(|records| {
+                records
+                    .into_iter()
+                    .filter(|record| {
+                        realm.is_none_or(|realm| {
+                            semantic_pack_realm(&record.shard.manifest.language) == realm
+                        })
+                    })
+                    .collect()
+            }),
+        )
     }
 }
 
@@ -204,7 +275,7 @@ impl ResolvedActiveSemanticModels {
         shard: &ActiveSemanticModelShard,
         statement_name: &str,
         statement: &str,
-    ) -> Vec<Arc<T>> {
+    ) -> Result<Vec<Arc<T>>, FamilyOpen> {
         let identity = shard
             .row_store
             .expect("row-backed shard has its catalog identity");
@@ -212,21 +283,18 @@ impl ResolvedActiveSemanticModels {
             CatalogShardDatabase::Durable => "durable",
             CatalogShardDatabase::Session => "session",
         };
-        semantic_catalog_question(
+        Ok(semantic_catalog_question(
             statement_name,
             identity,
-            self.source_reader
-                .as_ref()
-                .expect("row-backed set has its reader")
-                .raw_records(
-                    statement,
-                    named_params! { ":source_db": source, ":shard_key": identity.shard_key },
-                    &self.shards,
-                ),
-        )
+            (self.shard_row_reader(shard)?.as_ref() as &dyn CatalogRowReader).raw_records(
+                statement,
+                named_params! { ":source_db": source, ":shard_key": identity.shard_key },
+                &self.shards,
+            ),
+        )?
         .into_iter()
         .map(|record| record.record)
-        .collect()
+        .collect())
     }
 
     pub(super) fn shard_payload<T: serde::de::DeserializeOwned>(
@@ -234,39 +302,43 @@ impl ResolvedActiveSemanticModels {
         shard: &ActiveSemanticModelShard,
         statement_name: &str,
         statement: &str,
-    ) -> Option<Arc<T>> {
-        let mut records = self.shard_records(shard, statement_name, statement);
+    ) -> Result<Option<Arc<T>>, FamilyOpen> {
+        let mut records = self.shard_records(shard, statement_name, statement)?;
         debug_assert!(records.len() <= 1, "one whole-payload row per shard");
-        records.pop()
+        Ok(records.pop())
     }
 
     pub(super) fn has_family(
         &self,
         shard: &ActiveSemanticModelShard,
         family: brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily,
-    ) -> bool {
+    ) -> Result<bool, FamilyOpen> {
         let identity = shard
             .row_store
             .expect("row-backed shard has its catalog identity");
         semantic_catalog_question(
             "PAYLOAD_FAMILY_PRESENCE",
             (identity, family),
-            self.source_reader
-                .as_ref()
-                .expect("row-backed set has its reader")
+            (self.shard_row_reader(shard)?.as_ref() as &dyn CatalogRowReader)
                 .payload_family_presence(identity, family),
         )
     }
 }
 
 impl ResolvedActiveSemanticModels {
+    /// Open when the owner's spellings may be missing, so that no summary
+    /// question is narrowed to a partial spelling set.
     pub(super) fn summary_owner_spellings(
         &self,
         key: ProcedureSummaryMemberKey<'_>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, FamilyOpen> {
         let realm = semantic_pack_realm(key.language);
         let mut names = HashSet::default();
-        for declaration in self.all_type_records_named(key.owner) {
+        let declarations = self.all_type_records_named(key.owner);
+        if let Some(open) = declarations.open_for_language(key.language) {
+            return Err(open);
+        }
+        for declaration in declarations.rows {
             if declaration.shard.extraction().is_some()
                 && semantic_pack_realm(&declaration.shard.manifest.language) == realm
             {
@@ -278,14 +350,14 @@ impl ResolvedActiveSemanticModels {
         let mut names = names.into_iter().collect::<Vec<_>>();
         names.sort_unstable();
         names.push(key.owner.to_owned());
-        names
+        Ok(names)
     }
 
     pub(super) fn summary_member_records(
         &self,
         key: ProcedureSummaryMemberKey<'_>,
         owners: &[String],
-    ) -> Vec<ActivatedSemanticModelRecord<CompiledProcedureSummary>> {
+    ) -> FamilyRows<Vec<ActivatedSemanticModelRecord<CompiledProcedureSummary>>> {
         let realm = semantic_pack_realm(key.language);
         let mut posting = Vec::new();
         for owner in owners {
@@ -310,11 +382,11 @@ impl ResolvedActiveSemanticModels {
         posting.sort_by_key(|address| (address.shard, address.record));
         posting.dedup_by_key(|address| (address.shard, address.record));
         self.merged_question("SUMMARY_MEMBER", statements::SUMMARY_MEMBER,
-            (key.language, owners, key.member, key.has_receiver),
+            self.question_row_owners(Some(realm)),             (key.language, owners, key.member, key.has_receiver),
             named_params! { ":realm": realm, ":owners": serde_json::to_string(owners).expect("owner spellings serialize"),
                 ":member": key.member, ":receiver": key.has_receiver }, Some(&posting),
             |shard, index| shard.decoded().payload().procedure_summaries()?.get(index), record_json)
-            .into_iter().filter(|r| r.record.target.has_receiver == key.has_receiver).collect()
+            .map(|rows| rows.into_iter().filter(|r| r.record.target.has_receiver == key.has_receiver).collect())
     }
 
     pub(super) fn applicable_summary_records(
@@ -322,9 +394,12 @@ impl ResolvedActiveSemanticModels {
         key: ProcedureSummaryMemberKey<'_>,
         owners: &[String],
         actual_counts: &[u32],
-    ) -> Vec<ActivatedSemanticModelRecord<CompiledProcedureSummary>> {
+    ) -> FamilyRows<Vec<ActivatedSemanticModelRecord<CompiledProcedureSummary>>> {
         use crate::analyzer::semantic::oracle::dispatch::authored_procedure_target_identity;
-        let records = self.summary_member_records(key, owners);
+        let FamilyRows {
+            rows: records,
+            jvm_open,
+        } = self.summary_member_records(key, owners);
         let mut counts = actual_counts.to_vec();
         counts.sort_unstable();
         counts.dedup();
@@ -371,7 +446,10 @@ impl ResolvedActiveSemanticModels {
             }
         }
         candidates.sort_by_key(|(order, _)| *order);
-        candidates.into_iter().map(|(_, record)| record).collect()
+        FamilyRows {
+            rows: candidates.into_iter().map(|(_, record)| record).collect(),
+            jvm_open,
+        }
     }
 
     pub(super) fn applicable_member_summaries(
@@ -384,12 +462,14 @@ impl ResolvedActiveSemanticModels {
         ) -> ProcedureSummaryAcceptance,
     ) -> ProcedureSummaryMatch {
         if self.has_row_backed_shards() {
-            let owners = self.summary_owner_spellings(key);
-            return resolve_procedure_records(
-                self.applicable_summary_records(key, &owners, actual_counts),
-                procedure_claims_agree,
-                accepts,
-            );
+            let candidates = match self.summary_owner_spellings(key) {
+                Ok(owners) => self.applicable_summary_records(key, &owners, actual_counts),
+                Err(open) => FamilyRows {
+                    rows: Vec::new(),
+                    jvm_open: Some(open),
+                },
+            };
+            return resolve_procedure_records(candidates, procedure_claims_agree, accepts);
         }
         let shapes = self.procedure_shapes_for_member(key.language, key.owner, key.member);
         resolve_applicable_procedure_postings_where_for_counts(
@@ -423,6 +503,7 @@ impl ResolvedActiveSemanticModels {
         let mut records = self.merged_question(
             "SUMMARY_TARGET",
             statements::SUMMARY_TARGET,
+            self.question_row_owners(Some(semantic_pack_realm(target.language))),
             (
                 target.language,
                 target.path,
@@ -437,7 +518,9 @@ impl ResolvedActiveSemanticModels {
             |shard, index| shard.decoded().payload().procedure_summaries()?.get(index),
             record_json,
         );
-        records.sort_by_key(|record| record.record.target.variadic);
+        records
+            .rows
+            .sort_by_key(|record| record.record.target.variadic);
         resolve_procedure_records(records, procedure_declaration_claims_agree, |_, _| {
             ProcedureSummaryAcceptance::Accept(None)
         })
@@ -459,9 +542,13 @@ impl ResolvedActiveSemanticModels {
             .collect::<Vec<_>>();
         posting.sort_by_key(|address| (address.shard, address.record));
         posting.dedup_by_key(|address| (address.shard, address.record));
-        let records = self.merged_question(
+        let FamilyRows {
+            rows: records,
+            jvm_open,
+        } = self.merged_question(
             "SUMMARY_PATH",
             statements::SUMMARY_PATH,
+            self.question_row_owners(Some(semantic_pack_realm(target.language))),
             (target.language, target.path),
             named_params! { ":realm": semantic_pack_realm(target.language), ":path": target.path },
             Some(&posting),
@@ -516,9 +603,14 @@ impl ResolvedActiveSemanticModels {
                 }
             }
         }
-        resolve_procedure_records(selected, procedure_declaration_claims_agree, |_, _| {
-            ProcedureSummaryAcceptance::Accept(None)
-        })
+        resolve_procedure_records(
+            FamilyRows {
+                rows: selected,
+                jvm_open,
+            },
+            procedure_declaration_claims_agree,
+            |_, _| ProcedureSummaryAcceptance::Accept(None),
+        )
     }
 }
 
@@ -528,7 +620,7 @@ impl ResolvedActiveSemanticModels {
         shard: &ActiveSemanticModelShard,
         statement_name: &str,
         statement: &str,
-    ) -> Vec<Arc<(String, CompiledProcedureTarget)>> {
+    ) -> Result<Vec<Arc<(String, CompiledProcedureTarget)>>, FamilyOpen> {
         let identity = shard
             .row_store
             .expect("row-backed shard has its catalog identity");
@@ -536,34 +628,30 @@ impl ResolvedActiveSemanticModels {
             CatalogShardDatabase::Durable => "durable",
             CatalogShardDatabase::Session => "session",
         };
-        semantic_catalog_question(
+        Ok(semantic_catalog_question(
             statement_name,
             identity,
-            self.source_reader
-                .as_ref()
-                .expect("row-backed set has its reader")
-                .raw_rows(
-                    statement,
-                    named_params! { ":source_db": source, ":shard_key": identity.shard_key },
-                    &self.shards,
-                    |row| {
-                        let json: String = row.get("target_json")?;
-                        let target = serde_json::from_str(&json).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                row.as_ref()
-                                    .column_index("target_json")
-                                    .expect("summary target column"),
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                        Ok((row.get("record_id")?, target))
-                    },
-                ),
-        )
+            (self.shard_row_reader(shard)?.as_ref() as &dyn CatalogRowReader).raw_rows(
+                statement,
+                named_params! { ":source_db": source, ":shard_key": identity.shard_key },
+                &self.shards,
+                |row| {
+                    let json: String = row.get("target_json")?;
+                    let target = serde_json::from_str(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            row.column_index("target_json")
+                                .expect("summary target column"),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok((row.get("record_id")?, target))
+                },
+            ),
+        )?
         .into_iter()
         .map(|row| row.record)
-        .collect()
+        .collect())
     }
 }
 
@@ -574,7 +662,7 @@ impl ResolvedActiveSemanticModels {
         member: &str,
         receiver: bool,
         arity: u32,
-    ) -> bool {
+    ) -> FamilyPresence {
         let mut posting = Vec::new();
         if let Some(owners) = self
             .indexes
@@ -597,8 +685,8 @@ impl ResolvedActiveSemanticModels {
         }
         posting.sort_by_key(|a| (a.shard, a.record));
         posting.dedup_by_key(|a| (a.shard, a.record));
-        let records = self.merged_question("SUMMARY_MEMBER_CANDIDATES", statements::SUMMARY_MEMBER_CANDIDATES,
-            (language,member,receiver), named_params! { ":realm": semantic_pack_realm(language), ":member": member, ":receiver":receiver }, Some(&posting),
+        let FamilyRows { rows: records, jvm_open } = self.merged_question("SUMMARY_MEMBER_CANDIDATES", statements::SUMMARY_MEMBER_CANDIDATES,
+            self.question_row_owners(Some(semantic_pack_realm(language))),             (language,member,receiver), named_params! { ":realm": semantic_pack_realm(language), ":member": member, ":receiver":receiver }, Some(&posting),
             |shard,index| shard.decoded().payload().procedure_summaries()?.get(index), record_json::<CompiledProcedureSummary>);
         let mut owners = HashSet::default();
         for record in records {
@@ -609,30 +697,45 @@ impl ResolvedActiveSemanticModels {
                 owners.insert(owner.into_owned());
             }
         }
-        owners.into_iter().any(|owner| {
+        let mut open = jvm_open;
+        for owner in owners {
             let key = ProcedureSummaryMemberKey::new(language, &owner, member, receiver, arity);
-            resolve_procedure_records(
+            let matched = resolve_procedure_records(
                 self.applicable_summary_records(key, std::slice::from_ref(&owner), &[arity]),
                 procedure_claims_agree,
                 |_, _| ProcedureSummaryAcceptance::Accept(None),
-            )
-            .records
-            .iter()
-            .any(|s| !s.normal_return_type_refinements().is_empty())
-        })
+            );
+            if matched
+                .records
+                .iter()
+                .any(|s| !s.normal_return_type_refinements().is_empty())
+            {
+                return FamilyPresence::Present;
+            }
+            if let SemanticModelMatchDisposition::Open(owner_open) = matched.disposition {
+                open = Some(open.map_or(owner_open, |previous: FamilyOpen| {
+                    previous.merge(owner_open)
+                }));
+            }
+        }
+        open.map_or(FamilyPresence::Absent, FamilyPresence::Open)
     }
 
     pub(super) fn absence_candidate_question(
         &self,
         language: &str,
-    ) -> NormalContinuationAbsenceCandidateIndex {
-        let families = semantic_catalog_question(
-            "SUMMARY_ABSENT_FAMILIES",
-            language,
-            self.source_reader
-                .as_ref()
-                .expect("row-backed set has its reader")
-                .scalar_question(
+    ) -> Result<NormalContinuationAbsenceCandidateIndex, FamilyOpen> {
+        let mut families = Vec::new();
+        let owners = self.question_row_owners(Some(semantic_pack_realm(language)));
+        // A partial family list would read as "no absence candidates".
+        if let Some(open) = owners.jvm_open {
+            return Err(open);
+        }
+        for reader in owners.readers {
+            families.extend(semantic_catalog_question(
+                "SUMMARY_ABSENT_FAMILIES",
+                language,
+                (reader.as_ref() as &dyn CatalogRowReader).scalar_question(
                     statements::SUMMARY_ABSENT_FAMILIES,
                     named_params! { ":realm": semantic_pack_realm(language) },
                     |row| {
@@ -643,7 +746,8 @@ impl ResolvedActiveSemanticModels {
                         ))
                     },
                 ),
-        );
+            )?);
+        }
         let mut postings = ProcedureSummaryTargetPostings::default();
         let mut records = Vec::new();
         let mut entries = 0;
@@ -655,7 +759,11 @@ impl ResolvedActiveSemanticModels {
         };
         for (owner, member, receiver) in families {
             let key = ProcedureSummaryMemberKey::new(language, &owner, &member, receiver, 0);
-            for record in self.summary_member_records(key, std::slice::from_ref(&owner)) {
+            let records_for_owner = self.summary_member_records(key, std::slice::from_ref(&owner));
+            if let Some(open) = records_for_owner.jvm_open {
+                return Err(open);
+            }
+            for record in records_for_owner.rows {
                 let address = RecordAddress {
                     shard: 0,
                     record: u32::try_from(records.len()).expect("query-owned address space"),
@@ -682,7 +790,7 @@ impl ResolvedActiveSemanticModels {
                 records.push(record);
             }
         }
-        build_absence_candidates_with(
+        Ok(build_absence_candidates_with(
             &postings,
             &CancellationToken::new(),
             &mut entries,
@@ -696,6 +804,6 @@ impl ResolvedActiveSemanticModels {
                 )
             },
         )
-        .expect("uncancelled query-owned absence candidates fit allocation")
+        .expect("uncancelled query-owned absence candidates fit allocation"))
     }
 }

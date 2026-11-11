@@ -17,106 +17,172 @@ pub(crate) fn source_read(analyzer: &dyn IAnalyzer, family: WorkspaceFactFamily)
     );
 }
 
-// Read a retained index through its receipt before classifying its state.
-pub(crate) fn retained_external_index(
-    analyzer: &dyn IAnalyzer,
-    index: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
-        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
-            std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
-        >,
+type ExternalIndexCell = brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
+    brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
+        std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
     >,
-    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
-) -> JvmRetainedExternalIndex {
-    external_read(analyzer, index, memo);
-    super::retained_external_index_state(index.get().map(|entry| entry.replay().as_ref()))
+>;
+
+/// One JVM analyzer's external declaration index together with the bounded
+/// receipt of the inputs its build read. Java, Kotlin and Scala each hold one.
+///
+/// The slot is unbuilt until a build fills the index, which inserts the
+/// receipt in the same step. The index then outlives its receipt in two ways:
+/// the bounded receipt memo evicts it, or [`Self::updated`] carries the index
+/// into a new analyzer generation, which never inherits a receipt. A read of
+/// an index without its receipt never samples new inputs for the old value:
+/// it records an unattributed read, which refuses certification. Eviction is
+/// the memo's, so the receipt state is observed on each read, not stored.
+#[derive(Clone)]
+pub(crate) struct JvmExternalIndexSlot {
+    index: std::sync::Arc<ExternalIndexCell>,
+    receipt: super::hierarchy::RawDerivedMemo<(), ()>,
 }
 
-// A live index may outlast its bounded receipt. Never sample new inputs for
-// that old value: loss of its build receipt refuses certification instead.
-pub(crate) fn external_read(
-    analyzer: &dyn IAnalyzer,
-    index: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
-        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
-            std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
-        >,
-    >,
-    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
-) {
-    if index.get().is_none() {
-        return; // A retained-only peek has not consumed an external index.
+impl JvmExternalIndexSlot {
+    pub(crate) fn new(memo_budget: u64) -> Self {
+        Self {
+            index: std::sync::Arc::new(ExternalIndexCell::new()),
+            receipt: super::hierarchy::raw_derived_memo(memo_budget / 8),
+        }
     }
-    memo.read(
-        &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
-        |cache, capture| {
-            Ok::<_, std::convert::Infallible>(cache.get(&()).unwrap_or_else(|| {
-                std::sync::Arc::new(capture.build(|| {
-                    analyzer.record_unattributed_read();
-                    std::sync::Arc::new(())
-                }))
-            }))
-        },
-    )
-    .expect("external receipt lookup is infallible");
-}
 
-pub(crate) fn initialize_external_index(
-    analyzer: &dyn IAnalyzer,
-    authority: (Language, WorkspaceFactFamily),
-    index: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
-        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
-            std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
+    /// The slot of the next analyzer generation: the same index unless a
+    /// dependency input changed, and a receipt memo of its own.
+    pub(crate) fn updated(
+        &self,
+        changed_files: &std::collections::BTreeSet<
+            brokk_bifrost_core::analyzer::model::ProjectFile,
         >,
-    >,
-    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
-    build: impl FnOnce() -> std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
-) -> std::sync::Arc<super::external::JvmExternalDeclarationIndex> {
-    let mut result = None;
-    memo.read(
-        &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
-        |cache, capture| {
-            let mut built = None;
-            let value = brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
-                analyzer,
-                index,
-                || {
-                    let mut value = None;
-                    let receipt = std::sync::Arc::new(capture.build_weighted(|| {
-                        record_external_inputs(analyzer, authority.0, authority.1);
-                        value = Some(build());
-                        (std::sync::Arc::new(()), 0)
-                    }));
-                    let value = value.expect("builder produced an index");
-                    built = Some((std::sync::Arc::clone(&value), receipt));
-                    value
+        memo_budget: u64,
+    ) -> Self {
+        Self {
+            index: brokk_bifrost_analysis::analyzer::updated_external_index(
+                &self.index,
+                changed_files,
+                super::dependency_discovery::is_jvm_dependency_input,
+            ),
+            receipt: super::hierarchy::raw_derived_memo(memo_budget / 8),
+        }
+    }
+
+    /// Whether a build has filled the index. Records no read.
+    pub(crate) fn is_built(&self) -> bool {
+        self.index.get().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_index_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.index, &other.index)
+    }
+
+    /// The built index, read through its receipt, without building it.
+    pub(crate) fn retained(
+        &self,
+        analyzer: &dyn IAnalyzer,
+    ) -> Option<&super::external::JvmExternalDeclarationIndex> {
+        self.record_read(analyzer);
+        self.index.get().map(|entry| entry.replay().as_ref())
+    }
+
+    /// Classify the retained index for the proof-gated diagnostic ladder.
+    pub(crate) fn retained_state(&self, analyzer: &dyn IAnalyzer) -> JvmRetainedExternalIndex {
+        super::retained_external_index_state(self.retained(analyzer))
+    }
+
+    /// Record the read of a built index through its receipt. Reading an
+    /// unbuilt slot consumes no external index and records nothing.
+    pub(crate) fn record_read(&self, analyzer: &dyn IAnalyzer) {
+        if !self.is_built() {
+            return;
+        }
+        self.receipt
+            .read(
+                &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
+                |cache, capture| {
+                    Ok::<_, std::convert::Infallible>(cache.get(&()).unwrap_or_else(|| {
+                        std::sync::Arc::new(capture.build(|| {
+                            analyzer.record_unattributed_read();
+                            std::sync::Arc::new(())
+                        }))
+                    }))
                 },
-            );
-            let retained = index
-                .get()
-                .is_some_and(|retained| std::sync::Arc::ptr_eq(retained, &value));
-            if retained
-                && let Some((built_value, receipt)) = &built
-                && std::sync::Arc::ptr_eq(built_value, &value)
-            {
-                cache.insert((), std::sync::Arc::clone(receipt));
-            }
-            result = Some(value);
-            let receipt = if retained {
-                cache.get(&())
-            } else {
-                built.map(|(_, receipt)| receipt)
-            };
-            Ok::<_, std::convert::Infallible>(receipt.unwrap_or_else(|| {
-                std::sync::Arc::new(capture.build(|| {
-                    // A winning index whose bounded receipt was evicted cannot
-                    // be certified from freshly sampled inputs.
-                    analyzer.record_unattributed_read();
-                    std::sync::Arc::new(())
-                }))
-            }))
-        },
-    )
-    .expect("external index initialization is infallible");
-    result.expect("external lookup produced an owned index")
+            )
+            .expect("external receipt lookup is infallible");
+        if let Some(entry) = self.index.get() {
+            super::external::QueryGapRecorder::new(analyzer).all(entry.replay().as_ref());
+        }
+    }
+
+    /// The index, built by `build` on first use. The build records the
+    /// external inputs under `authority` into the receipt it inserts.
+    pub(crate) fn get_or_build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        authority: (Language, WorkspaceFactFamily),
+        build: impl FnOnce() -> std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
+    ) -> std::sync::Arc<super::external::JvmExternalDeclarationIndex> {
+        let index = &*self.index;
+        let mut result = None;
+        self.receipt
+            .read(
+                &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer),
+                |cache, capture| {
+                    let mut built = None;
+                    let value =
+                        brokk_bifrost_analysis::analyzer::common::replayable_query_cache_cell(
+                            analyzer,
+                            index,
+                            || {
+                                let mut value = None;
+                                let receipt = std::sync::Arc::new(capture.build_weighted(|| {
+                                    record_external_inputs(analyzer, authority.0, authority.1);
+                                    let built = build();
+                                    record_workspace_authority_read(
+                                        analyzer,
+                                        WorkspaceFactFamily::JvmExternalGaps,
+                                        AuthorityInputs::Fact {
+                                            language: Language::None,
+                                            subject: FactSubject::Whole,
+                                            answer: built.gap_identity(),
+                                        },
+                                    );
+                                    value = Some(built);
+                                    (std::sync::Arc::new(()), 0)
+                                }));
+                                let value = value.expect("builder produced an index");
+                                built = Some((std::sync::Arc::clone(&value), receipt));
+                                value
+                            },
+                        );
+                    let retained = index
+                        .get()
+                        .is_some_and(|retained| std::sync::Arc::ptr_eq(retained, &value));
+                    if retained
+                        && let Some((built_value, receipt)) = &built
+                        && std::sync::Arc::ptr_eq(built_value, &value)
+                    {
+                        cache.insert((), std::sync::Arc::clone(receipt));
+                    }
+                    result = Some(value);
+                    let receipt = if retained {
+                        cache.get(&())
+                    } else {
+                        built.map(|(_, receipt)| receipt)
+                    };
+                    Ok::<_, std::convert::Infallible>(receipt.unwrap_or_else(|| {
+                        std::sync::Arc::new(capture.build(|| {
+                            // A winning index whose bounded receipt was evicted
+                            // cannot be certified from freshly sampled inputs.
+                            analyzer.record_unattributed_read();
+                            std::sync::Arc::new(())
+                        }))
+                    }))
+                },
+            )
+            .expect("external index initialization is infallible");
+        result.expect("external lookup produced an owned index")
+    }
 }
 
 fn record_external_inputs(
@@ -413,19 +479,18 @@ mod tests {
 #[cfg(test)]
 pub(crate) fn assert_receipt_loss_refuses_live_index(
     analyzer: &dyn IAnalyzer,
-    index: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
-        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
-            std::sync::Arc<super::external::JvmExternalDeclarationIndex>,
-        >,
-    >,
-    memo: &super::hierarchy::RawDerivedMemo<(), ()>,
+    slot: &JvmExternalIndexSlot,
     read: impl Fn(),
 ) {
     use brokk_bifrost_analysis::analyzer::{ReadKey, capture_query_reads};
     read();
-    let built = std::sync::Arc::clone(index.get().expect("must build the real language index"));
+    let built = std::sync::Arc::clone(
+        slot.index
+            .get()
+            .expect("must build the real language index"),
+    );
     assert_eq!(
-        memo.account(|cache| {
+        slot.receipt.account(|cache| {
             cache.run_pending_tasks();
             usize::from(cache.get(&()).is_none())
         }),
@@ -449,7 +514,7 @@ pub(crate) fn assert_receipt_loss_refuses_live_index(
             "a lost receipt must never be recreated from current manifests: {reads:?}"
         );
         assert!(
-            std::sync::Arc::ptr_eq(&built, index.get().unwrap().replay()),
+            std::sync::Arc::ptr_eq(&built, slot.index.get().unwrap().replay()),
             "must keep the original index"
         );
     }

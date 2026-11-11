@@ -77,11 +77,11 @@ mod rust_departing_tests_tests {
                 ),
             )],
         );
-        let b = fixture.declaration("B");
+        let start = RouteEndpoint::Declaration(fixture.declaration("B"));
         let routes = identity_routes_from(
             fixture.analyzer(),
-            &RouteEndpoint::Declaration(b),
-            None,
+            &start,
+            Some(&[RouteHopKind::Alias]),
             &CancellationToken::new(),
         )
         .expect("not cancelled");
@@ -105,6 +105,20 @@ mod rust_departing_tests_tests {
                 .all(|hop| hop.kind == RouteHopKind::Alias)
         );
 
+        let unrestricted =
+            identity_routes_from(fixture.analyzer(), &start, None, &CancellationToken::new())
+                .expect("not cancelled");
+        // Unsupported kinds cannot certify a terminal in an unrestricted walk.
+        assert!(
+            unrestricted
+                .iter()
+                .any(|route| route.termination == RouteTermination::Incomplete)
+                && unrestricted
+                    .iter()
+                    .all(|route| route.termination != RouteTermination::Terminal),
+            "unrestricted routes: {unrestricted:?}"
+        );
+
         let cyclic = Fixture::new(
             Language::Rust,
             &[(
@@ -116,7 +130,7 @@ mod rust_departing_tests_tests {
         let routes = identity_routes_from(
             cyclic.analyzer(),
             &RouteEndpoint::Declaration(a),
-            None,
+            Some(&[RouteHopKind::Alias]),
             &CancellationToken::new(),
         )
         .expect("not cancelled");
@@ -252,9 +266,10 @@ mod rust_departing_tests_tests {
             &CancellationToken::new(),
         )
         .expect("not cancelled");
-        let RoundTripOutcome::Holds { terminals } = outcome else {
-            panic!("round trip must hold, got {outcome:?}");
-        };
-        assert!(terminals[0].fq_name().ends_with("Widget"));
+        // Rust does not produce the Export relation yet (#8152).
+        assert!(
+            matches!(outcome, RoundTripOutcome::ForwardInconclusive),
+            "round trip: {outcome:?}"
+        );
     }
 }

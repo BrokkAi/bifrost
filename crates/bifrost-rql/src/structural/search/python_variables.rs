@@ -412,6 +412,35 @@ impl PythonInitializerProof {
     }
 }
 
+/// The local-value oracle for one Python file, shared by structural seeds and
+/// `:enclosing` patterns. It reports the environment axes the oracle relies
+/// on, so an incomplete environment makes the caller's answer incomplete.
+pub(super) fn file_local_value_oracle(
+    analyzer: &dyn IAnalyzer,
+    environment_cache: &mut super::environment::EnvironmentTraversalCache,
+    file: &ProjectFile,
+    facts: &super::super::facts::FileFacts,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> Option<PythonLocalValueOracle> {
+    let environment = environment_cache.environment_for(analyzer, file);
+    environment_cache.report_completeness(
+        file,
+        &environment,
+        &[EnvironmentAxis::Scopes, EnvironmentAxis::BindingIntervals],
+        diagnostics,
+    );
+    let dynamic_scope_calls = environment_cache.python_dynamic_scope_calls(analyzer, file);
+    environment_cache
+        .python_variable_index_for(
+            analyzer,
+            file,
+            facts.source_identity(),
+            facts.source(),
+            &environment,
+        )
+        .map(|index| local_value_oracle(&index, facts, &dynamic_scope_calls))
+}
+
 pub(super) fn local_value_oracle(
     index: &PythonVariableIndex,
     facts: &super::super::facts::FileFacts,

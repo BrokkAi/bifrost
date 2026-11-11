@@ -11,6 +11,9 @@ fn package_storage_content_qualifier(package_name: &str) -> String {
 /// than checking out another reader, including through their bound project.
 pub trait StoreLanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
+    fn resolution_producer_epoch(&self) -> &'static str {
+        super::resolution::resolution_bundle_epoch(self.language())
+    }
     fn claims_included_files(&self) -> bool {
         false
     }

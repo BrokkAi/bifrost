@@ -1,7 +1,7 @@
 # brokk-bifrost-semantic-packs
 
-This crate is the optional distribution companion for Bifrost's curated,
-prebuilt semantic-model packs. Most applications should depend on
+This crate installs and authors semantic-model packs for Bifrost. Most
+applications should depend on
 [`brokk-bifrost`](https://crates.io/crates/brokk-bifrost) instead.
 
 The generic pack model, compiler, catalog, activation logic, and analyzer
@@ -9,9 +9,9 @@ overlays live in
 [`brokk-bifrost-analysis`](https://crates.io/crates/brokk-bifrost-analysis).
 Open semantic packs and policy rules are authored, generated, and released in
 [Bifrost-packs](https://github.com/BrokkAi/bifrost-packs). This crate retains
-engine-side compilation, verification, installation, and authoring tooling,
-plus existing embedded content during the v0.13.0 transition. Analyzer consumers can omit it and
-register their own packs.
+engine-side compilation, verification, installation, and authoring tooling; it
+ships no pack content. Analyzer consumers can omit it and register their own
+packs.
 
 Semantic-model packs describe API facts that are unavailable from workspace
 source, declarative facts produced by frameworks or generators, and reviewed
@@ -68,17 +68,6 @@ Version 0.8.19 adds the opt-in `release-tooling` feature and the
 and verify pinned JVM semantic-pack bundles. Ordinary consumers keep the
 feature disabled and do not compile the packaging dependencies.
 
-## Embedded registry
-
-The crate exposes `EmbeddedSemanticPack` and `EmbeddedPackRegistry` for
-reviewed Bifrost content. Registration is explicit. The registry validates all
-artifacts before it changes the target catalog. It returns ordered source IDs
-and manifest digests for deterministic provenance.
-
-`BIFROST_EMBEDDED_PACKS` is the production registry. Generic analyzer clients
-can omit this crate and register their own packs with
-`brokk-bifrost-analysis`.
-
 ## Authoring commands
 
 The same binary validates, lints, and compiles reviewed YAML or JSON through
@@ -118,29 +107,13 @@ procedure-summary IR, compiles every translated entry back through the
 production pack compiler, and joins the corpora into one deterministic report:
 
 ```text
-scripts/public/fetch-pinned-summary-corpora.sh /path/to/work-dir
 bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE report.json
 ```
 
-`semantic-packs/summary-corpora/pins.json` is the single source of truth for
-the upstream, revision, archive checksum, and license of each corpus. The
-corpora are third-party content and are not vendored here. The report records
+A pins file records the upstream, revision, archive checksum, and license of
+each corpus. The full corpora are third-party content and are not vendored
+here; `BrokkAi/bifrost-packs` owns the pins and the script that fetches them.
+The translator tests use the in-tree slices and `testdata/summary-corpora/pins.json`. The report records
 each corpus's revision and a digest of the exact bytes read, every row the
 translator could not carry and why, and each target the corpora agree on,
 dispute, or cover alone. Two runs over the same pins produce the same bytes.
-
-## Explicit transition registry selection
-
-For engine repository policy validation, `bifrost-semantic-pack
-export-embedded-registry OUTPUT` writes the entire frozen registered semantic
-set as compiled manifests and shards, plus `embedded-registry.json`. Supply
-that directory as `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` together with an explicit
-`BIFROST_OPEN_POLICY_PACK_ROOT`. The host verifies the complete source inventory
-and every byte against its own registry before registering the selected disk
-content. Missing, changed, or engine-mismatched content fails without fallback.
-Session provenance and partial completeness are preserved.
-
-This transition snapshot is not a native release bundle and does not qualify
-external content or authorize publication. Native external bundles continue
-through the existing release installer. Content ownership and retirement remain
-with the external pack migration; this command changes no frozen pack bytes.

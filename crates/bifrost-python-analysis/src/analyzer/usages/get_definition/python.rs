@@ -1,5 +1,3 @@
-use crate::analyzer::usages::get_definition::python;
-use brokk_bifrost_analysis::analyzer::common::language_for_file;
 #[cfg(test)]
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::*;
@@ -11,7 +9,6 @@ use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::query_token::QueryScope;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_core::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
 };
@@ -21,15 +18,16 @@ use brokk_bifrost_core::analyzer::usages::resolution_session::{
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
-use brokk_bifrost_python::usage_index::{ModuleBindingEventKind, ModuleBindingTimeline};
+pub(crate) use brokk_bifrost_python::syntax::{
+    python_attribute_callee_uses_self_or_cls_bounded,
+    python_attribute_names_nested_class_through_current_receiver_bounded,
+};
 use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use tree_sitter::Parser;
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::PythonAnalyzer;
-
-use crate::analyzer::python::external_authority::*;
 
 use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
 
@@ -40,19 +38,47 @@ pub(crate) fn definition_value_identity(
     source: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Option<ResolvedValueIdentity>, DerivationExecutionCause> {
-    match python_external_value_identity_at_range(analyzer, request, file, source, cancellation)? {
+    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)
+        .expect("Python identity hook requires Python analyzer");
+    let cancel = cancellation.cloned().unwrap_or_default();
+    let mut retained =
+        crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest::open(
+            python, &cancel,
+        );
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let Some(tree) = definition_tree(analyzer, scope.token(), file, Language::Python, source)
+    else {
+        return Ok(None);
+    };
+    match python_external_value_identity_at_range(
+        &mut retained,
+        analyzer,
+        request,
+        file,
+        source,
+        &tree,
+        cancellation,
+    )? {
         Some(identity) => Ok(Some(identity)),
-        None => {
-            python_attribute_value_identity_at_range(analyzer, request, file, source, cancellation)
-        }
+        None => python_attribute_value_identity_at_range(
+            &mut retained,
+            analyzer,
+            request,
+            file,
+            source,
+            &tree,
+            cancellation,
+        ),
     }
 }
 
 fn python_attribute_value_identity_at_range(
+    retained: &mut crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest<'_>,
     analyzer: &dyn IAnalyzer,
     request: &DefinitionLookupRequest,
     file: &ProjectFile,
     source: &str,
+    tree: &Tree,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Option<ResolvedValueIdentity>, DerivationExecutionCause> {
     let (Some(start_byte), Some(end_byte)) = (request.start_byte, request.end_byte) else {
@@ -68,32 +94,7 @@ fn python_attribute_value_identity_at_range(
     else {
         return Ok(None);
     };
-    let terminal_request = DefinitionLookupRequest {
-        file: file.clone(),
-        line: None,
-        column: None,
-        start_byte: Some(terminal_start_byte),
-        end_byte: Some(terminal_end_byte),
-    };
-    let outcome = if let Some(cancellation) = cancellation {
-        resolve_definition_batch_with_source_and_cancellation(
-            analyzer,
-            vec![terminal_request],
-            file.clone(),
-            Arc::<str>::from(source),
-            cancellation,
-        )
-    } else {
-        resolve_definition_batch_with_source(
-            analyzer,
-            vec![terminal_request],
-            file.clone(),
-            Arc::<str>::from(source),
-        )
-    }
-    .into_iter()
-    .next()
-    .expect("one identity request produces one outcome");
+    let Some((outcome, _)) = crate::analyzer::python::native_request::definition_lookup::definition_at_range_with_request(retained, analyzer, file, source, tree, terminal_start_byte..terminal_end_byte, cancellation)? else { return Ok(None); };
     match outcome.status {
         DefinitionLookupStatus::Cancelled => return Err(DerivationExecutionCause::Cancelled),
         DefinitionLookupStatus::ExceededBudget(_) => return Err(DerivationExecutionCause::Budget),
@@ -129,52 +130,48 @@ fn python_attribute_value_identity_at_range(
 }
 
 fn python_external_value_identity_at_range(
+    retained: &mut crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest<'_>,
     analyzer: &dyn IAnalyzer,
     request: &DefinitionLookupRequest,
     file: &ProjectFile,
     source: &str,
+    tree: &Tree,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Option<ResolvedValueIdentity>, DerivationExecutionCause> {
     let (Some(start_byte), Some(end_byte)) = (request.start_byte, request.end_byte) else {
         return Ok(None);
     };
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
+    let Some((outcome, _)) =
+        crate::analyzer::python::native_request::definition_lookup::definition_at_range_with_request(
+            retained,
+            analyzer,
+            file,
+            source,
+            tree,
+            start_byte..end_byte,
+            cancellation,
+        )?
+    else {
         return Ok(None);
     };
-    let resolution = python_external_imported_symbol_at_range_bounded(
-        python,
-        scope.token(),
-        file,
-        source,
-        start_byte,
-        end_byte,
-        cancellation,
-    );
-    let (module, member) = match resolution {
-        BoundedResolution::Complete {
-            value: Some((module, member)),
-            ..
-        } => (module, member),
-        BoundedResolution::Complete { value: None, .. } => return Ok(None),
-        BoundedResolution::Exceeded { .. } => return Err(DerivationExecutionCause::Budget),
-        BoundedResolution::Cancelled { .. } => return Err(DerivationExecutionCause::Cancelled),
-    };
-    let external = format!("{module}.{member}");
-    let Some(overlay) = analyzer.semantic_model_overlay() else {
-        return Ok(None);
-    };
-    let matched = overlay.symbols_named(&external);
-    if matched.disposition
-        != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    match outcome.status {
+        DefinitionLookupStatus::Cancelled => return Err(DerivationExecutionCause::Cancelled),
+        DefinitionLookupStatus::ExceededBudget(_) => return Err(DerivationExecutionCause::Budget),
+        DefinitionLookupStatus::Unavailable | DefinitionLookupStatus::Incomplete => {
+            return Err(DerivationExecutionCause::Provider);
+        }
+        _ => {}
+    }
+    if outcome.status != DefinitionLookupStatus::Resolved
+        || !outcome.definitions.is_empty()
+        || outcome.lexical_definition.is_some()
     {
         return Ok(None);
     }
-    let [symbol] = matched.records.as_slice() else {
+    let [symbol] = outcome.modeled_definitions.as_slice() else {
         return Ok(None);
     };
-    if symbol.qualified_name != external
-        || symbol.language != Language::Python.config_label()
+    if symbol.language != Language::Python.config_label()
         || !exact_semantic_model_value_identity(symbol)
     {
         return Ok(None);
@@ -218,38 +215,9 @@ pub(crate) struct PythonDefinitionState {
     python_contexts: HashMap<ProjectFile, Arc<PythonDefinitionContext>>,
 }
 
-impl PythonDefinitionState {
-    pub(crate) fn python_context(
-        &mut self,
-        token: QueryToken<'_>,
-        py: &PythonAnalyzer,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
-        source: &str,
-    ) -> Arc<python::PythonDefinitionContext> {
-        self.python_contexts
-            .entry(file.clone())
-            .or_insert_with(|| request_definition_context(py, analyzer, token, file, source))
-            .clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn python_build_counts(
-        &self,
-        analyzer: &dyn IAnalyzer,
-    ) -> (usize, usize, usize, usize) {
-        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
-        request_definition_build_counts(py)
-    }
-}
-
-use brokk_bifrost_python::graph::extractor::collect_module_binding_timeline;
-
 use brokk_bifrost_python::graph::extractor::collect_scope_facts_from_parsed_source;
 
 use brokk_bifrost_python::graph::extractor::enclosing_scope_facts;
-
-use brokk_bifrost_python::graph::extractor::is_declaration_identifier as python_is_declaration_identifier;
 
 use brokk_bifrost_python::graph::extractor::slice as python_slice;
 
@@ -273,8 +241,6 @@ use brokk_bifrost_python::syntax::python_node_is_in_annotation;
 
 use brokk_bifrost_core::analyzer::usages::model::ExportEntry;
 
-use brokk_bifrost_core::analyzer::usages::common::same_node;
-
 use brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 use brokk_bifrost_core::analyzer::definition_lookup::BoundedDefinitionLookup;
@@ -287,38 +253,27 @@ use brokk_bifrost_python::graph_support::resolve_module_code_unit;
 
 use brokk_bifrost_python::graph_support::retain_modules_for_importer;
 
-use brokk_bifrost_python::usage_index::usage_resolve_module_files;
-
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxSource;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
-use brokk_bifrost_core::path_utils::rel_path_string;
 use brokk_bifrost_python::bindings::{
     PythonClassReferenceScope, PythonDirectScopeBindingKind, PythonLexicalNameResolution,
     PythonLexicalScopeBindings, python_comprehension_binds_name_at,
     python_comprehension_binds_name_at_bounded, python_direct_scope_bindings_bounded,
     python_executable_scope_children, python_global_binding_is_untouched_bounded,
-    python_type_parameter_binds_name_at, python_type_parameter_binds_name_at_bounded,
-    python_unambiguous_module_binding_node_bounded,
+    python_type_parameter_binds_name_at_bounded, python_unambiguous_module_binding_node_bounded,
     python_unambiguous_module_class_binding_bounded,
 };
-use brokk_bifrost_python::declarations::python_module_name;
-use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
 use brokk_bifrost_python::graph::extractor::python_first_function_definition;
-use brokk_bifrost_python::graph::resolver::annotation_reference_candidates_at_focus;
 use brokk_bifrost_python::graph_support::PythonSource;
 use brokk_bifrost_python::imports::{
-    PythonImportBinding, PythonImportDetails, python_function_scoped_import_binding,
-    python_import_bindings_from_imports, python_import_bindings_from_imports_bounded,
+    PythonImportBinding, PythonImportDetails, python_import_bindings_from_imports_bounded,
     python_import_details, python_import_infos_from_node, python_local_module_alias_path_before,
     resolve_python_relative_module,
 };
 use brokk_bifrost_python::source_facts::{PythonModuleMutationFacts, PythonSourceFactProvider};
-use brokk_bifrost_python::syntax::{
-    leftmost_identifier, python_keyword_argument_label, python_reference_is_deferred_function_body,
-    python_static_attribute_path, python_static_attribute_path_bounded,
+pub(crate) use brokk_bifrost_python::syntax::{
+    python_keyword_argument_label, python_static_attribute_path_bounded,
 };
-use brokk_bifrost_python::usage_index::visible_module_binding_suffix;
 use std::cell::Cell;
 use std::sync::Mutex;
 #[cfg(test)]
@@ -440,39 +395,6 @@ pub(crate) fn request_definition_build_counts(py: &PythonAnalyzer) -> (usize, us
             .generic_receiver_type_fallbacks
             .load(Ordering::Relaxed),
     )
-}
-
-#[cfg(test)]
-pub(crate) fn request_definition_cached_read_keys(
-    py: &PythonAnalyzer,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-) -> Vec<ReadKey> {
-    let memo = py
-        .active_query_request_memo::<PythonDefinitionContextRequestMemo>()
-        .expect("Python definition cached reads require an active query scope");
-    let key = definition_context_key(analyzer, file, source, None);
-    let cell = memo.contexts.cell(&key);
-    let entry = cell
-        .get_or_build_pool_independent(|| panic!("Python definition context was not initialized"));
-    let mut reads = entry.reads.keys();
-    if let Some(scope_facts) = entry.value.scope_facts.get() {
-        reads.extend(scope_facts.reads.keys());
-    }
-    for receiver in entry
-        .value
-        .receiver_types
-        .lock()
-        .expect("Python receiver type cache mutex poisoned")
-        .values
-        .values()
-    {
-        reads.extend(receiver.reads.keys());
-    }
-    reads.sort();
-    reads.dedup();
-    reads
 }
 
 /// Complete syntax facts live for one active query, or one provider when no
@@ -673,6 +595,25 @@ impl<'a> PythonDefinitionProvider<'a> {
         brokk_bifrost_core::analyzer::definition_lookup::sort_dedup_units(units)
     }
 
+    fn workspace_fqn_prefix_exists(&self, prefix: &str) -> Option<bool> {
+        self.session
+            .query(|| self.python.workspace_fqn_prefix_exists(prefix))
+    }
+
+    fn workspace_module_prefix_exists(&self, prefix: &str) -> Option<bool> {
+        if prefix.is_empty() {
+            return Some(false);
+        }
+        if self.workspace_fqn_prefix_exists(prefix)? {
+            return Some(true);
+        }
+        self.session.query(|| {
+            self.python
+                .project()
+                .has_directory(std::path::Path::new(prefix))
+        })
+    }
+
     pub(crate) fn identifier(&self, identifier: &str) -> Vec<CodeUnit> {
         let units = self.session.query_limited_rows(|limit| {
             self.python
@@ -764,140 +705,6 @@ pub(crate) struct PythonTypeLookupResolution {
     pub(crate) target_kind: TypeLookupTargetKind,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn resolve_python_bounded(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<DefinitionLookupOutcome> {
-    let session = ResolutionSession::bounded(budget, cancellation);
-    let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
-        return session.finish(no_definition(
-            "python_analyzer_unavailable",
-            "Python analyzer is unavailable",
-        ));
-    };
-    let Some(tree) = tree else {
-        return session.finish(no_definition(
-            "python_parse_failed",
-            "Python source could not be parsed",
-        ));
-    };
-    let support = PythonDefinitionProvider::new(python, &session);
-    let Some(node) = python_smallest_named_node_covering_bounded(
-        &support,
-        tree.root_node(),
-        site.focus_start_byte,
-        site.focus_end_byte,
-    ) else {
-        return session.finish(no_definition(
-            "no_indexed_definition",
-            format!(
-                "`{}` did not resolve to an indexed Python definition",
-                site.text
-            ),
-        ));
-    };
-    if let Some(module_fqn) = python_import_module_fqn(python.project(), file, source, node)
-        && let Some(Some(module)) =
-            session.query(|| resolve_module_code_unit(python, Some(file), &module_fqn))
-    {
-        return session.finish(candidates_outcome(vec![module]));
-    }
-    if python_is_non_reference_context(node) || python_is_declaration_identifier(node) {
-        return session.finish(no_definition(
-            "declaration_or_import_site",
-            format!("`{}` is not a Python reference site", site.text),
-        ));
-    }
-    let outcome = match python_reference_node_bounded(&support, node) {
-        Some(PythonReferenceNode::Attribute { object, attribute }) => {
-            let member = python_slice(attribute, source);
-            let receiver = python_type_for_expression_bounded(
-                &support,
-                token,
-                file,
-                source,
-                tree.root_node(),
-                object,
-                0,
-            );
-            match receiver {
-                Some(receiver) if !member.is_empty() => {
-                    let candidates = support.members_for_owner(&receiver, member);
-                    if candidates.is_empty() {
-                        no_definition(
-                            "no_indexed_definition",
-                            format!(
-                                "`{}.{member}` is not indexed as a Python definition",
-                                receiver.fq_name()
-                            ),
-                        )
-                    } else {
-                        // Found by asking the index for `<receiver fq>.<member>`,
-                        // so the receiver is the owner and the walk took no
-                        // hierarchy hop (#1477). This seam has no ancestor walk
-                        // at all, so an inherited member never reaches it.
-                        let mut attribution = PythonMemberAttribution::default();
-                        attribution.record_direct(&receiver, &candidates);
-                        attribution.stage();
-                        candidates_outcome(candidates)
-                    }
-                }
-                _ => no_definition(
-                    "python_dynamic_receiver",
-                    format!(
-                        "`{}` has no structurally proven Python receiver type",
-                        site.text
-                    ),
-                ),
-            }
-        }
-        Some(PythonReferenceNode::Identifier(identifier)) => {
-            let Some(name) = python_focused_reference_text(
-                identifier,
-                source,
-                site.focus_start_byte,
-                site.focus_end_byte,
-                cancellation,
-            ) else {
-                return session.finish(no_definition(
-                    "python_reference_shape_unsupported",
-                    format!("`{}` is not a parsed Python reference", site.text),
-                ));
-            };
-            let candidates = support.file_identifier(file, name);
-            if candidates.is_empty() {
-                no_definition(
-                    "no_indexed_definition",
-                    format!("`{name}` did not resolve to an indexed Python definition"),
-                )
-            } else {
-                candidates_outcome(candidates)
-            }
-        }
-        Some(PythonReferenceNode::KeywordArgument { .. }) | None => no_definition(
-            "python_reference_shape_unsupported",
-            format!(
-                "`{}` is not a supported bounded Python reference shape",
-                site.text
-            ),
-        ),
-    };
-    if support.source_facts_unavailable() {
-        return session.finish(no_definition(
-            "python_source_facts_unavailable",
-            "Canonical Python declaration annotations are unavailable",
-        ));
-    }
-    session.finish(outcome)
-}
-
 pub(crate) fn python_type_lookup_resolution_bounded(
     support: &PythonDefinitionProvider<'_>,
     token: QueryToken<'_>,
@@ -962,7 +769,7 @@ fn python_external_class_reference_fqn_bounded(
         python_external_imported_symbol_bounded(support, token, file, source, root, reference)?;
     let qualified_name = format!("{module}.{member}");
     let overlay = support.python.semantic_model_overlay()?;
-    let matched = overlay.symbols_named(&qualified_name);
+    let matched = overlay.symbols_named_for(&qualified_name, "python");
     matched
         .records
         .iter()
@@ -1047,14 +854,7 @@ fn python_keyword_argument_with_step<'tree>(
     if !scope_step() || call.kind() != "call" {
         return None;
     }
-    Some(PythonReferenceNode::KeywordArgument { call, name: node })
-}
-
-fn python_reference_node_bounded<'tree>(
-    support: &PythonDefinitionProvider<'_>,
-    node: Node<'tree>,
-) -> Option<PythonReferenceNode<'tree>> {
-    python_reference_node_with_step(node, || support.scope_step())
+    Some(PythonReferenceNode::KeywordArgument)
 }
 
 fn python_reference_node_with_step<'tree>(
@@ -1087,12 +887,11 @@ fn python_reference_node_with_step<'tree>(
     match node.kind() {
         "attribute" => {
             let object = node.child_by_field_name("object")?;
-            let attribute = node.child_by_field_name("attribute")?;
-            Some(PythonReferenceNode::Attribute { object, attribute })
+            Some(PythonReferenceNode::Attribute { object })
         }
-        "identifier" => Some(PythonReferenceNode::Identifier(node)),
+        "identifier" => Some(PythonReferenceNode::Identifier),
         "string_content" if python_node_is_in_annotation(node) => {
-            Some(PythonReferenceNode::Identifier(node))
+            Some(PythonReferenceNode::Identifier)
         }
         _ => None,
     }
@@ -1167,45 +966,6 @@ pub(crate) fn python_attribute_callee_kind_bounded(
     } else {
         PythonAttributeCalleeKind::Value
     })
-}
-
-/// Whether an attribute call uses the conventional Python receiver name.
-pub(crate) fn python_attribute_callee_uses_self_or_cls_bounded(
-    source: &str,
-    callee: Node<'_>,
-) -> bool {
-    let Some(object) = callee.child_by_field_name("object") else {
-        return false;
-    };
-    object.kind() == "identifier" && matches!(python_slice(object, source), "self" | "cls")
-}
-
-/// Whether an attribute callee names a nested class in its enclosing class.
-pub(crate) fn python_attribute_callee_names_enclosing_nested_class_bounded(
-    source: &str,
-    callee: Node<'_>,
-) -> bool {
-    let Some(attribute) = callee.child_by_field_name("attribute") else {
-        return false;
-    };
-    let name = python_slice(attribute, source);
-    let mut ancestor = callee.parent();
-    while let Some(node) = ancestor {
-        if node.kind() == "class_definition" {
-            let Some(body) = node.child_by_field_name("body") else {
-                return false;
-            };
-            let mut cursor = body.walk();
-            return body.named_children(&mut cursor).any(|member| {
-                member.kind() == "class_definition"
-                    && member
-                        .child_by_field_name("name")
-                        .is_some_and(|class_name| python_slice(class_name, source) == name)
-            });
-        }
-        ancestor = node.parent();
-    }
-    false
 }
 
 /// Whether an attribute callee reads a stored value rather than naming a
@@ -1437,12 +1197,87 @@ pub(crate) fn python_external_model_namespace_available(
         && support.scope_step()
 }
 
+/// Whether a class base expression is rooted in one unshadowed, unmutated,
+/// module-level import of a module that the workspace does not contain.
+///
+/// Such a base names a class outside the analyzed program. When no active
+/// model covers it, the base is an unknown external endpoint rather than a
+/// workspace lookup that failed. Imports of workspace modules, relative imports
+/// (resolved into the importing package), wildcard-shadowed names and any
+/// other binding keep the caller's failed-resolution answer. `None` is a
+/// stopped walk.
+pub(crate) fn python_base_imported_from_external_module_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+) -> Option<bool> {
+    let path = python_static_attribute_path_bounded(expression, || support.scope_step())?;
+    let local_name = python_slice(*path.first()?, source);
+    if local_name.is_empty()
+        || !support.module_binding_unmutated_from_source_bounded(
+            file, root, source, local_name, expression,
+        )?
+        || python_namespace_root_shadowed_bounded(support, local_name, expression, source)?
+        || !python_import_binding_is_unique_bounded(
+            support,
+            root,
+            local_name,
+            expression.start_byte(),
+            source,
+        )?
+    {
+        return Some(false);
+    }
+    let binder = support.import_binder(token, file)?;
+    let Some(binding) = binder.bindings.get(local_name) else {
+        return Some(false);
+    };
+    let (module, member) = match binding.kind {
+        ImportKind::Named => {
+            let Some(member) = binding.imported_name.as_deref() else {
+                return Some(false);
+            };
+            (binding.module_specifier.clone(), member.to_owned())
+        }
+        // An unaliased `import pkg.child` binds `pkg`, while the expression
+        // continues through `child`; append those segments so the full module
+        // is checked rather than only the bound root.
+        ImportKind::Namespace if path.len() >= 2 => {
+            let mut module = binding.module_specifier.clone();
+            for segment in &path[1..path.len() - 1] {
+                module.push('.');
+                module.push_str(python_slice(*segment, source));
+            }
+            (module, python_slice(*path.last()?, source).to_owned())
+        }
+        _ => return Some(false),
+    };
+    // The binder resolves relative imports to absolute module names, so a
+    // workspace package root rejects both `from .missing import X` and an
+    // absolute import of a workspace module that does not declare the class.
+    let package = module.split('.').next().unwrap_or(module.as_str());
+    // A namespace package has no module unit or declaration of its own, so
+    // exact symbol lookups cannot see its descendants. Its directory still
+    // keeps `from nspkg import Missing` and relative imports beside
+    // `nspkg/sub.py` inside the workspace.
+    let package_exists = support.workspace_module_prefix_exists(package)?;
+    let external =
+        !package_exists && python_external_model_namespace_available(support, &module, &member);
+    if !support.python.indexed_source_matches(file, source) {
+        return None;
+    }
+    Some(external)
+}
+
 fn python_complete_external_module(
     support: &PythonDefinitionProvider<'_>,
     module: &str,
 ) -> Option<()> {
     let overlay = support.python.semantic_model_overlay()?;
-    let matched = overlay.symbols_named(module);
+    let matched = overlay.symbols_named_for(module, "python");
     let [symbol] = matched.records.as_slice() else {
         return None;
     };
@@ -1465,273 +1300,6 @@ fn python_complete_external_module(
         return None;
     }
     Some(())
-}
-
-pub(crate) fn python_external_imported_symbol_at_range_bounded(
-    py: &PythonAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    start_byte: usize,
-    end_byte: usize,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<Option<(String, String)>> {
-    let session = ResolutionSession::bounded(
-        brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-        cancellation,
-    );
-    let support = PythonDefinitionProvider::new(py, &session);
-    let resolved = brokk_bifrost_python::declarations::parse_python_tree(source).and_then(|tree| {
-        if tree.root_node().has_error() {
-            return None;
-        }
-        let mut pending = vec![tree.root_node()];
-        let mut exact = None;
-        while let Some(node) = pending.pop() {
-            if node.start_byte() == start_byte && node.end_byte() == end_byte {
-                if exact.is_some() {
-                    return None;
-                }
-                exact = Some(node);
-            }
-            let mut cursor = node.walk();
-            pending.extend(node.named_children(&mut cursor));
-        }
-        let selected = exact?;
-        let expression = if selected.kind() == "call" {
-            selected.child_by_field_name("function")?
-        } else {
-            selected
-        };
-        python_external_imported_symbol_bounded(
-            &support,
-            token,
-            file,
-            source,
-            tree.root_node(),
-            expression,
-        )
-    });
-    session.finish(resolved)
-}
-
-pub(crate) enum PythonImportedClassValueSelection {
-    Proven {
-        import_module: Vec<String>,
-        class_name: String,
-    },
-    Unproven(String),
-}
-
-/// Recognize a direct imported symbol used as a value, preserving the import's
-/// parser-derived module segments for the runtime binding resolver. This does
-/// not follow assignments or turn a constructor call into a class-object use.
-pub(crate) fn python_imported_class_value_selection_bounded(
-    py: &PythonAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-    cancellation: Option<&CancellationToken>,
-) -> BoundedResolution<Option<PythonImportedClassValueSelection>> {
-    let session = ResolutionSession::bounded(
-        brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-        cancellation,
-    );
-    let support = PythonDefinitionProvider::new(py, &session);
-    let selection = python_smallest_named_node_covering_bounded(
-        &support,
-        root,
-        site.focus_start_byte,
-        site.focus_end_byte,
-    )
-    .and_then(|focus| python_imported_value_expression_bounded(&support, focus))
-    .and_then(|expression| {
-        python_imported_class_value_candidate_bounded(
-            &support, token, file, source, root, expression,
-        )
-    });
-    session.finish(selection)
-}
-
-fn python_imported_class_value_candidate_bounded(
-    support: &PythonDefinitionProvider<'_>,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    expression: Node<'_>,
-) -> Option<PythonImportedClassValueSelection> {
-    let path = python_static_attribute_path(expression)?;
-    let local_name = python_slice(*path.first()?, source);
-    if local_name.is_empty() {
-        return None;
-    }
-    if python_namespace_root_shadowed_bounded(support, local_name, expression, source)? {
-        return None;
-    }
-    let imports = support
-        .session
-        .query(|| support.python.import_info_of(token, file))?;
-    let matching_imports = imports
-        .iter()
-        .filter(|import| import.local_name() == Some(local_name))
-        .count();
-    if matching_imports > 1 {
-        return Some(PythonImportedClassValueSelection::Unproven(format!(
-            "`{local_name}` has multiple parser-recorded imports at this value reference"
-        )));
-    }
-    if matching_imports == 0 && imports.iter().any(|import| import.is_wildcard) {
-        return Some(PythonImportedClassValueSelection::Unproven(format!(
-            "`{local_name}` may be supplied by a wildcard import whose member identity is unresolved"
-        )));
-    }
-    if matching_imports == 0 {
-        return None;
-    }
-    let binder = support.import_binder(token, file)?;
-    let Some(binding) = binder.bindings.get(local_name) else {
-        return Some(PythonImportedClassValueSelection::Unproven(format!(
-            "parser-recorded import `{local_name}` has no resolved import-binder record"
-        )));
-    };
-    let class_name = match binding.kind {
-        ImportKind::Named if path.len() == 1 => binding.imported_name.as_ref()?.clone(),
-        ImportKind::Namespace if path.len() == 2 => python_slice(path[1], source).to_owned(),
-        // A longer attribute chain is outside this direct imported-class
-        // route. Keep the original resolver's boundary result for it instead
-        // of treating an attribute as a class-binding failure.
-        ImportKind::Named | ImportKind::Namespace => return None,
-        _ => {
-            return Some(PythonImportedClassValueSelection::Unproven(format!(
-                "import binder `{local_name}` does not provide a direct class-value route"
-            )));
-        }
-    };
-    let Some((module, proved_class_name)) =
-        python_external_imported_symbol_bounded(support, token, file, source, root, expression)
-    else {
-        return Some(PythonImportedClassValueSelection::Unproven(format!(
-            "imported class candidate `{local_name}.{class_name}` was shadowed or its import identity was not unique"
-        )));
-    };
-    let Some(import_module) = python_external_import_module_segments_bounded(
-        support,
-        token,
-        file,
-        source,
-        expression,
-        &module,
-        &proved_class_name,
-    ) else {
-        return Some(PythonImportedClassValueSelection::Unproven(format!(
-            "imported class candidate `{local_name}.{class_name}` has no unique structured module path"
-        )));
-    };
-    Some(PythonImportedClassValueSelection::Proven {
-        import_module,
-        class_name: proved_class_name,
-    })
-}
-
-fn python_imported_value_expression_bounded<'tree>(
-    support: &PythonDefinitionProvider<'_>,
-    focus: Node<'tree>,
-) -> Option<Node<'tree>> {
-    if python_is_non_reference_context(focus)
-        || python_is_declaration_identifier(focus)
-        || focus.kind() == "string_content"
-    {
-        return None;
-    }
-    let mut expression = focus;
-    while let Some(parent) = expression.parent() {
-        if !support.scope_step() {
-            return None;
-        }
-        if parent.kind() != "attribute"
-            || parent.child_by_field_name("attribute") != Some(expression)
-        {
-            break;
-        }
-        expression = parent;
-    }
-    let path = python_static_attribute_path(expression)?;
-    for _ in 0..path.len() {
-        if !support.scope_step() {
-            return None;
-        }
-    }
-    let mut current = expression;
-    while let Some(parent) = current.parent() {
-        if !support.scope_step() {
-            return None;
-        }
-        if (parent.kind() == "call" && parent.child_by_field_name("function") == Some(current))
-            || (matches!(parent.kind(), "assignment" | "augmented_assignment")
-                && parent
-                    .child_by_field_name("left")
-                    .is_some_and(|left| node_contains_focus(left, current)))
-            || (parent.kind() == "keyword_argument"
-                && parent
-                    .child_by_field_name("name")
-                    .is_some_and(|name| node_contains_focus(name, current)))
-        {
-            return None;
-        }
-        current = parent;
-    }
-    Some(expression)
-}
-
-fn python_external_import_module_segments_bounded(
-    support: &PythonDefinitionProvider<'_>,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    source: &str,
-    expression: Node<'_>,
-    expected_module: &str,
-    expected_member: &str,
-) -> Option<Vec<String>> {
-    let path = python_static_attribute_path(expression)?;
-    let local_name = python_slice(*path.first()?, source);
-    let imports = support
-        .session
-        .query(|| support.python.import_info_of(token, file))?;
-    let mut matches = imports.iter().filter_map(|import| {
-        if import.local_name() != Some(local_name) {
-            return None;
-        }
-        let path = import.path.as_ref()?;
-        match path.kind? {
-            brokk_bifrost_core::analyzer::model::StructuredImportPathKind::Namespace
-                if path.render_segments(".") == expected_module =>
-            {
-                Some(path.segments.clone())
-            }
-            brokk_bifrost_core::analyzer::model::StructuredImportPathKind::ImportFrom
-                if path
-                    .segments
-                    .last()
-                    .is_some_and(|member| member == expected_member)
-                    && path.segments[..path.segments.len().saturating_sub(1)].join(".")
-                        == expected_module =>
-            {
-                Some(path.segments[..path.segments.len() - 1].to_vec())
-            }
-            _ => None,
-        }
-    });
-    let import_module = matches.next()?;
-    if matches.next().is_some()
-        || import_module.is_empty()
-        || import_module.iter().any(String::is_empty)
-    {
-        return None;
-    }
-    Some(import_module)
 }
 
 fn python_namespace_root_shadowed_bounded(
@@ -2076,23 +1644,6 @@ fn python_import_binding_is_unique_without_wildcards_bounded(
         }
     }
     Some(matched_import)
-}
-
-fn python_focused_reference_text<'source>(
-    node: Node<'_>,
-    source: &'source str,
-    focus_start: usize,
-    focus_end: usize,
-    cancellation: Option<&CancellationToken>,
-) -> Option<&'source str> {
-    if node.kind() != "string_content" {
-        return Some(python_slice(node, source));
-    }
-    let string = node.parent()?;
-    python_deferred_annotation_identifier_ranges(string, source, cancellation)?
-        .into_iter()
-        .any(|range| range.start_byte == focus_start && range.end_byte == focus_end)
-        .then(|| source.get(focus_start..focus_end))?
 }
 
 fn python_type_for_expression_bounded(
@@ -3973,373 +3524,6 @@ fn python_enclosing_body_callable_bounded<'tree>(
     )
 }
 
-pub(crate) fn resolve_python(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    context: &mut DefinitionBatchContext<'_, '_>,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-) -> DefinitionLookupOutcome {
-    let Some(py) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
-        return no_definition(
-            "python_analyzer_unavailable",
-            "Python analyzer is unavailable",
-        );
-    };
-    let Some(tree) = tree else {
-        return no_definition("python_parse_failed", "Python source could not be parsed");
-    };
-    if py.python_source_facts(token, file, &|| true).is_none() {
-        return no_definition(
-            "python_source_facts_unavailable",
-            "Canonical Python declaration annotations are unavailable",
-        );
-    }
-    let Some(node) =
-        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
-    else {
-        return no_definition(
-            "no_indexed_definition",
-            format!(
-                "`{}` did not resolve to an indexed Python definition",
-                site.text
-            ),
-        );
-    };
-    if let Some(module_fqn) = python_import_module_fqn(py.project(), file, source, node)
-        && let Some(module) = resolve_module_code_unit(py, Some(file), &module_fqn)
-    {
-        return candidates_outcome(vec![module]);
-    }
-    if python_is_non_reference_context(node) || python_is_declaration_identifier(node) {
-        return no_definition(
-            "declaration_or_import_site",
-            format!("`{}` is not a Python reference site", site.text),
-        );
-    }
-    if python_type_parameter_binds_name_at(&site.text, node, source) {
-        return no_definition(
-            "local_variable_reference",
-            format!("`{}` is a local Python type parameter", site.text),
-        );
-    }
-    if let Some(candidates) = python_annotation_focus_candidates(
-        analyzer,
-        py,
-        file,
-        source,
-        node,
-        site.focus_start_byte,
-        site.focus_end_byte,
-    ) {
-        return if candidates.is_empty() {
-            no_definition(
-                "no_indexed_definition",
-                format!(
-                    "annotation `{}` did not resolve to an indexed Python definition",
-                    site.text
-                ),
-            )
-        } else {
-            candidates_outcome(candidates)
-        };
-    }
-
-    let ctx = context
-        .language_state::<PythonDefinitionState>()
-        .python_context(token, py, analyzer, file, source);
-    let support = context.bounded_support();
-    let reference = python_reference_node(node);
-    match reference {
-        Some(PythonReferenceNode::Attribute { object, attribute }) => {
-            let object_text = python_slice(object, source);
-            let attribute_text = python_slice(attribute, source);
-            if object_text.is_empty() || attribute_text.is_empty() {
-                return no_definition("no_reference_text", "Python attribute reference is blank");
-            }
-            // Shadowing belongs to the root binding, not the rendered object
-            // chain. For `K.feature.DISK` the import binder is `K`; asking the
-            // lexical inventory about the non-binding spelling `K.feature`
-            // allowed a parameter named `K` to fall through to the namespace
-            // import route.
-            let (shadow_name, shadow_site) = leftmost_identifier(object)
-                .map(|root| (python_slice(root, source), root))
-                .unwrap_or((object_text, object));
-            let object_shadowed = ctx.name_shadowed_at(shadow_name, shadow_site, source);
-            if !object_shadowed && let Some(module) = ctx.namespace_module_for_node(object, source)
-            {
-                return python_fqn_outcome(
-                    py,
-                    support,
-                    file,
-                    &format!("{module}.{attribute_text}"),
-                    site.text.as_str(),
-                );
-            }
-            if !object_shadowed
-                && let Some(receiver_type) = ctx.receiver_type_for_object(py, support, object_text)
-            {
-                return python_member_outcome(
-                    analyzer,
-                    support,
-                    receiver_type,
-                    attribute_text,
-                    site,
-                );
-            }
-            if let Some(receiver_type) = python_receiver_type_unit(
-                analyzer,
-                token,
-                py,
-                support,
-                &ctx,
-                file,
-                source,
-                tree.root_node(),
-                object,
-            ) {
-                return python_member_outcome(
-                    analyzer,
-                    support,
-                    receiver_type,
-                    attribute_text,
-                    site,
-                );
-            }
-            if object_shadowed {
-                return no_definition(
-                    "local_variable_reference",
-                    format!("`{object_text}` is a local Python value"),
-                );
-            }
-            if let Some(import_target) = python_unresolved_import_boundary(
-                py,
-                file,
-                analyzer,
-                token,
-                object_text,
-                Some(attribute_text),
-            ) {
-                return python_import_binding_outcome(
-                    analyzer,
-                    py,
-                    token,
-                    support,
-                    file,
-                    object_text,
-                    Some(attribute_text),
-                    &import_target,
-                    site.text.as_str(),
-                );
-            }
-            no_definition(
-                "no_indexed_definition",
-                format!(
-                    "`{}` did not resolve to an indexed Python definition",
-                    site.text
-                ),
-            )
-        }
-        Some(PythonReferenceNode::Identifier(identifier)) => {
-            let Some(text) = python_focused_reference_text(
-                identifier,
-                source,
-                site.focus_start_byte,
-                site.focus_end_byte,
-                None,
-            ) else {
-                return no_definition(
-                    "python_reference_shape_unsupported",
-                    format!("`{}` is not a parsed Python reference", site.text),
-                );
-            };
-            if text.is_empty() {
-                return no_definition("no_reference_text", "Python identifier is blank");
-            }
-            if let Some(candidates) = python_function_import_binding_candidates(
-                py,
-                support,
-                &ctx,
-                source,
-                tree.root_node(),
-                identifier,
-                text,
-            ) {
-                return if candidates.is_empty() {
-                    no_definition(
-                        "local_variable_reference",
-                        format!(
-                            "`{text}` has a function-local Python binding without one indexed import target"
-                        ),
-                    )
-                } else {
-                    candidates_outcome(candidates)
-                };
-            }
-            if ctx.name_shadowed_at(text, identifier, source) {
-                return no_definition(
-                    "local_variable_reference",
-                    format!("`{text}` is a local Python value"),
-                );
-            }
-            if let Some(local) = ctx.same_file.get(text) {
-                let class_candidates =
-                    python_visible_class_binding_candidates(analyzer, file, identifier, local);
-                if !class_candidates.is_empty() {
-                    return candidates_outcome(class_candidates);
-                }
-            }
-            if let Some(candidates) = python_visible_module_binding_candidates(
-                analyzer,
-                py,
-                support,
-                &ctx,
-                source,
-                tree.root_node(),
-                identifier,
-                text,
-            ) {
-                if !candidates.is_empty() {
-                    return candidates_outcome(candidates);
-                }
-                if let Some(import_target) =
-                    python_unresolved_import_boundary(py, file, analyzer, token, text, None)
-                {
-                    return python_import_binding_outcome(
-                        analyzer,
-                        py,
-                        token,
-                        support,
-                        file,
-                        text,
-                        None,
-                        &import_target,
-                        text,
-                    );
-                }
-                if is_python_builtin_or_constant(text) {
-                    return no_definition(
-                        PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND,
-                        format!("`{text}` is supplied by the Python runtime"),
-                    );
-                }
-                if let Some(module) = ctx.namespace.get(text) {
-                    return python_module_outcome(py, support, file, module, text);
-                }
-                return no_definition(
-                    "no_indexed_definition",
-                    format!("`{text}` is bound locally but has no indexed Python definition"),
-                );
-            }
-            if let Some(module) = ctx.namespace.get(text) {
-                return python_module_outcome(py, support, file, module, text);
-            }
-            if let Some(fqn) = ctx.named.get(text) {
-                return python_fqn_outcome(py, support, file, fqn, text);
-            }
-            if let Some(candidates) = ctx.same_file.get(text)
-                && !candidates.is_empty()
-            {
-                let candidates =
-                    python_visible_same_file_candidates(analyzer, file, identifier, candidates);
-                if !candidates.is_empty() {
-                    return candidates_outcome(candidates);
-                }
-            }
-            if is_python_builtin_or_constant(text) {
-                return no_definition(
-                    PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND,
-                    format!("`{text}` is supplied by the Python runtime"),
-                );
-            }
-            if let Some(import_target) =
-                python_unresolved_import_boundary(py, file, analyzer, token, text, None)
-            {
-                return python_import_binding_outcome(
-                    analyzer,
-                    py,
-                    token,
-                    support,
-                    file,
-                    text,
-                    None,
-                    &import_target,
-                    text,
-                );
-            }
-            no_definition(
-                "no_indexed_definition",
-                format!("`{text}` did not resolve to an indexed Python definition"),
-            )
-        }
-        Some(PythonReferenceNode::KeywordArgument { call, name }) => {
-            let name_text = python_slice(name, source);
-            if name_text.is_empty() {
-                return no_definition("no_reference_text", "Python keyword argument is blank");
-            }
-            let Some(function) = call.child_by_field_name("function") else {
-                return no_definition("no_function_name", "Python call has no callee");
-            };
-            // `Foo(a=..)` -> `a` is a member/parameter of the callee's type (e.g. a
-            // dataclass field `Foo.a`). Type the callee and look the name up as a
-            // member.
-            if let Some(receiver_type) = python_receiver_type_unit(
-                analyzer,
-                token,
-                py,
-                support,
-                &ctx,
-                file,
-                source,
-                tree.root_node(),
-                function,
-            ) {
-                return python_member_outcome(analyzer, support, receiver_type, name_text, site);
-            }
-            no_definition(
-                "no_indexed_definition",
-                format!(
-                    "keyword argument `{name_text}` did not resolve to an indexed Python member"
-                ),
-            )
-        }
-        None => no_definition(
-            "unsupported_python_reference_shape",
-            format!(
-                "`{}` is a Python `{}` reference shape that get_definition does not resolve yet",
-                site.text,
-                node.kind()
-            ),
-        ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn python_annotation_focus_candidates(
-    analyzer: &dyn IAnalyzer,
-    python: &PythonAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    focus_start: usize,
-    focus_end: usize,
-) -> Option<Vec<CodeUnit>> {
-    with_python_graph_source(analyzer, |graph| {
-        annotation_reference_candidates_at_focus(
-            &graph,
-            python,
-            file,
-            source,
-            node,
-            focus_start,
-            focus_end,
-            true,
-        )
-    })
-}
-
 /// Restore the exact synthetic identifier selected inside a deferred annotation.
 ///
 /// Tree-sitter represents the contents of `"Widget | Gadget"` as one
@@ -4399,6 +3583,8 @@ pub(crate) fn python_site_for_focus(
 /// unconditional, module- or function-scoped binding visible at a static call.
 /// Rebinding, competing bindings, wildcard/class-local uncertainty, and the
 /// wrong attribute depth intentionally return no proof.
+// No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PythonImportedCallSelection {
     pub(crate) proof: ExactExternalCallProof,
     pub(crate) module: Vec<String>,
@@ -4409,6 +3595,8 @@ pub(crate) struct PythonImportedCallSelection {
 pub(crate) struct PythonImportedSymbolSelection {
     pub(crate) module: Vec<String>,
     pub(crate) member: String,
+    // No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+    #[cfg_attr(not(test), allow(dead_code))]
     canonical_name: String,
     import_kind: brokk_bifrost_core::analyzer::model::StructuredImportPathKind,
     // Selected structured namespace segments consumed before the final member.
@@ -4610,6 +3798,8 @@ fn python_imported_symbol_for_binding_bounded(
     })
 }
 
+// No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn exact_python_imported_call_selection(
     source: &str,
     tree: &Tree,
@@ -4888,6 +4078,8 @@ fn python_function_import_is_unconditional_bounded(
     Some(current.parent() == Some(body) && body.parent() == Some(function))
 }
 
+// No production caller since #5658 M8 step 1a; tests still exercise it until the legacy resolver is deleted (#5658).
+#[cfg_attr(not(test), allow(dead_code))]
 fn python_visible_module_import_binding_bounded<'a>(
     root: Node<'_>,
     bindings: &'a [PythonImportBinding],
@@ -4973,245 +4165,6 @@ fn python_visible_module_import_binding_bounded<'a>(
     })
     .ok()?;
     Some((matched && valid).then_some(binding))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn python_visible_module_binding_candidates(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    context: &PythonDefinitionContext,
-    source: &str,
-    root: Node<'_>,
-    node: Node<'_>,
-    name: &str,
-) -> Option<Vec<CodeUnit>> {
-    let timeline = context.module_bindings(source, root);
-    let events = timeline.get(name)?;
-    let cutoff = if python_reference_is_deferred_function_body(node) {
-        usize::MAX
-    } else {
-        node.start_byte()
-    };
-    let mut candidates = Vec::new();
-    for event in visible_module_binding_suffix(events, cutoff) {
-        match &event.kind {
-            ModuleBindingEventKind::FromImport {
-                module,
-                imported_name,
-            } => {
-                let mut resolved = false;
-                for module_file in usage_resolve_module_files(py, &context.file, module) {
-                    let Some(module_fqn) = analyzer
-                        .declarations(&module_file)
-                        .into_iter()
-                        .find(CodeUnit::is_module)
-                        .map(|unit| unit.fq_name())
-                    else {
-                        continue;
-                    };
-                    resolved = true;
-                    let fqn = format!("{module_fqn}.{imported_name}");
-                    if let Some(module) = resolve_module_code_unit(py, Some(&context.file), &fqn)
-                        && module.fq_name() == fqn
-                    {
-                        candidates.push(module);
-                        continue;
-                    }
-                    let mut imported =
-                        resolve_fqn_candidates(py, Some(&context.file), &fqn, |candidate| {
-                            support.fqn(candidate)
-                        });
-                    imported
-                        .retain(|candidate| !candidate.is_module() || candidate.fq_name() == fqn);
-                    candidates.extend(imported);
-                }
-                if !resolved {
-                    if let Some(fqn) = context.named.get(name) {
-                        let imported =
-                            resolve_fqn_candidates(py, Some(&context.file), fqn, |candidate| {
-                                support.fqn(candidate)
-                            });
-                        if !imported.is_empty() {
-                            candidates.extend(imported);
-                            continue;
-                        }
-                    }
-                    let fqn = if module.ends_with('.') {
-                        format!("{module}{imported_name}")
-                    } else {
-                        format!("{module}.{imported_name}")
-                    };
-                    let mut resolved_candidates =
-                        resolve_fqn_candidates(py, Some(&context.file), &fqn, |candidate| {
-                            support.fqn(candidate)
-                        });
-                    if resolved_candidates.is_empty() {
-                        // No Python module backs the specifier because it names a
-                        // CLR/JVM namespace this workspace indexes in another
-                        // language (#1174) -- pythonnet's
-                        // `from Python.Test import ClassCtorTest2`.
-                        resolved_candidates = python_cross_language_declarations(support, &fqn);
-                    }
-                    candidates.extend(resolved_candidates);
-                }
-            }
-            ModuleBindingEventKind::ImportModule { module, .. } => {
-                let bound_module = context
-                    .namespace
-                    .get(name)
-                    .map(String::as_str)
-                    .unwrap_or(module);
-                candidates.extend(resolve_module_code_unit(
-                    py,
-                    Some(&context.file),
-                    bound_module,
-                ));
-            }
-            ModuleBindingEventKind::Other => {
-                if let Some(local) = context.same_file.get(name) {
-                    candidates.extend(python_same_file_candidates_for_binding_event(
-                        analyzer,
-                        &context.file,
-                        root,
-                        node,
-                        local,
-                        event.visible_from,
-                    ));
-                }
-            }
-        }
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    Some(candidates)
-}
-
-fn python_function_import_binding_candidates(
-    py: &PythonAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    context: &PythonDefinitionContext,
-    source: &str,
-    root: Node<'_>,
-    node: Node<'_>,
-    name: &str,
-) -> Option<Vec<CodeUnit>> {
-    let bindings = context.scoped_import_bindings(source, root);
-    let binding = python_function_scoped_import_binding(&bindings, name, node)?;
-
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if matches!(parent.kind(), "function_definition" | "lambda") {
-            let inventory = python_lexical_scope_inventory_bounded(parent, source, || true)?;
-            if inventory.has_runtime_callable_binding_at(name, node) {
-                return Some(Vec::new());
-            }
-            break;
-        }
-        current = parent.parent();
-    }
-
-    let qualified_name =
-        resolve_python_relative_module(py.project(), &context.file, &binding.qualified_name)
-            .unwrap_or_else(|| binding.qualified_name.clone());
-    Some(resolve_fqn_candidates(
-        py,
-        Some(&context.file),
-        &qualified_name,
-        |candidate| support.fqn(candidate),
-    ))
-}
-
-fn python_same_file_candidates_for_binding_event(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    root: Node<'_>,
-    node: Node<'_>,
-    candidates: &[CodeUnit],
-    event_visible_from: usize,
-) -> Vec<CodeUnit> {
-    let visible = python_visible_same_file_candidates(analyzer, file, node, candidates);
-    // A function and a later assignment intentionally share one Python FQN, so
-    // this event has to name the physical declaration that was active when the
-    // event became visible instead of merging both units (#2053).
-    //
-    // Repeated assignments to one module-level name are one declaration, and
-    // the analyzer records it once, at its last spelling. An event that precedes
-    // every recorded range is therefore still a binding of that same
-    // declaration, written again further down; rejecting it discarded the
-    // timeline's own answer and reported a bound module-level name as having no
-    // indexed definition (#2157). The anchor is the latest declaration at or
-    // before the event, and the earliest recorded declaration when they all
-    // follow it.
-    let declaration_ends: Vec<usize> = visible
-        .iter()
-        .flat_map(|candidate| analyzer.ranges(candidate))
-        .map(|range| range.end_byte)
-        .collect();
-    let anchor_end = declaration_ends
-        .iter()
-        .copied()
-        .filter(|end| *end <= event_visible_from)
-        .max()
-        .or_else(|| declaration_ends.iter().copied().min());
-    let Some(anchor_end) = anchor_end else {
-        return Vec::new();
-    };
-    let reference_path = python_conditional_branch_path(node);
-    let event_path = event_visible_from
-        .checked_sub(1)
-        .and_then(|start| root.named_descendant_for_byte_range(start, event_visible_from))
-        .map(python_conditional_branch_path)
-        .unwrap_or_default();
-    visible
-        .into_iter()
-        .filter(|candidate| {
-            analyzer.ranges(candidate).iter().any(|range| {
-                range.end_byte == anchor_end
-                    && ((candidate.is_function()
-                        && range.start_byte <= node.start_byte()
-                        && node.end_byte() <= range.end_byte)
-                        || python_conditional_paths_are_compatible(&reference_path, &event_path))
-            })
-        })
-        .collect()
-}
-
-fn python_conditional_branch_path(mut node: Node<'_>) -> Vec<(usize, usize)> {
-    let mut path = Vec::new();
-    while let Some(parent) = node.parent() {
-        if matches!(parent.kind(), "if_statement" | "elif_clause") {
-            let in_condition = parent
-                .child_by_field_name("condition")
-                .is_some_and(|condition| {
-                    condition.start_byte() <= node.start_byte()
-                        && node.end_byte() <= condition.end_byte()
-                });
-            if !in_condition {
-                path.push((parent.start_byte(), node.start_byte()));
-            }
-        }
-        if matches!(
-            parent.kind(),
-            "module" | "function_definition" | "class_definition"
-        ) {
-            break;
-        }
-        node = parent;
-    }
-    path
-}
-
-fn python_conditional_paths_are_compatible(
-    left: &[(usize, usize)],
-    right: &[(usize, usize)],
-) -> bool {
-    left.iter().all(|(conditional, arm)| {
-        right
-            .iter()
-            .find(|(other, _)| other == conditional)
-            .is_none_or(|(_, other_arm)| other_arm == arm)
-    })
 }
 
 /// Which same-file declarations a bare Python name written at `node` can bind
@@ -5346,9 +4299,6 @@ pub(crate) struct PythonDefinitionContext {
     same_file: HashMap<String, Vec<CodeUnit>>,
     scope_facts: OnceLock<Replayable<Arc<PythonScopeFacts>>>,
     lexical_scopes: Mutex<HashMap<(usize, usize), PythonLexicalScopeBindings>>,
-    module_bindings: OnceLock<Arc<ModuleBindingTimeline>>,
-    scoped_import_bindings: OnceLock<Arc<Vec<PythonImportBinding>>>,
-    imports: Vec<brokk_bifrost_core::analyzer::model::ImportInfo>,
     source_sha256: [u8; 32],
     receiver_types: Mutex<PythonReceiverTypeCache>,
     #[cfg(test)]
@@ -5429,12 +4379,6 @@ impl PythonDefinitionContext {
             same_file,
             scope_facts: OnceLock::new(),
             lexical_scopes: Mutex::default(),
-            module_bindings: OnceLock::new(),
-            scoped_import_bindings: OnceLock::new(),
-            imports: analyzer
-                .import_analysis_provider()
-                .expect("Python import provider")
-                .import_info_of(token, file),
             receiver_types: Mutex::new(PythonReceiverTypeCache::new(
                 PYTHON_RECEIVER_TYPE_CACHE_LIMIT,
             )),
@@ -5570,25 +4514,6 @@ impl PythonDefinitionContext {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_receiver_type_cache_limit(&self, limit: usize) {
-        let mut cache = self
-            .receiver_types
-            .lock()
-            .expect("Python receiver type cache mutex poisoned");
-        cache.limit = limit;
-        cache.values.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn receiver_type_cache_len(&self) -> usize {
-        self.receiver_types
-            .lock()
-            .expect("Python receiver type cache mutex poisoned")
-            .values
-            .len()
-    }
-
     fn scope_facts(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -5634,36 +4559,6 @@ impl PythonDefinitionContext {
         entry.receipt.replay();
         Some(Arc::clone(&entry.value))
     }
-
-    fn module_bindings(&self, source: &str, root: Node<'_>) -> Arc<ModuleBindingTimeline> {
-        debug_assert!({
-            let keys = brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(source);
-            keys.as_bytes() == &self.source_sha256
-        });
-        self.module_bindings
-            .get_or_init(|| Arc::new(collect_module_binding_timeline(root, source, &self.imports)))
-            .clone()
-    }
-
-    fn scoped_import_bindings(
-        &self,
-        source: &str,
-        root: Node<'_>,
-    ) -> Arc<Vec<PythonImportBinding>> {
-        debug_assert!({
-            let keys = brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(source);
-            keys.as_bytes() == &self.source_sha256
-        });
-        self.scoped_import_bindings
-            .get_or_init(|| {
-                Arc::new(python_import_bindings_from_imports(
-                    &self.imports,
-                    root,
-                    source.len(),
-                ))
-            })
-            .clone()
-    }
 }
 
 #[cfg(test)]
@@ -5676,18 +4571,14 @@ pub(crate) struct PythonDefinitionBuildCounters {
 }
 
 enum PythonReferenceNode<'tree> {
-    Identifier(Node<'tree>),
+    Identifier,
     Attribute {
         object: Node<'tree>,
-        attribute: Node<'tree>,
     },
     /// A keyword argument `name=value` in a call `Callee(name=..)`: `name` resolves
     /// to the callee type's member/parameter (e.g. a dataclass field `Foo.a`), not
     /// a name in scope.
-    KeywordArgument {
-        call: Node<'tree>,
-        name: Node<'tree>,
-    },
+    KeywordArgument,
 }
 
 /// A keyword-argument identifier (`a` in `Foo(a=3)`): the `name` of a
@@ -5696,72 +4587,12 @@ fn python_reference_node(node: Node<'_>) -> Option<PythonReferenceNode<'_>> {
     python_reference_node_with_step(node, || true)
 }
 
-fn python_fqn_outcome(
-    py: &PythonAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    importer: &ProjectFile,
-    fqn: &str,
-    raw: &str,
-) -> DefinitionLookupOutcome {
-    let candidates = resolve_fqn_candidates(py, Some(importer), fqn, |name| support.fqn(name));
-    if !candidates.is_empty() {
-        return candidates_outcome(candidates);
-    }
-    // pythonnet-style interop (#1174): `from Python.Test import ClassCtorTest2`
-    // names a CLR type whose C# declaration is indexed at exactly this fq. The
-    // Python index has nothing here, so the exact cross-language declaration is
-    // the honest answer rather than a boundary claim about a workspace type.
-    let cross_language = python_cross_language_declarations(support, fqn);
-    if !cross_language.is_empty() {
-        return candidates_outcome(cross_language);
-    }
-    // `python_crosses_unindexed_boundary` is `!python_workspace_module_exists`,
-    // so its negation is the workspace-internal gate.
-    gated_boundary(
-        || !python_crosses_unindexed_boundary(py, support, fqn),
-        format!(
-            "`{raw}` resolves to `{fqn}`, which is outside this partial Python workspace analysis"
-        ),
-        UnindexedClaim::resolved_external(fqn, ClaimSubjectRole::Any),
-        "no_indexed_definition",
-        format!("`{raw}` resolved to `{fqn}`, but no indexed Python definition was found"),
-    )
-}
-
 /// Declarations indexed at exactly `fqn` in a language other than Python.
 fn python_cross_language_declarations(
     support: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Vec<CodeUnit> {
     cross_language_declarations(support, fqn, Language::Python)
-}
-
-fn python_module_outcome(
-    py: &PythonAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    importer: &ProjectFile,
-    module_fq: &str,
-    raw: &str,
-) -> DefinitionLookupOutcome {
-    if let Some(module) = resolve_module_code_unit(py, Some(importer), module_fq) {
-        return candidates_outcome(vec![module]);
-    }
-    // Same workspace-namespace gate as the fqn path above, plus the module path
-    // itself: `import Python.Test as Test` names a C# namespace that this
-    // workspace indexes, so it is internal even though Python declares no such
-    // module (#1174).
-    gated_boundary(
-        || {
-            !python_crosses_unindexed_boundary(py, support, module_fq)
-                || python_workspace_module_exists(py, support, module_fq)
-        },
-        format!(
-            "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
-        ),
-        UnindexedClaim::resolved_external(module_fq, ClaimSubjectRole::Module),
-        "no_indexed_definition",
-        format!("`{raw}` resolved to module `{module_fq}`, but no indexed Python module was found"),
-    )
 }
 
 fn python_class_for_fqn(
@@ -5780,469 +4611,6 @@ fn python_class_for_fqn(
                 .into_iter()
                 .find(|unit| unit.is_class())
         })
-}
-
-fn python_member_outcome(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    receiver_type: CodeUnit,
-    member: &str,
-    site: &ResolvedReferenceSite,
-) -> DefinitionLookupOutcome {
-    // A receiver typed cross-language (#1174) owns members in *its* language's
-    // index, not Python's, so the exact-fq member lookup has to follow it there.
-    let receiver_language = language_for_file(receiver_type.source());
-    let cross_language_owner = receiver_language != Language::Python;
-    let mut candidates = support.members_for_owner(&receiver_type, member);
-    // The member attribution this seam can name: every candidate was found by
-    // asking the index for `<owner fq>.<member>`, so the owner is exactly the
-    // type the lookup asked about, and the hop distance is that type's distance
-    // from the receiver. Built only while a trace records (#1477).
-    let mut attribution = PythonMemberAttribution::default();
-    attribution.record_direct(&receiver_type, &candidates);
-    if candidates.is_empty()
-        && let Some(provider) = analyzer.type_hierarchy_provider()
-    {
-        // The routes are the walk `get_ancestors` performs, retaining the hop
-        // distance and the first-discovery parent it discards.
-        let routes = if trace::recording() {
-            PythonAncestorRoutes::build(provider, &receiver_type)
-        } else {
-            PythonAncestorRoutes::default()
-        };
-        for ancestor in provider.get_ancestors(&receiver_type).definite().to_vec() {
-            let found = support.members_for_owner(&ancestor, member);
-            attribution.record_inherited(&receiver_type, &ancestor, &found, &routes);
-            candidates.extend(found);
-        }
-        sort_units(&mut candidates);
-        candidates.dedup();
-    }
-    if candidates.is_empty()
-        && !cross_language_owner
-        && let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer)
-        && let Some(overlay) = analyzer.semantic_model_overlay()
-        && let Some(symbol) =
-            crate::analyzer::python::python_external_value_member_on_workspace_class(
-                python,
-                &receiver_type,
-                member,
-                &overlay,
-            )
-    {
-        let mut reference = site.clone();
-        reference.text = symbol.qualified_name.clone();
-        let outcome = DefinitionLookupOutcome {
-            modeled_definitions: vec![symbol],
-            status: DefinitionLookupStatus::Resolved,
-            reference: Some(reference),
-            definitions: Vec::new(),
-            lexical_definition: None,
-            diagnostics: Vec::new(),
-        };
-        trace::record_selected_modeled(&outcome);
-        return outcome;
-    }
-    if candidates.is_empty() {
-        let owner = receiver_type.fq_name();
-        let message = if cross_language_owner {
-            format!(
-                "`{owner}.{member}` is not indexed; `{owner}` is a {} declaration, not a Python one",
-                receiver_language.config_label()
-            )
-        } else {
-            format!("`{owner}.{member}` is not indexed as a Python definition")
-        };
-        no_definition("no_indexed_definition", message)
-    } else {
-        attribution.stage();
-        candidates_outcome(candidates)
-    }
-}
-
-/// How many ancestor types the recording-only route walk may visit. Mirrors the
-/// bound the Java member-family walk applies to the same kind of closure: a
-/// diamond or a deep framework hierarchy stays bounded, and a hierarchy that
-/// exceeds the bound loses attribution rather than gaining a wrong one.
-const MAX_ANCESTOR_FRONTIER: usize = 512;
-
-/// The hop distance and first-discovery parent of every ancestor the Python
-/// member walk can reach (#1477).
-///
-/// `TypeHierarchyProvider::get_ancestors` flattens its breadth-first walk to a
-/// list, discarding both facts. This repeats that walk over the same
-/// direct-ancestor edges, in the same order and with the same
-/// fully-qualified-name deduplication, and retains them. It decides nothing:
-/// the production loop still consumes `get_ancestors` unchanged.
-///
-/// The walk is bounded by [`MAX_ANCESTOR_FRONTIER`]. Truncation removes
-/// attribution, never distorts it: breadth-first order fixes every depth at
-/// the level it was recorded, so an ancestor the bound cut off simply has no
-/// depth and [`PythonAncestorRoutes::route`] returns `None` for it, leaving
-/// that candidate unattributed.
-#[derive(Default)]
-struct PythonAncestorRoutes {
-    /// First-discovery parent of each ancestor the walk expanded.
-    parents: HashMap<CodeUnit, CodeUnit>,
-    /// Breadth-first hop distance from the receiver.
-    depths: HashMap<CodeUnit, usize>,
-}
-
-impl PythonAncestorRoutes {
-    fn build(
-        provider: &dyn brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider,
-        receiver: &CodeUnit,
-    ) -> Self {
-        let mut routes = Self::default();
-        let mut seen: HashSet<String> = HashSet::default();
-        seen.insert(receiver.fq_name());
-        let mut level = provider.get_direct_ancestors(receiver).definite().to_vec();
-        for ancestor in &level {
-            routes
-                .parents
-                .entry(ancestor.clone())
-                .or_insert_with(|| receiver.clone());
-        }
-        let mut depth = 0usize;
-        let mut visited = 0usize;
-        'walk: while !level.is_empty() {
-            depth += 1;
-            let mut next_level = Vec::new();
-            for ancestor in level {
-                if !seen.insert(ancestor.fq_name()) {
-                    continue;
-                }
-                visited += 1;
-                if visited > MAX_ANCESTOR_FRONTIER {
-                    // Stop before recording anything about this ancestor. Every
-                    // depth already recorded is the breadth-first minimum and
-                    // stays correct; the rest of the closure is simply absent,
-                    // so its candidates stay unattributed.
-                    break 'walk;
-                }
-                routes.depths.insert(ancestor.clone(), depth);
-                let expanded = provider.get_direct_ancestors(&ancestor).definite().to_vec();
-                for next in &expanded {
-                    routes
-                        .parents
-                        .entry(next.clone())
-                        .or_insert_with(|| ancestor.clone());
-                }
-                next_level.extend(expanded);
-            }
-            level = next_level;
-        }
-        routes
-    }
-
-    /// The exact route from `receiver` to `owner`, as first-discovery hops.
-    /// Every Python direct-ancestor edge is a base-class edge, so each hop is
-    /// [`HierarchyRelation::Extends`]. Returns `None` when the walk never
-    /// reached `owner`, which leaves the candidate unattributed rather than
-    /// attributed to a route this seam cannot name.
-    fn route(
-        &self,
-        receiver: &CodeUnit,
-        owner: &CodeUnit,
-    ) -> Option<(usize, Vec<trace::HierarchyHopRecord>)> {
-        use brokk_bifrost_core::analyzer::structural::resolution::HierarchyRelation;
-
-        let depth = *self.depths.get(owner)?;
-        let (route, reached_receiver) = trace::hierarchy_route_from_predecessors(
-            owner,
-            depth,
-            |current, _| current == receiver,
-            |current| {
-                self.parents
-                    .get(current)
-                    .cloned()
-                    .map(|parent| (parent, HierarchyRelation::Extends))
-            },
-            |unit| Some(unit.clone()),
-        )?;
-        if !reached_receiver {
-            return None;
-        }
-        debug_assert_eq!(
-            route.len(),
-            depth,
-            "the first-discovery chain must be exactly the walk's hop distance"
-        );
-        Some((depth, route))
-    }
-}
-
-/// The member attribution the Python member seams accumulate before they hand
-/// their candidates to the shared outcome constructor (#1477).
-///
-/// Applicability stays `Unknown`: these seams select by owner and name and
-/// never inspect the call shape, so claiming anything else would be inventing
-/// a check the resolver did not perform.
-#[derive(Default)]
-struct PythonMemberAttribution {
-    by_fq_name: Vec<(String, trace::MemberEnrichment)>,
-}
-
-impl PythonMemberAttribution {
-    /// Candidates found on the receiver's own type: depth zero, no route.
-    fn record_direct(&mut self, receiver: &CodeUnit, found: &[CodeUnit]) {
-        if !trace::recording() {
-            return;
-        }
-        for candidate in found {
-            self.by_fq_name.push((
-                candidate.fq_name(),
-                trace::member_enrichment_with_tier(
-                    receiver.clone(),
-                    0,
-                    brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier::InherentOrDirect,
-                    brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Unknown,
-                    Vec::new(),
-                ),
-            ));
-        }
-    }
-
-    /// Candidates found on an ancestor of the receiver. A candidate whose owner
-    /// the route walk cannot place stays unattributed.
-    fn record_inherited(
-        &mut self,
-        receiver: &CodeUnit,
-        owner: &CodeUnit,
-        found: &[CodeUnit],
-        routes: &PythonAncestorRoutes,
-    ) {
-        if !trace::recording() || found.is_empty() {
-            return;
-        }
-        let Some((depth, route)) = routes.route(receiver, owner) else {
-            return;
-        };
-        for candidate in found {
-            self.by_fq_name.push((
-                candidate.fq_name(),
-                trace::member_enrichment_with_tier(
-                    owner.clone(),
-                    depth,
-                    brokk_bifrost_core::analyzer::structural::resolution::MemberDispatchTier::InheritedOrPromoted,
-                    brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict::Unknown,
-                    route.clone(),
-                ),
-            ));
-        }
-    }
-
-    /// Stage the attribution for the outcome constructor the caller is about to
-    /// reach. Staging nothing leaves the rows unattributed, which is what an
-    /// unrecorded trace and an unplaceable owner must both look like.
-    fn stage(self) {
-        if self.by_fq_name.is_empty() {
-            return;
-        }
-        trace::stage_member_context(self.by_fq_name);
-    }
-}
-
-fn python_crosses_unindexed_boundary(
-    py: &PythonAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    fqn: &str,
-) -> bool {
-    // Python module paths are `.`-joined and identifiers never contain a
-    // literal `.`, so re-tokenizing `fqn` with the shared structured splitter
-    // and rejoining every part but the last with `.` reproduces
-    // `rsplit_once('.')`'s (module, _) split exactly, including the no-dot
-    // case (an empty module, which `python_workspace_module_exists` always
-    // rejects).
-    let segments = parse_symbol_path(Language::Python, fqn);
-    let module = segments[..segments.len().saturating_sub(1)].join(".");
-    !python_workspace_module_exists(py, support, &module)
-}
-
-/// Whether the workspace declares `module` as a package/namespace or as a
-/// declaration.
-///
-/// Deliberately language-blind: this is the honesty gate behind every confident
-/// Python boundary claim, and a namespace that only C#/Java/Scala declares (a
-/// pythonnet CLR namespace, say) is still *inside* the workspace. Answering it
-/// Python-only made the claim wrong about workspace-internal targets (#1174).
-fn python_workspace_module_exists(
-    py: &PythonAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    module: &str,
-) -> bool {
-    if module.is_empty() {
-        return false;
-    }
-    python_workspace_declares_module(support, module)
-        || !python_source_root_spellings(py, module).is_empty()
-}
-
-fn python_workspace_declares_module(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
-    !module.is_empty()
-        && (support.package_exists_in_any_language(module)
-            || !support.fqn_in_any_language(module).is_empty())
-}
-
-/// The names and paths this workspace indexes `module` under when `module` is
-/// written against a source root below the project root.
-///
-/// This is diagnostic evidence, not a binding decision. A tail match says the
-/// file would be the module *if* its implied root were on the importing
-/// program's path, and only the workspace's own structure -- a packaging
-/// manifest declaring that root, or a complete package chain from it -- makes
-/// that true; a candidate that fails that test is still the spelling the
-/// workspace indexes the file under, which the gap has to name (#3506).
-///
-/// Empty for every module the index spells exactly and for every genuinely
-/// external one, so it is only ever consulted after the exact lookups fail.
-fn python_source_root_spellings(py: &PythonAnalyzer, module: &str) -> Vec<String> {
-    python_source_root_spellings_excluding_installed_roots(py, module, &[])
-}
-
-/// Read installed roots from the exact active runtime publication selected by
-/// this query. A missing publication has no declared runtime evidence to
-/// exclude. A stale or unreadable publication is an error so uncertainty never
-/// turns a workspace candidate into an external identity.
-fn python_verified_installed_roots(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
-) -> Result<Vec<std::path::PathBuf>, String> {
-    let Some(active_snapshot) = analyzer.active_semantic_model_snapshot() else {
-        return Ok(Vec::new());
-    };
-    let Some(publication) = active_snapshot.python_runtime() else {
-        return Ok(Vec::new());
-    };
-    let Some((store, current_snapshot)) = py.python_runtime_store_snapshot() else {
-        return Err("the Python analyzer has no selected runtime store snapshot".to_owned());
-    };
-    if current_snapshot != publication.snapshot {
-        return Err(format!(
-            "runtime publication snapshot {:?} differs from selected snapshot {:?}",
-            publication.snapshot, current_snapshot
-        ));
-    }
-    store
-        .with_python_runtime_acquisition(publication.acquisition_id, &publication.snapshot, |tx| {
-            brokk_bifrost_analysis::analyzer::store::python_runtime::python_runtime_declared_archive_verified_installed_roots(
-                        tx,
-                        publication.acquisition_id,
-                    )
-        })
-        .map_err(|error| format!("{error:?}"))
-}
-
-fn python_source_root_spellings_excluding_installed_roots(
-    py: &PythonAnalyzer,
-    module: &str,
-    installed_roots: &[std::path::PathBuf],
-) -> Vec<String> {
-    let mut names = py
-        .module_spellings()
-        .suffix_candidates(module)
-        .into_iter()
-        .filter(|candidate| {
-            !installed_roots
-                .iter()
-                .any(|root| candidate.file.abs_path().starts_with(root))
-        })
-        .map(|candidate| {
-            format!(
-                "{} ({})",
-                python_module_name(py.project(), &candidate.file),
-                rel_path_string(&candidate.file)
-            )
-        })
-        .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// The outcome for a reference whose import binding named a module, when that
-/// binding resolved to nothing.
-///
-/// A module the workspace indexes only under a longer path-derived name is
-/// inside the workspace, so the honest failure names the spelling gap instead
-/// of claiming the import left the workspace: the two want different actions
-/// from a caller, and only one of them is true (#3506). The resolvers try the
-/// source roots first, so reaching this with a spelling gap means the specifier
-/// named more than one workspace module, or the imported member is absent from
-/// the module it did name.
-#[allow(clippy::too_many_arguments)]
-fn python_import_binding_outcome(
-    analyzer: &dyn IAnalyzer,
-    py: &PythonAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    local: &str,
-    attribute: Option<&str>,
-    import_target: &str,
-    reference: &str,
-) -> DefinitionLookupOutcome {
-    let installed_roots = match python_verified_installed_roots(analyzer, py) {
-        Ok(roots) => roots,
-        Err(error) => {
-            return no_definition(
-                "python_runtime_installed_root_evidence_incomplete",
-                format!(
-                    "`{reference}` could not establish whether `{import_target}` is an installed external package because the selected Python runtime evidence could not be read: {error}"
-                ),
-            );
-        }
-    };
-    let spellings =
-        python_source_root_spellings_excluding_installed_roots(py, import_target, &installed_roots);
-    if !spellings.is_empty() {
-        return no_definition(
-            "python_source_root_resolution_gap",
-            format!(
-                "`{reference}` is imported from `{import_target}`, which this workspace indexes under a source root below the project root as {spellings:?}; the module is inside the workspace, so this is a resolution gap rather than an import that left it"
-            ),
-        );
-    }
-    let subject = match attribute {
-        Some(attribute) => format!("{local}.{attribute}"),
-        None => local.to_string(),
-    };
-    // Module paths are semantic binder values. Probe every package prefix so
-    // adding a package or module invalidates this previously external boundary.
-    let mut prefix = import_target;
-    loop {
-        let normalized = brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::ForwardQueryProvider::normalize_rendered_name(py, prefix);
-        for spelling in [prefix, normalized.as_str()] {
-            analyzer.record_read(
-                brokk_bifrost_analysis::analyzer::read_ledger::ReadKey::index(
-                    brokk_bifrost_analysis::analyzer::read_ledger::IndexFamily::PathSymbol,
-                    spelling,
-                ),
-            );
-        }
-        let Some((parent, _)) = prefix.rsplit_once('.') else {
-            break;
-        };
-        prefix = parent;
-    }
-    let workspace_internal = python_import_binding_is_workspace_internal(
-        py,
-        token,
-        support,
-        file,
-        local,
-        attribute,
-        &installed_roots,
-    );
-    gated_boundary(
-        || workspace_internal,
-        format!(
-            "`{subject}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
-        ),
-        UnindexedClaim::external_boundary(import_target, ClaimSubjectRole::Module),
-        "no_indexed_definition",
-        format!("`{reference}` did not resolve to an indexed Python definition"),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6536,101 +4904,6 @@ fn python_self_receiver_type(
         .filter(|unit| unit.is_class())
 }
 
-fn python_unresolved_import_boundary(
-    py: &PythonAnalyzer,
-    file: &ProjectFile,
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    local: &str,
-    attribute: Option<&str>,
-) -> Option<String> {
-    let provider = analyzer.import_analysis_provider()?;
-    for import in provider.import_info_of(token, file) {
-        let alias_or_identifier = import.alias.as_deref().or(import.identifier.as_deref());
-        if alias_or_identifier == Some(local)
-            && provider
-                .imported_code_units_of(file)
-                .iter()
-                .all(|unit| unit.identifier() != local)
-        {
-            return Some(python_import_boundary_target(
-                py, token, file, local, attribute,
-            ));
-        }
-        if let Some(attribute) = attribute
-            && import.identifier.as_deref() == Some(attribute)
-            && import.alias.as_deref().unwrap_or(attribute) == attribute
-            && provider
-                .imported_code_units_of(file)
-                .iter()
-                .all(|unit| unit.identifier() != attribute)
-        {
-            return Some(python_import_boundary_target(
-                py,
-                token,
-                file,
-                local,
-                Some(attribute),
-            ));
-        }
-    }
-    None
-}
-
-fn python_import_boundary_target(
-    py: &PythonAnalyzer,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    local: &str,
-    attribute: Option<&str>,
-) -> String {
-    let binder = py.import_binder_of(token, file);
-    binder
-        .bindings
-        .get(local)
-        .or_else(|| attribute.and_then(|attribute| binder.bindings.get(attribute)))
-        .map(|binding| {
-            binding
-                .namespace_imported_module
-                .as_deref()
-                .unwrap_or(binding.module_specifier.as_str())
-                .to_string()
-        })
-        .unwrap_or_else(|| local.to_string())
-}
-
-/// True when the name is bound by an import whose *target module* the workspace
-/// actually indexes — e.g. `from .sibling import Thing` where `sibling` is a
-/// workspace module. A missing `Thing` is then a not-yet-indexed member of a
-/// known-internal module, never a confident cross-workspace boundary (#1158).
-/// This is the workspace-module guard the fqn/module paths already apply through
-/// `python_crosses_unindexed_boundary`, which the import-binding paths lacked.
-fn python_import_binding_is_workspace_internal(
-    py: &PythonAnalyzer,
-    token: QueryToken<'_>,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    local: &str,
-    attribute: Option<&str>,
-    installed_roots: &[std::path::PathBuf],
-) -> bool {
-    let binder = py.import_binder_of(token, file);
-    let Some(binding) = binder
-        .bindings
-        .get(local)
-        .or_else(|| attribute.and_then(|attribute| binder.bindings.get(attribute)))
-    else {
-        return false;
-    };
-    let module = binding
-        .namespace_imported_module
-        .as_deref()
-        .unwrap_or(binding.module_specifier.as_str());
-    python_workspace_declares_module(support, module)
-        || !python_source_root_spellings_excluding_installed_roots(py, module, installed_roots)
-            .is_empty()
-}
-
 fn python_name_shadowed_at(
     name: &str,
     reference: Node<'_>,
@@ -6666,119 +4939,6 @@ fn python_name_shadowed_at(
     false
 }
 
-fn python_is_non_reference_context(node: Node<'_>) -> bool {
-    let deferred_annotation = node.kind() == "string_content" && python_node_is_in_annotation(node);
-    let mut parent = Some(node);
-    while let Some(current) = parent {
-        // An f-string interpolation hole holds ordinary expression nodes, so the
-        // enclosing `string` does not make them opaque. The walk is bottom-up, so
-        // reaching the hole before any `string` proves no nested string literal
-        // separates the node from the code context. `format_expression` is the
-        // same hole inside a format specifier (`f"{value:{width}}"`).
-        if matches!(current.kind(), "interpolation" | "format_expression") {
-            return false;
-        }
-        if deferred_annotation && matches!(current.kind(), "string" | "string_content") {
-            parent = current.parent();
-            continue;
-        }
-        if matches!(
-            current.kind(),
-            "import_statement"
-                | "import_from_statement"
-                | "comment"
-                | "string"
-                | "string_content"
-                | "module"
-        ) && current.kind() != "module"
-        {
-            return true;
-        }
-        parent = current.parent();
-    }
-    false
-}
-
-fn python_import_module_fqn(
-    project: &dyn brokk_bifrost_core::analyzer::project::Project,
-    file: &ProjectFile,
-    source: &str,
-    focus: Node<'_>,
-) -> Option<String> {
-    let mut current = Some(focus);
-    while let Some(node) = current {
-        let module = match node.kind() {
-            "import_from_statement" => node.child_by_field_name("module_name"),
-            "import_statement" => {
-                let mut cursor = node.walk();
-                node.children_by_field_name("name", &mut cursor)
-                    .find_map(|imported| {
-                        let module = if imported.kind() == "aliased_import" {
-                            imported.child_by_field_name("name")?
-                        } else {
-                            imported
-                        };
-                        (module.start_byte() <= focus.start_byte()
-                            && focus.end_byte() <= module.end_byte())
-                        .then_some(module)
-                    })
-            }
-            _ => None,
-        };
-        if let Some(module) = module
-            && module.start_byte() <= focus.start_byte()
-            && focus.end_byte() <= module.end_byte()
-        {
-            let raw = python_focused_import_module(module, focus, source)?;
-            return if module.kind() == "relative_import" {
-                resolve_python_relative_module(project, file, &raw)
-            } else {
-                Some(raw)
-            };
-        }
-        current = node.parent();
-    }
-    None
-}
-
-fn python_focused_import_module(module: Node<'_>, focus: Node<'_>, source: &str) -> Option<String> {
-    match module.kind() {
-        "identifier" => same_node(module, focus).then(|| python_slice(module, source).to_string()),
-        "dotted_name" => {
-            let mut segments = Vec::new();
-            let mut cursor = module.walk();
-            for segment in module
-                .named_children(&mut cursor)
-                .filter(|child| child.kind() == "identifier")
-            {
-                segments.push(python_slice(segment, source));
-                if same_node(segment, focus) {
-                    return Some(segments.join("."));
-                }
-            }
-            None
-        }
-        "relative_import" => {
-            let mut cursor = module.walk();
-            let children: Vec<_> = module.named_children(&mut cursor).collect();
-            let prefix = children
-                .iter()
-                .find(|child| child.kind() == "import_prefix")
-                .copied()?;
-            let raw_prefix = python_slice(prefix, source);
-            if same_node(prefix, focus) {
-                return Some(raw_prefix.to_string());
-            }
-            let path = children
-                .into_iter()
-                .find(|child| matches!(child.kind(), "identifier" | "dotted_name"))?;
-            let suffix = python_focused_import_module(path, focus, source)?;
-            Some(format!("{raw_prefix}{suffix}"))
-        }
-        _ => None,
-    }
-}
-
 pub(crate) fn python_call_reference_candidate(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -6793,11 +4953,129 @@ pub(crate) fn python_call_reference_candidate(node: Node<'_>) -> bool {
     false
 }
 
+/// One selected native operation kept across the points of a batch or file
+/// window, as the Rust and Go batch operations keep theirs. It opens on first
+/// use, inside the caller's query, and every later use replays the opening
+/// reads so each query records them. Only a clean answer keeps the operation:
+/// a refusal, a budget stop or a store error reopens it for the next point, so
+/// a transient failure is never reused as another query's answer (#8411).
+struct PythonDefinitionBatchOperation<'a> {
+    python: &'a PythonAnalyzer,
+    request: Option<(
+        crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest<'a>,
+        brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads,
+    )>,
+}
+
+pub(crate) fn definition_batch_resolver<'a>(
+    analyzer: &'a dyn IAnalyzer,
+) -> Option<Box<dyn DefinitionBatchResolver<'a> + 'a>> {
+    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
+    Some(Box::new(PythonDefinitionBatchOperation {
+        python,
+        request: None,
+    }))
+}
+
+impl<'a> DefinitionBatchResolver<'a> for PythonDefinitionBatchOperation<'a> {
+    fn release_file_operation(&mut self) {
+        self.request = None;
+    }
+
+    fn release_before_store_read(&mut self) {
+        // A writer-backed reader owns the writer mutex, and the caller's store
+        // read would wait for it (#6018); pooled WAL readers may stay.
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|(request, _)| request.reader_excludes_store_access())
+        {
+            self.request = None;
+        }
+    }
+
+    fn precompute(
+        &mut self,
+        _analyzer: &dyn IAnalyzer,
+        _context: &mut DefinitionBatchContext<'_, '_>,
+        _requests: &[DefinitionLookupRequest],
+        _cancellation: Option<&CancellationToken>,
+    ) {
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_definition_dispatch(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+        _context: &mut DefinitionBatchContext<'a, '_>,
+        request: &DefinitionLookupRequest,
+        source: &Arc<str>,
+        tree: &Option<Tree>,
+        site: &ResolvedReferenceSite,
+        _operation: Option<brokk_bifrost_analysis::navigation::NavigationOperation>,
+        cancellation: Option<&CancellationToken>,
+        _go_session: Option<&ResolutionSession>,
+    ) -> std::ops::ControlFlow<DefinitionResolution, DefinitionResolution> {
+        match &self.request {
+            Some((_, reads)) => {
+                brokk_bifrost_analysis::analyzer::usages::common::replay_memo_reads(
+                    reads, analyzer,
+                );
+            }
+            None => {
+                let cancel = cancellation.cloned().unwrap_or_default();
+                self.request = Some(
+                    brokk_bifrost_analysis::analyzer::usages::common::capture_memo_reads(
+                        analyzer,
+                        || {
+                            crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest::open(
+                                self.python,
+                                &cancel,
+                            )
+                        },
+                    ),
+                );
+            }
+        }
+        let (retained, _) = self.request.as_mut().expect("Python batch request opened");
+        let result = retained.resolve_definition_with_call_evidence_bounded(
+            brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+                analyzer,
+                file: &request.file,
+                source,
+                tree: tree.as_ref(),
+                site,
+                budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+                cancellation,
+            },
+        );
+        // Go's rule: only a stopped answer or a failed operation releases the
+        // request; an incomplete or unprojectable answer keeps it.
+        let clean = matches!(
+            &result,
+            BoundedResolution::Complete { value: (outcome, _), .. }
+                if !outcome.diagnostics.iter().any(|diagnostic| {
+                    brokk_bifrost_analysis::analyzer::usages::common::is_native_operation_failure(
+                        &diagnostic.kind,
+                    )
+                })
+        );
+        if !clean || retained.reader_excludes_store_access() {
+            self.request = None;
+        }
+        std::ops::ControlFlow::Continue(definition_resolution_from_bounded(
+            result,
+            Language::Python,
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_definition_dispatch<'a>(
     analyzer: &'a dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
-    token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
-    context: &mut brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionBatchContext<
+    _token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    _context: &mut brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionBatchContext<
         'a,
         '_,
     >,
@@ -6814,232 +5092,94 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
 > {
-    let mut evidence = CallEvidence::default();
-    let outcome = {
-        let mut outcome = python::resolve_python(
-            analyzer,
-            token,
-            context,
-            &request.file,
-            source,
-            tree.as_ref(),
-            site,
+    let python = resolve_analyzer::<PythonAnalyzer>(analyzer)
+        .expect("Python dispatch hook requires Python analyzer");
+    let cancel = cancellation.cloned().unwrap_or_default();
+    let mut retained =
+        crate::analyzer::python::native_request::definition_lookup::PythonReceiverRequest::open(
+            python, &cancel,
         );
-        if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
-            && cancellation.is_some_and(CancellationToken::is_cancelled)
-        {
-            outcome = cancelled("Python imported class value resolution was cancelled");
-        } else if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
-            && analyzer
-                .active_semantic_model_snapshot()
-                .is_some_and(|snapshot| snapshot.python_runtime().is_some())
-        {
-            match tree.as_ref().map(|tree| {
-                python::python_imported_class_value_selection_bounded(
-                    resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer"),
-                    token,
-                    &request.file,
-                    source.as_ref(),
-                    tree.root_node(),
-                    site,
-                    cancellation,
-                )
-            }) {
-                Some(BoundedResolution::Complete {
-                    value: Some(selection),
-                    ..
-                }) => {
-                    outcome = match selection {
-                        python::PythonImportedClassValueSelection::Unproven(message) => {
-                            python_incomplete_class_value(
-                                outcome,
-                                DefinitionLookupStatus::Incomplete,
-                                python_class_resolution_incomplete_diagnostic(message),
-                            )
-                        }
-                        python::PythonImportedClassValueSelection::Proven {
-                            import_module,
-                            class_name,
-                        } => {
-                            let attempt = resolve_python_runtime_binding(
-                                    analyzer,
-                                    &request.file,
-                                    PythonImportedMember {
-                                        module: &import_module,
-                                        member: &class_name,
-                                    },
-                                    cancellation,
-                                    crate::analyzer::python::runtime_binding::resolve_python_defining_class_binding,
-                                );
-                            match attempt {
-                                PythonRuntimeBindingAttempt::Resolved(proof) => {
-                                    let canonical = proof.binding.canonical().join(".");
-                                    match python_class_symbol_from_binding(
-                                        analyzer,
-                                        &proof.binding,
-                                        &proof.provider,
-                                    ) {
-                                        Ok(symbol) => {
-                                            let mut reference = outcome
-                                                .reference
-                                                .take()
-                                                .unwrap_or_else(|| site.clone());
-                                            reference.text = canonical;
-                                            let resolved = DefinitionLookupOutcome {
-                                                modeled_definitions: vec![symbol],
-                                                status: DefinitionLookupStatus::Resolved,
-                                                reference: Some(reference),
-                                                definitions: Vec::new(),
-                                                lexical_definition: None,
-                                                diagnostics: Vec::new(),
-                                            };
-                                            trace::record_selected_modeled(&resolved);
-                                            resolved
-                                        }
-                                        Err(message) => python_incomplete_class_value(
-                                            outcome,
-                                            DefinitionLookupStatus::Incomplete,
-                                            python_class_resolution_incomplete_diagnostic(message),
-                                        ),
-                                    }
-                                }
-                                // No selected provider proof is available
-                                // to refine the boundary, so retain the
-                                // source resolver's existing claim.
-                                PythonRuntimeBindingAttempt::Unavailable => outcome,
-                                PythonRuntimeBindingAttempt::Cancelled => cancelled(
-                                    "Python imported class value resolution was cancelled",
-                                ),
-                                PythonRuntimeBindingAttempt::Failed(failure) => {
-                                    let (status, kind, message) =
-                                        python_runtime_binding_failure_parts(failure);
-                                    // A provider can withhold its competing declarations while
-                                    // still proving ambiguity; retain that typed verdict.
-                                    python_incomplete_class_value(
-                                        outcome,
-                                        status,
-                                        DefinitionLookupDiagnostic {
-                                            kind: kind.to_owned(),
-                                            message,
-                                            claim: None,
-                                        },
-                                    )
-                                }
-                            }
-                        }
-                    };
-                }
-                Some(BoundedResolution::Exceeded { limit, .. }) => {
-                    outcome = exceeded_budget(
-                        limit,
-                        "Python imported class value resolution exceeded its bounded scope",
-                    );
-                }
-                Some(BoundedResolution::Cancelled { .. }) => {
-                    outcome = cancelled("Python imported class value resolution was cancelled");
-                }
-                Some(BoundedResolution::Complete { value: None, .. }) | None => {}
-            }
-        }
-        let imported_call = if matches!(
-            outcome.status,
-            DefinitionLookupStatus::UnresolvableImportBoundary
-                | DefinitionLookupStatus::Incomplete
-                | DefinitionLookupStatus::NoDefinition
-        ) {
-            let session = ResolutionSession::bounded(
-                brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
-                cancellation,
-            );
-            let selection = tree.as_ref().and_then(|tree| {
-                let python = resolve_analyzer::<PythonAnalyzer>(analyzer)?;
-                if !session
-                    .query(|| python.indexed_source_matches(&request.file, source.as_ref()))?
-                {
-                    return None;
-                }
-                let imports = session.query(|| {
-                    analyzer
-                        .import_analysis_provider()
-                        .expect("Python import provider")
-                        .import_info_of(token, &request.file)
-                })?;
-                let selected = python::exact_python_imported_call_selection(
-                    source.as_ref(),
-                    tree,
-                    site,
-                    &imports,
-                    || session.scope_step(),
-                );
-                session
-                    .query(|| python.indexed_source_matches(&request.file, source.as_ref()))?
-                    .then_some(selected)
-                    .flatten()
-            });
-            match session.finish(selection) {
-                BoundedResolution::Complete { value, .. } => value,
-                BoundedResolution::Exceeded { limit, .. } => {
-                    outcome = exceeded_budget(
-                        limit,
-                        "Python imported call selection exhausted its budget",
-                    );
-                    None
-                }
-                BoundedResolution::Cancelled { .. } => {
-                    outcome = cancelled("Python imported call selection was cancelled");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if let Some(selection) = imported_call {
-            let runtime_binding = resolve_python_runtime_binding(
-                analyzer,
-                &request.file,
-                PythonImportedMember {
-                    module: &selection.module,
-                    member: &selection.member,
-                },
-                cancellation,
-                crate::analyzer::python::runtime_binding::resolve_python_defining_binding,
-            );
-            finish_python_imported_call_binding(
-                &mut outcome,
-                &mut evidence,
-                site,
-                selection.proof,
-                runtime_binding,
-                cancellation,
-            );
-        }
-        outcome
-    };
-    std::ops::ControlFlow::Continue(DefinitionResolution {
-        outcome,
-        evidence,
-        call_binding_discharge_digests: Vec::new(),
-    })
+    let result = retained.resolve_definition_with_call_evidence_bounded(
+        brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+            analyzer,
+            file: &request.file,
+            source,
+            tree: tree.as_ref(),
+            site,
+            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation,
+        },
+    );
+    std::ops::ControlFlow::Continue(definition_resolution_from_bounded(result, Language::Python))
 }
 
 #[cfg(test)]
 mod bounded_tests {
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 
     use crate::analyzer::usages::get_definition::python::*;
-
-    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
 
     use brokk_bifrost_core::analyzer::model::Language;
 
     use brokk_bifrost_core::analyzer::model::Range;
 
-    use brokk_bifrost_core::path_utils::rel_path_string;
-
     use brokk_bifrost_analysis::test_support::AnalyzerFixture;
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
-    fn unindexed_import_identity_is_a_bounded_content_answer() {
+    #[hardwon(
+        "c3db46f1308d: retained Python definition request held the writer-only store reader across lookups"
+    )]
+    fn python_definition_batch_releases_writer_only_reader_between_points() {
+        let source = "from service import Service\n\ndef handle(service: Service):\n    service.run()\n    service.stop()\n";
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Python)
+            .file("service.py", "class Service:\n    def run(self):\n        pass\n    def stop(self):\n        pass\n")
+            .file("app.py", source)
+            .build();
+        let project = fixture.project_dyn();
+        let store = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test(project.as_ref()).expect("writer-only store");
+        assert!(store.store.uses_single_connection_reads());
+        let python =
+            PythonAnalyzer::new_with_config_store_context(project, Default::default(), store, None)
+                .expect("Python analyzer");
+        let scope = AnalyzerQueryScope::new(&python);
+        let mut context = DefinitionBatchContext::new(&python, scope.token());
+        let requests = ["run", "stop"]
+            .into_iter()
+            .map(|name| {
+                let start =
+                    source.find(&format!("service.{name}()")).expect("call") + "service.".len();
+                DefinitionLookupRequest {
+                    file: fixture.file("app.py"),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start),
+                    end_byte: Some(start + name.len()),
+                }
+            })
+            .collect();
+        let outcomes =
+            resolve_definition_requests(&python, scope.token(), &mut context, requests, None, None);
+        assert_eq!(outcomes.len(), 2);
+        for (outcome, expected) in outcomes
+            .iter()
+            .zip(["service.Service.run", "service.Service.stop"])
+        {
+            assert_eq!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved,
+                "{outcome:?}"
+            );
+            let [definition] = outcome.definitions.as_slice() else {
+                panic!("expected one definition: {outcome:?}");
+            };
+            assert_eq!(definition.fq_name(), expected);
+        }
+    }
+
+    #[test]
+    #[hardwon("#9575: named Python import reads cannot discard the mutation evidence receipt")]
+    fn unindexed_import_identity_keeps_named_reads_and_the_mutation_scope_receipt() {
         let source = "from unavailable.package import ImmutableDict\nvalue = ImmutableDict\n";
         let project = crate::inline_project::InlineTestProject::with_language(Language::Python)
             .file("a.py", source)
@@ -7065,17 +5205,41 @@ mod bounded_tests {
                 )
             });
         assert!(matches!(answer, Ok(None)), "{answer:?}");
+        // #9751: completed mutation evidence is certified by the whole Python
+        // scope instead of refusing reuse.
+        assert!(
+            reads
+                .keys()
+                .contains(&analyzer.workspace_scope_read_key(&[Language::Python])),
+            "missing Python mutation scope receipt: {:?}",
+            reads.keys()
+        );
         assert!(reads.is_bounded(), "{reads:?}");
-        for module in ["unavailable.package", "unavailable"] {
-            assert!(
-                reads.keys().contains(&ReadKey::index(
-                    brokk_bifrost_analysis::analyzer::read_ledger::IndexFamily::PathSymbol,
-                    module,
-                )),
-                "missing {module}: {:?}",
-                reads.keys()
-            );
-        }
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert_eq!(reads.execution_dependences(), 0);
+        assert!(
+            reads.keys().contains(&ReadKey::index(
+                brokk_bifrost_analysis::analyzer::read_ledger::IndexFamily::PackageMembership,
+                "unavailable.package",
+            )),
+            "missing package membership: {:?}",
+            reads.keys()
+        );
+        assert!(
+            reads.keys().iter().any(|key| matches!(
+                key,
+                ReadKey::Lookup {
+                    kind: brokk_bifrost_analysis::analyzer::read_ledger::LookupKind::WorkspaceFact,
+                    question: brokk_bifrost_analysis::analyzer::read_ledger::LookupQuestion::WorkspaceFact {
+                        family: brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily::PythonModuleSpellings,
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "missing module spelling authority: {:?}",
+            reads.keys()
+        );
     }
 
     #[test]
@@ -7315,9 +5479,13 @@ mod bounded_tests {
     }
 
     impl IAnalyzer for ExpandedCallableRangeAnalyzer {
-        fn update(&self, changed_files: &std::collections::BTreeSet<ProjectFile>) -> Self {
+        fn update_with_listing(
+            &self,
+            changed_files: &std::collections::BTreeSet<ProjectFile>,
+            listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self {
             Self {
-                base: self.base.update(changed_files),
+                base: self.base.update_with_listing(changed_files, listing),
                 callable: self.callable.clone(),
                 range: self.range,
             }
@@ -7640,264 +5808,6 @@ mod bounded_tests {
         }
     }
 
-    fn wide_deep_member_fixture() -> (
-        AnalyzerFixture,
-        ProjectFile,
-        String,
-        Tree,
-        ResolvedReferenceSite,
-    ) {
-        let statements = (0..96)
-            .map(|index| format!("    value{index} = {index}\n"))
-            .collect::<String>();
-        let expression = format!("{}service{}.run()", "(".repeat(24), ")".repeat(24));
-        let source = format!(
-            "class Service:\n    def run(self) -> None:\n        pass\n\n\
-             def use(service: Service) -> None:\n{statements}    {expression}\n"
-        );
-        brokk_bifrost_analysis::analyzer::usages::test_support::wide_deep_member_fixture(
-            Language::Python,
-            "receiver.py",
-            source,
-            &expression,
-            "run",
-            parse_python_tree,
-        )
-    }
-
-    #[test]
-    fn bounded_python_wide_deep_walk_stops_without_partial_result() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_python_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::tiny(),
-            None,
-        );
-
-        assert!(matches!(
-            outcome,
-            BoundedResolution::Exceeded {
-                limit: ReceiverBudgetLimit::ScopeNodes,
-                ..
-            }
-        ));
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "bb38340252e1: Python from-import fixture resolves the module segment as the import anchor rather than the imported member"
-    )]
-    #[test]
-    fn bounded_python_from_import_module_segment_resolves_module_anchor() {
-        let source = "from example.service import Repository\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                ("src/example/__init__.py", ""),
-                ("src/example/service.py", "class Repository:\n    pass\n"),
-                ("tests/test_service.py", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "tests/test_service.py");
-        let tree = parse_python_tree(source).expect("Python tree");
-        let start_byte = source.find("service").expect("module segment");
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "service".to_string(),
-            range: Range {
-                start_byte,
-                end_byte: start_byte + "service".len(),
-                start_line: 1,
-                end_line: 1,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: start_byte + "service".len(),
-        };
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let outcome = resolve_python_bounded(
-            fixture.analyzer.analyzer(),
-            scope.token(),
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("Python module lookup should complete: {outcome:#?}");
-        };
-        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
-        assert!(
-            matches!(value.definitions.as_slice(), [definition]
-                if definition.is_module()
-                    && definition.fq_name() == "example.service"
-                    && rel_path_string(definition.source()) == "src/example/service.py"),
-            "{value:#?}"
-        );
-    }
-
-    #[test]
-    fn bounded_python_wide_deep_walk_honors_mid_walk_cancellation() {
-        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
-        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_python_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            Some(&cancellation),
-        );
-
-        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
-    }
-
-    #[brokk_bifrost_test_macros::hardwon(
-        "#1612: Ensures ordinary Python string content is not treated as a reference without a structured import/call node"
-    )]
-    #[test]
-    fn bounded_python_ordinary_string_is_not_a_reference() {
-        let source = "class Widget:\n    pass\n\nname = \"Widget\"\n";
-        let fixture =
-            AnalyzerFixture::new_for_language(Language::Python, &[("ordinary.py", source)]);
-        let file = ProjectFile::new(fixture.project_root(), "ordinary.py");
-        let tree = parse_python_tree(source).expect("Python tree");
-        let start_byte = source.rfind("Widget").expect("ordinary string content");
-        let site = ResolvedReferenceSite {
-            path: rel_path_string(&file),
-            text: "Widget".to_string(),
-            range: Range {
-                start_byte,
-                end_byte: start_byte + "Widget".len(),
-                start_line: 4,
-                end_line: 4,
-            },
-            focus_start_byte: start_byte,
-            focus_end_byte: start_byte + "Widget".len(),
-        };
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let token = scope.token();
-        let outcome = resolve_python_bounded(
-            fixture.analyzer.analyzer(),
-            token,
-            &file,
-            source,
-            Some(&tree),
-            &site,
-            ReceiverAnalysisBudget::default(),
-            None,
-        );
-        let BoundedResolution::Complete { value, .. } = outcome else {
-            panic!("ordinary string lookup did not complete: {outcome:#?}");
-        };
-        assert!(value.definitions.is_empty(), "{value:#?}");
-    }
-
-    #[test]
-    fn bounded_python_local_function_requires_definite_visibility() {
-        for (path, source) in [
-            (
-                "forward_local_factory.py",
-                r#"class Product:
-    def run(self) -> None:
-        pass
-
-def caller() -> None:
-    value = make()
-    value.run()
-
-    def make() -> Product:
-        return Product()
-"#,
-            ),
-            (
-                "conditional_local_factory.py",
-                r#"class Product:
-    def run(self) -> None:
-        pass
-
-def caller(flag) -> None:
-    if flag:
-        def make() -> Product:
-            return Product()
-
-    value = make()
-    value.run()
-"#,
-            ),
-            (
-                "header_forward_local_factory.py",
-                r#"class Product:
-    def run(self) -> None:
-        pass
-
-def outer() -> None:
-    def nested(argument=make().run()) -> None:
-        pass
-
-    def make() -> Product:
-        return Product()
-"#,
-            ),
-        ] {
-            let fixture = AnalyzerFixture::new_for_language(Language::Python, &[(path, source)]);
-            let file = ProjectFile::new(fixture.project_root(), path);
-            let tree = parse_python_tree(source).expect("Python tree");
-            let start_byte = source.rfind("run").expect("member name");
-            let start_line = source[..start_byte]
-                .bytes()
-                .filter(|byte| *byte == b'\n')
-                .count()
-                + 1;
-            let site = ResolvedReferenceSite {
-                path: rel_path_string(&file),
-                text: "run".to_string(),
-                range: Range {
-                    start_byte,
-                    end_byte: start_byte + "run".len(),
-                    start_line,
-                    end_line: start_line,
-                },
-                focus_start_byte: start_byte,
-                focus_end_byte: start_byte + "run".len(),
-            };
-            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-            let token = scope.token();
-            let outcome = resolve_python_bounded(
-                fixture.analyzer.analyzer(),
-                token,
-                &file,
-                source,
-                Some(&tree),
-                &site,
-                ReceiverAnalysisBudget::default(),
-                None,
-            );
-            let BoundedResolution::Complete { value, .. } = outcome else {
-                panic!("{path} lookup did not complete: {outcome:#?}");
-            };
-            assert!(
-                value
-                    .definitions
-                    .iter()
-                    .all(|definition| !definition.fq_name().ends_with("Product.run")),
-                "{path}: {value:#?}"
-            );
-        }
-    }
-
     fn imported_call_selection(source: &str, callee: &str) -> Option<PythonImportedCallSelection> {
         imported_call_selection_with_steps(source, callee, || true)
     }
@@ -8141,17 +6051,7 @@ mod batch_context_tests {
         }
 
         assert_eq!(py.prepared_syntax_parse_count_for_test(&file), 1);
-        assert_eq!(request_definition_build_counts(py), (1, 1, 1, 0));
-        assert!(!ledgers[0].is_empty());
-        let cached_reads =
-            request_definition_cached_read_keys(py, analyzer, &file, source.as_ref());
-        let replayed_reads = ledgers[1].keys();
-        assert!(
-            cached_reads
-                .iter()
-                .all(|read| replayed_reads.contains(read)),
-            "cached Python definition reads were not replayed: cached={cached_reads:?}, replayed={replayed_reads:?}"
-        );
+        assert!(ledgers.iter().all(|ledger| !ledger.is_empty()));
     }
 
     /// #3496: one call-target batch keeps whatever its resolver proved about
@@ -8206,18 +6106,65 @@ mod batch_context_tests {
 
         assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
         assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
-        assert_eq!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_build_counts(analyzer),
-            (1, 1, 1, 0)
-        );
-        assert!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_contexts
-                .is_empty()
-        );
+    }
+
+    #[test]
+    #[hardwon("#5658: supported lexical Python declarations were marked as unsupported binders")]
+    fn python_native_lexical_definitions_present_parameters_and_temporal_writes() {
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_core::analyzer::model::DeclarationKind;
+
+        for (source, needle, identifier, kind, declaration_start) in [
+            (
+                "def handle(service: Service):\n    service.run()\n",
+                "service.run",
+                "service",
+                DeclarationKind::Parameter,
+                11,
+            ),
+            (
+                "def f(x):\n    x = 2\n    x\n",
+                "x\n",
+                "x",
+                DeclarationKind::LocalVariable,
+                14,
+            ),
+        ] {
+            let fixture = InlineTestProject::with_language(Language::Python)
+                .file("app.py", source)
+                .build();
+            let workspace = fixture.workspace_analyzer(Default::default());
+            let analyzer = workspace.analyzer();
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+            let start = source.rfind(needle).expect("lexical reference in fixture");
+            let outcomes = resolve_definition_requests(
+                analyzer,
+                scope.token(),
+                &mut context,
+                vec![DefinitionLookupRequest {
+                    file: fixture.file("app.py"),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start),
+                    end_byte: Some(start + identifier.len()),
+                }],
+                None,
+                None,
+            );
+            assert_eq!(
+                outcomes[0].status,
+                DefinitionLookupStatus::Resolved,
+                "{outcomes:#?}"
+            );
+            let lexical = outcomes[0]
+                .lexical_definition
+                .as_ref()
+                .expect("presented lexical declaration");
+            assert_eq!(lexical.identifier, identifier);
+            assert_eq!(lexical.kind, kind);
+            assert_eq!(lexical.name_range.start_byte, declaration_start);
+        }
     }
 
     #[test]
@@ -8280,18 +6227,6 @@ mod batch_context_tests {
             outcomes[1].definitions[0].fq_name(),
             "middle_local_wins.Service.local_only"
         );
-        assert_eq!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_build_counts(analyzer),
-            (1, 1, 2, 0)
-        );
-        assert!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_contexts
-                .is_empty()
-        );
     }
 
     #[test]
@@ -8346,90 +6281,6 @@ mod batch_context_tests {
         assert_eq!(
             outcomes[1].definitions[0].fq_name(),
             "service_b.Service.stop"
-        );
-        assert_eq!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_build_counts(analyzer),
-            (2, 2, 2, 0)
-        );
-        assert!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_contexts
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn python_batch_receiver_type_cache_bypasses_inserts_at_its_limit() {
-        let source = "from service import Service\nfrom other import Other\n\ndef handle(service: Service, other: Other):\n    service.run()\n    other.stop()\n    service.run()\n";
-        let fixture = AnalyzerFixture::new_for_language(
-            Language::Python,
-            &[
-                (
-                    "service.py",
-                    "class Service:\n    def run(self):\n        pass\n",
-                ),
-                (
-                    "other.py",
-                    "class Other:\n    def stop(self):\n        pass\n",
-                ),
-                ("app.py", source),
-            ],
-        );
-        let file = ProjectFile::new(fixture.project_root(), "app.py");
-        let analyzer = fixture.analyzer.analyzer();
-        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        let python_context = context
-            .language_state::<PythonDefinitionState>()
-            .python_context(token, py, analyzer, &file, source);
-        python_context.set_receiver_type_cache_limit(1);
-        let member_offsets = [
-            source
-                .find("service.run")
-                .expect("first service call in source")
-                + "service.".len(),
-            source.find("other.stop").expect("other call in source") + "other.".len(),
-            source
-                .rfind("service.run")
-                .expect("second service call in source")
-                + "service.".len(),
-        ];
-        let requests = member_offsets
-            .into_iter()
-            .zip(["run", "stop", "run"])
-            .map(|(start_byte, needle)| DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(start_byte),
-                end_byte: Some(start_byte + needle.len()),
-            })
-            .collect();
-
-        let outcomes =
-            resolve_definition_requests(analyzer, token, &mut context, requests, None, None);
-
-        assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
-        assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
-        assert_eq!(outcomes[2].definitions[0].fq_name(), "service.Service.run");
-        assert_eq!(python_context.receiver_type_cache_len(), 1);
-        assert_eq!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_build_counts(analyzer),
-            (1, 1, 2, 0)
-        );
-        assert!(
-            context
-                .language_state::<PythonDefinitionState>()
-                .python_contexts
-                .is_empty()
         );
     }
 }

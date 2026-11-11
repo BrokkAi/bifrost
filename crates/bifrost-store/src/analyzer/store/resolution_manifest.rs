@@ -2,7 +2,6 @@
 
 use super::resolution_prepare::{resolution_rows::*, typed_rows::*};
 use crate::CancellationToken;
-use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 #[doc(hidden)]
 pub const BODY_MANIFEST_COLUMNS: &[&str] = &[
@@ -37,139 +36,189 @@ pub const BODY_MANIFEST_COLUMNS: &[&str] = &[
     "expected_capsule_reference_context_count",
 ];
 
+/// The fixed-schema byte encoding that the complete-bundle digests hash.
+///
+/// A family's name selects its row schema, so a cell carries only its value:
+/// fixed-width scalars as their big-endian bytes, variable-length values behind
+/// a `u64` length, and a one-byte tag where a value has variants. That keeps
+/// the encoding injective for each schema. Repeating column and type labels in
+/// every cell multiplied the hashed bytes several times over and made hashing
+/// the largest cost of preparing a large bundle (#9628).
+pub(super) mod compact {
+    use sha2::{Digest, Sha256};
+
+    pub(in super::super) fn put_u64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    pub(in super::super) fn put_len(out: &mut Vec<u8>, len: usize) {
+        put_u64(
+            out,
+            u64::try_from(len).expect("usize fits u64 on supported targets"),
+        );
+    }
+
+    pub(in super::super) fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
+        put_len(out, value.len());
+        out.extend_from_slice(value);
+    }
+
+    pub(in super::super) fn digest(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    /// SHA-256 over a stream of compact encodings, fed in large chunks.
+    pub(in super::super) struct StreamHasher {
+        sha: Sha256,
+        buffer: Vec<u8>,
+    }
+
+    impl StreamHasher {
+        const FLUSH_BYTES: usize = 1 << 16;
+
+        pub(in super::super) fn new(domain: &[u8]) -> Self {
+            let mut hasher = Self {
+                sha: Sha256::new(),
+                buffer: Vec::with_capacity(Self::FLUSH_BYTES * 2),
+            };
+            put_bytes(hasher.buffer(), domain);
+            hasher
+        }
+
+        /// The pending bytes; callers append one compact encoding at a time.
+        pub(in super::super) fn buffer(&mut self) -> &mut Vec<u8> {
+            if self.buffer.len() >= Self::FLUSH_BYTES {
+                self.sha.update(&self.buffer);
+                self.buffer.clear();
+            }
+            &mut self.buffer
+        }
+
+        pub(in super::super) fn finish(mut self) -> [u8; 32] {
+            self.sha.update(&self.buffer);
+            self.sha.finalize().into()
+        }
+    }
+}
+
+use compact::{StreamHasher, put_bytes, put_len};
+
 trait CanonicalCell {
-    fn hash(
+    fn encode(
         &self,
-        hash: &mut CanonicalHasher,
+        out: &mut Vec<u8>,
         shared: &[[u8; 32]],
         cancellation: &CancellationToken,
     ) -> Option<()>;
 }
 impl CanonicalCell for i64 {
-    fn hash(
-        &self,
-        hash: &mut CanonicalHasher,
-        _: &[[u8; 32]],
-        _: &CancellationToken,
-    ) -> Option<()> {
-        hash.field("integer", &self.to_be_bytes());
+    fn encode(&self, out: &mut Vec<u8>, _: &[[u8; 32]], _: &CancellationToken) -> Option<()> {
+        out.extend_from_slice(&self.to_be_bytes());
         Some(())
     }
 }
 impl CanonicalCell for u8 {
-    fn hash(
-        &self,
-        hash: &mut CanonicalHasher,
-        _: &[[u8; 32]],
-        _: &CancellationToken,
-    ) -> Option<()> {
-        hash.field("byte", &[*self]);
+    fn encode(&self, out: &mut Vec<u8>, _: &[[u8; 32]], _: &CancellationToken) -> Option<()> {
+        out.push(*self);
         Some(())
     }
 }
 impl CanonicalCell for bool {
-    fn hash(
-        &self,
-        hash: &mut CanonicalHasher,
-        _: &[[u8; 32]],
-        _: &CancellationToken,
-    ) -> Option<()> {
-        hash.field("boolean", &[u8::from(*self)]);
+    fn encode(&self, out: &mut Vec<u8>, _: &[[u8; 32]], _: &CancellationToken) -> Option<()> {
+        out.push(u8::from(*self));
         Some(())
     }
 }
 impl CanonicalCell for u32 {
-    fn hash(
-        &self,
-        hash: &mut CanonicalHasher,
-        shared: &[[u8; 32]],
-        _: &CancellationToken,
-    ) -> Option<()> {
-        hash.field("shared_digest", &shared[*self as usize]);
+    fn encode(&self, out: &mut Vec<u8>, shared: &[[u8; 32]], _: &CancellationToken) -> Option<()> {
+        out.extend_from_slice(&shared[*self as usize]);
         Some(())
     }
 }
 impl CanonicalCell for String {
-    fn hash(
-        &self,
-        hash: &mut CanonicalHasher,
-        _: &[[u8; 32]],
-        _: &CancellationToken,
-    ) -> Option<()> {
-        hash.field("text", self.as_bytes());
+    fn encode(&self, out: &mut Vec<u8>, _: &[[u8; 32]], _: &CancellationToken) -> Option<()> {
+        put_bytes(out, self.as_bytes());
         Some(())
     }
 }
 impl<T: CanonicalCell> CanonicalCell for Option<T> {
-    fn hash(
+    fn encode(
         &self,
-        hash: &mut CanonicalHasher,
+        out: &mut Vec<u8>,
         shared: &[[u8; 32]],
         cancellation: &CancellationToken,
     ) -> Option<()> {
         match self {
             Some(value) => {
-                hash.field("option", b"some");
-                value.hash(hash, shared, cancellation)?;
+                out.push(1);
+                value.encode(out, shared, cancellation)?;
             }
-            None => hash.field("option", b"none"),
+            None => out.push(0),
         }
         Some(())
     }
 }
 impl CanonicalCell for PathBodyToken {
-    fn hash(
+    fn encode(
         &self,
-        hash: &mut CanonicalHasher,
+        out: &mut Vec<u8>,
         shared: &[[u8; 32]],
         cancellation: &CancellationToken,
     ) -> Option<()> {
         match self {
-            Self::Open => hash.field("token", b"open"),
-            Self::Close => hash.field("token", b"close"),
-            Self::Null => hash.field("token", b"null"),
-            Self::Int(value) => value.hash(hash, shared, cancellation)?,
-            Self::Shared(slot) => slot.hash(hash, shared, cancellation)?,
-            Self::Text(value) => hash.field("text", value.as_bytes()),
+            Self::Open => out.push(0),
+            Self::Close => out.push(1),
+            Self::Null => out.push(2),
+            Self::Int(value) => {
+                out.push(3);
+                value.encode(out, shared, cancellation)?;
+            }
+            Self::Shared(slot) => {
+                out.push(4);
+                slot.encode(out, shared, cancellation)?;
+            }
+            Self::Text(value) => {
+                out.push(5);
+                put_bytes(out, value.as_bytes());
+            }
         }
         Some(())
     }
 }
 impl<T: CanonicalCell> CanonicalCell for Vec<T> {
-    fn hash(
+    fn encode(
         &self,
-        hash: &mut CanonicalHasher,
+        out: &mut Vec<u8>,
         shared: &[[u8; 32]],
         cancellation: &CancellationToken,
     ) -> Option<()> {
-        hash.field("length", &(self.len() as u64).to_be_bytes());
+        put_len(out, self.len());
         for value in self {
             if cancellation.is_cancelled() {
                 return None;
             }
-            value.hash(hash, shared, cancellation)?;
+            value.encode(out, shared, cancellation)?;
         }
         Some(())
     }
 }
 impl CanonicalCell for (PathBodyToken, bool) {
-    fn hash(
+    fn encode(
         &self,
-        hash: &mut CanonicalHasher,
+        out: &mut Vec<u8>,
         shared: &[[u8; 32]],
         cancellation: &CancellationToken,
     ) -> Option<()> {
-        self.0.hash(hash, shared, cancellation)?;
-        self.1.hash(hash, shared, cancellation)
+        self.0.encode(out, shared, cancellation)?;
+        self.1.encode(out, shared, cancellation)
     }
 }
 
 macro_rules! canonical_row {
     ($ty:ty, $($field:ident),+ $(,)?) => {
         impl CanonicalCell for $ty {
-            fn hash(&self, hash: &mut CanonicalHasher, shared: &[[u8; 32]], cancellation: &CancellationToken) -> Option<()> {
-                $(hash.field("column", stringify!($field).as_bytes());
-                  self.$field.hash(hash, shared, cancellation)?;)+
+            fn encode(&self, out: &mut Vec<u8>, shared: &[[u8; 32]], cancellation: &CancellationToken) -> Option<()> {
+                $(self.$field.encode(out, shared, cancellation)?;)+
                 Some(())
             }
         }
@@ -201,6 +250,7 @@ canonical_row!(
     end_byte,
     unqualified,
     owner,
+    prefix,
     receiver_origin,
     go_spelling_namespace,
     go_definition_namespaces,
@@ -338,32 +388,72 @@ canonical_row!(
 );
 
 fn family<T: CanonicalCell>(
-    hash: &mut CanonicalHasher,
+    hash: &mut StreamHasher,
     name: &str,
     rows: &[T],
     shared: &[[u8; 32]],
     cancellation: &CancellationToken,
 ) -> Option<()> {
     let mut digests = Vec::with_capacity(rows.len());
+    let mut row_bytes = Vec::new();
     for row in rows {
         if cancellation.is_cancelled() {
             return None;
         }
-        let mut row_hash = CanonicalHasher::new(b"bifrost-resolution-body-row:v1");
-        row.hash(&mut row_hash, shared, cancellation)?;
-        digests.push(row_hash.finish());
+        row_bytes.clear();
+        row.encode(&mut row_bytes, shared, cancellation)?;
+        digests.push(compact::digest(&row_bytes));
     }
     // Canonical order follows the complete producer row, not first-use interning.
     let digests = super::resolution::cancellable_sort_by(digests, Ord::cmp, cancellation)?;
-    hash.field("family", name.as_bytes());
-    hash.field("row_count", &(digests.len() as u64).to_be_bytes());
+    put_bytes(hash.buffer(), name.as_bytes());
+    put_len(hash.buffer(), digests.len());
     for digest in digests {
         if cancellation.is_cancelled() {
             return None;
         }
-        hash.field("row", &digest);
+        hash.buffer().extend_from_slice(&digest);
     }
     Some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn complete_body_digest_with_context(
+    language: brokk_bifrost_core::analyzer::Language,
+    contexts: &[super::resolution::PreparedResolutionRow],
+    headers: [u8; 32],
+    paths: &PreparedPathRows,
+    sites: &[PreparedSiteRow],
+    typed: &PreparedTypedRows,
+    gaps: &PreparedGapRows,
+    recipes: &[PreparedLookupRecipeRow],
+    membership: &[[u8; 32]],
+    cancellation: &CancellationToken,
+) -> Option<[u8; 32]> {
+    let digest = complete_body_digest(
+        headers,
+        paths,
+        sites,
+        typed,
+        gaps,
+        recipes,
+        membership,
+        cancellation,
+    )?;
+    if language != brokk_bifrost_core::analyzer::Language::Java {
+        assert!(contexts.is_empty());
+        return Some(digest);
+    }
+    let mut hash = StreamHasher::new(b"bifrost-java-reference-execution-body:v2");
+    hash.buffer().extend_from_slice(&digest);
+    put_len(hash.buffer(), contexts.len());
+    for row in contexts {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        row.encode(hash.buffer());
+    }
+    Some(hash.finish())
 }
 
 // Keep the content families separate so the digest binds each one.
@@ -378,8 +468,8 @@ pub(super) fn complete_body_digest(
     membership: &[[u8; 32]],
     cancellation: &CancellationToken,
 ) -> Option<[u8; 32]> {
-    let mut hash = CanonicalHasher::new(b"bifrost-complete-resolution-content:v1");
-    hash.field("headers", &headers);
+    let mut hash = StreamHasher::new(b"bifrost-complete-resolution-content:v2");
+    hash.buffer().extend_from_slice(&headers);
     family(&mut hash, "paths", &paths.rows, &paths.shared, cancellation)?;
     family(&mut hash, "sites", sites, &[], cancellation)?;
     family(&mut hash, "gaps", &gaps.rows, &gaps.shared, cancellation)?;
@@ -391,6 +481,7 @@ pub(super) fn complete_body_digest(
         type_frontiers,
         type_transfers,
         type_components,
+        type_productions,
         declared_type_arguments,
         type_arguments,
         underlying_types,
@@ -410,40 +501,30 @@ pub(super) fn complete_body_digest(
         callable_signatures,
         callable_parameter_owners
     );
-    // Existing languages have no constructor productions. Keep their sealed
-    // content identity unchanged rather than hashing a newly empty family.
-    if !typed.type_productions.is_empty() {
-        family(
-            &mut hash,
-            "type_productions",
-            &typed.type_productions,
-            &typed.shared,
-            cancellation,
-        )?;
-    }
     let members =
         super::resolution::cancellable_sort_by(membership.to_vec(), Ord::cmp, cancellation)?;
-    hash.field("membership_count", &(members.len() as u64).to_be_bytes());
+    put_len(hash.buffer(), members.len());
     for digest in members {
         if cancellation.is_cancelled() {
             return None;
         }
-        hash.field("member", &digest);
+        hash.buffer().extend_from_slice(&digest);
     }
     let recipes = super::resolution::cancellable_sort_by(
         recipes.iter().collect::<Vec<_>>(),
         |left, right| left.identity_digest.cmp(&right.identity_digest),
         cancellation,
     )?;
-    hash.field("recipe_count", &(recipes.len() as u64).to_be_bytes());
+    put_len(hash.buffer(), recipes.len());
     for recipe in recipes {
         if cancellation.is_cancelled() {
             return None;
         }
-        hash.field("recipe_identity", &recipe.identity_digest);
-        hash.field("recipe_language", &recipe.semantic_language.to_be_bytes());
-        hash.field("recipe_namespace", &recipe.namespace.to_be_bytes());
-        hash.field("recipe_spelling", recipe.spelling.as_bytes());
+        let out = hash.buffer();
+        out.extend_from_slice(&recipe.identity_digest);
+        out.extend_from_slice(&recipe.semantic_language.to_be_bytes());
+        out.extend_from_slice(&recipe.namespace.to_be_bytes());
+        put_bytes(out, recipe.spelling.as_bytes());
     }
     Some(hash.finish())
 }
@@ -530,7 +611,10 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_package_routes WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_package_route_segments WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_singleton_relations WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_extern_aliases WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_compilation_imports WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_reference_package_contexts WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_member_type_coverage WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_paths WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_sites WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_gaps WHERE blob_id = ?1),
@@ -559,7 +643,8 @@ pub(super) const COMPLETE_PUBLICATION_COUNTS_SQL: &str =
        (SELECT COUNT(*) FROM resolution_callable_parameter_owners WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_inputs WHERE blob_id = ?1),
        (SELECT COUNT(*) FROM resolution_capsule_declarations WHERE blob_id = ?1),
-       (SELECT COUNT(*) FROM resolution_capsule_reference_contexts WHERE blob_id = ?1)";
+       (SELECT COUNT(*) FROM resolution_capsule_reference_contexts WHERE blob_id = ?1),
+       (SELECT COUNT(*) FROM resolution_reference_execution_contexts WHERE blob_id = ?1)";
 
 // This byte sum always runs, even when consistency validation is sampled.
 pub(super) const COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL: &str = "SELECT (SELECT COALESCE(SUM(length(CAST(anchor AS BLOB)) + length(CAST(kind AS BLOB)) + coalesce(length(CAST(bound_name AS BLOB)),0)),0) FROM resolution_root_imports WHERE blob_id=?1)
@@ -594,6 +679,8 @@ pub(super) const COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL: &str = "SELECT (SELECT 
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(member_name AS BLOB)),0) + COALESCE(length(CAST(kind AS BLOB)),0) + COALESCE(length(CAST(status AS BLOB)),0)),0) FROM resolution_jvm_aliases WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(spelling AS BLOB)),0)),0) FROM resolution_jvm_alias_owner_segments WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(spelling AS BLOB)),0)),0) FROM resolution_package_route_segments WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(length(prefixes)),0) FROM resolution_reference_package_contexts WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(length(CAST(coverage AS BLOB)) + COALESCE(length(CAST(open_reason AS BLOB)),0)),0) FROM resolution_member_type_coverage WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(kind AS BLOB)),0)),0) FROM resolution_singleton_relations WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(body AS BLOB)),0) + COALESCE(length(CAST(end_fixed_key AS BLOB)),0)),0) FROM resolution_paths WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(completion AS BLOB)),0)),0) FROM resolution_type_transfers WHERE blob_id = ?1)
@@ -603,6 +690,7 @@ pub(super) const COMPLETE_PUBLICATION_PAYLOAD_BYTES_SQL: &str = "SELECT (SELECT 
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(body AS BLOB)),0)),0) FROM resolution_callable_signatures WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(host_content_oid AS BLOB)),0) + COALESCE(length(CAST(definition_content_oid AS BLOB)),0) + COALESCE(length(CAST(producer_epoch AS BLOB)),0) + COALESCE(length(CAST(derivation_digest AS BLOB)),0) + COALESCE(length(CAST(checkpoint_digest AS BLOB)),0)),0) FROM resolution_capsule_inputs WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(identifier AS BLOB)),0) + COALESCE(length(CAST(kind AS BLOB)),0)),0) FROM resolution_capsule_declarations WHERE blob_id = ?1)
+       + (SELECT COALESCE(SUM(length(CAST(disposition AS BLOB)) + COALESCE(length(CAST(procedure_kind AS BLOB)),0)),0) FROM resolution_reference_execution_contexts WHERE blob_id = ?1)
        + (SELECT COALESCE(SUM(COALESCE(length(CAST(lang AS BLOB)),0) + COALESCE(length(CAST(semantic_language AS BLOB)),0) + COALESCE(length(CAST(producer_epoch AS BLOB)),0) + COALESCE(length(CAST(interior_digest AS BLOB)),0)),0) FROM resolution_fragment_interiors WHERE blob_id = ?1)";
 
 /// Pre-write grouping bound. SQLite's JSONB element header uses at most nine
@@ -719,8 +807,12 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     #[test]
+    #[hardwon(
+        "#9002: review found the site-row prefix proof missing from the body digest, as da686f3b4f found the Go admission masks"
+    )]
     fn admission_proof_changes_invalidate_the_complete_body_identity() {
         let reference = PreparedSiteRow {
+            prefix: None,
             site: 1,
             role: 0,
             namespace: 6,
@@ -755,6 +847,20 @@ mod tests {
             original,
             "package admission changes answer authority"
         );
+        let mut with_prefix = reference;
+        with_prefix.prefix = Some(3);
+        assert_ne!(
+            digest(&with_prefix),
+            original,
+            "a published prefix proof is resolution evidence"
+        );
+        let mut proved_none = reference;
+        proved_none.prefix = Some(-1);
+        assert_ne!(
+            digest(&proved_none),
+            original,
+            "a proved absence of prefix differs from an unpublished one"
+        );
         let mut without_proof = reference;
         without_proof.go_spelling_namespace = None;
         assert_ne!(
@@ -763,6 +869,7 @@ mod tests {
             "missing spelling proof is incomplete evidence"
         );
         let mut definition = PreparedSiteRow {
+            prefix: None,
             site: 2,
             role: 1,
             namespace: 0,

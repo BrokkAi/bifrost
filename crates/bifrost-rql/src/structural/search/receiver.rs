@@ -1,3 +1,4 @@
+use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::*;
 
 pub(super) fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
@@ -483,6 +484,7 @@ pub(super) fn receiver_analysis_expansions_for_pipeline_row(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     cache_profile: &mut Option<QueryCacheProfile>,
     receiver_diagnostics: &mut ReceiverDiagnostics,
+    member_step: &mut MemberFormStep<'_>,
     shared_budget_exhausted: &mut bool,
     receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
@@ -538,6 +540,7 @@ pub(super) fn receiver_analysis_expansions_for_pipeline_row(
         max_outputs,
         cancellation,
         receiver_diagnostics,
+        member_step,
         shared_budget_exhausted,
         receiver_truncated,
     )
@@ -559,6 +562,7 @@ pub(super) fn receiver_analysis_expansions(
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     receiver_diagnostics: &mut ReceiverDiagnostics,
+    member_step: &mut MemberFormStep<'_>,
     shared_budget_exhausted: &mut bool,
     receiver_truncated: &mut bool,
 ) -> Vec<PipelineExpansion> {
@@ -641,11 +645,13 @@ pub(super) fn receiver_analysis_expansions(
         };
 
         let candidate_count = receiver_candidate_count(&report);
+        // Resolution rounds are iterations, not fact nodes.
         budget.fact_nodes = budget
             .fact_nodes
             .saturating_add(report.work.setup_nodes)
             .saturating_add(report.work.scope_nodes)
-            .saturating_add(report.work.summary_expansions);
+            .saturating_add(report.work.summary_expansions)
+            .saturating_add(report.work.hierarchy_order_steps);
         budget.pipeline_rows = budget
             .pipeline_rows
             .saturating_add(1)
@@ -708,13 +714,59 @@ pub(super) fn receiver_analysis_expansions(
             ReceiverQueryAnalysis::Values(
                 ReceiverAnalysisOutcome::Precise(_)
                 | ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Incomplete { .. }
                 | ReceiverAnalysisOutcome::Unknown,
             )
             | ReceiverQueryAnalysis::MemberTargets(
                 ReceiverAnalysisOutcome::Precise(_)
                 | ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Incomplete { .. }
                 | ReceiverAnalysisOutcome::Unknown,
             ) => {}
+        }
+        let has_possible = match &report.analysis {
+            ReceiverQueryAnalysis::Values(outcome) => outcome.possible_candidates().is_some(),
+            ReceiverQueryAnalysis::MemberTargets(outcome) => {
+                outcome.possible_candidates().is_some()
+            }
+        };
+        let incomplete = matches!(
+            &report.analysis,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Incomplete { .. })
+                | ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Incomplete { .. })
+        );
+        // An Incomplete outcome reports itself: a mixed modeled and workspace
+        // receiver is Incomplete even when its definition lookup resolved
+        // with no diagnostic of its own.
+        if incomplete && report.definition_diagnostics.is_empty() {
+            receiver_diagnostics.push((
+                CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                language,
+                operation.as_str(),
+                "receiver candidates are possible, not proven".to_string(),
+                None,
+            ));
+        }
+        if has_possible || report.possible_candidates_suppressed {
+            for diagnostic in &report.definition_diagnostics {
+                receiver_diagnostics.push((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                    language,
+                    operation.as_str(),
+                    format!("definition {}: {}", diagnostic.kind, diagnostic.message),
+                    None,
+                ));
+            }
+            if report.possible_candidates_suppressed {
+                receiver_diagnostics.push((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                    language,
+                    operation.as_str(),
+                    "possible candidates suppressed: neutral gate could not validate applicability"
+                        .to_string(),
+                    None,
+                ));
+            }
         }
         if let Some(capability) = report.semantic_unsupported {
             receiver_diagnostics.push((
@@ -759,12 +811,41 @@ pub(super) fn receiver_analysis_expansions(
             ));
             break;
         };
-        let value = ReceiverAnalysisValue {
+        let mut value = ReceiverAnalysisValue {
             report,
             capture: capture.clone(),
             site_id,
             site_ast_id,
+            member_forms: Vec::new(),
         };
+        // The verdict withholds a row whose target coverage is not exhaustive
+        // before it reads any form, so only exhaustive rows spend scan budget
+        // on classification; a withheld row cannot starve a later one.
+        if member_step.filter.is_some() && member_target_coverage(&value) == "exhaustive" {
+            let (member_forms, member_form_refused) = classify_member_targets(
+                analyzer,
+                &value.report,
+                member_step,
+                budget,
+                limits,
+                cancellation,
+            );
+            value.member_forms = member_forms;
+            if member_form_refused {
+                analyzer.mark_execution_dependent();
+                receiver_diagnostics.push((
+                    CodeQueryDiagnosticCode::ReceiverAnalysisPartial,
+                    value.report.site.language,
+                    operation.as_str(),
+                    "member form left unknown at max_scanned_files or max_scanned_source_bytes"
+                        .to_string(),
+                    Some(DerivationExecutionCause::Budget),
+                ));
+            }
+        }
+        if !member_step.admits(analyzer, &value) {
+            continue;
+        }
         let (value, trace) = if operation == ReceiverQueryOperation::MemberTargets {
             (
                 PipelineValue::MemberTargetAnalysis(value.clone()),
@@ -783,6 +864,388 @@ pub(super) fn receiver_analysis_expansions(
         });
     }
     expansions
+}
+
+/// The largest declaring file a member-form classification parses.
+const MAX_MEMBER_FORM_SOURCE_BYTES: usize = 1024 * 1024;
+
+type MemberDeclarationForms = Box<[(usize, usize, MemberForm)]>;
+
+/// What the `member-targets` step keeps for all of its input rows (#10229).
+///
+/// The step creates one per execution, so a declaring file is parsed and
+/// charged to the scan budget at most once however many rows reach it, and a
+/// member is classified at most once.
+pub(super) struct MemberFormStep<'f> {
+    /// The step's `:member-form` and `:trivial-property` options; `None` when
+    /// the step does not decide rows by the target's declaration.
+    filter: Option<&'f crate::query::ReceiverTraversalFilter>,
+    memo: HashMap<CodeUnit, MemberForm>,
+    /// Every member declaration of each declaring file the step reached, as
+    /// `(start_byte, end_byte, form)` sorted by start, classified in one walk
+    /// when the file was first needed. `None` when the file could not be read.
+    files: HashMap<ProjectFile, Option<MemberDeclarationForms>>,
+    /// Rows the filter could neither keep nor drop, with the reason.
+    withheld: Vec<(Language, String)>,
+}
+
+enum MemberFormVerdict {
+    Match,
+    Mismatch,
+    Unknown(String),
+}
+
+impl<'f> MemberFormStep<'f> {
+    pub(super) fn new(step: &'f QueryStep) -> Self {
+        let filter = match step {
+            QueryStep::MemberTargets(filter) if filter.filters_members() => Some(filter),
+            _ => None,
+        };
+        Self {
+            filter,
+            memo: HashMap::default(),
+            files: HashMap::default(),
+            withheld: Vec::new(),
+        }
+    }
+
+    /// Decide whether the row stays in the output. A row without a filter
+    /// always stays. With one, a row is kept when its single exact target
+    /// satisfies every option, dropped when it provably violates one, and
+    /// otherwise withheld and recorded for `member_form_undecided`: unknown is
+    /// not a mismatch, so a filter never turns an unexamined property into a
+    /// complete empty answer.
+    fn admits(&mut self, analyzer: &dyn IAnalyzer, value: &ReceiverAnalysisValue) -> bool {
+        let Some(filter) = self.filter else {
+            return true;
+        };
+        match member_form_verdict(filter, value) {
+            MemberFormVerdict::Match => true,
+            MemberFormVerdict::Mismatch => false,
+            MemberFormVerdict::Unknown(reason) => {
+                // The row is gone, so the answer no longer follows from the
+                // source files alone.
+                analyzer.mark_execution_dependent();
+                let site = &value.report.site;
+                self.withheld.push((
+                    site.language,
+                    format!(
+                        "{}:{}: {reason}",
+                        rel_path_string(&site.file),
+                        site.range.start_line
+                    ),
+                ));
+                false
+            }
+        }
+    }
+
+    /// One diagnostic for each language with withheld rows, naming every
+    /// withheld site.
+    pub(super) fn diagnostics(self) -> Vec<CodeQueryDiagnostic> {
+        let mut by_language: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        for (language, site) in self.withheld {
+            by_language
+                .entry(language.config_label())
+                .or_default()
+                .push(site);
+        }
+        by_language
+            .into_iter()
+            .map(|(language, mut sites)| {
+                sites.sort();
+                sites.dedup();
+                CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::MemberFormUndecided,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language,
+                    message: format!(
+                        "member-targets withheld rows whose member form or property triviality was undecided: {sites:?}"
+                    ),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The target coverage of a member-target row, as the rendered row reports it.
+fn member_target_coverage(value: &ReceiverAnalysisValue) -> &'static str {
+    let ReceiverQueryAnalysis::MemberTargets(outcome) = &value.report.analysis else {
+        unreachable!("member-target rows carry member-target analysis");
+    };
+    let (label, _, _) = receiver_outcome_metadata(outcome);
+    receiver_coverage(value, label)
+}
+
+/// Apply the step options to one analysis. Only an `exhaustive` row (one
+/// precise target, nothing truncated, no unsupported semantics) can decide;
+/// every other row is unknown.
+fn member_form_verdict(
+    filter: &crate::query::ReceiverTraversalFilter,
+    value: &ReceiverAnalysisValue,
+) -> MemberFormVerdict {
+    let coverage = member_target_coverage(value);
+    if coverage != "exhaustive" {
+        return MemberFormVerdict::Unknown(format!("target coverage is {coverage}"));
+    }
+    let ReceiverQueryAnalysis::MemberTargets(outcome) = &value.report.analysis else {
+        unreachable!("member-target rows carry member-target analysis");
+    };
+    let targets = outcome.values().into_iter().flatten().collect::<Vec<_>>();
+    if targets.is_empty() {
+        return MemberFormVerdict::Unknown("no target".to_string());
+    }
+    let mut verdicts = targets.into_iter().map(|target| {
+        let (member_form, trivial_property) = value.member_form(target);
+        let ReceiverMemberTarget::Workspace { member, .. } = target else {
+            return MemberFormVerdict::Unknown(
+                "the target belongs to a semantic pack, which records no member form".to_string(),
+            );
+        };
+        let mut unknown = Vec::new();
+        if !filter.member_form.is_empty() {
+            match member_form {
+                Some(form) if filter.member_form.contains(&form) => {}
+                Some(_) => return MemberFormVerdict::Mismatch,
+                None => unknown.push(format!(
+                    "the member form of {} is unknown",
+                    member.fq_name()
+                )),
+            }
+        }
+        if let Some(wanted) = filter.trivial_property {
+            match trivial_property {
+                Some(actual) if actual == wanted => {}
+                Some(_) => return MemberFormVerdict::Mismatch,
+                None => unknown.push(format!(
+                    "the property triviality of {} is unknown",
+                    member.fq_name()
+                )),
+            }
+        }
+        if unknown.is_empty() {
+            MemberFormVerdict::Match
+        } else {
+            MemberFormVerdict::Unknown(unknown.join("; "))
+        }
+    });
+    // A precise outcome holds one target; if it ever held several, they must
+    // agree for the row to be decided.
+    let first = verdicts.next().expect("targets are not empty");
+    for other in verdicts {
+        match (&first, &other) {
+            (MemberFormVerdict::Match, MemberFormVerdict::Match)
+            | (MemberFormVerdict::Mismatch, MemberFormVerdict::Mismatch) => {}
+            (MemberFormVerdict::Unknown(reason), _) | (_, MemberFormVerdict::Unknown(reason)) => {
+                return MemberFormVerdict::Unknown(reason.clone());
+            }
+            _ => {
+                return MemberFormVerdict::Unknown(
+                    "the targets differ in member form or property triviality".to_string(),
+                );
+            }
+        }
+    }
+    first
+}
+
+/// Classify each C# workspace member target of a member-target report (#10229).
+///
+/// The classification is made here, under the query's scanned-file and
+/// source-byte budget and its cancellation, so that rendering and the step's
+/// options only read it. `step` carries the memo and syntax cache for the
+/// whole step. Returns the classifications and whether the budget refused a
+/// declaring file.
+fn classify_member_targets(
+    analyzer: &dyn IAnalyzer,
+    report: &ReceiverQueryReport,
+    step: &mut MemberFormStep<'_>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> (Vec<(CodeUnit, MemberForm)>, bool) {
+    let ReceiverQueryAnalysis::MemberTargets(outcome) = &report.analysis else {
+        return (Vec::new(), false);
+    };
+    let mut refused = false;
+    let mut forms = Vec::new();
+    for target in outcome
+        .values()
+        .or_else(|| outcome.possible_candidates())
+        .into_iter()
+        .flatten()
+    {
+        let ReceiverMemberTarget::Workspace { member, .. } = target else {
+            continue;
+        };
+        if crate::analyzer::common::language_for_file(member.source()) != Language::CSharp
+            || forms.iter().any(|(unit, _)| unit == member)
+        {
+            continue;
+        }
+        let form = match step.memo.get(member) {
+            Some(form) => *form,
+            None => {
+                let form = source_member_form(
+                    analyzer,
+                    member,
+                    step,
+                    budget,
+                    limits,
+                    cancellation,
+                    &mut refused,
+                );
+                step.memo.insert(member.clone(), form);
+                form
+            }
+        };
+        forms.push((member.clone(), form));
+    }
+    (forms, refused)
+}
+
+/// Parse a declaring file through the provider's recorded, cancellable read,
+/// charging it to the query's scanned-file and source-byte budget. The step
+/// reads each file once. A file the budget cannot admit is not parsed, and
+/// `refused` is set.
+fn budgeted_member_syntax(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    refused: &mut bool,
+) -> StructuralSyntaxLimitedOutcome {
+    use brokk_bifrost_core::analyzer::work_budget::LimitedCounter;
+    let scanned_files = budget.scanned_files.saturating_add(1);
+    if !LimitedCounter::from_usage(scanned_files, limits.max_scanned_files).allows(0) {
+        *refused = true;
+        return StructuralSyntaxLimitedOutcome::Unavailable;
+    }
+    let remaining_bytes = limits
+        .max_scanned_source_bytes
+        .saturating_sub(budget.scanned_source_bytes);
+    let Some(provider) = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == Language::CSharp)
+    else {
+        return StructuralSyntaxLimitedOutcome::Unavailable;
+    };
+    let outcome = provider.structural_syntax_limited(
+        file,
+        remaining_bytes.min(MAX_MEMBER_FORM_SOURCE_BYTES),
+        cancellation,
+    );
+    match &outcome {
+        StructuralSyntaxLimitedOutcome::Available(syntax) => {
+            budget.scanned_files = scanned_files;
+            budget.scanned_source_bytes = budget
+                .scanned_source_bytes
+                .saturating_add(syntax.prepared().source().len());
+        }
+        StructuralSyntaxLimitedOutcome::Exceeded { .. }
+            if remaining_bytes < MAX_MEMBER_FORM_SOURCE_BYTES =>
+        {
+            *refused = true;
+        }
+        StructuralSyntaxLimitedOutcome::Exceeded { .. }
+        | StructuralSyntaxLimitedOutcome::Cancelled
+        | StructuralSyntaxLimitedOutcome::Unavailable => {}
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_member_form(
+    analyzer: &dyn IAnalyzer,
+    member: &CodeUnit,
+    step: &mut MemberFormStep<'_>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    refused: &mut bool,
+) -> MemberForm {
+    let Some(support) = crate::analyzer::languages::language_support_for_hook(
+        Language::CSharp,
+        "member_declaration_form",
+    ) else {
+        return (None, None);
+    };
+    let Some(ranges) = support.declaration_ranges_limited(analyzer, member, 2) else {
+        return (None, None);
+    };
+    if !ranges.complete || ranges.rows.len() != 1 {
+        return (None, None);
+    }
+    let file = member.source();
+    let forms = step.files.entry(file.clone()).or_insert_with(|| {
+        let outcome = budgeted_member_syntax(analyzer, file, budget, limits, cancellation, refused);
+        let StructuralSyntaxLimitedOutcome::Available(syntax) = outcome else {
+            return None;
+        };
+        Some(classify_member_declarations(support, syntax.prepared()))
+    });
+    let Some(forms) = forms else {
+        return (None, None);
+    };
+    // Member declarations do not nest, so at most one contains the range.
+    let range = ranges.rows[0];
+    forms[..forms.partition_point(|(start, _, _)| *start <= range.start_byte)]
+        .last()
+        .filter(|(_, end, _)| range.end_byte <= *end)
+        .map_or((None, None), |(_, _, form)| *form)
+}
+
+/// Classify every C# member declaration of one file in a single walk, sorted
+/// by start byte. Looking members up one at a time from the root re-reads the
+/// whole member list of their type for each of them, which is quadratic in
+/// the width of a large generated class; the file's full source is already
+/// charged to the scan budget, so classifying all of it costs nothing extra
+/// against the budget. A field or event declarator is classified through its
+/// whole declaration: an undecided `#if` in the prefix (`System.Action` in one
+/// branch, `event System.Action` in the other, then a shared `E;`) changes
+/// what the name declares.
+fn classify_member_declarations(
+    support: &dyn crate::analyzer::languages::LanguageSupport,
+    syntax: &brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree,
+) -> MemberDeclarationForms {
+    let regions = syntax.conditional_regions();
+    let mut memo = brokk_bifrost_analysis::analyzer::languages::MemberDeclarationMemo::default();
+    let mut forms = Vec::new();
+    let mut stack = vec![syntax.tree().root_node()];
+    let mut cursor = syntax.tree().walk();
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "field_declaration"
+                | "enum_member_declaration"
+                | "property_declaration"
+                | "method_declaration"
+                | "operator_declaration"
+                | "conversion_operator_declaration"
+                | "constructor_declaration"
+                | "destructor_declaration"
+                | "event_declaration"
+                | "event_field_declaration"
+        ) {
+            forms.push((
+                node.start_byte(),
+                node.end_byte(),
+                support.member_declaration_form(&mut memo, node, syntax.source(), &regions),
+            ));
+            continue;
+        }
+        stack.extend(node.named_children(&mut cursor));
+    }
+    forms.sort_unstable_by_key(|(start, _, _)| *start);
+    forms.into_boxed_slice()
 }
 
 pub(super) const RECEIVER_SITE_ID_DOMAIN: &[u8] = b"bifrost.code_query.receiver_site.v1";
@@ -867,6 +1330,17 @@ pub(super) fn record_receiver_pipeline_output_omission(
     }));
 }
 
+/// Project CodeQuery's single remaining fact budget onto the receiver axes.
+///
+/// Scope, summary and hierarchy-order work all count as facts; resolution
+/// rounds are iterations, not facts, and keep their own limit. Scope and
+/// summary are allocated first. Hierarchy-order work gets only what they
+/// leave, so the three never exceed the fact budget together. It can be zero
+/// while facts remain (a small custom budget, or a nearly spent one); order
+/// work then stops with the ordinary hierarchy budget stop and fails closed.
+/// This scope-and-summary-first priority makes RQL the exception to the rule
+/// that a preset's hierarchy allowance equals its scope allowance
+/// (`DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_WORK`).
 pub(super) fn receiver_budget_for_remaining_work(
     base: ReceiverAnalysisBudget,
     remaining_facts: usize,
@@ -874,15 +1348,27 @@ pub(super) fn receiver_budget_for_remaining_work(
 ) -> ReceiverAnalysisBudget {
     let desired_scope = base.max_scope_nodes.min(remaining_facts);
     let desired_summaries = base.max_summary_expansions.min(remaining_facts);
-    if desired_scope.saturating_add(desired_summaries) <= remaining_facts {
-        return ReceiverAnalysisBudget {
+    let with_hierarchy_remainder = |max_scope_nodes: usize, max_summary_expansions: usize| {
+        let allocated = max_scope_nodes
+            .checked_add(max_summary_expansions)
+            .filter(|allocated| *allocated <= remaining_facts)
+            .expect("scope and summary projections fit the remaining fact budget");
+        let unallocated = remaining_facts - allocated;
+        ReceiverAnalysisBudget {
             context_depth: base.context_depth,
             max_targets: base.max_targets.min(remaining_targets),
-            max_summary_expansions: desired_summaries,
+            max_summary_expansions,
             max_resolution_rounds: base.max_resolution_rounds,
             max_hierarchy_order_steps: base.max_hierarchy_order_steps,
-            max_scope_nodes: desired_scope,
-        };
+            max_scope_nodes,
+            max_hierarchy_order_work: base.max_hierarchy_order_work.min(unallocated),
+        }
+    };
+    if desired_scope
+        .checked_add(desired_summaries)
+        .is_some_and(|desired| desired <= remaining_facts)
+    {
+        return with_hierarchy_remainder(desired_scope, desired_summaries);
     }
 
     // CodeQuery has one fact-node budget, while receiver analysis exposes
@@ -894,20 +1380,18 @@ pub(super) fn receiver_budget_for_remaining_work(
     let unallocated = remaining_facts - summary_reserve - max_scope_nodes;
     let max_summary_expansions =
         summary_reserve.saturating_add((desired_summaries - summary_reserve).min(unallocated));
-    debug_assert!(max_scope_nodes.saturating_add(max_summary_expansions) <= remaining_facts);
-    ReceiverAnalysisBudget {
-        context_depth: base.context_depth,
-        max_targets: base.max_targets.min(remaining_targets),
-        max_summary_expansions,
-        max_resolution_rounds: base.max_resolution_rounds,
-        max_hierarchy_order_steps: base.max_hierarchy_order_steps,
-        max_scope_nodes,
-    }
+    with_hierarchy_remainder(max_scope_nodes, max_summary_expansions)
 }
 
 pub(super) fn receiver_candidate_count(report: &ReceiverQueryReport) -> usize {
     match &report.analysis {
-        ReceiverQueryAnalysis::Values(outcome) => outcome.values().map_or(0, <[_]>::len),
-        ReceiverQueryAnalysis::MemberTargets(outcome) => outcome.values().map_or(0, <[_]>::len),
+        ReceiverQueryAnalysis::Values(outcome) => outcome
+            .values()
+            .or_else(|| outcome.possible_candidates())
+            .map_or(0, <[_]>::len),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => outcome
+            .values()
+            .or_else(|| outcome.possible_candidates())
+            .map_or(0, <[_]>::len),
     }
 }

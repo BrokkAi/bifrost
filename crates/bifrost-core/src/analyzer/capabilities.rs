@@ -122,13 +122,23 @@ impl<T: Any> CapabilityProvider for T {
     }
 }
 
+/// Wrap a freshly built imported set without charging it.
+pub fn uncharged_imported_code_units(
+    build: impl FnOnce() -> HashSet<CodeUnit>,
+) -> Arc<crate::retention_budget::Accounted<HashSet<CodeUnit>>> {
+    Arc::new(crate::retention_budget::Accounted::uncharged(build()))
+}
+
 pub trait ImportAnalysisProvider: Send + Sync {
     /// Shared, not owned: every memoizing implementation already stores the set
     /// behind an `Arc` in its per-file cache, and the hottest consumers only
     /// read it (a membership test in candidate discovery, a projection to
     /// source files in the reverse-import index). Returning the `Arc` removes a
     /// whole-set clone per cache hit and per insert.
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>>;
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<crate::retention_budget::Accounted<HashSet<CodeUnit>>>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
     /// Return the union of workspace files that reference any `target`.
@@ -530,12 +540,15 @@ pub fn resolve_imported_files_from_infos(
     provider
         .imported_files_from_infos(file, imports)
         .unwrap_or_else(|| {
-            provider
-                .imported_code_units_from_infos(file, imports)
-                .unwrap_or_else(|| provider.imported_code_units_of(file))
-                .iter()
-                .map(|unit| unit.source().clone())
-                .collect()
+            if let Some(units) = provider.imported_code_units_from_infos(file, imports) {
+                units.iter().map(|unit| unit.source().clone()).collect()
+            } else {
+                provider
+                    .imported_code_units_of(file)
+                    .iter()
+                    .map(|unit| unit.source().clone())
+                    .collect()
+            }
         })
 }
 
@@ -545,7 +558,7 @@ pub fn build_reverse_import_index<F>(
     parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
 where
-    F: Fn(&ProjectFile) -> Arc<HashSet<CodeUnit>> + Sync,
+    F: Fn(&ProjectFile) -> Arc<crate::retention_budget::Accounted<HashSet<CodeUnit>>> + Sync,
 {
     build_reverse_file_index(
         files,
@@ -569,7 +582,7 @@ pub fn memoized_reverse_import_index<F, Files>(
     resolve_imported: F,
 ) -> Arc<ReverseFileIndex>
 where
-    F: Fn(&ProjectFile) -> Arc<HashSet<CodeUnit>> + Sync + Copy,
+    F: Fn(&ProjectFile) -> Arc<crate::retention_budget::Accounted<HashSet<CodeUnit>>> + Sync + Copy,
     Files: Fn() -> Vec<ProjectFile> + Copy,
 {
     memoized_reverse_file_index(memo, files, |file| {
@@ -759,6 +772,46 @@ pub struct PlatformInventoryMethod {
     pub returns: &'static str,
 }
 
+/// One declared parameter type of a nominal-family member, resolved and
+/// erased (JLS 4.6) from the declaration's own type node.
+///
+/// Override matching compares these per position (JLS 8.4.2, 8.4.8.1). A type
+/// variable of the member's *owner* keeps its index, because a subtype that
+/// names the owner with type arguments substitutes them before erasure
+/// (`compareTo(T)` in `Comparable<Box>` is `compareTo(Box)`). Any other type
+/// variable is replaced by the erasure of its leftmost bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberFamilyParameterType {
+    /// A primitive type, by keyword.
+    Primitive(String),
+    /// A nominal type whose fully qualified name is known.
+    Nominal(String),
+    /// A nominal type whose identity the analyzer could not establish. It
+    /// carries every fully qualified name the language's name tiers could give
+    /// the spelling at its use site, strongest first, and the type is one of
+    /// them. Two equal lists are the same type, because the tiers pick from a
+    /// list by a rule of its inputs; two disjoint lists are different types.
+    /// An empty list is a type that could not be read at all.
+    Unresolved(Vec<String>),
+    Array(Box<MemberFamilyParameterType>),
+    /// The owner's type parameter at `index`, with the erasure of its bound.
+    OwnerTypeParameter {
+        index: usize,
+        erasure: Box<MemberFamilyParameterType>,
+    },
+}
+
+/// The type arguments a subtype's declaration passes to one direct supertype,
+/// each as a [`MemberFamilyParameterType`] in the subtype's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberFamilySupertypeArguments {
+    /// The supertype is named raw (or is not generic): its members are erased.
+    Raw,
+    Arguments(Vec<MemberFamilyParameterType>),
+    /// The clause naming the supertype could not be read or singled out.
+    Unknown,
+}
+
 /// An ancestor whose member declarations the workspace did not read.
 #[derive(Debug, Clone)]
 pub struct UnreadMemberFamilyAncestor {
@@ -781,6 +834,9 @@ pub enum HierarchyOpenReason {
     MemberFamily(crate::analyzer::structural::resolution::MemberFamilyReason),
     /// The descendant index could not acquire the evidence needed to fill.
     DescendantIndexUnavailable,
+    /// Forward structural-satisfaction coverage (interfaces a type satisfies
+    /// without embedding them) is not closed.
+    ForwardSatisfactionIncomplete,
     /// Preserve the unread name and any language-specified member inventory.
     UnreadAncestor(UnreadMemberFamilyAncestor),
 }
@@ -799,6 +855,7 @@ impl HierarchyOpenReason {
         match self {
             Self::MemberFamily(reason) => reason.label(),
             Self::DescendantIndexUnavailable => "descendant_index_unavailable",
+            Self::ForwardSatisfactionIncomplete => "forward_satisfaction_incomplete",
             Self::UnreadAncestor(_) => "unread_ancestor",
         }
     }
@@ -930,14 +987,74 @@ pub trait TypeHierarchyProvider: Send + Sync {
         }
     }
 
-    /// Resolve and erase source parameter types before comparing an inventory.
-    /// A provider without such evidence conservatively leaves the side open.
+    /// Whether an unread ancestor's complete method inventory can declare
+    /// `member`. A method of another name never can. Parameter evidence from
+    /// the language narrows further; without it the side stays open.
     fn member_family_inventory_matches(
         &self,
-        _member: &CodeUnit,
-        _inventory: &[PlatformInventoryMethod],
+        member: &CodeUnit,
+        inventory: &[PlatformInventoryMethod],
     ) -> bool {
-        true
+        let methods: Vec<_> = inventory
+            .iter()
+            .filter(|method| method.name == member.identifier())
+            .collect();
+        if methods.is_empty() {
+            return false;
+        }
+        let Some(arity) = self.member_family_parameter_arity(member) else {
+            return true;
+        };
+        let methods: Vec<_> = methods
+            .into_iter()
+            .filter(|method| method.parameters.len() == arity)
+            .collect();
+        if methods.is_empty() {
+            return false;
+        }
+        if methods.iter().any(|method| method.parameters.is_empty()) {
+            return true;
+        }
+        let Some(parameters) = self.member_family_erased_parameters(member) else {
+            return true;
+        };
+        methods.iter().any(|method| {
+            parameters
+                .iter()
+                .map(String::as_str)
+                .eq(method.parameters.iter().copied())
+        })
+    }
+
+    /// The member's declared parameter count, when the language knows it.
+    fn member_family_parameter_arity(&self, _member: &CodeUnit) -> Option<usize> {
+        None
+    }
+
+    /// The member's parameter types resolved and erased the way the platform
+    /// inventory spells them, when the language can resolve them.
+    fn member_family_erased_parameters(&self, _member: &CodeUnit) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The member's declared parameter types for override matching, or `None`
+    /// when the language does not read them structurally. The shared walk then
+    /// falls back to the recorded parameter spellings, which can confirm an
+    /// override but never refute one.
+    fn member_family_parameter_types(
+        &self,
+        _member: &CodeUnit,
+    ) -> Option<Vec<MemberFamilyParameterType>> {
+        None
+    }
+
+    /// The type arguments `subtype` passes to its direct supertype `supertype`.
+    fn member_family_supertype_arguments(
+        &self,
+        _subtype: &CodeUnit,
+        _supertype: &CodeUnit,
+    ) -> MemberFamilySupertypeArguments {
+        MemberFamilySupertypeArguments::Unknown
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {

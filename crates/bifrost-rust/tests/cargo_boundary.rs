@@ -181,7 +181,7 @@ fn parsed_fixture() -> (
     Vec<RustSelectedManifestMount>,
 ) {
     use brokk_bifrost_core::analyzer::ProjectFile;
-    use brokk_bifrost_rust::declarations::parse_rust_file;
+    use brokk_bifrost_rust::declarations::parse_rust_file_with;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .canonicalize()
         .unwrap();
@@ -198,7 +198,14 @@ fn parsed_fixture() -> (
             let file = ProjectFile::new(root.clone(), path.clone());
             let tree = parser.parse(&text, None).unwrap();
             assert!(!tree.root_node().has_error(), "{path:?}");
-            let parsed = parse_rust_file(&file, &text, &tree);
+            let parsed = parse_rust_file_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                &file,
+                &text,
+                &tree,
+            );
             sources.push(
                 brokk_bifrost_rust::selected_context::RustSelectedSourceMount {
                     relative_path: path,
@@ -361,230 +368,6 @@ fn cargo_boundary_detached_cfg_has_test_but_no_cargo_features() {
 }
 
 #[test]
-fn cargo_boundary_legacy_module_graph_matches_reachability() {
-    use brokk_bifrost_core::{analyzer::ProjectFile, hash::HashMap};
-    use brokk_bifrost_rust::cargo_routes::RustCargoRouteIndex;
-    use brokk_bifrost_rust::declarations::parse_rust_file;
-    // A diamond shared by two Cargo roots. A separate cfg(test) branch has
-    // a child without its own cfg; neither belongs to production reachability.
-    let root = tempfile::tempdir().unwrap();
-    let definitions = [
-        (
-            "Cargo.toml",
-            "[package]\nname='graph'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nexternal-package='1'\ndirect={path='direct'}\n[patch.crates-io]\nexternal-package={path='patched'}\n",
-        ),
-        (
-            "patched/Cargo.toml",
-            "[package]\nname='external-package'\nversion='1.0.0'\nedition='2021'\n[lib]\nname='external_api'\n",
-        ),
-        ("patched/src/lib.rs", "pub struct Patched;"),
-        (
-            "direct/Cargo.toml",
-            "[package]\nname='direct'\nversion='0.1.0'\nedition='2021'\n",
-        ),
-        ("direct/src/lib.rs", "pub struct Direct;"),
-        (
-            "nested-app/Cargo.toml",
-            "[package]\nname='nested-app'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nescape={path='../../..'}\n",
-        ),
-        ("nested-app/src/lib.rs", "pub struct Nested;"),
-        ("src/lib.rs", "mod left; mod right; #[cfg(test)] mod tests;"),
-        ("src/main.rs", "mod left; mod bin_only; fn main() {}"),
-        ("src/left.rs", "#[path=\"shared.rs\"] mod shared;"),
-        (
-            "src/right.rs",
-            "#[path=\"shared.rs\"] mod shared; mod tail;",
-        ),
-        (
-            "src/shared.rs",
-            "pub struct Shared; #[path=\"left.rs\"] mod back;",
-        ),
-        ("src/right/tail.rs", "pub struct Tail; mod deep;"),
-        ("src/right/tail/deep.rs", "pub struct Deep; mod terminal;"),
-        ("src/right/tail/deep/terminal.rs", "pub struct Terminal;"),
-        ("src/bin_only.rs", "pub struct BinaryOnly;"),
-        ("src/tests.rs", "mod helper;"),
-        ("src/tests/helper.rs", "pub struct Helper;"),
-    ];
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .unwrap();
-    let mut files = Vec::new();
-    let mut facts = HashMap::default();
-    for (path, source) in definitions {
-        let destination = root.path().join(path);
-        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        std::fs::write(destination, source).unwrap();
-        if path.ends_with(".rs") {
-            let file = ProjectFile::new(root.path().to_owned(), path);
-            let tree = parser.parse(source, None).unwrap();
-            facts.insert(
-                file.clone(),
-                parse_rust_file(&file, source, &tree)
-                    .rust_usage_facts
-                    .module_routes,
-            );
-            files.push(file);
-        }
-    }
-    // This table is the finite graph's independently derived transitive closure.
-    let expected = [
-        ("direct/src/lib.rs", &["direct/src/lib.rs"][..], false),
-        (
-            "nested-app/src/lib.rs",
-            &["nested-app/src/lib.rs"][..],
-            false,
-        ),
-        ("patched/src/lib.rs", &["patched/src/lib.rs"][..], false),
-        ("src/lib.rs", &["src/lib.rs"][..], false),
-        ("src/main.rs", &["src/main.rs"][..], false),
-        ("src/left.rs", &["src/lib.rs", "src/main.rs"][..], false),
-        ("src/right.rs", &["src/lib.rs"][..], false),
-        ("src/shared.rs", &["src/lib.rs", "src/main.rs"][..], false),
-        ("src/right/tail.rs", &["src/lib.rs"][..], false),
-        ("src/right/tail/deep.rs", &["src/lib.rs"][..], false),
-        (
-            "src/right/tail/deep/terminal.rs",
-            &["src/lib.rs"][..],
-            false,
-        ),
-        ("src/bin_only.rs", &["src/main.rs"][..], false),
-        ("src/tests.rs", &["src/lib.rs"][..], true),
-        ("src/tests/helper.rs", &["src/lib.rs"][..], true),
-    ];
-    for _ in 0..8 {
-        files.rotate_left(1);
-        let index = RustCargoRouteIndex::build_while(&files, &facts, &|| true).unwrap();
-        let caller = ProjectFile::new(root.path().to_owned(), "src/lib.rs");
-        assert_eq!(
-            index.resolve_crate_root_file(&caller, "external_api"),
-            Some(ProjectFile::new(
-                root.path().to_owned(),
-                "patched/src/lib.rs"
-            ))
-        );
-        assert_eq!(
-            index.resolve_crate_root_file(&caller, "external_package"),
-            None
-        );
-        assert_eq!(
-            index.resolve_crate_root_file(
-                &ProjectFile::new(root.path().to_owned(), "nested-app/src/lib.rs"),
-                "graph"
-            ),
-            None,
-            "an escaping dependency path cannot resolve to the workspace root"
-        );
-        let partial = files
-            .iter()
-            .filter(|f| !f.rel_path().starts_with("patched") && !f.rel_path().starts_with("direct"))
-            .cloned()
-            .collect::<Vec<_>>();
-        let partial_index = RustCargoRouteIndex::build_while(&partial, &facts, &|| true).unwrap();
-        assert_eq!(
-            partial_index.resolve_crate_root_file(&caller, "external_api"),
-            Some(ProjectFile::new(
-                root.path().to_owned(),
-                "patched/src/lib.rs"
-            )),
-            "patch discovery must find manifests outside the analyzed inventory"
-        );
-        assert_eq!(
-            partial_index.resolve_crate_root_file(&caller, "direct"),
-            Some(ProjectFile::new(
-                root.path().to_owned(),
-                "direct/src/lib.rs"
-            )),
-            "path-dependency discovery must find manifests outside the analyzed inventory"
-        );
-        for (path, roots, test_only) in expected {
-            let file = ProjectFile::new(root.path().to_owned(), path);
-            let mut actual = index
-                .target_roots_for_file(&file)
-                .iter()
-                .map(|f| f.rel_path().to_string_lossy().replace('\\', "/"))
-                .collect::<Vec<_>>();
-            actual.sort();
-            assert_eq!(roots, actual, "{path}");
-            assert_eq!(test_only, index.file_is_test_only(&file), "{path}");
-        }
-    }
-}
-
-#[test]
-fn cargo_boundary_discovered_routes_follow_manifest_dependency_kinds() {
-    use brokk_bifrost_core::{analyzer::ProjectFile, hash::HashMap};
-    use brokk_bifrost_rust::cargo_routes::RustCargoRouteIndex;
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/cargo-matrix")
-        .canonicalize()
-        .unwrap();
-    let (sources, _) = parsed_fixture();
-    let files = sources
-        .iter()
-        .map(|s| ProjectFile::new(root.clone(), s.relative_path.clone()))
-        .collect::<Vec<_>>();
-    let facts = sources
-        .into_iter()
-        .map(|s| {
-            (
-                ProjectFile::new(root.clone(), s.relative_path),
-                s.facts.module_routes,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let index = RustCargoRouteIndex::build_while(&files, &facts, &|| true).unwrap();
-    for (caller, alias, target) in [
-        ("app/src/lib.rs", "dep_alias", Some("dep/src/lib.rs")),
-        ("app/src/lib.rs", "noise", Some("noise/src/lib.rs")),
-        ("app/custom/build.rs", "noise", Some("noise/src/lib.rs")),
-        ("app/custom/build.rs", "dep_alias", None),
-        ("member/src/lib.rs", "dep_alias", Some("dep/src/lib.rs")),
-        (
-            "nested/src/bin/deep/main.rs",
-            "nested",
-            Some("nested/src/lib.rs"),
-        ),
-    ] {
-        assert_eq!(
-            index.resolve_crate_root_file(&ProjectFile::new(root.clone(), caller), alias),
-            target.map(|p| ProjectFile::new(root.clone(), p)),
-            "{caller}: {alias}"
-        );
-    }
-    for omitted in ["app/src/main.rs", "app/custom/tool.rs"] {
-        let partial = files
-            .iter()
-            .filter(|f| f.rel_path() != Path::new(omitted))
-            .cloned()
-            .collect::<Vec<_>>();
-        let selected = if omitted == "app/src/main.rs" {
-            "app/custom/tool.rs"
-        } else {
-            "app/src/main.rs"
-        };
-        let selected = ProjectFile::new(root.clone(), selected);
-        let partial_index = RustCargoRouteIndex::build_while(&partial, &facts, &|| true).unwrap();
-        assert!(
-            partial_index
-                .target_roots_for_file(&selected)
-                .contains(&selected),
-            "an unselected explicit target cannot hide a selected sibling"
-        );
-    }
-    for line in include_str!("fixtures/cargo-matrix/expected.txt").lines() {
-        let fields = line.split(" | ").collect::<Vec<_>>();
-        let file = ProjectFile::new(root.clone(), fields[1]);
-        assert!(
-            index.target_roots_for_file(&file).contains(&file),
-            "explicit or inferred Cargo root: {}",
-            fields[1]
-        );
-    }
-}
-
-#[test]
 fn cargo_boundary_selected_units_keep_disjoint_dependency_routes() {
     use brokk_bifrost_core::{analyzer::ProjectFile, hash::HashMap};
     use brokk_bifrost_rust::cargo_routes::{
@@ -641,10 +424,34 @@ fn cargo_boundary_selected_units_keep_disjoint_dependency_routes() {
         library(3, &left, "left"),
         library(4, &right, "right"),
     ];
-    let index = RustCargoRouteIndex::build_from_summary_rows_while(
+    struct FixturePaths(Vec<(ProjectFile, String)>);
+    impl brokk_bifrost_rust::cargo_routes::RustRoutePathFacts for FixturePaths {
+        fn file_exists(&self, file: &ProjectFile) -> bool {
+            self.0.iter().any(|(candidate, _)| candidate == file)
+        }
+        fn workspace_relative(&self, _: &Path, _: &Path, _: &Path) -> Option<PathBuf> {
+            unreachable!("authored rows have no module path attributes")
+        }
+        fn package_name(&self, file: &ProjectFile) -> String {
+            self.0
+                .iter()
+                .find(|(candidate, _)| candidate == file)
+                .unwrap()
+                .1
+                .clone()
+        }
+    }
+    let paths = FixturePaths(vec![
+        (a.clone(), "left".into()),
+        (b.clone(), "right".into()),
+        (left.clone(), "left".into()),
+        (right.clone(), "right".into()),
+    ]);
+    let index = RustCargoRouteIndex::build_from_summary_rows_with_path_facts(
         &[a.clone(), b.clone(), left.clone(), right.clone()],
         &HashMap::default(),
         &rows,
+        &paths,
         &|| true,
     )
     .unwrap();

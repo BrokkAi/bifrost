@@ -15,26 +15,34 @@ mod search;
 #[cfg(test)]
 mod tests;
 
+use crate::analyzer::semantic::partial_flow::PartialFlowPort;
 use std::fmt;
 
 pub use graph::{
-    ComposedSourceId, Endpoint, ExecutionTarget, ExternalTargetIdentity, Hop, HopQuality, PortNode,
+    ComposedSourceId, Endpoint, ExecutionTarget, ExternalTargetIdentity, Hop, HopQuality,
+    ObjectAnchor, ObjectAnchorRole, ObjectAnchorSite, PortNode,
 };
 pub use labels::{ComposeLabels, LabelFunctions};
 pub use provider::{
-    BlockedGap, BoundSanitizer, BoundSource, BoundTransform, CallModel, CallerLocation, Callers,
-    Completeness, CompositionProvider, Dispatch, DispatchCandidate, EndpointEvidence, ExecutionArm,
-    ExecutionArmContext, ExecutionDispatch, ExecutionDispatchOutcome, ExecutionEndpointStatus,
-    ExecutionEndpoints, ExecutionSource, FallbackPorts, InteriorFlow, InteriorFlows,
-    InteriorObservation, InteriorSeed, InteriorTarget, InteriorWitnessStep, InvocationSite,
-    Invocations, ModelTransfer, Openness, ProcedureEndpoints, StoreChannelLink, StoreChannelLinks,
-    StoreWriteObservation, ValueTypeBarrierCheck, ValueTypeBarrierFindingNotes, WritebackBinding,
-    bound_return_member_matches, bound_return_selector_matches,
+    BlockedGap, BoundSanitizer, BoundSource, BoundTransform, CallHandoff, CallHandoffBinding,
+    CallHandoffExit, CallHandoffInventory, CallModel, CallObjectContinuity, CallerLocation,
+    Callers, Completeness, CompositionProvider, Dispatch, DispatchCandidate, EndpointEvidence,
+    ExecutionArm, ExecutionArmContext, ExecutionCallableInstance, ExecutionCertificate,
+    ExecutionCertificateStep, ExecutionDispatch, ExecutionDispatchOutcome, ExecutionEndpointStatus,
+    ExecutionEndpoints, ExecutionRootInventory, ExecutionSource, ExternalBodyUnavailableGap,
+    FallbackPorts, IncompleteCause, InteriorFlow, InteriorFlows, InteriorObservation, InteriorSeed,
+    InteriorTarget, InteriorWitnessStep, InvocationSite, Invocations, ModelTransfer,
+    ObjectPredecessor, ObjectRelation, Openness, OperationalCause, ProcedureEndpoints,
+    StoreChannelLink, StoreChannelLinks, StoreWriteObservation, ValueTypeBarrierCheck,
+    ValueTypeBarrierFindingNotes, WritebackBinding, bound_return_member_matches,
+    bound_return_selector_matches,
 };
 pub use report::ComposedStoreCrossing;
+pub(crate) use report::path_quality as composed_path_quality;
+pub(crate) use report::step as composed_witness_step;
 pub use search::{
-    BudgetLane, ExecutionOutcome, ExecutionReach, Incompleteness, SearchOutcome, SearchStats,
-    SourceSinkPair,
+    BudgetLane, ExecutionOutcome, ExecutionReach, ExecutionReachTarget, InPlaceTransform,
+    Incompleteness, ObjectReach, SearchOutcome, SearchStats, SourceSinkPair,
 };
 
 /// Reachability labels for RQL's value-flow question.
@@ -63,28 +71,60 @@ pub fn search_value_flow<Provider>(
 where
     Provider: CompositionProvider<Fact = (), Function = ()>,
 {
+    search_typed_value_pairs(
+        plan,
+        ValueFlowLabels,
+        plan.sinks().map(|(id, _)| (id, ())).collect(),
+        plan.sources()
+            .map(|(_, source)| BoundSource {
+                point: source.point().clone(),
+                phase: source.phase(),
+                carrier: source.carrier().clone(),
+                classes: (),
+                origin: crate::taint::SourceEventKey::new(source.key().clone()),
+                evidence: EndpointEvidence::Known(search::evidence_quality(
+                    source.proof(),
+                    source.completeness(),
+                )),
+            })
+            .collect(),
+        Vec::new(),
+        Vec::new(),
+        provider,
+        budget,
+        request,
+    )
+}
+
+/// Search value pairs with one client's facts and path functions. Endpoint
+/// ordering and the result shape are the shared search's existing contract.
+#[allow(clippy::too_many_arguments)]
+pub fn search_typed_value_pairs<L, Provider>(
+    plan: &crate::value_flow::ValueFlowPlan,
+    labels: L,
+    sinks: Vec<(crate::value_flow::ValueFlowSinkId, L::Fact)>,
+    sources: Vec<BoundSource<L::Fact>>,
+    sanitizers: Vec<BoundSanitizer<L::Function>>,
+    transforms: Vec<InPlaceTransform<L::Function>>,
+    provider: &Provider,
+    budget: CompositionBudget,
+    request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<SearchOutcome<L>, ComposeError>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
     search::search_pairs(
         search::ComposeQuery {
             execution_roots: Vec::new(),
+            object_roots: Vec::new(),
+            certified_procedure_reaches: None,
             value_flow: Some(plan),
-            labels: ValueFlowLabels,
-            sinks: plan.sinks().map(|(id, _)| (id, ())).collect(),
-            sources: plan
-                .sources()
-                .map(|(_, source)| BoundSource {
-                    point: source.point().clone(),
-                    phase: source.phase(),
-                    carrier: source.carrier().clone(),
-                    classes: (),
-                    origin: crate::taint::SourceEventKey::new(source.key().clone()),
-                    evidence: EndpointEvidence::Known(search::evidence_quality(
-                        source.proof(),
-                        source.completeness(),
-                    )),
-                })
-                .collect(),
-            sanitizers: Vec::new(),
-            transforms: Vec::new(),
+            labels,
+            sinks,
+            sources,
+            sanitizers,
+            transforms,
         },
         provider,
         budget,
@@ -101,7 +141,7 @@ pub fn taint_model_kill(
 }
 
 use crate::analyzer::semantic::SemanticRequest;
-use crate::value_flow::{DurableCallSiteKey, DurableProcedureKey};
+use crate::value_flow::{DurableCallSiteKey, DurableProcedureKey, ValueFlowSinkId};
 
 /// Search declared execution facts through body-owned invocation edges.
 pub fn search_execution<L, Provider>(
@@ -118,6 +158,8 @@ where
     let outcome = search::search_pairs(
         search::ComposeQuery {
             execution_roots: roots,
+            object_roots: Vec::new(),
+            certified_procedure_reaches: None,
             value_flow: None,
             labels,
             sinks: Vec::new(),
@@ -132,10 +174,43 @@ where
     Ok(ExecutionOutcome {
         sources: outcome.execution_sources,
         reaches: outcome.execution_reaches,
+        procedure_reaches: outcome.execution_procedure_reaches,
         functions: outcome.functions,
         incomplete: outcome.incomplete,
         stats: outcome.stats,
     })
+}
+
+/// Search object terminals without inventing a value-flow carrier at an exit.
+pub fn search_object_roots<L, Provider>(
+    roots: Vec<ObjectAnchor>,
+    labels: L,
+    provider: &Provider,
+    budget: CompositionBudget,
+    request: &mut SemanticRequest<'_>,
+) -> Result<SearchOutcome<L>, ComposeError>
+where
+    Provider: CompositionProvider,
+    L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
+{
+    search::search_pairs(
+        search::ComposeQuery {
+            execution_roots: Vec::new(),
+            object_roots: roots,
+            // Object items stay in their procedure and use typed handoffs;
+            // they never traverse the capture or lexical-parent value path.
+            certified_procedure_reaches: None,
+            value_flow: None,
+            labels,
+            sinks: Vec::new(),
+            sources: Vec::new(),
+            sanitizers: Vec::new(),
+            transforms: Vec::new(),
+        },
+        provider,
+        budget,
+        request,
+    )
 }
 
 use super::{
@@ -194,6 +269,7 @@ pub struct ValueTypeBarrierPairEvidence {
 /// dispatch.
 #[derive(Debug, Clone)]
 pub struct ComposeOutcome {
+    pub effective_budget: CompositionBudget,
     /// Lenient composition evidence; public barrier selection uses `barrier_pairs`.
     pub report: TaintFindingReport,
     pub incompleteness: Vec<Incompleteness>,
@@ -250,6 +326,7 @@ where
         if !quality.is_certain() {
             let reason = Incompleteness::SourceEvidence {
                 point: source.point.clone(),
+                cause: IncompleteCause::Operational(OperationalCause::Provider),
             };
             if !outcome.incomplete.contains(&reason) {
                 outcome.incomplete.push(reason);
@@ -272,6 +349,8 @@ fn taint_query(plan: &TaintAnalysisPlan) -> search::ComposeQuery<'_, labels::Tai
     };
     search::ComposeQuery {
         execution_roots: Vec::new(),
+        object_roots: Vec::new(),
+        certified_procedure_reaches: None,
         value_flow: Some(value_flow),
         labels: labels::TaintLabels::new(plan.universe()),
         sinks: plan
@@ -334,15 +413,158 @@ pub fn compose_taint_batch(
     budget: CompositionBudget,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ComposeOutcome, ComposeError> {
+    compose_taint_query(plan, taint_query(plan), provider, budget, request)
+}
+
+/// Compose only the bound sink events at one reported output site. The
+/// selected events share the plan's source universe; frontier origins remain
+/// unrestricted as the backward search enters other procedures.
+pub fn compose_taint_batch_for_sinks(
+    plan: &TaintAnalysisPlan,
+    selected_sinks: &[ValueFlowSinkId],
+    provider: &impl CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
+    budget: CompositionBudget,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ComposeOutcome, ComposeError> {
+    let mut query = taint_query(plan);
+    query
+        .sinks
+        .retain(|(sink, _)| selected_sinks.contains(sink));
+    assert!(
+        selected_sinks
+            .iter()
+            .all(|sink| query.sinks.iter().any(|(bound, _)| bound == sink)),
+        "selected sinks belong to the bound plan"
+    );
+    compose_taint_query(plan, query, provider, budget, request)
+}
+
+fn compose_taint_query(
+    plan: &TaintAnalysisPlan,
+    mut query: search::ComposeQuery<'_, labels::TaintLabels<'_>>,
+    provider: &impl CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
+    budget: CompositionBudget,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ComposeOutcome, ComposeError> {
     provider.reset_value_type_witnesses();
+    let nested_sink = query.sinks.iter().any(|(sink, _)| {
+        plan.value_flow()
+            .sink(*sink)
+            .expect("a bound sink names a sink of its plan")
+            .point()
+            .procedure()
+            .semantics()
+            .lexical_parent()
+            .is_some()
+    });
+    let (procedure_reaches, execution_incomplete) = if !nested_sink {
+        (Vec::new(), Vec::new())
+    } else {
+        provider.execution_discovery(budget, request, |request| {
+            let inventory = provider
+                .admitted_execution_roots(budget.max_hops, request)
+                .map_err(search::provider_error)?;
+            let execution = search_execution(
+                inventory.roots,
+                labels::TaintLabels::new(plan.universe()),
+                provider,
+                budget,
+                request,
+            )?;
+            let mut incomplete = execution.incomplete;
+            if let Completeness::Incomplete { reason, cause } = inventory.coverage {
+                incomplete.push(Incompleteness::ExecutionRoots { reason, cause });
+            }
+            if request.cancellation.is_cancelled()
+                && !incomplete.contains(&Incompleteness::Cancelled)
+            {
+                incomplete.push(Incompleteness::Cancelled);
+            }
+            Ok((execution.procedure_reaches, incomplete))
+        })?
+    };
+    query.certified_procedure_reaches = Some(procedure_reaches);
     let mut outcome = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.search");
-        search::search_pairs(taint_query(plan), provider, budget, request)?
+        search::search_pairs(query, provider, budget, request)?
     };
+    for gap in execution_incomplete {
+        if !outcome.incomplete.contains(&gap) {
+            outcome.incomplete.push(gap);
+        }
+    }
     let mut labeled = {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.labels");
         labels::evaluate_pairs(plan, &outcome.functions, &outcome.sources, &outcome.pairs)
     };
+    let unresolved_output_call = |hops: &[Hop]| {
+        hops.iter().find_map(|hop| {
+            let Hop::Model {
+                call,
+                actual,
+                result,
+                ..
+            } = hop
+            else {
+                return None;
+            };
+            outcome
+                .call_models
+                .get(call)
+                .expect("a model hop's call was dispatched")
+                .as_ref()
+                .and_then(|model| {
+                    model
+                        .transfers
+                        .iter()
+                        .any(|transfer| {
+                            transfer.unresolved_output_storage
+                                && &transfer.actual == actual
+                                && (&transfer.output == result
+                                    || matches!(result, PartialFlowPort::Heap { root, .. }
+                                if root.as_ref() == &transfer.output))
+                        })
+                        .then(|| call.clone())
+                })
+        })
+    };
+    // An override closure covers the call, but a receiver/argument output
+    // with unproven concrete storage cannot yield a finding. Record the
+    // refusal only when an accepted source/sink path consumes that output.
+    labeled.retain(|path| {
+        let Some(call) = unresolved_output_call(&path.hops) else {
+            return true;
+        };
+        let source = &outcome.sources[path.source.index()];
+        let source_call = crate::analyzer::semantic::icfg::invoked_call_at(&source.point)
+            .expect("a bound source point remains live")
+            .or_else(|| {
+                let crate::value_flow::ValueFlowCarrier::Value(value) = &source.carrier else {
+                    return None;
+                };
+                source
+                    .point
+                    .procedure()
+                    .semantics()
+                    .call_sites()
+                    .iter()
+                    .find_map(|site| {
+                        (site.result == Some(value.id())
+                            || site.normal_results.contains(&value.id()))
+                        .then_some(site.id)
+                    })
+            })
+            .map(|id| (source.point.procedure().durable_key(), id));
+        let reason = search::Incompleteness::ModelOutputStorage { call, source_call };
+        if !outcome.incomplete.contains(&reason) {
+            outcome.incomplete.push(reason);
+        }
+        false
+    });
+    for pair in outcome.pairs.iter_mut().chain(&mut outcome.strict_pairs) {
+        pair.paths
+            .retain(|(hops, _)| unresolved_output_call(hops).is_none());
+    }
     {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.source_evidence");
         judge_reported_sources(provider, &mut outcome, &mut labeled, request)?;
@@ -368,16 +590,24 @@ pub fn compose_taint_batch(
                 }
             }
             // Source judgments were already installed by the main report pass.
-            let (lenient, _, _) =
+            // A lenient witness run can stop or fail where the main one did
+            // not, so its reasons join the finding causes as the strict run's
+            // do (#9947).
+            let (lenient, reasons, _) =
                 report::build_report(plan, provider, budget, &outcome, labeled, request)?;
+            for reason in reasons {
+                if !finding_incompleteness.contains(&reason) {
+                    finding_incompleteness.push(reason);
+                }
+            }
             if lenient.findings().is_empty() {
                 continue;
             }
-            let strict = if let Some(strict) = outcome
-                .strict_pairs
-                .iter()
-                .find(|strict| strict.source == pair.source && strict.sink == pair.sink)
-            {
+            let strict = if let Some(strict) = outcome.strict_pairs.iter().find(|strict| {
+                strict.source == pair.source
+                    && strict.sink == pair.sink
+                    && strict.certificate == pair.certificate
+            }) {
                 let has_undecided = outcome.barrier_notes.iter().any(|notes| {
                     notes.source == outcome.sources[pair.source.index()].origin
                         && plan
@@ -424,6 +654,7 @@ pub fn compose_taint_batch(
         }
     }
     Ok(ComposeOutcome {
+        effective_budget: outcome.effective_budget,
         report,
         finding_incompleteness,
         incompleteness: outcome.incomplete,

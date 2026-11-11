@@ -228,7 +228,12 @@ pub fn generate_jvm_catalogs(
                     let mut identity = json!([role, catalog_category, symbol, port]);
                     identity.sort_all_objects();
                     let digest = Sha256::digest(serde_json::to_vec(&identity).expect("identity"));
-                    let id = format!("codeql-{digest:x}");
+                    let id = format!(
+                        "codeql-{}",
+                        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                            &digest.into()
+                        )
+                    );
                     let mut entry = json!({
                         "id": id,
                         "categories": [catalog_category],

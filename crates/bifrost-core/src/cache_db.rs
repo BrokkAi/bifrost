@@ -121,6 +121,25 @@ struct CacheMigration {
     sql: &'static str,
 }
 
+/// Test-only fixture for exercising the real upgrade from the last schema without
+/// configuration presence. Callers own the connection and may insert legacy rows.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_connection_through_262() -> Connection {
+    disable_sqlite_memory_statistics();
+    let mut conn = Connection::open_in_memory().expect("open test cache");
+    configure_connection(&mut conn).expect("configure test cache");
+    conn.execute_batch(BASELINE_SCHEMA_SQL)
+        .expect("create baseline schema");
+    for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version <= 262) {
+        conn.execute_batch(migration.sql)
+            .expect("apply pre-presence migration");
+    }
+    conn.pragma_update(None, "user_version", 262)
+        .expect("set pre-presence schema version");
+    conn
+}
+
 /// Compatible migrations after the schema 125 floor.
 const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
     CacheMigration {
@@ -549,6 +568,148 @@ const POST_BASELINE_MIGRATIONS: &[CacheMigration] = &[
         version: 236,
         sql: include_str!("../migrations/cache/0236-policy-unit-prefix-product.sql"),
     },
+    CacheMigration {
+        version: 240,
+        sql: include_str!("../migrations/cache/0240-policy-unit-output-product.sql"),
+    },
+    // #9177 extends the declaration question family without retiring old keys.
+    CacheMigration {
+        version: 243,
+        sql: include_str!("../migrations/cache/0243-declaration-candidates.sql"),
+    },
+    CacheMigration {
+        version: 250,
+        sql: include_str!("../migrations/cache/0250-resolution-reference-package-contexts.sql"),
+    },
+    CacheMigration {
+        version: 252,
+        sql: include_str!("../migrations/cache/0252-rust-copy-absence-census.sql"),
+    },
+    CacheMigration {
+        version: 256,
+        sql: include_str!("../migrations/cache/0256-directional-channel-components.sql"),
+    },
+    CacheMigration {
+        version: 260,
+        sql: include_str!("../migrations/cache/0260-python-import-module-operands.sql"),
+    },
+    CacheMigration {
+        version: 261,
+        sql: include_str!("../migrations/cache/0261-python-module-registry-writes.sql"),
+    },
+    CacheMigration {
+        version: 262,
+        sql: include_str!("../migrations/cache/0262-python-source-root-spellings.sql"),
+    },
+    CacheMigration {
+        version: 264,
+        sql: include_str!("../migrations/cache/0264-candidate-fq-publication-witness.sql"),
+    },
+    // #8870: Java reference execution contexts are part of resolution bundles.
+    CacheMigration {
+        version: 269,
+        sql: include_str!("../migrations/cache/0269-java-reference-execution-contexts.sql"),
+    },
+    CacheMigration {
+        version: 273,
+        sql: include_str!("../migrations/cache/0273-structural-role-coverage.sql"),
+    },
+    CacheMigration {
+        version: 274,
+        sql: include_str!("../migrations/cache/0274-member-type-coverage.sql"),
+    },
+    // #9002 publishes each reference's root prefix on its site row.
+    CacheMigration {
+        version: 275,
+        sql: include_str!("../migrations/cache/0275-resolution-site-prefix.sql"),
+    },
+    CacheMigration {
+        version: 276,
+        sql: include_str!("../migrations/cache/0276-configuration-input-presence.sql"),
+    },
+    CacheMigration {
+        version: 277,
+        sql: include_str!("../migrations/cache/0277-semantic-ir-footprint-coverage.sql"),
+    },
+    CacheMigration {
+        version: 278,
+        sql: include_str!("../migrations/cache/0278-semantic-ir-call-control-coverage.sql"),
+    },
+    CacheMigration {
+        version: 279,
+        sql: include_str!("../migrations/cache/0279-semantic-ir-publication-row-digest.sql"),
+    },
+    // #9559: sealed provider-publication certificates for the JVM external
+    // inventory.
+    CacheMigration {
+        version: 280,
+        sql: include_str!("../migrations/cache/0280-jvm-external-provider-publications.sql"),
+    },
+    CacheMigration {
+        version: 281,
+        sql: include_str!("../migrations/cache/0281-rust-route-question-lookups.sql"),
+    },
+    CacheMigration {
+        version: 282,
+        sql: include_str!("../migrations/cache/0282-resolution-identity-recipe-generation.sql"),
+    },
+    CacheMigration {
+        version: 283,
+        sql: include_str!("../migrations/cache/0283-csharp-compilation-open-reasons.sql"),
+    },
+    CacheMigration {
+        version: 284,
+        sql: include_str!("../migrations/cache/0284-rust-crate-inactive-placements.sql"),
+    },
+    CacheMigration {
+        version: 285,
+        sql: include_str!("../migrations/cache/0285-structural-role-name-inventory.sql"),
+    },
+    CacheMigration {
+        version: 286,
+        sql: include_str!("../migrations/cache/0286-g3-guarded-pattern-projections.sql"),
+    },
+    // Compatible: additive rows and columns; versioned filenames exclude mixed-version writers.
+    CacheMigration {
+        version: 290,
+        sql: include_str!("../migrations/cache/0290-semantic-ir-static-type-classes.sql"),
+    },
+    // Compatible: only adds the crate derivation's reverse path-probe table.
+    CacheMigration {
+        version: 291,
+        sql: include_str!("../migrations/cache/0291-rust-crate-path-probes.sql"),
+    },
+    // Compatible: nullable inventory columns read as unknown; versioned filenames exclude
+    // mixed-version writers.
+    CacheMigration {
+        version: 292,
+        sql: include_str!("../migrations/cache/0292-definition-index-inventory.sql"),
+    },
+    // Compatible: preserves compilation IDs and child rows in version-suffixed stores.
+    CacheMigration {
+        version: 295,
+        sql: include_str!("../migrations/cache/0295-csharp-compilation-instances.sql"),
+    },
+    // Compatible: preserves all existing general-ledger rows and IDs.
+    CacheMigration {
+        version: 299,
+        sql: include_str!("../migrations/cache/0299-rust-inventory-name-reads.sql"),
+    },
+    // Compatible upgrade: extern alias facts preserve all existing rows and IDs.
+    CacheMigration {
+        version: 302,
+        sql: include_str!("../migrations/cache/0302-extern-alias-facts.sql"),
+    },
+    // Compatible: preserves existing symbol environments with an empty open set.
+    CacheMigration {
+        version: 303,
+        sql: include_str!("../migrations/cache/0303-csharp-named-open-symbols.sql"),
+    },
+    // Compatible: indexes only; no rows or answer meanings change (#11173).
+    CacheMigration {
+        version: 311,
+        sql: include_str!("../migrations/cache/0311-rust-unit-summary-context-lookups.sql"),
+    },
 ];
 
 static CACHE_DB_FILE_NAME: Lazy<String> =
@@ -574,8 +735,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
 // in-memory database on every process start. The regression test below derives
 // the value through SQLite and forces this constant to move with a migration.
 const CURRENT_SCHEMA_OBJECTS_SHA256: [u8; 32] = [
-    130, 125, 123, 137, 226, 97, 165, 108, 51, 14, 105, 29, 40, 182, 161, 112, 52, 175, 9, 186, 1,
-    39, 183, 235, 14, 87, 176, 196, 4, 36, 120, 218,
+    235, 181, 232, 130, 46, 179, 240, 253, 46, 204, 235, 58, 116, 148, 189, 13, 4, 63, 162, 103,
+    108, 46, 217, 196, 78, 55, 108, 52, 38, 76, 135, 230,
 ];
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 // One primary-repository cache is intentionally shared by every linked worktree.
@@ -790,6 +951,8 @@ fn last_store_use_unix_seconds(store: &Path) -> Result<i64> {
 /// so a permission denial is reported with the ways out instead of SQLite's
 /// bare `unable to open database file` (issue #1544).
 /// The one door every analyzer-store connection in this process goes through.
+/// It disables SQLite's memory statistics before the library can be
+/// initialized by this connection.
 ///
 /// SQLite's statement profile is installed per connection, so a second
 /// `Connection::open_with_flags` on a store elsewhere in this file would be a
@@ -801,6 +964,7 @@ fn open_store_connection(
     flags: OpenFlags,
     role: ConnectionRole,
 ) -> rusqlite::Result<Connection> {
+    disable_sqlite_memory_statistics();
     let mut conn = Connection::open_with_flags(db_path, flags)?;
     if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
         register_seal_validation(&conn)?;
@@ -810,11 +974,13 @@ fn open_store_connection(
     Ok(conn)
 }
 
-/// The in-memory store [`crate::cache_db`]'s callers fall back to when no temp
-/// file can back an ephemeral analyzer store. It has no path, so it cannot go
-/// through [`open_store_connection`], and it is the only other way a process
-/// reaches a store.
+/// The single-connection in-memory store used by tests. Production ephemeral
+/// stores require a temp file so their reader pool can open independent read
+/// connections. It has no path, so it cannot go through
+/// [`open_store_connection`], and it is the only other way a process reaches a
+/// store.
 pub fn open_in_memory_store_connection() -> rusqlite::Result<Connection> {
+    disable_sqlite_memory_statistics();
     let mut conn = Connection::open_in_memory()?;
     register_seal_validation(&conn)?;
     conn.set_transaction_behavior(TransactionBehavior::Immediate);
@@ -835,7 +1001,6 @@ fn open_unified_connection_with_template_dir(
     db_path: &Path,
     template_dir: Option<&Path>,
 ) -> Result<Connection> {
-    disable_sqlite_memory_statistics();
     {
         let _scope = crate::profiling::scope("cache_db.validate_filesystem");
         validate_writable_cache_filesystem(db_path)?;
@@ -905,6 +1070,9 @@ fn keeps_sqlite_memory_statistics(opt_in: Option<&std::ffi::OsStr>) -> bool {
 /// the default and a measured run that leaves it set is not comparable with one
 /// that does not.
 pub fn disable_sqlite_memory_statistics() {
+    #[cfg(any(test, feature = "test-support"))]
+    test_process_sqlite::keep_linked();
+
     static DISABLED: Once = Once::new();
     DISABLED.call_once(|| {
         if keeps_sqlite_memory_statistics(std::env::var_os(MEMORY_STATISTICS_ENV).as_deref()) {
@@ -919,15 +1087,42 @@ pub fn disable_sqlite_memory_statistics() {
         if code != rusqlite::ffi::SQLITE_OK {
             // `SQLITE_MISUSE` is the only code this call returns, and it means
             // some other code in this process opened a raw SQLite connection
-            // first, so the library is already initialized. Test binaries do
-            // that; a Bifrost process does not. Leaving the statistics on costs
-            // throughput, never correctness, so report it and open the store.
+            // first, so the library is already initialized. Cache-DB connection
+            // factories and the semantic-pack catalog call this before their
+            // first open, and test processes call it from the constructor
+            // below. If this code appears, a raw opener bypassed both paths.
+            // Leaving the statistics on costs throughput, never correctness, so
+            // report it and open the store.
             eprintln!(
                 "Bifrost kept SQLite memory statistics on: \
                  sqlite3_config(SQLITE_CONFIG_MEMSTATUS, 0) returned {code}"
             );
         }
     });
+}
+
+/// Test processes must disable SQLite's memory statistics before libtest
+/// dispatches any test. A test may open SQLite through a raw
+/// `rusqlite::Connection` before it reaches a cache-DB opener, and then
+/// `sqlite3_config` is too late: every allocation and free takes SQLite's
+/// process-global `mem0.mutex` for the rest of the run.
+///
+/// `#[used]` keeps the constructor in its object file, but the linker still
+/// extracts an rlib member only when something references it. The anchor in
+/// [`disable_sqlite_memory_statistics`] lives beside the constructor and makes
+/// every test binary that reaches a cache-DB opener pull this module in.
+#[cfg(any(test, feature = "test-support"))]
+mod test_process_sqlite {
+    #[ctor::ctor(unsafe)]
+    fn disable_memory_statistics_before_tests() {
+        super::disable_sqlite_memory_statistics();
+    }
+
+    #[inline(never)]
+    pub(super) fn keep_linked() {
+        static LINKED: u8 = 0;
+        let _ = std::hint::black_box(LINKED);
+    }
 }
 
 /// The path the process cannot write, when a cache open failed on filesystem
@@ -1100,10 +1295,6 @@ fn validate_network_cache_policy(
 
 #[cfg(target_os = "linux")]
 fn network_filesystem_kind(path: &Path) -> Result<Option<&'static str>> {
-    use std::ffi::CString;
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt as _;
-
     let existing = path
         .ancestors()
         .find(|candidate| candidate.is_dir())
@@ -1113,26 +1304,12 @@ fn network_filesystem_kind(path: &Path) -> Result<Option<&'static str>> {
                 path.display()
             )
         })?;
-    let encoded = CString::new(existing.as_os_str().as_bytes()).map_err(|_| {
+    let filesystem_type = crate::content_digest::filesystem_type(existing).map_err(|error| {
         format!(
-            "cache DB path contains a NUL byte and cannot be inspected: {}",
+            "cache DB filesystem inspection failed for {}: {error}",
             existing.display()
         )
     })?;
-    let mut stats = MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `encoded` is a live NUL-terminated path and `stats` points to
-    // writable storage for one `statfs` result. A successful call initializes
-    // the result before `assume_init`.
-    let status = unsafe { libc::statfs(encoded.as_ptr(), stats.as_mut_ptr()) };
-    if status != 0 {
-        return Err(format!(
-            "cache DB filesystem inspection failed for {}: {}",
-            existing.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: `statfs` returned success and initialized the output structure.
-    let filesystem_type = unsafe { stats.assume_init() }.f_type as u64 & 0xffff_ffff;
     Ok(match filesystem_type {
         0x6969 => Some("NFS"),
         0xff53_4d42 => Some("CIFS/SMB"),
@@ -1222,7 +1399,6 @@ fn open_readonly_store_connection(
     flags: OpenFlags,
     error_context: &str,
 ) -> Result<Connection> {
-    disable_sqlite_memory_statistics();
     ensure_safe_cache_path(db_path)?;
     let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = open_store_connection(&db_path, flags, role)
@@ -3002,6 +3178,516 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11216: test processes opened SQLite before disabling memory statistics"
+    )]
+    fn sqlite_memory_statistics_are_disabled_before_a_raw_test_connection() {
+        if keeps_sqlite_memory_statistics(std::env::var_os(MEMORY_STATISTICS_ENV).as_deref()) {
+            return;
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE allocation_probe(value INTEGER);
+             INSERT INTO allocation_probe VALUES (1);",
+        )
+        .unwrap();
+        // SAFETY: the connection above initialized SQLite, and this read-only
+        // status call takes no borrowed pointers.
+        let used = unsafe { rusqlite::ffi::sqlite3_memory_used() };
+        assert_eq!(
+            used, 0,
+            "SQLite started before the test process disabled memory statistics; \
+             every allocation then takes SQLite's global mem0 mutex"
+        );
+    }
+
+    #[test]
+    #[hardwon("#10952: Rust inventory Name reads were rejected by general ledger CHECKs")]
+    fn migration_299_preserves_every_existing_read_family() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 299) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        // Isolate the rebuilt ledgers from owner setup, as in migration_279.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let fixtures = [
+            (
+                "lookup",
+                "'derivation:rust_broad_file_units:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_call_site_resolution:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_crate_name_units:v2'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_file_units:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_forward_scope_witness:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_package_units:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_route_directory:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_route_index:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_selected_units_known:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_selection_content:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_selection_content:v2'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_target_reachability:v2'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_dependents:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_inputs:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_naming:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_package_rows:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_routes:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:rust_unit_set:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'derivation:unit_summary:v1'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            ("index", "'definition_exact'", "index_key", "x'01'"),
+            (
+                "index",
+                "'definition_normalized_tail'",
+                "index_key",
+                "x'01'",
+            ),
+            ("index", "'definition_identifier'", "index_key", "x'01'"),
+            ("index", "'reference_identifier'", "index_key", "x'01'"),
+            ("index", "'import_path_segment'", "index_key", "x'01'"),
+            ("index", "'package_membership'", "index_key", "x'01'"),
+            ("index", "'supertype'", "index_key", "x'01'"),
+            ("index", "'supertype_lookup_path'", "index_key", "x'01'"),
+            ("index", "'path_symbol'", "index_key", "x'01'"),
+            (
+                "lookup",
+                "'certified_definition_answer'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'stored_semantic_ir_publication'",
+                "languages,rel_path,subject,digest,parse_variant_kind",
+                "'rust','a.rs',zeroblob(32),zeroblob(32),'empty'",
+            ),
+            (
+                "lookup",
+                "'resolved_name'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'definitions'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'identifier_candidates'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'short_name_candidates'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'declaration_facts'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'declaration_candidates'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'signature_metadata'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'callers'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'callees'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'usages'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'importers'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'reference_candidates'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'descendants'",
+                "rel_path,name,digest,decl_kind",
+                "'a.rs','Thing',zeroblob(32),'function'",
+            ),
+            (
+                "lookup",
+                "'dispatch'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'procedure_dispatch'",
+                "rel_path,subject,start_byte,end_byte,digest,site_ordinal",
+                "'a.rs',zeroblob(32),0,1,zeroblob(32),0",
+            ),
+            (
+                "lookup",
+                "'procedure_summary'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'workspace_fact'",
+                "languages,workspace_fact_family,digest",
+                "'rust','test',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'structural_name_inventory'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'structural_role_name_inventory'",
+                "rel_path,name,digest,structural_role,structural_keyword",
+                "'a.rs','Thing',zeroblob(32),'call',0",
+            ),
+            (
+                "lookup",
+                "'structural_recovered_inventory'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'rust_copy_absence'",
+                "subject,digest,copy_owning_unit,copy_target_unit,copy_module_path,copy_target_identity_digest,copy_census_version,copy_config_digest,copy_producer_digest",
+                "zeroblob(32),zeroblob(32),zeroblob(32),zeroblob(32),'a',zeroblob(32),1,zeroblob(32),zeroblob(32)",
+            ),
+            (
+                "lookup",
+                "'external_selection'",
+                "rel_path,name,digest",
+                "'a.rs','Thing',zeroblob(32)",
+            ),
+            (
+                "file",
+                "NULL",
+                "languages,rel_path,blob_oid",
+                "'rust','a.rs','1111111111111111111111111111111111111111'",
+            ),
+            ("path_absent", "NULL", "languages,rel_path", "'rust','a.rs'"),
+            ("scope", "NULL", "languages,digest", "'rust',zeroblob(32)"),
+            ("models", "NULL", "digest", "zeroblob(32)"),
+            ("configuration", "NULL", "digest", "zeroblob(32)"),
+            ("epoch", "NULL", "digest", "zeroblob(32)"),
+            (
+                "policy",
+                "NULL",
+                "subject,digest",
+                "zeroblob(32),zeroblob(32)",
+            ),
+            ("index", "'definitions'", "index_key", "x'01'"),
+            ("artifact", "'semantic_ir'", "subject", "zeroblob(32)"),
+        ];
+        for table in ["policy_read_keys", "class_set_summary_reads"] {
+            for (id, (kind, family, columns, values)) in fixtures.iter().enumerate() {
+                if table == "class_set_summary_reads" && *family == "'rust_copy_absence'" {
+                    continue; // This ledger has never admitted the Copy question.
+                }
+                let (ids, ids_values) = if table == "policy_read_keys" {
+                    ("read_id", format!("{}", id + 100))
+                } else {
+                    ("summary_id,read_ordinal", format!("44,{id}"))
+                };
+                let sql = format!(
+                    "INSERT INTO {table}({ids},key_digest,kind,family,{columns}) VALUES({ids_values},randomblob(32),'{kind}',{family},{values})"
+                );
+                conn.execute_batch(&sql)
+                    .unwrap_or_else(|err| panic!("{sql}: {err}"));
+            }
+        }
+        let rows = |table: &str| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                .unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |row| {
+                (0..width)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let before = [rows("policy_read_keys"), rows("class_set_summary_reads")];
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|m| m.version == 299)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        assert_eq!(
+            before,
+            [rows("policy_read_keys"), rows("class_set_summary_reads")]
+        );
+    }
+
+    #[test]
+    #[hardwon("#10952: Rust inventory Name questions require aligned Rust-only ledger checks")]
+    fn migration_299_inventory_name_checks_in_both_ledgers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CURRENT_FRESH_SCHEMA_SQL).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for table in ["policy_read_keys", "class_set_summary_reads"] {
+            let (ids, values) = if table == "policy_read_keys" {
+                ("", "")
+            } else {
+                ("summary_id,read_ordinal,", "1,0,")
+            };
+            for bound_family in [
+                "rust_bound_trait_impl_inventory",
+                "rust_traits_implemented_by_inventory",
+            ] {
+                let bound = format!(
+                    "INSERT INTO {table}({ids}key_digest,kind,family,languages,rel_path,blob_oid,start_byte,end_byte,digest) VALUES({values}randomblob(32),'lookup','{bound_family}','rust','a.rs','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',4294967295,4294967295,zeroblob(32))"
+                );
+                conn.execute_batch(&bound).unwrap();
+                conn.execute_batch(&format!("DELETE FROM {table}")).unwrap();
+                for malformed in [
+                    bound.replace("'rust'", "'go'"),
+                    bound.replace("'a.rs'", "NULL"),
+                    bound.replace("4294967295", "4294967296"),
+                    bound.replace("4294967295,4294967295", "0,1"),
+                    bound.replace("'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'", "NULL"),
+                ] {
+                    assert!(
+                        conn.execute_batch(&malformed).is_err(),
+                        "{table}: {malformed}"
+                    );
+                }
+            }
+            for family in [
+                "rust_unresolved_trait_impl_inventory",
+                "rust_module_import_candidate_inventory",
+                "rust_identifier_occurrence_inventory",
+                "rust_alias_blob_inventory",
+                "rust_macro_expansion_inventory",
+            ] {
+                let sql = format!(
+                    "INSERT INTO {table}({ids}key_digest,kind,family,languages,name,digest) VALUES({values}randomblob(32),'lookup','{family}','rust','Trait',zeroblob(32))"
+                );
+                conn.execute_batch(&sql).unwrap();
+                conn.execute_batch(&format!("DELETE FROM {table}")).unwrap();
+                for malformed in [
+                    sql.replace("'Trait'", "NULL"),
+                    sql.replace("'rust'", "'java'"),
+                    sql.replace("name,digest", "name,rel_path,digest")
+                        .replace("'Trait',", "'Trait','a.rs',"),
+                ] {
+                    let err = conn.execute_batch(&malformed).unwrap_err();
+                    assert!(
+                        err.to_string().contains("CHECK constraint failed"),
+                        "{table}: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn publication_read_columns_reject_malformed_rows_in_both_general_ledgers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CURRENT_FRESH_SCHEMA_SQL).unwrap();
+        // These isolated CHECK probes have no owning summary row.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        for table in ["policy_read_keys", "class_set_summary_reads"] {
+            let prefix = if table == "policy_read_keys" {
+                ""
+            } else {
+                "summary_id,read_ordinal,"
+            };
+            let values = if table == "policy_read_keys" {
+                ""
+            } else {
+                "1,0,"
+            };
+            let insert = |extra_columns: &str, extra_values: &str| {
+                format!(
+                    "INSERT INTO {table}({prefix}key_digest,kind,family,languages,rel_path,subject,digest,parse_variant_kind{extra_columns}) VALUES({values}zeroblob(32),'lookup','stored_semantic_ir_publication','raw-go','src/a.go',zeroblob(32),zeroblob(32),'empty'{extra_values})"
+                )
+            };
+            conn.execute_batch(&insert("", "")).unwrap();
+            conn.execute_batch(&format!("DELETE FROM {table}")).unwrap();
+            for (columns, values) in [
+                (",parse_variant_digest", ",zeroblob(32)"),
+                (",blob_oid", ",'0123456789012345678901234567890123456789'"),
+                (",name", ",'unrelated'"),
+            ] {
+                assert!(
+                    conn.execute_batch(&insert(columns, values)).is_err(),
+                    "{table} {columns}"
+                );
+            }
+            let other =
+                insert("", "").replace("'stored_semantic_ir_publication'", "'procedure_summary'");
+            assert!(conn.execute_batch(&other).is_err(), "{table} other family");
+        }
+    }
+
+    #[test]
+    fn migration_279_preserves_existing_general_ledger_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 279)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        // Preserve the ledger rows independently of their owners in this DDL test.
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        conn.execute_batch("INSERT INTO policy_read_keys(key_digest,kind,digest) VALUES(zeroblob(32),'models',zeroblob(32));
+            INSERT INTO class_set_summary_reads(summary_id,read_ordinal,key_digest,kind,digest) VALUES(1,0,zeroblob(32),'models',zeroblob(32));").unwrap();
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 279)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        for table in ["policy_read_keys", "class_set_summary_reads"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} WHERE kind='models' AND digest=zeroblob(32)"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table}");
+        }
+    }
     use brokk_bifrost_test_macros::hardwon;
     // The EXPLAIN QUERY PLAN pins below run their assertions once against a
     // database with no planner statistics and once with the statistics
@@ -5568,15 +6254,13 @@ mod tests {
 
     #[test]
     fn prefix_product_upgrade_rebuilds_policy_units() {
+        // A store at 0233, before 0236 paired prefix partitions with the
+        // prefix product, holds a prefix unit that stored rows.
         let mut conn = create_current_baseline_without_migration();
-        for migration in POST_BASELINE_MIGRATIONS
-            .iter()
-            .filter(|m| m.version < CURRENT_MIGRATION_VERSION)
-        {
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 236) {
             conn.execute_batch(migration.sql).unwrap();
         }
-        let previous = POST_BASELINE_MIGRATIONS[POST_BASELINE_MIGRATIONS.len() - 2].version;
-        conn.pragma_update(None, "user_version", previous).unwrap();
+        conn.pragma_update(None, "user_version", 233).unwrap();
         conn.execute_batch(
             "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at,prefix_cut_digest,prefix_input_digest)
              VALUES(hex(zeroblob(32)),'match','prefix','a.java','1111111111111111111111111111111111111111',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive','rows',jsonb('{}'),zeroblob(32),1,hex(zeroblob(32)),hex(zeroblob(32)));
@@ -5659,6 +6343,188 @@ mod tests {
             "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at,prefix_cut_digest,prefix_input_digest)
              VALUES(hex(zeroblob(32)),'match','prefix','a.java','1111111111111111111111111111111111111111',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive','prefix',jsonb('{}'),zeroblob(32),1,hex(zeroblob(32)),hex(zeroblob(32)));"
         ).unwrap();
+    }
+
+    #[test]
+    fn declaration_candidate_family_upgrade_preserves_both_read_tables() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 243) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 242).unwrap();
+        let blob_id =
+            insert_visibility_blob_fixture(&conn, "declaration-candidate-upgrade", None, 1);
+        conn.execute_batch(&format!(
+            "INSERT INTO class_set_procedure_surfaces(
+               surface_id, surface_digest, procedure_lineage, owner_rel_path,
+               owner_blob_id, lang, artifact_public_identity, artifact_content_identity,
+               schema_version, local_structure_digest, behavior_read_digest,
+               carrier_semantics_digest, direct_calls_digest, call_count, binding_count,
+               entered_count, lexical_child_count, read_count, completion, published_at,
+               exact_behavior_digest, exact_provenance_digest
+             ) VALUES(43, zeroblob(32), zeroblob(32), 'Owner.java', {blob_id}, 'java',
+                      zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32),
+                      zeroblob(32), zeroblob(32), 0, 0, 0, 0, 0, 'complete', 0,
+                      zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_summaries(
+               summary_id, lookup_digest, procedure_lineage, owner_rel_path, owner_blob_id,
+               lang, artifact_public_identity, artifact_content_identity, schema_version,
+               semantics_digest, context_digest, behavior_read_digest, dependency_digest,
+               carrier_digest, field_slots_digest, entry_fact_ordinal, fact_count,
+               exit_count, reached_count, dependency_count, read_count, charge_count,
+               completion, budget_mode, output_digest, content_digest, published_at,
+               root_surface_digest, direct_calls_digest
+             ) VALUES(44, zeroblob(32), zeroblob(32), 'Owner.java', {blob_id}, 'java',
+                      zeroblob(32), zeroblob(32), 1, zeroblob(32), zeroblob(32),
+                      zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(32),
+                      0, 1, 1, 0, 0, 1, 1, 'complete', 'exhaustive',
+                      zeroblob(32), zeroblob(32), 0, zeroblob(32), zeroblob(32));
+             INSERT INTO class_set_summary_reads(
+               summary_id, read_ordinal, key_digest, kind, languages, rel_path, blob_oid
+             ) VALUES(44, 0, zeroblob(32), 'file', 'java', 'Owner.java',
+                      '1111111111111111111111111111111111111111');
+             INSERT INTO policy_read_keys(
+               read_id, key_digest, kind, languages, rel_path, blob_oid
+             ) VALUES(55, zeroblob(32), 'file', 'java', 'Owner.java',
+                      '1111111111111111111111111111111111111111');
+             INSERT INTO policy_units(
+               unit_id, policy_semantic_hash, family, partition_kind, seed_rel_path,
+               seed_blob_oid, configuration_fingerprint, active_model_set_hash,
+               engine_epoch, completion, budget_mode, product_kind, product,
+               read_set_digest, published_at
+             ) VALUES(66, hex(zeroblob(32)), 'match', 'seed', 'Owner.java',
+                      '1111111111111111111111111111111111111111', hex(zeroblob(32)),
+                      hex(zeroblob(32)), hex(zeroblob(32)), 'complete', 'exhaustive',
+                      'rows', jsonb('{{}}'), zeroblob(32), 0);
+             INSERT INTO policy_unit_reads(unit_id, read_id) VALUES(66, 55);"
+        ))
+        .unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        let rows = |conn: &Connection, table: &str, order: &str| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+                .unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let rows_with_columns = |conn: &Connection, table: &str, order: &str, columns: &str| {
+            let mut statement = conn
+                .prepare(&format!("SELECT {columns} FROM {table} ORDER BY {order}"))
+                .unwrap();
+            let width = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..width)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let old_columns = [
+            "class_set_summary_reads",
+            "policy_read_keys",
+            "policy_unit_reads",
+        ]
+        .map(|table| {
+            conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+                .unwrap()
+                .column_names()
+                .join(", ")
+        });
+        let before = [
+            rows(&conn, "class_set_summary_reads", "summary_id, read_ordinal"),
+            rows(&conn, "policy_read_keys", "read_id"),
+            rows(&conn, "policy_unit_reads", "unit_id, read_id"),
+        ];
+        migrate(&mut conn).unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        let after = [
+            rows(&conn, "class_set_summary_reads", "summary_id, read_ordinal"),
+            rows(&conn, "policy_read_keys", "read_id"),
+            rows(&conn, "policy_unit_reads", "unit_id, read_id"),
+        ];
+        for (index, (old_table, new_table)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(old_table.len(), new_table.len());
+            let table = [
+                "class_set_summary_reads",
+                "policy_read_keys",
+                "policy_unit_reads",
+            ][index];
+            let order = ["summary_id, read_ordinal", "read_id", "unit_id, read_id"][index];
+            let retained = rows_with_columns(&conn, table, order, &old_columns[index]);
+            assert_eq!(old_table, &retained);
+            if index < 2 {
+                assert_eq!(conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE structural_role IS NOT NULL OR structural_keyword IS NOT NULL"),
+                    [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+            }
+        }
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        for (table, id_column, id) in [
+            ("class_set_summary_reads", "summary_id", 44),
+            ("policy_read_keys", "read_id", 55),
+            ("policy_unit_reads", "read_id", 55),
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {id_column} = ?1"),
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1,
+                "{table} lost its read row or link"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM class_set_summary_reads AS reads
+                 JOIN class_set_summaries AS owners USING(summary_id)
+                 WHERE reads.summary_id = 44",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM policy_unit_reads AS membership
+                 JOIN policy_read_keys AS keys USING(read_id)
+                 JOIN policy_units AS owners USING(unit_id)
+                 WHERE membership.unit_id = 66 AND membership.read_id = 55",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute_batch(
+            "INSERT INTO class_set_summary_reads(
+               summary_id, read_ordinal, key_digest, kind, family, rel_path,
+               name, digest, decl_kind
+             ) VALUES(44, 1, randomblob(32), 'lookup', 'declaration_candidates',
+                      'Owner.java', 'Owner.run', zeroblob(32), 'function');
+             INSERT INTO policy_read_keys(
+               read_id, key_digest, kind, family, rel_path, name, digest, decl_kind
+             ) VALUES(56, randomblob(32), 'lookup', 'declaration_candidates',
+                      'Owner.java', 'Owner.run', zeroblob(32), 'function');",
+        )
+        .unwrap();
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -5752,19 +6618,21 @@ mod tests {
             .unwrap(),
             1
         );
-        for (kind, field1, field2) in [
-            ("root", "root_locator", "root_compilation"),
-            ("prefix", "prefix_cut_digest", "prefix_input_digest"),
-            ("output", "anchor_locator", "compilation_digest"),
+        // Each typed partition stores its own product kind (0240 pairs an
+        // output partition with the output product).
+        for (kind, field1, field2, product) in [
+            ("root", "root_locator", "root_compilation", "root"),
+            (
+                "prefix",
+                "prefix_cut_digest",
+                "prefix_input_digest",
+                "prefix",
+            ),
+            ("output", "anchor_locator", "compilation_digest", "output"),
         ] {
             let sql = format!(
                 "INSERT INTO policy_units(policy_semantic_hash,family,partition_kind,seed_rel_path,seed_blob_oid,configuration_fingerprint,active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,product,read_set_digest,published_at,{field1},{field2}) VALUES(hex(zeroblob(32)),'match',?1,'a.java','1111111111111111111111111111111111111111',hex(zeroblob(32)),hex(zeroblob(32)),hex(zeroblob(32)),'complete','exhaustive',?2,jsonb('{{}}'),zeroblob(32),1,?3,?4)"
             );
-            let product = match kind {
-                "root" => "root",
-                "prefix" => "prefix",
-                _ => "rows",
-            };
             for value in ["a".repeat(64), "b".repeat(64)] {
                 conn.execute(
                     &sql,
@@ -5839,6 +6707,123 @@ mod tests {
     }
 
     #[test]
+    fn rust_inactive_placement_key_keeps_candidate_paths_and_mount_sites() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CURRENT_FRESH_SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO rust_crate_topologies(
+            topology_id, topology_digest, crate_key, producer_epoch, target_kind,
+            crate_name, edition, prelude, cfg_atoms, inventory_complete,
+            export_surface_digest, publication_state)
+            VALUES(1,zeroblob(32),zeroblob(32),'test','lib','fixture',
+                   '2021','std',jsonb('[]'),0,zeroblob(32),'complete');",
+        )
+        .unwrap();
+        let insert = "INSERT INTO rust_crate_inactive_placements VALUES
+            (1,'crate::foo',?1,'mod_declaration',?2,?3,0,NULL,?4)
+            ON CONFLICT(topology_id,module_path,rel_path,placement,mount_blob_id,mount_start_byte,scope_ordinal)
+            DO UPDATE SET activation = CASE WHEN activation=-1 OR excluded.activation=-1 THEN -1 ELSE 0 END";
+        for (path, mount, start, activation) in [
+            ("src/foo.rs", 10, 20, 0),
+            ("src/foo/mod.rs", 10, 20, 0),
+            ("src/foo.rs", 10, 21, 0),
+            ("src/foo.rs", 10, 20, -1),
+        ] {
+            conn.execute(insert, rusqlite::params![path, mount, start, activation])
+                .unwrap();
+        }
+        let rows: Vec<(String, i64, i64)> = conn
+            .prepare(
+                "SELECT rel_path,mount_start_byte,activation
+             FROM rust_crate_inactive_placements ORDER BY rel_path,mount_start_byte",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("src/foo.rs".into(), 20, -1),
+                ("src/foo.rs".into(), 21, 0),
+                ("src/foo/mod.rs".into(), 20, 0),
+            ]
+        );
+        let broad_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM rust_crate_broad_placements WHERE topology_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(broad_count, 3);
+    }
+
+    #[test]
+    #[hardwon("#9871: populated version-272 structural facts made migration 273 discard the cache")]
+    fn structural_role_coverage_upgrades_populated_and_empty_272_stores() {
+        for populated in [true, false] {
+            let mut conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version <= 272) {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 272).unwrap();
+            if populated {
+                let blob_id =
+                    insert_visibility_blob_fixture(&conn, "role-coverage-upgrade", Some(1), 1);
+                insert_empty_visibility_source(&conn, blob_id);
+                conn.execute(
+                    "INSERT INTO source_structural_facts(blob_id,nodes,roles,occurrence_roles)
+                     VALUES(?1,jsonb('[]'),jsonb('[]'),jsonb('[]'))",
+                    [blob_id],
+                )
+                .unwrap();
+            }
+            migrate(&mut conn).unwrap();
+            assert_eq!(
+                cache_migration_version(&conn).unwrap(),
+                CURRENT_MIGRATION_VERSION
+            );
+            assert!(current_schema_shape_is_valid(&conn).unwrap());
+            assert_eq!(
+                schema_object_definitions_sha256(&conn).unwrap(),
+                CURRENT_SCHEMA_OBJECTS_SHA256
+            );
+            verify_upgraded_store(&conn, Path::new("version-272-fixture")).unwrap();
+            let rows: Vec<(String, String, String, bool)> = conn
+                .prepare(
+                    "SELECT nodes,roles,occurrence_roles,role_coverage='[]'
+                 FROM structural_source_facts",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            assert_eq!(
+                rows,
+                if populated {
+                    vec![("[]".into(), "[]".into(), "[]".into(), true)]
+                } else {
+                    vec![]
+                }
+            );
+            let byte_identical: bool = conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM source_structural_facts WHERE role_coverage != jsonb('[]'))",
+                [], |r| r.get(0),
+            ).unwrap();
+            assert!(byte_identical);
+            assert!(
+                conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                    .unwrap()
+            );
+            // Reopening a migrated store must skip the historical migration.
+            migrate(&mut conn).unwrap();
+        }
+    }
+
+    #[test]
     fn current_schema_digest_matches_the_baseline_chain() {
         let conn = create_current_baseline_without_migration();
         for migration in POST_BASELINE_MIGRATIONS {
@@ -5848,6 +6833,238 @@ mod tests {
             schema_object_definitions_sha256(&conn).unwrap(),
             CURRENT_SCHEMA_OBJECTS_SHA256
         );
+    }
+
+    #[test]
+    fn guarded_pattern_projection_migration_upgrades_an_existing_store() {
+        let mut conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < 286)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO semantic_ir_producer_epochs(lang, producer_epoch) VALUES ('rust', 'existing-v285')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 285).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'semantic_ir_guarded_pattern_projections'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT producer_epoch FROM semantic_ir_producer_epochs WHERE lang = 'rust'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "existing-v285"
+        );
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+    }
+
+    #[test]
+    fn publication_witness_migration_backfills_and_exhaustion_aborts() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 264) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let a = insert_visibility_blob_fixture(&conn, "witness-a", None, 1);
+        let b = insert_visibility_blob_fixture(&conn, "witness-b", None, 1);
+        let incomplete = insert_visibility_blob_fixture(&conn, "witness-c", None, 0);
+        conn.execute_batch(
+            POST_BASELINE_MIGRATIONS
+                .iter()
+                .find(|migration| migration.version == 264)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
+        let witnesses: (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT (SELECT publication_witness FROM blob_meta WHERE blob_id = ?1),
+                        (SELECT publication_witness FROM blob_meta WHERE blob_id = ?2),
+                        (SELECT publication_witness FROM blob_meta WHERE blob_id = ?3)",
+                rusqlite::params![a, b, incomplete],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(witnesses, (a, b, None));
+        let (nonce_size, next): (i64, i64) = conn
+            .query_row(
+                "SELECT length(store_nonce), next_witness FROM blob_publication_witness_sequence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((nonce_size, next), (16, a.max(b) + 1));
+        conn.execute(
+            "UPDATE blob_publication_witness_sequence SET next_witness = 9223372036854775807",
+            [],
+        )
+        .unwrap();
+        let error = conn
+            .execute(
+                "UPDATE blob_meta SET is_complete = 1 WHERE blob_id = ?1",
+                [incomplete],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("publication witness exhausted"),
+            "{error}"
+        );
+        let unchanged: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT is_complete, publication_witness FROM blob_meta WHERE blob_id = ?1",
+                [incomplete],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged, (0, None));
+        conn.execute("DELETE FROM blob_publication_witness_sequence", [])
+            .unwrap();
+        let error = conn
+            .execute(
+                "UPDATE blob_meta SET is_complete = 1 WHERE blob_id = ?1",
+                [incomplete],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("publication witness exhausted"),
+            "{error}"
+        );
+        let unchanged: (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT is_complete, publication_witness FROM blob_meta WHERE blob_id = ?1",
+                [incomplete],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged, (0, None));
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 0)",
+            [seeded_oid("missing-sequence-insert")],
+        )
+        .unwrap();
+        let new_blob = conn.last_insert_rowid();
+        let error = conn.execute(
+            "INSERT INTO blob_meta(blob_id, lang, contains_tests, content_package,
+             stored_unit_count, range_count, signature_count, signature_metadata_count,
+             supertype_count, child_count, import_statement_count, type_identifier_count, is_complete)
+             VALUES(?1, 'java', 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1)",
+            [new_blob],
+        ).unwrap_err();
+        assert!(
+            error.to_string().contains("publication witness exhausted"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn complete_blob_fq_rows_are_sealed_and_cascade_remains_legal() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        let blob = insert_visibility_blob_fixture(&conn, "sealed-fq", None, 0);
+        conn.execute(
+            "INSERT INTO code_units(blob_id,lang,unit_key,kind,short_name,identifier,
+             content_qualifier,synthetic,is_type_alias,in_declarations,in_definition_lookup)
+             VALUES(?1,'java',0,0,'A','A','',0,0,1,1)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_unit_fq_segments(blob_id,lang,unit_key,seg_ordinal,seg_kind,segment)
+             VALUES(?1,'java',0,0,'type','A')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE blob_meta SET is_complete=1 WHERE blob_id=?1",
+            [blob],
+        )
+        .unwrap();
+        let first: i64 = conn
+            .query_row(
+                "SELECT publication_witness FROM blob_meta WHERE blob_id=?1",
+                [blob],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for sql in [
+            "INSERT INTO code_unit_fq_segments VALUES(?1,'java',0,1,'type','B')",
+            "INSERT OR REPLACE INTO code_unit_fq_segments VALUES(?1,'java',0,0,'type','B')",
+            "UPDATE code_unit_fq_segments SET segment='B' WHERE blob_id=?1",
+            "DELETE FROM code_unit_fq_segments WHERE blob_id=?1",
+        ] {
+            let error = conn.execute(sql, [blob]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("sealed FQ segments are immutable"),
+                "{sql}: {error}"
+            );
+        }
+        conn.execute(
+            "UPDATE blob_meta SET is_complete=0 WHERE blob_id=?1",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE code_unit_fq_segments SET segment='B' WHERE blob_id=?1",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE blob_meta SET is_complete=1 WHERE blob_id=?1",
+            [blob],
+        )
+        .unwrap();
+        let second: i64 = conn
+            .query_row(
+                "SELECT publication_witness FROM blob_meta WHERE blob_id=?1",
+                [blob],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(second > first);
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM code_unit_fq_segments WHERE blob_id=?1",
+                [blob],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let replacement = insert_visibility_blob_fixture(&conn, "sealed-fq", None, 1);
+        let third: i64 = conn
+            .query_row(
+                "SELECT publication_witness FROM blob_meta WHERE blob_id=?1",
+                [replacement],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(third > second);
     }
 
     #[test]
@@ -7045,6 +8262,85 @@ mod tests {
     }
 
     #[test]
+    fn output_product_migration_preserves_other_units_and_links() {
+        let conn = create_current_baseline_without_migration();
+        for migration in POST_BASELINE_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 236)
+        {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO policy_read_keys(read_id,key_digest,kind,digest)
+               VALUES(1,zeroblob(32),'models',zeroblob(32));
+             INSERT INTO policy_evaluations(evaluation_id,base_tree_oid,options_digest,
+               configuration_fingerprint,active_model_set_hash,engine_epoch,
+               resolved_commit,published_at)
+               VALUES(1,printf('%040x',0),printf('%064x',0),printf('%064x',0),
+                 printf('%064x',0),printf('%064x',0),printf('%040x',0),1);
+             INSERT INTO policy_evaluation_policies(evaluation_id,policy_id,source_hash,
+               semantic_hash,completion,completion_detail,qualified,qualification_detail,diagnostics)
+               VALUES(1,'test',printf('%064x',0),printf('%064x',0),'complete','{}',1,'','[]');
+             INSERT INTO policy_units(unit_id,policy_semantic_hash,family,partition_kind,
+               seed_rel_path,seed_blob_oid,prefix_cut_digest,prefix_input_digest,
+               anchor_locator,compilation_digest,configuration_fingerprint,
+               active_model_set_hash,engine_epoch,completion,budget_mode,product_kind,
+               read_set_digest,published_at,product)
+               VALUES
+               (1,printf('%064x',0),'taint','output','sink.rs',printf('%040x',0),
+                 '','',printf('%064x',0),printf('%064x',0),printf('%064x',0),
+                 printf('%064x',0),printf('%064x',0),'complete','exhaustive','rows',
+                 zeroblob(32),1,jsonb('{\"old\":true}')),
+               (2,printf('%064x',0),'taint','prefix','source.rs',printf('%040x',0),
+                 printf('%064x',0),printf('%064x',0),'','',printf('%064x',0),
+                 printf('%064x',0),printf('%064x',0),'complete','exhaustive','prefix',
+                 zeroblob(32),1,jsonb('{\"keep\":true}'));
+             INSERT INTO policy_unit_reads VALUES(1,1),(2,1);
+             INSERT INTO policy_unit_snapshots VALUES(1,zeroblob(32),1),(2,zeroblob(32),1);
+             INSERT INTO policy_evaluation_units VALUES(1,'test',1),(1,'test',2);",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute_batch(include_str!(
+            "../migrations/cache/0240-policy-unit-output-product.sql"
+        ))
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        for (table, expected) in [
+            ("policy_units", 2),
+            ("policy_unit_reads", 2),
+            ("policy_unit_snapshots", 2),
+            ("policy_evaluation_units", 2),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT unit_id FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, expected, "{table} retained only the prefix link");
+        }
+        let product: String = conn
+            .query_row(
+                "SELECT json(product) FROM policy_units WHERE unit_id=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(product, "{\"keep\":true}");
+        assert_eq!(
+            conn.prepare("PRAGMA index_list(policy_units)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn empty_subfloor_versions_are_recreated_at_the_current_schema() {
         for version in [62, 116] {
             let mut conn = Connection::open_in_memory().unwrap();
@@ -7059,6 +8355,64 @@ mod tests {
             );
             assert!(current_schema_is_valid(&conn).unwrap());
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "#8837: legacy empty probes had no evidence of presence and could replay stale C# membership"
+    )]
+    fn configuration_presence_migration_validates_only_content_proven_rows() {
+        let mut conn = create_current_baseline_without_migration();
+        let before_presence = POST_BASELINE_MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .filter(|version| *version < 276)
+            .max()
+            .expect("a migration precedes configuration presence");
+        for migration in POST_BASELINE_MIGRATIONS.iter().filter(|m| m.version < 276) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", before_presence)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES('0000000000000000000000000000000000000000000000000000000000000000','csharp',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO workspace_file_versions(workspace_id,lang,generation,input_kind,rel_path,blob_oid,valid_from)
+             VALUES('0000000000000000000000000000000000000000000000000000000000000000','csharp',1,'configuration','empty.props','e69de29bb2d1d6434b8b29ae775ad8c2e48c5391',1),
+                   ('0000000000000000000000000000000000000000000000000000000000000000','csharp',1,'configuration','nonempty.props','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let rows = conn
+            .prepare("SELECT rel_path,file_present FROM workspace_file_versions ORDER BY rel_path")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("empty.props".into(), None),
+                ("nonempty.props".into(), Some(1))
+            ]
+        );
+        assert!(conn.execute(
+            "INSERT INTO workspace_file_versions(workspace_id,lang,generation,input_kind,rel_path,blob_oid,valid_from)
+             VALUES('0000000000000000000000000000000000000000000000000000000000000000','csharp',1,'configuration','new.props','e69de29bb2d1d6434b8b29ae775ad8c2e48c5391',1)", [],
+        ).is_err());
+        assert!(conn.execute(
+            "INSERT INTO workspace_file_versions(workspace_id,lang,generation,input_kind,rel_path,blob_oid,valid_from,file_present)
+             VALUES('0000000000000000000000000000000000000000000000000000000000000000','csharp',1,'configuration','new.props','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,0)", [],
+        ).is_err());
+        assert!(conn.execute(
+            "UPDATE workspace_file_versions SET file_present=NULL WHERE rel_path='nonempty.props'", [],
+        ).is_err());
     }
 
     #[test]
@@ -7801,7 +9155,7 @@ mod tests {
             .unwrap();
         assert!(
             plan.iter()
-                .any(|step| step.contains("idx_code_units_lang_exact_fqn_declarations")),
+                .any(|step| step.contains("idx_code_units_lang_exact_fqn")),
             "exact live declaration lookup must use its partial index {state}: {plan:?}"
         );
         assert!(

@@ -139,6 +139,14 @@ pub fn exact_call_reference_for_call(
             if language == Language::Ruby && ruby_exact_bare_call_identifier(node) {
                 return Some(ExactCallReference::Resolvable(node_range(node)));
             }
+            // A Scala parameterless application or a Kotlin property read of
+            // a Java getter has no argument-list node either: its whole
+            // expression is the selection, and lowering
+            // emits the call site there. Resolution decides whether it applies
+            // anything; its dispatch reference is the member leaf.
+            if let Some(member) = resolution_decided_application(node, language) {
+                return Some(ExactCallReference::Resolvable(node_range(member)));
+            }
             if is_call_expression_node(node, language) {
                 if language == Language::Ruby && ruby_callable_object_call(node) {
                     return Some(ExactCallReference::Unsupported(
@@ -185,7 +193,8 @@ pub fn exact_call_reference_for_reverse_site(
         .root_node()
         .named_descendant_for_byte_range(site.start_byte, site.end_byte)?;
     loop {
-        if is_call_expression_node(node, language)
+        if (is_call_expression_node(node, language)
+            || resolution_decided_application(node, language).is_some())
             && let Some(ExactCallReference::Resolvable(range)) =
                 exact_call_reference_for_call(tree, language, &node_range(node))
             && (range.start_byte, range.end_byte) == (site.start_byte, site.end_byte)
@@ -194,6 +203,16 @@ pub fn exact_call_reference_for_reverse_site(
         }
         node = node.parent()?;
     }
+}
+
+/// The member leaf of a selection that is a call exactly when its member
+/// resolves to a callable (see
+/// [`LanguageKnowledge::resolution_decided_application`]).
+///
+/// [`LanguageKnowledge::resolution_decided_application`]: brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge::resolution_decided_application
+#[doc(hidden)]
+pub fn resolution_decided_application(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+    crate::analyzer::languages::language_knowledge(language)?.resolution_decided_application(node)
 }
 
 pub(crate) fn is_call_reference_range_in_tree(
@@ -285,7 +304,7 @@ pub fn call_site_syntax_for_reference(
                     range: range_for_span(facts, target.span),
                     name: None,
                     position: Some(current),
-                    spread: target.spread,
+                    spread: target.mode.is_spread(),
                 })
             }
             Role::Kwarg => Some(CallArgumentSyntax {
@@ -294,7 +313,7 @@ pub fn call_site_syntax_for_reference(
                     .keyword
                     .map(|keyword| keyword.text(facts.source()).to_owned()),
                 position: None,
-                spread: target.spread,
+                spread: target.mode.is_spread(),
             }),
             _ => None,
         })

@@ -2,6 +2,7 @@
 pub mod analyzer_definition_lookup;
 #[doc(hidden)]
 pub mod assignment_facts;
+pub mod derivation_host;
 #[doc(hidden)]
 pub mod loop_facts;
 #[doc(hidden)]
@@ -17,6 +18,8 @@ pub use assignment_facts::java_overwritten_local_candidates;
 pub use assignment_facts::js_ts_overwritten_local_candidates;
 pub use assignment_facts::plain_assignment_candidates;
 pub use assignment_facts::python_overwritten_local_candidates;
+pub use assignment_facts::rust_dead_write_macro_sources_by_binding;
+pub use assignment_facts::rust_dead_write_macro_sources_without_read;
 pub use assignment_facts::single_target_overwritten_local_candidates;
 
 pub use loop_facts::LoopCandidate;
@@ -30,7 +33,6 @@ pub use loop_facts::loop_candidates;
 pub use loop_facts::nested_loop_facts;
 
 pub(crate) use loop_facts::build_loop_candidates;
-pub(crate) use loop_facts::weight_loop_candidates;
 
 pub use source_admission::AdmissionDimension;
 pub use source_admission::SourceAdmissionRefusal;
@@ -216,8 +218,6 @@ pub mod test_support;
 
 pub mod usages;
 
-pub(crate) use brokk_bifrost_core::analyzer::weighted_cache;
-
 pub(crate) use brokk_bifrost_core::complete_value_cache;
 
 #[doc(hidden)]
@@ -397,6 +397,8 @@ pub use i_analyzer::SearchSymbolCandidates;
 pub use i_analyzer::SearchSymbolPatternBatch;
 pub use i_analyzer::WorkspaceFileIndex;
 pub use i_analyzer::WorkspaceFileIndexCell;
+pub use i_analyzer::enter_product_entry;
+pub use i_analyzer::{OuterRequest, current_outer_request, current_outer_request_or_transient};
 pub use i_analyzer::{
     capture_query_reads, capture_subsumed_query_read_receipt, capture_subsumed_query_reads,
     replay_query_read_keys, replay_query_read_receipt,
@@ -411,6 +413,8 @@ pub use i_analyzer::QueryToken;
 pub use i_analyzer::AnalyzerTestHooks;
 #[cfg(any(test, feature = "test-support"))]
 pub use i_analyzer::NoOpAnalyzerTestHooks;
+#[cfg(any(test, feature = "test-support"))]
+pub use i_analyzer::OperandProbeTestAction;
 
 pub use index_warmer::IndexWarmer;
 
@@ -511,6 +515,7 @@ pub use read_ledger::ReadLedger;
 pub use read_ledger::ReadSetDigest;
 pub use read_ledger::absent_summary_digest;
 
+pub use read_verification::ChangedDelta;
 pub use read_verification::ChangedFacts;
 pub use read_verification::ChangedRead;
 pub use read_verification::HeadInputs;
@@ -642,7 +647,8 @@ pub use brokk_bifrost_core::analyzer::definition_lookup;
 pub mod semantic;
 pub mod semantic_model;
 
-pub(crate) mod selected_services;
+#[doc(hidden)]
+pub mod selected_services;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -664,3 +670,11 @@ pub use workspace_authority::{
 };
 
 mod project_read_facade;
+
+/// Retry every reported path until the failed update has been reconciled.
+pub(crate) fn pending_update_paths(
+    changed: &std::collections::BTreeSet<brokk_bifrost_core::analyzer::ProjectFile>,
+    pending: &std::collections::BTreeSet<brokk_bifrost_core::analyzer::ProjectFile>,
+) -> std::collections::BTreeSet<brokk_bifrost_core::analyzer::ProjectFile> {
+    changed.union(pending).cloned().collect()
+}

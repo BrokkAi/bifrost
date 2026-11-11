@@ -26,9 +26,6 @@ tests/fixtures/python-native-callee-internal/probe.py text eol=lf
 # Typestate canonical contracts are compared byte for byte.
 tests/fixtures/typestate/*.canonical*.json text eol=lf
 
-# This upstream Node notice is copied verbatim, including its mixed line endings.
-semantic-packs/node/runtime-values/notices/node-v22.11.0.txt -text
-
 # Semantic-model source, schema, and text goldens are exact cross-platform contracts.
 schemas/semantic-model-pack-v2.schema.json text eol=lf
 schemas/semantic-model-pack-v3.schema.json text eol=lf
@@ -48,6 +45,7 @@ crates/bifrost-semantic/tests/fixtures/extraction-contract.json text eol=lf
 crates/bifrost-semantic/src/analyzer/semantic_model/csmi/profiles/runtime-values.fixture.json text eol=lf
 tests/fixtures/semantic-model-packs/*.json text eol=lf
 tests/fixtures/semantic-model-packs/*.yaml text eol=lf
+tests/fixtures/semantic-model-packs/trimmed/*.json text eol=lf
 tests/fixtures/semantic-model-packs/*.deflate binary
 tests/fixtures/csharp-external/*.dll binary
 docs/src/content/docs/semantic-model-packs.md text eol=lf
@@ -229,3 +227,6 @@ tests/fixtures/golden/jvm-import-context/equality/expected.txt text eol=lf
 crates/bifrost-core/migrations/cache/0229-csharp-undecided-chains.sql text eol=lf
 crates/bifrost-core/migrations/cache/0231-policy-evaluation-replay-evidence.sql text eol=lf
 crates/bifrost-core/migrations/cache/0233-policy-unit-typed-partition.sql text eol=lf
+
+schemas/semantic-model-pack-v31.schema.json text eol=lf
+schemas/semantic-model-compiled-manifest-v31.schema.json text eol=lf

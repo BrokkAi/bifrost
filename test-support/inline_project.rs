@@ -8,7 +8,8 @@
 //! suites without publishing the private assurance corpus.
 
 use brokk_bifrost_analysis::{
-    AnalyzerConfig, Language, Project, ProjectFile, TestProject, WorkspaceAnalyzer,
+    AnalyzerConfig, FilesystemProject, Language, Project, ProjectFile, TestProject,
+    WorkspaceAnalyzer, WorkspaceFileListingCache,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -137,6 +138,22 @@ pub fn python_workspace(files: &[(&str, &str)]) -> (BuiltInlineTestProject, Work
     (project, analyzer)
 }
 
+/// A project over the directory `root` whose file listing is certified
+/// complete. See [`BuiltInlineTestProject::certified_project_dyn`].
+pub fn certified_project_at(root: &Path) -> Arc<dyn Project> {
+    // `with_cached_listing` asserts that the cache root equals its own
+    // canonical root. A temp root behind a symlink (macOS `/var` ->
+    // `/private/var`) only matches once canonicalized; the cache normalizes.
+    let root = root
+        .canonicalize()
+        .expect("fixture root is a readable directory");
+    let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+    Arc::new(
+        FilesystemProject::with_cached_listing(&root, cache)
+            .expect("fixture root is a readable directory"),
+    )
+}
+
 pub struct BuiltInlineTestProject {
     temp: tempfile::TempDir,
     project: TestProject,
@@ -183,6 +200,19 @@ impl BuiltInlineTestProject {
     pub fn commit(&self, message: &str) {
         run_git(self.root(), &["add", "-A"]);
         run_git(self.root(), &["commit", "-m", message]);
+    }
+
+    /// A project over the same root whose file listing is certified complete.
+    ///
+    /// Uses the production filesystem project, including its listing cache.
+    pub fn certified_project_dyn(&self) -> Arc<dyn Project> {
+        certified_project_at(self.root())
+    }
+
+    /// [`Self::workspace_analyzer`] over [`Self::certified_project_dyn`].
+    pub fn certified_workspace_analyzer(&self, config: AnalyzerConfig) -> WorkspaceAnalyzer {
+        WorkspaceAnalyzer::build_ephemeral_footgun(self.certified_project_dyn(), config)
+            .expect("ephemeral inline workspace should build")
     }
 
     pub fn workspace_analyzer(&self, config: AnalyzerConfig) -> WorkspaceAnalyzer {

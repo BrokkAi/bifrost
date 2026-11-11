@@ -148,59 +148,12 @@ fi
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
-require_archive_file brokk-bifrost-semantic-packs models/jdk21-result-use-obligations.json
-require_archive_file brokk-bifrost-semantic-packs embedded/jdk21-result-use-obligations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/jdk21-result-use-obligations/shards/jdk21.reviewed-result-use.deflate
-require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-bytes-declarations.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-bytes-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-bytes-declarations/shards/go.stdlib.bytes.declarations.json
-require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-crypto-x509.json
-require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-crypto-x509-declarations.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509/shards/go.stdlib.crypto-x509.parameter-preconditions.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509-declarations/shards/go.stdlib.crypto-x509.declarations.json
-require_archive_file brokk-bifrost-semantic-packs models/go-concurrency.json
-require_archive_file brokk-bifrost-semantic-packs models/go-concurrency-declarations.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency/shards/go.concurrency.errgroup.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency/shards/go.concurrency.sync.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency-declarations/shards/go.concurrency.errgroup.declarations.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/go-concurrency-declarations/shards/go.concurrency.sync.declarations.deflate
-require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-sync-atomic.json
-require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-sync-atomic-declarations.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic/shards/go.stdlib.sync-atomic.concurrency.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-sync-atomic-declarations/shards/go.stdlib.sync-atomic.declarations.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-declarations/shards/declarations.child-process-exec-sync.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-declarations/shards/declarations.child-process-exec-sync.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-javascript-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-javascript-declarations/shards/declarations.buffer.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-typescript-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-buffer-typescript-declarations/shards/declarations.buffer.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-summaries/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-javascript-summaries/shards/summaries.child-process-exec-sync.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-summaries/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-child-process-typescript-summaries/shards/summaries.child-process-exec-sync.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-javascript/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-javascript/shards/runtime.node-process-values.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-typescript/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/node-runtime-values-typescript/shards/runtime.node-process-values.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-process-inputs/shards/runtime.python-process-inputs.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-declarations/shards/declarations.python-os-commands.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/python-security-sink-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-security-sink-declarations/shards/declarations.python-security-sink-apis.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/shards/declarations.python-stdlib-security-apis.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/python-stdlib-api-declarations/shards/declarations.python-ssl-legacy-api.deflate
-require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/manifest.json
-require_archive_file brokk-bifrost-semantic-packs embedded/python-os-command-summaries/shards/summaries.python-os-system.json
+semantic_pack_archive_files=$(tar -tzf "$(archive_for brokk-bifrost-semantic-packs)" | sed 's@^[^/]*/@@')
+if grep -Eq '^(models|embedded)/' <<<"$semantic_pack_archive_files"; then
+  echo "Semantic-pack archive contains product pack content (#4438):" >&2
+  grep -E '^(models|embedded)/' <<<"$semantic_pack_archive_files" >&2
+  exit 1
+fi
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs
 require_archive_file brokk-bifrost-runtime src/extension/workspace.rs
 
@@ -371,20 +324,23 @@ edition = "2024"
 publish = false
 
 [dependencies]
+brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }
 
 [patch.crates-io]
 $consumer_patches
 EOF
 cat > "$extension_consumer/src/main.rs" <<'EOF'
+use brokk_bifrost_runtime::analyzer::AnalyzerConfig;
 use brokk_bifrost_runtime::extension::{
     ExtensionCompatibility, ExtensionLimits, ExtensionWorkspace, ExtensionWorkspaceOptions,
-    NormalizedRelativePath,
+    NormalizedRelativePath, RetentionBudget,
 };
 
 fn main() {
     let root = std::env::args_os().nth(1).expect("fixture root");
-    let workspace = ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(root)).unwrap();
+    let budget = RetentionBudget::new(AnalyzerConfig::default().retention_budget_bytes());
+    let workspace = ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(root), &budget).unwrap();
     let path = NormalizedRelativePath::new("src/lib.rs").unwrap();
     let _ = ExtensionCompatibility::default();
     let _ = ExtensionLimits::default();

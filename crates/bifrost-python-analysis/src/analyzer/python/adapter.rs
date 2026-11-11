@@ -147,16 +147,8 @@ impl LanguageAdapter for PythonAdapter {
         })
     }
 
-    fn supports_structural_line_data(&self) -> bool {
-        true
-    }
-
-    fn is_structural_line_data(
-        &self,
-        node: tree_sitter::Node<'_>,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> std::ops::ControlFlow<(), bool> {
-        brokk_bifrost_python::adapter::is_string_line_data(node, should_stop)
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_python::adapter::PYTHON_LINE_DATA_KINDS
     }
 
     /// Relative to `brokk-bifrost-python`'s crate root: the `.scm` assets moved
@@ -194,15 +186,6 @@ impl LanguageAdapter for PythonAdapter {
         source: &str,
         tree: &Tree,
     ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
-        #[cfg(any(test, feature = "test-support"))]
-        if super::trial_native_python_selected() {
-            return brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
-                self.project(),
-                file,
-                source,
-                tree,
-            );
-        }
         parse_python_file(self.project(), file, source, tree)
     }
 
@@ -616,6 +599,7 @@ mod published_module_read_tests {
                     python.inner.selected_workspace_snapshots().as_ref(),
                     requests,
                     &brokk_bifrost_core::CancellationToken::default(),
+                    &brokk_bifrost_analysis::analyzer::store::CandidateFqMemo::default(),
                     |_| {},
                 )
                 .unwrap();

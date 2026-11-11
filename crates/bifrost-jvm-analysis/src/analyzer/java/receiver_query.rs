@@ -200,6 +200,14 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                     limit,
                 ));
             }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    site(file, Language::Java, range, &prepared.source, "query", None),
+                    ledger.work(),
+                    reason,
+                ));
+            }
         };
         let query_node = match operation {
             ReceiverQueryOperation::PointsTo => input_node,
@@ -235,6 +243,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                             limit,
                         ));
                     }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            site(
+                                file,
+                                Language::Java,
+                                node_range(input_node),
+                                &prepared.source,
+                                input_node.kind(),
+                                None,
+                            ),
+                            ledger.work(),
+                            reason,
+                        ));
+                    }
                 }
             }
             ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::MemberTargets => {
@@ -257,6 +280,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                     ),
                     ledger.work(),
                     limit,
+                ));
+            }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    site(
+                        file,
+                        Language::Java,
+                        query_range,
+                        &prepared.source,
+                        query_node.kind(),
+                        None,
+                    ),
+                    ledger.work(),
+                    reason,
                 ));
             }
         };
@@ -363,7 +401,23 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                         limit,
                     ));
                 }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        site(
+                            file,
+                            Language::Java,
+                            query_range,
+                            &prepared.source,
+                            query_node.kind(),
+                            member_name,
+                        ),
+                        ledger.work(),
+                        reason,
+                    ));
+                }
             };
+            let definition_diagnostics = outcome.diagnostics.clone();
             let (outcome, truncated) =
                 definition_outcome(outcome, ledger.remaining_budget().max_targets);
             candidates_truncated |= truncated;
@@ -372,7 +426,7 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             if !supports_precise || candidates_truncated {
                 neutral_incomplete(&mut analysis);
             }
-            return Ok(ReceiverQueryReport {
+            let mut report = ReceiverQueryReport {
                 operation,
                 site: site(
                     file,
@@ -387,8 +441,12 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                 work: ledger.work(),
                 candidates_truncated,
                 semantic_unsupported,
+                definition_diagnostics,
+                possible_candidates_suppressed: false,
                 points_to: None,
-            });
+            };
+            report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+            return Ok(report);
         }
 
         let type_resolution = java_type_outcome_at(
@@ -417,6 +475,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                     limit,
                 ));
             }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    site(
+                        file,
+                        Language::Java,
+                        query_range,
+                        &prepared.source,
+                        query_node.kind(),
+                        member_name,
+                    ),
+                    ledger.work(),
+                    reason,
+                ));
+            }
         };
         if type_outcome.types.is_empty() {
             let receiver_owners =
@@ -436,6 +509,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                         ),
                         ledger.work(),
                         limit,
+                    ));
+                }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        site(
+                            file,
+                            Language::Java,
+                            query_range,
+                            &prepared.source,
+                            query_node.kind(),
+                            member_name,
+                        ),
+                        ledger.work(),
+                        reason,
                     ));
                 }
             };
@@ -468,6 +556,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                             limit,
                         ));
                     }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            site(
+                                file,
+                                Language::Java,
+                                query_range,
+                                &prepared.source,
+                                query_node.kind(),
+                                member_name,
+                            ),
+                            ledger.work(),
+                            reason,
+                        ));
+                    }
                 };
             if let Some(context_node) = context_node {
                 let contextual = java_type_outcome_at(
@@ -494,6 +597,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                             ),
                             ledger.work(),
                             limit,
+                        ));
+                    }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            site(
+                                file,
+                                Language::Java,
+                                query_range,
+                                &prepared.source,
+                                query_node.kind(),
+                                member_name,
+                            ),
+                            ledger.work(),
+                            reason,
                         ));
                     }
                 };
@@ -537,6 +655,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                         limit,
                     ));
                 }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        site(
+                            file,
+                            Language::Java,
+                            query_range,
+                            &prepared.source,
+                            query_node.kind(),
+                            member_name,
+                        ),
+                        ledger.work(),
+                        reason,
+                    ));
+                }
             }
         } else {
             None
@@ -571,6 +704,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                     limit,
                 ));
             }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    site(
+                        file,
+                        Language::Java,
+                        query_range,
+                        &prepared.source,
+                        query_node.kind(),
+                        member_name,
+                    ),
+                    ledger.work(),
+                    reason,
+                ));
+            }
         };
         check_cancelled(cancellation)?;
 
@@ -600,6 +748,21 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
                             ),
                             ledger.work(),
                             limit,
+                        ));
+                    }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            site(
+                                file,
+                                Language::Java,
+                                query_range,
+                                &prepared.source,
+                                query_node.kind(),
+                                member_name,
+                            ),
+                            ledger.work(),
+                            reason,
                         ));
                     }
                 };
@@ -635,6 +798,8 @@ impl JavaReceiverQueryService for ReceiverQueryService<'_> {
             work: ledger.work(),
             candidates_truncated,
             semantic_unsupported,
+            definition_diagnostics: Vec::new(),
+            possible_candidates_suppressed: false,
             points_to: if operation == ReceiverQueryOperation::PointsTo {
                 Some(points_to.clone())
             } else {
@@ -809,6 +974,10 @@ fn prepend_java_preprocessing_work<T>(resolution: BoundedResolution<T>) -> Bound
             work: add_preprocessing(work),
             limit,
         },
+        BoundedResolution::Unavailable { work, reason } => BoundedResolution::Unavailable {
+            work: add_preprocessing(work),
+            reason,
+        },
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled {
             work: add_preprocessing(work),
         },
@@ -862,6 +1031,9 @@ fn java_contextual_type_node<'tree>(
             }
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(CompatibilityOutcome::Exceeded(limit));
+            }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(CompatibilityOutcome::Unavailable(reason));
             }
         };
         if parent.kind() == "variable_declarator"
@@ -996,6 +1168,9 @@ fn java_receiver_at_site<'tree>(
                     CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(CompatibilityOutcome::Exceeded(limit));
                     }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(CompatibilityOutcome::Unavailable(reason));
+                    }
                 };
             }
         }
@@ -1023,6 +1198,9 @@ fn java_member_node_at_site<'tree>(
             }
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(CompatibilityOutcome::Exceeded(limit));
+            }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(CompatibilityOutcome::Unavailable(reason));
             }
         };
     }

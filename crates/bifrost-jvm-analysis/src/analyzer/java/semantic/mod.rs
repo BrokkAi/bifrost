@@ -60,7 +60,13 @@ use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
 // #8599: method-reference receiver binding and null-check control flow changed.
 // v40: compose #8599 above master's v38 and the open #8634 v39 identity.
 // v41: qualified this now derives an opaque enclosing receiver instead of sharing inner this.
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v41";
+// #9447: structured formal roles and refusal change semantic payloads.
+// #9183: persist Java's per-procedure footprint branch account.
+// #10881: comparisons over literals and constant int/long locals fold to one arm.
+// #11022 J1: instance and non-void method signature and body footprint claims; above master v45.
+// #11014: resource-specific implicit close selection changes Java semantic artifacts.
+// Merge of #11022 J1 v46 and #11014 v47: both parents' semantic changes are present; v48 exceeds both.
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v48";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -109,6 +115,12 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                 }
                 ProcedureEnumeration::Cancelled { work } => {
                     return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Unknown { work } => {
+                    return Ok(SemanticOutcome::Unknown {
                         partial: None,
                         work,
                     });
@@ -228,6 +240,7 @@ mod control;
 mod inventory;
 mod numeric;
 mod syntax;
+pub(crate) use syntax::declaration_container_kind;
 #[cfg(test)]
 mod tests;
 mod values;
@@ -361,6 +374,7 @@ struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     structural_node_index: &'targets StructuralNodeIndex,
     session: ProcedureLoweringSession<'targets>,
+    return_type: Option<Node<'tree>>,
     expression_values: HashMap<usize, ValueId>,
     constant_index_values: HashMap<Box<str>, ValueId>,
     field_declaration_anchors:
@@ -369,6 +383,11 @@ struct LoweringContext<'tree, 'targets> {
     type_name_roots: HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
     local_type_nodes: HashMap<ValueId, Node<'tree>>,
+    /// Effectively final `int` and `long` locals whose initializer is an
+    /// integer literal, with that value. Such a local holds the value at every
+    /// read, so a condition over these locals and literals can be decided at
+    /// lowering time (see `LoweringContext::constant_truth`).
+    constant_locals: HashMap<ValueId, numeric::JavaNumericLiteral>,
     array_values: HashSet<ValueId>,
     non_null_values: HashSet<ValueId>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
@@ -426,6 +445,101 @@ mod persistence_tests {
     use brokk_bifrost_core::text_utils::compute_line_starts;
     use brokk_bifrost_test_macros::hardwon;
     use std::sync::Arc;
+
+    fn lower_call_control_fixture(source: &str) -> Vec<ProcedureSemanticsParts> {
+        let source: Arc<str> = source.into();
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Java)
+            .file("C.java", source.as_ref())
+            .build();
+        let file = fixture.file("C.java");
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source.as_ref(), None).unwrap();
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::clone(&source)),
+            tree,
+            compute_line_starts(&source),
+            LanguageDialect::for_path(Language::Java, file.rel_path()),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        match JavaSemanticLowerer
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .unwrap()
+        {
+            SemanticOutcome::Complete { value, .. } => value,
+            other => panic!("fixture lowering must complete: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[hardwon("#9550: real Java calls had no adapter admission regression case")]
+    fn call_control_real_direct_call_is_admitted() {
+        let parts = lower_call_control_fixture(
+            "class C { static void f(R x) { g(x); } static void g(R x) {} } class R {}",
+        );
+        let f = parts
+            .iter()
+            .find(|p| p.locator.declaration().last_segment_name() == Some("f"))
+            .unwrap();
+        assert_eq!(
+            f.call_control_coverage.admission,
+            Ok(()),
+            "{:#?}",
+            f.call_control_coverage.branches
+        );
+        assert!(
+            f.call_control_coverage
+                .branches
+                .iter()
+                .any(|b| b.kind == CallControlKind::ExplicitCall
+                    && b.disposition == CallControlDisposition::Represented)
+        );
+    }
+
+    #[test]
+    #[hardwon("#9550: a parameter annotation call was hidden by signature ownership refusal")]
+    fn call_in_parameter_annotation_refuses_scoped_coverage() {
+        let source = "@interface A { int value(); } class C { static void f(@A(value = g()) R x) {} static int g() { return 1; } } class R {}";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let parts = lower_call_control_fixture(source);
+        let f = parts
+            .iter()
+            .find(|p| p.locator.declaration().last_segment_name() == Some("f"))
+            .unwrap();
+        let parameter =
+            brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+                tree.root_node(),
+                "formal_parameter",
+            )
+            .unwrap();
+        let call =
+            brokk_bifrost_core::analyzer::tree_walk::first_named_descendant_of_kind_inclusive(
+                parameter,
+                "method_invocation",
+            )
+            .unwrap();
+        assert!(
+            call.start_byte() >= parameter.start_byte() && call.end_byte() <= parameter.end_byte()
+        );
+        assert!(f.call_control_coverage.admission.is_err());
+    }
 
     #[test]
     #[hardwon("#7369: Java pattern captures and compound writes must retain their row provenance")]

@@ -63,6 +63,85 @@ pub mod shared_support {
             _ => None,
         }
     }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#7573: fixed store reads bypassed the statement cache")]
+    fn fixed_sql_in_native_adapter_store_files_uses_the_statement_cache() {
+        #[derive(Default)]
+        struct DirectFixedSql(Vec<String>);
+        impl<'ast> Visit<'ast> for DirectFixedSql {
+            fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+                if item.attrs.iter().any(|attr| attr.path().is_ident("test")) {
+                    return;
+                }
+                syn::visit::visit_item_fn(self, item);
+            }
+            fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+                if item.attrs.iter().any(|attr| {
+                    attr.path().is_ident("cfg")
+                        && attr
+                            .parse_args::<syn::Path>()
+                            .is_ok_and(|path| path.is_ident("test"))
+                }) {
+                    return;
+                }
+                syn::visit::visit_item_mod(self, item);
+            }
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "query_row" | "prepare" | "execute" | "query_map"
+                ) && let Some(first) = call.args.first()
+                    && (matches!(
+                        first,
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(_),
+                            ..
+                        })
+                    ) || matches!(first, syn::Expr::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident.to_string().chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'))))
+                {
+                    self.0.push(call.method.to_string());
+                }
+                syn::visit::visit_expr_method_call(self, call);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/analyzer/store");
+        let mut files: Vec<_> = walkdir::WalkDir::new(root.join("resolution_operation"))
+            .into_iter()
+            .map(|entry| entry.unwrap().into_path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        files.extend(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    let name = path.file_name().unwrap().to_string_lossy();
+                    path.extension().is_some_and(|ext| ext == "rs")
+                        && ["python_", "go_", "jvm_", "rust_"]
+                            .iter()
+                            .any(|prefix| name.starts_with(prefix))
+                }),
+        );
+        files.sort();
+        // Scans src/analyzer/store/resolution_operation/ and the root store files
+        // prefixed python_, go_, jvm_ or rust_. The C# adapter files (csharp_) and
+        // the other store files are not scanned yet (#8637).
+        // Allowed exceptions are listed here with their reasons. There are none.
+        const ALLOWLIST: &[&str] = &[];
+        let mut failures = Vec::new();
+        for file in files {
+            let mut visitor = DirectFixedSql::default();
+            visitor.visit_file(&syn::parse_file(&std::fs::read_to_string(&file).unwrap()).unwrap());
+            if !visitor.0.is_empty() && !ALLOWLIST.contains(&file.to_str().unwrap()) {
+                failures.push((file, visitor.0));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "fixed SQL bypasses the statement cache: {failures:?}"
+        );
+    }
     impl<'ast> Visit<'ast> for Registry {
         fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
             if expression.mac.path.is_ident("format") {
@@ -225,18 +304,6 @@ pub mod shared_support {
                 crate::analyzer::store::csharp_compilation::SELECTED_CONFIGURATION_MASK_SQL,
             ),
             (
-                "csharp_units::GLOBAL_USING_CANDIDATES",
-                super::super::csharp_units::GLOBAL_USING_CANDIDATES,
-            ),
-            (
-                "csharp_units::GLOBAL_USING_SITES",
-                super::super::csharp_units::GLOBAL_USING_SITES,
-            ),
-            (
-                "csharp_units::GLOBAL_USING_COVERAGE",
-                super::super::csharp_units::GLOBAL_USING_COVERAGE,
-            ),
-            (
                 "csharp_demand::NAMESPACE_ROUTE",
                 super::super::csharp_demand::NAMESPACE_ROUTE,
             ),
@@ -262,6 +329,30 @@ pub mod shared_support {
             ),
             ("imports::POINT", imports::POINT),
             ("imports::ENUMERATE", imports::ENUMERATE),
+            (
+                "python_unit_summaries::LIVE",
+                crate::analyzer::store::python_unit_summaries::LIVE,
+            ),
+            (
+                "python_binding_rows::IMPORT_MODULE_OPERAND_SQL",
+                crate::analyzer::store::python_binding_rows::IMPORT_MODULE_OPERAND_SQL,
+            ),
+            (
+                "python_member_rows::BUILTIN_NAMESPACE_CLOSED_SQL",
+                crate::analyzer::store::python_member_rows::BUILTIN_NAMESPACE_CLOSED_SQL,
+            ),
+            (
+                "python_member_rows::UNIVERSE_REFERENCE_NAME_SQL",
+                crate::analyzer::store::python_member_rows::UNIVERSE_REFERENCE_NAME_SQL,
+            ),
+            (
+                "reverse_nomination::REVERSE_DEFINITION_SITE_SQL",
+                crate::analyzer::store::resolution_operation::reverse_nomination::REVERSE_DEFINITION_SITE_SQL,
+            ),
+            (
+                "rust_crate_derivation::SQL_RUST_CRATE_MEMBER_IDENTITY",
+                crate::analyzer::store::rust_crates::derivation::SQL_RUST_CRATE_MEMBER_IDENTITY,
+            ),
             ("imports::SCOPE_NAMED", imports::SCOPE_NAMED),
             ("imports::AT_SITE", imports::AT_SITE),
             (
@@ -297,6 +388,14 @@ pub mod shared_support {
                 rust_unit_summaries::DEPENDENCY_REEXPORT_WITNESS_SQL,
             ),
             (
+                "rust_copy_absence::RUST_COPY_ABSENCE_SQL",
+                crate::analyzer::store::rust_copy_absence::RUST_COPY_ABSENCE_SQL,
+            ),
+            (
+                "rust_copy_absence::RUST_COPY_ABSENCE_QUESTION_SQL",
+                crate::analyzer::store::rust_copy_absence::RUST_COPY_ABSENCE_QUESTION_SQL,
+            ),
+            (
                 "selected_definition::SELECTED_DEFINITION_BLOB_SQL",
                 selected_definition::SELECTED_DEFINITION_BLOB_SQL,
             ),
@@ -311,6 +410,10 @@ pub mod shared_support {
             (
                 "go_reverse_rows::GO_TARGET_DEFINITION_SEMANTICS_SQL",
                 go_reverse_rows::GO_TARGET_DEFINITION_SEMANTICS_SQL.as_str(),
+            ),
+            (
+                "go_facts::GO_SOURCE_HEADER_SQL",
+                brokk_bifrost_core::analyzer::go_facts::GO_SOURCE_HEADER_SQL,
             ),
             (
                 "rust_reverse_rows::initial_reference_inventory_gap_locators_sql",

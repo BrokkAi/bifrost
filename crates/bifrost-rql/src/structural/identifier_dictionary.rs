@@ -1,7 +1,7 @@
 //! Accepted identifier words for relations that guess at misspellings.
 //!
-//! `js/misspelled-identifier` reports an identifier part one typing slip from
-//! a more frequent part in the same file. A project or its host can name the
+//! `js/misspelled-identifier` reports an identifier part that the active typo
+//! table lists as a known misspelling. A project or its host can name the
 //! parts that are real words in its vocabulary, and the relation never reports
 //! a part the dictionary accepts.
 //!

@@ -112,37 +112,150 @@ pub fn walk_tree_preorder<'tree>(
     }
 }
 
-/// Whether `node` is a literal whose whole subtree is data: its kind is one of
-/// `literal_kinds`, and no node under it is an error, a missing node, or one
-/// of `interpolation_kinds`, which hold executable expressions. The language
-/// supplies the kinds; `should_stop` breaks the walk for cancellation or a
-/// deadline.
-pub fn is_uninterpolated_literal(
-    node: Node<'_>,
-    literal_kinds: &[&str],
-    interpolation_kinds: &[&str],
-    should_stop: &mut dyn FnMut() -> bool,
-) -> std::ops::ControlFlow<(), bool> {
-    use std::ops::ControlFlow;
-    if !literal_kinds.contains(&node.kind()) {
-        return ControlFlow::Continue(false);
+/// One language's grammar tables for the nodes whose bytes are data rather
+/// than code. Source admission excludes such nodes from line-length
+/// accounting, so a long string or numeric table does not refuse an ordinary
+/// file. Every language declares its tables; [`maximal_data_subtrees`] owns
+/// the walk.
+#[derive(Debug, Clone, Copy)]
+pub struct LineDataKinds {
+    /// String, raw string, number and character literals. A literal is data
+    /// when no node under it is an interpolation, an extra (a comment), an
+    /// error or a missing node.
+    pub literals: &'static [&'static str],
+    /// Nodes inside a literal that hold executable expressions.
+    pub interpolations: &'static [&'static str],
+    /// Composite nodes, such as array, tuple and initializer-list literals and
+    /// signed numbers, each with the anonymous tokens it may contain. A
+    /// composite is data when every named child is data and every anonymous
+    /// child is one of its tokens. A comment is not data: a composite that
+    /// holds one is not excluded whole, so the comment's bytes stay counted
+    /// while its data elements are still excluded one by one.
+    pub composites: &'static [(&'static str, &'static [&'static str])],
+}
+
+impl LineDataKinds {
+    /// Every kind the tables name, anonymous tokens included, with whether the
+    /// grammar must know it as a named node.
+    pub fn kinds(&self) -> impl Iterator<Item = (&'static str, bool)> + '_ {
+        let named = self
+            .literals
+            .iter()
+            .chain(self.interpolations)
+            .chain(self.composites.iter().map(|(kind, _)| kind))
+            .map(|kind| (*kind, true));
+        let tokens = self
+            .composites
+            .iter()
+            .flat_map(|(_, tokens)| tokens.iter().map(|token| (*token, false)));
+        named.chain(tokens)
     }
-    let mut result = ControlFlow::Continue(true);
-    walk_tree_preorder(node, true, |current| {
+}
+
+/// A maximal data subtree that [`maximal_data_subtrees`] selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataSubtree {
+    pub range: std::ops::Range<usize>,
+    /// Nodes in the subtree, anonymous nodes included.
+    pub nodes: usize,
+}
+
+/// The maximal data subtrees under `root` that `wanted` selects, in source
+/// order. A node is data by `kinds`; it is selected when `wanted` accepts it,
+/// no ancestor is an error or missing node, and no selected node contains it.
+/// One postorder pass decides every node, so the cost is linear in the tree.
+/// `should_stop` is polled once per node and breaks the walk for cancellation
+/// or a deadline.
+pub fn maximal_data_subtrees(
+    root: Node<'_>,
+    kinds: &LineDataKinds,
+    mut wanted: impl FnMut(Node<'_>) -> bool,
+    should_stop: &mut dyn FnMut() -> bool,
+) -> std::ops::ControlFlow<(), Vec<DataSubtree>> {
+    use std::ops::ControlFlow;
+    struct Frame {
+        /// Selected subtrees recorded before this node was entered.
+        mark: usize,
+        nodes: usize,
+        /// This node is an error or missing node.
+        self_bad: bool,
+        /// This node or a descendant is an error or missing node.
+        bad: bool,
+        /// A descendant is an interpolation or an extra (a comment).
+        interpolated: bool,
+        /// Every named child is data and every anonymous child is a
+        /// token of this node's composite entry.
+        children_data: bool,
+        under_bad: bool,
+        composite_tokens: Option<&'static [&'static str]>,
+    }
+    let enter = |node: Node<'_>, mark: usize, under_bad: bool| Frame {
+        mark,
+        nodes: 1,
+        self_bad: node.is_error() || node.is_missing(),
+        bad: node.is_error() || node.is_missing(),
+        interpolated: false,
+        children_data: true,
+        under_bad,
+        composite_tokens: kinds
+            .composites
+            .iter()
+            .find(|(kind, _)| *kind == node.kind())
+            .map(|(_, tokens)| *tokens),
+    };
+    let mut selected = Vec::new();
+    let mut cursor = root.walk();
+    let mut frames = vec![enter(root, 0, false)];
+    loop {
         if should_stop() {
-            result = ControlFlow::Break(());
-            WalkControl::Break
-        } else if current.is_error()
-            || current.is_missing()
-            || interpolation_kinds.contains(&current.kind())
-        {
-            result = ControlFlow::Continue(false);
-            WalkControl::Break
-        } else {
-            WalkControl::Continue
+            return ControlFlow::Break(());
         }
-    });
-    result
+        if cursor.goto_first_child() {
+            let parent = frames.last().expect("a visited node has a frame");
+            let under_bad = parent.under_bad || parent.self_bad;
+            frames.push(enter(cursor.node(), selected.len(), under_bad));
+            continue;
+        }
+        loop {
+            let node = cursor.node();
+            let frame = frames.pop().expect("a visited node has a frame");
+            let data = !frame.bad
+                && if kinds.literals.contains(&node.kind()) {
+                    !frame.interpolated
+                } else {
+                    frame.composite_tokens.is_some() && frame.children_data
+                };
+            if data && !frame.under_bad && wanted(node) {
+                selected.truncate(frame.mark);
+                selected.push(DataSubtree {
+                    range: node.byte_range(),
+                    nodes: frame.nodes,
+                });
+            }
+            let Some(parent) = frames.last_mut() else {
+                return ControlFlow::Continue(selected);
+            };
+            parent.nodes += frame.nodes;
+            parent.bad |= frame.bad;
+            parent.interpolated |= frame.interpolated
+                || node.is_extra()
+                || kinds.interpolations.contains(&node.kind());
+            parent.children_data &= if node.is_named() {
+                data
+            } else {
+                parent
+                    .composite_tokens
+                    .is_some_and(|tokens| tokens.contains(&node.kind()))
+            };
+            if cursor.goto_next_sibling() {
+                let parent = frames.last().expect("the parent frame is live");
+                let under_bad = parent.under_bad || parent.self_bad;
+                frames.push(enter(cursor.node(), selected.len(), under_bad));
+                break;
+            }
+            assert!(cursor.goto_parent(), "a non-root node has a parent");
+        }
+    }
 }
 
 fn try_walk_tree_preorder<'tree, Error>(
@@ -790,6 +903,16 @@ pub fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) ->
 /// often carries no `name` field, so returning it would defeat declaration-name
 /// resolution.
 pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+    node_for_exact_range_with_step(root, range, || true)
+}
+
+/// Metered exact-span lookup. `None` means either no matching node or that
+/// `scope_step` stopped the walk; the caller retains its own typed stop reason.
+pub fn node_for_exact_range_with_step<'tree>(
+    root: Node<'tree>,
+    range: &Range,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<Node<'tree>> {
     let mut best: Option<Node<'tree>> = None;
     // One cursor for the whole descent. `Node::walk` allocates, and this
     // function is called once per declaration range against the same file, so
@@ -797,6 +920,9 @@ pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<N
     let mut cursor = root.walk();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
             continue;
         }
@@ -806,6 +932,9 @@ pub fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<N
             best = Some(node);
         }
         for child in node.named_children(&mut cursor) {
+            if !scope_step() {
+                return None;
+            }
             // Named siblings are in source order, so once a child starts after
             // the range there is no later child that can contain it. A C++
             // translation unit holds thousands of top-level children and the

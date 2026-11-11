@@ -183,7 +183,7 @@ mod jvm_extraction_tests {
         );
         store
             .conn
-            .execute(|conn| {
+            .execute_fixture(|conn| {
                 conn.execute("DELETE FROM blobs", [])?;
                 let remaining: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM source_scala_declarations",
@@ -258,7 +258,7 @@ mod jvm_extraction_tests {
 
         store
             .conn
-            .execute(|conn| {
+            .execute_fixture(|conn| {
                 conn.execute("DELETE FROM blobs", [])?;
                 let remaining: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM source_scala_declarations",

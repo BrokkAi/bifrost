@@ -15,8 +15,8 @@ use git2::{ObjectType, Oid};
 use crate::analyzer::store::WorkspacePackageFileRow;
 #[cfg(test)]
 #[cfg(not(test))]
-use crate::analyzer::store::resolution_operation::jvm_reverse_rows::{
-    JvmReverseCandidateOutcome, JvmReverseConfirmed,
+use crate::analyzer::store::resolution_operation::nominal_reverse_rows::{
+    NominalReverseCandidateOutcome, NominalReverseConfirmed,
 };
 use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
 

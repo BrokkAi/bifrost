@@ -1059,6 +1059,15 @@ pub fn resolve_js_ts_imported_member_chain(
                 })
                 .collect(),
         ),
+        ReceiverAnalysisOutcome::Incomplete { candidates } => ReceiverAnalysisOutcome::Incomplete {
+            candidates: candidates
+                .into_iter()
+                .map(|declaration| JsTsResolvedImportedMember {
+                    declaration,
+                    endpoint_range: endpoint.range,
+                })
+                .collect(),
+        },
         ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
         ReceiverAnalysisOutcome::Unsupported { reason } => {
             ReceiverAnalysisOutcome::Unsupported { reason }
@@ -1076,9 +1085,10 @@ fn resolve_imported_member_step(
     value_position: bool,
     budget: ReceiverAnalysisBudget,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
-    let (owners, inherited_ambiguity) = match owners {
-        ReceiverAnalysisOutcome::Precise(owners) => (owners, false),
-        ReceiverAnalysisOutcome::Ambiguous(owners) => (owners, true),
+    let (owners, inherited_ambiguity, inherited_incomplete) = match owners {
+        ReceiverAnalysisOutcome::Precise(owners) => (owners, false, false),
+        ReceiverAnalysisOutcome::Ambiguous(owners) => (owners, true, false),
+        ReceiverAnalysisOutcome::Incomplete { candidates } => (candidates, false, true),
         ReceiverAnalysisOutcome::Unknown => return ReceiverAnalysisOutcome::Unknown,
         ReceiverAnalysisOutcome::Unsupported { reason } => {
             return ReceiverAnalysisOutcome::Unsupported { reason };
@@ -1106,6 +1116,18 @@ fn resolve_imported_member_step(
         ReceiverAnalysisOutcome::single_precise_or_ambiguous(candidates, budget)
     });
     let merged = ReceiverAnalysisOutcome::merge_branch_outcomes(branches, budget);
+    if inherited_incomplete {
+        return match merged {
+            ReceiverAnalysisOutcome::Precise(candidates)
+            | ReceiverAnalysisOutcome::Ambiguous(candidates) => {
+                ReceiverAnalysisOutcome::Incomplete { candidates }
+            }
+            ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Incomplete {
+                candidates: Vec::new(),
+            },
+            other => other,
+        };
+    }
     if inherited_ambiguity {
         match merged {
             ReceiverAnalysisOutcome::Precise(values)

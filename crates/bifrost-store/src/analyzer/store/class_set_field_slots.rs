@@ -735,7 +735,7 @@ impl AnalyzerStore {
         self.reject_injected_class_set_field_slot_operation_for_test()?;
         ensure_not_cancelled(cancellation)?;
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tx = conn.transaction()?;
         let row = load_index(&tx, key, cancellation)?;
         ensure_not_cancelled(cancellation)?;
         tx.commit()?;

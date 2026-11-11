@@ -727,7 +727,7 @@ impl DemandImplicitReceiverFrame {
                             .filter_map(|(identity, path)| {
                                 matches!(path.completion(), ResolutionCompletion::Incomplete(found)
                                 if found.iter().any(|reason| matches!(reason,
-                                    ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                                    ResolutionIncompleteReason::UnsupportedSemantic(reason) | ResolutionIncompleteReason::ReceiverSubclassObligation(reason)
                                         if reasons.contains(reason))))
                                 .then_some(*identity)
                             })
@@ -954,7 +954,7 @@ impl DemandImplicitReceiverFrame {
                 evaluation.lexical_paths_at(closed_endpoint(owner.scope_head(), [shape.lookup]))?
             {
                 if matches!(path.completion(), ResolutionCompletion::Incomplete(found)
-                    if found.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::UnsupportedSemantic(reason) if reasons.contains(reason))))
+                    if found.iter().any(|reason| matches!(reason, ResolutionIncompleteReason::UnsupportedSemantic(reason) | ResolutionIncompleteReason::ReceiverSubclassObligation(reason) if reasons.contains(reason))))
                 {
                     branches.push((identity, path, true));
                 }
@@ -1274,7 +1274,7 @@ impl DemandImplicitReceiverFrame {
                     ResolutionCompletion::Complete,
                 )),
             ))
-            .collect::<HashMap<_, _>>();
+            .collect::<AnswerMap>();
             if evaluation
                 .expand_types_in_call_position(
                     &[reference],
@@ -1298,7 +1298,7 @@ impl DemandImplicitReceiverFrame {
                     signature.get(evaluation.session).row().definition() == candidate
                 });
                 let Some(signature) = signature else {
-                    let answers = Arc::clone(&evaluation.member_applicability_answers);
+                    let answers = Rc::clone(&evaluation.member_applicability_answers);
                     let Some(assessment) = evaluation.assess_value_application(
                         candidate,
                         &call,
@@ -1361,7 +1361,7 @@ impl DemandImplicitReceiverFrame {
                     &call,
                     &signature,
                     inventory_complete,
-                    &HashMap::default(),
+                    &AnswerMap::default(),
                     previous_states,
                     &mut completion,
                 );
@@ -1447,11 +1447,19 @@ impl DemandReferenceEvaluationFrame {
                 return Ok(DemandFactEvaluationPoll::Continue);
             }
         }
-        let result =
-            self.implicit
-                .as_mut()
-                .unwrap()
-                .poll(evaluation, previous_states, readiness)?;
+        previous_states.begin_recording();
+        self.answers.begin_recording();
+        let result = self
+            .implicit
+            .as_mut()
+            .unwrap()
+            .poll(evaluation, previous_states, readiness);
+        let mut reads = previous_states.take_recorded();
+        reads.merge(self.answers.take_recorded());
+        evaluation
+            .typed_worklist
+            .add_reads(TypedWorkItem::Reference(reference), reads);
+        let result = result?;
         // A suspended frame has performed no work. Repeated polls must retain
         // its exact endpoints and accounting until the provider admits them.
         if matches!(result, DemandQualifiedPoll::AwaitingDependencies)
@@ -1545,7 +1553,7 @@ impl FactEvaluation<'_, '_> {
 
 // rustc rejects recursive receiver expansion. Real receiver chains are short;
 // eight derived steps bound work even when every step changes generic arguments.
-const MAX_EXPLICIT_RECEIVER_STEPS: usize = 8;
+use crate::analyzer::store::language_support::MAX_EXPLICIT_RECEIVER_STEPS;
 
 /// Ordered selection is independent of how a level obtains its members. Empty
 /// inner levels retain their completion in the first successful outer answer.
@@ -1583,6 +1591,7 @@ struct ExplicitReceiverCursor {
     selection: ReceiverLevelSelection,
     visited: HashSet<(ResolutionTypeRef, SelectedReceiverInstantiation)>,
     steps: usize,
+    initial_reference_depth: u32,
 }
 
 /// The first continuation searches the original frontier as one unit. Subsequent
@@ -1705,6 +1714,7 @@ impl DemandQualifiedFrame {
         readiness: &mut impl FnMut(
             &[OwnedBatchCandidateRequest<'_>],
         ) -> StoreResult<DemandForwardReadiness>,
+        provider: Option<&dyn DemandRootProvider>,
     ) -> StoreResult<DemandQualifiedPoll> {
         use DemandQualifiedPoll::{Continue, Ready};
         loop {
@@ -1714,6 +1724,7 @@ impl DemandQualifiedFrame {
                     evaluation,
                     self.states.as_ref().unwrap_or(previous_states),
                     readiness,
+                    provider,
                 )?;
                 let Ready(Some(answer)) = result else {
                     return Ok(result);
@@ -1744,6 +1755,18 @@ impl DemandQualifiedFrame {
                     if success {
                         let cursor = self.cursor.take().unwrap();
                         let result = self.level.result.take().unwrap();
+                        if self
+                            .template
+                            .routes
+                            .first()
+                            .is_some_and(|route| route.language() == Language::Rust)
+                        {
+                            evaluation.record_rust_receiver_search(
+                                result.answer.targets(),
+                                cursor.steps,
+                                Some(cursor.initial_reference_depth),
+                            );
+                        }
                         self.closed &= result.answer.completion()
                             == &ResolutionCompletion::Complete
                             && cursor.context.completion == ResolutionCompletion::Complete;
@@ -1762,6 +1785,22 @@ impl DemandQualifiedFrame {
                     let ReceiverLevelOrigin::Explicit { frontier } = &self.level.origin else {
                         unreachable!("qualified search has explicit receivers");
                     };
+                    if self
+                        .template
+                        .routes
+                        .first()
+                        .is_some_and(|route| route.language() == Language::Rust)
+                    {
+                        let values = frontier
+                            .iter()
+                            .map(|context| context.value)
+                            .collect::<Vec<_>>();
+                        evaluation.record_rust_step_zero_receiver_search(
+                            reference,
+                            result.answer.targets(),
+                            &values,
+                        );
+                    }
                     for context in frontier {
                         if !result.matched_receivers.contains(&context.value) {
                             self.cursors.push_back(ExplicitReceiverCursor {
@@ -1775,6 +1814,7 @@ impl DemandQualifiedFrame {
                                 ))
                                 .collect(),
                                 steps: 0,
+                                initial_reference_depth: context.value.ty().reference_indirection(),
                             });
                         }
                     }
@@ -1814,13 +1854,22 @@ impl DemandQualifiedFrame {
                 value: cursor.context.value,
                 instantiation: &cursor.context.instantiation,
             };
-            let step = support.selected_receiver_step(
-                request,
-                &mut ReceiverStepReads {
-                    evaluation,
-                    states: self.states.as_ref().unwrap_or(previous_states),
-                },
-            )?;
+            let states = self.states.as_ref().unwrap_or(previous_states);
+            // A receiver continuation may use a substituted state map whose
+            // recorder was consumed by an earlier poll. Capture every read
+            // made by the language hook for the current reference.
+            let record_step = states.recording.borrow().is_none();
+            if record_step {
+                states.begin_recording();
+            }
+            let step = support
+                .selected_receiver_step(request, &mut ReceiverStepReads { evaluation, states });
+            if record_step {
+                evaluation
+                    .typed_worklist
+                    .add_reads(TypedWorkItem::Reference(reference), states.take_recorded());
+            }
+            let step = step?;
             let step = match step {
                 SelectedReceiverStepRead::Pending => return Ok(Ready(None)),
                 SelectedReceiverStepRead::Cancelled => {
@@ -2031,7 +2080,7 @@ impl SelectedReceiverStepSource for ReceiverStepReads<'_, '_, '_> {
         request: &SelectedReceiverStepRequest<'_>,
     ) -> StoreResult<Option<ResolutionCompletion>> {
         let evaluation = &mut self.evaluation;
-        let answers = Arc::clone(&evaluation.member_applicability_answers);
+        let answers = Rc::clone(&evaluation.member_applicability_answers);
         Ok(evaluation
             .impl_subject_selection(
                 owner.owner_frontier(),
@@ -2060,7 +2109,7 @@ impl SelectedReceiverStepSource for ReceiverStepReads<'_, '_, '_> {
             reference,
             definition: target,
         };
-        let loaded = FactEvaluation::ensure_declaration_access_rows(
+        let loaded = crate::analyzer::store::resolution_operation::declaration_access::ensure_declaration_access_rows(
             policy,
             session.typed_source,
             session.resolution_session,
@@ -2099,7 +2148,7 @@ impl SelectedReceiverStepSource for ReceiverStepReads<'_, '_, '_> {
             return self.slot(slot);
         };
         let evaluation = &mut self.evaluation;
-        let answers = Arc::clone(&evaluation.member_applicability_answers);
+        let answers = Rc::clone(&evaluation.member_applicability_answers);
         let Some(selection) = evaluation.impl_subject_selection(
             owner.owner_frontier(),
             request.instantiation.application_slot,
@@ -2138,7 +2187,7 @@ impl SelectedReceiverStepSource for ReceiverStepReads<'_, '_, '_> {
         application: SemanticId,
         nominal: SemanticId,
     ) -> StoreResult<Option<bool>> {
-        let answers = Arc::clone(&self.evaluation.member_applicability_answers);
+        let answers = Rc::clone(&self.evaluation.member_applicability_answers);
         Ok(self
             .evaluation
             .sparse_type_arguments_from_value(application, nominal, &answers, self.states)?

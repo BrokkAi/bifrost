@@ -1,17 +1,133 @@
 //! Group-local composition over catalog rows and selected decoded inputs.
 
 use super::*;
+use crate::analyzer::store::active_models::FamilyRows;
 use crate::analyzer::store::cache_budget::StoreCacheBudget;
 use crate::analyzer::store::model_catalog::semantic_catalog_question;
 use crate::analyzer::store::semantic_composition::{
-    ComposedGroupCacheKey, CompositionDiscoveryCacheKey, CompositionLookup, SearchCandidate,
-    SearchCandidateStream, SearchGroup, SemanticOverlayBuildIdentity,
+    ComposedGroupCacheKey, CompositionDiscoveryCacheKey, CompositionLookup,
+    RequestSourceAnchorsKey, SearchCandidate, SearchCandidateStream, SearchGroup,
+    SemanticOverlayBuildIdentity,
 };
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::{
     CatalogError, statements as questions,
 };
+use brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen;
 use composition::{CompositionGroupKey, RowCompositionReads};
 use rusqlite::named_params;
+
+/// Activation-owner reads remain for overlay construction and eager anchors,
+/// release-bundle verification, and census-proven JVM-free consumers including
+/// C# type-forward boundaries. A JVM question must not use this helper without
+/// review of the #9559 routing plan.
+pub(super) fn activation_owner_question<T>(
+    reads: &RowCompositionReads<'_>,
+    statement: &str,
+    key: impl std::fmt::Debug,
+    answer: Result<T, CatalogError>,
+) -> T {
+    let answer = semantic_catalog_question(statement, key, answer).unwrap_or_else(|open| {
+        panic!("{statement}: unselected overlay reads run on the activation owner, which owns no JVM-family shards (#9559): {open:?}")
+    });
+    if let Some(open) = reads.open_part() {
+        panic!(
+            "{statement}: unselected overlay reads run on the activation owner, which owns no JVM-family shards (#9559): {open:?}"
+        );
+    }
+    answer
+}
+
+/// [`activation_owner_question`] for a whole-activation enumeration.
+pub(super) fn activation_owner_rows<R>(statement: &str, rows: FamilyRows<R>) -> R {
+    if let Some(open) = rows.jvm_open {
+        panic!(
+            "{statement}: unselected overlay reads run on the activation owner, which owns no JVM-family shards (#9559): {open:?}"
+        );
+    }
+    rows.rows
+}
+
+/// The open JVM-family part one request-time lookup saw. A lookup that saw one
+/// answers with possible candidates only and retains nothing it computed.
+#[derive(Default)]
+struct LookupOpen(std::cell::Cell<Option<FamilyOpen>>);
+
+impl LookupOpen {
+    fn note(&self, open: Option<FamilyOpen>) {
+        if self.0.get().is_none() || open.is_some_and(FamilyOpen::is_cancellation) {
+            self.0.set(open);
+        }
+    }
+
+    fn get(&self) -> Option<FamilyOpen> {
+        self.0.get()
+    }
+
+    /// An activation-owner path ends here: see [`activation_owner_question`].
+    fn assert_activation_owner(&self, statement: &str) {
+        if let Some(open) = self.get() {
+            panic!(
+                "{statement}: unselected overlay reads run on the activation owner, which owns no JVM-family shards (#9559): {open:?}"
+            );
+        }
+    }
+}
+
+/// A request-time lookup question. Unscoped reads keep the rows of every owner
+/// that answered and record an open JVM part; a scoped read that is open as a
+/// whole contributes nothing.
+fn lookup_question<T: Default>(
+    open: &LookupOpen,
+    reads: &RowCompositionReads<'_>,
+    statement: &str,
+    key: impl std::fmt::Debug,
+    answer: Result<T, CatalogError>,
+) -> T {
+    let answer = semantic_catalog_question(statement, key, answer);
+    open.note(reads.open_part());
+    answer.unwrap_or_else(|family_open| {
+        open.note(Some(family_open));
+        T::default()
+    })
+}
+
+/// The rows of one request-time lookup and the open part it saw, if any.
+pub(super) type LookupRows = (Vec<Arc<SemanticModelSymbol>>, Option<FamilyOpen>);
+
+#[derive(Debug)]
+pub(super) struct OwnerQualification {
+    pub(super) addresses: HashSet<(String, i64, i64)>,
+    pub(super) guarded: bool,
+    pub(super) name: String,
+}
+
+pub(super) fn reduce_owner_qualification_row(
+    qualifications: &mut HashMap<(String, String), OwnerQualification>,
+    row: &crate::analyzer::store::model_catalog::OwnedCatalogRow<'_>,
+) -> rusqlite::Result<()> {
+    let id: String = row.get("record_id")?;
+    let language: String = row.get("language")?;
+    let address = (
+        row.get("source_db")?,
+        row.get("shard_key")?,
+        row.get("record_key")?,
+    );
+    let guarded: bool = row.get("guarded")?;
+    let name: String = row.get("owner_name")?;
+    let group = qualifications
+        .entry((
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(&language).to_owned(),
+            id,
+        ))
+        .or_insert_with(|| OwnerQualification {
+            addresses: HashSet::default(),
+            guarded: false,
+            name,
+        });
+    group.addresses.insert(address);
+    group.guarded |= guarded;
+    Ok(())
+}
 
 fn attach_search_spelling(
     group: &mut SearchGroup,
@@ -38,18 +154,43 @@ pub(super) struct RowOverlay {
 }
 
 impl RowOverlay {
+    /// The declared type names of `language`, read scoped to it. A JVM-family
+    /// language is answered by its owner, so it is Open when a real request
+    /// owner cannot answer; any other language's rows all belong to the
+    /// activation owner, and reading them never binds a request owner.
     pub(super) fn declaration_type_names(
         &self,
+        language: &str,
     ) -> Result<Vec<(String, String)>, SemanticModelOverlayBuildError> {
-        Ok(selected_question(
-            "ALL_TYPES",
-            "active-set",
-            self.reads().types(questions::ALL_TYPES, &[]),
-        )?
-        .into_iter()
-        .filter(|r| r.record.type_kind != crate::analyzer::semantic_model::TypeKind::Module)
-        .map(|r| (r.shard.manifest.language.clone(), r.record.name.clone()))
-        .collect())
+        let records = if brokk_bifrost_core::analyzer::model::JVM_SEMANTIC_PACK_LANGUAGES
+            .contains(&language)
+        {
+            let reads =
+                RowCompositionReads::new(&self.active, &self.generated, &self.generated_relations);
+            selected_question(
+                "ALL_TYPES",
+                "active-set",
+                reads
+                    .for_language(language)
+                    .types(questions::ALL_TYPES, &[]),
+            )?
+        } else {
+            let reads = RowCompositionReads::activation_only(
+                &self.active,
+                &self.generated,
+                &self.generated_relations,
+            );
+            selected_question(
+                "ALL_TYPES",
+                "active-set",
+                reads.types(questions::ALL_TYPES, &[]),
+            )?
+        };
+        Ok(records
+            .into_iter()
+            .filter(|r| r.record.type_kind != crate::analyzer::semantic_model::TypeKind::Module)
+            .map(|r| (r.shard.manifest.language.clone(), r.record.name.clone()))
+            .collect())
     }
 
     /// These are activation-lifetime originals, not evictable cache entries.
@@ -100,10 +241,16 @@ impl RowOverlay {
             generated_relations,
         };
         if active.shards.iter().any(|shard| shard.decoded.is_none()) {
-            result.anchors = semantic_catalog_question(
+            let reads = RowCompositionReads::activation_only(
+                active,
+                &result.generated,
+                &result.generated_relations,
+            );
+            result.anchors = activation_owner_question(
+                &reads,
                 "SOURCE_TYPES/SOURCE_MEMBERS",
                 active.active_model_set_hash(),
-                result.reads().source_anchors(analyzer),
+                reads.activation_source_anchors(analyzer),
             );
         }
         for symbol in eager_symbols
@@ -159,30 +306,62 @@ impl RowOverlay {
         result
     }
 
-    fn composed_group(&self, key: &CompositionGroupKey) -> composition::ComposedGroup {
+    /// A group composed through its language's owner. A group whose read is
+    /// open as a whole contributes nothing; a partial one is not cached.
+    /// A composed group depends only on its key: `compose_group` scopes its
+    /// reads to the key's language whatever scope the lookup that reached it
+    /// had, so scoped and unscoped lookups share the cached group.
+    fn lookup_group(
+        &self,
+        key: &CompositionGroupKey,
+        open: &LookupOpen,
+    ) -> Option<composition::ComposedGroup> {
+        // Only this group's own anchor part decides here: an open part seen
+        // earlier in the same lookup must not drop a group that reads none.
+        let anchor_open = LookupOpen::default();
+        let anchors = self.anchor_view_scoped(&anchor_open, Some(&key.language));
+        if let Some(part) = anchor_open.get() {
+            open.note(Some(part));
+            return None;
+        }
+        // An open JVM owner has no retention binding, so its key would equal
+        // the key of a request without a request source; never share it.
+        let retention = self.jvm_retention(Some(&key.language));
+        let cache = self.cache.as_ref().filter(|_| retention.is_some());
         let cache_key = ComposedGroupCacheKey {
+            jvm_binding: retention.flatten(),
             build: self.build_identity,
             selection_digest: None,
             group: key.clone(),
         };
-        if let Some(value) = self
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.composed_group(&cache_key))
-        {
-            return (*value).clone();
+        if let Some(value) = cache.and_then(|cache| cache.composed_group(&cache_key)) {
+            return Some((*value).clone());
         }
         // The loader has no cancellation branch: it either returns a complete
         // group or an error. Callers check cancellation before using this answer.
-        let group = Arc::new(semantic_catalog_question(
+        let reads = self.reads();
+        let group = match semantic_catalog_question(
             "GROUP_OWNER_IDS/MEMBER_IDS_BY_OWNERS/OVERLAY_RELATIONS_FROM",
             key,
-            self.reads().compose_group(&self.anchors, key),
-        ));
-        if let Some(cache) = &self.cache {
-            cache.insert_composed_group(cache_key, Arc::clone(&group));
+            reads.compose_group(&anchors, key),
+        ) {
+            Ok(group) => group,
+            Err(family_open) => {
+                open.note(Some(family_open));
+                return None;
+            }
+        };
+        if let Some(part) = reads.open_part() {
+            open.note(Some(part));
+            return Some(group);
         }
-        Arc::unwrap_or_clone(group)
+        if open.get().is_some() {
+            return Some(group);
+        }
+        if let Some(cache) = cache {
+            drop(cache.insert_composed_group(cache_key, group.clone()));
+        }
+        Some(group)
     }
 
     fn selected_reads<'a>(
@@ -243,6 +422,77 @@ impl RowOverlay {
             .collect())
     }
 
+    /// Read one spelling through its exact selected provider before ordinary
+    /// cross-pack composition can suppress colliding package versions.
+    pub(super) fn selected_rust_symbols_named(
+        &self,
+        path: &str,
+        provider: &ModelProvider,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Result<Vec<SemanticModelSymbol>, SemanticModelOverlayBuildError> {
+        if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            return Err(SemanticModelOverlayBuildError::Cancelled);
+        }
+        let open = LookupOpen::default();
+        let rust_realm = Some(brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+            "rust",
+        ));
+        let mut ids = self.candidate_ids(
+            &open,
+            "TYPE_SPELLINGS",
+            questions::TYPE_SPELLINGS,
+            path,
+            named_params! { ":name": path },
+            rust_realm,
+        );
+        if let Some((owner, member)) = selected_rust_member_path(path) {
+            ids.extend(self.candidate_ids(
+                &open,
+                "MEMBERS_QUALIFIED",
+                questions::MEMBERS_QUALIFIED,
+                path,
+                named_params! { ":owner_name": owner, ":member": member },
+                rust_realm,
+            ));
+        }
+        ids.extend(self.candidate_ids(
+            &open,
+            "MEMBER_ALIASES",
+            questions::MEMBER_ALIASES,
+            path,
+            named_params! { ":name": path },
+            rust_realm,
+        ));
+        if open.get().is_some() {
+            return Err(open.get().expect("checked open").into());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let selection = ModelProviderSelection::new([provider.clone()]);
+        let default_cancellation = crate::CancellationToken::default();
+        let cancellation = cancellation.unwrap_or(&default_cancellation);
+        let mut symbols = Vec::new();
+        for id in ids {
+            if cancellation.is_cancelled() {
+                return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            symbols.extend(self.selected_symbols(
+                &ModelSymbolRef {
+                    provider: provider.clone(),
+                    symbol_id: id,
+                },
+                &selection,
+                cancellation,
+            )?);
+        }
+        symbols.retain(|symbol| {
+            symbol.qualified_name == path || symbol.aliases.iter().any(|alias| alias == path)
+        });
+        symbols.sort_by(composition::symbol_source_order);
+        symbols.dedup_by(|a, b| a == b);
+        Ok(symbols)
+    }
+
     /// One selected alias group is the cache unit, including its defining facets.
     pub(super) fn selected_groups(
         &self,
@@ -251,9 +501,16 @@ impl RowOverlay {
         selection: &ModelProviderSelection,
         cancellation: &crate::CancellationToken,
     ) -> Result<Vec<Vec<SemanticModelSymbol>>, SemanticModelOverlayBuildError> {
+        let anchor_open = LookupOpen::default();
+        let anchors = self.anchor_view_scoped(&anchor_open, Some(language));
+        if let Some(open) = anchor_open.get() {
+            return Err(open.into());
+        }
         if cancellation.is_cancelled() {
             return Err(SemanticModelOverlayBuildError::Cancelled);
         }
+        let retention = self.jvm_retention(Some(language));
+        let cache = self.cache.as_ref().filter(|_| retention.is_some());
         let input = self.selected_reads(language, selection, None, cancellation);
         let reads = composition::GroupProjection::new(input.as_ref());
         let selected_lookup = match reference {
@@ -268,22 +525,21 @@ impl RowOverlay {
             _ => return Ok(Vec::new()),
         };
         let lookup = CompositionDiscoveryCacheKey {
+            jvm_binding: retention.flatten(),
             build: self.build_identity,
             selection_digest: Some(selection.digest()),
+            realm: None,
             lookup: selected_lookup,
         };
-        let keys = self
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.composition_discovery(&lookup));
+        let keys = cache.and_then(|cache| cache.composition_discovery(&lookup));
         let keys = match keys {
-            Some(keys) => keys,
+            Some(keys) => crate::retention_budget::BudgetedValue::Retained(keys),
             None => {
                 let symbols = match reference {
                     TypeRef::Declared { id, .. } => selected_question(
                         "TYPES_BY_ID/MEMBERS_BY_ID",
                         reference,
-                        reads.symbols_with_id(&self.anchors, id),
+                        reads.symbols_with_id(&anchors, id),
                     )?,
                     TypeRef::Named { name, .. } => {
                         let records = selected_question(
@@ -297,7 +553,7 @@ impl RowOverlay {
                             symbols.extend(selected_question(
                                 "TYPES_BY_ID",
                                 &record.record.id,
-                                reads.owner_symbols(&self.anchors, &record.record.id),
+                                reads.owner_symbols(&anchors, &record.record.id),
                             )?);
                         }
                         symbols
@@ -311,7 +567,7 @@ impl RowOverlay {
                         selected_question(
                             "TYPES_BY_ID",
                             &owner,
-                            reads.owner_symbols(&self.anchors, &owner),
+                            reads.owner_symbols(&anchors, &owner),
                         )?
                     } else {
                         vec![symbol]
@@ -326,21 +582,20 @@ impl RowOverlay {
                         let owners = selected_question(
                             "GROUP_OWNERS",
                             &seed,
-                            reads.group_owners(&self.anchors, &seed),
+                            reads.group_owners(&anchors, &seed),
                         )?;
                         keys.push(composition::group_key(&owners.iter().collect::<Vec<_>>()));
                     }
                 }
                 keys.sort_unstable();
                 keys.dedup();
-                let keys = Arc::new(keys);
                 if cancellation.is_cancelled() {
                     return Err(SemanticModelOverlayBuildError::Cancelled);
                 }
-                if let Some(cache) = &self.cache {
-                    cache.insert_composition_discovery(lookup, Arc::clone(&keys));
+                match cache {
+                    Some(cache) => cache.insert_composition_discovery(lookup, keys),
+                    None => crate::retention_budget::BudgetedValue::request_only(keys),
                 }
-                keys
             }
         };
         let mut symbols = Vec::new();
@@ -349,22 +604,17 @@ impl RowOverlay {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
             }
             let cache_key = ComposedGroupCacheKey {
+                jvm_binding: self.retention_binding(Some(&key.language)),
                 build: self.build_identity,
                 selection_digest: Some(selection.digest()),
                 group: key.clone(),
             };
-            let cached = self
-                .cache
-                .as_ref()
-                .and_then(|cache| cache.composed_group(&cache_key));
+            let cached = cache.and_then(|cache| cache.composed_group(&cache_key));
             let group = match cached {
-                Some(group) => group,
+                Some(group) => crate::retention_budget::BudgetedValue::Retained(group),
                 None => {
-                    let owners = selected_question(
-                        "GROUP_OWNERS",
-                        key,
-                        reads.group_owners(&self.anchors, key),
-                    )?;
+                    let owners =
+                        selected_question("GROUP_OWNERS", key, reads.group_owners(&anchors, key))?;
                     let mut facets = HashSet::default();
                     let mut groups = Vec::new();
                     // Partition before the shared kernel: both representative and
@@ -391,7 +641,7 @@ impl RowOverlay {
                         let facet_owners = selected_question(
                             "GROUP_OWNERS",
                             &seed,
-                            facet_reads.group_owners(&self.anchors, &seed),
+                            facet_reads.group_owners(&anchors, &seed),
                         )?;
                         let facet_key =
                             composition::group_key(&facet_owners.iter().collect::<Vec<_>>());
@@ -399,7 +649,7 @@ impl RowOverlay {
                             groups.push(selected_question(
                                 "SELECTED_GROUP",
                                 &facet_key,
-                                facet_reads.compose_group(&self.anchors, &facet_key),
+                                facet_reads.compose_group(&anchors, &facet_key),
                             )?);
                         }
                     }
@@ -422,11 +672,10 @@ impl RowOverlay {
                         cancellation,
                     )?;
                     check_selected_cancellation(cancellation)?;
-                    let group = Arc::new(group);
-                    if let Some(cache) = &self.cache {
-                        cache.insert_composed_group(cache_key, Arc::clone(&group));
+                    match cache {
+                        Some(cache) => cache.insert_composed_group(cache_key, group),
+                        None => crate::retention_budget::BudgetedValue::request_only(group),
                     }
-                    group
                 }
             };
             symbols.push(group.symbols.clone());
@@ -444,6 +693,11 @@ impl RowOverlay {
         selection: &ModelProviderSelection,
         cancellation: &crate::CancellationToken,
     ) -> Result<(), SemanticModelOverlayBuildError> {
+        let anchor_open = LookupOpen::default();
+        let anchors = self.anchor_view_scoped(&anchor_open, Some(language));
+        if let Some(open) = anchor_open.get() {
+            return Err(open.into());
+        }
         let hook =
             brokk_bifrost_semantic::analyzer::semantic_model::overlay::model_composition_language(
                 language,
@@ -480,7 +734,7 @@ impl RowOverlay {
                     TypeRef::Declared { id, .. } => selected_question(
                         "GO_EMBEDDED_OWNER_ID",
                         id,
-                        reads.owner_symbols(&self.anchors, id),
+                        reads.owner_symbols(&anchors, id),
                     )?,
                     TypeRef::Named { name, .. } => {
                         let records = selected_question(
@@ -494,7 +748,7 @@ impl RowOverlay {
                             targets.extend(selected_question(
                                 "GO_EMBEDDED_OWNER_ID",
                                 &record.record.id,
-                                reads.owner_symbols(&self.anchors, &record.record.id),
+                                reads.owner_symbols(&anchors, &record.record.id),
                             )?);
                         }
                         targets
@@ -510,7 +764,7 @@ impl RowOverlay {
                     let group = selected_question(
                         "GO_EMBEDDED_GROUP",
                         &key,
-                        reads.group_symbols(&self.anchors, &key),
+                        reads.group_symbols(&anchors, &key),
                     )?;
                     for symbol in group {
                         if seen.insert((ModelProvider::from(&symbol.provenance), symbol.id.clone()))
@@ -532,53 +786,178 @@ impl RowOverlay {
         Ok(())
     }
 
-    fn discovered(&self, lookup: &CompositionLookup) -> Option<Arc<Vec<CompositionGroupKey>>> {
+    fn discovered(
+        &self,
+        lookup: &CompositionLookup,
+        realm: Option<&str>,
+    ) -> Option<crate::retention_budget::Retained<Vec<CompositionGroupKey>>> {
+        // A scoped lookup reads only its family, so its JVM state is its
+        // realm's: a Python lookup never binds the JVM owner to cache.
+        let binding = self.jvm_retention(realm.or(lookup_language(lookup)))?;
         self.cache.as_ref().and_then(|cache| {
             cache.composition_discovery(&CompositionDiscoveryCacheKey {
+                jvm_binding: binding,
                 build: self.build_identity,
                 selection_digest: None,
+                realm: realm.map(str::to_owned),
                 lookup: lookup.clone(),
             })
         })
     }
-    fn retain_discovery(&self, lookup: CompositionLookup, mut groups: Vec<CompositionGroupKey>) {
+    fn retain_discovery(
+        &self,
+        lookup: CompositionLookup,
+        mut groups: Vec<CompositionGroupKey>,
+        realm: Option<&str>,
+    ) {
+        let Some(binding) = self.jvm_retention(realm.or(lookup_language(&lookup))) else {
+            return;
+        };
         groups.sort_unstable();
         groups.dedup();
         if let Some(cache) = &self.cache {
-            cache.insert_composition_discovery(
+            drop(cache.insert_composition_discovery(
                 CompositionDiscoveryCacheKey {
+                    jvm_binding: binding,
                     build: self.build_identity,
                     selection_digest: None,
+                    realm: realm.map(str::to_owned),
                     lookup,
                 },
-                Arc::new(groups),
-            );
+                groups,
+            ));
         }
     }
-    fn owner_group_key(&self, key: &CompositionGroupKey) -> CompositionGroupKey {
+    fn owner_group_key(
+        &self,
+        key: &CompositionGroupKey,
+        open: &LookupOpen,
+        realm: Option<&str>,
+    ) -> CompositionGroupKey {
+        let anchors = self.anchor_view_scoped(open, Some(&key.language));
         let lookup = CompositionLookup::OwnerIdentity(key.clone());
-        if let Some(groups) = self.discovered(&lookup) {
+        if let Some(groups) = self.discovered(&lookup, realm) {
             return groups[0].clone();
         }
-        let owners = semantic_catalog_question(
+        let reads = self.reads_for_realm(realm);
+        let owners = lookup_question(
+            open,
+            &reads,
             "GROUP_OWNERS",
             key,
-            self.reads().group_owners(&self.anchors, key),
+            reads.group_owners(&anchors, key),
         );
+        if owners.is_empty() && open.get().is_some() {
+            return key.clone();
+        }
         let canonical = composition::group_key(&owners.iter().collect::<Vec<_>>());
-        self.retain_discovery(lookup, vec![canonical.clone()]);
+        if open.get().is_none() {
+            self.retain_discovery(lookup, vec![canonical.clone()], realm);
+        }
         canonical
     }
 
+    fn retention_binding(
+        &self,
+        language: Option<&str>,
+    ) -> Option<crate::analyzer::store::model_catalog::ReaderBinding> {
+        if language.is_some_and(|language| {
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(language) != "jvm"
+        }) {
+            return None;
+        }
+        self.active.question_row_owners(None).jvm_binding
+    }
+
+    /// The JVM owner's retention state for a question scoped to `language`
+    /// (None: any language), read once: `None` when the JVM part is open, so
+    /// nothing is cached, otherwise the binding that keys retention. A question
+    /// scoped to a non-JVM language never consults the JVM request owner, so
+    /// it is never open for it and has no binding; binding the owner there
+    /// would record a JVM read the question never makes.
+    fn jvm_retention(
+        &self,
+        language: Option<&str>,
+    ) -> Option<Option<crate::analyzer::store::model_catalog::ReaderBinding>> {
+        if language.is_some_and(|language| {
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(language) != "jvm"
+        }) {
+            return Some(None);
+        }
+        let owners = self.active.question_row_owners(None);
+        owners.jvm_open.is_none().then_some(owners.jvm_binding)
+    }
+
+    fn reads_for_realm<'a>(&'a self, realm: Option<&'a str>) -> RowCompositionReads<'a> {
+        let reads = self.reads();
+        match realm {
+            Some(realm) => reads.for_realm(realm),
+            None => reads,
+        }
+    }
+
     fn reads(&self) -> RowCompositionReads<'_> {
-        RowCompositionReads::new(
-            &self.active,
-            self.active
-                .source_reader()
-                .expect("row-backed active set has its reader"),
-            &self.generated,
-            &self.generated_relations,
-        )
+        RowCompositionReads::new(&self.active, &self.generated, &self.generated_relations)
+    }
+
+    fn anchor_view(&self, open: &LookupOpen) -> locations::SourceAnchorView<'_> {
+        self.anchor_view_scoped(open, None)
+    }
+
+    fn anchor_view_scoped(
+        &self,
+        open: &LookupOpen,
+        language: Option<&str>,
+    ) -> locations::SourceAnchorView<'_> {
+        let request = if !language.is_some_and(|language| {
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(language) != "jvm"
+        }) && self
+            .active
+            .shards
+            .iter()
+            .any(|shard| shard.decoded.is_none() && shard.request_owned())
+        {
+            let owners = self.active.question_row_owners(None);
+            let key = owners.jvm_binding.map(|binding| RequestSourceAnchorsKey {
+                build: self.build_identity,
+                binding,
+            });
+            if let Some(hit) = key.as_ref().and_then(|key| {
+                self.cache
+                    .as_ref()
+                    .and_then(|cache| cache.request_source_anchors(key))
+            }) {
+                Some(crate::retention_budget::BudgetedValue::Retained(hit))
+            } else {
+                let reads = self.reads();
+                let answer = semantic_catalog_question(
+                    "SOURCE_TYPES/SOURCE_MEMBERS",
+                    self.build_identity,
+                    reads.request_source_anchors(),
+                );
+                match answer {
+                    Ok(anchors) => {
+                        debug_assert!(!self.anchors.overlaps(&anchors));
+                        Some(match (key, &self.cache) {
+                            (Some(key), Some(cache)) => {
+                                cache.insert_request_source_anchors(key, anchors)
+                            }
+                            _ => crate::retention_budget::BudgetedValue::request_only(anchors),
+                        })
+                    }
+                    Err(family_open) => {
+                        open.note(Some(family_open));
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        locations::SourceAnchorView {
+            activation: &self.anchors,
+            request,
+        }
     }
 
     pub(super) fn row_language(&self, language: &str) -> bool {
@@ -589,13 +968,22 @@ impl RowOverlay {
     }
 
     pub(super) fn mark_identity_conflicts(&self, symbols: &mut [SemanticModelSymbol]) {
-        let reads = self.reads();
+        let anchors = locations::SourceAnchorView {
+            activation: &self.anchors,
+            request: None,
+        };
+        let reads = RowCompositionReads::activation_only(
+            &self.active,
+            &self.generated,
+            &self.generated_relations,
+        );
         let ids = symbols.iter().map(|s| s.id.clone()).collect::<HashSet<_>>();
         for id in ids {
-            let mut all = semantic_catalog_question(
+            let mut all = activation_owner_question(
+                &reads,
                 "TYPES_BY_ID/MEMBERS_BY_ID",
                 &id,
-                reads.symbols_with_id(&self.anchors, &id),
+                reads.symbols_with_id(&anchors, &id),
             );
             let matches = symbols
                 .iter()
@@ -617,22 +1005,27 @@ impl RowOverlay {
     fn discover_ids(
         &self,
         ids: &[String],
+        open: &LookupOpen,
+        realm: Option<&str>,
     ) -> (HashSet<CompositionGroupKey>, Vec<Arc<SemanticModelSymbol>>) {
-        let reads = self.reads();
+        let anchors = self.anchor_view_scoped(open, realm);
+        let reads = self.reads_for_realm(realm);
         let mut keys = HashSet::default();
         let mut result = Vec::new();
         for id in ids {
             let lookup = CompositionLookup::RecordId(id.clone());
-            if let Some(groups) = self.discovered(&lookup) {
+            if let Some(groups) = self.discovered(&lookup, realm) {
                 keys.extend(groups.iter().cloned());
                 continue;
             }
             let mut id_keys = HashSet::default();
             let mut has_orphan = false;
-            let mut symbols = semantic_catalog_question(
+            let mut symbols = lookup_question(
+                open,
+                &reads,
                 "TYPES_BY_ID/MEMBERS_BY_ID",
                 id,
-                reads.symbols_with_id(&self.anchors, id),
+                reads.symbols_with_id(&anchors, id),
             );
             mark_symbol_identity_conflicts(&mut symbols);
             for mut symbol in symbols
@@ -640,10 +1033,12 @@ impl RowOverlay {
                 .filter(|s| self.row_language(&s.language))
             {
                 let owners = if let Some(owner) = &symbol.owner_id {
-                    semantic_catalog_question(
+                    lookup_question(
+                        open,
+                        &reads,
                         "TYPES_BY_ID",
                         owner,
-                        reads.symbols_with_id(&self.anchors, owner),
+                        reads.symbols_with_id(&anchors, owner),
                     )
                     .into_iter()
                     .filter(|s| s.owner_id.is_none() && s.language == symbol.language)
@@ -662,11 +1057,12 @@ impl RowOverlay {
                         module_namespace: owner.kind == SemanticModelSymbolKind::Module,
                         identity: owner.qualified_name,
                     };
-                    id_keys.insert(self.owner_group_key(&key));
+                    id_keys.insert(self.owner_group_key(&key, open, realm));
                 }
             }
-            if !has_orphan {
-                self.retain_discovery(lookup, id_keys.iter().cloned().collect());
+            // A discovery that saw an open part is incomplete and is not retained.
+            if !has_orphan && open.get().is_none() {
+                self.retain_discovery(lookup, id_keys.iter().cloned().collect(), realm);
             }
             keys.extend(id_keys);
         }
@@ -677,47 +1073,63 @@ impl RowOverlay {
         &self,
         keys: impl IntoIterator<Item = CompositionGroupKey>,
         mut result: Vec<Arc<SemanticModelSymbol>>,
+        open: &LookupOpen,
     ) -> Vec<Arc<SemanticModelSymbol>> {
         for key in keys {
-            result.extend(self.composed_group(&key).symbols.into_iter().map(Arc::new));
+            if let Some(group) = self.lookup_group(&key, open) {
+                result.extend(group.symbols.into_iter().map(Arc::new));
+            }
         }
         result.sort_by(|a, b| composition::symbol_source_order(a, b));
         result
     }
-    fn symbols_for_ids(&self, ids: &[String]) -> Vec<Arc<SemanticModelSymbol>> {
-        let (keys, orphans) = self.discover_ids(ids);
-        self.project_groups(keys, orphans)
+    fn symbols_for_ids(
+        &self,
+        ids: &[String],
+        open: &LookupOpen,
+        realm: Option<&str>,
+    ) -> Vec<Arc<SemanticModelSymbol>> {
+        let (keys, orphans) = self.discover_ids(ids, open, realm);
+        self.project_groups(keys, orphans, open)
     }
     fn symbols_for_lookup(
         &self,
         lookup: CompositionLookup,
-        ids: impl FnOnce() -> Vec<String>,
-    ) -> Vec<Arc<SemanticModelSymbol>> {
-        if let Some(keys) = self.discovered(&lookup) {
-            return self.project_groups(keys.iter().cloned(), Vec::new());
+        ids: impl FnOnce(&LookupOpen) -> Vec<String>,
+        realm: Option<&str>,
+    ) -> LookupRows {
+        let open = LookupOpen::default();
+        if let Some(keys) = self.discovered(&lookup, realm) {
+            let rows = self.project_groups(keys.iter().cloned(), Vec::new(), &open);
+            return (rows, open.get());
         }
-        let (keys, orphans) = self.discover_ids(&ids());
-        if orphans.is_empty() {
-            self.retain_discovery(lookup, keys.iter().cloned().collect());
+        let (keys, orphans) = self.discover_ids(&ids(&open), &open, realm);
+        // A lookup that saw an open part is incomplete and is not retained.
+        if orphans.is_empty() && open.get().is_none() {
+            self.retain_discovery(lookup, keys.iter().cloned().collect(), realm);
         }
-        self.project_groups(keys, orphans)
+        let rows = self.project_groups(keys, orphans, &open);
+        (rows, open.get())
     }
 
     fn candidate_ids(
         &self,
+        open: &LookupOpen,
         statement_name: &str,
         statement: &str,
         key: impl std::fmt::Debug,
-        params: impl rusqlite::Params,
+        params: &[(&str, &dyn rusqlite::ToSql)],
+        realm: Option<&str>,
     ) -> Vec<String> {
-        semantic_catalog_question(
+        let reads = self.reads_for_realm(realm);
+        lookup_question(
+            open,
+            &reads,
             statement_name,
             key,
-            self.reads()
-                .reader
-                .raw_rows(statement, params, &self.active.shards, |row| {
-                    row.get::<_, String>("record_id")
-                }),
+            reads.raw_rows_for_overlay(statement, params, &self.active.shards, |row| {
+                row.get::<_, String>("record_id")
+            }),
         )
         .into_iter()
         .filter(|r| self.row_language(&r.shard.manifest.language))
@@ -725,65 +1137,94 @@ impl RowOverlay {
         .collect()
     }
 
-    pub(super) fn symbols_named(&self, name: &str) -> Vec<Arc<SemanticModelSymbol>> {
-        self.symbols_for_lookup(CompositionLookup::Name(name.to_owned()), || {
-            let mut ids = Vec::new();
-            for (label, sql) in [
-                ("TYPE_SPELLINGS", questions::TYPE_SPELLINGS),
-                ("MEMBER_SPELLINGS", questions::MEMBER_SPELLINGS),
-                ("MEMBER_ALIASES", questions::MEMBER_ALIASES),
-            ] {
-                ids.extend(self.candidate_ids(label, sql, name, named_params! { ":name": name }));
-            }
-            if let Some((owner, member)) =
-                crate::analyzer::semantic::oracle::dispatch::split_owner_member(name)
-            {
-                for (label, sql) in [
-                    ("MEMBERS_QUALIFIED", questions::MEMBERS_QUALIFIED),
-                    (
-                        "MEMBERS_ALIAS_QUALIFIED",
-                        questions::MEMBERS_ALIAS_QUALIFIED,
-                    ),
-                ] {
-                    ids.extend(self.candidate_ids(
-                        label,
-                        sql,
-                        (owner, member),
-                        named_params! { ":owner_name": owner, ":member": member },
-                    ));
-                }
-                ids.extend(self.candidate_ids(
-                    "MEMBERS_BY_OWNER_NAME",
-                    questions::MEMBERS_BY_OWNER_NAME,
-                    (owner, member),
-                    named_params! { ":owner": owner, ":name": member },
-                ));
-            }
-            ids.extend(
-                self.generated
-                    .iter()
-                    .filter(|s| {
-                        s.name == name
-                            || s.qualified_name == name
-                            || s.aliases.iter().any(|a| a == name)
-                    })
-                    .map(|s| s.id.clone()),
-            );
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        })
-        .into_iter()
-        .filter(|s| {
-            s.name == name || s.qualified_name == name || s.aliases.iter().any(|a| a == name)
-        })
-        .collect()
+    pub(super) fn symbols_named(&self, name: &str) -> LookupRows {
+        self.symbols_named_scoped(name, None)
     }
 
-    pub(super) fn members_of(&self, owner: &str) -> Vec<Arc<SemanticModelSymbol>> {
-        self.symbols_for_lookup(CompositionLookup::MembersOf(owner.to_owned()),|| {
-        let mut ids = self.candidate_ids("MEMBERS_BY_OWNERS", questions::MEMBERS_BY_OWNERS, owner,
-            named_params! { ":owner_ids": serde_json::to_string(&[owner]).expect("owner IDs serialize") });
+    pub(super) fn symbols_named_scoped(&self, name: &str, realm: Option<&str>) -> LookupRows {
+        let (rows, open) = self.symbols_for_lookup(
+            CompositionLookup::Name(name.to_owned()),
+            |open| {
+                let mut ids = Vec::new();
+                for (label, sql) in [
+                    ("TYPE_SPELLINGS", questions::TYPE_SPELLINGS),
+                    ("MEMBER_SPELLINGS", questions::MEMBER_SPELLINGS),
+                    ("MEMBER_ALIASES", questions::MEMBER_ALIASES),
+                ] {
+                    ids.extend(self.candidate_ids(
+                        open,
+                        label,
+                        sql,
+                        name,
+                        named_params! { ":name": name },
+                        realm,
+                    ));
+                }
+                // One indexed equality probe per dot boundary. Joining the
+                // boundaries through `json_extract` instead kept SQLite from
+                // seeking the name and owner indexes, so every dotted lookup
+                // scanned the catalog (#10397).
+                for (owner, member) in
+                    crate::analyzer::semantic::oracle::dispatch::owner_member_splits(name)
+                {
+                    for (label, sql) in [
+                        ("MEMBERS_QUALIFIED", questions::MEMBERS_QUALIFIED),
+                        (
+                            "MEMBERS_ALIAS_QUALIFIED",
+                            questions::MEMBERS_ALIAS_QUALIFIED,
+                        ),
+                    ] {
+                        ids.extend(self.candidate_ids(
+                            open,
+                            label,
+                            sql,
+                            (owner, member),
+                            named_params! { ":owner_name": owner, ":member": member },
+                            realm,
+                        ));
+                    }
+                    ids.extend(self.candidate_ids(
+                        open,
+                        "MEMBERS_BY_OWNER_NAME",
+                        questions::MEMBERS_BY_OWNER_NAME,
+                        (owner, member),
+                        named_params! { ":owner": owner, ":name": member },
+                        realm,
+                    ));
+                }
+                ids.extend(
+                    self.generated
+                        .iter()
+                        .filter(|s| {
+                            s.name == name
+                                || s.qualified_name == name
+                                || s.aliases.iter().any(|a| a == name)
+                        })
+                        .map(|s| s.id.clone()),
+                );
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            },
+            realm,
+        );
+        let rows = rows
+            .into_iter()
+            .filter(|s| {
+                s.name == name || s.qualified_name == name || s.aliases.iter().any(|a| a == name)
+            })
+            .collect();
+        (rows, open)
+    }
+
+    pub(super) fn members_of(&self, owner: &str) -> LookupRows {
+        self.members_of_scoped(owner, None)
+    }
+
+    pub(super) fn members_of_scoped(&self, owner: &str, realm: Option<&str>) -> LookupRows {
+        let (rows, open) = self.symbols_for_lookup(CompositionLookup::MembersOf(owner.to_owned()),|open| {
+        let mut ids = self.candidate_ids(open, "MEMBERS_BY_OWNERS", questions::MEMBERS_BY_OWNERS, owner,
+            named_params! { ":owner_ids": serde_json::to_string(&[owner]).expect("owner IDs serialize") }, realm);
         ids.push(owner.to_owned());
         ids.extend(
             self.generated
@@ -794,68 +1235,111 @@ impl RowOverlay {
         ids.sort_unstable();
         ids.dedup();
             ids
-        })
+        }, realm);
+        let rows = rows
             .into_iter()
             .filter(|s| s.owner_id.as_deref() == Some(owner))
-            .collect()
+            .collect();
+        (rows, open)
     }
 
-    pub(super) fn symbols_at_uri(&self, uri: &str) -> Vec<Arc<SemanticModelSymbol>> {
-        self.symbols_for_lookup(CompositionLookup::Uri(uri.to_owned()), || {
-            let mut ids = self
-                .generated
-                .iter()
-                .filter(|s| {
-                    matches!(&s.location,
-            SemanticModelLocation::Model(location) if location.uri == uri)
-                })
-                .map(|s| s.id.clone())
-                .collect::<Vec<_>>();
-            if let Some(id) = crate::analyzer::store::model_provenance::model_uri_record_id(uri) {
-                ids.push(id);
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        })
-        .into_iter()
-        .filter(|s| {
-            matches!(&s.location,
-            SemanticModelLocation::Model(location) if location.uri == uri)
-        })
-        .collect()
-    }
-
-    pub(super) fn symbols_at_authored_path(&self, path: &str) -> Vec<Arc<SemanticModelSymbol>> {
-        self.symbols_for_lookup(CompositionLookup::AuthoredPath(path.to_owned()), || {
-            let mut ids = self.anchors.ids_at_path(path);
-            ids.extend(
-                self.generated
+    pub(super) fn symbols_at_uri(&self, uri: &str) -> LookupRows {
+        let (rows, open) = self.symbols_for_lookup(
+            CompositionLookup::Uri(uri.to_owned()),
+            |_| {
+                let mut ids = self
+                    .generated
                     .iter()
                     .filter(|s| {
                         matches!(&s.location,
-            SemanticModelLocation::Authored(anchor) if anchor.path == path)
+            SemanticModelLocation::Model(location) if location.uri == uri)
                     })
-                    .map(|s| s.id.clone()),
-            );
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        })
-        .into_iter()
-        .filter(|s| {
-            matches!(&s.location,
-            SemanticModelLocation::Authored(anchor) if anchor.path == path)
-        })
-        .collect()
+                    .map(|s| s.id.clone())
+                    .collect::<Vec<_>>();
+                if let Some(id) = crate::analyzer::store::model_provenance::model_uri_record_id(uri)
+                {
+                    ids.push(id);
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            },
+            None,
+        );
+        let rows = rows
+            .into_iter()
+            .filter(|s| {
+                matches!(&s.location,
+            SemanticModelLocation::Model(location) if location.uri == uri)
+            })
+            .collect();
+        (rows, open)
     }
 
-    pub(super) fn symbols_with_id(&self, id: &str) -> Vec<Arc<SemanticModelSymbol>> {
-        self.symbols_for_ids(&[id.to_owned()])
+    pub(super) fn symbols_at_authored_path(&self, path: &str) -> LookupRows {
+        let (rows, open) = self.symbols_for_lookup(
+            CompositionLookup::AuthoredPath(path.to_owned()),
+            |open| {
+                let anchors = self.anchor_view(open);
+                let mut ids = anchors.ids_at_path(path);
+                ids.extend(
+                    self.generated
+                        .iter()
+                        .filter(|s| {
+                            matches!(&s.location,
+            SemanticModelLocation::Authored(anchor) if anchor.path == path)
+                        })
+                        .map(|s| s.id.clone()),
+                );
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            },
+            None,
+        );
+        let rows = rows
+            .into_iter()
+            .filter(|s| {
+                matches!(&s.location,
+            SemanticModelLocation::Authored(anchor) if anchor.path == path)
+            })
+            .collect();
+        (rows, open)
+    }
+
+    pub(super) fn symbols_with_id(&self, id: &str) -> LookupRows {
+        self.symbols_with_id_scoped(id, None)
+    }
+
+    pub(super) fn symbols_with_id_scoped(&self, id: &str, realm: Option<&str>) -> LookupRows {
+        let open = LookupOpen::default();
+        let rows = self
+            .symbols_for_ids(&[id.to_owned()], &open, realm)
             .into_iter()
             .filter(|s| s.id == id || s.semantic_contributors.iter().any(|c| c.record_id == id))
-            .collect()
+            .collect();
+        (rows, open.get())
     }
+}
+
+fn selected_rust_member_path(path: &str) -> Option<(String, String)> {
+    RustQualifiedPath::parse(path).and_then(|path| {
+        path.parent_and_member()
+            .map(|(owner, member)| (owner, member.to_owned()))
+    })
+}
+
+#[cfg(test)]
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10258: selected Rust row lookups reject malformed trailing path segments"
+)]
+fn selected_rust_member_path_rejects_trailing_dot() {
+    assert_eq!(selected_rust_member_path("sqlx.Pool."), None);
+    assert_eq!(
+        selected_rust_member_path("sqlx.Pool.query"),
+        Some(("sqlx.Pool".into(), "query".into()))
+    );
 }
 
 // Full scalar buffer: record/owner/language, physical source/shard/record keys,
@@ -866,9 +1350,10 @@ impl RowOverlay {
     fn candidate_buffer(
         &self,
         cancellation: Option<&crate::CancellationToken>,
-    ) -> Vec<SearchCandidate> {
-        let reads = self.reads();
-        let shards = self.active.shards.iter().filter(|s| s.decoded.is_none()).map(|s| {
+        realm: Option<&str>,
+    ) -> Option<Vec<SearchCandidate>> {
+        let reads = self.reads_for_realm(realm);
+        let shards = self.active.shards.iter().filter(|s| s.decoded.is_none() && realm.is_none_or(|realm| brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.manifest.language) == realm)).map(|s| {
             let identity = s.row_store.expect("row shard has catalog identity");
             let source = match identity.database {
                 crate::analyzer::store::active_models::CatalogShardDatabase::Durable => "durable",
@@ -877,39 +1362,88 @@ impl RowOverlay {
             serde_json::json!({"source_db":source,"shard_key":identity.shard_key,"digest":s.manifest.semantic_sha256})
         }).collect::<Vec<_>>();
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
-            return Vec::new();
+            return None;
         }
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<SearchCandidate> = Vec::new();
         semantic_catalog_question("SEARCH_ORDERED_CANDIDATES", self.active.active_model_set_hash(),
-            reads.reader.visit_scalar_rows(questions::SEARCH_ORDERED_CANDIDATES,
+            reads.visit_owned_rows(questions::SEARCH_ORDERED_CANDIDATES,
                 named_params! { ":owner_names": "[]", ":shards":serde_json::to_string(&shards).expect("shard identities serialize") },
+                cancellation,
                 |row| {
                     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) { return Ok(false); }
-                    candidates.push((row.get("record_id")?,row.get("owner_id")?,row.get("language")?,row.get("source_db")?,row.get("shard_key")?,row.get("record_key")?,row.get("qualified_name")?,row.get("spelling")?,row.get("pack_digest")?,row.get("record_name")?));
+                    candidates.push((row.get("record_id")?,row.get("owner_id")?,row.get("language")?,row.get("source_db")?,row.get("shard_key")?,row.get("record_key")?,row.get("qualified_name")?,row.get("spelling")?,row.get("pack_digest")?,row.get("record_name")?,row.get("row_kind")?));
                     Ok(true)
-                }));
-        candidates
+                })).ok()?;
+        if reads.open_part().is_some() {
+            return None;
+        }
+        let shard_order = self
+            .active
+            .shards
+            .iter()
+            .filter_map(|shard| {
+                let identity = shard.row_store?;
+                let source = match identity.database {
+                    crate::analyzer::store::active_models::CatalogShardDatabase::Durable => {
+                        "durable"
+                    }
+                    crate::analyzer::store::active_models::CatalogShardDatabase::Session => {
+                        "session"
+                    }
+                };
+                Some((
+                    (source, identity.shard_key),
+                    (
+                        shard.manifest.pack_id.as_str(),
+                        shard.descriptor.shard_id.as_str(),
+                        shard.manifest.semantic_sha256.as_str(),
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        candidates.sort_by(|a, b| {
+            let a_order = shard_order
+                .get(&(a.3.as_str(), a.4))
+                .expect("candidate has active shard");
+            let b_order = shard_order
+                .get(&(b.3.as_str(), b.4))
+                .expect("candidate has active shard");
+            (&a.6, &a.0, &a.8, a_order, &a.3, a.4, &a.10, a.5)
+                .cmp(&(&b.6, &b.0, &b.8, b_order, &b.3, b.4, &b.10, b.5))
+        });
+        // Candidate rows deduplicate by table-qualified address and spelling, preserving aliases.
+        let mut seen = HashSet::default();
+        candidates.retain(|row| {
+            seen.insert((row.3.clone(), row.4, row.10.clone(), row.5, row.7.clone()))
+        });
+        Some(candidates)
     }
 
     fn candidate_inputs<'a>(
         &'a self,
         cancellation: Option<&crate::CancellationToken>,
+        realm: Option<&str>,
     ) -> Option<(Vec<SearchCandidate>, Vec<&'a SemanticModelSymbol>)> {
         let has_candidates = self.active.shards.iter().any(|s| {
-            s.decoded.is_none()
+            realm.is_none_or(|realm| {
+                brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.manifest.language)
+                    == realm
+            }) && s.decoded.is_none()
                 && s.descriptor.payload_kind
                     == crate::analyzer::semantic_model::PayloadKind::DeclarationFacts
-        }) || self
-            .generated
-            .iter()
-            .any(|s| self.row_language(&s.language));
+        }) || self.generated.iter().any(|s| {
+            self.row_language(&s.language)
+                && realm.is_none_or(|realm| {
+                    brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.language) == realm
+                })
+        });
         if !has_candidates {
             return Some((Vec::new(), Vec::new()));
         }
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             return None;
         }
-        let candidates = self.candidate_buffer(cancellation);
+        let candidates = self.candidate_buffer(cancellation, realm)?;
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             return None;
         }
@@ -917,7 +1451,13 @@ impl RowOverlay {
             candidates,
             self.generated
                 .iter()
-                .filter(|s| self.row_language(&s.language))
+                .filter(|s| {
+                    self.row_language(&s.language)
+                        && realm.is_none_or(|realm| {
+                            brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.language)
+                                == realm
+                        })
+                })
                 .collect(),
         ))
     }
@@ -938,6 +1478,7 @@ impl RowOverlay {
         candidates: &[SearchCandidate],
         generated: &[&SemanticModelSymbol],
         cancellation: Option<&crate::CancellationToken>,
+        realm: Option<&str>,
     ) -> Option<SearchCandidateStream> {
         struct Owner {
             id: String,
@@ -960,12 +1501,15 @@ impl RowOverlay {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let reads = self.reads_for_realm(realm);
         semantic_catalog_question(
             "SEARCH_TYPES",
             self.active.active_model_set_hash(),
-            self.reads()
-                .reader
-                .visit_scalar_rows(questions::SEARCH_TYPES, [], |row| {
+            reads.visit_owned_rows(
+                questions::SEARCH_TYPE_IDENTITIES,
+                &[],
+                cancellation,
+                |row| {
                     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                         return Ok(false);
                     }
@@ -1002,8 +1546,13 @@ impl RowOverlay {
                         owners[index].identities.insert(spelling);
                     }
                     Ok(true)
-                }),
-        );
+                },
+            ),
+        )
+        .ok()?;
+        if reads.open_part().is_some() {
+            return None;
+        }
         for symbol in generated.iter().copied().filter(|s| s.owner_id.is_none()) {
             let identities = std::iter::once(symbol.qualified_name.clone())
                 .chain(symbol.aliases.iter().cloned())
@@ -1039,20 +1588,31 @@ impl RowOverlay {
             .collect::<HashSet<_>>();
         let owner_ids = owners.iter().map(|o| &o.id).collect::<Vec<_>>();
         let mut owner_qualifications = HashMap::default();
+        let mut qualification_rows = HashMap::default();
+        let reads = self.reads_for_realm(realm);
         semantic_catalog_question(
             "SEARCH_OWNER_QUALIFICATIONS", self.active.active_model_set_hash(),
-            self.reads().reader.visit_scalar_rows(
+            reads.visit_owned_rows(
                 questions::SEARCH_OWNER_QUALIFICATIONS,
                 named_params! { ":ids": serde_json::to_string(&owner_ids).expect("owner IDs serialize") },
+                cancellation,
                 |row| {
                     if cancellation.is_some_and(crate::CancellationToken::is_cancelled) { return Ok(false); }
-                    let ordinary = row.get::<_, usize>("record_count")? == 1 && !row.get::<_, bool>("guarded")?;
-                    let name = if ordinary { Some(row.get::<_,String>("owner_name")?) } else { None };
-                    owner_qualifications.insert(row.get::<_,String>("owner_id")?, name);
+                    reduce_owner_qualification_row(&mut qualification_rows, row)?;
                     Ok(true)
                 },
             ),
-        );
+        ).ok()?;
+        if reads.open_part().is_some() {
+            return None;
+        }
+        for (id, qualification) in qualification_rows {
+            owner_qualifications.insert(
+                id,
+                (qualification.addresses.len() == 1 && !qualification.guarded)
+                    .then_some(qualification.name),
+            );
+        }
         for closure in closures {
             let first = &owners[closure[0]];
             single_contributors.push(
@@ -1144,34 +1704,42 @@ impl RowOverlay {
     fn search_candidates(
         &self,
         cancellation: Option<&crate::CancellationToken>,
-    ) -> Option<Arc<SearchCandidateStream>> {
+        realm: Option<&str>,
+    ) -> Option<crate::retention_budget::BudgetedValue<SearchCandidateStream>> {
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             return None;
         }
+        // A stream belongs to its family and, when JVM rows contribute,
+        // to the request owner binding it read through.
+        let binding = self.jvm_retention(realm)?;
+        let key = crate::analyzer::store::semantic_composition::SearchCandidateKey {
+            realm: realm.map(str::to_owned),
+            build: self.build_identity,
+            jvm_binding: binding,
+        };
         if let Some(value) = self
             .cache
             .as_ref()
-            .and_then(|cache| cache.search_candidates(self.build_identity))
+            .and_then(|cache| cache.search_candidates(key.clone()))
         {
-            return Some(value);
+            return Some(crate::retention_budget::BudgetedValue::Retained(value));
         }
-        let (candidates, generated) = self.candidate_inputs(cancellation)?;
-        let value =
-            Arc::new(self.build_search_candidates(&candidates, &generated, cancellation)?);
-        if let Some(cache) = &self.cache {
-            cache.insert_search_candidates(self.build_identity, Arc::clone(&value));
-        }
-        Some(value)
+        let (candidates, generated) = self.candidate_inputs(cancellation, realm)?;
+        let value = self.build_search_candidates(&candidates, &generated, cancellation, realm)?;
+        Some(match &self.cache {
+            Some(cache) => cache.insert_search_candidates(key, value),
+            None => crate::retention_budget::BudgetedValue::request_only(value),
+        })
     }
 
     fn candidate_groups(
         &self,
         cancellation: Option<&crate::CancellationToken>,
     ) -> (Vec<SearchGroup>, Vec<Arc<SemanticModelSymbol>>, bool) {
-        let Some((candidates, generated)) = self.candidate_inputs(cancellation) else {
+        let Some((candidates, generated)) = self.candidate_inputs(cancellation, None) else {
             return (Vec::new(), Vec::new(), false);
         };
-        self.project_candidate_groups(candidates, generated, cancellation)
+        self.project_candidate_groups(candidates, generated, cancellation, None)
     }
 
     fn project_candidate_groups(
@@ -1179,8 +1747,11 @@ impl RowOverlay {
         candidates: Vec<SearchCandidate>,
         generated: Vec<&SemanticModelSymbol>,
         cancellation: Option<&crate::CancellationToken>,
+        realm: Option<&str>,
     ) -> (Vec<SearchGroup>, Vec<Arc<SemanticModelSymbol>>, bool) {
-        let reads = self.reads();
+        let anchor_open = LookupOpen::default();
+        let anchors = self.anchor_view_scoped(&anchor_open, realm);
+        let reads = self.reads_for_realm(realm);
         let mut keys_by_owner = HashMap::default();
         let mut groups = HashMap::<CompositionGroupKey, SearchGroup>::default();
         let mut orphans = Vec::new();
@@ -1202,10 +1773,12 @@ impl RowOverlay {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 keys_by_owner.entry(owner_key.clone())
             {
-                let mut owners = semantic_catalog_question(
+                let mut owners = lookup_question(
+                    &anchor_open,
+                    &reads,
                     "TYPES_BY_ID",
                     seed,
-                    reads.owner_symbols(&self.anchors, seed),
+                    reads.owner_symbols(&anchors, seed),
                 );
                 owners.extend(
                     self.generated
@@ -1221,11 +1794,16 @@ impl RowOverlay {
                         module_namespace: owner.kind == SemanticModelSymbolKind::Module,
                         identity: owner.qualified_name,
                     };
-                    let owners = semantic_catalog_question(
+                    let owners = lookup_question(
+                        &anchor_open,
+                        &reads,
                         "GROUP_OWNERS",
                         &key,
-                        reads.group_owners(&self.anchors, &key),
+                        reads.group_owners(&anchors, &key),
                     );
+                    if owners.is_empty() && anchor_open.get().is_some() {
+                        return (Vec::new(), Vec::new(), false);
+                    }
                     let key = composition::group_key(&owners.iter().collect::<Vec<_>>());
                     groups.entry(key.clone()).or_insert_with(|| {
                         let identities = owners
@@ -1251,10 +1829,10 @@ impl RowOverlay {
                 entry.insert(keys);
             }
             if keys_by_owner[&owner_key].is_empty() {
-                orphans.extend(self.symbols_for_ids(&[id.to_owned()]));
+                orphans.extend(self.symbols_for_ids(&[id.to_owned()], &anchor_open, realm));
             }
         }
-        for (id, owner, language, _, _, _, qualified_name, spelling, _, _) in &candidates {
+        for (id, owner, language, _, _, _, qualified_name, spelling, _, _, _) in &candidates {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return (Vec::new(), orphans, false);
             }
@@ -1287,12 +1865,20 @@ impl RowOverlay {
         (
             groups,
             orphans,
-            !cancellation.is_some_and(crate::CancellationToken::is_cancelled),
+            !cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                && anchor_open.get().is_none(),
         )
     }
 
-    fn compose_candidate_group(&self, candidates: SearchGroup) -> composition::ComposedGroup {
-        let group = self.composed_group(&candidates.key);
+    fn compose_candidate_group(
+        &self,
+        candidates: SearchGroup,
+        open: &LookupOpen,
+    ) -> Option<composition::ComposedGroup> {
+        let group = self.lookup_group(&candidates.key, open)?;
+        if open.get().is_some() {
+            return Some(group);
+        }
         #[cfg(debug_assertions)]
         {
             let spellings = candidates.spellings().collect::<HashSet<_>>();
@@ -1309,7 +1895,7 @@ impl RowOverlay {
                 group.symbols
             );
         }
-        group
+        Some(group)
     }
 
     /// Enumerate complete groups through the shared store retention budget.
@@ -1323,24 +1909,30 @@ impl RowOverlay {
     ) {
         let (candidates, orphans, complete) = self.candidate_groups(cancellation);
         let mut groups = Vec::new();
+        let open = LookupOpen::default();
         for candidate in candidates {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return (groups, orphans, false);
             }
-            groups.push(self.compose_candidate_group(candidate));
+            if let Some(group) = self.compose_candidate_group(candidate, &open) {
+                groups.push(group);
+            }
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return (groups, orphans, false);
             }
         }
-        (groups, orphans, complete)
+        (groups, orphans, complete && open.get().is_none())
     }
 
     pub(super) fn search_symbols(
         &self,
         patterns: &crate::analyzer::SearchSymbolPatternBatch,
         cancellation: Option<&crate::CancellationToken>,
+        realm: Option<&str>,
     ) -> (Vec<Arc<SemanticModelSymbol>>, bool) {
-        let Some(stream) = self.search_candidates(cancellation) else {
+        let anchor_open = LookupOpen::default();
+        let anchors = self.anchor_view_scoped(&anchor_open, realm);
+        let Some(stream) = self.search_candidates(cancellation, realm) else {
             return (Vec::new(), false);
         };
         let mut single = HashSet::default();
@@ -1390,7 +1982,7 @@ impl RowOverlay {
         // records before hydration, using the same exceptional qualification
         // question as group projection. Only matching IDs and their same-ID
         // conflict contributors are decoded; no group is composed or admitted.
-        let reads = self.reads();
+        let reads = self.reads_for_realm(realm);
         let mut owner_names = HashMap::default();
         let mut single_records = HashSet::default();
         let mut ids = HashSet::default();
@@ -1398,7 +1990,7 @@ impl RowOverlay {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return (Vec::new(), false);
             }
-            let (id, owner, language, _, _, _, _, spelling, digest, name) = candidate;
+            let (id, owner, language, _, _, _, _, spelling, digest, name, _) = candidate;
             if !single.contains(&(
                 language.clone(),
                 owner.as_ref().unwrap_or(id).clone(),
@@ -1407,20 +1999,37 @@ impl RowOverlay {
                 continue;
             }
             let qualified = if let Some(owner) = owner {
-                let qualified_owner = owner_names.entry(owner.clone()).or_insert_with(|| {
-                    stream
-                        .owner_qualifications
-                        .get(owner)
-                        .expect("active owner qualification")
-                        .clone()
-                        .or_else(|| {
-                            semantic_catalog_question(
-                                "TYPES_BY_ID",
-                                owner,
-                                reads.owner_qualification(owner),
-                            )
-                        })
-                });
+                let qualified_owner = owner_names
+                    .entry((
+                        brokk_bifrost_core::analyzer::model::semantic_pack_realm(language)
+                            .to_owned(),
+                        owner.clone(),
+                    ))
+                    .or_insert_with(|| {
+                        stream
+                            .owner_qualifications
+                            .get(&(
+                                brokk_bifrost_core::analyzer::model::semantic_pack_realm(language)
+                                    .to_owned(),
+                                owner.clone(),
+                            ))
+                            .cloned()
+                            .flatten()
+                            .or_else(|| {
+                                lookup_question(
+                                    &anchor_open,
+                                    &reads,
+                                    "TYPES_BY_ID",
+                                    owner,
+                                    reads.owner_qualification(
+                                        brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                                            language,
+                                        ),
+                                        owner,
+                                    ),
+                                )
+                            })
+                    });
                 Some(format!(
                     "{}.{}",
                     qualified_owner.as_deref().unwrap_or(owner),
@@ -1443,10 +2052,12 @@ impl RowOverlay {
         let mut records = if ids.is_empty() {
             Vec::new()
         } else {
-            semantic_catalog_question(
+            lookup_question(
+                &anchor_open,
+                &reads,
                 "TYPES_BY_IDS/MEMBERS_BY_IDS",
                 &ids,
-                reads.search_symbols(&self.anchors, &ids, owner_names),
+                reads.search_symbols(&anchors, &ids, owner_names),
             )
             .into_iter()
             .filter(|symbol| {
@@ -1465,6 +2076,11 @@ impl RowOverlay {
             .collect()
         };
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
+            // Records hydrated without the request anchors carry fallback
+            // locations, so a cancelled prefix is returned only when they read.
+            if anchor_open.get().is_some() {
+                return (Vec::new(), false);
+            }
             return (records, false);
         }
 
@@ -1486,7 +2102,7 @@ impl RowOverlay {
             })
             .collect();
         let (candidates, orphans, mut complete) =
-            self.project_candidate_groups(inputs, generated, cancellation);
+            self.project_candidate_groups(inputs, generated, cancellation, realm);
         records.extend(orphans);
         for candidate in candidates {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
@@ -1502,18 +2118,22 @@ impl RowOverlay {
             )) && candidate
                 .spellings()
                 .any(|spelling| patterns.is_match(&spelling))
+                && let Some(group) = self.compose_candidate_group(candidate, &anchor_open)
             {
-                records.extend(
-                    self.compose_candidate_group(candidate)
-                        .symbols
-                        .into_iter()
-                        .map(Arc::new),
-                );
+                records.extend(group.symbols.into_iter().map(Arc::new));
             }
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 complete = false;
                 break;
             }
+        }
+        // An open part (the source anchors or a group's composition) leaves
+        // the records unverified: their locations or composition may be wrong,
+        // so none is returned. A cancelled search keeps what it found.
+        if anchor_open.get().is_some()
+            || (!complete && !cancellation.is_some_and(crate::CancellationToken::is_cancelled))
+        {
+            return (Vec::new(), false);
         }
         records.sort_by(|a, b| composition::symbol_source_order(a, b));
         records.dedup_by(|a, b| a == b);
@@ -1533,7 +2153,10 @@ impl RowOverlay {
 
     pub(super) fn diagnostics(&self) -> Vec<Arc<SemanticModelCompositionDiagnostic>> {
         let (groups, _, complete) = self.groups(None);
-        debug_assert!(complete);
+        assert!(
+            complete,
+            "whole-overlay diagnostic enumeration is activation-owner only; an open JVM part must not reach it"
+        );
         let mut diagnostics = groups
             .into_iter()
             .flat_map(|g| g.diagnostics)
@@ -1547,34 +2170,57 @@ impl RowOverlay {
     fn rewritten_standalone_relations(
         &self,
         origins: &HashSet<String>,
+        open: &LookupOpen,
+        realm: Option<&str>,
     ) -> Vec<SemanticModelRelation> {
-        let reads = self.reads();
-        let mut relations = semantic_catalog_question(
+        let anchors = self.anchor_view_scoped(open, realm);
+        let reads = self.reads_for_realm(realm);
+        let mut relations = lookup_question(
+            open,
+            &reads,
             "RELATIONS_FROM/TYPES_BY_ID",
             origins,
-            reads.relations_for_origins(&self.anchors, origins),
+            reads.relations_for_origins(&anchors, origins),
         );
         composition::freeze_relation_order(relations.iter_mut());
         let mut replacements = HashMap::default();
         let mut composed_owners = HashSet::default();
         let mut origin_identities = composition::OriginRewrites::default();
-        for id in relations
+        for (family, id) in relations
             .iter()
-            .flat_map(|r| [&r.from, &r.to])
+            .flat_map(|r| {
+                let family = brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                    &r.provenance.activation.matched_evidence.language,
+                );
+                [(family, &r.from), (family, &r.to)]
+            })
             .collect::<HashSet<_>>()
         {
-            let (representative, origins) = semantic_catalog_question(
+            let answer = semantic_catalog_question(
                 "GROUP_OWNERS",
                 id,
-                reads.endpoint_representatives(&self.anchors, id),
+                reads.endpoint_representatives(&anchors, family, id),
             );
+            open.note(reads.open_part());
+            let (representative, origins) = match answer {
+                Ok(answer) => answer,
+                Err(part) => {
+                    open.note(Some(part));
+                    return Vec::new();
+                }
+            };
             for (pack, ids) in origins {
                 origin_identities.entry(pack).or_default().extend(ids);
             }
             if representative.composed {
-                composed_owners.insert(id.clone());
+                composed_owners.insert((family.to_owned(), id.clone()));
             }
-            replacements.extend(representative.replacements);
+            replacements.extend(
+                representative
+                    .replacements
+                    .into_iter()
+                    .map(|(id, replacement)| ((family.to_owned(), id), replacement)),
+            );
         }
         composition::rewrite_relations(
             relations.into_iter().enumerate().collect(),
@@ -1593,30 +2239,40 @@ impl RowOverlay {
         })
     }
 
+    /// Activation-owner enumeration; conformance is its only production caller.
+    /// Request-time relation queries use relations_from and relations_to.
     pub(super) fn relations(&self) -> Vec<Arc<SemanticModelRelation>> {
+        let anchor_open = LookupOpen::default();
+        let anchors = self.anchor_view(&anchor_open);
+        anchor_open.assert_activation_owner("SOURCE_TYPES/SOURCE_MEMBERS");
         let (groups, _, complete) = self.groups(None);
-        debug_assert!(complete);
+        assert!(
+            complete,
+            "whole-overlay relation enumeration is activation-owner only; an open JVM part must not reach it"
+        );
         let mut records = groups
             .into_iter()
             .flat_map(|g| g.relations.into_iter().map(|(_, r)| r))
             .collect::<Vec<_>>();
         let reads = self.reads();
-        let mut origins = semantic_catalog_question(
+        let mut origins = activation_owner_question(
+            &reads,
             "RELATION_ORIGINS",
             (),
-            reads
-                .reader
-                .scalar_question(questions::RELATION_ORIGINS, [], |row| {
-                    row.get::<_, String>(0)
-                }),
+            reads.scalar_question(questions::RELATION_ORIGINS, &[], |row| {
+                row.get::<_, String>(0)
+            }),
         );
         origins.extend(self.generated_relations.iter().map(|r| r.from.clone()));
+        origins.sort();
+        origins.dedup();
         let mut standalone = HashSet::default();
         for id in origins {
-            let owners = semantic_catalog_question(
+            let owners = activation_owner_question(
+                &reads,
                 "TYPES_BY_ID",
                 &id,
-                reads.owner_symbols(&self.anchors, &id),
+                reads.owner_symbols(&anchors, &id),
             );
             if owners.is_empty()
                 && !self
@@ -1627,16 +2283,31 @@ impl RowOverlay {
                 standalone.insert(id);
             }
         }
-        records.extend(self.rewritten_standalone_relations(&standalone));
+        records.extend(self.rewritten_standalone_relations(&standalone, &anchor_open, None));
+        anchor_open.assert_activation_owner("RELATIONS");
         records.retain(|r| self.row_relation(r));
         records.sort_by(composition::relation_source_order);
         records.into_iter().map(Arc::new).collect()
     }
 
-    pub(super) fn relations_from(&self, id: &str) -> Vec<Arc<SemanticModelRelation>> {
-        let reads = self.reads();
+    pub(super) fn relations_from(
+        &self,
+        id: &str,
+    ) -> (Vec<Arc<SemanticModelRelation>>, Option<FamilyOpen>) {
+        self.relations_from_scoped(id, None)
+    }
+
+    pub(super) fn relations_from_scoped(
+        &self,
+        id: &str,
+        realm: Option<&str>,
+    ) -> (Vec<Arc<SemanticModelRelation>>, Option<FamilyOpen>) {
+        let reads = self.reads_for_realm(realm);
+        let open = LookupOpen::default();
         let mut raw_ids = HashSet::from_iter([id.to_owned()]);
-        for symbol in self.symbols_with_id(id) {
+        let (symbols, part) = self.symbols_with_id_scoped(id, realm);
+        open.note(part);
+        for symbol in symbols {
             raw_ids.insert(symbol.id.clone());
             raw_ids.extend(
                 symbol
@@ -1645,16 +2316,32 @@ impl RowOverlay {
                     .map(|p| p.record_id.clone()),
             );
         }
-        self.relations_for_origins(&reads, raw_ids)
+        let records = self
+            .relations_for_origins(&reads, raw_ids, &open, realm)
             .into_iter()
             .filter(|r| r.from == id)
-            .collect()
+            .collect();
+        (records, open.get())
     }
 
-    pub(super) fn relations_to(&self, id: &str) -> Vec<Arc<SemanticModelRelation>> {
-        let reads = self.reads();
+    pub(super) fn relations_to(
+        &self,
+        id: &str,
+    ) -> (Vec<Arc<SemanticModelRelation>>, Option<FamilyOpen>) {
+        self.relations_to_scoped(id, None)
+    }
+
+    pub(super) fn relations_to_scoped(
+        &self,
+        id: &str,
+        realm: Option<&str>,
+    ) -> (Vec<Arc<SemanticModelRelation>>, Option<FamilyOpen>) {
+        let reads = self.reads_for_realm(realm);
+        let open = LookupOpen::default();
         let mut raw_targets = HashSet::from_iter([id.to_owned()]);
-        for symbol in self.symbols_with_id(id) {
+        let (symbols, part) = self.symbols_with_id_scoped(id, realm);
+        open.note(part);
+        for symbol in symbols {
             raw_targets.insert(symbol.id.clone());
             raw_targets.extend(
                 symbol
@@ -1665,7 +2352,7 @@ impl RowOverlay {
         }
         let mut raw_targets = raw_targets.into_iter().collect::<Vec<_>>();
         raw_targets.sort_unstable();
-        let mut origins = semantic_catalog_question("OVERLAY_RELATIONS_TO",id,reads.reader.raw_rows(questions::OVERLAY_RELATIONS_TO,
+        let mut origins = lookup_question(&open,&reads, "OVERLAY_RELATIONS_TO",id,reads.raw_rows_for_overlay(questions::OVERLAY_RELATIONS_TO,
             named_params! { ":raw_targets":serde_json::to_string(&raw_targets).expect("targets serialize") }, &self.active.shards,|row|row.get::<_,String>("from_id")))
             .into_iter().map(|r|Arc::unwrap_or_clone(r.record)).collect::<HashSet<_>>();
         origins.extend(
@@ -1674,31 +2361,48 @@ impl RowOverlay {
                 .filter(|r| raw_targets.contains(&r.to))
                 .map(|r| r.from.clone()),
         );
-        self.relations_for_origins(&reads, origins)
+        let records = self
+            .relations_for_origins(&reads, origins, &open, realm)
             .into_iter()
             .filter(|r| r.to == id)
-            .collect()
+            .collect();
+        (records, open.get())
     }
 
     fn relations_for_origins(
         &self,
         reads: &RowCompositionReads<'_>,
         origins: HashSet<String>,
+        open: &LookupOpen,
+        realm: Option<&str>,
     ) -> Vec<Arc<SemanticModelRelation>> {
+        let anchors = self.anchor_view_scoped(open, realm);
+        // A scoped lookup composes only its family's owners. The row owners
+        // are read through the scoped reads already; a generated owner, or a
+        // group key, of another family would compose through that family's
+        // owner (for a JVM one, binding the JVM request owner).
+        let in_realm = |language: &str| {
+            realm.is_none_or(|realm| {
+                brokk_bifrost_core::analyzer::model::semantic_pack_realm(language) == realm
+            })
+        };
         let mut keys = HashSet::default();
         let mut standalone = HashSet::default();
         for id in &origins {
-            let mut owners = semantic_catalog_question(
+            let mut owners = lookup_question(
+                open,
+                reads,
                 "TYPES_BY_ID",
                 id,
-                reads.owner_symbols(&self.anchors, id),
+                reads.owner_symbols(&anchors, id),
             );
             owners.extend(
                 self.generated
                     .iter()
-                    .filter(|s| s.owner_id.is_none() && &s.id == id)
+                    .filter(|s| s.owner_id.is_none() && &s.id == id && in_realm(&s.language))
                     .cloned(),
             );
+            owners.retain(|owner| in_realm(&owner.language));
             owners.sort_by(composition::symbol_source_order);
             if owners.is_empty() {
                 standalone.insert(id.clone());
@@ -1709,12 +2413,14 @@ impl RowOverlay {
                     module_namespace: owner.kind == SemanticModelSymbolKind::Module,
                     identity: owner.qualified_name.clone(),
                 };
-                keys.insert(self.owner_group_key(&key));
+                keys.insert(self.owner_group_key(&key, open, realm));
             }
         }
-        let mut records = self.rewritten_standalone_relations(&standalone);
+        let mut records = self.rewritten_standalone_relations(&standalone, open, realm);
         for key in keys {
-            let group = self.composed_group(&key);
+            let Some(group) = self.lookup_group(&key, open) else {
+                continue;
+            };
             records.extend(
                 group
                     .relations
@@ -1742,26 +2448,24 @@ impl RowOverlay {
         &self,
         name: &str,
         statement: &str,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
     ) -> Vec<(Arc<ActiveSemanticModelShard>, Arc<T>)> {
-        let rows = semantic_catalog_question(
+        let reads = self.reads();
+        let rows = activation_owner_question(
+            &reads,
             name,
             self.active.active_model_set_hash(),
-            self.reads()
-                .reader
-                .raw_rows(statement, bindings, &self.active.shards, |row| {
-                    let json: String = row.get("record_json")?;
-                    let record: T = serde_json::from_str(&json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            row.as_ref()
-                                .column_index("record_json")
-                                .expect("record column"),
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok((row.get::<_, i64>("record_key")?, Arc::new(record)))
-                }),
+            reads.raw_rows_for_overlay(statement, bindings, &self.active.shards, |row| {
+                let json: String = row.get("record_json")?;
+                let record: T = serde_json::from_str(&json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        row.column_index("record_json").expect("record column"),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok((row.get::<_, i64>("record_key")?, Arc::new(record)))
+            }),
         );
         let mut records = rows
             .into_iter()
@@ -1814,7 +2518,7 @@ impl RowOverlay {
         &self,
         name: &str,
         statement: &str,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
     ) -> Vec<Arc<CollectionFlowContract>> {
         self.contract_records::<crate::analyzer::semantic_model::CollectionFlowFact>(
             name, statement, bindings,
@@ -1873,7 +2577,7 @@ impl RowOverlay {
         &self,
         name: &str,
         statement: &str,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
     ) -> Vec<Arc<DeferredYieldContract>> {
         self.contract_records::<crate::analyzer::semantic_model::DeferredYieldFact>(
             name, statement, bindings,
@@ -1900,8 +2604,8 @@ impl RowOverlay {
     }
 
     pub(super) fn runtime_values(&self) -> Vec<Arc<RuntimeValueContracts>> {
-        self.active
-            .runtime_values()
+        activation_owner_rows("RUNTIME_VALUES", self.active.runtime_values())
+            .into_iter()
             .filter(|(_, shard)| shard.decoded.is_none())
             .map(|(payload, shard)| {
                 Arc::new(RuntimeValueContracts {
@@ -1926,10 +2630,12 @@ impl RowOverlay {
         binding: &str,
         language: &str,
     ) -> Vec<(Arc<RuntimeGlobalExposure>, Arc<SemanticModelProvenance>)> {
-        let records = semantic_catalog_question(
+        let reads = self.reads();
+        let records = activation_owner_question(
+            &reads,
             "RUNTIME_EXPOSURES",
             (binding, language),
-            self.reads().reader.raw_rows(
+            reads.raw_rows_for_overlay(
                 questions::RUNTIME_EXPOSURES,
                 named_params! { ":binding":binding },
                 &self.active.shards,
@@ -1938,9 +2644,7 @@ impl RowOverlay {
                     let exposure: RuntimeGlobalExposure =
                         serde_json::from_str(&json).map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                row.as_ref()
-                                    .column_index("exposure_json")
-                                    .expect("exposure column"),
+                                row.column_index("exposure_json").expect("exposure column"),
                                 rusqlite::types::Type::Text,
                                 Box::new(error),
                             )
@@ -2000,6 +2704,17 @@ fn selected_question<T>(
 ) -> Result<T, SemanticModelOverlayBuildError> {
     match result {
         Err(CatalogError::Cancelled) => Err(SemanticModelOverlayBuildError::Cancelled),
-        result => Ok(semantic_catalog_question(question, key, result)),
+        Err(CatalogError::FamilyOpen(open)) => Err(open.into()),
+        result => semantic_catalog_question(question, key, result).map_err(Into::into),
+    }
+}
+
+/// The language a composition lookup is scoped to, or None for an unscoped one.
+fn lookup_language(lookup: &CompositionLookup) -> Option<&str> {
+    match lookup {
+        CompositionLookup::SelectedId { language, .. }
+        | CompositionLookup::SelectedName { language, .. } => Some(language.as_str()),
+        CompositionLookup::OwnerIdentity(key) => Some(key.language.as_str()),
+        _ => None,
     }
 }

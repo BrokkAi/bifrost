@@ -1,5 +1,44 @@
 use super::*;
 
+#[test]
+fn active_close_match_shard_marks_complete_typestate_finding_without_changing_identity() {
+    let fixture = Fixture::new();
+    let budget = PolicyBudget::default();
+    let exact = protocol_run(
+        &fixture,
+        FakeProtocol {
+            error_transition: false,
+            witness: true,
+        },
+    );
+    assert_eq!(exact.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(exact.findings().len(), 1);
+    let unchanged = crate::evaluator::apply_approximate_family_backstop(
+        exact.clone(),
+        Some(crate::test_support::exact_rust_dependency_snapshot().as_ref()),
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&unchanged).unwrap(),
+        serde_json::to_vec(&exact).unwrap()
+    );
+    let marked = crate::evaluator::apply_approximate_family_backstop(
+        exact.clone(),
+        Some(crate::test_support::close_match_snapshot().as_ref()),
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(marked.completion(), exact.completion());
+    assert_eq!(marked.findings()[0].id(), exact.findings()[0].id());
+    let attribution = marked.findings()[0].model_attribution().unwrap();
+    assert!(attribution.approximate);
+    assert_eq!(
+        attribution.contributors[0].role,
+        crate::ModelAttributionRole::ReadDependency
+    );
+}
+
 struct TruncatedProtocolAdapter;
 
 impl crate::projection::sealed::TypestateAdapter for TruncatedProtocolAdapter {}
@@ -10,6 +49,7 @@ impl crate::evaluator::TypestatePolicyEvaluator for TruncatedProtocolAdapter {
         _policy: &LoadedPolicy,
         _spec: &crate::resolved::ResolvedTypestatePolicySpec,
         _context: &PolicyEvaluationContext<'_>,
+        _subject_scope: brokk_bifrost_rql::structural::search::CodeQueryExecutionScope<'_>,
         _budget: &PolicyBudget,
     ) -> Result<
         crate::projection::TypestateCompilationHashes,
@@ -44,6 +84,7 @@ impl crate::evaluator::TypestatePolicyEvaluator for TruncatedProtocolAdapter {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: crate::finding::PolicyWorkReport::default(),
+            subjects: None,
         }
     }
 }

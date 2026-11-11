@@ -2,6 +2,24 @@ use crate::analyzer::multi_analyzer::WorkspaceBuildContext;
 use crate::analyzer::multi_analyzer::build_language_delegate;
 use brokk_bifrost_core::analyzer::project::AsProject;
 
+/// Admission of an artifact to the shared composed flow search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositionReadiness {
+    Ready,
+    Language,
+    NoRows,
+}
+
+/// Whether the language certifies the caller inventory used by composition.
+pub fn composition_language_supported(
+    key: &crate::analyzer::semantic::SemanticArtifactKey,
+) -> bool {
+    use crate::analyzer::semantic::SemanticLanguage;
+    matches!(key.language(), SemanticLanguage::Standard(language)
+        if crate::analyzer::languages::language_support(language)
+            .is_some_and(|support| support.certifies_caller_inventory()))
+}
+
 use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
 use crate::analyzer::semantic_model::DependencyDiscoveryOutcome;
 use crate::analyzer::semantic_model::DependencyPackLimits;
@@ -16,9 +34,10 @@ use crate::analyzer::semantic_model::SemanticModelActivationRequest;
 use crate::analyzer::semantic_model::SemanticModelRuntimeOutcome;
 use crate::analyzer::semantic_model::SemanticPackCatalog;
 use crate::analyzer::semantic_model::SubprocessPolicy;
-use crate::analyzer::semantic_model::acquire_active_semantic_models_with_runtime_artifacts;
+use crate::analyzer::semantic_model::acquire_active_semantic_models_with_inputs;
 use crate::analyzer::semantic_model::prepare_installed_dependency_packs;
 use crate::analyzer::semantic_model::runtime::ApproximateSemanticModelExpectation;
+use crate::analyzer::semantic_model::{ActivationInputs, RustSelectedCargoGraph};
 
 use crate::analyzer::store::StoreError;
 
@@ -69,6 +88,7 @@ pub struct SharedAnalyzerCache {
 }
 
 impl SharedAnalyzerCache {
+    #[cfg(any(test, feature = "test-support"))]
     /// Open the persisted cache serving `repository_root`.
     ///
     /// Opening is strict. A request that analyzes an immutable revision reads
@@ -89,6 +109,17 @@ impl SharedAnalyzerCache {
         repository_root: &Path,
         cancellation: &crate::CancellationToken,
     ) -> Result<Self, StoreError> {
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            AnalyzerConfig::default().retention_budget_bytes(),
+        );
+        Self::open_with_budget(repository_root, cancellation, &budget)
+    }
+
+    pub fn open_with_budget(
+        repository_root: &Path,
+        cancellation: &crate::CancellationToken,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
         // Opening the cache is the first place a budgeted immutable request
         // touches the filesystem, and on a loaded box it can be where the
         // budget goes; name it so the host does not fall back to "executing
@@ -101,7 +132,7 @@ impl SharedAnalyzerCache {
             )));
         }
         let db_path = crate::analyzer::store::analyzer_db_path(repository_root);
-        let store = crate::analyzer::store::AnalyzerStore::open_persistent(&db_path).map_err(
+        let store = crate::analyzer::store::AnalyzerStore::open_persistent_with_config(&db_path, &Default::default(), budget).map_err(
             |error| {
                 error.context(format!(
                     "opening the shared analyzer cache at {} for immutable revision analysis; this cache is derived state, so remove {} and retry to rebuild it, or set BIFROST_CACHE_ROOT to relocate it off a read-only checkout",
@@ -118,6 +149,10 @@ impl SharedAnalyzerCache {
 
     fn store(&self) -> Arc<crate::analyzer::store::AnalyzerStore> {
         Arc::clone(&self.store)
+    }
+
+    pub fn retention_budget(&self) -> &brokk_bifrost_core::retention_budget::RetentionBudget {
+        self.store.retention_budget()
     }
 
     /// Publish what the request that opened this cache is doing with it,
@@ -191,16 +226,150 @@ impl Drop for WorkspaceProjectionLease {
 }
 
 /// A language context reads configuration from its selected SQL revision.
-/// Source reads and listing ownership remain with the caller's project. No
-/// configuration collection is retained in Rust, and a missing selected input
+/// Source reads and listing ownership remain with the caller's project. Rust
+/// naming retains selected Cargo manifests, and a missing selected input
 /// never falls back to a file that happens to remain on disk.
 pub(crate) struct SelectedConfigurationProject {
     project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot,
     project: Arc<dyn Project>,
     language: Language,
+    source: Arc<dyn ConfigurationSource>,
+    naming_source: Option<StoredManifestSource>,
+    publication: Option<SelectedConfigurationPublication>,
+}
+
+struct SelectedConfigurationPublication {
     store: Arc<crate::analyzer::store::AnalyzerStore>,
     snapshot: crate::analyzer::store::WorkspaceSnapshotId,
     _projection_lease: Option<Arc<WorkspaceProjectionLease>>,
+}
+
+trait ConfigurationSource: Send + Sync {
+    fn lists_path(&self, _path: &str) -> bool {
+        false
+    }
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+    fn bytes(&self, path: &str) -> std::io::Result<Option<Vec<u8>>>;
+    fn bytes_with_conn(
+        &self,
+        _conn: &rusqlite::Connection,
+        path: &str,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        self.bytes(path)
+    }
+}
+
+/// The build's configuration capture, indexed by relative path once so each
+/// naming probe is a lookup rather than a scan of every captured input.
+struct CapturedConfigurationSource {
+    inputs: Arc<Vec<crate::analyzer::store::WorkspaceConfigurationInput>>,
+    present: HashMap<String, usize>,
+    source_paths: std::collections::HashSet<String>,
+}
+
+impl CapturedConfigurationSource {
+    fn new(
+        inputs: Arc<Vec<crate::analyzer::store::WorkspaceConfigurationInput>>,
+        files: &[ProjectFile],
+    ) -> Self {
+        let present = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.file_present)
+            .map(|(index, input)| (input.relative_path().to_string(), index))
+            .collect();
+        Self {
+            inputs,
+            present,
+            source_paths: files
+                .iter()
+                .map(crate::path_utils::rel_path_string)
+                .collect(),
+        }
+    }
+}
+
+impl ConfigurationSource for CapturedConfigurationSource {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.source_paths)
+            + self.source_paths.capacity() * (std::mem::size_of::<String>() + 1)
+            + self
+                .source_paths
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+    }
+    fn lists_path(&self, path: &str) -> bool {
+        self.source_paths.contains(path) || self.present.contains_key(path)
+    }
+    fn bytes(&self, path: &str) -> std::io::Result<Option<Vec<u8>>> {
+        Ok(self
+            .present
+            .get(path)
+            .map(|&index| self.inputs[index].source_bytes().to_vec()))
+    }
+}
+
+struct StoredManifestSource {
+    manifests: std::io::Result<HashMap<String, Vec<u8>>>,
+    target_roots: std::io::Result<std::collections::HashSet<String>>,
+}
+impl ConfigurationSource for StoredManifestSource {
+    fn lists_path(&self, path: &str) -> bool {
+        self.target_roots
+            .as_ref()
+            .is_ok_and(|roots| roots.contains(path))
+    }
+    fn retained_bytes(&self) -> usize {
+        self.target_roots.as_ref().map_or(0, |roots| {
+            std::mem::size_of_val(roots)
+                + roots.capacity() * (std::mem::size_of::<String>() + 1)
+                + roots.iter().map(String::capacity).sum::<usize>()
+        }) + self.manifests.as_ref().map_or(0, |manifests| {
+            std::mem::size_of_val(manifests)
+                + manifests.capacity() * (std::mem::size_of::<(String, Vec<u8>)>() + 1)
+                + manifests
+                    .iter()
+                    .map(|(path, bytes)| path.capacity() + bytes.capacity())
+                    .sum::<usize>()
+        })
+    }
+
+    fn bytes(&self, path: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.target_roots
+            .as_ref()
+            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
+        self.manifests
+            .as_ref()
+            .map(|manifests| manifests.get(path).cloned())
+            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    }
+}
+
+struct StoredConfigurationSource {
+    store: Arc<crate::analyzer::store::AnalyzerStore>,
+    snapshot: crate::analyzer::store::WorkspaceSnapshotId,
+}
+impl ConfigurationSource for StoredConfigurationSource {
+    fn bytes(&self, path: &str) -> std::io::Result<Option<Vec<u8>>> {
+        self.store
+            .selected_configuration_source(&self.snapshot, path)
+            .map_err(std::io::Error::other)
+    }
+    fn bytes_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        path: &str,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        crate::analyzer::store::AnalyzerStore::selected_configuration_source_with_conn(
+            conn,
+            &self.snapshot,
+            path,
+        )
+        .map_err(std::io::Error::other)
+    }
 }
 
 impl SelectedConfigurationProject {
@@ -211,13 +380,44 @@ impl SelectedConfigurationProject {
         snapshot: crate::analyzer::store::WorkspaceSnapshotId,
         projection_lease: Option<Arc<WorkspaceProjectionLease>>,
     ) -> Self {
+        let naming_source = (language == Language::Rust).then(|| StoredManifestSource {
+            target_roots: store
+                .selected_rust_target_roots(&snapshot)
+                .map_err(std::io::Error::other),
+            manifests: store
+                .selected_cargo_manifests(&snapshot)
+                .map_err(std::io::Error::other),
+        });
         Self {
             project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
             project,
             language,
-            store,
-            snapshot,
-            _projection_lease: projection_lease,
+            source: Arc::new(StoredConfigurationSource {
+                store: Arc::clone(&store),
+                snapshot: snapshot.clone(),
+            }),
+            naming_source,
+            publication: Some(SelectedConfigurationPublication {
+                store,
+                snapshot,
+                _projection_lease: projection_lease,
+            }),
+        }
+    }
+
+    pub(crate) fn captured(
+        project: Arc<dyn Project>,
+        language: Language,
+        inputs: Arc<Vec<crate::analyzer::store::WorkspaceConfigurationInput>>,
+        files: &[ProjectFile],
+    ) -> Self {
+        Self {
+            project_reads: brokk_bifrost_core::analyzer::project_reads::ProjectReadSlot::default(),
+            project,
+            language,
+            source: Arc::new(CapturedConfigurationSource::new(inputs, files)),
+            naming_source: None,
+            publication: None,
         }
     }
 
@@ -226,16 +426,23 @@ impl SelectedConfigurationProject {
     }
 
     fn configuration_source(&self, file: &ProjectFile) -> std::io::Result<Option<Vec<u8>>> {
-        self.store
-            .selected_configuration_source(
-                &self.snapshot,
-                &crate::path_utils::rel_path_string(file),
-            )
-            .map_err(std::io::Error::other)
+        self.source.bytes(&crate::path_utils::rel_path_string(file))
     }
 }
 
 impl Project for SelectedConfigurationProject {
+    fn has_exact_directory_entry(&self, file: &ProjectFile) -> std::io::Result<bool> {
+        self.project.has_exact_directory_entry(file)
+    }
+
+    fn update_cached_listing_for_resolved_path(&self, file: &ProjectFile) -> bool {
+        self.project.update_cached_listing_for_resolved_path(file)
+    }
+
+    fn directory_entries(&self, parent: &Path) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.project.directory_entries(parent)
+    }
+
     fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -256,14 +463,21 @@ impl Project for SelectedConfigurationProject {
         true
     }
     fn selected_module_name(&self, file: &ProjectFile) -> std::io::Result<Option<String>> {
+        let Some(publication) = &self.publication else {
+            return self.project.selected_module_name(file);
+        };
         if !crate::analyzer::store::store_language_support(self.language)
             .expect("selected language has store support")
             .publishes_own_module_file_anchors()
         {
             return self.project.selected_module_name(file);
         }
-        self.store
-            .selected_module_name(&self.snapshot, &crate::path_utils::rel_path_string(file))
+        publication
+            .store
+            .selected_module_name(
+                &publication.snapshot,
+                &crate::path_utils::rel_path_string(file),
+            )
             .map_err(std::io::Error::other)
     }
     fn selected_module_name_with_conn(
@@ -271,6 +485,9 @@ impl Project for SelectedConfigurationProject {
         conn: &rusqlite::Connection,
         file: &ProjectFile,
     ) -> std::io::Result<Option<String>> {
+        let Some(publication) = &self.publication else {
+            return self.project.selected_module_name_with_conn(conn, file);
+        };
         if !crate::analyzer::store::store_language_support(self.language)
             .expect("selected language has store support")
             .publishes_own_module_file_anchors()
@@ -279,10 +496,31 @@ impl Project for SelectedConfigurationProject {
         }
         crate::analyzer::store::AnalyzerStore::selected_module_name_with_conn(
             conn,
-            &self.snapshot,
+            &publication.snapshot,
             &crate::path_utils::rel_path_string(file),
         )
         .map_err(std::io::Error::other)
+    }
+    fn selected_configuration_lists_path(&self, path: &Path) -> bool {
+        let source: &dyn ConfigurationSource = self
+            .naming_source
+            .as_ref()
+            .map_or(self.source.as_ref(), |source| source);
+        source.lists_path(&brokk_bifrost_core::path_utils::workspace_relative_slash_path(path))
+    }
+    fn selected_configuration_retained_bytes(&self) -> usize {
+        self.naming_source.as_ref().map_or_else(
+            || self.source.retained_bytes(),
+            ConfigurationSource::retained_bytes,
+        )
+    }
+
+    fn selected_configuration_bytes(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        let source: &dyn ConfigurationSource = self
+            .naming_source
+            .as_ref()
+            .map_or(self.source.as_ref(), |source| source);
+        source.bytes(&brokk_bifrost_core::path_utils::workspace_relative_slash_path(path))
     }
     fn configuration_source_with_conn(
         &self,
@@ -292,15 +530,11 @@ impl Project for SelectedConfigurationProject {
         if !self.is_configuration(path) {
             return self.project.configuration_source_with_conn(conn, path);
         }
-        let file = ProjectFile::new(self.root(), path);
-        let source =
-            crate::analyzer::store::AnalyzerStore::selected_configuration_source_with_conn(
+        self.source
+            .bytes_with_conn(
                 conn,
-                &self.snapshot,
-                &crate::path_utils::rel_path_string(&file),
-            )
-            .map_err(std::io::Error::other)?;
-        source
+                &brokk_bifrost_core::path_utils::workspace_relative_slash_path(path),
+            )?
             .map(brokk_bifrost_core::analyzer::project::decode_source_bytes)
             .transpose()
     }
@@ -328,6 +562,41 @@ impl Project for SelectedConfigurationProject {
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
         self.project.all_files_shared()
+    }
+    fn cached_omissions_if_available(
+        &self,
+    ) -> std::io::Result<
+        Option<std::sync::Arc<Vec<brokk_bifrost_core::analyzer::project::WorkspaceFileOmission>>>,
+    > {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        self.project.cached_omissions_if_available()
+    }
+    fn cached_listing_if_available(
+        &self,
+    ) -> std::io::Result<Option<brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>>
+    {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        self.project.cached_listing_if_available()
+    }
+    fn cached_analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> std::io::Result<Option<BTreeSet<ProjectFile>>> {
+        let _project_read = brokk_bifrost_core::analyzer::project_reads::listing_read(self);
+        self.project.cached_analyzable_files_from(files, language)
+    }
+    fn all_files_with_omissions(
+        &self,
+    ) -> std::io::Result<brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        self.project.all_files_with_omissions()
     }
     fn workspace_file_listing_count(&self) -> usize {
         self.project.workspace_file_listing_count()
@@ -380,6 +649,10 @@ impl Project for SelectedConfigurationProject {
     fn invalidate_cached_file_listing(&self) {
         self.project.invalidate_cached_file_listing();
     }
+    fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        self.project.revalidate_symlink_omissions(changed);
+    }
+
     fn update_cached_listing_for_path(&self, path: &Path) -> bool {
         self.project.update_cached_listing_for_path(path)
     }
@@ -444,11 +717,14 @@ impl Project for SelectedConfigurationProject {
                 if !self.is_configuration(file.rel_path()) {
                     self.project.read_file_snapshot(file)
                 } else {
-                    self.read_source(file).map(|source| {
-                        brokk_bifrost_core::analyzer::project::ProjectFileSnapshot::disk(
-                            source.into_bytes(),
-                        )
-                    })
+                    self.configuration_source(file)?
+                        .map(brokk_bifrost_core::analyzer::project::ProjectFileSnapshot::disk)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "absent selected configuration",
+                            )
+                        })
                 }
             },
             |snapshot| Some(snapshot.oid()),
@@ -512,8 +788,13 @@ impl Project for SelectedConfigurationProject {
 }
 
 pub struct EmptyAnalyzer {
+    pending_updates: BTreeSet<ProjectFile>,
+    update_error: Option<StoreError>,
     project: Arc<dyn Project>,
     build_context: Option<Arc<WorkspaceBuildContext>>,
+    /// A storeless workspace has no owner's budget, so its runtime caches
+    /// use one that keeps nothing.
+    retain_nothing: brokk_bifrost_core::retention_budget::RetentionBudget,
     project_reads: super::tree_sitter_analyzer::ProjectReadRegistry,
     // Fixed snapshot value for persisted C# receipt verification tests.
     #[cfg(test)]
@@ -523,6 +804,8 @@ impl Clone for EmptyAnalyzer {
     fn clone(&self) -> Self {
         let mut clone = Self::new(Arc::clone(&self.project));
         clone.build_context = self.build_context.clone();
+        clone.pending_updates = self.pending_updates.clone();
+        clone.update_error = self.update_error.clone();
         #[cfg(test)]
         {
             clone.csharp_parse_variant_for_test = self.csharp_parse_variant_for_test;
@@ -535,9 +818,12 @@ impl EmptyAnalyzer {
         let project = super::project_read_facade::with_project_read_slot(project);
         let project_reads = super::tree_sitter_analyzer::ProjectReadRegistry::new(&project);
         Self {
+            pending_updates: BTreeSet::new(),
+            update_error: None,
             project,
             project_reads,
             build_context: None,
+            retain_nothing: brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
             #[cfg(test)]
             csharp_parse_variant_for_test: brokk_bifrost_core::gitblob::ParseVariant::Empty,
         }
@@ -558,6 +844,8 @@ impl EmptyAnalyzer {
     }
     fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut analyzer = Self::new(Arc::clone(&project));
+        analyzer.pending_updates = self.pending_updates.clone();
+        analyzer.update_error = self.update_error.clone();
         analyzer.build_context = self
             .build_context
             .as_ref()
@@ -566,8 +854,11 @@ impl EmptyAnalyzer {
     }
     pub(crate) fn clone_for_read_attribution(&self) -> Self {
         Self {
+            pending_updates: self.pending_updates.clone(),
+            update_error: self.update_error.clone(),
             project: Arc::clone(&self.project),
             build_context: self.build_context.clone(),
+            retain_nothing: self.retain_nothing.clone(),
             project_reads: self.project_reads.clone(),
             #[cfg(test)]
             csharp_parse_variant_for_test: self.csharp_parse_variant_for_test,
@@ -670,6 +961,9 @@ impl IAnalyzer for EmptyAnalyzer {
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        if let Some(error) = &self.update_error {
+            context.record_store_error(error.clone());
+        }
         self.project_reads.begin_query(context);
     }
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
@@ -688,6 +982,12 @@ impl IAnalyzer for EmptyAnalyzer {
     fn record_unattributed_reads(&self, count: usize) {
         self.project_reads.record_unattributed_reads(count);
     }
+    fn refuse_read_reuse(&self) {
+        super::i_analyzer::record_reuse_refusal(
+            || self.project_reads.read_ledger_attached(),
+            || self.project_reads.contexts(),
+        );
+    }
     fn records_query_reads(&self) -> bool {
         true
     }
@@ -703,9 +1003,10 @@ impl IAnalyzer for EmptyAnalyzer {
         super::i_analyzer::current_thread_read_ledger()
     }
 
-    fn update(
+    fn update_with_listing(
         &self,
         _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
+        _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Self
     where
         Self: Sized,
@@ -746,6 +1047,44 @@ pub enum WorkspaceAnalyzer {
     Multi(Box<MultiAnalyzer>),
 }
 
+/// Hash the identities supplied by the active provider registry. The ordered
+/// input also lets a regression test simulate one binary's adapter bump.
+#[doc(hidden)]
+pub fn policy_lowering_identity_from_adapters(
+    adapters: impl IntoIterator<
+        Item = (
+            Language,
+            crate::analyzer::semantic::service::SemanticAdapterIdentity,
+            Option<crate::analyzer::semantic::AdapterSemanticsVersion>,
+        ),
+    >,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    use crate::analyzer::semantic::ids::LengthDelimitedDigest;
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-policy-active-lowering:v1");
+    digest.push(crate::analyzer::semantic::SemanticIrVersion::current().as_bytes());
+    for (language, identity, type_flow) in adapters {
+        digest.push(language.config_label().as_bytes());
+        digest.push(identity.adapter.name().as_bytes());
+        digest.push(identity.adapter.fingerprint().as_bytes());
+        digest.push(identity.configuration.as_bytes());
+        digest.push(identity.dependencies.as_bytes());
+        digest.push(
+            crate::analyzer::store::semantic_ir::semantic_ir_producer_epoch(&identity).as_bytes(),
+        );
+        // A presence marker keeps the field sequence fixed per language, so
+        // adding or removing a type-flow adapter always changes the digest.
+        match type_flow {
+            Some(version) => {
+                digest.push(b"type-flow:some");
+                digest.push(version.name().as_bytes());
+                digest.push(version.fingerprint().as_bytes());
+            }
+            None => digest.push(b"type-flow:none"),
+        }
+    }
+    digest.finish()
+}
+
 /// Caller-owned state needed to activate explicitly configured dependency packs.
 /// Constructing a workspace never opens a semantic-pack catalog or discovers an
 /// ecosystem; hosts must opt in by supplying this context.
@@ -758,6 +1097,16 @@ pub struct DependencyPackWorkspaceContext<'a> {
     pub cancellation: &'a crate::CancellationToken,
 }
 
+type DependencyPackDiscoveryResult = (
+    &'static dyn DependencyResolver,
+    DependencyPackLimits,
+    DependencyDiscoveryOutcome,
+    std::sync::Arc<[crate::analyzer::read_ledger::ReadKey]>,
+    crate::analyzer::semantic::ids::StableDigest,
+    crate::analyzer::dependency_support::ExternalDiscoveryReads,
+    Option<RustSelectedCargoGraph>,
+);
+
 pub type PythonSemanticModelWorkspaceContext<'a> = DependencyPackWorkspaceContext<'a>;
 
 #[derive(Debug)]
@@ -768,7 +1117,7 @@ pub struct PythonSemanticModelActivationOutcome {
 }
 
 /// One dependency ecosystem whose exact local evidence a host can activate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DependencyPackEcosystem {
     Jvm,
     DotNet,
@@ -1018,6 +1367,29 @@ fn python_runtime_publication(
 }
 
 impl WorkspaceAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_pending_update_paths(&self) -> &BTreeSet<ProjectFile> {
+        match self {
+            Self::Multi(analyzer) => &analyzer.pending_updates,
+            Self::Empty(analyzer) => &analyzer.pending_updates,
+        }
+    }
+
+    pub(crate) fn retention_budget(
+        &self,
+    ) -> &brokk_bifrost_core::retention_budget::RetentionBudget {
+        if let Some(caches) = self.analyzer().snapshot_caches() {
+            caches.retention_budget()
+        } else if let Some(store) = self.store() {
+            store.retention_budget()
+        } else {
+            match self {
+                Self::Empty(empty) => &empty.retain_nothing,
+                _ => panic!("a workspace with analyzers has a store and its budget"),
+            }
+        }
+    }
+
     fn from_updated_multi(analyzer: MultiAnalyzer) -> Self {
         if analyzer.delegates().is_empty()
             && let Some(build_context) = analyzer.workspace_build_context()
@@ -1043,26 +1415,62 @@ impl WorkspaceAnalyzer {
         .resolve_workspace_dependencies(self, config, limits, cancellation)
     }
 
+    pub fn store_captured_dependency_discovery(
+        &self,
+        ecosystem: DependencyPackEcosystem,
+        discovery: crate::analyzer::semantic_model::CapturedDependencyDiscovery,
+    ) {
+        self.analyzer()
+            .snapshot_caches()
+            .expect("updated snapshot has caches")
+            .store_captured_dependency_discovery(ecosystem, discovery);
+    }
+
+    fn take_captured_dependency_discovery(
+        &self,
+        ecosystem: DependencyPackEcosystem,
+    ) -> Option<crate::analyzer::semantic_model::CapturedDependencyDiscovery> {
+        self.analyzer()
+            .snapshot_caches()
+            .and_then(|caches| caches.take_captured_dependency_discovery(ecosystem))
+    }
+
     fn discover_dependency_pack_ecosystem(
         &self,
         ecosystem: DependencyPackEcosystem,
         config: &AnalyzerConfig,
         context: &DependencyPackWorkspaceContext<'_>,
-    ) -> (
-        &'static dyn DependencyResolver,
-        DependencyPackLimits,
-        DependencyDiscoveryOutcome,
-    ) {
+    ) -> DependencyPackDiscoveryResult {
         let resolver = ecosystem.resolver();
         let mut limits = context.limits;
         resolver.adjust_limits(config, &mut limits);
-        let discovery = {
-            let _scope = crate::profiling::scope_with(|| {
-                format!("semantic_pack.discover[{}]", ecosystem.label())
+        let discovery = self
+            .take_captured_dependency_discovery(ecosystem)
+            .unwrap_or_else(|| {
+                let _scope = crate::profiling::scope_with(|| {
+                    format!("semantic_pack.discover[{}]", ecosystem.label())
+                });
+                crate::analyzer::semantic_model::capture_dependency_discovery(
+                    self.analyzer(),
+                    || {
+                        self.resolve_dependency_discovery(
+                            ecosystem,
+                            config,
+                            &limits,
+                            context.cancellation,
+                        )
+                    },
+                )
             });
-            self.resolve_dependency_discovery(ecosystem, config, &limits, context.cancellation)
-        };
-        (resolver, limits, discovery)
+        (
+            resolver,
+            limits,
+            discovery.outcome,
+            discovery.project_read_keys,
+            discovery.project_read_identity,
+            discovery.external_reads,
+            discovery.rust_cargo_graph,
+        )
     }
 
     /// Discover, prepare, and publish exact local dependency packs as one
@@ -1097,8 +1505,18 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: DependencyPackWorkspaceContext<'_>,
     ) -> DependencyPackActivationOutcome {
+        self.activate_dependency_packs_with_inputs(config, ecosystems, context, None)
+    }
+
+    pub(crate) fn activate_dependency_packs_with_inputs(
+        &self,
+        config: &AnalyzerConfig,
+        ecosystems: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+        inputs: Option<&ActivationInputs>,
+    ) -> DependencyPackActivationOutcome {
         let mut outcomes = Vec::with_capacity(ecosystems.len());
-        let mut activation = context.activation.clone();
+        let mut activation = self.dependency_pack_activation_inputs(ecosystems, &context, inputs);
         let mut publication_evidence = Vec::with_capacity(ecosystems.len());
         let mut cancelled = false;
 
@@ -1109,13 +1527,25 @@ impl WorkspaceAnalyzer {
         // separates discovery, which walks the workspace, from preparation,
         // which reads and generates packs.
         for ecosystem in ecosystems.iter().copied() {
-            let (resolver, limits, discovery) =
-                self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
-            activation.approximate_standard_libraries.extend(
+            let (
+                resolver,
+                limits,
+                discovery,
+                discovery_read_keys,
+                discovery_read_identity,
+                external_reads,
+                rust_cargo_graph,
+            ) = self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+            if ecosystem == DependencyPackEcosystem::Cargo {
+                activation.rust_cargo_graph = rust_cargo_graph;
+            }
+            activation.request.approximate_standard_libraries.extend(
                 discovery
                     .standard_library_pack_expectations()
                     .filter(|expectation| expectation.approximate)
                     .map(|expectation| ApproximateSemanticModelExpectation {
+                        toolchain: (expectation.language == Language::Rust)
+                            .then(|| "rust".to_owned()),
                         language: expectation.language.config_label().to_owned(),
                         ecosystem: ecosystem.label().to_owned(),
                         pack_id: expectation.pack_id.to_owned(),
@@ -1157,11 +1587,14 @@ impl WorkspaceAnalyzer {
             }
             if preparation.complete || !preparation.evidence.is_empty() {
                 activation
+                    .request
                     .evidence
                     .extend(preparation.evidence.iter().cloned());
                 publication_evidence.push((
                     ecosystem.languages().to_vec().into_boxed_slice(),
-                    DependencyDiscoveryEvidence::from_outcome(&discovery),
+                    DependencyDiscoveryEvidence::from_outcome(&discovery)
+                        .with_project_reads(discovery_read_keys, discovery_read_identity)
+                        .with_external_reads(external_reads.keys, external_reads.complete),
                 ));
             }
             outcomes.push(DependencyPackEcosystemOutcome {
@@ -1171,7 +1604,7 @@ impl WorkspaceAnalyzer {
             });
         }
 
-        self.finalize_dependency_pack_activation(
+        let outcome = self.finalize_dependency_pack_activation(
             config,
             activation,
             publication_evidence,
@@ -1179,7 +1612,11 @@ impl WorkspaceAnalyzer {
             cancelled,
             ecosystems.is_empty(),
             &context,
-        )
+        );
+        if !cancelled && let Some(caches) = self.analyzer().snapshot_caches() {
+            caches.record_activated_dependency_ecosystems(ecosystems);
+        }
+        outcome
     }
 
     /// The installed-pack stage of [`Self::activate_dependency_packs`]: run
@@ -1201,20 +1638,42 @@ impl WorkspaceAnalyzer {
         ecosystems: &[DependencyPackEcosystem],
         context: DependencyPackWorkspaceContext<'_>,
     ) -> InstalledDependencyPackActivationOutcome {
+        self.activate_installed_dependency_packs_with_inputs(config, ecosystems, context, None)
+    }
+
+    pub(crate) fn activate_installed_dependency_packs_with_inputs(
+        &self,
+        config: &AnalyzerConfig,
+        ecosystems: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+        inputs: Option<&ActivationInputs>,
+    ) -> InstalledDependencyPackActivationOutcome {
         let mut outcomes = Vec::with_capacity(ecosystems.len());
-        let mut activation = context.activation.clone();
+        let mut activation = self.dependency_pack_activation_inputs(ecosystems, &context, inputs);
         let mut publication_evidence = Vec::with_capacity(ecosystems.len());
         let mut pending = Vec::new();
         let mut cancelled = false;
 
         for ecosystem in ecosystems.iter().copied() {
-            let (resolver, limits, discovery) =
-                self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
-            activation.approximate_standard_libraries.extend(
+            let (
+                resolver,
+                limits,
+                discovery,
+                discovery_read_keys,
+                discovery_read_identity,
+                external_reads,
+                rust_cargo_graph,
+            ) = self.discover_dependency_pack_ecosystem(ecosystem, config, &context);
+            if ecosystem == DependencyPackEcosystem::Cargo {
+                activation.rust_cargo_graph = rust_cargo_graph;
+            }
+            activation.request.approximate_standard_libraries.extend(
                 discovery
                     .standard_library_pack_expectations()
                     .filter(|expectation| expectation.approximate)
                     .map(|expectation| ApproximateSemanticModelExpectation {
+                        toolchain: (expectation.language == Language::Rust)
+                            .then(|| "rust".to_owned()),
                         language: expectation.language.config_label().to_owned(),
                         ecosystem: ecosystem.label().to_owned(),
                         pack_id: expectation.pack_id.to_owned(),
@@ -1262,11 +1721,14 @@ impl WorkspaceAnalyzer {
             }));
             if preparation.outcome.complete || !preparation.outcome.evidence.is_empty() {
                 activation
+                    .request
                     .evidence
                     .extend(preparation.outcome.evidence.iter().cloned());
                 publication_evidence.push((
                     ecosystem.languages().to_vec().into_boxed_slice(),
-                    DependencyDiscoveryEvidence::from_outcome(&discovery),
+                    DependencyDiscoveryEvidence::from_outcome(&discovery)
+                        .with_project_reads(discovery_read_keys, discovery_read_identity)
+                        .with_external_reads(external_reads.keys, external_reads.complete),
                 ));
             }
             outcomes.push(DependencyPackEcosystemOutcome {
@@ -1285,7 +1747,29 @@ impl WorkspaceAnalyzer {
             ecosystems.is_empty(),
             &context,
         );
+        if !cancelled && let Some(caches) = self.analyzer().snapshot_caches() {
+            caches.record_activated_dependency_ecosystems(ecosystems);
+        }
         InstalledDependencyPackActivationOutcome { outcome, pending }
+    }
+
+    fn dependency_pack_activation_inputs(
+        &self,
+        ecosystems: &[DependencyPackEcosystem],
+        context: &DependencyPackWorkspaceContext<'_>,
+        inputs: Option<&ActivationInputs>,
+    ) -> ActivationInputs {
+        let mut activation = inputs.cloned().unwrap_or_else(|| ActivationInputs {
+            request: context.activation.clone(),
+            rust_cargo_graph: self
+                .carried_activation_inputs()
+                .and_then(|carried| carried.rust_cargo_graph),
+        });
+        activation.request = context.activation.clone();
+        if ecosystems.contains(&DependencyPackEcosystem::Cargo) {
+            activation.rust_cargo_graph = None;
+        }
+        activation
     }
 
     // These are the distinct values consumed directly by the shared finalization tail.
@@ -1293,7 +1777,7 @@ impl WorkspaceAnalyzer {
     fn finalize_dependency_pack_activation(
         &self,
         config: &AnalyzerConfig,
-        mut activation: SemanticModelActivationRequest,
+        mut activation: ActivationInputs,
         dependencies: Vec<(Box<[Language]>, DependencyDiscoveryEvidence)>,
         outcomes: Vec<DependencyPackEcosystemOutcome>,
         cancelled: bool,
@@ -1308,7 +1792,7 @@ impl WorkspaceAnalyzer {
         let python_runtime = match python_runtime_publication(
             self,
             config,
-            &mut activation,
+            &mut activation.request,
             context,
         ) {
             Ok(publication) => publication,
@@ -1354,7 +1838,7 @@ impl WorkspaceAnalyzer {
     /// nothing to publish leaves any previous publication untouched.
     fn publish_dependency_pack_activation(
         &self,
-        mut activation: SemanticModelActivationRequest,
+        mut activation: ActivationInputs,
         publication: DependencyPackPublicationEvidence,
         outcomes: Vec<DependencyPackEcosystemOutcome>,
         cancelled: bool,
@@ -1364,8 +1848,8 @@ impl WorkspaceAnalyzer {
         if cancelled
             || (!ecosystems_empty
                 && publication.dependencies.is_empty()
-                && activation.evidence.is_empty()
-                && activation.approximate_standard_libraries.is_empty())
+                && activation.request.evidence.is_empty()
+                && activation.request.approximate_standard_libraries.is_empty())
         {
             return DependencyPackActivationOutcome {
                 ecosystems: outcomes,
@@ -1374,11 +1858,23 @@ impl WorkspaceAnalyzer {
             };
         }
 
-        activation.evidence.sort();
-        activation.evidence.dedup();
+        activation.request.evidence.sort();
+        activation.request.evidence.dedup();
+        if let Some(graph) = &mut activation.rust_cargo_graph {
+            graph.retain_evidence(&activation.request.evidence);
+        }
+        debug_assert!(
+            activation
+                .rust_cargo_graph
+                .as_ref()
+                .is_none_or(|graph| graph
+                    .validate_evidence(&activation.request.evidence)
+                    .is_ok()),
+            "retain_evidence leaves exactly the evidence the Cargo graph validates"
+        );
         let runtime = {
             let _scope = crate::profiling::scope("semantic_pack.acquire_active");
-            acquire_active_semantic_models_with_runtime_artifacts(
+            acquire_active_semantic_models_with_inputs(
                 self.analyzer(),
                 context.catalog,
                 context.persistence,
@@ -1409,6 +1905,34 @@ impl WorkspaceAnalyzer {
         self.analyzer()
             .snapshot_caches()
             .is_some_and(|caches| caches.invalidate_dependency_pack_state(&languages))
+    }
+
+    /// Ecosystems whose previous discovery could not be proved current after an update.
+    pub fn requires_whole_dependency_refresh(&self) -> bool {
+        self.analyzer()
+            .snapshot_caches()
+            .is_none_or(|caches| caches.requires_whole_dependency_refresh())
+    }
+
+    pub fn stale_dependency_ecosystems(&self) -> Vec<DependencyPackEcosystem> {
+        self.analyzer()
+            .snapshot_caches()
+            .map(|caches| caches.stale_dependency_ecosystems())
+            .unwrap_or_default()
+    }
+
+    pub fn carried_activation_request(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::SemanticModelActivationRequest> {
+        self.analyzer()
+            .snapshot_caches()
+            .and_then(|caches| caches.carried_activation_request())
+    }
+
+    pub fn carried_activation_inputs(&self) -> Option<ActivationInputs> {
+        self.analyzer()
+            .snapshot_caches()
+            .and_then(|caches| caches.carried_activation_inputs())
     }
 
     /// Discover, prepare, and publish Python environment facts into this
@@ -1482,6 +2006,7 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Language-restricted [`Self::build_ephemeral_footgun`], and a footgun for
     /// the same reason: read that function's doc before calling this one. The
     /// persisted equivalent is [`Self::build_persisted_for_languages`].
@@ -1490,13 +2015,27 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Result<Self, StoreError> {
-        let store_context = super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            config.retention_budget_bytes(),
+        );
+        Self::build_ephemeral_for_languages_footgun_with_budget(project, config, languages, &budget)
+    }
+
+    pub fn build_ephemeral_for_languages_footgun_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        languages: &BTreeSet<Language>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
+        let store_context = super::tree_sitter_analyzer::ephemeral_store_context_with_budget(
             project.as_ref(),
             &config,
+            budget,
         )?;
         Self::build_filtered(project, config, Some(languages), store_context, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Build an analyzer over a delete-on-drop temporary store, no matter what
     /// the project's [`Project::persistence_root`] says.
     ///
@@ -1539,9 +2078,21 @@ impl WorkspaceAnalyzer {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        let store_context = super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            config.retention_budget_bytes(),
+        );
+        Self::build_ephemeral_footgun_with_budget(project, config, &budget)
+    }
+
+    pub fn build_ephemeral_footgun_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
+        let store_context = super::tree_sitter_analyzer::ephemeral_store_context_with_budget(
             project.as_ref(),
             &config,
+            budget,
         )?;
         Self::build_filtered(project, config, None, store_context, None)
     }
@@ -1557,6 +2108,7 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, None, store_context, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Share the rooted project's persistent blob cache while isolating its
     /// selected file set in a session projection. Cache location and build
     /// serialization are the same as for [`Self::build_persisted`], but the
@@ -1577,6 +2129,20 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, None, store_context, None)
     }
 
+    pub fn build_scoped_persisted_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
+        let store_context = super::tree_sitter_analyzer::scoped_store_context_with_budget(
+            project.as_ref(),
+            &config,
+            budget,
+        )?;
+        Self::build_filtered(project, config, None, store_context, None)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     /// Build an analyzer over one immutable revision image, publishing its
     /// parsed facts into the repository's shared content-addressed cache.
     ///
@@ -1618,6 +2184,20 @@ impl WorkspaceAnalyzer {
         cache: Option<&SharedAnalyzerCache>,
         blobs: Arc<RevisionBlobIdentities>,
     ) -> Result<Self, StoreError> {
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            config.retention_budget_bytes(),
+        );
+        Self::build_revision_image_with_budget(project, config, languages, cache, blobs, &budget)
+    }
+
+    pub fn build_revision_image_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        languages: Option<&BTreeSet<Language>>,
+        cache: Option<&SharedAnalyzerCache>,
+        blobs: Arc<RevisionBlobIdentities>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
         let mut store_context = match cache {
             Some(cache) => {
                 let mut context =
@@ -1627,9 +2207,10 @@ impl WorkspaceAnalyzer {
                 context.cancellation = cache.cancellation.clone();
                 context
             }
-            None => super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+            None => super::tree_sitter_analyzer::ephemeral_store_context_with_budget(
                 project.as_ref(),
                 &config,
+                budget,
             )?,
         };
         store_context.revision_blobs = Some(blobs);
@@ -1657,18 +2238,21 @@ impl WorkspaceAnalyzer {
     pub fn build_ephemeral_with_tier_access_footgun(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<(Self, Arc<AnalyzerBuildTierAccess>), StoreError> {
         Self::build_with_tier_access(|observer| {
             let mut store_context =
-                super::tree_sitter_analyzer::ephemeral_store_context_with_config(
+                super::tree_sitter_analyzer::ephemeral_store_context_with_budget(
                     project.as_ref(),
                     &config,
+                    budget,
                 )?;
             store_context.build_tier_access = Arc::clone(observer);
             Self::build_filtered(project, config, None, store_context, None)
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn build_persisted(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
@@ -1676,6 +2260,61 @@ impl WorkspaceAnalyzer {
         Self::build_persisted_inner(project, config, None, true, None)
     }
 
+    pub fn build_persisted_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
+        Self::build_persisted_inner_with_budget(project, config, None, true, None, budget)
+    }
+
+    pub fn build_persisted_with_budget_and_progress<F>(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+        progress: F,
+    ) -> Result<Self, StoreError>
+    where
+        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
+    {
+        Self::build_persisted_inner_with_budget(
+            project,
+            config,
+            Some(Arc::new(progress)),
+            true,
+            None,
+            budget,
+        )
+    }
+
+    pub fn build_persisted_without_automatic_gc_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
+        Self::build_persisted_inner_with_budget(project, config, None, false, None, budget)
+    }
+
+    pub fn build_persisted_without_automatic_gc_with_budget_and_progress<F>(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+        progress: F,
+    ) -> Result<Self, StoreError>
+    where
+        F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
+    {
+        Self::build_persisted_inner_with_budget(
+            project,
+            config,
+            Some(Arc::new(progress)),
+            false,
+            None,
+            budget,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     /// Language-restricted [`Self::build_persisted`]: the same shared
     /// content-addressed cache, with only the requested languages' parsers run.
     ///
@@ -1689,14 +2328,28 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Result<Self, StoreError> {
-        let store_context = super::tree_sitter_analyzer::persistent_store_context_with_config(
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            config.retention_budget_bytes(),
+        );
+        Self::build_persisted_for_languages_with_budget(project, config, languages, &budget)
+    }
+
+    pub fn build_persisted_for_languages_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        languages: &BTreeSet<Language>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
+        let store_context = super::tree_sitter_analyzer::persistent_store_context_with_budget(
             project.as_ref(),
             &config,
             true,
+            budget,
         )?;
         Self::build_filtered(project, config, Some(languages), store_context, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Build a persisted analyzer whose cache is collected only when the host
     /// explicitly requests it.
     pub fn build_persisted_without_automatic_gc(
@@ -1706,6 +2359,7 @@ impl WorkspaceAnalyzer {
         Self::build_persisted_inner(project, config, None, false, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Build a progress-reporting persisted analyzer whose cache is collected
     /// only when the host explicitly requests it.
     pub fn build_persisted_without_automatic_gc_with_progress<F>(
@@ -1724,12 +2378,21 @@ impl WorkspaceAnalyzer {
     pub fn build_persisted_with_tier_access(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<(Self, Arc<AnalyzerBuildTierAccess>), StoreError> {
         Self::build_with_tier_access(|observer| {
-            Self::build_persisted_inner(project, config, None, true, Some(Arc::clone(observer)))
+            Self::build_persisted_inner_with_budget(
+                project,
+                config,
+                None,
+                true,
+                Some(Arc::clone(observer)),
+                budget,
+            )
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Progress-reporting variant of `build_persisted`.
     pub fn build_persisted_with_progress<F>(
         project: Arc<dyn Project>,
@@ -1742,6 +2405,7 @@ impl WorkspaceAnalyzer {
         Self::build_persisted_inner(project, config, Some(Arc::new(progress)), true, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn build_persisted_inner(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
@@ -1749,12 +2413,34 @@ impl WorkspaceAnalyzer {
         automatic_gc: bool,
         tier_access: Option<Arc<AnalyzerBuildTierAccess>>,
     ) -> Result<Self, StoreError> {
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            config.retention_budget_bytes(),
+        );
+        Self::build_persisted_inner_with_budget(
+            project,
+            config,
+            progress,
+            automatic_gc,
+            tier_access,
+            &budget,
+        )
+    }
+
+    fn build_persisted_inner_with_budget(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: Option<BuildProgress>,
+        automatic_gc: bool,
+        tier_access: Option<Arc<AnalyzerBuildTierAccess>>,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self, StoreError> {
         let mut store_context = {
             let _scope = profiling::scope("WorkspaceAnalyzer::open_persistent_store");
-            super::tree_sitter_analyzer::persistent_store_context_with_config(
+            super::tree_sitter_analyzer::persistent_store_context_with_budget(
                 project.as_ref(),
                 &config,
                 automatic_gc,
+                budget,
             )?
         };
         if let Some(tier_access) = tier_access {
@@ -1930,9 +2616,15 @@ impl WorkspaceAnalyzer {
                 ).optional()?
             };
             if let Some(snapshot) = snapshot {
-                store_context
+                let report = store_context
                     .store
                     .reconcile_rust_crates_unless_current(&snapshot)?;
+                if let Some(derivations) = delegates
+                    .get(&Language::Rust)
+                    .and_then(|delegate| delegate.analyzer().derivations())
+                {
+                    derivations.forget_rust_units(&report);
+                }
             }
         }
 
@@ -1981,6 +2673,29 @@ impl WorkspaceAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
             Self::Multi(analyzer) => analyzer.as_ref(),
+        }
+    }
+
+    /// Replay a recorded derivation with the analyzer that owns its language.
+    pub(crate) fn replay_derivation(
+        &self,
+        kind: brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationKindId,
+        question: &brokk_bifrost_semantic::analyzer::semantic::derivation::DerivationQuestion,
+    ) -> crate::analyzer::derivation_host::ReplayResult {
+        use crate::analyzer::derivation_host::{ReplayMissing, ReplayResult};
+        let Some(language) = question.language.as_ref() else {
+            return ReplayResult::Missing(ReplayMissing::NoRecipe);
+        };
+        let analyzer: &dyn IAnalyzer = match self {
+            Self::Multi(multi) => match multi.delegates().get(language).map(|d| d.analyzer()) {
+                Some(analyzer) => analyzer,
+                None => return ReplayResult::Missing(ReplayMissing::NoRecipe),
+            },
+            Self::Empty(_) => return ReplayResult::Missing(ReplayMissing::NoRecipe),
+        };
+        match analyzer.derivations() {
+            Some(derivations) => derivations.replay(analyzer, kind, question),
+            None => ReplayResult::Missing(ReplayMissing::NoRecipe),
         }
     }
 
@@ -2255,6 +2970,46 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// Active lowering identity for policy persistence, in language order.
+    /// The caller supplies the model snapshot pinned for this evaluation.
+    #[doc(hidden)]
+    pub fn policy_lowering_identity(
+        &self,
+        models: Option<&crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+    ) -> crate::analyzer::semantic::ids::StableDigest {
+        let mut identities = Vec::new();
+        for language in Language::ALL {
+            let Some(support) = crate::analyzer::languages::language_support(language) else {
+                continue;
+            };
+            let identity = support
+                .policy_lowering_identity(models)
+                .expect("registered language must declare a policy lowering identity");
+            let type_flow = crate::analyzer::semantic::type_flow::type_flow_adapter(language)
+                .map(|adapter| adapter.semantics_version());
+            identities.push((language, identity, type_flow));
+        }
+        policy_lowering_identity_from_adapters(identities)
+    }
+
+    /// Read one selected publication through its language provider.
+    pub fn stored_semantic_ir_publication_read(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+        subject: [u8; 32],
+        source_byte_cap: Option<usize>,
+        cancellation: &crate::analyzer::semantic::CancellationToken,
+    ) -> Result<
+        crate::analyzer::semantic::StoredSemanticIrRead,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let Some(provider) = self.program_semantics_provider_for_file(file) else {
+            self.analyzer().refuse_read_reuse();
+            return Ok(crate::analyzer::semantic::StoredSemanticIrRead::Refused);
+        };
+        provider.stored_semantic_ir_publication_read(file, subject, source_byte_cap, cancellation)
+    }
+
     /// The prepared syntax the analysis walk holds for `file`, for the
     /// host differential. Empty workspaces hold none.
     #[cfg(any(test, feature = "test-support"))]
@@ -2379,13 +3134,15 @@ impl WorkspaceAnalyzer {
             delegate, active,
         );
         let result = provider.materialize(file, request);
-        if match &result {
-            Err(_) => true,
+        // A budget outcome follows a refusal the ledger already recorded, so
+        // its dependence carries the budget cause; an error or a cancellation
+        // does not.
+        let budget_outcome = match &result {
+            Err(_) => false,
             Ok(outcome) => {
                 matches!(
                     outcome,
-                    crate::analyzer::semantic::SemanticOutcome::Cancelled { .. }
-                        | crate::analyzer::semantic::SemanticOutcome::ExceededBudget { .. }
+                    crate::analyzer::semantic::SemanticOutcome::ExceededBudget { .. }
                 ) || outcome.available_value().is_some_and(|artifact| {
                     artifact.procedures().iter().any(|procedure| {
                         procedure.gaps().iter().any(|gap| {
@@ -2394,7 +3151,12 @@ impl WorkspaceAnalyzer {
                     })
                 })
             }
-        } {
+        };
+        let cancelled = matches!(
+            &result,
+            Ok(crate::analyzer::semantic::SemanticOutcome::Cancelled { .. })
+        );
+        if result.is_err() || cancelled || budget_outcome {
             brokk_bifrost_core::profiling::note_with(|| {
                 format!(
                     "policy.units unbounded origin={}:{} cause=budget:semantic_artifact",
@@ -2403,8 +3165,65 @@ impl WorkspaceAnalyzer {
                 )
             });
             self.analyzer().mark_execution_dependent();
+            if budget_outcome {
+                self.analyzer().record_budget_dependences(1);
+            }
         }
         result
+    }
+
+    /// Admit the selected procedure's stored footprint through its file provider.
+    pub fn stored_footprint_coverage(
+        &self,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::FootprintAdmission,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        use crate::analyzer::semantic::{FootprintAdmission, FootprintAdmissionRefusal};
+        let key = procedure.artifact().key();
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            self.analyzer().refuse_read_reuse();
+            return Ok(FootprintAdmission::Refused(
+                FootprintAdmissionRefusal::CoverageUnavailable,
+            ));
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some(provider) = self.program_semantics_provider_for_file(&file) else {
+            self.analyzer().refuse_read_reuse();
+            return Ok(FootprintAdmission::Refused(
+                FootprintAdmissionRefusal::CoverageUnavailable,
+            ));
+        };
+        provider.stored_footprint_coverage(procedure, request)
+    }
+
+    /// Admit the selected procedure's stored call/control coverage through its file provider.
+    pub fn stored_call_control_coverage(
+        &self,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::FootprintAdmission,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        use crate::analyzer::semantic::{FootprintAdmission, FootprintAdmissionRefusal};
+        let key = procedure.artifact().key();
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            return Ok(FootprintAdmission::Refused(
+                FootprintAdmissionRefusal::CoverageUnavailable,
+            ));
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some(provider) = self.program_semantics_provider_for_file(&file) else {
+            return Ok(FootprintAdmission::Refused(
+                FootprintAdmissionRefusal::CoverageUnavailable,
+            ));
+        };
+        provider.stored_call_control_coverage(procedure, request)
     }
 
     /// The stored partial flows of one procedure, when the procedure's file has
@@ -2420,13 +3239,44 @@ impl WorkspaceAnalyzer {
         let key = procedure.artifact().key();
         let root = self.analyzer().project().root();
         if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            self.analyzer().refuse_read_reuse();
             return Ok(None);
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
         let Some((_, provider)) = self.program_semantics_provider_context_for_file(&file) else {
+            self.analyzer().refuse_read_reuse();
             return Ok(None);
         };
         provider.stored_partial_flows(&file, key, procedure.id())
+    }
+
+    /// Decode one complete stored procedure for a query-local ordered solve.
+    /// The read ledger still names the same whole-blob semantic artifact as
+    /// full decoding; narrowing read keys belongs to Milestone 5.
+    pub fn stored_semantic_ir_procedure(
+        &self,
+        procedure: &crate::analyzer::semantic::ProcedureHandle,
+    ) -> Result<
+        Option<crate::analyzer::semantic::ProcedureSemanticsParts>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let key = procedure.artifact().key();
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            self.analyzer().refuse_read_reuse();
+            return Ok(None);
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some((_, provider)) = self.program_semantics_provider_context_for_file(&file) else {
+            self.analyzer().refuse_read_reuse();
+            return Ok(None);
+        };
+        let parts = provider.stored_semantic_ir_procedure(&file, key, procedure.id())?;
+        if parts.is_some() {
+            self.analyzer()
+                .record_read(crate::analyzer::ReadKey::semantic_artifact(key));
+        }
+        Ok(parts)
     }
 
     /// Whether the file of `key` has a complete semantic IR publication for
@@ -2438,13 +3288,31 @@ impl WorkspaceAnalyzer {
     ) -> Result<bool, crate::analyzer::semantic::SemanticProviderError> {
         let root = self.analyzer().project().root();
         if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            self.analyzer().refuse_read_reuse();
             return Ok(false);
         }
         let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
         let Some((_, provider)) = self.program_semantics_provider_context_for_file(&file) else {
+            self.analyzer().refuse_read_reuse();
             return Ok(false);
         };
         provider.has_complete_semantic_ir_rows(&file, key)
+    }
+
+    /// Both composed taint and value flow require a certified caller inventory
+    /// and complete IR publication for every artifact they bind up front.
+    pub fn composition_readiness(
+        &self,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+    ) -> Result<CompositionReadiness, crate::analyzer::semantic::SemanticProviderError> {
+        if !composition_language_supported(key) {
+            return Ok(CompositionReadiness::Language);
+        }
+        Ok(if self.has_complete_semantic_ir_rows(key)? {
+            CompositionReadiness::Ready
+        } else {
+            CompositionReadiness::NoRows
+        })
     }
 
     /// Bind the demand-materialized ICFG facade to this exact analyzer
@@ -2515,6 +3383,8 @@ impl WorkspaceAnalyzer {
             for _ in 0..ledger.execution_dependences() {
                 self.analyzer().mark_execution_dependent();
             }
+            self.analyzer()
+                .record_budget_dependences(ledger.budget_dependences());
         }
     }
 
@@ -2571,12 +3441,65 @@ impl WorkspaceAnalyzer {
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
             let _scope = profiling::scope("WorkspaceAnalyzer::update");
+            let root = self.analyzer().project().root();
+            let rebased_files;
+            let changed_files = if changed_files.iter().all(|file| file.root() == root) {
+                changed_files
+            } else {
+                rebased_files = Self::rebase_changed_files(changed_files, root);
+                &rebased_files
+            };
+            let pending = match self {
+                Self::Multi(analyzer) => &analyzer.pending_updates,
+                Self::Empty(analyzer) => &analyzer.pending_updates,
+            };
+            let changes = super::pending_update_paths(changed_files, pending);
+            let changed_files = &changes;
+            let project = self.analyzer().project();
+            project.revalidate_symlink_omissions(changed_files);
+            // A configuration input stays reachable by path even when ignore
+            // rules keep it out of the listing, so the workspace resolves it
+            // through the delegates that read it.
+            let is_configuration_input = |file: &crate::analyzer::ProjectFile| match self {
+                Self::Multi(analyzer) => analyzer
+                    .delegates()
+                    .keys()
+                    .any(|language| super::is_language_configuration_input(*language, file)),
+                Self::Empty(_) => false,
+            };
+            let resolution = project.all_files_with_omissions().and_then(|mut listing| {
+                let resolved =
+                    brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
+                        project,
+                        changed_files,
+                        &mut listing,
+                        &is_configuration_input,
+                    )?;
+                Ok((resolved, listing))
+            });
+            let (resolved_files, listing) = match resolution {
+                Ok(result) => result,
+                Err(error) => {
+                    return match self {
+                        Self::Multi(analyzer) => {
+                            Self::Multi(Box::new(analyzer.failed_update(error, changed_files)))
+                        }
+                        Self::Empty(analyzer) => {
+                            let mut failed = analyzer.clone();
+                            failed.update_error = Some(error.into());
+                            failed.pending_updates.extend(changed_files.iter().cloned());
+                            Self::Empty(failed)
+                        }
+                    };
+                }
+            };
+            let changed_files = &resolved_files;
             if profiling::enabled() {
                 profiling::note(format!("changed_files={}", changed_files.len()));
             }
             self.analyzer()
                 .invalidate_cached_file_identities_for(changed_files);
-            let next = match self {
+            let mut next = match self {
                 Self::Empty(analyzer) => {
                     let Some(build_context) = analyzer.build_context.as_ref() else {
                         return Self::Empty(analyzer.clone());
@@ -2592,11 +3515,80 @@ impl WorkspaceAnalyzer {
                         })
                     })
                 }
-                Self::Multi(analyzer) => Self::from_updated_multi(analyzer.update(changed_files)),
+                Self::Multi(analyzer) => Self::from_updated_multi(
+                    analyzer.update_with_listing(changed_files, Some(&listing)),
+                ),
             };
+            // Resolution succeeded, but a delegate can still fail while applying
+            // the update. Keep the reported paths until both stages succeed.
+            match &mut next {
+                Self::Multi(analyzer) => analyzer.clear_update_failure(),
+                Self::Empty(analyzer) => {
+                    analyzer.update_error = None;
+                    analyzer.pending_updates.clear();
+                }
+            }
+            let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+            let attribution = context.enter();
+            next.analyzer().begin_query(&context);
+            next.analyzer().end_query(&context);
+            drop(attribution);
+            if context.store_error().is_some() {
+                match &mut next {
+                    Self::Multi(analyzer) => {
+                        analyzer.pending_updates.extend(changes.iter().cloned())
+                    }
+                    Self::Empty(analyzer) => {
+                        analyzer.pending_updates.extend(changes.iter().cloned())
+                    }
+                }
+            }
             next.reconcile_updated_build_context(Some(changed_files));
+            self.carry_verified_dependency_evidence(&next, Some(changed_files));
             next
         })
+    }
+
+    /// Rebase caller-named changed files onto the project's own root.
+    ///
+    /// A project canonicalizes its root at construction, so a symlinked
+    /// temporary directory or Windows' 8.3 short name may spell the same
+    /// workspace differently from the project. Using such a file unchanged
+    /// would update no live path: the analyzer would keep the old blob while
+    /// the bytes on disk moved on, and the old blob could not be read back.
+    fn rebase_changed_files(
+        changed_files: &BTreeSet<ProjectFile>,
+        root: &Path,
+    ) -> BTreeSet<ProjectFile> {
+        let canonical_root = root.canonicalize().ok();
+        changed_files
+            .iter()
+            .map(|file| {
+                if file.root() == root {
+                    return file.clone();
+                }
+                // A file rooted at an ancestor of the project strips lexically,
+                // so a symlink in the file's own path keeps its name.
+                let abs_path = file.abs_path();
+                if let Ok(rel_path) = abs_path.strip_prefix(root) {
+                    return ProjectFile::new(root.to_path_buf(), rel_path.to_path_buf());
+                }
+                // The caller's root still exists when the file does not, so
+                // canonicalizing the root resolves an alias (a symlinked
+                // directory or Windows' 8.3 short name) for edits and deletions
+                // alike. Joining the relative path before stripping keeps a
+                // symlink in the file's own path from becoming its target.
+                if let (Some(canonical_root), Ok(canonical_file_root)) =
+                    (canonical_root.as_ref(), file.root().canonicalize())
+                {
+                    let canonical_abs = canonical_file_root.join(file.rel_path());
+                    if let Ok(rel_path) = canonical_abs.strip_prefix(canonical_root) {
+                        return ProjectFile::new(root.to_path_buf(), rel_path.to_path_buf());
+                    }
+                }
+                file.clone()
+            })
+            .collect()
     }
 
     /// Refresh external-tool contexts for this updated snapshot without
@@ -2660,6 +3652,7 @@ impl WorkspaceAnalyzer {
                 }
             };
             next.reconcile_updated_build_context(None);
+            self.carry_verified_dependency_evidence(&next, None);
             next
         })
     }
@@ -2674,11 +3667,254 @@ impl WorkspaceAnalyzer {
             }
         }
     }
+
+    fn carry_verified_dependency_evidence(
+        &self,
+        next: &Self,
+        changed_files: Option<&BTreeSet<ProjectFile>>,
+    ) {
+        use crate::analyzer::read_verification::{
+            ChangedFacts, HeadInputs, KeyVerdict, LookupMemo, LookupReplayLimits, NoSummaryAnswers,
+            verify_read_key,
+        };
+        use crate::analyzer::semantic::ids::StableDigest;
+        use crate::analyzer::semantic::invalidation::DerivedArtifactId;
+        use crate::analyzer::semantic::read_ledger::{
+            LookupKind, LookupQuestion, ReadKey, WorkspaceFactFamily,
+        };
+
+        let Some(old_cache) = self.analyzer().snapshot_caches() else {
+            return;
+        };
+        let Some(new_cache) = next.analyzer().snapshot_caches() else {
+            return;
+        };
+        let activated = old_cache.activated_dependency_ecosystems();
+        let old_evidence = activated
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|ecosystem| {
+                ecosystem
+                    .languages()
+                    .iter()
+                    .find_map(|language| old_cache.dependency_discovery_evidence(*language))
+                    .map(|evidence| (ecosystem, evidence))
+            })
+            .collect::<Vec<_>>();
+        if old_evidence.is_empty() {
+            new_cache.install_carried_dependency_evidence(
+                Vec::new(),
+                activated.clone().unwrap_or_default(),
+                old_cache.carried_activation_inputs(),
+                activated,
+            );
+            return;
+        }
+        let mut carried = Vec::new();
+        let mut stale = activated
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|ecosystem| !old_evidence.iter().any(|(old, _)| old == ecosystem))
+            .collect::<Vec<_>>();
+        // Construct replay inputs once for all ecosystems. Discovery records
+        // project reads; model, policy and epoch reads have no authority here.
+        let changed = ChangedFacts::between(self, next);
+        let empty = StableDigest::sha256([]);
+        let mut inputs = HeadInputs {
+            models: empty,
+            policy_semantic_hash: empty,
+            policy_source: empty,
+            configuration: empty,
+            epoch: empty,
+        };
+        let mut memo = LookupMemo::default();
+        let old_ignore = self.analyzer().project().ignore_rules_digest().ok();
+        let new_ignore = next.analyzer().project().ignore_rules_digest().ok();
+        let changed_paths = changed_files.map(|files| {
+            files
+                .iter()
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        for (ecosystem, evidence) in old_evidence {
+            let eligible = evidence
+                .carry_eligible_external_reads()
+                .is_some_and(|keys| keys.iter().all(|key| key.still_matches()));
+            let same_configuration = self.config() == next.config();
+            // Treat every changed path as a potential addition or removal. This
+            // is conservative for edits, and includes overlay-set changes.
+            let membership_unchanged = changed_paths
+                .as_ref()
+                .zip(old_ignore.zip(new_ignore))
+                .is_some_and(|(paths, (old, new))| {
+                    crate::analyzer::semantic_model::discovery_membership_unchanged(
+                        ecosystem.resolver(),
+                        paths,
+                        paths,
+                        &old,
+                        &new,
+                    )
+                });
+            let project_reads_match = eligible
+                && same_configuration
+                && evidence.project_read_keys.iter().all(|key| {
+                    // Discovery chooses the packs to activate, so it
+                    // normally observes that no model set is active. That
+                    // absence marker keeps carry-over exactly as it was
+                    // before absence was recorded as a read; a read of an
+                    // actual model set still refuses carry-over.
+                    if let ReadKey::Models(models) = key {
+                        return *models
+                            == crate::analyzer::i_analyzer::current_model_set_digest(None);
+                    }
+                    if matches!(key, ReadKey::Policy { .. } | ReadKey::Epoch(_)) {
+                        return false;
+                    }
+                    if let ReadKey::Configuration(configuration) = key {
+                        inputs.configuration = *configuration;
+                    }
+                    let verdict = verify_read_key(
+                        DerivedArtifactId::semantic_artifact(evidence.project_read_identity),
+                        next,
+                        &changed,
+                        &inputs,
+                        key,
+                        LookupReplayLimits::default(),
+                        &NoSummaryAnswers,
+                        &mut memo,
+                    );
+                    matches!(verdict, KeyVerdict::Unchanged)
+                        || membership_unchanged
+                            && matches!(
+                                key,
+                                ReadKey::Lookup {
+                                    kind: LookupKind::WorkspaceFact,
+                                    question: LookupQuestion::WorkspaceFact {
+                                        family: WorkspaceFactFamily::WorkspaceFileInventory
+                                            | WorkspaceFactFamily::WorkspaceFileListing,
+                                        ..
+                                    },
+                                    ..
+                                }
+                            )
+                            && matches!(verdict, KeyVerdict::Changed(_))
+                });
+            if project_reads_match {
+                for language in ecosystem.languages() {
+                    carried.push((*language, Arc::clone(&evidence)));
+                }
+            } else {
+                stale.push(ecosystem);
+            }
+        }
+        new_cache.install_carried_dependency_evidence(
+            carried,
+            stale,
+            old_cache.carried_activation_inputs(),
+            activated,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_discovery_capture_changes_identity_only_for_observed_files() {
+        use crate::analyzer::dependency_support::{
+            capture_external_discovery_reads, declare_external_discovery_reads_complete,
+            report_external_discovery_read,
+        };
+        use crate::analyzer::semantic_model::ExternalDiscoveryRead;
+        let temp = tempfile::tempdir().unwrap();
+        let observed = temp.path().join("Cargo.lock");
+        let unrelated = temp.path().join("edited.rs");
+        std::fs::write(&observed, b"one").unwrap();
+        let identity = || {
+            let (_, reads) = capture_external_discovery_reads(|| {
+                let bytes = std::fs::read(&observed).unwrap();
+                report_external_discovery_read(ExternalDiscoveryRead::file(&observed, &bytes));
+                declare_external_discovery_reads_complete();
+            });
+            let evidence = DependencyDiscoveryEvidence::from_outcome(
+                &DependencyDiscoveryOutcome::complete(Vec::new()),
+            )
+            .with_external_reads(reads.keys, reads.complete);
+            assert!(evidence.carry_eligible_external_reads().is_some());
+            evidence.external_read_identity
+        };
+        let first = identity();
+        std::fs::write(&unrelated, b"edit").unwrap();
+        assert_eq!(first, identity());
+        std::fs::write(&observed, b"two").unwrap();
+        assert_ne!(first, identity());
+        let (_, incomplete) = capture_external_discovery_reads(|| {
+            report_external_discovery_read(ExternalDiscoveryRead::file(&observed, b"two"));
+        });
+        assert!(
+            DependencyDiscoveryEvidence::from_outcome(&DependencyDiscoveryOutcome::complete(
+                Vec::new()
+            ))
+            .with_external_reads(incomplete.keys, incomplete.complete)
+            .carry_eligible_external_reads()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn project_discovery_read_identity_tracks_manifest_not_unread_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[dependencies]\nserde_json = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/untouched.rs"), "fn untouched() {}\n").unwrap();
+        std::fs::write(root.join("src/edited.rs"), "fn edited() {}\n").unwrap();
+
+        let identity = || {
+            let project = Arc::new(FilesystemProject::new(root.clone()).unwrap());
+            let workspace = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(project));
+            let manifest = ProjectFile::new(root.clone(), "Cargo.toml");
+            let (_, reads) = super::super::i_analyzer::capture_with_read_ledger_scope(
+                workspace.analyzer(),
+                None,
+                || {
+                    workspace
+                        .analyzer()
+                        .project()
+                        .read_file_snapshot(&manifest)
+                        .unwrap();
+                },
+            );
+            assert_eq!(reads.unattributed_reads(), 0);
+            assert!(reads.keys().iter().any(|key| matches!(key, crate::analyzer::ReadKey::File { rel_path, .. } if rel_path.as_ref() == "Cargo.toml")));
+            let evidence = DependencyDiscoveryEvidence::from_outcome(
+                &DependencyDiscoveryOutcome::complete(Vec::new()),
+            )
+            .with_project_reads(reads.canonical_keys(), reads.digest().digest());
+            assert_eq!(evidence.project_read_keys.len(), reads.len());
+            evidence.project_read_identity
+        };
+        let first = identity();
+        std::fs::write(
+            root.join("src/edited.rs"),
+            "fn edited() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+        assert_eq!(first, identity());
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[dependencies]\nserde_json = \"2\"\n",
+        )
+        .unwrap();
+        assert_ne!(first, identity());
+    }
 
     use crate::analyzer::store::liveness::Liveness;
 
@@ -2689,6 +3925,18 @@ mod tests {
     use crate::gitblob::test_repo::commit_all;
     use crate::gitblob::test_repo::init_repo;
     use crate::path_normalization::NormalizePath;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9737: a storeless workspace's semantic oracle panicked asking for a budget"
+    )]
+    fn a_storeless_workspace_builds_its_semantic_oracle_without_retaining() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = Arc::new(FilesystemProject::new(temp.path().to_path_buf()).unwrap());
+        let workspace = WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(project));
+        drop(workspace.semantic_oracle_provider());
+        assert_eq!(workspace.retention_budget().accounted_bytes(), 0);
+    }
 
     #[test]
     fn selected_project_listing_tracks_file_changes_and_overlay_snapshots() {
@@ -2777,7 +4025,9 @@ mod tests {
         );
 
         std::fs::write(root.join("新規.java"), "class Added {}\n").unwrap();
-        assert!(selected.update_cached_listing_for_path(Path::new("新規.java")));
+        if !selected.update_cached_listing_for_path(Path::new("新規.java")) {
+            selected.invalidate_cached_file_listing();
+        }
         assert_matches_fresh_project();
 
         std::fs::remove_file(root.join("café.java")).unwrap();
@@ -2786,7 +4036,9 @@ mod tests {
 
         std::fs::rename(root.join("kept.java"), root.join("renamed.java")).unwrap();
         assert!(selected.update_cached_listing_for_path(Path::new("kept.java")));
-        assert!(selected.update_cached_listing_for_path(Path::new("renamed.java")));
+        if !selected.update_cached_listing_for_path(Path::new("renamed.java")) {
+            selected.invalidate_cached_file_listing();
+        }
         assert_matches_fresh_project();
 
         selected.invalidate_cached_file_listing();

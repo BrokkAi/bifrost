@@ -15,7 +15,7 @@ use brokk_bifrost_core::hash::HashSet;
 use std::borrow::Cow;
 use tree_sitter::Node;
 
-use crate::declarations::{rust_node_text, rust_package_name};
+use crate::declarations::rust_node_text;
 use crate::graph_support::{ReferenceContextResult, RustSource, resolve_module_package};
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 use crate::syntax::{outer_attributes, rust_attribute_path_is, unwrap_attributes};
@@ -68,7 +68,15 @@ pub fn rust_import_binding_name<'a>(import: &'a ImportInfo) -> RustImportBinding
     let name = import
         .local_name()
         .expect("non-glob Rust import must have a parser-derived local name");
-    RustImportBindingName::Named(Cow::Borrowed(name))
+    RustImportBindingName::Named(Cow::Borrowed(
+        brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(name),
+    ))
+}
+
+/// Compare a projected import binder with a spelling read from Rust source.
+pub fn rust_binding_name_matches(binding: &str, written: &str) -> bool {
+    use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
+    strip_raw_identifier_prefix(binding) == strip_raw_identifier_prefix(written)
 }
 
 #[derive(Debug, Clone)]
@@ -518,10 +526,25 @@ pub fn rust_imported_code_units(
     file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> HashSet<CodeUnit> {
-    let package = rust_package_name(file);
+    // Ownerless entry: share one nonretaining naming handle for this call.
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    rust_imported_code_units_with(&caches, index, file, imports)
+}
+
+pub fn rust_imported_code_units_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    index: &dyn CodeUnitIndex,
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> HashSet<CodeUnit> {
+    let package = crate::declarations::rust_package_name_with(caches, file);
     let mut resolved = HashSet::default();
     for import in imports {
-        if let Some(target_fq_name) = resolve_rust_import_fq_name(file, &package, import) {
+        if let Some(target_fq_name) =
+            resolve_rust_import_fq_name_with(caches, file, &package, import)
+        {
             resolved.extend(index.definitions(&target_fq_name));
         }
     }
@@ -534,9 +557,23 @@ pub fn rust_could_import_file(
     imports: &[ImportInfo],
     target: &ProjectFile,
 ) -> bool {
-    let package = rust_package_name(source_file);
+    // Ownerless entry: share one nonretaining naming handle for this call.
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    rust_could_import_file_with(&caches, index, source_file, imports, target)
+}
+
+pub fn rust_could_import_file_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    index: &dyn CodeUnitIndex,
+    source_file: &ProjectFile,
+    imports: &[ImportInfo],
+    target: &ProjectFile,
+) -> bool {
+    let package = crate::declarations::rust_package_name_with(caches, source_file);
     imports.iter().any(|import| {
-        resolve_rust_import_fq_name(source_file, &package, import)
+        resolve_rust_import_fq_name_with(caches, source_file, &package, import)
             .into_iter()
             .any(|fq_name| {
                 index
@@ -1240,8 +1277,14 @@ pub fn resolve_rust_import_package_scoped(
     let segments = parse_symbol_path(Language::Rust, module_specifier);
     let lexical_package = matches!(segments.first().map(String::as_str), Some("self" | "super"))
         .then(|| {
-            let file_package = rust_package_name(file);
-            crate::lexical_scope::lexical_package_at(&file_package, source, scope_start)
+            let file_package =
+                crate::declarations::rust_package_name_with(rust.crate_naming_caches(), file);
+            crate::lexical_scope::lexical_package_at_with(
+                rust.lexical_caches(),
+                &file_package,
+                source,
+                scope_start,
+            )
         });
     resolve_rust_import_package_segments(
         rust,
@@ -1268,7 +1311,7 @@ fn resolve_rust_import_package_segments(
         return resolve_module_package(rust, token, file, module_specifier);
     }
     let lexical_package = lexical_package.expect("relative Rust imports have a lexical package");
-    let crate_package = rust_crate_root_package(file);
+    let crate_package = rust_crate_root_package_with(rust.crate_naming_caches(), file);
     Ok(resolve_rust_module_segments_with_crate(
         lexical_package,
         &crate_package,
@@ -1398,6 +1441,19 @@ pub fn resolve_rust_import_fq_name(
     package: &str,
     import: &ImportInfo,
 ) -> Option<String> {
+    // Standalone entry without an analyzer owner.
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    resolve_rust_import_fq_name_with(&caches, source_file, package, import)
+}
+
+pub fn resolve_rust_import_fq_name_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    source_file: &ProjectFile,
+    package: &str,
+    import: &ImportInfo,
+) -> Option<String> {
     let path = import
         .path
         .as_ref()
@@ -1410,7 +1466,7 @@ pub fn resolve_rust_import_fq_name(
         return None;
     }
 
-    let crate_package = rust_crate_root_package(source_file);
+    let crate_package = rust_crate_root_package_with(caches, source_file);
     resolve_rust_module_segments_with_crate(package, &crate_package, &path.segments)
 }
 
@@ -1446,7 +1502,19 @@ fn rust_external_module_route_from_root<'a>(
 /// of the shared modules beside it -- `mod common;` in `benches/a.rs` and in
 /// `benches/b.rs` both name the single `benches/common/mod.rs` identity.
 pub fn rust_target_kind_root_package(file: &ProjectFile) -> Option<String> {
-    crate::crate_naming::rust_target_kind_root(file).map(|root| root.join("."))
+    rust_target_kind_root_package_with(
+        &crate::crate_naming::RustCrateNamingCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+        ),
+        file,
+    )
+}
+
+pub fn rust_target_kind_root_package_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Option<String> {
+    crate::crate_naming::rust_target_kind_root_with(caches, file).map(|root| root.join("."))
 }
 
 /// Re-spell a package resolved under a Cargo target's private `crate::` root
@@ -1459,8 +1527,19 @@ pub fn rust_target_kind_root_package(file: &ProjectFile) -> Option<String> {
 /// lives. Callers still decide whether that alternative has an indexed,
 /// reachable backing file and must keep the private-root answer first.
 pub fn rust_target_kind_root_alternative(file: &ProjectFile, package: &str) -> Option<String> {
-    let kind_root = rust_target_kind_root_package(file)?;
-    let own_root = rust_crate_root_package(file);
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    rust_target_kind_root_alternative_with(&caches, file, package)
+}
+
+pub fn rust_target_kind_root_alternative_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    package: &str,
+) -> Option<String> {
+    let kind_root = rust_target_kind_root_package_with(caches, file)?;
+    let own_root = rust_crate_root_package_with(caches, file);
     let suffix = package.strip_prefix(&own_root)?;
     if !suffix.is_empty() && !suffix.starts_with('.') {
         return None;
@@ -1471,7 +1550,17 @@ pub fn rust_target_kind_root_alternative(file: &ProjectFile, package: &str) -> O
 /// Package that `crate::` resolves to from `file`: crate-anchored when a
 /// `Cargo.toml` governs the file, otherwise the legacy path-derived root.
 pub fn rust_crate_root_package(file: &ProjectFile) -> String {
-    if let Some(paths) = crate::crate_naming::rust_crate_paths(file) {
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    rust_crate_root_package_with(&caches, file)
+}
+
+pub fn rust_crate_root_package_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> String {
+    if let Some(paths) = crate::crate_naming::rust_crate_paths_with(caches, file) {
         return paths.crate_root.join(".");
     }
     crate::crate_naming::path_derived_crate_root_components(file.rel_path()).join(".")

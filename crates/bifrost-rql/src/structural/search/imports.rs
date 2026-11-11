@@ -154,7 +154,7 @@ pub(super) fn acquire_direct_import_layer(
                     DirectImportTopologyLimits {
                         max_files: remaining_import_files,
                         max_edges: remaining_import_edges,
-                        max_retained_bytes: cache.max_retained_bytes(),
+                        construction_limit_bytes: cache.construction_limit_bytes(),
                     },
                 );
                 fallback_graph = build.fallback;

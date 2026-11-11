@@ -7,7 +7,6 @@ use crate::graph_support::{
 use crate::hierarchy_source_context::RustSourceContextIndex;
 use crate::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package,
 };
 use crate::usage::exported_targets_from_files;
 use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
@@ -990,7 +989,8 @@ fn lexically_imported_units(
     lexical_package: &str,
     reference: &str,
 ) -> Result<Vec<CodeUnit>, RustCargoRouteError> {
-    let crate_package = rust_crate_root_package(file);
+    let crate_package =
+        crate::imports::rust_crate_root_package_with(rust.crate_naming_caches(), file);
     let mut units = Vec::new();
     for (local_name, binding) in &binder.bindings {
         let imported_name = match binding.kind {
@@ -2491,7 +2491,8 @@ where
     let name = terminal.name.as_str();
     let module_path = contexts.module_path(facts, context, &|| true)?;
     let local_module = module_path.join(".");
-    let file_package = crate::declarations::rust_package_name(file);
+    let file_package =
+        crate::declarations::rust_package_name_with(rust.crate_naming_caches(), file);
     let lexical_package = if local_module.is_empty() {
         file_package
     } else {
@@ -2503,7 +2504,8 @@ where
             .then(|| binder.bindings.get(&head.name))
             .flatten()
             .filter(|binding| matches!(binding.kind, ImportKind::Namespace));
-        let crate_package = rust_crate_root_package(file);
+        let crate_package =
+            crate::imports::rust_crate_root_package_with(rust.crate_naming_caches(), file);
         let package = if let Some(binding) = namespace {
             // The binder owns a semantic module identity. Resolve that base
             // through the shared helper, then append the source-owned tail.

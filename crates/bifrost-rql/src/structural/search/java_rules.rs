@@ -26,6 +26,7 @@ use brokk_bifrost_jvm::java::javadoc::{
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
+use super::documentation_tags::{NamedTag, missing_tag, unknown_tag_ranges};
 use super::field_metadata::{FieldSite, field_sites};
 use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches, UndecidedSite};
 
@@ -252,15 +253,11 @@ fn javadoc_matches(
                         let reports = callable_inconsistent_throws(
                             analyzer, &sites, node, &source, undecided,
                         );
-                        tag_matches.extend(
-                            reports
-                                .into_iter()
-                                .map(|report| LanguageRuleMatch {
-                                    select,
-                                    report,
-                                    heuristic: None,
-                                }),
-                        );
+                        tag_matches.extend(reports.into_iter().map(|report| LanguageRuleMatch {
+                            select,
+                            report,
+                            heuristic: None,
+                        }));
                     }
                     _ => record_decision(
                         callable_rule_matches(analyzer, &sites, node, &source, rule),
@@ -1069,7 +1066,18 @@ fn lookup_qualified_type(
     let Some(models) = analyzer.active_semantic_models() else {
         return TypeResolution::Absent;
     };
-    match models.types_named(qualified).records.as_slice() {
+    let mut matched = models.types_named(qualified);
+    matched.records.retain(|record| {
+        brokk_bifrost_core::analyzer::model::semantic_pack_realm(&record.shard.manifest.language)
+            == "jvm"
+    });
+    if matches!(
+        matched.disposition,
+        crate::analyzer::semantic_model::SemanticModelMatchDisposition::Open(_)
+    ) {
+        return TypeResolution::Unknown("the semantic-model type lookup is open");
+    }
+    match matched.records.as_slice() {
         [] => TypeResolution::Absent,
         [matched] => TypeResolution::Known(TypeDeclaration {
             arity: Some(matched.record.type_parameters.len()),
@@ -1505,12 +1513,18 @@ fn undocumented_parameter(
     let Some(name) = parameter_name(parameter, source) else {
         return Decision::Fails;
     };
-    Decision::from_bool(!documentation.tags.iter().any(|tag| {
-        tag.kind == JavadocTagKind::Param
-            && tag.name.as_deref() == Some(name.as_str())
-            && tag.acceptable
-    }))
-    .and(|| callable_is_eligible(analyzer, site, callable, source))
+    let tags = documentation
+        .tags
+        .iter()
+        .filter(|tag| tag.kind == JavadocTagKind::Param)
+        .map(|tag| NamedTag {
+            name: tag.name.as_deref(),
+            acceptable: tag.acceptable,
+            range: Some(javadoc_tag_range(callable, source, tag)),
+        })
+        .collect::<Vec<_>>();
+    Decision::from_bool(missing_tag(&name, &tags))
+        .and(|| callable_is_eligible(analyzer, site, callable, source))
 }
 
 fn callable_unknown_parameter_tags(
@@ -1532,18 +1546,21 @@ fn callable_unknown_parameter_tags(
     }
     let actual_parameters = parameter_names(callable, source);
     let type_parameters = type_parameter_names(callable, source);
-    documentation
+    let tags = documentation
         .tags
         .iter()
-        .filter(|tag| {
-            tag.kind == JavadocTagKind::Param
-                && tag.name.as_deref().is_none_or(|name| {
-                    !actual_parameters.iter().any(|actual| actual == name)
-                        && !type_parameters.iter().any(|actual| actual == name)
-                })
+        .filter(|tag| tag.kind == JavadocTagKind::Param)
+        .map(|tag| NamedTag {
+            name: tag.name.as_deref(),
+            acceptable: tag.acceptable,
+            range: Some(javadoc_tag_range(callable, source, tag)),
         })
-        .map(|tag| javadoc_tag_range(callable, source, tag))
-        .collect()
+        .collect::<Vec<_>>();
+    let names = actual_parameters
+        .into_iter()
+        .chain(type_parameters)
+        .collect::<Vec<_>>();
+    unknown_tag_ranges(&tags, &names)
 }
 
 fn unknown_type_parameter_tag(
@@ -1567,18 +1584,17 @@ fn unknown_type_parameter_tag(
     if declaration.kind() == "record_declaration" {
         valid.extend(parameter_names_from_field(declaration, source));
     }
-    documentation
+    let tags = documentation
         .tags
         .iter()
-        .filter(|tag| {
-            tag.kind == JavadocTagKind::Param
-                && tag
-                    .name
-                    .as_deref()
-                    .is_none_or(|name| !valid.iter().any(|actual| actual == name))
+        .filter(|tag| tag.kind == JavadocTagKind::Param)
+        .map(|tag| NamedTag {
+            name: tag.name.as_deref(),
+            acceptable: tag.acceptable,
+            range: Some(javadoc_tag_range(declaration, source, tag)),
         })
-        .map(|tag| javadoc_tag_range(declaration, source, tag))
-        .collect()
+        .collect::<Vec<_>>();
+    unknown_tag_ranges(&tags, &valid)
 }
 
 fn javadoc_tag_range(
@@ -1592,10 +1608,12 @@ fn javadoc_tag_range(
     let start_byte = offset + tag.start_byte;
     let end_byte = offset + tag.end_byte;
     let line_at = |offset: usize| {
-        comment.start_position().row + 1 + source[comment.start_byte()..offset]
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
+        comment.start_position().row
+            + 1
+            + source[comment.start_byte()..offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
     };
     Range {
         start_byte,

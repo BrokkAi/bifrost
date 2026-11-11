@@ -10,7 +10,7 @@ MostRelevantFilesRankingModeValue = Literal[
     "cascade", "history_imports", "usage_graph", "usage_graph_exact"
 ]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
-SymbolSourcesIncompleteReasonValue = Literal["cancelled"]
+SymbolSourcesIncompleteReasonValue = Literal["cancelled", "inside_unclosed_construct", "read_incomplete"]
 DefinitionLookupIncompleteReasonValue = Literal[
     "cancelled",
     "time_budget",
@@ -477,6 +477,16 @@ class CodeQueryCapture:
 
 
 @dataclass(frozen=True)
+class CodeQueryReferenceFacets:
+    known: list[str]
+    undecided: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CodeQueryReferenceFacets:
+        return cls(list(data["known"]), list(data["undecided"]))
+
+
+@dataclass(frozen=True)
 class CodeQueryResultRef:
     result_type: str
     path: str
@@ -490,7 +500,7 @@ class CodeQueryResultRef:
     target_fq_name: str | None = None
     target_id: str | None = None
     proof: str | None = None
-    reference_kind: str | None = None
+    reference_facets: CodeQueryReferenceFacets | None = None
     caller_fq_name: str | None = None
     callee_fq_name: str | None = None
     input_kind: str | None = None
@@ -526,7 +536,8 @@ class CodeQueryResultRef:
             target_fq_name=data.get("target_fq_name"),
             target_id=data.get("target_id"),
             proof=data.get("proof"),
-            reference_kind=data.get("reference_kind"),
+            reference_facets=CodeQueryReferenceFacets.from_dict(data["reference_facets"])
+            if "reference_facets" in data else None,
             caller_fq_name=data.get("caller_fq_name"),
             callee_fq_name=data.get("callee_fq_name"),
             input_kind=data.get("input_kind"),
@@ -708,7 +719,7 @@ def _query_reference_site_fields(data: dict[str, Any]) -> dict[str, Any]:
         else None,
         "usage_kind": data["usage_kind"],
         "proof": data["proof"],
-        "reference_kind": data.get("reference_kind"),
+        "reference_facets": CodeQueryReferenceFacets.from_dict(data["reference_facets"]),
     }
 
 
@@ -1893,7 +1904,7 @@ class CodeQueryReferenceSite:
     enclosing_declaration: CodeQueryDeclaration | None
     usage_kind: str
     proof: str
-    reference_kind: str | None = None
+    reference_facets: CodeQueryReferenceFacets
     provenance: list[CodeQueryProvenance] = field(default_factory=list)
     provenance_truncated: bool = False
 
@@ -2410,13 +2421,15 @@ class CodeQueryBinding:
 class CodeQueryCandidateRef:
     """What a resolution candidate points at.
 
-    Two of the five shapes (``binding`` and ``external_route``) carry no
-    workspace declaration, which is why ``candidate_target`` is partial by
-    construction: it can answer only for ``unit`` candidates.
+    Only ``unit`` carries a workspace declaration for ``candidate_target``.
+    A modeled candidate instead carries its pack-declared symbol ID and
+    mandatory defining provider; its name is presentation only.
     """
 
     candidate_kind: str
     name: str
+    provider: dict[str, str] | None = None
+    symbol_id: str | None = None
     unit: CodeQueryDeclaration | None = None
     kind: str | None = None
     range: CodeQueryRange | None = None
@@ -2440,6 +2453,8 @@ class CodeQueryCandidateRef:
             range=CodeQueryRange.from_dict(range_data) if range_data else None,
             path=data.get("path"),
             ast_id=data.get("ast_id"),
+            provider=data["provider"] if candidate_kind == "modeled" else None,
+            symbol_id=data["symbol_id"] if candidate_kind == "modeled" else None,
         )
 
 
@@ -2517,8 +2532,7 @@ class CodeQueryReferenceEdge:
     facts-arena node; where it is present, string equality with a capture's or
     an occurrence's ``ast_id`` is the correlation join.
     ``enclosing_declaration`` is absent when no indexed declaration encloses
-    the site, and ``reference_kind`` is absent when the producer classified no
-    structured kind -- neither absence means the edge is weaker.
+    the site. ``reference_facets`` separates proven and undecided kinds.
     ``generation`` is the workspace generation the edge was derived in; a
     comparison must refuse to relate rows from two generations.
 
@@ -2540,9 +2554,9 @@ class CodeQueryReferenceEdge:
     owner_relation: str
     provenance_direction: str
     generation: int
+    reference_facets: CodeQueryReferenceFacets
     ast_id: str | None = None
     enclosing_declaration: CodeQueryDeclaration | None = None
-    reference_kind: str | None = None
     provenance: list[CodeQueryProvenance] = field(default_factory=list)
     provenance_truncated: bool = False
 
@@ -2566,7 +2580,7 @@ class CodeQueryReferenceEdge:
             f"{self.usage_kind}] -> {self.target.fq_name} [{self.target.kind}]"
         )
         detail = (
-            f"  kind {self.reference_kind or 'unclassified'}, "
+            f"  facets known={self.reference_facets.known}, undecided={self.reference_facets.undecided}, "
             f"site {self.site_class}, relation {self.owner_relation}, "
             f"generation {self.generation}"
         )
@@ -3193,6 +3207,8 @@ class CodeQueryMemberTarget:
     name: str
     fq_name: str
     kind: str
+    member_form: str | None = None
+    trivial_property: bool | None = None
     path: str | None = None
     language: str | None = None
     start_line: int | None = None
@@ -3215,6 +3231,8 @@ class CodeQueryMemberTarget:
             name=data["name"],
             fq_name=data["fq_name"],
             kind=data["kind"],
+            member_form=data.get("member_form"),
+            trivial_property=data.get("trivial_property"),
             path=data.get("path"),
             language=data.get("language"),
             start_line=_optional_int(data, "start_line"),
@@ -5362,6 +5380,7 @@ class CodeQueryConfigurationFact:
     id: str
     fact_id: str
     path: str
+    directory: str
     format: str
     node_kind: str
     provenance: str
@@ -5385,6 +5404,7 @@ class CodeQueryConfigurationFact:
             id=data["id"],
             fact_id=data["fact_id"],
             path=data["path"],
+            directory=data["directory"],
             format=data["format"],
             node_kind=data["node_kind"],
             provenance=data["fact_provenance"],
@@ -5644,6 +5664,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     INVALID_PLAN = "invalid_plan"
     CANCELLED = "cancelled"
     UNSUPPORTED_STRUCTURAL_FEATURE = "unsupported_structural_feature"
+    STRUCTURAL_ROLE_COVERAGE_INCOMPLETE = "structural_role_coverage_incomplete"
     MISSING_STRUCTURAL_ADAPTER = "missing_structural_adapter"
     RECOVERED_SYNTAX_INCOMPLETE = "recovered_syntax_incomplete"
     UNSUPPORTED_IMPORT_ANALYSIS = "unsupported_import_analysis"
@@ -5660,6 +5681,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     SEMANTIC_BUDGET_EXHAUSTED = "semantic_budget_exhausted"
     SEMANTIC_PROVIDER_FAILED = "semantic_provider_failed"
     SEMANTIC_PACK_ACQUISITION_PENDING = "semantic_pack_acquisition_pending"
+    SEMANTIC_PACK_ACTIVATION_FAILED = "semantic_pack_activation_failed"
     WORKSPACE_SEMANTIC_MODELS_NOT_LOADED = "workspace_semantic_models_not_loaded"
     UNRESOLVED_PROTOCOL_REFERENCE = "unresolved_protocol_reference"
     TYPESTATE_REGISTRATION_STALE = "typestate_registration_stale"
@@ -5695,12 +5717,20 @@ class CodeQueryDiagnosticCode(StrEnum):
     CALL_RELATION_TARGETS_AMBIGUOUS = "call_relation_targets_ambiguous"
     CALL_RELATION_CANDIDATE_LIMIT = "call_relation_candidate_limit"
     CALL_RELATION_ANALYSIS_FAILED = "call_relation_analysis_failed"
+    RENDERED_CAPTURES_TRUNCATED = "rendered_captures_truncated"
     REFERENCE_SOURCE_BYTES_TRUNCATED = "reference_source_bytes_truncated"
     REFERENCE_CANDIDATE_FILES_TRUNCATED = "reference_candidate_files_truncated"
     REFERENCE_CANDIDATES_OMITTED = "reference_candidates_omitted"
     REFERENCE_TARGETS_AMBIGUOUS = "reference_targets_ambiguous"
     REFERENCE_CALLSITE_LIMIT = "reference_callsite_limit"
     REFERENCE_ANALYSIS_FAILED = "reference_analysis_failed"
+    REFERENCE_KIND_UNDECIDED = "reference_kind_undecided"
+    ENCLOSING_PATTERN_UNDECIDED = "enclosing_pattern_undecided"
+    QUALIFYING_TYPE_UNRESOLVED = "qualifying_type_unresolved"
+    POLICY_DECLARED_PROVEN_SUBSET = "policy_declared_proven_subset"
+    IDENTICAL_CAPTURES_OPEN = "identical_captures_open"
+    ROW_PREDICATE_UNDECIDED = "row_predicate_undecided"
+    MEMBER_FORM_UNDECIDED = "member_form_undecided"
     USES_PARSER_UNSUPPORTED = "uses_parser_unsupported"
     USES_CANDIDATE_LIMIT = "uses_candidate_limit"
     USES_TARGETS_AMBIGUOUS = "uses_targets_ambiguous"
@@ -7950,16 +7980,18 @@ class SymbolSourcesIncomplete:
 
     target: str
     reason: SymbolSourcesIncompleteReasonValue
+    detail: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> SymbolSourcesIncomplete:
         return cls(
             target=data["target"],
             reason=_symbol_sources_incomplete_reason(data["reason"]),
+            detail=data.get("detail"),
         )
 
     def render_text(self) -> str:
-        return f"{self.target} ({self.reason})"
+        return f"{self.target} ({self.detail or self.reason})"
 
 
 @dataclass(frozen=True)
@@ -8440,6 +8472,18 @@ class UsageGraphTruncatedSymbol:
 
 
 @dataclass(frozen=True)
+class UsageGraphScopeObligation:
+    """An assumption bounding graph completeness, not an incompleteness reason."""
+
+    code: str
+    message: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageGraphScopeObligation:
+        return cls(code=data["code"], message=data["message"])
+
+
+@dataclass(frozen=True)
 class UsageGraphCSharpCompilation:
     """One selected C# project or loose compilation in a usage graph."""
 
@@ -8462,6 +8506,7 @@ class UsageGraphCSharpCompilation:
         )
 
 
+
 @dataclass(frozen=True)
 class UsageGraphResult:
     """The whole-workspace resolved usage graph.
@@ -8473,6 +8518,7 @@ class UsageGraphResult:
     nodes: list[UsageGraphNode]
     edges: list[UsageGraphEdge]
     truncated_symbols: list[UsageGraphTruncatedSymbol]
+    scope_obligations: list[UsageGraphScopeObligation] = field(default_factory=list)
     session_subset: SessionSubset | None = None
     csharp_compilations: list[UsageGraphCSharpCompilation] = field(default_factory=list)
     rendered_text: str | None = None
@@ -8487,6 +8533,10 @@ class UsageGraphResult:
             truncated_symbols=[
                 UsageGraphTruncatedSymbol.from_dict(item)
                 for item in data.get("truncated_symbols", [])
+            ],
+            scope_obligations=[
+                UsageGraphScopeObligation.from_dict(item)
+                for item in data.get("scope_obligations", [])
             ],
             session_subset=_session_subset(data),
             csharp_compilations=[
@@ -9940,6 +9990,7 @@ class CodeQueryResult(_GeneratedCodeQueryResult):
             results=decoded.results,
             session_subset=decoded.session_subset,
             truncated=decoded.truncated,
+            depth_bound_status=decoded.depth_bound_status,
             rendered_text=rendered_text,
         )
 

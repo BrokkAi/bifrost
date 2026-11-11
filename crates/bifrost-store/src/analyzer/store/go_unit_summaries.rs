@@ -495,16 +495,15 @@ impl UnitSummaryLanguage for GoUnitSummaries {
 
     fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
         install_go_summary_sources(conn)?;
-        conn.execute("DELETE FROM temp.go_summary_snapshot", [])?;
-        conn.execute(
-            "INSERT INTO temp.go_summary_snapshot VALUES(?1,?2,?3,?4)",
-            rusqlite::params![
+        conn.prepare_cached("DELETE FROM temp.go_summary_snapshot")?
+            .execute([])?;
+        conn.prepare_cached("INSERT INTO temp.go_summary_snapshot VALUES(?1,?2,?3,?4)")?
+            .execute(rusqlite::params![
                 snapshot.workspace_id.as_str(),
                 snapshot.lang,
                 snapshot.generation.get(),
                 snapshot.revision
-            ],
-        )?;
+            ])?;
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS go_unit_summary_units(
                unit_id INTEGER PRIMARY KEY,
@@ -514,18 +513,19 @@ impl UnitSummaryLanguage for GoUnitSummaries {
              ) STRICT;
              DELETE FROM temp.go_unit_summary_units;",
         )?;
-        conn.execute(STAGE_UNITS_SQL, [self.context_id])?;
-        conn.execute(
-            "INSERT INTO temp.unit_summary_work(unit_id) SELECT unit_id FROM temp.go_unit_summary_units",
+        conn.prepare_cached(STAGE_UNITS_SQL)?
+            .execute([self.context_id])?;
+        conn.prepare_cached("INSERT INTO temp.unit_summary_work(unit_id) SELECT unit_id FROM temp.go_unit_summary_units")?.execute(
             [],
         )?;
-        conn.execute(STAGE_IMPORT_EDGES_SQL, [])?;
-        conn.execute(STAGE_TEST_EDGES_SQL, [])?;
+        conn.prepare_cached(STAGE_IMPORT_EDGES_SQL)?.execute([])?;
+        conn.prepare_cached(STAGE_TEST_EDGES_SQL)?.execute([])?;
         Ok(())
     }
 
     fn clear_stage(&self, conn: &Connection) -> Result<()> {
-        conn.execute("DELETE FROM temp.go_unit_summary_units", [])?;
+        conn.prepare_cached("DELETE FROM temp.go_unit_summary_units")?
+            .execute([])?;
         Ok(())
     }
 

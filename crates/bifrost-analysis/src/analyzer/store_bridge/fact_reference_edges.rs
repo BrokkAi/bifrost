@@ -25,8 +25,9 @@ use crate::analyzer::resolution::fact_source::{
 use crate::analyzer::resolution::local_identity::ResolutionIdentityTranslation;
 use crate::analyzer::resolution::worker_transport::WorkerAnswer;
 use crate::analyzer::resolution::{
-    BindingFragmentId, FactReferenceSiteMetadata, MAX_REFERENCE_SEEDS_PER_BATCH, ResolutionAnswer,
-    ResolutionBatchMetrics, ResolutionCompletion, ResolutionIncompleteReason, SemanticId,
+    BindingFragmentId, FactCallableReceiverChannels, FactReferenceSiteMetadata,
+    MAX_REFERENCE_SEEDS_PER_BATCH, ResolutionAnswer, ResolutionBatchMetrics, ResolutionCompletion,
+    ResolutionIncompleteReason, SemanticId,
 };
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 
@@ -564,6 +565,9 @@ impl<'analyzer> NativeReferenceEdgeBatchProjector<'analyzer> {
         let mut definitions = HashSet::default();
         for answer in batch.answers() {
             definitions.extend(answer.answer().binding().targets().iter().copied());
+            if let Some(targets) = answer.scoped_withheld_targets() {
+                definitions.extend(targets.iter().copied());
+            }
             if let Some(owner) = answer.reference_owner().flatten() {
                 definitions.insert(owner);
             }
@@ -2365,8 +2369,18 @@ fn canonical_inverse_row_order(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| {
             left.reference_kind
+                .known()
+                .iter()
+                .next()
                 .map(|kind| kind as u8)
-                .cmp(&right.reference_kind.map(|kind| kind as u8))
+                .cmp(
+                    &right
+                        .reference_kind
+                        .known()
+                        .iter()
+                        .next()
+                        .map(|kind| kind as u8),
+                )
         })
         .then_with(|| (left.proof as u8).cmp(&(right.proof as u8)))
         .then_with(|| left.usage_kind.cmp(&right.usage_kind))
@@ -2432,6 +2446,7 @@ const fn inverse_reason_rank(reason: &EdgeIncompleteReason) -> u8 {
         EdgeIncompleteReason::InverseIndexTargetUncovered => 14,
         EdgeIncompleteReason::TimeBudgetExceeded => 15,
         EdgeIncompleteReason::SelectedInverseIndexUnavailable { .. } => 16,
+        EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => 17,
     }
 }
 
@@ -2934,6 +2949,20 @@ pub const fn fact_callable_receiver_target_admission(
         external_candidate: channels.includes_external(),
         same_owner_inventory: channels.includes_self_receiver(),
         gap: disposition.gap(),
+    }
+}
+
+/// A source-proven current instance selects the self-receiver channel even
+/// when the language publishes member calls in the Value namespace. Other
+/// origins need target-local receiver analysis before choosing a channel.
+pub const fn fact_reference_receiver_channels(
+    origin: Option<ResolutionCallableReceiverOrigin>,
+) -> FactCallableReceiverChannels {
+    match origin {
+        Some(ResolutionCallableReceiverOrigin::CurrentInstance) => {
+            FactCallableReceiverChannels::SelfReceiver
+        }
+        _ => FactCallableReceiverChannels::None,
     }
 }
 
@@ -3543,6 +3572,7 @@ fn push_reference_edges(
     owner_relation: OwnerRelation,
     proof: UsageProof,
     ambiguous_candidate: bool,
+    dispatch_extensibility: Option<brokk_bifrost_core::analyzer::model::DispatchExtensibility>,
     usage_kinds: &[UsageHitKind],
     emitted: &mut HashSet<(CodeUnit, UsageHitKind)>,
     missing_reference_kinds: &mut HashSet<(SemanticId, SemanticId)>,
@@ -3550,8 +3580,8 @@ fn push_reference_edges(
     gaps: &mut Vec<FactReferenceEdgeGap>,
     reasons: &mut Vec<EdgeIncompleteReason>,
 ) {
-    let reference_kind = file.classifier.as_ref().and_then(|classifier| {
-        classifier.classify_reference_kind(range.start_byte, range.end_byte, &target)
+    let reference_kind = file.classifier.as_ref().map(|classifier| {
+        classifier.classify_reference_facets(range.start_byte, range.end_byte, &target)
     });
     // Import bindings have an exact editor role but no runtime reference kind.
     // Preserve their rows without inventing a missing call/read classification.
@@ -3564,6 +3594,12 @@ fn push_reference_edges(
         && usage_kinds
             .iter()
             .any(|kind| !matches!(kind, UsageHitKind::Import | UsageHitKind::Reexport));
+    // The kind axis is unsupported only for a file without a classifier. A
+    // classifier always answers with facets, and a kind it cannot prove stays
+    // undecided on the row, where every kind consumer reads it
+    // (`ReferenceFacets::matches`, per-kind edge parity, the canonical graph's
+    // kind projection). A file-level gap for an undecided facet would only
+    // repeat that per-row answer, coarsened to the whole target (#9803).
     if needs_reference_kind
         && reference_kind.is_none()
         && missing_reference_kinds.insert((reference, target_semantic))
@@ -3587,6 +3623,7 @@ fn push_reference_edges(
             continue;
         }
         edges.push(ReferenceEdgeRow {
+            dispatch_extensibility: dispatch_extensibility.filter(|_| target.is_function()),
             site: EdgeSite {
                 file: file.file().clone(),
                 range,
@@ -3595,7 +3632,9 @@ fn push_reference_edges(
             },
             owner_relation,
             target: target.clone(),
-            reference_kind,
+            reference_kind: reference_kind.unwrap_or_else(|| {
+                brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None)
+            }),
             proof,
             ambiguous_candidate: ambiguous_candidate
                 && usage_kind.included_in(UsageHitSurface::ExternalUsages),
@@ -3817,15 +3856,28 @@ pub fn project_fact_reference_edge_batch(
                 &mut reasons,
                 EdgeIncompleteReason::ForwardResolutionIncomplete,
             );
-            let key = (metadata.start_byte(), metadata.end_byte());
-            let name = catalog
-                .reference_facts
-                .get(&answer.reference())
-                .map(|(name, _)| name.clone());
-            unresolved_sites
-                .entry(key)
-                .or_default()
-                .push((site.clone(), name));
+            if let Some(targets) = answer.scoped_withheld_targets() {
+                // The producer has already scoped this open label to possible
+                // attribute declarations. A name-only row would also withhold
+                // unrelated classes with the same spelling.
+                for &target in targets {
+                    if let FactReferenceEdgeDeclaration::Graph(declaration) =
+                        catalog.declaration(target)?
+                    {
+                        note_undrawn_target(&mut withheld_references, site.as_ref(), declaration);
+                    }
+                }
+            } else {
+                let key = (metadata.start_byte(), metadata.end_byte());
+                let name = catalog
+                    .reference_facts
+                    .get(&answer.reference())
+                    .map(|(name, _)| name.clone());
+                unresolved_sites
+                    .entry(key)
+                    .or_default()
+                    .push((site.clone(), name));
+            }
         }
 
         let projection =
@@ -3943,6 +3995,7 @@ pub fn project_fact_reference_edge_batch(
                         projection.binding_shape(),
                         FactReferenceBindingShape::CompleteAmbiguity(_)
                     ),
+                    answer.dispatch_extensibility(),
                     usage_kinds,
                     &mut emitted,
                     &mut missing_reference_kinds,
@@ -4030,8 +4083,8 @@ pub fn project_fact_reference_edge_batch(
                 continue;
             }
             let same_owner_inventory = value_like
-                && (metadata.receiver_origin()
-                    == Some(ResolutionCallableReceiverOrigin::CurrentInstance)
+                && (fact_reference_receiver_channels(metadata.receiver_origin())
+                    .includes_self_receiver()
                     || owner_relation == OwnerRelation::SelfReference
                     || (metadata.unqualified()
                         && is_same_owner_member_reference(owner_relation, &target)));
@@ -4046,6 +4099,7 @@ pub fn project_fact_reference_edge_batch(
                 owner_relation,
                 proof,
                 projection.status() == FactReferenceProjectionStatus::Ambiguous,
+                answer.dispatch_extensibility(),
                 if metadata.site_kind() == ResolutionSiteKind::ImportDeclaration
                     || file.classifier.as_ref().is_some_and(|classifier| {
                         classifier.is_import_binding_reference(

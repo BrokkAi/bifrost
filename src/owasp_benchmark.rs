@@ -1,6 +1,6 @@
 //! OWASP Benchmark (Java) taint bakeoff scorer.
 //!
-//! This module scores Bifrost's `require-model` taint analysis against the
+//! This module scores Bifrost's taint analysis against the
 //! labeled OWASP BenchmarkJava corpus. It lives in the facade for the same
 //! reason `summary_foundry_demand` does: it needs both the semantic-pack /
 //! semantic-model machinery from `brokk-bifrost-analysis` and the policy
@@ -21,7 +21,8 @@
 //! `expectedresults-1.2.csv`, builds one workspace analyzer over the Benchmark
 //! source (with the built classpath fed in so types resolve), activates the
 //! shipped Java sanitizer packs plus the pinned ESAPI pack, runs one
-//! `require-model` taint policy per injection category through the production
+//! taint policy per injection category, under the chosen unmodeled-call
+//! behavior, through the production
 //! evaluator, maps each finding and each per-root completion back to its case,
 //! and feeds the pure core. The whole run is a measurement performed once; the
 //! artifact it writes is committed.
@@ -49,7 +50,9 @@ use brokk_bifrost_analysis::{
     AnalyzerConfig, CancellationToken, DependencyPackEcosystem, DependencyPackWorkspaceContext,
     FilesystemProject, JvmDependencyDiscoveryMode, JvmExternalArtifact, Project, WorkspaceAnalyzer,
 };
-use brokk_bifrost_flow::dataflow::{SemanticInputStatus, SummaryBoundaryKind};
+use brokk_bifrost_flow::dataflow::{
+    SemanticInputStatus, SummaryBoundaryKind, UnmodeledCallBehavior,
+};
 use brokk_bifrost_policy::{
     PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
     PolicySemanticModelContext, PolicySourceIdentity,
@@ -130,8 +133,8 @@ pub enum CaseCompletion {
     /// Proven precisely, but resting on authored-complete external procedure
     /// summaries rather than analyzed code (#1916).
     ProvenBySummary,
-    /// The `require-model` analysis abstained: an unmodeled boundary on the flow
-    /// prevented a reliable verdict.
+    /// The analysis abstained: an unmodeled boundary on the flow prevented a
+    /// reliable verdict.
     Inconclusive,
     /// No taint root formed for the case's file, so no verdict was even
     /// attempted. Treated exactly like `Inconclusive` for scoring (an
@@ -528,7 +531,7 @@ fn case_name_from_path(path: &str) -> Option<String> {
 }
 
 // ===========================================================================
-// Per-category require-model policies
+// Per-category taint policies
 // ===========================================================================
 
 /// One sink endpoint: the callee name to match and how to select its operand.
@@ -540,18 +543,36 @@ struct Sink {
 /// How a sink identifies the call whose operand it observes.
 ///
 /// Most Benchmark endpoints are intentionally broad name selectors. The
-/// PrintWriter formatting overloads are different: their payload formals move
-/// when Locale is present, so those endpoints use the exact call-binding
-/// relation and let the compiler map the selected formal back to each written
-/// caller-side actual.
+/// PrintWriter writer surface is different: `println`, `print`, `write` and
+/// `append` share their names with `StringBuilder`, `Writer` and other
+/// receivers, and the formatting overloads move their payload formals when a
+/// Locale is present. Those endpoints name the qualified callable instead.
+/// The policy loader resolves the qualified locator against the activated
+/// `bifrost.jdk` bundle to the whole overload family, and the exact
+/// call-binding relation maps the selected formal back to each written
+/// caller-side actual. The generated bundle names its members by digest, so
+/// the qualified name is the only stable way to spell them.
 enum SinkSelector {
     Name {
         argument: u32,
     },
-    ExactCallBinding {
-        model_id: &'static str,
-        formal_name: &'static str,
+    QualifiedCallBinding {
+        callable: &'static str,
+        formal: SinkFormal,
     },
+}
+
+/// The payload formal of a qualified sink. A name selects it in every overload
+/// that declares it; the formatting overloads need one, because Locale shifts
+/// the payload's position. An index selects the same position in every
+/// overload; the print, println and write families need one, because the
+/// payload's formal name differs by overload (`s`, `obj`, `buf`, `x`), and a
+/// name selector rejecting every overload it witnesses reports the discovery
+/// incomplete.
+#[derive(Clone, Copy)]
+enum SinkFormal {
+    Name(&'static str),
+    Index(u32),
 }
 
 /// The attacker-controlled sources, shared by every category. These are the
@@ -581,12 +602,9 @@ fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
         callee,
         selector: SinkSelector::Name { argument },
     };
-    let exact = |callee, model_id, formal_name| Sink {
+    let qualified = |callee, callable, formal| Sink {
         callee,
-        selector: SinkSelector::ExactCallBinding {
-            model_id,
-            formal_name,
-        },
+        selector: SinkSelector::QualifiedCallBinding { callable, formal },
     };
     match category {
         // The JDBC lane (`prepareStatement` .. `addBatch`) plus the Spring
@@ -612,12 +630,23 @@ fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
             s("queryForRowSet", 0),
             s("batchUpdate", 0),
         ],
-        InjectionCategory::Cmdi => vec![s("exec", 0), s("command", 0), s("ProcessBuilder", 0)],
+        // `Runtime.exec(cmd, envp, ...)`: the environment array is a second
+        // injection point (`PATH`, `LD_PRELOAD`), and the Benchmark labels
+        // flows into it as command injection.
+        InjectionCategory::Cmdi => vec![
+            s("exec", 0),
+            s("exec", 1),
+            s("command", 0),
+            s("ProcessBuilder", 0),
+        ],
         // DirContext.search(name, filter, ...): both the distinguished name and
         // the search filter are injectable, so both operands are sinks.
         InjectionCategory::Ldapi => vec![s("search", 0), s("search", 1)],
+        // `new File(parent, child)` resolves `child` against `parent`, so an
+        // attacker-controlled child path traverses as well as a whole path.
         InjectionCategory::Pathtraver => vec![
             s("File", 0),
+            s("File", 1),
             s("FileInputStream", 0),
             s("FileOutputStream", 0),
             s("RandomAccessFile", 0),
@@ -629,39 +658,58 @@ fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
         ],
         InjectionCategory::Xpathi => vec![s("evaluate", 0), s("compile", 0)],
         InjectionCategory::Xss => vec![
-            exact("println", "member.printwriter.println-string", "x"),
-            exact("print", "member.printwriter.print-string", "s"),
-            exact("write", "member.printwriter.write-string", "s"),
-            exact("format", "member.printwriter.format-format", "format"),
-            exact("format", "member.printwriter.format-format", "args"),
-            exact(
-                "format",
-                "member.printwriter.format-locale-format",
-                "format",
+            qualified(
+                "println",
+                "java.io.PrintWriter.println",
+                SinkFormal::Index(0),
             ),
-            exact("format", "member.printwriter.format-locale-format", "args"),
-            exact("printf", "member.printwriter.printf-format", "format"),
-            exact("printf", "member.printwriter.printf-format", "args"),
-            exact(
+            qualified("print", "java.io.PrintWriter.print", SinkFormal::Index(0)),
+            qualified("write", "java.io.PrintWriter.write", SinkFormal::Index(0)),
+            qualified(
+                "format",
+                "java.io.PrintWriter.format",
+                SinkFormal::Name("format"),
+            ),
+            qualified(
+                "format",
+                "java.io.PrintWriter.format",
+                SinkFormal::Name("args"),
+            ),
+            qualified(
                 "printf",
-                "member.printwriter.printf-locale-format",
-                "format",
+                "java.io.PrintWriter.printf",
+                SinkFormal::Name("format"),
             ),
-            exact("printf", "member.printwriter.printf-locale-format", "args"),
-            s("append", 0),
+            qualified(
+                "printf",
+                "java.io.PrintWriter.printf",
+                SinkFormal::Name("args"),
+            ),
+            qualified(
+                "append",
+                "java.io.PrintWriter.append",
+                SinkFormal::Name("csq"),
+            ),
         ],
     }
 }
 
 /// The policy id for one category, stable and auditable.
-pub fn policy_id(category: InjectionCategory) -> String {
-    format!("bifrost.owasp-benchmark.{}.require-model", category.label())
+pub fn policy_id(category: InjectionCategory, call_modeling: UnmodeledCallBehavior) -> String {
+    format!(
+        "bifrost.owasp-benchmark.{}.{}",
+        category.label(),
+        call_modeling.label()
+    )
 }
 
-/// Build the `require-model` taint policy source for one category. Every policy
-/// shares the source set and differs only in its sink set, so a finding
-/// attributes unambiguously to the category whose policy produced it.
-pub fn build_policy(category: InjectionCategory) -> String {
+/// Build the taint policy source for one category. Every policy shares the
+/// source set and differs only in its sink set, so a finding attributes
+/// unambiguously to the category whose policy produced it. `call_modeling`
+/// decides what crosses a call that has neither an analyzed body nor a model:
+/// `paranoid` propagates every structurally justified transfer, `optimistic`
+/// preserves facts only, and `require-model` abstains.
+pub fn build_policy(category: InjectionCategory, call_modeling: UnmodeledCallBehavior) -> String {
     let hazard_label = category.hazard_label();
     let mut sources = String::new();
     for (index, callee) in SOURCE_CALLEES.iter().enumerate() {
@@ -697,10 +745,7 @@ pub fn build_policy(category: InjectionCategory) -> String {
                      \x20           :dangerous-operand (argument :index {argument}) :accepts [{hazard_label}])\n"
                 ));
             }
-            SinkSelector::ExactCallBinding {
-                model_id,
-                formal_name,
-            } => {
+            SinkSelector::QualifiedCallBinding { callable, formal } => {
                 // Keep the call-binding row as the endpoint's output. The
                 // `call-argument` query step filters by the exact declared
                 // formal, while taint endpoint lowering remaps that formal to
@@ -708,39 +753,51 @@ pub fn build_policy(category: InjectionCategory) -> String {
                 // essential for Locale-first and variadic overloads: Locale is
                 // formal 0, format is formal 1, and every written vararg maps
                 // to formal 2.
-                let display_name = format!("{callee} {formal_name}");
+                let (display_name, formal_selector, operand) = match formal {
+                    SinkFormal::Name(name) => (
+                        format!("{callee} {name}"),
+                        format!(":formal-name {name:?}"),
+                        format!("(argument :name {name:?})"),
+                    ),
+                    SinkFormal::Index(position) => (
+                        format!("{callee} #{position}"),
+                        format!(":formal-index {position}"),
+                        format!("(argument :index {position})"),
+                    ),
+                };
                 sinks.push_str(&format!(
                     "          (sink :id snk-{index} :display-name {display_name:?}\n\
                      \x20           :categories [data.sensitive]\n\
                      \x20           :selector (rql :schema-version 1\n\
                      \x20             (language java\n\
-                     \x20               (call-argument :formal-name {formal_name:?}\n\
-                     \x20                 (resolved-call :resolves-to {model_id} :proof declared\n\
+                     \x20               (call-argument {formal_selector}\n\
+                     \x20                 (resolved-call :resolves-to {callable:?} :proof declared\n\
                      \x20                   (call-bindings (call-shape (call :callee (name {callee:?}))))))))\n\
-                     \x20           :dangerous-operand (argument :name {formal_name:?}) :accepts [{hazard_label}])\n",
+                     \x20           :dangerous-operand {operand} :accepts [{hazard_label}])\n",
                 ));
             }
         }
     }
-    let id = policy_id(category);
+    let id = policy_id(category, call_modeling);
     let taxonomy_id = format!("BENCHMARK-{}", category.label().to_uppercase());
     format!(
         "(policy\n\
         \x20 :schema-version 1\n\
         \x20 :id {id:?}\n\
-        \x20 :name \"OWASP Benchmark {label} (require-model)\"\n\
+        \x20 :name \"OWASP Benchmark {label} ({call_modeling})\"\n\
         \x20 :message \"data carrying {hazard_label} reached a {label} sink\"\n\
         \x20 :severity warning\n\
         \x20 :analysis (analysis\n\
         \x20   :type taint\n\
         \x20   :mode may\n\
-        \x20   :call-modeling (call-modeling :unmodeled require-model)\n\
+        \x20   :call-modeling (call-modeling :unmodeled {call_modeling})\n\
         \x20   :sources (endpoint-set :entries [\n{sources}          ])\n\
         \x20   :sinks (endpoint-set :entries [\n{sinks}          ]))\n\
         \x20 :classification (classification\n\
         \x20   :fallback (classification-id :taxonomy \"OWASP\" :id {taxonomy_id:?})))\n",
         label = category.label(),
         hazard_label = hazard_label,
+        call_modeling = call_modeling.label(),
     )
 }
 
@@ -817,7 +874,7 @@ pub fn promote_staged_sanitizer_pack(
 /// One pack to activate: its on-disk JSON and the activation evidence that lets
 /// the analyzer bind it. The set spans sanitizer packs, external declaration
 /// packs (servlet/JDBC/java.lang framework decls), and the golden JDK
-/// procedure-summary pack -- every pack the require-model run needs to close a
+/// procedure-summary pack -- every pack the run needs to close a
 /// boundary the Benchmark routes flows through.
 struct LoadedPack {
     pack_id: String,
@@ -853,7 +910,7 @@ fn jdk_toolchain() -> CatalogCoordinate {
 // bakeoff-vs-product divergence issue #2558 exists to close.
 
 /// The exact JDK release the pinned `bifrost.jdk` pack was extracted from
-/// (`semantic-packs/jvm/temurin-jdk-21.0.8+9.json`). The pack's activation
+/// (pinned in `BrokkAi/bifrost-packs`). The pack's activation
 /// selector accepts the whole `>=21.0.0, <22.0.0` API surface that build
 /// serves (#3465), so the harness names the extraction build itself rather
 /// than an arbitrary member of the range: the measurement is about the pack
@@ -979,6 +1036,9 @@ pub struct RunConfig {
     /// control (every shipped pack declares `safety.review_required`, so an
     /// enable control is what lets it resolve as active).
     pub packs: Vec<PackSpec>,
+    /// What each category's taint policy does at a call with neither an
+    /// analyzed body nor a model.
+    pub call_modeling: UnmodeledCallBehavior,
     /// Wall-clock budget for each category's taint run.
     pub timeout: Duration,
     /// Optional cap on the number of cases scored, for a smoke run. `None`
@@ -1158,7 +1218,7 @@ fn run_analyzer_config(dependency_jars: &[PathBuf]) -> AnalyzerConfig {
 }
 
 /// Run the whole bakeoff: build the workspace, activate the packs, run one
-/// require-model policy per category, map findings and completions back to
+/// taint policy per category, map findings and completions back to
 /// cases, and score.
 pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let csv_path = config.benchmark_root.join("expectedresults-1.2.csv");
@@ -1178,8 +1238,13 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         .map_err(|error| format!("open benchmark project: {error}"))?;
     let project: Arc<dyn Project> = Arc::new(project);
     let analyzer_config = run_analyzer_config(&config.dependency_jars);
-    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(project, analyzer_config)
-        .map_err(|error| format!("build benchmark workspace: {error}"))?;
+    // One benchmark run owns its retention budget.
+    let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
+        analyzer_config.retention_budget_bytes(),
+    );
+    let workspace =
+        WorkspaceAnalyzer::build_ephemeral_footgun_with_budget(project, analyzer_config, &budget)
+            .map_err(|error| format!("build benchmark workspace: {error}"))?;
 
     // The same measurement `PolicyCoordinator` takes to scale its budget lanes:
     // the on-disk size of every analyzed file. Recording it makes the run's
@@ -1342,9 +1407,9 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             category.label()
         );
         let cancellation = CancellationToken::new().with_timeout(config.timeout);
-        let policy = build_policy(category);
+        let policy = build_policy(category, config.call_modeling);
         let inputs = [PolicyEvaluationInput::embedded(
-            PolicySourceIdentity::new(policy_id(category)),
+            PolicySourceIdentity::new(policy_id(category, config.call_modeling)),
             &policy,
         )];
         let outcome = evaluate_policy_inputs_with_analyzer_and_semantic_models(
@@ -1359,6 +1424,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
                 persistence: None,
             },
             Some(&cancellation),
+            &budget,
         )
         .map_err(|error| format!("evaluate {} policy: {error}", category.label()))?;
 
@@ -1793,7 +1859,7 @@ mod tests {
 
         for (category, hazard_label) in expected {
             assert_eq!(category.hazard_label(), hazard_label);
-            let policy = build_policy(category);
+            let policy = build_policy(category, UnmodeledCallBehavior::Paranoid);
 
             assert!(!policy.contains("attacker-controlled"));
             assert_eq!(
@@ -2000,12 +2066,12 @@ mod tests {
     }
 
     #[test]
-    fn built_policy_carries_sources_sinks_and_require_model() {
-        let policy = build_policy(InjectionCategory::Sqli);
-        assert!(policy.contains(":unmodeled require-model"));
+    fn built_policy_carries_sources_sinks_and_call_modeling() {
+        let policy = build_policy(InjectionCategory::Sqli, UnmodeledCallBehavior::Optimistic);
+        assert!(policy.contains(":unmodeled optimistic"));
         assert!(policy.contains("getParameter"));
         assert!(policy.contains("executeQuery"));
-        assert!(policy.contains("bifrost.owasp-benchmark.sqli.require-model"));
+        assert!(policy.contains("bifrost.owasp-benchmark.sqli.optimistic"));
         // Every sink selector constrains minimum arity so a no-operand
         // arity-overloaded call (e.g. `PreparedStatement.execute()`) does not
         // collide by name and abort binding (#1935 cause 1). An operand at
@@ -2015,12 +2081,15 @@ mod tests {
         // benchmark cases sink through; its SQL operand is argument 0 too.
         assert!(policy.contains("(call :callee (name \"queryForObject\") (arity :min 1))"));
         // A pathtraver policy names the file sinks, not the sql ones.
-        let pathtraver = build_policy(InjectionCategory::Pathtraver);
+        let pathtraver = build_policy(
+            InjectionCategory::Pathtraver,
+            UnmodeledCallBehavior::Paranoid,
+        );
         assert!(pathtraver.contains("FileInputStream"));
         assert!(!pathtraver.contains("executeQuery"));
         // The ldapi filter operand sits at argument index 1, so its sink
         // requires at least two positional arguments.
-        let ldapi = build_policy(InjectionCategory::Ldapi);
+        let ldapi = build_policy(InjectionCategory::Ldapi, UnmodeledCallBehavior::Paranoid);
         assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 1))"));
         assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 2))"));
     }

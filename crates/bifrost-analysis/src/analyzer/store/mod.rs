@@ -31,8 +31,8 @@ pub use crate::analyzer::store_bridge::{
     AnalyzerStoreEngineExt, prepare_parsed_blob_at_generations,
 };
 
-#[cfg(any(test, feature = "test-support"))]
 pub mod python_unit_summaries {
+    #[cfg(any(test, feature = "test-support"))]
     pub use crate::analyzer::store_bridge::PythonEnvironmentPublicationEngineExt;
     pub use brokk_bifrost_store::analyzer::store::python_unit_summaries::*;
 }

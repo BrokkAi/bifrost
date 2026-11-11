@@ -57,8 +57,13 @@ fn embedded_policies_accept_the_full_batch_capacity_without_python_models() {
         })
         .collect::<Vec<_>>();
     let options = crate::test_support::evaluation_options("2026-07-27");
-    let outcome =
-        evaluate_policy_inputs(project.path(), &inputs, &options).expect("a full batch is legal");
+    let outcome = evaluate_policy_inputs(
+        project.path(),
+        &inputs,
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .expect("a full batch is legal");
     assert_eq!(outcome.report().runs().len(), maximum);
     assert!(
         outcome
@@ -80,7 +85,15 @@ fn embedded_policies_accept_the_full_batch_capacity_without_python_models() {
         PolicySourceIdentity::new("policies/one-more.rqlp"),
         matching_policy(maximum),
     ));
-    assert!(evaluate_policy_inputs(project.path(), &too_many, &options).is_err());
+    assert!(
+        evaluate_policy_inputs(
+            project.path(),
+            &too_many,
+            &options,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -114,6 +127,7 @@ fn policy_files_accept_the_full_batch_capacity() {
         &flow,
         &options,
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("a full file batch is legal");
     assert_eq!(outcome.report().runs().len(), maximum);
@@ -134,7 +148,8 @@ fn policy_files_accept_the_full_batch_capacity() {
             &workspace,
             &flow,
             &options,
-            None
+            None,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests()
         )
         .is_err()
     );

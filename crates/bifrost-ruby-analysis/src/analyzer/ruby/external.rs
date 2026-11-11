@@ -183,6 +183,9 @@ schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.ruby.external".to_owned(),
                     activation,
@@ -219,6 +222,18 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
         dependency.evidence.language == "ruby" && dependency.evidence.ecosystem == "rubygems"
+    }
+
+    /// An exact `Gemfile.lock` package coordinate names no artifact.
+    fn installed_packs_only(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.artifacts.is_empty() && dependency.evidence.package.is_some()
+    }
+
+    /// A reviewed gem pack and the declarations generated from the same gem's
+    /// archive would both own its constants, so the reviewed pack wins and
+    /// generation serves gems no reviewed pack covers (#10011).
+    fn reviewed_pack_supersedes_production(&self, dependency: &ResolvedDependency) -> bool {
+        !dependency.artifacts.is_empty()
     }
 
     fn produce(
@@ -282,6 +297,7 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
                 artifact_sha256: None,
             }],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source,
                 revision: Some(artifact.sha256().to_owned()),
             },

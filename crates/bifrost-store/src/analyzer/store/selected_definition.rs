@@ -42,7 +42,7 @@ pub(crate) enum SelectedDefinitionSemanticReadOutcome {
 /// tree, or a second item declared under a different `cfg`. The declaration
 /// row and the native bridge exist for all three, so this reader answers for
 /// all three and the caller decides what each one means to it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub enum SelectedDeclarationDefinition {
     Lexical(LexicalDefinition),
@@ -76,7 +76,8 @@ pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str = "SELECT json_extract(r
             declaration.start_line, declaration.end_line,
             declaration.name_start_byte, declaration.name_end_byte,
             declaration.name_start_line, declaration.name_end_line,
-            declaration.name_occurrence_id IS NULL
+            declaration.name_occurrence_id IS NULL,
+            semantic.namespace
      FROM json_each(?1) AS request
      CROSS JOIN temp.selected_resolution_mounts AS mount
        ON mount.mount_ordinal = json_extract(request.value, '$[0]')
@@ -102,7 +103,8 @@ pub(super) const SELECTED_LEXICAL_DEFINITIONS_SQL: &str = "SELECT json_extract(r
 
 /// The hydrated `code_units` columns every selected unit reader projects, in
 /// the order `candidate_row_from_row` reads them.
-const SELECTED_UNIT_COLUMNS: &str = "keys.blob_oid, units.lang, units.unit_key, units.kind,
+pub(super) const SELECTED_UNIT_COLUMNS: &str =
+    "keys.blob_oid, units.lang, units.unit_key, units.kind,
      units.short_name, units.content_qualifier, units.signature,
      units.synthetic, units.is_type_alias, units.top_level_ordinal,
      units.in_declarations, units.in_definition_lookup,
@@ -255,6 +257,9 @@ thread_local! {
     static SELECTED_DEFINITION_UNIT_SQL_WORK: std::cell::Cell<(u64, u64)> = const {
         std::cell::Cell::new((0, 0))
     };
+    static SELECTED_LEXICAL_DEFINITION_SQL_EXECUTIONS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Executions and VM steps of the unit hydration statements only, excluding
@@ -263,6 +268,12 @@ thread_local! {
 #[doc(hidden)]
 pub fn take_selected_definition_unit_sql_work() -> (u64, u64) {
     SELECTED_DEFINITION_UNIT_SQL_WORK.with(|work| work.replace((0, 0)))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_selected_lexical_definition_sql_executions() -> u64 {
+    SELECTED_LEXICAL_DEFINITION_SQL_EXECUTIONS.with(|work| work.replace(0))
 }
 
 pub(super) const SELECTED_DEFINITION_BLOB_SQL: &str = "SELECT interior.blob_id FROM temp.selected_resolution_mounts AS mount CROSS JOIN main.resolution_fragment_interiors AS interior ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language AND interior.semantic_language=mount.semantic_language AND interior.producer_epoch=mount.producer_epoch AND interior.interior_digest=mount.interior_digest AND interior.publication_state='complete' WHERE mount.mount_ordinal=?1";
@@ -290,8 +301,8 @@ static HIERARCHY_DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> = std::sy
      JOIN main.code_units AS units ON units.blob_id=interior.blob_id AND units.unit_key=definition.unit_key
      JOIN main.blobs AS keys ON keys.id=units.blob_id
      JOIN main.blob_meta AS meta ON meta.blob_id=units.blob_id
-     WHERE interior.blob_id=?1 AND interior.publication_state='complete' AND units.in_declarations=1 AND {}
-     ORDER BY definition.semantic_key", super::PARSED_BLOB_COMPLETE_CONDITION)
+     WHERE interior.blob_id=?1 AND interior.{} AND units.in_declarations=1 AND {}
+     ORDER BY definition.semantic_key", super::publication::IS_COMPLETE, super::PARSED_BLOB_COMPLETE_CONDITION)
     },
 );
 
@@ -369,6 +380,10 @@ impl SelectedResolutionMountInventory<'_> {
                     .collect::<Vec<_>>(),
             )
             .expect("integer and Boolean request tuples serialize");
+            if let Some(rows) = self.selected_lexical_read_memo.borrow().get(&requests) {
+                all_rows.extend(rows.iter().cloned());
+                continue;
+            }
             let rows =
                 with_resolution_read_progress_handler(self.connection(), cancellation, |conn| {
                     let mut statement = conn.prepare_cached(SELECTED_LEXICAL_DEFINITIONS_SQL)?;
@@ -393,6 +408,7 @@ impl SelectedResolutionMountInventory<'_> {
                                 } else {
                                     Some(range(8)?)
                                 },
+                                row.get::<_, String>(13)?,
                             ))
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()
@@ -405,7 +421,12 @@ impl SelectedResolutionMountInventory<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            for (mount, definition, kind, identifier, declaration_range, name_range) in rows {
+            #[cfg(any(test, feature = "test-support"))]
+            SELECTED_LEXICAL_DEFINITION_SQL_EXECUTIONS.with(|work| work.set(work.get() + 1));
+            let mut projected_rows = Vec::with_capacity(rows.len());
+            for (mount, definition, kind, identifier, declaration_range, name_range, namespace) in
+                rows
+            {
                 // `source_declarations` checks that the lexical kind and the
                 // lexical identifier are either both stored or both absent,
                 // so the two halves cannot disagree here.
@@ -416,6 +437,17 @@ impl SelectedResolutionMountInventory<'_> {
                                 "invalid selected lexical declaration kind {kind:?}"
                             ))
                         })?;
+                        // SLS chapter 2 gives type and term names distinct
+                        // namespaces. The persisted semantic site already
+                        // owns that distinction; present a local type binder
+                        // as a type without changing source-declaration rows.
+                        let kind = match (kind, namespace.as_str()) {
+                            (DeclarationKind::Parameter, "type") => DeclarationKind::TypeParameter,
+                            (DeclarationKind::BlockLocalItem, "type") => {
+                                DeclarationKind::BlockLocalType
+                            }
+                            _ => kind,
+                        };
                         SelectedDeclarationDefinition::Lexical(LexicalDefinition {
                             source_file: None,
                             identifier,
@@ -436,8 +468,20 @@ impl SelectedResolutionMountInventory<'_> {
                         "a source declaration stores its lexical kind and identifier together: {kind:?}, {identifier:?}"
                     ),
                 };
-                all_rows.push((mount, definition, projected));
+                projected_rows.push((mount, definition, projected));
             }
+            if !cancellation.is_cancelled() {
+                self.selected_lexical_read_memo
+                    .borrow_mut()
+                    .insert_bounded_weighed(
+                        requests.clone(),
+                        projected_rows.clone(),
+                        requests
+                            .len()
+                            .saturating_add(projected_rows.len().saturating_mul(256)),
+                    );
+            }
+            all_rows.extend(projected_rows);
         }
         if cancellation.is_cancelled() {
             return Ok(SelectedLexicalDefinitionReadOutcome::Cancelled);
@@ -652,6 +696,18 @@ impl SelectedResolutionMountInventory<'_> {
             ));
         }
         let requests = requests.into_iter().collect::<Vec<_>>();
+        let projection = if sql == SELECTED_DEFINITION_UNITS_SQL.as_str() {
+            0
+        } else {
+            debug_assert_eq!(sql, SELECTED_DECLARATION_UNITS_SQL.as_str());
+            1
+        };
+        let memo_key = (projection, requests.clone());
+        if let Some(rows) = self.selected_unit_read_memo.borrow().get(&memo_key) {
+            return Ok(SelectedDefinitionUnitReadOutcome::Ready(
+                rows.clone().into_boxed_slice(),
+            ));
+        }
         let mut all_rows = Vec::new();
         for page in requests.chunks(SELECTED_MOUNT_PAGE_ROWS) {
             if cancellation.is_cancelled() {
@@ -703,12 +759,26 @@ impl SelectedResolutionMountInventory<'_> {
                 return Ok(SelectedDefinitionUnitReadOutcome::Cancelled);
             }
         }
+        let rows = all_rows
+            .into_iter()
+            .map(|(row, (mount, definition))| (mount, definition, row))
+            .collect::<Vec<_>>();
+        if !cancellation.is_cancelled() {
+            // The cap is shared by exact requests. Large hydration results
+            // are charged by an intentionally conservative per-row estimate.
+            self.selected_unit_read_memo
+                .borrow_mut()
+                .insert_bounded_weighed(
+                    memo_key,
+                    rows.clone(),
+                    requests
+                        .len()
+                        .saturating_mul(32)
+                        .saturating_add(rows.len().saturating_mul(1024)),
+                );
+        }
         Ok(SelectedDefinitionUnitReadOutcome::Ready(
-            all_rows
-                .into_iter()
-                .map(|(row, (mount, definition))| (mount, definition, row))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            rows.into_boxed_slice(),
         ))
     }
 }

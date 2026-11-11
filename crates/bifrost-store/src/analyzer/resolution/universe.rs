@@ -53,6 +53,8 @@ pub struct UniverseEntry {
     /// Source-free definition projection for this language's universe rule.
     /// None retains the existing predeclared or external-boundary surface.
     pub(crate) definition_tier: Option<PrecedenceTier>,
+    /// Whether a selected binding has the runtime-provided definition disposition.
+    pub(crate) predeclared: bool,
 }
 
 const fn go_primitive_type(
@@ -67,6 +69,7 @@ const fn go_primitive_type(
         identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::Primitive),
         range_type,
         definition_tier: None,
+        predeclared: true,
     }
 }
 
@@ -79,6 +82,7 @@ const fn go_builtin_type(spelling: &'static str) -> UniverseEntry {
         identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::LanguageBuiltin),
         range_type: None,
         definition_tier: None,
+        predeclared: true,
     }
 }
 
@@ -91,6 +95,7 @@ const fn go_callable(spelling: &'static str) -> UniverseEntry {
         identity_kind: UniverseIdentityKind::Callable,
         range_type: None,
         definition_tier: None,
+        predeclared: true,
     }
 }
 
@@ -103,6 +108,7 @@ const fn go_value(spelling: &'static str) -> UniverseEntry {
         identity_kind: UniverseIdentityKind::Value,
         range_type: None,
         definition_tier: None,
+        predeclared: true,
     }
 }
 
@@ -119,6 +125,7 @@ const fn jvm_builtin_type(
         identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::LanguageBuiltin),
         range_type: None,
         definition_tier: None,
+        predeclared: false,
     }
 }
 
@@ -377,6 +384,7 @@ const fn rust_primitive_type(spelling: &'static str) -> UniverseEntry {
         identity_kind: UniverseIdentityKind::Type(IntrinsicTypeKind::Primitive),
         range_type: None,
         definition_tier: None,
+        predeclared: false,
     }
 }
 
@@ -477,6 +485,7 @@ static PYTHON_UNIVERSE: std::sync::LazyLock<Vec<UniverseEntry>> = std::sync::Laz
             },
             range_type: None,
             definition_tier: None,
+            predeclared: true,
         })
         .collect()
 });

@@ -4,7 +4,13 @@ use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
 
 use brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes;
 
+use brokk_bifrost_analysis::analyzer::dependency_support::{
+    refuse_external_discovery_reads, report_external_discovery_read,
+};
 use brokk_bifrost_analysis::analyzer::semantic_model::CatalogCoordinate;
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    ExternalDiscoveryRead, UnverifiableDiscoveryRead,
+};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyArtifactRole;
 
@@ -246,6 +252,14 @@ fn discover_domain_with_runner(
     if discovery.mode == GoDependencyDiscoveryMode::Disabled {
         return DependencyDiscoveryOutcome::complete(Vec::new()).into();
     }
+    // Active discovery consumes go env/list output and may traverse the module cache.
+    report_external_discovery_read(ExternalDiscoveryRead::Unverifiable(
+        UnverifiableDiscoveryRead::ProcessOutput,
+    ));
+    report_external_discovery_read(ExternalDiscoveryRead::Unverifiable(
+        UnverifiableDiscoveryRead::ExternalCacheWalk,
+    ));
+    refuse_external_discovery_reads();
     if let Err(error) = validate_config(discovery) {
         return failed_outcome("go.config_invalid", error, cancellation, limits).into();
     }
@@ -572,12 +586,15 @@ fn build_curated_pack_evidence_outcome(
 ) -> DependencyDiscoveryOutcome {
     let mut modules = BTreeMap::new();
     let mut diagnostics = Vec::new();
+    let mut observed_standard = false;
     for package in packages {
         push_package_incompleteness_diagnostic(&package, &mut diagnostics, limits);
         if package.module.as_ref().is_some_and(|module| module.main) {
             continue;
         }
         if package.standard {
+            observed_standard |=
+                !package.incomplete && package.error.is_none() && package.deps_errors.is_empty();
             continue;
         }
         let Some(module) = package.module else {
@@ -625,6 +642,28 @@ fn build_curated_pack_evidence_outcome(
             declared_by: None,
         })
         .collect::<Vec<_>>();
+    if observed_standard && let Some(version) = &toolchain.version {
+        dependencies.push(ResolvedDependency {
+            id: format!("go:curated:stdlib:{version}"),
+            evidence: SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go-stdlib".to_owned(),
+                package: None,
+                module: None,
+                toolchain: Some(toolchain),
+                target: Some(target),
+                configuration: Some(configuration),
+                artifact_sha256: None,
+            },
+            provenance: vec![DependencyProvenance {
+                key: "go.version".to_owned(),
+                value: environment.goversion.clone(),
+            }],
+            artifacts: Vec::new(),
+            scope: DependencyScope::Unknown,
+            declared_by: None,
+        });
+    }
 
     let mut suppressed_diagnostics = SuppressedDiagnostics::default();
     if dependencies.len() > limits.max_dependencies {
@@ -663,7 +702,14 @@ fn build_curated_pack_evidence_outcome(
 
 fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, OsString)> {
     let build_configuration = host_build_configuration(config);
-    let mut env = reviewed_host_environment(|name| std::env::var_os(name));
+    let mut env = reviewed_host_environment(|name| {
+        let value = std::env::var_os(name);
+        report_external_discovery_read(ExternalDiscoveryRead::Environment {
+            name: name.into(),
+            value: value.clone(),
+        });
+        value
+    });
     env.extend([
         // #7002: belt-and-braces against git credential prompts; downloads and VCS stamping are already disabled.
         os_env("GIT_TERMINAL_PROMPT", "0"),
@@ -1647,6 +1693,7 @@ pub(crate) fn discover_domain(
 mod tests {
 
     use crate::analyzer::go::dependency_discovery::*;
+    use brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads;
     use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependencyArtifactInput;
 
     use brokk_bifrost_core::analyzer::config::GoAnalyzerConfig;
@@ -1679,6 +1726,26 @@ mod tests {
                 roots: RefCell::new(Vec::new()),
             }
         }
+    }
+
+    #[test]
+    fn active_go_discovery_refuses_external_carry() {
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Go);
+        let (_, reads) = capture_external_discovery_reads(|| {
+            resolve_with_runner(
+                &GoAnalyzerConfig::default(),
+                &project,
+                &DependencyPackLimits::default(),
+                None,
+                &FakeRunner::with_outputs([b"{}".to_vec()]),
+            )
+        });
+        assert!(!reads.complete);
+        assert!(reads.keys.iter().any(|read| matches!(
+            read,
+            ExternalDiscoveryRead::Unverifiable(UnverifiableDiscoveryRead::ProcessOutput)
+        )));
     }
 
     impl GoCommandRunner for FakeRunner {
@@ -2841,6 +2908,57 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "#9255: default Go discovery omitted actual standard packages from artifact-free activation evidence"
+    )]
+    fn default_go_discovery_emits_one_artifact_free_stdlib_coordinate() {
+        if Command::new("go").arg("version").output().is_err() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temporary.path().join("go.mod"),
+            "module example.com/bifrost-curated-smoke\n\ngo 1.24\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temporary.path().join("main.go"),
+            "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"ok\") }\n",
+        )
+        .unwrap();
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let config = GoAnalyzerConfig::default();
+        assert_eq!(
+            config.dependency_discovery.mode,
+            GoDependencyDiscoveryMode::CuratedPackEvidence
+        );
+        let outcome = resolve_go_semantic_pack_dependencies(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(outcome.complete, "{outcome:?}");
+        assert_eq!(outcome.dependencies.len(), 1, "{outcome:?}");
+        let dependency = &outcome.dependencies[0];
+        assert!(dependency.id.starts_with("go:curated:stdlib:"));
+        assert!(dependency.artifacts.is_empty());
+        assert_eq!(dependency.evidence.ecosystem, "go-stdlib");
+        assert_eq!(dependency.evidence.toolchain.as_ref().unwrap().name, "go");
+        assert!(
+            dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .unwrap()
+                .version
+                .is_some()
+        );
+        assert!(dependency.evidence.target.is_some());
+        assert!(dependency.evidence.configuration.is_some());
+    }
+
+    #[test]
     fn curated_evidence_keeps_only_exact_reachable_modules_without_sources() {
         let temporary = tempfile::tempdir().unwrap();
         let project = TestProject::new(temporary.path(), Language::Go);
@@ -2886,8 +3004,12 @@ mod tests {
 
         assert!(outcome.complete, "{:?}", outcome.diagnostics);
         assert_eq!(runner.invocations.borrow().len(), 2);
-        assert_eq!(outcome.dependencies.len(), 1);
-        let dependency = &outcome.dependencies[0];
+        assert_eq!(outcome.dependencies.len(), 2);
+        let dependency = outcome
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.id.starts_with("go:curated:github.com/"))
+            .unwrap();
         assert_eq!(
             dependency.id,
             "go:curated:github.com/stretchr/testify@v1.11.1"
@@ -2906,6 +3028,110 @@ mod tests {
                 .iter()
                 .any(|fact| { fact.key == "module.sum" && fact.value == "h1:reviewed" })
         );
+        let standard_library = outcome
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.id == "go:curated:stdlib:1.25.1")
+            .unwrap();
+        assert!(standard_library.artifacts.is_empty());
+        assert_eq!(standard_library.evidence.ecosystem, "go-stdlib");
+        assert_eq!(
+            standard_library.evidence.toolchain,
+            Some(CatalogCoordinate {
+                name: "go".to_owned(),
+                version: Some(Version::new(1, 25, 1)),
+            })
+        );
+        assert_eq!(
+            standard_library.evidence.target.as_deref(),
+            Some("go-linux-arm64")
+        );
+        assert!(standard_library.evidence.configuration.is_some());
+    }
+
+    #[test]
+    #[hardwon(
+        "#9255: curated Go discovery skipped clean standard packages, leaving reviewed stdlib packs inactive"
+    )]
+    fn curated_standard_evidence_requires_clean_metadata_and_exact_go_version() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let mut config = config();
+        config.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        for (standard_package, version, expected_standard) in [
+            (
+                serde_json::json!({"ImportPath": "net/http", "Standard": true}),
+                "go1.25.1",
+                true,
+            ),
+            (
+                serde_json::json!({"ImportPath": "net/http", "Standard": true, "Incomplete": true}),
+                "go1.25.1",
+                false,
+            ),
+            (
+                serde_json::json!({"ImportPath": "net/http", "Standard": true, "Error": {"Err": "unavailable"}}),
+                "go1.25.1",
+                false,
+            ),
+            (
+                serde_json::json!({"ImportPath": "net/http", "Standard": true, "DepsErrors": [{"Err": "unavailable"}]}),
+                "go1.25.1",
+                false,
+            ),
+            (
+                serde_json::json!({"ImportPath": "net/http", "Standard": true}),
+                "unknown-go",
+                false,
+            ),
+        ] {
+            let mut environment: serde_json::Value =
+                serde_json::from_slice(&environment(temporary.path())).unwrap();
+            environment["GOVERSION"] = version.into();
+            let package_stream = format!(
+                "{}\n{}\n",
+                standard_package,
+                serde_json::json!({
+                    "ImportPath": "example.com/broken",
+                    "Error": {"Err": "missing module"},
+                    "Module": {"Path": "example.com/broken", "Version": "v1.2.3"}
+                })
+            );
+            let runner = FakeRunner::with_outputs([
+                serde_json::to_vec(&environment).unwrap(),
+                package_stream.into_bytes(),
+            ]);
+            let outcome = resolve_with_runner(
+                &config,
+                &project,
+                &DependencyPackLimits::default(),
+                None,
+                &runner,
+            );
+            assert_eq!(
+                outcome
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| dependency.evidence.ecosystem == "go-stdlib")
+                    .count(),
+                usize::from(expected_standard),
+                "{standard_package:?}, {version}: {outcome:?}"
+            );
+            assert!(
+                !outcome.complete
+                    && outcome
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "go.package_incomplete"),
+                "{outcome:?}"
+            );
+            assert!(
+                outcome
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency.id == "go:curated:example.com/broken@v1.2.3")
+            );
+        }
     }
 
     #[test]

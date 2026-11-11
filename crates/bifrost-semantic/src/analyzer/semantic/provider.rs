@@ -6,7 +6,70 @@ use std::sync::{Arc, Mutex};
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
+use crate::analyzer::semantic::read_ledger::StoredSemanticIrPublicationAnswer;
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::gitblob::ParseVariant;
+use git2::Oid;
+
+/// The authority and exact store key used by one publication observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSemanticIrSelection {
+    pub rel_path: Box<str>,
+    pub oid: Oid,
+    pub storage_language: Box<str>,
+    pub variant: ParseVariant,
+}
+
+/// A refusal cannot be represented as an absent publication.
+#[derive(Debug)]
+pub enum StoredSemanticIrRead {
+    Refused,
+    Observed(Box<StoredSemanticIrObservation>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredSemanticIrPublicationHead {
+    NoHead,
+    StaleEpoch,
+    Present {
+        active_epoch: Box<str>,
+        row_digest: [u8; 32],
+        content: [u8; 32],
+        source_bytes: usize,
+    },
+}
+
+pub fn classify(
+    observation: &StoredSemanticIrObservation,
+    subject: [u8; 32],
+) -> StoredSemanticIrPublicationAnswer {
+    match &observation.head {
+        StoredSemanticIrPublicationHead::NoHead => StoredSemanticIrPublicationAnswer::NoHead,
+        StoredSemanticIrPublicationHead::StaleEpoch => {
+            StoredSemanticIrPublicationAnswer::StaleEpoch
+        }
+        StoredSemanticIrPublicationHead::Present {
+            active_epoch,
+            row_digest,
+            content,
+            ..
+        } if *content == subject => StoredSemanticIrPublicationAnswer::Present {
+            active_epoch: active_epoch.clone(),
+            row_digest: *row_digest,
+        },
+        StoredSemanticIrPublicationHead::Present { .. } => {
+            StoredSemanticIrPublicationAnswer::ContentMismatch
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct StoredSemanticIrObservation {
+    pub selection: StoredSemanticIrSelection,
+    pub head: StoredSemanticIrPublicationHead,
+    pub source_content: Option<[u8; 32]>,
+    pub rows: Option<Vec<crate::analyzer::semantic::ProcedureSemanticsParts>>,
+}
 
 use crate::analyzer::semantic::capabilities::SemanticCapabilities;
 
@@ -18,6 +81,7 @@ use crate::analyzer::semantic::ids::SemanticArtifactKey;
 
 use crate::analyzer::semantic::ids::StableDigest;
 
+use crate::analyzer::semantic::ir::ProcedureHandle;
 use crate::analyzer::semantic::ir::SemanticArtifact;
 
 use crate::analyzer::semantic::ir::SemanticIrError;
@@ -31,6 +95,10 @@ use brokk_bifrost_core::analyzer::work_budget::BudgetLedger;
 use brokk_bifrost_core::analyzer::work_budget::WorkBudgetExceeded;
 
 use brokk_bifrost_core::analyzer::work_budget::define_work_dimensions;
+
+/// A moment in a semantic budget's refusal count. See
+/// [`SemanticBudget::refusal_mark`].
+pub type SemanticBudgetRefusalMark = brokk_bifrost_core::analyzer::work_budget::RefusalMark;
 
 define_work_dimensions! {
     #[repr(u8)]
@@ -226,6 +294,8 @@ impl SemanticWork {
 #[derive(Debug, Clone)]
 pub struct SemanticBudget {
     ledger: BudgetLedger<SemanticWork>,
+    window_open: bool,
+    window_default_limits: Option<SemanticWork>,
     // Admitted plus worked per lane, so held-and-scanned bytes can count twice.
     // Cumulative accounting is telemetry, not a bound.
     cumulative: SemanticWork,
@@ -238,8 +308,12 @@ pub struct SemanticBudget {
     replay_observers: Vec<ReplayObserver>,
     lowering_work: Option<Arc<Mutex<SemanticWork>>>,
     resident_peak: SemanticWork,
+    /// What this ledger itself held at its peak, apart from rows it inherited
+    /// from a parent (see [`ResidentInterval`]).
+    own: ResidentInterval,
     resident_artifacts: Arc<ResidentArtifacts>,
     resident_owners: Arc<ResidentOwners>,
+    reacquired: Arc<Vec<MemoDependencyGuard>>,
     inherited_artifacts: Arc<ResidentArtifacts>,
     scope: Arc<SemanticBudgetScope>,
     charged_artifacts: Arc<HashSet<StableDigest>>,
@@ -248,8 +322,43 @@ pub struct SemanticBudget {
     /// on a staging copy that is then discarded is still recorded; a child
     /// ledger has its own.
     first_refusal: Arc<std::sync::OnceLock<SemanticBudgetRefusal>>,
+    refusal_origins: Arc<Mutex<SemanticRefusalOrigins>>,
+    unit_resident_lane: bool,
     // Timing-only query history. Lightweight scope identities never retain it.
     lowered: Arc<Mutex<HashSet<StableDigest>>>,
+}
+
+/// The admission authority that produced a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticRefusalOrigin {
+    UnitResident,
+    Other,
+}
+
+/// Origins accumulated across staging copies and child roots of one unit.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticRefusalOrigins {
+    resident: bool,
+    other: bool,
+}
+
+impl SemanticRefusalOrigins {
+    pub fn resident_only(self) -> bool {
+        self.resident && !self.other
+    }
+}
+
+/// The unowned part of a ledger's resident balance at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchMark(SemanticWork);
+
+/// The parts of a semantic ledger's resident balance, by holder kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentCensus {
+    pub balance: SemanticWork,
+    pub unowned: SemanticWork,
+    pub live_artifacts: SemanticWork,
+    pub live_owners: SemanticWork,
 }
 
 /// One charge a semantic budget refused, and the code that asked for it.
@@ -281,6 +390,7 @@ pub struct SemanticBudgetScopeIdentity {
 /// is accounting identity, not an artifact cache or a public result identity.
 #[derive(Debug, Clone)]
 pub struct SemanticBudgetScopeSnapshot {
+    refusal_origins: Arc<Mutex<SemanticRefusalOrigins>>,
     admitted_artifacts: Arc<ResidentArtifacts>,
     scope: Arc<SemanticBudgetScope>,
     charged_artifacts: Arc<HashSet<StableDigest>>,
@@ -293,10 +403,16 @@ pub struct SemanticBudgetCharge {
     resident: SemanticWork,
     resident_artifacts: Arc<ResidentArtifacts>,
     resident_owners: Arc<ResidentOwners>,
+    reacquired: Arc<Vec<MemoDependencyGuard>>,
     scope: Arc<SemanticBudgetScope>,
     work: SemanticWork,
     performed: SemanticWork,
     resident_peak: SemanticWork,
+    /// The most rows the child itself held at once, apart from any it inherited.
+    resident_transient_peak: SemanticWork,
+    /// Whether the child was granted room beside its parent's holders, so its
+    /// peak must fit on top of the parent's balance when the charge is applied.
+    resident_coexists: bool,
     root_work_peak: SemanticWork,
     charged_artifacts: Arc<HashSet<StableDigest>>,
 }
@@ -404,6 +520,8 @@ impl SemanticBudget {
         }
         Ok(Self {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
+            window_open: false,
+            window_default_limits: None,
             cumulative: SemanticWork::default(),
             performed: SemanticWork::default(),
             root_work: SemanticWork::default(),
@@ -411,13 +529,17 @@ impl SemanticBudget {
             replay_observers: Vec::new(),
             lowering_work: None,
             resident_peak: SemanticWork::default(),
+            own: ResidentInterval::independent(),
             resident_artifacts: Arc::default(),
             resident_owners: Arc::default(),
+            reacquired: Arc::default(),
             inherited_artifacts: Arc::default(),
             scope: Arc::new(SemanticBudgetScope),
             charged_artifacts: Arc::new(HashSet::new()),
             shared_summary_expansion_limit: None,
             first_refusal: Arc::default(),
+            refusal_origins: Arc::default(),
+            unit_resident_lane: false,
             lowered: Arc::default(),
         })
     }
@@ -438,6 +560,49 @@ impl SemanticBudget {
         self.ledger.limits()
     }
 
+    /// Open a window in which charged artifacts may expand row grants.
+    pub fn start_artifact_window(&mut self, _file: &ProjectFile) {
+        assert!(!self.window_open);
+        self.window_open = true;
+        self.window_default_limits = Some(self.ledger.limits());
+    }
+
+    /// Artifact rows are grant-neutral while a file window is open.
+    fn grant_artifact_rows(&mut self, work: SemanticWork) {
+        if !self.window_open {
+            return;
+        }
+        let defaults = self.ledger.limits();
+        let limits = SemanticWork {
+            procedures: defaults.procedures.saturating_add(work.procedures),
+            blocks: defaults.blocks.saturating_add(work.blocks),
+            program_points: defaults.program_points.saturating_add(work.program_points),
+            values: defaults.values.saturating_add(work.values),
+            allocations: defaults.allocations.saturating_add(work.allocations),
+            call_sites: defaults.call_sites.saturating_add(work.call_sites),
+            memory_locations: defaults
+                .memory_locations
+                .saturating_add(work.memory_locations),
+            captures: defaults.captures.saturating_add(work.captures),
+            source_mappings: defaults
+                .source_mappings
+                .saturating_add(work.source_mappings),
+            evidence: defaults.evidence.saturating_add(work.evidence),
+            gaps: defaults.gaps.saturating_add(work.gaps),
+            events: defaults.events.saturating_add(work.events),
+            control_edges: defaults.control_edges.saturating_add(work.control_edges),
+            ..defaults
+        };
+        self.ledger = self.ledger.with_limits(limits);
+    }
+
+    pub fn release_artifact_window(&mut self) {
+        if let Some(defaults) = self.window_default_limits.take() {
+            self.ledger = self.ledger.with_limits(defaults);
+        }
+        self.window_open = false;
+    }
+
     pub const fn used(&self) -> SemanticWork {
         self.cumulative
     }
@@ -450,6 +615,7 @@ impl SemanticBudget {
 
     /// Live admissions, excluding references owned only by materialization caches.
     pub fn resident(&self) -> SemanticWork {
+        self.retire_expired_reacquisitions();
         let mut used = self.ledger.used();
         for (artifact, work) in self.resident_artifacts.values() {
             if !artifact.has_consumer() {
@@ -464,6 +630,33 @@ impl SemanticBudget {
         used
     }
 
+    /// What the resident balance is made of, without changing it. The
+    /// balance equals the three parts below: rows no registered holder owns
+    /// (scratch that was never closed, or rows of a returned value its caller
+    /// keeps), the census of artifacts a consumer still holds, and the census
+    /// of live cache or source owners.
+    pub fn resident_census(&self) -> ResidentCensus {
+        self.retire_expired_reacquisitions();
+        let mut live_artifacts = SemanticWork::default();
+        for (artifact, work) in self.resident_artifacts.values() {
+            if artifact.has_consumer() {
+                live_artifacts = live_artifacts.conservative_add(*work);
+            }
+        }
+        let mut live_owners = SemanticWork::default();
+        for (owner, work) in self.resident_owners.values() {
+            if owner.strong_count() > 0 {
+                live_owners = live_owners.conservative_add(*work);
+            }
+        }
+        ResidentCensus {
+            balance: self.resident(),
+            unowned: self.raw_resident(),
+            live_artifacts,
+            live_owners,
+        }
+    }
+
     pub const fn resident_peak(&self) -> SemanticWork {
         self.resident_peak
     }
@@ -474,7 +667,13 @@ impl SemanticBudget {
         self.ledger = self.ledger.with_used(used);
         self.resident_artifacts = Arc::default();
         self.resident_owners = Arc::default();
+        self.reacquired = Arc::default();
         self.inherited_artifacts = Arc::default();
+        // Nothing inherited is left to count on.
+        self.own.base = SemanticWork::default();
+        for observer in &mut self.replay_observers {
+            observer.resident.base = SemanticWork::default();
+        }
     }
 
     /// A returned root releases resolver sessions and other transient rows,
@@ -499,6 +698,7 @@ impl SemanticBudget {
     pub fn release_unleased_artifacts(&mut self, leases: &SemanticArtifactLeaseChild) {
         self.reconcile_residency();
         let mut used = self.ledger.used();
+        let mut refunded_artifacts = SemanticWork::default();
         Arc::make_mut(&mut self.resident_artifacts).retain(|_, (allocation, work)| {
             if allocation
                 .upgrade()
@@ -512,12 +712,14 @@ impl SemanticBudget {
                     .all(|dimension| work.get(*dimension) <= used.get(*dimension))
             );
             used = used.saturating_sub(*work);
+            refunded_artifacts = refunded_artifacts.saturating_add(*work);
             false
         });
         // Prepared sessions and cached results have their own holders. A
         // pooled source has no active session token after return, so its
         // admission is refunded independently of pool occupancy.
         self.ledger = self.ledger.with_used(used);
+        self.refund_artifact_grants(refunded_artifacts);
     }
 
     /// Associate admitted census with its allocation without pinning it.
@@ -549,11 +751,25 @@ impl SemanticBudget {
     /// work, peaks and separately owned artifacts, and refund scratch on both
     /// success and error before the caller admits the returned value's census.
     pub fn with_temporary_admissions<T>(&mut self, derive: impl FnOnce(&mut Self) -> T) -> T {
-        let before = self.raw_resident();
+        let mark = self.scratch_mark();
         let result = derive(self);
-        let scratch = self.raw_resident().saturating_sub(before);
-        self.release_admission(scratch);
+        self.release_scratch_since(&mark);
         result
+    }
+
+    /// Remember the admissions that no registered holder owns, so a stretch of
+    /// code that leaves nothing behind but scratch can refund exactly its own.
+    /// Use this where the stretch has early exits that a closure cannot span;
+    /// otherwise use [`Self::with_temporary_admissions`].
+    pub fn scratch_mark(&self) -> ScratchMark {
+        ScratchMark(self.raw_resident())
+    }
+
+    /// Refund the unowned admissions made since `mark`. Performed work,
+    /// cumulative counters, peaks and the census of registered holders stay.
+    pub fn release_scratch_since(&mut self, mark: &ScratchMark) {
+        let scratch = self.raw_resident().saturating_sub(mark.0);
+        self.release_admission(scratch);
     }
 
     /// Bind retained prepared source to the session that owns it. Weak tokens
@@ -623,12 +839,27 @@ impl SemanticBudget {
             .get(&key)
             .is_some_and(|(owner, _)| owner.strong_count() > 0)
         {
+            self.touch_owner(key);
             return None;
         }
         Some(SemanticWork {
             source_bytes: bytes,
             ..SemanticWork::default()
         })
+    }
+
+    /// Attach the exact source acquisition address after the normal admission.
+    #[doc(hidden)]
+    pub fn record_source_reacquisition<T: Send + Sync + 'static>(
+        &mut self,
+        owner: &Arc<T>,
+        key: MemoSourceDependency,
+    ) {
+        if let Some((receipt, _)) =
+            Arc::make_mut(&mut self.resident_owners).get_mut(&(Arc::as_ptr(owner) as usize))
+        {
+            receipt.source = Some(key);
+        }
     }
 
     fn record_source_owner<T: Send + Sync + 'static>(
@@ -640,22 +871,64 @@ impl SemanticBudget {
         Arc::make_mut(&mut self.resident_owners).insert(key, (weak_resident_owner(owner), work));
     }
 
+    fn retire_expired_reacquisitions(&self) {
+        for guard in self.reacquired.iter() {
+            guard.retain_while_provider_lives();
+        }
+    }
+
     fn reconcile_residency(&mut self) {
+        // A prepared source stops coexisting with the region when its cold
+        // provider drops the sessions. Retire the real allocation before the
+        // ordinary weak registry computes its refund.
+        Arc::make_mut(&mut self.reacquired).retain(|guard| guard.retain_while_provider_lives());
         // Consumer state can change when another policy takes a cached artifact.
         // Decide retention and refund together: a second observation could keep
         // an artifact whose census the first observation already refunded.
         let mut resident = self.ledger.used();
-        refund_expired_residents(
+        let mut expired_owners = Vec::new();
+        refund_expired_residents_noting(
             Arc::make_mut(&mut self.resident_owners),
             &mut resident,
             |owner| owner.strong_count() > 0,
+            |key, census| expired_owners.push((*key, *census)),
         );
-        refund_expired_residents(
+        let mut expired_artifacts = Vec::new();
+        let refunded_artifacts = refund_expired_residents_noting(
             Arc::make_mut(&mut self.resident_artifacts),
             &mut resident,
             ResidentArtifact::has_consumer,
+            |key, census| expired_artifacts.push((*key, *census)),
         );
         self.ledger = self.ledger.with_used(resident);
+        // Rows an interval inherited are no longer there to count on.
+        for (key, census) in &expired_owners {
+            self.own.owner_expired(key, *census);
+            for observer in &mut self.replay_observers {
+                observer.resident.owner_expired(key, *census);
+            }
+        }
+        for (key, census) in &expired_artifacts {
+            self.own.artifact_expired(key, *census);
+            for observer in &mut self.replay_observers {
+                observer.resident.artifact_expired(key, *census);
+            }
+        }
+        self.refund_artifact_grants(refunded_artifacts);
+    }
+
+    fn refund_artifact_grants(&mut self, work: SemanticWork) {
+        if self.window_open {
+            let defaults = self
+                .window_default_limits
+                .expect("open window has defaults");
+            let limits = self
+                .ledger
+                .limits()
+                .saturating_sub(work)
+                .component_max(defaults);
+            self.ledger = self.ledger.with_limits(limits);
+        }
     }
 
     pub fn remaining(&self) -> SemanticWork {
@@ -663,8 +936,53 @@ impl SemanticBudget {
     }
 
     /// Check one atomic charge without mutating this budget.
+    pub fn refusal_origins(&self) -> SemanticRefusalOrigins {
+        *self.refusal_origins.lock().expect("refusal origins lock")
+    }
+
+    fn note_refusal_origin(&self, origin: SemanticRefusalOrigin) {
+        let mut origins = self.refusal_origins.lock().expect("refusal origins lock");
+        if origin == SemanticRefusalOrigin::UnitResident && self.unit_resident_lane {
+            origins.resident = true;
+        } else {
+            origins.other = true;
+        }
+    }
+
     pub fn refusal_count(&self) -> usize {
         self.ledger.refusal_count()
+    }
+
+    /// The refusals observed so far. A request built with
+    /// [`SemanticRequest::observing_refusals_since`] treats a refusal before
+    /// this mark as another unit's, not its own.
+    pub fn refusal_mark(&self) -> SemanticBudgetRefusalMark {
+        self.ledger.refusal_mark()
+    }
+
+    /// Refusals recorded since `mark`; all of this budget's refusals when the
+    /// mark belongs to another logical budget.
+    pub fn refusals_since(&self, mark: &SemanticBudgetRefusalMark) -> usize {
+        self.ledger.refusals_since(mark)
+    }
+
+    /// Record a bounded proof's deadline as a budget stop without inventing
+    /// retained rows. The first refusal remains the request's stop cause.
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn note_external_stop(&self, dimension: SemanticBudgetDimension) {
+        let limit = match dimension {
+            SemanticBudgetDimension::SourceBytes => self.limits().source_bytes,
+            SemanticBudgetDimension::NestedEntries => self.limits().nested_entries,
+            _ => unreachable!("only bounded source and structured proof scans use this stop"),
+        };
+        let exceeded = SemanticBudgetExceeded::new(dimension, limit, limit.saturating_add(1));
+        self.note_refusal_origin(SemanticRefusalOrigin::Other);
+        self.ledger.record_refusal();
+        self.first_refusal.get_or_init(|| SemanticBudgetRefusal {
+            exceeded,
+            site: std::panic::Location::caller(),
+        });
     }
 
     pub fn check_admission(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
@@ -679,7 +997,10 @@ impl SemanticBudget {
         self.ledger
             .with_used(self.resident())
             .check_without_recording(work)
-            .map_err(SemanticBudgetExceeded::from)?;
+            .map_err(|error| {
+                self.note_refusal_origin(SemanticRefusalOrigin::UnitResident);
+                SemanticBudgetExceeded::from(error)
+            })?;
         let Some(limit) = self.shared_summary_expansion_limit else {
             return Ok(());
         };
@@ -696,6 +1017,7 @@ impl SemanticBudget {
             assert!(work.captures > 0, "summary expansion charge is non-empty");
             SemanticBudgetDimension::Captures
         };
+        self.note_refusal_origin(SemanticRefusalOrigin::Other);
         Err(SemanticBudgetExceeded {
             dimension,
             limit,
@@ -712,6 +1034,29 @@ impl SemanticBudget {
     pub fn admit(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
         self.admit_held(work)?;
         self.performed = self.performed.saturating_add(work);
+        Ok(())
+    }
+
+    /// Charge a complete artifact census and its matching window grant together.
+    pub fn admit_artifact_rows(
+        &mut self,
+        work: SemanticWork,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        let mut staged = self.clone();
+        staged.grant_artifact_rows(work);
+        staged.admit(work)?;
+        *self = staged;
+        Ok(())
+    }
+
+    fn admit_resident_artifact_rows(
+        &mut self,
+        work: SemanticWork,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        let mut staged = self.clone();
+        staged.grant_artifact_rows(work);
+        staged.admit_resident(work)?;
+        *self = staged;
         Ok(())
     }
 
@@ -737,20 +1082,41 @@ impl SemanticBudget {
     #[track_caller]
     fn admit_resident(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
         let site = std::panic::Location::caller();
-        if let Err(exceeded) = self.check_admission(work) {
-            self.first_refusal
-                .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
-            return Err(exceeded);
-        }
+        self.require_room(work)?;
         self.reconcile_residency();
         self.ledger.charge(work).map_err(|exceeded| {
+            self.note_refusal_origin(SemanticRefusalOrigin::UnitResident);
             let exceeded = SemanticBudgetExceeded::from(exceeded);
             self.first_refusal
                 .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
             exceeded
         })?;
-        self.resident_peak = self.resident_peak.component_max(self.ledger.used());
+        let used = self.ledger.used();
+        self.resident_peak = self.resident_peak.component_max(used);
+        self.observe_resident(used);
         Ok(())
+    }
+
+    /// Refuse, and remember the refusing code, when `work` would not fit the
+    /// resident balance. Nothing is admitted.
+    #[track_caller]
+    fn require_room(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
+        let site = std::panic::Location::caller();
+        self.check_admission(work).inspect_err(|exceeded| {
+            let exceeded = *exceeded;
+            self.first_refusal
+                .get_or_init(|| SemanticBudgetRefusal { exceeded, site });
+        })
+    }
+
+    /// Record the highest resident balance every open measurement interval saw,
+    /// so a replay can later check the peak a computation needed, not only the
+    /// rows it kept.
+    fn observe_resident(&mut self, used: SemanticWork) {
+        self.own.observe(used);
+        for observer in &mut self.replay_observers {
+            observer.resident.observe(used);
+        }
     }
 
     /// Record performed work as telemetry. Only retained admissions can refuse.
@@ -798,14 +1164,80 @@ impl SemanticBudget {
         }
     }
 
+    /// A fresh resident ledger for one Output unit of a batch, under this
+    /// ledger's limits and logical scope.
+    ///
+    /// The ledger shares the paid artifact identities (so a repeat touch of an
+    /// artifact is charged as a lookup in work) but inherits no live artifact
+    /// credit: an artifact the unit touches is admitted into its own balance
+    /// whether or not an earlier unit, or a cache that still pins it, already
+    /// holds it. What a unit is charged therefore depends on the rows it holds
+    /// itself, not on how many units ran before it. It has its own refusal
+    /// count and first refusal. Fold it back with [`Self::absorb_unit`].
+    pub fn unit_ledger(&self) -> Self {
+        let mut unit = Self::new_child(self.limits(), &self.scope_snapshot());
+        unit.refusal_origins = Arc::default();
+        unit.unit_resident_lane = true;
+        unit.inherited_artifacts = Arc::default();
+        unit.shared_summary_expansion_limit = self.shared_summary_expansion_limit;
+        unit
+    }
+
+    /// Fold a finished unit ledger into this one: cumulative and performed
+    /// work, the largest work and resident peaks, and the paid artifact
+    /// identities. A unit's resident rows die with the unit, so none are
+    /// imported, and its refusals stay its own.
+    pub fn absorb_unit(&mut self, unit: Self) {
+        assert!(
+            Arc::ptr_eq(&self.scope, &unit.scope),
+            "unit belongs to this semantic scope"
+        );
+        self.cumulative = self.cumulative.saturating_add(unit.cumulative);
+        self.performed = self.performed.saturating_add(unit.performed);
+        self.root_work_peak = self.root_work_peak.component_max(unit.root_work_peak);
+        self.resident_peak = self.resident_peak.component_max(unit.resident_peak);
+        self.observe_completed_root(unit.root_work_peak);
+        if !Arc::ptr_eq(&self.charged_artifacts, &unit.charged_artifacts) {
+            Arc::make_mut(&mut self.charged_artifacts)
+                .extend(unit.charged_artifacts.iter().copied());
+        }
+    }
+
+    /// Replay a stored unit product the way a fresh unit leaves this ledger: on
+    /// an empty unit ledger, which must have room for the unit's peak, with only
+    /// its work and peaks folded in. Whether it fits depends on the product and
+    /// the limits alone.
+    pub fn replay_unit(
+        &mut self,
+        replay: SemanticBudgetReplay,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        let mut unit = self.unit_ledger();
+        unit.replay_product(replay)?;
+        self.absorb_unit(unit);
+        Ok(())
+    }
+
+    /// Whether [`Self::replay_unit`] would succeed, without changing anything.
+    pub fn replay_unit_fits(&self, replay: SemanticBudgetReplay) -> bool {
+        self.unit_ledger().replay_product_fits(replay)
+    }
+
     pub fn replay_snapshot(&mut self) -> SemanticBudgetReplaySnapshot {
         self.replay_observers
             .retain(|observer| observer.owner.strong_count() > 0);
-        let owner = Arc::new(());
+        self.reconcile_residency();
+        let owner = Arc::new(Mutex::new(MemoDependencyTouches::default()));
+        let resident = ResidentInterval::beginning(
+            self.ledger.used(),
+            &self.resident_owners,
+            &self.resident_artifacts,
+            false,
+        );
         self.replay_observers.push(ReplayObserver {
             owner: Arc::downgrade(&owner),
             base: self.root_work,
             peak: SemanticWork::default(),
+            resident,
         });
         SemanticBudgetReplaySnapshot {
             owner,
@@ -814,6 +1246,223 @@ impl SemanticBudget {
             artifacts: Arc::clone(&self.resident_artifacts),
             owners: Arc::clone(&self.resident_owners),
             raw_resident: self.raw_resident(),
+        }
+    }
+
+    /// Capture the cold fill's live dependencies and its scratch bound.
+    /// The returned holder pays its own census through the ordinary replay.
+    pub fn memo_admission_since<T: Send + Sync + 'static>(
+        &self,
+        before: &SemanticBudgetReplaySnapshot,
+        returned_holder: &Arc<T>,
+    ) -> SemanticMemoAdmission {
+        self.retire_expired_reacquisitions();
+        let touched = before
+            .owner
+            .lock()
+            .expect("memo dependency receipt poisoned");
+        let mut owners = (*self.resident_owners).clone();
+        owners.remove(&(Arc::as_ptr(returned_holder) as usize));
+        owners.retain(|key, (owner, _)| {
+            owner.strong_count() > 0
+                && (!before.owners.contains_key(key) || touched.owners.contains(key))
+        });
+        let mut artifacts = (*self.resident_artifacts).clone();
+        artifacts.retain(|key, (artifact, _)| {
+            artifact.has_consumer()
+                && (!before.artifacts.contains_key(key) || touched.artifacts.contains(key))
+        });
+        // An inherited dependency that expired inside the interval was part
+        // of the cold fill too. Its census was excluded from the interval's
+        // baseline-relative peak; conservatively restore it as transient room.
+        let mut transient_peak = self.replay_since(before).resident_peak;
+        for (key, (_, census)) in before.owners.iter() {
+            if touched.owners.contains(key)
+                && !owners.contains_key(key)
+                && *key != Arc::as_ptr(returned_holder) as usize
+            {
+                transient_peak = transient_peak.conservative_add(*census);
+            }
+        }
+        for (key, (_, census)) in before.artifacts.iter() {
+            if touched.artifacts.contains(key) && !artifacts.contains_key(key) {
+                transient_peak = transient_peak.conservative_add(*census);
+            }
+        }
+        let acquired_owners = owners
+            .keys()
+            .filter(|key| !before.owners.contains_key(key))
+            .copied()
+            .collect();
+        let acquired_artifacts = artifacts
+            .keys()
+            .filter(|key| !before.artifacts.contains_key(key))
+            .copied()
+            .collect();
+        SemanticMemoAdmission {
+            acquired_owners,
+            acquired_artifacts,
+            owners,
+            artifacts,
+            transient_peak,
+        }
+    }
+
+    /// Speculative hit admission. A miss must recompute without recording a
+    /// refusal: only that cold path can establish that the answer is incomplete.
+    /// The caller evicts a rejected entry before recomputing, so cache-only
+    /// holders cannot inflate the cold fill's balance. Live dependencies are
+    /// restored transactionally; expired dependencies can use the active provider.
+    /// Restoration imports residency only. The caller's replay owns cumulative
+    /// work telemetry; this probe must not count the dependency's work again.
+    #[track_caller]
+    pub fn admit_memo_hit(
+        &mut self,
+        admission: &SemanticMemoAdmission,
+    ) -> Result<(), SemanticMemoAdmissionMiss> {
+        self.admit_memo_hit_with(admission, None)
+    }
+
+    /// Admit with the active provider's exact dependency acquisition paths.
+    #[track_caller]
+    pub fn admit_memo_hit_with(
+        &mut self,
+        admission: &SemanticMemoAdmission,
+        reacquirer: Option<&dyn MemoDependencyReacquirer>,
+    ) -> Result<(), SemanticMemoAdmissionMiss> {
+        let site = std::panic::Location::caller();
+        let mut probe = Self {
+            refusal_origins: Arc::default(),
+            ..self.clone()
+        };
+        probe.reconcile_residency();
+        let mut acquired_owners = Vec::new();
+        let mut acquired_artifacts = Vec::new();
+        for (key, (owner, census)) in &admission.owners {
+            if probe.resident_owners.contains_key(key) {
+                continue;
+            }
+            let mut owner = owner.clone();
+            if owner.upgrade().is_none() {
+                let source = owner
+                    .source
+                    .as_ref()
+                    .ok_or(SemanticMemoAdmissionMiss::MissingDependency)?;
+                let guard = reacquirer.ok_or(SemanticMemoAdmissionMiss::MissingDependency)?;
+                let guard = match source.acquisition {
+                    MemoSourceAcquisition::Admit => {
+                        guard.admit_source(source, probe.limits().source_bytes)
+                    }
+                    MemoSourceAcquisition::Hold => {
+                        guard.hold_source(source, probe.limits().source_bytes)
+                    }
+                    MemoSourceAcquisition::Readmit => {
+                        guard.readmit_source(source, probe.limits().source_bytes)
+                    }
+                }
+                .map_err(|_| SemanticMemoAdmissionMiss::MissingDependency)?;
+                if guard.census != *census {
+                    return Err(SemanticMemoAdmissionMiss::MissingDependency);
+                }
+                let allocation = guard
+                    .allocation()
+                    .ok_or(SemanticMemoAdmissionMiss::MissingDependency)?;
+                owner.allocation = Arc::downgrade(&allocation);
+                probe.pin_reacquired(guard);
+            }
+            if admission.acquired_owners.contains(key) {
+                acquired_owners.push((*key, owner.clone(), *census));
+                continue;
+            }
+            probe
+                .check_admission_without_recording(*census)
+                .map_err(SemanticMemoAdmissionMiss::Residency)?;
+            probe
+                .admit_resident(*census)
+                .expect("prechecked owner admission");
+            Arc::make_mut(&mut probe.resident_owners).insert(*key, (owner.clone(), *census));
+        }
+        for (key, (artifact, census)) in &admission.artifacts {
+            if probe.resident_artifacts.contains_key(key) {
+                continue;
+            }
+            // The cold ledger also holds a weak registry entry. Restore it
+            // only while a real consumer keeps the allocation resident. A
+            // cache-only allocation needs cold acquisition to own its lifetime.
+            let mut artifact = artifact.clone();
+            if artifact.consumer().is_none() {
+                let live = reacquirer
+                    .ok_or(SemanticMemoAdmissionMiss::MissingDependency)?
+                    .artifact(&artifact.key, &artifact.capabilities)
+                    .map_err(|_| SemanticMemoAdmissionMiss::MissingDependency)?;
+                if live.key() != &artifact.key
+                    || live.capabilities() != &artifact.capabilities
+                    || live.work() != *census
+                {
+                    return Err(SemanticMemoAdmissionMiss::MissingDependency);
+                }
+                artifact = ResidentArtifact::new(&live);
+                probe.pin_reacquired(MemoDependencyGuard::new(live, *census, None));
+            }
+            if admission.acquired_artifacts.contains(key) {
+                acquired_artifacts.push((*key, artifact.clone(), *census));
+                continue;
+            }
+            probe
+                .check_admission_without_recording(*census)
+                .map_err(SemanticMemoAdmissionMiss::Residency)?;
+            probe
+                .admit_resident_artifact_rows(*census)
+                .expect("prechecked artifact admission");
+            Arc::make_mut(&mut probe.resident_artifacts).insert(*key, (artifact.clone(), *census));
+        }
+        probe
+            .check_admission_without_recording(admission.transient_peak)
+            .map_err(|exceeded| {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!("semantic.memo_hit[{}].residency_miss", site)
+                });
+                SemanticMemoAdmissionMiss::Residency(exceeded)
+            })?;
+        let high = probe
+            .ledger
+            .used()
+            .conservative_add(admission.transient_peak);
+        for (key, owner, census) in acquired_owners {
+            probe
+                .admit_resident(census)
+                .expect("retained owner fits measured peak");
+            Arc::make_mut(&mut probe.resident_owners).insert(key, (owner, census));
+        }
+        for (key, artifact, census) in acquired_artifacts {
+            probe
+                .admit_resident_artifact_rows(census)
+                .expect("retained artifact fits measured peak");
+            Arc::make_mut(&mut probe.resident_artifacts).insert(key, (artifact, census));
+        }
+        brokk_bifrost_core::profiling::note_with(|| {
+            format!("semantic.memo_hit[{}].admitted", site)
+        });
+        probe.refusal_origins = Arc::clone(&self.refusal_origins);
+        *self = probe;
+        for key in admission.owners.keys() {
+            self.touch_owner(*key);
+        }
+        for key in admission.artifacts.keys() {
+            self.touch_artifact(*key);
+        }
+        self.resident_peak = self.resident_peak.component_max(high);
+        self.observe_resident(high);
+        Ok(())
+    }
+
+    fn pin_reacquired(&mut self, guard: MemoDependencyGuard) {
+        if !self
+            .reacquired
+            .iter()
+            .any(|existing| Arc::ptr_eq(&existing.allocation, &guard.allocation))
+        {
+            Arc::make_mut(&mut self.reacquired).push(guard);
         }
     }
 
@@ -847,10 +1496,61 @@ impl SemanticBudget {
         census
     }
 
+    /// The descriptor to replay for a cached derivation that `owner` holds.
+    ///
+    /// Call `admit_memo_hit` first to check the cold fill's transient room
+    /// and dependencies. This descriptor then imports work and admits only
+    /// returned rows; it does not repeat that peak check. An already-resident
+    /// holder retains no additional rows. Returns whether the holder was
+    /// already resident, so the caller registers it only once. Independent
+    /// policy products use their full replay descriptor instead.
+    pub fn replay_for_holder<T: Send + Sync + 'static>(
+        &self,
+        owner: &Arc<T>,
+        mut replay: SemanticBudgetReplay,
+    ) -> (SemanticBudgetReplay, bool) {
+        let already_held = self.has_replay_holder(owner);
+        replay.resident_peak = SemanticWork::default();
+        if already_held {
+            replay.retained = SemanticWork::default();
+        }
+        (replay, already_held)
+    }
+
+    fn touch_owner(&self, key: usize) {
+        for observer in &self.replay_observers {
+            if let Some(owner) = observer.owner.upgrade() {
+                owner
+                    .lock()
+                    .expect("memo dependency receipt poisoned")
+                    .owners
+                    .insert(key);
+            }
+        }
+    }
+
+    fn touch_artifact(&self, key: (StableDigest, usize)) {
+        for observer in &self.replay_observers {
+            if let Some(owner) = observer.owner.upgrade() {
+                owner
+                    .lock()
+                    .expect("memo dependency receipt poisoned")
+                    .artifacts
+                    .insert(key);
+            }
+        }
+    }
+
     pub fn has_replay_holder<T: Send + Sync + 'static>(&self, owner: &Arc<T>) -> bool {
-        self.resident_owners
-            .get(&(Arc::as_ptr(owner) as usize))
-            .is_some_and(|(allocation, _)| allocation.strong_count() > 0)
+        let key = Arc::as_ptr(owner) as usize;
+        let resident = self
+            .resident_owners
+            .get(&key)
+            .is_some_and(|(allocation, _)| allocation.strong_count() > 0);
+        if resident {
+            self.touch_owner(key);
+        }
+        resident
     }
 
     pub fn track_replay_holder<T: Send + Sync + 'static>(
@@ -890,6 +1590,7 @@ impl SemanticBudget {
             performed: self.performed.saturating_sub(before.performed),
             root_work_peak: observer.peak,
             retained,
+            resident_peak: observer.resident.peak.component_max(retained),
         }
     }
 
@@ -918,6 +1619,15 @@ impl SemanticBudget {
         replay: SemanticBudgetReplay,
     ) -> Result<(), SemanticBudgetExceeded> {
         let mut staged = self.clone();
+        // Expired holders are not part of the balance this replay lands on.
+        staged.reconcile_residency();
+        // A fresh computation would have needed its peak, scratch included,
+        // before it kept its retained rows, so a replay is refused where the
+        // computation would have been (#10530).
+        staged.require_room(replay.resident_peak)?;
+        let high = staged.ledger.used().conservative_add(replay.resident_peak);
+        staged.resident_peak = staged.resident_peak.component_max(high);
+        staged.observe_resident(high);
         staged.admit(replay.retained)?;
         staged.cumulative = self.cumulative.saturating_add(replay.cumulative);
         staged.performed = self.performed.saturating_add(replay.performed);
@@ -927,9 +1637,10 @@ impl SemanticBudget {
         Ok(())
     }
 
-    /// Check replay's retained admission without changing budget or refusal state.
+    /// Check replay's peak and retained admissions without changing budget or
+    /// refusal state. The peak covers the retained rows.
     pub fn replay_product_fits(&self, replay: SemanticBudgetReplay) -> bool {
-        self.check_admission_without_recording(replay.retained)
+        self.check_admission_without_recording(replay.resident_peak.component_max(replay.retained))
             .is_ok()
     }
 
@@ -960,6 +1671,19 @@ impl SemanticBudget {
         self.resident_peak = self.resident_peak.component_max(staged.resident_peak);
         self.root_work_peak = self.root_work_peak.component_max(staged.root_work_peak);
         self.observe_root_work();
+        // The staged copy saw resident peaks of its own that this ledger never
+        // admitted. Its own peak is what a parent is told this ledger needed,
+        // and a measurement interval that both copies share keeps them too.
+        self.own.peak = self.own.peak.component_max(staged.own.peak);
+        for observer in &mut self.replay_observers {
+            if let Some(seen) = staged
+                .replay_observers
+                .iter()
+                .find(|seen| seen.owner.ptr_eq(&observer.owner))
+            {
+                observer.resident.peak = observer.resident.peak.component_max(seen.resident.peak);
+            }
+        }
     }
 
     /// Start another independent solver root while preserving query counters.
@@ -972,6 +1696,7 @@ impl SemanticBudget {
 
     /// A finished root contributes counters and peaks, never another root's allowance.
     pub fn absorb_root_work(&mut self, child: Self) {
+        child.retire_expired_reacquisitions();
         assert!(
             Arc::ptr_eq(&self.scope, &child.scope),
             "root belongs to this semantic scope"
@@ -981,11 +1706,34 @@ impl SemanticBudget {
         // caches. Transfer only those admissions that still have a holder.
         let cumulative = self.cumulative;
         let performed = self.performed;
+        // A root child ran beside what this ledger held, so a measurement
+        // interval open here saw the root's own peak on top of the balance that
+        // is still here once expired holders are gone. The child's own peak
+        // leaves out the rows it inherited, including any that expired while
+        // it ran (#10530). A child under an allowance of its own is not bound
+        // to fit beside this ledger, so it adds nothing to the interval.
+        self.reconcile_residency();
+        if child.own.coexists {
+            let high = self.ledger.used().conservative_add(child.own.peak);
+            self.resident_peak = self.resident_peak.component_max(high);
+            self.observe_resident(high);
+        }
         for (key, (owner, census)) in child.resident_owners.iter() {
             if owner.strong_count() > 0 && !self.resident_owners.contains_key(key) {
                 self.admit(*census)
                     .expect("a root admitted its live owners against the parent's grant");
                 Arc::make_mut(&mut self.resident_owners).insert(*key, (owner.clone(), *census));
+            }
+        }
+        for guard in child.reacquired.iter() {
+            if self.resident_owners.values().any(|(receipt, _)| {
+                receipt.upgrade().is_some_and(|owner| {
+                    guard
+                        .allocation()
+                        .is_some_and(|allocation| Arc::ptr_eq(&owner, &allocation))
+                })
+            }) {
+                self.pin_reacquired(guard.clone());
             }
         }
         self.observe_completed_root(child.root_work_peak);
@@ -1026,6 +1774,7 @@ impl SemanticBudget {
             Arc::make_mut(&mut admitted_artifacts).retain(|_, (owner, _)| owner.has_consumer());
         }
         SemanticBudgetScopeSnapshot {
+            refusal_origins: Arc::clone(&self.refusal_origins),
             admitted_artifacts,
             scope: Arc::clone(&self.scope),
             charged_artifacts: Arc::clone(&self.charged_artifacts),
@@ -1063,6 +1812,8 @@ impl SemanticBudget {
     pub fn new_child(limits: SemanticWork, parent: &SemanticBudgetScopeSnapshot) -> Self {
         Self {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
+            window_open: false,
+            window_default_limits: None,
             cumulative: SemanticWork::default(),
             performed: SemanticWork::default(),
             root_work: SemanticWork::default(),
@@ -1070,15 +1821,30 @@ impl SemanticBudget {
             replay_observers: Vec::new(),
             lowering_work: None,
             resident_peak: SemanticWork::default(),
+            own: ResidentInterval::independent(),
             resident_artifacts: Arc::default(),
             resident_owners: Arc::default(),
+            reacquired: Arc::default(),
             inherited_artifacts: Arc::clone(&parent.admitted_artifacts),
             scope: Arc::clone(&parent.scope),
             charged_artifacts: Arc::clone(&parent.charged_artifacts),
             shared_summary_expansion_limit: parent.shared_summary_expansion_limit,
             first_refusal: Arc::default(),
+            refusal_origins: Arc::clone(&parent.refusal_origins),
+            unit_resident_lane: false,
             lowered: Arc::clone(&parent.lowered),
         }
+    }
+
+    /// A child carved from the allowance its parent had left, to run beside the
+    /// parent's holders: unlike an independent child (a class-set root or a
+    /// prepass under an allowance of its own), its peak must fit on top of the
+    /// parent's balance when its charge is applied, and siblings carved from the
+    /// same remainder that do not fit together are refused (#10530).
+    pub fn new_carved_child(limits: SemanticWork, parent: &SemanticBudgetScopeSnapshot) -> Self {
+        let mut child = Self::new_child(limits, parent);
+        child.own.coexists = true;
+        child
     }
 
     /// A root's callee admissions coexist with the parent's current file.
@@ -1092,8 +1858,15 @@ impl SemanticBudget {
         child.shared_summary_expansion_limit = parent.shared_summary_expansion_limit;
         child.resident_artifacts = Arc::clone(&parent.resident_artifacts);
         child.resident_owners = Arc::clone(&parent.resident_owners);
+        child.reacquired = Arc::clone(&parent.reacquired);
         child.reconcile_residency();
         child.resident_peak = child.ledger.used();
+        child.own = ResidentInterval::beginning(
+            child.ledger.used(),
+            &child.resident_owners,
+            &child.resident_artifacts,
+            true,
+        );
         child
     }
 
@@ -1110,16 +1883,22 @@ impl SemanticBudget {
             resident: self.ledger.used(),
             resident_artifacts: self.resident_artifacts,
             resident_owners: self.resident_owners,
+            reacquired: self.reacquired,
             scope: self.scope,
             work,
             performed: self.performed,
             resident_peak: self.resident_peak,
+            resident_transient_peak: self.own.peak,
+            resident_coexists: self.own.coexists,
             root_work_peak: self.root_work_peak,
             charged_artifacts: self.charged_artifacts,
         }
     }
 
     fn child_resident_addition(&self, charge: &SemanticBudgetCharge) -> SemanticWork {
+        for guard in charge.reacquired.iter() {
+            guard.retain_while_provider_lives();
+        }
         let mut resident = charge.resident;
         for (key, (owner, census)) in charge.resident_artifacts.iter() {
             if !owner.has_consumer() || self.resident_artifacts.contains_key(key) {
@@ -1145,6 +1924,9 @@ impl SemanticBudget {
             "semantic child charge belongs to a different logical scope"
         );
         let mut charge = charge;
+        for guard in charge.reacquired.iter() {
+            guard.retain_while_provider_lives();
+        }
         // A cache can evict between producing and importing this receipt.
         // Keep live allocations held until their admission registry commits.
         let mut artifact_holders = Vec::new();
@@ -1169,6 +1951,23 @@ impl SemanticBudget {
             }
         });
         let mut staged = self.clone();
+        for guard in charge.reacquired.iter() {
+            staged.pin_reacquired(guard.clone());
+        }
+        staged.reconcile_residency();
+        // The child ran beside what this ledger held, and siblings carved from
+        // the same remaining allowance may not fit together. A live run that
+        // went over must be refused here, or its replay would be refused where
+        // the live run was not (#10530).
+        if charge.resident_coexists {
+            staged.require_room(charge.resident_transient_peak)?;
+            let high = staged
+                .ledger
+                .used()
+                .conservative_add(charge.resident_transient_peak);
+            staged.resident_peak = staged.resident_peak.component_max(high);
+            staged.observe_resident(high);
+        }
         let total = work.component_max(charge.work);
         let performed = charge.performed;
         let bounded = self
@@ -1179,6 +1978,7 @@ impl SemanticBudget {
             performed,
             root_work_peak: charge.root_work_peak,
             retained: bounded,
+            resident_peak: SemanticWork::default(),
         })?;
         Arc::make_mut(&mut staged.resident_artifacts).extend(
             charge
@@ -1219,7 +2019,12 @@ impl SemanticBudget {
         let bounded = self
             .child_resident_addition(charge)
             .conservative_add(work.saturating_sub(charge.work));
-        self.check_admission(bounded)
+        let peak = if charge.resident_coexists {
+            charge.resident_transient_peak
+        } else {
+            SemanticWork::default()
+        };
+        self.check_admission(bounded.component_max(peak))
     }
 
     #[doc(hidden)]
@@ -1239,10 +2044,15 @@ impl SemanticBudget {
 
     pub(crate) fn has_charged_allocation(&self, artifact: &Arc<SemanticArtifact>) -> bool {
         let key = (artifact.key().fingerprint(), Arc::as_ptr(artifact) as usize);
-        self.resident_artifacts
+        let resident = self
+            .resident_artifacts
             .get(&key)
             .or_else(|| self.inherited_artifacts.get(&key))
-            .is_some_and(|(allocation, _)| allocation.has_consumer())
+            .is_some_and(|(allocation, _)| allocation.has_consumer());
+        if resident {
+            self.touch_artifact(key);
+        }
+        resident
     }
 
     #[track_caller]
@@ -1260,11 +2070,11 @@ impl SemanticBudget {
             // The scope already performed this census. The returned
             // allocation is live until its consumer releases it, so it spends
             // residency, but a repeat lookup is the only new work.
-            self.admit_resident(census)?;
+            self.admit_resident_artifact_rows(census)?;
             self.track_resident_artifact(artifact);
             return self.charge_complete_artifact_hit(identity, census);
         }
-        self.admit(census)?;
+        self.admit_artifact_rows(census)?;
         self.record_charged_artifact(identity);
         self.track_resident_artifact(artifact);
         Ok(())
@@ -1302,6 +2112,7 @@ impl SemanticBudget {
                 performed: census,
                 root_work_peak: SemanticWork::default(),
                 retained: SemanticWork::default(),
+                resident_peak: SemanticWork::default(),
             })?;
             staged.record_charged_artifact(artifact);
         }
@@ -1326,7 +2137,7 @@ impl SemanticBudget {
                 ..SemanticWork::default()
             });
         } else {
-            staged.admit(full_work)?;
+            staged.admit_artifact_rows(full_work)?;
             staged.record_charged_artifact(artifact);
         }
         *self = staged;
@@ -1655,21 +2466,35 @@ impl SemanticExecutionBudget {
         )
     }
 
+    /// The one way to refuse a charge: the ledger becomes exhausted and the
+    /// answer under construction is reported execution dependent, so it is
+    /// never reused as content.
+    fn refuse(state: &mut SemanticExecutionBudgetState) -> BudgetRefusal {
+        state.exhausted = true;
+        brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+        BudgetRefusal(())
+    }
+
     pub fn admit_materialization(&self, file: &ProjectFile) -> bool {
+        self.try_admit_materialization(file).is_ok()
+    }
+
+    pub(crate) fn try_admit_materialization(
+        &self,
+        file: &ProjectFile,
+    ) -> Result<(), BudgetRefusal> {
         let mut state = self.state.lock().expect("semantic execution budget lock");
         if state.materialized_files.contains(file) {
-            return true;
+            return Ok(());
         }
         let used = state
             .externally_materialized_files
             .saturating_add(state.materialized_files.len());
         if used >= state.max_materialized_files {
-            state.exhausted = true;
-            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-            return false;
+            return Err(Self::refuse(&mut state));
         }
         Arc::make_mut(&mut state.materialized_files).insert(file.clone());
-        true
+        Ok(())
     }
 
     pub fn charge_external_query_work(
@@ -1682,6 +2507,7 @@ impl SemanticExecutionBudget {
         // them with final result paths would be unsound for branches that
         // materialize one file while producing evidence from another.
         self.charge_external_work(materialized_files, traversal_steps)
+            .is_ok()
     }
 
     pub fn external_query_work_fits(
@@ -1700,16 +2526,18 @@ impl SemanticExecutionBudget {
                 .is_none_or(|limit| traversal_steps <= limit.saturating_sub(state.traversal_steps))
     }
 
-    fn charge_external_work(&self, materialized_files: usize, traversal_steps: usize) -> bool {
+    fn charge_external_work(
+        &self,
+        materialized_files: usize,
+        traversal_steps: usize,
+    ) -> Result<(), BudgetRefusal> {
         let mut state = self.state.lock().expect("semantic execution budget lock");
         let Some(attempted_files) = state
             .externally_materialized_files
             .checked_add(state.materialized_files.len())
             .and_then(|used| used.checked_add(materialized_files))
         else {
-            state.exhausted = true;
-            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-            return false;
+            return Err(Self::refuse(&mut state));
         };
         let attempted_traversal = state.traversal_steps.saturating_add(traversal_steps);
         if attempted_files > state.max_materialized_files
@@ -1717,19 +2545,28 @@ impl SemanticExecutionBudget {
                 .max_traversal_steps
                 .is_some_and(|limit| traversal_steps > limit.saturating_sub(state.traversal_steps))
         {
-            state.exhausted = true;
-            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
-            return false;
+            return Err(Self::refuse(&mut state));
         }
         state.externally_materialized_files += materialized_files;
         state.traversal_steps = attempted_traversal;
-        true
+        Ok(())
     }
 
     pub fn charge_traversal(&self, steps: usize) -> bool {
+        self.try_charge_traversal(steps).is_ok()
+    }
+
+    pub(crate) fn try_charge_traversal(&self, steps: usize) -> Result<(), BudgetRefusal> {
         self.charge_external_work(0, steps)
     }
 }
+
+/// A charge a [`SemanticExecutionBudget`] refused. Only the ledger's
+/// `refuse` builds one, so holding a refusal proves the ledger is exhausted
+/// and the answer was reported execution dependent.
+#[must_use = "a refused execution-budget charge stops the work that asked for it"]
+#[derive(Debug)]
+pub(crate) struct BudgetRefusal(());
 
 /// A semantic result whose uncertainty, partial value, and work remain explicit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1945,6 +2782,9 @@ pub struct SemanticRequest<'a> {
     value_type_barrier_context: Option<&'a dyn crate::analyzer::semantic::ValueTypeBarrierContext>,
     #[doc(hidden)]
     pub artifact_collector: Option<SemanticArtifactCollector>,
+    /// Where this request's own refusals start counting; `None` counts all of
+    /// the budget's refusals.
+    refusal_mark: Option<SemanticBudgetRefusalMark>,
 }
 
 impl<'a> SemanticRequest<'a> {
@@ -1955,6 +2795,7 @@ impl<'a> SemanticRequest<'a> {
             execution: None,
             artifact_collector: None,
             value_type_barrier_context: None,
+            refusal_mark: None,
         }
     }
 
@@ -1969,7 +2810,18 @@ impl<'a> SemanticRequest<'a> {
             execution: Some(execution.clone()),
             artifact_collector: None,
             value_type_barrier_context: None,
+            refusal_mark: None,
         }
+    }
+
+    /// Count only the refusals recorded after `mark` as this request's own for
+    /// [`Self::stop_observed`]. A caller that runs independent units on one
+    /// ledger takes the mark when a unit starts, so a refusal that truncated an
+    /// earlier unit is not read as a stop of this one. A request staged over a
+    /// child budget, which counts from zero, sees all of that budget's refusals.
+    pub fn observing_refusals_since(mut self, mark: SemanticBudgetRefusalMark) -> Self {
+        self.refusal_mark = Some(mark);
+        self
     }
 
     /// Observe complete artifacts materialized by this request and its staged
@@ -1989,6 +2841,7 @@ impl<'a> SemanticRequest<'a> {
             execution: self.execution.clone(),
             artifact_collector: self.artifact_collector.clone(),
             value_type_barrier_context: self.value_type_barrier_context,
+            refusal_mark: self.refusal_mark.clone(),
         }
     }
 
@@ -2010,6 +2863,7 @@ impl<'a> SemanticRequest<'a> {
             execution: Some(execution.clone()),
             artifact_collector: self.artifact_collector.clone(),
             value_type_barrier_context: self.value_type_barrier_context,
+            refusal_mark: self.refusal_mark.clone(),
         }
     }
 
@@ -2050,6 +2904,20 @@ impl<'a> SemanticRequest<'a> {
         self.execution.as_ref()
     }
 
+    /// A query-local proof stopped before it could establish complete data.
+    /// Capture-scoped memos must not retain values produced under this state.
+    pub fn stop_observed(&self) -> bool {
+        self.cancellation.is_cancelled()
+            || match &self.refusal_mark {
+                Some(mark) => self.budget.refusals_since(mark) > 0,
+                None => self.budget.refusal_count() > 0,
+            }
+            || self
+                .execution
+                .as_ref()
+                .is_some_and(|budget| budget.work().exhausted)
+    }
+
     #[doc(hidden)]
     pub fn artifact_collector(&self) -> Option<&SemanticArtifactCollector> {
         self.artifact_collector.as_ref()
@@ -2072,9 +2940,13 @@ impl<'a> SemanticRequest<'a> {
     }
 
     pub fn charge_execution_traversal(&self, steps: usize) -> bool {
+        self.try_charge_execution_traversal(steps).is_ok()
+    }
+
+    pub(crate) fn try_charge_execution_traversal(&self, steps: usize) -> Result<(), BudgetRefusal> {
         self.execution
             .as_ref()
-            .is_none_or(|execution| execution.charge_traversal(steps))
+            .map_or(Ok(()), |execution| execution.try_charge_traversal(steps))
     }
 }
 
@@ -2198,8 +3070,32 @@ impl SemanticArtifactSourceSnapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FootprintAdmission {
+    Admitted {
+        call_target_obligations: Vec<crate::analyzer::semantic::CallTargetObligation>,
+    },
+    Refused(FootprintAdmissionRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FootprintAdmissionRefusal {
+    CoverageUnavailable,
+    OldContract,
+    UnknownCode,
+    DuplicateClass,
+    MissingClass,
+    RefusedCoverage,
+}
+
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
 pub trait ProgramSemanticsProvider: Send + Sync {
+    /// Identity of the active lowerer before any file is materialized.
+    fn lowering_identity(
+        &self,
+    ) -> Option<crate::analyzer::semantic::service::SemanticAdapterIdentity> {
+        None
+    }
     /// Exercise the language lowerer before publication in cross-language tests.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
@@ -2286,6 +3182,51 @@ pub trait ProgramSemanticsProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Observe the selected stored publication under one bounded authority check.
+    fn stored_semantic_ir_publication_read(
+        &self,
+        _file: &ProjectFile,
+        _subject: [u8; 32],
+        _source_byte_cap: Option<usize>,
+        _cancellation: &CancellationToken,
+    ) -> Result<StoredSemanticIrRead, SemanticProviderError> {
+        Ok(StoredSemanticIrRead::Refused)
+    }
+
+    /// Admission for an exact stored procedure footprint. Missing authority refuses.
+    fn stored_footprint_coverage(
+        &self,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<crate::analyzer::semantic::FootprintAdmission, SemanticProviderError> {
+        Ok(crate::analyzer::semantic::FootprintAdmission::Refused(
+            crate::analyzer::semantic::FootprintAdmissionRefusal::CoverageUnavailable,
+        ))
+    }
+
+    /// Admission for the selected procedure's scoped call/control coverage. Missing authority refuses.
+    fn stored_call_control_coverage(
+        &self,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<crate::analyzer::semantic::FootprintAdmission, SemanticProviderError> {
+        Ok(crate::analyzer::semantic::FootprintAdmission::Refused(
+            crate::analyzer::semantic::FootprintAdmissionRefusal::CoverageUnavailable,
+        ))
+    }
+
+    /// Decode one procedure from the artifact's complete stored IR rows.
+    /// A provider without matching rows returns `None`.
+    fn stored_semantic_ir_procedure(
+        &self,
+        _file: &ProjectFile,
+        _key: &SemanticArtifactKey,
+        _procedure: ProcedureId,
+    ) -> Result<Option<crate::analyzer::semantic::ProcedureSemanticsParts>, SemanticProviderError>
+    {
+        Ok(None)
+    }
+
     /// Whether the file's complete semantic IR rows carry the artifact `key`
     /// under the active producer epoch. `false` for a language that stores no
     /// rows, and for a file without a complete publication.
@@ -2336,6 +3277,667 @@ impl ProgramSemanticsProvider for UnsupportedProgramSemantics {
 mod tests {
     use crate::analyzer::semantic::provider::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn provider_without_store_refuses_publication_read() {
+        let file = ProjectFile::new(std::env::temp_dir(), "sample.rs");
+        let result = UnsupportedProgramSemantics.stored_semantic_ir_publication_read(
+            &file,
+            [0; 32],
+            None,
+            &CancellationToken::default(),
+        );
+        assert!(matches!(result, Ok(StoredSemanticIrRead::Refused)));
+    }
+
+    #[test]
+    #[hardwon("#10403: a refusal that truncated one unit cut every later unit on the ledger short")]
+    fn refusal_mark_scopes_a_stop_to_the_unit_that_caused_it() {
+        let cancellation = CancellationToken::default();
+        let over = SemanticWork {
+            program_points: 2,
+            ..SemanticWork::default()
+        };
+        let mut budget = SemanticBudget::uniform(1).unwrap();
+        // Unit one is refused.
+        assert!(budget.admit(over).is_err());
+        // Without a mark every later request on the ledger still sees the stop.
+        assert!(SemanticRequest::new(&mut budget, &cancellation).stop_observed());
+        // A request that starts after the refusal does not count it as its own.
+        let mark = budget.refusal_mark();
+        assert!(
+            !SemanticRequest::new(&mut budget, &cancellation)
+                .observing_refusals_since(mark.clone())
+                .stop_observed()
+        );
+        // A refusal during the request is its own.
+        assert!(budget.admit(over).is_err());
+        assert!(
+            SemanticRequest::new(&mut budget, &cancellation)
+                .observing_refusals_since(mark.clone())
+                .stop_observed()
+        );
+        assert_eq!(budget.refusals_since(&mark), 1);
+        // A staged request keeps the mark; one over a child budget, which
+        // counts from zero, sees all of its own refusals.
+        let request =
+            SemanticRequest::new(&mut budget, &cancellation).observing_refusals_since(mark.clone());
+        let mut staged_copy = request.budget.clone();
+        assert!(request.staged(&mut staged_copy).stop_observed());
+        let mut child = SemanticBudget::uniform(1).unwrap();
+        assert!(child.admit(over).is_err());
+        let request =
+            SemanticRequest::new(&mut budget, &cancellation).observing_refusals_since(mark.clone());
+        assert!(request.staged(&mut child).stop_observed());
+        assert_eq!(child.refusals_since(&mark), 1);
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a replayed Output unit passed on its retained census while a fresh run is refused at the transient peak"
+    )]
+    fn replay_checks_the_transient_peak_not_only_the_retained_census() {
+        let evidence = |rows: usize| SemanticWork {
+            evidence: rows,
+            ..SemanticWork::default()
+        };
+        let mut generous = SemanticBudget::uniform(100).unwrap();
+        let before = generous.replay_snapshot();
+        // A computation that needs 80 rows while it runs and keeps 10.
+        generous.admit(evidence(80)).unwrap();
+        generous.release_admission(evidence(70));
+        let replay = generous.replay_since(&before);
+        assert_eq!(replay.retained.evidence, 10);
+        assert_eq!(replay.resident_peak.evidence, 80);
+
+        // A tighter ledger fits the 10 retained rows but a fresh run would be
+        // refused at 80, so the replay must be too, and must say so the same way.
+        let mut tight = SemanticBudget::uniform(50).unwrap();
+        assert!(tight.check_admission(replay.retained).is_ok());
+        assert!(!tight.replay_product_fits(replay));
+        assert!(tight.replay_product(replay).is_err());
+        assert_eq!(
+            tight.resident().evidence,
+            0,
+            "a refused replay admits nothing"
+        );
+        let mut fresh = SemanticBudget::uniform(50).unwrap();
+        assert!(fresh.admit(evidence(80)).is_err());
+        assert_eq!(
+            tight
+                .first_refusal()
+                .map(|refusal| refusal.exceeded.dimension()),
+            fresh
+                .first_refusal()
+                .map(|refusal| refusal.exceeded.dimension()),
+            "the replay and the fresh run are refused on the same lane"
+        );
+
+        // A ledger with room for the peak replays it and keeps only the retained rows.
+        let mut roomy = SemanticBudget::uniform(90).unwrap();
+        assert!(roomy.replay_product_fits(replay));
+        roomy.replay_product(replay).unwrap();
+        assert_eq!(roomy.resident().evidence, 10);
+        // A descriptor built without a measurement checks only what it retains.
+        let unmeasured = SemanticBudgetReplay {
+            retained: evidence(10),
+            ..SemanticBudgetReplay::default()
+        };
+        assert!(
+            SemanticBudget::uniform(10)
+                .unwrap()
+                .replay_product_fits(unmeasured)
+        );
+    }
+
+    fn evidence_rows(rows: usize) -> SemanticWork {
+        SemanticWork {
+            evidence: rows,
+            ..SemanticWork::default()
+        }
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a product computed through a root child was replayed without the peak its child needed"
+    )]
+    fn replay_checks_the_peak_of_an_absorbed_root_child() {
+        // The parent already holds 10 rows when the measured computation starts.
+        let mut parent = SemanticBudget::uniform(100).unwrap();
+        parent.admit(evidence_rows(10)).unwrap();
+        let before = parent.replay_snapshot();
+        // The root runs beside those 10 rows: it needs 60 more while it runs
+        // and keeps 10 behind a cache owner.
+        let mut root = SemanticBudget::new_root_child(&parent);
+        root.admit(evidence_rows(60)).unwrap();
+        root.release_admission(evidence_rows(60));
+        let kept = root.replay_snapshot();
+        root.admit(evidence_rows(10)).unwrap();
+        let owner = Arc::new(());
+        root.bind_replay_holder(&owner, &kept);
+        parent.absorb_root_work(root);
+        let replay = parent.replay_since(&before);
+        assert_eq!(replay.retained.evidence, 10);
+        assert_eq!(replay.resident_peak.evidence, 60);
+
+        // A fresh run on a ledger of 50 is refused when the root asks for its
+        // 60 beside the parent's 10. The replay must be refused on the same lane.
+        let mut fresh = SemanticBudget::uniform(50).unwrap();
+        fresh.admit(evidence_rows(10)).unwrap();
+        let mut fresh_root = SemanticBudget::new_root_child(&fresh);
+        assert!(fresh_root.admit(evidence_rows(60)).is_err());
+        let mut tight = SemanticBudget::uniform(50).unwrap();
+        assert!(tight.check_admission(replay.retained).is_ok());
+        assert!(!tight.replay_product_fits(replay));
+        assert_eq!(
+            tight
+                .replay_product(replay)
+                .map_err(|exceeded| exceeded.dimension()),
+            Err(fresh_root.first_refusal().unwrap().exceeded.dimension())
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a product computed through an applied child charge was replayed without the peak its child needed"
+    )]
+    fn replay_checks_the_peak_of_an_applied_child_charge() {
+        let mut parent = SemanticBudget::uniform(100).unwrap();
+        parent.admit(evidence_rows(10)).unwrap();
+        let before = parent.replay_snapshot();
+        // An independent child carved from the remaining allowance needs 60 and
+        // keeps 5.
+        let mut child =
+            SemanticBudget::new_carved_child(parent.remaining(), &parent.scope_snapshot());
+        child.admit(evidence_rows(60)).unwrap();
+        child.release_admission(evidence_rows(55));
+        parent
+            .apply_child_charge(SemanticWork::default(), child.into_child_charge())
+            .unwrap();
+        let replay = parent.replay_since(&before);
+        assert_eq!(replay.retained.evidence, 5);
+        assert_eq!(replay.resident_peak.evidence, 60);
+        let mut tight = SemanticBudget::uniform(50).unwrap();
+        assert!(tight.check_admission(replay.retained).is_ok());
+        assert!(!tight.replay_product_fits(replay));
+        assert!(tight.replay_product(replay).is_err());
+    }
+
+    #[test]
+    #[hardwon("#10893: dropped policy source sessions prevented every warm summary hit")]
+    fn expired_source_reacquisition_preserves_cold_peak_edges() {
+        use crate::analyzer::semantic::service::{
+            SemanticAdapterIdentity, semantic_artifact_key_from_content,
+        };
+        use crate::analyzer::semantic::{ContentIdentity, DependencyFingerprint, ProcedureId};
+        struct Sources {
+            lifetime: Option<Weak<()>>,
+        }
+        impl MemoDependencyReacquirer for Sources {
+            fn hold_source(
+                &self,
+                _: &MemoSourceDependency,
+                _: usize,
+            ) -> Result<MemoDependencyGuard, MemoDependencyRefusal> {
+                Ok(MemoDependencyGuard::new(
+                    Arc::new(vec![0_u8; 20]),
+                    SemanticWork {
+                        source_bytes: 20,
+                        ..Default::default()
+                    },
+                    self.lifetime.clone(),
+                ))
+            }
+        }
+        let sources = Sources { lifetime: None };
+        let file = ProjectFile::new(std::env::temp_dir(), "reacquire.rs");
+        let key = semantic_artifact_key_from_content(
+            &file,
+            brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                brokk_bifrost_core::analyzer::model::Language::Rust,
+            ),
+            ContentIdentity::from_digest(StableDigest::sha256(b"source")),
+            None,
+            SemanticAdapterIdentity::for_adapter(
+                "test",
+                b"1",
+                b"",
+                DependencyFingerprint::from_digest(StableDigest::sha256(b"")),
+            ),
+        )
+        .unwrap();
+        let source = SemanticWork {
+            source_bytes: 20,
+            ..Default::default()
+        };
+        let scratch = SemanticWork {
+            source_bytes: 80,
+            ..Default::default()
+        };
+        for inherited in [false, true] {
+            let owner = Arc::new(vec![0_u8; 20]);
+            let mut fill = SemanticBudget::uniform(150).unwrap();
+            if inherited {
+                fill.hold_source(&owner, 20).unwrap();
+            }
+            let before = fill.replay_snapshot();
+            fill.hold_source(&owner, 20).unwrap();
+            fill.record_source_reacquisition(
+                &owner,
+                MemoSourceDependency {
+                    procedure: (key.clone(), ProcedureId::new(0)),
+                    acquisition: MemoSourceAcquisition::Hold,
+                },
+            );
+            fill.admit(scratch).unwrap();
+            fill.release_admission(scratch);
+            let admission = fill.memo_admission_since(&before, &Arc::new(()));
+            drop(owner);
+            drop(fill);
+            for limit in [99, 100] {
+                let mut warm = SemanticBudget::uniform(limit).unwrap();
+                let accepted = warm.admit_memo_hit_with(&admission, Some(&sources)).is_ok();
+                let mut cold = SemanticBudget::uniform(limit).unwrap();
+                let owner = Arc::new(vec![0_u8; 20]);
+                cold.hold_source(&owner, 20).unwrap();
+                assert_eq!(cold.admit(scratch).is_ok(), accepted);
+                assert_eq!(accepted, limit == 100);
+                assert_eq!(warm.refusal_count(), 0);
+                assert_eq!(warm.refusal_origins(), SemanticRefusalOrigins::default());
+                if accepted {
+                    cold.release_admission(scratch);
+                    assert_eq!(warm.resident(), source);
+                    assert_eq!(warm.resident(), cold.resident());
+                    assert_eq!(warm.resident_peak(), cold.resident_peak());
+                    assert_eq!(warm.resident_owners.len(), cold.resident_owners.len());
+                    let mut parent = SemanticBudget::uniform(limit).unwrap();
+                    let mut child = SemanticBudget::new_root_child(&parent);
+                    child
+                        .admit_memo_hit_with(&admission, Some(&sources))
+                        .unwrap();
+                    parent.absorb_root_work(child);
+                    assert_eq!(parent.resident(), source);
+                    parent.release_resident();
+                    assert!(parent.reacquired.is_empty());
+                    let provider = Arc::new(());
+                    let scoped = Sources {
+                        lifetime: Some(Arc::downgrade(&provider)),
+                    };
+                    let mut region = SemanticBudget::uniform(limit).unwrap();
+                    region
+                        .admit_memo_hit_with(&admission, Some(&scoped))
+                        .unwrap();
+                    let staging = region.clone();
+                    drop(provider);
+                    assert_eq!(region.resident(), SemanticWork::default());
+                    assert_eq!(staging.resident(), SemanticWork::default());
+                } else {
+                    assert_eq!(warm.resident(), SemanticWork::default());
+                    assert!(warm.reacquired.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#10893: a warm memo hit completed where a cold fill stopped on transient residency")]
+    fn memo_admission_preserves_cold_transient_and_dependency_stops() {
+        let mut fill = SemanticBudget::uniform(150).unwrap();
+        let before = fill.replay_snapshot();
+        fill.admit(evidence_rows(80)).unwrap();
+        fill.release_admission(evidence_rows(80));
+        fill.admit(evidence_rows(1)).unwrap();
+        let result = Arc::new(());
+        let admission = fill.memo_admission_since(&before, &result);
+        for limit in [79, 80] {
+            let mut warm = SemanticBudget::uniform(limit).unwrap();
+            let accepted = warm.admit_memo_hit(&admission).is_ok();
+            assert_eq!(accepted, limit == 80);
+            assert_eq!(warm.refusal_count(), 0, "a speculative miss is not a stop");
+            assert_eq!(warm.refusal_origins(), SemanticRefusalOrigins::default());
+            assert_eq!(warm.resident(), SemanticWork::default());
+            let mut cold = SemanticBudget::uniform(limit).unwrap();
+            assert_eq!(cold.admit(evidence_rows(80)).is_ok(), accepted);
+        }
+
+        // Acquisitions inside the interval are already in its peak.
+        let dependency = Arc::new(());
+        let mut fill = SemanticBudget::uniform(150).unwrap();
+        let before = fill.replay_snapshot();
+        fill.admit_held(evidence_rows(20)).unwrap();
+        fill.track_replay_holder(&dependency, evidence_rows(20));
+        fill.admit(evidence_rows(80)).unwrap();
+        fill.release_admission(evidence_rows(80));
+        let admission = fill.memo_admission_since(&before, &Arc::new(()));
+        for limit in [99, 100] {
+            let mut warm = SemanticBudget::uniform(limit).unwrap();
+            let accepted = warm.admit_memo_hit(&admission).is_ok();
+            let mut cold = SemanticBudget::uniform(limit).unwrap();
+            cold.admit_held(evidence_rows(20)).unwrap();
+            cold.track_replay_holder(&dependency, evidence_rows(20));
+            assert_eq!(cold.admit(evidence_rows(80)).is_ok(), accepted);
+            assert_eq!(accepted, limit == 100);
+            assert_eq!(warm.refusal_count(), 0);
+            if accepted {
+                cold.release_admission(evidence_rows(80));
+                assert_eq!(warm.resident(), cold.resident());
+            } else {
+                assert_eq!(warm.resident(), SemanticWork::default());
+            }
+        }
+
+        // A cache-only result must be evicted on a miss before the cold fill
+        // starts. Otherwise its old 400 rows falsely refuse a 480-row fill.
+        let mut cache = HashMap::new();
+        let mut warm = SemanticBudget::uniform(600).unwrap();
+        let before = warm.replay_snapshot();
+        warm.admit(evidence_rows(480)).unwrap();
+        warm.release_admission(evidence_rows(80));
+        let holder = Arc::new(());
+        warm.bind_replay_holder(&holder, &before);
+        let admission = warm.memo_admission_since(&before, &holder);
+        cache.insert(0, holder);
+        assert!(warm.admit_memo_hit(&admission).is_err());
+        assert_eq!(warm.refusal_count(), 0);
+        drop(cache.remove(&0).unwrap());
+        let before = warm.replay_snapshot();
+        warm.admit(evidence_rows(480)).unwrap();
+        warm.release_admission(evidence_rows(80));
+        let holder = Arc::new(());
+        warm.bind_replay_holder(&holder, &before);
+        let mut cold = SemanticBudget::uniform(600).unwrap();
+        cold.admit(evidence_rows(480)).unwrap();
+        cold.release_admission(evidence_rows(80));
+        assert_eq!(warm.resident(), cold.resident());
+        assert_eq!(warm.refusal_count(), cold.refusal_count());
+
+        // The fill inherited this dependency. Its interval peak alone omits it.
+        let dependency = Arc::new(());
+        let mut fill = SemanticBudget::uniform(150).unwrap();
+        fill.admit(evidence_rows(100)).unwrap();
+        fill.track_replay_holder(&dependency, evidence_rows(100));
+        let untouched = Arc::new(());
+        fill.admit_held(evidence_rows(20)).unwrap();
+        fill.track_replay_holder(&untouched, evidence_rows(20));
+        let before = fill.replay_snapshot();
+        assert!(fill.has_replay_holder(&dependency));
+        fill.admit(evidence_rows(1)).unwrap();
+        let result = Arc::new(());
+        let admission = fill.memo_admission_since(&before, &result);
+        assert!(
+            !admission
+                .owners
+                .contains_key(&(Arc::as_ptr(&untouched) as usize))
+        );
+        for limit in [100, 101] {
+            let mut warm = SemanticBudget::uniform(limit).unwrap();
+            let accepted = warm.admit_memo_hit(&admission).is_ok();
+            assert_eq!(accepted, limit == 101);
+            assert_eq!(warm.refusal_count(), 0);
+            assert_eq!(warm.refusal_origins(), SemanticRefusalOrigins::default());
+            let mut cold = SemanticBudget::uniform(limit).unwrap();
+            cold.admit_held(evidence_rows(100)).unwrap();
+            cold.track_replay_holder(&dependency, evidence_rows(100));
+            assert_eq!(cold.check_admission(evidence_rows(1)).is_ok(), accepted);
+            if accepted {
+                assert_eq!(warm.resident(), cold.resident());
+                assert_eq!(
+                    warm.resident_owners.keys().collect::<Vec<_>>(),
+                    cold.resident_owners.keys().collect::<Vec<_>>()
+                );
+            } else {
+                assert_eq!(warm.resident(), SemanticWork::default());
+            }
+        }
+        drop(dependency);
+        let expired = Arc::new(());
+        let mut fill = SemanticBudget::uniform(150).unwrap();
+        fill.admit(evidence_rows(100)).unwrap();
+        fill.track_replay_holder(&expired, evidence_rows(100));
+        let before = fill.replay_snapshot();
+        assert!(fill.has_replay_holder(&expired));
+        drop(expired);
+        fill.admit(evidence_rows(1)).unwrap();
+        let expired_admission = fill.memo_admission_since(&before, &Arc::new(()));
+        assert!(
+            SemanticBudget::uniform(50)
+                .unwrap()
+                .admit_memo_hit(&expired_admission)
+                .is_err()
+        );
+        let mut fresh = SemanticBudget::uniform(150).unwrap();
+        assert!(matches!(
+            fresh.admit_memo_hit(&admission),
+            Err(SemanticMemoAdmissionMiss::MissingDependency)
+        ));
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a second lookup of a resident cached product was refused for scratch room it never allocates"
+    )]
+    fn a_repeat_lookup_of_a_resident_product_needs_no_transient_room() {
+        // A refinement that kept 400 rows but needed 80 more while it was derived.
+        let descriptor_with_scratch = || SemanticBudgetReplay {
+            retained: evidence_rows(400),
+            resident_peak: evidence_rows(480),
+            ..SemanticBudgetReplay::default()
+        };
+        let mut budget = SemanticBudget::uniform(600).unwrap();
+        // A 400-row refinement whose derivation held no more than it keeps.
+        let before = budget.replay_snapshot();
+        budget.admit(evidence_rows(400)).unwrap();
+        let owner = Arc::new(());
+        budget.bind_replay_holder(&owner, &before);
+        let descriptor = budget.replay_since(&before);
+        assert_eq!(descriptor.retained.evidence, 400);
+        assert_eq!(descriptor.resident_peak.evidence, 400);
+        // The product is resident, so the second lookup allocates nothing and
+        // is not refused although 400 more rows would not fit under 600.
+        let (replay, already_held) = budget.replay_for_holder(&owner, descriptor);
+        assert!(already_held);
+        assert_eq!(replay.retained, SemanticWork::default());
+        assert_eq!(replay.resident_peak, SemanticWork::default());
+        budget.replay_continuation(replay).unwrap();
+        assert_eq!(budget.resident().evidence, 400);
+        // A cached product that is not resident needs room for its returned
+        // rows, but not for the scratch its derivation used.
+        let stranger = Arc::new(());
+        let (replay, already_held) = budget.replay_for_holder(&stranger, descriptor);
+        assert!(!already_held);
+        assert_eq!(replay.retained.evidence, 400);
+        assert_eq!(replay.resident_peak, SemanticWork::default());
+        assert!(
+            !budget.replay_product_fits(replay),
+            "400 more do not fit beside 400"
+        );
+        let mut roomy = SemanticBudget::uniform(450).unwrap();
+        let (replay, _) = roomy.replay_for_holder(&stranger, descriptor_with_scratch());
+        assert!(roomy.replay_product_fits(replay));
+        roomy.replay_continuation(replay).unwrap();
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: an expired holder inflated the peak recorded for the interval that enclosed a replay"
+    )]
+    fn an_expired_holder_does_not_inflate_the_recorded_peak() {
+        let inner = SemanticBudgetReplay {
+            retained: evidence_rows(50),
+            resident_peak: evidence_rows(50),
+            ..SemanticBudgetReplay::default()
+        };
+        // The holder was admitted before the interval and expires inside it.
+        let mut budget = SemanticBudget::uniform(100).unwrap();
+        let before_holder = budget.replay_snapshot();
+        budget.admit(evidence_rows(60)).unwrap();
+        let holder = Arc::new(());
+        budget.bind_replay_holder(&holder, &before_holder);
+        drop(before_holder);
+        let outer = budget.replay_snapshot();
+        drop(holder);
+        budget.replay_product(inner).unwrap();
+        let enclosing = budget.replay_since(&outer);
+        assert_eq!(enclosing.resident_peak.evidence, 50);
+        assert!(
+            SemanticBudget::uniform(100)
+                .unwrap()
+                .replay_product_fits(enclosing)
+        );
+
+        // The holder was admitted inside the interval and expires inside it.
+        let mut budget = SemanticBudget::uniform(100).unwrap();
+        let outer = budget.replay_snapshot();
+        let before_holder = budget.replay_snapshot();
+        budget.admit(evidence_rows(60)).unwrap();
+        let holder = Arc::new(());
+        budget.bind_replay_holder(&holder, &before_holder);
+        drop(holder);
+        budget.replay_product(inner).unwrap();
+        let enclosing = budget.replay_since(&outer);
+        // 60 while the holder lived, then 50 on its own: never 110.
+        assert_eq!(enclosing.resident_peak.evidence, 60);
+        assert!(
+            SemanticBudget::uniform(100)
+                .unwrap()
+                .replay_product_fits(enclosing)
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a root's inherited holder expiring hid the rows the root then used, so its replay passed where recomputing refuses"
+    )]
+    fn a_root_reports_its_own_peak_when_an_inherited_holder_expires() {
+        let mut parent = SemanticBudget::uniform(100).unwrap();
+        let held = parent.replay_snapshot();
+        parent.admit(evidence_rows(80)).unwrap();
+        let inherited = Arc::new(());
+        parent.bind_replay_holder(&inherited, &held);
+        drop(held);
+        let before = parent.replay_snapshot();
+        let mut root = SemanticBudget::new_root_child(&parent);
+        drop(inherited);
+        // The inherited 80 are gone; the root needs 60 temporary rows of its own.
+        root.admit(evidence_rows(60)).unwrap();
+        root.release_admission(evidence_rows(60));
+        parent.absorb_root_work(root);
+        let replay = parent.replay_since(&before);
+        assert_eq!(replay.resident_peak.evidence, 60);
+        // Recomputing on a ledger of 50 refuses the root's 60; so must the replay.
+        let mut fresh = SemanticBudget::uniform(50).unwrap();
+        let mut fresh_root = SemanticBudget::new_root_child(&fresh);
+        assert!(fresh_root.admit(evidence_rows(60)).is_err());
+        assert!(fresh.replay_product(replay).is_err());
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: sibling children carved from the same allowance could together exceed the limit without a refusal, so their replay was refused where the live run was not"
+    )]
+    fn children_that_do_not_fit_together_are_refused_when_applied() {
+        let mut parent = SemanticBudget::uniform(100).unwrap();
+        parent.admit(evidence_rows(10)).unwrap();
+        let before = parent.replay_snapshot();
+        let scope = parent.scope_snapshot();
+        // Both children are carved from the same 90 remaining rows.
+        let mut first = SemanticBudget::new_carved_child(parent.remaining(), &scope);
+        let mut second = SemanticBudget::new_carved_child(parent.remaining(), &scope);
+        first.admit(evidence_rows(60)).unwrap();
+        first.release_admission(evidence_rows(50));
+        // The second child needs 90 at its peak and keeps only 5, so its
+        // retained rows fit and only its peak does not.
+        second.admit(evidence_rows(90)).unwrap();
+        second.release_admission(evidence_rows(85));
+        let first = first.into_child_charge();
+        let second = second.into_child_charge();
+
+        parent
+            .apply_child_charge(SemanticWork::default(), first)
+            .unwrap();
+        assert_eq!(parent.resident().evidence, 20);
+        // 20 held + the second child's 90 is 110 on a limit of 100.
+        assert!(
+            parent
+                .check_child_charge(SemanticWork::default(), &second)
+                .is_err()
+        );
+        assert!(
+            parent
+                .apply_child_charge(SemanticWork::default(), second)
+                .is_err()
+        );
+        assert!(parent.first_refusal().is_some());
+        assert_eq!(
+            parent.resident().evidence,
+            20,
+            "a refused child admits nothing"
+        );
+        // The live run recorded only what it really held, and its replay agrees.
+        let replay = parent.replay_since(&before);
+        assert_eq!(replay.resident_peak.evidence, 60);
+        assert!(
+            SemanticBudget::uniform(80)
+                .unwrap()
+                .replay_product_fits(replay)
+        );
+        assert!(
+            !SemanticBudget::uniform(50)
+                .unwrap()
+                .replay_product_fits(replay)
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a child under an allowance of its own was recorded beside its parent, so a stored product depended on the balance it was replayed on"
+    )]
+    fn an_independent_child_does_not_add_its_peak_beside_its_parent() {
+        let mut parent = SemanticBudget::uniform(100).unwrap();
+        parent.admit(evidence_rows(10)).unwrap();
+        let before = parent.replay_snapshot();
+        // An allowance of its own that happens to be within what the parent has
+        // left, as a class-set root's engine allotment can be.
+        let scope = parent.scope_snapshot();
+        let mut applied = SemanticBudget::new_child(evidence_rows(60), &scope);
+        applied.admit(evidence_rows(60)).unwrap();
+        applied.release_admission(evidence_rows(55));
+        parent.admit(evidence_rows(40)).unwrap();
+        // 50 held + the child's 60 is over the limit, and that is not its concern.
+        parent
+            .apply_child_charge(SemanticWork::default(), applied.into_child_charge())
+            .unwrap();
+        let mut absorbed = SemanticBudget::new_child(evidence_rows(60), &scope);
+        absorbed.admit(evidence_rows(60)).unwrap();
+        absorbed.release_admission(evidence_rows(60));
+        parent.absorb_root_work(absorbed);
+        let replay = parent.replay_since(&before);
+        // Only the parent's own 40 and the child's 5 kept rows are on the record.
+        assert_eq!(replay.resident_peak.evidence, 45);
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a child's discarded staged work kept its peak from the observers but not from the peak the child reports to its parent"
+    )]
+    fn a_childs_retained_staged_work_keeps_its_peak_for_the_parent() {
+        let mut parent = SemanticBudget::uniform(100).unwrap();
+        let before = parent.replay_snapshot();
+        let mut root = SemanticBudget::new_root_child(&parent);
+        // The staging copy admits 60 rows and is discarded, as the heap oracle
+        // does when its publication is interrupted.
+        let mut staged = root.clone();
+        staged.admit(evidence_rows(60)).unwrap();
+        root.retain_performed_work(&staged);
+        parent.absorb_root_work(root);
+        let replay = parent.replay_since(&before);
+        assert_eq!(replay.resident_peak.evidence, 60);
+        let mut fresh = SemanticBudget::uniform(50).unwrap();
+        let fresh_root = SemanticBudget::new_root_child(&fresh);
+        let mut fresh_staged = fresh_root.clone();
+        assert!(fresh_staged.admit(evidence_rows(60)).is_err());
+        assert!(fresh.replay_product(replay).is_err());
+    }
 
     #[test]
     #[hardwon("#8389: refused replay preflight recorded a refusal on the live budget")]
@@ -2605,6 +4207,37 @@ mod tests {
 
     fn mock_file() -> ProjectFile {
         ProjectFile::new(std::env::temp_dir(), "src/mock.ts")
+    }
+
+    #[test]
+    fn sibling_conversion_census_charges_are_independent_of_batch_order() {
+        let parent = SemanticBudget::uniform(4096).expect("parent");
+        let snapshot = parent.scope_snapshot();
+        let artifact = StableDigest::sha256(b"conversion file census");
+        let full = SemanticWork {
+            source_bytes: 800,
+            nested_entries: 200,
+            ..SemanticWork::default()
+        };
+        let run = |budget: &mut SemanticBudget| {
+            budget
+                .charge_complete_artifact_hit(artifact, full)
+                .expect("first touch");
+            budget
+                .charge_complete_artifact_hit(artifact, full)
+                .expect("repeat touch");
+            budget.used()
+        };
+        let alone = run(&mut SemanticBudget::new_child(parent.limits(), &snapshot));
+        for order in [[0, 1], [1, 0]] {
+            let mut siblings = [
+                SemanticBudget::new_child(parent.limits(), &snapshot),
+                SemanticBudget::new_child(parent.limits(), &snapshot),
+            ];
+            for index in order {
+                assert_eq!(run(&mut siblings[index]), alone);
+            }
+        }
     }
 
     #[test]
@@ -3223,16 +4856,16 @@ mod tests {
         let second = ProjectFile::new(first.root(), "src/second.rs");
         let source = SemanticExecutionBudget::new(4);
         assert!(source.admit_materialization(&first));
-        assert!(source.charge_external_work(1, 2));
+        assert!(source.charge_external_work(1, 2).is_ok());
         let before = source.snapshot();
         assert!(source.admit_materialization(&second));
-        assert!(source.charge_external_work(1, 3));
+        assert!(source.charge_external_work(1, 3).is_ok());
         let after = source.snapshot();
         let charge = source.charge_since(&before).expect("monotonic charge");
 
         let replay = SemanticExecutionBudget::new(4);
         assert!(replay.admit_materialization(&first));
-        assert!(replay.charge_external_work(1, 2));
+        assert!(replay.charge_external_work(1, 2).is_ok());
         assert_eq!(replay.snapshot(), before);
         assert!(replay.replay_charge(&before, &charge));
         assert_eq!(replay.snapshot(), after);
@@ -3241,10 +4874,148 @@ mod tests {
         assert!(!replay.replay_charge(&before, &charge));
         assert_eq!(replay.snapshot(), already_replayed);
     }
+
+    #[test]
+    #[hardwon(
+        "#10530: Output units shared one resident ledger, so a unit was charged and refused for the rows earlier units left"
+    )]
+    fn a_unit_ledger_starts_empty_and_refuses_on_its_own() {
+        let mut batch = SemanticBudget::uniform(100).unwrap();
+        batch.admit(evidence_rows(70)).unwrap();
+        let mut unit = batch.unit_ledger();
+        assert_eq!(unit.resident(), SemanticWork::default());
+        assert_eq!(unit.limits(), batch.limits());
+
+        // 80 rows do not fit beside the batch's 70 but fit a unit's own ledger.
+        unit.admit(evidence_rows(80)).unwrap();
+        assert!(unit.admit(evidence_rows(30)).is_err());
+        assert!(unit.refusal_count() > 0);
+        assert_eq!(
+            batch.refusal_count(),
+            0,
+            "a unit's refusal is not the batch's"
+        );
+        assert!(batch.first_refusal().is_none());
+
+        let unit_cumulative = unit.used();
+        let batch_cumulative = batch.used();
+        batch.absorb_unit(unit);
+        assert_eq!(
+            batch.resident().evidence,
+            70,
+            "a unit's resident rows die with the unit"
+        );
+        assert_eq!(batch.refusal_count(), 0);
+        assert!(batch.first_refusal().is_none());
+        assert_eq!(
+            batch.used(),
+            batch_cumulative.saturating_add(unit_cumulative),
+            "the unit's work is the batch's work"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: a unit's rows were counted on the batch's own measurement as well, so the batch product charged them twice"
+    )]
+    fn absorbing_a_unit_adds_its_work_but_not_its_rows_to_an_open_measurement() {
+        let mut batch = SemanticBudget::uniform(100).unwrap();
+        batch.admit(evidence_rows(10)).unwrap();
+        let before = batch.replay_snapshot();
+        let mut unit = batch.unit_ledger();
+        unit.admit(evidence_rows(80)).unwrap();
+        unit.release_admission(evidence_rows(75));
+        // The unit is measured on its own ledger.
+        assert_eq!(unit.resident().evidence, 5);
+        batch.absorb_unit(unit);
+        // The batch's measurement sees the unit's work, which is performed, but
+        // neither the 5 rows it kept nor the 80 it held: the unit was not
+        // running beside the batch's rows.
+        let replay = batch.replay_since(&before);
+        assert_eq!(replay.cumulative.evidence, 80);
+        assert_eq!(replay.retained.evidence, 0);
+        assert_eq!(replay.resident_peak.evidence, 0);
+    }
+
+    #[test]
+    #[hardwon(
+        "#10530: whether a stored unit replayed depended on the rows earlier units held, so warm runs differed from cold ones"
+    )]
+    fn a_unit_replay_fits_by_its_own_product_not_by_the_batch_balance() {
+        let mut measured = SemanticBudget::uniform(200).unwrap();
+        let before = measured.replay_snapshot();
+        measured.admit(evidence_rows(80)).unwrap();
+        measured.release_admission(evidence_rows(60));
+        let replay = measured.replay_since(&before);
+        assert_eq!(replay.retained.evidence, 20);
+        assert_eq!(replay.resident_peak.evidence, 80);
+
+        // A batch that already holds 60 rows cannot take 80 more under 100, yet a
+        // fresh unit would run on an empty ledger and fit, so the replay does.
+        let mut batch = SemanticBudget::uniform(100).unwrap();
+        batch.admit(evidence_rows(60)).unwrap();
+        assert!(!batch.replay_product_fits(replay));
+        assert!(batch.replay_unit_fits(replay));
+        let cumulative = batch.used();
+        batch.replay_unit(replay).unwrap();
+        assert_eq!(
+            batch.resident().evidence,
+            60,
+            "a replayed unit leaves no resident rows"
+        );
+        assert_eq!(
+            batch.used().evidence,
+            cumulative.evidence + replay.cumulative.evidence
+        );
+
+        // The limit still binds: a unit whose own peak exceeds it is refused,
+        // and nothing changes.
+        let mut small = SemanticBudget::uniform(50).unwrap();
+        let used = small.used();
+        assert!(!small.replay_unit_fits(replay));
+        assert!(small.replay_unit(replay).is_err());
+        assert_eq!(small.used(), used);
+        assert_eq!(small.resident(), SemanticWork::default());
+        assert_eq!(small.refusal_count(), 0, "a refused replay is the unit's");
+    }
+
+    #[test]
+    fn a_unit_ledger_shares_paid_artifacts_with_the_batch() {
+        let already_paid = StableDigest::sha256(b"paid before the unit");
+        let paid_by_unit = StableDigest::sha256(b"paid by the unit");
+        let full_work = SemanticWork {
+            procedures: 2,
+            blocks: 3,
+            ..SemanticWork::default()
+        };
+        let mut batch = SemanticBudget::uniform(64).unwrap();
+        batch.record_charged_artifact(already_paid);
+        let mut unit = batch.unit_ledger();
+        assert!(unit.has_charged_artifact(already_paid));
+        unit.charge_complete_artifact_hit(paid_by_unit, full_work)
+            .unwrap();
+        assert!(unit.has_charged_artifact(paid_by_unit));
+        assert!(!batch.has_charged_artifact(paid_by_unit));
+        batch.absorb_unit(unit);
+        assert!(
+            batch.has_charged_artifact(paid_by_unit),
+            "a later unit pays the repeat price"
+        );
+        let later = batch.unit_ledger();
+        assert!(later.has_charged_artifact(paid_by_unit));
+    }
 }
 
 /// Portable accounting for a cached product. Each object remains SQL-readable
 /// when persisted in a policy unit's JSONB product.
+///
+/// The work counters (`cumulative`, `performed`, `root_work_peak`) are
+/// execution-dependent telemetry (#10893). A memo hit charges no work, so a
+/// product filled after its siblings warmed shared memos records less work than
+/// the same product filled cold. They cannot change an answer: `charge_work`
+/// never refuses, and `replay_product` admits on `resident_peak` and `retained`
+/// only. Byte-equality tests of persisted products normalize these three
+/// counters.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticBudgetReplay {
@@ -3257,13 +5028,72 @@ pub struct SemanticBudgetReplay {
     pub performed: SemanticWork,
     pub root_work_peak: SemanticWork,
     pub retained: SemanticWork,
+    /// The most resident rows the computation held above where it started, at
+    /// any point and scratch included. A replay must fit this, not only the
+    /// retained census, or it would pass where a fresh run is refused. Absent
+    /// in a descriptor built without a measurement, which then checks only
+    /// `retained`.
+    #[serde(default)]
+    pub resident_peak: SemanticWork,
+}
+
+/// In-memory admission receipt; no work telemetry or persisted fields.
+#[derive(Debug, Clone)]
+pub struct SemanticMemoAdmission {
+    acquired_owners: HashSet<usize>,
+    acquired_artifacts: HashSet<(StableDigest, usize)>,
+    owners: ResidentOwners,
+    artifacts: ResidentArtifacts,
+    transient_peak: SemanticWork,
+}
+
+impl SemanticMemoAdmission {
+    /// Payload capacity census for the descriptor's owned hash tables.
+    pub fn retained_bytes(&self) -> usize {
+        let identities = self
+            .owners
+            .values()
+            .filter_map(|(owner, _)| owner.source.as_ref())
+            .map(|source| source.procedure.0.path().as_str().len())
+            .chain(
+                self.artifacts
+                    .values()
+                    .map(|(artifact, _)| artifact.key.path().as_str().len()),
+            )
+            .fold(0usize, usize::saturating_add);
+        identities
+            .saturating_add(
+                self.acquired_owners.capacity() * (std::mem::size_of::<usize>() + 1)
+                    + self.acquired_artifacts.capacity()
+                        * (std::mem::size_of::<(StableDigest, usize)>() + 1),
+            )
+            .saturating_add(self.owners.capacity().saturating_mul(
+                std::mem::size_of::<(usize, (ResidentOwnerReceipt, SemanticWork))>() + 1,
+            ))
+            .saturating_add(self.artifacts.capacity().saturating_mul(
+                std::mem::size_of::<((StableDigest, usize), (ResidentArtifact, SemanticWork))>()
+                    + 1,
+            ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SemanticMemoAdmissionMiss {
+    MissingDependency,
+    Residency(SemanticBudgetExceeded),
+}
+
+#[derive(Debug, Default)]
+struct MemoDependencyTouches {
+    owners: HashSet<usize>,
+    artifacts: HashSet<(StableDigest, usize)>,
 }
 
 /// Query-local measurement interval. Dropping it retires its observer even
 /// when a computation returns early; staging copies preserve value semantics.
 #[derive(Debug)]
 pub struct SemanticBudgetReplaySnapshot {
-    owner: Arc<()>,
+    owner: Arc<Mutex<MemoDependencyTouches>>,
     cumulative: SemanticWork,
     performed: SemanticWork,
     artifacts: Arc<ResidentArtifacts>,
@@ -3273,30 +5103,225 @@ pub struct SemanticBudgetReplaySnapshot {
 
 #[derive(Debug, Clone)]
 struct ReplayObserver {
-    owner: Weak<()>,
+    owner: Weak<Mutex<MemoDependencyTouches>>,
     base: SemanticWork,
     peak: SemanticWork,
+    resident: ResidentInterval,
+}
+
+/// The most rows a computation held at once above what it inherited, scratch
+/// included. `base` is the balance the interval began with that is still held:
+/// when an inherited holder expires mid-interval the base drops by its census,
+/// so the expiry is not mistaken for room the computation can count on, and a
+/// later admission is measured against what is really still there.
+#[derive(Debug, Clone)]
+struct ResidentInterval {
+    base: SemanticWork,
+    peak: SemanticWork,
+    /// Whether the interval ran beside its parent's holders (a root child) or
+    /// under an allowance of its own.
+    coexists: bool,
+    inherited_owners: Arc<ResidentOwners>,
+    inherited_artifacts: Arc<ResidentArtifacts>,
+}
+
+impl ResidentInterval {
+    fn independent() -> Self {
+        Self {
+            base: SemanticWork::default(),
+            peak: SemanticWork::default(),
+            coexists: false,
+            inherited_owners: Arc::default(),
+            inherited_artifacts: Arc::default(),
+        }
+    }
+
+    fn beginning(
+        used: SemanticWork,
+        owners: &Arc<ResidentOwners>,
+        artifacts: &Arc<ResidentArtifacts>,
+        coexists: bool,
+    ) -> Self {
+        Self {
+            base: used,
+            peak: SemanticWork::default(),
+            coexists,
+            inherited_owners: Arc::clone(owners),
+            inherited_artifacts: Arc::clone(artifacts),
+        }
+    }
+
+    fn observe(&mut self, used: SemanticWork) {
+        self.peak = self.peak.component_max(used.saturating_sub(self.base));
+    }
+
+    fn owner_expired(&mut self, key: &usize, census: SemanticWork) {
+        if self.inherited_owners.contains_key(key) {
+            self.base = self.base.saturating_sub(census);
+        }
+    }
+
+    fn artifact_expired(&mut self, key: &(StableDigest, usize), census: SemanticWork) {
+        if self.inherited_artifacts.contains_key(key) {
+            self.base = self.base.saturating_sub(census);
+        }
+    }
 }
 
 type ResidentOwner = dyn std::any::Any + Send + Sync;
 
-type ResidentOwners = HashMap<usize, (Weak<ResidentOwner>, SemanticWork)>;
+type ResidentOwners = HashMap<usize, (ResidentOwnerReceipt, SemanticWork)>;
 
-fn weak_resident_owner<T: Send + Sync + 'static>(owner: &Arc<T>) -> Weak<ResidentOwner> {
+#[derive(Debug, Clone)]
+struct ResidentOwnerReceipt {
+    allocation: Weak<ResidentOwner>,
+    source: Option<MemoSourceDependency>,
+}
+
+impl ResidentOwnerReceipt {
+    fn strong_count(&self) -> usize {
+        self.allocation.strong_count()
+    }
+    fn upgrade(&self) -> Option<Arc<ResidentOwner>> {
+        self.allocation.upgrade()
+    }
+}
+
+/// Exact source address; the artifact key includes the blob and adapter identity.
+#[derive(Debug, Clone)]
+pub struct MemoSourceDependency {
+    pub procedure: (
+        crate::analyzer::semantic::SemanticArtifactKey,
+        crate::analyzer::semantic::ProcedureId,
+    ),
+    pub acquisition: MemoSourceAcquisition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum MemoSourceAcquisition {
+    Admit,
+    Hold,
+    Readmit,
+}
+
+/// A real allocation retained by the current region, never a residency marker.
+#[derive(Clone)]
+pub struct MemoDependencyGuard {
+    // All staging clones share release, so no discarded probe can prolong a
+    // provider's source lifetime after another clone reconciles its ledger.
+    allocation: Arc<Mutex<Option<Arc<ResidentOwner>>>>,
+    pub census: SemanticWork,
+    provider_lifetime: Option<Weak<()>>,
+}
+
+impl MemoDependencyGuard {
+    /// Source guards use the active provider's lifetime. Region-owned
+    /// allocations may omit it; all staging clones share allocation release.
+    pub fn new<T: Send + Sync + 'static>(
+        allocation: Arc<T>,
+        census: SemanticWork,
+        provider_lifetime: Option<Weak<()>>,
+    ) -> Self {
+        Self {
+            allocation: Arc::new(Mutex::new(Some(allocation))),
+            census,
+            provider_lifetime,
+        }
+    }
+
+    fn allocation(&self) -> Option<Arc<ResidentOwner>> {
+        self.allocation
+            .lock()
+            .expect("memo dependency allocation poisoned")
+            .clone()
+    }
+
+    fn retain_while_provider_lives(&self) -> bool {
+        if self
+            .provider_lifetime
+            .as_ref()
+            .is_none_or(|owner| owner.strong_count() > 0)
+        {
+            return true;
+        }
+        self.allocation
+            .lock()
+            .expect("memo dependency allocation poisoned")
+            .take();
+        false
+    }
+}
+
+impl fmt::Debug for MemoDependencyGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoDependencyGuard")
+            .field("census", &self.census)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum MemoDependencyRefusal {
+    MissingDependency,
+    Provider(SemanticProviderError),
+}
+
+pub trait MemoDependencyReacquirer {
+    fn hold_source(
+        &self,
+        key: &MemoSourceDependency,
+        max_bytes: usize,
+    ) -> Result<MemoDependencyGuard, MemoDependencyRefusal>;
+
+    fn readmit_source(
+        &self,
+        key: &MemoSourceDependency,
+        max_bytes: usize,
+    ) -> Result<MemoDependencyGuard, MemoDependencyRefusal> {
+        self.hold_source(key, max_bytes)
+    }
+
+    fn admit_source(
+        &self,
+        _key: &MemoSourceDependency,
+        _max_bytes: usize,
+    ) -> Result<MemoDependencyGuard, MemoDependencyRefusal> {
+        Err(MemoDependencyRefusal::MissingDependency)
+    }
+
+    // A validity key alone does not select stored-publication provenance.
+    // Providers without an exact cache acquisition path must retain the miss.
+    fn artifact(
+        &self,
+        _key: &crate::analyzer::semantic::SemanticArtifactKey,
+        _capabilities: &SemanticCapabilities,
+    ) -> Result<Arc<SemanticArtifact>, MemoDependencyRefusal> {
+        Err(MemoDependencyRefusal::MissingDependency)
+    }
+}
+
+fn weak_resident_owner<T: Send + Sync + 'static>(owner: &Arc<T>) -> ResidentOwnerReceipt {
     let erased: Arc<ResidentOwner> = Arc::clone(owner) as Arc<ResidentOwner>;
-    Arc::downgrade(&erased)
+    ResidentOwnerReceipt {
+        allocation: Arc::downgrade(&erased),
+        source: None,
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ResidentArtifact {
     allocation: Weak<SemanticArtifact>,
     cache_pins: Arc<crate::analyzer::semantic::ir::ArtifactCachePins>,
+    key: crate::analyzer::semantic::SemanticArtifactKey,
+    capabilities: SemanticCapabilities,
 }
 
 impl ResidentArtifact {
     fn new(artifact: &Arc<SemanticArtifact>) -> Self {
         Self {
             allocation: Arc::downgrade(artifact),
+            key: artifact.key().clone(),
+            capabilities: artifact.capabilities().clone(),
             cache_pins: Arc::clone(&artifact.cache_pins),
         }
     }
@@ -3327,19 +5352,34 @@ impl ResidentArtifact {
 }
 
 /// Refund and remove using one liveness observation per admission.
+#[cfg(test)]
 fn refund_expired_residents<Key: Eq + std::hash::Hash, Owner>(
     entries: &mut HashMap<Key, (Owner, SemanticWork)>,
     used: &mut SemanticWork,
+    is_live: impl FnMut(&Owner) -> bool,
+) -> SemanticWork {
+    refund_expired_residents_noting(entries, used, is_live, |_, _| {})
+}
+
+/// [`refund_expired_residents`] that also names each admission it removed.
+fn refund_expired_residents_noting<Key: Eq + std::hash::Hash, Owner>(
+    entries: &mut HashMap<Key, (Owner, SemanticWork)>,
+    used: &mut SemanticWork,
     mut is_live: impl FnMut(&Owner) -> bool,
-) {
-    entries.retain(|_, (owner, work)| {
+    mut expired: impl FnMut(&Key, &SemanticWork),
+) -> SemanticWork {
+    let mut refunded = SemanticWork::default();
+    entries.retain(|key, (owner, work)| {
         if is_live(owner) {
             true
         } else {
+            expired(key, work);
             *used = used.saturating_sub(*work);
+            refunded = refunded.saturating_add(*work);
             false
         }
     });
+    refunded
 }
 
 type ResidentArtifacts = HashMap<(StableDigest, usize), (ResidentArtifact, SemanticWork)>;

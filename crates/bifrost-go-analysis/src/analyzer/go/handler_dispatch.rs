@@ -129,6 +129,13 @@ pub fn go_http_handler_dispatch(
     argument: ValueId,
     request: &mut SemanticRequest<'_>,
 ) -> Result<GoHttpHandlerDispatch, SemanticProviderError> {
+    let _model_scope = match AnalyzerQueryScope::with_compatible_selected_model_snapshot(
+        workspace.analyzer(),
+        active_models.cloned(),
+    ) {
+        Ok(scope) => scope,
+        Err(_) => return Ok(open(GoHttpHandlerOpenReason::BudgetExhausted)),
+    };
     let semantics = procedure.semantics();
     let Some(value) = semantics.value(argument) else {
         return Ok(open(GoHttpHandlerOpenReason::NotExact));
@@ -274,7 +281,7 @@ enum ServeHttpResolution {
 #[allow(clippy::too_many_arguments)]
 fn serve_http_method(
     workspace: &WorkspaceAnalyzer,
-    active_models: Option<&Arc<ActiveSemanticModelSnapshot>>,
+    _active_models: Option<&Arc<ActiveSemanticModelSnapshot>>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -297,8 +304,6 @@ fn serve_http_method(
     ) else {
         return Ok(ServeHttpResolution::NotExact);
     };
-    let scope =
-        AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, active_models.cloned());
     let outcome = resolve_type_at_reference_site_with_budget(
         analyzer,
         file,
@@ -307,7 +312,6 @@ fn serve_http_method(
         site,
         ReceiverAnalysisBudget::default(),
     );
-    drop(scope);
     if let Err(reason) = charge_work(
         request,
         SemanticWork {

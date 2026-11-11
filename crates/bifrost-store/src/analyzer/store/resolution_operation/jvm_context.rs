@@ -13,6 +13,7 @@ pub fn jvm_import_target_mounts() -> ImportTargetMounts {
 }
 
 use super::context_preparation::{ContextPlanCell, ContextPlanMemo, RequestContextMemo};
+use super::demand_closure::Read;
 use super::file_context::RootHalfRequest;
 use super::imports::{
     ImportBinder, ImportBinderClass, ImportBinderRules, ImportTokenMetadata, SelectedImportRoute,
@@ -32,17 +33,30 @@ use super::root_bridges::{
 };
 use super::unit_access::{UnitAccess, UnitAccessRules, read_unit_access};
 use super::*;
+use crate::analyzer::resolution::SelectedExplicitImportBoundary;
+use crate::analyzer::resolution::fact_resolution::demand_scheduler::{
+    SelectedExternalOwner, SelectedExternalOwnerSelection,
+};
+use crate::analyzer::resolution::selected_context::{
+    ExplicitImportAdmission, SelectedJavaOnDemandSource, SelectedJavaTypeNameOwner,
+    SelectedJavaTypeNameWinner,
+};
+use crate::analyzer::resolution::tier_evaluator::{
+    ContributorClosure, InheritedTierKnowledge, InheritedTierWitness, LexicalTypeLevel,
+    TierContributor, TierDecision, TierInput, TierReceipt, TierWitness, evaluate_tiers,
+    place_lexical_type,
+};
 use crate::analyzer::resolution::{
     BatchEndpointClassification, BindingOrigin, CanonicalIdentityDescriptor, CanonicalIdentityPart,
     FactPageVisitor, FactReadOutcome, JvmImplicitRootProvider,
     LoweredDeclarationVisibilityProperty, LoweredPackageMember, LoweredPackageReference,
-    PrecedenceStep, ResolutionIdentityDigestKey, SelectedJvmBridgeEvidence,
+    PrecedenceStep, ResolutionAnswer, ResolutionIdentityDigestKey, SelectedJvmBridgeEvidence,
     SelectedJvmBridgeProvenance, SelectedJvmBridgeVisibility, SelectedPackageBridgeDescriptor,
     SelectedResolutionMountContext, SelectedRootBridgeDescriptor, SelectedRootPathHalf,
-    SharedNameInterner, binding_origin_rank, language_callables_occupy_value_namespace,
-    language_implicit_root_member_names, language_import_owner_steps_bind_singletons,
-    language_jvm_declaration_access_rules, language_jvm_package_requires_directory_agreement,
-    package_domain_semantic,
+    SharedNameInterner, binding_origin_rank, fact_source::JvmAccessEndpoint,
+    language_callables_occupy_value_namespace, language_implicit_root_member_names,
+    language_import_owner_steps_bind_singletons, language_jvm_declaration_access_rules,
+    language_jvm_package_requires_directory_agreement, package_domain_semantic,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionConstructionRequirementKind, ResolutionGapKind, ResolutionImportRouteKind,
@@ -55,6 +69,23 @@ use brokk_bifrost_jvm::java::import_split::{
 };
 use std::cell::Cell;
 use std::sync::{Arc, Mutex};
+
+const JVM_IMPORT_ALIAS_COVERAGE_OPEN: &str = "jvm-import-alias-coverage-open";
+
+// A selected member-owner visit certifies absence only after every page and
+// its completion receipt have been consumed. Shared with inherited lookup.
+pub(super) fn jvm_member_owner_pages_complete(outcome: &FactReadOutcome) -> bool {
+    outcome.is_exhausted() && outcome.evidence() == &ResolutionCompletion::Complete
+}
+
+// Declaration-unit rows are the second half of the source-member certificate.
+// A missing crosswalk must leave negative member answers open.
+pub(super) fn jvm_member_crosswalk_complete(
+    coordinates: &[(SelectedResolutionMountOrdinal, ResolutionLocalKey)],
+    named_keys: &BTreeSet<ResolutionLocalKey>,
+) -> bool {
+    coordinates.iter().all(|(_, key)| named_keys.contains(key))
+}
 
 // Active package-member inventory is read once for all demands in a file plan.
 const JVM_ACTIVE_PACKAGE_MEMBERS_SQL: &str = "SELECT CAST(demand.key AS INTEGER),member.provider_id,member.ordinal,member.member_kind,member.visibility,member.is_static,member.callable_family_complete,owner.callables_complete,owner.values_complete \
@@ -447,19 +478,19 @@ pub(super) struct JvmContextPreparation {
     qualifier_names_by_demand: HashMap<String, HashSet<String>>,
     package_reference_occurrences: Vec<crate::analyzer::resolution::LoweredPackageReference>,
     package_references: Vec<crate::analyzer::resolution::LoweredPackageReference>,
+    // Exact enclosing packaging clauses for each selected Scala occurrence.
+    // None means the producer has not certified the clause boundary at this site.
+    scala_reference_packages: HashMap<SemanticId, Option<Vec<String>>>,
+    scala_local_package_by_token: HashMap<SemanticId, String>,
     same_package_lookups: BTreeSet<SemanticId>,
     references_by_name: HashMap<String, Vec<crate::analyzer::resolution::LoweredPackageReference>>,
     unqualified_type_references: BTreeSet<SemanticId>,
     // Share the selected rows without cloning them into each named builder.
     // Short-lived ledger locks preserve transfer of this owned preparation.
     imports: ContextPlanMemo<CandidatePathIdentity, Arc<JvmDerivedImport>>,
-    // A named context can skip an earlier open alias before deriving the same
-    // static import that a full context later visits with that alias present.
-    #[cfg(any(test, feature = "test-support"))]
-    java_imports: ContextPlanMemo<(CandidatePathIdentity, bool), Arc<JavaDerivedImport>>,
     implicit: ContextPlanCell<Arc<JvmImplicitContextParts>>,
     external_providers: JvmExternalProviderBlueprint,
-    on_demand_types: ContextPlanMemo<SemanticId, JvmOnDemandTypeChoice>,
+    simple_type_name_decisions: ContextPlanMemo<SemanticId, Arc<JvmSimpleTypeNameDecision>>,
     on_demand_bindings: ContextPlanMemo<SemanticId, JvmOnDemandBindings>,
 }
 
@@ -582,8 +613,10 @@ impl JvmContextPreparation {
         heap.btree_set(&self.unqualified_type_references);
         self.imports.for_each_entry(|_, import| {
             heap.arc(import, |import, heap| {
-                if let Some(head) = &import.earlier_head {
-                    charge_recipes(heap, head);
+                if let Some(heads) = &import.earlier_head {
+                    for head in heads {
+                        charge_recipes(heap, head);
+                    }
                 }
                 heap.vec(&import.earlier_wildcards);
                 for wildcard in &import.earlier_wildcards {
@@ -602,12 +635,23 @@ impl JvmContextPreparation {
                         .saturating_mul(UNCENSUSED_ELEMENT_BYTES),
                 );
                 charge_strings(heap, &import.open_aliases);
-                for recipes in import.scala_imports.values() {
-                    charge_recipes(heap, recipes);
+                for routes in import.scala_imports.values() {
+                    for recipes in routes {
+                        charge_recipes(heap, recipes);
+                    }
                 }
                 for wildcards in import.scala_wildcards.values() {
                     for recipes in wildcards {
                         charge_recipes(heap, recipes);
+                    }
+                }
+                if let Some(alias) = &import.package_alias {
+                    heap.add(std::mem::size_of_val(alias));
+                    heap.add(alias.selected_name.capacity() + alias.container.capacity());
+                    heap.vec(&alias.exact_hosts);
+                    for (segment, hosts) in &alias.receipts {
+                        heap.add(segment.capacity());
+                        heap.vec(hosts);
                     }
                 }
                 heap.add(
@@ -616,25 +660,6 @@ impl JvmContextPreparation {
                 );
             });
         });
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.java_imports.for_each_entry(|_, import| {
-                heap.arc(import, |import, heap| {
-                    charge_root_bridges(heap, &import.bridges);
-                    if let Some(evidence) = &import.on_demand {
-                        evidence.charge_retained(heap);
-                    }
-                    heap.vec(&import.external_static_imports);
-                    heap.add(
-                        (import.external_static_imports.len()
-                            + import.static_import_searches.len())
-                        .saturating_mul(UNCENSUSED_ELEMENT_BYTES),
-                    );
-                    charge_strings(heap, &import.open_jvm_alias_imports);
-                    charge_gaps(heap, &import.scoped_gaps);
-                });
-            });
-        }
         self.implicit.with_value(|implicit| {
             heap.arc(implicit, |implicit, heap| {
                 heap.vec(&implicit.bridges);
@@ -680,25 +705,39 @@ impl JvmContextPreparation {
             );
         }
         drop(registered);
-        self.on_demand_types.for_each_entry(|_, choice| {
-            heap.add(UNCENSUSED_ELEMENT_BYTES);
-            if let JvmOnDemandTypeChoice::Competing(candidates) = choice {
-                heap.vec(candidates);
-                for candidate in candidates {
-                    heap.add(
-                        candidate.fqn.capacity()
-                            + candidate.package.capacity()
-                            + UNCENSUSED_ELEMENT_BYTES,
-                    );
-                    if let Some(coordinate) = &candidate.coordinate {
-                        heap.vec(&coordinate.outward);
+        self.simple_type_name_decisions
+            .for_each_entry(|_, decision| {
+                heap.arc(decision, |decision, heap| {
+                    heap.vec(&decision.witnesses);
+                    heap.add(decision.witnesses.len() * UNCENSUSED_ELEMENT_BYTES);
+                });
+                match &decision.lower {
+                    JvmOnDemandTypeChoice::Competing(candidates) => {
+                        heap.vec(candidates);
+                        for candidate in candidates {
+                            heap.add(
+                                candidate.fqn.capacity()
+                                    + candidate.package.capacity()
+                                    + UNCENSUSED_ELEMENT_BYTES,
+                            );
+                            if let Some(coordinate) = &candidate.coordinate {
+                                heap.vec(&coordinate.outward);
+                            }
+                            if let Some(declared) = &candidate.declared {
+                                heap.add(declared.fqn.capacity());
+                            }
+                        }
                     }
-                    if let Some(declared) = &candidate.declared {
-                        heap.add(declared.fqn.capacity());
+                    JvmOnDemandTypeChoice::Possible(winner) => {
+                        heap.add(winner.package.capacity() + winner.declared.fqn.capacity());
                     }
+                    JvmOnDemandTypeChoice::Unavailable
+                    | JvmOnDemandTypeChoice::OpenDefault
+                    | JvmOnDemandTypeChoice::Indexed(_)
+                    | JvmOnDemandTypeChoice::Alias(_)
+                    | JvmOnDemandTypeChoice::Intrinsic(_) => {}
                 }
-            }
-        });
+            });
         self.on_demand_bindings.for_each_entry(|_, bindings| {
             heap.arc(bindings, |_, _| {});
         });
@@ -818,14 +857,18 @@ pub enum JvmImportContextSnapshotRefusal {
     StoreInternedSincePublish,
     /// The cold build was not Ready.
     NotReady,
+    /// The operation reads frozen or bottom inherited member-type knowledge,
+    /// or a JVM decision consumed a walk result. The snapshot key does not
+    /// name that evidence.
+    InheritedTierKnowledge,
 }
 
-type JvmScalaImports = BTreeMap<(BindingNodeId, String), Vec<ResolutionLookupSemanticRecipe>>;
+type JvmScalaImports = BTreeMap<(BindingNodeId, String), Vec<Vec<ResolutionLookupSemanticRecipe>>>;
 type JvmScalaWildcards = BTreeMap<BindingNodeId, Vec<Vec<ResolutionLookupSemanticRecipe>>>;
 
 struct JvmDerivedImport {
     on_demand: Option<JvmOnDemandPackageEvidence>,
-    earlier_head: Option<Vec<ResolutionLookupSemanticRecipe>>,
+    earlier_head: Option<Vec<Vec<ResolutionLookupSemanticRecipe>>>,
     earlier_wildcards: Vec<Vec<ResolutionLookupSemanticRecipe>>,
     bridges: Vec<SelectedRootBridgeDescriptor>,
     gaps: Vec<JvmImportContextGap>,
@@ -838,6 +881,41 @@ struct JvmDerivedImport {
     inventory_open: bool,
     scala_imports: JvmScalaImports,
     scala_wildcards: JvmScalaWildcards,
+    package_alias: Option<JvmSelectedPackageAlias>,
+    explicit_import: Option<JvmExplicitImportOutcome>,
+}
+
+/// How a Java single-type import's own JLS 7.5.1 proof ended, for its own
+/// declaration site and for the references whose decision it wins.
+#[derive(Clone, Debug)]
+enum JvmExplicitImportOutcome {
+    /// A selected workspace source declaration, proven or competing.
+    WorkspaceSource,
+    /// No workspace source declaration. `declared` says the operation
+    /// selected a model- or provider-declared type with this name.
+    External { fqn: String, declared: bool },
+}
+
+/// A named import's selected package coordinate. `selected_name` is the
+/// authored selector; `demand` is the local spelling used by references.
+/// Each receipt is reread before a half consumes the coordinate.
+#[derive(Clone, Debug)]
+pub(super) struct JvmSelectedPackageAlias {
+    pub(super) source_token: SemanticId,
+    pub(super) selected_name: String,
+    pub(super) demand: ResolutionLookupSemanticRecipe,
+    pub(super) container: String,
+    receipts: JvmPackageRouteReceipts,
+    exact_hosts: Vec<JvmImportTarget>,
+}
+
+type JvmPackageRouteReceipts = Vec<(String, Vec<JvmImportTarget>)>;
+
+// Package references retain a source-site ordinal; root-path halves retain a
+// binding node whose selected endpoint supplies the reference semantic key.
+enum ScalaPackageContextReference {
+    Site(ResolutionSiteId),
+    Semantic(SemanticId),
 }
 
 // Raw selected-fact evidence only. Frame ownership, precedence and obligations
@@ -885,16 +963,6 @@ impl JvmOnDemandPackageEvidence {
             bridge.charge_retained(heap);
         }
     }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct JavaDerivedImport {
-    on_demand: Option<JvmOnDemandPackageEvidence>,
-    bridges: Vec<SelectedRootBridgeDescriptor>,
-    external_static_imports: Vec<JavaExternalStaticImportBoundary>,
-    static_import_searches: BTreeMap<(Option<ResolutionSiteId>, bool), JavaStaticImportSearch>,
-    open_jvm_alias_imports: Vec<String>,
-    scoped_gaps: Vec<JvmImportContextGap>,
 }
 
 #[derive(Clone)]
@@ -1072,6 +1140,7 @@ struct JvmOnDemandType {
     declared: JvmDeclaredType,
     precedence: super::jvm_demand::JvmBindingPrecedence,
     package: String,
+    source: Option<SelectedJavaOnDemandSource>,
 }
 
 #[derive(Clone)]
@@ -1082,6 +1151,7 @@ struct JvmOnDemandCandidate {
     package: String,
     declared: Option<JvmDeclaredType>,
     implicit_root: bool,
+    source: Option<SelectedJavaOnDemandSource>,
 }
 
 fn on_demand_candidate_shadows(
@@ -1128,9 +1198,390 @@ enum JvmOnDemandTypeChoice {
     Unavailable,
     Competing(Vec<JvmOnDemandCandidate>),
     OpenDefault,
+    Possible(JvmOnDemandType),
     Indexed(JvmOnDemandType),
     Alias(JvmOnDemandType),
     Intrinsic(JvmOnDemandType),
+}
+
+/// What the on-demand and default chooser observed for one reference.
+struct JvmOnDemandObservation {
+    choice: JvmOnDemandTypeChoice,
+    /// The reference's authored local path was read, so `lexical` is a
+    /// closed answer rather than a missing read.
+    local_path_read: bool,
+    /// A definition on the reference's lexical path (JLS 6.4.1).
+    lexical: bool,
+    /// A current-package definition from another compilation unit.
+    same_package: bool,
+    /// The chooser did not search on-demand and default packages: a nearer
+    /// definition preempted them, or no provider was selected for a name that
+    /// needs one.
+    unsearched: bool,
+}
+
+impl JvmOnDemandObservation {
+    fn searched(choice: JvmOnDemandTypeChoice) -> Self {
+        Self {
+            choice,
+            local_path_read: false,
+            lexical: false,
+            same_package: false,
+            unsearched: false,
+        }
+    }
+}
+
+/// One alternative for a simple type name at one reference.
+#[derive(Clone)]
+enum JvmTypeNameAlternative {
+    /// A definition on the reference's lexical path.
+    Lexical,
+    /// A selected single-type import binder for the name, by import token.
+    ExplicitImport(SemanticId),
+    /// A current-package definition from another compilation unit.
+    SamePackage,
+    /// An on-demand or default-import candidate, by canonical name.
+    OnDemand(String),
+    /// A lexical definition placed on the scope order, by definition.
+    PlacedLexical(SemanticId),
+    /// A lexical binder whose selected scope cannot be placed on the
+    /// reference ancestry, so no dominance claim is supported.
+    UnsupportedLexical(SemanticId),
+    /// A member type an enclosing class inherits, by declaration.
+    InheritedMember(SemanticId),
+}
+
+// Java tier ranks, nearest scope first (JLS 6.4.1). Milestone 2 of #9546 adds
+// the inherited member-type tier at rank 1.
+const JVM_LEXICAL_TYPE_TIER: u32 = 0;
+const JVM_SINGLE_TYPE_IMPORT_TIER: u32 = 2;
+const JVM_SAME_PACKAGE_TYPE_TIER: u32 = 3;
+const JVM_ON_DEMAND_TYPE_TIER: u32 = 4;
+
+/// The complete simple-type-name decision for one selected reference: every
+/// applicable tier is enumerated and closed before the language order picks a
+/// winner. `lower` is the on-demand and default chooser's own result.
+struct JvmSimpleTypeNameDecision {
+    /// The lookup the decision answers. The memo is keyed by reference, so
+    /// every caller must ask the same question about it.
+    lookup: SemanticId,
+    witnesses: Vec<TierWitness<JvmTypeNameAlternative>>,
+    decision: TierDecision<JvmTypeNameAlternative>,
+    lower: JvmOnDemandTypeChoice,
+    /// Assembled with inherited member-type tiers: any Open decision keeps a
+    /// lower positive choice possible only.
+    open_inherited_rank: Option<u32>,
+    /// Some tier value came from the operation's inherited-tier table, so the
+    /// answer depends on the walk and its reuse is refused.
+    consumed_walk: bool,
+    selected_owner: Option<SelectedJavaTypeNameOwner>,
+}
+
+/// The tiers above on-demand and default imports for one Java reference, the
+/// on-demand rank below them, and whether any tier read the inherited table.
+struct JvmInheritedTypeNameTiers {
+    tiers: Vec<TierInput<JvmTypeNameAlternative>>,
+    on_demand_rank: u32,
+    consumed_walk: bool,
+    open_inherited_rank: Option<u32>,
+}
+
+/// One enclosing class's inherited member types for one name.
+fn jvm_inherited_tier(
+    rank: u32,
+    witness: InheritedTierWitness,
+) -> TierInput<JvmTypeNameAlternative> {
+    let (candidates, closure) = match witness {
+        InheritedTierWitness::Absent => (
+            Vec::new(),
+            ContributorClosure::Closed(TierReceipt {
+                selected_read: "jvm-inherited-member-walk",
+            }),
+        ),
+        InheritedTierWitness::Proven(declarations) => (
+            declarations
+                .into_iter()
+                .map(JvmTypeNameAlternative::InheritedMember)
+                .collect(),
+            ContributorClosure::Closed(TierReceipt {
+                selected_read: "jvm-inherited-member-walk",
+            }),
+        ),
+        InheritedTierWitness::Open { .. } => (Vec::new(), ContributorClosure::Open),
+    };
+    TierInput {
+        rank,
+        contributors: vec![TierContributor {
+            candidates,
+            closure,
+        }],
+    }
+}
+
+/// The reference's enclosing classes are unknown, so no inherited tier can be
+/// ruled out ahead of any other candidate.
+fn jvm_unknown_enclosing_classes_tier() -> TierInput<JvmTypeNameAlternative> {
+    TierInput {
+        rank: 0,
+        contributors: vec![TierContributor {
+            candidates: Vec::new(),
+            closure: ContributorClosure::Open,
+        }],
+    }
+}
+
+/// Whether the inherited tier can displace this lexical binder. The Java
+/// branch follows JLS class-body ordering. Kotlin and Scala have no complete
+/// classifier dominance proof for non-local binders here, so they remain
+/// competing at every enclosing level.
+fn jvm_inherited_competes(
+    language: Language,
+    lexical: LexicalTypeLevel,
+    inherited_level: usize,
+) -> bool {
+    match language {
+        Language::Java => match lexical {
+            LexicalTypeLevel::Local => false,
+            LexicalTypeLevel::Declared(level) => inherited_level < level,
+            LexicalTypeLevel::Outside(level) => inherited_level <= level,
+            LexicalTypeLevel::Unit => true,
+        },
+        Language::Kotlin | Language::Scala => !matches!(lexical, LexicalTypeLevel::Local),
+        _ => unreachable!("JVM simple type name"),
+    }
+}
+
+impl JvmSimpleTypeNameDecision {
+    /// The scoped gap the selected route must carry when an inherited member
+    /// type keeps its selection from being certain. An Open decision also
+    /// withholds import and default-import targets below the open tier.
+    fn inherited_lexical_gap(&self) -> Option<&'static str> {
+        if matches!(&self.decision, TierDecision::Open { possible, .. } if possible.iter().any(|alternative| matches!(alternative, JvmTypeNameAlternative::UnsupportedLexical(_))))
+        {
+            return Some("jvm-inherited-member-type-unsupported-form");
+        }
+        if matches!(&self.decision, TierDecision::Open { .. }) && self.open_inherited_rank.is_some()
+        {
+            return Some("jvm-inherited-member-type-open");
+        }
+        if !self.consumed_walk {
+            return None;
+        }
+        let inherited = |alternative: &JvmTypeNameAlternative| {
+            matches!(alternative, JvmTypeNameAlternative::InheritedMember(_))
+        };
+        match &self.decision {
+            TierDecision::Unique { selected, .. } if inherited(selected) => {
+                Some("jvm-inherited-member-type-competing")
+            }
+            TierDecision::Ambiguous { candidates, .. } if candidates.iter().any(inherited) => {
+                Some("jvm-inherited-member-type-competing")
+            }
+            TierDecision::Absent { .. }
+            | TierDecision::Open { .. }
+            | TierDecision::Unique { .. }
+            | TierDecision::Ambiguous { .. } => None,
+        }
+    }
+
+    /// `nearer` holds the tiers above on-demand and default imports.
+    fn from_tiers(
+        lookup: SemanticId,
+        mut nearer: Vec<TierInput<JvmTypeNameAlternative>>,
+        on_demand_rank: u32,
+        observed: JvmOnDemandObservation,
+        consumed_walk: bool,
+        open_inherited_rank: Option<u32>,
+    ) -> Self {
+        let (candidates, closed) = match &observed.choice {
+            _ if observed.unsearched => (Vec::new(), false),
+            JvmOnDemandTypeChoice::Unavailable => (Vec::new(), true),
+            JvmOnDemandTypeChoice::OpenDefault => (Vec::new(), false),
+            JvmOnDemandTypeChoice::Possible(winner) => (
+                vec![JvmTypeNameAlternative::OnDemand(
+                    winner.declared.fqn.clone(),
+                )],
+                false,
+            ),
+            JvmOnDemandTypeChoice::Competing(candidates) => (
+                candidates
+                    .iter()
+                    .map(|candidate| JvmTypeNameAlternative::OnDemand(candidate.fqn.clone()))
+                    .collect(),
+                true,
+            ),
+            JvmOnDemandTypeChoice::Indexed(winner)
+            | JvmOnDemandTypeChoice::Alias(winner)
+            | JvmOnDemandTypeChoice::Intrinsic(winner) => (
+                vec![JvmTypeNameAlternative::OnDemand(
+                    winner.declared.fqn.clone(),
+                )],
+                true,
+            ),
+        };
+        let highest_open_rank = nearer
+            .iter()
+            .filter(|tier| {
+                tier.contributors
+                    .iter()
+                    .any(|contributor| matches!(contributor.closure, ContributorClosure::Open))
+            })
+            .map(|tier| tier.rank)
+            .min();
+        nearer.push(TierInput {
+            rank: on_demand_rank,
+            contributors: vec![TierContributor {
+                candidates,
+                closure: if closed {
+                    ContributorClosure::Closed(TierReceipt {
+                        selected_read: "jvm-on-demand-package-plan",
+                    })
+                } else {
+                    ContributorClosure::Open
+                },
+            }],
+        });
+        // The chooser already ranks its own candidates; tiers are disjoint.
+        let (witnesses, decision) = evaluate_tiers(nearer, |_| {});
+        Self {
+            lookup,
+            witnesses,
+            decision,
+            lower: observed.choice,
+            consumed_walk,
+            open_inherited_rank: open_inherited_rank
+                .filter(|rank| Some(*rank) == highest_open_rank),
+            selected_owner: None,
+        }
+    }
+
+    /// The choice the on-demand and default registrations consume. A nearer
+    /// tier that is Proven leaves them nothing to bind. With inherited tiers
+    /// an Open decision makes a lower positive choice possible only; the
+    /// legacy path without them retains its existing result.
+    fn on_demand_choice(&self) -> JvmOnDemandTypeChoice {
+        let nearer = |alternative: &JvmTypeNameAlternative| {
+            !matches!(alternative, JvmTypeNameAlternative::OnDemand(_))
+        };
+        match &self.decision {
+            TierDecision::Unique { selected, .. } if nearer(selected) => {
+                JvmOnDemandTypeChoice::Unavailable
+            }
+            TierDecision::Ambiguous { candidates, .. } if candidates.iter().all(nearer) => {
+                JvmOnDemandTypeChoice::Unavailable
+            }
+            TierDecision::Open { .. } if self.open_inherited_rank.is_some() => match &self.lower {
+                JvmOnDemandTypeChoice::Indexed(winner)
+                | JvmOnDemandTypeChoice::Alias(winner)
+                | JvmOnDemandTypeChoice::Intrinsic(winner) => {
+                    JvmOnDemandTypeChoice::Possible(winner.clone())
+                }
+                other => other.clone(),
+            },
+            _ => self.lower.clone(),
+        }
+    }
+}
+
+pub(super) struct JvmLexicalAnswerFinalizer<'a, 'store, 'project> {
+    pub(super) operation: &'a SelectedResolutionOperation<'store, 'project>,
+}
+
+impl crate::analyzer::resolution::fact_resolution::LexicalAnswerFinalizer
+    for JvmLexicalAnswerFinalizer<'_, '_, '_>
+{
+    fn refuse_consumed_walk(&self, consumed_walk: bool) -> Result<()> {
+        if consumed_walk {
+            self.operation
+                .ready
+                .read_reuse
+                .ok_or_else(|| super::missing_read_reuse_authority("JVM inherited member"))?
+                .refuse_read_reuse();
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        reference: SemanticId,
+        answer: crate::analyzer::resolution::fact_resolution::SharedAnswer,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::analyzer::resolution::fact_resolution::FinalizedLexicalAnswer> {
+        use crate::analyzer::resolution::fact_resolution::FinalizedLexicalAnswer;
+        let unchanged = |answer| FinalizedLexicalAnswer {
+            answer,
+            withheld: None,
+            consumed_walk: false,
+            labelled_incomplete: false,
+        };
+        if self.operation.jvm_inherited_tier_knowledge.is_none() {
+            return Ok(unchanged(answer));
+        }
+        let Some(ordinal) = reference.ordinal() else {
+            return Ok(unchanged(answer));
+        };
+        let source = self
+            .operation
+            .mount_table()
+            .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+        let Some(prepared) = self.operation.jvm_import_context_preparation(
+            source.semantic_language(),
+            source.persisted_relative_path(),
+            cancellation,
+        )?
+        else {
+            return Ok(unchanged(answer));
+        };
+        let Some(decision) = prepared.simple_type_name_decisions.get(&reference) else {
+            return Ok(unchanged(answer));
+        };
+        let Some(label) = decision.inherited_lexical_gap() else {
+            return Ok(FinalizedLexicalAnswer {
+                consumed_walk: decision.consumed_walk,
+                ..unchanged(answer)
+            });
+        };
+        if let TierDecision::Unique {
+            selected: JvmTypeNameAlternative::InheritedMember(inherited),
+            ..
+        } = &decision.decision
+            && answer.targets() == [*inherited]
+        {
+            return Ok(FinalizedLexicalAnswer {
+                consumed_walk: decision.consumed_walk,
+                ..unchanged(answer)
+            });
+        }
+        if answer.targets().is_empty() {
+            return Ok(FinalizedLexicalAnswer {
+                consumed_walk: decision.consumed_walk,
+                ..unchanged(answer)
+            });
+        }
+        let reason = ResolutionIncompleteReason::UnsupportedSemantic(
+            self.operation.ready.context_identities.named_semantic(
+                CanonicalHasher::new(label.as_bytes()).finish(),
+                label,
+                "Inherited member type may displace the lexical type",
+            ),
+        );
+        let completion = answer
+            .completion()
+            .combine(&ResolutionCompletion::incomplete([reason]));
+        let withheld = (label == "jvm-inherited-member-type-open").then(|| {
+            crate::analyzer::resolution::batch::WithheldLexicalTargets {
+                targets: answer.targets().to_vec().into_boxed_slice(),
+                reason,
+            }
+        });
+        Ok(FinalizedLexicalAnswer {
+            answer: Arc::new(ResolutionAnswer::new([], [], completion)),
+            withheld,
+            consumed_walk: decision.consumed_walk,
+            labelled_incomplete: true,
+        })
+    }
 }
 
 fn jvm_on_demand_import(binder: &ImportBinder) -> bool {
@@ -1297,6 +1748,49 @@ pub struct JvmImportContextGap {
     suppress_if_same_package_candidate: bool,
 }
 
+pub(super) fn assert_compatible_scoped_gap_reasons(
+    previous: &JvmImportContextGap,
+    current: &JvmImportContextGap,
+) {
+    assert_eq!(previous.reason, current.reason);
+    if previous.kind == JVM_IMPORT_ALIAS_COVERAGE_OPEN {
+        // This reason comes from the selected alias surface's incomplete
+        // completion, so several imports can attach it to different lookups.
+        // Their source token, reference, lookup and owner belong to the
+        // attachment; the underlying coverage and closure must still agree.
+        assert_eq!(
+            (
+                previous.kind,
+                previous.boundary_status,
+                previous.nominal_type_identity,
+                &previous.external_member_targets,
+                &previous.pack_completion,
+                previous.suppress_if_same_package_candidate,
+            ),
+            (
+                current.kind,
+                current.boundary_status,
+                current.nominal_type_identity,
+                &current.external_member_targets,
+                &current.pack_completion,
+                current.suppress_if_same_package_candidate,
+            ),
+            "scoped alias coverage gaps sharing a reason disagree on closure"
+        );
+    } else {
+        // A package-demand token can represent several references. Only the
+        // representative source reference may differ for one owned reason.
+        let mut previous = previous.clone();
+        let mut current = current.clone();
+        previous.source_reference = None;
+        current.source_reference = None;
+        assert_eq!(
+            previous, current,
+            "scoped gaps sharing a reason disagree on provenance or closure"
+        );
+    }
+}
+
 /// One exact selected terminal route published for a JVM root reference.
 /// `complete` is set only when the selected package/member pages and access
 /// evidence exhaust this namespace's candidate space.
@@ -1345,7 +1839,7 @@ fn jvm_alias_coverage_gaps(
                 source_reference,
                 lookup: lookup.clone(),
                 reason: *reason,
-                kind: "jvm-import-alias-coverage-open",
+                kind: JVM_IMPORT_ALIAS_COVERAGE_OPEN,
                 owner: Some(owner.to_owned()),
                 boundary_status: None,
                 nominal_type_identity: None,
@@ -1502,6 +1996,16 @@ impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
         let member = pair.member;
         let candidate = pair.extra;
         let source_language = self.source.semantic_language();
+        let caller_package = if source_language == Language::Scala {
+            self.prepared
+                .scala_reference_packages
+                .get(&reference.token)
+                .and_then(Option::as_ref)
+                .and_then(|prefixes| prefixes.last())
+                .map(String::as_str)
+        } else {
+            self.caller_package
+        };
         let target_mount = &candidate.target;
         debug_assert_ne!(pair.target_mount, self.source.ordinal());
         let target_language = target_mount.semantic_language();
@@ -1516,7 +2020,7 @@ impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
         {
             return Ok(None);
         }
-        if Some(candidate.package) == self.caller_package
+        if Some(candidate.package) == caller_package
             && !matches!(
                 self.operation.jvm_current_package_candidate(
                     self.prepared,
@@ -1530,7 +2034,7 @@ impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
         {
             return Ok(None);
         }
-        let relation = JvmDeclarationAccessContext::between(self.caller_package, candidate.package)
+        let relation = JvmDeclarationAccessContext::between(caller_package, candidate.package)
             .with_reference(Some(reference.reference));
         let completion = match self.operation.jvm_declaration_access(
             member.definition,
@@ -1588,16 +2092,27 @@ impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
             candidate.target_digest,
             |key| operation.identity_content_digest(key, cancellation),
         )?;
-        if Some(candidate.package) == self.caller_package
+        let lexical_package = source_language == Language::Scala
+            && self
+                .prepared
+                .scala_reference_packages
+                .get(&reference.token)
+                .and_then(Option::as_ref)
+                .is_some_and(|prefixes| prefixes.iter().any(|prefix| prefix == candidate.package));
+        if (Some(candidate.package) == caller_package || lexical_package)
             && completion == ResolutionCompletion::Complete
         {
             self.same_package_lookups
                 .borrow_mut()
-                .insert(reference.lookup);
+                .insert(if source_language == Language::Scala {
+                    reference.token
+                } else {
+                    reference.lookup
+                });
         }
         let precedence = SelectedResolutionOperation::selected_jvm_package_precedence(
             source_language,
-            self.caller_package,
+            caller_package,
             candidate.package,
         );
         Ok(Some(PackageBridgeAdmission {
@@ -1644,85 +2159,6 @@ impl<'a> PackageBridgeRules for JvmPackageBridgeRules<'a, '_, '_> {
             admission.completion,
         )
         .with_candidate_origin_rank(evidence.candidate_origin_rank)
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct JavaPackageBridgeCandidate<'a> {
-    reference: &'a LoweredPackageReference,
-    candidate: &'a JvmPackageCandidate,
-    target: SelectedResolutionOperationMount,
-    access: ResolutionCompletion,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct JavaPackageBridgeRules<'a, 'store, 'input> {
-    operation: &'a SelectedResolutionOperation<'store, 'input>,
-    source: &'a SelectedResolutionOperationMount,
-    caller_package: Option<&'a str>,
-    prepared: &'a JvmContextPreparation,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl<'a> PackageBridgeRules for JavaPackageBridgeRules<'a, '_, '_> {
-    type Extra = &'a JavaPackageBridgeCandidate<'a>;
-    type Admission = PackageBridgeAdmission<BindingFragmentId>;
-
-    fn admit(
-        &self,
-        _operation: &ReadySelectedResolution<'_, '_>,
-        pair: &PackageBridgePair<'_, Self::Extra>,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<Self::Admission>> {
-        debug_assert_ne!(pair.target_mount, self.source.ordinal());
-        if pair.member.domain != pair.reference.domain
-            || pair.member.namespace != pair.reference.namespace
-        {
-            return Ok(None);
-        }
-        if !matches!(
-            self.operation.jvm_current_package_candidate(
-                self.prepared,
-                pair.reference.lookup,
-                pair.member.definition,
-                self.caller_package.unwrap_or(""),
-                cancellation,
-            )?,
-            SelectedPackageRows::Ready(true)
-        ) {
-            return Ok(None);
-        }
-        let access = match self.operation.jvm_declaration_access(
-            pair.member.definition,
-            JvmDeclarationAccessContext::between(
-                self.caller_package,
-                self.caller_package.unwrap_or(""),
-            ),
-            &pair.extra.access,
-            cancellation,
-        )? {
-            JvmDeclarationAccess::Ready(completion) => completion,
-            JvmDeclarationAccess::Excluded | JvmDeclarationAccess::Cancelled => return Ok(None),
-        };
-        Ok(Some(PackageBridgeAdmission {
-            evidence: pair.target_fragment,
-            completion: access,
-        }))
-    }
-
-    fn descriptor(
-        &self,
-        pair: &PackageBridgePair<'_, Self::Extra>,
-        admission: Self::Admission,
-    ) -> SelectedPackageBridgeDescriptor {
-        SelectedPackageBridgeDescriptor::new(
-            self.source.fragment(),
-            admission.evidence,
-            Language::Java,
-            pair.reference,
-            pair.member,
-            admission.completion,
-        )
     }
 }
 
@@ -1947,7 +2383,7 @@ fn has_open_jvm_alias_for_owner(
             || gaps.iter().any(|gap| {
                 matches!(
                     gap.kind,
-                    "jvm-import-alias-coverage-open" | "jvm-import-alias-route-open"
+                    JVM_IMPORT_ALIAS_COVERAGE_OPEN | "jvm-import-alias-route-open"
                 ) && gap.owner.as_deref() == Some(owner.as_str())
             })
     })
@@ -2077,264 +2513,6 @@ fn jvm_inventory_reason_digest(
         CanonicalIdentityPart::Label(language.config_label()),
     )?;
     Ok(descriptor.finish())
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn java_inventory_reason_digest(
-    fragment_digest: [u8; 32],
-    resolve: impl FnMut(ResolutionIdentityDigestKey) -> Result<[u8; 32]>,
-) -> Result<[u8; 32]> {
-    let mut descriptor =
-        CanonicalIdentityDescriptor::new(b"bifrost-java-context-incomplete:v1", resolve);
-    descriptor.field("context", CanonicalIdentityPart::Content(&fragment_digest))?;
-    Ok(descriptor.finish())
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JvmInventoryReasonProof {
-    pub fragment: String,
-    pub language: Language,
-    pub java_digest: String,
-    pub common_digest: String,
-}
-
-// #7314 6b: delete this operation-scoped oracle authority with the harness.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, Copy)]
-pub enum JavaOracleSelection {
-    Legacy,
-    FullCandidate,
-}
-
-// #7314 6b: source-owned oracle evidence, deleted with the oracle.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Clone, Copy)]
-pub enum JvmOracleSourceSubject<'a> {
-    AuthoredTypeImport(&'a str),
-    TypeParameter,
-    Other,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl SelectedResolutionOperation<'_, '_> {
-    /// #7314 6b: select before any context or query can populate this operation.
-    pub fn with_java_oracle_selection_for_test(mut self, selection: JavaOracleSelection) -> Self {
-        assert!(self.java_oracle_selection.is_none());
-        assert!(self.jvm_context_preparations.is_empty());
-        assert!(self.jvm_file_contexts.borrow().is_empty());
-        self.ready
-            .context_identities
-            .set_java_oracle_authority(format!("{selection:?}"));
-        self.java_oracle_selection = Some(selection);
-        self
-    }
-    // #7314 6b: read-only winning bindings and reference association.
-    pub(super) fn java_oracle_reference_observation_for_test(
-        &self,
-        language: Language,
-        path: &str,
-        reference: SemanticId,
-        subject: JvmOracleSourceSubject<'_>,
-        cancellation: &CancellationToken,
-    ) -> Result<serde_json::Value> {
-        let prepared = self
-            .jvm_import_context_preparation(language, path, cancellation)?
-            .expect("prepared oracle caller");
-        let mut bindings = Vec::new();
-        let mut expected = Vec::new();
-        let mut binding_references = Vec::new();
-        let mut import_subjects = Vec::new();
-        // Authored named imports are not in the implicit-provider blueprint.
-        let mut recipes = prepared
-            .external_providers
-            .recipes
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for binder in &prepared.binders {
-            if let Some(demand) = binder.recipes.last() {
-                recipes.push(
-                    self.jvm_generated_lookup(language, demand.namespace(), demand.spelling())
-                        .recipe
-                        .clone(),
-                );
-            }
-        }
-        recipes.sort_by_key(|recipe| format!("{recipe:?}"));
-        recipes.dedup();
-        for recipe in recipes {
-            let rows = super::jvm_demand::jvm_import_bindings_for_lookup(
-                self,
-                prepared.source.ordinal(),
-                &recipe,
-                cancellation,
-            )?
-            .expect("oracle bindings exhausted");
-            for row in rows.iter().filter(|row| row.reference == reference) {
-                bindings.push(self.canonical_java_snapshot(format!("{row:?}")));
-                if rows
-                    .iter()
-                    .filter(|other| other.reference == reference)
-                    .all(|other| {
-                        (other.token == row.token && other.endpoint == row.endpoint)
-                            || super::jvm_demand::jvm_import_binding_shadows(language, row, other)
-                    })
-                {
-                    for binder in &prepared.binders {
-                        if matches!(&binder.half, SelectedRootPathHalf::Import { token, .. } if *token == row.token)
-                            && (language != Language::Java
-                                || binder.route.as_ref().is_some_and(|route| {
-                                    route.kind == SelectedImportRouteKind::SingleType
-                                }))
-                        {
-                            let fqn = binder
-                                .recipes
-                                .iter()
-                                .map(ResolutionLookupSemanticRecipe::spelling)
-                                .collect::<Vec<_>>()
-                                .join(".");
-                            let declared = self.jvm_declared_type(language, &fqn)?;
-                            let owner = declared.as_ref().and_then(|declared| declared.owner.as_ref()).map(|owner| serde_json::json!({"fqn":fqn,"provider_id":owner.provider_id.as_ref()}));
-                            import_subjects.push(serde_json::json!({"fqn":fqn,"declared":declared.is_some(),"owner":owner}));
-                            binding_references
-                                .push(self.canonical_java_snapshot(format!("{:?}", row.reference)));
-                            if let Some(owner) = owner {
-                                expected.push(owner);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // #7314 6b: the harness supplies this subject from the producer's
-        // SingleType route and terminal qualifier reference, never from the actual registry.
-        if let JvmOracleSourceSubject::AuthoredTypeImport(fqn) = subject {
-            assert!(
-                prepared.binders.iter().any(|b| (language != Language::Java
-                    || b.route
-                        .as_ref()
-                        .is_some_and(|r| r.kind == SelectedImportRouteKind::SingleType))
-                    && b.recipes
-                        .iter()
-                        .map(ResolutionLookupSemanticRecipe::spelling)
-                        .collect::<Vec<_>>()
-                        .join(".")
-                        == fqn),
-                "authored import must match its binder: {language:?}/{fqn}"
-            );
-            let declared = self.jvm_declared_type(language, fqn)?;
-            let owner = declared
-                .as_ref()
-                .and_then(|d| d.owner.as_ref())
-                .map(|o| serde_json::json!({"fqn":fqn,"provider_id":o.provider_id.as_ref()}));
-            import_subjects
-                .push(serde_json::json!({"fqn":fqn,"declared":declared.is_some(),"owner":owner}));
-            binding_references.push(self.canonical_java_snapshot(format!("{reference:?}")));
-            if let Some(owner) = owner {
-                expected.push(owner);
-            }
-        }
-        if matches!(subject, JvmOracleSourceSubject::TypeParameter) {
-            expected.clear();
-            import_subjects.clear();
-            binding_references.clear();
-        }
-        let mut implicit_boundary = false;
-        if import_subjects.is_empty()
-            && bindings.is_empty()
-            && matches!(subject, JvmOracleSourceSubject::Other)
-        {
-            let rules = nominal_language_rules(language).expect("JVM rules");
-            for ((_, lookup), references) in &prepared.external_providers.references_by_route {
-                if !references.contains(&reference) {
-                    continue;
-                }
-                binding_references.push(self.canonical_java_snapshot(format!("{reference:?}")));
-                let recipe = &prepared.external_providers.recipes[lookup];
-                let mut owners = Vec::new();
-                let mut best_rank = None;
-                for provider in rules.implicit_root_providers() {
-                    if let JvmImplicitRootProvider::Package(package) = provider {
-                        let fqn = format!("{package}.{}", recipe.spelling());
-                        if let Some(declared) = self.jvm_declared_type(language, &fqn)?
-                            && let Some(owner) = declared.owner
-                        {
-                            let rank = rules
-                                .implicit_root_precedence(*provider)
-                                .expect("implicit root rank");
-                            if best_rank.is_none_or(|old| rank < old) {
-                                owners.clear();
-                                best_rank = Some(rank);
-                            }
-                            if best_rank == Some(rank) {
-                                owners.push(serde_json::json!({"fqn":fqn,"provider_id":owner.provider_id.as_ref()}));
-                            }
-                        }
-                    }
-                }
-                owners.sort_by_key(serde_json::Value::to_string);
-                owners.dedup();
-                if owners.len() == 1 {
-                    expected.extend(owners);
-                } else {
-                    implicit_boundary = !owners.is_empty();
-                    if owners.is_empty()
-                        && let Some(package) = rules.unindexed_implicit_owner_package()
-                    {
-                        implicit_boundary = true;
-                        expected.push(serde_json::json!({"fqn":format!("{package}.{}",recipe.spelling()),"provider_id":"jvm-unindexed-import"}));
-                    }
-                }
-            }
-        }
-        bindings.sort();
-        bindings.dedup();
-        expected.sort_by_key(serde_json::Value::to_string);
-        expected.dedup();
-        binding_references.sort();
-        binding_references.dedup();
-        import_subjects.sort_by_key(serde_json::Value::to_string);
-        import_subjects.dedup();
-        let mut association = self
-            .ready
-            .context_identities
-            .java_oracle_reference_association(reference);
-        for field in ["claim", "boundaries"] {
-            association[field] = serde_json::json!(
-                self.canonical_java_snapshot(association[field].as_str().unwrap().to_owned())
-            );
-        }
-        let reference = self.canonical_java_snapshot(format!("{reference:?}"));
-        Ok(
-            serde_json::json!({"reference": reference, "binding_references": binding_references, "registered": association, "expected_import_owners": expected, "import_subjects": import_subjects, "implicit_boundary": implicit_boundary, "bindings": bindings}),
-        )
-    }
-    pub fn java_oracle_visits_for_test(&self) -> Vec<String> {
-        self.java_oracle_visits.borrow().clone()
-    }
-    pub(super) fn java_oracle_context_for_test(
-        &self,
-        selection: JavaOracleSelection,
-        path: &str,
-        lookup: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<JvmImportContext> {
-        self.java_oracle_visits
-            .borrow_mut()
-            .push(format!("{selection:?}/context/{path}/{lookup:?}"));
-        match selection {
-            JavaOracleSelection::Legacy => {
-                self.selected_java_import_context_with_jvm_peers(path, lookup, cancellation)
-            }
-            JavaOracleSelection::FullCandidate => self.assemble_jvm_import_context_with_rules(
-                &JavaJvmImportRules,
-                path,
-                lookup,
-                cancellation,
-            ),
-        }
-    }
 }
 
 struct SelectedJvmImportRules(&'static dyn super::nominal_rules::NominalLanguageRules);
@@ -2467,70 +2645,6 @@ impl JvmImportAssemblyRules for JavaJvmImportRules {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl JvmImportContext {
-    fn java_assembly_snapshot(
-        &self,
-        canonical: &impl Fn(String) -> String,
-    ) -> BTreeMap<String, serde_json::Value> {
-        let Self::Ready {
-            context,
-            external_static_imports,
-            inventory_reason,
-            open_jvm_alias_imports,
-            scoped_gaps,
-        } = self
-        else {
-            return BTreeMap::from([(
-                "state".into(),
-                serde_json::json!(if matches!(self, Self::Cancelled) {
-                    "Cancelled"
-                } else {
-                    "Unavailable"
-                }),
-            )]);
-        };
-        let mut fields = context.java_assembly_snapshot(canonical);
-        fields.insert(
-            "external_static_imports".into(),
-            serde_json::json!(
-                external_static_imports
-                    .iter()
-                    .map(|value| canonical(format!("{value:?}")))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        fields.insert(
-            "inventory_reason".into(),
-            serde_json::json!(inventory_reason.map(|value| canonical(format!("{value:?}")))),
-        );
-        fields.insert(
-            "open_jvm_alias_imports".into(),
-            serde_json::json!(open_jvm_alias_imports),
-        );
-        let mut gaps = scoped_gaps.iter().collect::<Vec<_>>();
-        gaps.sort_by_key(|gap| {
-            (
-                format!("{:?}", gap.lookup.namespace()),
-                gap.lookup.spelling(),
-                gap.kind,
-                &gap.owner,
-                gap.source_token,
-                gap.source_reference,
-            )
-        });
-        fields.insert(
-            "scoped_gaps".into(),
-            serde_json::json!(
-                gaps.into_iter()
-                    .map(|gap| canonical(format!("{gap:?}")))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        fields
-    }
-}
-
 impl SelectedResolutionOperation<'_, '_> {
     /// Count one import-context snapshot outcome (published, restored, or a
     /// refusal cause) in this operation's `BIFROST_SEAM_PROFILE` record.
@@ -2618,6 +2732,18 @@ impl SelectedResolutionOperation<'_, '_> {
     /// that has done no JVM context work and minted no shared name, so its
     /// numbering and memo state are exactly the build's.
     fn jvm_import_context_snapshot_refusal(&self) -> Option<JvmImportContextSnapshotRefusal> {
+        // Walk and Unavailable take the same tier-assembly path. Unavailable
+        // fails if a witness is asked, so a completed context under either
+        // variant has the same content until a decision consumes a witness.
+        if matches!(
+            self.jvm_inherited_tier_knowledge,
+            Some(super::inherited_member_walk::JvmInheritedKnowledge::Frozen(
+                _
+            )) | Some(super::inherited_member_walk::JvmInheritedKnowledge::Bottom)
+        ) || self.jvm_decision_consumed_walk.get()
+        {
+            return Some(JvmImportContextSnapshotRefusal::InheritedTierKnowledge);
+        }
         if self.ready.inventory.staged_read_epoch() != (0, 0)
             || !self.ready.context_identities.is_empty()
             || !self.jvm_file_contexts.borrow().is_empty()
@@ -2651,7 +2777,11 @@ impl SelectedResolutionOperation<'_, '_> {
             Some(_) => 0,
         };
         let context = self.jvm_import_context(source_language, caller_path, cancellation)?;
-        if let Some(refusal) = refusal {
+        if let Some(refusal) = refusal.or_else(|| {
+            self.jvm_decision_consumed_walk
+                .get()
+                .then_some(JvmImportContextSnapshotRefusal::InheritedTierKnowledge)
+        }) {
             return Ok((context, Err(refusal)));
         }
         let JvmImportContext::Ready {
@@ -2783,6 +2913,16 @@ impl SelectedResolutionOperation<'_, '_> {
         let rules =
             nominal_language_rules(source_language).expect("caller belongs to a nominal family");
         let context = rules.selected_import_context(self, caller_path, lookup, cancellation)?;
+        if let JvmImportContext::Ready { scoped_gaps, .. } = &context {
+            let mut reasons: HashMap<SemanticId, &JvmImportContextGap> = HashMap::default();
+            for gap in scoped_gaps {
+                if let Some(previous) = reasons.insert(gap.reason, gap) {
+                    // Different attachments may carry one reason. Validate
+                    // the reason's provenance and closure before publication.
+                    assert_compatible_scoped_gap_reasons(previous, gap);
+                }
+            }
+        }
         if !matches!(context, JvmImportContext::Cancelled) && !cancellation.is_cancelled() {
             self.jvm_file_contexts
                 .borrow_mut()
@@ -2800,368 +2940,6 @@ impl SelectedResolutionOperation<'_, '_> {
         let rules =
             nominal_language_rules(source_language).expect("caller belongs to a nominal family");
         rules.reverse_import_context(self, caller_path, cancellation)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn java_inventory_reason_proof_for_test(
-        &self,
-        path: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<JvmInventoryReasonProof> {
-        let mount = self
-            .mount_table()
-            .mount_for_path(Language::Java.config_label(), path)?
-            .expect("proof file is selected");
-        let record = self
-            .ready
-            .inventory
-            .mount_record_by_ordinal(mount.ordinal())?;
-        let language = mount.semantic_language();
-        assert_eq!(language, Language::Java);
-        let encode = |digest| {
-            format!(
-                "digest:{}",
-                brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest)
-            )
-        };
-        let fragment = encode(
-            self.ready
-                .identity_content_digest(mount.fragment().into(), cancellation)?,
-        );
-        // The Java producer reads record content; the common producer resolves
-        // the selected fragment. Check their association independently of anchors.
-        assert_eq!(fragment, encode(record.fragment_digest().as_bytes()));
-        Ok(JvmInventoryReasonProof {
-            fragment,
-            language,
-            java_digest: encode(java_inventory_reason_digest(
-                record.fragment_digest().as_bytes(),
-                |key| self.ready.identity_content_digest(key, cancellation),
-            )?),
-            common_digest: encode(jvm_inventory_reason_digest(
-                mount.fragment(),
-                language,
-                |key| self.ready.identity_content_digest(key, cancellation),
-            )?),
-        })
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn canonical_java_snapshot(&self, text: String) -> String {
-        use crate::analyzer::resolution::{
-            BindingNodeId, PartialPathId, ResolutionIdentityDigestKey,
-        };
-        let aliases = regex::Regex::new(
-            r"(SemanticId|BindingNodeId|PartialPathId|BindingFragmentId)\(([0-9]+)\)",
-        )
-        .unwrap();
-        let hash_fields = regex::Regex::new(
-            r"(route_identity|dependency_identity): (\[(?:[0-9]+, ){31}[0-9]+\])",
-        )
-        .unwrap();
-        let text = aliases.replace_all(&text, |capture: &regex::Captures<'_>| {
-            let raw: u64 = capture[2].parse().unwrap();
-            let key = match &capture[1] {
-                "SemanticId" => {
-                    ResolutionIdentityDigestKey::Semantic(SemanticId::from_raw_for_test(raw))
-                }
-                "BindingNodeId" => {
-                    ResolutionIdentityDigestKey::Node(BindingNodeId::from_raw_for_test(raw))
-                }
-                "PartialPathId" => {
-                    ResolutionIdentityDigestKey::Path(PartialPathId::from_raw_for_test(raw))
-                }
-                "BindingFragmentId" => ResolutionIdentityDigestKey::Fragment(
-                    BindingFragmentId::at_ordinal(u32::try_from(raw).unwrap()),
-                ),
-                _ => unreachable!(),
-            };
-            let digest = self
-                .ready
-                .identity_content_digest(key, &CancellationToken::new())
-                .expect("snapshot alias has canonical content");
-            format!(
-                "{}(digest:{})",
-                &capture[1],
-                brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest)
-            )
-        });
-        hash_fields
-            .replace_all(&text, |capture: &regex::Captures<'_>| {
-                let digest: [u8; 32] = serde_json::from_str(&capture[2]).unwrap();
-                format!(
-                    "{}: digest:{}",
-                    &capture[1],
-                    brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest)
-                )
-            })
-            .into_owned()
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn render_java_assembly_snapshot(
-        &self,
-        context: JvmImportContext,
-    ) -> BTreeMap<String, serde_json::Value> {
-        assert!(
-            matches!(context, JvmImportContext::Ready { .. }),
-            "equality harness requires a ready context"
-        );
-        context.java_assembly_snapshot(&|text| self.canonical_java_snapshot(text))
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn java_selected_import_context_snapshot_for_test(
-        &self,
-        path: &str,
-        lookup: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<BTreeMap<String, serde_json::Value>> {
-        let context =
-            self.selected_java_import_context_with_jvm_peers(path, lookup, cancellation)?;
-        Ok(self.render_java_assembly_snapshot(context))
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn java_selected_qualified_publication_snapshot_for_test(
-        &self,
-        path: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<BTreeMap<String, serde_json::Value>> {
-        let mut fields = BTreeMap::new();
-        self.append_jvm_publications_for_test(
-            Language::Java,
-            path,
-            cancellation,
-            &mut fields,
-            |half, completion| {
-                self.java_qualified_type_publication(Language::Java, half, completion, cancellation)
-            },
-        )?;
-        Ok(fields)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn java_full_import_context_snapshot_for_test(
-        &self,
-        path: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<BTreeMap<String, serde_json::Value>> {
-        let context = self.assemble_jvm_import_context_with_rules(
-            &JavaJvmImportRules,
-            path,
-            None,
-            cancellation,
-        )?;
-        Ok(self.render_java_assembly_snapshot(context))
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn java_full_qualified_publication_snapshot_for_test(
-        &self,
-        path: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<BTreeMap<String, serde_json::Value>> {
-        let mut fields = BTreeMap::new();
-        self.append_jvm_publications_for_test(
-            Language::Java,
-            path,
-            cancellation,
-            &mut fields,
-            |half, completion| {
-                self.common_qualified_type_publication_with_rules(
-                    &JavaJvmImportRules,
-                    half,
-                    completion,
-                    cancellation,
-                )
-            },
-        )?;
-        Ok(fields)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn jvm_default_qualified_publication_snapshot_for_test(
-        &self,
-        language: Language,
-        path: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<BTreeMap<String, serde_json::Value>> {
-        let mut fields = BTreeMap::new();
-        self.append_jvm_publications_for_test(
-            language,
-            path,
-            cancellation,
-            &mut fields,
-            |half, completion| {
-                self.common_qualified_type_publication_with_rules(
-                    &SelectedJvmImportRules(
-                        nominal_language_rules(language).expect("nominal JVM control"),
-                    ),
-                    half,
-                    completion,
-                    cancellation,
-                )
-            },
-        )?;
-        Ok(fields)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn append_jvm_publications_for_test(
-        &self,
-        language: Language,
-        path: &str,
-        cancellation: &CancellationToken,
-        fields: &mut BTreeMap<String, serde_json::Value>,
-        mut publish: impl FnMut(
-            &SelectedRootPathHalf,
-            &ResolutionCompletion,
-        ) -> Result<Option<JvmRoutePublication>>,
-    ) -> Result<()> {
-        let mount = self
-            .mount_table()
-            .mount_for_path(language.config_label(), path)?
-            .expect("selected JVM file");
-        let (halves, outcome) =
-            self.read_root_inventory(RootHalfRequest::Imports(&[mount.ordinal()]), cancellation)?;
-        let mut coverages = [[0_usize; 3]; 2];
-        let complete = ResolutionCompletion::Complete;
-        for (index, half) in halves
-            .iter()
-            .filter(|half| matches!(half, SelectedRootPathHalf::Reference { .. }))
-            .enumerate()
-        {
-            for (input, completion) in [("complete", &complete), ("evidence", outcome.evidence())] {
-                if input == "evidence" && completion == &complete {
-                    continue;
-                }
-                let coverage = &mut coverages[usize::from(input == "evidence")];
-                coverage[0] += 1;
-                let prefix = format!("publication/{index}/input={input}");
-                fields.insert(
-                    format!("{prefix}/half"),
-                    serde_json::json!(self.canonical_java_snapshot(format!("{half:?}"))),
-                );
-                fields.insert(
-                    format!("{prefix}/input"),
-                    serde_json::json!(self.canonical_java_snapshot(format!("{completion:?}"))),
-                );
-                let publication = publish(half, completion)?;
-                let state = if publication.is_some() {
-                    "Ready"
-                } else if cancellation.is_cancelled() {
-                    "Cancelled"
-                } else {
-                    "Unavailable"
-                };
-                fields.insert(format!("{prefix}/state"), serde_json::json!(state));
-                if let Some(publication) = publication {
-                    coverage[2] += usize::from(publication.complete);
-                    coverage[1] += usize::from(!publication.bridges.is_empty());
-                    fields.insert(
-                        format!("{prefix}/bridges"),
-                        serde_json::json!(
-                            publication
-                                .bridges
-                                .iter()
-                                .map(|bridge| self.canonical_java_snapshot(format!("{bridge:?}")))
-                                .collect::<Vec<_>>()
-                        ),
-                    );
-                    fields.insert(
-                        format!("{prefix}/complete"),
-                        serde_json::json!(publication.complete),
-                    );
-                    let mut targets = publication
-                        .selected_targets
-                        .iter()
-                        .map(|target| self.canonical_java_snapshot(format!("{target:?}")))
-                        .collect::<Vec<_>>();
-                    targets.sort();
-                    fields.insert(
-                        format!("{prefix}/selected_targets"),
-                        serde_json::json!({"set": targets}),
-                    );
-                }
-            }
-        }
-        for (input, coverage) in ["complete", "evidence"].into_iter().zip(coverages) {
-            fields.insert(
-                format!("publication_coverage/{input}"),
-                serde_json::json!(coverage),
-            );
-        }
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn selected_java_import_context_with_jvm_peers(
-        &self,
-        caller_path: &str,
-        lookup: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<JvmImportContext> {
-        let java = self.java_import_context_parts(caller_path, lookup, cancellation)?;
-        // The retired oracle retains the old peer contribution, independently
-        // of Java's promoted production dispatch.
-        let peers = self.assemble_jvm_import_context_with_rules(
-            &SelectedJvmImportRules(
-                nominal_language_rules(Language::Java).expect("Java has nominal rules"),
-            ),
-            caller_path,
-            lookup,
-            cancellation,
-        )?;
-        match (java, peers) {
-            (JvmImportContext::Cancelled, _) | (_, JvmImportContext::Cancelled) => {
-                Ok(JvmImportContext::Cancelled)
-            }
-            (
-                JvmImportContext::Ready {
-                    context,
-                    external_static_imports,
-                    inventory_reason,
-                    mut open_jvm_alias_imports,
-                    scoped_gaps,
-                },
-                JvmImportContext::Ready {
-                    context: peer_context,
-                    open_jvm_alias_imports: peer_open_jvm_alias_imports,
-                    scoped_gaps: peer_scoped_gaps,
-                    ..
-                },
-            ) => {
-                let mounts = self.mount_table();
-                let selected_mount_of = selected_mount_lookup(mounts);
-                let Some(context) =
-                    (*context).merge(*peer_context, cancellation, &selected_mount_of)?
-                else {
-                    return Ok(JvmImportContext::Cancelled);
-                };
-                let mut scoped_gaps = scoped_gaps;
-                open_jvm_alias_imports.extend(peer_open_jvm_alias_imports);
-                open_jvm_alias_imports.sort_unstable();
-                open_jvm_alias_imports.dedup();
-                scoped_gaps.extend(peer_scoped_gaps);
-                scoped_gaps.sort_by(|left, right| {
-                    (&left.lookup, left.reason).cmp(&(&right.lookup, right.reason))
-                });
-                scoped_gaps.dedup();
-                Ok(JvmImportContext::Ready {
-                    context: Box::new(context),
-                    external_static_imports,
-                    inventory_reason,
-                    open_jvm_alias_imports,
-                    scoped_gaps,
-                })
-            }
-            (ready @ JvmImportContext::Ready { .. }, JvmImportContext::Unavailable) => Ok(ready),
-            (JvmImportContext::Unavailable, ready @ JvmImportContext::Ready { .. }) => Ok(ready),
-            (JvmImportContext::Unavailable, JvmImportContext::Unavailable) => {
-                Ok(JvmImportContext::Unavailable)
-            }
-        }
     }
 
     /// Read the structured binder table once for this selected file. Reference
@@ -3185,6 +2963,20 @@ impl SelectedResolutionOperation<'_, '_> {
             halves,
             cancellation,
         )
+    }
+
+    /// The package one JVM source file declares, from its memoized context
+    /// preparation: the outer None is cancellation or an unprepared file, the
+    /// inner None the default package.
+    pub(super) fn jvm_source_file_package(
+        &self,
+        source_language: Language,
+        caller_path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Option<String>>> {
+        Ok(self
+            .jvm_import_context_preparation(source_language, caller_path, cancellation)?
+            .map(|prepared| prepared.source_package.clone()))
     }
 
     fn jvm_import_context_preparation(
@@ -3235,11 +3027,10 @@ impl SelectedResolutionOperation<'_, '_> {
             .inventory
             .mount_record_by_ordinal(source.ordinal())?;
         let source_package: Option<String> = connection
-            .query_row(
+            .prepare_cached(
                 "SELECT content_package FROM main.blob_meta WHERE blob_id=?1 AND is_complete=1",
-                [source_record.blob_id()],
-                |row| row.get(0),
-            )
+            )?
+            .query_row([source_record.blob_id()], |row| row.get(0))
             .optional()?;
         let source_package = rules
             .lexical_package(self, source_record.blob_id())?
@@ -3371,6 +3162,18 @@ impl SelectedResolutionOperation<'_, '_> {
         };
         let package_references =
             unique_package_references_by_token(&package_reference_occurrences)?;
+        let mut scala_reference_packages = HashMap::default();
+        if source_language == Language::Scala {
+            for reference in &package_references {
+                scala_reference_packages.insert(
+                    reference.token,
+                    self.scala_reference_package_prefixes_with_coverage(
+                        source_record.blob_id(),
+                        ScalaPackageContextReference::Site(reference.source_site),
+                    )?,
+                );
+            }
+        }
         // Prefill only names the old loops consume: qualified lexical routes,
         // proven supertype routes, import binders and package lookup names.
         let mut recipe_semantics = Vec::new();
@@ -3572,20 +3375,48 @@ impl SelectedResolutionOperation<'_, '_> {
             }
         }
         let mut same_package_lookups = BTreeSet::new();
+        let mut scala_local_package_by_token = HashMap::default();
         let SelectedPackageRows::Ready(local_package_members) =
             self.jvm_package_member_set(source.ordinal(), cancellation)?
         else {
             return Ok(None);
         };
         for reference in &package_references {
-            if local_package_members
+            let members = local_package_members
                 .get(&reference.lookup)
                 .into_iter()
                 .flat_map(|members| members.iter())
-                .any(|member| {
+                .filter(|member| {
                     member.domain == reference.domain && member.namespace == reference.namespace
                 })
-            {
+                .collect::<Vec<_>>();
+            if source_language == Language::Scala {
+                if let Some(prefixes) = scala_reference_packages
+                    .get(&reference.token)
+                    .and_then(Option::as_ref)
+                {
+                    for package in prefixes.iter().rev() {
+                        let mut found = false;
+                        for member in &members {
+                            let SelectedPackageRows::Ready(declared) =
+                                self.jvm_declaration_package(member.definition, cancellation)?
+                            else {
+                                return Ok(None);
+                            };
+                            found |= declared.as_deref() == Some(package.as_str());
+                        }
+                        if found {
+                            // Scala keys same-package proof by occurrence token, as
+                            // the bridge and current-package producers do. A member
+                            // of a certified enclosing package outranks default
+                            // imports, so it suppresses their gaps for this token.
+                            scala_local_package_by_token.insert(reference.token, package.clone());
+                            same_package_lookups.insert(reference.token);
+                            break;
+                        }
+                    }
+                }
+            } else if !members.is_empty() {
                 same_package_lookups.insert(reference.lookup);
             }
         }
@@ -3599,6 +3430,15 @@ impl SelectedResolutionOperation<'_, '_> {
             .copied()
             .map(ResolutionQuery::new)
             .collect::<Vec<_>>();
+        // A language whose types can be called (Kotlin's `Thread()`) also
+        // searches an unqualified callee's Type namespace, so a default or
+        // on-demand import offers the callee the type it offers a written type
+        // reference. Explicit imports admit callees the same way.
+        let callee_names_types = matches!(
+            crate::analyzer::resolution::fact_resolution::type_in_call_position(source_language),
+            crate::analyzer::resolution::fact_resolution::TypeInCallPosition::Constructors
+                | crate::analyzer::resolution::fact_resolution::TypeInCallPosition::ApplyMembers
+        );
         let mut unqualified_type_references = BTreeSet::new();
         for queries in type_reference_queries
             .chunks(crate::analyzer::resolution::MAX_REFERENCE_SEEDS_PER_BATCH)
@@ -3618,11 +3458,14 @@ impl SelectedResolutionOperation<'_, '_> {
                                 == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::TypeReference;
                             let is_type_or_value_qualifier = type_or_value_qualifier
                                 && rules.qualifier_site_kinds().contains(&metadata.site_kind());
-                            matches!(
-                                metadata.namespace(),
-                                ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
-                            )
-                                && (is_type_reference || is_type_or_value_qualifier)
+                            let is_unqualified_callee = callee_names_types
+                                && metadata.namespace() == ResolutionNamespace::Callable
+                                && metadata.unqualified();
+                            (is_unqualified_callee
+                                || (matches!(
+                                    metadata.namespace(),
+                                    ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
+                                ) && (is_type_reference || is_type_or_value_qualifier)))
                                 && (type_or_value_qualifier || metadata.unqualified())
                                 && (type_or_value_qualifier
                                     || (!qualified_reference_nodes.contains(&seed.node())
@@ -3697,6 +3540,7 @@ impl SelectedResolutionOperation<'_, '_> {
             source_language,
             source.fragment(),
             source_package.as_deref(),
+            &scala_reference_packages,
             &package_references,
             &binders,
             cancellation,
@@ -3715,15 +3559,16 @@ impl SelectedResolutionOperation<'_, '_> {
             qualifier_names_by_demand,
             package_reference_occurrences,
             package_references,
+            scala_reference_packages,
+            scala_local_package_by_token,
             same_package_lookups,
             references_by_name,
             unqualified_type_references,
             imports: ContextPlanMemo::default(),
-            #[cfg(any(test, feature = "test-support"))]
-            java_imports: ContextPlanMemo::default(),
+
             implicit: ContextPlanCell::default(),
             external_providers,
-            on_demand_types: ContextPlanMemo::default(),
+            simple_type_name_decisions: ContextPlanMemo::default(),
             on_demand_bindings: ContextPlanMemo::default(),
         })))
     }
@@ -3893,6 +3738,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 let mut route_inventory_open = false;
                 let mut pending_scala_imports = BTreeMap::new();
                 let mut pending_scala_wildcards: JvmScalaWildcards = BTreeMap::new();
+                let mut package_alias = None;
+                let mut explicit_import = None;
                 'derive_import: {
                     let lexical_prefixes = rules.lexical_import_package_prefixes(
                         self,
@@ -4022,6 +3869,29 @@ impl SelectedResolutionOperation<'_, '_> {
                     } else {
                         Vec::new()
                     };
+                    if let Some(alternatives) = &earlier_head
+                        && alternatives.len() > 1
+                    {
+                        rules.record_import_gap(
+                            self,
+                            JvmImportContextGapSpec {
+                                source: source.fragment(),
+                                source_token: token,
+                                source_reference: None,
+                                kind: "jvm-import-alias-route-open",
+                                owner: None,
+                                lookup: source_demand.clone(),
+                                detail: format!(
+                                    "competing selected import heads for `{}`: {alternatives:?}",
+                                    binder.head
+                                ),
+                            },
+                            &mut scoped_gaps,
+                            &mut route_inventory_open,
+                            cancellation,
+                        )?;
+                        break 'derive_import;
+                    }
                     let earlier_route = if rules
                         .lexical_import_anchors()
                         .contains(&ResolutionRootImportAnchor::Lexical)
@@ -4030,7 +3900,10 @@ impl SelectedResolutionOperation<'_, '_> {
                         recipes.first().and_then(|head| {
                             earlier_scala_imports
                                 .get(&(source_scope_head, head.spelling().to_owned()))
-                                .map(|prefix: &Vec<ResolutionLookupSemanticRecipe>| {
+                                .and_then(|prefixes: &Vec<Vec<ResolutionLookupSemanticRecipe>>| {
+                                    prefixes.first()
+                                })
+                                .map(|prefix| {
                                     let mut route = prefix.clone();
                                     route.extend(recipes.iter().skip(1).cloned());
                                     route
@@ -4075,6 +3948,101 @@ impl SelectedResolutionOperation<'_, '_> {
                     for lookup_route in &lookup_routes {
                         if cancellation.is_cancelled() {
                             return Ok(JvmImportContext::Cancelled);
+                        }
+                        if source_language == Language::Scala
+                            && demand_recipe.namespace() == ResolutionNamespace::Package
+                            && selector.as_ref().is_some_and(|selector| {
+                                selector.kind == ResolutionImportSelectorKind::Named
+                            })
+                        {
+                            let Some(receipts) = self.jvm_selected_package_alias_receipts(
+                                family,
+                                lookup_route,
+                                source_name,
+                                cancellation,
+                            )?
+                            else {
+                                return Ok(JvmImportContext::Cancelled);
+                            };
+                            if let Some(receipts) = receipts {
+                                let container = receipts
+                                    .last()
+                                    .expect("package route has a selector")
+                                    .0
+                                    .clone();
+                                let targets = self.jvm_import_targets(
+                                    family.import_target_mounts(),
+                                    &container,
+                                )?;
+                                let mut access_complete = true;
+                                for &(ordinal, version) in targets.ordered.iter() {
+                                    let target = self.mount_table().mount_by_ordinal(
+                                        SelectedResolutionMountOrdinal::new(ordinal),
+                                    )?;
+                                    let access = self.jvm_qualified_source_access_completion(
+                                        source_language,
+                                        context_id,
+                                        caller_version,
+                                        source.persisted_relative_path(),
+                                        version,
+                                        target.persisted_relative_path(),
+                                        &ResolutionCompletion::Complete,
+                                    )?;
+                                    access_complete &=
+                                        access == Some(ResolutionCompletion::Complete);
+                                }
+                                if !access_complete {
+                                    scoped_gaps.push(self.jvm_import_context_gap(JvmImportContextGapSpec {
+                                        source: source.fragment(),
+                                        source_token: token,
+                                        source_reference: None,
+                                        kind: "jvm-package-alias-route-open",
+                                        owner: Some(container),
+                                        lookup: source_demand.clone(),
+                                        detail: format!("selected package alias `{local_name}` has incomplete source access"),
+                                    }, cancellation)?);
+                                    route_inventory_open = true;
+                                    break;
+                                }
+                                package_alias = Some(JvmSelectedPackageAlias {
+                                    source_token: token,
+                                    selected_name: source_name.to_owned(),
+                                    demand: source_demand.clone(),
+                                    container,
+                                    receipts,
+                                    exact_hosts: targets.ordered.to_vec(),
+                                });
+                                resolved_lookup_route = Some(lookup_route.clone());
+                                package_prefix_found = true;
+                                break;
+                            }
+                            let owner = lookup_route
+                                .iter()
+                                .map(ResolutionLookupSemanticRecipe::spelling)
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            let Some(owner_hosts) = self.jvm_selected_package_segment_hosts(
+                                family,
+                                &owner,
+                                cancellation,
+                            )?
+                            else {
+                                return Ok(JvmImportContext::Cancelled);
+                            };
+                            if !owner_hosts.is_empty() {
+                                scoped_gaps.push(self.jvm_import_context_gap(JvmImportContextGapSpec {
+                                    source: source.fragment(),
+                                    source_token: token,
+                                    source_reference: None,
+                                    kind: "jvm-package-alias-route-open",
+                                    owner: Some(owner),
+                                    lookup: source_demand.clone(),
+                                    detail: format!("selected owner of `{}` does not prove package selector `{}`", local_name, source_name),
+                                }, cancellation)?);
+                                route_inventory_open = true;
+                                break;
+                            }
+                            continue;
                         }
                         if route_misses.replay(
                             lookup_route,
@@ -4121,6 +4089,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 route: &recipes,
                                 lookup_route,
                                 demand: &source_demand,
+                                selected_name: None,
                                 language: source_language,
                             };
                             let Some(alias_import_bridges) = self.jvm_alias_import_bridges(
@@ -4349,15 +4318,16 @@ impl SelectedResolutionOperation<'_, '_> {
                             }
                         }
                         // The route may end inside a type the package declares:
-                        // `import pkg.Obj.member` names a member of `Obj`. An import that
-                        // renames the member keeps the alias route above.
+                        // `import pkg.Obj.member` names a member of `Obj`.
                         if (root_bridges.len() == bridges_before
                             || selector.as_ref().is_some_and(|selector| {
                                 selector.kind == ResolutionImportSelectorKind::Named
                                     && !chained_wildcard_route
                             }))
                             && candidate_prefix_found
-                            && source_name == local_name
+                            // A named import reads the authored member even when
+                            // it binds a different local spelling. This applies
+                            // to every namespace of Scala and Kotlin imports.
                             && selector.as_ref().is_some_and(|selector| {
                                 matches!(
                                     selector.kind,
@@ -4394,6 +4364,8 @@ impl SelectedResolutionOperation<'_, '_> {
                                     route: &recipes,
                                     lookup_route,
                                     demand: &source_demand,
+                                    selected_name: (source_name != local_name)
+                                        .then_some(source_name),
                                     language: source_language,
                                 },
                                 &ResolutionCompletion::Complete,
@@ -4504,7 +4476,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         && selector.as_ref().is_some_and(|selector| {
                             selector.kind == ResolutionImportSelectorKind::Named
                         })
-                        && root_bridges.len() > bridges_before
+                        && (root_bridges.len() > bridges_before || package_alias.is_some())
                         && let Some(mut resolved_route) = resolved_lookup_route
                     {
                         resolved_route.push(
@@ -4517,7 +4489,9 @@ impl SelectedResolutionOperation<'_, '_> {
                             .clone(),
                         );
                         pending_scala_imports
-                            .insert((source_scope_head, local_name.to_owned()), resolved_route);
+                            .entry((source_scope_head, local_name.to_owned()))
+                            .or_insert_with(Vec::new)
+                            .push(resolved_route);
                     }
                     if let Some(kind) = assembly.static_import(binder) {
                         let import = JavaMemberImportDemand {
@@ -4536,6 +4510,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             route: &recipes,
                             lookup_route: &recipes,
                             demand: &demand_recipe,
+                            selected_name: None,
                             language: source_language,
                         };
                         let mut owner_found = false;
@@ -4774,6 +4749,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             route: &recipes,
                             lookup_route: &recipes,
                             demand: &demand,
+                            selected_name: None,
                             language: source_language,
                         };
                         let mut owner_found = false;
@@ -4791,7 +4767,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         let mut proven_bridges = Vec::new();
                         match kind {
                             ResolutionImportRouteKind::SingleType => {
-                                let Some(modeled) = self.jvm_single_type_import(
+                                let Some((modeled, outcome)) = self.jvm_single_type_import(
                                     &prepared,
                                     binder,
                                     inventory.members,
@@ -4804,6 +4780,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 else {
                                     return Ok(JvmImportContext::Cancelled);
                                 };
+                                explicit_import = Some(outcome);
                                 if let Some(declared) = modeled {
                                     // Registration retains token/endpoint, precedence and
                                     // unqualified-reference guards. Indexed status remains
@@ -4860,6 +4837,8 @@ impl SelectedResolutionOperation<'_, '_> {
                     inventory_open: route_inventory_open,
                     scala_imports: pending_scala_imports,
                     scala_wildcards: pending_scala_wildcards,
+                    package_alias,
+                    explicit_import,
                 });
                 prepared.imports.insert(identity, Arc::clone(&derived));
                 derived
@@ -4877,7 +4856,16 @@ impl SelectedResolutionOperation<'_, '_> {
             model_declared_routes.extend(derived.model_routes.iter().cloned());
             open_jvm_alias_imports.extend(derived.open_aliases.iter().cloned());
             route_inventory_open |= derived.inventory_open;
-            pending_scala_imports.extend(derived.scala_imports.clone());
+            for (key, routes) in &derived.scala_imports {
+                let selected = pending_scala_imports
+                    .entry(key.clone())
+                    .or_insert_with(Vec::new);
+                for route in routes {
+                    if !selected.contains(route) {
+                        selected.push(route.clone());
+                    }
+                }
+            }
             for (scope, routes) in &derived.scala_wildcards {
                 pending_scala_wildcards
                     .entry(*scope)
@@ -5012,11 +5000,41 @@ impl SelectedResolutionOperation<'_, '_> {
         let mut package_bridges = implicit.bridges.clone();
         scoped_gaps.extend(implicit.gaps.iter().cloned());
         same_package_lookups.extend(implicit.same_package_lookups.iter().copied());
-        if let Some(package) = source_package.as_ref().filter(|package| !implicit_root_providers.iter().any(|provider| matches!(provider, JvmImplicitRootProvider::Package(name) if *name == package.as_str()))) {
-            let references = match lookup {
-                Some(name) => prepared.references_by_name.get(name).map(Vec::as_slice).unwrap_or_default(),
-                None => package_references.as_slice(),
-            };
+        let references = match lookup {
+            Some(name) => prepared
+                .references_by_name
+                .get(name)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            None => package_references.as_slice(),
+        };
+        if source_language == Language::Scala {
+            for reference in references {
+                let Some(prefixes) = prepared.scala_reference_packages.get(&reference.token).and_then(Option::as_ref) else {
+                    let Some(mut recipes) = self.jvm_lookup_recipes(source.fragment(), [reference.lookup], cancellation)? else { return Ok(JvmImportContext::Cancelled); };
+                    scoped_gaps.push(self.jvm_import_context_boundary_gap_with_same_package_shadow(
+                        JvmImportContextGapSpec {
+                            source: source.fragment(),
+                            source_token: reference.token,
+                            source_reference: Some(reference.reference),
+                            kind: "scala-package-clause-boundary-open",
+                            owner: None,
+                            lookup: recipes.pop().expect("one selected lookup recipe"),
+                            detail: "selected Scala reference lacks an enclosing package-clause boundary".to_owned(),
+                        },
+                        cancellation,
+                    )?);
+                    continue;
+                };
+                for package in prefixes.iter().rev() {
+                    if implicit_root_providers.iter().any(|provider| matches!(provider, JvmImplicitRootProvider::Package(name) if *name == package.as_str())) { continue; }
+                    let Some(peers) = self.jvm_package_import_bridges(&import_context, std::slice::from_ref(package), std::slice::from_ref(reference), &mut scoped_gaps, &mut same_package_lookups, cancellation)? else { return Ok(JvmImportContext::Cancelled); };
+                    let found = !peers.is_empty();
+                    package_bridges.extend(peers);
+                    if found { break; }
+                }
+            }
+        } else if let Some(package) = source_package.as_ref().filter(|package| !implicit_root_providers.iter().any(|provider| matches!(provider, JvmImplicitRootProvider::Package(name) if *name == package.as_str()))) {
             let Some(peers) = self.jvm_package_import_bridges(&import_context, std::slice::from_ref(package), references, &mut scoped_gaps, &mut same_package_lookups, cancellation)? else { return Ok(JvmImportContext::Cancelled); };
             package_bridges.extend(peers);
         }
@@ -5039,7 +5057,11 @@ impl SelectedResolutionOperation<'_, '_> {
         scoped_gaps.retain(|gap| {
             !gap.suppress_if_same_package_candidate
                 || (lookup.is_none_or(|name| gap.lookup.spelling() == name)
-                    && !same_package_lookups.contains(&gap.lookup.semantic(&names)))
+                    && !same_package_lookups.contains(&if source_language == Language::Scala {
+                        gap.source_token
+                    } else {
+                        gap.lookup.semantic(&names)
+                    }))
         });
         let Some(mut model_bound_references) = register_model_declared_jvm_type_identities(
             self,
@@ -5149,12 +5171,29 @@ impl SelectedResolutionOperation<'_, '_> {
                         }
                         model_bound_references.insert(reference);
                     }
-                    JvmOnDemandTypeChoice::Competing(_) | JvmOnDemandTypeChoice::OpenDefault => {
+                    JvmOnDemandTypeChoice::Competing(_)
+                    | JvmOnDemandTypeChoice::OpenDefault
+                    | JvmOnDemandTypeChoice::Possible(_) => {
                         competing_references.insert(reference);
                     }
-                    _ => {}
+                    JvmOnDemandTypeChoice::Unavailable
+                    | JvmOnDemandTypeChoice::Indexed(_)
+                    | JvmOnDemandTypeChoice::Intrinsic(_)
+                    | JvmOnDemandTypeChoice::Alias(_) => {}
                 }
             }
+        }
+        if source_language == Language::Java
+            && self
+                .record_java_explicit_import_boundaries(
+                    &prepared,
+                    &open_jvm_alias_imports,
+                    &identities,
+                    cancellation,
+                )?
+                .is_none()
+        {
+            return Ok(JvmImportContext::Cancelled);
         }
         let implicit_type_references = unqualified_type_references
             .difference(&model_bound_references)
@@ -5236,10 +5275,102 @@ impl SelectedResolutionOperation<'_, '_> {
         })
     }
 
-    // The spelling and lexical reference are known here, including when a
-    // name-independent implicit plan is first prepared for another lookup.
-    // Exact owner reads are memoized by name and binding inputs by lookup.
-    // The decision belongs to this reference's scope, independent of lookup order.
+    /// Record the imported-type boundary of each Java single-type import whose
+    /// own proof found no workspace source declaration, at each unqualified
+    /// type reference whose simple-type-name decision the import wins. The
+    /// projection renders it only when the selected answer has no target. The
+    /// import declaration's own target name is a separate reference with no
+    /// selected link to its binder, so Java's projection still answers it.
+    fn record_java_explicit_import_boundaries(
+        &self,
+        prepared: &JvmContextPreparation,
+        open_aliases: &[String],
+        identities: &SelectedContextIdentities,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>> {
+        let mut recorded = BTreeSet::new();
+        for binder in prepared
+            .binders
+            .iter()
+            .filter(|binder| jvm_single_type_import(binder))
+        {
+            let Some(derived) = prepared.imports.get(&binder.identity) else {
+                continue;
+            };
+            let Some(JvmExplicitImportOutcome::External { fqn, declared }) =
+                &derived.explicit_import
+            else {
+                continue;
+            };
+            if open_aliases.iter().any(|alias| alias == fqn) {
+                continue;
+            }
+            let SelectedRootPathHalf::Import { token, .. } = binder.half else {
+                unreachable!("an import binder has an import half")
+            };
+            let demand = binder.recipes.last().expect("an import has a demand");
+            let boundary = SelectedExplicitImportBoundary {
+                imported_fqn: Arc::from(fqn.as_str()),
+                simple_name: Arc::from(demand.spelling()),
+                external_target: declared.then(|| Arc::from(fqn.as_str())),
+            };
+            // The references this import binds, as registration reads them:
+            // the selected import bindings for the name, at unqualified Type
+            // sites. A TypeOrValue site is an ambiguous expression name, which
+            // a type-name decision does not reclassify.
+            let recipe = self
+                .jvm_generated_lookup(Language::Java, ResolutionNamespace::Type, demand.spelling())
+                .recipe
+                .clone();
+            let lookup = recipe.semantic(&self.ready.shared_names());
+            let Some(bindings) =
+                self.jvm_on_demand_bindings(prepared, lookup, &recipe, cancellation)?
+            else {
+                return Ok(None);
+            };
+            for binding in bindings.iter().filter(|binding| binding.token == token) {
+                if !recorded.insert((token, binding.reference)) {
+                    continue;
+                }
+                let Some(seed) = self
+                    .ready
+                    .lexical_source()
+                    .reference_seed(ResolutionQuery::new(binding.reference), cancellation)?
+                else {
+                    continue;
+                };
+                if !seed.site_metadata().is_some_and(|metadata| {
+                    metadata.unqualified() && metadata.namespace() == ResolutionNamespace::Type
+                }) {
+                    continue;
+                }
+                let Some(decision) = self.jvm_simple_type_name_decision(
+                    prepared,
+                    binding.reference,
+                    lookup,
+                    &recipe,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                if matches!(
+                    &decision.decision,
+                    TierDecision::Unique {
+                        selected: JvmTypeNameAlternative::ExplicitImport(winner),
+                        ..
+                    } if *winner == token
+                ) {
+                    identities
+                        .record_java_explicit_import_boundary(binding.reference, boundary.clone());
+                }
+            }
+        }
+        Ok(Some(()))
+    }
+
+    /// The on-demand and default choice that registrations consume, from
+    /// the reference's simple-type-name decision.
     fn jvm_on_demand_type(
         &self,
         prepared: &JvmContextPreparation,
@@ -5248,18 +5379,799 @@ impl SelectedResolutionOperation<'_, '_> {
         recipe: &ResolutionLookupSemanticRecipe,
         cancellation: &CancellationToken,
     ) -> Result<Option<JvmOnDemandTypeChoice>> {
-        if let Some(choice) = prepared.on_demand_types.get(&reference) {
-            return Ok(Some(choice));
+        Ok(self
+            .jvm_simple_type_name_decision(prepared, reference, lookup, recipe, cancellation)?
+            .map(|decision| decision.on_demand_choice()))
+    }
+
+    // The spelling and lexical reference are known here, including when a
+    // name-independent implicit plan is first prepared for another lookup.
+    // Exact owner reads are memoized by name and binding inputs by lookup.
+    // The decision belongs to this reference's scope, independent of lookup
+    // order. The preparation is per file, scope and stage, and the provider set
+    // and model authority are fixed for the operation, so the reference keys it.
+    fn jvm_simple_type_name_decision(
+        &self,
+        prepared: &JvmContextPreparation,
+        reference: SemanticId,
+        lookup: SemanticId,
+        recipe: &ResolutionLookupSemanticRecipe,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Arc<JvmSimpleTypeNameDecision>>> {
+        debug_assert_eq!(
+            recipe.semantic(&self.ready.shared_names()),
+            lookup,
+            "the recipe spells the lookup the decision answers"
+        );
+        if let Some(decision) = prepared.simple_type_name_decisions.get(&reference) {
+            debug_assert_eq!(
+                decision.lookup, lookup,
+                "one reference asks one simple-type-name question"
+            );
+            self.jvm_decision_consumed_walk
+                .set(self.jvm_decision_consumed_walk.get() || decision.consumed_walk);
+            if let Some(selected) = &decision.selected_owner {
+                self.ready
+                    .context_identities
+                    .record_java_type_name_owner(reference, selected.clone());
+            }
+            return Ok(Some(decision));
         }
-        let language = prepared.source.semantic_language();
-        if self
-            .jvm_external_provider_ids
-            .get_or_init(|| self.ready.selected_jvm_external_providers())
-            .is_empty()
-            && !on_demand_type_admitted_without_provider(language, recipe)
+        let Some(observed) =
+            self.jvm_on_demand_observation(prepared, reference, lookup, recipe, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let inherited = self.jvm_inherited_tier_knowledge.is_some();
+        let mut nearer = Vec::new();
+        let mut on_demand_rank = JVM_ON_DEMAND_TYPE_TIER;
+        let mut consumed_walk = false;
+        let mut open_inherited_rank = None;
+        if prepared.source.semantic_language() == Language::Java {
+            let Some(bindings) =
+                self.jvm_on_demand_bindings(prepared, lookup, recipe, cancellation)?
+            else {
+                return Ok(None);
+            };
+            let local_closure = if observed.local_path_read {
+                ContributorClosure::Closed(TierReceipt {
+                    selected_read: "jvm-authored-local-path",
+                })
+            } else {
+                ContributorClosure::Open
+            };
+            // Java ignores a repeated single-type import of the same type (JLS
+            // 7.5.1), so one imported path is one alternative, named by its
+            // first import token. Distinct paths for one simple name stay
+            // distinct alternatives and decide Ambiguous.
+            let names = self.ready.shared_names();
+            let mut imported_paths = HashSet::default();
+            let explicit = bindings
+                .iter()
+                .filter(|binding| binding.reference == reference)
+                .filter_map(|binding| {
+                    prepared.binders.iter().find(|binder| {
+                        jvm_single_type_import(binder)
+                            && matches!(&binder.half, SelectedRootPathHalf::Import { token, .. } if *token == binding.token)
+                    })
+                    .map(|binder| (binder, binding.token))
+                })
+                .filter(|(binder, _)| {
+                    imported_paths.insert(
+                        binder
+                            .recipes
+                            .iter()
+                            .map(|recipe| recipe.semantic(&names))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .map(|(_, token)| JvmTypeNameAlternative::ExplicitImport(token))
+                .collect();
+            if inherited {
+                let Some(tiers) = self.jvm_java_inherited_type_name_tiers(
+                    reference,
+                    lookup,
+                    recipe.spelling(),
+                    explicit,
+                    local_closure,
+                    observed.same_package,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                nearer = tiers.tiers;
+                on_demand_rank = tiers.on_demand_rank;
+                consumed_walk = tiers.consumed_walk;
+                open_inherited_rank = tiers.open_inherited_rank;
+            } else {
+                nearer.extend([
+                    TierInput {
+                        rank: JVM_LEXICAL_TYPE_TIER,
+                        contributors: vec![TierContributor {
+                            candidates: observed
+                                .lexical
+                                .then_some(JvmTypeNameAlternative::Lexical)
+                                .into_iter()
+                                .collect(),
+                            closure: local_closure.clone(),
+                        }],
+                    },
+                    // The bindings are read from the file's selected root imports,
+                    // which list every import declaration; the reader returns None
+                    // only on cancellation. The context-wide inventory reason is
+                    // about external artifacts and inherited routes, not about the
+                    // import declarations, so it does not open this tier.
+                    TierInput {
+                        rank: JVM_SINGLE_TYPE_IMPORT_TIER,
+                        contributors: vec![TierContributor {
+                            candidates: explicit,
+                            closure: ContributorClosure::Closed(TierReceipt {
+                                selected_read: "jvm-selected-root-imports",
+                            }),
+                        }],
+                    },
+                    TierInput {
+                        rank: JVM_SAME_PACKAGE_TYPE_TIER,
+                        contributors: vec![TierContributor {
+                            candidates: observed
+                                .same_package
+                                .then_some(JvmTypeNameAlternative::SamePackage)
+                                .into_iter()
+                                .collect(),
+                            closure: local_closure,
+                        }],
+                    },
+                ]);
+            }
+        } else if inherited {
+            let Some(tiers) = self.jvm_non_java_inherited_tiers(
+                prepared.source.semantic_language(),
+                reference,
+                lookup,
+                recipe.spelling(),
+                cancellation,
+            )?
+            else {
+                return Ok(None);
+            };
+            nearer = tiers.tiers;
+            on_demand_rank = tiers.on_demand_rank;
+            consumed_walk = tiers.consumed_walk;
+        }
+        let mut decision = JvmSimpleTypeNameDecision::from_tiers(
+            lookup,
+            nearer,
+            on_demand_rank,
+            observed,
+            consumed_walk,
+            open_inherited_rank,
+        );
+
+        self.jvm_decision_consumed_walk
+            .set(self.jvm_decision_consumed_walk.get() || consumed_walk);
+
+        if prepared.source.semantic_language() == Language::Java
+            && recipe.namespace() == ResolutionNamespace::Type
+            && self
+                .ready
+                .lexical_source()
+                .reference_seed(ResolutionQuery::new(reference), cancellation)?
+                .is_some_and(|seed| {
+                    seed.site_metadata().is_some_and(|metadata| {
+                        metadata.unqualified() && metadata.namespace() == ResolutionNamespace::Type
+                    })
+                })
         {
-            return Ok(Some(JvmOnDemandTypeChoice::Unavailable));
+            let winning = match &decision.decision {
+                TierDecision::Unique { selected: JvmTypeNameAlternative::ExplicitImport(token), .. } => {
+                    prepared.binders.iter().find_map(|binder| {
+                        matches!(&binder.half, SelectedRootPathHalf::Import { token: candidate, .. } if candidate == token)
+                            .then(|| prepared.imports.get(&binder.identity))
+                            .flatten()
+                            .and_then(|derived| match &derived.explicit_import {
+                                Some(JvmExplicitImportOutcome::External { fqn, declared: true }) =>
+                                    Some((SelectedJavaTypeNameWinner::ExplicitImport(*token), fqn.clone())),
+                                _ => None,
+                            })
+                    })
+                }
+                TierDecision::Unique { selected: JvmTypeNameAlternative::OnDemand(fqn), .. } => {
+                    let source = match &decision.lower {
+                        JvmOnDemandTypeChoice::Indexed(winner)
+                        | JvmOnDemandTypeChoice::Alias(winner)
+                        | JvmOnDemandTypeChoice::Intrinsic(winner) => winner.source.clone(),
+                        _ => None,
+                    };
+                    // Two authored routes can supply the winning name at one
+                    // rank (a repeated `import p.*;` is legal). The chooser
+                    // then keeps no source, and neither route is certified.
+                    source.map(|source| (SelectedJavaTypeNameWinner::OnDemand {
+                        fqn: Arc::from(fqn.as_str()), source,
+                    }, fqn.clone()))
+                }
+                _ => None,
+            };
+            if let Some((winner, fqn)) = winning
+                && let Some(declared) = self.jvm_declared_type(Language::Java, &fqn)?
+                && let Some(Some(owner)) =
+                    self.jvm_declared_owner_selection(Language::Java, &fqn)?
+            {
+                debug_assert_eq!(declared.owner.as_ref(), Some(&owner));
+                let authority = crate::analyzer::resolution::fact_resolution::demand_scheduler::jvm_external_nominal_authority(
+                    &owner.provider_id,
+                    declared.indexed,
+                );
+                let identities = &self.ready.context_identities;
+                let semantic =
+                    identities.external_owner_semantic(&owner, &self.ready.shared_names());
+                let proposal = if let SelectedJavaTypeNameWinner::ExplicitImport(token) = &winner {
+                    let mut proved_sites = BTreeSet::new();
+                    for binder in &prepared.binders {
+                        let Some(route) = &binder.route else { continue };
+                        let selected = match route.kind {
+                            SelectedImportRouteKind::SingleType => matches!(
+                                &binder.half,
+                                SelectedRootPathHalf::Import { token: candidate, .. } if candidate == token
+                            ),
+                            SelectedImportRouteKind::TypeOnDemand => {
+                                binder.recipes.last().is_some_and(|demand| {
+                                    demand.namespace() == ResolutionNamespace::Type
+                                        && demand.spelling() == recipe.spelling()
+                                })
+                            }
+                            _ => false,
+                        };
+                        if selected && let Some(site) = route.source_site {
+                            proved_sites.insert(site.get());
+                        }
+                    }
+                    Some(ExplicitImportAdmission {
+                        token: *token,
+                        lookup,
+                        blob: prepared.source_record.blob_id(),
+                        fragment: prepared.source.fragment(),
+                        certificate: SelectedExternalOwner {
+                            reference,
+                            owner: semantic,
+                            authority,
+                            selection: SelectedExternalOwnerSelection::ExplicitImport(*token),
+                        },
+                        proved_sites,
+                    })
+                } else {
+                    None
+                };
+                let selected = SelectedJavaTypeNameOwner {
+                    winner,
+                    owner: semantic,
+                    authority,
+                    proposal,
+                };
+                identities.record_java_type_name_owner(reference, selected.clone());
+                decision.selected_owner = Some(selected);
+            }
         }
+        let decision = Arc::new(decision);
+        prepared
+            .simple_type_name_decisions
+            .insert(reference, Arc::clone(&decision));
+        Ok(Some(decision))
+    }
+
+    /// Freeze the inherited member-type knowledge this operation's JVM
+    /// simple-type-name decisions read. Every decision memo lives in this
+    /// operation, so installing the table before any JVM context work binds
+    /// every memo to exactly this table.
+    pub(crate) fn install_jvm_inherited_tier_knowledge(
+        &mut self,
+        knowledge: Arc<InheritedTierKnowledge>,
+    ) {
+        self.install_jvm_inherited_knowledge(
+            super::inherited_member_walk::JvmInheritedKnowledge::Frozen(knowledge),
+        );
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn install_jvm_inherited_tier_knowledge_for_test(
+        &mut self,
+        knowledge: Arc<InheritedTierKnowledge>,
+    ) {
+        self.install_jvm_inherited_tier_knowledge(knowledge);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn finalize_jvm_lexical_targets_for_test(
+        &self,
+        reference: SemanticId,
+        targets: Vec<SemanticId>,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<SemanticId>, Option<Vec<SemanticId>>)> {
+        use crate::analyzer::resolution::fact_resolution::LexicalAnswerFinalizer;
+        let raw = Arc::new(ResolutionAnswer::new(
+            targets,
+            [],
+            ResolutionCompletion::Complete,
+        ));
+        let finalized =
+            JvmLexicalAnswerFinalizer { operation: self }.finalize(reference, raw, cancellation)?;
+        Ok((
+            finalized.answer.targets().to_vec(),
+            finalized.withheld.map(|payload| payload.targets.to_vec()),
+        ))
+    }
+
+    /// The selected access endpoint of one reference: its enclosing classes,
+    /// innermost first, and their type-body heads. The inner None means the
+    /// selected facts name no endpoint for it; the outer None is cancellation.
+    fn jvm_reference_access_endpoint(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Option<JvmAccessEndpoint>>> {
+        let Some(endpoints) = self
+            .ready
+            .typed_source()
+            .jvm_access_endpoints(&[reference], cancellation)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            endpoints
+                .into_iter()
+                .find(|endpoint| endpoint.semantic == reference),
+        ))
+    }
+
+    /// Whether the class bodies on the reference's checkpoint ancestry are
+    /// exactly the endpoint's enclosing classes: the same heads, innermost
+    /// first, with none missing and none extra. A class body missing from the
+    /// list would be ranked by position alone and its inherited tier never
+    /// asked, so any other shape keeps no level order. None is cancellation.
+    fn jvm_endpoint_lists_every_body(
+        &self,
+        evidence: &crate::analyzer::resolution::ReferenceLocalPathEvidence,
+        endpoint: &JvmAccessEndpoint,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>> {
+        let lexical = self.ready.lexical_source();
+        let nodes = evidence
+            .ordered_checkpoint_ancestry()
+            .iter()
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>();
+        let mut bodies = HashSet::default();
+        for chunk in nodes.chunks(crate::analyzer::resolution::MAX_SOURCE_ROWS_PER_BATCH) {
+            let owners = lexical.scope_owners_for_heads(chunk, cancellation)?;
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            bodies.extend(
+                owners
+                    .iter()
+                    .filter(|owner| owner.is_type_body())
+                    .map(|owner| owner.scope_head()),
+            );
+        }
+        let on_ancestry = nodes
+            .iter()
+            .filter(|node| bodies.contains(*node))
+            .map(|node| Some(*node))
+            .collect::<Vec<_>>();
+        Ok(Some(on_ancestry == endpoint.enclosing_template_heads))
+    }
+
+    /// The declaring class of each definition that a selected member-owner row
+    /// names as a nested type. A definition with no such row, or whose pages
+    /// were not read to the end, is absent from the map. None is cancellation.
+    fn jvm_nested_type_owners(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<HashMap<SemanticId, SemanticId>>> {
+        let mut owners = HashMap::default();
+        let typed = self.ready.typed_source();
+        for chunk in definitions.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let mut rows = Vec::new();
+            let outcome = typed.visit_member_owner_pages_for_definitions(
+                TypedFactRequest::new(chunk),
+                cancellation,
+                &mut FactPageVisitor::new(&mut |page| {
+                    rows.extend(
+                        page.iter()
+                            .filter(|row| row.row().kind() == ResolutionMemberKind::NestedType)
+                            .map(|row| (row.row().definition(), row.row().owner_definition())),
+                    );
+                    Ok(true)
+                }),
+            )?;
+            if outcome.is_cancelled() {
+                return Ok(None);
+            }
+            if jvm_member_owner_pages_complete(&outcome) {
+                owners.extend(rows);
+            }
+        }
+        Ok(Some(owners))
+    }
+
+    /// Place lexical type binders against the inherited tiers. Only a binder
+    /// proved inside the innermost body is independent of inheritance in both
+    /// languages. Other binders can compete with an inherited classifier.
+    fn jvm_non_java_inherited_tiers(
+        &self,
+        language: Language,
+        reference: SemanticId,
+        lookup: SemanticId,
+        spelling: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<JvmInheritedTypeNameTiers>> {
+        let local = super::imports::authored_reference_local_path_evidence(
+            &self.ready,
+            reference,
+            cancellation,
+        )?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let Some(endpoint) = self.jvm_reference_access_endpoint(reference, cancellation)? else {
+            return Ok(None);
+        };
+        let endpoint = match (endpoint, local.as_ref()) {
+            (Some(endpoint), Some(evidence)) => {
+                let Some(complete) =
+                    self.jvm_endpoint_lists_every_body(evidence, &endpoint, cancellation)?
+                else {
+                    return Ok(None);
+                };
+                complete.then_some(endpoint)
+            }
+            (endpoint, _) => endpoint,
+        };
+        let Some(endpoint) = endpoint else {
+            let mut tiers = vec![jvm_unknown_enclosing_classes_tier()];
+            if let Some(definition) = local
+                .as_ref()
+                .and_then(|evidence| evidence.local_definitions().iter().next().copied())
+            {
+                tiers.push(TierInput {
+                    rank: 0,
+                    contributors: vec![TierContributor {
+                        candidates: vec![JvmTypeNameAlternative::UnsupportedLexical(definition)],
+                        closure: ContributorClosure::Open,
+                    }],
+                });
+            }
+            return Ok(Some(JvmInheritedTypeNameTiers {
+                tiers,
+                on_demand_rank: 1,
+                consumed_walk: false,
+                // Class-header references have no endpoint yet, so an
+                // unknown-enclosing tier must not withhold their targets; that
+                // waits for the header endpoint fix with #7006 enablement.
+                open_inherited_rank: None,
+            }));
+        };
+        let count = endpoint.enclosing_templates.len();
+        let mut tiers = Vec::new();
+        if let Some(evidence) = &local {
+            let definitions = evidence.local_definitions();
+            let mut placed = BTreeMap::<u32, (usize, Vec<SemanticId>)>::new();
+            let mut unsupported = Vec::new();
+            for definition in definitions {
+                let Some(placement) = place_lexical_type(*definition, evidence, &endpoint) else {
+                    unsupported.push(JvmTypeNameAlternative::UnsupportedLexical(*definition));
+                    continue;
+                };
+                // The hook describes which inherited levels can compete. Java
+                // uses its JLS level order; Kotlin and Scala conservatively
+                // leave every non-local binder behind the applicable levels.
+                let rank = (0..count)
+                    .filter(|&level| jvm_inherited_competes(language, placement.level, level))
+                    .map(|level| u32::try_from(level + 2).expect("enclosing classes fit u32"))
+                    .max()
+                    .unwrap_or(0);
+                let entry = placed
+                    .entry(rank)
+                    .or_insert((placement.ancestry_position, Vec::new()));
+                if placement.ancestry_position < entry.0 {
+                    *entry = (placement.ancestry_position, Vec::new());
+                }
+                if placement.ancestry_position == entry.0 {
+                    entry.1.push(*definition);
+                }
+            }
+            if !unsupported.is_empty() {
+                tiers.push(TierInput {
+                    rank: 0,
+                    contributors: vec![TierContributor {
+                        candidates: unsupported,
+                        closure: ContributorClosure::Open,
+                    }],
+                });
+            }
+            for (rank, (_, definitions)) in placed {
+                tiers.push(TierInput {
+                    rank,
+                    contributors: vec![TierContributor {
+                        candidates: definitions
+                            .into_iter()
+                            .map(JvmTypeNameAlternative::PlacedLexical)
+                            .collect(),
+                        closure: ContributorClosure::Closed(TierReceipt {
+                            selected_read: "jvm-authored-local-path",
+                        }),
+                    }],
+                });
+            }
+        }
+        let mut open_inherited_rank = None;
+        for (level, owner) in endpoint.enclosing_templates.iter().enumerate() {
+            let Some(witness) =
+                self.jvm_inherited_witness(*owner, lookup, spelling, cancellation)?
+            else {
+                return Ok(None);
+            };
+            let rank = u32::try_from(level + 1).expect("enclosing classes fit u32");
+            if matches!(witness, InheritedTierWitness::Open { .. }) {
+                open_inherited_rank =
+                    Some(open_inherited_rank.map_or(rank, |prior: u32| prior.min(rank)));
+            }
+            tiers.push(jvm_inherited_tier(rank, witness));
+        }
+        Ok(Some(JvmInheritedTypeNameTiers {
+            on_demand_rank: u32::try_from(count + 2).expect("enclosing classes fit u32"),
+            consumed_walk: count > 0,
+            open_inherited_rank,
+            tiers,
+        }))
+    }
+
+    /// Java's scope order for one simple type name with inherited member types
+    /// (JLS 6.3, 6.4.1, 8.5). Ranks run from the reference outward: Local; for
+    /// each enclosing class innermost first, the member types it declares,
+    /// the member types it inherits, and the scopes between its body and the
+    /// next class body (its type parameters, and for a local class the blocks
+    /// around it); then single-type imports together with same-unit top-level
+    /// types, which conflict (JLS 7.5.1); then the current package; then
+    /// on-demand and default imports.
+    #[allow(clippy::too_many_arguments)]
+    fn jvm_java_inherited_type_name_tiers(
+        &self,
+        reference: SemanticId,
+        lookup: SemanticId,
+        spelling: &str,
+        explicit: Vec<JvmTypeNameAlternative>,
+        lexical_closure: ContributorClosure,
+        same_package: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<JvmInheritedTypeNameTiers>> {
+        let Some(endpoint) = self.jvm_reference_access_endpoint(reference, cancellation)? else {
+            return Ok(None);
+        };
+        let local = super::imports::authored_reference_local_path_evidence(
+            &self.ready,
+            reference,
+            cancellation,
+        )?;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let endpoint = match (endpoint, &local) {
+            (Some(endpoint), Some(evidence)) => {
+                let Some(complete) =
+                    self.jvm_endpoint_lists_every_body(evidence, &endpoint, cancellation)?
+                else {
+                    return Ok(None);
+                };
+                complete.then_some(endpoint)
+            }
+            (endpoint, _) => endpoint,
+        };
+        let mut tiers = Vec::new();
+        let mut open_inherited_rank = None;
+        // Without every enclosing class, no level order is proved.
+        let (templates, base) = match &endpoint {
+            Some(endpoint) => (endpoint.enclosing_templates.as_slice(), 0),
+            None => {
+                // No withholding for an unknown-enclosing tier until class-header
+                // references have endpoints (deferred with #7006 enablement).
+                tiers.push(jvm_unknown_enclosing_classes_tier());
+                (&[][..], 1)
+            }
+        };
+        let levels = u32::try_from(templates.len()).expect("enclosing classes fit u32");
+        let level_rank = |level: usize, slot: u32| {
+            base + 1 + 3 * u32::try_from(level).expect("enclosing classes fit u32") + slot
+        };
+        let unit_rank = base + 1 + 3 * levels;
+        // The nearest definition of each level, as the lexical engine selects
+        // it; definitions whose order is not proved stay open.
+        let definitions = local
+            .as_ref()
+            .map(|evidence| evidence.local_definitions())
+            .unwrap_or_default();
+        let placements = definitions
+            .iter()
+            .map(|definition| {
+                local
+                    .as_ref()
+                    .zip(endpoint.as_ref())
+                    .and_then(|(evidence, endpoint)| {
+                        place_lexical_type(*definition, evidence, endpoint)
+                    })
+            })
+            .collect::<Vec<_>>();
+        // A type binder in a class body is that class's member type only when
+        // the selected member-owner row says so; the binder's scope alone does
+        // not prove it.
+        let declared = definitions
+            .iter()
+            .zip(&placements)
+            .filter(|(_, placement)| {
+                matches!(
+                    placement.map(|placement| placement.level),
+                    Some(LexicalTypeLevel::Declared(_))
+                )
+            })
+            .map(|(definition, _)| *definition)
+            .collect::<Vec<_>>();
+        let Some(member_types) = self.jvm_nested_type_owners(&declared, cancellation)? else {
+            return Ok(None);
+        };
+        let mut placed = BTreeMap::<u32, (usize, Vec<SemanticId>)>::new();
+        let mut unplaced = Vec::new();
+        for (&definition, placement) in definitions.iter().zip(placements) {
+            let confirmed = match placement.map(|placement| placement.level) {
+                Some(LexicalTypeLevel::Declared(level)) => {
+                    member_types.get(&definition) == Some(&templates[level])
+                }
+                _ => true,
+            };
+            let Some(placement) = placement.filter(|_| confirmed) else {
+                unplaced.push(JvmTypeNameAlternative::PlacedLexical(definition));
+                continue;
+            };
+            let competing = (0..templates.len())
+                .filter(|&level| jvm_inherited_competes(Language::Java, placement.level, level))
+                .count();
+            let competing = u32::try_from(competing).expect("enclosing classes fit u32");
+            let rank = match placement.level {
+                LexicalTypeLevel::Local => base,
+                LexicalTypeLevel::Declared(_) => base + 1 + 3 * competing,
+                LexicalTypeLevel::Outside(_) => base + 3 * competing,
+                // With no enclosing class there is no inherited tier to order
+                // against, so the unit's types keep the single lexical tier.
+                LexicalTypeLevel::Unit if levels == 0 => base,
+                LexicalTypeLevel::Unit => base + 1 + 3 * competing,
+            };
+            debug_assert_eq!(
+                rank,
+                match placement.level {
+                    LexicalTypeLevel::Local => base,
+                    LexicalTypeLevel::Declared(level) => level_rank(level, 0),
+                    LexicalTypeLevel::Outside(level) => level_rank(level, 2),
+                    LexicalTypeLevel::Unit if levels == 0 => base,
+                    LexicalTypeLevel::Unit => unit_rank,
+                }
+            );
+            let entry = placed
+                .entry(rank)
+                .or_insert((placement.ancestry_position, Vec::new()));
+            if placement.ancestry_position < entry.0 {
+                *entry = (placement.ancestry_position, Vec::new());
+            }
+            if placement.ancestry_position == entry.0 {
+                entry.1.push(definition);
+            }
+        }
+        if !unplaced.is_empty() {
+            tiers.push(TierInput {
+                rank: base,
+                contributors: vec![TierContributor {
+                    candidates: unplaced,
+                    closure: ContributorClosure::Open,
+                }],
+            });
+        }
+        let mut lexical = |rank: u32| TierContributor {
+            candidates: placed
+                .remove(&rank)
+                .map(|(_, definitions)| {
+                    definitions
+                        .into_iter()
+                        .map(JvmTypeNameAlternative::PlacedLexical)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            closure: lexical_closure.clone(),
+        };
+        tiers.push(TierInput {
+            rank: base,
+            contributors: vec![lexical(base)],
+        });
+        for (level, owner) in templates.iter().enumerate() {
+            tiers.push(TierInput {
+                rank: level_rank(level, 0),
+                contributors: vec![lexical(level_rank(level, 0))],
+            });
+            let Some(witness) =
+                self.jvm_inherited_witness(*owner, lookup, spelling, cancellation)?
+            else {
+                return Ok(None);
+            };
+            let rank = level_rank(level, 1);
+            if matches!(witness, InheritedTierWitness::Open { .. }) {
+                open_inherited_rank =
+                    Some(open_inherited_rank.map_or(rank, |prior: u32| prior.min(rank)));
+            }
+            tiers.push(jvm_inherited_tier(rank, witness));
+            tiers.push(TierInput {
+                rank: level_rank(level, 2),
+                contributors: vec![lexical(level_rank(level, 2))],
+            });
+        }
+        let mut unit = Vec::new();
+        if levels > 0 {
+            unit.push(lexical(unit_rank));
+        }
+        // JLS 7.5.1 ignores a single-type import of a type the unit itself
+        // declares, and an import token does not identify its declaration. So
+        // a same-unit type and an import with the same name stay open rather
+        // than conflicting.
+        let unit_conflict = unit
+            .first()
+            .is_some_and(|lexical| !lexical.candidates.is_empty())
+            && !explicit.is_empty();
+        // The bindings are read from the file's selected root imports, which
+        // list every import declaration.
+        unit.push(TierContributor {
+            candidates: explicit,
+            closure: if unit_conflict {
+                ContributorClosure::Open
+            } else {
+                ContributorClosure::Closed(TierReceipt {
+                    selected_read: "jvm-selected-root-imports",
+                })
+            },
+        });
+        tiers.push(TierInput {
+            rank: unit_rank,
+            contributors: unit,
+        });
+        tiers.push(TierInput {
+            rank: unit_rank + 1,
+            contributors: vec![TierContributor {
+                candidates: same_package
+                    .then_some(JvmTypeNameAlternative::SamePackage)
+                    .into_iter()
+                    .collect(),
+                closure: lexical_closure.clone(),
+            }],
+        });
+        assert!(
+            placed.is_empty(),
+            "every placed rank has a tier: {placed:?}"
+        );
+        Ok(Some(JvmInheritedTypeNameTiers {
+            tiers,
+            on_demand_rank: unit_rank + 2,
+            consumed_walk: levels > 0,
+            open_inherited_rank,
+        }))
+    }
+
+    fn jvm_on_demand_observation(
+        &self,
+        prepared: &JvmContextPreparation,
+        reference: SemanticId,
+        lookup: SemanticId,
+        recipe: &ResolutionLookupSemanticRecipe,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<JvmOnDemandObservation>> {
+        let language = prepared.source.semantic_language();
         let rules = nominal_language_rules(language).expect("JVM caller");
         let Some(bindings) = self.jvm_on_demand_bindings(prepared, lookup, recipe, cancellation)?
         else {
@@ -5273,7 +6185,44 @@ impl SelectedResolutionOperation<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let same_package = prepared.source_package.as_deref().unwrap_or("");
+        let scala_token = (language == Language::Scala)
+            .then(|| {
+                prepared
+                    .package_references
+                    .iter()
+                    .find(|candidate| {
+                        candidate.reference == reference
+                            && candidate.lookup == lookup
+                            && candidate.namespace == ResolutionNamespace::Type
+                    })
+                    .map(|candidate| candidate.token)
+            })
+            .flatten();
+        let same_package = if language == Language::Scala {
+            scala_token
+                .and_then(|token| {
+                    prepared
+                        .scala_local_package_by_token
+                        .get(&token)
+                        .or_else(|| {
+                            prepared
+                                .scala_reference_packages
+                                .get(&token)
+                                .and_then(Option::as_ref)
+                                .and_then(|prefixes| prefixes.last())
+                        })
+                })
+                .map(String::as_str)
+                .unwrap_or("")
+        } else {
+            prepared.source_package.as_deref().unwrap_or("")
+        };
+        let same_package_local = if language == Language::Scala {
+            scala_token
+                .is_some_and(|token| prepared.scala_local_package_by_token.contains_key(&token))
+        } else {
+            prepared.same_package_lookups.contains(&lookup)
+        };
         // A package plan can contain enclosing-prefix hosts and imported
         // names. Its lookup bucket is not proof of same-package ownership.
         // Package bridges establish that stronger rank during binding.
@@ -5284,19 +6233,39 @@ impl SelectedResolutionOperation<'_, '_> {
                 lookup,
                 recipe.spelling(),
                 same_package,
-                prepared.same_package_lookups.contains(&lookup),
+                same_package_local,
                 local.as_ref().map(|local| local.local_definitions()),
             ),
         );
         let has_local_definition = local
             .as_ref()
             .is_some_and(|evidence| !evidence.local_definitions().is_empty());
-        if language != Language::Scala
-            && (prepared.same_package_lookups.contains(&lookup) || has_local_definition)
-        {
+        if language != Language::Scala && (same_package_local || has_local_definition) {
             // JLS 6.4.1: same-unit and current-package definitions preempt
             // Java on-demand type imports before their provider search.
-            return Ok(Some(JvmOnDemandTypeChoice::Unavailable));
+            return Ok(Some(JvmOnDemandObservation {
+                choice: JvmOnDemandTypeChoice::Unavailable,
+                local_path_read: local.is_some(),
+                lexical: has_local_definition,
+                same_package: same_package_local,
+                unsearched: true,
+            }));
+        }
+        // With no selected provider, a name that needs one cannot be searched.
+        // The nearer tiers above are still read, so they can close.
+        if self
+            .jvm_external_provider_ids
+            .get_or_init(|| self.ready.selected_jvm_external_providers())
+            .is_empty()
+            && !on_demand_type_admitted_without_provider(language, recipe)
+        {
+            return Ok(Some(JvmOnDemandObservation {
+                choice: JvmOnDemandTypeChoice::Unavailable,
+                local_path_read: local.is_some(),
+                lexical: has_local_definition,
+                same_package: same_package_local,
+                unsearched: true,
+            }));
         }
         let package_coordinate = local.as_ref().and_then(|evidence| {
             evidence
@@ -5319,6 +6288,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                     .unwrap_or(u32::MAX),
                             },
                             None,
+                            Some(SelectedJavaOnDemandSource::Default),
                         )
                     })
                 }
@@ -5349,6 +6319,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     package.clone(),
                     binding.precedence,
                     binding.coordinate.clone(),
+                    Some(SelectedJavaOnDemandSource::AuthoredImport(*token)),
                 ));
             }
         }
@@ -5367,16 +6338,17 @@ impl SelectedResolutionOperation<'_, '_> {
                 },
             )
         };
-        packages.sort_by_key(|(package, precedence, _)| (priority(*precedence), package.clone()));
+        packages
+            .sort_by_key(|(package, precedence, _, _)| (priority(*precedence), package.clone()));
         let mut deciding_rank = packages
             .iter()
-            .filter(|(package, _, _)| {
+            .filter(|(package, _, _, _)| {
                 prepared
                     .package_plan
                     .get(package)
                     .is_some_and(|plan| plan.candidates.contains_key(&lookup))
             })
-            .map(|(_, precedence, _)| priority(*precedence))
+            .map(|(_, precedence, _, _)| priority(*precedence))
             .min();
         let mut candidates = Vec::new();
         if language == Language::Scala {
@@ -5387,8 +6359,8 @@ impl SelectedResolutionOperation<'_, '_> {
             let local_rank =
                 binding_origin_rank(language, BindingOrigin::SameCompilationUnitPackage)
                     .expect("Scala same-unit rank");
-            if has_local_definition || prepared.same_package_lookups.contains(&lookup) {
-                let coordinate = if prepared.same_package_lookups.contains(&lookup) {
+            if has_local_definition || same_package_local {
+                let coordinate = if same_package_local {
                     package_coordinate.clone()
                 } else {
                     local.as_ref().and_then(|evidence| {
@@ -5412,36 +6384,42 @@ impl SelectedResolutionOperation<'_, '_> {
                     package: same_package.to_owned(),
                     declared: None,
                     implicit_root: false,
+                    source: None,
                 });
             } else {
-                let fqn = if same_package.is_empty() {
-                    recipe.spelling().to_owned()
-                } else {
-                    format!("{same_package}.{}", recipe.spelling())
-                };
-                if let Some(declared) = self.jvm_declared_type(language, &fqn)?
-                    && declared.owner.is_some()
+                if let Some(prefixes) = scala_token
+                    .and_then(|token| prepared.scala_reference_packages.get(&token))
+                    .and_then(Option::as_ref)
                 {
-                    candidates.push(JvmOnDemandCandidate {
-                        precedence: super::jvm_demand::JvmBindingPrecedence {
-                            rank: binding_origin_rank(
-                                language,
-                                BindingOrigin::OtherCompilationUnitPackage,
-                            )
-                            .expect("Scala other-unit package rank"),
-                            depth: 0,
-                        },
-                        coordinate: package_coordinate.clone(),
-                        fqn,
-                        package: same_package.to_owned(),
-                        declared: Some(declared),
-                        implicit_root: false,
-                    });
+                    for package in prefixes.iter().rev() {
+                        let fqn = format!("{package}.{}", recipe.spelling());
+                        if let Some(declared) = self.jvm_declared_type(language, &fqn)?
+                            && declared.owner.is_some()
+                        {
+                            candidates.push(JvmOnDemandCandidate {
+                                precedence: super::jvm_demand::JvmBindingPrecedence {
+                                    rank: binding_origin_rank(
+                                        language,
+                                        BindingOrigin::OtherCompilationUnitPackage,
+                                    )
+                                    .expect("Scala other-unit package rank"),
+                                    depth: 0,
+                                },
+                                coordinate: package_coordinate.clone(),
+                                fqn,
+                                package: package.clone(),
+                                declared: Some(declared),
+                                implicit_root: false,
+                                source: None,
+                            });
+                            break;
+                        }
+                    }
                 }
             }
         }
         let mut open_default = false;
-        for (package, precedence, coordinate) in packages {
+        for (package, precedence, coordinate, source) in packages {
             if language != Language::Scala
                 && deciding_rank.is_some_and(|best| priority(precedence) > best)
             {
@@ -5582,6 +6560,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 package,
                 declared: external,
                 implicit_root: precedence.rank == default_rank,
+                source,
             };
             if language == Language::Scala {
                 retain_on_demand_candidate(language, &mut candidates, candidate);
@@ -5592,6 +6571,12 @@ impl SelectedResolutionOperation<'_, '_> {
                     < (existing.precedence.rank, existing.precedence.depth)
                 {
                     *existing = candidate;
+                } else if priority(precedence) == priority(existing.precedence)
+                    && existing.source != candidate.source
+                {
+                    // One FQN at one winning rank can still have two authored
+                    // routes. Keep the type choice, but certify neither route.
+                    existing.source = None;
                 }
             } else {
                 candidates.push(candidate);
@@ -5615,6 +6600,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 precedence,
                 package,
                 declared,
+                source,
                 ..
             } = candidate;
             match declared {
@@ -5623,6 +6609,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         declared,
                         precedence,
                         package,
+                        source,
                     })
                 }
                 Some(declared)
@@ -5635,6 +6622,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         declared,
                         precedence,
                         package,
+                        source,
                     })
                 }
                 Some(declared)
@@ -5649,6 +6637,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         declared,
                         precedence,
                         package,
+                        source,
                     })
                 }
                 _ => JvmOnDemandTypeChoice::Unavailable,
@@ -5658,8 +6647,13 @@ impl SelectedResolutionOperation<'_, '_> {
         } else {
             JvmOnDemandTypeChoice::Unavailable
         };
-        prepared.on_demand_types.insert(reference, choice.clone());
-        Ok(Some(choice))
+        Ok(Some(JvmOnDemandObservation {
+            choice,
+            local_path_read: local.is_some(),
+            lexical: has_local_definition,
+            same_package: same_package_local,
+            unsearched: false,
+        }))
     }
 
     fn jvm_on_demand_bindings(
@@ -5754,10 +6748,16 @@ impl SelectedResolutionOperation<'_, '_> {
             .any(|(&(_, lookup), references)| {
                 prepared.external_providers.recipes[&lookup].spelling() == recipe.spelling()
                     && references.iter().any(|reference| {
-                        matches!(
-                            prepared.on_demand_types.get(reference),
-                            Some(JvmOnDemandTypeChoice::Competing(_))
-                        )
+                        prepared
+                            .simple_type_name_decisions
+                            .get(reference)
+                            .is_some_and(|decision| {
+                                matches!(
+                                    decision.on_demand_choice(),
+                                    JvmOnDemandTypeChoice::Competing(_)
+                                        | JvmOnDemandTypeChoice::Possible(_)
+                                )
+                            })
                     })
             })
     }
@@ -5781,6 +6781,67 @@ impl SelectedResolutionOperation<'_, '_> {
         let names = self.ready.shared_names();
         let identities = &self.ready.context_identities;
         let mut selected = BTreeSet::new();
+        if language == Language::Scala {
+            for (&(source_token, lookup), references) in
+                &prepared.external_providers.references_by_route
+            {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                if same_package_lookups.contains(&source_token)
+                    || prepared
+                        .scala_local_package_by_token
+                        .contains_key(&source_token)
+                {
+                    continue;
+                }
+                let Some(prefixes) = prepared
+                    .scala_reference_packages
+                    .get(&source_token)
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let recipe = &prepared.external_providers.recipes[&lookup];
+                if demanded_name.is_some_and(|name| name != recipe.spelling()) {
+                    continue;
+                }
+                let Some(bindings) = super::jvm_demand::jvm_import_bindings_for_lookup(
+                    self,
+                    prepared.source.ordinal(),
+                    recipe,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                for package in prefixes.iter().rev() {
+                    let fqn = format!("{package}.{}", recipe.spelling());
+                    let Some(owner) = self.declared_jvm_owner(language, &fqn)? else {
+                        continue;
+                    };
+                    for &reference in references {
+                        if bindings.iter().any(|binding| {
+                            binding.reference == reference && binding.precedence.rank < rank
+                        }) {
+                            continue;
+                        }
+                        register_model_declared_jvm_type_identity(
+                            self,
+                            reference,
+                            &fqn,
+                            Some(&owner),
+                            identities,
+                            &names,
+                        )?;
+                        selected.insert(reference);
+                        same_package_lookups.insert(source_token);
+                    }
+                    break;
+                }
+            }
+            return Ok(Some(selected));
+        }
         for (&(_, lookup), references) in &prepared.external_providers.references_by_route {
             if cancellation.is_cancelled() {
                 return Ok(None);
@@ -6325,6 +7386,218 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(exists)
     }
 
+    // Direct selected package hosts and selected parent edges are separate
+    // positive facts. A parent package can exist without a file directly in it.
+    // Preserve every source fragment of a package as one namespace receipt.
+    fn jvm_selected_package_segment_hosts(
+        &self,
+        family: &dyn NominalPackageRules,
+        package: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<JvmImportTarget>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let direct = self.jvm_import_targets(family.import_target_mounts(), package)?;
+        let mut hosts = direct.ordered.to_vec();
+        let connection = self.ready.inventory.connection();
+        let edges = connection
+            .prepare_cached(
+                "SELECT mounted.mount_ordinal,mounted.file_version_id
+             FROM temp.selected_resolution_mounts AS mounted
+             JOIN main.workspace_file_package_edge_rows AS edge
+               ON edge.file_version_id=mounted.file_version_id
+             WHERE mounted.storage_language IN ('java','kotlin','scala')
+               AND (edge.parent_package_name=?1 OR edge.child_package_name=?1)",
+            )?
+            .query_map([package], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        hosts.extend(edges);
+        hosts.sort_unstable();
+        hosts.dedup();
+        Ok((!cancellation.is_cancelled()).then_some(hosts))
+    }
+
+    fn jvm_selected_package_alias_receipts(
+        &self,
+        family: &dyn NominalPackageRules,
+        owner_route: &[ResolutionLookupSemanticRecipe],
+        selected_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Option<JvmPackageRouteReceipts>>> {
+        let mut package = String::new();
+        let mut receipts = Vec::with_capacity(owner_route.len() + 1);
+        for segment in owner_route
+            .iter()
+            .map(ResolutionLookupSemanticRecipe::spelling)
+            .chain([selected_name])
+        {
+            if !package.is_empty() {
+                package.push('.');
+            }
+            package.push_str(segment);
+            let Some(hosts) =
+                self.jvm_selected_package_segment_hosts(family, &package, cancellation)?
+            else {
+                return Ok(None);
+            };
+            if hosts.is_empty() {
+                return Ok(Some(None));
+            }
+            receipts.push((package.clone(), hosts));
+        }
+        // The selector itself needs a file in its exact package. An ancestor
+        // edge only proves the existence of a namespace, not that selected full route.
+        let full = self.jvm_import_targets(family.import_target_mounts(), &package)?;
+        Ok(Some((!full.ordered.is_empty()).then_some(receipts)))
+    }
+
+    pub(super) fn jvm_selected_package_alias_for_import(
+        &self,
+        source_mount: SelectedResolutionMountOrdinal,
+        source_token: SemanticId,
+        source_lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Read<Option<JvmSelectedPackageAlias>>> {
+        let source = self.mount_table().mount_by_ordinal(source_mount)?;
+        let Some(prepared) = self.jvm_import_context_preparation(
+            source.semantic_language(),
+            source.persisted_relative_path(),
+            cancellation,
+        )?
+        else {
+            return Ok(Read::Cancelled(cancelled_completion()));
+        };
+        let names = self.ready.shared_names();
+        let alias = prepared.binders.iter().filter(|binder| {
+            matches!(&binder.half, SelectedRootPathHalf::Import { token, .. } if *token == source_token)
+        }).filter_map(|binder| prepared.imports.get(&binder.identity))
+          .filter_map(|derived| derived.package_alias.clone())
+          .find(|alias| alias.source_token == source_token && alias.demand.semantic(&names) == source_lookup);
+        let Some(alias) = alias else {
+            return Ok(Read::ready(None));
+        };
+        let family = nominal_language_rules(source.semantic_language())
+            .expect("selected package alias has nominal rules")
+            .family();
+        let mut valid = true;
+        for (package, expected) in &alias.receipts {
+            let Some(actual) =
+                self.jvm_selected_package_segment_hosts(family, package, cancellation)?
+            else {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            };
+            if &actual != expected {
+                valid = false;
+                break;
+            }
+        }
+        let exact = self.jvm_import_targets(family.import_target_mounts(), &alias.container)?;
+        valid &= exact.ordered.as_ref() == alias.exact_hosts.as_slice();
+        if valid {
+            for &(ordinal, version) in &alias.exact_hosts {
+                if cancellation.is_cancelled() {
+                    return Ok(Read::Cancelled(cancelled_completion()));
+                }
+                let target = self
+                    .mount_table()
+                    .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
+                valid &= self.jvm_qualified_source_access_completion(
+                    source.semantic_language(),
+                    prepared.context_id,
+                    prepared.source_record.file_version_id(),
+                    source.persisted_relative_path(),
+                    version,
+                    target.persisted_relative_path(),
+                    &ResolutionCompletion::Complete,
+                )? == Some(ResolutionCompletion::Complete);
+            }
+        }
+        if !valid {
+            let reason = self.ready.context_identities.named_semantic(
+                CanonicalHasher::new(b"jvm-package-alias-route-open:v1").finish(),
+                "jvm-package-alias-route-open",
+                "Selected package alias route changed before replay",
+            );
+            return Ok(Read::Ready {
+                value: None,
+                completion: ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                ]),
+            });
+        }
+        Ok(Read::ready(Some(alias)))
+    }
+
+    pub(super) fn jvm_selected_package_alias_for_site(
+        &self,
+        source_mount: SelectedResolutionMountOrdinal,
+        source_site: ResolutionSiteId,
+        source_lookup: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> Result<Read<Option<JvmSelectedPackageAlias>>> {
+        let source = self.mount_table().mount_by_ordinal(source_mount)?;
+        let Some(prepared) = self.jvm_import_context_preparation(
+            source.semantic_language(),
+            source.persisted_relative_path(),
+            cancellation,
+        )?
+        else {
+            return Ok(Read::Cancelled(cancelled_completion()));
+        };
+        let names = self.ready.shared_names();
+        let mut tokens = Vec::new();
+        for binder in &prepared.binders {
+            let Some(derived) = prepared.imports.get(&binder.identity) else {
+                continue;
+            };
+            let Some(alias) = &derived.package_alias else {
+                continue;
+            };
+            if alias.demand.semantic(&names) != source_lookup {
+                continue;
+            }
+            let Some(metadata) = self.import_token_metadata(
+                prepared.source_record.blob_id(),
+                source_mount,
+                alias.source_token,
+                cancellation,
+            )?
+            else {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            };
+            if metadata.route.as_ref().and_then(|route| route.source_site) == Some(source_site)
+                && !tokens.contains(&alias.source_token)
+            {
+                tokens.push(alias.source_token);
+            }
+        }
+        match tokens.as_slice() {
+            [] => Ok(Read::ready(None)),
+            [token] => self.jvm_selected_package_alias_for_import(
+                source_mount,
+                *token,
+                source_lookup,
+                cancellation,
+            ),
+            _ => {
+                let reason = self.ready.context_identities.named_semantic(
+                    CanonicalHasher::new(b"jvm-package-alias-site-ambiguous:v1").finish(),
+                    "jvm-package-alias-route-open",
+                    "Competing selected package aliases at one import site",
+                );
+                Ok(Read::Ready {
+                    value: None,
+                    completion: ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                    ]),
+                })
+            }
+        }
+    }
+
     fn jvm_package_member_targets(
         &self,
         key: &JvmPackageTargetKey,
@@ -6720,11 +7993,16 @@ impl SelectedResolutionOperation<'_, '_> {
     /// Match a file's structured reference names against its package/default
     /// import sets once. Named contexts consume only their reference rows from
     /// this plan; access evidence and bridge publication stay demand-scoped.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-reference package evidence is explicit"
+    )]
     fn jvm_file_package_plan(
         &self,
         language: Language,
         fragment: BindingFragmentId,
         source_package: Option<&str>,
+        scala_reference_packages: &HashMap<SemanticId, Option<Vec<String>>>,
         references: &[LoweredPackageReference],
         binders: &[ImportBinder],
         cancellation: &CancellationToken,
@@ -6742,6 +8020,14 @@ impl SelectedResolutionOperation<'_, '_> {
             })
             .collect::<Vec<_>>();
         packages.extend(source_package.map(str::to_owned));
+        if language == Language::Scala {
+            packages.extend(
+                scala_reference_packages
+                    .values()
+                    .flatten()
+                    .flat_map(|prefixes| prefixes.iter().cloned()),
+            );
+        }
         let names = self.ready.shared_names();
         let mut lookups = HashMap::default();
         let mut has_provider_free_type = false;
@@ -7092,16 +8378,18 @@ impl SelectedResolutionOperation<'_, '_> {
                 else {
                     return Ok(None);
                 };
-                if matches!(choice, JvmOnDemandTypeChoice::Competing(_))
-                    && self
-                        .jvm_competing_on_demand_gaps(
-                            prepared,
-                            reference,
-                            source_recipe,
-                            scoped_gaps,
-                            cancellation,
-                        )?
-                        .is_none()
+                if matches!(
+                    choice,
+                    JvmOnDemandTypeChoice::Competing(_) | JvmOnDemandTypeChoice::Possible(_)
+                ) && self
+                    .jvm_competing_on_demand_gaps(
+                        prepared,
+                        reference,
+                        source_recipe,
+                        scoped_gaps,
+                        cancellation,
+                    )?
+                    .is_none()
                 {
                     return Ok(None);
                 }
@@ -7151,7 +8439,10 @@ impl SelectedResolutionOperation<'_, '_> {
                             // acquisition gap is registered separately.
                             (winner.package == *package, false)
                         }
-                        _ => (false, false),
+                        JvmOnDemandTypeChoice::Possible(_)
+                        | JvmOnDemandTypeChoice::Competing(_)
+                        | JvmOnDemandTypeChoice::OpenDefault
+                        | JvmOnDemandTypeChoice::Unavailable => (false, false),
                     }
                 } else {
                     (false, false)
@@ -7264,16 +8555,75 @@ impl SelectedResolutionOperation<'_, '_> {
                     let target_lookup_semantic = target_lookup.semantic(&names);
                     // These reads were outside the member loop before shared
                     // assembly. Carry their evidence in the candidate inventory.
-                    let Some(access) = self.jvm_qualified_source_access_completion(
-                        source_language,
-                        context_id,
-                        caller_version,
-                        source_path,
-                        target_version,
-                        target_mount.persisted_relative_path(),
-                        &ResolutionCompletion::Complete,
-                    )?
-                    else {
+                    let exact_scala_access = if source_language == Language::Scala
+                        && !self
+                            .jvm_implicit_project_context(context_id)?
+                            .has_selected_project
+                    {
+                        prepared
+                            .scala_reference_packages
+                            .get(&reference.token)
+                            .and_then(Option::as_ref)
+                            .map(|prefixes| {
+                                let caller =
+                                    crate::analyzer::store::maven::JvmSourceDomain::discover(
+                                        std::path::Path::new(source_path),
+                                        prefixes.last().map(String::as_str).unwrap_or(""),
+                                        language_jvm_package_requires_directory_agreement(
+                                            source_language,
+                                            target_mount.semantic_language(),
+                                        ),
+                                    );
+                                let target =
+                                    crate::analyzer::store::maven::JvmSourceDomain::discover(
+                                        std::path::Path::new(
+                                            target_mount.persisted_relative_path(),
+                                        ),
+                                        package,
+                                        language_jvm_package_requires_directory_agreement(
+                                            source_language,
+                                            target_mount.semantic_language(),
+                                        ),
+                                    );
+                                match (caller, target) {
+                                    (Some(caller), Some(target)) => {
+                                        Some(caller.can_access(&target))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                    } else {
+                        None
+                    };
+                    let Some(access) = (if source_language == Language::Scala
+                        && !self
+                            .jvm_implicit_project_context(context_id)?
+                            .has_selected_project
+                    {
+                        match exact_scala_access.flatten() {
+                            Some(true) => Some(ResolutionCompletion::Complete),
+                            Some(false) | None => {
+                                let reason = self.ready.context_identities.named_semantic(
+                                    CanonicalHasher::new(b"jvm-source-domain-open:v1").finish(),
+                                    "jvm-source-domain-open",
+                                    "Selected source package and path do not prove a source access domain",
+                                );
+                                Some(ResolutionCompletion::incomplete([
+                                    ResolutionIncompleteReason::UnsupportedSemantic(reason),
+                                ]))
+                            }
+                        }
+                    } else {
+                        self.jvm_qualified_source_access_completion(
+                            source_language,
+                            context_id,
+                            caller_version,
+                            source_path,
+                            target_version,
+                            target_mount.persisted_relative_path(),
+                            &ResolutionCompletion::Complete,
+                        )?
+                    }) else {
                         continue;
                     };
                     candidates.push(JvmPackageBridgeCandidate {
@@ -7421,13 +8771,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 let Some(local_key) = predef_member.definition.local_key() else {
                     continue;
                 };
-                let has_object_relation = connection
-                    .query_row(
-                        "SELECT 1 FROM main.resolution_semantic_sites AS site
+                let has_object_relation = connection.prepare_cached("SELECT 1 FROM main.resolution_semantic_sites AS site
                          JOIN main.resolution_singleton_relations AS singleton
                            ON singleton.blob_id=site.blob_id AND singleton.declaration_site=site.source_site
                          WHERE site.blob_id=?1 AND site.semantic_key=?2
-                           AND site.semantic_role='definition' AND singleton.kind='object'",
+                           AND site.semantic_role='definition' AND singleton.kind='object'")?.query_row(
                         rusqlite::params![target_record.blob_id(), local_key],
                         |_| Ok(()),
                     )
@@ -7650,7 +8998,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .implicit_root_precedence(JvmImplicitRootProvider::ScalaPredef)
                         .expect("Predef rank"),
                 };
-                if !prepared.same_package_lookups.contains(&reference.lookup)
+                if !prepared.scala_local_package_by_token.contains_key(&reference.token)
                     && local.is_none_or(|local| local.local_definitions().is_empty())
                     && !bindings.iter().any(|binding| {
                         binding.reference == reference.reference
@@ -7670,13 +9018,54 @@ impl SelectedResolutionOperation<'_, '_> {
                             owner: None,
                             indexed: false,
                         });
-                    prepared.on_demand_types.insert(
+                    // A Predef alias still sits below the enclosing classes'
+                    // inherited tiers when the operation has their table.
+                    let tiers = match &self.jvm_inherited_tier_knowledge {
+                        Some(_) => {
+                            let Some(tiers) = self.jvm_non_java_inherited_tiers(
+                                source_language,
+                                reference.reference,
+                                reference.lookup,
+                                source_recipe.spelling(),
+                                cancellation,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            Some(tiers)
+                        }
+                        None => None,
+                    };
+                    let JvmInheritedTypeNameTiers {
+                        tiers,
+                        on_demand_rank,
+                        consumed_walk,
+                        open_inherited_rank,
+                    } = tiers.unwrap_or(JvmInheritedTypeNameTiers {
+                        tiers: Vec::new(),
+                        on_demand_rank: JVM_ON_DEMAND_TYPE_TIER,
+                        consumed_walk: false,
+                        open_inherited_rank: None,
+                    });
+                    self.jvm_decision_consumed_walk
+                        .set(self.jvm_decision_consumed_walk.get() || consumed_walk);
+                    prepared.simple_type_name_decisions.insert(
                         reference.reference,
-                        JvmOnDemandTypeChoice::Alias(JvmOnDemandType {
-                            declared,
-                            precedence,
-                            package: SCALA_PREDEF_DEFAULT_IMPORT.to_owned(),
-                        }),
+                        Arc::new(JvmSimpleTypeNameDecision::from_tiers(
+                            reference.lookup,
+                            tiers,
+                            on_demand_rank,
+                            JvmOnDemandObservation::searched(JvmOnDemandTypeChoice::Alias(
+                                JvmOnDemandType {
+                                    declared,
+                                    precedence,
+                                    package: SCALA_PREDEF_DEFAULT_IMPORT.to_owned(),
+                                    source: None,
+                                },
+                            )),
+                            consumed_walk,
+                            open_inherited_rank,
+                        )),
                     );
                     continue;
                 }
@@ -7856,9 +9245,11 @@ impl SelectedResolutionOperation<'_, '_> {
                     };
                     if let Some(singleton_kind) = singleton_kind {
                         let has_singleton = connection
-                            .query_row(
+                            .prepare_cached(
                                 "SELECT 1 FROM main.resolution_singleton_relations
                                  WHERE blob_id=?1 AND declaration_site=?2 AND kind=?3",
+                            )?
+                            .query_row(
                                 rusqlite::params![
                                     target_record.blob_id(),
                                     declaration_site,
@@ -8563,7 +9954,13 @@ impl SelectedResolutionOperation<'_, '_> {
                     JvmOnDemandTypeChoice::Indexed(winner) if winner.package == package => {
                         found = true;
                     }
-                    _ => return Ok(false),
+                    JvmOnDemandTypeChoice::Possible(_)
+                    | JvmOnDemandTypeChoice::Competing(_)
+                    | JvmOnDemandTypeChoice::OpenDefault
+                    | JvmOnDemandTypeChoice::Unavailable
+                    | JvmOnDemandTypeChoice::Alias(_)
+                    | JvmOnDemandTypeChoice::Intrinsic(_)
+                    | JvmOnDemandTypeChoice::Indexed(_) => return Ok(false),
                 }
             }
         }
@@ -8585,6 +9982,13 @@ impl SelectedResolutionOperation<'_, '_> {
                 self.ready
                     .context_identities
                     .record_java_import_route_gap_reason(reason);
+                self.ready
+                    .context_identities
+                    .record_java_selected_import_proof(
+                        prepared.source.fragment(),
+                        source_site,
+                        reason,
+                    );
             }
         }
         Ok(found)
@@ -8609,20 +10013,6 @@ impl SelectedResolutionOperation<'_, '_> {
                 evidence.push(row.clone());
             }
         };
-        #[cfg(any(test, feature = "test-support"))]
-        if matches!(
-            self.java_oracle_selection,
-            Some(JavaOracleSelection::Legacy)
-        ) {
-            prepared
-                .java_imports
-                .for_each_entry(|_, import| retain(import.on_demand.as_ref()));
-        } else {
-            prepared
-                .imports
-                .for_each_entry(|_, import| retain(import.on_demand.as_ref()));
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
         prepared
             .imports
             .for_each_entry(|_, import| retain(import.on_demand.as_ref()));
@@ -8768,6 +10158,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 route: &recipes,
                 lookup_route: &recipes,
                 demand: &demand_recipe,
+                selected_name: None,
                 language: Language::Java,
             },
             &ResolutionCompletion::Complete,
@@ -8799,6 +10190,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 import_route.staged,
             )? {
                 identities.record_java_import_route_gap_reason(reason);
+                identities.record_java_selected_import_proof(
+                    source.fragment(),
+                    source_site,
+                    reason,
+                );
             }
         }
         // #8487: the frame also carries name-specific outcomes that the
@@ -8856,7 +10252,7 @@ impl SelectedResolutionOperation<'_, '_> {
         bridges: &mut Vec<SelectedRootBridgeDescriptor>,
         scoped_gaps: &mut Vec<JvmImportContextGap>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<Option<JvmDeclaredType>>> {
+    ) -> Result<Option<(Option<JvmDeclaredType>, JvmExplicitImportOutcome)>> {
         let mut modeled = None;
         let connection = self.ready.inventory.connection();
         let context_id = prepared.context_id;
@@ -8907,6 +10303,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 route: &recipes,
                 lookup_route: &recipes,
                 demand: &demand_recipe,
+                selected_name: None,
                 language: Language::Java,
             },
             &ResolutionCompletion::Complete,
@@ -8948,6 +10345,7 @@ impl SelectedResolutionOperation<'_, '_> {
             &selected_types,
             member_inventory_complete && package_inventory.workspace_inventory_complete,
         );
+        let mut outcome = JvmExplicitImportOutcome::WorkspaceSource;
         let targets = match proof {
             JavaSingleTypeImportProof::Proven(unit) => {
                 if let Some(source_site) = import_route.source_site {
@@ -8959,11 +10357,22 @@ impl SelectedResolutionOperation<'_, '_> {
                         import_route.staged,
                     )? {
                         identities.record_java_import_route_gap_reason(reason);
+                        identities.record_java_selected_import_proof(
+                            source.fragment(),
+                            source_site,
+                            reason,
+                        );
                     }
                 }
                 vec![unit]
             }
             JavaSingleTypeImportProof::Open { gap, targets } => {
+                if targets.is_empty() {
+                    outcome = JvmExplicitImportOutcome::External {
+                        fqn: path.join("."),
+                        declared: false,
+                    };
+                }
                 if targets.is_empty() && gap == JavaImportSplitGap::MissingDestination {
                     let owner = recipes
                         .iter()
@@ -8984,6 +10393,10 @@ impl SelectedResolutionOperation<'_, '_> {
                     if let Some(declared_type) = declared_type {
                         // Carry the successful typed proof, including indexed status.
                         // The legacy caller discards it; only the candidate consumes it.
+                        outcome = JvmExplicitImportOutcome::External {
+                            fqn: declared.clone(),
+                            declared: true,
+                        };
                         modeled = Some(declared_type.clone());
                         let model_owner = declared_type.owner;
                         let boundary = register_model_declared_jvm_type_identity(
@@ -9003,6 +10416,11 @@ impl SelectedResolutionOperation<'_, '_> {
                                 import_route.staged,
                             )? {
                                 identities.record_java_import_route_gap_reason(reason);
+                                identities.record_java_selected_import_proof(
+                                    source.fragment(),
+                                    source_site,
+                                    reason,
+                                );
                             }
                         }
                         if let Some(boundary) = boundary {
@@ -9076,7 +10494,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 })
                 .map(|candidate| candidate.bridge),
         );
-        Ok(Some(modeled))
+        Ok(Some((modeled, outcome)))
     }
 
     fn jvm_static_import_search_complete(
@@ -9187,6 +10605,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 route: candidate_owner,
                 lookup_route: candidate_owner,
                 demand,
+                selected_name: None,
                 language: Language::Java,
             };
             let Some(aliases) = self.jvm_alias_import_bridges(
@@ -9374,438 +10793,17 @@ impl SelectedResolutionOperation<'_, '_> {
                     search.staged,
                 )? {
                     identities.record_java_import_route_gap_reason(reason);
+                    identities.record_java_selected_import_proof(
+                        source.fragment(),
+                        source_site,
+                        reason,
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    fn java_import_context_parts(
-        &self,
-        caller_path: &str,
-        lookup: Option<&str>,
-        cancellation: &CancellationToken,
-    ) -> Result<JvmImportContext> {
-        if cancellation.is_cancelled() {
-            return Ok(JvmImportContext::Cancelled);
-        }
-        let Some(prepared) =
-            self.jvm_import_context_preparation(Language::Java, caller_path, cancellation)?
-        else {
-            return Ok(if cancellation.is_cancelled() {
-                JvmImportContext::Cancelled
-            } else {
-                JvmImportContext::Unavailable
-            });
-        };
-        let context_id = prepared.context_id;
-        let source = &prepared.source;
-        let source_record = &prepared.source_record;
-        let file_version = source_record.file_version_id();
-        let source_package = prepared.source_package.clone();
-        let identities = self.ready.context_identities.clone();
-        let evidence = "JVM selected source facts leave effective classpath, external artifacts, inherited imports and peer-language routes open";
-        let digest =
-            java_inventory_reason_digest(source_record.fragment_digest().as_bytes(), |key| {
-                self.ready.identity_content_digest(key, cancellation)
-            })?;
-        let reason = identities.named_semantic(digest, "java-context-incomplete", evidence);
-        let completion = ResolutionCompletion::Complete;
-        // Inventory uncertainty describes routes we have not enumerated. A
-        // positive source bridge carries its own source/declaration access
-        // evidence; unrelated inventory gaps must not taint that witness.
-        let mut bridges = Vec::new();
-        let mut external_static_imports = Vec::new();
-        // All namespace demands of one import must close before its source
-        // placeholder can retire. A found member is not an exhaustive search.
-        let mut static_import_searches = BTreeMap::new();
-        let mut open_jvm_alias_imports = Vec::new();
-        let mut scoped_gaps = Vec::new();
-        let Some(open_static_alias_owners) =
-            self.jvm_open_static_alias_owners(&prepared, cancellation)?
-        else {
-            return Ok(JvmImportContext::Cancelled);
-        };
-        for binder in &prepared.binders {
-            if lookup.is_some_and(|lookup| {
-                binder.route.as_ref().is_some_and(|route| {
-                    matches!(
-                        route.kind,
-                        SelectedImportRouteKind::SingleType | SelectedImportRouteKind::SingleStatic
-                    )
-                }) && binder
-                    .recipes
-                    .last()
-                    .expect("an import has a demand")
-                    .spelling()
-                    != lookup
-            }) {
-                continue;
-            }
-            let import = binder.half.clone();
-            let SelectedRootPathHalf::Import {
-                identity,
-                token,
-                anchor,
-                anchor_semantic,
-                ..
-            } = import
-            else {
-                continue;
-            };
-            if self.jvm_indexed_on_demand_import(&prepared, binder, cancellation)? {
-                continue;
-            }
-            let Some(import_route) = &binder.route else {
-                continue;
-            };
-            let kind = import_route.kind;
-            if !matches!(
-                kind,
-                SelectedImportRouteKind::SingleType
-                    | SelectedImportRouteKind::TypeOnDemand
-                    | SelectedImportRouteKind::SingleStatic
-                    | SelectedImportRouteKind::StaticOnDemand
-            ) {
-                // Actual token provenance is required before composing an import.
-                continue;
-            }
-            let import_kind = match kind {
-                SelectedImportRouteKind::SingleType => ResolutionImportRouteKind::SingleType,
-                SelectedImportRouteKind::TypeOnDemand => ResolutionImportRouteKind::TypeOnDemand,
-                SelectedImportRouteKind::SingleStatic => ResolutionImportRouteKind::SingleStatic,
-                SelectedImportRouteKind::StaticOnDemand => {
-                    ResolutionImportRouteKind::StaticOnDemand
-                }
-                SelectedImportRouteKind::Named | SelectedImportRouteKind::Star => {
-                    unreachable!("Java import kind was checked above")
-                }
-            };
-            let mut recipes = binder.recipes.clone();
-            let demand_recipe = recipes.pop().expect("one import demand");
-            let earlier_alias_open =
-                has_open_jvm_alias_for_owner(&open_jvm_alias_imports, &scoped_gaps, &recipes);
-            let cached = prepared.java_imports.get(&(identity, earlier_alias_open));
-            let derived = if let Some(derived) = cached {
-                derived
-            } else {
-                self.profile_jvm_read("derive_java_import", identity);
-                let mut bridges = Vec::new();
-                let mut external_static_imports = Vec::new();
-                let mut static_import_searches = BTreeMap::new();
-                let mut open_jvm_alias_imports = Vec::new();
-                let mut scoped_gaps = Vec::new();
-                let mut on_demand = None;
-                'derive_java_import: {
-                    let mut owner_found = false;
-                    let member_import = JavaMemberImportDemand {
-                        half: &binder.half,
-                        import_kind: Some(import_kind),
-                        caller_package: source_package.as_deref(),
-                        source: source.fragment(),
-                        token,
-                        prefix_reference: None,
-                        scope_head: None,
-                        anchor,
-                        anchor_semantic,
-                        selector_kind: None,
-                        import_precedence: None,
-                        candidate_origin_rank: None,
-                        route: &recipes,
-                        lookup_route: &recipes,
-                        demand: &demand_recipe,
-                        language: Language::Java,
-                    };
-                    let Some(member_inventory) = self.jvm_type_member_import_candidates(
-                        context_id,
-                        file_version,
-                        &member_import,
-                        &ResolutionCompletion::Complete,
-                        cancellation,
-                        &mut owner_found,
-                    )?
-                    else {
-                        return Ok(JvmImportContext::Cancelled);
-                    };
-                    let Some(static_search_complete) = self.jvm_static_import_search_complete(
-                        import_kind,
-                        owner_found,
-                        &member_inventory,
-                        &demand_recipe,
-                        cancellation,
-                    )?
-                    else {
-                        return Ok(JvmImportContext::Cancelled);
-                    };
-                    let member_route_complete = member_inventory.route_search_complete
-                        && !member_inventory.inherited_route_open;
-                    let JavaTypeMemberImportInventory {
-                        members,
-                        workspace_type_rows,
-                        workspace_inventory_complete: member_inventory_complete,
-                        ..
-                    } = member_inventory;
-                    match kind {
-                        SelectedImportRouteKind::SingleStatic
-                        | SelectedImportRouteKind::StaticOnDemand => {
-                            let owner_key = recipes
-                                .iter()
-                                .map(|part| part.spelling().to_owned())
-                                .collect::<Vec<_>>();
-                            let global_alias_open = open_static_alias_owners.contains(&owner_key);
-                            let accumulated_alias_open = global_alias_open
-                                || earlier_alias_open
-                                || has_open_jvm_alias_for_owner(
-                                    &open_jvm_alias_imports,
-                                    &scoped_gaps,
-                                    &recipes,
-                                );
-                            if self
-                                .jvm_static_import(
-                                    &prepared,
-                                    binder,
-                                    &member_import,
-                                    members,
-                                    owner_found,
-                                    static_search_complete,
-                                    &mut bridges,
-                                    &mut external_static_imports,
-                                    &mut static_import_searches,
-                                    &mut open_jvm_alias_imports,
-                                    &mut scoped_gaps,
-                                    cancellation,
-                                    accumulated_alias_open,
-                                    |witness| {
-                                        // Keep this bridge until production Java runs the
-                                        // common import assembly (#7314).
-                                        if let Some(scope) = java_unresolved_static_owner(&witness)
-                                        {
-                                            record_jvm_import_member_scope(self, &witness, &scope)?;
-                                        }
-                                        Ok(())
-                                    },
-                                )?
-                                .is_none()
-                            {
-                                return Ok(JvmImportContext::Cancelled);
-                            }
-                            break 'derive_java_import;
-                        }
-                        SelectedImportRouteKind::SingleType => {
-                            if self
-                                .jvm_single_type_import(
-                                    &prepared,
-                                    binder,
-                                    members,
-                                    workspace_type_rows,
-                                    member_inventory_complete,
-                                    &mut bridges,
-                                    &mut scoped_gaps,
-                                    cancellation,
-                                )?
-                                .is_none()
-                            {
-                                return Ok(JvmImportContext::Cancelled);
-                            }
-                            break 'derive_java_import;
-                        }
-                        SelectedImportRouteKind::TypeOnDemand => {
-                            bridges.extend(members.into_iter().map(|member| member.bridge));
-                        }
-                        SelectedImportRouteKind::Named | SelectedImportRouteKind::Star => {
-                            unreachable!("Java import kind was checked above")
-                        }
-                    }
-                    let Some(evidence) = self.jvm_type_on_demand_import(
-                        &prepared,
-                        binder,
-                        member_route_complete,
-                        &mut bridges,
-                        cancellation,
-                    )?
-                    else {
-                        return Ok(JvmImportContext::Cancelled);
-                    };
-                    on_demand = evidence.frame_evidence;
-                }
-                if cancellation.is_cancelled() {
-                    return Ok(JvmImportContext::Cancelled);
-                }
-                let derived = Arc::new(JavaDerivedImport {
-                    on_demand,
-                    bridges,
-                    external_static_imports,
-                    static_import_searches,
-                    open_jvm_alias_imports,
-                    scoped_gaps,
-                });
-                prepared
-                    .java_imports
-                    .insert((identity, earlier_alias_open), Arc::clone(&derived));
-                derived
-            };
-            bridges.extend(derived.bridges.iter().cloned());
-            external_static_imports.extend(derived.external_static_imports.iter().cloned());
-            open_jvm_alias_imports.extend(derived.open_jvm_alias_imports.iter().cloned());
-            scoped_gaps.extend(derived.scoped_gaps.iter().cloned());
-            for (&key, search) in &derived.static_import_searches {
-                let combined = static_import_searches
-                    .entry(key)
-                    .or_insert_with(|| search.clone());
-                combined.complete &= search.complete;
-                combined.found |= search.found;
-            }
-        }
-        let package_references = match lookup {
-            Some(name) => prepared
-                .references_by_name
-                .get(name)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            None => prepared.package_references.as_slice(),
-        };
-        let mut package_candidates = Vec::new();
-        for package in source_package.iter() {
-            let planned = prepared
-                .package_plan
-                .get(package)
-                .expect("file preparation plans its own package");
-            let mut candidate_references = Vec::new();
-            for (position, reference) in package_references.iter().enumerate() {
-                for candidate in planned
-                    .candidates
-                    .get(&reference.lookup)
-                    .into_iter()
-                    .flatten()
-                {
-                    let order = match candidate {
-                        JvmPackageCandidate::SourceMount { order, .. } => *order,
-                        JvmPackageCandidate::ExternalMember(_) => continue,
-                    };
-                    candidate_references.push((order, position, reference, candidate));
-                }
-            }
-            // Keep the old target-then-reference order while reading only
-            // candidates present in the invariant file plan.
-            candidate_references.sort_by_key(|(order, position, _, _)| (*order, *position));
-            for (_, _, reference, candidate) in candidate_references {
-                if cancellation.is_cancelled() {
-                    return Ok(JvmImportContext::Cancelled);
-                }
-                let (ordinal, target_version) = match candidate {
-                    JvmPackageCandidate::SourceMount { mount, version, .. } => (*mount, *version),
-                    JvmPackageCandidate::ExternalMember(_) => continue,
-                };
-                if ordinal == source.ordinal() {
-                    continue;
-                }
-                let target_mount = self.mount_table().mount_by_ordinal(ordinal)?;
-                // This hook's package peers are Java-only; mixed-language
-                // imports continue through the separate JVM bridge proof.
-                if !nominal_language_rules(source.semantic_language())
-                    .expect("caller belongs to a nominal family")
-                    .package_peer_languages()
-                    .contains(&target_mount.semantic_language())
-                {
-                    continue;
-                }
-                let Some(access) = self.jvm_unit_access_completion(
-                    source.semantic_language(),
-                    context_id,
-                    file_version,
-                    source.persisted_relative_path(),
-                    target_version,
-                    target_mount.persisted_relative_path(),
-                    &ResolutionCompletion::Complete,
-                )?
-                else {
-                    continue;
-                };
-                package_candidates.push(JavaPackageBridgeCandidate {
-                    reference,
-                    candidate,
-                    target: target_mount,
-                    access,
-                });
-            }
-        }
-        let pairs = package_candidates.iter().flat_map(|candidate| {
-            match candidate.candidate {
-                JvmPackageCandidate::SourceMount { members, .. } => members,
-                JvmPackageCandidate::ExternalMember(_) => {
-                    unreachable!("external member has no source bridge")
-                }
-            }
-            .iter()
-            .map(move |member| PackageBridgePair {
-                reference: candidate.reference,
-                member,
-                target_fragment: candidate.target.fragment(),
-                target_mount: candidate.target.ordinal(),
-                extra: candidate,
-            })
-        });
-        let assembly = assemble_package_bridges(
-            &self.ready,
-            pairs,
-            &JavaPackageBridgeRules {
-                operation: self,
-                source,
-                caller_package: source_package.as_deref(),
-                prepared: &prepared,
-            },
-            cancellation,
-        )?;
-        if assembly
-            .completion
-            .contains_reason(ResolutionIncompleteReason::Cancelled)
-        {
-            return Ok(JvmImportContext::Cancelled);
-        }
-        let package_bridges = assembly.descriptors;
-        self.jvm_complete_static_imports(&prepared, static_import_searches)?;
-        // An indexed same-named member from another import cannot close this
-        // exact unavailable owner. Keep each boundary scoped to its own route.
-        let mount = SelectedResolutionMountContext::new(
-            source.ordinal(),
-            source.fragment(),
-            Language::Java,
-            bridges,
-            completion,
-        )?
-        .with_package_bridges(package_bridges)?;
-        let mounts = self.mount_table();
-        let context = SelectedResolutionContextSet::new(
-            identities,
-            vec![mount],
-            mounts.mount_count(),
-            &selected_mount_lookup(mounts),
-        )?
-        .with_callable_imports(
-            source.semantic_language(),
-            prepared.binders.iter().map(|binder| &binder.half),
-            &self.ready.lexical_source(),
-            cancellation,
-        )?;
-        let access_identity = self.ready.context_identities.named_semantic(
-            CanonicalHasher::new(b"java-selected-declaration-access:v1").finish(),
-            "java-selected-declaration-access",
-            "Java declaration visibility under exact selected package and lexical ownership",
-        );
-        external_static_imports
-            .sort_by(|left, right| (&left.member, &left.owner).cmp(&(&right.member, &right.owner)));
-        external_static_imports.dedup();
-        Ok(JvmImportContext::Ready {
-            context: Box::new(context.with_declaration_access_source(
-                self.jvm_declaration_access_source(access_identity),
-            )),
-            external_static_imports,
-            inventory_reason: Some(reason),
-            open_jvm_alias_imports,
-            scoped_gaps,
-        })
-    }
     #[allow(clippy::too_many_arguments)]
     fn jvm_unit_access_completion(
         &self,
@@ -10031,7 +11029,7 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(SelectedPackageRows::Ready(package))
     }
 
-    fn jvm_external_type_is_indexed(
+    pub(super) fn jvm_external_type_is_indexed(
         &self,
         owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
     ) -> Result<bool> {
@@ -10051,8 +11049,7 @@ impl SelectedResolutionOperation<'_, '_> {
     fn declares_jvm_type(&self, language: Language, fqn: &str) -> Result<bool> {
         if self
             .ready
-            .analyzer
-            .and_then(|analyzer| analyzer.model_authority())
+            .model_authority()
             .is_some_and(|overlay| overlay.declares_jvm_type(fqn))
         {
             return Ok(true);
@@ -10105,10 +11102,7 @@ impl SelectedResolutionOperation<'_, '_> {
         {
             return Ok(owner.clone());
         }
-        let authority = self
-            .ready
-            .analyzer
-            .and_then(|analyzer| analyzer.model_authority());
+        let authority = self.ready.model_authority();
         let relations = nominal_language_rules(language)
             .expect("caller belongs to a nominal family")
             .family()
@@ -10801,6 +11795,15 @@ fn register_model_declared_jvm_type_identities(
         .mount_table()
         .mount_by_ordinal(source)?
         .semantic_language();
+    // A language whose types can be called (Kotlin's `ZipInputStream(input)`)
+    // also searches a callee's Type namespace. The import binding below proves
+    // the callee is the lexical name the import binds, so the callee takes the
+    // imported type like any type reference does.
+    let callee_names_types = matches!(
+        crate::analyzer::resolution::fact_resolution::type_in_call_position(language),
+        crate::analyzer::resolution::fact_resolution::TypeInCallPosition::Constructors
+            | crate::analyzer::resolution::fact_resolution::TypeInCallPosition::ApplyMembers
+    );
     for route in routes {
         if route.lookup.namespace() != ResolutionNamespace::Type {
             continue;
@@ -10843,12 +11846,28 @@ fn register_model_declared_jvm_type_identities(
                 continue;
             };
             if !seed.site_metadata().is_some_and(|metadata| {
-                metadata.unqualified()
+                (metadata.unqualified()
                     && matches!(
                         metadata.namespace(),
                         ResolutionNamespace::Type | ResolutionNamespace::TypeOrValue
-                    )
+                    ))
+                    || (metadata.namespace() == ResolutionNamespace::Callable && callee_names_types)
             }) {
+                continue;
+            }
+            // A callee takes the type only from an indexed inventory, which
+            // lists the constructors the call applies. A model-declared type
+            // without one keeps the callee's import boundary.
+            if seed
+                .site_metadata()
+                .is_some_and(|metadata| metadata.namespace() == ResolutionNamespace::Callable)
+                && !route
+                    .owner
+                    .as_ref()
+                    .map(|owner| operation.jvm_external_type_is_indexed(owner))
+                    .transpose()?
+                    .unwrap_or(false)
+            {
                 continue;
             }
             operation.profile_jvm_read(
@@ -11247,6 +12266,9 @@ pub(super) struct JvmMemberImportKey {
     route: Vec<ResolutionLookupSemanticRecipe>,
     lookup_route: Vec<ResolutionLookupSemanticRecipe>,
     demand: ResolutionLookupSemanticRecipe,
+    // A named import can bind a local spelling while reading another member.
+    // Reusing a memo hit across those selections would return the wrong bridge.
+    selected_name: Option<String>,
     language: Language,
     // Preserve Complete versus a raw empty Incomplete, and reason order.
     completion: Option<Vec<ResolutionIncompleteReason>>,
@@ -11990,7 +13012,12 @@ impl RootBridgeRules for JavaPackageRootRules<'_, '_, '_> {
         };
         debug_assert_eq!(pair.import_half, self.import.half);
         self.import
-            .bridge(identity.fragment(), *token, completion)
+            .bridge(
+                identity.fragment(),
+                *token,
+                self.import.demand.clone(),
+                completion,
+            )
             .with_selected_export(&self.operation.ready.shared_names(), pair.export_half)
     }
 
@@ -12023,6 +13050,8 @@ struct JavaMemberImportDemand<'a> {
     /// enclosing package first.
     lookup_route: &'a [ResolutionLookupSemanticRecipe],
     demand: &'a ResolutionLookupSemanticRecipe,
+    /// A renamed selector binds `demand` locally but searches this authored member.
+    selected_name: Option<&'a str>,
     /// The source language. A cross-language destination supplies its own
     /// namespace rules and an explicit JVM bridge proof.
     language: Language,
@@ -12099,7 +13128,10 @@ impl SelectedResolutionOperation<'_, '_> {
         let demand = recipes.pop().expect("import demand");
         if !matches!(
             demand.namespace(),
-            ResolutionNamespace::Type | ResolutionNamespace::Value | ResolutionNamespace::Callable
+            ResolutionNamespace::Type
+                | ResolutionNamespace::Value
+                | ResolutionNamespace::Callable
+                | ResolutionNamespace::Package
         ) || recipes.is_empty()
         {
             return Ok(None);
@@ -12182,63 +13214,51 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(selected.into_iter().collect()))
     }
 
-    fn scala_reference_package_prefixes(
+    fn scala_reference_package_prefixes_with_coverage(
         &self,
         blob: i64,
-        reference: BindingNodeId,
-    ) -> Result<Vec<String>> {
-        let key = reference
-            .local_key()
-            .expect("selected Scala reference has a local key");
+        reference: ScalaPackageContextReference,
+    ) -> Result<Option<Vec<String>>> {
         let connection = self.ready.inventory.connection();
-        let import = connection
+        let site_key = match reference {
+            ScalaPackageContextReference::Site(site) => i64::from(site.get()),
+            ScalaPackageContextReference::Semantic(semantic) => semantic
+                .local_key()
+                .expect("selected Scala reference semantic has a local key")
+                .into(),
+        };
+        // A selected blob and exact reference site are the only authority.
+        // Absence remains Open; JSON [] is affirmative empty coverage.
+        let encoded = connection
             .prepare_cached(
-                "SELECT import.import_id
-             FROM main.resolution_sites AS site
-             JOIN main.source_imports AS import ON import.blob_id=site.blob_id
-               AND import.declaration_start_byte<=site.start_byte
-               AND import.declaration_end_byte>=site.end_byte
-             WHERE site.blob_id=?1 AND site.site=?2 AND site.role=0
-             ORDER BY import.declaration_end_byte-import.declaration_start_byte
-             LIMIT 1",
+                "SELECT json(context.prefixes)
+                 FROM main.resolution_reference_package_contexts AS context
+                 JOIN main.resolution_sites AS site
+                   ON site.blob_id=context.blob_id AND site.site=context.reference_site
+                 WHERE context.blob_id=?1 AND context.reference_site=?2 AND site.role=0",
             )?
-            .query_row(rusqlite::params![blob, key], |row| row.get::<_, i64>(0))
+            .query_row(rusqlite::params![blob, site_key], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()?;
-        if let Some(import) = import {
-            return Ok(connection
-                .prepare_cached(
-                    "SELECT prefix FROM main.source_import_prefixes
-                 WHERE blob_id=?1 AND import_id=?2 ORDER BY ordinal",
-                )?
-                .query_map(rusqlite::params![blob, import], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?);
-        }
-        let declaration = connection
-            .prepare_cached(
-                "SELECT declaration.declaration_id
-             FROM main.resolution_sites AS site
-             JOIN main.source_declarations AS declaration ON declaration.blob_id=site.blob_id
-               AND declaration.start_byte<=site.start_byte
-               AND declaration.end_byte>=site.end_byte
-             JOIN main.source_scala_declarations AS scala
-               ON scala.blob_id=declaration.blob_id
-              AND scala.declaration_id=declaration.declaration_id
-             WHERE site.blob_id=?1 AND site.site=?2 AND site.role=0
-             ORDER BY declaration.end_byte-declaration.start_byte, declaration.declaration_id
-             LIMIT 1",
-            )?
-            .query_row(rusqlite::params![blob, key], |row| row.get::<_, i64>(0))
-            .optional()?;
-        if let Some(declaration) = declaration {
-            return Ok(connection
-                .prepare_cached(
-                    "SELECT prefix FROM main.source_scala_declaration_lexical_prefixes
-                 WHERE blob_id=?1 AND declaration_id=?2 ORDER BY ordinal",
-                )?
-                .query_map(rusqlite::params![blob, declaration], |row| row.get(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?);
-        }
-        Ok(self.scala_primary_package(blob)?.into_iter().collect())
+        encoded
+            .map(|value| {
+                let prefixes = serde_json::from_str::<Vec<String>>(&value).map_err(|error| {
+                    StoreError::corrupt(format!(
+                        "invalid selected reference package context: {error}"
+                    ))
+                })?;
+                if prefixes
+                    .iter()
+                    .any(|prefix| prefix.is_empty() || prefix.split('.').any(str::is_empty))
+                {
+                    return Err(StoreError::corrupt(
+                        "selected reference package context has an empty segment",
+                    ));
+                }
+                Ok(prefixes)
+            })
+            .transpose()
     }
 
     pub(super) fn scala_primary_package(&self, blob: i64) -> Result<Option<String>> {
@@ -12540,7 +13560,7 @@ impl SelectedResolutionOperation<'_, '_> {
         self.ready
             .inventory
             .connection()
-            .query_row(
+            .prepare_cached(
                 "SELECT EXISTS(
                     SELECT 1
                     FROM main.resolution_semantic_sites AS site
@@ -12551,6 +13571,8 @@ impl SelectedResolutionOperation<'_, '_> {
                       AND site.semantic_role='definition'
                       AND singleton.kind IN ('object', 'companion')
                 )",
+            )?
+            .query_row(
                 rusqlite::params![record.blob_id(), i64::from(local_key)],
                 |row| row.get(0),
             )
@@ -12572,8 +13594,12 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .inventory
             .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
-        let proven = self.ready.inventory.connection().query_row(
-            "SELECT EXISTS(
+        let proven = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(
+                "SELECT EXISTS(
                 SELECT 1 FROM main.resolution_semantic_sites AS site
                 JOIN main.resolution_additional_definition_namespaces AS term_type
                   ON term_type.blob_id=site.blob_id
@@ -12589,9 +13615,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 WHERE site.blob_id=?1 AND site.semantic_key=?2
                   AND site.semantic_role='definition' AND site.namespace='value'
             )",
-            rusqlite::params![record.blob_id(), i64::from(local_key)],
-            |row| row.get::<_, bool>(0),
-        )?;
+            )?
+            .query_row(
+                rusqlite::params![record.blob_id(), i64::from(local_key)],
+                |row| row.get::<_, bool>(0),
+            )?;
         Ok(proven.then_some(definition))
     }
 
@@ -12624,6 +13652,7 @@ impl SelectedResolutionOperation<'_, '_> {
             route: import.route.to_vec(),
             lookup_route: import.lookup_route.to_vec(),
             demand: import.demand.clone(),
+            selected_name: import.selected_name.map(str::to_owned),
             language: import.language,
             completion: match completion {
                 ResolutionCompletion::Complete => None,
@@ -12896,7 +13925,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .iter()
                         .map(|recipe| (recipe.spelling(), ResolutionNamespace::Type))
                         .chain(std::iter::once((
-                            import.demand.spelling(),
+                            import.selected_name.unwrap_or(import.demand.spelling()),
                             import.demand.namespace(),
                         )))
                         .enumerate()
@@ -12973,14 +14002,13 @@ impl SelectedResolutionOperation<'_, '_> {
                                 return Ok(None);
                             }
                             if step == nested_route.len() {
-                                terminal_member_inventory_complete &= outcome.is_exhausted()
-                                    && outcome.evidence() == &ResolutionCompletion::Complete;
+                                terminal_member_inventory_complete &=
+                                    jvm_member_owner_pages_complete(&outcome);
                             }
-                            declared_members_complete &= outcome.is_exhausted()
-                                && outcome.evidence() == &ResolutionCompletion::Complete;
+                            declared_members_complete &= jvm_member_owner_pages_complete(&outcome);
                             if version.is_some() && collect_workspace_type_rows {
-                                workspace_inventory_complete &= outcome.is_exhausted()
-                                    && outcome.evidence() == &ResolutionCompletion::Complete;
+                                workspace_inventory_complete &=
+                                    jvm_member_owner_pages_complete(&outcome);
                             }
                             members.sort_unstable_by_key(|(definition, _)| *definition);
                             members.dedup();
@@ -13015,7 +14043,7 @@ impl SelectedResolutionOperation<'_, '_> {
                                 let named_keys =
                                     rows.iter().map(|(_, key, _)| *key).collect::<BTreeSet<_>>();
                                 declared_members_complete &=
-                                    chunk.iter().all(|(_, key)| named_keys.contains(key));
+                                    jvm_member_crosswalk_complete(chunk, &named_keys);
                                 if version.is_some()
                                     && collect_workspace_type_rows
                                     && rows.len() != chunk.len()
@@ -13224,7 +14252,11 @@ impl SelectedResolutionOperation<'_, '_> {
                                 row.source_kind()
                                     != Some(ResolutionSupertypeKind::ImplicitSuperclass)
                                     || language_implicit_root_member_names(target_language)
-                                        .contains(&import.demand.spelling())
+                                        .contains(
+                                            &import
+                                                .selected_name
+                                                .unwrap_or(import.demand.spelling()),
+                                        )
                             });
                     }
                     for (member, access, member_access, unit, bridge_allowed) in owners {
@@ -13242,7 +14274,12 @@ impl SelectedResolutionOperation<'_, '_> {
                             ));
                         };
                         let bridge = if target_language == import.language {
-                            import.bridge(identity.fragment(), token, access)
+                            let selected_demand = self.jvm_generated_lookup(
+                                target_language,
+                                import.demand.namespace(),
+                                import.selected_name.unwrap_or(import.demand.spelling()),
+                            ).recipe.clone();
+                            import.bridge(identity.fragment(), token, selected_demand, access)
                         } else {
                             let Some(visibility) = self.jvm_bridge_visibility(
                                 member, relation, cancellation,
@@ -13252,7 +14289,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             let target_demand = self.jvm_generated_lookup(
                                 target_language,
                                 import.demand.namespace(),
-                                import.demand.spelling(),
+                                import.selected_name.unwrap_or(import.demand.spelling()),
                                 ).recipe.clone();
                             let bridge = SelectedRootBridgeDescriptor::from_selected_path_tokens_with_jvm_evidence(
                                 import.source,
@@ -13406,6 +14443,7 @@ impl JavaMemberImportDemand<'_> {
         &self,
         target: BindingFragmentId,
         export_token: SemanticId,
+        target_demand: ResolutionLookupSemanticRecipe,
         completion: ResolutionCompletion,
     ) -> SelectedRootBridgeDescriptor {
         let bridge = if let Some(prefix) = self.prefix_reference {
@@ -13421,7 +14459,7 @@ impl JavaMemberImportDemand<'_> {
                 prefix,
                 self.route.to_vec(),
                 self.demand.clone(),
-                self.demand.clone(),
+                target_demand,
                 completion,
             )
         } else {
@@ -13436,7 +14474,7 @@ impl JavaMemberImportDemand<'_> {
                 export_token,
                 self.route.to_vec(),
                 self.demand.clone(),
-                self.demand.clone(),
+                target_demand,
                 completion,
             )
         };
@@ -13470,35 +14508,6 @@ impl JavaMemberImportDemand<'_> {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
-    #[cfg(any(test, feature = "test-support"))]
-    fn java_package_type_import_bridges(
-        &self,
-        context: i64,
-        caller_version: Option<i64>,
-        import: &JavaMemberImportDemand<'_>,
-        completion: &ResolutionCompletion,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<Vec<SelectedRootBridgeDescriptor>>> {
-        let Some(inventory) = self.java_package_type_import_inventory(
-            context,
-            caller_version,
-            import,
-            completion,
-            cancellation,
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(
-            inventory
-                .candidates
-                .into_iter()
-                .take(1)
-                .map(|candidate| candidate.bridge)
-                .collect(),
-        ))
-    }
-
     fn java_package_type_import_inventory(
         &self,
         context: i64,
@@ -13641,7 +14650,7 @@ impl SelectedResolutionOperation<'_, '_> {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
-    pub(super) fn jvm_lexical_import_qualifier(
+    pub(super) fn jvm_lexical_route_head(
         &self,
         node: BindingNodeId,
         cancellation: &CancellationToken,
@@ -13663,9 +14672,15 @@ impl SelectedResolutionOperation<'_, '_> {
         if terminal != crate::analyzer::resolution::ReferenceSeedReadTerminal::Exhausted {
             return Ok(None);
         }
-        Ok(Some(rows.iter().filter_map(|row| row.seed()).filter_map(|seed| seed.site_metadata())
-            .any(|metadata| metadata.site_kind() ==
-                brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ImportQualifierReference)))
+        // A root-routed reference that keeps lexical lookup heads a lexical
+        // route: an import qualifier or an owner-continued term path. Its
+        // package reading ranks below every lexical binder.
+        Ok(Some(
+            rows.iter()
+                .filter_map(|row| row.seed())
+                .filter_map(|seed| seed.site_metadata())
+                .any(|metadata| metadata.unqualified()),
+        ))
     }
 
     pub(super) fn jvm_qualified_type_bridges(
@@ -13684,37 +14699,6 @@ impl SelectedResolutionOperation<'_, '_> {
         nominal_language_rules(source_mount.semantic_language())
             .expect("caller belongs to a nominal family")
             .qualified_type_bridges(self, half, completion, cancellation)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn java_qualified_type_publication(
-        &self,
-        _language: Language,
-        half: &SelectedRootPathHalf,
-        completion: &ResolutionCompletion,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<JvmRoutePublication>> {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(selection) = self.java_oracle_selection {
-            self.java_oracle_visits
-                .borrow_mut()
-                .push(format!("{selection:?}/qualified/{half:?}"));
-            if let JavaOracleSelection::FullCandidate = selection {
-                return self.common_qualified_type_publication_with_rules(
-                    &JavaJvmImportRules,
-                    half,
-                    completion,
-                    cancellation,
-                );
-            }
-        }
-        Ok(self
-            .java_qualified_type_bridges(half, completion, cancellation)?
-            .map(|bridges| JvmRoutePublication {
-                bridges,
-                selected_targets: BTreeSet::new(),
-                complete: false,
-            }))
     }
 
     pub(super) fn common_qualified_type_publication(
@@ -13766,8 +14750,7 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(None);
         };
         if let Some(origin) = jvm_lexical_import_head_origin(language) {
-            let Some(import_head) =
-                self.jvm_lexical_import_qualifier(*source_reference, cancellation)?
+            let Some(import_head) = self.jvm_lexical_route_head(*source_reference, cancellation)?
             else {
                 return Ok(None);
             };
@@ -13833,8 +14816,30 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             return Ok(None);
         };
-        let prefixes =
-            self.scala_reference_package_prefixes(record.blob_id(), *source_reference)?;
+        let Some(endpoints) = self.jvm_endpoint_classifications(*source_reference, cancellation)?
+        else {
+            return Ok(None);
+        };
+        let source_semantic = endpoints
+            .iter()
+            .find(|row| row.node() == *source_reference)
+            .and_then(|row| row.reference());
+        let Some(prefixes) = source_semantic
+            .map(|semantic| {
+                self.scala_reference_package_prefixes_with_coverage(
+                    record.blob_id(),
+                    ScalaPackageContextReference::Semantic(semantic),
+                )
+            })
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(Some(JvmRoutePublication {
+                bridges: Vec::new(),
+                selected_targets: BTreeSet::new(),
+                complete: false,
+            }));
+        };
         let routes = jvm_import_lookup_routes(
             Language::Scala,
             *anchor,
@@ -13945,6 +14950,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 route: recipes,
                 lookup_route,
                 demand: source_demand,
+                selected_name: None,
                 language: source_language,
             };
             let mut owner_found = false;
@@ -14006,11 +15012,10 @@ impl SelectedResolutionOperation<'_, '_> {
             .prepare_cached(CONTEXT_SELECTION)?
             .query_row([source_language.config_label()], |row| row.get::<_, i64>(0))?;
         let caller_package: Option<String> = connection
-            .query_row(
+            .prepare_cached(
                 "SELECT content_package FROM main.blob_meta WHERE blob_id=?1 AND is_complete=1",
-                [source_record.blob_id()],
-                |row| row.get(0),
-            )
+            )?
+            .query_row([source_record.blob_id()], |row| row.get(0))
             .optional()?;
         let Some(mut recipes) = self.jvm_lookup_recipes(
             identity.fragment(),
@@ -14303,111 +15308,6 @@ impl SelectedResolutionOperation<'_, '_> {
             complete: route_complete,
         })))
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub(super) fn java_qualified_type_bridges(
-        &self,
-        half: &SelectedRootPathHalf,
-        completion: &ResolutionCompletion,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<Vec<SelectedRootBridgeDescriptor>>> {
-        let SelectedRootPathHalf::Reference {
-            identity,
-            prefix_reference,
-            route,
-            token,
-            anchor,
-            anchor_semantic,
-            demand,
-            ..
-        } = half
-        else {
-            unreachable!("qualified Java demand has a reference half");
-        };
-        let mount = self
-            .mount_table()
-            .mount_for_fragment(identity.fragment())?
-            .expect("selected source half has its mount");
-        let record = self
-            .ready
-            .inventory
-            .mount_record_by_ordinal(mount.ordinal())?;
-        let connection = self.ready.inventory.connection();
-        let context: i64 = connection
-            .prepare_cached(CONTEXT_SELECTION)?
-            .query_row(["java"], |row| row.get(0))?;
-        let package: Option<String> = connection
-            .query_row(
-                "SELECT content_package FROM main.blob_meta WHERE blob_id=?1 AND is_complete=1",
-                [record.blob_id()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(mut recipes) = self.jvm_lookup_recipes(
-            identity.fragment(),
-            route.iter().copied().chain(std::iter::once(*demand)),
-            cancellation,
-        )?
-        else {
-            return Ok(None);
-        };
-        let demand = recipes.pop().expect("qualified type demand");
-        // A Java root prefix may end in a Type or a Value (`Math.max`,
-        // `System.out`); the package and member reads below take the demand's
-        // namespace, as the common route does.
-        assert!(matches!(
-            demand.namespace(),
-            ResolutionNamespace::Type | ResolutionNamespace::Value
-        ));
-
-        let import = JavaMemberImportDemand {
-            half,
-            import_kind: None,
-            caller_package: package.as_deref(),
-            source: identity.fragment(),
-            token: *token,
-            prefix_reference: *prefix_reference,
-            scope_head: None,
-            anchor: *anchor,
-            anchor_semantic: *anchor_semantic,
-            selector_kind: None,
-            import_precedence: None,
-            candidate_origin_rank: None,
-            route: &recipes,
-            lookup_route: &recipes,
-            demand: &demand,
-            language: Language::Java,
-        };
-        let Some(mut bridges) = self.java_package_type_import_bridges(
-            context,
-            record.file_version_id(),
-            &import,
-            completion,
-            cancellation,
-        )?
-        else {
-            return Ok(None);
-        };
-        let mut owner_found = false;
-        let Some(member_inventory) = self.jvm_type_member_import_candidates(
-            context,
-            record.file_version_id(),
-            &import,
-            completion,
-            cancellation,
-            &mut owner_found,
-        )?
-        else {
-            return Ok(None);
-        };
-        bridges.extend(
-            member_inventory
-                .members
-                .into_iter()
-                .map(|member| member.bridge),
-        );
-        Ok(Some(bridges))
-    }
 }
 
 // Read once before source polling. Reconstructing a half view after a wait
@@ -14476,11 +15376,10 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .inventory
             .connection()
-            .query_row(
+            .prepare_cached(
                 "SELECT content_package FROM main.blob_meta WHERE blob_id=?1 AND is_complete=1",
-                [record.blob_id()],
-                |row| row.get::<_, Option<String>>(0),
-            )
+            )?
+            .query_row([record.blob_id()], |row| row.get::<_, Option<String>>(0))
             .optional()?
             .flatten();
         let source_package = nominal_language_rules(mount.semantic_language())
@@ -14547,6 +15446,7 @@ impl SelectedResolutionOperation<'_, '_> {
         &self,
         owner: SemanticId,
         route: &super::demand_closure::MemberRouteContext<'_, ()>,
+        lookup: &ResolutionLookupSemanticRecipe,
         occurrence: SemanticId,
         cancellation: &CancellationToken,
     ) -> Result<Option<JvmSourceMemberRows>> {
@@ -14554,7 +15454,6 @@ impl SelectedResolutionOperation<'_, '_> {
             HierarchyProviderAuthority, HierarchyProviderKey, HierarchyProviderObservation,
             HierarchyProviderOperand, HierarchyProviderVisit,
         };
-        let lookup = route.lookup;
         let step =
             u32::try_from(route.cursor.consumed_prefix_segments).expect("route step fits u32");
         let mut rows = Vec::new();
@@ -14592,11 +15491,51 @@ impl SelectedResolutionOperation<'_, '_> {
         Ok(Some(JvmSourceMemberRows { rows, observation }))
     }
 
+    fn jvm_member_route_namespace(
+        &self,
+        language: Language,
+        route: &super::demand_closure::MemberRouteContext<'_, ()>,
+    ) -> ResolutionNamespace {
+        let rules = nominal_language_rules(language).expect("caller belongs to a nominal family");
+        if route.position == super::demand_closure::MemberRoutePosition::Segment {
+            rules.intermediate_member_namespace(route.namespace)
+        } else {
+            route.namespace
+        }
+    }
+
+    /// Whether a member-owner row answers this route's lookup: its kind and
+    /// spelling match, and a Scala value or callable route names an object,
+    /// never a class, through a nested type.
+    pub(super) fn jvm_member_row_selected(
+        &self,
+        language: Language,
+        route: &super::demand_closure::MemberRouteContext<'_, ()>,
+        lookup: &ResolutionLookupSemanticRecipe,
+        row: &crate::analyzer::resolution::LoweredMemberOwnerProperty,
+    ) -> Result<bool> {
+        let rules = nominal_language_rules(language).expect("caller belongs to a nominal family");
+        let namespace = self.jvm_member_route_namespace(language, route);
+        if !jvm_member_kind_matches(language, namespace, row.kind())
+            || !jvm_member_name_matches(language, row.member_name(), lookup.spelling())
+        {
+            return Ok(false);
+        }
+        Ok(!(rules.has_singleton_import_values()
+            && matches!(
+                namespace,
+                ResolutionNamespace::Value | ResolutionNamespace::Callable
+            )
+            && row.kind() == ResolutionMemberKind::NestedType
+            && !self.jvm_scala_object_definition(row.definition())?))
+    }
+
     pub(super) fn jvm_source_member_target(
         &self,
         source: &super::demand_closure::SourceHalf,
         reader: &JvmSourceReaderContext,
         route: &super::demand_closure::MemberRouteContext<'_, ()>,
+        lookup: &ResolutionLookupSemanticRecipe,
         row: &crate::analyzer::resolution::LoweredMemberOwnerProperty,
         cancellation: &CancellationToken,
     ) -> Result<super::demand_closure::Read<Option<super::demand_closure::SelectedMemberRouteTarget>>>
@@ -14604,29 +15543,12 @@ impl SelectedResolutionOperation<'_, '_> {
         use super::demand_closure::{
             BridgeMaterial, Read, RouteLocation, SelectedMemberRouteTarget, SelectedMemberTarget,
         };
-        let lookup = route.lookup;
         let completion = &route.selection.completion;
         let language = reader.language;
         let rules = nominal_language_rules(language).expect("caller belongs to a nominal family");
         let family = rules.family();
-        let namespace = if route.position == super::demand_closure::MemberRoutePosition::Segment {
-            rules.intermediate_member_namespace(route.namespace)
-        } else {
-            route.namespace
-        };
-        if !jvm_member_kind_matches(language, namespace, row.kind())
-            || !jvm_member_name_matches(language, row.member_name(), lookup.spelling())
-        {
-            return Ok(Read::ready(None));
-        }
-        if rules.has_singleton_import_values()
-            && matches!(
-                namespace,
-                ResolutionNamespace::Value | ResolutionNamespace::Callable
-            )
-            && row.kind() == ResolutionMemberKind::NestedType
-            && !self.jvm_scala_object_definition(row.definition())?
-        {
+        let namespace = self.jvm_member_route_namespace(language, route);
+        if !self.jvm_member_row_selected(language, route, lookup, row)? {
             return Ok(Read::ready(None));
         }
         let definition = row.definition();
@@ -14654,11 +15576,10 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .inventory
             .connection()
-            .query_row(
+            .prepare_cached(
                 "SELECT content_package FROM main.blob_meta WHERE blob_id=?1 AND is_complete=1",
-                [target_record.blob_id()],
-                |row| row.get(0),
-            )
+            )?
+            .query_row([target_record.blob_id()], |row| row.get(0))
             .optional()?
             .flatten();
         let mut relation = JvmDeclarationAccessContext::between(
@@ -14892,21 +15813,26 @@ impl SelectedResolutionOperation<'_, '_> {
             .model_authority()
             .as_ref()
             .and_then(|authority| authority.active_models())
-            .is_some_and(|models| {
-                models.shards().iter().any(|shard| {
-                    shard.manifest.ecosystem == "jdk"
-                        && shard.extraction().is_some_and(|extraction| {
-                            matches!(
-                                extraction.kind,
-                                crate::analyzer::semantic_model::ArtifactExtractionKind::JdkSourceZip
-                                    | crate::analyzer::semantic_model::ArtifactExtractionKind::JdkJmodSet
-                            )
-                        })
-                        && shard.descriptor.payload_kind
-                            == crate::analyzer::semantic_model::PayloadKind::DeclarationFacts
-                })
-            })
+            .is_some_and(|models| jdk_declaration_extraction_selected(&models))
     }
+}
+
+/// Whether selected declaration facts include an extraction-backed JDK inventory.
+pub fn jdk_declaration_extraction_selected(
+    models: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+) -> bool {
+    models.shards().iter().any(|shard| {
+        shard.manifest.ecosystem == "jdk"
+            && shard.extraction().is_some_and(|extraction| {
+                matches!(
+                    extraction.kind,
+                    crate::analyzer::semantic_model::ArtifactExtractionKind::JdkSourceZip
+                        | crate::analyzer::semantic_model::ArtifactExtractionKind::JdkJmodSet
+                )
+            })
+            && shard.descriptor.payload_kind
+                == crate::analyzer::semantic_model::PayloadKind::DeclarationFacts
+    })
 }
 
 pub(super) fn classify_jvm_package(
@@ -15457,6 +16383,294 @@ pub(in crate::analyzer) fn jvm_lexical_import_head_origin(
     nominal_language_rules(language)
         .expect("caller belongs to a nominal family")
         .lexical_import_head_origin()
+}
+
+#[cfg(test)]
+mod inherited_decision_tests {
+    use super::*;
+
+    #[test]
+    fn language_hook_preserves_only_proved_local_dominance() {
+        for language in [Language::Kotlin, Language::Scala] {
+            assert!(!jvm_inherited_competes(
+                language,
+                LexicalTypeLevel::Local,
+                0
+            ));
+            for lexical in [
+                LexicalTypeLevel::Declared(0),
+                LexicalTypeLevel::Outside(0),
+                LexicalTypeLevel::Unit,
+            ] {
+                assert!(jvm_inherited_competes(language, lexical, 0));
+            }
+        }
+        assert!(!jvm_inherited_competes(
+            Language::Java,
+            LexicalTypeLevel::Declared(0),
+            0
+        ));
+        assert!(jvm_inherited_competes(
+            Language::Java,
+            LexicalTypeLevel::Outside(0),
+            0
+        ));
+    }
+
+    fn closed(candidates: Vec<JvmTypeNameAlternative>) -> TierContributor<JvmTypeNameAlternative> {
+        TierContributor {
+            candidates,
+            closure: ContributorClosure::Closed(TierReceipt {
+                selected_read: "selected-test-facts",
+            }),
+        }
+    }
+
+    fn tier(
+        rank: u32,
+        candidates: Vec<JvmTypeNameAlternative>,
+    ) -> TierInput<JvmTypeNameAlternative> {
+        TierInput {
+            rank,
+            contributors: vec![closed(candidates)],
+        }
+    }
+
+    fn decision(
+        tiers: Vec<TierInput<JvmTypeNameAlternative>>,
+        lower: JvmOnDemandTypeChoice,
+        inherited: bool,
+    ) -> JvmSimpleTypeNameDecision {
+        let open_rank = inherited
+            .then(|| {
+                tiers
+                    .iter()
+                    .filter(|tier| {
+                        tier.contributors
+                            .iter()
+                            .any(|c| matches!(c.closure, ContributorClosure::Open))
+                    })
+                    .map(|tier| tier.rank)
+                    .min()
+            })
+            .flatten();
+        JvmSimpleTypeNameDecision::from_tiers(
+            SemanticId::for_test("name"),
+            tiers,
+            20,
+            JvmOnDemandObservation::searched(lower),
+            inherited,
+            open_rank,
+        )
+    }
+
+    fn intrinsic(name: &str) -> JvmOnDemandTypeChoice {
+        JvmOnDemandTypeChoice::Intrinsic(JvmOnDemandType {
+            declared: JvmDeclaredType {
+                fqn: name.to_owned(),
+                owner: None,
+                indexed: false,
+            },
+            precedence: super::super::jvm_demand::JvmBindingPrecedence { rank: 0, depth: 0 },
+            package: "java.lang".to_owned(),
+            source: None,
+        })
+    }
+
+    #[test]
+    fn unsearched_on_demand_does_not_open_closed_inheritance() {
+        let observed = JvmOnDemandObservation {
+            unsearched: true,
+            ..JvmOnDemandObservation::searched(JvmOnDemandTypeChoice::Unavailable)
+        };
+        let closed = JvmSimpleTypeNameDecision::from_tiers(
+            SemanticId::for_test("name"),
+            vec![jvm_inherited_tier(1, InheritedTierWitness::Absent)],
+            20,
+            observed,
+            true,
+            None,
+        );
+        assert!(matches!(closed.decision, TierDecision::Open { .. }));
+        assert_eq!(closed.inherited_lexical_gap(), None);
+
+        let open = JvmSimpleTypeNameDecision::from_tiers(
+            SemanticId::for_test("name"),
+            vec![jvm_inherited_tier(
+                1,
+                InheritedTierWitness::Open {
+                    frontier: Vec::new(),
+                    reasons: vec!["unresolved-supertype"],
+                },
+            )],
+            20,
+            JvmOnDemandObservation {
+                unsearched: true,
+                ..JvmOnDemandObservation::searched(JvmOnDemandTypeChoice::Unavailable)
+            },
+            true,
+            Some(1),
+        );
+        assert_eq!(
+            open.inherited_lexical_gap(),
+            Some("jvm-inherited-member-type-open")
+        );
+    }
+
+    #[test]
+    fn open_inheritance_makes_default_import_possible() {
+        let inherited = jvm_inherited_tier(
+            1,
+            InheritedTierWitness::Open {
+                frontier: Vec::new(),
+                reasons: vec!["unresolved-supertype"],
+            },
+        );
+        let answer = decision(
+            vec![tier(0, Vec::new()), inherited],
+            intrinsic("java.lang.Exception"),
+            true,
+        );
+        assert!(matches!(answer.decision, TierDecision::Open { .. }));
+        assert!(matches!(
+            answer.on_demand_choice(),
+            JvmOnDemandTypeChoice::Possible(_)
+        ));
+        let legacy = decision(
+            vec![tier(0, Vec::new())],
+            intrinsic("java.lang.Exception"),
+            false,
+        );
+        assert!(matches!(
+            legacy.on_demand_choice(),
+            JvmOnDemandTypeChoice::Intrinsic(_)
+        ));
+    }
+
+    #[test]
+    fn inherited_member_precedes_import_and_outer_lexical_type() {
+        let member = SemanticId::for_test("Base.T");
+        let outer = SemanticId::for_test("Outer.T");
+        let imported = SemanticId::for_test("import T");
+        let inherited = jvm_inherited_tier(2, InheritedTierWitness::Proven(vec![member]));
+        let lower = vec![
+            tier(0, Vec::new()),
+            inherited,
+            tier(3, vec![JvmTypeNameAlternative::PlacedLexical(outer)]),
+            tier(4, vec![JvmTypeNameAlternative::ExplicitImport(imported)]),
+        ];
+        let answer = decision(lower, intrinsic("java.lang.T"), true);
+        assert!(
+            matches!(answer.decision, TierDecision::Unique { selected: JvmTypeNameAlternative::InheritedMember(id), .. } if id == member)
+        );
+        assert_eq!(
+            answer.inherited_lexical_gap(),
+            Some("jvm-inherited-member-type-competing")
+        );
+        assert!(matches!(
+            answer.on_demand_choice(),
+            JvmOnDemandTypeChoice::Unavailable
+        ));
+
+        let absent = decision(
+            vec![
+                tier(3, vec![JvmTypeNameAlternative::PlacedLexical(outer)]),
+                jvm_inherited_tier(2, InheritedTierWitness::Absent),
+            ],
+            JvmOnDemandTypeChoice::Unavailable,
+            true,
+        );
+        assert!(
+            matches!(absent.decision, TierDecision::Unique { selected: JvmTypeNameAlternative::PlacedLexical(id), .. } if id == outer)
+        );
+        let open = decision(
+            vec![
+                tier(3, vec![JvmTypeNameAlternative::PlacedLexical(outer)]),
+                jvm_inherited_tier(
+                    2,
+                    InheritedTierWitness::Open {
+                        frontier: Vec::new(),
+                        reasons: vec!["unresolved-supertype"],
+                    },
+                ),
+            ],
+            JvmOnDemandTypeChoice::Unavailable,
+            true,
+        );
+        assert!(matches!(open.decision, TierDecision::Open { .. }));
+        assert_eq!(
+            open.inherited_lexical_gap(),
+            Some("jvm-inherited-member-type-open")
+        );
+    }
+
+    /// JLS 7.5.1 ignores a unit's single-type import of a type it declares,
+    /// and an import token does not identify its declaration, so the tier
+    /// builder leaves that import contributor open and the unit tier is
+    /// undecided. Two closed identities in one tier still conflict.
+    #[test]
+    fn a_same_unit_type_and_its_import_stay_open_and_distinct_identities_conflict() {
+        let local = SemanticId::for_test("local T");
+        let imported = SemanticId::for_test("import T");
+        let self_import = decision(
+            vec![TierInput {
+                rank: 4,
+                contributors: vec![
+                    closed(vec![JvmTypeNameAlternative::PlacedLexical(local)]),
+                    TierContributor {
+                        candidates: vec![JvmTypeNameAlternative::ExplicitImport(imported)],
+                        closure: ContributorClosure::Open,
+                    },
+                ],
+            }],
+            JvmOnDemandTypeChoice::Unavailable,
+            true,
+        );
+        assert!(matches!(self_import.decision, TierDecision::Open { .. }));
+        let conflict = decision(
+            vec![tier(
+                4,
+                vec![
+                    JvmTypeNameAlternative::PlacedLexical(local),
+                    JvmTypeNameAlternative::ExplicitImport(imported),
+                ],
+            )],
+            JvmOnDemandTypeChoice::Unavailable,
+            true,
+        );
+        assert!(
+            matches!(conflict.decision, TierDecision::Ambiguous { ref candidates, .. } if candidates.len() == 2)
+        );
+    }
+
+    #[test]
+    fn inherited_member_precedes_class_type_parameter() {
+        let member = SemanticId::for_test("Base.T");
+        let parameter = SemanticId::for_test("C.T");
+        let parameter_tier = tier(3, vec![JvmTypeNameAlternative::PlacedLexical(parameter)]);
+        let answer = decision(
+            vec![
+                jvm_inherited_tier(2, InheritedTierWitness::Proven(vec![member])),
+                parameter_tier.clone(),
+            ],
+            JvmOnDemandTypeChoice::Unavailable,
+            true,
+        );
+        assert!(
+            matches!(answer.decision, TierDecision::Unique { selected: JvmTypeNameAlternative::InheritedMember(id), .. } if id == member)
+        );
+        let absent = decision(
+            vec![
+                jvm_inherited_tier(2, InheritedTierWitness::Absent),
+                parameter_tier,
+            ],
+            JvmOnDemandTypeChoice::Unavailable,
+            true,
+        );
+        assert!(
+            matches!(absent.decision, TierDecision::Unique { selected: JvmTypeNameAlternative::PlacedLexical(id), .. } if id == parameter)
+        );
+    }
 }
 
 #[cfg(test)]

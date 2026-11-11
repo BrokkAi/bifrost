@@ -9,26 +9,146 @@
 //! statements to the tables and indexes they touch.
 //!
 //! The instrument is off unless `BIFROST_SQL_PROFILE` names an output file. The
-//! variable is read once per process; with it unset, [`install`] installs no
-//! hook and a connection behaves exactly as it did before this module existed.
+//! variable is read once per process; with it unset, the profile collector
+//! stays off while the statement-start attribution guard remains installed.
 //!
-//! The rusqlite callback is a plain function pointer with no context argument,
-//! so the aggregate is process-global behind one mutex and the connection's
-//! role is baked into the function pointer by [`callback_for`]. One process is
-//! one workload: the runner names the output file, and nothing here tags a
-//! route.
+//! One callback per connection dispatches attribution, profiling and listeners.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, c_void};
 use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
-use rusqlite::trace::{TraceEvent, TraceEventCodes};
-use rusqlite::{Connection, StatementStatus};
+use crate::attribution::ConnectionTag;
+use rusqlite::{Connection, ffi};
+
+#[cfg(test)]
+thread_local! { static ROW_DISPATCHES: Cell<usize> = const { Cell::new(0) }; }
+
+type Listener = Arc<dyn for<'a> Fn(ListenerEvent<'a>) + Send + Sync>;
+#[derive(Clone, Copy)]
+pub enum ListenerEvent<'a> {
+    Statement {
+        statement: usize,
+        sql: Option<&'a str>,
+    },
+    Row {
+        statement: usize,
+        sql: Option<&'a str>,
+    },
+    Profile {
+        statement: usize,
+        sql: Option<&'a str>,
+        elapsed: Duration,
+    },
+}
+struct TraceContext {
+    tag: ConnectionTag,
+    /// A `ConnectionRole` discriminant. Atomic because a reinstall on the
+    /// owning thread updates it while a `ListenerGuard` on another thread may
+    /// hold a shared reference to this context.
+    role: std::sync::atomic::AtomicU8,
+    db: *mut ffi::sqlite3,
+    profiling: bool,
+    listeners: Mutex<HashMap<u64, Listener>>,
+    next_listener: std::sync::atomic::AtomicU64,
+}
+// A live registry entry always names a live connection: CLOSE removes it before
+// SQLite frees that handle, so reuse of a sqlite3 address cannot match an old tag.
+static TAGS: OnceLock<Mutex<HashMap<usize, ConnectionTag>>> = OnceLock::new();
+fn tags() -> &'static Mutex<HashMap<usize, ConnectionTag>> {
+    TAGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+pub fn connection_tag(conn: &Connection) -> Option<ConnectionTag> {
+    // SAFETY: a borrowed Connection keeps its sqlite3 handle live.
+    tags()
+        .lock()
+        .expect("tag registry poisoned")
+        .get(&(unsafe { conn.handle() } as usize))
+        .copied()
+}
+pub struct ListenerGuard {
+    tag: ConnectionTag,
+    id: u64,
+}
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        // SAFETY: CLOSE removes the context under this same registry lock
+        // before freeing it. A concurrent drop either precedes that free or
+        // sees no context. Tags are never reused.
+        let registry = contexts().lock().expect("contexts poisoned");
+        if let Some(&ptr) = registry.get(&self.tag) {
+            unsafe { &*(ptr as *const TraceContext) }
+                .listeners
+                .lock()
+                .expect("listeners poisoned")
+                .remove(&self.id);
+        }
+    }
+}
+/// Every event: a connection with a listener, or under the SQL profile.
+const TRACE_ALL: u32 = ffi::SQLITE_TRACE_STMT
+    | ffi::SQLITE_TRACE_CLOSE
+    | ffi::SQLITE_TRACE_ROW
+    | ffi::SQLITE_TRACE_PROFILE;
+/// Attribution needs STMT and CLOSE only; the profile needs every event.
+fn trace_mask(profiling: bool) -> u32 {
+    if profiling {
+        TRACE_ALL
+    } else {
+        ffi::SQLITE_TRACE_STMT | ffi::SQLITE_TRACE_CLOSE
+    }
+}
+/// Once attached, a connection retains ROW and PROFILE callbacks until CLOSE.
+/// Only test and measurement code attaches listeners, so this callback cost is accepted.
+pub fn attach_listener(conn: &Connection, listener: Listener) -> ListenerGuard {
+    // SAFETY: the registry is populated only by install and removed on a
+    // successful CLOSE; Connection borrows the handle for the guard lifetime.
+    unsafe {
+        let db = conn.handle();
+        if !tags()
+            .lock()
+            .expect("tag registry poisoned")
+            .contains_key(&(db as usize))
+        {
+            install(conn, ConnectionRole::Ephemeral);
+        }
+        let tag = tags().lock().expect("tag registry poisoned")[&(db as usize)];
+        let ptr = contexts().lock().expect("contexts poisoned")[&tag] as *mut TraceContext;
+        let context = &*ptr;
+        let id = context
+            .next_listener
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut listeners = context.listeners.lock().expect("listeners poisoned");
+        listeners.insert(id, listener);
+        ffi::sqlite3_trace_v2(db, TRACE_ALL, Some(trace_callback), ptr.cast());
+        ListenerGuard { tag, id }
+    }
+}
+type CloseHooks = Mutex<Vec<fn(ConnectionTag)>>;
+static CLOSE_HOOKS: OnceLock<CloseHooks> = OnceLock::new();
+fn close_hooks() -> &'static CloseHooks {
+    CLOSE_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+pub fn on_connection_close(hook: fn(ConnectionTag)) {
+    let mut hooks = close_hooks().lock().expect("close hooks poisoned");
+    if !hooks
+        .iter()
+        .any(|existing| std::ptr::fn_addr_eq(*existing, hook))
+    {
+        hooks.push(hook);
+    }
+}
+static CONTEXTS: OnceLock<Mutex<HashMap<ConnectionTag, usize>>> = OnceLock::new();
+fn contexts() -> &'static Mutex<HashMap<ConnectionTag, usize>> {
+    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Names the JSON-lines dump file. Unset means no instrument at all.
 pub const PROFILE_PATH_ENV: &str = "BIFROST_SQL_PROFILE";
@@ -250,10 +370,6 @@ impl ConnectionRole {
         Self::Cleanup,
         Self::Ephemeral,
     ];
-
-    const fn from_index(index: u8) -> Self {
-        Self::ALL[index as usize]
-    }
 
     fn as_str(self) -> &'static str {
         match self {
@@ -507,108 +623,288 @@ pub fn install_catalog_active(conn: &Connection) {
     install(conn, ConnectionRole::Reader);
 }
 
-/// Install the profile hook on one analyzer-store connection.
-///
-/// Called from the single opener in `cache_db`, so no connection can be missed.
-pub(crate) fn install(conn: &Connection, role: ConnectionRole) {
-    if profile().is_none() {
-        return;
-    }
-    static FLUSHER: Once = Once::new();
-    FLUSHER.call_once(|| {
-        let spawned = std::thread::Builder::new()
-            .name("bifrost-sql-profile".to_string())
-            .spawn(|| {
-                loop {
-                    std::thread::sleep(FLUSH_INTERVAL);
-                    flush();
-                }
-            });
-        if let Err(error) = spawned {
-            eprintln!("Bifrost SQL profile has no background writer: {error}");
+type TestStatementObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+thread_local! {
+    static TEST_SUBSCRIBERS: RefCell<Vec<(usize, TestStatementObserver)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_SUBSCRIBER: Cell<usize> = const { Cell::new(0) };
+}
+
+fn notify_test_subscribers(sql: &str) {
+    TEST_SUBSCRIBERS.with(|subscribers| {
+        for (_, subscriber) in subscribers.borrow().iter() {
+            subscriber(sql);
         }
     });
-    conn.trace_v2(
-        TraceEventCodes::SQLITE_TRACE_STMT
-            | TraceEventCodes::SQLITE_TRACE_PROFILE
-            | TraceEventCodes::SQLITE_TRACE_ROW
-            | TraceEventCodes::SQLITE_TRACE_CLOSE,
-        Some(callback_for(role)),
-    );
 }
 
-/// A function pointer that carries the role, because the SQLite callback takes
-/// none.
-fn callback_for(role: ConnectionRole) -> fn(TraceEvent<'_>) {
-    match role {
-        ConnectionRole::Writer => on_event::<{ ConnectionRole::Writer as u8 }>,
-        ConnectionRole::Reader => on_event::<{ ConnectionRole::Reader as u8 }>,
-        ConnectionRole::SessionReader => on_event::<{ ConnectionRole::SessionReader as u8 }>,
-        ConnectionRole::StreamingReader => on_event::<{ ConnectionRole::StreamingReader as u8 }>,
-        ConnectionRole::UpgradeSource => on_event::<{ ConnectionRole::UpgradeSource as u8 }>,
-        ConnectionRole::UpgradeTarget => on_event::<{ ConnectionRole::UpgradeTarget as u8 }>,
-        ConnectionRole::VersionProbe => on_event::<{ ConnectionRole::VersionProbe as u8 }>,
-        ConnectionRole::Cleanup => on_event::<{ ConnectionRole::Cleanup as u8 }>,
-        ConnectionRole::Ephemeral => on_event::<{ ConnectionRole::Ephemeral as u8 }>,
+/// A thread-local test observer. The connection's permanent trace hook remains installed.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestStatementSubscription {
+    id: usize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn subscribe_test_statements(
+    _conn: &Connection,
+    subscriber: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
+) -> TestStatementSubscription {
+    let id = NEXT_SUBSCRIBER.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        id
+    });
+    TEST_SUBSCRIBERS.with(|subscribers| subscribers.borrow_mut().push((id, subscriber)));
+    TestStatementSubscription { id }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestStatementSubscription {
+    fn drop(&mut self) {
+        TEST_SUBSCRIBERS
+            .with(|subscribers| subscribers.borrow_mut().retain(|(id, _)| *id != self.id));
     }
 }
 
-fn on_event<const ROLE: u8>(event: TraceEvent<'_>) {
-    match event {
-        TraceEvent::Stmt(statement, _) => {
-            let role = ConnectionRole::from_index(ROLE);
-            let active = ActiveStatement {
-                role,
-                sql: statement.sql().into_owned(),
-                keys: LOGICAL_KEY_COUNT.with(Cell::get),
-                rows: 0,
-            };
-            ACTIVE_STATEMENTS.with(|current| current.borrow_mut().push(active));
+/// Install the statement dispatcher on one analyzer-store connection.
+/// The profile collector is attached only when configured.
+pub(crate) fn install(conn: &Connection, role: ConnectionRole) {
+    let profiling = profile().is_some();
+    static FLUSHER: Once = Once::new();
+    if profiling {
+        FLUSHER.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("bifrost-sql-profile".to_string())
+                .spawn(|| {
+                    loop {
+                        std::thread::sleep(FLUSH_INTERVAL);
+                        flush();
+                    }
+                });
+            if let Err(error) = spawned {
+                eprintln!("Bifrost SQL profile has no background writer: {error}");
+            }
+        });
+    }
+    // SAFETY: Connection owns db; SQLite calls CLOSE before freeing it. A busy
+    // close keeps this context because sqlite3Close (sqlite3.c:188462,188481)
+    // traces before connectionIsBusy. sqlite3_next_stmt sees db->pVdbe;
+    // connectionIsBusy also checks online backups (sqlite3.c:188438), but
+    // rusqlite Backup borrows both connections and Bifrost's Connection::backup
+    // finishes before returning (cache_db.rs:1790). rusqlite uses sqlite3_close
+    // (inner_connection.rs:139-165) and Drop calls close (:412-417).
+    unsafe {
+        let db = conn.handle();
+        let existing_tag = tags()
+            .lock()
+            .expect("tag registry poisoned")
+            .get(&(db as usize))
+            .copied();
+        if let Some(tag) = existing_tag {
+            let existing = contexts().lock().expect("contexts poisoned")[&tag];
+            // Catalog readers reopen the role on the same connection after
+            // db::open. The borrowed Connection excludes concurrent use.
+            (*(existing as *const TraceContext))
+                .role
+                .store(role as u8, std::sync::atomic::Ordering::Relaxed);
+            return;
         }
-        TraceEvent::Row(statement) => {
-            let role = ConnectionRole::from_index(ROLE);
-            ACTIVE_STATEMENTS.with(|current| {
-                if let Some(active) = current.borrow_mut().last_mut() {
-                    active.rows += 1;
+        let context = Box::into_raw(Box::new(TraceContext {
+            tag: ConnectionTag::next(),
+            role: std::sync::atomic::AtomicU8::new(role as u8),
+            db,
+            profiling,
+            listeners: Mutex::new(HashMap::new()),
+            next_listener: std::sync::atomic::AtomicU64::new(1),
+        }));
+        tags()
+            .lock()
+            .expect("tag registry poisoned")
+            .insert(db as usize, (*context).tag);
+        contexts()
+            .lock()
+            .expect("contexts poisoned")
+            .insert((*context).tag, context as usize);
+        ffi::sqlite3_trace_v2(
+            db,
+            trace_mask(profiling),
+            Some(trace_callback),
+            context.cast(),
+        );
+    }
+}
+// SAFETY: SQLite supplies a live TraceContext pointer installed above; stmt
+// pointers are valid for this callback. On CLOSE, free only when no statements
+// remain, because sqlite3Close reports CLOSE before a possible SQLITE_BUSY.
+unsafe extern "C" fn trace_callback(
+    code: u32,
+    raw: *mut c_void,
+    p: *mut c_void,
+    x: *mut c_void,
+) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let context = &*(raw as *mut TraceContext);
+        if code == ffi::SQLITE_TRACE_CLOSE {
+            if ffi::sqlite3_next_stmt(context.db, std::ptr::null_mut()).is_null() {
+                // Hold the registry lock through free so a guard on another
+                // thread cannot dereference this context after CLOSE.
+                let mut registry = contexts().lock().expect("contexts poisoned");
+                registry.remove(&context.tag);
+                tags()
+                    .lock()
+                    .expect("tag registry poisoned")
+                    .remove(&(context.db as usize));
+                if context.profiling {
+                    flush();
                 }
-            });
-            record_decoded_row(role, statement.sql().as_ref());
+                let tag = context.tag;
+                drop(Box::from_raw(raw as *mut TraceContext));
+                drop(registry);
+                let hooks = close_hooks().lock().expect("close hooks poisoned").clone();
+                for hook in hooks {
+                    hook(tag);
+                }
+            }
+            return ffi::SQLITE_OK;
         }
-        TraceEvent::Profile(statement, elapsed) => {
-            let role = ConnectionRole::from_index(ROLE);
-            let sql = statement.sql();
-            let (keys, rows) = ACTIVE_STATEMENTS.with(|current| {
-                let mut active = current.borrow_mut();
-                active
-                    .iter()
-                    .rposition(|entry| entry.role == role && entry.sql == sql.as_ref())
-                    .map(|index| active.remove(index))
-                    .map_or((None, 0), |entry| (entry.keys, entry.rows))
-            });
-            let expanded = statement.expanded_sql();
-            record(
-                role,
-                sql.as_ref(),
-                expanded.clone(),
-                elapsed,
-                statement.get_status(StatementStatus::Run),
-                statement.get_status(StatementStatus::RePrepare),
-                rows,
-            );
-            if let Some(profile) = profile() {
-                profile.record_request_statement(
-                    role,
-                    sql.as_ref(),
-                    expanded.as_deref(),
-                    elapsed,
-                    keys,
-                    rows,
-                );
+        let stmt = p as *mut ffi::sqlite3_stmt;
+        let sql_ptr = ffi::sqlite3_sql(stmt);
+        let sql = (!sql_ptr.is_null()).then(|| CStr::from_ptr(sql_ptr).to_string_lossy());
+        let sql_text = sql.as_deref().unwrap_or("");
+        if code == ffi::SQLITE_TRACE_STMT {
+            // Attribution failing closed must not depend on the listeners below.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::attribution::statement_started(sql_text, context.tag)
+            }))
+            .is_err()
+            {
+                crate::attribution::statement_lost();
+            }
+            notify_test_subscribers(sql_text);
+        }
+        // A once-listened connection retains ROW and PROFILE callbacks for life.
+        // Skip dispatch when neither a listener nor profiling needs them.
+        if (code == ffi::SQLITE_TRACE_ROW || code == ffi::SQLITE_TRACE_PROFILE)
+            && !context.profiling
+            && context
+                .listeners
+                .lock()
+                .expect("listeners poisoned")
+                .is_empty()
+        {
+            return ffi::SQLITE_OK;
+        }
+        if code == ffi::SQLITE_TRACE_STMT
+            || code == ffi::SQLITE_TRACE_ROW
+            || code == ffi::SQLITE_TRACE_PROFILE
+        {
+            let event = match code {
+                ffi::SQLITE_TRACE_STMT => ListenerEvent::Statement {
+                    statement: stmt as usize,
+                    sql: (!x.is_null())
+                        .then(|| CStr::from_ptr(x.cast()).to_str().ok())
+                        .flatten(),
+                },
+                ffi::SQLITE_TRACE_ROW => ListenerEvent::Row {
+                    statement: stmt as usize,
+                    sql: sql.as_deref(),
+                },
+                _ => ListenerEvent::Profile {
+                    statement: stmt as usize,
+                    sql: sql.as_deref(),
+                    elapsed: Duration::from_nanos(*(x as *const u64)),
+                },
+            };
+            let listeners = context
+                .listeners
+                .lock()
+                .expect("listeners poisoned")
+                .values()
+                .map(Arc::clone)
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            if code == ffi::SQLITE_TRACE_ROW {
+                ROW_DISPATCHES.with(|count| count.set(count.get() + 1));
+            }
+            // A panicking listener loses only its own event; the others still
+            // see it. The panic hook has already reported the panic.
+            for listener in listeners {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(event)))
+                    .is_err()
+                {
+                    eprintln!("analyzer SQL listener panicked; its event was dropped");
+                }
             }
         }
-        TraceEvent::Close(_) => flush(),
-        _ => {}
+        if !context.profiling {
+            return ffi::SQLITE_OK;
+        }
+        let role = ConnectionRole::ALL
+            [usize::from(context.role.load(std::sync::atomic::Ordering::Relaxed))];
+        match code {
+            ffi::SQLITE_TRACE_STMT => {
+                let active = ActiveStatement {
+                    role,
+                    sql: sql_text.to_owned(),
+                    keys: LOGICAL_KEY_COUNT.with(Cell::get),
+                    rows: 0,
+                };
+                ACTIVE_STATEMENTS.with(|current| current.borrow_mut().push(active));
+            }
+            ffi::SQLITE_TRACE_ROW => {
+                ACTIVE_STATEMENTS.with(|current| {
+                    if let Some(active) = current.borrow_mut().last_mut() {
+                        active.rows += 1;
+                    }
+                });
+                record_decoded_row(role, sql_text);
+            }
+            ffi::SQLITE_TRACE_PROFILE => {
+                let elapsed = Duration::from_nanos(*(x as *const i64) as u64);
+                let (keys, rows) = ACTIVE_STATEMENTS.with(|current| {
+                    let mut active = current.borrow_mut();
+                    active
+                        .iter()
+                        .rposition(|entry| entry.role == role && entry.sql == sql_text)
+                        .map(|index| active.remove(index))
+                        .map_or((None, 0), |entry| (entry.keys, entry.rows))
+                });
+                let expanded_ptr = ffi::sqlite3_expanded_sql(stmt);
+                let expanded = if expanded_ptr.is_null() {
+                    None
+                } else {
+                    let value = CStr::from_ptr(expanded_ptr).to_string_lossy().into_owned();
+                    ffi::sqlite3_free(expanded_ptr.cast());
+                    Some(value)
+                };
+                record(
+                    role,
+                    sql_text,
+                    expanded.clone(),
+                    elapsed,
+                    ffi::sqlite3_stmt_status(stmt, ffi::SQLITE_STMTSTATUS_RUN, 0),
+                    ffi::sqlite3_stmt_status(stmt, ffi::SQLITE_STMTSTATUS_REPREPARE, 0),
+                    rows,
+                );
+                if let Some(profile) = profile() {
+                    profile.record_request_statement(
+                        role,
+                        sql_text,
+                        expanded.as_deref(),
+                        elapsed,
+                        keys,
+                        rows,
+                    );
+                }
+            }
+            _ => {}
+        }
+        ffi::SQLITE_OK
+    }));
+    if result.is_err() && code == ffi::SQLITE_TRACE_STMT {
+        crate::attribution::statement_lost();
     }
+    ffi::SQLITE_OK
 }
 
 fn record_decoded_row(role: ConnectionRole, sql: &str) {
@@ -876,7 +1172,242 @@ fn render(profile: &Profile) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::{self, AttributionFrame};
     use crate::cache_db::{cache_db_file_name, open_readonly_connection, open_unified_connection};
+    use brokk_bifrost_test_macros::hardwon;
+
+    struct Seen(Mutex<Vec<ConnectionTag>>);
+    impl AttributionFrame for Seen {
+        fn mark_unattributed(&self, _: &str, _: Option<&'static str>, tag: ConnectionTag) {
+            self.0.lock().unwrap().push(tag);
+        }
+    }
+
+    #[test]
+    #[hardwon("#9755: removing a temporary trace listener erased statement attribution")]
+    fn tags_and_listener_detach_preserve_attribution() {
+        let bare = Connection::open_in_memory().unwrap();
+        assert_eq!(connection_tag(&bare), None);
+        let first = Connection::open_in_memory().unwrap();
+        let second = Connection::open_in_memory().unwrap();
+        install(&first, ConnectionRole::Ephemeral);
+        install(&second, ConnectionRole::Ephemeral);
+        let first_tag = connection_tag(&first).unwrap();
+        let second_tag = connection_tag(&second).unwrap();
+        assert_ne!(first_tag, second_tag);
+        install(&first, ConnectionRole::Reader);
+        assert_eq!(connection_tag(&first), Some(first_tag));
+        let seen = Arc::new(Seen(Mutex::new(Vec::new())));
+        let _frame = attribution::enter_frame(seen.clone());
+        let events = Arc::new(Mutex::new(0));
+        let count = events.clone();
+        let listener = attach_listener(&first, Arc::new(move |_| *count.lock().unwrap() += 1));
+        first.execute_batch("SELECT 1").unwrap();
+        drop(listener);
+        let before = *events.lock().unwrap();
+        first.execute_batch("SELECT 2").unwrap();
+        assert_eq!(*events.lock().unwrap(), before);
+        assert_eq!(*seen.0.lock().unwrap(), [first_tag, first_tag]);
+        // SAFETY: the connection remains live until close returns.
+        let address = unsafe { first.handle() } as usize;
+        first.close().unwrap();
+        assert!(!tags().lock().unwrap().contains_key(&address));
+    }
+
+    #[test]
+    #[hardwon("#9755: a detached guard could remove a reused connection listener")]
+    fn guard_survives_close_and_detaches_while_connection_is_idle() {
+        let conn = Connection::open_in_memory().unwrap();
+        let first = attach_listener(&conn, Arc::new(|_| {}));
+        let hit = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture = Arc::clone(&hit);
+        let second = attach_listener(
+            &conn,
+            Arc::new(move |event| {
+                if matches!(event, ListenerEvent::Statement { .. }) {
+                    capture.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }),
+        );
+        // Simulate check-in: the guard owns only the tag while the connection
+        // waits in a pool, and detaching must not remove the second listener.
+        let mut pool = vec![conn];
+        drop(first);
+        let conn = pool.pop().unwrap();
+        conn.query_row("SELECT 1", [], |row| row.get::<_, i32>(0))
+            .unwrap();
+        assert_eq!(hit.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let before = ROW_DISPATCHES.with(Cell::get);
+        drop(second);
+        conn.query_row("SELECT 2", [], |row| row.get::<_, i32>(0))
+            .unwrap();
+        assert_eq!(ROW_DISPATCHES.with(Cell::get), before);
+        let after_close = attach_listener(&conn, Arc::new(|_| {}));
+        conn.close().unwrap();
+        drop(after_close);
+    }
+
+    #[test]
+    #[hardwon("#9755: a listener panic crossed SQLite's C callback")]
+    fn panicking_listener_does_not_abort_or_hide_the_event() {
+        let conn = Connection::open_in_memory().unwrap();
+        let lost = attribution::lost_statements();
+        let panics = attach_listener(
+            &conn,
+            Arc::new(|event| {
+                if matches!(event, ListenerEvent::Statement { .. }) {
+                    panic!("listener");
+                }
+            }),
+        );
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        let _second = attach_listener(
+            &conn,
+            Arc::new(move |event| {
+                if matches!(event, ListenerEvent::Statement { .. }) {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }),
+        );
+        conn.execute_batch("SELECT 1").unwrap();
+        // The other listener saw the statement, and attribution lost nothing.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(attribution::lost_statements(), lost);
+        drop(panics);
+        conn.execute_batch("SELECT 2").unwrap();
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    #[hardwon("#9755: a panic in attribution lost a statement without refusing its frame")]
+    fn panicking_attribution_observer_marks_the_frame_lost() {
+        struct Panics;
+        impl attribution::StatementObserver for Panics {
+            fn statement(&self, _: &str) {
+                panic!("observer");
+            }
+        }
+        struct Lost(std::sync::atomic::AtomicBool);
+        impl AttributionFrame for Lost {
+            fn mark_unattributed(&self, _: &str, _: Option<&'static str>, _: ConnectionTag) {}
+            fn mark_lost(&self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        install(&conn, ConnectionRole::Ephemeral);
+        let frame = Arc::new(Lost(std::sync::atomic::AtomicBool::new(false)));
+        let _frame = attribution::enter_frame(frame.clone());
+        let _observer = attribution::observe_statements(Arc::new(Panics));
+        conn.execute_batch("SELECT 1").unwrap();
+        assert!(frame.0.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    #[hardwon("#9755: trigger callbacks were reported as repeated outer statements")]
+    fn trigger_statement_listener_uses_event_sql() {
+        let conn = Connection::open_in_memory().unwrap();
+        install(&conn, ConnectionRole::Ephemeral);
+        conn.execute_batch(
+            "CREATE TABLE t(v); CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT v FROM t; END;",
+        )
+        .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _listener = attach_listener(
+            &conn,
+            Arc::new(move |event| {
+                if let ListenerEvent::Statement { sql: Some(sql), .. } = event {
+                    sink.lock().unwrap().push(sql.to_owned());
+                }
+            }),
+        );
+        let frame = Arc::new(Seen(Mutex::new(Vec::new())));
+        let _frame = attribution::enter_frame(frame.clone());
+        conn.execute_batch("INSERT INTO t VALUES (1)").unwrap();
+        let statements = seen.lock().unwrap();
+        assert!(
+            statements
+                .iter()
+                .any(|sql| sql == "INSERT INTO t VALUES (1)")
+        );
+        assert!(statements.iter().any(|sql| sql.starts_with("--")));
+        assert!(
+            frame
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|tag| *tag == connection_tag(&conn).unwrap())
+        );
+    }
+
+    #[test]
+    fn only_core_installs_sqlite_trace() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for base in ["crates", "tests"] {
+            let mut pending = vec![root.join(base)];
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        if path.file_name().unwrap() != "target" {
+                            pending.push(path);
+                        }
+                        continue;
+                    }
+                    if path.extension().is_none_or(|ext| ext != "rs")
+                        || path.ends_with("crates/bifrost-core/src/cache_db/sql_profile.rs")
+                    {
+                        continue;
+                    }
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for pattern in [
+                        "sqlite3_trace_v2",
+                        ".trace_v2(",
+                        ".trace(Some",
+                        ".profile(Some",
+                    ] {
+                        assert!(
+                            !source.contains(pattern),
+                            "{} contains {pattern}",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#9755: CLOSE trace before SQLITE_BUSY could discard a live connection tag")]
+    fn refused_close_keeps_tag_and_context() {
+        let conn = Connection::open_in_memory().unwrap();
+        install(&conn, ConnectionRole::Ephemeral);
+        let tag = connection_tag(&conn).unwrap();
+        let sql = c"SELECT 1";
+        let mut stmt = std::ptr::null_mut();
+        // SAFETY: conn is live; the raw statement is finalized before retrying close.
+        let address = unsafe {
+            let db = conn.handle();
+            assert_eq!(
+                ffi::sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, std::ptr::null_mut()),
+                ffi::SQLITE_OK
+            );
+            db as usize
+        };
+        let (conn, _) = conn
+            .close()
+            .expect_err("unfinalized statement must refuse close");
+        assert_eq!(connection_tag(&conn), Some(tag));
+        // SAFETY: stmt belongs to the still-live connection.
+        unsafe {
+            assert_eq!(ffi::sqlite3_finalize(stmt), ffi::SQLITE_OK);
+        }
+        conn.close().unwrap();
+        assert!(!tags().lock().unwrap().contains_key(&address));
+    }
 
     /// The hook exists or it does not: a connection opened while
     /// [`PROFILE_PATH_ENV`] is unset carries no hook for the rest of its life,
@@ -884,6 +1415,7 @@ mod tests {
     /// Both halves are asserted in one process because [`PROFILE`] is
     /// process-global and is written once.
     #[test]
+    #[hardwon("#10272: process-global SQL profile rows include independently opened connections")]
     fn profile_records_only_connections_opened_with_the_variable_set() {
         assert!(
             std::env::var_os(PROFILE_PATH_ENV).is_none(),
@@ -909,6 +1441,9 @@ mod tests {
         );
 
         let profiled = open_readonly_connection(&db).expect("reader for the profile test");
+        let independent = open_readonly_connection(&db).expect("independent profile reader");
+        // These are process-wide samples, so assert only the rows this test
+        // must contribute and allow other connections to add more.
         let (_, rows_before, _) = totals_with_rows().expect("profile totals before marker queries");
         for _ in 0..3 {
             let marker: i64 = profiled
@@ -916,6 +1451,10 @@ mod tests {
                 .expect("profiled marker");
             assert_eq!(marker, 1717);
         }
+        let independent_marker: i64 = independent
+            .query_row("SELECT 1919", [], |row| row.get(0))
+            .expect("independent profiled marker");
+        assert_eq!(independent_marker, 1919);
         for _ in 0..3 {
             let marker: i64 = profiled
                 .prepare_cached("SELECT 1818")
@@ -925,7 +1464,10 @@ mod tests {
             assert_eq!(marker, 1818);
         }
         let (_, rows_after, _) = totals_with_rows().expect("profile totals after marker queries");
-        assert_eq!(rows_after - rows_before, 6);
+        assert!(
+            rows_after - rows_before >= 7,
+            "the seven marker queries must contribute at least seven decoded rows: before={rows_before}, after={rows_after}"
+        );
         flush();
 
         let dump = std::fs::read_to_string(&dump_path).expect("profile dump");
@@ -978,6 +1520,12 @@ mod tests {
         assert_eq!(cached["reused_executions"], 2);
         assert_eq!(cached["max_statement_runs"], 3);
         assert_eq!(cached["max_statement_reprepares"], 0);
+        let independent_marker = statements
+            .iter()
+            .find(|line| line["sql"] == "SELECT 1919")
+            .expect("independent connection statement profile");
+        assert_eq!(independent_marker["executions"], 1);
+        assert_eq!(independent_marker["decoded_rows"], 1);
         assert_eq!(
             marker[0]["role"], "reader",
             "dump statements: {statements:?}"

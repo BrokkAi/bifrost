@@ -1,0 +1,91 @@
+{
+  "root": 0,
+  "crate_version": "1.0.0",
+  "includes_private": true,
+  "index": {
+    "0": {
+      "id": 0,
+      "crate_id": 0,
+      "name": "sqlx",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "module": {
+          "is_crate": true,
+          "items": [
+            1
+          ],
+          "is_stripped": false
+        }
+      }
+    },
+    "1": {
+      "id": 1,
+      "crate_id": 1,
+      "name": "query",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "function": {
+          "sig": {
+            "inputs": [],
+            "output": {
+              "primitive": "usize"
+            },
+            "is_c_variadic": false
+          },
+          "generics": {
+            "params": [],
+            "where_predicates": []
+          },
+          "header": {
+            "is_const": false,
+            "is_unsafe": false,
+            "is_async": false,
+            "abi": "Rust"
+          },
+          "has_body": true,
+          "default_unstable": null
+        }
+      }
+    }
+  },
+  "paths": {
+    "0": {
+      "crate_id": 0,
+      "path": [
+        "sqlx"
+      ],
+      "kind": "module"
+    },
+    "1": {
+      "crate_id": 1,
+      "path": [
+        "sqlx_core",
+        "query",
+        "query"
+      ],
+      "kind": "function"
+    }
+  },
+  "external_crates": {
+    "1": {
+      "name": "sqlx_core",
+      "html_root_url": null,
+      "path": "sqlx_core.rlib"
+    }
+  },
+  "format_version": 61,
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "target_features": []
+  }
+}

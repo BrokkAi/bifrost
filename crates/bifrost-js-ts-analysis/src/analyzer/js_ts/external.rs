@@ -3,6 +3,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::compiler;
 use brokk_bifrost_analysis::analyzer::semantic_model::{identity, producer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use semver::Version;
@@ -10,10 +11,16 @@ use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::path_normalization::is_canonical_spelling;
 
 use brokk_bifrost_semantic::analyzer::semantic::common::bounded_message;
 
 use brokk_bifrost_analysis::analyzer::dependency_support::BoundedReadError;
+use brokk_bifrost_analysis::analyzer::dependency_support::{
+    declare_external_discovery_reads_complete, refuse_external_discovery_reads,
+    report_external_discovery_read,
+};
+use brokk_bifrost_analysis::analyzer::semantic_model::ExternalDiscoveryRead;
 
 use brokk_bifrost_analysis::analyzer::dependency_support::failed_dependency_pack_production as dependency_failure;
 
@@ -155,7 +162,7 @@ use brokk_bifrost_js_ts::typescript::ts_is_global_internal_module as is_global_i
 pub const TYPESCRIPT_STDLIB_PACKAGE: &str = "typescript";
 pub const TYPESCRIPT_STDLIB_VERSION: &str = "7.0.2";
 /// The TypeScript library declaration pack the pinned package selects
-/// (`semantic-packs/typescript/typescript-*.json`).
+/// (authored in `BrokkAi/bifrost-packs`).
 pub const TYPESCRIPT_STDLIB_PACK_ID: &str = "bifrost.typescript-stdlib";
 const TYPESCRIPT_LIBRARY_ACTIVATION_DIAGNOSTIC: &str = "typescript.library.activation";
 
@@ -243,7 +250,7 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         if cancelled(cancellation) {
             return cancelled_outcome();
         }
-        if !lockfile.is_file() {
+        if !report_file_probe(&lockfile, config.max_lockfile_bytes) {
             if config
                 .lockfile_paths
                 .iter()
@@ -322,6 +329,7 @@ pub fn resolve_js_ts_semantic_pack_dependencies(
         }
     }
 
+    declare_external_discovery_reads_complete();
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     dependencies.dedup_by(|left, right| left.id == right.id);
     // Every diagnostic below is mapped to error severity, so the truncated
@@ -1075,6 +1083,9 @@ schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
                 carried_sources: carried_source_paths(&shards),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards,
             }),
             completeness,
@@ -2033,6 +2044,8 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         self.type_index_by_name
             .insert(name.to_owned(), self.types.len());
         self.types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -2610,6 +2623,7 @@ fn js_ts_dependency_production_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "exact local npm declaration dependency".to_owned(),
             revision: dependency
                 .evidence
@@ -2656,6 +2670,7 @@ fn typescript_library_production_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "official TypeScript npm package".to_owned(),
             revision: Some(TYPESCRIPT_STDLIB_VERSION.to_owned()),
         },
@@ -2711,6 +2726,9 @@ fn resolve_locked_package(
             format!("installed package directory is unavailable: {error}"),
         )
     })?;
+    if !is_canonical_spelling(&package_path, &canonical_package) {
+        refuse_external_discovery_reads();
+    }
     if !approved_roots
         .iter()
         .any(|approved| canonical_package.starts_with(approved))
@@ -2780,6 +2798,9 @@ fn resolve_locked_package(
             &config_path,
             lockfile.parent().unwrap_or_else(|| Path::new(".")),
         );
+        // The core config resolver follows extends and probes paths internally.
+        // Its reads have no external discovery recorder here.
+        refuse_external_discovery_reads();
         if !activation.selection.is_complete() || activation.evidence.is_empty() {
             return Err(failure(
                 TYPESCRIPT_LIBRARY_ACTIVATION_DIAGNOSTIC,
@@ -2942,7 +2963,7 @@ fn declaration_entries(
     }
     if entries.is_empty() {
         let conventional = PathBuf::from("index.d.ts");
-        if package_root.join(&conventional).is_file() {
+        if report_file_probe(&package_root.join(&conventional), 1024 * 1024) {
             entries.push(DeclarationEntry {
                 module: imported_name,
                 relative_path: conventional,
@@ -2963,7 +2984,10 @@ fn declaration_entries(
                 entry.relative_path.display()
             )
         })?;
-        if !canonical.starts_with(package_root) || !canonical.is_file() {
+        if !is_canonical_spelling(&path, &canonical) {
+            refuse_external_discovery_reads();
+        }
+        if !canonical.starts_with(package_root) || !report_file_probe(&canonical, 1024 * 1024) {
             return Err(format!(
                 "declaration entry {} escapes the installed package",
                 entry.relative_path.display()
@@ -3117,7 +3141,13 @@ fn approved_package_roots(config: &JsTsDependencyDiscoveryConfig, root: &Path) -
     };
     candidates
         .into_iter()
-        .filter_map(|path| path.canonicalize().ok())
+        .filter_map(|path| {
+            let canonical = path.canonicalize().ok()?;
+            if canonical != path {
+                refuse_external_discovery_reads();
+            }
+            Some(canonical)
+        })
         .collect()
 }
 
@@ -3159,8 +3189,35 @@ fn read_json_bounded(path: &Path, max_bytes: u64) -> Result<Value, String> {
             format!("JSON metadata exceeds configured limit {max_bytes}")
         }
     })?;
+    report_external_discovery_read(ExternalDiscoveryRead::file(path, &bytes));
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("could not parse JSON metadata: {error}"))
+}
+
+fn report_file_probe(path: &Path, max_bytes: u64) -> bool {
+    if !path.is_file() {
+        if !path.exists() {
+            report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                absolute_path: path.to_path_buf(),
+            });
+        } else {
+            refuse_external_discovery_reads();
+        }
+        return false;
+    }
+    let bytes = File::open(path).and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    match bytes {
+        Ok(bytes) if bytes.len() as u64 <= max_bytes => {
+            report_external_discovery_read(ExternalDiscoveryRead::file(path, &bytes));
+        }
+        _ => refuse_external_discovery_reads(),
+    }
+    true
 }
 
 fn slash_path(path: &Path) -> String {
@@ -3222,10 +3279,63 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
 mod producer_tests {
 
     use crate::analyzer::js_ts::external::*;
+    use brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads;
+    use brokk_bifrost_core::analyzer::model::Language;
+    use brokk_bifrost_core::analyzer::project::TestProject;
 
     use compiler::compile_pack;
 
     use producer::read_exact_source_set;
+
+    #[test]
+    fn npm_lock_change_or_optional_lock_appearance_invalidates_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let lock = root.join("package-lock.json");
+        std::fs::write(&lock, r#"{"lockfileVersion":3,"packages":{}}"#).unwrap();
+        let project = TestProject::new(root, Language::TypeScript);
+        let config = JsTsDependencyDiscoveryConfig::default();
+        let discover = || {
+            resolve_js_ts_semantic_pack_dependencies(
+                &config,
+                &project,
+                &DependencyPackLimits::default(),
+                None,
+            )
+        };
+        let (outcome, reads) = capture_external_discovery_reads(discover);
+        assert!(outcome.complete, "{:?}", outcome.diagnostics);
+        assert!(reads.complete);
+        assert_eq!(reads.keys.len(), 3);
+        assert!(reads.keys.iter().all(|key| key.still_matches()));
+        std::fs::write(
+            root.join("npm-shrinkwrap.json"),
+            r#"{"lockfileVersion":3,"packages":{}}"#,
+        )
+        .unwrap();
+        assert!(reads.keys.iter().any(|key| !key.still_matches()));
+        std::fs::remove_file(root.join("npm-shrinkwrap.json")).unwrap();
+        std::fs::write(&lock, r#"{"lockfileVersion":3,"packages":{"":{}}}"#).unwrap();
+        assert!(reads.keys.iter().any(|key| !key.still_matches()));
+
+        let package = root.join("node_modules/typescript");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &lock,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/typescript":{"version":"7.0.2"}}}"#,
+        )
+        .unwrap();
+        let (_, reads) = capture_external_discovery_reads(discover);
+        assert!(
+            !reads.complete,
+            "TypeScript config selection needs its own read recorder"
+        );
+    }
 
     const DECLARATIONS: &str = r#"
 export interface Widget<T> extends Base<T> {
@@ -4163,6 +4273,7 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
                 artifact_sha256: None,
             }],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "test".to_owned(),
                 revision: Some("1.2.3".to_owned()),
             },

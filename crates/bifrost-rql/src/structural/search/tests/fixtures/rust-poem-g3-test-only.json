@@ -1,0 +1,172 @@
+{
+  "schema_version": 30,
+  "pack_id": "fixture.rust-poem-g3",
+  "version": "1.0.0",
+  "producer": {
+    "name": "g3-test-declarations",
+    "version": "1.0.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "test-only Poem declaration and re-export authority"
+  },
+  "license": "NOASSERTION",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "declarations.rust-poem-g3",
+      "activation": [
+        {
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "poem",
+            "name": "poem",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/lib.rs",
+              "symbol": "poem"
+            }
+          },
+          {
+            "id": "poem.web",
+            "name": "poem.web",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/mod.rs",
+              "symbol": "poem::web"
+            }
+          },
+          {
+            "id": "poem.web.query",
+            "name": "poem.web.query",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/query.rs",
+              "symbol": "poem::web::query"
+            }
+          },
+          {
+            "id": "poem_web_query_query",
+            "name": "poem.web.query.Query",
+            "type_kind": "struct",
+            "visibility": "public",
+            "type_parameters": [
+              "T"
+            ],
+            "aliases": [
+              "poem.web.Query"
+            ],
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/query.rs",
+              "symbol": "poem::web::query::Query"
+            },
+            "tuple_fields": {
+              "arity": 1,
+              "fields": [
+                {
+                  "kind": "public",
+                  "ordinal": 0,
+                  "id": "poem_web_query_query.field.0",
+                  "type": {
+                    "kind": "type_parameter",
+                    "name": "T"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "id": "poem.web.path",
+            "name": "poem.web.path",
+            "type_kind": "module",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/path.rs",
+              "symbol": "poem::web::path"
+            }
+          },
+          {
+            "id": "poem_web_path_path",
+            "name": "poem.web.path.Path",
+            "type_kind": "struct",
+            "visibility": "public",
+            "type_parameters": [
+              "T"
+            ],
+            "aliases": [
+              "poem.web.Path"
+            ],
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/path.rs",
+              "symbol": "poem::web::path::Path"
+            },
+            "tuple_fields": {
+              "arity": 1,
+              "fields": [
+                {
+                  "kind": "public",
+                  "ordinal": 0,
+                  "id": "poem_web_path_path.field.0",
+                  "type": {
+                    "kind": "type_parameter",
+                    "name": "T"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "poem_web_query_query.field.0",
+            "owner": "poem_web_query_query",
+            "name": "0",
+            "member_kind": "field",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/query.rs",
+              "symbol": "poem::web::query::Query"
+            }
+          },
+          {
+            "id": "poem_web_path_path.field.0",
+            "owner": "poem_web_path_path",
+            "name": "0",
+            "member_kind": "field",
+            "visibility": "public",
+            "locator": {
+              "kind": "artifact",
+              "path": "poem/src/web/path.rs",
+              "symbol": "poem::web::path::Path"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

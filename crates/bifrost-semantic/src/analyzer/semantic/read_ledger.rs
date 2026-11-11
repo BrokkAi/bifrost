@@ -9,12 +9,99 @@ use crate::analyzer::semantic::ids::StableDigest;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType};
 
 use brokk_bifrost_core::analyzer::model::Language;
+use brokk_bifrost_core::analyzer::structural::kinds::Role;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::path_utils::rel_path_string;
 use git2::Oid;
 use serde::{Deserialize, Serialize};
+
+/// A mount-free question about a stored semantic IR publication.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct StoredSemanticIrPublicationQuestion {
+    pub rel_path: Box<str>,
+    pub storage_language: Box<str>,
+    pub subject: [u8; 32],
+    pub parse_variant: StoredSemanticIrParseVariant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum StoredSemanticIrParseVariant {
+    Empty,
+    Digest([u8; 32]),
+}
+
+/// Cache provenance only for artifacts lowered from source after a refused read.
+/// This domain is distinct from every verified built-from question and answer.
+pub static REFUSED_PROVENANCE: std::sync::LazyLock<StableDigest> = std::sync::LazyLock::new(|| {
+    StableDigest::from_array(
+        CanonicalHasher::new(b"bifrost-semantic-artifact:refused-provenance:v1").finish(),
+    )
+});
+
+impl StoredSemanticIrPublicationQuestion {
+    pub fn built_from_digest(&self, answer: &StoredSemanticIrPublicationAnswer) -> StableDigest {
+        let mut hasher = CanonicalHasher::new(b"bifrost-semantic-artifact:built-from:v1");
+        LookupQuestion::StoredSemanticIrPublication(self.clone()).push_canonical(&mut hasher);
+        hasher.field(
+            "answer_digest",
+            answer.clone().canonical_digest().as_bytes(),
+        );
+        StableDigest::from_array(hasher.finish())
+    }
+
+    pub fn new(
+        rel_path: Box<str>,
+        storage_language: Box<str>,
+        subject: [u8; 32],
+        variant: brokk_bifrost_core::gitblob::ParseVariant,
+    ) -> Self {
+        let parse_variant = match variant {
+            brokk_bifrost_core::gitblob::ParseVariant::Empty => StoredSemanticIrParseVariant::Empty,
+            brokk_bifrost_core::gitblob::ParseVariant::Digest(digest) => {
+                StoredSemanticIrParseVariant::Digest(digest)
+            }
+        };
+        Self {
+            rel_path,
+            storage_language,
+            subject,
+            parse_variant,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredSemanticIrPublicationAnswer {
+    NoHead,
+    StaleEpoch,
+    ContentMismatch,
+    Present {
+        active_epoch: Box<str>,
+        row_digest: [u8; 32],
+    },
+}
+
+impl StoredSemanticIrPublicationAnswer {
+    pub fn canonical_digest(self) -> StableDigest {
+        let mut hasher = CanonicalHasher::new(b"bifrost-stored-semantic-ir-publication:answer:v1");
+        match self {
+            Self::NoHead => hasher.field("answer", b"no_head"),
+            Self::StaleEpoch => hasher.field("answer", b"stale_epoch"),
+            Self::ContentMismatch => hasher.field("answer", b"content_mismatch"),
+            Self::Present {
+                active_epoch,
+                row_digest,
+            } => {
+                hasher.field("answer", b"present");
+                hasher.field("active_epoch", active_epoch.as_bytes());
+                hasher.field("row_digest", &row_digest);
+            }
+        }
+        StableDigest::from_array(hasher.finish())
+    }
+}
 
 /// Domain for one read key's canonical encoding.
 #[doc(hidden)]
@@ -126,6 +213,7 @@ pub enum WorkspaceFactFamily {
     RubyMixinRelations,
     RubySemanticFacts,
     RubyTypesByIdentifier,
+    RubySingletonMemberMutation,
     PhpDirectDescendants,
     PhpReverseImports,
     PhpComposerAutoload,
@@ -154,6 +242,7 @@ pub enum WorkspaceFactFamily {
     JavaImportInventory,
     JavaWorkspaceClasses,
     JvmSelectedRootPresence,
+    JvmExternalGaps,
     JavaReferencingFiles,
     JavaReverseImports,
     JavaSamePackageReferences,
@@ -330,6 +419,10 @@ impl WorkspaceFactFamily {
         (Self::RubyMixinRelations, "ruby_mixin_relations"),
         (Self::RubySemanticFacts, "ruby_semantic_facts"),
         (Self::RubyTypesByIdentifier, "ruby_types_by_identifier"),
+        (
+            Self::RubySingletonMemberMutation,
+            "ruby_singleton_member_mutation",
+        ),
         (Self::PhpDirectDescendants, "php_direct_descendants"),
         (Self::PhpReverseImports, "php_reverse_imports"),
         (Self::PhpComposerAutoload, "php_composer_autoload"),
@@ -371,6 +464,7 @@ impl WorkspaceFactFamily {
         (Self::JavaImportInventory, "java_import_inventory"),
         (Self::JavaWorkspaceClasses, "java_workspace_classes"),
         (Self::JvmSelectedRootPresence, "jvm_selected_root_presence"),
+        (Self::JvmExternalGaps, "jvm_external_gaps"),
         (Self::JavaReferencingFiles, "java_referencing_files"),
         (Self::JavaReverseImports, "java_reverse_imports"),
         (
@@ -548,6 +642,11 @@ impl FactSubject {
 /// against another workspace and comparing digests is what detects the change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LookupKind {
+    /// Certified composite answer to a definition probe.
+    CertifiedDefinitionAnswer,
+    StoredSemanticIrPublication,
+    /// A registered dependency-tracked derivation.
+    Derivation(crate::analyzer::semantic::derivation::DerivationKindId),
     /// The exact rendered-name answer of the shared resolver, including its
     /// structured identifier compatibility view and request memo.
     ResolvedName,
@@ -560,6 +659,20 @@ pub enum LookupKind {
     /// The declaration candidates returned by one analyzer's short-name
     /// lookup.
     ShortNameCandidates,
+    /// Selected bound impl endpoints keyed by the placed subject declaration.
+    RustTraitsImplementedByInventory,
+    /// Live published alias blobs mentioning one Rust spelling.
+    RustAliasBlobInventory,
+    /// Live published macro expansion candidates for one spelling.
+    RustMacroExpansionInventory,
+    /// Selected bound impl endpoints keyed by the placed trait declaration.
+    RustBoundTraitImplInventory,
+    /// Selected live unresolved impls naming one Rust trait spelling.
+    RustUnresolvedTraitImplInventory,
+    /// Selected live placements whose imports can name one Rust component.
+    RustModuleImportCandidateInventory,
+    /// Selected live blobs and context masks for one Rust identifier.
+    RustIdentifierOccurrenceInventory,
     /// The exact declaration facts used by a language resolver: the target
     /// declaration identity and the optional declaration that owns it.
     ///
@@ -568,6 +681,9 @@ pub enum LookupKind {
     /// while a structural fallback may read that file, and the answer digest
     /// binds both the target and the resolved parent.
     DeclarationFacts,
+    /// The full set of parser declarations matching a declaration question's
+    /// rendered name, kind and signature. Membership within that set is exact.
+    DeclarationCandidates,
     /// The structured signature metadata consumed for one declaration.
     SignatureMetadata,
     /// The callers of one declaration, from the call relation.
@@ -598,17 +714,275 @@ pub enum LookupKind {
     ProcedureSummary,
     /// A named workspace authority answer.
     WorkspaceFact,
+    /// Exact-name structural posting inventory across one selected provider.
+    StructuralNameInventory,
+    StructuralRoleNameInventory,
+    /// Recovered-file inventory across one selected structural provider.
+    StructuralRecoveredInventory,
+    /// A selected Rust crate's closed census of impl subjects for one local ADT.
+    RustCopyAbsence,
+    /// The external (dependency) semantic-pack inputs one request selected,
+    /// recorded as the digest of the selection question and the digest of the
+    /// answer it produced.
+    ExternalSelection,
+}
+
+/// Persisted derivation labels and the exact question shape admitted for each.
+#[derive(Debug, Clone, Copy)]
+pub struct PersistedDerivationFamily {
+    pub id: crate::analyzer::semantic::derivation::DerivationKindId,
+    pub language: bool,
+    pub subject: bool,
+    pub rel_path: bool,
+    pub name: bool,
+    /// The kind is computed only on a lent, in-memory operation, so no
+    /// persisted read set may hold its lookup: replay has no operation to
+    /// recompute it on. Only the codec table in [`Self::of`] sets this; a
+    /// kind's own `QUESTION_SHAPE` leaves it false.
+    pub memory_only: bool,
+}
+
+impl PersistedDerivationFamily {
+    pub const fn new(
+        id: crate::analyzer::semantic::derivation::DerivationKindId,
+        language: bool,
+        subject: bool,
+        rel_path: bool,
+        name: bool,
+    ) -> Self {
+        Self {
+            id,
+            language,
+            subject,
+            rel_path,
+            name,
+            memory_only: false,
+        }
+    }
+    /// The codec entry for a registered derivation label. Each entry states
+    /// its question shape and whether the kind is memory-only, so a newly
+    /// registered kind cannot be persisted without an explicit decision.
+    pub fn of(label: &str) -> Option<Self> {
+        let (id, language, subject, rel_path, name, memory_only) = match label {
+            "derivation:unit_summary:v1" => (
+                "derivation:unit_summary:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_set:v1" => (
+                "derivation:rust_unit_set:v1",
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_file_units:v1" => (
+                "derivation:rust_file_units:v1",
+                true,
+                false,
+                true,
+                false,
+                false,
+            ),
+            "derivation:rust_broad_file_units:v1" => (
+                "derivation:rust_broad_file_units:v1",
+                true,
+                false,
+                true,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_routes:v1" => (
+                "derivation:rust_unit_routes:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_route_directory:v1" => (
+                "derivation:rust_route_directory:v1",
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_route_index:v1" => (
+                "derivation:rust_route_index:v1",
+                false,
+                false,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_selected_units_known:v1" => (
+                "derivation:rust_selected_units_known:v1",
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_dependency_identities:v1" => (
+                "derivation:rust_unit_dependency_identities:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_naming:v1" => (
+                "derivation:rust_unit_naming:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_inputs:v1" => (
+                "derivation:rust_unit_inputs:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_unit_dependents:v1" => (
+                "derivation:rust_unit_dependents:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_package_units:v1" => (
+                "derivation:rust_package_units:v1",
+                true,
+                false,
+                false,
+                true,
+                false,
+            ),
+            "derivation:rust_target_reachability:v2" => (
+                "derivation:rust_target_reachability:v2",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            "derivation:rust_crate_name_units:v2" => (
+                "derivation:rust_crate_name_units:v2",
+                true,
+                false,
+                false,
+                true,
+                false,
+            ),
+            "derivation:rust_unit_package_rows:v1" => (
+                "derivation:rust_unit_package_rows:v1",
+                true,
+                true,
+                false,
+                false,
+                false,
+            ),
+            // Retired by #10949; kept only so old stored read sets decode.
+            // Never register this label again: use a new label or version.
+            // Delete only after the store file version suffix moves past every
+            // store that could hold these read sets.
+            "derivation:rust_selection_content:v1" => (
+                "derivation:rust_selection_content:v1",
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            // Retired by #10949; kept only so old stored read sets decode.
+            // Never register this label again: use a new label or version.
+            // Delete only after the store file version suffix moves past every
+            // store that could hold these read sets.
+            "derivation:rust_selection_content:v2" => (
+                "derivation:rust_selection_content:v2",
+                true,
+                false,
+                false,
+                false,
+                false,
+            ),
+            // Retired by #10949; kept only so old stored read sets decode.
+            // Never register this label again: use a new label or version.
+            // Delete only after the store file version suffix moves past every
+            // store that could hold these read sets.
+            "derivation:rust_forward_scope_witness:v1" => (
+                "derivation:rust_forward_scope_witness:v1",
+                true,
+                true,
+                true,
+                false,
+                false,
+            ),
+            // Retired by #10949; kept only so old stored read sets decode.
+            // Never register this label again: use a new label or version.
+            // Delete only after the store file version suffix moves past every
+            // store that could hold these read sets.
+            "derivation:rust_call_site_resolution:v1" => (
+                "derivation:rust_call_site_resolution:v1",
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
+            _ => return None,
+        };
+        Some(Self {
+            id: crate::analyzer::semantic::derivation::DerivationKindId(id),
+            language,
+            subject,
+            rel_path,
+            name,
+            memory_only,
+        })
+    }
+
+    pub fn admits(
+        self,
+        question: &crate::analyzer::semantic::derivation::DerivationQuestion,
+    ) -> bool {
+        question.language.is_some() == self.language
+            && question.subject.is_some() == self.subject
+            && question.rel_path.is_some() == self.rel_path
+            && question.name.is_some() == self.name
+    }
 }
 
 impl LookupKind {
     /// The label used in the canonical encoding and in diagnostics.
     pub const fn stable_label(self) -> &'static str {
         match self {
+            Self::CertifiedDefinitionAnswer => "certified_definition_answer",
+            Self::StoredSemanticIrPublication => "stored_semantic_ir_publication",
+            Self::Derivation(id) => id.0,
             Self::ResolvedName => "resolved_name",
             Self::Definitions => "definitions",
             Self::IdentifierCandidates => "identifier_candidates",
             Self::ShortNameCandidates => "short_name_candidates",
+            Self::RustTraitsImplementedByInventory => "rust_traits_implemented_by_inventory",
+            Self::RustAliasBlobInventory => "rust_alias_blob_inventory",
+            Self::RustMacroExpansionInventory => "rust_macro_expansion_inventory",
+            Self::RustBoundTraitImplInventory => "rust_bound_trait_impl_inventory",
+            Self::RustUnresolvedTraitImplInventory => "rust_unresolved_trait_impl_inventory",
+            Self::RustModuleImportCandidateInventory => "rust_module_import_candidate_inventory",
+            Self::RustIdentifierOccurrenceInventory => "rust_identifier_occurrence_inventory",
             Self::DeclarationFacts => "declaration_facts",
+            Self::DeclarationCandidates => "declaration_candidates",
             Self::SignatureMetadata => "signature_metadata",
             Self::Callers => "callers",
             Self::Callees => "callees",
@@ -620,6 +994,11 @@ impl LookupKind {
             Self::ProcedureDispatch => "procedure_dispatch",
             Self::ProcedureSummary => "procedure_summary",
             Self::WorkspaceFact => "workspace_fact",
+            Self::StructuralNameInventory => "structural_name_inventory",
+            Self::StructuralRoleNameInventory => "structural_role_name_inventory",
+            Self::StructuralRecoveredInventory => "structural_recovered_inventory",
+            Self::RustCopyAbsence => "rust_copy_absence",
+            Self::ExternalSelection => "external_selection",
         }
     }
 }
@@ -697,6 +1076,23 @@ pub enum ReadKey {
 }
 
 impl ReadKey {
+    /// Whether a persisted read set may hold this key.
+    ///
+    /// The one predicate every publisher of a read set to disk applies. A
+    /// derivation lookup is persistable only when its kind is registered in the
+    /// persisted codec and is not memory-only: replay recomputes a persisted
+    /// lookup from a stored inventory, and a kind computed on a lent in-memory
+    /// operation (or one the codec does not know) has nothing to recompute on.
+    pub fn is_persistable(&self) -> bool {
+        match self {
+            Self::Lookup {
+                kind: LookupKind::Derivation(id),
+                ..
+            } => PersistedDerivationFamily::of(id.0).is_some_and(|family| !family.memory_only),
+            _ => true,
+        }
+    }
+
     /// One per-file fact read of `rel_path`'s `blob`.
     ///
     /// `rel_path` must already be the normalized workspace-relative spelling
@@ -896,6 +1292,51 @@ impl ReadKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "question", rename_all = "snake_case")]
 pub enum LookupQuestion {
+    /// One Rust declaration placed in a selected workspace file.
+    RustPlacedDeclaration {
+        blob: [u8; 20],
+        declaration: u32,
+        rel_path: Box<str>,
+    },
+    /// A definition probe over exactly these language delegates. The normalized
+    /// form is already normalized and must be looked up without another pass.
+    CertifiedDefinition {
+        kind: CertifiedDefinitionKind,
+        name: Box<str>,
+        delegates: Vec<Language>,
+        normalization_version: Option<u32>,
+    },
+    StoredSemanticIrPublication(StoredSemanticIrPublicationQuestion),
+    /// Mount-free key of a registered derivation.
+    Derivation(crate::analyzer::semantic::derivation::DerivationQuestion),
+    /// The selected crate, target declaration and authorities for Copy absence.
+    RustCopyAbsence {
+        owning_unit: StableDigest,
+        target_unit: StableDigest,
+        module_path: Box<str>,
+        target_identity_digest: StableDigest,
+        census_version: u32,
+        config_digest: StableDigest,
+        producer_digest: StableDigest,
+    },
+    /// Exact-name posting inventory under one provider's selection authority.
+    StructuralName {
+        language: Language,
+        name: Box<str>,
+        authority: StableDigest,
+    },
+    StructuralRoleName {
+        language: Language,
+        role: Role,
+        name: Box<str>,
+        keyword: bool,
+        authority: StableDigest,
+    },
+    /// Recovered-file inventory under one provider's selection authority.
+    StructuralRecovered {
+        language: Language,
+        authority: StableDigest,
+    },
     /// One answer from a named workspace authority.
     WorkspaceFact {
         family: WorkspaceFactFamily,
@@ -919,7 +1360,9 @@ pub enum LookupQuestion {
         signature: Option<String>,
     },
     /// One file.
-    File { rel_path: Box<str> },
+    File {
+        rel_path: Box<str>,
+    },
     /// One call addressed by stable procedure lineage and source-order rank.
     CallSite {
         rel_path: Box<str>,
@@ -927,8 +1370,26 @@ pub enum LookupQuestion {
         site: CallSiteLocator,
     },
     /// One procedure summary, by its mount-free identity.
-    Summary { identity: StableDigest },
+    Summary {
+        identity: StableDigest,
+    },
+    /// The external-input selection one request made, by the digest of the
+    /// selection question. The answer digest rides in the key's `digest`.
+    ExternalSelection {
+        question_digest: [u8; 32],
+    },
 }
+
+/// The three definition questions admitted by protocol certificates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CertifiedDefinitionKind {
+    Exact,
+    NormalizedTail,
+    Identifier,
+}
+
+/// Increment when the normalized-tail key or matching rule changes.
+pub const DEFINITION_NORMALIZED_TAIL_VERSION: u32 = 1;
 
 /// A call's rank among its enclosing procedure's calls in source order.
 /// Equal source spans retain semantic call-row order as a tie breaker.
@@ -938,6 +1399,28 @@ pub struct CallSiteLocator {
 }
 
 impl LookupQuestion {
+    /// Construct a canonical composite definition question.
+    pub fn certified_definition(
+        kind: CertifiedDefinitionKind,
+        name: impl Into<Box<str>>,
+        delegates: impl IntoIterator<Item = Language>,
+    ) -> Self {
+        let mut delegates: Vec<_> = delegates.into_iter().collect();
+        delegates.sort();
+        delegates.dedup();
+        assert!(
+            !delegates.is_empty(),
+            "a certified definition needs a delegate"
+        );
+        Self::CertifiedDefinition {
+            kind,
+            name: name.into(),
+            delegates,
+            normalization_version: (kind == CertifiedDefinitionKind::NormalizedTail)
+                .then_some(DEFINITION_NORMALIZED_TAIL_VERSION),
+        }
+    }
+
     /// The question "what does the workspace answer about this declaration?".
     pub fn declaration(unit: &CodeUnit) -> Self {
         Self::Declaration {
@@ -981,20 +1464,39 @@ impl LookupQuestion {
     /// The label used in the canonical encoding and in diagnostics.
     pub const fn stable_label(&self) -> &'static str {
         match self {
+            Self::CertifiedDefinition { .. } => "certified_definition",
+            Self::StoredSemanticIrPublication(..) => "stored_semantic_ir_publication",
+            Self::Derivation(_) => "derivation",
             Self::Name { .. } => "name",
+            Self::RustPlacedDeclaration { .. } => "rust_placed_declaration",
             Self::Declaration { .. } => "declaration",
             Self::File { .. } => "file",
             Self::CallSite { .. } => "call_site",
             Self::Summary { .. } => "summary",
             Self::WorkspaceFact { .. } => "workspace_fact",
+            Self::StructuralName { .. } => "structural_name",
+            Self::StructuralRoleName { .. } => "structural_role_name",
+            Self::StructuralRecovered { .. } => "structural_recovered",
+            Self::RustCopyAbsence { .. } => "rust_copy_absence",
+            Self::ExternalSelection { .. } => "external_selection",
         }
     }
 
     /// The workspace-relative path this question is about, when it names one.
     pub fn rel_path(&self) -> Option<&str> {
         match self {
-            Self::Name { .. } | Self::Summary { .. } | Self::WorkspaceFact { .. } => None,
-            Self::Declaration { rel_path, .. }
+            Self::StoredSemanticIrPublication(question) => Some(&question.rel_path),
+            Self::CertifiedDefinition { .. } => None,
+            Self::Derivation(question) => question.rel_path.as_deref(),
+            Self::Name { .. }
+            | Self::Summary { .. }
+            | Self::WorkspaceFact { .. }
+            | Self::StructuralName { .. }
+            | Self::StructuralRoleName { .. }
+            | Self::StructuralRecovered { .. } => None,
+            Self::RustCopyAbsence { .. } | Self::ExternalSelection { .. } => None,
+            Self::RustPlacedDeclaration { rel_path, .. }
+            | Self::Declaration { rel_path, .. }
             | Self::File { rel_path }
             | Self::CallSite { rel_path, .. } => Some(rel_path),
         }
@@ -1004,6 +1506,110 @@ impl LookupQuestion {
     pub(crate) fn push_canonical(&self, hasher: &mut CanonicalHasher) {
         hasher.field("question", self.stable_label().as_bytes());
         match self {
+            Self::RustPlacedDeclaration {
+                blob,
+                declaration,
+                rel_path,
+            } => {
+                hasher.field("blob", blob);
+                hasher.field("declaration", &declaration.to_be_bytes());
+                hasher.field("rel_path", rel_path.as_bytes());
+            }
+            Self::CertifiedDefinition {
+                kind,
+                name,
+                delegates,
+                normalization_version,
+            } => {
+                let kind = match kind {
+                    CertifiedDefinitionKind::Exact => "exact",
+                    CertifiedDefinitionKind::NormalizedTail => "normalized_tail",
+                    CertifiedDefinitionKind::Identifier => "identifier",
+                };
+                hasher.field("kind", kind.as_bytes());
+                hasher.field("name", name.as_bytes());
+                for delegate in delegates {
+                    hasher.field("delegate", delegate.config_label().as_bytes());
+                }
+                hasher.field(
+                    "normalization_version",
+                    &normalization_version.unwrap_or(0).to_be_bytes(),
+                );
+            }
+            Self::StoredSemanticIrPublication(question) => {
+                hasher.field("rel_path", question.rel_path.as_bytes());
+                hasher.field("storage_language", question.storage_language.as_bytes());
+                hasher.field("subject", &question.subject);
+                match question.parse_variant {
+                    StoredSemanticIrParseVariant::Empty => {
+                        hasher.field("parse_variant_kind", b"empty")
+                    }
+                    StoredSemanticIrParseVariant::Digest(digest) => {
+                        hasher.field("parse_variant_kind", b"digest");
+                        hasher.field("parse_variant_digest", &digest);
+                    }
+                }
+            }
+            Self::Derivation(question) => {
+                if let Some(language) = question.language {
+                    hasher.field("language", language.config_label().as_bytes());
+                }
+                if let Some(subject) = question.subject {
+                    hasher.field("subject", &subject);
+                }
+                if let Some(path) = &question.rel_path {
+                    hasher.field("rel_path", path.as_bytes());
+                }
+                if let Some(name) = &question.name {
+                    hasher.field("name", name.as_bytes());
+                }
+            }
+            Self::RustCopyAbsence {
+                owning_unit,
+                target_unit,
+                module_path,
+                target_identity_digest,
+                census_version,
+                config_digest,
+                producer_digest,
+            } => {
+                hasher.field("owning_unit", owning_unit.as_bytes());
+                hasher.field("target_unit", target_unit.as_bytes());
+                hasher.field("module_path", module_path.as_bytes());
+                hasher.field("target_identity_digest", target_identity_digest.as_bytes());
+                hasher.field("census_version", &census_version.to_be_bytes());
+                hasher.field("config_digest", config_digest.as_bytes());
+                hasher.field("producer_digest", producer_digest.as_bytes());
+            }
+            Self::StructuralName {
+                language,
+                name,
+                authority,
+            } => {
+                hasher.field("language", language.config_label().as_bytes());
+                hasher.field("name", name.as_bytes());
+                hasher.field("authority", authority.as_bytes());
+            }
+            Self::StructuralRoleName {
+                language,
+                role,
+                name,
+                keyword,
+                authority,
+            } => {
+                hasher.field("language", language.config_label().as_bytes());
+                hasher.field("role", role.label().as_bytes());
+                hasher.field("name", name.as_bytes());
+                hasher.field("keyword", &[*keyword as u8]);
+                hasher.field("authority", authority.as_bytes());
+            }
+            Self::StructuralRecovered {
+                language,
+                authority,
+            } => {
+                hasher.field("language", language.config_label().as_bytes());
+                hasher.field("authority", authority.as_bytes());
+            }
             Self::Name { language, name } => {
                 match language {
                     Some(language) => {
@@ -1042,6 +1648,9 @@ impl LookupQuestion {
                 hasher.field("ordinal", &(site.ordinal as u64).to_be_bytes());
             }
             Self::Summary { identity } => hasher.field("identity", identity.as_bytes()),
+            Self::ExternalSelection { question_digest } => {
+                hasher.field("question_digest", question_digest)
+            }
             Self::WorkspaceFact {
                 family,
                 language,
@@ -1103,5 +1712,69 @@ impl LookupQuestion {
                 }
             }
         }
+    }
+}
+
+// The derivation budget owns the cloned keys in its read vector. Count the
+// vector's inline slots at the entry and the allocations here.
+impl brokk_bifrost_core::retention_budget::RetainedBytes for ReadKey {
+    fn retained_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let owned = match self {
+            Self::File { rel_path, .. } | Self::PathAbsent { rel_path, .. } => rel_path.len(),
+            Self::Index { key, .. } => key.len(),
+            Self::Lookup { question, .. } => match question {
+                LookupQuestion::CertifiedDefinition {
+                    name, delegates, ..
+                } => name.len() + delegates.capacity() * size_of::<Language>(),
+                LookupQuestion::StoredSemanticIrPublication(q) => {
+                    q.rel_path.len() + q.storage_language.len()
+                }
+                LookupQuestion::Derivation(q) => {
+                    q.rel_path.as_ref().map_or(0, |p| p.len())
+                        + q.name.as_ref().map_or(0, |n| n.len())
+                }
+                LookupQuestion::RustCopyAbsence { module_path, .. } => module_path.len(),
+                LookupQuestion::StructuralName { name, .. }
+                | LookupQuestion::StructuralRoleName { name, .. }
+                | LookupQuestion::Name { name, .. } => name.len(),
+                LookupQuestion::StructuralRecovered { .. }
+                | LookupQuestion::Summary { .. }
+                | LookupQuestion::ExternalSelection { .. } => 0,
+                LookupQuestion::Declaration {
+                    rel_path,
+                    fq_name,
+                    signature,
+                    ..
+                } => {
+                    rel_path.len() + fq_name.len() + signature.as_ref().map_or(0, String::capacity)
+                }
+                LookupQuestion::RustPlacedDeclaration { rel_path, .. }
+                | LookupQuestion::File { rel_path }
+                | LookupQuestion::CallSite { rel_path, .. } => rel_path.len(),
+                LookupQuestion::WorkspaceFact { subject, .. } => match subject {
+                    FactSubject::Whole | FactSubject::Class { .. } => 0,
+                    FactSubject::File { rel_path } => rel_path.len(),
+                    FactSubject::Named { name } => name.len(),
+                    FactSubject::NamedMember { owner, member } => owner.len() + member.len(),
+                    FactSubject::ClassMember { member, .. } => member.len(),
+                    FactSubject::NameGroupMember { names, member } => {
+                        names.capacity() * size_of::<Box<str>>()
+                            + names.iter().map(|name| name.len()).sum::<usize>()
+                            + member.len()
+                    }
+                    FactSubject::FileNamedMember {
+                        rel_path,
+                        owner,
+                        member,
+                        ..
+                    } => rel_path.len() + owner.len() + member.len(),
+                },
+            },
+            Self::Artifact { rel_path, .. } => rel_path.as_ref().map_or(0, |p| p.len()),
+            Self::Scope { languages, .. } => languages.len() * size_of::<Language>(),
+            Self::Models(_) | Self::Policy { .. } | Self::Configuration(_) | Self::Epoch(_) => 0,
+        };
+        size_of::<Self>().saturating_add(owned)
     }
 }

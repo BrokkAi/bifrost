@@ -23,45 +23,68 @@ use brokk_bifrost_semantic::analyzer::semantic_model::model::{
 };
 use std::sync::Arc;
 
-pub(super) struct ModelApplicability<'a> {
+pub(super) struct ModelApplicability<'a, 'resolver> {
     analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
     overlay: &'a SemanticModelOverlay,
     active: &'a ResolvedActiveSemanticModels,
+    resolver: &'resolver dyn super::std_types::RustTypeProofResolver,
     sized_parameters: std::collections::HashSet<String>,
 }
 
-impl<'a> ModelApplicability<'a> {
+impl<'a, 'resolver> ModelApplicability<'a, 'resolver> {
     pub(super) fn new(
         analyzer: &'a dyn IAnalyzer,
         rust: &'a RustAnalyzer,
         overlay: &'a SemanticModelOverlay,
         active: &'a ResolvedActiveSemanticModels,
+        resolver: &'resolver dyn super::std_types::RustTypeProofResolver,
     ) -> Self {
         Self {
             analyzer,
             rust,
             overlay,
             active,
+            resolver,
             sized_parameters: Default::default(),
         }
     }
 
     pub(super) fn owner(&self, ty: &TypeRef) -> Option<Arc<SemanticModelSymbol>> {
         match ty {
-            TypeRef::Named { name, .. } => self.overlay.symbols_named(name).unique(),
-            TypeRef::Declared { id, .. } => self.overlay.symbols_with_id(id).unique(),
-            TypeRef::Slice { .. } => self.overlay.symbols_named("core.primitive.slice").unique(),
-            TypeRef::FixedArray { .. } => {
-                self.overlay.symbols_named("core.primitive.array").unique()
+            TypeRef::Named { name, .. } => {
+                // rustdoc preserves primitive Target types by their primitive
+                // spelling; the declaration owner is the canonical primitive.
+                if super::call_conversion::primitive_for_spelling(name).is_some() {
+                    self.overlay
+                        .symbols_named_in_family(&format!("core.primitive.{name}"), "rust")
+                        .unique()
+                } else {
+                    self.overlay.symbols_named_in_family(name, "rust").unique()
+                }
             }
+            TypeRef::Declared { id, .. } => {
+                self.overlay.symbols_with_id_in_family(id, "rust").unique()
+            }
+            TypeRef::Slice { .. } => self
+                .overlay
+                .symbols_named_in_family("core.primitive.slice", "rust")
+                .unique(),
+            TypeRef::FixedArray { .. } => self
+                .overlay
+                .symbols_named_in_family("core.primitive.array", "rust")
+                .unique(),
             _ => None,
         }
     }
 
     pub(super) fn member(&self, symbol: &SemanticModelSymbol) -> Option<Arc<MemberFact>> {
-        self.active
-            .all_member_records_with_id(&symbol.id)
+        let mut records = self.active.all_member_records_with_id(&symbol.id);
+        if records.open_for_language(&symbol.language).is_some() {
+            return None;
+        }
+        records
+            .rows
             .find(|record| record.shard.manifest.semantic_sha256 == symbol.provenance.pack_digest)
             .map(|record| record.record)
     }
@@ -281,27 +304,11 @@ impl<'a> ModelApplicability<'a> {
         if unknown { None } else { Some(true) }
     }
 
-    pub(super) fn receiver_type(
+    pub(super) fn receiver_type<'tree>(
         &mut self,
-        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         source: &str,
-        ty: tree_sitter::Node<'_>,
-    ) -> Option<TypeRef> {
-        self.receiver_type_with(source, ty, &mut |node| {
-            super::std_types::rust_nominal_receiver_application_with_operation(
-                analyzer, file, source, node, None, None, None,
-            )
-        })
-    }
-
-    pub(super) fn receiver_type_with<'tree>(
-        &mut self,
-        source: &str,
         ty: tree_sitter::Node<'tree>,
-        nominal: &mut dyn FnMut(
-            tree_sitter::Node<'tree>,
-        ) -> Option<(String, Vec<tree_sitter::Node<'tree>>)>,
     ) -> Option<TypeRef> {
         let mut ancestor = Some(ty);
         let mut seen = std::collections::HashSet::new();
@@ -332,17 +339,15 @@ impl<'a> ModelApplicability<'a> {
             }
             ancestor = node.parent();
         }
-        self.source_type(source, ty, 16, nominal)
+        self.source_type(file, source, ty, 16)
     }
 
     fn source_type<'tree>(
         &self,
+        file: &ProjectFile,
         source: &str,
         ty: tree_sitter::Node<'tree>,
         depth: u8,
-        nominal: &mut dyn FnMut(
-            tree_sitter::Node<'tree>,
-        ) -> Option<(String, Vec<tree_sitter::Node<'tree>>)>,
     ) -> Option<TypeRef> {
         if depth == 0 {
             return None;
@@ -350,10 +355,10 @@ impl<'a> ModelApplicability<'a> {
         if ty.kind() == "reference_type" {
             return Some(TypeRef::ByRef {
                 element: Box::new(self.source_type(
+                    file,
                     source,
                     ty.child_by_field_name("type")?,
                     depth - 1,
-                    nominal,
                 )?),
                 reference_kind: crate::analyzer::semantic_model::TypeRefReferenceKind::Lvalue,
             });
@@ -372,13 +377,16 @@ impl<'a> ModelApplicability<'a> {
                 name: rust_node_text(ty, source).into(),
             });
         }
-        let (owner, arguments) = nominal(ty)?;
-        let symbol = self.overlay.symbols_named(&owner).unique()?;
+        let (owner, arguments) = self.resolver.nominal_type_owner(file, source, ty)?;
+        let symbol = self
+            .overlay
+            .symbols_named_in_family(&owner, "rust")
+            .unique()?;
         let fact = owner_declaration(self.active, &symbol)?;
         let mut actual = arguments
             .into_iter()
             .map(|argument| {
-                self.source_type(source, argument, depth - 1, nominal)
+                self.source_type(file, source, argument, depth - 1)
                     .unwrap_or(TypeRef::Unknown)
             })
             .collect::<Vec<_>>();
@@ -401,6 +409,74 @@ impl<'a> ModelApplicability<'a> {
         }
     }
 
+    pub(super) fn operator_output(
+        &self,
+        receiver: &SemanticModelSymbol,
+        trait_: &SemanticModelSymbol,
+        left: &brokk_bifrost_analysis::analyzer::usages::call_conversion::RustConversionType,
+        right: &brokk_bifrost_analysis::analyzer::usages::call_conversion::RustConversionType,
+        declaration: &crate::analyzer::semantic_model::TypeFact,
+    ) -> Option<TypeRef> {
+        use brokk_bifrost_analysis::analyzer::usages::call_conversion::RustConversionType;
+        let RustConversionType::Model {
+            symbol, arguments, ..
+        } = left
+        else {
+            return None;
+        };
+        if !arguments.is_empty() || !declaration.implemented_traits_complete {
+            return None;
+        }
+        let trait_declaration = owner_declaration(self.active, trait_)?;
+        if !trait_declaration.generic_trait_impls_complete
+            || !trait_declaration.generic_trait_impls.is_empty()
+        {
+            return None;
+        }
+        let actual = TypeRef::Declared {
+            id: symbol.clone(),
+            arguments: vec![],
+            nullable: false,
+        };
+        let mut selected = None;
+        for fact in &declaration.implemented_traits {
+            if self.owner(&fact.trait_type)?.id != trait_.id {
+                continue;
+            }
+            let mut bindings = std::collections::HashMap::new();
+            if let Some(pattern) = &fact.self_pattern {
+                self.bind_pattern(&actual, pattern, &mut bindings)?;
+            }
+            bindings.insert("Self".into(), actual.clone());
+            let applied = substitute(&fact.trait_type, &bindings, 16)?;
+            let arguments = match applied {
+                TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } => arguments,
+                _ => return None,
+            };
+            let [rhs] = arguments.as_slice() else {
+                return None;
+            };
+            match super::call_conversion::matches_model_type(right, rhs)? {
+                false => continue,
+                true => {
+                    if fact.is_negative
+                        || !self.positive_bounds(&fact.bounds, &bindings, 16)
+                        || selected.is_some()
+                    {
+                        return None;
+                    }
+                    let output = fact
+                        .associated_types
+                        .iter()
+                        .find(|binding| binding.name == "Output")?;
+                    selected = Some(substitute(&output.r#type, &bindings, 16)?);
+                }
+            }
+        }
+        let _ = receiver;
+        selected
+    }
+
     pub(super) fn deref_target(
         &self,
         receiver: &SemanticModelSymbol,
@@ -409,9 +485,13 @@ impl<'a> ModelApplicability<'a> {
         let declaration = owner_declaration(self.active, receiver)?;
         let deref = self
             .overlay
-            .symbols_named("core.ops.Deref")
+            .symbols_named_in_family("core.ops.Deref", "rust")
             .unique()
-            .or_else(|| self.overlay.symbols_named("std.ops.Deref").unique())?;
+            .or_else(|| {
+                self.overlay
+                    .symbols_named_in_family("std.ops.Deref", "rust")
+                    .unique()
+            })?;
         let mut target = None;
         let mut proven = false;
         for fact in &declaration.implemented_traits {
@@ -439,6 +519,81 @@ impl<'a> ModelApplicability<'a> {
             target = Some(found);
         }
         proven.then_some(target).flatten()
+    }
+
+    pub(super) fn deref_adjustment(
+        &self,
+        receiver: &SemanticModelSymbol,
+    ) -> Option<crate::analyzer::semantic_model::ReceiverAdjustment> {
+        if receiver.provenance.pack_id != "bifrost.rust-stdlib"
+            || receiver.provenance.extraction.is_none()
+        {
+            return None;
+        }
+        let deref = self
+            .overlay
+            .symbols_named_in_family("core.ops.Deref", "rust")
+            .unique()
+            .or_else(|| {
+                self.overlay
+                    .symbols_named_in_family("std.ops.Deref", "rust")
+                    .unique()
+            })?;
+        let family = self.overlay.members_of_in_family(&receiver.id, "rust");
+        let mut selected = None;
+        for symbol in &family.records {
+            if symbol.name != "deref" {
+                continue;
+            }
+            let member = self.member(symbol)?;
+            let Some(implemented) = member.implemented_trait.as_ref() else {
+                continue;
+            };
+            if !self
+                .owner(implemented)
+                .is_some_and(|owner| owner.id == deref.id)
+            {
+                continue;
+            }
+            if selected.replace(member).is_some() {
+                return None;
+            }
+        }
+        let member = selected?;
+        if !matches!(
+            member.self_form,
+            Some(crate::analyzer::semantic_model::RustSelfForm::Shared)
+        ) || !member
+            .signature
+            .as_ref()
+            .is_some_and(|signature| signature.parameters.is_empty())
+        {
+            return None;
+        }
+        let crate::analyzer::semantic_model::Locator::Artifact { path, symbol } = &member.locator
+        else {
+            return None;
+        };
+        let matched = self.active.procedure_summaries_for(
+            crate::analyzer::semantic_model::ProcedureSummaryTargetKey::new(
+                "rust", path, symbol, true, 0,
+            ),
+        );
+        if matched.applicability
+            != crate::analyzer::semantic_model::ProcedureSummaryApplicability::Complete
+            || matched.disposition
+                != crate::analyzer::semantic_model::SemanticModelMatchDisposition::Unique
+        {
+            return None;
+        }
+        let [summary] = matched.records.as_slice() else {
+            return None;
+        };
+        let adjustment = crate::analyzer::semantic_model::ReceiverAdjustment::from_selected(
+            &member,
+            &summary.record,
+        )?;
+        Some(adjustment)
     }
 
     fn bind_pattern(
@@ -504,7 +659,7 @@ impl<'a> ModelApplicability<'a> {
         }
         if self
             .overlay
-            .symbols_named("core.marker.Sized")
+            .symbols_named_in_family("core.marker.Sized", "rust")
             .unique()
             .is_some_and(|sized| sized.id == trait_.id)
         {
@@ -539,13 +694,23 @@ impl<'a> ModelApplicability<'a> {
             let Some(implemented) = self.owner(&fact.trait_type) else {
                 continue;
             };
-            let reaches = implemented.id == trait_.id
-                || self
-                    .overlay
-                    .ancestors_of(&implemented)
-                    .records
-                    .iter()
-                    .any(|ancestor| ancestor.id == trait_.id);
+            let reaches = implemented.id == trait_.id || {
+                let ancestors = self.overlay.ancestors_of(&implemented);
+                // Ancestors read next to an open part are candidates, not
+                // proofs; the bound is unproven and the proof stops.
+                if matches!(
+                    ancestors.disposition,
+                    crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+                ) {
+                    super::std_types::incomplete_proof("supertrait_hierarchy_open");
+                    false
+                } else {
+                    ancestors
+                        .records
+                        .iter()
+                        .any(|ancestor| ancestor.id == trait_.id)
+                }
+            };
             if !reaches {
                 continue;
             }
@@ -569,7 +734,7 @@ pub(super) fn workspace_trait_may_apply(
     rust: &RustAnalyzer,
     trait_: &CodeUnit,
     receiver: &SemanticModelSymbol,
-    model: &ModelApplicability<'_>,
+    model: &ModelApplicability<'_, '_>,
 ) -> Option<bool> {
     let live = rust.live_blobs();
     let mut files = workspace_read(brokk_bifrost_rust::graph_support::impl_files_of_trait(
@@ -600,7 +765,7 @@ pub(super) fn external_workspace_impl_may_apply(
     rust: &RustAnalyzer,
     trait_: &SemanticModelSymbol,
     receiver: &SemanticModelSymbol,
-    model: &ModelApplicability<'_>,
+    model: &ModelApplicability<'_, '_>,
 ) -> Option<bool> {
     let live = rust.live_blobs();
     let mut files = std::collections::HashSet::new();
@@ -629,7 +794,7 @@ pub(super) fn external_workspace_impl_may_apply(
 
 // Both source and modeled traits can be renamed before an impl header or an
 // opaque macro mentions them. This worklist belongs to the current query.
-fn workspace_trait_spellings(
+pub(super) fn workspace_trait_spellings(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
     name: &str,
@@ -664,7 +829,7 @@ fn workspace_impls_may_apply(
     files: &[ProjectFile],
     trait_identity: &TraitIdentity,
     receiver: &SemanticModelSymbol,
-    model: &ModelApplicability<'_>,
+    model: &ModelApplicability<'_, '_>,
 ) -> Option<bool> {
     let scope = AnalyzerQueryScope::new(analyzer);
     for file in files {
@@ -752,7 +917,10 @@ fn workspace_impls_may_apply(
                         }
                         if let Some(TraitIdentity::Model(id)) =
                             resolve_trait(analyzer, file, source, prepared.tree(), bound, model)
-                            && let Some(trait_) = model.overlay.symbols_with_id(&id).unique()
+                            && let Some(trait_) = model
+                                .overlay
+                                .symbols_with_id_in_family(&id, "rust")
+                                .unique()
                         {
                             impossible |= owner_declaration(model.active, &trait_)
                                 .is_some_and(|fact| fact.type_parameters.is_empty())
@@ -769,9 +937,10 @@ fn workspace_impls_may_apply(
                     return Some(true);
                 }
             } else {
-                let nominal = super::std_types::rust_nominal_receiver_owner_with_operation(
-                    analyzer, file, source, target, None, None, None,
-                );
+                let nominal = model
+                    .resolver
+                    .nominal_type_owner(file, source, target)
+                    .map(|(owner, _)| owner);
                 match nominal {
                     Some(owner) if owner != receiver.qualified_name => continue,
                     None => match resolve_trait(
@@ -813,9 +982,9 @@ fn resolve_trait(
     source: &str,
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node<'_>,
-    model: &ModelApplicability<'_>,
+    model: &ModelApplicability<'_, '_>,
 ) -> Option<TraitIdentity> {
-    let value = resolve_source_definition(analyzer, file, source, tree, node)?;
+    let value = resolve_source_definition(analyzer, file, source, tree, node, model)?;
     match value.definitions.as_slice() {
         [unit] => return Some(TraitIdentity::Workspace(unit.clone())),
         [] => {}
@@ -830,7 +999,7 @@ fn resolve_trait(
         let module = brokk_bifrost_rust::prelude::rust_prelude_trait_module(&name)?;
         let symbol = model
             .overlay
-            .symbols_named(&format!("{crate_name}.{module}.{name}"))
+            .symbols_named_in_family(&format!("{crate_name}.{module}.{name}"), "rust")
             .unique()?;
         return Some(TraitIdentity::Model(symbol.id.clone()));
     }
@@ -842,7 +1011,7 @@ fn resolve_trait(
     };
     model
         .overlay
-        .symbols_named(subject)
+        .symbols_named_in_family(subject, "rust")
         .unique()
         .map(|symbol| TraitIdentity::Model(symbol.id.clone()))
 }
@@ -853,6 +1022,7 @@ fn resolve_source_definition(
     source: &str,
     tree: &tree_sitter::Tree,
     node: tree_sitter::Node<'_>,
+    model: &ModelApplicability<'_, '_>,
 ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupOutcome> {
     use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
     use brokk_bifrost_core::analyzer::model::Range;
@@ -878,7 +1048,7 @@ fn resolve_source_definition(
     };
     let resolved =
         brokk_bifrost_analysis::analyzer::usages::get_definition::trace::without_recording(|| {
-            super::native_points::resolve_rust_definition_bounded(BoundedReceiverQuery {
+            model.resolver.resolve(BoundedReceiverQuery {
         analyzer,
         file,
         source,
@@ -905,14 +1075,14 @@ pub(super) fn lexical_receiver_traits<'a>(
     source: &str,
     tree: &tree_sitter::Tree,
     mut ty: tree_sitter::Node<'_>,
-    model: &ModelApplicability<'a>,
+    model: &ModelApplicability<'a, '_>,
 ) -> Option<Vec<Arc<SemanticModelSymbol>>> {
     while ty.kind() == "reference_type" {
         ty = ty.child_by_field_name("type")?;
     }
     let segments = brokk_bifrost_rust::graph_support::rust_path_segments(ty)?;
     let root = *segments.first()?;
-    let outcome = resolve_source_definition(analyzer, file, source, tree, root)?;
+    let outcome = resolve_source_definition(analyzer, file, source, tree, root, model)?;
     let lexical = outcome.lexical_definition.as_ref()?;
     debug_assert!(
         lexical
@@ -947,11 +1117,14 @@ pub(super) fn lexical_receiver_traits<'a>(
         for owner in lexical_bound_surfaces(&roots, model)? {
             if let Some(associated) = model
                 .overlay
-                .symbols_named(&format!(
-                    "{}.{}",
-                    owner.qualified_name,
-                    rust_node_text(*segment, source)
-                ))
+                .symbols_named_in_family(
+                    &format!(
+                        "{}.{}",
+                        owner.qualified_name,
+                        rust_node_text(*segment, source)
+                    ),
+                    "rust",
+                )
                 .unique()
                 && !projected
                     .iter()
@@ -990,7 +1163,7 @@ fn modeled_bound_traits<'a>(
     source: &str,
     tree: &tree_sitter::Tree,
     mut bounds: Vec<tree_sitter::Node<'_>>,
-    model: &ModelApplicability<'a>,
+    model: &ModelApplicability<'a, '_>,
 ) -> Option<Vec<Arc<SemanticModelSymbol>>> {
     let mut roots = Vec::new();
     while let Some(bound) = bounds.pop() {
@@ -1001,9 +1174,12 @@ fn modeled_bound_traits<'a>(
             }
             "lifetime" | "removed_trait_bound" => {}
             _ => match resolve_trait(analyzer, file, source, tree, bound, model)? {
-                TraitIdentity::Model(id) => {
-                    roots.push(model.overlay.symbols_with_id(&id).unique()?)
-                }
+                TraitIdentity::Model(id) => roots.push(
+                    model
+                        .overlay
+                        .symbols_with_id_in_family(&id, "rust")
+                        .unique()?,
+                ),
                 // An unresolved workspace bound may declare or inherit the
                 // requested name. Do not certify a partial external surface.
                 TraitIdentity::Workspace(_) => return None,
@@ -1015,7 +1191,7 @@ fn modeled_bound_traits<'a>(
 
 fn lexical_bound_surfaces<'a>(
     roots: &[Arc<SemanticModelSymbol>],
-    model: &ModelApplicability<'a>,
+    model: &ModelApplicability<'a, '_>,
 ) -> Option<Vec<Arc<SemanticModelSymbol>>> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1076,6 +1252,29 @@ pub(super) fn substitute(
     bindings: &std::collections::HashMap<String, TypeRef>,
     depth: u8,
 ) -> Option<TypeRef> {
+    // Rust rustdoc uses Wildcard for uncertain types and Array for slices and
+    // arrays. Trait applicability never substitutes through either input form.
+    // Bound values are returned unchanged by the simultaneous substitution.
+    let mut pending = vec![ty];
+    while let Some(current) = pending.pop() {
+        match current {
+            TypeRef::Wildcard { .. } | TypeRef::Array { .. } => return None,
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments)
+            }
+            TypeRef::Slice { element } | TypeRef::ByRef { element, .. } => pending.push(element),
+            _ => {}
+        }
+    }
+    ty.substitute(bindings, depth)
+}
+
+#[cfg(test)]
+fn substitute_oracle(
+    ty: &TypeRef,
+    bindings: &std::collections::HashMap<String, TypeRef>,
+    depth: u8,
+) -> Option<TypeRef> {
     if depth == 0 {
         return None;
     }
@@ -1089,7 +1288,7 @@ pub(super) fn substitute(
             name: name.clone(),
             arguments: arguments
                 .iter()
-                .map(|argument| substitute(argument, bindings, depth - 1))
+                .map(|argument| substitute_oracle(argument, bindings, depth - 1))
                 .collect::<Option<_>>()?,
             nullable: *nullable,
         },
@@ -1101,18 +1300,18 @@ pub(super) fn substitute(
             id: id.clone(),
             arguments: arguments
                 .iter()
-                .map(|argument| substitute(argument, bindings, depth - 1))
+                .map(|argument| substitute_oracle(argument, bindings, depth - 1))
                 .collect::<Option<_>>()?,
             nullable: *nullable,
         },
         TypeRef::Slice { element } => TypeRef::Slice {
-            element: Box::new(substitute(element, bindings, depth - 1)?),
+            element: Box::new(substitute_oracle(element, bindings, depth - 1)?),
         },
         TypeRef::ByRef {
             element,
             reference_kind,
         } => TypeRef::ByRef {
-            element: Box::new(substitute(element, bindings, depth - 1)?),
+            element: Box::new(substitute_oracle(element, bindings, depth - 1)?),
             reference_kind: *reference_kind,
         },
         TypeRef::Unknown => TypeRef::Unknown,
@@ -1136,7 +1335,7 @@ fn workspace_read<T>(
     }
 }
 
-fn macro_may_name_trait(rust: &RustAnalyzer, name: &str) -> Option<bool> {
+pub(super) fn macro_may_name_trait(rust: &RustAnalyzer, name: &str) -> Option<bool> {
     Some(
         workspace_read(rust.rust_identifier_occurrence_blobs(name))?
             .iter()
@@ -1144,4 +1343,48 @@ fn macro_may_name_trait(rust: &RustAnalyzer, name: &str) -> Option<bool> {
                 context & brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_MACRO != 0
             }),
     )
+}
+
+#[cfg(test)]
+mod substitution_properties {
+    use super::{substitute, substitute_oracle};
+    use brokk_bifrost_semantic::analyzer::semantic_model::TypeRef;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    fn type_ref() -> impl Strategy<Value = TypeRef> {
+        prop_oneof![
+            Just(TypeRef::Unknown),
+            Just(TypeRef::TypeParameter { name: "T".into() }),
+            Just(TypeRef::named("java.lang.String")),
+            Just(TypeRef::Wildcard {
+                variance: brokk_bifrost_semantic::analyzer::semantic_model::WildcardVariance::Any,
+                bound: None
+            }),
+        ]
+        .prop_recursive(6, 48, 4, |inner| {
+            prop_oneof![
+                inner.clone().prop_map(|element| TypeRef::Array {
+                    element: Box::new(element)
+                }),
+                inner.clone().prop_map(|element| TypeRef::Slice {
+                    element: Box::new(element)
+                }),
+                prop::collection::vec(inner, 0..3).prop_map(|arguments| TypeRef::Named {
+                    name: "Vec".into(),
+                    arguments,
+                    nullable: false
+                }),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn wrapper_matches_original(ty in type_ref(), bound in type_ref(), depth in 0u8..18) {
+            let bindings = HashMap::from([("T".to_owned(), bound)]);
+            prop_assert_eq!(substitute(&ty, &bindings, depth), substitute_oracle(&ty, &bindings, depth));
+        }
+    }
 }

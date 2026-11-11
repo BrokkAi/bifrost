@@ -10,6 +10,7 @@
 //! solver's meetings answer which classes reach that value.
 
 use crate::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
+use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -146,20 +147,43 @@ pub struct TypeFlowPlan {
     dispatch_reads: HashMap<DurableProcedureKey, ProcedureDispatchReadContract>,
     local_structure_digests: HashMap<DurableProcedureKey, StableDigest>,
     summary_cuts: HashSet<DurableProcedureKey>,
-    /// The workspace field-slot index this plan read stopped short. The typed
-    /// charge is present whenever the index named one; the index also reports
-    /// an untyped transient resolver-budget stop, which sets the flag alone.
-    field_slot_semantic_exhausted: bool,
-    field_slot_semantic_exhaustion: Option<SemanticBudgetExceeded>,
+    /// Whether the workspace field-slot index this plan read stopped short.
+    field_slot_exhaustion: PlanExhaustion,
     discovery_failure: Option<UnknownReason>,
     field_refinements: Vec<(ProcedureHandle, FieldLoadRefinement)>,
     class_closed_load_refinements: Vec<(ProcedureHandle, ClassClosedLoadRefinement)>,
     field_store_receivers: Vec<FieldStoreReceiver>,
-    refinement_budget_exhausted: bool,
-    /// The first semantic charge a procedure-local refinement could not pay.
-    refinement_exhaustion: Option<SemanticBudgetExceeded>,
+    /// Whether a procedure-local refinement could not pay a semantic charge.
+    refinement_exhaustion: PlanExhaustion,
     correlations: Vec<(ProcedureHandle, CorrelationAnalysis)>,
     guard_bindings: HashMap<DurableProcedureKey, GuardBindings>,
+}
+
+/// Whether one plan-building stage stopped short of the semantic work it
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanExhaustion {
+    /// The stage paid every charge it asked for.
+    None,
+    /// The stage could not pay this charge; for refinement, the first one.
+    Typed(SemanticBudgetExceeded),
+    /// The stage stopped without naming a charge: the field-slot index's
+    /// transient resolver-budget stop, or a refinement stop whose caller did
+    /// not know the charge.
+    Untyped,
+}
+
+impl PlanExhaustion {
+    const fn exhausted(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    const fn exceeded(self) -> Option<SemanticBudgetExceeded> {
+        match self {
+            Self::Typed(exceeded) => Some(exceeded),
+            Self::None | Self::Untyped => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1549,11 +1573,11 @@ pub struct ProcedureRefinements {
 #[derive(Debug)]
 struct DerivedRefinement<T> {
     keys: Option<Arc<[crate::analyzer::ReadKey]>>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: ReadChannels,
     value: T,
     owner: Arc<()>,
     work: crate::analyzer::semantic::SemanticBudgetReplay,
+    admission: crate::analyzer::semantic::SemanticMemoAdmission,
 }
 
 /// Census the rows and text that actually leave a refinement derivation.
@@ -1657,25 +1681,18 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
             timed_out: cancellation.is_timed_out(),
         });
     }
-    if let Some(derived) = cache.get(&identity) {
+    if let Some(derived) = cache.get(&identity)
+        && budget.admit_memo_hit(&derived.admission).is_ok()
+    {
         if let Some(keys) = &derived.keys {
             workspace.analyzer().record_read_receipt(keys);
         }
-        crate::analyzer::replay_query_read_receipt(
-            workspace.analyzer(),
-            [],
-            derived.unattributed_reads,
-            derived.execution_dependences,
-        );
+        crate::analyzer::replay_query_read_receipt(workspace.analyzer(), [], derived.channels);
         debug_assert_eq!(
             derived.work.retained,
             refinement_census(&derived.value, &derived.keys)
         );
-        let already_held = budget.has_replay_holder(&derived.owner);
-        let mut replay = derived.work;
-        if already_held {
-            replay.retained = SemanticWork::default();
-        }
+        let (replay, already_held) = budget.replay_for_holder(&derived.owner, derived.work);
         budget
             .replay_continuation(replay)
             .map_err(CorrelationError::Budget)?;
@@ -1684,6 +1701,9 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
             budget.record_charged_artifact(identity);
         }
         return Ok(derived.value.clone());
+    }
+    if cache.remove(&identity).is_some() {
+        profiling::note("semantic.memo_admission_eviction.type_flow_refinement");
     }
     let _derivation = profiling::scope_with(|| {
         format!(
@@ -1699,8 +1719,7 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
     let keys = reads.unordered_keys();
     // Empty receipts must retain no allocation or residency entry.
     let keys = (!keys.is_empty()).then(|| Arc::from(keys));
-    let unattributed_reads = reads.unattributed_reads();
-    let execution_dependences = reads.execution_dependences();
+    let channels = reads.channels();
     let census = refinement_census(&value, &keys);
     budget.admit(census).map_err(CorrelationError::Budget)?;
     let mut work = budget.replay_since(&before);
@@ -1712,17 +1731,19 @@ fn reused_or_derived<T: Clone + RefinementCensus>(
         "a refinement holder pays its returned census"
     );
     budget.record_charged_artifact(identity);
-    cache.insert(
-        identity,
-        DerivedRefinement {
-            keys,
-            unattributed_reads,
-            execution_dependences,
-            value: value.clone(),
-            owner,
-            work,
-        },
-    );
+    if !channels.reuse_refused {
+        cache.insert(
+            identity,
+            DerivedRefinement {
+                keys,
+                channels,
+                value: value.clone(),
+                admission: budget.memo_admission_since(&before, &owner),
+                owner,
+                work,
+            },
+        );
+    }
     Ok(value)
 }
 
@@ -2452,14 +2473,17 @@ impl TypeFlowPlan {
             dispatch_reads,
             local_structure_digests,
             summary_cuts,
-            field_slot_semantic_exhausted: field_slots.semantic_budget_exhausted(),
-            field_slot_semantic_exhaustion: field_slots.semantic_budget_exhaustion(),
+            field_slot_exhaustion: match field_slots.semantic_budget_exhaustion() {
+                Some(exceeded) => PlanExhaustion::Typed(exceeded),
+                None if field_slots.semantic_budget_exhausted() => PlanExhaustion::Untyped,
+                None => PlanExhaustion::None,
+            },
             discovery_failure,
             field_refinements,
             class_closed_load_refinements,
             field_store_receivers,
-            refinement_budget_exhausted: refinement_exhaustion.is_some(),
-            refinement_exhaustion,
+            refinement_exhaustion: refinement_exhaustion
+                .map_or(PlanExhaustion::None, PlanExhaustion::Typed),
             correlations,
             guard_bindings,
         })
@@ -2495,26 +2519,29 @@ impl TypeFlowPlan {
         &mut self,
         exhaustion: Option<SemanticBudgetExceeded>,
     ) {
-        self.refinement_budget_exhausted = true;
-        if self.refinement_exhaustion.is_none() {
-            self.refinement_exhaustion = exhaustion;
-        }
+        self.refinement_exhaustion = match (self.refinement_exhaustion, exhaustion) {
+            (PlanExhaustion::Typed(first), _) => PlanExhaustion::Typed(first),
+            (PlanExhaustion::None | PlanExhaustion::Untyped, Some(exceeded)) => {
+                PlanExhaustion::Typed(exceeded)
+            }
+            (PlanExhaustion::None | PlanExhaustion::Untyped, None) => PlanExhaustion::Untyped,
+        };
     }
 
     /// The first semantic charge a procedure-local refinement could not pay.
     pub(crate) const fn refinement_exhaustion(&self) -> Option<SemanticBudgetExceeded> {
-        self.refinement_exhaustion
+        self.refinement_exhaustion.exceeded()
     }
 
     /// The charge the workspace field-slot index could not pay, when it named
     /// one. `None` with [`Self::field_slot_semantic_exhausted`] set is the
     /// index's untyped transient resolver-budget stop.
     pub(crate) const fn field_slot_semantic_exhaustion(&self) -> Option<SemanticBudgetExceeded> {
-        self.field_slot_semantic_exhaustion
+        self.field_slot_exhaustion.exceeded()
     }
 
     pub(crate) const fn field_slot_semantic_exhausted(&self) -> bool {
-        self.field_slot_semantic_exhausted
+        self.field_slot_exhaustion.exhausted()
     }
 
     /// These sources and exclusions depend on a preliminary solve of this
@@ -2535,8 +2562,8 @@ impl TypeFlowPlan {
             })
     }
 
-    pub(crate) fn refinement_budget_exhausted(&self) -> bool {
-        self.refinement_budget_exhausted
+    pub(crate) const fn refinement_budget_exhausted(&self) -> bool {
+        self.refinement_exhaustion.exhausted()
     }
 
     /// The points [`refine_sources`](Self::refine_sources) can ask evidence
@@ -3281,13 +3308,11 @@ impl TypeFlowPlan {
             dispatch_reads,
             local_structure_digests,
             summary_cuts,
-            field_slot_semantic_exhausted,
-            field_slot_semantic_exhaustion,
+            field_slot_exhaustion,
             discovery_failure,
             field_refinements,
             class_closed_load_refinements,
             field_store_receivers,
-            refinement_budget_exhausted,
             refinement_exhaustion,
             correlations,
             guard_bindings,
@@ -3302,13 +3327,11 @@ impl TypeFlowPlan {
             && dispatch_read_contracts_name_the_same_reads(dispatch_reads, &other.dispatch_reads)
             && local_structure_digests == &other.local_structure_digests
             && summary_cuts == &other.summary_cuts
-            && field_slot_semantic_exhausted == &other.field_slot_semantic_exhausted
-            && field_slot_semantic_exhaustion == &other.field_slot_semantic_exhaustion
+            && field_slot_exhaustion == &other.field_slot_exhaustion
             && discovery_failure == &other.discovery_failure
             && field_refinements == &other.field_refinements
             && class_closed_load_refinements == &other.class_closed_load_refinements
             && field_store_receivers == &other.field_store_receivers
-            && refinement_budget_exhausted == &other.refinement_budget_exhausted
             && refinement_exhaustion == &other.refinement_exhaustion
             && correlations == &other.correlations
             && guard_bindings == &other.guard_bindings
@@ -3372,7 +3395,7 @@ impl TypeFlowPlan {
     }
 
     pub(crate) const fn field_slot_semantic_budget_exhausted(&self) -> bool {
-        self.field_slot_semantic_exhausted || self.refinement_budget_exhausted
+        self.field_slot_exhaustion.exhausted() || self.refinement_exhaustion.exhausted()
     }
 
     pub(crate) const fn provider_failure_observed(&self) -> bool {
@@ -4902,6 +4925,7 @@ mod tests {
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("reason text is not a soundness discriminator".into()),
                 completeness: EvidenceCompleteness::Partial("unsupported external family".into()),
+                partial_cause: None,
                 provenance: Box::new([]),
             };
             let mut candidates = Vec::new();

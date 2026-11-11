@@ -20,15 +20,16 @@ fn usable_incomplete_models_report_each_inactive_source_file() {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let report = SemanticModelActivationReport::default();
-    let usable = Arc::new(ResolvedActiveSemanticModels {
-        active_model_set_hash: "empty-active-models".to_owned(),
-        source_reader: None,
-        shards: Vec::new(),
-        indexes: MatcherIndexes::default(),
-        extraction_gaps: Vec::new(),
-        extraction_gaps_by_declaration: Default::default(),
-        report: report.clone(),
-    });
+    let usable = Arc::new(ResolvedActiveSemanticModels::new(
+        "empty-active-models".to_owned(),
+        None,
+        Vec::new(),
+        MatcherIndexes::default(),
+        Vec::new(),
+        Default::default(),
+        Default::default(),
+        report.clone(),
+    ));
     let activation = WorkspacePacksActivation {
         ecosystems: Vec::new(),
         workspace_models: vec![
@@ -72,6 +73,7 @@ fn usable_incomplete_models_report_each_inactive_source_file() {
         &crate::test_support::evaluation_options("2026-07-27"),
         PolicyHostActivationContext::new(None, Some(&activation), &[], None),
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("canonical policy report");
     assert_eq!(outcome.report().runs()[0].findings().len(), 1);

@@ -44,9 +44,9 @@ use super::fact_source::{
     CompanionTypeRelation, DeclarationAccessDecision, DeferredMemberOwnerLookupName,
     FactPageVisitor, FactReadOutcome, JvmAliasProperty, LoweredIntrinsicTypeDescriptor,
     LoweredRustDeclarationAuthority, LoweredRustReferenceContext, QualifiedRouteSlotLookup,
-    RustImplementedTraits, SelectedGapReasonProvenance, SelectedQualifiedRoute,
-    SelectedTypeFrontierCompletion, SelectedTypedFactSource, SelectedTypedRow,
-    TypedFactPageVisitor, TypedFactReadOutcome, TypedFactRequest,
+    RustImplementedTraits, SelectedGapReasonProvenance, SelectedJavaGapOccurrence,
+    SelectedQualifiedRoute, SelectedTypeFrontierCompletion, SelectedTypedFactSource,
+    SelectedTypedRow, TypedFactPageVisitor, TypedFactReadOutcome, TypedFactRequest,
 };
 use super::local_identity::{ResolutionIdentityTranslation, SelectedResolutionMountOrdinal};
 use super::model::{
@@ -442,11 +442,22 @@ impl SpliceMount for super::FactReferenceSiteMetadata {
     }
 }
 
+impl SpliceMount for super::ResolutionSlotValue {
+    fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        super::remount::remount_slot_value(*self, translation)
+    }
+}
+
 impl SpliceMount for super::ConditionalTypeSeed {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
         Self {
             slot: translation.semantic(self.slot),
             value: super::remount::remount_slot_value(self.value, translation),
+            discharged_gap_reasons: self
+                .discharged_gap_reasons
+                .iter()
+                .map(|&reason| translation.semantic(reason))
+                .collect(),
             prerequisites: self
                 .prerequisites
                 .iter()
@@ -743,6 +754,10 @@ impl SpliceMount for ReferenceSeed {
                 .map(|metadata| remount_site_metadata(metadata, translation)),
             self.completion().splice(translation),
         )
+        .with_prefix_reference(
+            self.prefix_reference()
+                .map(|prefix| prefix.map(|prefix| translation.semantic(prefix))),
+        )
         .with_language(self.language())
     }
 }
@@ -853,11 +868,40 @@ impl SpliceMount for SelectedGapReasonProvenance {
 
 impl SpliceMount for SelectedTypeFrontierCompletion {
     fn splice<T: ResolutionIdentityTranslation>(&self, translation: &T) -> Self {
+        let contributions = self
+            .java_contributions()
+            .iter()
+            .map(|contribution| {
+                let occurrence = match contribution.occurrence() {
+                    SelectedJavaGapOccurrence::LoweredDigest(digest) => {
+                        SelectedJavaGapOccurrence::LoweredDigest(digest)
+                    }
+                    SelectedJavaGapOccurrence::StoredMain { mount, gap } => {
+                        SelectedJavaGapOccurrence::StoredMain {
+                            mount: translation
+                                .fragment(BindingFragmentId::at_ordinal(mount))
+                                .ordinal(),
+                            gap,
+                        }
+                    }
+                    SelectedJavaGapOccurrence::Staged { producer, gap } => {
+                        SelectedJavaGapOccurrence::Staged { producer, gap }
+                    }
+                };
+                contribution.with_mounted_parts(
+                    occurrence,
+                    translation.fragment(contribution.fragment()),
+                    translation.semantic(contribution.frontier()),
+                    translation.semantic(contribution.reason()),
+                )
+            })
+            .collect::<Vec<_>>();
         SelectedTypeFrontierCompletion::new(
             translation.fragment(self.fragment()),
             translation.semantic(self.frontier()),
             self.completion().splice(translation),
         )
+        .with_java_contributions(contributions.into_boxed_slice())
     }
 }
 
@@ -897,6 +941,14 @@ impl SpliceMount for ReferenceLocalPathEvidence {
             self.reaches_package_root_scope(),
         )
         .with_local_bindings_certified(self.local_bindings_certified())
+        .with_definition_endpoints(
+            self.definition_endpoints()
+                .iter()
+                .map(|(definition, node)| {
+                    (translation.semantic(*definition), translation.node(*node))
+                })
+                .collect(),
+        )
         .with_lexical_scopes(
             self.lexical_scopes()
                 .iter()
@@ -1244,6 +1296,19 @@ where
     S: std::ops::Deref,
     S::Target: BatchResolutionFragmentSource,
 {
+    fn root_reference_token(
+        &self,
+        reference: SemanticId,
+        candidate: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.inner.root_reference_token(
+            self.argument(&reference),
+            self.argument(&candidate),
+            cancellation,
+        )
+    }
+
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -1349,6 +1414,15 @@ where
     ) -> StoreResult<bool> {
         self.inner
             .supports_direct_type_shapes(self.argument(&reference), cancellation)
+    }
+
+    fn supports_exact_type_argument_links(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.inner
+            .supports_exact_type_argument_links(self.argument(&reference), cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -1625,6 +1699,38 @@ where
     S: std::ops::Deref,
     S::Target: SelectedTypedFactSource,
 {
+    fn selected_blob_for_fragment(
+        &self,
+        fragment: BindingFragmentId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<i64>>> {
+        self.inner.selected_blob_for_fragment(
+            self.interior_translation().fragment(fragment),
+            cancellation,
+        )
+    }
+    fn selected_blob_gap_reason_provenance(
+        &self,
+        blob: i64,
+        fragment: BindingFragmentId,
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SelectedGapReasonProvenance>>> {
+        self.inner
+            .selected_blob_gap_reason_provenance(
+                blob,
+                self.interior_translation().fragment(fragment),
+                &self.arguments(reasons),
+                cancellation,
+            )
+            .map(|rows| rows.map(|rows| self.results(&rows)))
+    }
+    fn jvm_external_owner_is_indexed(
+        &self,
+        owner: &super::ExternalOwnerIdentity,
+    ) -> StoreResult<bool> {
+        self.inner.jvm_external_owner_is_indexed(owner)
+    }
     fn supports_conditional_type_seeds(&self) -> bool {
         self.inner.supports_conditional_type_seeds()
     }
@@ -1641,6 +1747,31 @@ where
         ))
     }
 
+    fn selected_model_language(
+        &self,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<brokk_bifrost_core::analyzer::Language>> {
+        self.inner
+            .selected_model_language(self.argument(&token), cancellation)
+    }
+    fn selected_model_projection(
+        &self,
+        token: SemanticId,
+        kind: brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind,
+        receivers: &[crate::analyzer::resolution::ResolutionSlotValue],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<(Vec<super::ResolutionSlotValue>, super::ResolutionCompletion)>> {
+        Ok(self
+            .inner
+            .selected_model_projection(
+                self.argument(&token),
+                kind,
+                &self.arguments(receivers),
+                cancellation,
+            )?
+            .map(|(values, completion)| (self.results(&values), self.result(&completion))))
+    }
     fn qualified_member_registrations(
         &self,
     ) -> &'static [super::fact_source::QualifiedMemberRegistration] {
@@ -1674,6 +1805,15 @@ where
     ) -> StoreResult<bool> {
         self.inner
             .jvm_intrinsic_owner_is_unshadowed(owner_fqn, cancellation)
+    }
+
+    fn selected_jvm_declaration_owner(
+        &self,
+        owner_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<super::ExternalOwnerIdentity>>> {
+        self.inner
+            .selected_jvm_declaration_owner(owner_fqn, cancellation)
     }
 
     fn generated_items_cannot_shadow_bindings(
@@ -1962,6 +2102,11 @@ where
                         .enclosing_templates
                         .iter()
                         .map(|owner| self.result(owner))
+                        .collect();
+                    row.enclosing_template_heads = row
+                        .enclosing_template_heads
+                        .iter()
+                        .map(|head| head.map(|node| self.result(&node)))
                         .collect();
                     row.outermost_type = row.outermost_type.map(|owner| self.result(&owner));
                 }
@@ -2603,11 +2748,13 @@ mod tests {
         );
         // #8834: jvm_selected_root_presence is forwarded with the other seam methods.
         // #5671: forward the root-inventory admission session with the other seam methods.
-        assert_eq!(batch.len(), 39, "BatchResolutionFragmentSource: {batch:?}");
+        // #7708: supports_exact_type_argument_links is forwarded with the other seam methods.
+        assert_eq!(batch.len(), 41, "BatchResolutionFragmentSource: {batch:?}");
         // The descriptor-only projection is forwarded independently of the
         // seed reader; the source-derived membership check below proves both.
-        // #7619 adds two readers; #5671 adds one.
-        assert_eq!(typed.len(), 98, "SelectedTypedFactSource: {typed:?}");
+        // #7619 adds two readers; #5671 adds one; #7654 adds
+        // selected_jvm_declaration_owner; #5658 adds two Python readers.
+        assert_eq!(typed.len(), 104, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = forwarded_methods(include_str!("mounted.rs"))
             .into_iter()

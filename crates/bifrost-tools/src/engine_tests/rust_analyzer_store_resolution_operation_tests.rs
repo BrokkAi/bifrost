@@ -403,6 +403,7 @@ pub mod rust_departing_root_tests {
                         cancellation,
                     )
                 },
+                |_| Ok(()),
                 |queries| {
                     let candidates = queries
                         .candidate_sets(targets)?
@@ -2129,14 +2130,14 @@ pub mod rust_departing_root_tests {
                 self._project_root.path(),
                 RUST_ROOT_CONSUMER_PATH,
                 source,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
             );
             let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                 .expect("hash private Rust persisted source");
             let prepared = AnalyzerStore::prepare_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 self.generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 Arc::clone(&state),
             )
             .expect("prepare private Rust persisted source");
@@ -2189,7 +2190,7 @@ pub mod rust_departing_root_tests {
                     self._project_root.path(),
                     relative_path,
                     source,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                 );
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .expect("hash private Rust persisted source");
@@ -2197,7 +2198,7 @@ pub mod rust_departing_root_tests {
                     AnalyzerStore::prepare_parsed_blob(
                         &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                         self.generation,
-                        &RustAdapter,
+                        &RustAdapter::for_tests(),
                         Arc::clone(&state),
                     )
                     .expect("prepare private Rust persisted source"),
@@ -2377,7 +2378,7 @@ pub mod rust_departing_root_tests {
             );
             let project_root = tempfile::tempdir().expect("Rust root operation test project root");
             let project = MutableGenerationProject::new(project_root.path(), Language::Rust);
-            let adapter = RustAdapter;
+            let adapter = RustAdapter::for_tests();
             let store = AnalyzerStore::open_ephemeral().expect("Rust root operation test store");
             let generation = store
                 .ensure_language_epoch_value("rust", "resolution-operation-rust-root-test-v1")
@@ -2587,7 +2588,7 @@ pub mod rust_departing_root_tests {
             let prepared = AnalyzerStore::prepare_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 self.generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 Arc::clone(state),
             )
             .expect("prepare actual parsed replacement content");
@@ -3051,7 +3052,7 @@ pub mod rust_departing_root_tests {
         pub(crate) const FANOUT: i64 = 128;
         // These are independent input rows, not the production gap encoder.
         // The schema's shared-name invariant is satisfied even for synthetic names.
-        let lookups = fixture.store.conn.execute(move |conn| {
+        let lookups = fixture.store.conn.execute_fixture(move |conn| {
         let mut lookups = vec![0];
         for index in 1..=FANOUT {
             let mut digest = [0_u8; 32];
@@ -3325,7 +3326,7 @@ pub mod rust_departing_root_tests {
         use rusqlite::types::Value;
 
         let fixture = RustRootResolutionOperationFixture::new();
-        let zero_count_tails = fixture.store.conn.execute(|conn| {
+        let zero_count_tails = fixture.store.conn.execute_fixture(|conn| {
             conn.execute(
                 "INSERT INTO resolution_path_endpoint_headers
                  (blob_id, direction, identity_id, symbol_fixed_count, open_tail)
@@ -3755,14 +3756,37 @@ pub mod rust_departing_root_tests {
             // (resolution_selection.rs) and, per search, four reads that verify
             // reason-owner memo hits against the publication (resolution_typed.rs,
             // cfg(debug_assertions)). Release-code builds such as the measure
-            // profile compile them out: 270/238 open, 328 search.
+            // profile compile them out: 270/238 open, 328 search at that time; the
+            // #9231 and packed TEMP notes below move the measure counts to 270/237, 330.
             // #8166: the batch candidate-path memo serves repeated
             // RESOLUTION_PATHS_BY_KEY_SQL hydration within one point operation;
             // only that statement moves: -2 executions/-3 rows per search.
+            // #9231: before the typed-round ready queue forwards a call result
+            // whose input is newly demanded, it reads that input's competing
+            // producers through the selected readers: +2 search statements and
+            // no decoded rows in both debug and measure builds after the merge.
+            // Packed TEMP admissions remove the count table's unique index:
+            // one fewer schema row at cold open, with identical point work.
+            // #9060: the semi-naive typed worklist skips clean references and
+            // slots, removing four repeated search statements in debug builds.
+            // Merged: both changes are independent; both profiles measured after the merge.
+            // #9709 (migration 0274) adds the member_type_coverage stage family:
+            // its TEMP table and unique and seek indexes add three cold-open
+            // schema statements and rows in both profiles; the search is unchanged.
+            // #9755 serves the exact-key site-row memo only inside an active stage
+            // read, so a cached absence cannot cross a lazy publication. This
+            // search repeats one RESOLUTION_SITES_BY_KEY_SQL read outside a stage
+            // read that the memo used to answer: +1 statement/+1 decoded row per
+            // search in both profiles (the gate is not cfg-dependent); the open
+            // is unchanged.
+            // #9948 installs three selected-summary TEMP trigger definitions
+            // (+3 schema statements/rows at cold open). This Rust fixture also
+            // executes four trigger bodies while filling/clearing selection
+            // rows (+4 statements, no decoded result rows). Search is unchanged.
             if cfg!(debug_assertions) {
-                (273, 241, 332, 204)
+                (283, 246, 331, 205)
             } else {
-                (270, 238, 328, 204)
+                (280, 243, 331, 205)
             },
             "production Rust cold point SQL changed; the crate-key open and row-backed point search have exact statement and decoded-row counts"
         );
@@ -3814,11 +3838,11 @@ pub mod rust_departing_root_tests {
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
             // The same three cached recipe reads as the cold search: -3/-3.
             // #8166: the same candidate-path hydration as the cold search: -2/-3.
-            if cfg!(debug_assertions) {
-                (5, 4, 332, 204)
-            } else {
-                (5, 4, 328, 204)
-            },
+            // #9231: the same two sole-producer reads as the cold search: +2/0
+            // in both debug and measure builds after the merge.
+            // #9755: the same site-row read outside a stage read as the cold
+            // search: +1/+1.
+            (5, 4, 331, 205),
             "production Rust warm point SQL changed; exact relational selection verification and requested opening metadata keep the open at five statements while the row-backed search has exact statement and decoded-row counts"
         );
         assert_eq!(
@@ -3841,11 +3865,10 @@ pub mod rust_departing_root_tests {
             // #6594: independently measured warm/repeated searches also skip 31 empty reads.
             // The same three cached recipe reads as the cold search: -3/-3.
             // #8166: the same candidate-path hydration as the cold search: -2/-3.
-            if cfg!(debug_assertions) {
-                (5, 4, 332, 204)
-            } else {
-                (5, 4, 328, 204)
-            },
+            // #9231: the same two sole-producer reads as the cold search: +2/0
+            // in both debug and measure builds after the merge.
+            // #9755: the same site-row read outside a stage read: +1/+1.
+            (5, 4, 331, 205),
             "repeated production Rust warm point SQL changed; the repeated retained selection and row-backed search have identical measured counts"
         );
         assert_eq!(cold.2, first_warm.2);
@@ -4261,6 +4284,9 @@ pub mod rust_departing_root_tests {
             BoundedResolution::Cancelled { work } => {
                 panic!("uncancelled production Rust point-scale search stopped at {work:?}")
             }
+            BoundedResolution::Unavailable { reason, work } => {
+                panic!("production Rust point-scale search lost an input ({reason}) at {work:?}")
+            }
         };
         let (oracle_outcome, _, oracle_answer) = answer_of(oracle);
         let bounded = match bounded {
@@ -4275,6 +4301,9 @@ pub mod rust_departing_root_tests {
                 BoundedResolution::Exceeded { limit, work }
             }
             BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
+            BoundedResolution::Unavailable { reason, work } => {
+                BoundedResolution::Unavailable { reason, work }
+            }
         };
         let (outcome, receiver_work, answer) = answer_of(bounded);
         assert_eq!(
@@ -4412,6 +4441,7 @@ pub mod rust_departing_root_tests {
                 summary_expansions: 0,
                 scope_nodes: expected_scope_nodes,
                 resolution_rounds: 10,
+                hierarchy_order_steps: 0,
             },
             "production Rust point-scale receiver work changed"
         );
@@ -4560,8 +4590,12 @@ pub mod rust_departing_root_tests {
         );
 
         let fixture = RustRootResolutionOperationFixture::new();
-        let (state, facts) =
-            parsed_operation_state(fixture._project_root.path(), PATH, SOURCE, &RustAdapter);
+        let (state, facts) = parsed_operation_state(
+            fixture._project_root.path(),
+            PATH,
+            SOURCE,
+            &RustAdapter::for_tests(),
+        );
         let definition = site_for_identifier(
             &facts,
             "persisted_macro",
@@ -4591,7 +4625,7 @@ pub mod rust_departing_root_tests {
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
             fixture.generation,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             state,
         )
         .expect("prepare Rust macro blob with resolution bundle");
@@ -4670,7 +4704,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let facts = state
             .source_facts
@@ -4807,7 +4841,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             &dirty_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let masks = [SelectedResolutionOverlayMask::replacement(
             "rust",
@@ -5067,7 +5101,7 @@ pub mod rust_departing_root_tests {
                 fixture._project_root.path(),
                 RUST_ROOT_CONSUMER_PATH,
                 new,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
             );
             let cancellation = CancellationToken::new();
             let content = fixture.publish_counterfactual_content(
@@ -5202,7 +5236,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             edited_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let content = fixture.publish_counterfactual_content(
             RUST_ROOT_CONSUMER_PATH,
@@ -5241,7 +5275,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             dirty_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let cancellation = CancellationToken::new();
         fixture.project.set_overlay_content(
@@ -5340,13 +5374,13 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             dirty_consumer_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let (provider_state, provider_facts) = parsed_operation_source_state(
             fixture._project_root.path(),
             RUST_ROOT_PROVIDER_PATH,
             dirty_provider_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let target = site_for_identifier(
             &provider_facts,
@@ -5501,7 +5535,7 @@ pub mod rust_departing_root_tests {
                 fixture._project_root.path(),
                 RUST_ROOT_CONSUMER_PATH,
                 source,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
             );
             let cancellation = CancellationToken::new();
             let replacement = fixture.publish_counterfactual_content(
@@ -5604,13 +5638,13 @@ pub mod rust_departing_root_tests {
                 fixture._project_root.path(),
                 RUST_ROOT_CONSUMER_PATH,
                 consumer_source,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
             );
             let (provider_state, provider_facts) = parsed_operation_source_state(
                 fixture._project_root.path(),
                 RUST_ROOT_PROVIDER_PATH,
                 provider_source,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
             );
             let cancellation = CancellationToken::new();
             let replacements = vec![
@@ -5744,7 +5778,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             dirty_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         // Former transient limitation: retain expected evidence until native review.
         let cancellation = CancellationToken::new();
@@ -5827,13 +5861,13 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             ALT_PROVIDER_ROOT_PATH,
             ALT_PROVIDER_ROOT_SOURCE,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let (alt_state, _) = parsed_operation_state(
             fixture._project_root.path(),
             ALT_PROVIDER_PATH,
             ALT_PROVIDER_SOURCE,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let alt_root_oid = Oid::hash_object(ObjectType::Blob, ALT_PROVIDER_ROOT_SOURCE.as_bytes())
             .expect("hash alternate Rust provider root source");
@@ -5843,14 +5877,14 @@ pub mod rust_departing_root_tests {
             AnalyzerStore::prepare_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(alt_root_oid, "rust"),
                 fixture.generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 alt_root_state,
             )
             .expect("prepare alternate Rust provider root blob"),
             AnalyzerStore::prepare_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(alt_oid, "rust"),
                 fixture.generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 alt_state,
             )
             .expect("prepare alternate Rust provider blob"),
@@ -6299,8 +6333,26 @@ pub mod rust_departing_root_tests {
                 // #6844 adds 30 charged steps for selected-language capability
                 // reads and positional callable-result slots. Nongeneric callees
                 // skip five empty generic-formal reader charges (312 -> 307).
-                scope_nodes: 307,
+                // #9231 charges the typed-round ready queue's sole-producer
+                // reads for newly demanded call-result inputs and the in-round
+                // DeclaredType steps they admit: 15 more steps, the same rounds
+                // and the same answer (307 -> 322).
+                // #9301 reads the binding projections of the evaluated
+                // references to find Scala bare-term bindings before the
+                // extension and term-family passes. Those reads run for every
+                // language, so this Rust request pays 24 more steps with the
+                // same rounds and the same answer (322 -> 346).
+                // #9300's semi-naive typed rounds skip unchanged reference and
+                // slot evaluations: 346 on #9301's master becomes 261 here
+                // after the exact-round self-answer dependency is restored.
+                // #9324 (30406a83b1) reads the answer's target member owners
+                // before discharging an inapplicable external access gap. This
+                // incomplete call answer pays two more scope steps for that
+                // read even though the fixture has no external sibling to
+                // discharge, with the same rounds and answer: 261 -> 263.
+                scope_nodes: 263,
                 resolution_rounds: 10,
+                hierarchy_order_steps: 0,
             },
             "engine admission charges the point request; tier-1 candidate and declaration work must remain exact"
         );
@@ -7004,7 +7056,7 @@ pub mod rust_departing_root_tests {
                     fixture._project_root.path(),
                     path,
                     &source,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                 );
                 ((*path).to_owned(), source, state)
             })
@@ -7030,7 +7082,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             reference_path,
             &reference_source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let site = site_for_identifier(
             &reference_facts,
@@ -7214,7 +7266,7 @@ pub mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let masks = replacement
             .map(|_| {
@@ -7491,7 +7543,7 @@ pub fn caller(t: &Tensor) {
             initial_inserts + 1,
             "the repeated operation reuses the prepared include plan"
         );
-        eprintln!("STORE_CACHE_WEIGHTS {:?}", cache.entry_weights_for_test());
+        eprintln!("STORE_CACHE_WEIGHTS {:?}", cache.region_stats());
     }
 
     /// A byte-identical replacement uses the persisted macro capsule; an edited
@@ -7685,7 +7737,7 @@ pub fn caller(t: &Tensor) {
                 fixture._project_root.path(),
                 RUST_ROOT_CONSUMER_PATH,
                 replacement.unwrap_or(RUST_MACRO_CONSUMER_SOURCE),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
             );
             let masks = replacement
                 .map(|_| {
@@ -7866,7 +7918,7 @@ pub fn caller(t: &Tensor) {
             let mut parser = Parser::new();
             let host_file = ProjectFile::new(fixture._project_root.path().to_path_buf(), path);
             parser
-                .set_language(&RustAdapter.parser_language_for_file(&host_file))
+                .set_language(&RustAdapter::for_tests().parser_language_for_file(&host_file))
                 .unwrap();
             let host_tree = parser.parse(&host_source, None).unwrap();
             let mut pending = vec![host_tree.root_node()];
@@ -8304,7 +8356,7 @@ pub fn caller(t: &Tensor) {
         // Class (c), unknown package placement, still qualifies every lexical
         // transfer read even when the requested slot has no typed frontier/rule.
         // Reference omissions and JVM alias gaps cannot create this covers=0 row.
-        fixture.store.conn.execute(move |conn| {
+        fixture.store.conn.execute_fixture(move |conn| {
         conn.execute("INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES(?1,930001,0,2)",[blob]).unwrap();
         conn.execute("INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) VALUES(?1,0,0,0,930001,930001)",[blob]).unwrap();
     });
@@ -8385,7 +8437,7 @@ pub fn caller(t: &Tensor) {
             (first.ordinal(), first.blob_id()),
             (second.ordinal(), second.blob_id()),
         ];
-        fixture.store.conn.execute(move |conn| {
+        fixture.store.conn.execute_fixture(move |conn| {
         for (_,blob) in coordinates {
             conn.execute("INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES(?1,960001,0,0)", [blob]).unwrap();
             for gap in [950_001,950_002] {
@@ -8560,7 +8612,7 @@ pub fn caller(t: &Tensor) {
         };
         pub(crate) const FIRST: u32 = 980_000;
         let blob_id = mount.blob_id();
-        fixture.store.conn.execute(move |conn| {
+        fixture.store.conn.execute_fixture(move |conn| {
     for offset in 0..64_u32 {
         conn.execute(
             "INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) VALUES(?1,?2,?3,0)",
@@ -8999,5 +9051,79 @@ pub fn caller(t: &Tensor) {
             panic!("selected Rust consumer-crate context must be ready")
         };
         (*context, crate_keys)
+    }
+    #[test]
+    #[hardwon("#9060: a forty-call Rust builder chain exhausted the bounded scope-node lookup")]
+    fn long_builder_chain_finishes_within_scope_node_budget() {
+        let length = 40;
+        let mut source = String::from("struct Builder; impl Builder { fn new() -> Self { Self }\n");
+        for n in 0..length {
+            source.push_str(&format!("fn a{n:02}(self, _: usize) -> Self {{ self }}\n"));
+        }
+        source.push_str(
+            "fn trim_ascii(self, _: usize) -> Self { self } }\nfn probe() { let _ = Builder::new()",
+        );
+        for n in 0..length {
+            source.push_str(&format!(".a{n:02}(1)"));
+        }
+        source.push_str(".trim_ascii(1); }\n");
+        let mut fixture = RustRootResolutionOperationFixture::new();
+        fixture.replace_persisted_consumer_source(&source);
+        let start = source.rfind(".trim_ascii(").unwrap() + 1;
+        let locator = SelectedSemanticLocator::for_reference_range(
+            "rust",
+            RUST_ROOT_CONSUMER_PATH,
+            start,
+            start + "trim_ascii".len(),
+        );
+        let cancellation = CancellationToken::new();
+        let outcome = fixture
+            .open_ready(&cancellation)
+            .resolve_rust_reference_for_caller_bounded(
+                Path::new(RUST_ROOT_CONSUMER_PATH),
+                &locator,
+                ReceiverAnalysisBudget {
+                    max_summary_expansions: 10_000,
+                    max_resolution_rounds: 10_000,
+                    max_scope_nodes: 200_000,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                &cancellation,
+                &mut SelectedResolutionContextMetrics,
+                &mut ResolutionBatchMetrics::default(),
+            )
+            .unwrap();
+        match outcome {
+            BoundedResolution::Complete {
+                value:
+                    SelectedRustCallerReferenceOutcome::Operation(
+                        SelectedResolutionOperationOutcome::Native(
+                            SelectedResolutionLocated::Found(answers),
+                        ),
+                    ),
+                work,
+            } => {
+                let answer = only_rust_point_answer(answers);
+                assert!(work.scope_nodes < 200_000, "{work:?}");
+                assert!(
+                    answer
+                        .definition_names
+                        .iter()
+                        .any(|(_, name)| name.ends_with("Builder.trim_ascii")),
+                    "{:?}",
+                    answer.definition_names
+                );
+            }
+            BoundedResolution::Complete { .. } => {
+                panic!("growth probe did not locate the Rust call")
+            }
+            BoundedResolution::Exceeded { limit, work } => {
+                panic!("builder lookup exceeded {limit:?}: {work:?}")
+            }
+            BoundedResolution::Cancelled { work } => panic!("builder lookup cancelled: {work:?}"),
+            BoundedResolution::Unavailable { reason, work } => {
+                panic!("builder lookup lost an input ({reason}): {work:?}")
+            }
+        }
     }
 }

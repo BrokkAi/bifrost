@@ -1539,6 +1539,8 @@ pub struct RustMacroInputToken {
 /// later consumers rather than silently reflecting a projection's choices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RustItemSourceFacts {
+    /// Boundaries collected from the completed primary source tree.
+    pub impl_census_boundaries: Vec<RustImplCensusBoundary>,
     pub contexts: Vec<RustSourceContextFact>,
     pub syntax: Vec<RustItemSyntaxFact>,
     pub generics: Vec<RustDeclarationGenericsSourceFact>,
@@ -1551,6 +1553,21 @@ pub struct RustItemSourceFacts {
     pub macro_definitions: Vec<RustMacroDefinitionSourceFact>,
     pub macro_inputs: Vec<RustMacroInvocationInputSourceFact>,
     pub import_contexts: Vec<RustItemImportContextFact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RustImplCensusBoundary {
+    pub kind: RustImplCensusBoundaryKind,
+    pub start_byte: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustImplCensusBoundaryKind {
+    Macro,
+    Derive,
+    ExpandingAttribute,
+    InternalAttribute,
+    SyntaxError,
 }
 
 impl RustItemSourceFacts {
@@ -1595,6 +1612,11 @@ impl RustItemSourceFacts {
         self.contexts
             .capacity()
             .saturating_mul(std::mem::size_of::<RustSourceContextFact>())
+            .saturating_add(
+                self.impl_census_boundaries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<RustImplCensusBoundary>()),
+            )
             .saturating_add(
                 self.contexts
                     .iter()

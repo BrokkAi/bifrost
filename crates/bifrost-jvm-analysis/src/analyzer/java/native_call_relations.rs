@@ -9,6 +9,9 @@ use crate::analyzer::java::JavaAnalyzer;
 use crate::analyzer::java::selected_reverse::JavaSelectedInverseResolution;
 
 use crate::analyzer::java::selected_reverse::JavaSelectedReverseOutcome;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::ReverseReferenceExecutionContext;
+use brokk_bifrost_core::analyzer::model::ProcedureKind;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionDisposition;
 
 use crate::analyzer::java::selected_reverse::java_selected_inverse_detailed_for;
 
@@ -29,6 +32,7 @@ use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationProvider;
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationResult;
+use brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage;
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::native_incoming_preflight;
 
@@ -146,9 +150,27 @@ fn project_incoming_calls(
 ) -> CallRelationResult {
     let mut result = CallRelationResult {
         proof_authority: UsageProofAuthority::Native,
+        caller_inventory: if matches!(selected.edges.completeness, EdgeCompleteness::Complete) {
+            CallerInventoryCoverage::Complete
+        } else {
+            CallerInventoryCoverage::Incomplete
+        },
         diagnostics: incomplete_diagnostics(&selected.edges, target),
         ..CallRelationResult::default()
     };
+    if result.caller_inventory == CallerInventoryCoverage::Complete
+        && java_unenumerable_dispatch(java, target)
+    {
+        result.diagnostics.push(diagnostic(
+            CallRelationDiagnosticCode::AnalysisFailed,
+            format!(
+                "Java dispatch can reach {} without a selected inverse row",
+                target.fq_name()
+            ),
+            target.fq_name().to_string(),
+            "native_call_dispatch_unenumerable",
+        ));
+    }
     let mut selected_edges = std::mem::take(&mut selected.edges.edges);
     selected_edges.sort_by(|left, right| {
         (
@@ -195,7 +217,6 @@ fn project_incoming_calls(
                 edge.site.file.to_string(),
                 reason,
             ));
-            continue;
         }
         rows.push((edge, ()));
     }
@@ -213,6 +234,31 @@ fn project_incoming_calls(
     if let Some(sites) = projected.unwrap_or_else(|never| match never {}) {
         finish_incoming_sites(sites, &mut result);
     }
+    for site in &result.sites {
+        let context = selected.execution_context(
+            &site.file,
+            site.callee_range.start_byte,
+            site.callee_range.end_byte,
+        );
+        record_caller_context(
+            &mut result.caller_inventory,
+            &mut result.diagnostics,
+            context,
+            &site.file,
+            &site.callee_range,
+        );
+    }
+    if result.caller_inventory == CallerInventoryCoverage::Incomplete && result.sites.is_empty() {
+        result.diagnostics.push(diagnostic(
+            CallRelationDiagnosticCode::AnalysisFailed,
+            format!(
+                "no projected Java invocation certifies callers of {}",
+                target.fq_name()
+            ),
+            target.fq_name().to_string(),
+            "native_call_target_without_invocation_certificate",
+        ));
+    }
     // Constructor identity is a Java rule; raw_call_site preserves syntax kind.
     if target.is_class()
         || java
@@ -227,6 +273,68 @@ fn project_incoming_calls(
     result
 }
 
+fn caller_context_reason(
+    context: Option<ReverseReferenceExecutionContext>,
+) -> Option<&'static str> {
+    use brokk_bifrost_analysis::analyzer::read_ledger::reason;
+    match context {
+        // A present callable_site is the navigation owner: the store's
+        // publication seal (validate_reference_execution_contexts) rejects any
+        // method or constructor context whose callable_site is not the site's
+        // owner, and selected reads serve only sealed fragments.
+        Some(ReverseReferenceExecutionContext::Present {
+            disposition: ResolutionReferenceExecutionDisposition::Callable,
+            callable_site: Some(_),
+            ..
+        }) => None,
+        Some(ReverseReferenceExecutionContext::Present {
+            disposition: ResolutionReferenceExecutionDisposition::Callable,
+            procedure_kind: Some(ProcedureKind::Lambda | ProcedureKind::Initializer),
+            callable_site: None,
+            ..
+        }) => Some(reason::JAVA_CALLER_PUBLIC_IDENTITY_MISSING),
+        Some(ReverseReferenceExecutionContext::Present {
+            disposition: ResolutionReferenceExecutionDisposition::Unknown,
+            ..
+        }) => Some(reason::JAVA_REFERENCE_EXECUTION_CONTEXT_UNKNOWN),
+        Some(ReverseReferenceExecutionContext::CapabilityAbsent) => {
+            Some(reason::JAVA_REFERENCE_EXECUTION_CONTEXT_CAPABILITY_ABSENT)
+        }
+        Some(ReverseReferenceExecutionContext::RowAbsent) => {
+            Some(reason::JAVA_REFERENCE_EXECUTION_CONTEXT_ROW_ABSENT)
+        }
+        Some(ReverseReferenceExecutionContext::Present { .. }) | None => {
+            Some(reason::JAVA_REFERENCE_EXECUTION_CONTEXT_CORRUPT)
+        }
+    }
+}
+
+fn record_caller_context(
+    coverage: &mut CallerInventoryCoverage,
+    diagnostics: &mut Vec<CallRelationDiagnostic>,
+    context: Option<ReverseReferenceExecutionContext>,
+    file: &ProjectFile,
+    range: &brokk_bifrost_core::analyzer::model::Range,
+) {
+    let Some(reason) = caller_context_reason(context) else {
+        return;
+    };
+    *coverage = CallerInventoryCoverage::Incomplete;
+    let message = format!("Java caller identity is incomplete at {range:?}: {reason}");
+    if !diagnostics.iter().any(|item| {
+        item.reason_kind.as_deref() == Some(reason)
+            && item.context == file.to_string()
+            && item.message == message
+    }) {
+        diagnostics.push(diagnostic(
+            CallRelationDiagnosticCode::AnalysisFailed,
+            message,
+            file.to_string(),
+            reason,
+        ));
+    }
+}
+
 struct JavaIncomingProjection<'a> {
     java: &'a JavaAnalyzer,
     trees: HashMap<ProjectFile, Tree>,
@@ -234,6 +342,10 @@ struct JavaIncomingProjection<'a> {
 
 impl IncomingCallProjection for JavaIncomingProjection<'_> {
     type Error = std::convert::Infallible;
+
+    fn unenumerable_dispatch(&mut self, target: &CodeUnit) -> Result<bool, Self::Error> {
+        Ok(java_unenumerable_dispatch(self.java, target))
+    }
 
     fn load_file(
         &mut self,
@@ -333,6 +445,20 @@ impl IncomingCallProjection for JavaIncomingProjection<'_> {
     }
 }
 
+fn java_unenumerable_dispatch(java: &JavaAnalyzer, target: &CodeUnit) -> bool {
+    if !target.is_function() {
+        return false;
+    }
+    let metadata = java.signature_metadata(target);
+    // A receiver can escape through virtual dispatch, a functional value, or
+    // an external callback. The selected inverse has no closed-dispatch proof.
+    // Missing metadata cannot certify a direct-only call either.
+    metadata.is_empty()
+        || !metadata
+            .iter()
+            .all(|signature| signature.callable_is_constructor() || signature.callable_is_static())
+}
+
 fn is_java_invocation_reference(root: Node<'_>, start_byte: usize, end_byte: usize) -> bool {
     let mut candidates = Vec::new();
     let mut stack = vec![root];
@@ -427,5 +553,42 @@ fn diagnostic(
         context: context.into(),
         semantic_count: None,
         reason_kind: Some(reason_kind.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod caller_context_tests {
+    use super::*;
+
+    #[test]
+    fn selected_execution_context_controls_caller_identity() {
+        let state = |disposition, procedure_kind, callable_site| {
+            Some(ReverseReferenceExecutionContext::Present {
+                disposition,
+                procedure_kind,
+                initializer_is_static: None,
+                callable_site,
+            })
+        };
+        let file = ProjectFile::new(std::env::temp_dir(), "Caller.java");
+        let range = brokk_bifrost_core::analyzer::model::Range {
+            start_byte: 1,
+            end_byte: 2,
+            start_line: 0,
+            end_line: 0,
+        };
+        for (context, expected) in [
+            (state(ResolutionReferenceExecutionDisposition::Callable, Some(ProcedureKind::Lambda), None), Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::JAVA_CALLER_PUBLIC_IDENTITY_MISSING)),
+            (state(ResolutionReferenceExecutionDisposition::Unknown, None, None), Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::JAVA_REFERENCE_EXECUTION_CONTEXT_UNKNOWN)),
+            (Some(ReverseReferenceExecutionContext::RowAbsent), Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::JAVA_REFERENCE_EXECUTION_CONTEXT_ROW_ABSENT)),
+            (Some(ReverseReferenceExecutionContext::CapabilityAbsent), Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::JAVA_REFERENCE_EXECUTION_CONTEXT_CAPABILITY_ABSENT)),
+            (state(ResolutionReferenceExecutionDisposition::NonExecutable, None, None), Some(brokk_bifrost_analysis::analyzer::read_ledger::reason::JAVA_REFERENCE_EXECUTION_CONTEXT_CORRUPT)),
+        ] {
+            let mut coverage = CallerInventoryCoverage::Complete;
+            let mut diagnostics = Vec::new();
+            record_caller_context(&mut coverage, &mut diagnostics, context, &file, &range);
+            assert_eq!(coverage, if expected.is_some() { CallerInventoryCoverage::Incomplete } else { CallerInventoryCoverage::Complete });
+            assert_eq!(diagnostics.first().and_then(|entry| entry.reason_kind.as_deref()), expected);
+        }
     }
 }

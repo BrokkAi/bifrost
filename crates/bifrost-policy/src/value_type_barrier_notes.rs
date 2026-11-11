@@ -30,6 +30,35 @@ pub struct ValueTypeBarrierNote {
 }
 
 impl ValueTypeBarrierNote {
+    pub(crate) fn from_output_check(
+        workspace: &WorkspaceAnalyzer,
+        check: &brokk_bifrost_flow::taint::output_product::OutputBarrierCheckRow,
+    ) -> Result<Self, String> {
+        let brokk_bifrost_flow::taint::output_product::OutputBarrierDecisionRow::Undecided(reason) =
+            check.decision
+        else {
+            return Err("a barrier note requires an undecided proof".into());
+        };
+        let locator = check
+            .value_location
+            .clone()
+            .decode()
+            .map_err(|error| format!("{error:?}"))?;
+        let note = Self {
+            barrier_id: check.id.clone(),
+            predicate: check.predicate,
+            reason,
+            location: crate::semantic_identity::policy_location(workspace, &locator)?,
+            mapping_kind: check.mapping_kind.clone(),
+            procedure: check.procedure.clone(),
+            value_id: check.value_id,
+            phase: check.phase.clone(),
+            name: check.name.clone(),
+        };
+        note.validate().map_err(|error| error.to_string())?;
+        Ok(note)
+    }
+
     pub fn barrier_id(&self) -> &str {
         &self.barrier_id
     }
@@ -154,12 +183,12 @@ impl ValueTypeBarrierNote {
 impl RetainedSize for ValueTypeBarrierNote {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.barrier_id.capacity()
+            + self.barrier_id.len()
             + retained_extra(&self.location)
-            + self.mapping_kind.capacity()
-            + self.procedure.capacity()
-            + self.phase.capacity()
-            + retained_extra(&self.name)
+            + self.mapping_kind.len()
+            + self.procedure.len()
+            + self.phase.len()
+            + self.name.as_ref().map_or(0, String::len)
     }
 }
 
@@ -188,20 +217,12 @@ impl ValueTypeBarrierNotes {
         if self.entries.contains(&note) {
             return;
         }
-        let extra = retained_extra(&note)
-            + if self.entries.len() == self.entries.capacity() {
-                std::mem::size_of::<ValueTypeBarrierNote>()
-            } else {
-                0
-            };
+        let extra = note.retained_size();
         if self.entries.len() == MAX_NOTES
             || self.retained_size().saturating_add(extra) > MAX_NOTE_BYTES
         {
             self.note_omitted();
             return;
-        }
-        if self.entries.len() == self.entries.capacity() {
-            self.entries.reserve_exact(1);
         }
         self.entries.push(note);
     }
@@ -237,7 +258,12 @@ impl ValueTypeBarrierNotes {
 
 impl RetainedSize for ValueTypeBarrierNotes {
     fn retained_size(&self) -> usize {
-        std::mem::size_of::<Self>() + retained_extra(&self.entries)
+        std::mem::size_of::<Self>()
+            + self
+                .entries
+                .iter()
+                .map(RetainedSize::retained_size)
+                .sum::<usize>()
     }
 }
 

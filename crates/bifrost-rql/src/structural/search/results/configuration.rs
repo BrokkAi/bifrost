@@ -21,6 +21,7 @@ pub struct CodeQueryConfigurationFact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_id: Option<String>,
     pub path: String,
+    pub directory: String,
     pub format: &'static str,
     pub node_kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]

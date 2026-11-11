@@ -5,9 +5,9 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::analyzer::complete_value_cache::{
-    CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
-};
+use crate::analyzer::complete_value_cache::CompleteValueWait;
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
+use brokk_bifrost_core::retention_budget::{RetainedBytes, RetentionBudget, SharedAllocation};
 
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{
@@ -19,17 +19,11 @@ use crate::analyzer::read_ledger::ReadKey;
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry, memo_attribution};
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use brokk_bifrost_core::analyzer::memo_attribution::ReplayedMemoValue;
 use brokk_bifrost_store::analyzer::store::cache_budget::{RetainedHeap, retained_read_key};
 
 type DerivedLayerEntry = ReplayingMemoEntry<Arc<DerivedLayer>, ReadKey>;
-
-fn entry_retained_bytes(entry: &DerivedLayerEntry) -> usize {
-    entry.retained_bytes(|key| {
-        let mut heap = RetainedHeap::default();
-        retained_read_key(&mut heap, key);
-        heap.total()
-    })
-}
+pub type DerivedLayerHandle = ReplayedMemoValue<Arc<DerivedLayer>, ReadKey>;
 
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
@@ -152,7 +146,7 @@ pub enum DerivedLayerLifecycle {
 
 pub enum DerivedLayerAcquisition {
     Ready {
-        layer: Arc<DerivedLayer>,
+        layer: DerivedLayerHandle,
         lifecycle: DerivedLayerLifecycle,
         wait: CompleteValueWait,
         build: DerivedLayerBuildMetrics,
@@ -183,6 +177,12 @@ pub enum DerivedLayerAcquisition {
 struct DerivedLayerKey {
     request: DerivedLayerRequest,
     workspace_content: WorkspaceContentIdentity,
+}
+
+impl RetainedBytes for DerivedLayerKey {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+    }
 }
 
 impl DerivedLayerKey {
@@ -234,27 +234,26 @@ struct DerivedLayerObservations {
 /// caller still supplies a `content_is_current` predicate and a late build
 /// against content that has moved is refused rather than published.
 pub struct SnapshotDerivedLayerCache {
-    max_retained_bytes: u64,
-    values: ReplayingMemo<CompleteValueCache<DerivedLayerKey, DerivedLayerEntry>>,
+    construction_limit_bytes: u64,
+    budget: RetentionBudget,
+    values: ReplayingMemo<BudgetedValueCache<DerivedLayerKey, SharedAllocation<DerivedLayerEntry>>>,
     observations: Mutex<Vec<(WorkspaceContentIdentity, DerivedLayerObservations)>>,
     verdicts: ArtifactVerdictLog,
 }
 
 impl SnapshotDerivedLayerCache {
-    pub const DEFAULT_MAX_RETAINED_BYTES: u64 = 32 * 1024 * 1024;
+    pub const DEFAULT_CONSTRUCTION_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
     /// How many workspace content identities keep their Auto observations.
     /// Small: an analyzer answers about one content at a time, and the previous
     /// one only matters while an in-flight request still holds it.
     const MAX_OBSERVED_CONTENTS: usize = 4;
 
-    pub fn new(max_retained_bytes: u64) -> Self {
+    pub fn new(construction_limit_bytes: u64, budget: &RetentionBudget) -> Self {
         Self {
-            max_retained_bytes,
-            values: ReplayingMemo::new(CompleteValueCache::new(
-                max_retained_bytes,
-                |_, entry: &Arc<DerivedLayerEntry>| {
-                    entry_retained_bytes(entry).clamp(1, u32::MAX as usize) as u32
-                },
+            construction_limit_bytes,
+            budget: budget.clone(),
+            values: ReplayingMemo::new(BudgetedValueCache::new(
+                budget.region("analysis.derived_layers", None),
             )),
             observations: Mutex::new(Vec::new()),
             verdicts: ArtifactVerdictLog::default(),
@@ -314,7 +313,7 @@ impl SnapshotDerivedLayerCache {
         request: DerivedLayerRequest,
         workspace_content: WorkspaceContentIdentity,
         cancellation: &CancellationToken,
-    ) -> Option<Arc<DerivedLayer>> {
+    ) -> Option<DerivedLayerHandle> {
         let key = DerivedLayerKey {
             request,
             workspace_content,
@@ -322,10 +321,12 @@ impl SnapshotDerivedLayerCache {
         let ready = self
             .values
             .read(&memo_attribution(analyzer), |values, _| {
-                values.get_ready(&key, cancellation).ok_or(())
+                values
+                    .get_ready(&key, cancellation)
+                    .map(|value| Arc::clone(value.arc()))
+                    .ok_or(())
             })
-            .ok()
-            .map(|entry| Arc::clone(&entry));
+            .ok();
         self.verdicts.record(match ready {
             Some(_) => ArtifactVerdict::Retained(RetentionReason::InputsUnchanged {
                 artifact: key.artifact(),
@@ -337,8 +338,8 @@ impl SnapshotDerivedLayerCache {
         ready
     }
 
-    pub fn max_retained_bytes(&self) -> u64 {
-        self.max_retained_bytes
+    pub fn construction_limit_bytes(&self) -> u64 {
+        self.construction_limit_bytes
     }
 
     /// Auto avoids constructing a whole-workspace relation for a one-off
@@ -414,7 +415,7 @@ impl SnapshotDerivedLayerCache {
             let (acquisition, wait) = values.acquire(&key, cancellation);
             wait_metrics = wait;
             match acquisition {
-                CompleteValueAcquisition::Cached { value } => {
+                BudgetedValueAcquisition::Cached { value } => {
                     if !content_is_current() {
                         return Err(DerivedLayerAcquisition::Unavailable {
                             reason: "derived-layer workspace content changed before reuse".to_string(),
@@ -423,9 +424,9 @@ impl SnapshotDerivedLayerCache {
                         });
                     }
                     self.verdicts.record(ArtifactVerdict::Retained(RetentionReason::InputsUnchanged { artifact: key.artifact() }));
-                    Ok(value)
+                    Ok(Arc::clone(value.arc()))
                 }
-                CompleteValueAcquisition::Leader { permit } => {
+                BudgetedValueAcquisition::Leader { permit } => {
                     self.verdicts.record(ArtifactVerdict::Invalidated(InvalidationReason::NoRetainedArtifact { artifact: key.artifact() }));
                     let mut reject_followers = false;
                     let entry = capture.try_build_weighted(|| {
@@ -461,8 +462,8 @@ impl SnapshotDerivedLayerCache {
                             }
                         }
                     });
-                    let entry = match entry {
-                        Ok(entry) => Arc::new(entry),
+                    let mut entry = match entry {
+                        Ok(entry) => entry,
                         Err(failure) => {
                             if reject_followers {
                                 permit.publish_rejected();
@@ -470,15 +471,18 @@ impl SnapshotDerivedLayerCache {
                             return Err(failure);
                         }
                     };
-                    let retained_bytes = entry_retained_bytes(&entry);
-                    if retained_bytes as u64 > self.max_retained_bytes {
-                        permit.publish_rejected();
-                        return Err(DerivedLayerAcquisition::Unavailable {
-                            reason: format!("derived layer retained-byte limit exceeded: {retained_bytes} > {}", self.max_retained_bytes),
-                            over_budget: true, rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget), wait, build: build_metrics,
-                        });
+                    entry.charge(&self.budget, |key| {
+                        let mut heap = RetainedHeap::default();
+                        retained_read_key(&mut heap, key);
+                        heap.total()
+                    });
+                    let charged = brokk_bifrost_core::retention_budget::SelfCharged::allocation_charge(&entry).is_charged();
+                    let entry = Arc::new(entry);
+                    if charged {
+                        permit.publish_complete(SharedAllocation::new(Arc::clone(&entry)));
+                    } else {
+                        permit.publish_request_owned(SharedAllocation::new(Arc::clone(&entry)));
                     }
-                    permit.publish_complete(Arc::clone(&entry));
                     if !content_is_current() {
                         return Err(DerivedLayerAcquisition::Unavailable {
                             reason: "derived-layer workspace content changed during publication".to_string(),
@@ -488,16 +492,16 @@ impl SnapshotDerivedLayerCache {
                     lifecycle = DerivedLayerLifecycle::Built;
                     Ok(entry)
                 }
-                CompleteValueAcquisition::Rejected => Err(DerivedLayerAcquisition::Unavailable {
+                BudgetedValueAcquisition::Rejected => Err(DerivedLayerAcquisition::Unavailable {
                     reason: "derived-layer construction rejected by same-key leader".to_string(),
                     over_budget: false, rejection_scope: None, wait, build: DerivedLayerBuildMetrics::default(),
                 }),
-                CompleteValueAcquisition::Cancelled => Err(DerivedLayerAcquisition::Cancelled { wait, build: DerivedLayerBuildMetrics::default() }),
+                BudgetedValueAcquisition::Cancelled => Err(DerivedLayerAcquisition::Cancelled { wait, build: DerivedLayerBuildMetrics::default() }),
             }
         });
         match selected {
             Ok(entry) => DerivedLayerAcquisition::Ready {
-                layer: Arc::clone(&entry),
+                layer: entry,
                 lifecycle,
                 wait: wait_metrics,
                 build: build_metrics,
@@ -511,27 +515,38 @@ impl SnapshotDerivedLayerCache {
         self.values
             .read(
                 &memo_attribution(&crate::analyzer::MultiAnalyzer::default()),
-                |values, _| Err::<Arc<DerivedLayerEntry>, _>(values.len_for_test()),
+                |values, _| {
+                    Err::<Arc<DerivedLayerEntry>, _>(values.region().stats().entries as u64)
+                },
             )
             .err()
             .expect("test observation returns no retained answer")
     }
 
     #[cfg(test)]
-    fn waiting_count_for_test(&self) -> usize {
+    fn waiting_count_for_test(&self, workspace_content: WorkspaceContentIdentity) -> usize {
         self.values
             .read(
                 &memo_attribution(&crate::analyzer::MultiAnalyzer::default()),
-                |values, _| Err::<Arc<DerivedLayerEntry>, _>(values.waiting_count_for_test()),
+                |values, _| {
+                    Err::<Arc<DerivedLayerEntry>, _>(values.waiters_for_test(&DerivedLayerKey {
+                        request: DerivedLayerRequest::complete_direct_import_topology(),
+                        workspace_content,
+                    }))
+                },
             )
             .err()
             .expect("test observation returns no retained answer")
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for SnapshotDerivedLayerCache {
     fn default() -> Self {
-        Self::new(Self::DEFAULT_MAX_RETAINED_BYTES)
+        Self::new(
+            Self::DEFAULT_CONSTRUCTION_LIMIT_BYTES,
+            &RetentionBudget::for_tests(),
+        )
     }
 }
 
@@ -539,7 +554,7 @@ impl Default for SnapshotDerivedLayerCache {
 pub struct DirectImportTopologyLimits {
     pub max_files: usize,
     pub max_edges: usize,
-    pub max_retained_bytes: u64,
+    pub construction_limit_bytes: u64,
 }
 
 pub struct DirectImportTopologyBuild {
@@ -684,7 +699,7 @@ pub fn build_direct_import_topology(
         };
     }
 
-    let maximum_working_bytes = limits.max_retained_bytes.saturating_mul(3);
+    let maximum_working_bytes = limits.construction_limit_bytes.saturating_mul(3);
     if RequestLocalDirectImportGraph::fixed_working_bytes(&files) > maximum_working_bytes {
         metrics.elapsed_ns = elapsed_ns(started);
         return DirectImportTopologyBuild {
@@ -744,7 +759,8 @@ pub fn build_direct_import_topology(
     let projected_working_bytes = request_graph
         .estimated_working_bytes()
         .saturating_add(retained_bytes);
-    if retained_bytes > limits.max_retained_bytes || projected_working_bytes > maximum_working_bytes
+    if retained_bytes > limits.construction_limit_bytes
+        || projected_working_bytes > maximum_working_bytes
     {
         metrics.elapsed_ns = elapsed_ns(started);
         metrics.retained_bytes = retained_bytes;
@@ -752,7 +768,7 @@ pub fn build_direct_import_topology(
             outcome: DerivedLayerBuildOutcome::Unavailable {
                 reason: format!(
                     "direct import topology retained-byte limit exceeded: {retained_bytes} > {}",
-                    limits.max_retained_bytes
+                    limits.construction_limit_bytes
                 ),
                 over_budget: true,
                 rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
@@ -775,12 +791,12 @@ pub fn build_direct_import_topology(
         .expect("complete import graph was frozen");
     metrics.elapsed_ns = elapsed_ns(started);
     metrics.retained_bytes = retained_bytes;
-    if retained_bytes > limits.max_retained_bytes {
+    if retained_bytes > limits.construction_limit_bytes {
         return DirectImportTopologyBuild {
             outcome: DerivedLayerBuildOutcome::Unavailable {
                 reason: format!(
                     "direct import topology retained-byte limit exceeded: {retained_bytes} > {}",
-                    limits.max_retained_bytes
+                    limits.construction_limit_bytes
                 ),
                 over_budget: true,
                 rejection_scope: Some(DerivedLayerRejectionScope::SnapshotBudget),
@@ -1689,7 +1705,11 @@ mod tests {
     }
 
     impl IAnalyzer for FiniteImports {
-        fn update(&self, _: &std::collections::BTreeSet<ProjectFile>) -> Self {
+        fn update_with_listing(
+            &self,
+            _: &std::collections::BTreeSet<ProjectFile>,
+            _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self {
             unimplemented!()
         }
         fn update_all(&self) -> Self {
@@ -1719,8 +1739,11 @@ mod tests {
         fn imported_code_units_of(
             &self,
             _: &ProjectFile,
-        ) -> Arc<HashSet<crate::analyzer::CodeUnit>> {
-            Arc::new(HashSet::default())
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<crate::analyzer::CodeUnit>>>
+        {
+            Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                HashSet::default(),
+            ))
         }
         fn referencing_files_of(&self, _: &ProjectFile) -> HashSet<ProjectFile> {
             unimplemented!()
@@ -1756,7 +1779,7 @@ mod tests {
                     DirectImportTopologyLimits {
                         max_files: limit,
                         max_edges: 10,
-                        max_retained_bytes: 1024 * 1024,
+                        construction_limit_bytes: 1024 * 1024,
                     },
                 );
                 assert_eq!(
@@ -1828,7 +1851,7 @@ mod tests {
             DirectImportTopologyLimits {
                 max_files: 5,
                 max_edges: 1,
-                max_retained_bytes: 1024 * 1024,
+                construction_limit_bytes: 1024 * 1024,
             },
         );
         assert!(matches!(
@@ -1878,7 +1901,7 @@ mod tests {
 
     #[test]
     fn snapshot_cache_reuses_by_workspace_content_and_retains_both() {
-        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024, &RetentionBudget::for_tests());
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancellation = CancellationToken::default();
         let builds = AtomicUsize::new(0);
@@ -1963,7 +1986,7 @@ mod tests {
     /// otherwise be willing to retain.
     #[test]
     fn a_late_build_against_content_that_moved_is_never_published() {
-        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024, &RetentionBudget::for_tests());
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancellation = CancellationToken::default();
         let builds = AtomicUsize::new(0);
@@ -2033,7 +2056,7 @@ mod tests {
     #[cfg(test)]
     #[test]
     fn cancelled_and_late_stale_builds_do_not_publish() {
-        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024, &RetentionBudget::for_tests());
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancelled = CancellationToken::default();
         cancelled.cancel();
@@ -2070,7 +2093,7 @@ mod tests {
     /// reason rather than reusing a value it cannot prove current.
     #[test]
     fn every_decision_records_a_verdict_and_a_missing_identity_widens() {
-        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024, &RetentionBudget::for_tests());
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancellation = CancellationToken::default();
 
@@ -2113,7 +2136,7 @@ mod tests {
     #[cfg(test)]
     #[test]
     fn unavailable_build_can_retry() {
-        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024, &RetentionBudget::for_tests());
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let cancellation = CancellationToken::default();
         let first = cache.acquire(
@@ -2150,7 +2173,7 @@ mod tests {
     #[cfg(test)]
     #[test]
     fn auto_rejections_keep_incomparable_request_budgets_and_snapshot_failures() {
-        let cache = SnapshotDerivedLayerCache::new(1024 * 1024);
+        let cache = SnapshotDerivedLayerCache::new(1024 * 1024, &RetentionBudget::for_tests());
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let workspace_content = content(1);
 
@@ -2192,7 +2215,7 @@ mod tests {
 
     fn wait_for_follower(cache: &SnapshotDerivedLayerCache) {
         brokk_bifrost_core::test_support::wait_for_nonzero_count(
-            || cache.waiting_count_for_test(),
+            || cache.waiting_count_for_test(content(1)),
             "same-key derived request did not enter the single-flight wait",
         );
     }
@@ -2200,7 +2223,10 @@ mod tests {
     #[cfg(test)]
     #[test]
     fn same_key_builds_once_and_cancelled_follower_does_not_cancel_leader() {
-        let cache = Arc::new(SnapshotDerivedLayerCache::new(1024 * 1024));
+        let cache = Arc::new(SnapshotDerivedLayerCache::new(
+            1024 * 1024,
+            &RetentionBudget::for_tests(),
+        ));
         let request = DerivedLayerRequest::complete_direct_import_topology();
         let builds = Arc::new(AtomicUsize::new(0));
         let (leader_started_tx, leader_started_rx) = mpsc::channel();
@@ -2313,7 +2339,7 @@ mod tests {
                 DirectImportTopologyLimits {
                     max_files: 100,
                     max_edges: 100,
-                    max_retained_bytes: 1024 * 1024,
+                    construction_limit_bytes: 1024 * 1024,
                 },
             );
             let DerivedLayerBuildOutcome::Complete {

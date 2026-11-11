@@ -2,6 +2,7 @@
 
 pub use brokk_bifrost_analysis::analyzer::PythonSemanticModelWorkspaceContext;
 pub mod mcp_install;
+pub mod open_packs;
 // OWASP BenchmarkJava taint bakeoff scorer. Like `summary_foundry_demand`, it
 // runs the require-model taint policy through the production evaluator and so
 // needs both the semantic-model machinery from brokk-bifrost-analysis and the
@@ -84,39 +85,42 @@ pub fn install_bifrost_semantic_model_packs() -> Result<(), String> {
 
 fn register_bifrost_semantic_model_packs(
     catalog: &brokk_bifrost_analysis::analyzer::semantic_model::SemanticPackCatalog,
-) -> Result<(), String> {
-    if let Some(bundle) = std::env::var_os("BIFROST_OPEN_SEMANTIC_PACK_BUNDLE") {
-        if bundle.is_empty() {
-            return Err(
-                "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE must name a native bundle directory".into(),
-            );
+    coverage: &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage,
+) -> Result<Vec<brokk_bifrost_analysis::analyzer::semantic_model::CatalogLeaseToken>, String> {
+    let bundle = match std::env::var_os(open_packs::SEMANTIC_BUNDLE_ENV) {
+        Some(bundle) if bundle.is_empty() => {
+            return Err(format!(
+                "{} must name a native bundle directory",
+                open_packs::SEMANTIC_BUNDLE_ENV
+            ));
         }
-        let root = std::path::Path::new(&bundle);
-        if root
-            .join(brokk_bifrost_semantic_packs::prepared_registry::PREPARED_REGISTRY_MARKER)
-            .try_exists()
-            .map_err(|error| format!("read configured semantic selection: {error}"))?
-        {
-            return brokk_bifrost_semantic_packs::prepared_registry::register_prepared_registry(
-                root, catalog,
+        Some(bundle) => Some(std::path::PathBuf::from(bundle)),
+        // A running background acquisition is awaited here; the MCP warm
+        // reaches this only in its expensive stage (#11030).
+        None => open_packs::semantic_bundle_root()?,
+    };
+    if let Some(root) = bundle.as_deref() {
+        let (installed, leases) =
+            brokk_bifrost_semantic_packs::release_bundle::install_release_bundle_with_leases(
+                root, catalog, coverage,
             )
-            .map(|_| ())
-            .map_err(|error| format!("failed to register configured semantic selection: {error}"));
-        }
-        let installed =
-            brokk_bifrost_semantic_packs::release_bundle::install_release_bundle(root, catalog)
-                .map_err(|error| {
-                    format!("failed to install configured open semantic packs: {error}")
-                })?;
-        if installed.is_empty() {
+            .map_err(|error| {
+                format!("failed to install configured open semantic packs: {error}")
+            })?;
+        if installed.is_empty()
+            && matches!(
+                coverage,
+                brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease
+            )
+        {
             return Err("configured open semantic bundle installs no compatible packs".into());
         }
-        return Ok(());
+        return Ok(leases);
     }
-    // The engine ships no product packs (#4438). Without a configured bundle
-    // the catalog stays empty; offline hosts point the variable above at an
-    // extracted packs release.
-    Ok(())
+    // The engine ships no product packs (#4438). Without a configured or
+    // acquired bundle the catalog stays empty; offline hosts point the
+    // variable above at an extracted packs release.
+    Ok(Vec::new())
 }
 
 /// Pack-consumer profile for this exact engine build.
@@ -135,7 +139,7 @@ pub fn open_pack_engine_profile() -> serde_json::Value {
     serde_json::json!({
         "engine_version": BIFROST_VERSION,
         "build_identity": BIFROST_BUILD_IDENTITY,
-        "model_set_sha256": format!("{:x}", model_set.finalize()),
+        "model_set_sha256": brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(&model_set.finalize().into()),
         "capability_contract_version": 1,
         "schemas": {
             "policy_document": [policy::schema::POLICY_SCHEMA_VERSION],

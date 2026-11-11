@@ -616,36 +616,54 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        crate::analyzer::jvm::hierarchy::derived_read(&self.imported_code_units, self, file, || {
-            if file_language(file) != Language::Scala {
-                return (Arc::new(HashSet::default()), 0);
-            }
-            let imported = {
-                let imports = self.inner.import_info_of(token, file);
-                let wildcard_environment = self.wildcard_import_environment(file, &imports);
-                let mut imported = HashSet::default();
-                for (import_index, info) in imports.iter().enumerate() {
-                    for code_unit in self.resolve_import_info(
-                        token,
-                        file,
-                        import_index,
-                        info,
-                        &wildcard_environment,
-                    ) {
-                        imported.insert(code_unit);
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let scope = AnalyzerQueryScope::new(self);
+            let token = scope.token();
+            crate::analyzer::jvm::hierarchy::derived_read(
+                &self.imported_code_units,
+                self,
+                file,
+                || {
+                    if file_language(file) != Language::Scala {
+                        return (
+                            Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                                HashSet::default(),
+                            )),
+                            0,
+                        );
                     }
-                }
-                imported
-            };
-            let imported = Arc::new(imported);
-            let bytes =
-                brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set(file, &imported)
-                    as usize;
-            (imported, bytes)
-        })
+                    let imported = {
+                        let imports = self.inner.import_info_of(token, file);
+                        let wildcard_environment = self.wildcard_import_environment(file, &imports);
+                        let mut imported = HashSet::default();
+                        for (import_index, info) in imports.iter().enumerate() {
+                            for code_unit in self.resolve_import_info(
+                                token,
+                                file,
+                                import_index,
+                                info,
+                                &wildcard_environment,
+                            ) {
+                                imported.insert(code_unit);
+                            }
+                        }
+                        imported
+                    };
+                    let imported = Arc::new(
+                        brokk_bifrost_core::retention_budget::Accounted::uncharged(imported),
+                    );
+                    let bytes =
+                        brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(
+                            &imported,
+                        ) as usize;
+                    (imported, bytes)
+                },
+            )
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

@@ -820,6 +820,44 @@ impl<'tree, 'source> RustOwnershipIndex<'tree, 'source> {
         self.classify_nominal_reference(type_node).into_public()
     }
 
+    /// Classify the selected declaration itself, after a caller has resolved
+    /// its exact source range. This does not resolve a name in this file: a
+    /// declaration in another file may have the same spelling.
+    pub fn classify_selected_nominal_declaration(
+        &self,
+        declaration: Node<'tree>,
+    ) -> RustOwnershipClass {
+        if !matches!(declaration.kind(), "struct_item" | "enum_item")
+            || has_macro_ancestor(declaration)
+        {
+            return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::UnsupportedType);
+        }
+        let mut matching = self
+            .declarations
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.identity.source_start == declaration.start_byte());
+        let Some((index, _)) = matching.next() else {
+            return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::AmbiguousIdentity);
+        };
+        if matching.next().is_some() {
+            return RustOwnershipClass::Incomplete(RustOwnershipIncomplete::AmbiguousIdentity);
+        }
+        match self
+            .states
+            .get(&index)
+            .copied()
+            .expect("indexed declaration has state")
+        {
+            NominalState::Move => RustOwnershipClass::Move,
+            NominalState::Copy => RustOwnershipClass::AggregateCopy,
+            NominalState::Incomplete(reason) => RustOwnershipClass::Incomplete(reason),
+            NominalState::Pending => {
+                RustOwnershipClass::Incomplete(RustOwnershipIncomplete::CyclicNominal)
+            }
+        }
+    }
+
     /// Resolve a local nominal type's exact, nongeneric `Drop::drop` body.
     ///
     /// This returns a method only when the impl's trait path resolved to the
@@ -3019,6 +3057,25 @@ mod tests {
         assert_eq!(
             index.classify_type(type_named(tree.root_node(), source, "Inner")),
             RustOwnershipClass::Incomplete(RustOwnershipIncomplete::WrongTraitIdentity)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#10389: raw import alias lost the Option Copy proof")]
+    fn raw_option_alias_keeps_copy_proof() {
+        let source = "use std::option::Option as r#type; fn f() { let value: r#type<i32>; }";
+        let tree = parse(source);
+        let index =
+            RustOwnershipIndex::build(tree.root_node(), source, 100_000, |_| Ok::<_, ()>(()))
+                .unwrap();
+        assert_eq!(
+            index
+                .classify_type_bounded(
+                    type_named(tree.root_node(), source, "r#type<i32>"),
+                    |_| Ok::<_, ()>(())
+                )
+                .unwrap(),
+            RustOwnershipClass::AggregateCopy
         );
     }
 

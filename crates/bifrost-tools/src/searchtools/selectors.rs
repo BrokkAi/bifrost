@@ -1,4 +1,5 @@
 use crate::searchtools::navigation::*;
+use brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill;
 
 use crate::searchtools::*;
 // The canonical-selector decision stays C++ specific. Its header and implementation
@@ -132,9 +133,9 @@ impl UnclosedConstructCache {
         if language_for_target(unit) != Language::Cpp {
             return None;
         }
-        self.files
-            .entry(unit.source().clone())
-            .or_insert_with(|| {
+        let mut uncached = None;
+        if !self.files.contains_key(unit.source()) {
+            match complete_query_cache_fill(analyzer, || {
                 if analyzer.parse_completeness(unit.source()) != ParseCompleteness::Partial {
                     return HashMap::default();
                 }
@@ -155,7 +156,17 @@ impl UnclosedConstructCache {
                         _ => None,
                     })
                     .collect()
-            })
+            }) {
+                Ok(value) => {
+                    self.files.insert(unit.source().clone(), value);
+                }
+                Err(value) => uncached = Some(value),
+            }
+        }
+        uncached
+            .as_ref()
+            .or_else(|| self.files.get(unit.source()))
+            .unwrap()
             .get(unit)
             .cloned()
     }
@@ -193,6 +204,8 @@ pub enum DefinitionLookupIncompleteReason {
     StructureUnavailable,
     NavigationTargets,
 }
+
+pub type DefinitionLookupCompletion = Completion<DefinitionLookupIncompleteReason>;
 
 /// Map the stable diagnostic kinds emitted by definition resolution to the
 /// small public vocabulary used by both definition result surfaces.
@@ -274,15 +287,92 @@ pub(crate) fn definition_lookup_incomplete_reason_for_kinds<'a>(
         .find_map(definition_lookup_incomplete_reason_for_kind)
 }
 
-pub(crate) const fn definition_lookup_complete_default() -> bool {
+/// Whether one lookup or scan finished, and if not, why.
+///
+/// The reason is the only state: a lookup is complete exactly when it has no
+/// incomplete reason, so no producer can report `complete: false` without a
+/// reason, or a reason on a complete answer. Flattened into a result, this
+/// writes `complete: false` and `incomplete_reason` when incomplete, and
+/// nothing when complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completion<R>(Option<R>);
+
+impl<R: Copy> Completion<R> {
+    pub const COMPLETE: Self = Self(None);
+
+    pub const fn incomplete(reason: R) -> Self {
+        Self(Some(reason))
+    }
+
+    pub const fn from_reason(reason: Option<R>) -> Self {
+        Self(reason)
+    }
+
+    pub const fn is_complete(self) -> bool {
+        self.0.is_none()
+    }
+
+    pub const fn incomplete_reason(self) -> Option<R> {
+        self.0
+    }
+
+    /// Keep the reason already recorded; adopt `reason` only when complete.
+    pub fn mark_incomplete(&mut self, reason: R) {
+        self.0.get_or_insert(reason);
+    }
+}
+
+impl<R: Serialize> Serialize for Completion<R> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Some(reason) = &self.0 else {
+            return serializer.serialize_map(Some(0))?.end();
+        };
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("complete", &false)?;
+        map.serialize_entry("incomplete_reason", reason)?;
+        map.end()
+    }
+}
+
+// The schema of the two keys `Completion` writes when flattened. A plain
+// comment, not a doc comment: schemars would publish a doc comment as the
+// schema's description. Never constructed: only its generated schema is used.
+#[allow(dead_code)]
+#[derive(schemars::JsonSchema)]
+struct CompletionWireSchema<R> {
+    #[serde(
+        default = "completion_complete_default",
+        skip_serializing_if = "definition_lookup_complete"
+    )]
+    complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incomplete_reason: Option<R>,
+}
+
+const fn completion_complete_default() -> bool {
     true
+}
+
+impl<R: schemars::JsonSchema> schemars::JsonSchema for Completion<R> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        CompletionWireSchema::<R>::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        CompletionWireSchema::<R>::json_schema(generator)
+    }
 }
 
 pub(crate) fn definition_lookup_complete(value: &bool) -> bool {
     *value
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct NotFoundInput {
     pub input: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,7 +488,7 @@ pub(crate) fn renderable_not_found_input(input: impl Into<String>) -> NotFoundIn
     not_found_input(input, Some(RESOLVED_BUT_NOT_RENDERABLE_NOTE.to_string()))
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct AmbiguousSymbol {
     pub target: String,
     pub matches: Vec<String>,
@@ -478,6 +568,7 @@ pub(crate) fn lexical_definition_candidate(
 pub(crate) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
     match kind {
         DeclarationKind::Parameter => "parameter",
+        DeclarationKind::TypeParameter => "type_parameter",
         DeclarationKind::ReceiverParameter => "receiver_parameter",
         DeclarationKind::ImportAlias => "type",
         DeclarationKind::StatementLabel => "statement_label",
@@ -485,6 +576,7 @@ pub(crate) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
         // A block-local item is an item, not a variable: naming it
         // local_variable would misreport a nested `fn` or `struct`.
         DeclarationKind::BlockLocalItem => "block_local_item",
+        DeclarationKind::BlockLocalType => "block_local_type",
         DeclarationKind::Field => "field",
         DeclarationKind::LocalVariable
         | DeclarationKind::CatchParameter
@@ -515,13 +607,26 @@ impl CppIdentityRenderCache {
             return None;
         }
         let fqn = unit.fq_name();
-        if self.loaded_fqns.insert(fqn.clone()) {
-            let definitions: Vec<_> = analyzer
-                .definitions(&fqn)
-                .filter(|candidate| language_for_target(candidate) == Language::Cpp)
-                .collect();
-            self.canonical_selectors
-                .extend(cpp_canonical_selectors(analyzer, token, &definitions));
+        if !self.loaded_fqns.contains(&fqn) {
+            let fill = complete_query_cache_fill(analyzer, || {
+                let definitions: Vec<_> = analyzer
+                    .definitions(&fqn)
+                    .filter(|candidate| language_for_target(candidate) == Language::Cpp)
+                    .collect();
+                cpp_canonical_selectors(analyzer, token, &definitions)
+            });
+            match fill {
+                Ok(value) => {
+                    self.loaded_fqns.insert(fqn);
+                    self.canonical_selectors.extend(value);
+                }
+                Err(value) => {
+                    return value
+                        .get(unit)
+                        .cloned()
+                        .or_else(|| Some(file_anchored_definition_selector(unit)));
+                }
+            }
         }
         self.canonical_selectors
             .get(unit)
@@ -533,12 +638,20 @@ impl CppIdentityRenderCache {
         &mut self,
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
-    ) -> Option<&[brokk_bifrost_analysis::analyzer::languages::DeclarationNavigationOccurrence]>
+    ) -> Option<Vec<brokk_bifrost_analysis::analyzer::languages::DeclarationNavigationOccurrence>>
     {
-        self.cpp_occurrences
-            .entry(unit.clone())
-            .or_insert_with(|| declaration_navigation_occurrences(analyzer, unit))
-            .as_deref()
+        if let Some(value) = self.cpp_occurrences.get(unit) {
+            return value.clone();
+        }
+        match complete_query_cache_fill(analyzer, || {
+            declaration_navigation_occurrences(analyzer, unit)
+        }) {
+            Ok(value) => {
+                self.cpp_occurrences.insert(unit.clone(), value.clone());
+                value
+            }
+            Err(value) => value,
+        }
     }
 
     pub(crate) fn primary_range(
@@ -557,7 +670,7 @@ impl CppIdentityRenderCache {
         } else {
             None
         };
-        primary_range_from_ranges(ranges, occurrences)
+        primary_range_from_ranges(ranges, occurrences.as_deref())
     }
 
     pub(crate) fn primary_range_from_projected_pair(
@@ -568,7 +681,7 @@ impl CppIdentityRenderCache {
         secondary: Range,
     ) -> Option<Range> {
         let occurrences = self.occurrences(analyzer, unit)?;
-        primary_range_from_ranges(vec![primary, secondary], Some(occurrences))
+        primary_range_from_ranges(vec![primary, secondary], Some(&occurrences))
     }
 
     /// The physical declaration ranges to render for `unit`. A C++ class with
@@ -682,10 +795,21 @@ impl DefinitionCandidateRenderCache {
                 Some((1, 1)),
             ));
         }
-        let context = self
-            .contexts
-            .entry(unit.source().clone())
-            .or_insert_with(|| load_declaration_name_context(analyzer, unit.source()));
+        let mut uncached = None;
+        if !self.contexts.contains_key(unit.source()) {
+            match complete_query_cache_fill(analyzer, || {
+                load_declaration_name_context(analyzer, unit.source())
+            }) {
+                Ok(value) => {
+                    self.contexts.insert(unit.source().clone(), value);
+                }
+                Err(value) => uncached = Some(value),
+            }
+        }
+        let context = uncached
+            .as_ref()
+            .or_else(|| self.contexts.get(unit.source()))
+            .unwrap();
         let name_range = context.as_ref().and_then(|context| {
             // A class with a forward declaration and a definition carries both
             // as declaration ranges; its name is displayed at the definition
@@ -715,10 +839,22 @@ impl DefinitionCandidateRenderCache {
         let Some(declaration_range) = target.declaration_range else {
             return self.display_range(analyzer, &target.code_unit);
         };
-        let context = self
-            .contexts
-            .entry(target.code_unit.source().clone())
-            .or_insert_with(|| load_declaration_name_context(analyzer, target.code_unit.source()));
+        let mut uncached = None;
+        if !self.contexts.contains_key(target.code_unit.source()) {
+            match complete_query_cache_fill(analyzer, || {
+                load_declaration_name_context(analyzer, target.code_unit.source())
+            }) {
+                Ok(value) => {
+                    self.contexts
+                        .insert(target.code_unit.source().clone(), value);
+                }
+                Err(value) => uncached = Some(value),
+            }
+        }
+        let context = uncached
+            .as_ref()
+            .or_else(|| self.contexts.get(target.code_unit.source()))
+            .unwrap();
         let name_range = context.as_ref().and_then(|context| {
             context.name_range_for_declaration(&target.code_unit, declaration_range)
         });
@@ -2466,9 +2602,9 @@ mod tests {
             vec![complete, cancelled],
         );
         assert_eq!(result.status, "ambiguous", "{result:?}");
-        assert!(!result.complete, "{result:?}");
+        assert!(!result.completion.is_complete(), "{result:?}");
         assert_eq!(
-            result.incomplete_reason,
+            result.completion.incomplete_reason(),
             Some(DefinitionLookupIncompleteReason::Cancelled)
         );
     }

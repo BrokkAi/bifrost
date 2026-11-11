@@ -1,24 +1,22 @@
 //! Shared snapshot, publication, and complete-cache mechanics for language lowerers.
 
-#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
+use std::sync::Weak;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use brokk_bifrost_core::budgeted_value_cache::{
+    BudgetedValueAcquisition, BudgetedValueCache, BudgetedValuePermit,
+};
 use brokk_bifrost_core::gitblob::BlobKey;
-use moka::sync::Cache;
-
-#[cfg(any(test, feature = "test-support"))]
-use brokk_bifrost_core::complete_value_cache::CompleteValueRevivalCensus;
-
-use brokk_bifrost_core::complete_value_cache::CompleteValueAcquisition;
-
-use brokk_bifrost_core::complete_value_cache::CompleteValueCache;
+use brokk_bifrost_core::retention_budget::{
+    AllocationCharge, BudgetRegion, BudgetedValue, RetainedBytes, RetentionBudget, SelfCharged,
+    SharedAllocation, SharedValue,
+};
 
 use brokk_bifrost_core::complete_value_cache::CompleteValueWait;
 
@@ -100,17 +98,43 @@ use crate::analyzer::semantic::WorkspaceMountId;
 
 use crate::analyzer::semantic::WorkspaceRelativePath;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProvenancedArtifactKey {
+    pub artifact: SemanticArtifactKey,
+    pub built_from: crate::analyzer::semantic::StableDigest,
+}
+
+impl RetainedBytes for ProvenancedArtifactKey {
+    fn retained_bytes(&self) -> usize {
+        self.artifact
+            .retained_bytes()
+            .saturating_add(size_of::<crate::analyzer::semantic::StableDigest>())
+    }
+}
+
 /// Immutable complete-artifact cache shared by one concrete analyzer adapter.
 ///
-/// Moka bounds retained bytes rather than entry count. Incomplete outcomes are
+/// The owner's retention budget bounds kept bytes. Incomplete outcomes are
 /// never presented to this type, so a lookup can always be treated as a fully
 /// validated immutable artifact. The in-flight map serializes construction for
 /// one exact artifact key without retaining completed work.
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct CompleteSemanticArtifactCache {
+    retention_budget: RetentionBudget,
     #[doc(hidden)]
-    pub inner: CompleteValueCache<SemanticArtifactKey, SemanticArtifact>,
+    pub inner: BudgetedValueCache<ProvenancedArtifactKey, CachedSemanticArtifact>,
+    /// The instance this cache published for each key, held weakly. The
+    /// region revives a charged artifact after eviction, but it refuses one
+    /// the budget could not charge, so a later miss would build a second
+    /// instance while the first is still held. `ProcedureHandle` compares its
+    /// artifact by pointer, so that second instance splits the handles a
+    /// policy plan was compiled against from the ones its solve resolves and
+    /// drops real flow (#2307). Reusing the live instance keeps one identity
+    /// per key; the map holds no strong reference, so it bounds identity, not
+    /// memory. It is keyed like `inner`, by provenance too, so an instance
+    /// built from another stored publication is never reused (#9784).
+    live: Arc<Mutex<LiveArtifacts>>,
     /// Independent deterministic typestate-continuation eviction witnesses
     /// shared by analyzer clones. Production builds carry neither the flags
     /// nor the control surface.
@@ -128,8 +152,11 @@ pub struct CompleteSemanticArtifactCache {
     /// analyzer clones for the same reason the cache itself is.
     #[cfg(any(test, feature = "test-support"))]
     materializations: Arc<Mutex<HashMap<WorkspaceRelativePath, SemanticMaterializationCensus>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    acquiring: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for CompleteSemanticArtifactCache {
     fn default() -> Self {
         Self::new(SEMANTIC_MATERIALIZATION_CACHE_BYTES)
@@ -137,14 +164,18 @@ impl Default for CompleteSemanticArtifactCache {
 }
 
 impl CompleteSemanticArtifactCache {
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new(max_retained_bytes: u64) -> Self {
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(max_retained_bytes);
+        Self::new_with_budget(&budget)
+    }
+
+    pub fn new_with_budget(budget: &RetentionBudget) -> Self {
         Self {
-            inner: CompleteValueCache::with_retention(
-                max_retained_bytes,
-                weigh_complete_artifact,
-                |artifact| Arc::new(CachedSemanticArtifact::new(&artifact)),
-            ),
+            retention_budget: budget.clone(),
+            inner: BudgetedValueCache::new(budget.region("semantic.complete_artifact", None)),
+            live: Arc::new(Mutex::new(LiveArtifacts::default())),
             #[cfg(any(test, feature = "test-support"))]
             selector_continuation_invalidation_armed: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-support"))]
@@ -161,7 +192,13 @@ impl CompleteSemanticArtifactCache {
             )),
             #[cfg(any(test, feature = "test-support"))]
             materializations: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(any(test, feature = "test-support"))]
+            acquiring: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    pub fn retention_budget(&self) -> &RetentionBudget {
+        &self.retention_budget
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -270,14 +307,14 @@ impl CompleteSemanticArtifactCache {
             SemanticCacheRevivalCensus::default();
         self.active_invalidation_witness
             .store(witness, Ordering::Release);
-        self.inner.reset_revival_census_for_test();
-        self.inner.invalidate_all_for_test();
+        self.inner.region().reset_revival_census_for_test();
+        self.inner.region().evict_all_for_test();
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn latch_active_invalidation_revival_census_for_test(&self) {
         let current =
-            SemanticCacheRevivalCensus::from_complete_value(self.inner.revival_census_for_test());
+            SemanticCacheRevivalCensus::from_region(self.inner.region().revival_census_for_test());
         let retained = match self.active_invalidation_witness.load(Ordering::Acquire) {
             SELECTOR_CONTINUATION_INVALIDATION_WITNESS => {
                 &self.selector_continuation_revival_census
@@ -304,8 +341,8 @@ impl CompleteSemanticArtifactCache {
             .lock()
             .expect("semantic invalidation revival census mutex poisoned");
         if self.active_invalidation_witness.load(Ordering::Acquire) == witness {
-            retained.component_max(SemanticCacheRevivalCensus::from_complete_value(
-                self.inner.revival_census_for_test(),
+            retained.component_max(SemanticCacheRevivalCensus::from_region(
+                self.inner.region().revival_census_for_test(),
             ))
         } else {
             retained
@@ -334,20 +371,83 @@ impl CompleteSemanticArtifactCache {
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn insert(&self, key: SemanticArtifactKey, artifact: Arc<SemanticArtifact>) {
-        self.inner.insert_complete_for_test(key, artifact);
+    pub fn insert(&self, key: ProvenancedArtifactKey, artifact: Arc<SemanticArtifact>) {
+        if artifact.allocation_charge().is_charged() {
+            self.inner
+                .region()
+                .insert_shared(key, CachedSemanticArtifact::new(&artifact));
+        }
     }
 
     #[doc(hidden)]
     pub fn acquire(
         &self,
-        key: &SemanticArtifactKey,
+        key: &ProvenancedArtifactKey,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> (
-        CompleteValueAcquisition<SemanticArtifactKey, SemanticArtifact>,
+        BudgetedValueAcquisition<ProvenancedArtifactKey, CachedSemanticArtifact>,
         CompleteValueWait,
     ) {
-        self.inner.acquire(key, cancellation)
+        #[cfg(any(test, feature = "test-support"))]
+        self.acquiring.fetch_add(1, Ordering::AcqRel);
+        let (acquisition, wait) = self.inner.acquire(key, cancellation);
+        #[cfg(any(test, feature = "test-support"))]
+        self.acquiring.fetch_sub(1, Ordering::AcqRel);
+        let acquisition = match acquisition {
+            BudgetedValueAcquisition::Leader { permit } => match self.live_instance(key) {
+                Some(artifact) => BudgetedValueAcquisition::Cached {
+                    value: self.publish(permit, &artifact),
+                },
+                None => BudgetedValueAcquisition::Leader { permit },
+            },
+            other => other,
+        };
+        (acquisition, wait)
+    }
+
+    /// Complete a flight with its artifact. The region keeps a charged one;
+    /// an uncharged one is request-owned. Either way its identity is recorded
+    /// first, so no flight that starts after this one completes can miss it.
+    #[doc(hidden)]
+    pub fn publish(
+        &self,
+        permit: BudgetedValuePermit<ProvenancedArtifactKey, CachedSemanticArtifact>,
+        artifact: &Arc<SemanticArtifact>,
+    ) -> BudgetedValue<CachedSemanticArtifact> {
+        self.live
+            .lock()
+            .expect("semantic live-artifact map poisoned")
+            .record(permit.key(), artifact);
+        let cached = CachedSemanticArtifact::new(artifact);
+        if artifact.allocation_charge().is_charged() {
+            permit.publish_shared(cached)
+        } else {
+            permit.publish_request_owned(cached)
+        }
+    }
+
+    /// Drop every artifact and fence every running build, forgetting the live
+    /// identities too, so an invalidated instance cannot be reused (#3377).
+    #[doc(hidden)]
+    pub fn invalidate_all(&self) {
+        self.inner.invalidate_all();
+        self.live
+            .lock()
+            .expect("semantic live-artifact map poisoned")
+            .instances
+            .clear();
+    }
+
+    fn live_instance(&self, key: &ProvenancedArtifactKey) -> Option<Arc<SemanticArtifact>> {
+        let mut live = self
+            .live
+            .lock()
+            .expect("semantic live-artifact map poisoned");
+        let artifact = live.instances.get(key)?.upgrade();
+        if artifact.is_none() {
+            live.instances.remove(key);
+        }
+        artifact
     }
 
     /// Look one already-published artifact up without reserving a flight.
@@ -357,23 +457,47 @@ impl CompleteSemanticArtifactCache {
     #[doc(hidden)]
     pub fn get_ready(
         &self,
-        key: &SemanticArtifactKey,
+        key: &ProvenancedArtifactKey,
         cancellation: &crate::analyzer::semantic::CancellationToken,
     ) -> Option<Arc<SemanticArtifact>> {
-        self.inner.get_ready(key, cancellation)
+        self.inner
+            .get_ready(key, cancellation)
+            .map(|value| Arc::clone(value.arc()))
     }
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
-        self.inner.len_for_test()
+        self.inner.region().stats().entries as u64
     }
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn waiting_count(&self) -> usize {
-        self.inner.waiting_count_for_test()
+        self.acquiring.load(Ordering::Acquire)
+    }
+}
+
+/// Weak identities of published artifacts, swept of dropped ones whenever the
+/// map doubles past its last sweep, so a sweep costs amortized constant time
+/// per publication and dead entries never outnumber live ones by much.
+#[derive(Default)]
+struct LiveArtifacts {
+    instances: HashMap<ProvenancedArtifactKey, Weak<SemanticArtifact>>,
+    sweep_at: usize,
+}
+
+impl LiveArtifacts {
+    const MIN_SWEEP_KEYS: usize = 1024;
+
+    fn record(&mut self, key: &ProvenancedArtifactKey, artifact: &Arc<SemanticArtifact>) {
+        debug_assert_eq!(&key.artifact, artifact.key());
+        self.instances.insert(key.clone(), Arc::downgrade(artifact));
+        if self.instances.len() > self.sweep_at.max(Self::MIN_SWEEP_KEYS) {
+            self.instances.retain(|_, weak| weak.strong_count() > 0);
+            self.sweep_at = self.instances.len().saturating_mul(2);
+        }
     }
 }
 
@@ -401,28 +525,41 @@ const SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES: u64 = 32_768;
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct SourceContentIdentityMemo {
-    entries: Cache<BlobKey, ContentIdentity>,
+    entries: BudgetRegion<SourceBlobKey, ContentIdentity>,
 }
 
-impl Default for SourceContentIdentityMemo {
-    fn default() -> Self {
-        Self {
-            entries: Cache::builder()
-                .max_capacity(SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES)
-                .build(),
-        }
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SourceBlobKey(BlobKey);
+
+impl RetainedBytes for SourceBlobKey {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>() + self.0.lang.capacity()
+    }
+}
+
+impl RetainedBytes for ContentIdentity {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
     }
 }
 
 impl SourceContentIdentityMemo {
+    pub fn new(budget: &RetentionBudget) -> Self {
+        Self {
+            entries: budget.region(
+                "semantic_source_content_identity",
+                Some(SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES as usize),
+            ),
+        }
+    }
     #[doc(hidden)]
     pub fn get(&self, source: BlobKey) -> Option<ContentIdentity> {
-        self.entries.get(&source)
+        self.entries.get(&SourceBlobKey(source)).map(|value| *value)
     }
 
     #[doc(hidden)]
     pub fn record(&self, source: BlobKey, content: ContentIdentity) {
-        self.entries.insert(source, content);
+        self.entries.insert(SourceBlobKey(source), content);
     }
 }
 
@@ -436,7 +573,6 @@ pub fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
         (count as u64).saturating_mul(row_size as u64)
     }
 
-    let work = artifact.work();
     let locator_index_entry = size_of::<SemanticLocator>()
         .saturating_add(size_of::<ProcedureId>())
         .saturating_add(size_of::<usize>() * 2);
@@ -446,16 +582,29 @@ pub fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
         .fold(0usize, |rows, procedure| {
             rows.saturating_add(procedure.pointer_invalidations().len())
         });
+    ((size_of::<Arc<SemanticArtifact>>()
+        + size_of::<SemanticArtifact>()
+        + size_of::<SemanticArtifactKey>()) as u64)
+        .saturating_add(retained_work_bytes(
+            &artifact.work(),
+            pointer_invalidation_rows,
+        ))
+        .saturating_add(rows(
+            artifact.work().procedures,
+            size_of::<ProcedureSemantics>(),
+        ))
+        .saturating_add(rows(artifact.work().procedures, locator_index_entry))
+        .max(1)
+}
+
+fn retained_work_bytes(work: &SemanticWork, pointer_invalidation_rows: usize) -> u64 {
+    fn rows(count: usize, row_size: usize) -> u64 {
+        (count as u64).saturating_mul(row_size as u64)
+    }
     let nested_entries = work
         .nested_entries
         .saturating_sub(pointer_invalidation_rows);
-    let mut bytes = (size_of::<Arc<SemanticArtifact>>()
-        + size_of::<SemanticArtifact>()
-        + size_of::<SemanticArtifactKey>()) as u64;
-    bytes = bytes
-        .saturating_add(rows(work.procedures, size_of::<ProcedureSemantics>()))
-        .saturating_add(rows(work.procedures, locator_index_entry))
-        .saturating_add(rows(work.blocks, size_of::<BasicBlock>()))
+    0u64.saturating_add(rows(work.blocks, size_of::<BasicBlock>()))
         .saturating_add(rows(work.program_points, size_of::<ProgramPoint>()))
         .saturating_add(rows(work.values, size_of::<SemanticValue>()))
         .saturating_add(rows(work.allocations, size_of::<AllocationSite>()))
@@ -478,9 +627,17 @@ pub fn retained_artifact_base_bytes(artifact: &SemanticArtifact) -> u64 {
             size_of::<PointerInvalidation>(),
         ))
         .saturating_add((work.owned_text_bytes as u64).saturating_mul(2))
-        .saturating_add(work.source_bytes as u64);
+        .saturating_add(work.source_bytes as u64)
+}
 
-    bytes.max(1)
+/// Conservative retained size of a decoded procedure, including nested rows.
+pub fn procedure_parts_retained_bytes(parts: &ProcedureSemanticsParts) -> usize {
+    let work = crate::analyzer::semantic::measure_procedure_work(parts);
+    let bytes = (size_of::<ProcedureSemanticsParts>() as u64).saturating_add(retained_work_bytes(
+        &work,
+        parts.pointer_invalidations.len(),
+    ));
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 /// Convert the artifact's retained rows and derived indexes into a conservative
@@ -503,6 +660,8 @@ pub fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArt
             |bytes, procedure| {
                 bytes
                     .saturating_add(procedure.call_indexes_retained_bytes())
+                    .saturating_add(procedure.callable_selection_dominance_reserved_bytes())
+                    .saturating_add(procedure.call_gap_index_reserved_bytes())
                     .saturating_add(procedure.value_identity_index_retained_bytes())
             },
         )
@@ -513,8 +672,16 @@ pub fn semantic_artifact_retained_bytes(artifact: &SemanticArtifact) -> u64 {
     retained_artifact_bytes(artifact.key(), artifact)
 }
 
-fn weigh_complete_artifact(key: &SemanticArtifactKey, artifact: &Arc<SemanticArtifact>) -> u32 {
-    retained_artifact_bytes(key, artifact).min(u64::from(u32::MAX)) as u32
+impl SelfCharged for SemanticArtifact {
+    fn allocation_charge(&self) -> &AllocationCharge {
+        &self.charge
+    }
+}
+
+impl RetainedBytes for SemanticArtifactKey {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.path().as_str().len())
+    }
 }
 
 /// Snapshot-stable adapter identity. Only intrafile extraction inputs belong
@@ -794,7 +961,9 @@ pub fn semantic_artifact_key_from_content(
 }
 
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn publish_lowered(
+    retention_budget: &RetentionBudget,
     key: SemanticArtifactKey,
     capabilities: SemanticCapabilities,
     lowered: SemanticOutcome<Vec<ProcedureSemanticsParts>>,
@@ -806,6 +975,7 @@ pub fn publish_lowered(
     macro_rules! publish_parts {
         ($parts:expr, $work:expr) => {{
             let publication = match publish(
+                retention_budget,
                 key.clone(),
                 capabilities.clone(),
                 $parts,
@@ -1050,13 +1220,18 @@ enum Publication {
 }
 
 fn publish(
+    retention_budget: &RetentionBudget,
     key: SemanticArtifactKey,
     capabilities: SemanticCapabilities,
     parts: Vec<ProcedureSemanticsParts>,
     budget: &mut crate::analyzer::semantic::SemanticBudget,
 ) -> Result<Publication, SemanticProviderError> {
     match SemanticArtifact::try_new_with_budget(key, capabilities, parts, budget) {
-        Ok(artifact) => {
+        Ok(mut artifact) => {
+            artifact.charge = AllocationCharge::acquire(
+                retention_budget,
+                semantic_artifact_retained_bytes(&artifact) as usize,
+            );
             let artifact = Arc::new(artifact);
             budget.track_resident_artifact(&artifact);
             Ok(Publication::Artifact(artifact))
@@ -1115,7 +1290,7 @@ pub struct SemanticCacheRevivalCensus {
 
 #[cfg(any(test, feature = "test-support"))]
 impl SemanticCacheRevivalCensus {
-    fn from_complete_value(census: CompleteValueRevivalCensus) -> Self {
+    fn from_region(census: brokk_bifrost_core::retention_budget::RevivalCensus) -> Self {
         Self {
             operations: census.operations,
             distinct_artifacts: census.distinct_values,
@@ -1141,23 +1316,58 @@ impl SemanticCacheRevivalCensus {
 }
 
 // Provisional owner decision for the current Python semantic path (#5113).
-// Revisit when Python moves to the native engine. Each cache gets this cap,
-// independently of the global memo budget.
+// Revisit when Python moves to the native engine. The prepared dispatch pool
+// still uses this cap; the complete artifact cache uses the owner's budget.
 #[doc(hidden)]
 pub const SEMANTIC_MATERIALIZATION_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// One cache-owned artifact reference, excluded from a root's resident census.
 /// The mutex serializes reference creation/destruction with census reads,
-/// including Moka's delayed physical reclamation after logical eviction.
+/// including delayed physical reclamation after logical eviction.
 #[doc(hidden)]
-pub struct CachedSemanticArtifact(Option<Arc<SemanticArtifact>>);
+pub struct CachedSemanticArtifact(Option<SharedAllocation<SemanticArtifact>>);
 
 impl CachedSemanticArtifact {
     #[doc(hidden)]
     pub fn new(artifact: &Arc<SemanticArtifact>) -> Self {
         let mut pins = artifact.cache_pins.lock();
         *pins += 1;
-        Self(Some(Arc::clone(artifact)))
+        Self(Some(SharedAllocation::new(Arc::clone(artifact))))
+    }
+
+    pub fn arc(&self) -> &Arc<SemanticArtifact> {
+        self.0
+            .as_ref()
+            .expect("cache artifact is live until drop")
+            .arc()
+    }
+}
+
+impl RetainedBytes for CachedSemanticArtifact {
+    fn retained_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .expect("cache artifact is live until drop")
+            .retained_bytes()
+    }
+
+    fn eviction_bytes(&self) -> usize {
+        self.0
+            .as_ref()
+            .expect("cache artifact is live until drop")
+            .eviction_bytes()
+    }
+}
+
+impl SharedValue for CachedSemanticArtifact {
+    type Shared = SemanticArtifact;
+
+    fn shared(&self) -> &Arc<SemanticArtifact> {
+        self.arc()
+    }
+
+    fn rewrap(artifact: Arc<SemanticArtifact>) -> Self {
+        Self::new(&artifact)
     }
 }
 
@@ -1165,14 +1375,14 @@ impl std::ops::Deref for CachedSemanticArtifact {
     type Target = Arc<SemanticArtifact>;
 
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("cache artifact is live until drop")
+        self.arc()
     }
 }
 
 impl Drop for CachedSemanticArtifact {
     fn drop(&mut self) {
         let artifact = self.0.take().expect("cache artifact drops once");
-        let counter = Arc::clone(&artifact.cache_pins);
+        let counter = Arc::clone(&artifact.arc().cache_pins);
         let mut pins = counter.lock();
         *pins -= 1;
         drop(artifact);

@@ -254,6 +254,77 @@ fn decode_floating(token: &str, negative: bool) -> Option<JavaNumericLiteral> {
     }
 }
 
+/// Evaluate one integral arithmetic operator after binary numeric promotion
+/// (JLS 5.6.2, 15.17, 15.18.2): either `long` operand promotes both to
+/// `long`, and otherwise both are `int`. Results wrap as Java's operators do;
+/// `MIN / -1` is `MIN` in both languages. A zero divisor throws at run time,
+/// so division and remainder by zero have no value. Floating operands and
+/// other operators have no value here.
+pub(in crate::analyzer::java::semantic) fn java_integral_binary(
+    operator: &str,
+    left: JavaNumericLiteral,
+    right: JavaNumericLiteral,
+) -> Option<JavaNumericLiteral> {
+    use JavaNumericLiteral::{Int, Long};
+    match (left, right) {
+        (Int(left), Int(right)) => Some(Int(match operator {
+            "+" => left.wrapping_add(right),
+            "-" => left.wrapping_sub(right),
+            "*" => left.wrapping_mul(right),
+            "/" | "%" if right == 0 => return None,
+            "/" => left.wrapping_div(right),
+            "%" => left.wrapping_rem(right),
+            _ => return None,
+        })),
+        (Int(_) | Long(_), Int(_) | Long(_)) => {
+            let (left, right) = (left.integer()?, right.integer()?);
+            if matches!(operator, "/" | "%") && right == 0 {
+                return None;
+            }
+            Some(Long(match operator {
+                "+" => left.wrapping_add(right),
+                "-" => left.wrapping_sub(right),
+                "*" => left.wrapping_mul(right),
+                "/" => left.wrapping_div(right),
+                "%" => left.wrapping_rem(right),
+                _ => return None,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate unary minus on an integral value; it wraps at the type's minimum.
+pub(in crate::analyzer::java::semantic) fn java_integral_negate(
+    value: JavaNumericLiteral,
+) -> Option<JavaNumericLiteral> {
+    match value {
+        JavaNumericLiteral::Int(value) => Some(JavaNumericLiteral::Int(value.wrapping_neg())),
+        JavaNumericLiteral::Long(value) => Some(JavaNumericLiteral::Long(value.wrapping_neg())),
+        JavaNumericLiteral::Float(_) | JavaNumericLiteral::Double(_) => None,
+    }
+}
+
+/// Evaluate a numerical comparison of two integral values (JLS 15.20.1,
+/// 15.21.1). Promotion to `long` is exact, so comparing the widened values is
+/// the comparison Java performs.
+pub(in crate::analyzer::java::semantic) fn java_integral_comparison(
+    operator: &str,
+    left: JavaNumericLiteral,
+    right: JavaNumericLiteral,
+) -> Option<bool> {
+    let (left, right) = (left.integer()?, right.integer()?);
+    Some(match operator {
+        "==" => left == right,
+        "!=" => left != right,
+        "<" => left < right,
+        "<=" => left <= right,
+        ">" => left > right,
+        ">=" => left >= right,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
 

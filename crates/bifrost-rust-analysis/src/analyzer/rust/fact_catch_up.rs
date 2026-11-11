@@ -385,10 +385,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
-    fn project(files: &[(String, String)]) -> (tempfile::TempDir, RustAnalyzer) {
-        crate::analyzer::rust::test_support::project(files)
-    }
-
     fn project_with_config(
         files: &[(String, String)],
         config: brokk_bifrost_core::analyzer::config::AnalyzerConfig,
@@ -409,8 +405,13 @@ mod tests {
         (temp, analyzer)
     }
 
-    fn workspace_of(size: usize) -> (tempfile::TempDir, RustAnalyzer) {
-        project(&workspace_files(size))
+    fn workspace_of(
+        size: usize,
+    ) -> (
+        crate::analyzer::rust::test_support::CertifiedFixture,
+        RustAnalyzer,
+    ) {
+        crate::analyzer::rust::test_support::certified_project(&workspace_files(size))
     }
 
     fn importers(analyzer: &RustAnalyzer) -> brokk_bifrost_core::hash::HashSet<ProjectFile> {
@@ -504,7 +505,7 @@ mod tests {
         let other_build = std::thread::spawn(move || {
             let other = TreeSitterAnalyzer::new_with_config_and_progress(
                 std::sync::Arc::new(TestProject::new(other_root, Language::Rust)),
-                RustAdapter,
+                RustAdapter::for_tests(),
                 config,
                 move |event| {
                     if event.phase == BuildProgressPhase::Parse

@@ -244,3 +244,30 @@ fn typestate_subjects_events_and_terminal_states_survive_projection() {
         json!(["closed", "open"])
     );
 }
+
+#[test]
+fn declared_subset_requires_a_reason_and_changes_only_declared_identity() {
+    let policy = |coverage: &str| {
+        format!(
+            r#"(policy :id "test.coverage" :name "Coverage" :message "M" :severity warning
+        {coverage} :analysis (analysis :type match :selector (rql (language python (class)))))"#
+        )
+    };
+    let parse =
+        |source: &str| parse_rqlp_source(source, PolicySourceIdentity::new("coverage.rqlp"));
+    let absent = parse(&policy(""))
+        .unwrap()
+        .document()
+        .to_normalized_authored_json();
+    assert!(absent.get("coverage").is_none());
+    let declared = parse(&policy(
+        ":coverage (proven-subset :reason \"Only named classes\")",
+    ))
+    .unwrap()
+    .document()
+    .to_normalized_authored_json();
+    assert_eq!(declared["coverage"]["reason"], "Only named classes");
+    assert_ne!(absent, declared);
+    assert!(parse(&policy(":coverage (proven-subset :reason \"\")")).is_err());
+    assert!(parse(&policy(":coverage (proven-subset :reason \"   \")")).is_err());
+}

@@ -71,24 +71,24 @@ intelligence even when no ignore rule matches them:
   strict physical-line limit, or to `0` to turn the line limit off. See
   [Environment Variables](/reference/environment/).
 
-At the default setting, C/C++ analysis can admit generated numeric tables.
-The parser must prove that the excluded spans contain only numeric initializer
-lists, including nested lists and signed numbers. Python also admits string
-and bytes literals, including implicit concatenation, when they contain no
-interpolation fields (for example, generated protobuf descriptors).
-JavaScript and TypeScript admit string literals, JSX attribute strings and
-template literals without substitutions (for example, an inlined SVG path).
-The remaining bytes on each
-physical line must fit the default limit. The complete original source is still
-analyzed, and any separate syntax recovery remains incomplete evidence.
+At the default setting, every language admits a line that is long only
+because of data. The parser must prove that the excluded spans are string,
+number or character literals without interpolation, or array, list, tuple or
+initializer-list literals and signed numbers built only from them. Examples are
+a long expected-output string in a Rust test, a generated protobuf descriptor
+in Python, an inlined SVG path in JavaScript, and a generated numeric table in
+C. The remaining bytes on each physical line must fit the default limit, so a
+minified bundle, whose long lines are code, is still refused. Comments do not
+count as data. The complete original source is still analyzed, and any
+separate syntax recovery remains incomplete evidence.
 
-This exception has finite limits: 1 MiB of source, 65536 syntax-tree nodes,
-depth 128, 8 MiB of cumulative node spans, and 8192 nodes across all excluded
-data subtrees. Parsing and admission share a 10-second deadline. An explicit positive
+The excluded data subtrees may hold at most 8192 syntax-tree nodes in total;
+the rest of the file has the same limits as any other file. Parsing and
+admission share a 10-second deadline. An explicit positive
 `BIFROST_MAX_LINE_LENGTH`, including `16000`, applies the strict physical-line
 limit instead. Choose this setting before starting Bifrost; changing it between
-runs invalidates C/C++, Python, JavaScript and TypeScript facts admitted under
-the previous setting. The 1 MiB source limit also applies to the NUL proof.
+runs invalidates the facts admitted under the previous setting. A NUL proof
+applies only to sources of at most 1 MiB.
 
 File-level tools can still read files that analysis refuses.
 

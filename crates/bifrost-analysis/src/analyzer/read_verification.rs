@@ -25,7 +25,11 @@
 //! Everything else -- artifacts, scopes, models, policy, configuration, epoch
 //! -- is an identity comparison against what the head publishes.
 
-use crate::analyzer::semantic::read_ledger::{FactSubject, WorkspaceFactFamily};
+use crate::analyzer::semantic::read_ledger::{
+    FactSubject, StoredSemanticIrPublicationAnswer, StoredSemanticIrPublicationQuestion,
+    WorkspaceFactFamily,
+};
+use crate::analyzer::semantic::{StoredSemanticIrRead, classify};
 use git2::Oid;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -37,10 +41,14 @@ use crate::analyzer::read_ledger::{
     absent_signature_metadata_digest,
 };
 use crate::analyzer::semantic::ids::StableDigest;
+use crate::analyzer::semantic::read_ledger::{
+    CertifiedDefinitionKind, DEFINITION_NORMALIZED_TAIL_VERSION,
+};
 use crate::analyzer::semantic::{
     CallSiteHandle, DispatchOracle, ProcedureHandle, SemanticBudget, SemanticRequest, SemanticWork,
     WorkspaceSemanticOracle,
 };
+use crate::analyzer::structural::index::StructuralIndexAcquisition;
 use crate::analyzer::usages::call_relations::{CallRelationLimits, CallRelationService};
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, UsageFinder};
 use crate::analyzer::workspace::WorkspaceAnalyzer;
@@ -66,6 +74,13 @@ pub trait WorkspaceFactIndex: Send + Sync {
     /// The language whose analyzed content this index describes.
     fn fact_index_language(&self) -> Language;
 
+    /// Whether this analyzer still holds a workspace listing proof, which a
+    /// listing omission that may hide source would withdraw. An update with no
+    /// changed file needs to run only while there is a proof to withdraw.
+    fn holds_workspace_listing_proof(&self) -> bool {
+        false
+    }
+
     /// Replay the shared declaration and structural-parent facts, before any
     /// language adapter adds its own parent interpretation.
     fn declaration_facts_digest(&self, declaration: &CodeUnit) -> StableDigest;
@@ -75,6 +90,12 @@ pub trait WorkspaceFactIndex: Send + Sync {
 
     /// Replay one complete name lookup, including an empty answer.
     fn definition_answer_digest(&self, name: &str) -> StableDigest;
+
+    /// Look up an already normalized definition-tail key without normalizing it again.
+    /// `None` means this delegate cannot certify the answer.
+    fn normalized_tail_candidates(&self, _key: &str) -> Option<Vec<CodeUnit>> {
+        None
+    }
 
     /// Replay declarations addressed by a source identifier.
     fn identifier_candidate_answer_digest(&self, name: &str) -> StableDigest;
@@ -93,8 +114,65 @@ pub trait WorkspaceFactIndex: Send + Sync {
         None
     }
 
-    /// Every analyzed path of this language with the blob it resolves to.
-    fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)>;
+    /// A digest of everything this language's content identity folds except
+    /// the analyzed file set: the language epoch, the analyzer configuration,
+    /// the selected configuration, the package-identity inputs and the
+    /// overlays.
+    ///
+    /// Two snapshots whose file sets agree on every path and blob can still
+    /// mean different things when this digest differs, because those inputs
+    /// rekey declarations in files whose blobs did not change. `None` when the
+    /// index cannot state it, which a caller treats as "moved".
+    fn identity_inputs_digest(&self) -> Option<StableDigest> {
+        None
+    }
+
+    /// Every analyzed path of this language with the blob it resolves to, or
+    /// None when the listing could not be read completely (a store failure):
+    /// a partial list would read the missing files as absent.
+    fn analyzed_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>>;
+
+    /// Whether this index reads package-identity inputs at all.
+    fn has_workspace_package_identity_inputs(&self) -> bool {
+        false
+    }
+
+    /// Whether `file`, which no analyzer parses, qualifies this language's
+    /// declarations (`go.mod`, `Cargo.toml`). Answered from the path alone, so
+    /// it also classifies a committed file the head no longer has.
+    fn is_package_identity_input(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// The package-identity inputs this language's head read, each with the
+    /// blob of the bytes it read.
+    ///
+    /// These are not in [`Self::analyzed_blobs`], so a comparison of analyzed
+    /// sources never sees them. `None` means the head cannot say what it read
+    /// (the files moved since the generation was built, or a read failed),
+    /// which is not an empty answer.
+    fn package_identity_input_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+        Some(Vec::new())
+    }
+
+    /// Whether `file`, which this language reads as selected configuration but
+    /// does not qualify its declarations with (`Cargo.lock`, `go.sum`,
+    /// `package.json`), is such an input. Answered from the path alone, so it
+    /// also classifies a committed file the head no longer has.
+    fn is_selected_configuration_input(&self, _path: &Path) -> bool {
+        false
+    }
+
+    /// The selected-configuration inputs this language's head was built
+    /// against, each with the blob it read. A retained absence is not listed.
+    /// Package-identity inputs are listed by
+    /// [`Self::package_identity_input_blobs`] instead.
+    ///
+    /// `None` means the head cannot say what it read, which is not an empty
+    /// answer.
+    fn selected_configuration_input_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+        Some(Vec::new())
+    }
 
     /// Every source-admission refusal persisted for the selected revision,
     /// with the blob identity recorded at admission time.
@@ -114,6 +192,17 @@ pub trait WorkspaceFactIndex: Send + Sync {
         file: &ProjectFile,
         blob: Oid,
     ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>>;
+
+    /// Test-only detail for a [`Self::blob_index_keys`] answer of `None`.
+    ///
+    /// The production answer is deliberately just `None`, because a warm base
+    /// must fail closed when it cannot enumerate a blob's keys. A test that
+    /// checks the enumerator succeeds needs the branch that refused, and the
+    /// store error that refusal may have discarded.
+    #[cfg(any(test, feature = "test-support"))]
+    fn blob_index_keys_failure(&self, _file: &ProjectFile, _blob: Oid) -> Option<String> {
+        None
+    }
 
     /// Every `(family, key, digest)` the *persisted* facts of `blob` contribute, with
     /// `source` as that blob's own bytes.
@@ -136,6 +225,28 @@ pub trait WorkspaceFactIndex: Send + Sync {
         source: &str,
     ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>>;
 
+    /// Process-local identity of the fact store owning snapshot revisions.
+    /// Clones share this identity; independent ephemeral stores do not.
+    fn definition_inventory_owner(&self) -> Option<usize> {
+        None
+    }
+
+    /// Exact selected snapshots covered by this delegate's listing proof.
+    /// An empty or unknown proof cannot certify a definition inventory.
+    fn definition_inventory_snapshots(&self) -> Option<crate::analyzer::store::ListedSnapshots> {
+        None
+    }
+
+    /// Canonical per-file contributions to one definition bucket. Unknown
+    /// inventory or incomplete per-file facts refuse the entire certificate.
+    fn definition_inventory_entries(
+        &self,
+        _family: IndexFamily,
+        _key: &[u8],
+    ) -> Option<Vec<(String, String, StableDigest)>> {
+        None
+    }
+
     /// Query-local callable metrics from this language's structured AST.
     ///
     /// This is deliberately a fact-index seam rather than the authority-gated
@@ -153,6 +264,99 @@ pub trait WorkspaceFactIndex: Send + Sync {
         )>,
     > {
         None
+    }
+}
+
+/// Snapshot identity captured before a solve. Kept separate from the inventory
+/// digest so an unrelated revision can verify the same bucket at head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionInventorySnapshot {
+    delegates: Vec<(Language, usize, crate::analyzer::store::ListedSnapshots)>,
+}
+
+impl DefinitionInventorySnapshot {
+    pub fn capture(analyzer: &dyn IAnalyzer) -> Option<Self> {
+        let indexes = analyzer.workspace_fact_indexes();
+        let mut delegates = Vec::new();
+        for language in analyzer.languages() {
+            let index = indexes
+                .iter()
+                .find(|index| index.fact_index_language() == language)?;
+            let snapshots = index.definition_inventory_snapshots()?;
+            if snapshots.snapshots().is_empty() {
+                return None;
+            }
+            // Snapshot revision numbers are local to a store; distinct ephemeral
+            // analyzers can reuse them. Bind the solve capability to its owner
+            // as well as the selected workspace/generation/revision tuple.
+            let owner = index.definition_inventory_owner()?;
+            delegates.push((language, owner, snapshots));
+        }
+        if delegates.is_empty() {
+            return None;
+        }
+        Some(Self { delegates })
+    }
+
+    pub fn languages(&self) -> Vec<Language> {
+        self.delegates
+            .iter()
+            .map(|(language, _, _)| *language)
+            .collect()
+    }
+
+    /// Recheck both before and after enumeration. No result may be attached to
+    /// a solve if its exact selected workspace/generation/revision moved.
+    pub fn digest(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: IndexFamily,
+        key: &[u8],
+    ) -> Option<StableDigest> {
+        if Self::capture(analyzer).as_ref() != Some(self) {
+            return None;
+        }
+        let normalization = match family {
+            IndexFamily::DefinitionNormalizedTail => Some(DEFINITION_NORMALIZED_TAIL_VERSION),
+            IndexFamily::DefinitionExact | IndexFamily::DefinitionIdentifier => None,
+            _ => return None,
+        };
+        let mut hash = CanonicalHasher::new(b"bifrost:definition-index-inventory:v1");
+        hash.field("family", family.stable_label().as_bytes());
+        hash.field("key", key);
+        hash.field(
+            "normalization",
+            &normalization
+                .map(u32::to_le_bytes)
+                .map(Vec::from)
+                .unwrap_or_default(),
+        );
+        let languages = self.languages();
+        hash.sequence("delegates", &languages, |hash, language| {
+            hash.value(language.config_label().as_bytes());
+        });
+        let indexes = analyzer.workspace_fact_indexes();
+        let mut entries = Vec::new();
+        for language in languages {
+            let index = indexes
+                .iter()
+                .find(|index| index.fact_index_language() == language)?;
+            entries.extend(index.definition_inventory_entries(family, key)?);
+            if entries.len() > 65_536 {
+                return None;
+            }
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        hash.sequence("entries", &entries, |hash, (path, language, digest)| {
+            hash.value(path.as_bytes());
+            hash.value(language.as_bytes());
+            hash.value(digest.as_bytes());
+        });
+        if Self::capture(analyzer).as_ref() != Some(self) {
+            return None;
+        }
+        Some(StableDigest::from_array(hash.finish()))
     }
 }
 
@@ -176,301 +380,138 @@ pub trait WorkspaceFactIndex: Send + Sync {
 /// verification. A caller must widen rather than trust an incomplete answer.
 #[derive(Debug)]
 pub struct ChangedFacts {
-    paths: HashMap<Language, HashSet<Box<str>>>,
-    keys: HashSet<(IndexFamily, Box<[u8]>)>,
+    delta: ChangedDelta,
     /// The head's whole path map, retained because a `ReadKey::File` names the
     /// blob its reader saw, which need not be either side of this difference:
     /// a unit published by an earlier head run carries that run's blob. Only
     /// comparing against the head's own map answers exactly, and building it
     /// once here is what keeps verification linear in the number of units.
     head_blobs: HashMap<(Language, Box<str>), Oid>,
-    unenumerated: Vec<(Language, Box<str>)>,
-    languages_without_index: Vec<Language>,
-    refused_sources_incomplete: bool,
 }
 
-impl ChangedFacts {
-    /// The difference between two workspaces.
-    pub fn between(base: &WorkspaceAnalyzer, head: &WorkspaceAnalyzer) -> Self {
-        let mut facts = Self {
-            paths: HashMap::default(),
-            keys: HashSet::default(),
-            head_blobs: HashMap::default(),
-            unenumerated: Vec::new(),
-            languages_without_index: Vec::new(),
-            refused_sources_incomplete: false,
-        };
-        let base_indexes = fact_indexes_by_language(base);
-        let head_indexes = fact_indexes_by_language(head);
-        for (analyzer, indexes) in [(base, &base_indexes), (head, &head_indexes)] {
-            for language in analyzer.analyzer().languages() {
-                if !indexes.contains_key(&language) {
-                    facts.languages_without_index.push(language);
-                }
-            }
-        }
-        facts.languages_without_index.sort();
-        facts.languages_without_index.dedup();
+/// The head-independent half of [`ChangedFacts`]: what moved, without the
+/// head's own path map.
+///
+/// A delta can be computed once, when a workspace advances from one snapshot
+/// to the next, kept, [`Self::union`]ed with the deltas of later steps, and
+/// attached to whichever head finally asks with [`ChangedFacts::at_head`]. The
+/// union of the step deltas covers everything that moved between the first
+/// snapshot and the last: a key whose published digest differs between the
+/// two ends differs at some step. It can be larger than the direct
+/// difference (a key that moved and moved back stays), and a larger set costs
+/// only reuse.
+///
+/// [`Self::between`] is the guarded producer. Besides the file difference it
+/// refuses to be [`Self::is_complete`] when an input that decides what a
+/// snapshot means moved without a path moving: a package-identity input such as
+/// `go.mod`, the selected configuration, the language epoch or the analyzer
+/// configuration. Those rekey declarations in files whose blobs are unchanged,
+/// so the path and key sets alone would understate what moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedDelta {
+    paths: HashMap<Language, HashSet<Box<str>>>,
+    keys: HashSet<(IndexFamily, Box<[u8]>)>,
+    unenumerated: Vec<(Language, Box<str>)>,
+    languages_without_index: Vec<Language>,
+    /// The head's own record of what it read could not be retrieved: its
+    /// source-admission refusals, or the identity inputs it read.
+    refused_sources_incomplete: bool,
+    /// Languages whose identity inputs other than the analyzed file set
+    /// differ between the two ends, or cannot be compared.
+    identity_inputs_moved: Vec<Language>,
+    /// An end of a warm comparison is a project that layers request overlays,
+    /// whether or not a buffer is open now. Two analyzers of one session can
+    /// share a mutable overlay project, so both observe the buffers as they
+    /// are now, including after the last one closed, rather than as the
+    /// earlier snapshot saw them; the overlay state is not frozen per
+    /// analyzer yet (#10493 slice 3).
+    unfrozen_overlays: bool,
+    /// No base was compared, so no index difference is known at all.
+    without_base: bool,
+}
 
-        let mut languages = base_indexes.keys().copied().collect::<Vec<_>>();
-        languages.extend(head_indexes.keys().copied());
-        languages.sort();
-        languages.dedup();
-        for language in languages {
-            let base_blobs = base_indexes
-                .get(&language)
-                .map(|index| blob_map(*index))
-                .unwrap_or_default();
-            let head_blobs = head_indexes
-                .get(&language)
-                .map(|index| blob_map(*index))
-                .unwrap_or_default();
-            let mut paths = base_blobs
-                .keys()
-                .chain(head_blobs.keys())
-                .collect::<Vec<_>>();
-            paths.sort();
-            paths.dedup();
-            for rel_path in paths {
-                let base_blob = base_blobs.get(rel_path);
-                let head_blob = head_blobs.get(rel_path);
-                if base_blob.map(|(_, blob)| blob) == head_blob.map(|(_, blob)| blob) {
-                    continue;
-                }
-                let entries =
-                    |side: Option<&(ProjectFile, Oid)>, index: Option<&&dyn WorkspaceFactIndex>| {
-                        side.map(|(file, blob)| {
-                            index.and_then(|index| index.blob_index_keys(file, *blob))
-                        })
-                    };
-                facts.record_index_difference(
-                    language,
-                    rel_path,
-                    entries(base_blob, base_indexes.get(&language)),
-                    entries(head_blob, head_indexes.get(&language)),
-                );
-            }
-            for (rel_path, (_, blob)) in &head_blobs {
-                facts.head_blobs.insert((language, rel_path.clone()), *blob);
-            }
-        }
-        facts
-    }
-
-    /// The difference between a committed base subtree and `head`, with the
-    /// base's facts read from the store instead of from a base analyzer.
-    ///
-    /// This is [`Self::between`] for a run that is not going to build the base
-    /// at all. The base side is `base_blobs`, the `(workspace-relative path,
-    /// blob)` listing of one committed tree, and the base blobs' index keys
-    /// come from the facts the store already holds for them -- published by
-    /// the run that evaluated that base, keyed by content, and therefore still
-    /// the base's own facts. `base_source` supplies the bytes of the few blobs
-    /// that moved, which hydration needs and which the object database can
-    /// answer without materializing a tree.
-    ///
-    /// A base path is considered when the head serves its language and does
-    /// not ignore it. A path whose keys cannot be enumerated leaves this set
-    /// incomplete when the head analyzes that path too -- both sides published
-    /// facts for it, so a failure there is missing evidence -- and is skipped
-    /// when the head does not, because a blob no analyzer ever parsed
-    /// published no index key to miss. (Reclamation cannot make that second
-    /// case wrong: rows are reclaimed when a generation moves, and a
-    /// generation move rotates the analysis epoch that every reusable unit's
-    /// key carries.)
-    pub fn from_committed_tree(
-        head: &WorkspaceAnalyzer,
-        base_blobs: &[(Box<str>, Oid)],
-        base_source: &dyn Fn(Oid) -> Option<String>,
-    ) -> Self {
-        let mut facts = Self {
-            paths: HashMap::default(),
-            keys: HashSet::default(),
-            head_blobs: HashMap::default(),
-            unenumerated: Vec::new(),
-            languages_without_index: Vec::new(),
-            refused_sources_incomplete: false,
-        };
-        let head_indexes = fact_indexes_by_language(head);
-        for language in head.analyzer().languages() {
-            if !head_indexes.contains_key(&language) {
-                facts.languages_without_index.push(language);
-            }
-        }
-        let mut head_by_language: HashMap<Language, HashMap<Box<str>, (ProjectFile, Oid)>> =
-            HashMap::default();
-        let mut refused_by_language: HashMap<Language, HashMap<Box<str>, Oid>> = HashMap::default();
-        for (language, index) in &head_indexes {
-            let blobs = blob_map(*index);
-            for (rel_path, (_, blob)) in &blobs {
-                facts
-                    .head_blobs
-                    .insert((*language, rel_path.clone()), *blob);
-            }
-            head_by_language.insert(*language, blobs);
-            match index.refused_source_blobs() {
-                Ok(refusals) => {
-                    refused_by_language.insert(
-                        *language,
-                        refusals
-                            .into_iter()
-                            .map(|(file, blob)| {
-                                (
-                                    Box::from(crate::path_utils::rel_path_string(&file).as_str()),
-                                    blob,
-                                )
-                            })
-                            .collect(),
-                    );
-                }
-                Err(error) => {
-                    head.analyzer().record_query_failure(error);
-                    facts.refused_sources_incomplete = true;
-                }
-            }
-        }
-
-        let project = head.analyzer().project();
-        let root = project.root().to_path_buf();
-        // One pass over the committed listing, so the head pass below is a
-        // lookup per head file rather than a scan of the whole tree.
-        let base_blob_by_path = base_blobs
-            .iter()
-            .map(|(rel_path, blob)| (rel_path.clone(), *blob))
-            .collect::<HashMap<Box<str>, Oid>>();
-        let mut base_by_language: HashMap<Language, HashSet<Box<str>>> = HashMap::default();
-        for (rel_path, blob) in base_blobs {
-            let file = ProjectFile::new(root.clone(), Path::new(rel_path.as_ref()).to_path_buf());
-            let language = file.language();
-            if language == Language::None || project.is_bifrostignored(Path::new(rel_path.as_ref()))
-            {
-                continue;
-            }
-            let Some(index) = head_indexes.get(&language) else {
-                facts.languages_without_index.push(language);
-                continue;
-            };
-            base_by_language
-                .entry(language)
-                .or_default()
-                .insert(rel_path.clone());
-            let head_blob = head_by_language
-                .get(&language)
-                .and_then(|blobs| blobs.get(rel_path))
-                .map(|(_, blob)| *blob)
-                .or_else(|| {
-                    refused_by_language
-                        .get(&language)
-                        .and_then(|blobs| blobs.get(rel_path).copied())
-                });
-            if head_blob == Some(*blob) {
-                continue;
-            }
-            facts
-                .paths
-                .entry(language)
-                .or_default()
-                .insert(rel_path.clone());
-            let keys = base_source(*blob)
-                .and_then(|source| index.stored_blob_index_keys(&file, *blob, &source));
-            let head_entries = head_by_language
-                .get(&language)
-                .and_then(|blobs| blobs.get(rel_path))
-                .map(|(head_file, head_blob)| index.blob_index_keys(head_file, *head_blob));
-            // An absent deleted blob never published facts in this generation;
-            // retain the existing reclamation/admission exception.
-            let base_entries = if keys.is_none() && head_blob.is_none() {
-                None
-            } else {
-                Some(keys)
-            };
-            facts.record_index_difference(language, rel_path, base_entries, head_entries);
-        }
-
-        for (language, blobs) in &head_by_language {
-            let base_paths = base_by_language.get(language);
-            for (rel_path, (file, blob)) in blobs {
-                let unchanged = base_blob_by_path.get(rel_path).copied() == Some(*blob)
-                    && base_paths.is_some_and(|paths| paths.contains(rel_path));
-                if unchanged {
-                    continue;
-                }
-                if base_paths.is_some_and(|paths| paths.contains(rel_path)) {
-                    continue;
-                }
-                facts.record_changed_blob(
-                    *language,
-                    rel_path,
-                    file,
-                    *blob,
-                    head_indexes.get(language).copied(),
-                );
-            }
-        }
-        for (language, refusals) in &refused_by_language {
-            let base_paths = base_by_language.get(language);
-            for (rel_path, blob) in refusals {
-                let unchanged = base_blob_by_path.get(rel_path).copied() == Some(*blob)
-                    && base_paths.is_some_and(|paths| paths.contains(rel_path));
-                if !unchanged {
-                    facts
-                        .paths
-                        .entry(*language)
-                        .or_default()
-                        .insert(rel_path.clone());
-                }
-            }
-        }
-        facts.languages_without_index.sort();
-        facts.languages_without_index.dedup();
-        facts
-    }
-
-    /// What moved between this comparison's head and itself: nothing.
-    ///
-    /// A [`ReadKey::Index`] is proved by membership in the set of names that
-    /// moved between two workspaces, which is a statement about a read set
-    /// recorded on the first of them. A read set the head itself recorded
-    /// needs the difference between the head and the head, so its index
-    /// probes hold because nothing moved, while its file keys are still
-    /// checked against the same head path map. Built from this comparison's
-    /// own map so that no second enumeration of the head is paid for.
-    pub fn head_only(&self) -> Self {
+impl ChangedDelta {
+    fn empty() -> Self {
         Self {
             paths: HashMap::default(),
             keys: HashSet::default(),
-            head_blobs: self.head_blobs.clone(),
             unenumerated: Vec::new(),
-            languages_without_index: self.languages_without_index.clone(),
-            refused_sources_incomplete: self.refused_sources_incomplete,
+            languages_without_index: Vec::new(),
+            refused_sources_incomplete: false,
+            identity_inputs_moved: Vec::new(),
+            unfrozen_overlays: false,
+            without_base: false,
         }
     }
 
-    /// Whether every changed blob's facts were enumerated and every language
-    /// the two analyzers serve published a fact index.
+    /// What moved from `old` to `new`, complete only when no identity input
+    /// moved with it.
+    ///
+    /// This is the producer for a warm base, which compares two analyzers of
+    /// the same workspace at different times. [`ChangedFacts::between`] (the
+    /// diff_base path) does not apply the guard: there, an identity input
+    /// that moves is a file difference that the units' own recorded reads and
+    /// the committed-tree package-identity differences already account for
+    /// key by key, and the guard would turn every manifest edit into a full run.
+    pub fn between(old: &WorkspaceAnalyzer, new: &WorkspaceAnalyzer) -> Self {
+        let mut delta = compare_workspaces(old, new).0;
+        delta.identity_inputs_moved = identity_inputs_moved(old, new);
+        // A project with no overlay concept answers None; an overlay project
+        // answers Some even with no buffer open.
+        let layers_overlays = |analyzer: &WorkspaceAnalyzer| {
+            analyzer.analyzer().project().overlay_content().is_some()
+        };
+        delta.unfrozen_overlays = layers_overlays(old) || layers_overlays(new);
+        delta
+    }
+
+    /// Everything that moved in `self` or in `later`, for a chain of steps.
+    pub fn union(mut self, later: &Self) -> Self {
+        for (language, paths) in &later.paths {
+            self.paths
+                .entry(*language)
+                .or_default()
+                .extend(paths.iter().cloned());
+        }
+        self.keys.extend(later.keys.iter().cloned());
+        self.unenumerated.extend(later.unenumerated.iter().cloned());
+        self.languages_without_index
+            .extend(later.languages_without_index.iter().copied());
+        self.identity_inputs_moved
+            .extend(later.identity_inputs_moved.iter().copied());
+        self.refused_sources_incomplete |= later.refused_sources_incomplete;
+        self.unfrozen_overlays |= later.unfrozen_overlays;
+        self.without_base |= later.without_base;
+        self.unenumerated.sort();
+        self.unenumerated.dedup();
+        self.languages_without_index.sort();
+        self.languages_without_index.dedup();
+        self.identity_inputs_moved.sort();
+        self.identity_inputs_moved.dedup();
+        self
+    }
+
+    /// Whether every changed blob's facts were enumerated, every language the
+    /// two analyzers serve published a fact index, no identity input moved,
+    /// and neither end is a project that layers request overlays.
     pub fn is_complete(&self) -> bool {
         self.unenumerated.is_empty()
             && self.languages_without_index.is_empty()
+            && self.identity_inputs_moved.is_empty()
+            && !self.unfrozen_overlays
             && !self.refused_sources_incomplete
+            && !self.without_base
     }
 
-    /// The changed blobs whose facts could not be enumerated, and the
-    /// languages that published no fact index at all.
-    pub fn incompleteness(&self) -> (&[(Language, Box<str>)], &[Language]) {
-        (&self.unenumerated, &self.languages_without_index)
+    /// The languages whose identity inputs moved without a file difference
+    /// accounting for it. See [`Self::between`].
+    pub fn identity_inputs_moved(&self) -> &[Language] {
+        &self.identity_inputs_moved
     }
 
     /// Whether a changed file has different published entries under this key.
     pub fn contains(&self, family: IndexFamily, key: &[u8]) -> bool {
         self.keys.contains(&(family, Box::from(key)))
-    }
-
-    /// The blob the head resolves `rel_path` to in `language`, or `None` when
-    /// the head does not analyze it.
-    pub fn head_blob(&self, language: Language, rel_path: &str) -> Option<Oid> {
-        self.head_blobs
-            .get(&(language, Box::from(rel_path)))
-            .copied()
     }
 
     /// Whether this path's blob differs between the two workspaces.
@@ -532,6 +573,101 @@ impl ChangedFacts {
         }
     }
 
+    /// Compare retained inputs by blob in both directions, with one pass over
+    /// the committed tree shared by all languages and input kinds.
+    fn record_input_differences(
+        &mut self,
+        indexes: &HashMap<Language, &dyn WorkspaceFactIndex>,
+        analyzed: &HashMap<Language, HashMap<Box<str>, (ProjectFile, Oid)>>,
+        project: &dyn crate::Project,
+        base_blobs: &[(Box<str>, Oid)],
+        base_blob_by_path: &HashMap<Box<str>, Oid>,
+    ) {
+        enum InputKind {
+            PackageIdentity,
+            SelectedConfiguration,
+        }
+        let mut participating = Vec::new();
+        for (&language, &index) in indexes {
+            let mut kinds = vec![(
+                InputKind::SelectedConfiguration,
+                index.selected_configuration_input_blobs(),
+            )];
+            if index.has_workspace_package_identity_inputs() {
+                kinds.push((
+                    InputKind::PackageIdentity,
+                    index.package_identity_input_blobs(),
+                ));
+            }
+            for (kind, inputs) in kinds {
+                let Some(inputs) = inputs else {
+                    self.refused_sources_incomplete = true;
+                    continue;
+                };
+                let inputs = inputs
+                    .into_iter()
+                    .map(|(file, blob)| {
+                        (
+                            Box::<str>::from(crate::path_utils::rel_path_string(&file).as_str()),
+                            blob,
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                participating.push((language, index, kind, inputs));
+            }
+        }
+        let mut record = |language, kind: &InputKind, path: &str| {
+            self.paths
+                .entry(language)
+                .or_default()
+                .insert(Box::from(path));
+            // The normal source comparison above enumerates a path's changed
+            // keys only for the language that analyzes it, so a configuration
+            // input is enumerated only when its own language analyzes the path
+            // (a build.gradle.kts that Kotlin analyzes says nothing about the
+            // dependency evidence Java reads from it). Package identity can
+            // also rekey declarations in unchanged files.
+            if matches!(kind, InputKind::PackageIdentity)
+                || !analyzed
+                    .get(&language)
+                    .is_some_and(|blobs| blobs.contains_key(path))
+            {
+                self.unenumerated.push((language, Box::from(path)));
+            }
+        };
+        for (language, _, kind, inputs) in &participating {
+            for (path, blob) in inputs {
+                if base_blob_by_path.get(path) != Some(blob) {
+                    record(*language, kind, path);
+                }
+            }
+        }
+        // A committed input the head did not read is a difference. Package
+        // identity has no exemption: the head reads those inputs from the
+        // whole listing, and Go naming reads manifests from disk directly. A
+        // selected-configuration input exists only if the head's listing
+        // selects it, so a committed file that is still on disk but outside
+        // the listing (`is_gitignored`) was never an input on either side.
+        for (rel_path, _) in base_blobs {
+            let path = Path::new(rel_path.as_ref());
+            let mut outside_listing = None;
+            for (language, index, kind, inputs) in &participating {
+                let is_input = match kind {
+                    InputKind::PackageIdentity => index.is_package_identity_input(path),
+                    InputKind::SelectedConfiguration => {
+                        index.is_selected_configuration_input(path)
+                            && !*outside_listing.get_or_insert_with(|| project.is_gitignored(path))
+                    }
+                };
+                if !inputs.contains_key(rel_path) && is_input {
+                    record(*language, kind, rel_path);
+                }
+            }
+        }
+        self.unenumerated.sort();
+        self.unenumerated.dedup();
+    }
+
     fn record_changed_blob(
         &mut self,
         language: Language,
@@ -553,6 +689,393 @@ impl ChangedFacts {
     }
 }
 
+/// The file and key difference between two workspaces, with the head's own
+/// path map, which the same pass already enumerated. Both
+/// [`ChangedFacts::between`] and [`ChangedDelta::between`] start from this.
+fn compare_workspaces(
+    base: &WorkspaceAnalyzer,
+    head: &WorkspaceAnalyzer,
+) -> (ChangedDelta, HashMap<(Language, Box<str>), Oid>) {
+    let mut delta = ChangedDelta::empty();
+    let mut head_path_blobs = HashMap::default();
+    let base_indexes = fact_indexes_by_language(base);
+    let head_indexes = fact_indexes_by_language(head);
+    for (analyzer, indexes) in [(base, &base_indexes), (head, &head_indexes)] {
+        for language in analyzer.analyzer().languages() {
+            if !indexes.contains_key(&language) {
+                delta.languages_without_index.push(language);
+            }
+        }
+    }
+    delta.languages_without_index.sort();
+    delta.languages_without_index.dedup();
+
+    let mut languages = base_indexes.keys().copied().collect::<Vec<_>>();
+    languages.extend(head_indexes.keys().copied());
+    languages.sort();
+    languages.dedup();
+    for language in languages {
+        // A side with no index for the language lists nothing; a side whose
+        // listing failed cannot show which of its files are absent.
+        let listed =
+            |indexes: &HashMap<Language, &dyn WorkspaceFactIndex>| match indexes.get(&language) {
+                Some(index) => blob_map(*index),
+                None => Some(HashMap::default()),
+            };
+        let (Some(base_blobs), Some(head_blobs)) = (listed(&base_indexes), listed(&head_indexes))
+        else {
+            delta.languages_without_index.push(language);
+            continue;
+        };
+        let mut paths = base_blobs
+            .keys()
+            .chain(head_blobs.keys())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        for rel_path in paths {
+            let base_blob = base_blobs.get(rel_path);
+            let head_blob = head_blobs.get(rel_path);
+            if base_blob.map(|(_, blob)| blob) == head_blob.map(|(_, blob)| blob) {
+                continue;
+            }
+            let entries = |side: Option<&(ProjectFile, Oid)>,
+                           index: Option<&&dyn WorkspaceFactIndex>| {
+                side.map(|(file, blob)| index.and_then(|index| index.blob_index_keys(file, *blob)))
+            };
+            delta.record_index_difference(
+                language,
+                rel_path,
+                entries(base_blob, base_indexes.get(&language)),
+                entries(head_blob, head_indexes.get(&language)),
+            );
+        }
+        for (rel_path, (_, blob)) in &head_blobs {
+            head_path_blobs.insert((language, rel_path.clone()), *blob);
+        }
+    }
+    delta.languages_without_index.sort();
+    delta.languages_without_index.dedup();
+    (delta, head_path_blobs)
+}
+
+/// The identity guard of [`ChangedDelta::between`]: per language, everything
+/// the content identity folds except the file set. A language present on one
+/// side only, or one whose digest cannot be stated, counts as moved.
+fn identity_inputs_moved(base: &WorkspaceAnalyzer, head: &WorkspaceAnalyzer) -> Vec<Language> {
+    let base_indexes = fact_indexes_by_language(base);
+    let head_indexes = fact_indexes_by_language(head);
+    let mut languages = base_indexes.keys().copied().collect::<Vec<_>>();
+    languages.extend(head_indexes.keys().copied());
+    languages.sort();
+    languages.dedup();
+    languages.retain(|language| {
+        let digest = |indexes: &HashMap<Language, &dyn WorkspaceFactIndex>| {
+            indexes
+                .get(language)
+                .and_then(|index| index.identity_inputs_digest())
+        };
+        let (base_digest, head_digest) = (digest(&base_indexes), digest(&head_indexes));
+        base_digest.is_none() || base_digest != head_digest
+    });
+    languages
+}
+
+impl ChangedFacts {
+    /// The difference between two workspaces for a diff_base run. Unlike
+    /// [`ChangedDelta::between`] it applies no identity guard; see there.
+    pub fn between(base: &WorkspaceAnalyzer, head: &WorkspaceAnalyzer) -> Self {
+        let (delta, head_blobs) = compare_workspaces(base, head);
+        Self { delta, head_blobs }
+    }
+
+    /// A delta computed earlier, attached to the head it leads to.
+    ///
+    /// The caller states that `delta` covers everything that moved from the
+    /// snapshot it is compared against to `head`; this only reads the head's
+    /// own path map, which a `ReadKey::File` is checked against.
+    pub fn at_head(mut delta: ChangedDelta, head: &WorkspaceAnalyzer) -> Self {
+        let mut head_blobs = HashMap::default();
+        for (language, index) in fact_indexes_by_language(head) {
+            let Some(blobs) = blob_map(index) else {
+                delta.languages_without_index.push(language);
+                continue;
+            };
+            for (rel_path, (_, blob)) in blobs {
+                head_blobs.insert((language, rel_path), blob);
+            }
+        }
+        delta.languages_without_index.sort();
+        delta.languages_without_index.dedup();
+        Self { delta, head_blobs }
+    }
+
+    /// The difference between a committed base subtree and `head`, with the
+    /// base's facts read from the store instead of from a base analyzer.
+    ///
+    /// This is [`Self::between`] for a run that is not going to build the base
+    /// at all. The base side is `base_blobs`, the `(workspace-relative path,
+    /// blob)` listing of one committed tree, and the base blobs' index keys
+    /// come from the facts the store already holds for them -- published by
+    /// the run that evaluated that base, keyed by content, and therefore still
+    /// the base's own facts. `base_source` supplies the bytes of the few blobs
+    /// that moved, which hydration needs and which the object database can
+    /// answer without materializing a tree.
+    ///
+    /// A base path is considered when the head serves its language and does
+    /// not ignore it. A path whose keys cannot be enumerated leaves this set
+    /// incomplete when the head analyzes that path too -- both sides published
+    /// facts for it, so a failure there is missing evidence -- and is skipped
+    /// when the head does not, because a blob no analyzer ever parsed
+    /// published no index key to miss. (Reclamation cannot make that second
+    /// case wrong: rows are reclaimed when a generation moves, and a
+    /// generation move rotates the analysis epoch that every reusable unit's
+    /// key carries.)
+    ///
+    /// The difference also covers the non-source inputs the head read: the
+    /// package-identity inputs (`go.mod`, `Cargo.toml`) and the selected
+    /// configuration (`Cargo.lock`, `go.sum`, `package.json`). They are
+    /// compared by blob, because an uncommitted edit to one changes what the
+    /// head means without changing any analyzed blob (see
+    /// [`ChangedDelta::record_input_differences`]).
+    pub fn from_committed_tree(
+        head: &WorkspaceAnalyzer,
+        base_blobs: &[(Box<str>, Oid)],
+        base_source: &dyn Fn(Oid) -> Option<String>,
+    ) -> Self {
+        let mut facts = Self {
+            delta: ChangedDelta::empty(),
+            head_blobs: HashMap::default(),
+        };
+        let head_indexes = fact_indexes_by_language(head);
+        for language in head.analyzer().languages() {
+            if !head_indexes.contains_key(&language) {
+                facts.delta.languages_without_index.push(language);
+            }
+        }
+        let mut head_by_language: HashMap<Language, HashMap<Box<str>, (ProjectFile, Oid)>> =
+            HashMap::default();
+        let mut refused_by_language: HashMap<Language, HashMap<Box<str>, Oid>> = HashMap::default();
+        for (language, index) in &head_indexes {
+            let Some(blobs) = blob_map(*index) else {
+                facts.delta.languages_without_index.push(*language);
+                continue;
+            };
+            for (rel_path, (_, blob)) in &blobs {
+                facts
+                    .head_blobs
+                    .insert((*language, rel_path.clone()), *blob);
+            }
+            head_by_language.insert(*language, blobs);
+            match index.refused_source_blobs() {
+                Ok(refusals) => {
+                    refused_by_language.insert(
+                        *language,
+                        refusals
+                            .into_iter()
+                            .map(|(file, blob)| {
+                                (
+                                    Box::from(crate::path_utils::rel_path_string(&file).as_str()),
+                                    blob,
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+                Err(error) => {
+                    head.analyzer().record_query_failure(error);
+                    facts.delta.refused_sources_incomplete = true;
+                }
+            }
+        }
+
+        let project = head.analyzer().project();
+        let root = project.root().to_path_buf();
+        // One pass over the committed listing, so the head pass below is a
+        // lookup per head file rather than a scan of the whole tree.
+        let base_blob_by_path = base_blobs
+            .iter()
+            .map(|(rel_path, blob)| (rel_path.clone(), *blob))
+            .collect::<HashMap<Box<str>, Oid>>();
+        let mut base_by_language: HashMap<Language, HashSet<Box<str>>> = HashMap::default();
+        for (rel_path, blob) in base_blobs {
+            let file = ProjectFile::new(root.clone(), Path::new(rel_path.as_ref()).to_path_buf());
+            let language = file.language();
+            if language == Language::None || project.is_bifrostignored(Path::new(rel_path.as_ref()))
+            {
+                continue;
+            }
+            let Some(index) = head_indexes.get(&language) else {
+                facts.delta.languages_without_index.push(language);
+                continue;
+            };
+            base_by_language
+                .entry(language)
+                .or_default()
+                .insert(rel_path.clone());
+            let head_blob = head_by_language
+                .get(&language)
+                .and_then(|blobs| blobs.get(rel_path))
+                .map(|(_, blob)| *blob)
+                .or_else(|| {
+                    refused_by_language
+                        .get(&language)
+                        .and_then(|blobs| blobs.get(rel_path).copied())
+                });
+            if head_blob == Some(*blob) {
+                continue;
+            }
+            facts
+                .delta
+                .paths
+                .entry(language)
+                .or_default()
+                .insert(rel_path.clone());
+            let keys = base_source(*blob)
+                .and_then(|source| index.stored_blob_index_keys(&file, *blob, &source));
+            let head_entries = head_by_language
+                .get(&language)
+                .and_then(|blobs| blobs.get(rel_path))
+                .map(|(head_file, head_blob)| index.blob_index_keys(head_file, *head_blob));
+            // An absent deleted blob never published facts in this generation;
+            // retain the existing reclamation/admission exception.
+            let base_entries = if keys.is_none() && head_blob.is_none() {
+                None
+            } else {
+                Some(keys)
+            };
+            facts
+                .delta
+                .record_index_difference(language, rel_path, base_entries, head_entries);
+        }
+
+        for (language, blobs) in &head_by_language {
+            let base_paths = base_by_language.get(language);
+            for (rel_path, (file, blob)) in blobs {
+                let unchanged = base_blob_by_path.get(rel_path).copied() == Some(*blob)
+                    && base_paths.is_some_and(|paths| paths.contains(rel_path));
+                if unchanged {
+                    continue;
+                }
+                if base_paths.is_some_and(|paths| paths.contains(rel_path)) {
+                    continue;
+                }
+                facts.delta.record_changed_blob(
+                    *language,
+                    rel_path,
+                    file,
+                    *blob,
+                    head_indexes.get(language).copied(),
+                );
+            }
+        }
+        facts.delta.record_input_differences(
+            &head_indexes,
+            &head_by_language,
+            project,
+            base_blobs,
+            &base_blob_by_path,
+        );
+        for (language, refusals) in &refused_by_language {
+            let base_paths = base_by_language.get(language);
+            for (rel_path, blob) in refusals {
+                let unchanged = base_blob_by_path.get(rel_path).copied() == Some(*blob)
+                    && base_paths.is_some_and(|paths| paths.contains(rel_path));
+                if !unchanged {
+                    facts
+                        .delta
+                        .paths
+                        .entry(*language)
+                        .or_default()
+                        .insert(rel_path.clone());
+                }
+            }
+        }
+        facts.delta.languages_without_index.sort();
+        facts.delta.languages_without_index.dedup();
+        facts
+    }
+
+    /// What moved between this comparison's head and itself: nothing.
+    ///
+    /// A [`ReadKey::Index`] is proved by membership in the set of names that
+    /// moved between two workspaces, which is a statement about a read set
+    /// recorded on the first of them. A read set the head itself recorded
+    /// needs the difference between the head and the head, so its index
+    /// probes hold because nothing moved, while its file keys are still
+    /// checked against the same head path map. Built from this comparison's
+    /// own map so that no second enumeration of the head is paid for.
+    pub fn head_only(&self) -> Self {
+        let mut delta = ChangedDelta::empty();
+        delta.languages_without_index = self.delta.languages_without_index.clone();
+        delta.refused_sources_incomplete = self.delta.refused_sources_incomplete;
+        delta.without_base = self.delta.without_base;
+        Self {
+            delta,
+            head_blobs: self.head_blobs.clone(),
+        }
+    }
+
+    /// A comparison with no base, for a read set verified against the head
+    /// alone, such as a protocol receipt checked against the request that
+    /// serves it. No index difference can be proved, so the set is incomplete
+    /// and every [`ReadKey::Index`] fails closed. It holds no head path map, so
+    /// file keys read the head directly, once per path through the
+    /// [`LookupMemo`]; nothing here enumerates the workspace.
+    pub fn without_base() -> Self {
+        let mut delta = ChangedDelta::empty();
+        delta.without_base = true;
+        Self {
+            delta,
+            head_blobs: HashMap::default(),
+        }
+    }
+
+    /// Whether every changed blob's facts were enumerated and every language
+    /// the two analyzers serve published a fact index.
+    pub fn is_complete(&self) -> bool {
+        self.delta.is_complete()
+    }
+
+    /// The changed blobs whose facts could not be enumerated, and the
+    /// languages that published no fact index at all.
+    pub fn incompleteness(&self) -> (&[(Language, Box<str>)], &[Language]) {
+        (
+            &self.delta.unenumerated,
+            &self.delta.languages_without_index,
+        )
+    }
+
+    /// Whether a changed file has different published entries under this key.
+    pub fn contains(&self, family: IndexFamily, key: &[u8]) -> bool {
+        self.delta.contains(family, key)
+    }
+
+    /// The blob the head resolves `rel_path` to in `language`, or `None` when
+    /// the head does not analyze it.
+    pub fn head_blob(&self, language: Language, rel_path: &str) -> Option<Oid> {
+        self.head_blobs
+            .get(&(language, Box::from(rel_path)))
+            .copied()
+    }
+
+    /// Whether this path's blob differs between the two workspaces.
+    pub fn path_changed(&self, language: Language, rel_path: &str) -> bool {
+        self.delta.path_changed(language, rel_path)
+    }
+
+    /// Every workspace-relative path whose blob differs, with its language.
+    /// Carries files only: the difference holds no line ranges.
+    pub fn changed_paths(&self) -> impl Iterator<Item = (Language, &str)> + '_ {
+        self.delta.changed_paths()
+    }
+
+    /// How many paths changed, over every language.
+    pub fn changed_path_count(&self) -> usize {
+        self.delta.changed_path_count()
+    }
+}
+
 /// One fact index per language an analyzer publishes.
 fn fact_indexes_by_language(
     analyzer: &WorkspaceAnalyzer,
@@ -567,17 +1090,21 @@ fn fact_indexes_by_language(
 
 /// One language's analyzed paths, by their normalized workspace-relative
 /// spelling -- the one name a base export and a head checkout agree on.
-fn blob_map(index: &dyn WorkspaceFactIndex) -> HashMap<Box<str>, (ProjectFile, Oid)> {
-    index
-        .analyzed_blobs()
-        .into_iter()
-        .map(|(file, blob)| {
-            (
-                Box::from(crate::path_utils::rel_path_string(&file).as_str()),
-                (file, blob),
-            )
-        })
-        .collect()
+/// None when the language's listing could not be read; see
+/// [`WorkspaceFactIndex::analyzed_blobs`].
+fn blob_map(index: &dyn WorkspaceFactIndex) -> Option<HashMap<Box<str>, (ProjectFile, Oid)>> {
+    Some(
+        index
+            .analyzed_blobs()?
+            .into_iter()
+            .map(|(file, blob)| {
+                (
+                    Box::from(crate::path_utils::rel_path_string(&file).as_str()),
+                    (file, blob),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The bounded limits a replayed lookup re-runs its funnel under.
@@ -595,6 +1122,8 @@ pub struct LookupReplayLimits {
     pub max_usage_files: usize,
     /// How many usages one usage query may retain.
     pub max_usages: usize,
+    /// Caps the one-file source read proving a NoHead or StaleEpoch answer.
+    pub stored_semantic_ir_source_bytes: usize,
     /// The semantic work one dispatch replay may charge.
     pub semantic: SemanticWork,
 }
@@ -611,6 +1140,7 @@ impl Default for LookupReplayLimits {
             },
             max_usage_files: DEFAULT_MAX_FILES,
             max_usages: DEFAULT_MAX_USAGES,
+            stored_semantic_ir_source_bytes: usize::MAX,
             semantic: SemanticWork::default_limits(),
         }
     }
@@ -667,12 +1197,52 @@ impl SummaryAnswers for NoSummaryAnswers {
 pub struct LookupMemo {
     answers: HashMap<(LookupKind, LookupQuestion), Option<StableDigest>>,
     replay_elapsed: Duration,
+    selection_request:
+        Option<std::sync::Arc<brokk_bifrost_core::analyzer::outer_request::OuterRequest>>,
     raw_blobs: HashMap<(Language, Box<str>), Result<Option<Oid>, ()>>,
 }
 
 impl LookupMemo {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn external_selection_answer(
+        &mut self,
+        authorities: &[&dyn brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority],
+        question: &LookupQuestion,
+        cancellation: &CancellationToken,
+    ) -> Option<StableDigest> {
+        use brokk_bifrost_core::analyzer::external_selection::SelectionRetry;
+        use brokk_bifrost_core::analyzer::outer_request::OuterRequest;
+        let key = (LookupKind::ExternalSelection, question.clone());
+        if let Some(answer) = self.answers.get(&key) {
+            return *answer;
+        }
+        let request = self.selection_request.get_or_insert_with(OuterRequest::new);
+        let answer = if let LookupQuestion::ExternalSelection { question_digest } = question {
+            authorities
+                .iter()
+                .find_map(|authority| {
+                    authority
+                        .questions()
+                        .into_iter()
+                        .find(|q| q.digest == *question_digest)
+                        .map(|q| {
+                            authority.answer(request, &q, &SelectionRetry::default(), cancellation)
+                        })
+                })
+                .and_then(Result::ok)
+                .filter(|a| a.complete && a.certified)
+                .map(|a| StableDigest::from_array(a.answer_digest))
+        } else {
+            None
+        };
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        self.answers.insert(key, answer);
+        answer
     }
 
     /// The head's blob at one recorded path, read at most once per head
@@ -790,6 +1360,72 @@ impl LookupMemo {
 /// file that left the analyzed set, or an artifact whose fingerprint moved are
 /// all cases where the head has no answer to the question that was asked, and
 /// a unit that depended on the old answer must be recomputed.
+/// Replay a certified probe against every delegate named by its question.
+/// Incomplete reads are deliberately not certified: their operational state
+/// cannot be reconstructed from a partial declaration set alone.
+pub fn certified_definition_answer_digest(
+    analyzer: &dyn IAnalyzer,
+    question: &LookupQuestion,
+) -> Option<StableDigest> {
+    let LookupQuestion::CertifiedDefinition {
+        kind,
+        name,
+        delegates,
+        normalization_version,
+    } = question
+    else {
+        return None;
+    };
+    if delegates.is_empty() || !delegates.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    if (*kind == CertifiedDefinitionKind::NormalizedTail)
+        != (*normalization_version == Some(DEFINITION_NORMALIZED_TAIL_VERSION))
+    {
+        return None;
+    }
+    let actual: Vec<_> = analyzer.languages().into_iter().collect();
+    if actual != *delegates {
+        return None;
+    }
+    if !analyzer.has_complete_symbol_lookup_index() {
+        return None;
+    }
+    let answer = match kind {
+        CertifiedDefinitionKind::Exact => analyzer.get_definitions(name),
+        CertifiedDefinitionKind::NormalizedTail => {
+            // The question already holds the normalized key; do not normalize it again.
+            let indexes = analyzer.workspace_fact_indexes();
+            let mut answer = Vec::new();
+            for language in delegates {
+                let index = indexes
+                    .iter()
+                    .find(|index| index.fact_index_language() == *language)?;
+                answer.extend(index.normalized_tail_candidates(name)?);
+            }
+            answer
+        }
+        CertifiedDefinitionKind::Identifier => analyzer
+            .lookup_candidates_by_identifier(name)
+            .into_iter()
+            .collect(),
+    };
+    analyzer.current_query_read_completion().ok()?;
+    Some(certified_definition_complete_answer_digest(&answer))
+}
+
+/// Digest the answer already consumed by a definition funnel. Callers must
+/// publish this only when that funnel established a complete answer.
+pub fn certified_definition_complete_answer_digest(answer: &[CodeUnit]) -> StableDigest {
+    let mut hasher = CanonicalHasher::new(b"certified_definition_answer:v1");
+    hasher.field("completion", b"complete");
+    hasher.field(
+        "answer",
+        crate::analyzer::read_ledger::declaration_set_digest(answer.iter()).as_bytes(),
+    );
+    StableDigest::from_array(hasher.finish())
+}
+
 pub fn replay_lookup(
     head: &WorkspaceAnalyzer,
     kind: LookupKind,
@@ -801,6 +1437,145 @@ pub fn replay_lookup(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     match kind {
+        LookupKind::StoredSemanticIrPublication => {
+            let LookupQuestion::StoredSemanticIrPublication(q) = question else {
+                debug_assert!(
+                    false,
+                    "a stored semantic IR read needs a publication question"
+                );
+                return None;
+            };
+            let file = analyzed_file(analyzer, &q.rel_path)?;
+            let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+            let StoredSemanticIrRead::Observed(observation) = head
+                .stored_semantic_ir_publication_read(
+                    &file,
+                    q.subject,
+                    Some(limits.stored_semantic_ir_source_bytes),
+                    &cancellation,
+                )
+                .ok()?
+            else {
+                return None;
+            };
+            let selection = &observation.selection;
+            if StoredSemanticIrPublicationQuestion::new(
+                selection.rel_path.clone(),
+                selection.storage_language.clone(),
+                q.subject,
+                selection.variant,
+            ) != *q
+            {
+                return None;
+            }
+            let answer = classify(&observation, q.subject);
+            match &answer {
+                StoredSemanticIrPublicationAnswer::Present { .. } => {}
+                StoredSemanticIrPublicationAnswer::NoHead
+                | StoredSemanticIrPublicationAnswer::StaleEpoch => {
+                    if observation.source_content != Some(q.subject) {
+                        return None;
+                    }
+                }
+                StoredSemanticIrPublicationAnswer::ContentMismatch => return None,
+            }
+            Some(answer.canonical_digest())
+        }
+        // #9737 M3: derivation replay must verify through the selected engine.
+        LookupKind::Derivation(_) => None,
+        // #9559 M3a: the head has no external-selection verifier yet.
+        LookupKind::ExternalSelection => None,
+        LookupKind::RustBoundTraitImplInventory
+        | LookupKind::RustTraitsImplementedByInventory
+        | LookupKind::RustAliasBlobInventory
+        | LookupKind::RustMacroExpansionInventory
+        | LookupKind::RustUnresolvedTraitImplInventory
+        | LookupKind::RustModuleImportCandidateInventory
+        | LookupKind::RustIdentifierOccurrenceInventory
+        | LookupKind::RustCopyAbsence => crate::analyzer::languages::language_support_for_hook(
+            Language::Rust,
+            "replay_owned_lookup",
+        )?
+        .replay_owned_lookup(head, kind, question, limits.semantic.nested_entries),
+        LookupKind::StructuralNameInventory
+        | LookupKind::StructuralRoleNameInventory
+        | LookupKind::StructuralRecoveredInventory => {
+            let workspace_before = analyzer.workspace_content_identity()?;
+            let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let (language, authority, name, role) = match (kind, question) {
+                (
+                    LookupKind::StructuralNameInventory,
+                    LookupQuestion::StructuralName {
+                        language,
+                        name,
+                        authority,
+                    },
+                ) => (*language, *authority, Some(name.as_ref()), None),
+                (
+                    LookupKind::StructuralRoleNameInventory,
+                    LookupQuestion::StructuralRoleName {
+                        language,
+                        role,
+                        name,
+                        keyword,
+                        authority,
+                    },
+                ) => (
+                    *language,
+                    *authority,
+                    Some(name.as_ref()),
+                    Some((*role, *keyword)),
+                ),
+                (
+                    LookupKind::StructuralRecoveredInventory,
+                    LookupQuestion::StructuralRecovered {
+                        language,
+                        authority,
+                    },
+                ) => (*language, *authority, None, None),
+                _ => return None,
+            };
+            let provider = analyzer
+                .structural_fact_providers()
+                .into_iter()
+                .find(|provider| provider.structural_language() == language)?;
+            if !provider.structural_inventory_complete() {
+                return None;
+            }
+            if provider.structural_selection_authority()? != authority {
+                return None;
+            }
+            let before = provider.structural_content_identity()?;
+            let cache = provider.snapshot_structural_index_cache()?;
+            let StructuralIndexAcquisition::Ready { index, .. } =
+                cache.inner().acquire(provider, &cancellation)
+            else {
+                return None;
+            };
+            if index.content_identity() != before
+                || provider.structural_content_identity()? != before
+                || provider.structural_selection_authority()? != authority
+            {
+                return None;
+            }
+            let digest = if let Some((role, keyword)) = role {
+                index.role_name_inventory(role, name?, keyword).0
+            } else if let Some(name) = name {
+                index.exact_name_inventory(name).0
+            } else {
+                index.recovered_inventory().0
+            };
+            if cancellation.is_cancelled()
+                || provider.structural_content_identity()? != before
+                || analyzer.workspace_content_identity()? != workspace_before
+            {
+                return None;
+            }
+            Some(digest)
+        }
         LookupKind::ResolvedName => {
             use crate::analyzer::BoundedDefinitionLookup;
             let LookupQuestion::Name { language, name } = question else {
@@ -814,6 +1589,9 @@ pub fn replay_lookup(
             lookup
                 .can_publish()
                 .then(|| crate::analyzer::read_ledger::declaration_set_digest(&definitions))
+        }
+        LookupKind::CertifiedDefinitionAnswer => {
+            certified_definition_answer_digest(analyzer, question)
         }
         LookupKind::Definitions
         | LookupKind::IdentifierCandidates
@@ -866,6 +1644,20 @@ pub fn replay_lookup(
                 .declaration_facts_digest(&declaration),
             None => absent_declaration_facts_digest(),
         }),
+        LookupKind::DeclarationCandidates => {
+            let LookupQuestion::Declaration { rel_path, .. } = question else {
+                unreachable!("declaration candidates require a declaration question")
+            };
+            let file = ProjectFile::new(analyzer.project().root(), Path::new(rel_path.as_ref()));
+            let candidates = analyzer.declaration_candidates_for_question(&file, question)?;
+            analyzer.current_query_read_completion().ok()?;
+            Some(
+                crate::analyzer::read_ledger::declaration_candidate_set_digest(
+                    question,
+                    &candidates,
+                ),
+            )
+        }
         LookupKind::SignatureMetadata => Some(match replayed_declaration(analyzer, question) {
             Some(declaration) => analyzer
                 .workspace_fact_indexes()
@@ -1075,6 +1867,16 @@ fn answer_workspace_fact(
         WorkspaceFactFamily::FieldSlots => summaries.workspace_fact(family, language, subject),
         WorkspaceFactFamily::JvmSelectedRootPresence => {
             if language != Language::None || !matches!(subject, FactSubject::Named { .. }) {
+                return None;
+            }
+            crate::analyzer::languages::language_support(Language::Java)?
+                .workspace_fact_answer(analyzer, family, language, subject)
+        }
+        // The unresolved-coordinate set of the JVM external index. It names no
+        // workspace file: a jar that appears or disappears under a repository
+        // root changes it with no workspace edit.
+        WorkspaceFactFamily::JvmExternalGaps => {
+            if language != Language::None || !matches!(subject, FactSubject::Whole) {
                 return None;
             }
             crate::analyzer::languages::language_support(Language::Java)?
@@ -1533,183 +2335,302 @@ pub fn verify_read_set_for_artifact(
     memo: &mut LookupMemo,
 ) -> ReadVerdict {
     for key in keys {
-        let reason = match key {
-            ReadKey::File {
-                language,
-                rel_path,
-                blob,
-                parse_variant,
-            } => match memo.head_blob(head, changed, *language, rel_path) {
-                Ok(after) => {
-                    let file = ProjectFile::new(
-                        head.analyzer().project().root().to_path_buf(),
-                        Path::new(rel_path.as_ref()),
-                    );
-                    if after == Some(*blob)
-                        && brokk_bifrost_core::analyzer::project_reads::without_project_reads(
-                            || head.analyzer().selected_parse_variant(&file),
-                        ) != Some(*parse_variant)
-                    {
-                        return ReadVerdict::Changed(Box::new(ChangedRead {
-                            key: key.clone(),
-                            reason: InvalidationReason::DependencyChanged {
-                                artifact,
-                                dependency: key.canonical_digest(),
-                            },
-                        }));
-                    }
-                    (after != Some(*blob)).then(|| InvalidationReason::InputContentChanged {
-                        artifact,
-                        before: blob_identity(Some(*blob)),
-                        after: blob_identity(after),
-                    })
-                }
-                Err(_) => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
-            },
-            // Absence must include non-source inputs, whose paths never enter
-            // the analyzed map (for example package.json and Gemfile).
-            ReadKey::PathAbsent { language, rel_path } => {
-                match memo.head_blob(head, changed, *language, rel_path) {
-                    Ok(after) => after.map(|blob| InvalidationReason::InputContentChanged {
-                        artifact,
-                        before: blob_identity(None),
-                        after: blob_identity(Some(blob)),
-                    }),
-                    Err(_) => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
-                }
+        match verify_read_key(
+            artifact, head, changed, inputs, key, limits, summaries, memo,
+        ) {
+            KeyVerdict::Unchanged => {}
+            KeyVerdict::Changed(reason) | KeyVerdict::MissingEvidence(reason) => {
+                return ReadVerdict::Changed(Box::new(ChangedRead {
+                    reason,
+                    key: key.clone(),
+                }));
             }
-            ReadKey::Index { family, key } => {
-                if !changed.is_complete() {
-                    // A changed-key set that could not be completed is smaller
-                    // than the truth, and a smaller set would let a changed
-                    // name pass. The absence of evidence is not evidence.
-                    Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact })
-                } else {
-                    changed.contains(*family, key).then_some(
-                        InvalidationReason::DependencyChanged {
-                            artifact,
-                            dependency: ReadKey::index(*family, key).canonical_digest(),
-                        },
-                    )
-                }
-            }
-            // A procedure-summary read is the one lookup whose absence is not
-            // evidence of a change. A head that has not solved anything
-            // retains no summary at all, so replaying every recorded summary
-            // read against a cold repository would answer absence for all of
-            // them and recompute every unit that ever crossed the summary
-            // funnel -- which is every typestate root. What carries the
-            // dependency instead is the closure the recorder names beside the
-            // summary: one `Artifact` key per member, verified by fingerprint
-            // against what the head would derive from those files now. So an
-            // absent or unanswerable summary lookup holds, and only a head
-            // that does retain a summary under the recorded identity, with
-            // different content, reports a change.
-            ReadKey::Lookup {
-                kind: LookupKind::ProcedureSummary,
-                question,
-                digest,
-            } => match memo.answer(
-                head,
-                LookupKind::ProcedureSummary,
-                question,
-                limits,
-                summaries,
-            ) {
-                None => None,
-                Some(replayed)
-                    if replayed == crate::analyzer::read_ledger::absent_summary_digest() =>
-                {
-                    None
-                }
-                Some(replayed) if replayed != *digest => {
-                    Some(InvalidationReason::DependencyFingerprintChanged {
-                        artifact,
-                        before: *digest,
-                        after: replayed,
-                    })
-                }
-                Some(_) => None,
-            },
-            ReadKey::Lookup {
-                kind,
-                question,
-                digest,
-            } => match memo.answer(head, *kind, question, limits, summaries) {
-                // The head has no answer to the question that was asked, so
-                // nothing about it can be reused.
-                None => Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact }),
-                Some(replayed) if replayed != *digest => {
-                    Some(InvalidationReason::DependencyFingerprintChanged {
-                        artifact,
-                        before: *digest,
-                        after: replayed,
-                    })
-                }
-                Some(_) => None,
-            },
-            ReadKey::Artifact { id, rel_path } => {
-                verify_artifact(head, artifact, *id, rel_path.as_deref())
-            }
-            ReadKey::Scope {
-                languages,
-                identity,
-            } => match head
-                .analyzer()
-                .workspace_content_identities()
-                .and_then(|identities| identities.scope(|language| languages.contains(&language)))
-            {
-                None => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
-                Some(head_identity) if head_identity != *identity => {
-                    Some(InvalidationReason::DependencyChanged {
-                        artifact,
-                        dependency: key.canonical_digest(),
-                    })
-                }
-                Some(_) => None,
-            },
-            ReadKey::Models(models) => (*models != inputs.models).then_some(
-                InvalidationReason::DependencyFingerprintChanged {
-                    artifact,
-                    before: *models,
-                    after: inputs.models,
-                },
-            ),
-            ReadKey::Policy {
-                semantic_hash,
-                source,
-            } => (*semantic_hash != inputs.policy_semantic_hash || *source != inputs.policy_source)
-                .then(|| InvalidationReason::DependencyFingerprintChanged {
-                    artifact,
-                    before: key.canonical_digest(),
-                    after: ReadKey::Policy {
-                        semantic_hash: inputs.policy_semantic_hash,
-                        source: inputs.policy_source,
-                    }
-                    .canonical_digest(),
-                }),
-            ReadKey::Configuration(configuration) => (*configuration != inputs.configuration)
-                .then_some(InvalidationReason::DependencyFingerprintChanged {
-                    artifact,
-                    before: *configuration,
-                    after: inputs.configuration,
-                }),
-            ReadKey::Epoch(epoch) => {
-                (*epoch != inputs.epoch).then_some(InvalidationReason::EpochChanged {
-                    artifact,
-                    before: *epoch,
-                    after: inputs.epoch,
-                })
-            }
-        };
-        if let Some(reason) = reason {
-            return ReadVerdict::Changed(Box::new(ChangedRead {
-                reason,
-                key: key.clone(),
-            }));
         }
     }
     ReadVerdict::Unchanged
+}
+
+/// The result of checking one recorded input against the selected head.
+#[derive(Debug)]
+pub enum KeyVerdict {
+    Unchanged,
+    Changed(InvalidationReason),
+    MissingEvidence(InvalidationReason),
+}
+
+/// Verify one recorded input. The engine's base-input check will call this
+/// routine against its selected snapshot when that binding is available.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_read_key(
+    artifact: DerivedArtifactId,
+    head: &WorkspaceAnalyzer,
+    changed: &ChangedFacts,
+    inputs: &HeadInputs,
+    key: &ReadKey,
+    limits: LookupReplayLimits,
+    summaries: &dyn SummaryAnswers,
+    memo: &mut LookupMemo,
+) -> KeyVerdict {
+    let reason = match key {
+        ReadKey::File {
+            language,
+            rel_path,
+            blob,
+            parse_variant,
+        } => match memo.head_blob(head, changed, *language, rel_path) {
+            Ok(after) => {
+                let file = ProjectFile::new(
+                    head.analyzer().project().root().to_path_buf(),
+                    Path::new(rel_path.as_ref()),
+                );
+                if after == Some(*blob)
+                    && brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
+                        head.analyzer().selected_parse_variant(&file)
+                    }) != Some(*parse_variant)
+                {
+                    return KeyVerdict::Changed(InvalidationReason::DependencyChanged {
+                        artifact,
+                        dependency: key.canonical_digest(),
+                    });
+                }
+                (after != Some(*blob)).then(|| InvalidationReason::InputContentChanged {
+                    artifact,
+                    before: blob_identity(Some(*blob)),
+                    after: blob_identity(after),
+                })
+            }
+            Err(_) => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
+        },
+        // Absence must include non-source inputs, whose paths never enter
+        // the analyzed map (for example package.json and Gemfile).
+        ReadKey::PathAbsent { language, rel_path } => {
+            match memo.head_blob(head, changed, *language, rel_path) {
+                Ok(after) => after.map(|blob| InvalidationReason::InputContentChanged {
+                    artifact,
+                    before: blob_identity(None),
+                    after: blob_identity(Some(blob)),
+                }),
+                Err(_) => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
+            }
+        }
+        ReadKey::Index { family, key } => {
+            if !changed.is_complete() {
+                // A changed-key set that could not be completed is smaller
+                // than the truth, and a smaller set would let a changed
+                // name pass. The absence of evidence is not evidence.
+                Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact })
+            } else {
+                changed
+                    .contains(*family, key)
+                    .then_some(InvalidationReason::DependencyChanged {
+                        artifact,
+                        dependency: ReadKey::index(*family, key).canonical_digest(),
+                    })
+            }
+        }
+        // A procedure-summary read is the one lookup whose absence is not
+        // evidence of a change. A head that has not solved anything
+        // retains no summary at all, so replaying every recorded summary
+        // read against a cold repository would answer absence for all of
+        // them and recompute every unit that ever crossed the summary
+        // funnel -- which is every typestate root. What carries the
+        // dependency instead is the closure the recorder names beside the
+        // summary: one `Artifact` key per member, verified by fingerprint
+        // against what the head would derive from those files now. So an
+        // absent or unanswerable summary lookup holds, and only a head
+        // that does retain a summary under the recorded identity, with
+        // different content, reports a change.
+        ReadKey::Lookup {
+            kind: LookupKind::ExternalSelection,
+            question,
+            digest,
+        } => {
+            let answer = memo.external_selection_answer(
+                &head.analyzer().external_selection_authorities(),
+                question,
+                &head
+                    .analyzer()
+                    .active_query_cancellation()
+                    .unwrap_or_default(),
+            );
+            (answer != Some(*digest)).then(|| InvalidationReason::DependencyChanged {
+                artifact,
+                dependency: key.canonical_digest(),
+            })
+        }
+        ReadKey::Lookup {
+            kind: LookupKind::ProcedureSummary,
+            question,
+            digest,
+        } => match memo.answer(
+            head,
+            LookupKind::ProcedureSummary,
+            question,
+            limits,
+            summaries,
+        ) {
+            None => None,
+            Some(replayed) if replayed == crate::analyzer::read_ledger::absent_summary_digest() => {
+                None
+            }
+            Some(replayed) if replayed != *digest => {
+                Some(InvalidationReason::DependencyFingerprintChanged {
+                    artifact,
+                    before: *digest,
+                    after: replayed,
+                })
+            }
+            Some(_) => None,
+        },
+        ReadKey::Lookup {
+            kind,
+            question,
+            digest,
+        } => match kind {
+            LookupKind::Derivation(_) => {
+                let answer = if let Some(Some(answer)) =
+                    memo.answers.get(&(*kind, question.clone()))
+                {
+                    Some(*answer)
+                } else {
+                    let started = Instant::now();
+                    let answer = match (kind, question) {
+                        (LookupKind::Derivation(kind), LookupQuestion::Derivation(question)) => {
+                            match head.replay_derivation(*kind, question) {
+                                crate::analyzer::derivation_host::ReplayResult::Identity(
+                                    identity,
+                                ) => Some(identity.0),
+                                crate::analyzer::derivation_host::ReplayResult::Missing(_) => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    memo.replay_elapsed += started.elapsed();
+                    if let Some(identity) = answer {
+                        memo.answers
+                            .insert((*kind, question.clone()), Some(identity));
+                    }
+                    answer
+                };
+                match answer {
+                    Some(after) if after != *digest => {
+                        Some(InvalidationReason::DependencyFingerprintChanged {
+                            artifact,
+                            before: *digest,
+                            after,
+                        })
+                    }
+                    Some(_) => None,
+                    None => Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact }),
+                }
+            }
+            LookupKind::StoredSemanticIrPublication
+            | LookupKind::RustCopyAbsence
+            | LookupKind::RustBoundTraitImplInventory
+            | LookupKind::RustTraitsImplementedByInventory
+            | LookupKind::RustAliasBlobInventory
+            | LookupKind::RustMacroExpansionInventory
+            | LookupKind::RustUnresolvedTraitImplInventory
+            | LookupKind::RustModuleImportCandidateInventory
+            | LookupKind::RustIdentifierOccurrenceInventory
+            | LookupKind::StructuralNameInventory
+            | LookupKind::StructuralRoleNameInventory
+            | LookupKind::StructuralRecoveredInventory
+            | LookupKind::ResolvedName
+            | LookupKind::CertifiedDefinitionAnswer
+            | LookupKind::Definitions
+            | LookupKind::IdentifierCandidates
+            | LookupKind::ShortNameCandidates
+            | LookupKind::DeclarationFacts
+            | LookupKind::DeclarationCandidates
+            | LookupKind::SignatureMetadata
+            | LookupKind::Callers
+            | LookupKind::Callees
+            | LookupKind::Usages
+            | LookupKind::ReferenceCandidates
+            | LookupKind::Descendants
+            | LookupKind::Importers
+            | LookupKind::Dispatch
+            | LookupKind::ProcedureDispatch
+            | LookupKind::WorkspaceFact => {
+                match memo.answer(head, *kind, question, limits, summaries) {
+                    None => Some(InvalidationReason::ReverseDependencyEvidenceMissing { artifact }),
+                    Some(replayed) if replayed != *digest => {
+                        Some(InvalidationReason::DependencyFingerprintChanged {
+                            artifact,
+                            before: *digest,
+                            after: replayed,
+                        })
+                    }
+                    Some(_) => None,
+                }
+            }
+            LookupKind::ProcedureSummary | LookupKind::ExternalSelection => {
+                unreachable!("handled by preceding arm")
+            }
+        },
+        ReadKey::Artifact { id, rel_path } => {
+            verify_artifact(head, artifact, *id, rel_path.as_deref())
+        }
+        ReadKey::Scope {
+            languages,
+            identity,
+        } => match head
+            .analyzer()
+            .workspace_content_identities()
+            .and_then(|identities| identities.scope(|language| languages.contains(&language)))
+        {
+            None => Some(InvalidationReason::ContentIdentityEvidenceMissing { artifact }),
+            Some(head_identity) if head_identity != *identity => {
+                Some(InvalidationReason::DependencyChanged {
+                    artifact,
+                    dependency: key.canonical_digest(),
+                })
+            }
+            Some(_) => None,
+        },
+        ReadKey::Models(models) => {
+            (*models != inputs.models).then_some(InvalidationReason::DependencyFingerprintChanged {
+                artifact,
+                before: *models,
+                after: inputs.models,
+            })
+        }
+        ReadKey::Policy {
+            semantic_hash,
+            source,
+        } => (*semantic_hash != inputs.policy_semantic_hash || *source != inputs.policy_source)
+            .then(|| InvalidationReason::DependencyFingerprintChanged {
+                artifact,
+                before: key.canonical_digest(),
+                after: ReadKey::Policy {
+                    semantic_hash: inputs.policy_semantic_hash,
+                    source: inputs.policy_source,
+                }
+                .canonical_digest(),
+            }),
+        ReadKey::Configuration(configuration) => (*configuration != inputs.configuration)
+            .then_some(InvalidationReason::DependencyFingerprintChanged {
+                artifact,
+                before: *configuration,
+                after: inputs.configuration,
+            }),
+        ReadKey::Epoch(epoch) => {
+            (*epoch != inputs.epoch).then_some(InvalidationReason::EpochChanged {
+                artifact,
+                before: *epoch,
+                after: inputs.epoch,
+            })
+        }
+    };
+    match reason {
+        None => KeyVerdict::Unchanged,
+        Some(reason @ InvalidationReason::ContentIdentityEvidenceMissing { .. })
+        | Some(reason @ InvalidationReason::ReverseDependencyEvidenceMissing { .. }) => {
+            KeyVerdict::MissingEvidence(reason)
+        }
+        Some(reason) => KeyVerdict::Changed(reason),
+    }
 }
 
 /// Whether the head still derives the artifact a unit consumed.
@@ -1801,13 +2722,18 @@ mod tests {
 
     #[derive(Clone)]
     struct FactIndex {
+        language: Language,
+        normalized: Vec<CodeUnit>,
         file: ProjectFile,
         blob: Oid,
         rows: Vec<(Oid, IndexKeys)>,
     }
     impl WorkspaceFactIndex for FactIndex {
         fn fact_index_language(&self) -> Language {
-            Language::Python
+            self.language
+        }
+        fn identity_inputs_digest(&self) -> Option<StableDigest> {
+            Some(StableDigest::sha256(b"fake identity inputs"))
         }
         fn declaration_facts_digest(&self, _: &CodeUnit) -> StableDigest {
             unimplemented!()
@@ -1818,14 +2744,35 @@ mod tests {
         fn definition_answer_digest(&self, _: &str) -> StableDigest {
             unimplemented!()
         }
+        fn normalized_tail_candidates(&self, key: &str) -> Option<Vec<CodeUnit>> {
+            Some(
+                self.normalized
+                    .iter()
+                    .filter(|unit| unit.fq_name() == key)
+                    .cloned()
+                    .collect(),
+            )
+        }
         fn identifier_candidate_answer_digest(&self, _: &str) -> StableDigest {
             unimplemented!()
         }
         fn short_name_candidate_answer_digest(&self, _: &str) -> StableDigest {
             unimplemented!()
         }
-        fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
-            vec![(self.file.clone(), self.blob)]
+        fn analyzed_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+            Some(vec![(self.file.clone(), self.blob)])
+        }
+        fn is_selected_configuration_input(&self, path: &Path) -> bool {
+            path == Path::new("pyproject.toml")
+        }
+        fn selected_configuration_input_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+            Some(
+                if self.is_selected_configuration_input(self.file.rel_path()) {
+                    vec![(self.file.clone(), self.blob)]
+                } else {
+                    Vec::new()
+                },
+            )
         }
         fn refused_source_blobs(
             &self,
@@ -1860,6 +2807,8 @@ mod tests {
         let file = ProjectFile::new(root.to_path_buf(), "app.py");
         file.write(source).unwrap();
         FactIndex {
+            language: Language::Python,
+            normalized: Vec::new(),
             file,
             blob: blob(source),
             // An independent, handwritten fact-store oracle. No parsing or
@@ -1886,6 +2835,8 @@ mod tests {
             language: Language::Python,
             index: index
                 .map(|index| std::sync::Arc::new(index) as std::sync::Arc<dyn WorkspaceFactIndex>),
+            definitions: Vec::new(),
+            complete_symbol_index: true,
         };
         WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
             std::collections::BTreeMap::from([(Language::Python, AnalyzerDelegate::new(analyzer))]),
@@ -1898,6 +2849,64 @@ mod tests {
         (root, head)
     }
 
+    #[test]
+    fn claimed_configuration_differences_keep_the_enumerated_keys_complete() {
+        let (root, head) = workspace_fixture("def before():\n    pass\n");
+        let mut index = fixture_index(root.path(), "def before():\n    pass\n");
+        index.file = ProjectFile::new(root.path(), "pyproject.toml");
+        let indexes = [(Language::Python, &index as &dyn WorkspaceFactIndex)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let path = Box::<str>::from("pyproject.toml");
+        let base_blob = Oid::hash_object(git2::ObjectType::Blob, b"old configuration").unwrap();
+        let base = vec![(path.clone(), base_blob)];
+        let base_map = [(path.clone(), base_blob)]
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        // Only the input's own language enumerates its keys: an analysis of
+        // the same path by another language leaves this input unenumerated.
+        for (owner, claimed) in [
+            (None, false),
+            (Some(Language::TypeScript), false),
+            (Some(Language::Python), true),
+        ] {
+            let analyzed = owner
+                .map(|owner| {
+                    (
+                        owner,
+                        [(path.clone(), (index.file.clone(), index.blob))]
+                            .into_iter()
+                            .collect::<HashMap<_, _>>(),
+                    )
+                })
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+            let mut facts = ChangedFacts::between(&head, &head);
+            facts.delta.record_input_differences(
+                &indexes,
+                &analyzed,
+                head.analyzer().project(),
+                &base,
+                &base_map,
+            );
+            assert_eq!(facts.is_complete(), claimed);
+            assert!(
+                facts
+                    .changed_paths()
+                    .any(|(_, path)| path == "pyproject.toml")
+            );
+            // Repeated input observations are a set, including unenumerated paths.
+            facts.delta.record_input_differences(
+                &indexes,
+                &analyzed,
+                head.analyzer().project(),
+                &base,
+                &base_map,
+            );
+            assert_eq!(facts.delta.unenumerated.len(), usize::from(!claimed));
+        }
+    }
+
     fn inputs() -> HeadInputs {
         let digest = StableDigest::sha256(b"test non-source inputs");
         HeadInputs {
@@ -1906,6 +2915,306 @@ mod tests {
             policy_source: digest,
             configuration: digest,
             epoch: digest,
+        }
+    }
+
+    #[test]
+    fn certified_definition_questions_refuse_changed_normalization_and_delegate_sets() {
+        let (_root, head) = workspace_fixture("def before():\n    pass\n");
+        let scope = AnalyzerQueryScope::new(head.analyzer());
+        let _token = scope.token();
+        for kind in [
+            CertifiedDefinitionKind::Exact,
+            CertifiedDefinitionKind::NormalizedTail,
+            CertifiedDefinitionKind::Identifier,
+        ] {
+            let question = LookupQuestion::CertifiedDefinition {
+                kind,
+                name: "missing".into(),
+                delegates: vec![Language::Python],
+                normalization_version: (kind == CertifiedDefinitionKind::NormalizedTail)
+                    .then_some(DEFINITION_NORMALIZED_TAIL_VERSION),
+            };
+            assert!(
+                certified_definition_answer_digest(head.analyzer(), &question).is_some(),
+                "{kind:?}"
+            );
+            let LookupQuestion::CertifiedDefinition { delegates, .. } = &question else {
+                unreachable!()
+            };
+            assert_eq!(delegates.as_slice(), &[Language::Python]);
+            let mut changed_delegates = question.clone();
+            if let LookupQuestion::CertifiedDefinition { delegates, .. } = &mut changed_delegates {
+                delegates.push(Language::Rust);
+            }
+            assert!(
+                certified_definition_answer_digest(head.analyzer(), &changed_delegates).is_none()
+            );
+            if kind == CertifiedDefinitionKind::NormalizedTail {
+                let mut stale = question;
+                if let LookupQuestion::CertifiedDefinition {
+                    normalization_version,
+                    ..
+                } = &mut stale
+                {
+                    *normalization_version = Some(DEFINITION_NORMALIZED_TAIL_VERSION + 1);
+                }
+                assert!(certified_definition_answer_digest(head.analyzer(), &stale).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn certified_exact_and_identifier_answers_detect_new_definition_in_another_file() {
+        use crate::analyzer::multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+        let root = tempfile::tempdir().unwrap();
+        let project = std::sync::Arc::new(crate::TestProject::new(root.path(), Language::Python));
+        let build = |definitions: Vec<CodeUnit>| {
+            let delegate = crate::analyzer::packs_document::tests::CatalogWorkspace {
+                project: project.clone(),
+                language: Language::Python,
+                index: Some(std::sync::Arc::new(fixture_index(root.path(), ""))),
+                definitions,
+                complete_symbol_index: true,
+            };
+            WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
+                std::collections::BTreeMap::from([(
+                    Language::Python,
+                    AnalyzerDelegate::new(delegate),
+                )]),
+            )))
+        };
+        let base = build(Vec::new());
+        let added = CodeUnit::new(
+            ProjectFile::new(root.path(), "other.py"),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "target",
+        );
+        let head = build(vec![added]);
+        let normalized_added = CodeUnit::new(
+            ProjectFile::new(root.path(), "normalized.py"),
+            crate::analyzer::CodeUnitType::Function,
+            "",
+            "target",
+        );
+        let normalized_head = workspace(
+            root.path(),
+            Some(FactIndex {
+                normalized: vec![normalized_added],
+                ..fixture_index(root.path(), "")
+            }),
+        );
+        let normalized_question = LookupQuestion::CertifiedDefinition {
+            kind: CertifiedDefinitionKind::NormalizedTail,
+            name: "target".into(),
+            delegates: vec![Language::Python],
+            normalization_version: Some(DEFINITION_NORMALIZED_TAIL_VERSION),
+        };
+        assert_ne!(
+            certified_definition_answer_digest(base.analyzer(), &normalized_question),
+            certified_definition_answer_digest(normalized_head.analyzer(), &normalized_question),
+            "a normalized-tail negative answer survived an added definition"
+        );
+        let normalized_key = ReadKey::lookup(
+            LookupKind::CertifiedDefinitionAnswer,
+            normalized_question,
+            certified_definition_answer_digest(
+                base.analyzer(),
+                &LookupQuestion::certified_definition(
+                    CertifiedDefinitionKind::NormalizedTail,
+                    "target",
+                    [Language::Python],
+                ),
+            )
+            .unwrap(),
+        );
+        assert!(
+            verify_read_set(
+                &base,
+                &ChangedFacts::between(&base, &base),
+                &inputs(),
+                std::slice::from_ref(&normalized_key),
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            )
+            .is_unchanged()
+        );
+        assert!(
+            !verify_read_set(
+                &normalized_head,
+                &ChangedFacts::between(&base, &normalized_head),
+                &inputs(),
+                &[normalized_key],
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            )
+            .is_unchanged()
+        );
+        let foreign = crate::analyzer::packs_document::tests::CatalogWorkspace {
+            project: project.clone(),
+            language: Language::Rust,
+            index: Some(std::sync::Arc::new(FactIndex {
+                language: Language::Rust,
+                ..fixture_index(root.path(), "")
+            })),
+            complete_symbol_index: true,
+            definitions: vec![CodeUnit::new(
+                ProjectFile::new(root.path(), "foreign.rs"),
+                crate::analyzer::CodeUnitType::Function,
+                "",
+                "target",
+            )],
+        };
+        let mut foreign_empty = foreign.clone();
+        foreign_empty.definitions.clear();
+        let cross_base = WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
+            std::collections::BTreeMap::from([
+                (
+                    Language::Python,
+                    AnalyzerDelegate::new(
+                        crate::analyzer::packs_document::tests::CatalogWorkspace {
+                            project: project.clone(),
+                            language: Language::Python,
+                            index: Some(std::sync::Arc::new(fixture_index(root.path(), ""))),
+                            definitions: Vec::new(),
+                            complete_symbol_index: true,
+                        },
+                    ),
+                ),
+                (Language::Rust, AnalyzerDelegate::new(foreign_empty)),
+            ]),
+        )));
+        let cross_language = WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
+            std::collections::BTreeMap::from([
+                (
+                    Language::Python,
+                    AnalyzerDelegate::new(
+                        crate::analyzer::packs_document::tests::CatalogWorkspace {
+                            project: project.clone(),
+                            language: Language::Python,
+                            index: Some(std::sync::Arc::new(fixture_index(root.path(), ""))),
+                            definitions: Vec::new(),
+                            complete_symbol_index: true,
+                        },
+                    ),
+                ),
+                (Language::Rust, AnalyzerDelegate::new(foreign)),
+            ]),
+        )));
+        let cross_normalized = WorkspaceAnalyzer::Multi(Box::new(MultiAnalyzer::new(
+            std::collections::BTreeMap::from([
+                (
+                    Language::Python,
+                    AnalyzerDelegate::new(
+                        crate::analyzer::packs_document::tests::CatalogWorkspace {
+                            project: project.clone(),
+                            language: Language::Python,
+                            index: Some(std::sync::Arc::new(fixture_index(root.path(), ""))),
+                            definitions: Vec::new(),
+                            complete_symbol_index: true,
+                        },
+                    ),
+                ),
+                (
+                    Language::Rust,
+                    AnalyzerDelegate::new(
+                        crate::analyzer::packs_document::tests::CatalogWorkspace {
+                            project: project.clone(),
+                            language: Language::Rust,
+                            index: Some(std::sync::Arc::new(FactIndex {
+                                language: Language::Rust,
+                                normalized: vec![CodeUnit::new(
+                                    ProjectFile::new(root.path(), "foreign_normalized.rs"),
+                                    crate::analyzer::CodeUnitType::Function,
+                                    "",
+                                    "target",
+                                )],
+                                ..fixture_index(root.path(), "")
+                            })),
+                            definitions: Vec::new(),
+                            complete_symbol_index: true,
+                        },
+                    ),
+                ),
+            ]),
+        )));
+        let cross_normalized_question = LookupQuestion::certified_definition(
+            CertifiedDefinitionKind::NormalizedTail,
+            "target",
+            [Language::Python, Language::Rust],
+        );
+        assert_ne!(
+            certified_definition_answer_digest(cross_base.analyzer(), &cross_normalized_question),
+            certified_definition_answer_digest(
+                cross_normalized.analyzer(),
+                &cross_normalized_question
+            ),
+            "normalized-tail missed an added definition in an existing foreign delegate"
+        );
+        for kind in [
+            CertifiedDefinitionKind::Exact,
+            CertifiedDefinitionKind::Identifier,
+        ] {
+            let question = LookupQuestion::CertifiedDefinition {
+                kind,
+                name: "target".into(),
+                delegates: vec![Language::Python],
+                normalization_version: None,
+            };
+            let digest = certified_definition_answer_digest(base.analyzer(), &question).unwrap();
+            let changed = certified_definition_answer_digest(head.analyzer(), &question).unwrap();
+            assert_ne!(
+                digest, changed,
+                "{kind:?} negative answer survived an added definition"
+            );
+            let key = ReadKey::lookup(
+                LookupKind::CertifiedDefinitionAnswer,
+                question.clone(),
+                digest,
+            );
+            assert!(
+                verify_read_set(
+                    &base,
+                    &ChangedFacts::between(&base, &base),
+                    &inputs(),
+                    std::slice::from_ref(&key),
+                    LookupReplayLimits::default(),
+                    &NoSummaryAnswers,
+                    &mut LookupMemo::new(),
+                )
+                .is_unchanged(),
+                "{kind:?} unchanged certified read did not verify"
+            );
+            let verdict = verify_read_set(
+                &head,
+                &ChangedFacts::between(&base, &head),
+                &inputs(),
+                &[key],
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            );
+            assert!(
+                !verdict.is_unchanged(),
+                "{kind:?} certified read was reused after an added definition"
+            );
+            assert!(
+                certified_definition_answer_digest(cross_language.analyzer(), &question).is_none(),
+                "{kind:?} must refuse a newly added delegate"
+            );
+            let cross_question = LookupQuestion::certified_definition(
+                kind,
+                "target",
+                [Language::Python, Language::Rust],
+            );
+            assert_ne!(
+                certified_definition_answer_digest(cross_base.analyzer(), &cross_question),
+                certified_definition_answer_digest(cross_language.analyzer(), &cross_question),
+                "{kind:?} missed an added definition in an existing foreign delegate"
+            );
         }
     }
 
@@ -1959,9 +3268,11 @@ mod tests {
             ),
         ] {
             let mut changed = ChangedFacts::between(&head, &head);
-            changed.record_index_difference(Language::Python, "app.py", base, current);
+            changed
+                .delta
+                .record_index_difference(Language::Python, "app.py", base, current);
             assert_eq!(
-                changed.keys,
+                changed.delta.keys,
                 expected
                     .into_iter()
                     .map(|name| (IndexFamily::DefinitionExact, Box::from(name.as_bytes())))
@@ -1970,6 +3281,127 @@ mod tests {
             assert_eq!(changed.is_complete(), complete);
             assert_eq!(changed.changed_path_count(), 1);
         }
+    }
+
+    #[test]
+    fn external_selection_replay_requires_certified_complete_current_answers() {
+        use brokk_bifrost_core::analyzer::external_selection::{
+            ExternalSelectionAuthority, ExternalSelectionQuestion, ExternalSelectionQuestionKind,
+            SelectionRefused, SelectionRetry, VerifiedSelection,
+        };
+        use brokk_bifrost_core::analyzer::outer_request::OuterRequest;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Authority {
+            complete: bool,
+            certified: bool,
+            stale: bool,
+            calls: AtomicUsize,
+        }
+        impl ExternalSelectionAuthority for Authority {
+            fn questions(&self) -> Vec<ExternalSelectionQuestion> {
+                vec![ExternalSelectionQuestion {
+                    kind: ExternalSelectionQuestionKind::Dependencies,
+                    digest: [3; 32],
+                    uncertified: false,
+                }]
+            }
+            fn answer(
+                &self,
+                _: &OuterRequest,
+                _: &ExternalSelectionQuestion,
+                _: &SelectionRetry,
+                _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+            ) -> Result<Arc<VerifiedSelection>, SelectionRefused> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.stale {
+                    return Err(SelectionRefused::Stale);
+                }
+                Ok(Arc::new(VerifiedSelection {
+                    question_digest: [3; 32],
+                    answer_digest: [4; 32],
+                    view_stamp: None,
+                    complete: self.complete,
+                    certified: self.certified,
+                    records: Arc::new(()),
+                }))
+            }
+        }
+        let question = LookupQuestion::ExternalSelection {
+            question_digest: [3; 32],
+        };
+        for (complete, certified, stale) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let authority = Authority {
+                complete,
+                certified,
+                stale,
+                calls: AtomicUsize::new(0),
+            };
+            let mut memo = LookupMemo::new();
+            let expected =
+                (complete && certified && !stale).then(|| StableDigest::from_array([4; 32]));
+            for _ in 0..2 {
+                assert_eq!(
+                    memo.external_selection_answer(
+                        &[&authority],
+                        &question,
+                        &CancellationToken::default()
+                    ),
+                    expected
+                );
+            }
+            assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+            assert_ne!(expected, Some(StableDigest::from_array([5; 32])));
+        }
+        assert_eq!(
+            LookupMemo::new().external_selection_answer(
+                &[],
+                &question,
+                &CancellationToken::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_external_selection_question_verifies_as_changed() {
+        let (_root, head) = workspace_fixture("def before():\n    pass\n");
+        let key = ReadKey::lookup(
+            LookupKind::ExternalSelection,
+            LookupQuestion::ExternalSelection {
+                question_digest: [3; 32],
+            },
+            StableDigest::sha256(b"answer"),
+        );
+        let artifact = DerivedArtifactId::semantic_artifact(StableDigest::sha256(b"artifact"));
+        let verdict = verify_read_set_for_artifact(
+            artifact,
+            &head,
+            &ChangedFacts::between(&head, &head),
+            &inputs(),
+            std::slice::from_ref(&key),
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+            &mut LookupMemo::new(),
+        );
+        let changed = verdict
+            .changed()
+            .expect("an unverifiable external selection must not verify as unchanged");
+        assert_eq!(changed.key, key);
+        assert_eq!(
+            changed.reason,
+            InvalidationReason::DependencyChanged {
+                artifact,
+                dependency: key.canonical_digest(),
+            }
+        );
     }
 
     #[test]
@@ -2026,6 +3458,7 @@ mod tests {
         let (base_root, base) = workspace_fixture("def before():\n    pass\n");
         let base_blobs = fact_indexes_by_language(&base)[&Language::Python]
             .analyzed_blobs()
+            .expect("the fixture listing reads")
             .into_iter()
             .map(|(file, blob)| {
                 (

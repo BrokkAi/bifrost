@@ -3,7 +3,7 @@ mod jvm_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_selection::CLEAR_SELECTED_RESOLUTION_TEMP_SQL;
+    use brokk_bifrost_analysis::analyzer::store::clear_selected_resolution_temp_for_test;
 
     use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -146,16 +146,17 @@ mod jvm_extraction_tests {
             .connection()
             .query_row("PRAGMA main.data_version", [], |row| row.get(0))
             .unwrap();
-        fixture
-            .store
-            .conn
-            .lock()
-            .unwrap()
+        let writer = fixture.store.conn.lock().unwrap();
+        let _fixture =
+            brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&writer);
+        writer
             .execute(
                 "UPDATE main.resolution_fragment_interiors SET payload_bytes=payload_bytes+1",
                 [],
             )
             .unwrap();
+        drop(_fixture);
+        drop(writer);
         let after_commit: i64 = ready
             .connection()
             .query_row("PRAGMA main.data_version", [], |row| row.get(0))
@@ -168,16 +169,17 @@ mod jvm_extraction_tests {
             .unwrap();
         check_interior_count(&ready, 2);
         check_interior_count(&ready, 0);
-        fixture
-            .store
-            .conn
-            .lock()
-            .unwrap()
+        let writer = fixture.store.conn.lock().unwrap();
+        let _fixture =
+            brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&writer);
+        writer
             .execute(
                 "UPDATE main.resolution_fragment_interiors SET publication_state='building'",
                 [],
             )
             .unwrap();
+        drop(_fixture);
+        drop(writer);
         begin(ready.connection());
         let error = SelectedResolutionLexicalSource::new_on_demand(&ready)
             .validate_selected_interiors_for_test(&CancellationToken::default())
@@ -329,8 +331,7 @@ mod jvm_extraction_tests {
             ensure_revisioned_workspace_views(&conn).unwrap();
             conn.execute_batch(selected_resolution_temp_schema_sql())
                 .unwrap();
-            conn.execute_batch(CLEAR_SELECTED_RESOLUTION_TEMP_SQL)
-                .unwrap();
+            clear_selected_resolution_temp_for_test(&conn).unwrap();
             let tx = conn.unchecked_transaction().unwrap();
             assert!(
                 insert_selection_input(
@@ -682,7 +683,7 @@ mod jvm_extraction_tests {
     #[test]
     fn mask_exclusion_precedes_persisted_artifact_availability() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        fixture.store.conn.execute(|conn| {
+        fixture.store.conn.execute_fixture(|conn| {
             conn.execute("DELETE FROM resolution_fragment_interiors", [])
                 .unwrap();
             conn.execute("UPDATE blob_meta SET is_complete = 0", [])
@@ -935,7 +936,9 @@ mod jvm_extraction_tests {
             same_connection.unowned_changes,
             main_schema.unowned_changes + 1
         );
+        let _fixture = brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(conn);
         conn.execute_batch("VACUUM").unwrap();
+        drop(_fixture);
         let vacuumed = ready.read_change_stamp().unwrap();
         assert_eq!(vacuumed.unowned_changes, same_connection.unowned_changes);
         assert_ne!(
@@ -1035,7 +1038,7 @@ mod jvm_extraction_tests {
     #[test]
     fn reused_inventory_validation_still_observes_later_epoch_drift() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        let mut ready = fixture.open_ready(&[]);
+        let ready = fixture.open_ready(&[]);
         ready
             .with_owned_temp_write(|connection| {
                 connection.execute_batch(
@@ -1068,7 +1071,7 @@ mod jvm_extraction_tests {
     #[test]
     fn post_ready_epoch_drift_revalidates_stale() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        let mut ready = fixture.open_ready(&[]);
+        let ready = fixture.open_ready(&[]);
         fixture.store.conn.execute(|conn| {
             conn.execute(
                 "UPDATE resolution_producer_epochs SET producer_epoch = 'future'
@@ -1087,7 +1090,7 @@ mod jvm_extraction_tests {
     #[test]
     fn post_ready_membership_or_artifact_loss_is_inventory_drift() {
         let membership = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        let mut ready = membership.open_ready(&[]);
+        let ready = membership.open_ready(&[]);
         membership.store.conn.execute(|conn| {
             conn.execute("DELETE FROM workspace_file_versions", [])
                 .unwrap();
@@ -1101,8 +1104,8 @@ mod jvm_extraction_tests {
         drop(ready);
 
         let artifact = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        let mut ready = artifact.open_ready(&[]);
-        artifact.store.conn.execute(|conn| {
+        let ready = artifact.open_ready(&[]);
+        artifact.store.conn.execute_fixture(|conn| {
             conn.execute("DELETE FROM resolution_fragment_interiors", [])
                 .unwrap();
         });
@@ -1352,8 +1355,8 @@ mod jvm_extraction_tests {
             },
         )]);
 
-        let mut first = fixture.open_ready(&[]);
-        let mut second = match fixture
+        let first = fixture.open_ready(&[]);
+        let second = match fixture
             .store
             .open_selected_resolution_mount_inventory(
                 &other_workspace,
@@ -1925,7 +1928,10 @@ mod jvm_extraction_tests {
             fingerprint: ready.fingerprint(),
             expected_transient_replacement_count: ready.expected_transient_replacement_count(),
         };
-        let tx = ready.conn.transaction().unwrap();
+        // This test writes selection rows and needs a real SQLite transaction.
+        let tx = std::ops::DerefMut::deref_mut(&mut ready.conn)
+            .transaction()
+            .unwrap();
         // This test deliberately replaces the selected mount rows.
         brokk_bifrost_analysis::analyzer::store::resolution_selection::drop_selected_mount_guards_for_test(&tx).unwrap();
         tx.execute("DELETE FROM temp.selected_resolution_mounts", [])
@@ -2146,7 +2152,7 @@ mod jvm_extraction_tests {
             Vec::new(),
             Vec::new(),
         );
-        fixture.store.conn.execute(|conn| {
+        fixture.store.conn.execute_fixture(|conn| {
             conn.execute("DELETE FROM resolution_fragment_interiors", [])
                 .unwrap();
         });
@@ -2210,7 +2216,7 @@ mod jvm_extraction_tests {
     #[test]
     fn missing_interior_and_incomplete_parent_cannot_disappear_from_inventory() {
         let missing = crate::selection_fixture_support::JvmSelectionFixture::new(1);
-        missing.store.conn.execute(|conn| {
+        missing.store.conn.execute_fixture(|conn| {
             conn.execute("DELETE FROM resolution_fragment_interiors", [])
                 .unwrap();
         });

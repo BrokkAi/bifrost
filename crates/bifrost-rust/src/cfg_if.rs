@@ -156,6 +156,15 @@ pub(crate) fn item_tree(
 }
 
 #[cfg(test)]
+fn parse_rust_tree_for_test(source: &str) -> Option<tree_sitter::Tree> {
+    // Standalone fixtures have no analyzer owner; retain nothing across calls.
+    let caches = crate::lexical_scope::RustLexicalCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    crate::lexical_scope::parse_rust_tree_with(&caches, source)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::selected_context::RustSelectedActivation::{Active, Inactive};
@@ -174,7 +183,7 @@ mod tests {
                 pub struct Last;
             }
         }"#;
-        let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+        let tree = parse_rust_tree_for_test(source).unwrap();
         let invocation = tree.root_node().named_child(0).unwrap();
         assert!(is_cfg_if(invocation, source));
         let arms = arms(invocation, source).unwrap();
@@ -237,7 +246,7 @@ mod tests {
             ("cfg_if! { r#if #[cfg(windows)] { mod fake; } }", false),
             ("cfg_if! { if #[cfg(windows)] { mod broken; }", false),
         ] {
-            let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+            let tree = parse_rust_tree_for_test(source).unwrap();
             let invocation = tree.root_node().named_child(0).unwrap();
             assert_eq!(
                 item_tree(invocation, source).is_some(),

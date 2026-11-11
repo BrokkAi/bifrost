@@ -1,0 +1,9 @@
+f1fb39345c13e5d570d8b80ead80882443d9bc093aeeeb87ea1288f8044f50f4  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sinks-alloc-layout.json
+61c9ecf6747b93f3040cb6c0a12c7fedd9f908b9702a939129c87c47a7650579  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sinks-alloc-size.json
+fe9f2709a5ba9dfff6c1feb76526b12ef8a0558ec649f416149538bf49e94d6a  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sinks-log-injection.json
+da7f7d38d34179b90384db3cb7111b71d8405ece3870656c80523a69b6a67fd5  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sinks-path-injection.json
+fc8cf415b16d11f614bec9667a7cd51af967b964a3efc806d4d7585c9521dad5  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sinks-pointer-access.json
+113555e02ea2d69eccf3906addae00bc23317ab915e3ff019fd3df5fdedb3df0  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sources-commandargs.json
+cdfaa8521f291206be45d124682efcb55e64d003ff57a7432c09660963d38086  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sources-environment.json
+3348695b6a84af667cb53c616309ecb84c8883fbf2a0987e08d0679be2c495f3  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sources-file.json
+33fe921fb47892ab46fedaf8101371f612a5087f9710946f074721a07d9e96eb  crates/bifrost-semantic-packs/testdata/summary-corpora/codeql-rust/catalogs/codeql-rust-sources-pointer-invalidate.json

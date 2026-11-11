@@ -5,6 +5,7 @@
 //! fully qualified declaration identities, member joins use the indexed owner,
 //! and same-project joins compare project roots. No source-text lookup is used.
 
+use super::configuration::ScalarValue;
 use super::cross_domain::{
     CrossDomainBinding, CrossDomainValue, cross_domain_diagnostic, plan_rows_budget,
 };
@@ -50,11 +51,6 @@ fn member_key(value: &ConfigurationFactValue) -> Option<&str> {
     }
 }
 
-fn scalar_member(value: &ConfigurationFactValue, index: usize) -> Option<String> {
-    let member = fact_value_at(value, index);
-    member.scalar_value()
-}
-
 fn section_for_member(value: &ConfigurationFactValue) -> Option<usize> {
     let ConfigurationNodeKind::Member { value: child, .. } = value.fact().kind() else {
         return None;
@@ -63,25 +59,28 @@ fn section_for_member(value: &ConfigurationFactValue) -> Option<usize> {
     Some(child)
 }
 
+/// The scalar of the first `key` member of `section` that holds one. An
+/// undecodable scalar is returned as such, never skipped for a later member.
 fn member_value_in_section(
     value: &ConfigurationFactValue,
     section: usize,
     key: &str,
-) -> Option<(usize, String)> {
-    child_indices(value, section).find_map(|index| {
-        let candidate = fact_value_at(value, index);
-        (member_key(&candidate) == Some(key))
-            .then(|| scalar_member(value, index).map(|scalar| (index, scalar)))
-            .flatten()
-    })
+) -> ScalarValue {
+    child_indices(value, section)
+        .map(|index| fact_value_at(value, index))
+        .filter(|candidate| member_key(candidate) == Some(key))
+        .map(|candidate| candidate.scalar_value())
+        .find(|scalar| !matches!(scalar, ScalarValue::Absent))
+        .unwrap_or(ScalarValue::Absent)
 }
 
-/// Find the nearest enclosing XML/object section carrying a class member.
-fn enclosing_class(value: &ConfigurationFactValue) -> Option<(usize, String)> {
+/// The class member of the nearest enclosing XML/object section carrying one.
+fn enclosing_class(value: &ConfigurationFactValue) -> ScalarValue {
     let mut current = Some(value.index);
     while let Some(index) = current {
-        if let Some((_, class_name)) = member_value_in_section(value, index, "class") {
-            return Some((index, class_name));
+        let class_name = member_value_in_section(value, index, "class");
+        if !matches!(class_name, ScalarValue::Absent) {
+            return class_name;
         }
         current = value
             .document
@@ -90,22 +89,26 @@ fn enclosing_class(value: &ConfigurationFactValue) -> Option<(usize, String)> {
             .and_then(ConfigurationFact::parent)
             .map(|id| id.index());
     }
-    None
+    ScalarValue::Absent
 }
 
-fn property_name(value: &ConfigurationFactValue) -> Option<String> {
+/// The nearest `name` property at or above the fact. An undecodable `name`
+/// is returned as such, never skipped for an outer one.
+fn property_name(value: &ConfigurationFactValue) -> ScalarValue {
     let mut current = Some(value.index);
     while let Some(index) = current {
         let candidate = fact_value_at(value, index);
-        if member_key(&candidate) == Some("name")
-            && let Some(name) = candidate.scalar_value()
-        {
-            return Some(name);
+        if member_key(&candidate) == Some("name") {
+            let name = candidate.scalar_value();
+            if !matches!(name, ScalarValue::Absent) {
+                return name;
+            }
         }
-        if let Some(section) = section_for_member(&candidate)
-            && let Some((_, name)) = member_value_in_section(value, section, "name")
-        {
-            return Some(name);
+        if let Some(section) = section_for_member(&candidate) {
+            let name = member_value_in_section(value, section, "name");
+            if !matches!(name, ScalarValue::Absent) {
+                return name;
+            }
         }
         current = value
             .document
@@ -114,7 +117,7 @@ fn property_name(value: &ConfigurationFactValue) -> Option<String> {
             .and_then(ConfigurationFact::parent)
             .map(|id| id.index());
     }
-    None
+    ScalarValue::Absent
 }
 
 /// The generic member-name transform used by `scalar-member`: capitalize the
@@ -143,6 +146,13 @@ fn owner_for_declaration(
     if exhausted { Err(true) } else { Ok(owner) }
 }
 
+fn undecodable_scalar(configuration: &ConfigurationFactValue) -> JoinDecision {
+    JoinDecision::Incomplete(format!(
+        "configuration scalar in {} could not be decoded",
+        rel_path_string(configuration.file())
+    ))
+}
+
 fn matches_declaration(
     relation: ConfigurationCodeMatch,
     configuration: &ConfigurationFactValue,
@@ -152,16 +162,15 @@ fn matches_declaration(
     owner_work_limit: usize,
 ) -> JoinDecision {
     match relation {
-        ConfigurationCodeMatch::ScalarDeclaration => {
-            if configuration
-                .scalar_value()
-                .is_some_and(|value| value == declaration.unit.fq_name_str())
-            {
+        // A scalar the decoder could not read is neither a match nor a
+        // non-match, so an absence relation cannot claim it.
+        ConfigurationCodeMatch::ScalarDeclaration => match configuration.scalar_value() {
+            ScalarValue::Decoded(value) if value == declaration.unit.fq_name_str() => {
                 JoinDecision::Match
-            } else {
-                JoinDecision::NoMatch
             }
-        }
+            ScalarValue::Undecodable => undecodable_scalar(configuration),
+            ScalarValue::Decoded(_) | ScalarValue::Absent => JoinDecision::NoMatch,
+        },
         ConfigurationCodeMatch::ScalarOwner => {
             let owner =
                 match owner_for_declaration(state, declaration, owner_work, owner_work_limit) {
@@ -174,15 +183,18 @@ fn matches_declaration(
                     Err(false) => unreachable!("owner lookup only reports true exhaustion"),
                 };
             match (configuration.scalar_value(), owner) {
-                (Some(value), Some(owner)) if value == owner.unit.fq_name_str() => {
+                (ScalarValue::Undecodable, _) => undecodable_scalar(configuration),
+                (ScalarValue::Decoded(value), Some(owner)) if value == owner.unit.fq_name_str() => {
                     JoinDecision::Match
                 }
                 _ => JoinDecision::NoMatch,
             }
         }
         ConfigurationCodeMatch::ScalarMember => {
-            let Some(property) = property_name(configuration) else {
-                return JoinDecision::NoMatch;
+            let property = match property_name(configuration) {
+                ScalarValue::Decoded(property) => property,
+                ScalarValue::Undecodable => return undecodable_scalar(configuration),
+                ScalarValue::Absent => return JoinDecision::NoMatch,
             };
             let Some(expected_member) = transformed_member_name(&property) else {
                 return JoinDecision::NoMatch;
@@ -190,8 +202,10 @@ fn matches_declaration(
             if !declaration.unit.is_callable() || declaration.unit.identifier() != expected_member {
                 return JoinDecision::NoMatch;
             }
-            let Some((_, class_name)) = enclosing_class(configuration) else {
-                return JoinDecision::NoMatch;
+            let class_name = match enclosing_class(configuration) {
+                ScalarValue::Decoded(class_name) => class_name,
+                ScalarValue::Undecodable => return undecodable_scalar(configuration),
+                ScalarValue::Absent => return JoinDecision::NoMatch,
             };
             let owner =
                 match owner_for_declaration(state, declaration, owner_work, owner_work_limit) {
@@ -222,7 +236,10 @@ fn matches_same_project(configuration: &ConfigurationFactValue, code: &PipelineV
 fn config_key(relation: ConfigurationCodeMatch, value: &ConfigurationFactValue) -> String {
     match relation {
         ConfigurationCodeMatch::SameProject => "same-project".to_string(),
-        _ => value.scalar_value().unwrap_or_else(|| value.route()),
+        _ => value
+            .scalar_value()
+            .decoded()
+            .unwrap_or_else(|| value.route()),
     }
 }
 
@@ -236,7 +253,7 @@ pub(super) fn execute(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let mut truncated = code.truncated || configuration.truncated;
+    let mut truncated = code.is_truncated() || configuration.is_truncated();
     let desired_rows = plan_rows_budget(terminal_cap, state, limits);
     let owner_work_limit = limits.max_pipeline_rows.saturating_mul(64).max(1_024);
     let mut owner_work = 0;
@@ -320,7 +337,7 @@ pub(super) fn execute(
             }
         }
 
-        if relation.absence && !matched && !configuration_incomplete && !code.truncated {
+        if relation.absence && !matched && !configuration_incomplete && !code.is_truncated() {
             if rows.len() >= desired_rows {
                 truncated = true;
                 break;
@@ -343,7 +360,7 @@ pub(super) fn execute(
         }
     }
 
-    if relation.absence && (code.truncated || configuration.truncated) {
+    if relation.absence && (code.is_truncated() || configuration.is_truncated()) {
         incomplete_reasons.push(
             "configuration-code anti-join inputs were truncated, so absence is not provable"
                 .to_string(),
@@ -358,13 +375,8 @@ pub(super) fn execute(
             format!(
                 "configuration_code retained no negative claim for incomplete inputs: {incomplete_reasons:?}"
             ),
-        ), (relation.absence && (code.truncated || configuration.truncated)).then_some(DerivationExecutionCause::Budget)));
+        ), (relation.absence && (code.is_truncated() || configuration.is_truncated())).then_some(DerivationExecutionCause::Budget)));
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }

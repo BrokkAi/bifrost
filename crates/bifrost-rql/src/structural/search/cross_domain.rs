@@ -380,7 +380,7 @@ pub(super) fn execute_correlate_configuration_key(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let mut truncated = code.truncated || configuration.truncated;
+    let mut truncated = code.is_truncated() || configuration.is_truncated();
 
     let document_gaps = relation
         .documents
@@ -431,7 +431,7 @@ pub(super) fn execute_correlate_configuration_key(
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return cancelled_plan_execution();
+            return PlanExecution::cancelled(Vec::new());
         }
         let PipelineValue::ExpressionSite(site) = &code_row.value else {
             unreachable!("validated configuration_key code inputs produce expression sites");
@@ -562,12 +562,7 @@ pub(super) fn execute_correlate_configuration_key(
         ));
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 
 /// Evaluate `require-both`: boolean satisfaction of both inputs, with each
@@ -580,16 +575,11 @@ pub(super) fn execute_require_both(
     limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
-    let mut truncated = code.truncated || configuration.truncated;
+    let mut truncated = code.is_truncated() || configuration.is_truncated();
     // An unsatisfied side yields no rows. Its own diagnostics already say
     // whether that emptiness is exhaustive or incomplete.
     if code.rows.is_empty() || configuration.rows.is_empty() {
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated,
-            cancelled: false,
-            pipeline_halted: false,
-        };
+        return PlanExecution::new(Vec::new(), truncated);
     }
     let desired_rows = plan_rows_budget(terminal_cap, state, limits);
     let witnesses = code
@@ -629,10 +619,5 @@ pub(super) fn execute_require_both(
             provenance_truncated,
         );
     }
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }

@@ -712,6 +712,9 @@ fn incomplete_reason_label(reason: &EnvironmentIncompleteReason) -> &'static str
         EnvironmentIncompleteReason::BindingActivationUnknown => {
             "an activation interval could not be stated"
         }
+        EnvironmentIncompleteReason::BindingIdentityUnknown => {
+            "a binder identity could not be proven"
+        }
         EnvironmentIncompleteReason::ImportTargetUnstructured => {
             "an import records no structured target"
         }
@@ -784,6 +787,17 @@ impl BindingValue {
         &self.result.bindings[self.index]
     }
 
+    /// Preserve the row selected by a physical source occurrence. Logical
+    /// identity can be canonical while `binding-occurrence` still names the
+    /// token that a containing syntax query selected.
+    pub(super) fn selected_row(&self) -> &BindingRow {
+        self.row()
+    }
+
+    fn canonical_row(&self) -> &BindingRow {
+        &self.result.bindings[self.row().logical_index]
+    }
+
     pub(super) fn key(&self) -> BindingKey {
         BindingKey {
             file: self.file.clone(),
@@ -796,7 +810,7 @@ impl BindingValue {
     pub(super) fn set_difference_key(&self) -> BindingKey {
         BindingKey {
             file: self.file.clone(),
-            index: self.index,
+            index: self.canonical_index(),
             shadowed: false,
             reached_from: None,
         }
@@ -806,12 +820,19 @@ impl BindingValue {
         &self.file
     }
 
+    fn canonical_index(&self) -> usize {
+        self.canonical_row().logical_index
+    }
+
     pub(super) fn id(&self) -> String {
-        let row = self.row();
+        let row = self.canonical_row();
         let mut digest = LengthDelimitedDigest::new(BINDING_ID_DOMAIN);
         digest.push(row.content_identity.as_bytes());
-        digest.push(&row.range.start_byte.to_le_bytes());
-        digest.push(&row.range.end_byte.to_le_bytes());
+        let (start, end) = row
+            .logical_anchor
+            .unwrap_or((row.range.start_byte, row.range.end_byte));
+        digest.push(&start.to_le_bytes());
+        digest.push(&end.to_le_bytes());
         digest.push(row.name.as_bytes());
         digest.push(row.kind.label().as_bytes());
         digest.finish().to_string()
@@ -992,6 +1013,18 @@ pub(super) fn public_binding(value: &BindingValue, range: CodeQueryRange) -> Cod
         path: super::rel_path_string(&row.file),
         language: crate::analyzer::common::language_for_file(&row.file).config_label(),
         name: row.name.clone(),
+        immediate_parent_kind: row
+            .syntax
+            .as_ref()
+            .map(|syntax| syntax.immediate_parent_kind.clone()),
+        whole_let_initializer: row
+            .syntax
+            .as_ref()
+            .is_some_and(|syntax| syntax.whole_let_initializer),
+        whole_match_arm_identifier: row
+            .syntax
+            .as_ref()
+            .is_some_and(|syntax| syntax.whole_match_arm_identifier),
         kind: row.kind.label(),
         hoisting: row.hoisting.label(),
         namespace: row.namespace().label(),
@@ -1097,6 +1130,37 @@ pub(super) fn candidate_unit(candidate: &TraceCandidateRef) -> Option<&crate::an
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn or_pattern_keeps_selected_occurrence_beside_canonical_identity() {
+        use super::super::tests::inline_project::InlineTestProject;
+        use crate::analyzer::AnalyzerConfig;
+
+        let source = "enum E { A(i32), B(i32) } fn f(v: E) { match v { E::A(x) | E::B(x) => {} } }";
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("main.rs", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let file = project.file("main.rs");
+        let result = Arc::new(environment_for_file(workspace.analyzer(), &file));
+        let first = source.find("A(x)").unwrap() + 2;
+        let second = source.find("B(x)").unwrap() + 2;
+        let index = result
+            .bindings
+            .iter()
+            .position(|row| row.range.start_byte == second)
+            .unwrap();
+        let value = BindingValue {
+            file,
+            result,
+            index,
+            shadowed: false,
+            reached_from: None,
+        };
+        assert_eq!(value.row().range.start_byte, second);
+        assert_eq!(value.selected_row().range.start_byte, second);
+        assert_eq!(value.canonical_row().range.start_byte, first);
+    }
 
     #[test]
     #[hardwon(

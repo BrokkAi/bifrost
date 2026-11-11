@@ -122,8 +122,7 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         usage_kind: Option<&'static str>,
         proof: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reference_kind: Option<&'static str>,
+        reference_facets: CodeQueryReferenceFacets,
     },
     CallSite {
         path: String,
@@ -559,6 +558,8 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         target_fq_name: String,
         provenance: &'static str,
+        proof: &'static str,
+        reference_facets: CodeQueryReferenceFacets,
     },
     StateEvent {
         id: String,

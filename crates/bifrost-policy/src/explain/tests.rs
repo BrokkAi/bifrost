@@ -270,6 +270,7 @@ impl Fixture {
             cvss_overlays: &[],
             organizational_risk: &[],
             incremental: None,
+            identifier_typos: None,
         }
     }
 
@@ -1023,6 +1024,7 @@ fn cancellation_after_registration_wins_over_ambiguous_selection() {
         None,
         Some(&cancellation),
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect_err("cancellation after the final registration wins before selection");
 
@@ -1048,8 +1050,13 @@ fn the_host_explains_a_retained_finding_after_a_malformed_packs_document() {
 
     let options =
         PolicyEvaluationOptions::new("2026-08-28".parse().expect("fixed explanation parity date"));
-    let outcome = evaluate_policy_inputs(root, &inputs, &options)
-        .expect("normal evaluation diagnoses packs and continues");
+    let outcome = evaluate_policy_inputs(
+        root,
+        &inputs,
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .expect("normal evaluation diagnoses packs and continues");
     assert!(
         outcome
             .report()
@@ -1071,6 +1078,7 @@ fn the_host_explains_a_retained_finding_after_a_malformed_packs_document() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("the retained unreliable finding remains explainable");
     assert_eq!(explanation.question(), ExplanationQuestion::Why);
@@ -1346,6 +1354,7 @@ fn fake_projection(
             // The projection authority requires this to equal the report's own
             // witness truncation flag (`validate_witness_references`).
             witness_refs_truncated: shape.witnesses_truncated,
+            model_attribution: None,
             report: crate::projection::ProjectedFindingReport {
                 value_type_barrier_notes: Default::default(),
                 primary: observation_location(),
@@ -2239,6 +2248,7 @@ impl crate::evaluator::TypestatePolicyEvaluator for FakeProtocolAdapter {
         _policy: &LoadedPolicy,
         _spec: &crate::resolved::ResolvedTypestatePolicySpec,
         _context: &PolicyEvaluationContext<'_>,
+        _subject_scope: brokk_bifrost_rql::structural::search::CodeQueryExecutionScope<'_>,
         _budget: &PolicyBudget,
     ) -> Result<
         crate::projection::TypestateCompilationHashes,
@@ -2264,6 +2274,7 @@ impl crate::evaluator::TypestatePolicyEvaluator for FakeProtocolAdapter {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: crate::finding::PolicyWorkReport::default(),
+            subjects: None,
         }
     }
 }
@@ -2396,6 +2407,7 @@ fn fake_protocol_projection(
         subject: AnalysisSubjectRef::try_new("test", "resource-instance").expect("a subject ref"),
         witness_refs,
         witness_refs_truncated: false,
+        model_attribution: None,
         report: crate::projection::ProjectedFindingReport {
             value_type_barrier_notes: Default::default(),
             primary: observation_location(),
@@ -2653,6 +2665,7 @@ fn the_host_refuses_an_explanation_pinned_to_a_generation_the_workspace_lost() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("an unpinned explanation answers");
     let current = unpinned
@@ -2669,6 +2682,7 @@ fn the_host_refuses_an_explanation_pinned_to_a_generation_the_workspace_lost() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("the current generation is accepted");
     assert_eq!(pinned.to_json(), unpinned.to_json());
@@ -2684,6 +2698,7 @@ fn the_host_refuses_an_explanation_pinned_to_a_generation_the_workspace_lost() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect_err("a workspace that moved must not be silently explained");
     assert_eq!(
@@ -2709,10 +2724,20 @@ fn a_reopened_disk_workspace_rejects_a_generation_from_before_an_edit() {
     let target =
         ExplanationTarget::Candidate(ExplanationCandidate::at_offset("app.ts", 0).unwrap());
     let limits = ExplanationLimits::default();
-    let old = explain_policy_inputs(&root, &inputs, &target, None, None, None, None, &limits)
-        .unwrap()
-        .workspace_generation()
-        .unwrap();
+    let old = explain_policy_inputs(
+        &root,
+        &inputs,
+        &target,
+        None,
+        None,
+        None,
+        None,
+        &limits,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .unwrap()
+    .workspace_generation()
+    .unwrap();
     std::fs::write(
         root.join("app.ts"),
         format!("{RELATIONAL_FIXTURE}\nfunction newFunction() {{ return 42; }}\n"),
@@ -2727,6 +2752,7 @@ fn a_reopened_disk_workspace_rejects_a_generation_from_before_an_edit() {
         None,
         None,
         &limits,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     );
     assert!(
         matches!(result, Err(ExplainError::StaleWorkspaceGeneration { .. })),
@@ -3337,6 +3363,7 @@ fn the_host_reports_an_unloadable_policy_as_a_stated_condition() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect_err("a missing policy file is a stated condition, not a panic");
     assert!(
@@ -3365,6 +3392,7 @@ fn the_host_honors_front_door_cancellation_before_loading_policy_inputs() {
         None,
         Some(&cancellation),
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect_err("explicit cancellation wins before the absent input is loaded");
     assert_eq!(
@@ -3418,6 +3446,7 @@ class Caller {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("owned-analyzer registration resolves both qualified locators");
     assert_eq!(explanation.question(), ExplanationQuestion::WhyNot);
@@ -3701,6 +3730,7 @@ fn a_stale_generation_refuses_a_why_request_before_evaluating_the_policy() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect_err("a stale pin is refused");
     assert!(
@@ -3726,6 +3756,7 @@ fn a_near_miss_ranking_honours_the_same_workspace_generation_pin() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("an unpinned ranking answers");
     let current = ranking
@@ -3741,6 +3772,7 @@ fn a_near_miss_ranking_honours_the_same_workspace_generation_pin() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("the current generation is accepted");
 
@@ -3753,6 +3785,7 @@ fn a_near_miss_ranking_honours_the_same_workspace_generation_pin() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect_err("a stale pin is refused for a ranking too");
     assert_eq!(

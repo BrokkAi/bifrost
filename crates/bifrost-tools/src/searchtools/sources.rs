@@ -94,6 +94,7 @@ pub struct SymbolSourcesResult {
 #[serde(rename_all = "snake_case")]
 pub enum SymbolSourcesIncompleteReason {
     Cancelled,
+    ReadIncomplete,
     /// The declaration lies inside a construct its file's parse never closed,
     /// so its scope and nesting are a recovery claim (#3501).
     InsideUnclosedConstruct,
@@ -103,6 +104,8 @@ pub enum SymbolSourcesIncompleteReason {
 pub struct SymbolSourcesIncomplete {
     pub target: String,
     pub reason: SymbolSourcesIncompleteReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +166,7 @@ fn cancelled_source_outcome(symbol: &str) -> SourceLookupOutcome {
     SourceLookupOutcome::Cancelled(SymbolSourcesIncomplete {
         target: symbol.to_string(),
         reason: SymbolSourcesIncompleteReason::Cancelled,
+        detail: None,
     })
 }
 
@@ -479,7 +483,7 @@ fn get_symbol_sources_with_budget(
     // reaches reads whose signatures do not carry one: on C++ the per-symbol
     // `definitions` read runs identity reconciliation, which is where #1908
     // spent 270 s with nothing polling it.
-    let _analyzer_query = match cancellation {
+    let analyzer_query = match cancellation {
         Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
         None => AnalyzerQueryScope::new(analyzer),
     };
@@ -853,6 +857,7 @@ fn get_symbol_sources_with_budget(
                         incomplete.push(SymbolSourcesIncomplete {
                             target: block.label.clone(),
                             reason: SymbolSourcesIncompleteReason::InsideUnclosedConstruct,
+                            detail: None,
                         });
                     }
                 }
@@ -873,6 +878,28 @@ fn get_symbol_sources_with_budget(
                     max_source_bytes: source_budget.max_source_bytes,
                 });
             }
+        }
+    }
+
+    if let Err(reason) = analyzer_query.read_completion() {
+        match reason {
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled => {
+                if !incomplete
+                    .iter()
+                    .any(|item| item.reason == SymbolSourcesIncompleteReason::Cancelled)
+                {
+                    incomplete.push(SymbolSourcesIncomplete {
+                        target: "query".to_owned(),
+                        reason: SymbolSourcesIncompleteReason::Cancelled,
+                        detail: None,
+                    });
+                }
+            }
+            reason => incomplete.push(SymbolSourcesIncomplete {
+                target: "query".to_owned(),
+                reason: SymbolSourcesIncompleteReason::ReadIncomplete,
+                detail: Some(format!("{reason:?}")),
+            }),
         }
     }
 
@@ -907,17 +934,23 @@ fn semantic_model_source_outcome_with_anchor(
     source_budget: &SourceByteBudget,
 ) -> Option<SourceLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
-    let mut records = if symbol.starts_with("bifrost-model://") {
+    let mut matched = if symbol.starts_with("bifrost-model://") {
         overlay.symbols_at_uri(symbol)
     } else {
         overlay.symbols_with_id(symbol)
-    }
-    .records;
-    if records.is_empty() {
-        records = overlay.symbols_named(symbol).records;
+    };
+    if matched.records.is_empty()
+        && !matches!(
+            matched.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        )
+    {
+        matched = overlay.symbols_named(symbol);
     }
     if let Some(required_path) = required_path {
-        records.retain(|model| {
+        matched.records.retain(|model| {
             matches!(
                 &model.location,
                 brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
@@ -925,13 +958,19 @@ fn semantic_model_source_outcome_with_anchor(
             )
         });
     }
-    let disposition = match records.len() {
-        0 => brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty,
-        1 if !records[0].provenance.ambiguous => {
-            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    let disposition = if matches!(
+        matched.disposition,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        matched.disposition
+    } else {
+        match matched.records.len() {
+            0 => brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty,
+            1 if !matched.records[0].provenance.ambiguous => brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique,
+            _ => brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict,
         }
-        _ => brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict,
     };
+    let records = matched.records;
     match disposition {
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
             let model = &records[0];
@@ -989,6 +1028,11 @@ fn semantic_model_source_outcome_with_anchor(
             }))
         }
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => None,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_) => Some(SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
+            target: symbol.to_string(),
+            matches: records.iter().map(|record| record.location.identity().to_string()).collect(),
+            note: Some("semantic-model source inventory is incomplete".to_string()),
+        })),
     }
 }
 

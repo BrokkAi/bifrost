@@ -5,6 +5,10 @@
 //! crate cannot name.
 
 use brokk_bifrost_analysis::analyzer::cognitive_complexity;
+use brokk_bifrost_core::retention_budget::RetentionBudget;
+use brokk_bifrost_rust::crate_naming::RustCrateNamingCaches;
+use brokk_bifrost_rust::lexical_scope::RustLexicalCaches;
+use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::model::Language;
 
@@ -17,7 +21,8 @@ use brokk_bifrost_rust::adapter::{
     RUST_COGNITIVE_CONFIG, RUST_FILE_EXTENSION, rust_extract_call_receiver,
 };
 use brokk_bifrost_rust::declarations::{
-    parse_rust_file, rust_file_package_fq, rust_package_name, rust_semantic_package_fq,
+    parse_rust_file_with, rust_file_package_fq_with, rust_package_name_with,
+    rust_semantic_package_fq,
 };
 use brokk_bifrost_rust::queries::RUST_QUERY_DIRECTORY;
 use brokk_bifrost_rust::test_detection::rust_source_contains_tests;
@@ -31,14 +36,116 @@ use tree_sitter::Tree;
 /// report a false negative if one were ever asked about a Rust package. No
 /// Rust caller reaches them today; a future one must resolve the anchor
 /// instead of matching persisted text.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 #[doc(hidden)]
-pub struct RustAdapter;
+pub struct RustAdapter {
+    pub(crate) naming: Arc<RustCrateNamingCaches>,
+    pub(crate) lexical: Arc<RustLexicalCaches>,
+}
+
+impl std::fmt::Debug for RustAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustAdapter").finish_non_exhaustive()
+    }
+}
+
+impl RustAdapter {
+    pub fn new(naming: Arc<RustCrateNamingCaches>, lexical: Arc<RustLexicalCaches>) -> Self {
+        Self { naming, lexical }
+    }
+
+    /// An adapter with no owner to charge, for parsing outside any analyzer.
+    /// Its caches admit nothing, so each call computes and drops its own
+    /// values.
+    pub fn ownerless() -> Self {
+        let budget = RetentionBudget::retain_nothing();
+        Self::new(
+            Arc::new(RustCrateNamingCaches::new(&budget)),
+            Arc::new(RustLexicalCaches::new(&budget)),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_tests() -> Self {
+        let budget = RetentionBudget::for_tests();
+        Self::new(
+            Arc::new(RustCrateNamingCaches::new(&budget)),
+            Arc::new(RustLexicalCaches::new(&budget)),
+        )
+    }
+
+    pub fn lexical_caches(&self) -> &RustLexicalCaches {
+        &self.lexical
+    }
+}
 
 static RUST_SEMANTIC_LOWERER: crate::analyzer::rust::semantic::RustSemanticLowerer =
     crate::analyzer::rust::semantic::RustSemanticLowerer;
 
 impl LanguageAdapter for RustAdapter {
+    fn for_project(
+        &self,
+        project: Arc<dyn brokk_bifrost_core::analyzer::project::Project>,
+    ) -> Option<Self> {
+        struct SelectedManifestSource(Arc<dyn brokk_bifrost_core::analyzer::project::Project>);
+        impl brokk_bifrost_rust::crate_naming::RustManifestSource for SelectedManifestSource {
+            fn lists_path(&self, file: &ProjectFile) -> bool {
+                self.0.selected_configuration_lists_path(file.rel_path())
+            }
+            fn retained_bytes(&self) -> usize {
+                self.0.selected_configuration_retained_bytes()
+            }
+            fn bytes(&self, file: &ProjectFile) -> std::io::Result<Option<Vec<u8>>> {
+                self.0.selected_configuration_bytes(file.rel_path())
+            }
+        }
+        let source = Arc::new(SelectedManifestSource(project));
+        Some(Self::new(
+            Arc::new(self.naming.for_source(source)),
+            Arc::clone(&self.lexical),
+        ))
+    }
+
+    fn record_file_identity_inputs(
+        &self,
+        analyzer: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<Self>,
+        file: &ProjectFile,
+    ) {
+        if file
+            .rel_path()
+            .extension()
+            .is_none_or(|extension| extension != "rs")
+            || !brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(analyzer)
+                .is_capturing()
+        {
+            return;
+        }
+        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::record_identity_walk_inputs(
+            analyzer,
+            Language::Rust,
+            brokk_bifrost_rust::crate_naming::rust_file_identity_inputs_with(&self.naming, file)
+                .iter(),
+        );
+    }
+
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[
+                "string_literal",
+                "raw_string_literal",
+                "integer_literal",
+                "float_literal",
+                "char_literal",
+            ],
+            interpolations: &[],
+            composites: &[
+                ("array_expression", &["[", "]", ",", ";"]),
+                ("tuple_expression", &["(", ")", ","]),
+                ("unary_expression", &["-"]),
+            ],
+        }
+    }
+
     fn cross_file_children(
         &self,
         analyzer: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<Self>,
@@ -112,8 +219,8 @@ impl LanguageAdapter for RustAdapter {
         true
     }
 
-    fn workspace_package_identity_input(&self, file: &ProjectFile) -> bool {
-        crate::analyzer::rust::is_cargo_topology_input(file)
+    fn workspace_package_identity_input_path(&self, path: &std::path::Path) -> bool {
+        crate::analyzer::rust::is_cargo_topology_input(path)
     }
 
     /// The same parse crate reconciliation reads, minus what no Rust reader
@@ -157,7 +264,7 @@ impl LanguageAdapter for RustAdapter {
         source: &str,
         tree: &Tree,
     ) -> brokk_bifrost_core::analyzer::parsed_file::ParsedFile {
-        parse_rust_file(file, source, tree)
+        parse_rust_file_with(&self.naming, file, source, tree)
     }
 
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
@@ -218,7 +325,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for RustAdapt
         file: &ProjectFile,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<String> {
         Ok(if content_qualifier.is_empty() {
-            rust_package_name(file)
+            rust_package_name_with(&self.naming, file)
         } else {
             content_qualifier.to_string()
         })
@@ -236,7 +343,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for RustAdapt
     ) -> Option<brokk_bifrost_core::analyzer::fq_name::FqName> {
         match anchor {
             PackageAnchor::OwnModule { pop } => {
-                let package = rust_file_package_fq(file);
+                let package = rust_file_package_fq_with(&self.naming, file);
                 let keep = package.len().saturating_sub(usize::from(pop));
                 Some(package.prefix(keep))
             }
@@ -244,7 +351,7 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for RustAdapt
             // legitimate empty prefix, not an absent one: it is what lets an
             // `impl crate::Type` member persist a package-free tail.
             PackageAnchor::CrateRoot => Some(rust_semantic_package_fq(
-                &brokk_bifrost_rust::imports::rust_crate_root_package(file),
+                &brokk_bifrost_rust::imports::rust_crate_root_package_with(&self.naming, file),
             )),
         }
     }

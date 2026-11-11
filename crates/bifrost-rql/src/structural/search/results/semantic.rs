@@ -468,6 +468,9 @@ pub enum CodeQueryFlowWitnessStepKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CodeQueryFlowWitnessStep {
     pub kind: CodeQueryFlowWitnessStepKind,
+    /// Exact selected procedure summary when this step is a modeled transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_fingerprint: Option<String>,
     pub source: CodeQuerySourceSite,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_symbol: Option<CodeQueryFlowSymbolSite>,
@@ -1006,6 +1009,9 @@ pub struct CodeQueryStatementReachability {
     pub statement_kind: &'static str,
     /// `reachable`, `unreachable`, or `open`.
     pub verdict: &'static str,
+    /// Rust only: `first`, `not_first`, or `open`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region_first: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

@@ -48,7 +48,7 @@ mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_CONSUMER_PATH,
             source,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let cancellation = CancellationToken::new();
         let replacement = fixture.publish_counterfactual_content(
@@ -119,7 +119,7 @@ mod rust_departing_root_tests {
             fixture._project_root.path(),
             RUST_ROOT_PROVIDER_PATH,
             RUST_ROOT_PROVIDER_SOURCE,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
         );
         let cancellation = CancellationToken::new();
         let replacement = fixture.publish_counterfactual_content(
@@ -138,6 +138,8 @@ mod rust_departing_root_tests {
         // only the user-facing CodeUnit projection becomes unavailable. Open after
         // this mutation so freshness captures it rather than returning Stale.
         fixture.store.conn.execute(move |connection| {
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(connection);
             assert!(connection.execute(
             "UPDATE code_units SET in_declarations=0 WHERE blob_id=?1 AND in_declarations=1",
             [blob_id],

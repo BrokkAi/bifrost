@@ -1808,6 +1808,55 @@ fn selected_property_scope_reasons(
     Vec<PropertyReachingIncompleteReason>,
     HashSet<(ProgramPointId, u32)>,
 ) {
+    let (mut reasons, mut scoped_event_keys) = selected_property_coordinate_reasons(
+        snapshot,
+        relations,
+        relation_limit,
+        selected_read,
+        projected_stores,
+        cancellation,
+    );
+    for relation in relations.iter().take(relation_limit).filter(|relation| {
+        relation.point.id() == selected_read.point.id()
+            && relation.event_index == selected_read.event_index
+    }) {
+        if let Some(original) = &relation.original_cell
+            && let Some(location) = project_location(
+                snapshot.procedure(),
+                relation.point.id(),
+                relation.event_index,
+                original,
+                &mut reasons,
+            )
+        {
+            let mut read = selected_read.clone();
+            read.location = location;
+            let (original_reasons, keys) = selected_property_coordinate_reasons(
+                snapshot,
+                relations,
+                relation_limit,
+                &read,
+                projected_stores,
+                cancellation,
+            );
+            reasons.extend(original_reasons);
+            scoped_event_keys.extend(keys);
+        }
+    }
+    (reasons, scoped_event_keys)
+}
+
+fn selected_property_coordinate_reasons(
+    snapshot: &ValueFlowSnapshot,
+    relations: &[ValueFlowRelation],
+    relation_limit: usize,
+    selected_read: &PropertyReadRecord,
+    projected_stores: &[PropertyStoreRecord],
+    cancellation: &CancellationToken,
+) -> (
+    Vec<PropertyReachingIncompleteReason>,
+    HashSet<(ProgramPointId, u32)>,
+) {
     let procedure = snapshot.procedure();
     let mut reasons = Vec::new();
     let mut scoped_event_keys = HashSet::new();

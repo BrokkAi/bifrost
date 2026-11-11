@@ -17,7 +17,7 @@ Bifrost uses only standard MCP metadata for tool discovery. It does not provide 
 
 The initialize result contains routing instructions for the tools selected at startup. The first 512 characters contain the general routing guidance.
 
-Each tool has a name, a description, an input schema, and annotations. Up to nine tools also publish a JSON Schema 2020-12 `outputSchema` for their `structuredContent`. The count depends on the toolsets and mode. Every tool is annotated `readOnlyHint: true`, except `refresh` and `activate_workspace`. Server instructions and tool descriptions contain no more than 2,000 characters.
+Each tool has a name, a description, an input schema, and annotations. Up to fourteen tools also publish a JSON Schema 2020-12 `outputSchema` for their `structuredContent`. The count depends on the toolsets and mode. Every tool is annotated `readOnlyHint: true`, except `refresh` and `activate_workspace`. Server instructions and tool descriptions contain no more than 2,000 characters.
 
 The `initialize` result carries the exact build identity of the binary in `_meta["io.bifrost/build-identity"]`. The server publishes one resource, `bifrost://agent-guidance/agents.md`; see [Agent Instructions](/agents/).
 

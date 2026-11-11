@@ -309,7 +309,9 @@ impl FieldStoreSurvey {
 impl FieldSlotIndex {
     // Bump when the language-neutral field-slot algorithm changes.
     // #8385: semantic read digests omit source positions; old stored checksums miss.
-    const ALGORITHM_VERSION: u32 = 31;
+    // #10539: the dynamic-store survey's value-flow solve joins one event's
+    // alternatives instead of killing them.
+    const ALGORITHM_VERSION: u32 = 32;
     // Bump only when the persisted row encoding changes.
     const REPRESENTATION_VERSION: u32 = 2;
 
@@ -369,6 +371,10 @@ impl FieldSlotIndex {
         let (acquisition, _) = cache.complete.acquire(&memory_key, cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
+                debug_assert!(
+                    !AnalyzerQueryScope::is_taint_output_receipt_capture_active(),
+                    "#7262/#8880: FieldSlotIndex memory hit during taint Output receipt capture"
+                );
                 let mut staged_budget = semantic_budget.clone();
                 if value.replay_mounted_artifacts(&mut staged_budget, cancellation) {
                     *semantic_budget = staged_budget;
@@ -3029,7 +3035,7 @@ mod tests {
             )
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig {
-            memo_cache_budget_bytes: Some(0),
+            retention_budget_bytes: Some(0),
             ..AnalyzerConfig::default()
         });
         let adapter = BlockingTypeFlowAdapter::python().without_hierarchy_block();
@@ -4455,6 +4461,46 @@ mod tests {
         let mut replayed = artifact_census(&warm.index);
         replayed.nested_entries += warm.index.mounted_artifacts.len();
         assert_eq!(warm_budget.used(), replayed);
+    }
+
+    /// The tripwire is a `debug_assert!`, so builds without debug assertions
+    /// (`--profile measure`, `--release`) never panic here.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(
+        expected = "#7262/#8880: FieldSlotIndex memory hit during taint Output receipt capture"
+    )]
+    fn taint_output_receipt_rejects_field_slot_memory_hit() {
+        let project = field_slot_project();
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted workspace builds");
+        let adapter = type_flow_adapter(Language::Python).expect("Python type-flow adapter");
+        let cache = FieldSlotIndexCache::default();
+        let cancellation = crate::analyzer::semantic::CancellationToken::new();
+        let cold = acquire(
+            &workspace,
+            adapter,
+            &cache,
+            &mut SemanticBudget::default(),
+            &cancellation,
+        )
+        .expect("cold index builds");
+        assert_eq!(cold.kind, FieldSlotIndexAcquisitionKind::Built);
+        let _capture = AnalyzerQueryScope::capturing_taint_output_receipt(workspace.analyzer());
+        brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(
+            workspace.analyzer(),
+            || {
+                acquire(
+                    &workspace,
+                    adapter,
+                    &cache,
+                    &mut SemanticBudget::default(),
+                    &cancellation,
+                )
+                .expect("warm index lookup");
+            },
+        );
     }
 
     #[test]

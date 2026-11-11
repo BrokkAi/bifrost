@@ -13,12 +13,14 @@ mod clones;
 #[doc(hidden)]
 pub mod constant_identity;
 mod dependency_discovery;
+pub mod dependency_evidence;
 pub(crate) mod diagnostics;
 mod external;
 mod gem_artifact;
 mod hierarchy;
 mod imports;
 mod mixins;
+mod mutation_facts;
 mod rbs_artifact;
 mod semantic;
 mod source_artifact;
@@ -127,8 +129,6 @@ use brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem;
 
 use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
 
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set;
-
 use brokk_bifrost_core::analyzer::weighted_cache::weight_project_file_set;
 
 use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
@@ -207,6 +207,7 @@ type AuthorityCell<T> =
     Arc<WorkspaceAuthorityMemo<brokk_bifrost_analysis::analyzer::common::QueryCacheCell<T>>>;
 type ReverseImports = HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>;
 type AutoloadConstantFiles = HashMap<String, HashSet<ProjectFile>>;
+type SingletonMutationMemo = Cache<(Box<str>, Box<str>), bool>;
 type AuthorityWithFiles<M> = Arc<WorkspaceAuthorityMemo<(M, Cache<(), Arc<[ReadKey]>>)>>;
 
 fn weight_load_authority_files(_key: &(), files: &Arc<[ReadKey]>) -> u32 {
@@ -222,7 +223,10 @@ fn weight_load_authority_files(_key: &(), files: &Arc<[ReadKey]>) -> u32 {
 pub struct RubyAnalyzer {
     inner: TreeSitterAnalyzer<RubyAdapter>,
     memo_budget: u64,
-    imported_code_units: BoundedMemo<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    imported_code_units: BoundedMemo<
+        ProjectFile,
+        Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
+    >,
     referencing_files: BoundedMemo<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: BoundedMemo<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// Byte-bounded outcomes and read receipts, separated by test-filter
@@ -244,6 +248,9 @@ pub struct RubyAnalyzer {
     /// resolving relative (unqualified) supertype references without scanning
     /// every declaration.
     types_by_identifier: AuthorityCell<Arc<HashMap<String, Vec<CodeUnit>>>>,
+    /// Workspace scans for rewrites of a model-declared singleton method,
+    /// keyed by owner constant path and member name (#9336).
+    singleton_member_mutation_free: Arc<WorkspaceAuthorityMemo<SingletonMutationMemo>>,
 }
 
 brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::impl_forward_query_provider!(
@@ -251,6 +258,33 @@ brokk_bifrost_analysis::analyzer::analyzer_definition_lookup::impl_forward_query
 );
 
 impl RubyAnalyzer {
+    /// Whether no workspace Ruby file can replace the singleton method
+    /// `member` of the model-declared constant `owner`, memoized per snapshot.
+    /// A cancelled scan answers open and is not memoized.
+    pub(crate) fn external_singleton_mutation_free(
+        &self,
+        owner: &str,
+        member: &str,
+        keep_going: &dyn Fn() -> bool,
+    ) -> bool {
+        self.singleton_member_mutation_free.read(
+            &memo_attribution(self),
+            |memo| {
+                memo.optionally_get_with((owner.into(), member.into()), || {
+                    mutation_facts::singleton_member_mutation_free(
+                        self,
+                        owner,
+                        member,
+                        mutation_facts::SINGLETON_MUTATION_MAX_NODES,
+                        keep_going,
+                    )
+                })
+                .unwrap_or(false)
+            },
+            |answer| mutation_facts::singleton_inputs(owner, member, *answer),
+        )
+    }
+
     fn authority_inputs(&self) -> AuthorityInputs<'static> {
         self.authority_inputs_with(&[])
     }
@@ -285,10 +319,12 @@ impl RubyAnalyzer {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         TreeSitterAnalyzer::wrap_with_config(
             config,
@@ -324,7 +360,10 @@ impl RubyAnalyzer {
             memo_budget,
             imported_code_units: Arc::new(ReplayingMemo::new(build_weighted_cache(
                 memo_budget / 4,
-                |_key, entry: &MemoEntry<Arc<HashSet<CodeUnit>>>| {
+                |_key,
+                 entry: &MemoEntry<
+                    Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
+                >| {
                     u32::try_from(entry.retained_bytes(|key| {
                         let mut heap = RetainedHeap::default();
                         retained_read_key(&mut heap, key);
@@ -408,9 +447,14 @@ impl RubyAnalyzer {
                 WorkspaceFactFamily::RubyTypesByIdentifier,
                 brokk_bifrost_analysis::analyzer::common::QueryCacheCell::new(),
             )),
+            singleton_member_mutation_free: Arc::new(WorkspaceAuthorityMemo::new(
+                WorkspaceFactFamily::RubySingletonMemberMutation,
+                Cache::builder().max_capacity(4_096).build(),
+            )),
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
@@ -744,6 +788,25 @@ impl CodeUnitIndex for RubyAnalyzer {
 impl IAnalyzer for RubyAnalyzer {
     brokk_bifrost_analysis::forward_query_read_ledger!();
 
+    fn dependency_file_evidence(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence,
+    > {
+        self.inner.dependency_file_evidence()
+    }
+
+    fn dependency_file_locations(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(
+            String,
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        self.inner.dependency_file_locations()
+    }
+
     brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::delegate_inner_procedure_fact_methods!();
 
     brokk_bifrost_analysis::analyzer::i_analyzer::forward_relational_definition_batch!();
@@ -825,9 +888,16 @@ impl IAnalyzer for RubyAnalyzer {
         fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+            Self::from_inner(
+                self.inner.update_with_listing(changed_files, listing),
+                self.memo_budget,
+            )
         })
     }
 
@@ -1008,6 +1078,40 @@ static RUBY_USAGE_STRATEGY: RubyUsageGraphStrategy = RubyUsageGraphStrategy::new
 pub struct RubySupport;
 
 impl LanguageSupport for RubySupport {
+    fn identity_transparent_wrapper_kinds(&self) -> &'static [&'static str] {
+        &["parenthesized_statements"]
+    }
+
+    fn branch_current_object_fields(
+        &self,
+    ) -> Option<
+        brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchCurrentObjectFields,
+    > {
+        Some(brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchCurrentObjectFields {
+            access_kind: "call",
+            receiver_field: "receiver",
+            member_field: "method",
+            current_kind: "self",
+            parent_kind: "super",
+            invocation_kind: "NONE",
+            invocation_target_field: "NONE",
+            storage_ancestors: &[],
+        })
+    }
+
+    fn policy_lowering_identity(
+        &self,
+        _models: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer::identity(
+                &semantic::RubySemanticLowerer,
+            ),
+        )
+    }
+
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -1052,6 +1156,45 @@ impl LanguageSupport for RubySupport {
                 )?,
             ),
         )
+    }
+
+    fn workspace_module_member_mutation_free(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        module: &str,
+        member: &str,
+        max_nodes: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<bool> {
+        mutation_facts::singleton_member_mutation_free(
+            analyzer, module, member, max_nodes, keep_going,
+        )
+    }
+
+    fn workspace_fact_answer(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        family: WorkspaceFactFamily,
+        language: Language,
+        subject: &brokk_bifrost_analysis::analyzer::FactSubject,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest> {
+        match (family, language, subject) {
+            (
+                WorkspaceFactFamily::RubySingletonMemberMutation,
+                Language::Ruby,
+                brokk_bifrost_analysis::analyzer::FactSubject::NamedMember { owner, member },
+            ) => Some(mutation_facts::answer_digest(
+                mutation_facts::singleton_member_mutation_free(
+                    analyzer,
+                    owner,
+                    member,
+                    mutation_facts::SINGLETON_MUTATION_MAX_NODES,
+                    &|| true,
+                )
+                .unwrap_or(false),
+            )),
+            _ => None,
+        }
     }
 
     fn procedure_syntax_roles(
@@ -1381,8 +1524,9 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for Ruby
     fn update(
         &self,
         changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
-        Box::new(IAnalyzer::update(self, changed_files))
+        Box::new(IAnalyzer::update_with_listing(self, changed_files, listing))
     }
 
     fn update_all_with_progress(
@@ -1427,6 +1571,10 @@ mod dependency_packs {
     pub(crate) struct RubyDependencyResolver;
 
     impl DependencyResolver for RubyDependencyResolver {
+        fn is_discovery_candidate(&self, rel_path: &std::path::Path) -> bool {
+            super::dependency_evidence::is_ruby_dependency_input(rel_path)
+        }
+
         fn adapter(&self) -> &'static dyn DependencyPackAdapter {
             &RubyDependencyPackAdapter
         }
@@ -1443,6 +1591,7 @@ mod dependency_packs {
             &self,
             config: &AnalyzerConfig,
             project: &dyn Project,
+            _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -1451,4 +1600,51 @@ mod dependency_packs {
     }
 }
 
-impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RubySupport {}
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for RubySupport {
+    /// Gemfiles, lockfiles, gemspecs and runtime pins feed static dependency
+    /// evidence, so each revision retains their exact bytes.
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        dependency_evidence::is_ruby_dependency_input(path)
+    }
+
+    /// Runtime pins apply from a bundle's directory upward and are often
+    /// dotfiles a listing omits.
+    fn include_native_metadata_paths(
+        &self,
+        project: &dyn brokk_bifrost_analysis::analyzer::Project,
+        _files: &std::collections::BTreeSet<ProjectFile>,
+        inputs: &mut std::collections::BTreeSet<ProjectFile>,
+    ) -> std::io::Result<()> {
+        use brokk_bifrost_analysis::analyzer::store::workspace_inputs::metadata_ancestor_directories;
+        let directories = metadata_ancestor_directories(
+            inputs
+                .iter()
+                .filter(|file| dependency_evidence::is_ruby_bundle_input(file.rel_path())),
+        );
+        for directory in directories {
+            for name in [".ruby-version", ".tool-versions"] {
+                if let Some(file) = project.file_by_rel_path(&directory.join(name)) {
+                    inputs.insert(file);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        let selected = selected
+            .iter()
+            .map(|(file, source, _)| (file.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        dependency_evidence::collect_ruby_dependency_evidence(&selected, limits)
+    }
+}

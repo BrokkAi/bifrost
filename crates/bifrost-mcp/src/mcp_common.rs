@@ -325,7 +325,12 @@ fn mcp_analyzer_request_budget_secs(value: Option<String>) -> Result<Option<u64>
 
 pub(crate) fn request_correlation_id(id: &Value) -> String {
     let encoded = serde_json::to_string(id).expect("JSON-RPC request IDs always serialize");
-    format!("sha256:{:x}", Sha256::digest(encoded.as_bytes()))
+    format!(
+        "sha256:{}",
+        brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(encoded.as_bytes()).into()
+        )
+    )
 }
 
 pub fn build_server_spec_with_hidden(

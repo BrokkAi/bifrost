@@ -169,10 +169,11 @@ impl<'a> GoOverlayPackages<'a> {
         let overlay = self.overlay?;
         let mut selected = None;
         for qualified_name in qualified_names {
-            let matched = overlay.symbols_named(qualified_name);
+            let matched = overlay.symbols_named_for(qualified_name, "go");
             match matched.disposition {
                 SemanticModelOverlayDisposition::Empty => {}
-                SemanticModelOverlayDisposition::Conflict => return None,
+                SemanticModelOverlayDisposition::Conflict
+                | SemanticModelOverlayDisposition::Open(_) => return None,
                 SemanticModelOverlayDisposition::Unique => {
                     let candidate = matched
                         .unique()
@@ -194,7 +195,9 @@ impl<'a> GoOverlayPackages<'a> {
     /// unique: the overlay marks it `Conflict` and this returns `None`, so
     /// neither navigation nor a diagnostic picks an arbitrary winner.
     pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
-        self.overlay?.symbols_named(qualified_name).unique()
+        self.overlay?
+            .symbols_named_in_family(qualified_name, "go")
+            .unique()
     }
 
     /// The unique symbol a Go reference may resolve to: one visible, public Go
@@ -290,7 +293,7 @@ impl<'a> GoOverlayPackages<'a> {
             .iter()
             .any(|candidate| {
                 overlay
-                    .symbols_named(candidate)
+                    .symbols_named_for(candidate, "go")
                     .records
                     .iter()
                     .any(|symbol| symbol.language == "go")
@@ -341,7 +344,7 @@ impl<'a> GoOverlayPackages<'a> {
         let overlay = self.overlay?;
         let symbols = Self::member_candidates(import_path, member)
             .iter()
-            .flat_map(|candidate| overlay.symbols_named(candidate).records)
+            .flat_map(|candidate| overlay.symbols_named_for(candidate, "go").records)
             .filter(|symbol| symbol.language == "go")
             .collect::<Vec<_>>();
         let [symbol] = symbols.as_slice() else {

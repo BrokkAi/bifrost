@@ -26,8 +26,9 @@ use crate::scala::wildcard_imports::scala_import_path;
 use crate::scala::{scala_nested_type_candidates, scala_short_name_terminal_segment};
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::usages::accumulator::{UsageAccumulator, UsageFlow};
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, classify_recursive_hit, external_usage_hit_count, usage_hit,
+    SNIPPET_CONTEXT_LINES, classify_recursive_hit, usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{ClassRangeIndex, UsageReferenceKind};
 use brokk_bifrost_core::analyzer::usages::model::{UsageHit, UsageHitKind};
@@ -758,7 +759,8 @@ pub struct ScalaQueryHitSink<'a> {
     pub catalog: &'a ScalaQueryTargetCatalog,
     pub eligibility: &'a ScalaFileEligibility,
     pub hits: &'a mut [BTreeSet<UsageHit>],
-    pub observed_hits: &'a mut BTreeSet<UsageHit>,
+    /// Every external-surface hit across targets, against the callsite budget.
+    pub observed: &'a mut UsageAccumulator,
     /// Foreign-target scans (#1859) report receiver references they cannot
     /// type here instead of dropping them; Scala-target scans leave this
     /// `None` and keep dropping unproven names.
@@ -766,8 +768,6 @@ pub struct ScalaQueryHitSink<'a> {
     pub enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
     pub relevant_names: HashSet<String>,
     pub allow_all_names: bool,
-    pub max_usages: usize,
-    pub limit_exceeded: bool,
 }
 
 impl ScalaQueryHitSink<'_> {
@@ -1004,7 +1004,7 @@ impl ScalaQueryHitSink<'_> {
             // A reference inside a *callable* target's own declaration is a
             // recursive call (#1638). It is recorded as a `SelfReceiver` hit,
             // which the editor surface lists and the external usage surface
-            // omits, and it stays out of `observed_hits` so the callsite budget
+            // omits, and it stays out of `observed` so the callsite budget
             // still counts only references from elsewhere. Inside any other
             // target's own declaration the shared classifier keeps initializer
             // value reads and excludes declaration names.
@@ -1028,12 +1028,11 @@ impl ScalaQueryHitSink<'_> {
             let Some(target_hit) = target_hit else {
                 continue;
             };
-            if self.hits[target_id].insert(target_hit.clone()) && !recursive {
-                self.observed_hits.insert(target_hit);
-                if external_usage_hit_count(self.observed_hits) > self.max_usages {
-                    self.limit_exceeded = true;
-                    break;
-                }
+            if self.hits[target_id].insert(target_hit.clone())
+                && !recursive
+                && self.observed.insert_hit(target_hit) == UsageFlow::LimitReached
+            {
+                break;
             }
         }
     }
@@ -1227,7 +1226,7 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
     }
 
     fn should_stop(&self) -> bool {
-        self.limit_exceeded
+        self.observed.limit_reached()
     }
 
     fn record_import_name(

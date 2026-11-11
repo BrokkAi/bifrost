@@ -9,7 +9,7 @@ use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationScalarKind, ConfigurationSourceRange, classify_configuration_path,
 };
 use quick_xml::Reader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesRef, BytesStart, Event};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
@@ -25,8 +25,9 @@ use tree_sitter::{Language, Node, Parser, Tree};
 const JSON_ADAPTER_SCHEMA_VERSION: u32 = 4;
 const PROPERTIES_ADAPTER_SCHEMA_VERSION: u32 = 1;
 const TOML_ADAPTER_SCHEMA_VERSION: u32 = 1;
-const XML_ADAPTER_SCHEMA_VERSION: u32 = 1;
+const XML_ADAPTER_SCHEMA_VERSION: u32 = 2;
 const YAML_ADAPTER_SCHEMA_VERSION: u32 = 1;
+const HOCON_ADAPTER_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigurationIngestionOutcome {
@@ -75,14 +76,7 @@ pub fn ingest_configuration_document(path: &Path, bytes: &[u8]) -> Configuration
         ConfigurationFormat::Toml => ingest_toml,
         ConfigurationFormat::Xml => ingest_xml,
         ConfigurationFormat::Yaml => ingest_yaml,
-        // No maintained HOCON parser reports source ranges, and every fact
-        // carries exact evidence, so HOCON documents are discovered but not
-        // read.
-        ConfigurationFormat::Hocon => {
-            return ConfigurationIngestionOutcome::Unsupported {
-                format: Some(format),
-            };
-        }
+        ConfigurationFormat::Hocon => ingest_hocon,
     };
     let Ok(source) = std::str::from_utf8(bytes) else {
         return ConfigurationIngestionOutcome::Incomplete {
@@ -96,13 +90,97 @@ pub fn ingest_configuration_document(path: &Path, bytes: &[u8]) -> Configuration
     }
 }
 
+/// One step of a member or element route in a configuration document.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DocumentRouteStep {
+    Key(String),
+    Index(usize),
+}
+
+/// Exact spans of every object member and sequence element of one clean
+/// configuration document, keyed by route. A dependency producer reads values
+/// with a maintained decoder and cites each one through these spans; the map
+/// lives no longer than the one document it describes.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentSpans(
+    std::collections::BTreeMap<Vec<DocumentRouteStep>, ConfigurationSourceRange>,
+);
+
+impl DocumentSpans {
+    /// Spans of `facts`. A repeated key is an error, because a decoder keeps
+    /// the last value while the span would cite another member.
+    pub fn from_facts(facts: &ConfigurationDocumentFacts) -> Result<Self, String> {
+        let mut spans = std::collections::BTreeMap::new();
+        for fact in facts.facts() {
+            let segments = fact.route().segments();
+            let member = matches!(fact.kind(), ConfigurationNodeKind::Member { .. });
+            let element = segments.last().is_some_and(|segment| {
+                matches!(segment.selector(), ConfigurationRouteSelector::Index(_))
+            });
+            if !member && !element {
+                continue;
+            }
+            let route = segments
+                .iter()
+                .map(|segment| match segment.selector() {
+                    ConfigurationRouteSelector::Key { occurrence, .. } if *occurrence > 1 => {
+                        Err("duplicate mapping key".to_owned())
+                    }
+                    ConfigurationRouteSelector::Key { name, .. } => {
+                        Ok(DocumentRouteStep::Key(name.clone()))
+                    }
+                    ConfigurationRouteSelector::Index(index) => {
+                        Ok(DocumentRouteStep::Index(*index))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            spans.insert(route, fact.evidence());
+        }
+        Ok(Self(spans))
+    }
+
+    pub fn get(&self, route: &[DocumentRouteStep]) -> Option<ConfigurationSourceRange> {
+        self.0.get(route).copied()
+    }
+
+    /// The span of the member reached through object keys alone.
+    pub fn member(&self, keys: &[&str]) -> Option<ConfigurationSourceRange> {
+        self.get(
+            &keys
+                .iter()
+                .map(|key| DocumentRouteStep::Key((*key).to_owned()))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+/// Decode one JSON document with `serde_json` for its values and with the
+/// configuration ingester for exact member and element spans. `path` selects
+/// the parser, so a JSON file without a `.json` name passes a `.json` path.
+pub fn decode_json_document(
+    path: &Path,
+    text: &str,
+) -> Result<(serde_json::Value, DocumentSpans), String> {
+    let facts = match ingest_configuration_document(path, text.as_bytes()) {
+        ConfigurationIngestionOutcome::Facts(facts) if facts.completeness().is_complete() => facts,
+        outcome => {
+            return Err(format!(
+                "JSON parser did not establish clean input: {outcome:?}"
+            ));
+        }
+    };
+    let spans = DocumentSpans::from_facts(&facts)?;
+    let value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    Ok((value, spans))
+}
+
 /// Cache compatibility identity for the TOML adapter and its pinned parser.
 pub fn toml_configuration_adapter_epoch() -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"bifrost-configuration-toml-adapter\n");
     hasher.update(TOML_ADAPTER_SCHEMA_VERSION.to_le_bytes());
     hasher.update(b"toml_edit-0.22.27");
-    format!("{:x}", hasher.finalize())
+    crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
 }
 
 pub fn xml_configuration_adapter_epoch() -> String {
@@ -110,7 +188,7 @@ pub fn xml_configuration_adapter_epoch() -> String {
     hasher.update(b"bifrost-configuration-xml-adapter\n");
     hasher.update(XML_ADAPTER_SCHEMA_VERSION.to_le_bytes());
     hasher.update(b"quick-xml-0.40.1");
-    format!("{:x}", hasher.finalize())
+    crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
 }
 
 fn raw_scalar_value<'a>(
@@ -162,7 +240,7 @@ pub fn decoded_xml_scalar_value(
             )
         });
     if is_element_text {
-        Some(quick_xml::escape::unescape(raw).ok()?.trim().to_string())
+        decode_xml_element_text(raw).map(|(text, _)| text)
     } else {
         // The fact already selected an attribute value. Delegate XML 1.0
         // sections 2.11 and 3.3.3 to the maintained reader: normalize literal
@@ -178,6 +256,53 @@ pub fn decoded_xml_scalar_value(
                 .into_owned(),
         )
     }
+}
+
+/// Decode one element-text evidence span as an XML content fragment and
+/// return the text with the number of bytes the reader consumed. The reader
+/// sees only `fragment`, so the work of one lookup is bounded by the scalar's
+/// own length and never by the size of the document that contains it.
+fn decode_xml_element_text(fragment: &str) -> Option<(String, usize)> {
+    let mut reader = Reader::from_str(fragment);
+    let mut decoded = String::new();
+    loop {
+        match reader.read_event().ok()? {
+            // XML 1.0 normalizes CRLF and a lone CR to LF in the document
+            // before parsing, CDATA included; a character reference to CR is
+            // not part of that input text and keeps its CR.
+            Event::Text(text) => decoded.push_str(&normalize_xml_line_ends(&text.decode().ok()?)),
+            Event::CData(cdata) => {
+                decoded.push_str(&normalize_xml_line_ends(&cdata.decode().ok()?));
+            }
+            Event::GeneralRef(reference) => decoded.push_str(&xml_reference_text(&reference)?),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Some((
+        decoded.trim().to_owned(),
+        usize::try_from(reader.buffer_position()).expect("a fragment offset fits in usize"),
+    ))
+}
+
+fn normalize_xml_line_ends(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Expand one XML reference: a character reference to a legal XML 1.0
+/// character, or one of the five predefined entities. Any other reference
+/// names a DTD entity this adapter does not resolve, and an illegal code
+/// point is not content, so both answer `None`.
+fn xml_reference_text(reference: &BytesRef<'_>) -> Option<String> {
+    if reference.is_char_ref() {
+        let character = reference.resolve_char_ref().ok().flatten()?;
+        return matches!(
+            character,
+            '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}'
+        )
+        .then(|| character.to_string());
+    }
+    quick_xml::escape::resolve_predefined_entity(&reference.decode().ok()?).map(str::to_owned)
 }
 
 /// Decode one authored Java-properties scalar after the maintained grammar has
@@ -201,7 +326,262 @@ pub fn decoded_json_scalar_value(
     fact_id: ConfigurationFactId,
 ) -> Option<String> {
     let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Json)?;
-    serde_json::from_str::<String>(raw).ok()
+    if matches!(
+        document.fact(fact_id)?.kind(),
+        ConfigurationNodeKind::Scalar {
+            scalar_kind: ConfigurationScalarKind::Integer | ConfigurationScalarKind::Decimal
+        }
+    ) {
+        return Some(raw.to_owned());
+    }
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    Some(match value {
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) | serde_json::Value::Null => {
+            raw.to_owned()
+        }
+        _ => return None,
+    })
+}
+
+/// Interpret only the TOML token already selected by the configuration fact.
+pub fn decoded_toml_scalar_value(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> Option<String> {
+    let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Toml)?;
+    let value = raw.parse::<toml_edit::Value>().ok()?;
+    match value {
+        toml_edit::Value::String(text) => Some(text.value().to_owned()),
+        toml_edit::Value::Boolean(_)
+        | toml_edit::Value::Integer(_)
+        | toml_edit::Value::Float(_)
+        | toml_edit::Value::Datetime(_) => Some(raw.to_owned()),
+        _ => None,
+    }
+}
+
+/// An exact base-ten configuration number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigurationNumber {
+    negative: bool,
+    digits: String,
+    exponent: i64,
+}
+
+/// How the configuration number grammar reads a token: an optional sign,
+/// decimal digits with an optional fraction, and an optional exponent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigurationNumberToken {
+    Number(ConfigurationNumber),
+    /// A decimal whose exponent does not fit an `i64`. It denotes a number
+    /// the comparison cannot represent, so an answer that needs it is
+    /// incomplete.
+    OutOfRange,
+    /// Not a decimal number.
+    NotDecimal,
+}
+
+impl ConfigurationNumber {
+    /// Read a decimal value selected by the format grammar, or a query bound.
+    pub fn parse(text: &str) -> Option<Self> {
+        match Self::read(text) {
+            ConfigurationNumberToken::Number(number) => Some(number),
+            ConfigurationNumberToken::OutOfRange | ConfigurationNumberToken::NotDecimal => None,
+        }
+    }
+
+    /// [`Self::parse`], telling an out-of-range decimal from a non-number.
+    /// Nothing expands an exponent (comparison works on digit counts), so
+    /// any exponent that fits an `i64` is read exactly.
+    pub fn read(text: &str) -> ConfigurationNumberToken {
+        let (negative, text) = if let Some(rest) = text.strip_prefix('-') {
+            (true, rest)
+        } else {
+            (false, text.strip_prefix('+').unwrap_or(text))
+        };
+        let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+            Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+            None => (text, None),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if whole.is_empty() && fraction.is_empty() {
+            return ConfigurationNumberToken::NotDecimal;
+        }
+        if !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+        {
+            return ConfigurationNumberToken::NotDecimal;
+        }
+        let exponent = match exponent {
+            None => 0,
+            Some(exponent) => {
+                let unsigned = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+                if unsigned.is_empty() || !unsigned.bytes().all(|b| b.is_ascii_digit()) {
+                    return ConfigurationNumberToken::NotDecimal;
+                }
+                let Ok(exponent) = exponent.parse::<i64>() else {
+                    return ConfigurationNumberToken::OutOfRange;
+                };
+                exponent
+            }
+        };
+        let digits = format!("{whole}{fraction}");
+        let digits = digits.trim_start_matches('0');
+        if digits.is_empty() {
+            return ConfigurationNumberToken::Number(Self {
+                negative: false,
+                digits: "0".into(),
+                exponent: 0,
+            });
+        }
+        let normalized = digits.trim_end_matches('0');
+        let exponent = i64::try_from(fraction.len())
+            .ok()
+            .and_then(|fraction| exponent.checked_sub(fraction))
+            .and_then(|exponent| {
+                i64::try_from(digits.len() - normalized.len())
+                    .ok()
+                    .and_then(|trailing| exponent.checked_add(trailing))
+            });
+        let Some(exponent) = exponent else {
+            return ConfigurationNumberToken::OutOfRange;
+        };
+        ConfigurationNumberToken::Number(Self {
+            negative,
+            exponent,
+            digits: normalized.into(),
+        })
+    }
+
+    /// Compare normalized magnitudes without expanding powers of ten.
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self.negative != other.negative {
+            return other.negative.cmp(&self.negative);
+        }
+        let magnitude = if self.digits == "0" || other.digits == "0" {
+            (self.digits != "0").cmp(&(other.digits != "0"))
+        } else {
+            let left = self.digits.len() as i128 + i128::from(self.exponent);
+            let right = other.digits.len() as i128 + i128::from(other.exponent);
+            left.cmp(&right).then_with(|| {
+                let width = self.digits.len().max(other.digits.len());
+                self.digits
+                    .bytes()
+                    .chain(std::iter::repeat(b'0'))
+                    .take(width)
+                    .cmp(
+                        other
+                            .digits
+                            .bytes()
+                            .chain(std::iter::repeat(b'0'))
+                            .take(width),
+                    )
+            })
+        };
+        if self.negative && magnitude != Ordering::Equal {
+            magnitude.reverse()
+        } else {
+            magnitude
+        }
+    }
+}
+
+/// The number the format's own parser reports for one scalar: TOML integers
+/// (hexadecimal, octal, binary and underscore spellings included) and
+/// floats, JSON and HOCON numbers, and YAML numbers. A scalar the parser
+/// reads as a string, boolean, null, date or time has none, and so do XML
+/// and properties scalars, which are text. `NotDecimal` means the format reads
+/// no number here; the caller may still read a decimal spelling in the
+/// decoded text.
+pub fn parsed_scalar_number(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> ConfigurationNumberToken {
+    use ConfigurationNumberToken::NotDecimal;
+    let format = document.format();
+    let Some(raw) = (match format {
+        ConfigurationFormat::Json
+        | ConfigurationFormat::Yaml
+        | ConfigurationFormat::Toml
+        | ConfigurationFormat::Hocon => raw_scalar_value(document, source, fact_id, format),
+        ConfigurationFormat::Xml | ConfigurationFormat::Properties => None,
+    }) else {
+        return NotDecimal;
+    };
+    match format {
+        ConfigurationFormat::Json => ConfigurationNumber::read(raw),
+        ConfigurationFormat::Yaml => {
+            let number = match serde_saphyr::from_str::<serde_json::Value>(raw) {
+                Ok(value) => match tagged_yaml_scalar(raw) {
+                    TaggedYamlScalar::NoScalar => exact_yaml_number(raw, &value),
+                    TaggedYamlScalar::Untagged(token) | TaggedYamlScalar::OtherTag(token) => {
+                        exact_yaml_number(&token, &value)
+                    }
+                    TaggedYamlScalar::Core(token, value) => exact_yaml_number(&token, &value),
+                    TaggedYamlScalar::Invalid => NotDecimal,
+                },
+                // A number `serde_saphyr` cannot represent (`1e5000`) is read
+                // from its decoded text by the caller.
+                Err(_) => match tagged_yaml_scalar(raw) {
+                    TaggedYamlScalar::Core(token, value) => exact_yaml_number(&token, &value),
+                    TaggedYamlScalar::NoScalar
+                    | TaggedYamlScalar::Untagged(_)
+                    | TaggedYamlScalar::OtherTag(_)
+                    | TaggedYamlScalar::Invalid => NotDecimal,
+                },
+            };
+            // An infinity or NaN is a number no comparison here represents.
+            if number == NotDecimal && yaml_scalar_is_non_finite_float(raw) {
+                ConfigurationNumberToken::OutOfRange
+            } else {
+                number
+            }
+        }
+        ConfigurationFormat::Toml => match raw.parse::<toml_edit::Value>() {
+            Ok(toml_edit::Value::Integer(integer)) => {
+                ConfigurationNumber::read(&integer.value().to_string())
+            }
+            // `inf` and `nan` are numbers no exact comparison represents.
+            Ok(toml_edit::Value::Float(float)) if !float.value().is_finite() => {
+                ConfigurationNumberToken::OutOfRange
+            }
+            // The TOML parser accepted this float token; its underscores
+            // separate digits.
+            Ok(toml_edit::Value::Float(_)) => ConfigurationNumber::read(&raw.replace('_', "")),
+            _ => NotDecimal,
+        },
+        // The HOCON grammar reads a number token only when the whole scalar
+        // is one JSON number; a concatenation such as `10 s` is a string.
+        ConfigurationFormat::Hocon => match document.fact(fact_id).map(ConfigurationFact::kind) {
+            Some(ConfigurationNodeKind::Scalar {
+                scalar_kind: ConfigurationScalarKind::Integer | ConfigurationScalarKind::Decimal,
+            }) => ConfigurationNumber::read(raw),
+            _ => NotDecimal,
+        },
+        ConfigurationFormat::Xml | ConfigurationFormat::Properties => {
+            unreachable!("XML and properties scalars have no format number")
+        }
+    }
+}
+
+/// Preserve decimal token precision; non-decimal YAML integers use the
+/// format parser's integer conversion.
+fn exact_yaml_number(token: &str, value: &serde_json::Value) -> ConfigurationNumberToken {
+    let serde_json::Value::Number(number) = value else {
+        return ConfigurationNumberToken::NotDecimal;
+    };
+    match ConfigurationNumber::read(token.trim()) {
+        ConfigurationNumberToken::NotDecimal if !number.is_f64() => {
+            ConfigurationNumber::read(&number.to_string())
+        }
+        read => read,
+    }
 }
 
 /// Decode a YAML string scalar after the maintained grammar has selected its
@@ -214,7 +594,131 @@ pub fn decoded_yaml_scalar_value(
     fact_id: ConfigurationFactId,
 ) -> Option<String> {
     let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Yaml)?;
-    serde_saphyr::from_str::<String>(raw).ok()
+    if let Ok(text) = serde_saphyr::from_str::<String>(raw) {
+        return Some(text);
+    }
+    // A null, boolean or number that the string decoder rejects (`null`,
+    // `~`, an empty value, or a scalar with a core-schema tag) is still a
+    // known scalar, so its decoded text is its own token, without the anchor
+    // or tag the fact's evidence can include (`&a null` decodes to `null`).
+    // Only a scalar the YAML decoder itself rejects stays undecodable.
+    match serde_saphyr::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_)) => {
+            match tagged_yaml_scalar(raw) {
+                TaggedYamlScalar::NoScalar => Some(raw.trim().to_owned()),
+                TaggedYamlScalar::Untagged(token)
+                | TaggedYamlScalar::OtherTag(token)
+                | TaggedYamlScalar::Core(token, _) => Some(token),
+                // `!!null not-null` decodes to null whatever its token says.
+                TaggedYamlScalar::Invalid => None,
+            }
+        }
+        Ok(
+            serde_json::Value::String(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_),
+        ) => None,
+        Err(_) => match tagged_yaml_scalar(raw) {
+            TaggedYamlScalar::Core(token, _) => Some(token),
+            // A plain decimal `serde_saphyr` cannot represent (`1e5000`) is
+            // still a number; its token is its text, and numeric bounds read
+            // that exactly.
+            TaggedYamlScalar::Untagged(token)
+                if ConfigurationNumber::read(&token) != ConfigurationNumberToken::NotDecimal =>
+            {
+                Some(token)
+            }
+            TaggedYamlScalar::NoScalar
+            | TaggedYamlScalar::Untagged(_)
+            | TaggedYamlScalar::OtherTag(_)
+            | TaggedYamlScalar::Invalid => None,
+        },
+    }
+}
+
+/// How a YAML scalar's tag decides its value. `serde_saphyr` reads
+/// `!!int 42` into neither text nor a JSON value, so its YAML event parser
+/// supplies the scalar's own escape-processed token, without any anchor or
+/// tag, and its resolved tag.
+enum TaggedYamlScalar {
+    /// The parser reports no scalar: an empty document or an alias.
+    NoScalar,
+    /// No tag: the scalar's token.
+    Untagged(String),
+    /// A tag outside the core schema's int, float, bool and null: the
+    /// scalar's token.
+    OtherTag(String),
+    /// A core-schema int, float, bool or null tag whose token, decoded
+    /// untagged, is a value of that type: the token and its value.
+    Core(String, serde_json::Value),
+    /// A core-schema tag whose token is not of the tagged type: `!!int abc`,
+    /// `!!int 4.5`, `!!float 0x2A` or `!!null not-null`.
+    Invalid,
+}
+
+/// Whether a YAML float token is an infinity or NaN (`.inf`, `-.inf`, `.nan`).
+fn yaml_float_is_non_finite(token: &str) -> bool {
+    serde_saphyr::from_str::<f64>(token).is_ok_and(|number| !number.is_finite())
+}
+
+/// Whether a YAML scalar is a core-schema infinity or NaN: a plain untagged
+/// token or a `!!float` one. `serde_saphyr` reads a plain `.inf` as the
+/// string ".inf", so without this a numeric bound would treat it as no number
+/// at all; a quoted '.inf' stays a string.
+fn yaml_scalar_is_non_finite_float(raw: &str) -> bool {
+    use serde_saphyr::granit_parser::{Event, Parser, ScalarStyle};
+    Parser::new_from_str(raw)
+        .find_map(|event| match event.ok()?.0 {
+            Event::Scalar(token, style, _, tag) => Some((token, style, tag)),
+            _ => None,
+        })
+        .is_some_and(|(token, style, tag)| {
+            let float = match tag {
+                None => style == ScalarStyle::Plain,
+                Some(tag) => format!("{}{}", tag.handle, tag.suffix) == "tag:yaml.org,2002:float",
+            };
+            float && yaml_float_is_non_finite(&token)
+        })
+}
+
+fn tagged_yaml_scalar(raw: &str) -> TaggedYamlScalar {
+    use serde_saphyr::granit_parser::{Event, Parser};
+    let Some((token, tag)) = Parser::new_from_str(raw).find_map(|event| match event.ok()?.0 {
+        Event::Scalar(token, _, _, tag) => Some((token.into_owned(), tag)),
+        _ => None,
+    }) else {
+        return TaggedYamlScalar::NoScalar;
+    };
+    let Some(tag) = tag else {
+        return TaggedYamlScalar::Untagged(token);
+    };
+    let resolved = format!("{}{}", tag.handle, tag.suffix);
+    let Some(kind @ ("int" | "float" | "bool" | "null")) =
+        resolved.strip_prefix("tag:yaml.org,2002:")
+    else {
+        return TaggedYamlScalar::OtherTag(token);
+    };
+    let Ok(value) = serde_saphyr::from_str::<serde_json::Value>(&token) else {
+        return TaggedYamlScalar::Invalid;
+    };
+    let typed = match (kind, &value) {
+        ("int", serde_json::Value::Number(number)) => !number.is_f64(),
+        // The core schema's float forms are a decimal (any exponent) and the
+        // infinities and NaN; a hex integer is not one.
+        ("float", _) => {
+            !matches!(
+                ConfigurationNumber::read(token.trim()),
+                ConfigurationNumberToken::NotDecimal
+            ) || yaml_float_is_non_finite(&token)
+        }
+        ("bool", serde_json::Value::Bool(_)) | ("null", serde_json::Value::Null) => true,
+        _ => false,
+    };
+    if typed {
+        TaggedYamlScalar::Core(token, value)
+    } else {
+        TaggedYamlScalar::Invalid
+    }
 }
 
 fn decode_properties_value(raw: &str) -> String {
@@ -343,7 +847,7 @@ fn grammar_adapter_epoch(
         }
         hasher.update([0]);
     }
-    format!("{:x}", hasher.finalize())
+    crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
 }
 
 #[derive(Debug)]
@@ -1469,6 +1973,7 @@ struct XmlFrame {
     section: usize,
     route: ConfigurationRoute,
     occurrences: HashMap<String, usize>,
+    text_interrupted: bool,
 }
 
 fn ingest_xml(source: &str) -> Result<ConfigurationDocumentFacts, ConfigurationIngestionError> {
@@ -1502,16 +2007,24 @@ fn ingest_xml(source: &str) -> Result<ConfigurationDocumentFacts, ConfigurationI
         let end = (reader.buffer_position() as usize).min(source.len());
         let range = ConfigurationSourceRange::new(start.min(end), end).map_err(model_error)?;
         match event {
-            Event::Start(element) => add_xml_element(
-                source,
-                &element,
-                range,
-                &mut pending,
-                &mut stack,
-                &mut root_occurrences,
-                &mut recoveries,
-            )?,
+            Event::Start(element) => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.text_interrupted = true;
+                }
+                add_xml_element(
+                    source,
+                    &element,
+                    range,
+                    &mut pending,
+                    &mut stack,
+                    &mut root_occurrences,
+                    &mut recoveries,
+                )?;
+            }
             Event::Empty(element) => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.text_interrupted = true;
+                }
                 add_xml_element(
                     source,
                     &element,
@@ -1552,16 +2065,31 @@ fn ingest_xml(source: &str) -> Result<ConfigurationDocumentFacts, ConfigurationI
                         "XML CDATA could not be decoded".into(),
                     )
                 })?;
-                let content_range = borrowed_xml_range(source, &cdata)?;
+                // The span keeps the section markers: a span must read as a
+                // content fragment on its own, and CDATA content alone is not
+                // one (`a&b`, `<literal>`).
                 add_xml_text(
                     content.trim().is_empty(),
-                    content_range,
+                    range,
                     &stack,
                     &mut pending,
                     &mut recoveries,
                 )?;
             }
-            Event::DocType(_) | Event::GeneralRef(_) => {
+            Event::GeneralRef(reference) => {
+                // A reference is element content: it extends the scalar span
+                // so decoding sees it. Only a reference the decoder cannot
+                // expand (a DTD entity) leaves the document incomplete.
+                add_xml_text(false, range, &stack, &mut pending, &mut recoveries)?;
+                if xml_reference_text(&reference).is_none() {
+                    entity_evidence.push(range);
+                    recoveries.push(ConfigurationRecovery::new(
+                        ConfigurationRecoveryReason::UnsupportedScalar,
+                        range,
+                    ));
+                }
+            }
+            Event::DocType(_) => {
                 entity_evidence.push(range);
                 recoveries.push(ConfigurationRecovery::new(
                     ConfigurationRecoveryReason::UnsupportedScalar,
@@ -1747,6 +2275,7 @@ fn add_xml_element(
         section,
         route,
         occurrences: HashMap::new(),
+        text_interrupted: false,
     });
     Ok(())
 }
@@ -1793,10 +2322,22 @@ fn add_xml_text(
         }
     );
     if has_header {
-        recoveries.push(ConfigurationRecovery::new(
-            ConfigurationRecoveryReason::UnsupportedScalar,
-            range,
-        ));
+        if frame.text_interrupted {
+            recoveries.push(ConfigurationRecovery::new(
+                ConfigurationRecoveryReason::UnsupportedScalar,
+                range,
+            ));
+        } else if let PendingKind::Section {
+            header: Some(header),
+            ..
+        } = &pending[frame.section].kind
+        {
+            let header = *header;
+            let previous = pending[header].range;
+            pending[header].range =
+                ConfigurationSourceRange::new(previous.start_byte(), range.end_byte())
+                    .map_err(model_error)?;
+        }
         return Ok(());
     }
     let scalar = pending.len();
@@ -2551,6 +3092,482 @@ fn yaml_scalar_kind(content: Node<'_>) -> ConfigurationScalarKind {
     }
 }
 
+/// One HOCON subtree waiting to become a fact, walked with an explicit stack.
+struct HoconWork<'tree> {
+    node: HoconNode<'tree>,
+    parent: usize,
+    link: Link,
+    route: ConfigurationRoute,
+    range: ConfigurationSourceRange,
+}
+
+enum HoconNode<'tree> {
+    /// A braced `object`, or the `document` itself when the root braces are
+    /// omitted: both hold `field` and `include` children.
+    Object(Node<'tree>),
+    /// The member that path element `element` of `field` names. Its key
+    /// segment is already in the work item's route.
+    Member { field: Node<'tree>, element: usize },
+    /// The object that a dotted path implies after element `element - 1`:
+    /// `a.b = 1` authors member `a` whose value is an object holding `b`.
+    ImpliedObject { field: Node<'tree>, element: usize },
+    /// A `value` node: one piece, or several concatenated on one line.
+    Value(Node<'tree>),
+}
+
+/// Byte ranges of the HOCON constructs whose effect on the effective
+/// configuration this authored-fact layer leaves unresolved.
+#[derive(Default)]
+struct HoconFeatureEvidence {
+    includes: Vec<ConfigurationSourceRange>,
+    interpolation: Vec<ConfigurationSourceRange>,
+    format_merge: Vec<ConfigurationSourceRange>,
+}
+
+impl HoconFeatureEvidence {
+    fn into_semantics(self) -> ConfigurationFeatureSemantics {
+        fn state(mut evidence: Vec<ConfigurationSourceRange>) -> ConfigurationFeatureState {
+            if evidence.is_empty() {
+                ConfigurationFeatureState::NotApplicable
+            } else {
+                evidence.sort();
+                evidence.dedup();
+                ConfigurationFeatureState::Unresolved { evidence }
+            }
+        }
+        ConfigurationFeatureSemantics::new(
+            ConfigurationFeatureState::NotApplicable,
+            ConfigurationFeatureState::NotApplicable,
+            state(self.includes),
+            state(self.interpolation),
+            state(self.format_merge),
+            ConfigurationFeatureState::NotApplicable,
+        )
+    }
+}
+
+/// Cache compatibility identity for the HOCON adapter and its live grammar.
+pub fn hocon_configuration_adapter_epoch() -> String {
+    grammar_adapter_epoch(
+        b"bifrost-configuration-hocon-adapter\n",
+        HOCON_ADAPTER_SCHEMA_VERSION,
+        tree_sitter_hocon::GRAMMAR_VERSION.as_bytes(),
+        &tree_sitter_hocon::LANGUAGE.into(),
+    )
+}
+
+/// Ingest a Lightbend HOCON document through brokk-tree-sitter-hocon.
+///
+/// The root is the document's braced object or array, or, when the root
+/// braces are omitted, an object spanning the whole document. A dotted path
+/// authors one member per element, each holding an implied object, the shape
+/// TOML's dotted keys produce: `akka.remote.port = 1` routes as
+/// `["akka","remote","port"]`, and every element's key evidence is that
+/// element's own bytes. A repeated key keeps its same-key occurrence ordinal.
+///
+/// Facts describe authored source only. HOCON merges a repeated object key,
+/// appends with `+=`, splices `include` files and expands `${...}`; each is
+/// recorded as unresolved feature evidence for the effective layer, never
+/// applied. A concatenated scalar (`10 s`, `foo ${bar}`) is one string
+/// scalar whose evidence covers every piece, `Opaque` when it holds a
+/// substitution. Object or array concatenation (`${base} { x = 1 }`) is an
+/// effective merge the single-value member cannot represent, so it is typed
+/// `UnsupportedConstruct` recovery and the member keeps no value.
+fn ingest_hocon(source: &str) -> Result<ConfigurationDocumentFacts, ConfigurationIngestionError> {
+    let tree = parse_tree(&tree_sitter_hocon::LANGUAGE.into(), "HOCON", source)?;
+    let root = tree.root_node();
+    let document_range = source_range(root)?;
+    let mut recoveries = collect_recoveries(root, |node| node.is_error() || node.is_missing())?;
+    let mut features = HoconFeatureEvidence::default();
+    let mut pending = vec![PendingFact {
+        parent: None,
+        route: ConfigurationRoute::root(),
+        range: document_range,
+        kind: PendingKind::Document(None),
+    }];
+    let mut cursor = root.walk();
+    let braced = root
+        .named_children(&mut cursor)
+        .find(|node| matches!(node.kind(), "object" | "array"));
+    let mut stack = vec![HoconWork {
+        node: match braced {
+            Some(node) if node.kind() == "object" => HoconNode::Object(node),
+            // A root array is a value the grammar did not wrap.
+            Some(node) => HoconNode::Value(node),
+            None => HoconNode::Object(root),
+        },
+        parent: 0,
+        link: Link::DocumentRoot,
+        route: ConfigurationRoute::root(),
+        range: braced.map_or(Ok(document_range), source_range)?,
+    }];
+    while let Some(work) = stack.pop() {
+        add_hocon_node(
+            source,
+            work,
+            &mut pending,
+            &mut stack,
+            &mut recoveries,
+            &mut features,
+        )?;
+    }
+    recoveries.sort_by_key(|recovery| {
+        (
+            recovery.evidence().start_byte(),
+            recovery.evidence().end_byte(),
+        )
+    });
+    recoveries.dedup();
+    let completeness = if recoveries.is_empty() {
+        ConfigurationCompleteness::Complete
+    } else {
+        ConfigurationCompleteness::Incomplete { recoveries }
+    };
+    ConfigurationDocumentFacts::new(
+        ConfigurationFormat::Hocon,
+        finalize(pending)?,
+        completeness,
+        features.into_semantics(),
+    )
+    .map_err(model_error)
+}
+
+fn add_hocon_node<'tree>(
+    source: &str,
+    work: HoconWork<'tree>,
+    pending: &mut Vec<PendingFact>,
+    stack: &mut Vec<HoconWork<'tree>>,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+    features: &mut HoconFeatureEvidence,
+) -> Result<(), ConfigurationIngestionError> {
+    let id = pending.len();
+    let mut children = Vec::new();
+    let kind = match work.node {
+        HoconNode::Object(object) => {
+            let mut occurrences = HashMap::<String, usize>::new();
+            let mut cursor = object.walk();
+            for member in object.named_children(&mut cursor) {
+                match member.kind() {
+                    "field" => {
+                        let Some(element) = hocon_path_elements(member).next() else {
+                            unreachable!("a HOCON path has at least one element");
+                        };
+                        let key_range = source_range(element)?;
+                        let key = hocon_key_text(source, element, recoveries)?;
+                        let occurrence = occurrences.entry(key.clone()).or_default();
+                        *occurrence += 1;
+                        // A repeated key merges with, or replaces, the earlier
+                        // member in the effective configuration.
+                        if *occurrence > 1 {
+                            features.format_merge.push(key_range);
+                        }
+                        children.push(HoconWork {
+                            node: HoconNode::Member {
+                                field: member,
+                                element: 0,
+                            },
+                            parent: id,
+                            link: Link::ObjectMember,
+                            route: work.route.clone().child(ConfigurationRouteSegment::key(
+                                key,
+                                *occurrence,
+                                key_range,
+                            )),
+                            range: source_range(member)?,
+                        });
+                    }
+                    "include" => features.includes.push(source_range(member)?),
+                    // Comments hold no member, and error nodes are already
+                    // recovery evidence.
+                    _ => {}
+                }
+            }
+            PendingKind::Object(Vec::new())
+        }
+        HoconNode::Member { field, element } => {
+            let Some(segment) = work.route.segments().last() else {
+                unreachable!("a HOCON member is only queued with its own key route segment");
+            };
+            let ConfigurationRouteSelector::Key { name, .. } = segment.selector() else {
+                unreachable!("a HOCON member route segment is always an authored key");
+            };
+            let key = ConfigurationKey::new(name.clone(), segment.evidence());
+            match hocon_path_elements(field).nth(element + 1) {
+                Some(next) => children.push(HoconWork {
+                    node: HoconNode::ImpliedObject {
+                        field,
+                        element: element + 1,
+                    },
+                    parent: id,
+                    link: Link::MemberValue,
+                    route: work.route.clone(),
+                    range: ConfigurationSourceRange::new(next.start_byte(), field.end_byte())
+                        .map_err(model_error)?,
+                }),
+                None => {
+                    if field
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| operator.kind() == "+=")
+                    {
+                        features.format_merge.push(source_range(field)?);
+                    }
+                    if let Some(value) = field.child_by_field_name("value") {
+                        children.push(HoconWork {
+                            node: HoconNode::Value(value),
+                            parent: id,
+                            link: Link::MemberValue,
+                            route: work.route.clone(),
+                            range: source_range(value)?,
+                        });
+                    }
+                }
+            }
+            PendingKind::Member {
+                role: ConfigurationMemberRole::ObjectMember,
+                key,
+                value: None,
+            }
+        }
+        HoconNode::ImpliedObject { field, element } => {
+            let Some(path_element) = hocon_path_elements(field).nth(element) else {
+                unreachable!("an implied HOCON object is only queued for an authored element");
+            };
+            let key_range = source_range(path_element)?;
+            let key = hocon_key_text(source, path_element, recoveries)?;
+            children.push(HoconWork {
+                node: HoconNode::Member { field, element },
+                parent: id,
+                link: Link::ObjectMember,
+                route: work
+                    .route
+                    .clone()
+                    .child(ConfigurationRouteSegment::key(key, 1, key_range)),
+                range: work.range,
+            });
+            PendingKind::Object(Vec::new())
+        }
+        HoconNode::Value(value) => {
+            let mut cursor = value.walk();
+            let pieces = if value.kind() == "value" {
+                value
+                    .named_children(&mut cursor)
+                    .filter(|piece| piece.kind() != "comment")
+                    .collect::<Vec<_>>()
+            } else {
+                // The root array is its own single piece.
+                vec![value]
+            };
+            for piece in &pieces {
+                if piece.kind() == "substitution" {
+                    features.interpolation.push(source_range(*piece)?);
+                }
+            }
+            match pieces.as_slice() {
+                [piece] if piece.kind() == "object" => {
+                    stack.push(HoconWork {
+                        node: HoconNode::Object(*piece),
+                        ..work
+                    });
+                    return Ok(());
+                }
+                [piece] if piece.kind() == "array" => {
+                    let mut cursor = piece.walk();
+                    for (index, item) in piece
+                        .named_children(&mut cursor)
+                        .filter(|item| item.kind() == "value")
+                        .enumerate()
+                    {
+                        let range = source_range(item)?;
+                        children.push(HoconWork {
+                            node: HoconNode::Value(item),
+                            parent: id,
+                            link: Link::SequenceItem,
+                            route: work
+                                .route
+                                .clone()
+                                .child(ConfigurationRouteSegment::index(index, range)),
+                            range,
+                        });
+                    }
+                    PendingKind::Sequence(Vec::new())
+                }
+                [piece] => PendingKind::Scalar(hocon_scalar_kind(source, *piece, recoveries)?),
+                pieces
+                    if pieces
+                        .iter()
+                        .any(|piece| matches!(piece.kind(), "object" | "array")) =>
+                {
+                    features.format_merge.push(work.range);
+                    recoveries.push(ConfigurationRecovery::new(
+                        ConfigurationRecoveryReason::UnsupportedConstruct,
+                        work.range,
+                    ));
+                    return Ok(());
+                }
+                pieces => {
+                    let mut kind = ConfigurationScalarKind::String;
+                    for piece in pieces {
+                        if hocon_scalar_kind(source, *piece, recoveries)?
+                            == ConfigurationScalarKind::Opaque
+                        {
+                            kind = ConfigurationScalarKind::Opaque;
+                        }
+                    }
+                    PendingKind::Scalar(kind)
+                }
+            }
+        }
+    };
+    attach(&mut pending[work.parent].kind, work.link, id)?;
+    pending.push(PendingFact {
+        parent: Some(work.parent),
+        route: work.route,
+        range: work.range,
+        kind,
+    });
+    stack.extend(children.into_iter().rev());
+    Ok(())
+}
+
+fn hocon_path_elements(field: Node<'_>) -> impl Iterator<Item = Node<'_>> {
+    let Some(path) = field.child_by_field_name("key") else {
+        unreachable!("a HOCON field always has a key path");
+    };
+    let mut cursor = path.walk();
+    path.named_children(&mut cursor)
+        .filter(|element| element.kind() == "path_element")
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// The scalar kind of one value piece. A quoted string the JSON string
+/// decoder rejects (an invalid escape) is typed recovery evidence and an
+/// `Opaque` scalar, as in the JSON adapter.
+fn hocon_scalar_kind(
+    source: &str,
+    piece: Node<'_>,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+) -> Result<ConfigurationScalarKind, ConfigurationIngestionError> {
+    Ok(match piece.kind() {
+        "string" => {
+            if serde_json::from_str::<String>(token_text(source, piece)?).is_ok() {
+                ConfigurationScalarKind::String
+            } else {
+                recoveries.push(ConfigurationRecovery::new(
+                    ConfigurationRecoveryReason::UnsupportedScalar,
+                    source_range(piece)?,
+                ));
+                ConfigurationScalarKind::Opaque
+            }
+        }
+        "multiline_string" | "unquoted_string" => ConfigurationScalarKind::String,
+        // The grammar's number token is a JSON number; its spelling is the
+        // only structure that separates an integer from a decimal.
+        "number" => {
+            if token_text(source, piece)?.contains(['.', 'e', 'E']) {
+                ConfigurationScalarKind::Decimal
+            } else {
+                ConfigurationScalarKind::Integer
+            }
+        }
+        "true" | "false" => ConfigurationScalarKind::Boolean,
+        "null" => ConfigurationScalarKind::Null,
+        // The effective value of a substitution is unknown here.
+        "substitution" => ConfigurationScalarKind::Opaque,
+        // An error node inside a value is already recovery evidence.
+        _ => ConfigurationScalarKind::Opaque,
+    })
+}
+
+/// The authored text of one path element. Its pieces are joined with the
+/// whitespace between them, which the specification keeps as part of the
+/// key. A key the grammar continued onto another line is malformed: a
+/// newline ends a HOCON key. A quoted piece the JSON string decoder rejects
+/// keeps its authored element text as recovery evidence.
+fn hocon_key_text(
+    source: &str,
+    element: Node<'_>,
+    recoveries: &mut Vec<ConfigurationRecovery>,
+) -> Result<String, ConfigurationIngestionError> {
+    if element.start_position().row != element.end_position().row {
+        recoveries.push(ConfigurationRecovery::new(
+            ConfigurationRecoveryReason::MalformedSyntax,
+            source_range(element)?,
+        ));
+    }
+    match hocon_pieces_text(source, element) {
+        Ok(text) => Ok(text),
+        Err(piece) => {
+            recoveries.push(ConfigurationRecovery::new(
+                ConfigurationRecoveryReason::UnsupportedScalar,
+                source_range(piece)?,
+            ));
+            Ok(token_text(source, element)?.to_owned())
+        }
+    }
+}
+
+/// The decoded text of a `path_element` or `value` node: its pieces in
+/// order, joined by the source text between them. The grammar ends a key
+/// and a value at a newline and comments run to a newline, so that text is
+/// only the inline whitespace HOCON keeps inside a concatenation. `Err`
+/// names the first piece with no decoded text: a substitution, whose value
+/// is unresolved, or a quoted string the JSON decoder rejects.
+fn hocon_pieces_text<'tree>(source: &str, node: Node<'tree>) -> Result<String, Node<'tree>> {
+    let mut text = String::new();
+    let mut previous_end = None;
+    let mut cursor = node.walk();
+    for piece in node.named_children(&mut cursor) {
+        if piece.kind() == "comment" {
+            continue;
+        }
+        let token = source.get(piece.byte_range()).ok_or(piece)?;
+        if let Some(end) = previous_end {
+            text.push_str(source.get(end..piece.start_byte()).ok_or(piece)?);
+        }
+        match piece.kind() {
+            "string" => text.push_str(&serde_json::from_str::<String>(token).map_err(|_| piece)?),
+            // The token is `"""`, raw content, and a closing run of at least
+            // three quotes, of which all but the last three are content.
+            "multiline_string" => text.push_str(&token[3..token.len() - 3]),
+            "unquoted_key" | "unquoted_string" | "number" | "true" | "false" | "null" => {
+                text.push_str(token);
+            }
+            _ => return Err(piece),
+        }
+        previous_end = Some(piece.end_byte());
+    }
+    Ok(text)
+}
+
+/// Decode one HOCON scalar fact. The fact's evidence is re-parsed alone as
+/// the single element of an array, so the grammar, not a text scan, selects
+/// its pieces, and the work is bounded by the scalar's own length. A scalar
+/// that holds a substitution has no decoded text here.
+pub fn decoded_hocon_scalar_value(
+    document: &ConfigurationDocumentFacts,
+    source: &str,
+    fact_id: ConfigurationFactId,
+) -> Option<String> {
+    let raw = raw_scalar_value(document, source, fact_id, ConfigurationFormat::Hocon)?;
+    let wrapped = format!("[{raw}]");
+    let tree = parse_tree(&tree_sitter_hocon::LANGUAGE.into(), "HOCON", &wrapped).ok()?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let array = root.named_child(0).filter(|node| node.kind() == "array")?;
+    let mut cursor = array.walk();
+    let mut values = array
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "value");
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    hocon_pieces_text(&wrapped, value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3204,6 +4221,7 @@ caf\\u00e9.mode=on\n";
             toml_configuration_adapter_epoch(),
             xml_configuration_adapter_epoch(),
             yaml_configuration_adapter_epoch(),
+            hocon_configuration_adapter_epoch(),
         ];
         for epoch in &epochs {
             assert_eq!(epoch.len(), 64, "{epoch}");
@@ -3222,6 +4240,7 @@ caf\\u00e9.mode=on\n";
                 toml_configuration_adapter_epoch(),
                 xml_configuration_adapter_epoch(),
                 yaml_configuration_adapter_epoch(),
+                hocon_configuration_adapter_epoch(),
             ]
         );
         // Adapters over the same document model must never share a cache
@@ -3238,21 +4257,11 @@ caf\\u00e9.mode=on\n";
     fn every_discovery_extension_reaches_its_format_adapter() {
         // The canonical registry's discovery extensions and the ingestion
         // dispatch are one contract: a path the registry discovers must reach
-        // the adapter of the same format, or name that format as one without
-        // an adapter, never an unclassified rejection.
+        // the adapter of the same format, never an unclassified rejection.
         for format in ConfigurationFormat::ALL {
             for extension in format.discovery_extensions() {
                 let path = PathBuf::from("conf").join(format!("candidate.{extension}"));
                 match (format, ingest_configuration_document(&path, b"")) {
-                    (
-                        ConfigurationFormat::Hocon,
-                        ConfigurationIngestionOutcome::Unsupported {
-                            format: Some(ConfigurationFormat::Hocon),
-                        },
-                    ) => {}
-                    (ConfigurationFormat::Hocon, other) => {
-                        panic!("{path:?} must report HOCON as unread: {other:?}")
-                    }
                     (_, ConfigurationIngestionOutcome::Facts(facts)) => {
                         assert_eq!(facts.format(), format, "{path:?}");
                     }
@@ -3564,10 +4573,11 @@ caf\\u00e9.mode=on\n";
         let source = "<server><![CDATA[<literal>]]></server>";
         let document = xml_facts(source);
         assert!(document.completeness().is_complete(), "{document:#?}");
-        let scalar = document
+        let (index, scalar) = document
             .facts()
             .iter()
-            .find(|fact| {
+            .enumerate()
+            .find(|(_, fact)| {
                 matches!(
                     fact.kind(),
                     ConfigurationNodeKind::Scalar {
@@ -3576,9 +4586,13 @@ caf\\u00e9.mode=on\n";
                 )
             })
             .unwrap();
+        // The span keeps the section markers so that it reads as a content
+        // fragment on its own.
+        assert_eq!(slice(source, scalar.evidence()), "<![CDATA[<literal>]]>");
         assert_eq!(
-            &source[scalar.evidence().start_byte()..scalar.evidence().end_byte()],
-            "<literal>"
+            decoded_xml_scalar_value(&document, source, ConfigurationFactId::new(index).unwrap())
+                .as_deref(),
+            Some("<literal>")
         );
     }
 
@@ -3619,6 +4633,92 @@ caf\\u00e9.mode=on\n";
                 ("mode", Some("prod&test".to_string())),
                 ("host", Some("primary.example".to_string()))
             ]
+        );
+    }
+
+    /// The scalar fact holding the text of the first element named `name`.
+    fn xml_element_text_scalar(
+        document: &ConfigurationDocumentFacts,
+        name: &str,
+    ) -> ConfigurationFactId {
+        document
+            .facts()
+            .iter()
+            .find_map(|fact| {
+                let ConfigurationNodeKind::Member {
+                    key,
+                    value: Some(value),
+                    ..
+                } = fact.kind()
+                else {
+                    return None;
+                };
+                let ConfigurationNodeKind::Section {
+                    header: Some(header),
+                    ..
+                } = document.fact(*value)?.kind()
+                else {
+                    return None;
+                };
+                (key.text() == name).then_some(*header)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[hardwon(
+        "16cb55304e1c: XML references inside element text were dropped from the decoded scalar"
+    )]
+    fn xml_element_text_expands_predefined_and_character_references() {
+        for (authored, expected, complete) in [
+            ("a&amp;b", Some("a&b"), true),
+            ("&amp;b", Some("&b"), true),
+            ("a&amp;", Some("a&"), true),
+            ("&#65;", Some("A"), true),
+            ("&#x41;&lt;&gt;&quot;&apos;", Some("A<>\"'"), true),
+            ("a<![CDATA[&amp;]]>&amp;", Some("a&amp;&"), true),
+            ("a&ent;b", None, false),
+            ("&#0;", None, false),
+            ("&#1;", None, false),
+            ("&#xD800;", None, false),
+            ("&#x110000;", None, false),
+        ] {
+            let source = format!("<x>{authored}</x>");
+            let document = xml_facts(&source);
+            let scalar = xml_element_text_scalar(&document, "x");
+            assert_eq!(
+                decoded_xml_scalar_value(&document, &source, scalar).as_deref(),
+                expected,
+                "{authored}"
+            );
+            assert_eq!(
+                document.completeness().is_complete(),
+                complete,
+                "{authored}"
+            );
+            let range = document.fact(scalar).unwrap().evidence();
+            assert_eq!(slice(&source, range), authored);
+        }
+    }
+
+    #[test]
+    #[hardwon("16cb55304e1c: XML scalar lookup re-read the whole document for every value")]
+    fn xml_element_text_lookup_reads_only_the_scalar_span() {
+        let items = (0..500)
+            .map(|index| format!("<item n=\"{index}\">value-{index}</item>"))
+            .collect::<String>();
+        let source = format!("<root>{items}<target> a<![CDATA[&b]]>c </target></root>");
+        let document = xml_facts(&source);
+        let header = xml_element_text_scalar(&document, "target");
+        let range = document.fact(header).unwrap().evidence();
+        let fragment = &source[range.start_byte()..range.end_byte()];
+        assert!(source.len() > 50 * fragment.len());
+        let (text, consumed) = decode_xml_element_text(fragment).unwrap();
+        assert_eq!(text, "a&bc");
+        assert_eq!(consumed, fragment.len());
+        assert_eq!(
+            decoded_xml_scalar_value(&document, &source, header),
+            Some("a&bc".to_owned())
         );
     }
 

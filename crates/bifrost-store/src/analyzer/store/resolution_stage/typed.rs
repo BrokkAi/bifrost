@@ -139,6 +139,23 @@ fn encode_rows(
         row.cell("length_token", json!(item.length));
         emit("type_productions", sequence, row)?;
     }
+    for (sequence, item) in typed.type_components().iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut row = EncodedRow::new();
+        row.semantic("container_slot", item.container());
+        row.cell(
+            "constructor",
+            code(ALL_RESOLUTION_TYPE_CONSTRUCTOR_KINDS, item.constructor()),
+        );
+        row.cell(
+            "kind",
+            code(ALL_RESOLUTION_TYPE_COMPONENT_KINDS, item.kind()),
+        );
+        row.semantic("component_slot", item.component());
+        emit("type_components", sequence, row)?;
+    }
     for (sequence, item) in typed.type_arguments().iter().enumerate() {
         if cancellation.is_cancelled() {
             return Ok(false);
@@ -307,6 +324,29 @@ fn encode_rows(
         row.cell("scope_head_node", codec::encode_node(item.scope_head()));
         row.cell("scope_kind", item.scope_kind_label());
         emit("member_scopes", sequence, row)?;
+    }
+    // Only JVM producers publish member-type claims, and no JVM fragment is
+    // staged today: typed fragments reach the stage only through Rust macro
+    // capsules. The family keeps a staged claim for symmetry; a staged owner
+    // without a row reads Unknown through the readers' left join.
+    for (sequence, (item, coverage)) in typed
+        .member_scopes()
+        .iter()
+        .filter_map(|item| item.member_types().map(|coverage| (item, coverage)))
+        .enumerate()
+    {
+        if cancellation.is_cancelled() {
+            return Ok(false);
+        }
+        let mut row = EncodedRow::new();
+        row.semantic("definition", item.definition());
+        row.cell("scope_head_node", codec::encode_node(item.scope_head()));
+        row.cell("coverage", coverage.label());
+        row.cell(
+            "open_reason",
+            json!(coverage.open_reason().map(|reason| reason.label())),
+        );
+        emit("member_type_coverage", sequence, row)?;
     }
     for (sequence, item) in typed.member_owners().iter().enumerate() {
         if cancellation.is_cancelled() {
@@ -894,11 +934,18 @@ fn decode_visibility(row: &Row<'_>) -> Result<LoweredDeclarationVisibilityProper
     .with_boundary(boundary))
 }
 fn decode_member_scope(row: &Row<'_>) -> Result<LoweredMemberScopeProperty> {
-    Ok(LoweredMemberScopeProperty::new(
-        row_semantic(row, "definition")?,
+    let definition = row_semantic(row, "definition")?;
+    let property = LoweredMemberScopeProperty::new(
+        definition,
         codec::decode_node(row.get("scope_head_node")?),
     )
-    .with_scope_kind_label(&row.get::<_, String>("scope_kind")?))
+    .with_scope_kind_label(&row.get::<_, String>("scope_kind")?);
+    let member_types = typed_rows::decode_member_types(
+        definition,
+        row.get("member_types_coverage")?,
+        row.get("member_types_open_reason")?,
+    )?;
+    Ok(property.with_member_types(member_types))
 }
 fn decode_member_owner(row: &Row<'_>) -> Result<LoweredMemberOwnerProperty> {
     let kind: String = row.get("member_kind")?;
@@ -1321,7 +1368,7 @@ pub(in crate::analyzer::store) fn visit_declaration_visibility_pages_for_definit
     )
 }
 
-pub(in crate::analyzer::store) const VISIT_MEMBER_SCOPE_PAGES_FOR_DEFINITIONS_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.definition_key IS request.value->>0 AND fact.definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal WHERE fact.scope_kind='type_body'";
+pub(in crate::analyzer::store) const VISIT_MEMBER_SCOPE_PAGES_FOR_DEFINITIONS_SQL: &str = "SELECT fact.*,coverage.coverage AS member_types_coverage,coverage.open_reason AS member_types_open_reason FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.definition_key IS request.value->>0 AND fact.definition_shared IS request.value->>1 JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal LEFT JOIN temp.selected_resolution_stage_member_type_coverage coverage ON coverage.definition_key IS fact.definition_key AND coverage.definition_shared IS fact.definition_shared AND coverage.host_ordinal=fact.host_ordinal WHERE fact.scope_kind='type_body'";
 
 pub(in crate::analyzer::store) fn visit_member_scope_pages_for_definitions(
     selection: &SelectedResolutionMountInventory<'_>,
@@ -1619,7 +1666,7 @@ pub(in crate::analyzer::store) fn visit_intrinsic_type_descriptor_pages_for_type
     )
 }
 
-pub(in crate::analyzer::store) const MEMBER_SCOPE_HEAD_SQL: &str = "SELECT fact.* FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.scope_head_node=request.value JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal WHERE fact.scope_kind='type_body'";
+pub(in crate::analyzer::store) const MEMBER_SCOPE_HEAD_SQL: &str = "SELECT fact.*,coverage.coverage AS member_types_coverage,coverage.open_reason AS member_types_open_reason FROM json_each(?1) request CROSS JOIN temp.selected_resolution_stage_member_scopes fact ON fact.scope_head_node=request.value JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=fact.host_ordinal LEFT JOIN temp.selected_resolution_stage_member_type_coverage coverage ON coverage.definition_key IS fact.definition_key AND coverage.definition_shared IS fact.definition_shared AND coverage.host_ordinal=fact.host_ordinal WHERE fact.scope_kind='type_body'";
 pub(in crate::analyzer::store) fn visit_member_scope_pages_for_heads(
     selection: &SelectedResolutionMountInventory<'_>,
     request: TypedFactRequest<'_, BindingNodeId>,

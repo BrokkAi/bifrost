@@ -119,7 +119,7 @@ mod jvm_extraction_tests {
         );
         store
             .conn
-            .execute(|conn| {
+            .execute_fixture(|conn| {
                 conn.execute("DELETE FROM blobs", [])?;
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM source_java_declaration_manifests",

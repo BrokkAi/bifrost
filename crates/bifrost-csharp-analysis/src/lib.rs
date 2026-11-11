@@ -59,3 +59,49 @@ fn __brokk_bifrost_store_language_supports_v1()
         std::sync::OnceLock::new();
     TABLE.get_or_init(|| __brokk_bifrost_language_supports_v1().store_supports())
 }
+
+#[cfg(test)]
+mod icfg_domain_tests {
+    use brokk_bifrost_analysis::analyzer::semantic::icfg::{
+        IcfgProvider, IcfgProviderBehaviorIdentity, WorkspaceIcfgProvider,
+    };
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#8837: a present empty nearer C# configuration file reused an older full ICFG answer"
+    )]
+    fn present_empty_csharp_configuration_rotates_retained_full_provider_identity() {
+        let fixture = AnalyzerFixture::new_for_language(
+            brokk_bifrost_core::analyzer::model::Language::CSharp,
+            &[
+                (
+                    "Directory.Build.props",
+                    "<Project><PropertyGroup><Root>yes</Root></PropertyGroup></Project>",
+                ),
+                ("Directory.Build.targets", "<Project />"),
+                ("Directory.Packages.props", "<Project />"),
+                ("App/Directory.Build.props", ""),
+                ("App/Directory.Build.targets", "<Project />"),
+                ("App/Directory.Packages.props", "<Project />"),
+                ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+                ("App/Class.cs", "class Class { }"),
+            ],
+        );
+        let provider = WorkspaceIcfgProvider::new(fixture.analyzer());
+        let old = IcfgProviderBehaviorIdentity::for_test_workspace_with_domains(
+            &provider,
+            (
+                b"bifrost-icfg-provider/workspace-behavior/v686",
+                b"bifrost-icfg-provider/workspace-read-behavior/v685",
+            ),
+        );
+        let current = provider.behavior_identity();
+        assert_ne!(
+            old.digest(),
+            current.digest(),
+            "a retained full-provider answer must miss after the domain rotation"
+        );
+    }
+}

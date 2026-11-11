@@ -261,6 +261,50 @@ pub fn call_shape_for_call(
     })
 }
 
+/// The shape of a member selection that resolution admitted as a call
+/// (`LanguageKnowledge::resolution_decided_application`): Scala's
+/// parameterless `entry.getName` applies `getName` to `entry` and writes no
+/// argument list, so it has no argument group.
+pub fn selection_call_shape(
+    facts: &FileFacts,
+    file: &ProjectFile,
+    selection_id: u32,
+) -> CallShapeReport {
+    let selection = facts.node(selection_id);
+    assert_eq!(
+        selection.kind,
+        NormalizedKind::FieldAccess,
+        "a resolution-decided application is a member selection"
+    );
+    let content_identity = facts.source_identity();
+    let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_SITE_ID_DOMAIN);
+    digest.push(content_identity.as_bytes());
+    digest.push(&selection.range.start_byte.to_le_bytes());
+    digest.push(&selection.range.end_byte.to_le_bytes());
+    let site_id = digest.finish().to_string();
+    let member = facts.role_targets(selection_id, Role::Field).next();
+    CallShapeReport {
+        outcome: CallShapeOutcome {
+            id: site_id.clone(),
+            site_id,
+            site_ast_id: ast_id(content_identity, selection_id),
+            file: file.clone(),
+            range: selection.range,
+            callee_range: member.map(|target| super::range_for_span(facts, target.span)),
+            callee_name: member.map(|target| target.span.text(facts.source()).to_owned()),
+            receiver_range: facts
+                .role_targets(selection_id, Role::Object)
+                .next()
+                .map(|target| super::range_for_span(facts, target.span)),
+            call_kind: CallKind::Method,
+            coverage: CallShapeCoverage::Exact,
+            callee_provenance: None,
+        },
+        groups: Vec::new(),
+        arguments: Vec::new(),
+    }
+}
+
 /// Derive the shapes of every call site in one file's facts, in arena order,
 /// up to `limit` sites.
 ///
@@ -312,7 +356,7 @@ fn argument_groups_of(
             name: target
                 .keyword
                 .map(|keyword| keyword.text(facts.source()).to_owned()),
-            spread: target.spread,
+            spread: target.mode.is_spread(),
             literal_value: target
                 .node
                 .and_then(|node| facts.node(node).string_value.clone()),

@@ -1,9 +1,7 @@
 //! Snapshot-owned complete usage-ranking graphs.
 
 use super::workspace_graph::{UsageEcosystem, WorkspaceUsageRankingGraph};
-use crate::analyzer::complete_value_cache::{
-    CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
-};
+use crate::analyzer::complete_value_cache::CompleteValueWait;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{
     ArtifactVerdict, ArtifactVerdictLog, DerivedArtifactId, DerivedArtifactKind,
@@ -12,9 +10,11 @@ use crate::analyzer::invalidation::{
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
+use brokk_bifrost_core::retention_budget::{
+    Accounted, BudgetedValue, RetainedBytes, RetentionBudget, SelfCharged, SharedAllocation,
+};
 use std::sync::Arc;
-
-pub(crate) const DEFAULT_MAX_RETAINED_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[doc(hidden)]
@@ -141,6 +141,18 @@ impl WorkspaceUsageGraphCacheKey {
     }
 }
 
+impl RetainedBytes for WorkspaceUsageGraphCacheKey {
+    fn retained_bytes(&self) -> usize {
+        WorkspaceUsageGraphCacheKey::retained_bytes(self)
+    }
+}
+
+impl RetainedBytes for WorkspaceUsageRankingGraph {
+    fn retained_bytes(&self) -> usize {
+        WorkspaceUsageRankingGraph::retained_bytes(self)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum WorkspaceUsageGraphCacheLifecycle {
@@ -162,13 +174,13 @@ pub enum WorkspaceUsageGraphCacheBuildOutcome {
 #[doc(hidden)]
 pub enum WorkspaceUsageGraphCacheAcquisition {
     Ready {
-        graph: Arc<WorkspaceUsageRankingGraph>,
+        graph: Arc<Accounted<WorkspaceUsageRankingGraph>>,
         lifecycle: WorkspaceUsageGraphCacheLifecycle,
         wait: CompleteValueWait,
     },
     /// Useful partial evidence that is deliberately not published to the
     /// complete-value cache.
-    Incomplete(Arc<WorkspaceUsageRankingGraph>),
+    Incomplete(Arc<Accounted<WorkspaceUsageRankingGraph>>),
     Cancelled,
     Stale,
 }
@@ -180,28 +192,24 @@ pub enum WorkspaceUsageGraphCacheAcquisition {
 /// ecosystem whose content did not move still answers from it.
 #[doc(hidden)]
 pub struct SnapshotWorkspaceUsageGraphCache {
-    max_retained_bytes: u64,
+    budget: RetentionBudget,
     values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo<
-        CompleteValueCache<WorkspaceUsageGraphCacheKey, WorkspaceUsageRankingGraph>,
+        BudgetedValueCache<
+            WorkspaceUsageGraphCacheKey,
+            SharedAllocation<Accounted<WorkspaceUsageRankingGraph>>,
+        >,
     >,
     #[doc(hidden)]
     pub verdicts: ArtifactVerdictLog,
 }
 
 impl SnapshotWorkspaceUsageGraphCache {
-    pub(crate) fn new(max_retained_bytes: u64) -> Self {
+    pub(crate) fn new(budget: &RetentionBudget) -> Self {
         Self {
-            max_retained_bytes,
+            budget: budget.clone(),
             values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo::new(
                 crate::analyzer::WorkspaceFactFamily::WorkspaceUsageGraph,
-                CompleteValueCache::new(
-                    max_retained_bytes,
-                    |key: &WorkspaceUsageGraphCacheKey, graph: &Arc<WorkspaceUsageRankingGraph>| {
-                        key.retained_bytes()
-                            .saturating_add(graph.retained_bytes())
-                            .min(u32::MAX as usize) as u32
-                    },
-                ),
+                BudgetedValueCache::new(budget.region("analysis.workspace_usage_graph", None)),
             ),
             verdicts: ArtifactVerdictLog::default(),
         }
@@ -277,7 +285,10 @@ impl SnapshotWorkspaceUsageGraphCache {
 
     fn acquire_value<E>(
         &self,
-        values: &CompleteValueCache<WorkspaceUsageGraphCacheKey, WorkspaceUsageRankingGraph>,
+        values: &BudgetedValueCache<
+            WorkspaceUsageGraphCacheKey,
+            SharedAllocation<Accounted<WorkspaceUsageRankingGraph>>,
+        >,
         key: WorkspaceUsageGraphCacheKey,
         cancellation: &CancellationToken,
         build: impl FnOnce() -> Result<WorkspaceUsageGraphCacheBuildOutcome, E>,
@@ -285,7 +296,7 @@ impl SnapshotWorkspaceUsageGraphCache {
     ) -> Result<WorkspaceUsageGraphCacheAcquisition, E> {
         let (acquisition, wait) = values.acquire(&key, cancellation);
         Ok(match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
+            BudgetedValueAcquisition::Cached { value } => {
                 if content_is_current() {
                     self.verdicts.record(ArtifactVerdict::Retained(
                         RetentionReason::InputsUnchanged {
@@ -293,7 +304,7 @@ impl SnapshotWorkspaceUsageGraphCache {
                         },
                     ));
                     WorkspaceUsageGraphCacheAcquisition::Ready {
-                        graph: value,
+                        graph: Arc::clone(value.arc()),
                         lifecycle: WorkspaceUsageGraphCacheLifecycle::Hit,
                         wait,
                     }
@@ -301,7 +312,7 @@ impl SnapshotWorkspaceUsageGraphCache {
                     WorkspaceUsageGraphCacheAcquisition::Stale
                 }
             }
-            CompleteValueAcquisition::Leader { permit } => {
+            BudgetedValueAcquisition::Leader { permit } => {
                 self.verdicts.record(ArtifactVerdict::Invalidated(
                     InvalidationReason::NoRetainedArtifact {
                         artifact: key.artifact(),
@@ -320,28 +331,34 @@ impl SnapshotWorkspaceUsageGraphCache {
                         if !content_is_current() {
                             return Ok(WorkspaceUsageGraphCacheAcquisition::Stale);
                         }
-                        let retained_bytes =
-                            key.retained_bytes().saturating_add(graph.retained_bytes());
-                        let graph = Arc::new(graph);
-                        if retained_bytes as u64 > self.max_retained_bytes {
-                            return Ok(WorkspaceUsageGraphCacheAcquisition::Ready {
-                                graph,
-                                lifecycle: WorkspaceUsageGraphCacheLifecycle::UncachedOverBudget,
-                                wait,
-                            });
-                        }
-                        permit.publish_complete(Arc::clone(&graph));
+                        let graph = Arc::new(Accounted::charged(&self.budget, graph));
+                        let charged = graph.allocation_charge().is_charged();
+                        let retained = if charged {
+                            matches!(
+                                permit.publish_complete(SharedAllocation::new(Arc::clone(&graph))),
+                                BudgetedValue::Retained(_)
+                            )
+                        } else {
+                            permit.publish_request_owned(SharedAllocation::new(Arc::clone(&graph)));
+                            false
+                        };
                         if !content_is_current() {
                             return Ok(WorkspaceUsageGraphCacheAcquisition::Stale);
                         }
                         WorkspaceUsageGraphCacheAcquisition::Ready {
                             graph,
-                            lifecycle: WorkspaceUsageGraphCacheLifecycle::Built,
+                            lifecycle: if retained {
+                                WorkspaceUsageGraphCacheLifecycle::Built
+                            } else {
+                                WorkspaceUsageGraphCacheLifecycle::UncachedOverBudget
+                            },
                             wait,
                         }
                     }
                     WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph) => {
-                        WorkspaceUsageGraphCacheAcquisition::Incomplete(Arc::new(graph))
+                        WorkspaceUsageGraphCacheAcquisition::Incomplete(Arc::new(
+                            Accounted::uncharged(graph),
+                        ))
                     }
                     WorkspaceUsageGraphCacheBuildOutcome::Cancelled => {
                         WorkspaceUsageGraphCacheAcquisition::Cancelled
@@ -351,8 +368,8 @@ impl SnapshotWorkspaceUsageGraphCache {
                     }
                 }
             }
-            CompleteValueAcquisition::Cancelled => WorkspaceUsageGraphCacheAcquisition::Cancelled,
-            CompleteValueAcquisition::Rejected => WorkspaceUsageGraphCacheAcquisition::Stale,
+            BudgetedValueAcquisition::Cancelled => WorkspaceUsageGraphCacheAcquisition::Cancelled,
+            BudgetedValueAcquisition::Rejected => WorkspaceUsageGraphCacheAcquisition::Stale,
         })
     }
 
@@ -363,27 +380,28 @@ impl SnapshotWorkspaceUsageGraphCache {
             &crate::analyzer::workspace_authority::memo_attribution(
                 &crate::analyzer::MultiAnalyzer::default(),
             ),
-            |values| values.len_for_test(),
+            |values| values.region().stats().entries as u64,
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
         )
     }
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn waiting_count_for_test(&self) -> usize {
+    pub fn waiting_count_for_test(&self, key: &WorkspaceUsageGraphCacheKey) -> usize {
         self.values.read(
             &crate::analyzer::workspace_authority::memo_attribution(
                 &crate::analyzer::MultiAnalyzer::default(),
             ),
-            |values| values.waiting_count_for_test(),
+            |values| values.waiters_for_test(key),
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
         )
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for SnapshotWorkspaceUsageGraphCache {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_RETAINED_BYTES)
+        Self::new(&RetentionBudget::for_tests())
     }
 }
 
@@ -392,7 +410,7 @@ impl Default for SnapshotWorkspaceUsageGraphCache {
 pub fn ready_graph(
     acquisition: WorkspaceUsageGraphCacheAcquisition,
 ) -> (
-    Arc<WorkspaceUsageRankingGraph>,
+    Arc<Accounted<WorkspaceUsageRankingGraph>>,
     WorkspaceUsageGraphCacheLifecycle,
 ) {
     match acquisition {

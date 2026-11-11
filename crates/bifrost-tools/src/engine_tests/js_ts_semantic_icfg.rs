@@ -384,6 +384,7 @@ mod js_ts_extraction_tests {
         assert!(dispatch.boundaries().is_empty(), "{dispatch:#?}");
     }
     #[test]
+    #[allow(clippy::mutable_key_type)]
     fn final_dispatch_limit_counts_unique_materialized_procedures() {
         let source = concat!(
             "export function first() { return 1; }\n",
@@ -1090,6 +1091,7 @@ mod js_ts_extraction_tests {
                 completeness: EvidenceCompleteness::Partial(
                     "fabricated foreign-origin boundary".into(),
                 ),
+                partial_cause: None,
                 provenance: Box::new([]),
             },
             model: CallToReturnModel::NormalAndExceptional,

@@ -113,6 +113,7 @@ pub(crate) fn resolved_policy_to_json(
     match_manifests: &[ResolvedMatchDirectoryManifest],
     endpoint_set_dependencies: &[ResolvedEndpointSetDependency],
     precedence: &PolicyPrecedenceManifest,
+    without_flow: Option<&ResolvedTaintPolicySpec>,
 ) -> Result<Value, LoadedModelError> {
     let mut value = RqlpDocument::Policy {
         definition: Box::new(definition.clone()),
@@ -130,7 +131,17 @@ pub(crate) fn resolved_policy_to_json(
             })
         }
         (PolicyAnalysis::Taint { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
-            resolved_taint_to_json(spec, selectors)?
+            let mut value = resolved_taint_to_json(spec, selectors)?;
+            if let Some(secondary) = without_flow {
+                value
+                    .as_object_mut()
+                    .expect("taint projection is an object")
+                    .insert(
+                        "without_flow".to_string(),
+                        resolved_taint_to_json(secondary, selectors)?,
+                    );
+            }
+            value
         }
         (PolicyAnalysis::Flow { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
             // Flow resolves into the same taint-shaped model, so the resolved
@@ -287,6 +298,7 @@ pub(crate) fn loaded_policy_to_json(policy: &LoadedPolicy) -> Result<Value, Load
         policy.match_directory_manifests(),
         policy.endpoint_set_dependencies(),
         policy.precedence_manifest(),
+        policy.resolved_without_flow(),
     )
 }
 
@@ -704,7 +716,7 @@ fn resolved_typestate_automaton_to_json(automaton: &ResolvedTypestateAutomatonSp
     });
     let mut expectations = automaton.terminal_expectations.iter().collect::<Vec<_>>();
     expectations.sort_by(|left, right| left.id.cmp(&right.id));
-    typestate_automaton_projection_to_json(
+    let mut value = typestate_automaton_projection_to_json(
         json!(sorted_ids(&automaton.states)),
         automaton.initial.as_str(),
         json!(sorted_ids(&automaton.accepting_states)),
@@ -733,16 +745,25 @@ fn resolved_typestate_automaton_to_json(automaton: &ResolvedTypestateAutomatonSp
                 .map(resolved_typestate_expectation_to_json)
                 .collect(),
         ),
-    )
+    );
+    if let Some(set) = &automaton.event_set {
+        value["event_set"] =
+            json!({"name": set.name, "version": set.version, "effects": set.effects});
+    }
+    value
 }
 
 fn resolved_typestate_event_to_json(event: &ResolvedTypestateEventSpec) -> Value {
-    resolved_typestate_entry_to_json(
+    let mut value = resolved_typestate_entry_to_json(
         event.id.as_str(),
         resolved_typestate_event_trigger_to_json(&event.trigger),
         &event.applies_to_subjects,
         &event.supersedes,
-    )
+    );
+    if let Some(effect) = &event.semantic_effect {
+        value["semantic_effect"] = json!(effect);
+    }
+    value
 }
 
 fn resolved_typestate_event_trigger_to_json(trigger: &ResolvedTypestateEventTrigger) -> Value {

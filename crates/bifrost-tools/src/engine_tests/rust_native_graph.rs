@@ -5,7 +5,9 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::languages::NativeWorkspaceGraphProvider;
     use brokk_bifrost_core::cancellation::CancellationToken;
 
-    use brokk_bifrost_analysis::analyzer::structural::reference_edges::EdgeCompleteness;
+    use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+        EdgeCompleteness, EdgeIncompleteReason,
+    };
 
     use brokk_bifrost_core::hash::HashSet;
 
@@ -31,6 +33,38 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
     use brokk_bifrost_test_macros::hardwon;
     use std::cell::Cell;
+
+    #[test]
+    fn rust_crate_root_checks_use_selected_membership() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"roots\"\nversion = \"0.1.0\"\n",
+            )
+            .file("src/lib.rs", "pub mod a; pub mod b;\n")
+            .file("src/a.rs", "pub fn a() { crate::b::b(); }\n")
+            .file("src/b.rs", "pub fn b() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let _scope =
+            brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
+        let store = analyzer.analyzer_store();
+        store.reset_parsed_blob_point_contains_queries_for_test();
+        for _ in 0..8 {
+            for path in ["src/lib.rs", "src/a.rs", "src/b.rs"] {
+                brokk_bifrost_rust::usage::rust_file_is_actual_crate_root_with(
+                    &analyzer,
+                    &fixture.file(path),
+                )
+                .expect("root route available");
+            }
+        }
+        assert_eq!(
+            store.parsed_blob_point_contains_queries_for_test(),
+            0,
+            "root checks use the live selection"
+        );
+    }
 
     /// A macro argument that reaches the graph only through a selected
     /// textual-macro capsule must still project its edge, and one such file
@@ -804,22 +838,17 @@ mod tests {
             const { std::cell::Cell::new(TracedSqlCost { statements: 0, rows: 0 }) };
     }
 
-    unsafe extern "C" fn record_traced_sql(
-        event: std::ffi::c_uint,
-        _context: *mut std::ffi::c_void,
-        _statement: *mut std::ffi::c_void,
-        _raw_sql: *mut std::ffi::c_void,
-    ) -> std::ffi::c_int {
+    fn record_traced_sql(event: brokk_bifrost_core::cache_db::sql_profile::ListenerEvent<'_>) {
+        use brokk_bifrost_core::cache_db::sql_profile::ListenerEvent;
         TRACED_SQL_COST.with(|cost| {
             let mut current = cost.get();
             match event {
-                rusqlite::ffi::SQLITE_TRACE_STMT => current.statements += 1,
-                rusqlite::ffi::SQLITE_TRACE_ROW => current.rows += 1,
-                _ => unreachable!("only statement and row events are registered"),
+                ListenerEvent::Statement { .. } => current.statements += 1,
+                ListenerEvent::Row { .. } => current.rows += 1,
+                ListenerEvent::Profile { .. } => return,
             }
             cost.set(current);
         });
-        0
     }
 
     /// Run `probe` with the store's next pooled reader traced, and return what
@@ -828,30 +857,17 @@ mod tests {
         store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
         probe: impl FnOnce(),
     ) -> TracedSqlCost {
-        {
+        let guard = {
             let connection = store.read_conn().expect("check out a reader to trace");
-            // SAFETY: the callback keeps no SQLite pointers, and the same
-            // reader is checked out again below to unregister it before the
-            // store is dropped.
-            let status = unsafe {
-                rusqlite::ffi::sqlite3_trace_v2(
-                    connection.handle(),
-                    rusqlite::ffi::SQLITE_TRACE_STMT | rusqlite::ffi::SQLITE_TRACE_ROW,
-                    Some(record_traced_sql),
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
-        }
+            brokk_bifrost_core::cache_db::sql_profile::attach_listener(
+                &connection,
+                std::sync::Arc::new(record_traced_sql),
+            )
+        };
         TRACED_SQL_COST.with(|cost| cost.set(TracedSqlCost::default()));
         probe();
         let cost = TRACED_SQL_COST.with(Cell::get);
-        let connection = store.read_conn().expect("check out the traced reader");
-        // SAFETY: a zero mask removes the callback from the same connection.
-        let status = unsafe {
-            rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut())
-        };
-        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        drop(guard);
         cost
     }
 
@@ -979,7 +995,13 @@ mod tests {
             .file("src/first.rs", first)
             .file("src/second.rs", second)
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let targets = ["src/left.rs", "src/right.rs"].map(|path| {
             rust.declarations(&fixture.file(path))
                 .into_iter()
@@ -992,9 +1014,10 @@ mod tests {
             "identical source bytes at different mounts name distinct declarations"
         );
         let cancellation = CancellationToken::new();
-        for (index, path, source, expected_complete) in [
-            (0, "src/first.rs", first, true),
-            (1, "src/second.rs", second, false),
+        // Certified-absent modules preserve crate-wide route completeness.
+        for (index, path, source, expected_reverse_complete, expected_graph_complete) in [
+            (0, "src/first.rs", first, true, true),
+            (1, "src/second.rs", second, false, false),
         ] {
             let file = fixture.file(path);
             let caller = rust
@@ -1060,9 +1083,24 @@ mod tests {
             };
             assert_eq!(
                 matches!(&reverse, FuzzyResult::Success { .. }),
-                expected_complete,
+                expected_reverse_complete,
                 "{reverse:?}"
             );
+            if let FuzzyResult::Incomplete { diagnostics, .. } = &reverse {
+                let reason_kinds = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.reason_kind.as_str())
+                    .collect::<HashSet<_>>();
+                assert!(
+                    !reason_kinds.contains("rust_route_evidence_incomplete"),
+                    "{reverse:?}"
+                );
+                assert_eq!(
+                    reason_kinds.contains("native_reference_inventory_incomplete"),
+                    index == 1,
+                    "only second.rs has an opaque reference inventory: {reverse:?}"
+                );
+            }
             let buckets = match &reverse {
                 FuzzyResult::Success {
                     hits_by_overload, ..
@@ -1098,10 +1136,19 @@ mod tests {
                 .unwrap(),
             );
             assert_eq!(
-                complete, expected_complete,
+                complete, expected_graph_complete,
                 "{:?}",
                 rooted.forward_completeness
             );
+            match (&rooted.forward_completeness, index) {
+                (EdgeCompleteness::Complete, 0) => {}
+                (EdgeCompleteness::Incomplete { reasons }, 1) => assert!(
+                    reasons.contains(&EdgeIncompleteReason::ReferenceEnumerationIncomplete),
+                    "{:?}",
+                    rooted.forward_completeness
+                ),
+                (reasons, _) => panic!("unexpected rooted forward completeness: {reasons:?}"),
+            }
             assert_eq!(rooted.edges.len(), 1);
             let edge = &rooted.edges[0];
             assert_eq!(
@@ -1894,7 +1941,9 @@ mod tests {
                 "paths={paths:?}: {:?}",
                 scope.store_error()
             );
+            // Python coverage is complete relative to the selected environment.
             assert!(graph.complete, "paths={paths:?}: {graph:#?}");
+            assert!(graph.incomplete_reasons.is_empty(), "{graph:#?}");
             assert!(
                 graph
                     .edges

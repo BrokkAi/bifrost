@@ -10,6 +10,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct RubyKnowledge;
 
 impl LanguageKnowledge for RubyKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }

@@ -133,7 +133,12 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        brokk_bifrost_rust::lexical_scope::parse_rust_tree(source).expect("parse Rust")
+        // This test has no Rust analyzer owner; retain nothing beyond this parse.
+        let caches = brokk_bifrost_rust::lexical_scope::RustLexicalCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+        );
+        brokk_bifrost_rust::lexical_scope::parse_rust_tree_with(&caches, source)
+            .expect("parse Rust")
     }
 
     #[test]

@@ -41,6 +41,7 @@ mod version;
 mod workspace;
 
 pub use artifacts::*;
+pub use brokk_bifrost_analysis::retention_budget::RetentionBudget;
 pub use brokk_bifrost_rql::CodeQuery;
 pub use codec::{
     ExtensionDecodeError, ExtensionEncodeError, ExtensionRequest, ExtensionResponse,

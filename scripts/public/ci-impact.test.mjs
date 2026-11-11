@@ -222,24 +222,7 @@ test("unrelated Rust, documentation, and plugin paths do not select CSMI", () =>
   }
 });
 
-test("pinned semantic-pack inputs and builders select only their matching lanes", () => {
-  for (const [changedPath, component] of [
-    ["semantic-packs/jvm/temurin-jdk-21.0.8+9.json", "semantic_pack_jvm"],
-    ["semantic-packs/python/typeshed-stdlib-2026.8.31.json", "semantic_pack_python"],
-    ["semantic-packs/typescript/typescript-7.0.2.json", "semantic_pack_typescript"],
-    ["semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json", "semantic_pack_rust"],
-    ["scripts/public/build-pinned-jvm-semantic-packs.sh", "semantic_pack_jvm"],
-    ["scripts/public/build-pinned-python-semantic-packs.sh", "semantic_pack_python"],
-    ["scripts/public/build-pinned-typescript-semantic-packs.sh", "semantic_pack_typescript"],
-    ["scripts/public/build-pinned-rust-semantic-packs.sh", "semantic_pack_rust"],
-  ]) {
-    assert.deepEqual(
-      selected(classifyChangeSet({ eventName: "pull_request", changedPaths: [changedPath] })),
-      [component],
-      changedPath,
-    );
-  }
-
+test("semantic-pack compiler source selects every semantic-pack lane", () => {
   assert.deepEqual(
     selected(
       classifyChangeSet({

@@ -57,13 +57,16 @@ mod python_extraction_tests {
     #[test]
     fn exact_dispatch_retains_python_imported_callable_proof() {
         let source = "import subprocess\ndef caller(command):\n    return subprocess.run(command, shell=True)\n";
-        let fixture =
+        let mut fixture =
             AnalyzerFixture::new_for_language(Language::Python, &[("external.py", source)]);
+        crate::engine_tests::python_analyzer_semantic_workspace_oracle_dispatch::runtime_fixture::activate(
+            &mut fixture, "external.py", &["subprocess"], "run", &["command", "shell"],
+        );
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
             AnalyzerQueryScope::new(fixture.analyzer.analyzer()).token(),
             &ExactCallLocation {
-                file: ProjectFile::new(fixture.project_root(), "external.py"),
+                file: ProjectFile::new(fixture.project_root(), "src/external.py"),
                 call_span: call_span(source, "subprocess.run(command, shell=True)"),
             },
             Arc::from(source),
@@ -82,7 +85,10 @@ mod python_extraction_tests {
             vec![CallDispatchBoundaryKind::External {
                 callee_text: Some("subprocess.run".into()),
                 normalized_static_owner: None,
-                external_callee_identity: None,
+                // Runtime admission carries the selected external identity (step 1b).
+                external_callee_identity: Some(brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdentity::new(
+                    Language::Python, "subprocess", "run",
+                )),
             }]
         );
         let proof = lookup
@@ -90,6 +96,7 @@ mod python_extraction_tests {
             .as_ref()
             .expect("Python import proof");
         assert_eq!(proof.canonical_callee(), "subprocess.run");
+        assert!(proof.python_runtime_artifact().is_some(), "{lookup:#?}");
         assert_eq!(
             proof.call_application(),
             CallApplicationKind::PackageFunction
@@ -220,6 +227,13 @@ mod python_residency_tests {
         );
         assert_eq!(survey.sites.len(), 40, "{survey:?}");
         assert!(!survey.truncated, "{survey:?}");
-        assert!(survey.diagnostics.is_empty(), "{survey:?}");
+        // Scope obligations do not make the bounded caller inventory incomplete.
+        assert!(
+            survey
+                .diagnostics
+                .iter()
+                .all(|diagnostic| { !diagnostic.message.contains("python_environment_open") }),
+            "{survey:?}"
+        );
     }
 }

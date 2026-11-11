@@ -176,7 +176,7 @@ pub(crate) fn csharp_visible_extension_method_candidates(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-) -> Vec<CodeUnit> {
+) -> brokk_bifrost_csharp::graph::resolver::ExtensionCandidates {
     brokk_bifrost_csharp::graph::resolver::visible_extension_method_candidates(
         csharp,
         token,
@@ -204,7 +204,7 @@ pub(crate) fn csharp_visible_extension_method_candidates_in_session(
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
     session: &ResolutionSession,
-) -> Vec<CodeUnit> {
+) -> brokk_bifrost_csharp::graph::resolver::ExtensionCandidates {
     brokk_bifrost_csharp::graph::resolver::visible_extension_method_candidates_in_session(
         csharp,
         token,

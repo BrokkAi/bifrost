@@ -73,6 +73,12 @@ mod jvm_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
 
+    use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
+
+    use brokk_bifrost_core::analyzer::usages::model::ReferenceKindSet;
+
+    use brokk_bifrost_core::analyzer::usages::model::Truth;
+
     use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 
     use brokk_bifrost_core::analyzer::usages::model::UsageProof;
@@ -510,12 +516,8 @@ class Owner {\n\
             targets
                 .iter()
                 .filter(|target| target.is_field())
-                .any(|target| {
-                    !index
-                        .inverse_for(target)
-                        .completeness
-                        .covers(EdgeAxis::KindClassification)
-                })
+                .any(|target| !index.inverse_for(target).completeness.is_complete()),
+            "a field target must keep the field-only gap the type/callable check above ignores"
         );
 
         let uncovered = CodeUnit::new(
@@ -1374,13 +1376,13 @@ class Owner {\n\
             &CancellationToken::new(),
         )
         .expect("the inline native edge batch must project");
+        // The file has a classifier, so no row reports an unsupported kind
+        // axis; what the classifier cannot prove stays undecided on the row
+        // (asserted on the same-owner write below).
         assert_eq!(
             projected.completeness(),
             &EdgeCompleteness::Incomplete {
-                reasons: vec![
-                    EdgeIncompleteReason::ForwardResolutionIncomplete,
-                    EdgeIncompleteReason::AxisUnsupported(EdgeAxis::KindClassification),
-                ],
+                reasons: vec![EdgeIncompleteReason::ForwardResolutionIncomplete],
             }
         );
         assert!(
@@ -1406,6 +1408,20 @@ class Owner {\n\
         assert_eq!(same_owner.owner_relation, OwnerRelation::SameOwner);
         assert_eq!(same_owner.usage_kind, UsageHitKind::SelfReceiver);
         assert_eq!(same_owner.proof, UsageProof::Proven);
+        // `value = 1`: the assignment operator proves a plain write without
+        // a read.
+        assert_eq!(
+            same_owner
+                .reference_kind
+                .matches(ReferenceKindSet::from_kinds([ReferenceKind::FieldWrite])),
+            Truth::True
+        );
+        assert_eq!(
+            same_owner
+                .reference_kind
+                .matches(ReferenceKindSet::from_kinds([ReferenceKind::FieldRead])),
+            Truth::False
+        );
         assert_eq!(
             same_owner.site.range,
             Range {

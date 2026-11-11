@@ -207,6 +207,7 @@ fn revalidate(loaded: LoadedPolicy, source: &str) -> Result<LoadedPolicy, Loaded
         loaded.endpoint_set_dependencies,
         loaded.precedence_manifest,
         loaded.resolved_taint,
+        loaded.resolved_without_flow,
         loaded.resolved_typestate,
     )
 }
@@ -675,6 +676,7 @@ fn inline_selector_cannot_disappear_from_loaded_policy() {
         Vec::new(),
         Vec::new(),
         PolicyPrecedenceManifest::default(),
+        None,
         None,
         None,
     )

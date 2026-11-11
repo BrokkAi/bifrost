@@ -1,6 +1,5 @@
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
-use rusqlite::trace::TraceEventCodes;
-use rusqlite::{OptionalExtension, params, params_from_iter, trace::TraceEvent, types::Value};
+use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 use std::sync::{LazyLock, Mutex};
 
 use super::{AnalyzerStore, Result, StoreError, WorkspaceId};
@@ -58,13 +57,20 @@ static IMPORT_GRAPH_STATEMENT_PROFILE: LazyLock<
     Mutex<std::collections::BTreeMap<String, ImportGraphStatementProfile>>,
 > = LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
 
-fn record_import_graph_statement_profile(event: TraceEvent<'_>) {
-    if let TraceEvent::Profile(statement, duration) = event {
+fn record_import_graph_statement_profile(
+    event: brokk_bifrost_core::cache_db::sql_profile::ListenerEvent<'_>,
+) {
+    if let brokk_bifrost_core::cache_db::sql_profile::ListenerEvent::Profile {
+        sql: Some(sql),
+        elapsed,
+        ..
+    } = event
+    {
         let mut profile = IMPORT_GRAPH_STATEMENT_PROFILE
             .lock()
             .expect("import graph SQL profile lock");
-        let entry = profile.entry(statement.sql().into_owned()).or_default();
-        let elapsed_ns = duration.as_nanos();
+        let entry = profile.entry(sql.to_owned()).or_default();
+        let elapsed_ns = elapsed.as_nanos();
         entry.calls += 1;
         entry.total_ns += elapsed_ns;
         entry.max_ns = entry.max_ns.max(elapsed_ns);
@@ -1342,12 +1348,9 @@ impl AnalyzerStore {
                 .iter()
                 .map(|(path, ordinal)| (path.as_str(), *ordinal))
                 .collect::<std::collections::HashSet<_>>();
-            if profile_sql {
-                transaction.trace_v2(
-                    TraceEventCodes::SQLITE_TRACE_PROFILE,
-                    Some(record_import_graph_statement_profile),
-                );
-            }
+            let profile_guard = profile_sql.then(|| brokk_bifrost_core::cache_db::sql_profile::attach_listener(
+                &transaction, std::sync::Arc::new(record_import_graph_statement_profile)));
+
             mark_publish_stage!("transaction_start_and_identity");
             if stored_identity.is_none() {
                 transaction.execute(
@@ -1801,7 +1804,7 @@ impl AnalyzerStore {
                 publish_stages.push(("commit", publish_stage_started.elapsed().as_nanos()));
             }
             if profile_sql {
-                connection.trace_v2(TraceEventCodes::empty(), None);
+                drop(profile_guard);
                 let mut profile = std::mem::take(
                     &mut *IMPORT_GRAPH_STATEMENT_PROFILE
                         .lock()

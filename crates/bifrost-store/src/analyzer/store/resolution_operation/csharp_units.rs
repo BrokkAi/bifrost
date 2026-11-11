@@ -7,7 +7,7 @@ use super::*;
 use crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory;
 use crate::analyzer::store::{
     WorkspaceSnapshotId,
-    csharp_compilation::{CSharpCompilationView, SelectedCSharpMembership},
+    csharp_compilation::{CSharpCompilationView, CertifiedCSharpHandle, SelectedCSharpMembership},
 };
 use rusqlite::types::Value;
 
@@ -43,11 +43,16 @@ impl<'a, 'selection> CSharpUnitReader<'a, 'selection> {
     pub fn new(
         selection: &'a SelectedResolutionMountInventory<'selection>,
         snapshot: &'a WorkspaceSnapshotId,
+        certified: &CertifiedCSharpHandle,
         identities: &'a SelectedContextIdentities,
     ) -> Result<Self> {
         Ok(Self {
             selection,
-            compilations: CSharpCompilationView::selected(selection.connection(), snapshot)?,
+            compilations: Some(CSharpCompilationView::certified(
+                selection.connection(),
+                snapshot,
+                certified,
+            )),
             identities,
             placements: Default::default(),
             access: Default::default(),
@@ -62,7 +67,7 @@ impl<'a, 'selection> CSharpUnitReader<'a, 'selection> {
     ) -> Result<Option<super::super::csharp_compilation::CSharpCompilationMetadata>> {
         self.compilations
             .as_ref()
-            .map(|view| view.metadata(placement.project_path.as_deref()))
+            .map(|view| view.metadata(placement.compilation_id))
             .transpose()
             .map(Option::flatten)
     }
@@ -312,31 +317,23 @@ impl UnitAccessRules for CSharpAccessRules<'_> {
     }
 }
 
-// Read A is trial-only. Read B replaces this function with compilation-keyed
-// extent and coverage reads without changing the returned inventory contract.
-pub const GLOBAL_USING_CANDIDATES: &str = "SELECT DISTINCT v.rel_path
- FROM main.resolution_compilation_imports g
- CROSS JOIN main.blobs b ON b.id=g.blob_id
- CROSS JOIN main.workspace_file_versions v INDEXED BY idx_workspace_file_versions_snapshot_blob
- ON v.workspace_id=?1 AND v.lang='csharp' AND v.generation=?2 AND v.blob_oid=b.blob_oid
- WHERE v.valid_from<=?3 AND (v.valid_until IS NULL OR v.valid_until>?3) AND v.input_kind='source'
- AND NOT EXISTS(SELECT 1 FROM temp.selected_resolution_overlay_masks x
- WHERE x.storage_language='csharp' AND x.persisted_relative_path=v.rel_path)
- UNION SELECT m.persisted_relative_path FROM temp.selected_resolution_mounts m
- JOIN main.resolution_compilation_imports g ON g.blob_id=m.blob_id
- WHERE m.storage_language='csharp' AND m.file_version_id IS NULL";
-pub const GLOBAL_USING_SITES: &str = "SELECT g.import_site,s.local_name
- FROM main.resolution_compilation_imports g
- LEFT JOIN main.resolution_import_selectors s ON s.blob_id=g.blob_id AND s.site=g.import_site
- WHERE g.blob_id=?1 ORDER BY g.import_site";
-pub const GLOBAL_USING_COVERAGE: &str = "SELECT l.expected_unmasked_mount_count,
- (SELECT count(*) FROM temp.selected_resolution_mounts m WHERE m.storage_language='csharp' AND m.file_version_id IS NOT NULL),
- (SELECT coalesce(sum(x.expected_transient_replacement_count),0) FROM temp.selected_resolution_overlay_masks x WHERE x.storage_language='csharp'),
- (SELECT count(*) FROM temp.selected_resolution_mounts m WHERE m.storage_language='csharp' AND m.file_version_id IS NULL),
- (SELECT json_group_array(m.persisted_relative_path) FROM temp.selected_resolution_mounts m
-  WHERE m.storage_language='csharp' AND EXISTS(SELECT 1 FROM main.resolution_gaps gap
-   WHERE gap.blob_id=m.blob_id AND gap.covers=1))
- FROM temp.selected_resolution_languages l WHERE l.storage_language='csharp'";
+// A coverage row counts only for a compilation of a set at the current
+// derivation version: a row left by an older derivation proves nothing.
+pub const SELECTED_GLOBAL_USING_COVERAGE: &str =
+    "SELECT v.membership_complete,v.publications_expected,
+ v.publications_installed,json(v.reasons)
+ FROM temp.selected_csharp_compilation_using_coverage v
+ JOIN main.csharp_compilations c ON c.compilation_id=v.compilation_id
+ JOIN main.csharp_compilation_sets s ON s.set_id=c.set_id AND s.derivation_version=?2
+ WHERE v.compilation_id=?1";
+// The extent holds only installed publications of selected members; the reader
+// checks each row's blob against the selected mount, and coverage proves the
+// publication counts. Joining the member view would build an automatic index.
+pub const SELECTED_GLOBAL_USING_SITES: &str =
+    "SELECT e.rel_path,e.blob_id,e.import_site,s.local_name
+ FROM temp.selected_csharp_global_using_extent e
+ LEFT JOIN main.resolution_import_selectors s ON s.blob_id=e.blob_id AND s.site=e.import_site
+ WHERE e.compilation_id=?1";
 
 pub(super) struct CSharpGlobalUsingRoute {
     pub fragment: BindingFragmentId,
@@ -348,9 +345,35 @@ pub(super) struct CSharpGlobalUsings {
     pub completion: crate::analyzer::resolution::ResolutionCompletion,
 }
 impl CSharpUnitReader<'_, '_> {
+    #[cfg(feature = "test-support")]
+    pub fn global_usings_for_test(
+        &mut self,
+        compilation_id: i64,
+        project_path: Option<String>,
+        cancellation: &CancellationToken,
+        session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
+    ) -> Result<Option<(usize, crate::analyzer::resolution::ResolutionCompletion)>> {
+        let placement = CSharpUnitPlacement {
+            compilation_id,
+            project_path,
+            key: PlacementKey {
+                language: Language::CSharp,
+                unit_digest: [0; 32],
+                subject: PlacementSubject {
+                    blob: None,
+                    path: None,
+                    file_version: None,
+                },
+                declaration: None,
+            },
+        };
+        Ok(self
+            .global_usings(&placement, cancellation, session)?
+            .map(|answer| (answer.routes.len(), answer.completion)))
+    }
+
     pub(super) fn global_usings(
         &mut self,
-        snapshot: &WorkspaceSnapshotId,
         placement: &CSharpUnitPlacement,
         cancellation: &CancellationToken,
         session: &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
@@ -358,143 +381,96 @@ impl CSharpUnitReader<'_, '_> {
         use crate::analyzer::resolution::{ResolutionCompletion, ResolutionIncompleteReason};
         let conn = self.selection.connection();
         let mut missing = Vec::new();
-        let counts = conn
-            .prepare_cached(GLOBAL_USING_COVERAGE)?
-            .query_row([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })?;
-        if counts.0 != counts.1 || counts.2 != counts.3 {
-            missing.push(format!(
-                "source publications: expected/installed persisted {}/{}, transient {}/{}",
-                counts.0, counts.1, counts.2, counts.3
-            ));
-        }
-        if !self
-            .compilations
-            .as_ref()
-            .map(|view| view.inventory_gaps(placement.compilation_id))
-            .transpose()?
-            .is_some_and(|gaps| gaps.is_empty())
-        {
-            let gaps = self.inventory_gaps(placement)?;
-            missing.push(format!("compilation inventory is open: {gaps:?}"));
-        }
-        let changed: bool = conn
-            .prepare_cached(super::super::csharp_compilation::SELECTED_CONFIGURATION_MASK_SQL)?
+        let coverage = conn
+            .prepare_cached(SELECTED_GLOBAL_USING_COVERAGE)?
             .query_row(
                 rusqlite::params![
-                    snapshot.workspace_id.as_str(),
-                    snapshot.generation.0,
-                    snapshot.revision
+                    placement.compilation_id,
+                    super::super::csharp_compilation::DERIVATION_VERSION
                 ],
-                |row| row.get(0),
-            )?;
-        if changed {
-            missing.push(
-                "configuration inputs are replaced; derived membership is unavailable".into(),
-            );
-        }
-        // A published fragment with incomplete enumeration does not certify
-        // zero global directives. In particular an unsupported using target can
-        // have a gap and no marker; retain that source's inventory obligation.
-        let uncertain: Vec<String> = serde_json::from_str(&counts.4).map_err(|error| {
-            StoreError::corrupt(format!("invalid global-using coverage paths: {error}"))
-        })?;
-        for path in uncertain {
-            if cancellation.is_cancelled() || !session.scope_step() {
-                return Ok(None);
-            }
-            if let Some(view) = self.compilations.as_ref() {
-                match view.selected_compilations_of(self.selection, &path)? {
-                    SelectedCSharpMembership::Proven(membership) => {
-                        if !membership
-                            .open
-                            .iter()
-                            .any(|open| open.compilation_id == placement.compilation_id)
-                            && !membership.proven.contains(&placement.compilation_id)
-                        {
-                            continue;
-                        }
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        // Completeness comes from the coverage row alone, never from the absence
+        // of extent rows. Its `metadata` reason is native demand's obligation.
+        match coverage {
+            Some((membership, expected, installed, reasons)) => {
+                if !membership {
+                    let gaps = self.inventory_gaps(placement)?;
+                    missing.push(format!("compilation inventory is open: {gaps:?}"));
+                }
+                if expected != installed {
+                    missing.push(format!(
+                        "source publications: expected/installed {expected}/{installed}"
+                    ));
+                }
+                let reasons: Vec<serde_json::Value> =
+                    serde_json::from_str(&reasons).map_err(|error| {
+                        StoreError::corrupt(format!(
+                            "invalid global-using coverage reasons: {error}"
+                        ))
+                    })?;
+                for reason in &reasons {
+                    if reason["kind"] != "source_enumeration" {
+                        continue;
                     }
-                    SelectedCSharpMembership::Unproven { .. } => {}
-                    SelectedCSharpMembership::NotSelected => {}
+                    let paths = reason["paths"].as_array().ok_or_else(|| {
+                        StoreError::corrupt("source enumeration reason lacks its paths")
+                    })?;
+                    for path in paths {
+                        missing.push(format!(
+                            "source marker enumeration incomplete: {}",
+                            path.as_str().ok_or_else(|| {
+                                StoreError::corrupt("source enumeration path is not text")
+                            })?
+                        ));
+                    }
                 }
             }
-            missing.push(format!("source marker enumeration incomplete: {path}"));
+            None => missing.push("selected compilation coverage row missing".into()),
         }
         let mut routes = Vec::new();
-        let mut statement = conn.prepare_cached(GLOBAL_USING_CANDIDATES)?;
-        let mut rows = statement.query(rusqlite::params![
-            snapshot.workspace_id.as_str(),
-            snapshot.generation.0,
-            snapshot.revision
-        ])?;
-        while let Some(row) = rows.next()? {
+        let mut sites = conn
+            .prepare_cached(SELECTED_GLOBAL_USING_SITES)?
+            .query_map([placement.compilation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        sites.sort_unstable();
+        for (path, blob, site, alias) in sites {
             if cancellation.is_cancelled() || !session.scope_step() {
                 return Ok(None);
             }
-            let path: String = row.get(0)?;
             let Some(mount) = self.selection.mount_record_for_path("csharp", &path)? else {
-                missing.push(format!("source publication unavailable: {path}"));
+                missing.push(format!("selected source mount unavailable: {path}"));
                 continue;
             };
-            let Some(view) = self.compilations.as_ref() else {
-                continue;
-            };
-            let ids = match view.selected_compilations_of(self.selection, &path)? {
-                SelectedCSharpMembership::Proven(membership) => {
-                    if membership
-                        .open
-                        .iter()
-                        .any(|open| open.compilation_id == placement.compilation_id)
-                    {
-                        missing.push(format!("membership open: {path}: {:?}", membership.open));
-                    }
-                    membership.proven
-                }
-                SelectedCSharpMembership::Unproven { .. } => {
-                    missing.push(format!("membership unavailable: {path}"));
-                    continue;
-                }
-                SelectedCSharpMembership::NotSelected => {
-                    missing.push(format!("membership unavailable: {path}"));
-                    continue;
-                }
-            };
-            if !ids.contains(&placement.compilation_id) {
+            if mount.blob_id() != blob {
+                missing.push(format!("selected source publication differs: {path}"));
                 continue;
             }
-            // A candidate blob merely discovers a path. Only its selected mount
-            // authorizes the publication/parse variant used to hydrate a route.
-            let mut sites = conn.prepare_cached(GLOBAL_USING_SITES)?;
-            for site in sites.query_map([mount.blob_id()], |row| {
-                Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?))
-            })? {
-                if cancellation.is_cancelled() || !session.scope_step() {
-                    return Ok(None);
-                }
-                let (site, alias) = site?;
-                let route = super::imports::route_at_site(conn, mount.blob_id(), site)?
-                    .ok_or_else(|| {
-                        StoreError::corrupt("global using marker lacks its root import")
-                    })?;
-                // Root bound_name is the target demand; the selector owns the
-                // local alias spelling, as the shared named-scope reader does.
-                if route.kind == "named" && alias.is_none() {
-                    return Err(StoreError::corrupt("global alias lacks its named selector"));
-                }
-                routes.push(CSharpGlobalUsingRoute {
-                    fragment: mount.fragment_id(),
-                    alias,
-                    route,
-                });
+            let route = super::imports::route_at_site(conn, blob, site)?
+                .ok_or_else(|| StoreError::corrupt("global using extent lacks its root import"))?;
+            if route.kind == "named" && alias.is_none() {
+                return Err(StoreError::corrupt("global alias lacks its named selector"));
             }
+            routes.push(CSharpGlobalUsingRoute {
+                fragment: mount.fragment_id(),
+                alias,
+                route,
+            });
         }
         missing.sort_unstable();
         missing.dedup();

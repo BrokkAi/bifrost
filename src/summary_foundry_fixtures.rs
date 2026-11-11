@@ -236,6 +236,7 @@ fn run_case(
             persistence: None,
         },
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .map_err(|error| FixtureRunError::Evaluation {
         detail: error.to_string(),

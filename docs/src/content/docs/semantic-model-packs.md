@@ -419,7 +419,7 @@ These hosts run the reviewed workspace route:
 | Host | When it runs | On failure |
 | --- | --- | --- |
 | A CLI policy run without `--sources`: `bifrost --policy`, `--policy-file`, and `bifrost scan` | every policy run, including the diff base, when the directory exists | a `workspace-model-load-failed` report diagnostic and exit 2 |
-| A `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries | when the session activates packs, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` (also `1` or `enabled`) | the session records a failed activation; a policy run in that session reports `pack-activation-failed` and exits 2 |
+| A `SearchToolsService` session: the MCP server, one-shot `--tool` and `--query-file` runs, a policy run with `--sources`, and the Rust and Python libraries | when the session activates packs, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` (also `1` or `enabled`) | the session records a failed activation, which `get_active_workspace` reports; every `query_code` answer that can depend on semantic models carries an incomplete `semantic_pack_activation_failed` diagnostic that gives the reason; a policy run in that session reports `pack-activation-failed` and exits 2 |
 
 `BIFROST_WORKSPACE_SEMANTIC_MODELS` is off by default. It also accepts `off`,
 `0`, and `disabled`; any other value is an error. When the variable is unset
@@ -520,14 +520,27 @@ rules failed closed, so production emitted neither rule.
 
 ## Version and extension rules
 
-Every source pack must contain a `schema_version` this build supports, from
-`2` through `22`. The field is mandatory: omitted, zero, and unsupported versions
+Every source pack must contain a `schema_version` this build supports: `2`
+through `22`, or `26` through `32`. Versions `23`, `24`, and `25` are explicitly unsupported.
+The field is mandatory: omitted, zero, and unsupported versions
 fail instead of falling back. Every object rejects unknown fields, and every
 variant is explicitly tagged. A schema addition takes a new version number and
 a new checked-in schema rather than silently widening a number that already
 shipped.
 
-The newest schema is `22`. Packs generated from pinned artifacts declare the
+Schema `32` carries optional structured `alias_target` facts over each alias's
+own type parameters. Missing targets make no claim. Rust selected-type readers
+expand complete targets recursively through shared type resolution; missing or
+incomplete target evidence remains Partial.
+
+Schema `26` carries reviewed receiver lifecycle subject effects and exhaustive
+event-set coverage claims; ordinary generated packs use schema `22`.
+Schema `27` carries fenced completeness claims, and `28` carries Rust artifact
+approximation provenance. Schema `29` carries public Rustdoc cross-crate
+reexports; they resolve only through the selected Cargo graph and exact
+defining artifact. Rust dependency production uses schema `29`; packs without
+these claims decode with the same declarations under their lower valid labels.
+Packs generated from pinned artifacts declare the
 lowest schema their content needs, never below `8`, so a reader that predates a
 field still accepts a pack that does not use it.
 
@@ -585,7 +598,7 @@ incomplete signature or body; none of those absences supplies an unknown type
 for a known port.
 
 The machine-readable contract is
-[`schemas/semantic-model-pack-v22.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v22.schema.json).
+[`schemas/semantic-model-pack-v32.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v32.schema.json).
 It is generated from `AuthoredSemanticModelPack`; a repository test requires
 the checked-in bytes to match the Rust-derived schema exactly.
 The version-two through version-eight schemas stay checked in as frozen
@@ -999,7 +1012,40 @@ against the original wheel archives without running Python. The
 [reference](/reference/semantic-packs/) describes that field. The separately
 distributed `bifrost-lsp` server documents its own initialization options.
 
-Ruby records likewise use passive, host-supplied evidence. A
+Every host, including the CLI policy runner, `--query-file` and the MCP
+server, also reads the workspace's bundles without configuration. Each
+`Gemfile.lock` (or `gems.locked`) spec from the rubygems.org `GEM` source is
+activation evidence naming the gem and its exact version, so an installed or
+reviewed `.bifrost/semantic-models` pack whose shard names
+`"package": {"name": "rubyzip", "version": "=2.3.2"}` activates from the
+lockfile alone. A locked gem with no compatible pack is not a failure. It
+fails closed. `GIT` and `PATH` specs and other gem servers activate nothing,
+and a gem that bundles lock at more than one version activates none of them
+and is reported as `ruby.lockfile.ambiguous_activation`, because activation is
+workspace-wide. A Ruby class from a pack constructs instances only through a
+declared singleton `new` whose result names the class.
+
+Pack requirements are semver, so a RubyGems version becomes a semver
+coordinate: the first three release segments are major, minor and patch, a
+prerelease such as `8.1.0.beta1` becomes `8.1.0-beta.1`, and later release
+segments become build metadata, which requirements ignore. A four-segment
+Rails `7.0.8.1` therefore matches a pack that requires `=7.0.8` or
+`>=7.0.8, <7.0.9`, and no requirement can tell `7.0.8.1` from `7.0.8.2`.
+
+A bundle that vendors a locked gem's archive also generates that gem's
+declarations, as host-supplied archive evidence does. Bifrost looks for the
+file Bundler writes, `<gem>-<version>[-<platform>].gem`, first in the bundle's
+`vendor/cache/` (`bundle cache`), then in each
+`vendor/bundle/ruby/<abi>/cache/` (`bundle install --path vendor/bundle`), and
+uses the first one present. A `CHECKSUMS` entry for that spec must match the
+archive, or nothing is generated and the mismatch is reported. One archive per
+gem generates declarations for the whole workspace. A compatible installed or
+reviewed pack for the same gem and version outranks the generated
+declarations, which would otherwise give its constants two owners; generation
+serves only gems no reviewed pack covers. An installed tree without its
+archive generates nothing.
+
+Ruby records can also use passive, host-supplied archive evidence. A
 `RubyDependencyApiEvidence` row identifies one `Gemfile.lock` by path and
 SHA-256, the exact Ruby version and platform, explicit approved archive roots,
 and each selected gem's name, version, source, optional checksum, and `.gem`
@@ -1457,20 +1503,16 @@ payload:
           certainty: possible
 ```
 
-## Shipped packs
+## Pack content
 
-The engine embeds 42 reviewed packs: Scala case-class and Lombok and getset
-generator rules, JDK 21 result-use obligations, Node runtime-values,
-child-process, and `Buffer` packs, Python process-input and `os.system` packs,
-and Go standard-library, concurrency, and Testify packs. Hosts register them
-when they bootstrap the catalog. Most activate when the workspace contains the
-pack's language. The eight Node packs set `safety.review_required` and also need
-an `enable` entry. The [shipped packs table](/reference/semantic-packs/) lists
-each pack, what it models, and what activates it.
+The engine ships no packs. Open packs are released in
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs) and installed at
+bootstrap or from an extracted release; see
+[Pack content](/reference/semantic-packs/#pack-content).
 
 ## Reviewed Node runtime packs
 
-The embedded registry ships reviewed Node runtime packs for JavaScript
+Bifrost-packs releases reviewed Node runtime packs for JavaScript
 and TypeScript: a runtime-values pack per language modeling the `process`
 global exposure with `env` static-property and `argv` static-index
 keyed-read behaviors, and a child-process summaries pack modeling the
@@ -1489,7 +1531,7 @@ callee the activated packs do not summarize keeps the run inconclusive.
 
 Runtime-values activation is a layered contract. An exposure authored as
 `enabled` is intrinsically eligible within its model; it never bypasses
-pack activation. Every shipped Node runtime pack sets
+pack activation. Every reviewed Node runtime pack sets
 `safety.review_required`, so
 activation additionally needs exact host-supplied evidence -- language,
 npm ecosystem, the exact Node artifact coordinates and digest, and the

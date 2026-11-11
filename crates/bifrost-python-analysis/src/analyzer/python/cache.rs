@@ -24,15 +24,6 @@ pub(crate) struct PythonModuleMemberMutationKey {
     member: String,
 }
 
-impl PythonUsageEdgesKey {
-    pub(crate) fn new(nodes: &HashSet<String>, targets: &HashSet<String>) -> Self {
-        Self {
-            caller_nodes: sorted_names(nodes),
-            callee_targets: sorted_names(targets),
-        }
-    }
-}
-
 impl PythonClassMutationKey {
     pub(crate) fn new(identity_groups: &[Vec<&str>], member: &str) -> Self {
         let mut identity_groups = identity_groups
@@ -145,30 +136,6 @@ pub(crate) fn weight_import_binder(_key: &ProjectFile, value: &Arc<ImportBinder>
         })
         .sum::<usize>();
     (bindings_size + size_of::<ImportBinder>()).min(u32::MAX as usize) as u32
-}
-
-pub(crate) fn weight_python_usage_edges(
-    key: &PythonUsageEdgesKey,
-    edges: &Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges>,
-) -> u32 {
-    let key_bytes = names_weight(&key.caller_nodes) + names_weight(&key.callee_targets);
-    brokk_bifrost_analysis::analyzer::usages::inverted_edges::weight_usage_edge_contents(
-        key_bytes, edges,
-    )
-}
-
-fn sorted_names(names: &HashSet<String>) -> Arc<[String]> {
-    let mut sorted_names = names.iter().cloned().collect::<Vec<_>>();
-    sorted_names.sort_unstable();
-    sorted_names.into()
-}
-
-fn names_weight(names: &Arc<[String]>) -> usize {
-    size_of::<Arc<[String]>>()
-        + names
-            .iter()
-            .map(|item| size_of::<String>() + item.len())
-            .sum::<usize>()
 }
 
 /// A bounded derived value retains its complete input receipt on every hit.
@@ -296,8 +263,6 @@ mod tests {
 
     use crate::analyzer::python::cache::*;
 
-    use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges;
-
     use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
     use brokk_bifrost_core::analyzer::model::Language;
@@ -308,88 +273,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use brokk_bifrost_test_macros::hardwon;
-    #[test]
-    #[hardwon(
-        "#1320: Regression from sustained warm Python benchmark latency: cached exact-target edges must be reused and invalidated with analyzer generation"
-    )]
-    fn usage_edges_are_reused_per_target_set_and_reset_on_update() {
-        let root = tempfile::tempdir().expect("temporary project root");
-        let file = ProjectFile::new(root.path(), "module.py");
-        file.write("def target(): pass\n")
-            .expect("write Python fixture");
-        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
-            root.path().to_path_buf(),
-            Language::Python,
-        )));
-        let nodes = HashSet::from_iter(["module.target".to_string(), "module.other".to_string()]);
-        let first_targets = HashSet::from_iter(["module.target".to_string()]);
-        let second_targets = HashSet::from_iter(["module.target".to_string()]);
-        let builds = AtomicUsize::new(0);
-
-        let first = analyzer
-            .usage_edges_for_targets(&nodes, &first_targets, || {
-                builds.fetch_add(1, Ordering::Relaxed);
-                Some(UsageEdges::default())
-            })
-            .expect("first Python usage graph build");
-        let second = analyzer
-            .usage_edges_for_targets(&nodes, &second_targets, || {
-                panic!("warm Python usage graph must reuse the cached edges")
-            })
-            .expect("cached Python usage graph");
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(1, builds.load(Ordering::Relaxed));
-
-        let different_targets = HashSet::from_iter(["module.other".to_string()]);
-        analyzer.usage_edges_for_targets(&nodes, &different_targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            Some(UsageEdges::default())
-        });
-        assert_eq!(
-            2,
-            builds.load(Ordering::Relaxed),
-            "different callee targets need a separately resolved graph"
-        );
-
-        let updated = analyzer.update(&std::collections::BTreeSet::from([file]));
-        updated.usage_edges_for_targets(&nodes, &first_targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            Some(UsageEdges::default())
-        });
-        assert_eq!(3, builds.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn unavailable_usage_edges_are_not_cached() {
-        let root = tempfile::tempdir().expect("temporary project root");
-        let analyzer = PythonAnalyzer::new(Arc::new(TestProject::new(
-            root.path().to_path_buf(),
-            Language::Python,
-        )));
-        let nodes = HashSet::from_iter(["module.target".to_string()]);
-        let targets = HashSet::from_iter(["module.target".to_string()]);
-        let builds = AtomicUsize::new(0);
-
-        let missing = analyzer.usage_edges_for_targets(&nodes, &targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            None
-        });
-        assert!(missing.is_none());
-
-        let available = analyzer.usage_edges_for_targets(&nodes, &targets, || {
-            builds.fetch_add(1, Ordering::Relaxed);
-            Some(UsageEdges::default())
-        });
-        assert!(available.is_some());
-        assert_eq!(2, builds.load(Ordering::Relaxed));
-
-        analyzer.usage_edges_for_targets(&nodes, &targets, || {
-            panic!("available Python usage graph must be cached")
-        });
-        assert_eq!(2, builds.load(Ordering::Relaxed));
-    }
-
     #[test]
     #[hardwon("#4598: constructor member lookups repeated the same full-workspace mutation scan")]
     fn class_mutation_scan_cache_keys_sorted_inputs_and_resets_on_update() {

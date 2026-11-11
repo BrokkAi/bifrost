@@ -30,7 +30,9 @@ use crate::analyzer::semantic::SemanticLocator;
 
 use crate::analyzer::semantic::SemanticValueKind;
 
-use crate::analyzer::semantic::ValueFlowEndpoint;
+use crate::analyzer::semantic::{
+    CandidateCoverage, SemanticOutcome, ValueFlowEndpoint, ValueFlowRelationKind, ValueFlowSnapshot,
+};
 
 use crate::analyzer::semantic::ValueId;
 
@@ -87,6 +89,111 @@ pub enum PartialFlowPort {
         target: ProcedureId,
         destination: MemoryLocationId,
     },
+}
+
+/// Real member-store outputs of a callee. An unavailable or incomplete
+/// inventory cannot exclude any writeback.
+pub fn written_heap_ports(
+    outcome: &SemanticOutcome<ValueFlowSnapshot>,
+) -> Option<Box<[PartialFlowPort]>> {
+    let snapshot = outcome.available_value()?;
+    if !outcome.is_complete() || snapshot.coverage() != CandidateCoverage::Exhaustive {
+        return None;
+    }
+    let mut ports = Vec::new();
+    for relation in snapshot.relations() {
+        if relation.kind == ValueFlowRelationKind::MemoryStore
+            && let Some(port @ PartialFlowPort::Heap { .. }) = port_of_endpoint(&relation.target)
+            && !ports.contains(&port)
+        {
+            ports.push(port);
+        }
+    }
+    Some(ports.into_boxed_slice())
+}
+
+/// Whether a caller read can observe a callee member write. A read of an
+/// aggregate covers descendants even with an Exact tail; a Summary tail can
+/// also cover descendants. Indexed selectors cannot prove paths disjoint.
+/// Roots must already be in the same callee frame.
+pub fn heap_ports_overlap(read: &PartialFlowPort, written: &PartialFlowPort) -> bool {
+    let (
+        PartialFlowPort::Heap {
+            root: read_root,
+            selectors: read_selectors,
+            ..
+        },
+        PartialFlowPort::Heap {
+            root: written_root,
+            selectors: written_selectors,
+            ..
+        },
+    ) = (read, written)
+    else {
+        return false;
+    };
+    read_root == written_root
+        && read_selectors
+            .iter()
+            .zip(written_selectors.iter())
+            .all(|(read, written)| {
+                bound_return_selector_matches(read, written, |_| None)
+                    || bound_return_selector_matches(written, read, |_| None)
+                    || matches!(
+                        read,
+                        HeapSelector::AnyIndex
+                            | HeapSelector::ExactIndex(_)
+                            | HeapSelector::ConstantIndex(_)
+                    )
+                    || matches!(
+                        written,
+                        HeapSelector::AnyIndex
+                            | HeapSelector::ExactIndex(_)
+                            | HeapSelector::ConstantIndex(_)
+                    )
+            })
+}
+
+/// A field locator may carry the declaration chain of the procedure that
+/// uses it. The declaration anchor identifies the member across those chains.
+/// Uncertain selectors overlap; their producer must report a field-identity
+/// gap before a complete answer can rely on them.
+fn selectors_name_same_member(read: &HeapSelector, written: &HeapSelector) -> bool {
+    match (read, written) {
+        (HeapSelector::Field(read), HeapSelector::Field(written)) => {
+            canonical_field_member_matches(read, written)
+        }
+        _ => read == written,
+    }
+}
+
+/// A declaration-backed field can be used from different procedure scopes.
+pub fn canonical_field_member_matches(read: &SemanticLocator, written: &SemanticLocator) -> bool {
+    read.mount() == written.mount()
+        && read.path() == written.path()
+        && read.language() == written.language()
+        && read.role() == written.role()
+        && read.anchor() == written.anchor()
+}
+
+/// Match selectors after a binding proves that both roots name one object.
+/// A language hook can also map a declared field to its canonical member.
+pub fn bound_return_selector_matches(
+    actual: &HeapSelector,
+    formal: &HeapSelector,
+    canonical_field: impl FnOnce(&SemanticLocator) -> Option<SemanticLocator>,
+) -> bool {
+    selectors_name_same_member(actual, formal)
+        || matches!(
+            (actual, formal),
+            (HeapSelector::ExactIndex(_), HeapSelector::AnyIndex)
+        )
+        || match (actual, formal) {
+            (HeapSelector::Field(actual), HeapSelector::Field(formal)) => {
+                canonical_field(formal).as_ref() == Some(actual)
+            }
+            _ => false,
+        }
 }
 
 /// One selector of a `Heap` port. Mirrors [`AccessSelector`] with the

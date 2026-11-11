@@ -24,9 +24,31 @@ pub(crate) mod model_receiver;
 pub(super) mod native_call_relations;
 #[doc(hidden)]
 pub mod native_graph;
+#[cfg(any(test, feature = "test-support"))]
+mod native_hierarchy;
+#[cfg(any(test, feature = "test-support"))]
+pub use native_hierarchy::{
+    GoFamilyPositiveStopProbe, assemble_go_member_family_for_test,
+    stop_next_go_forward_scan_for_test, take_go_forward_scan_probe_for_test,
+};
 pub(super) mod native_outgoing;
 #[doc(hidden)]
 pub mod native_points;
+/// Read the request's model selection without recording a model read.
+pub(super) fn selected_go_model_snapshot(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+) -> Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot>> {
+    analyzer
+        .active_query_semantic_model_snapshot()
+        .expect("Go model selection requires an entry scope")
+}
+
+pub(super) fn selected_go_model_overlay(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
+) -> Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlay>> {
+    selected_go_model_snapshot(analyzer)
+        .and_then(|snapshot| snapshot.semantic_model_overlay().cloned())
+}
 /// Go's declared receiver rule and the independently established operand
 /// shape select one preparation. Missing addressability never creates a borrow.
 pub(crate) fn go_method_receiver_preparation(
@@ -125,9 +147,14 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for GoSupport
         selected: &[(
             ProjectFile,
             brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
         )],
         limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
     ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        let selected = selected
+            .iter()
+            .map(|(file, source, _)| (file.clone(), source.clone()))
+            .collect::<Vec<_>>();
         let snapshots = selected
             .iter()
             .map(|(file, source)| build_evidence::GoBuildSnapshot {
@@ -221,7 +248,12 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for GoSupport
                     Selection::Intrinsic("int")
                 }
                 Some(Constructor::Map) => Selection::Component(Component::Key),
-                Some(Constructor::Channel) => Selection::Component(Component::Element),
+                Some(
+                    Constructor::Channel
+                    | Constructor::ChannelBoth
+                    | Constructor::ChannelSend
+                    | Constructor::ChannelReceive,
+                ) => Selection::Component(Component::Element),
                 None => match intrinsic.and_then(|entry| entry.range_type) {
                     Some(GoRangeType::String) => Selection::Intrinsic("int"),
                     Some(GoRangeType::Integer) => Selection::Operand,
@@ -233,7 +265,10 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for GoSupport
                     Constructor::Array
                     | Constructor::Slice
                     | Constructor::Sequence
-                    | Constructor::Channel,
+                    | Constructor::Channel
+                    | Constructor::ChannelBoth
+                    | Constructor::ChannelSend
+                    | Constructor::ChannelReceive,
                 ) => Selection::Component(Component::Element),
                 Some(Constructor::Map) => Selection::Component(Component::Value),
                 None if intrinsic
@@ -474,7 +509,8 @@ pub use crate::analyzer::go::semantic::reference_assertion_payload_type_is_exact
 
 pub use crate::analyzer::go::semantic::workspace_reference_assertion_accepts_payload;
 
-pub use crate::analyzer::go::type_identity_proof::go_native_error_function_value_obligation;
+pub use crate::analyzer::go::type_identity_proof::go_native_error_bound_function_value_obligations;
+pub use crate::analyzer::go::type_identity_proof::go_native_error_function_value_obligations;
 
 pub use crate::analyzer::go::type_identity_proof::go_native_error_result_obligation;
 
@@ -1104,8 +1140,6 @@ impl GoAnalyzer {
     }
 
     fn refresh_source_inventory(&self) -> brokk_bifrost_analysis::analyzer::store::Result<()> {
-        use brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome;
-
         use brokk_bifrost_analysis::analyzer::store::go_package_context::source_inventory_profile;
         let profile = source_inventory_profile();
         if self
@@ -1117,13 +1151,42 @@ impl GoAnalyzer {
         let Some(snapshot) = self.inner.selected_workspace_snapshots().get("go").cloned() else {
             return Ok(());
         };
+        self.refresh_source_inventory_at(
+            &snapshot,
+            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+        )
+        .map(|_| ())
+    }
+
+    fn refresh_source_inventory_at(
+        &self,
+        snapshot: &brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::store::go_package_context::GoContextPublicationOutcome,
+    > {
+        use brokk_bifrost_analysis::analyzer::store::go_package_context::{
+            GoContextPublicationOutcome, source_inventory_profile,
+        };
+        if cancellation.is_cancelled() {
+            return Ok(GoContextPublicationOutcome::Cancelled);
+        }
+        if self.inner.selected_workspace_snapshots().get("go") != Some(snapshot) {
+            return Ok(GoContextPublicationOutcome::InputsChanged);
+        }
+        let profile = source_inventory_profile();
         match self.inner.analyzer_store().publish_go_source_context(
             snapshot.clone(),
             self.inner.project().root(),
-            &brokk_bifrost_core::cancellation::CancellationToken::new(),
+            cancellation,
         )? {
             GoContextPublicationOutcome::Published(identity) => {
-                assert!(self.activate_native_context_profile(&snapshot, profile));
+                if cancellation.is_cancelled() {
+                    return Ok(GoContextPublicationOutcome::Cancelled);
+                }
+                if !self.activate_native_context_profile(snapshot, profile) {
+                    return Ok(GoContextPublicationOutcome::InputsChanged);
+                }
                 // The summaries of this publication's units, after the head is
                 // published and before any request reads them.
                 // Optional by design: a failure leaves readers on their fallback
@@ -1132,12 +1195,12 @@ impl GoAnalyzer {
                     "go.unit_summaries.reconcile.source_inventory",
                 );
                 let reconciliation = self.inner.analyzer_store().reconcile_unit_summaries(
-                    &snapshot,
+                    snapshot,
                     brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
                         context_id: identity.context_id,
                         profile,
                     },
-                    &brokk_bifrost_core::cancellation::CancellationToken::new(),
+                    cancellation,
                 );
                 drop(timing);
                 brokk_bifrost_core::profiling::note_with(|| {
@@ -1153,11 +1216,14 @@ impl GoAnalyzer {
                         "go.unit_summary_failed: Go unit summaries were not reconciled: {error}"
                     ),
                 }
+                Ok(if cancellation.is_cancelled() {
+                    GoContextPublicationOutcome::Cancelled
+                } else {
+                    GoContextPublicationOutcome::Published(identity)
+                })
             }
-            GoContextPublicationOutcome::InputsChanged | GoContextPublicationOutcome::Cancelled => {
-            }
+            outcome => Ok(outcome),
         }
-        Ok(())
     }
 
     fn with_source_inventory(self) -> Self {
@@ -1178,6 +1244,7 @@ impl GoAnalyzer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
@@ -1198,6 +1265,7 @@ impl GoAnalyzer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         invalidate_nearest_go_module_cache();
@@ -1230,6 +1298,7 @@ impl GoAnalyzer {
         Ok(analyzer)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
@@ -1323,14 +1392,16 @@ impl GoAnalyzer {
                             .into_iter()
                             .map(|row| row.file)
                             .collect();
-                        let mut index = packages::GoWorkspacePathIndex::build(
+                        let index = packages::GoWorkspacePathIndex::build(
                             self.project(),
                             |file| self.package_clause_of(file),
                             &refused,
+                            || {
+                                workspace_facts::stable_completion(
+                                    completion_scope.captured_read_incompleteness(),
+                                )
+                            },
                         );
-                        index.set_completion(workspace_facts::stable_completion(
-                            completion_scope.captured_read_incompleteness(),
-                        ));
                         let answer = StableDigest::from_array(index.read_answer());
                         (Arc::new(index), answer)
                     },
@@ -1426,6 +1497,22 @@ impl GoAnalyzer {
     #[doc(hidden)]
     pub fn graph_inventory_complete(&self) -> bool {
         self.workspace_path_index().is_complete()
+            && self.inner.indexed_source_inventory_complete()
+            && self.workspace_declaration_identities_authoritative()
+    }
+
+    /// The usage graph's inventory check. The graph names every refused source
+    /// as an exclusion, so a structure gap of a named refusal does not make the
+    /// other files' edges unavailable. Hierarchy, dispatch and reverse imports
+    /// keep [`Self::graph_inventory_complete`]: a refused source can hold an
+    /// implementation or a reference they would otherwise claim is absent.
+    pub(crate) fn graph_inventory_complete_with_named_refusals(&self) -> bool {
+        let Ok(exclusions) = self.graph_source_exclusions() else {
+            return false;
+        };
+        let excluded = exclusions.into_iter().map(|(file, _)| file).collect();
+        self.workspace_path_index()
+            .is_complete_excluding_sources(&excluded)
             && self.inner.indexed_source_inventory_complete()
             && self.workspace_declaration_identities_authoritative()
     }
@@ -1585,10 +1672,41 @@ impl GoAnalyzer {
 }
 
 impl TypeHierarchyProvider for GoAnalyzer {
+    fn with_hierarchy_query(
+        &self,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            native_hierarchy::with_native_query(self, None, run);
+            return;
+        }
+        run(&mut brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(self));
+    }
+    fn with_hierarchy_query_for(
+        &self,
+        _root: &CodeUnit,
+        run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
+    ) {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            native_hierarchy::with_native_query(self, Some(_root), run);
+            return;
+        }
+        run(&mut brokk_bifrost_core::analyzer::capabilities::ForwardingHierarchyQuery(self));
+    }
     fn get_direct_ancestors(
         &self,
         code_unit: &CodeUnit,
     ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            let mut answer = None;
+            self.with_hierarchy_query_for(code_unit, &mut |query| {
+                answer = Some(query.direct_ancestors(code_unit))
+            });
+            return answer.expect("hierarchy query runs once");
+        }
         let edges = self
             .hierarchy_index(&code_unit.fq_name())
             .map(|index| index.direct_ancestors(code_unit))
@@ -1600,6 +1718,14 @@ impl TypeHierarchyProvider for GoAnalyzer {
         &self,
         code_unit: &CodeUnit,
     ) -> brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            let mut answer = None;
+            self.with_hierarchy_query_for(code_unit, &mut |query| {
+                answer = Some(query.direct_descendants(code_unit))
+            });
+            return answer.expect("hierarchy query runs once");
+        }
         match self.hierarchy_index(&code_unit.fq_name()) {
             Ok(index) => {
                 let mut edges: Vec<_> = index.direct_descendants(code_unit).into_iter().collect();
@@ -1614,8 +1740,31 @@ impl TypeHierarchyProvider for GoAnalyzer {
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            return native_hierarchy::supports(self, code_unit);
+        }
         self.hierarchy_index(&code_unit.fq_name())
             .is_ok_and(|index| index.supports(code_unit))
+    }
+    fn member_family_ancestors(
+        &self,
+        owner: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::capabilities::MemberFamilyAncestors {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            let mut answer = None;
+            self.with_hierarchy_query_for(owner, &mut |query| {
+                answer = Some(query.member_family_ancestors(owner))
+            });
+            return answer.expect("hierarchy query runs once");
+        }
+        let answer = self.get_direct_ancestors(owner);
+        brokk_bifrost_core::analyzer::capabilities::MemberFamilyAncestors {
+            resolved: answer.edges,
+            ambiguous: answer.ambiguous,
+            unread: Vec::new(),
+        }
     }
 }
 
@@ -1659,6 +1808,10 @@ impl brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyProvid
         member: &CodeUnit,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
     ) -> brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyAnswer {
+        #[cfg(any(test, feature = "test-support"))]
+        if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+            return native_hierarchy::member_family(self, member, cancellation);
+        }
         match self.hierarchy_index(&member.fq_name()) {
             Ok(index) => go_member_family(self, &index, member, cancellation),
             Err(_) => brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyAnswer::incomplete(
@@ -2065,7 +2218,11 @@ impl IAnalyzer for GoAnalyzer {
         fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
             // Package facts are keyed by import path. A module-path change
             // therefore rekeys every Go file below this manifest, including files
@@ -2074,7 +2231,7 @@ impl IAnalyzer for GoAnalyzer {
             // first so neither path can reuse the old nearest-module answer.
             invalidate_nearest_go_module_cache();
             Self {
-                inner: self.inner.update(changed_files),
+                inner: self.inner.update_with_listing(changed_files, listing),
                 memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
                 active_base_profile: self.active_base_profile.clone(),
                 build_selection_error: self.build_selection_error.clone(),
@@ -2396,8 +2553,9 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for GoAn
     fn update(
         &self,
         changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
-        Box::new(IAnalyzer::update(self, changed_files))
+        Box::new(IAnalyzer::update_with_listing(self, changed_files, listing))
     }
 
     fn update_all_with_progress(
@@ -2431,9 +2589,9 @@ fn go_type_skeleton(code_unit: &CodeUnit, skeleton: String) -> String {
 
 fn go_branch_reference_site(
     node: tree_sitter::Node<'_>,
-) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite> {
+) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::ReferenceSite> {
     use brokk_bifrost_analysis::analyzer::structural::branch_relations::{
-        BranchReferenceKind, BranchReferenceSite,
+        ReferenceKind, ReferenceSite,
     };
     let (focus, kind) = match node.kind() {
         "call_expression" => {
@@ -2441,7 +2599,7 @@ fn go_branch_reference_site(
             if function.kind() != "identifier" {
                 return None;
             }
-            (function, BranchReferenceKind::Method)
+            (function, ReferenceKind::Method)
         }
         "identifier"
             if node.parent().is_some_and(|parent| {
@@ -2451,16 +2609,1670 @@ fn go_branch_reference_site(
         {
             return None;
         }
-        "identifier" => (node, BranchReferenceKind::Field),
+        "identifier" => (node, ReferenceKind::Field),
         _ => return None,
     };
-    Some(BranchReferenceSite {
+    Some(ReferenceSite {
         range: (focus.start_byte(), focus.end_byte()),
         kind,
     })
 }
 
+fn go_selected_pointer_formal(
+    workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+    ordinal: u32,
+    request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<Option<(usize, usize)>, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError>
+{
+    use brokk_bifrost_analysis::analyzer::semantic::{FormalMultiplicity, SemanticValueKind};
+    if request.stop_observed()
+        || procedure.artifact().key().language()
+            != brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                brokk_bifrost_core::analyzer::model::Language::Go,
+            )
+    {
+        return Ok(None);
+    }
+    let mut formals = procedure.semantics().values().iter().filter(|value| {
+        matches!(value.kind, SemanticValueKind::Parameter {
+            ordinal: found,
+            multiplicity: FormalMultiplicity::One,
+            ..
+        } if found == ordinal)
+    });
+    if formals.next().is_none() || formals.next().is_some() {
+        return Ok(None);
+    }
+    let key = procedure.artifact().key();
+    let Some(file) = workspace
+        .analyzer()
+        .project()
+        .file_by_rel_path(std::path::Path::new(key.path().as_str()))
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = workspace
+        .current_program_semantics_artifact_source(&file, request.budget.limits().source_bytes)?
+    else {
+        request.budget.note_external_stop(
+            brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+        );
+        return Ok(None);
+    };
+    if snapshot.key() != key {
+        return Ok(None);
+    }
+    let work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+        nested_entries: snapshot.source().len(),
+        ..Default::default()
+    };
+    if request.budget.check_admission(work).is_err() {
+        request.budget.note_external_stop(
+            brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+        );
+        return Ok(None);
+    }
+    request.budget.charge_work(work);
+    let span = procedure.semantics().locator().anchor().span();
+    let proof = crate::analyzer::usages::get_definition::go::direct_pointer_formal_pointee_at_span(
+        &file,
+        snapshot.source(),
+        span.start_byte() as usize,
+        span.end_byte() as usize,
+        ordinal as usize,
+    );
+    Ok(if request.stop_observed() { None } else { proof })
+}
+
+fn go_selected_pointer_receiver(
+    workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+    request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<Option<(usize, usize)>, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError>
+{
+    if request.stop_observed()
+        || procedure.artifact().key().language()
+            != brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                brokk_bifrost_core::analyzer::model::Language::Go,
+            )
+    {
+        return Ok(None);
+    }
+    let key = procedure.artifact().key();
+    let Some(file) = workspace
+        .analyzer()
+        .project()
+        .file_by_rel_path(std::path::Path::new(key.path().as_str()))
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = workspace
+        .current_program_semantics_artifact_source(&file, request.budget.limits().source_bytes)?
+    else {
+        request.budget.note_external_stop(
+            brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+        );
+        return Ok(None);
+    };
+    if snapshot.key() != key {
+        return Ok(None);
+    }
+    let work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+        nested_entries: snapshot.source().len(),
+        ..Default::default()
+    };
+    if request.budget.check_admission(work).is_err() {
+        request.budget.note_external_stop(
+            brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+        );
+        return Ok(None);
+    }
+    request.budget.charge_work(work);
+    let span = procedure.semantics().locator().anchor().span();
+    let proof =
+        crate::analyzer::usages::get_definition::go::direct_pointer_receiver_pointee_at_span(
+            &file,
+            snapshot.source(),
+            span.start_byte() as usize,
+            span.end_byte() as usize,
+        );
+    Ok(if request.stop_observed() { None } else { proof })
+}
+
+fn go_selected_pointer_result(
+    workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+    ordinal: u32,
+    request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+) -> Result<Option<(usize, usize)>, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError>
+{
+    if request.stop_observed()
+        || procedure.artifact().key().language()
+            != brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                brokk_bifrost_core::analyzer::model::Language::Go,
+            )
+    {
+        return Ok(None);
+    }
+    let key = procedure.artifact().key();
+    let Some(file) = workspace
+        .analyzer()
+        .project()
+        .file_by_rel_path(std::path::Path::new(key.path().as_str()))
+    else {
+        return Ok(None);
+    };
+    let Some(snapshot) = workspace
+        .current_program_semantics_artifact_source(&file, request.budget.limits().source_bytes)?
+    else {
+        request.budget.note_external_stop(
+            brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+        );
+        return Ok(None);
+    };
+    if snapshot.key() != key {
+        return Ok(None);
+    }
+    let work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+        nested_entries: snapshot.source().len().saturating_add(2),
+        ..Default::default()
+    };
+    if request.budget.check_admission(work).is_err() {
+        request.budget.note_external_stop(
+            brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+        );
+        return Ok(None);
+    }
+    request.budget.charge_work(work);
+    let span = procedure.semantics().locator().anchor().span();
+    let range =
+        brokk_bifrost_analysis::analyzer::semantic::type_flow::analyzer_range_for_span(span);
+    let Some(declaration) = workspace.analyzer().enclosing_code_unit(&file, &range) else {
+        return Ok(None);
+    };
+    if !declaration.is_function()
+        || declaration.is_synthetic()
+        || declaration.source() != &file
+        || crate::analyzer::usages::get_definition::go::result_binds_by_reference_at_ordinal(
+            workspace.analyzer(),
+            &file,
+            snapshot.source(),
+            &declaration,
+            ordinal as usize,
+        ) != Some(true)
+    {
+        return Ok(None);
+    }
+    let proof = crate::analyzer::usages::get_definition::go::direct_pointer_result_pointee_at_span(
+        &file,
+        snapshot.source(),
+        span.start_byte() as usize,
+        span.end_byte() as usize,
+        ordinal as usize,
+    );
+    Ok(if request.stop_observed() { None } else { proof })
+}
+
+fn go_remaining_receiver_budget(
+    budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget,
+    work: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork,
+) -> brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+    brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+        max_scope_nodes: budget.max_scope_nodes.saturating_sub(work.scope_nodes),
+        max_summary_expansions: budget
+            .max_summary_expansions
+            .saturating_sub(work.summary_expansions),
+        max_resolution_rounds: budget
+            .max_resolution_rounds
+            .saturating_sub(work.resolution_rounds),
+        ..budget
+    }
+}
+
+fn go_imported_pointer_formal_site(
+    target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+    ordinal: u32,
+    root: tree_sitter::Node<'_>,
+    file: &brokk_bifrost_core::analyzer::model::ProjectFile,
+    source: &str,
+) -> Option<(
+    brokk_bifrost_core::analyzer::model::Range,
+    brokk_bifrost_core::analyzer::model::Range,
+    brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
+)> {
+    use brokk_bifrost_analysis::analyzer::semantic::{FormalMultiplicity, SemanticValueKind};
+    let mut formals = target.semantics().values().iter().filter(|value| {
+        matches!(value.kind, SemanticValueKind::Parameter {
+            ordinal: found, multiplicity: FormalMultiplicity::One, ..
+        } if found == ordinal)
+    });
+    if formals.next().is_none() || formals.next().is_some() {
+        return None;
+    }
+    let span = target.semantics().locator().anchor().span();
+    let (binding, qualifier) =
+        crate::analyzer::usages::get_definition::go::direct_imported_pointer_formal_at_span(
+            root,
+            span.start_byte() as usize,
+            span.end_byte() as usize,
+            ordinal as usize,
+        )?;
+    let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+        path: brokk_bifrost_core::path_utils::rel_path_string(file),
+        text: source.get(binding.start_byte..binding.end_byte)?.to_owned(),
+        range: binding,
+        focus_start_byte: binding.start_byte,
+        focus_end_byte: binding.end_byte,
+    };
+    Some((binding, qualifier, site))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeledFormalRefusal {
+    NoDirectImportedPointerFormal,
+    NominalOrIndirectionMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeledFormalVerdict {
+    Identity,
+    Unknown,
+    Refused(ModeledFormalRefusal),
+}
+
+#[cfg(test)]
+mod modeled_formal_certificate_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::semantic::oracle::traits::DispatchOracle;
+    use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::heap::ModeledFreshResultOracle;
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        OracleCallContext, SemanticBudget, SemanticRequest,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+        SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+        SemanticModelRuntimeOutcome, SemanticPackCatalog, SessionPackSource, SessionPackSourceKind,
+        SourceFormat, acquire_active_semantic_models, compile_source,
+    };
+    use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+
+    #[test]
+    fn modeled_fresh_result_join_discriminates_imported_formals() {
+        let source = r#"package lifecycle
+import "example.com/resfs"
+	type File struct{}
+	func inspectFile(f *resfs.File) { _ = f }
+	func inspectOther(f *resfs.Other) { _ = f }
+	func inspectLocal(f *File) { _ = f }
+	func inspectValue(f resfs.File) { _ = f }
+	func Read(path string) {
+	    f, err := resfs.Open(path)
+	    if err != nil { return }
+	    inspectFile(f)
+	}
+"#;
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/lifecycle\n\ngo 1.22\n")
+            .file("app.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let mut activation =
+            brokk_bifrost_analysis::test_support::go_semantic_model_activation_request(None);
+        for (id, bytes) in [
+            (
+                "test.9432.resfs-declarations",
+                include_bytes!(
+                    "../../../testdata/semantic-model-packs/9432-resfs-declarations.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "test.9432.resfs-summary",
+                include_bytes!("../../../testdata/semantic-model-packs/9432-resfs-summary.json")
+                    .as_slice(),
+            ),
+        ] {
+            let compiled =
+                compile_source(SourceFormat::Json, bytes, &CompilerOptions::default()).unwrap();
+            catalog
+                .register_session_pack(
+                    &compiled,
+                    &SessionPackSource {
+                        kind: SessionPackSourceKind::Embedded,
+                        source_id: format!("test:{id}"),
+                    },
+                )
+                .unwrap();
+            activation.controls.push(SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: id.into(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            });
+        }
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
+        let activated = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &activation,
+            &cancellation,
+        );
+        assert!(
+            matches!(activated, SemanticModelRuntimeOutcome::Ready { .. }),
+            "{activated:?}"
+        );
+        let file = project.file("app.go");
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .expect("Go semantics materializes");
+        let handles = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| artifact.procedure_handle(procedure.id()).unwrap())
+            .collect::<Vec<_>>();
+        let call = handles.iter().flat_map(|procedure| {
+            procedure.semantics().call_sites().iter().map(move |row| {
+                procedure.call_site_handle(row.id).unwrap()
+            })
+        }).find(|call| {
+            let span = brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range(call).unwrap();
+            &source[span.start_byte..span.end_byte] == "resfs.Open(path)"
+        }).expect("exact modeled producer occurrence");
+        let result_id = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .unwrap()
+            .normal_result_values()
+            .next()
+            .expect("result zero");
+        let result = call.procedure().value_handle(result_id).unwrap();
+        let oracle = workspace.semantic_oracle_provider();
+        let dispatch = oracle
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .unwrap();
+        let origin = oracle
+            .modeled_fresh_call_result_origin(
+                &call,
+                &result,
+                &OracleCallContext::empty(),
+                &dispatch,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .expect("real selected Fresh origin");
+        assert!(origin.proves_complete_fresh_result());
+        // This checks direct constructor discrimination. It does not prove that
+        // production inspect binding reaches this seam; #9486 retains the later
+        // three-negative end-to-end obligation.
+        for (name, expected) in [
+            ("inspectFile", ModeledFormalVerdict::Identity),
+            (
+                "inspectOther",
+                ModeledFormalVerdict::Refused(ModeledFormalRefusal::NominalOrIndirectionMismatch),
+            ),
+            (
+                "inspectLocal",
+                ModeledFormalVerdict::Refused(ModeledFormalRefusal::NoDirectImportedPointerFormal),
+            ),
+            (
+                "inspectValue",
+                ModeledFormalVerdict::Refused(ModeledFormalRefusal::NoDirectImportedPointerFormal),
+            ),
+        ] {
+            let target = handles
+                .iter()
+                .find(|procedure| {
+                    let span = procedure.semantics().locator().anchor().span();
+                    source[span.start_byte() as usize..span.end_byte() as usize]
+                        .contains(&format!("func {name}("))
+                })
+                .unwrap_or_else(|| panic!("formal procedure {name} has an exact anchor"));
+            let mut budget = SemanticBudget::default();
+            let actual = GoSupport
+                .modeled_call_result_formal_verdict(
+                    &workspace,
+                    &origin,
+                    target,
+                    0,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+}
+
+impl GoSupport {
+    fn modeled_call_result_formal_verdict(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        origin: &brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::heap::ModeledFreshCallResultOrigin,
+        target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        target_ordinal: u32,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        ModeledFormalVerdict,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+        use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+        use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+        use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_call_range;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoExternalPackageProvenance;
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+        use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+
+        let unknown = || Ok(ModeledFormalVerdict::Unknown);
+        if request.stop_observed()
+            || origin.call.procedure().artifact().key().language()
+                != brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                    brokk_bifrost_core::analyzer::model::Language::Go,
+                )
+            || target.artifact().key().language()
+                != brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                    brokk_bifrost_core::analyzer::model::Language::Go,
+                )
+        {
+            return unknown();
+        }
+        let analyzer = workspace.analyzer();
+        let Some(go) = resolve_analyzer::<crate::analyzer::go::GoAnalyzer>(analyzer) else {
+            return unknown();
+        };
+        let project = analyzer.project();
+        let Some(source_file) = project.file_by_rel_path(std::path::Path::new(
+            origin.call.procedure().artifact().key().path().as_str(),
+        )) else {
+            return unknown();
+        };
+        let Some(formal_file) = project.file_by_rel_path(std::path::Path::new(
+            target.artifact().key().path().as_str(),
+        )) else {
+            return unknown();
+        };
+        let Some(source) = workspace.current_program_semantics_artifact_source(
+            &source_file,
+            request.budget.limits().source_bytes,
+        )?
+        else {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+            );
+            return unknown();
+        };
+        let Some(formal_source) = workspace.current_program_semantics_artifact_source(
+            &formal_file,
+            request.budget.limits().source_bytes,
+        )?
+        else {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+            );
+            return unknown();
+        };
+        if source.key() != origin.call.procedure().artifact().key()
+            || formal_source.key() != target.artifact().key()
+        {
+            return unknown();
+        }
+        let source_work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: source
+                .source()
+                .len()
+                .saturating_add(formal_source.source().len()),
+            ..Default::default()
+        };
+        if request.budget.check_admission(source_work).is_err() {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+            );
+            return unknown();
+        }
+        request.budget.charge_work(source_work);
+        let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+            Ok(scope) => scope,
+            Err(_) => {
+                analyzer.mark_execution_dependent();
+                return unknown();
+            }
+        };
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let (Some(source_syntax), Some(formal_syntax)) = (
+            go.inner.prepared_syntax(scope.token(), &source_file),
+            go.inner.prepared_syntax(scope.token(), &formal_file),
+        ) else {
+            return unknown();
+        };
+        if source_syntax.source() != source.source()
+            || formal_syntax.source() != formal_source.source()
+            || source_syntax.tree().root_node().has_error()
+            || formal_syntax.tree().root_node().has_error()
+        {
+            return unknown();
+        }
+        let call_range = exact_call_range(&origin.call)?;
+        let source_tree = source_syntax.tree();
+        let Some(call_node) = source_tree
+            .root_node()
+            .named_descendant_for_byte_range(call_range.start_byte, call_range.end_byte)
+        else {
+            return unknown();
+        };
+        if call_node.kind() != "call_expression"
+            || call_node.start_byte() != call_range.start_byte
+            || call_node.end_byte() != call_range.end_byte
+        {
+            return unknown();
+        }
+        let Some(callee) = call_node.child_by_field_name("function") else {
+            return unknown();
+        };
+        if callee.kind() != "selector_expression" {
+            return unknown();
+        }
+        let Some(field) = callee.child_by_field_name("field") else {
+            return unknown();
+        };
+        let producer_site = ResolvedReferenceSite {
+            path: brokk_bifrost_core::path_utils::rel_path_string(&source_file),
+            text: source.source()[callee.start_byte()..callee.end_byte()].to_owned(),
+            range: brokk_bifrost_core::analyzer::model::Range {
+                start_byte: callee.start_byte(),
+                end_byte: callee.end_byte(),
+                start_line: callee.start_position().row + 1,
+                end_line: callee.end_position().row + 1,
+            },
+            focus_start_byte: field.start_byte(),
+            focus_end_byte: field.end_byte(),
+        };
+        let Some(selector) = brokk_bifrost_go::references::go_selector_descriptor(
+            source_tree.root_node(),
+            &producer_site,
+        ) else {
+            return unknown();
+        };
+        if selector.focus_segment != 1
+            || selector.members.len() != 1
+            || !matches!(selector.base.kind(), "identifier" | "package_identifier")
+        {
+            return unknown();
+        }
+        let qualifier = brokk_bifrost_core::analyzer::model::Range {
+            start_byte: selector.base.start_byte(),
+            end_byte: selector.base.end_byte(),
+            start_line: selector.base.start_position().row + 1,
+            end_line: selector.base.end_position().row + 1,
+        };
+        let Some((binding, formal_qualifier, formal_site)) = go_imported_pointer_formal_site(
+            target,
+            target_ordinal,
+            formal_syntax.tree().root_node(),
+            &formal_file,
+            formal_source.source(),
+        ) else {
+            return Ok(ModeledFormalVerdict::Refused(
+                ModeledFormalRefusal::NoDirectImportedPointerFormal,
+            ));
+        };
+        let mut native = match GoNativePointRequest::open_for_file(
+            go,
+            &source_file,
+            analyzer.semantic_model_overlay(),
+            request.cancellation,
+        ) {
+            Ok(GoNativePointRequestOpen::Ready(selected)) => selected,
+            Ok(GoNativePointRequestOpen::Cancelled) => return unknown(),
+            Ok(GoNativePointRequestOpen::Unavailable { .. }) => {
+                analyzer.mark_execution_dependent();
+                return unknown();
+            }
+            Err(error) => {
+                analyzer.record_query_failure(error);
+                return unknown();
+            }
+        };
+        let budget = ReceiverAnalysisBudget::default();
+        let producer_query = BoundedReceiverQuery {
+            analyzer,
+            file: &source_file,
+            source: source.source(),
+            tree: Some(source_tree),
+            site: &producer_site,
+            budget,
+            cancellation: Some(request.cancellation),
+        };
+        let BoundedResolution::Complete {
+            value: producer,
+            work: producer_work,
+        } = native.resolve_definition_with_evidence(producer_query)
+        else {
+            return unknown();
+        };
+        let Some(identity) = producer.external_callee_identity.as_ref() else {
+            return unknown();
+        };
+        if identity.owner_fqn() != origin.target.owner_fqn()
+            || identity.member() != origin.target.member()
+            || producer
+                .exact_external_call
+                .as_ref()
+                .is_none_or(|proof| proof.parameter_count != origin.target.arity())
+        {
+            return unknown();
+        }
+        let remaining = go_remaining_receiver_budget(budget, producer_work);
+        let BoundedResolution::Complete {
+            value: Some(producer_import),
+            work: producer_import_work,
+        } = (match native.selected_model_import_at_qualifier(
+            BoundedReceiverQuery {
+                budget: remaining,
+                ..producer_query
+            },
+            qualifier,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                analyzer.record_query_failure(error);
+                return unknown();
+            }
+        })
+        else {
+            return unknown();
+        };
+        let member = if let Some(selection) = producer.model_member_selection.as_ref() {
+            let Some(candidate) = selection.selected_candidate() else {
+                return unknown();
+            };
+            if !selection.complete
+                || selection.native_target_count != 0
+                || !candidate.complete
+                || !candidate.selection_complete
+                || !candidate.route_exact
+            {
+                return unknown();
+            }
+            candidate.member.clone()
+        } else {
+            let Some(member) = native.selected_imported_package_callable(
+                &producer_import,
+                &origin.target,
+                request.cancellation,
+            ) else {
+                return unknown();
+            };
+            member
+        };
+        let consumed = producer_work.saturating_add(producer_import_work);
+        let formal_query = BoundedReceiverQuery {
+            analyzer,
+            file: &formal_file,
+            source: formal_source.source(),
+            tree: Some(formal_syntax.tree()),
+            site: &formal_site,
+            budget: go_remaining_receiver_budget(budget, consumed),
+            cancellation: Some(request.cancellation),
+        };
+        let BoundedResolution::Complete {
+            value: Some(formal_proof),
+            work: formal_work,
+        } = (match native.selected_imported_pointer_formal(formal_query, binding, formal_qualifier)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                analyzer.record_query_failure(error);
+                return unknown();
+            }
+        })
+        else {
+            return unknown();
+        };
+        let formal_type = formal_proof.canonical;
+        let formal_import = formal_proof.import;
+        let Some((results, model_work)) =
+            native.selected_callable_result_type_identities(&member, request.cancellation)
+        else {
+            return unknown();
+        };
+        let Some(Some(result_type)) = results.get(origin.ordinal as usize) else {
+            return unknown();
+        };
+        let (
+            GoExternalPackageProvenance::SemanticModel {
+                symbol_id: producer_symbol,
+                pack_id: producer_pack,
+                pack_digest: producer_digest,
+                ..
+            },
+            GoExternalPackageProvenance::SemanticModel {
+                symbol_id: formal_symbol,
+                pack_id: formal_pack,
+                pack_digest: formal_digest,
+                ..
+            },
+        ) = (
+            &producer_import.import.provenance,
+            &formal_import.import.provenance,
+        )
+        else {
+            return unknown();
+        };
+        debug_assert_eq!(
+            producer_import.mount,
+            brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedResolutionMountOrdinal::new(
+                producer_import.binder.ordinal().expect("selected binder has a mount"),
+            ),
+        );
+        debug_assert_eq!(
+            formal_import.mount,
+            brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedResolutionMountOrdinal::new(
+                formal_import.binder.ordinal().expect("selected binder has a mount"),
+            ),
+        );
+        if producer_import.context.selection_id != formal_import.context.selection_id
+            || producer_import.context.revision != formal_import.context.revision
+            || producer_import.import.import_path != formal_import.import.import_path
+            || producer_symbol != formal_symbol
+            || producer_pack != formal_pack
+            || producer_digest != formal_digest
+            || member.provider.pack_id != *producer_pack
+            || member.provider.pack_digest != *producer_digest
+        {
+            return unknown();
+        }
+        if !matches!((result_type, formal_type),
+                (brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity::Nominal {
+                    digest: left, indirection: 1,
+                }, brokk_bifrost_analysis::analyzer::resolution::CanonicalTypeIdentity::Nominal {
+                    digest: right, indirection: 1,
+                }) if *left == right)
+        {
+            return Ok(ModeledFormalVerdict::Refused(
+                ModeledFormalRefusal::NominalOrIndirectionMismatch,
+            ));
+        }
+        let work = consumed.saturating_add(formal_work);
+        let charged = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: work
+                .scope_nodes
+                .saturating_add(work.setup_nodes)
+                .saturating_add(work.summary_expansions)
+                .saturating_add(work.resolution_rounds)
+                .saturating_add(model_work),
+            ..Default::default()
+        };
+        if request.budget.check_admission(charged).is_err() {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+            );
+            return unknown();
+        }
+        request.budget.charge_work(charged);
+        Ok(if request.stop_observed() {
+            ModeledFormalVerdict::Unknown
+        } else {
+            ModeledFormalVerdict::Identity
+        })
+    }
+}
+
+fn source_callable_collect_nodes<'tree>(
+    nodes: impl IntoIterator<Item = tree_sitter::Node<'tree>>,
+    scope_step: &mut dyn FnMut() -> bool,
+) -> Option<Vec<tree_sitter::Node<'tree>>> {
+    let mut collected = Vec::new();
+    for node in nodes {
+        if !scope_step() {
+            return None;
+        }
+        collected.push(node);
+    }
+    Some(collected)
+}
+
 impl LanguageSupport for GoSupport {
+    fn identity_receiver_lookup(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::structural::identity::ReceiverLookupPolicy {
+        brokk_bifrost_analysis::analyzer::structural::identity::ReceiverLookupPolicy::ReceiverOnly
+    }
+
+    fn policy_lowering_identity(
+        &self,
+        _models: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer::identity(
+                &semantic::GoSemanticLowerer,
+            ),
+        )
+    }
+
+    fn fresh_logical_instance(
+        &self,
+        node: tree_sitter::Node<'_>,
+        allocation: &brokk_bifrost_analysis::analyzer::semantic::AllocationSite,
+        artifact: &brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact,
+        source: &str,
+    ) -> brokk_bifrost_analysis::analyzer::languages::FreshEndpoint {
+        use brokk_bifrost_analysis::analyzer::languages::FreshEndpoint;
+        use brokk_bifrost_analysis::analyzer::semantic::{AllocationKind, GoPredeclaredBuiltin};
+        if node.kind() != "call_expression"
+            || node.has_error()
+            || allocation.kind != AllocationKind::Object
+        {
+            return FreshEndpoint::Unknown("address-of or aggregate-copy transport is not proven");
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return FreshEndpoint::Unknown("Go call function unavailable");
+        };
+        if function.kind() != "identifier"
+            || function.utf8_text(source.as_bytes()).ok() != Some("new")
+        {
+            return FreshEndpoint::Unknown("not a bare Go new call");
+        }
+        let arguments =
+            brokk_bifrost_core::analyzer::tree_walk::named_children_by_field(node, "arguments");
+        if !matches!(arguments.as_slice(), [argument] if semantic::is_go_type_syntax(argument.kind()))
+        {
+            return FreshEndpoint::Unknown("Go new requires one type argument");
+        }
+        if !artifact
+            .go_predeclared_builtin_assumptions()
+            .contains(&GoPredeclaredBuiltin::New)
+        {
+            return FreshEndpoint::Unknown("builtin new assumption not recorded");
+        }
+        FreshEndpoint::Proven
+    }
+
+    fn source_callable_application(
+        &self,
+        owner: tree_sitter::Node<'_>,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::SourceCallableApplication> {
+        (scope_step() && owner.kind() == "func_literal").then_some(
+            brokk_bifrost_analysis::analyzer::languages::SourceCallableApplication::NoReceiver,
+        )
+    }
+
+    fn source_callable_initializer_matches(
+        &self,
+        declaration: tree_sitter::Node<'_>,
+        name: &Range,
+        callable: &Range,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        if !scope_step() {
+            return false;
+        }
+        // Native lexical publication uses the enclosing declaration when it
+        // contains one spec. Normalize that grammar wrapper before matching
+        // the same name and initializer fields as a grouped var spec.
+        let declaration = if declaration.kind() == "var_declaration" {
+            let mut spec = None;
+            let mut cursor = declaration.walk();
+            for child in declaration.named_children(&mut cursor) {
+                if !scope_step() {
+                    return false;
+                }
+                if child.is_extra() {
+                    continue;
+                }
+                if child.kind() != "var_spec" || spec.replace(child).is_some() {
+                    return false;
+                }
+            }
+            let Some(spec) = spec else {
+                return false;
+            };
+            spec
+        } else {
+            declaration
+        };
+        let (names, values) = match declaration.kind() {
+            "short_var_declaration" => {
+                let (Some(names), Some(values)) = (
+                    declaration.child_by_field_name("left"),
+                    declaration.child_by_field_name("right"),
+                ) else {
+                    return false;
+                };
+                if !scope_step() || !scope_step() {
+                    return false;
+                }
+                let names = if names.kind() == "expression_list" {
+                    let mut cursor = names.walk();
+                    let Some(nodes) = source_callable_collect_nodes(
+                        names.named_children(&mut cursor),
+                        scope_step,
+                    ) else {
+                        return false;
+                    };
+                    nodes
+                } else {
+                    if !scope_step() {
+                        return false;
+                    }
+                    vec![names]
+                };
+                let values = if values.kind() == "expression_list" {
+                    let mut cursor = values.walk();
+                    let Some(nodes) = source_callable_collect_nodes(
+                        values.named_children(&mut cursor),
+                        scope_step,
+                    ) else {
+                        return false;
+                    };
+                    nodes
+                } else {
+                    if !scope_step() {
+                        return false;
+                    }
+                    vec![values]
+                };
+                (names, values)
+            }
+            "var_spec" => {
+                let mut names_cursor = declaration.walk();
+                let Some(names) = source_callable_collect_nodes(
+                    declaration.children_by_field_name("name", &mut names_cursor),
+                    scope_step,
+                ) else {
+                    return false;
+                };
+                let Some(values) = declaration.child_by_field_name("value") else {
+                    return false;
+                };
+                if !scope_step() {
+                    return false;
+                }
+                let mut values_cursor = values.walk();
+                let values = if values.kind() == "expression_list" {
+                    let Some(nodes) = source_callable_collect_nodes(
+                        values.named_children(&mut values_cursor),
+                        scope_step,
+                    ) else {
+                        return false;
+                    };
+                    nodes
+                } else {
+                    if !scope_step() {
+                        return false;
+                    }
+                    vec![values]
+                };
+                (names, values)
+            }
+            _ => return false,
+        };
+        names.len() == values.len()
+            && names.iter().zip(values).any(|(binder, initializer)| {
+                scope_step()
+                    && binder.start_byte() == name.start_byte
+                    && binder.end_byte() == name.end_byte
+                    && initializer.start_byte() == callable.start_byte
+                    && initializer.end_byte() == callable.end_byte
+            })
+    }
+
+    fn identity_conversion_from_modeled_call_result(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        origin: &brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::heap::ModeledFreshCallResultOrigin,
+        target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        target_ordinal: u32,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion as Conversion;
+        Ok(
+            match self.modeled_call_result_formal_verdict(
+                workspace,
+                origin,
+                target,
+                target_ordinal,
+                request,
+            )? {
+                ModeledFormalVerdict::Identity => Conversion::Identity,
+                ModeledFormalVerdict::Unknown | ModeledFormalVerdict::Refused(_) => {
+                    Conversion::Unknown
+                }
+            },
+        )
+    }
+
+    fn identity_conversion_from_call_result(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        source: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        result_ordinal: u32,
+        target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        target_ordinal: u32,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion as Conversion;
+        if source.artifact().key() != target.artifact().key() {
+            return Ok(Conversion::Unknown);
+        }
+        let result = go_selected_pointer_result(workspace, source, result_ordinal, request)?;
+        let formal = go_selected_pointer_formal(workspace, target, target_ordinal, request)?;
+        Ok(
+            if result.is_some() && result == formal && !request.stop_observed() {
+                Conversion::Identity
+            } else {
+                Conversion::Unknown
+            },
+        )
+    }
+    fn captured_value_static_type_is_reference(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        captured: brokk_bifrost_analysis::analyzer::semantic::ValueId,
+        origin_result: brokk_bifrost_analysis::analyzer::semantic::ValueId,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError> {
+        use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+        use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+        use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+        use brokk_bifrost_analysis::analyzer::resolution::{
+            ResolutionCompletion, ResolutionSlotValue,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_receiver_anchor::GoStaticMembership;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+
+        let declared_result_is_pointer =
+            |ty: brokk_bifrost_analysis::analyzer::resolution::ResolutionTypeRef| {
+                ty.indirection() > 0
+            };
+
+        let Some(value) = procedure.semantics().value(captured) else {
+            return Ok(false);
+        };
+        let Some(mapping) = procedure.semantics().source_mapping(value.source) else {
+            return Ok(false);
+        };
+        let span = mapping.locator.anchor().span();
+        let start = span.start_byte() as usize;
+        let end = span.end_byte() as usize;
+        let analyzer = workspace.analyzer();
+        let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+            return Ok(false);
+        };
+        let Some(file) = analyzer.project().file_by_rel_path(std::path::Path::new(
+            procedure.artifact().key().path().as_str(),
+        )) else {
+            return Ok(false);
+        };
+        let Some(source) = workspace.current_program_semantics_artifact_source(
+            &file,
+            request.budget.limits().source_bytes,
+        )?
+        else {
+            return Ok(false);
+        };
+        if source.key() != procedure.artifact().key() {
+            return Ok(false);
+        }
+        let source_work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: source.source().len(),
+            ..Default::default()
+        };
+        if request.budget.check_admission(source_work).is_err() {
+            return Ok(false);
+        }
+        request.budget.charge_work(source_work);
+        let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+            Ok(scope) => scope,
+            Err(_) => {
+                analyzer.mark_execution_dependent();
+                return Ok(false);
+            }
+        };
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let Some(syntax) = go.inner.prepared_syntax(scope.token(), &file) else {
+            return Ok(false);
+        };
+        if syntax.source() != source.source() || syntax.tree().root_node().has_error() {
+            return Ok(false);
+        }
+        let site = brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+            path: brokk_bifrost_core::path_utils::rel_path_string(&file),
+            text: source.source().get(start..end).unwrap_or_default().into(),
+            range: brokk_bifrost_core::analyzer::model::Range {
+                start_byte: start,
+                end_byte: end,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: end,
+        };
+        let mut native = match GoNativePointRequest::open_for_file(
+            go,
+            &file,
+            analyzer.semantic_model_overlay(),
+            request.cancellation,
+        ) {
+            Ok(GoNativePointRequestOpen::Ready(selected)) => selected,
+            Ok(GoNativePointRequestOpen::Cancelled) => return Ok(false),
+            Ok(GoNativePointRequestOpen::Unavailable { .. }) => {
+                analyzer.mark_execution_dependent();
+                return Ok(false);
+            }
+            Err(error) => {
+                analyzer.record_query_failure(error);
+                return Ok(false);
+            }
+        };
+        let query = BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source: source.source(),
+            tree: Some(syntax.tree()),
+            site: &site,
+            budget: Default::default(),
+            cancellation: Some(request.cancellation),
+        };
+        // A call result has its own source mapping. Select the call through the
+        // semantic result row, then use the parsed selector's receiver as the
+        // positioned native type query. This also gives the declared result
+        // ordinal for multi-result methods.
+        let mut producers = procedure
+            .semantics()
+            .call_sites()
+            .iter()
+            .filter_map(|call| {
+                call.normal_result_values()
+                    .position(|result| result == origin_result)
+                    .map(|ordinal| (call, ordinal))
+            });
+        if let (Some((call, ordinal)), None) = (producers.next(), producers.next())
+            && let Some(call_mapping) = procedure.semantics().source_mapping(call.source)
+        {
+            let call_span = call_mapping.locator.anchor().span();
+            let call_start = call_span.start_byte() as usize;
+            let call_end = call_span.end_byte() as usize;
+            let call_node = syntax
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(call_start, call_end);
+            if let Some(call_node) = call_node.filter(|node| {
+                call.receiver.is_some()
+                    && node.kind() == "call_expression"
+                    && node.start_byte() == call_start
+                    && node.end_byte() == call_end
+            }) && let Some(selector) = call_node
+                .child_by_field_name("function")
+                .filter(|node| node.kind() == "selector_expression")
+            {
+                let Some(receiver_node) = selector.child_by_field_name("operand") else {
+                    return Ok(false);
+                };
+                let Some(member_node) = selector.child_by_field_name("field") else {
+                    return Ok(false);
+                };
+                let Some(member_name) = source.source().get(member_node.byte_range()) else {
+                    return Ok(false);
+                };
+                let receiver_site =
+                    brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+                        path: brokk_bifrost_core::path_utils::rel_path_string(&file),
+                        text: source
+                            .source()
+                            .get(receiver_node.byte_range())
+                            .unwrap_or_default()
+                            .into(),
+                        range: brokk_bifrost_core::analyzer::model::Range {
+                            start_byte: receiver_node.start_byte(),
+                            end_byte: receiver_node.end_byte(),
+                            start_line: receiver_node.start_position().row + 1,
+                            end_line: receiver_node.end_position().row + 1,
+                        },
+                        focus_start_byte: receiver_node.start_byte(),
+                        focus_end_byte: receiver_node.end_byte(),
+                    };
+                let receiver_query = BoundedReceiverQuery {
+                    site: &receiver_site,
+                    ..query
+                };
+                let mut receiver = None;
+                let resolved = native.resolve_type_with_evidence(receiver_query, |evidence| {
+                    let answer = &evidence.answer;
+                    let [frontier] = answer.projected_frontiers() else {
+                        return;
+                    };
+                    let [ResolutionSlotValue::Runtime { ty, .. }] = frontier.possible_values()
+                    else {
+                        return;
+                    };
+                    let [shape] = answer.projected_type_shapes() else {
+                        return;
+                    };
+                    if answer.completion() == &ResolutionCompletion::Complete
+                        && answer.binding().completion() == &ResolutionCompletion::Complete
+                        && frontier.completion() == &ResolutionCompletion::Complete
+                        && shape.completion() == &ResolutionCompletion::Complete
+                        && shape.supported()
+                        && shape.root_slot() == frontier.slot()
+                    {
+                        receiver = Some(*ty);
+                    }
+                });
+                if !matches!(resolved, BoundedResolution::Complete { value, .. } if value.status == brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved)
+                {
+                    return Ok(false);
+                }
+                let Some(receiver) = receiver else {
+                    return Ok(false);
+                };
+                let member = native.go_static_type_member(
+                    receiver_query,
+                    receiver,
+                    member_name,
+                    receiver_node.kind() == "identifier",
+                );
+                let member = match member {
+                    Ok(BoundedResolution::Complete {
+                        value: Some(member),
+                        ..
+                    }) => member,
+                    Ok(_) => return Ok(false),
+                    Err(error) => {
+                        analyzer.record_query_failure(error);
+                        return Ok(false);
+                    }
+                };
+                if member.completion != ResolutionCompletion::Complete
+                    || member.membership() != GoStaticMembership::Present
+                {
+                    return Ok(false);
+                }
+                let [candidate] = member.candidates.as_slice() else {
+                    return Ok(false);
+                };
+                if !candidate.signature_types_complete {
+                    return Ok(false);
+                }
+                let Some(signature) = &candidate.signature else {
+                    return Ok(false);
+                };
+                if ordinal == 0
+                    && (signature
+                        .result_owner_type_parameter()
+                        .is_some_and(|binding| binding.indirection_delta() <= 0)
+                        || signature
+                            .result_type_parameter()
+                            .is_some_and(|binding| binding.indirection_delta() <= 0))
+                {
+                    return Ok(false);
+                }
+                let Some(result) = signature.result_types().get(ordinal) else {
+                    return Ok(false);
+                };
+                let pointer = candidate.signature_types.iter().find(|state| state.slot() == result.slot())
+                            .is_some_and(|state| {
+                                state.completion() == &ResolutionCompletion::Complete
+                                    && matches!(state.possible_values(), [ResolutionSlotValue::Runtime { ty, .. }] if declared_result_is_pointer(*ty))
+                            });
+                return Ok(pointer && !request.stop_observed());
+            }
+        }
+        let mut pointer = false;
+        let result = native.resolve_type_with_evidence(query, |evidence| {
+            let answer = &evidence.answer;
+            let [frontier] = answer.projected_frontiers() else {
+                return;
+            };
+            let [ResolutionSlotValue::Runtime { ty, .. }] = frontier.possible_values() else {
+                return;
+            };
+            let [shape] = answer.projected_type_shapes() else {
+                return;
+            };
+            pointer = answer.completion() == &ResolutionCompletion::Complete
+                && answer.binding().completion() == &ResolutionCompletion::Complete
+                && frontier.completion() == &ResolutionCompletion::Complete
+                && shape.completion() == &ResolutionCompletion::Complete
+                && shape.supported()
+                && shape.root_slot() == frontier.slot()
+                && declared_result_is_pointer(*ty);
+        });
+        Ok(
+            matches!(result, BoundedResolution::Complete { value, .. } if value.status == brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Resolved)
+                && pointer
+                && !request.stop_observed(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_conversion_preserves_identity(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        procedure: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        converted: brokk_bifrost_analysis::analyzer::semantic::ValueId,
+        target: brokk_bifrost_analysis::analyzer::semantic::ValueId,
+        callee: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        ordinal: u32,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError> {
+        use brokk_bifrost_analysis::analyzer::semantic::{SemanticValueKind, SourceMappingKind};
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        let semantics = procedure.semantics();
+        let Some(converted_value) = semantics.value(converted) else {
+            return Ok(false);
+        };
+        if !matches!(&converted_value.kind, SemanticValueKind::LanguageDefined(name) if name.as_ref() == "go.assignment_conversion")
+        {
+            return Ok(false);
+        }
+        let Some(converted_mapping) = semantics
+            .source_mapping(converted_value.source)
+            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+        else {
+            return Ok(false);
+        };
+        let Some(binding_mapping) = semantics
+            .value(target)
+            .and_then(|value| semantics.source_mapping(value.source))
+            .filter(|mapping| mapping.kind == SourceMappingKind::Exact)
+        else {
+            return Ok(false);
+        };
+        let range = |mapping: &brokk_bifrost_analysis::analyzer::semantic::SourceMapping| {
+            let span = mapping.locator.anchor().span();
+            brokk_bifrost_core::analyzer::model::Range {
+                start_byte: span.start_byte() as usize,
+                end_byte: span.end_byte() as usize,
+                start_line: span.start().line() as usize + 1,
+                end_line: span.end().line() as usize + 1,
+            }
+        };
+        let call_range = range(converted_mapping);
+        let binding_range = range(binding_mapping);
+        let analyzer = workspace.analyzer();
+        let Some(file) = analyzer.project().file_by_rel_path(std::path::Path::new(
+            procedure.artifact().key().path().as_str(),
+        )) else {
+            return Ok(false);
+        };
+        let Some(source) = workspace.current_program_semantics_artifact_source(
+            &file,
+            request.budget.limits().source_bytes,
+        )?
+        else {
+            return Ok(false);
+        };
+        if source.key() != procedure.artifact().key() {
+            return Ok(false);
+        }
+        let source_work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: source.source().len(),
+            ..Default::default()
+        };
+        if request.budget.check_admission(source_work).is_err() {
+            return Ok(false);
+        }
+        request.budget.charge_work(source_work);
+        analyzer.record_read(
+            brokk_bifrost_analysis::analyzer::ReadKey::semantic_artifact(callee.artifact().key()),
+        );
+        let selected = |answer| match answer {
+            BoundedResolution::Complete { value, work } => Some((value, work)),
+            BoundedResolution::Exceeded { .. }
+            | BoundedResolution::Unavailable { .. }
+            | BoundedResolution::Cancelled { .. } => None,
+        };
+        let Some((binding, binding_work)) =
+            selected(type_identity_proof::go_explicit_binding_type_identity(
+                analyzer,
+                &file,
+                source.source(),
+                binding_range,
+                request.cancellation,
+            ))
+        else {
+            return Ok(false);
+        };
+        let Some((result, result_work)) =
+            selected(type_identity_proof::go_call_result_type_identity(
+                analyzer,
+                &file,
+                source.source(),
+                call_range,
+                ordinal,
+                request.cancellation,
+            ))
+        else {
+            return Ok(false);
+        };
+        let work = binding_work.saturating_add(result_work);
+        let charge = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: work
+                .setup_nodes
+                .saturating_add(work.scope_nodes)
+                .saturating_add(work.resolution_rounds)
+                .saturating_add(work.summary_expansions),
+            ..Default::default()
+        };
+        if request.budget.check_admission(charge).is_err() {
+            return Ok(false);
+        }
+        request.budget.charge_work(charge);
+        Ok(!request.stop_observed()
+            && type_identity_proof::go_assignment_conversion_types_identical(result, binding))
+    }
+    fn requires_selected_receiver_witness(&self) -> bool {
+        true
+    }
+
+    fn selected_method_has_pointer_receiver(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        callee: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<bool, brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError> {
+        Ok(go_selected_pointer_receiver(workspace, callee, request)?.is_some())
+    }
+    fn ownership_class_of_formal(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        callee: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        ordinal: u32,
+        _actual: brokk_bifrost_analysis::analyzer::semantic::ValueId,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::languages::SelectedCallResultOwnership,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use crate::analyzer::go::native_points::{GoNativePointRequest, GoNativePointRequestOpen};
+        use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
+        use brokk_bifrost_analysis::analyzer::languages::SelectedCallResultOwnership as Ownership;
+        use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+        if go_selected_pointer_formal(workspace, callee, ordinal, request)?.is_some() {
+            return Ok(Ownership::Reference);
+        }
+        if request.stop_observed() {
+            return Ok(Ownership::Unknown);
+        }
+        let analyzer = workspace.analyzer();
+        let Some(go) = resolve_analyzer::<crate::analyzer::go::GoAnalyzer>(analyzer) else {
+            return Ok(Ownership::Unknown);
+        };
+        let Some(file) = analyzer.project().file_by_rel_path(std::path::Path::new(
+            callee.artifact().key().path().as_str(),
+        )) else {
+            return Ok(Ownership::Unknown);
+        };
+        let Some(source) = workspace.current_program_semantics_artifact_source(
+            &file,
+            request.budget.limits().source_bytes,
+        )?
+        else {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::SourceBytes,
+            );
+            return Ok(Ownership::Unknown);
+        };
+        if source.key() != callee.artifact().key() {
+            return Ok(Ownership::Unknown);
+        }
+        let source_work = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: source.source().len(),
+            ..Default::default()
+        };
+        if request.budget.check_admission(source_work).is_err() {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+            );
+            return Ok(Ownership::Unknown);
+        }
+        request.budget.charge_work(source_work);
+        let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+            Ok(scope) => scope,
+            Err(_) => {
+                analyzer.mark_execution_dependent();
+                return Ok(Ownership::Unknown);
+            }
+        };
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let Some(syntax) = go.inner.prepared_syntax(scope.token(), &file) else {
+            return Ok(Ownership::Unknown);
+        };
+        if syntax.source() != source.source() || syntax.tree().root_node().has_error() {
+            return Ok(Ownership::Unknown);
+        }
+        let Some((binding, qualifier, site)) = go_imported_pointer_formal_site(
+            callee,
+            ordinal,
+            syntax.tree().root_node(),
+            &file,
+            source.source(),
+        ) else {
+            return Ok(Ownership::Unknown);
+        };
+        let mut native = match GoNativePointRequest::open_for_file(
+            go,
+            &file,
+            analyzer.semantic_model_overlay(),
+            request.cancellation,
+        ) {
+            Ok(GoNativePointRequestOpen::Ready(selected)) => selected,
+            Ok(GoNativePointRequestOpen::Cancelled) => return Ok(Ownership::Unknown),
+            Ok(GoNativePointRequestOpen::Unavailable { .. }) => {
+                analyzer.mark_execution_dependent();
+                return Ok(Ownership::Unknown);
+            }
+            Err(error) => {
+                analyzer.record_query_failure(error);
+                return Ok(Ownership::Unknown);
+            }
+        };
+        let query = BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source: source.source(),
+            tree: Some(syntax.tree()),
+            site: &site,
+            budget: Default::default(),
+            cancellation: Some(request.cancellation),
+        };
+        let BoundedResolution::Complete {
+            value: Some(_formal),
+            work,
+        } = (match native.selected_imported_pointer_formal(query, binding, qualifier) {
+            Ok(proof) => proof,
+            Err(error) => {
+                analyzer.record_query_failure(error);
+                return Ok(Ownership::Unknown);
+            }
+        })
+        else {
+            return Ok(Ownership::Unknown);
+        };
+        let charged = brokk_bifrost_analysis::analyzer::semantic::SemanticWork {
+            nested_entries: work
+                .scope_nodes
+                .saturating_add(work.setup_nodes)
+                .saturating_add(work.summary_expansions)
+                .saturating_add(work.resolution_rounds),
+            ..Default::default()
+        };
+        if request.budget.check_admission(charged).is_err() {
+            request.budget.note_external_stop(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticBudgetDimension::NestedEntries,
+            );
+            return Ok(Ownership::Unknown);
+        }
+        request.budget.charge_work(charged);
+        Ok(if request.stop_observed() {
+            Ownership::Unknown
+        } else {
+            Ownership::Reference
+        })
+    }
+
+    fn identity_conversion_between_formals(
+        &self,
+        workspace: &brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        source: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        source_ordinal: u32,
+        target: &brokk_bifrost_analysis::analyzer::semantic::ProcedureHandle,
+        target_ordinal: u32,
+        request: &mut brokk_bifrost_analysis::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion,
+        brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
+    > {
+        use brokk_bifrost_analysis::analyzer::languages::SelectedIdentityConversion as Conversion;
+        // A common, versioned source and one package-scoped pointee declaration
+        // prove whole-type identity without equating spellings across packages.
+        if source.artifact().key() != target.artifact().key() {
+            return Ok(Conversion::Unknown);
+        }
+        let source_type = go_selected_pointer_formal(workspace, source, source_ordinal, request)?;
+        let target_type = go_selected_pointer_formal(workspace, target, target_ordinal, request)?;
+        Ok(
+            if source_type.is_some() && source_type == target_type && !request.stop_observed() {
+                Conversion::Identity
+            } else {
+                Conversion::Unknown
+            },
+        )
+    }
+
+    fn certifies_caller_inventory(&self) -> bool {
+        true
+    }
+
+    fn implicit_entry_point(&self, analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> Option<bool> {
+        go_implicit_entry_point(analyzer, candidate)
+    }
+
     fn lexical_definitions_are_authoritative(&self) -> bool {
         false
     }
@@ -2469,8 +4281,7 @@ impl LanguageSupport for GoSupport {
         &self,
         node: tree_sitter::Node<'_>,
         _source: &str,
-    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
-    {
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::ReferenceSite> {
         go_branch_reference_site(node)
     }
 
@@ -2478,8 +4289,7 @@ impl LanguageSupport for GoSupport {
         &self,
         node: tree_sitter::Node<'_>,
         _source: &str,
-    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchReferenceSite>
-    {
+    ) -> Option<brokk_bifrost_analysis::analyzer::structural::branch_relations::ReferenceSite> {
         go_branch_reference_site(node)
     }
 
@@ -2499,6 +4309,50 @@ impl LanguageSupport for GoSupport {
 
     fn closed_receiver_summary_closes_external_body(&self) -> bool {
         true
+    }
+
+    fn static_class_conversion_needs_actual(
+        &self,
+        formal: brokk_bifrost_analysis::analyzer::semantic::StaticTypeClass,
+    ) -> bool {
+        use brokk_bifrost_analysis::analyzer::semantic::StaticTypeClass as Class;
+        // Only an interface-typed (or unproven) formal can box its argument.
+        matches!(formal, Class::Interface | Class::Unknown)
+    }
+
+    fn static_class_argument_conversion(
+        &self,
+        formal: brokk_bifrost_analysis::analyzer::semantic::StaticTypeClass,
+        actual: brokk_bifrost_analysis::analyzer::semantic::StaticTypeClass,
+    ) -> Option<
+        Result<
+            Option<brokk_bifrost_analysis::analyzer::semantic::ValueTransfer>,
+            brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown,
+        >,
+    > {
+        use brokk_bifrost_analysis::analyzer::semantic::StaticTypeClass as Class;
+        use brokk_bifrost_analysis::analyzer::semantic::{
+            TransferKind, TransferOperation, ValueTransfer,
+        };
+        use brokk_bifrost_analysis::analyzer::usages::call_conversion::ConversionUnknown;
+        // Boxing happens only at an interface-typed parameter. An Unknown
+        // formal is an interface or a type the argument is assignable to, so
+        // interface, pointer and reference arguments keep their identity
+        // either way; a struct, array or basic value is copied (#10582).
+        match (formal, actual) {
+            (
+                Class::Interface | Class::Unknown,
+                Class::Interface | Class::Pointer | Class::Reference,
+            ) => Some(Ok(None)),
+            (Class::Interface, Class::Value) => Some(Ok(Some(ValueTransfer {
+                kind: TransferKind::Boxing,
+                operation: TransferOperation::None,
+            }))),
+            (Class::Interface | Class::Unknown, Class::Value | Class::Unknown) => {
+                Some(Err(ConversionUnknown::UnresolvedSignature))
+            }
+            (Class::Value | Class::Pointer | Class::Reference, _) => None,
+        }
     }
 
     fn call_argument_partition_is_complete(
@@ -2522,6 +4376,12 @@ impl LanguageSupport for GoSupport {
         Option<Box<dyn brokk_bifrost_analysis::analyzer::semantic::ValueTypeBarrierContext + 'a>>,
         brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
     > {
+        let _model_scope =
+            AnalyzerQueryScope::pin_selected_model_snapshot(analyzer).map_err(|_| {
+                brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError::source_access(
+                    "Go model snapshot conflicts with the outer overlay",
+                )
+            })?;
         Ok(Some(value_type_barriers::open(analyzer)))
     }
 
@@ -2589,6 +4449,8 @@ impl LanguageSupport for GoSupport {
         use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork;
         use brokk_bifrost_core::path_utils::rel_path_string;
         let analyzer = query.analyzer;
+        let _model_scope = AnalyzerQueryScope::pin_selected_model_snapshot(analyzer)
+            .map_err(|_| "Go model snapshot conflicts with the outer overlay".to_owned())?;
         let site = query.site;
         let budget = query.budget;
         let language = Language::Go;
@@ -2600,23 +4462,27 @@ impl LanguageSupport for GoSupport {
         use crate::analyzer::go::native_points::GoNativePointRequestOpen;
         let go = resolve_analyzer::<crate::analyzer::go::GoAnalyzer>(analyzer)
             .ok_or("assignment-value probe has no Go analyzer")?;
-        let mut go_request =
-            match GoNativePointRequest::open_for_file(go, query.file, None, cancellation)
-                .map_err(|error| error.to_string())?
-            {
-                GoNativePointRequestOpen::Ready(request) => request,
-                GoNativePointRequestOpen::Unavailable { kind, message } => {
-                    return Ok(Some(BoundedResolution::Complete {
-                        value: unavailable_assignment_value_probe(site, kind, message),
-                        work: ReceiverAnalysisWork::default(),
-                    }));
-                }
-                GoNativePointRequestOpen::Cancelled => {
-                    return Ok(Some(BoundedResolution::Cancelled {
-                        work: ReceiverAnalysisWork::default(),
-                    }));
-                }
-            };
+        let mut go_request = match GoNativePointRequest::open_for_file(
+            go,
+            query.file,
+            analyzer.semantic_model_overlay(),
+            cancellation,
+        )
+        .map_err(|error| error.to_string())?
+        {
+            GoNativePointRequestOpen::Ready(request) => request,
+            GoNativePointRequestOpen::Unavailable { kind, message } => {
+                return Ok(Some(BoundedResolution::Complete {
+                    value: unavailable_assignment_value_probe(site, kind, message),
+                    work: ReceiverAnalysisWork::default(),
+                }));
+            }
+            GoNativePointRequestOpen::Cancelled => {
+                return Ok(Some(BoundedResolution::Cancelled {
+                    work: ReceiverAnalysisWork::default(),
+                }));
+            }
+        };
         let locator = SelectedSemanticLocator::for_reference_range(
             "go",
             rel_path_string(&request.file),
@@ -2739,6 +4605,7 @@ impl LanguageSupport for GoSupport {
 
     fn native_member_attribution(
         &self,
+        _analyzer: &dyn brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer,
         context: &brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeMemberContext,
         outcome: brokk_bifrost_core::analyzer::structural::resolution::CandidateOutcome,
     ) -> Option<brokk_bifrost_analysis::analyzer::languages::NativeMemberAttribution> {
@@ -2768,7 +4635,7 @@ impl LanguageSupport for GoSupport {
                 } else {
                     MemberDispatchTier::InheritedOrPromoted
                 },
-                relation: HierarchyRelation::Embedded,
+                relations: vec![HierarchyRelation::Embedded; depth],
                 precedence_tier: if depth == 0 {
                     PrecedenceTier::OwnMember
                 } else {
@@ -2808,6 +4675,24 @@ impl LanguageSupport for GoSupport {
         >,
         brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
     > {
+        let analyzer = oracle.workspace().analyzer();
+        let _model_scope =
+            AnalyzerQueryScope::pin_selected_model_snapshot(analyzer).map_err(|_| {
+                brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError::source_access(
+                    "Go model snapshot conflicts with the outer overlay",
+                )
+            })?;
+        let selected = selected_go_model_snapshot(analyzer);
+        let stored = oracle.active_semantic_model_snapshot();
+        if !matches!((&selected, &stored), (None, None))
+            && !matches!((&selected, &stored), (Some(a), Some(b)) if Arc::ptr_eq(a, b))
+        {
+            return Err(
+                brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError::source_access(
+                    "Go oracle snapshot differs from the request",
+                ),
+            );
+        }
         oracle.materialize_go_callable_factory(call, proof, request)
     }
 
@@ -2998,12 +4883,48 @@ impl LanguageSupport for GoSupport {
         }) {
             return Ok(());
         }
-        dependency_packs::reconcile_go_dependencies_after_edit(
-            workspace,
-            config,
-            limits,
-            cancellation,
-        )?;
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::DependencyResolver;
+        let mut adjusted_limits = *limits;
+        dependency_packs::GoDependencyResolver.adjust_limits(config, &mut adjusted_limits);
+        let captured =
+            brokk_bifrost_analysis::analyzer::semantic_model::capture_dependency_discovery(
+                workspace.analyzer(),
+                || {
+                    let mut outcome = match dependency_packs::reconcile_go_dependencies_after_edit(
+                        workspace,
+                        config,
+                        &adjusted_limits,
+                        cancellation,
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            let mut outcome = brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome::complete(Vec::new());
+                            outcome.complete = false;
+                            outcome.cancelled = cancellation.is_cancelled();
+                            outcome.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
+                            severity: brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Error,
+                            code: "go.native_context_store_failure".into(), dependency_id: None,
+                            location: None, message: error.to_string(),
+                        });
+                            outcome
+                        }
+                    };
+                    dependency_discovery::append_vendor_activation_rows(
+                        &mut outcome,
+                        &config.go,
+                        workspace.analyzer().project(),
+                        &adjusted_limits,
+                        Some(cancellation),
+                    );
+                    outcome
+                },
+            );
+        if !captured.outcome.cancelled {
+            workspace.store_captured_dependency_discovery(
+                brokk_bifrost_analysis::analyzer::DependencyPackEcosystem::Go,
+                captured,
+            );
+        }
         Ok(())
     }
 
@@ -3084,6 +5005,13 @@ impl LanguageSupport for GoSupport {
             BoundedResolution, ResolutionSession,
         };
         let complete_none = |work| BoundedResolution::Complete { value: None, work };
+        let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+            Ok(scope) => scope,
+            Err(_) => {
+                analyzer.mark_execution_dependent();
+                return complete_none(Default::default());
+            }
+        };
         let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
             return complete_none(Default::default());
         };
@@ -3147,6 +5075,9 @@ impl LanguageSupport for GoSupport {
             BoundedResolution::Exceeded { limit, work } => {
                 return BoundedResolution::Exceeded { limit, work };
             }
+            BoundedResolution::Unavailable { reason, work } => {
+                return BoundedResolution::Unavailable { reason, work };
+            }
             BoundedResolution::Cancelled { work } => return BoundedResolution::Cancelled { work },
         };
         if type_outcome.status != TypeLookupStatus::Resolved {
@@ -3155,17 +5086,7 @@ impl LanguageSupport for GoSupport {
         let Some(receiver) = selected_type else {
             return complete_none(type_work);
         };
-        let remaining =
-            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: budget.max_scope_nodes.saturating_sub(type_work.scope_nodes),
-                max_summary_expansions: budget
-                    .max_summary_expansions
-                    .saturating_sub(type_work.summary_expansions),
-                max_resolution_rounds: budget
-                    .max_resolution_rounds
-                    .saturating_sub(type_work.resolution_rounds),
-                ..budget
-            };
+        let remaining = budget.remaining_after(&type_work);
         // An allocated value has the value method set even if its syntax is a
         // place. Only an allocated pointer admits pointer receiver methods.
         let member_answer = request.go_static_type_member(
@@ -3192,6 +5113,12 @@ impl LanguageSupport for GoSupport {
                     work: type_work.saturating_add(work),
                 };
             }
+            BoundedResolution::Unavailable { reason, work } => {
+                return BoundedResolution::Unavailable {
+                    reason,
+                    work: type_work.saturating_add(work),
+                };
+            }
             BoundedResolution::Cancelled { work } => {
                 return BoundedResolution::Cancelled {
                     work: type_work.saturating_add(work),
@@ -3211,17 +5138,7 @@ impl LanguageSupport for GoSupport {
         let [candidate] = selection.candidates.as_slice() else {
             return complete_none(work);
         };
-        let remaining =
-            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: budget.max_scope_nodes.saturating_sub(work.scope_nodes),
-                max_summary_expansions: budget
-                    .max_summary_expansions
-                    .saturating_sub(work.summary_expansions),
-                max_resolution_rounds: budget
-                    .max_resolution_rounds
-                    .saturating_sub(work.resolution_rounds),
-                ..budget
-            };
+        let remaining = budget.remaining_after(&work);
         let projected =
             request.project_allocation_method(candidate.definition, remaining, &cancellation);
         let (method, projection_work) = match projected {
@@ -3232,6 +5149,15 @@ impl LanguageSupport for GoSupport {
             } => {
                 return BoundedResolution::Exceeded {
                     limit,
+                    work: work.saturating_add(projection_work),
+                };
+            }
+            BoundedResolution::Unavailable {
+                reason,
+                work: projection_work,
+            } => {
+                return BoundedResolution::Unavailable {
+                    reason,
                     work: work.saturating_add(projection_work),
                 };
             }
@@ -3247,17 +5173,7 @@ impl LanguageSupport for GoSupport {
         let Some(method) = method else {
             return complete_none(work);
         };
-        let remaining =
-            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
-                max_scope_nodes: budget.max_scope_nodes.saturating_sub(work.scope_nodes),
-                max_summary_expansions: budget
-                    .max_summary_expansions
-                    .saturating_sub(work.summary_expansions),
-                max_resolution_rounds: budget
-                    .max_resolution_rounds
-                    .saturating_sub(work.resolution_rounds),
-                ..budget
-            };
+        let remaining = budget.remaining_after(&work);
         let session = ResolutionSession::bounded(remaining, Some(&cancellation));
         let support =
             crate::analyzer::usages::get_definition::go::AnalyzerGoDefinitionProvider::bounded(
@@ -3283,10 +5199,34 @@ impl LanguageSupport for GoSupport {
                 limit,
                 work: work.saturating_add(check_work),
             },
+            BoundedResolution::Unavailable {
+                reason,
+                work: check_work,
+            } => BoundedResolution::Unavailable {
+                reason,
+                work: work.saturating_add(check_work),
+            },
             BoundedResolution::Cancelled { work: check_work } => BoundedResolution::Cancelled {
                 work: work.saturating_add(check_work),
             },
         }
+    }
+
+    /// Optional split-receipt route; specialized navigation batches may refuse.
+    fn resolve_call_targets_with_receipts(
+        &self,
+        _analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+        _token: brokk_bifrost_analysis::analyzer::QueryToken<'_>,
+        _requests: Vec<
+            brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest,
+        >,
+        _file: brokk_bifrost_analysis::analyzer::ProjectFile,
+        _source: std::sync::Arc<str>,
+        _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::SplitCallTargetBatch>
+    {
+        // Go's specialized navigation batch has no split receipt yet.
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3300,6 +5240,9 @@ impl LanguageSupport for GoSupport {
         file: brokk_bifrost_core::analyzer::model::ProjectFile,
         source: std::sync::Arc<str>,
         _primary_tree: Option<tree_sitter::Tree>,
+        _preparation: Option<
+            &brokk_bifrost_analysis::analyzer::usages::get_definition::PreparedDefinitionSource,
+        >,
         cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
     ) -> Vec<brokk_bifrost_analysis::analyzer::usages::get_definition::CallTargetLookupOutcome>
     {
@@ -3378,6 +5321,13 @@ impl LanguageSupport for GoSupport {
         use brokk_bifrost_core::analyzer::model::Language;
 
         use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+        let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+            Ok(scope) => scope,
+            Err(_) => {
+                analyzer.mark_execution_dependent();
+                return None;
+            }
+        };
         Some((|| {
             // Go's boundary evidence is the same pair the Python and JS/TS arm
             // reads, resolved through the shared Go package identity so a
@@ -3613,6 +5563,14 @@ impl LanguageSupport for GoSupport {
             &brokk_bifrost_analysis::analyzer::semantic::DeferredMemberSelection,
         >,
     ) {
+        let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+            Ok(scope) => scope,
+            Err(_) => {
+                lookup.truncated = true;
+                analyzer.mark_execution_dependent();
+                return;
+            }
+        };
         selector_calls::apply_go_typed_selector_target_at_call(
             lookup,
             analyzer,
@@ -3640,6 +5598,8 @@ impl LanguageSupport for GoSupport {
         analyzer: &'a dyn IAnalyzer,
         cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Option<Box<dyn brokk_bifrost_analysis::analyzer::languages::ReceiverRequest + 'a>> {
+        let _model_scope = AnalyzerQueryScope::pin_selected_model_snapshot(analyzer).ok()?;
+        let snapshot = selected_go_model_snapshot(analyzer);
         let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
         if let Ok(native_points::GoNativePointRequestOpen::Ready(opened)) =
             native_points::GoNativePointRequest::open(
@@ -3648,7 +5608,11 @@ impl LanguageSupport for GoSupport {
                 cancellation,
             )
         {
-            Some(opened)
+            Some(Box::new(native_points::GoScopedReceiverRequest {
+                analyzer,
+                snapshot,
+                request: opened,
+            }))
         } else {
             None
         }
@@ -3785,6 +5749,7 @@ mod dependency_packs {
             &self,
             config: &AnalyzerConfig,
             project: &dyn Project,
+            _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -3838,6 +5803,17 @@ mod dependency_packs {
         )
     }
 
+    fn record_native_context_refusal(outcome: &mut DependencyDiscoveryOutcome, message: String) {
+        outcome.complete = false;
+        outcome.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
+            severity: brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
+            code: "go.native_context_inputs_changed".into(),
+            dependency_id: None,
+            location: None,
+            message,
+        });
+    }
+
     pub(super) fn reconcile_selected_go_domains(
         workspace: &WorkspaceAnalyzer,
         config: &AnalyzerConfig,
@@ -3850,7 +5826,6 @@ mod dependency_packs {
         use brokk_bifrost_analysis::analyzer::store::go_package_context::GoInputObservationOutcome;
 
         use brokk_bifrost_analysis::analyzer::store::go_package_context::profile_digest;
-        use rusqlite::OptionalExtension;
         let project = workspace.analyzer().project();
         let Some(store) = workspace.store() else {
             return Ok(
@@ -3863,28 +5838,13 @@ mod dependency_packs {
                 .semantic_packs,
             );
         };
-        let workspace_id =
-            brokk_bifrost_analysis::analyzer::store::WorkspaceId::for_root(project.root());
-        let snapshot = {
-            let conn = store.read_conn()?;
-            conn.query_row(
-                "SELECT h.workspace_id,h.generation,h.revision FROM workspace_heads h
-                 JOIN analysis_epochs e ON e.lang=h.lang AND e.generation=h.generation
-                 WHERE h.workspace_id=?1 AND h.lang='go'",
-                [workspace_id.as_str()],
-                |row| {
-                    Ok(brokk_bifrost_analysis::analyzer::store::WorkspaceSnapshotId {
-                        workspace_id: workspace_id.clone(),
-                        lang: "go".into(),
-                        generation: brokk_bifrost_analysis::analyzer::store::GenerationId::from_persisted(
-                            row.get(1)?,
-                        ),
-                        revision: row.get(2)?,
-                    })
-                },
-            )
-            .optional()?
+        let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer()) else {
+            return Ok(DependencyDiscoveryOutcome::complete(Vec::new()));
         };
+        // A scoped operation owns a distinct projection even when its root and
+        // numeric generation/revision match the persisted root workspace.
+        let snapshots = go.inner.selected_workspace_snapshots();
+        let snapshot = snapshots.get("go").cloned();
         let overlays = brokk_bifrost_analysis::analyzer::store::go_package_context::GoOverlaySnapshot::capture(project)?;
         let before = snapshot
             .as_ref()
@@ -3926,10 +5886,7 @@ mod dependency_packs {
                 limits,
                 Some(cancellation),
             );
-            if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer())
-            {
-                go.record_build_selection(&discovered)?;
-            }
+            go.record_build_selection(&discovered)?;
             return Ok(discovered.semantic_packs);
         }
         let domains = store.go_discovery_domain_inputs(selected, project.root())?;
@@ -3948,12 +5905,7 @@ mod dependency_packs {
                     limits,
                     Some(cancellation),
                 );
-                if let Some(go) = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
-                    crate::analyzer::GoAnalyzer,
-                >(workspace.analyzer())
-                {
-                    go.record_build_selection(&discovered)?;
-                }
+                go.record_build_selection(&discovered)?;
                 return Ok(discovered.semantic_packs);
             }
         };
@@ -3985,12 +5937,16 @@ mod dependency_packs {
             &domains,
         )?;
         if domains.is_empty() {
-            if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer())
+            let publication = if go.inner.selected_workspace_snapshots().get("go") != Some(selected)
             {
+                GoContextPublicationOutcome::InputsChanged
+            } else {
                 *go.profile_write() = None;
-                go.refresh_source_inventory()?;
-            }
-            return Ok(if trigger == GoReconciliationTrigger::SourceChange {
+                go.refresh_source_inventory_at(selected, cancellation)?
+            };
+            let mut outcome = if trigger == GoReconciliationTrigger::SourceChange
+                || matches!(publication, GoContextPublicationOutcome::Cancelled)
+            {
                 DependencyDiscoveryOutcome::complete(Vec::new())
             } else {
                 crate::analyzer::go::dependency_discovery::discover_go_packages(
@@ -4000,9 +5956,22 @@ mod dependency_packs {
                     Some(cancellation),
                 )
                 .semantic_packs
-            });
+            };
+            match publication {
+                GoContextPublicationOutcome::Published(_) => {}
+                GoContextPublicationOutcome::Cancelled => {
+                    outcome.cancelled = true;
+                    outcome.complete = false;
+                }
+                GoContextPublicationOutcome::InputsChanged => {
+                    let message = "Go source inventory could not be activated at the captured selected snapshot".to_owned();
+                    eprintln!("go.native_context_inputs_changed: {message}");
+                    record_native_context_refusal(&mut outcome, message);
+                }
+            }
+            return Ok(outcome);
         }
-        if let Some(go) = resolve_analyzer::<crate::analyzer::GoAnalyzer>(workspace.analyzer()) {
+        {
             let base =
                 brokk_bifrost_analysis::analyzer::store::go_package_context::base_profile_digest(
                     &base_template,
@@ -4023,11 +5992,15 @@ mod dependency_packs {
         let mut worker_failures = Vec::new();
         for chunk in domains.chunks(width) {
             let outcomes = std::thread::scope(|scope| {
+                let read_attribution =
+                    brokk_bifrost_analysis::analyzer::ReadAttribution::for_request();
                 let handles=chunk.iter().map(|(domain,input_digest)| {
+                    let read_attribution = read_attribution.clone();
                     let base_environment=base_environment.clone();
                     let root_key=&root_key;
                     let overlays=&overlays;
                     scope.spawn(move || -> brokk_bifrost_analysis::analyzer::store::Result<_> {
+                        let _read_attribution = read_attribution.install();
                         use crate::analyzer::go::dependency_discovery::{domain_environment, discover_domain, GoPackageDiscovery};
                         let mut environment=base_environment;
                         environment.gowork=if domain.gowork_path.is_empty(){"off".into()}else{project.root().join(&domain.gowork_path).to_string_lossy().into_owned()};
@@ -4122,19 +6095,19 @@ mod dependency_packs {
                     }
                 };
                 if let Some((identity, profile)) = reused {
-                    match store.reconcile_unit_summaries(selected,brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries{context_id:identity.context_id,profile},cancellation) {
-                        Ok(report) if report.failed.is_empty()=>{},
-                        report=>eprintln!("go.unit_summary_failed: domain {domain:?}, reconciliation {report:?}"),
-                    }
                     if root_key
                         .as_ref()
                         .is_some_and(|key| key.0 == domain.directory && key.1 == domain.gowork_path)
-                        && let Some(go) =
-                            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
-                                crate::analyzer::GoAnalyzer,
-                            >(workspace.analyzer())
+                        && !go.activate_native_context_profile(selected, profile)
                     {
-                        go.activate_native_context_profile(selected, profile);
+                        let message = "Reused Go native package context could not be activated at the captured selected snapshot".to_owned();
+                        eprintln!("go.native_context_inputs_changed: domain {domain:?}: {message}");
+                        record_native_context_refusal(&mut aggregate, message);
+                        continue;
+                    }
+                    match store.reconcile_unit_summaries(selected,brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries{context_id:identity.context_id,profile},cancellation) {
+                        Ok(report) if report.failed.is_empty()=>{},
+                        report=>eprintln!("go.unit_summary_failed: domain {domain:?}, reconciliation {report:?}"),
                     }
                     continue;
                 }
@@ -4143,7 +6116,6 @@ mod dependency_packs {
                     aggregate.complete &= discovered.semantic_packs.complete;
                     continue;
                 };
-                let selected_snapshot = snapshot.clone();
                 let profile = profile_digest(&canonical);
                 let mut input_change = None;
                 let publication =
@@ -4192,12 +6164,7 @@ mod dependency_packs {
                     GoContextPublicationOutcome::Published(identity) => {
                         let activated = !root_key.as_ref().is_some_and(|key| {
                             key.0 == domain.directory && key.1 == domain.gowork_path
-                        }) || selected_snapshot.as_ref().is_some_and(|snapshot| {
-                            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
-                                crate::analyzer::GoAnalyzer,
-                            >(workspace.analyzer())
-                            .is_some_and(|go| go.activate_native_context_profile(snapshot, profile))
-                        });
+                        }) || go.activate_native_context_profile(selected, profile);
                         if activated {
                             GoContextPublicationOutcome::Published(identity)
                         } else {
@@ -4213,16 +6180,13 @@ mod dependency_packs {
                         });
                         // The head is the membership authority the unit summaries are
                         // derived from, so they are reconciled after it and never before.
-                        let snapshot = selected_snapshot
-                            .as_ref()
-                            .expect("a published Go context was selected at a snapshot");
                         // The summaries are optional (readers fall back), so a store error
                         // here is a diagnostic, not a failure of the activation whose head
                         // was already published.
                         let timing =
                             brokk_bifrost_core::profiling::scope("go.unit_summaries.reconcile");
                         let reconciliation = store.reconcile_unit_summaries(
-                    snapshot,
+                    selected,
                     brokk_bifrost_analysis::analyzer::store::go_unit_summaries::GoUnitSummaries {
                         context_id: identity.context_id,
                         profile,
@@ -4259,19 +6223,15 @@ mod dependency_packs {
                         // Without the first disagreement, the refusal was the
                         // before/after comparison or the publication's head check.
                         let message = format!(
-                            "Go source or configuration no longer matches the selected revision ({}); native package context was not published",
+                            "Go source or configuration no longer matches the selected revision ({}); native package context was not activated",
                             input_change.map_or_else(
-                                || "inputs changed while discovery ran".to_owned(),
+                                || "inputs or selected snapshot changed while discovery ran"
+                                    .to_owned(),
                                 |change| format!("{change:?}")
                             )
                         );
                         eprintln!("go.native_context_inputs_changed: domain {domain:?}: {message}");
-                        discovered.semantic_packs.complete = false;
-                        discovered.semantic_packs.diagnostics.push(brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnostic {
-                    severity: brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackDiagnosticSeverity::Warning,
-                    code: "go.native_context_inputs_changed".into(), dependency_id:None, location:None,
-                    message,
-                });
+                        record_native_context_refusal(&mut discovered.semantic_packs, message);
                     }
                 }
                 if root_key
@@ -4373,6 +6333,27 @@ mod hierarchy_tests {
                 + updated.workspace_path_index_build_count_for_test(),
             2
         );
+    }
+
+    #[hardwon("#10694: one Go source refused after parsing emptied the whole workspace's Go graph")]
+    #[test]
+    fn graph_inventory_retains_named_refusal_without_closing_resolution() {
+        let source = format!("package app\nvar audioData{} int8\n", "A".repeat(20_000));
+        let go = analyzer(&[
+            ("oversized.go", &source),
+            ("other/routes.go", "package other\nfunc Route() {}\n"),
+        ]);
+        assert!(!go.workspace_path_index().is_complete());
+        // Hierarchy, dispatch and reverse imports stay open over the refusal.
+        assert!(!go.graph_inventory_complete());
+        assert!(go.graph_inventory_complete_with_named_refusals());
+        let exclusions = go.graph_source_exclusions().unwrap();
+        assert_eq!(exclusions.len(), 1);
+        assert_eq!(
+            exclusions[0].0,
+            ProjectFile::new(go.project().root(), "oversized.go")
+        );
+        assert!(!exclusions[0].1.is_empty());
     }
 
     #[test]
@@ -4736,11 +6717,24 @@ mod hierarchy_tests {
             assert_eq!(
                 answer.outcome,
                 MemberFamilyOutcome::Incomplete,
-                "the satisfaction pass skips an interface carrying type terms, \
-                 so neither end of {} may claim an exhaustive family",
+                "an interface carrying type terms has no complete method-set \
+                 inventory, so neither end of {} may claim an exhaustive family",
                 unit.fq_name()
             );
-            assert_eq!(answer.reason, Some(MemberFamilyReason::HierarchyTruncated));
+            // The native hierarchy classifies the gap by cause. Until the Go
+            // hierarchy routing swap, the default route is the legacy index,
+            // which maps every NotEnumerable family to HierarchyTruncated;
+            // drop that branch with the swap.
+            let expected = if std::env::var_os("BIFROST_TRIAL_NATIVE_GO_HIERARCHY").is_some() {
+                MemberFamilyReason::CoverageIncomplete
+            } else {
+                MemberFamilyReason::HierarchyTruncated
+            };
+            assert_eq!(
+                answer.reason,
+                Some(expected),
+                "the gap is in the content of the family, not a budget stop"
+            );
             assert!(answer.edges.is_empty());
         }
         assert_eq!(
@@ -4861,6 +6855,8 @@ mod selector_calls {
         else {
             return;
         };
+        lookup.receiver_owner_relation =
+            brokk_bifrost_analysis::analyzer::semantic::ReceiverOwnerRelation::Unknown;
         let field = callable
             .child_by_field_name("field")
             .expect("selected callable has field");
@@ -4912,6 +6908,13 @@ mod selector_calls {
                 BoundedResolution::Complete { .. } => {}
                 BoundedResolution::Exceeded { .. } => {
                     lookup.budget_exhausted = true;
+                    return;
+                }
+                BoundedResolution::Unavailable { .. } => {
+                    lookup.status = Some(brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Unavailable);
+                    lookup
+                        .diagnostic_kinds
+                        .push("native_input_unavailable".into());
                     return;
                 }
                 BoundedResolution::Cancelled { .. } => {
@@ -5014,6 +7017,13 @@ mod selector_calls {
         {
             lookup.member_receiver_preparation = preparation;
         }
+        let owner_relation = associated[0].receiver_owner_relation;
+        if associated
+            .iter()
+            .all(|row| row.receiver_owner_relation == owner_relation)
+        {
+            lookup.receiver_owner_relation = owner_relation;
+        }
     }
 }
 
@@ -5032,5 +7042,6 @@ pub fn go_implicit_entry_point(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -
     brokk_bifrost_go::entry_point::go_implicit_entry_point(candidate, package_clause.as_deref())
 }
 pub use type_identity_proof::{
-    go_explicit_binding_type_identity, go_selected_callable_result_type_identities,
+    go_assignment_conversion_types_identical, go_explicit_binding_type_identity,
+    go_selected_callable_result_type_identities,
 };

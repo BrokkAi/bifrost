@@ -15,6 +15,7 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
+use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
@@ -60,6 +61,55 @@ const RUST_TASK_SPAWN_PATHS: &[&[&str]] = &[
 pub struct RustStructuralSpec;
 
 pub static RUST_STRUCTURAL_SPEC: RustStructuralSpec = RustStructuralSpec;
+
+fn rust_binding_needs_strict_selection(binder: Node<'_>) -> bool {
+    let whole_arm = binder
+        .parent()
+        .is_some_and(|parent| parent.kind() == "match_pattern");
+    let whole_let_condition = binder.parent().is_some_and(|parent| {
+        parent.kind() == "let_condition"
+            && parent
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| pattern.id() == binder.id())
+    });
+    let shorthand_field = binder.kind() == "shorthand_field_identifier"
+        && binder
+            .parent()
+            .is_some_and(|parent| parent.kind() == "field_pattern");
+    let mut ancestor = binder.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "let_declaration" && parent.child_by_field_name("alternative").is_some()
+        {
+            return true;
+        }
+        if matches!(parent.kind(), "or_pattern" | "reference_pattern") {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "match_pattern" | "match_arm" | "let_condition"
+        ) {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "match_arm"
+                | "let_declaration"
+                | "let_condition"
+                | "parameter"
+                | "closure_parameters"
+                | "for_expression"
+        ) {
+            break;
+        }
+        ancestor = parent.parent();
+    }
+    whole_arm || whole_let_condition || shorthand_field
+}
+
+fn rust_occurrence_needs_binding_verdict(node: Node<'_>, role: OccurrenceRole) -> bool {
+    role == OccurrenceRole::Binder && rust_binding_needs_strict_selection(node)
+}
 
 /// Classify one exact Rust call expression without resolving its callee.  The
 /// `drop` spelling is read only from the parser-selected function identifier;
@@ -244,6 +294,7 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("compound_assignment_expr", NormalizedKind::Assignment),
     ("use_declaration", NormalizedKind::Import),
     ("identifier", NormalizedKind::Identifier),
+    ("shorthand_field_identifier", NormalizedKind::Identifier),
     ("field_identifier", NormalizedKind::Identifier),
     ("scoped_identifier", NormalizedKind::Identifier),
     ("type_identifier", NormalizedKind::Identifier),
@@ -266,6 +317,40 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     // loop and conditional bodies, and bare blocks in expression position.
     ("block", NormalizedKind::Block),
 ];
+
+/// The last statement of a block. Comments are named extras in
+/// tree-sitter-rust and a labeled block's `label` is a named child; neither is
+/// a statement.
+pub fn rust_block_last_statement(block: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = block.walk();
+    block
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra() && child.kind() != "label")
+        .last()
+}
+
+/// The expression a block evaluates to. A trailing `if`, `match`, `loop` or
+/// block without `;` sits inside an `expression_statement`; the statement's
+/// expression is the tail. A last statement ending in `;`, a `let` or an item
+/// leaves the block without a tail value.
+pub fn rust_block_tail_expression(block: Node<'_>) -> Option<Node<'_>> {
+    let last = rust_block_last_statement(block)?;
+    if last.kind() == "expression_statement" {
+        let mut cursor = last.walk();
+        if last.children(&mut cursor).any(|child| child.kind() == ";") {
+            return None;
+        }
+        let mut cursor = last.walk();
+        return last
+            .named_children(&mut cursor)
+            .find(|child| !child.is_extra());
+    }
+    let kind = last.kind();
+    let declaration = kind.ends_with("_declaration")
+        || kind.ends_with("_item")
+        || matches!(kind, "macro_definition" | "empty_statement");
+    (!declaration).then_some(last)
+}
 
 /// Remove transparent receiver parentheses without descending recursively.
 pub fn rust_receiver_operand(mut node: Node<'_>) -> Node<'_> {
@@ -530,6 +615,140 @@ fn attach_outer_attribute_decorators(sink: &mut RoleSink<'_>, item: Node<'_>) {
     }
 }
 
+/// An outer attribute is source preserving only when every effective meta
+/// item selected by its parsed `cfg_attr` tree has a known inert path.
+fn rust_attribute_preserves_body(
+    attribute: Node<'_>,
+    source: &str,
+    context: Option<&CallSiteContext>,
+) -> bool {
+    let Some(item) = attribute.parent() else {
+        return false;
+    };
+    if item.kind() != "attribute_item" {
+        return false;
+    }
+    let owner_scope = item
+        .parent()
+        .and_then(|attributes| attributes.parent())
+        .and_then(|owner| owner.parent());
+    crate::resolution::rust_effective_attributes(std::iter::once(item), source).is_some_and(
+        |attributes| {
+            !attributes.is_empty()
+                && attributes.into_iter().all(|attribute| {
+                    if attribute.path.len() != 1 {
+                        return false;
+                    }
+                    let name = crate::declarations::rust_node_text(attribute.path[0], source);
+                    if name == "test" {
+                        let mut work = 0usize;
+                        let mut charge = |amount: usize| -> Result<(), ()> {
+                            work = work.saturating_add(amount);
+                            (work <= 100_000).then_some(()).ok_or(())
+                        };
+                        let unshadowed = owner_scope.is_some_and(|scope| {
+                            if let Some(context) = context {
+                                let mut current = Some(scope);
+                                while let Some(node) = current {
+                                    if !context.test_attribute_scope_unshadowed(node.id()) {
+                                        return false;
+                                    }
+                                    current = node.parent();
+                                }
+                                true
+                            } else {
+                                crate::lexical_scope::rust_test_attribute_unshadowed_bounded(
+                                    scope,
+                                    source,
+                                    &mut charge,
+                                ) == Ok(true)
+                            }
+                        });
+                        if !unshadowed {
+                            return false;
+                        }
+                    }
+                    matches!(
+                        name,
+                        "test"
+                            | "cfg"
+                            | "allow"
+                            | "warn"
+                            | "deny"
+                            | "forbid"
+                            | "expect"
+                            | "inline"
+                            | "cold"
+                            | "must_use"
+                            | "doc"
+                            | "deprecated"
+                            | "track_caller"
+                            | "derive"
+                            | "automatically_derived"
+                            | "non_exhaustive"
+                            | "repr"
+                    )
+                })
+        },
+    )
+}
+
+fn attach_attribute_arguments(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
+    fn emit(sink: &mut RoleSink<'_>, segment: &[Node<'_>]) {
+        let Some(first) = segment.first().copied() else {
+            return;
+        };
+        let last = *segment.last().unwrap();
+        let span = Span {
+            start_byte: first.start_byte(),
+            end_byte: last.end_byte(),
+        };
+        if segment.len() == 1 && first.kind() == "identifier" {
+            sink.argument_maybe_named(first, Some(first), false);
+        } else if segment.len() >= 3 && first.kind() == "identifier" && segment[1].kind() == "=" {
+            if segment.len() == 3
+                && matches!(
+                    segment[2].kind(),
+                    "string_literal"
+                        | "char_literal"
+                        | "integer_literal"
+                        | "float_literal"
+                        | "boolean_literal"
+                )
+            {
+                sink.kwarg(first, segment[2]);
+            } else {
+                sink.kwarg_value_span(
+                    first,
+                    Span {
+                        start_byte: segment[2].start_byte(),
+                        end_byte: last.end_byte(),
+                    },
+                );
+            }
+        } else {
+            sink.argument_span(span);
+        }
+    }
+    let mut segment = Vec::new();
+    for index in 1..arguments.child_count().saturating_sub(1) {
+        if !sink.should_continue() {
+            break;
+        }
+        let child = arguments.child(index).unwrap();
+        if child.is_extra() {
+            continue;
+        }
+        if child.kind() == "," {
+            emit(sink, &segment);
+            segment.clear();
+        } else {
+            segment.push(child);
+        }
+    }
+    emit(sink, &segment);
+}
+
 fn derive_path_module(node: Node<'_>) -> Option<Node<'_>> {
     let separator = node.prev_sibling()?;
     (separator.kind() == "::")
@@ -597,7 +816,7 @@ fn rust_is_in_use_tree(node: Node<'_>) -> bool {
 pub(crate) fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
     if !matches!(
         node.kind(),
-        "identifier" | "field_identifier" | "type_identifier"
+        "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier"
     ) {
         return None;
     }
@@ -629,12 +848,24 @@ pub(crate) fn rust_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
         _ if field == Some("name") && RUST_DECLARATION_HEADS.contains(&parent_kind) => {
             OccurrenceRole::DeclarationName
         }
-        "parameter" | "let_declaration" | "for_expression" if field == Some("pattern") => {
+        "parameter" | "let_declaration" | "let_condition" | "for_expression"
+            if field == Some("pattern") =>
+        {
             OccurrenceRole::Binder
         }
-        "closure_parameters" | "ref_pattern" | "mut_pattern" | "tuple_pattern"
-        | "slice_pattern" | "captured_pattern" => OccurrenceRole::Binder,
+        "closure_parameters" | "ref_pattern" | "reference_pattern" | "mut_pattern"
+        | "or_pattern" | "tuple_pattern" | "slice_pattern" | "captured_pattern" => {
+            if anchor.id() == node.id() {
+                OccurrenceRole::Binder
+            } else {
+                OccurrenceRole::PatternPosition
+            }
+        }
+        "match_pattern" if field == Some("condition") => OccurrenceRole::ValueReference,
+        "match_pattern" if anchor.id() == node.id() => OccurrenceRole::Binder,
+        "match_pattern" => OccurrenceRole::PatternPosition,
         "field_pattern" if field == Some("pattern") => OccurrenceRole::Binder,
+        "field_pattern" if node.kind() == "shorthand_field_identifier" => OccurrenceRole::Binder,
         "field_pattern" if field == Some("name") => OccurrenceRole::MemberPosition,
         "tuple_struct_pattern" => match field {
             Some("type") => OccurrenceRole::PatternPosition,
@@ -677,6 +908,16 @@ fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
         )
     })?;
     match form.kind() {
+        "parameter"
+            if form.parent().is_some_and(|parameters| {
+                parameters.kind() == "parameters"
+                    && parameters
+                        .parent()
+                        .is_some_and(|owner| owner.kind() == "function_signature_item")
+            }) =>
+        {
+            None
+        }
         "parameter" | "closure_parameters" | "self_parameter" => Some(BindingActivation {
             kind: BindingKind::Parameter,
             hoisting: HoistingClass::ScopeWide,
@@ -696,8 +937,8 @@ fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
             activation: node_range(form),
         }),
         "let_condition" => {
-            // `if let Some(x) = value { .. }` binds in the consequence only;
-            // the else arm can resolve the same spelling to an outer local.
+            // A let-chain binder is visible in later `&&` conditions as well
+            // as the body, but never in its own initializer or the else arm.
             let owner = nearest_ancestor(form, |kind| {
                 matches!(kind, "if_expression" | "while_expression")
             })?;
@@ -709,7 +950,12 @@ fn rust_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingActi
             Some(BindingActivation {
                 kind: BindingKind::PatternBinder,
                 hoisting: HoistingClass::DeclaredHead,
-                activation: node_range(body),
+                activation: Range {
+                    start_byte: form.end_byte(),
+                    end_byte: body.end_byte(),
+                    start_line: form.end_position().row + 1,
+                    end_line: body.end_position().row + 1,
+                },
             })
         }
         _ => Some(BindingActivation {
@@ -1300,6 +1546,166 @@ fn rust_callee_bound_paths<E>(
 }
 
 impl StructuralSpec for RustStructuralSpec {
+    fn call_site_context(&self, root: Node<'_>, source: &str) -> CallSiteContext {
+        self.call_site_context_limited(root, source, usize::MAX, None)
+            .expect("unbounded Rust syntax preparation")
+    }
+
+    fn call_site_context_limited(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        _max_work_items: usize,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Result<
+        CallSiteContext,
+        brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop,
+    > {
+        use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop;
+        let mut binders = Vec::new();
+        let mut test_scopes_to_prepare = Vec::new();
+        let mut stack = vec![root];
+        let mut work = 0usize;
+        // This is a preparation budget, not the collector's fact-node budget:
+        // raw Rust syntax can contain many nodes that never become facts.
+        // Fixed per-file work allowance: identical bytes always persist the
+        // same verdicts regardless of request budget or cache history.
+        const PREPARATION_LIMIT: usize = 100_000;
+        while let Some(node) = stack.pop() {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                return Err(StructuralFactCollectorStop::Cancelled);
+            }
+            work = work.saturating_add(1);
+            if work > PREPARATION_LIMIT {
+                return Ok(CallSiteContext::with_open_binding_candidates());
+            }
+            if let Some(role) = rust_occurrence_role(node)
+                && rust_occurrence_needs_binding_verdict(node, role)
+            {
+                binders.push(node);
+            }
+            if node.kind() == "attribute_item"
+                && crate::resolution::rust_effective_attributes(std::iter::once(node), source)
+                    .is_some_and(|attributes| {
+                        attributes.into_iter().any(|attribute| {
+                            attribute.path.len() == 1
+                                && crate::declarations::rust_node_text(attribute.path[0], source)
+                                    == "test"
+                        })
+                    })
+                && let Some(scope) = node
+                    .parent()
+                    .and_then(|attributes| attributes.parent())
+                    .and_then(|owner| owner.parent())
+            {
+                test_scopes_to_prepare.push(scope);
+            }
+            for index in (0..node.named_child_count()).rev() {
+                stack.push(node.named_child(index).expect("named child"));
+            }
+        }
+        // Classification is a second bounded phase. The index scans each
+        // lexical scope once; charge each candidate before entering it.
+        if work.saturating_add(binders.len()) > PREPARATION_LIMIT {
+            return Ok(CallSiteContext::with_open_binding_candidates());
+        }
+        if cancellation.is_some_and(|token| token.is_cancelled()) {
+            return Err(StructuralFactCollectorStop::Cancelled);
+        }
+        let mut index = crate::lexical_scope::RustStrictPatternIndex::default();
+        let mut answers = Vec::with_capacity(binders.len());
+        for &binder in &binders {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                return Err(StructuralFactCollectorStop::Cancelled);
+            }
+            work += 1;
+            if work > PREPARATION_LIMIT {
+                return Ok(CallSiteContext::with_open_binding_candidates());
+            }
+            let verdict = if rust_binding_needs_strict_selection(binder) {
+                let mut charge = |amount: usize| {
+                    if cancellation.is_some_and(|token| token.is_cancelled()) {
+                        return Err(StructuralFactCollectorStop::Cancelled);
+                    }
+                    work = work.saturating_add(amount);
+                    if work > PREPARATION_LIMIT {
+                        return Err(StructuralFactCollectorStop::Exceeded);
+                    }
+                    Ok(())
+                };
+                let classification =
+                    match index.classify_with_budget(root, source, binder, &mut charge) {
+                        Ok(classification) => classification,
+                        Err(StructuralFactCollectorStop::Cancelled) => {
+                            return Err(StructuralFactCollectorStop::Cancelled);
+                        }
+                        Err(StructuralFactCollectorStop::Exceeded) => {
+                            return Ok(CallSiteContext::with_open_binding_candidates());
+                        }
+                    };
+                match classification {
+                    crate::lexical_scope::RustPatternName::Binding => {
+                        brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding
+                    }
+                    crate::lexical_scope::RustPatternName::ValueItem => {
+                        brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::ValueItem
+                    }
+                    crate::lexical_scope::RustPatternName::Unknown => {
+                        brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Open
+                    }
+                }
+            } else {
+                brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding
+            };
+            answers.push(verdict);
+        }
+        let verdicts = binders
+            .into_iter()
+            .zip(answers)
+            .map(|(binder, verdict)| (binder.id(), verdict))
+            .collect();
+        let mut test_scopes = brokk_bifrost_core::hash::HashMap::default();
+        for owner_scope in test_scopes_to_prepare {
+            let mut current = Some(owner_scope);
+            while let Some(scope) = current {
+                if cancellation.is_some_and(|token| token.is_cancelled()) {
+                    return Err(StructuralFactCollectorStop::Cancelled);
+                }
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    test_scopes.entry(scope.id())
+                {
+                    let mut charge = |amount: usize| {
+                        if cancellation.is_some_and(|token| token.is_cancelled()) {
+                            return Err(StructuralFactCollectorStop::Cancelled);
+                        }
+                        work = work.saturating_add(amount);
+                        if work > PREPARATION_LIMIT {
+                            return Err(StructuralFactCollectorStop::Exceeded);
+                        }
+                        Ok(())
+                    };
+                    let unshadowed = match crate::lexical_scope::rust_test_scope_unshadowed_bounded(
+                        scope,
+                        source,
+                        &mut charge,
+                    ) {
+                        Ok(value) => value,
+                        Err(StructuralFactCollectorStop::Cancelled) => {
+                            return Err(StructuralFactCollectorStop::Cancelled);
+                        }
+                        Err(StructuralFactCollectorStop::Exceeded) => {
+                            return Ok(CallSiteContext::with_open_binding_candidates());
+                        }
+                    };
+                    entry.insert(unshadowed);
+                }
+                current = scope.parent();
+            }
+        }
+        Ok(CallSiteContext::with_binding_candidate_verdicts(verdicts)
+            .with_test_attribute_scopes(test_scopes))
+    }
+
     fn supports_unsafe_context(&self) -> bool {
         true
     }
@@ -1394,9 +1800,38 @@ impl StructuralSpec for RustStructuralSpec {
         &self,
         node: Node<'_>,
         _kind: NormalizedKind,
-        _source: &str,
+        source: &str,
     ) -> Option<&'static str> {
-        (node.kind() == "macro_invocation").then_some("rust_macro_invocation")
+        if node.kind() == "macro_invocation" {
+            return Some("rust_macro_invocation");
+        }
+        if node.kind() == "attribute" {
+            return Some(if rust_attribute_preserves_body(node, source, None) {
+                "rust_body_preserving_attribute"
+            } else {
+                "rust_opaque_attribute"
+            });
+        }
+        None
+    }
+
+    fn generator_construct_with_context(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        source: &str,
+        context: &CallSiteContext,
+    ) -> Option<&'static str> {
+        if node.kind() == "attribute" {
+            return Some(
+                if rust_attribute_preserves_body(node, source, Some(context)) {
+                    "rust_body_preserving_attribute"
+                } else {
+                    "rust_opaque_attribute"
+                },
+            );
+        }
+        self.generator_construct(node, kind, source)
     }
 
     fn supports_boolean_literal_value(&self) -> bool {
@@ -1452,6 +1887,11 @@ impl StructuralSpec for RustStructuralSpec {
             _ => None,
         }
     }
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::ConcurrentSpawn, NormalizedKind::Method]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         RUST_KIND_TABLE
     }
@@ -1553,10 +1993,6 @@ impl StructuralSpec for RustStructuralSpec {
         )
     }
 
-    fn supports_role(&self, role: Role) -> bool {
-        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_kwarg(role)
-    }
-
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &RUST_OCCURRENCE_ROLE_SUPPORT
     }
@@ -1587,6 +2023,128 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn binding_activation(&self, binder: Node<'_>, scope: Range) -> Option<BindingActivation> {
         rust_binding_activation(binder, scope)
+    }
+
+    fn binding_candidate_excluded(&self, binder: Node<'_>) -> bool {
+        let Some(signature) = nearest_ancestor(binder, |kind| kind == "function_signature_item")
+        else {
+            return false;
+        };
+        let Some(parameters) = signature.child_by_field_name("parameters") else {
+            return false;
+        };
+        // Only the signature's own formals are absent from CodeQL's local
+        // Variable rows. A const-expression `let` inside a written type is a
+        // real local and must retain its binder fact.
+        let Some(parameter) = nearest_ancestor(binder, |kind| {
+            matches!(kind, "parameter" | "self_parameter")
+        }) else {
+            return false;
+        };
+        let in_formal_list = parameter
+            .parent()
+            .is_some_and(|parent| parent.id() == parameters.id());
+        let in_formal_pattern = if parameter.kind() == "self_parameter" {
+            binder
+                .parent()
+                .is_some_and(|parent| parent.id() == parameter.id())
+        } else {
+            parameter
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| {
+                    pattern.start_byte() <= binder.start_byte()
+                        && binder.end_byte() <= pattern.end_byte()
+                })
+        };
+        in_formal_list && in_formal_pattern
+    }
+
+    fn binding_candidate_verdict(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        binder: Node<'_>,
+    ) -> brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict {
+        use crate::lexical_scope::RustPatternName;
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        // Parameter patterns are irrefutable. A binder beneath `&` remains
+        // a binding unless this lexical check proves a competing value item.
+        if !rust_binding_needs_strict_selection(binder) {
+            return BindingCandidateVerdict::Binding;
+        }
+        let mut work = 0usize;
+        let mut charge = |amount: usize| -> Result<(), ()> {
+            work = work.saturating_add(amount);
+            (work <= 100_000).then_some(()).ok_or(())
+        };
+        match crate::lexical_scope::rust_pattern_name_strict_bounded(
+            root,
+            source,
+            binder,
+            &mut charge,
+        ) {
+            Ok(RustPatternName::Binding) => BindingCandidateVerdict::Binding,
+            Ok(RustPatternName::ValueItem) => BindingCandidateVerdict::ValueItem,
+            Ok(RustPatternName::Unknown) | Err(()) => BindingCandidateVerdict::Open,
+        }
+    }
+
+    fn binding_candidate_verdicts(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        binders: &[Node<'_>],
+    ) -> Vec<brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict> {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let mut index = crate::lexical_scope::RustStrictPatternIndex::default();
+        binders
+            .iter()
+            .map(|&binder| {
+                if !rust_binding_needs_strict_selection(binder) {
+                    return BindingCandidateVerdict::Binding;
+                }
+                match index.classify(root, source, binder) {
+                    crate::lexical_scope::RustPatternName::Binding => {
+                        BindingCandidateVerdict::Binding
+                    }
+                    crate::lexical_scope::RustPatternName::ValueItem => {
+                        BindingCandidateVerdict::ValueItem
+                    }
+                    crate::lexical_scope::RustPatternName::Unknown => BindingCandidateVerdict::Open,
+                }
+            })
+            .collect()
+    }
+
+    fn logical_binding_anchor(&self, binder: Node<'_>, source: &str) -> Option<(usize, usize)> {
+        let anchor = crate::binding_identity::rust_binding_anchor(binder, source)?;
+        Some((anchor.start_byte, anchor.end_byte))
+    }
+
+    fn logical_binding_anchors(
+        &self,
+        binders: &[Node<'_>],
+        source: &str,
+    ) -> Vec<Option<(usize, usize)>> {
+        let Some(first) = binders.first() else {
+            return Vec::new();
+        };
+        let mut root = *first;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        crate::binding_identity::rust_binding_anchors(root, source, binders)
+            .0
+            .into_iter()
+            .map(|anchor| anchor.map(|anchor| (anchor.start_byte, anchor.end_byte)))
+            .collect()
+    }
+
+    fn binding_syntax(
+        &self,
+        binder: Node<'_>,
+    ) -> Option<brokk_bifrost_core::analyzer::structural::spec::BindingSyntax> {
+        crate::binding_identity::rust_binding_syntax(binder)
     }
 
     fn qualified_path_root<'tree>(&self, token: Node<'tree>) -> Option<Node<'tree>> {
@@ -1660,7 +2218,30 @@ impl StructuralSpec for RustStructuralSpec {
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
         if let Some(role) = rust_occurrence_role(node) {
-            sink.occurrence_role(node, role);
+            // Bare match/let-condition patterns and `&C` need lexical
+            // selection before their occurrence class can be published.
+            let ambiguous_pattern = rust_occurrence_needs_binding_verdict(node, role);
+            if ambiguous_pattern {
+                match sink
+                    .binding_candidate_verdict_at(node.id())
+                    .unwrap_or(brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Open)
+                {
+                    brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding => {
+                        sink.occurrence_role(node, OccurrenceRole::Binder);
+                    }
+                    brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::ValueItem => {
+                        sink.occurrence_role(node, OccurrenceRole::PatternPosition);
+                    }
+                    brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Open => {
+                        // The paired roles are a query-time completeness gap:
+                        // either a binding or a matched value item may exist.
+                        sink.occurrence_role(node, OccurrenceRole::Binder);
+                        sink.occurrence_role(node, OccurrenceRole::PatternPosition);
+                    }
+                }
+            } else {
+                sink.occurrence_role(node, role);
+            }
         }
         match kind {
             NormalizedKind::Decorator => {
@@ -1676,6 +2257,11 @@ impl StructuralSpec for RustStructuralSpec {
                     && let Some(value) = node.child_by_field_name("value")
                 {
                     sink.role(Role::Arg, value);
+                }
+                if node.kind() == "attribute"
+                    && let Some(arguments) = node.child_by_field_name("arguments")
+                {
+                    attach_attribute_arguments(sink, arguments);
                 }
                 if node.kind() == "identifier"
                     && let Some(module) = derive_path_module(node)
@@ -1904,7 +2490,7 @@ fn collection_elements_exclude_attributes_and_target_expression_payloads() {
         "fn f() { let values = [#[Marker] first(), second()]; }",
         "fn f() { let values = (#[Marker] first(), second()); }",
     ] {
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let tree = parse_rust_tree_for_test(source).expect("Rust tree");
         assert!(
             !tree.root_node().has_error(),
             "{}",
@@ -1932,7 +2518,7 @@ fn collection_elements_exclude_attributes_and_target_expression_payloads() {
             NormalizedKind::CollectionLiteral,
             &mut sink,
         );
-        let (_, roles, _, stop) = sink.into_parts();
+        let (_, roles, _, _, stop) = sink.into_parts();
         assert_eq!(stop, None);
         assert_eq!(
             roles.iter().map(|role| role.role).collect::<Vec<_>>(),
@@ -1951,7 +2537,13 @@ fn collection_elements_exclude_attributes_and_target_expression_payloads() {
         assert_eq!(
             roles
                 .iter()
-                .map(|role| role.target_node)
+                .map(|role| match role.target {
+                    brokk_bifrost_core::analyzer::structural::spec::PendingRoleTargetKind::Node(
+                        id,
+                    ) => id,
+                    brokk_bifrost_core::analyzer::structural::spec::PendingRoleTargetKind::Span =>
+                        panic!("call argument has a node target"),
+                })
                 .collect::<Vec<_>>(),
             calls.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
         );
@@ -1960,8 +2552,13 @@ fn collection_elements_exclude_attributes_and_target_expression_payloads() {
 
 #[cfg(test)]
 mod binding_activation_tests {
-    use super::{nearest_ancestor, node_range, rust_binding_activation};
+    use super::{
+        RUST_STRUCTURAL_SPEC, nearest_ancestor, node_range, parse_rust_tree_for_test,
+        rust_binding_activation, rust_occurrence_needs_binding_verdict, rust_occurrence_role,
+    };
     use brokk_bifrost_core::analyzer::Range;
+    use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Node;
 
@@ -1994,9 +2591,12 @@ mod binding_activation_tests {
             "        let _ = value;\n",
             "        break;\n",
             "    }\n",
+            "    if let Some(guarded) = first && guarded > 0 {\n",
+            "        let _ = guarded;\n",
+            "    }\n",
             "}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let tree = parse_rust_tree_for_test(source).expect("Rust tree");
         let root = tree.root_node();
         assert!(!root.has_error(), "{}", root.to_sexp());
         let scope = Range {
@@ -2006,7 +2606,7 @@ mod binding_activation_tests {
             end_line: root.end_position().row + 1,
         };
         let conditions = nodes_of_kind(root, "let_condition");
-        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions.len(), 3);
 
         for condition in conditions {
             let owner = nearest_ancestor(condition, |kind| {
@@ -2029,8 +2629,762 @@ mod binding_activation_tests {
                 .expect("pattern binder");
 
             let activation = rust_binding_activation(binder, scope).expect("binding activation");
-            assert_eq!(activation.activation, node_range(body));
+            assert_eq!(activation.activation.start_byte, condition.end_byte());
+            assert_eq!(activation.activation.end_byte, body.end_byte());
+            if &source[binder.byte_range()] == "guarded" {
+                let guard_use = source.find("guarded > 0").unwrap();
+                assert!(activation.activation.start_byte <= guard_use);
+                assert!(guard_use < activation.activation.end_byte);
+            }
         }
+    }
+
+    #[test]
+    fn trait_signature_parameters_are_not_value_bindings() {
+        let source = "trait T { fn declared(&self, unused: i32); fn defined(&self, live: i32) { let _ = live; } }";
+        let tree = parse_rust_tree_for_test(source).expect("Rust tree");
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let scope = node_range(root);
+        let parameters = nodes_of_kind(root, "parameter");
+        assert_eq!(parameters.len(), 2);
+        let names: Vec<_> = parameters
+            .iter()
+            .map(|parameter| {
+                let pattern = parameter.child_by_field_name("pattern").unwrap();
+                let name = &source[pattern.byte_range()];
+                (name, rust_binding_activation(pattern, scope).is_some())
+            })
+            .collect();
+        assert_eq!(names, [("unused", false), ("live", true)]);
+    }
+
+    #[test]
+    #[hardwon("#10389: bodyless trait signatures exclude only their own formals")]
+    fn trait_signature_const_expression_local_is_not_excluded() {
+        let source =
+            "trait T { fn f(x: [u8; { let n = 1; let _c = |nested: usize| nested; n }]); }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let identifiers = nodes_of_kind(root, "identifier");
+        let binder = |name: &str| {
+            identifiers
+                .iter()
+                .copied()
+                .find(|node| &source[node.byte_range()] == name)
+                .unwrap()
+        };
+        assert!(RUST_STRUCTURAL_SPEC.binding_candidate_excluded(binder("x")));
+        assert!(!RUST_STRUCTURAL_SPEC.binding_candidate_excluded(binder("n")));
+        assert!(!RUST_STRUCTURAL_SPEC.binding_candidate_excluded(binder("nested")));
+    }
+
+    #[test]
+    #[hardwon("#10389: reference parameter patterns retain irrefutable binders")]
+    fn reference_parameter_patterns_are_bindings_unless_a_value_item_wins() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source = "const X: i32 = 0; fn f(&x: &i32, &(a, b): &(i32, i32), &X: &i32) {} fn g() { let _closure = |&y: &i32| y; }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        for (name, expected) in [
+            ("x", BindingCandidateVerdict::Binding),
+            ("a", BindingCandidateVerdict::Binding),
+            ("b", BindingCandidateVerdict::Binding),
+            ("y", BindingCandidateVerdict::Binding),
+            ("X", BindingCandidateVerdict::ValueItem),
+        ] {
+            let binder = nodes_of_kind(root, "identifier")
+                .into_iter()
+                .find(|node| {
+                    &source[node.byte_range()] == name
+                        && nearest_ancestor(*node, |kind| kind == "reference_pattern").is_some()
+                })
+                .expect(name);
+            assert_eq!(
+                RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, binder),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#10389: shorthand field pattern selects a visible constant")]
+    fn shorthand_field_pattern_checks_lexical_value_items() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source =
+            "const X: i32 = 0; struct P { X: i32 } fn f(p: P) { match p { P { X } => {} } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let binder = nodes_of_kind(root, "shorthand_field_identifier")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, binder),
+            BindingCandidateVerdict::ValueItem
+        );
+    }
+
+    #[test]
+    #[hardwon("#10389: bare or alternatives are binder candidates with one anchor")]
+    fn bare_or_alternatives_have_binding_roles_and_one_anchor() {
+        let source = "fn f(v: i32) { match v { x | x => { let _ = x; } } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let alternatives: Vec<_> = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .filter(|node| node.parent().is_some_and(|p| p.kind() == "or_pattern"))
+            .collect();
+        assert_eq!(alternatives.len(), 2);
+        let context = RUST_STRUCTURAL_SPEC.call_site_context(root, source);
+        for alternative in &alternatives {
+            assert_eq!(
+                rust_occurrence_role(*alternative),
+                Some(OccurrenceRole::Binder)
+            );
+            assert_eq!(
+                context.binding_candidate_verdict_at(alternative.id()),
+                Some(brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Binding)
+            );
+        }
+        let anchors = RUST_STRUCTURAL_SPEC.logical_binding_anchors(&alternatives, source);
+        assert_eq!(anchors[0], anchors[1]);
+        assert!(anchors[0].is_some());
+    }
+
+    #[test]
+    #[hardwon("#10389: bare or-pattern constants and globs keep honest verdicts")]
+    fn bare_or_alternatives_respect_value_items_and_open_imports() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        for (prefix, expected) in [
+            ("const MAX: i32 = 1;", BindingCandidateVerdict::ValueItem),
+            ("use dep::*;", BindingCandidateVerdict::Open),
+        ] {
+            let source = format!("{prefix} fn f(v: i32) {{ match v {{ MAX | MAX => () }} }}");
+            let tree = parse_rust_tree_for_test(&source).unwrap();
+            let root = tree.root_node();
+            let alternatives: Vec<_> = nodes_of_kind(root, "identifier")
+                .into_iter()
+                .filter(|node| node.parent().is_some_and(|p| p.kind() == "or_pattern"))
+                .collect();
+            assert_eq!(alternatives.len(), 2);
+            for alternative in alternatives {
+                assert_eq!(
+                    RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, &source, alternative),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#10389: nested refutable identifiers select value items or stay Open")]
+    fn nested_refutable_identifiers_check_lexical_items() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source = "const MAX: i32 = 1; fn f(v: Option<i32>, pair: (i32, i32)) { match v { Some(MAX) => (), Some(x) => () } match pair { (MAX, x) => () } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let context = RUST_STRUCTURAL_SPEC.call_site_context(root, source);
+        let patterns: Vec<_> = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .filter(|node| nearest_ancestor(*node, |kind| kind == "match_pattern").is_some())
+            .collect();
+        let max: Vec<_> = patterns
+            .iter()
+            .copied()
+            .filter(|node| &source[node.byte_range()] == "MAX")
+            .collect();
+        assert_eq!(max.len(), 2);
+        for node in max {
+            assert_eq!(
+                RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, node),
+                BindingCandidateVerdict::ValueItem
+            );
+            assert_eq!(
+                context.binding_candidate_verdict_at(node.id()),
+                Some(BindingCandidateVerdict::ValueItem)
+            );
+        }
+        let x: Vec<_> = patterns
+            .iter()
+            .copied()
+            .filter(|node| &source[node.byte_range()] == "x")
+            .collect();
+        assert_eq!(x.len(), 2);
+        for node in x {
+            assert_eq!(
+                RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, node),
+                BindingCandidateVerdict::Binding
+            );
+            assert_eq!(
+                context.binding_candidate_verdict_at(node.id()),
+                Some(BindingCandidateVerdict::Binding)
+            );
+        }
+    }
+
+    // The Rust unused-variable binding-facts fixture, copied here because this
+    // crate is public and the shared fixture tree is not.
+    const UNUSED_VARIABLE_BINDERS: &str = r#"#![allow(dead_code, unused_variables, unused_assignments)]
+
+fn plain(used_parameter: i32, unused_parameter: i32) {
+    let unused_uninitialized: i32;
+    let initialized = 1;
+    let _ignored: i32;
+    let used = used_parameter;
+    let used = used + 1;
+    let assigned: i32;
+    assigned = 2;
+    let _ = (used, assigned);
+}
+
+fn closure_parameters() {
+    let closure = |used_closure: i32, unused_closure: i32| {
+        let _ = used_closure;
+    };
+    let _ = closure;
+}
+
+fn patterns(input: Option<(i32, i32)>, values: Vec<i32>) {
+    if let Some((if_used, if_unused)) = input {
+        let _ = if_used;
+    }
+    for loop_unused in values {
+        let nested = 1;
+        let _ = nested;
+    }
+    match input {
+        Some((match_used, match_unused)) => {
+            let _ = match_used;
+        }
+        None => {}
+    }
+}
+
+enum Either {
+    A(i32),
+    B(i32),
+}
+
+fn or_pattern(value: Either) {
+    match value {
+        Either::A(or_unused) | Either::B(or_unused) => {}
+    }
+}
+
+fn initializer_shapes(value: Option<(i32, i32)>) {
+    let (destructured_left, destructured_right) = (1, 2);
+    let Some(let_else_name) = value else { return };
+    if let Some((if_left, if_right)) = value {}
+    if let if_whole = 1 {}
+    while let Some(while_name) = value {
+        break;
+    }
+    while let while_whole = 1 {
+        break;
+    }
+}
+
+fn shadowing() {
+    let shadowed: i32;
+    {
+        let shadowed = 1;
+        let _ = shadowed;
+    }
+}
+
+fn captures() {
+    let captured = 1;
+    let closure = || captured;
+    let _ = closure;
+}
+
+fn binding_modes() {
+    let source = 1;
+    let ref by_ref = source;
+    let ref mut by_ref_mut = source;
+    let _x: i32;
+}
+
+struct Receiver;
+
+impl Receiver {
+    fn method(&self, method_unused: i32) {}
+}
+
+fn exclusion_shapes(value: Option<i32>) {
+    match value {
+        Some(UPPERCASE_ARM) => {}
+        None => {}
+    }
+    match value {
+        NESTED_UPPERCASE | NESTED_UPPERCASE => {}
+    }
+    let before_todo: i32;
+    todo!();
+}
+
+macro_rules! use_value {
+    ($name:ident) => {
+        let _ = $name;
+    };
+}
+
+macro_rules! make_binding {
+    () => {
+        let macro_binder: i32;
+    };
+}
+
+fn macro_access() {
+    let macro_value = 1;
+    use_value!(macro_value);
+    make_binding!();
+}
+"#;
+
+    #[test]
+    #[hardwon("#10389: batched Rust binder selection preserves per-node verdicts")]
+    fn batch_binding_verdicts_match_per_node_fixture_answers() {
+        for source in [
+            UNUSED_VARIABLE_BINDERS,
+            "const C: i32 = 1; struct P { C: i32 } fn f(v: P) { match v { P { C } => {} } }",
+            "const C: i32 = 1; fn f(v: i32) { use dep::*; match v { C => {}, x => {} } }",
+            "fn f(&x: &i32, &(a, b): &(i32, i32)) { let _ = (x, a, b); }",
+        ] {
+            let tree = parse_rust_tree_for_test(source).unwrap();
+            let root = tree.root_node();
+            let binders: Vec<_> = nodes_of_kind(root, "identifier")
+                .into_iter()
+                .chain(nodes_of_kind(root, "shorthand_field_identifier"))
+                .filter(|node| rust_occurrence_role(*node) == Some(OccurrenceRole::Binder))
+                .collect();
+            let batch = RUST_STRUCTURAL_SPEC.binding_candidate_verdicts(root, source, &binders);
+            let per_node: Vec<_> = binders
+                .iter()
+                .map(|binder| RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, *binder))
+                .collect();
+            assert_eq!(batch, per_node, "{source}");
+            let extraction_context = RUST_STRUCTURAL_SPEC.call_site_context(root, source);
+            for (&binder, &verdict) in binders.iter().zip(&per_node) {
+                if rust_occurrence_needs_binding_verdict(binder, OccurrenceRole::Binder) {
+                    assert_eq!(
+                        extraction_context.binding_candidate_verdict_at(binder.id()),
+                        Some(verdict),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#10389: strict Rust pattern scope scans grow linearly with functions")]
+    fn strict_pattern_scope_index_scans_file_once_for_many_functions() {
+        let mut source = String::new();
+        for index in 0..128 {
+            use std::fmt::Write as _;
+            writeln!(
+                source,
+                "fn f{index}(v: i32) {{ match v {{ x{index} => () }} }}"
+            )
+            .unwrap();
+        }
+        let tree = parse_rust_tree_for_test(&source).unwrap();
+        let root = tree.root_node();
+        let binders: Vec<_> = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .filter(|node| {
+                node.parent()
+                    .is_some_and(|parent| parent.kind() == "match_pattern")
+            })
+            .collect();
+        assert_eq!(binders.len(), 128);
+        let mut index = crate::lexical_scope::RustStrictPatternIndex::default();
+        for binder in binders {
+            assert_eq!(
+                index.classify(root, &source, binder),
+                crate::lexical_scope::RustPatternName::Binding
+            );
+        }
+        assert_eq!(index.source_file_scans, 1);
+        assert!(index.scope_scans <= 128 * 16, "{}", index.scope_scans);
+    }
+
+    #[test]
+    #[hardwon("#10389: Rust binding prewalk honors cancellation and fact budget")]
+    fn binding_context_preparation_stops_before_unbounded_scan() {
+        use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollectorStop;
+        let source = (0..128)
+            .map(|i| format!("fn f{i}(v: i32) {{ match v {{ x{i} => () }} }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tree = parse_rust_tree_for_test(&source).unwrap();
+        let token = brokk_bifrost_core::CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            RUST_STRUCTURAL_SPEC.call_site_context_limited(
+                tree.root_node(),
+                &source,
+                usize::MAX,
+                Some(&token)
+            ),
+            Err(StructuralFactCollectorStop::Cancelled)
+        ));
+        assert!(
+            RUST_STRUCTURAL_SPEC
+                .call_site_context_limited(tree.root_node(), &source, 10, None)
+                .is_ok()
+        );
+        let huge = (0..16_000)
+            .map(|i| format!("fn f{i}(v: i32) {{ match v {{ x{i} => () }} }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let huge_tree = parse_rust_tree_for_test(&huge).unwrap();
+        let context = RUST_STRUCTURAL_SPEC
+            .call_site_context_limited(huge_tree.root_node(), &huge, 10, None)
+            .unwrap();
+        let unbounded_context = RUST_STRUCTURAL_SPEC
+            .call_site_context_limited(huge_tree.root_node(), &huge, usize::MAX, None)
+            .unwrap();
+        let first = nodes_of_kind(huge_tree.root_node(), "identifier")
+            .into_iter()
+            .find(|node| &huge[node.byte_range()] == "x0")
+            .unwrap();
+        assert_eq!(
+            context.binding_candidate_verdict_at(first.id()),
+            Some(brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict::Open)
+        );
+        assert_eq!(
+            context.binding_candidate_verdict_at(first.id()),
+            unbounded_context.binding_candidate_verdict_at(first.id())
+        );
+    }
+
+    #[test]
+    fn shorthand_field_and_bare_arm_are_binder_candidates() {
+        let source = "struct Point { y: i32 } fn f(point: Point) { match point { Point { y } => (), E::Variant => (), p => () } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let shorthand = nodes_of_kind(root, "shorthand_field_identifier");
+        assert_eq!(shorthand.len(), 1);
+        assert_eq!(
+            rust_occurrence_role(shorthand[0]),
+            Some(OccurrenceRole::Binder)
+        );
+        let bare = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .find(|node| {
+                &source[node.byte_range()] == "p"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "match_pattern")
+            })
+            .unwrap();
+        assert_eq!(rust_occurrence_role(bare), Some(OccurrenceRole::Binder));
+        let variant = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .find(|node| &source[node.byte_range()] == "Variant")
+            .unwrap();
+        assert_eq!(
+            rust_occurrence_role(variant),
+            Some(OccurrenceRole::PatternPosition)
+        );
+    }
+
+    #[test]
+    #[hardwon("#10389: qualified Rust variant patterns retain references inside wrappers")]
+    fn qualified_variant_patterns_are_references_and_bare_names_are_binders() {
+        let source = "enum E { A, B } fn f(v: E, r: &E) { match r { &E::A => {}, &E::B => {}, &x => {} } match v { E::A | E::B => {}, a | b => {} } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        for node in nodes_of_kind(root, "identifier") {
+            let text = &source[node.byte_range()];
+            if matches!(text, "A" | "B") && node.start_byte() > source.find("match r").unwrap() {
+                assert_eq!(
+                    rust_occurrence_role(node),
+                    Some(OccurrenceRole::PatternPosition),
+                    "{text}"
+                );
+            }
+            if matches!(text, "x" | "a" | "b") {
+                assert_eq!(
+                    rust_occurrence_role(node),
+                    Some(OccurrenceRole::Binder),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#10389: local test-module glob preserves built-in test only when proven")]
+    fn local_test_glob_checks_parent_exports() {
+        for (parent, expected) in [
+            ("", "rust_body_preserving_attribute"),
+            ("use tokio::*;", "rust_opaque_attribute"),
+            ("macro_rules! test { () => {} }", "rust_opaque_attribute"),
+        ] {
+            let source = format!(
+                "{parent} mod tests {{ use super::*; #[test] fn t() {{ let unused = 1; }} }}"
+            );
+            let tree = parse_rust_tree_for_test(&source).unwrap();
+            let context = RUST_STRUCTURAL_SPEC.call_site_context(tree.root_node(), &source);
+            let attribute = nodes_of_kind(tree.root_node(), "attribute")
+                .into_iter()
+                .next()
+                .unwrap();
+            assert!(
+                RUST_STRUCTURAL_SPEC.generator_construct_with_context(
+                    attribute,
+                    brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Decorator,
+                    &source,
+                    &context,
+                ) == Some(expected),
+                "{source}"
+            );
+        }
+        for (source, expected) in [
+            (
+                "mod tests { use tokio::test; #[test] fn t() { let x = 1; } }",
+                "rust_opaque_attribute",
+            ),
+            (
+                "#[test] fn t() { let x = 1; }",
+                "rust_body_preserving_attribute",
+            ),
+            (
+                "#[cfg_attr(test, test)] fn t() { let x = 1; }",
+                "rust_body_preserving_attribute",
+            ),
+        ] {
+            let tree = parse_rust_tree_for_test(source).unwrap();
+            let context = RUST_STRUCTURAL_SPEC.call_site_context(tree.root_node(), source);
+            let attribute = nodes_of_kind(tree.root_node(), "attribute")
+                .into_iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                RUST_STRUCTURAL_SPEC.generator_construct_with_context(
+                    attribute,
+                    brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Decorator,
+                    source,
+                    &context,
+                ),
+                Some(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon("#10389: nested test attribute cannot reuse a source-file verdict by byte offset")]
+    fn nested_test_attribute_checks_source_file_scope() {
+        let source = "fn outer() { #[test] fn t() { let x = 1; } } use some_proc_macro::test;";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let context = RUST_STRUCTURAL_SPEC.call_site_context(tree.root_node(), source);
+        let attribute = nodes_of_kind(tree.root_node(), "attribute")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            RUST_STRUCTURAL_SPEC.generator_construct_with_context(
+                attribute,
+                brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Decorator,
+                source,
+                &context,
+            ),
+            Some("rust_opaque_attribute")
+        );
+    }
+
+    #[test]
+    #[hardwon("#10389: let-else constant patterns are values while bare names bind")]
+    fn refutable_let_else_uses_strict_pattern_selection() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source = "const MAX: i32 = 1; fn f(v: Option<i32>) { let Some(MAX) = v else { return }; let _ = MAX; let Some(x) = v else { return }; let _ = x; }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        let context = RUST_STRUCTURAL_SPEC.call_site_context(root, source);
+        for node in nodes_of_kind(root, "identifier") {
+            if node.start_byte() < source.find("let Some(MAX)").unwrap() {
+                continue;
+            }
+            match &source[node.byte_range()] {
+                "MAX" if node.start_byte() == source.find("let Some(MAX)").unwrap() + 9 => {
+                    assert_eq!(
+                        context.binding_candidate_verdict_at(node.id()),
+                        Some(BindingCandidateVerdict::ValueItem)
+                    );
+                }
+                "x" if node.start_byte() == source.find("let Some(x)").unwrap() + 9 => {
+                    assert_eq!(
+                        context.binding_candidate_verdict_at(node.id()),
+                        Some(BindingCandidateVerdict::Binding)
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#10389: test attribute scope prewalk scans a module once")]
+    fn test_attribute_scope_preparation_is_linear_and_bounded() {
+        let source = format!(
+            "mod tests {{ use super::*; {} }}",
+            (0..128)
+                .map(|i| format!("#[test] fn t{i}() {{ let unused = {i}; }}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_for_test(&source).unwrap();
+        let context = RUST_STRUCTURAL_SPEC.call_site_context(tree.root_node(), &source);
+        assert!(
+            context.test_attribute_scope_scans() <= 4,
+            "{}",
+            context.test_attribute_scope_scans()
+        );
+
+        let huge = format!(
+            "{}#[test] fn t() {{ let unused = 1; }}",
+            (0..40_000)
+                .map(|i| format!("const C{i}: i32 = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_for_test(&huge).unwrap();
+        let context = RUST_STRUCTURAL_SPEC
+            .call_site_context_limited(tree.root_node(), &huge, 100_000, None)
+            .unwrap();
+        let attribute = nodes_of_kind(tree.root_node(), "attribute")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            RUST_STRUCTURAL_SPEC.generator_construct_with_context(
+                attribute,
+                brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind::Decorator,
+                &huge,
+                &context
+            ),
+            Some("rust_opaque_attribute")
+        );
+    }
+
+    #[test]
+    fn strict_bare_patterns_keep_value_items_and_named_struct_bindings_distinct() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source = "const C: i32 = 1; struct S { field: i32 } fn f(v: i32) { match v { C => {}, S => {}, &C => {}, _ => {} } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        for (name, expected) in [
+            ("C", BindingCandidateVerdict::ValueItem),
+            ("S", BindingCandidateVerdict::Binding),
+        ] {
+            let pattern = nodes_of_kind(root, "identifier")
+                .into_iter()
+                .find(|node| {
+                    &source[node.byte_range()] == name
+                        && node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "match_pattern")
+                })
+                .unwrap();
+            assert_eq!(
+                RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, pattern),
+                expected,
+                "{name}"
+            );
+            if name == "S" {
+                let mut charge = |_: usize| Ok::<(), ()>(());
+                assert_eq!(
+                    crate::lexical_scope::rust_pattern_name_bounded(
+                        root,
+                        source,
+                        pattern,
+                        &mut charge,
+                    ),
+                    Ok(crate::lexical_scope::RustPatternName::Binding)
+                );
+            }
+        }
+        let reference_constant = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .find(|node| {
+                &source[node.byte_range()] == "C"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "reference_pattern")
+            })
+            .unwrap();
+        assert_eq!(
+            RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, reference_constant),
+            BindingCandidateVerdict::ValueItem
+        );
+        let mut charge = |_: usize| Ok::<(), ()>(());
+        assert_eq!(
+            crate::lexical_scope::rust_pattern_name_bounded(
+                root,
+                source,
+                reference_constant,
+                &mut charge,
+            ),
+            Ok(crate::lexical_scope::RustPatternName::ValueItem)
+        );
+    }
+
+    #[test]
+    fn inner_glob_keeps_outer_constant_pattern_open() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source = "const C: i32 = 1; fn f(v: i32) { use dep::*; match v { C => {}, _ => {} } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let pattern = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .find(|node| {
+                &source[node.byte_range()] == "C"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "match_pattern")
+            })
+            .unwrap();
+        assert_eq!(
+            RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, pattern),
+            BindingCandidateVerdict::Open
+        );
+    }
+
+    #[test]
+    fn named_field_struct_does_not_hide_outer_value_item() {
+        use brokk_bifrost_core::analyzer::structural::spec::BindingCandidateVerdict;
+        let source = "const S: i32 = 1; fn f(v: i32) { struct S { field: i32 } match v { S => {}, _ => {} } }";
+        let tree = parse_rust_tree_for_test(source).unwrap();
+        let root = tree.root_node();
+        assert!(!root.has_error(), "{}", root.to_sexp());
+        let pattern = nodes_of_kind(root, "identifier")
+            .into_iter()
+            .find(|node| {
+                &source[node.byte_range()] == "S"
+                    && node
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "match_pattern")
+            })
+            .unwrap();
+        assert_eq!(
+            RUST_STRUCTURAL_SPEC.binding_candidate_verdict(root, source, pattern),
+            BindingCandidateVerdict::ValueItem
+        );
     }
 }
 
@@ -2060,6 +3414,77 @@ mod parameter_tests {
             occurrence_text(source, &source_facts.occurrences, name),
             "password"
         );
+    }
+
+    #[test]
+    fn constant_pattern_keeps_reference_occurrence_when_binding_is_excluded() {
+        let source = "const C: i32 = 1; fn f(v: i32) { match v { C => {}, &C => {}, x if x > 0 => {}, _ => {} } }";
+        let parsed = parse_rust_fixture(source);
+        let source_facts = parsed.source_facts.as_ref().unwrap();
+        let facts = &source_facts.structural;
+        for marker in ["C =>", "&C =>"] {
+            let start = source.find(marker).unwrap() + usize::from(marker.starts_with('&'));
+            let node = facts
+                .nodes()
+                .iter()
+                .position(|node| {
+                    let range = source_facts.occurrences.occurrence(node.occurrence).range;
+                    range.start_byte == start && range.end_byte == start + 1
+                })
+                .unwrap() as u32;
+            let roles = facts.occurrence_roles(node);
+            assert!(
+                !roles.contains(&OccurrenceRole::Binder),
+                "{marker}: {roles:?}"
+            );
+            assert!(
+                roles.contains(&OccurrenceRole::PatternPosition),
+                "{marker}: {roles:?}"
+            );
+        }
+        let guard = source.find("if x >").unwrap() + 3;
+        let node = facts
+            .nodes()
+            .iter()
+            .position(|node| {
+                let range = source_facts.occurrences.occurrence(node.occurrence).range;
+                range.start_byte == guard && range.end_byte == guard + 1
+            })
+            .unwrap() as u32;
+        assert!(
+            facts
+                .occurrence_roles(node)
+                .contains(&OccurrenceRole::ValueReference)
+        );
+    }
+
+    #[test]
+    fn let_condition_constant_and_imported_match_pattern_keep_reference_possibility() {
+        let source = "const C: i32 = 1; use dep::D; fn f(v: i32) { if let C = v {} match v { D => {}, _ => {} } }";
+        let parsed = parse_rust_fixture(source);
+        let source_facts = parsed.source_facts.as_ref().unwrap();
+        let facts = &source_facts.structural;
+        for (marker, expect_binder) in [("C = v", false), ("D =>", true)] {
+            let start = source.find(marker).unwrap();
+            let node = facts
+                .nodes()
+                .iter()
+                .position(|node| {
+                    let range = source_facts.occurrences.occurrence(node.occurrence).range;
+                    range.start_byte == start && range.end_byte == start + 1
+                })
+                .unwrap() as u32;
+            let roles = facts.occurrence_roles(node);
+            assert_eq!(
+                roles.contains(&OccurrenceRole::Binder),
+                expect_binder,
+                "{marker}: {roles:?}"
+            );
+            assert!(
+                roles.contains(&OccurrenceRole::PatternPosition),
+                "{marker}: {roles:?}"
+            );
+        }
     }
 }
 
@@ -2174,7 +3599,7 @@ mod type_argument_role_tests {
             "    Wrapper::<des::Des>::new();\n",
             "}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let tree = parse_rust_tree_for_test(source).expect("Rust tree");
         assert!(
             !tree.root_node().has_error(),
             "{}",
@@ -2198,7 +3623,7 @@ mod type_argument_role_tests {
             let parents = ParentIndex::new(tree.root_node());
             let mut sink = RoleSink::new(source, &mut facts, 32, None, &parents);
             RUST_STRUCTURAL_SPEC.extract(call, NormalizedKind::Call, &mut sink);
-            let (_, roles, _, stop) = sink.into_parts();
+            let (_, roles, _, _, stop) = sink.into_parts();
             assert_eq!(stop, None);
             let texts = roles
                 .iter()
@@ -2459,7 +3884,7 @@ mod result_use_tests {
             let mut facts = PrimarySourceFactCollector::new(source);
             let mut sink = RoleSink::new(source, &mut facts, 16, None, &parents);
             RUST_STRUCTURAL_SPEC.extract(call, NormalizedKind::Call, &mut sink);
-            let (_, roles, _, stop) = sink.into_parts();
+            let (_, roles, _, _, stop) = sink.into_parts();
             assert_eq!(stop, None);
             let receivers = roles
                 .iter()
@@ -2481,7 +3906,7 @@ fn callee_provenance_walk_obeys_the_extraction_work_allowance() {
         "fn run<F: Fn()>(f: F) { f(); }",
         "fn run<F: FnMut()>(mut f: F) { let mut g = f; g(); }",
     ] {
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("Rust grammar");
+        let tree = parse_rust_tree_for_test(source).expect("Rust grammar");
         let mut stack = vec![tree.root_node()];
         let call = loop {
             let node = stack.pop().expect("fixture call");
@@ -2517,11 +3942,12 @@ fn callee_provenance_walk_obeys_the_extraction_work_allowance() {
 
 #[cfg(test)]
 mod attribute_role_grammar_tests {
+    use super::parse_rust_tree_for_test;
     #[test]
     fn grammar_derive_and_ordinary_attribute_arguments() {
         for (attribute, expected) in [("derive", true), ("allow", false), ("custom", false)] {
             let source = format!("#[{attribute}(Marker)] struct Item;");
-            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            let tree = parse_rust_tree_for_test(&source).unwrap();
             assert!(!tree.root_node().has_error());
             let mut pending = vec![tree.root_node()];
             let marker = loop {
@@ -2609,7 +4035,7 @@ mod ownership_role_grammar_boundary {
                 NormalizedKind::Import
             };
             RUST_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
-            let (_, roles, _, stop) = sink.into_parts();
+            let (_, roles, _, _, stop) = sink.into_parts();
             assert_eq!(stop, None);
             let mut selected = roles
                 .into_iter()
@@ -2644,4 +4070,13 @@ mod ownership_role_grammar_boundary {
             ]
         );
     }
+}
+
+#[cfg(test)]
+fn parse_rust_tree_for_test(source: &str) -> Option<tree_sitter::Tree> {
+    // Standalone fixtures have no analyzer owner; retain nothing across calls.
+    let caches = crate::lexical_scope::RustLexicalCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    crate::lexical_scope::parse_rust_tree_with(&caches, source)
 }

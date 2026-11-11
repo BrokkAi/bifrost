@@ -11,12 +11,17 @@ pub const RUST_CFG_DECORATED_MACROS_SOURCE: &str =
     include_str!("../fixtures/rust_cfg_decorated_macros.rs");
 
 /// Build fixed non-source inputs for read-ledger verification tests.
+///
+/// The fixture workspaces these tests use activate no semantic model set, so a
+/// model-set read records the absence digest (#9755) and the head must name
+/// that same digest. A test that activates models overrides `models` with the
+/// active model-set digest.
 #[cfg(any(test, feature = "test-support"))]
 pub fn read_ledger_test_inputs() -> crate::analyzer::HeadInputs {
     use crate::analyzer::semantic::ids::StableDigest;
 
     crate::analyzer::HeadInputs {
-        models: StableDigest::sha256("models"),
+        models: crate::analyzer::i_analyzer::current_model_set_digest(None),
         policy_semantic_hash: StableDigest::sha256("policy-semantic"),
         policy_source: StableDigest::sha256("policy-source"),
         configuration: StableDigest::sha256("configuration"),
@@ -121,6 +126,10 @@ pub fn ruby_gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
     }
     gem
 }
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod hit_parity;
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "../../../test-support/git.rs"]
@@ -509,6 +518,7 @@ pub fn artifact_production_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: provenance_source.to_owned(),
             revision: None,
         },

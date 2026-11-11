@@ -405,6 +405,7 @@ mod native_demand_installer_tests {
         static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
     }
     struct FakeInstaller;
+
     impl StoreLanguageSupport for FakeInstaller {
         fn demand_installer(&self) -> Option<NativeDemandInstaller> {
             Some(NativeDemandInstaller(&FakeInstaller))
@@ -439,6 +440,7 @@ mod native_demand_installer_tests {
                 request.lexical,
                 request.paths,
                 request.typed,
+                &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
                 request.cancellation,
                 request.session,
                 |operation| run(operation, &mut FakeInstaller),
@@ -514,9 +516,8 @@ mod native_demand_installer_tests {
                         context_metrics: &mut SelectedResolutionContextMetrics,
                         session: &session,
                         artifacts: None,
-                        go_demand: None,
+                        language_demand: NativeLanguageDemand::None,
                         selected_import_gap: None,
-                        go_receiver_overlay: None,
                         query_result_slot: None,
                         point_metrics: None,
                     },
@@ -605,9 +606,8 @@ mod native_demand_installer_tests {
                     context_metrics: &mut SelectedResolutionContextMetrics,
                     session: &session,
                     artifacts: None,
-                    go_demand: None,
+                    language_demand: NativeLanguageDemand::None,
                     selected_import_gap: None,
-                    go_receiver_overlay: None,
                     query_result_slot: None,
                     point_metrics: None,
                 },
@@ -661,9 +661,8 @@ mod native_demand_installer_tests {
                         context_metrics: &mut SelectedResolutionContextMetrics,
                         session: &session,
                         artifacts: None,
-                        go_demand: None,
+                        language_demand: NativeLanguageDemand::None,
                         selected_import_gap: None,
-                        go_receiver_overlay: None,
                         query_result_slot: None,
                         point_metrics: None,
                     },

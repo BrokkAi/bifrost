@@ -3,14 +3,18 @@
 use super::super::Result;
 use super::super::resolution::with_resolution_read_progress_handler;
 use super::super::resolution_prepare::resolution_rows::gap_origin_code;
+use super::super::resolution_prepare::resolution_rows::gap_origin_from_code;
 use super::super::resolution_selection::SelectedResolutionMountInventory;
 use super::{codec, lexical};
 use crate::CancellationToken;
+use crate::analyzer::Language;
 use crate::analyzer::resolution::{
     BindingFragmentId, LoweringGapOrigin, PolledCompletionAccumulator, ResolutionCompletion,
-    ResolutionIncompleteReason, SelectedTypeFrontierCompletion, SemanticId, TypedFactPageVisitor,
-    TypedFactReadOutcome, TypedFactRequest,
+    ResolutionIncompleteReason, SelectedJavaGapOccurrence, SelectedJavaTypeFrontierContribution,
+    SelectedTypeFrontierCompletion, SemanticId, TypedFactPageVisitor, TypedFactReadOutcome,
+    TypedFactRequest,
 };
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
 use rusqlite::named_params;
 use serde_json::json;
 use std::sync::OnceLock;
@@ -68,15 +72,15 @@ WITH main_requests AS (
  SELECT value->>0 AS host, value->>1 AS slot, value->>2 AS base FROM json_each(:main_requests)
 ), stage_requests AS (
  SELECT value->>0 AS key, value->>1 AS shared FROM json_each(:stage_requests)
-), raw_gaps(host,subject_key,subject_shared,reason_key,origin) AS (
- SELECT m.mount_ordinal,k.base+g.subject,NULL,k.base+g.reason,r.origin
+), raw_gaps(host,subject_key,subject_shared,reason_key,origin,source_site,gap_key,producer_id) AS (
+ SELECT m.mount_ordinal,k.base+g.subject,NULL,k.base+g.reason,r.origin,r.site,g.gap,0
  FROM main_requests k
  JOIN temp.selected_resolution_mounts m ON m.mount_ordinal=k.host
  JOIN temp.selected_resolution_scope_mounts scope ON scope.mount_ordinal=m.mount_ordinal
  JOIN main.resolution_gaps g ON g.blob_id=m.blob_id AND g.covers=7 AND g.subject=k.slot
  JOIN main.resolution_gap_reasons r ON r.blob_id=g.blob_id AND r.reason=g.reason
  UNION ALL
- SELECT g.host_ordinal,g.subject_key,g.subject_shared,g.reason_key,g.origin
+ SELECT g.host_ordinal,g.subject_key,g.subject_shared,g.reason_key,g.origin,g.source_site,g.gap_key,g.producer_id
  FROM stage_requests k
  CROSS JOIN temp.selected_resolution_stage_gaps g
    ON g.subject_key IS k.key AND g.subject_shared IS k.shared AND g.covers=7
@@ -98,9 +102,22 @@ WITH main_requests AS (
  SELECT host,subject_key,subject_shared FROM effective
 )
 SELECT d.host,d.subject_key,d.subject_shared,
- json_group_array(DISTINCT e.reason_key) FILTER(WHERE e.reason_key IS NOT NULL)
+ json_group_array(DISTINCT e.reason_key) FILTER(WHERE e.reason_key IS NOT NULL),
+ json_group_array(json_array(e.gap_key,e.reason_key,e.source_site,e.origin,e.producer_id,
+   EXISTS(SELECT 1 FROM temp.selected_resolution_stage_reference_contexts c
+     WHERE e.producer_id!=0 AND c.producer_id=e.producer_id AND c.host_ordinal=e.host
+       AND c.source_site=e.source_site
+       AND c.semantic_key=(:local_base+(e.host<<32)+e.source_site)
+       AND c.semantic_shared IS NULL)))
+   FILTER(WHERE e.reason_key IS NOT NULL AND
+     (m.semantic_language=:java_language OR EXISTS (
+       SELECT 1 FROM temp.selected_resolution_stage_producers p
+       JOIN temp.selected_resolution_admissions a ON a.admission_id=p.admission_id
+       WHERE e.producer_id!=0 AND p.producer_id=e.producer_id
+         AND a.semantic_language=:java_language)))
 FROM declared d LEFT JOIN effective e
  ON e.host=d.host AND e.subject_key IS d.subject_key AND e.subject_shared IS d.subject_shared
+LEFT JOIN temp.selected_resolution_mounts m ON m.mount_ordinal=d.host
 GROUP BY d.host,d.subject_key,d.subject_shared
 ORDER BY d.host,d.subject_key,d.subject_shared
 "#,
@@ -143,6 +160,7 @@ pub(in crate::analyzer::store) fn visit_frontier_completion(
                 ":stage_requests": requested,
                 ":qualified_origin": gap_origin_code(LoweringGapOrigin::QualifiedReference),
                 ":local_base": codec::encode_semantic(SemanticId::local(0, 0)),
+                ":java_language": Language::Java.config_label(),
             })?;
             let mut answer = Vec::new();
             while let Some(row) = rows.next()? {
@@ -153,15 +171,54 @@ pub(in crate::analyzer::store) fn visit_frontier_completion(
                 let frontier = decode_pair(row.get(1)?, row.get(2)?);
                 let reasons: Vec<i64> =
                     serde_json::from_str(&row.get::<_, String>(3)?).expect("frontier reasons JSON");
+                let raw: Vec<[i64; 6]> = serde_json::from_str(&row.get::<_, String>(4)?)
+                    .expect("frontier contributions JSON");
                 let completion = super::completion_from_reasons(reasons.into_iter().map(|key| {
                     ResolutionIncompleteReason::UnsupportedSemantic(codec::decode_semantic(key))
                 }));
                 evidence.include(&completion);
-                answer.push(SelectedTypeFrontierCompletion::new(
-                    BindingFragmentId::at_ordinal(host),
-                    frontier,
-                    completion,
-                ));
+                let mut contributions = Vec::new();
+                for [
+                    gap_key,
+                    reason_key,
+                    site,
+                    origin,
+                    producer,
+                    producer_has_reference,
+                ] in raw
+                {
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let gap = u32::try_from(gap_key).expect("gap key fits u32");
+                    let occurrence = if producer == 0 {
+                        SelectedJavaGapOccurrence::StoredMain { mount: host, gap }
+                    } else {
+                        SelectedJavaGapOccurrence::Staged { producer, gap }
+                    };
+                    contributions.push(
+                        SelectedJavaTypeFrontierContribution::from_stored(
+                            occurrence,
+                            BindingFragmentId::at_ordinal(host),
+                            frontier,
+                            codec::decode_semantic(reason_key),
+                            ResolutionSiteId::new(
+                                u32::try_from(site).expect("source site fits u32"),
+                            ),
+                            gap_origin_from_code(origin),
+                        )
+                        .with_staged_producer_reference(producer_has_reference != 0),
+                    );
+                }
+                contributions.sort_unstable_by_key(|contribution| contribution.occurrence());
+                answer.push(
+                    SelectedTypeFrontierCompletion::new(
+                        BindingFragmentId::at_ordinal(host),
+                        frontier,
+                        completion,
+                    )
+                    .with_java_contributions(contributions.into_boxed_slice()),
+                );
             }
             Ok(Some(answer))
         });

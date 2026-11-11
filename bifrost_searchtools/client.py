@@ -300,7 +300,9 @@ class SearchToolsClient:
         projection (every usage site the usage index enumerates for a
         declaration) and ``edges_from`` is the forward one (the resolver's own
         resolved targets for one exact token); both accept ``reference_kinds``,
-        ``proof``, ``surface``, ``usage``, ``relation``, and ``site_class``.
+        ``enclosing``, ``proof``, ``surface``, ``usage``, ``relation``, and
+        ``site_class``. The ``enclosing`` pattern filters by the declaration
+        containing each reference site.
         ``surface`` is optional with no default, because the complete edge
         answer includes editor-only rows. A forward query in a language whose
         adapter has no forward projection reports ``edge_axis_unsupported``

@@ -26,7 +26,7 @@ mod second { fn repeated() {} }
             .file("src/lib.rs", RUST_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let facts = state
             .source_facts
             .as_ref()
@@ -90,7 +90,7 @@ mod second { fn repeated() {} }
         let error = store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect_err("missing native bridge must fail publication");
@@ -117,7 +117,7 @@ mod second { fn repeated() {} }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("publish Rust native declaration bridges");
@@ -202,7 +202,7 @@ mod second { fn repeated() {} }
             .file("src/lib.rs", "")
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let facts = state
             .source_facts
             .as_ref()
@@ -218,7 +218,7 @@ mod second { fn repeated() {} }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("publish empty Rust native declaration family");

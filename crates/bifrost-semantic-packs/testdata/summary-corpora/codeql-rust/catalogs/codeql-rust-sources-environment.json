@@ -1,0 +1,60 @@
+{
+  "categories": [
+    "environment"
+  ],
+  "external_models": [],
+  "name": "codeql-rust-sources-environment",
+  "sanitizers": [],
+  "schema_version": 1,
+  "sinks": [],
+  "sources": [
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "environment"
+      ],
+      "display_name": "std.env.temp_dir",
+      "evidence": null,
+      "id": "codeql-1adc553ca9d84f196e1455d2183289dfb7e9592201131187691fea6d95d645ba",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "temp_dir"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.63b6bfb6d02cbde0c36528625c3bfdae299a9b7809d7fd878edc81fa83173049"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "environment"
+    }
+  ],
+  "transforms": [],
+  "version": 1
+}

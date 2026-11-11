@@ -26,8 +26,26 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
 use uuid::Uuid;
+mod pinned_reader;
+const GENERATED_SOURCE_IDENTITY_LOOKUP: &str = "SELECT gp.production_digest, gp.input_digest
+                 FROM catalog_generated_source_identities AS ident
+                 JOIN catalog_generated_productions AS gp
+                   ON gp.production_digest = ident.production_digest
+                 WHERE ident.source_identity = ?1
+                   AND ident.producer_name = ?2
+                   AND ident.producer_version = ?3
+                   AND ident.schema_version = ?4
+                   AND ident.generated_cache_version = ?5
+                   AND gp.producer_name = ident.producer_name
+                   AND gp.producer_version = ident.producer_version
+                   AND gp.schema_version = ident.schema_version";
+pub use pinned_reader::{
+    ExpectedCatalogEntry, PinnedCatalogReader, PinnedCatalogRow, PinnedCatalogStatus,
+    PinnedReaderError,
+};
 // Both GC phases must protect every installed pack file.
 const OBJECT_LINKED: &str = "EXISTS(SELECT 1 FROM catalog_pack_shards AS shards
     WHERE shards.stored_digest = objects.stored_digest
@@ -164,6 +182,34 @@ pub struct CatalogLease<'a> {
     released: bool,
 }
 
+/// An owned lease identity. The catalog that issued it releases it after
+/// activation publishes; expiry protects abandoned tokens after a crash.
+pub struct CatalogLeaseToken {
+    lease_id: String,
+    manifest_digest: String,
+}
+
+/// Neutral release metadata already checked against the release index by the caller.
+pub struct ExpectedReleaseInstall<'a> {
+    pub manifest: &'a CompiledPackManifest,
+    pub manifest_bytes: &'a [u8],
+    pub manifest_object_digest: &'a str,
+    pub shard_digests: &'a [String],
+}
+
+pub enum ReuseDecision<'a> {
+    Reusable {
+        lease: CatalogLease<'a>,
+    },
+    Repaired {
+        lease: CatalogLease<'a>,
+        decoded: usize,
+        reconciled: usize,
+    },
+    Install,
+    StaleOrUnavailable,
+}
+
 pub struct SemanticPackCatalog {
     // Field order is deliberate: all SQLite/session state must drop before an
     // owned ephemeral root is deleted, including on Windows.
@@ -176,7 +222,7 @@ pub struct SemanticPackCatalog {
     #[doc(hidden)]
     pub connection: Arc<Mutex<Connection>>,
     session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
-    session_packs: Mutex<Vec<SessionPack>>,
+    session_packs: Arc<Mutex<Vec<SessionPack>>>,
     session_activations: Mutex<HashMap<String, SessionActivation>>,
     rejected_manifests: Mutex<HashSet<String>>,
     decoded_manifests: Mutex<DecodedManifestMemo>,
@@ -199,12 +245,32 @@ pub struct SemanticPackCatalog {
     _ephemeral_root: Option<Arc<TempDir>>,
 }
 
+/// Owned source for request-scoped pinned JVM catalog reads. The catalog remains
+/// writable for pack installation; later reads see the shared session inventory.
+#[derive(Clone)]
+pub struct PinnedCatalogSource {
+    pool: Option<Arc<pinned_reader::PinnedReaderPool>>,
+    root: PathBuf,
+    session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
+    session_packs: Arc<Mutex<Vec<SessionPack>>>,
+    instance_identity: u64,
+    // Drop SQLite/session state before deleting the owned ephemeral root.
+    _ephemeral_root: Option<Arc<TempDir>>,
+}
+
 pub(crate) struct SessionActivation {
     active_set: SemanticPackActiveSet,
     owner: Weak<()>,
 }
 
 impl CatalogLease<'_> {
+    pub fn into_token(mut self, manifest_digest: String) -> CatalogLeaseToken {
+        self.released = true;
+        CatalogLeaseToken {
+            lease_id: std::mem::take(&mut self.lease_id),
+            manifest_digest,
+        }
+    }
     pub fn renew(&mut self, ttl: Duration) -> Result<(), CatalogError> {
         let expires_at = lease_expiry(ttl)?;
         let connection = self
@@ -257,6 +323,19 @@ impl Drop for CatalogLease<'_> {
                 self.lease_id
             );
         }
+    }
+}
+
+impl PinnedCatalogSource {
+    fn active_reader_connection(&self) -> Result<Connection, CatalogError> {
+        debug_assert!(
+            self.instance_identity > 0,
+            "catalog instance identity is initialized"
+        );
+        crate::analyzer::store::model_catalog::open_active_reader_connection(
+            &self.root,
+            &self.session_catalog,
+        )
     }
 }
 
@@ -323,7 +402,7 @@ impl SemanticPackCatalog {
             instance_identity,
             connection: Arc::new(Mutex::new(connection)),
             session_catalog: Arc::new(Mutex::new(None)),
-            session_packs: Mutex::new(Vec::new()),
+            session_packs: Arc::new(Mutex::new(Vec::new())),
             session_activations: Mutex::new(HashMap::new()),
             rejected_manifests: Mutex::new(HashSet::new()),
             decoded_manifests: Mutex::new(DecodedManifestMemo {
@@ -445,30 +524,30 @@ impl SemanticPackCatalog {
         &self.root
     }
 
-    fn active_reader_connection(&self) -> Result<Connection, CatalogError> {
-        let mut session = self
-            .outside_capture()
-            .session_catalog
-            .lock()
-            .expect("session semantic catalog mutex poisoned");
-        if session.is_none() {
-            *session = Some(open_session_semantic_catalog()?);
+    pub fn pinned_catalog_source(
+        &self,
+        budget: &crate::analyzer::store::cache_budget::StoreCacheBudget,
+    ) -> PinnedCatalogSource {
+        let mut source = self.unpooled_catalog_source();
+        source.pool = Some(Arc::new(pinned_reader::PinnedReaderPool::new(budget)));
+        source
+    }
+
+    fn unpooled_catalog_source(&self) -> PinnedCatalogSource {
+        PinnedCatalogSource {
+            pool: None,
+            root: self.root.clone(),
+            session_catalog: Arc::clone(&self.session_catalog),
+            session_packs: Arc::clone(&self.session_packs),
+            instance_identity: self.instance_identity,
+            _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
         }
-        let connection = brokk_bifrost_semantic::analyzer::semantic_model::catalog::db::open(
-            &self.root,
-            CatalogOpenMode::ReadOnly,
-        )?;
-        brokk_bifrost_core::cache_db::sql_profile::install_catalog_active(&connection);
-        // db::open also sets query_only, which forbids TEMP writes. The main
-        // file remains protected by SQLITE_OPEN_READ_ONLY; membership is TEMP.
-        connection
-            .pragma_update(None, "query_only", false)
-            .map_err(|error| CatalogError::sqlite("enable active TEMP membership", error))?;
-        rows::attach_session_rows(
-            &connection,
-            session.as_ref().expect("session catalog initialized"),
-        )?;
-        Ok(connection)
+    }
+
+    fn active_reader_connection(&self) -> Result<Connection, CatalogError> {
+        self.outside_capture()
+            .unpooled_catalog_source()
+            .active_reader_connection()
     }
 
     /// A connection and TEMP membership table owned by exactly one active set.
@@ -518,6 +597,7 @@ impl SemanticPackCatalog {
         }
         Ok((
             CatalogRuntimeSourceReader {
+                root: self.root.clone(),
                 connection: Arc::new(Mutex::new(connection)),
                 session_catalog: Arc::clone(&self.outside_capture().session_catalog),
                 _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
@@ -654,6 +734,7 @@ impl SemanticPackCatalog {
                 kind: DurablePackSourceKind::Generated,
                 source_id: production.key.source_id(),
             },
+            extraction.as_ref(),
             |transaction, manifest, now| {
                 insert_generated_production(transaction, &production.key, manifest, now)?;
                 if let Some(extraction) = &extraction {
@@ -1142,7 +1223,7 @@ impl SemanticPackCatalog {
         pack: &CompiledSemanticModelPack,
         source: &DurablePackSource,
     ) -> Result<InstallOutcome, CatalogError> {
-        self.install_with(pack, source, |_, _, _| Ok(()))
+        self.install_with(pack, source, None, |_, _, _| Ok(()))
     }
 
     pub fn install_release(
@@ -1152,9 +1233,238 @@ impl SemanticPackCatalog {
         extraction: &PackExtractionAccounting,
     ) -> Result<InstallOutcome, CatalogError> {
         validate_extraction_accounting(extraction)?;
-        self.install_with(pack, source, |transaction, manifest, _| {
-            insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)
-        })
+        self.install_with(
+            pack,
+            source,
+            Some(extraction),
+            |transaction, manifest, _| {
+                insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)
+            },
+        )
+    }
+
+    /// Check the exact release install from stored objects.
+    /// The caller has already verified index/manifest agreement and the
+    /// consumed release assets. No distribution shard is read on success.
+    pub fn exact_release_install_reusable<'a>(
+        &'a self,
+        expected: &ExpectedReleaseInstall<'_>,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<ReuseDecision<'a>, CatalogError> {
+        let _scope = crate::profiling::scope("semantic_pack.release_bundle.exact_reuse");
+        let manifest = expected.manifest;
+        if expected.shard_digests.len() != manifest.shards.len()
+            || crate::analyzer::semantic_model::csmi::sha256_hex(expected.manifest_bytes)
+                != expected.manifest_object_digest
+        {
+            return Ok(ReuseDecision::Install);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        let stored_manifest =
+            read_available_manifest_on(&self.root, &connection, &manifest.content_sha256)?;
+        if stored_manifest.as_deref() != Some(expected.manifest_bytes) {
+            return Ok(ReuseDecision::Install);
+        }
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        let mut statement = connection
+            .prepare(
+                "SELECT shard.shard_id, shard.descriptor_json, shard.stored_digest,
+                    object.relative_path, object.stored_size
+             FROM catalog_pack_shards AS shard
+             JOIN catalog_objects AS object ON object.stored_digest = shard.stored_digest
+             WHERE shard.manifest_digest = ?1 ORDER BY shard.ordinal",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare stored release shards", error))?;
+        let stored = statement
+            .query_map([&manifest.content_sha256], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })
+            .map_err(|error| CatalogError::sqlite("query stored release shards", error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| CatalogError::sqlite("read stored release shards", error))?;
+        if stored.len() != manifest.shards.len() {
+            return Ok(ReuseDecision::Install);
+        }
+        let mut certificates = Vec::with_capacity(stored.len());
+        let mut markers = Vec::with_capacity(stored.len());
+        for (descriptor, ((shard_id, descriptor_json, digest, _, _), expected_digest)) in manifest
+            .shards
+            .iter()
+            .zip(stored.iter().zip(expected.shard_digests))
+        {
+            if shard_id != &descriptor.shard_id
+                || digest != expected_digest
+                || digest != &descriptor.stored_sha256
+                || descriptor_json
+                    != &serde_json::to_vec(descriptor)
+                        .map_err(|error| CatalogError::Integrity(error.to_string()))?
+            {
+                return Ok(ReuseDecision::Install);
+            }
+            self.sql_statements.fetch_add(1, Ordering::Relaxed);
+            let recorded: Option<(i64, i64)> = connection
+                .query_row(
+                    CERTIFIED_SHARD_SQL,
+                    params![manifest.content_sha256, shard_id, SHARD_VALIDATION_VERSION],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| CatalogError::sqlite("release certificate", error))?;
+            certificates.push(recorded.is_some_and(|(text, depth)| {
+                usize::try_from(text)
+                    .is_ok_and(|value| value <= self.options.decode_limits.max_text_bytes)
+                    && usize::try_from(depth)
+                        .is_ok_and(|value| value <= self.options.decode_limits.max_depth)
+            }));
+            self.sql_statements.fetch_add(1, Ordering::Relaxed);
+            let indexed: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM catalog_semantic_rows_indexed_shards
+                 WHERE manifest_digest=?1 AND shard_id=?2 AND index_version=4)",
+                    params![manifest.content_sha256, shard_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| CatalogError::sqlite("release publication marker", error))?;
+            markers.push(indexed);
+        }
+        drop(statement);
+        drop(connection);
+        let mut shards = Vec::with_capacity(stored.len());
+        let mut hydrated_count = 0u64;
+        let mut hydrated_bytes = 0u64;
+        let mut hydrated_ns = 0u128;
+        let mut decoded_count = 0u64;
+        let mut decoded_ns = 0u128;
+        for (index, ((_, _, digest, relative_path, size), descriptor)) in
+            stored.iter().zip(&manifest.shards).enumerate()
+        {
+            let _scope =
+                crate::profiling::scope("semantic_pack.release_bundle.stored_hydrate_or_decode");
+            self.object_reads.fetch_add(1, Ordering::Relaxed);
+            let bytes = match storage::read(&self.root, relative_path, digest, *size) {
+                Ok(bytes) => bytes,
+                Err(CatalogError::Integrity(_)) => return Ok(ReuseDecision::Install),
+                Err(CatalogError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Ok(ReuseDecision::Install);
+                }
+                Err(error) => return Err(error),
+            };
+            let started = Instant::now();
+            let (decoded, census) = if certificates[index] && markers[index] {
+                let decoded = crate::analyzer::semantic_model::artifact::hydrate_certified_shard(
+                    manifest,
+                    descriptor,
+                    &bytes,
+                    &self.options.decode_limits,
+                )
+                .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+                hydrated_count += 1;
+                hydrated_bytes += bytes.len() as u64;
+                hydrated_ns += started.elapsed().as_nanos();
+                (decoded, Default::default())
+            } else {
+                let result = self.decode_stored_shard_with_census(manifest, descriptor, &bytes)?;
+                decoded_count += 1;
+                decoded_ns += started.elapsed().as_nanos();
+                result
+            };
+            if !certificates[index] {
+                let connection = self
+                    .connection
+                    .lock()
+                    .expect("semantic-pack catalog connection mutex poisoned");
+                record_shard_validation(
+                    &connection,
+                    &manifest.content_sha256,
+                    &descriptor.shard_id,
+                    census,
+                )?;
+            }
+            shards.push(ValidatedShard {
+                diagnostics: Vec::new(),
+                descriptor: descriptor.clone(),
+                bytes,
+                selectors: decoded.activation().to_vec(),
+                decoded,
+                census,
+            });
+        }
+        let validated = ValidatedPack {
+            manifest: manifest.clone(),
+            shards,
+        };
+        if manifest.language == "python" {
+            let _scope =
+                crate::profiling::scope("semantic_pack.release_bundle.python_profile_validation");
+            let authored =
+                crate::analyzer::semantic_model::artifact::authored_pack_from_decoded_shards(
+                    manifest,
+                    validated.shards.iter().map(|shard| &shard.decoded),
+                );
+            let diagnostics =
+                crate::analyzer::semantic_model::validate::validate_csmi_profile_evidence(
+                    &authored,
+                );
+            if !diagnostics.is_empty() {
+                return Err(CatalogError::Integrity(format!(
+                    "Python compiled pack has inconsistent full-pack evidence: {diagnostics:?}"
+                )));
+            }
+        }
+        if !self.unchanged_release_install(
+            &validated,
+            expected.manifest_bytes,
+            source,
+            extraction,
+        )? {
+            return Ok(ReuseDecision::Install);
+        }
+        if markers.iter().any(|indexed| !indexed) {
+            let _scope = crate::profiling::scope("semantic_pack.release_bundle.reconcile");
+            self.reconcile_installed_semantic_rows(&validated)?;
+        }
+        if std::env::var_os("BIFROST_TIMING").is_some() {
+            eprintln!(
+                "6397-m0 catalog pack={} stored_hashed_bytes={} hydrated_count={} hydrated_bytes={} hydrated_ns={} decoded_count={} decoded_ns={} reconciled_shards={}",
+                manifest.pack_id,
+                2 * (stored.iter().map(|row| row.4).sum::<u64>()
+                    + expected.manifest_bytes.len() as u64),
+                hydrated_count,
+                hydrated_bytes,
+                hydrated_ns,
+                decoded_count,
+                decoded_ns,
+                markers.iter().filter(|indexed| !**indexed).count(),
+            );
+        }
+        let reconciled = markers.iter().filter(|indexed| !**indexed).count();
+        match self.lease(
+            &manifest.content_sha256,
+            "release-bootstrap",
+            Duration::from_secs(300),
+        ) {
+            Ok(lease) if decoded_count > 0 || reconciled > 0 => Ok(ReuseDecision::Repaired {
+                lease,
+                decoded: decoded_count as usize,
+                reconciled,
+            }),
+            Ok(lease) => Ok(ReuseDecision::Reusable { lease }),
+            Err(CatalogError::Unavailable) => Ok(ReuseDecision::StaleOrUnavailable),
+            Err(error) => Err(error),
+        }
     }
 
     /// Install a release pack and return an opaque proof of the exact source
@@ -1220,6 +1530,7 @@ impl SemanticPackCatalog {
             key,
             pack,
             source,
+            Some(extraction),
             || validate_extraction_accounting(extraction),
             |transaction, manifest, now| {
                 insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)?;
@@ -1340,6 +1651,13 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        Self::extraction_accounting_on(&connection, manifest_digest)
+    }
+
+    fn extraction_accounting_on(
+        connection: &Connection,
+        manifest_digest: &str,
+    ) -> Result<Option<PackExtractionAccounting>, CatalogError> {
         let counts = connection
             .query_row(
                 "SELECT reject_count, suppressed_reject_count, error_reject_count
@@ -1421,6 +1739,7 @@ impl SemanticPackCatalog {
             key,
             pack,
             &source,
+            None,
             || Ok(()),
             |transaction, manifest, now| {
                 insert_generated_production(transaction, key, manifest, now)
@@ -1443,6 +1762,7 @@ impl SemanticPackCatalog {
             key,
             pack,
             &source,
+            None,
             || validate_exact_go_source(artifact, packages),
             |transaction, manifest, now| {
                 insert_generated_production(transaction, key, manifest, now)?;
@@ -1461,6 +1781,7 @@ impl SemanticPackCatalog {
         key: &GeneratedProductionKey,
         pack: &CompiledSemanticModelPack,
         source: &DurablePackSource,
+        expected_extraction: Option<&PackExtractionAccounting>,
         validate_install: impl FnOnce() -> Result<(), CatalogError>,
         record_install: impl FnOnce(
             &Transaction<'_>,
@@ -1470,7 +1791,7 @@ impl SemanticPackCatalog {
     ) -> Result<GeneratedInstallOutcome, CatalogError> {
         validate_generated_pack_identity(key, &pack.manifest)?;
         validate_install()?;
-        let install = self.install_with(pack, source, record_install)?;
+        let install = self.install_with(pack, source, expected_extraction, record_install)?;
         let production = GeneratedProduction {
             key: key.clone(),
             manifest_digest: install.manifest_digest.clone(),
@@ -1610,18 +1931,7 @@ impl SemanticPackCatalog {
             .expect("semantic-pack catalog connection mutex poisoned");
         let row = connection
             .query_row(
-                "SELECT gp.production_digest, gp.input_digest
-                 FROM catalog_generated_source_identities AS ident
-                 JOIN catalog_generated_productions AS gp
-                   ON gp.production_digest = ident.production_digest
-                 WHERE ident.source_identity = ?1
-                   AND ident.producer_name = ?2
-                   AND ident.producer_version = ?3
-                   AND ident.schema_version = ?4
-                   AND ident.generated_cache_version = ?5
-                   AND gp.producer_name = ident.producer_name
-                   AND gp.producer_version = ident.producer_version
-                   AND gp.schema_version = ident.schema_version",
+                GENERATED_SOURCE_IDENTITY_LOOKUP,
                 params![
                     source_identity,
                     &producer.name,
@@ -1797,6 +2107,7 @@ impl SemanticPackCatalog {
         &self,
         pack: &CompiledSemanticModelPack,
         source: &DurablePackSource,
+        expected_extraction: Option<&PackExtractionAccounting>,
         record_install: impl FnOnce(
             &Transaction<'_>,
             &CompiledPackManifest,
@@ -1840,6 +2151,7 @@ impl SemanticPackCatalog {
         let install_result = self.commit_install(
             pack,
             source,
+            expected_extraction,
             &validated,
             &published,
             &manifest_path,
@@ -1880,6 +2192,16 @@ impl SemanticPackCatalog {
             .connection
             .lock()
             .expect("semantic-pack catalog connection mutex poisoned");
+        self.exact_verified_install_present_on(&connection, validated, manifest_bytes, source)
+    }
+
+    fn exact_verified_install_present_on(
+        &self,
+        connection: &Connection,
+        validated: &ValidatedPack,
+        manifest_bytes: &[u8],
+        source: &DurablePackSource,
+    ) -> Result<bool, CatalogError> {
         let provenance_json = serde_json::to_vec(&validated.manifest.provenance)
             .map_err(|error| CatalogError::Integrity(error.to_string()))?;
         let pack = connection
@@ -1956,7 +2278,7 @@ impl SemanticPackCatalog {
             return Ok(false);
         }
 
-        if read_available_manifest_on(&self.root, &connection, &validated.manifest.content_sha256)?
+        if read_available_manifest_on(&self.root, connection, &validated.manifest.content_sha256)?
             .is_none()
         {
             return Ok(false);
@@ -2241,6 +2563,57 @@ impl SemanticPackCatalog {
         )
     }
 
+    fn unchanged_release_install_on(
+        &self,
+        connection: &Connection,
+        validated: &ValidatedPack,
+        manifest_bytes: &[u8],
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<bool, CatalogError> {
+        if !self.exact_verified_install_present_on(connection, validated, manifest_bytes, source)?
+            || Self::extraction_accounting_on(connection, &validated.manifest.content_sha256)?
+                .as_ref()
+                != Some(extraction)
+        {
+            return Ok(false);
+        }
+        for shard in &validated.shards {
+            let marker: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM catalog_semantic_rows_indexed_shards
+                 WHERE manifest_digest=?1 AND shard_id=?2 AND index_version=4)",
+                    params![validated.manifest.content_sha256, shard.descriptor.shard_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| CatalogError::sqlite("check exact shard marker", error))?;
+            if !marker {
+                return Ok(false);
+            }
+            let certificate: Option<(i64, i64)> = connection
+                .query_row(
+                    CERTIFIED_SHARD_SQL,
+                    params![
+                        validated.manifest.content_sha256,
+                        shard.descriptor.shard_id,
+                        SHARD_VALIDATION_VERSION
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| CatalogError::sqlite("check exact shard certificate", error))?;
+            if !certificate.is_some_and(|(text, depth)| {
+                usize::try_from(text)
+                    .is_ok_and(|value| value <= self.options.decode_limits.max_text_bytes)
+                    && usize::try_from(depth)
+                        .is_ok_and(|value| value <= self.options.decode_limits.max_depth)
+            }) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn reconcile_installed_semantic_rows(
         &self,
         validated: &ValidatedPack,
@@ -2273,6 +2646,7 @@ impl SemanticPackCatalog {
         &self,
         pack: &CompiledSemanticModelPack,
         source: &DurablePackSource,
+        expected_extraction: Option<&PackExtractionAccounting>,
         validated: &ValidatedPack,
         published: &[PathBuf],
         manifest_path: &Path,
@@ -2292,6 +2666,61 @@ impl SemanticPackCatalog {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| CatalogError::sqlite("begin pack install", error))?;
+        if let Some(extraction) = expected_extraction
+            && self.unchanged_release_install_on(
+                &transaction,
+                validated,
+                &pack.manifest_bytes,
+                source,
+                extraction,
+            )?
+        {
+            transaction
+                .execute(
+                    "DELETE FROM catalog_install_object_reservations WHERE installation_id=?1",
+                    [installation_id],
+                )
+                .map_err(|error| {
+                    CatalogError::sqlite("release losing install reservations", error)
+                })?;
+            transaction
+                .commit()
+                .map_err(|error| CatalogError::sqlite("commit losing install", error))?;
+            return Ok(false);
+        }
+        if self.exact_verified_install_present_on(
+            &transaction,
+            validated,
+            &pack.manifest_bytes,
+            source,
+        )? {
+            for shard in &validated.shards {
+                let indexed: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM catalog_semantic_rows_indexed_shards
+                     WHERE manifest_digest=?1 AND shard_id=?2 AND index_version=4)",
+                        params![validated.manifest.content_sha256, shard.descriptor.shard_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| CatalogError::sqlite("check installed shard marker", error))?;
+                if !indexed {
+                    rows::publish_semantic_rows(&transaction, &validated.manifest, &shard.decoded)?;
+                }
+            }
+            record_install(&transaction, &validated.manifest, now)?;
+            transaction
+                .execute(
+                    "DELETE FROM catalog_install_object_reservations WHERE installation_id=?1",
+                    [installation_id],
+                )
+                .map_err(|error| {
+                    CatalogError::sqlite("release reconciled install reservations", error)
+                })?;
+            transaction
+                .commit()
+                .map_err(|error| CatalogError::sqlite("commit reconciled install", error))?;
+            return Ok(false);
+        }
         for (shard, path) in validated.shards.iter().zip(published) {
             storage::verify_existing(
                 &self.root,
@@ -2321,6 +2750,86 @@ impl SemanticPackCatalog {
             .zip(&validated.manifest.shards)
             .enumerate()
         {
+            // #6397: INSERT OR REPLACE cascades through the shard and deletes
+            // its selector, routing and semantic publication rows.
+            type ExistingShardRow = (i64, Vec<u8>, String, String, String, String, u64);
+            let existing: Option<ExistingShardRow> = transaction
+                .query_row(
+                    "SELECT ordinal, descriptor_json, stored_digest, payload_kind,
+                            content_digest, semantic_digest, record_count FROM catalog_pack_shards
+                 WHERE manifest_digest=?1 AND shard_id=?2",
+                    params![validated.manifest.content_sha256, descriptor.shard_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| CatalogError::sqlite("check existing shard", error))?;
+            if let Some((
+                stored_ordinal,
+                stored_descriptor,
+                stored_digest,
+                payload_kind,
+                content_digest,
+                semantic_digest,
+                record_count,
+            )) = existing
+            {
+                let expected_descriptor = serde_json::to_vec(descriptor)
+                    .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+                if stored_ordinal != ordinal as i64
+                    || stored_descriptor != expected_descriptor
+                    || stored_digest != descriptor.stored_sha256
+                    || payload_kind != payload_kind_name(descriptor.payload_kind)
+                    || content_digest != descriptor.content_sha256
+                    || semantic_digest != descriptor.semantic_sha256
+                    || record_count != descriptor.record_count
+                {
+                    return Err(CatalogError::Integrity(format!(
+                        "installed shard {} differs from release manifest",
+                        descriptor.shard_id,
+                    )));
+                }
+                // Preserve the parent shard row: replacing it would cascade
+                // through selector, routing and semantic publication rows.
+                insert_object(
+                    &transaction,
+                    &descriptor.stored_sha256,
+                    descriptor.stored_size,
+                    descriptor.raw_size,
+                    descriptor.encoding,
+                    path,
+                    now,
+                )?;
+                record_shard_validation(
+                    &transaction,
+                    &validated.manifest.content_sha256,
+                    &descriptor.shard_id,
+                    shard.census,
+                )?;
+                rows::publish_semantic_rows(&transaction, &validated.manifest, &shard.decoded)?;
+                insert_selectors(
+                    &transaction,
+                    &validated.manifest.content_sha256,
+                    &descriptor.shard_id,
+                    &shard.selectors,
+                )?;
+                insert_routing_keys(
+                    &transaction,
+                    &validated.manifest.content_sha256,
+                    &descriptor.shard_id,
+                    &descriptor.routing_keys,
+                )?;
+                continue;
+            }
             insert_object(
                 &transaction,
                 &descriptor.stored_sha256,
@@ -2619,6 +3128,32 @@ impl SemanticPackCatalog {
             lease_id,
             released: false,
         })
+    }
+
+    pub fn release_leases(&self, tokens: &[CatalogLeaseToken]) -> Result<(), CatalogError> {
+        // A read-only handle issues no leases (`lease` requires a writable
+        // catalog), so releasing nothing must not open a write transaction.
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| CatalogError::sqlite("begin lease release", error))?;
+        for token in tokens {
+            transaction
+                .execute(
+                    "DELETE FROM catalog_leases WHERE lease_id=?1 AND manifest_digest=?2",
+                    params![token.lease_id, token.manifest_digest],
+                )
+                .map_err(|error| CatalogError::sqlite("release semantic-pack lease", error))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| CatalogError::sqlite("commit lease release", error))
     }
 
     pub fn pin(&self, manifest_digest: &str, pin_id: &str) -> Result<(), CatalogError> {
@@ -6823,5 +7358,16 @@ mod connection_read_tests {
                 "a connection handle retains no query answer"
             );
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "catalog acquisition must precede captured semantic reads")]
+    fn non_jvm_catalog_acquisition_still_refuses_capture() {
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let analyzer = MultiAnalyzer::default();
+        capture_query_reads(&analyzer, || {
+            catalog.runtime_source_reader(std::iter::empty()).unwrap();
+        });
     }
 }

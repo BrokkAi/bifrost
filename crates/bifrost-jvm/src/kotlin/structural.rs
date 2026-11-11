@@ -414,7 +414,10 @@ fn attach_argument(sink: &mut RoleSink<'_>, argument: Node<'_>) {
 /// positional read so this adapter and the usage graphs agree about which
 /// arguments are named.
 fn named_argument_parts<'tree>(argument: Node<'tree>) -> Option<(Node<'tree>, Node<'tree>)> {
-    let children = named_children(argument);
+    let children: Vec<_> = named_children(argument)
+        .into_iter()
+        .filter(|child| !child.is_extra())
+        .collect();
     let keyword = children.first().copied()?;
     if !kotlin_named_argument_label(argument, keyword) {
         return None;
@@ -440,7 +443,10 @@ fn attach_call_arguments(sink: &mut RoleSink<'_>, call: Node<'_>) {
             match named_argument_parts(argument) {
                 Some((keyword, value)) => sink.kwarg(keyword, value),
                 None => {
-                    if let Some(value) = first_named_child(argument) {
+                    if let Some(value) = named_children(argument)
+                        .into_iter()
+                        .find(|child| !child.is_extra())
+                    {
                         attach_argument(sink, value);
                     }
                 }
@@ -591,6 +597,11 @@ impl StructuralSpec for KotlinStructuralSpec {
 
     fn supports_boolean_literal_value(&self) -> bool {
         true
+    }
+
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::Method, NormalizedKind::Throw]
     }
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
@@ -771,6 +782,10 @@ impl StructuralSpec for KotlinStructuralSpec {
             NormalizedKind::Decorator => {
                 if let Some(name) = expression_name_node(node) {
                     sink.set_name(name);
+                }
+                if let Some(invocation) = first_named_child_of_kind(node, "constructor_invocation")
+                {
+                    attach_call_arguments(sink, invocation);
                 }
             }
             NormalizedKind::Identifier => sink.set_name(node),

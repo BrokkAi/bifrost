@@ -4,6 +4,7 @@ use brokk_bifrost_analysis::analyzer::workspace_authority::{
     AuthorityInputs, CaptureScopedMemo, WorkspaceAuthorityMemo, memo_attribution,
 };
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 
 use brokk_bifrost_cpp::declarations::cpp_sentinel_recovered_classes;
 
@@ -28,10 +29,6 @@ use brokk_bifrost_analysis::analyzer::usages::inverted_edges::build_edge_output;
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::parse_and_collect_with_domain;
 
 use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHitSurface;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphFailureReason;
 
@@ -69,12 +66,11 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_cpp::declarations::CppSentinelRecoveredClass;
 use brokk_bifrost_cpp::graph::extractor::{
-    ScanState, prepare_file, prewarm_project_using_index, scan_prepared_file,
+    prepare_file, prewarm_project_using_index, scan_prepared_file,
 };
 use brokk_bifrost_cpp::graph::resolver::{
     RecoveredCReferenceRanges, TargetSpec, TypeScanKey, VisibilityIndex,
 };
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -409,22 +405,17 @@ impl CppQueryResolver<'_> {
             .chain(site_equivalents.iter())
             .cloned()
             .collect();
-        let files = self.scan_files(overloads, scan_scope);
+        // The scan stops at the `max_usages` cap, so the files it reached
+        // decide the sample and total. Walk them in path order, not hash order,
+        // so the same inputs give the same answer.
+        let mut files: Vec<ProjectFile> =
+            self.scan_files(overloads, scan_scope).into_iter().collect();
+        files.sort_unstable();
 
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
+        let mut usages = UsageAccumulator::bounded(max_usages);
 
         'files: for file in files {
-            if scan_scope.is_cancelled() || *state.limit_exceeded {
+            if scan_scope.is_cancelled() || usages.limit_reached() {
                 break;
             }
             let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
@@ -572,7 +563,7 @@ impl CppQueryResolver<'_> {
                     class_ranges.as_deref(),
                     spec,
                     &target_group,
-                    &mut state,
+                    &mut usages,
                 );
                 if report_stats {
                     eprintln!(
@@ -580,37 +571,19 @@ impl CppQueryResolver<'_> {
                         file.rel_path().display(),
                         prepared_file.prepared.source().len(),
                         spec.target.fq_name(),
-                        *state.raw_match_count,
-                        state.hits.len(),
-                        state.unproven_hits.len(),
+                        usages.raw_match_count(),
+                        usages.hits().len(),
+                        usages.unproven_hits().len(),
                         started.elapsed().as_millis(),
                     );
                 }
-                if *state.limit_exceeded {
+                if usages.limit_reached() {
                     break 'files;
                 }
             }
         }
 
-        let external_hit_count = hits
-            .iter()
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-            .count();
-        if limit_exceeded || external_hit_count > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_hit_count,
-                limit: max_usages,
-                sample_hits: hits,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
-            target.clone(),
-            hits,
-            unproven_hits,
-            scan_scope.max_unproven(),
-        ))
+        GraphUsageOutcome::Resolved(usages.finish(target, scan_scope.max_unproven()))
     }
 
     fn scan_files(

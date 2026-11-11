@@ -9,8 +9,9 @@
 
 use super::inline_project::BuiltInlineTestProject;
 use super::*;
+use crate::PlanPartitioning;
 use crate::structural::search::units::{
-    CodeQueryExecutionScope, execute_code_query_unit, merge_unit_rows, seed_file_order,
+    CodeQueryExecutionScope, MergedLimit, execute_code_query_unit, merge_unit_rows, seed_file_order,
 };
 use proptest::prelude::*;
 
@@ -119,7 +120,7 @@ fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
             CodeQuery::from_json(&value).expect("property query should parse"),
         )
     };
-    vec![
+    let mut plans = vec![
         query(
             "structural seed",
             json!({
@@ -189,6 +190,60 @@ fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
             }),
         ),
         query(
+            "union minuend except",
+            json!({
+                "schema_version": 1,
+                "except": [
+                    { "union": [
+                        {
+                            "match": { "kind": "function", "name": { "regex": "^fn[0-9]$" } },
+                            "steps": [{ "op": "filter", "where": [{ "field": "name", "op": "is_not_null" }] }]
+                        },
+                        { "match": { "kind": "function" } }
+                    ] },
+                    { "match": { "kind": "function", "name": { "regex": "^fn0$" } } }
+                ],
+                "limit": 500,
+                "result_detail": "full"
+            }),
+        ),
+        query(
+            "empty union minuend except",
+            json!({
+                "schema_version": 1,
+                "except": [
+                    { "union": [
+                        { "match": { "kind": "function", "name": { "regex": "^absent$" } } },
+                        { "match": { "kind": "function", "name": { "regex": "^fn0$" } } }
+                    ] },
+                    { "match": { "kind": "function" } }
+                ],
+                "limit": 500,
+                "result_detail": "full"
+            }),
+        ),
+        query(
+            "mixed root union",
+            json!({
+                "schema_version": 1,
+                "union": [
+                    { "except": [
+                        { "match": { "kind": "function" } },
+                        { "match": { "kind": "function", "name": { "regex": "^fn0$" } } }
+                    ] },
+                    { "except": [
+                        { "union": [
+                            { "match": { "kind": "function", "name": { "regex": "^fn[0-9]$" } } },
+                            { "match": { "kind": "function" } }
+                        ] },
+                        { "match": { "kind": "function", "name": { "regex": "^absent$" } } }
+                    ] }
+                ],
+                "limit": 500,
+                "result_detail": "full"
+            }),
+        ),
+        query(
             "occurrence seed",
             json!({
                 "schema_version": 1,
@@ -197,7 +252,26 @@ fn partitioned_plans() -> Vec<(&'static str, CodeQuery)> {
                 "result_detail": "full"
             }),
         ),
-    ]
+    ];
+    for (label, source) in [
+        (
+            "depth one",
+            "(callees :depth 1 (enclosing-decl (function)))",
+        ),
+        (
+            "depth two",
+            "(callees :depth 2 (enclosing-decl (function)))",
+        ),
+        (
+            "erased depth answer",
+            "(filter :where ((fq_name regex \"^never/\")) (callees :depth 1 (enclosing-decl (function))))",
+        ),
+    ] {
+        let mut parsed = CodeQuery::from_sexp(source).unwrap();
+        parsed.limit = 500;
+        plans.push((label, parsed));
+    }
+    plans
 }
 
 /// The rendered rows, with the one coordinate a merge cannot reproduce removed
@@ -220,6 +294,46 @@ fn comparable_rendering(items: &[UnitRowItem]) -> String {
     // exactly the opportunistic coordinate this normalization removes.
     strip_nested_node_ranges(&mut value);
     serde_json::to_string(&value).expect("normalized rows serialize")
+}
+
+fn canonical_rows(
+    items: &[UnitRowItem],
+    evidence: &[DetailedCodeQueryEvidence],
+) -> Vec<(String, DetailedCodeQueryEvidence)> {
+    canonical_rows_with(items, evidence, |item| {
+        comparable_rendering(std::slice::from_ref(item))
+    })
+}
+
+/// New set-minuend controls compare every rendered field, including nested
+/// coordinates. Only result indices are neutralized because cross-file order
+/// is explicitly outside the result contract.
+fn exact_rows(
+    items: &[UnitRowItem],
+    evidence: &[DetailedCodeQueryEvidence],
+) -> Vec<(String, DetailedCodeQueryEvidence)> {
+    canonical_rows_with(items, evidence, |item| {
+        serde_json::to_string(item).expect("rendered item serializes")
+    })
+}
+
+fn canonical_rows_with(
+    items: &[UnitRowItem],
+    evidence: &[DetailedCodeQueryEvidence],
+    render: impl Fn(&UnitRowItem) -> String,
+) -> Vec<(String, DetailedCodeQueryEvidence)> {
+    let mut rows = items
+        .iter()
+        .zip(evidence)
+        .map(|(item, proof)| {
+            let mut proof = proof.clone();
+            proof.result_index = 0; // The cross-file result order is not a contract.
+            (render(item), proof)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), evidence.len(), "every row has evidence");
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
 }
 
 /// Remove every `node_range` from one rendered value, iteratively: a rendered
@@ -282,10 +396,85 @@ fn assert_no_cap_was_reached(
     Ok(())
 }
 
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "69e0507ebf4b: legacy Unknown caller inventory must remain unknown across moved seeds"
+)]
+fn legacy_caller_inventory_keeps_merged_membership_unknown() {
+    let generated = GeneratedProject {
+        functions_per_file: vec![1, 2, 1, 2, 2, 1, 2, 2, 1, 1],
+        call_targets: vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(8),
+            None,
+            Some(1),
+            Some(4),
+            Some(9),
+            Some(4),
+            Some(0),
+            None,
+        ],
+    };
+    for move_seeds in [false, true] {
+        let mut layout = generated.clone();
+        if move_seeds {
+            layout.functions_per_file.reverse();
+        }
+        let project = layout.build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_sexp("(callers :depth 1 (enclosing-decl (function)))").unwrap();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let whole = execute_code_query_detailed_eager_index(
+            workspace.analyzer(),
+            &flow,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+        );
+        assert_eq!(
+            whole.result.depth_bound_status,
+            Some(DepthBoundStatus::Unknown)
+        );
+        let mut files = workspace.analyzer().analyzed_files();
+        files.sort_by(seed_file_order);
+        let products = files
+            .iter()
+            .map(|file| {
+                execute_code_query_unit(
+                    workspace.analyzer(),
+                    &flow,
+                    None,
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                )
+            })
+            .collect::<Vec<_>>();
+        for reverse in [false, true] {
+            let mut ordered = products.clone();
+            if reverse {
+                ordered.reverse();
+            }
+            assert_eq!(
+                merge_unit_rows(&query, ordered).depth_bound_status,
+                whole.result.depth_bound_status,
+                "moved={move_seeds}, reversed={reverse}"
+            );
+        }
+    }
+}
+
 proptest! {
     // Two cases: each builds a workspace analyzer over up to ten files and
-    // runs one whole execution plus one execution per seed file for seven
-    // plans, which is about forty executions per case. The nightly
+    // runs whole and seed-scoped executions for the partitionable plan family.
+    // Seed allocation varies with functions_per_file; merges also vary unit order. The nightly
     // property-stress job cranks PROPTEST_CASES.
     #![proptest_config(ProptestConfig::with_cases(2))]
 
@@ -327,29 +516,90 @@ proptest! {
                     )
                 })
                 .collect::<Vec<_>>();
+            for reversed in [false, true] {
+                let mut ordered = units.clone();
+                if reversed { ordered.reverse(); }
+                let status = merge_unit_rows(&query, ordered).depth_bound_status;
+                prop_assert_eq!(status, whole.result.depth_bound_status, "{}: depth status reversed={}", label, reversed);
+            }
+            if units.len() > 1 {
+                let mut rotated = units.clone();
+                rotated.rotate_left(1);
+                prop_assert_eq!(merge_unit_rows(&query, rotated).depth_bound_status,
+                    whole.result.depth_bound_status, "{}: rotated depth status", label);
+            }
             let merged = merge_unit_rows(&query, units);
+            if matches!(label, "union minuend except" | "mixed root union") {
+                let divisor = PlanPartitioning::fair_share_divisor(&query.plan)
+                    .expect("the accepted set has a fair-share divisor");
+                prop_assert_eq!(
+                    divisor,
+                    if label == "mixed root union" { 8 } else { 4 },
+                    "{}: maximal nested fair share",
+                    label
+                );
+                let spent = merged.work.scanned_files
+                    + merged.budgeted_work.import_files_resolved;
+                let threshold = usize::try_from(spent).unwrap() * divisor;
+                let mut at_boundary = limits;
+                at_boundary.max_scanned_files = threshold;
+                prop_assert_eq!(
+                    merged.reached_limit(&at_boundary, query.limit),
+                    Some(MergedLimit::ScannedFiles),
+                    "{}: equality at the fair-share cap widens",
+                    label
+                );
+                let mut below_boundary = limits;
+                below_boundary.max_scanned_files = threshold + divisor;
+                prop_assert_eq!(
+                    merged.reached_limit(&below_boundary, query.limit),
+                    None,
+                    "{}: one more scanned-file share leaves headroom",
+                    label
+                );
+                if !merged.items.is_empty() {
+                    prop_assert_eq!(
+                        merged.reached_limit(&limits, merged.items.len()),
+                        Some(MergedLimit::ResultLimit),
+                        "{}: the root cap applies after the merge",
+                        label
+                    );
+                }
+            }
 
-            let merged_bytes = comparable_rendering(&merged.items);
-            let whole_bytes = comparable_rendering(
-                &whole
-                    .result
-                    .results
-                    .iter()
-                    .map(UnitRowItem::project)
-                    .collect::<Vec<_>>(),
-            );
+            let merged_evidence = merged.detailed_evidence(project.root());
+            let whole_items = whole.result.results.iter().map(UnitRowItem::project).collect::<Vec<_>>();
+            let compare = if matches!(
+                label,
+                "union minuend except" | "empty union minuend except" | "mixed root union"
+            ) {
+                exact_rows
+            } else {
+                canonical_rows
+            };
+            let merged_bytes = compare(&merged.items, &merged_evidence);
+            let whole_bytes = compare(&whole_items, &whole.evidence);
             prop_assert_eq!(
                 &merged_bytes,
                 &whole_bytes,
-                "{}: merged rows must serialize byte for byte as the whole execution's",
+                "{}: each keyed row and its evidence must match the whole execution",
                 label
             );
-            prop_assert_eq!(
-                merged.detailed_evidence(project.root()),
-                whole.evidence,
-                "{}: evidence must match row for row",
-                label
-            );
+            if label == "mixed root union" {
+                prop_assert_eq!(merged.truncated, whole.result.truncated, "{}: truncation", label);
+                prop_assert_eq!(
+                    merged.items.iter().map(|item| serde_json::to_value(item).unwrap()).collect::<Vec<_>>(),
+                    whole_items.iter().map(|item| serde_json::to_value(item).unwrap()).collect::<Vec<_>>(),
+                    "{}: ordered full native payloads",
+                    label
+                );
+                let mut actual_evidence = merged_evidence.clone();
+                let mut expected_evidence = whole.evidence.clone();
+                for evidence in &mut actual_evidence { evidence.result_index = 0; }
+                for evidence in &mut expected_evidence { evidence.result_index = 0; }
+                prop_assert_eq!(actual_evidence, expected_evidence, "{}: ordered evidence", label);
+                prop_assert_eq!(&merged.diagnostics, &whole.result.diagnostics, "{}: diagnostics", label);
+            }
             prop_assert_eq!(
                 merged.completion(),
                 whole.result.completion(),
@@ -440,6 +690,403 @@ proptest! {
                     index
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn set_minuend_except_preserves_distinct_native_fields_per_key() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("a.py", "print('a')\n")
+        .file("b.py", "print('b')\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let limits = CodeQueryExecutionLimits::default();
+    let named = "(project :columns ((name x)) (language python (call)))";
+    let literal = "(project :columns ((string_value x)) (language python (call)))";
+    let subtract = "(project :columns ((name x)) (language python (call :name \"absent\")))";
+    for (first, second, expected) in [(named, literal, Some("print")), (literal, named, None)] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(result-detail full (except (union {first} {second}) {subtract}))"
+        ))
+        .expect("the projected set has a compatible schema");
+        assert_eq!(
+            PlanPartitioning::classify(&query.plan),
+            PlanPartitioning::BySeedExcept
+        );
+        let whole = execute_code_query_detailed_eager_index(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &query,
+            limits,
+            None,
+        );
+        let files = crate::structural::search::units::plan_seed_files(
+            &query.plan,
+            &workspace.analyzer().analyzed_files(),
+        );
+        let units = files
+            .iter()
+            .map(|file| {
+                execute_code_query_unit(
+                    workspace.analyzer(),
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    None,
+                    &query,
+                    limits,
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                )
+            })
+            .collect::<Vec<_>>();
+        let merged = merge_unit_rows(&query, units);
+        assert_eq!(merged.completion(), whole.result.completion());
+        let whole_items = whole
+            .result
+            .results
+            .iter()
+            .map(UnitRowItem::project)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact_rows(&merged.items, &merged.detailed_evidence(project.root())),
+            exact_rows(&whole_items, &whole.evidence),
+            "whole and per-file items, fields, provenance, and evidence"
+        );
+        assert_eq!(merged.items.len(), 2);
+        for item in &merged.items {
+            let actual = item.field("x").expect("the projected alias exists");
+            match expected {
+                Some(expected) => assert!(
+                    matches!(actual, Some(CodeQueryRowScalarRef::String(value)) if value == expected)
+                ),
+                None => assert!(actual.is_none(), "{actual:#?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn root_union_of_excepts_keeps_first_native_payload_and_both_paths() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("a.py", "print('a')\n")
+        .file("b.py", "print('b')\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(result-detail full (union
+            (except
+              (project :columns ((name x)) (language python (call)))
+              (project :columns ((name x)) (language python (call :name \"absent\"))))
+            (except
+              (project :columns ((string_value x)) (language python (call)))
+              (project :columns ((string_value x)) (language python (call :name \"absent\"))))))",
+    )
+    .expect("mixed root set parses");
+    assert_eq!(
+        PlanPartitioning::classify(&query.plan),
+        PlanPartitioning::BySeedSetUnion
+    );
+    let limits = CodeQueryExecutionLimits::default();
+    let whole = execute_code_query_detailed_eager_index(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        limits,
+        None,
+    );
+    let files = crate::structural::search::units::plan_seed_files(
+        &query.plan,
+        &workspace.analyzer().analyzed_files(),
+    );
+    let units = files.iter().map(|file| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            None,
+            &query,
+            limits,
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+        )
+    });
+    let merged = merge_unit_rows(&query, units);
+    assert_eq!(merged.completion(), whole.result.completion());
+    assert_eq!(merged.diagnostics, whole.result.diagnostics);
+    let whole_items = whole
+        .result
+        .results
+        .iter()
+        .map(UnitRowItem::project)
+        .collect::<Vec<_>>();
+    assert_eq!(merged.items, whole_items, "ordered native rows and traces");
+    let mut merged_evidence = merged.detailed_evidence(project.root());
+    let mut whole_evidence = whole.evidence;
+    for evidence in &mut merged_evidence {
+        evidence.result_index = 0;
+    }
+    for evidence in &mut whole_evidence {
+        evidence.result_index = 0;
+    }
+    assert_eq!(merged_evidence, whole_evidence, "ordered evidence");
+    for row in &merged.items {
+        assert!(
+            row.provenance
+                .iter()
+                .any(|trace| trace.branch.first() == Some(&0))
+        );
+        assert!(
+            row.provenance
+                .iter()
+                .any(|trace| trace.branch.first() == Some(&1))
+        );
+        assert!(
+            matches!(row.field("x"), Ok(Some(CodeQueryRowScalarRef::String(value))) if value == "print")
+        );
+    }
+}
+
+#[test]
+fn root_union_enumerates_subtrahend_only_empty_minuend_files() {
+    let project = InlineTestProject::new()
+        .file("a.ts", "export function keep() { return 1; }\n")
+        .file("b.py", "def remove():\n    pass\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(result-detail full (union
+            (except
+              (language typescript (function :name \"keep\"))
+              (language python (function)))
+            (except
+              (language typescript (function :name \"absent\"))
+              (language python (function)))))",
+    )
+    .expect("mixed set parses");
+    assert_eq!(
+        PlanPartitioning::classify(&query.plan),
+        PlanPartitioning::BySeedSetUnion
+    );
+    let files = crate::structural::search::units::plan_seed_files(
+        &query.plan,
+        &workspace.analyzer().analyzed_files(),
+    );
+    assert_eq!(files.len(), 2, "subtrahend-only b.py must be enumerated");
+    assert!(
+        files
+            .iter()
+            .any(|file| file.rel_path().to_str() == Some("b.py"))
+    );
+    let limits = CodeQueryExecutionLimits::default();
+    let whole = execute_code_query_detailed_eager_index(
+        workspace.analyzer(),
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        limits,
+        None,
+    );
+    let units = files
+        .iter()
+        .map(|file| {
+            execute_code_query_unit(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                None,
+                &query,
+                limits,
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+            )
+        })
+        .collect::<Vec<_>>();
+    let python_unit = files
+        .iter()
+        .position(|file| file.rel_path().to_str() == Some("b.py"))
+        .expect("Python subtrahend seed is selected");
+    assert!(units[python_unit].rows.is_empty());
+    assert!(units[python_unit].work.scanned_files > 0);
+    let merged = merge_unit_rows(&query, units);
+    let whole_items = whole
+        .result
+        .results
+        .iter()
+        .map(UnitRowItem::project)
+        .collect::<Vec<_>>();
+    assert_eq!(merged.items, whole_items);
+    let mut merged_evidence = merged.detailed_evidence(project.root());
+    let mut whole_evidence = whole.evidence;
+    for evidence in &mut merged_evidence {
+        evidence.result_index = 0;
+    }
+    for evidence in &mut whole_evidence {
+        evidence.result_index = 0;
+    }
+    assert_eq!(merged_evidence, whole_evidence);
+    assert_eq!(merged.completion(), whole.result.completion());
+    assert_eq!(merged.diagnostics, whole.result.diagnostics);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8389: an empty per-file intersect operand skipped a later branch's work and gap"
+)]
+fn intersect_minuends_keep_the_whole_execution_and_late_budget_gap() {
+    let mut heavy = String::new();
+    for index in 0..64 {
+        heavy.push_str(&format!(
+            "export function other{index}() {{ return {index}; }}\n"
+        ));
+    }
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("f.ts", &heavy)
+        .file("g.ts", "export function target() { return 1; }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let a = json!({"match": {"kind": "function", "name": {"regex": "^target$"}}});
+    let b = json!({"match": {"kind": "function"}});
+    let c = json!({"match": {"kind": "function", "name": {"regex": "^absent$"}}});
+    let a_query = CodeQuery::from_json(&a).expect("A parses");
+    let b_query = CodeQuery::from_json(&b).expect("B parses");
+    let files = workspace.analyzer().analyzed_files();
+    let f = files
+        .iter()
+        .find(|file| file.rel_path().to_str() == Some("f.ts"))
+        .unwrap();
+    let g = files
+        .iter()
+        .find(|file| file.rel_path().to_str() == Some("g.ts"))
+        .unwrap();
+    let run_leaf = |query: &CodeQuery, file: &ProjectFile, limits| {
+        execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            None,
+            query,
+            limits,
+            None,
+            CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+        )
+    };
+    let unlimited = CodeQueryExecutionLimits::default();
+    let a_f = run_leaf(&a_query, f, unlimited);
+    let a_g = run_leaf(&a_query, g, unlimited);
+    let b_f = run_leaf(&b_query, f, unlimited);
+    let b_g = run_leaf(&b_query, g, unlimited);
+    assert!(a_f.rows.is_empty());
+    assert_eq!(a_f.completion, CodeQueryCompletion::Complete);
+    assert_eq!(a_g.rows.len(), 1);
+    assert_eq!(b_f.rows.len(), 64);
+    assert_eq!(b_g.rows.len(), 1);
+    let late_b = run_leaf(
+        &b_query,
+        f,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 16,
+            ..unlimited
+        },
+    );
+    assert!(late_b.truncated);
+    assert!(late_b.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+            || diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+    }));
+    let cases = [
+        (
+            "root",
+            json!({"intersect": [a.clone(), b.clone()]}),
+            c.clone(),
+            true,
+        ),
+        (
+            "nested",
+            json!({"union": [
+                {"intersect": [a.clone(), b.clone()]}, a.clone()
+            ]}),
+            c.clone(),
+            true,
+        ),
+        (
+            "subtrahend",
+            json!({"union": [a.clone(), a.clone()]}),
+            json!({"intersect": [a.clone(), b.clone()]}),
+            true,
+        ),
+        (
+            "globally empty",
+            json!({"intersect": [c.clone(), b.clone()]}),
+            a.clone(),
+            false,
+        ),
+    ];
+    for (label, minuend, subtrahend, should_gap) in cases {
+        let query = CodeQuery::from_json(&json!({
+            "schema_version": 1,
+            "except": [minuend, subtrahend],
+            "limit": 500,
+            "result_detail": "full"
+        }))
+        .expect("intersect control parses");
+        assert_eq!(
+            PlanPartitioning::classify(&query.plan),
+            PlanPartitioning::Whole(crate::PlanWidenDetail::ExceptNonLeafMinuend)
+        );
+        for limits in [
+            CodeQueryExecutionLimits::default(),
+            CodeQueryExecutionLimits {
+                max_pipeline_rows: 16,
+                ..CodeQueryExecutionLimits::default()
+            },
+        ] {
+            let whole = execute_code_query_detailed_eager_index(
+                workspace.analyzer(),
+                &flow,
+                &query,
+                limits,
+                None,
+            );
+            let unit = execute_code_query_unit(
+                workspace.analyzer(),
+                &flow,
+                None,
+                &query,
+                limits,
+                None,
+                CodeQueryExecutionScope::whole_workspace(),
+            );
+            let capped = limits.max_pipeline_rows == 16;
+            if capped && should_gap {
+                assert!(
+                    whole.result.truncated,
+                    "{label}: {:?}",
+                    whole.result.diagnostics
+                );
+                assert!(
+                    whole.result.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+                            || diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                    }),
+                    "{label}: {:?}",
+                    whole.result.diagnostics
+                );
+            }
+            if capped && !should_gap {
+                assert!(!whole.result.truncated, "{label}: globally empty A skips B");
+            }
+            assert_eq!(unit.completion, whole.result.completion(), "{label}");
+            assert_eq!(unit.work, whole.work, "{label}");
+            assert_eq!(unit.diagnostics, whole.result.diagnostics, "{label}");
+            let merged = merge_unit_rows(&query, vec![unit]);
+            let whole_items = whole
+                .result
+                .results
+                .iter()
+                .map(UnitRowItem::project)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exact_rows(&merged.items, &merged.detailed_evidence(project.root())),
+                exact_rows(&whole_items, &whole.evidence),
+                "{label}"
+            );
         }
     }
 }

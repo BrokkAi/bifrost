@@ -32,7 +32,7 @@ applies:
    invocation. The policy flags are `--policy`, `--no-builtin-policies`,
    `--policy-file`, `--policy-pack`, `--policy-category`, `--policy-id`,
    `--exclude-policy-id`, `--list-policies`, `--list-row-schemas`, `--format`, `--fail-on`,
-   `--suppressions-file`, `--scope-file`, `--baseline-file`, `--accept-current`,
+   `--suppressions-file`, `--scope-file`, `--inline-suppression-prefix`, `--baseline-file`, `--accept-current`,
    `--evaluation-date`, `--diff-base`, `--no-incremental`, `--policy-timings`, `--policy-cost-hints`, `--policy-deadlines-ms`,
    `--output`, `--color`, `--verbose`, `--require-explicit-schema-versions`,
    `--explain-finding`, `--explain-candidate`, `--explain-near-misses`, and
@@ -160,6 +160,7 @@ Built-in selectors combine like this:
 | --- | --- | --- | --- | --- |
 | `--suppressions-file PATH` | Workspace-relative JSON file | `.bifrost/suppressions.json`, `.bifrost/suppressions.private.json`, and `.bifrost/suppressions.local.json`, read in that order when present | Once | Read accepted findings from this one file instead of the three default files. |
 | `--scope-file PATH` | Workspace-relative JSON file | `.bifrost/policy-scope.json` | Once | Read directory-level acceptances and root exclusions from this file. |
+| `--inline-suppression-prefix WORD` | 1 to 32 ASCII letters, digits, `-`, `_` | `bifrost` | Once | Accept findings with `// WORD: ignore[...] -- reason` comment directives. See [Inline directives](/reference/policies/#inline-directives). |
 | `--baseline-file PATH` | Workspace-relative JSON file | `.bifrost/baseline.json` | Once | Read, and with `--accept-current` write, the bulk-acceptance baseline. |
 | `--evaluation-date YYYY-MM-DD` | UTC calendar date, year 0 to 9999 | Today in UTC | Once | Date used for suppression expiry. A suppression stays current on its `expires_at` date. |
 | `--require-explicit-schema-versions` | None | Off | - | Reject a policy, endpoint, or RQL dependency that omits its schema version. |
@@ -222,7 +223,7 @@ Bifrost rejects these combinations before it does any work:
 | `--list-policies` with `--list-row-schemas` | Error, exit 2 |
 | A listing flag with any other policy flag or `--sources` | Error, exit 2 |
 | Two of `--explain-finding`, `--explain-candidate`, `--explain-near-misses` | Error, exit 2 |
-| An explanation flag with `--format`, `--fail-on`, `--suppressions-file`, `--scope-file`, `--baseline-file`, `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`, `--policy-cost-hints`, `--policy-deadlines-ms`, `--verbose`, `--color`, or `--sources` | Error, exit 2 |
+| An explanation flag with `--format`, `--fail-on`, `--suppressions-file`, `--scope-file`, `--inline-suppression-prefix`, `--baseline-file`, `--accept-current`, `--evaluation-date`, `--diff-base`, `--policy-timings`, `--policy-cost-hints`, `--policy-deadlines-ms`, `--verbose`, `--color`, or `--sources` | Error, exit 2 |
 | An explanation flag with no `--policy-file` and no built-in selector | Error, exit 2 |
 | `--explain-generation` without an explanation flag | Error, exit 2 |
 | `--no-builtin-policies` with a built-in selector, or without `--policy-file` | Error, exit 2 |

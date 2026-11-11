@@ -8,6 +8,15 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+mod route_questions;
+pub use route_questions::{
+    RustSelectedUnitsPublication, rust_broad_file_units, rust_broad_placement_rows,
+    rust_crate_name_units, rust_file_units, rust_package_units, rust_selected_units_known,
+    rust_unit_dependents, rust_unit_inputs, rust_unit_package_rows,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use route_questions::{explain_rust_route_questions, rust_crate_name_units_sql};
+
 #[cfg(any(test, feature = "test-support"))]
 use std::fmt::Debug;
 
@@ -56,7 +65,7 @@ use brokk_bifrost_rust::usage::direct_import_scope_for_module_with_identity;
 // Version 20 separates module inventories from binding gaps at colliding paths.
 // Version 23 preserves resolved subjects of otherwise unresolved trait impls.
 #[doc(hidden)]
-pub const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 23;
+pub const RUST_UNIT_SUMMARY_DERIVATION_VERSION: i64 = 24;
 
 pub(crate) const IMPORTING_FILES_FOR_MEMBER_SQL: &str = r#"
 WITH target_declarations AS (
@@ -162,6 +171,7 @@ WITH selected_units AS (
    AND rust_versions.valid_from = versions.valid_from
    AND rust_versions.summary_id = versions.summary_id
   WHERE selected.lang = 'rust'
+    /* UNIT_KEY_FILTER */
     AND versions.valid_from <= selected.revision
     AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
     AND summaries.lang = 'rust'
@@ -234,6 +244,7 @@ WITH selected_units AS (
    AND rust_versions.valid_from = versions.valid_from
    AND rust_versions.summary_id = versions.summary_id
   WHERE selected.lang = 'rust'
+    /* UNIT_KEY_FILTER */
     AND versions.valid_from <= selected.revision
     AND (versions.valid_until IS NULL OR selected.revision < versions.valid_until)
     AND summaries.lang = 'rust'
@@ -872,19 +883,20 @@ const IMPORTS_SQL: &str =
       ON segment.blob_id = imports.blob_id AND segment.import_id = imports.import_id
     ORDER BY sources.rel_path, sources.blob_id, imports.import_id, segment.ordinal";
 
-const IMPORT_TARGET_KEYS_SQL: &str = "SELECT DISTINCT imports.target_crate_key
-    FROM main.source_rust_import_targets AS targets
-    JOIN main.rust_crate_imports AS imports
-      ON imports.topology_id = ?1 AND imports.module_path = targets.module_path
-     AND imports.blob_id = targets.blob_id AND imports.import_ordinal = targets.ordinal
-    WHERE targets.blob_id = ?2 AND targets.source_import_id = ?3
-    UNION
-    SELECT DISTINCT imports.target_crate_key
-    FROM main.source_rust_import_targets AS targets
-    JOIN main.rust_crate_glob_imports AS imports
-      ON imports.topology_id = ?1 AND imports.module_path = targets.module_path
-     AND imports.blob_id = targets.blob_id AND imports.import_ordinal = targets.ordinal
-    WHERE targets.blob_id = ?2 AND targets.source_import_id = ?3";
+// Read retained routes once per topology. The route tables can use their
+// topology_id key prefix; the source binder is identified by blob and ordinal.
+const IMPORT_TARGET_KEYS_SQL: &str =
+    "SELECT targets.blob_id, targets.source_import_id, imports.target_crate_key
+    FROM main.rust_crate_imports AS imports
+    CROSS JOIN main.source_rust_import_targets AS targets
+      ON targets.blob_id = imports.blob_id AND targets.ordinal = imports.import_ordinal
+    WHERE imports.topology_id = ?1 AND targets.source_import_id IS NOT NULL
+    UNION ALL
+    SELECT targets.blob_id, targets.source_import_id, imports.target_crate_key
+    FROM main.rust_crate_glob_imports AS imports
+    CROSS JOIN main.source_rust_import_targets AS targets
+      ON targets.blob_id = imports.blob_id AND targets.ordinal = imports.import_ordinal
+    WHERE imports.topology_id = ?1 AND targets.source_import_id IS NOT NULL";
 
 const EXPORTS_SQL: &str = "SELECT exports.module_path, exports.namespace, exports.name,
        exports.origin, exports.declaration_blob_id, exports.declaration_site,
@@ -988,20 +1000,6 @@ pub(crate) const DEPENDENCY_REEXPORT_WITNESS_SQL: &str = concat!(
      )"
 );
 
-const LOCAL_IMPORT_SQL: &str = "SELECT EXISTS(
-    SELECT 1 FROM main.source_rust_import_targets AS targets
-    JOIN main.rust_crate_imports AS imports
-      ON imports.topology_id = ?1 AND imports.module_path = targets.module_path
-     AND imports.blob_id = targets.blob_id AND imports.import_ordinal = targets.ordinal
-    WHERE targets.blob_id = ?2 AND targets.source_import_id = ?3 AND imports.target_crate_key = ?4
-    UNION
-    SELECT 1 FROM main.source_rust_import_targets AS targets
-    JOIN main.rust_crate_glob_imports AS imports
-      ON imports.topology_id = ?1 AND imports.module_path = targets.module_path
-     AND imports.blob_id = targets.blob_id AND imports.import_ordinal = targets.ordinal
-    WHERE targets.blob_id = ?2 AND targets.source_import_id = ?3 AND imports.target_crate_key = ?4
-  )";
-
 // A forwarded public-surface gap describes the topology's reachability graph,
 // not this unit's own export or import inventory. A declared `pub mod` whose
 // file is missing has a known binding and a known failed lookup, like the
@@ -1019,16 +1017,92 @@ const GAPS_SQL: &str = "SELECT gap_kind, subject, json(detail)
 pub struct RustUnitSummaries;
 
 /// Compare Rust-specific publication with the generic summary producer.
+// #11173: use the Copy-absence anti-join's key, independently of source role.
+#[cfg(any(test, feature = "test-support"))]
+fn assert_source_members(conn: &Connection, topology_id: i64, summary_id: i64) {
+    let missing = conn
+        .prepare_cached(
+            "SELECT source.blob_id, source.rel_path, source.source_kind
+             FROM main.rust_crate_container_sources AS source
+             WHERE source.topology_id = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM main.resolution_unit_summary_members AS member
+                 WHERE member.summary_id = ?2 AND member.blob_id = source.blob_id
+                   AND member.rel_path = source.rel_path)
+             ORDER BY source.rel_path, source.source_kind, source.blob_id",
+        )
+        .expect("prepare source-to-member invariant")
+        .query_map(params![topology_id, summary_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("read source-to-member invariant")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect missing source members");
+    assert!(
+        missing.is_empty(),
+        "topology {topology_id}, summary {summary_id}: sources missing members: {missing:?}"
+    );
+}
+
+#[cfg(test)]
+mod source_member_invariant_tests {
+    use super::*;
+
+    #[test]
+    fn source_members_detects_omitted_members_of_each_kind() {
+        // Minimal independent derivation tables keep this mutation local to the
+        // assertion. Engine fixtures below exercise the real publishers/schema.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rust_crate_container_sources (
+                topology_id INTEGER, blob_id INTEGER, rel_path TEXT, source_kind TEXT);
+             CREATE TABLE resolution_unit_summary_members (
+                summary_id INTEGER, blob_id INTEGER, rel_path TEXT);
+             INSERT INTO rust_crate_container_sources VALUES
+                (1, 10, 'lib.rs', 'declared'), (1, 20, 'splice.rs', 'include');
+             INSERT INTO resolution_unit_summary_members VALUES
+                (2, 10, 'lib.rs'), (2, 20, 'splice.rs');",
+        )
+        .unwrap();
+        assert_source_members(&conn, 1, 2);
+        for kind in ["declared", "include"] {
+            conn.execute_batch("SAVEPOINT mutation").unwrap();
+            assert_eq!(
+                conn.execute(
+                    "DELETE FROM resolution_unit_summary_members WHERE blob_id IN (
+                    SELECT blob_id FROM rust_crate_container_sources WHERE source_kind = ?1)",
+                    [kind],
+                )
+                .unwrap(),
+                1
+            );
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_source_members(&conn, 1, 2);
+            }));
+            conn.execute_batch("ROLLBACK TO mutation; RELEASE mutation")
+                .unwrap();
+            assert!(failure.is_err(), "omitted {kind} member must be detected");
+            assert_source_members(&conn, 1, 2);
+        }
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapshotId) {
     let topology_count: usize = conn
-        .query_row(
+        .prepare_cached(
             "SELECT count(*) FROM main.rust_crate_versions AS versions
              JOIN main.rust_crate_topologies AS topology USING(topology_id)
              WHERE versions.workspace_id = ?1 AND versions.lang = 'rust'
                AND versions.generation = ?2 AND versions.valid_from <= ?3
                AND (versions.valid_until IS NULL OR ?3 < versions.valid_until)
                AND topology.publication_state = 'complete'",
+        )
+        .expect("prepare Rust topology count")
+        .query_row(
             rusqlite::params![
                 snapshot.workspace_id.as_str(),
                 snapshot.generation.get(),
@@ -1039,7 +1113,7 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
         .expect("count selected Rust topology versions");
     let crosswalk = {
         let mut statement = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT topology.topology_id, topology.crate_key, topology.crate_name,
                         summary.summary_id
                  FROM main.rust_crate_versions AS versions
@@ -1092,9 +1166,69 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
     );
 
     for (topology_id, crate_key, crate_name, summary_id) in crosswalk {
+        // Membership first: the column comparisons below read members, and a
+        // missing member must be reported as such, not as a column mismatch.
+        assert_source_members(conn, topology_id, summary_id);
+        // Compare the residual reader columns, not the unrelated import-id domain.
+        for (family, expected_sql, actual_sql) in [
+            (
+                "residual import routes",
+                "SELECT DISTINCT json_array(module_path, blob_id, import_ordinal, binder_scope, namespace, bound_name, hex(target_crate_key), target_module_path, target_name) FROM rust_crate_imports WHERE topology_id=?1",
+                "SELECT DISTINCT json_array(route.module_path, member.blob_id, route.route_ordinal, route.binder_scope, route.namespace, route.bound_name, hex(route.target_unit_key), route.target_module_path, route.target_name) FROM rust_resolution_unit_summary_import_routes AS route JOIN resolution_unit_summary_members AS member USING(summary_id, member_ordinal) WHERE route.summary_id=?1",
+            ),
+            (
+                "residual gaps",
+                "SELECT json_array(gap_kind, subject, json(detail)) FROM rust_crate_gaps WHERE topology_id=?1 AND gap_kind IN ('unknown_activation', 'inactive_placement')",
+                "SELECT json_array(gap_kind, subject, json(detail)) FROM rust_resolution_unit_summary_gaps WHERE summary_id=?1 AND gap_kind IN ('unknown_activation', 'inactive_placement')",
+            ),
+            (
+                "residual parent placements",
+                "SELECT DISTINCT json_array(container_path, blob_id, rel_path, scope_ordinal, source_kind, enum_scope_node_key) FROM rust_crate_container_sources WHERE topology_id=?1",
+                "SELECT DISTINCT json_array(attr.module_path, member.blob_id, member.rel_path, placement.scope_ordinal, attr.source_kind, attr.enum_scope_node_key) FROM resolution_unit_summary_placements AS placement JOIN rust_resolution_unit_summary_placement_attributes AS attr USING(summary_id, container_path, member_ordinal) JOIN resolution_unit_summary_members AS member USING(summary_id, member_ordinal) WHERE placement.summary_id=?1",
+            ),
+        ] {
+            let read = |sql: &str, id| {
+                conn.prepare_cached(sql)
+                    .expect("prepare residual differential")
+                    .query_map([id], |row| row.get::<_, String>(0))
+                    .expect("read residual differential")
+                    .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+                    .expect("collect residual differential")
+            };
+            assert_set_equal(
+                &format!("{crate_name} {family}"),
+                &read(expected_sql, topology_id),
+                &read(actual_sql, summary_id),
+            );
+        }
+
+        // #11173: crate-name readers consume these copied context fields.
+        let context_rows = |sql: &str, id: i64| {
+            conn.prepare_cached(sql)
+                .expect("prepare Rust crate-name context differential")
+                .query_map([id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .expect("read Rust crate-name context differential")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect Rust crate-name context differential")
+        };
+        let expected_context = context_rows(
+            "SELECT target_kind, crate_name FROM main.rust_crate_topologies WHERE topology_id = ?1",
+            topology_id,
+        );
+        let actual_context = context_rows(
+            "SELECT target_kind, crate_name FROM main.rust_resolution_unit_summary_contexts WHERE summary_id = ?1",
+            summary_id,
+        );
+        assert_eq!(
+            expected_context, actual_context,
+            "{crate_name} crate-name context for unit {crate_key:?}"
+        );
+
         let expected_members = {
             let mut statement = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT DISTINCT blob_id, rel_path, source_kind
                      FROM main.rust_crate_container_sources
                      WHERE topology_id = ?1",
@@ -1114,7 +1248,7 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
         };
         let actual_members = {
             let mut statement = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT blob_id, rel_path, source_role
                      FROM main.resolution_unit_summary_members
                      WHERE summary_id = ?1",
@@ -1140,7 +1274,7 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
 
         let expected_exports = {
             let mut statement = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT namespace, name FROM main.rust_crate_exports
                      WHERE topology_id = ?1 AND visibility = 'public'",
                 )
@@ -1168,7 +1302,7 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
         };
         let actual_exports = {
             let mut statement = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT identity_id, namespace
                      FROM main.resolution_unit_summary_exports
                      WHERE summary_id = ?1 AND visibility = 'exported'",
@@ -1186,15 +1320,13 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
             .difference(&actual_exports)
             .map(|(identity_id, namespace)| {
                 let spelling: String = conn
-                    .query_row(
-                        "SELECT spelling FROM main.resolution_identities WHERE id = ?1",
-                        [identity_id],
-                        |row| row.get(0),
-                    )
+                    .prepare_cached("SELECT spelling FROM main.resolution_identities WHERE id = ?1")
+                    .expect("prepare Rust export spelling lookup")
+                    .query_row([identity_id], |row| row.get(0))
                     .expect("lookup missing Rust export spelling");
                 let topology_rows = {
                     let mut statement = conn
-                        .prepare(
+                        .prepare_cached(
                             "SELECT module_path, origin, declaration_blob_id, declaration_site
                              FROM main.rust_crate_exports
                              WHERE topology_id = ?1 AND namespace = ?2 AND name = ?3
@@ -1226,8 +1358,8 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
 
         let expected_dependencies = {
             let mut statement = conn
-                .prepare(
-                    "SELECT extern_name, boundary, dependency_crate_key
+                .prepare_cached(
+                    "SELECT extern_name, boundary, dependency_crate_key, dependency_kind
                      FROM main.rust_crate_dependencies WHERE topology_id = ?1",
                 )
                 .expect("prepare Rust topology dependencies");
@@ -1237,11 +1369,12 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .expect("read Rust topology dependencies")
                 .map(|row| {
-                    let (extern_name, boundary, dependency_key) =
+                    let (extern_name, boundary, dependency_key, dependency_kind) =
                         row.expect("decode Rust topology dependency");
                     let key = match (boundary.as_str(), dependency_key) {
                         ("workspace", Some(key)) => {
@@ -1258,26 +1391,38 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
                     } else {
                         boundary
                     };
-                    (boundary, key)
+                    (extern_name, dependency_kind, boundary, key)
                 })
                 .collect::<std::collections::BTreeSet<_>>()
         };
         let actual_dependencies = {
             let mut statement = conn
-                .prepare(
-                    "SELECT boundary, dependency_unit_key
-                     FROM main.resolution_unit_summary_dependencies
-                     WHERE summary_id = ?1 AND boundary IN ('workspace', 'external', 'standard')",
+                .prepare_cached(
+                    "SELECT names.extern_name, names.dependency_kind, dependency.boundary,
+                            dependency.dependency_unit_key
+                     FROM main.rust_unit_summary_dependency_names AS names
+                     JOIN main.resolution_unit_summary_dependencies AS dependency
+                       ON dependency.summary_id = names.summary_id
+                      AND dependency.dependency_ordinal = names.dependency_ordinal
+                     WHERE names.summary_id = ?1 AND dependency.boundary IN ('workspace', 'external', 'standard')",
                 )
                 .expect("prepare Rust summary dependencies");
             statement
                 .query_map([summary_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
                 })
                 .expect("read Rust summary dependencies")
                 .map(|row| {
-                    let (boundary, key) = row.expect("decode Rust summary dependency");
+                    let (extern_name, dependency_kind, boundary, key) =
+                        row.expect("decode Rust summary dependency");
                     (
+                        extern_name,
+                        dependency_kind,
                         boundary,
                         digest_from_row(key).expect("Rust summary dependency key is 32 bytes"),
                     )
@@ -1290,6 +1435,20 @@ pub(super) fn assert_differential(conn: &Connection, snapshot: &WorkspaceSnapsho
             &expected_dependencies,
             &actual_dependencies,
         );
+
+        let expected_prelude: String = conn
+            .prepare_cached("SELECT prelude FROM main.rust_crate_topologies WHERE topology_id = ?1")
+            .expect("prepare Rust topology prelude")
+            .query_row([topology_id], |row| row.get(0))
+            .expect("read Rust topology prelude");
+        let actual_prelude: String = conn
+            .prepare_cached(
+                "SELECT prelude FROM main.rust_resolution_unit_summary_contexts WHERE summary_id = ?1",
+            )
+            .expect("prepare Rust summary prelude")
+            .query_row([summary_id], |row| row.get(0))
+            .expect("read Rust summary prelude");
+        assert_eq!(expected_prelude, actual_prelude, "{crate_name} prelude");
     }
 }
 
@@ -1322,25 +1481,24 @@ impl UnitSummaryLanguage for RustUnitSummaries {
 
     fn stage(&self, conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
         conn.execute_batch(STAGE_SCHEMA_SQL)?;
-        conn.execute(
-            STAGE_UNITS_SQL,
-            params![
-                snapshot.workspace_id.as_str(),
-                snapshot.generation.get(),
-                snapshot.revision
-            ],
-        )?;
-        conn.execute(
+        conn.prepare_cached(STAGE_UNITS_SQL)?.execute(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision
+        ])?;
+        conn.prepare_cached(
             "INSERT INTO temp.unit_summary_work(unit_id)
              SELECT unit_id FROM temp.rust_unit_summary_units",
-            [],
-        )?;
-        conn.execute(STAGE_DEPENDENCY_EDGES_SQL, [])?;
+        )?
+        .execute([])?;
+        conn.prepare_cached(STAGE_DEPENDENCY_EDGES_SQL)?
+            .execute([])?;
         Ok(())
     }
 
     fn clear_stage(&self, conn: &Connection) -> Result<()> {
-        conn.execute("DELETE FROM temp.rust_unit_summary_units", [])?;
+        conn.prepare_cached("DELETE FROM temp.rust_unit_summary_units")?
+            .execute([])?;
         Ok(())
     }
 
@@ -1369,11 +1527,11 @@ impl UnitSummaryLanguage for RustUnitSummaries {
             }
         }
 
-        let producer_epoch: String = conn.query_row(
-            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang = 'rust'",
-            [],
-            |row| row.get(0),
-        )?;
+        let producer_epoch: String = conn
+            .prepare_cached(
+                "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang = 'rust'",
+            )?
+            .query_row([], |row| row.get(0))?;
         let mut reads = read_rows(conn, snapshot, &producer_epoch)?;
         // The summary consumes the crate topology, so its digest is a read.
         // It covers the crate derivation version, which changes derived
@@ -1726,11 +1884,9 @@ impl UnitSummaryLanguage for RustUnitSummaries {
         unit: &UnitInputs,
         summary_id: i64,
     ) -> Result<usize> {
-        let valid_from: i64 = conn
-            .query_row(
-                "SELECT valid_from FROM resolution_unit_summary_versions
+        let valid_from: i64 = conn.prepare_cached("SELECT valid_from FROM resolution_unit_summary_versions
              WHERE workspace_id = ?1 AND lang = 'rust' AND generation = ?2
-               AND profile_digest = zeroblob(32) AND unit_key = ?3 AND summary_id = ?4 AND valid_until IS NULL",
+               AND profile_digest = zeroblob(32) AND unit_key = ?3 AND summary_id = ?4 AND valid_until IS NULL")?.query_row(
                 params![
                     snapshot.workspace_id.as_str(),
                     snapshot.generation.get(),
@@ -1746,11 +1902,13 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                 ))
             })?;
         let (topology_id, manifest_file_version_id): (i64, Option<i64>) = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT topology_id, manifest_file_version_id FROM rust_crate_versions
              WHERE workspace_id = ?1 AND lang = 'rust' AND generation = ?2
                AND crate_key = ?3 AND valid_from <= ?4
                AND (valid_until IS NULL OR ?4 < valid_until)",
+            )?
+            .query_row(
                 params![
                     snapshot.workspace_id.as_str(),
                     snapshot.generation.get(),
@@ -1765,7 +1923,7 @@ impl UnitSummaryLanguage for RustUnitSummaries {
                     unit.label, unit.unit_id, snapshot.revision
                 ))
             })?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO rust_resolution_unit_summary_versions(
                  workspace_id, lang, generation, unit_key, valid_from, summary_id,
                  manifest_file_version_id, topology_id, profile_digest)
@@ -1774,16 +1932,16 @@ impl UnitSummaryLanguage for RustUnitSummaries {
              DO UPDATE SET summary_id = excluded.summary_id,
                            manifest_file_version_id = excluded.manifest_file_version_id,
                            topology_id = excluded.topology_id",
-            params![
-                snapshot.workspace_id.as_str(),
-                snapshot.generation.get(),
-                unit.unit_key.as_slice(),
-                valid_from,
-                summary_id,
-                manifest_file_version_id,
-                topology_id
-            ],
-        )?;
+        )?
+        .execute(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            unit.unit_key.as_slice(),
+            valid_from,
+            summary_id,
+            manifest_file_version_id,
+            topology_id
+        ])?;
         Ok(1)
     }
 }
@@ -1807,11 +1965,9 @@ fn write_rust_summary_rows(
            ON members.summary_id=?1 AND members.rel_path=sources.rel_path
           AND members.source_role=sources.source_kind
          WHERE sources.topology_id=?2";
-    let topology_id: i64 = conn.query_row(
-        "SELECT topology_id FROM temp.rust_unit_summary_units WHERE unit_id = ?1",
-        [unit.unit_id],
-        |row| row.get(0),
-    )?;
+    let topology_id: i64 = conn
+        .prepare_cached("SELECT topology_id FROM temp.rust_unit_summary_units WHERE unit_id = ?1")?
+        .query_row([unit.unit_id], |row| row.get(0))?;
     for table in [
         "rust_resolution_unit_summary_gaps",
         "rust_resolution_unit_summary_contexts",
@@ -1832,9 +1988,12 @@ fn write_rust_summary_rows(
         RUST_SUMMARY_CONTAINER_ATTRIBUTES_SQL,
         RUST_SUMMARY_PLACEMENT_ATTRIBUTES_SQL,
         "INSERT INTO rust_resolution_unit_summary_file_naming(
-                 summary_id, member_ordinal, package_components, root_components)
+                 summary_id, member_ordinal, package_components, package_path, root_components)
              SELECT ?1, members.member_ordinal, naming.package_components,
-                    naming.root_components
+                    COALESCE((SELECT group_concat(value, '.') FROM (
+                        SELECT value FROM json_each(naming.package_components)
+                        ORDER BY CAST(key AS INTEGER)
+                    )), ''), naming.root_components
              FROM rust_crate_file_naming AS naming
              JOIN resolution_unit_summary_members AS members
                ON members.summary_id = ?1 AND members.rel_path = naming.rel_path
@@ -1859,18 +2018,21 @@ fn write_rust_summary_rows(
               AND members.source_role = sources.source_kind
              WHERE routes.topology_id = ?2",
     ] {
-        let written = conn.execute(sql, params![summary_id, topology_id])?;
+        let written = conn
+            .prepare_cached(sql)?
+            .execute(params![summary_id, topology_id])?;
         rows_written += written;
     }
-    let context_written = conn.execute(
-        "INSERT INTO rust_resolution_unit_summary_contexts(
+    let context_written = conn
+        .prepare_cached(
+            "INSERT INTO rust_resolution_unit_summary_contexts(
              summary_id, target_kind, crate_name, edition, prelude, cfg_atoms,
              inventory_complete, development_capable)
          SELECT ?1, target_kind, crate_name, edition, prelude, cfg_atoms,
                 inventory_complete, ?3
          FROM rust_crate_topologies WHERE topology_id = ?2",
-        params![summary_id, topology_id, development_capable],
-    )?;
+        )?
+        .execute(params![summary_id, topology_id, development_capable])?;
     assert_eq!(
         context_written, 1,
         "{} has one Rust unit context",
@@ -2339,8 +2501,9 @@ fn write_rust_summary_rows(
         rows_written += 1;
     }
 
-    rows_written += conn.execute(
-        "INSERT INTO rust_resolution_unit_summary_generated_names(
+    rows_written += conn
+        .prepare_cached(
+            "INSERT INTO rust_resolution_unit_summary_generated_names(
              summary_id, module_path, member_ordinal, invocation_occurrence_id,
              declaration_id, namespace, name, visibility, restricted_module_path,
              module_item)
@@ -2357,10 +2520,11 @@ fn write_rust_summary_rows(
           AND members.rel_path = sources.rel_path
           AND members.source_role = sources.source_kind
          WHERE items.topology_id = ?2",
-        params![summary_id, topology_id],
-    )?;
-    rows_written += conn.execute(
-        "INSERT INTO rust_resolution_unit_summary_macro_decisions(
+        )?
+        .execute(params![summary_id, topology_id])?;
+    rows_written += conn
+        .prepare_cached(
+            "INSERT INTO rust_resolution_unit_summary_macro_decisions(
              summary_id, member_ordinal, invocation_occurrence_id, decoration_cfg)
          SELECT DISTINCT ?1, members.member_ordinal, decisions.invocation_occurrence_id,
                 decisions.decoration_cfg
@@ -2372,8 +2536,8 @@ fn write_rust_summary_rows(
           AND members.rel_path = sources.rel_path
           AND members.source_role = sources.source_kind
          WHERE decisions.topology_id = ?2",
-        params![summary_id, topology_id],
-    )?;
+        )?
+        .execute(params![summary_id, topology_id])?;
     rows_written += write_rust_trait_endpoints(
         conn,
         snapshot,
@@ -2791,13 +2955,12 @@ fn write_rust_effective_bindings(
         );
     }
     let root_member: Option<i64> = conn
-        .query_row(
+        .prepare_cached(
             "SELECT member_ordinal FROM rust_unit_summary_placements
              WHERE summary_id = ?1 AND module_path = 'crate'
              ORDER BY member_ordinal LIMIT 1",
-            [summary_id],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([summary_id], |row| row.get(0))
         .optional()?;
 
     let mut bindings = RustClosureBindings::default();
@@ -3442,8 +3605,7 @@ fn rust_summary_development_capability(
         String,
         Option<i64>,
         Option<Vec<u8>>,
-    ) = conn.query_row(
-        DEVELOPMENT_CAPABILITY_SQL,
+    ) = conn.prepare_cached(DEVELOPMENT_CAPABILITY_SQL)?.query_row(
         params![
             snapshot.workspace_id.as_str(),
             snapshot.generation.get(),
@@ -3808,11 +3970,11 @@ fn canonical_export_target(
     let dependency_ordinal = if same_unit {
         None
     } else {
-        let producer_epoch: String = conn.query_row(
-            "SELECT producer_epoch FROM main.resolution_producer_epochs WHERE lang = 'rust'",
-            [],
-            |row| row.get(0),
-        )?;
+        let producer_epoch: String = conn
+            .prepare_cached(
+                "SELECT producer_epoch FROM main.resolution_producer_epochs WHERE lang = 'rust'",
+            )?
+            .query_row([], |row| row.get(0))?;
         let mut statement = conn.prepare_cached(DEPENDENCY_REEXPORT_WITNESS_SQL)?;
         let mut first_hop = dependency_ordinals.get(&target_unit_key).copied();
         for (dependency_key, ordinal) in dependency_ordinals {
@@ -3874,6 +4036,14 @@ impl RustUnitSummaries {
             rel_path: String,
             segments: Vec<String>,
         }
+        let mut target_keys: HashMap<(i64, i64), HashSet<[u8; 32]>> = HashMap::new();
+        let mut target_statement = conn.prepare_cached(IMPORT_TARGET_KEYS_SQL)?;
+        let mut target_rows = target_statement.query([topology_id])?;
+        while let Some(row) = target_rows.next()? {
+            let binder = (row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
+            let key = digest_from_row(row.get::<_, Vec<u8>>(2)?)?;
+            target_keys.entry(binder).or_default().insert(key);
+        }
         let mut imports = Vec::new();
         let mut statement = conn.prepare_cached(IMPORTS_SQL)?;
         let mut rows = statement.query([topology_id])?;
@@ -3896,23 +4066,16 @@ impl RustUnitSummaries {
             }
             let spelling = segments.join("::");
             let root = segments[0].as_str();
+            let retained_keys = target_keys.get(&(pending.blob_id, pending.import_id));
             let is_local = matches!(root, "crate" | "self" | "super")
-                || conn.query_row(
-                    LOCAL_IMPORT_SQL,
-                    params![
-                        topology_id,
-                        pending.blob_id,
-                        pending.import_id,
-                        unit.unit_key.as_slice()
-                    ],
-                    |row| row.get::<_, bool>(0),
-                )?;
+                || retained_keys.is_some_and(|keys| keys.contains(&unit.unit_key));
             if is_local {
                 return Ok(());
             }
             let direct_key = dependency_keys_by_extern.get(root).copied();
-            let target_key =
-                import_target_key(conn, topology_id, pending.blob_id, pending.import_id)?;
+            let target_key = retained_keys
+                .filter(|keys| keys.len() == 1)
+                .and_then(|keys| keys.iter().next().copied());
             let dependency_key = direct_key.or(target_key);
             let dependency_ordinal =
                 dependency_key.and_then(|key| dependency_ordinals.get(&key).copied());
@@ -4064,24 +4227,6 @@ fn target_identity(
     .transpose()
 }
 
-fn import_target_key(
-    conn: &Connection,
-    topology_id: i64,
-    blob_id: i64,
-    import_id: i64,
-) -> Result<Option<[u8; 32]>> {
-    let mut statement = conn.prepare_cached(IMPORT_TARGET_KEYS_SQL)?;
-    let keys = statement
-        .query_map(params![topology_id, blob_id, import_id], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if keys.len() > 1 {
-        return Ok(None);
-    }
-    keys.into_iter().next().map(digest_from_row).transpose()
-}
-
 fn rust_namespace_code(namespace: &str) -> Result<i64> {
     let namespace = match namespace {
         "type" => ResolutionNamespace::Type,
@@ -4176,6 +4321,25 @@ fn digest_from_row(bytes: Vec<u8>) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| StoreError::corrupt(format!("digest is {} bytes", bytes.len())))
+}
+
+fn check_rust_summary_selection(conn: &Connection, snapshot: &WorkspaceSnapshotId) -> Result<()> {
+    let selected: Option<i64> = conn
+        .prepare_cached(
+            "SELECT revision FROM temp.selected_workspace_revisions
+         WHERE workspace_id = ?1 AND lang = 'rust' AND generation = ?2",
+        )?
+        .query_row(
+            params![snapshot.workspace_id.0, snapshot.generation.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if selected != Some(snapshot.revision) {
+        return Err(StoreError::stale_generation(format!(
+            "Rust workspace selection differs from snapshot {snapshot:?}: selected {selected:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl AnalyzerStore {
@@ -4428,21 +4592,58 @@ impl AnalyzerStore {
         let Some(snapshot) = snapshots.get("rust") else {
             return Ok(Vec::new());
         };
+        // The generation check and the rows must come from one snapshot, or a
+        // concurrent generation replacement could return a partial set.
         let mut conn = self.read_conn_for_workspace(snapshots)?;
         let tx = conn.transaction()?;
-        super::require_current_generation(&tx, "rust", snapshot.generation)?;
-        let mut statement = tx.prepare_cached(PACKAGE_ROWS_SQL)?;
+        let rows = Self::rust_summary_package_rows_on_connection(&tx, snapshot, None)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    #[doc(hidden)]
+    pub fn rust_summary_package_rows_for_unit(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit_key: &[u8; 32],
+    ) -> Result<Vec<RustSummaryPackageRow>> {
+        Self::rust_summary_package_rows_on_connection(conn, snapshot, Some(unit_key))
+    }
+
+    fn rust_summary_package_rows_on_connection(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit_key: Option<&[u8; 32]>,
+    ) -> Result<Vec<RustSummaryPackageRow>> {
+        super::require_current_generation(conn, "rust", snapshot.generation)?;
+        check_rust_summary_selection(conn, snapshot)?;
+        let sql = PACKAGE_ROWS_SQL.replace(
+            "/* UNIT_KEY_FILTER */",
+            if unit_key.is_some() {
+                "AND versions.unit_key = ?2"
+            } else {
+                ""
+            },
+        );
+        let mut statement = conn.prepare_cached(&sql)?;
+        let unit_key = unit_key.map(|key| key.as_slice());
         let raw_rows = statement
-            .query_map([RUST_UNIT_SUMMARY_DERIVATION_VERSION], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, bool>(5)?,
-                ))
-            })?
+            .query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(&RUST_UNIT_SUMMARY_DERIVATION_VERSION as &dyn rusqlite::ToSql)
+                        .chain(unit_key.as_ref().map(|key| key as &dyn rusqlite::ToSql)),
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut rows = Vec::with_capacity(raw_rows.len());
         for (rel_path, package_components, crate_name, target_kind, blob_oid, is_root_member) in
@@ -4477,7 +4678,6 @@ impl AnalyzerStore {
             });
         }
         drop(statement);
-        tx.commit()?;
         Ok(rows)
     }
 
@@ -4513,31 +4713,68 @@ impl AnalyzerStore {
         let Some(snapshot) = snapshots.get("rust") else {
             return Ok(Vec::new());
         };
+        // The generation check and the rows must come from one snapshot, or a
+        // concurrent generation replacement could return a partial set.
         let mut conn = self.read_conn_for_workspace(snapshots)?;
         let tx = conn.transaction()?;
-        super::require_current_generation(&tx, "rust", snapshot.generation)?;
-        let mut statement = tx.prepare_cached(CARGO_ROUTE_ROWS_SQL)?;
+        let rows = Self::rust_summary_cargo_route_rows_on_connection(&tx, snapshot, None)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    #[doc(hidden)]
+    pub fn rust_summary_cargo_route_rows_for_unit(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit_key: &[u8; 32],
+    ) -> Result<Vec<RustSummaryCargoRouteRow>> {
+        Self::rust_summary_cargo_route_rows_on_connection(conn, snapshot, Some(unit_key))
+    }
+
+    fn rust_summary_cargo_route_rows_on_connection(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+        unit_key: Option<&[u8; 32]>,
+    ) -> Result<Vec<RustSummaryCargoRouteRow>> {
+        super::require_current_generation(conn, "rust", snapshot.generation)?;
+        check_rust_summary_selection(conn, snapshot)?;
+        let sql = CARGO_ROUTE_ROWS_SQL.replace(
+            "/* UNIT_KEY_FILTER */",
+            if unit_key.is_some() {
+                "AND versions.unit_key = ?2"
+            } else {
+                ""
+            },
+        );
+        let mut statement = conn.prepare_cached(&sql)?;
+        let unit_key = unit_key.map(|key| key.as_slice());
         let raw_rows = statement
-            .query_map([RUST_UNIT_SUMMARY_DERIVATION_VERSION], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, bool>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                    row.get::<_, Option<Vec<u8>>>(11)?,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                    row.get::<_, Option<String>>(14)?,
-                    row.get::<_, Option<String>>(15)?,
-                ))
-            })?
+            .query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(&RUST_UNIT_SUMMARY_DERIVATION_VERSION as &dyn rusqlite::ToSql)
+                        .chain(unit_key.as_ref().map(|key| key as &dyn rusqlite::ToSql)),
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<Vec<u8>>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut rows = Vec::with_capacity(raw_rows.len());
         for (
@@ -4610,7 +4847,6 @@ impl AnalyzerStore {
             });
         }
         drop(statement);
-        tx.commit()?;
         Ok(rows)
     }
 }

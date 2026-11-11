@@ -116,14 +116,20 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [JS_TS_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, JS_TS])],
   [TOOLS, new Set([RUST_ANALYSIS, GO_ANALYSIS, CORE, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, CPP, GO, PHP, PYTHON, RUST, JVM_ANALYSIS])],
   [FLOW, new Set([CORE, ANALYSIS])],
-  // Query execution uses the C++, Python, JVM and JS/TS crates' structured
-  // grammar hooks. JS/TS property rules reuse the syntax and TypeScript object
+  // Query execution uses the C++, C#, Python, JVM and JS/TS crates' structured
+  // grammar hooks. C# XML documentation rules reuse the documentation and
+  // syntax hooks; JS/TS property rules reuse the syntax and TypeScript object
   // helpers; these language crates remain below analysis and depend on core.
-  [RQL, new Set([RUST_ANALYSIS, GO_ANALYSIS, TOOLS, CORE, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW, CPP, PYTHON, JVM, JS_TS, JVM_ANALYSIS])],
-  [POLICY, new Set([RUST_ANALYSIS, TOOLS, ANALYSIS, FLOW, RQL])],
+  [RQL, new Set([RUST_ANALYSIS, GO_ANALYSIS, TOOLS, CORE, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW, CPP, CSHARP, PYTHON, JVM, JS_TS, JVM_ANALYSIS])],
+  // Policy findings carry core's shared typed omission count through their
+  // report boundary, so policy reads the value directly instead of through a
+  // re-export. Core remains below policy, so the edge stays one-way.
+  [POLICY, new Set([CORE, RUST_ANALYSIS, TOOLS, ANALYSIS, FLOW, RQL])],
   [SEMANTIC_PACKS, new Set([RUST_ANALYSIS, GO_ANALYSIS, ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW, JVM_ANALYSIS])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
-  [MCP, new Set([TOOLS, ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
+  // The MCP service owns the warm process's core retention budget and passes
+  // it to every workspace build.
+  [MCP, new Set([CORE, TOOLS, ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
   [FACADE, new Set([RUST_ANALYSIS, GO_ANALYSIS, TOOLS, ANALYSIS, CPP_ANALYSIS, CSHARP_ANALYSIS, PHP_ANALYSIS, PYTHON_ANALYSIS, RUBY_ANALYSIS, JS_TS_ANALYSIS, FLOW, POLICY, RUNTIME, MCP, SEMANTIC_PACKS, RQL, JVM_ANALYSIS])],
   [RUST_ANALYSIS, new Set([CORE, SEMANTIC, ANALYSIS, RUST])],
 ]);

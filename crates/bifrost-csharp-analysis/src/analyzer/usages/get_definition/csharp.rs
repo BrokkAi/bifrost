@@ -132,6 +132,7 @@ use brokk_bifrost_csharp::graph::resolver::{
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::csharp_has_modifier;
 use brokk_bifrost_csharp::syntax::csharp_source_identifier;
+use brokk_bifrost_csharp::syntax::variable_declarator_initializer;
 use brokk_bifrost_csharp::syntax::{
     CSharpNamedArgumentLabel, csharp_arity_preserving_full_name,
     csharp_constant_pattern_type_candidate, csharp_implicit_accessor_value,
@@ -941,7 +942,7 @@ pub(crate) fn csharp_type_lookup_resolution_in_session(
     )
 }
 
-fn csharp_using_alias_definition(
+pub(crate) fn csharp_using_alias_definition(
     root: Node<'_>,
     source: &str,
     reference: &str,
@@ -1003,6 +1004,67 @@ fn csharp_navigable_using_alias_binding(
         return None;
     }
     csharp_using_alias_definition(root, source, reference)
+}
+
+/// The diagnostic that marks a C# member call published as a reduced-form
+/// call to a model-declared static extension method.
+const CSHARP_MODEL_EXTENSION_INVOCATION: &str = "csharp_model_extension_invocation";
+
+/// Publish the canonical identity of the one model extension method that
+/// extension lookup found for an external receiver (#8297), as an external
+/// member boundary like an external instance member's.
+///
+/// C# considers extension methods only when the receiver's type has no
+/// member of that name, so the receiver's external hierarchy must prove that
+/// absence. Several applicable owners in the nearest scope are an ambiguity,
+/// which publishes nothing. Like workspace extension lookup, this trusts the
+/// visible declarations of the imported namespaces to be all of them (#7531).
+fn publish_csharp_model_extension(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    site: &ResolvedReferenceSite,
+    receiver_type_names: &[String],
+    member: &str,
+    owners: &[String],
+    outcome: &mut DefinitionLookupOutcome,
+) {
+    let [owner] = owners else {
+        outcome.status = DefinitionLookupStatus::Ambiguous;
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "csharp_model_extension_ambiguous".to_owned(),
+            message: format!(
+                "C# extension `{member}` is declared by semantic models on {owners:?} in one scope"
+            ),
+        });
+        return;
+    };
+    let external = csharp.external_declarations(analyzer.semantic_model_overlay());
+    let instance_absent = receiver_type_names
+        .iter()
+        .filter(|receiver| external.declares_type(receiver))
+        .map(|receiver| external.hierarchy_lacks_member(receiver, member))
+        .reduce(|left, right| left && right)
+        .unwrap_or(false);
+    if !instance_absent {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "csharp_model_extension_receiver_open".to_owned(),
+            message: format!(
+                "receiver types {receiver_type_names:?} do not prove that no instance member `{member}` takes precedence over model extension `{owner}.{member}`"
+            ),
+        });
+        return;
+    }
+    outcome.reference = Some(ResolvedReferenceSite {
+        text: format!("{owner}.{member}"),
+        ..site.clone()
+    });
+    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        claim: None,
+        kind: CSHARP_MODEL_EXTENSION_INVOCATION.to_owned(),
+        message: format!("C# call to model extension method `{owner}.{member}` in reduced form"),
+    });
 }
 
 pub(crate) struct CSharpDefinitionResolution {
@@ -1116,7 +1178,17 @@ fn csharp_external_member_evidence(
     else {
         return CallEvidence::default();
     };
-    let proof = if is_static {
+    let extension_invocation = outcome
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == CSHARP_MODEL_EXTENSION_INVOCATION);
+    let proof = if extension_invocation {
+        assert!(is_static, "a C# extension method is static");
+        let Some(parameter_count) = parameter_count.checked_add(1) else {
+            return CallEvidence::default();
+        };
+        ExactExternalCallProof::csharp_extension_external_member(&owner, &member, parameter_count)
+    } else if is_static {
         ExactExternalCallProof::csharp_static_external_member(&owner, &member, parameter_count)
     } else {
         ExactExternalCallProof::csharp_bound_external_member(&owner, &member, parameter_count)
@@ -1918,6 +1990,8 @@ fn resolve_csharp_reference(
             // bases leave the workspace). An extension method is a candidate for
             // either, so the escalation is gated on "bound nothing", not on one
             // particular unresolved status.
+            let mut extension_open = None;
+            let mut model_extension_owners = Vec::new();
             if outcome.definitions.is_empty() && should_try_extensions {
                 let extensions = match definitions.session() {
                     Some(session) => csharp_visible_extension_method_candidates_in_session(
@@ -1946,28 +2020,80 @@ fn resolve_csharp_reference(
                         explicit_generic_arity,
                     ),
                 };
-                if !extensions.is_empty() {
-                    outcome = candidates_outcome(extensions);
+                extension_open = extensions.open;
+                model_extension_owners = extensions.model_owners;
+                if let Some(reason) = extensions.open {
+                    let open = brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen::content(
+                        reason,
+                        brokk_bifrost_semantic::analyzer::semantic_model::runtime::CSHARP_SEMANTIC_PACK_LANGUAGES,
+                    );
+                    analyzer.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                            format!("csharp extension lookup is open: {}", open.reason).into(),
+                        ),
+                    );
+                }
+                if !extensions.candidates.is_empty() {
+                    outcome = if extensions.open.is_some() {
+                        DefinitionLookupOutcome {
+                            status: DefinitionLookupStatus::Incomplete,
+                            definitions: extensions.candidates,
+                            modeled_definitions: Vec::new(),
+                            reference: None,
+                            lexical_definition: None,
+                            diagnostics: Vec::new(),
+                        }
+                    } else {
+                        candidates_outcome(extensions.candidates)
+                    };
+                    // A model extension in the same scope competes with the
+                    // workspace ones; neither is the better candidate by
+                    // visibility alone.
+                    if !model_extension_owners.is_empty() {
+                        outcome.status = DefinitionLookupStatus::Ambiguous;
+                        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                            claim: None,
+                            kind: "csharp_model_extension_ambiguous".to_owned(),
+                            message: format!(
+                                "C# extension `{member}` is also declared by semantic models on {model_extension_owners:?}"
+                            ),
+                        });
+                    }
                 }
             }
-            outcome = refine_csharp_invocation_overload(
-                analyzer,
-                token,
-                csharp,
-                definitions,
-                file,
-                source,
-                tree.root_node(),
-                name,
-                outcome,
-            );
+            if extension_open.is_none() {
+                outcome = refine_csharp_invocation_overload(
+                    analyzer,
+                    token,
+                    csharp,
+                    definitions,
+                    file,
+                    source,
+                    tree.root_node(),
+                    name,
+                    outcome,
+                );
+            }
+            // An open extension lookup may hide a nearer omitted extension, so no candidate
+            // is proven. Keep possible definitions under `Incomplete` and skip overload
+            // refinement, which would otherwise publish a selected trace row.
+            if let Some(reason) = extension_open {
+                outcome.status = DefinitionLookupStatus::Incomplete;
+                outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                    claim: None,
+                    kind: "csharp_extension_lookup_open".to_owned(),
+                    message: format!(
+                        "C# extension lookup for `{member}` is open ({reason}); the candidates are possible, not proven"
+                    ),
+                });
+            }
             if owners.is_empty() && !receiver_type_names.is_empty() {
                 // The authored extension identity can be known while ordinary
                 // member lookup remains incomplete. Keep that frontier even
                 // for a positive result: an unindexed instance member might
                 // take precedence over the applicable workspace extension.
                 // An empty answer here is a boundary, not an exact negative.
-                if outcome.definitions.is_empty() {
+                if outcome.definitions.is_empty() && extension_open.is_none() {
                     outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
                     outcome
                         .diagnostics
@@ -1997,6 +2123,7 @@ fn resolve_csharp_reference(
                 // names no candidate owner, or several, keeps the receiver
                 // spelling and publishes no identity.
                 if outcome.definitions.is_empty()
+                    && extension_open.is_none()
                     && let Some(canonical) = external_member_identity
                 {
                     outcome.reference = Some(ResolvedReferenceSite {
@@ -2006,6 +2133,19 @@ fn resolve_csharp_reference(
                         // rather than rebuilt from a node.
                         ..site.clone()
                     });
+                } else if outcome.definitions.is_empty()
+                    && extension_open.is_none()
+                    && !model_extension_owners.is_empty()
+                {
+                    publish_csharp_model_extension(
+                        analyzer,
+                        csharp,
+                        site,
+                        &receiver_type_names,
+                        member,
+                        &model_extension_owners,
+                        &mut outcome,
+                    );
                 }
             }
             outcome
@@ -3419,15 +3559,13 @@ fn csharp_reference_node<'tree>(
             || (parent.kind() == "conditional_access_expression"
                 && csharp_conditional_member_access(parent)
                     .is_some_and(|access| same_node(access.binding, current)))
+            // Only the subscript names the indexer. The indexed expression is
+            // its own reference: `Query` in `request.Query["x"]` is the
+            // property read, not the `IQueryCollection` indexer (#8307).
             || (parent.kind() == "element_access_expression"
-                && (parent
-                    .child_by_field_name("expression")
-                    .is_some_and(|expression| {
-                        same_node(expression, current) || same_node(expression, original)
-                    })
-                    || parent
-                        .child_by_field_name("subscript")
-                        .is_some_and(|subscript| same_node(subscript, current))))
+                && parent
+                    .child_by_field_name("subscript")
+                    .is_some_and(|subscript| same_node(subscript, current)))
             || (matches!(
                 parent.kind(),
                 "string_literal" | "character_literal" | "argument" | "bracketed_argument_list"
@@ -5938,6 +6076,21 @@ fn csharp_receiver_types(
             }
         }
     }
+    if receiver_types.fq_names.is_empty() {
+        receiver_types = csharp_external_receiver_base_types(
+            analyzer,
+            token,
+            csharp,
+            definitions,
+            file,
+            source,
+            root,
+            base,
+        );
+        if !definitions.observe_cancellation() {
+            return CSharpReceiverTypes::default();
+        }
+    }
 
     csharp_apply_receiver_transitions(
         analyzer,
@@ -5966,6 +6119,22 @@ fn csharp_apply_receiver_transitions(
     for transition in transitions {
         if receiver_types.fq_names.is_empty() || !definitions.scope_step() {
             return CSharpReceiverTypes::default();
+        }
+        // A receiver whose type no workspace declaration indexes crosses the
+        // member through the external declaration surface instead (#8299).
+        if receiver_types.units.is_empty() {
+            receiver_types = csharp_external_transition_types(
+                analyzer,
+                csharp,
+                definitions,
+                source,
+                &receiver_types.fq_names,
+                transition,
+            );
+            if !definitions.observe_cancellation() {
+                return CSharpReceiverTypes::default();
+            }
+            continue;
         }
         receiver_types = match *transition {
             CSharpReceiverTransition::Member { name, .. } => {
@@ -6000,6 +6169,322 @@ fn csharp_apply_receiver_transitions(
         }
     }
     receiver_types
+}
+
+/// The one type the value of `expression` has, as the receiver ladder types
+/// it: a workspace declaration, a declared external member's type, or the
+/// spelling of a typed binding. Several candidates answer nothing (#8299).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn csharp_expression_value_type(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+) -> Option<String> {
+    let definitions = CSharpDefinitionProvider::new(csharp, file);
+    let types = csharp_receiver_types(
+        analyzer,
+        token,
+        csharp,
+        &definitions,
+        file,
+        source,
+        root,
+        expression,
+    );
+    match types.fq_names.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Fold one transition over receiver type names that only an external surface
+/// declares: a member read takes the declared type of the external field or
+/// property, a call the return type of the external method of that arity.
+fn csharp_external_transition_types(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    source: &str,
+    receiver_type_names: &[String],
+    transition: &CSharpReceiverTransition<'_>,
+) -> CSharpReceiverTypes {
+    let (name, arity) = match *transition {
+        CSharpReceiverTransition::Member { name, .. } => (name, None),
+        CSharpReceiverTransition::Invocation { invocation, name } => (
+            name,
+            Some(csharp_argument_count_in_session(
+                invocation,
+                source,
+                definitions,
+            )),
+        ),
+    };
+    let mut types = CSharpReceiverTypes::default();
+    let Some(name) = csharp_member_name(name) else {
+        return types;
+    };
+    if let Some(value_type) = csharp.external_member_value_type(
+        analyzer.semantic_model_overlay(),
+        receiver_type_names,
+        csharp_node_text(name.identifier, source),
+        arity,
+    ) {
+        types.push_fq_name(definitions, value_type);
+    }
+    types.normalized()
+}
+
+/// The receiver types of a base expression that no workspace declaration
+/// types, read from the external declaration surface (#8299).
+///
+/// The base can name an external type for a static access (`Options` in
+/// `Options.Standard`), create an external object, or be a `var` local, whose
+/// type is its initializer's. A chain of `var` locals is unrolled here with an
+/// explicit stack of the transitions each initializer applies, so a long
+/// chain cannot exhaust the Rust stack. An answer is a set of candidate type
+/// names: the member step that consumes them keeps only an owner the external
+/// surface declares the member on.
+#[allow(clippy::too_many_arguments)]
+fn csharp_external_receiver_base_types<'tree>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    mut base: Node<'tree>,
+) -> CSharpReceiverTypes {
+    let mut pending = Vec::new();
+    let mut types = loop {
+        if !definitions.scope_step() {
+            return CSharpReceiverTypes::default();
+        }
+        match base.kind() {
+            "identifier" => {
+                let Some(initializer) = csharp_var_local_initializer(base, source) else {
+                    let mut types = CSharpReceiverTypes::default();
+                    let name = csharp_node_text(base, source);
+                    let shadowed = csharp_type_bindings_before_scoped(
+                        csharp,
+                        token,
+                        definitions,
+                        file,
+                        source,
+                        root,
+                        base.start_byte(),
+                    )
+                    .is_shadowed(name);
+                    if !shadowed
+                        && let Some(type_node) =
+                            csharp_enclosing_member_type_node(base, name, source)
+                    {
+                        for name in csharp_structured_receiver_reference_type_names(
+                            token,
+                            definitions,
+                            file,
+                            source,
+                            type_node,
+                            &csharp_reference_type_text(type_node, source),
+                        ) {
+                            types.push_fq_name(definitions, name);
+                        }
+                        break types;
+                    }
+                    for name in csharp_unindexed_type_qualifier_names(
+                        analyzer,
+                        token,
+                        csharp,
+                        definitions,
+                        file,
+                        source,
+                        root,
+                        base,
+                    ) {
+                        types.push_fq_name(definitions, name);
+                    }
+                    break types;
+                };
+                let Some(program) = csharp_receiver_program(definitions, initializer) else {
+                    return CSharpReceiverTypes::default();
+                };
+                let CSharpReceiverBase::Expression(next) = program.base else {
+                    return CSharpReceiverTypes::default();
+                };
+                pending.push(program.transitions);
+                let types = csharp_receiver_base_types(
+                    analyzer,
+                    token,
+                    csharp,
+                    definitions,
+                    file,
+                    source,
+                    root,
+                    next,
+                );
+                if !types.fq_names.is_empty() {
+                    break types;
+                }
+                base = next;
+            }
+            "object_creation_expression" => {
+                let mut types = CSharpReceiverTypes::default();
+                if let Some(type_node) = base.child_by_field_name("type") {
+                    for name in csharp_structured_receiver_reference_type_names(
+                        token,
+                        definitions,
+                        file,
+                        source,
+                        type_node,
+                        &csharp_reference_type_text(type_node, source),
+                    ) {
+                        types.push_fq_name(definitions, name);
+                    }
+                }
+                break types;
+            }
+            _ => return CSharpReceiverTypes::default(),
+        }
+    };
+    while let Some(transitions) = pending.pop() {
+        types = csharp_apply_receiver_transitions(
+            analyzer,
+            token,
+            csharp,
+            definitions,
+            file,
+            source,
+            types.normalized(),
+            &transitions,
+        );
+    }
+    types.normalized()
+}
+
+/// The declared type node of the field or property named `name` that the
+/// innermost type declaration enclosing `reference` declares in this file.
+/// That type's own member is the nearest one a bare name binds once no local
+/// or parameter shadows it, so a member inherited from a base or declared by
+/// an outer type is never chosen here. More than one declaration of the name
+/// answers nothing.
+fn csharp_enclosing_member_type_node<'tree>(
+    reference: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut scope = reference.parent();
+    let owner = loop {
+        let current = scope?;
+        if matches!(
+            current.kind(),
+            "class_declaration" | "struct_declaration" | "record_declaration"
+        ) {
+            break current;
+        }
+        scope = current.parent();
+    };
+    let body = owner.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let mut found = None;
+    for member in body.named_children(&mut cursor) {
+        let type_node = match member.kind() {
+            "field_declaration" => member
+                .named_children(&mut member.walk())
+                .find(|child| child.kind() == "variable_declaration")
+                .filter(|declaration| {
+                    declaration
+                        .named_children(&mut declaration.walk())
+                        .any(|declarator| {
+                            declarator.kind() == "variable_declarator"
+                                && declarator
+                                    .child_by_field_name("name")
+                                    .is_some_and(|node| csharp_node_text(node, source) == name)
+                        })
+                })
+                .and_then(|declaration| declaration.child_by_field_name("type")),
+            "property_declaration" => member
+                .child_by_field_name("name")
+                .filter(|node| csharp_node_text(*node, source) == name)
+                .and_then(|_| member.child_by_field_name("type")),
+            _ => None,
+        };
+        if let Some(type_node) = type_node {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(type_node);
+        }
+    }
+    found
+}
+
+/// The initializer of the implicitly typed (`var`) local that `reference`
+/// names, when the nearest declaration of that name before it in its
+/// callable is such a local. A typed local, a parameter or a member answers
+/// nothing: their types come from their declarations.
+fn csharp_var_local_initializer<'tree>(
+    reference: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let name = csharp_node_text(reference, source);
+    let mut scope = reference.parent();
+    while let Some(current) = scope {
+        if matches!(
+            current.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "destructor_declaration"
+                | "operator_declaration"
+                | "conversion_operator_declaration"
+                | "accessor_declaration"
+                | "local_function_statement"
+                | "lambda_expression"
+                | "anonymous_method_expression"
+                | "class_declaration"
+                | "struct_declaration"
+                | "record_declaration"
+                | "compilation_unit"
+        ) {
+            return None;
+        }
+        if current.kind() == "block" {
+            let mut cursor = current.walk();
+            let mut nearest = None;
+            for statement in current.named_children(&mut cursor) {
+                if statement.start_byte() >= reference.start_byte() {
+                    break;
+                }
+                if statement.kind() != "local_declaration_statement" {
+                    continue;
+                }
+                let Some(declaration) = statement.named_child(0) else {
+                    continue;
+                };
+                let mut declarators = declaration.walk();
+                for declarator in declaration.named_children(&mut declarators) {
+                    if declarator.kind() == "variable_declarator"
+                        && declarator
+                            .child_by_field_name("name")
+                            .is_some_and(|node| csharp_node_text(node, source) == name)
+                    {
+                        nearest = Some((declaration, declarator));
+                    }
+                }
+            }
+            if let Some((declaration, declarator)) = nearest {
+                return declaration
+                    .child_by_field_name("type")
+                    .filter(|ty| ty.kind() == "implicit_type")
+                    .and_then(|_| variable_declarator_initializer(declarator));
+            }
+        }
+        scope = current.parent();
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6042,11 +6527,28 @@ fn csharp_receiver_base_types(
                     receiver.start_byte(),
                 );
                 let mut receiver_types = CSharpReceiverTypes::default();
-                // Both forms are pushed as the fq name they carry, which is
-                // what this shadowed-binding fallback already did; only the
-                // resolved form is now typed as one.
-                if let Some(declared) = first_precise(&legacy, name) {
-                    receiver_types.push_fq_name(definitions, declared.as_type_name().to_string());
+                // A resolved form is the fq name it carries. A spelling names
+                // what the receiver site's namespace and `using` scopes can
+                // make of it, as for a direct receiver, so a member chain on a
+                // value of an external type (`mvc.Formatters.Add`) reaches the
+                // owner the external surface declares (#8299).
+                match first_precise(&legacy, name) {
+                    Some(CSharpDeclaredType::Resolved { fqn }) => {
+                        receiver_types.push_fq_name(definitions, fqn);
+                    }
+                    Some(CSharpDeclaredType::Spelling(spelling)) => {
+                        for name in csharp_structured_receiver_reference_type_names(
+                            token,
+                            definitions,
+                            file,
+                            source,
+                            receiver,
+                            &spelling,
+                        ) {
+                            receiver_types.push_fq_name(definitions, name);
+                        }
+                    }
+                    None => {}
                 }
                 receiver_types
             } else {
@@ -6192,6 +6694,15 @@ fn csharp_receiver_base_is_shadowed(
 /// the workspace does not index, which is the same frontier
 /// `csharp_receiver_type_unindexed` publishes for receivers whose type was
 /// read but not indexed (#3466).
+///
+/// A dotted qualifier such as `Serializer.Typeless` names a type only through
+/// its head: C# binds the leftmost identifier by the same ladder and reads
+/// each later segment as a member type of what the head named. The head's
+/// candidate names therefore carry the written nested segments, so a `using`
+/// or alias reaches a nested external type exactly as it reaches a top-level
+/// one (#8298). Unlike a bare identifier, a later segment can just as well be
+/// a static field or property (`Console.Out`), so only a candidate that the
+/// external declaration surface declares as a type survives.
 #[allow(clippy::too_many_arguments)]
 fn csharp_unindexed_type_qualifier_names(
     analyzer: &dyn IAnalyzer,
@@ -6203,6 +6714,23 @@ fn csharp_unindexed_type_qualifier_names(
     root: Node<'_>,
     receiver: Node<'_>,
 ) -> Vec<String> {
+    let mut nested = Vec::new();
+    let mut head = receiver;
+    while head.kind() == "member_access_expression" {
+        let (Some(segment), Some(qualifier)) = (
+            csharp_member_access_name(head),
+            csharp_member_access_receiver(head),
+        ) else {
+            return Vec::new();
+        };
+        if segment.kind() != "identifier" {
+            return Vec::new();
+        }
+        nested.push(csharp_node_text(segment, source));
+        head = qualifier;
+    }
+    nested.reverse();
+    let receiver = head;
     if receiver.kind() != "identifier" || !definitions.scope_step() {
         return Vec::new();
     }
@@ -6230,17 +6758,27 @@ fn csharp_unindexed_type_qualifier_names(
             return Vec::new();
         }
     }
-    csharp_structured_receiver_reference_type_names(
+    let heads = csharp_structured_receiver_reference_type_names(
         token,
         definitions,
         file,
         source,
         receiver,
         name,
-    )
+    );
+    if nested.is_empty() {
+        return heads;
+    }
+    let nested = nested.join(".");
+    let external = csharp.external_declarations(analyzer.semantic_model_overlay());
+    heads
+        .into_iter()
+        .map(|head| format!("{head}.{nested}"))
+        .filter(|candidate| external.declares_type(candidate))
+        .collect()
 }
 
-fn canonical_csharp_predefined_type(reference: &str) -> Option<&'static str> {
+pub(crate) fn canonical_csharp_predefined_type(reference: &str) -> Option<&'static str> {
     match reference {
         "bool" => Some("System.Boolean"),
         "byte" => Some("System.Byte"),

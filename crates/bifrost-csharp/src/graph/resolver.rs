@@ -3,6 +3,7 @@ use crate::graph::CSharpGraphSource;
 use crate::graph::extractor::member_access_name;
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
+use crate::namespace_regions::CSharpFileScopedNamespaces;
 pub use crate::syntax::csharp_identifier_text as node_text;
 use crate::syntax::{
     CSharpMemberName, CSharpRelationalGenericCall, csharp_arity_preserving_full_name,
@@ -1644,7 +1645,11 @@ fn extension_invocation_return_type_fq_name_inner(
         usage,
         session,
     );
-    unique_candidate_return_type(candidates, session, |unit| {
+    if let Some(reason) = candidates.open {
+        csharp.record_pack_open(reason);
+        return None;
+    }
+    unique_candidate_return_type(candidates.candidates, session, |unit| {
         CandidateReturnType::Resolved(callable_return_type_fq_name(
             csharp,
             token,
@@ -3449,6 +3454,7 @@ fn extension_method_receiver_type_in_session(
     extension_method_receiver_type_inner(graph, csharp, token, unit, false, Some(session))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CSharpExtensionReceiver {
     Any,
     Exact(String),
@@ -3536,9 +3542,9 @@ pub(super) fn extension_visibility_site_key(site: Node<'_>) -> (usize, usize) {
         }
         root = parent;
     }
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor)
-        .find(|child| child.kind() == "file_scoped_namespace_declaration")
+    CSharpFileScopedNamespaces::from_root(root, || true)
+        .expect("an unbounded walk completes")
+        .first()
         .map_or((root.start_byte(), root.end_byte()), |namespace| {
             (namespace.start_byte(), namespace.end_byte())
         })
@@ -3945,6 +3951,41 @@ fn parameter_type_is_workspace_interface(
     .unwrap_or(false)
 }
 
+/// Extension candidates and a deterministic open pack-family reason, if any.
+///
+/// `model_owners` names, sorted, the declaring static classes of applicable
+/// extension methods that an active semantic model declares in the same
+/// nearest scope as `candidates`. A model method has no workspace
+/// declaration, so its owner is the identity the caller can publish.
+#[derive(Debug)]
+pub struct ExtensionCandidates {
+    pub candidates: Vec<CodeUnit>,
+    pub model_owners: Vec<String>,
+    pub open: Option<&'static str>,
+}
+
+/// One static extension method that an active C# semantic model declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CSharpModelExtensionMethod {
+    /// The declaring static class.
+    pub owner_fqn: String,
+    /// The type of the `this` parameter.
+    pub receiver: CSharpExtensionReceiver,
+    /// Declared parameters, the receiver included, that a call must supply.
+    pub required_parameters: usize,
+    /// Declared parameters, the receiver included; `None` with a `params` array.
+    pub max_parameters: Option<usize>,
+    pub generic_arity: usize,
+}
+
+/// The model extension methods of one name, and why the model read could not
+/// enumerate them all, if it could not.
+#[derive(Debug, Default)]
+pub struct CSharpModelExtensionMethods {
+    pub methods: Vec<CSharpModelExtensionMethod>,
+    pub open: Option<&'static str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn visible_extension_method_candidates(
     csharp: &dyn CSharpSource,
@@ -3957,7 +3998,7 @@ pub fn visible_extension_method_candidates(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-) -> Vec<CodeUnit> {
+) -> ExtensionCandidates {
     visible_extension_method_candidates_inner(
         csharp,
         token,
@@ -3986,7 +4027,7 @@ pub fn visible_extension_method_candidates_in_session(
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
     session: &ResolutionSession,
-) -> Vec<CodeUnit> {
+) -> ExtensionCandidates {
     visible_extension_method_candidates_inner(
         csharp,
         token,
@@ -4013,7 +4054,7 @@ pub(super) fn usage_visible_extension_method_candidates(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-) -> Vec<CodeUnit> {
+) -> ExtensionCandidates {
     visible_extension_method_candidates_inner(
         csharp,
         token,
@@ -4042,11 +4083,16 @@ fn visible_extension_method_candidates_inner(
     explicit_generic_arity: Option<usize>,
     usage: bool,
     session: Option<&ResolutionSession>,
-) -> Vec<CodeUnit> {
+) -> ExtensionCandidates {
+    let mut open = None;
     let compatible_receiver_types =
         compatible_receiver_type_names(csharp, token, graph, receiver_type_names, usage, session);
     if !usage && compatible_receiver_types.is_empty() {
-        return Vec::new();
+        return ExtensionCandidates {
+            candidates: Vec::new(),
+            model_owners: Vec::new(),
+            open,
+        };
     }
     let builtin_value_arguments = CSharpBuiltinValueArguments::at_site(site, source);
     let scopes = extension_visibility_scopes(csharp, token, source, site, usage, session);
@@ -4074,7 +4120,11 @@ fn visible_extension_method_candidates_inner(
     };
     for unit in named {
         if !resolution_scope_step(session) {
-            return Vec::new();
+            return ExtensionCandidates {
+                candidates: Vec::new(),
+                model_owners: Vec::new(),
+                open,
+            };
         }
         if unit.is_function() && unit.identifier() == member {
             named_candidates.push(unit);
@@ -4096,22 +4146,59 @@ fn visible_extension_method_candidates_inner(
     // records the site as unproven rather than proving or disclaiming one.
     let receiver_is_untyped = usage && compatible_receiver_types.is_empty();
     let mut untyped_receiver_candidates = Vec::new();
+    // Every scope set includes the global namespace, and no index answers which static classes
+    // of a namespace have an open surface. While a Fenced pack is active, namespace-visible
+    // extension lookup is therefore open (#10291 restores precision).
+    if csharp.fenced_pack_active() {
+        open = open.or(Some(
+            "csharp fenced pack is active, so namespace-visible extension owners are not enumerable",
+        ));
+    }
+    // A semantic model can declare an extension method that no workspace
+    // declaration backs (#8297). Only an invocation can apply one, and only
+    // the forward walk can name it, so the usage walk reads none.
+    let model_extensions = if usage || call_arity.is_none() {
+        CSharpModelExtensionMethods::default()
+    } else {
+        csharp.model_extension_methods(member)
+    };
+    open = open.or(model_extensions.open);
     for scope in scopes {
         if !resolution_scope_step(session) {
-            return Vec::new();
+            return ExtensionCandidates {
+                candidates: Vec::new(),
+                model_owners: Vec::new(),
+                open,
+            };
         }
         let mut candidates = Vec::new();
         for unit in &named_candidates {
             if !resolution_scope_step(session) {
-                return Vec::new();
+                return ExtensionCandidates {
+                    candidates: Vec::new(),
+                    model_owners: Vec::new(),
+                    open,
+                };
             }
             if scope.namespaces.contains(unit.package_name()) {
+                let mut path = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                    Language::CSharp,
+                    &unit.fq_name(),
+                );
+                path.pop();
+                open = open.or(csharp.pack_open_reason(&path.join("."), Some(member)));
                 candidates.push(unit.clone());
             }
         }
         for owner_fqn in &scope.static_owner_fqns {
+            let owner_open = csharp.pack_open_reason(owner_fqn, Some(member));
+            open = open.or(owner_open);
             if !resolution_scope_step(session) {
-                return Vec::new();
+                return ExtensionCandidates {
+                    candidates: Vec::new(),
+                    model_owners: Vec::new(),
+                    open,
+                };
             }
             let static_candidates = if usage {
                 resolution_query_rows(session, || {
@@ -4140,7 +4227,11 @@ fn visible_extension_method_candidates_inner(
             };
             for unit in static_candidates {
                 if !resolution_scope_step(session) {
-                    return Vec::new();
+                    return ExtensionCandidates {
+                        candidates: Vec::new(),
+                        model_owners: Vec::new(),
+                        open,
+                    };
                 }
                 if unit.is_function() && unit.identifier() == member {
                     candidates.push(unit);
@@ -4152,7 +4243,11 @@ fn visible_extension_method_candidates_inner(
         let mut filtered = Vec::new();
         for unit in candidates {
             if !resolution_scope_step(session) {
-                return Vec::new();
+                return ExtensionCandidates {
+                    candidates: Vec::new(),
+                    model_owners: Vec::new(),
+                    open,
+                };
             }
             if explicit_generic_arity.is_some_and(|arity| {
                 method_generic_arity_for_unit(csharp, &unit, session) != Some(arity)
@@ -4167,7 +4262,11 @@ fn visible_extension_method_candidates_inner(
                 extension_method_receiver_type(graph, csharp, token, &unit)
             };
             if session.is_some_and(|session| !session.observe_cancellation()) {
-                return Vec::new();
+                return ExtensionCandidates {
+                    candidates: Vec::new(),
+                    model_owners: Vec::new(),
+                    open,
+                };
             }
             let Some(receiver) = receiver else {
                 continue;
@@ -4203,7 +4302,11 @@ fn visible_extension_method_candidates_inner(
                 continue;
             }
             if session.is_some_and(|session| !session.observe_cancellation()) {
-                return Vec::new();
+                return ExtensionCandidates {
+                    candidates: Vec::new(),
+                    model_owners: Vec::new(),
+                    open,
+                };
             }
             filtered.push(unit);
         }
@@ -4214,12 +4317,20 @@ fn visible_extension_method_candidates_inner(
                     untyped_receiver_candidates.extend(candidates);
                     continue;
                 }
-                return candidates;
+                return ExtensionCandidates {
+                    candidates,
+                    model_owners: Vec::new(),
+                    open,
+                };
             }
             continue;
         };
         let Some(declared_arity) = call_arity.checked_add(1) else {
-            return Vec::new();
+            return ExtensionCandidates {
+                candidates: Vec::new(),
+                model_owners: Vec::new(),
+                open,
+            };
         };
         let applicable = candidates
             .iter()
@@ -4230,12 +4341,24 @@ fn visible_extension_method_candidates_inner(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if !applicable.is_empty() {
+        let model_owners = applicable_model_extension_owners(
+            &model_extensions.methods,
+            &scope,
+            &compatible_receiver_types,
+            declared_arity,
+            explicit_generic_arity,
+        );
+        if !applicable.is_empty() || !model_owners.is_empty() {
             if receiver_is_untyped {
+                debug_assert!(model_owners.is_empty(), "the usage walk reads no models");
                 untyped_receiver_candidates.extend(applicable);
                 continue;
             }
-            return applicable;
+            return ExtensionCandidates {
+                candidates: applicable,
+                model_owners,
+                open,
+            };
         }
         // A declaration whose parameter list cannot accept this argument list is
         // not the target -- the same verdict #1797 made the ordinary member walk
@@ -4250,7 +4373,54 @@ fn visible_extension_method_candidates_inner(
     }
     untyped_receiver_candidates.sort();
     untyped_receiver_candidates.dedup();
-    untyped_receiver_candidates
+    ExtensionCandidates {
+        candidates: untyped_receiver_candidates,
+        model_owners: Vec::new(),
+        open,
+    }
+}
+
+/// The owners of the model extension methods that this scope makes visible
+/// and that accept the receiver and `declared_arity` arguments, the receiver
+/// included. These are the same visibility, receiver and arity gates the
+/// workspace candidates of the scope pass.
+fn applicable_model_extension_owners(
+    methods: &[CSharpModelExtensionMethod],
+    scope: &CSharpExtensionScope,
+    compatible_receiver_types: &HashSet<String>,
+    declared_arity: usize,
+    explicit_generic_arity: Option<usize>,
+) -> Vec<String> {
+    let mut owners = methods
+        .iter()
+        .filter(|method| {
+            let mut namespace = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                Language::CSharp,
+                &method.owner_fqn,
+            );
+            namespace.pop();
+            (scope.namespaces.contains(&namespace.join("."))
+                || scope.static_owner_fqns.contains(&method.owner_fqn))
+                && explicit_generic_arity.is_none_or(|arity| arity == method.generic_arity)
+                && method.required_parameters <= declared_arity
+                && method
+                    .max_parameters
+                    .is_none_or(|max| declared_arity <= max)
+                && match &method.receiver {
+                    CSharpExtensionReceiver::Any => true,
+                    CSharpExtensionReceiver::Exact(receiver) => {
+                        let receiver = csharp_normalize_full_name(receiver);
+                        compatible_receiver_types
+                            .iter()
+                            .any(|candidate| type_identity_matches(candidate, &receiver))
+                    }
+                }
+        })
+        .map(|method| method.owner_fqn.clone())
+        .collect::<Vec<_>>();
+    owners.sort();
+    owners.dedup();
+    owners
 }
 
 fn extension_visibility_scopes(
@@ -4316,9 +4486,9 @@ fn extension_visibility_scopes(
     }
 
     let file_scoped_declaration = if namespace_nodes.is_empty() {
-        let mut cursor = root.walk();
-        root.named_children(&mut cursor)
-            .find(|child| child.kind() == "file_scoped_namespace_declaration")
+        CSharpFileScopedNamespaces::from_root(root, || true)
+            .expect("an unbounded walk completes")
+            .first()
     } else {
         None
     };
@@ -4378,7 +4548,7 @@ fn extension_visibility_scopes(
             })
         },
         || {
-            if usage {
+            let mut owners: Vec<String> = if usage {
                 csharp
                     .usage_global_static_using_types()
                     .iter()
@@ -4390,7 +4560,17 @@ fn extension_visibility_scopes(
                     .iter()
                     .map(CodeUnit::fq_name)
                     .collect()
-            }
+            };
+            // The resolved units omit a pack-only owner. The unresolved names (the bounded
+            // path above returns them as-is) keep it, so its fence is still checked.
+            owners.extend(
+                csharp
+                    .global_static_using_type_names()
+                    .iter()
+                    .filter(|name| csharp.fenced_pack_owner_exists(name))
+                    .cloned(),
+            );
+            owners
         },
     );
     compilation_scope
@@ -4493,7 +4673,7 @@ fn collect_scope_using_directives(
         }
         if csharp_using_directive_is_static(directive) {
             if let Some(target) = csharp_using_directive_target(directive, source)
-                && let Some(owner) = namespace_relative_names(resolution_namespace, &target)
+                && let Some(owner_fqn) = namespace_relative_names(resolution_namespace, &target)
                     .into_iter()
                     .find_map(|candidate| {
                         if !resolution_scope_step(session) {
@@ -4504,15 +4684,22 @@ fn collect_scope_using_directives(
                                 class_unit_for_fq_name(csharp, token, &candidate)
                             })
                             .flatten()
+                            .map(|owner| owner.fq_name())
                         } else {
                             resolution_query(session, || {
                                 forward_class_unit_for_fq_name(csharp, &candidate)
                             })
                             .flatten()
+                            .map(|owner| owner.fq_name())
                         }
+                        .or_else(|| {
+                            csharp
+                                .fenced_pack_owner_exists(&candidate)
+                                .then_some(candidate)
+                        })
                     })
             {
-                scope.static_owner_fqns.insert(owner.fq_name());
+                scope.static_owner_fqns.insert(owner_fqn);
             }
         } else if let Some(target) = csharp_using_directive_namespace(directive, source) {
             let namespace = namespace_relative_names(resolution_namespace, &target)

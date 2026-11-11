@@ -7,18 +7,30 @@ use crate::syntax::{
 impl Producer<'_, '_> {
     pub(super) fn using(&mut self, node: Node<'_>, ctx: Context) {
         let site = self.site(node, ctx.scope, ResolutionSiteKind::ImportDeclaration);
+        let is_global = csharp_using_directive_is_global(node);
         let alias = node.child_by_field_name("name");
         let Some(parts) = csharp_using_directive_target_node(node).and_then(|n| self.path(n))
         else {
-            self.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
+            let site = self.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
+            if is_global {
+                self.facts.add_reference_enumeration_gap(
+                    site,
+                    ResolutionGapKind::CompilationImportsUnenumerated,
+                );
+            }
             return;
         };
         if parts.is_empty() {
-            self.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
+            let site = self.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
+            if is_global {
+                self.facts.add_reference_enumeration_gap(
+                    site,
+                    ResolutionGapKind::CompilationImportsUnenumerated,
+                );
+            }
             return;
         }
         let is_static = csharp_using_directive_is_static(node);
-        let is_global = csharp_using_directive_is_global(node);
         let names = parts
             .iter()
             .map(|&part| self.name(part))
@@ -50,11 +62,10 @@ impl Producer<'_, '_> {
         self.facts.root_imports.push(ResolutionRootImportFact {
             site,
             root_scope: ctx.scope,
-            anchor: if csharp_using_directive_target_node(node).is_some_and(Self::absolute_path) {
-                ResolutionRootImportAnchor::Absolute
-            } else {
-                ResolutionRootImportAnchor::Lexical
-            },
+            anchor: Self::path_anchor(
+                csharp_using_directive_target_node(node).expect("validated using target"),
+                self.source,
+            ),
             position: None,
         });
         if is_global {

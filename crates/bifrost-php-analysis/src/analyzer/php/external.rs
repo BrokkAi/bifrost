@@ -55,6 +55,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::producer::ExternalArtifact
 
 use brokk_bifrost_analysis::analyzer::semantic_model::MemberFact;
 
+use brokk_bifrost_analysis::analyzer::semantic_model::MemberKind;
+
 use brokk_bifrost_analysis::analyzer::semantic_model::NameSelector;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::Producer;
@@ -275,7 +277,7 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     bifrost: None,
                     toolchains: Vec::new(),
                 },
-                provenance: Provenance { source, revision },
+                provenance: Provenance { rust_artifact_approximation: None, source, revision },
                 license: "NOASSERTION".to_owned(),
                 completeness,
                 safety: Safety {
@@ -285,6 +287,9 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.external".to_owned(),
                     activation,
@@ -494,6 +499,9 @@ schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.external".to_owned(),
                     activation,
@@ -651,6 +659,14 @@ impl PhpDeclarationStubPackProducer {
                         dropped.push(fact.id.clone());
                         None
                     } else {
+                        let mut fact = fact;
+                        // PHP cannot overload or redeclare a function, and a
+                        // stub describes the runtime that defines it, so one
+                        // builtin function is its whole callable family. A
+                        // workspace function of the same name in a namespace
+                        // has a different owner, so this claim does not stop
+                        // an unqualified call there from binding to it.
+                        fact.callable_family_complete = fact.member_kind == MemberKind::Function;
                         Some(fact)
                     }
                 },
@@ -768,6 +784,9 @@ schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.php.builtin".to_owned(),
                     activation,
@@ -1315,6 +1334,7 @@ mod declaration_stub_tests {
                 artifact_sha256: None,
             }],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "test".to_owned(),
                 revision: None,
             },
@@ -1418,6 +1438,10 @@ namespace {
 
         let prepare = produced.member_named("PDO", "prepare");
         assert_eq!(prepare.member_kind, MemberKind::Method);
+        assert!(
+            !prepare.callable_family_complete,
+            "a stub method makes no claim about overrides or other owners"
+        );
         let signature = prepare
             .signature
             .as_ref()
@@ -1450,6 +1474,10 @@ namespace {
             "substr",
         );
         assert_eq!(substr.member_kind, MemberKind::Function);
+        assert!(
+            substr.callable_family_complete,
+            "PHP cannot overload or redeclare a function, so a builtin is its whole family"
+        );
         assert_eq!(
             substr.signature.as_ref().unwrap().parameters.len(),
             3,

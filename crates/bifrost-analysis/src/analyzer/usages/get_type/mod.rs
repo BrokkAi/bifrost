@@ -129,7 +129,7 @@ pub fn exact_semantic_model_type_outcome(
     target_kind: TypeLookupTargetKind,
 ) -> Option<TypeLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
-    let matched = overlay.symbols_named(fqn);
+    let matched = overlay.symbols_named_for(fqn, language.config_label());
     let matched_record_count = matched.records.len();
     let records = matched
         .records
@@ -179,7 +179,10 @@ pub fn exact_semantic_model_type_outcome(
 pub fn resolve_type_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
-) -> Vec<TypeLookupOutcome> {
+) -> Vec<(
+    TypeLookupOutcome,
+    Option<crate::analyzer::QueryReadIncomplete>,
+)> {
     resolve_type_batch_with_budget(analyzer, requests, INTERACTIVE_TYPE_LOOKUP_BUDGET)
 }
 
@@ -188,11 +191,18 @@ pub fn resolve_type_batch_with_budget(
     analyzer: &dyn IAnalyzer,
     requests: Vec<TypeLookupRequest>,
     budget: ReceiverAnalysisBudget,
-) -> Vec<TypeLookupOutcome> {
+) -> Vec<(
+    TypeLookupOutcome,
+    Option<crate::analyzer::QueryReadIncomplete>,
+)> {
     let mut context = TypeBatchContext::new(analyzer);
     requests
         .into_iter()
-        .map(|request| resolve_one(analyzer, &mut context, request, budget))
+        .map(|request| {
+            let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+            let outcome = resolve_one(analyzer, &mut context, request, budget);
+            (outcome, scope.read_completion().err())
+        })
         .collect()
 }
 
@@ -249,11 +259,26 @@ impl<'a> TypeBatchContext<'a> {
             .clone()
     }
 
-    fn tree(&mut self, file: &ProjectFile, language: Language, source: &str) -> Option<Tree> {
-        self.trees
-            .entry((file.clone(), language))
-            .or_insert_with(|| parse_tree_for_type_lookup(file, language, source))
-            .clone()
+    fn tree(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        language: Language,
+        source: &str,
+    ) -> Option<Tree> {
+        let key = (file.clone(), language);
+        if let Some(tree) = self.trees.get(&key) {
+            return tree.clone();
+        }
+        match crate::analyzer::common::complete_query_cache_fill(analyzer, || {
+            parse_tree_for_type_lookup(file, language, source)
+        }) {
+            Ok(tree) => {
+                self.trees.insert(key, tree.clone());
+                tree
+            }
+            Err(tree) => tree,
+        }
     }
 }
 
@@ -277,7 +302,7 @@ fn resolve_one<'a>(
     let tree = if request.source.is_some() {
         parse_tree_for_type_lookup(&file, language, &source)
     } else {
-        context.tree(&file, language, &source)
+        context.tree(analyzer, &file, language, &source)
     };
     let site = match resolve_reference_site(
         &request.as_source_location(),
@@ -310,7 +335,8 @@ fn resolve_one<'a>(
     )
 }
 
-fn finish_bounded_resolution(
+#[doc(hidden)]
+pub fn finish_bounded_resolution(
     resolution: Option<BoundedResolution<TypeLookupOutcome>>,
     language: Language,
     site: ResolvedReferenceSite,
@@ -335,6 +361,11 @@ fn finish_bounded_resolution(
                  the result is incomplete, not a proven absence of a type",
                 limit.as_str()
             ),
+        ),
+        BoundedResolution::Unavailable { reason, .. } => diagnostic_outcome(
+            TypeLookupStatus::Unavailable,
+            "resolution_input_unavailable",
+            format!("bounded type resolution input unavailable: {reason}"),
         ),
         BoundedResolution::Cancelled { .. } => diagnostic_outcome(
             TypeLookupStatus::Cancelled,

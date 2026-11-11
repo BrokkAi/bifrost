@@ -106,6 +106,8 @@ use crate::analyzer::semantic_model::ReceiverFact;
 use crate::analyzer::semantic_model::RelationFact;
 
 use crate::analyzer::semantic_model::RelationKind;
+use crate::analyzer::semantic_model::{RustExternalReexport, RustExternalReexportTarget};
+use brokk_bifrost_semantic::analyzer::semantic_model::model::RustReexportTargetNamespace;
 
 use crate::analyzer::semantic_model::Signature;
 
@@ -141,6 +143,29 @@ use brokk_bifrost_core::hash::HashSet;
 
 const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
 const RUSTDOC_FORMAT_VERSION: u32 = 61;
+const RUSTDOC_PRODUCER_CONTRACT: &str = "rustdoc-json-pack-producer/1";
+/// The highest authored schema this Rustdoc producer may write.
+pub(crate) const RUSTDOC_PACK_MAX_SCHEMA_VERSION: u32 =
+    brokk_bifrost_semantic::analyzer::semantic_model::ALIAS_TARGET_MIN_SCHEMA_VERSION;
+
+fn assert_pack_schema_within_producer_max(pack: Option<&AuthoredSemanticModelPack>) {
+    if let Some(pack) = pack {
+        assert!(
+            pack.schema_version <= RUSTDOC_PACK_MAX_SCHEMA_VERSION,
+            "Rustdoc producer wrote schema {} above its maximum {}",
+            pack.schema_version,
+            RUSTDOC_PACK_MAX_SCHEMA_VERSION
+        );
+    }
+}
+
+// Update this list when this producer begins consuming a converted field. The
+// conversion certificate is refused before the rustdoc-types parser runs.
+const CONVERTED_FIELDS_CONSUMED: &[&str] = &[];
+#[cfg(test)]
+mod conversion_contract {
+    include!("rustdoc_conversion_contract.rs");
+}
 const RUST_STD_CRATE_NAME: &str = "std";
 const RUST_STD_HASHMAP_NAME: &str = "std.collections.HashMap";
 const MAX_MODEL_NAME_BYTES: usize = 16 * 1024;
@@ -152,6 +177,37 @@ pub struct RustdocJsonPackProducer;
 #[derive(Debug, Deserialize)]
 struct RustdocVersionEnvelope {
     format_version: u32,
+    #[serde(rename = "_bifrost_conversion")]
+    conversion: Option<RustdocConversionCertificate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustdocConversionCertificate {
+    producer_contract: String,
+    uncertified_fields: Vec<String>,
+}
+
+fn validate_conversion_certificate(
+    certificate: Option<&RustdocConversionCertificate>,
+    producer_contract: &str,
+    consumed: &[&str],
+) -> Result<(), &'static str> {
+    let Some(certificate) = certificate else {
+        return Ok(());
+    };
+    if certificate.producer_contract != producer_contract {
+        return Err("converted rustdoc artifact targets a different producer contract");
+    }
+    if certificate
+        .uncertified_fields
+        .iter()
+        .any(|field| consumed.contains(&field.as_str()))
+    {
+        return Err(
+            "converted rustdoc artifact has an uncertified field consumed by this producer",
+        );
+    }
+    Ok(())
 }
 
 brokk_bifrost_semantic::implement_external_artifact_pack_producer!(
@@ -275,6 +331,59 @@ impl RustdocJsonPackProducer {
             .collect::<RandomHashMap<_, _>>();
         let mut productions = Vec::with_capacity(ordered.len());
         let mut links = SourceSetLinks::default();
+        // Index only declaration binders before projecting cross-document impls.
+        // This request-local metadata is bounded by the authenticated source set;
+        // the join still decides whether an owner was actually emitted.
+        for (crate_name, path) in &ordered {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return failed_artifact_production(
+                    "artifact.cancelled",
+                    "rustdoc source-set production was cancelled",
+                    limits,
+                );
+            }
+            if let Some(bytes) = entries.get(path)
+                && let Ok(document) = decode_rustdoc_json_document(request, bytes)
+            {
+                let Ok(root) = validated_document_root(request, &document, Some(crate_name)) else {
+                    continue;
+                };
+                let names = match item_names(&document, root, cancellation) {
+                    Ok(names) => names,
+                    Err(NameIndexError::Cancelled) => {
+                        return failed_artifact_production(
+                            "artifact.cancelled",
+                            "rustdoc source-set production was cancelled",
+                            limits,
+                        );
+                    }
+                    Err(NameIndexError::Limit) => continue,
+                };
+                for (id, item) in &document.index {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return failed_artifact_production(
+                            "artifact.cancelled",
+                            "rustdoc source-set production was cancelled",
+                            limits,
+                        );
+                    }
+                    if item.crate_id != root.crate_id {
+                        continue;
+                    }
+                    let generics = match &item.inner {
+                        ItemEnum::Struct(item) => &item.generics,
+                        ItemEnum::Enum(item) => &item.generics,
+                        ItemEnum::Union(item) => &item.generics,
+                        _ => continue,
+                    };
+                    if let Some(name) = names.get(id) {
+                        links
+                            .owner_parameters
+                            .insert(name.clone(), generic_names(generics));
+                    }
+                }
+            }
+        }
         for (crate_name, path) in &ordered {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return failed_artifact_production(
@@ -341,6 +450,87 @@ fn produce_loaded_document(
     )
 }
 
+fn decode_rustdoc_json_document(
+    request: &ArtifactProductionRequest,
+    bytes: &[u8],
+) -> Result<RustdocCrate, (&'static str, String)> {
+    let envelope: RustdocVersionEnvelope = serde_json::from_slice(bytes).map_err(|error| {
+        (
+            "rust.rustdoc.invalid_json",
+            format!("could not decode rustdoc JSON version: {error}"),
+        )
+    })?;
+    if envelope.format_version != RUSTDOC_FORMAT_VERSION {
+        return Err((
+            "rust.rustdoc.unsupported_version",
+            format!(
+                "rustdoc JSON format {} is unsupported; this producer accepts {}",
+                envelope.format_version, RUSTDOC_FORMAT_VERSION
+            ),
+        ));
+    }
+    validate_conversion_certificate(
+        envelope.conversion.as_ref(),
+        RUSTDOC_PRODUCER_CONTRACT,
+        CONVERTED_FIELDS_CONSUMED,
+    )
+    .map_err(|message| ("rust.rustdoc.uncertified_conversion", message.to_owned()))?;
+    let document: RustdocCrate = serde_json::from_slice(bytes).map_err(|error| {
+        (
+            "rust.rustdoc.invalid_json",
+            format!(
+                "could not decode rustdoc JSON format {}: {error}",
+                RUSTDOC_FORMAT_VERSION
+            ),
+        )
+    })?;
+    let requested_versions = request
+        .activation
+        .iter()
+        .filter_map(|selector| selector.package.as_ref())
+        .filter_map(|package| package.version.as_deref())
+        .map(|version| version.strip_prefix('=').unwrap_or(version))
+        .collect::<RandomHashSet<_>>();
+    let version_mismatch =
+        if let Some(approximation) = &request.provenance.rust_artifact_approximation {
+            document.crate_version.as_deref() != Some(approximation.built_from_version.as_str())
+                || requested_versions.len() != 1
+                || !requested_versions.contains(
+                    approximation
+                        .activation_version_requirement
+                        .strip_prefix('=')
+                        .unwrap_or(&approximation.activation_version_requirement),
+                )
+        } else {
+            requested_versions.len() > 1
+                || requested_versions
+                    .iter()
+                    .next()
+                    .is_some_and(|expected| document.crate_version.as_deref() != Some(*expected))
+        };
+    if version_mismatch {
+        return Err((
+            "rust.rustdoc.crate_version_mismatch",
+            format!(
+                "rustdoc crate version {:?} does not match requested package versions {:?}",
+                document.crate_version, requested_versions
+            ),
+        ));
+    }
+    if request.activation.iter().any(|selector| {
+        !selector.targets.is_empty() && !selector.targets.contains(&document.target.triple)
+    }) {
+        return Err((
+            "rust.rustdoc.target_mismatch",
+            format!(
+                "rustdoc target {} does not match requested activation targets",
+                document.target.triple
+            ),
+        ));
+    }
+    Ok(document)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn produce_loaded_json_document(
     request: &ArtifactProductionRequest,
@@ -352,79 +542,16 @@ fn produce_loaded_json_document(
     bytes: &[u8],
     links: &mut SourceSetLinks,
 ) -> ArtifactProduction {
-    let envelope: RustdocVersionEnvelope = match serde_json::from_slice(bytes) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            return failed_artifact_production(
-                "rust.rustdoc.invalid_json",
-                format!("could not decode rustdoc JSON version: {error}"),
-                limits,
-            );
-        }
-    };
-    if envelope.format_version != RUSTDOC_FORMAT_VERSION {
-        return failed_artifact_production(
-            "rust.rustdoc.unsupported_version",
-            format!(
-                "rustdoc JSON format {} is unsupported; this producer accepts {}",
-                envelope.format_version, RUSTDOC_FORMAT_VERSION
-            ),
-            limits,
-        );
-    }
-    let document: RustdocCrate = match serde_json::from_slice(bytes) {
+    let document = match decode_rustdoc_json_document(request, bytes) {
         Ok(document) => document,
-        Err(error) => {
-            return failed_artifact_production(
-                "rust.rustdoc.invalid_json",
-                format!(
-                    "could not decode rustdoc JSON format {}: {error}",
-                    RUSTDOC_FORMAT_VERSION
-                ),
-                limits,
-            );
-        }
+        Err((code, message)) => return failed_artifact_production(code, message, limits),
     };
     let document_limits = ArtifactProducerLimits {
         max_records: limits.max_records.max(document.index.len()),
         ..*limits
     };
-    let requested_versions = request
-        .activation
-        .iter()
-        .filter_map(|selector| selector.package.as_ref())
-        .filter_map(|package| package.version.as_deref())
-        .map(|version| version.strip_prefix('=').unwrap_or(version))
-        .collect::<RandomHashSet<_>>();
-    if requested_versions.len() > 1
-        || requested_versions
-            .iter()
-            .next()
-            .is_some_and(|expected| document.crate_version.as_deref() != Some(*expected))
-    {
-        return failed_artifact_production(
-            "rust.rustdoc.crate_version_mismatch",
-            format!(
-                "rustdoc crate version {:?} does not match requested package versions {:?}",
-                document.crate_version, requested_versions
-            ),
-            limits,
-        );
-    }
-    if request.activation.iter().any(|selector| {
-        !selector.targets.is_empty() && !selector.targets.contains(&document.target.triple)
-    }) {
-        return failed_artifact_production(
-            "rust.rustdoc.target_mismatch",
-            format!(
-                "rustdoc target {} does not match requested activation targets",
-                document.target.triple
-            ),
-            limits,
-        );
-    }
     collect_cross_document_reexports(&document, source_relative_path, links);
-    produce_document(
+    let mut production = produce_document(
         request,
         &document_limits,
         artifact_sha256,
@@ -433,7 +560,377 @@ fn produce_loaded_json_document(
         expected_crate,
         source_relative_path,
         links,
-    )
+    );
+    if source_relative_path.is_none()
+        && let Some(pack) = production.pack.as_mut()
+    {
+        for shard in &mut pack.shards {
+            if let AuthoredPayload::DeclarationFacts { types, .. } = &mut shard.payload {
+                retain_available_alias_targets(types);
+                if types.iter().any(|ty| ty.alias_target.is_some()) {
+                    pack.schema_version = RUSTDOC_PACK_MAX_SCHEMA_VERSION;
+                }
+            }
+        }
+    }
+    let mut reexports_limited = false;
+    let mut reexports_unsupported = false;
+    if source_relative_path.is_none()
+        && let Some(pack) = production.pack.as_mut()
+    {
+        let Ok((routes, limited, unsupported_named, unsupported_glob)) =
+            collect_external_reexports_status(&document, limits.max_records, cancellation)
+        else {
+            return failed_artifact_production(
+                "artifact.cancelled",
+                "rustdoc re-export collection was cancelled",
+                limits,
+            );
+        };
+        pack.rust_external_reexports = routes;
+        if limited || unsupported_named {
+            // Missing routes affect only the facade join, not retained declarations.
+            pack.rust_external_reexports_truncated = true;
+        }
+        pack.rust_external_reexports_glob_incomplete = unsupported_glob;
+        reexports_limited = limited;
+        reexports_unsupported = unsupported_named || unsupported_glob;
+        if !pack.rust_external_reexports.is_empty()
+            || pack.rust_external_reexports_truncated
+            || pack.rust_external_reexports_glob_incomplete
+        {
+            pack.schema_version = pack.schema_version.max(
+                brokk_bifrost_semantic::analyzer::semantic_model::RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION);
+        }
+    }
+    // The generic producer treats every warning as a declaration gap. These
+    // two warnings describe only routes that the schema-29 carrier records as
+    // incomplete; retained declarations remain complete. Other warnings and
+    // suppressed diagnostics still keep the pack Partial.
+    if source_relative_path.is_none()
+        && production.pack.as_ref().is_some_and(|pack| {
+            !pack.rust_external_reexports.is_empty()
+                || pack.rust_external_reexports_truncated
+                || pack.rust_external_reexports_glob_incomplete
+        })
+        && production.suppressed_diagnostics.total() == 0
+        && production.diagnostics.iter().all(|diagnostic| {
+            matches!(
+                diagnostic.code.as_str(),
+                "rust.rustdoc.glob_reexport_unexpanded"
+                    | "rust.rustdoc.reexport_target_unavailable"
+            )
+        })
+    {
+        production.completeness = Completeness::Complete;
+        if let Some(pack) = production.pack.as_mut() {
+            pack.completeness = Completeness::Complete;
+        }
+    }
+    if reexports_limited {
+        push_limit_warning(
+            &mut production,
+            limits,
+            "limit.rust_external_reexports",
+            format!(
+                "rustdoc re-export extraction stopped after {} routes; routes beyond the limit are missing evidence, not absent",
+                limits.max_records
+            ),
+        );
+    }
+    if reexports_unsupported {
+        push_limit_warning(
+            &mut production,
+            limits,
+            "rust.external_reexports.unsupported_surface",
+            "public local module aliases or unsupported glob targets leave Rust facade routes incomplete; missing routes are missing evidence, not absence".to_owned(),
+        );
+    }
+    assert_pack_schema_within_producer_max(production.pack.as_ref());
+    production
+}
+
+/// Preserve only root-reachable Rustdoc edges. Item IDs and external crate IDs
+/// remain document-local until activation joins the selected Cargo graph.
+///
+/// The flags report a route limit hit and an unsupported public alias or glob.
+/// Either makes a missing route missing evidence rather than absence.
+fn collect_external_reexports_status(
+    document: &RustdocCrate,
+    max_records: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(Vec<RustExternalReexport>, bool, bool, bool), ()> {
+    collect_external_reexports_status_with_probe(document, max_records, cancellation, || {})
+}
+
+fn collect_external_reexports_status_with_probe(
+    document: &RustdocCrate,
+    max_records: usize,
+    cancellation: Option<&CancellationToken>,
+    mut visit: impl FnMut(),
+) -> Result<(Vec<RustExternalReexport>, bool, bool, bool), ()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(());
+    }
+    let Some(root) = document.index.get(&document.root) else {
+        return Ok((Vec::new(), false, false, false));
+    };
+    let mut ordered = document.index.values().collect::<Vec<_>>();
+    ordered.sort_by_key(|item| item.id);
+    let Some(parents) = parent_index(&ordered, cancellation) else {
+        return Err(());
+    };
+    let mut result = Vec::new();
+    let mut unsupported_named = false;
+    let mut unsupported_glob = false;
+    let mut retained_competitors = 0usize;
+    for item in ordered {
+        visit();
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        // One record past the limit proves the limit was exceeded.
+        if result.len() > max_records {
+            break;
+        }
+        let path = match public_module_item_path(document, &parents, item.id) {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(()) => {
+                if matches!(&item.inner, ItemEnum::Use(import) if import.is_glob) {
+                    unsupported_glob = true;
+                } else {
+                    unsupported_named = true;
+                }
+                continue;
+            }
+        };
+        match &item.inner {
+            ItemEnum::Use(import) => {
+                let Some(target_id) = import.id else {
+                    if import.is_glob {
+                        unsupported_glob = true;
+                    } else {
+                        unsupported_named = true;
+                    }
+                    continue;
+                };
+                let target = rust_external_target(document, root.crate_id, target_id);
+                if import.is_glob {
+                    let Some(target) = target else {
+                        unsupported_glob = true;
+                        continue;
+                    };
+                    let Some(summary) = document.paths.get(&target_id) else {
+                        unsupported_glob = true;
+                        continue;
+                    };
+                    if summary.kind != rustdoc_types::ItemKind::Module {
+                        unsupported_glob = true;
+                        continue;
+                    }
+                    let Some(parent_id) = parents.get(&item.id) else {
+                        unsupported_glob = true;
+                        continue;
+                    };
+                    let Some(parent) = document.index.get(parent_id) else {
+                        unsupported_glob = true;
+                        continue;
+                    };
+                    let ItemEnum::Module(module) = &parent.inner else {
+                        unsupported_glob = true;
+                        continue;
+                    };
+                    let mut explicit_competitors = Vec::new();
+                    let mut glob_competitors = Vec::new();
+                    let mut unresolved_glob_competitor = false;
+                    for sibling_id in &module.items {
+                        if *sibling_id == item.id {
+                            continue;
+                        }
+                        let Some(sibling) = document.index.get(sibling_id) else {
+                            continue;
+                        };
+                        retained_competitors = retained_competitors.saturating_add(1);
+                        if retained_competitors > max_records {
+                            unsupported_glob = true;
+                            unresolved_glob_competitor = true;
+                            break;
+                        }
+                        match &sibling.inner {
+                            ItemEnum::Use(other) if other.is_glob => {
+                                if let Some(id) = other.id
+                                    && let Some(target) =
+                                        rust_external_target(document, root.crate_id, id)
+                                {
+                                    glob_competitors.push(target);
+                                } else {
+                                    unresolved_glob_competitor = true;
+                                }
+                            }
+                            _ => {
+                                if let Some(name) = match &sibling.inner {
+                                    ItemEnum::Use(import) => Some(&import.name),
+                                    _ => sibling.name.as_ref(),
+                                } {
+                                    explicit_competitors.push(name.clone());
+                                }
+                            }
+                        }
+                    }
+                    explicit_competitors.sort();
+                    explicit_competitors.dedup();
+                    glob_competitors
+                        .sort_by(|a, b| a.path.cmp(&b.path).then(a.item_id.cmp(&b.item_id)));
+                    result.push(RustExternalReexport::GlobUse {
+                        facade_module_path: brokk_bifrost_analysis::analyzer::semantic_model::rust_qualified_path::RustQualifiedPath::parse(&path)
+                            .and_then(|segments| segments.parent_and_member().map(|(parent, _)| parent))
+                            .unwrap_or_else(|| path.clone()),
+                        use_item_id: item.id.0,
+                        target_module: target,
+                        explicit_competitors,
+                        glob_competitors,
+                        unresolved_glob_competitor,
+                    });
+                } else {
+                    if let Some(target) = target {
+                        result.push(RustExternalReexport::ExplicitUse {
+                            facade_path: path,
+                            use_item_id: item.id.0,
+                            target,
+                        });
+                    } else if !document.index.get(&target_id).is_some_and(|local| {
+                        local.crate_id == root.crate_id
+                            && !matches!(&local.inner, ItemEnum::Module(_) | ItemEnum::Use(_))
+                    }) {
+                        unsupported_named = true;
+                    }
+                }
+            }
+            _ if item.crate_id != root.crate_id => {
+                if let Some(original) = rust_external_target(document, root.crate_id, item.id) {
+                    result.push(RustExternalReexport::InlinedItem {
+                        facade_path: path,
+                        local_item_id: item.id.0,
+                        original,
+                    });
+                } else {
+                    unsupported_named = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let limited = result.len() > max_records;
+    result.truncate(max_records);
+    Ok((result, limited, unsupported_named, unsupported_glob))
+}
+
+#[cfg(test)]
+pub(crate) fn collect_external_reexports(
+    document: &RustdocCrate,
+    max_records: usize,
+) -> (Vec<RustExternalReexport>, bool, bool) {
+    let (routes, limited, named, glob) =
+        collect_external_reexports_status(document, max_records, None)
+            .expect("uncancelled test collection");
+    (routes, limited, named || glob)
+}
+
+fn rust_external_target(
+    document: &RustdocCrate,
+    root_crate_id: u32,
+    item_id: Id,
+) -> Option<RustExternalReexportTarget> {
+    let summary = document.paths.get(&item_id)?;
+    if summary.crate_id == root_crate_id || summary.path.len() > 64 {
+        return None;
+    }
+    let external = document.external_crates.get(&summary.crate_id)?;
+    if summary.path.first()? != &external.name
+        || summary
+            .path
+            .iter()
+            .any(|part| part.is_empty() || part.len() > MAX_MODEL_NAME_BYTES)
+    {
+        return None;
+    }
+    // External summaries prove only these four namespaces. External Struct
+    // hides its field shape (plain vs unit/tuple), so Struct, Union,
+    // TypeAlias, Constant, Static, Macro and all other kinds stay unmapped.
+    // An exact item in `index` can refine Struct using its own inner kind.
+    let namespace = document
+        .index
+        .get(&item_id)
+        .and_then(|item| match &item.inner {
+            ItemEnum::Struct(value) => Some(match value.kind {
+                StructKind::Unit | StructKind::Tuple(_) => RustReexportTargetNamespace::Both,
+                StructKind::Plain { .. } => RustReexportTargetNamespace::TypeOrModule,
+            }),
+            _ => None,
+        })
+        .or(match summary.kind {
+            rustdoc_types::ItemKind::Function => Some(RustReexportTargetNamespace::Value),
+            rustdoc_types::ItemKind::Module
+            | rustdoc_types::ItemKind::Enum
+            | rustdoc_types::ItemKind::Trait => Some(RustReexportTargetNamespace::TypeOrModule),
+            _ => None,
+        });
+    Some(RustExternalReexportTarget {
+        namespace,
+        external_crate_id: summary.crate_id,
+        external_crate_name: external.name.clone(),
+        item_id: item_id.0,
+        path: summary.path.clone(),
+    })
+}
+
+fn public_module_item_path(
+    document: &RustdocCrate,
+    parents: &HashMap<Id, Id>,
+    item_id: Id,
+) -> Result<Option<String>, ()> {
+    let mut parts = Vec::new();
+    let mut current = item_id;
+    let mut visited = HashSet::default();
+    while visited.insert(current) {
+        if parts.len() >= 64 {
+            return Err(());
+        }
+        let Some(item) = document.index.get(&current) else {
+            return Ok(None);
+        };
+        if current != document.root && !matches!(item.visibility, RustVisibility::Public) {
+            return Ok(None);
+        }
+        if current != item_id
+            && current != document.root
+            && !matches!(item.inner, ItemEnum::Module(_))
+        {
+            return Ok(None);
+        }
+        let name = match &item.inner {
+            ItemEnum::Use(import) => import.name.clone(),
+            _ => match &item.name {
+                Some(name) => name.clone(),
+                None => return Ok(None),
+            },
+        };
+        parts.push(name);
+        if current == document.root {
+            parts.reverse();
+            return if parts.iter().map(String::len).sum::<usize>() < MAX_MODEL_NAME_BYTES {
+                Ok(Some(parts.join(".")))
+            } else {
+                Err(())
+            };
+        }
+        let Some(parent) = parents.get(&current) else {
+            return Ok(None);
+        };
+        current = *parent;
+    }
+    Ok(None)
 }
 
 fn limit_production_records(
@@ -466,13 +963,27 @@ fn limit_production_records(
     let remaining = remaining.saturating_sub(members.len());
     relations.truncate(remaining);
     production.completeness = Completeness::Partial;
+    push_limit_warning(
+        production,
+        limits,
+        "limit.records",
+        format!("source set stopped after {max_records} aggregate records"),
+    );
+}
+
+fn push_limit_warning(
+    production: &mut ArtifactProduction,
+    limits: &ArtifactProducerLimits,
+    code: &str,
+    message: String,
+) {
     let diagnostic = ProducerDiagnostic {
         severity: ProducerDiagnosticSeverity::Warning,
         source_entry: None,
-        code: "limit.records".to_owned(),
+        code: code.to_owned(),
         location: None,
         declaration: None,
-        message: format!("source set stopped after {max_records} aggregate records"),
+        message,
     };
     if production.diagnostics.len() < limits.max_diagnostics
         || admit_into_full_diagnostics(
@@ -511,15 +1022,37 @@ fn union_facts<T: PartialEq>(target: &mut Vec<T>, source: Vec<T>) {
     }
 }
 
+// Transient presentation identity: unlike a member ID, this does not depend
+// on the precision of the per-document signature projection.
+#[derive(PartialEq, Eq, Hash)]
+struct ImplMemberKey {
+    owner: String,
+    name: String,
+    kind: u8,
+    implementation: String,
+}
+
+enum ImplMemberOrigin {
+    Local,
+    NewlyDeferred,
+}
+
+struct ImplMemberPresentation {
+    key: ImplMemberKey,
+    origin: ImplMemberOrigin,
+}
+
 #[derive(Default)]
 struct SourceSetLinks {
+    owner_parameters: RandomHashMap<String, Vec<String>>,
+    impl_member_presentations: RandomHashMap<String, RandomHashMap<String, ImplMemberPresentation>>,
     reexports: Vec<CrossDocumentReexport>,
     private_modules: RandomHashSet<String>,
     generic_trait_impls: Vec<(String, GenericTraitImplFact)>,
     concrete_trait_impls: Vec<(String, ImplementedTraitFact)>,
     callable_impl_members: RandomHashSet<String>,
-    incomplete_callable_owners: RandomHashSet<String>,
-    pending_primitive_members: Vec<(String, ProducerDiagnostic)>,
+    incomplete_callable_owner_refs: Vec<TypeRef>,
+    pending_external_members: Vec<(String, ProducerDiagnostic)>,
     declarations_interrupted: bool,
     incomplete_implementation_owners: RandomHashSet<String>,
     incomplete_generic_traits: RandomHashSet<String>,
@@ -568,13 +1101,30 @@ fn certify_callable_families(
                 .map(|signature| signature.parameters.len()),
         )
     };
+    let incomplete_ids = links
+        .incomplete_callable_owner_refs
+        .iter()
+        .filter_map(|owner| match owner {
+            TypeRef::Declared { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect::<RandomHashSet<_>>();
+    let incomplete_names = links
+        .incomplete_callable_owner_refs
+        .iter()
+        .filter_map(|owner| match owner {
+            TypeRef::Named { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<RandomHashSet<_>>();
     let mut families = RandomHashMap::new();
     for member in members.iter() {
         let eligible = !links.declarations_interrupted
             && links.callable_impl_members.contains(&member.id)
-            && owners
-                .get(&member.owner)
-                .is_some_and(|name| !links.incomplete_callable_owners.contains(*name))
+            && owners.get(&member.owner).is_some_and(|name| {
+                !incomplete_ids.contains(member.owner.as_str())
+                    && !incomplete_names.contains(name.as_str())
+            })
             && member
                 .implemented_trait
                 .as_ref()
@@ -766,6 +1316,122 @@ fn apply_cross_document_reexports(
         }
     }
     resolved
+}
+
+// Alias claims must not inherit the lossy signature converter's fallbacks.
+// Recursion is bounded by the producer's signature-depth limit.
+fn exact_alias_target(
+    ty: &Type,
+    parameters: &[String],
+    document: &RustdocCrate,
+    type_ids: &HashMap<Id, String>,
+    limits: &ArtifactProducerLimits,
+    diagnostics: &mut BoundedProducerDiagnostics,
+    depth: usize,
+) -> Option<TypeRef> {
+    if depth >= limits.max_signature_depth {
+        return None;
+    }
+    let mut convert = |ty: &Type| {
+        exact_alias_target(
+            ty,
+            parameters,
+            document,
+            type_ids,
+            limits,
+            diagnostics,
+            depth + 1,
+        )
+    };
+    Some(match ty {
+        Type::Generic(name) if parameters.contains(name) => {
+            TypeRef::TypeParameter { name: name.clone() }
+        }
+        Type::Primitive(name) => TypeRef::named(name),
+        Type::Tuple(elements) => TypeRef::Tuple {
+            elements: elements.iter().map(&mut convert).collect::<Option<_>>()?,
+        },
+        Type::BorrowedRef {
+            type_,
+            is_mutable: false,
+            ..
+        } => TypeRef::ByRef {
+            element: Box::new(convert(type_)?),
+            reference_kind: TypeRefReferenceKind::Lvalue,
+        },
+        Type::Slice(element) => TypeRef::Slice {
+            element: Box::new(convert(element)?),
+        },
+        Type::ResolvedPath(path) => {
+            let arguments = match path.args.as_deref() {
+                None => Vec::new(),
+                Some(GenericArgs::AngleBracketed { args, constraints })
+                    if constraints.is_empty() =>
+                {
+                    let mut arguments = Vec::new();
+                    for arg in args {
+                        match arg {
+                            GenericArg::Type(ty) => arguments.push(convert(ty)?),
+                            GenericArg::Lifetime(_) => {}
+                            _ => return None,
+                        }
+                    }
+                    arguments
+                }
+                _ => return None,
+            };
+            let mut target = path_type_ref(path, document, type_ids, limits, diagnostics, depth);
+            match &mut target {
+                TypeRef::Declared {
+                    arguments: existing,
+                    ..
+                }
+                | TypeRef::Named {
+                    arguments: existing,
+                    ..
+                } => *existing = arguments,
+                _ => unreachable!("path projection produces a declared or named reference"),
+            }
+            target
+        }
+        _ => return None,
+    })
+}
+
+// An external rustdoc path alone does not establish that a declaration exists
+// in this production. Delay this check until the source-set join is complete.
+fn retain_available_alias_targets(types: &mut [TypeFact]) {
+    let ids: RandomHashSet<_> = types.iter().map(|ty| ty.id.clone()).collect();
+    let names: RandomHashSet<_> = types.iter().map(|ty| ty.name.clone()).collect();
+    for ty in types {
+        let mut pending = ty.alias_target.iter().collect::<Vec<_>>();
+        let mut available = true;
+        while let Some(target) = pending.pop() {
+            match target {
+                TypeRef::Declared { id, arguments, .. } => {
+                    available &= ids.contains(id);
+                    pending.extend(arguments);
+                }
+                TypeRef::Named {
+                    name, arguments, ..
+                } => {
+                    available &= names.contains(name)
+                        || super::call_conversion::primitive_for_spelling(name).is_some()
+                        || matches!(name.as_str(), "f16" | "f128");
+                    pending.extend(arguments);
+                }
+                TypeRef::Tuple { elements } => pending.extend(elements),
+                TypeRef::ByRef { element, .. } | TypeRef::Slice { element } => {
+                    pending.push(element)
+                }
+                TypeRef::TypeParameter { .. } => {}
+                _ => available = false,
+            }
+        }
+        if !available {
+            ty.alias_target = None;
+        }
+    }
 }
 
 // Contract conversion preserves binders nested inside constructors. Existing
@@ -1351,12 +2017,16 @@ fn merge_source_set_productions(
             merged_types.push(fact);
         }
     }
-    // A primitive extension can precede its defining document. Missing
+    // An external impl can precede its defining document. Missing
     // definitions still produce diagnostics and never leave dangling facts.
-    let mut missing_primitive_members: RandomHashSet<&String> = RandomHashSet::default();
-    for (member_id, diagnostic) in &links.pending_primitive_members {
-        if !type_positions.contains_key(diagnostic.declaration.as_ref().expect("primitive owner")) {
-            missing_primitive_members.insert(member_id);
+    let owner_ids = merged_types
+        .iter()
+        .map(|ty| (ty.name.as_str(), ty.id.as_str()))
+        .collect::<RandomHashMap<_, _>>();
+    let mut missing_external_members: RandomHashSet<&String> = RandomHashSet::default();
+    for (member_id, diagnostic) in &links.pending_external_members {
+        if !owner_ids.contains_key(diagnostic.declaration.as_deref().expect("external owner")) {
+            missing_external_members.insert(member_id);
             if diagnostics.len() < limits.max_diagnostics
                 || admit_into_full_diagnostics(
                     &mut diagnostics,
@@ -1371,8 +2041,74 @@ fn merge_source_set_productions(
             }
         }
     }
-    members.retain(|member| !missing_primitive_members.contains(&member.id));
-    relations.retain(|relation| !missing_primitive_members.contains(&relation.from));
+    members.retain(|member| !missing_external_members.contains(&member.id));
+    relations.retain(|relation| !missing_external_members.contains(&relation.from));
+    // A new external presentation may project renamed impl binders more
+    // precisely than an existing local presentation. Preserve the local ID,
+    // signature and locator instead of publishing a duplicate callable.
+    let presentation = |member: &MemberFact| {
+        let Locator::Artifact { path, .. } = &member.locator else {
+            return None;
+        };
+        links
+            .impl_member_presentations
+            .get(path)
+            .and_then(|document| document.get(&member.id))
+    };
+    let mut local_presentations: RandomHashMap<&ImplMemberKey, usize> = RandomHashMap::default();
+    for (index, member) in members.iter().enumerate() {
+        if let Some(presentation) = presentation(member)
+            && matches!(presentation.origin, ImplMemberOrigin::Local)
+        {
+            local_presentations
+                .entry(&presentation.key)
+                .or_insert(index);
+        }
+    }
+    let duplicates = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, member)| {
+            let presentation = presentation(member)?;
+            if !matches!(presentation.origin, ImplMemberOrigin::NewlyDeferred) {
+                return None;
+            }
+            local_presentations
+                .get(&presentation.key)
+                .map(|local| (index, *local))
+        })
+        .collect::<Vec<_>>();
+    let mut dropped_presentations: RandomHashMap<String, RandomHashSet<String>> =
+        RandomHashMap::default();
+    let mut dropped_member_ids: RandomHashSet<String> = RandomHashSet::default();
+    for (duplicate, local) in duplicates {
+        let Locator::Artifact { path, .. } = &members[duplicate].locator else {
+            unreachable!("impl presentation has an artifact locator")
+        };
+        dropped_presentations
+            .entry(path.clone())
+            .or_default()
+            .insert(members[duplicate].id.clone());
+        dropped_member_ids.insert(members[duplicate].id.clone());
+        let aliases = std::mem::take(&mut members[duplicate].aliases);
+        union_facts(&mut members[local].aliases, aliases);
+    }
+    members.retain(|member| match &member.locator {
+        Locator::Artifact { path, .. } => !dropped_presentations
+            .get(path)
+            .is_some_and(|ids| ids.contains(&member.id)),
+        _ => true,
+    });
+    let retained_member_ids = members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect::<RandomHashSet<_>>();
+    // Identical IDs retain the usual relation union. Differing projection IDs
+    // must not leave relations whose source is the discarded external copy.
+    relations.retain(|relation| {
+        !dropped_member_ids.contains(&relation.from)
+            || retained_member_ids.contains(relation.from.as_str())
+    });
     let mut types = merged_types;
     let resolved_reexports = apply_cross_document_reexports(
         &links.reexports,
@@ -1436,6 +2172,7 @@ fn merge_source_set_productions(
     }
     let mut seen_relation_ids: RandomHashSet<String> = RandomHashSet::default();
     relations.retain(|fact| seen_relation_ids.insert(fact.id.clone()));
+    retain_available_alias_targets(&mut types);
     types.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
     members.sort_by(|left, right| {
         left.owner
@@ -1469,12 +2206,18 @@ fn merge_source_set_productions(
                 artifact_sha256,
             ),
         ),
-        schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+        schema_version: if types.iter().any(|ty| ty.alias_target.is_some()) {
+            RUSTDOC_PACK_MAX_SCHEMA_VERSION
+        } else if request.provenance.rust_artifact_approximation.is_some() {
+            brokk_bifrost_semantic::analyzer::semantic_model::model::RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION
+        } else {
+            crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
+        },
         pack_id: request.pack_id.clone(),
         version: request.pack_version.clone(),
         producer: Producer {
             name: "bifrost-rustdoc-json".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: super::external::RUST_PACK_PRODUCER_VERSION.to_owned(),
         },
         language: "rust".to_owned(),
         ecosystem: request.ecosystem.clone(),
@@ -1486,6 +2229,9 @@ fn merge_source_set_productions(
         carried_sources: Vec::new(),
         cpp_portability: None,
         python_correspondence: None,
+        rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
         shards: source_set_declaration_shards(
             types,
             members,
@@ -1494,6 +2240,7 @@ fn merge_source_set_productions(
             &links.private_modules,
         ),
     });
+    assert_pack_schema_within_producer_max(pack.as_ref());
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
         pack,
@@ -1638,47 +2385,22 @@ fn source_set_declaration_shards(
     packed
 }
 
-#[allow(clippy::too_many_arguments)]
-fn produce_document(
+fn validated_document_root<'a>(
     request: &ArtifactProductionRequest,
-    limits: &ArtifactProducerLimits,
-    artifact_sha256: &str,
-    document: &RustdocCrate,
-    cancellation: Option<&CancellationToken>,
+    document: &'a RustdocCrate,
     expected_crate: Option<&str>,
-    source_relative_path: Option<&str>,
-    links: &mut SourceSetLinks,
-) -> ArtifactProduction {
-    let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-    let Some(root) = document.index.get(&document.root) else {
-        diagnostics.error(
+) -> Result<&'a Item, (&'static str, String)> {
+    let root = document.index.get(&document.root).ok_or_else(|| {
+        (
             "rust.rustdoc.missing_root",
-            None,
-            "rustdoc JSON root item is absent from the item index",
-        );
-        return finish(
-            request,
-            artifact_sha256,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            diagnostics,
-        );
-    };
+            "rustdoc JSON root item is absent from the item index".to_owned(),
+        )
+    })?;
     if !matches!(root.inner, ItemEnum::Module(_)) {
-        diagnostics.error(
+        return Err((
             "rust.rustdoc.invalid_root",
-            None,
-            "rustdoc JSON root item is not a module",
-        );
-        return finish(
-            request,
-            artifact_sha256,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            diagnostics,
-        );
+            "rustdoc JSON root item is not a module".to_owned(),
+        ));
     }
     let mut requested_crates = request
         .activation
@@ -1705,22 +2427,43 @@ fn produce_document(
             .as_ref()
             .is_none_or(|name| !requested_crates.is_empty() && !requested_crates.contains(name))
     {
-        diagnostics.error(
+        return Err((
             "rust.rustdoc.crate_name_mismatch",
-            None,
             format!(
                 "rustdoc root crate {root_name:?} does not match requested modules {requested_crates:?}"
             ),
-        );
-        return finish(
-            request,
-            artifact_sha256,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            diagnostics,
-        );
+        ));
     }
+    Ok(root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_document(
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    artifact_sha256: &str,
+    document: &RustdocCrate,
+    cancellation: Option<&CancellationToken>,
+    expected_crate: Option<&str>,
+    source_relative_path: Option<&str>,
+    links: &mut SourceSetLinks,
+) -> ArtifactProduction {
+    let decode_veto_start = links.incomplete_callable_owner_refs.len();
+    let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+    let root = match validated_document_root(request, document, expected_crate) {
+        Ok(root) => root,
+        Err((code, message)) => {
+            diagnostics.error(code, None, message);
+            return finish(
+                request,
+                artifact_sha256,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                diagnostics,
+            );
+        }
+    };
     if document.index.len() > limits.max_records {
         diagnostics.error(
             "limit.input_items",
@@ -1930,6 +2673,20 @@ fn produce_document(
         }
         type_position.insert(item.id, types.len());
         types.push(TypeFact {
+            alias_target: if let ItemEnum::TypeAlias(alias) = &item.inner {
+                exact_alias_target(
+                    &alias.type_,
+                    &generic_names(&alias.generics),
+                    document,
+                    &type_ids,
+                    limits,
+                    &mut diagnostics,
+                    0,
+                )
+            } else {
+                None
+            },
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -2028,6 +2785,7 @@ fn produce_document(
     );
 
     let mut member_position = HashMap::default();
+    let mut impl_identities: HashMap<Id, String> = HashMap::default();
     for item in &ordered_items {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
@@ -2076,23 +2834,25 @@ fn produce_document(
         {
             member_kind = MemberKind::Method;
         }
-        let primitive_extension = source_relative_path.is_some()
+        let external_extension = source_relative_path.is_some()
             && parents
                 .get(&item.id)
                 .and_then(|parent| document.index.get(parent))
-                .is_some_and(|parent| {
-                    matches!(&parent.inner, ItemEnum::Impl(implementation)
-                        if matches!(&implementation.for_, Type::Primitive(_) | Type::Slice(_) | Type::Array { .. }))
-                });
+                .is_some_and(|parent| matches!(&parent.inner, ItemEnum::Impl(_)));
         let owner_item_id = if let Some(id) = type_id_by_name.get(&owner_name) {
             id.clone()
-        } else if primitive_extension {
-            // Primitive identities are shared across documents. Validate this
-            // owner after the source-set join, rather than dropping alloc/std
-            // extensions of a primitive emitted by core.
-            owner_name.clone()
+        } else if external_extension {
+            // Resolve external impl owners only after all documents are joined.
+            // The member keeps the identity and locator of its impl document.
+            if owner_name.starts_with("core.primitive.") {
+                owner_name.clone()
+            } else {
+                type_declaration_id(TypeIdentity {
+                    ecosystem: "cargo",
+                    name: &owner_name,
+                })
+            }
         } else {
-            links.incomplete_callable_owners.insert(owner_name.clone());
             diagnostics.warning(
                 "rust.rustdoc.missing_member_owner",
                 Some(format!("item.{}", item.id.0)),
@@ -2108,11 +2868,6 @@ fn produce_document(
             name == "self" || name.ends_with(" self")
         }));
         let diagnostics_before = diagnostics.total();
-        let owner_type_parameters = type_item_by_name
-            .get(&owner_name)
-            .and_then(|owner| type_position.get(owner))
-            .map(|position| types[*position].type_parameters.as_slice())
-            .unwrap_or_default();
         let implementation = parents
             .get(&item.id)
             .and_then(|parent| document.index.get(parent))
@@ -2120,11 +2875,83 @@ fn produce_document(
                 ItemEnum::Impl(implementation) => Some(implementation),
                 _ => None,
             });
+        let external_owner = !type_id_by_name.contains_key(&owner_name);
+        let owner_parameters = links
+            .owner_parameters
+            .get(&owner_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut parameter_bindings = Vec::new();
+        let canonical_owner = if external_owner {
+            implementation.and_then(|implementation| match &implementation.for_ {
+                Type::ResolvedPath(path) => {
+                    if let Some(GenericArgs::AngleBracketed { args, .. }) = path.args.as_deref() {
+                        for (argument, parameter) in args
+                            .iter()
+                            .filter(|argument| !matches!(argument, GenericArg::Lifetime(_)))
+                            .zip(owner_parameters)
+                        {
+                            if let GenericArg::Type(Type::Generic(name)) = argument {
+                                parameter_bindings.push((name.clone(), parameter.clone()));
+                            }
+                        }
+                    }
+                    Some((path.id, owner_item_id.as_str()))
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let mut seen_binders: RandomHashSet<&str> = RandomHashSet::default();
+        let repeated_binders = parameter_bindings
+            .iter()
+            .filter_map(|(binder, _)| {
+                (!seen_binders.insert(binder.as_str())).then_some(binder.as_str())
+            })
+            .collect::<RandomHashSet<_>>();
+        let mut repeated_binders = repeated_binders
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        repeated_binders.sort_unstable();
+        let ambiguous_impl_bindings = !repeated_binders.is_empty();
+        if ambiguous_impl_bindings {
+            diagnostics.warning(
+                "rust.rustdoc.impl_binder_ambiguous",
+                Some(format!("item.{}", item.id.0)),
+                format!("impl binders map to multiple owner parameters: {repeated_binders:?}"),
+            );
+        }
+        parameter_bindings.retain(|(binder, _)| repeated_binders.binary_search(binder).is_err());
+        if external_owner && let ItemEnum::Function(function) = &item.inner {
+            let method_parameters = generic_names(&function.generics);
+            let before = parameter_bindings.len();
+            parameter_bindings.retain(|(_, owner)| !method_parameters.contains(owner));
+            if parameter_bindings.len() != before {
+                diagnostics.warning(
+                    "rust.rustdoc.impl_binder_shadowed",
+                    Some(format!("item.{}", item.id.0)),
+                    "impl binder cannot be transported without capturing a method parameter",
+                );
+            }
+        }
+        let owner_type_parameters = type_item_by_name
+            .get(&owner_name)
+            .and_then(|owner| type_position.get(owner))
+            .map(|position| types[*position].type_parameters.as_slice())
+            .unwrap_or(owner_parameters);
         let self_type = implementation.map(|implementation| {
             RustdocTypeProjection {
                 document,
                 type_ids: &type_ids,
-                owner_type_parameters,
+                canonical_owner,
+                parameter_bindings: &parameter_bindings,
+                owner_type_parameters: if external_owner {
+                    &[]
+                } else {
+                    owner_type_parameters
+                },
                 self_type: None,
                 limits,
             }
@@ -2133,7 +2960,13 @@ fn produce_document(
         let projection = RustdocTypeProjection {
             document,
             type_ids: &type_ids,
-            owner_type_parameters,
+            canonical_owner,
+            parameter_bindings: &parameter_bindings,
+            owner_type_parameters: if external_owner {
+                &[]
+            } else {
+                owner_type_parameters
+            },
             self_type: self_type.as_ref(),
             limits,
         };
@@ -2170,6 +3003,18 @@ fn produce_document(
                     None
                 }
             });
+        let implementation_identity = implementation
+            .filter(|implementation| {
+                implementation.trait_.is_some()
+                    || (source_relative_path.is_some()
+                        && matches!(implementation.for_, Type::ResolvedPath(_)))
+            })
+            .map(|implementation| {
+                impl_identities
+                    .entry(parents[&item.id])
+                    .or_insert_with(|| trait_impl_identity(implementation, document))
+                    .clone()
+            });
         let mut member_id = member_declaration_id(MemberIdentity {
             owner_id: &owner_item_id,
             kind: member_kind,
@@ -2185,11 +3030,40 @@ fn produce_document(
                 .as_ref()
                 .and_then(|signature| signature.returns.as_ref()),
         });
-        if let Some(implementation) = trait_implementation {
+        if trait_implementation.is_some() {
             member_id.push_str(&format!(
                 ".trait.{}",
-                trait_impl_identity(implementation, document)
+                implementation_identity
+                    .as_ref()
+                    .expect("trait impl identity")
             ));
+        }
+        if let (Some(source), Some(implementation), Some(identity)) = (
+            source_relative_path,
+            implementation,
+            implementation_identity,
+        ) && matches!(implementation.for_, Type::ResolvedPath(_))
+        {
+            // Primitive extensions predate this deferral and keep their existing
+            // merge behavior. Only newly deferred resolved-path owners fold.
+            links
+                .impl_member_presentations
+                .entry(source.to_owned())
+                .or_default()
+                .entry(member_id.clone())
+                .or_insert(ImplMemberPresentation {
+                    key: ImplMemberKey {
+                        owner: owner_item_id.clone(),
+                        name: name.to_owned(),
+                        kind: member_kind as u8,
+                        implementation: identity,
+                    },
+                    origin: if external_owner {
+                        ImplMemberOrigin::NewlyDeferred
+                    } else {
+                        ImplMemberOrigin::Local
+                    },
+                });
         }
         let path = names
             .get(&item.id)
@@ -2219,12 +3093,12 @@ fn produce_document(
         {
             links.callable_impl_members.insert(member_id.clone());
         }
-        if primitive_extension && !type_id_by_name.contains_key(&owner_name) {
-            links.pending_primitive_members.push((
+        if external_extension && !type_id_by_name.contains_key(&owner_name) {
+            links.pending_external_members.push((
                 member_id.clone(),
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Warning,
-                    source_entry: source_relative_path.map(Into::into),
+                    source_entry: None,
                     code: "rust.rustdoc.missing_member_owner".into(),
                     location: Some(format!("item.{}", item.id.0)),
                     declaration: Some(owner_name.clone()),
@@ -2255,7 +3129,11 @@ fn produce_document(
                 bind_concrete_implementation(
                     &mut fact,
                     &implementation.for_,
-                    owner_type_parameters,
+                    if ambiguous_impl_bindings {
+                        &[]
+                    } else {
+                        owner_type_parameters
+                    },
                 );
                 fact.trait_type
             }),
@@ -2310,7 +3188,11 @@ fn produce_document(
             ),
         });
         if diagnostics.total() != diagnostics_before {
-            links.incomplete_callable_owners.insert(owner_name);
+            links.incomplete_callable_owner_refs.push(TypeRef::Named {
+                name: owner_name,
+                arguments: Vec::new(),
+                nullable: false,
+            });
         }
     }
 
@@ -2359,6 +3241,19 @@ fn produce_document(
     links.declarations_interrupted |= relations_limited
         || types.len().saturating_add(members.len()) >= limits.max_records
         || cancellation.is_some_and(CancellationToken::is_cancelled);
+    // Resolve local decode vetoes in the document that reported them. External
+    // references remain pending until the joined source set supplies the owner.
+    for owner in &mut links.incomplete_callable_owner_refs[decode_veto_start..] {
+        if let TypeRef::Named { name, .. } = owner
+            && let Some(id) = type_id_by_name.get(name)
+        {
+            *owner = TypeRef::Declared {
+                id: id.clone(),
+                arguments: Vec::new(),
+                nullable: false,
+            };
+        }
+    }
     certify_callable_families(&types, &mut members, links);
     finish(
         request,
@@ -2815,6 +3710,8 @@ fn rust_type_ref(
     RustdocTypeProjection {
         document,
         type_ids,
+        canonical_owner: None,
+        parameter_bindings: &[],
         owner_type_parameters: &[],
         self_type: None,
         limits,
@@ -2825,6 +3722,8 @@ fn rust_type_ref(
 struct RustdocTypeProjection<'a> {
     document: &'a RustdocCrate,
     type_ids: &'a HashMap<Id, String>,
+    canonical_owner: Option<(Id, &'a str)>,
+    parameter_bindings: &'a [(String, String)],
     owner_type_parameters: &'a [String],
     self_type: Option<&'a TypeRef>,
     limits: &'a ArtifactProducerLimits,
@@ -2857,6 +3756,22 @@ impl RustdocTypeProjection<'_> {
             // type parameter references cannot be resolved by the compiler.
             Type::Generic(name) if name == "Self" && self.self_type.is_some() => {
                 self.self_type.expect("impl self type").clone()
+            }
+            Type::Generic(name)
+                if self
+                    .parameter_bindings
+                    .iter()
+                    .any(|(binder, _)| binder == name) =>
+            {
+                TypeRef::TypeParameter {
+                    name: self
+                        .parameter_bindings
+                        .iter()
+                        .find(|(binder, _)| binder == name)
+                        .expect("known impl binder")
+                        .1
+                        .clone(),
+                }
             }
             Type::Generic(name) if self.owner_type_parameters.contains(name) => {
                 TypeRef::TypeParameter { name: name.clone() }
@@ -2932,9 +3847,14 @@ impl RustdocTypeProjection<'_> {
             .as_deref()
             .map(|args| self.arguments(args, diagnostics, depth))
             .unwrap_or_default();
-        if let Some(id) = self.type_ids.get(&path.id) {
+        if let Some(id) = self
+            .canonical_owner
+            .filter(|(owner, _)| *owner == path.id)
+            .map(|(_, id)| id)
+            .or_else(|| self.type_ids.get(&path.id).map(String::as_str))
+        {
             TypeRef::Declared {
-                id: id.clone(),
+                id: id.to_owned(),
                 arguments,
                 nullable: false,
             }
@@ -2987,6 +3907,8 @@ fn path_type_ref(
     RustdocTypeProjection {
         document,
         type_ids,
+        canonical_owner: None,
+        parameter_bindings: &[],
         owner_type_parameters: &[],
         self_type: None,
         limits,
@@ -3132,7 +4054,11 @@ fn apply_impl_hierarchy(
                 .cloned()
                 .or_else(|| resolved_type_name(&implementation.for_, projection.document))
         {
-            links.incomplete_callable_owners.insert(owner);
+            links.incomplete_callable_owner_refs.push(TypeRef::Named {
+                name: owner,
+                arguments: Vec::new(),
+                nullable: false,
+            });
         }
         project_impl_contract(
             item,
@@ -3799,15 +4725,20 @@ fn finish(
             callable_values: None,
         }]
     };
-    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
-        request,
-        artifact_sha256,
-        "bifrost-rustdoc-json",
-        "rust",
-        diagnostics,
-        suppressed_diagnostics,
-        shards,
-    )
+    let mut production =
+        brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_authored_pack_production(
+            request,
+            artifact_sha256,
+            "bifrost-rustdoc-json",
+            "rust",
+            diagnostics,
+            suppressed_diagnostics,
+            shards,
+        );
+    if let Some(pack) = &mut production.pack {
+        pack.producer.version = super::external::RUST_PACK_PRODUCER_VERSION.to_owned();
+    }
+    production
 }
 
 fn collection_flow_facts(
@@ -3965,6 +4896,47 @@ mod tests {
     use crate::analyzer::rust::test_support::rustdoc_item as item;
 
     use crate::analyzer::rust::rustdoc_artifact::*;
+
+    #[test]
+    fn uncertified_fields_are_not_read_by_current_producer() {
+        let source = include_str!("rustdoc_artifact.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let external = include_str!("external.rs");
+        for (_, field_read, _, _) in conversion_contract::UNCERTIFIED_FIELD_READS {
+            assert!(
+                !production.contains(field_read),
+                "new read of {field_read} needs a contract update"
+            );
+            assert!(
+                !external.contains(field_read),
+                "new read of {field_read} needs a contract update"
+            );
+        }
+    }
+
+    #[test]
+    fn uncertified_field_is_refused_if_future_producer_reads_it() {
+        let marker = RustdocConversionCertificate {
+            producer_contract: RUSTDOC_PRODUCER_CONTRACT.to_owned(),
+            uncertified_fields: vec!["Item::stability".to_owned()],
+        };
+        assert!(
+            validate_conversion_certificate(
+                Some(&marker),
+                RUSTDOC_PRODUCER_CONTRACT,
+                &["Item::stability"]
+            )
+            .is_err()
+        );
+        assert!(
+            validate_conversion_certificate(Some(&marker), "rustdoc-json-pack-producer/2", &[])
+                .is_err()
+        );
+        assert!(
+            validate_conversion_certificate(Some(&marker), RUSTDOC_PRODUCER_CONTRACT, &[]).is_ok()
+        );
+    }
+
     use rustdoc_types::{
         Abi, Function, FunctionHeader, FunctionSignature, GenericParamDef, GenericParamDefKind,
         Impl, ItemKind, ItemSummary, Module, Struct, Target, Trait, TraitBoundModifier, Use,
@@ -3986,6 +4958,863 @@ mod tests {
     use crate::analyzer::semantic_model::compile_pack;
 
     use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_source_set;
+
+    #[test]
+    fn facade_fixture_documents_decode_as_rustdoc_format_61() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rustdoc-facade");
+        for name in [
+            "core-v1.json",
+            "core-v2.json",
+            "facade-public.json",
+            "facade-missing.json",
+            "facade-private.json",
+            "facade-shadowed.json",
+            "facade-glob.json",
+            "facade-two-globs.json",
+            "facade-inlined.json",
+            "facade-private-module.json",
+            "cycle-a.json",
+            "cycle-b.json",
+        ] {
+            let bytes = fs::read(root.join(name)).expect("synthetic rustdoc fixture exists");
+            let document: RustdocCrate =
+                serde_json::from_slice(&bytes).expect("fixture obeys rustdoc format 61");
+            assert_eq!(document.format_version, 61, "{name}");
+            assert!(document.index.contains_key(&document.root), "{name}");
+        }
+    }
+
+    #[test]
+    fn facade_fixture_edges_require_structured_targets_and_public_modules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rustdoc-facade");
+        let edges = |name: &str| {
+            let document: RustdocCrate =
+                serde_json::from_slice(&fs::read(root.join(name)).unwrap()).unwrap();
+            let (routes, limited, unsupported) = collect_external_reexports(&document, 100);
+            assert!(!limited, "{name}");
+            assert!(!unsupported, "{name}");
+            routes
+        };
+        assert!(matches!(
+            edges("facade-public.json").as_slice(),
+            [RustExternalReexport::ExplicitUse { target, .. }]
+                if target.item_id == 100
+                    && target.path.iter().map(String::as_str).eq(["sqlx_core", "query", "query"])
+        ));
+        assert!(matches!(
+            edges("facade-glob.json").as_slice(),
+            [RustExternalReexport::GlobUse { target_module, .. }]
+                if target_module.path.iter().map(String::as_str).eq(["sqlx_core", "query"])
+        ));
+        assert!(matches!(
+            edges("facade-inlined.json").as_slice(),
+            [RustExternalReexport::InlinedItem { original, .. }]
+                if original.path.iter().map(String::as_str).eq(["sqlx_core", "query", "query"])
+        ));
+        assert!(matches!(
+            edges("facade-two-globs.json").as_slice(),
+            [RustExternalReexport::GlobUse { glob_competitors, .. },
+             RustExternalReexport::GlobUse { .. }]
+                if glob_competitors.len() == 1
+        ));
+        assert!(matches!(
+            edges("facade-shadowed.json").as_slice(),
+            [RustExternalReexport::GlobUse { explicit_competitors, .. }]
+                if explicit_competitors.iter().map(String::as_str).eq(["query"])
+        ));
+        for name in [
+            "facade-missing.json",
+            "facade-private.json",
+            "facade-private-module.json",
+        ] {
+            assert!(edges(name).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: unresolved named and invalid external targets make facade routes incomplete"
+    )]
+    fn invalid_named_and_inlined_reexports_are_incomplete() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rustdoc-facade");
+        for (fixture, item_id, target_id) in [
+            ("facade-public.json", "1", "100"),
+            ("facade-inlined.json", "1", "1"),
+        ] {
+            let original: serde_json::Value =
+                serde_json::from_slice(&fs::read(root.join(fixture)).unwrap()).unwrap();
+            for path in [
+                serde_json::json!(["wrong", "query"]),
+                serde_json::json!(["sqlx_core", ""]),
+                serde_json::json!(["sqlx_core", "x".repeat(MAX_MODEL_NAME_BYTES + 1)]),
+                serde_json::json!(vec!["sqlx_core"; 65]),
+            ] {
+                let mut json = original.clone();
+                json["paths"][target_id]["path"] = path;
+                let document: RustdocCrate = serde_json::from_value(json).unwrap();
+                let (_, _, unsupported) = collect_external_reexports(&document, 100);
+                assert!(unsupported, "{fixture}");
+            }
+            let mut json = original.clone();
+            json["paths"].as_object_mut().unwrap().remove(target_id);
+            let document: RustdocCrate = serde_json::from_value(json).unwrap();
+            assert!(collect_external_reexports(&document, 100).2, "{fixture}");
+            if fixture == "facade-public.json" {
+                let mut json = original.clone();
+                json["index"][item_id]["inner"]["use"]["id"] = serde_json::Value::Null;
+                let document: RustdocCrate = serde_json::from_value(json).unwrap();
+                assert!(collect_external_reexports(&document, 100).2);
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: a local non-module Use is already an ordinary declaration alias"
+    )]
+    fn local_item_reexport_does_not_truncate_facade() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-public.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        let mut local_module = json["index"]["0"].clone();
+        local_module["id"] = serde_json::json!(3);
+        local_module["name"] = serde_json::json!("error");
+        local_module["inner"]["module"]["is_crate"] = serde_json::json!(false);
+        local_module["inner"]["module"]["items"] = serde_json::json!([2]);
+        json["index"]["3"] = local_module;
+        let mut local_type = json["index"]["0"].clone();
+        local_type["id"] = serde_json::json!(2);
+        local_type["name"] = serde_json::json!("Error");
+        local_type["inner"] = serde_json::json!({"struct": {
+            "kind": "unit", "generics": {"params":[], "where_predicates":[]}, "impls":[]
+        }});
+        json["index"]["2"] = local_type;
+        json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 3]);
+        json["index"]["1"]["inner"]["use"]["name"] = serde_json::json!("Error");
+        json["index"]["1"]["inner"]["use"]["id"] = serde_json::json!(2);
+        json["paths"].as_object_mut().unwrap().remove("100");
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temp.path(), serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut request = request(temp.path().to_path_buf());
+        request.activation[0].package = Some(NameSelector {
+            name: "sqlx".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        });
+        let product = RustdocJsonPackProducer
+            .produce_exact_artifact(&request, &ArtifactProducerLimits::default());
+        assert_eq!(product.completeness, Completeness::Complete);
+        let pack = product.pack.unwrap();
+        assert!(!pack.rust_external_reexports_truncated);
+        assert!(pack.shards.iter().any(|shard| {
+            let AuthoredPayload::DeclarationFacts { types, .. } = &shard.payload else {
+                return false;
+            };
+            types.iter().any(|fact| {
+                fact.name == "sqlx.error.Error"
+                    && fact.aliases.iter().any(|alias| alias == "sqlx.Error")
+            })
+        }));
+        let document: RustdocCrate = serde_json::from_value(json).unwrap();
+        let (routes, limited, unsupported) = collect_external_reexports(&document, 100);
+        assert!(routes.is_empty());
+        assert!(!limited && !unsupported);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: many glob competitors consume one bounded carrier budget"
+    )]
+    fn glob_competitor_overflow_marks_surface_incomplete() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-glob.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        for id in 2..20 {
+            let mut item = json["index"]["1"].clone();
+            item["id"] = serde_json::json!(id);
+            item["inner"]["use"]["id"] = serde_json::json!(100 + id);
+            json["index"][id.to_string()] = item;
+            json["paths"][(100 + id).to_string()] = serde_json::json!({
+                "crate_id": 1, "path": ["sqlx_core", format!("module{id}")], "kind": "module"
+            });
+            json["index"]["0"]["inner"]["module"]["items"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!(id));
+        }
+        let document: RustdocCrate = serde_json::from_value(json).unwrap();
+        let (_, _, unsupported) = collect_external_reexports(&document, 4);
+        assert!(unsupported);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: public facade paths beyond 64 modules are incomplete, not absent"
+    )]
+    fn deep_public_reexport_path_marks_surface_incomplete() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-public.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([2]);
+        for id in 2..68 {
+            let mut module = json["index"]["0"].clone();
+            module["id"] = serde_json::json!(id);
+            module["name"] = serde_json::json!(format!("m{id}"));
+            module["inner"]["module"]["is_crate"] = serde_json::json!(false);
+            module["inner"]["module"]["items"] =
+                serde_json::json!([if id == 67 { 1 } else { id + 1 }]);
+            json["index"][id.to_string()] = module;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deep-route.json");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let document: RustdocCrate = serde_json::from_value(json).unwrap();
+        let (routes, _, unsupported) = collect_external_reexports(&document, 100);
+        assert!(routes.is_empty());
+        assert!(unsupported);
+        let mut request = request(path);
+        request.activation[0].package = Some(NameSelector {
+            name: "sqlx".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        });
+        let product = RustdocJsonPackProducer
+            .produce_exact_artifact(&request, &ArtifactProducerLimits::default());
+        let pack = product.pack.expect("deep route keeps declarations");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        assert!(pack.rust_external_reexports_truncated);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: the external reexport limit counts routes, not later items"
+    )]
+    fn external_reexport_limit_is_exact_and_reports_truncation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-two-globs.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // An orphan item with the highest id: it is scanned after both routes
+        // but is not reachable from the root module, so it yields no route.
+        let mut orphan = json["index"]["2"].clone();
+        orphan["id"] = 3.into();
+        json["index"]["3"] = orphan;
+        let document: RustdocCrate = serde_json::from_value(json).unwrap();
+        assert_eq!(document.index.len(), 4);
+        let (all, limited, unsupported) = collect_external_reexports(&document, 100);
+        assert!(!limited);
+        assert!(!unsupported);
+        assert_eq!(all.len(), 2);
+        // Reaching the limit exactly is not truncation, even though the scan
+        // continues past the last route over unrelated items.
+        let (exact, limited, unsupported) = collect_external_reexports(&document, 2);
+        assert!(!limited);
+        assert!(!unsupported);
+        assert_eq!(exact, all);
+        // One route over the limit keeps the first route and reports the cut.
+        let (over, limited, _) = collect_external_reexports(&document, 1);
+        assert!(limited);
+        assert_eq!(over.as_slice(), &all[..1]);
+        let (none, limited, _) = collect_external_reexports(&document, 0);
+        assert!(limited);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: local module glob leaves declarations complete without adding aliases"
+    )]
+    fn local_module_glob_preserves_complete_declarations() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/core-v1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        let mut local_glob: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/rustdoc-facade/facade-public.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        local_glob = local_glob["index"]["1"].clone();
+        local_glob["id"] = serde_json::json!(3);
+        local_glob["inner"]["use"]["name"] = serde_json::json!("*");
+        local_glob["inner"]["use"]["id"] = serde_json::json!(1);
+        local_glob["inner"]["use"]["is_glob"] = serde_json::json!(true);
+        json["index"]["3"] = local_glob;
+        json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 3]);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("local-glob.json");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut request = request(path);
+        request.activation[0].package = Some(NameSelector {
+            name: "sqlx_core".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        });
+        let product = RustdocJsonPackProducer
+            .produce_exact_artifact(&request, &ArtifactProducerLimits::default());
+        let pack = product.pack.expect("complete local glob pack");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        assert!(!pack.rust_external_reexports_truncated);
+        assert!(pack.rust_external_reexports_glob_incomplete);
+        let aliases = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { members, .. } => members
+                    .iter()
+                    .flat_map(|member| member.aliases.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !aliases.contains(&"sqlx_core.query".to_owned()),
+            "{aliases:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: local error glob abstains without partializing declarations"
+    )]
+    fn local_error_glob_does_not_publish_root_error_alias() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/core-v1.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        json["index"]["1"]["name"] = serde_json::json!("error");
+        json["index"]["2"]["name"] = serde_json::json!("Error");
+        json["index"]["2"]["inner"] = serde_json::json!({"struct": {
+            "kind":"unit", "generics":{"params":[],"where_predicates":[]}, "impls":[]
+        }});
+        json["paths"]["1"]["path"] = serde_json::json!(["sqlx_core", "error"]);
+        json["paths"]["2"] = serde_json::json!({"crate_id":0,
+            "path":["sqlx_core","error","Error"],"kind":"struct"});
+        let facade: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/rustdoc-facade/facade-public.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut glob = facade["index"]["1"].clone();
+        glob["id"] = serde_json::json!(3);
+        glob["inner"]["use"]["id"] = serde_json::json!(1);
+        glob["inner"]["use"]["name"] = serde_json::json!("*");
+        glob["inner"]["use"]["is_glob"] = serde_json::json!(true);
+        json["index"]["3"] = glob;
+        json["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([1, 3]);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("error-glob.json");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut request = request(path);
+        request.activation[0].package = Some(NameSelector {
+            name: "sqlx_core".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        });
+        let pack = RustdocJsonPackProducer
+            .produce_exact_artifact(&request, &ArtifactProducerLimits::default())
+            .pack
+            .expect("error glob pack");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        assert!(!pack.rust_external_reexports_truncated);
+        assert!(pack.rust_external_reexports_glob_incomplete);
+        let aliases = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types
+                    .iter()
+                    .flat_map(|ty| ty.aliases.iter())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !aliases.contains(&"sqlx_core.Error".to_owned()),
+            "{aliases:?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: truncated external reexports retain a typed schema-29 marker"
+    )]
+    fn truncated_external_reexports_only_mark_route_surface_incomplete() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-two-globs.json");
+        let produce = |max_records: usize| {
+            let mut request = request(path.clone());
+            request.activation[0].package = Some(NameSelector {
+                name: "sqlx".to_owned(),
+                version: Some("=1.0.0".to_owned()),
+            });
+            RustdocJsonPackProducer.produce_exact_artifact(
+                &request,
+                &ArtifactProducerLimits {
+                    max_records,
+                    ..ArtifactProducerLimits::default()
+                },
+            )
+        };
+        for max_records in [100, 2] {
+            let product = produce(max_records);
+            let pack = product
+                .pack
+                .unwrap_or_else(|| panic!("{:#?}", product.diagnostics));
+            assert_eq!(pack.rust_external_reexports.len(), 2, "{max_records}");
+            assert!(!pack.rust_external_reexports_truncated);
+            assert!(
+                product
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != "limit.rust_external_reexports"),
+                "{max_records}"
+            );
+        }
+        let product = produce(1);
+        assert_eq!(product.completeness, Completeness::Complete);
+        assert!(
+            product
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.rust_external_reexports"),
+            "{:#?}",
+            product.diagnostics
+        );
+        let pack = product.pack.expect("truncated routes still publish a pack");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        assert_eq!(pack.rust_external_reexports.len(), 1);
+        assert!(pack.rust_external_reexports_truncated);
+        let zero = produce(0)
+            .pack
+            .expect("zero retained routes still publish a pack");
+        assert!(zero.rust_external_reexports.is_empty());
+        assert!(zero.rust_external_reexports_truncated);
+        assert_eq!(zero.schema_version, brokk_bifrost_semantic::analyzer::semantic_model::RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: reexport namespace comes only from structured target kind"
+    )]
+    fn external_target_namespace_is_structured_or_unknown() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-public.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+        for (kind, expected) in [
+            ("function", Some(RustReexportTargetNamespace::Value)),
+            ("module", Some(RustReexportTargetNamespace::TypeOrModule)),
+            ("struct", None),
+        ] {
+            json["paths"]["100"]["kind"] = serde_json::json!(kind);
+            let document: RustdocCrate = serde_json::from_value(json.clone()).unwrap();
+            let route = collect_external_reexports(&document, 100).0.remove(0);
+            assert_eq!(route.target().namespace, expected, "{kind}");
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#10258: native Rustdoc Use items have null outer names")]
+    fn native_use_names_preserve_explicit_and_glob_reexports() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let native: RustdocCrate = serde_json::from_slice(
+            &fs::read(root.join("rustdoc-converter-inline/native-61.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            collect_external_reexports(&native, 100)
+                .0
+                .iter()
+                .any(|edge| matches!(
+                    edge, RustExternalReexport::ExplicitUse { facade_path, .. }
+                        if facade_path.ends_with(".Debug")
+                ))
+        );
+        let mut glob: RustdocCrate = serde_json::from_slice(
+            &fs::read(root.join("rustdoc-facade/facade-glob.json")).unwrap(),
+        )
+        .unwrap();
+        for item in glob.index.values_mut() {
+            if matches!(item.inner, ItemEnum::Use(_)) {
+                item.name = None;
+            }
+        }
+        assert!(
+            matches!(collect_external_reexports(&glob, 100).0.as_slice(),
+                [RustExternalReexport::GlobUse { facade_module_path, .. }] if facade_module_path == "sqlx"
+            )
+        );
+    }
+
+    #[test]
+    fn facade_reexports_require_schema_29_on_write_and_read() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/rustdoc-facade/facade-public.json");
+        let mut request = request(path);
+        request.activation[0].package = Some(NameSelector {
+            name: "sqlx".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        });
+        let product = RustdocJsonPackProducer
+            .produce_exact_artifact(&request, &ArtifactProducerLimits::default());
+        let pack = product
+            .pack
+            .unwrap_or_else(|| panic!("{:#?}", product.diagnostics));
+        assert_eq!(pack.schema_version, 29);
+        assert!(!pack.rust_external_reexports.is_empty());
+        let mut old = pack.clone();
+        old.schema_version = 28;
+        assert!(
+            compile_pack(&old, &CompilerOptions::default())
+                .unwrap_err()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "rust_external_reexports.schema_version")
+        );
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        let mut old_manifest: serde_json::Value =
+            serde_json::from_slice(&compiled.manifest_bytes).unwrap();
+        old_manifest["schema_version"] = serde_json::json!(28);
+        assert!(
+            brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest(
+                &serde_json::to_vec(&old_manifest).unwrap(),
+                &brokk_bifrost_semantic::analyzer::semantic_model::artifact::DecodeLimits::default(
+                ),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "68437a4a94ff: alias targets erased mutable reference types"
+    )]
+    fn alias_targets_are_exact_and_survive_validator_roundtrip() {
+        let mut doc = document(false);
+        let parameter = GenericParamDef {
+            name: "T".into(),
+            kind: GenericParamDefKind::Type {
+                bounds: vec![],
+                default: Some(Type::Primitive("u8".into())),
+                is_synthetic: false,
+            },
+        };
+        let aliases = [
+            (
+                100,
+                "Defaulted",
+                Type::Tuple(vec![
+                    Type::Generic("T".into()),
+                    Type::ResolvedPath(path(1, "widget::Widget")),
+                ]),
+            ),
+            (
+                101,
+                "Nested",
+                Type::ResolvedPath(RustdocPath {
+                    args: Some(Box::new(GenericArgs::AngleBracketed {
+                        args: vec![GenericArg::Type(Type::Generic("T".into()))],
+                        constraints: vec![],
+                    })),
+                    ..path(100, "widget::Defaulted")
+                }),
+            ),
+            (
+                102,
+                "Projection",
+                Type::QualifiedPath {
+                    name: "Item".into(),
+                    args: None,
+                    self_type: Box::new(Type::Generic("T".into())),
+                    trait_: None,
+                },
+            ),
+            (
+                103,
+                "Absent",
+                Type::ResolvedPath(path(999, "missing::Type")),
+            ),
+            (
+                104,
+                "Reference",
+                Type::BorrowedRef {
+                    lifetime: None,
+                    is_mutable: false,
+                    type_: Box::new(Type::Generic("T".into())),
+                },
+            ),
+        ];
+        let aliases = aliases.into_iter().chain([
+            (105, "Opaque", Type::ImplTrait(vec![])),
+            (
+                106,
+                "ConstArray",
+                Type::Array {
+                    type_: Box::new(Type::Primitive("u8".into())),
+                    len: "N".into(),
+                },
+            ),
+            (107, "Unbound", Type::Generic("Outside".into())),
+            (
+                108,
+                "MutableReference",
+                Type::BorrowedRef {
+                    lifetime: None,
+                    is_mutable: true,
+                    type_: Box::new(Type::Generic("T".into())),
+                },
+            ),
+            (
+                109,
+                "NestedMutableReference",
+                Type::Tuple(vec![Type::BorrowedRef {
+                    lifetime: None,
+                    is_mutable: true,
+                    type_: Box::new(Type::Generic("T".into())),
+                }]),
+            ),
+        ]);
+        for (id, name, type_) in aliases {
+            doc.index.insert(
+                Id(id),
+                item(
+                    id,
+                    Some(name),
+                    RustVisibility::Public,
+                    ItemEnum::TypeAlias(rustdoc_types::TypeAlias {
+                        type_,
+                        generics: Generics {
+                            params: vec![parameter.clone()],
+                            where_predicates: vec![],
+                        },
+                    }),
+                ),
+            );
+            doc.paths.insert(
+                Id(id),
+                ItemSummary {
+                    crate_id: 0,
+                    path: vec!["widget".into(), name.into()],
+                    kind: ItemKind::TypeAlias,
+                },
+            );
+            let ItemEnum::Module(root) = &mut doc.index.get_mut(&Id(0)).unwrap().inner else {
+                unreachable!()
+            };
+            root.items.push(Id(id));
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        let pack = production.pack.unwrap();
+        assert_eq!(pack.schema_version, 32);
+        let AuthoredPayload::DeclarationFacts { types, .. } = &pack.shards[0].payload else {
+            unreachable!()
+        };
+        let fact = |name: &str| {
+            types
+                .iter()
+                .find(|ty| ty.name == format!("widget.{name}"))
+                .unwrap()
+        };
+        assert!(matches!(
+            fact("Defaulted").alias_target,
+            Some(TypeRef::Tuple { .. })
+        ));
+        assert!(fact("Defaulted").type_parameter_defaults[0].is_some());
+        assert!(matches!(
+            fact("Nested").alias_target,
+            Some(TypeRef::Declared { .. })
+        ));
+        assert!(matches!(
+            fact("Reference").alias_target,
+            Some(TypeRef::ByRef { .. })
+        ));
+        assert!(fact("Projection").alias_target.is_none());
+        assert!(fact("Absent").alias_target.is_none());
+        for name in [
+            "Opaque",
+            "ConstArray",
+            "Unbound",
+            "MutableReference",
+            "NestedMutableReference",
+        ] {
+            assert!(fact(name).alias_target.is_none(), "{name}");
+        }
+        let decoded = serde_json::from_slice(&serde_json::to_vec(&pack).unwrap()).unwrap();
+        compile_pack(&decoded, &CompilerOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn io_result_alias_target_requires_cross_document_owner() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rustdoc-contract");
+        let root = tempfile::tempdir().unwrap();
+        for name in ["core", "std"] {
+            fs::copy(
+                fixture.join(format!("{name}.json")),
+                root.path().join(format!("{name}.json")),
+            )
+            .unwrap();
+        }
+        let binder = |name: &str| GenericParamDef {
+            name: name.into(),
+            kind: GenericParamDefKind::Type {
+                bounds: vec![],
+                default: None,
+                is_synthetic: false,
+            },
+        };
+        let core_path = root.path().join("core.json");
+        let mut core: RustdocCrate =
+            serde_json::from_slice(&fs::read(&core_path).unwrap()).unwrap();
+        core.index.insert(
+            Id(100),
+            item(
+                100,
+                Some("Result"),
+                RustVisibility::Public,
+                ItemEnum::Enum(rustdoc_types::Enum {
+                    generics: Generics {
+                        params: vec![binder("T"), binder("E")],
+                        where_predicates: vec![],
+                    },
+                    has_stripped_variants: false,
+                    variants: vec![],
+                    impls: vec![],
+                }),
+            ),
+        );
+        core.paths.insert(
+            Id(100),
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["core".into(), "result".into(), "Result".into()],
+                kind: ItemKind::Enum,
+            },
+        );
+        let ItemEnum::Module(module) = &mut core.index.get_mut(&core.root).unwrap().inner else {
+            unreachable!()
+        };
+        module.items.push(Id(100));
+        fs::write(&core_path, serde_json::to_vec(&core).unwrap()).unwrap();
+        let std_path = root.path().join("std.json");
+        let mut doc: RustdocCrate = serde_json::from_slice(&fs::read(&std_path).unwrap()).unwrap();
+        doc.index.insert(
+            Id(100),
+            item(
+                100,
+                Some("Result"),
+                RustVisibility::Public,
+                ItemEnum::TypeAlias(rustdoc_types::TypeAlias {
+                    type_: Type::ResolvedPath(RustdocPath {
+                        args: Some(Box::new(GenericArgs::AngleBracketed {
+                            args: vec![
+                                GenericArg::Type(Type::Generic("T".into())),
+                                GenericArg::Type(Type::ResolvedPath(path(102, "std::io::Error"))),
+                            ],
+                            constraints: vec![],
+                        })),
+                        ..path(101, "core::result::Result")
+                    }),
+                    generics: Generics {
+                        params: vec![binder("T")],
+                        where_predicates: vec![],
+                    },
+                }),
+            ),
+        );
+        doc.paths.insert(
+            Id(100),
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["std".into(), "io".into(), "Result".into()],
+                kind: ItemKind::TypeAlias,
+            },
+        );
+        doc.paths.insert(
+            Id(101),
+            ItemSummary {
+                crate_id: 1,
+                path: vec!["core".into(), "result".into(), "Result".into()],
+                kind: ItemKind::Enum,
+            },
+        );
+        doc.index.insert(
+            Id(102),
+            item(
+                102,
+                Some("Error"),
+                RustVisibility::Public,
+                ItemEnum::Struct(Struct {
+                    kind: StructKind::Unit,
+                    generics: generics(),
+                    impls: vec![],
+                }),
+            ),
+        );
+        doc.paths.insert(
+            Id(102),
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["std".into(), "io".into(), "Error".into()],
+                kind: ItemKind::Struct,
+            },
+        );
+        let ItemEnum::Module(module) = &mut doc.index.get_mut(&doc.root).unwrap().inner else {
+            unreachable!()
+        };
+        module.items.extend([Id(100), Id(102)]);
+        fs::write(&std_path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        for include_core in [true, false] {
+            let crates = if include_core {
+                vec![
+                    ("core".into(), "core.json".into()),
+                    ("std".into(), "std.json".into()),
+                ]
+            } else {
+                vec![("std".into(), "std.json".into())]
+            };
+            let paths = crates
+                .iter()
+                .map(|(_, path): &(String, String)| std::path::PathBuf::from(path))
+                .collect::<Vec<_>>();
+            let limits = ArtifactProducerLimits::default();
+            let artifact = read_exact_source_set(root.path(), &paths, 3, 8, &limits).unwrap();
+            let mut request = request(root.path().to_path_buf());
+            request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+            request.activation[0].package = None;
+            let pack = RustdocJsonPackProducer
+                .produce_loaded_source_set(&request, &limits, None, &artifact, &crates)
+                .pack
+                .unwrap();
+            let alias = pack
+                .shards
+                .iter()
+                .find_map(|shard| match &shard.payload {
+                    AuthoredPayload::DeclarationFacts { types, .. } => {
+                        types.iter().find(|ty| ty.name == "std.io.Result")
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(alias.alias_target.is_some(), include_core);
+            assert_eq!(pack.schema_version == 32, include_core);
+            if include_core {
+                compile_pack(&pack, &CompilerOptions::default()).unwrap();
+            }
+        }
+    }
 
     fn generics() -> Generics {
         Generics {
@@ -4249,6 +6078,42 @@ mod tests {
     }
 
     #[test]
+    fn conversion_certificate_is_parser_and_pack_neutral() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let request = hashmap_request(file.path().to_path_buf(), "std");
+        let plain = serde_json::to_value(hashmap_document("std")).unwrap();
+        fs::write(file.path(), serde_json::to_vec(&plain).unwrap()).unwrap();
+        let mut plain_pack = RustdocJsonPackProducer
+            .produce(&request, &ArtifactProducerLimits::default(), None)
+            .pack
+            .expect("plain document produces a pack");
+        let mut converted = plain.clone();
+        converted["_bifrost_conversion"] = serde_json::json!({
+            "producer_contract": RUSTDOC_PRODUCER_CONTRACT,
+            "uncertified_fields": ["Item::stability"]
+        });
+        let parsed: RustdocCrate = serde_json::from_value(converted.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), plain);
+        fs::write(file.path(), serde_json::to_vec(&converted).unwrap()).unwrap();
+        let mut converted_pack = RustdocJsonPackProducer
+            .produce(&request, &ArtifactProducerLimits::default(), None)
+            .pack
+            .expect("converted document produces a pack");
+        // The input digest intentionally changes; compare the authored pack
+        // after removing only its artifact identity references.
+        assert_ne!(converted_pack.extraction, plain_pack.extraction);
+        for pack in [&mut plain_pack, &mut converted_pack] {
+            pack.extraction = None;
+            for shard in &mut pack.shards {
+                for selector in &mut shard.activation {
+                    selector.artifact_sha256 = None;
+                }
+            }
+        }
+        assert_eq!(converted_pack, plain_pack);
+    }
+
+    #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#6542: Rust std production discarded cross-document owners and trait contracts"
     )]
@@ -4290,7 +6155,10 @@ mod tests {
         standalone_request.artifact_kind = ExternalArtifactKind::RustdocJson;
         let standalone =
             RustdocJsonPackProducer.produce_exact_artifact(&standalone_request, &limits);
-        assert_eq!(standalone.completeness, Completeness::Partial);
+        assert_eq!(standalone.completeness, Completeness::Complete);
+        assert!(standalone.pack.as_ref().is_some_and(|pack| {
+            !pack.rust_external_reexports.is_empty() && !pack.rust_external_reexports_truncated
+        }));
         assert!(
             standalone
                 .diagnostics
@@ -4300,12 +6168,55 @@ mod tests {
         let pack = production
             .pack
             .expect("synthetic source set produces facts");
+        assert!(!pack.rust_external_reexports_truncated);
+        assert!(!pack.rust_external_reexports_glob_incomplete);
+        assert!(pack.rust_external_reexports.is_empty());
+        assert_eq!(
+            pack.schema_version,
+            crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
+        );
         let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
         assert_eq!(
             lowest_schema_version(&pack, &CompilerOptions::default()).unwrap(),
             19
         );
         assert_eq!(compiled.shards.len(), 1, "small modules share one shard");
+        // Source production, schema-29 production relabeling, the schema-28
+        // approximation gate, and release lowest-schema labeling all decode
+        // the same ordinary Rust declarations when no reexports are carried.
+        let mut payloads = Vec::new();
+        for schema_version in [19, 22, 28, 29] {
+            let mut relabelled = pack.clone();
+            relabelled.schema_version = schema_version;
+            let compiled = compile_pack(&relabelled, &CompilerOptions::default()).unwrap();
+            assert!(compiled.manifest.rust_external_reexports.is_empty());
+            assert!(
+                !String::from_utf8_lossy(&compiled.manifest_bytes)
+                    .contains("rust_external_reexports")
+            );
+            let manifest =
+                brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest(
+                    &compiled.manifest_bytes,
+                    &DecodeLimits::default(),
+                )
+                .unwrap();
+            let payload = compiled
+                .shards
+                .iter()
+                .map(|shard| {
+                    let decoded = brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_shard_for_manifest(
+                        &manifest,
+                        &shard.descriptor,
+                        &shard.bytes,
+                        &DecodeLimits::default(),
+                    )
+                    .unwrap();
+                    serde_json::to_value(decoded.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            payloads.push(payload);
+        }
+        assert!(payloads.windows(2).all(|pair| pair[0] == pair[1]));
         assert!(
             pack.shards
                 .iter()
@@ -4739,8 +6650,14 @@ mod tests {
         assert!(
             members.iter().any(|fact| fact.owner == widget.id
                 && fact.name == "consume"
-                && !fact.callable_family_complete),
-            "a skipped impl member in another document blocks the defining owner's families"
+                && fact.callable_family_complete),
+            "a joined external impl owner does not poison the defining owner's families"
+        );
+        assert!(
+            members.iter().any(|fact| fact.owner == widget.id
+                && fact.name == "consume"
+                && matches!(&fact.locator, Locator::Artifact { path, .. } if path == "alloc.json")),
+            "the joined impl member retains its defining alloc document locator"
         );
 
         // Suppression must not erase the owner-scoped failed-decode evidence.
@@ -4797,6 +6714,45 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "declaration.rust_contract_schema_version")
         );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: two-document set reexports retain master-compatible absence of carrier"
+    )]
+    fn two_document_source_set_public_use_keeps_master_carrier_bytes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rustdoc-contract");
+        let paths = ["core.json", "std.json"].map(std::path::PathBuf::from);
+        let limits = ArtifactProducerLimits::default();
+        let artifact = read_exact_source_set(&root, &paths, 2, 8, &limits).unwrap();
+        let mut request = request(root.join("stdlib"));
+        request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+        request.activation[0].package = None;
+        request.activation[0].module = None;
+        let production = RustdocJsonPackProducer.produce_loaded_source_set(
+            &request,
+            &limits,
+            None,
+            &artifact,
+            &[
+                ("core".into(), "core.json".into()),
+                ("std".into(), "std.json".into()),
+            ],
+        );
+        let pack = production.pack.expect("two-document source set pack");
+        assert!(!pack.rust_external_reexports_truncated);
+        assert!(pack.rust_external_reexports.is_empty());
+        assert!(!pack.rust_external_reexports_glob_incomplete);
+        assert!(pack.schema_version < brokk_bifrost_semantic::analyzer::semantic_model::RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION);
+        // Master already projects this in-set alias as an ordinary fact.
+        assert!(pack.shards.iter().any(|shard| {
+            match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => types
+                    .iter()
+                    .any(|fact| fact.aliases.contains(&"std.Widget".to_owned())),
+                _ => false,
+            }
+        }));
     }
 
     #[test]
@@ -5094,6 +7050,427 @@ mod tests {
         }
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "4a60102383ba: external impl owners poisoned joined callable families"
+    )]
+    fn external_impl_owners_resolve_per_source_set() {
+        let owner_id = |name: &str| {
+            type_declaration_id(TypeIdentity {
+                ecosystem: "cargo",
+                name,
+            })
+        };
+        let root = tempfile::tempdir().unwrap();
+        write_crate_document(root.path(), "core");
+        write_crate_document(root.path(), "alloc");
+        write_crate_document(root.path(), "std");
+        let std_path = root.path().join("std.json");
+        let mut extension: RustdocCrate =
+            serde_json::from_slice(&fs::read(&std_path).unwrap()).unwrap();
+        extension.index.remove(&Id(1));
+        extension.paths.get_mut(&Id(1)).unwrap().path = vec!["alloc".into(), "Widget".into()];
+        extension.paths.get_mut(&Id(1)).unwrap().crate_id = 1;
+        let ItemEnum::Module(module) = &mut extension.index.get_mut(&Id(0)).unwrap().inner else {
+            unreachable!()
+        };
+        module.items = vec![Id(2), Id(7)];
+        fs::write(&std_path, serde_json::to_vec(&extension).unwrap()).unwrap();
+        let produce = |names: &[&str]| {
+            let limits = ArtifactProducerLimits {
+                max_signature_depth: 16,
+                ..ArtifactProducerLimits::default()
+            };
+            let paths = names
+                .iter()
+                .map(|name| std::path::PathBuf::from(format!("{name}.json")))
+                .collect::<Vec<_>>();
+            let artifact =
+                read_exact_source_set(root.path(), &paths, names.len(), 8, &limits).unwrap();
+            let mut request = request(root.path().join("stdlib"));
+            request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+
+            let crates = names
+                .iter()
+                .map(|name| (name.to_string(), format!("{name}.json")))
+                .collect::<Vec<_>>();
+            let production = RustdocJsonPackProducer
+                .produce_loaded_source_set(&request, &limits, None, &artifact, &crates);
+            let pack = production
+                .pack
+                .unwrap_or_else(|| panic!("{:?}", production.diagnostics));
+            compile_pack(&pack, &CompilerOptions::default())
+                .unwrap_or_else(|diagnostics| panic!("{diagnostics:#?}"));
+            let members = pack
+                .shards
+                .into_iter()
+                .flat_map(|shard| match shard.payload {
+                    AuthoredPayload::DeclarationFacts { members, .. } => members,
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            (members, production.diagnostics)
+        };
+        let (missing, diagnostics) = produce(&["std"]);
+        assert!(
+            !missing
+                .iter()
+                .any(|member| member.owner == owner_id("alloc.Widget"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "rust.rustdoc.missing_member_owner")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "rust.rustdoc.missing_member_owner")
+                .all(|diagnostic| diagnostic.declaration.is_none()
+                    || diagnostic.source_entry.is_none())
+        );
+        let (joined, _) = produce(&["std", "alloc"]);
+        let extensions = joined
+            .iter()
+            .filter(|member| member.owner == owner_id("alloc.Widget") && member.name == "render")
+            .collect::<Vec<_>>();
+        assert_eq!(extensions.len(), 2);
+        assert!(
+            extensions
+                .iter()
+                .all(|member| member.callable_family_complete)
+        );
+        assert!(extensions.iter().any(
+            |member| matches!(&member.locator, Locator::Artifact { path, .. } if path == "std.json")
+        ));
+        let (no_std, _) = produce(&["core", "alloc"]);
+        let own = no_std
+            .iter()
+            .find(|member| member.owner == owner_id("alloc.Widget") && member.name == "render")
+            .unwrap();
+        assert!(own.callable_family_complete);
+        assert!(
+            joined
+                .iter()
+                .any(|member| member.id == own.id && member.locator == own.locator)
+        );
+        // The same impl displayed in both documents has one canonical identity.
+        let original_extension = fs::read(&std_path).unwrap();
+        let mut duplicate = extension.clone();
+        duplicate.paths.get_mut(&Id(2)).unwrap().path = vec!["alloc".into(), "Display".into()];
+        fs::write(&std_path, serde_json::to_vec(&duplicate).unwrap()).unwrap();
+        let (deduplicated, _) = produce(&["alloc", "std"]);
+        assert_eq!(deduplicated.iter().filter(|member| member.owner == owner_id("alloc.Widget") && member.name == "render").count(), 1, "{deduplicated:#?}");
+        fs::write(&std_path, original_extension).unwrap();
+
+        // An external impl retains the receiver's generic return binding.
+        let alloc_path = root.path().join("alloc.json");
+        let original_alloc = fs::read(&alloc_path).unwrap();
+        let original_std = fs::read(&std_path).unwrap();
+        for path in [&alloc_path, &std_path] {
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let binder = if path == &std_path { "X" } else { "T" };
+            let parameters = serde_json::json!([{"name":binder, "kind":{"type":{"bounds":[], "default":null, "is_synthetic":false}}}]);
+            if json["index"]["1"].is_object() {
+                json["index"]["1"]["inner"]["struct"]["generics"]["params"] = parameters.clone();
+            }
+            json["index"]["2"]["inner"]["trait"]["generics"]["params"] = serde_json::json!([{"name":"T", "kind":{"type":{"bounds":[], "default":null, "is_synthetic":false}}}]);
+            json["index"]["7"]["inner"]["impl"]["trait"]["args"] = serde_json::json!({"angle_bracketed":{"args":[{"type":{"generic":binder}}],"constraints":[]}});
+            json["index"]["7"]["inner"]["impl"]["generics"]["params"] = parameters;
+            json["index"]["7"]["inner"]["impl"]["for"]["resolved_path"]["args"] = serde_json::json!({"angle_bracketed":{"args":[{"type":{"generic":binder}}],"constraints":[]}});
+            json["index"]["8"]["inner"]["function"]["sig"]["output"] =
+                serde_json::json!({"generic":binder});
+            fs::write(path, serde_json::to_vec(&json).unwrap()).unwrap();
+        }
+        let (generic_members, _) = produce(&["alloc", "std"]);
+        let generic_extensions = generic_members
+            .iter()
+            .filter(|member| member.owner == owner_id("alloc.Widget") && member.name == "render")
+            .collect::<Vec<_>>();
+        assert_eq!(generic_extensions.len(), 2);
+        assert!(
+            generic_extensions
+                .iter()
+                .all(|member| member.signature.as_ref().unwrap().returns
+                    == Some(TypeRef::TypeParameter { name: "T".into() }))
+        );
+        assert!(generic_extensions.iter().all(|member| {
+            match member.implemented_trait.as_ref().unwrap() {
+                TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } => {
+                    arguments == &[TypeRef::TypeParameter { name: "T".into() }]
+                }
+                _ => false,
+            }
+        }));
+        // Rejected documents must never supply or overwrite owner binders.
+        let mut rejected: serde_json::Value =
+            serde_json::from_slice(&fs::read(&alloc_path).unwrap()).unwrap();
+        rejected["index"]["0"]["name"] = serde_json::json!("zzz");
+        rejected["paths"]["0"]["path"] = serde_json::json!(["zzz"]);
+        rejected["index"]["1"]["inner"]["struct"]["generics"]["params"] = serde_json::json!([{"name":"Poison", "kind":{"type":{"bounds":[], "default":null, "is_synthetic":false}}}]);
+        for code in [
+            "rust.rustdoc.unsupported_version",
+            "rust.rustdoc.uncertified_conversion",
+            "rust.rustdoc.crate_name_mismatch",
+            "rust.rustdoc.crate_version_mismatch",
+            "rust.rustdoc.target_mismatch",
+            "rust.rustdoc.invalid_root",
+            "rust.rustdoc.missing_root",
+        ] {
+            let mut bad = rejected.clone();
+            match code {
+                "rust.rustdoc.unsupported_version" => {
+                    bad["format_version"] = serde_json::json!(RUSTDOC_FORMAT_VERSION + 1)
+                }
+                "rust.rustdoc.uncertified_conversion" => {
+                    bad["_bifrost_conversion"] =
+                        serde_json::json!({"producer_contract":"wrong", "uncertified_fields":[]})
+                }
+                "rust.rustdoc.crate_name_mismatch" => {
+                    bad["index"]["0"]["name"] = serde_json::json!("wrong")
+                }
+                "rust.rustdoc.crate_version_mismatch" => {
+                    bad["crate_version"] = serde_json::json!("999.0.0")
+                }
+                "rust.rustdoc.target_mismatch" => {
+                    bad["target"]["triple"] = serde_json::json!("wrong-target")
+                }
+                "rust.rustdoc.invalid_root" => {
+                    bad["index"]["0"]["inner"] = bad["index"]["1"]["inner"].clone()
+                }
+                "rust.rustdoc.missing_root" => {
+                    bad["index"].as_object_mut().unwrap().remove("0");
+                }
+                _ => unreachable!(),
+            }
+            fs::write(
+                root.path().join("zzz.json"),
+                serde_json::to_vec(&bad).unwrap(),
+            )
+            .unwrap();
+            let (usable_members, rejected_diagnostics) = produce(&["alloc", "std", "zzz"]);
+            assert!(
+                rejected_diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "{code}"
+            );
+            assert!(usable_members.iter().any(|member| member.owner == owner_id("alloc.Widget") && member.name == "render" && matches!(&member.locator, Locator::Artifact { path, .. } if path == "std.json") && member.signature.as_ref().unwrap().returns == Some(TypeRef::TypeParameter { name: "T".into() })), "{code}");
+        }
+        let generic_alloc = fs::read(&alloc_path).unwrap();
+        let mut no_path: serde_json::Value = serde_json::from_slice(&generic_alloc).unwrap();
+        no_path["paths"].as_object_mut().unwrap().remove("1");
+        fs::write(&alloc_path, serde_json::to_vec(&no_path).unwrap()).unwrap();
+        let (derived_name_members, _) = produce(&["alloc", "std"]);
+        assert!(derived_name_members.iter().filter(|member| member.owner == owner_id("alloc.Widget") && member.name == "render").all(|member| member.signature.as_ref().unwrap().returns == Some(TypeRef::TypeParameter { name: "T".into() })));
+        fs::write(&alloc_path, generic_alloc).unwrap();
+
+        let mut shadowed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&std_path).unwrap()).unwrap();
+        shadowed["index"]["8"]["inner"]["function"]["generics"]["params"] = serde_json::json!([{"name":"T", "kind":{"type":{"bounds":[], "default":null, "is_synthetic":false}}}]);
+        fs::write(&std_path, serde_json::to_vec(&shadowed).unwrap()).unwrap();
+        let (shadowed_members, shadowed_diagnostics) = produce(&["alloc", "std"]);
+        assert!(
+            shadowed_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "rust.rustdoc.impl_binder_shadowed")
+        );
+        assert!(shadowed_members.iter().any(
+            |member| matches!(&member.locator, Locator::Artifact { path, .. } if path == "std.json")
+                && member.name == "render"
+                && !member.callable_family_complete
+                && matches!(
+                    member.signature.as_ref().unwrap().returns,
+                    Some(TypeRef::Wildcard { .. })
+                )
+        ));
+        fs::write(&alloc_path, original_alloc).unwrap();
+        fs::write(&std_path, original_std).unwrap();
+
+        // An impl-only binder is not a parameter of a non-generic owner.
+        let original_std = fs::read(&std_path).unwrap();
+        let mut extra: serde_json::Value = serde_json::from_slice(&original_std).unwrap();
+        extra["index"]["7"]["inner"]["impl"]["generics"]["params"] = serde_json::json!([{"name":"Extra", "kind":{"type":{"bounds":[], "default":null, "is_synthetic":false}}}]);
+        extra["index"]["8"]["inner"]["function"]["sig"]["output"] =
+            serde_json::json!({"generic":"Extra"});
+        fs::write(&std_path, serde_json::to_vec(&extra).unwrap()).unwrap();
+        let (extra_members, _) = produce(&["alloc", "std"]);
+        assert!(
+            extra_members
+                .iter()
+                .any(|member| member.owner == owner_id("alloc.Widget")
+                    && member.name == "render"
+                    && matches!(
+                        member.signature.as_ref().unwrap().returns,
+                        Some(TypeRef::Wildcard { .. })
+                    ))
+        );
+        fs::write(&std_path, original_std).unwrap();
+
+        // Pair<X, X> cannot transport X to two distinct owner parameters.
+        let saved_alloc = fs::read(&alloc_path).unwrap();
+        let saved_std = fs::read(&std_path).unwrap();
+        let binder_parameter = |name: &str| serde_json::json!({"name":name, "kind":{"type":{"bounds":[], "default":null, "is_synthetic":false}}});
+        let mut pair: serde_json::Value = serde_json::from_slice(&saved_alloc).unwrap();
+        pair["index"]["1"]["inner"]["struct"]["generics"]["params"] =
+            serde_json::json!([binder_parameter("A"), binder_parameter("B")]);
+        pair["index"]["1"]["inner"]["struct"]["impls"] = serde_json::json!([]);
+        pair["index"].as_object_mut().unwrap().remove("7");
+        pair["index"].as_object_mut().unwrap().remove("8");
+        fs::write(&alloc_path, serde_json::to_vec(&pair).unwrap()).unwrap();
+        let mut repeated: serde_json::Value = serde_json::from_slice(&saved_std).unwrap();
+        repeated["index"]["2"]["inner"]["trait"]["generics"]["params"] =
+            serde_json::json!([binder_parameter("Y")]);
+        repeated["index"]["7"]["inner"]["impl"]["generics"]["params"] =
+            serde_json::json!([binder_parameter("X")]);
+        repeated["index"]["7"]["inner"]["impl"]["for"]["resolved_path"]["args"] = serde_json::json!({"angle_bracketed":{"args":[{"type":{"generic":"X"}},{"type":{"generic":"X"}}],"constraints":[]}});
+        repeated["index"]["7"]["inner"]["impl"]["trait"]["args"] = serde_json::json!({"angle_bracketed":{"args":[{"type":{"generic":"X"}}],"constraints":[]}});
+        repeated["index"]["8"]["inner"]["function"]["sig"]["output"] =
+            serde_json::json!({"generic":"X"});
+        fs::write(&std_path, serde_json::to_vec(&repeated).unwrap()).unwrap();
+        let (repeated_members, repeated_diagnostics) = produce(&["alloc", "std"]);
+        assert!(
+            repeated_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "rust.rustdoc.impl_binder_ambiguous")
+        );
+        let repeated_member = repeated_members
+            .iter()
+            .find(|member| member.owner == owner_id("alloc.Widget") && member.name == "render")
+            .unwrap();
+        assert!(!repeated_member.callable_family_complete);
+        assert!(matches!(
+            repeated_member.signature.as_ref().unwrap().returns,
+            Some(TypeRef::Wildcard { .. })
+        ));
+        assert!(
+            matches!(repeated_member.implemented_trait.as_ref().unwrap(), TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } if arguments == &[TypeRef::Unknown])
+        );
+        fs::write(&alloc_path, saved_alloc).unwrap();
+        fs::write(&std_path, saved_std).unwrap();
+
+        // A renamed binder keeps its existing local projection and identity,
+        // even when the external presentation sorts before the defining crate.
+        write_crate_document(root.path(), "zzz");
+        let owner_path = root.path().join("zzz.json");
+        let mut local: serde_json::Value =
+            serde_json::from_slice(&fs::read(&owner_path).unwrap()).unwrap();
+        local["index"]["1"]["inner"]["struct"]["generics"]["params"] =
+            serde_json::json!([binder_parameter("T")]);
+        local["index"]["7"]["inner"]["impl"]["generics"]["params"] =
+            serde_json::json!([binder_parameter("X")]);
+        local["index"]["7"]["inner"]["impl"]["for"]["resolved_path"]["args"] = serde_json::json!({"angle_bracketed":{"args":[{"type":{"generic":"X"}}],"constraints":[]}});
+        local["index"]["8"]["inner"]["function"]["sig"]["inputs"][0][0] = serde_json::json!("self");
+        let argument = local["index"]["7"]["inner"]["impl"]["for"].clone();
+        local["index"]["8"]["inner"]["function"]["sig"]["inputs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(["other", argument]));
+        local["index"]["8"]["inner"]["function"]["sig"]["output"] =
+            serde_json::json!({"generic":"X"});
+        fs::write(&owner_path, serde_json::to_vec(&local).unwrap()).unwrap();
+        let (local_members, _) = produce(&["zzz"]);
+        let existing_local = local_members
+            .iter()
+            .find(|member| member.owner == owner_id("zzz.Widget") && member.name == "render")
+            .unwrap();
+        assert!(matches!(
+            existing_local.signature.as_ref().unwrap().returns,
+            Some(TypeRef::Wildcard { .. })
+        ));
+        let mut external = local.clone();
+        external["index"]["0"]["name"] = serde_json::json!("aaa");
+        external["paths"]["0"]["path"] = serde_json::json!(["aaa"]);
+        external["index"]["0"]["inner"]["module"]["items"] = serde_json::json!([7]);
+        external["index"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|id, _| matches!(id.as_str(), "0" | "7" | "8"));
+        external["paths"]["1"]["crate_id"] = serde_json::json!(1);
+        external["paths"]["2"]["crate_id"] = serde_json::json!(1);
+        fs::write(
+            root.path().join("aaa.json"),
+            serde_json::to_vec(&external).unwrap(),
+        )
+        .unwrap();
+        let (folded, _) = produce(&["aaa", "zzz"]);
+        let folded = folded
+            .iter()
+            .filter(|member| member.owner == owner_id("zzz.Widget") && member.name == "render")
+            .collect::<Vec<_>>();
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].id, existing_local.id);
+        assert_eq!(folded[0].signature, existing_local.signature);
+        assert_eq!(folded[0].locator, existing_local.locator);
+        assert!(matches!(&folded[0].locator, Locator::Artifact { path, .. } if path == "zzz.json"));
+        local["index"]["1"]["inner"]["struct"]["impls"] = serde_json::json!([]);
+        local["index"].as_object_mut().unwrap().remove("7");
+        local["index"].as_object_mut().unwrap().remove("8");
+        fs::write(&owner_path, serde_json::to_vec(&local).unwrap()).unwrap();
+        let (external_only, _) = produce(&["aaa", "zzz"]);
+        let external_only = external_only
+            .iter()
+            .find(|member| member.owner == owner_id("zzz.Widget") && member.name == "render")
+            .unwrap();
+        assert_ne!(external_only.id, existing_local.id);
+        assert_eq!(
+            external_only.signature.as_ref().unwrap().returns,
+            Some(TypeRef::TypeParameter { name: "T".into() })
+        );
+        assert!(
+            matches!(&external_only.locator, Locator::Artifact { path, .. } if path == "aaa.json")
+        );
+        assert!(external_only.callable_family_complete);
+
+        // Signature-depth failures must still veto the owner after the join,
+        // for both a local declaration and an externally implemented owner.
+        for crate_name in ["std", "alloc"] {
+            let path = root.path().join(format!("{crate_name}.json"));
+            let bytes = fs::read(&path).unwrap();
+            let mut broken: RustdocCrate = serde_json::from_slice(&bytes).unwrap();
+            let ItemEnum::Function(function) = &mut broken.index.get_mut(&Id(8)).unwrap().inner
+            else {
+                unreachable!()
+            };
+            let mut output = Type::Primitive("str".into());
+            for _ in 0..20 {
+                output = Type::Tuple(vec![output]);
+            }
+            function.sig.output = Some(output);
+            fs::write(&path, serde_json::to_vec(&broken).unwrap()).unwrap();
+            let (members, diagnostics) = produce(&["core", "alloc", "std"]);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "limit.signature_depth")
+            );
+            assert!(
+                members
+                    .iter()
+                    .filter(|member| member.owner == owner_id("alloc.Widget")
+                        && member.name == "render")
+                    .all(|member| !member.callable_family_complete)
+            );
+            assert!(
+                members
+                    .iter()
+                    .any(|member| member.owner == owner_id("core.Widget")
+                        && member.name == "render"
+                        && member.callable_family_complete)
+            );
+            fs::write(&path, bytes).unwrap();
+            let (restored, _) = produce(&["alloc", "std"]);
+            assert!(
+                restored
+                    .iter()
+                    .filter(|member| member.owner == owner_id("alloc.Widget")
+                        && member.name == "render")
+                    .all(|member| member.callable_family_complete)
+            );
+        }
+    }
+
     fn write_crate_document(root: &Path, crate_name: &str) {
         let mut document = document(false);
         document.index.get_mut(&document.root).unwrap().name = Some(crate_name.to_owned());
@@ -5130,6 +7507,7 @@ mod tests {
                 artifact_sha256: None,
             }],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
                 revision: None,
             },
@@ -5216,6 +7594,28 @@ mod tests {
             Some(artifact.sha256())
         );
         assert_eq!(pack.provenance, request.provenance);
+    }
+
+    #[test]
+    fn unchanged_rustdoc_pack_keeps_pre_layout_serialization_shape() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), serde_json::to_vec(&document(false)).unwrap()).unwrap();
+        let production = RustdocJsonPackProducer.produce_exact_artifact(
+            &request(file.path().to_path_buf()),
+            &ArtifactProducerLimits::default(),
+        );
+        let pack = production.pack.expect("unchanged rustdoc produces a pack");
+        assert_eq!(pack.schema_version, 22);
+        let serialized = serde_json::to_value(&pack).unwrap();
+        assert_eq!(serialized["schema_version"], 22);
+        let mut type_count = 0;
+        for shard in serialized["shards"].as_array().unwrap() {
+            for ty in shard["payload"]["types"].as_array().unwrap() {
+                type_count += 1;
+                assert!(ty.get("tuple_fields").is_none());
+            }
+        }
+        assert!(type_count > 0, "fixture must exercise generated TypeFacts");
     }
 
     #[test]
@@ -5657,5 +8057,31 @@ mod tests {
 
         assert!(production.pack.is_none());
         assert_eq!(production.diagnostics[0].code, "artifact.cancelled");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: cancelled reexport collection cannot publish partial routes"
+    )]
+    fn cancelled_reexport_collection_returns_no_carrier() {
+        let document = document(false);
+        let cancellation = CancellationToken::new();
+        let mut visited = 0;
+        let result = collect_external_reexports_status_with_probe(
+            &document,
+            100,
+            Some(&cancellation),
+            || {
+                visited += 1;
+                if visited == 2 {
+                    cancellation.cancel();
+                }
+            },
+        );
+        assert_eq!(visited, 2, "the walk was cancelled after a retained item");
+        assert!(
+            result.is_err(),
+            "partial route state must never be returned"
+        );
     }
 }

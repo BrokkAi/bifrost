@@ -285,26 +285,53 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     pub(in crate::analyzer::kotlin::semantic) fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
         procedure_kind: ProcedureKind,
         properties: ProcedureProperties,
     ) -> Result<(), KotlinLoweringError> {
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots(
+        if self.session.cancellation().is_cancelled() {
+            return Err(KotlinLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = formal_parameter_slots_for_owner_with_nodes(
             Language::Kotlin,
-            self.prepared.tree().root_node(),
+            callable,
             self.prepared.source(),
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        );
+        if self.session.cancellation().is_cancelled() {
+            return Err(KotlinLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = match slots {
+            Some(slots) => slots,
+            None if matches!(
+                callable.kind(),
+                "anonymous_initializer"
+                    | "property_declaration"
+                    | "class_parameter"
+                    | "enum_entry"
+                    | "getter"
+            ) =>
+            {
+                Vec::new()
+            }
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "Kotlin callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
+        };
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
-            let node = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
+        for (slot, node) in slots {
             let metadata = self.value_mapping(builder, node)?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
@@ -312,7 +339,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: false },
+                    SemanticValueKind::Receiver {
+                        dispatch: false,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(value);
                 value
@@ -374,7 +404,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: false },
+                SemanticValueKind::Receiver {
+                    dispatch: false,
+                    mode: Default::default(),
+                },
             )?);
         }
 
@@ -392,7 +425,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?);
         }
         Ok(())

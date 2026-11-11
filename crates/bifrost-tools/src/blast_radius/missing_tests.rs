@@ -196,6 +196,7 @@ fn propagate_reachability_frontier(
 }
 
 struct PreparedMissingTests {
+    incomplete: Vec<crate::result_incomplete::ToolResultIncomplete>,
     prepared: PreparedDiff,
     endpoints: BlastRadiusEndpoints,
     paths_outside_file_graph: Vec<String>,
@@ -221,8 +222,10 @@ pub fn missing_tests_at_root(
     params: MissingTestsParams,
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<MissingTestsResult, String> {
-    let mut work = prepare_missing_tests_at_root(root, params, options, cancellation)?;
+    let mut work =
+        prepare_missing_tests_at_root(root, params, options, cancellation, retention_budget)?;
     if work.candidates.is_empty() {
         return Ok(finish_missing_tests(
             work,
@@ -275,6 +278,7 @@ fn prepare_missing_tests_at_root(
     params: MissingTestsParams,
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<PreparedMissingTests, String> {
     let prepared = PreparedDiff::at_root(
         root,
@@ -284,6 +288,7 @@ fn prepare_missing_tests_at_root(
         },
         options,
         cancellation,
+        retention_budget,
     )?;
     let endpoints = BlastRadiusEndpoints {
         base: prepared.base.label(),
@@ -297,7 +302,9 @@ fn prepare_missing_tests_at_root(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let symbol_changes = analyze_prepared_symbol_changes(&prepared, false)?.into_symbol_changes();
+    let symbol_changes = analyze_prepared_symbol_changes(&prepared, false)?;
+    let incomplete = symbol_changes.incomplete().to_vec();
+    let symbol_changes = symbol_changes.into_symbol_changes();
     let mut candidates = changed_callables(&symbol_changes)
         .into_iter()
         .filter_map(|change| {
@@ -336,6 +343,7 @@ fn prepare_missing_tests_at_root(
             .then_with(|| left.record.after.fqn.cmp(&right.record.after.fqn))
     });
     Ok(PreparedMissingTests {
+        incomplete,
         prepared,
         endpoints,
         paths_outside_file_graph,
@@ -403,12 +411,24 @@ fn finish_missing_tests(
     unresolved_changed_paths: Vec<String>,
 ) -> MissingTestsResult {
     let PreparedMissingTests {
+        incomplete,
         prepared: _,
         endpoints,
         paths_outside_file_graph,
         candidates,
     } = work;
     let mut global_reasons = BTreeSet::new();
+    // Snapshot metadata can be partial while the target graph and its usage
+    // lookups closed. Preserve their independently proven outcomes and mark
+    // the metadata gap at the request boundary.
+    for entry in &incomplete {
+        use crate::result_incomplete::ToolResultIncompleteReason as R;
+        global_reasons.insert(if entry.reason == R::Cancelled {
+            MissingTestsIncompleteReason::TargetGraphCancelled
+        } else {
+            MissingTestsIncompleteReason::CompilationScopeUnresolved
+        });
+    }
     if graph_cancelled {
         global_reasons.insert(MissingTestsIncompleteReason::TargetGraphCancelled);
     }
@@ -589,13 +609,10 @@ fn scan_target(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<ScanUsagesTa
 
 fn exact_node_outcome(analyzer: &dyn IAnalyzer, entry: ScanUsagesEntry) -> ExactNodeOutcome {
     let mut outcome = ExactNodeOutcome::default();
-    if !entry.complete {
-        outcome.incomplete_reasons.insert(
-            entry
-                .incomplete_reason
-                .map(map_scan_incomplete_reason)
-                .unwrap_or(MissingTestsIncompleteReason::UsageAnalysisIncomplete),
-        );
+    if let Some(reason) = entry.completion.incomplete_reason() {
+        outcome
+            .incomplete_reasons
+            .insert(map_scan_incomplete_reason(reason));
     }
     match entry.status {
         ScanUsagesStatus::NotFound => {
@@ -839,6 +856,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("missing tests");
         let candidate = result
@@ -929,6 +947,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("missing tests");
 
@@ -1001,6 +1020,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("missing tests");
 
@@ -1033,6 +1053,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("prepare changed functions before cancelling the graph");
         let target_context = build_target_file_dependency_analyzer(&work.prepared, None)

@@ -279,9 +279,9 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
         (
             value,
             CapturedMemoReads {
+                runtime_cache_touched: reads.runtime_cache_touched(),
                 keys: Arc::from(reads.unordered_keys()),
-                unattributed_reads: reads.unattributed_reads(),
-                execution_dependences: reads.execution_dependences(),
+                channels: reads.channels(),
                 first_refusal: reads.first_refusal(),
                 first_execution_refusal: reads.first_execution_refusal(),
             },
@@ -301,15 +301,18 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
         (
             value,
             CapturedMemoReads {
+                runtime_cache_touched: reads.runtime_cache_touched(),
                 keys: Arc::from(reads.unordered_keys()),
-                unattributed_reads: reads.unattributed_reads(),
-                execution_dependences: reads.execution_dependences(),
+                channels: reads.channels(),
                 first_refusal: reads.first_refusal(),
                 first_execution_refusal: reads.first_execution_refusal(),
             },
         )
     }
     fn replay(&self, reads: &CapturedMemoReads<ReadKey>) {
+        if reads.runtime_cache_touched {
+            self.analyzer.mark_runtime_cache_touched();
+        }
         let _refusal =
             brokk_bifrost_core::profiling::read_refusal_scope(reads.first_refusal.clone());
         let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
@@ -319,8 +322,7 @@ impl MemoAttribution for AnalyzerMemoAttribution<'_> {
         super::i_analyzer::replay_shared_query_read_receipt(
             self.analyzer,
             &reads.keys,
-            reads.unattributed_reads,
-            reads.execution_dependences,
+            reads.channels,
         );
     }
 }
@@ -339,12 +341,7 @@ impl<'a> AuthorityRecorder<WorkspaceFactFamily, AuthorityInputs<'a>>
             reads.first_execution_refusal.clone(),
         );
         if matches!(&inputs, AuthorityInputs::Fact { .. }) {
-            super::i_analyzer::replay_query_read_receipt(
-                self.analyzer,
-                [],
-                reads.unattributed_reads,
-                reads.execution_dependences,
-            );
+            super::i_analyzer::replay_query_read_receipt(self.analyzer, [], reads.channels);
         } else {
             self.replay(&reads);
         }
@@ -428,6 +425,35 @@ mod tests {
     use crate::analyzer::{MultiAnalyzer, capture_query_reads};
     use std::convert::Infallible;
     use std::sync::OnceLock;
+
+    #[test]
+    fn runtime_cache_touch_replays_from_another_units_memo_fill() {
+        let analyzer = MultiAnalyzer::default();
+        let attribution = memo_attribution(&analyzer);
+        let memo = ReplayingMemo::new(OnceLock::new());
+        let read = || {
+            memo.read(&attribution, |cell, capture| {
+                Ok::<_, Infallible>(Arc::clone(cell.get_or_init(|| {
+                    Arc::new(capture.build(|| {
+                        analyzer.mark_runtime_cache_touched();
+                        17
+                    }))
+                })))
+            })
+            .unwrap();
+        };
+        // Unit A fills the shared memo before unit B's checkpoint.
+        let (_, first) = capture_query_reads(&analyzer, read);
+        assert!(first.runtime_cache_touched());
+        // Unit B hits A's entry; eligibility evidence must survive that hit.
+        let (_, second) = capture_query_reads(&analyzer, read);
+        assert!(second.runtime_cache_touched());
+        assert_eq!(second.execution_dependences(), 0);
+        assert_eq!(second.budget_dependences(), 0);
+        // An independent unit that never consulted the memo stays untouched.
+        let (_, independent) = capture_query_reads(&analyzer, || ());
+        assert!(!independent.runtime_cache_touched());
+    }
 
     #[test]
     fn owned_memo_reads_reach_the_owner_on_untransported_helper_threads() {
@@ -794,8 +820,7 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Owne
     fn replay(
         &self,
         receipts: &[OpaqueReadReceipt],
-        unattributed_reads: usize,
-        execution_dependences: usize,
+        channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
     ) {
         checked_read_ledger_attachment(self.analyzer.as_ref());
         for receipt in receipts {
@@ -804,12 +829,7 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Owne
                 .expect("only analysis constructs read receipts");
             self.analyzer.record_read_receipt(&keys.keys);
         }
-        super::i_analyzer::replay_query_read_receipt(
-            self.analyzer.as_ref(),
-            [],
-            unattributed_reads,
-            execution_dependences,
-        );
+        super::i_analyzer::replay_query_read_receipt(self.analyzer.as_ref(), [], channels);
     }
     fn record(
         &self,
@@ -870,8 +890,7 @@ fn erased_memo_receipt(
             .map(|key| format!("{key:?}").len())
             .sum::<usize>();
     brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
-        unattributed_reads: reads.unattributed_reads,
-        execution_dependences: reads.execution_dependences,
+        channels: reads.channels,
         first_refusal: reads.first_refusal.clone(),
         first_execution_refusal: reads.first_execution_refusal.clone(),
         receipt: OpaqueReadReceipt::new(
@@ -887,9 +906,9 @@ pub(super) fn erased_captured_reads(
 ) -> brokk_bifrost_core::analyzer::project_reads::ErasedCapturedReads {
     erased_memo_receipt(
         CapturedMemoReads {
+            runtime_cache_touched: reads.runtime_cache_touched(),
             keys: Arc::from(reads.unordered_keys()),
-            unattributed_reads: reads.unattributed_reads(),
-            execution_dependences: reads.execution_dependences(),
+            channels: reads.channels(),
             first_refusal: reads.first_refusal(),
             first_execution_refusal: reads.first_execution_refusal(),
         },
@@ -899,8 +918,7 @@ pub(super) fn erased_captured_reads(
 pub(super) fn replay_erased_reads(
     contexts: &[Arc<super::AnalyzerQueryContext>],
     receipts: &[OpaqueReadReceipt],
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
 ) {
     // Refusal provenance is timing-only; with timing off, scan nothing.
     let timing = brokk_bifrost_core::profiling::enabled();
@@ -929,16 +947,31 @@ pub(super) fn replay_erased_reads(
         let reads = receipt
             .downcast_ref::<CapturedMemoReads<ReadKey>>()
             .expect("only analysis constructs read receipts");
+        if reads.runtime_cache_touched {
+            super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
+                ledger.mark_runtime_cache_touched();
+            });
+        }
         super::i_analyzer::record_receipt_on_active_ledgers(contexts, &reads.keys);
     }
 
     super::i_analyzer::replay_read_channels(
         [],
-        unattributed_reads,
-        execution_dependences,
+        channels,
         |key| super::i_analyzer::record_read_on_active_ledgers(contexts, key),
         |count| super::i_analyzer::record_unattributed_on_active_ledgers(contexts, count),
         |count| super::i_analyzer::record_execution_dependence_on_active_ledgers(contexts, count),
+        |count| super::i_analyzer::record_budget_dependence_on_active_ledgers(contexts, count),
+        || {
+            super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
+                ledger.refuse_read_reuse()
+            })
+        },
+        |count| {
+            super::i_analyzer::for_each_unshadowed_active_ledger(contexts, |ledger| {
+                ledger.record_persistence_refusals(count)
+            })
+        },
     );
 }
 

@@ -12,14 +12,102 @@ use crate::analyzer::semantic_model::overlay::{
 use crate::analyzer::store::active_models::ResolvedActiveSemanticModels;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
 
-pub trait SelectedAnalyzerServices: Send + Sync {
+/// Query-local import proof consumed only by the language's existing authority.
+#[derive(Debug)]
+pub struct SelectedExternalBindingRequest<'a> {
+    pub file: &'a ProjectFile,
+    pub language: Language,
+    pub snapshot: &'a super::super::WorkspaceSnapshotId,
+    pub selected: &'a super::PythonSelectedExternalImport,
+    pub path: &'a [String],
+}
+
+#[derive(Debug)]
+pub enum SelectedExternalBindingRead {
+    Admitted(Box<SemanticModelSymbol>),
+    Refused { code: &'static str, detail: String },
+    Cancelled,
+}
+impl SelectedExternalBindingRead {
+    pub fn unavailable() -> Self {
+        Self::Refused {
+            code: "selected_external_binding_unavailable",
+            detail: "the selected language has no external binding authority".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigurationCertificate {
+    Certified,
+    Uncertified,
+}
+
+pub trait SelectedAnalyzerServices:
+    brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal
+{
+    fn certify_selected_configuration(
+        &self,
+        _language: Language,
+        _snapshot: &super::super::WorkspaceSnapshotId,
+        _input_identity: &[u8; 32],
+        _connection: &rusqlite::Connection,
+    ) -> ConfigurationCertificate {
+        ConfigurationCertificate::Uncertified
+    }
+
+    fn admit_selected_external_binding(
+        &self,
+        _request: &SelectedExternalBindingRequest<'_>,
+        _cancellation: &crate::CancellationToken,
+    ) -> SelectedExternalBindingRead {
+        SelectedExternalBindingRead::unavailable()
+    }
+
     fn declarations_named(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit>;
+    fn verified_declaration(&self, expected: &CodeUnit) -> Option<CodeUnit>;
     fn external_inventory_providers(&self) -> Vec<String>;
     fn active_models(&self) -> Option<Arc<ResolvedActiveSemanticModels>>;
     fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>>;
+    fn record_model_authority_read(&self, _hash: &str) {}
+}
+
+/// The store owns selected TEMP rows, while the engine owns read attribution.
+/// Keep a preparation's receipt opaque until a later consumer replays it.
+pub trait SelectedMacroFrontierReads: Send + Sync {
+    fn capture(
+        &self,
+        prepare: &mut dyn FnMut() -> super::super::Result<super::SelectedResolutionStageOutcome>,
+    ) -> (
+        super::super::Result<super::SelectedResolutionStageOutcome>,
+        Box<dyn std::any::Any + Send + Sync>,
+    );
+
+    fn replay(&self, receipt: &(dyn std::any::Any + Send + Sync));
+
+    fn receipt_bytes(&self, receipt: &(dyn std::any::Any + Send + Sync)) -> usize;
+
+    fn policy_unit_label(&self) -> Option<String>;
+}
+
+#[derive(Debug)]
+pub enum ModelRuntimeBases {
+    Agreed(Vec<TypeRef>),
+    Unproven,
+    Cancelled,
 }
 
 pub trait SelectedModelAuthority {
+    /// The agreed ordered Python runtime bases for a selected class owner.
+    fn python_runtime_bases(
+        &self,
+        _qualified_name: &str,
+        _symbol_id: &str,
+        _cancellation: &crate::CancellationToken,
+    ) -> ModelRuntimeBases {
+        ModelRuntimeBases::Unproven
+    }
+
     /// Active-set declarations matching the caller's fixed simple-name vocabulary.
     fn model_declared_types_named(
         &self,

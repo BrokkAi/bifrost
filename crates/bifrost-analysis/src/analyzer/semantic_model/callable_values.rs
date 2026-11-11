@@ -35,7 +35,7 @@ pub fn activated_returned_callable_targets(
     cancellation: &CancellationToken,
 ) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
     let reader = active
-        .source_reader()
+        .activation_reader()
         .ok_or(crate::analyzer::semantic_model::CatalogError::Unavailable)?;
     activated_returned_callable_targets_from_reader(
         reader,
@@ -80,7 +80,7 @@ pub fn activated_callback_invocations(
     cancellation: &CancellationToken,
 ) -> Result<ActivatedCallableValuesQuery, crate::analyzer::semantic_model::CatalogError> {
     let reader = active
-        .source_reader()
+        .activation_reader()
         .ok_or(crate::analyzer::semantic_model::CatalogError::Unavailable)?;
     activated_callback_invocations_from_reader(
         reader,

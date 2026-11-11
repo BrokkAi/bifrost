@@ -447,30 +447,43 @@ pub(crate) mod tests {
 
         outer.values = vec![
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(0),
                 kind: SemanticValueKind::Callable,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(1),
-                kind: SemanticValueKind::Receiver { dispatch: true },
+                kind: SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(2),
                 kind: SemanticValueKind::Local,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(3),
                 kind: SemanticValueKind::Callable,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: brokk_bifrost_analysis::analyzer::semantic::ids::ValueId::new(4),
                 kind: SemanticValueKind::Temporary,
                 source,

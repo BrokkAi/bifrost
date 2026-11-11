@@ -8,7 +8,7 @@ fn match_in_tree(tree: &tree_sitter::Tree, source: &str) -> MacroArmMatch {
 }
 
 fn matches(source: &str) -> MacroArmMatch {
-    let tree = parse_rust_tree(source).unwrap();
+    let tree = parse_rust_tree_for_test(source).unwrap();
     assert!(!tree.root_node().has_error());
     match_in_tree(&tree, source)
 }
@@ -91,7 +91,7 @@ fn deeply_nested_matcher_groups_run_on_a_small_stack() {
         "[".repeat(depth),
         "]".repeat(depth),
     );
-    let tree = parse_rust_tree(&source).unwrap();
+    let tree = parse_rust_tree_for_test(&source).unwrap();
     assert!(!tree.root_node().has_error());
     let (tree, matched) = std::thread::Builder::new()
         .stack_size(64 * 1024)
@@ -116,7 +116,7 @@ fn deeply_nested_repetition_frames_run_on_a_small_stack() {
         "$(".repeat(depth),
         ")+".repeat(depth),
     );
-    let tree = parse_rust_tree(&source).unwrap();
+    let tree = parse_rust_tree_for_test(&source).unwrap();
     assert!(!tree.root_node().has_error());
     let (tree, matched) = std::thread::Builder::new()
         .stack_size(64 * 1024)
@@ -136,7 +136,7 @@ fn deeply_nested_repetition_frames_run_on_a_small_stack() {
 fn canonical_matcher_interrupts_during_indexing_and_matching_then_retries() {
     use std::cell::Cell;
     let source = "macro_rules! m { ($([$($name:ident),+]);+) => {}; } m!([a,b];[c]);";
-    let tree = parse_rust_tree(source).unwrap();
+    let tree = parse_rust_tree_for_test(source).unwrap();
     let definition = named_descendant(tree.root_node(), "macro_definition").unwrap();
     let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
     let arguments = named_child_of_kind(invocation, "token_tree").unwrap();
@@ -168,7 +168,7 @@ fn canonical_matcher_interrupts_during_indexing_and_matching_then_retries() {
 #[test]
 fn canonical_missing_pattern_is_not_an_empty_matcher() {
     let source = "macro_rules! m { () => {}; () => {}; } m!();";
-    let tree = parse_rust_tree(source).unwrap();
+    let tree = parse_rust_tree_for_test(source).unwrap();
     let definition = named_descendant(tree.root_node(), "macro_definition").unwrap();
     let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
     let arguments = named_child_of_kind(invocation, "token_tree").unwrap();
@@ -180,4 +180,12 @@ fn canonical_missing_pattern_is_not_an_empty_matcher() {
     let matched = match_macro_rules(&definition, arguments, source, &|| true).unwrap();
     assert_eq!(matched.arm_index, 1);
     assert!(matched.bindings.is_empty());
+}
+
+fn parse_rust_tree_for_test(source: &str) -> Option<tree_sitter::Tree> {
+    // Standalone fixtures have no analyzer owner; retain nothing across calls.
+    let caches = crate::lexical_scope::RustLexicalCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    crate::lexical_scope::parse_rust_tree_with(&caches, source)
 }

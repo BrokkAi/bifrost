@@ -684,6 +684,11 @@ impl StructuralSpec for GoStructuralSpec {
                     }
                 }
             }
+            NormalizedKind::Return => {
+                if let Some(values) = first_named_child(node) {
+                    attach_role_targets(sink, Role::Value, values);
+                }
+            }
             NormalizedKind::Import => attach_import_modules(sink, node),
             NormalizedKind::Identifier => sink.set_name(node),
             _ => {}

@@ -61,6 +61,7 @@ codes! {
     LIMIT_ARCHIVE_DIRECTORY = "limit.archive_directory" => Gap,
     LIMIT_ARCHIVE_ENTRIES = "limit.archive_entries" => Gap,
     JVM_DEPENDENCY_UNRESOLVED = "jvm.dependency_unresolved" => Artifact,
+    JVM_DISCOVERY_SUPPRESSED = "jvm.discovery.suppressed" => Artifact,
     JVM_INDEX_CAPPED_ENTRIES = "jvm.index.capped_entries" => Artifact,
     LIMIT_ARTIFACT_MEMBERS = "limit.artifact_members" => Artifact,
     KOTLIN_CLASSIFICATION_CAPPED = "kotlin.classification_capped" => Artifact,

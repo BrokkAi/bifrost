@@ -55,6 +55,9 @@ impl CallArgumentConversionProver for ScalaCallArgumentConversionProver {
     fn prove_argument(
         &self,
         analyzer: &dyn IAnalyzer,
+        _sources: &brokk_bifrost_analysis::analyzer::usages::call_conversion::CallConversionContext<
+            '_,
+        >,
         file: &ProjectFile,
         actual: Node<'_>,
         source: &str,

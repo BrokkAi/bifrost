@@ -655,6 +655,7 @@ fn receiver_type_fqn_at_depth(
                     values.into_iter().next()
                 }
                 ReceiverAnalysisOutcome::Precise(_)
+                | ReceiverAnalysisOutcome::Incomplete { .. }
                 | ReceiverAnalysisOutcome::Ambiguous(_)
                 | ReceiverAnalysisOutcome::Unsupported { .. }
                 | ReceiverAnalysisOutcome::ExceededBudget { .. }
@@ -738,6 +739,7 @@ fn seed_variable_declaration(
             }
             Some(
                 ReceiverAnalysisOutcome::Precise(_)
+                | ReceiverAnalysisOutcome::Incomplete { .. }
                 | ReceiverAnalysisOutcome::Ambiguous(_)
                 | ReceiverAnalysisOutcome::Unsupported { .. }
                 | ReceiverAnalysisOutcome::ExceededBudget { .. }

@@ -296,7 +296,7 @@ mod jvm_extraction_tests {
         };
         store
             .conn
-            .execute(move |conn| {
+            .execute_fixture(move |conn| {
                 conn.execute_batch(
             "DROP TRIGGER legacy_resolution_declaration_visibility_properties_no_canonical_insert;",
         )?;
@@ -374,6 +374,7 @@ mod jvm_extraction_tests {
                     &snapshots,
                     &requests,
                     &CancellationToken::default(),
+                    &brokk_bifrost_analysis::analyzer::store::CandidateFqMemo::default(),
                     |_| {},
                 )
             };

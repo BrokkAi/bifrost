@@ -121,7 +121,7 @@ use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
                 ).unwrap();
             }
             let (original, formals, defaults) = {
-                let mut ready = fixture.open_ready(&[]);
+                let ready = fixture.open_ready(&[]);
                 let original = ready.read_change_stamp().unwrap();
                 ready
                     .ensure_generic_formals_schema(ready.connection())

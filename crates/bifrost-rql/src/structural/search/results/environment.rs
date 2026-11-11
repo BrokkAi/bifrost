@@ -171,6 +171,10 @@ pub struct CodeQueryBinding {
     pub path: String,
     pub language: &'static str,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub immediate_parent_kind: Option<String>,
+    pub whole_let_initializer: bool,
+    pub whole_match_arm_identifier: bool,
     pub kind: &'static str,
     pub hoisting: &'static str,
     pub namespace: &'static str,
@@ -342,8 +346,7 @@ pub struct CodeQueryReferenceEdge {
     pub target: CodeQueryDeclaration,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enclosing_declaration: Option<CodeQueryDeclaration>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference_kind: Option<&'static str>,
+    pub reference_facets: CodeQueryReferenceFacets,
     pub proof: &'static str,
     pub usage_kind: &'static str,
     pub site_class: &'static str,
@@ -618,6 +621,7 @@ pub enum CodeQueryCandidateRef {
         name: String,
     },
     Modeled {
+        provider: crate::analyzer::semantic_model::ModelProvider,
         symbol_id: String,
         name: String,
     },

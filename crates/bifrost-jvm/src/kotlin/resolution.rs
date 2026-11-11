@@ -16,6 +16,7 @@ use super::syntax::{
     kotlin_owner_label_matches, kotlin_parameter_default, kotlin_user_type_segments,
 };
 use crate::constructor_site::ConstructorSite;
+use crate::resolution_scan_index::ResolutionScanIndex;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, DeclarationKind, ProjectFile};
 use brokk_bifrost_core::analyzer::resolution_facts::*;
 use brokk_bifrost_core::analyzer::source_facts::{
@@ -28,6 +29,41 @@ use brokk_bifrost_core::analyzer::tree_walk::{
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
+
+pub(crate) const KOTLIN_MEMBER_TYPE_CENSUS: crate::member_type_coverage::MemberTypeCensus =
+    crate::member_type_coverage::MemberTypeCensus {
+        type_bodies: &["class_body", "enum_class_body"],
+        wrappers: &[],
+        type_declarations: &[
+            "class_declaration",
+            "object_declaration",
+            "companion_object",
+        ],
+        non_type_members: &[
+            "anonymous_initializer",
+            "destructuring_declaration",
+            "function_declaration",
+            "getter",
+            "property_declaration",
+            "secondary_constructor",
+            "setter",
+        ],
+        trivia: &["line_comment", "multiline_comment"],
+        opaque: &[(
+            "type_alias",
+            MemberTypesOpenReason::NestedTypeAliasWithoutMemberRow,
+        )],
+        entry_bodies: &[(
+            "enum_entry",
+            MemberTypesOpenReason::EnumEntryBodyDeclaration,
+        )],
+        declaration_site: kotlin_member_type_site,
+    };
+
+fn kotlin_member_type_site(declaration: Node<'_>) -> Option<Node<'_>> {
+    first_named_child_of_kind(declaration, "type_identifier")
+        .or_else(|| (declaration.kind() == "companion_object").then_some(declaration))
+}
 
 pub(super) struct KotlinResolutionExtraction {
     pub facts: FileResolutionFacts,
@@ -195,6 +231,7 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     source_declarations: &'declarations HashMap<(usize, Option<usize>), SourceDeclarationId>,
     units: HashMap<SourceDeclarationId, CodeUnit>,
     facts: FileResolutionFacts,
+    scan_index: ResolutionScanIndex,
     site_occurrences: Vec<SourceOccurrenceId>,
     declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
     names: HashMap<String, ResolutionNameId>,
@@ -213,6 +250,7 @@ struct KotlinResolutionBuilder<'source, 'collector, 'declarations> {
     receiver_frames: Vec<KotlinReceiverFrame<'source>>,
     anonymous_type_owners: HashSet<ResolutionSiteId>,
     type_sites: HashMap<usize, ResolutionSiteId>,
+    member_type_bodies: Vec<crate::member_type_coverage::MemberTypeBody>,
     type_names: HashMap<ResolutionSiteId, ResolutionNameId>,
     type_simple_names: HashMap<ResolutionSiteId, &'source str>,
     type_parents: HashMap<ResolutionSiteId, Option<ResolutionSiteId>>,
@@ -264,6 +302,7 @@ pub(super) fn extract_kotlin_resolution<'source>(
         source_declarations,
         units: source_units.iter().cloned().collect(),
         facts: FileResolutionFacts::default(),
+        scan_index: ResolutionScanIndex::default(),
         site_occurrences: Vec::new(),
         declaration_sources: Vec::new(),
         names: HashMap::default(),
@@ -277,6 +316,7 @@ pub(super) fn extract_kotlin_resolution<'source>(
         receiver_frames: Vec::new(),
         anonymous_type_owners: HashSet::default(),
         type_sites: HashMap::default(),
+        member_type_bodies: Vec::new(),
         type_names: HashMap::default(),
         type_simple_names: HashMap::default(),
         type_parents: HashMap::default(),
@@ -388,6 +428,10 @@ impl<'source, 'collector, 'declarations>
                     context.receiver_frame = Some(frame);
                     context.owner_type = Some(owner);
                     context.scope = self.ensure_type_body_scope(owner);
+                    self.member_type_bodies
+                        .push(crate::member_type_coverage::MemberTypeBody::new(
+                            owner, node,
+                        ));
                     context.callable = None;
                     context.declaration = Some(owner);
                     context.singleton_owner = false;
@@ -398,6 +442,11 @@ impl<'source, 'collector, 'declarations>
                     // Enum-entry overrides are members of the enum class, so
                     // keep them in its canonical type-body scope.
                 } else {
+                    if let Some(owner) = context.owner_type {
+                        self.member_type_bodies.push(
+                            crate::member_type_coverage::MemberTypeBody::new(owner, node),
+                        );
+                    }
                     let body_scope = context.owner_type.and_then(|owner| {
                         self.initialization_scopes.get(&owner).map(|scope| {
                             self.facts.scopes[scope.index()]
@@ -633,6 +682,12 @@ impl<'source, 'collector, 'declarations>
         self.finish_scope_wide_activations();
         self.finish_applied_type_arguments();
         crate::implicit_supertype::publish_written_supertype_names(&mut self.facts);
+        self.facts.member_type_coverage = crate::member_type_coverage::member_type_coverage(
+            root,
+            &self.member_type_bodies,
+            &self.facts,
+            &KOTLIN_MEMBER_TYPE_CENSUS,
+        );
         assert_eq!(
             self.site_occurrences.len(),
             self.facts.sites.len(),
@@ -2200,6 +2255,16 @@ impl<'source, 'collector, 'declarations>
         }
         let final_slot = previous.expect("a qualified type has a segment");
         if reference_sites.len() > 1 {
+            for &site in reference_sites
+                .iter()
+                .skip(1)
+                .take(reference_sites.len() - 2)
+            {
+                // Every segment has its own reference and projection. The
+                // preceding segment's slot qualifies this intermediate one;
+                // only the final segment below owns the lexical root route.
+                self.facts.typed_receiver_prefix_absences.push(site);
+            }
             let reference = *reference_sites.last().unwrap();
             self.facts
                 .root_references
@@ -3405,6 +3470,90 @@ impl<'source, 'collector, 'declarations>
             reference_scope,
             qualifier,
         );
+        let non_owning_receiver =
+            navigation
+                .and_then(kotlin_navigation_receiver)
+                .is_some_and(|receiver| {
+                    if receiver.kind() == "call_expression" {
+                        return self.call_result_slots.get(&receiver.id()).copied() == qualifier;
+                    }
+                    if receiver.kind() == "this_expression" {
+                        return matches!(
+                            self.this_expression_receiver(receiver, context.receiver_frame),
+                            Some(KotlinReceiver::Extension(_))
+                        ) && self
+                            .expression_slots_by_node
+                            .get(&(receiver.id(), ResolutionTypeSlotRole::ExpressionValue))
+                            .copied()
+                            == qualifier;
+                    }
+                    if receiver.kind() == "callable_reference"
+                        && receiver
+                            .child(receiver.child_count() - 1)
+                            .is_some_and(|token| token.kind() == "class")
+                    {
+                        return self
+                            .expression_slots_by_node
+                            .get(&(receiver.id(), ResolutionTypeSlotRole::ExpressionValue))
+                            .copied()
+                            == qualifier;
+                    }
+                    let mut current = receiver;
+                    let mut terminal = None;
+                    loop {
+                        let site = if current.kind() == "simple_identifier" {
+                            self.sites_by_node.get(&current.id()).copied()
+                        } else if current.kind() == "navigation_expression" {
+                            kotlin_navigation_member(current)
+                                .and_then(|member| self.sites_by_node.get(&member.id()).copied())
+                        } else {
+                            None
+                        };
+                        let Some(site) = site else {
+                            return false;
+                        };
+                        terminal.get_or_insert(site);
+                        if current.kind() == "simple_identifier" {
+                            break;
+                        }
+                        let Some(parent) = kotlin_navigation_receiver(current) else {
+                            return false;
+                        };
+                        let Some(parent_site) = (if parent.kind() == "simple_identifier" {
+                            self.sites_by_node.get(&parent.id()).copied()
+                        } else {
+                            kotlin_navigation_member(parent)
+                                .and_then(|member| self.sites_by_node.get(&member.id()).copied())
+                        }) else {
+                            return false;
+                        };
+                        let linked = self.scan_index.has_identifier_qualifier_site(
+                            &self.facts,
+                            site,
+                            ResolutionIdentifierRole::Reference,
+                            parent_site,
+                        );
+                        if !linked {
+                            return false;
+                        }
+                        current = parent;
+                    }
+                    terminal.is_some_and(|terminal| {
+                        qualifier.is_some_and(|slot| {
+                            self.facts.type_slots[slot.index()].site == terminal
+                        })
+                    })
+                });
+        if is_navigation_member
+            && qualifier.is_some()
+            && non_owning_receiver
+            && !self.scan_index.has_root(&self.facts, site)
+        {
+            // Each receiver segment is a separate reference and its terminal
+            // slot qualifies this member. The member has no root route of its
+            // own; a root fact, when present, remains authoritative.
+            self.facts.typed_receiver_prefix_absences.push(site);
+        }
         if !is_call_callee
             && matches!(
                 kind,
@@ -4092,6 +4241,7 @@ impl<'source, 'collector, 'declarations>
                 input,
                 output,
             );
+            self.scan_index.invalidate_projections();
         }
     }
 
@@ -4863,28 +5013,7 @@ fn annotation_string_argument(annotation: Node<'_>, source: &str) -> Option<Stri
         return None;
     }
     let value = named_children(args[0]).last().copied()?;
-    if value.kind() != "string_literal" {
-        return None;
-    }
-    let mut contents = Vec::new();
-    let mut stack = vec![value];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "string_content" => {
-                let raw = source.get(node.start_byte()..node.end_byte())?;
-                if raw.contains('\\') || raw.contains('$') {
-                    return None;
-                }
-                contents.push(raw);
-            }
-            "interpolation_expression_start"
-            | "interpolated_expression"
-            | "interpolation_identifier_start"
-            | "interpolated_identifier" => return None,
-            _ => stack.extend(named_children(node)),
-        }
-    }
-    (contents.len() == 1 && !contents[0].is_empty()).then(|| contents[0].to_owned())
+    crate::kotlin::syntax::kotlin_plain_string_literal(value, source).map(str::to_owned)
 }
 
 fn callable_parameter_nodes(callable: Node<'_>) -> Vec<Node<'_>> {
@@ -5014,6 +5143,33 @@ fn kotlin_getter_name(property: &str) -> String {
     }
 }
 
+/// The synthetic property name Kotlin reads a Java getter `getX()` as, or
+/// `None` when the method name is not a `get` getter name.
+///
+/// This is the Kotlin compiler's rule: the character after `get` must not be
+/// a lowercase ASCII letter, and the rest is decapitalized "smartly", so a
+/// leading acronym lowercases as a word (`getURL` is `url`, `getURLPath` is
+/// `urlPath`). An `isX()` getter reads as `isX`, its own name, so it needs no
+/// synthetic name. Callers own the shape check (an instance method with no
+/// parameters that returns a value).
+pub fn kotlin_synthetic_property_name(getter: &str) -> Option<String> {
+    let rest = getter.strip_prefix("get")?;
+    let first = rest.chars().next()?;
+    if first.is_ascii_lowercase() {
+        return None;
+    }
+    let uppercase = rest.chars().take_while(char::is_ascii_uppercase).count();
+    Some(match uppercase {
+        0 => rest.to_owned(),
+        1 => first.to_ascii_lowercase().to_string() + &rest[1..],
+        // Every character is an uppercase ASCII letter here, so byte and
+        // character offsets agree.
+        run if run == rest.len() => rest.to_ascii_lowercase(),
+        // The last capital of the run starts the next word.
+        run => rest[..run - 1].to_ascii_lowercase() + &rest[run - 1..],
+    })
+}
+
 fn kotlin_setter_name(property: &str) -> String {
     if is_boolean_property_name(property) {
         format!(
@@ -5047,6 +5203,40 @@ mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
+
+    /// Kotlin's "smart" decapitalization is easy to get subtly wrong: a
+    /// leading acronym lowercases as one word, and its last capital starts
+    /// the next word only when more follows.
+    #[test]
+    fn synthetic_property_names_follow_kotlin_decapitalization() {
+        for (getter, property) in [
+            ("getName", Some("name")),
+            ("getNextEntry", Some("nextEntry")),
+            ("getURL", Some("url")),
+            ("getURLPath", Some("urlPath")),
+            ("getX", Some("x")),
+            ("get2D", Some("2D")),
+            ("get_value", Some("_value")),
+            ("getaB", None),
+            ("get", None),
+            ("isDaemon", None),
+            ("name", None),
+        ] {
+            assert_eq!(
+                kotlin_synthetic_property_name(getter).as_deref(),
+                property,
+                "{getter}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_type_census_classifies_every_kotlin_type_body_member() {
+        crate::member_type_coverage::assert_census_covers_grammar(
+            brokk_tree_sitter_kotlin::NODE_TYPES,
+            &KOTLIN_MEMBER_TYPE_CENSUS,
+        );
+    }
 
     fn parse(
         source: &str,
@@ -5201,6 +5391,7 @@ mod tests {
             source_declarations,
             units: HashMap::default(),
             facts: FileResolutionFacts::default(),
+            scan_index: ResolutionScanIndex::default(),
             site_occurrences: Vec::new(),
             declaration_sources: Vec::new(),
             names: HashMap::default(),
@@ -5214,6 +5405,7 @@ mod tests {
             receiver_frames: Vec::new(),
             anonymous_type_owners: HashSet::default(),
             type_sites: HashMap::default(),
+            member_type_bodies: Vec::new(),
             type_names: HashMap::default(),
             type_simple_names: HashMap::default(),
             type_parents: HashMap::default(),

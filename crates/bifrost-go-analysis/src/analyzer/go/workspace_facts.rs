@@ -9,16 +9,24 @@ use brokk_bifrost_analysis::analyzer::{FactSubject, IAnalyzer, Language, Workspa
 // gap. The receipt rejects operational reasons, so they cannot be retained.
 pub(super) fn stable_completion(
     reasons: Vec<brokk_bifrost_analysis::analyzer::QueryReadIncomplete>,
-) -> Vec<(u8, String)> {
+) -> Vec<brokk_bifrost_go::packages::GoReadGap> {
     use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+    use brokk_bifrost_go::packages::{GoReadGap, GoReadGapKind};
     let mut completion = reasons
         .into_iter()
         .filter_map(|reason| match reason {
-            QueryReadIncomplete::StructureUnavailable(file) => {
-                Some((1, brokk_bifrost_core::path_utils::rel_path_string(&file)))
-            }
-            QueryReadIncomplete::ArtifactUnavailable(detail) => Some((2, detail.into_string())),
-            QueryReadIncomplete::SemanticEvidenceGap(detail) => Some((3, detail.into_string())),
+            QueryReadIncomplete::StructureUnavailable(file) => Some(GoReadGap {
+                kind: GoReadGapKind::StructureUnavailable,
+                detail: brokk_bifrost_core::path_utils::rel_path_string(&file),
+            }),
+            QueryReadIncomplete::ArtifactUnavailable(detail) => Some(GoReadGap {
+                kind: GoReadGapKind::ArtifactUnavailable,
+                detail: detail.into_string(),
+            }),
+            QueryReadIncomplete::SemanticEvidenceGap(detail) => Some(GoReadGap {
+                kind: GoReadGapKind::SemanticEvidenceGap,
+                detail: detail.into_string(),
+            }),
             // Execution-dependent reasons make the fill refuse, so a retained
             // value never carries one. Listing them keeps a new variant from
             // silently escaping the certificate.

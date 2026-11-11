@@ -25,7 +25,7 @@ use crate::hash::HashSet;
 
 use super::batch::{BatchResolutionFragmentSource, CancellationEvidenceLedger};
 use super::common_fact_lowering::LoweredDeferredMemberOwner;
-use super::fact_lowering::{LoweredResolutionFragment, LoweringGapOrigin};
+use super::fact_lowering::{LoweredCoverageGap, LoweredResolutionFragment, LoweringGapOrigin};
 use super::model::{
     BindingFragmentId, BindingNodeId, ResolutionCompletion, ResolutionIncompleteReason, SemanticId,
 };
@@ -124,6 +124,8 @@ pub struct JvmAccessEndpoint {
     pub language: Language,
     pub package: Option<String>,
     pub enclosing_templates: Vec<SemanticId>,
+    /// Type-body heads in the same order as `enclosing_templates`.
+    pub enclosing_template_heads: Vec<Option<BindingNodeId>>,
     pub outermost_type: Option<SemanticId>,
 }
 
@@ -1489,12 +1491,119 @@ impl SelectedGapReasonProvenance {
     }
 }
 
-/// The persisted semantic completion attached to one selected typed frontier.
+/// One selected effective Java type-frontier gap before completion folds equal reasons.
+/// The selected fragment and destination frontier are carried by its enclosing
+/// row; the producer occurrence and source site distinguish same-reason causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedJavaTypeFrontierContribution {
+    occurrence: SelectedJavaGapOccurrence,
+    fragment: BindingFragmentId,
+    frontier: SemanticId,
+    reason: SemanticId,
+    source_site: ResolutionSiteId,
+    origin: LoweringGapOrigin,
+    staged_producer_has_reference: bool,
+}
+
+/// Both preload and SQLite readers keep the producer's exact gap identity.
+/// A mounted key is local to the selected mount, not a reason ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SelectedJavaGapOccurrence {
+    LoweredDigest([u8; 32]),
+    StoredMain { mount: u32, gap: u32 },
+    Staged { producer: i64, gap: u32 },
+}
+
+impl SelectedJavaTypeFrontierContribution {
+    pub const fn from_lowered(fragment: BindingFragmentId, gap: LoweredCoverageGap) -> Self {
+        let super::fact_lowering::LoweringCoverageFrontier::Type { frontier } = gap.frontier()
+        else {
+            panic!("Java type-frontier contribution has a type destination")
+        };
+        Self {
+            occurrence: SelectedJavaGapOccurrence::LoweredDigest(gap.digest()),
+            fragment,
+            frontier,
+            reason: gap.reason_semantic(),
+            source_site: gap.site(),
+            origin: gap.origin(),
+            staged_producer_has_reference: false,
+        }
+    }
+
+    pub const fn from_stored(
+        occurrence: SelectedJavaGapOccurrence,
+        fragment: BindingFragmentId,
+        frontier: SemanticId,
+        reason: SemanticId,
+        source_site: ResolutionSiteId,
+        origin: LoweringGapOrigin,
+    ) -> Self {
+        Self {
+            occurrence,
+            fragment,
+            frontier,
+            reason,
+            source_site,
+            origin,
+            staged_producer_has_reference: false,
+        }
+    }
+
+    /// The staged producer published the local reference at this exact site.
+    /// The selected reader checks the producer, host, site and semantic key.
+    pub(crate) const fn with_staged_producer_reference(mut self, associated: bool) -> Self {
+        self.staged_producer_has_reference = associated;
+        self
+    }
+
+    pub(crate) const fn staged_producer_has_reference(self) -> bool {
+        self.staged_producer_has_reference
+    }
+
+    pub const fn occurrence(self) -> SelectedJavaGapOccurrence {
+        self.occurrence
+    }
+    pub const fn fragment(self) -> BindingFragmentId {
+        self.fragment
+    }
+    pub const fn frontier(self) -> SemanticId {
+        self.frontier
+    }
+    pub const fn reason(self) -> SemanticId {
+        self.reason
+    }
+    pub const fn source_site(self) -> ResolutionSiteId {
+        self.source_site
+    }
+    pub const fn origin(self) -> LoweringGapOrigin {
+        self.origin
+    }
+
+    pub const fn with_mounted_parts(
+        self,
+        occurrence: SelectedJavaGapOccurrence,
+        fragment: BindingFragmentId,
+        frontier: SemanticId,
+        reason: SemanticId,
+    ) -> Self {
+        Self {
+            occurrence,
+            fragment,
+            frontier,
+            reason,
+            ..self
+        }
+    }
+}
+
+/// The selected semantic completion attached to one typed frontier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedTypeFrontierCompletion {
     fragment: BindingFragmentId,
     frontier: SemanticId,
     completion: ResolutionCompletion,
+    java_contributions: Box<[SelectedJavaTypeFrontierContribution]>,
 }
 
 impl SelectedTypeFrontierCompletion {
@@ -1507,7 +1616,26 @@ impl SelectedTypeFrontierCompletion {
             fragment,
             frontier,
             completion,
+            java_contributions: Box::new([]),
         }
+    }
+
+    pub fn with_java_contributions(
+        mut self,
+        contributions: Box<[SelectedJavaTypeFrontierContribution]>,
+    ) -> Self {
+        assert!(
+            contributions.iter().all(|contribution| {
+                contribution.fragment() == self.fragment && contribution.frontier() == self.frontier
+            }),
+            "Java contribution belongs to its selected frontier"
+        );
+        self.java_contributions = contributions;
+        self
+    }
+
+    pub fn java_contributions(&self) -> &[SelectedJavaTypeFrontierContribution] {
+        &self.java_contributions
     }
 
     pub const fn fragment(&self) -> BindingFragmentId {
@@ -1524,10 +1652,6 @@ impl SelectedTypeFrontierCompletion {
 
     pub const fn natural_identity(&self) -> (BindingFragmentId, SemanticId) {
         (self.fragment(), self.frontier)
-    }
-
-    pub fn into_parts(self) -> (BindingFragmentId, SemanticId, ResolutionCompletion) {
-        (self.fragment(), self.frontier, self.completion)
     }
 }
 
@@ -1712,9 +1836,50 @@ pub struct ConditionalTypeSeed {
     pub slot: SemanticId,
     pub value: super::ResolutionSlotValue,
     pub prerequisites: Vec<(SemanticId, SemanticId)>,
+    /// Exact gap reasons superseded when this seed activates.
+    pub discharged_gap_reasons: Vec<SemanticId>,
 }
 
 pub trait SelectedTypedFactSource {
+    /// Current selected blob for the fragment, if it has a selected mount.
+    fn selected_blob_for_fragment(
+        &self,
+        _fragment: BindingFragmentId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<i64>>> {
+        Ok((!cancellation.is_cancelled()).then_some(None))
+    }
+    /// Persisted provenance for mounted reasons on one selected blob.
+    fn selected_blob_gap_reason_provenance(
+        &self,
+        _blob: i64,
+        _fragment: BindingFragmentId,
+        _reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SelectedGapReasonProvenance>>> {
+        Ok((!cancellation.is_cancelled()).then(Vec::new))
+    }
+    /// Whether the selected JVM inventory declares the complete owner type.
+    fn jvm_external_owner_is_indexed(&self, _owner: &ExternalOwnerIdentity) -> StoreResult<bool> {
+        Ok(false)
+    }
+    fn selected_model_language(
+        &self,
+        _token: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Language>> {
+        Ok(None)
+    }
+    fn selected_model_projection(
+        &self,
+        _token: SemanticId,
+        _kind: brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind,
+        _receivers: &[super::ResolutionSlotValue],
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<(Vec<super::ResolutionSlotValue>, ResolutionCompletion)>> {
+        Ok(None)
+    }
+
     /// Fixed selected capability. Default languages incur no seed reader call.
     fn supports_conditional_type_seeds(&self) -> bool {
         false
@@ -1765,6 +1930,17 @@ pub trait SelectedTypedFactSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<bool> {
         Ok(!cancellation.is_cancelled())
+    }
+
+    /// The exact selected declaration owner for a JVM type. The outer None
+    /// means unacquired; Some(None) means competing selected declarations.
+    /// This is a read of operation-pinned provider authority, not a name guess.
+    fn selected_jvm_declaration_owner(
+        &self,
+        _owner_fqn: &str,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<ExternalOwnerIdentity>>> {
+        Ok(None)
     }
 
     /// Selected source language capability for one positioned reference.

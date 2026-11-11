@@ -42,7 +42,7 @@ fn csharp_namespace_members_use_selected_names_and_exact_levels() {
     let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
-    let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
         fixture.project_dyn(),
         AnalyzerConfig::default(),
         context,
@@ -51,9 +51,20 @@ fn csharp_namespace_members_use_selected_names_and_exact_levels() {
     let snapshots = store
         .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".to_owned()])
         .unwrap();
-    let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
     let cancellation = CancellationToken::new();
     let project = fixture.project_dyn();
+    let services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+            >(workspace.analyzer())
+            .expect("C# analyzer"),
+        );
     let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
         .open_selected_resolution_operation(
             SelectedResolutionOperationInput::new(
@@ -62,7 +73,8 @@ fn csharp_namespace_members_use_selected_names_and_exact_levels() {
                 &snapshots,
                 &languages,
                 &[],
-            ),
+            )
+            .with_analyzer(&services),
             &cancellation,
         )
         .unwrap()

@@ -366,6 +366,8 @@ pub(crate) mod tests {
 
     fn go_test_type(id: &str, name: &str, kind: TypeKind, symbol: &str) -> TypeFact {
         TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             id: id.to_owned(),
@@ -1878,6 +1880,8 @@ pub(crate) mod tests {
         };
         relations.clear();
         types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -1942,6 +1946,8 @@ pub(crate) mod tests {
                     concurrency_effects: Vec::new(),
                     returned_callables: Vec::new(),
                     declared_effects: Vec::new(),
+                    subject_effects: Vec::new(),
+                    lifecycle_coverage: Vec::new(),
                     preconditions: None,
                     result_contracts: Vec::new(),
                     result_use_obligations: Vec::new(),
@@ -2167,6 +2173,8 @@ pub(crate) mod tests {
                 }),
                 move_semantics: None,
                 drop_glue: None,
+                drop_effects: None,
+                drop_review: None,
             });
             (type_id, member_id)
         };
@@ -2819,6 +2827,8 @@ pub(crate) mod tests {
                 copy: Some(TypeCopySemantics::Trivial),
                 move_semantics: None,
                 drop_glue: None,
+                drop_effects: None,
+                drop_review: None,
             });
         }
         let exported = export_authored_csmi_pack(&value_semantics, &artifact, &options)

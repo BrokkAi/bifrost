@@ -2,20 +2,19 @@ use crate::graph::extractor::ScanCtx;
 use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::model::Range;
 use brokk_bifrost_core::analyzer::usages::common::{
-    SNIPPET_CONTEXT_LINES, classify_recursive_hit, external_usage_hit_count, insert_unproven_hit,
-    reclassify_self_receiver_hit_at, usage_hit,
+    SNIPPET_CONTEXT_LINES, classify_recursive_hit, usage_hit,
 };
 use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     // A derivation that admitted a declaration of unproven membership does
     // not prove this site.
-    if ctx.membership.doubt() > ctx.site_doubt {
+    if ctx.site_doubt.tripped(ctx.membership) {
         push_unproven_hit(node, ctx);
         return;
     }
@@ -51,9 +50,8 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         Some(node),
         &crate::CSharpKnowledge,
     ) {
-        ctx.hits.insert(hit);
+        ctx.usages.insert_hit(hit);
     }
-    refresh_usage_limit(ctx);
 }
 
 /// Push `node` as a same-owner `this`/own-type receiver hit (#1014 facet B):
@@ -63,12 +61,12 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// exactly one place.
 pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx);
-}
-
-fn refresh_usage_limit(ctx: &mut ScanCtx<'_>) {
-    *ctx.limit_exceeded = external_usage_hit_count(ctx.hits) > ctx.max_usages;
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_self_receiver,
+    );
 }
 
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -78,7 +76,8 @@ pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if hit.enclosing == ctx.spec.target {
         return;
     }
-    insert_unproven_hit(ctx.unproven_hits, Some(hit.usage_hit(ctx)));
+    let hit = hit.usage_hit(ctx);
+    ctx.usages.insert_unproven_hit(hit);
 }
 
 struct NodeHit {

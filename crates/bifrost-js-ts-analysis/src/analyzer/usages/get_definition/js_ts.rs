@@ -788,7 +788,11 @@ fn exact_modeled_type_named(
     language: Language,
     name: &str,
 ) -> Option<Arc<SemanticModelSymbol>> {
-    let matched = overlay.symbols_named(name);
+    let matched = overlay.symbols_named_for(
+        name,
+        brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language)
+            .semantic_pack_label(),
+    );
     if matched.disposition != SemanticModelOverlayDisposition::Unique {
         return None;
     }
@@ -815,7 +819,11 @@ fn callable_declared_return_owner(
     else {
         return None;
     };
-    let matched = overlay.symbols_with_id(id);
+    let matched = overlay.symbols_with_id_for(
+        id,
+        brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language)
+            .semantic_pack_label(),
+    );
     if matched.disposition != SemanticModelOverlayDisposition::Unique {
         return None;
     }
@@ -968,7 +976,7 @@ pub(crate) fn resolve_js_ts(
     // A renamed destructuring key is a property read on the destructured value,
     // so it is answered before the declaration terminal below claims the whole
     // `pair_pattern` (#2039).
-    if let Some(candidates) = focused.and_then(|node| {
+    if let Some((candidates, incomplete)) = focused.and_then(|node| {
         jsts_destructured_property_key_candidates(
             analyzer,
             host,
@@ -983,9 +991,20 @@ pub(crate) fn resolve_js_ts(
             &batch,
             node,
         )
-    }) && !candidates.is_empty()
-    {
-        return js_ts_candidates_outcome(analyzer, candidates);
+    }) {
+        if incomplete {
+            let mut outcome = js_ts_candidates_outcome(analyzer, candidates);
+            outcome.status = DefinitionLookupStatus::Incomplete;
+            outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                kind: "incomplete_destructured_member".to_string(),
+                message: "destructured property has possible receiver members".to_string(),
+                claim: None,
+            });
+            return outcome;
+        }
+        if !candidates.is_empty() {
+            return js_ts_candidates_outcome(analyzer, candidates);
+        }
     }
     if focused
         .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
@@ -1139,6 +1158,22 @@ pub(crate) fn resolve_js_ts(
                     .map(|endpoint| endpoint.declaration)
                     .collect();
                 return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Incomplete { candidates } => {
+                let mut outcome = js_ts_candidates_outcome(
+                    analyzer,
+                    candidates
+                        .into_iter()
+                        .map(|endpoint| endpoint.declaration)
+                        .collect(),
+                );
+                outcome.status = DefinitionLookupStatus::Incomplete;
+                outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                    kind: "incomplete_import_member_chain".to_string(),
+                    message: format!("`{reference}` has possible imported member targets"),
+                    claim: None,
+                });
+                return outcome;
             }
             ReceiverAnalysisOutcome::Ambiguous(_)
             | ReceiverAnalysisOutcome::Unknown
@@ -1431,6 +1466,16 @@ pub(crate) fn resolve_js_ts(
                     "receiver_analysis_not_precise",
                     format!("`{reference}` did not resolve to a precise JS/TS receiver"),
                 );
+            }
+            ReceiverAnalysisOutcome::Incomplete { candidates } => {
+                let mut outcome = js_ts_candidates_outcome(analyzer, candidates);
+                outcome.status = DefinitionLookupStatus::Incomplete;
+                outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                    kind: "incomplete_receiver_member".to_string(),
+                    message: format!("`{reference}` has possible receiver members"),
+                    claim: None,
+                });
+                return outcome;
             }
             ReceiverAnalysisOutcome::Ambiguous(_)
             | ReceiverAnalysisOutcome::Unsupported { .. }
@@ -3490,7 +3535,7 @@ fn jsts_receiver_provider_member_candidates(
 /// spelled receiver at all: the call names its module in its own argument
 /// (#2211), so the key resolves against that module's export surface.
 ///
-/// `None` means the site is not a renamed destructuring key. `Some([])` is a
+/// `None` means the site is not a renamed destructuring key. `Some(([], false))` is a
 /// key whose owner this file cannot prove -- an untyped parameter, an external
 /// package result, a nested or parameter pattern -- which the caller then
 /// reports as the declaration terminal it otherwise is.
@@ -3508,7 +3553,7 @@ fn jsts_destructured_property_key_candidates(
     lexical_bindings: &JsTsLexicalBindingIndex,
     batch: &JsTsDefinitionContext,
     key: Node<'_>,
-) -> Option<Vec<CodeUnit>> {
+) -> Option<(Vec<CodeUnit>, bool)> {
     let destructured = destructured_property_key_source(key)?;
     let member = node_text(key, source);
     debug_assert!(
@@ -3533,19 +3578,21 @@ fn jsts_destructured_property_key_candidates(
     // binding and its type, and a summarized call.
     let value = match destructured {
         JsTsDestructuringSource::Element(iterable) => {
-            return Some(
+            return Some((
                 provider.resolve_iterable_element_member_targets(iterable, member, budget),
-            );
+                false,
+            ));
         }
         JsTsDestructuringSource::Value(value) => value,
     };
-    let mut candidates =
+    let (mut candidates, incomplete) =
         match provider.resolve_member_targets(value, member, key.start_byte(), budget) {
-            ReceiverAnalysisOutcome::Precise(targets) => targets,
+            ReceiverAnalysisOutcome::Precise(targets) => (targets, false),
+            ReceiverAnalysisOutcome::Incomplete { candidates } => (candidates, true),
             ReceiverAnalysisOutcome::Ambiguous(_)
             | ReceiverAnalysisOutcome::Unknown
             | ReceiverAnalysisOutcome::Unsupported { .. }
-            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+            | ReceiverAnalysisOutcome::ExceededBudget { .. } => (Vec::new(), false),
         };
 
     // `await` and parentheses wrap the initializer without changing what it
@@ -3659,7 +3706,7 @@ fn jsts_destructured_property_key_candidates(
     }
     sort_units(&mut candidates);
     candidates.dedup();
-    Some(candidates)
+    Some((candidates, incomplete))
 }
 
 fn jsts_destructured_member_candidates(

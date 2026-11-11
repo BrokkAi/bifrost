@@ -108,6 +108,14 @@ impl SelectedDemandState {
             .expect("completed roots are not poisoned")
             .get(key)
             .cloned();
+        record_resolution_work(
+            if answer.is_some() {
+                ResolutionWork::CompletedRootMemoHit
+            } else {
+                ResolutionWork::CompletedRootMemoMiss
+            },
+            1,
+        );
         crate::profiling::note_with(|| {
             format!(
                 "typed_root_memo request={} root={:?} hit={} miss={}",
@@ -154,21 +162,49 @@ impl SelectedDemandState {
         {
             return;
         }
-        let stopped = |completion: &ResolutionCompletion| {
-            matches!(completion, ResolutionCompletion::Incomplete(reasons) if reasons.iter().any(|reason| matches!(reason,
-                ResolutionIncompleteReason::Cancelled | ResolutionIncompleteReason::ReceiverBudgetExhausted(_) | ResolutionIncompleteReason::TimeBudgetExceeded(_))))
-        };
+        let stopped = |completion: &ResolutionCompletion| matches!(completion, ResolutionCompletion::Incomplete(reasons) if reasons.iter().any(ResolutionIncompleteReason::is_execution_stop));
+        // Keep this destructure exhaustive so every new answer field gets an
+        // explicit memo-admission decision.
+        let FactResolutionAnswer {
+            query_obligations: _,
+            site_metadata: _,
+            callable_receiver_dispositions: _,
+            callable_candidate_applicability: _,
+            call_target_boundary,
+            application_completion,
+            member_owners: _,
+            member_rejections: _,
+            model_member_selection,
+            absent_member: _,
+            type_bound_receiver: _,
+            observed_type_identity: _,
+            binding,
+            root_projections: _,
+            projected_frontiers,
+            projected_type_shapes: _,
+            completion,
+            external_argument_reasons: _,
+            external_call_binding_reasons: _,
+            external_constructor_hierarchy_reasons: _,
+        } = answer;
         // Request-minted model candidate identities and metadata are a
         // projection for this operation, never completed-root memo payload.
-        if answer.model_member_selection.is_some()
-            || stopped(answer.completion())
-            || stopped(answer.binding().completion())
-            || stopped(&answer.call_target_boundary)
-            || answer
-                .binding()
+        if model_member_selection.is_some()
+            || stopped(completion)
+            || stopped(binding.completion())
+            || stopped(call_target_boundary)
+            || application_completion.as_ref().is_some_and(stopped)
+            || binding
                 .witnesses()
                 .iter()
                 .any(|witness| stopped(witness.completion()))
+            || projected_frontiers
+                .iter()
+                .any(|frontier| stopped(frontier.completion()))
+            || answer
+                .projected_type_shapes()
+                .iter()
+                .any(|shape| stopped(shape.completion()))
         {
             return;
         }
@@ -244,6 +280,7 @@ impl SelectedDemandState {
                     | ResolutionIncompleteReason::InconsistentPrecedence(id)
                     | ResolutionIncompleteReason::OpenBoundary { semantic: id, .. }
                     | ResolutionIncompleteReason::UnsupportedSemantic(id)
+                    | ResolutionIncompleteReason::ReceiverSubclassObligation(id)
                     | ResolutionIncompleteReason::ReceiverBudgetExhausted(id)
                     | ResolutionIncompleteReason::TimeBudgetExceeded(id) => semantic(id),
                 })
@@ -320,6 +357,9 @@ impl SelectedDemandState {
                                 FactProjectedTypeNodeForm::Alias(id)
                                 | FactProjectedTypeNodeForm::Slice(id)
                                 | FactProjectedTypeNodeForm::Array(id) => semantic(*id),
+                                FactProjectedTypeNodeForm::Channel { element, .. } => {
+                                    semantic(*element)
+                                }
                                 FactProjectedTypeNodeForm::Map { key, value } => {
                                     semantic(*key) && semantic(*value)
                                 }
@@ -332,5 +372,79 @@ impl SelectedDemandState {
                     })
             })
             && completion(answer_completion)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
+
+    #[test]
+    fn completed_roots_reject_execution_stops_in_nested_completions() {
+        let source = PreloadedFactResolutionService::from_lowered_fragments([], []);
+        let observed = ObservedBatchSource::new(&source);
+        let cancellation = CancellationToken::new();
+        let session = FactReadSession::from_split_sources(&observed, &source, &cancellation);
+        let reference =
+            SemanticId::shared_name(crate::analyzer::resolution::SharedNameId::interned(1));
+        let stop =
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::CyclicPrefixDependency(
+                reference,
+            )]);
+        let content_gap =
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                reference,
+            )]);
+        let authority = PRELOADED_FIXTURE_AUTHORITY;
+        let key = RootMemoKey {
+            declaration_access: 0,
+            context: [0; 32],
+            reference: DemandReferenceKey::caller(reference),
+            fragment: BindingFragmentId::for_test(b"completed-root-fragment"),
+            site: FactReferenceSiteMetadata::new(
+                ResolutionSiteId::new(0),
+                ResolutionNamespace::Value,
+                ResolutionSiteKind::ValueReference,
+                0,
+                0,
+                true,
+                None,
+                None,
+            ),
+            request: authority.request,
+            epoch: authority.content_epoch,
+            scope: authority.scope,
+            budget: None,
+        };
+        let memo = SelectedDemandState::default();
+        for placement in 0..4 {
+            let mut answer = empty_fact_resolution_answer(
+                if placement == 0 {
+                    stop.clone()
+                } else {
+                    ResolutionCompletion::Complete
+                },
+                &cancellation,
+            );
+            match placement {
+                1 => answer.application_completion = Some(stop.clone()),
+                2 => {
+                    answer.projected_frontiers = vec![TypedFrontierState::new(
+                        reference,
+                        Vec::<ResolutionSlotValue>::new(),
+                        stop.clone(),
+                    )]
+                    .into_boxed_slice()
+                }
+                3 => answer.application_completion = Some(content_gap.clone()),
+                _ => {}
+            }
+            memo.retain(&key, &answer, &session);
+            let later_session =
+                FactReadSession::from_split_sources(&observed, &source, &cancellation);
+            assert_eq!(memo.lookup(&key, &later_session).is_some(), placement == 3);
+            assert_eq!(memo.hits_for_test(), usize::from(placement == 3));
+        }
     }
 }

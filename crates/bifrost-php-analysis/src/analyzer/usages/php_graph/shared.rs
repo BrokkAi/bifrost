@@ -108,11 +108,16 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             }
             push_override_declaration_hit(self.php, source, &override_declaration, &mut hits);
         }
-        for file in files {
+        // The scan returns at the `max_usages` cap, so the files it reached
+        // decide the sample and total. Walk them in path order, not hash order,
+        // so the same inputs give the same answer.
+        let mut ordered: Vec<&ProjectFile> = files.iter().collect();
+        ordered.sort_unstable();
+        for file in ordered {
             if scan_scope.is_cancelled() {
                 break;
             }
-            scan_file(self.php, source, &file, &spec, hierarchy, &mut hits);
+            scan_file(self.php, source, file, &spec, hierarchy, &mut hits);
             let external_callsites =
                 brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(&hits);
             if external_callsites > max_usages {

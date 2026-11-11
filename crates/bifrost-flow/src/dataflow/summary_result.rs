@@ -1,5 +1,7 @@
 //! Deterministic public results for in-memory summary tabulation.
 
+use super::summary::MemberReadReceipt;
+use crate::hash::{HashMap, HashSet};
 use std::{
     cmp::Ordering,
     error::Error,
@@ -832,6 +834,8 @@ pub struct SummaryMetrics {
 /// Deterministic typed result of one query-local summary solve.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SummaryDataflowResult<Fact> {
+    caller_conversions: HashSet<CallSiteHandle>,
+    member_receipts: Option<HashMap<ProcedureHandle, MemberReadReceipt>>,
     facts: Box<[Fact]>,
     reached: Box<[SummaryReachedFact]>,
     end_summaries: Box<[TabulationEndSummary]>,
@@ -849,6 +853,7 @@ pub struct SummaryDataflowResult<Fact> {
 impl<Fact> SummaryDataflowResult<Fact> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
+        member_receipts: Option<HashMap<ProcedureHandle, MemberReadReceipt>>,
         facts: Vec<Fact>,
         mut reached: Vec<SummaryReachedFact>,
         mut end_summaries: Vec<TabulationEndSummary>,
@@ -872,6 +877,8 @@ impl<Fact> SummaryDataflowResult<Fact> {
         incoming_calls.dedup();
 
         Self {
+            caller_conversions: HashSet::default(),
+            member_receipts,
             facts: facts.into_boxed_slice(),
             reached: reached.into_boxed_slice(),
             end_summaries: end_summaries.into_boxed_slice(),
@@ -905,8 +912,21 @@ impl<Fact> SummaryDataflowResult<Fact> {
         self
     }
 
+    pub(crate) fn with_caller_conversions(mut self, calls: HashSet<CallSiteHandle>) -> Self {
+        self.caller_conversions = calls;
+        self
+    }
+
+    pub(crate) fn caller_conversions(&self) -> &HashSet<CallSiteHandle> {
+        &self.caller_conversions
+    }
+
     pub fn facts(&self) -> &[Fact] {
         &self.facts
+    }
+
+    pub fn member_receipts(&self) -> Option<&HashMap<ProcedureHandle, MemberReadReceipt>> {
+        self.member_receipts.as_ref()
     }
 
     pub fn fact(&self, id: FactId) -> Option<&Fact> {
@@ -965,6 +985,11 @@ impl<Fact> SummaryDataflowResult<Fact> {
         self.work
     }
 
+    #[cfg(test)]
+    pub(crate) fn witness_node_count(&self) -> usize {
+        self.witness_store.node_count()
+    }
+
     pub const fn semantic_work(&self) -> SemanticWork {
         self.semantic_work
     }
@@ -981,6 +1006,11 @@ impl<Fact> SummaryDataflowResult<Fact> {
     /// Shared semantic artifacts behind handles and `Arc`s are intentionally excluded.
     pub fn retained_bytes(&self) -> usize {
         size_of::<Self>()
+            .saturating_add(
+                self.caller_conversions
+                    .capacity()
+                    .saturating_mul(size_of::<CallSiteHandle>()),
+            )
             .saturating_add(size_of_val(self.facts()))
             .saturating_add(size_of_val(self.reached()))
             .saturating_add(size_of_val(self.end_summaries()))

@@ -10508,7 +10508,7 @@ fn scala_stage_member_context(
 /// (`ScalaAnalyzer::relation_kind`): a supertype is a trait implementation when
 /// the trait is mixed into something that is not itself a trait; a trait
 /// extending a trait, or a class extending a class, is ordinary inheritance.
-fn scala_hierarchy_relation(
+pub(crate) fn scala_hierarchy_relation(
     scala: &ScalaAnalyzer,
     owner: &CodeUnit,
     ancestor: &CodeUnit,
@@ -14723,7 +14723,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     tree: &Option<tree_sitter::Tree>,
     site: &brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite,
     _operation: Option<brokk_bifrost_analysis::navigation::NavigationOperation>,
-    _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
     _go_session: Option<
         &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession,
     >,
@@ -14731,8 +14731,7 @@ pub(crate) fn resolve_definition_dispatch<'a>(
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionResolution,
 > {
-    let evidence = CallEvidence::default();
-    let outcome = scala::resolve_scala(
+    let mut outcome = scala::resolve_scala(
         analyzer,
         token,
         context,
@@ -14740,6 +14739,21 @@ pub(crate) fn resolve_definition_dispatch<'a>(
         source,
         tree.as_ref(),
         site,
+    );
+    // Navigation renders the incumbent resolver's outcome. A call's proof is
+    // the selected native answer's, the same evidence Kotlin and the native
+    // Scala route take.
+    let evidence = crate::analyzer::jvm::native_points::scala_native_call_evidence(
+        brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery {
+            analyzer,
+            file: &request.file,
+            source,
+            tree: tree.as_ref(),
+            site,
+            budget: brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
+            cancellation,
+        },
+        &mut outcome,
     );
     std::ops::ControlFlow::Continue(DefinitionResolution {
         outcome,

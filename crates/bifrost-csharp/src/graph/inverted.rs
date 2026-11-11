@@ -22,7 +22,7 @@ use crate::graph::extractor::{
     is_declaration_name, is_unqualified_method_group_value, member_access_name,
     member_access_receiver,
 };
-use crate::graph::membership_scope::MembershipScopedSource;
+use crate::graph::membership_scope::{DoubtMemo, Doubted, MembershipScopedSource, SiteDoubt};
 use crate::graph::resolver::{
     CSharpBuiltinValueArguments, UnqualifiedMethodGroupResolution, argument_count,
     class_unit_for_fq_name, collection_target_element_type_node, extension_visibility_site_key,
@@ -83,14 +83,14 @@ pub fn scan_file(
         graph,
         csharp: &membership,
         membership: &membership,
-        site_doubt: 0,
+        site_doubt: SiteDoubt::default(),
         file,
         source: input.source,
         class_ranges: ClassRangeIndex::build(graph.index, file),
         using_aliases: csharp.using_aliases_of(file),
-        method_group_cache: HashMap::default(),
-        member_cache: HashMap::default(),
-        extension_cache: HashMap::default(),
+        method_group_cache: DoubtMemo::default(),
+        member_cache: DoubtMemo::default(),
+        extension_cache: DoubtMemo::default(),
         callee_visibility: HashMap::default(),
         input,
         edges: PerFileEdges::default(),
@@ -103,18 +103,18 @@ pub fn scan_file(
 struct CsScan<'a> {
     graph: &'a CSharpGraphSource<'a>,
     csharp: &'a dyn CSharpSource,
-    /// The same source as `csharp`, for its doubt count.
+    /// The same source as `csharp`, for its doubt accounting.
     membership: &'a MembershipScopedSource<'a>,
     /// Doubt admitted before the node now being recorded: an edge whose
     /// derivation admitted more is not proven.
-    site_doubt: usize,
+    site_doubt: SiteDoubt,
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
     using_aliases: Arc<HashMap<String, String>>,
-    method_group_cache: HashMap<(String, String), (UnqualifiedMethodGroupResolution, bool)>,
-    member_cache: HashMap<MemberCacheKey, (Vec<String>, bool)>,
-    extension_cache: HashMap<ExtensionCacheKey, (Vec<String>, bool)>,
+    method_group_cache: DoubtMemo<(String, String), UnqualifiedMethodGroupResolution>,
+    member_cache: DoubtMemo<MemberCacheKey, Vec<String>>,
+    extension_cache: DoubtMemo<ExtensionCacheKey, Vec<String>>,
     /// Whether this file's compilation sees each callee identity, for this
     /// file's scan only.
     callee_visibility: HashMap<String, Option<CSharpCompilationVisibility>>,
@@ -219,7 +219,7 @@ impl CsScan<'_> {
     /// declaration of `callee`: a member only an invisible copy declares is
     /// no edge, and one only an unproven copy declares is unproven inbound.
     fn record(&mut self, callee: String, node: Node<'_>) {
-        if self.membership.doubt() > self.site_doubt {
+        if self.site_doubt.tripped(self.membership) {
             self.record_unproven_callee(callee, node);
             return;
         }
@@ -278,49 +278,42 @@ impl CsScan<'_> {
             explicit_generic_arity,
             call_arity,
         );
-        if !self.member_cache.contains_key(&key) {
-            let before = self.membership.doubt();
-            let candidates = class_unit_for_fq_name(self.csharp, token, owner_fqn)
-                .map(|owner| {
-                    call_arity.map_or_else(
-                        || {
-                            nearest_member_candidates_for_owner(
-                                self.graph,
-                                self.csharp,
-                                token,
-                                &owner,
-                                name,
-                                explicit_generic_arity,
-                            )
-                        },
-                        |arity| {
-                            invocation_member_candidates_for_owner(
-                                self.graph,
-                                self.csharp,
-                                token,
-                                &owner,
-                                name,
-                                explicit_generic_arity,
-                                arity,
-                            )
-                        },
-                    )
-                })
-                .unwrap_or_default()
-                .into_iter()
-                .map(|candidate| candidate.fq_name())
-                .collect();
-            let doubted = self.membership.doubt() > before;
-            self.member_cache.insert(key.clone(), (candidates, doubted));
-        } else {
-            let doubted = self.member_cache[&key].1;
-            self.membership.replay(doubted);
-        }
-        let (candidates, _) = self
+        let (graph, csharp) = (self.graph, self.csharp);
+        let callees = self
             .member_cache
-            .get(&key)
-            .expect("member cache entry was inserted");
-        let callees = candidates.clone();
+            .get_or_derive(key, self.membership, || {
+                class_unit_for_fq_name(csharp, token, owner_fqn)
+                    .map(|owner| {
+                        call_arity.map_or_else(
+                            || {
+                                nearest_member_candidates_for_owner(
+                                    graph,
+                                    csharp,
+                                    token,
+                                    &owner,
+                                    name,
+                                    explicit_generic_arity,
+                                )
+                            },
+                            |arity| {
+                                invocation_member_candidates_for_owner(
+                                    graph,
+                                    csharp,
+                                    token,
+                                    &owner,
+                                    name,
+                                    explicit_generic_arity,
+                                    arity,
+                                )
+                            },
+                        )
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|candidate| candidate.fq_name())
+                    .collect()
+            })
+            .clone();
         if !callees.is_empty() {
             for callee in callees {
                 // Same-owner (`this.`, bare implicit-this, own-type static) calls
@@ -352,35 +345,34 @@ impl CsScan<'_> {
                     scope_end,
                     CSharpBuiltinValueArguments::at_site(node, self.source),
                 );
-                if let Some((_, doubted)) = self.extension_cache.get(&extension_key) {
-                    self.membership.replay(*doubted);
-                } else {
-                    let before = self.membership.doubt();
-                    let receiver_types = [owner_fqn.to_string()];
-                    let mut extensions = usage_visible_extension_method_candidates(
-                        self.csharp,
-                        token,
-                        self.graph,
-                        self.source,
-                        node,
-                        &receiver_types,
-                        name,
-                        Some(call_arity),
-                        explicit_generic_arity,
-                    )
-                    .into_iter()
-                    .map(|extension| extension.fq_name())
-                    .collect::<Vec<_>>();
-                    extensions.sort();
-                    extensions.dedup();
-                    let doubted = self.membership.doubt() > before;
-                    self.extension_cache
-                        .insert(extension_key.clone(), (extensions, doubted));
-                }
+                let (graph, csharp, source, membership) =
+                    (self.graph, self.csharp, self.source, self.membership);
                 self.extension_cache
-                    .get(&extension_key)
-                    .expect("extension cache entry was inserted")
-                    .0
+                    .get_or_derive(extension_key, self.membership, || {
+                        let receiver_types = [owner_fqn.to_string()];
+                        let found = usage_visible_extension_method_candidates(
+                            csharp,
+                            token,
+                            graph,
+                            source,
+                            node,
+                            &receiver_types,
+                            name,
+                            Some(call_arity),
+                            explicit_generic_arity,
+                        );
+                        if found.open.is_some() {
+                            membership.add_doubt();
+                        }
+                        let mut extensions = found
+                            .candidates
+                            .into_iter()
+                            .map(|extension| extension.fq_name())
+                            .collect::<Vec<_>>();
+                        extensions.sort();
+                        extensions.dedup();
+                        extensions
+                    })
                     .clone()
             })
             .unwrap_or_default();
@@ -395,7 +387,7 @@ impl CsScan<'_> {
             return;
         }
 
-        if candidates.is_empty() {
+        if callees.is_empty() {
             if explicit_generic_arity.is_some() || same_owner {
                 self.record_unproven(name, node);
             } else {
@@ -436,7 +428,7 @@ fn walk(
                 bindings.enter_scope();
             }
             seed_declaration(node, token, ctx, bindings);
-            ctx.site_doubt = ctx.membership.doubt();
+            ctx.site_doubt = ctx.membership.site();
             record_reference(node, token, ctx, bindings);
             if enters_scope {
                 TreeWalkAction::DescendWithExit
@@ -638,27 +630,29 @@ fn record_reference(
                     }
                     let key = (owner_fqn.clone(), name.clone());
                     let resolution =
-                        if let Some((cached, doubted)) = ctx.method_group_cache.get(&key) {
-                            ctx.membership.replay(*doubted);
+                        if let Some(cached) = ctx.method_group_cache.get(&key, ctx.membership) {
                             cached.clone()
                         } else {
-                            let before = ctx.membership.doubt();
-                            let Some(owner) = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)
-                            else {
+                            // An owner that does not resolve is not cached: the
+                            // site records nothing, so there is no answer to reuse.
+                            let derived = ctx.membership.doubted(|| {
+                                let owner = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)?;
+                                let resolution = resolve_unqualified_method_group_for_owner(
+                                    ctx.graph, ctx.csharp, token, &owner, &name,
+                                );
+                                Some(match resolution {
+                                    UnqualifiedMethodGroupResolution::NoMember => {
+                                        resolve_imported_static_method_group(
+                                            ctx.csharp, token, ctx.file, &name,
+                                        )
+                                    }
+                                    resolution => resolution,
+                                })
+                            });
+                            let Some(derived) = derived.transpose() else {
                                 return;
                             };
-                            let mut resolution = resolve_unqualified_method_group_for_owner(
-                                ctx.graph, ctx.csharp, token, &owner, &name,
-                            );
-                            if matches!(resolution, UnqualifiedMethodGroupResolution::NoMember) {
-                                resolution = resolve_imported_static_method_group(
-                                    ctx.csharp, token, ctx.file, &name,
-                                );
-                            }
-                            let doubted = ctx.membership.doubt() > before;
-                            ctx.method_group_cache
-                                .insert(key, (resolution.clone(), doubted));
-                            resolution
+                            ctx.method_group_cache.insert(key, derived).clone()
                         };
                     if matches!(&resolution, UnqualifiedMethodGroupResolution::NoMember)
                         || unqualified_member_has_structured_shadow(node, ctx.source)
@@ -991,7 +985,7 @@ fn seed_declaration(
             ) else {
                 return;
             };
-            let resolved = ctx.membership.measured(|| {
+            let resolved = ctx.membership.doubted(|| {
                 ctx.resolve_type_fqn_at(
                     token,
                     &reference_type_text(type_node, ctx.source),
@@ -1016,7 +1010,7 @@ fn seed_variable_declaration(
             return;
         };
         // `var x = new Foo()` infers from the initializer; other `var` is unknown.
-        let resolved = ctx.membership.measured(|| {
+        let resolved = ctx.membership.doubted(|| {
             if type_text == "var" {
                 var_initializer_type(child, token, ctx, bindings)
             } else {
@@ -1032,7 +1026,7 @@ fn seed_variable_declaration(
 /// shadows the name: its uses then prove no edge.
 fn seed_typed(
     name: Node<'_>,
-    (resolved, doubted): (Option<String>, bool),
+    resolved: Doubted<Option<String>>,
     ctx: &CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
@@ -1040,6 +1034,7 @@ fn seed_typed(
     if binding_name.is_empty() {
         return;
     }
+    let (resolved, doubted) = resolved.into_parts();
     bindings.seed_or_shadow(binding_name.to_string(), resolved.filter(|_| !doubted));
 }
 

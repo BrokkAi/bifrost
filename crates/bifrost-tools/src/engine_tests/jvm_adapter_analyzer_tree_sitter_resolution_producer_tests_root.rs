@@ -529,7 +529,7 @@ fn implicit_root_stays_open_with_selected_package_gap_in_both_orders() {
             .unwrap();
         // The selected java.lang mount has an open persisted package-member
         // inventory before the operation opens; no stage epoch changes later.
-        analyzer.analyzer_store().conn.execute(|connection| {
+        analyzer.analyzer_store().conn.execute_fixture(|connection| {
             let inserted = connection.execute(
                 "INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) SELECT interior.blob_id,930001,0,2 FROM resolution_fragment_interiors AS interior JOIN blob_meta AS meta ON meta.blob_id=interior.blob_id WHERE interior.lang='java' AND meta.content_package='java.lang'",
                 [],
@@ -787,6 +787,194 @@ fn jvm_supertype_reference_admission_probe(caller_path: &str) {
             },
         )
         .unwrap();
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9195: shared selected JVM hierarchy stopped at a Kotlin source typealias"
+)]
+fn kotlin_source_alias_parent_closes_in_selected_native_hierarchy() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        LoweredSemanticRole, SelectedFactOperationBlueprintConstruction,
+        SelectedResolutionContextValidationOutcome, SelectedSemanticLocator,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmHierarchyReadReceipts;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::kotlin::adapter::KotlinAdapter;
+
+    let fixture = InlineTestProject::with_language(Language::Kotlin)
+        .file("lib/Base.kt", "package lib\nopen class Base\n")
+        .file(
+            "app/Alias.kt",
+            "package app\nimport lib.Base\ntypealias AliasToBase = Base\n",
+        )
+        .file("app/Child.kt", "package app\nclass X : AliasToBase()\n")
+        .build();
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), KotlinAdapter);
+    let base_state = analyzer
+        .fetch_file_state(&fixture.file("lib/Base.kt"))
+        .unwrap();
+    let child_state = analyzer
+        .fetch_file_state(&fixture.file("app/Child.kt"))
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let snapshots = analyzer.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("kotlin", Language::Kotlin)];
+    let input = SelectedResolutionOperationInput::new(
+        analyzer.project(),
+        analyzer.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &[],
+    );
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+        .analyzer_store()
+        .open_selected_resolution_operation(input, &cancellation)
+        .unwrap()
+    else {
+        panic!("open selected Kotlin operation")
+    };
+    let jvm_context::JvmImportContext::Ready {
+        context,
+        scoped_gaps: gaps,
+        ..
+    } = operation
+        .jvm_import_context(Language::Kotlin, "app/Child.kt", &cancellation)
+        .unwrap()
+    else {
+        panic!("Kotlin import context")
+    };
+    let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+        .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+        .unwrap()
+    else {
+        panic!("validate Kotlin context")
+    };
+    let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+        .ready
+        .collect_blueprint(context, &cancellation)
+        .unwrap()
+    else {
+        panic!("Kotlin blueprint")
+    };
+    let lexical = operation.ready.lexical_source();
+    let typed = operation.ready.typed_source();
+    let locate = |path, site| {
+        let locator =
+            SelectedSemanticLocator::new("kotlin", path, site, LoweredSemanticRole::Definition);
+        let LocatedSemantic::Found(id) = operation
+            .ready
+            .lookup_locator(&lexical, &locator, &cancellation)
+            .unwrap()
+        else {
+            panic!("locate {path}")
+        };
+        id
+    };
+    let child = locate(
+        "app/Child.kt",
+        child_state.resolution_facts.supertypes[0].subtype,
+    );
+    let base = locate(
+        "lib/Base.kt",
+        base_state.resolution_facts.supertypes[0].subtype,
+    );
+    let session = ResolutionSession::unbounded();
+    let SelectedNativeDefinitions::Ready(definitions) = operation
+        .selected_hierarchy_definition_units(&[base], &cancellation, &session)
+        .unwrap()
+    else {
+        panic!("selected Kotlin source Base is hydratable")
+    };
+    assert!(
+        matches!(&definitions[..], [(id, SelectedNativeDefinition::Unit(unit))]
+        if *id == base && unit.fq_name() == "lib.Base")
+    );
+    #[derive(Default)]
+    struct CountingReceipts {
+        captured: usize,
+        replayed: usize,
+    }
+    impl JvmHierarchyReadReceipts for CountingReceipts {
+        type Receipt = ();
+        fn capture<T>(&mut self, read: impl FnOnce() -> T) -> (T, ()) {
+            self.captured += 1;
+            (read(), ())
+        }
+        fn replay(&mut self, _: &()) {
+            self.replayed += 1;
+        }
+    }
+    let mut receipts = CountingReceipts::default();
+    operation
+        .with_jvm_hierarchy_query_receipts(
+            JvmForwardOperationContext {
+                storage_language: "kotlin",
+                blueprint: &blueprint,
+                caller_path: "app/Child.kt",
+                import_gaps: &gaps,
+                lexical: &lexical,
+                typed: &typed,
+                cancellation: &cancellation,
+                session: &session,
+            },
+            &mut receipts,
+            |query| {
+                let answer = query.jvm_direct_supertype_answer(child)?;
+                assert_eq!(answer.parents.len(), 1, "{answer:?}");
+                let parent = &answer.parents[0];
+                let binding = query.resolve_reference_uncached_for_test(parent.reference)?;
+                assert_eq!(binding.binding().targets().len(), 1, "{binding:?}");
+                assert_ne!(
+                    binding.binding().targets()[0],
+                    base,
+                    "binding API retains the alias"
+                );
+                assert_eq!(
+                    parent.targets,
+                    vec![base],
+                    "selected alias RHS resolves in its declaration context: {answer:?}"
+                );
+                assert_eq!(
+                    parent.completion,
+                    brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete,
+                    "{answer:?}"
+                );
+                let repeated = query.jvm_direct_supertype_answer(child)?;
+                assert_eq!(repeated.parents[0].targets, vec![base]);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(
+        receipts.captured > 0 && receipts.replayed > 0,
+        "selected alias reads must be captured and replayed: {} / {}",
+        receipts.captured,
+        receipts.replayed
+    );
+    let budget = brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+        max_scope_nodes: 1,
+        ..Default::default()
+    };
+    let limited = ResolutionSession::bounded(budget, Some(&cancellation));
+    operation.with_jvm_hierarchy_query(JvmForwardOperationContext {
+        storage_language: "kotlin", blueprint: &blueprint, caller_path: "app/Child.kt",
+        import_gaps: &gaps, lexical: &lexical, typed: &typed,
+        cancellation: &cancellation, session: &limited,
+    }, |query| {
+        let cut = query.jvm_direct_supertype_answer(child)?;
+        assert!(cut.parents.iter().all(|parent|
+            parent.completion != brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete),
+            "a stopped alias chain cannot certify a parent: {cut:?}");
+        Ok(())
+    }).unwrap();
 }
 
 #[test]
@@ -1072,4 +1260,284 @@ fn jvm_descendant_r4_profile() {
             },
         )
         .unwrap();
+}
+
+struct ScalaAliasWalkObservation {
+    targets: Vec<brokk_bifrost_analysis::analyzer::resolution::SemanticId>,
+    completion: brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion,
+    replayed: usize,
+    scope_nodes: usize,
+}
+
+fn selected_scala_alias_walk(
+    aliases: &str,
+    other_files: &[(&str, &str)],
+    max_scope_nodes: Option<usize>,
+) -> ScalaAliasWalkObservation {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::resolution::{
+        LoweredSemanticRole, SelectedFactOperationBlueprintConstruction,
+        SelectedResolutionContextValidationOutcome, SelectedSemanticLocator,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_demand::JvmForwardOperationContext;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_direct_supertypes::JvmHierarchyReadReceipts;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::*;
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+    use brokk_bifrost_core::cancellation::CancellationToken;
+    use brokk_bifrost_jvm_analysis::analyzer::scala::adapter::ScalaAdapter;
+
+    let mut project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Aliases.scala", aliases)
+        .file("app/Child.scala", "package app\nclass Child extends A0\n");
+    for (path, source) in other_files {
+        project = project.file(*path, *source);
+    }
+    let fixture = project.build();
+    let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), ScalaAdapter);
+    analyzer
+        .fetch_file_state(&fixture.file("app/Aliases.scala"))
+        .unwrap();
+    for (path, _) in other_files {
+        analyzer.fetch_file_state(&fixture.file(*path)).unwrap();
+    }
+    let child_state = analyzer
+        .fetch_file_state(&fixture.file("app/Child.scala"))
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let snapshots = analyzer.selected_workspace_snapshots();
+    let languages = [SelectedResolutionLanguage::new("scala", Language::Scala)];
+    let input = SelectedResolutionOperationInput::new(
+        analyzer.project(),
+        analyzer.workspace_id(),
+        snapshots.as_ref(),
+        &languages,
+        &[],
+    );
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = analyzer
+        .analyzer_store()
+        .open_selected_resolution_operation(input, &cancellation)
+        .unwrap()
+    else {
+        panic!("open selected Scala operation")
+    };
+    let jvm_context::JvmImportContext::Ready {
+        context,
+        scoped_gaps: gaps,
+        ..
+    } = operation
+        .jvm_import_context(Language::Scala, "app/Child.scala", &cancellation)
+        .unwrap()
+    else {
+        panic!("Scala import context")
+    };
+    let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+        .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+        .unwrap()
+    else {
+        panic!("validate Scala context")
+    };
+    let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+        .ready
+        .collect_blueprint(context, &cancellation)
+        .unwrap()
+    else {
+        panic!("Scala blueprint")
+    };
+    let lexical = operation.ready.lexical_source();
+    let typed = operation.ready.typed_source();
+    let locator = SelectedSemanticLocator::new(
+        "scala",
+        "app/Child.scala",
+        child_state
+            .resolution_facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == brokk_bifrost_core::analyzer::resolution_facts::ResolutionIdentifierRole::Declaration
+                    && identifier.namespace == brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type
+                    && child_state.resolution_facts.names[identifier.name.index()].spelling == "Child"
+            })
+            .expect("fixture Child declaration")
+            .site,
+        LoweredSemanticRole::Definition,
+    );
+    let LocatedSemantic::Found(child) = operation
+        .ready
+        .lookup_locator(&lexical, &locator, &cancellation)
+        .unwrap()
+    else {
+        panic!("locate Scala child")
+    };
+    let session = max_scope_nodes.map_or_else(ResolutionSession::unbounded, |max_scope_nodes| {
+        ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes,
+                ..Default::default()
+            },
+            Some(&cancellation),
+        )
+    });
+    #[derive(Default)]
+    struct CountingReceipts {
+        replayed: usize,
+    }
+    impl JvmHierarchyReadReceipts for CountingReceipts {
+        type Receipt = ();
+        fn capture<T>(&mut self, read: impl FnOnce() -> T) -> (T, ()) {
+            (read(), ())
+        }
+        fn replay(&mut self, _: &()) {
+            self.replayed += 1;
+        }
+    }
+    let mut receipts = CountingReceipts::default();
+    let (targets, completion) = operation
+        .with_jvm_hierarchy_query_receipts(
+            JvmForwardOperationContext {
+                storage_language: "scala",
+                blueprint: &blueprint,
+                caller_path: "app/Child.scala",
+                import_gaps: &gaps,
+                lexical: &lexical,
+                typed: &typed,
+                cancellation: &cancellation,
+                session: &session,
+            },
+            &mut receipts,
+            |query| {
+                let answer = query.jvm_direct_supertype_answer(child)?;
+                assert_eq!(answer.parents.len(), 1, "{answer:?}");
+                let parent = answer.parents.into_iter().next().unwrap();
+                Ok((parent.targets, parent.completion))
+            },
+        )
+        .unwrap();
+    let work = session.finish(()).work();
+    ScalaAliasWalkObservation {
+        targets,
+        completion,
+        replayed: receipts.replayed,
+        scope_nodes: work.scope_nodes,
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9195: alias-parent walk re-expanded reconverging aliases per path and skipped budget debit on cached steps"
+)]
+fn scala_selected_alias_dag_expands_linearly() {
+    let mut aliases = String::from("package app\n");
+    let mut files = Vec::new();
+    for level in 0..8 {
+        aliases.push_str(&format!("import left{level}.*\nimport right{level}.*\n"));
+        files.push((
+            format!("left{level}/B.scala"),
+            format!("package left{level}\ntype B{level} = app.A{}\n", level + 1),
+        ));
+        files.push((
+            format!("right{level}/B.scala"),
+            format!("package right{level}\ntype B{level} = app.A{}\n", level + 1),
+        ));
+    }
+    for level in 0..8 {
+        aliases.push_str(&format!("type A{level} = B{level}\n"));
+    }
+    aliases.push_str("type A8 = lib.Base\n");
+    files.push((
+        "lib/Base.scala".to_owned(),
+        "package lib\nclass Base\n".to_owned(),
+    ));
+    let borrowed = files
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let observation = selected_scala_alias_walk(&aliases, &borrowed, None);
+    assert_eq!(observation.targets.len(), 1, "{:?}", observation.targets);
+    assert!(
+        observation.replayed < 150,
+        "replayed {} reads for 25 aliases",
+        observation.replayed
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9195: alias-parent walk re-expanded reconverging aliases per path and skipped budget debit on cached steps"
+)]
+fn scala_selected_alias_fanout_charges_and_stays_open() {
+    let aliases = "package app\nimport one.*\nimport two.*\ntype A0 = Base\n";
+    let files = [
+        ("one/Base.scala", "package one\nclass Base\n"),
+        ("two/Base.scala", "package two\nclass Base\n"),
+    ];
+    let full = selected_scala_alias_walk(aliases, &files, Some(10_000));
+    assert_eq!(full.targets.len(), 2, "{:?}", full.targets);
+    assert!(
+        !matches!(&full.completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(reasons)
+            if reasons.iter().any(|reason| matches!(reason, brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::ReceiverBudgetExhausted(_)))),
+        "{:?}",
+        full.completion
+    );
+    let single = selected_scala_alias_walk(
+        "package app\nimport one.*\ntype A0 = Base\n",
+        &files[..1],
+        Some(10_000),
+    );
+    assert!(
+        full.scope_nodes > single.scope_nodes,
+        "fanout {} <= single {}",
+        full.scope_nodes,
+        single.scope_nodes
+    );
+    let cut = selected_scala_alias_walk(aliases, &files, Some(full.scope_nodes - 1));
+    assert_ne!(
+        cut.completion,
+        brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete
+    );
+    assert!(
+        matches!(&cut.completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(reasons)
+            if reasons.iter().any(|reason| matches!(reason, brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::ReceiverBudgetExhausted(_)))),
+        "{:?}",
+        cut.completion
+    );
+    assert_eq!(cut.scope_nodes, full.scope_nodes - 1);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9195: alias-parent walk re-expanded reconverging aliases per path and skipped budget debit on cached steps"
+)]
+fn scala_selected_alias_budget_cut_is_deterministic() {
+    let aliases = "package app\nimport one.*\nimport two.*\ntype A0 = Base\n";
+    let files = [
+        ("one/Base.scala", "package one\nclass Base\n"),
+        ("two/Base.scala", "package two\nclass Base\n"),
+    ];
+    let full = selected_scala_alias_walk(aliases, &files, Some(10_000));
+    assert!(
+        !matches!(&full.completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(reasons)
+            if reasons.iter().any(|reason| matches!(reason, brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::ReceiverBudgetExhausted(_)))),
+        "{:?}",
+        full.completion
+    );
+    let budget = full.scope_nodes - 1;
+    let first = selected_scala_alias_walk(aliases, &files, Some(budget));
+    let second = selected_scala_alias_walk(aliases, &files, Some(budget));
+    assert_ne!(
+        first.completion,
+        brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Complete
+    );
+    assert!(
+        matches!(&first.completion, brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(reasons)
+            if reasons.iter().any(|reason| matches!(reason, brokk_bifrost_analysis::analyzer::resolution::ResolutionIncompleteReason::ReceiverBudgetExhausted(_)))),
+        "{:?}",
+        first.completion
+    );
+    assert_eq!(first.targets, second.targets);
+    assert_eq!(first.completion, second.completion);
+    assert_eq!(first.scope_nodes, second.scope_nodes);
 }

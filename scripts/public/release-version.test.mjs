@@ -5,24 +5,12 @@ import test from "node:test";
 import {
   confirmReleaseVersion,
   normalizeReleaseTag,
-  THIRD_PARTY_SEMANTIC_PACK_SPECS,
   readCargoVersion,
   syncBifrostDependencyVersions,
   syncCitationVersion,
   validatePyprojectVersionInheritance,
   validateWorkspaceVersionInheritance,
 } from "./release-version.mjs";
-
-test("release inputs include every pinned third-party semantic-pack ecosystem", () => {
-  assert.deepEqual(THIRD_PARTY_SEMANTIC_PACK_SPECS, [
-    "semantic-packs/jvm/temurin-jdk-21.0.8+9.json",
-    "semantic-packs/jvm/kotlin-stdlib-2.2.20.json",
-    "semantic-packs/jvm/scala-library-2.13.16.json",
-    "semantic-packs/python/typeshed-stdlib-2026.8.31.json",
-    "semantic-packs/typescript/typescript-7.0.2.json",
-    "semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json",
-  ]);
-});
 
 test("synchronizes exact internal Bifrost dependency versions", () => {
   const manifest = [

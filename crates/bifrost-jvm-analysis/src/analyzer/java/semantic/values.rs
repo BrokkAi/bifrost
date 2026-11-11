@@ -1,3 +1,4 @@
+use crate::analyzer::java::semantic::numeric::{JavaNumericLiteral, java_numeric_literal};
 use brokk_bifrost_analysis::analyzer::java_integral_parameter::JavaScalarType;
 
 use crate::analyzer::java::semantic::syntax::*;
@@ -18,6 +19,31 @@ fn java_binding_declares_array(node: Node<'_>) -> bool {
                 .and_then(|declaration| declaration.child_by_field_name("type"))
         })
         .is_some_and(crate::analyzer::java::java_type_syntax_is_array)
+}
+
+/// The value an `int` or `long` local declarator's integer-literal
+/// initializer gives the local, converted to the declared type (JLS 5.2).
+/// Any other declared type, including `var`, an array or a narrower integral
+/// type, has no constant here.
+fn java_integral_literal_initializer(
+    source: &str,
+    declarator: Node<'_>,
+    type_node: Option<Node<'_>>,
+) -> Option<JavaNumericLiteral> {
+    if declarator.kind() != "variable_declarator" || java_binding_declares_array(declarator) {
+        return None;
+    }
+    let type_node = type_node.filter(|node| node.kind() == "integral_type")?;
+    let literal = java_numeric_literal(source, declarator.child_by_field_name("value")?)?;
+    match (type_node.child(0)?.kind(), literal) {
+        ("int", JavaNumericLiteral::Int(_)) | ("long", JavaNumericLiteral::Long(_)) => {
+            Some(literal)
+        }
+        ("long", JavaNumericLiteral::Int(value)) => {
+            Some(JavaNumericLiteral::Long(i64::from(value)))
+        }
+        _ => None,
+    }
 }
 
 /// A resolved, unambiguous field declaration: its own name's source anchor,
@@ -283,6 +309,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
         if spec.captures_incomplete {
+            self.session.footprint_class(
+                FootprintClass::Capture,
+                FootprintDisposition::Refused(FootprintRefusal::RelevantGap),
+            );
             self.add_gap(builder, entry, SemanticGapSubject::Procedure,
                 SemanticCapability::Captures, SemanticGapKind::Unsupported,
                 "lambda capture inventory includes an unsupported binding or enclosing-class boundary")?;
@@ -335,6 +365,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if node.kind() == "catch_formal_parameter" {
                     self.non_null_values.insert(value);
                 }
+                if let Some(constant) =
+                    java_integral_literal_initializer(self.prepared.source(), node, type_node)
+                {
+                    self.constant_locals.insert(value, constant);
+                }
                 self.locals
                     .entry(text.into())
                     .or_default()
@@ -353,6 +388,36 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 && let Some(text) = node_text(self.prepared.source(), binder)
             {
                 self.pattern_variable_names.insert(text.into());
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        if self.constant_locals.is_empty() {
+            return Ok(());
+        }
+        // A literal-initialized local keeps its value only if nothing writes
+        // it again. Nested procedures are scanned too: Java rejects their
+        // writes to a captured local, and a write to a shadowing binding
+        // resolves to the outer local here, which only drops a constant.
+        try_walk_named_tree_preorder(body, true, |node| {
+            if self.session.cancellation().is_cancelled() {
+                return Err(JavaLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if !matches!(node.kind(), "assignment_expression" | "update_expression") {
+                return Ok(WalkControl::Continue);
+            }
+            let mut target = node
+                .child_by_field_name("left")
+                .or_else(|| first_named_child(node));
+            while let Some(inner) = target.filter(|t| t.kind() == "parenthesized_expression") {
+                target = first_named_child(inner);
+            }
+            if let Some(target) = target.filter(|t| t.kind() == "identifier")
+                && let Some(name) = node_text(self.prepared.source(), target)
+                && let Some(local) = self.local_at(name, target.start_byte())
+            {
+                self.constant_locals.remove(&local);
             }
             Ok(WalkControl::Continue)
         })
@@ -415,16 +480,53 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     pub(in crate::analyzer::java::semantic) fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
         procedure_kind: ProcedureKind,
         properties: ProcedureProperties,
     ) -> Result<(), JavaLoweringError> {
+        if self.session.cancellation().is_cancelled() {
+            return Err(JavaLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
         let slots = formal_parameter_slots_for_owner_with_nodes(
             Language::Java,
             callable,
             self.prepared.source(),
-        )
-        .unwrap_or_default();
+        );
+        if self.session.cancellation().is_cancelled() {
+            return Err(JavaLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let proven_empty = matches!(
+            callable.kind(),
+            "static_initializer" | "enum_constant" | "variable_declarator"
+        ) || callable.kind() == "block"
+            && callable
+                .parent()
+                .is_some_and(|parent| parent.kind() == "class_body");
+        self.session.footprint_formal_slots(match &slots {
+            Some(slots) => Ok(slots.len()),
+            None if proven_empty => Ok(0),
+            None => Err(FootprintRefusal::FormalSlotsUnavailable),
+        });
+        let slots = match slots {
+            Some(slots) => slots,
+            None if proven_empty => Vec::new(),
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "Java callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
+        };
         let mut ordinal = 0_u32;
         for (slot, node) in slots {
             let anchor = source_anchor(node, 0).map_err(JavaLoweringError::Invalid)?;
@@ -440,7 +542,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: true },
+                    SemanticValueKind::Receiver {
+                        dispatch: true,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(value);
                 value
@@ -483,7 +588,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?);
         }
         if let Some(receiver) = self.receiver {
@@ -608,20 +716,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// parameter already relies on) and writing back to one after a call
     /// that may have mutated the object it names (`emit_receiver_write_back`,
     /// #2571). Keeping one resolver means the two directions can never drift
-    /// apart on which node names which slot.
+    /// apart on which node names which slot. A lexical refusal, including
+    /// unavailable formal layout, also blocks an implicit field proof.
     pub(super) fn pattern_visibility_unproven(&self, node: Node<'tree>) -> bool {
         use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus_with_visibility;
         node.kind() == "identifier"
             && node_text(self.prepared.source(), node).is_some_and(|name| {
-                self.pattern_variable_names.contains(name)
-                    && resolve_lexical_binding_from_focus_with_visibility(
-                        Language::Java,
-                        node,
-                        self.prepared.source(),
-                        node.start_byte(),
-                        name,
-                    )
-                    .is_err()
+                resolve_lexical_binding_from_focus_with_visibility(
+                    Language::Java,
+                    node,
+                    self.prepared.source(),
+                    node.start_byte(),
+                    name,
+                )
+                .is_err()
             })
     }
 
@@ -695,6 +803,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     target,
                 },
             )?;
+            self.session
+                .footprint_consume_subtree(node, BranchClass::Identifier);
         }
         Ok(())
     }
@@ -1200,6 +1310,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     result,
                 },
             )?;
+            // A read that can initialize another class also executes its
+            // initializer effects. The exceptional edge alone does not model
+            // those effects, so it cannot earn a full-footprint claim yet.
+            if !self.static_field_may_initialize(node) {
+                self.session
+                    .footprint_consume_subtree(node, BranchClass::Identifier);
+            }
             return Ok(());
         }
         let Some((location, field_anchor, name)) =

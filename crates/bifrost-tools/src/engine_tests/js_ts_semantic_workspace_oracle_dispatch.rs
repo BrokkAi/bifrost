@@ -756,6 +756,7 @@ export function shadowed(raw) {
             unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
+            partial_cause: None,
             provenance: Box::new([]),
         };
         let identity_only = |owner| DispatchBoundary {
@@ -769,6 +770,7 @@ export function shadowed(raw) {
             unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
+            partial_cause: None,
             provenance: Box::new([]),
         };
         let mut boundaries = vec![
@@ -1161,6 +1163,7 @@ export function shadowed(raw) {
             unmaterialized_external_target: None,
             proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
             completeness: EvidenceCompleteness::Partial("open dispatch".into()),
+            partial_cause: None,
             provenance: Box::new([]),
         }];
         attach_dispatch_provenance(
@@ -1387,6 +1390,7 @@ export function shadowed(raw) {
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
                 completeness: EvidenceCompleteness::Partial("open dispatch".into()),
+                partial_cause: None,
                 provenance: Box::new([]),
             },
             DispatchBoundary {
@@ -1396,6 +1400,7 @@ export function shadowed(raw) {
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("dispatch limit reached".into()),
                 completeness: EvidenceCompleteness::Partial("targets were omitted".into()),
+                partial_cause: None,
                 provenance: Box::new([]),
             },
         ];
@@ -1436,6 +1441,7 @@ export function shadowed(raw) {
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Proven,
                 completeness: EvidenceCompleteness::Complete,
+                partial_cause: None,
                 provenance: Box::new([]),
             },
         );
@@ -1494,6 +1500,7 @@ export function shadowed(raw) {
             unmaterialized_external_target: None,
             proof: ProofStatus::Proven,
             completeness: EvidenceCompleteness::Complete,
+            partial_cause: None,
             provenance: Box::new([]),
         };
         assert_eq!(
@@ -1537,6 +1544,7 @@ export function shadowed(raw) {
             semantic_call,
             Some(&proof),
             None,
+            None,
         )
         .expect("canonical Go package call");
         let locator = target.locator().clone();
@@ -1554,6 +1562,7 @@ export function shadowed(raw) {
                 unmaterialized_external_target: Some(target),
                 proof: ProofStatus::Proven,
                 completeness: EvidenceCompleteness::Complete,
+                partial_cause: None,
                 provenance: Box::new([]),
             },
         );
@@ -1590,6 +1599,7 @@ export function shadowed(raw) {
                 unmaterialized_external_target: None,
                 proof: ProofStatus::Proven,
                 completeness: EvidenceCompleteness::Complete,
+                partial_cause: None,
                 provenance: Box::new([]),
             },
         );

@@ -34,18 +34,7 @@ use rusqlite::{OptionalExtension, params};
 use std::sync::Arc;
 
 #[doc(hidden)]
-pub const GO_SOURCE_HEADER_SQL: &str = "SELECT blob.id, marker.logical_rows, marker.payload_bytes,
-            source.occurrence_count, source.declaration_count, source.declaration_unit_count,
-            marker.membership_digest, marker.has_build_constraints,
-            marker.build_selection_facts_version
-     FROM blobs AS blob
-     JOIN source_go_manifests AS marker ON marker.blob_id = blob.id
-     JOIN source_fact_manifests AS source ON source.blob_id = blob.id
-     JOIN blob_meta AS meta ON meta.blob_id = blob.id
-     JOIN source_fact_readiness AS ready ON ready.blob_id = blob.id
-     WHERE blob.blob_oid = ?1 AND blob.lang = 'go' AND blob.parse_variant = x'' AND blob.generation = ?2
-       AND marker.facts_version = ?3 AND source.facts_version = ?4
-       AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
+pub const GO_SOURCE_HEADER_SQL: &str = brokk_bifrost_core::analyzer::go_facts::GO_SOURCE_HEADER_SQL;
 
 fn required<T>(value: Option<T>, label: &str) -> Result<T> {
     brokk_bifrost_analysis::analyzer::store::required_source_value(value, "Go source syntax", label)

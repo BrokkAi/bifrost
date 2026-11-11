@@ -1,8 +1,8 @@
 //! Query projection of branch relations over one exact source snapshot.
 
 use super::super::branch_relations::{
-    self, BranchOpenReason, BranchReferenceKind, BranchReferenceProofs, BranchReferenceSite,
-    BranchRelationVerdict, BranchStorageField,
+    self, BranchOpenReason, BranchRelationVerdict, ReferenceKind, ReferenceProofs, ReferenceSite,
+    StorageField,
 };
 use super::super::provider::StructuralSyntaxLimitedOutcome;
 use super::results::{
@@ -32,7 +32,7 @@ const MAX_BRANCH_SOURCE_BYTES: usize = 1024 * 1024;
 #[derive(Default)]
 pub(super) struct BranchRelationTraversalCache {
     syntax: CaptureScopedMemo<HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>>,
-    reference_proofs: CaptureScopedMemo<HashMap<ProjectFile, Arc<BranchReferenceProofs>>>,
+    reference_proofs: CaptureScopedMemo<HashMap<ProjectFile, Arc<ReferenceProofs>>>,
     scalar: CaptureScopedMemo<
         HashMap<ProcedureHandle, Result<Arc<ScalarConditionDerivation>, ScalarConditionGap>>,
     >,
@@ -753,15 +753,55 @@ fn resolve_branch_references(
     env: &super::super::lexical_environment::EnvironmentFileResult,
     syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
     cancellation: Option<&CancellationToken>,
-) -> BranchReferenceProofs {
-    let mut proofs = BranchReferenceProofs::default();
+) -> ReferenceProofs {
     let sites = match branch_relations::reference_sites(syntax, seed.language, &seed.facts, env) {
         Ok(sites) => sites,
         Err(reason) => {
-            proofs.collection_gap = Some(reason);
-            return proofs;
+            return ReferenceProofs {
+                collection_gap: Some(reason),
+                ..Default::default()
+            };
         }
     };
+    resolve_reference_sites(analyzer, seed, syntax, sites, syntax_cache, cancellation)
+}
+
+pub(super) fn resolve_references_in_ranges(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    syntax: &PreparedSyntaxTree,
+    env: &super::super::lexical_environment::EnvironmentFileResult,
+    ranges: &[Range],
+    syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
+    cancellation: Option<&CancellationToken>,
+) -> ReferenceProofs {
+    let sites = match branch_relations::reference_sites_in_ranges(
+        syntax,
+        seed.language,
+        &seed.facts,
+        env,
+        ranges,
+    ) {
+        Ok(sites) => sites,
+        Err(reason) => {
+            return ReferenceProofs {
+                collection_gap: Some(reason),
+                ..Default::default()
+            };
+        }
+    };
+    resolve_reference_sites(analyzer, seed, syntax, sites, syntax_cache, cancellation)
+}
+
+fn resolve_reference_sites(
+    analyzer: &dyn IAnalyzer,
+    seed: &SeedMatch,
+    syntax: &PreparedSyntaxTree,
+    sites: Vec<ReferenceSite>,
+    syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
+    cancellation: Option<&CancellationToken>,
+) -> ReferenceProofs {
+    let mut proofs = ReferenceProofs::default();
     if sites.is_empty() {
         return proofs;
     }
@@ -792,22 +832,7 @@ fn resolve_branch_references(
         seed.language,
         "branch_current_object_fields",
     );
-    let field_spec = support
-        .and_then(|support| support.branch_current_object_fields())
-        .filter(|spec| {
-            // Most files never use a base receiver. Avoid declaration reads
-            // unless receiver normalization can matter in this file.
-            sites.iter().any(|site| {
-                syntax
-                    .tree()
-                    .root_node()
-                    .named_descendant_for_byte_range(site.range.0, site.range.1)
-                    .and_then(|name| name.parent())
-                    .filter(|access| spec.member(*access).is_some())
-                    .and_then(|access| access.child_by_field_name(spec.receiver_field))
-                    .is_some_and(|receiver| receiver.kind() == spec.parent_kind)
-            })
-        });
+    let field_spec = support.and_then(|support| support.branch_current_object_fields());
     // At most the bounded reference-site set, retained only during this file's
     // lookup. Repeated reads of one field do not repeat declaration queries.
     let mut declarations = HashMap::default();
@@ -818,10 +843,11 @@ fn resolve_branch_references(
                 .tree()
                 .root_node()
                 .named_descendant_for_byte_range(site.range.0, site.range.1)
-            && let Some(access) = name.parent()
-            && spec
-                .member(access)
-                .is_some_and(|member| (member.start_byte(), member.end_byte()) == site.range)
+            && (name.parent().is_some_and(|access| {
+                spec.member(access)
+                    .is_some_and(|member| (member.start_byte(), member.end_byte()) == site.range)
+            }) || name.kind() == "identifier"
+                || name.kind() == "simple_identifier")
             && let Some(declaration) = declarations.entry(target.clone()).or_insert_with(|| {
                 branch_storage_field(analyzer, support, spec, target, syntax_cache, cancellation)
             })
@@ -844,7 +870,7 @@ fn branch_storage_field(
     target: &CodeUnit,
     syntax_cache: &mut HashMap<ProjectFile, Arc<StructuralSyntaxLimitedOutcome>>,
     cancellation: Option<&CancellationToken>,
-) -> Option<BranchStorageField> {
+) -> Option<StorageField> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return None;
     }
@@ -881,14 +907,14 @@ fn branch_storage_field(
     if !spec.is_storage_declaration(name) {
         return None;
     }
-    Some(BranchStorageField {
+    Some(StorageField {
         file: file.clone(),
         range,
     })
 }
 
 fn admit_reference_proof(
-    site: BranchReferenceSite,
+    site: ReferenceSite,
     outcome: &DefinitionLookupOutcome,
 ) -> Result<CodeUnit, BranchOpenReason> {
     let exact_focus = outcome.reference.as_ref().is_some_and(|reference| {
@@ -898,8 +924,8 @@ fn admit_reference_proof(
         && exact_focus
         && outcome.definitions.len() == 1
         && match site.kind {
-            BranchReferenceKind::Field => outcome.definitions[0].is_field(),
-            BranchReferenceKind::Method => outcome.definitions[0].is_callable(),
+            ReferenceKind::Field => outcome.definitions[0].is_field(),
+            ReferenceKind::Method => outcome.definitions[0].is_callable(),
         }
         && outcome.lexical_definition.is_none()
         && outcome.diagnostics.is_empty()

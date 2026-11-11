@@ -17,8 +17,8 @@ use crate::relational::{
 };
 use crate::resolved::LoadedPolicy;
 use brokk_bifrost_rql::structural::search::{
-    UnitRowItem, execute_code_query_detailed_eager_index,
-    execute_code_query_detailed_eager_index_workspace,
+    CodeQueryExecutionScope, UnitRowItem, execute_code_query_detailed_eager_index_in_scope,
+    execute_code_query_detailed_eager_index_workspace_in_scope,
 };
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryResultDetail};
 use brokk_bifrost_rql::{
@@ -167,20 +167,22 @@ pub(super) fn explain_relational_candidate(
             query.result_detail = CodeQueryResultDetail::Full;
             query.limit = budget.query_limits().max_pipeline_rows;
             let detailed = if let Some(workspace) = context.workspace {
-                execute_code_query_detailed_eager_index_workspace(
+                execute_code_query_detailed_eager_index_workspace_in_scope(
                     workspace,
                     context.flow_resources(),
                     &query,
                     budget.query_limits(),
                     context.cancellation,
+                    CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
                 )
             } else {
-                execute_code_query_detailed_eager_index(
+                execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
                     context.flow_resources(),
                     &query,
                     budget.query_limits(),
                     context.cancellation,
+                    CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
                 )
             };
             let rows = detailed

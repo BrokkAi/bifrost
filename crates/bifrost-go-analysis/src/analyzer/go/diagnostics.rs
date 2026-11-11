@@ -53,6 +53,24 @@ pub(crate) fn collect_go_semantic_diagnostics(
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return SemanticDiagnosticReport::new();
     };
+    let _model_scope =
+        match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            analyzer,
+        ) {
+            Ok(scope) => scope,
+            Err(_) => {
+                let mut report = SemanticDiagnosticReport::new();
+                report.push_incomplete(
+                    None,
+                    vec![
+                        SemanticDiagnosticIncompleteReason::CanonicalFactsUnavailable {
+                            detail: "Go model snapshot conflicts with the outer overlay".into(),
+                        },
+                    ],
+                );
+                return report;
+            }
+        };
     let external = AnalyzerGoExternalEvidence {
         overlay: analyzer.semantic_model_overlay(),
         discovery: analyzer.dependency_discovery_evidence(Language::Go),
@@ -105,8 +123,8 @@ pub(crate) fn collect_go_semantic_diagnostics(
                     owner: path.into(),
                     is_dot: binding.local_name == ".",
                     detail: format!(
-                        "Go import {:?} is incomplete: {:?}; named reasons: {:?}",
-                        binding.source_spelling, binding.completion, binding.named_reasons
+                        "Go import {:?} is incomplete: {}; named reasons: {:?}",
+                        binding.source_spelling, binding.completion_display, binding.named_reasons
                     ),
                 });
             }

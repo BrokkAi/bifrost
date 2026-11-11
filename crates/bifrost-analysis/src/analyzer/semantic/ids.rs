@@ -133,10 +133,10 @@ pub(crate) mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "bf73c1a83d7de89ff7d04d104295114e4142cf0b785a68d141c25df11d0532ff"
+            "e1a974280b1b740b861a6b74da697fef4518e4ffe5b3d3c1c5ccd9e181423868"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 46);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 47);
     }
 
     fn digest(label: &str) -> StableDigest {

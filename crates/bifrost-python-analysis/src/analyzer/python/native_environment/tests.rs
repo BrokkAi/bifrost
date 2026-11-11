@@ -499,29 +499,7 @@ fn module_rebindings_retained_temporal_selection() {
 #[brokk_bifrost_test_macros::hardwon(
     "#6108: cold bulk publication skipped Python native binding rows"
 )]
-fn python_trial_cold_index_publishes_scoped_blobs() {
-    const CHILD: &str = "BIFROST_PYTHON_COLD_INDEX_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        for trial in [false, true] {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command.args([
-                "--exact",
-                "analyzer::python::native_environment::tests::python_trial_cold_index_publishes_scoped_blobs",
-                "--nocapture",
-            ]).env(CHILD, "1").env_remove("BIFROST_TRIAL_NATIVE_PYTHON");
-            if trial {
-                // Presence, including an empty value, selects the trial.
-                command.env("BIFROST_TRIAL_NATIVE_PYTHON", "");
-            }
-            let output = command.output().unwrap();
-            assert!(output.status.success(), "trial={trial}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
-                "the selected child test must run: trial={trial}: {output:?}",
-            );
-        }
-        return;
-    }
+fn python_production_cold_index_publishes_scoped_blobs() {
     use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
     use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
     // The project is authored inline: this crate is open core, and the root
@@ -570,14 +548,7 @@ fn python_trial_cold_index_publishes_scoped_blobs() {
         "SELECT count(*) FROM python_binding_source source JOIN blobs ON blobs.id=source.blob_id WHERE blobs.lang='python'",
         [], |row| row.get(0),
     ).unwrap();
-    assert_eq!(
-        published,
-        if super::super::trial_native_python_selected() {
-            expected
-        } else {
-            0
-        }
-    );
+    assert_eq!(published, expected);
 }
 
 #[test]
@@ -607,28 +578,6 @@ fn python_configuration_input_names_agree_with_staging() {
 
 #[test]
 fn python_workspace_native_environment_lifecycle() {
-    const CHILD: &str = "BIFROST_PYTHON_ENVIRONMENT_LIFECYCLE_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        for trial in [false, true] {
-            let cache = tempfile::tempdir().unwrap();
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command.args([
-                "--exact",
-                "analyzer::python::native_environment::tests::python_workspace_native_environment_lifecycle",
-                "--nocapture",
-            ]).env(CHILD, "1").env("XDG_CACHE_HOME", cache.path()).env_remove("BIFROST_TRIAL_NATIVE_PYTHON");
-            if trial {
-                command.env("BIFROST_TRIAL_NATIVE_PYTHON", "1");
-            }
-            let output = command.output().unwrap();
-            assert!(output.status.success(), "trial={trial}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
-                "child must run: {output:?}"
-            );
-        }
-        return;
-    }
     use super::super::PythonAnalyzer;
     use super::super::native_request::{PythonNativeOpen, open_python_native_request};
     use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
@@ -655,17 +604,6 @@ fn python_workspace_native_environment_lifecycle() {
     )
     .unwrap();
     let token = CancellationToken::new();
-    let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
-    if !super::super::trial_native_python_selected() {
-        match open_python_native_request(python, &token).unwrap() {
-            PythonNativeOpen::Unavailable { kind, message } => {
-                assert_eq!(kind, "python_environment_unreconciled");
-                assert!(message.contains("Workspace"), "{message}");
-            }
-            _ => panic!("trial off must report unavailable"),
-        }
-        return;
-    }
     fn selected(workspace: &WorkspaceAnalyzer, token: &CancellationToken) -> i64 {
         let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
         match open_python_native_request(python, token).unwrap() {
@@ -737,6 +675,66 @@ fn python_workspace_native_environment_lifecycle() {
     ));
 }
 
+/// A memo hit on the selected summary must leave the caller's read ledger
+/// exactly as the cold lookup did.
+#[test]
+fn python_native_request_summary_memo_replays_the_cold_reads() {
+    use super::super::PythonAnalyzer;
+    use super::super::native_request::{
+        PythonNativeOpen, PythonSelectedSummaryRequestMemo, open_python_native_request,
+    };
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+    use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::store_context_from_store;
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerQueryScope, WorkspaceAnalyzer, capture_query_reads,
+    };
+
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file("src/pkg/__init__.py", "")
+        .file("src/pkg/model.py", "class Widget: pass\n")
+        .build();
+    let directory = tempfile::tempdir().unwrap();
+    let store = AnalyzerStore::open_persistent(&directory.path().join("workspace.db")).unwrap();
+    let context = store_context_from_store(fixture.project_dyn().as_ref(), store, false);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        fixture.project_dyn(),
+        Default::default(),
+        context,
+    )
+    .unwrap();
+    let python = resolve_analyzer::<PythonAnalyzer>(workspace.analyzer()).unwrap();
+    let token = CancellationToken::new();
+    let open = || {
+        capture_query_reads(python, || {
+            match open_python_native_request(python, &token).unwrap() {
+                PythonNativeOpen::Ready(request) => request.environment.summary,
+                PythonNativeOpen::Unavailable { kind, message } => panic!("{kind}: {message}"),
+                PythonNativeOpen::Cancelled => panic!("unexpected cancellation"),
+            }
+        })
+    };
+    let _scope = AnalyzerQueryScope::new(python);
+    let memo = python
+        .active_query_request_memo::<PythonSelectedSummaryRequestMemo>()
+        .unwrap();
+    let (cold, cold_reads) = open();
+    assert_eq!(memo.hits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let (warm, warm_reads) = open();
+    assert_eq!(memo.hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(warm, cold);
+    assert!(!cold_reads.keys().is_empty());
+    assert_eq!(warm_reads.keys(), cold_reads.keys());
+    assert_eq!(
+        warm_reads.unattributed_reads(),
+        cold_reads.unattributed_reads()
+    );
+    assert_eq!(
+        warm_reads.execution_dependences(),
+        cold_reads.execution_dependences()
+    );
+}
+
 #[test]
 #[brokk_bifrost_test_macros::hardwon(
     "#5658: review found that a module-qualified external call lost python_provider_open"
@@ -778,6 +776,67 @@ fn external_callee_import_forms_retain_provider_obligations() {
             "{answer}\n{output}"
         );
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9575: a preexisting selected operation must refuse reuse in its current capture, including errors"
+)]
+fn python_native_operation_marks_later_consumers_and_error_forwarding() {
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+
+    let fixture = InlineTestProject::with_language(Language::Python)
+        .file("src/probe.py", "from pkg import value\nvalue\n")
+        .file("src/pkg.py", "value = 1\n")
+        .build();
+    let directory = tempfile::tempdir().unwrap();
+    let environment = PythonNativeEnvironment::open(
+        &directory.path().join("native.db"),
+        fixture.root(),
+        profile(),
+    )
+    .unwrap();
+    let (revision, _) = build(&environment, &fixture);
+    let project = fixture.project_dyn();
+    let capture_owner = brokk_bifrost_analysis::MultiAnalyzer::default();
+    let (result, outer) = capture_query_reads(&capture_owner, || {
+        brokk_bifrost_analysis::native_resolution_test_support::with_python_native_operation(
+            &environment.publication,
+            project.as_ref(),
+            revision,
+            |operation, summary, cancellation| {
+                // The real operation already exists before either consumer.
+                // A warm operation must mark its new consumer, not its builder.
+                let mut previous = None;
+                for _ in 0..2 {
+                    let (answer, consumer) = capture_query_reads(&capture_owner, || {
+                        operation.python_native_route_probe(
+                            summary,
+                            environment.publication.profile.python_version,
+                            cancellation,
+                        )
+                    });
+                    let answer = answer?;
+                    assert!(consumer.reuse_refused(), "{consumer:?}");
+                    assert!(!consumer.is_bounded());
+                    if let Some(previous) = &previous {
+                        assert_eq!(previous, &answer);
+                    }
+                    previous = Some(answer);
+                }
+                Err::<(), _>(brokk_bifrost_analysis::analyzer::store::StoreError::new(
+                    "9575 deliberate consumer error",
+                ))
+            },
+        )
+    });
+    let error = result.expect_err("deliberate error must remain an error");
+    assert!(error.to_string().contains("9575 deliberate consumer error"));
+    assert!(
+        outer.reuse_refused(),
+        "error results must forward the real capture"
+    );
+    assert!(!outer.is_bounded());
 }
 
 #[test]

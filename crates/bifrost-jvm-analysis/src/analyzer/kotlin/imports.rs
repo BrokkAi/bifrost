@@ -169,7 +169,7 @@ impl KotlinAnalyzer {
         token: QueryToken<'_>,
         file: &ProjectFile,
         realm: Option<&JvmSourceRealm<'_>>,
-    ) -> Arc<HashSet<CodeUnit>> {
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
         let cache = match realm {
             Some(_) => &self.realm_imported_code_units,
             None => &self.imported_code_units,
@@ -183,9 +183,11 @@ impl KotlinAnalyzer {
                     HashSet::default()
                 }
             };
-            let resolved = Arc::new(resolved);
+            let resolved = Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                resolved,
+            ));
             let bytes =
-                brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set(file, &resolved)
+                brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(&resolved)
                     as usize;
             (resolved, bytes)
         })
@@ -235,10 +237,15 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        self.imported_code_units_in_realm(token, file, None)
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let scope = AnalyzerQueryScope::new(self);
+            let token = scope.token();
+            self.imported_code_units_in_realm(token, file, None)
+        }
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {

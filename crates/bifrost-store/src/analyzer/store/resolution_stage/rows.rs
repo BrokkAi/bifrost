@@ -225,6 +225,15 @@ const TYPED_FAMILIES: &[TypedFamily] = &[
         unique: &[&["definition", "scope_head_node"], &["scope_head_node"]],
         seeks: &[&["definition"], &["scope_head_node"]],
     },
+    // #9546: one member-type claim per certified source type body; a type body
+    // with no row is Unknown.
+    TypedFamily {
+        name: "member_type_coverage",
+        semantics: &["definition"],
+        columns: "scope_head_node INTEGER NOT NULL CHECK(scope_head_node>=0), coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'open')), open_reason TEXT, CHECK((open_reason IS NOT NULL) = (coverage = 'open'))",
+        unique: &[&["definition"]],
+        seeks: &[&["definition"]],
+    },
     TypedFamily {
         name: "member_owners",
         semantics: &["definition", "owner_definition"],
@@ -451,6 +460,7 @@ CREATE TEMP TABLE IF NOT EXISTS selected_resolution_stage_semantics(
  end_byte INTEGER CHECK(end_byte IS NULL OR end_byte>=start_byte), unqualified INTEGER,
  owner_kind INTEGER NOT NULL CHECK(owner_kind IN (0,1,2)), owner_key INTEGER CHECK(owner_key IS NULL OR owner_key>=0), owner_shared INTEGER CHECK(owner_shared IS NULL OR owner_shared>0),
  receiver_origin INTEGER,
+ prefix_key INTEGER, prefix_shared INTEGER,
  go_spelling_namespace INTEGER CHECK(go_spelling_namespace IS NULL OR (role=0 AND unqualified IS 1 AND go_spelling_namespace=namespace AND go_spelling_namespace IN (0,1,2,6))),
  go_definition_namespaces INTEGER CHECK(go_definition_namespaces IS NULL OR (role=1 AND go_definition_namespaces BETWEEN 1 AND 15)),
  go_package_qualifier INTEGER NOT NULL DEFAULT 0 CHECK(go_package_qualifier IN (0,1) AND (go_package_qualifier=0 OR (role=0 AND unqualified IS 1 AND namespace=6 AND go_spelling_namespace IS 6))),

@@ -23,11 +23,16 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for Javascrip
         _root: &std::path::Path,
         selected: &[(
             ProjectFile,
-            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
         )],
         limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
     ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
-        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
+        let selected = selected
+            .iter()
+            .map(|(file, source, _)| (file.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        dependency_evidence::js_ts_selected_dependency_file_evidence(&selected, limits)
     }
     fn is_configuration_input_path(&self, path: &Path) -> bool {
         dependency_evidence::is_js_ts_dependency_input(path)
@@ -40,11 +45,16 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for Typescrip
         _root: &std::path::Path,
         selected: &[(
             ProjectFile,
-            brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
         )],
         limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
     ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
-        dependency_evidence::js_ts_selected_dependency_file_evidence(selected, limits)
+        let selected = selected
+            .iter()
+            .map(|(file, source, _)| (file.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        dependency_evidence::js_ts_selected_dependency_file_evidence(&selected, limits)
     }
     fn is_configuration_input_path(&self, path: &Path) -> bool {
         dependency_evidence::is_js_ts_dependency_input(path)
@@ -746,7 +756,95 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     )
 }
 
+fn source_callable_application(
+    owner: tree_sitter::Node<'_>,
+    scope_step: &mut dyn FnMut() -> bool,
+) -> Option<brokk_bifrost_analysis::analyzer::languages::SourceCallableApplication> {
+    use brokk_bifrost_analysis::analyzer::languages::SourceCallableApplication;
+    if !scope_step() {
+        return None;
+    }
+    if (0..owner.child_count()).any(|index| {
+        !scope_step()
+            || owner
+                .child(index)
+                .is_some_and(|child| child.kind() == "async" || child.kind() == "*")
+    }) {
+        return None;
+    }
+    match owner.kind() {
+        "arrow_function" => Some(SourceCallableApplication::JsArrow),
+        "function_expression" => Some(SourceCallableApplication::JsOrdinaryFunction),
+        _ => None,
+    }
+}
+
+fn source_callable_initializer_matches(
+    declaration: tree_sitter::Node<'_>,
+    name: &Range,
+    callable: &Range,
+    scope_step: &mut dyn FnMut() -> bool,
+) -> bool {
+    scope_step()
+        && declaration.kind() == "variable_declarator"
+        && declaration.child_by_field_name("name").is_some_and(|node| {
+            scope_step() && node.start_byte() == name.start_byte && node.end_byte() == name.end_byte
+        })
+        && declaration
+            .child_by_field_name("value")
+            .is_some_and(|node| {
+                scope_step()
+                    && node.start_byte() == callable.start_byte
+                    && node.end_byte() == callable.end_byte
+            })
+        && declaration.parent().is_some_and(|parent| {
+            scope_step()
+                && parent.kind() == "lexical_declaration"
+                && scope_step()
+                && parent
+                    .child(0)
+                    .is_some_and(|keyword| keyword.kind() == "const")
+        })
+}
+
 impl LanguageSupport for JavascriptSupport {
+    fn identity_receiver_lookup(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::structural::identity::ReceiverLookupPolicy {
+        brokk_bifrost_analysis::analyzer::structural::identity::ReceiverLookupPolicy::ReceiverOnly
+    }
+
+    fn policy_lowering_identity(
+        &self,
+        _models: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer::identity(
+                &semantic::JsTsSemanticLowerer::javascript(),
+            ),
+        )
+    }
+
+    fn source_callable_application(
+        &self,
+        owner: tree_sitter::Node<'_>,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::SourceCallableApplication> {
+        source_callable_application(owner, scope_step)
+    }
+
+    fn source_callable_initializer_matches(
+        &self,
+        declaration: tree_sitter::Node<'_>,
+        name: &Range,
+        callable: &Range,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        source_callable_initializer_matches(declaration, name, callable, scope_step)
+    }
+
     fn workspace_fact_answer(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
@@ -1009,6 +1107,43 @@ impl LanguageSupport for JavascriptSupport {
 pub struct TypescriptSupport;
 
 impl LanguageSupport for TypescriptSupport {
+    fn identity_receiver_lookup(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::structural::identity::ReceiverLookupPolicy {
+        brokk_bifrost_analysis::analyzer::structural::identity::ReceiverLookupPolicy::ReceiverOnly
+    }
+
+    fn policy_lowering_identity(
+        &self,
+        _models: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer::identity(
+                &semantic::JsTsSemanticLowerer::typescript(),
+            ),
+        )
+    }
+
+    fn source_callable_application(
+        &self,
+        owner: tree_sitter::Node<'_>,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> Option<brokk_bifrost_analysis::analyzer::languages::SourceCallableApplication> {
+        source_callable_application(owner, scope_step)
+    }
+
+    fn source_callable_initializer_matches(
+        &self,
+        declaration: tree_sitter::Node<'_>,
+        name: &Range,
+        callable: &Range,
+        scope_step: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        source_callable_initializer_matches(declaration, name, callable, scope_step)
+    }
+
     fn workspace_fact_answer(
         &self,
         analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
@@ -1377,6 +1512,7 @@ mod dependency_packs {
             &self,
             config: &AnalyzerConfig,
             project: &dyn Project,
+            _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {

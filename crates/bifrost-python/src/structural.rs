@@ -65,6 +65,43 @@ fn python_first_named_operand(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| !child.is_extra())
 }
 
+/// Peel Python's transparent type wrappers while ignoring grammar extras.
+pub(crate) fn python_unwrap_type(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "type" {
+        let Some(operand) = python_first_named_operand(node) else {
+            break;
+        };
+        node = operand;
+    }
+    node
+}
+
+fn attach_python_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
+    for index in 0..arguments.named_child_count() {
+        if !sink.should_continue() {
+            break;
+        }
+        let Some(argument) = arguments.named_child(index) else {
+            continue;
+        };
+        if argument.is_extra() {
+            continue;
+        }
+        match argument.kind() {
+            "keyword_argument" => {
+                if let (Some(keyword), Some(value)) = (
+                    argument.child_by_field_name("name"),
+                    argument.child_by_field_name("value"),
+                ) {
+                    sink.kwarg(keyword, value);
+                }
+            }
+            "list_splat" | "dictionary_splat" if python_literal_pack_arguments(argument, sink) => {}
+            _ => attach_argument_role_with_derived_name(sink, argument, expression_name_node),
+        }
+    }
+}
+
 pub(crate) fn python_parenthesized_expression_child(node: Node<'_>) -> Option<Node<'_>> {
     assert_eq!(node.kind(), "parenthesized_expression");
     let mut cursor = node.walk();
@@ -810,29 +847,6 @@ fn python_identifier_is_parameter(node: Node<'_>) -> bool {
     }
 }
 
-/// Whether a `def` declares a method, that is, whether the suite it sits in
-/// belongs to a `class_definition`.
-///
-/// This reads the parse tree rather than the nearest enclosing normalized kind
-/// because the suite between a class and its methods is itself a normalized
-/// node now (`NormalizedKind::Block`, issue #1474). Walking the concrete
-/// ancestors is also the more direct statement of the rule: a nested `def`
-/// inside a method reaches its enclosing `function_definition` first and stays
-/// a function.
-fn python_definition_is_method(definition: Node<'_>) -> bool {
-    let mut current = definition;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "class_definition" => return true,
-            // The suite that holds the members, and the wrapper a decorated
-            // definition sits in, are pass-through on the way to the owner.
-            "block" | "decorated_definition" => current = parent,
-            _ => return false,
-        }
-    }
-    false
-}
-
 /// The binding one Python binder token introduces, and the interval it is in
 /// effect over.
 ///
@@ -946,6 +960,7 @@ fn python_collect_all_members(
     if !matches!(value.kind(), "list" | "tuple") {
         return ReadableSurface::No;
     }
+    let mut readable = ReadableSurface::Yes;
     let mut cursor = value.walk();
     for element in value
         .named_children(&mut cursor)
@@ -958,10 +973,10 @@ fn python_collect_all_members(
                     range: node_range(element),
                 });
             }
-            None => return ReadableSurface::No,
+            None => readable = ReadableSurface::No,
         }
     }
-    ReadableSurface::Yes
+    readable
 }
 
 fn python_module_export_bindings(
@@ -1164,6 +1179,9 @@ fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts
                         || expression
                             .child_by_field_name("operator")
                             .is_some_and(|operator| operator.kind() == "+=");
+                    if !extends {
+                        members.clear();
+                    }
                     if !extends
                         || python_collect_all_members(value, source, &mut members)
                             == ReadableSurface::No
@@ -1179,6 +1197,7 @@ fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts
                         && names_all(function.child_by_field_name("object"))
                     {
                         stated = true;
+                        members.clear();
                         readable = ReadableSurface::No;
                     }
                 }
@@ -1226,19 +1245,21 @@ fn python_source_export_facts(root: Node<'_>, source: &str) -> SourceExportFacts
 /// conditionally is still bound by the statement this reader already sees.
 /// A statement that assigns, extends, or mutates `__all__` with anything but a
 /// list or tuple of plain string literals makes the surface unreadable: the
-/// members are then unknown, and no import is classified from them.
+/// remaining members are unknown, while known literal members are retained.
 fn python_curated_export_surface(root: Node<'_>, source: &str) -> CuratedExportSurface {
     let facts = python_source_export_facts(root, source);
-    match (facts.declared, facts.complete) {
-        (false, _) => CuratedExportSurface::Absent,
-        (true, false) => CuratedExportSurface::Unreadable,
-        (true, true) => CuratedExportSurface::Listed(
-            facts
-                .exports
-                .into_iter()
-                .map(|export| export.exported_name)
-                .collect(),
-        ),
+    if !facts.declared {
+        return CuratedExportSurface::Absent;
+    }
+    let names = facts
+        .exports
+        .into_iter()
+        .map(|export| export.exported_name)
+        .collect();
+    if facts.complete {
+        CuratedExportSurface::Listed(names)
+    } else {
+        CuratedExportSurface::PartiallyListed(names)
     }
 }
 
@@ -1406,6 +1427,7 @@ impl StructuralSpec for PythonStructuralSpec {
         static SUPPORT: IdentityRouteSupport = DEEP_IDENTITY_AXES
             .supported_relation(RouteHopKind::Alias)
             .supported_relation(RouteHopKind::Import)
+            .supported_relation(RouteHopKind::Export)
             .supported_relation(RouteHopKind::ReExport)
             .supported_relation(RouteHopKind::NestedOwner);
         &SUPPORT
@@ -1459,6 +1481,37 @@ impl StructuralSpec for PythonStructuralSpec {
         }
     }
 
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded regex facts beyond the grammar kind table.
+        &[
+            NormalizedKind::ComparisonChain,
+            NormalizedKind::Method,
+            NormalizedKind::Parameter,
+            NormalizedKind::RegexAlternation,
+            NormalizedKind::RegexAnchor,
+            NormalizedKind::RegexCharacterClass,
+            NormalizedKind::RegexCharacterRange,
+            NormalizedKind::RegexEscape,
+            NormalizedKind::RegexGroup,
+            NormalizedKind::RegexIncomplete,
+            NormalizedKind::RegexLiteral,
+            NormalizedKind::RegexPattern,
+            NormalizedKind::RegexQuantifier,
+            NormalizedKind::RegexRiskBackspaceEscape,
+            NormalizedKind::RegexRiskBadTag,
+            NormalizedKind::RegexRiskDuplicateClassCharacter,
+            NormalizedKind::RegexRiskExponential,
+            NormalizedKind::RegexRiskHostname,
+            NormalizedKind::RegexRiskIncompleteSpecialGroup,
+            NormalizedKind::RegexRiskPolynomial,
+            NormalizedKind::RegexRiskRange,
+            NormalizedKind::RegexRiskUnmatchableCaret,
+            NormalizedKind::RegexRiskUnmatchableDollar,
+            NormalizedKind::RegexSequence,
+            NormalizedKind::RegexWildcard,
+        ]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         PYTHON_KIND_TABLE
     }
@@ -1475,7 +1528,9 @@ impl StructuralSpec for PythonStructuralSpec {
             NormalizedKind::Identifier if python_identifier_is_parameter(node) => {
                 NormalizedKind::Parameter
             }
-            NormalizedKind::Function if python_definition_is_method(node) => NormalizedKind::Method,
+            NormalizedKind::Function if crate::syntax::python_method_owner(node).is_some() => {
+                NormalizedKind::Method
+            }
             NormalizedKind::Comparison if python_comparison_shape(node).operator_count > 1 => {
                 NormalizedKind::ComparisonChain
             }
@@ -1660,34 +1715,7 @@ impl StructuralSpec for PythonStructuralSpec {
                     }
                 }
                 if let Some(arguments) = node.child_by_field_name("arguments") {
-                    for index in 0..arguments.named_child_count() {
-                        if !sink.should_continue() {
-                            break;
-                        }
-                        let Some(argument) = arguments.named_child(index) else {
-                            continue;
-                        };
-                        if argument.is_extra() {
-                            continue;
-                        }
-                        match argument.kind() {
-                            "keyword_argument" => {
-                                if let (Some(keyword), Some(value)) = (
-                                    argument.child_by_field_name("name"),
-                                    argument.child_by_field_name("value"),
-                                ) {
-                                    sink.kwarg(keyword, value);
-                                }
-                            }
-                            "list_splat" | "dictionary_splat"
-                                if python_literal_pack_arguments(argument, sink) => {}
-                            _ => attach_argument_role_with_derived_name(
-                                sink,
-                                argument,
-                                expression_name_node,
-                            ),
-                        }
-                    }
+                    attach_python_argument_roles(sink, arguments);
                 }
             }
             NormalizedKind::FieldAccess => {
@@ -1806,9 +1834,18 @@ impl StructuralSpec for PythonStructuralSpec {
             },
             NormalizedKind::Identifier | NormalizedKind::Parameter => sink.set_name(node),
             NormalizedKind::Decorator => {
-                if let Some(name) = python_first_named_operand(node).and_then(expression_name_node)
+                if let Some(name) = python_first_named_operand(node)
+                    .map(python_unwrap_parenthesized)
+                    .and_then(expression_name_node)
                 {
                     sink.set_name(name);
+                }
+                if let Some(call) = python_first_named_operand(node)
+                    .map(python_unwrap_parenthesized)
+                    .filter(|child| child.kind() == "call")
+                    && let Some(arguments) = call.child_by_field_name("arguments")
+                {
+                    attach_python_argument_roles(sink, arguments);
                 }
             }
             NormalizedKind::ForLoop => {

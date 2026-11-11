@@ -92,8 +92,11 @@ pub struct ScoreDiffParams {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DiffScoreResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<crate::result_incomplete::ToolResultIncomplete>,
+
     pub endpoints: DiffEndpoints,
     pub geometry: GeometryFeatures,
     pub coordination: CoordinationFeatures,
@@ -104,7 +107,7 @@ pub struct DiffScoreResult {
 
 /// How much of the codebase the patch touches, and how spread out those touches
 /// are.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct GeometryFeatures {
     pub edited_symbols: usize,
     pub introduced_symbols: usize,
@@ -129,7 +132,7 @@ pub struct GeometryFeatures {
 }
 
 /// What untouched code has to agree with for the patch to be correct.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct CoordinationFeatures {
     /// Reference sites, across the whole target revision, for symbols whose
     /// signature changed, counting only sites in files the diff did not touch.
@@ -155,7 +158,7 @@ pub struct CoordinationFeatures {
     pub dispatch_extensible_edited_symbols: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SignatureChangeCallers {
     pub fqn: String,
     pub path: String,
@@ -176,7 +179,7 @@ pub struct SignatureChangeCallers {
 /// test region of the target revision. It is NOT transitive -- a symbol reached
 /// only through an intermediate that a test does call is reported here as
 /// having no direct test reference.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct VerificationFeatures {
     pub changed_production_symbols: usize,
     pub without_direct_test_reference: Vec<UntestedSymbol>,
@@ -190,7 +193,7 @@ pub struct VerificationFeatures {
     pub unresolved_symbols: Vec<UnresolvedSymbol>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct UntestedSymbol {
     pub fqn: String,
     pub kind: String,
@@ -206,7 +209,7 @@ pub struct UntestedSymbol {
     pub non_test_reference_sites: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct UnresolvedSymbol {
     pub fqn: String,
     pub path: String,
@@ -218,7 +221,7 @@ pub struct UnresolvedSymbol {
 
 /// SonarSource cognitive complexity over the edited symbol pairs, as the
 /// established metric to compare the features above against.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct BaselineFeatures {
     pub cognitive_before: u64,
     pub cognitive_after: u64,
@@ -226,7 +229,7 @@ pub struct BaselineFeatures {
     pub max_cognitive_after: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ExcludedFiles {
     pub binary_files: usize,
     pub unparseable_files: usize,
@@ -246,8 +249,15 @@ pub fn score_diff_at_root(
     params: ScoreDiffParams,
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<DiffScoreResult, String> {
-    DiffScoringSession::default().score_at_root(root, params, options, cancellation)
+    DiffScoringSession::default().score_at_root(
+        root,
+        params,
+        options,
+        cancellation,
+        retention_budget,
+    )
 }
 
 /// Retains one immutable target's analysis across diff-scoring requests.
@@ -301,6 +311,7 @@ impl DiffScoringSession {
         params: ScoreDiffParams,
         options: &DiffAnalysisOptions,
         cancellation: &CancellationToken,
+        retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<DiffScoreResult, String> {
         let prepared = PreparedDiff::at_root(
             root,
@@ -310,6 +321,7 @@ impl DiffScoringSession {
             },
             options,
             cancellation,
+            retention_budget,
         )?;
         if !prepared.target.is_immutable() {
             let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;
@@ -393,6 +405,7 @@ impl DiffScoringSession {
         params: ScoreDiffParams,
         options: &DiffAnalysisOptions,
         cancellation: &CancellationToken,
+        retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<DiffScoreResult, String> {
         assert!(
             params.targets_worktree(),
@@ -409,7 +422,13 @@ impl DiffScoringSession {
             // Worktree endpoints select disk bytes over the complete project.
             // Partial analyzers and unsaved editor buffers cannot answer that
             // question, but the ordinary full disk analysis can.
-            return self.score_at_root(project.root(), params, options, cancellation);
+            return self.score_at_root(
+                project.root(),
+                params,
+                options,
+                cancellation,
+                retention_budget,
+            );
         }
         let prepared = PreparedDiff::at_root(
             workspace.analyzer().project().root(),
@@ -419,6 +438,7 @@ impl DiffScoringSession {
             },
             options,
             cancellation,
+            retention_budget,
         )?;
         assert!(!prepared.target.is_immutable());
         let analyzed = analyze_prepared_diff_with_endpoints(&prepared, true)?;
@@ -460,6 +480,7 @@ fn score_analyzed_diff(
     cache: &ReferenceCache,
     cancellation: &CancellationToken,
 ) -> DiffScoreResult {
+    let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(whole_target);
     let changed_paths: BTreeSet<String> = analyzed
         .result
         .file_changes
@@ -485,7 +506,17 @@ fn score_analyzed_diff(
     let baseline = baseline_features(&analyzed);
     let excluded = excluded_files(&analyzed.result.file_changes);
 
+    let mut incomplete = analyzed.result.incomplete.clone();
+    incomplete.extend(crate::result_incomplete::query_read_incomplete(&scope));
+    if cancellation.is_cancelled()
+        && !incomplete.iter().any(|entry| {
+            entry.reason == crate::result_incomplete::ToolResultIncompleteReason::Cancelled
+        })
+    {
+        incomplete.push(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled.into());
+    }
     DiffScoreResult {
+        incomplete,
         endpoints: analyzed.result.endpoints.clone(),
         geometry,
         coordination,
@@ -1328,6 +1359,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("score_diff failed")
     }
@@ -1857,6 +1889,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &cancellation,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         );
         let score = result.expect("score diff reports incomplete symbols");
         assert!(

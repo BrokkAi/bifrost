@@ -552,7 +552,14 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         );
     }
 
-    if let Some(error) = query_scope.store_error() {
+    let incomplete = crate::result_incomplete::query_read_incomplete(&query_scope);
+    if !incomplete.is_empty() {
+        truncated = true;
+        findings.clear();
+        skipped.push(format!(
+            "dead-code analysis incomplete: {incomplete:?}; no findings published"
+        ));
+    } else if let Some(error) = query_scope.store_error() {
         findings.clear();
         skipped.push(format!(
             "dead-code analysis input authority failed: {error}; no findings published"
@@ -1171,6 +1178,8 @@ mod tests {
                     node.unproven_inbound = self.unproven;
                 }
                 let projection = SelectedWorkspaceUsageGraphProjection {
+                    relative_import_routes: Vec::new(),
+                    scope_obligations: Vec::new(),
                     raw_proven_inbound: vec![0; nodes.len()],
                     nodes,
                     edges: Vec::new(),
@@ -1340,7 +1349,12 @@ mod tests {
             )
             .file("src/lib.rs", source)
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let analyzer = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            RustAnalyzer,
+        >(_workspace.analyzer())
+        .unwrap()
+        .clone();
         let mut candidates = analyzer
             .all_declarations()
             .filter(|unit| unit.identifier() == "target")
@@ -1410,7 +1424,12 @@ mod tests {
                 .file("src/lib.rs", source)
                 .build();
             let file = fixture.file("src/lib.rs");
-            let analyzer = RustAnalyzer::new(fixture.project_dyn());
+            let _workspace = fixture.certified_workspace_analyzer(Default::default());
+            let analyzer = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                RustAnalyzer,
+            >(_workspace.analyzer())
+            .unwrap()
+            .clone();
             let candidate = analyzer
                 .declarations(&file)
                 .into_iter()
@@ -1746,7 +1765,13 @@ mod tests {
             }
         }
         impl IAnalyzer for SourceOnlyAnalyzer {
-            fn update(&self, _files: &std::collections::BTreeSet<ProjectFile>) -> Self {
+            fn update_with_listing(
+                &self,
+                _files: &std::collections::BTreeSet<ProjectFile>,
+                _listing: Option<
+                    &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+                >,
+            ) -> Self {
                 unimplemented!()
             }
             fn update_all(&self) -> Self {
@@ -2131,7 +2156,9 @@ fn is_dead_code_candidate(
         return false;
     }
     if language == Language::Go {
-        match brokk_bifrost_go_analysis::go_implicit_entry_point(analyzer, code_unit) {
+        let support = language_support_for_hook(language, "implicit_entry_point")
+            .expect("Go has registered language support");
+        match support.implicit_entry_point(analyzer, code_unit) {
             Some(true) => return false,
             Some(false) => {}
             None => {
@@ -2202,6 +2229,40 @@ fn kotlin_implicit_entry_point(
 }
 
 fn analyze_candidate(
+    declaration_syntax: &mut DeclarationSyntaxCache<'_>,
+    candidate: &CodeUnit,
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Option<DeadCodeFinding> {
+    let skip_start = skipped.len();
+    let analyzer = declaration_syntax.analyzer;
+    match brokk_bifrost_analysis::analyzer::i_analyzer::complete_independent_answer(
+        analyzer,
+        || {
+            analyze_candidate_inner(
+                declaration_syntax,
+                candidate,
+                usage_candidate_file_cap,
+                usage_cap,
+                skipped,
+            )
+        },
+    ) {
+        Ok(Ok(finding)) => finding,
+        Ok(Err(reasons)) => {
+            skipped.truncate(skip_start);
+            skipped.push(format!(
+                "`{}`: usage analysis is incomplete: {reasons:?}; evidence is inconclusive",
+                candidate.fq_name()
+            ));
+            None
+        }
+        Err(_error) => None,
+    }
+}
+
+fn analyze_candidate_inner(
     declaration_syntax: &mut DeclarationSyntaxCache<'_>,
     candidate: &CodeUnit,
     usage_candidate_file_cap: usize,
@@ -2784,7 +2845,7 @@ fn prove_native_candidates(
         }
         return Vec::new();
     }
-    let projection = match provider.project(
+    let projection = match provider.project_dead_code(
         analyzer,
         &files,
         &brokk_bifrost_core::cancellation::CancellationToken::default(),

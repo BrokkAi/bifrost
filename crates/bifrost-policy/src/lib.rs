@@ -3,6 +3,10 @@
 //! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
 //! depend on `brokk-bifrost` instead.
 
+// Policy keys hash immutable semantic identity; lazy dominance is derived
+// state and is excluded from equality and hashing.
+#![allow(clippy::mutable_key_type)]
+
 pub(crate) fn fmt_policy_json_decode_error(
     formatter: &mut std::fmt::Formatter<'_>,
     document: &str,
@@ -96,9 +100,11 @@ mod finding_identity;
 mod format;
 mod future_evidence;
 mod identity;
+mod inline_suppression;
 mod loading;
 mod locator;
 mod parallel;
+mod phase_cpu;
 mod projection;
 mod registry;
 #[cfg(test)]
@@ -205,6 +211,7 @@ pub use finding_identity::*;
 pub use format::*;
 pub use future_evidence::*;
 pub use identity::*;
+pub use inline_suppression::*;
 pub use parallel::*;
 pub use registry::*;
 pub use relational::*;
@@ -225,6 +232,11 @@ pub use brokk_bifrost_flow::taint::{ProductionTaintAnalysisResult, ProductionTai
 pub use taint_policy::with_composition_taint_engine_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use taint_policy::with_icfg_taint_engine_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub use taint_policy::{OutputAnchorOrder, OutputOrderProbe, OutputRefusalProbe, OutputRetryProbe};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use typestate_policy::{TypestateEngineOverride, with_typestate_engine_for_test};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use taint_barriers::count_value_type_barrier_calls_for_test;

@@ -2825,6 +2825,60 @@ mod coordinated_producer_tests {
             source_declaration("Outer.D.Method")
         );
     }
+
+    #[test]
+    fn anonymous_interface_identity_has_a_nameless_source_bridge() {
+        let source = "package p\ntype Outer struct { A, B interface { Run() error } }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n";
+        let parsed = parse(source);
+        let facts = parsed.source_facts.as_ref().expect("source facts");
+        let tree = parse_go_tree(source);
+        let mut pending = vec![tree.root_node()];
+        let mut interface = None;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "interface_type" {
+                interface = Some(node);
+                break;
+            }
+            pending.extend(named_children(node));
+        }
+        let interface_start = interface.expect("interface syntax").start_byte();
+        let identity = parsed
+            .resolution_facts
+            .sites
+            .iter()
+            .find(|site| {
+                site.kind == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::TypeDeclaration
+                    && site.start_byte == interface_start
+            })
+            .expect("anonymous interface identity");
+        let source_id = facts
+            .native_declaration_sources
+            .iter()
+            .find(|(site, _)| *site == identity.id)
+            .map(|(_, source_id)| *source_id)
+            .expect("identity source bridge");
+        assert!(facts.occurrences.declaration(source_id).name.is_none());
+        assert!(
+            !parsed
+                .source_declaration_units
+                .iter()
+                .any(|(declaration, _)| *declaration == source_id)
+        );
+
+        let method_units = parsed
+            .source_declaration_units
+            .iter()
+            .filter(|(_, unit)| matches!(unit.short_name(), "Outer.A.Run" | "Outer.B.Run"))
+            .collect::<Vec<_>>();
+        assert_eq!(method_units.len(), 2);
+        assert_eq!(method_units[0].0, method_units[1].0);
+        assert!(
+            facts
+                .native_declaration_sources
+                .iter()
+                .any(|(_, declaration)| *declaration == method_units[0].0)
+        );
+    }
 }
 
 #[cfg(test)]

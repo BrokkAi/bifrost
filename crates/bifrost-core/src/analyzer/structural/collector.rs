@@ -8,9 +8,11 @@
 
 use super::callable::CallSiteContext;
 use super::facts::{NormalizedNode, RoleTarget, Span, StructuralFactRows};
-use super::kinds::NormalizedKind;
+use super::kinds::{COVERAGE_ROLES, NormalizedKind, Role, RoleCoverage, RoleCoverageGap};
 use super::occurrences::OccurrenceRole;
-use super::spec::{PendingRoleTarget, RoleSink, RoleSinkParts, RoleSinkStop, StructuralSpec};
+use super::spec::{
+    PendingRoleTarget, PendingRoleTargetKind, RoleSink, RoleSinkParts, RoleSinkStop, StructuralSpec,
+};
 use crate::analyzer::source_facts::PrimarySourceFactCollector;
 use crate::analyzer::tree_walk::{ParentIndex, collect_parse_errors, node_range};
 use crate::cancellation::CancellationToken;
@@ -55,6 +57,7 @@ pub struct StructuralFactCollector<'a, 'tree> {
     fact_by_ast_node: HashMap<usize, u32>,
     pending_roles: Vec<Vec<PendingRoleTarget>>,
     pending_occurrence_roles: Vec<PendingOccurrence>,
+    coverage: Vec<(u32, Role, RoleCoverage, Option<Span>)>,
     role_count: usize,
 }
 
@@ -78,6 +81,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             fact_by_ast_node: HashMap::default(),
             pending_roles: Vec::new(),
             pending_occurrence_roles: Vec::new(),
+            coverage: Vec::new(),
             role_count: 0,
         }
     }
@@ -194,6 +198,12 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         source_facts: &mut PrimarySourceFactCollector<'_>,
     ) -> Result<u32, StructuralFactCollectorStop> {
         self.admit()?;
+        debug_assert!(
+            self.spec.emits_kind(normalized_kind),
+            "{} emits unlisted structural kind {:?}",
+            self.spec.language().config_label(),
+            normalized_kind
+        );
         let range = node_range(node);
         assert!(
             range.end_byte <= self.source.len()
@@ -310,7 +320,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             string_value,
             construct: self
                 .spec
-                .generator_construct(node, normalized_kind, self.source)
+                .generator_construct_with_context(node, normalized_kind, self.source, self.context)
                 .map(str::to_owned),
             parent: enclosing_normalized_id,
             name: None,
@@ -332,6 +342,12 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         let embedded_base = u32::try_from(self.nodes.len())
             .expect("embedded structural fact ids must fit in a u32 before allocation");
         for (embedded_index, embedded) in embedded_facts.iter().enumerate() {
+            debug_assert!(
+                self.spec.emits_kind(embedded.kind),
+                "{} emits unlisted embedded structural kind {:?}",
+                self.spec.language().config_label(),
+                embedded.kind
+            );
             assert!(
                 range.start_byte <= embedded.range.start_byte
                     && embedded.range.end_byte <= range.end_byte,
@@ -424,6 +440,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             self.cancellation,
             &self.parents,
         )
+        .with_call_site_context(self.context)
     }
 
     /// Record `node`'s visible children in the walk's parent index.
@@ -456,7 +473,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
         if self.is_cancelled() {
             return Err(StructuralFactCollectorStop::Cancelled);
         }
-        let (name, roles, occurrence_roles, stop) = sink;
+        let (name, roles, occurrence_roles, coverage, stop) = sink;
         match stop {
             Some(RoleSinkStop::Exceeded) => return Err(StructuralFactCollectorStop::Exceeded),
             Some(RoleSinkStop::Cancelled) => return Err(StructuralFactCollectorStop::Cancelled),
@@ -470,6 +487,30 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             "role admission must remain within the combined structural budget"
         );
         self.pending_roles[fact_id as usize] = roles;
+        let kind = self.nodes[fact_id as usize].kind;
+        let coverage_start = self.coverage.len();
+        for (role, outcome, container) in coverage {
+            debug_assert!(role.valid_for(kind));
+            debug_assert!(self.spec.certified_role_kinds(role).contains(&kind));
+            debug_assert!(
+                !self.coverage[coverage_start..]
+                    .iter()
+                    .any(|&(owner, existing, _, _)| owner == fact_id && existing == role)
+            );
+            self.coverage.push((fact_id, role, outcome, container));
+        }
+        for &role in COVERAGE_ROLES {
+            debug_assert_eq!(
+                self.coverage[coverage_start..]
+                    .iter()
+                    .filter(|&&(owner, existing, _, _)| owner == fact_id && existing == role)
+                    .count(),
+                usize::from(self.spec.certified_role_kinds(role).contains(&kind)),
+                "certified {:?} owner {:?} must have exactly one coverage outcome",
+                role,
+                kind
+            );
+        }
         self.pending_occurrence_roles
             .extend(
                 occurrence_roles
@@ -510,10 +551,13 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             })
             .collect();
         let StructuralFactCollector {
+            spec,
+            source,
             mut nodes,
             fact_by_ast_node,
             pending_roles,
             pending_occurrence_roles,
+            mut coverage,
             role_count,
             cancellation,
             ..
@@ -529,8 +573,28 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             }
         }
 
+        if coverage.iter().any(|entry| entry.3.is_some())
+            && let Some(preprocessor) = spec.preprocess(source)
+        {
+            let regions = preprocessor.conditional_regions(source);
+            // Activation uses source text alone; unknown symbols remain uncertain.
+            // A later configuration can only decide more regions, so this
+            // persisted gap can only err toward incomplete.
+            for (_, _, outcome, container) in &mut coverage {
+                if container
+                    .is_some_and(|span| regions.has_uncertain_text(span.start_byte..span.end_byte))
+                {
+                    outcome.add_gap(RoleCoverageGap::ConditionalRegion);
+                }
+            }
+        }
+        let mut coverage: Vec<_> = coverage
+            .into_iter()
+            .map(|(owner, role, outcome, _)| (owner, role, outcome))
+            .collect();
+        coverage.sort_unstable_by_key(|&(owner, role, _)| (owner, role));
         let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), role_count);
-        for pending in pending_roles {
+        for (owner, pending) in pending_roles.into_iter().enumerate() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return Err(StructuralFactCollectorStop::Cancelled);
             }
@@ -540,12 +604,27 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
                 }
                 roles.values_mut().push(RoleTarget {
                     role: pending.role,
-                    spread: pending.spread,
+                    mode: pending.mode,
                     keyword: pending.keyword,
-                    node: fact_by_ast_node.get(&pending.target_node).copied(),
+                    node: match pending.target {
+                        PendingRoleTargetKind::Node(node) => fact_by_ast_node.get(&node).copied(),
+                        PendingRoleTargetKind::Span => None,
+                    },
                     occurrence: pending.occurrence,
                     name: pending.name,
                 });
+                if pending.role.has_coverage()
+                    && roles
+                        .values_mut()
+                        .last()
+                        .is_some_and(|target| target.node.is_none())
+                    && let Ok(index) = coverage.binary_search_by_key(
+                        &(owner as u32, pending.role),
+                        |&(covered_owner, covered_role, _)| (covered_owner, covered_role),
+                    )
+                {
+                    coverage[index].2.add_gap(RoleCoverageGap::MissingTarget);
+                }
             }
             roles.finish_row();
         }
@@ -607,6 +686,7 @@ impl<'a, 'tree> StructuralFactCollector<'a, 'tree> {
             roles.finish(),
             occurrence_rows.finish(),
             recovered_regions,
-        ))
+        )
+        .with_coverage(coverage))
     }
 }

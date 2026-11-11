@@ -111,13 +111,13 @@ calls, and the receiver steps `receiver_targets`, `points_to`, and
 | Language | Call and receiver precision | Named arguments (`kwargs`) | Import-file edges | Indexed hierarchy |
 | --- | --- | --- | --- | --- |
 | Python | Resolved functions, methods, and properties | Yes | Yes | Yes |
-| Java | Receiver identity, overloads, constructors, fields, and types | No | Yes | Yes |
+| Java | Receiver identity, overloads, constructors, fields, and types | Annotation arguments only | Yes | Yes |
 | JavaScript | Module and method identity; `this` references are separated by result surface | No | Yes | Yes |
 | TypeScript | JavaScript forms plus typed declaration and module identity | No | Yes | Yes |
 | Go | Package-scoped functions, methods, fields, and types | No | Yes | Yes, including indexed type relationships |
 | C (`cpp`) | Functions, fields, and types; method receivers and class inheritance do not apply | No | Yes, from `#include` | Not applicable |
 | C++ (`cpp`) | Functions, members, fields, types, includes, and structured receiver resolution | No | Yes, from `#include` | Yes |
-| Rust | Functions, impl members, fields, types, and explicit `self` handling | No | Yes, including `pub use` re-exports | Yes |
+| Rust | Functions, impl members, fields, types, and explicit `self` handling | Attribute arguments only | Yes, including `pub use` re-exports | Yes |
 | PHP | Namespaces, functions, methods, fields, types, static receivers, and `$this` ownership | Yes | Yes, from namespace imports and type references | Yes |
 | Scala | Receiver and overload resolution across methods, fields, types, and inheritance | Yes | Yes | Yes |
 | C# | Receiver and overload resolution across methods, constructors, fields, and types | Yes | Yes | Yes |
@@ -146,17 +146,17 @@ These forms create an edge to a project file:
 | Language | Semantic adapter: CFG, value flow, taint, typestate | Class-set type flow (`class_set`, `absent_member`) | Build topology (`target_of`, `source_set_of`, `topology_edges_of`) | Semantic-pack ecosystem |
 | --- | --- | --- | --- | --- |
 | Python | Yes | Yes | No | `python` |
-| Java | Yes | No | Maven only | `jvm` |
+| Java | Yes | No | Maven, Gradle Kotlin DSL, sbt | `jvm` |
 | JavaScript | Yes | Yes | No | `npm` |
 | TypeScript | Yes, shared with JavaScript | Yes | No | `npm` |
 | Go | Yes | No | No | `go` |
 | C and C++ | Yes, one shared C-family adapter | No | No | `cpp` |
 | Rust | Yes | No | No | `cargo` |
 | PHP | Yes | Yes | No | `composer` |
-| Scala | Yes | No | Maven only | `jvm` |
+| Scala | Yes | No | Maven, Gradle Kotlin DSL, sbt | `jvm` |
 | C# | Yes | No | No | `dotnet` |
 | Ruby | Yes | Yes | No | `ruby` |
-| Kotlin | Yes | No | Maven only | `jvm` |
+| Kotlin | Yes | No | Maven, Gradle Kotlin DSL, sbt | `jvm` |
 
 Notes on the analysis table:
 
@@ -169,9 +169,11 @@ Notes on the analysis table:
   `absent_member` return no rows and the diagnostic
   `semantic_capability_unsupported` with the message
   `class-set propagation is unsupported for <label>`.
-- Build topology reads Maven `pom.xml` files only. See
-  [Project and build inputs](#project-and-build-inputs). A workspace with
-  only Gradle builds returns the diagnostic `topology_derivation_incomplete`.
+- JVM build topology reads Maven `pom.xml` files, Gradle Kotlin DSL
+  settings and build scripts, and `build.sbt`. See
+  [Project and build inputs](#project-and-build-inputs). A workspace whose
+  builds use Gradle's Groovy DSL returns the diagnostic
+  `topology_derivation_incomplete`.
   A file that no build file claims returns no row.
 - The semantic-pack ecosystem names the dependency ecosystem whose packs
   describe external libraries for that language. Java, Kotlin, and Scala
@@ -189,7 +191,7 @@ some ecosystems, can run a build tool; the next table lists those files.
 | Label | Files read during analysis | What Bifrost uses them for |
 | --- | --- | --- |
 | `python` | `pyproject.toml` (`tool.setuptools.packages.find.where`); `setup.py`, parsed and never run (`packages`, a literal `package_dir`, and the `where` argument of `find_packages` or `find_namespace_packages`); `__init__.py` package layout | Module identity. Bifrost picks the nearest project and the deepest import root that contains the file. Without packaging evidence, the outermost `__init__.py` package sets the module path. See [Identity and Language Front Ends](/design/identity-and-language-frontends/) |
-| `java`, `kotlin`, `scala` | `package` declarations in source; Maven `pom.xml` files | Package identity comes from source. `pom.xml` files define build targets, `main` and `test` source sets, and dependency edges between targets of the same workspace, with the Maven scope. Gradle build scripts are not read for topology |
+| `java`, `kotlin`, `scala` | `package` declarations in source; `pom.xml`, `settings.gradle.kts`, `build.gradle.kts` and `build.sbt` files | Package identity comes from source. Each pom, each Gradle project the settings file includes, and each sbt `project` defines a build target with `main` and `test` source sets (for Gradle, when the script applies a JVM plugin such as `java`, `java-library` or Kotlin JVM), and dependency edges between targets of the same workspace with their scope: a Maven coordinate, a Gradle `project(...)` dependency or an sbt `dependsOn`. Groovy Gradle files are not read |
 | `go` | The nearest `go.mod` (`module` directive) | Package import paths, which are the qualified names of Go declarations. Without a `go.mod`, Bifrost uses the directory path |
 | `rust` | `Cargo.toml`: `[package]`, `[lib]`, `[[bin]]`, `[[example]]`, `[[test]]`, `[[bench]]`, the conventional target paths such as `src/main.rs` and `src/bin/`, `build.rs`, `[workspace]`, path dependencies and `package` renames in `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]`, and `[features]` | Crate roots, module routes, and crate names used to resolve `use` paths and calls |
 | `javascript`, `typescript` | The nearest `tsconfig.json` or `jsconfig.json` for each importing file (`extends`, `compilerOptions.baseUrl`, `compilerOptions.paths`); every `package.json` outside `node_modules` that has a `name` (`exports` entry for `.`, `main`, `module`) | Resolving non-relative import specifiers to project files: path aliases such as `@/lib/foo`, and bare specifiers that name a workspace package. Package entries that name source through the `source` or `development` condition are tried first |
@@ -367,8 +369,8 @@ kinds.
 | --- | --- | --- |
 | `callee` | `call`, `concurrent_spawn` | none |
 | `receiver` | `call`, `concurrent_spawn` | none |
-| `args` | `call`, `concurrent_spawn` | none |
-| `kwargs` | `call`, `concurrent_spawn` | `java`, `go`, `cpp`, `javascript`, `typescript`, `rust` |
+| `args` | `call`, `concurrent_spawn`, `decorator` | none |
+| `kwargs` | `call`, `concurrent_spawn`, `decorator` | `go`, `cpp`, `javascript`, `typescript` |
 | `left` | `assignment` | none |
 | `right` | `assignment` | none |
 | `operator` | `assignment` | none |
@@ -541,6 +543,20 @@ toolchain, from the unreplaced modules of a validated `vendor/modules.txt`.
 Root requirements, checksums, replacements and an unvalidated listing name no
 selected version, so they activate no model.
 
+### Java, Kotlin and Scala
+
+- `pom.xml`, Gradle Kotlin DSL scripts (`settings.gradle.kts`,
+  `build.gradle.kts`), `gradle/libs.versions.toml`, `gradle.lockfile`,
+  `build.sbt`, sbt-dependency-lock's `build.sbt.lock`, and the JDK pins
+  `.java-version`, `.sdkmanrc` and `.tool-versions` are read as files, without
+  running Maven, Gradle or sbt, and published to the `dependency_evidence` /
+  `(dependency-evidence ...)` seed with ecosystems `maven` and
+  `jvm-toolchain`. Kotlin DSL scripts and `build.sbt` are read from their
+  syntax trees; only literal arguments are interpreted. Maven parents and BOMs
+  are followed only inside the workspace, and profiles are not evaluated.
+  Groovy `build.gradle` and `settings.gradle` files are reported as unread
+  gaps, because Bifrost has no Groovy grammar.
+
 ### JavaScript and TypeScript
 
 - `.js`, `.mjs`, and `.cjs` files use a repaired JavaScript grammar that
@@ -550,6 +566,14 @@ selected version, so they activate no model.
   `.cjs`, and `.jsx` files when the parameter is a bare identifier, a default
   value (`a = 1`), or a destructuring pattern. A rest parameter (`...args`) and
   a single unparenthesized arrow parameter (`x => x`) do not match.
+
+### PHP
+
+- `composer.json`, `composer.lock` and `.php-version` outside `vendor`
+  directories are read as files, without running Composer, and published to
+  the `dependency_evidence` / `(dependency-evidence ...)` seed with
+  ecosystems `composer` and `php-toolchain`. The code-to-project join that
+  would tell which lock governs a source file is not published yet.
 
 ### Python
 
@@ -600,6 +624,13 @@ established component relation.
   Use a `call` pattern with the callee `raise`.
 - Import-file edges come from `require`, `require_relative`, `load`, and
   `autoload` calls with a literal path.
+- `Gemfile`, `gems.rb`, `Gemfile.lock`, `gems.locked`, `*.gemspec`,
+  `.ruby-version` and `.tool-versions` are read as files, without running
+  Bundler, and published to the `dependency_evidence` /
+  `(dependency-evidence ...)` seed with ecosystems `rubygems` and
+  `ruby-toolchain`. `Gemfile` and gemspec declarations are read from the Ruby
+  syntax tree; only literal arguments are interpreted. The code-to-bundle
+  join that would tell which lock governs a source file is not published yet.
 
 ### Rust
 

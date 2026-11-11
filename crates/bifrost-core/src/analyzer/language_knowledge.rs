@@ -70,6 +70,25 @@ pub enum ScalarObjectFieldKind {
 }
 
 /// Language syntax and rules independent of query-time engine state.
+/// What an unmarked member store (one whose lowering states no value-copy
+/// mode) means for a read that continues through the stored cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmarkedMemberStores {
+    /// The store puts the stored object itself, or a value the lowering
+    /// already copied, into the cell, never an inline value that kept the
+    /// source's storage, so the read follows the storage the stored value
+    /// names.
+    Followable,
+    /// The store may not be followed; a read through it is reported partial.
+    Opaque,
+    /// The store may copy (PHP's copy-on-write arrays) and lowering cannot
+    /// tell which stores do. A procedure with no store marked as a reference
+    /// builds no prefix-store index, so its reads keep the access-path
+    /// outcome they have without one; following, or making every unmarked
+    /// store opaque, would block the whole procedure's snapshot (#10683).
+    Unindexed,
+}
+
 pub trait LanguageKnowledge: Send + Sync {
     /// Whether a field with this structured scalar value kind cannot carry a
     /// reference into a copied object of this language.
@@ -145,6 +164,14 @@ pub trait LanguageKnowledge: Send + Sync {
         false
     }
 
+    /// Other languages whose external declarations this language calls
+    /// directly, with no binding layer between them. A resolver-owned callee
+    /// identity names its declaring language, which for such a call is not
+    /// the caller's: a Kotlin call to a JDK method selects a Java declaration.
+    fn external_declaration_languages(&self) -> &'static [Language] {
+        &[]
+    }
+
     /// The complete supertypes of a builtin type whose supertypes no indexed
     /// declaration supplies. A builtin with this answer is a subtype of its
     /// own, each `aliases` and each `nominal` spelling, of no other builtin
@@ -171,6 +198,57 @@ pub trait LanguageKnowledge: Send + Sync {
         false
     }
 
+    /// External callee expansion requires a proven receiver binding.
+    fn external_callee_expansion_requires_receiver_binding(&self) -> bool {
+        false
+    }
+
+    /// An exact external callable retains its import boundary for application.
+    fn exact_external_call_keeps_import_boundary(&self) -> bool {
+        false
+    }
+
+    /// Model declarations project first-class runtime values and descriptor results.
+    fn model_declarations_project_runtime_values(&self) -> bool {
+        false
+    }
+
+    /// Model declarations supply authored runtime bases to hierarchy queries.
+    fn model_declarations_supply_runtime_bases(&self) -> bool {
+        false
+    }
+
+    /// Intrinsic type owners use the source language's member lookup rules
+    /// even when they have no mounted declaration carrying a language.
+    fn intrinsic_owners_use_source_member_rules(&self) -> bool {
+        false
+    }
+
+    /// Qualified type names inhabit the value namespace, so class-valued
+    /// attribute reads need no separate type lookup route.
+    fn qualified_type_lookups_use_value_namespace(&self) -> bool {
+        false
+    }
+
+    /// An unsupported callable expression concerns its first-class value,
+    /// independently of the callable's declared or inferred result type.
+    fn callable_expression_type_gap_is_value_only(&self) -> bool {
+        false
+    }
+
+    /// Members are not in the lexical scope of their owner's member bodies,
+    /// so a directly owned member declaration needs no lexical binder.
+    fn owned_members_are_not_lexically_scoped(&self) -> bool {
+        false
+    }
+
+    /// Several writers of one logical member are alternatives of one
+    /// declaration, so definition lookup counts public declarations.
+    /// Elsewhere two declarations with one display identity stay ambiguous.
+    fn reassignments_are_one_declaration(&self) -> bool {
+        false
+    }
+
     /// Publish the established local-binding diagnostic for a proven native
     /// lexical binding that has no indexed declaration unit.
     fn native_local_binding_diagnostic(&self) -> bool {
@@ -188,6 +266,16 @@ pub trait LanguageKnowledge: Send + Sync {
     /// This supplies container taint to element reads without proving runtime behavior.
     fn keyed_property_reads_container_element(&self) -> bool {
         false
+    }
+
+    /// How a store into a field, element or property whose lowering states no
+    /// value-copy mode is treated when a read continues through the stored
+    /// cell; see [`UnmarkedMemberStores`]. The default is `Opaque`. Go is
+    /// `Opaque`: its selector assignment of a struct value stores the
+    /// source's storage without a copy, and its lowering states no copy mode
+    /// for the field.
+    fn unmarked_member_stores(&self) -> UnmarkedMemberStores {
+        UnmarkedMemberStores::Opaque
     }
 
     /// Callee routes for a language that binds the innermost term family
@@ -311,6 +399,30 @@ pub trait LanguageKnowledge: Send + Sync {
     /// `None` when the generic field lookup already finds it.
     fn call_callee_node<'t>(&self, _call: tree_sitter::Node<'t>) -> Option<tree_sitter::Node<'t>> {
         None
+    }
+
+    /// The member leaf of a member selection that applies its member exactly
+    /// when that member resolves to a callable, or `None` for any other node.
+    ///
+    /// Scala's uniform access makes `entry.getName` a call of `getName()` when
+    /// `getName` is a method and a field read when it names a `val` or a Java
+    /// field. Syntax alone cannot tell the two apart, so consumers treat the
+    /// node as a call site only after resolution proves its member callable.
+    /// Structural facts keep such a node a field access and RQL decides
+    /// `kind: call` at query time: many consumers enumerate call facts outside
+    /// the matcher, and a call fact for a `val` read would give them wrong
+    /// answers, while a field access only leaves them without the new rows.
+    fn resolution_decided_application<'t>(
+        &self,
+        _selection: tree_sitter::Node<'t>,
+    ) -> Option<tree_sitter::Node<'t>> {
+        None
+    }
+
+    /// Whether [`Self::resolution_decided_application`] can name any node of
+    /// this language, so consumers parse a file for it only when it may.
+    fn has_resolution_decided_applications(&self) -> bool {
+        false
     }
 
     /// The binding target and value of a field initializer or assignment.

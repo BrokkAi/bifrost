@@ -6,11 +6,13 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::analyzer::identifier::define_identifier;
+use crate::analyzer::semantic::partial_flow::PartialFlowPort;
 use crate::analyzer::semantic::{
-    AbstractObject, AccessPathRoot, CandidateCoverage, DeclarationLocator, DurableCallContext,
-    DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity, EvidenceCompleteness,
-    ObjectCardinality, OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus,
-    SemanticArtifact, SemanticArtifactKey, SemanticLocator, SourceAnchor,
+    AbstractObject, AccessPathRoot, CallSiteHandle, CandidateCoverage, ControlEdgeKind,
+    DeclarationLocator, DurableCallContext, DurableObjectIdentity, DurablePortIdentity,
+    DurableValueIdentity, EvidenceCompleteness, ObjectCardinality, OracleCallContext,
+    ProcedureHandle, ProcedureId, ProgramPointHandle, ProofStatus, SemanticArtifact,
+    SemanticArtifactKey, SemanticLocator, SourceAnchor,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -319,6 +321,16 @@ impl TypestateBindingContext {
         }
     }
 
+    /// The binding context of a callee entered at this call. The oracle's
+    /// bounded context and this plan's key are derived from the same stack.
+    pub fn entered(&self, call: CallSiteHandle) -> Self {
+        let runtime = self
+            .runtime
+            .extended(call, crate::analyzer::semantic::OracleLimits::default());
+        let key = typestate_runtime_context_key(&runtime);
+        Self { runtime, key }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn try_new(runtime: OracleCallContext) -> Result<Self, TypestateBindingPlanError> {
         if runtime.calls().len() > MAX_TYPESTATE_CONTEXT_DEPTH {
@@ -551,7 +563,69 @@ pub struct TypestateEventBindingSpec {
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
     modeled_external_effect: Option<String>,
+    semantic_effect: Option<Arc<str>>,
     condition: Option<TypestateEventCondition>,
+    selected_operand: Option<TypestateSelectedOperand>,
+}
+
+/// The exact call operand selected by a policy event. A missing port cannot
+/// authorize a formal-pair alias guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TypestateEventPort {
+    Receiver,
+    Argument { ordinal: u32 },
+    Result { ordinal: Option<u32> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TypestateSelectedOperand {
+    call: CallSiteHandle,
+    port: TypestateEventPort,
+    selected_target: Option<(SemanticArtifactKey, ProcedureId)>,
+}
+
+impl TypestateSelectedOperand {
+    pub fn new(call: CallSiteHandle, port: TypestateEventPort) -> Self {
+        Self {
+            call,
+            port,
+            selected_target: None,
+        }
+    }
+
+    pub fn with_selected_target(mut self, target: (SemanticArtifactKey, ProcedureId)) -> Self {
+        self.selected_target = Some(target);
+        self
+    }
+
+    pub fn selected_target(&self) -> Option<&(SemanticArtifactKey, ProcedureId)> {
+        self.selected_target.as_ref()
+    }
+
+    pub fn call(&self) -> &CallSiteHandle {
+        &self.call
+    }
+
+    pub const fn port(&self) -> TypestateEventPort {
+        self.port
+    }
+
+    pub fn partial_flow_port(&self) -> PartialFlowPort {
+        match self.port {
+            TypestateEventPort::Receiver => PartialFlowPort::CallReceiver {
+                call: self.call.id(),
+            },
+            TypestateEventPort::Argument { ordinal } => PartialFlowPort::CallArgument {
+                call: self.call.id(),
+                ordinal,
+            },
+            TypestateEventPort::Result { ordinal } => PartialFlowPort::CallResult {
+                call: self.call.id(),
+                ordinal,
+            },
+        }
+    }
 }
 
 /// A Boolean equality condition evaluated against the selected call's
@@ -617,7 +691,9 @@ impl TypestateEventBindingSpec {
             role,
             quality,
             modeled_external_effect: None,
+            semantic_effect: None,
             condition: None,
+            selected_operand: None,
         }
     }
 
@@ -642,6 +718,194 @@ impl TypestateEventBindingSpec {
     pub fn with_condition(mut self, condition: TypestateEventCondition) -> Self {
         self.condition = Some(condition);
         self
+    }
+
+    pub fn with_selected_operand(mut self, operand: TypestateSelectedOperand) -> Self {
+        assert_eq!(self.site.call_site_handle(), Some(operand.call()));
+        self.selected_operand = Some(operand);
+        self
+    }
+    pub fn with_semantic_effect(mut self, effect: Option<Arc<str>>) -> Self {
+        self.semantic_effect = effect;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TypestateCoverageEventSet {
+    pub name: String,
+    pub version: u32,
+    pub effects: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageCandidatePhase {
+    AtMatch,
+    BeforeCall,
+    AfterNormalReturn,
+    AfterExceptionalReturn,
+    NormalProcedureExit,
+    ExceptionalProcedureExit,
+    SuspensionBoundary,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageCandidateSpec {
+    pub event: String,
+    pub semantic_effect: Option<Arc<str>>,
+    pub quality: TypestateBindingQuality,
+    pub alias_derived: bool,
+}
+
+impl CoverageCandidateSpec {
+    pub fn is_definitive(&self) -> bool {
+        !self.alias_derived && self.quality.is_definitive()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageCandidateGroupSpec {
+    pub subject: TypestateSubjectKey,
+    pub site: TypestateObservationSite,
+    pub phase: CoverageCandidatePhase,
+    pub candidates: Vec<CoverageCandidateSpec>,
+}
+
+/// Provenance of the exact activated summary selected for a call. A model ID
+/// alone is insufficient because two active shards may contain that ID.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CoverageRecordKey {
+    pub active_model_set_hash: String,
+    pub pack_id: String,
+    pub pack_digest: String,
+    pub shard_id: String,
+    pub shard_digest: String,
+    pub record_id: String,
+    pub model_id: String,
+    pub record_digest: String,
+    pub selected_member_id: String,
+    #[serde(serialize_with = "serialize_coverage_context")]
+    pub context: TypestateContextKey,
+    pub claim_id: Option<String>,
+    pub witness_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageRefusalReason {
+    MissingSelectedRecord,
+    MissingContext,
+    MissingClaim,
+    EventSetMismatch,
+    SubjectMismatch,
+    ExtraActual,
+    MultipleCandidates,
+    CandidateUnproven,
+    UnmappedCandidate,
+    WitnessCountMismatch,
+    WitnessEffectMismatch,
+    WitnessNotDefinite,
+    ReceiverTransportUnproven,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CoverageDecisionKind {
+    Unclaimed {
+        record: CoverageRecordKey,
+    },
+    Refused {
+        reason: CoverageRefusalReason,
+        record: Option<CoverageRecordKey>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageDecisionSpec {
+    pub subject: TypestateSubjectKey,
+    pub site: TypestateObservationSite,
+    pub phase: CoverageCandidatePhase,
+    pub kind: CoverageDecisionKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageDecision {
+    subject: TypestateSubjectId,
+    site: TypestateObservationSite,
+    phase: CoverageCandidatePhase,
+    kind: CoverageDecisionKind,
+}
+
+impl CoverageDecision {
+    pub fn kind(&self) -> &CoverageDecisionKind {
+        &self.kind
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct TypestateCoverageSpec {
+    pub event_set: Option<TypestateCoverageEventSet>,
+    pub candidate_groups: Vec<CoverageCandidateGroupSpec>,
+    pub decisions: Vec<CoverageDecisionSpec>,
+    pub unproven_relations: Vec<UnprovenEventRelation>,
+}
+
+/// One subject whose absence from an observed event has not been proved.
+#[derive(Debug, Clone)]
+pub struct UnprovenEventRelation {
+    pub subject: TypestateSubjectKey,
+    pub site: TypestateObservationSite,
+    pub event: String,
+    pub phase: String,
+    pub exit: Option<String>,
+    pub observation_procedure: SemanticLocator,
+    pub reason: String,
+}
+
+fn canonical_unproven_relation(relation: &UnprovenEventRelation) -> CanonicalUnprovenRelation<'_> {
+    CanonicalUnprovenRelation {
+        subject: canonical_subject_key(&relation.subject),
+        site: canonical_site(&relation.site),
+        event: &relation.event,
+        phase: &relation.phase,
+        exit: relation.exit.as_deref(),
+        observation_procedure: canonical_locator(&relation.observation_procedure),
+        reason: &relation.reason,
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalUnprovenRelation<'a> {
+    subject: CanonicalSubjectKey<'a>,
+    site: CanonicalSite<'a>,
+    event: &'a str,
+    phase: &'a str,
+    exit: Option<&'a str>,
+    observation_procedure: CanonicalLocator<'a>,
+    reason: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageCandidateGroup {
+    subject: TypestateSubjectId,
+    site: TypestateObservationSite,
+    phase: CoverageCandidatePhase,
+    candidates: Box<[CoverageCandidateSpec]>,
+}
+
+impl CoverageCandidateGroup {
+    pub const fn subject(&self) -> TypestateSubjectId {
+        self.subject
+    }
+    pub fn site(&self) -> &TypestateObservationSite {
+        &self.site
+    }
+    pub const fn phase(&self) -> CoverageCandidatePhase {
+        self.phase
+    }
+    pub fn candidates(&self) -> &[CoverageCandidateSpec] {
+        &self.candidates
     }
 }
 
@@ -681,6 +945,22 @@ pub struct BoundTypestateSubject {
 }
 
 impl BoundTypestateSubject {
+    /// Ephemeral subject for a selected receiver certificate. Its dense ID
+    /// and class never enter a binding plan or a published answer.
+    pub(super) fn receiver_event_probe(
+        object: AbstractObject,
+        quality: TypestateBindingQuality,
+    ) -> Self {
+        let class = TypestateSubjectClassKey::new("receiver-event-probe")
+            .expect("receiver event probe class is valid");
+        Self {
+            id: TypestateSubjectId::new(0),
+            key: TypestateSubjectKey::for_object(class, &object),
+            object,
+            quality,
+        }
+    }
+
     pub const fn id(&self) -> TypestateSubjectId {
         self.id
     }
@@ -734,6 +1014,21 @@ impl BoundTypestateInitialSeed {
         self.activation_edge.as_ref()
     }
 
+    pub(crate) fn activation_successor(&self) -> Option<(ProgramPointHandle, ControlEdgeKind)> {
+        self.activation_edge().map(|edge| {
+            let row = edge
+                .procedure()
+                .semantics()
+                .control_edge(edge.id())
+                .expect("validated control-edge activation resolves");
+            let target = edge
+                .procedure()
+                .point_handle(row.target_point)
+                .expect("validated control-edge activation retains its target");
+            (target, row.kind)
+        })
+    }
+
     pub const fn role(&self) -> TypestateObjectRole {
         self.role
     }
@@ -757,7 +1052,9 @@ pub struct BoundTypestateEvent {
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
     modeled_external_effect: Option<String>,
+    semantic_effect: Option<Arc<str>>,
     condition: Option<TypestateEventCondition>,
+    selected_operand: Option<TypestateSelectedOperand>,
 }
 
 impl BoundTypestateEvent {
@@ -793,8 +1090,16 @@ impl BoundTypestateEvent {
         self.modeled_external_effect.as_deref()
     }
 
+    pub fn semantic_effect(&self) -> Option<&str> {
+        self.semantic_effect.as_deref()
+    }
+
     pub const fn condition(&self) -> Option<TypestateEventCondition> {
         self.condition
+    }
+
+    pub fn selected_operand(&self) -> Option<&TypestateSelectedOperand> {
+        self.selected_operand.as_ref()
     }
 }
 
@@ -856,6 +1161,11 @@ pub struct TypestateBindingPlan {
     subjects: Box<[BoundTypestateSubject]>,
     initial_seeds: Box<[BoundTypestateInitialSeed]>,
     event_bindings: Box<[BoundTypestateEvent]>,
+    event_templates: Box<[BoundTypestateEvent]>,
+    event_set: Option<TypestateCoverageEventSet>,
+    coverage_candidate_groups: Box<[CoverageCandidateGroup]>,
+    coverage_decisions: Box<[CoverageDecision]>,
+    unproven_relations: Box<[UnprovenEventRelation]>,
     call_noninterference_bindings: Box<[BoundTypestateCallNonInterference]>,
     terminal_bindings: Box<[BoundTypestateTerminal]>,
     terminals_by_point: HashMap<ProgramPointHandle, HashMap<OracleCallContext, Box<[usize]>>>,
@@ -881,6 +1191,11 @@ type SubjectIndexByCall =
     HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[TypestateSubjectId]>>;
 type SubjectIndexByPoint = HashMap<ProgramPointHandle, Box<[TypestateSubjectId]>>;
 
+pub struct TypestateEventBindings {
+    pub events: Vec<TypestateEventBindingSpec>,
+    pub templates: Vec<TypestateEventBindingSpec>,
+}
+
 impl TypestateBindingPlan {
     pub fn try_new(
         protocol: &CompiledProtocol,
@@ -901,12 +1216,69 @@ impl TypestateBindingPlan {
 
     pub fn try_new_with_call_noninterference(
         protocol: &CompiledProtocol,
+        subjects: Vec<BoundTypestateSubjectSpec>,
+        initial_seeds: Vec<TypestateInitialSeedSpec>,
+        event_bindings: Vec<TypestateEventBindingSpec>,
+        call_noninterference_bindings: Vec<TypestateCallNonInterferenceSpec>,
+        terminal_bindings: Vec<TypestateTerminalBindingSpec>,
+    ) -> Result<Self, TypestateBindingPlanError> {
+        Self::try_new_with_coverage(
+            protocol,
+            subjects,
+            initial_seeds,
+            TypestateEventBindings {
+                events: event_bindings,
+                templates: Vec::new(),
+            },
+            call_noninterference_bindings,
+            terminal_bindings,
+            TypestateCoverageSpec::default(),
+        )
+    }
+
+    pub fn try_new_with_coverage(
+        protocol: &CompiledProtocol,
         mut subjects: Vec<BoundTypestateSubjectSpec>,
         mut initial_seeds: Vec<TypestateInitialSeedSpec>,
-        mut event_bindings: Vec<TypestateEventBindingSpec>,
+        events: TypestateEventBindings,
         mut call_noninterference_bindings: Vec<TypestateCallNonInterferenceSpec>,
         mut terminal_bindings: Vec<TypestateTerminalBindingSpec>,
+        coverage: TypestateCoverageSpec,
     ) -> Result<Self, TypestateBindingPlanError> {
+        let TypestateEventBindings {
+            events: mut event_bindings,
+            templates: mut event_templates,
+        } = events;
+        let TypestateCoverageSpec {
+            event_set,
+            candidate_groups: mut coverage_candidate_groups,
+            decisions: mut coverage_decisions,
+            mut unproven_relations,
+        } = coverage;
+        check_count(
+            "unproven_relations",
+            unproven_relations.len(),
+            MAX_TYPESTATE_EVENT_BINDINGS,
+        )?;
+        unproven_relations.sort_by(|left, right| {
+            canonical_json(
+                &canonical_unproven_relation(left),
+                "unproven relation is canonical",
+            )
+            .cmp(&canonical_json(
+                &canonical_unproven_relation(right),
+                "unproven relation is canonical",
+            ))
+        });
+        unproven_relations.dedup_by(|right, left| {
+            canonical_json(
+                &canonical_unproven_relation(left),
+                "unproven relation is canonical",
+            ) == canonical_json(
+                &canonical_unproven_relation(right),
+                "unproven relation is canonical",
+            )
+        });
         check_count("subjects", subjects.len(), MAX_TYPESTATE_SUBJECTS)?;
         check_count(
             "initial_seeds",
@@ -915,7 +1287,7 @@ impl TypestateBindingPlan {
         )?;
         check_count(
             "event_bindings",
-            event_bindings.len(),
+            event_bindings.len() + event_templates.len(),
             MAX_TYPESTATE_EVENT_BINDINGS,
         )?;
         check_count(
@@ -951,6 +1323,8 @@ impl TypestateBindingPlan {
         {
             return Err(TypestateBindingPlanError::ConflictingEventOrder);
         }
+        event_templates.sort_by(compare_event_specs);
+        event_templates.dedup_by(|right, left| compare_event_specs(left, right) == Ordering::Equal);
         call_noninterference_bindings.sort_by(compare_call_noninterference_specs);
         reject_adjacent_duplicates(
             &call_noninterference_bindings,
@@ -1006,8 +1380,12 @@ impl TypestateBindingPlan {
             });
         }
 
-        let mut compiled_events = Vec::with_capacity(event_bindings.len());
-        for (index, binding) in event_bindings.iter().enumerate() {
+        let mut compiled_events = Vec::with_capacity(event_bindings.len() + event_templates.len());
+        for (index, binding) in event_bindings
+            .iter()
+            .chain(event_templates.iter())
+            .enumerate()
+        {
             let subject = subject_id(&subject_ids, &binding.subject)?;
             let event = protocol
                 .event_id(&binding.event)
@@ -1031,9 +1409,66 @@ impl TypestateBindingPlan {
                 role: binding.role,
                 quality: binding.quality.clone(),
                 modeled_external_effect: binding.modeled_external_effect.clone(),
+                semantic_effect: binding.semantic_effect.clone(),
                 condition: binding.condition,
+                selected_operand: binding.selected_operand.clone(),
             });
         }
+
+        coverage_candidate_groups.sort_by_cached_key(|group| {
+            canonical_json(
+                &(
+                    canonical_subject_key(&group.subject),
+                    canonical_site(&group.site),
+                    group.phase,
+                ),
+                "coverage candidate group key is serializable",
+            )
+        });
+        let compiled_coverage_groups = coverage_candidate_groups
+            .iter_mut()
+            .map(|group| {
+                group.candidates.sort_by_cached_key(|candidate| {
+                    canonical_json(
+                        &(
+                            &candidate.event,
+                            &candidate.semantic_effect,
+                            candidate.alias_derived,
+                            canonical_quality(&candidate.quality),
+                        ),
+                        "coverage candidate is serializable",
+                    )
+                });
+                Ok(CoverageCandidateGroup {
+                    subject: subject_id(&subject_ids, &group.subject)?,
+                    site: group.site.clone(),
+                    phase: group.phase,
+                    candidates: group.candidates.clone().into_boxed_slice(),
+                })
+            })
+            .collect::<Result<Vec<_>, TypestateBindingPlanError>>()?;
+
+        coverage_decisions.sort_by_cached_key(|decision| {
+            canonical_json(
+                &(
+                    canonical_subject_key(&decision.subject),
+                    canonical_site(&decision.site),
+                    decision.phase,
+                ),
+                "coverage decision key is serializable",
+            )
+        });
+        let compiled_coverage_decisions = coverage_decisions
+            .iter()
+            .map(|decision| {
+                Ok(CoverageDecision {
+                    subject: subject_id(&subject_ids, &decision.subject)?,
+                    site: decision.site.clone(),
+                    phase: decision.phase,
+                    kind: decision.kind.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, TypestateBindingPlanError>>()?;
 
         let mut compiled_call_noninterference =
             Vec::with_capacity(call_noninterference_bindings.len());
@@ -1080,9 +1515,43 @@ impl TypestateBindingPlan {
             });
         }
 
+        let template_start = event_bindings.len();
+        let compiled_templates = compiled_events.split_off(template_start);
         let canonical = CanonicalBindingPlan {
             schema_version: BINDING_PLAN_SCHEMA_VERSION,
             protocol_hash: protocol.hash(),
+            event_set: event_set.as_ref(),
+            coverage_candidate_groups: coverage_candidate_groups
+                .iter()
+                .map(|group| CanonicalCoverageCandidateGroup {
+                    subject: canonical_subject_key(&group.subject),
+                    site: canonical_site(&group.site),
+                    phase: group.phase,
+                    candidates: group
+                        .candidates
+                        .iter()
+                        .map(|candidate| CanonicalCoverageCandidate {
+                            event: &candidate.event,
+                            semantic_effect: candidate.semantic_effect.as_deref(),
+                            quality: canonical_quality(&candidate.quality),
+                            alias_derived: candidate.alias_derived,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            coverage_decisions: coverage_decisions
+                .iter()
+                .map(|decision| CanonicalCoverageDecision {
+                    subject: canonical_subject_key(&decision.subject),
+                    site: canonical_site(&decision.site),
+                    phase: decision.phase,
+                    kind: &decision.kind,
+                })
+                .collect(),
+            unproven_relations: unproven_relations
+                .iter()
+                .map(canonical_unproven_relation)
+                .collect(),
             subjects: subjects.iter().map(canonical_subject).collect(),
             initial_seeds: initial_seeds
                 .iter()
@@ -1096,18 +1565,10 @@ impl TypestateBindingPlan {
                     reviewed_fresh_result: seed.reviewed_fresh_result,
                 })
                 .collect(),
-            event_bindings: event_bindings
+            event_bindings: event_bindings.iter().map(canonical_event_binding).collect(),
+            event_templates: event_templates
                 .iter()
-                .map(|binding| CanonicalEventBinding {
-                    event: binding.event.as_str(),
-                    subject: canonical_subject_key(&binding.subject),
-                    site: canonical_site(&binding.site),
-                    order: binding.order,
-                    role: binding.role,
-                    quality: canonical_quality(&binding.quality),
-                    modeled_external_effect: binding.modeled_external_effect.as_deref(),
-                    condition: binding.condition.map(canonical_event_condition),
-                })
+                .map(canonical_event_binding)
                 .collect(),
             call_noninterference_bindings: call_noninterference_bindings
                 .iter()
@@ -1136,7 +1597,12 @@ impl TypestateBindingPlan {
             protocol,
             &subjects,
             &initial_seeds,
-            &event_bindings,
+            ProcedureEventBindings {
+                events: &event_bindings,
+                templates: &event_templates,
+                coverage_decisions: &coverage_decisions,
+                unproven_relations: &unproven_relations,
+            },
             &call_noninterference_bindings,
             &terminal_bindings,
         )
@@ -1157,6 +1623,11 @@ impl TypestateBindingPlan {
             subjects: compiled_subjects.into_boxed_slice(),
             initial_seeds: compiled_seeds.into_boxed_slice(),
             event_bindings: compiled_events.into_boxed_slice(),
+            event_templates: compiled_templates.into_boxed_slice(),
+            event_set,
+            coverage_candidate_groups: compiled_coverage_groups.into_boxed_slice(),
+            coverage_decisions: compiled_coverage_decisions.into_boxed_slice(),
+            unproven_relations: unproven_relations.into_boxed_slice(),
             call_noninterference_bindings: compiled_call_noninterference.into_boxed_slice(),
             terminal_bindings: compiled_terminals.into_boxed_slice(),
             terminals_by_point: terminal_indexes.points,
@@ -1179,6 +1650,10 @@ impl TypestateBindingPlan {
 
     pub fn subjects(&self) -> &[BoundTypestateSubject] {
         &self.subjects
+    }
+
+    pub fn unproven_relations(&self) -> &[UnprovenEventRelation] {
+        &self.unproven_relations
     }
 
     /// Visit the semantic artifact identity of every procedure and scoped
@@ -1267,8 +1742,55 @@ impl TypestateBindingPlan {
         &self.event_bindings
     }
 
+    pub fn event_templates(&self) -> &[BoundTypestateEvent] {
+        &self.event_templates
+    }
+
+    pub fn event_set(&self) -> Option<&TypestateCoverageEventSet> {
+        self.event_set.as_ref()
+    }
+
+    pub fn coverage_candidate_groups(&self) -> &[CoverageCandidateGroup] {
+        &self.coverage_candidate_groups
+    }
+
+    pub fn coverage_candidate_group(
+        &self,
+        subject: TypestateSubjectId,
+        site: &TypestateObservationSite,
+        phase: CoverageCandidatePhase,
+    ) -> Option<&CoverageCandidateGroup> {
+        self.coverage_candidate_groups
+            .iter()
+            .find(|group| group.subject == subject && group.site == *site && group.phase == phase)
+    }
+
+    pub fn coverage_decision(
+        &self,
+        subject: TypestateSubjectId,
+        site: &TypestateObservationSite,
+        phase: CoverageCandidatePhase,
+    ) -> Option<&CoverageDecision> {
+        self.coverage_decisions.iter().find(|decision| {
+            decision.subject == subject && decision.site == *site && decision.phase == phase
+        })
+    }
+
     pub fn event_binding(&self, id: TypestateEventBindingId) -> Option<&BoundTypestateEvent> {
-        self.event_bindings.get(id.index())
+        self.event_bindings.get(id.index()).or_else(|| {
+            id.index()
+                .checked_sub(self.event_bindings.len())
+                .and_then(|index| self.event_templates.get(index))
+        })
+    }
+
+    pub fn event_templates_at_call_site_all_contexts(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+    ) -> impl Iterator<Item = &BoundTypestateEvent> {
+        self.event_templates
+            .iter()
+            .filter(move |template| template.site.call_site_handle() == Some(call))
     }
 
     pub fn call_noninterference_bindings(&self) -> &[BoundTypestateCallNonInterference] {
@@ -1802,7 +2324,6 @@ fn typestate_context_key(context: DurableCallContext) -> TypestateContextKey {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn typestate_runtime_context_key(context: &OracleCallContext) -> TypestateContextKey {
     typestate_context_key(
         DurableCallContext::of(context).expect("call contexts retain validated call sites"),
@@ -2051,6 +2572,29 @@ fn compare_event_specs(
                 .cmp(&right.modeled_external_effect)
         })
         .then_with(|| left.condition.cmp(&right.condition))
+        .then_with(|| {
+            compare_selected_operands(
+                left.selected_operand.as_ref(),
+                right.selected_operand.as_ref(),
+            )
+        })
+}
+
+fn compare_selected_operands(
+    left: Option<&TypestateSelectedOperand>,
+    right: Option<&TypestateSelectedOperand>,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => left
+            .call
+            .durable_key()
+            .cmp(&right.call.durable_key())
+            .then_with(|| left.port.cmp(&right.port))
+            .then_with(|| left.selected_target.cmp(&right.selected_target)),
+    }
 }
 
 fn compare_event_order_keys(
@@ -2060,6 +2604,12 @@ fn compare_event_order_keys(
     compare_sites(&left.site, &right.site)
         .then_with(|| left.order.cmp(&right.order))
         .then_with(|| left.subject.cmp(&right.subject))
+        .then_with(|| {
+            compare_selected_operands(
+                left.selected_operand.as_ref(),
+                right.selected_operand.as_ref(),
+            )
+        })
 }
 
 fn compare_call_noninterference_specs(
@@ -2324,6 +2874,9 @@ fn canonical_json<T: serde::Serialize + ?Sized>(value: &T, invariant: &str) -> S
 struct ProcedureBindingIndexes {
     seeds: Vec<usize>,
     events: Vec<usize>,
+    templates: Vec<usize>,
+    coverage_decisions: Vec<usize>,
+    unproven_relations: Vec<usize>,
     call_noninterference: Vec<usize>,
     terminals: Vec<usize>,
 }
@@ -2333,14 +2886,27 @@ type ProcedureBindingSummaryHashes =
 type ProcedureBindingSummaryHashResult =
     Result<(ProcedureBindingSummaryHashes, TypestateBindingSummaryHash), serde_json::Error>;
 
+struct ProcedureEventBindings<'a> {
+    events: &'a [TypestateEventBindingSpec],
+    templates: &'a [TypestateEventBindingSpec],
+    coverage_decisions: &'a [CoverageDecisionSpec],
+    unproven_relations: &'a [UnprovenEventRelation],
+}
+
 fn procedure_summary_hashes(
     protocol: &CompiledProtocol,
     subjects: &[BoundTypestateSubjectSpec],
     initial_seeds: &[TypestateInitialSeedSpec],
-    event_bindings: &[TypestateEventBindingSpec],
+    event_bindings: ProcedureEventBindings<'_>,
     call_noninterference_bindings: &[TypestateCallNonInterferenceSpec],
     terminal_bindings: &[TypestateTerminalBindingSpec],
 ) -> ProcedureBindingSummaryHashResult {
+    let ProcedureEventBindings {
+        events: event_bindings,
+        templates: event_templates,
+        coverage_decisions,
+        unproven_relations,
+    } = event_bindings;
     type ProcedureKey = (SemanticArtifactKey, DeclarationLocator);
     let mut indexes = HashMap::<ProcedureKey, ProcedureBindingIndexes>::new();
     for (index, seed) in initial_seeds.iter().enumerate() {
@@ -2355,6 +2921,27 @@ fn procedure_summary_hashes(
             .entry(summary_binding_procedure_key(&event.site))
             .or_default()
             .events
+            .push(index);
+    }
+    for (index, template) in event_templates.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&template.site))
+            .or_default()
+            .templates
+            .push(index);
+    }
+    for (index, decision) in coverage_decisions.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&decision.site))
+            .or_default()
+            .coverage_decisions
+            .push(index);
+    }
+    for (index, relation) in unproven_relations.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&relation.site))
+            .or_default()
+            .unproven_relations
             .push(index);
     }
     for (index, binding) in call_noninterference_bindings.iter().enumerate() {
@@ -2373,11 +2960,16 @@ fn procedure_summary_hashes(
     }
 
     let empty = CanonicalBindingPlan {
+        event_set: None,
+        coverage_candidate_groups: Vec::new(),
+        coverage_decisions: Vec::new(),
+        unproven_relations: Vec::new(),
         schema_version: BINDING_PLAN_SCHEMA_VERSION,
         protocol_hash: protocol.hash(),
         subjects: Vec::new(),
         initial_seeds: Vec::new(),
         event_bindings: Vec::new(),
+        event_templates: Vec::new(),
         call_noninterference_bindings: Vec::new(),
         terminal_bindings: Vec::new(),
     };
@@ -2397,6 +2989,24 @@ fn procedure_summary_hashes(
             )
             .chain(
                 indexes
+                    .templates
+                    .iter()
+                    .map(|index| &event_templates[*index].subject),
+            )
+            .chain(
+                indexes
+                    .coverage_decisions
+                    .iter()
+                    .map(|index| &coverage_decisions[*index].subject),
+            )
+            .chain(
+                indexes
+                    .unproven_relations
+                    .iter()
+                    .map(|index| &unproven_relations[*index].subject),
+            )
+            .chain(
+                indexes
                     .call_noninterference
                     .iter()
                     .map(|index| &call_noninterference_bindings[*index].subject),
@@ -2413,6 +3023,26 @@ fn procedure_summary_hashes(
         let canonical = CanonicalBindingPlan {
             schema_version: BINDING_PLAN_SCHEMA_VERSION,
             protocol_hash: protocol.hash(),
+            event_set: None,
+            coverage_candidate_groups: Vec::new(),
+            coverage_decisions: indexes
+                .coverage_decisions
+                .iter()
+                .map(|index| {
+                    let decision = &coverage_decisions[*index];
+                    CanonicalCoverageDecision {
+                        subject: canonical_subject_key(&decision.subject),
+                        site: canonical_site(&decision.site),
+                        phase: decision.phase,
+                        kind: &decision.kind,
+                    }
+                })
+                .collect(),
+            unproven_relations: indexes
+                .unproven_relations
+                .iter()
+                .map(|index| canonical_unproven_relation(&unproven_relations[*index]))
+                .collect(),
             subjects: subject_keys
                 .into_iter()
                 .map(|key| {
@@ -2454,9 +3084,16 @@ fn procedure_summary_hashes(
                         role: binding.role,
                         quality: canonical_quality(&binding.quality),
                         modeled_external_effect: binding.modeled_external_effect.as_deref(),
+                        semantic_effect: binding.semantic_effect.as_deref(),
                         condition: binding.condition.map(canonical_event_condition),
+                        selected_operand: canonical_selected_operand(binding),
                     }
                 })
+                .collect(),
+            event_templates: indexes
+                .templates
+                .iter()
+                .map(|index| canonical_event_binding(&event_templates[*index]))
                 .collect(),
             call_noninterference_bindings: indexes
                 .call_noninterference
@@ -2511,9 +3148,18 @@ fn summary_binding_procedure_key(
 struct CanonicalBindingPlan<'a> {
     schema_version: u32,
     protocol_hash: TypestateProtocolHash,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_set: Option<&'a TypestateCoverageEventSet>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    coverage_candidate_groups: Vec<CanonicalCoverageCandidateGroup<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    coverage_decisions: Vec<CanonicalCoverageDecision<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unproven_relations: Vec<CanonicalUnprovenRelation<'a>>,
     subjects: Vec<CanonicalSubject<'a>>,
     initial_seeds: Vec<CanonicalSeed<'a>>,
     event_bindings: Vec<CanonicalEventBinding<'a>>,
+    event_templates: Vec<CanonicalEventBinding<'a>>,
     call_noninterference_bindings: Vec<CanonicalCallNonInterferenceBinding<'a>>,
     terminal_bindings: Vec<CanonicalTerminalBinding<'a>>,
 }
@@ -2643,7 +3289,86 @@ struct CanonicalEventBinding<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     modeled_external_effect: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_effect: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     condition: Option<CanonicalEventCondition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_operand: Option<CanonicalSelectedOperand<'a>>,
+}
+
+fn canonical_event_binding(binding: &TypestateEventBindingSpec) -> CanonicalEventBinding<'_> {
+    CanonicalEventBinding {
+        event: binding.event.as_str(),
+        subject: canonical_subject_key(&binding.subject),
+        site: canonical_site(&binding.site),
+        order: binding.order,
+        role: binding.role,
+        quality: canonical_quality(&binding.quality),
+        modeled_external_effect: binding.modeled_external_effect.as_deref(),
+        semantic_effect: binding.semantic_effect.as_deref(),
+        condition: binding.condition.map(canonical_event_condition),
+        selected_operand: canonical_selected_operand(binding),
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalSelectedOperand<'a> {
+    call: CanonicalSite<'a>,
+    port: TypestateEventPort,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_target: Option<CanonicalSelectedTarget>,
+}
+
+#[derive(Serialize)]
+struct CanonicalSelectedTarget {
+    artifact: String,
+    procedure: u32,
+}
+
+fn canonical_selected_operand(
+    binding: &TypestateEventBindingSpec,
+) -> Option<CanonicalSelectedOperand<'_>> {
+    binding
+        .selected_operand
+        .as_ref()
+        .map(|operand| CanonicalSelectedOperand {
+            call: canonical_site(&binding.site),
+            port: operand.port,
+            selected_target: operand
+                .selected_target
+                .as_ref()
+                .map(|(artifact, procedure)| CanonicalSelectedTarget {
+                    // Checkout-independent: a diff base evaluated from another mount
+                    // must produce the same plan identity for the same content.
+                    artifact: artifact.public_fingerprint().to_string(),
+                    procedure: procedure.get(),
+                }),
+        })
+}
+
+#[derive(Serialize)]
+struct CanonicalCoverageCandidateGroup<'a> {
+    subject: CanonicalSubjectKey<'a>,
+    site: CanonicalSite<'a>,
+    phase: CoverageCandidatePhase,
+    candidates: Vec<CanonicalCoverageCandidate<'a>>,
+}
+
+#[derive(Serialize)]
+struct CanonicalCoverageCandidate<'a> {
+    event: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantic_effect: Option<&'a str>,
+    quality: CanonicalQuality,
+    alias_derived: bool,
+}
+
+#[derive(Serialize)]
+struct CanonicalCoverageDecision<'a> {
+    subject: CanonicalSubjectKey<'a>,
+    site: CanonicalSite<'a>,
+    phase: CoverageCandidatePhase,
+    kind: &'a CoverageDecisionKind,
 }
 
 #[derive(Serialize)]
@@ -2928,7 +3653,12 @@ fn canonical_activation_edge(
     edge: &crate::analyzer::semantic::ControlEdgeHandle,
 ) -> CanonicalActivationEdge {
     CanonicalActivationEdge {
-        artifact: edge.procedure().artifact().key().fingerprint().to_string(),
+        artifact: edge
+            .procedure()
+            .artifact()
+            .key()
+            .public_fingerprint()
+            .to_string(),
         procedure: edge.procedure().id().get(),
         edge: edge.id().get(),
     }
@@ -2960,6 +3690,16 @@ fn canonical_context_key(context: &TypestateContextKey) -> CanonicalContext<'_> 
         calls: context.calls.iter().map(canonical_locator).collect(),
         truncated: context.truncated,
     }
+}
+
+fn serialize_coverage_context<S>(
+    context: &TypestateContextKey,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    canonical_context_key(context).serialize(serializer)
 }
 
 fn canonical_value_identity(value: &DurableValueIdentity) -> CanonicalValueIdentity<'_> {

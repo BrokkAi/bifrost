@@ -8,13 +8,14 @@
 //!   run --benchmark <dir> --packs-dir <dir> --deps <dir> --jdk-catalog <dir>
 //!       --out <path> [--progress-out <path>] [--esapi-digest <hex>]
 //!       [--limit <n>] [--timeout-secs <s>]
+//!       [--call-modeling paranoid|optimistic|require-model]
 //!       Build the Benchmark workspace, activate the curated sanitizer/summary
 //!       packs and, through the product dependency-pack path (#2558), the real
 //!       `bifrost.jdk` release bundle installed at `--jdk-catalog`; run one
-//!       require-model taint policy per category, score, and write the
+//!       taint policy per category, score, and write the
 //!       artifact. `--jdk-catalog` must already have the bundle installed
 //!       (`bifrost-semantic-pack install <bundle-dir> <catalog-dir>`,
-//!       built by `scripts/public/build-pinned-jvm-semantic-packs.sh`); the
+//!       from a `BrokkAi/bifrost-packs` release); the
 //!       runner never installs into it and opens it read-only.
 //!
 //! The heavy logic is gated behind the `release-tooling` feature so it stays out
@@ -59,6 +60,7 @@ mod imp {
         InjectionCategory, PackSpec, RunConfig, RunResult, build_policy, policy_id,
         promote_staged_sanitizer_pack, run as run_bakeoff,
     };
+    use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
     use semver::Version;
     use serde::Serialize;
     use tempfile::NamedTempFile;
@@ -435,7 +437,7 @@ mod imp {
 
     #[derive(Serialize)]
     struct PolicyMeta {
-        mode: &'static str,
+        call_modeling: &'static str,
         note: &'static str,
         per_category: Vec<CategoryPolicy>,
     }
@@ -515,6 +517,7 @@ mod imp {
         benchmark_commit: Option<String>,
         benchmark_version: &'static str,
         timeout_secs_per_category: u64,
+        call_modeling: &'static str,
         dependency_jars: usize,
         case_limit: Option<usize>,
         final_artifact: &'a str,
@@ -653,6 +656,20 @@ mod imp {
                 .unwrap_or(3600),
         );
 
+        // The policy language's own default is `paranoid`. `require-model`
+        // abstains at every unmodeled call, which on the Benchmark turned
+        // almost every case into an abstention rather than a verdict.
+        let call_modeling = match flags.get("call-modeling").map(String::as_str) {
+            None | Some("paranoid") => UnmodeledCallBehavior::Paranoid,
+            Some("optimistic") => UnmodeledCallBehavior::Optimistic,
+            Some("require-model") => UnmodeledCallBehavior::RequireModel,
+            Some(other) => {
+                return Err(format!(
+                    "--call-modeling must be paranoid, optimistic, or require-model, not {other:?}"
+                ));
+            }
+        };
+
         let packs: Vec<PackSpec> = PACKS
             .iter()
             .map(|descriptor| {
@@ -685,6 +702,7 @@ mod imp {
             benchmark_root: benchmark_root.clone(),
             dependency_jars,
             packs,
+            call_modeling,
             timeout,
             case_limit,
             jdk_catalog_root,
@@ -709,6 +727,7 @@ mod imp {
                 benchmark_commit: git_head(&benchmark_root),
                 benchmark_version: "1.2",
                 timeout_secs_per_category: timeout.as_secs(),
+                call_modeling: call_modeling.label(),
                 dependency_jars: config.dependency_jars.len(),
                 case_limit,
                 final_artifact: out,
@@ -779,8 +798,8 @@ mod imp {
             .into_iter()
             .map(|category| CategoryPolicy {
                 category: category.label(),
-                policy_id: policy_id(category),
-                source: build_policy(category),
+                policy_id: policy_id(category, config.call_modeling),
+                source: build_policy(category, config.call_modeling),
             })
             .collect();
         let overall = &result.scoreboard.overall;
@@ -807,11 +826,13 @@ mod imp {
                 skipped_non_taint_categories: result.label_set.skipped_non_taint.clone(),
             },
             policy: PolicyMeta {
-                mode: "require-model",
+                call_modeling: config.call_modeling.label(),
                 note: "One taint policy per category, sharing the attacker-controlled source \
                        set and differing only in sinks, so a finding attributes unambiguously \
-                       to a category. `require-model` fails closed on an unmodeled boundary: an \
-                       unmodeled call on a flow yields Inconclusive, never a silent pass-through.",
+                       to a category. `call_modeling` decides what crosses a call with neither \
+                       an analyzed body nor a model: paranoid propagates, optimistic preserves, \
+                       require-model abstains. Cases whose analysis stayed incomplete are scored \
+                       as abstentions in the honest matrix either way.",
                 per_category,
             },
             packs: PacksMeta {

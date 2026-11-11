@@ -636,6 +636,7 @@ fn ts_collect_receiver_owners_from_bindings(
                     ReceiverAnalysisOutcome::Precise(values)
                     | ReceiverAnalysisOutcome::Ambiguous(values) => values,
                     ReceiverAnalysisOutcome::Unknown
+                    | ReceiverAnalysisOutcome::Incomplete { .. }
                     | ReceiverAnalysisOutcome::Unsupported { .. }
                     | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                 };
@@ -2131,8 +2132,16 @@ export function caller(items: string[]): Wrapped<string> | string {
         fn imported_code_units_of(
             &self,
             _file: &ProjectFile,
-        ) -> Arc<brokk_bifrost_core::hash::HashSet<CodeUnit>> {
-            Arc::new(brokk_bifrost_core::hash::HashSet::default())
+        ) -> Arc<
+            brokk_bifrost_core::retention_budget::Accounted<
+                brokk_bifrost_core::hash::HashSet<CodeUnit>,
+            >,
+        > {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
+                    brokk_bifrost_core::hash::HashSet::default()
+                },
+            )
         }
 
         fn referencing_files_of(

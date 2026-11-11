@@ -242,7 +242,9 @@ mod jvm_extraction_tests {
         before_publication.execute_batch(
         "CREATE TABLE resolution_identities(id INTEGER PRIMARY KEY,identity_digest BLOB NOT NULL UNIQUE)",
     ).unwrap();
-        let names = SharedNameTable::new(SharedNameCache::default());
+        let names = SharedNameTable::new(SharedNameCache::new(
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        ));
         let request = names.interner(&before_publication).intern(digest);
         assert!(!request.is_interned());
         let authority = SelectedResolutionAuthority::new(
@@ -596,6 +598,7 @@ mod jvm_extraction_tests {
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::plan_rows;
 
         use brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context;
+        use brokk_bifrost_analysis::analyzer::store::resolution::RESOLUTION_MANIFEST_COUNT_COLUMNS;
         use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
         use rusqlite::{StatementStatus, types::Value};
         for noise in [16, 4096] {
@@ -609,8 +612,11 @@ mod jvm_extraction_tests {
                     .execute("DELETE FROM temp.selected_resolution_admissions", [])
                     .unwrap();
                 let transaction = connection.unchecked_transaction().unwrap();
+                let counts =
+                    serde_json::to_string(&vec![0_i64; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()])
+                        .unwrap();
                 for invocation in 0..=noise {
-                    transaction.execute("INSERT INTO temp.selected_resolution_admissions(workspace_id,storage_language,generation,revision,blob_id,blob_oid,manifest_digest,producer_epoch,logical_rows,payload_bytes,input_kind,host_content_oid,invocation,definition_content_oid,selected_declaration,matched_arm_index,derivation_digest,checkpoint_digest,host_module_scope) VALUES('owner','rust',1,1,1,?1,zeroblob(32),'epoch',1,0,1,'host',?2,'definition',0,0,zeroblob(32),zeroblob(32),0)",params![format!("capsule-{invocation}"),invocation]).unwrap();
+                    transaction.execute("INSERT INTO temp.selected_resolution_admissions(workspace_id,storage_language,generation,revision,blob_id,blob_oid,manifest_digest,manifest_counts,producer_epoch,logical_rows,payload_bytes,input_kind,host_content_oid,invocation,definition_content_oid,selected_declaration,matched_arm_index,derivation_digest,checkpoint_digest,host_module_scope) VALUES('owner','rust',1,1,1,?1,zeroblob(32),jsonb(?3),'epoch',1,0,1,'host',?2,'definition',0,0,zeroblob(32),zeroblob(32),0)",params![format!("capsule-{invocation}"),invocation,&counts]).unwrap();
                     if invocation < noise {
                         transaction.execute("INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,admission_id) VALUES(1,?1)",[transaction.last_insert_rowid()]).unwrap();
                     }

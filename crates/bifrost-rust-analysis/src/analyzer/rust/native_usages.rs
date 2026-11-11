@@ -272,6 +272,26 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
         let fallback_cancellation = CancellationToken::new();
         let cancellation = scope.cancellation().unwrap_or(&fallback_cancellation);
         let targets = unique_targets(targets);
+        // The route questions a usage read asks (test-only files, target
+        // reachability) record a route evidence gap on the query scope when
+        // their answer is partial. This scope captures them so the result can
+        // say so; it does not hide them from the enclosing scopes.
+        let read_incompleteness = AnalyzerQueryScope::capturing_read_incompleteness(rust);
+        if let Err(error) =
+            rust.check_route_membership_completeness(&|| !cancellation.is_cancelled())
+        {
+            return match error {
+                brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled => {
+                    DIAGNOSTICS.cancelled(primary)
+                }
+                brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable => DIAGNOSTICS
+                    .failure(
+                        primary,
+                        "native_store_error",
+                        "Rust route membership unavailable".to_string(),
+                    ),
+            };
+        }
         let outcome = with_rust_selected_reverse_queries_in_files(
             rust,
             scope.candidate_files(),
@@ -377,7 +397,13 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
         );
         let (kind, reason) = match outcome {
             RustSelectedReverseOutcome::Ready(Some(result)) => {
-                return GraphUsageOutcome::Resolved(result);
+                return GraphUsageOutcome::Resolved(with_route_evidence_gaps(
+                    result,
+                    primary,
+                    &crate::analyzer::rust::route_kinds::route_evidence_gaps(
+                        &read_incompleteness.captured_read_incompleteness(),
+                    ),
+                ));
             }
             RustSelectedReverseOutcome::Ready(None) => {
                 assert!(
@@ -399,6 +425,51 @@ fn execute_native_usages_with<Sets: AsRef<[RustReverseCandidateSet]>>(
         outcome,
         #[cfg(test)]
         work,
+    }
+}
+
+/// A result read from partial route evidence is incomplete: positives stay,
+/// and a missing hit cannot prove absence. `gaps` is the text of each route
+/// evidence gap the read recorded, which names the incomplete units.
+fn with_route_evidence_gaps(
+    result: FuzzyResult,
+    primary: &CodeUnit,
+    gaps: &[String],
+) -> FuzzyResult {
+    if gaps.is_empty() {
+        return result;
+    }
+    let diagnostic = DIAGNOSTICS.diagnostic(
+        primary,
+        "rust_route_evidence_incomplete",
+        format!("{gaps:?}"),
+    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => FuzzyResult::Incomplete {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+            diagnostics: vec![diagnostic],
+        },
+        FuzzyResult::Incomplete {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+            mut diagnostics,
+        } => {
+            diagnostics.push(diagnostic);
+            FuzzyResult::Incomplete {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+                diagnostics,
+            }
+        }
+        other @ (FuzzyResult::Failure { .. } | FuzzyResult::TooManyCallsites { .. }) => other,
     }
 }
 
@@ -588,7 +659,12 @@ mod tests {
                     builder = builder.file(path, source.clone());
                 }
                 let fixture = builder.build();
-                let rust = RustAnalyzer::from_project(fixture.project().clone());
+                let _workspace = fixture.certified_workspace_analyzer(Default::default());
+                let rust = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                    RustAnalyzer,
+                >(_workspace.analyzer())
+                .unwrap()
+                .clone();
                 let target = rust
                     .declarations(&fixture.file("src/service.rs"))
                     .into_iter()
@@ -641,7 +717,13 @@ mod tests {
             .file("src/lib.rs", "pub mod api;\nuse crate::api::{first, second};\npub fn caller() { first(); second(); }\n")
             .file("src/api.rs", "pub fn first() {}\npub fn second() {}\n")
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let targets = ["first", "second"].map(|name| {
             rust.declarations(&fixture.file("src/api.rs"))
                 .into_iter()
@@ -763,7 +845,12 @@ mod tests {
                 .file("src/lib.rs", lib_source)
                 .file("src/target.rs", target_source)
                 .build();
-            let rust = RustAnalyzer::new(fixture.project_dyn());
+            let _workspace = fixture.certified_workspace_analyzer(Default::default());
+            let rust = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+                RustAnalyzer,
+            >(_workspace.analyzer())
+            .unwrap()
+            .clone();
             let target = rust
                 .declarations(&fixture.file("src/target.rs"))
                 .into_iter()
@@ -883,7 +970,13 @@ mod tests {
             .file("src/api.rs", "pub fn target() {}\n")
             .file("src/hidden.rs", "unknown_macro!();\n")
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let target = rust
             .declarations(&fixture.file("src/api.rs"))
             .into_iter()
@@ -1001,7 +1094,13 @@ mod tests {
                 "use provider::target;\npub fn caller() { target(); }\n",
             )
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let target = rust
             .declarations(&fixture.file("provider/src/lib.rs"))
             .into_iter()

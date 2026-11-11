@@ -63,6 +63,15 @@ pub(crate) enum UnionExecutionStrategy {
 pub struct CodeQueryResult {
     pub results: Vec<CodeQueryResultItem>,
     pub truncated: bool,
+    /// Whether a bounded callers/callees closure has a new declaration one
+    /// step beyond its bound. This is an observation about the query, not a
+    /// row, and the status alone does not make the bounded answer incomplete.
+    /// A probe that exhausts the shared execution budget is an ordinary step
+    /// budget stop: both whole and partitioned execution must enumerate the
+    /// same frontier under the same limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(default)]
+    pub depth_bound_status: Option<DepthBoundStatus>,
     /// Present only when this session covers an explicitly named subset of the
     /// workspace, in which case the query ran over that many files. This is not
     /// a diagnostic: a query over the named files is exact for those files. It
@@ -72,6 +81,58 @@ pub struct CodeQueryResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]
     pub diagnostics: Vec<CodeQueryDiagnostic>,
+}
+
+/// Outcome of checking whether a bounded call closure can grow by one step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DepthBoundStatus {
+    Reached,
+    NotReached,
+    Unknown,
+}
+
+impl DepthBoundStatus {
+    /// One answer-level observation, shared by agent text and the interactive REPL.
+    pub const fn answer_text(self) -> &'static str {
+        match self {
+            Self::Reached => "depth bound: reached (results beyond the bound may exist)",
+            Self::NotReached => "depth bound: not reached",
+            Self::Unknown => "depth bound: unknown (the frontier could not be certified)",
+        }
+    }
+
+    /// Combine observations from the same query. A witness proves reachability;
+    /// absent one, any undecided frontier prevents a negative claim.
+    pub const fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Reached, _) | (_, Self::Reached) => Self::Reached,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            _ => Self::NotReached,
+        }
+    }
+}
+
+#[cfg(test)]
+mod depth_bound_status_tests {
+    use super::DepthBoundStatus::{NotReached, Reached, Unknown};
+
+    #[test]
+    fn join_is_conservative_for_all_nine_pairs() {
+        for (left, right, expected) in [
+            (NotReached, NotReached, NotReached),
+            (NotReached, Unknown, Unknown),
+            (NotReached, Reached, Reached),
+            (Unknown, NotReached, Unknown),
+            (Unknown, Unknown, Unknown),
+            (Unknown, Reached, Reached),
+            (Reached, NotReached, Reached),
+            (Reached, Unknown, Reached),
+            (Reached, Reached, Reached),
+        ] {
+            assert_eq!(left.join(right), expected);
+        }
+    }
 }
 
 /// The supported `query_code` response selected by the root execution mode.
@@ -282,6 +343,11 @@ impl CodeQueryResult {
 /// completion from the same two inputs before it has a `CodeQueryResult` to
 /// ask (issue: impact-sliced `--diff-base`, Milestone 2), and two derivations
 /// of one contract would be two contracts.
+///
+/// A truncated result names its cause: every bound that stops a query pushes
+/// an `Incomplete` diagnostic (or cancels it), so an incomplete completion
+/// always carries at least one code. #2779 was a truncation without one,
+/// which a consumer could only report as an unexplained partial discovery.
 pub fn code_query_completion(
     truncated: bool,
     diagnostics: &[CodeQueryDiagnostic],
@@ -308,7 +374,11 @@ pub fn code_query_completion(
         return CodeQueryCompletion::Cancelled;
     }
     let incomplete = codes_with_impact(CodeQueryDiagnosticImpact::Incomplete);
-    if truncated || !incomplete.is_empty() {
+    assert!(
+        !truncated || !incomplete.is_empty(),
+        "a truncated CodeQuery result must name its cause in an Incomplete diagnostic: {diagnostics:?}"
+    );
+    if !incomplete.is_empty() {
         return CodeQueryCompletion::Incomplete { codes: incomplete };
     }
     let declared_non_exhaustive =
@@ -889,4 +959,36 @@ pub struct CodeQueryDeclaration {
     pub node_range: Option<CodeQueryRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_model: Option<Box<crate::analyzer::semantic_model::SemanticModelProvenance>>,
+}
+
+#[cfg(test)]
+mod depth_text_tests {
+    use super::*;
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "93df5f3cf606: agent text omitted answer-level depth completion"
+    )]
+    fn depth_status_text_preserves_all_values_and_absence() {
+        for (status, expected) in [
+            (None, "No query results.\n"),
+            (
+                Some(DepthBoundStatus::Reached),
+                "No query results.\ndepth bound: reached (results beyond the bound may exist)\n",
+            ),
+            (
+                Some(DepthBoundStatus::NotReached),
+                "No query results.\ndepth bound: not reached\n",
+            ),
+            (
+                Some(DepthBoundStatus::Unknown),
+                "No query results.\ndepth bound: unknown (the frontier could not be certified)\n",
+            ),
+        ] {
+            let result = CodeQueryResult {
+                depth_bound_status: status,
+                ..Default::default()
+            };
+            assert_eq!(result.render_text(), expected);
+        }
+    }
 }

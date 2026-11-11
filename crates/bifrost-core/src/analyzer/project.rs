@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use walkdir::WalkDir;
 
 /// Default upper bound (8 MiB) on the size of a single in-memory overlay.
 /// Picked to cover all hand-written source comfortably while bounding the
@@ -27,6 +26,48 @@ use walkdir::WalkDir;
 /// path per `OVERLAY_REJECTION_LOG_THROTTLE`); reads fall through to disk
 /// instead.
 pub const DEFAULT_MAX_OVERLAY_BYTES: usize = 8 * 1024 * 1024;
+
+static NEXT_PROJECT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_project_view_id() -> u64 {
+    NEXT_PROJECT_VIEW_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("project view id space exhausted")
+}
+
+/// An owner-local view revision, optionally paired with the view it wraps.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProjectViewStamp {
+    view_id: u64,
+    generation: u64,
+    delegate: Option<Box<ProjectViewStamp>>,
+}
+
+impl ProjectViewStamp {
+    /// Frame this process-local view identity for in-memory request keys only.
+    pub fn hash_into(&self, hash: &mut crate::analyzer::canonical_hash::CanonicalHasher) {
+        let mut cursor = Some(self);
+        while let Some(stamp) = cursor {
+            hash.field("view_id", &stamp.view_id.to_be_bytes());
+            hash.field("generation", &stamp.generation.to_be_bytes());
+            cursor = stamp.delegate.as_deref();
+            hash.field("has_delegate", &[u8::from(cursor.is_some())]);
+        }
+    }
+
+    fn own(view_id: u64, generation: u64) -> Self {
+        Self {
+            view_id,
+            generation,
+            delegate: None,
+        }
+    }
+
+    fn over(mut self, delegate: ProjectViewStamp) -> Self {
+        self.delegate = Some(Box::new(delegate));
+        self
+    }
+}
 
 /// Minimum interval between stderr lines reporting an oversized overlay for
 /// the same path. didChange fires per-keystroke, so an editor parked on a
@@ -506,6 +547,29 @@ pub trait Project: AsProject + Send + Sync {
         self.selected_module_name(file)
     }
 
+    /// Whether the selected generation lists a target root.
+    fn selected_configuration_lists_path(&self, path: &Path) -> bool {
+        self.root().join(path).is_file()
+    }
+
+    /// Immutable selected configuration storage charged by the naming owner.
+    fn selected_configuration_retained_bytes(&self) -> usize {
+        0
+    }
+
+    /// Exact bytes of a configuration input. A store-backed project answers
+    /// from the configuration its generation selected (the build capture, then
+    /// the published store) and never from the live filesystem. A project that
+    /// is not store-backed has no generations, so its own files are the
+    /// authority.
+    fn selected_configuration_bytes(&self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        match self.read_file_snapshot(&ProjectFile::new(self.root(), path)) {
+            Ok(snapshot) => Ok(Some(snapshot.bytes().to_vec())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Read optional configuration using an existing store read. Store-backed
     /// projects select retained bytes through this connection, including absence.
     fn configuration_source_with_conn(
@@ -534,6 +598,28 @@ pub trait Project: AsProject + Send + Sync {
     }
     fn analyzer_languages(&self) -> BTreeSet<Language>;
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>>;
+    /// Visible immediate file and directory entries from this project's authoritative view.
+    /// Disk enumeration owners override this to avoid a workspace walk.
+    fn directory_entries(&self, parent: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+        let mut entries = BTreeSet::new();
+        for file in self.authoritative_files()? {
+            let mut path = file.rel_path();
+            while let Some(ancestor) = path.parent() {
+                if ancestor == parent {
+                    entries.insert(ProjectFile::new(self.root(), path));
+                    break;
+                }
+                path = ancestor;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Recheck membership against the current project view without using a
+    /// cached or constructor-seeded listing.
+    fn authoritative_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.all_files()
+    }
     /// Share one immutable whole-workspace listing when the project owns a
     /// listing cache. The default preserves custom project implementations.
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
@@ -541,6 +627,39 @@ pub trait Project: AsProject + Send + Sync {
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
         self.all_files().map(Arc::new)
+    }
+    /// Read cached omissions without starting a workspace walk. None means
+    /// completeness cannot be certified from this project on a point update.
+    fn cached_omissions_if_available(&self) -> io::Result<Option<Arc<Vec<WorkspaceFileOmission>>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        Ok(None)
+    }
+    fn cached_listing_if_available(&self) -> io::Result<Option<SharedWorkspaceFileListing>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        Ok(None)
+    }
+    fn cached_analyzable_files_from(
+        &self,
+        _files: &BTreeSet<ProjectFile>,
+        _language: Language,
+    ) -> io::Result<Option<BTreeSet<ProjectFile>>> {
+        let _project_read = listing_read(self);
+        Ok(None)
+    }
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+        self.all_files_shared().map(|files| {
+            (
+                files,
+                Arc::new(vec![WorkspaceFileOmission {
+                    path: PathBuf::new(),
+                    reason: WorkspaceFileOmissionReason::Unknown,
+                }]),
+            )
+        })
     }
     /// Whole-workspace file listings this project instance has performed --
     /// the per-instance complexity signal pinned by the issue #1325 regression
@@ -644,6 +763,23 @@ pub trait Project: AsProject + Send + Sync {
     /// without a listing cache ignore it.
     fn invalidate_cached_file_listing(&self) {}
 
+    /// Revision of the mutable project view, if its owner can certify one.
+    fn view_stamp(&self) -> Option<ProjectViewStamp> {
+        None
+    }
+
+    /// Whether the exact reported name exists, including omitted entries.
+    fn has_exact_directory_entry(&self, file: &ProjectFile) -> io::Result<bool> {
+        Ok(self
+            .directory_entries(file.rel_path().parent().expect("file parent"))?
+            .contains(file))
+    }
+
+    /// Patch an exact member already admitted by the directory view.
+    fn update_cached_listing_for_resolved_path(&self, file: &ProjectFile) -> bool {
+        self.update_cached_listing_for_path(file.rel_path())
+    }
+
     /// Update a cached whole-workspace listing for one created, removed or
     /// renamed path without walking the workspace. Returns `false` when the
     /// project cannot decide that path alone, and the caller then invalidates
@@ -651,6 +787,13 @@ pub trait Project: AsProject + Send + Sync {
     fn update_cached_listing_for_path(&self, _rel_path: &Path) -> bool {
         false
     }
+
+    /// Drop the cached listing when a cached symlink omission's reason or
+    /// target no longer matches. A target can change with no event on the
+    /// link, so this rechecks the links that `changed` can affect, and every
+    /// link whose target lies outside the workspace or did not resolve.
+    /// Projects without a listing cache do nothing.
+    fn revalidate_symlink_omissions(&self, _changed: &BTreeSet<ProjectFile>) {}
 
     /// Read the source text of `file`. Default reads from disk and decodes it
     /// with [`decode_source_bytes`].
@@ -755,11 +898,259 @@ pub trait Project: AsProject + Send + Sync {
     }
 
     /// Monotonic process-local generation for source that can change behind
-    /// an analyzer. Immutable/disk projects use zero because analyzer updates
-    /// already create a fresh cache owner.
+    /// an analyzer. Every analyzer memo relies on this invariant: content the
+    /// analyzer can observe changes only with a new analyzer, a replaced memo
+    /// bundle, or an advance of this generation. Immutable/disk projects use
+    /// zero because analyzer updates already create a fresh cache owner.
+    /// Neither zero nor nonzero is a test of a project's capabilities.
     fn analysis_generation(&self) -> u64 {
         0
     }
+}
+
+fn disk_has_exact_directory_entry(file: &ProjectFile) -> io::Result<bool> {
+    for entry in std::fs::read_dir(file.abs_path().parent().expect("file parent"))? {
+        if entry?.file_name() == file.rel_path().file_name().expect("file name") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn disk_directory_entries(
+    project: &dyn Project,
+    parent: &Path,
+) -> io::Result<BTreeSet<ProjectFile>> {
+    let root = project.root();
+    let owned = AnalyzerOwnedPaths::new(root);
+    let repo = crate::gitblob::discover(root);
+    let membership = repo
+        .as_ref()
+        .map(crate::gitblob::WorkingTreeMembership::new)
+        .transpose()
+        .map_err(io::Error::other)?;
+    let mut files = BTreeSet::new();
+    for entry in WalkBuilder::new(root.join(parent))
+        .max_depth(Some(1))
+        .hidden(false)
+        .ignore(false)
+        .require_git(false)
+        .git_ignore(repo.is_none())
+        .git_global(repo.is_none())
+        .git_exclude(repo.is_none())
+        .build()
+    {
+        let entry = entry.map_err(io::Error::other)?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .is_some_and(|kind| kind.is_file() || kind.is_dir())
+            || owned.contains(path)
+        {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("directory entry belongs to project");
+        if relative.to_str().is_none() {
+            continue;
+        }
+        // Git point membership accepts files, not directory containers.
+        // Keep containers traversable; the final file probe still enforces
+        // ignored paths and nested-repository membership.
+        if let Some(repo) = &repo
+            && entry.file_type().is_some_and(|kind| kind.is_file())
+        {
+            let workdir = repo
+                .workdir()
+                .ok_or_else(|| io::Error::other("repository has no working directory"))?;
+            let workdir_relative = path.strip_prefix(workdir).map_err(io::Error::other)?;
+            if !membership
+                .as_ref()
+                .expect("repository membership")
+                .contains(workdir_relative)
+                .map_err(io::Error::other)?
+            {
+                continue;
+            }
+        }
+        files.insert(ProjectFile::new(root, relative));
+    }
+    Ok(files)
+}
+
+/// Resolve reported updates, retrying against fresh membership when needed.
+///
+/// `explicitly_read` names analyzer-owned inputs that a reader opens by path
+/// even when the project's ignore rules omit them from enumeration, such as a
+/// build file a language captures as configuration. An omitted entry named by
+/// `explicitly_read` is admitted under its exact spelling without refreshing
+/// the listing: it is an input, not a workspace member.
+pub fn resolve_update_paths_with_refresh(
+    project: &dyn Project,
+    changed: &BTreeSet<ProjectFile>,
+    listing: &mut SharedWorkspaceFileListing,
+    explicitly_read: &dyn Fn(&ProjectFile) -> bool,
+) -> io::Result<BTreeSet<ProjectFile>> {
+    let (resolved, mut refresh, explicit_inputs) =
+        resolve_update_paths_with_explicit_inputs(project, changed, &listing.0, explicitly_read)?;
+    let mut patched = false;
+    for file in resolved.iter().filter(|file| {
+        !listing.0.contains(*file) && file.exists() && !explicit_inputs.contains(*file)
+    }) {
+        // The directory view established the exact spelling. The project point
+        // update reuses that admission and applies the cache's omission checks.
+        if project.update_cached_listing_for_resolved_path(file) {
+            patched = true;
+        } else {
+            // No cache, or membership/omission status cannot be certified alone.
+            refresh = true;
+        }
+    }
+    if !refresh {
+        if patched {
+            *listing = project.all_files_with_omissions()?;
+        }
+        return Ok(resolved);
+    }
+    project.invalidate_cached_file_listing();
+    *listing = project.all_files_with_omissions()?;
+    Ok(resolve_update_paths_with_explicit_inputs(project, changed, &listing.0, explicitly_read)?.0)
+}
+
+/// Resolve watcher spellings before any update consumer publishes paths.
+/// An unresolved existing name invalidates membership evidence; it is never admitted.
+pub fn resolve_update_paths(
+    project: &dyn Project,
+    changed: &BTreeSet<ProjectFile>,
+    listed: &BTreeSet<ProjectFile>,
+) -> io::Result<(BTreeSet<ProjectFile>, bool)> {
+    let (resolved, refresh, _) =
+        resolve_update_paths_with_explicit_inputs(project, changed, listed, &|_| false)?;
+    Ok((resolved, refresh))
+}
+
+/// Resolve update paths and report the inputs admitted despite enumeration
+/// omitting them. The third set holds those paths so a caller can keep them
+/// out of any listing patch.
+fn resolve_update_paths_with_explicit_inputs(
+    project: &dyn Project,
+    changed: &BTreeSet<ProjectFile>,
+    listed: &BTreeSet<ProjectFile>,
+    explicitly_read: &dyn Fn(&ProjectFile) -> bool,
+) -> io::Result<(BTreeSet<ProjectFile>, bool, BTreeSet<ProjectFile>)> {
+    let mut resolved = BTreeSet::new();
+    let mut refresh_listing = false;
+    let mut explicit_inputs = BTreeSet::new();
+    let mut directories = HashMap::new();
+    for file in changed {
+        if listed.contains(file) || project.has_overlay(file) || !file.exists() {
+            resolved.insert(file.clone());
+            continue;
+        }
+        let result = (|| -> io::Result<_> {
+            let mut path_resolved = BTreeSet::new();
+            let mut canonical_parent = PathBuf::new();
+            let mut missing_parent = false;
+            for component in file
+                .rel_path()
+                .parent()
+                .expect("project file has a parent")
+                .components()
+            {
+                let candidate = ProjectFile::new(project.root(), canonical_parent.join(component));
+                let entries = match directories.entry(canonical_parent.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(project.directory_entries(&canonical_parent)?)
+                    }
+                };
+                if entries.contains(&candidate) {
+                    canonical_parent.push(component);
+                    continue;
+                }
+                let mut matching = None;
+                for entry in entries.iter() {
+                    if same_file::is_same_file(candidate.abs_path(), entry.abs_path())? {
+                        matching = Some(entry.rel_path().to_path_buf());
+                        break;
+                    }
+                }
+                match matching {
+                    Some(parent) => canonical_parent = parent,
+                    None => {
+                        // Enumeration can omit an ignored directory and
+                        // everything under it. An input the analyzer reads by
+                        // path still reaches its exact spelling; it is not
+                        // admitted as a listing member.
+                        let reported =
+                            ProjectFile::new(project.root(), file.rel_path().to_path_buf());
+                        if explicitly_read(&reported)
+                            && project.has_exact_directory_entry(&reported)?
+                        {
+                            explicit_inputs.insert(reported.clone());
+                            path_resolved.insert(reported);
+                            return Ok((path_resolved, false));
+                        }
+                        missing_parent = true;
+                        break;
+                    }
+                }
+            }
+            if missing_parent {
+                return Ok((path_resolved, true));
+            }
+            let canonical_file = ProjectFile::new(
+                project.root(),
+                canonical_parent.join(
+                    file.rel_path()
+                        .file_name()
+                        .expect("project file has a name"),
+                ),
+            );
+            let parent = canonical_parent.as_path();
+            let entries = match directories.entry(parent.to_path_buf()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(project.directory_entries(parent)?)
+                }
+            };
+            if entries.contains(&canonical_file) {
+                path_resolved.insert(canonical_file);
+                return Ok((path_resolved, false));
+            }
+            // An omitted real entry is membership evidence, never a spelling
+            // alias. Enumeration must retain its omission evidence. An input
+            // the analyzer reads by path is the exception: ignore rules are
+            // what hide it from enumeration, and its edit must still reach the
+            // reader. It stays out of the listing.
+            if project.has_exact_directory_entry(&canonical_file)? {
+                if explicitly_read(&canonical_file) {
+                    explicit_inputs.insert(canonical_file.clone());
+                    path_resolved.insert(canonical_file);
+                    return Ok((path_resolved, false));
+                }
+                return Ok((path_resolved, true));
+            }
+            let mut matched = false;
+            for entry in entries.iter() {
+                if listed.contains(entry)
+                    && same_file::is_same_file(file.abs_path(), entry.abs_path())?
+                {
+                    path_resolved.insert(entry.clone());
+                    matched = true;
+                }
+            }
+            Ok((path_resolved, !matched))
+        })();
+        let (paths, refresh) = result?;
+        resolved.extend(paths);
+        refresh_listing |= refresh;
+    }
+    Ok((resolved, refresh_listing, explicit_inputs))
 }
 
 fn read_disk_file_snapshot(file: &ProjectFile) -> io::Result<ProjectFileSnapshot> {
@@ -899,6 +1290,14 @@ fn filesystem_has_directory(root: &Path, rel_path: &Path) -> bool {
 }
 
 impl Project for TestProject {
+    fn has_exact_directory_entry(&self, file: &ProjectFile) -> io::Result<bool> {
+        disk_has_exact_directory_entry(file)
+    }
+
+    fn directory_entries(&self, parent: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+        disk_directory_entries(self, parent)
+    }
+
     fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -954,27 +1353,18 @@ impl Project for TestProject {
     }
 
     fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.all_files_with_omissions()
+            .map(|(files, _)| (*files).clone())
+    }
+
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
         self.listing_count.fetch_add(1, Ordering::Relaxed);
-        let mut files = BTreeSet::new();
-
-        for entry in WalkDir::new(&self.root) {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let rel = entry
-                .path()
-                .strip_prefix(&self.root)
-                .expect("walkdir returned a path outside the project root");
-            files.insert(ProjectFile::new(self.root.clone(), rel.to_path_buf()));
-        }
-
-        publish_file_set(self, &files)?;
-        Ok(files)
+        let listing = collect_workspace_files_with_omissions(&self.root)?;
+        publish_file_set(self, &listing.files)?;
+        Ok((Arc::new(listing.files), Arc::new(listing.omissions)))
     }
 
     fn has_directory(&self, rel_path: &Path) -> bool {
@@ -997,13 +1387,7 @@ impl Project for TestProject {
         let files = self.all_files()?;
         Ok(files
             .into_iter()
-            .filter(|file| {
-                file.rel_path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| extensions.contains(&ext))
-                    .unwrap_or(false)
-            })
+            .filter(|file| file.language() == language)
             .collect())
     }
 
@@ -1037,7 +1421,7 @@ impl Project for TestProject {
 /// The cache owns only its own mutex, held for at most one walk's duration, so
 /// readers never block behind session write locks held during watcher-delta
 /// re-analysis, and a cold cache fills without waiting for the analyzer index
-/// build. `invalidate` touches only an atomic and never blocks. Refills go
+/// build. `invalidate` serializes with refills and path updates. Refills go
 /// through [`collect_workspace_files`], so the git-index union is recomputed
 /// together with the ignore-aware walk: tracked files shadowed by broad ignore
 /// patterns stay listed after invalidation.
@@ -1045,6 +1429,7 @@ impl Project for TestProject {
 pub struct WorkspaceFileListingCache {
     project_reads: ProjectReadSlot,
     root: PathBuf,
+    view_id: u64,
     generation: AtomicU64,
     walks: AtomicUsize,
     cached: Mutex<Option<CachedFileListing>>,
@@ -1054,6 +1439,10 @@ pub struct WorkspaceFileListingCache {
 struct CachedFileListing {
     generation: u64,
     files: Arc<BTreeSet<ProjectFile>>,
+    omissions: Arc<Vec<WorkspaceFileOmission>>,
+    /// The resolved target of each symlink in `omissions`, for
+    /// [`WorkspaceFileListingCache::revalidate_symlink_omissions`].
+    symlinks: Arc<SymlinkTargets>,
     matcher: Arc<BifrostIgnoreMatcher>,
     receipt: ProjectReadReceipt,
 }
@@ -1067,7 +1456,11 @@ impl WorkspaceFileListingCache {
         );
         Self {
             project_reads: ProjectReadSlot::default(),
-            root,
+            // `FilesystemProject::with_cached_listing` normalizes its root, so
+            // the cache stores the same spelling: on Windows a canonicalized
+            // root is verbatim (`\\?\C:\...`) until `normalize` collapses it.
+            root: root.normalize(),
+            view_id: next_project_view_id(),
             generation: AtomicU64::new(0),
             walks: AtomicUsize::new(0),
             cached: Mutex::new(None),
@@ -1079,19 +1472,64 @@ impl WorkspaceFileListingCache {
     }
 
     /// Drop the cached listing. The next `files` call re-walks the root and
-    /// re-unions the git index. Never blocks, so watcher event handlers can
-    /// call it inline.
+    /// re-unions the git index. Serialization with fills and path updates
+    /// ensures the listing epoch advances with the mutation.
     pub fn invalidate(&self) {
+        let mut slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        *slot = None;
         self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn view_stamp(&self) -> ProjectViewStamp {
+        let _slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        ProjectViewStamp::own(self.view_id, self.generation.load(Ordering::Acquire))
     }
 
     /// The current listing, walking the root only when no fresh listing is
     /// cached. Concurrent callers serialize on the internal mutex, so a cold
-    /// cache is filled by exactly one walk. The generation is sampled before
-    /// the walk: an `invalidate` racing with the fill leaves the stored entry
-    /// stale-marked, so the next call re-walks instead of serving a listing
-    /// that may predate the change.
+    /// cache is filled by exactly one walk. Invalidation serializes with that
+    /// fill and clears it if the invalidation follows the walk.
     pub fn files(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.listing().map(|(files, _)| files)
+    }
+
+    fn cached_analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> Option<BTreeSet<ProjectFile>> {
+        let slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        let cached = slot.as_ref()?;
+        if cached.generation != self.generation.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(
+            files_for_language(files, language, ProjectFile::language)
+                .into_iter()
+                .filter(|file| !cached.matcher.is_ignored(file))
+                .collect(),
+        )
+    }
+    pub fn cached_listing(&self) -> Option<SharedWorkspaceFileListing> {
+        let slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        let cached = slot.as_ref()?;
+        (cached.generation == self.generation.load(Ordering::Acquire))
+            .then(|| (Arc::clone(&cached.files), Arc::clone(&cached.omissions)))
+    }
+
+    pub fn listing(&self) -> io::Result<SharedWorkspaceFileListing> {
         self.project_reads.cached_inventory(&self.root, || {
             let mut slot = self
                 .cached
@@ -1102,20 +1540,26 @@ impl WorkspaceFileListingCache {
                 && cached.generation == generation
             {
                 publish_receipt(cached.receipt.clone());
-                return Ok(Arc::clone(&cached.files));
+                return Ok((Arc::clone(&cached.files), Arc::clone(&cached.omissions)));
             }
             self.walks.fetch_add(1, Ordering::Relaxed);
-            let files = Arc::new(collect_workspace_files(&self.root)?);
+            let listing = collect_workspace_files_with_omissions(&self.root)?;
+            let files = Arc::new(listing.files);
+            let omissions = Arc::new(listing.omissions);
+            let symlinks = Arc::new(listing.symlinks);
             let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
             let receipt = matcher.listing_receipt();
+            let generation = self.generation.fetch_add(1, Ordering::Release) + 1;
             *slot = Some(CachedFileListing {
                 generation,
                 files: Arc::clone(&files),
+                omissions: Arc::clone(&omissions),
+                symlinks,
                 matcher,
                 receipt: receipt.clone(),
             });
             publish_receipt(receipt);
-            Ok(files)
+            Ok((files, omissions))
         })
     }
 
@@ -1135,6 +1579,60 @@ impl WorkspaceFileListingCache {
         }
     }
 
+    /// Invalidate cached omissions whose symlink targets changed since listing.
+    ///
+    /// A target can change with no event on the link, so a link is rechecked
+    /// when a path in `changed` equals its target or one of the ancestors of
+    /// its target or of itself; an index built with the listing finds those
+    /// links from the changed paths. A link whose target lies outside the
+    /// workspace, or did not resolve, has no workspace event to wait for and is
+    /// rechecked on every update (two `stat` calls and a `canonicalize`). Every
+    /// other link costs nothing. A link that is itself a changed
+    /// path invalidates through [`Self::update_path`]. The check holds no cache
+    /// lock. A target outside the workspace that changes with no update at all
+    /// is seen at the next update, like any other unwatched input.
+    pub fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        let (omissions, symlinks) = {
+            let slot = self
+                .cached
+                .lock()
+                .expect("workspace file listing cache poisoned");
+            let Some(cached) = slot.as_ref() else {
+                return;
+            };
+            (Arc::clone(&cached.omissions), Arc::clone(&cached.symlinks))
+        };
+        let changed = symlinks.affected_by(changed).any(|link| {
+            #[cfg(any(test, feature = "test-support"))]
+            super::project_reads::count_project_io(super::project_reads::ProjectIo::SymlinkRecheck);
+            let absolute = self.root.join(&link.path);
+            !absolute
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_symlink())
+                || {
+                    let now =
+                        classify_symlink(&symlinks.canonical_root, &absolute, link.path.clone());
+                    now.reason != link.reason || now.target != link.target
+                }
+        });
+        if !changed {
+            return;
+        }
+        let mut slot = self
+            .cached
+            .lock()
+            .expect("workspace file listing cache poisoned");
+        // A walk meanwhile gives fresh omissions; a point patch keeps the
+        // checked ones, which are stale.
+        if slot
+            .as_ref()
+            .is_some_and(|cached| Arc::ptr_eq(&cached.omissions, &omissions))
+        {
+            *slot = None;
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// Record one path's membership in the cached listing without walking.
     ///
     /// Returns `false` when the caller must invalidate instead: the listing
@@ -1143,6 +1641,52 @@ impl WorkspaceFileListingCache {
     /// fresh listing is cached there is nothing to update: the next
     /// [`Self::files`] walks anyway, so that also succeeds.
     pub fn update_path(&self, file: &ProjectFile, listed: bool) -> bool {
+        self.update_path_in(&TestProject::new(file.root(), Language::None), file, listed)
+    }
+
+    /// Patch membership using the owning project's visible directory view.
+    pub fn update_path_in(&self, project: &dyn Project, file: &ProjectFile, listed: bool) -> bool {
+        if listed {
+            let files = {
+                let slot = self
+                    .cached
+                    .lock()
+                    .expect("workspace file listing cache poisoned");
+                slot.as_ref().map(|cached| Arc::clone(&cached.files))
+            };
+            if let Some(files) = files {
+                let Ok((paths, refresh)) =
+                    resolve_update_paths(project, &BTreeSet::from([file.clone()]), &files)
+                else {
+                    return false;
+                };
+                if refresh {
+                    return false;
+                }
+                if !paths.contains(file) {
+                    return true;
+                }
+            }
+        }
+        self.update_resolved_path(file, listed)
+    }
+
+    fn update_resolved_path(&self, file: &ProjectFile, listed: bool) -> bool {
+        // A point update cannot certify an omission's cause. Re-list when a
+        // watcher sees a path whose metadata may be skipped by enumeration.
+        if file.rel_path().to_str().is_none()
+            || file
+                .abs_path()
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_symlink())
+            || listed
+                && !file
+                    .abs_path()
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            return false;
+        }
         let mut slot = self
             .cached
             .lock()
@@ -1190,6 +1734,8 @@ impl WorkspaceFileListingCache {
         let receipt = cached.matcher.receipt_for(&files);
         cached.files = files;
         cached.receipt = receipt;
+        let next = self.generation.fetch_add(1, Ordering::Release) + 1;
+        cached.generation = next;
         true
     }
 
@@ -1210,6 +1756,7 @@ struct IgnoreRulesSnapshot {
 #[derive(Debug, Clone)]
 pub struct FilesystemProject {
     project_reads: ProjectReadSlot,
+    view_id: u64,
     root: PathBuf,
     languages: BTreeSet<Language>,
     listing_count: Arc<AtomicUsize>,
@@ -1217,8 +1764,15 @@ pub struct FilesystemProject {
     /// The constructor's discovery walk is a useful build seed, but only for
     /// the first consumer. Manual sessions deliberately return to fresh walks
     /// after that one use rather than retaining a stale cache.
-    initial_listing: Arc<Mutex<Option<Arc<BTreeSet<ProjectFile>>>>>,
+    initial_listing: Arc<Mutex<InitialListing>>,
     bifrost_ignore: Arc<Mutex<Option<IgnoreRulesSnapshot>>>,
+}
+
+#[derive(Debug)]
+struct InitialListing {
+    files: Option<Arc<BTreeSet<ProjectFile>>>,
+    omissions: Arc<Vec<WorkspaceFileOmission>>,
+    epoch: u64,
 }
 
 impl FilesystemProject {
@@ -1242,11 +1796,16 @@ impl FilesystemProject {
         let receipt = matcher.listing_receipt();
         Self {
             project_reads: ProjectReadSlot::default(),
+            view_id: next_project_view_id(),
             root: root.to_path_buf(),
             languages: detect_languages_in_files(&files),
             listing_count: Arc::new(AtomicUsize::new(0)),
             cached_listing: None,
-            initial_listing: Arc::new(Mutex::new(Some(files))),
+            initial_listing: Arc::new(Mutex::new(InitialListing {
+                files: Some(files),
+                omissions: Arc::new(Vec::new()),
+                epoch: 0,
+            })),
             bifrost_ignore: Arc::new(Mutex::new(Some(IgnoreRulesSnapshot { matcher, receipt }))),
         }
     }
@@ -1260,9 +1819,15 @@ impl FilesystemProject {
             ));
         }
 
-        let files = Arc::new(collect_workspace_files(&root)?);
+        let listing = collect_workspace_files_with_omissions(&root)?;
+        let files = Arc::new(listing.files);
         let matcher = Arc::new(BifrostIgnoreMatcher::build(&root, &files)?);
         let project = Self::from_listing_and_matcher(&root, Arc::clone(&files), matcher);
+        project
+            .initial_listing
+            .lock()
+            .expect("initial listing lock")
+            .omissions = Arc::new(listing.omissions);
         Ok(project)
     }
 
@@ -1286,9 +1851,14 @@ impl FilesystemProject {
             listing.root(),
             "cached listing root must match the canonical project root"
         );
-        let files = listing.files()?;
+        let (files, omissions) = listing.listing()?;
         let matcher = listing.matcher()?;
         let mut project = Self::from_listing_and_matcher(&root, files, matcher);
+        project
+            .initial_listing
+            .lock()
+            .expect("initial listing lock")
+            .omissions = omissions;
         project.cached_listing = Some(listing);
         Ok(project)
     }
@@ -1355,18 +1925,48 @@ impl FilesystemProject {
         Ok(Some(Arc::clone(&snapshot.matcher)))
     }
 
-    fn take_initial_listing(&self) -> Option<Arc<BTreeSet<ProjectFile>>> {
+    fn take_initial_listing(&self) -> Option<SharedWorkspaceFileListing> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        self.initial_listing
+        let mut initial = self
+            .initial_listing
             .lock()
-            .expect("initial workspace listing mutex poisoned")
+            .expect("initial workspace listing mutex poisoned");
+        let files = initial
+            .files
             .take()
+            .map(|files| (files, Arc::clone(&initial.omissions)));
+        if files.is_some() {
+            initial.epoch = initial
+                .epoch
+                .checked_add(1)
+                .expect("listing epoch exhausted");
+        }
+        files
     }
 }
 
 impl Project for FilesystemProject {
+    fn has_exact_directory_entry(&self, file: &ProjectFile) -> io::Result<bool> {
+        disk_has_exact_directory_entry(file)
+    }
+
+    fn directory_entries(&self, parent: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+        disk_directory_entries(self, parent)
+    }
+
+    fn view_stamp(&self) -> Option<ProjectViewStamp> {
+        let initial = self
+            .initial_listing
+            .lock()
+            .expect("initial workspace listing mutex poisoned");
+        let own = ProjectViewStamp::own(self.view_id, initial.epoch);
+        Some(match &self.cached_listing {
+            Some(cache) => own.over(cache.view_stamp()),
+            None => own,
+        })
+    }
     fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -1433,44 +2033,103 @@ impl Project for FilesystemProject {
         self.all_files_shared().map(|files| (*files).clone())
     }
 
+    fn authoritative_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        collect_workspace_files(&self.root)
+    }
+
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.all_files_with_omissions().map(|(files, _)| files)
+    }
+
+    fn cached_omissions_if_available(&self) -> io::Result<Option<Arc<Vec<WorkspaceFileOmission>>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        Ok(self
+            .cached_listing
+            .as_ref()
+            .and_then(|cache| cache.cached_listing().map(|(_, omissions)| omissions)))
+    }
+    fn cached_listing_if_available(&self) -> io::Result<Option<SharedWorkspaceFileListing>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        Ok(self
+            .cached_listing
+            .as_ref()
+            .and_then(|cache| cache.cached_listing()))
+    }
+    fn cached_analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> io::Result<Option<BTreeSet<ProjectFile>>> {
+        let _project_read = listing_read(self);
+        Ok(self
+            .cached_listing
+            .as_ref()
+            .and_then(|cache| cache.cached_analyzable_files_from(files, language)))
+    }
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
         self.listing_count.fetch_add(1, Ordering::Relaxed);
         if let Some(cache) = &self.cached_listing {
-            return cache.files();
+            return cache.listing();
         }
-        let files = if let Some(files) = self.take_initial_listing() {
-            files
-        } else {
-            let files = Arc::new(collect_workspace_files(&self.root)?);
-            let mut slot = self
-                .bifrost_ignore
-                .lock()
-                .expect("Bifrost ignore matcher lock poisoned");
-            if let Some(snapshot) = slot.as_mut() {
-                // Fresh file discovery does not invalidate ignore rules. Keep
-                // the matcher until explicit invalidation, but certify this
-                // walk's files using the rules that will filter them.
-                snapshot.receipt = snapshot.matcher.receipt_for(&files);
-            } else {
-                let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
-                let receipt = matcher.listing_receipt();
-                *slot = Some(IgnoreRulesSnapshot { matcher, receipt });
+        let (files, omissions, walked) = match self.take_initial_listing() {
+            Some((files, omissions)) => (files, omissions, false),
+            None => {
+                let listing = collect_workspace_files_with_omissions(&self.root)?;
+                (Arc::new(listing.files), Arc::new(listing.omissions), true)
             }
-            files
         };
-        let receipt = self
+        // Read the receipt under the same lock that fills the matcher. The
+        // watcher's `invalidate_cached_file_listing` clears the matcher on its
+        // own lock, so a second lock acquisition here could find it gone and
+        // had to panic. A matcher cleared after the seed was taken is rebuilt
+        // over that seed, exactly as a walk rebuilds one over its own files.
+        let mut slot = self
             .bifrost_ignore
             .lock()
-            .expect("Bifrost ignore matcher lock poisoned")
-            .as_ref()
-            .expect("listing filled matcher")
-            .receipt
-            .clone();
+            .expect("Bifrost ignore matcher lock poisoned");
+        let receipt = match slot.as_mut() {
+            Some(snapshot) => {
+                if walked {
+                    // Fresh file discovery does not invalidate ignore rules.
+                    // Keep the matcher until explicit invalidation, but
+                    // certify this walk's files using the rules that will
+                    // filter them.
+                    snapshot.receipt = snapshot.matcher.receipt_for(&files);
+                }
+                snapshot.receipt.clone()
+            }
+            None => {
+                let matcher = Arc::new(BifrostIgnoreMatcher::build(&self.root, &files)?);
+                let receipt = matcher.listing_receipt();
+                *slot = Some(IgnoreRulesSnapshot {
+                    matcher,
+                    receipt: receipt.clone(),
+                });
+                receipt
+            }
+        };
+        drop(slot);
         publish_receipt(receipt);
-        Ok(files)
+        Ok((files, omissions))
+    }
+
+    fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        if let Some(cache) = &self.cached_listing {
+            cache.revalidate_symlink_omissions(changed);
+        }
+    }
+
+    fn update_cached_listing_for_resolved_path(&self, file: &ProjectFile) -> bool {
+        self.cached_listing
+            .as_ref()
+            .is_some_and(|cache| cache.update_resolved_path(file, true))
     }
 
     fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
@@ -1497,20 +2156,26 @@ impl Project for FilesystemProject {
         let Ok(listed) = crate::gitblob::working_tree_path_is_listed(&repo, workdir_rel) else {
             return false;
         };
-        cache.update_path(
+        cache.update_path_in(
+            self,
             &ProjectFile::new(self.root.clone(), rel_path.to_path_buf()),
             listed,
         )
     }
 
     fn invalidate_cached_file_listing(&self) {
+        let mut initial = self
+            .initial_listing
+            .lock()
+            .expect("initial workspace listing mutex poisoned");
+        initial.files = None;
+        initial.epoch = initial
+            .epoch
+            .checked_add(1)
+            .expect("listing epoch exhausted");
         if let Some(cache) = &self.cached_listing {
             cache.invalidate();
         }
-        *self
-            .initial_listing
-            .lock()
-            .expect("initial workspace listing mutex poisoned") = None;
         *self
             .bifrost_ignore
             .lock()
@@ -1930,6 +2595,115 @@ impl Project for MultiRootProject {
         Ok(files)
     }
 
+    fn cached_omissions_if_available(&self) -> io::Result<Option<Arc<Vec<WorkspaceFileOmission>>>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        let mut omissions = Vec::new();
+        for root in &self.roots {
+            let Some(rows) = root.cached_omissions_if_available()? else {
+                return Ok(None);
+            };
+            omissions.extend(rows.iter().map(|omission| {
+                WorkspaceFileOmission {
+                    path: root
+                        .root()
+                        .strip_prefix(&self.root)
+                        .expect("child root belongs to common root")
+                        .join(&omission.path),
+                    reason: omission.reason,
+                }
+            }));
+        }
+        Ok(Some(Arc::new(omissions)))
+    }
+    fn cached_listing_if_available(&self) -> io::Result<Option<SharedWorkspaceFileListing>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        let mut files = BTreeSet::new();
+        let mut omissions = Vec::new();
+        for root in &self.roots {
+            let Some((root_files, rows)) = root.cached_listing_if_available()? else {
+                return Ok(None);
+            };
+            files.extend(
+                root_files
+                    .iter()
+                    .cloned()
+                    .map(|file| self.common_file_for_root_file(file)),
+            );
+            omissions.extend(rows.iter().map(|omission| {
+                WorkspaceFileOmission {
+                    path: root
+                        .root()
+                        .strip_prefix(&self.root)
+                        .expect("child root belongs to common root")
+                        .join(&omission.path),
+                    reason: omission.reason,
+                }
+            }));
+        }
+        Ok(Some((Arc::new(files), Arc::new(omissions))))
+    }
+    fn cached_analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> io::Result<Option<BTreeSet<ProjectFile>>> {
+        let _project_read = listing_read(self);
+        let mut analyzable = BTreeSet::new();
+        for root in &self.roots {
+            let root_files = files
+                .iter()
+                .filter_map(|file| {
+                    let abs_path = file.abs_path();
+                    let rel = abs_path.strip_prefix(root.root()).ok()?;
+                    Some(ProjectFile::new(
+                        root.root().to_path_buf(),
+                        rel.to_path_buf(),
+                    ))
+                })
+                .collect();
+            let Some(rows) = root.cached_analyzable_files_from(&root_files, language)? else {
+                return Ok(None);
+            };
+            analyzable.extend(
+                rows.into_iter()
+                    .map(|file| self.common_file_for_root_file(file)),
+            );
+        }
+        Ok(Some(analyzable))
+    }
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        let mut files = BTreeSet::new();
+        let mut omissions = Vec::new();
+        for root in &self.roots {
+            let (root_files, root_omissions) = root.all_files_with_omissions()?;
+            files.extend(
+                root_files
+                    .iter()
+                    .cloned()
+                    .map(|file| self.common_file_for_root_file(file)),
+            );
+            omissions.extend(root_omissions.iter().map(|omission| {
+                WorkspaceFileOmission {
+                    path: root
+                        .root()
+                        .strip_prefix(&self.root)
+                        .expect("child root belongs to common root")
+                        .join(&omission.path),
+                    reason: omission.reason,
+                }
+            }));
+        }
+        publish_file_set(self, &files)?;
+        Ok((Arc::new(files), Arc::new(omissions)))
+    }
+
     fn workspace_file_listing_count(&self) -> usize {
         self.roots
             .iter()
@@ -2014,6 +2788,25 @@ impl Project for MultiRootProject {
         }
     }
 
+    fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        for root in &self.roots {
+            // Each child keeps its own listing cache, so it sees the changed
+            // paths relative to its own root; paths outside it are not its.
+            let root_changed = changed
+                .iter()
+                .filter_map(|file| {
+                    let abs_path = file.abs_path();
+                    let rel_path = abs_path.strip_prefix(root.root()).ok()?;
+                    Some(ProjectFile::new(
+                        root.root().to_path_buf(),
+                        rel_path.to_path_buf(),
+                    ))
+                })
+                .collect::<BTreeSet<_>>();
+            root.revalidate_symlink_omissions(&root_changed);
+        }
+    }
+
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
         let _project_read = self
             .project_read_slot()
@@ -2046,13 +2839,307 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
     Some(ancestor)
 }
 
+/// Analyzer-owned files beneath the selected workspace root. Construction
+/// resolves every spelling once: the root and each cache directory in lexical
+/// and canonical form, so a symlinked workspace root or cache directory
+/// matches. `contains` is then a lexical prefix test with no filesystem access,
+/// because it runs for every walked path.
+#[derive(Clone)]
+pub struct AnalyzerOwnedPaths {
+    cache_dirs: Vec<PathBuf>,
+    legacy_dirs: [PathBuf; 2],
+}
+
+impl AnalyzerOwnedPaths {
+    pub fn new(root: &Path) -> Self {
+        Self::with_cache_dir(root, gitblob::cache_dir_path(root))
+    }
+
+    fn with_cache_dir(root: &Path, effective_cache: PathBuf) -> Self {
+        let root = root.to_path_buf().normalize();
+        let canonical_root = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.clone())
+            .normalize();
+        let default_root = gitblob::discover(&root)
+            .as_ref()
+            .and_then(gitblob::primary_repo_root)
+            .unwrap_or_else(|| root.clone());
+        let default_cache = default_root
+            .join(gitblob::PROJECT_DIR_NAME)
+            .join(gitblob::CACHE_SUBDIR_NAME);
+        let mut cache_dirs = Vec::new();
+        for dir in [effective_cache, default_cache] {
+            add_directory_spellings(&mut cache_dirs, &root, &canonical_root, dir);
+        }
+        cache_dirs.sort_unstable();
+        cache_dirs.dedup();
+        Self {
+            cache_dirs,
+            legacy_dirs: [
+                root.join(gitblob::PROJECT_DIR_NAME),
+                canonical_root.join(gitblob::PROJECT_DIR_NAME),
+            ],
+        }
+    }
+
+    /// Extend the owned paths with one generated-state directory beneath
+    /// `root`. A workspace-local semantic-pack catalog is opened read-write by
+    /// the engine, so its SQLite files are analyzer state and must not look
+    /// like workspace edits to the watcher.
+    pub fn with_extra_directory(mut self, root: &Path, directory: PathBuf) -> Self {
+        let root = root.to_path_buf().normalize();
+        let canonical_root = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.clone())
+            .normalize();
+        add_directory_spellings(&mut self.cache_dirs, &root, &canonical_root, directory);
+        self.cache_dirs.sort_unstable();
+        self.cache_dirs.dedup();
+        self
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        let path = path.to_path_buf().normalize();
+        self.cache_dirs.iter().any(|dir| path.starts_with(dir))
+            || (path
+                .parent()
+                .is_some_and(|parent| self.legacy_dirs.iter().any(|dir| parent == dir))
+                && path
+                    .file_name()
+                    .is_some_and(crate::cache_db::is_legacy_project_cache_file_name))
+    }
+}
+
+fn add_directory_spellings(
+    owned_dirs: &mut Vec<PathBuf>,
+    root: &Path,
+    canonical_root: &Path,
+    dir: PathBuf,
+) {
+    let dir = if dir.is_absolute() {
+        dir
+    } else {
+        std::env::current_dir()
+            .expect("workspace collection has a current directory")
+            .join(dir)
+    }
+    .normalize();
+    let canonical = dir.canonicalize().map(NormalizePath::normalize);
+    // A directory that does not exist yet has no canonical form; rebasing it
+    // onto the other root spelling covers the paths a walk or a watcher
+    // reports once it is created.
+    for spelling in [Some(dir), canonical.ok()].into_iter().flatten() {
+        for (from, to) in [(root, canonical_root), (canonical_root, root)] {
+            if let Ok(relative) = spelling.strip_prefix(from) {
+                owned_dirs.push(spelling.clone());
+                owned_dirs.push(to.join(relative));
+            }
+        }
+    }
+}
+
 /// Collect every file under `root` that belongs to the analyzer's view of the
 /// workspace. The walk is ignore-aware, skips `.git/`, and keeps other dotted
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+    collect_workspace_files_with_omissions(root).map(|listing| listing.files)
+}
+
+/// A listing and the paths discarded by enumeration itself. Ignore rules are
+/// outside the listing universe and therefore do not produce omissions.
+#[derive(Debug)]
+pub struct WorkspaceFileListing {
+    pub files: BTreeSet<ProjectFile>,
+    pub omissions: Vec<WorkspaceFileOmission>,
+    /// Where each symlink omission resolved when the listing was built.
+    pub symlinks: SymlinkTargets,
+}
+
+/// The resolved target of every symlink omission of one listing, kept beside
+/// the omissions so that an update rechecks only the links a change can
+/// affect.
+#[derive(Debug, Default)]
+pub struct SymlinkTargets {
+    /// The canonical workspace root the targets were resolved against.
+    canonical_root: PathBuf,
+    links: Vec<SymlinkRecord>,
+    /// For each path that can alter an in-workspace link's classification, the
+    /// indices into `links` of the links it can alter: the link's target and
+    /// every ancestor of the target, the link itself and every ancestor of the
+    /// link (a directory removed, renamed or replaced).
+    by_path: HashMap<PathBuf, Vec<usize>>,
+    /// The links with no recorded path to wait for: a target outside the
+    /// workspace, through another symlink, or none. Every update rechecks them.
+    always: Vec<usize>,
+}
+
+impl SymlinkTargets {
+    fn new(canonical_root: PathBuf, links: Vec<SymlinkRecord>) -> Self {
+        let mut by_path: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        let mut always = Vec::new();
+        for (index, link) in links.iter().enumerate() {
+            match &link.target {
+                SymlinkTarget::Inside(target) => {
+                    for ancestor in target.ancestors().chain(link.path.ancestors()) {
+                        let indices = by_path.entry(ancestor.to_path_buf()).or_default();
+                        // The target and the link share their ancestors.
+                        if indices.last() != Some(&index) {
+                            indices.push(index);
+                        }
+                    }
+                }
+                SymlinkTarget::External | SymlinkTarget::Indirect | SymlinkTarget::Unresolved => {
+                    always.push(index);
+                }
+            }
+        }
+        Self {
+            canonical_root,
+            links,
+            by_path,
+            always,
+        }
+    }
+
+    /// The links a change to any path of `changed` can affect: the indexed
+    /// links that name a changed path, then the links that are always rechecked.
+    /// The cost follows the changed paths and the always-rechecked links, not
+    /// the number of links in the workspace.
+    fn affected_by<'a>(
+        &'a self,
+        changed: &BTreeSet<ProjectFile>,
+    ) -> impl Iterator<Item = &'a SymlinkRecord> {
+        let mut indexed: Vec<usize> = changed
+            .iter()
+            .filter_map(|file| self.by_path.get(file.rel_path()))
+            .flatten()
+            .copied()
+            .collect();
+        indexed.sort_unstable();
+        indexed.dedup();
+        #[cfg(any(test, feature = "test-support"))]
+        for _ in &indexed {
+            super::project_reads::count_project_io(
+                super::project_reads::ProjectIo::SymlinkCandidate,
+            );
+        }
+        // A link is in the index or in `always`, never both.
+        indexed
+            .into_iter()
+            .chain(self.always.iter().copied())
+            .map(|index| &self.links[index])
+    }
+}
+
+#[derive(Debug)]
+struct SymlinkRecord {
+    path: PathBuf,
+    reason: WorkspaceFileOmissionReason,
+    target: SymlinkTarget,
+}
+
+/// Where a symlink resolves, chains included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SymlinkTarget {
+    /// The canonical target, relative to the canonical workspace root.
+    Inside(PathBuf),
+    /// The target lies outside the workspace, so no workspace event names it.
+    External,
+    /// The link resolves through another symlink, in its target or in one of
+    /// the target's directories. That hop can be ignored or unlisted, so no
+    /// event on a recorded path need name it.
+    Indirect,
+    /// Canonicalization failed: dangling, a loop or no permission.
+    Unresolved,
+}
+
+#[derive(Debug)]
+pub struct WorkspaceFileOmission {
+    pub path: PathBuf,
+    pub reason: WorkspaceFileOmissionReason,
+}
+
+pub type SharedWorkspaceFileListing = (Arc<BTreeSet<ProjectFile>>, Arc<Vec<WorkspaceFileOmission>>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceFileOmissionReason {
+    Unknown,
+    /// A regular file at a known path that this listing deliberately does not
+    /// supply, such as a file outside a bounded revision image's ecosystem.
+    /// A consumer whose own files could be at that path treats it as missing.
+    NotSupplied,
+    WalkError,
+    NonUtf8GitPath,
+    /// A symbolic link whose target is a file.
+    Symlink,
+    /// A symbolic link whose target is a directory. The files below it are not
+    /// listed.
+    SymlinkToDirectory,
+    /// A symbolic link whose target could not be read, so its kind is unknown.
+    UnreadableSymlink,
+    NonRegular,
+    NonUtf8Name,
+}
+
+/// The omission reason and resolved target of the symbolic link at `absolute`
+/// in the workspace whose canonical root is `canonical_root`. The kind of the
+/// target decides whether files may hide behind it. The walk and the
+/// revalidation share this classifier, so they agree on every link.
+fn classify_symlink(canonical_root: &Path, absolute: &Path, path: PathBuf) -> SymlinkRecord {
+    let reason = match std::fs::metadata(absolute) {
+        Ok(target) if target.is_file() => WorkspaceFileOmissionReason::Symlink,
+        Ok(target) if target.is_dir() => WorkspaceFileOmissionReason::SymlinkToDirectory,
+        // A FIFO, socket or device: reading it can block, and nothing can
+        // hide behind it.
+        Ok(_) => WorkspaceFileOmissionReason::NonRegular,
+        Err(_) => WorkspaceFileOmissionReason::UnreadableSymlink,
+    };
+    let target = match std::fs::canonicalize(absolute) {
+        Ok(canonical) => {
+            let canonical = canonical.normalize();
+            // The link's own directories are real: the listing does not
+            // descend through a symlink. So when its first hop, taken
+            // lexically, already names the canonical path, no other symlink
+            // took part in the resolution.
+            let direct = std::fs::read_link(absolute).ok().is_some_and(|hop| {
+                canonical_root
+                    .join(&path)
+                    .parent()
+                    .expect("a listed symlink has a parent directory")
+                    .join(hop)
+                    .normalize()
+                    == canonical
+            });
+            match canonical.strip_prefix(canonical_root) {
+                Ok(rel) if direct => SymlinkTarget::Inside(rel.to_path_buf()),
+                Ok(_) => SymlinkTarget::Indirect,
+                Err(_) => SymlinkTarget::External,
+            }
+        }
+        Err(_) => SymlinkTarget::Unresolved,
+    };
+    SymlinkRecord {
+        path,
+        reason,
+        target,
+    }
+}
+
+impl SymlinkRecord {
+    fn omission(&self) -> WorkspaceFileOmission {
+        WorkspaceFileOmission {
+            path: self.path.clone(),
+            reason: self.reason,
+        }
+    }
+}
+
+pub fn collect_workspace_files_with_omissions(root: &Path) -> io::Result<WorkspaceFileListing> {
     #[cfg(any(test, feature = "test-support"))]
     super::project_reads::count_project_io(super::project_reads::ProjectIo::Walk);
     let _scope = crate::profiling::scope("project::collect_workspace_files");
+    let owned_paths = AnalyzerOwnedPaths::new(root);
     let mut apply_parent_ignores = true;
     if let Some(repo) = crate::gitblob::discover(root) {
         let workdir = repo
@@ -2064,18 +3151,64 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
         // below already discards everything outside it, so scoping the
         // enumeration to the subtree yields the same listing at a cost
         // proportional to the workspace instead of the ancestor repository.
-        let active_paths =
+        let (active_paths, non_utf8_paths) =
             match crate::gitblob::subtree_pathspec(&canonical_workdir, &canonical_root) {
-                Some(subtree) => crate::gitblob::working_tree_paths_under(&repo, &subtree),
-                None => crate::gitblob::all_working_tree_paths(&repo),
+                Some(subtree) => {
+                    crate::gitblob::working_tree_paths_with_non_utf8(&repo, Some(&subtree))
+                }
+                None => crate::gitblob::working_tree_paths_with_non_utf8(&repo, None),
             }
             .map_err(io::Error::other)?;
         let mut files = BTreeSet::new();
+        let mut symlinks = Vec::new();
+        let mut omissions: Vec<_> = non_utf8_paths
+            .into_iter()
+            .filter_map(|path| {
+                canonical_workdir
+                    .join(path)
+                    .strip_prefix(&canonical_root)
+                    .ok()
+                    .map(|rel| WorkspaceFileOmission {
+                        path: rel.to_path_buf(),
+                        reason: WorkspaceFileOmissionReason::NonUtf8GitPath,
+                    })
+            })
+            .collect();
         for rel in active_paths {
             let absolute = canonical_workdir.join(rel);
             let Ok(project_rel) = absolute.strip_prefix(&canonical_root) else {
                 continue;
             };
+            if owned_paths.contains(&absolute) {
+                continue;
+            }
+            if let Ok(metadata) = absolute.symlink_metadata() {
+                let reason = if metadata.file_type().is_symlink() {
+                    let record =
+                        classify_symlink(&canonical_root, &absolute, project_rel.to_path_buf());
+                    let reason = record.reason;
+                    symlinks.push(record);
+                    Some(reason)
+                } else if !metadata.file_type().is_file() {
+                    Some(WorkspaceFileOmissionReason::NonRegular)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    omissions.push(WorkspaceFileOmission {
+                        path: project_rel.to_path_buf(),
+                        reason,
+                    });
+                    // Git lists every symlink so that it reaches this
+                    // classification. Only a link to a regular file is read as
+                    // a file. A link to a directory, to a FIFO or device, or to
+                    // nothing readable has no content to analyze, and neither
+                    // has a non-regular entry.
+                    if reason != WorkspaceFileOmissionReason::Symlink {
+                        continue;
+                    }
+                }
+            }
             files.insert(ProjectFile::new(
                 root.to_path_buf(),
                 project_rel.to_path_buf(),
@@ -2085,11 +3218,16 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
         // hide the complete subtree. In that case, Git cannot represent the
         // explicitly selected workspace. Walk the selected root instead.
         if !files.is_empty() {
-            return Ok(files);
+            return Ok(WorkspaceFileListing {
+                files,
+                omissions,
+                symlinks: SymlinkTargets::new(canonical_root, symlinks),
+            });
         }
         apply_parent_ignores = false;
     }
 
+    let canonical_root = root.canonicalize()?.normalize();
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .ignore(false)
@@ -2107,7 +3245,9 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
         // many clones -- and would otherwise index git's own files. `git_exclude`
         // detection (`.git/info/exclude`) is unaffected: the ignore crate reads
         // it during repo detection, independent of whether the walk yields `.git`.
-        .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"))
+        .filter_entry(move |entry| {
+            entry.file_name() != std::ffi::OsStr::new(".git") && !owned_paths.contains(entry.path())
+        })
         // Parallel traversal: the walk is `stat`/`readdir`-bound, so on large
         // trees (and high-latency filesystems) spreading directory enumeration
         // across threads is a substantial win. The ignore crate defaults the
@@ -2121,16 +3261,59 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
     // as we go keeps the peak memory to roughly one copy rather than buffering
     // the whole channel before building the set. The first walk error wins and
     // is surfaced after the traversal completes.
-    let (tx, rx) = std::sync::mpsc::channel::<ProjectFile>();
-    let collector = std::thread::spawn(move || rx.into_iter().collect::<BTreeSet<ProjectFile>>());
+    enum Walked {
+        File(ProjectFile),
+        Omission(WorkspaceFileOmission),
+        Symlink(SymlinkRecord),
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Walked>();
+    let collector_root = canonical_root.clone();
+    let collector = std::thread::spawn(move || {
+        let mut files = BTreeSet::new();
+        let mut omissions = Vec::new();
+        let mut links = Vec::new();
+        for item in rx {
+            match item {
+                Walked::File(file) => {
+                    files.insert(file);
+                }
+                Walked::Omission(omission) => omissions.push(omission),
+                Walked::Symlink(record) => {
+                    omissions.push(record.omission());
+                    links.push(record);
+                }
+            }
+        }
+        WorkspaceFileListing {
+            files,
+            omissions,
+            symlinks: SymlinkTargets::new(collector_root, links),
+        }
+    });
     let first_error: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
     walker.run(|| {
         let tx = tx.clone();
+        let canonical_root = canonical_root.clone();
         let first_error = Arc::clone(&first_error);
         Box::new(move |result| {
             let entry = match result {
                 Ok(entry) => entry,
                 Err(err) => {
+                    let mut source = &err;
+                    let path = loop {
+                        match source {
+                            ignore::Error::WithPath { path, .. } => break path.as_path(),
+                            ignore::Error::Loop { child, .. } => break child.as_path(),
+                            ignore::Error::WithLineNumber { err, .. }
+                            | ignore::Error::WithDepth { err, .. } => source = err,
+                            _ => break root,
+                        }
+                    };
+                    let path = path.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
+                    let _ = tx.send(Walked::Omission(WorkspaceFileOmission {
+                        path: path.to_path_buf(),
+                        reason: WorkspaceFileOmissionReason::WalkError,
+                    }));
                     let mut slot = first_error.lock().expect("walk error lock poisoned");
                     if slot.is_none() {
                         *slot = Some(io::Error::other(err.to_string()));
@@ -2150,7 +3333,35 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
                     .expect("walker returned a path outside the project root");
                 // Receiver is dropped only after the walk returns, so a send
                 // failure is impossible here; ignore the result to stay panic-free.
-                let _ = tx.send(ProjectFile::new(root.to_path_buf(), rel.to_path_buf()));
+                let _ = tx.send(Walked::File(ProjectFile::new(
+                    root.to_path_buf(),
+                    rel.to_path_buf(),
+                )));
+                if rel.file_name().is_some_and(|name| name.to_str().is_none()) {
+                    let _ = tx.send(Walked::Omission(WorkspaceFileOmission {
+                        path: rel.to_path_buf(),
+                        reason: WorkspaceFileOmissionReason::NonUtf8Name,
+                    }));
+                }
+            } else if let Some(file_type) = entry.file_type()
+                && !file_type.is_dir()
+            {
+                let rel = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("walker returned a path outside the project root");
+                let _ = tx.send(if file_type.is_symlink() {
+                    Walked::Symlink(classify_symlink(
+                        &canonical_root,
+                        entry.path(),
+                        rel.to_path_buf(),
+                    ))
+                } else {
+                    Walked::Omission(WorkspaceFileOmission {
+                        path: rel.to_path_buf(),
+                        reason: WorkspaceFileOmissionReason::NonRegular,
+                    })
+                });
             }
             WalkState::Continue
         })
@@ -2159,12 +3370,15 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
     // walker thread's clone has also been dropped.
     drop(tx);
 
-    let files = collector.join().expect("file-collector thread panicked");
+    let listing = collector.join().expect("file-collector thread panicked");
 
     if let Some(error) = first_error.lock().expect("walk error lock poisoned").take() {
-        return Err(io::Error::other(PartialWorkspaceListing { files, error }));
+        return Err(io::Error::other(PartialWorkspaceListing {
+            files: listing.files,
+            error,
+        }));
     }
-    Ok(files)
+    Ok(listing)
 }
 
 /// The error of a workspace walk that failed under part of the tree, carrying
@@ -2294,6 +3508,7 @@ impl WorkspaceOverlayContent {
 /// exactly as it was before the buffer existed.
 pub struct OverlayProject {
     project_reads: ProjectReadSlot,
+    view_id: u64,
     /// The overlay content identity published for the map's current revision.
     /// Recomputing it hashes every open buffer, so it is derived once per
     /// accepted edit rather than once per query. The revision is a memo key
@@ -2344,6 +3559,7 @@ impl OverlayProject {
     pub fn with_max_bytes(delegate: Arc<dyn Project>, max_overlay_bytes: usize) -> Self {
         Self {
             project_reads: ProjectReadSlot::default(),
+            view_id: next_project_view_id(),
             overlay_content: Mutex::new(None),
             delegate,
             overlays: Arc::new(RwLock::new(HashMap::new())),
@@ -2393,6 +3609,7 @@ impl OverlayProject {
         super::project_reads::publish_overlays(&Some(content));
         Self {
             project_reads: ProjectReadSlot::default(),
+            view_id: next_project_view_id(),
             overlay_content: Mutex::new(None),
             delegate: Arc::clone(&self.delegate),
             overlays: Arc::new(RwLock::new(frozen_overlays)),
@@ -2575,6 +3792,20 @@ impl OverlayProject {
 }
 
 impl Project for OverlayProject {
+    fn directory_entries(&self, parent: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+        self.delegate.directory_entries(parent)
+    }
+
+    fn view_stamp(&self) -> Option<ProjectViewStamp> {
+        let _overlays = self.overlays.read().expect("overlay lock poisoned");
+        let own = ProjectViewStamp::own(
+            self.view_id,
+            self.published_generation.load(Ordering::Acquire),
+        );
+        self.delegate
+            .view_stamp()
+            .map(|delegate| own.over(delegate))
+    }
     fn ignore_rules_digest(&self) -> io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -2619,11 +3850,51 @@ impl Project for OverlayProject {
         self.all_files_shared().map(|files| (*files).clone())
     }
 
+    fn authoritative_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        let mut files = self.delegate.authoritative_files()?;
+        files.extend(self.overlay_project_files());
+        Ok(files)
+    }
+
     fn all_files_shared(&self) -> io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.all_files_with_omissions().map(|(files, _)| files)
+    }
+
+    fn cached_omissions_if_available(&self) -> io::Result<Option<Arc<Vec<WorkspaceFileOmission>>>> {
         let _project_read = self
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
-        let files = self.delegate.all_files_shared()?;
+        self.delegate.cached_omissions_if_available()
+    }
+    fn cached_listing_if_available(&self) -> io::Result<Option<SharedWorkspaceFileListing>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        let Some((files, omissions)) = self.delegate.cached_listing_if_available()? else {
+            return Ok(None);
+        };
+        let additions: Vec<ProjectFile> =
+            Self::buffers_missing_from(self.overlay_project_files(), &files).collect();
+        if additions.is_empty() {
+            return Ok(Some((files, omissions)));
+        }
+        let mut extended = (*files).clone();
+        extended.extend(additions);
+        Ok(Some((Arc::new(extended), omissions)))
+    }
+    fn cached_analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> io::Result<Option<BTreeSet<ProjectFile>>> {
+        let _project_read = listing_read(self);
+        self.delegate.cached_analyzable_files_from(files, language)
+    }
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        let (files, omissions) = self.delegate.all_files_with_omissions()?;
         let additions: Vec<ProjectFile> =
             Self::buffers_missing_from(self.overlay_project_files(), &files).collect();
         // Nothing to add is the ordinary case -- every open buffer has its file
@@ -2632,12 +3903,12 @@ impl Project for OverlayProject {
         // a whole-workspace clone the price of holding a buffer open.
         if additions.is_empty() {
             publish_file_set(self, &files)?;
-            return Ok(files);
+            return Ok((files, omissions));
         }
         let mut extended = (*files).clone();
         extended.extend(additions);
         publish_file_set(self, &extended)?;
-        Ok(Arc::new(extended))
+        Ok((Arc::new(extended), omissions))
     }
 
     fn has_directory(&self, rel_path: &Path) -> bool {
@@ -2749,6 +4020,18 @@ impl Project for OverlayProject {
         self.delegate.invalidate_cached_file_listing();
     }
 
+    fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        self.delegate.revalidate_symlink_omissions(changed);
+    }
+
+    fn has_exact_directory_entry(&self, file: &ProjectFile) -> std::io::Result<bool> {
+        self.delegate.has_exact_directory_entry(file)
+    }
+
+    fn update_cached_listing_for_resolved_path(&self, file: &ProjectFile) -> bool {
+        self.delegate.update_cached_listing_for_resolved_path(file)
+    }
+
     fn update_cached_listing_for_path(&self, rel_path: &Path) -> bool {
         self.delegate.update_cached_listing_for_path(rel_path)
     }
@@ -2839,17 +4122,17 @@ impl Project for OverlayProject {
             .project_read_slot()
             .map(|slot| slot.overlays(self.as_project()));
         let answer = 'answer: {
-            let revision = self.published_generation.load(Ordering::Acquire);
             let mut memo = self
                 .overlay_content
                 .lock()
                 .expect("overlay content memo poisoned");
+            let overlays = self.overlays.read().expect("overlay lock poisoned");
+            let revision = self.published_generation.load(Ordering::Acquire);
             if let Some((memoized_revision, content)) = memo.as_ref()
                 && *memoized_revision == revision
             {
                 break 'answer Some(Arc::clone(content));
             }
-            let overlays = self.overlays.read().expect("overlay lock poisoned");
             let root = self.delegate.root();
             let content = Arc::new(WorkspaceOverlayContent::new(overlays.iter().filter_map(
                 |(abs_path, entry)| {
@@ -2888,6 +4171,19 @@ fn detect_languages_in_files(files: &BTreeSet<ProjectFile>) -> BTreeSet<Language
     languages
 }
 
+/// Cargo auto-discovery directories whose immediate children can own main.rs.
+pub const RUST_TARGET_LAYOUT_DIRECTORIES: [&str; 4] = ["tests", "examples", "benches", "src/bin"];
+
+/// Whether a workspace path has one of Cargo's directory-target layouts.
+pub fn is_rust_target_layout_main(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "main.rs")
+        && path.parent().and_then(Path::parent).is_some_and(|parent| {
+            RUST_TARGET_LAYOUT_DIRECTORIES
+                .iter()
+                .any(|kind| parent.ends_with(kind))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2896,6 +4192,157 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11129: a case-insensitive update alias became a second selected file"
+    )]
+    fn listing_update_path_distinguishes_alias_from_new_entry() {
+        struct View(TestProject);
+        impl Project for View {
+            fn root(&self) -> &Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+            fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
+                self.0.read_source(file)
+            }
+            fn directory_entries(&self, parent: &Path) -> io::Result<BTreeSet<ProjectFile>> {
+                Ok(self
+                    .0
+                    .directory_entries(parent)?
+                    .into_iter()
+                    .filter(|file| file.rel_path() != Path::new("Foo.rs"))
+                    .collect())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("foo.RS"), "before").unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        cache.files().unwrap();
+        if !root.join("Foo.rs").exists() {
+            std::fs::hard_link(root.join("foo.RS"), root.join("Foo.rs")).unwrap();
+        }
+        let alias = ProjectFile::new(&root, "Foo.rs");
+        assert!(cache.update_path_in(&View(TestProject::new(&root, Language::None)), &alias, true));
+        assert!(!cache.files().unwrap().contains(&alias));
+        let added = ProjectFile::new(&root, "new.rs");
+        std::fs::write(added.abs_path(), "new").unwrap();
+        assert!(cache.update_path(&added, true));
+        assert!(cache.files().unwrap().contains(&added));
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9737: the default listing silently certified unknown omissions"
+    )]
+    fn default_listing_reports_unknown_omissions() {
+        // TestProject certifies its listing through the shared collector, so
+        // a project that keeps the trait's default listing wraps it.
+        struct DefaultListingProject(TestProject);
+        impl Project for DefaultListingProject {
+            fn root(&self) -> &Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+        }
+        let temp = TempDir::new().unwrap();
+        let project = DefaultListingProject(TestProject::new(temp.path(), Language::Rust));
+        let (_, omissions) = project.all_files_with_omissions().unwrap();
+        assert_eq!(omissions.len(), 1);
+        assert_eq!(omissions[0].reason, WorkspaceFileOmissionReason::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#9737: multi-root listings dropped symlink omissions")]
+    fn multi_root_listing_forwards_omissions() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        write_file(&first, "source.rs", "fn source() {}\n");
+        std::os::unix::fs::symlink(first.join("source.rs"), first.join("linked.rs")).unwrap();
+        let project = MultiRootProject::new([first, second]).unwrap();
+        let (_, omissions) = project.all_files_with_omissions().unwrap();
+        assert!(omissions.iter().any(|omission| {
+            omission.path == Path::new("first/linked.rs")
+                && omission.reason == WorkspaceFileOmissionReason::Symlink
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10321: a multi-root project never rechecked its children's symlinks after a target-only change"
+    )]
+    fn multi_root_revalidation_reaches_the_child_that_owns_the_changed_target() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut children = Vec::new();
+        let mut caches = Vec::new();
+        for name in ["first", "second"] {
+            let child = root.join(name);
+            write_file(&child, "target.txt", "target\n");
+            std::os::unix::fs::symlink("target.txt", child.join("link.txt")).unwrap();
+            let cache = Arc::new(WorkspaceFileListingCache::new(child.clone()));
+            cache.listing().unwrap();
+            children
+                .push(FilesystemProject::with_cached_listing(&child, Arc::clone(&cache)).unwrap());
+            caches.push(cache);
+        }
+        let project = MultiRootProject {
+            project_reads: ProjectReadSlot::default(),
+            root: root.clone(),
+            roots: children,
+            languages: BTreeSet::new(),
+            persistence_dir: None,
+        };
+
+        // The changed path is named from the common root; the second child
+        // and a path under no child are not affected by it.
+        std::fs::remove_file(root.join("first/target.txt")).unwrap();
+        project.revalidate_symlink_omissions(
+            &[
+                ProjectFile::new(&root, "first/target.txt"),
+                ProjectFile::new(&root, "elsewhere/other.txt"),
+            ]
+            .into(),
+        );
+        assert!(
+            caches[0].cached_listing().is_none(),
+            "a deleted target must invalidate its child's listing"
+        );
+        assert!(
+            caches[1].cached_listing().is_some(),
+            "a change under the first child must not touch the second"
+        );
+    }
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -3175,6 +4622,98 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10166: analyzer cache files changed the workspace inventory digest across roots"
+    )]
+    fn analyzer_cache_does_not_change_inventory_digest_across_roots() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        write_file(&first, "src/main.rs", "fn main() {}\n");
+        write_file(&second, "src/main.rs", "fn main() {}\n");
+        write_file(&first, ".bifrost/cache/bifrost_cache.db", "cache bytes");
+        std::fs::create_dir_all(second.join(".bifrost/cache")).unwrap();
+        std::fs::copy(
+            first.join(".bifrost/cache/bifrost_cache.db"),
+            second.join(".bifrost/cache/bifrost_cache.db"),
+        )
+        .unwrap();
+        let first = first.canonicalize().unwrap();
+        let second = second.canonicalize().unwrap();
+        let first_project = FilesystemProject::new(&first).unwrap();
+        let second_project = FilesystemProject::new(&second).unwrap();
+        let first_files = first_project.all_files().unwrap();
+        let second_files = second_project.all_files().unwrap();
+        assert!(
+            !first_files
+                .iter()
+                .any(|file| file.rel_path().starts_with(".bifrost/cache"))
+        );
+        assert!(
+            !second_files
+                .iter()
+                .any(|file| file.rel_path().starts_with(".bifrost/cache"))
+        );
+        let first_digest =
+            crate::analyzer::project_reads::file_set_receipt(&first_project, &first_files)
+                .unwrap()
+                .inventory;
+        let second_digest =
+            crate::analyzer::project_reads::file_set_receipt(&second_project, &second_files)
+                .unwrap()
+                .inventory;
+        assert_eq!(first_digest, second_digest);
+    }
+
+    #[test]
+    fn analyzer_owned_paths_keep_configuration_and_cache_siblings() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::test_repo::init_repo(&root);
+        write_file(&root, ".bifrost/policies/rule.rqlp", "rule content");
+        write_file(&root, ".bifrost/cachex/main.rs", "fn main() {}");
+        write_file(&root, ".bifrost/cache/db", "cache");
+        crate::gitblob::test_repo::commit_all(&repo, "track project inputs");
+        let files = collect_workspace_files(&root).unwrap();
+        assert!(files.contains(&ProjectFile::new(&root, ".bifrost/policies/rule.rqlp")));
+        assert!(files.contains(&ProjectFile::new(&root, ".bifrost/cachex/main.rs")));
+        assert!(!files.contains(&ProjectFile::new(&root, ".bifrost/cache/db")));
+        let override_dir = root.join("other-cache");
+        let owned = AnalyzerOwnedPaths::with_cache_dir(&root, override_dir.clone());
+        assert!(owned.contains(&root.join(".bifrost/cache/db")));
+        assert!(owned.contains(&override_dir.join("db")));
+        assert!(!owned.contains(&root.join(".bifrost/cachex/main.rs")));
+        assert!(owned.contains(&root.join(".bifrost/bifrost_cache.db-wal")));
+    }
+
+    #[test]
+    fn analyzer_owned_paths_exclude_symlinked_cache_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let target = temp.path().join("cache-target");
+        std::fs::create_dir_all(root.join(".bifrost")).unwrap();
+        write_file(&target, "db", "cache");
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&target, root.join(".bifrost/cache"));
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&target, root.join(".bifrost/cache"));
+        if let Err(error) = link_result {
+            if error.kind() == io::ErrorKind::PermissionDenied
+                || (cfg!(windows) && error.raw_os_error() == Some(1314))
+            {
+                eprintln!("skipping symlink cache test: symlink permission unavailable: {error}");
+                return;
+            }
+            panic!("cannot create cache symlink: {error}");
+        }
+        let root = root.canonicalize().unwrap();
+        let owned = AnalyzerOwnedPaths::new(&root);
+        assert!(owned.contains(&root.join(".bifrost/cache/db")));
+        assert!(!owned.contains(&target.join("db")));
+        assert!(collect_workspace_files(&root).unwrap().is_empty());
+    }
+
+    #[test]
     fn collect_project_files_skips_dot_git_but_keeps_other_dotdirs() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -3238,6 +4777,134 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10321: every update stat-ed every cached symlink, so its cost grew with the symlink count"
+    )]
+    fn symlink_revalidation_rechecks_only_links_a_change_can_affect() {
+        use super::super::project_reads::measure_project_io;
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let outside = TempDir::new().unwrap();
+        write_file(&root, "unrelated.txt", "unrelated\n");
+        write_file(&root, "sub/inner.txt", "inner\n");
+        write_file(outside.path(), "external.txt", "external\n");
+        for index in 0..20 {
+            write_file(&root, &format!("targets/t{index}.txt"), "target\n");
+            std::os::unix::fs::symlink(
+                root.join(format!("targets/t{index}.txt")),
+                root.join(format!("link{index}.txt")),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink("sub/inner.txt", root.join("deep.link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("external.txt"),
+            root.join("external.link"),
+        )
+        .unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        cache.listing().unwrap();
+        let changed = |paths: &[&str]| -> BTreeSet<ProjectFile> {
+            paths
+                .iter()
+                .map(|path| ProjectFile::new(&root, *path))
+                .collect()
+        };
+        // The rechecks, and the in-workspace links the index offered for them.
+        let recheck = |paths: &[&str]| {
+            let counts =
+                measure_project_io(|| cache.revalidate_symlink_omissions(&changed(paths))).1;
+            (counts.symlink_candidates, counts.symlink_rechecks)
+        };
+
+        // Only the link to a target outside the workspace has no event to
+        // wait for, and no in-workspace link is even considered.
+        assert_eq!(recheck(&["unrelated.txt"]), (0, 1), "unrelated change");
+        assert!(cache.cached_listing().is_some());
+        // A changed target, and a changed ancestor of a target, name their links.
+        assert_eq!(recheck(&["targets/t3.txt"]), (1, 2), "changed target");
+        assert_eq!(recheck(&["sub"]), (1, 2), "changed ancestor of a target");
+        assert_eq!(recheck(&["link4.txt"]), (1, 2), "changed link");
+        assert_eq!(
+            recheck(&["targets/t3.txt", "link3.txt", "link4.txt"]),
+            (2, 3),
+            "a link named by two changed paths is considered once"
+        );
+        assert!(cache.cached_listing().is_some());
+
+        std::fs::remove_file(root.join("targets/t3.txt")).unwrap();
+        recheck(&["targets/t3.txt"]);
+        assert!(
+            cache.cached_listing().is_none(),
+            "a deleted target must invalidate the listing"
+        );
+        cache.listing().unwrap();
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        recheck(&["sub"]);
+        assert!(
+            cache.cached_listing().is_none(),
+            "a removed ancestor of a target must invalidate the listing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10321: a link resolved through another symlink kept its class after the hop changed"
+    )]
+    fn symlink_reached_through_another_symlink_is_rechecked_on_every_update() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "unrelated.txt", "unrelated\n");
+        write_file(&root, "data.txt", "data\n");
+        write_file(&root, "hops/.keep", "");
+        std::os::unix::fs::symlink("../data.txt", root.join("hops/alias")).unwrap();
+        std::os::unix::fs::symlink("hops/alias", root.join("chain.link")).unwrap();
+        let cache = WorkspaceFileListingCache::new(root.clone());
+        cache.listing().unwrap();
+        // The hop may be ignored or unlisted, so its change may arrive with no
+        // event on a recorded path. Only an unrelated path is reported here.
+        std::fs::remove_file(root.join("hops/alias")).unwrap();
+        cache.revalidate_symlink_omissions(&[ProjectFile::new(&root, "unrelated.txt")].into());
+        assert!(
+            cache.cached_listing().is_none(),
+            "a dangling chain must invalidate the listing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10321: a Git listing made a symlink to a FIFO an analyzable file"
+    )]
+    fn git_listing_keeps_a_symlink_to_a_fifo_out_of_the_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::test_repo::init_repo(&root);
+        write_file(&root, "tracked.rs", "fn tracked() {}\n");
+        crate::gitblob::test_repo::commit_all(&repo, "tracked source");
+        let status = std::process::Command::new("mkfifo")
+            .arg(root.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::os::unix::fs::symlink("pipe", root.join("generated.rs")).unwrap();
+
+        let listing = collect_workspace_files_with_omissions(&root).unwrap();
+        let generated = ProjectFile::new(&root, "generated.rs");
+        assert!(!listing.files.contains(&generated), "{:?}", listing.files);
+        assert!(
+            listing.omissions.iter().any(|omission| {
+                omission.path == std::path::Path::new("generated.rs")
+                    && omission.reason == WorkspaceFileOmissionReason::NonRegular
+            }),
+            "{:?}",
+            listing.omissions
+        );
+    }
+
     #[test]
     fn collect_project_files_includes_nonignored_untracked_files() {
         let temp = TempDir::new().unwrap();
@@ -3258,6 +4925,41 @@ mod tests {
         assert!(rels.contains("tracked.rs"), "{rels:?}");
         assert!(rels.contains("generated.rs"), "{rels:?}");
         assert!(!rels.contains("ignored/ignored.rs"), "{rels:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_listing_reports_symlink_without_changing_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "source.rs", "fn source() {}\n");
+        std::os::unix::fs::symlink(root.join("source.rs"), root.join("linked.rs")).unwrap();
+
+        let listing = collect_workspace_files_with_omissions(&root).unwrap();
+        assert!(
+            listing
+                .files
+                .contains(&ProjectFile::new(&root, "source.rs"))
+        );
+        assert!(
+            !listing
+                .files
+                .contains(&ProjectFile::new(&root, "linked.rs"))
+        );
+        assert!(listing.omissions.iter().any(|omission| {
+            omission.path == Path::new("linked.rs")
+                && omission.reason == WorkspaceFileOmissionReason::Symlink
+        }));
+
+        let cache = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, Arc::clone(&cache)).unwrap();
+        let (files, omissions) = project.all_files_with_omissions().unwrap();
+        assert_eq!(cache.walk_count(), 1);
+        assert!(!files.contains(&ProjectFile::new(&root, "linked.rs")));
+        assert!(omissions.iter().any(|omission| {
+            omission.path == Path::new("linked.rs")
+                && omission.reason == WorkspaceFileOmissionReason::Symlink
+        }));
     }
 
     #[test]
@@ -3386,6 +5088,20 @@ mod tests {
 
         assert!(project.all_files_shared().unwrap().contains(&added));
         assert_eq!(project.workspace_file_listing_count(), 1);
+    }
+
+    #[test]
+    fn authoritative_walk_sees_nested_manifest_without_cache_event() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_file(&root, "a.rs", "fn a() {}\n");
+        let listing = Arc::new(WorkspaceFileListingCache::new(root.clone()));
+        let project = FilesystemProject::with_cached_listing(&root, listing).unwrap();
+        let before = project.all_files_shared().unwrap();
+        let added = write_file(&root, "nested/pom.xml", "<project/>\n");
+        assert!(!before.contains(&added));
+        assert!(!project.all_files().unwrap().contains(&added));
+        assert!(project.authoritative_files().unwrap().contains(&added));
     }
 
     /// Invalidation must also drop the cached `.bifrostignore` matcher, or the
@@ -4023,6 +5739,74 @@ mod tests {
     }
 
     #[test]
+    fn overlay_stamp_waits_for_mutation_and_composes_delegate() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "app.ts", "class Disk {}\n");
+        let delegate = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = Arc::new(OverlayProject::new(delegate.clone()));
+        let before = overlay.view_stamp().unwrap();
+        assert!(overlay.set(file.abs_path(), "class Overlay {}\n".to_string()));
+        let after_set = overlay.view_stamp().unwrap();
+        assert_ne!(before, after_set);
+
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let clearing = {
+            let overlay = Arc::clone(&overlay);
+            let path = file.abs_path();
+            thread::spawn(move || {
+                overlay.remove_overlay_with_revision_hook(&path, || {
+                    removed_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        removed_rx.recv().unwrap();
+        let (stamp_tx, stamp_rx) = mpsc::channel();
+        let reader = {
+            let overlay = Arc::clone(&overlay);
+            thread::spawn(move || stamp_tx.send(overlay.view_stamp()).unwrap())
+        };
+        assert!(matches!(
+            stamp_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_tx.send(()).unwrap();
+        assert!(clearing.join().unwrap());
+        assert_ne!(stamp_rx.recv().unwrap().unwrap(), after_set);
+        reader.join().unwrap();
+
+        let before_delegate = overlay.view_stamp().unwrap();
+        delegate.invalidate_cached_file_listing();
+        assert_ne!(overlay.view_stamp().unwrap(), before_delegate);
+    }
+
+    #[test]
+    fn listing_invalidate_and_path_update_each_advance_stamp_once() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = write_file(&root, "first.rs", "fn first() {}\n");
+        let second = write_file(&root, "second.rs", "fn second() {}\n");
+        let cache = Arc::new(WorkspaceFileListingCache::new(root));
+        cache.files().unwrap();
+        let before = cache.view_stamp().generation;
+        let cache_for_update = Arc::clone(&cache);
+        let updating = thread::spawn(move || cache_for_update.update_path(&first, false));
+        let cache_for_invalidate = Arc::clone(&cache);
+        let invalidating = thread::spawn(move || cache_for_invalidate.invalidate());
+        assert!(updating.join().unwrap());
+        invalidating.join().unwrap();
+        let after = cache.view_stamp().generation;
+        assert!(after == before + 1 || after == before + 2);
+        // An update after invalidation has no fresh listing to change.
+        cache.files().unwrap();
+        let before_update = cache.view_stamp().generation;
+        assert!(cache.update_path(&second, false));
+        assert_eq!(cache.view_stamp().generation, before_update + 1);
+    }
+
+    #[test]
     fn file_by_rel_path_rejects_directories() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -4077,4 +5861,18 @@ mod tests {
             "after rejection, read must fall through to disk"
         );
     }
+}
+
+/// The exact non-source probes behind a cached nearest-module answer.
+#[derive(Clone, Debug)]
+pub enum IdentityWalkInput {
+    File {
+        rel_path: String,
+        blob: [u8; 20],
+        content_digest: [u8; 32],
+    },
+    PathAbsent {
+        rel_path: String,
+    },
+    Unavailable,
 }

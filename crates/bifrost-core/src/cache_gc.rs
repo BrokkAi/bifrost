@@ -992,7 +992,19 @@ fn delete_analyzer_candidates(
             symbols.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
             chains.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
         }
-        dropped += delete.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
+        let deleted = delete.execute((key.oid.to_string(), &key.lang, generation, key.variant))?;
+        if deleted > 0 {
+            // The predicate above spares every mounted blob, so no file
+            // version should lose its blob here; the hook proves it in-transaction.
+            crate::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(
+                tx,
+                &key.oid.to_string(),
+                &key.lang,
+                *generation,
+                key.variant,
+            )?;
+        }
+        dropped += deleted;
     }
     Ok(dropped)
 }

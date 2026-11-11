@@ -33,7 +33,19 @@ use serde::{Deserialize, Serialize};
 /// inventories. Version twenty-two carries reviewed Rust drop glue on type
 /// value semantics.
 pub const VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION: u32 = 8;
+/// Ordinary generated packs retain schema 22; #9431 claims use schema 26.
 pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 22;
+/// A pack may first claim locally fenced declaration omissions in schema 27.
+pub const FENCED_COMPLETENESS_MIN_SCHEMA_VERSION: u32 = 27;
+/// Rust artifact approximation provenance first appears in schema 28.
+pub const RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION: u32 = 28;
+/// Latest supported authored schema, including Rust tuple-field layouts.
+pub const SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION: u32 = 32;
+/// Tuple-field layouts in authored packs first appear in schema 30.
+pub const TUPLE_FIELD_LAYOUT_MIN_SCHEMA_VERSION: u32 = 30;
+pub const RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION: u32 = 29;
+/// #9431: receiver lifecycle claims first appear in schema 26.
+pub const LIFECYCLE_COVERAGE_MIN_SCHEMA_VERSION: u32 = 26;
 /// The schema versions a reader accepts.
 ///
 /// Packs reject unknown fields and every object is explicitly tagged, so a
@@ -43,8 +55,14 @@ pub const SEMANTIC_MODEL_SCHEMA_VERSION: u32 = 22;
 /// pack or release asset keeps loading here until its producer regenerates it
 /// on the normal cadence. A version-two pack carries no `ambient_use` fact, so
 /// it answers "unreviewed" for every declaration, which is what absence means.
+///
+/// This list is an input to `authoring_json_schema()`. Adding a version, like
+/// any change to the authored model, changes `authoring-schema-sha256` in
+/// `tests/fixtures/golden/semantic-procedure-claims/wire-contract/expected.txt`;
+/// re-bless that golden with `BIFROST_BLESS=1` in the same change.
 pub const SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28, 29, 30,
+    31, 32,
 ];
 /// Explicit unknown type knowledge first appeared in schema nine.
 pub const UNKNOWN_TYPE_MIN_SCHEMA_VERSION: u32 = 9;
@@ -68,6 +86,10 @@ pub const RUNTIME_BASES_MIN_SCHEMA_VERSION: u32 = 17;
 pub const RUST_DECLARATION_CONTRACT_MIN_SCHEMA_VERSION: u32 = 18;
 /// Reviewed Rust drop glue first appeared in schema twenty-two.
 pub const RUST_DROP_GLUE_MIN_SCHEMA_VERSION: u32 = 22;
+/// Reviewed Rust destruction effects and exact review scopes.
+pub const RUST_DROP_EFFECTS_MIN_SCHEMA_VERSION: u32 = 31;
+/// Structured alias targets first appeared in schema 32.
+pub const ALIAS_TARGET_MIN_SCHEMA_VERSION: u32 = 32;
 /// Structured channel-close effects and returned-callable bindings first
 /// appeared in schema eleven.
 pub const CHANNEL_CLOSE_EFFECTS_MIN_SCHEMA_VERSION: u32 = 11;
@@ -83,7 +105,10 @@ pub const AMBIENT_USE_MIN_SCHEMA_VERSION: u32 = 3;
 /// The lowest native artifact schema that can carry the runtime-contracts 0.2
 /// companion. Older compiled artifacts deliberately keep their wire shape.
 pub const RUNTIME_CONTRACTS_MIN_SCHEMA_VERSION: u32 = 4;
-pub const PROCEDURE_SUMMARY_CONTRACT_VERSION: u32 = 1;
+/// #9431 carries lifecycle witness and coverage rows in compiled summaries.
+pub const PROCEDURE_SUMMARY_CONTRACT_VERSION: u32 = 2;
+/// #9431 keeps frozen v1 procedure artifacts readable while v2 carries lifecycle claims.
+pub const PROCEDURE_SUMMARY_SUPPORTED_CONTRACT_VERSIONS: &[u32] = &[1, 2];
 pub const MAX_PROCEDURE_SUMMARY_ORDINAL: u32 = 65_535;
 pub const MAX_PROCEDURE_SUMMARY_LOCATIONS: usize = 65_536;
 pub const MAX_PROCEDURE_SUMMARY_TRANSFERS: usize = 65_536;
@@ -91,6 +116,10 @@ pub const MAX_PROCEDURE_SUMMARY_EFFECTS: usize = 65_536;
 pub const MAX_PROCEDURE_SUMMARY_AMBIGUOUS_CALLEES: usize = 4_096;
 pub const MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES: usize = 65_536;
 pub const MAX_PROCEDURE_SUMMARY_MODEL_ID_BYTES: usize = 512;
+/// The longest stable ID, ID component or ID reference a pack may declare. A
+/// report that names a pack record (a type, member or field ID) must accept
+/// every ID the pack format accepts.
+pub const MAX_STABLE_ID_BYTES: usize = 256;
 /// Upper bound on the labels one `sanitize` effect removes. It mirrors the
 /// policy-local `(sanitize :removes [LABEL...])` bound (#1923).
 pub const MAX_PROCEDURE_SUMMARY_SANITIZE_LABELS: usize = 64;
@@ -916,7 +945,7 @@ pub struct AuthoredSemanticModelPack {
     #[serde(skip)]
     #[schemars(skip)]
     pub extraction: Option<ArtifactExtraction>,
-    #[schemars(range(min = 2, max = SEMANTIC_MODEL_SCHEMA_VERSION))]
+    #[schemars(range(min = 2, max = SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION))]
     pub schema_version: u32,
     pub pack_id: String,
     pub version: String,
@@ -955,7 +984,82 @@ pub struct AuthoredSemanticModelPack {
     /// evidence, preserving the serialized form of existing packs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_correspondence: Option<PythonCorrespondenceEvidence>,
+    /// Unresolved Rustdoc references. Activation must prove the selected Cargo
+    /// edge and defining declaration before these become lookup aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_external_reexports: Vec<RustExternalReexport>,
+    #[serde(default, skip_serializing_if = "rust_reexports_not_truncated")]
+    pub rust_external_reexports_truncated: bool,
+    /// Unsupported glob composition affects only names that require a glob.
+    #[serde(default, skip_serializing_if = "rust_reexports_not_truncated")]
+    pub rust_external_reexports_glob_incomplete: bool,
     pub shards: Vec<AuthoredShard>,
+}
+
+pub(crate) fn rust_reexports_not_truncated(value: &bool) -> bool {
+    !*value
+}
+
+/// An external rustdoc item ID is local to one facade document. Its path is
+/// evidence from that document's `paths` table, never from `Use.source`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RustExternalReexportTarget {
+    /// One namespace the target proves, not the full set a named Use imports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<RustReexportTargetNamespace>,
+    pub external_crate_id: u32,
+    pub external_crate_name: String,
+    pub item_id: u32,
+    pub path: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RustReexportTargetNamespace {
+    Value,
+    TypeOrModule,
+    Both,
+}
+
+/// Each variant retains the exact rustdoc form that supplied the edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RustExternalReexport {
+    ExplicitUse {
+        facade_path: String,
+        use_item_id: u32,
+        target: RustExternalReexportTarget,
+    },
+    GlobUse {
+        facade_module_path: String,
+        use_item_id: u32,
+        target_module: RustExternalReexportTarget,
+        /// Names of direct items and named imports in this module. Readers
+        /// decide precedence using their proven Rust namespaces.
+        explicit_competitors: Vec<String>,
+        /// Every other glob in this module, including its exact target. A
+        /// name exported by two globs is ambiguous and must abstain.
+        glob_competitors: Vec<RustExternalReexportTarget>,
+        /// A local or malformed competing glob cannot be ruled out from this
+        /// cross-package proof, so the join abstains.
+        unresolved_glob_competitor: bool,
+    },
+    InlinedItem {
+        facade_path: String,
+        local_item_id: u32,
+        original: RustExternalReexportTarget,
+    },
+}
+
+impl RustExternalReexport {
+    pub fn target(&self) -> &RustExternalReexportTarget {
+        match self {
+            Self::ExplicitUse { target, .. } => target,
+            Self::GlobUse { target_module, .. } => target_module,
+            Self::InlinedItem { original, .. } => original,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1558,8 +1662,6 @@ mod compatibility_tests {
 
     use crate::analyzer::semantic_model::model::Compatibility;
 
-    use crate::analyzer::semantic_model::model::SEMANTIC_MODEL_SCHEMA_VERSION;
-
     use crate::analyzer::semantic_model::model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
     use semver::Version;
 
@@ -1636,7 +1738,9 @@ mod compatibility_tests {
         assert!(missing_legacy.matches_engine(11, &engine).unwrap());
         assert_eq!(
             SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS,
-            (2..=SEMANTIC_MODEL_SCHEMA_VERSION).collect::<Vec<_>>()
+            (2..=22)
+                .chain([26, 27, 28, 29, 30, 31, 32])
+                .collect::<Vec<_>>()
         );
 
         assert!(
@@ -1662,6 +1766,159 @@ pub struct Provenance {
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rust_artifact_approximation: Option<RustArtifactApproximation>,
+}
+
+impl Provenance {
+    /// Close-match dependency artifacts carry an explicit pinned X and
+    /// activation range. This excludes the separate unpinned-stdlib
+    /// approximation route, whose shards may also have `approximate = true`.
+    pub fn is_close_match_approximation(&self) -> bool {
+        self.rust_artifact_approximation.is_some()
+    }
+}
+
+/// The pinned artifact side of an approximate Rust declaration pack. The
+/// resolved Cargo version and direction are computed when this pack activates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RustArtifactApproximation {
+    pub built_from_version: String,
+    pub built_from_features: Vec<String>,
+    pub built_from_cfgs: Vec<String>,
+    pub target: String,
+    pub format_version: u32,
+    pub toolchain: String,
+    pub docsrs_build: bool,
+    pub original_sha256: String,
+    pub produced_sha256: String,
+    pub activation_version_requirement: String,
+    pub mismatch_kinds: Vec<RustArtifactMismatchKind>,
+    pub selection_rule_id: String,
+    pub selection_rule_version: u32,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RustArtifactMismatchKind {
+    VersionNearby,
+    FeatureSuperset,
+    FormatConverted,
+}
+
+impl RustArtifactApproximation {
+    /// The resolved Y is deliberately supplied at activation, never pinned in
+    /// the pack built from X. Both the report and policy advisory use this.
+    pub fn activation_reason(&self, resolved: &semver::Version) -> Result<String, String> {
+        let built = semver::Version::parse(&self.built_from_version)
+            .map_err(|error| format!("invalid built-from Rust artifact version: {error}"))?;
+        if self.selection_rule_id != "cargo-compatible-nearest" || self.selection_rule_version != 1
+        {
+            return Err("unsupported Rust artifact approximation selection rule".into());
+        }
+        let requirement = semver::VersionReq::parse(&self.activation_version_requirement)
+            .map_err(|error| format!("invalid Rust artifact activation range: {error}"))?;
+        if !requirement.matches(&built) || !requirement.matches(resolved) {
+            return Err("Rust artifact activation range excludes X or Y".into());
+        }
+        let same_family = if !built.pre.is_empty() || !resolved.pre.is_empty() {
+            built == *resolved
+        } else if built.major > 0 {
+            built.major == resolved.major
+        } else if built.minor > 0 {
+            built.major == resolved.major && built.minor == resolved.minor
+        } else {
+            built == *resolved
+        };
+        if !same_family {
+            return Err("Rust artifact activation crosses a Cargo breaking boundary".into());
+        }
+        let direction = match built.cmp(resolved) {
+            std::cmp::Ordering::Less => "older_artifact",
+            std::cmp::Ordering::Greater => "newer_artifact",
+            std::cmp::Ordering::Equal => "same_version",
+        };
+        let mut kinds = self
+            .mismatch_kinds
+            .iter()
+            .map(|kind| match kind {
+                RustArtifactMismatchKind::VersionNearby => "version_nearby",
+                RustArtifactMismatchKind::FeatureSuperset => "feature_superset",
+                RustArtifactMismatchKind::FormatConverted => "format_converted",
+            })
+            .collect::<Vec<_>>();
+        if built != *resolved && !kinds.contains(&"version_nearby") {
+            kinds.push("version_nearby");
+        }
+        let kinds = kinds.join(",");
+        Ok(format!(
+            "declaration_artifact_version_approximate built_from={} resolved={} direction={} mismatch_kinds={} rule={}@{}",
+            self.built_from_version,
+            resolved,
+            direction,
+            kinds,
+            self.selection_rule_id,
+            self.selection_rule_version,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod rust_approximation_provenance_tests {
+    use super::{Provenance, RustArtifactApproximation};
+
+    #[test]
+    fn exact_pack_provenance_keeps_its_existing_bytes() {
+        let provenance = Provenance {
+            source: "registry:widget".to_owned(),
+            revision: Some("abc123".to_owned()),
+            rust_artifact_approximation: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&provenance).unwrap(),
+            r#"{"source":"registry:widget","revision":"abc123"}"#,
+        );
+    }
+
+    #[test]
+    fn approximation_reason_is_stable_for_same_y_and_changes_with_y() {
+        let record = RustArtifactApproximation {
+            built_from_version: "0.4.23".to_owned(),
+            built_from_features: vec!["std".to_owned()],
+            built_from_cfgs: vec!["docsrs".to_owned()],
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            format_version: 61,
+            toolchain: "nightly-2026-08-24".to_owned(),
+            docsrs_build: true,
+            original_sha256: "11".repeat(32),
+            produced_sha256: "11".repeat(32),
+            activation_version_requirement: ">=0.4.0, <0.5.0".to_owned(),
+            mismatch_kinds: Vec::new(),
+            selection_rule_id: "cargo-compatible-nearest".to_owned(),
+            selection_rule_version: 1,
+        };
+        let y1 = semver::Version::parse("0.4.25").unwrap();
+        let y2 = semver::Version::parse("0.4.26").unwrap();
+        let warm = record.activation_reason(&y1).unwrap();
+        assert_eq!(warm, record.activation_reason(&y1).unwrap());
+        assert_ne!(warm, record.activation_reason(&y2).unwrap());
+        assert!(warm.contains("built_from=0.4.23 resolved=0.4.25 direction=older_artifact"));
+        assert!(warm.contains("mismatch_kinds=version_nearby"));
+        assert!(
+            !record
+                .activation_reason(&semver::Version::parse("0.4.23").unwrap())
+                .unwrap()
+                .contains("version_nearby")
+        );
+        let outside = semver::Version::parse("0.5.0").unwrap();
+        assert!(record.activation_reason(&outside).is_err());
+        let mut invalid = record.clone();
+        invalid.selection_rule_version += 1;
+        assert!(invalid.activation_reason(&y1).is_err());
+    }
 }
 
 #[derive(
@@ -1670,6 +1927,7 @@ pub struct Provenance {
 #[serde(rename_all = "snake_case")]
 pub enum Completeness {
     Partial,
+    Fenced,
     Complete,
 }
 
@@ -1677,6 +1935,7 @@ impl Completeness {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Partial => "partial",
+            Self::Fenced => "fenced",
             Self::Complete => "complete",
         }
     }
@@ -1857,6 +2116,11 @@ pub struct AuthoredProcedureSummary {
     /// the same discipline `covers_overrides` uses above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_effects: Vec<AuthoredDeclaredEffect>,
+    /// Reviewed receiver effects and exhaustive lifecycle claims (#9431).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_effects: Vec<AuthoredSubjectEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_coverage: Vec<AuthoredLifecycleCoverage>,
     /// Reviewed predicates required of this exact procedure invocation's
     /// inputs. Omission means operation preconditions were not reviewed; a
     /// present empty list means the procedure was reviewed and requires none.
@@ -2121,6 +2385,50 @@ pub enum AuthoredResultPredicate {
 /// `id` is a namespaced identifier (`vendor.effect`); the namespace separator is
 /// required so two vendors can ship packs without colliding on bare words like
 /// `write`.
+/// One reviewed effect of a procedure on its receiver at one exit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredSubjectEffect {
+    pub id: String,
+    pub effect: String,
+    pub subject: AuthoredCoverageSubject,
+    pub exit: AuthoredSummaryExitKind,
+    pub condition: AuthoredCoverageCondition,
+    pub timing: DeclaredEffectTiming,
+    pub certainty: DeclaredEffectCertainty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredCoverageSubject {
+    Receiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredCoverageCondition {
+    Always,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredEventSet {
+    pub name: String,
+    pub version: u32,
+    pub effects: Vec<String>,
+}
+
+/// Exhaustive reviewed receiver effects from this event set at this exit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredLifecycleCoverage {
+    pub id: String,
+    pub event_set: AuthoredEventSet,
+    pub subject: AuthoredCoverageSubject,
+    pub exit: AuthoredSummaryExitKind,
+    pub witnesses: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthoredDeclaredEffect {
@@ -2804,10 +3112,17 @@ pub struct NameSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TypeFact {
+    /// Structured target over this alias's own parameters. Absence makes no claim.
+    /// Rust selected-type readers expand targets through shared type resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_target: Option<TypeRef>,
     pub id: String,
     pub name: String,
     pub type_kind: TypeKind,
     pub visibility: Visibility,
+    /// Enumerated Rust tuple-struct slots. Absence is unknown, not zero fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuple_fields: Option<TupleFieldLayout>,
     #[serde(default)]
     pub is_abstract: bool,
     #[serde(default)]
@@ -2873,6 +3188,63 @@ pub struct TypeFact {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// The public API shape of a Rust tuple struct, including opaque slots that
+/// occupy an ordinal but cannot authorize a field projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TupleFieldLayout {
+    pub arity: u32,
+    #[serde(default)]
+    pub fields: Vec<TupleFieldSlot>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_exhaustive: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_hidden: bool,
+}
+
+impl TupleFieldLayout {
+    pub fn is_complete(&self) -> bool {
+        !self.non_exhaustive
+            && !self.owner_hidden
+            && self.fields.len() == self.arity as usize
+            && self.fields.iter().enumerate().all(|(index, slot)| {
+                slot.ordinal() == index as u32 && matches!(slot, TupleFieldSlot::Public { .. })
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TupleFieldSlot {
+    Public {
+        ordinal: u32,
+        id: String,
+        r#type: TypeRef,
+    },
+    Opaque {
+        ordinal: u32,
+        visibility: TupleFieldVisibility,
+    },
+}
+
+/// Why this ordinal cannot be used as an externally visible field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TupleFieldVisibility {
+    Private,
+    Restricted,
+    Hidden,
+    Stripped,
+}
+
+impl TupleFieldSlot {
+    pub fn ordinal(&self) -> u32 {
+        match self {
+            Self::Public { ordinal, .. } | Self::Opaque { ordinal, .. } => *ordinal,
+        }
+    }
 }
 
 /// Rustdoc const defaults are compiler-rendered scalar expressions, not parsed source.
@@ -3060,6 +3432,276 @@ pub struct TypeValueSemantics {
     /// makes no claim, so the value's scope exit stays unproven.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop_glue: Option<TypeDropGlue>,
+    /// Reviewed library destruction; never a synonym for inert glue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_effects: Option<TypeDropEffects>,
+    /// Exact reviewed applicability for either destruction claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_review: Option<TypeDropReview>,
+}
+
+/// A complete library effect bound; payload and cross-crate fields compose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeDropEffects {
+    pub kind: TypeDropEffectKind,
+    pub payloads: Vec<TypeRef>,
+    pub field_types: Vec<TypeRef>,
+    pub internal_field_coverage: TypeDropFieldCoverage,
+    pub allocator_assumption: TypeDropAllocatorAssumption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeDropEffectKind {
+    MemoryOrRefcountRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeDropFieldCoverage {
+    ReviewedTransitive,
+}
+
+/// Environment assumption shared with existing standard owned-memory admission.
+/// Applies only to consumers for which memory/refcount release is unobservable.
+/// A proof relying on this assumption must retain it in its provenance.
+/// A complete allocator census will tighten both paths together (#10969).
+pub const GLOBAL_ALLOCATOR_RELEASE_ASSUMPTION: &str =
+    "global-allocator deallocation performs only memory release and no Q-observable effect";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeDropAllocatorAssumption {
+    None,
+    // Relies on GLOBAL_ALLOCATOR_RELEASE_ASSUMPTION.
+    GlobalMemoryReleaseOnly,
+}
+
+/// Review evidence is per crate, never a certificate for a dependency closure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeDropReview {
+    pub scope: TypeDropReviewScope,
+    pub review: TypeDropReviewProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TypeDropReviewProvenance {
+    pub source: String,
+    pub revision: String,
+    pub source_digests: Vec<String>,
+    /// Required for feature-superset close matching: review included negative cfgs.
+    /// An absent attestation permits exact feature matches only.
+    #[serde(default)]
+    pub cfg_not_features_reviewed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TypeDropReviewScope {
+    Cargo {
+        package: String,
+        version: String,
+        source_sha256: String,
+        enabled_features: Vec<String>,
+        target: String,
+        cfgs: Vec<String>,
+    },
+    RustStd {
+        toolchain: String,
+        source_revision: String,
+        target: String,
+        cfgs: Vec<String>,
+    },
+}
+
+/// Selection evidence is provided only when package/features/configuration
+/// are complete. Missing evidence is passed as None to the admission function.
+pub enum DropReviewSelection<'a> {
+    Exact {
+        scope: &'a TypeDropReviewScope,
+        cargo_requirement: Option<&'a str>,
+    },
+    CargoRequirement {
+        package: &'a str,
+        requirement: &'a str,
+        enabled_features: &'a [String],
+        target: &'a str,
+        cfgs: &'a [String],
+    },
+}
+
+/// The result names the chosen candidate; approximation evidence must accompany
+/// every consuming discharge, including memo hits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropReviewAdmission {
+    Exact {
+        candidate: usize,
+    },
+    Approximate {
+        candidate: usize,
+        diagnostic: String,
+    },
+    Unknown,
+}
+
+/// One admission and ranking policy for all reviewed destruction facts.
+/// Exact locked scope wins; then exact version with reviewed feature coverage;
+/// then nearest caret-compatible version. Distance is lexicographic absolute
+/// (major, minor, patch) delta; equal deltas prefer the lower SemVer. Without a
+/// lock, the caret lower bound is the ranking anchor and is never called exact.
+/// Scope admission alone does not establish payload or allocator effects.
+pub fn drop_review_scope_admits(
+    candidates: &[TypeDropReview],
+    selected: Option<DropReviewSelection<'_>>,
+) -> DropReviewAdmission {
+    let Some(selected) = selected else {
+        return DropReviewAdmission::Unknown;
+    };
+    let (exact, package, requirement, features, target, cfgs) = match selected {
+        DropReviewSelection::Exact {
+            scope,
+            cargo_requirement,
+        } => {
+            let exact_candidate = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| &candidate.scope == scope)
+                .min_by_key(|(_, candidate)| {
+                    serde_json::to_string(candidate).expect("review is serializable")
+                });
+            if let Some((candidate, _)) = exact_candidate {
+                return DropReviewAdmission::Exact { candidate };
+            }
+            let TypeDropReviewScope::Cargo {
+                package,
+                enabled_features,
+                target,
+                cfgs,
+                ..
+            } = scope
+            else {
+                return DropReviewAdmission::Unknown;
+            };
+            (
+                Some(scope),
+                package.as_str(),
+                cargo_requirement,
+                enabled_features.as_slice(),
+                target.as_str(),
+                cfgs.as_slice(),
+            )
+        }
+        DropReviewSelection::CargoRequirement {
+            package,
+            requirement,
+            enabled_features,
+            target,
+            cfgs,
+        } => (
+            None,
+            package,
+            Some(requirement),
+            enabled_features,
+            target,
+            cfgs,
+        ),
+    };
+    let range = requirement
+        .and_then(|requirement| VersionReq::parse(requirement).ok())
+        .filter(|range| {
+            range.comparators.len() == 1 && range.comparators[0].op == semver::Op::Caret
+        });
+    let locked_version = match exact {
+        Some(TypeDropReviewScope::Cargo { version, .. }) => Version::parse(version).ok(),
+        _ => None,
+    };
+    let anchor = locked_version.clone().or_else(|| {
+        range.as_ref().map(|range| {
+            let comparator = &range.comparators[0];
+            Version::new(
+                comparator.major,
+                comparator.minor.unwrap_or(0),
+                comparator.patch.unwrap_or(0),
+            )
+        })
+    });
+    let Some(anchor) = anchor else {
+        return DropReviewAdmission::Unknown;
+    };
+    let chosen = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reviewed)| {
+            let TypeDropReviewScope::Cargo {
+                package: reviewed_package,
+                version,
+                source_sha256,
+                enabled_features: reviewed_features,
+                target: reviewed_target,
+                cfgs: reviewed_cfgs,
+            } = &reviewed.scope
+            else {
+                return None;
+            };
+            let version = Version::parse(version).ok()?;
+            if package != reviewed_package
+                || target != reviewed_target
+                || cfgs != reviewed_cfgs
+                || (features != reviewed_features && !reviewed.review.cfg_not_features_reviewed)
+                || !features
+                    .iter()
+                    .all(|feature| reviewed_features.contains(feature))
+            {
+                return None;
+            }
+            let same_version = locked_version.as_ref() == Some(&version);
+            if same_version {
+                if let Some(TypeDropReviewScope::Cargo {
+                    source_sha256: selected_digest,
+                    ..
+                }) = exact
+                    && selected_digest != source_sha256
+                {
+                    return None;
+                }
+            } else if !range.as_ref().is_some_and(|range| range.matches(&version)) {
+                return None;
+            }
+            let rank = (
+                u8::from(!same_version),
+                anchor.major.abs_diff(version.major),
+                anchor.minor.abs_diff(version.minor),
+                anchor.patch.abs_diff(version.patch),
+                version > anchor,
+                version.clone(),
+                serde_json::to_string(reviewed).expect("review is serializable"),
+            );
+            Some((
+                rank,
+                index,
+                version,
+                reviewed_features,
+                reviewed.review.cfg_not_features_reviewed,
+            ))
+        })
+        .min_by(|left, right| left.0.cmp(&right.0));
+    let Some((_, candidate, reviewed_version, reviewed_features, cfg_not_reviewed)) = chosen else {
+        return DropReviewAdmission::Unknown;
+    };
+    DropReviewAdmission::Approximate {
+        candidate,
+        diagnostic: format!(
+            "drop_review_scope_approximate reviewed_version={reviewed_version} selected_version={} requirement={} reviewed_features={reviewed_features:?} selected_features={features:?} cfg_not_features_reviewed={cfg_not_reviewed}",
+            locked_version
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unresolved".into()),
+            requirement.unwrap_or("unavailable")
+        ),
+    }
 }
 
 /// Reviewed Rust drop glue for one declared type.
@@ -3583,7 +4225,9 @@ pub struct Signature {
     pub returns: Option<TypeRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Parameter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3620,7 +4264,9 @@ impl Parameter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ParameterRole {
     Request,
@@ -3632,7 +4278,20 @@ pub enum ParameterRole {
 /// additionally use `/` and `*` to declare positional-only and named-only
 /// regions; preserving that distinction prevents an exact model binding from
 /// accepting a call the declared API itself rejects.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ParameterPassingMode {
     PositionalOnly,
@@ -3663,7 +4322,9 @@ impl ParameterPassingMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TypeRef {
     /// Rust associated-type projection, retained without claiming a solved type.
@@ -3741,6 +4402,67 @@ pub enum TypeRef {
 }
 
 impl TypeRef {
+    /// Substitute type variables simultaneously. An unbound variable leaves
+    /// the result unknown to the caller.
+    pub fn substitute(
+        &self,
+        bindings: &std::collections::HashMap<String, TypeRef>,
+        depth: u8,
+    ) -> Option<TypeRef> {
+        if depth == 0 {
+            return None;
+        }
+        Some(match self {
+            Self::TypeParameter { name } => bindings.get(name)?.clone(),
+            Self::Named {
+                name,
+                arguments,
+                nullable,
+            } => Self::Named {
+                name: name.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| argument.substitute(bindings, depth - 1))
+                    .collect::<Option<_>>()?,
+                nullable: *nullable,
+            },
+            Self::Declared {
+                id,
+                arguments,
+                nullable,
+            } => Self::Declared {
+                id: id.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| argument.substitute(bindings, depth - 1))
+                    .collect::<Option<_>>()?,
+                nullable: *nullable,
+            },
+            Self::Slice { element } => Self::Slice {
+                element: Box::new(element.substitute(bindings, depth - 1)?),
+            },
+            Self::ByRef {
+                element,
+                reference_kind,
+            } => Self::ByRef {
+                element: Box::new(element.substitute(bindings, depth - 1)?),
+                reference_kind: *reference_kind,
+            },
+            Self::Array { element } => Self::Array {
+                element: Box::new(element.substitute(bindings, depth - 1)?),
+            },
+            Self::Wildcard { variance, bound } => Self::Wildcard {
+                variance: *variance,
+                bound: match bound {
+                    Some(bound) => Some(Box::new(bound.substitute(bindings, depth - 1)?)),
+                    None => None,
+                },
+            },
+            Self::Unknown => Self::Unknown,
+            _ => return None,
+        })
+    }
+
     #[doc(hidden)]
     pub fn named(name: impl Into<String>) -> Self {
         Self::Named {
@@ -3810,7 +4532,20 @@ impl Signature {
 /// here lets C++ copy and move overloads retain distinct parameter identities,
 /// while producers that do not distinguish categories continue to use the
 /// default lvalue form.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TypeRefReferenceKind {
     #[default]
@@ -3824,7 +4559,9 @@ impl TypeRefReferenceKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelDirection {
     Bidirectional,
@@ -3832,7 +4569,9 @@ pub enum ChannelDirection {
     Send,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum WildcardVariance {
     Any,

@@ -133,7 +133,7 @@ pub(super) fn member_family_expansions_for_declaration(
             target: edge.target.clone(),
             relation: edge.relation,
             depth: edge.depth,
-            proof: if edge.arity_unique {
+            proof: if edge.structurally_unique {
                 "proven"
             } else {
                 "unproven"

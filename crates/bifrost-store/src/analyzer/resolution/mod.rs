@@ -36,13 +36,14 @@ pub mod precedence;
 pub mod query_obligations;
 #[doc(hidden)]
 pub mod remount;
+#[doc(hidden)]
+pub mod tier_evaluator;
 pub use query_obligations::{QueryObligation, QueryObligations};
 mod saturation;
 pub mod seam_profile;
 pub mod seed_key_profile;
 #[doc(hidden)]
 pub mod selected_context;
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod temporal_binding;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -84,7 +85,7 @@ pub use engine::cancelled_completion;
 
 pub(crate) use fact_resolution::{
     QualifiedMemberId, QualifiedMemberInput, QualifiedMemberProvider, TypedConstructionInput,
-    completion_without_unsupported_semantic,
+    TypedConstructionResult, completion_without_unsupported_semantic,
 };
 
 pub(crate) use fact_source::language_identity_domain;
@@ -321,13 +322,6 @@ fn partial_path_id_for_test(value: &str) -> PartialPathId {
 pub(crate) use fact_lowering::jvm_terminal_type_gap_origin_is_safe;
 pub(crate) use fact_lowering::jvm_type_prefix_gap_origin_is_safe;
 
-static GO_UNIVERSE_IDENTITY_DIGESTS: std::sync::LazyLock<HashSet<[u8; 32]>> =
-    std::sync::LazyLock::new(|| {
-        universe::go_entries()
-            .map(universe::identity_digest)
-            .collect()
-    });
-
 pub(crate) fn go_universe_identity_digest(
     namespace: brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace,
     spelling: &str,
@@ -344,10 +338,9 @@ fn never_cancelled() -> bool {
     false
 }
 
-/// Recognize one selected Go universe identity without projecting it as a
-/// source declaration. The Go universe is a fixed language table, and each
-/// entry is compared through the same shared identity used during binding.
-pub(crate) fn is_go_universe_identity(
+/// Ask the selected universe entry's language rule whether it is runtime-provided.
+/// Workspace and local declarations cannot share a universe identity.
+pub(crate) fn is_predeclared_universe_identity(
     source: &impl BatchResolutionFragmentSource,
     identity: SemanticId,
     cancellation: &crate::CancellationToken,
@@ -355,20 +348,15 @@ pub(crate) fn is_go_universe_identity(
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    if !source.supports_go_universe() {
-        return Ok(Some(false));
-    }
-    let Some(digest) = source.shared_name_digest_for_identity(identity, cancellation)? else {
-        return if cancellation.is_cancelled() {
-            Ok(None)
-        } else {
-            Ok(Some(false))
-        };
-    };
+    let entry = universe_entry_for_identity(source, identity, cancellation)?;
     if cancellation.is_cancelled() {
         return Ok(None);
     }
-    Ok(Some(GO_UNIVERSE_IDENTITY_DIGESTS.contains(&digest)))
+    Ok(Some(entry.is_some_and(|entry| {
+        entry.predeclared
+            && (entry.language != brokk_bifrost_core::analyzer::Language::Go
+                || source.supports_go_universe())
+    })))
 }
 
 /// Identify a fixed language-universe rule from its selected scalar identity.
@@ -425,6 +413,8 @@ pub(super) const fn binding_projection_kind_rank(
         BindingProjectionKind::TargetNominalTypeIdentity => 6,
         BindingProjectionKind::TargetCallableLaterResultType => 7,
         BindingProjectionKind::NonInvokingMemberReference => 8,
+        BindingProjectionKind::BareTermBinding => 9,
+        BindingProjectionKind::BareTermBindingNoExpectedType => 10,
     }
 }
 
@@ -441,6 +431,7 @@ pub(super) const fn declaration_type_role_rank(
         DeclarationTypeRole::NominalIdentity => 4,
         DeclarationTypeRole::CallableFirstResult => 5,
         DeclarationTypeRole::ObservedValue => 6,
+        DeclarationTypeRole::EvaluatedValue => 7,
     }
 }
 
@@ -506,8 +497,6 @@ pub(crate) use demand_overlay::DemandSelectedOverlayBlueprint;
 pub use engine::PreloadedFragment;
 pub use engine::PreloadedFragmentSource;
 pub use engine::ReferenceSearchAnswer;
-pub use engine::ResolutionEngine;
-pub use engine::ResolutionFragmentSource;
 pub use engine::ResolutionQuery;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -660,14 +649,17 @@ pub(crate) use fact_resolution::SelectedFactOperationBlueprint;
 pub use fact_resolution::SelectedFactOperationBlueprintConstruction;
 #[doc(hidden)]
 pub use fact_resolution::{
-    CanonicalTypeIdentity, CanonicalTypeNode, canonical_projected_type_identity,
-    canonical_type_identity,
+    CanonicalChannelDirection, CanonicalTypeIdentity, CanonicalTypeNode,
+    canonical_projected_type_identity, canonical_type_identity,
 };
 
 #[cfg(any(test, feature = "test-support"))]
 pub use fact_resolution::reset_reverse_fact_evaluation_count_for_test;
 #[cfg(any(test, feature = "test-support"))]
 pub use fact_resolution::reverse_fact_evaluation_count_for_test;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use fact_resolution::with_full_typed_pass_for_test;
 pub(crate) use fact_resolution::{
     CloseContinuationId, CloseProgress, CloseResume, HierarchyCursorScope,
     HierarchyLinearizationPolicy, HierarchyOrderBudget, HierarchyOrderDecision,
@@ -677,6 +669,11 @@ pub(crate) use fact_resolution::{
     HierarchyProviderObservation, HierarchyProviderOperand, HierarchyProviderVisit,
     HierarchySelectionProvenance, HierarchySequenceId, HierarchySequenceRole,
     HierarchyTailMembership, ProviderObservationStore, RootClosure,
+};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use fact_resolution::{
+    assert_full_typed_round_parity_by_for_test, assert_full_typed_round_parity_for_test,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -760,6 +757,7 @@ pub use fact_source::TypedFactReadOutcome;
 pub use fact_source::TypedFactReadTerminal;
 pub use fact_source::TypedFactRequest;
 pub use fact_source::{FactModelMember, FactModelMemberSelection};
+pub(crate) use fact_source::{SelectedJavaGapOccurrence, SelectedJavaTypeFrontierContribution};
 
 pub(crate) use local_identity::SUPPLEMENTAL_LOCAL_KEY_BASE;
 
@@ -833,6 +831,7 @@ pub use model::WitnessStep;
 
 pub(crate) use model::BindingOrigin;
 pub(crate) use model::GoBindingClassification;
+pub(crate) use model::LexicalChoiceRecord;
 pub(crate) use model::UnindexedExternalFrontier;
 pub(crate) use model::binding_origin_rank;
 pub(crate) use model::classify_binding_namespace;
@@ -862,6 +861,8 @@ pub(crate) use selected_context::SelectedContextPathPublication;
 pub(crate) use selected_context::SelectedContextPathPublicationOutcome;
 pub(crate) use selected_context::SelectedContextPathSource;
 pub(crate) use selected_context::SelectedContextPathToken;
+#[doc(hidden)]
+pub use selected_context::SelectedExplicitImportBoundary;
 pub(crate) use selected_context::SelectedJvmBridgeEvidence;
 pub(crate) use selected_context::SelectedJvmBridgeProvenance;
 pub(crate) use selected_context::SelectedJvmBridgeVisibility;
@@ -1150,6 +1151,7 @@ impl LoweredResolutionFactsWithIdentityCatalog {
             site.node(),
             Some(changed),
         )
+        .with_prefix_reference(site.prefix_reference())
         .with_go_definition_namespaces(site.go_definition_namespaces());
         let lexical = fact_lowering::LoweredResolutionFragment::new(
             self.lexical.fragment(),
@@ -1449,22 +1451,33 @@ pub fn lower_resolution_facts_for_selection(
 ) -> LoweredResolutionFactsWithIdentityCatalog {
     common_fact_lowering::validate_binding_facts(facts);
     let mut identities = ResolutionIdentityCatalogBuilder::new(fragment, names);
-    let mut lexical = fact_lowering::lower_file_resolution_facts_with_identities(
-        &mut identities,
-        language,
-        facts,
-    );
-    let normalized = local_writes::attach_local_writes(facts, &lexical, &mut identities);
-    let facts = normalized.as_ref();
-    if matches!(normalized, std::borrow::Cow::Owned(_)) {
-        // New join slots and failed attachment gaps must be published by both
-        // lexical coverage and typed lowering, under the same identity catalog.
-        lexical = fact_lowering::lower_file_resolution_facts_with_identities(
+    // Only a local write needs the lexical graph to find its target. Without
+    // one, attachment normalizes first and the file lowers once; with one,
+    // the new join slots and failed attachment gaps must be published by both
+    // lexical coverage and typed lowering, under the same identity catalog.
+    let (lexical, normalized) = if facts.local_writes.is_empty() {
+        let normalized = local_writes::attach_binding_values(facts, language);
+        let lexical = fact_lowering::lower_file_resolution_facts_with_identities(
+            &mut identities,
+            language,
+            normalized.as_ref(),
+        );
+        (lexical, normalized)
+    } else {
+        let lexical = fact_lowering::lower_file_resolution_facts_with_identities(
             &mut identities,
             language,
             facts,
         );
-    }
+        let normalized = local_writes::attach_local_writes(facts, &lexical, &mut identities);
+        let lexical = fact_lowering::lower_file_resolution_facts_with_identities(
+            &mut identities,
+            language,
+            normalized.as_ref(),
+        );
+        (lexical, normalized)
+    };
+    let facts = normalized.as_ref();
     let typed = typed_fact_lowering::lower_typed_resolution_facts_with_identities(
         &mut identities,
         language,

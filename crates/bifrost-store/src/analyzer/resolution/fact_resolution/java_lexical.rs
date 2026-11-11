@@ -38,6 +38,30 @@ struct JavaLexicalReplay {
     active: Option<DemandForwardBatchFrame>,
 }
 
+fn settle_selected_hierarchy_occurrence(
+    branch: PartialPath,
+    identity: CandidatePathIdentity,
+    selected_owner: bool,
+    transferred: &BTreeSet<SemanticId>,
+) -> PartialPath {
+    if !selected_owner {
+        return branch;
+    }
+    let Some(index) = branch.addressed_lexical_choice() else {
+        return branch;
+    };
+    let record = &branch.lexical_choices()[index];
+    if record.source_fragment == identity.fragment()
+        && record.source_path == identity.path()
+        && record.owner == branch.start().node()
+        && matches!(record.reason, ResolutionIncompleteReason::UnsupportedSemantic(reason) if transferred.contains(&reason))
+    {
+        branch.settle_addressed_lexical_choice()
+    } else {
+        branch
+    }
+}
+
 impl PendingLexicalHierarchy {
     pub(super) fn new(
         answers: Vec<(SemanticId, SharedAnswer)>,
@@ -390,6 +414,31 @@ impl JavaLexicalReplay {
         if !current_type_is_jvm {
             current_type = None;
         }
+        // A marked Scala bare term has the same three term-family lookup
+        // routes as an application, but no CallFact. SLS 2.13 chapter 2,
+        // Identifiers, Names and Scopes: an inherited member binds in the
+        // template scope before an outer same-name term. Its Callable route
+        // therefore needs the same ancestor proof as an applied member.
+        // Replay that hierarchy proof from the marker, without inventing an
+        // argument list. Only the Scala producer emits this marker; shared
+        // replay keys on the structural fact instead of the language.
+        let bare_term = if lookups.len() != 1 && !has_jvm_call {
+            let read = evaluation
+                .session
+                .projections_for_references(&[reference])?;
+            let Some(projections) = evaluation.accept_session_read(read) else {
+                return Ok(None);
+            };
+            projections.iter().any(|projection| {
+                projection
+                    .get(evaluation.session)
+                    .row()
+                    .kind()
+                    .is_bare_term_binding()
+            })
+        } else {
+            false
+        };
         if lookups.len() != 1
             && (!matches!(
                 metadata.namespace(),
@@ -397,6 +446,7 @@ impl JavaLexicalReplay {
                     | ResolutionNamespace::Callable
                     | ResolutionNamespace::TypeOrValue
             ) || (!matches!(metadata.namespace(), ResolutionNamespace::TypeOrValue)
+                && !bare_term
                 && !calls.iter().any(|call| {
                     let call = call.get(evaluation.session).row();
                     call.callee_reference() == reference
@@ -405,16 +455,17 @@ impl JavaLexicalReplay {
         {
             return Ok(None);
         }
-        let callable_overload_set = has_jvm_call;
+        let callable_overload_set = has_jvm_call || bare_term;
         if metadata.namespace() == ResolutionNamespace::Callable && !callable_overload_set {
             return Ok(None);
         }
-        let call_namespace_ladder = calls.iter().any(|call| {
-            let call = call.get(evaluation.session).row();
-            call.callee_reference() == reference
-                && super::super::fact_lowering::call_target_lookup_routes(call.language(), true)
-                    .is_some()
-        });
+        let call_namespace_ladder = bare_term
+            || calls.iter().any(|call| {
+                let call = call.get(evaluation.session).row();
+                call.callee_reference() == reference
+                    && super::super::fact_lowering::call_target_lookup_routes(call.language(), true)
+                        .is_some()
+            });
         let mut shapes = Vec::with_capacity(lookups.len());
         for lookup in lookups {
             // Scala calls carry Callable, Value and Type lookup routes. Each
@@ -443,15 +494,13 @@ impl JavaLexicalReplay {
                 },
                 0,
             );
-            shapes.push(
-                if callable_overload_set
-                    && (!call_namespace_ladder || namespace == ResolutionNamespace::Callable)
-                {
-                    shape.with_callable_overload_set()
-                } else {
-                    shape
-                },
-            );
+            // A bare Scala term can carry a Callable route without a CallFact.
+            // Its inherited method search still needs the callable policy.
+            shapes.push(if namespace == ResolutionNamespace::Callable {
+                shape.with_callable_overload_set()
+            } else {
+                shape
+            });
         }
         let mut branches = Vec::new();
         let mut enclosing_type_branches = Vec::new();
@@ -677,10 +726,61 @@ impl JavaLexicalReplay {
                     return Ok(Ready(None));
                 };
                 if outside_root {
-                    self.removals.push(*identity);
-                    self.group = None;
-                    self.cursor += 1;
-                    return Ok(Continue);
+                    let addressed = branch.addressed_lexical_choice().and_then(|index| {
+                        let record = &branch.lexical_choices()[index];
+                        (record.source_fragment == identity.fragment()
+                            && record.source_path == identity.path()
+                            && record.owner == branch.start().node())
+                        .then_some(record.reason)
+                    });
+                    if let Some(reason) = addressed {
+                        let Some(replacement) = branch
+                            .clone_with_poll(&mut || evaluation.poll_cancelled())
+                            .and_then(|path| {
+                                path.settle_addressed_lexical_choice()
+                                    .without_reasons_with_poll(&[reason], &mut || {
+                                        evaluation.poll_cancelled()
+                                    })
+                            })
+                        else {
+                            return Ok(Ready(None));
+                        };
+                        self.removals.push(*identity);
+                        if !replacement.lexical_choices().is_empty() {
+                            let mut descriptor = CanonicalIdentityDescriptor::new(
+                                b"bifrost-java-lexical-closed-empty-retained-9002:v1",
+                                |key| {
+                                    evaluation
+                                        .session
+                                        .identity_digest(evaluation.hierarchy, key)
+                                },
+                            );
+                            descriptor.field(
+                                "branch",
+                                CanonicalIdentityPart::identity(identity.path()),
+                            )?;
+                            descriptor.field(
+                                "fragment",
+                                CanonicalIdentityPart::identity(identity.fragment()),
+                            )?;
+                            descriptor
+                                .field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
+                            let path_id = evaluation.hierarchy.operation_path(descriptor.finish());
+                            self.additions.push((
+                                CandidatePathIdentity::new(identity.fragment(), path_id),
+                                replacement,
+                            ));
+                        }
+                        self.group = None;
+                        self.cursor += 1;
+                        return Ok(Continue);
+                    }
+                    if branch.lexical_choices().is_empty() {
+                        self.removals.push(*identity);
+                        self.group = None;
+                        self.cursor += 1;
+                        return Ok(Continue);
+                    }
                 }
             }
             let (paths, remove_branch) = evaluation.java_lexical_bridges(
@@ -744,7 +844,36 @@ impl JavaLexicalReplay {
                     .map(|(identity, _)| *identity)
                     .collect(),
             };
-            if let Some(answer) = evaluation.hierarchy.java_lexical_reruns.get(&key).cloned() {
+            let cached = if evaluation
+                .prefix_read_scope(self.seed.reference())
+                .is_some()
+            {
+                let cached = evaluation
+                    .hierarchy
+                    .java_lexical_reruns
+                    .get(&key)
+                    .map(|entry| {
+                        entry
+                            .read(
+                                &mut evaluation
+                                    .query_obligations
+                                    .node(QueryNode::Lexical(self.seed.reference())),
+                            )
+                            .clone()
+                    });
+                record_resolution_work(
+                    if cached.is_some() {
+                        ResolutionWork::JavaRerunMemoHit
+                    } else {
+                        ResolutionWork::JavaRerunMemoMiss
+                    },
+                    1,
+                );
+                cached
+            } else {
+                None
+            };
+            if let Some(answer) = cached {
                 self.removals.clear();
                 self.additions.clear();
                 evaluation.observe_resolution_answer_cancellation_evidence(&answer);
@@ -831,15 +960,21 @@ impl JavaLexicalReplay {
         let (reference, answer) = answers.into_vec().pop().unwrap().into_parts();
         assert_eq!(reference, self.seed.reference());
         evaluation.observe_resolution_answer_cancellation_evidence(&answer);
-        if !evaluation.cancellation_observed {
+        if !evaluation.cancellation_observed
+            && let Some(prefix_scope) = evaluation.prefix_read_scope(reference)
+        {
             let key = self
                 .rerun_key
                 .clone()
                 .expect("a re-evaluation records its overlay composition");
+            let mut scope = evaluation
+                .query_obligations
+                .scope(QueryNode::Lexical(reference));
+            scope.union(&prefix_scope);
             evaluation
                 .hierarchy
                 .java_lexical_reruns
-                .insert(key, answer.clone());
+                .insert(key, ClosedQueryValue::new(answer.clone(), scope));
         }
         Ok(DemandQualifiedPoll::Ready(Some(answer)))
     }
@@ -1080,12 +1215,32 @@ impl FactEvaluation<'_, '_> {
         }
         // Transfer applies only to this exact source-owned branch. Its residual
         // reasons and the selected hierarchy evidence remain on each replacement.
+        let Some(mut branch_after) = branch.clone_with_poll(&mut || self.poll_cancelled()) else {
+            return Ok((additions, false));
+        };
+        // Moving an unresolved gap with no selected owner is not a proof that
+        // the lexical branch was discharged. Closed-empty proof is handled by
+        // the poll path; here the owner must take responsibility for the gap.
+        branch_after = settle_selected_hierarchy_occurrence(
+            branch_after,
+            branch_identity,
+            !selection.owners.is_empty(),
+            &transferred,
+        );
         let Some(branch_completion) =
+            self.completion_after_hierarchy_transfer_for_path(&branch_after, &transferred)
+        else {
+            return Ok((additions, false));
+        };
+        // Route progress and lexical settlement are separate proofs. A
+        // transfer may move to the next terminal while the original gap still
+        // belongs to this open lexical occurrence.
+        let Some(route_completion) =
             self.completion_after_hierarchy_transfer(branch.completion(), &transferred)
         else {
             return Ok((additions, false));
         };
-        let replaces_branch = branch_completion != *branch.completion();
+        let replaces_branch = route_completion != *branch.completion();
         let Some(completion) =
             self.hierarchy
                 .evidence
@@ -1106,12 +1261,15 @@ impl FactEvaluation<'_, '_> {
         // Other lexical branches retain their independent placement uncertainty.
         if selection.owners.is_empty() && replaces_branch {
             let normalized = branch_completion.combine(&completion);
-            if normalized == ResolutionCompletion::Complete {
+            let route_normalized = route_completion.combine(&completion);
+            if normalized == ResolutionCompletion::Complete
+                && branch_after.lexical_choices().is_empty()
+            {
                 return Ok((additions, true));
             }
-            if normalized != *branch.completion() {
+            if route_normalized != *branch.completion() {
                 let Some(endpoint) =
-                    self.java_inherited_frontier_endpoint(branch.end(), &normalized)?
+                    self.java_inherited_frontier_endpoint(branch.end(), &route_normalized)?
                 else {
                     return Ok((additions, false));
                 };
@@ -1120,7 +1278,7 @@ impl FactEvaluation<'_, '_> {
                     endpoint,
                     branch.precedence().to_vec().into_boxed_slice(),
                     branch.witness().to_vec().into_boxed_slice(),
-                    normalized,
+                    route_normalized,
                     &mut || self.poll_cancelled(),
                 ) else {
                     return Ok((additions, false));
@@ -1139,6 +1297,7 @@ impl FactEvaluation<'_, '_> {
                 )?;
                 descriptor.field("lookup", CanonicalIdentityPart::identity(shape.lookup))?;
                 let path_id = self.hierarchy.operation_path(descriptor.finish());
+                let path = path.carry_lexical_choices_from(&branch_after);
                 additions.push((
                     CandidatePathIdentity::new(branch_identity.fragment(), path_id),
                     path,
@@ -1182,8 +1341,14 @@ impl FactEvaluation<'_, '_> {
                         && (coverage.supertypes_complete || coverage.member_names_only)
                         && scope_completion == ResolutionCompletion::Complete
                     {
+                        let member_owner = self
+                            .selected_scala_anyref_object(selected.owner)?
+                            .unwrap_or(selected.owner);
+                        if self.cancellation_observed {
+                            return Ok((additions, false));
+                        }
                         let Some(family) = self.external_member_family(
-                            selected.owner,
+                            member_owner,
                             shape,
                             coverage,
                             selected.owner_path.clone(),
@@ -1286,7 +1451,9 @@ impl FactEvaluation<'_, '_> {
                                     branch_completion
                                         .combine(&completion)
                                         .combine(family.completion()),
-                                ),
+                                )
+                                .carry_lexical_choices_from(&branch_after)
+                                .without_addressed_lexical_choice(),
                             ));
                         }
                         continue;
@@ -1337,7 +1504,9 @@ impl FactEvaluation<'_, '_> {
                             branch.precedence().to_vec(),
                             steps,
                             external_completion,
-                        ),
+                        )
+                        .carry_lexical_choices_from(&branch_after)
+                        .without_addressed_lexical_choice(),
                     ));
                     continue;
                 }
@@ -1364,7 +1533,10 @@ impl FactEvaluation<'_, '_> {
                         witness,
                         branch_completion.clone(),
                     );
-                    let prefix = prefix.with_additional_completion(&completion);
+                    let prefix = prefix
+                        .carry_lexical_choices_from(&branch_after)
+                        .without_addressed_lexical_choice()
+                        .with_additional_completion(&completion);
                     let Some(Ok(composed)) =
                         prefix.concatenate_with_poll(&path, &mut || self.poll_cancelled())
                     else {
@@ -1611,5 +1783,58 @@ impl FactEvaluation<'_, '_> {
             implicit_root_references.extend(unresolved);
         }
         Ok(Some(Some(implicit_root_references)))
+    }
+}
+
+#[cfg(test)]
+mod settlement_contract_tests {
+    use super::*;
+    use crate::analyzer::resolution::model::LexicalChoiceRecord;
+
+    #[test]
+    fn ownerless_transfer_keeps_addressed_gap_and_selected_owner_settles_only_it() {
+        let fragment = BindingFragmentId::for_test(b"9002-settlement-fragment");
+        let path = PartialPathId::for_test(b"9002-settlement-path");
+        let sibling_path = PartialPathId::for_test(b"9002-settlement-sibling");
+        let identity = CandidatePathIdentity::new(fragment, path);
+        let owner = BindingNodeId::universal_root();
+        let reason_id = SemanticId::for_test(b"9002-1127-gap");
+        let reason = ResolutionIncompleteReason::UnsupportedSemantic(reason_id);
+        let endpoint = super::super::super::open_endpoint(
+            owner,
+            Vec::<SemanticId>::new(),
+            StackVariableId::operation_local(0),
+        );
+        let record = |source_path| LexicalChoiceRecord {
+            source_fragment: fragment,
+            source_path,
+            reason,
+            owner,
+            precedence: Box::new([]),
+            segment_position: 0,
+        };
+        let branch = PartialPath::new(
+            endpoint.clone(),
+            endpoint,
+            Vec::<PrecedenceStep>::new(),
+            Vec::<WitnessStep>::new(),
+            ResolutionCompletion::incomplete([reason]),
+        )
+        .with_lexical_choice(record(sibling_path), false)
+        .with_lexical_choice(record(path), true);
+        let transferred = BTreeSet::from([reason_id]);
+        let ownerless =
+            settle_selected_hierarchy_occurrence(branch.clone(), identity, false, &transferred);
+        assert_eq!(ownerless.addressed_lexical_choice(), Some(1));
+        assert_eq!(ownerless.lexical_choices().len(), 2);
+        assert!(ownerless.completion().contains_reason(reason));
+        let selected =
+            settle_selected_hierarchy_occurrence(branch.clone(), identity, true, &transferred);
+        assert_eq!(selected.addressed_lexical_choice(), None);
+        assert_eq!(selected.lexical_choices(), &[record(sibling_path)]);
+        assert!(selected.completion().contains_reason(reason));
+        let closed_empty = branch.settle_addressed_lexical_choice();
+        assert_eq!(closed_empty.lexical_choices(), &[record(sibling_path)]);
+        assert!(closed_empty.completion().contains_reason(reason));
     }
 }

@@ -1,0 +1,382 @@
+{
+  "categories": [
+    "pointer-invalidate"
+  ],
+  "external_models": [],
+  "name": "codeql-rust-sources-pointer-invalidate",
+  "sanitizers": [],
+  "schema_version": 1,
+  "sinks": [],
+  "sources": [
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "core.ptr.null_mut",
+      "evidence": null,
+      "id": "codeql-020e1dc17e59d8c88020c949fea02a8fcddf12242bdfbd271a4183040346c74f",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "null_mut"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.53fa85916cfa26b3000b006d4b9d55f7bc2e2fa41d6d11be23dacea07db8efe7"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "core.ptr.dangling_mut",
+      "evidence": null,
+      "id": "codeql-25f335ad04eacf5954793dc046a9abf9b1cef12f9856d1d20a75d3e8f1823a8e",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "dangling_mut"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.d30664e6adfdec65bdceef4be8fd821e563bca9902c719eaec0a7b1a29ff4e46"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "std.alloc.__default_lib_allocator.__rdl_alloc",
+      "evidence": null,
+      "id": "codeql-4a6a9f88facf0543a72e97438402312fb9df5af7c1c4431d6fa1c951507a2189",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "__rdl_alloc"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.9f8139f00d9448f4474ffa5c0321acd1e047e1bda07558db20dc4080843df24d"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "std.alloc.__default_lib_allocator.__rdl_alloc_zeroed",
+      "evidence": null,
+      "id": "codeql-5a23fd1b38571f20cd2ec36d979de73c2f623bafe5fb21a5c5e92e3466d6e7ab",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "__rdl_alloc_zeroed"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.c2806bc356e487af3acf30885b1d67542d6bf76e2c08f4d9f85b3f8344fa4b3e"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "core.intrinsics.const_allocate",
+      "evidence": null,
+      "id": "codeql-7a3b55ec1c8c28e831b9aa89fb06b35c7450b7bbce9758f7ffcca23cbcc2e408",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "const_allocate"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.9c604aeb14111011f879313a04b2843df1efac12ec89d1509789b04d51bfc651"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "core.ptr.dangling",
+      "evidence": null,
+      "id": "codeql-8d4fdfa21149c0b3463ceeeb473162d5d83750daa626325f9aa89e634744f061",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "dangling"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.e0007ef24b2b3569daa28e9eac262fc577adbab3af951ceb902247f44f1c8f6a"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "core.ptr.null",
+      "evidence": null,
+      "id": "codeql-c30edacf69a6a680c8a530e07294bd83e4aeb28a52a646864a22c21f9ff2f73d",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "null"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.55c970530e4eed8fde7df7378877e1820d4eb99ba21dd3eecc597036abc74dd6"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "pointer-invalidate"
+      ],
+      "display_name": "std.alloc.__default_lib_allocator.__rdl_realloc",
+      "evidence": null,
+      "id": "codeql-d89f2cc793cfffe3b697da4765f89bb3bed3f0e537ab8f30aab1dc5f41c12a8e",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "__rdl_realloc"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.ba24c7791adae4cd0debf55041b6efb4ed7c58d03cdbf6ad4fce654e170d31d4"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": null
+    }
+  ],
+  "transforms": [],
+  "version": 1
+}

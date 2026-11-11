@@ -195,6 +195,9 @@ fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<SourceAnchorGroup>) 
     if let Some(sub) = &pattern.has {
         collect_pattern_anchors(sub, out);
     }
+    if let Some(sub) = &pattern.each {
+        collect_pattern_anchors(sub, out);
+    }
     for &role in Role::list_target_roles() {
         for sub in pattern.list_role_patterns(role) {
             collect_pattern_anchors(sub, out);
@@ -240,6 +243,7 @@ pub(crate) fn comparison_chain_role_demands<'a>(
         let opaque = opaque
             || pattern.not.is_some()
             || pattern.not_has.is_some()
+            || pattern.count.is_some()
             || !pattern.all.is_empty()
             || !pattern.any.is_empty();
         let compatible = (pattern.kinds.is_empty()

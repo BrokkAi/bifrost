@@ -178,7 +178,7 @@ end
         assert!(store.ruby_source_facts(oid, generation).is_err());
         store
             .conn
-            .execute(|conn| {
+            .execute_fixture(|conn| {
                 conn.execute("DELETE FROM blobs", [])?;
                 for table in [
                     "source_ruby_loads",
@@ -408,7 +408,7 @@ end
             ),
             ("load \"#{name}\"\n", RubyRuntimeBoundary::DynamicLoad, 0),
             (
-                "loader.require \"ready\"\n",
+                "Kernel.require \"ready\"\n",
                 RubyRuntimeBoundary::DynamicRequire,
                 1,
             ),

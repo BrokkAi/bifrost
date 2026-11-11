@@ -512,6 +512,41 @@ impl ProcedureCfgBuilder {
         Ok(())
     }
 
+    /// Retain an inert syntax projection for selected declaration admission.
+    #[doc(hidden)]
+    pub fn next_guarded_pattern_projection_ordinal(&self) -> u32 {
+        u32::try_from(self.parts.guarded_pattern_projections.len())
+            .expect("guarded projection count is bounded by the semantic budget")
+    }
+
+    /// Retain an inert syntax projection for selected declaration admission.
+    #[doc(hidden)]
+    pub fn add_guarded_pattern_projection(
+        &mut self,
+        candidate: crate::analyzer::semantic::GuardedPatternProjection,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        assert_eq!(
+            candidate.ordinal as usize,
+            self.parts.guarded_pattern_projections.len(),
+            "guarded projection ordinals must be dense"
+        );
+        let owned_text_bytes = candidate
+            .path
+            .iter()
+            .map(|step| match step {
+                crate::analyzer::semantic::PatternProjectionStep::Tuple(_) => 0,
+                crate::analyzer::semantic::PatternProjectionStep::Named(name) => name.len(),
+            })
+            .sum();
+        self.reserve(SemanticWork {
+            nested_entries: candidate.path.len().saturating_add(1),
+            owned_text_bytes,
+            ..SemanticWork::default()
+        })?;
+        self.parts.guarded_pattern_projections.push(candidate);
+        Ok(())
+    }
+
     pub(crate) fn add_point(
         &mut self,
         events: Vec<SemanticEvent>,
@@ -2014,6 +2049,8 @@ mod tests {
             let before = builder.prospective_work();
             let error = builder
                 .add_value(SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(0),
                     kind,
                     source: SourceMappingId::new(0),

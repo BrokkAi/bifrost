@@ -97,6 +97,7 @@ pub(super) struct ExecutedQueryRows {
     pub(super) items: Vec<UnitRowItem>,
     pub(super) evidence: Vec<UnitRowEvidence>,
     pub(super) completion: CodeQueryCompletion,
+    pub(super) depth_bound_status: Option<DepthBoundStatus>,
     pub(super) truncated: bool,
     pub(super) diagnostics: Vec<CodeQueryDiagnostic>,
     pub(super) work: CodeQueryExecutionWork,
@@ -119,6 +120,7 @@ impl ExecutedQueryRows {
                 .map(UnitRowEvidence::project)
                 .collect(),
             completion: detailed.result.completion(),
+            depth_bound_status: detailed.result.depth_bound_status,
             truncated: detailed.result.truncated,
             diagnostics: detailed.result.diagnostics,
             work: detailed.work,
@@ -129,6 +131,7 @@ impl ExecutedQueryRows {
     fn of_merged(merged: MergedUnitRows) -> Self {
         Self {
             completion: merged.completion(),
+            depth_bound_status: merged.depth_bound_status,
             truncated: merged.truncated,
             diagnostics: merged.diagnostics,
             work: merged.work,
@@ -670,6 +673,7 @@ fn sliced_assertion_run(
         workspace: context.workspace,
         cancellation: context.cancellation,
         limits,
+        depth_opt_in: false,
         workspace_files: &workspace_files,
         subject_batch: None,
     };
@@ -760,7 +764,11 @@ fn sliced_assertion_run(
     keys.extend(assert_keys);
     // Every unit of this policy is published and merged, so this list is what
     // another run replays to reproduce the product without executing anything.
-    incremental.record_units(policy.definition().metadata.id.clone(), keys);
+    incremental.commit_units(
+        policy.definition().metadata.id.clone(),
+        reuse.take_staged(),
+        keys,
+    );
     Ok(result)
 }
 
@@ -823,7 +831,7 @@ fn whole_assertion_run(
             format!("policy.subject_query[{}]", policy.definition().metadata.id)
         });
         match subject_batch {
-            Some(batch) => batch.execute(subject_query, context, budget),
+            Some(batch) => batch.execute(subject_query, context, budget, false),
             None => Arc::new(ExecutedQueryRows::of_detailed(match context.workspace {
                 Some(workspace) => execute_code_query_detailed_eager_index_workspace_in_scope(
                     workspace,
@@ -831,7 +839,9 @@ fn whole_assertion_run(
                     subject_query,
                     budget.query_limits(),
                     context.cancellation,
-                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                    execution_scope
+                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                        .with_depth_bound_status(false),
                 ),
                 None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
@@ -839,7 +849,9 @@ fn whole_assertion_run(
                     subject_query,
                     budget.query_limits(),
                     context.cancellation,
-                    execution_scope.unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                    execution_scope
+                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                        .with_depth_bound_status(false),
                 ),
             })),
         }
@@ -1128,7 +1140,7 @@ fn assertion_run<'a>(
     // know which files it failed to consider, so per-file attribution is
     // impossible by construction and the whole run is inconclusive.
     let run_failures = failure_reasons(&rows.completion);
-    let subject_incomplete = incomplete_reasons(&rows.completion, rows.truncated);
+    let subject_incomplete = incomplete_reasons(&rows.completion);
     let subjects = match collect_assertion_subjects(&rows.items, &rows.evidence) {
         Ok(subjects) => subjects,
         Err(message) => return Err(Box::new(AssertionRunRefusal::Failed(message))),
@@ -1387,7 +1399,8 @@ fn evaluate_assert_file(
     let seed_files = [subject_file];
     let mut workspace_files = files_by_rel.values().cloned().collect::<Vec<_>>();
     workspace_files.sort();
-    let execution_scope = CodeQueryExecutionScope::for_seed_files(&seed_files, &workspace_files);
+    let execution_scope = CodeQueryExecutionScope::for_seed_files(&seed_files, &workspace_files)
+        .with_depth_bound_status(false);
     let mut file_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
 
     // Establishment probes precede correlated row queries: retain each actual
@@ -1409,10 +1422,7 @@ fn evaluate_assert_file(
                 &mut row_family_session,
                 execution_scope.clone(),
             );
-            file_incomplete.extend(incomplete_reasons(
-                &outcome.result.completion(),
-                outcome.result.truncated,
-            ));
+            file_incomplete.extend(incomplete_reasons(&outcome.result.completion()));
             file_failures.extend(failure_reasons(&outcome.result.completion()));
             file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
             file_work = file_work.saturating_add(outcome.work);
@@ -1546,10 +1556,7 @@ fn evaluate_assert_file(
             &mut row_family_session,
             execution_scope.clone(),
         );
-        file_incomplete.extend(incomplete_reasons(
-            &outcome.result.completion(),
-            outcome.result.truncated,
-        ));
+        file_incomplete.extend(incomplete_reasons(&outcome.result.completion()));
         file_failures.extend(failure_reasons(&outcome.result.completion()));
         file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
         file_work = file_work.saturating_add(outcome.work);
@@ -1564,12 +1571,13 @@ fn evaluate_assert_file(
                 return Err(Box::new(AssertFileFailure::QueryPlan(message)));
             }
         };
-        let mut outcome = execute_code_query_detailed_eager_index(
+        let mut outcome = execute_code_query_detailed_eager_index_in_scope(
             context.analyzer,
             context.flow_resources(),
             &query,
             budget.query_limits(),
             context.cancellation,
+            CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
         );
         // A dynamic generation site reports the generated-set axis
         // incomplete at query level, but here that honesty is handled per
@@ -1579,10 +1587,7 @@ fn evaluate_assert_file(
         outcome.result.diagnostics.retain(|diagnostic| {
             diagnostic.code != CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
         });
-        file_incomplete.extend(incomplete_reasons(
-            &outcome.result.completion(),
-            outcome.result.truncated,
-        ));
+        file_incomplete.extend(incomplete_reasons(&outcome.result.completion()));
         file_failures.extend(failure_reasons(&outcome.result.completion()));
         file_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
         file_work = file_work.saturating_add(outcome.work);
@@ -2378,7 +2383,8 @@ fn whole_relational_bindings(
                     context.cancellation,
                     execution_scope
                         .clone()
-                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                        .with_depth_bound_status(false),
                 ),
                 None => execute_code_query_detailed_eager_index_in_scope(
                     context.analyzer,
@@ -2388,7 +2394,8 @@ fn whole_relational_bindings(
                     context.cancellation,
                     execution_scope
                         .clone()
-                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace),
+                        .unwrap_or_else(CodeQueryExecutionScope::whole_workspace)
+                        .with_depth_bound_status(false),
                 ),
             })
         })
@@ -2432,6 +2439,7 @@ fn sliced_relational_bindings(
         workspace: context.workspace,
         cancellation: context.cancellation,
         limits,
+        depth_opt_in: false,
         workspace_files: &workspace_files,
         // Binding queries are not counted as batch consumers.
         subject_batch: None,
@@ -2459,7 +2467,11 @@ fn sliced_relational_bindings(
     }
     // Every unit of this policy is published and merged, so this list is what
     // another run replays to reproduce the product without executing anything.
-    incremental.record_units(policy.definition().metadata.id.clone(), keys);
+    incremental.commit_units(
+        policy.definition().metadata.id.clone(),
+        reuse.take_staged(),
+        keys,
+    );
     Ok(executed)
 }
 
@@ -2556,7 +2568,7 @@ fn relational_run(
     let mut total_work: Option<CodeQueryExecutionWork> = None;
 
     for rows in executed {
-        let reasons = incomplete_reasons(&rows.completion, rows.truncated);
+        let reasons = incomplete_reasons(&rows.completion);
         run_incomplete.extend(reasons.iter().copied());
         // One binding's rows, one coverage. This is the mapping issue 2435 is
         // about: `ProvenSubset` is not "not exhaustive", and a suppressed row
@@ -3763,9 +3775,27 @@ fn forward_usage_kind_is_classified(row: &ReferenceEdgeRow) -> bool {
 /// `EdgeClassVerdict::Undecidable`.
 fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> Option<Vec<String>> {
     let mut mismatches = Vec::new();
-    if left.reference_kind != right.reference_kind {
+    // Facets are compared kind by kind. Both producers stating the same truth
+    // for a kind agree, including both leaving it undecided; one proving a
+    // kind present and the other proving it absent is a disagreement; one
+    // proving a kind that the other leaves undecided is a difference in
+    // evidence, not a contradiction, so the comparison is inconclusive.
+    let mut kind_unknown = false;
+    for kind in brokk_bifrost_analysis::analyzer::usages::ReferenceKind::ALL {
+        use brokk_bifrost_analysis::analyzer::usages::{ReferenceKindSet, Truth};
+        let requested = ReferenceKindSet::from_kinds([kind]);
+        let left_match = left.reference_kind.matches(requested);
+        let right_match = right.reference_kind.matches(requested);
+        if left_match == right_match {
+            continue;
+        }
+        if left_match == Truth::Unknown || right_match == Truth::Unknown {
+            kind_unknown = true;
+            continue;
+        }
         mismatches.push(format!(
-            "reference_kind {} != {}",
+            "reference facet {}: {} != {}",
+            brokk_bifrost_rql::schema::reference_kind_label(kind),
             edge_kind_label(left),
             edge_kind_label(right)
         ));
@@ -3806,13 +3836,24 @@ fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> O
             right.owner_relation.label()
         ));
     }
+    if kind_unknown && mismatches.is_empty() {
+        return None;
+    }
     Some(mismatches)
 }
 
-fn edge_kind_label(row: &ReferenceEdgeRow) -> &'static str {
-    row.reference_kind.map_or("unclassified", |kind| {
-        brokk_bifrost_rql::schema::reference_kind_label(kind)
-    })
+fn edge_kind_label(row: &ReferenceEdgeRow) -> String {
+    let labels = |kinds: brokk_bifrost_analysis::analyzer::usages::ReferenceKindSet| {
+        kinds
+            .iter()
+            .map(brokk_bifrost_rql::schema::reference_kind_label)
+            .collect::<Vec<_>>()
+    };
+    format!(
+        "known={:?}, undecided={:?}",
+        labels(row.reference_kind.known()),
+        labels(row.reference_kind.undecided())
+    )
 }
 
 /// One human-readable statement of an edge, used in observed text so a finding
@@ -4155,14 +4196,33 @@ fn edge_class_verdict(
                 value.label().to_string()
             })
         }
-        EdgeClassConstraint::Kind { require, forbid } => match edge.reference_kind {
-            // An unclassified kind is not a kind; it can neither satisfy a
-            // requirement nor trip a prohibition.
-            None => EdgeClassVerdict::Undecidable,
-            Some(kind) => check(kind, require, forbid, |value| {
-                brokk_bifrost_rql::schema::reference_kind_label(value).to_string()
-            }),
-        },
+        EdgeClassConstraint::Kind { require, forbid } => {
+            use brokk_bifrost_analysis::analyzer::usages::{ReferenceKindSet, Truth};
+            let forbidden = edge
+                .reference_kind
+                .matches(ReferenceKindSet::from_kinds(forbid.iter().copied()));
+            if forbidden == Truth::True {
+                return EdgeClassVerdict::Violated(format!(
+                    "carries forbidden reference facet: {}",
+                    edge_kind_label(edge)
+                ));
+            }
+            let required = if require.is_empty() {
+                Truth::True
+            } else {
+                edge.reference_kind
+                    .matches(ReferenceKindSet::from_kinds(require.iter().copied()))
+            };
+            match (required, forbidden) {
+                (Truth::False, _) => EdgeClassVerdict::Violated(format!(
+                    "lacks required reference facet: {}",
+                    edge_kind_label(edge)
+                )),
+                (Truth::Unknown, _) | (_, Truth::Unknown) => EdgeClassVerdict::Undecidable,
+                (Truth::True, Truth::False) => EdgeClassVerdict::Satisfied,
+                (_, Truth::True) => unreachable!(),
+            }
+        }
     }
 }
 
@@ -6119,6 +6179,9 @@ mod value_origin_tests {
             path: "origin.py".to_owned(),
             language: "python",
             name: "target".to_owned(),
+            immediate_parent_kind: None,
+            whole_let_initializer: false,
+            whole_match_arm_identifier: false,
             kind: "local",
             hoisting: "scope_wide",
             namespace: "value",

@@ -200,6 +200,7 @@ fn exact_row(
         coverage: EffectCoverage::Exhaustive,
         reason: None,
         replacement_events: Vec::new(),
+        read_event: None,
     };
     // The row's range is the declaration, while the source-backed AST join is
     // the read event's exact child. Keep the latter available to detailed
@@ -280,6 +281,7 @@ fn relation_row(
             coverage,
             reason,
             replacement_events: Vec::new(),
+            read_event: None,
         },
     )))
 }

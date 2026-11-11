@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod python_residency_tests {
 
-    use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
 
     use brokk_bifrost_core::analyzer::structural::occurrences::Namespace;
 
@@ -11,13 +11,17 @@ mod python_residency_tests {
 
     use brokk_bifrost_core::analyzer::model::Language;
 
+    use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+
+    use brokk_bifrost_core::analyzer::structural::resolution::CandidateOutcome;
+
+    use brokk_bifrost_core::analyzer::structural::resolution::RejectionReason;
+
     use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::js_ts_tests_support::Fixture;
 
     use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::js_ts_tests_support::discovery_declaring_with_stub_artifacts;
 
     use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::js_ts_tests_support::expect_row;
-
-    use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::js_ts_tests_support::external_boundaries;
 
     use brokk_bifrost_analysis::analyzer::structural::occurrence_rows::js_ts_tests_support::trace_of;
     #[test]
@@ -97,9 +101,9 @@ mod python_residency_tests {
         assert_eq!(nonlocal.role, OccurrenceRole::NonlocalDirective);
         assert_eq!(nonlocal.class, OccurrenceClass::NonReference);
     }
-    /// #1601 acceptance: a Python file importing a distribution the workspace
-    /// declares but does not contain reports `external_declared_unindexed`,
-    /// and the dotted attribute read routes through the same declared module.
+    /// Discovery alone cannot establish an external Python provider identity.
+    /// Without a runtime or model, the import draws the unresolvable import
+    /// boundary claim (the precedence chain in definition_lookup.rs).
     #[test]
     fn a_python_import_of_a_declared_unindexed_distribution_reports_declared_unindexed() {
         let source = concat!(
@@ -114,18 +118,27 @@ mod python_residency_tests {
             &discovery_declaring_with_stub_artifacts("python", &["requests"]),
         );
         let result = fixture.traced_result();
+        assert_eq!(
+            expect_row(&result.rows, fixture.at("requests.get"), "declared read").resolution_status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary)
+        );
         let trace = trace_of(&result.rows, fixture.at("requests.get"), "declared read");
+        // Discovery declarations do not admit external Python identities without
+        // runtime publication (step 1b): the one external route is rejected at
+        // the boundary, classified ExternalDeclaredUnindexed.
         assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
-            "the build declares `requests`, so the miss is declared-unindexed: {:?}",
-            trace.candidates
+            matches!(
+                trace.candidates.as_slice(),
+                [candidate] if matches!(
+                    candidate.outcome,
+                    CandidateOutcome::Rejected(RejectionReason::BoundaryBlocked)
+                ) && matches!(candidate.boundary, BoundaryStatus::ExternalDeclaredUnindexed)
+                    && candidate.external_target.is_none()
+            ),
+            "{trace:?}"
         );
     }
-    /// #1601 acceptance: a name nothing declares stays `external_unknown`
-    /// even when discovery ran to completion, and a workspace where discovery
-    /// never ran reports `external_unknown` for everything.
+    /// Missing runtime admission stays open with or without dependency discovery.
     #[test]
     fn an_undeclared_python_import_stays_external_unknown() {
         let source = concat!(
@@ -136,17 +149,33 @@ mod python_residency_tests {
         );
         let undiscovered = Fixture::new(Language::Python, "app/client.py", source);
         let trace_rows = undiscovered.traced_result();
+        assert_eq!(
+            expect_row(
+                &trace_rows.rows,
+                undiscovered.at("nonsuch.get"),
+                "no discovery"
+            )
+            .resolution_status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary)
+        );
         let trace = trace_of(
             &trace_rows.rows,
             undiscovered.at("nonsuch.get"),
             "no discovery",
         );
+        // Discovery declarations do not admit external Python identities without
+        // runtime publication (step 1b): the one external route is rejected at
+        // the boundary, classified ExternalUnknown.
         assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalUnknown),
-            "no discovery has run, so nothing is known: {:?}",
-            trace.candidates
+            matches!(
+                trace.candidates.as_slice(),
+                [candidate] if matches!(
+                    candidate.outcome,
+                    CandidateOutcome::Rejected(RejectionReason::BoundaryBlocked)
+                ) && matches!(candidate.boundary, BoundaryStatus::ExternalUnknown)
+                    && candidate.external_target.is_none()
+            ),
+            "{trace:?}"
         );
 
         let declared_elsewhere = Fixture::new(Language::Python, "app/client.py", source);
@@ -157,17 +186,33 @@ mod python_residency_tests {
                 &discovery_declaring_with_stub_artifacts("python", &["requests"]),
             );
         let result = declared_elsewhere.traced_result();
+        assert_eq!(
+            expect_row(
+                &result.rows,
+                declared_elsewhere.at("nonsuch.get"),
+                "undeclared read"
+            )
+            .resolution_status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary)
+        );
         let trace = trace_of(
             &result.rows,
             declared_elsewhere.at("nonsuch.get"),
             "undeclared read",
         );
+        // Discovery declarations do not admit external Python identities without
+        // runtime publication (step 1b): the one external route is rejected at
+        // the boundary, classified ExternalUnknown.
         assert!(
-            external_boundaries(trace)
-                .iter()
-                .all(|boundary| *boundary == BoundaryStatus::ExternalUnknown),
-            "a complete discovery declares nothing named `nonsuch`: {:?}",
-            trace.candidates
+            matches!(
+                trace.candidates.as_slice(),
+                [candidate] if matches!(
+                    candidate.outcome,
+                    CandidateOutcome::Rejected(RejectionReason::BoundaryBlocked)
+                ) && matches!(candidate.boundary, BoundaryStatus::ExternalUnknown)
+                    && candidate.external_target.is_none()
+            ),
+            "{trace:?}"
         );
     }
 }

@@ -307,7 +307,21 @@ pub struct UnitSummaryReconciliation {
     /// Units whose live version row already pointed at the digest's summary.
     pub unchanged: usize,
     /// Units rebound to an existing summary, without derivation.
-    pub rebound: usize,
+    pub rebound_count: usize,
+    /// The pass's net effect on live units, as (language, unit key): for each
+    /// unit the pass published or closed, its live output before the pass
+    /// compared with its live output after it, so a unit that a fixpoint round
+    /// republished several times, or published back to its original output,
+    /// is reported once or not at all. Units the pass left alone cost nothing.
+    /// Units live both before and after the pass whose output digest differs.
+    pub output_changed: Vec<(String, [u8; 32])>,
+    /// Units live after the pass and not before it.
+    pub added: Vec<(String, [u8; 32])>,
+    /// Units live before the pass and not after it.
+    pub closed: Vec<(String, [u8; 32])>,
+    /// The live output before the pass of every unit the pass published or
+    /// closed, by unit key, until the pass classifies them.
+    pub(crate) touched: std::collections::HashMap<[u8; 32], Option<Vec<u8>>>,
     pub derived: usize,
     /// Rows written by derived units (header, children and version rows).
     pub rows_written: usize,
@@ -471,14 +485,16 @@ pub(crate) const WITHDRAW_UNSETTLED_SQL: &str = "DELETE FROM resolution_unit_sum
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
        AND profile_digest = ?5 AND valid_until IS NULL AND valid_from = ?4
        AND NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS settled
-                       WHERE settled.unit_key = resolution_unit_summary_versions.unit_key)";
+                       WHERE settled.unit_key = resolution_unit_summary_versions.unit_key)
+     RETURNING unit_key, summary_id";
 pub(crate) const CLOSE_UNSETTLED_SQL: &str =
     "UPDATE resolution_unit_summary_versions INDEXED BY resolution_unit_summary_versions_open
        SET valid_until = ?4
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
        AND profile_digest = ?5 AND valid_until IS NULL AND valid_from < ?4
        AND NOT EXISTS (SELECT 1 FROM temp.unit_summary_order AS settled
-                       WHERE settled.unit_key = resolution_unit_summary_versions.unit_key)";
+                       WHERE settled.unit_key = resolution_unit_summary_versions.unit_key)
+     RETURNING unit_key, summary_id";
 pub(crate) const LATER_OPEN_VERSION_SQL: &str =
     "SELECT EXISTS(SELECT 1 FROM resolution_unit_summary_versions
        INDEXED BY resolution_unit_summary_versions_open
@@ -632,57 +648,28 @@ impl StatementCounter {
     }
 }
 
-/// Registers `sqlite3_trace_v2` statement counting on the writer connection for
-/// the length of one pass. It holds the raw handle, not a borrow, because the
-/// pass needs `&mut Connection` for its transactions.
+/// Counts statements on one pass without borrowing its mutable connection.
 struct StatementCount {
-    handle: Option<*mut rusqlite::ffi::sqlite3>,
+    _guard: Option<brokk_bifrost_core::cache_db::sql_profile::ListenerGuard>,
 }
 
 impl StatementCount {
     fn register(conn: &Connection, counter: &StatementCounter) -> Self {
-        unsafe extern "C" fn count(
-            event: std::ffi::c_uint,
-            context: *mut std::ffi::c_void,
-            _: *mut std::ffi::c_void,
-            _: *mut std::ffi::c_void,
-        ) -> std::ffi::c_int {
-            if event == rusqlite::ffi::SQLITE_TRACE_STMT {
-                // SAFETY: the pass retains the counter's Arc until it unregisters.
-                let counter = unsafe { &*context.cast::<AtomicUsize>() };
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-            0
-        }
-        let Some(counter) = &counter.0 else {
-            return Self { handle: None };
-        };
-        // SAFETY: the callback keeps no SQLite pointer, and `Drop` unregisters it
-        // before the connection or the counter's Arc is released.
-        let handle = unsafe { conn.handle() };
-        let status = unsafe {
-            rusqlite::ffi::sqlite3_trace_v2(
-                handle,
-                rusqlite::ffi::SQLITE_TRACE_STMT,
-                Some(count),
-                Arc::as_ptr(counter).cast_mut().cast(),
+        let guard = counter.0.as_ref().map(|counter| {
+            let counter = Arc::clone(counter);
+            brokk_bifrost_core::cache_db::sql_profile::attach_listener(
+                conn,
+                Arc::new(move |event| {
+                    if matches!(
+                        event,
+                        brokk_bifrost_core::cache_db::sql_profile::ListenerEvent::Statement { .. }
+                    ) {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
             )
-        };
-        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
-        Self {
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for StatementCount {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle {
-            // SAFETY: unregisters the callback registered by `register`.
-            let status =
-                unsafe { rusqlite::ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut()) };
-            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
-        }
+        });
+        Self { _guard: guard }
     }
 }
 
@@ -785,7 +772,66 @@ fn reconcile_staged(
         }
     }
     close_unsettled(conn, snapshot, language, &mut report)?;
+    let lang = language.lang();
+    for (key, before) in std::mem::take(&mut report.touched) {
+        match (before, live_unit_output(conn, snapshot, language, &key)?) {
+            (Some(before), Some(after)) if before != after => {
+                report.output_changed.push((lang.to_owned(), key));
+            }
+            (Some(_), None) => report.closed.push((lang.to_owned(), key)),
+            (None, Some(_)) => report.added.push((lang.to_owned(), key)),
+            _ => {}
+        }
+    }
+    for keys in [
+        &mut report.output_changed,
+        &mut report.added,
+        &mut report.closed,
+    ] {
+        keys.sort_unstable();
+    }
     Ok(report)
+}
+
+/// The output digest of a unit's live summary version at the snapshot's
+/// revision, if it has one.
+fn live_unit_output(
+    conn: &Connection,
+    snapshot: &WorkspaceSnapshotId,
+    language: &dyn UnitSummaryLanguage,
+    unit_key: &[u8; 32],
+) -> Result<Option<Vec<u8>>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT summaries.output_digest
+             FROM resolution_unit_summary_versions AS versions
+             JOIN resolution_unit_summaries AS summaries
+               ON summaries.summary_id = versions.summary_id
+             WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+               AND versions.generation = ?3 AND versions.unit_key = ?4
+               AND versions.profile_digest = ?5
+               AND versions.valid_until IS NULL AND versions.valid_from <= ?6",
+        )?
+        .query_row(
+            params![
+                snapshot.workspace_id.as_str(),
+                language.lang(),
+                snapshot.generation.get(),
+                unit_key.as_slice(),
+                language.profile_digest().as_slice(),
+                snapshot.revision
+            ],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn summary_output(conn: &Connection, summary_id: i64) -> Result<Vec<u8>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT output_digest FROM resolution_unit_summaries WHERE summary_id = ?1",
+        )?
+        .query_row([summary_id], |row| row.get(0))?)
 }
 
 /// Derive again, in order, the units that consumed a dependency before the pass
@@ -936,6 +982,13 @@ fn publish_unit(
     {
         UnitPublication::Unchanged
     } else {
+        if let std::collections::hash_map::Entry::Vacant(slot) = report.touched.entry(unit.unit_key)
+        {
+            slot.insert(match open {
+                Some((open_summary, _)) => Some(summary_output(conn, open_summary)?),
+                None => None,
+            });
+        }
         let transaction_started = Instant::now();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut rows_written = 0;
@@ -1036,7 +1089,7 @@ fn publish_unit(
     match publication {
         UnitPublication::Unchanged => report.unchanged += 1,
         UnitPublication::Rebound { rows_written } => {
-            report.rebound += 1;
+            report.rebound_count += 1;
             report.rows_written += rows_written;
         }
         UnitPublication::Derived {
@@ -1185,17 +1238,31 @@ fn close_unsettled(
             snapshot.generation.get()
         )));
     }
+    // The closing statements return the versions they end, so the report
+    // learns which units closed without another pass over the live versions.
     for statement in [WITHDRAW_UNSETTLED_SQL, CLOSE_UNSETTLED_SQL] {
-        report.closed_versions += tx.execute(
-            statement,
-            params![
-                snapshot.workspace_id.as_str(),
-                language.lang(),
-                snapshot.generation.get(),
-                snapshot.revision,
-                language.profile_digest().as_slice()
-            ],
-        )?;
+        let ended = tx
+            .prepare_cached(statement)?
+            .query_map(
+                params![
+                    snapshot.workspace_id.as_str(),
+                    language.lang(),
+                    snapshot.generation.get(),
+                    snapshot.revision,
+                    language.profile_digest().as_slice()
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        report.closed_versions += ended.len();
+        for (key, summary_id) in ended {
+            let key: [u8; 32] = key
+                .try_into()
+                .map_err(|_| StoreError::corrupt("invalid unit key"))?;
+            if let std::collections::hash_map::Entry::Vacant(slot) = report.touched.entry(key) {
+                slot.insert(Some(summary_output(&tx, summary_id)?));
+            }
+        }
     }
     // Unbound content-addressed headers remain reusable by another build until
     // periodic GC. Other profiles keep their own independent intervals.
@@ -1448,6 +1515,7 @@ fn write_summary(
     output_digest: &[u8; 32],
     rows_written: &mut usize,
 ) -> Result<i64> {
+    let _owner = super::sealed_families::Scope::new(tx, super::sealed_families::Owner::UnitSummary);
     let summary_id = match replace {
         Some(summary_id) => {
             tx.execute(
@@ -1645,18 +1713,345 @@ fn write_summary(
     );
     *rows_written +=
         members + exports + imports + dependencies.len() + unit.reads.len() + outputs.gaps.len();
-    tx.execute(
-        "UPDATE resolution_unit_summaries SET complete = ?2, member_count = ?3, export_count = ?4,
-                import_count = ?5, output_digest = ?6, publication_state = 'complete'
-         WHERE summary_id = ?1",
-        params![
-            summary_id,
-            outputs.complete,
-            members,
-            exports,
-            imports,
-            output_digest.as_slice()
+    super::publication::seal(
+        tx,
+        "resolution_unit_summaries",
+        "summary_id",
+        summary_id,
+        &[
+            ("complete", &outputs.complete),
+            ("member_count", &members),
+            ("export_count", &exports),
+            ("import_count", &imports),
+            ("output_digest", &output_digest.as_slice()),
         ],
     )?;
     Ok(summary_id)
+}
+
+#[cfg(test)]
+mod reconciliation_report_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    struct FixtureUnit {
+        key: [u8; 32],
+        input: u8,
+        surface: u8,
+    }
+
+    #[derive(Clone)]
+    struct Fixture(Arc<Mutex<Vec<FixtureUnit>>>);
+
+    impl UnitSummaryLanguage for Fixture {
+        fn lang(&self) -> &'static str {
+            "rust"
+        }
+        fn unit_kind(&self) -> &'static str {
+            "rust_crate"
+        }
+        fn derivation_version(&self) -> i64 {
+            1
+        }
+        fn stage(&self, conn: &Connection, _: &WorkspaceSnapshotId) -> Result<()> {
+            for (ordinal, _) in self.0.lock().unwrap().iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO temp.unit_summary_work(unit_id) VALUES(?1)",
+                    [ordinal as i64 + 1],
+                )?;
+            }
+            Ok(())
+        }
+        fn inputs(
+            &self,
+            _: &Connection,
+            _: &WorkspaceSnapshotId,
+            unit_id: i64,
+        ) -> Result<UnitInputs> {
+            let FixtureUnit { key, input, .. } = self.0.lock().unwrap()[unit_id as usize - 1];
+            Ok(UnitInputs {
+                unit_id,
+                unit_key: key,
+                label: format!("crate-{unit_id}"),
+                members: vec![],
+                reads: vec![UnitRead {
+                    kind: "configuration",
+                    key_digest: [0; 32],
+                    digest: [input; 32],
+                }],
+                dependencies: vec![],
+                dependency_names: vec![],
+                containers: vec![],
+                placements: vec![],
+            })
+        }
+        fn derive(
+            &self,
+            _: &Connection,
+            _: &WorkspaceSnapshotId,
+            unit: &UnitInputs,
+            _: &[ConsumedDependency],
+            _: &str,
+        ) -> Result<UnitOutputs> {
+            let surface = self.0.lock().unwrap()[unit.unit_id as usize - 1].surface;
+            Ok(UnitOutputs {
+                exports: vec![],
+                imports: vec![],
+                gaps: vec![],
+                complete: true,
+                public_surface_digest: Some([surface; 32]),
+            })
+        }
+    }
+
+    #[test]
+    fn reconciliation_reports_only_changed_live_unit_outputs() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store.conn.execute(|conn| conn.execute(
+            "INSERT INTO resolution_producer_epochs(lang, producer_epoch) VALUES('rust', 'fixture')", []
+        )).unwrap();
+        let fixture = Fixture(Arc::new(Mutex::new(vec![FixtureUnit {
+            key: [1; 32],
+            input: 1,
+            surface: 1,
+        }])));
+        let mut snapshot = WorkspaceSnapshotId {
+            workspace_id: super::super::WorkspaceId("a".repeat(64)),
+            lang: "rust".into(),
+            generation: super::super::GenerationId::from_persisted(0),
+            revision: 1,
+        };
+        let run = |snapshot: &WorkspaceSnapshotId| {
+            store
+                .reconcile_unit_summaries(snapshot, fixture.clone(), &CancellationToken::default())
+                .unwrap()
+        };
+        let first = run(&snapshot);
+        assert_eq!(first.added, vec![("rust".into(), [1; 32])], "{first:?}");
+        fixture.0.lock().unwrap()[0].input = 2;
+        snapshot.revision += 1;
+        let body = run(&snapshot);
+        assert!(
+            body.output_changed.is_empty() && body.added.is_empty() && body.closed.is_empty(),
+            "{body:?}"
+        );
+        fixture.0.lock().unwrap()[0] = FixtureUnit {
+            key: [1; 32],
+            input: 3,
+            surface: 2,
+        };
+        snapshot.revision += 1;
+        let surface = run(&snapshot);
+        assert_eq!(
+            surface.output_changed,
+            vec![("rust".into(), [1; 32])],
+            "{surface:?}"
+        );
+        fixture.0.lock().unwrap().push(FixtureUnit {
+            key: [2; 32],
+            input: 1,
+            surface: 1,
+        });
+        snapshot.revision += 1;
+        let added = run(&snapshot);
+        assert_eq!(added.added, vec![("rust".into(), [2; 32])], "{added:?}");
+        fixture.0.lock().unwrap().pop();
+        snapshot.revision += 1;
+        let closed = run(&snapshot);
+        assert_eq!(closed.closed, vec![("rust".into(), [2; 32])], "{closed:?}");
+        fixture.0.lock().unwrap()[0] = FixtureUnit {
+            key: [1; 32],
+            input: 2,
+            surface: 1,
+        };
+        snapshot.revision += 1;
+        let rebound = run(&snapshot);
+        assert_eq!(
+            (rebound.rebound_count, &rebound.output_changed),
+            (1, &vec![("rust".into(), [1; 32])]),
+            "{rebound:?}"
+        );
+    }
+}
+
+/// The answer to an exact live-summary read at a selected snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitLive {
+    Present { output_digest: [u8; 32] },
+    Absent,
+}
+
+/// Read with the same revision, profile, epoch and version predicate as reconciliation.
+pub fn live_unit_summary(
+    conn: &Connection,
+    snapshot: &WorkspaceSnapshotId,
+    unit_key: &[u8; 32],
+    producer_epoch: &str,
+    derivation_version: i64,
+) -> Result<UnitLive> {
+    let row: Option<Vec<u8>> = conn
+        .prepare_cached(LIVE_SUMMARY_SQL)?
+        .query_row(
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang.as_str(),
+                snapshot.generation.get(),
+                unit_key.as_slice(),
+                snapshot.revision,
+                producer_epoch,
+                derivation_version
+            ],
+            |row| row.get(1),
+        )
+        .optional()?;
+    match row {
+        Some(bytes) => {
+            let output_digest: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| StoreError::corrupt("unit summary output digest width"))?;
+            Ok(UnitLive::Present { output_digest })
+        }
+        None => Ok(UnitLive::Absent),
+    }
+}
+
+/// Complete Rust membership, ordered for stable hashing and negative answers.
+pub fn live_rust_unit_set(
+    conn: &Connection,
+    snapshot: &WorkspaceSnapshotId,
+    producer_epoch: &str,
+) -> Result<Vec<(String, [u8; 32])>> {
+    assert_eq!(snapshot.lang, "rust");
+    // #9737 M3 G: open RecomputeOnCurrency attribution scope at this SQL call.
+    let mut stmt = conn.prepare_cached(
+        "SELECT topologies.crate_name, versions.unit_key
+         FROM resolution_unit_summary_versions AS versions
+         JOIN resolution_unit_summaries AS summaries ON summaries.summary_id = versions.summary_id
+         JOIN rust_resolution_unit_summary_versions AS rust_versions
+           ON rust_versions.workspace_id = versions.workspace_id
+          AND rust_versions.lang = versions.lang
+          AND rust_versions.generation = versions.generation
+          AND rust_versions.unit_key = versions.unit_key
+          AND rust_versions.valid_from = versions.valid_from
+          AND rust_versions.summary_id = versions.summary_id
+         JOIN rust_crate_topologies AS topologies ON topologies.topology_id = rust_versions.topology_id
+         WHERE versions.workspace_id = ?1 AND versions.lang = 'rust' AND versions.generation = ?2
+           AND versions.profile_digest = zeroblob(32)
+           AND versions.valid_from <= ?3 AND (versions.valid_until IS NULL OR ?3 < versions.valid_until)
+           AND summaries.publication_state = 'complete' AND summaries.producer_epoch = ?4
+           AND summaries.derivation_version = ?5
+         ORDER BY topologies.crate_name, versions.unit_key"
+    )?;
+    let rows = stmt.query_map(
+        params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision,
+            producer_epoch,
+            super::rust_unit_summaries::RUST_UNIT_SUMMARY_DERIVATION_VERSION
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+    )?;
+    rows.map(|row| {
+        let (name, key) = row?;
+        let key = key
+            .try_into()
+            .map_err(|_| StoreError::corrupt("Rust unit key width"))?;
+        Ok((name, key))
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod derivation_live_tests {
+    use super::*;
+    use crate::analyzer::store::{GenerationId, WorkspaceId};
+
+    #[test]
+    fn live_unit_tracks_rebound_change_close_add_and_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE resolution_unit_summary_versions (
+                workspace_id TEXT, lang TEXT, generation INTEGER, unit_key BLOB,
+                profile_digest BLOB, valid_from INTEGER, valid_until INTEGER, summary_id INTEGER);
+             CREATE TABLE resolution_unit_summaries (
+                summary_id INTEGER, output_digest BLOB, publication_state TEXT,
+                producer_epoch TEXT, derivation_version INTEGER);",
+        )
+        .unwrap();
+        let snapshot = WorkspaceSnapshotId {
+            workspace_id: WorkspaceId("a".repeat(64)),
+            lang: "rust".into(),
+            generation: GenerationId(0),
+            revision: 1,
+        };
+        let key = [1; 32];
+        let added = [2; 32];
+        for (id, digest, state, epoch) in [
+            (1, [3u8; 32], "complete", "epoch"),
+            (2, [3; 32], "complete", "epoch"),
+            (3, [4; 32], "complete", "epoch"),
+            (4, [5; 32], "building", "epoch"),
+            (5, [6; 32], "complete", "old"),
+            (6, [7; 32], "complete", "epoch"),
+        ] {
+            conn.execute(
+                "INSERT INTO resolution_unit_summaries VALUES (?1, ?2, ?3, ?4, 1)",
+                params![id, digest.as_slice(), state, epoch],
+            )
+            .unwrap();
+        }
+        for (unit_key, from, until, id) in [
+            (key, 1, Some(2), 1),
+            (key, 2, Some(3), 2),
+            (key, 3, Some(4), 3),
+            (key, 4, Some(5), 4),
+            (key, 5, Some(6), 5),
+            (added, 2, None, 6),
+        ] {
+            conn.execute("INSERT INTO resolution_unit_summary_versions VALUES (?1, 'rust', 0, ?2, zeroblob(32), ?3, ?4, ?5)",
+                params![snapshot.workspace_id.as_str(), unit_key.as_slice(), from, until, id]).unwrap();
+        }
+        let read = |revision, unit_key| {
+            let mut selected = snapshot.clone();
+            selected.revision = revision;
+            live_unit_summary(&conn, &selected, unit_key, "epoch", 1).unwrap()
+        };
+        assert_eq!(
+            read(1, &key),
+            UnitLive::Present {
+                output_digest: [3; 32]
+            }
+        );
+        assert_eq!(
+            read(2, &key),
+            UnitLive::Present {
+                output_digest: [3; 32]
+            }
+        );
+        assert_eq!(
+            read(3, &key),
+            UnitLive::Present {
+                output_digest: [4; 32]
+            }
+        );
+        assert_eq!(read(4, &key), UnitLive::Absent);
+        assert_eq!(read(5, &key), UnitLive::Absent);
+        assert_eq!(read(6, &key), UnitLive::Absent);
+        assert_eq!(read(1, &added), UnitLive::Absent);
+        assert_eq!(
+            read(2, &added),
+            UnitLive::Present {
+                output_digest: [7; 32]
+            }
+        );
+        assert_eq!(read(2, &[9; 32]), UnitLive::Absent);
+        let mut selected = snapshot;
+        selected.revision = 2;
+        assert_eq!(
+            live_unit_summary(&conn, &selected, &key, "epoch", 2).unwrap(),
+            UnitLive::Absent
+        );
+    }
 }

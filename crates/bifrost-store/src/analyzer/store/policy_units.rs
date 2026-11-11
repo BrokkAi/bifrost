@@ -1020,8 +1020,8 @@ fn write_unit(
     // Configuration and Epoch store the named non-source input's digest.
     const INTERN_READ_KEY_SQL: &str = "INSERT INTO policy_read_keys(
            key_digest, kind, family, languages, rel_path, name, index_key,
-           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18))
+           blob_oid, subject, start_byte, end_byte, digest, site_ordinal, decl_kind, decl_signature, workspace_fact_family, fact_member, fact_names, copy_owning_unit, copy_target_unit, copy_module_path, copy_target_identity_digest, copy_census_version, copy_config_digest, copy_producer_digest, parse_variant_kind, parse_variant_digest, structural_role, structural_keyword
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, jsonb(?18), ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
          ON CONFLICT(key_digest) DO NOTHING";
     let mut intern = conn.prepare_cached(INTERN_READ_KEY_SQL)?;
     let mut find =
@@ -1031,7 +1031,8 @@ fn write_unit(
          ON CONFLICT(unit_id, read_id) DO NOTHING",
     )?;
     for read in &unit.reads {
-        let columns = ReadKeyColumns::of(read);
+        let columns = ReadKeyColumns::of(read)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         intern.execute(params![
             columns.key_digest.as_slice(),
             columns.kind,
@@ -1051,6 +1052,17 @@ fn write_unit(
             columns.workspace_fact_family,
             columns.fact_member,
             columns.fact_names,
+            columns.copy_owning_unit,
+            columns.copy_target_unit,
+            columns.copy_module_path,
+            columns.copy_target_identity_digest,
+            columns.copy_census_version,
+            columns.copy_config_digest,
+            columns.copy_producer_digest,
+            columns.parse_variant_kind,
+            columns.parse_variant_digest,
+            columns.structural_role,
+            columns.structural_keyword,
         ])?;
         let read_id = find.query_row(params![columns.key_digest.as_slice()], |row| {
             row.get::<_, i64>(0)
@@ -1254,12 +1266,7 @@ fn decode_unit_row(row: &rusqlite::Row<'_>) -> Result<(i64, PolicyUnitRow)> {
 /// The language a workspace-relative path belongs to, for a unit whose seed
 /// blob has left the cache and taken its storage language with it.
 fn language_of_rel_path(rel_path: &str) -> Language {
-    Language::from_extension(
-        std::path::Path::new(rel_path)
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default(),
-    )
+    Language::from_path(std::path::Path::new(rel_path))
 }
 
 /// Every read key one unit recorded.
@@ -1267,7 +1274,7 @@ fn load_unit_reads(conn: &rusqlite::Connection, unit_id: i64) -> Result<Vec<Read
     let mut statement = conn.prepare_cached(
         "SELECT keys.key_digest, keys.kind, keys.family, keys.languages, keys.rel_path,
                 keys.name, keys.index_key, keys.blob_oid, keys.subject,
-                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names)
+                keys.start_byte, keys.end_byte, keys.digest, keys.site_ordinal, keys.decl_kind, keys.decl_signature, keys.workspace_fact_family, keys.fact_member, json(keys.fact_names), keys.copy_owning_unit, keys.copy_target_unit, keys.copy_module_path, keys.copy_target_identity_digest, keys.copy_census_version, keys.copy_config_digest, keys.copy_producer_digest, keys.parse_variant_kind, keys.parse_variant_digest, keys.structural_role, keys.structural_keyword
          FROM policy_unit_reads AS membership
          JOIN policy_read_keys AS keys ON keys.read_id = membership.read_id
          WHERE membership.unit_id = ?1",
@@ -1341,6 +1348,26 @@ mod tests {
     fn every_read_key_shape() -> Vec<ReadKey> {
         let digest = StableDigest::sha256(b"answer");
         vec![
+            ReadKey::lookup(
+                LookupKind::ExternalSelection,
+                LookupQuestion::ExternalSelection {
+                    question_digest: *StableDigest::sha256(b"selection question").as_bytes(),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::RustCopyAbsence,
+                LookupQuestion::RustCopyAbsence {
+                    owning_unit: StableDigest::sha256(b"owner"),
+                    target_unit: StableDigest::sha256(b"target"),
+                    module_path: "crate::resource".into(),
+                    target_identity_digest: StableDigest::sha256(b"Resource"),
+                    census_version: 1,
+                    config_digest: StableDigest::sha256(b"cfg"),
+                    producer_digest: StableDigest::sha256(b"producer"),
+                },
+                digest,
+            ),
             ReadKey::file(
                 Language::Java,
                 "src/Main.java",
@@ -1349,6 +1376,34 @@ mod tests {
             ),
             ReadKey::path_absent(Language::Java, "src/Missing.java"),
             ReadKey::index(IndexFamily::DefinitionExact, b"com.example.Main"),
+            ReadKey::lookup(
+                LookupKind::StructuralRoleNameInventory,
+                LookupQuestion::StructuralRoleName {
+                    language: Language::Java,
+                    role: brokk_bifrost_core::analyzer::structural::kinds::Role::Callee,
+                    name: "Main".into(),
+                    keyword: true,
+                    authority: StableDigest::sha256(b"structural selection"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::StructuralNameInventory,
+                LookupQuestion::StructuralName {
+                    language: Language::Java,
+                    name: "Main".into(),
+                    authority: StableDigest::sha256(b"structural selection"),
+                },
+                digest,
+            ),
+            ReadKey::lookup(
+                LookupKind::StructuralRecoveredInventory,
+                LookupQuestion::StructuralRecovered {
+                    language: Language::Java,
+                    authority: StableDigest::sha256(b"structural selection"),
+                },
+                digest,
+            ),
             ReadKey::lookup(
                 LookupKind::ResolvedName,
                 LookupQuestion::Name {
@@ -1668,6 +1723,55 @@ mod tests {
         assert_eq!(loaded.key, seed_key("src/Main.java"));
         assert_eq!(loaded.product, "{\"rows\":[]}");
         let conn = store.conn.lock().unwrap();
+        let unit_id = conn
+            .query_row("SELECT unit_id FROM policy_units", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let role_id = conn.query_row("SELECT read_id FROM policy_read_keys WHERE family='structural_role_name_inventory'", [], |row| row.get::<_, i64>(0)).unwrap();
+        let other_id = conn
+            .query_row(
+                "SELECT read_id FROM policy_read_keys WHERE family='structural_name_inventory'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        for (sql, read_id) in [
+            (
+                "UPDATE policy_read_keys SET structural_role=NULL WHERE read_id=?1",
+                role_id,
+            ),
+            (
+                "UPDATE policy_read_keys SET structural_keyword=NULL WHERE read_id=?1",
+                role_id,
+            ),
+            (
+                "UPDATE policy_read_keys SET structural_role='bogus' WHERE read_id=?1",
+                role_id,
+            ),
+            (
+                "UPDATE policy_read_keys SET structural_keyword=2 WHERE read_id=?1",
+                role_id,
+            ),
+            (
+                "UPDATE policy_read_keys SET structural_role='callee' WHERE read_id=?1",
+                other_id,
+            ),
+            (
+                "UPDATE policy_read_keys SET structural_keyword=1 WHERE read_id=?1",
+                other_id,
+            ),
+        ] {
+            conn.execute_batch("SAVEPOINT malformed_role_read").unwrap();
+            if conn.execute(sql, [read_id]).is_ok() {
+                assert!(
+                    load_unit_reads(&conn, unit_id).unwrap_err().is_corrupt(),
+                    "{sql}"
+                );
+            }
+            conn.execute_batch("ROLLBACK TO malformed_role_read; RELEASE malformed_role_read")
+                .unwrap();
+        }
         let text_name_group = ReadKey::lookup(
             LookupKind::WorkspaceFact,
             LookupQuestion::WorkspaceFact {
@@ -1680,7 +1784,7 @@ mod tests {
             },
             StableDigest::sha256(b"answer"),
         );
-        let text_columns = ReadKeyColumns::of(&text_name_group);
+        let text_columns = ReadKeyColumns::of(&text_name_group).unwrap();
         let text_error = conn
             .execute(
                 "INSERT INTO policy_read_keys(
@@ -1746,16 +1850,20 @@ mod tests {
                 events: 6,
                 ..Default::default()
             },
+            resident_peak: crate::analyzer::semantic::SemanticWork {
+                events: 9,
+                ..Default::default()
+            },
         };
         let mut unit = unit_row("src/Main.java", vec![]);
         unit.product = serde_json::json!({"semantic": accounting}).to_string();
         store.publish_policy_units(vec![unit]).unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let observed: (String, i64, i64, i64) = conn.query_row(
-            "SELECT typeof(product), json_extract(product, '$.semantic.cumulative.events'), json_extract(product, '$.semantic.root_work_peak.events'), json_extract(product, '$.semantic.retained.events') FROM policy_units", [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        let observed: (String, i64, i64, i64, i64) = conn.query_row(
+            "SELECT typeof(product), json_extract(product, '$.semantic.cumulative.events'), json_extract(product, '$.semantic.root_work_peak.events'), json_extract(product, '$.semantic.retained.events'), json_extract(product, '$.semantic.resident_peak.events') FROM policy_units", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         ).unwrap();
-        assert_eq!(observed, ("blob".into(), 21, 8, 6));
+        assert_eq!(observed, ("blob".into(), 21, 8, 6, 9));
     }
 
     #[test]

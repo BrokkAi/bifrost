@@ -171,7 +171,6 @@ fn populate_lexical_captures<'tree>(
 ) -> Result<(), JavaCaptureInventoryStop> {
     use brokk_bifrost_analysis::analyzer::lexical_definitions::LexicalBindingResolution;
 
-    use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus;
     use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding_from_focus_with_visibility;
 
     if !specs.iter().any(|spec| spec.kind == ProcedureKind::Lambda) {
@@ -179,12 +178,30 @@ fn populate_lexical_captures<'tree>(
     }
     let mut bindings = HashMap::default();
     let mut writes = Vec::new();
+    let mut lexical_inventory_unavailable = vec![false; specs.len()];
     for spec in specs.iter() {
         charge_capture_inventory(inventory, cancellation)?;
-        for (slot, node) in
-            formal_parameter_slots_for_owner_with_nodes(Language::Java, spec.callable, source)
-                .unwrap_or_default()
-        {
+        let slots =
+            formal_parameter_slots_for_owner_with_nodes(Language::Java, spec.callable, source);
+        let slots = match slots {
+            Some(slots) => slots,
+            None if matches!(
+                spec.callable.kind(),
+                "static_initializer" | "enum_constant" | "variable_declarator"
+            ) || spec.callable.kind() == "block"
+                && spec
+                    .callable
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "class_body") =>
+            {
+                Vec::new()
+            }
+            None => {
+                lexical_inventory_unavailable[spec.id.index()] = true;
+                Vec::new()
+            }
+        };
+        for (slot, node) in slots {
             charge_capture_inventory(inventory, cancellation)?;
             if slot.receiver || slot.unique_name().is_none() {
                 continue;
@@ -244,23 +261,37 @@ fn populate_lexical_captures<'tree>(
             continue;
         }
         let name = node_text(source, target).expect("write target is source-backed");
-        if let Some(resolution) = resolve_lexical_binding_from_focus(
+        let resolution = match resolve_lexical_binding_from_focus_with_visibility(
             Language::Java,
             target,
             source,
             target.start_byte(),
             name,
         ) {
-            let definition = match resolution {
-                LexicalBindingResolution::Parameter(definition)
-                | LexicalBindingResolution::OtherLocal(definition) => definition,
-            };
-            let key = (
-                definition.name_range.start_byte,
-                definition.name_range.end_byte,
-            );
-            binding_writes.entry(key).or_default().push((owner, write));
-        }
+            Ok(Some(resolution)) => resolution,
+            Ok(None) => continue,
+            Err(_) => {
+                // A refused nearer binding may hide any ancestor's parameter.
+                // Every lambda that reads through this writer's lexical chain
+                // must inherit the existing incomplete capture inventory.
+                let mut current = Some(owner);
+                while let Some(id) = current {
+                    charge_capture_inventory(inventory, cancellation)?;
+                    lexical_inventory_unavailable[id.index()] = true;
+                    current = specs[id.index()].lexical_parent;
+                }
+                continue;
+            }
+        };
+        let definition = match resolution {
+            LexicalBindingResolution::Parameter(definition)
+            | LexicalBindingResolution::OtherLocal(definition) => definition,
+        };
+        let key = (
+            definition.name_range.start_byte,
+            definition.name_range.end_byte,
+        );
+        binding_writes.entry(key).or_default().push((owner, write));
     }
     let mut stable = HashSet::default();
     for (&key, &(owner, binding)) in &bindings {
@@ -311,6 +342,20 @@ fn populate_lexical_captures<'tree>(
 
     let mut captures = vec![HashMap::default(); specs.len()];
     let mut incomplete = vec![false; specs.len()];
+    for spec in specs
+        .iter()
+        .filter(|spec| spec.kind == ProcedureKind::Lambda)
+    {
+        let mut current = Some(spec.id);
+        while let Some(id) = current {
+            charge_capture_inventory(inventory, cancellation)?;
+            if lexical_inventory_unavailable[id.index()] {
+                incomplete[spec.id.index()] = true;
+                break;
+            }
+            current = specs[id.index()].lexical_parent;
+        }
+    }
     for spec in specs
         .iter()
         .filter(|spec| spec.kind == ProcedureKind::Lambda)

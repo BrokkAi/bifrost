@@ -680,6 +680,8 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         concurrency_effects: Vec::new(),
         returned_callables: Vec::new(),
         declared_effects: Vec::new(),
+        subject_effects: Vec::new(),
+        lifecycle_coverage: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
         result_use_obligations: Vec::new(),
@@ -746,7 +748,7 @@ fn reconcile_overload_groups(
         if agrees {
             if indexes
                 .iter()
-                .any(|index| matches!(summaries[*index].completeness, Completeness::Partial))
+                .any(|index| !matches!(summaries[*index].completeness, Completeness::Complete))
             {
                 weakened.extend(indexes.iter().copied());
             }
@@ -876,6 +878,7 @@ fn build_pack(
                 .unwrap_or_default(),
         },
         Provenance {
+            rust_artifact_approximation: None,
             source: realm.provenance_source.to_owned(),
             revision: Some(realm.provenance_revision.to_owned()),
         },

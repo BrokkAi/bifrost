@@ -203,57 +203,62 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
         (
             Language::Cpp,
             "app.cpp",
-            "void audit() {}\nvoid run() { audit(); }\n",
+            "#define AUDIT() audit()\nstruct App { void audit() {} void run() { audit(); this->audit(); AUDIT(); } };\nvoid audit() {}\nvoid run() { audit(); ::audit(); App a; a.audit(); }\n",
         ),
         (
             Language::CSharp,
             "App.cs",
-            "class App { void Audit() {} void Run() { Audit(); } }\n",
+            "class App { void Audit() {} void Run() { Audit(); this.Audit(); } }\n",
         ),
         (
             Language::Go,
             "app.go",
-            "package app\nfunc audit() {}\nfunc run() { audit() }\n",
+            "package app\nfunc audit() {}\ntype App struct { audit func() }\nfunc (a App) run() { audit(); a.audit() }\n",
         ),
         (
             Language::Java,
             "App.java",
-            "class App { void audit() {} void run() { audit(); } }\n",
+            "class App { void audit() {} void run() { audit(); this.audit(); Util.audit(); } }\nclass Util { static void audit() {} }\n",
         ),
         (
             Language::JavaScript,
             "app.js",
-            "function audit() {}\nfunction run() { audit(); }\n",
+            "function audit() {}\nconst app = { audit };\nfunction run() { audit(); app.audit(); }\n",
+        ),
+        (
+            Language::Kotlin,
+            "App.kt",
+            "fun audit() {}\nobject Util { fun audit() {} }\nclass App { fun audit() {}; fun run() { audit(); this.audit(); Util.audit() } }\nfun run() { audit(); App().audit() }\n",
         ),
         (
             Language::Php,
             "app.php",
-            "<?php\nfunction audit() {}\nfunction run() { audit(); }\n",
+            "<?php\nfunction audit() {}\nclass App { function audit() {} function run() { audit(); \\audit(); $this->audit(); } }\n",
         ),
         (
             Language::Python,
             "app.py",
-            "def audit():\n    pass\n\ndef run():\n    audit()\n",
+            "def audit():\n    pass\n\nclass App:\n    def audit(self): pass\n    def run(self):\n        audit()\n        self.audit()\n",
         ),
         (
             Language::Ruby,
             "app.rb",
-            "def audit; end\ndef run; audit(); end\n",
+            "def audit; end\nclass App\n def audit; end\n def run; audit(); self.audit(); end\nend\n",
         ),
         (
             Language::Rust,
             "lib.rs",
-            "fn audit() {}\nfn run() { audit(); }\n",
+            "fn audit() {}\nstruct App; impl App { fn audit(&self) {} }\nmacro_rules! call_audit { () => { audit() }; }\nfn run() { audit(); crate::audit(); App.audit(); call_audit!(); }\n",
         ),
         (
             Language::Scala,
             "App.scala",
-            "object App { def audit(): Unit = (); def run(): Unit = audit() }\n",
+            "object App { def audit(): Unit = (); def run(): Unit = { audit(); this.audit(); App.audit() } }\n",
         ),
         (
             Language::TypeScript,
             "app.ts",
-            "function audit(): void {}\nfunction run(): void { audit(); }\n",
+            "function audit(): void {}\nconst app = { audit };\nfunction run(): void { audit(); app.audit(); }\n",
         ),
     ];
     for (language, path, source) in cases {
@@ -262,6 +267,18 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
         ProjectFile::new(root.clone(), path)
             .write(source)
             .expect("write source");
+        // A trailing incomplete call forces parser recovery near the callee.
+        let recovered_path = format!(
+            "recovered.{ext}",
+            ext = std::path::Path::new(path)
+                .extension()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        ProjectFile::new(root.clone(), recovered_path)
+            .write(format!("{source}\naudit("))
+            .expect("write recovered source");
         let analyzer = language_analyzer(language, TestProject::new(root, language));
         let callee = if language == Language::CSharp {
             "Audit"
@@ -275,6 +292,7 @@ fn indexed_postings_match_scan_results_in_every_structural_language() {
             }
         }))
         .expect("query");
+        check_role_name_index_contains_scan(analyzer.as_ref(), &query).unwrap();
         let scan = execute_code_query_with_access_mode(
             analyzer.as_ref(),
             &query,
@@ -1601,6 +1619,279 @@ fn auto_reuses_but_does_not_build_a_whole_snapshot_for_a_narrow_scope() {
 }
 
 #[test]
+#[hardwon("#9179: small workspaces must retain their scan Scope dependency below index admission")]
+fn small_auto_scope_scans_and_records_scope() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    for index in 0..(MIN_AUTO_STRUCTURAL_INDEX_FILES - 1) {
+        ProjectFile::new(root.clone(), format!("file_{index}.ts"))
+            .write(format!("class Type{index} {{}}\n"))
+            .expect("write source");
+    }
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let (result, ledger) = crate::analyzer::capture_query_reads(&analyzer, || {
+        run_class_query(&analyzer, "Type0", StructuralAccessMode::Auto)
+    });
+    assert_eq!(
+        result.profile.expect("profile").access_path.selected,
+        "scan_only"
+    );
+    assert!(
+        ledger.keys().iter().any(|key| matches!(
+            key,
+            crate::analyzer::ReadKey::Scope { languages, .. }
+                if languages.as_ref() == [Language::TypeScript]
+        )),
+        "{:?}",
+        ledger.keys()
+    );
+}
+
+#[test]
+#[hardwon("#9179: a ready structural index hit omitted the exact-name inventory read")]
+fn ready_snapshot_index_hit_records_inventory_lookups() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    for index in 0..MIN_AUTO_STRUCTURAL_INDEX_FILES {
+        ProjectFile::new(root.clone(), format!("file_{index}.ts"))
+            .write(format!("class Type{index} {{}}\n"))
+            .expect("write source");
+    }
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let built = run_class_query(&analyzer, "Type0", StructuralAccessMode::EagerAuto);
+    assert_eq!(
+        built
+            .profile
+            .expect("build profile")
+            .access_path
+            .index_builds,
+        1
+    );
+    let (hit, ledger) = crate::analyzer::capture_query_reads(&analyzer, || {
+        run_class_query(&analyzer, "Type0", StructuralAccessMode::EagerAuto)
+    });
+    assert_eq!(hit.profile.expect("hit profile").access_path.index_hits, 1);
+    let keys = ledger.keys();
+    assert!(
+        keys.iter().any(|key| matches!(key,
+            crate::analyzer::ReadKey::Lookup {
+                kind: crate::analyzer::LookupKind::StructuralNameInventory,
+                question: crate::analyzer::LookupQuestion::StructuralName { name, .. },
+                ..
+            } if name.as_ref() == "Type0"
+        )),
+        "{keys:?}"
+    );
+    assert!(
+        keys.iter().any(|key| matches!(
+            key,
+            crate::analyzer::ReadKey::Lookup {
+                kind: crate::analyzer::LookupKind::StructuralRecoveredInventory,
+                ..
+            }
+        )),
+        "{keys:?}"
+    );
+    // Other query consumers may retain an independent whole-language read.
+    assert!(
+        keys.iter()
+            .any(|key| matches!(key, crate::analyzer::ReadKey::Scope { .. })),
+        "{keys:?}"
+    );
+}
+
+#[test]
+#[hardwon("#9179: occurrence-role changes must invalidate a recorded exact-name inventory")]
+fn occurrence_role_edit_rejects_recorded_exact_name_lookup() {
+    use crate::analyzer::{
+        ChangedFacts, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadKey,
+        verify_read_set,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let target = ProjectFile::new(root.clone(), "target.ts");
+    target.write("class Target {}\n").expect("base source");
+    for index in 1..MIN_AUTO_STRUCTURAL_INDEX_FILES {
+        ProjectFile::new(root.clone(), format!("file_{index}.ts"))
+            .write(format!("class Other{index} {{}}\n"))
+            .expect("write source");
+    }
+    let base = WorkspaceAnalyzer::build_ephemeral_footgun(
+        Arc::new(TestProject::new(root, Language::TypeScript)),
+        AnalyzerConfig::default(),
+    )
+    .expect("base workspace");
+    let (_, ledger) = crate::analyzer::capture_query_reads(base.analyzer(), || {
+        run_class_query(base.analyzer(), "Target", StructuralAccessMode::EagerAuto)
+    });
+    let lookup = ledger
+        .keys()
+        .iter()
+        .find(|key| {
+            matches!(key, ReadKey::Lookup {
+            kind: crate::analyzer::LookupKind::StructuralNameInventory,
+            question: crate::analyzer::LookupQuestion::StructuralName { name, .. },
+            ..
+        } if name.as_ref() == "Target")
+        })
+        .expect("recorded exact-name lookup")
+        .clone();
+    let base_provider = base
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .next()
+        .expect("base structural provider");
+    let base_facts = base_provider.structural_facts(&target).expect("base facts");
+    target.write("Target();\n").expect("edit occurrence role");
+    let head = base.update(&BTreeSet::from([target.clone()]));
+    let head_provider = head
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .next()
+        .expect("head structural provider");
+    let head_facts = head_provider.structural_facts(&target).expect("head facts");
+    let roles = |facts: &crate::analyzer::structural::facts::FileFacts| {
+        (0..facts.nodes().len())
+            .flat_map(|node| facts.occurrence_roles(node as u32).iter().copied())
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(roles(&base_facts), roles(&head_facts));
+    let StructuralIndexAcquisition::Ready { index, .. } = head_provider
+        .snapshot_structural_index_cache()
+        .expect("snapshot cache")
+        .inner()
+        .acquire(head_provider, &CancellationToken::default())
+    else {
+        panic!("head structural index");
+    };
+    assert_eq!(index.exact_name_inventory("Target").1, vec![target]);
+    let digest = crate::analyzer::semantic::StableDigest::sha256(b"test inputs");
+    let inputs = HeadInputs {
+        models: digest,
+        policy_semantic_hash: digest,
+        policy_source: digest,
+        configuration: digest,
+        epoch: digest,
+    };
+    let verdict = verify_read_set(
+        &head,
+        &ChangedFacts::between(&base, &head),
+        &inputs,
+        &[lookup],
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    assert!(
+        !verdict.is_unchanged(),
+        "changed occurrence role: {verdict:?}"
+    );
+}
+
+#[test]
+#[hardwon(
+    "#9179: a same-name edit changed structural kind or role without moving the posting path"
+)]
+fn exact_name_inventory_changes_for_source_kind_role_and_overlay_edits() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let target = ProjectFile::new(root.clone(), "target.ts");
+    target.write("class Target {}\n").expect("base source");
+    for index in 1..MIN_AUTO_STRUCTURAL_INDEX_FILES {
+        ProjectFile::new(root.clone(), format!("file_{index}.ts"))
+            .write(format!("class Other{index} {{}}\n"))
+            .expect("write source");
+    }
+    let project: Arc<dyn crate::analyzer::Project> =
+        Arc::new(TestProject::new(root, Language::TypeScript));
+    let analyzer = TypescriptAnalyzer::new(Arc::clone(&project));
+    let inventory = |analyzer: &TypescriptAnalyzer| {
+        let provider = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .next()
+            .expect("structural provider");
+        let cache = provider
+            .snapshot_structural_index_cache()
+            .expect("snapshot cache");
+        let StructuralIndexAcquisition::Ready { index, .. } = cache
+            .inner()
+            .acquire(provider, &CancellationToken::default())
+        else {
+            panic!("complete structural index");
+        };
+        index.exact_name_inventory("Target")
+    };
+    let (base_digest, base_paths) = inventory(&analyzer);
+    assert_eq!(base_paths, vec![target.clone()]);
+
+    target.write("function Target() {}\n").expect("edit kind");
+    let changed_kind = analyzer.update(&BTreeSet::from([target.clone()]));
+    let (kind_digest, kind_paths) = inventory(&changed_kind);
+    assert_eq!(kind_paths, base_paths);
+    assert_ne!(kind_digest, base_digest);
+
+    target
+        .write("function Target(value: string) {}\n")
+        .expect("edit parameter role");
+    let changed_role = changed_kind.update(&BTreeSet::from([target.clone()]));
+    let (role_digest, role_paths) = inventory(&changed_role);
+    assert_eq!(role_paths, base_paths);
+    assert_ne!(role_digest, kind_digest);
+
+    let overlay = Arc::new(OverlayProject::new(project));
+    assert!(overlay.set(
+        target.abs_path(),
+        "function Target(other: number) {}\n".to_string()
+    ));
+    let overlaid = changed_role.clone_with_project(overlay as Arc<dyn crate::analyzer::Project>);
+    let (overlay_digest, overlay_paths) = inventory(&overlaid);
+    assert_eq!(overlay_paths, base_paths);
+    assert_ne!(overlay_digest, role_digest);
+}
+
+#[test]
+#[hardwon("#9179: a stopped structural inventory replay could certify an empty head")]
+fn stopped_structural_inventory_replay_refuses() {
+    use crate::analyzer::{LookupReplayLimits, NoSummaryAnswers, replay_lookup};
+
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("target.ts", "class Target {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let provider = workspace
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .next()
+        .expect("structural provider");
+    let question = crate::analyzer::LookupQuestion::StructuralName {
+        language: Language::TypeScript,
+        name: "Target".into(),
+        authority: provider
+            .structural_selection_authority()
+            .expect("selection authority"),
+    };
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let _scope =
+        crate::analyzer::AnalyzerQueryScope::with_cancellation(workspace.analyzer(), &cancellation);
+    assert!(
+        replay_lookup(
+            &workspace,
+            crate::analyzer::LookupKind::StructuralNameInventory,
+            &question,
+            LookupReplayLimits::default(),
+            &NoSummaryAnswers,
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn auto_builds_only_after_a_viable_scope_is_reused() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");
@@ -1922,4 +2213,81 @@ fn semantic_procedure_references_release_windows_and_reject_changed_revisions() 
         diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
             && diagnostic.message.contains("source generation changed")
     }));
+}
+
+#[test]
+fn role_name_receipt_detects_a_new_callee_file() {
+    use crate::analyzer::{
+        ChangedFacts, HeadInputs, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadKey,
+        verify_read_set,
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    for index in 0..MIN_AUTO_STRUCTURAL_INDEX_FILES {
+        ProjectFile::new(root.clone(), format!("Unit{index}.java"))
+            .write(format!(
+                "class Unit{index} {{ void run() {{ other(); }} void other() {{}} }}\n"
+            ))
+            .expect("base source");
+    }
+    let base = WorkspaceAnalyzer::build_ephemeral_footgun(
+        Arc::new(TestProject::new(root.clone(), Language::Java)),
+        AnalyzerConfig::default(),
+    )
+    .expect("base workspace");
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["java"],
+        "match": { "kind": "call", "callee": { "name": "audit" } }
+    }))
+    .expect("callee query");
+    let (_, ledger) = crate::analyzer::capture_query_reads(base.analyzer(), || {
+        execute_code_query_with_access_mode(
+            base.analyzer(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            StructuralAccessMode::EagerAuto,
+            true,
+        )
+        .expect("base query")
+    });
+    let lookup = ledger
+        .keys()
+        .iter()
+        .find(|key| {
+            matches!(key,
+                ReadKey::Lookup {
+                    kind: crate::analyzer::LookupKind::StructuralRoleNameInventory,
+                    question: crate::analyzer::LookupQuestion::StructuralRoleName {
+                        role: brokk_bifrost_core::analyzer::structural::kinds::Role::Callee,
+                        name, keyword: false, ..
+                    }, ..
+                } if name.as_ref() == "audit"
+            )
+        })
+        .expect("role-name inventory receipt")
+        .clone();
+    let added = ProjectFile::new(root, "Added.java");
+    added
+        .write("class Added { void run() { audit(); } void audit() {} }\n")
+        .expect("new callee source");
+    let head = base.update(&BTreeSet::from([added]));
+    let digest = crate::analyzer::semantic::StableDigest::sha256(b"test inputs");
+    let inputs = HeadInputs {
+        models: digest,
+        policy_semantic_hash: digest,
+        policy_source: digest,
+        configuration: digest,
+        epoch: digest,
+    };
+    let verdict = verify_read_set(
+        &head,
+        &ChangedFacts::between(&base, &head),
+        &inputs,
+        &[lookup],
+        LookupReplayLimits::default(),
+        &NoSummaryAnswers,
+        &mut LookupMemo::new(),
+    );
+    assert!(!verdict.is_unchanged(), "new posting file: {verdict:?}");
 }

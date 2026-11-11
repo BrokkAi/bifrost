@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 /// Lexically normalize a path while preserving its absolute/relative form.
 ///
@@ -26,6 +26,21 @@ impl NormalizePath for PathBuf {
         }
         normalized
     }
+}
+
+/// Whether `canonical`, the canonicalized form of `path`, names the location
+/// that `path` spells, so that `path` resolves through no symlink.
+///
+/// Spelling alone does not count as a difference: on Windows, canonicalizing
+/// returns a verbatim (`\\?\`) path with `\` separators, while a configured
+/// path joined from `a/b` keeps its `/`. A `..` component counts as a
+/// difference even when the lexical result matches, because the component it
+/// cancels may be a symlink.
+pub fn is_canonical_spelling(path: &Path, canonical: &Path) -> bool {
+    !path
+        .components()
+        .any(|component| component == Component::ParentDir)
+        && path.to_path_buf().normalize() == canonical.to_path_buf().normalize()
 }
 
 #[cfg(windows)]

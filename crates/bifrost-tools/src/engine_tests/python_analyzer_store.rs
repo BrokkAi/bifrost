@@ -163,12 +163,25 @@ mod python_extraction_tests {
 
         {
             let conn = store.conn.lock().unwrap();
-            assert!(
+            // code_units is a sealed blob-row family: write as a fixture so
+            // the schema, not the writer guard, is what refuses the delete
+            // (the sealed FQ-segment trigger fires before the source foreign
+            // key; either is a schema constraint).
+            let deleted = {
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
                 conn.execute(
                     "DELETE FROM code_units WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python')",
                     [oid.to_string()],
                 )
-                .is_err()
+            };
+            assert!(
+                matches!(
+                    &deleted,
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::ConstraintViolation
+                ),
+                "the schema protects published units: {deleted:?}"
             );
             // Canonical source links prevent deleting published units. Damage
             // the expected count directly to exercise independent read checks.
@@ -663,8 +676,8 @@ mod python_extraction_tests {
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
-                    &parse_state(&RustAdapter, &file),
+                    &RustAdapter::for_tests(),
+                    &parse_state(&RustAdapter::for_tests(), &file),
                 )
                 .unwrap();
 
@@ -682,7 +695,7 @@ mod python_extraction_tests {
 
             assert!(
                 plan.iter().any(|detail| detail
-                    .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
+                    .contains("SEARCH units USING INDEX idx_code_units_lang_identifier")),
                 "limited candidate query must seek the identifier index {state}: {plan:#?}"
             );
             assert!(

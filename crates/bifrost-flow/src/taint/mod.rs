@@ -1,10 +1,12 @@
 //! Set-oriented, diagnostic-neutral taint analysis over the shared IDE kernel.
 
+mod attributed;
 mod barriers;
 mod client;
 pub mod compose;
 mod finding;
 mod model;
+pub mod output_product;
 mod plan;
 mod planned;
 mod production;
@@ -13,15 +15,15 @@ mod summary;
 pub use client::{
     TaintBackwardFact, TaintBackwardFlowProblem, TaintBackwardHit, TaintBackwardResult,
     TaintEdgeFunction, TaintFact, TaintFlowProblem, TaintSolveError, TaintSummaryResult,
-    plan_taint_batch_direction, solve_taint_batch_backward, solve_taint_batch_with_summaries,
-    solve_taint_batch_with_witnesses,
+    plan_taint_batch_direction, solve_taint_batch_backward, solve_taint_batch_with_model_receipts,
+    solve_taint_batch_with_summaries, solve_taint_batch_with_witnesses,
 };
 pub use finding::{
     TaintAttributionBudget, TaintAttributionWork, TaintFinding, TaintFindingCollectionLimits,
     TaintFindingEntry, TaintFindingError, TaintFindingKey, TaintFindingReport,
     TaintOriginFindingEvidence, TaintOriginStatus, TaintWitnessTruncationCause,
     collect_taint_findings, collect_taint_findings_with_attribution_budget,
-    collect_taint_findings_with_limits,
+    collect_taint_findings_with_limits, collect_taint_findings_with_model_receipts,
 };
 pub use model::{
     MAX_TAINT_CLASSES, SourceClassId, SourceEventKey, TaintClassSet, TaintModelError,
@@ -51,6 +53,7 @@ pub use summary::{
     TaintTransferSummary, TaintTransferSummaryCacheStatus, TaintTransferSummaryError,
     TaintTransferSummaryKey, TaintTransferSummaryRepositoryLimits, TaintTransferSummarySolveError,
     TaintTransferSummarySolveResult, solve_taint_with_reusable_summaries,
+    solve_taint_with_reusable_summaries_with_model_receipts,
 };
 
 pub use barriers::{IcfgBarrierError, IcfgBarrierOutcome, IcfgBarrierSession};

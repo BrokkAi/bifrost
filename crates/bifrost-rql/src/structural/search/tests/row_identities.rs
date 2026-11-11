@@ -54,6 +54,9 @@ fn unavailable_runtime_read() -> CodeQueryResult {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "9969efb4c231: an incomplete keyed read truncated rows without naming a cause"
+)]
 fn unavailable_runtime_read_keeps_unknown_key_kind() {
     let result = unavailable_runtime_read();
     let rows = serde_json::to_value(&result).unwrap();
@@ -63,7 +66,13 @@ fn unavailable_runtime_read_keeps_unknown_key_kind() {
         assert_eq!(row["key_kind"], "unknown", "{row}");
         assert_eq!(row["outcome"], "incomplete", "{row}");
     }
-    assert!(!result.diagnostics.is_empty(), "{result:?}");
+    // The incomplete keyed read truncates the result, and the truncation must
+    // name its cause: an advisory alone would leave the completion codeless.
+    assert!(result.truncated, "{result:?}");
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { codes } if !codes.is_empty()),
+        "{result:?}"
+    );
 }
 
 #[test]

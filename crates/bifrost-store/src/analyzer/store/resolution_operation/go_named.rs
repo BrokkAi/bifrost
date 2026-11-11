@@ -151,7 +151,7 @@ pub struct GoPreparedImportContext {
 /// operation prepares more than one file; published context paths are not
 /// staged source content and do not change this identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) struct GoPreparedContextKey {
+pub(crate) struct GoPreparedContextKey {
     kind: GoPreparedContextKind,
     stage: GoPreparationStage,
     context_id: i64,
@@ -160,6 +160,13 @@ pub(super) struct GoPreparedContextKey {
     source_role: String,
     scope: [u8; 32],
     stage_epoch: (u64, u64),
+}
+
+impl GoPreparedContextKey {
+    /// Heap bytes owned by this key, for request-local census accounting.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.caller_path.capacity() + self.source_role.capacity()
+    }
 }
 
 pub(super) type GoPreparedContextMemo =
@@ -316,6 +323,8 @@ pub struct GoImportDiagnosticBinding {
     pub provider_path: Option<String>,
     pub has_source_declarations: bool,
     pub completion: ResolutionCompletion,
+    /// Stable content rendering for diagnostics; raw Debug exposes request IDs.
+    pub completion_display: String,
     pub named_reasons: Vec<(&'static str, Arc<str>)>,
 }
 
@@ -342,12 +351,15 @@ impl GoPreparedImportContext {
                 | JavaImportRouteGapReasons
                 | JavaImportMemberScopes
                 | JvmExternalTypeIdentities
+                | GoExternalTypeWitnesses
                 | JvmExternalTypeIdentitiesByReference
                 | JvmExternalTypeBoundaries
                 | JvmExternalOwners
                 | ModelMembers
                 | JvmSupertypeNames
-                | JvmExternalMembers => PreparedContextIdentityPolicy::Refuse,
+                | JvmExternalMembers
+                | JavaExplicitImportBoundaries
+                | JavaTypeNameOwners => PreparedContextIdentityPolicy::Refuse,
             }
         });
         let Some(GoImportDiagnosticView {
@@ -368,6 +380,7 @@ impl GoPreparedImportContext {
             provider_path,
             has_source_declarations,
             completion,
+            completion_display,
             named_reasons,
         } in bindings
         {
@@ -377,6 +390,7 @@ impl GoPreparedImportContext {
             let _: &Option<String> = provider_path;
             let _: &bool = has_source_declarations;
             let _: &Vec<(&'static str, Arc<str>)> = named_reasons;
+            let _: &String = completion_display;
             // go_dot_import_context_for_selection builds inventory completion only
             // from canonical named reasons; go_import_completion_for adds the same.
             // go_import_binding_context_for_selection returns cancellation separately,
@@ -385,10 +399,13 @@ impl GoPreparedImportContext {
             if let ResolutionCompletion::Incomplete(reasons) = completion {
                 for reason in reasons.iter() {
                     match reason {
-                        ResolutionIncompleteReason::UnsupportedSemantic(identity) => assert!(
-                            identities.named_reason(*identity).is_some(),
-                            "diagnostic snapshot retains only canonical named reasons: {identity:?}"
-                        ),
+                        ResolutionIncompleteReason::UnsupportedSemantic(identity)
+                        | ResolutionIncompleteReason::ReceiverSubclassObligation(identity) => {
+                            assert!(
+                                identities.named_reason(*identity).is_some(),
+                                "diagnostic snapshot retains only canonical named reasons: {identity:?}"
+                            )
+                        }
                         ResolutionIncompleteReason::Cancelled
                         | ResolutionIncompleteReason::CyclicExpansion(_)
                         | ResolutionIncompleteReason::CyclicPrefixDependency(_)
@@ -877,26 +894,6 @@ impl GoImportBindingRow {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
-    /// Capture the caller's overlay rather than the language delegate's cache.
-    /// A multi-language analyzer can activate models without populating its
-    /// Go delegate. This authority lives only for the selected operation.
-    #[doc(hidden)]
-    pub fn with_go_model_authority(
-        self,
-        overlay: Option<Arc<dyn super::SelectedModelAuthority + Send + Sync>>,
-    ) -> Self {
-        assert!(
-            self.ready.attached_model_authority.is_none()
-                && self.go_import_inputs.borrow().mounts.is_empty(),
-            "model authority is captured before import preparation"
-        );
-        let mut operation = self;
-        operation.ready.attached_model_authority = Some(overlay);
-        // Validate a captured authority against any analyzer service set now.
-        drop(operation.ready.model_authority());
-        operation
-    }
-
     /// Overlay authority precedes missing durable import authority, like
     /// `model_declared_jvm_owner` in the JVM context. The registered language
     /// hook supplies the package clause name and provider identity; no basename
@@ -1088,7 +1085,7 @@ impl SelectedResolutionOperation<'_, '_> {
         self.go_file_import_context_with_role(context_id, path, &source_role, cancellation)
     }
 
-    pub(crate) fn go_source_role_for_mount(
+    pub fn go_source_role_for_mount(
         &self,
         context_id: i64,
         mount: SelectedResolutionMountOrdinal,
@@ -1161,8 +1158,8 @@ impl SelectedResolutionOperation<'_, '_> {
             .ready
             .inventory
             .connection()
+            .prepare_cached(DOMAIN_FOR_MODULE_SQL)?
             .query_row(
-                DOMAIN_FOR_MODULE_SQL,
                 rusqlite::params![
                     snapshot.workspace_id.as_str(),
                     snapshot.generation.get(),
@@ -1227,7 +1224,7 @@ impl SelectedResolutionOperation<'_, '_> {
             // unmounted persisted source to this operation's exact revision;
             // an overlay must prove its placement through the mounted branch.
             connection
-                .query_row(
+                .prepare_cached(
                     "SELECT file.file_version_id FROM main.workspace_file_versions file
                  JOIN temp.selected_workspace_revisions selected
                    ON selected.workspace_id=file.workspace_id AND selected.lang=file.lang
@@ -1237,31 +1234,25 @@ impl SelectedResolutionOperation<'_, '_> {
                    AND (file.valid_until IS NULL OR selected.revision<file.valid_until)
                    AND NOT EXISTS(SELECT 1 FROM temp.selected_resolution_overlay_masks mask
                      WHERE mask.storage_language='go' AND mask.persisted_relative_path=?1)",
-                    [path],
-                    |row| row.get(0),
-                )
+                )?
+                .query_row([path], |row| row.get(0))
                 .optional()?
         };
         let Some(version) = version else {
             return Ok(GraphFileSkipReason::Unplaced);
         };
-        let ignored: bool = connection.query_row(
-            GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL.as_str(),
-            rusqlite::params![context_id, version],
-            |row| row.get(0),
-        )?;
+        let ignored: bool = connection
+            .prepare_cached(GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_0_SQL.as_str())?
+            .query_row(rusqlite::params![context_id, version], |row| row.get(0))?;
         if ignored {
             return Ok(GraphFileSkipReason::ExcludedBuildSelection);
         }
-        let inventory: bool = connection.query_row(
-            GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL.as_str(),
-            [version],
-            |row| row.get(0),
-        )?;
+        let inventory: bool = connection
+            .prepare_cached(GO_INTERVAL_GO_GRAPH_FILE_EXCLUSION_1_SQL.as_str())?
+            .query_row([version], |row| row.get(0))?;
         if let Some(module_path) = module_path.filter(|_| inventory) {
-            let selected: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM main.go_package_instances
-                 WHERE context_id=?1 AND provider_module_path=?2 AND provider_provenance='go_tool')",
+            let selected: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM main.go_package_instances
+                 WHERE context_id=?1 AND provider_module_path=?2 AND provider_provenance='go_tool')")?.query_row(
                 rusqlite::params![context_id, module_path], |row| row.get(0),
             )?;
             if !selected {
@@ -1441,11 +1432,10 @@ impl SelectedResolutionOperation<'_, '_> {
                         && let Some(snapshot) =
                             context.cache_snapshot(&self.ready.lexical_source(), cancellation)?
                     {
-                        let cache_value = Arc::new(snapshot);
                         self.ready
                             .store
                             .cache_budget
-                            .insert_go_prepared_context(cache_key, cache_value);
+                            .insert_go_prepared_context(cache_key, snapshot);
                     }
                     Ok(Some(*context))
                 }
@@ -1766,19 +1756,46 @@ impl SelectedResolutionOperation<'_, '_> {
         provider: Option<&GoFileImportRow>,
         completion: ResolutionCompletion,
     ) -> GoImportDiagnosticBinding {
-        let named_reasons = match &completion {
+        let identities = &self.ready.context_identities;
+        // Ready Go import completions contain only canonical named reasons;
+        // assert_go_snapshot_safe checks that every reason is context-local.
+        let completion_display =
+            crate::analyzer::resolution::model::content_ordered_completion_debug(
+                &completion,
+                |key| {
+                    let number = key
+                        .context_number()
+                        .expect("Go import diagnostics name context-local reasons");
+                    identities
+                        .content_digest(number)
+                        .expect("Go reason has canonical content")
+                },
+            );
+        let mut named = match &completion {
             ResolutionCompletion::Complete => Vec::new(),
             ResolutionCompletion::Incomplete(reasons) => reasons
                 .iter()
                 .filter_map(|reason| {
-                    if let ResolutionIncompleteReason::UnsupportedSemantic(id) = reason {
-                        self.ready.context_identities.named_reason(*id)
-                    } else {
-                        None
-                    }
+                    let ResolutionIncompleteReason::UnsupportedSemantic(id) = reason else {
+                        return None;
+                    };
+                    let number = id
+                        .operation_local_number()
+                        .expect("Go named reason has number")
+                        & !crate::analyzer::resolution::model::CONTEXT_OPERATION_BASE;
+                    let digest = identities
+                        .content_digest(number)
+                        .expect("Go named reason has content");
+                    identities
+                        .named_reason(*id)
+                        .map(|details| (digest, details))
                 })
                 .collect(),
         };
+        named.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let named_reasons = named.into_iter().map(|(_, details)| details).collect();
         GoImportDiagnosticBinding {
             local_name: local_name.into(),
             source_spelling,
@@ -1790,6 +1807,7 @@ impl SelectedResolutionOperation<'_, '_> {
             }),
             has_source_declarations: provider.is_some_and(|row| row.has_source_declarations),
             completion,
+            completion_display,
             named_reasons,
         }
     }
@@ -2130,12 +2148,14 @@ impl SelectedResolutionOperation<'_, '_> {
             &providers,
             prepared.package_inventory,
             cancellation,
+            &ResolutionSession::unbounded(),
         )
     }
 
     /// Authorize package exports only through definitions actually reached by
     /// the positioned lexical prefix. Local values and types remain blockers.
     #[cfg(any(test, feature = "test-support"))]
+    #[allow(clippy::too_many_arguments)]
     fn go_eager_qualified_import_context(
         &self,
         context: SelectedResolutionContextSet,
@@ -2144,6 +2164,7 @@ impl SelectedResolutionOperation<'_, '_> {
         providers: &HashMap<SemanticId, i64>,
         inventory: GoPackageInventoryState,
         cancellation: &CancellationToken,
+        session: &ResolutionSession,
     ) -> Result<GoDotImportContext> {
         let lexical = self.ready.lexical_source();
         let identities = self.ready.context_identities.clone();
@@ -2204,8 +2225,9 @@ impl SelectedResolutionOperation<'_, '_> {
             &lexical,
             &lexical,
             &typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
             cancellation,
-            &ResolutionSession::unbounded(),
+            session,
             |operation| {
                 let mut resolutions = HashMap::default();
                 for references in references.chunks(MAX_REFERENCE_SEEDS_PER_BATCH) {
@@ -2481,6 +2503,7 @@ impl super::super::cache_budget::RetainedBytes for GoPreparedImportContextSnapsh
                 heap.add(
                     binding.local_name.capacity()
                         + binding.source_spelling.capacity()
+                        + binding.completion_display.capacity()
                         + binding.provider_path.as_ref().map_or(0, String::capacity),
                 );
                 binding.completion.charge_retained(&mut heap);
@@ -2504,6 +2527,146 @@ mod snapshot_tests {
     use crate::analyzer::resolution::local_identity::PerRequestSharedNames;
     use crate::analyzer::resolution::{ExternalOwnerIdentity, ExternalOwnerLanguage};
     use crate::analyzer::semantic_model::{ModelProvider, ModelSymbolRef};
+
+    #[test]
+    fn go_external_type_witness_validates_only_under_its_exact_authority() {
+        use super::super::go_demand::{
+            GoExternalTypeWitness, GoTerminalAuthority, GoTerminalDemand,
+        };
+        use crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind;
+
+        let names = PerRequestSharedNames::new();
+        let identities = SelectedContextIdentities::new();
+        let external = identities.external_owner_semantic_for_language(
+            ExternalOwnerLanguage::Go,
+            &ExternalOwnerIdentity {
+                provider_id: std::sync::Arc::from("pack-digest"),
+                owner_fqn: std::sync::Arc::from("net.Addr"),
+            },
+            &names,
+        );
+        let reference = SemanticId::for_test(b"go-addr-reference");
+        let slot = SemanticId::for_test(b"go-addr-slot");
+        let binder = SemanticId::for_test(b"go-net-binder");
+        let import = |pack_digest: &str| GoSelectedExternalImport {
+            source_spelling: "net".into(),
+            import_path: "net".into(),
+            package_name: "net".into(),
+            provenance: GoExternalPackageProvenance::SemanticModel {
+                symbol_id: "package.net".into(),
+                pack_id: "go-net".into(),
+                pack_digest: pack_digest.into(),
+                record_id: "net".into(),
+            },
+        };
+        let seed = crate::analyzer::resolution::SeedReadAuthority {
+            request: 7,
+            content_epoch: 11,
+            scope: [3; 32],
+        };
+        // The qualified root in the caller's own file has no source context,
+        // so its provider rows read the operation's caller demand.
+        let caller = GoTerminalAuthority {
+            demand: GoTerminalDemand::Caller {
+                context_id: 1,
+                caller: SelectedResolutionMountOrdinal::new(1),
+                preparation: None,
+            },
+            binder_import: import("pack-digest"),
+            active_model_set_hash: "models-a".into(),
+            seed_authority: seed,
+        };
+        identities.record_go_external_type_witness(
+            reference,
+            slot,
+            binder,
+            GoExternalTypeWitness {
+                source_node: BindingNodeId::local(1, 1),
+                owner_semantic: external,
+                owner_provider: ModelProvider {
+                    pack_id: "go-net".into(),
+                    pack_version: "1.0.0".into(),
+                    pack_digest: "pack-digest".into(),
+                },
+                qualified_name: "net.Addr".into(),
+                kind: SemanticModelSymbolKind::Interface,
+                authority: caller.clone(),
+            },
+        );
+        let key = (reference, slot, binder);
+        let owner = identities
+            .validated_external_owner(&key, &caller)
+            .expect("the caller-demand witness validates under its own authority");
+        assert_eq!(owner.semantic, external);
+        assert_eq!(owner.reference, reference);
+
+        let other_models = GoTerminalAuthority {
+            active_model_set_hash: "models-b".into(),
+            ..caller.clone()
+        };
+        assert_eq!(
+            identities.validated_external_owner(&key, &other_models),
+            None
+        );
+        let prepared = GoTerminalAuthority {
+            demand: GoTerminalDemand::Prepared(GoPreparedContextKey {
+                kind: GoPreparedContextKind::File,
+                stage: GoPreparationStage::Full,
+                context_id: 1,
+                caller_mount: SelectedResolutionMountOrdinal::new(1),
+                caller_path: "net.go".into(),
+                source_role: "go".into(),
+                scope: seed.scope,
+                stage_epoch: (seed.content_epoch, 0),
+            }),
+            ..caller.clone()
+        };
+        assert_eq!(identities.validated_external_owner(&key, &prepared), None);
+        // The same question selected again under another authority keeps its
+        // own witness; each validates only under its own authority.
+        identities.record_go_external_type_witness(
+            reference,
+            slot,
+            binder,
+            GoExternalTypeWitness {
+                source_node: BindingNodeId::local(1, 1),
+                owner_semantic: external,
+                owner_provider: ModelProvider {
+                    pack_id: "go-net".into(),
+                    pack_version: "1.0.0".into(),
+                    pack_digest: "pack-digest".into(),
+                },
+                qualified_name: "net.Addr".into(),
+                kind: SemanticModelSymbolKind::Interface,
+                authority: prepared.clone(),
+            },
+        );
+        assert_eq!(
+            identities
+                .validated_external_owner(&key, &prepared)
+                .map(|owner| owner.authority),
+            Some(prepared.clone())
+        );
+        assert_eq!(
+            identities
+                .validated_external_owner(&key, &caller)
+                .map(|owner| owner.authority),
+            Some(caller.clone())
+        );
+        let other_import = GoTerminalAuthority {
+            binder_import: import("other-digest"),
+            ..caller.clone()
+        };
+        assert_eq!(
+            identities.validated_external_owner(&key, &other_import),
+            None
+        );
+        let other_binder = (reference, slot, SemanticId::for_test(b"go-other-binder"));
+        assert_eq!(
+            identities.validated_external_owner(&other_binder, &caller),
+            None
+        );
+    }
 
     fn snapshot(identities: SelectedContextIdentities) -> GoPreparedImportContextSnapshot {
         GoPreparedImportContextSnapshot {
@@ -2542,6 +2705,7 @@ mod snapshot_tests {
                 completion: ResolutionCompletion::incomplete([
                     ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::context_local(1)),
                 ]),
+                completion_display: String::new(),
                 named_reasons: Vec::new(),
             }],
             source_authority_gaps: Vec::new(),

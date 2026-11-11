@@ -1,0 +1,83 @@
+{
+  "schema_version": 22,
+  "pack_id": "test.rust-std-deref-summary",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-reviewed-rust-std-deref",
+    "version": "0.1.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "toolchains": [
+      {
+        "name": "rust",
+        "requirement": "=1.100.0-nightly"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "Explicitly test-only trimmed fixture of reviewed Rust std Deref summary contract.",
+    "revision": "fb6531d550e0075b9eb9a51464f404805eec87d9"
+  },
+  "license": "MIT OR Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.rust.std-deref",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "rust",
+            "version": "=1.100.0-nightly"
+          },
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "std-deref.pathbuf",
+            "target": {
+              "path": "std.json",
+              "symbol": "std.path.PathBuf.deref#member.00c10d3f6a56b967a178a91289acfcb2c815b1c664da0352ff712ea324628c07.trait.49bfe6addd6729ac7567f39fc70981cb7c84f19c9dd3502aa76f546529cdcc1c",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "ordinary_heap_unchanged": true,
+            "no_concurrency_effects": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                },
+                "value_transfer": {
+                  "kind": {
+                    "kind": "conversion",
+                    "preservation": "identity"
+                  },
+                  "operation": {
+                    "kind": "none"
+                  }
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 use crate::CancellationToken;
 
-use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
+use brokk_bifrost_core::retention_budget::{AllocationCharge, RetentionBudget, SharedAllocation};
 
 use crate::analyzer::IAnalyzer;
 use crate::analyzer::Language;
@@ -9,7 +10,8 @@ use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::semantic_model::SemanticModelOverlayBuildError;
 use crate::analyzer::semantic_model::SemanticPackCatalog;
 use crate::analyzer::semantic_model::SemanticPackSelectorQuery;
-use crate::analyzer::semantic_model::{CatalogMiss, CatalogPackSourceKind};
+use crate::analyzer::semantic_model::{CatalogCoordinate, CatalogMiss, CatalogPackSourceKind};
+use crate::analyzer::store::active_models::ActivationExclusions;
 pub use crate::analyzer::store::active_models::{
     ActivatedProcedureSummary, ActivatedSemanticModelRecord, ActiveSemanticModelShard,
     EffectiveProcedureClaims, MatcherIndexes, ProcedureSummaryMatch, ResolvedActiveSemanticModels,
@@ -33,10 +35,24 @@ pub use brokk_bifrost_semantic::analyzer::semantic_model::runtime::*;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// #10189 lifts this hold after Match and Assertion have per-lookup OPEN.
+/// Installed includes a user-supplied local bundle; it is visibly refused
+/// under the interim rule rather than treated as an unmarked exact model.
+const APPROXIMATE_DISTRIBUTED_SHARDS_ALLOWED: bool = false;
+
+fn is_distributed_pack_source(kind: CatalogPackSourceKind) -> bool {
+    matches!(
+        kind,
+        CatalogPackSourceKind::Installed
+            | CatalogPackSourceKind::PreShipped
+            | CatalogPackSourceKind::Embedded
+    )
+}
 
 /// One immutable semantic-model publication captured under the runtime's
 /// publication lock.
@@ -44,9 +60,10 @@ use std::time::Instant;
 /// The declaration overlay is derived from `active_models`. Keeping the pair
 /// in one owned value prevents a request from combining one activation's
 /// procedure summaries with a later activation's declaration resolver.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ActiveSemanticModelSnapshot {
     active_models: Arc<ResolvedActiveSemanticModels>,
+    rust_cargo_graph: Option<Arc<super::RustSelectedCargoGraph>>,
     semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
     overlay_measurement: Option<SemanticModelOverlayMeasurement>,
     jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
@@ -55,9 +72,15 @@ pub struct ActiveSemanticModelSnapshot {
         Option<crate::analyzer::store::python_runtime::PythonRuntimeProviderPublication>,
 }
 
+struct OverlayActivation<'a> {
+    request: &'a SemanticModelActivationRequest,
+    rust_cargo_graph: Option<&'a super::RustSelectedCargoGraph>,
+}
+
 impl ActiveSemanticModelSnapshot {
     fn new(
         active_models: Arc<ResolvedActiveSemanticModels>,
+        rust_cargo_graph: Option<Arc<super::RustSelectedCargoGraph>>,
         semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
         overlay_measurement: Option<SemanticModelOverlayMeasurement>,
         jdk_artifacts_by_configured_home: Arc<HashMap<PathBuf, SemanticModelActivationEvidence>>,
@@ -72,6 +95,7 @@ impl ActiveSemanticModelSnapshot {
         );
         Self {
             active_models,
+            rust_cargo_graph,
             semantic_model_overlay,
             overlay_measurement,
             jdk_artifacts_by_configured_home,
@@ -81,6 +105,10 @@ impl ActiveSemanticModelSnapshot {
 
     pub fn active_models(&self) -> &Arc<ResolvedActiveSemanticModels> {
         &self.active_models
+    }
+
+    pub fn rust_cargo_graph(&self) -> Option<&super::RustSelectedCargoGraph> {
+        self.rust_cargo_graph.as_deref()
     }
 
     pub fn semantic_model_overlay(&self) -> Option<&Arc<SemanticModelOverlay>> {
@@ -203,9 +231,26 @@ pub fn degrade_pack_gap_absences(
 }
 
 pub(crate) struct SemanticModelRuntimeCache {
-    values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
+    values: BudgetedValueCache<String, SharedAllocation<ResolvedActiveSemanticModels>>,
+    budget: RetentionBudget,
     published: Mutex<PublishedSemanticModelState>,
     inventory_store: std::sync::OnceLock<std::sync::Weak<AnalyzerStore>>,
+    graph_identities: Mutex<VecDeque<GraphIdentityMemo>>,
+}
+
+/// How many Cargo-graph identities one analyzer snapshot remembers. Each entry
+/// is two short strings; the bound keeps a long-lived process from collecting
+/// one per request it ever served.
+const GRAPH_IDENTITY_MEMO_ENTRIES: usize = 8;
+
+/// The computed facade identity of one Cargo activation, keyed by the inputs
+/// that determine it, so a repeat activation can look up its snapshot-cache
+/// key without resolving the catalog again. It holds a budget charge; an
+/// entry the budget refuses is not kept.
+struct GraphIdentityMemo {
+    key: String,
+    identity: String,
+    _charge: AllocationCharge,
 }
 
 #[derive(Default)]
@@ -213,6 +258,132 @@ pub(crate) struct PublishedSemanticModelState {
     snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     dependency_evidence:
         HashMap<Language, Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>>,
+    stale_dependency_ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
+    activated_dependency_ecosystems: Option<Vec<crate::analyzer::DependencyPackEcosystem>>,
+    requires_whole_dependency_refresh: bool,
+    captured_dependency_discoveries: HashMap<
+        crate::analyzer::DependencyPackEcosystem,
+        crate::analyzer::semantic_model::CapturedDependencyDiscovery,
+    >,
+    activation_request: Option<ActivationInputs>,
+}
+
+/// Inputs retained together across partial refresh and publication.
+#[derive(Clone, Debug)]
+pub struct ActivationInputs {
+    pub request: SemanticModelActivationRequest,
+    pub rust_cargo_graph: Option<super::RustSelectedCargoGraph>,
+}
+
+fn three_copy_graph_retained_bytes(overlay_bytes: u64, graph_copy_bytes: usize) -> u64 {
+    overlay_bytes.saturating_add(
+        u64::try_from(graph_copy_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2),
+    )
+}
+
+impl From<SemanticModelActivationRequest> for ActivationInputs {
+    fn from(request: SemanticModelActivationRequest) -> Self {
+        Self {
+            request,
+            rust_cargo_graph: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod carry_request_tests {
+    use super::*;
+
+    #[test]
+    fn stale_ecosystem_is_removed_from_carried_request() {
+        let evidence =
+            |ecosystem: crate::analyzer::DependencyPackEcosystem| SemanticModelActivationEvidence {
+                language: ecosystem.languages()[0].config_label().to_owned(),
+                ecosystem: ecosystem.label().to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            };
+        let request = SemanticModelActivationRequest {
+            bifrost_version: Version::new(0, 15, 1),
+            approximate_standard_libraries: [
+                crate::analyzer::DependencyPackEcosystem::Cargo,
+                crate::analyzer::DependencyPackEcosystem::Npm,
+            ]
+            .into_iter()
+            .map(|ecosystem| ApproximateSemanticModelExpectation {
+                toolchain: None,
+                language: ecosystem.languages()[0].config_label().to_owned(),
+                ecosystem: ecosystem.label().to_owned(),
+                pack_id: format!("{}-stdlib", ecosystem.label()),
+            })
+            .collect(),
+            evidence: [
+                crate::analyzer::DependencyPackEcosystem::Cargo,
+                crate::analyzer::DependencyPackEcosystem::Npm,
+            ]
+            .into_iter()
+            .map(evidence)
+            .collect(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let cache = SemanticModelRuntimeCache::default();
+        cache.install_carried_dependency_evidence(
+            Vec::new(),
+            vec![crate::analyzer::DependencyPackEcosystem::Cargo],
+            Some(request.into()),
+            Some(vec![
+                crate::analyzer::DependencyPackEcosystem::Cargo,
+                crate::analyzer::DependencyPackEcosystem::Npm,
+            ]),
+        );
+        let carried = cache.carried_activation_request().unwrap();
+        assert_eq!(carried.evidence.len(), 1);
+        assert_eq!(
+            carried.evidence[0].ecosystem,
+            crate::analyzer::DependencyPackEcosystem::Npm.label()
+        );
+        assert_eq!(carried.approximate_standard_libraries.len(), 1);
+        assert_eq!(
+            carried.approximate_standard_libraries[0].ecosystem,
+            crate::analyzer::DependencyPackEcosystem::Npm.label()
+        );
+    }
+
+    #[test]
+    fn verified_partial_refresh_carries_cargo_graph() {
+        let request = SemanticModelActivationRequest {
+            bifrost_version: Version::new(0, 15, 1),
+            approximate_standard_libraries: Vec::new(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let graph = super::super::RustSelectedCargoGraph::from_cargo_resolve(
+            super::super::CargoResolveView::from_rows(Vec::new(), Vec::new()),
+        )
+        .unwrap();
+        let cache = SemanticModelRuntimeCache::default();
+        cache.install_carried_dependency_evidence(
+            Vec::new(),
+            Vec::new(),
+            Some(ActivationInputs {
+                request,
+                rust_cargo_graph: Some(graph.clone()),
+            }),
+            Some(Vec::new()),
+        );
+        assert_eq!(
+            cache.carried_activation_inputs().unwrap().rust_cargo_graph,
+            Some(graph)
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -221,22 +392,196 @@ pub struct SemanticModelActivationPersistence<'a> {
     pub store: &'a AnalyzerStore,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Default for SemanticModelRuntimeCache {
     fn default() -> Self {
-        Self::new(1)
+        Self::new(&RetentionBudget::for_tests())
     }
 }
 
 impl SemanticModelRuntimeCache {
-    pub(crate) fn new(max_retained_bytes: u64) -> Self {
+    pub(crate) fn install_carried_dependency_evidence(
+        &self,
+        evidence: Vec<(
+            Language,
+            Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>,
+        )>,
+        mut stale: Vec<crate::analyzer::DependencyPackEcosystem>,
+        old_request: Option<ActivationInputs>,
+        activated: Option<Vec<crate::analyzer::DependencyPackEcosystem>>,
+    ) {
+        let mut published = self
+            .published
+            .lock()
+            .expect("semantic-model publication mutex poisoned");
+        for (language, value) in evidence {
+            published
+                .dependency_evidence
+                .entry(language)
+                .or_insert(value);
+        }
+        stale.retain(|ecosystem| {
+            !ecosystem
+                .languages()
+                .iter()
+                .all(|language| published.dependency_evidence.contains_key(language))
+        });
+        let carried_request = old_request.map(|mut inputs| {
+            inputs.request.evidence.retain(|entry| {
+                !stale
+                    .iter()
+                    .any(|ecosystem| ecosystem.label() == entry.ecosystem)
+            });
+            inputs
+                .request
+                .approximate_standard_libraries
+                .retain(|entry| {
+                    !stale
+                        .iter()
+                        .any(|ecosystem| ecosystem.label() == entry.ecosystem)
+                });
+            if stale.contains(&crate::analyzer::DependencyPackEcosystem::Cargo) {
+                inputs.rust_cargo_graph = None;
+            }
+            inputs
+        });
+        if published.activation_request.is_none() {
+            published.activation_request = carried_request;
+        }
+        published.stale_dependency_ecosystems = stale;
+        published.requires_whole_dependency_refresh = activated.is_none();
+        published.activated_dependency_ecosystems = activated;
+    }
+
+    pub(crate) fn carried_activation_request(&self) -> Option<SemanticModelActivationRequest> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .activation_request
+            .clone()
+            .map(|inputs| inputs.request)
+    }
+
+    pub(crate) fn carried_activation_inputs(&self) -> Option<ActivationInputs> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .activation_request
+            .clone()
+    }
+
+    pub(crate) fn store_captured_dependency_discovery(
+        &self,
+        ecosystem: crate::analyzer::DependencyPackEcosystem,
+        discovery: crate::analyzer::semantic_model::CapturedDependencyDiscovery,
+    ) {
+        assert!(!discovery.outcome.cancelled);
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .captured_dependency_discoveries
+            .insert(ecosystem, discovery);
+    }
+
+    pub(crate) fn take_captured_dependency_discovery(
+        &self,
+        ecosystem: crate::analyzer::DependencyPackEcosystem,
+    ) -> Option<crate::analyzer::semantic_model::CapturedDependencyDiscovery> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .captured_dependency_discoveries
+            .remove(&ecosystem)
+    }
+
+    pub(crate) fn activated_dependency_ecosystems(
+        &self,
+    ) -> Option<Vec<crate::analyzer::DependencyPackEcosystem>> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .activated_dependency_ecosystems
+            .clone()
+    }
+
+    pub(crate) fn record_activated_dependency_ecosystems(
+        &self,
+        ecosystems: &[crate::analyzer::DependencyPackEcosystem],
+    ) {
+        let mut published = self
+            .published
+            .lock()
+            .expect("semantic-model publication mutex poisoned");
+        let activated = published
+            .activated_dependency_ecosystems
+            .get_or_insert_with(Vec::new);
+        for ecosystem in ecosystems {
+            if !activated.contains(ecosystem) {
+                activated.push(*ecosystem);
+            }
+        }
+        published.requires_whole_dependency_refresh = false;
+    }
+
+    pub(crate) fn requires_whole_dependency_refresh(&self) -> bool {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .requires_whole_dependency_refresh
+    }
+
+    pub(crate) fn stale_dependency_ecosystems(
+        &self,
+    ) -> Vec<crate::analyzer::DependencyPackEcosystem> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .stale_dependency_ecosystems
+            .clone()
+    }
+
+    pub(crate) fn new(budget: &RetentionBudget) -> Self {
         Self {
-            values: CompleteValueCache::<String, ResolvedActiveSemanticModels>::new(
-                max_retained_bytes,
-                |_, active| u32::try_from(active.retained_bytes()).unwrap_or(u32::MAX),
-            ),
+            values: BudgetedValueCache::new(budget.region("semantic_models", None)),
+            budget: budget.clone(),
             published: Mutex::new(PublishedSemanticModelState::default()),
             inventory_store: std::sync::OnceLock::new(),
+            graph_identities: Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn remembered_graph_identity(&self, key: &str) -> Option<String> {
+        self.graph_identities
+            .lock()
+            .expect("graph identity memo mutex poisoned")
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.identity.clone())
+    }
+
+    fn remember_graph_identity(&self, key: String, identity: String) {
+        let charge = AllocationCharge::acquire(
+            &self.budget,
+            std::mem::size_of::<GraphIdentityMemo>() + key.len() + identity.len(),
+        );
+        if !charge.is_charged() {
+            return;
+        }
+        let mut memo = self
+            .graph_identities
+            .lock()
+            .expect("graph identity memo mutex poisoned");
+        if memo.iter().any(|entry| entry.key == key) {
+            return;
+        }
+        if memo.len() == GRAPH_IDENTITY_MEMO_ENTRIES {
+            memo.pop_front();
+        }
+        memo.push_back(GraphIdentityMemo {
+            key,
+            identity,
+            _charge: charge,
+        });
     }
 
     pub(crate) fn bind_inventory_store(&self, store: &Arc<AnalyzerStore>) {
@@ -313,19 +658,23 @@ impl SemanticModelRuntimeCache {
     fn publish_overlay(
         &self,
         analyzer: &dyn IAnalyzer,
+        activation: OverlayActivation<'_>,
         active: &Arc<ResolvedActiveSemanticModels>,
         dependency_evidence: Option<&[DependencyEvidencePublication]>,
         runtime_artifacts: RuntimeArtifactPublication<'_>,
         cancellation: &CancellationToken,
-        max_combined_retained_bytes: u64,
     ) -> Result<Arc<ActiveSemanticModelSnapshot>, SemanticModelOverlayBuildError> {
+        let OverlayActivation {
+            request,
+            rust_cargo_graph,
+        } = activation;
         let RuntimeArtifactPublication {
             jdk_artifacts_by_configured_home,
             python_runtime,
         } = runtime_artifacts;
         let _scope = crate::profiling::scope("semantic_pack.publish_overlay");
         {
-            let published = self
+            let mut published = self
                 .published
                 .lock()
                 .expect("semantic-model publication mutex poisoned");
@@ -334,18 +683,50 @@ impl SemanticModelRuntimeCache {
                 && python_runtime.is_none()
                 && let Some(snapshot) = published.snapshot.as_ref()
                 && Arc::ptr_eq(snapshot.active_models(), active)
+                && snapshot.rust_cargo_graph() == rust_cargo_graph
             {
-                return Ok(Arc::clone(snapshot));
+                let snapshot = Arc::clone(snapshot);
+                published.activation_request = Some(ActivationInputs {
+                    request: request.clone(),
+                    rust_cargo_graph: rust_cargo_graph.cloned(),
+                });
+                return Ok(snapshot);
             }
         }
         let overlay_started = Instant::now();
-        let overlay = Arc::new(SemanticModelOverlay::build(
+        let mut overlay = SemanticModelOverlay::build_with_rust_graph(
             analyzer,
             active,
+            rust_cargo_graph,
             cancellation,
-            max_combined_retained_bytes,
-        )?);
-        let retained_bytes = overlay.retained_bytes_lower_bound();
+            request.limits.max_retained_bytes,
+            &self.budget,
+        )?;
+        // The overlay owns one graph copy; publication retains two more in
+        // the snapshot and carried activation inputs.
+        let graph_copy_bytes =
+            rust_cargo_graph.map_or(0, super::RustSelectedCargoGraph::retained_bytes_lower_bound);
+        let retained_bytes =
+            three_copy_graph_retained_bytes(overlay.retained_bytes_lower_bound(), graph_copy_bytes);
+        if active.retained_bytes().saturating_add(retained_bytes)
+            > request.limits.max_retained_bytes
+        {
+            return Err(SemanticModelOverlayBuildError::RetainedBytesExceeded(
+                crate::analyzer::semantic_model::SemanticModelOverlayBudgetExceeded {
+                    loaded_records: active.activation_report().loaded_records,
+                    models_retained_bytes: active.retained_bytes(),
+                    overlay_working_bytes: retained_bytes,
+                    combined_budget_bytes: request.limits.max_retained_bytes,
+                },
+            ));
+        }
+        // The published snapshot keeps the overlay across requests as part of
+        // the analyzer's selected state, so it owns a required charge too.
+        overlay.charge = AllocationCharge::acquire_required(
+            &self.budget,
+            retained_bytes.try_into().unwrap_or(usize::MAX),
+        );
+        let overlay = Arc::new(overlay);
         let mut published = self
             .published
             .lock()
@@ -355,8 +736,14 @@ impl SemanticModelRuntimeCache {
             && python_runtime.is_none()
             && let Some(current) = published.snapshot.as_ref()
             && Arc::ptr_eq(current.active_models(), active)
+            && current.rust_cargo_graph() == rust_cargo_graph
         {
-            return Ok(Arc::clone(current));
+            let current = Arc::clone(current);
+            published.activation_request = Some(ActivationInputs {
+                request: request.clone(),
+                rust_cargo_graph: rust_cargo_graph.cloned(),
+            });
+            return Ok(current);
         }
         if let Some(evidence) = dependency_evidence {
             for (languages, value) in evidence {
@@ -387,6 +774,7 @@ impl SemanticModelRuntimeCache {
             .unwrap_or_default();
         let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
             Arc::clone(active),
+            rust_cargo_graph.cloned().map(Arc::new),
             Some(overlay),
             Some(overlay_measurement),
             jdk_artifacts_by_configured_home,
@@ -398,6 +786,10 @@ impl SemanticModelRuntimeCache {
             }),
         ));
         published.snapshot = Some(Arc::clone(&snapshot));
+        published.activation_request = Some(ActivationInputs {
+            request: request.clone(),
+            rust_cargo_graph: rust_cargo_graph.cloned(),
+        });
         Ok(snapshot)
     }
 }
@@ -422,7 +814,7 @@ pub fn resolve_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelResolutionOutcome {
-    resolve_active_semantic_models_with_loader(catalog, request, cancellation, |candidate| {
+    resolve_active_semantic_models_with_loader(catalog, request, None, cancellation, |candidate| {
         catalog.load(candidate)
     })
 }
@@ -442,7 +834,7 @@ pub fn resolve_row_backed_semantic_models_for_test(
             "M3 owns the remaining eager derivations for {language}; M2 tests cannot row-back that language"
         );
     }
-    resolve_active_semantic_models_with_loader(catalog, request, cancellation, |candidate| {
+    resolve_active_semantic_models_with_loader(catalog, request, None, cancellation, |candidate| {
         let loaded = catalog.load_metadata_only_for_test(candidate)?;
         if languages.contains(&loaded.manifest.language.as_str()) {
             Ok(loaded)
@@ -462,9 +854,230 @@ pub fn row_backing_language_supported_in_m2(language: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseMatchVersionAdmission {
+    Covered,
+    MissingEvidence,
+}
+
+fn close_match_version_admission(
+    claim: &crate::analyzer::semantic_model::RustArtifactApproximation,
+    evidence: &[SemanticModelActivationEvidence],
+    language: &str,
+    ecosystem: &str,
+    package_name: &str,
+) -> CloseMatchVersionAdmission {
+    if evidence.iter().any(|row| {
+        row.language == language
+            && row.ecosystem == ecosystem
+            && row.package.as_ref().is_some_and(|package| {
+                package.name == package_name
+                    && package
+                        .version
+                        .as_ref()
+                        .is_none_or(|version| claim.activation_reason(version).is_err())
+            })
+    }) {
+        CloseMatchVersionAdmission::MissingEvidence
+    } else {
+        CloseMatchVersionAdmission::Covered
+    }
+}
+
+fn retain_pack_winners(
+    selected: &mut Vec<CandidateSelection>,
+    report: &mut SemanticModelActivationReport,
+    limits: SemanticModelRuntimeLimits,
+    excluded_shards: &mut std::collections::BTreeSet<(String, String)>,
+) {
+    // One active version per authored pack_id (#8405): two versions of one
+    // pack are one provider, not two, so model lookups must not see both. The
+    // higher-precedence source wins, then the newer version. Manifests that
+    // tie on both but differ in content are a genuine conflict, not versions
+    // of each other, so all of them stay active and composition reports the
+    // conflict; the manifest digest only picks which winner a Shadowed reason
+    // names. The same manifest from several sources survives here and meets
+    // the equivalent-shard rule below.
+    // Generated and workspace-produced packs are exact output for one
+    // dependency or source set: their pack_id names the producer family (for
+    // example bifrost.external.go) and their version is the engine's, so they
+    // are not versions of one pack and strict activation already selects them.
+    // Bounded by max_catalog_candidates and retained only for this activation.
+    let authored = |selection: &CandidateSelection| {
+        !matches!(
+            selection.active.source_kind,
+            CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced
+        )
+    };
+    let pack_keys = selected
+        .iter()
+        .map(|selection| {
+            (
+                !selection.active.approximate,
+                selection.source_rank,
+                Version::parse(&selection.active.manifest.version)
+                    .expect("validated manifest version is semver"),
+                selection.active.manifest.content_sha256.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut pack_winners = HashMap::<&str, usize>::default();
+    for (index, selection) in selected.iter().enumerate() {
+        if !authored(selection) {
+            continue;
+        }
+        let winner = pack_winners
+            .entry(selection.active.manifest.pack_id.as_str())
+            .or_insert(index);
+        if pack_keys[index] > pack_keys[*winner] {
+            *winner = index;
+        }
+    }
+    let pack_winners = pack_winners
+        .into_iter()
+        .map(|(pack_id, index)| {
+            let winner = &selected[index].active;
+            (
+                pack_id.to_owned(),
+                (
+                    (
+                        (pack_keys[index].0, pack_keys[index].1),
+                        pack_keys[index].2.clone(),
+                    ),
+                    winner.manifest.content_sha256.clone(),
+                    winner.source_kind,
+                    winner.source_id.clone(),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let pack_ranks = pack_keys
+        .into_iter()
+        .map(|(exact, rank, version, _)| ((exact, rank), version))
+        .collect::<Vec<_>>();
+    let mut position = 0;
+    selected.retain(|selection| {
+        let rank = &pack_ranks[position];
+        position += 1;
+        if !authored(selection) {
+            return true;
+        }
+        let manifest = &selection.active.manifest;
+        let (winner_rank, digest, source_kind, source_id) = &pack_winners[&manifest.pack_id];
+        if rank == winner_rank || *digest == manifest.content_sha256 {
+            return true;
+        }
+        excluded_shards.insert(ActivationExclusions::key(manifest, &selection.active.descriptor));
+        push_explanation(
+            report,
+            limits,
+            SemanticModelActivationExplanation {
+                manifest_digest: manifest.content_sha256.clone(),
+                pack_id: Some(manifest.pack_id.clone()),
+                shard_id: selection.active.descriptor.shard_id.as_str().to_owned(),
+                source_kind: selection.active.source_kind,
+                source_id: selection.active.source_id.clone(),
+                status: SemanticModelActivationStatus::Shadowed,
+                reason: format!(
+                    "pack {} keeps one active version: version {} from {} source {source_id} takes precedence over version {}",
+                    manifest.pack_id,
+                    winner_rank.1,
+                    source_kind.as_str(),
+                    manifest.version
+                ),
+            },
+        );
+        false
+    });
+    debug_assert_eq!(
+        position,
+        pack_ranks.len(),
+        "retain visits every selection once, in order"
+    );
+}
+
+fn supplies_rust_assumption(
+    request: &SemanticModelActivationRequest,
+    manifest: &crate::analyzer::semantic_model::CompiledPackManifest,
+) -> bool {
+    request
+        .approximate_standard_libraries
+        .iter()
+        .any(|expectation| {
+            expectation.toolchain.as_deref() == Some("rust")
+                && expectation.language == "rust"
+                && manifest.language == "rust"
+                && expectation.ecosystem == manifest.ecosystem
+                && expectation.pack_id == manifest.pack_id
+        })
+}
+
+fn assumed_rust_toolchain<'a>(
+    request: &SemanticModelActivationRequest,
+    shards: impl IntoIterator<Item = &'a ActiveSemanticModelShard>,
+) -> Result<Version, String> {
+    let stdlib = shards
+        .into_iter()
+        .filter(|shard| shard.approximate && supplies_rust_assumption(request, &shard.manifest))
+        .collect::<Vec<_>>();
+    let mut versions = std::collections::BTreeSet::new();
+    let mut non_exact = false;
+    let mut missing_version = false;
+    for shard in &stdlib {
+        for selector in shard.selectors.iter() {
+            if let Some(toolchain) = &selector.toolchain
+                && toolchain.name == "rust"
+            {
+                match toolchain.version.as_deref() {
+                    Some(requirement) => {
+                        // A semver equality requires all three components. A
+                        // bare version means caret compatibility, not equality.
+                        let exact = requirement
+                            .strip_prefix('=')
+                            .and_then(|version| Version::parse(version.trim()).ok());
+                        match exact {
+                            Some(version) => {
+                                versions.insert(version);
+                            }
+                            None => non_exact = true,
+                        }
+                    }
+                    None => missing_version = true,
+                }
+            } else {
+                // Selectors are alternatives; an unconstrained alternative
+                // cannot justify assuming one exact Rust version.
+                missing_version = true;
+            }
+        }
+    }
+    let source = stdlib
+        .iter()
+        .map(|shard| format!("{}@{}", shard.manifest.pack_id, shard.manifest.version))
+        .collect::<std::collections::BTreeSet<_>>();
+    if stdlib.is_empty() {
+        Err("no approximately selected Rust standard-library pack".to_owned())
+    } else if non_exact {
+        Err(format!(
+            "winning stdlib {source:?} has a non-exact Rust selector range"
+        ))
+    } else if missing_version || versions.is_empty() {
+        Err(format!(
+            "winning stdlib {source:?} names no exact Rust toolchain version"
+        ))
+    } else if versions.len() != 1 {
+        Err(format!(
+            "winning stdlib {source:?} names several Rust toolchain versions: {versions:?}"
+        ))
+    } else {
+        Ok(versions.into_iter().next().expect("one version"))
+    }
+}
+
 fn resolve_active_semantic_models_with_loader(
     catalog: &SemanticPackCatalog,
     request: &SemanticModelActivationRequest,
+    rust_cargo_graph: Option<&super::RustSelectedCargoGraph>,
     cancellation: &CancellationToken,
     load: impl Fn(
         &crate::analyzer::semantic_model::catalog::CatalogCandidate,
@@ -473,6 +1086,7 @@ fn resolve_active_semantic_models_with_loader(
 ) -> SemanticModelResolutionOutcome {
     let _scope = crate::profiling::scope("semantic_pack.resolve_active");
     let mut report = SemanticModelActivationReport::default();
+    let mut excluded_shards = std::collections::BTreeSet::new();
     let activation_sql_start = catalog.sql_statement_count();
     let selection_started = Instant::now();
     let CanonicalActivationEvidence {
@@ -594,59 +1208,166 @@ fn resolve_active_semantic_models_with_loader(
     let mut selected = Vec::<CandidateSelection>::new();
     let mut incomplete = false;
     let mut decode_hydration_nanos = 0u64;
-    for candidate in candidates.into_values() {
+    let sharing_rust = request
+        .approximate_standard_libraries
+        .iter()
+        .any(|expectation| {
+            expectation.language == "rust" && expectation.toolchain.as_deref() == Some("rust")
+        })
+        && !evidence.iter().any(|row| {
+            row.language == "rust"
+                && row.toolchain.as_ref().is_some_and(|coordinate| {
+                    coordinate.name == "rust" && coordinate.version.is_some()
+                })
+        });
+    let mut pending = VecDeque::new();
+    let mut catalog_candidates = candidates.into_values();
+    let mut catalog_done = false;
+    let mut assumed_toolchain = None;
+    loop {
         if cancellation.is_cancelled() {
             return SemanticModelResolutionOutcome::Cancelled(report);
         }
-        let load_started = Instant::now();
-        let loaded = match load(&candidate) {
-            Ok(loaded) => loaded,
-            Err(miss) => {
-                let reconciliation_required =
-                    matches!(miss, CatalogMiss::IndexReconciliationRequired { .. });
-                incomplete = true;
-                push_explanation(
+        let (candidate, loaded, from_pending) = if let Some(candidate) = catalog_candidates.next() {
+            let load_started = Instant::now();
+            let loaded = match load(&candidate) {
+                Ok(loaded) => loaded,
+                Err(miss) => {
+                    let reconciliation_required =
+                        matches!(miss, CatalogMiss::IndexReconciliationRequired { .. });
+                    incomplete = true;
+                    push_explanation(
+                        &mut report,
+                        request.limits,
+                        SemanticModelActivationExplanation {
+                            manifest_digest: candidate.manifest_digest().to_owned(),
+                            pack_id: None,
+                            shard_id: candidate.shard_id().to_owned(),
+                            source_kind: candidate.source_kind(),
+                            source_id: candidate.source_id().to_owned(),
+                            status: SemanticModelActivationStatus::Unavailable,
+                            reason: catalog_miss_reason(&miss),
+                        },
+                    );
+                    if reconciliation_required {
+                        return SemanticModelResolutionOutcome::Unavailable(report);
+                    }
+                    continue;
+                }
+            };
+            decode_hydration_nanos =
+                decode_hydration_nanos.saturating_add(elapsed_ns(load_started));
+            report.loaded_shards = report.loaded_shards.saturating_add(1);
+            report.loaded_records = report.loaded_records.saturating_add(
+                usize::try_from(loaded.descriptor.record_count)
+                    .expect("validated record count fits usize"),
+            );
+            if report.loaded_shards > request.limits.max_loaded_shards
+                || report.loaded_records > request.limits.max_records
+            {
+                push_request_explanation(
                     &mut report,
                     request.limits,
-                    SemanticModelActivationExplanation {
-                        manifest_digest: candidate.manifest_digest().to_owned(),
-                        pack_id: None,
-                        shard_id: candidate.shard_id().to_owned(),
-                        source_kind: candidate.source_kind(),
-                        source_id: candidate.source_id().to_owned(),
-                        status: SemanticModelActivationStatus::Unavailable,
-                        reason: catalog_miss_reason(&miss),
-                    },
+                    "semantic-model decoded shard budget exceeded".to_owned(),
                 );
-                if reconciliation_required {
-                    return SemanticModelResolutionOutcome::Unavailable(report);
-                }
-                continue;
+                return SemanticModelResolutionOutcome::Unavailable(report);
             }
-        };
-        decode_hydration_nanos = decode_hydration_nanos.saturating_add(elapsed_ns(load_started));
-        report.loaded_shards = report.loaded_shards.saturating_add(1);
-        report.loaded_records = report.loaded_records.saturating_add(
-            usize::try_from(loaded.descriptor.record_count)
-                .expect("validated record count fits usize"),
-        );
-        if report.loaded_shards > request.limits.max_loaded_shards
-            || report.loaded_records > request.limits.max_records
-        {
-            push_request_explanation(
-                &mut report,
-                request.limits,
-                "semantic-model decoded shard budget exceeded".to_owned(),
-            );
-            return SemanticModelResolutionOutcome::Unavailable(report);
-        }
 
-        let approximate = approximate_standard_libraries.iter().any(|expectation| {
+            (candidate, loaded, false)
+        } else {
+            if !catalog_done {
+                catalog_done = true;
+                if !pending.is_empty() {
+                    // Keep the stdlib's ordinary authored-pack precedence, but
+                    // do not build indexes or source readers to learn its version.
+                    let (mut stdlib, others): (Vec<_>, Vec<_>) =
+                        selected.drain(..).partition(|selection| {
+                            selection.active.approximate
+                                && supplies_rust_assumption(request, &selection.active.manifest)
+                        });
+                    retain_pack_winners(
+                        &mut stdlib,
+                        &mut report,
+                        request.limits,
+                        &mut excluded_shards,
+                    );
+                    assumed_toolchain = Some(if incomplete {
+                        Err("the stdlib selection is incomplete".to_owned())
+                    } else {
+                        assumed_rust_toolchain(
+                            request,
+                            stdlib.iter().map(|selection| &selection.active),
+                        )
+                    });
+                    selected = others;
+                    selected.extend(stdlib);
+                }
+            }
+            let Some((candidate, loaded)) = pending.pop_front() else {
+                break;
+            };
+            (candidate, loaded, true)
+        };
+        let assumption = assumed_toolchain.as_ref();
+        let approximate_stdlib = approximate_standard_libraries.iter().any(|expectation| {
             expectation.pack_id == loaded.manifest.pack_id
                 && semantic_pack_language(&expectation.language) == loaded.manifest.language
                 && expectation.ecosystem == loaded.manifest.ecosystem
         });
-        let activation_match = if approximate {
+        let exact_match = (!approximate_stdlib && !from_pending)
+            .then(|| {
+                strict_activation_match(
+                    &loaded.manifest,
+                    &loaded.selectors,
+                    &evidence,
+                    &request.bifrost_version,
+                )
+            })
+            .flatten();
+        let uses_assumption = !approximate_stdlib
+            && exact_match.is_none()
+            && loaded.manifest.language == "rust"
+            && (loaded
+                .manifest
+                .compatibility
+                .toolchains
+                .iter()
+                .any(|constraint| constraint.name == "rust")
+                || loaded.selectors.iter().any(|selector| {
+                    selector
+                        .toolchain
+                        .as_ref()
+                        .is_some_and(|coordinate| coordinate.name == "rust")
+                }));
+        if uses_assumption && sharing_rust && !catalog_done {
+            pending.push_back((candidate, loaded));
+            continue;
+        }
+        let mut assumed_evidence = Vec::new();
+        if uses_assumption && let Some(Ok(version)) = assumption {
+            assumed_evidence = evidence
+                .iter()
+                .filter(|row| row.language == "rust" && row.ecosystem == loaded.manifest.ecosystem)
+                .cloned()
+                .collect();
+            assumed_evidence.push(SemanticModelActivationEvidence {
+                language: "rust".into(),
+                ecosystem: loaded.manifest.ecosystem.clone(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            });
+            for row in &mut assumed_evidence {
+                row.toolchain = Some(CatalogCoordinate {
+                    name: "rust".into(),
+                    version: Some(version.clone()),
+                });
+            }
+        }
+        let activation_match = if approximate_stdlib {
             // An expectation requests a pack; it does not prove any of that
             // pack's toolchain coordinates or artifact digests exist locally.
             // Catalog discovery already checked engine compatibility.
@@ -667,12 +1388,17 @@ fn resolve_active_semantic_models_with_loader(
                 matched_requirements: Vec::new(),
             })
         } else {
-            strict_activation_match(
-                &loaded.manifest,
-                &loaded.selectors,
-                &evidence,
-                &request.bifrost_version,
-            )
+            exact_match.or_else(|| {
+                if assumed_evidence.is_empty() {
+                    return None;
+                }
+                strict_activation_match(
+                    &loaded.manifest,
+                    &loaded.selectors,
+                    &assumed_evidence,
+                    &request.bifrost_version,
+                )
+            })
         };
         let Some(StrictActivationMatch {
             evidence_rank,
@@ -681,8 +1407,43 @@ fn resolve_active_semantic_models_with_loader(
             matched_requirements,
         }) = activation_match
         else {
-            let reason =
-                strict_activation_mismatch_reason(&loaded.manifest, &loaded.selectors, &evidence);
+            let excluded = loaded
+                .manifest
+                .provenance
+                .rust_artifact_approximation
+                .as_ref()
+                .is_some_and(|record| {
+                    loaded.selectors.iter().any(|selector| {
+                        selector.package.as_ref().is_some_and(|package| {
+                            close_match_version_admission(
+                                record,
+                                &evidence,
+                                &loaded.manifest.language,
+                                &loaded.manifest.ecosystem,
+                                &package.name,
+                            ) == CloseMatchVersionAdmission::MissingEvidence
+                        })
+                    })
+                });
+            let mut reason = if excluded {
+                "close-match claim excludes this resolved version".to_owned()
+            } else {
+                strict_activation_mismatch_reason(&loaded.manifest, &loaded.selectors, &evidence)
+            };
+            if uses_assumption && let Some(assumption) = assumption {
+                match assumption {
+                    Ok(version) => reason.push_str(&format!(
+                        "; selector rejects assumed Rust toolchain {version}"
+                    )),
+                    Err(reason_missing) => {
+                        reason.push_str(&format!("; no assumed Rust toolchain: {reason_missing}"))
+                    }
+                }
+            }
+            excluded_shards.insert(ActivationExclusions::key(
+                &loaded.manifest,
+                &loaded.descriptor,
+            ));
             push_loaded_explanation(
                 &mut report,
                 request.limits,
@@ -692,6 +1453,73 @@ fn resolve_active_semantic_models_with_loader(
             );
             continue;
         };
+        let approximate_record = loaded
+            .manifest
+            .provenance
+            .rust_artifact_approximation
+            .as_ref();
+        if let Some(record) = approximate_record {
+            // Rust overlay lookups are keyed by crate spelling, not Cargo package
+            // ID (rust/crate_identity.rs). A second resolved version of the same
+            // crate cannot safely be separated from the selected shard here.
+            let excluded_version = matched_evidence.package.as_ref().is_some_and(|package| {
+                close_match_version_admission(
+                    record,
+                    &evidence,
+                    &matched_evidence.language,
+                    &matched_evidence.ecosystem,
+                    &package.name,
+                ) == CloseMatchVersionAdmission::MissingEvidence
+            });
+            if excluded_version {
+                excluded_shards.insert(ActivationExclusions::key(
+                    &loaded.manifest,
+                    &loaded.descriptor,
+                ));
+                push_loaded_explanation(
+                    &mut report,
+                    request.limits,
+                    &loaded,
+                    SemanticModelActivationStatus::Incompatible,
+                    "close-match claim excludes this resolved version",
+                );
+                continue;
+            }
+            let reason = matched_evidence
+                .package
+                .as_ref()
+                .and_then(|package| package.version.as_ref())
+                .ok_or_else(|| {
+                    "approximate Rust dependency pack requires a matched Cargo package version"
+                        .to_owned()
+                })
+                .and_then(|version| record.activation_reason(version))
+                .and_then(|_| {
+                    (matched_evidence.target.as_deref() == Some(record.target.as_str()))
+                        .then_some(())
+                        .ok_or_else(|| {
+                            "approximate Rust artifact target differs from matched Cargo target"
+                                .to_owned()
+                        })
+                });
+            if let Err(reason) = reason {
+                excluded_shards.insert(ActivationExclusions::key(
+                    &loaded.manifest,
+                    &loaded.descriptor,
+                ));
+                push_loaded_explanation(
+                    &mut report,
+                    request.limits,
+                    &loaded,
+                    SemanticModelActivationStatus::Incompatible,
+                    &reason,
+                );
+                continue;
+            }
+        }
+        let approximate_dependency = approximate_record.is_some();
+        let approximate =
+            approximate_stdlib || approximate_dependency || !assumed_evidence.is_empty();
         let control = match effective_control(&loaded.manifest, &request.controls) {
             Ok(control) => control,
             Err(reason) => {
@@ -707,6 +1535,10 @@ fn resolve_active_semantic_models_with_loader(
             }
         };
         if control == Some(SemanticModelControlAction::Disable) {
+            excluded_shards.insert(ActivationExclusions::key(
+                &loaded.manifest,
+                &loaded.descriptor,
+            ));
             push_loaded_explanation(
                 &mut report,
                 request.limits,
@@ -731,8 +1563,16 @@ fn resolve_active_semantic_models_with_loader(
                     CatalogPackSourceKind::PreShipped | CatalogPackSourceKind::Embedded
                 )
             {
+                excluded_shards.insert(ActivationExclusions::key(
+                    &loaded.manifest,
+                    &loaded.descriptor,
+                ));
                 continue;
             }
+            excluded_shards.insert(ActivationExclusions::key(
+                &loaded.manifest,
+                &loaded.descriptor,
+            ));
             push_loaded_explanation(
                 &mut report,
                 request.limits,
@@ -756,6 +1596,7 @@ fn resolve_active_semantic_models_with_loader(
                 ActiveSemanticModelShard {
                     metadata: std::sync::Arc::new(
                         crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                            assumed_rust_toolchain: !assumed_evidence.is_empty(),
                             approximate,
                             manifest: loaded.manifest,
                             descriptor: loaded.descriptor,
@@ -777,104 +1618,11 @@ fn resolve_active_semantic_models_with_loader(
         });
     }
 
-    // One active version per authored pack_id (#8405): two versions of one
-    // pack are one provider, not two, so model lookups must not see both. The
-    // higher-precedence source wins, then the newer version. Manifests that
-    // tie on both but differ in content are a genuine conflict, not versions
-    // of each other, so all of them stay active and composition reports the
-    // conflict; the manifest digest only picks which winner a Shadowed reason
-    // names. The same manifest from several sources survives here and meets
-    // the equivalent-shard rule below.
-    // Generated and workspace-produced packs are exact output for one
-    // dependency or source set: their pack_id names the producer family (for
-    // example bifrost.external.go) and their version is the engine's, so they
-    // are not versions of one pack and strict activation already selects them.
-    // Bounded by max_catalog_candidates and retained only for this activation.
-    let authored = |selection: &CandidateSelection| {
-        !matches!(
-            selection.active.source_kind,
-            CatalogPackSourceKind::Generated | CatalogPackSourceKind::WorkspaceProduced
-        )
-    };
-    let pack_keys = selected
-        .iter()
-        .map(|selection| {
-            (
-                selection.source_rank,
-                Version::parse(&selection.active.manifest.version)
-                    .expect("validated manifest version is semver"),
-                selection.active.manifest.content_sha256.as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut pack_winners = HashMap::<&str, usize>::default();
-    for (index, selection) in selected.iter().enumerate() {
-        if !authored(selection) {
-            continue;
-        }
-        let winner = pack_winners
-            .entry(selection.active.manifest.pack_id.as_str())
-            .or_insert(index);
-        if pack_keys[index] > pack_keys[*winner] {
-            *winner = index;
-        }
-    }
-    let pack_winners = pack_winners
-        .into_iter()
-        .map(|(pack_id, index)| {
-            let winner = &selected[index].active;
-            (
-                pack_id.to_owned(),
-                (
-                    (pack_keys[index].0, pack_keys[index].1.clone()),
-                    winner.manifest.content_sha256.clone(),
-                    winner.source_kind,
-                    winner.source_id.clone(),
-                ),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let pack_ranks = pack_keys
-        .into_iter()
-        .map(|(rank, version, _)| (rank, version))
-        .collect::<Vec<_>>();
-    let mut position = 0;
-    selected.retain(|selection| {
-        let rank = &pack_ranks[position];
-        position += 1;
-        if !authored(selection) {
-            return true;
-        }
-        let manifest = &selection.active.manifest;
-        let (winner_rank, digest, source_kind, source_id) = &pack_winners[&manifest.pack_id];
-        if rank == winner_rank || *digest == manifest.content_sha256 {
-            return true;
-        }
-        push_explanation(
-            &mut report,
-            request.limits,
-            SemanticModelActivationExplanation {
-                manifest_digest: manifest.content_sha256.clone(),
-                pack_id: Some(manifest.pack_id.clone()),
-                shard_id: selection.active.descriptor.shard_id.as_str().to_owned(),
-                source_kind: selection.active.source_kind,
-                source_id: selection.active.source_id.clone(),
-                status: SemanticModelActivationStatus::Shadowed,
-                reason: format!(
-                    "pack {} keeps one active version: version {} from {} source {source_id} takes precedence over version {}",
-                    manifest.pack_id,
-                    winner_rank.1,
-                    source_kind.as_str(),
-                    manifest.version
-                ),
-            },
-        );
-        false
-    });
-    debug_assert_eq!(
-        position,
-        pack_ranks.len(),
-        "retain visits every selection once, in order"
+    retain_pack_winners(
+        &mut selected,
+        &mut report,
+        request.limits,
+        &mut excluded_shards,
     );
     // An extraction selected by coordinates defers to an extraction of the
     // exact artifact behind the same coordinates (#9474). A released JDK pack
@@ -939,6 +1687,10 @@ fn resolve_active_semantic_models_with_loader(
     for selection in selected.into_iter().rev() {
         let key = (selection.semantic_sha256.clone(), selection.payload_kind);
         if let Some(&winner) = by_semantic_shard.get(&key) {
+            excluded_shards.insert(ActivationExclusions::key(
+                &selection.active.manifest,
+                &selection.active.descriptor,
+            ));
             let active_winner: &CandidateSelection = &active[winner];
             push_explanation(
                 &mut report,
@@ -976,6 +1728,70 @@ fn resolve_active_semantic_models_with_loader(
             .then_with(|| left.semantic_sha256.cmp(&right.semantic_sha256))
     });
 
+    // Only a shard that survived controls and both precedence passes can
+    // affect this request. Dormant distributed candidates stay Disabled or
+    // Shadowed in the activation report without opening a false gap.
+    active.retain(|selection| {
+        if !selection.active.manifest.provenance.is_close_match_approximation()
+            || !is_distributed_pack_source(selection.active.source_kind)
+            || APPROXIMATE_DISTRIBUTED_SHARDS_ALLOWED
+        {
+            return true;
+        }
+        incomplete = true;
+        push_explanation(
+            &mut report,
+            request.limits,
+            SemanticModelActivationExplanation {
+                manifest_digest: selection.active.manifest.content_sha256.clone(),
+                pack_id: Some(selection.active.manifest.pack_id.clone()),
+                shard_id: selection.active.descriptor.shard_id.as_str().to_owned(),
+                source_kind: selection.active.source_kind,
+                source_id: selection.active.source_id.clone(),
+                status: SemanticModelActivationStatus::ApproximateDistributedBlocked,
+                reason: "approximate Rust dependency artifact from a distributed source is held until causal attribution is available for every consuming family (#10189, #10198, #10212); Installed includes user-supplied local bundles".to_owned(),
+            },
+        );
+        false
+    });
+
+    if let Some(Ok(expected_version)) = assumed_toolchain.as_ref() {
+        let final_assumption = if incomplete {
+            Err("the final stdlib selection is incomplete".to_owned())
+        } else {
+            assumed_rust_toolchain(request, active.iter().map(|selection| &selection.active))
+        };
+        if final_assumption.as_ref().ok() != Some(expected_version) {
+            let reason = format!(
+                "no stable assumed Rust toolchain: expected {expected_version}, final selection: {final_assumption:?}"
+            );
+            active.retain(|selection| {
+                let shard = &selection.active;
+                let assumed_companion = selection.active.assumed_rust_toolchain;
+                if assumed_companion {
+                    excluded_shards.insert(ActivationExclusions::key(
+                        &shard.manifest,
+                        &shard.descriptor,
+                    ));
+                    push_explanation(
+                        &mut report,
+                        request.limits,
+                        SemanticModelActivationExplanation {
+                            manifest_digest: shard.manifest.content_sha256.clone(),
+                            pack_id: Some(shard.manifest.pack_id.clone()),
+                            shard_id: shard.descriptor.shard_id.as_str().to_owned(),
+                            source_kind: shard.source_kind,
+                            source_id: shard.source_id.clone(),
+                            status: SemanticModelActivationStatus::Incompatible,
+                            reason: reason.clone(),
+                        },
+                    );
+                }
+                !assumed_companion
+            });
+        }
+    }
+
     for selection in &active {
         // A review-gated pack reaches this push only through an explicit
         // compatible enable control, so the report retains that user
@@ -1003,11 +1819,33 @@ fn resolve_active_semantic_models_with_loader(
                 reason.push_str(&matched.describe());
             }
         }
+        if selection.active.assumed_rust_toolchain
+            && let Some(toolchain) = &selection.active.matched_evidence.toolchain
+            && let Some(version) = &toolchain.version
+        {
+            reason.push_str(&format!("; assumed {} toolchain {version}", toolchain.name));
+        }
         if let Some((source_kind, source_id)) = &selection.extraction_deferred_to {
             reason.push_str(&format!(
                 "; extraction authority defers to the exact artifact extraction from {} source {source_id}",
                 source_kind.as_str()
             ));
+        }
+        if let Some(record) = &selection
+            .active
+            .manifest
+            .provenance
+            .rust_artifact_approximation
+            && let Some(resolved) = selection
+                .active
+                .matched_evidence
+                .package
+                .as_ref()
+                .and_then(|package| package.version.as_ref())
+            && let Ok(approximation_reason) = record.activation_reason(resolved)
+        {
+            reason.push_str("; ");
+            reason.push_str(&approximation_reason);
         }
         push_explanation(
             &mut report,
@@ -1094,7 +1932,12 @@ fn resolve_active_semantic_models_with_loader(
     }
     report.extraction_gaps = extraction_gaps.len();
 
-    let active_model_set_hash = active_model_set_hash(&active, &extraction_gaps);
+    let active_model_set_hash = match rust_cargo_graph {
+        Some(graph) => {
+            active_model_set_hash_with_cargo_graph(&active, &extraction_gaps, Some(graph))
+        }
+        None => active_model_set_hash(&active, &extraction_gaps),
+    };
     let mut shards = active
         .into_iter()
         .map(|selection| std::sync::Arc::new(selection.active))
@@ -1113,6 +1956,21 @@ fn resolve_active_semantic_models_with_loader(
         }
     };
     report.phase_measurements.matcher_construction_nanos = elapsed_ns(matcher_started);
+    // The index build checked the shards and indexes; the exclusion record is
+    // retained with them, so the activation's limit covers it too.
+    let excluded_shards = ActivationExclusions::new(excluded_shards);
+    if report
+        .retained_bytes
+        .saturating_add(excluded_shards.retained_bytes())
+        > request.limits.max_retained_bytes
+    {
+        push_request_explanation(
+            &mut report,
+            request.limits,
+            "semantic-model retained-byte budget exceeded".to_owned(),
+        );
+        return SemanticModelResolutionOutcome::Unavailable(report);
+    }
     report.phase_measurements.catalog_sql_statements = catalog
         .sql_statement_count()
         .saturating_sub(activation_sql_start);
@@ -1138,7 +1996,7 @@ fn resolve_active_semantic_models_with_loader(
         };
     for (shard, identity) in shards.iter_mut().zip(row_identities) {
         debug_assert_eq!(
-            source_reader
+            (&source_reader as &dyn crate::analyzer::store::model_catalog::CatalogRowReader)
                 .callable_values_presence(identity)
                 .expect("selected shard marker exists"),
             shard.has_callable_values,
@@ -1148,15 +2006,26 @@ fn resolve_active_semantic_models_with_loader(
             .expect("shard metadata has not been published")
             .row_store = Some(identity);
     }
-    let resolved = ResolvedActiveSemanticModels {
-        source_reader: Some(source_reader),
+    let source_reader = Arc::new(source_reader);
+    let request_source = Arc::new(
+        crate::analyzer::store::model_catalog::ActivationRowReaderSource::new(
+            Arc::clone(&source_reader),
+            &active_model_set_hash,
+        ),
+    );
+    let mut resolved = ResolvedActiveSemanticModels::new(
         active_model_set_hash,
+        Some(source_reader),
         shards,
         indexes,
         extraction_gaps,
         extraction_gaps_by_declaration,
-        report: report.clone(),
-    };
+        excluded_shards,
+        report.clone(),
+    );
+    resolved
+        .install_request_source(Some(request_source))
+        .expect("activation source retains its reader");
     if incomplete {
         SemanticModelResolutionOutcome::Incomplete {
             usable: (!resolved.shards.is_empty()).then_some(resolved),
@@ -1182,6 +2051,19 @@ pub fn acquire_active_semantic_models(
         None,
         cancellation,
     )
+}
+
+fn resolve_against_snapshot<T: Eq, R>(
+    snapshot: &T,
+    current: impl FnOnce() -> T,
+    resolve: impl FnOnce() -> R,
+) -> Result<R, R> {
+    let outcome = resolve();
+    if &current() == snapshot {
+        Ok(outcome)
+    } else {
+        Err(outcome)
+    }
 }
 
 /// Acquire and atomically publish one generation's overlay and discovery evidence.
@@ -1226,15 +2108,46 @@ pub(crate) fn acquire_active_semantic_models_with_runtime_artifacts(
     runtime_artifacts: RuntimeArtifactPublication<'_>,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_active_semantic_models_with_inputs(
+        analyzer,
+        catalog,
+        persistence,
+        &ActivationInputs::from(request.clone()),
+        dependency_evidence,
+        runtime_artifacts,
+        cancellation,
+    )
+}
+
+pub(crate) fn acquire_active_semantic_models_with_inputs(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    inputs: &ActivationInputs,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
+    runtime_artifacts: RuntimeArtifactPublication<'_>,
+    cancellation: &CancellationToken,
+) -> SemanticModelRuntimeOutcome {
+    let request = &inputs.request;
     acquire_with_resolution(
         analyzer,
         catalog,
         persistence,
         request,
+        inputs.rust_cargo_graph.as_ref(),
         dependency_evidence,
         runtime_artifacts,
         cancellation,
-        || resolve_active_semantic_models(catalog, request, cancellation),
+        false,
+        || {
+            resolve_active_semantic_models_with_loader(
+                catalog,
+                request,
+                inputs.rust_cargo_graph.as_ref(),
+                cancellation,
+                |candidate| catalog.load(candidate),
+            )
+        },
     )
 }
 
@@ -1246,18 +2159,38 @@ pub fn acquire_eager_semantic_models_for_test(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_eager_semantic_models_with_request_owner_for_test(
+        analyzer,
+        catalog,
+        request,
+        cancellation,
+        false,
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn acquire_eager_semantic_models_with_request_owner_for_test(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    request: &SemanticModelActivationRequest,
+    cancellation: &CancellationToken,
+    request_owner: bool,
+) -> SemanticModelRuntimeOutcome {
     acquire_with_resolution(
         analyzer,
         catalog,
         None,
         request,
         None,
+        None,
         RuntimeArtifactPublication::default(),
         cancellation,
+        request_owner,
         || {
             resolve_active_semantic_models_with_loader(
                 catalog,
                 request,
+                None,
                 cancellation,
                 |candidate| catalog.load_decoded_for_test(candidate),
             )
@@ -1271,9 +2204,11 @@ fn acquire_with_resolution(
     catalog: &SemanticPackCatalog,
     persistence: Option<SemanticModelActivationPersistence<'_>>,
     request: &SemanticModelActivationRequest,
+    rust_cargo_graph: Option<&super::RustSelectedCargoGraph>,
     dependency_evidence: Option<&[DependencyEvidencePublication]>,
     runtime_artifacts: RuntimeArtifactPublication<'_>,
     cancellation: &CancellationToken,
+    request_owner: bool,
     resolve: impl Fn() -> SemanticModelResolutionOutcome,
 ) -> SemanticModelRuntimeOutcome {
     debug_assert!(
@@ -1308,8 +2243,83 @@ fn acquire_with_resolution(
             crate::analyzer::canonical_hash::lower_hex_string(&publication.evidence_digest)
         })
         .unwrap_or_default();
+    let caches = analyzer.snapshot_caches();
+    // Selection decides whether reexports are active, and only a reexport-bearing
+    // Rust shard puts the Cargo graph into the cache key. The first activation
+    // for a graph therefore resolves before the lookup and reuses that result on
+    // a miss. The identity it computes is remembered under the inputs that
+    // determine it, so a repeat activation looks up the snapshot without
+    // resolving: the catalog identity covers the packs, the request key the
+    // evidence and limits, the provider identity the Python publication, and the
+    // graph digest the graph.
+    let snapshot_content = analyzer.workspace_content_identity();
+    let content_is_current = || analyzer.workspace_content_identity() == snapshot_content;
+    let mut graph_resolved = None;
+    let graph_identity = match (caches, rust_cargo_graph) {
+        (Some(caches), Some(graph)) => {
+            let memo_key = format!(
+                "{request_key}:{provider_identity}:{}:{}:{}:{}",
+                catalog_identity.instance_identity,
+                catalog_identity.mutation_generation,
+                catalog_identity.sqlite_data_version,
+                cargo_graph_digest(graph, request)
+            );
+            match caches
+                .semantic_models()
+                .remembered_graph_identity(&memo_key)
+            {
+                Some(identity) => identity,
+                None => {
+                    let outcome = match resolve_against_snapshot(
+                        &snapshot_content,
+                        || analyzer.workspace_content_identity(),
+                        || with_python_provider_identity(resolve(), python_runtime),
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(_) => return stale_generation_outcome(request.limits),
+                    };
+                    let identity = reexport_graph_identity(&outcome);
+                    // A cancelled or unavailable resolution says nothing about
+                    // what the inputs select.
+                    if matches!(outcome, SemanticModelResolutionOutcome::Ready(_)) {
+                        caches
+                            .semantic_models()
+                            .remember_graph_identity(memo_key, identity.clone());
+                    }
+                    graph_resolved = Some(outcome);
+                    identity
+                }
+            }
+        }
+        _ => String::new(),
+    };
+    // #9559: the real JVM request owner is reachable only from tests until
+    // step 3d. It is authoritative only with JVM row composition, and the
+    // switched-on path still has open items (generator-rule ownership,
+    // membership reconciliation, incomplete search). Production always
+    // installs the placeholder.
+    let request_source = if request_owner {
+        analyzer
+            .snapshot_caches()
+            .and_then(|caches| caches.semantic_models().native_inventory_store())
+            .and_then(|store| {
+                analyzer
+                    .request_row_reader_source(&catalog.pinned_catalog_source(&store.cache_budget))
+            })
+    } else {
+        None
+    };
+    let source_identity = request_source.as_ref().and_then(|source| source.identity());
+    let source_suffix = source_identity
+        .map(|identity| {
+            format!(
+                ":{}",
+                crate::analyzer::canonical_hash::lower_hex_string(&identity)
+            )
+        })
+        .unwrap_or_default();
     let key = format!(
-        "{request_key}:{provider_identity}:{}:{}:{}",
+        "{request_key}:{provider_identity}:{graph_identity}:{}:{}:{}{source_suffix}",
         catalog_identity.instance_identity,
         catalog_identity.mutation_generation,
         catalog_identity.sqlite_data_version
@@ -1318,10 +2328,36 @@ fn acquire_with_resolution(
     // this resolution. Comparing the whole optional identity keeps an analyzer
     // that states none (an empty workspace) on its previous behavior instead of
     // reporting a permanent mismatch.
-    let snapshot_content = analyzer.workspace_content_identity();
-    let content_is_current = || analyzer.workspace_content_identity() == snapshot_content;
-    let Some(caches) = analyzer.snapshot_caches() else {
-        let outcome = with_python_provider_identity(resolve(), python_runtime);
+    let Some(caches) = caches else {
+        let mut outcome = graph_resolved
+            .take()
+            .unwrap_or_else(|| with_python_provider_identity(resolve(), python_runtime));
+        if let Some(source) = &request_source {
+            match &mut outcome {
+                SemanticModelResolutionOutcome::Ready(active) => {
+                    if let Err(error) = active.install_request_source(Some(Arc::clone(source))) {
+                        return catalog_lifecycle_error(
+                            request.limits,
+                            "install request source",
+                            error,
+                        );
+                    }
+                }
+                SemanticModelResolutionOutcome::Incomplete {
+                    usable: Some(active),
+                    ..
+                } => {
+                    if let Err(error) = active.install_request_source(Some(Arc::clone(source))) {
+                        return catalog_lifecycle_error(
+                            request.limits,
+                            "install request source",
+                            error,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
         if !content_is_current() {
             return stale_generation_outcome(request.limits);
         }
@@ -1339,7 +2375,8 @@ fn acquire_with_resolution(
     };
     let (acquisition, _) = caches.semantic_models().values.acquire(&key, cancellation);
     match acquisition {
-        CompleteValueAcquisition::Cached { value } => {
+        BudgetedValueAcquisition::Cached { value } => {
+            let value = Arc::clone(value.arc());
             if !content_is_current() {
                 return stale_generation_outcome(request.limits);
             }
@@ -1348,11 +2385,14 @@ fn acquire_with_resolution(
             }
             let snapshot = match caches.semantic_models().publish_overlay(
                 analyzer,
+                OverlayActivation {
+                    request,
+                    rust_cargo_graph,
+                },
                 &value,
                 dependency_evidence,
                 runtime_artifacts,
                 cancellation,
-                request.limits.max_retained_bytes,
             ) {
                 Ok(snapshot) => snapshot,
                 Err(error) => return overlay_build_outcome(&value, error, request.limits),
@@ -1363,8 +2403,44 @@ fn acquire_with_resolution(
                 lifecycle: SemanticModelRuntimeLifecycle::Cached,
             }
         }
-        CompleteValueAcquisition::Leader { permit } => {
-            let outcome = with_python_provider_identity(resolve(), python_runtime);
+        BudgetedValueAcquisition::Leader { permit } => {
+            let mut outcome = graph_resolved
+                .take()
+                .unwrap_or_else(|| with_python_provider_identity(resolve(), python_runtime));
+            if let Some(source) = &request_source {
+                match &mut outcome {
+                    SemanticModelResolutionOutcome::Ready(active) => {
+                        if let Err(error) = active.install_request_source(Some(Arc::clone(source)))
+                        {
+                            return catalog_lifecycle_error(
+                                request.limits,
+                                "install request source",
+                                error,
+                            );
+                        }
+                    }
+                    SemanticModelResolutionOutcome::Incomplete {
+                        usable: Some(active),
+                        ..
+                    } => {
+                        if let Err(error) = active.install_request_source(Some(Arc::clone(source)))
+                        {
+                            return catalog_lifecycle_error(
+                                request.limits,
+                                "install request source",
+                                error,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            debug_assert!(
+                rust_cargo_graph.is_none()
+                    || !matches!(outcome, SemanticModelResolutionOutcome::Ready(_))
+                    || reexport_graph_identity(&outcome) == graph_identity,
+                "the remembered graph identity must equal the resolved one"
+            );
             let SemanticModelResolutionOutcome::Ready(active) = outcome else {
                 return runtime_outcome(
                     outcome,
@@ -1376,32 +2452,43 @@ fn acquire_with_resolution(
             if !content_is_current() {
                 return stale_generation_outcome(request.limits);
             }
+            let mut active = active;
+            // The active models are the analyzer's selected state, published
+            // in its snapshot, not an optional cache: their charge cannot be
+            // refused (the construction limit already bounds them).
+            active.charge = AllocationCharge::acquire_required(
+                &caches.semantic_models().budget,
+                active.retained_bytes().try_into().unwrap_or(usize::MAX),
+            );
             let active = Arc::new(active);
             if let Err(error) = publish_active_models(analyzer, catalog, persistence, &active) {
                 return catalog_lifecycle_error(request.limits, "publish", error);
             }
             let snapshot = match caches.semantic_models().publish_overlay(
                 analyzer,
+                OverlayActivation {
+                    request,
+                    rust_cargo_graph,
+                },
                 &active,
                 dependency_evidence,
                 runtime_artifacts,
                 cancellation,
-                request.limits.max_retained_bytes,
             ) {
                 Ok(snapshot) => snapshot,
                 Err(error) => return overlay_build_outcome(&active, error, request.limits),
             };
-            permit.publish_complete(Arc::clone(&active));
+            permit.publish_complete(SharedAllocation::new(Arc::clone(&active)));
             SemanticModelRuntimeOutcome::Ready {
                 active,
                 snapshot,
                 lifecycle: SemanticModelRuntimeLifecycle::Built,
             }
         }
-        CompleteValueAcquisition::Cancelled => {
+        BudgetedValueAcquisition::Cancelled => {
             SemanticModelRuntimeOutcome::Cancelled(SemanticModelActivationReport::default())
         }
-        CompleteValueAcquisition::Rejected => {
+        BudgetedValueAcquisition::Rejected => {
             unreachable!("semantic-model runtime cache never publishes deterministic rejections")
         }
     }
@@ -1414,7 +2501,9 @@ pub(crate) fn overlay_build_outcome(
 ) -> SemanticModelRuntimeOutcome {
     let mut report = active.activation_report().clone();
     match error {
-        SemanticModelOverlayBuildError::Cancelled => SemanticModelRuntimeOutcome::Cancelled(report),
+        SemanticModelOverlayBuildError::Cancelled | SemanticModelOverlayBuildError::Open(_) => {
+            SemanticModelRuntimeOutcome::Cancelled(report)
+        }
         SemanticModelOverlayBuildError::RetainedBytesExceeded(measurements) => {
             report.overlay_budget_exceeded = Some(measurements);
             push_request_explanation(
@@ -1538,7 +2627,8 @@ pub(crate) fn with_python_provider_identity(
             hasher.update(b"bifrost.python-runtime-active-set.v1\0");
             hasher.update(active.active_model_set_hash.as_bytes());
             hasher.update(publication.evidence_digest);
-            active.active_model_set_hash = format!("{:x}", hasher.finalize());
+            active.active_model_set_hash =
+                crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into());
         }
     }
     outcome
@@ -1557,6 +2647,7 @@ pub(crate) fn runtime_outcome(
             let active = Arc::new(active);
             let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
                 Arc::clone(&active),
+                None,
                 None,
                 None,
                 Arc::new(
@@ -1600,8 +2691,11 @@ pub(crate) fn stale_generation_outcome(
 }
 
 pub(crate) fn compare_selection(left: &CandidateSelection, right: &CandidateSelection) -> Ordering {
-    left.evidence_rank
-        .cmp(&right.evidence_rank)
+    right
+        .active
+        .approximate
+        .cmp(&left.active.approximate)
+        .then_with(|| left.evidence_rank.cmp(&right.evidence_rank))
         .then_with(|| left.source_rank.cmp(&right.source_rank))
         .then_with(|| left.semantic_sha256.cmp(&right.semantic_sha256))
         .then_with(|| {
@@ -1616,6 +2710,14 @@ pub(crate) fn compare_selection(left: &CandidateSelection, right: &CandidateSele
 pub(crate) fn active_model_set_hash(
     active: &[CandidateSelection],
     extraction_gaps: &[Arc<ActivePackExtractionGap>],
+) -> String {
+    active_model_set_hash_with_cargo_graph(active, extraction_gaps, None)
+}
+
+fn active_model_set_hash_with_cargo_graph(
+    active: &[CandidateSelection],
+    extraction_gaps: &[Arc<ActivePackExtractionGap>],
+    rust_cargo_graph: Option<&super::RustSelectedCargoGraph>,
 ) -> String {
     let mut rows = active.iter().collect::<Vec<_>>();
     rows.sort_unstable_by(|left, right| {
@@ -1650,10 +2752,52 @@ pub(crate) fn active_model_set_hash(
         if selection.active.approximate {
             hasher.update(b"approximate\0");
         }
+        if selection.active.assumed_rust_toolchain {
+            // Keep both approximation causes in identity even when artifact
+            // provenance already set the general approximate bit.
+            hasher.update(b"assumed-rust-toolchain\0");
+        }
+        if let Some(claim) = &selection
+            .active
+            .manifest
+            .provenance
+            .rust_artifact_approximation
+        {
+            // The pack digest covers facts. Activation attribution also depends
+            // on the selected X/selection rule, so keep it in this active-set
+            // component. Exact-pack hash bytes stay unchanged.
+            hash_key_part(
+                &mut hasher,
+                &serde_json::to_string(claim).expect("validated claim serializes"),
+            );
+        }
         if selection.active.extraction_deferred {
             hasher.update(b"extraction_deferred\0");
         }
         hash_key_part(&mut hasher, &selection.semantic_sha256);
+        if !selection.active.manifest.rust_external_reexports.is_empty()
+            || selection.active.manifest.rust_external_reexports_truncated
+            || selection
+                .active
+                .manifest
+                .rust_external_reexports_glob_incomplete
+        {
+            // The shard digest covers declarations, while these routes live
+            // in the manifest and change caller-visible binding answers.
+            let routes = serde_json::to_vec(&selection.active.manifest.rust_external_reexports)
+                .expect("validated reexport carrier serializes");
+            hasher.update((routes.len() as u64).to_be_bytes());
+            hasher.update(&routes);
+            hasher.update([u8::from(
+                selection.active.manifest.rust_external_reexports_truncated,
+            )]);
+            hasher.update([u8::from(
+                selection
+                    .active
+                    .manifest
+                    .rust_external_reexports_glob_incomplete,
+            )]);
+        }
         hasher.update([match selection.payload_kind {
             PayloadKind::DeclarationFacts => 0,
             PayloadKind::GeneratorRules => 1,
@@ -1678,7 +2822,130 @@ pub(crate) fn active_model_set_hash(
         hash_key_part(&mut hasher, &gap.pack_id);
         hash_key_part(&mut hasher, &gap.reason);
     }
-    format!("{:x}", hasher.finalize())
+    if active.iter().any(|selection| {
+        selection.active.manifest.language == "rust"
+            && (!selection.active.manifest.rust_external_reexports.is_empty()
+                || selection.active.manifest.rust_external_reexports_truncated
+                || selection
+                    .active
+                    .manifest
+                    .rust_external_reexports_glob_incomplete)
+    }) {
+        hasher.update(b"bifrost.rust-cargo-reexports.v1\0");
+        match rust_cargo_graph {
+            Some(graph) => hash_cargo_graph_packages(
+                &mut hasher,
+                graph,
+                active
+                    .iter()
+                    .filter(|selection| selection.active.manifest.language == "rust")
+                    .flat_map(|selection| {
+                        std::iter::once(&selection.active.matched_evidence)
+                            .chain(&selection.active.matching_evidence)
+                    }),
+            ),
+            None => hasher.update(b"missing-cargo-graph"),
+        }
+    }
+    crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
+}
+
+/// Hash the selected packages that `evidence` maps to in `graph`: identity,
+/// scope, admission tuple and scoped edges. The active-set identity and the
+/// graph digest below share this encoding, so a graph field the identity
+/// reads cannot be missing from the digest that stands in for it.
+fn hash_cargo_graph_packages<'a>(
+    hasher: &mut Sha256,
+    graph: &super::RustSelectedCargoGraph,
+    evidence: impl Iterator<Item = &'a SemanticModelActivationEvidence>,
+) {
+    let mut packages = evidence
+        .filter_map(|evidence| graph.package_for_evidence(evidence).cloned())
+        .collect::<Vec<_>>();
+    packages.sort();
+    packages.dedup();
+    hasher.update((packages.len() as u64).to_be_bytes());
+    let mut edges = graph.scoped_edge_names().peekable();
+    for package in packages {
+        hash_key_part(hasher, package.as_str());
+        for scope in [&package.configuration, &package.target] {
+            match scope {
+                Some(value) => {
+                    hasher.update([1]);
+                    hash_key_part(hasher, value);
+                }
+                None => hasher.update([0]),
+            }
+        }
+        // Serialize the admission tuple itself. A field added to
+        // the tuple cannot silently be omitted from identity.
+        if let Some(tuple) = graph.artifact_tuple(&package) {
+            let tuple_bytes =
+                serde_json::to_vec(tuple).expect("typed Cargo artifact tuple serializes");
+            hasher.update((tuple_bytes.len() as u64).to_be_bytes());
+            hasher.update(tuple_bytes);
+        }
+        let mut package_edges = Vec::new();
+        while let Some((source, _, _, _)) = edges.peek() {
+            match source.cmp(&&package) {
+                Ordering::Less => {
+                    edges.next();
+                }
+                Ordering::Greater => break,
+                Ordering::Equal => package_edges.push(edges.next().expect("peeked edge")),
+            }
+        }
+        hasher.update((package_edges.len() as u64).to_be_bytes());
+        for (source, dependency_name, target, crate_name) in package_edges {
+            hash_key_part(hasher, source.as_str());
+            hash_key_part(hasher, dependency_name);
+            hash_key_part(hasher, target);
+            match crate_name {
+                Some(name) => {
+                    hasher.update([1]);
+                    hash_key_part(hasher, name);
+                }
+                None => hasher.update([0]),
+            }
+        }
+    }
+}
+
+/// Digest of everything in `graph` that the facade identity can read for an
+/// activation with this `request`: the graph's data for every package the
+/// request's evidence selects. Selection only ever maps evidence rows of the
+/// request (the workspace retains the graph to exactly that evidence), so a
+/// graph change that could move the identity moves this digest.
+fn cargo_graph_digest(
+    graph: &super::RustSelectedCargoGraph,
+    request: &SemanticModelActivationRequest,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.rust-cargo-graph-digest.v1\0");
+    hash_cargo_graph_packages(&mut hasher, graph, request.evidence.iter());
+    crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
+}
+
+/// The active-set identity of `outcome` when it depends on the Cargo graph,
+/// else empty: graph data enters the identity only for a reexport-bearing
+/// Rust shard.
+fn reexport_graph_identity(outcome: &SemanticModelResolutionOutcome) -> String {
+    let active = match outcome {
+        SemanticModelResolutionOutcome::Ready(active) => Some(active),
+        SemanticModelResolutionOutcome::Incomplete { usable, .. } => usable.as_ref(),
+        _ => None,
+    };
+    active
+        .filter(|active| {
+            active.shards().iter().any(|shard| {
+                shard.manifest.language == "rust"
+                    && (!shard.manifest.rust_external_reexports.is_empty()
+                        || shard.manifest.rust_external_reexports_truncated
+                        || shard.manifest.rust_external_reexports_glob_incomplete)
+            })
+        })
+        .map(|active| active.active_model_set_hash().to_owned())
+        .unwrap_or_default()
 }
 
 pub(crate) fn push_request_explanation(
@@ -1735,6 +3002,20 @@ pub(crate) fn push_explanation(
     }
 }
 
+/// An active model set published without a declaration overlay, as the
+/// uncached activation path can publish it.
+#[cfg(test)]
+pub(crate) fn snapshot_without_overlay_fixture(name: &str) -> Arc<ActiveSemanticModelSnapshot> {
+    Arc::new(ActiveSemanticModelSnapshot::new(
+        Arc::new(resolved_active_models_fixture(name, vec![])),
+        None,
+        None,
+        None,
+        Arc::new(HashMap::default()),
+        None,
+    ))
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[track_caller]
 pub(crate) fn resolved_active_models_fixture(
@@ -1749,15 +3030,125 @@ pub(crate) fn resolved_active_models_fixture(
         &mut report,
     )
     .expect("active-model fixture matcher builds");
-    ResolvedActiveSemanticModels {
-        source_reader: None,
-        active_model_set_hash: active_model_set_hash.into(),
+    ResolvedActiveSemanticModels::new(
+        active_model_set_hash.into(),
+        None,
         shards,
         indexes,
-        extraction_gaps: Vec::new(),
-        extraction_gaps_by_declaration: HashMap::default(),
+        Vec::new(),
+        HashMap::default(),
+        Default::default(),
         report,
+    )
+}
+
+/// Minimal source-absent publication for policy tests of an already selected
+/// shard. It deliberately bypasses activation; activation tests cover their
+/// own admission rules before publishing a snapshot.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_snapshot_from_compiled_pack(
+    compiled: crate::analyzer::semantic_model::CompiledSemanticModelPack,
+    matched_evidence: SemanticModelActivationEvidence,
+    source_kind: CatalogPackSourceKind,
+) -> Arc<ActiveSemanticModelSnapshot> {
+    test_snapshot_from_compiled_pack_with_evidences(compiled, vec![matched_evidence], source_kind)
+}
+
+/// Publish the same compiled shard with all matching resolved package tuples.
+/// This matches normal activation's one-shard/many-evidence shape and proves
+/// attribution retains every matched Y for one selected record.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_snapshot_from_compiled_pack_with_evidences(
+    compiled: crate::analyzer::semantic_model::CompiledSemanticModelPack,
+    matched_evidences: Vec<SemanticModelActivationEvidence>,
+    source_kind: CatalogPackSourceKind,
+) -> Arc<ActiveSemanticModelSnapshot> {
+    test_snapshot_from_compiled_packs(vec![(compiled, matched_evidences, source_kind)])
+}
+
+/// Publish multiple selected compiled packs in one source-absent test snapshot.
+/// Each pack keeps its own manifest digest while each evidence tuple keeps its
+/// own resolved Cargo version.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_snapshot_from_compiled_packs(
+    packs: Vec<(
+        crate::analyzer::semantic_model::CompiledSemanticModelPack,
+        Vec<SemanticModelActivationEvidence>,
+        CatalogPackSourceKind,
+    )>,
+) -> Arc<ActiveSemanticModelSnapshot> {
+    assert!(!packs.is_empty(), "test snapshot needs a compiled pack");
+    let mut shards = Vec::new();
+    let mut identity_rows = Vec::new();
+    for (pack_index, (compiled, matched_evidences, source_kind)) in packs.into_iter().enumerate() {
+        assert!(
+            !matched_evidences.is_empty(),
+            "test snapshot needs evidence"
+        );
+        let manifest = Arc::new(compiled.manifest);
+        for (artifact_index, artifact) in compiled.shards.into_iter().enumerate() {
+            let matched_evidence = &matched_evidences[0];
+            for evidence in &matched_evidences {
+                identity_rows.push(format!(
+                    "{}:{}:{}:{}:{evidence:?}",
+                    manifest.semantic_sha256,
+                    manifest.content_sha256,
+                    manifest.provenance.is_close_match_approximation(),
+                    artifact.descriptor.shard_id
+                ));
+            }
+            let decoded = crate::analyzer::semantic_model::decode_shard(
+                &artifact.descriptor,
+                &artifact.bytes,
+                &crate::analyzer::semantic_model::DecodeLimits::default(),
+            )
+            .expect("test pack shard decodes");
+            shards.push(Arc::new(ActiveSemanticModelShard {
+                metadata: Arc::new(
+                    crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        assumed_rust_toolchain: false,
+                        approximate: manifest.provenance.is_close_match_approximation(),
+                        descriptor: artifact.descriptor.clone(),
+                        selectors: decoded.activation().to_vec(),
+                        row_store: None,
+                        has_callable_values: decoded.callable_values().is_some(),
+                        manifest: Arc::clone(&manifest),
+                        source_kind,
+                        source_id: format!(
+                            "test:close-match-active-shard:{pack_index}:{artifact_index}"
+                        ),
+                        matched_evidence: matched_evidence.clone(),
+                        matching_evidence: matched_evidences.clone(),
+                        evidence_rank: EvidenceRank::VersionedCoordinate,
+                        source_rank: 0,
+                        extraction_deferred: false,
+                    },
+                ),
+                decoded: Some(decoded),
+            }));
+        }
     }
+    identity_rows.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"bifrost.test.semantic-model-active-set.v1\0");
+    for row in identity_rows {
+        hash_key_part(&mut hasher, &row);
+    }
+    let active = Arc::new(resolved_active_models_fixture(
+        crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into()),
+        shards,
+    ));
+    Arc::new(ActiveSemanticModelSnapshot::new(
+        active,
+        None,
+        None,
+        None,
+        Arc::new(HashMap::default()),
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -1839,6 +3230,35 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
 
     use brokk_bifrost_analysis::analyzer::semantic_model::artifact::decode_shard;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10258: three retained Cargo graph copies must fit the publication budget")]
+    fn carried_graph_copies_are_in_the_publication_limit() {
+        let active_bytes = 10;
+        let overlay_with_one_graph = 50;
+        let graph_copy = 40;
+        let limit = 100;
+        assert!(active_bytes + overlay_with_one_graph <= limit);
+        let publication =
+            super::three_copy_graph_retained_bytes(overlay_with_one_graph, graph_copy);
+        assert!(active_bytes + publication > limit);
+    }
+
+    #[test]
+    #[hardwon("#10258: graph resolution changing workspace generation cannot publish its outcome")]
+    fn graph_resolution_rejects_generation_bump() {
+        let generation = std::cell::Cell::new(7u64);
+        let captured = generation.get();
+        let result = super::resolve_against_snapshot(
+            &captured,
+            || generation.get(),
+            || {
+                generation.set(8);
+                "selected graph"
+            },
+        );
+        assert_eq!(result, Err("selected graph"));
+    }
 
     const PACK: &[u8] = br#"{
       "schema_version": 2,
@@ -1973,6 +3393,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         ActiveSemanticModelShard {
             metadata: std::sync::Arc::new(
                 crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                    assumed_rust_toolchain: false,
                     descriptor,
                     selectors: decoded.activation().to_vec(),
                     row_store: None,
@@ -2137,6 +3558,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             ActiveSemanticModelShard {
                 metadata: std::sync::Arc::new(
                     crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        assumed_rust_toolchain: false,
                         descriptor: manifest
                             .shards
                             .iter()
@@ -2169,15 +3591,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &mut report,
         )
         .expect("variadic summary indexes");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:variadic-formals".to_owned(),
-            shards: vec![active_shard],
+        let active = ResolvedActiveSemanticModels::new(
+            "test:variadic-formals".to_owned(),
+            None,
+            vec![active_shard],
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        };
+        );
         let direct = |id| {
             brokk_bifrost_analysis::analyzer::semantic::SemanticCallArgument::direct(
                 brokk_bifrost_analysis::analyzer::semantic::ValueId::new(id),
@@ -2448,7 +3871,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
         };
         assert!(summaries.iter().all(|summary| {
             summary.completeness
-                == brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Partial
+                != brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Complete
         }));
         let evidence = |jdk_version: &str, digest: &str| SemanticModelActivationEvidence {
             language: "java".to_owned(),
@@ -2555,6 +3978,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             ActiveSemanticModelShard {
                 metadata: std::sync::Arc::new(
                     crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        assumed_rust_toolchain: false,
                         descriptor: manifest
                             .shards
                             .iter()
@@ -2638,6 +4062,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
                 ActiveSemanticModelShard {
                     metadata: std::sync::Arc::new(
                         crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                            assumed_rust_toolchain: false,
                             descriptor: manifest
                                 .shards
                                 .iter()
@@ -2686,6 +4111,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             ActiveSemanticModelShard {
                 metadata: std::sync::Arc::new(
                     crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        assumed_rust_toolchain: false,
                         descriptor: manifest
                             .shards
                             .iter()
@@ -2718,15 +4144,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &mut report,
         )
         .expect("two equal-summary JDK shards index");
-        let active_set = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:two-jdk-artifacts".to_owned(),
-            shards: separate,
+        let active_set = ResolvedActiveSemanticModels::new(
+            "test:two-jdk-artifacts".to_owned(),
+            None,
+            separate,
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        };
+        );
         let selected = target("fixed", 3).with_selected_jdk_for_test(second.clone());
         let matched = active_set.procedure_summaries_for_selected_jdk_artifact(&selected);
         assert_eq!(matched.disposition, SemanticModelMatchDisposition::Unique);
@@ -2966,6 +4393,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             ActiveSemanticModelShard {
                 metadata: std::sync::Arc::new(
                     crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        assumed_rust_toolchain: false,
                         descriptor: manifest
                             .shards
                             .iter()
@@ -3005,15 +4433,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &mut report,
         )
         .expect("same-artifact Python models index");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:same-python-artifact-two-models".to_owned(),
+        let active = ResolvedActiveSemanticModels::new(
+            "test:same-python-artifact-two-models".to_owned(),
+            None,
             shards,
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        };
+        );
         let target_for_model = |manifest: &str| {
             target_for_language(
                 brokk_bifrost_core::analyzer::model::Language::Python,
@@ -3124,15 +4553,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &mut report,
         )
         .expect("exact Python summary indexes");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:python-argument-permutations".to_owned(),
-            shards: vec![shard],
+        let active = ResolvedActiveSemanticModels::new(
+            "test:python-argument-permutations".to_owned(),
+            None,
+            vec![shard],
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        };
+        );
         let target = || {
             target_for_language(
                 brokk_bifrost_core::analyzer::model::Language::Python,
@@ -3221,15 +4651,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &mut report,
         )
         .expect("exact Python summary indexes");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:python-formal-shape".to_owned(),
-            shards: vec![shard],
+        let active = ResolvedActiveSemanticModels::new(
+            "test:python-formal-shape".to_owned(),
+            None,
+            vec![shard],
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        };
+        );
 
         let omitted_default = target_for_language(
             brokk_bifrost_core::analyzer::model::Language::Python,
@@ -3311,6 +4742,7 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             ActiveSemanticModelShard {
                 metadata: std::sync::Arc::new(
                     crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                        assumed_rust_toolchain: false,
                         descriptor: manifest
                             .shards
                             .iter()
@@ -3343,15 +4775,16 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
             &mut report,
         )
         .expect("call-shape summary indexes");
-        let active = ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:call-shape".to_owned(),
-            shards: vec![active_shard],
+        let active = ResolvedActiveSemanticModels::new(
+            "test:call-shape".to_owned(),
+            None,
+            vec![active_shard],
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        };
+        );
         let fixed_target = target("fixed", 3);
         let fixed_match = active.procedure_summaries_for_external_target(&fixed_target);
         assert_eq!(
@@ -3416,6 +4849,9 @@ pub(crate) mod unmaterialized_call_shape_binding_tests {
 /// assigning their conflicting records opposite matcher precedence.
 #[cfg(test)]
 pub(crate) mod active_model_set_identity_tests {
+    use super::{APPROXIMATE_DISTRIBUTED_SHARDS_ALLOWED, is_distributed_pack_source};
+
+    use crate::analyzer::store::active_models::matcher_posting_admission;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelShard;
     use sha2::Digest;
@@ -3439,6 +4875,9 @@ pub(crate) mod active_model_set_identity_tests {
     use sha2::Sha256;
 
     use brokk_bifrost_analysis::analyzer::semantic_model::runtime::active_model_set_hash;
+    use brokk_bifrost_semantic::analyzer::semantic_model::{
+        CatalogCoordinate, RustArtifactApproximation, RustArtifactMismatchKind,
+    };
 
     use brokk_bifrost_analysis::analyzer::semantic_model::compiler::CompilerOptions;
 
@@ -3450,7 +4889,7 @@ pub(crate) mod active_model_set_identity_tests {
 
     use brokk_bifrost_analysis::analyzer::semantic_model::artifact::decode_shard;
 
-    fn procedure_selection(
+    pub(super) fn procedure_selection(
         pack_id: &str,
         normal_continuation_absent: bool,
         evidence_rank: EvidenceRank,
@@ -3526,6 +4965,7 @@ pub(crate) mod active_model_set_identity_tests {
                 ActiveSemanticModelShard {
                     metadata: std::sync::Arc::new(
                         crate::analyzer::store::active_models::ActiveSemanticModelShardMetadata {
+                            assumed_rust_toolchain: false,
                             descriptor: manifest
                                 .shards
                                 .iter()
@@ -3552,6 +4992,330 @@ pub(crate) mod active_model_set_identity_tests {
         }
     }
 
+    #[test]
+    fn approximate_artifact_resolved_version_changes_active_identity() {
+        assert_eq!(
+            active_model_set_hash(
+                &[procedure_selection(
+                    "test.exact-rust-artifact",
+                    false,
+                    EvidenceRank::VersionedCoordinate,
+                )],
+                &[],
+            ),
+            "bdae8d0a64d99845005280bdaa217928e688092823dc8551574c1116b838ef1c",
+            "exact-pack active-set bytes remain unchanged",
+        );
+        let make_selection = |version: &str| {
+            let mut selection = procedure_selection(
+                "test.approximate-rust-artifact",
+                false,
+                EvidenceRank::VersionedCoordinate,
+            );
+            let metadata = std::sync::Arc::make_mut(&mut selection.active.metadata);
+            metadata.approximate = true;
+            std::sync::Arc::make_mut(&mut metadata.manifest)
+                .provenance
+                .rust_artifact_approximation = Some(RustArtifactApproximation {
+                built_from_version: "0.4.23".to_owned(),
+                built_from_features: vec!["std".to_owned()],
+                built_from_cfgs: vec!["docsrs".to_owned()],
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                format_version: 61,
+                toolchain: "nightly-2026-08-24".to_owned(),
+                docsrs_build: true,
+                original_sha256: "11".repeat(32),
+                produced_sha256: "11".repeat(32),
+                activation_version_requirement: ">=0.4.0, <0.5.0".to_owned(),
+                mismatch_kinds: vec![RustArtifactMismatchKind::VersionNearby],
+                selection_rule_id: "cargo-compatible-nearest".to_owned(),
+                selection_rule_version: 1,
+            });
+            metadata.matched_evidence.package = Some(CatalogCoordinate {
+                name: "widget".to_owned(),
+                version: Some(semver::Version::parse(version).unwrap()),
+            });
+            metadata.matching_evidence = vec![metadata.matched_evidence.clone()];
+            selection
+        };
+        let warm = make_selection("0.4.25");
+        let cold = make_selection("0.4.25");
+        let changed = make_selection("0.4.26");
+        assert_eq!(
+            active_model_set_hash(&[warm], &[]),
+            active_model_set_hash(&[cold], &[])
+        );
+        assert_ne!(
+            active_model_set_hash(&[make_selection("0.4.25")], &[]),
+            active_model_set_hash(&[changed], &[]),
+        );
+        let with_toolchain_claim = |assumed| {
+            let mut selection = make_selection("0.4.25");
+            let metadata = std::sync::Arc::make_mut(&mut selection.active.metadata);
+            metadata.assumed_rust_toolchain = assumed;
+            metadata.matched_evidence.toolchain = Some(CatalogCoordinate {
+                name: "rust".into(),
+                version: Some(semver::Version::parse("1.100.0-nightly").unwrap()),
+            });
+            metadata.matching_evidence = vec![metadata.matched_evidence.clone()];
+            selection
+        };
+        assert_ne!(
+            active_model_set_hash(&[with_toolchain_claim(false)], &[]),
+            active_model_set_hash(&[with_toolchain_claim(true)], &[]),
+            "the assumed-toolchain claim is distinct even when artifact approximation already set approximate"
+        );
+        let baseline = active_model_set_hash(&[make_selection("0.4.25")], &[]);
+        for edit in 0..4 {
+            let mut changed_claim = make_selection("0.4.25");
+            let claim = std::sync::Arc::make_mut(
+                &mut std::sync::Arc::make_mut(&mut changed_claim.active.metadata).manifest,
+            )
+            .provenance
+            .rust_artifact_approximation
+            .as_mut()
+            .unwrap();
+            match edit {
+                0 => claim.built_from_version = "0.4.24".into(),
+                1 => claim
+                    .mismatch_kinds
+                    .push(RustArtifactMismatchKind::FormatConverted),
+                2 => claim.selection_rule_id = "another-rule".into(),
+                3 => claim.selection_rule_version = 2,
+                _ => unreachable!(),
+            }
+            assert_ne!(baseline, active_model_set_hash(&[changed_claim], &[]));
+        }
+    }
+
+    #[test]
+    fn approximate_distributed_source_hold_classifies_every_catalog_source() {
+        use CatalogPackSourceKind as Kind;
+        const { assert!(!APPROXIMATE_DISTRIBUTED_SHARDS_ALLOWED) };
+        for kind in [Kind::Installed, Kind::PreShipped, Kind::Embedded] {
+            assert!(is_distributed_pack_source(kind), "{}", kind.as_str());
+        }
+        for kind in [
+            Kind::Generated,
+            Kind::WorkspaceProduced,
+            Kind::EphemeralWorkspace,
+        ] {
+            assert!(!is_distributed_pack_source(kind), "{}", kind.as_str());
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: conditional facade hash tracks the selected scoped graph"
+    )]
+    fn cargo_graph_changes_hash_only_for_reexport_schema() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            CargoPackageId, CargoResolveEdge, CargoResolveView, CargoSelectedPackage,
+            RustCargoArtifactTuple, RustSelectedCargoGraph,
+        };
+        let graph = |target: &str, unrelated: bool| {
+            let mut evidence =
+                procedure_selection("test.cargo-hash", false, EvidenceRank::VersionedCoordinate)
+                    .active
+                    .matched_evidence
+                    .clone();
+            evidence.language = "rust".into();
+            RustSelectedCargoGraph::from_cargo_resolve(CargoResolveView::from_rows(
+                vec![CargoSelectedPackage {
+                    evidence,
+                    package_id: CargoPackageId("facade".into()),
+                    artifact: RustCargoArtifactTuple {
+                        version: "1.0.0".into(),
+                        resolved_features: Vec::new(),
+                        artifact_features: Vec::new(),
+                        target: "test-target".into(),
+                        toolchain: "test-toolchain".into(),
+                        format_version: 61,
+                        sha256: "11".repeat(32),
+                        exact: true,
+                    },
+                }],
+                [CargoResolveEdge {
+                    source: CargoPackageId("facade".into()),
+                    dependency_name: "sqlx".into(),
+                    target: CargoPackageId(target.into()),
+                }]
+                .into_iter()
+                .chain(unrelated.then(|| CargoResolveEdge {
+                    source: CargoPackageId("facade".into()),
+                    dependency_name: "other".into(),
+                    target: CargoPackageId("unrelated".into()),
+                }))
+                .collect(),
+            ))
+            .unwrap()
+        };
+        let first = graph("sqlx-core@1", false);
+        let second = graph("sqlx-core@2", false);
+        let unrelated = graph("sqlx-core@1", true);
+        let ordinary =
+            || procedure_selection("test.cargo-hash", false, EvidenceRank::VersionedCoordinate);
+        assert_eq!(
+            super::active_model_set_hash_with_cargo_graph(&[ordinary()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[ordinary()], &[], Some(&second))
+        );
+        assert_eq!(
+            active_model_set_hash(&[ordinary()], &[]),
+            super::active_model_set_hash_with_cargo_graph(&[ordinary()], &[], Some(&first)),
+        );
+        let no_reexports = || {
+            let mut selected = ordinary();
+            let metadata = std::sync::Arc::make_mut(&mut selected.active.metadata);
+            let manifest = std::sync::Arc::make_mut(&mut metadata.manifest);
+            manifest.schema_version = 29;
+            manifest.language = "rust".into();
+            selected
+        };
+        let feature_changed =
+            RustSelectedCargoGraph::from_cargo_resolve(CargoResolveView::from_rows(
+                vec![CargoSelectedPackage {
+                    evidence: {
+                        let mut evidence = no_reexports().active.matched_evidence.clone();
+                        evidence.language = "rust".into();
+                        evidence
+                    },
+                    package_id: CargoPackageId("facade".into()),
+                    artifact: RustCargoArtifactTuple {
+                        version: "1.0.0".into(),
+                        resolved_features: vec!["extra".into()],
+                        artifact_features: Vec::new(),
+                        target: "test-target".into(),
+                        toolchain: "test-toolchain".into(),
+                        format_version: 61,
+                        sha256: "11".repeat(32),
+                        exact: true,
+                    },
+                }],
+                vec![CargoResolveEdge {
+                    source: CargoPackageId("facade".into()),
+                    dependency_name: "sqlx".into(),
+                    target: CargoPackageId("sqlx-core@1".into()),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(
+            super::active_model_set_hash_with_cargo_graph(&[no_reexports()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[no_reexports()], &[], Some(&second)),
+        );
+        assert_eq!(
+            active_model_set_hash(&[no_reexports()], &[]),
+            super::active_model_set_hash_with_cargo_graph(&[no_reexports()], &[], Some(&first)),
+            "no-reexport active identity keeps the pre-graph bytes",
+        );
+        assert_eq!(
+            super::active_model_set_hash_with_cargo_graph(&[no_reexports()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[no_reexports()], &[], Some(&unrelated)),
+        );
+        assert_eq!(
+            super::active_model_set_hash_with_cargo_graph(&[no_reexports()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(
+                &[no_reexports()],
+                &[],
+                Some(&feature_changed)
+            ),
+            "no-reexport hash must remain byte-identical when Cargo features change",
+        );
+        let reexport = || {
+            let mut selected = no_reexports();
+            let metadata = std::sync::Arc::make_mut(&mut selected.active.metadata);
+            let manifest = std::sync::Arc::make_mut(&mut metadata.manifest);
+            manifest.rust_external_reexports.push(
+                brokk_bifrost_semantic::analyzer::semantic_model::RustExternalReexport::ExplicitUse {
+                    facade_path: "sqlx::query".into(),
+                    use_item_id: 1,
+                    target: brokk_bifrost_semantic::analyzer::semantic_model::RustExternalReexportTarget {
+                        namespace: None,
+                        external_crate_id: 1,
+                        external_crate_name: "sqlx_core".into(),
+                        item_id: 2,
+                        path: vec!["sqlx_core".into(), "query".into()],
+                    },
+                },
+            );
+            metadata.matched_evidence.language = "rust".into();
+            selected
+        };
+        assert_ne!(
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&second))
+        );
+        assert_ne!(
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&unrelated)),
+            "the conditional hash reads unrelated edges from the same scoped graph",
+        );
+        let mut truncated = reexport();
+        std::sync::Arc::make_mut(
+            &mut std::sync::Arc::make_mut(&mut truncated.active.metadata).manifest,
+        )
+        .rust_external_reexports_truncated = true;
+        assert_ne!(
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[truncated], &[], Some(&first)),
+            "the marker changes the active identity even when retained routes stay the same",
+        );
+        let mut changed_route = reexport();
+        let metadata = std::sync::Arc::make_mut(&mut changed_route.active.metadata);
+        let manifest = std::sync::Arc::make_mut(&mut metadata.manifest);
+        if let brokk_bifrost_semantic::analyzer::semantic_model::RustExternalReexport::ExplicitUse {
+            facade_path,
+            ..
+        } = &mut manifest.rust_external_reexports[0]
+        {
+            *facade_path = "sqlx::raw_sql".into();
+        }
+        assert_ne!(
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[changed_route], &[], Some(&first)),
+            "manifest-only route changes must change the active identity"
+        );
+        let cache = super::SemanticModelRuntimeCache::default();
+        cache.install_carried_dependency_evidence(
+            Vec::new(),
+            Vec::new(),
+            Some(super::ActivationInputs {
+                request: super::SemanticModelActivationRequest {
+                    bifrost_version: semver::Version::new(0, 15, 1),
+                    approximate_standard_libraries: Vec::new(),
+                    evidence: Vec::new(),
+                    controls: Vec::new(),
+                    limits: super::SemanticModelRuntimeLimits::default(),
+                },
+                rust_cargo_graph: Some(first.clone()),
+            }),
+            Some(Vec::new()),
+        );
+        let carried = cache
+            .carried_activation_inputs()
+            .unwrap()
+            .rust_cargo_graph
+            .unwrap();
+        assert_eq!(carried, first);
+        assert_eq!(carried.canonical_edges(), first.canonical_edges());
+        assert_eq!(
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&first)),
+            super::active_model_set_hash_with_cargo_graph(&[reexport()], &[], Some(&carried)),
+        );
+    }
+
+    #[test]
+    fn exact_model_selection_precedes_approximate_with_equal_evidence_rank() {
+        let exact =
+            procedure_selection("test.exact-wins", false, EvidenceRank::VersionedCoordinate);
+        let mut approximate =
+            procedure_selection("test.exact-wins", false, EvidenceRank::VersionedCoordinate);
+        std::sync::Arc::make_mut(&mut approximate.active.metadata).approximate = true;
+        assert_eq!(
+            super::compare_selection(&exact, &approximate),
+            std::cmp::Ordering::Greater,
+        );
+    }
+
     fn legacy_payload_only_hash(active: &[CandidateSelection]) -> String {
         let mut rows = active
             .iter()
@@ -3576,7 +5340,7 @@ pub(crate) mod active_model_set_identity_tests {
             hasher.update(digest.as_bytes());
             hasher.update([kind]);
         }
-        format!("{:x}", hasher.finalize())
+        crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
     }
 
     #[track_caller]
@@ -3590,6 +5354,101 @@ pub(crate) mod active_model_set_identity_tests {
     }
 
     #[test]
+    fn matcher_posting_admission_tracks_guard_evidence_and_shard_order() {
+        fn shards() -> Vec<std::sync::Arc<ActiveSemanticModelShard>> {
+            ["test.admission_a", "test.admission_b"]
+                .into_iter()
+                .map(|id| {
+                    std::sync::Arc::new(
+                        procedure_selection(id, true, EvidenceRank::Language).active,
+                    )
+                })
+                .collect()
+        }
+
+        let original = shards();
+        let baseline = matcher_posting_admission(&original);
+        let rebuilt = shards();
+        let again = matcher_posting_admission(&rebuilt);
+        assert_eq!(baseline, again);
+        assert!(baseline.agrees_with(again));
+
+        let mut changed_version = shards();
+        let metadata = std::sync::Arc::make_mut(
+            &mut std::sync::Arc::get_mut(&mut changed_version[0])
+                .unwrap()
+                .metadata,
+        );
+        metadata.matched_evidence.toolchain = Some(
+            brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogCoordinate {
+                name: "jdk".to_owned(),
+                version: Some("21.0.1".parse().unwrap()),
+            },
+        );
+        let version = matcher_posting_admission(&changed_version);
+        assert_ne!(baseline.all, version.all);
+        assert!(!baseline.agrees_with(version));
+
+        let mut changed_target = shards();
+        let metadata = std::sync::Arc::make_mut(
+            &mut std::sync::Arc::get_mut(&mut changed_target[0])
+                .unwrap()
+                .metadata,
+        );
+        metadata.matched_evidence.target = Some("linux-x86_64".to_owned());
+        let target = matcher_posting_admission(&changed_target);
+        assert_ne!(baseline.all, target.all);
+        assert!(!baseline.agrees_with(target));
+
+        let mut reordered = shards();
+        reordered.swap(0, 1);
+        assert_ne!(baseline.all, matcher_posting_admission(&reordered).all);
+    }
+
+    #[test]
+    fn matcher_posting_admission_curated_part_ignores_generated_shards() {
+        fn shards() -> Vec<std::sync::Arc<ActiveSemanticModelShard>> {
+            let curated = procedure_selection("test.curated", true, EvidenceRank::Language).active;
+            let mut generated =
+                procedure_selection("test.generated", true, EvidenceRank::Language).active;
+            std::sync::Arc::make_mut(&mut generated.metadata).source_kind =
+                CatalogPackSourceKind::Generated;
+            vec![std::sync::Arc::new(curated), std::sync::Arc::new(generated)]
+        }
+
+        let baseline = matcher_posting_admission(&shards());
+        assert_eq!(
+            baseline.curated,
+            matcher_posting_admission(&shards()).curated
+        );
+
+        let mut changed_curated = shards();
+        std::sync::Arc::make_mut(
+            &mut std::sync::Arc::get_mut(&mut changed_curated[0])
+                .unwrap()
+                .metadata,
+        )
+        .matched_evidence
+        .target = Some("linux-x86_64".to_owned());
+        assert_ne!(
+            baseline.curated,
+            matcher_posting_admission(&changed_curated).curated
+        );
+
+        let mut changed_generated = shards();
+        std::sync::Arc::make_mut(
+            &mut std::sync::Arc::get_mut(&mut changed_generated[1])
+                .unwrap()
+                .metadata,
+        )
+        .matched_evidence
+        .target = Some("linux-x86_64".to_owned());
+        let changed = matcher_posting_admission(&changed_generated);
+        assert_eq!(baseline.curated, changed.curated);
+        assert_ne!(baseline.all, changed.all);
+    }
+
+    #[test]
     fn value_semantics_schema_rotates_active_set_identity() {
         assert_eq!(SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION, 11);
         let mut previous = Sha256::new();
@@ -3597,7 +5456,8 @@ pub(crate) mod active_model_set_identity_tests {
         previous.update(2u32.to_be_bytes());
         previous.update(0u64.to_be_bytes());
         previous.update(0u64.to_be_bytes());
-        let previous = format!("{:x}", previous.finalize());
+        let previous =
+            crate::analyzer::canonical_hash::lower_hex_string(&previous.finalize().into());
 
         assert_ne!(
             active_model_set_hash(&[], &[]),
@@ -3617,7 +5477,7 @@ pub(crate) mod active_model_set_identity_tests {
         previous.update(0u64.to_be_bytes());
         assert_ne!(
             active_model_set_hash(&[], &[]),
-            format!("{:x}", previous.finalize())
+            crate::analyzer::canonical_hash::lower_hex_string(&previous.finalize().into())
         );
     }
 
@@ -3659,7 +5519,8 @@ pub(crate) mod active_model_set_identity_tests {
 mod model_read_attribution_tests {
     use super::*;
     use crate::analyzer::semantic::StableDigest;
-    use crate::analyzer::{MultiAnalyzer, ReadKey, capture_query_reads};
+    use crate::analyzer::{AnalyzerQueryScope, MultiAnalyzer, ReadKey, capture_query_reads};
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn published_models_record_the_model_key_on_every_snapshot_hit() {
@@ -3673,17 +5534,19 @@ mod model_read_attribution_tests {
             &mut report,
         )
         .unwrap();
-        let active = Arc::new(ResolvedActiveSemanticModels {
-            source_reader: None,
-            active_model_set_hash: "test:published-model-key".to_owned(),
-            shards: Vec::new(),
+        let active = Arc::new(ResolvedActiveSemanticModels::new(
+            "test:published-model-key".to_owned(),
+            None,
+            Vec::new(),
             indexes,
-            extraction_gaps: Vec::new(),
-            extraction_gaps_by_declaration: HashMap::default(),
+            Vec::new(),
+            HashMap::default(),
+            Default::default(),
             report,
-        });
+        ));
         let snapshot = Arc::new(ActiveSemanticModelSnapshot::new(
             active.clone(),
+            None,
             None,
             None,
             Arc::new(HashMap::default()),
@@ -3705,6 +5568,134 @@ mod model_read_attribution_tests {
     }
 
     #[test]
+    #[hardwon("#9163: a selected operation mixed a republished model set with its captured set")]
+    fn selected_model_scope_keeps_one_publication_and_respects_outer_overrides() {
+        let analyzer = MultiAnalyzer::default();
+        let caches = analyzer.snapshot_caches().unwrap();
+        let make_snapshot = |hash: &str| {
+            let mut report = SemanticModelActivationReport::default();
+            let indexes = MatcherIndexes::build(
+                &[],
+                SemanticModelRuntimeLimits::default(),
+                &CancellationToken::default(),
+                &mut report,
+            )
+            .unwrap();
+            let active = Arc::new(ResolvedActiveSemanticModels::new(
+                hash.to_owned(),
+                None,
+                Vec::new(),
+                indexes,
+                Vec::new(),
+                HashMap::default(),
+                Default::default(),
+                report,
+            ));
+            let overlay = Arc::new(
+                SemanticModelOverlay::build(
+                    &analyzer,
+                    &active,
+                    &CancellationToken::default(),
+                    u64::MAX,
+                    &RetentionBudget::for_tests(),
+                )
+                .unwrap(),
+            );
+            Arc::new(ActiveSemanticModelSnapshot::new(
+                active,
+                None,
+                Some(overlay),
+                Some(SemanticModelOverlayMeasurement::default()),
+                Arc::new(HashMap::default()),
+                None,
+            ))
+        };
+        let first = make_snapshot("test:one-model-set");
+        let second = make_snapshot("test:one-model-set");
+        let third = make_snapshot("test:next-model-set");
+        let first_overlay = first.semantic_model_overlay().unwrap().clone();
+        assert_eq!(
+            first.active_models().active_model_set_hash(),
+            second.active_models().active_model_set_hash()
+        );
+
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            let _outer = AnalyzerQueryScope::with_semantic_model_overlay(&analyzer, None);
+            let _pin = AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer).unwrap();
+        });
+        assert!(
+            reads.keys().is_empty(),
+            "capture and an early exit read no models"
+        );
+
+        caches.semantic_models().published.lock().unwrap().snapshot = Some(first.clone());
+        let (selected, reads) = capture_query_reads(&analyzer, || {
+            let _pin = AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer).unwrap();
+            caches.semantic_models().published.lock().unwrap().snapshot = Some(second.clone());
+            analyzer.semantic_model_overlay().unwrap()
+        });
+        assert!(Arc::ptr_eq(&selected, &first_overlay));
+        assert_eq!(
+            reads.keys(),
+            vec![ReadKey::Models(StableDigest::sha256(
+                first.active_models().active_model_set_hash()
+            ))]
+        );
+
+        caches.semantic_models().published.lock().unwrap().snapshot = Some(first.clone());
+        let _outer =
+            AnalyzerQueryScope::with_semantic_model_overlay(&analyzer, Some(first_overlay.clone()));
+        let _matching = AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer).unwrap();
+        assert!(Arc::ptr_eq(
+            &analyzer.semantic_model_overlay().unwrap(),
+            &first_overlay
+        ));
+        drop(_matching);
+        caches.semantic_models().published.lock().unwrap().snapshot = Some(second);
+        assert!(AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer).is_err());
+        drop(_outer);
+
+        let _outer_none = AnalyzerQueryScope::with_semantic_model_overlay(&analyzer, None);
+        assert!(AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer).is_err());
+        drop(_outer_none);
+
+        let _outer_snapshot =
+            AnalyzerQueryScope::with_active_semantic_model_snapshot(&analyzer, None);
+        assert!(
+            AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer)
+                .unwrap()
+                .is_none()
+        );
+        let (selected, reads) =
+            capture_query_reads(&analyzer, || analyzer.active_semantic_model_snapshot());
+        assert!(selected.is_none());
+        assert_eq!(
+            reads.keys(),
+            vec![ReadKey::Models(
+                crate::analyzer::i_analyzer::current_model_set_digest(None)
+            )]
+        );
+        drop(_outer_snapshot);
+
+        caches.semantic_models().published.lock().unwrap().snapshot = Some(third.clone());
+        let (selected, reads) = capture_query_reads(&analyzer, || {
+            let _pin = AnalyzerQueryScope::pin_selected_model_snapshot(&analyzer).unwrap();
+            analyzer.semantic_model_overlay().unwrap()
+        });
+        assert!(Arc::ptr_eq(
+            &selected,
+            third.semantic_model_overlay().unwrap()
+        ));
+        assert_eq!(
+            reads.keys(),
+            vec![ReadKey::Models(StableDigest::sha256(
+                third.active_models().active_model_set_hash()
+            ))],
+            "a later operation reads the newly published set"
+        );
+    }
+
+    #[test]
     fn native_inventory_store_cell_returns_the_bound_capability_on_hits() {
         let analyzer = MultiAnalyzer::default();
         let cache = SemanticModelRuntimeCache::default();
@@ -3718,6 +5709,584 @@ mod model_read_attribution_tests {
                 reads.keys().is_empty(),
                 "a store capability has no derived answer"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_identity_memo_tests {
+    use super::active_model_set_identity_tests::procedure_selection;
+    use super::*;
+    use crate::analyzer::MultiAnalyzer;
+    use crate::analyzer::semantic_model::{
+        CargoPackageId, CargoResolveEdge, CargoResolveView, CargoSelectedPackage, CatalogOptions,
+        RustCargoArtifactTuple, RustExternalReexport, RustExternalReexportTarget,
+        RustSelectedCargoGraph,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn evidence() -> SemanticModelActivationEvidence {
+        let mut evidence =
+            procedure_selection("test.graph-memo", false, EvidenceRank::VersionedCoordinate)
+                .active
+                .matched_evidence
+                .clone();
+        evidence.language = "rust".into();
+        evidence
+    }
+
+    fn request(evidence: Vec<SemanticModelActivationEvidence>) -> SemanticModelActivationRequest {
+        SemanticModelActivationRequest {
+            bifrost_version: Version::new(0, 15, 1),
+            approximate_standard_libraries: Vec::new(),
+            evidence,
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        }
+    }
+
+    fn graph(core: &str) -> RustSelectedCargoGraph {
+        RustSelectedCargoGraph::from_cargo_resolve(CargoResolveView::from_rows(
+            vec![CargoSelectedPackage {
+                evidence: evidence(),
+                package_id: CargoPackageId("facade".into()),
+                artifact: RustCargoArtifactTuple {
+                    version: "1.0.0".into(),
+                    resolved_features: Vec::new(),
+                    artifact_features: Vec::new(),
+                    target: "test-target".into(),
+                    toolchain: "test-toolchain".into(),
+                    format_version: 61,
+                    sha256: "11".repeat(32),
+                    exact: true,
+                },
+            }],
+            vec![CargoResolveEdge {
+                source: CargoPackageId("facade".into()),
+                dependency_name: "sqlx".into(),
+                target: CargoPackageId(core.into()),
+            }],
+        ))
+        .unwrap()
+    }
+
+    fn reexport_selection() -> CandidateSelection {
+        let mut selected =
+            procedure_selection("test.graph-memo", false, EvidenceRank::VersionedCoordinate);
+        let metadata = Arc::make_mut(&mut selected.active.metadata);
+        let manifest = Arc::make_mut(&mut metadata.manifest);
+        manifest.schema_version = 29;
+        manifest.language = "rust".into();
+        manifest
+            .rust_external_reexports
+            .push(RustExternalReexport::ExplicitUse {
+                facade_path: "sqlx::query".into(),
+                use_item_id: 1,
+                target: RustExternalReexportTarget {
+                    namespace: None,
+                    external_crate_id: 1,
+                    external_crate_name: "sqlx_core".into(),
+                    item_id: 2,
+                    path: vec!["sqlx_core".into(), "query".into()],
+                },
+            });
+        metadata.matched_evidence.language = "rust".into();
+        selected
+    }
+
+    /// A resolution that selects one reexport-bearing Rust shard, so the
+    /// active-set identity reads `graph`, and counts how often it runs.
+    fn acquire(
+        analyzer: &MultiAnalyzer,
+        catalog: &SemanticPackCatalog,
+        request: &SemanticModelActivationRequest,
+        graph: &RustSelectedCargoGraph,
+        resolves: &AtomicUsize,
+    ) -> String {
+        let outcome = acquire_with_resolution(
+            analyzer,
+            catalog,
+            None,
+            request,
+            Some(graph),
+            None,
+            RuntimeArtifactPublication::default(),
+            &CancellationToken::default(),
+            false,
+            || {
+                resolves.fetch_add(1, AtomicOrdering::SeqCst);
+                let selection = reexport_selection();
+                let hash = active_model_set_hash_with_cargo_graph(
+                    std::slice::from_ref(&selection),
+                    &[],
+                    Some(graph),
+                );
+                SemanticModelResolutionOutcome::Ready(resolved_active_models_fixture(
+                    hash,
+                    vec![Arc::new(selection.active)],
+                ))
+            },
+        );
+        let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome else {
+            panic!("activation must be ready: {outcome:?}");
+        };
+        active.active_model_set_hash().to_owned()
+    }
+
+    #[test]
+    #[hardwon(
+        "#10258: a Cargo activation resolved before every snapshot-cache lookup, even on a hit"
+    )]
+    fn repeat_cargo_activation_does_not_resolve_and_input_changes_do() {
+        let analyzer = MultiAnalyzer::default();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let resolves = AtomicUsize::new(0);
+        let first = graph("sqlx-core@1");
+        let second = graph("sqlx-core@2");
+        let request = request(vec![evidence()]);
+
+        let first_hash = acquire(&analyzer, &catalog, &request, &first, &resolves);
+        assert_eq!(resolves.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            acquire(&analyzer, &catalog, &request, &first, &resolves),
+            first_hash
+        );
+        assert_eq!(
+            resolves.load(AtomicOrdering::SeqCst),
+            1,
+            "identical inputs must not resolve again"
+        );
+
+        // A different graph is a different identity and must resolve.
+        let second_hash = acquire(&analyzer, &catalog, &request, &second, &resolves);
+        assert_eq!(resolves.load(AtomicOrdering::SeqCst), 2);
+        assert_ne!(second_hash, first_hash);
+        assert_eq!(
+            acquire(&analyzer, &catalog, &request, &first, &resolves),
+            first_hash,
+            "the first graph's identity is still remembered"
+        );
+        assert_eq!(resolves.load(AtomicOrdering::SeqCst), 2);
+
+        // Different evidence is a different request.
+        let mut other = evidence();
+        other.target = Some("other-target".into());
+        let other_request = request_with_extra(&request, other);
+        acquire(&analyzer, &catalog, &other_request, &first, &resolves);
+        assert_eq!(resolves.load(AtomicOrdering::SeqCst), 3);
+    }
+
+    fn request_with_extra(
+        base: &SemanticModelActivationRequest,
+        extra: SemanticModelActivationEvidence,
+    ) -> SemanticModelActivationRequest {
+        let mut evidence = base.evidence.clone();
+        evidence.push(extra);
+        request(evidence)
+    }
+
+    #[test]
+    fn unfinished_resolution_is_not_remembered() {
+        let analyzer = MultiAnalyzer::default();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let resolves = AtomicUsize::new(0);
+        let graph = graph("sqlx-core@1");
+        let request = request(vec![evidence()]);
+        for expected in 1..=2 {
+            let outcome = acquire_with_resolution(
+                &analyzer,
+                &catalog,
+                None,
+                &request,
+                Some(&graph),
+                None,
+                RuntimeArtifactPublication::default(),
+                &CancellationToken::default(),
+                false,
+                || {
+                    resolves.fetch_add(1, AtomicOrdering::SeqCst);
+                    SemanticModelResolutionOutcome::Cancelled(
+                        SemanticModelActivationReport::default(),
+                    )
+                },
+            );
+            assert!(matches!(outcome, SemanticModelRuntimeOutcome::Cancelled(_)));
+            assert_eq!(resolves.load(AtomicOrdering::SeqCst), expected);
+        }
+    }
+
+    #[test]
+    fn graph_digest_follows_the_graph_data_the_identity_reads() {
+        let request = request(vec![evidence()]);
+        let digest = |graph: &RustSelectedCargoGraph| cargo_graph_digest(graph, &request);
+        assert_eq!(digest(&graph("sqlx-core@1")), digest(&graph("sqlx-core@1")));
+        assert_ne!(digest(&graph("sqlx-core@1")), digest(&graph("sqlx-core@2")));
+    }
+}
+
+#[cfg(test)]
+mod assumed_toolchain_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::*;
+    use brokk_bifrost_test_macros::hardwon;
+    use serde_json::json;
+    use std::cell::{Cell, RefCell};
+
+    fn pack(id: &str, version: &str, activation: serde_json::Value) -> serde_json::Value {
+        json!({
+            "schema_version": 2, "pack_id": id, "version": version,
+            "producer": {"name": "test-only", "version": "1.0.0"},
+            "language": "rust", "ecosystem": "cargo", "compatibility": {"bifrost":"*", "toolchains":[{"name":"rust", "requirement":"=1.100.0-nightly"}]},
+            "provenance": {"source": "test-only shared toolchain review regression"},
+            "license": "NOASSERTION", "completeness": "complete",
+            "safety": {"generated_code_only": false, "review_required": false},
+            "shards": [{"id": "main", "activation": activation, "payload": {
+                "kind": "declaration_facts", "types": [{
+                    "id": format!("{id}.marker"), "name": format!("{id}.Marker"),
+                    "type_kind": "struct", "visibility": "public",
+                    "locator": {"kind":"artifact", "path":"fixture.json", "symbol":id}
+                }], "members": [], "relations": []
+            }}]
+        })
+    }
+
+    fn artifact_model(id: &str, toolchain_keyed: bool) -> serde_json::Value {
+        let mut artifact = pack(id, "9.8.7", json!([{"package":{"name":"widget"}}]));
+        artifact["schema_version"] = 28.into();
+        artifact["compatibility"] = json!({"toolchains":[]});
+        artifact["provenance"]["rust_artifact_approximation"] =
+            serde_json::to_value(RustArtifactApproximation {
+                built_from_version: "1.0.1".into(),
+                built_from_features: vec!["std".into()],
+                built_from_cfgs: vec!["docsrs".into()],
+                target: "x86_64-unknown-linux-gnu".into(),
+                format_version: 61,
+                toolchain: "nightly-2026-08-24".into(),
+                docsrs_build: true,
+                original_sha256: "11".repeat(32),
+                produced_sha256: "11".repeat(32),
+                activation_version_requirement: ">=1.0.0, <2.0.0".into(),
+                mismatch_kinds: vec![RustArtifactMismatchKind::VersionNearby],
+                selection_rule_id: "cargo-compatible-nearest".into(),
+                selection_rule_version: 1,
+            })
+            .unwrap();
+        if toolchain_keyed {
+            artifact["compatibility"]["toolchains"] =
+                json!([{"name":"rust","requirement":"=1.100.0-nightly"}]);
+            artifact["shards"][0]["activation"][0]["toolchain"] =
+                json!({"name":"rust","version":"=1.100.0-nightly"});
+        }
+        artifact
+    }
+
+    #[test]
+    #[hardwon(
+        "#11114: partial stdlib selection admitted a toolchain assumption; manifest constraints and exact alternatives were mishandled"
+    )]
+    fn shared_toolchain_requires_complete_selection_and_preserves_exact_alternatives() {
+        for case in [
+            "transient-load",
+            "single-load",
+            "manifest",
+            "versionless",
+            "independent-artifact",
+            "independent-artifact-pinned",
+            "dual-artifact",
+            "no-stdlib",
+            "no-companion",
+            "exact-pinned-alternative",
+        ] {
+            let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+            let mut stdlib = pack(
+                "test.stdlib",
+                "9.8.7",
+                json!([{"toolchain":{"name":"rust","version":"=1.100.0-nightly"}}]),
+            );
+            if matches!(case, "transient-load" | "single-load") {
+                let mut other = stdlib["shards"][0].clone();
+                other["id"] = "other".into();
+                other["activation"][0]["toolchain"]["version"] = if case == "transient-load" {
+                    "=1.99.0"
+                } else {
+                    "=1.100.0-nightly"
+                }
+                .into();
+                other["payload"]["types"][0]["id"] = "other.marker".into();
+                other["payload"]["types"][0]["name"] = "other.Marker".into();
+                stdlib["shards"].as_array_mut().unwrap().push(other);
+            }
+            let mut companion = pack(
+                "test.companion",
+                "9.8.7",
+                json!([{"toolchain":{"name":"rust","version":"=1.100.0-nightly"}}]),
+            );
+            if case == "manifest" {
+                companion["compatibility"]["toolchains"] =
+                    json!([{"name":"rust","requirement":"=1.100.0-nightly"}]);
+                companion["shards"][0]["activation"] = json!([{}]);
+            } else if case == "exact-pinned-alternative" {
+                companion["shards"][0]["activation"] = json!([
+                    {"package":{"name":"widget","version":"=1.0.0"}},
+                    {"toolchain":{"name":"rust","version":"=1.99.0"}}
+                ]);
+            }
+            let mut models = Vec::new();
+            if case != "no-stdlib" {
+                models.push(stdlib);
+            }
+            if case != "no-companion" {
+                models.push(companion);
+            }
+            if case == "exact-pinned-alternative" {
+                models.push(pack("test.companion", "8.0.0", json!([{}])));
+            }
+            if case.starts_with("independent-artifact") {
+                for id in ["test.independent-artifact", "test.blocked-artifact"] {
+                    let artifact = artifact_model(id, false);
+                    models.push(artifact);
+                }
+            }
+            if case == "dual-artifact" {
+                models.push(artifact_model("test.dual-artifact", true));
+            }
+            for model in models {
+                let compiled = compile_source(
+                    SourceFormat::Json,
+                    &serde_json::to_vec(&model).unwrap(),
+                    &CompilerOptions::default(),
+                )
+                .unwrap();
+                catalog
+                    .register_session_pack(
+                        &compiled,
+                        &SessionPackSource {
+                            kind: if matches!(
+                                compiled.manifest.pack_id.as_str(),
+                                "test.independent-artifact" | "test.dual-artifact"
+                            ) {
+                                SessionPackSourceKind::EphemeralWorkspace
+                            } else {
+                                SessionPackSourceKind::Embedded
+                            },
+                            source_id: format!(
+                                "{}@{}",
+                                compiled.manifest.pack_id, compiled.manifest.version
+                            ),
+                        },
+                    )
+                    .unwrap();
+            }
+            let request = SemanticModelActivationRequest {
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                approximate_standard_libraries: vec![ApproximateSemanticModelExpectation {
+                    language: "rust".into(),
+                    ecosystem: "cargo".into(),
+                    pack_id: "test.stdlib".into(),
+                    toolchain: Some("rust".into()),
+                }],
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "rust".into(),
+                    ecosystem: "cargo".into(),
+                    package: Some(CatalogCoordinate {
+                        name: "widget".into(),
+                        version: Some(Version::new(1, 0, 0)),
+                    }),
+                    module: None,
+                    toolchain: matches!(
+                        case,
+                        "exact-pinned-alternative"
+                            | "versionless"
+                            | "independent-artifact"
+                            | "independent-artifact-pinned"
+                            | "dual-artifact"
+                    )
+                    .then(|| CatalogCoordinate {
+                        name: "rust".into(),
+                        version: matches!(
+                            case,
+                            "exact-pinned-alternative" | "independent-artifact-pinned"
+                        )
+                        .then(|| Version::parse("1.100.0-nightly").unwrap()),
+                    }),
+                    target: (case.starts_with("independent-artifact") || case == "dual-artifact")
+                        .then(|| "x86_64-unknown-linux-gnu".into()),
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: ["test.stdlib", "test.companion"]
+                    .into_iter()
+                    .map(|pack_id| SemanticModelActivationControl {
+                        scope: SemanticModelControlScope::Workspace,
+                        action: SemanticModelControlAction::Enable,
+                        selector: SemanticModelPackSelector {
+                            pack_id: pack_id.into(),
+                            version: None,
+                            manifest_digest: None,
+                        },
+                    })
+                    .collect(),
+                limits: SemanticModelRuntimeLimits::default(),
+            };
+            let missing_loads = Cell::new(0);
+            let load_counts = RefCell::new(BTreeMap::new());
+            let sql_start = catalog.sql_statement_count();
+            let result = resolve_active_semantic_models_with_loader(
+                &catalog,
+                &request,
+                None,
+                &CancellationToken::default(),
+                |candidate| {
+                    let key = (
+                        candidate.manifest_digest().to_owned(),
+                        candidate.shard_id().to_owned(),
+                        candidate.source_kind(),
+                        candidate.source_id().to_owned(),
+                    );
+                    let mut counts = load_counts.borrow_mut();
+                    let count = counts.entry(key).or_insert(0usize);
+                    *count += 1;
+                    assert_eq!(
+                        *count, 1,
+                        "each candidate is hydrated once, including stdlib and missing/unused companions"
+                    );
+                    drop(counts);
+                    if candidate.shard_id() == "other" {
+                        missing_loads.set(missing_loads.get() + 1);
+                        if case == "transient-load" && missing_loads.get() == 1 {
+                            return Err(CatalogMiss::NotFound);
+                        }
+                    }
+                    catalog.load_decoded_for_test(candidate)
+                },
+            );
+            let active = match &result {
+                SemanticModelResolutionOutcome::Ready(active) => active,
+                SemanticModelResolutionOutcome::Incomplete {
+                    usable: Some(active),
+                    ..
+                } => active,
+                _ => panic!("{case}: {result:#?}"),
+            };
+            assert_eq!(
+                active.report.phase_measurements.catalog_sql_statements,
+                catalog.sql_statement_count().saturating_sub(sql_start),
+                "all catalog work must be reported, including choosing the stdlib assumption"
+            );
+            let shards = active.shards();
+            let companion = shards
+                .iter()
+                .find(|shard| shard.manifest.pack_id == "test.companion");
+            assert_eq!(
+                active.report.loaded_shards,
+                load_counts.borrow().values().sum::<usize>()
+                    - usize::from(case == "transient-load"),
+                "the report accounts for every successful hydration"
+            );
+            if let Some(companion) = companion {
+                assert_eq!(
+                    companion.assumed_rust_toolchain,
+                    case != "exact-pinned-alternative" && case != "independent-artifact-pinned"
+                );
+            }
+            if case == "dual-artifact" {
+                let dual = shards
+                    .iter()
+                    .find(|shard| shard.manifest.pack_id == "test.dual-artifact")
+                    .unwrap();
+                assert!(dual.assumed_rust_toolchain && dual.approximate);
+                assert!(
+                    dual.manifest
+                        .provenance
+                        .rust_artifact_approximation
+                        .is_some()
+                );
+                assert_eq!(
+                    dual.matched_evidence
+                        .toolchain
+                        .as_ref()
+                        .unwrap()
+                        .version
+                        .as_ref()
+                        .unwrap()
+                        .to_string(),
+                    "1.100.0-nightly"
+                );
+            }
+            if case == "transient-load" {
+                assert!(
+                    matches!(result, SemanticModelResolutionOutcome::Incomplete { .. }),
+                    "{result:#?}"
+                );
+                assert_eq!(
+                    missing_loads.get(),
+                    1,
+                    "an incomplete preselection must not be retried using a partial assumption"
+                );
+                assert!(companion.is_none(), "{result:#?}");
+            } else if case.starts_with("independent-artifact") {
+                assert!(
+                    matches!(result, SemanticModelResolutionOutcome::Incomplete { .. }),
+                    "{result:#?}"
+                );
+                assert_eq!(
+                    companion.is_some(),
+                    case == "independent-artifact-pinned",
+                    "only the shared assumption was withdrawn"
+                );
+                let independent = shards
+                    .iter()
+                    .find(|shard| shard.manifest.pack_id == "test.independent-artifact")
+                    .unwrap_or_else(|| {
+                        panic!("independent package match was removed: {result:#?}")
+                    });
+                assert!(independent.approximate);
+                assert!(!independent.assumed_rust_toolchain);
+                assert_eq!(
+                    independent
+                        .matched_evidence
+                        .toolchain
+                        .as_ref()
+                        .unwrap()
+                        .version
+                        .is_some(),
+                    case == "independent-artifact-pinned"
+                );
+                assert!(
+                    active
+                        .report
+                        .explanations
+                        .iter()
+                        .filter(|explanation| explanation.pack_id.as_deref()
+                            == Some("test.independent-artifact")
+                            && explanation.status == SemanticModelActivationStatus::Active)
+                        .all(|explanation| !explanation.reason.contains("assumed rust toolchain")),
+                    "independent attribution must not claim a shared assumption"
+                );
+                assert!(
+                    independent
+                        .manifest
+                        .provenance
+                        .rust_artifact_approximation
+                        .is_some()
+                );
+                assert!(active.report.explanations.iter().any(|explanation| {
+                    explanation.pack_id.as_deref() == Some("test.blocked-artifact")
+                        && explanation.status
+                            == SemanticModelActivationStatus::ApproximateDistributedBlocked
+                }));
+            } else if matches!(case, "no-stdlib" | "no-companion") {
+                assert!(companion.is_none(), "{case}: {result:#?}");
+            } else {
+                let companion = companion.unwrap_or_else(|| panic!("{case}: {result:#?}"));
+                assert_eq!(companion.manifest.version, "9.8.7", "{case}");
+                assert_eq!(
+                    companion.approximate,
+                    case != "exact-pinned-alternative",
+                    "{case}"
+                );
+            }
         }
     }
 }

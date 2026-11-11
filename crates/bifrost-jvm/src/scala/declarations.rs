@@ -262,6 +262,7 @@ pub fn parse_scala_file(
         visitor.parsed,
         &scala_facts,
         visitor.collector,
+        &visitor.package_contexts,
     );
     drop(visitor);
     let source_declarations = native

@@ -217,6 +217,14 @@ The ICFG vocabulary includes:
 | Dispatch boundary | Unresolved, truncated, external, unmaterialized, or deferred call behavior remains open |
 | Limit or continuation boundary | Call depth, node, edge, or continuation semantics stopped complete expansion |
 
+An exceptional return needs a carrier on the callee side. A local throw
+relates its value to the procedure's exceptional-return port, and so does a
+call's exceptional continuation, through the value the call receives from its
+own callee. The procedure's control flow decides whether a local handler
+intercepts it first. An exception raised two calls down therefore keeps its
+carrier through an intermediate procedure that does not catch it. A call whose
+exceptional continuation receives no value leaves its bindings open.
+
 Every edge carries its own proof and evidence completeness. Boundaries are
 first-class graph rows. A solver may report positive reachability from a partial
 graph alongside the boundaries that prevent a complete-model claim.
@@ -307,6 +315,24 @@ sanitizer behavior, while fact topology tracks carriers and sink meetings.
 | Taint | Set-oriented sources and sinks over the IDE-style class-set domain; compatible policies can share one solve | A finding requires a propagated source-to-sink meeting; selector co-presence alone is insufficient |
 | Typestate | Finite protocol states and uncertainty over bound subjects; forward and backward execution share semantic edges | Findings retain protocol state, certainty, analysis completion, and witnesses |
 | Class-set type flow | Seeds class atoms and explicit unknown atoms, then reuses the value-flow solver for receiver propagation | Unknown or incomplete class sets remain typed unknown or incomplete results |
+
+### Callee footprint certificates (#9183)
+
+A callee footprint certificate proves two properties for one selected call, candidate procedure, caller context, and pair of formal parameters. The tracked subject enters formal F1. The other actual enters F2. N1 proves that no path through the callee, including nested calls and exceptional exits, publishes F1's referent to F2-reachable storage, a global, a capture, a result, a thrown value, or another port. N2 proves that no effect rooted at F2 can reach F1's referent. The certificate covers both exits. `formal_footprint_certificate` computes it during the query. Missing coverage, open dispatch, recursion, or exhausted work leaves the result Unknown. A value-transfer summary or an empty set of discovered effects cannot prove these properties.
+
+Each lowerer makes a `ProcedureFootprintCoverage` witness for the selected procedure. It accounts for the source boundary, including the signature, parameter patterns, attributes, body, implicit behavior, and ownership of nested bodies. The witness gives each `FootprintClass` a `Represented`, `Excluded`, or `Refused` disposition. The classes cover formal slots; signature, attributes and transforms; memory reads and writes; publication and escape; static or global access; captures; nested calls and their targets; normal and exceptional exits; cleanup, drop and unwind; conversion and initialization; deferred execution; and nested callable ownership. `Represented` means every encountered instance was lowered. It remains valid with zero rows when the procedure has no instance of that class. `Excluded` makes an affirmative claim that the class has no applicable effect. Rows that contradict an exclusion cause refusal. An unsupported branch, an unaccounted source node, or a relevant gap also refuses. The bounded witness is stored with the semantic IR; the source-node account is temporary.
+
+An inventoried call does not prove its target. A target gap remains an obligation for that exact call until dispatch, port mapping, and the candidate footprint close it. `call_target_gap_pair` defines the unique call-resolution and callable-reference gap pair. The shared assembler uses it when writing obligations, and the projection uses it when reading them. Unpaired relevant gaps refuse. This rule applies to every language lowerer.
+
+Typestate also needs a witness that the tracked subject is F1's exact referent. `CallSubjectMapping::Associated` carries that proof. `SubjectUnproven` means the subject match alone is missing; dispatch, binding, continuity, phase, and reference-identity transport still hold. The F2 exclusion in `TypestateCompositionProvider::call_handoffs` requires an Associated F1 handoff, a discharge-eligible SubjectUnproven F2 handoff at the same call, candidate, context, and exit, and `formal_pair_separation`. That separation also requires disjoint actuals before effects, no publication of the fresh subject before the call, singleton dispatch, and a Proven footprint certificate. Failure keeps the handoff.
+
+Within a callee's formal-entry summary, a direct, identity-preserving handoff through another formal has conditional presence. `TypestateComposeFunction::guarded` gives the Alias arm the callee effect and the NoAlias arm `Absent`. `Absent` means no reach: it is distinct from identity, and composition with it is absorbing. A choice drops Absent alternatives but retains and deduplicates the other origins. A guard becomes Absent only when both arms are Absent. A proven NoAlias removes only that handoff before it affects quality; Alias keeps its effect, and an unresolved guard remains uncertain at the root. NoAlias uses `formal_pair_separation` rather than an assumption about different formal positions.
+
+A typestate root reports a clean result only when the completeness of the summaries it consumes is justified. Each reached procedure must have admitted scoped call/control coverage: an affirmative, source-checked account of every call and control effect in its body, published with its semantic IR. ICFG and composition decide this with one shared predicate, `RootCallClosure::summary_completeness_justified`. A root whose closure reaches a procedure with refused coverage is `Inconclusive` with `PartialDiscovery` in both engines. A closure that is incomplete only because a call has no workspace body (an external or library call with modeled boundaries) does not change completion on its own. A proven, complete transfer to a workspace-local procedure is part of the closure whatever its file. When the absence of a subject from an event cannot be proven, the root carries an `UnprovenEventRelation` marker. That marker is ignored only when the root's complete call closure proves it cannot reach the observing procedure; otherwise it adds `PartialDiscovery`. Producers that refuse coverage (several Rust, Go and Java branches still do) therefore cost precision, never a missed finding.
+
+A solved typestate root is stored as a root product and replayed on a later evaluation when none of its recorded reads changed. ICFG and composition roots follow the same rules, and each engine publishes under its own root-key domain. The two engines therefore never replay each other's roots, even in one store or under the test-only engine override. A root is published only when its result does not depend on how this execution ran. One shared boundary, used by both engines, records the cancellation state, execution-budget exhaustion, semantic and solver read refusals, and the analyzer generation before the root, and compares them after it. A root is also execution dependent when the search reports cancelled or budget incompleteness, when a nested summary is incomplete for an execution reason, or when it used a recursive pending summary. Composition answers several questions through query-local memos: summaries, pending summaries, local partial flows, dispatches, openness, sweeps, and the ordered parts, bypasses and inert drops. Each memo entry keeps the read receipts behind it and replays them on a hit, so a replayed root records the same reads as a fresh one. The receipt bytes are charged to a query-local budget. An entry the budget cannot admit is returned without being retained, and never hides a refusal. A replayed root checks the shared limits and work admission again and keeps its completion and reasons. A root that no longer fits is recomputed.
+
+Canonical typestate binding plans and policy unit keys hash each artifact's `public_fingerprint`. It retains content, adapter, IR, configuration, dependencies, and the workspace-relative path while excluding the absolute mount and overlay snapshot token. A comment-only diff base can run from another mount, so mount-sensitive hashes would prevent valid unit reuse even when answers agree. Call-site locators and occurrences still distinguish separate bindings.
 
 Class-set dispatch feedback can close a resolved receiver call's dynamic-dispatch
 remainder when the complete receiver set names exactly the declarations already
@@ -831,10 +857,11 @@ An incomplete batch reports with the ICFG engine's diagnostic families. The
 first cause is ranked: cancellation and budget exhaustion come first, then an
 open procedure (ordered by artifact, locator, and procedure), then other causes,
 and source or sink evidence last. Source-evidence diagnostics can appear beside
-the first cause, and endpoint refusals are reported separately. The
-`taint.compose.counts` profiling note carries the full list. When a run
-concludes but a finding is partial, the finding's cause is also emitted as a run
-diagnostic. For an open procedure, the cause names that procedure, not the call
+the first cause, followed by distinct open-helper causes in deterministic
+semantic procedure and full-cause order. Endpoint refusals are reported
+separately. The `taint.compose.counts` profiling note carries the full list.
+A partial finding's cause is also emitted as a run diagnostic, including when
+the run is inconclusive. For an open procedure, the cause names that procedure, not the call
 in a caller that enters it.
 
 The composition differs from the ICFG engine in two recorded ways. Heap

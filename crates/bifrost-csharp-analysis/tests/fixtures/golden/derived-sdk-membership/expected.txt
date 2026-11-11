@@ -1,0 +1,5 @@
+Microsoft.NET.Sdk.Razor:
+App/A.cs: member
+App/obj/Debug/net10.0/Generated.cs: unproven
+no-framework-suffix: App/obj/Debug/EmbeddedAttribute.cs: unproven
+unknown-output: Sibling/EmbeddedAttribute.cs: unproven

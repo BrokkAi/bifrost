@@ -26,21 +26,84 @@ fn traced_occurrence_row<'a>(
         .find(|other| other.node == row.node && other.role == row.role)
 }
 
+/// How one edge row fares against an edge filter. A row whose owner relation
+/// is Unknown cannot be decided against a relation filter that does not list
+/// Unknown, nor a row whose reference kind is unclassified against a
+/// reference-kind filter. The caller reports either only after every other
+/// filter, including the enclosing pattern, has kept the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeFilterMatch {
+    Excluded,
+    Kept,
+    Undecided { relation: bool, kind: bool },
+}
+
+/// `unclassified` receives the row's site only when its reference kind is
+/// undecided; the caller keeps it once the row survives the enclosing filter.
 fn edge_filter_matches(
     filter: &EdgeFilter,
     row: &super::super::reference_edges::ReferenceEdgeRow,
-) -> bool {
-    (filter.reference_kinds.is_empty()
-        || row
-            .reference_kind
-            .is_some_and(|kind| filter.reference_kinds.contains(&kind)))
-        && filter.proof.is_none_or(|proof| row.proof == proof)
+    unclassified: &mut Vec<String>,
+) -> EdgeFilterMatch {
+    use brokk_bifrost_core::analyzer::structural::edges::OwnerRelation;
+    let relation_listed =
+        filter.relations.is_empty() || filter.relations.contains(&row.owner_relation);
+    // A known relation outside the filter excludes the row before the
+    // reference-kind check can record it as unclassified.
+    if !(filter.proof.is_none_or(|proof| row.proof == proof)
         && filter
             .surface
             .is_none_or(|surface| row.included_in(surface))
         && (filter.usage_kinds.is_empty() || filter.usage_kinds.contains(&row.usage_kind))
-        && (filter.relations.is_empty() || filter.relations.contains(&row.owner_relation))
         && (filter.site_classes.is_empty() || filter.site_classes.contains(&row.site_class))
+        && (relation_listed || row.owner_relation == OwnerRelation::Unknown))
+    {
+        return EdgeFilterMatch::Excluded;
+    }
+    let before = unclassified.len();
+    let kind_matches = classified_reference_kind_matches(
+        row.reference_kind,
+        &filter.reference_kinds,
+        &row.site.file,
+        row.site.range,
+        unclassified,
+    );
+    let kind_undecided = unclassified.len() > before;
+    if !kind_matches && !kind_undecided {
+        return EdgeFilterMatch::Excluded;
+    }
+    if relation_listed && !kind_undecided {
+        EdgeFilterMatch::Kept
+    } else {
+        EdgeFilterMatch::Undecided {
+            relation: !relation_listed,
+            kind: kind_undecided,
+        }
+    }
+}
+
+fn undecided_owner_relation(
+    filter: &EdgeFilter,
+    row: &super::super::reference_edges::ReferenceEdgeRow,
+) -> CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::EdgeDerivationIncomplete,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: crate::analyzer::common::language_for_file(&row.site.file).config_label(),
+        message: format!(
+            "owner relation unknown at {}:{}@{}; requested relations {:?} cannot be decided",
+            rel_path_string(&row.site.file),
+            row.site.range.start_line,
+            row.site.range.start_byte,
+            filter.relations
+        ),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    })
 }
 
 /// Expand one file's occurrence rows, optionally restricted to those lexically
@@ -139,6 +202,7 @@ pub(super) fn occurrences_of_declaration(
     filter: &OccurrenceFilter,
     indexed: &mut IndexedDeclarations,
     reference_cache: &mut ReferenceTraversalCache,
+    environment_cache: &mut super::environment::EnvironmentTraversalCache,
     occurrence_cache: &mut OccurrenceTraversalCache,
     budget: &mut CodeQueryExecutionBudget,
     limits: CodeQueryExecutionLimits,
@@ -154,6 +218,7 @@ pub(super) fn occurrences_of_declaration(
         &ReferenceTraversalFilter::default(),
         indexed,
         reference_cache,
+        environment_cache,
         budget,
         limits,
         diagnostics,
@@ -425,7 +490,7 @@ pub(super) fn binding_occurrence_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     row_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
-    let Some(node) = value.row().node else {
+    let Some(node) = value.selected_row().node else {
         return Vec::new();
     };
     let filter = OccurrenceFilter {
@@ -467,14 +532,24 @@ pub(super) fn binding_uses_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     row_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
+    let mut roles = vec![
+        OccurrenceRole::TypeOperand,
+        OccurrenceRole::PathSegment,
+        OccurrenceRole::ReceiverPosition,
+        OccurrenceRole::ValueReference,
+    ];
+    // Pattern-position namespaces are currently incomplete for Rust. Import
+    // binders can be used solely in a pattern, so demand that role and keep
+    // their no-access proof Open until the adapter can classify it.
+    if crate::analyzer::common::language_for_file(value.file()) == Language::Rust
+        && value.row().kind
+            == brokk_bifrost_core::analyzer::structural::resolution::BindingKind::ImportBinder
+    {
+        roles.push(OccurrenceRole::PatternPosition);
+    }
     let filter = OccurrenceFilter {
         classes: vec![OccurrenceClass::Reference],
-        roles: vec![
-            OccurrenceRole::TypeOperand,
-            OccurrenceRole::PathSegment,
-            OccurrenceRole::ReceiverPosition,
-            OccurrenceRole::ValueReference,
-        ],
+        roles,
         ..OccurrenceFilter::default()
     };
     let Some(result) =
@@ -496,11 +571,15 @@ pub(super) fn binding_uses_expansions(
         binding_scope.range.start_byte <= call.start_byte
             && call.end_byte <= binding_scope.range.end_byte
     });
+    let rust_binding_name = (crate::analyzer::common::language_for_file(value.file())
+        == Language::Rust)
+        .then_some(value.row().name.as_str());
     let mut unresolved_candidates = result
         .rows
         .iter()
         .filter(|occurrence| {
             binding_scope.contains(occurrence.range.start_byte)
+                && rust_binding_name.is_none_or(|name| occurrence.effective_spelling() == name)
                 && matches!(
                     super::super::lexical_environment::binding_of(
                         &value.result,
@@ -522,20 +601,93 @@ pub(super) fn binding_uses_expansions(
         *row_exhausted = true;
         return Vec::new();
     }
-    let contains_unresolved_reference = unresolved_candidates
-        .iter()
-        .any(|occurrence| matches!(&occurrence.target, OccurrenceTarget::Unresolved(_)));
-    let scope_complete = environment::BINDING_QUERY_AXES
-        .iter()
-        .all(|axis| value.result.completeness.covers(*axis))
+    let rust_facts = rust_binding_name.and_then(|_| {
+        analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust)
+            .and_then(|provider| provider.structural_facts(value.file()))
+    });
+    let opaque_rust_macro = if rust_binding_name.is_some() {
+        match rust_facts.as_ref() {
+            Some(facts) => {
+                let scope = value
+                    .row()
+                    .node
+                    .and_then(|node| rust_nearest_callable(facts, node));
+                let Some(has_macro) =
+                    occurrence_cache.rust_scope_has_macro(value.file(), facts, scope, cancellation)
+                else {
+                    *row_exhausted = true;
+                    return Vec::new();
+                };
+                rust_binding_has_decorator(facts, value.row().node) || has_macro
+            }
+            None => true,
+        }
+    } else {
+        false
+    };
+    // A Rust unresolved constructor or constant with a different spelling
+    // cannot access this lexical binder. Keep the existing conservative rule
+    // for other languages until their own binding-access proof is reviewed.
+    let contains_unresolved_reference = unresolved_candidates.iter().any(|occurrence| {
+        rust_binding_name.is_none_or(|name| occurrence.effective_spelling() == name)
+            && matches!(&occurrence.target, OccurrenceTarget::Unresolved(_))
+    });
+    // A semantic target does not prove this lexical access belongs to a
+    // different binder. If the lexical join itself cannot place a same-name
+    // reference, the no-access answer remains open even when target resolution
+    // returned a symbol.
+    let unjoined_rust_reference = rust_binding_name.is_some_and(|name| {
+        result.rows.iter().any(|occurrence| {
+            value.row().activation.start_byte <= occurrence.range.start_byte
+                && occurrence.range.end_byte <= value.row().activation.end_byte
+                && Some(occurrence.node) != value.row().node
+                && occurrence.effective_spelling() == name
+                && matches!(
+                    super::super::lexical_environment::binding_of(
+                        &value.result,
+                        occurrence.effective_spelling(),
+                        occurrence.range.start_byte,
+                        Some(occurrence.namespace),
+                    ),
+                    super::super::lexical_environment::BindingOfOutcome::NoBinding
+                        | super::super::lexical_environment::BindingOfOutcome::Incomplete(_)
+                )
+        })
+    });
+    // An ambiguous binder elsewhere in a Rust file makes the file-wide
+    // BindingIntervals axis incomplete. An existing binder with an exact
+    // anchor can still prove no access within its own activation interval:
+    // any same-name reference that the lexical join cannot place is checked
+    // above and keeps only that binding open.
+    let binding_axes_complete =
+        if rust_binding_name.is_some() && value.row().logical_anchor.is_some() {
+            value
+                .result
+                .completeness
+                .covers(super::super::resolution::EnvironmentAxis::Scopes)
+        } else {
+            environment::BINDING_QUERY_AXES
+                .iter()
+                .all(|axis| value.result.completeness.covers(*axis))
+        };
+    let scope_complete = binding_axes_complete
         && filter
             .required_roles()
             .iter()
             .all(|role| result.completeness.covers(*role))
         && !contains_dynamic_call
-        && !contains_unresolved_reference;
+        && !contains_unresolved_reference
+        && !unjoined_rust_reference
+        && !opaque_rust_macro;
     environment_cache.record_binding_use_completeness(analyzer, value, scope_complete);
-    if contains_dynamic_call || contains_unresolved_reference {
+    if contains_dynamic_call
+        || contains_unresolved_reference
+        || unjoined_rust_reference
+        || opaque_rust_macro
+    {
         let message = format!(
             "{} lexical scope {} has unresolved or dynamic references; binding uses are incomplete",
             super::rel_path_string(value.file()),
@@ -577,6 +729,48 @@ pub(super) fn binding_uses_expansions(
             }))
         })
         .collect()
+}
+
+fn rust_binding_has_decorator(
+    facts: &crate::analyzer::structural::FileFacts,
+    binder_node: Option<u32>,
+) -> bool {
+    let mut current = binder_node;
+    while let Some(index) = current {
+        let node = facts.node(index);
+        if facts
+            .role_targets(
+                index,
+                brokk_bifrost_core::analyzer::structural::kinds::Role::Decorator,
+            )
+            .any(|target| {
+                target.node.is_none_or(|decorator| {
+                    facts.node(decorator).construct.as_deref()
+                        != Some("rust_body_preserving_attribute")
+                })
+            })
+        {
+            return true;
+        }
+        current = node.parent;
+    }
+    false
+}
+
+fn rust_nearest_callable(facts: &crate::analyzer::structural::FileFacts, node: u32) -> Option<u32> {
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+    let mut current = Some(node);
+    while let Some(index) = current {
+        let fact = facts.node(index);
+        if matches!(
+            fact.kind,
+            NormalizedKind::Function | NormalizedKind::Method | NormalizedKind::Lambda
+        ) {
+            return Some(index);
+        }
+        current = fact.parent;
+    }
+    None
 }
 
 /// The candidates the resolver considered for one reference occurrence.
@@ -738,16 +932,20 @@ pub(super) fn member_selection_expansions(
 /// The canonical inverse edges of one declaration, filtered and indexed.
 ///
 /// A row whose target cannot be located as an exact indexed declaration is
-/// omitted with an `EdgeDerivationIncomplete` diagnostic rather than silently
+/// omitted with a `EdgeDerivationIncomplete` diagnostic rather than silently
 /// dropped: the derivation asserted an edge, and losing it without a trace
 /// would be the silent gap the domain exists to remove.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn inverse_edge_expansions(
     analyzer: &dyn IAnalyzer,
     edge_cache: &mut EdgeTraversalCache,
+    environment_cache: &mut super::environment::EnvironmentTraversalCache,
     indexed: &mut IndexedDeclarations,
     declaration: &DeclarationValue,
     filter: &EdgeFilter,
     cancellation: Option<&CancellationToken>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     let result = edge_cache.inverse_for(analyzer, &declaration.unit, cancellation);
@@ -759,7 +957,18 @@ pub(super) fn inverse_edge_expansions(
         &result,
         diagnostics,
     );
-    edge_row_expansions(analyzer, indexed, &result, filter, None, diagnostics)
+    edge_row_expansions(
+        analyzer,
+        indexed,
+        &result,
+        filter,
+        None,
+        environment_cache,
+        budget,
+        limits,
+        cancellation,
+        diagnostics,
+    )
 }
 
 /// The state events of one seed procedure.
@@ -1627,10 +1836,13 @@ pub(super) fn topology_edge_expansions(
 pub(super) fn forward_edge_expansions(
     analyzer: &dyn IAnalyzer,
     edge_cache: &mut EdgeTraversalCache,
+    environment_cache: &mut super::environment::EnvironmentTraversalCache,
     indexed: &mut IndexedDeclarations,
     value: &OccurrenceValue,
     filter: &EdgeFilter,
     cancellation: Option<&CancellationToken>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     row_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
@@ -1654,28 +1866,86 @@ pub(super) fn forward_edge_expansions(
         &result,
         filter,
         Some(site_ast_id.as_str()),
+        environment_cache,
+        budget,
+        limits,
+        cancellation,
         diagnostics,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn edge_row_expansions(
     analyzer: &dyn IAnalyzer,
     indexed: &mut IndexedDeclarations,
     result: &super::super::reference_edges::EdgeDerivationResult,
     filter: &EdgeFilter,
     site_ast_id: Option<&str>,
+    environment_cache: &mut super::environment::EnvironmentTraversalCache,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     let mut expansions = Vec::new();
     let mut omitted = 0usize;
     let mut omitted_language = None;
+    let mut unclassified = Vec::new();
+    let mut unclassified_language = None;
+    let mut enclosing = filter
+        .enclosing
+        .as_ref()
+        .map(|pattern| EnclosingPatternEvaluator::new(analyzer, pattern));
+    let owner_classified = result.covers(super::super::edges::EdgeAxis::OwnerClassification);
     for row in &result.edges {
         if let Some(site_ast_id) = site_ast_id
             && row.site.ast_id.as_deref() != Some(site_ast_id)
         {
             continue;
         }
-        if !edge_filter_matches(filter, row) {
+        let mut row_unclassified = Vec::new();
+        let matches = edge_filter_matches(filter, row, &mut row_unclassified);
+        if matches == EdgeFilterMatch::Excluded {
+            continue;
+        }
+        if let Some(enclosing) = enclosing.as_mut() {
+            let site = format!(
+                "{}:{}@{}",
+                crate::path_utils::workspace_relative_slash_path(row.site.file.rel_path()),
+                row.site.range.start_line,
+                row.site.range.start_byte
+            );
+            // An unknown owner and a file-scope owner both project to `None`;
+            // only a result that classified every owner proves there is none.
+            let keep = match row.site.enclosing.as_ref() {
+                None if !owner_classified => {
+                    enclosing.withhold(site);
+                    false
+                }
+                owner => enclosing.keeps(
+                    environment_cache,
+                    owner,
+                    site,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                ),
+            };
+            if !keep {
+                continue;
+            }
+        }
+        if let EdgeFilterMatch::Undecided { relation, kind } = matches {
+            if kind {
+                unclassified.append(&mut row_unclassified);
+                unclassified_language.get_or_insert_with(|| {
+                    crate::analyzer::common::language_for_file(&row.site.file)
+                });
+            }
+            if relation {
+                diagnostics.push(undecided_owner_relation(filter, row));
+            }
             continue;
         }
         let Some(target) = indexed.get(analyzer, &row.target) else {
@@ -1697,6 +1967,20 @@ pub(super) fn edge_row_expansions(
             },
         ))));
     }
+    if let Some(language) = unclassified_language {
+        report_unclassified_reference_kinds(
+            &filter.reference_kinds,
+            unclassified,
+            language,
+            diagnostics,
+        );
+    }
+    if let (Some(enclosing), Some(first)) = (enclosing, result.edges.first()) {
+        enclosing.finish(
+            crate::analyzer::common::language_for_file(&first.site.file),
+            diagnostics,
+        );
+    }
     if omitted > 0 {
         let language = omitted_language.expect("an omitted edge names its language");
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
@@ -1716,4 +2000,115 @@ pub(super) fn edge_row_expansions(
         }));
     }
     expansions
+}
+
+#[cfg(test)]
+mod owner_relation_tests {
+    use super::super::super::reference_edges::{EdgeSite, ReferenceEdgeRow};
+    use super::*;
+    use brokk_bifrost_core::analyzer::structural::edges::{
+        EdgeProvenance, OwnerRelation, SiteClass,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#11089: an Unknown owner relation was silently excluded from relation-filtered edge answers"
+    )]
+    fn unknown_owner_relation_is_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(root.path(), "app.py");
+        let row = ReferenceEdgeRow {
+            dispatch_extensibility: None,
+            target: CodeUnit::new(
+                file.clone(),
+                crate::analyzer::CodeUnitType::Function,
+                "",
+                "helper",
+            ),
+            site: EdgeSite {
+                file,
+                range: Range {
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: 1,
+                    end_line: 1,
+                },
+                ast_id: None,
+                enclosing: None,
+            },
+            reference_kind: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(
+                None,
+            ),
+            proof: UsageProof::Proven,
+            ambiguous_candidate: false,
+            usage_kind: UsageHitKind::Reference,
+            site_class: SiteClass::UseSite,
+            owner_relation: OwnerRelation::Unknown,
+            provenance: EdgeProvenance::Forward,
+            generation: 0,
+        };
+        for (relations, expected) in [
+            (vec![], EdgeFilterMatch::Kept),
+            (vec![OwnerRelation::Unknown], EdgeFilterMatch::Kept),
+            (
+                vec![OwnerRelation::External],
+                EdgeFilterMatch::Undecided {
+                    relation: true,
+                    kind: false,
+                },
+            ),
+            (
+                vec![OwnerRelation::InheritedOwner],
+                EdgeFilterMatch::Undecided {
+                    relation: true,
+                    kind: false,
+                },
+            ),
+        ] {
+            let filter = EdgeFilter {
+                relations,
+                ..EdgeFilter::default()
+            };
+            assert_eq!(
+                edge_filter_matches(&filter, &row, &mut Vec::new()),
+                expected
+            );
+            let diagnostic = undecided_owner_relation(&filter, &row);
+            assert_eq!(
+                diagnostic.code,
+                CodeQueryDiagnosticCode::EdgeDerivationIncomplete
+            );
+            assert_eq!(diagnostic.impact, CodeQueryDiagnosticImpact::Incomplete);
+        }
+        // A known relation outside the filter excludes the row before an
+        // unclassified reference kind is recorded.
+        let known = ReferenceEdgeRow {
+            owner_relation: OwnerRelation::SameOwner,
+            ..row.clone()
+        };
+        let filter = EdgeFilter {
+            relations: vec![OwnerRelation::External],
+            reference_kinds: vec![
+                brokk_bifrost_core::analyzer::usages::model::ReferenceKind::MethodCall,
+            ],
+            ..EdgeFilter::default()
+        };
+        let mut unclassified = Vec::new();
+        assert_eq!(
+            edge_filter_matches(&filter, &known, &mut unclassified),
+            EdgeFilterMatch::Excluded
+        );
+        assert!(unclassified.is_empty(), "{unclassified:?}");
+        // An Unknown relation with an unclassified kind is undecided on both
+        // axes; the caller records either only after the enclosing filter.
+        assert_eq!(
+            edge_filter_matches(&filter, &row, &mut unclassified),
+            EdgeFilterMatch::Undecided {
+                relation: true,
+                kind: true,
+            }
+        );
+        assert_eq!(unclassified.len(), 1, "{unclassified:?}");
+    }
 }

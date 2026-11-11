@@ -47,10 +47,10 @@ use brokk_bifrost_core::analyzer::structural::resolution::{
 };
 
 use crate::analyzer::resolution::{
-    BindingFragmentId, BindingNodeId, EndpointSignature, LoweredCandidateDirection,
-    LoweredCoverageGap, LoweredSemanticRole, LoweredSemanticSite, LoweringCoverageFrontier,
-    LoweringGapOrigin, PartialPath, PartialPathId, PartialScopedSymbol, PrecedenceStep,
-    ResolutionCompletion, ResolutionIdentityCatalog, ResolutionIdentityDomain,
+    BindingFragmentId, BindingNodeId, EndpointSignature, LexicalChoiceRecord,
+    LoweredCandidateDirection, LoweredCoverageGap, LoweredSemanticRole, LoweredSemanticSite,
+    LoweringCoverageFrontier, LoweringGapOrigin, PartialPath, PartialPathId, PartialScopedSymbol,
+    PrecedenceStep, ResolutionCompletion, ResolutionIdentityCatalog, ResolutionIdentityDomain,
     ResolutionIncompleteReason, ResolutionLookupSemanticRecipe, SemanticId, SharedNameId,
     StackPattern, StackVariableId, WitnessStep,
 };
@@ -217,7 +217,7 @@ pub(crate) const RESOLUTION_ROOT_TERMINAL_PATHS_SQL: &str = "SELECT path FROM re
 /// number (lane NB), so this one statement answers "is this node a reference
 /// or a definition" and "which node does this definition own" alike.
 pub(crate) const RESOLUTION_SITES_BY_KEY_SQL: &str = "SELECT site, role, namespace, site_kind, \
-     start_byte, end_byte, unqualified, owner, receiver_origin, go_spelling_namespace, go_definition_namespaces, go_package_qualifier \
+     start_byte, end_byte, unqualified, owner, receiver_origin, go_spelling_namespace, go_definition_namespaces, go_package_qualifier, prefix \
      FROM resolution_sites \
      WHERE blob_id = ?1 AND site IN (SELECT value FROM json_each(?2))";
 
@@ -522,6 +522,7 @@ pub(crate) struct PreparedSiteRow {
     pub(crate) end_byte: Option<i64>,
     pub(crate) unqualified: Option<i64>,
     pub(crate) owner: Option<i64>,
+    pub(crate) prefix: Option<i64>,
     pub(crate) receiver_origin: Option<i64>,
     pub(crate) go_spelling_namespace: Option<i64>,
     pub(crate) go_definition_namespaces: Option<u8>,
@@ -581,6 +582,7 @@ impl SharedNames {
 pub(super) fn prepare_path_rows(
     keys: &ResolutionLocalKeys,
     identities: &ResolutionIdentityCatalog,
+    language: Language,
     paths: &[(PartialPathId, PartialPath)],
 ) -> PreparedPathRows {
     let mut shared = SharedNames::default();
@@ -596,7 +598,14 @@ pub(super) fn prepare_path_rows(
             "a persisted path's key must be the one its mounted id carries"
         );
         let mut variables: Vec<(StackVariableId, i64)> = Vec::new();
-        let body = path_body(&mut shared, keys, identities, path, &mut variables);
+        let body = path_body(
+            &mut shared,
+            keys,
+            identities,
+            language,
+            path,
+            &mut variables,
+        );
         let start = endpoint_lead(&mut shared, keys, identities, path.start());
         let end = endpoint_lead(&mut shared, keys, identities, path.end());
         let root_terminal = root_terminal_identity(&mut shared, identities, path);
@@ -881,6 +890,9 @@ pub(super) fn prepare_site_rows(
             let owner = site
                 .reference_owner()
                 .map(|owner| owner.map_or(-1, |semantic| keys.semantic(semantic)));
+            let prefix = site
+                .prefix_reference()
+                .map(|prefix| prefix.map_or(-1, |semantic| keys.semantic(semantic)));
             PreparedSiteRow {
                 site: i64::from(site.site().get()),
                 role: semantic_role_code(site.role()),
@@ -894,6 +906,7 @@ pub(super) fn prepare_site_rows(
                 }),
                 unqualified: metadata.map(|metadata| i64::from(metadata.unqualified())),
                 owner,
+                prefix,
                 receiver_origin: site.receiver_origin().map(receiver_origin_code),
                 go_spelling_namespace: metadata
                     .and_then(|row| row.go_spelling_namespace())
@@ -963,6 +976,7 @@ fn path_body(
     shared: &mut SharedNames,
     keys: &ResolutionLocalKeys,
     identities: &ResolutionIdentityCatalog,
+    language: Language,
     path: &PartialPath,
     variables: &mut Vec<(StackVariableId, i64)>,
 ) -> Vec<PathBodyToken> {
@@ -1048,6 +1062,40 @@ fn path_body(
     out.push(PathBodyToken::Close);
     write_completion(&mut out, keys, path.completion());
     out.push(PathBodyToken::Int(i64::from(path.owner_continued())));
+    if crate::analyzer::resolution::fact_source::language_has_jvm_semantics(language) {
+        out.push(PathBodyToken::Open);
+        out.push(PathBodyToken::Open);
+        for record in path.lexical_choices() {
+            assert_eq!(record.source_fragment, identities.fragment());
+            out.push(PathBodyToken::Open);
+            out.push(PathBodyToken::Int(keys.path(record.source_path)));
+            out.push(PathBodyToken::Int(node_key(keys, record.owner)));
+            out.push(PathBodyToken::Int(i64::from(record.segment_position)));
+            out.push(PathBodyToken::Open);
+            for step in record.precedence.iter() {
+                out.push(PathBodyToken::Open);
+                out.push(PathBodyToken::Int(code(ALL_PRECEDENCE_TIERS, step.tier)));
+                out.push(PathBodyToken::Int(i64::from(step.ordinal)));
+                out.push(signed_semantic(shared, keys, identities, step.semantic));
+                out.push(PathBodyToken::Close);
+            }
+            out.push(PathBodyToken::Close);
+            write_completion(
+                &mut out,
+                keys,
+                &ResolutionCompletion::incomplete([record.reason]),
+            );
+            out.push(PathBodyToken::Close);
+        }
+        out.push(PathBodyToken::Close);
+        push_option(
+            &mut out,
+            path.addressed_lexical_choice()
+                .map(|index| i64::try_from(index).expect("an occurrence index fits i64")),
+        );
+        out.push(PathBodyToken::Int(i64::from(path.segment_count())));
+        out.push(PathBodyToken::Close);
+    }
     out.push(PathBodyToken::Close);
     out
 }
@@ -1216,8 +1264,8 @@ pub(crate) fn parse_path_body(body: &str) -> ParsedPathBody {
         serde_json::from_str(body).expect("a stored path body is the JSON this module wrote");
     let cells = array(&document, "body").to_vec();
     assert!(
-        matches!(cells.len(), 11 | 12),
-        "a stored path body has eleven legacy or twelve current positions"
+        matches!(cells.len(), 11..=13),
+        "a stored path body has eleven legacy, twelve, or thirteen positions"
     );
     ParsedPathBody(cells)
 }
@@ -1228,6 +1276,7 @@ pub(crate) fn parse_path_body(body: &str) -> ParsedPathBody {
 /// stitching seeks by, so they are columns and not body positions.
 pub(crate) fn decode_path_row(
     context: &PathBodyContext,
+    language: Language,
     start_node: i64,
     end_node: i64,
     body: &ParsedPathBody,
@@ -1266,7 +1315,7 @@ pub(crate) fn decode_path_row(
         Some(1) => true,
         Some(value) => panic!("a path owner-continuation bit is 0 or 1, got {value}"),
     };
-    let path = PartialPath::new(
+    let mut path = PartialPath::new(
         start,
         end,
         precedence,
@@ -1274,6 +1323,65 @@ pub(crate) fn decode_path_row(
         decode_completion(context, &cells[10]),
     )
     .with_root_import_activation(root_import_activation);
+    if crate::analyzer::resolution::fact_source::language_has_jvm_semantics(language) {
+        let metadata = array(
+            cells
+                .get(12)
+                .expect("a selected JVM bundle has #9002 lexical metadata"),
+            "lexical metadata",
+        );
+        assert_eq!(
+            metadata.len(),
+            3,
+            "lexical metadata has records, address and segment count"
+        );
+        let records = array(&metadata[0], "lexical records")
+            .iter()
+            .map(|cell| {
+                let cell = array(cell, "lexical record");
+                assert_eq!(cell.len(), 5);
+                let reason = match decode_completion(context, &cell[4]) {
+                    ResolutionCompletion::Incomplete(reasons) if reasons.iter().count() == 1 => {
+                        reasons.iter().next().copied().expect("one reason")
+                    }
+                    other => panic!("a lexical record has one incomplete reason: {other:?}"),
+                };
+                let precedence = array(&cell[3], "lexical precedence")
+                    .iter()
+                    .map(|step| {
+                        let step = array(step, "lexical precedence step");
+                        assert_eq!(step.len(), 3);
+                        PrecedenceStep {
+                            tier: from_code::<PrecedenceTier>(
+                                ALL_PRECEDENCE_TIERS,
+                                integer(&step[0], "precedence tier"),
+                                "precedence tier",
+                            ),
+                            ordinal: u32::try_from(integer(&step[1], "precedence ordinal"))
+                                .expect("precedence ordinal fits u32"),
+                            semantic: context.semantic(integer(&step[2], "precedence semantic")),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                LexicalChoiceRecord {
+                    source_fragment: context.fragment,
+                    source_path: context.path(integer(&cell[0], "lexical source path")),
+                    owner: context.node(integer(&cell[1], "lexical owner")),
+                    segment_position: u32::try_from(integer(&cell[2], "lexical position"))
+                        .expect("segment position fits u32"),
+                    precedence,
+                    reason,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let addressed = optional_integer(&metadata[1], "addressed lexical occurrence")
+            .map(|value| usize::try_from(value).expect("addressed occurrence is nonnegative"));
+        let segment_count =
+            u32::try_from(integer(&metadata[2], "segment count")).expect("segment count fits u32");
+        path = path.with_lexical_metadata(records, addressed, segment_count);
+    }
     if owner_continued {
         path.with_owner_continued()
     } else {

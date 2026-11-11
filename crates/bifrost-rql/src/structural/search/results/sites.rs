@@ -1,6 +1,31 @@
 use super::*;
 use schemars::JsonSchema;
 
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct CodeQueryReferenceFacets {
+    pub known: Vec<&'static str>,
+    pub undecided: Vec<&'static str>,
+}
+
+impl From<brokk_bifrost_core::analyzer::usages::model::ReferenceFacets>
+    for CodeQueryReferenceFacets
+{
+    fn from(facets: brokk_bifrost_core::analyzer::usages::model::ReferenceFacets) -> Self {
+        Self {
+            known: facets
+                .known()
+                .iter()
+                .map(brokk_bifrost_rql::schema::reference_kind_label)
+                .collect(),
+            undecided: facets
+                .undecided()
+                .iter()
+                .map(brokk_bifrost_rql::schema::reference_kind_label)
+                .collect(),
+        }
+    }
+}
+
 #[cfg_attr(feature = "query-result-fixtures", derive(Default))]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryReferenceSite {
@@ -12,8 +37,7 @@ pub struct CodeQueryReferenceSite {
     pub enclosing_declaration: Option<CodeQueryDeclaration>,
     pub usage_kind: &'static str,
     pub proof: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference_kind: Option<&'static str>,
+    pub reference_facets: CodeQueryReferenceFacets,
 }
 
 /// One classified identifier position.
@@ -81,7 +105,18 @@ pub struct CodeQueryCallSite {
     pub range: CodeQueryRange,
     pub callee_range: CodeQueryRange,
     pub caller: CodeQueryDeclaration,
-    pub callee: CodeQueryDeclaration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fq_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_reason: Option<String>,
+    pub completeness: &'static str,
+    pub coverage: &'static str,
     pub call_kind: &'static str,
     pub proof: &'static str,
     /// Structured receiver syntax for the call. `this` is kept distinct from
@@ -207,6 +242,8 @@ pub struct CodeQueryReceiverAnalysis {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CodeQueryMemberTarget {
     pub id: String,
+    pub member_form: Option<&'static str>,
+    pub trivial_property: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -560,8 +597,16 @@ pub struct CodeQueryDispatchTarget {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_ast_id: Option<String>,
     pub path: String,
+    /// Source range of the call that selected this target arm.
+    pub range: CodeQueryRange,
+    /// Stable identity of the structural root that reached this call.
+    pub root_id: String,
     /// Zero-based position of this arm among the site's retained arms.
     pub ordinal: usize,
+    /// Number of target arms in this exact answer, only when candidate
+    /// coverage is exhaustive. Absent for open or truncated sets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<usize>,
     /// The arm's semantic identity: a domain-separated digest over the
     /// target's artifact fingerprint and semantic locator. Never an arena id.
     pub target_id: String,
@@ -591,6 +636,9 @@ pub struct CodeQueryDispatchTarget {
     /// materialized candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boundary_kind: Option<&'static str>,
+    /// Stable label of the oracle's typed partial boundary cause, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_reason: Option<&'static str>,
 }
 
 /// The mandatory terminal row for one member's canonical method family
@@ -1608,6 +1656,9 @@ pub struct CodeQueryAssignmentRelation {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[schemars(default)]
     pub replacement_events: Vec<CodeQueryStateEventRef>,
+    /// First reachable explicit source read when write liveness is Live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_event: Option<CodeQueryStateEventRef>,
 }
 
 /// One value transferred from a detached task's call site into its body.

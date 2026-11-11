@@ -384,9 +384,7 @@ impl PythonRuntimeProviderContext<'_> {
             limits,
             Some(cancellation),
         );
-        if report.cancelled
-            || !report.complete
-            || !report.scope_complete
+        if !report.complete()
             || report.suppressed_diagnostics != 0
             || report.suppressed_frontiers != 0
             || report.artifacts.len() != artifacts.len()
@@ -713,14 +711,14 @@ fn package_initializer_frontier_matches_binding(
 
 #[derive(Debug)]
 pub(crate) struct PythonRuntimeLookupRows {
-    scopes: Vec<stored::PythonRuntimeScopeRow>,
+    pub(crate) scopes: Vec<stored::PythonRuntimeScopeRow>,
     pub(crate) has_scope_ambiguity: bool,
     pub(crate) unresolved_scopes: Vec<stored::PythonRuntimeScopeRow>,
     pub(crate) candidates: Vec<stored::PythonRuntimeProviderCandidateRow>,
 }
 
 pub(crate) fn python_runtime_provider_lookup(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: stored::PythonRuntimeAcquisitionId,
     snapshot: &WorkspaceSnapshotId,
     source: &Path,
@@ -776,7 +774,7 @@ pub(crate) fn python_runtime_provider_lookup(
 }
 
 fn python_runtime_artifacts_for_environment(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: stored::PythonRuntimeAcquisitionId,
     environment: i64,
 ) -> Result<Vec<PythonRuntimeArtifactInventory>, StoreError> {
@@ -798,7 +796,7 @@ fn python_runtime_artifacts_for_environment(
 }
 
 fn python_runtime_artifact_member_inventory(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: stored::PythonRuntimeAcquisitionId,
     artifact: i64,
 ) -> Result<Vec<stored::PythonRuntimeArtifactMemberRow>, StoreError> {
@@ -812,7 +810,7 @@ fn python_runtime_artifact_member_inventory(
 }
 
 fn python_runtime_scope_frontiers(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     id: stored::PythonRuntimeAcquisitionId,
     environment: i64,
     import: &str,

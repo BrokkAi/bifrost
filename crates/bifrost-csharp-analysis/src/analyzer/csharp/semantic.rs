@@ -26,6 +26,7 @@ use brokk_bifrost_semantic::analyzer::semantic::lowering::unique_map_value;
 use tree_sitter::Node;
 
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use brokk_bifrost_analysis::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
@@ -66,6 +67,7 @@ use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::tree_walk::parent_if_field;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_csharp::graph_support::csharp_enclosing_namespace_path;
+use brokk_bifrost_csharp::namespace_regions::CSharpFileScopedNamespaces;
 use brokk_bifrost_csharp::structural::first_argument_value;
 use brokk_bifrost_csharp::syntax::{
     csharp_accessor_owner, csharp_has_modifier as has_modifier,
@@ -170,7 +172,23 @@ fn compound_division_can_throw(context: CSharpCompoundContext) -> bool {
 // #8708: publish captured lexical cells in the enclosing procedure.
 // #8717: array initializers record that their elements are not stored.
 // #8803: constructed expressions need conversion proofs before preserving identity.
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v41";
+// #9270: yield return retains its partial normal continuation and disposal gaps.
+// #9447: structured formal roles and refusal change semantic payloads.
+// #9651: a store to a declared slot with a decided conversion records no
+// accessor gap.
+// #10394: an over-cap struct copy publishes its slot limit as budget data.
+// #9408: a qualified type name resolves to its same-file declaration.
+// #9408: a qualified path declines through an inaccessible nested type.
+// #10270: target-typed `new()` becomes a structural call fact, which shifts the
+// StructuralNodeIndex identities that call-point mapping reads.
+// #10270 under the 2026-11-07 lever rule: master is at v45 (#10394), so #10270
+// takes v46.
+// #10270 final merge: master is at v47 (#9408), so #10270 takes v48.
+// #9402: an unresolved member is keyed by its name within the procedure.
+// #8299: a typed local whose initializer this file cannot type keeps its value
+// and records a residual-conversion gap instead of an unknown conversion call.
+// Merge of master v49 (#9402) with #8299 v49: max of both sides + 1 gives v50.
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v50";
 
 /// How many declared slots one value-type copy duplicates.
 ///
@@ -178,9 +196,47 @@ const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v41";
 /// more slots than this keeps a typed decline rather than growing the graph.
 const CSHARP_MAX_COPIED_SLOTS: usize = 32;
 
-impl_program_semantics_provider!(CSharpAnalyzer, CSharpSemanticLowerer);
+impl_program_semantics_provider!(CSharpAnalyzer, |analyzer| analyzer
+    .inner
+    .adapter()
+    .semantic_lowerer());
 
-pub(crate) struct CSharpSemanticLowerer;
+#[derive(Clone, Copy)]
+pub(crate) struct CSharpSemanticLowerer {
+    trial: bool,
+}
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+pub(crate) const CSharpSemanticLowerer: CSharpSemanticLowerer =
+    CSharpSemanticLowerer { trial: false };
+
+static PLAIN_LOWERER: CSharpSemanticLowerer = CSharpSemanticLowerer { trial: false };
+static TRIAL_LOWERER: CSharpSemanticLowerer = CSharpSemanticLowerer { trial: true };
+
+impl CSharpSemanticLowerer {
+    pub(crate) fn for_trial(
+        trial: brokk_bifrost_core::analyzer::config::CSharpNativeTrial,
+    ) -> Self {
+        if trial.is_on() {
+            TRIAL_LOWERER
+        } else {
+            PLAIN_LOWERER
+        }
+    }
+
+    pub(crate) fn as_static(&self) -> &'static Self {
+        if self.trial {
+            &TRIAL_LOWERER
+        } else {
+            &PLAIN_LOWERER
+        }
+    }
+
+    pub(crate) fn plain() -> &'static Self {
+        &PLAIN_LOWERER
+    }
+}
 
 impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -191,7 +247,11 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
         SemanticAdapterIdentity::for_adapter(
             "csharp",
             ADAPTER_VERSION,
-            b"csharp-intrafile-execution-defaults-v1",
+            if self.trial {
+                b"csharp-intrafile-execution-defaults-v1-native-trial".as_slice()
+            } else {
+                b"csharp-intrafile-execution-defaults-v1".as_slice()
+            },
             DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
         )
     }
@@ -770,6 +830,56 @@ struct CSharpTypeDeclaration {
 /// it must decline -- the same collapse [`MemberDeclarations`] performs.
 type TypeDeclarations = HashMap<Box<str>, Option<CSharpTypeDeclaration>>;
 
+/// Type declarations by their full path: the namespace segments, every
+/// enclosing type's name, then the type's own name. This is how a qualified
+/// occurrence such as `Probe.StartInfo` or `Outer.Inner` names a type.
+///
+/// A `None` value records a path that names no single non-generic
+/// declaration: two declarations claim it (a `partial` type, as for
+/// [`TypeDeclarations`]), or the type or an enclosing type is generic, so an
+/// identifier-only spelling of it is a different arity.
+type QualifiedTypeDeclarations = HashMap<Box<[Box<str>]>, Option<usize>>;
+
+/// What a qualified type name is resolved against.
+#[derive(Debug, Default)]
+struct CSharpQualifiedTypes {
+    declarations: QualifiedTypeDeclarations,
+    /// Every proper prefix of a key in `declarations`: the namespaces and the
+    /// enclosing types this file declares. A qualified occurrence binds its
+    /// first segment in the innermost scope that declares that name.
+    prefixes: HashSet<Box<[Box<str>]>>,
+    /// Each type declaration as a lookup scope for a qualified name's first
+    /// segment, keyed by its start byte.
+    scopes: HashMap<usize, CSharpTypeScope>,
+    /// Nested types that are neither `public` nor `internal`, by full path,
+    /// with the start byte of the type that declares them. Outside that type
+    /// C# member lookup skips such a type and may find an accessible inherited
+    /// one instead, which this file does not model. `None` records a path
+    /// that more than one container claims.
+    restricted: HashMap<Box<[Box<str>]>, Option<usize>>,
+}
+
+/// One type declaration as a scope that a qualified name's first segment is
+/// looked up in.
+#[derive(Debug)]
+struct CSharpTypeScope {
+    path: Box<[Box<str>]>,
+    /// A `partial` type declares nested types elsewhere too.
+    partial: bool,
+    /// Whether the declaration has a base list, through which it may inherit
+    /// nested types.
+    inherits: bool,
+}
+
+/// What one scope says about a qualified name's first segment.
+enum CSharpScopeLookup {
+    /// The scope declares it; the path continues from here.
+    Declared(Vec<Box<str>>),
+    Absent,
+    /// The scope might declare it in source this file cannot see.
+    Unknown,
+}
+
 /// One exact ordinary static callable and its declared parameter types.
 #[derive(Debug)]
 struct CSharpStaticCallable {
@@ -795,6 +905,7 @@ struct CSharpTypeIndex {
     /// Interned only while this file is lowered; no workspace-wide index.
     unresolved: std::cell::RefCell<CSharpUnresolvedTypes>,
     declarations: TypeDeclarations,
+    qualified: CSharpQualifiedTypes,
     /// Names bound by a `using X = ...;` alias anywhere in this file.
     aliases: HashSet<Box<str>>,
     /// Direct base types keyed by the source declaration that names them.
@@ -1017,7 +1128,10 @@ impl CSharpTypeIndex {
                     },
                 )
             }
-            "generic_name" | "qualified_name" | "alias_qualified_name" => {
+            "qualified_name" => self
+                .qualified_declaration(current, source)
+                .or_else(|| self.unresolved_name(current, source, arguments)),
+            "generic_name" | "alias_qualified_name" => {
                 self.unresolved_name(current, source, arguments)
             }
             _ => None,
@@ -1048,6 +1162,133 @@ impl CSharpTypeIndex {
             }
         }
         Some(identity)
+    }
+
+    /// The declaration in this file a dotted name of plain identifiers names.
+    ///
+    /// C# binds the first segment in the innermost scope that declares it:
+    /// each enclosing type, then each enclosing namespace outward, then the
+    /// global namespace. Once a scope of this file declares the first segment,
+    /// the rest of the name must follow from there or the name declines; a
+    /// scope further out is not consulted. A name whose first segment is an
+    /// alias or a type parameter, or that only another file declares,
+    /// declines, which leaves the scoped unresolved identity (#9408).
+    fn qualified_declaration(&self, node: Node<'_>, source: &str) -> Option<CSharpTypeIdentity> {
+        let mut segments = Vec::new();
+        let mut current = node;
+        loop {
+            match current.kind() {
+                "qualified_name" => {
+                    let name = current
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "identifier")?;
+                    segments.push(Box::<str>::from(nonempty_node_text(source, name)?));
+                    current = current.child_by_field_name("qualifier")?;
+                }
+                "identifier" => {
+                    segments.push(Box::<str>::from(nonempty_node_text(source, current)?));
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        segments.reverse();
+        let first = &segments[0];
+        if self.aliases.contains(first) || type_parameter_binds(node, first, source) {
+            return None;
+        }
+        let mut bound = None;
+        let mut owner = scope_type_node(node);
+        while let Some(declaration) = owner {
+            match self.type_scope_lookup(declaration.start_byte(), first) {
+                CSharpScopeLookup::Declared(path) => {
+                    bound = Some(path);
+                    break;
+                }
+                CSharpScopeLookup::Absent => owner = enclosing_type_node(declaration),
+                CSharpScopeLookup::Unknown => return None,
+            }
+        }
+        if bound.is_none() {
+            let namespace = enclosing_namespace_path(source, node);
+            let importing = namespace_levels_with_usings(node, namespace.len(), source);
+            for length in (0..=namespace.len()).rev() {
+                let mut path = namespace[..length].to_vec();
+                path.push(first.clone());
+                if self.declares_path(&path) {
+                    bound = Some(path);
+                    break;
+                }
+                // A `using` in this namespace body is consulted before the
+                // next namespace out, and what it imports is not in view.
+                if importing.contains(&length) {
+                    return None;
+                }
+            }
+        }
+        let mut path = bound?;
+        path.extend(segments[1..].iter().cloned());
+        // Each trailing segment is a member lookup in the type before it, and
+        // that lookup sees only accessible nested types. Decline unless every
+        // restricted type on the path is used inside the type that declares it.
+        let accessible =
+            (1..=path.len()).all(
+                |length| match self.qualified.restricted.get(&path[..length]) {
+                    None => true,
+                    Some(None) => false,
+                    Some(Some(container)) => {
+                        let mut current = scope_type_node(node);
+                        while let Some(owner) = current {
+                            if owner.start_byte() == *container {
+                                return true;
+                            }
+                            current = enclosing_type_node(owner);
+                        }
+                        false
+                    }
+                },
+            );
+        if !accessible {
+            return None;
+        }
+        let start_byte = self
+            .qualified
+            .declarations
+            .get(path.as_slice())
+            .copied()
+            .flatten()?;
+        self.declared_at(start_byte)
+    }
+
+    fn declares_path(&self, path: &[Box<str>]) -> bool {
+        self.qualified.prefixes.contains(path) || self.qualified.declarations.contains_key(path)
+    }
+
+    /// Look `first` up among the nested types of the type declared at
+    /// `owner`. Every nested type is accessible inside the type that declares
+    /// it, so its own declarations answer directly.
+    ///
+    /// A type with a base list may also bring inherited nested types into
+    /// scope, subject to which bases count for its kind (base classes for a
+    /// class, base interfaces only for an interface) and to accessibility.
+    /// This lookup does not model those rules, and a `partial` type declares
+    /// nested types elsewhere, so either answer is unknown.
+    fn type_scope_lookup(&self, owner: usize, first: &str) -> CSharpScopeLookup {
+        let Some(scope) = self.qualified.scopes.get(&owner) else {
+            return CSharpScopeLookup::Unknown;
+        };
+        if scope.partial {
+            return CSharpScopeLookup::Unknown;
+        }
+        let mut path = scope.path.to_vec();
+        path.push(Box::from(first));
+        if self.declares_path(&path) {
+            CSharpScopeLookup::Declared(path)
+        } else if scope.inherits {
+            CSharpScopeLookup::Unknown
+        } else {
+            CSharpScopeLookup::Absent
+        }
     }
 
     /// A lossless spelling for inferred predefined types and their arrays.
@@ -1196,7 +1437,7 @@ fn declaration_is_visible_from(
     source: &str,
 ) -> bool {
     if let Some(container) = declaration.container {
-        let mut current = enclosing_type_node(node);
+        let mut current = scope_type_node(node);
         while let Some(owner) = current {
             if owner.start_byte() == container {
                 return true;
@@ -1212,6 +1453,62 @@ fn declaration_is_visible_from(
             .iter()
             .zip(occurrence.iter())
             .all(|(declared, enclosing)| declared == enclosing)
+}
+
+/// A type declaration's full path, and whether it or an enclosing type is
+/// generic: the namespace segments, every enclosing type's name outermost
+/// first, then its own name. `None` when a declaration on the way has no name.
+fn qualified_type_path(node: Node<'_>, source: &str) -> Option<(Vec<Box<str>>, bool)> {
+    let mut names = Vec::new();
+    let mut generic = false;
+    let mut current = Some(node);
+    while let Some(declaration) = current {
+        names.push(declaration_container_name(source, declaration)?);
+        generic |= named_children(declaration)
+            .into_iter()
+            .any(|child| child.kind() == "type_parameter_list");
+        current = enclosing_type_node(declaration);
+    }
+    let mut path = enclosing_namespace_path(source, node).into_vec();
+    path.extend(names.into_iter().rev());
+    Some((path, generic))
+}
+
+/// The namespace depths, counted in segments, whose namespace body around
+/// `node` holds a `using` directive. `depth` is the length of the occurrence's
+/// namespace path. A file-scoped namespace takes every top-level directive,
+/// including those that apply at the global level, which only declines more.
+fn namespace_levels_with_usings(node: Node<'_>, depth: usize, source: &str) -> Vec<usize> {
+    let has_using = |container: Node<'_>| {
+        named_children(container).into_iter().any(|child| {
+            child.kind() == "using_directive"
+                || (child.kind() == "declaration_list"
+                    && named_children(child)
+                        .into_iter()
+                        .any(|entry| entry.kind() == "using_directive"))
+        })
+    };
+    let mut levels = Vec::new();
+    let mut remaining = depth;
+    let mut root = node;
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "namespace_declaration" {
+            if has_using(ancestor) {
+                levels.push(remaining);
+            }
+            let segments = ancestor.child_by_field_name("name").map_or(0, |name| {
+                brokk_bifrost_csharp::syntax::csharp_type_node_segments(name, source).len()
+            });
+            remaining = remaining.saturating_sub(segments);
+        }
+        root = ancestor;
+        current = ancestor.parent();
+    }
+    if remaining > 0 && has_using(root) {
+        levels.push(remaining);
+    }
+    levels
 }
 
 /// One `implicit`/`explicit operator` declaration whose source and target
@@ -1250,6 +1547,7 @@ struct PendingConversionOperator<'tree> {
 /// row starts inexact for them and a copy of that type keeps a typed decline.
 fn record_type_declaration(
     types: &mut TypeDeclarations,
+    qualified: &mut CSharpQualifiedTypes,
     members: &mut HashMap<usize, CSharpTypeMembers>,
     kinds: &mut HashMap<usize, CSharpDeclaredTypeKind>,
     node: Node<'_>,
@@ -1284,6 +1582,42 @@ fn record_type_declaration(
         namespace: enclosing_namespace_path(source, node),
     };
     kinds.insert(node.start_byte(), kind);
+    if let Some((path, generic)) = qualified_type_path(node, source) {
+        if let Some(container) = declaration.container
+            && !has_modifier(source, node, "public")
+            && !has_modifier(source, node, "internal")
+        {
+            match qualified.restricted.entry(path.clone().into_boxed_slice()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(container));
+                }
+            }
+        }
+        for length in 1..path.len() {
+            qualified.prefixes.insert(Box::from(&path[..length]));
+        }
+        qualified.scopes.insert(
+            node.start_byte(),
+            CSharpTypeScope {
+                path: path.clone().into_boxed_slice(),
+                partial: has_modifier(source, node, "partial"),
+                inherits: named_children(node)
+                    .into_iter()
+                    .any(|child| child.kind() == "base_list"),
+            },
+        );
+        match qualified.declarations.entry(path.into_boxed_slice()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((!generic).then_some(node.start_byte()));
+            }
+        }
+    }
     members.insert(
         node.start_byte(),
         CSharpTypeMembers {
@@ -1521,6 +1855,7 @@ fn enumerate_procedures<'tree>(
     }
     let mut type_receiver_shadows = TypeReceiverShadowIndex::default();
     let mut type_declarations = TypeDeclarations::default();
+    let mut qualified_types = CSharpQualifiedTypes::default();
     let mut type_aliases = HashSet::<Box<str>>::default();
     let mut type_members = HashMap::<usize, CSharpTypeMembers>::default();
     let mut type_kinds = HashMap::<usize, CSharpDeclaredTypeKind>::default();
@@ -1570,6 +1905,7 @@ fn enumerate_procedures<'tree>(
         }
         record_type_declaration(
             &mut type_declarations,
+            &mut qualified_types,
             &mut type_members,
             &mut type_kinds,
             frame.node,
@@ -1659,6 +1995,7 @@ fn enumerate_procedures<'tree>(
         array_elements: Default::default(),
         unresolved: Default::default(),
         declarations: type_declarations,
+        qualified: qualified_types,
         aliases: type_aliases,
         base_types: HashMap::default(),
         members: type_members,
@@ -1844,9 +2181,9 @@ fn file_scoped_namespace_path(
     root: Node<'_>,
     inventory: &mut ProcedureInventoryBuilder<'_>,
 ) -> Result<usize, SemanticProviderError> {
-    let Some(namespace) = named_children(root)
-        .into_iter()
-        .find(|child| child.kind() == "file_scoped_namespace_declaration")
+    let Some(namespace) = CSharpFileScopedNamespaces::from_root(root, || true)
+        .expect("an unbounded walk completes")
+        .first()
     else {
         return Ok(inventory.root_path());
     };
@@ -2314,6 +2651,15 @@ struct LoweringContext<'tree, 'targets> {
     /// two occurrences of `values[0]` must share one index value or they
     /// address two different elements. Java canonicalizes the same way.
     constant_index_values: HashMap<Box<str>, ValueId>,
+    /// The anchor each member name this file cannot resolve is keyed by: the
+    /// name's first occurrence in this procedure (#9402).
+    ///
+    /// Occurrence anchors would give `a.Query` and `b.Query` two member
+    /// identities, so a store through one alias and a load through another
+    /// would look disjoint. Keyed by name, every occurrence agrees, and the
+    /// query-time member-identity discharge proves that the name names one
+    /// declaration in this procedure before it retires the location's gap.
+    unresolved_member_anchors: HashMap<Box<str>, SourceAnchor>,
     callable_type_parameters: HashSet<Box<str>>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
@@ -2356,6 +2702,10 @@ struct MemoryTarget {
     location: MemoryLocationId,
     kind: MemoryAccessKind,
     resolved: bool,
+    /// Whether the target is an instance slot this file declares on the
+    /// accessed type: a field, an auto-property or a field-like event. A
+    /// store to a slot runs no accessor (#9651).
+    slot: bool,
 }
 
 struct ObjectInitializerStore {
@@ -2425,6 +2775,7 @@ fn lower_procedure<'tree, 'targets>(
         structural_node_index,
         return_type: callable_return_type(spec.callable),
         constant_index_values: HashMap::default(),
+        unresolved_member_anchors: HashMap::default(),
         callable_type_parameters: callable_type_parameter_names(spec.callable, prepared.source()),
         session,
         expression_values: HashMap::default(),
@@ -2443,7 +2794,13 @@ fn lower_procedure<'tree, 'targets>(
         is_async: spec.properties.is_async,
         awaited_calls: HashMap::default(),
     };
-    context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.emit_procedure_inputs(
+        &mut builder,
+        entry,
+        spec.callable,
+        spec.kind,
+        spec.properties,
+    )?;
     context.emit_capture_inputs(&mut builder, spec, entry)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
     context.resolve_implicit_local_types();
@@ -2689,6 +3046,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
         procedure_kind: ProcedureKind,
         properties: ProcedureProperties,
@@ -2698,27 +3056,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 builder.prospective_work(),
             )));
         }
-        let layout =
-            formal_parameter_slots_for_owner(Language::CSharp, callable, self.prepared.source())
-                .unwrap_or_default();
+        let layout = formal_parameter_slots_for_owner_with_nodes(
+            Language::CSharp,
+            callable,
+            self.prepared.source(),
+        );
         if self.session.cancellation().is_cancelled() {
             return Err(CSharpLoweringError::Cancelled(Box::new(
                 builder.prospective_work(),
             )));
         }
+        let slots = match layout {
+            Some(slots) => slots,
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "C# callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
+        };
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
+        for (slot, node) in slots {
             if self.session.cancellation().is_cancelled() {
                 return Err(CSharpLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            let node = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
             let metadata = self.session.add_value_mapping(builder, node)?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
@@ -2726,7 +3094,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: true },
+                    SemanticValueKind::Receiver {
+                        dispatch: true,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(value);
                 value
@@ -2789,7 +3160,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?);
         }
         if let Some(receiver) = self.receiver {
@@ -3197,17 +3571,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         name: &str,
         access: Node<'tree>,
     ) -> Option<MemberDeclaration> {
-        if let Some(owner) = self.expression_type_identity(base)
-            && let Some(member) = self.type_index.member(owner, name)
-        {
-            return Some(MemberDeclaration {
-                anchor: member.anchor,
-                is_static: false,
-                type_spelling: member.type_spelling.clone(),
-            });
-        }
-        self.access_owner_type(base)
-            .and_then(|owner| self.member_declaration_for(&owner, name, access))
+        self.expression_type_identity(base)
+            .and_then(|owner| self.instance_member_declaration(owner, name))
+            .or_else(|| {
+                self.access_owner_type(base)
+                    .and_then(|owner| self.member_declaration_for(&owner, name, access))
+            })
+    }
+
+    /// The instance slot `name` that the type identity `owner` declares, as a
+    /// member declaration. The identity already settled which type the
+    /// occurrence names, however it was spelled.
+    fn instance_member_declaration(
+        &self,
+        owner: CSharpTypeIdentity,
+        name: &str,
+    ) -> Option<MemberDeclaration> {
+        let member = self.type_index.member(owner, name)?;
+        Some(MemberDeclaration {
+            anchor: member.anchor,
+            is_static: false,
+            type_spelling: member.type_spelling.clone(),
+        })
     }
 
     fn type_node_identity(&self, node: Node<'tree>) -> Option<CSharpTypeIdentity> {
@@ -3449,6 +3834,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None if preservation
                 .unwrap_or_else(|| self.identity_is_preserved(declared, operand)) =>
             {
+                Ok((
+                    point,
+                    Some((point, source)),
+                    ImplicitConversionDecision::Preserved,
+                ))
+            }
+            // A local declared with a named type and initialized from a value
+            // this file cannot type (`string tool = Request.ReadInput();`)
+            // runs no user code exactly when the value already has the declared
+            // type. Only the workspace resolver can tell, so the value keeps its
+            // identity here and the conversion stays an obligation the
+            // language's query-time proof discharges (#8299). Undischarged, it
+            // leaves the value and any code a conversion could run open.
+            None if super::residual_conversion::residual_declarator_type(operand).is_some() => {
+                self.session.add_gap_with_impacts_and_discharge(
+                    builder,
+                    point,
+                    SemanticGapSubject::Value(target),
+                    SemanticCapability::Values,
+                    SemanticGapImpacts::DEFERRED_EFFECTS,
+                    SemanticGapKind::Unknown,
+                    SemanticGapDischarge::ResidualConversion,
+                    "C# implicit conversion of the initializer to the declared local type is not proven to be an identity",
+                )?;
                 Ok((
                     point,
                     Some((point, source)),
@@ -4595,7 +5004,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     return Ok(None);
                 };
                 let base = self.receiver;
-                self.declared_member_location(builder, point, access, Some(declaration), base)
+                let slot = node_text(self.prepared.source(), access).is_some_and(|name| {
+                    enclosing_type_node(access)
+                        .and_then(|owner| self.type_index.declared_at(owner.start_byte()))
+                        .and_then(|owner| self.type_index.member(owner, name))
+                        .is_some()
+                });
+                Ok(self
+                    .declared_member_location(builder, point, access, Some(declaration), base)?
+                    .map(|target| MemoryTarget { slot, ..target }))
             }
             _ => Ok(None),
         }
@@ -4651,7 +5068,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             };
             Some(base_value)
         };
-        self.declared_member_location(builder, point, name_node, declaration, base_value)
+        let slot = self
+            .expression_type_identity(base)
+            .and_then(|owner| self.type_index.member(owner, &name))
+            .is_some();
+        Ok(self
+            .declared_member_location(builder, point, name_node, declaration, base_value)?
+            .map(|target| MemoryTarget { slot, ..target }))
     }
 
     /// The location of a member named at `name_node`, addressed through
@@ -4680,6 +5103,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 location,
                 kind: MemoryAccessKind::Static,
                 resolved: true,
+                slot: false,
             }));
         }
         let Some(base_value) = base_value else {
@@ -4697,6 +5121,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             location,
             kind: MemoryAccessKind::Field,
             resolved: declaration.is_some(),
+            slot: false,
         }))
     }
 
@@ -4760,6 +5185,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 && subscript.is_some_and(|subscript| {
                     expression_value_kind(self.prepared.source(), subscript).is_constant()
                 }),
+            slot: false,
         }))
     }
 
@@ -4903,15 +5329,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
     /// Anchor a member location to its *declaration* when one is known, so two
     /// occurrences of the same member agree on one identity, and to the
-    /// occurrence otherwise.
+    /// member name's first occurrence in this procedure otherwise.
     fn member_locator(
-        &self,
+        &mut self,
         occurrence: Node<'tree>,
         declaration: Option<&MemberDeclaration>,
     ) -> Result<SemanticLocator, CSharpLoweringError> {
         let anchor = match declaration {
             Some(declaration) => declaration.anchor,
-            None => source_anchor(occurrence, 0).map_err(CSharpLoweringError::Invalid)?,
+            None => {
+                let anchor = source_anchor(occurrence, 0).map_err(CSharpLoweringError::Invalid)?;
+                let name = nonempty_node_text(self.prepared.source(), occurrence)
+                    .expect("a member location names a nonempty member");
+                *self
+                    .unresolved_member_anchors
+                    .entry(Box::from(name))
+                    .or_insert(anchor)
+            }
         };
         let procedure = self.session.locator();
         Ok(procedure.memory_location_at(anchor))
@@ -5071,12 +5505,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let exact = storage.exact;
         let slots = storage.members.clone();
         if slots.len() > CSHARP_MAX_COPIED_SLOTS {
-            return self.session.record_gap(
+            return self.session.record_exceeded_budget_gap(
                 builder,
                 point,
                 SemanticGapSubject::Value(target),
                 SemanticCapability::FieldMemory,
-                SemanticGapKind::ExceededBudget,
+                SemanticBudgetExceeded::new(
+                    SemanticBudgetDimension::MemoryLocations,
+                    CSHARP_MAX_COPIED_SLOTS,
+                    slots.len(),
+                ),
                 "value-type copy holds more declared slots than one copy duplicates",
             );
         }
@@ -5160,10 +5598,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(name) = nonempty_node_text(self.prepared.source(), name_node) else {
             return Ok(None);
         };
-        let declaration = creation
-            .child_by_field_name("type")
-            .and_then(|created| declared_type_spelling(created, self.prepared.source()))
-            .and_then(|owner| self.member_declaration_for(&owner, name, creation));
+        let created = creation.child_by_field_name("type");
+        let owner = created.and_then(|ty| self.type_node_identity(ty));
+        let declaration = owner
+            .and_then(|owner| self.instance_member_declaration(owner, name))
+            .or_else(|| {
+                created
+                    .and_then(|created| declared_type_spelling(created, self.prepared.source()))
+                    .and_then(|owner| self.member_declaration_for(&owner, name, creation))
+            });
         // A `static` member has no per-object slot, so an initializer cannot
         // name one; declining keeps the write out of the heap stratum.
         if declaration
@@ -5175,9 +5618,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let declared = declaration
             .as_ref()
             .and_then(|declaration| declaration.type_spelling.clone());
-        let destination = creation
-            .child_by_field_name("type")
-            .and_then(|ty| self.type_node_identity(ty))
+        let destination = owner
             .and_then(|owner| self.type_index.member(owner, name))
             .and_then(|member| member.type_identity);
         let base = self.expression_value(
@@ -5196,6 +5637,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 location,
                 kind: MemoryAccessKind::Field,
                 resolved: declaration.is_some(),
+                slot: false,
             },
             destination,
             declared,
@@ -5852,6 +6294,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Some(assigned),
                 stack,
             )?;
+            // A decided conversion is either built in or publishes its own
+            // operator call, so only an undecided one or an accessor can run
+            // unrecorded code here.
+            let unrecorded_code = !store.slot
+                || matches!(
+                    decision,
+                    ImplicitConversionDecision::Unknown | ImplicitConversionDecision::Ref
+                );
             if matches!(decision, ImplicitConversionDecision::Carry(..)) {
                 self.publish_implicit_conversion(
                     builder,
@@ -5863,11 +6313,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     ValueFlowKind::Local,
                 )?;
             }
-            self.session.record_gap(
-                builder, continuation, SemanticGapSubject::Point,
-                SemanticCapability::Calls, SemanticGapKind::Unknown,
-                "assignment target accessors and overloaded assignment conversions require type refinement",
-            )?;
+            if unrecorded_code {
+                self.session.record_gap(
+                    builder, continuation, SemanticGapSubject::Point,
+                    SemanticCapability::Calls, SemanticGapKind::Unknown,
+                    "assignment target accessors and overloaded assignment conversions require type refinement",
+                )?;
+            }
             self.implicit_abort_route(builder, node, continuation, scope, stack)?;
             self.emit_memory_store(builder, continuation, store, assigned)?;
             if let Some(result) = result {
@@ -5898,6 +6350,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "C# assignment result identity is unavailable until implicit conversion resolution is available",
             )?;
         }
+        // Reaching here with a store means the value's identity is
+        // preserved, so no conversion runs and only an accessor could.
+        let accessor_may_run = store.as_ref().is_none_or(|store| !store.slot);
         if let Some(store) = store {
             self.emit_memory_store(builder, point, store, value)?;
         } else {
@@ -5907,11 +6362,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "tuple, deconstruction, and ref assignment targets are not yet lowered into memory flow",
             )?;
         }
-        self.session.record_gap(
-            builder, point, SemanticGapSubject::Point,
-            SemanticCapability::Calls, SemanticGapKind::Unknown,
-            "assignment target accessors and overloaded assignment conversions require type refinement",
-        )?;
+        if accessor_may_run {
+            self.session.record_gap(
+                builder, point, SemanticGapSubject::Point,
+                SemanticCapability::Calls, SemanticGapKind::Unknown,
+                "assignment target accessors and overloaded assignment conversions require type refinement",
+            )?;
+        }
         self.implicit_abort_route(builder, node, point, scope, stack)?;
         Ok(point)
     }
@@ -6538,12 +6995,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.abrupt(builder, terminal, scope, CompletionKind::Throw, None, stack)
             }
             "yield_statement" => {
-                let value_node = first_named_child(node);
+                let value_node = if has_direct_token(node, "return") && !node.has_error() {
+                    first_named_child(node)
+                } else {
+                    None
+                };
                 let terminal = if value_node.is_some() {
                     self.session.add_node_point(builder, node, Vec::new())?
                 } else {
                     entry
                 };
+                if let Some(value_node) = value_node {
+                    self.session.add_partial_generator_normal_continuation(
+                        builder,
+                        terminal,
+                        next,
+                        "yield suspension and resumption are not lowered",
+                    )?;
+                    self.session.record_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ResourceManagement,
+                        SemanticGapKind::Unsupported,
+                        "early iterator disposal and enclosing finally cleanup are not lowered",
+                    )?;
+                    stack.push(Work::Expression {
+                        node: value_node,
+                        entry,
+                        next: EdgeTarget::normal(terminal),
+                        scope,
+                    });
+                    return Ok(());
+                }
                 self.session.record_gap(
                     builder,
                     terminal,
@@ -6551,16 +7035,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticCapability::GeneratorSuspension,
                     SemanticGapKind::Unsupported,
                     "yield suspension and resumption are not lowered",
-                )?;
-                if let Some(value_node) = value_node {
-                    stack.push(Work::Expression {
-                        node: value_node,
-                        entry,
-                        next: EdgeTarget::normal(terminal),
-                        scope,
-                    });
-                }
-                Ok(())
+                )
             }
             "break_statement" | "continue_statement" => {
                 let kind = if node.kind() == "break_statement" {
@@ -10357,6 +10832,30 @@ fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
+/// The innermost type whose *body* contains `node`: the type whose nested
+/// types a name at `node` can see.
+///
+/// A type's header -- its attributes, base list, constraints and primary
+/// constructor parameters -- is outside its body, so a name there sees the
+/// enclosing type's members, not the declared type's own (C# 7.8.1). The
+/// declared type always sits in its enclosing type's body.
+fn scope_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let owner = enclosing_type_node(node)?;
+    let in_body = brokk_bifrost_core::analyzer::tree_walk::child_by_field_or_named_child_of_kinds(
+        owner,
+        "body",
+        &["declaration_list"],
+    )
+    .is_some_and(|body| {
+        body.start_byte() <= node.start_byte() && node.end_byte() <= body.end_byte()
+    });
+    if in_body {
+        Some(owner)
+    } else {
+        enclosing_type_node(owner)
+    }
+}
+
 /// The declared spelling of a type node, array ranks included.
 ///
 /// `csharp_type_node_identity` unwraps an `array_type` to its element type, so
@@ -10985,21 +11484,88 @@ mod tests {
         );
     }
 
-    fn lower(source: &str) -> Vec<ProcedureSemanticsParts> {
+    fn prepare(source: &str) -> PreparedSyntaxTree {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
         assert!(!tree.root_node().has_error());
-        let prepared = PreparedSyntaxTree::new(
+        PreparedSyntaxTree::new(
             PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
             tree,
             compute_line_starts(source),
             LanguageDialect::Standard(Language::CSharp),
             PreparedSourceOrigin::Disk,
             None,
+        )
+    }
+
+    #[test]
+    #[hardwon(
+        "#9408: a qualified base clause resolved through the declared type's own nested types"
+    )]
+    fn qualified_base_clause_resolves_outside_the_declared_type_body() {
+        // The base list is outside `X`'s body, so `Api.Net` there names the
+        // namespace's `Api.Net`, whose `operator +` makes `this + value` user
+        // code; `X.Api.Net` would make it look like built-in concatenation.
+        let source = "namespace N\n{\n    class Api { public class Net { public static string operator +(Net left, string right) { return right; } } }\n    class X : Api.Net { public class Api { public class Net { } } }\n}\n";
+        let start = |needle: &str| source.find(needle).expect("fixture text");
+        let namespace_net = start("public class Net { public static");
+        let nested_net = start("public class Net { }");
+        let bases = base_types(source, start("class X"));
+        assert_eq!(
+            bases.as_slice(),
+            [Some(CSharpTypeIdentity::Declared {
+                start_byte: namespace_net,
+                kind: CSharpDeclaredTypeKind::Reference,
+            })],
+            "nested Net starts at {nested_net}"
         );
+    }
+
+    #[test]
+    #[hardwon("#9408: a qualified name bound a private nested type that C# lookup skips")]
+    fn qualified_name_declines_a_private_nested_type_outside_its_container() {
+        // From `User`, the private `Holder.Inner` is not a candidate, so C#
+        // binds the inherited `Base.Inner.S`; the private `S` must not win.
+        let source = "namespace N\n{\n    public class Base { public class Inner { public class S { } } }\n    public class Holder : Base { private class Inner { public class S { } } class Own : Inner.S { } }\n    public class User : Holder.Inner.S { }\n}\n";
+        let start = |needle: &str| source.find(needle).expect("fixture text");
+        let private_s =
+            start("private class Inner { public class S") + "private class Inner { ".len();
+        let private_s = Some(CSharpTypeIdentity::Declared {
+            start_byte: private_s,
+            kind: CSharpDeclaredTypeKind::Reference,
+        });
+        assert_ne!(base_types(source, start("public class User")), [private_s]);
+        // Inside `Holder`, the private type is accessible and still binds.
+        assert_eq!(base_types(source, start("class Own")), [private_s]);
+    }
+
+    fn base_types(source: &str, declaration: usize) -> Vec<Option<CSharpTypeIdentity>> {
+        let prepared = prepare(source);
+        let file = ProjectFile::new(std::env::temp_dir(), "base_clause.cs");
+        let primary = brokk_bifrost_csharp::declarations::parse_csharp_file(
+            &file,
+            prepared.source(),
+            prepared.tree(),
+        );
+        let ProcedureLoweringInput::Complete { value, .. } = enumerate_procedures(
+            &file,
+            &prepared,
+            &primary,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .unwrap()
+        .into_lowering_input() else {
+            panic!("fixture enumeration must complete");
+        };
+        value.type_index.base_types[&declaration].to_vec()
+    }
+
+    fn lower(source: &str) -> Vec<ProcedureSemanticsParts> {
+        let prepared = prepare(source);
         let file = ProjectFile::new(std::env::temp_dir(), "initializer.cs");
         let SemanticOutcome::Complete {
             value: procedures, ..
@@ -11121,6 +11687,65 @@ mod tests {
                 )),
             "the argument copy must carry its declared field storage"
         );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10394: a struct copy above the slot cap published an invalid budget gap, so the whole file failed to materialize"
+    )]
+    fn aggregate_copy_over_the_slot_cap_keeps_the_file_semantically_materialized() {
+        let fields = (0..=CSHARP_MAX_COPIED_SLOTS)
+            .map(|index| format!("public string F{index};"))
+            .collect::<String>();
+        let source = format!(
+            "struct Big {{ {fields} }} class C {{ Big Run(Big input) {{ Big copy = input; return copy; }} }}"
+        );
+        let project = crate::inline_project::InlineTestProject::with_language(Language::CSharp)
+            .file("Fixture.cs", source)
+            .build();
+        let workspace = project
+            .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &project.file("Fixture.cs"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("C# semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("the artifact passes IR validation");
+        let run = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("Run")
+            })
+            .unwrap();
+        let gap = run
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.detail
+                    .starts_with("value-type copy holds more declared slots")
+            })
+            .expect("the over-cap copy keeps a typed decline");
+        let exceeded = gap
+            .budget
+            .expect("an exceeded-budget gap carries structured budget data");
+        assert_eq!(
+            exceeded.dimension(),
+            SemanticBudgetDimension::MemoryLocations
+        );
+        assert_eq!(exceeded.limit(), CSHARP_MAX_COPIED_SLOTS);
+        assert_eq!(exceeded.attempted(), CSHARP_MAX_COPIED_SLOTS + 1);
     }
 
     fn mapping_text<'s>(

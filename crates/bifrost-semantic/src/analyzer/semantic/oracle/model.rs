@@ -1621,7 +1621,8 @@ impl AbstractObject {
     }
 }
 
-/// One abstract addressable location.
+/// One abstract location of a logical referent. Its identity does not assert
+/// a unique numeric address; distinct zero-sized referents may share one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AbstractLocation {
     object: AbstractObject,
@@ -1646,7 +1647,8 @@ impl AbstractLocation {
 }
 /// Two access paths compared at one exact observation. Cross-time or
 /// cross-context questions require a separate relation rather than silently
-/// weakening this point-sensitive alias contract.
+/// weakening this point-sensitive alias contract. Disjoint answers concern
+/// logical referents, not pointer equality or distinct numeric addresses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AliasQuery {
     left: AccessPathAtPoint,

@@ -10,7 +10,7 @@ use crate::analyzer::DeclarationId;
 use crate::analyzer::Language;
 use crate::analyzer::ProjectFile;
 use crate::analyzer::Range;
-use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
+use brokk_bifrost_core::analyzer::usages::model::ReferenceFacets;
 use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 use brokk_bifrost_core::analyzer::usages::model::UsageHitSurface;
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
@@ -50,11 +50,13 @@ pub enum WithheldCallee {
 /// One canonical reference edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceEdgeRow {
+    /// Per-reference dispatch openness from the selected forward answer.
+    /// Unset is unknown, never permission to expand dispatch.
+    pub dispatch_extensibility: Option<brokk_bifrost_core::analyzer::model::DispatchExtensibility>,
     pub site: EdgeSite,
     pub target: CodeUnit,
-    /// Typed source-level classification, absent when no producer could state
-    /// one. Absence is "unclassified", never a kind.
-    pub reference_kind: Option<ReferenceKind>,
+    /// Typed source-level classification. Unproven facets remain undecided.
+    pub reference_kind: ReferenceFacets,
     pub proof: UsageProof,
     /// This exact target is one member of a closed ambiguous binding.
     /// Ranking graphs may retain it as a candidate edge while preserving the
@@ -197,6 +199,9 @@ pub enum EdgeIncompleteReason {
     /// A selected native inverse index retained an open binding, so a target's
     /// indexed incoming rows may omit additional references.
     InverseIndexResolutionIncomplete,
+    /// A selected inverse edge has an otherwise complete binding that depends
+    /// on outstanding query obligations, so its proof remains conditional.
+    InverseIndexQueryObligationsOutstanding,
     /// A selected native inverse index retained an open receiver/admission
     /// boundary, so a target's indexed incoming rows may omit another channel.
     InverseIndexAdmissionIncomplete,
@@ -262,6 +267,7 @@ impl EdgeCompleteness {
                 ),
                 EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
                 | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding
                 | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
                 | EdgeIncompleteReason::InverseIndexTargetUncovered
                 | EdgeIncompleteReason::TimeBudgetExceeded

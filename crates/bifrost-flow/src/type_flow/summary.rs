@@ -7,6 +7,7 @@
 //! root-local source ID, so the same relation can be remapped for callers that
 //! pass different class-producing values.
 
+use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
 use std::{
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
@@ -76,7 +77,10 @@ use super::{FieldSlotIndex, TypeFlowPlan};
 // computed with joining return ports must not survive that transfer change.
 // #3430 keys a guard source by what it states instead of by a per-plan
 // counter, so rows naming the old positional keys must not be restored.
-const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v17";
+// #10539 joins the alternatives of one event (the arms of a returned join)
+// instead of letting each kill the last, so a summary that lost an arm's class
+// must not be restored.
+const CLASS_SET_SUMMARY_SEMANTICS: &[u8] = b"bifrost-class-set-summary-semantics-v18";
 const CLASS_SET_SUMMARY_CONTEXT: &[u8] = b"bifrost-class-set-summary-context-v1";
 const CLASS_SET_SUMMARY_BEHAVIOR: &[u8] = b"bifrost-class-set-summary-behavior-v3";
 const CLASS_SET_SUMMARY_ATOM: &[u8] = b"bifrost-class-set-summary-atom-v1";
@@ -756,16 +760,17 @@ fn record_field_slot_compatibility(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeSummaryInputs {
     keys: Arc<[ReadKey]>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: ReadChannels,
 }
 
 impl Default for RuntimeSummaryInputs {
     fn default() -> Self {
         Self {
             keys: Arc::default(),
-            unattributed_reads: 1,
-            execution_dependences: 0,
+            channels: ReadChannels {
+                unattributed_reads: 1,
+                ..ReadChannels::default()
+            },
         }
     }
 }
@@ -776,8 +781,7 @@ impl RuntimeSummaryInputs {
             Some(reads) => Self {
                 // Summary envelopes compare their arrays; keep this publication canonical.
                 keys: reads.canonical_keys(),
-                unattributed_reads: reads.unattributed_reads(),
-                execution_dependences: reads.execution_dependences(),
+                channels: reads.channels(),
             },
             None => Self::default(),
         }
@@ -802,8 +806,7 @@ impl RuntimeSummaryInputs {
         crate::analyzer::i_analyzer::replay_shared_query_read_receipt(
             workspace.analyzer(),
             &self.keys,
-            self.unattributed_reads,
-            self.execution_dependences,
+            self.channels,
         );
     }
 }
@@ -1000,6 +1003,9 @@ impl RuntimeSummaryStore {
         summary: Arc<ClassSetProcedureSummary>,
         byte_limit: usize,
     ) -> bool {
+        if summary.inputs.channels.reuse_refused {
+            return false;
+        }
         let new_id = summary.inputs.allocation_id();
         let old_id = self.values.get(&key).map(|old| old.inputs.allocation_id());
         let removed_bytes = old_id.filter(|old| *old != new_id).map_or(0, |old| {
@@ -1926,6 +1932,7 @@ impl<'workspace, 'provider> ClassSetAcquisitionCuts<'workspace, 'provider> {
         replay_query_read_keys(
             self.workspace.analyzer(),
             selected.hydrated.dispatch_reads.iter().cloned(),
+            0,
             0,
         );
         Some(selected)
@@ -4327,7 +4334,7 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             if row.reads.iter().map(|read| &read.key).ne(reads.iter()) {
                 return Ok(None);
             }
-            replay_query_read_keys(self.workspace.analyzer(), reads.iter().cloned(), 0);
+            replay_query_read_keys(self.workspace.analyzer(), reads.iter().cloned(), 0, 0);
             let mut summary = match restore_persisted_summary(self.plan, &frame.key, &reads, row) {
                 Ok(Some(summary)) => summary,
                 Ok(None) => {
@@ -4444,6 +4451,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
         // capture's sound superset, shared by every restored row, so subsequent
         // roots inherit these inputs. No attached capture stays fail closed.
         let inputs = RuntimeSummaryInputs::capture(self.workspace);
+        if inputs.channels.reuse_refused {
+            return Ok(None);
+        }
         let root_lookup = class_set_runtime_lookup_key(&root.key);
         let publications = publications
             .into_iter()
@@ -4800,6 +4810,9 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
             }
         });
         let inputs = RuntimeSummaryInputs::capture(self.workspace);
+        if inputs.channels.reuse_refused {
+            return 0;
+        }
         projected.into_iter().fold(0usize, |published, mut row| {
             if !row.valid {
                 return published;
@@ -4855,6 +4868,12 @@ impl<'plan> PreparedClassSetSummaries<'plan> {
     }
 
     fn publish_surfaces(&mut self, cancellation: &CancellationToken) {
+        if RuntimeSummaryInputs::capture(self.workspace)
+            .channels
+            .reuse_refused
+        {
+            return;
+        }
         let mut surfaces = self.surfaces.values().cloned().collect::<Vec<_>>();
         surfaces.sort_unstable_by_key(|surface| *surface.surface_digest());
         for surface in surfaces {
@@ -6242,6 +6261,7 @@ impl PreparedClassSetSummaries<'_> {
                 exit_kind: row.exit_kind,
                 exit_fact,
                 qualities: row.qualities.clone(),
+                evidence: None,
             });
         }
         let mut reached = Vec::with_capacity(summary.reached.len());
@@ -6266,6 +6286,7 @@ impl PreparedClassSetSummaries<'_> {
                 point,
                 fact,
                 qualities: row.qualities.clone(),
+                evidence: None,
             });
         }
         Ok(Some(ReusableProcedureSummary {
@@ -6496,12 +6517,13 @@ mod tests {
     ) {
         let adapter =
             type_flow_adapter(Language::Python).expect("Python registers a type-flow adapter");
-        runtime_fixture_from_project_with_adapter(project, adapter)
+        runtime_fixture_from_project_with_adapter(project, adapter, "app.py")
     }
 
     fn runtime_fixture_from_project_with_adapter(
         project: BuiltInlineTestProject,
         adapter: &dyn TypeFlowAdapter,
+        fixture_file: &str,
     ) -> (
         BuiltInlineTestProject,
         WorkspaceAnalyzer,
@@ -6513,7 +6535,7 @@ mod tests {
         let mut semantic_budget = SemanticBudget::default();
         let artifact = workspace
             .materialize_program_semantics(
-                &project.file("app.py"),
+                &project.file(fixture_file),
                 &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
             )
             .expect("runtime fixture semantics materialize")
@@ -6957,7 +6979,7 @@ mod tests {
             )
             .build();
         let (_project, workspace, field_slots, procedures) =
-            runtime_fixture_from_project_with_adapter(project, &adapter);
+            runtime_fixture_from_project_with_adapter(project, &adapter, "app.py");
 
         let result = solve_runtime_root_with_adapter(
             &workspace,
@@ -6994,11 +7016,11 @@ mod tests {
         );
 
         assert!(
-            result.complete,
+            result.complete(),
             "the open-boundary solve reaches a fixed point"
         );
         assert_eq!(
-            result.persistence_status,
+            result.persistence_status(),
             TypeFlowRootPersistenceStatus::Eligible,
             "stable typed uncertainty is durable when the engine reaches a fixed point"
         );
@@ -7040,7 +7062,7 @@ mod tests {
             &mut one_pass_solver_budget,
         );
         assert_eq!(
-            one_pass.persistence_status,
+            one_pass.persistence_status(),
             TypeFlowRootPersistenceStatus::Eligible
         );
 
@@ -7070,13 +7092,13 @@ mod tests {
         );
 
         assert!(
-            fallback.complete,
+            fallback.complete(),
             "feedback returns the earlier complete result after the refinement stops; one-pass work={:?}; fallback={fallback:#?}",
             one_pass_semantic_budget.used(),
         );
         assert_eq!(result_site_shape(&fallback), result_site_shape(&one_pass));
         assert_eq!(
-            fallback.persistence_status,
+            fallback.persistence_status(),
             TypeFlowRootPersistenceStatus::Ineligible(
                 TypeFlowRootPersistenceRejection::FeedbackFallback
             )
@@ -7937,7 +7959,7 @@ mod tests {
         );
         assert_eq!(warm.class_sets, cold.class_sets);
         assert_eq!(warm.findings, cold.findings);
-        assert_eq!(warm.complete, cold.complete);
+        assert_eq!(warm.complete(), cold.complete());
     }
 
     #[test]
@@ -8196,7 +8218,7 @@ mod tests {
             )
             .build();
         let (_project, workspace, field_slots, procedures) =
-            runtime_fixture_from_project_with_adapter(project, &adapter);
+            runtime_fixture_from_project_with_adapter(project, &adapter, "app.py");
         let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
         let cold = solve_runtime_root_with_adapter(
@@ -8589,7 +8611,7 @@ mod tests {
         assert!(reused.reusable_summary_hits > 0, "{reused:#?}");
         assert_eq!(reused.class_sets, fresh.class_sets);
         assert_eq!(reused.findings, fresh.findings);
-        assert_eq!(reused.complete, fresh.complete);
+        assert_eq!(reused.complete(), fresh.complete());
 
         let known = reused
             .class_sets
@@ -10223,13 +10245,16 @@ mod tests {
                 &mut SemanticRequest::new(&mut budget, &cancellation),
             )
             .expect("the middle snapshot is available");
-        let (_, _, middle_closure) = cuts
-            .validated_surface_closure(
-                &second_procedures["middle"],
-                &middle_snapshot,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .expect("the middle surface closure validates");
+        let (middle_result, middle_reads) =
+            capture_query_reads(second_workspace.analyzer(), || {
+                cuts.validated_surface_closure(
+                    &second_procedures["middle"],
+                    &middle_snapshot,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("the middle surface closure validates")
+            });
+        let (_, _, middle_closure) = middle_result;
         for name in ["middle", "leaf"] {
             assert!(
                 middle_closure.contains_key(&second_procedures[name].durable_key()),
@@ -10261,12 +10286,31 @@ mod tests {
             "the later descendant role expands the lazy lexical edge exactly once"
         );
         let validation_work = cuts.validation_work;
-        cuts.validated_surface_closure(
-            &second_procedures["middle"],
-            &middle_snapshot,
-            &mut SemanticRequest::new(&mut budget, &cancellation),
-        )
-        .expect("the fully memoized middle surface closure validates again");
+        let (repeat_result, repeat_reads) =
+            capture_query_reads(second_workspace.analyzer(), || {
+                cuts.validated_surface_closure(
+                    &second_procedures["middle"],
+                    &middle_snapshot,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("the fully memoized middle surface closure validates again")
+            });
+        assert!(
+            repeat_result
+                .2
+                .contains_key(&second_procedures["middle"].durable_key())
+        );
+        let keys = middle_reads.canonical_keys();
+        assert!(!keys.is_empty(), "validation captured named read keys");
+        let repeated_keys = repeat_reads.canonical_keys();
+        assert!(
+            keys.iter()
+                .all(|key| repeated_keys.binary_search(key).is_ok()),
+            "the memoized validation replayed its captured keys: fill={keys:?}, repeat={repeated_keys:?}"
+        );
+        assert!(repeat_reads.unattributed_reads() >= middle_reads.unattributed_reads());
+        assert!(repeat_reads.execution_dependences() >= middle_reads.execution_dependences());
+        assert!(!middle_reads.reuse_refused() || repeat_reads.reuse_refused());
         assert_eq!(cuts.validation_work, validation_work);
 
         assert!(cuts.disable_cut(&second_procedures["leaf"]));
@@ -11152,11 +11196,11 @@ mod tests {
             &mut solver_budget,
         );
         assert!(
-            !solver_limited.complete,
+            !solver_limited.complete(),
             "the solver ceiling stops the fixed point"
         );
         assert_eq!(
-            solver_limited.persistence_status,
+            solver_limited.persistence_status(),
             TypeFlowRootPersistenceStatus::Ineligible(
                 TypeFlowRootPersistenceRejection::SolverIncomplete
             )
@@ -11179,7 +11223,7 @@ mod tests {
             ValueFlowCache::default(),
         );
         assert_eq!(
-            semantic_limited.persistence_status,
+            semantic_limited.persistence_status(),
             TypeFlowRootPersistenceStatus::Ineligible(
                 TypeFlowRootPersistenceRejection::SemanticBudget
             )
@@ -11382,34 +11426,61 @@ mod tests {
     }
     #[test]
     fn acyclic_wrapper_summary_is_published_and_reused_with_equal_results() {
-        let (_project, workspace, field_slots, procedures) = runtime_fixture(concat!(
-            "def leaf():\n",
-            "    value = 123\n",
-            "    value.__class__\n",
-            "    return value\n",
-            "def wrapper():\n",
-            "    first = leaf()\n",
-            "    first.__class__\n",
-            "    second = leaf()\n",
-            "    second.__eq__\n",
-            "    return second\n",
-            "def first_root():\n",
-            "    value = wrapper()\n",
-            "    return value.__class__\n",
-            "def second_root():\n",
-            "    value = wrapper()\n",
-            "    return value.__class__\n",
-        ));
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file(
+                "app.ts",
+                concat!(
+                    "class Item {\n",
+                    "    left: number;\n",
+                    "    right: number;\n",
+                    "    constructor() {\n",
+                    "        this.left = 1;\n",
+                    "        this.right = 2;\n",
+                    "    }\n",
+                    "}\n",
+                    "function leaf(): Item {\n",
+                    "    return new Item();\n",
+                    "}\n",
+                    "function wrapper(): Item {\n",
+                    "    const first = leaf();\n",
+                    "    const second = leaf();\n",
+                    "    first.left;\n",
+                    "    second.right;\n",
+                    "    return second;\n",
+                    "}\n",
+                    "function first_root(): number {\n",
+                    "    const value = wrapper();\n",
+                    "    return value.left;\n",
+                    "}\n",
+                    "function second_root(): number {\n",
+                    "    const value = wrapper();\n",
+                    "    return value.left;\n",
+                    "}\n",
+                ),
+            )
+            .build();
+        let adapter = type_flow_adapter(Language::TypeScript)
+            .expect("TypeScript registers a type-flow adapter");
+        let (_project, workspace, field_slots, procedures) =
+            runtime_fixture_from_project_with_adapter(project, adapter, "app.ts");
+        assert!(!procedures.is_empty(), "TypeScript procedures materialize");
         let state = TypeFlowSummaryState::new(&workspace);
         let cache = ValueFlowCache::default();
-        let first = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["first_root"],
-            state.clone(),
-            cache.clone(),
+        let (first, cold_reads) = capture_query_reads(workspace.analyzer(), || {
+            solve_runtime_root_with_adapter(
+                &workspace,
+                adapter,
+                &field_slots,
+                &procedures["first_root"],
+                state.clone(),
+                cache.clone(),
+            )
+        });
+        assert!(
+            first.published_summaries > 0,
+            "{first:#?}\ncold capture: {cold_reads:#?}"
         );
-        assert!(first.published_summaries > 0, "{first:#?}");
+        assert!(!first.class_sets.is_empty(), "{first:#?}");
         {
             let runtime = state
                 .class_set
@@ -11428,15 +11499,59 @@ mod tests {
             );
         }
 
-        let reused = solve_runtime_root(
-            &workspace,
-            &field_slots,
-            &procedures["second_root"],
-            state.clone(),
-            cache,
+        let wrapper_inputs = state
+            .class_set
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .find(|summary| summary_name(summary) == "wrapper")
+            .expect("the wrapper summary was retained")
+            .inputs
+            .clone();
+        assert!(
+            !wrapper_inputs.keys.is_empty(),
+            "wrapper retained named runtime inputs"
         );
-        let fresh = solve_runtime_root(
+        assert!(
+            !wrapper_inputs.channels.reuse_refused,
+            "a refused runtime receipt cannot be retained: {wrapper_inputs:?}"
+        );
+        let cold_keys = cold_reads.canonical_keys();
+        assert!(
+            wrapper_inputs
+                .keys
+                .iter()
+                .all(|key| cold_keys.binary_search(key).is_ok()),
+            "published wrapper inputs came from the cold capture: inputs={:?}, cold={cold_keys:?}",
+            wrapper_inputs.keys
+        );
+        let (reused, warm_reads) = capture_query_reads(workspace.analyzer(), || {
+            solve_runtime_root_with_adapter(
+                &workspace,
+                adapter,
+                &field_slots,
+                &procedures["second_root"],
+                state.clone(),
+                cache,
+            )
+        });
+        let warm_keys = warm_reads.canonical_keys();
+        assert!(
+            wrapper_inputs
+                .keys
+                .iter()
+                .all(|key| warm_keys.binary_search(key).is_ok()),
+            "the real wrapper reuse hit replayed retained keys: inputs={:?}, warm={warm_keys:?}",
+            wrapper_inputs.keys
+        );
+        assert!(warm_reads.unattributed_reads() >= wrapper_inputs.channels.unattributed_reads);
+        assert!(
+            warm_reads.execution_dependences() >= wrapper_inputs.channels.execution_dependences
+        );
+        let fresh = solve_runtime_root_with_adapter(
             &workspace,
+            adapter,
             &field_slots,
             &procedures["second_root"],
             TypeFlowSummaryState::new(&workspace),
@@ -11445,10 +11560,10 @@ mod tests {
         assert!(reused.reusable_summary_hits > 0, "{reused:#?}");
         assert_eq!(reused.class_sets, fresh.class_sets);
         assert_eq!(reused.findings, fresh.findings);
-        assert_eq!(reused.complete, fresh.complete);
+        assert_eq!(reused.complete(), fresh.complete());
         assert_eq!(
-            reused.semantic_budget_exhausted,
-            fresh.semantic_budget_exhausted
+            reused.semantic_budget_exhausted(),
+            fresh.semantic_budget_exhausted()
         );
         assert!(
             state

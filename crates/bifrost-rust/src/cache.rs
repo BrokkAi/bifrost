@@ -146,7 +146,8 @@ pub fn weight_rust_usage_facts<K>(_key: &K, value: &Arc<RustUsageFacts>) -> u32 
 
 /// Byte weight of a memoized file list (module-backing files, owner crate
 /// roots). The paths dominate; the vector header is noise beside them.
-pub fn weight_project_file_list<K>(_key: &K, value: &Arc<Vec<ProjectFile>>) -> u32 {
+#[allow(clippy::ptr_arg)]
+pub fn weight_project_file_list<K>(_key: &K, value: &Vec<ProjectFile>) -> u32 {
     let size = value
         .iter()
         .map(|file| file.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
@@ -160,10 +161,10 @@ pub fn weight_project_file_list<K>(_key: &K, value: &Arc<Vec<ProjectFile>>) -> u
 /// The key carries the cost here, not the value: most probes find nothing, and
 /// memoizing "nothing" is the point, so a weigher that only counted the file
 /// list would let unbounded distinct module paths accumulate for free.
-// The signature is moka's: a weigher is `Fn(&K, &V)`, and the key type is
+// The key type is
 // `PathBuf`.
 #[allow(clippy::ptr_arg)]
-pub fn weight_module_probe(key: &PathBuf, value: &Arc<Vec<ProjectFile>>) -> u32 {
+pub fn weight_module_probe(key: &PathBuf, value: &Vec<ProjectFile>) -> u32 {
     let files = value
         .iter()
         .map(|file| file.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
@@ -175,7 +176,7 @@ pub fn weight_module_probe(key: &PathBuf, value: &Arc<Vec<ProjectFile>>) -> u32 
 /// the answer "no file declares this module", which costs only its key.
 pub fn weight_module_domains(
     key: &crate::usage::ModuleKey,
-    value: &Option<Arc<Vec<crate::usage::Domain>>>,
+    value: &Option<Vec<crate::usage::Domain>>,
 ) -> u32 {
     let domains = value
         .iter()
@@ -187,9 +188,10 @@ pub fn weight_module_domains(
 
 /// Byte weight of one module alias's routes. Each route owns a target path, a
 /// target module key, and a domain.
+#[allow(clippy::ptr_arg)]
 pub fn weight_alias_routes(
     key: &crate::usage::ModuleKey,
-    value: &Arc<Vec<crate::usage::RustModuleAliasRoute>>,
+    value: &Vec<crate::usage::RustModuleAliasRoute>,
 ) -> u32 {
     let routes = value
         .iter()
@@ -205,17 +207,19 @@ pub fn weight_alias_routes(
 
 /// Byte weight of one file's forward import edges. Each edge owns the importer
 /// and target paths, two module keys, its typed binding names, and its domain.
+#[allow(clippy::ptr_arg)]
 pub fn weight_forward_import_edges(
     _key: &ProjectFile,
-    value: &Arc<Vec<crate::usage::RustImportEdge>>,
+    value: &Vec<crate::usage::RustImportEdge>,
 ) -> u32 {
     weight_import_edges(value).min(u32::MAX as usize) as u32
 }
 
 /// Byte weight of the import edges that bind one symbol identity.
+#[allow(clippy::ptr_arg)]
 pub fn weight_binding_edges(
     key: &crate::usage::RustSymbolIdentity,
-    value: &Arc<Vec<crate::usage::RustImportEdge>>,
+    value: &Vec<crate::usage::RustImportEdge>,
 ) -> u32 {
     let size = weight_identity(key) + weight_import_edges(value);
     size.min(u32::MAX as usize) as u32
@@ -254,9 +258,10 @@ fn weight_identity(identity: &crate::usage::RustSymbolIdentity) -> usize {
 }
 
 /// Byte weight of what one module binds.
+#[allow(clippy::ptr_arg)]
 pub fn weight_module_bindings(
     key: &(ProjectFile, crate::usage::ModuleKey),
-    value: &Arc<Vec<crate::usage_walks::RustModuleBinding>>,
+    value: &Vec<crate::usage_walks::RustModuleBinding>,
 ) -> u32 {
     let bindings = value
         .iter()
@@ -274,7 +279,7 @@ pub fn weight_module_bindings(
 /// Byte weight of one file's origin routes, bucketed by first path segment.
 pub fn weight_origin_routes(
     _key: &ProjectFile,
-    value: &Arc<HashMap<String, Vec<crate::usage::RustOriginRoute>>>,
+    value: &HashMap<String, Vec<crate::usage::RustOriginRoute>>,
 ) -> u32 {
     let size = value
         .iter()
@@ -300,9 +305,10 @@ pub fn weight_origin_routes(
 }
 
 /// Byte weight of one file's macro scope edges.
+#[allow(clippy::ptr_arg)]
 pub fn weight_macro_scope_edges(
     _key: &ProjectFile,
-    value: &Arc<Vec<crate::usage::RustMacroScopeEdge>>,
+    value: &Vec<crate::usage::RustMacroScopeEdge>,
 ) -> u32 {
     let size = value
         .iter()
@@ -319,7 +325,7 @@ pub fn weight_macro_scope_edges(
 /// Byte weight of one macro's visible ranges, per scope.
 pub fn weight_macro_visible_ranges(
     key: &CodeUnit,
-    value: &Arc<crate::usage::RustMacroScopeRanges>,
+    value: &crate::usage::RustMacroScopeRanges,
 ) -> u32 {
     let size = value
         .iter()
@@ -335,9 +341,10 @@ pub fn weight_macro_visible_ranges(
 /// Byte weight of one file's composed include-expansion routes. The host
 /// bindings dominate: a deeply nested include accumulates one per binding
 /// visible at each splice it passed through.
+#[allow(clippy::ptr_arg)]
 pub fn weight_include_routes(
     _key: &ProjectFile,
-    value: &Arc<Vec<crate::usage_includes::RustIncludeRoute>>,
+    value: &Vec<crate::usage_includes::RustIncludeRoute>,
 ) -> u32 {
     let size = value
         .iter()
@@ -368,13 +375,10 @@ pub fn weight_include_routes(
 ///
 /// The key is one identifier and the value is the whole workspace answer for
 /// it, so the group strings and their file paths carry the cost.
-// The signature is moka's: a weigher is `Fn(&K, &V)`, and the key type is
+// The key type is
 // `String`.
 #[allow(clippy::ptr_arg)]
-pub fn weight_module_declarations(
-    key: &String,
-    value: &Arc<HashMap<String, Vec<ProjectFile>>>,
-) -> u32 {
+pub fn weight_module_declarations(key: &String, value: &HashMap<String, Vec<ProjectFile>>) -> u32 {
     let groups = value
         .iter()
         .map(|(package, files)| {

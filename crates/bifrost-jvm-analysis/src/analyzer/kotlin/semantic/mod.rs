@@ -41,7 +41,7 @@ use brokk_bifrost_semantic::analyzer::semantic::lowering::*;
 
 use tree_sitter::Node;
 
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use brokk_bifrost_analysis::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
@@ -109,7 +109,10 @@ use brokk_bifrost_jvm::kotlin::value_classes::{
 // #8387: invalidate artifacts embedding ranked synthetic declaration identities.
 // #8689: invalidate Kotlin artifacts after mutable closure captures acquire shared cells.
 // #8591: context-parameter function types change Kotlin semantic identities.
-const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v24";
+// #8672: Kotlin 0.4.9 keeps annotated primary constructors after line comments.
+// #9447: structured formal roles and refusal change semantic payloads.
+// #9423: property reads lower as bound-method call sites (Java getters).
+const ADAPTER_VERSION: &[u8] = b"kotlin-value-semantics-v28";
 
 impl_program_semantics_provider!(KotlinAnalyzer, KotlinSemanticLowerer);
 
@@ -152,6 +155,12 @@ impl ProgramSemanticsLowerer for KotlinSemanticLowerer {
                 }
                 ProcedureEnumeration::Cancelled { work } => {
                     return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Unknown { work } => {
+                    return Ok(SemanticOutcome::Unknown {
                         partial: None,
                         work,
                     });
@@ -335,6 +344,7 @@ fn kotlin_capabilities() -> SemanticCapabilities {
 mod control;
 mod inventory;
 mod syntax;
+pub(crate) use syntax::declaration_container_kind;
 
 pub(crate) use crate::analyzer::kotlin::semantic::syntax::PROCEDURE_SYNTAX_ROLES;
 #[cfg(test)]

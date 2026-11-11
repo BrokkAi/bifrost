@@ -7,6 +7,8 @@ pub use brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::*;
 pub(crate) mod conversions;
 #[doc(hidden)]
 pub mod dispatch;
+mod footprint;
+pub use footprint::{FootprintUnknown, FootprintVerdict, FormalFootprintCertificate};
 #[doc(hidden)]
 pub mod heap;
 #[doc(hidden)]
@@ -21,7 +23,10 @@ pub use runtime_values::{
 };
 #[doc(hidden)]
 pub mod value_flow;
-use crate::analyzer::languages::{SavedDefaultArgumentSafety, language_support_for_hook};
+use crate::analyzer::languages::{
+    SavedDefaultArgumentSafety, SelectedBindingUnavailable, SelectedTupleBinding,
+    language_support_for_hook,
+};
 use crate::analyzer::semantic::{DispatchHints, OracleLimits};
 use crate::analyzer::semantic::{FormalParameterPassingMode, ProcedureHandle};
 use crate::analyzer::semantic_model::{
@@ -55,15 +60,54 @@ pub use value_flow::{
     value_flow_capabilities_are_open,
 };
 /// Workspace semantic oracles bound to one immutable analyzer generation.
+/// A Java call's selected declaration and the selected-call lookup's
+/// incomplete reason, memoized per call site.
+type ConversionJavaTargets = crate::analyzer::usages::common::QueryReadMemo<
+    crate::analyzer::semantic::CallSiteHandle,
+    Option<(crate::analyzer::CodeUnit, Option<Box<str>>)>,
+>;
+
 #[derive(Clone)]
 pub struct WorkspaceSemanticOracle<'a> {
+    // Tracks cold session lifetime only; real source allocations pay residency.
+    source_region: Arc<()>,
     workspace: &'a WorkspaceAnalyzer,
     runtime_reads: runtime_values::RuntimeReadCache,
     runtime_syntax: runtime_values::RuntimeSyntaxCache,
+    lexical_indexes: crate::analyzer::lexical_definitions::LexicalIndexCache,
     runtime_write_footprints: runtime_values::AttributedRuntimeWriteFootprintCache,
     // Completed incoming bindings live only as long as this query provider.
     #[doc(hidden)]
     pub incoming_actuals: Arc<IncomingActualCache>,
+    pub(super) conversion_sources:
+        Arc<crate::analyzer::usages::call_conversion::CallConversionCache>,
+    conversion_bindings: Arc<std::sync::Mutex<crate::analyzer::usages::CallBindingCache>>,
+    // Provider-owned memos share the immutable captured model snapshot.
+    conversion_java_targets: Arc<ConversionJavaTargets>,
+    conversion_candidates: Arc<
+        crate::analyzer::usages::common::QueryReadMemo<
+            crate::analyzer::semantic::ProcedureHandle,
+            conversions::ConversionCandidate,
+        >,
+    >,
+    conversion_rows: Arc<
+        crate::analyzer::usages::common::QueryReadMemo<
+            (
+                crate::analyzer::semantic::CallSiteHandle,
+                crate::analyzer::semantic::DispatchCandidate,
+            ),
+            conversions::ConversionRows,
+        >,
+    >,
+    conversion_effects: Arc<
+        crate::analyzer::usages::common::QueryReadMemo<
+            (
+                crate::analyzer::semantic::CallSiteHandle,
+                crate::analyzer::semantic::DispatchCandidate,
+            ),
+            bool,
+        >,
+    >,
     dispatch_materialization_ns: Arc<std::sync::atomic::AtomicU64>,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
@@ -73,7 +117,161 @@ pub struct WorkspaceSemanticOracle<'a> {
     python_saved_default_safety: Option<Arc<SavedDefaultArgumentSafety>>,
 }
 
+/// One selected answer and its exact read dependencies. The guarded IR row
+/// remains inert; consumers use this selected proof for exact binder sources.
+pub struct SelectedPatternProjection {
+    pub candidate: crate::analyzer::semantic::GuardedPatternProjection,
+    pub binding: SelectedTupleBinding,
+    receipt: crate::analyzer::i_analyzer::QueryReadReceipt,
+}
+
+impl SelectedPatternProjection {
+    /// Stable content identity for the source, declaration, and model reads.
+    pub fn receipt_id(&self) -> crate::analyzer::read_ledger::ReadSetDigest {
+        self.receipt.digest()
+    }
+
+    /// Replay admission inputs when a selected record is reused by a consumer.
+    pub fn replay_reads(&self, workspace: &WorkspaceAnalyzer) {
+        self.receipt.replay(workspace.analyzer());
+    }
+}
+
 impl<'a> WorkspaceSemanticOracle<'a> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn conversion_lexical_work(
+        &self,
+        file: &crate::ProjectFile,
+    ) -> crate::analyzer::lexical_definitions::LexicalIndexWork {
+        self.conversion_sources
+            .lexical_work(self.workspace.analyzer(), file)
+    }
+
+    /// Select the guarded pattern projections `wanted` accepts, in one pass
+    /// over the procedure's candidates. A consumer asks only for the candidates
+    /// it needs, so an unrelated pattern is never admitted and cannot make the
+    /// answer unavailable. `None` means execution was cancelled; a candidate
+    /// that hit a limit comes back as `Unavailable` with its cause and the
+    /// others keep their own decisions.
+    pub fn selected_pattern_projections_where(
+        &self,
+        procedure: &ProcedureHandle,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+        mut wanted: impl FnMut(&crate::analyzer::semantic::GuardedPatternProjection) -> bool,
+    ) -> Result<
+        Option<Arc<[SelectedPatternProjection]>>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let candidates = procedure.semantics().guarded_pattern_projections();
+        if candidates.is_empty() {
+            return Ok(Some(Arc::from([])));
+        }
+        let Some(support) = crate::analyzer::languages::language_support(
+            procedure.artifact().key().language().language(),
+        ) else {
+            return Ok(Some(Arc::from([])));
+        };
+        let mut selected = Vec::new();
+        for candidate in candidates {
+            if !wanted(candidate) {
+                continue;
+            }
+            let Some(projection) =
+                self.admit_pattern_candidate(support, procedure, candidate, request)?
+            else {
+                return Ok(None);
+            };
+            selected.push(projection);
+        }
+        Ok(Some(Arc::from(selected)))
+    }
+
+    /// Admit the one candidate with this dense per-procedure ordinal, without
+    /// visiting the others. `Ok(None)` is a cancellation, or an ordinal the
+    /// procedure does not have.
+    pub fn selected_pattern_projection_at(
+        &self,
+        procedure: &ProcedureHandle,
+        ordinal: u32,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<Option<SelectedPatternProjection>, crate::analyzer::semantic::SemanticProviderError>
+    {
+        let Some(candidate) = procedure
+            .semantics()
+            .guarded_pattern_projections()
+            .get(ordinal as usize)
+        else {
+            return Ok(None);
+        };
+        let Some(support) = crate::analyzer::languages::language_support(
+            procedure.artifact().key().language().language(),
+        ) else {
+            return Ok(None);
+        };
+        self.admit_pattern_candidate(support, procedure, candidate, request)
+    }
+
+    fn admit_pattern_candidate(
+        &self,
+        support: &dyn crate::analyzer::languages::LanguageSupport,
+        procedure: &ProcedureHandle,
+        candidate: &crate::analyzer::semantic::GuardedPatternProjection,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<Option<SelectedPatternProjection>, crate::analyzer::semantic::SemanticProviderError>
+    {
+        if request.cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let (answer, receipt) = crate::analyzer::i_analyzer::QueryReadReceipt::capture(
+            self.workspace.analyzer(),
+            || {
+                self.active_semantic_models();
+                support.admit_selected_tuple_binding(
+                    self.workspace,
+                    procedure,
+                    candidate,
+                    self.active_semantic_model_snapshot.as_deref(),
+                    request,
+                )
+            },
+        );
+        let binding = answer?;
+        // Only a cancellation interrupts the selection.
+        if matches!(
+            binding,
+            SelectedTupleBinding::Unavailable(SelectedBindingUnavailable::Cancelled)
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(SelectedPatternProjection {
+            candidate: candidate.clone(),
+            binding,
+            receipt,
+        }))
+    }
+
+    /// Prove that one selected callee cannot connect two formal referents.
+    #[allow(clippy::too_many_arguments)]
+    pub fn formal_footprint_certificate(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        candidate: &crate::analyzer::semantic::ProcedureHandle,
+        context: &crate::analyzer::semantic::OracleCallContext,
+        tracked_formal: usize,
+        other_formal: usize,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<FormalFootprintCertificate, crate::analyzer::semantic::SemanticProviderError> {
+        footprint::formal_footprint_certificate(
+            self,
+            call,
+            candidate,
+            context,
+            tracked_formal,
+            other_formal,
+            request,
+        )
+    }
+
     fn dispatch_materialization_timer(&self) -> DispatchMaterializationTimer {
         DispatchMaterializationTimer {
             nanos: Arc::clone(&self.dispatch_materialization_ns),
@@ -179,16 +377,26 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         let incoming_actuals = Arc::new(IncomingActualCache::default());
         Self {
             workspace,
-            runtime_reads: runtime_values::runtime_read_cache(),
+            source_region: Arc::new(()),
+            lexical_indexes: crate::analyzer::lexical_definitions::lexical_index_cache(
+                workspace.retention_budget(),
+            ),
+            runtime_reads: runtime_values::runtime_read_cache(workspace.retention_budget()),
             dispatch_materialization_ns: Arc::clone(&incoming_actuals.dispatch_materialization_ns),
             incoming_actuals,
-            runtime_syntax: workspace
-                .analyzer()
-                .snapshot_caches()
-                .map_or_else(runtime_syntax_cache, |caches| {
-                    caches.runtime_syntax().clone()
-                }),
-            runtime_write_footprints: runtime_values::attributed_runtime_write_footprint_cache(),
+            conversion_sources: Arc::new(Default::default()),
+            conversion_bindings: Arc::new(Default::default()),
+            conversion_java_targets: Arc::new(crate::analyzer::usages::common::query_read_memo()),
+            conversion_candidates: Arc::new(crate::analyzer::usages::common::query_read_memo()),
+            conversion_rows: Arc::new(crate::analyzer::usages::common::query_read_memo()),
+            conversion_effects: Arc::new(crate::analyzer::usages::common::query_read_memo()),
+            runtime_syntax: workspace.analyzer().snapshot_caches().map_or_else(
+                || runtime_syntax_cache(workspace.retention_budget()),
+                |caches| caches.runtime_syntax().clone(),
+            ),
+            runtime_write_footprints: runtime_values::attributed_runtime_write_footprint_cache(
+                workspace.retention_budget(),
+            ),
             limits,
             hierarchy_expansion,
             active_semantic_model_snapshot,
@@ -235,15 +443,15 @@ impl<'a> WorkspaceSemanticOracle<'a> {
     }
 
     pub fn active_semantic_models(&self) -> Option<&Arc<ResolvedActiveSemanticModels>> {
-        if let Some(snapshot) = &self.active_semantic_model_snapshot {
-            self.workspace
-                .analyzer()
-                .record_read(crate::analyzer::ReadKey::Models(
-                    crate::analyzer::semantic::StableDigest::sha256(
-                        snapshot.active_models().active_model_set_hash(),
-                    ),
-                ));
-        }
+        self.workspace
+            .analyzer()
+            .record_read(crate::analyzer::ReadKey::Models(
+                crate::analyzer::i_analyzer::current_model_set_digest(
+                    self.active_semantic_model_snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.active_models().active_model_set_hash()),
+                ),
+            ));
 
         match self.active_semantic_model_snapshot.as_ref() {
             Some(snapshot) => Some(snapshot.active_models()),

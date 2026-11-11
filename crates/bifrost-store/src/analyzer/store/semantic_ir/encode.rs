@@ -17,15 +17,17 @@ use crate::analyzer::semantic::partial_flow::fixpoint::ProcedurePartialFlows;
 use crate::analyzer::semantic::partial_flow::ports::{HeapSelector, PartialFlowPort};
 use crate::analyzer::semantic::{
     AllocationKind, ArgumentDomain, BackingStoreOffset, CallArgumentExpansion,
-    CallableReferenceKind, CallableTarget, CallableTargetResolution, CaptureMode, CaptureSource,
-    ContentIdentity, ControlContinuation, DeclarationLocator, DropBehavior, EvidenceCompleteness,
+    CallControlDisposition, CallControlKind, CallableReferenceKind, CallableTarget,
+    CallableTargetResolution, CaptureMode, CaptureSource, ContentIdentity, ControlContinuation,
+    DeclarationLocator, DropBehavior, EvidenceCompleteness, FootprintClass, FootprintDisposition,
     FormalMultiplicity, GuardArm, GuardPredicate, MemoryLocationKind, MemoryValueCopy,
-    PointerAccessWidth, PointerByteOffset, PointerInvalidationTarget, PointerOriginKind,
-    ProcedureSemanticsParts, ProofStatus, ScopeEndAt, SemanticEffect, SemanticGapSubject,
-    SemanticIncompleteReason, SemanticIncompleteSubject, SemanticLanguage, SemanticLocator,
-    SemanticPlace, SemanticRole, SemanticValueKind, SourceAnchor, SwitchEdgeParts,
-    SynchronizationPayload, SynchronizationPayloadCopy, TransferKind, TransferOperation,
-    ValueFlowKind, WorkspaceMountId, WorkspaceRelativePath,
+    PatternProjectionStatus, PatternProjectionStep, PointerAccessWidth, PointerByteOffset,
+    PointerInvalidationTarget, PointerOriginKind, ProcedureSemanticsParts, ProofStatus, ScopeEndAt,
+    SemanticEffect, SemanticGapImpact, SemanticGapSubject, SemanticIncompleteReason,
+    SemanticIncompleteSubject, SemanticLanguage, SemanticLocator, SemanticPlace, SemanticRole,
+    SemanticValueKind, SourceAnchor, SwitchEdgeParts, SynchronizationPayload,
+    SynchronizationPayloadCopy, TransferKind, TransferOperation, ValueFlowKind, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 use crate::hash::HashMap;
 
@@ -389,8 +391,17 @@ impl<'a> Encoder<'a> {
                 code(properties.construction_return),
                 integer(procedure.source),
                 integer(procedure.evidence),
+                flag(procedure.declared_result_classes.is_some()),
             ],
         );
+        if let Some(classes) = &procedure.declared_result_classes {
+            for (ordinal, class) in classes.iter().enumerate() {
+                self.rows.push(
+                    Table::ResultTypeClasses,
+                    vec![integer(id), some(ordinal as i64), some(*class as i64)],
+                );
+            }
+        }
         self.values(procedure);
         self.allocations(procedure);
         self.memory_locations(procedure);
@@ -409,6 +420,141 @@ impl<'a> Encoder<'a> {
         self.lifecycle(procedure);
         self.pointers(procedure);
         self.receiver_type_facts(procedure);
+        self.guarded_pattern_projections(procedure);
+        self.footprint_coverage(procedure);
+        self.call_control_coverage(procedure);
+    }
+
+    fn footprint_coverage(&mut self, procedure: &ProcedureSemanticsParts) {
+        let coverage = &procedure.footprint_coverage;
+        let (boundary_disposition, boundary_reason) = match coverage.boundary {
+            Ok(()) => (1, Value::Null),
+            Err(reason) => (3, some(reason.code())),
+        };
+        self.rows.push(
+            Table::FootprintCoverage,
+            vec![
+                integer(procedure.id),
+                some(i64::from(coverage.contract_version)),
+                some(boundary_disposition),
+                boundary_reason,
+            ],
+        );
+        for class in FootprintClass::ALL {
+            let disposition = coverage.classes[(class.code() - 1) as usize];
+            let reason = match disposition {
+                FootprintDisposition::Represented => Value::Null,
+                FootprintDisposition::Excluded(reason) => some(reason.code()),
+                FootprintDisposition::Refused(reason) => some(reason.code()),
+            };
+            self.rows.push(
+                Table::FootprintCoverageClasses,
+                vec![
+                    integer(procedure.id),
+                    some(class.code()),
+                    some(disposition.code()),
+                    reason,
+                ],
+            );
+        }
+        for obligation in &coverage.call_target_obligations {
+            let impacts = SemanticGapImpact::ALL
+                .into_iter()
+                .filter(|impact| obligation.impacts.contains(*impact))
+                .fold(0_i64, |bits, impact| bits | (1_i64 << (impact as u8)));
+            self.rows.push(
+                Table::FootprintCallTargetObligations,
+                vec![
+                    integer(procedure.id),
+                    integer(obligation.call),
+                    integer(obligation.gap),
+                    some(impacts),
+                ],
+            );
+        }
+    }
+
+    fn call_control_coverage(&mut self, procedure: &ProcedureSemanticsParts) {
+        let coverage = &procedure.call_control_coverage;
+        let (boundary, boundary_reason) = match coverage.source_boundary {
+            Ok(()) => (1, Value::Null),
+            Err(reason) => (3, some(reason.code())),
+        };
+        let (admission, admission_reason) = match coverage.admission {
+            Ok(()) => (1, Value::Null),
+            Err(reason) => (3, some(reason.code())),
+        };
+        self.rows.push(
+            Table::CallControlCoverage,
+            vec![
+                integer(procedure.id),
+                some(1_i64),
+                some(boundary),
+                boundary_reason,
+                some(admission),
+                admission_reason,
+                some(coverage.call_target_obligations.len() as i64),
+            ],
+        );
+        let kinds = [
+            CallControlKind::Syntax,
+            CallControlKind::ExplicitCall,
+            CallControlKind::Control,
+            CallControlKind::InitializationConversion,
+            CallControlKind::Deferred,
+            CallControlKind::Callback,
+            CallControlKind::NestedCallable,
+            CallControlKind::ImplicitAccess,
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let mut disposition = 2;
+            let mut reason = Some(3_i64); // No source branch of this class.
+            for branch in coverage
+                .branches
+                .iter()
+                .filter(|branch| branch.kind == kind)
+            {
+                match branch.disposition {
+                    CallControlDisposition::Refused(why) => {
+                        disposition = 3;
+                        reason = Some(why.code());
+                        break;
+                    }
+                    CallControlDisposition::Represented => {
+                        disposition = 1;
+                        reason = None;
+                    }
+                    CallControlDisposition::AffirmativelyExcluded(why) if disposition != 1 => {
+                        reason = Some(why.code());
+                    }
+                    CallControlDisposition::AffirmativelyExcluded(_) => {}
+                }
+            }
+            self.rows.push(
+                Table::CallControlClasses,
+                vec![
+                    integer(procedure.id),
+                    some((index + 1) as i64),
+                    some(disposition),
+                    reason.map_or(Value::Null, some),
+                ],
+            );
+        }
+        for obligation in &coverage.call_target_obligations {
+            let impacts = SemanticGapImpact::ALL
+                .into_iter()
+                .filter(|impact| obligation.impacts.contains(*impact))
+                .fold(0_i64, |bits, impact| bits | (1_i64 << (impact as u8)));
+            self.rows.push(
+                Table::CallControlObligations,
+                vec![
+                    integer(procedure.id),
+                    integer(obligation.call),
+                    integer(obligation.gap),
+                    some(impacts),
+                ],
+            );
+        }
     }
 
     fn values(&mut self, procedure: &'a ProcedureSemanticsParts) {
@@ -443,7 +589,16 @@ impl<'a> Encoder<'a> {
                 SemanticValueKind::DefaultArgument {
                     ordinal: default_ordinal,
                 } => ordinal = integer(*default_ordinal),
-                SemanticValueKind::Receiver { dispatch } => value_flag = flag(*dispatch),
+                SemanticValueKind::Receiver { dispatch, mode } => {
+                    value_flag = flag(*dispatch);
+                    // Receiver rows reuse the otherwise empty ordinal cell.
+                    ordinal = integer(match mode {
+                        crate::analyzer::semantic::ReceiverMode::Unknown => 0_u32,
+                        crate::analyzer::semantic::ReceiverMode::SharedBorrow => 1,
+                        crate::analyzer::semantic::ReceiverMode::MutableBorrow => 2,
+                        crate::analyzer::semantic::ReceiverMode::Owned => 3,
+                    });
+                }
                 SemanticValueKind::Boolean(constant) => value_flag = flag(*constant),
                 SemanticValueKind::UnsignedInteger(constant) => magnitude = decimal(constant),
                 SemanticValueKind::SignedInteger(constant) => magnitude = decimal(constant),
@@ -482,6 +637,20 @@ impl<'a> Encoder<'a> {
                     text,
                     integer(value.source),
                     integer(value.evidence),
+                    some(value.static_type_class as i64),
+                    value.static_type_origin.as_ref().map_or(
+                        Value::Null,
+                        |crate::analyzer::semantic::StaticTypeOrigin::CallResult {
+                             call, ..
+                         }| integer(*call),
+                    ),
+                    value.static_type_origin.as_ref().map_or(
+                        Value::Null,
+                        |crate::analyzer::semantic::StaticTypeOrigin::CallResult {
+                             ordinal,
+                             ..
+                         }| integer(*ordinal),
+                    ),
                 ],
             );
         }
@@ -1074,12 +1243,14 @@ impl<'a> Encoder<'a> {
                         );
                     }
                     ValueFlowKind::Local
+                    | ValueFlowKind::OwnershipUnknown
                     | ValueFlowKind::Parameter
                     | ValueFlowKind::Receiver
                     | ValueFlowKind::Return
                     | ValueFlowKind::ReferenceBoxing
                     | ValueFlowKind::ReferenceUnboxing
-                    | ValueFlowKind::LanguageDefined => {}
+                    | ValueFlowKind::LanguageDefined
+                    | ValueFlowKind::ByValueCapture => {}
                 }
                 EventCells {
                     sub_kind: Some(ValueFlowKindTag::of(kind).code()),
@@ -1647,6 +1818,49 @@ impl<'a> Encoder<'a> {
             );
         }
     }
+
+    fn guarded_pattern_projections(&mut self, procedure: &'a ProcedureSemanticsParts) {
+        let id = procedure.id.get();
+        for candidate in &procedure.guarded_pattern_projections {
+            self.rows.push(
+                Table::GuardedPatternProjections,
+                vec![
+                    integer(id),
+                    integer(candidate.ordinal),
+                    integer(candidate.point),
+                    integer(candidate.whole_value),
+                    integer(candidate.binder),
+                    integer(candidate.pattern_source),
+                    integer(candidate.binder_source),
+                    some(i64::from(candidate.declared_path_len)),
+                    some(match candidate.status {
+                        PatternProjectionStatus::Unevaluated => 0_i64,
+                    }),
+                ],
+            );
+            for (step_index, step) in candidate.path.iter().enumerate() {
+                let (kind, tuple_ordinal, named_text) = match step {
+                    PatternProjectionStep::Tuple(ordinal) => {
+                        (0_i64, some(i64::from(*ordinal)), Value::Null)
+                    }
+                    PatternProjectionStep::Named(name) => {
+                        (1_i64, Value::Null, some(self.text(name)))
+                    }
+                };
+                self.rows.push(
+                    Table::GuardedPatternSteps,
+                    vec![
+                        integer(id),
+                        integer(candidate.ordinal),
+                        some(step_index as i64),
+                        some(kind),
+                        tuple_ordinal,
+                        named_text,
+                    ],
+                );
+            }
+        }
+    }
 }
 
 impl<'a> Encoder<'a> {
@@ -1687,8 +1901,8 @@ impl<'a> Encoder<'a> {
                 integer(procedure),
                 code(flows.outcome),
                 detail,
-                flag(flows.open),
-                flag(flows.relations_complete),
+                flag(flows.has_undischarged_gap()),
+                flag(flows.relations_proven()),
                 some(i64::try_from(flows.ports.len()).expect("port count fits i64")),
                 some(i64::try_from(flows.flows.len()).expect("flow count fits i64")),
                 json_ids(gaps.into_iter()),

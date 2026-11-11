@@ -57,6 +57,7 @@ fn one_typestate_projection_fits_a_one_finding_budget() {
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
         work: PolicyWorkReport::default(),
+        subjects: None,
     });
     let validated = validate_typestate_batch(&authority, batch, &budget).unwrap();
     assert_eq!(validated.projections.len(), 1);
@@ -259,6 +260,7 @@ fn truncated_typestate_witnesses_remain_marked_in_validated_batch() {
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
         work: PolicyWorkReport::default(),
+        subjects: None,
     });
     let validated = validate_typestate_batch(&authority, batch, &PolicyBudget::default()).unwrap();
     assert_eq!(validated.projections.len(), 1);
@@ -412,6 +414,7 @@ fn truncated_typestate_diagnostics_make_batch_inconclusive() {
         diagnostics: Vec::new(),
         diagnostics_truncated: true,
         work: PolicyWorkReport::default(),
+        subjects: None,
     });
     let validated = validate_typestate_batch(&authority, batch, &PolicyBudget::default()).unwrap();
     assert!(

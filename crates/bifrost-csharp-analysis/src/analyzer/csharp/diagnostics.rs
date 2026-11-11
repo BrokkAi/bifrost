@@ -274,8 +274,7 @@ impl CSharpExternalEvidence for RetainedCSharpExternal<'_> {
     }
 
     fn surface_is_known(&self) -> bool {
-        self.index
-            .is_some_and(|index| index.is_complete() && index.has_dependency_inputs())
+        self.index.is_some_and(|index| index.proves_absence())
     }
 
     fn declares_namespace(&self, namespace: &str) -> CSharpExternalNamespace {

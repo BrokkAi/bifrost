@@ -68,6 +68,11 @@ impl SelectedResolutionMountInventory<'_> {
         self.derive_helper_decisions().borrow_mut().enabled = true;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::analyzer::store) fn derive_helper_decisions_enabled_for_test(&self) -> bool {
+        self.derive_helper_decisions().borrow().enabled
+    }
+
     /// Decide every derive-helper gap of `mounts`. `false` means cancelled.
     pub(in crate::analyzer::store) fn decide_derive_helpers_of_mounts(
         &self,

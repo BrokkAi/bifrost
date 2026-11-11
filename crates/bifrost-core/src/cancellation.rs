@@ -6,12 +6,14 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[doc(hidden)]
+#[track_caller]
 pub fn optional_is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
-    cancellation.is_some_and(CancellationToken::is_cancelled)
+    cancellation.is_some_and(|token| token.is_cancelled())
 }
 
 /// Return whether cancellation is observed at this 256-unit polling checkpoint.
 #[doc(hidden)]
+#[track_caller]
 pub fn is_cancelled_at_checkpoint(cancellation: Option<&CancellationToken>, index: usize) -> bool {
     index.is_multiple_of(256) && optional_is_cancelled(cancellation)
 }
@@ -28,6 +30,7 @@ pub struct CancellationToken {
     deadline: Option<Instant>,
     soft_deadline: Option<Instant>,
     parent: Option<Arc<CancellationToken>>,
+    additional_parent: Option<Arc<CancellationToken>>,
     /// What the work under this token is doing right now. See
     /// [`CancellationToken::enter_phase`].
     phase: Arc<Mutex<Option<String>>>,
@@ -126,6 +129,15 @@ impl CancellationToken {
             phase: Arc::clone(&self.phase),
             phase_sink: self.phase_sink.clone(),
             result_sink: self.result_sink.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// Observe both independent cancellation chains for one operation.
+    pub fn combined_with(&self, other: &Self) -> Self {
+        Self {
+            parent: Some(Arc::new(self.clone())),
+            additional_parent: Some(Arc::new(other.clone())),
             ..Self::default()
         }
     }
@@ -261,10 +273,12 @@ impl CancellationToken {
     /// Whether this token or one of its parents has passed its soft deadline.
     ///
     /// Unlike a hard deadline, observing this value never cancels the token.
+    #[track_caller]
     pub fn soft_deadline_passed(&self) -> bool {
         let passed = self.soft_deadline_passed_unrecorded();
         if passed {
-            crate::analyzer::carried_context::mark_execution_dependent();
+            crate::analyzer::execution_census::note_stop_observed();
+            crate::analyzer::carried_context::mark_observed("token");
         }
         passed
     }
@@ -290,22 +304,30 @@ impl CancellationToken {
     }
 
     /// Whether cancellation was triggered by this token's wall-clock deadline.
+    #[track_caller]
     pub fn is_timed_out(&self) -> bool {
         let timed_out = self.timed_out.load(Ordering::Acquire)
             || self
                 .parent
                 .as_ref()
+                .is_some_and(|parent| parent.is_timed_out())
+            || self
+                .additional_parent
+                .as_ref()
                 .is_some_and(|parent| parent.is_timed_out());
         if timed_out {
-            crate::analyzer::carried_context::mark_execution_dependent();
+            crate::analyzer::execution_census::note_stop_observed();
+            crate::analyzer::carried_context::mark_observed("token");
         }
         timed_out
     }
 
+    #[track_caller]
     pub fn is_cancelled(&self) -> bool {
         let cancelled = self.is_cancelled_unrecorded();
         if cancelled {
-            crate::analyzer::carried_context::mark_execution_dependent();
+            crate::analyzer::execution_census::note_stop_observed();
+            crate::analyzer::carried_context::mark_observed("token");
         }
         cancelled
     }
@@ -360,6 +382,10 @@ impl CancellationToken {
         self.parent
             .as_ref()
             .is_some_and(|parent| parent.is_cancelled_unrecorded())
+            || self
+                .additional_parent
+                .as_ref()
+                .is_some_and(|parent| parent.is_cancelled_unrecorded())
     }
 
     #[cfg(any(test, feature = "test-support"))]

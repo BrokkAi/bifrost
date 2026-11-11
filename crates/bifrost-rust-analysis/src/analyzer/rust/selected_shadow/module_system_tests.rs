@@ -613,7 +613,14 @@ fn canonical_rust_occurrences_are_shared_by_native_structural_and_declaration_pr
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
-        brokk_bifrost_rust::declarations::parse_rust_file(&fixture.file(path), source, &tree)
+        brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &fixture.file(path),
+            source,
+            &tree,
+        )
     };
     let first = parse("src/first.rs");
     let second = parse("src/second.rs");

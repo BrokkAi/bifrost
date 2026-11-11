@@ -1,5 +1,6 @@
 //! Request-local proofs from selected Rust type identities and enum syntax.
 
+use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -68,8 +69,11 @@ use ValueTypeBarrierReason::{
 };
 
 struct RustBarrierContext<'a> {
+    // The analyzer the service was opened on, which may be an enclosing
+    // multi-analyzer; the capture records through it, not through `rust`.
+    analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
-    state: RefCell<RustBarrierState<'a>>,
+    state: CaptureScopedMemo<RefCell<RustBarrierState<'a>>>,
 }
 
 struct RustBarrierState<'a> {
@@ -118,8 +122,9 @@ pub(crate) fn open<'a>(
         None => None,
     };
     Ok(Box::new(RustBarrierContext {
+        analyzer,
         rust,
-        state: RefCell::new(RustBarrierState {
+        state: CaptureScopedMemo::new(RefCell::new(RustBarrierState {
             operation,
             unavailable,
             values: HashMap::default(),
@@ -134,7 +139,7 @@ pub(crate) fn open<'a>(
             observation_misses: 0,
             native_type_lookups: 0,
             budget_short_circuits: 0,
-        }),
+        })),
     }))
 }
 
@@ -168,198 +173,208 @@ impl ValueTypeBarrierContext for RustBarrierContext<'_> {
         {
             return Ok(undecided());
         }
-        let mut state = self.state.borrow_mut();
-        let prepared = match prepare_value_type_barrier_source(
-            &self.rust.inner,
-            &mut state.syntax,
-            &file,
-            request,
-        ) {
-            Ok(prepared) => prepared,
-            Err(reason) => return Ok(ObservedValueType::Undecided(reason)),
-        };
-        if !value_type_barrier_source_matches(observation, &prepared)
-            || !self
-                .rust
-                .inner
-                .source_matches_selected_native_content(&file, prepared.source())
-        {
-            return Ok(undecided());
-        }
-        let span = mapping.locator.anchor().span();
-        let Some(expression) = prepared
-            .tree()
-            .root_node()
-            .named_descendant_for_byte_range(span.start_byte() as usize, span.end_byte() as usize)
-        else {
-            return Ok(undecided());
-        };
-        if expression.start_byte() != span.start_byte() as usize
-            || expression.end_byte() != span.end_byte() as usize
-            || expression.has_error()
-            || expression.is_missing()
-        {
-            return Ok(undecided());
-        }
-        let source = prepared.source();
-        let literal = match expression.kind() {
-            "boolean_literal" | "true" | "false" => Some("bool"),
-            "char_literal" => Some("char"),
-            "integer_literal" => super::semantic::rust_integer_literal_parts(source, expression)
-                .and_then(|(_, suffix)| (!suffix.is_empty()).then_some(suffix)),
-            _ => None,
-        };
-        if let Some(canonical) = literal {
-            return Ok(ObservedValueType::Named {
-                canonical: canonical.to_owned(),
-            });
-        }
-        let Some(name) = brokk_bifrost_rust::structural::expression_name_node(expression) else {
-            return Ok(undecided());
-        };
-        let Some(identifier) = source.get(name.start_byte()..name.end_byte()) else {
-            return Ok(undecided());
-        };
-        let Some(binding) = resolve_lexical_binding(
-            Language::Rust,
-            prepared.tree().root_node(),
-            source,
-            name.start_byte(),
-            name.end_byte(),
-            identifier,
-        ) else {
-            return Ok(undecided());
-        };
-        let (LexicalBindingResolution::Parameter(definition)
-        | LexicalBindingResolution::OtherLocal(definition)) = binding;
-        let mut current = prepared.tree().root_node().named_descendant_for_byte_range(
-            definition.declaration_range.start_byte,
-            definition.declaration_range.end_byte,
-        );
-        let declared = loop {
-            let Some(node) = current else {
+        self.state.read(&memo_attribution(self.analyzer), |state| {
+            let mut state = state.borrow_mut();
+            let prepared = match prepare_value_type_barrier_source(
+                &self.rust.inner,
+                &mut state.syntax,
+                &file,
+                request,
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => return Ok(ObservedValueType::Undecided(reason)),
+            };
+            if !value_type_barrier_source_matches(observation, &prepared)
+                || !self
+                    .rust
+                    .inner
+                    .source_matches_selected_native_content(&file, prepared.source())
+            {
+                return Ok(undecided());
+            }
+            let span = mapping.locator.anchor().span();
+            let Some(expression) = prepared.tree().root_node().named_descendant_for_byte_range(
+                span.start_byte() as usize,
+                span.end_byte() as usize,
+            ) else {
                 return Ok(undecided());
             };
-            match node.kind() {
-                "parameter" | "let_declaration" => break node.child_by_field_name("type"),
-                "function_item" | "function_signature_item" | "closure_expression" => {
-                    return Ok(undecided());
-                }
-                _ => current = node.parent(),
-            }
-        };
-        let Some(ty) = declared else {
-            return Ok(undecided());
-        };
-        let primitive = if ty.kind() == "primitive_type" {
-            Some(ty)
-        } else if ty.kind() == "reference_type"
-            && !(0..ty.named_child_count())
-                .filter_map(|index| ty.named_child(index))
-                .any(|child| child.kind() == "mutable_specifier")
-        {
-            ty.child_by_field_name("type")
-                .filter(|inner| inner.kind() == "primitive_type")
-        } else {
-            None
-        };
-        let Some(primitive) = primitive else {
-            return Ok(undecided());
-        };
-        let Some(spelling) = source.get(primitive.start_byte()..primitive.end_byte()) else {
-            return Ok(undecided());
-        };
-        let Some(operation) = state.operation.as_mut() else {
-            return Ok(undecided());
-        };
-        // The Rust resolver replaces primitive intrinsic seeds when lexical
-        // declarations shadow their spelling. Only its selected intrinsic
-        // identity can establish that this occurrence denotes a builtin.
-        let locator = SelectedSemanticLocator::for_reference_range(
-            "rust",
-            mapping.locator.path().as_str(),
-            name.start_byte(),
-            name.end_byte(),
-        );
-        let answer = operation
-            .resolve_rust_type_for_caller_bounded(
-                file.rel_path(),
-                &locator,
-                ReceiverAnalysisBudget::default(),
-                request.cancellation,
-                &mut SelectedResolutionContextMetrics,
-                &mut ResolutionBatchMetrics::default(),
-            )
-            .map_err(|error| SemanticProviderError::source_access(error.to_string()))?;
-        let work = answer.work();
-        request.budget.charge_work(SemanticWork {
-            events: work.scope_nodes,
-            ..Default::default()
-        });
-        if !request.charge_execution_traversal(work.scope_nodes) {
-            return Ok(ObservedValueType::Undecided(BudgetExceeded));
-        }
-        let BoundedResolution::Complete {
-            value:
-                SelectedRustCallerReferenceOutcome::Operation(
-                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                        answers,
-                    )),
-                ),
-            ..
-        } = answer
-        else {
-            return Ok(match answer {
-                BoundedResolution::Cancelled { .. } => ObservedValueType::Undecided(Cancelled),
-                BoundedResolution::Exceeded { .. } => ObservedValueType::Undecided(BudgetExceeded),
-                BoundedResolution::Complete { .. } => undecided(),
-            });
-        };
-        if answers.is_empty() {
-            return Ok(undecided());
-        }
-        let mut selection =
-            brokk_bifrost_analysis::analyzer::native_points::BarrierValueTypeSelection::default();
-        let mut proven = true;
-        for answer in &answers {
-            if !answer.macro_expansion_gaps.is_empty()
-                || !answer.generated_surface_gaps.is_empty()
-                || answer.resolution.binding().targets().len() > 1
+            if expression.start_byte() != span.start_byte() as usize
+                || expression.end_byte() != span.end_byte() as usize
+                || expression.has_error()
+                || expression.is_missing()
             {
-                proven = false;
-                break;
+                return Ok(undecided());
             }
-            let ty = match selection.observe(&answer.resolution, None) {
-                Ok(Some(ty)) => ty,
-                _ => {
+            let source = prepared.source();
+            let literal = match expression.kind() {
+                "boolean_literal" | "true" | "false" => Some("bool"),
+                "char_literal" => Some("char"),
+                "integer_literal" => {
+                    super::semantic::rust_integer_literal_parts(source, expression)
+                        .and_then(|(_, suffix)| (!suffix.is_empty()).then_some(suffix))
+                }
+                _ => None,
+            };
+            if let Some(canonical) = literal {
+                return Ok(ObservedValueType::Named {
+                    canonical: canonical.to_owned(),
+                });
+            }
+            let Some(name) = brokk_bifrost_rust::structural::expression_name_node(expression)
+            else {
+                return Ok(undecided());
+            };
+            let Some(identifier) = source.get(name.start_byte()..name.end_byte()) else {
+                return Ok(undecided());
+            };
+            let Some(binding) = resolve_lexical_binding(
+                Language::Rust,
+                prepared.tree().root_node(),
+                source,
+                name.start_byte(),
+                name.end_byte(),
+                identifier,
+            ) else {
+                return Ok(undecided());
+            };
+            let (LexicalBindingResolution::Parameter(definition)
+            | LexicalBindingResolution::OtherLocal(definition)) = binding;
+            let mut current = prepared.tree().root_node().named_descendant_for_byte_range(
+                definition.declaration_range.start_byte,
+                definition.declaration_range.end_byte,
+            );
+            let declared = loop {
+                let Some(node) = current else {
+                    return Ok(undecided());
+                };
+                match node.kind() {
+                    "parameter" | "let_declaration" => break node.child_by_field_name("type"),
+                    "function_item" | "function_signature_item" | "closure_expression" => {
+                        return Ok(undecided());
+                    }
+                    _ => current = node.parent(),
+                }
+            };
+            let Some(ty) = declared else {
+                return Ok(undecided());
+            };
+            let primitive = if ty.kind() == "primitive_type" {
+                Some(ty)
+            } else if ty.kind() == "reference_type"
+                && !(0..ty.named_child_count())
+                    .filter_map(|index| ty.named_child(index))
+                    .any(|child| child.kind() == "mutable_specifier")
+            {
+                ty.child_by_field_name("type")
+                    .filter(|inner| inner.kind() == "primitive_type")
+            } else {
+                None
+            };
+            let Some(primitive) = primitive else {
+                return Ok(undecided());
+            };
+            let Some(spelling) = source.get(primitive.start_byte()..primitive.end_byte()) else {
+                return Ok(undecided());
+            };
+            let Some(operation) = state.operation.as_mut() else {
+                return Ok(undecided());
+            };
+            // The Rust resolver replaces primitive intrinsic seeds when lexical
+            // declarations shadow their spelling. Only its selected intrinsic
+            // identity can establish that this occurrence denotes a builtin.
+            let locator = SelectedSemanticLocator::for_reference_range(
+                "rust",
+                mapping.locator.path().as_str(),
+                name.start_byte(),
+                name.end_byte(),
+            );
+            let answer = operation
+                .resolve_rust_type_for_caller_bounded(
+                    file.rel_path(),
+                    &locator,
+                    ReceiverAnalysisBudget::default(),
+                    request.cancellation,
+                    &mut SelectedResolutionContextMetrics,
+                    &mut ResolutionBatchMetrics::default(),
+                )
+                .map_err(|error| SemanticProviderError::source_access(error.to_string()))?;
+            let work = answer.work();
+            request.budget.charge_work(SemanticWork {
+                events: work.scope_nodes,
+                ..Default::default()
+            });
+            if !request.charge_execution_traversal(work.scope_nodes) {
+                return Ok(ObservedValueType::Undecided(BudgetExceeded));
+            }
+            let BoundedResolution::Complete {
+                value:
+                    SelectedRustCallerReferenceOutcome::Operation(
+                        SelectedResolutionOperationOutcome::Native(
+                            SelectedResolutionLocated::Found(answers),
+                        ),
+                    ),
+                ..
+            } = answer
+            else {
+                return Ok(match answer {
+                    BoundedResolution::Cancelled { .. } => ObservedValueType::Undecided(Cancelled),
+                    BoundedResolution::Exceeded { .. } => {
+                        ObservedValueType::Undecided(BudgetExceeded)
+                    }
+                    BoundedResolution::Unavailable { .. } => {
+                        ObservedValueType::Undecided(UnavailableObservation)
+                    }
+                    BoundedResolution::Complete { .. } => undecided(),
+                });
+            };
+            if answers.is_empty() {
+                return Ok(undecided());
+            }
+            let mut selection =
+                brokk_bifrost_analysis::analyzer::native_points::BarrierValueTypeSelection::default(
+                );
+            let mut proven = true;
+            for answer in &answers {
+                if !answer.macro_expansion_gaps.is_empty()
+                    || !answer.generated_surface_gaps.is_empty()
+                    || answer.resolution.binding().targets().len() > 1
+                {
                     proven = false;
                     break;
                 }
-            };
-            if !answer.projection.intrinsic_types.iter().any(|intrinsic| {
-                intrinsic.identity() == ty.identity()
-                    && intrinsic.kind() == IntrinsicTypeKind::Primitive
-                    && intrinsic.spelling() == spelling
-            }) {
-                proven = false;
-                break;
+                let ty = match selection.observe(&answer.resolution, None) {
+                    Ok(Some(ty)) => ty,
+                    _ => {
+                        proven = false;
+                        break;
+                    }
+                };
+                if !answer.projection.intrinsic_types.iter().any(|intrinsic| {
+                    intrinsic.identity() == ty.identity()
+                        && intrinsic.kind() == IntrinsicTypeKind::Primitive
+                        && intrinsic.spelling() == spelling
+                }) {
+                    proven = false;
+                    break;
+                }
             }
-        }
-        proven &= selection.finish().is_ok();
-        let canonical = if proven {
-            if ty.kind() == "reference_type" {
-                (spelling == "str").then_some("&str")
+            proven &= selection.finish().is_ok();
+            let canonical = if proven {
+                if ty.kind() == "reference_type" {
+                    (spelling == "str").then_some("&str")
+                } else {
+                    Some(spelling)
+                }
             } else {
-                Some(spelling)
-            }
-        } else {
-            None
-        };
-        Ok(
-            canonical.map_or_else(undecided, |canonical| ObservedValueType::Named {
-                canonical: canonical.to_owned(),
-            }),
-        )
+                None
+            };
+            Ok(
+                canonical.map_or_else(undecided, |canonical| ObservedValueType::Named {
+                    canonical: canonical.to_owned(),
+                }),
+            )
+        })
     }
 
     fn classify(
@@ -371,84 +386,94 @@ impl ValueTypeBarrierContext for RustBarrierContext<'_> {
         if request.cancellation.is_cancelled() {
             return Ok(Undecided(Cancelled));
         }
-        let mut state = self.state.borrow_mut();
-        let value = observation
-            .point()
-            .procedure()
-            .value_handle(observation.value())
-            .expect("observation value was validated at construction");
-        state.distinct_values.insert(value.clone());
-        let key = (value, predicate);
-        if let Some(&decision) = state.values.get(&key) {
-            // Native lookup reads this value's immutable source mapping, not
-            // the point or phase at which propagation observes it. The handle
-            // includes materialization identity; another procedure body cannot
-            // reuse this proof merely because its dense ValueId is equal.
-            // The proof was validated before entering this request's memo.
-            state.observation_hits += 1;
-            return Ok(decision);
-        }
-        let semantic_key = (key.0.clone(), predicate, request.budget.remaining());
-        if state.semantic_failures.contains(&semantic_key)
-            || state.budget_failures.contains(&(
-                key.0.clone(),
-                predicate,
-                ReceiverAnalysisBudget::default(),
-            ))
-        {
-            // One bounded attempt per value/predicate/full budget in this query.
-            // Later native cache warming deliberately does not retry that budget.
-            state.observation_hits += 1;
-            state.budget_hits += 1;
-            return Ok(Undecided(BudgetExceeded));
-        }
-        state.observation_misses += 1;
-        let decision = self.classify_observation(&mut state, observation, predicate, request)?;
-        let decision = if let Some(operation) = state.operation.as_mut() {
-            match operation
-                .finish_native(
-                    decision,
-                    &ResolutionCompletion::Complete,
-                    request.cancellation,
-                )
-                .map_err(|error| SemanticProviderError::source_access(error.to_string()))?
-            {
-                SelectedResolutionOperationOutcome::Native(decision) => decision,
-                SelectedResolutionOperationOutcome::Cancelled(_) => Undecided(Cancelled),
-                SelectedResolutionOperationOutcome::Stale(_)
-                | SelectedResolutionOperationOutcome::Unavailable(_) => Undecided(IncompleteType),
+        self.state.read(&memo_attribution(self.analyzer), |state| {
+            let mut state = state.borrow_mut();
+            let value = observation
+                .point()
+                .procedure()
+                .value_handle(observation.value())
+                .expect("observation value was validated at construction");
+            state.distinct_values.insert(value.clone());
+            let key = (value, predicate);
+            if let Some(&decision) = state.values.get(&key) {
+                // Native lookup reads this value's immutable source mapping, not
+                // the point or phase at which propagation observes it. The handle
+                // includes materialization identity; another procedure body cannot
+                // reuse this proof merely because its dense ValueId is equal.
+                // The proof was validated before entering this request's memo.
+                state.observation_hits += 1;
+                return Ok(decision);
             }
-        } else {
-            decision
-        };
-        if decision == Undecided(BudgetExceeded) {
-            state.semantic_failures.insert(semantic_key);
-        } else if decision != Undecided(Cancelled) {
-            state.values.insert(key, decision);
-        }
-        Ok(decision)
+            let semantic_key = (key.0.clone(), predicate, request.budget.remaining());
+            if state.semantic_failures.contains(&semantic_key)
+                || state.budget_failures.contains(&(
+                    key.0.clone(),
+                    predicate,
+                    ReceiverAnalysisBudget::default(),
+                ))
+            {
+                // One bounded attempt per value/predicate/full budget in this query.
+                // Later native cache warming deliberately does not retry that budget.
+                state.observation_hits += 1;
+                state.budget_hits += 1;
+                return Ok(Undecided(BudgetExceeded));
+            }
+            state.observation_misses += 1;
+            let decision =
+                self.classify_observation(&mut state, observation, predicate, request)?;
+            let decision = if let Some(operation) = state.operation.as_mut() {
+                match operation
+                    .finish_native(
+                        decision,
+                        &ResolutionCompletion::Complete,
+                        request.cancellation,
+                    )
+                    .map_err(|error| SemanticProviderError::source_access(error.to_string()))?
+                {
+                    SelectedResolutionOperationOutcome::Native(decision) => decision,
+                    SelectedResolutionOperationOutcome::Cancelled(_) => Undecided(Cancelled),
+                    SelectedResolutionOperationOutcome::Stale(_)
+                    | SelectedResolutionOperationOutcome::Unavailable(_) => {
+                        Undecided(IncompleteType)
+                    }
+                }
+            } else {
+                decision
+            };
+            if decision == Undecided(BudgetExceeded) {
+                state.semantic_failures.insert(semantic_key);
+            } else if decision != Undecided(Cancelled) {
+                state.values.insert(key, decision);
+            }
+            Ok(decision)
+        })
     }
 }
 
 impl Drop for RustBarrierContext<'_> {
     fn drop(&mut self) {
-        let state = self.state.get_mut();
-        brokk_bifrost_core::profiling::note_with(|| {
-            format!(
-                "taint.barriers.rust.counts operation_opens={} observation_hits={} observation_misses={} value_predicate_keys={} type_predicate_keys={} native_type_lookups={} budget_short_circuits={} distinct_value_keys={} budget_refusals={} budget_memo_hits={} native_failure_keys={} prepared_files={}",
-                usize::from(state.operation.is_some()),
-                state.observation_hits,
-                state.observation_misses,
-                state.values.len(),
-                state.types.len(),
-                state.native_type_lookups,
-                state.budget_short_circuits,
-                state.distinct_values.len(),
-                state.budget_refusals,
-                state.budget_hits,
-                state.budget_failures.len(),
-                state.syntax.len(),
-            )
+        // Profiling output only: `account` reads the counters without binding
+        // the memo to a capture, which a drop outside any capture must not do.
+        self.state.account(|state| {
+            let state = state.borrow();
+            brokk_bifrost_core::profiling::note_with(|| {
+                format!(
+                    "taint.barriers.rust.counts operation_opens={} observation_hits={} observation_misses={} value_predicate_keys={} type_predicate_keys={} native_type_lookups={} budget_short_circuits={} distinct_value_keys={} budget_refusals={} budget_memo_hits={} native_failure_keys={} prepared_files={}",
+                    usize::from(state.operation.is_some()),
+                    state.observation_hits,
+                    state.observation_misses,
+                    state.values.len(),
+                    state.types.len(),
+                    state.native_type_lookups,
+                    state.budget_short_circuits,
+                    state.distinct_values.len(),
+                    state.budget_refusals,
+                    state.budget_hits,
+                    state.budget_failures.len(),
+                    state.syntax.len(),
+                )
+            });
+            0
         });
     }
 }
@@ -575,6 +600,9 @@ impl RustBarrierContext<'_> {
                 state.budget_failures.insert(failure_key);
                 (Undecided(BudgetExceeded), work)
             }
+            BoundedResolution::Unavailable { work, .. } => {
+                (Undecided(UnavailableObservation), work)
+            }
             BoundedResolution::Complete { value, work } => (
                 match value {
                     SelectedRustCallerReferenceOutcome::Operation(
@@ -603,10 +631,12 @@ impl RustBarrierContext<'_> {
             ),
         };
         request.budget.charge_work(SemanticWork {
-            events: work.scope_nodes,
+            events: work.scope_nodes.saturating_add(work.hierarchy_order_steps),
             ..Default::default()
         });
-        if !request.charge_execution_traversal(work.scope_nodes) {
+        if !request
+            .charge_execution_traversal(work.scope_nodes.saturating_add(work.hierarchy_order_steps))
+        {
             return Ok(Undecided(BudgetExceeded));
         }
         Ok(decision)
@@ -916,8 +946,9 @@ fn run(flag: bool, alias: AliasBool, lookalike: Bool, state: State,
             panic!("native operation must be admitted");
         };
         let context = RustBarrierContext {
+            analyzer: &rust,
             rust: &rust,
-            state: RefCell::new(RustBarrierState {
+            state: CaptureScopedMemo::new(RefCell::new(RustBarrierState {
                 operation: None,
                 unavailable: IncompleteType,
                 values: HashMap::default(),
@@ -932,7 +963,7 @@ fn run(flag: bool, alias: AliasBool, lookalike: Bool, state: State,
                 observation_misses: 0,
                 native_type_lookups: 0,
                 budget_short_circuits: 0,
-            }),
+            })),
         };
         let mut budget = SemanticBudget::default();
         let mut request = SemanticRequest::new(&mut budget, &cancellation);

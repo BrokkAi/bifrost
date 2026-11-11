@@ -126,7 +126,7 @@ impl CallRelationProvider for GoNativeCallRelations {
             return unavailable("native Go analyzer is unavailable", caller);
         };
         crate::analyzer::go::native_outgoing::outgoing(
-            go,
+            analyzer, go,
             caller,
             limits,
             brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),

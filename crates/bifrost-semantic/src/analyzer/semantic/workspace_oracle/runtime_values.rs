@@ -283,7 +283,10 @@ pub fn gap_belongs_to_load(
                 && gap.capability == SemanticCapability::ExceptionalControlFlow))
 }
 
-use brokk_bifrost_core::complete_value_cache::CompleteValueCache;
+use brokk_bifrost_core::budgeted_value_cache::BudgetedValueCache;
+use brokk_bifrost_core::retention_budget::{
+    Accounted, RetainedBytes, RetentionBudget, SharedAllocation,
+};
 use brokk_bifrost_js_ts::syntax::{
     JsTsRuntimeAccessKey, JsTsRuntimeAccessorCoverage, JsTsRuntimeMutationEvidence,
     JsTsRuntimeReadFacts, JsTsRuntimeRootResolution, extract_js_ts_runtime_reads,
@@ -537,7 +540,7 @@ pub fn runtime_syntax_facts(
 }
 
 #[doc(hidden)]
-pub type RuntimeReadCache = CompleteValueCache<ProcedureHandle, RuntimeKeyedReadResult>;
+pub type RuntimeReadCache = BudgetedValueCache<ProcedureHandle, RuntimeKeyedReadResult>;
 
 /// Pure frontend facts, before model activation or procedure-local projection.
 /// A complete census can still describe invalid syntax; consumers must retain
@@ -553,38 +556,42 @@ pub struct RuntimeSyntaxSnapshot {
     pub work: crate::analyzer::semantic::SemanticBudgetReplay,
     #[doc(hidden)]
     pub owner: Arc<()>,
+    #[doc(hidden)]
+    pub admission: crate::analyzer::semantic::SemanticMemoAdmission,
 }
 
 #[doc(hidden)]
-pub type RuntimeSyntaxCache = CompleteValueCache<StableDigest, RuntimeSyntaxSnapshot>;
+pub type RuntimeSyntaxCache =
+    BudgetedValueCache<StableDigest, SharedAllocation<Accounted<RuntimeSyntaxSnapshot>>>;
 
-#[doc(hidden)]
-pub fn runtime_syntax_cache() -> RuntimeSyntaxCache {
-    CompleteValueCache::new(8 * 1024 * 1024, |_, value: &Arc<RuntimeSyntaxSnapshot>| {
-        let facts = &value.facts;
-        let weight = std::mem::size_of::<RuntimeSyntaxSnapshot>()
+impl RetainedBytes for RuntimeSyntaxSnapshot {
+    fn retained_bytes(&self) -> usize {
+        let facts = &self.facts;
+        let weight = self.admission.retained_bytes()
+            + std::mem::size_of::<RuntimeSyntaxSnapshot>()
             + facts.reads.capacity() * std::mem::size_of::<RuntimeSyntaxRead>()
             + facts.writes.capacity() * std::mem::size_of::<String>();
-        facts
-            .reads
-            .iter()
-            .fold(
-                facts.writes.iter().fold(weight, |total, write| {
-                    total.saturating_add(write.capacity())
-                }),
-                |total, read| {
-                    total.saturating_add(
-                        read.root_name.capacity()
-                            + read.container.capacity()
-                            + match &read.key {
-                                Ok(RuntimeAccessKey::Property(key)) => key.capacity(),
-                                _ => 0,
-                            },
-                    )
-                },
-            )
-            .min(u32::MAX as usize) as u32
-    })
+        facts.reads.iter().fold(
+            facts.writes.iter().fold(weight, |total, write| {
+                total.saturating_add(write.capacity())
+            }),
+            |total, read| {
+                total.saturating_add(
+                    read.root_name.capacity()
+                        + read.container.capacity()
+                        + match &read.key {
+                            Ok(RuntimeAccessKey::Property(key)) => key.capacity(),
+                            _ => 0,
+                        },
+                )
+            },
+        )
+    }
+}
+
+#[doc(hidden)]
+pub fn runtime_syntax_cache(budget: &RetentionBudget) -> RuntimeSyntaxCache {
+    BudgetedValueCache::new(budget.region("semantic.runtime_syntax", None))
 }
 
 /// The runtime initialization and mutation footprint of every other
@@ -609,61 +616,62 @@ pub enum WorkspaceRuntimeWriteFootprint {
 
 #[doc(hidden)]
 pub type WorkspaceRuntimeWriteFootprintCache =
-    CompleteValueCache<ProjectFile, WorkspaceRuntimeWriteFootprint>;
+    BudgetedValueCache<ProjectFile, WorkspaceRuntimeWriteFootprint>;
 
-#[doc(hidden)]
-pub fn workspace_runtime_write_footprint_cache() -> WorkspaceRuntimeWriteFootprintCache {
-    CompleteValueCache::new(1024 * 1024, |_, _| 256)
+impl RetainedBytes for WorkspaceRuntimeWriteFootprint {
+    fn retained_bytes(&self) -> usize {
+        256
+    }
 }
 
 #[doc(hidden)]
-pub fn runtime_read_cache() -> RuntimeReadCache {
-    CompleteValueCache::new(
-        8 * 1024 * 1024,
-        |_, result: &Arc<RuntimeKeyedReadResult>| {
-            result
-                .endpoints
-                .iter()
-                .fold(
-                    256usize.saturating_add(result.candidates.iter().fold(
-                        0usize,
-                        |total, candidate| {
-                            total.saturating_add(
-                                std::mem::size_of::<RuntimeKeyedReadCandidate>()
-                                    + candidate.global.len()
-                                    + candidate.container.len()
-                                    + candidate.key.as_ref().map_or(0, |key| match key {
-                                        RuntimeAccessKey::Property(property) => property.len(),
-                                        RuntimeAccessKey::Index(_) => 0,
-                                    }),
-                            )
-                        },
-                    )),
-                    |total, endpoint| {
-                        total.saturating_add(
-                            512 + endpoint.runtime.len()
-                                + endpoint.global.len()
-                                + endpoint.container.len()
-                                + endpoint.active_model_set_hash.len()
-                                + endpoint.manifest_digest.len()
-                                + endpoint.shard_id.len()
-                                + endpoint.activation_source.len()
-                                + endpoint.producer.len()
-                                + endpoint.runtime_profile_digest.len()
-                                + endpoint.exposure_id.len()
-                                + endpoint.behavior_id.len()
-                                + match &endpoint.key {
-                                    RuntimeAccessKey::Property(key) => key.len(),
-                                    RuntimeAccessKey::Index(_) => 16,
-                                }
-                                + endpoint.discharged_gaps.len()
-                                    * std::mem::size_of::<SemanticGapId>(),
-                        )
-                    },
+pub fn workspace_runtime_write_footprint_cache(
+    budget: &RetentionBudget,
+) -> WorkspaceRuntimeWriteFootprintCache {
+    BudgetedValueCache::new(budget.region("semantic.runtime_write_footprint", None))
+}
+
+#[doc(hidden)]
+pub fn runtime_read_cache(budget: &RetentionBudget) -> RuntimeReadCache {
+    BudgetedValueCache::new(budget.region("semantic.runtime_reads", None))
+}
+
+impl RetainedBytes for RuntimeKeyedReadResult {
+    fn retained_bytes(&self) -> usize {
+        self.endpoints.iter().fold(
+            256usize.saturating_add(self.candidates.iter().fold(0usize, |total, candidate| {
+                total.saturating_add(
+                    std::mem::size_of::<RuntimeKeyedReadCandidate>()
+                        + candidate.global.len()
+                        + candidate.container.len()
+                        + candidate.key.as_ref().map_or(0, |key| match key {
+                            RuntimeAccessKey::Property(property) => property.len(),
+                            RuntimeAccessKey::Index(_) => 0,
+                        }),
                 )
-                .min(u32::MAX as usize) as u32
-        },
-    )
+            })),
+            |total, endpoint| {
+                total.saturating_add(
+                    512 + endpoint.runtime.len()
+                        + endpoint.global.len()
+                        + endpoint.container.len()
+                        + endpoint.active_model_set_hash.len()
+                        + endpoint.manifest_digest.len()
+                        + endpoint.shard_id.len()
+                        + endpoint.activation_source.len()
+                        + endpoint.producer.len()
+                        + endpoint.runtime_profile_digest.len()
+                        + endpoint.exposure_id.len()
+                        + endpoint.behavior_id.len()
+                        + match &endpoint.key {
+                            RuntimeAccessKey::Property(key) => key.len(),
+                            RuntimeAccessKey::Index(_) => 16,
+                        }
+                        + endpoint.discharged_gaps.len() * std::mem::size_of::<SemanticGapId>(),
+                )
+            },
+        )
+    }
 }
 
 impl RuntimeKeyedReadResult {

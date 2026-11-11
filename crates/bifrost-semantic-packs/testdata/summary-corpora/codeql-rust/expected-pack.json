@@ -1,0 +1,381 @@
+{
+  "schema_version": 22,
+  "pack_id": "codeql.rust-stdlib.summaries",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost-codeql-rust",
+    "version": "0.11.0"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "toolchains": [
+      {
+        "name": "rust",
+        "requirement": "=1.100.0-nightly"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "https://github.com/github/codeql (MIT); stdlib bifrost.rust-stdlib@1.100.0-nightly source-set c7ef5e3d3c34f267d81d2c06f1d5cacced6abdfd59e51e5b8467529600ef5bce",
+    "revision": "1be292a1e54696ca543b4ad0f9b4537b9687caa7"
+  },
+  "license": "MIT",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.codeql-rust-stdlib",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "rust",
+            "version": "=1.100.0-nightly"
+          },
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.codeql-rust.member.004445c68711af0549dd971e3831cedbc76a8f19b86ac55f987525edb482b514",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.unicode.unicode_data.conversions.to_lower",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.080aca5b62a8e838fbd2e9b604b2039fcd59e80ef18c747f60a33e18ea1ff1a9",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.ptr.with_exposed_provenance",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.0ddcb5e7c57d89c5a3ae091f06aa25bdce23391c0624589870c5ce44812fba1b",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.mem.transmute_copy",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.0eb8cd06edae383af622b846c358b8f3e6b0335649591c8398eeefe90e6a83f1",
+            "target": {
+              "path": "alloc.json",
+              "symbol": "alloc.fmt.format",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.19b9b1db51e9389510eb861b74afe1b2ca9d64f54d6ddb7d767ff987b037f5af",
+            "target": {
+              "path": "std.json",
+              "symbol": "std.os.unix.fs.lchown",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.296ae4e5708f0e4dfb04319727644a4e9f7b208db5888b089097b20694d39f7f",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.array.from_ref",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.3427d3c39396aefde2ee0f3a461ca17f7f9c0a0599b80f88f553ba9e8b9e8a43",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.unicode.unicode_data.conversions.to_upper",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.4a05724c746db283e8c51fda83c0a128e2f5f9874c53394b03ae765743ab952b",
+            "target": {
+              "path": "std.json",
+              "symbol": "std.os.unix.fs.mkfifo",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.574c78d8149d3a676312bd3a901eafc40e6bdef548dc7d762194b531c11f92cf",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.array.from_mut",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.638774fc18130a4016edfe33388f9ec7f4564f8bd22d0d2641e14f1c5180c2fe",
+            "target": {
+              "path": "std.json",
+              "symbol": "std.os.unix.fs.chown",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.89e64b94dec65ef8faf034c672b2bc3b0c147a7b9b41b6b0e62583292de1bdd3",
+            "target": {
+              "path": "std.json",
+              "symbol": "std.fs.set_permissions",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.d505a8823e622044d39d532dd3f3877f038c159844d9ee327b893cf25c7ae0d4",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.ptr.with_exposed_provenance_mut",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "summary.codeql-rust.member.e0a2cdca980ea76e91734113ecb8d532ba7d0188eee6bb07fc201f89aeae454f",
+            "target": {
+              "path": "core.json",
+              "symbol": "core.char.from_digit",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

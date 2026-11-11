@@ -144,6 +144,13 @@ pub(crate) struct TypedConstructionInput {
     pub(crate) binding: ResolutionAnswer,
 }
 
+/// Query-local construction evidence; independent of the callee binding.
+#[derive(Clone, Debug)]
+pub(crate) struct TypedConstructionResult {
+    pub(crate) value: Option<ResolutionSlotValue>,
+    pub(crate) completion: ResolutionCompletion,
+}
+
 enum TypedPrerequisiteInput {
     Member(QualifiedMemberInput),
     Construction(TypedConstructionInput),
@@ -166,13 +173,21 @@ impl TypedPrerequisiteInput {
 /// An optional provider view owns prepared language data and shared row slots.
 /// Default languages need no associated context/row types or allocations.
 pub(crate) trait QualifiedMemberProvider {
+    /// Register a recipe constructed by this operation rather than read from a fragment.
+    fn register_query_lookup(&mut self, _lookup: SemanticId, _spelling: &str) -> bool {
+        false
+    }
+
     fn poll_construction(
         &mut self,
         _input: &TypedConstructionInput,
         _provenance: HierarchyProvenanceView<'_>,
         _resume: CloseResume<'_>,
-    ) -> StoreResult<CloseProgress<Option<ResolutionSlotValue>>> {
-        Ok(CloseProgress::Ready(None))
+    ) -> StoreResult<CloseProgress<TypedConstructionResult>> {
+        Ok(CloseProgress::Ready(TypedConstructionResult {
+            value: None,
+            completion: ResolutionCompletion::Complete,
+        }))
     }
 
     fn prepare_qualified_member(
@@ -312,13 +327,15 @@ enum TypedPrerequisiteAnswer {
             crate::analyzer::store::resolution_operation::member_access::MemberAccessResult,
         >,
     ),
-    Construction(Option<ResolutionSlotValue>),
+    Construction(TypedConstructionResult),
 }
 
 /// Readiness of the member request is separate from its semantic coverage.
 #[derive(Debug)]
 pub(crate) enum MemberSelectionOutcome {
     QualifierIsNamespace,
+    AdmittedBinding(SemanticId),
+    OwnDictionary(Vec<SemanticId>),
     Ready {
         request: Option<MemberSelectionRequest>,
         completion: ResolutionCompletion,
@@ -330,6 +347,8 @@ pub(crate) enum MemberSelectionOutcome {
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct MemberSelection {
+    /// Only these exact own dictionaries were demanded; no MRO closure is asserted.
+    pub(crate) own_dictionary: bool,
     pub(super) query_obligations: super::super::QueryObligations,
     pub(crate) order: Option<HierarchyOrderOutcomeId>,
     pub(crate) provenance: HierarchySelectionProvenance,
@@ -337,6 +356,12 @@ pub struct MemberSelection {
     pub(crate) completion: ResolutionCompletion,
     /// Negative provider proofs from this selection's exact hierarchy requests.
     pub(crate) discharged_provider_reasons: BTreeSet<SemanticId>,
+}
+
+pub(crate) struct MemberQueryResult {
+    pub(crate) access:
+        crate::analyzer::store::resolution_operation::member_access::MemberAccessResult,
+    pub(crate) order: Option<HierarchyOrderOutcomeId>,
 }
 
 struct MemberSelectionFrame<'source> {
@@ -348,6 +373,34 @@ struct MemberSelectionFrame<'source> {
     owners: BTreeSet<SemanticId>,
     completion: ResolutionCompletion,
     discharged_provider_reasons: BTreeSet<SemanticId>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PYTHON_CONSTRUCTOR_ORDER_TEST: std::cell::Cell<Option<SemanticId>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_python_constructor_order_test<T>(
+    root: SemanticId,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PYTHON_CONSTRUCTOR_ORDER_TEST.set(None);
+        }
+    }
+    PYTHON_CONSTRUCTOR_ORDER_TEST.with(|slot| {
+        assert!(slot.replace(Some(root)).is_none());
+    });
+    let _reset = Reset;
+    run()
+}
+
+#[cfg(test)]
+pub(crate) fn is_python_constructor_order_test_root(root: SemanticId) -> bool {
+    PYTHON_CONSTRUCTOR_ORDER_TEST.get() == Some(root)
 }
 
 enum MemberSelectionPoll {
@@ -389,7 +442,8 @@ impl<'source> MemberSelectionFrame<'source> {
         } else {
             request.namespace
         };
-        let order = request.order.map(|request| {
+        #[allow(unused_mut)]
+        let mut order = request.order.map(|request| {
             HierarchyOrderState::new(request, HierarchyProvenanceView::new(evaluation.hierarchy))
         });
         let mut groups = BTreeMap::<HierarchyLookupShape, Vec<HierarchyRoot>>::new();
@@ -419,6 +473,38 @@ impl<'source> MemberSelectionFrame<'source> {
                 value,
                 route_ordinal: 0,
             });
+        }
+        #[cfg(test)]
+        if request.language == Language::Python
+            && let Some(root) = PYTHON_CONSTRUCTOR_ORDER_TEST.get()
+            && groups
+                .values()
+                .flatten()
+                .any(|candidate| candidate.owner == root)
+        {
+            let provenance = HierarchyProvenanceId::default();
+            let base = evaluation.hierarchy.order.owner(
+                SemanticId::for_test("8704-constructor-base"),
+                Vec::new(),
+                provenance,
+                false,
+            );
+            let expression = evaluation.hierarchy.order.owner(
+                root,
+                vec![HierarchyOrderedBase {
+                    expression: base,
+                    reference: root,
+                    kind: None,
+                    ordinal: 0,
+                }],
+                provenance,
+                false,
+            );
+            order
+                .as_mut()
+                .expect("constructor requests C3")
+                .root(expression, root);
+            groups.clear();
         }
         Some(Self {
             order,
@@ -547,21 +633,31 @@ impl<'source> MemberSelectionFrame<'source> {
                 brokk_bifrost_core::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_HIERARCHY_ORDER_STEPS,
                 ResolutionSession::hierarchy_order_limit,
             );
-            let remaining = limit.saturating_sub(evaluation.hierarchy.order_work);
+            #[cfg(test)]
+            let limit = if PYTHON_CONSTRUCTOR_ORDER_TEST.get().is_some() {
+                1
+            } else {
+                limit
+            };
+            let session = &*evaluation.session;
             let view = HierarchyProvenanceView::new(evaluation.hierarchy);
             let mut steps = 0;
             let outcome = order.poll(
                 &evaluation.hierarchy.order,
                 view,
+                evaluation.root,
+                limit,
                 &mut || {
-                    if poll_cancelled(cancellation, work) || steps == remaining {
+                    if poll_cancelled(cancellation, work)
+                        || !session.charge_hierarchy_order_steps(1)
+                    {
                         return false;
                     }
                     steps += 1;
                     super::super::seam_profile::record_hierarchy_order_step();
                     true
                 },
-                &mut || cancellation.is_cancelled(),
+                &mut || cancellation.is_cancelled() || session.resolution_stopped(),
             );
             evaluation.hierarchy.order_work += steps;
             let outcome = outcome?;
@@ -576,6 +672,7 @@ impl<'source> MemberSelectionFrame<'source> {
             None
         };
         Ok(MemberSelectionPoll::Ready(MemberSelection {
+            own_dictionary: false,
             // Member-selection polling never begins a new evaluation round; dependency waits resume this same ledger.
             query_obligations: evaluation.query_obligations.published(),
             order,
@@ -667,7 +764,10 @@ impl ClosedQueryScope {
             .iter()
             .filter_map(|(_, reason)| match reason {
                 ResolutionIncompleteReason::OpenBoundary { semantic, .. }
-                | ResolutionIncompleteReason::UnsupportedSemantic(semantic) => Some(*semantic),
+                | ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => {
+                    Some(*semantic)
+                }
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
@@ -702,6 +802,45 @@ impl ClosedQueryScope {
     }
 }
 
+/// A selected route's positive nominal owner, scoped to its exact terminal.
+/// This is not member, dispatch, or absence authority.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SelectedExternalOwner {
+    pub(crate) reference: SemanticId,
+    pub(crate) owner: SemanticId,
+    pub(crate) authority: ExternalNominalAuthority,
+    pub(crate) selection: SelectedExternalOwnerSelection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ExternalNominalAuthority {
+    LanguageRoot,
+    IndexedDeclaration,
+    UnindexedModelDeclaration,
+}
+
+pub(crate) fn jvm_external_nominal_authority(
+    provider_id: &str,
+    indexed: bool,
+) -> ExternalNominalAuthority {
+    if provider_id == "jvm-intrinsic" {
+        ExternalNominalAuthority::LanguageRoot
+    } else if indexed {
+        ExternalNominalAuthority::IndexedDeclaration
+    } else {
+        ExternalNominalAuthority::UnindexedModelDeclaration
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SelectedExternalOwnerSelection {
+    ExplicitImport(SemanticId),
+    Jvm {
+        route: crate::analyzer::store::resolution_operation::demand_closure::RouteAlternativeOwner,
+        import_token: Option<SemanticId>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ClosureDischarges {
@@ -719,6 +858,8 @@ pub struct ClosureDischarges {
     /// A closed selected route's exact terminal targets, including an empty
     /// set when the provider exhausted the route and proved no target exists.
     pub(crate) selected_targets: Option<BTreeSet<SemanticId>>,
+    /// Nominal owners certified by the same selected alternatives as targets.
+    pub(crate) selected_external_owners: BTreeSet<SelectedExternalOwner>,
     /// The selected route may remove the listed gaps on its own empty answer.
     pub(crate) authoritative_empty_result: bool,
     /// A type-prefix proof also closes the same exact prefix reference's gap.
@@ -741,6 +882,7 @@ impl ClosureDischarges {
             positive_binding_providers: BTreeMap::new(),
             operation_local_placeholders: false,
             selected_targets: None,
+            selected_external_owners: BTreeSet::new(),
             authoritative_empty_result: false,
             prefix_reference: None,
             prefix_reasons: BTreeSet::new(),
@@ -757,6 +899,7 @@ impl ClosureDischarges {
             positive_binding_providers: BTreeMap::new(),
             operation_local_placeholders: true,
             selected_targets: None,
+            selected_external_owners: BTreeSet::new(),
             authoritative_empty_result: false,
             prefix_reference: None,
             prefix_reasons: BTreeSet::new(),
@@ -782,6 +925,14 @@ impl ClosureDischarges {
         } else {
             self.selected_targets = Some(targets);
         }
+        self
+    }
+
+    pub(crate) fn with_selected_external_owner(
+        mut self,
+        certificate: SelectedExternalOwner,
+    ) -> Self {
+        self.selected_external_owners.insert(certificate);
         self
     }
 
@@ -845,6 +996,8 @@ impl ClosureDischarges {
                 .get_or_insert_with(BTreeSet::new)
                 .extend(targets);
         }
+        self.selected_external_owners
+            .extend(other.selected_external_owners);
         self.authoritative_empty_result |= other.authoritative_empty_result;
         if let Some(reference) = other.prefix_reference {
             assert!(
@@ -884,7 +1037,37 @@ pub(crate) enum RootDiscovery {
     Cancelled(ResolutionCompletion),
 }
 
-pub(crate) trait RootProvider {
+/// Scheduler code is generic over `P: RootProvider + ?Sized`, which cannot
+/// unsize to `&dyn RootProvider`; this hands signature certification a shared
+/// view of the same provider.
+pub(crate) trait AsDynRootProvider {
+    fn as_dyn_root_provider(&self) -> &dyn RootProvider;
+}
+
+impl<P: RootProvider> AsDynRootProvider for P {
+    fn as_dyn_root_provider(&self) -> &dyn RootProvider {
+        self
+    }
+}
+
+pub(crate) trait RootProvider: AsDynRootProvider {
+    /// Certifies an external Go type leaf of a compared signature against the
+    /// selected owner this provider's current close attempt recorded.
+    fn certify_external_owner(
+        &self,
+        _reference: SemanticId,
+        _slot: SemanticId,
+        _semantic: SemanticId,
+        _kind: Option<crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind>,
+    ) -> Option<crate::analyzer::resolution::selected_context::ValidatedOwner> {
+        None
+    }
+    fn order_cost(&self, _endpoint: &RelationKey) -> usize {
+        0
+    }
+
+    fn record_order_cost(&mut self, _endpoint: &RelationKey, _cost: usize) {}
+
     fn qualified_members(&mut self) -> Option<&mut dyn QualifiedMemberProvider> {
         None
     }
@@ -1090,6 +1273,7 @@ pub(crate) enum BatchOutcome {
 struct Task<'a> {
     root: ReferenceKey,
     memo_key: Option<RootMemoKey>,
+    memo_prefix_ready: bool,
     frame: Option<DemandFactEvaluationTask<'a>>,
     answer: Option<FactResolutionAnswer>,
     /// This task's own frame metrics, mirrored after every poll of it.
@@ -1128,6 +1312,9 @@ struct DemandedReferenceOwner {
 
 struct Relation<'source> {
     endpoint: RelationKey,
+    /// Logical order steps paid by the first consumer and replayed by later consumers.
+    order_cost: usize,
+    child_relations: HashSet<usize>,
     dependencies: Vec<usize>,
     pending: usize,
     waiters: Vec<usize>,
@@ -1174,6 +1361,7 @@ enum QualifiedMemberPhase {
     Access,
 }
 
+#[derive(Clone, Copy)]
 enum RelationAdmission {
     Ready(usize),
     Cancelled,
@@ -1196,13 +1384,23 @@ struct Scheduler<'a> {
     runnable: VecDeque<Runnable>,
     relations: Vec<Relation<'a>>,
     relation_ids: HashMap<RelationKey, usize>,
+    replayed_relations: HashSet<(MemberConsumerId, usize)>,
+    #[cfg(test)]
+    warm_replay_charges: Vec<(MemberConsumerId, usize, usize)>,
+    #[cfg(test)]
+    pending_replay_charges: Vec<(MemberConsumerId, usize, usize)>,
     qualified_members: HashMap<usize, QualifiedMemberWait<'a>>,
+    // A standalone member query uses the same parked member consumer as typed
+    // expressions, but returns its access result without evaluating a lexical root.
+    member_query: Option<usize>,
+    member_query_order: Option<HierarchyOrderOutcomeId>,
+    member_query_result: Option<
+        crate::analyzer::store::resolution_operation::demand_closure::Read<
+            crate::analyzer::store::resolution_operation::member_access::MemberAccessResult,
+        >,
+    >,
     typed_references: HashMap<usize, (SemanticId, usize)>,
     qualified_dependents: HashMap<usize, Vec<usize>>,
-    qualified_evidence: HashMap<
-        QualifiedMemberId,
-        crate::analyzer::store::resolution_operation::member_access::MemberAccessEvidence,
-    >,
     /// The demanded references this scheduler's live tasks are evaluating.
     /// Bounded by the tasks, and dropped with the scheduler.
     claims: HashMap<ReferenceKey, DemandedReferenceOwner>,
@@ -1216,6 +1414,27 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
+    fn charge_relation_replay(
+        &mut self,
+        consumer: MemberConsumerId,
+        relation: usize,
+        session: Option<&ResolutionSession>,
+    ) -> bool {
+        if self.replayed_relations.contains(&(consumer, relation)) {
+            return true;
+        }
+        if session.is_some_and(|session| {
+            !session.hierarchy_order_steps(self.relations[relation].order_cost)
+        }) {
+            return false;
+        }
+        #[cfg(test)]
+        self.pending_replay_charges
+            .push((consumer, relation, self.relations[relation].order_cost));
+        self.replayed_relations.insert((consumer, relation));
+        true
+    }
+
     fn unavailable(
         mut self,
         operation: &mut Resources<'_, 'a>,
@@ -1507,6 +1726,7 @@ impl<'a> Scheduler<'a> {
                             operation.session,
                             operation.hierarchy,
                             self.tasks[target].root.reference,
+                            false,
                         )?,
                     ]));
                 }
@@ -1739,6 +1959,7 @@ impl<'a> Scheduler<'a> {
         self.tasks.push(Task {
             root,
             memo_key: None,
+            memo_prefix_ready: false,
             frame: Some(DemandFactEvaluationTask::new(state)),
             answer: None,
             metrics: ResolutionBatchMetrics::default(),
@@ -1813,6 +2034,8 @@ impl<'a> Scheduler<'a> {
         }
         self.relations.push(Relation {
             endpoint,
+            order_cost: 0,
+            child_relations: HashSet::default(),
             prefix_count: dependencies.len(),
             dependencies,
             pending,
@@ -1874,16 +2097,27 @@ impl<'a> Scheduler<'a> {
             "only a closed endpoint carries closure discharges: {endpoint:?}"
         );
         self.replay_provider_closure(&endpoint, provider);
-        self.install_relation(operation, endpoint, discovery)
+        let prior_cost = if matches!(discovery, RootDiscovery::AlreadyReady { .. }) {
+            provider.order_cost(&endpoint)
+        } else {
+            0
+        };
+        let admission = self.install_relation(operation, endpoint, discovery);
+        if let RelationAdmission::Ready(id) = admission {
+            self.relations[id].order_cost = prior_cost;
+        }
+        admission
     }
 
     /// Retain only the negative provider proofs consumed by this selection.
     /// A closed endpoint can predate this scheduler, so consult its provider
     /// when the scheduler has no local discharge record.
     fn member_readiness(
-        &self,
+        &mut self,
         requests: &[OwnedBatchCandidateRequest<'_>],
         environment: EnvironmentId,
+        consumer: MemberConsumerId,
+        session: Option<&ResolutionSession>,
         provider: &(impl RootProvider + ?Sized),
         discharged_provider_reasons: &mut BTreeSet<SemanticId>,
     ) -> DemandForwardReadiness {
@@ -1899,6 +2133,13 @@ impl<'a> Scheduler<'a> {
             {
                 return DemandForwardReadiness::AwaitingDependencies;
             }
+            let id = self.relation_ids[&endpoint];
+            if !self.charge_relation_replay(consumer, id, session) {
+                return DemandForwardReadiness::AwaitingDependencies;
+            }
+            if let MemberConsumerId::Relation(parent) = consumer {
+                self.relations[parent].child_relations.insert(id);
+            }
             if let Some(discharges) = self.closure_discharges.get(&endpoint) {
                 discharged_provider_reasons
                     .extend(discharges.discharged_provider_reasons.iter().copied());
@@ -1912,7 +2153,9 @@ impl<'a> Scheduler<'a> {
     fn retain_completed_roots(&self, operation: &Resources<'_, '_>) {
         if let Some((memo, _, _)) = operation.completed_roots {
             for task in &self.tasks {
-                if let (Some(key), Some(answer)) = (&task.memo_key, &task.answer) {
+                if let (Some(key), Some(answer)) = (&task.memo_key, &task.answer)
+                    && task.memo_prefix_ready
+                {
                     memo.retain(key, answer, operation.session);
                 }
             }
@@ -2182,6 +2425,51 @@ pub(super) fn resolve_prerequisite_for_test(
     }
 }
 
+/// Select a query-owned member through the existing dependency scheduler and
+/// language access hook. No lexical answer is published for the positioned site.
+pub(super) fn resolve_member(
+    operation: &mut Resources<'_, '_>,
+    input: QualifiedMemberInput,
+    provider: &mut (impl RootProvider + ?Sized),
+) -> StoreResult<Option<MemberQueryResult>> {
+    use crate::analyzer::store::resolution_operation::demand_closure::Read;
+    if provider.qualified_members().is_none() {
+        return Ok(None);
+    }
+    let mut scheduler = new_scheduler();
+    let Some(task) = scheduler.admit(operation, input.reference, None) else {
+        return Ok(None);
+    };
+    let id = QualifiedMemberId::issue(HierarchyProvenanceView::new(operation.hierarchy));
+    scheduler.member_query = Some(task);
+    scheduler.qualified_members.insert(
+        task,
+        QualifiedMemberWait {
+            id,
+            completion: input.completion.clone(),
+            input: TypedPrerequisiteInput::Member(input),
+            member_selection: None,
+            selection: None,
+            continuation_members: None,
+            close_continuation: None,
+            close_reference: None,
+            phase: QualifiedMemberPhase::Preparing,
+        },
+    );
+    match drive_scheduler(operation, scheduler, provider, Vec::new(), |scheduler| {
+        scheduler.member_query_result.is_some()
+    })? {
+        SchedulerOutcome::Ready(mut scheduler) => Ok(match scheduler.member_query_result.take() {
+            Some(Read::Ready { value, .. }) => Some(MemberQueryResult {
+                access: value,
+                order: scheduler.member_query_order,
+            }),
+            _ => None,
+        }),
+        SchedulerOutcome::Incomplete(_, _) | SchedulerOutcome::Terminal(_) => Ok(None),
+    }
+}
+
 fn new_scheduler<'a>() -> Scheduler<'a> {
     Scheduler {
         close_waiters: HashSet::default(),
@@ -2191,10 +2479,17 @@ fn new_scheduler<'a>() -> Scheduler<'a> {
         runnable: VecDeque::new(),
         relations: Vec::new(),
         relation_ids: HashMap::default(),
+        replayed_relations: HashSet::default(),
+        #[cfg(test)]
+        warm_replay_charges: Vec::new(),
+        #[cfg(test)]
+        pending_replay_charges: Vec::new(),
         qualified_members: HashMap::default(),
+        member_query: None,
+        member_query_order: None,
+        member_query_result: None,
         typed_references: HashMap::default(),
         qualified_dependents: HashMap::default(),
-        qualified_evidence: HashMap::default(),
         claims: HashMap::default(),
         query_scopes: HashMap::default(),
         closure_discharges: HashMap::default(),
@@ -2256,6 +2551,7 @@ impl MemberConsumerId {
         match self {
             Self::Relation(id) => {
                 scheduler.relations[dependency].relation_waiters.push(id);
+                scheduler.relations[id].child_relations.insert(dependency);
                 scheduler.relations[id].waits_on.push(dependency);
                 scheduler.relations[id].pending += 1;
             }
@@ -2361,14 +2657,24 @@ fn poll_member_consumer<'source>(
 ) -> StoreResult<MemberConsumerPoll> {
     let environment = consumer.environment(scheduler);
     let mut discharged_provider_reasons = BTreeSet::new();
+    let before = operation.hierarchy.order_work;
+    let session = operation.session.resolution_session;
     let polled = frame.poll(operation, &mut |requests| {
         Ok(scheduler.member_readiness(
             requests,
             environment,
+            consumer,
+            session,
             provider,
             &mut discharged_provider_reasons,
         ))
     })?;
+    if operation.session.resolution_stopped() {
+        return Ok(MemberConsumerPoll::Cancelled);
+    }
+    if let MemberConsumerId::Relation(id) = consumer {
+        scheduler.relations[id].order_cost += operation.hierarchy.order_work - before;
+    }
     frame
         .discharged_provider_reasons
         .extend(discharged_provider_reasons);
@@ -2453,6 +2759,7 @@ fn poll_member_consumer<'source>(
                 };
                 if !scheduler.relations[dependency].closed && seen.insert(dependency) {
                     consumer.await_relation(scheduler, dependency);
+                    scheduler.replayed_relations.insert((consumer, dependency));
                 }
             }
             if consumer.pending(scheduler) == 0 {
@@ -2579,12 +2886,50 @@ fn poll_qualified_member_consumer<'source>(
                     provenance,
                     resume,
                 )? {
+                    CloseProgress::Ready(MemberSelectionOutcome::OwnDictionary(owners)) => {
+                        wait.selection = Some(MemberSelection {
+                            own_dictionary: true,
+                            query_obligations: super::super::QueryObligations::empty(),
+                            order: None,
+                            provenance: provenance.selection(Default::default()),
+                            owners,
+                            completion: wait.input.member().completion.clone(),
+                            discharged_provider_reasons: Default::default(),
+                        });
+                        wait.phase = QualifiedMemberPhase::Access;
+                        scheduler.qualified_members.insert(task, wait);
+                        scheduler.runnable.push_back(Runnable::Task(task));
+                        return Ok(true);
+                    }
+                    CloseProgress::Ready(MemberSelectionOutcome::AdmittedBinding(token)) => {
+                        let reference = wait.input.reference().reference;
+                        let answer = ResolutionAnswer::new(
+                            vec![token],
+                            Vec::new(),
+                            ResolutionCompletion::Complete,
+                        );
+                        let complete = scheduler.tasks[task]
+                            .frame
+                            .as_mut()
+                            .expect("held binding task")
+                            .resume_qualified_answer(operation, reference, answer, Vec::new())?;
+                        hook.cancel_qualified_member(wait.id);
+                        active.remove(&wait.id);
+                        scheduler.tasks[task].waiting = 0;
+                        scheduler.tasks[task].hierarchy_waits.clear();
+                        scheduler.tasks[task].waits_on.clear();
+                        if complete {
+                            scheduler.runnable.push_back(Runnable::Task(task));
+                        }
+                        return Ok(complete);
+                    }
                     CloseProgress::Ready(MemberSelectionOutcome::QualifierIsNamespace) => {
                         scheduler.tasks[task]
                             .frame
                             .as_mut()
                             .expect("held typed task")
                             .resume_qualified_namespace(
+                                operation.session,
                                 wait.input.reference().reference,
                                 wait.input.member().route_ordinal,
                             );
@@ -2667,7 +3012,8 @@ fn poll_qualified_member_consumer<'source>(
         progress.map(TypedPrerequisiteAnswer::Member)
     };
     let progress = match progress {
-        CloseProgress::Ready(TypedPrerequisiteAnswer::Construction(value)) => {
+        CloseProgress::Ready(TypedPrerequisiteAnswer::Construction(mut value)) => {
+            value.completion = value.completion.combine(&wait.completion);
             let TypedPrerequisiteInput::Construction(input) = wait.input else {
                 unreachable!("a construction reply retains its construction input")
             };
@@ -2675,8 +3021,7 @@ fn poll_qualified_member_consumer<'source>(
                 .frame
                 .as_mut()
                 .expect("held typed task")
-                .constructed_values
-                .insert((input.output, input.binding.targets()[0]), value);
+                .install_constructed_value(input.output, input.binding.targets()[0], value);
             scheduler.tasks[task].hierarchy_waits.clear();
             scheduler.tasks[task].waits_on.clear();
             active.remove(&wait.id);
@@ -2737,7 +3082,25 @@ fn poll_qualified_member_consumer<'source>(
             scheduler.qualified_members.insert(task, wait);
             Ok(false)
         }
-        CloseProgress::Ready(result) => {
+        CloseProgress::Ready(mut result) => {
+            if scheduler.member_query == Some(task) {
+                if let Read::Ready { value, completion } = &mut result {
+                    value.completion = value
+                        .completion
+                        .combine(completion)
+                        .combine(&wait.completion);
+                }
+                scheduler.member_query_order = wait
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| selection.order);
+                scheduler.member_query_result = Some(result);
+                scheduler.tasks[task].frame = None;
+                hook.cancel_qualified_member(wait.id);
+                active.remove(&wait.id);
+                return Ok(true);
+            }
+            let mut member_owners = Vec::new();
             let answer = match result {
                 Read::Ready {
                     mut value,
@@ -2766,7 +3129,7 @@ fn poll_qualified_member_consumer<'source>(
                             value: (answer, evidence),
                             ..
                         } => {
-                            scheduler.qualified_evidence.insert(wait.id, evidence);
+                            member_owners = evidence.member_owners;
                             answer
                         }
                         Read::Cancelled(completion) => {
@@ -2781,12 +3144,9 @@ fn poll_qualified_member_consumer<'source>(
                 }
                 Read::Unavailable { completion, .. } => {
                     wait.completion = wait.completion.combine(&completion);
-                    registered_qualified_open_answer(
-                        operation.session,
-                        operation.hierarchy,
-                        wait.input.reference().reference,
-                        &wait.completion,
-                    )?
+                    // An empty answer is only sound while it stays incomplete.
+                    assert_ne!(wait.completion, ResolutionCompletion::Complete);
+                    ResolutionAnswer::new(Vec::new(), Vec::new(), wait.completion.clone())
                 }
                 Read::Cancelled(_) => unreachable!("cancelled read handled above"),
             };
@@ -2798,12 +3158,10 @@ fn poll_qualified_member_consumer<'source>(
                 .as_mut()
                 .expect("held typed task")
                 .resume_qualified_answer(
-                    operation.session,
-                    operation.hierarchy,
-                    operation.forward_candidate_artifacts,
-                    operation.candidate_paths,
+                    operation,
                     wait.input.reference().reference,
                     answer,
+                    member_owners,
                 )?;
             hook.cancel_qualified_member(wait.id);
             active.remove(&wait.id);
@@ -2922,7 +3280,11 @@ fn drive_scheduler<'source>(
     is_complete: impl Fn(&Scheduler<'source>) -> bool,
 ) -> StoreResult<SchedulerOutcome<'source>> {
     let mut active_closes = std::mem::take(&mut scheduler.close_waiters);
-    let mut active_qualified = HashSet::default();
+    let mut active_qualified = scheduler
+        .qualified_members
+        .values()
+        .map(|wait| wait.id)
+        .collect::<HashSet<_>>();
     let mut result = drive_scheduler_inner(
         operation,
         scheduler,
@@ -3142,6 +3504,7 @@ fn drive_scheduler_inner<'source>(
                         operation.session,
                         operation.hierarchy,
                         root,
+                        false,
                     )?]);
                 let state = scheduler.tasks[id]
                     .frame
@@ -3235,7 +3598,9 @@ fn drive_scheduler_inner<'source>(
                     scheduler.relations[id].member_completion = completion;
                     request
                 }
-                MemberSelectionOutcome::QualifierIsNamespace => {
+                MemberSelectionOutcome::AdmittedBinding(_)
+                | MemberSelectionOutcome::OwnDictionary(_)
+                | MemberSelectionOutcome::QualifierIsNamespace => {
                     unreachable!("namespace classification belongs to registered preparation")
                 }
                 MemberSelectionOutcome::Unavailable(completion) => {
@@ -3321,6 +3686,16 @@ fn drive_scheduler_inner<'source>(
         {
             return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
         }
+        // A query may request the member selection itself, without publishing
+        // a lexical relation. Existing endpoint callers finish after closure.
+        if is_complete(&scheduler) {
+            return Ok(SchedulerOutcome::Ready(Box::new(scheduler)));
+        }
+        let child_cost = scheduler.relations[id]
+            .child_relations
+            .iter()
+            .map(|child| scheduler.relations[*child].order_cost)
+            .sum::<usize>();
         let relation = &mut scheduler.relations[id];
         if !relation.prefix_charged {
             if !operation.session.charge_scope_steps(relation.prefix_count) {
@@ -3437,7 +3812,16 @@ fn drive_scheduler_inner<'source>(
             }
         };
         let outcome = outcome.combine(&relation.member_completion);
+        relation.order_cost += child_cost;
         let completion = outcome.completion();
+        provider.record_order_cost(&relation.endpoint, relation.order_cost);
+        let replay_count = relation.waiters.len() + relation.relation_waiters.len();
+        let replay_steps = relation
+            .order_cost
+            .saturating_mul(replay_count.saturating_sub(1));
+        if !operation.session.charge_scope_steps(replay_steps) {
+            return Ok(SchedulerOutcome::Terminal(scheduler.cancelled(operation)));
+        }
         if let Some(discharges) = scheduler.closure_discharges.get(&relation.endpoint)
             && !discharges.discharged_provider_reasons.is_empty()
         {
@@ -3662,8 +4046,7 @@ fn poll_round<'a>(
                 .map(|request| {
                     (
                         frame
-                            .references
-                            .as_ref()
+                            .reference_frame()
                             .expect("pending requests belong to a reference frame")
                             .pending_request_owner(request),
                         request.endpoint().clone(),
@@ -3672,6 +4055,10 @@ fn poll_round<'a>(
                 .collect::<HashSet<_>>();
             let relations = &scheduler.relations;
             let relation_ids = &scheduler.relation_ids;
+            let replayed_relations = &mut scheduler.replayed_relations;
+            #[cfg(test)]
+            let warm_replay_charges = &mut scheduler.warm_replay_charges;
+            let bounded_session = operation.session.resolution_session;
             let closure_discharges = &scheduler.closure_discharges;
             let claims = &mut scheduler.claims;
             scheduler.tasks[id]
@@ -3698,7 +4085,36 @@ fn poll_round<'a>(
                                 (request.owner, request.request.endpoint().clone())
                             }));
                         }
-                        Ok(readiness)
+                        // A request that yields for closed-relation discharges is
+                        // charged once, by charge_relation_replay on the pending
+                        // path of the next poll; charging it here would charge it
+                        // twice. Only requests that are ready now are charged here.
+                        if readiness == DemandForwardReadiness::AwaitingDependencies {
+                            return Ok(readiness);
+                        }
+                        for request in requests {
+                            let relation = relation_ids[&RelationKey {
+                                endpoint: request.request.endpoint().clone(),
+                                environment,
+                            }];
+                            let consumer = (MemberConsumerId::QualifiedTask(id), relation);
+                            if replayed_relations.contains(&consumer) {
+                                continue;
+                            }
+                            if bounded_session.is_some_and(|session| {
+                                !session.hierarchy_order_steps(relations[relation].order_cost)
+                            }) {
+                                return Ok(DemandForwardReadiness::AwaitingDependencies);
+                            }
+                            #[cfg(test)]
+                            warm_replay_charges.push((
+                                consumer.0,
+                                relation,
+                                relations[relation].order_cost,
+                            ));
+                            replayed_relations.insert(consumer);
+                        }
+                        Ok(DemandForwardReadiness::Ready)
                     },
                     &mut |reference| {
                         let reference = ReferenceKey {
@@ -3724,6 +4140,7 @@ fn poll_round<'a>(
                             }
                         }
                     },
+                    Some(provider.as_dyn_root_provider()),
                 )
         };
         scheduler.tasks[id].metrics = scheduler.tasks[id]
@@ -3744,8 +4161,7 @@ fn poll_round<'a>(
                 .as_ref()
                 .expect("suspended task retains its frame");
             let references = frame
-                .references
-                .as_ref()
+                .reference_frame()
                 .expect("pending requests belong to a reference frame");
             let pending = frame
                 .pending_requests()
@@ -3776,6 +4192,22 @@ fn poll_round<'a>(
         match polled {
             DemandFactEvaluationPoll::Continue => scheduler.runnable.push_back(Runnable::Task(id)),
             DemandFactEvaluationPoll::Ready(mut answer) => {
+                let prefix_scope = scheduler.tasks[id]
+                    .frame
+                    .as_ref()
+                    .and_then(|frame| frame.evaluation.as_ref())
+                    .and_then(|state| {
+                        prefix_read_scope_from_parts(
+                            scheduler.tasks[id].root.reference,
+                            &state.root_prefixes,
+                            &state.member_applicability_answers,
+                            &state.query_obligations,
+                        )
+                    });
+                if let Some(scope) = prefix_scope {
+                    answer.query_obligations.union(&scope);
+                    scheduler.tasks[id].memo_prefix_ready = true;
+                }
                 select_universe_binding(
                     operation.session,
                     scheduler.tasks[id]
@@ -3891,12 +4323,10 @@ fn poll_round<'a>(
                         .as_mut()
                         .expect("held typed task")
                         .resume_qualified_answer(
-                            operation.session,
-                            operation.hierarchy,
-                            operation.forward_candidate_artifacts,
-                            operation.candidate_paths,
+                            operation,
                             input.reference.reference,
                             answer,
+                            Vec::new(),
                         )?
                     {
                         return Ok(RoundOutcome::Cancelled);
@@ -3935,8 +4365,14 @@ fn poll_round<'a>(
                         .frame
                         .as_mut()
                         .expect("held typed task")
-                        .constructed_values
-                        .insert((input.output, input.binding.targets()[0]), None);
+                        .install_constructed_value(
+                            input.output,
+                            input.binding.targets()[0],
+                            TypedConstructionResult {
+                                value: None,
+                                completion: ResolutionCompletion::Complete,
+                            },
+                        );
                     scheduler.runnable.push_back(Runnable::Task(id));
                     continue;
                 };
@@ -4044,6 +4480,7 @@ fn poll_round<'a>(
                     // The owner already waits, directly or through relations,
                     // on this task. Evaluating the reference here is what
                     // every task did before the claim existed.
+                    record_resolution_work(ResolutionWork::WaitCycleBypass, 1);
                     claim.bypass.insert(id);
                     scheduler.runnable.push_back(Runnable::Task(id));
                 } else {
@@ -4094,8 +4531,19 @@ fn poll_round<'a>(
                         };
                     if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
                         scheduler.relations[relation_id].waiters.push(id);
+                        scheduler
+                            .replayed_relations
+                            .insert((MemberConsumerId::QualifiedTask(id), relation_id));
                         scheduler.tasks[id].waiting += 1;
                         scheduler.tasks[id].waits_on.push(relation_id);
+                    } else if scheduler.relations[relation_id].closed
+                        && !scheduler.charge_relation_replay(
+                            MemberConsumerId::QualifiedTask(id),
+                            relation_id,
+                            operation.session.resolution_session,
+                        )
+                    {
+                        return Ok(RoundOutcome::Cancelled);
                     }
                 }
                 if scheduler.tasks[id].waiting == 0 {
@@ -4156,8 +4604,19 @@ fn poll_round<'a>(
             };
             if !scheduler.relations[relation_id].closed && waiting.insert(relation_id) {
                 scheduler.relations[relation_id].waiters.push(id);
+                scheduler
+                    .replayed_relations
+                    .insert((MemberConsumerId::QualifiedTask(id), relation_id));
                 scheduler.tasks[id].waiting += 1;
                 scheduler.tasks[id].waits_on.push(relation_id);
+            } else if scheduler.relations[relation_id].closed
+                && !scheduler.charge_relation_replay(
+                    MemberConsumerId::QualifiedTask(id),
+                    relation_id,
+                    operation.session.resolution_session,
+                )
+            {
+                return Ok(RoundOutcome::Cancelled);
             }
         }
         // The readiness gate covered the complete lexical frontier.
@@ -4482,9 +4941,317 @@ fn read_root_seeds<'a>(
     Ok(Some(seeds))
 }
 
+/// Run the shared selection phase without installing a lexical answer. The
+/// caller retains the selected owners and their operation-local C3 provenance.
+pub(super) fn select_members(
+    resources: &mut Resources<'_, '_>,
+    provider: &mut (impl RootProvider + ?Sized),
+    request: MemberSelectionRequest,
+) -> StoreResult<(Option<MemberSelection>, ResolutionCompletion)> {
+    let endpoint = RelationKey::caller(EndpointSignature::new(
+        BindingNodeId::universal_root(),
+        StackPattern::closed([request.reference, request.lookup]),
+        StackPattern::closed(Vec::<BindingNodeId>::new()),
+    ));
+    let (mut scheduler, admission) = seed_close_scheduler(
+        resources,
+        &endpoint,
+        Vec::new(),
+        ResolutionCompletion::Complete,
+    );
+    let RelationAdmission::Ready(relation) = admission else {
+        return Ok((None, incomplete_cancelled()));
+    };
+    let Some(frame) = MemberSelectionFrame::new(resources, request) else {
+        return Ok((None, incomplete_cancelled()));
+    };
+    scheduler.relations[relation].member_requested = true;
+    scheduler.relations[relation].member_selection = Some(Box::new(frame));
+    scheduler.runnable.push_back(Runnable::Relation(relation));
+    match drive_scheduler(resources, scheduler, provider, Vec::new(), |scheduler| {
+        scheduler.relations[relation].selected_members.is_some()
+    })? {
+        SchedulerOutcome::Ready(mut scheduler) => {
+            let selection = scheduler.relations[relation]
+                .selected_members
+                .take()
+                .expect("requested selection is ready");
+            let completion = selection.completion.clone();
+            scheduler.retain_completed_roots(resources);
+            Ok((Some(selection), completion))
+        }
+        SchedulerOutcome::Incomplete(_, outcome) | SchedulerOutcome::Terminal(outcome) => {
+            let completion = match outcome {
+                BatchOutcome::Cancelled(completion)
+                | BatchOutcome::Unavailable { completion, .. }
+                | BatchOutcome::Unsupported(Unsupported::CyclicPrefixDependency {
+                    completion,
+                    ..
+                }) => completion,
+                BatchOutcome::Ready(_) => unreachable!("ready selection returns its scheduler"),
+            };
+            Ok((None, completion))
+        }
+    }
+}
+
+/// Resolve a query-local qualified member through the same preparation,
+/// hierarchy selection, access certificates and prerequisites as source roots.
+pub(super) fn qualified_member(
+    resources: &mut Resources<'_, '_>,
+    provider: &mut (impl RootProvider + ?Sized),
+    input: &QualifiedMemberInput,
+) -> StoreResult<(Vec<SemanticId>, ResolutionCompletion)> {
+    use crate::analyzer::store::resolution_operation::demand_closure::Read;
+    use crate::analyzer::store::resolution_operation::member_access::MemberAccessResult;
+    enum Reply {
+        Members(CloseContinuationId, MemberSelection),
+        Reference(CloseContinuationId, ReferenceKey, Box<FactResolutionAnswer>),
+    }
+    enum Step {
+        Prepared(MemberSelectionOutcome),
+        Access(Read<MemberAccessResult>),
+    }
+    let id = QualifiedMemberId::issue(HierarchyProvenanceView::new(resources.hierarchy));
+    let result = (|| {
+        let mut selection = None;
+        let mut reply = None;
+        let mut evidence = input.completion.clone();
+        loop {
+            if !resources.session.charge_scope_steps(1) {
+                return Ok((Vec::new(), evidence.combine(&incomplete_cancelled())));
+            }
+            let provenance = HierarchyProvenanceView::new(resources.hierarchy);
+            let resume = match &reply {
+                None => CloseResume::Start,
+                Some(Reply::Members(continuation, selection)) => CloseResume::Members {
+                    continuation: *continuation,
+                    selection,
+                },
+                Some(Reply::Reference(continuation, key, answer)) => CloseResume::Reference {
+                    continuation: *continuation,
+                    key: *key,
+                    answer,
+                },
+            };
+            let hook = provider
+                .qualified_members()
+                .expect("qualified member has a language provider");
+            let progress = match &selection {
+                None => hook
+                    .prepare_qualified_member(id, input, provenance, resume)?
+                    .map(Step::Prepared),
+                Some(selection) => hook
+                    .poll_qualified_member(id, selection, provenance, resume)?
+                    .map(Step::Access),
+            };
+            match progress {
+                CloseProgress::Ready(Step::Prepared(MemberSelectionOutcome::AdmittedBinding(
+                    token,
+                ))) => {
+                    return Ok((vec![token], ResolutionCompletion::Complete));
+                }
+                CloseProgress::Ready(Step::Prepared(MemberSelectionOutcome::OwnDictionary(
+                    owners,
+                ))) => {
+                    selection = Some(MemberSelection {
+                        own_dictionary: true,
+                        query_obligations: super::super::QueryObligations::empty(),
+                        order: None,
+                        provenance: provenance.selection(Default::default()),
+                        owners,
+                        completion: input.completion.clone(),
+                        discharged_provider_reasons: Default::default(),
+                    });
+                    reply = None;
+                }
+                CloseProgress::Ready(Step::Access(Read::Ready { value, completion })) => {
+                    // Successful access already applied its exclusion certificates.
+                    // Intermediate snapshots are retained only for cancellation.
+                    let completion = input
+                        .completion
+                        .combine(&completion)
+                        .combine(&value.completion);
+                    let targets = value
+                        .targets
+                        .into_iter()
+                        .map(|target| target.target.token)
+                        .collect();
+                    return Ok((targets, completion));
+                }
+                CloseProgress::Ready(Step::Access(Read::Unavailable { completion, .. }))
+                | CloseProgress::Ready(Step::Prepared(MemberSelectionOutcome::Unavailable(
+                    completion,
+                ))) => {
+                    return Ok((
+                        Vec::new(),
+                        evidence
+                            .combine(&completion)
+                            .combine(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::UnsupportedSemantic(
+                                    input.reference.reference,
+                                ),
+                            ])),
+                    ));
+                }
+                CloseProgress::Ready(Step::Access(Read::Cancelled(completion)))
+                | CloseProgress::Ready(Step::Prepared(MemberSelectionOutcome::Cancelled(
+                    completion,
+                )))
+                | CloseProgress::Cancelled(completion) => {
+                    return Ok((Vec::new(), evidence.combine(&completion)));
+                }
+                CloseProgress::Ready(Step::Prepared(MemberSelectionOutcome::Ready {
+                    request: Some(request),
+                    completion,
+                })) => {
+                    evidence = evidence.combine(&completion);
+                    let (selected, completion) = select_members(resources, provider, request)?;
+                    evidence = evidence.combine(&completion);
+                    let Some(selected) = selected else {
+                        return Ok((Vec::new(), evidence));
+                    };
+                    selection = Some(selected);
+                    reply = None;
+                }
+                CloseProgress::Ready(Step::Prepared(MemberSelectionOutcome::Ready {
+                    request: None,
+                    completion,
+                })) => {
+                    return Ok((
+                        Vec::new(),
+                        evidence
+                            .combine(&completion)
+                            .combine(&ResolutionCompletion::incomplete([
+                                ResolutionIncompleteReason::UnsupportedSemantic(
+                                    input.reference.reference,
+                                ),
+                            ])),
+                    ));
+                }
+                CloseProgress::Ready(Step::Prepared(
+                    MemberSelectionOutcome::QualifierIsNamespace,
+                )) => {
+                    return Ok((
+                        Vec::new(),
+                        evidence.combine(&ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(
+                                input.reference.reference,
+                            ),
+                        ])),
+                    ));
+                }
+                CloseProgress::Members {
+                    continuation,
+                    request,
+                    completion,
+                } => {
+                    evidence = evidence.combine(&completion);
+                    let (selected, completion) = select_members(resources, provider, request)?;
+                    evidence = evidence.combine(&completion);
+                    let Some(selected) = selected else {
+                        return Ok((Vec::new(), evidence));
+                    };
+                    reply = Some(Reply::Members(continuation, selected));
+                }
+                CloseProgress::Reference {
+                    continuation,
+                    key,
+                    completion,
+                } => {
+                    assert_eq!(key.environment, CALLER_ENVIRONMENT);
+                    evidence = evidence.combine(&completion);
+                    let answer = match resolve(resources, key.reference, provider)? {
+                        Outcome::Ready(answer) => answer,
+                        Outcome::Unavailable { completion, .. }
+                        | Outcome::Cancelled(completion)
+                        | Outcome::Unsupported(Unsupported::CyclicPrefixDependency {
+                            completion,
+                            ..
+                        }) => {
+                            return Ok((Vec::new(), evidence.combine(&completion)));
+                        }
+                    };
+                    reply = Some(Reply::Reference(continuation, key, Box::new(answer)));
+                }
+            }
+        }
+    })();
+    provider
+        .qualified_members()
+        .expect("qualified member has a language provider")
+        .cancel_qualified_member(id);
+    result
+}
+
+/// Drive a language's ordinary construction proof through the shared member
+/// scheduler. This is also used by reverse queries after the callee is bound.
+pub(super) fn prove_construction(
+    resources: &mut Resources<'_, '_>,
+    provider: &mut (impl RootProvider + ?Sized),
+    input: &TypedConstructionInput,
+) -> StoreResult<(Option<ResolutionSlotValue>, ResolutionCompletion)> {
+    let mut reply: Option<(CloseContinuationId, MemberSelection)> = None;
+    let mut evidence = input.binding.completion().clone();
+    loop {
+        let provenance = HierarchyProvenanceView::new(resources.hierarchy);
+        let resume = match &reply {
+            None => CloseResume::Start,
+            Some((continuation, selection)) => CloseResume::Members {
+                continuation: *continuation,
+                selection,
+            },
+        };
+        match provider
+            .qualified_members()
+            .expect("construction has a language provider")
+            .poll_construction(input, provenance, resume)?
+        {
+            CloseProgress::Ready(TypedConstructionResult {
+                value,
+                completion: construction,
+            }) => {
+                // The language proof certifies the returned value. Its member
+                // selection was a prerequisite, not a binding of this call. The
+                // construction's own evidence (an unproven class decorator, for
+                // example) joins the binding's and never replaces it.
+                let completion = if value.is_some() {
+                    input.binding.completion().combine(&construction)
+                } else {
+                    evidence.combine(&construction)
+                };
+                return Ok((value, completion));
+            }
+            CloseProgress::Cancelled(completion) => {
+                return Ok((None, evidence.combine(&completion)));
+            }
+            CloseProgress::Members {
+                continuation,
+                request,
+                completion,
+            } => {
+                evidence = evidence.combine(&completion);
+                let (selection, completion) = select_members(resources, provider, request)?;
+                evidence = evidence.combine(&completion);
+                let Some(selection) = selection else {
+                    return Ok((None, evidence));
+                };
+                reply = Some((continuation, selection));
+            }
+            CloseProgress::Reference { .. } => {
+                unreachable!("construction requests member selection")
+            }
+        }
+    }
+}
+
 pub(super) enum EndpointPreparation {
     Ready(RootClosure),
     Incomplete(ResolutionCompletion),
+    Failed {
+        completion: ResolutionCompletion,
+        atom: ResolutionIncompleteReason,
+    },
 }
 
 /// Close one endpoint between evaluator polls. Its positioned prefix tasks run
@@ -4506,11 +5273,11 @@ pub(super) fn prepare_forward(
             return Ok(EndpointPreparation::Incomplete(completion));
         }
         RootDiscovery::Unavailable { completion, .. } => {
-            return Ok(EndpointPreparation::Incomplete(completion.combine(
-                &ResolutionCompletion::incomplete([
-                    ResolutionIncompleteReason::UnsupportedSemantic(target),
-                ]),
-            )));
+            let atom = ResolutionIncompleteReason::UnsupportedSemantic(target);
+            return Ok(EndpointPreparation::Failed {
+                completion: completion.combine(&ResolutionCompletion::incomplete([atom])),
+                atom,
+            });
         }
     };
     let mut answers = Vec::new();
@@ -4522,11 +5289,11 @@ pub(super) fn prepare_forward(
         match resolve(resources, root.reference, provider)? {
             Outcome::Ready(answer) => answers.push((root, answer)),
             Outcome::Unavailable { completion, .. } => {
-                return Ok(EndpointPreparation::Incomplete(completion.combine(
-                    &ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::UnsupportedSemantic(root.reference),
-                    ]),
-                )));
+                let atom = ResolutionIncompleteReason::UnsupportedSemantic(root.reference);
+                return Ok(EndpointPreparation::Failed {
+                    completion: completion.combine(&ResolutionCompletion::incomplete([atom])),
+                    atom,
+                });
             }
             Outcome::Cancelled(completion)
             | Outcome::Unsupported(Unsupported::CyclicPrefixDependency { completion, .. }) => {
@@ -4543,7 +5310,9 @@ pub(super) fn prepare_forward(
             request,
             completion,
         } => (request, completion),
-        MemberSelectionOutcome::QualifierIsNamespace => {
+        MemberSelectionOutcome::AdmittedBinding(_)
+        | MemberSelectionOutcome::OwnDictionary(_)
+        | MemberSelectionOutcome::QualifierIsNamespace => {
             unreachable!("namespace classification belongs to registered preparation")
         }
         MemberSelectionOutcome::Unavailable(completion)
@@ -4822,6 +5591,16 @@ pub(super) fn prepare_reverse(
             EndpointPreparation::Incomplete(evidence) => {
                 completion.include(&evidence);
                 return Ok(EndpointPreparation::Incomplete(completion.finish()));
+            }
+            EndpointPreparation::Failed {
+                completion: evidence,
+                atom,
+            } => {
+                completion.include(&evidence);
+                return Ok(EndpointPreparation::Failed {
+                    completion: completion.finish(),
+                    atom,
+                });
             }
         }
     }
@@ -5181,6 +5960,31 @@ mod tests {
                             }
                             if scheduler.tasks[task].answer.is_some() {
                                 assert_eq!(installs, usize::from(with_discharges));
+                                let relation = scheduler.relation_ids[&endpoint];
+                                let consumer = MemberConsumerId::QualifiedTask(task);
+                                let closure_charges = scheduler
+                                    .warm_replay_charges
+                                    .iter()
+                                    .filter(|(charged, id, _)| {
+                                        *charged == consumer && *id == relation
+                                    })
+                                    .count();
+                                let pending_charges = scheduler
+                                    .pending_replay_charges
+                                    .iter()
+                                    .filter(|(charged, id, _)| {
+                                        *charged == consumer && *id == relation
+                                    })
+                                    .count();
+                                assert_eq!(
+                                    closure_charges + pending_charges,
+                                    1,
+                                    "replay charge for initially_closed={initially_closed}, with_discharges={with_discharges}: closure={closure_charges}, pending={pending_charges}"
+                                );
+                                if with_discharges {
+                                    // The discharge yield is charged by the pending path after suspension.
+                                    assert_eq!(pending_charges, 1);
+                                }
                                 return;
                             }
                         }
@@ -5244,7 +6048,7 @@ mod tests {
                         )
                         .unwrap();
                         if let Some(frame) = &scheduler.tasks[task].frame {
-                            if let Some(references) = &frame.references {
+                            if let Some(references) = frame.reference_frame() {
                                 requested_owners.extend(
                                     frame
                                         .pending_requests()
@@ -5265,6 +6069,23 @@ mod tests {
                             }
                         }
                         if scheduler.tasks[task].answer.is_some() {
+                            let relation = scheduler.relation_ids[&shared_endpoint];
+                            let consumer = MemberConsumerId::QualifiedTask(task);
+                            let closure_charges = scheduler
+                                .warm_replay_charges
+                                .iter()
+                                .filter(|(charged, id, _)| *charged == consumer && *id == relation)
+                                .count();
+                            let pending_charges = scheduler
+                                .pending_replay_charges
+                                .iter()
+                                .filter(|(charged, id, _)| *charged == consumer && *id == relation)
+                                .count();
+                            assert_eq!(
+                                (closure_charges, pending_charges),
+                                (0, 1),
+                                "both owners share one pending replay charge per (consumer, relation)"
+                            );
                             assert_eq!(
                                 requested_owners,
                                 [reference, other_reference].into_iter().collect()
@@ -5532,7 +6353,8 @@ mod tests {
                         .unwrap()
                         {
                             EndpointPreparation::Ready(c) => c.completion().clone(),
-                            EndpointPreparation::Incomplete(c) => c,
+                            EndpointPreparation::Incomplete(c)
+                            | EndpointPreparation::Failed { completion: c, .. } => c,
                         }
                     } else {
                         let mut scheduler = new_scheduler();
@@ -5869,6 +6691,8 @@ mod tests {
                             request: &BatchCandidateRequest::new(0, dependency.endpoint.clone())
                         }],
                         CALLER_ENVIRONMENT,
+                        MemberConsumerId::Relation(0),
+                        None,
                         &provider,
                         &mut witnesses,
                     ),
@@ -6070,6 +6894,12 @@ mod tests {
                 frame.phase = super::super::DemandFactEvaluationPhase::Round;
                 let reason = ResolutionIncompleteReason::UnsupportedSemantic(owner_root.reference);
                 let state = frame.evaluation.as_mut().unwrap();
+                // This synthetic task skips root initialization and has no
+                // seed; publish its explicit open prefix state as a real
+                // initialization would before the forced round.
+                state
+                    .root_prefixes
+                    .insert(owner_root.reference, RootPrefixRead::Unknown(reason));
                 state.cancellation_reasons.include_reason_with_poll(
                     reason,
                     state.cancellation,
@@ -6085,11 +6915,12 @@ mod tests {
                             resources.candidate_paths,
                             &mut |_| panic!("empty round has no dependencies"),
                             &mut |_| panic!("empty round opens no lexical frame"),
+                            None,
                         )
                         .unwrap(),
                     DemandFactEvaluationPoll::Continue
                 ));
-                assert!(frame.references.as_ref().unwrap().references.is_empty());
+                assert!(frame.reference_frame().unwrap().references.is_empty());
                 let binding = Arc::new(ResolutionAnswer::new(
                     Vec::new(),
                     Vec::new(),
@@ -6099,8 +6930,7 @@ mod tests {
                     .answers
                     .insert(owner_root.reference, Arc::clone(&binding));
                 frame
-                    .references
-                    .as_mut()
+                    .reference_frame_mut()
                     .unwrap()
                     .answers
                     .insert(owner_root.reference, binding);
@@ -6353,6 +7183,32 @@ mod tests {
                 .unwrap();
                 assert!(memo.lookup(&key, resources.session).is_none());
             }
+            let mut answer = empty_fact_resolution_answer(
+                ResolutionCompletion::Complete,
+                resources.session.cancellation,
+            );
+            answer.projected_type_shapes = Some(Box::new(FactProjectedTypeShapeSet {
+                shapes: vec![FactProjectedTypeShape {
+                    output_slot: reference,
+                    root_slot: reference,
+                    nodes: Box::new([]),
+                    completion: ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::ReceiverBudgetExhausted(reference),
+                    ]),
+                    supported: true,
+                }]
+                .into_boxed_slice(),
+            }));
+            let nested_stop_key = RootMemoKey::new(
+                resources.session,
+                ReferenceKey::caller(reference),
+                &seed,
+                9,
+                [0x42; 32],
+            )
+            .unwrap();
+            memo.retain(&nested_stop_key, &answer, resources.session);
+            assert!(memo.lookup(&nested_stop_key, resources.session).is_none());
         });
     }
     struct SourceProvider {
@@ -6728,19 +7584,28 @@ mod tests {
         completion: ResolutionCompletion,
         work: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisWork,
         complete: Option<bool>,
+        order_completion: Option<ResolutionCompletion>,
         ordered: Vec<SemanticId>,
         order_work: usize,
     }
     fn order_fixture(enabled: bool, cap: usize, bases: bool, cancel: bool) -> OrderFixtureResult {
+        order_fixture_with_extra_root(enabled, cap, bases, cancel, false)
+    }
+    fn order_fixture_with_extra_root(
+        enabled: bool,
+        cap: usize,
+        bases: bool,
+        cancel: bool,
+        extra_root: bool,
+    ) -> OrderFixtureResult {
         let session = ResolutionSession::bounded(
             ReceiverAnalysisBudget {
-                max_scope_nodes: 1,
+                max_scope_nodes: 1000,
                 max_hierarchy_order_steps: cap,
                 ..ReceiverAnalysisBudget::default()
             },
             None,
         );
-        assert!(session.scope_step()); // The aggregate consumes its entire finite allowance.
         let mut result = None;
         with_resources_in_session(Some(&session), |resources| {
             let root = SemanticId::for_test("repair-order-root");
@@ -6791,6 +7656,25 @@ mod tests {
             );
             if let Some(order) = &mut frame.order {
                 order.root(expression, root);
+                if extra_root {
+                    let other = SemanticId::for_test("repair-order-other");
+                    let other_expression = resources.hierarchy.order.owner(
+                        other,
+                        if bases {
+                            vec![HierarchyOrderedBase {
+                                expression: leaf,
+                                reference: base,
+                                kind: None,
+                                ordinal: 0,
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        HierarchyProvenanceId::default(),
+                        false,
+                    );
+                    order.root(other_expression, other);
+                }
             }
             if cancel {
                 resources.session.cancellation.cancel();
@@ -6809,7 +7693,7 @@ mod tests {
             };
             let view = HierarchyProvenanceView::new(resources.hierarchy);
             let mut ordered = Vec::new();
-            let complete = selection.order.map(|id| {
+            let order_status = selection.order.map(|id| {
                 assert!(
                     view.visit_order(id, &mut || false, &mut |owner| {
                         ordered.push(owner.owner);
@@ -6817,7 +7701,8 @@ mod tests {
                     })
                     .unwrap()
                 );
-                view.order_status(id).complete
+                let status = view.order_status(id);
+                (status.complete, status.completion.clone())
             });
             let BoundedResolution::Complete { work, .. } = session.finish(()) else {
                 panic!("ordering must not stop the aggregate budget");
@@ -6826,7 +7711,8 @@ mod tests {
                 owners: selection.owners,
                 completion: selection.completion,
                 work,
-                complete,
+                complete: order_status.as_ref().map(|(complete, _)| *complete),
+                order_completion: order_status.map(|(_, completion)| completion),
                 ordered,
                 order_work: resources.hierarchy.order_work,
             });
@@ -6836,6 +7722,7 @@ mod tests {
             completion: ResolutionCompletion::Complete,
             work: session.finish(()).work(),
             complete: None,
+            order_completion: None,
             ordered: Vec::new(),
             order_work: 0,
         })
@@ -6849,7 +7736,7 @@ mod tests {
         let ordered = order_fixture(true, 100, true, false);
         assert_eq!(plain.owners, ordered.owners);
         assert_eq!(plain.completion, ordered.completion);
-        assert_eq!(plain.work, ordered.work);
+        assert!(ordered.work.hierarchy_order_steps > plain.work.hierarchy_order_steps);
         assert_eq!(ordered.complete, Some(true));
         assert!(ordered.order_work > 0);
     }
@@ -6863,7 +7750,7 @@ mod tests {
             let stopped = order_fixture(true, cap, true, false);
             assert_eq!(plain.owners, stopped.owners);
             assert_eq!(plain.completion, stopped.completion);
-            assert_eq!(plain.work, stopped.work);
+            assert!(stopped.work.scope_nodes >= plain.work.scope_nodes);
             assert!(stopped.order_work <= cap);
             if cap == 0 {
                 assert_eq!(stopped.complete, Some(false));
@@ -6872,6 +7759,343 @@ mod tests {
                 assert!(stopped.ordered.is_empty());
             }
         }
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8704: a capped hierarchy order reported Complete and hid its budget cause"
+    )]
+    fn shared_closer_order_cap_reports_incomplete() {
+        let stopped = order_fixture(true, 0, true, false);
+        assert_eq!(stopped.complete, Some(false));
+        assert!(stopped.order_completion.unwrap().contains_reason(
+            ResolutionIncompleteReason::ReceiverBudgetExhausted(SemanticId::for_test(
+                "repair-order-root"
+            ))
+        ));
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8704: two selected class orders incorrectly shared one hierarchy-order cap"
+    )]
+    fn shared_closer_order_gives_each_class_its_own_cap() {
+        let single = order_fixture(true, 100, true, false);
+        assert!(single.order_work > 0);
+        let both = order_fixture_with_extra_root(true, single.order_work, true, false, true);
+        assert_eq!(both.complete, Some(true));
+        assert_eq!(both.order_completion, Some(ResolutionCompletion::Complete));
+        assert!(both.order_work > single.order_work);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8704: replaying a closed relation skipped or double-charged a bounded session"
+    )]
+    fn relation_order_replay_charges_once_per_consumer_in_either_order() {
+        for consumers in [[0, 1], [1, 0]] {
+            let session = ResolutionSession::bounded(
+                ReceiverAnalysisBudget {
+                    max_scope_nodes: 5,
+                    max_hierarchy_order_work: 5,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            );
+            with_resources_in_session(Some(&session), |resources| {
+                let mut scheduler = new_scheduler();
+                let RelationAdmission::Ready(relation) = scheduler.install_relation(
+                    resources,
+                    member_endpoint(),
+                    RootDiscovery::AlreadyReady {
+                        completion: ResolutionCompletion::Complete,
+                    },
+                ) else {
+                    panic!("closed relation admitted");
+                };
+                scheduler.relations[relation].order_cost = 3;
+                let first = MemberConsumerId::QualifiedTask(consumers[0]);
+                assert!(scheduler.charge_relation_replay(first, relation, Some(&session)));
+                let charged = session.finish(()).work().hierarchy_order_steps;
+                assert!(scheduler.charge_relation_replay(first, relation, Some(&session)));
+                assert_eq!(session.finish(()).work().hierarchy_order_steps, charged);
+                assert!(!scheduler.charge_relation_replay(
+                    MemberConsumerId::QualifiedTask(consumers[1]),
+                    relation,
+                    Some(&session),
+                ));
+                assert!(matches!(
+                    session.finish(()),
+                    BoundedResolution::Exceeded { .. }
+                ));
+                assert!(scheduler.relations[relation].closed);
+            });
+        }
+    }
+
+    #[test]
+    fn closed_relation_charges_later_lexical_task_its_nested_order_cost() {
+        struct Provider;
+        impl RootProvider for Provider {
+            fn discover(&mut self, _: &RelationKey) -> StoreResult<RootDiscovery> {
+                Ok(RootDiscovery::Ready(RootPlan {
+                    prefixes: Vec::new(),
+                    completion: ResolutionCompletion::Complete,
+                }))
+            }
+            fn close(
+                &mut self,
+                _: &RelationKey,
+                _: &[(ReferenceKey, &FactResolutionAnswer)],
+            ) -> StoreResult<RootClosure> {
+                Ok(RootClosure::Published(ResolutionCompletion::Complete))
+            }
+            fn close_selected_members(
+                &mut self,
+                endpoint: &RelationKey,
+                inputs: &[(ReferenceKey, &FactResolutionAnswer)],
+                _: &MemberSelection,
+            ) -> StoreResult<RootClosure> {
+                self.close(endpoint, inputs)
+            }
+        }
+        fn attach_order<'source>(
+            scheduler: &mut Scheduler<'source>,
+            resources: &mut Resources<'_, 'source>,
+            relation: usize,
+            name: &str,
+        ) {
+            let root = SemanticId::for_test(name);
+            let base = SemanticId::for_test(format!("{name}-base"));
+            let leaf = resources.hierarchy.order.owner(
+                base,
+                Vec::new(),
+                HierarchyProvenanceId::default(),
+                false,
+            );
+            let expression = resources.hierarchy.order.owner(
+                root,
+                vec![HierarchyOrderedBase {
+                    expression: leaf,
+                    reference: base,
+                    kind: None,
+                    ordinal: 0,
+                }],
+                HierarchyProvenanceId::default(),
+                false,
+            );
+            let mut frame = MemberSelectionFrame::new(
+                resources,
+                MemberSelectionRequest {
+                    policy: &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
+                    order: Some(HierarchyOrderRequest {
+                        policy: &REPAIR_ORDER,
+                        start_after: None,
+                    }),
+                    reference: root,
+                    values: Vec::new(),
+                    lookup: root,
+                    namespace: ResolutionNamespace::Type,
+                    language: Language::Scala,
+                },
+            )
+            .unwrap();
+            frame.order.as_mut().unwrap().root(expression, root);
+            scheduler.relations[relation].member_requested = true;
+            scheduler.relations[relation].member_selection = Some(Box::new(frame));
+        }
+        let session = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 100_000,
+                ..ReceiverAnalysisBudget::default()
+            },
+            None,
+        );
+        with_resources_in_session(Some(&session), |resources| {
+            let mut provider = Provider;
+            let mut scheduler = new_scheduler();
+            let parent_endpoint = member_endpoint();
+            let first = ReferenceKey::caller(SemanticId::for_test("warm-relation-first"));
+            let first_task = scheduler.admit(resources, first, None).unwrap();
+            let state = scheduler.tasks[first_task]
+                .frame
+                .take()
+                .unwrap()
+                .evaluation
+                .unwrap();
+            scheduler.tasks[first_task].frame =
+                Some(DemandFactEvaluationTask::pending_relation_for_test(
+                    state,
+                    first.reference,
+                    parent_endpoint.endpoint.clone(),
+                ));
+            scheduler.runnable.clear();
+            assert!(matches!(
+                poll_round(
+                    resources,
+                    &mut scheduler,
+                    &[first_task],
+                    &mut provider,
+                    &|_| false,
+                    &mut HashSet::default(),
+                )
+                .unwrap(),
+                RoundOutcome::Continue
+            ));
+            let parent = scheduler.relation_ids[&parent_endpoint];
+            assert_eq!(scheduler.tasks[first_task].waiting, 1);
+            let child_endpoint = RelationKey::caller(EndpointSignature::new(
+                BindingNodeId::universal_root(),
+                StackPattern::closed([SemanticId::for_test("warm-relation-child")]),
+                StackPattern::closed(Vec::<BindingNodeId>::new()),
+            ));
+            let RelationAdmission::Ready(child) = scheduler.install_relation(
+                resources,
+                child_endpoint,
+                provider.discover(&parent_endpoint).unwrap(),
+            ) else {
+                panic!("child admitted");
+            };
+            attach_order(&mut scheduler, resources, child, "warm-child-order");
+            let spent_before_child = session.finish(()).work().hierarchy_order_steps;
+            scheduler.runnable.clear();
+            scheduler.runnable.push_back(Runnable::Relation(child));
+            let SchedulerOutcome::Ready(scheduler) = drive_scheduler(
+                resources,
+                scheduler,
+                &mut provider,
+                Vec::new(),
+                |scheduler| scheduler.relations[child].closed,
+            )
+            .unwrap() else {
+                panic!("child order closes");
+            };
+            let mut scheduler = *scheduler;
+            let child_cost = scheduler.relations[child].order_cost;
+            assert!(child_cost > 0);
+            attach_order(&mut scheduler, resources, parent, "warm-parent-order");
+            scheduler.relations[parent].child_relations.insert(child);
+            scheduler.runnable.clear();
+            scheduler.runnable.push_back(Runnable::Relation(parent));
+            let SchedulerOutcome::Ready(scheduler) = drive_scheduler(
+                resources,
+                scheduler,
+                &mut provider,
+                Vec::new(),
+                |scheduler| scheduler.relations[parent].closed,
+            )
+            .unwrap() else {
+                panic!("parent order closes");
+            };
+            let mut scheduler = *scheduler;
+            let total = scheduler.relations[parent].order_cost;
+            assert!(total > child_cost);
+            let cold_spend = session.finish(()).work().hierarchy_order_steps - spent_before_child;
+            assert!(
+                cold_spend >= total,
+                "cold parent and child order steps charge the bounded session",
+            );
+            let second = ReferenceKey::caller(SemanticId::for_test("warm-relation-second"));
+            let second_task = scheduler.admit(resources, second, None).unwrap();
+            let state = scheduler.tasks[second_task]
+                .frame
+                .take()
+                .unwrap()
+                .evaluation
+                .unwrap();
+            scheduler.tasks[second_task].frame =
+                Some(DemandFactEvaluationTask::pending_relation_for_test(
+                    state,
+                    second.reference,
+                    parent_endpoint.endpoint.clone(),
+                ));
+            scheduler.runnable.clear();
+            let spent_before_second = session.finish(()).work().hierarchy_order_steps;
+            let outcome = poll_round(
+                resources,
+                &mut scheduler,
+                &[second_task],
+                &mut provider,
+                &|_| false,
+                &mut HashSet::default(),
+            );
+            assert!(outcome.is_ok(), "warm task poll failed");
+            assert_eq!(
+                session.finish(()).work().hierarchy_order_steps - spent_before_second,
+                cold_spend,
+                "warm and cold scheduler polls pay equal total session work",
+            );
+            assert_eq!(
+                scheduler.warm_replay_charges,
+                vec![(MemberConsumerId::QualifiedTask(second_task), parent, total)]
+            );
+        });
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8704: a session-budget stop during order work was mislabeled as a local cap"
+    )]
+    fn bounded_session_order_stop_is_execution_dependent_and_unmemoized() {
+        let session = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 1,
+                max_hierarchy_order_work: 1,
+                max_hierarchy_order_steps: 100,
+                ..ReceiverAnalysisBudget::default()
+            },
+            None,
+        );
+        with_resources_in_session(Some(&session), |resources| {
+            let root = SemanticId::for_test("bounded-order-root");
+            let base = SemanticId::for_test("bounded-order-base");
+            let mut frame = MemberSelectionFrame::new(
+                resources,
+                MemberSelectionRequest {
+                    policy: &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
+                    order: Some(HierarchyOrderRequest {
+                        policy: &REPAIR_ORDER,
+                        start_after: None,
+                    }),
+                    reference: root,
+                    values: Vec::new(),
+                    lookup: root,
+                    namespace: ResolutionNamespace::Type,
+                    language: Language::Scala,
+                },
+            )
+            .unwrap();
+            let leaf = resources.hierarchy.order.owner(
+                base,
+                Vec::new(),
+                HierarchyProvenanceId::default(),
+                false,
+            );
+            let expression = resources.hierarchy.order.owner(
+                root,
+                vec![HierarchyOrderedBase {
+                    expression: leaf,
+                    reference: base,
+                    kind: None,
+                    ordinal: 0,
+                }],
+                HierarchyProvenanceId::default(),
+                false,
+            );
+            frame.order.as_mut().unwrap().root(expression, root);
+            assert!(matches!(
+                frame
+                    .poll(resources, &mut |_| unreachable!("no member dependencies"))
+                    .unwrap(),
+                MemberSelectionPoll::Cancelled
+            ));
+            assert!(resources.hierarchy.order_outcomes.is_empty());
+        });
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit::HierarchyOrderSteps,
+                ..
+            }
+        ));
     }
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -6885,7 +8109,7 @@ mod tests {
             done.ordered,
             vec![SemanticId::for_test("repair-order-root")]
         );
-        assert_eq!(done.work.scope_nodes, 1);
+        assert_eq!(done.work.scope_nodes, 0);
     }
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
@@ -7302,31 +8526,32 @@ mod tests {
                     scheduler.tasks[dependency].answer = Some(answer);
                 }
                 let frame = scheduler.tasks[task].frame.as_mut().unwrap();
-                frame.phase = DemandFactEvaluationPhase::References;
-                frame.references = Some(DemandReferenceEvaluationFrame {
-                    references: vec![root.reference],
-                    cursor: 0,
-                    routes: HashMap::default(),
-                    calls: HashMap::default(),
-                    answers: HashMap::default(),
-                    literal_keys: Default::default(),
-                    expression_reference: None,
-                    active: None,
-                    qualified: None,
-                    registered_qualified: Some(Box::new(RegisteredQualifiedFrame {
-                        pending: VecDeque::new(),
-                        active: Some(ActiveRegisteredQualifiedGroup::Members { precedence: 0 }),
-                        answers: Vec::new(),
-                        pending_dependency: false,
-                    })),
-                    scheduler_members: true,
-                    root_metadata: None,
-                    lexical_hierarchy: None,
-                    implicit: None,
-                    implicit_answer: None,
-                    applied_members: None,
-                    applied_hierarchy: None,
-                });
+                frame.phase = DemandFactEvaluationPhase::References(Box::new(
+                    DemandReferenceEvaluationFrame {
+                        references: vec![root.reference],
+                        cursor: 0,
+                        routes: HashMap::default(),
+                        calls: HashMap::default(),
+                        answers: AnswerMap::default(),
+                        literal_keys: Default::default(),
+                        expression_reference: None,
+                        active: None,
+                        qualified: None,
+                        registered_qualified: Some(Box::new(RegisteredQualifiedFrame {
+                            pending: VecDeque::new(),
+                            active: Some(ActiveRegisteredQualifiedGroup::Members { precedence: 0 }),
+                            answers: Vec::new(),
+                            pending_dependency: false,
+                        })),
+                        scheduler_members: true,
+                        root_metadata: None,
+                        lexical_hierarchy: None,
+                        implicit: None,
+                        implicit_answer: None,
+                        applied_members: None,
+                        applied_hierarchy: None,
+                    },
+                ));
                 let id =
                     QualifiedMemberId::issue(HierarchyProvenanceView::new(resources.hierarchy));
                 let input = QualifiedMemberInput {
@@ -7402,8 +8627,7 @@ mod tests {
                             .frame
                             .as_ref()
                             .unwrap()
-                            .references
-                            .as_ref()
+                            .reference_frame()
                             .unwrap()
                             .registered_qualified
                             .as_ref()

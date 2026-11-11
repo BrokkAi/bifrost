@@ -1,3 +1,4 @@
+use brokk_bifrost_core::analyzer::scope_regions::{ScopeRegions, ScopeRegionsBuilder};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -134,24 +135,65 @@ struct PhpNamespaceScope {
     events: Vec<PhpAliasEvent>,
 }
 
-#[derive(Debug, Clone)]
-struct PhpContextSegment {
-    start: usize,
-    end: usize,
-    context: PhpFileContext,
+/// Where the root walk of [`php_namespace_scopes`] stands between
+/// namespace declarations. Global code runs until a namespace declaration; an
+/// unbraced `namespace N;` runs until the next namespace declaration or the end
+/// of the file. A braced `namespace N { ... }` is closed on sight, so it is
+/// never a state, and the code after it is global again.
+enum PhpNamespaceState {
+    Global {
+        start: usize,
+        events: Vec<PhpAliasEvent>,
+    },
+    Unbraced {
+        start: usize,
+        namespace: String,
+        events: Vec<PhpAliasEvent>,
+    },
+}
+
+impl PhpNamespaceState {
+    fn events_mut(&mut self) -> &mut Vec<PhpAliasEvent> {
+        match self {
+            Self::Global { events, .. } | Self::Unbraced { events, .. } => events,
+        }
+    }
+
+    /// Close the running scope at `end`, the start of the next namespace
+    /// declaration or the end of the file.
+    fn finish(self, end: usize) -> PhpNamespaceScope {
+        let (start, namespace, events) = match self {
+            Self::Global { start, events } => (start, String::new(), events),
+            Self::Unbraced {
+                start,
+                namespace,
+                events,
+            } => (start, namespace, events),
+        };
+        PhpNamespaceScope {
+            start,
+            end,
+            namespace,
+            events,
+        }
+    }
 }
 
 /// The lexical namespace and import context of a complete PHP source tree.
 ///
 /// PHP has three scope shapes here: statements in the global namespace,
 /// braced namespace bodies, and unbraced namespaces that continue to the next
-/// namespace declaration (or end of file). The index stores those regions and
-/// structured alias events without retaining the parser tree or source bytes,
-/// so one parsed file can answer many context queries cheaply.
+/// namespace declaration (or end of file). The index stores those regions,
+/// split at every `use` declaration's end, without retaining the parser tree
+/// or source bytes, so one parsed file can answer many context queries cheaply.
 #[derive(Debug, Clone)]
 pub struct PhpFileContextIndex {
     source_len: usize,
-    segments: Vec<PhpContextSegment>,
+    regions: ScopeRegions<PhpFileContext>,
+    /// The context after the last `use` of the last scope, which a byte at or
+    /// past the end of the source sees. No region holds it when that `use`
+    /// ends the file.
+    end_context: PhpFileContext,
     merged_aliases: PhpUseAliases,
 }
 
@@ -159,87 +201,7 @@ impl PhpFileContextIndex {
     /// Build an index while invoking `step` for every syntax node inspected.
     /// Cancellation returns `None`; no partial index escapes the build.
     pub fn from_tree(root: Node<'_>, source: &str, mut step: impl FnMut() -> bool) -> Option<Self> {
-        let mut scopes = Vec::new();
-        let mut global_start = 0usize;
-        let mut global_events = Vec::new();
-        let mut unbraced: Option<PhpNamespaceScope> = None;
-        let mut cursor = root.walk();
-        for child in root.named_children(&mut cursor) {
-            if !step() {
-                return None;
-            }
-            if let Some(scope) = &mut unbraced {
-                if child.kind() != "namespace_definition" {
-                    if child.kind() == "namespace_use_declaration" {
-                        scope
-                            .events
-                            .push(php_alias_event(child, source, &mut step)?);
-                    }
-                    continue;
-                }
-                let mut finished = unbraced.take().expect("active namespace scope");
-                finished.end = child.start_byte();
-                scopes.push(finished);
-                global_start = child.start_byte();
-                global_events.clear();
-            }
-            if child.kind() != "namespace_definition" {
-                if child.kind() == "namespace_use_declaration" {
-                    global_events.push(php_alias_event(child, source, &mut step)?);
-                }
-                continue;
-            }
-
-            let namespace = match child.child_by_field_name("name") {
-                Some(name) => php_path_from_node(name, source, &mut step)?,
-                None => String::new(),
-            };
-            if let Some(body) = child.child_by_field_name("body") {
-                scopes.push(PhpNamespaceScope {
-                    start: global_start,
-                    end: child.start_byte(),
-                    namespace: String::new(),
-                    events: std::mem::take(&mut global_events),
-                });
-                scopes.push(PhpNamespaceScope {
-                    start: child.start_byte(),
-                    end: child.end_byte(),
-                    namespace,
-                    events: php_alias_events_from_children(
-                        body,
-                        body.start_byte(),
-                        body.end_byte(),
-                        source,
-                        &mut step,
-                    )?,
-                });
-                global_start = child.end_byte();
-            } else {
-                scopes.push(PhpNamespaceScope {
-                    start: global_start,
-                    end: child.start_byte(),
-                    namespace: String::new(),
-                    events: std::mem::take(&mut global_events),
-                });
-                unbraced = Some(PhpNamespaceScope {
-                    start: child.start_byte(),
-                    end: source.len(),
-                    namespace,
-                    events: Vec::new(),
-                });
-            }
-        }
-        if let Some(scope) = unbraced {
-            scopes.push(scope);
-        } else {
-            scopes.push(PhpNamespaceScope {
-                start: global_start,
-                end: source.len(),
-                namespace: String::new(),
-                events: global_events,
-            });
-        }
-
+        let scopes = php_namespace_scopes(root, source, usize::MAX, &mut step)?;
         let mut merged_aliases = PhpUseAliases::default();
         let mut ambiguous_type_locals = HashSet::default();
         let mut ambiguous_function_locals = HashSet::default();
@@ -254,8 +216,17 @@ impl PhpFileContextIndex {
                 );
             }
         }
+        Some(Self::from_scopes(scopes, source.len(), merged_aliases))
+    }
 
-        let mut segments = Vec::new();
+    /// Split each namespace scope at its `use` declarations' ends.
+    fn from_scopes(
+        scopes: Vec<PhpNamespaceScope>,
+        source_len: usize,
+        merged_aliases: PhpUseAliases,
+    ) -> Self {
+        let mut regions = ScopeRegionsBuilder::default();
+        let mut end_context = None;
         for scope in scopes {
             let mut aliases = PhpUseAliases::default();
             let mut cursor = scope.start;
@@ -264,28 +235,23 @@ impl PhpFileContextIndex {
                     namespace: scope.namespace.clone(),
                     aliases: aliases.clone(),
                 };
-                segments.push(PhpContextSegment {
-                    start: cursor,
-                    end: event.end,
-                    context,
-                });
+                regions.push(cursor..event.end, context);
                 aliases.extend(event.aliases);
                 cursor = event.end;
             }
-            segments.push(PhpContextSegment {
-                start: cursor,
-                end: scope.end,
-                context: PhpFileContext {
-                    namespace: scope.namespace,
-                    aliases,
-                },
-            });
+            let context = PhpFileContext {
+                namespace: scope.namespace,
+                aliases,
+            };
+            regions.push(cursor..scope.end, context.clone());
+            end_context = Some(context);
         }
-        Some(Self {
-            source_len: source.len(),
-            segments,
+        Self {
+            source_len,
+            regions: regions.finish(),
+            end_context: end_context.expect("the root walk always closes a final scope"),
             merged_aliases,
-        })
+        }
     }
 
     /// Return the exact namespace/import context visible at `byte`.
@@ -295,18 +261,12 @@ impl PhpFileContextIndex {
     /// should interpret the declaration node with [`php_use_aliases_from_node`]
     /// directly.
     pub fn context_at(&self, byte: usize) -> &PhpFileContext {
-        let byte = byte.min(self.source_len);
-        let segment_index = self
-            .segments
-            .partition_point(|segment| segment.start <= byte)
-            .saturating_sub(1);
-        let segment = self
-            .segments
-            .get(segment_index)
-            .filter(|segment| byte < segment.end)
-            .or_else(|| self.segments.last())
-            .expect("a PHP context index always has at least one segment");
-        &segment.context
+        if byte >= self.source_len {
+            return &self.end_context;
+        }
+        self.regions
+            .value_at(byte)
+            .expect("PHP context regions partition the source")
     }
 
     /// Return aliases that can be used as a conservative whole-file summary.
@@ -320,6 +280,67 @@ impl PhpFileContextIndex {
     pub fn merged_aliases(&self) -> PhpUseAliases {
         self.merged_aliases.clone()
     }
+}
+
+/// The namespace scopes of a PHP file, each with its `use` events, in source
+/// order. Statements that start after `through` cannot change the context of a
+/// byte at or before it, so the walk stops there: a single-byte query near the
+/// start of a large file inspects only its prefix (#3026). The last scope
+/// always runs to the end of the source.
+fn php_namespace_scopes(
+    root: Node<'_>,
+    source: &str,
+    through: usize,
+    step: &mut impl FnMut() -> bool,
+) -> Option<Vec<PhpNamespaceScope>> {
+    let mut scopes = Vec::new();
+    let mut state = PhpNamespaceState::Global {
+        start: 0,
+        events: Vec::new(),
+    };
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if !step() {
+            return None;
+        }
+        if child.start_byte() > through {
+            break;
+        }
+        if child.kind() != "namespace_definition" {
+            if child.kind() == "namespace_use_declaration" {
+                state
+                    .events_mut()
+                    .push(php_alias_event(child, source, step)?);
+            }
+            continue;
+        }
+        scopes.push(state.finish(child.start_byte()));
+        let namespace = match child.child_by_field_name("name") {
+            Some(name) => php_path_from_node(name, source, step)?,
+            None => String::new(),
+        };
+        state = match child.child_by_field_name("body") {
+            Some(body) => {
+                scopes.push(PhpNamespaceScope {
+                    start: child.start_byte(),
+                    end: child.end_byte(),
+                    namespace,
+                    events: php_alias_events_from_children(body, through, source, step)?,
+                });
+                PhpNamespaceState::Global {
+                    start: child.end_byte(),
+                    events: Vec::new(),
+                }
+            }
+            None => PhpNamespaceState::Unbraced {
+                start: child.start_byte(),
+                namespace,
+                events: Vec::new(),
+            },
+        };
+    }
+    scopes.push(state.finish(source.len()));
+    Some(scopes)
 }
 
 impl PhpUseAliases {
@@ -476,8 +497,7 @@ pub struct PhpUseBinding {
 
 fn php_alias_events_from_children(
     parent: Node<'_>,
-    start: usize,
-    end: usize,
+    through: usize,
     source: &str,
     step: &mut impl FnMut() -> bool,
 ) -> Option<Vec<PhpAliasEvent>> {
@@ -487,13 +507,12 @@ fn php_alias_events_from_children(
         if !step() {
             return None;
         }
-        if child.start_byte() < start || child.end_byte() > end {
-            continue;
+        if child.start_byte() > through {
+            break;
         }
-        if child.kind() != "namespace_use_declaration" {
-            continue;
+        if child.kind() == "namespace_use_declaration" {
+            events.push(php_alias_event(child, source, step)?);
         }
-        events.push(php_alias_event(child, source, step)?);
     }
     Some(events)
 }
@@ -650,92 +669,18 @@ fn add_php_import_alias(
     Some(())
 }
 
-/// Builds the PHP namespace/import context visible at `byte` from a complete
-/// structured index. `step` is honored during the whole index build; a
-/// cancellation never returns a partially collected alias map.
+/// Builds the PHP namespace/import context visible at `byte` from the prefix of
+/// a [`PhpFileContextIndex`] that can affect it. `step` is honored during the
+/// whole build; a cancellation never returns a partially collected alias map.
 pub fn php_file_context_from_tree_at(
     root: Node<'_>,
     source: &str,
     byte: usize,
     mut step: impl FnMut() -> bool,
 ) -> Option<PhpFileContext> {
-    php_file_context_at_byte(root, source, byte, &mut step)
-}
-
-fn php_file_context_at_byte(
-    root: Node<'_>,
-    source: &str,
-    byte: usize,
-    step: &mut impl FnMut() -> bool,
-) -> Option<PhpFileContext> {
-    let byte = byte.min(source.len());
-    let mut namespace = String::new();
-    let mut aliases = PhpUseAliases::default();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if !step() {
-            return None;
-        }
-        if child.start_byte() > byte {
-            break;
-        }
-        if child.kind() == "namespace_definition" {
-            let child_end = child.end_byte();
-            let child_namespace = match child.child_by_field_name("name") {
-                Some(name) => php_path_from_node(name, source, step)?,
-                None => String::new(),
-            };
-            if let Some(body) = child.child_by_field_name("body") {
-                if byte < body.start_byte() {
-                    break;
-                }
-                if byte < body.end_byte() {
-                    return Some(PhpFileContext {
-                        namespace: child_namespace,
-                        aliases: php_aliases_in_body_at(body, source, byte, step)?,
-                    });
-                }
-                namespace.clear();
-                aliases = PhpUseAliases::default();
-            } else if byte < child_end {
-                break;
-            } else {
-                namespace = child_namespace;
-                aliases = PhpUseAliases::default();
-            }
-            continue;
-        }
-        if child.kind() == "namespace_use_declaration" {
-            if child.start_byte() >= byte || child.end_byte() > byte {
-                break;
-            }
-            let parsed = php_use_aliases_from_node(child, source, step)?;
-            aliases.extend(parsed);
-        }
-    }
-    Some(PhpFileContext { namespace, aliases })
-}
-
-fn php_aliases_in_body_at(
-    body: Node<'_>,
-    source: &str,
-    byte: usize,
-    step: &mut impl FnMut() -> bool,
-) -> Option<PhpUseAliases> {
-    let mut aliases = PhpUseAliases::default();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        if !step() {
-            return None;
-        }
-        if child.start_byte() >= byte || child.end_byte() > byte {
-            break;
-        }
-        if child.kind() == "namespace_use_declaration" {
-            aliases.extend(php_use_aliases_from_node(child, source, step)?);
-        }
-    }
-    Some(aliases)
+    let scopes = php_namespace_scopes(root, source, byte, &mut step)?;
+    let index = PhpFileContextIndex::from_scopes(scopes, source.len(), PhpUseAliases::default());
+    Some(index.context_at(byte).clone())
 }
 
 /// Interpret one tree-sitter `namespace_use_declaration` node, one clause at a

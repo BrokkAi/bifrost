@@ -134,6 +134,45 @@ demand-scoped revalidation. Changed output recomputes demanded parents, while
 equal output only rebinds evidence; incomplete, corrupt, cancelled, or
 over-budget reuse falls back to a fresh witness-capable solve.
 
+#### Reads of stored semantic IR publications
+
+A per-file semantic IR publication is the atomic unit that a reader consumes:
+one head row and its child rows. A product that reads a publication records
+one read for it. The read's question names the workspace-relative path, the
+raw storage-language key, the parse variant and the source content identity.
+Its answer is one of four states:
+
+- no head;
+- a head from a stale epoch;
+- a head whose source content does not match;
+- a present head, with its active epoch and its row digest.
+
+The row digest covers the sealed head metadata and every child family a
+reader consumes, in a fixed table and key order. Identical rows give an
+identical digest. Every route that rewrites, repairs, prunes or deletes
+publication rows either updates the digest or removes the head, in the same
+transaction.
+
+Some states cannot be recorded. These are a head with no row digest (written
+before the digest existed), a head that is not complete (building, failed or
+cancelled), a decode or store error, and a selection that is unavailable,
+drifted or comes from an unsaved overlay. Each of them refuses reuse. None of
+them is ever recorded as "no head", because that answer would let a later
+publication go unnoticed.
+
+The reader samples its selection (path, live content identity, storage
+language and parse variant). It reads the head, the epoch and the rows in one
+SQLite snapshot for that selection, and samples the selection again before it
+serves or records anything. If the selection changed in between, it refuses.
+
+The in-memory artifact cache keys each artifact built from stored rows by the
+publication answer it was built from, as well as by its usual artifact key,
+even when that read cannot be recorded. A warm lookup under a different answer
+therefore misses. An old artifact can never be returned with a new receipt.
+Only an artifact lowered from source after a refused read uses the fixed
+"refused" provenance. Reusing it records no receipt and marks the product's
+reuse as refused again.
+
 ## Versions, generations, revisions, and epochs
 
 Several version-like values protect different boundaries:

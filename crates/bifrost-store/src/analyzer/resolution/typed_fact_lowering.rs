@@ -11,8 +11,8 @@ use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
-    FileResolutionFacts, IntrinsicTypeKind, IntrinsicTypeSeedFact, PositionedIdentifierFact,
-    ResolutionBinderKind, ResolutionCallArgumentFact, ResolutionCallFact,
+    FileResolutionFacts, IntrinsicTypeKind, IntrinsicTypeSeedFact, MemberTypesCoverage,
+    PositionedIdentifierFact, ResolutionBinderKind, ResolutionCallArgumentFact, ResolutionCallFact,
     ResolutionCallTypeArgumentFact, ResolutionCallableParameterFact,
     ResolutionCallableReceiverForm, ResolutionCallableResultTypeFact,
     ResolutionCallableResultTypeParameterFact, ResolutionCallableSignatureFact,
@@ -706,6 +706,12 @@ pub struct ExternalMemberCoverage {
 
 impl ExternalMemberCoverage {
     pub fn covers(self, namespace: ResolutionNamespace) -> bool {
+        // The owner declares its own constructors and inherits none, so its
+        // callable inventory lists every candidate whatever its supertypes. A
+        // names-only certificate lists no constructors, so it proves none absent.
+        if namespace == ResolutionNamespace::Constructor {
+            return self.callables_complete && !self.member_names_only;
+        }
         (self.supertypes_complete || self.member_names_only)
             && match namespace {
                 ResolutionNamespace::Callable => self.callables_complete,
@@ -723,6 +729,9 @@ pub struct LoweredMemberScopeProperty {
     scope_head: Option<BindingNodeId>,
     external_coverage: Option<ExternalMemberCoverage>,
     scope_kind: ResolutionScopeKind,
+    /// The producer's member-type claim for a source type body; `None` is
+    /// Unknown and never complete.
+    member_types: Option<MemberTypesCoverage>,
 }
 
 impl LoweredMemberScopeProperty {
@@ -744,7 +753,30 @@ impl LoweredMemberScopeProperty {
             scope_head: Some(scope_head),
             external_coverage: None,
             scope_kind,
+            member_types: None,
         }
+    }
+
+    /// Attach the producer's member-type claim to a source type body.
+    pub const fn with_member_types(self, member_types: Option<MemberTypesCoverage>) -> Self {
+        assert!(
+            member_types.is_none()
+                || (self.scope_head.is_some()
+                    && matches!(self.scope_kind, ResolutionScopeKind::TypeBody)),
+            "only a source type body carries a member-type claim"
+        );
+        Self {
+            member_types,
+            ..self
+        }
+    }
+
+    /// The producer's member-type claim for this source type body. `None` is
+    /// Unknown: the owner's member-type inventory is not certified. Only the
+    /// typed member-scope page readers carry the claim; a scope-owner lookup
+    /// builds its property without one, so it always reads as Unknown.
+    pub const fn member_types(&self) -> Option<MemberTypesCoverage> {
+        self.member_types
     }
 
     pub const fn scope_kind(&self) -> ResolutionScopeKind {
@@ -791,6 +823,7 @@ impl LoweredMemberScopeProperty {
             scope_head: None,
             external_coverage: Some(coverage),
             scope_kind: ResolutionScopeKind::TypeBody,
+            member_types: None,
         }
     }
     pub const fn external_coverage(&self) -> Option<ExternalMemberCoverage> {
@@ -816,6 +849,9 @@ pub struct LoweredMemberOwnerProperty {
     access: ResolutionMemberAccess,
     qualifier_compatibility: ResolutionMemberQualifierCompatibility,
     external_lookup: Option<[SemanticId; 15]>,
+    /// The lookup a Kotlin property read of this Java getter makes:
+    /// Kotlin reads `getNextEntry()` as the property `nextEntry`.
+    external_property_lookup: Option<SemanticId>,
     external_visibility: Option<DeclaredVisibility>,
 }
 
@@ -838,6 +874,7 @@ impl LoweredMemberOwnerProperty {
             access,
             qualifier_compatibility,
             external_lookup: None,
+            external_property_lookup: None,
             external_visibility: None,
         }
     }
@@ -866,6 +903,9 @@ impl LoweredMemberOwnerProperty {
     pub const fn external_lookup(&self) -> Option<[SemanticId; 15]> {
         self.external_lookup
     }
+    pub const fn external_property_lookup(&self) -> Option<SemanticId> {
+        self.external_property_lookup
+    }
     pub const fn external_visibility(&self) -> Option<DeclaredVisibility> {
         self.external_visibility
     }
@@ -889,8 +929,19 @@ impl LoweredMemberOwnerProperty {
             access,
             qualifier_compatibility,
             external_lookup: Some(lookup),
+            external_property_lookup: None,
             external_visibility: Some(visibility),
         }
+    }
+
+    /// An external getter that a Kotlin property read with `lookup` selects.
+    pub fn with_external_property_lookup(mut self, lookup: SemanticId) -> Self {
+        assert!(
+            self.external_lookup.is_some() && self.kind == ResolutionMemberKind::Method,
+            "only an external method is a synthetic property getter: {self:?}"
+        );
+        self.external_property_lookup = Some(lookup);
+        self
     }
 
     pub const fn kind(&self) -> ResolutionMemberKind {
@@ -950,6 +1001,7 @@ impl LoweredConstructionRequirementProperty {
 pub enum LoweredSupertypeTarget {
     SelectedReference(SemanticId),
     External(super::ExternalOwnerIdentity),
+    ResolvedIdentity(SemanticId),
 }
 
 /// A declared hierarchy edge and its honest source or external target.
@@ -1034,6 +1086,9 @@ impl super::mounted::SpliceMount for LoweredSupertypeProperty {
                 LoweredSupertypeTarget::SelectedReference(reference) => {
                     LoweredSupertypeTarget::SelectedReference(translation.semantic(*reference))
                 }
+                LoweredSupertypeTarget::ResolvedIdentity(identity) => {
+                    LoweredSupertypeTarget::ResolvedIdentity(*identity)
+                }
                 LoweredSupertypeTarget::External(target) => {
                     LoweredSupertypeTarget::External(target.clone())
                 }
@@ -1043,6 +1098,24 @@ impl super::mounted::SpliceMount for LoweredSupertypeProperty {
 }
 
 impl LoweredSupertypeProperty {
+    /// A query-local model edge, never an authored source reference.
+    pub fn resolved(
+        definition: SemanticId,
+        reference: SemanticId,
+        frontier: SemanticId,
+        parent_ordinal: u32,
+        target: SemanticId,
+    ) -> Self {
+        Self {
+            definition,
+            reference,
+            frontier,
+            kind: None,
+            parent_ordinal,
+            target: LoweredSupertypeTarget::ResolvedIdentity(target),
+        }
+    }
+
     pub fn external(
         definition: SemanticId,
         reference: SemanticId,
@@ -2377,7 +2450,10 @@ impl LoweredTypedFragment {
                     ResolutionTypeConstructorKind::Sequence
                     | ResolutionTypeConstructorKind::Slice
                     | ResolutionTypeConstructorKind::Array
-                    | ResolutionTypeConstructorKind::Channel,
+                    | ResolutionTypeConstructorKind::Channel
+                    | ResolutionTypeConstructorKind::ChannelBoth
+                    | ResolutionTypeConstructorKind::ChannelSend
+                    | ResolutionTypeConstructorKind::ChannelReceive,
                     ResolutionTypeComponentKind::Element,
                 )
                 | (
@@ -3340,9 +3416,14 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 call.callee
             })
         })
+        .chain(facts.binding_projections.iter().filter_map(|projection| {
+            (language == Language::Scala && projection.kind.is_bare_term_binding())
+                .then_some(projection.reference)
+        }))
         .collect::<HashSet<_>>();
     let independent_results =
         super::fact_lowering::applicability_independent_result_slots(language, facts);
+    let callable_values = super::fact_lowering::callable_value_type_gap_outputs(language, facts);
     let projected_outputs = facts
         .binding_projections
         .iter()
@@ -3363,10 +3444,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         .type_slots
         .iter()
         .map(|slot| {
-            let frontier = LoweredTypedFrontier::new(
-                identities.semantic(type_slot_semantic_identity(slot.id)),
-                slot.role,
-            );
+            let frontier =
+                LoweredTypedFrontier::new(identities.type_slot_semantic(slot.id), slot.role);
             if transferred_identity_outputs.contains(&slot.id)
                 && !projected_outputs.contains(&slot.id)
                 && index.identifiers.get(&slot.site).is_some_and(|identifier| {
@@ -3392,10 +3471,10 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             assert_eq!(container.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             assert_eq!(component.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             LoweredTypeComponent::new(
-                identities.semantic(type_slot_semantic_identity(fact.container)),
+                identities.type_slot_semantic(fact.container),
                 fact.constructor,
                 fact.kind,
-                identities.semantic(type_slot_semantic_identity(fact.component)),
+                identities.type_slot_semantic(fact.component),
             )
         })
         .collect::<Vec<_>>();
@@ -3408,9 +3487,9 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             assert_eq!(owner.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             assert_eq!(argument.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             LoweredDeclaredTypeArgument::new(
-                identities.semantic(type_slot_semantic_identity(fact.owner)),
+                identities.type_slot_semantic(fact.owner),
                 fact.ordinal,
-                identities.semantic(type_slot_semantic_identity(fact.argument)),
+                identities.type_slot_semantic(fact.argument),
             )
         })
         .collect::<Vec<_>>();
@@ -3423,9 +3502,9 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             assert_eq!(application.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             assert_eq!(argument.role, ResolutionTypeSlotRole::TargetTypeIdentity);
             LoweredTypeArgument::new(
-                identities.semantic(type_slot_semantic_identity(fact.application)),
+                identities.type_slot_semantic(fact.application),
                 fact.ordinal,
-                identities.semantic(type_slot_semantic_identity(fact.argument)),
+                identities.type_slot_semantic(fact.argument),
                 fact.indirection_delta,
                 fact.reference_indirection_delta,
             )
@@ -3451,7 +3530,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 identities.source_definition_semantic(fact.alias),
                 fact.ordinal,
                 identities.source_definition_semantic(fact.parameter),
-                identities.semantic(type_slot_semantic_identity(fact.target)),
+                identities.type_slot_semantic(fact.target),
                 fact.indirection_delta,
                 fact.reference_indirection_delta,
             )
@@ -3505,7 +3584,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             LoweredGenericFormalDefault::new(
                 identities.source_definition_semantic(fact.owner),
                 fact.ordinal,
-                identities.semantic(type_slot_semantic_identity(fact.default)),
+                identities.type_slot_semantic(fact.default),
             )
         })
         .collect();
@@ -3525,7 +3604,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         assert_eq!(target.role, ResolutionTypeSlotRole::TargetTypeIdentity);
         underlying_types.push(LoweredUnderlyingType::new(
             identities.source_definition_semantic(subject.site),
-            identities.semantic(type_slot_semantic_identity(target.id)),
+            identities.type_slot_semantic(target.id),
         ));
     }
 
@@ -3543,15 +3622,18 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             "a type transfer cannot be reflexive"
         );
         validate_transfer_roles(fact, input.role, output.role);
-        let source_slot = identities.semantic(type_slot_semantic_identity(fact.input));
-        let target_slot = identities.semantic(type_slot_semantic_identity(fact.output));
+        let source_slot = identities.type_slot_semantic(fact.input);
+        let target_slot = identities.type_slot_semantic(fact.output);
         // A receiver slot can share its source site with the callee. The
         // callee's applicability obligation is not receiver construction
         // evidence. Input-frontier uncertainty still propagates normally.
         let callee_sites = &callee_sites;
         let argument_independent_calls = &argument_independent_calls;
-        let independent_result = fact.kind == ResolutionTypeTransferKind::DeclaredType
-            && independent_results.contains(&fact.output);
+        let independent_result = independent_results.contains(&fact.output)
+            && (fact.kind == ResolutionTypeTransferKind::DeclaredType
+                || (fact.kind == ResolutionTypeTransferKind::Initialization
+                    && callable_values.contains_key(&output.site)));
+        let callable_values = &callable_values;
         let completion = completion_for_gaps(
             identities,
             [input.site, output.site].into_iter().flat_map(|site| {
@@ -3560,12 +3642,18 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                     .into_iter()
                     .flatten()
                     .filter_map(move |&kind| {
-                        (!(kind == ResolutionGapKind::UnsupportedCallApplicability
-                            && (callee_sites.contains(&site)
-                                || (fact.kind == ResolutionTypeTransferKind::Receiver
-                                    && site == output.site
-                                    && argument_independent_calls.contains(&site))
-                                || (independent_result && site == output.site))))
+                        let function_value_gap = kind
+                            == ResolutionGapKind::UnsupportedExpressionType
+                            && callable_values
+                                .get(&site)
+                                .is_some_and(|&value| value != fact.input && value != fact.output);
+                        (!(function_value_gap
+                            || (kind == ResolutionGapKind::UnsupportedCallApplicability
+                                && (callee_sites.contains(&site)
+                                    || (fact.kind == ResolutionTypeTransferKind::Receiver
+                                        && site == output.site
+                                        && argument_independent_calls.contains(&site))
+                                    || (independent_result && site == output.site)))))
                             .then_some((site, kind))
                     })
             }),
@@ -3602,7 +3690,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 validate_type_definition(output.site, &index);
                 identities.source_definition_semantic(output.site)
             } else {
-                identities.semantic(type_slot_semantic_identity(fact.output))
+                identities.type_slot_semantic(fact.output)
             }
         } else {
             identities.shared_name(super::universe::intrinsic_type_identity_digest(
@@ -3635,7 +3723,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             fact.kind,
             spelling,
             TypedFrontierState::new(
-                identities.semantic(type_slot_semantic_identity(fact.output)),
+                identities.type_slot_semantic(fact.output),
                 values,
                 completion,
             ),
@@ -3652,7 +3740,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         validate_projection(fact, &index, facts);
         projections.push(LoweredBindingProjection::new(
             identities.source_reference_semantic(fact.reference),
-            identities.semantic(type_slot_semantic_identity(fact.output)),
+            identities.type_slot_semantic(fact.output),
             fact.kind,
         ));
     }
@@ -3717,7 +3805,9 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             // Rust associated functions inhabit the value namespace even when
             // used without a call. Keep the ordinary value route for constants
             // and constructors; a callable alternative admits method items.
-            let member_routes = if let Some(call_routes) = call_target_routes
+            let member_routes = if projection.kind.is_bare_term_binding() {
+                &[(0, ResolutionNamespace::Callable)][..]
+            } else if let Some(call_routes) = call_target_routes
                 && projection.kind == BindingProjectionKind::TargetCallableResultType
             {
                 call_routes
@@ -3740,7 +3830,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 } else {
                     rank
                 };
-                let source_namespace = if identifier.namespace == ResolutionNamespace::TypeOrValue
+                let source_namespace = if projection.kind.is_bare_term_binding()
+                    || identifier.namespace == ResolutionNamespace::TypeOrValue
                     || (call_target_routes.is_some() && namespace != ResolutionNamespace::Callable)
                 {
                     namespace
@@ -3749,7 +3840,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 };
                 qualified_routes.push(LoweredQualifiedSeededRoute::new_with_source_lookup(
                     reference,
-                    identities.semantic(type_slot_semantic_identity(qualifier)),
+                    identities.type_slot_semantic(qualifier),
                     identities.lookup_semantic_in_domain(
                         identity_domain,
                         namespace,
@@ -3762,7 +3853,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                         index.name(identifier.name),
                     ),
                     precedence_ordinal,
-                    identities.semantic(type_slot_semantic_identity(projection.output)),
+                    identities.type_slot_semantic(projection.output),
                     projection.kind,
                     coarse_gap_reason,
                     open_member_surfaces.contains(&identifier.site),
@@ -3786,7 +3877,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         );
         declaration_types.push(LoweredDeclarationTypeProperty::new(
             identities.source_definition_semantic(fact.declaration),
-            identities.semantic(type_slot_semantic_identity(fact.slot)),
+            identities.type_slot_semantic(fact.slot),
             fact.role,
         ));
     }
@@ -3831,13 +3922,13 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             );
             declaration_types.push(LoweredDeclarationTypeProperty::new(
                 identities.source_definition_semantic(binder.declaration),
-                identities.semantic(type_slot_semantic_identity(slot)),
+                identities.type_slot_semantic(slot),
                 DeclarationTypeRole::ObservedValue,
             ));
         }
     }
 
-    let member_scopes = lower_member_scope_properties(identities, &index);
+    let member_scopes = lower_member_scope_properties(identities, facts, &index);
     let deferred_member_owners =
         lower_deferred_member_owner_properties(identities, language, facts, &index);
     let definition_properties = lower_definition_properties_with_index(
@@ -3942,7 +4033,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 LoweredCallArgumentProperty::new(
                     argument.list_ordinal,
                     argument.ordinal,
-                    identities.semantic(type_slot_semantic_identity(argument.value)),
+                    identities.type_slot_semantic(argument.value),
                     argument
                         .label
                         .map(|label| index.name(label).to_owned().into_boxed_str()),
@@ -3951,7 +4042,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             .collect::<Vec<_>>();
         let argument_slots = arguments
             .iter()
-            .map(|argument| identities.semantic(type_slot_semantic_identity(argument.value)))
+            .map(|argument| identities.type_slot_semantic(argument.value))
             .collect::<Vec<_>>();
         let local_completion = completion_for_site_iter(
             identities,
@@ -3972,29 +4063,29 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             arguments
                 .unwrap_or_default()
                 .into_iter()
-                .map(|argument| identities.semantic(type_slot_semantic_identity(argument.value)))
+                .map(|argument| identities.type_slot_semantic(argument.value))
                 .collect::<Vec<_>>()
         };
         let owner_type_argument_slots = slots_of(owner_type_arguments_by_call.remove(&call.call));
         let type_argument_slots = slots_of(type_arguments_by_call.remove(&call.call));
         let owner_type_segment = owner_type_segments_by_call
             .remove(&call.call)
-            .map(|slot| identities.semantic(type_slot_semantic_identity(slot)));
+            .map(|slot| identities.type_slot_semantic(slot));
         let expected_result_slot = expected_results_by_call
             .remove(&call.call)
-            .map(|slot| identities.semantic(type_slot_semantic_identity(slot)));
+            .map(|slot| identities.type_slot_semantic(slot));
         let extra_result_slots = call
             .extra_result_slots
             .iter()
-            .map(|&slot| identities.semantic(type_slot_semantic_identity(slot)))
+            .map(|&slot| identities.type_slot_semantic(slot))
             .collect::<Vec<_>>();
         call_obligations.push(
             LoweredCallApplicabilityObligation::new(
                 call_semantic,
                 identities.source_reference_semantic(call.callee),
                 call.receiver
-                    .map(|slot| identities.semantic(type_slot_semantic_identity(slot))),
-                identities.semantic(type_slot_semantic_identity(call.result)),
+                    .map(|slot| identities.type_slot_semantic(slot)),
+                identities.type_slot_semantic(call.result),
                 argument_slots,
                 eligible_rules_by_call
                     .remove(&call.call)
@@ -4092,7 +4183,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             extension_receivers_by_callable
                 .insert(
                     receiver.callable,
-                    identities.semantic(type_slot_semantic_identity(receiver.receiver_type)),
+                    identities.type_slot_semantic(receiver.receiver_type),
                 )
                 .is_none(),
             "one extension receiver per callable"
@@ -4167,7 +4258,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 LoweredCallableParameterProperty::new(
                     parameter.ordinal,
                     identities.source_definition_semantic(parameter.parameter),
-                    identities.semantic(type_slot_semantic_identity(parameter.value_type)),
+                    identities.type_slot_semantic(parameter.value_type),
                     parameter.repeated,
                 )
             })
@@ -4202,7 +4293,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
                 assert_eq!(value_type.role, ResolutionTypeSlotRole::DeclaredValue);
                 LoweredCallableResultTypeProperty::new(
                     result.ordinal,
-                    identities.semantic(type_slot_semantic_identity(result.value_type)),
+                    identities.type_slot_semantic(result.value_type),
                 )
             })
             .collect::<Vec<_>>();
@@ -4279,7 +4370,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         assert_eq!(index.slot(row.output).site, row.declaration);
         declaration_values.push(LoweredDeclarationValue {
             declaration: identities.source_definition_semantic(row.declaration),
-            output: identities.semantic(type_slot_semantic_identity(row.output)),
+            output: identities.type_slot_semantic(row.output),
             kind: row.kind,
         });
     }
@@ -4324,7 +4415,7 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
         callable_returns.push(LoweredCallableReturn {
             callable: identities.source_definition_semantic(row.callable),
             return_site: identities.source_filler_semantic(row.return_site),
-            value: identities.semantic(type_slot_semantic_identity(row.value)),
+            value: identities.type_slot_semantic(row.value),
         });
     }
     callable_returns.sort_by_key(|row| (row.callable, row.return_site, row.value));
@@ -4356,8 +4447,8 @@ pub(super) fn lower_typed_resolution_facts_with_identities(
             .type_productions
             .iter()
             .map(|fact| LoweredTypeProduction {
-                output: identities.semantic(type_slot_semantic_identity(fact.output)),
-                element: identities.semantic(type_slot_semantic_identity(fact.element)),
+                output: identities.type_slot_semantic(fact.output),
+                element: identities.type_slot_semantic(fact.element),
                 constructor: fact.constructor,
                 length: fact.length.clone(),
             })
@@ -4400,7 +4491,7 @@ fn lower_deferred_member_owner_properties(
         properties.push(
             LoweredDeferredMemberOwner::new(
                 identities.source_definition_semantic(fact.member),
-                identities.semantic(type_slot_semantic_identity(fact.owner_type)),
+                identities.type_slot_semantic(fact.owner_type),
                 lookup,
                 fact.kind,
                 fact.access,
@@ -4409,7 +4500,7 @@ fn lower_deferred_member_owner_properties(
             .with_hierarchy_frontier(
                 hierarchy_by_member
                     .get(&fact.member)
-                    .map(|&slot| identities.semantic(type_slot_semantic_identity(slot))),
+                    .map(|&slot| identities.type_slot_semantic(slot)),
             ),
         );
     }
@@ -4428,8 +4519,22 @@ fn lower_deferred_member_owner_properties(
 
 fn lower_member_scope_properties(
     identities: &mut ResolutionIdentityCatalogBuilder,
+    facts: &FileResolutionFacts,
     index: &TypedFactIndex<'_>,
 ) -> Vec<LoweredMemberScopeProperty> {
+    // The claim comes from the producer, keyed by the owner. A type body
+    // without one stays Unknown; its presence alone certifies nothing.
+    let mut claims = HashMap::default();
+    for claim in &facts.member_type_coverage {
+        assert!(
+            index.type_body_scope_by_owner.contains_key(&claim.owner),
+            "a member-type claim names a type declaration with a type body: {claim:?}"
+        );
+        assert!(
+            claims.insert(claim.owner, claim.coverage).is_none(),
+            "one member-type claim per owner: {claim:?}"
+        );
+    }
     let mut properties = index
         .type_member_scopes()
         .into_iter()
@@ -4438,6 +4543,7 @@ fn lower_member_scope_properties(
                 identities.source_definition_semantic(declaration),
                 identities.source_scope_node(scope),
             )
+            .with_member_types(claims.get(&declaration).copied())
         })
         .collect::<Vec<_>>();
     for scope in index
@@ -4657,7 +4763,7 @@ fn lower_definition_properties_with_index(
         supertypes.push(LoweredSourceSupertypeProperty::new(
             identities.source_definition_semantic(fact.subtype),
             identities.source_reference_semantic(fact.supertype_reference),
-            identities.semantic(type_slot_semantic_identity(fact.supertype_slot)),
+            identities.type_slot_semantic(fact.supertype_slot),
             fact.kind,
             fact.parent_ordinal,
         ));
@@ -5256,7 +5362,7 @@ impl<'facts> TypedFactIndex<'facts> {
             .map(|slots| {
                 slots
                     .iter()
-                    .map(|&slot| identities.semantic(type_slot_semantic_identity(slot)))
+                    .map(|&slot| identities.type_slot_semantic(slot))
                     .collect()
             })
             .unwrap_or_else(|| vec![site_type_frontier_semantic(identities, site)])
@@ -5919,6 +6025,19 @@ fn validate_projection(
     let non_invoking_constructor_reference = fact.kind
         == BindingProjectionKind::NonInvokingMemberReference
         && reference.namespace == ResolutionNamespace::Constructor;
+    let bare_term_binding = fact.kind.is_bare_term_binding()
+        && matches!(
+            reference.namespace,
+            ResolutionNamespace::Value | ResolutionNamespace::TypeOrValue
+        )
+        && matches!(
+            reference_site.kind,
+            ResolutionSiteKind::ValueReference | ResolutionSiteKind::MemberReference
+        );
+    if bare_term_binding {
+        assert_eq!(output.site, fact.reference);
+        assert!(facts.calls.iter().all(|call| call.callee != fact.reference));
+    }
     if fact.kind == BindingProjectionKind::NonInvokingMemberReference {
         assert_eq!(output.site, fact.reference);
         assert!(matches!(
@@ -5940,6 +6059,7 @@ fn validate_projection(
             || (fact.kind == BindingProjectionKind::TargetTypeOrDeclaredValueType
                 && reference.namespace == ResolutionNamespace::Value)
             || non_invoking_constructor_reference
+            || bare_term_binding
             || callable_value_reference
             || callable_type_or_value_reference,
         "binding projection namespace does not match its contract: {fact:?}"
@@ -6000,6 +6120,11 @@ const fn projection_contract(
             ResolutionNamespace::Callable,
             ResolutionTypeSlotRole::ExpressionValue,
         ),
+        BindingProjectionKind::BareTermBinding
+        | BindingProjectionKind::BareTermBindingNoExpectedType => (
+            ResolutionNamespace::Value,
+            ResolutionTypeSlotRole::ExpressionValue,
+        ),
         BindingProjectionKind::TargetTypeOrDeclaredValueType => (
             ResolutionNamespace::TypeOrValue,
             ResolutionTypeSlotRole::ExpressionValue,
@@ -6041,7 +6166,9 @@ fn validate_declaration_type(fact: DeclarationTypeSlotFact, index: &TypedFactInd
                     || declaration.kind == ResolutionSiteKind::Pattern
             );
         }
-        DeclarationTypeRole::Return | DeclarationTypeRole::CallableFirstResult => {
+        DeclarationTypeRole::Return
+        | DeclarationTypeRole::CallableFirstResult
+        | DeclarationTypeRole::EvaluatedValue => {
             assert_eq!(declaration.kind, ResolutionSiteKind::CallableDeclaration);
         }
     }
@@ -6203,7 +6330,7 @@ fn gaps_by_site(facts: &FileResolutionFacts) -> HashMap<ResolutionSiteId, Vec<Re
     let mut seen = HashSet::default();
     for gap in &facts.gaps {
         assert!(seen.insert(gap), "duplicate resolution gap: {gap:?}");
-        if !matches!(
+        if gap.kind != ResolutionGapKind::FileProgramEvidence && !matches!(
             gap.route(),
             Some(
                 brokk_bifrost_core::analyzer::resolution_facts::ResolutionRouteGap::UnknownAlias { .. }
@@ -6368,6 +6495,11 @@ fn assert_source_lowerable_qualified_routes(
         {
             call_target_lookup_routes(language, true)
                 .expect("Scala publishes callee term-family routes")
+        } else if kind == BindingProjectionKind::TargetTypeOrDeclaredValueType
+            && crate::analyzer::semantic::languages::language_knowledge(language)
+                .is_some_and(|support| support.qualified_type_lookups_use_value_namespace())
+        {
+            lookup_routes(ResolutionNamespace::Value)
         } else if kind == BindingProjectionKind::NonInvokingMemberReference {
             // Callable and constructor references share binding-only projection
             // semantics; the producer's namespace is the language hook.
@@ -6376,6 +6508,8 @@ fn assert_source_lowerable_qualified_routes(
                 ResolutionNamespace::Callable | ResolutionNamespace::Constructor
             ));
             lookup_routes(projection_routes[0].namespace)
+        } else if kind.is_bare_term_binding() {
+            &[(0, ResolutionNamespace::Callable)]
         } else {
             lookup_routes(projection_contract(kind).0)
         };
@@ -6899,6 +7033,8 @@ const fn gap_kind_rank(kind: ResolutionGapKind) -> u8 {
         ResolutionGapKind::UnexpandedItemMacro => 19,
         ResolutionGapKind::UnexpandedImplMacro => 20,
         ResolutionGapKind::UnsupportedExpressionType => 21,
+        ResolutionGapKind::FileProgramEvidence => 22,
+        ResolutionGapKind::CompilationImportsUnenumerated => 23,
     }
 }
 

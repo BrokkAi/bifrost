@@ -15,6 +15,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct JavaKnowledge;
 
 impl LanguageKnowledge for JavaKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn semantic_string_constant_value(&self, payload: &str) -> Option<String> {
         Some(payload.to_owned())
     }
@@ -148,6 +154,18 @@ impl LanguageKnowledge for JavaKnowledge {
 pub struct KotlinKnowledge;
 
 impl LanguageKnowledge for KotlinKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
+    // Kotlin and Scala call Java members of the JDK and of Java libraries
+    // directly; the selected member is the Java declaration itself.
+    fn external_declaration_languages(&self) -> &'static [Language] {
+        &[Language::Java]
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }
@@ -174,6 +192,17 @@ impl LanguageKnowledge for KotlinKnowledge {
 
     fn language(&self) -> Language {
         Language::Kotlin
+    }
+
+    fn resolution_decided_application<'t>(
+        &self,
+        selection: tree_sitter::Node<'t>,
+    ) -> Option<tree_sitter::Node<'t>> {
+        crate::kotlin::syntax::kotlin_property_read_member(selection)
+    }
+
+    fn has_resolution_decided_applications(&self) -> bool {
+        true
     }
 
     fn numeric_promotion(
@@ -368,6 +397,18 @@ impl LanguageKnowledge for KotlinKnowledge {
 pub struct ScalaKnowledge;
 
 impl LanguageKnowledge for ScalaKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
+    // Kotlin and Scala call Java members of the JDK and of Java libraries
+    // directly; the selected member is the Java declaration itself.
+    fn external_declaration_languages(&self) -> &'static [Language] {
+        &[Language::Java]
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }
@@ -387,6 +428,17 @@ impl LanguageKnowledge for ScalaKnowledge {
 
     fn language(&self) -> Language {
         Language::Scala
+    }
+
+    fn resolution_decided_application<'t>(
+        &self,
+        selection: tree_sitter::Node<'t>,
+    ) -> Option<tree_sitter::Node<'t>> {
+        crate::scala::structural::scala_selection_application_member(selection)
+    }
+
+    fn has_resolution_decided_applications(&self) -> bool {
+        true
     }
 
     fn call_may_apply_value(&self) -> bool {

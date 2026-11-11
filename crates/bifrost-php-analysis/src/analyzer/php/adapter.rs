@@ -23,6 +23,21 @@ use tree_sitter::Tree;
 pub struct PhpAdapter;
 
 impl LanguageAdapter for PhpAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &["string", "nowdoc", "integer", "float"],
+            interpolations: &[],
+            composites: &[
+                (
+                    "array_creation_expression",
+                    &["array", "(", ")", "[", "]", ","],
+                ),
+                ("array_element_initializer", &["=>"]),
+                ("unary_op_expression", &["-", "+"]),
+            ],
+        }
+    }
+
     /// Relative to `brokk-bifrost-php`'s crate root: the `.scm` assets moved with
     /// the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {

@@ -347,6 +347,7 @@ pub use crate::searchtools::scan_usages::UsageGraphEdge;
 pub use crate::searchtools::scan_usages::UsageGraphFileNote;
 
 pub use crate::searchtools::scan_usages::UsageGraphIncompleteReason;
+pub use crate::searchtools::scan_usages::UsageGraphScopeObligation;
 
 pub use crate::searchtools::scan_usages::UsageGraphImplicitCallers;
 
@@ -396,6 +397,8 @@ pub use crate::searchtools::selectors::AmbiguousSymbol;
 pub use crate::searchtools::selectors::DefinitionCandidate;
 
 pub use crate::searchtools::selectors::DefinitionDiagnostic;
+
+pub use crate::searchtools::selectors::Completion;
 
 pub use crate::searchtools::selectors::DefinitionLookupIncompleteReason;
 
@@ -694,6 +697,9 @@ pub enum SemanticModelOverlayStatus {
         stage: SemanticModelWarmStage,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pending_acquisitions: Vec<PendingSemanticPackAcquisition>,
+        /// The host's shipped-pack acquisition the warm still waits for.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        shipped_pack_acquisition: Option<String>,
     },
     Partial {
         reasons: Vec<String>,

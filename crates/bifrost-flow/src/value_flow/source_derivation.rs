@@ -293,6 +293,7 @@ pub fn derive_source_normal_result(
     semantic_budget: &mut SemanticBudget,
     solver_budget: &mut SolverBudget,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<SourceDerivationResult, SourceDerivationError> {
     if !matches!(input.language, Language::Python | Language::JavaScript) {
         return Err(SourceDerivationError::InvalidInput(
@@ -458,10 +459,11 @@ pub fn derive_source_normal_result(
         .dependency_discovery
         .discover_workspace_lockfiles = false;
     let languages = BTreeSet::from([input.language]);
-    let analyzer = WorkspaceAnalyzer::build_ephemeral_for_languages_footgun(
+    let analyzer = WorkspaceAnalyzer::build_ephemeral_for_languages_footgun_with_budget(
         Arc::clone(&project),
         config,
         &languages,
+        retention_budget,
     )
     .map_err(|error| SourceDerivationError::Analyzer(error.to_string()))?;
     let entry_file = project
@@ -1026,6 +1028,7 @@ mod tests {
             &mut SemanticBudget::default(),
             &mut SolverBudget::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("the isolated source request should run")
     }
@@ -1071,6 +1074,7 @@ mod tests {
                 &mut SemanticBudget::default(),
                 &mut SolverBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
             )
             .expect("bounded request yields a digest")
             .input_digest
@@ -1086,6 +1090,7 @@ mod tests {
             &mut SemanticBudget::default(),
             &mut SolverBudget::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("bounded request yields a digest");
         assert_eq!(under_tighter_source_limits.input_digest, initial);
@@ -1098,6 +1103,7 @@ mod tests {
             &mut SemanticBudget::default(),
             &mut SolverBudget::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("bounded request retains dependencies")
         .dependencies;
@@ -1169,6 +1175,7 @@ mod tests {
                 &mut SemanticBudget::default(),
                 &mut SolverBudget::default(),
                 &CancellationToken::default(),
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
             )
             .expect("the isolated source request should run");
             assert!(
@@ -1237,6 +1244,7 @@ mod tests {
             &mut SemanticBudget::default(),
             &mut SolverBudget::default(),
             &token,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("cancellation produces a typed outcome");
         assert_eq!(result.status, TransferPartitionStatus::Unknown);
@@ -1277,6 +1285,7 @@ mod tests {
             &mut SemanticBudget::default(),
             &mut SolverBudget::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("source budget produces a typed outcome");
         assert_eq!(result.status, TransferPartitionStatus::Unknown);

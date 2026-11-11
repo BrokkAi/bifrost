@@ -9,7 +9,7 @@
 //! and dead code. Both drive the same receiver typing, member lookup, and name
 //! ladder through `super::resolver::KotlinResolutionCtx`.
 
-use crate::analyzer::usages::kotlin_graph::KotlinFileScanOutput;
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 
 use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
 
@@ -40,8 +40,6 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdgeWeights;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges;
 
 use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphFailureReason;
 
@@ -83,7 +81,6 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::graph::inverted::scan_file as scan_inverted_file;
 use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
-use std::collections::BTreeSet;
 
 /// Resolves usages of one Kotlin target within a candidate file set.
 ///
@@ -171,21 +168,14 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         let prepared_files = prepare_kotlin_scan_files(analyzer, &ordered);
         drop(_prepare_scope);
 
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
+        let mut usages = UsageAccumulator::bounded(max_usages);
         match scan_and_merge_kotlin_files(
             &relational_session,
             analyzer,
             token,
             &prepared_files,
             &spec,
-            max_usages,
-            &mut hits,
-            &mut unproven_hits,
-            &mut raw_match_count,
-            &mut limit_exceeded,
+            &mut usages,
         ) {
             KotlinPreparedScanStatus::Complete | KotlinPreparedScanStatus::Cancelled => {}
             KotlinPreparedScanStatus::Failed => {
@@ -208,23 +198,8 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
                 token,
                 scan_scope.candidate_files(),
                 target,
-                max_usages,
-                &mut hits,
-                &mut unproven_hits,
-                &mut raw_match_count,
-                &mut limit_exceeded,
+                &mut usages,
             );
-        }
-
-        let external_callsites =
-            brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(&hits);
-        if limit_exceeded || external_callsites > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_callsites,
-                limit: max_usages,
-                sample_hits: hits,
-            });
         }
 
         // A reference the scan could not prove is reported in its own channel
@@ -232,12 +207,7 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         // lands there — a written type either resolves to the target or does not,
         // with no receiver to be uncertain about — but a call through a receiver
         // whose type could not be established does.
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
-            target.clone(),
-            hits,
-            unproven_hits,
-            scan_scope.max_unproven(),
-        ))
+        GraphUsageOutcome::Resolved(usages.finish(target, scan_scope.max_unproven()))
     }
 }
 
@@ -258,15 +228,11 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
     analyzer: &dyn IAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
-    max_usages: usize,
-    hits: &mut BTreeSet<UsageHit>,
-    unproven_hits: &mut BTreeSet<UsageHit>,
-    raw_match_count: &mut usize,
-    limit_exceeded: &mut bool,
+    usages: &mut UsageAccumulator,
 ) {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    if *limit_exceeded || !target.is_class() {
+    if usages.limit_reached() || !target.is_class() {
         return;
     }
     if resolve_analyzer::<KotlinAnalyzer>(analyzer).is_none() {
@@ -302,11 +268,7 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         token,
         &prepared_files,
         &spec,
-        max_usages,
-        hits,
-        unproven_hits,
-        raw_match_count,
-        limit_exceeded,
+        usages,
     );
 }
 
@@ -323,11 +285,7 @@ fn scan_and_merge_kotlin_files(
     token: QueryToken<'_>,
     prepared_files: &[PreparedKotlinScanFile],
     spec: &TargetSpec,
-    max_usages: usize,
-    hits: &mut BTreeSet<UsageHit>,
-    unproven_hits: &mut BTreeSet<UsageHit>,
-    raw_match_count: &mut usize,
-    limit_exceeded: &mut bool,
+    usages: &mut UsageAccumulator,
 ) -> KotlinPreparedScanStatus {
     match scan_kotlin_files_replayable(
         relational_session,
@@ -335,54 +293,24 @@ fn scan_and_merge_kotlin_files(
         token,
         prepared_files,
         spec,
-        max_usages,
+        usages,
     ) {
         brokk_bifrost_analysis::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(results) => {
-            merge_kotlin_scan_results(
-                results.into_iter().map(Some),
-                hits,
-                unproven_hits,
-                raw_match_count,
-                limit_exceeded,
-                max_usages,
-            );
+            for file_usages in results {
+                usages.absorb(file_usages);
+            }
             KotlinPreparedScanStatus::Complete
         }
         brokk_bifrost_analysis::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(results) => {
-            merge_kotlin_scan_results(
-                results,
-                hits,
-                unproven_hits,
-                raw_match_count,
-                limit_exceeded,
-                max_usages,
-            );
+            for file_usages in results.into_iter().flatten() {
+                usages.absorb(file_usages);
+            }
             KotlinPreparedScanStatus::Cancelled
         }
         brokk_bifrost_analysis::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => {
             KotlinPreparedScanStatus::Failed
         }
     }
-}
-
-fn merge_kotlin_scan_results(
-    results: impl IntoIterator<Item = Option<KotlinFileScanOutput>>,
-    hits: &mut BTreeSet<UsageHit>,
-    unproven_hits: &mut BTreeSet<UsageHit>,
-    raw_match_count: &mut usize,
-    limit_exceeded: &mut bool,
-    max_usages: usize,
-) {
-    for (file_hits, file_unproven_hits, file_raw_match_count, file_limit_exceeded) in
-        results.into_iter().flatten()
-    {
-        hits.extend(file_hits);
-        unproven_hits.extend(file_unproven_hits);
-        *raw_match_count += file_raw_match_count;
-        *limit_exceeded |= file_limit_exceeded;
-    }
-    *limit_exceeded |=
-        brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(hits) > max_usages;
 }
 
 /// Builds the whole Kotlin `caller -> callee` edge set in one inverted pass.

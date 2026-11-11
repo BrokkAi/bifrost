@@ -13,6 +13,7 @@ fn string_column(conn: &Connection, sql: &str, parameter: &str) -> Vec<String> {
 }
 
 #[hardwon("#6218: temporal input foreign keys lacked bounded child probes")]
+#[hardwon("#10552: topology GC scanned every crate path probe")]
 #[test]
 fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
     let conn = open_in_memory_cache();
@@ -69,10 +70,13 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
         "SELECT name FROM sqlite_schema WHERE type = 'table'
          AND (name LIKE 'resolution_%' OR name LIKE 'source_%'
               OR name LIKE 'python_binding_%' OR name LIKE 'python_member_%'
+              OR name = 'python_import_module_operands'
+              OR name IN ('python_module_registry_writes', 'python_unit_summary_spellings', 'python_package_path_extensions')
               OR name LIKE 'go_context_%' OR name LIKE 'go_package_%'
               OR name = 'semantic_ir_call_sites' OR name IN ('csharp_compilation_symbols','csharp_undecided_chains')
               OR name IN ('csharp_using_publications','csharp_compilation_members','csharp_global_using_extent',
-                          'csharp_compilation_using_coverage')) AND ?1 = ''",
+                          'csharp_compilation_using_coverage')
+              OR name = 'rust_crate_path_probes') AND ?1 = ''",
         "",
     );
     assert_eq!(
@@ -122,6 +126,7 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
         "symbols_closed",
         "open_reason",
         "symbol_set_digest",
+        "named_open_symbols",
     ] {
         assert!(
             compilation_columns.iter().any(|name| name == column),
@@ -180,6 +185,29 @@ fn native_foreign_keys_have_selective_or_unique_bounded_child_probes() {
                 foreign_keys.entry(id).or_default().push(column);
             }
             for (id, columns) in &foreign_keys {
+                if table == "rust_crate_path_probes" {
+                    let plan = conn
+                        .prepare(
+                            "EXPLAIN QUERY PLAN DELETE FROM rust_crate_topologies WHERE topology_id = ?1",
+                        )
+                        .unwrap()
+                        .query_map([1_i64], |row| row.get::<_, String>(3))
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    assert!(
+                        plan.iter()
+                            .any(|line| line.contains("SEARCH rust_crate_path_probes")),
+                        "{state}: {plan:?}"
+                    );
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|line| line.contains("SCAN rust_crate_path_probes")),
+                        "{state}: {plan:?}"
+                    );
+                    continue;
+                }
                 if matches!(
                     table.as_str(),
                     "csharp_using_publications"

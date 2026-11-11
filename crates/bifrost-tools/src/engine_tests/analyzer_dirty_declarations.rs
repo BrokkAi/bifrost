@@ -508,6 +508,7 @@ fn analyzed_blob_identity_tracks_live_file_content() {
     let file = ProjectFile::new(project.root().to_path_buf(), "Widget.java");
     let first = analyzer
         .analyzed_blobs()
+        .expect("the listing reads")
         .into_iter()
         .find(|(path, _)| path == &file)
         .expect("analyzed file identity")
@@ -517,6 +518,7 @@ fn analyzed_blob_identity_tracks_live_file_content() {
     let updated = analyzer.update(&BTreeSet::from([file.clone()]));
     let actual = updated
         .analyzed_blobs()
+        .expect("the listing reads")
         .into_iter()
         .find(|(path, _)| path == &file)
         .expect("updated analyzed file identity")

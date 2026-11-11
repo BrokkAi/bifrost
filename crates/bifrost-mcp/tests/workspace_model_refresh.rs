@@ -1,5 +1,6 @@
 use brokk_bifrost_mcp::searchtools_service::SearchToolsService;
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 
 fn pack(name: &str) -> String {
     json!({
@@ -63,7 +64,20 @@ fn workspace_model_edit_replaces_active_pack_status() {
     service
         .call_tool_value("update_paths", json!({"paths": [pack_path]}))
         .expect("update pack path");
-    let after = active(&service);
+    // Refresh starts a new background warm. Observe its settled result, not
+    // the pending stage that may be visible immediately after update_paths.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let after = loop {
+        let status = active(&service);
+        if status["semantic_packs_ready"] == true {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pack warm did not settle: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(
         after["semantic_model_overlay"]["state"], "unavailable",
         "{after}"

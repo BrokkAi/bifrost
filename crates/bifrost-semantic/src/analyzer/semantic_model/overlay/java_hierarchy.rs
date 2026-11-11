@@ -15,6 +15,8 @@ pub enum JavaHierarchyIncomplete {
 pub struct JavaHierarchyWitness {
     /// Exact declaration provenance, in source-to-supertype order.
     pub declarations: Vec<SemanticModelProvenance>,
+    /// Ordered parameters for each declaration, when its edges came from inventory.
+    pub type_parameters: Vec<Option<Vec<String>>>,
     pub edges: Vec<HierarchyFact>,
 }
 

@@ -1,0 +1,218 @@
+{
+  "categories": [
+    "alloc-size"
+  ],
+  "external_models": [],
+  "name": "codeql-rust-sinks-alloc-size",
+  "sanitizers": [],
+  "schema_version": 1,
+  "sinks": [
+    {
+      "accepts": [
+        "attacker-controlled"
+      ],
+      "categories": [
+        "alloc-size"
+      ],
+      "dangerous_operand": {
+        "index": 0,
+        "type": "argument_index"
+      },
+      "display_name": "std.alloc.__default_lib_allocator.__rdl_alloc",
+      "id": "codeql-2481ce9ae14786a9856cd1ea9cda0dc30d74874c12b94b07276b3159fc334c03",
+      "impacts": [],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "__rdl_alloc"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.9f8139f00d9448f4474ffa5c0321acd1e047e1bda07558db20dc4080843df24d"
+              }
+            },
+            {
+              "formal_index": 0,
+              "op": "call_argument"
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "tags": []
+    },
+    {
+      "accepts": [
+        "attacker-controlled"
+      ],
+      "categories": [
+        "alloc-size"
+      ],
+      "dangerous_operand": {
+        "index": 3,
+        "type": "argument_index"
+      },
+      "display_name": "std.alloc.__default_lib_allocator.__rdl_realloc",
+      "id": "codeql-266ce29867bb36627bffda2525b272f41cda2d2821eaba1f62c972349a177e01",
+      "impacts": [],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "__rdl_realloc"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.ba24c7791adae4cd0debf55041b6efb4ed7c58d03cdbf6ad4fce654e170d31d4"
+              }
+            },
+            {
+              "formal_index": 3,
+              "op": "call_argument"
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "tags": []
+    },
+    {
+      "accepts": [
+        "attacker-controlled"
+      ],
+      "categories": [
+        "alloc-size"
+      ],
+      "dangerous_operand": {
+        "index": 0,
+        "type": "argument_index"
+      },
+      "display_name": "std.alloc.__default_lib_allocator.__rdl_alloc_zeroed",
+      "id": "codeql-c8c80ae7cbde772cda0e0a57192786fefdc0f6bf79dc6f81075ece5441dd8038",
+      "impacts": [],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "__rdl_alloc_zeroed"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.c2806bc356e487af3acf30885b1d67542d6bf76e2c08f4d9f85b3f8344fa4b3e"
+              }
+            },
+            {
+              "formal_index": 0,
+              "op": "call_argument"
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "tags": []
+    },
+    {
+      "accepts": [
+        "attacker-controlled"
+      ],
+      "categories": [
+        "alloc-size"
+      ],
+      "dangerous_operand": {
+        "index": 2,
+        "type": "argument_index"
+      },
+      "display_name": "alloc.alloc.realloc",
+      "id": "codeql-eb3a99d616120f45624b9155fa8d46698c30267e147878c6ab04efedbccf1faa",
+      "impacts": [],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "realloc"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.ab496e954f21f8bb9a85f267192956eb73637b1b2a0471cf887712f22192d525"
+              }
+            },
+            {
+              "formal_index": 2,
+              "op": "call_argument"
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "tags": []
+    }
+  ],
+  "sources": [],
+  "transforms": [],
+  "version": 1
+}

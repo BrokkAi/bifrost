@@ -145,6 +145,13 @@ impl SolverBudget {
         self.ledger.refusal_count()
     }
 
+    /// A copy that owns its refusal counter (see [`BudgetLedger::detached`]).
+    pub fn detached(&self) -> Self {
+        Self {
+            ledger: self.ledger.detached(),
+        }
+    }
+
     pub const fn limits(&self) -> SolverWork {
         self.ledger.limits()
     }

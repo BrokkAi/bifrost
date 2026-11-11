@@ -11,7 +11,12 @@ pub struct StableDigest(Box<str>);
 
 impl StableDigest {
     pub fn sha256(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)).into_boxed_str())
+        Self(
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(bytes).into(),
+            )
+            .into_boxed_str(),
+        )
     }
 
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {

@@ -377,7 +377,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             BoundedResolution::Exceeded { .. } => {
                 return ClassSeed::Unknown(UnknownReason::SemanticBudget);
             }
-            BoundedResolution::Cancelled { .. } => {
+            BoundedResolution::Unavailable { .. } | BoundedResolution::Cancelled { .. } => {
                 return ClassSeed::Unknown(UnknownReason::UncertainFlow);
             }
         }
@@ -394,7 +394,7 @@ impl TypeFlowAdapter for RubyTypeFlowAdapter {
             BoundedResolution::Exceeded { .. } => {
                 return ClassSeed::Unknown(UnknownReason::SemanticBudget);
             }
-            BoundedResolution::Cancelled { .. } => {
+            BoundedResolution::Unavailable { .. } | BoundedResolution::Cancelled { .. } => {
                 return ClassSeed::Unknown(UnknownReason::UncertainFlow);
             }
             BoundedResolution::Complete { value, .. } => {

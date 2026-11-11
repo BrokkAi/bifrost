@@ -21,9 +21,7 @@ use toml_edit::ImDocument;
 
 use crate::analyzer::rust::dependency_discovery::CargoLockPackage;
 
-use crate::analyzer::rust::toolchain_evidence::{
-    push_rust_toolchain_evidence, rust_toolchain_input,
-};
+use crate::analyzer::rust::toolchain_evidence::push_rust_toolchain_evidence;
 
 use crate::analyzer::rust::dependency_discovery::CargoLockfile;
 
@@ -46,6 +44,7 @@ use crate::analyzer::semantic_model::{
 };
 use brokk_bifrost_analysis::analyzer::dependency_support::{
     dependency_diagnostic as diagnostic, dependency_provenance_entry as entry,
+    select_dependency_input_snapshots,
 };
 
 use crate::analyzer::topology::DependencyScope;
@@ -86,70 +85,21 @@ fn acquire_cargo_discovery_rows(
     usize,
     Vec<(ProjectFile, ProjectSourceSnapshot)>,
 ) {
-    let mut selected = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
-    let mut bytes = 0_u64;
-    let mut cancelled = false;
-    let files = match project.all_files_shared() {
-        Ok(files) => files,
-        Err(error) => {
-            diagnostics.push(diagnostic("rust.files.list", None, error.to_string()));
-            let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
-            (outcome.diagnostics, outcome.suppressed_diagnostics) = diagnostics.finish();
-            outcome.complete = false;
-            return (outcome, 0, Vec::new());
-        }
-    };
-    for file in files
-        .iter()
-        .filter(|file| cargo_input(file.rel_path()) || rust_toolchain_input(file.rel_path()))
-    {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            cancelled = true;
-            diagnostics.push(diagnostic(
-                "rust.evidence.cancelled",
-                None,
-                "Cargo file acquisition cancelled",
-            ));
-            break;
-        }
-        if selected.len() >= limits.max_source_files_per_artifact {
-            diagnostics.push(diagnostic(
-                "limit.cargo_files",
-                None,
-                "Cargo file count exceeds the dependency evidence limit",
-            ));
-            break;
-        }
-        let remaining = limits.max_total_artifact_bytes.saturating_sub(bytes);
-        let cap = remaining
-            .min(limits.producer.max_artifact_bytes)
-            .min(usize::MAX as u64) as usize;
-        if cap == 0 {
-            diagnostics.push(diagnostic(
-                "limit.total_artifact_bytes",
-                Some(file.rel_path()),
-                "Cargo evidence byte budget exhausted",
-            ));
-            break;
-        }
-        match project.read_source_snapshot_limited(file, cap) {
-            Ok(Some(snapshot)) => {
-                bytes += snapshot.source().len() as u64;
-                selected.push((file.clone(), snapshot));
-            }
-            Ok(None) => diagnostics.push(diagnostic(
-                "limit.artifact_bytes",
-                Some(file.rel_path()),
-                "selected Cargo snapshot exceeds its byte limit",
-            )),
-            Err(error) => diagnostics.push(diagnostic(
-                "rust.files.read",
-                Some(file.rel_path()),
-                error.to_string(),
-            )),
-        }
-    }
+    let (selected, bytes, cancelled) = select_dependency_input_snapshots(
+        project,
+        "Cargo",
+        "rust",
+        |path| {
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyResolver::is_discovery_candidate(
+                &crate::analyzer::rust::dependency_packs::CargoDependencyResolver,
+                path,
+            )
+        },
+        limits,
+        cancellation,
+        &mut diagnostics,
+    );
     let mut outcome = cargo_file_discovery_rows(project.root(), &selected, limits, cancellation);
     for entry in outcome.diagnostics.drain(..) {
         diagnostics.push(entry);
@@ -1183,6 +1133,11 @@ fn lock_reference_matches(
         && source.is_none_or(|source| Some(source) == package.source.as_deref()))
 }
 
+/// Every `cargo.lock_association` value: what `associate` returns for a
+/// declaration, which an owned direct lock row inherits, plus `transitive` for
+/// the lock instances that direct instance reaches.
+pub const CARGO_LOCK_ASSOCIATIONS: [&str; 4] = ["exact", "transitive", "ambiguous", "unresolved"];
+
 #[allow(clippy::too_many_arguments)]
 fn associate(
     root: &Path,
@@ -1442,11 +1397,16 @@ pub fn acquire_rust_file_dependency_evidence(
 /// names one published package version and the declaring member owns it. Raw
 /// lock rows, declared-only rows, unresolved or ambiguous associations, and
 /// git, path, or alternate-registry sources activate nothing; the files-only
-/// evidence surface keeps their association state. When the exact rows of one
-/// package lock more than one version, none of them activates: activation is
-/// workspace-wide, so selecting one version would apply its models to members
-/// that compile against another. That ambiguity is reported, not dropped, as
-/// is an acquisition limit that may have omitted rows.
+/// evidence surface keeps their association state. When the declarations of
+/// one package may compile against more than one crates.io version, none of
+/// them activates: activation is workspace-wide, so selecting one version would
+/// apply its models to paths that compile against another. The possible
+/// versions are every crates.io lock candidate of every declaration, not only
+/// the exact ones: `mongodb = "3.2.4"` next to a renamed
+/// `{ package = "mongodb", version = "3.2.5" }` leaves the first declaration
+/// ambiguous between both instances, so the second's exact 3.2.5 row must not
+/// activate alone (#9914). That ambiguity is reported, not dropped, as is an
+/// acquisition limit that may have omitted rows.
 ///
 /// Returns the rows, those diagnostics, and whether acquisition was cancelled.
 pub(crate) fn cargo_lock_activation_rows(
@@ -1468,7 +1428,33 @@ pub(crate) fn cargo_lock_activation_rows(
         .map(|row| (row.id.as_str(), row))
         .collect::<HashMap<_, _>>();
     let mut by_package = std::collections::BTreeMap::<&str, Vec<ResolvedDependency>>::new();
+    let mut possible_versions = HashMap::<&str, Vec<&Version>>::default();
     for declaration in &outcome.dependencies {
+        for candidate in declaration
+            .provenance
+            .iter()
+            .filter(|entry| entry.key == "cargo.lock_candidate")
+        {
+            let Some(locked) = locks.get(candidate.value.as_str()) else {
+                continue;
+            };
+            if value(locked, "cargo.source") != Some(CRATES_IO) {
+                continue;
+            }
+            let package = locked
+                .evidence
+                .package
+                .as_ref()
+                .expect("lock rows name their package");
+            let version = package
+                .version
+                .as_ref()
+                .expect("lock rows name their version");
+            possible_versions
+                .entry(package.name.as_str())
+                .or_default()
+                .push(version);
+        }
         if value(declaration, "cargo.lock_association") != Some("exact") {
             continue;
         }
@@ -1518,10 +1504,9 @@ pub(crate) fn cargo_lock_activation_rows(
         .cloned()
         .collect::<Vec<_>>();
     for (package, mut candidates) in by_package {
-        let mut versions = candidates
-            .iter()
-            .filter_map(|row| row.evidence.package.as_ref()?.version.as_ref())
-            .collect::<Vec<_>>();
+        let mut versions = possible_versions
+            .remove(package)
+            .expect("an exact row's lock instance is a candidate of its declaration");
         versions.sort();
         versions.dedup();
         if versions.len() > 1 {

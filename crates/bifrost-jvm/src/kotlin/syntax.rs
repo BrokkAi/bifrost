@@ -70,6 +70,22 @@ pub fn kotlin_call_with_callee(node: Node<'_>) -> Option<Node<'_>> {
     (kotlin_callee(call)?.id() == node.id()).then_some(call)
 }
 
+/// The member leaf of a property-shaped `navigation_expression` that no call
+/// consumes as its callee, or `None` for any other node.
+///
+/// Kotlin reads a Java getter as a property: `zis.nextEntry` calls
+/// `getNextEntry()`, while the same syntax reads a Kotlin property or a Java
+/// field. Only resolution can tell the two apart (see
+/// `LanguageKnowledge::resolution_decided_application`). An assignment target
+/// is a `directly_assignable_expression`, so it never reaches here, and
+/// `(a.b)()` invokes the value `a.b` reads rather than applying `b`.
+pub fn kotlin_property_read_member(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "navigation_expression" || kotlin_call_with_callee(node).is_some() {
+        return None;
+    }
+    kotlin_navigation_member(node)
+}
+
 /// The `value_arguments` node a Kotlin call passes its arguments in.
 ///
 /// An ordinary call nests it inside `call_suffix`; a `constructor_invocation`
@@ -678,6 +694,25 @@ impl KotlinIntegerSuffix {
     pub fn is_unsigned(self) -> bool {
         matches!(self, Self::Unsigned | Self::UnsignedLong)
     }
+}
+
+/// The text of a nonempty `string_literal` with one literal segment: no
+/// escape and no `$` template, so the source bytes are the value.
+pub fn kotlin_plain_string_literal<'source>(
+    literal: Node<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    if literal.kind() != "string_literal" {
+        return None;
+    }
+    let mut cursor = literal.walk();
+    let mut contents = literal.named_children(&mut cursor);
+    let content = contents.next()?;
+    if contents.next().is_some() || content.kind() != "string_content" {
+        return None;
+    }
+    let raw = source.get(content.start_byte()..content.end_byte())?;
+    (!raw.is_empty() && !raw.contains(['\\', '$'])).then_some(raw)
 }
 
 /// Decode an AST-selected decimal, hexadecimal or binary integer literal.

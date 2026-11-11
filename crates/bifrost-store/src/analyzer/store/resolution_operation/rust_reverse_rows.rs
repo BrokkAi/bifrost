@@ -447,8 +447,8 @@ pub(crate) fn initial_reference_inventory_gap_locators_sql() -> &'static str {
                      AND reference_site.role=0
                      AND (
                        gap.origin=?3 OR (
-                         gap.origin=?11
-                         AND reference_site.site_kind IN (?5,?8)
+                         gap.origin=?10
+                         AND reference_site.site_kind IN (?13,?7)
                          AND EXISTS (
                            SELECT 1 FROM main.resolution_semantic_sites AS reference
                            JOIN main.resolution_call_obligations AS obligation
@@ -462,10 +462,10 @@ pub(crate) fn initial_reference_inventory_gap_locators_sql() -> &'static str {
                            WHERE reference.blob_id=gap.blob_id
                              AND reference.source_site=gap.source_site
                              AND reference.semantic_role='reference'
-                             AND json_extract(arena.spans,'$[' || context.source_occurrence || '][4]')=?13
+                             AND json_extract(arena.spans,'$[' || context.source_occurrence || '][4]')=?12
                              AND EXISTS (
                                SELECT 1 FROM json_each(obligation.eligible_rules) AS rule
-                               WHERE rule.value=?12
+                               WHERE rule.value=?11
                              )
                          )
                          AND EXISTS (
@@ -479,8 +479,6 @@ pub(crate) fn initial_reference_inventory_gap_locators_sql() -> &'static str {
                      )
                  )",
             )
-            .replace("?6", "'[]'")
-            .replace("?9", "'[]'")
     })
 }
 
@@ -1249,7 +1247,6 @@ fn initial_reference_inventory_gap_locators(
                 crate::analyzer::store::resolution_stage::codec::encode_semantic(
                     SemanticId::local(0, 0)
                 ),
-                site_kind_code(ResolutionSiteKind::MemberReference),
                 "[]",
                 target.owner_is_type_scope(),
                 site_kind_code(ResolutionSiteKind::CallableReference),
@@ -1267,6 +1264,7 @@ fn initial_reference_inventory_gap_locators(
                 super::super::source_facts::provenance_code(
                     brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::PrimaryNode,
                 ),
+                site_kind_code(ResolutionSiteKind::MemberReference),
             ])?;
             while let Some(row) = rows.next()? {
                 let host = row.get::<_, u32>(0)?;
@@ -1319,7 +1317,6 @@ fn target_scoped_reference_inventory_gaps(
         gap_origin_code(crate::analyzer::resolution::LoweringGapOrigin::QualifiedReference);
     let local_base =
         crate::analyzer::store::resolution_stage::codec::encode_semantic(SemanticId::local(0, 0));
-    let member_reference = site_kind_code(ResolutionSiteKind::MemberReference);
     let callable_reference = site_kind_code(ResolutionSiteKind::CallableReference);
     let mut reasons = Vec::new();
     let mut locators = Vec::new();
@@ -1335,7 +1332,6 @@ fn target_scoped_reference_inventory_gaps(
                 sites.names_json,
                 qualified_origin,
                 local_base,
-                member_reference,
                 accounted_reference_sites_json,
                 target.owner_is_type_scope(),
                 callable_reference,
@@ -2388,6 +2384,7 @@ pub fn confirm_rust_reverse_references(
         let outcome = match &answer {
             BoundedResolution::Complete { .. } => "complete",
             BoundedResolution::Exceeded { .. } => "bounded",
+            BoundedResolution::Unavailable { .. } => "unavailable",
             BoundedResolution::Cancelled { .. } => "cancelled",
         };
         let value = serde_json::json!({"stage":"session","root":operation.ready.project.root(),
@@ -2407,6 +2404,9 @@ pub fn confirm_rust_reverse_references(
             completion: cancelled_completion(),
         },
         BoundedResolution::Exceeded { limit, .. } => reverse::ReverseBatch::Bounded(limit),
+        BoundedResolution::Unavailable { reason, .. } => reverse::ReverseBatch::Unavailable(
+            SelectedResolutionUnavailable::CatalogInputUnavailable { reason },
+        ),
         BoundedResolution::Complete { value, .. } => value.map_limit(|limit| match limit {}),
     };
     // Keep the existing consumer mapping; internal lifecycle outcomes stay typed.
@@ -2482,36 +2482,8 @@ pub fn candidate_set_enumerations_for_test() -> usize {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-unsafe extern "C" fn record_reverse_sql_work(
-    event: std::ffi::c_uint,
-    _context: *mut std::ffi::c_void,
-    statement: *mut std::ffi::c_void,
-    _sql: *mut std::ffi::c_void,
-) -> std::ffi::c_int {
-    REVERSE_SQL_WORK.with(|work| {
-        let mut work = work.borrow_mut();
-        let sql = unsafe {
-            let raw = rusqlite::ffi::sqlite3_sql(statement.cast());
-            (!raw.is_null()).then(|| std::ffi::CStr::from_ptr(raw).to_string_lossy())
-        };
-        // Point resolution has separate exact-work pins for persisted interior
-        // reads. This trace measures the reverse crate/import/reference row
-        // frontier that replaced workspace root-half reconstruction.
-        if sql
-            .as_deref()
-            .is_some_and(|sql| sql.contains("resolution_fragment_interiors"))
-        {
-            return;
-        }
-        if let Some(work) = work.as_mut() {
-            match event {
-                rusqlite::ffi::SQLITE_TRACE_STMT => work.0 += 1,
-                rusqlite::ffi::SQLITE_TRACE_ROW => work.1 += 1,
-                _ => {}
-            }
-        }
-    });
-    0
+thread_local! {
+    static REVERSE_SQL_GUARD: RefCell<Vec<(brokk_bifrost_core::attribution::ConnectionTag, brokk_bifrost_core::cache_db::sql_profile::ListenerGuard)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2521,26 +2493,46 @@ pub(super) fn reverse_sql_work_trace_active() -> bool {
 
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn attach_reverse_sql_work_trace(connection: &rusqlite::Connection) {
-    // SAFETY: every attached connection is used on this thread, where the
-    // trace destination lives, and is detached before the reader is returned.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(
-            connection.handle(),
-            rusqlite::ffi::SQLITE_TRACE_STMT | rusqlite::ffi::SQLITE_TRACE_ROW,
-            Some(record_reverse_sql_work),
-            std::ptr::null_mut(),
-        )
+    use brokk_bifrost_core::cache_db::sql_profile::{
+        ListenerEvent, attach_listener, connection_tag,
     };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    if connection_tag(connection).is_some_and(|tag| {
+        REVERSE_SQL_GUARD.with(|slot| slot.borrow().iter().any(|(known, _)| *known == tag))
+    }) {
+        return;
+    }
+    let guard = attach_listener(
+        connection,
+        std::sync::Arc::new(|event| {
+            let (sql, is_row) = match event {
+                ListenerEvent::Statement { sql, .. } => (sql, false),
+                ListenerEvent::Row { sql, .. } => (sql, true),
+                ListenerEvent::Profile { .. } => return,
+            };
+            if sql.is_some_and(|sql| sql.contains("resolution_fragment_interiors")) {
+                return;
+            }
+            REVERSE_SQL_WORK.with(|work| {
+                if let Some(work) = work.borrow_mut().as_mut() {
+                    if is_row {
+                        work.1 += 1;
+                    } else {
+                        work.0 += 1;
+                    }
+                }
+            });
+        }),
+    );
+    let tag = connection_tag(connection).expect("reverse SQL trace connection tag");
+    REVERSE_SQL_GUARD.with(|slot| slot.borrow_mut().push((tag, guard)));
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn detach_reverse_sql_work_trace(connection: &rusqlite::Connection) {
-    // SAFETY: this removes the callback installed on this same connection.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut())
-    };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    // Only this connection's listener: another attached reader keeps counting.
+    let tag = brokk_bifrost_core::cache_db::sql_profile::connection_tag(connection)
+        .expect("reverse SQL trace connection tag");
+    REVERSE_SQL_GUARD.with(|slot| slot.borrow_mut().retain(|(known, _)| *known != tag));
 }
 
 fn retain_owned_reverse_rejection(
@@ -2803,34 +2795,6 @@ struct RustReverseQueries<'a, 'store, 'input> {
 }
 
 impl RustReverseQueries<'_, '_, '_> {
-    /// Answer on the operation's own connection, taking it back from the
-    /// callback first and lending it again afterwards. `stopped` is the
-    /// answer when the wait for the connection is cancelled, or when another
-    /// store user changed the selection's rows while the callback had the
-    /// connection, which makes the operation stale.
-    fn on_own_connection<T>(
-        &mut self,
-        stopped: T,
-        answer: impl FnOnce(&mut Self) -> Result<T>,
-    ) -> Result<T> {
-        match self
-            .selected
-            .ready
-            .inventory
-            .reclaim_writer(self.cancellation)?
-        {
-            SelectedResolutionRevalidationOutcome::Current => {}
-            SelectedResolutionRevalidationOutcome::Cancelled => return Ok(stopped),
-            SelectedResolutionRevalidationOutcome::Stale(reason) => {
-                self.stale = Some(reason);
-                return Ok(stopped);
-            }
-        }
-        let answer = answer(self)?;
-        self.selected.ready.inventory.lend_writer()?;
-        Ok(answer)
-    }
-
     /// Record why a target has no selected definition, and return it. The
     /// enclosing operation reports it as its outcome.
     fn missing_definition_unit(&mut self, target: &CodeUnit) -> SelectedResolutionUnavailable {
@@ -5040,37 +5004,31 @@ impl RustReverseQueries<'_, '_, '_> {
     }
 }
 
-/// The callback's view of the operation. On the in-memory fallback the
-/// operation's reader is the store's only connection, and the callback reads
-/// the store between queries: its projection asks the analyzer for parents,
-/// sources and structural facts. So the operation lends that connection to
-/// the callback, and takes it back only while it answers (#6018).
+/// The callback reads through the operation's reader while holding its read
+/// frame. Product stores supply independent pooled readers for ordinary reads.
 impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
     fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>> {
-        self.on_own_connection(None, |queries| {
-            let definition = match queries
-                .selected
-                .locate_rust_definition(target, queries.cancellation)?
-            {
-                SelectedRustDefinitionSemanticOutcome::Found(definition) => definition,
-                SelectedRustDefinitionSemanticOutcome::Cancelled => return Ok(None),
-                // Without the definition nothing proves the target is outside
-                // every trait impl, so the inventory stays open.
-                SelectedRustDefinitionSemanticOutcome::Missing => return Ok(Some(true)),
-            };
-            let Some(ordinal) = definition.ordinal() else {
-                return Ok(Some(true));
-            };
-            queries
-                .selected
-                .ready
-                .lexical_source()
-                .rust_unenumerable_member_dispatch(
-                    SelectedResolutionMountOrdinal::new(ordinal),
-                    definition,
-                    queries.cancellation,
-                )
-        })
+        let definition = match self
+            .selected
+            .locate_rust_definition(target, self.cancellation)?
+        {
+            SelectedRustDefinitionSemanticOutcome::Found(definition) => definition,
+            SelectedRustDefinitionSemanticOutcome::Cancelled => return Ok(None),
+            // Without the definition nothing proves the target is outside
+            // every trait impl, so the inventory stays open.
+            SelectedRustDefinitionSemanticOutcome::Missing => return Ok(Some(true)),
+        };
+        let Some(ordinal) = definition.ordinal() else {
+            return Ok(Some(true));
+        };
+        self.selected
+            .ready
+            .lexical_source()
+            .rust_unenumerable_member_dispatch(
+                SelectedResolutionMountOrdinal::new(ordinal),
+                definition,
+                self.cancellation,
+            )
     }
 
     fn analysis_generation(&self) -> u64 {
@@ -5081,7 +5039,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
         &mut self,
         targets: &[CodeUnit],
     ) -> Result<Option<Vec<RustReverseCandidateSet>>> {
-        self.on_own_connection(None, |queries| queries.held_candidate_sets(targets))
+        self.held_candidate_sets(targets)
     }
 
     fn rust_cfg_activation_for_caller_under_site_cfg(
@@ -5095,11 +5053,8 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
             bool,
         )>,
     > {
-        self.on_own_connection(None, |queries| {
-            queries
-                .selected
-                .rust_cfg_activation_for_caller_under_site_cfg(caller, condition, cancellation)
-        })
+        self.selected
+            .rust_cfg_activation_for_caller_under_site_cfg(caller, condition, cancellation)
     }
 
     fn references_to(
@@ -5108,16 +5063,43 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
         candidates: &[RustReverseCandidateSet],
         request: RustReverseRequest,
     ) -> Result<SelectedRustReverseBatchOutcome> {
-        self.on_own_connection(SelectedRustReverseBatchOutcome::Cancelled, |queries| {
-            queries.held_references_to(targets, candidates, request)
-        })
+        self.held_references_to(targets, candidates, request)
+    }
+
+    fn call_reference_in_file(
+        &mut self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Result<Option<SemanticId>> {
+        // A tuple-struct constructor's callee token also has a type
+        // reference; the call is the value one.
+        let locator = SelectedSemanticLocator::for_reference_range_in_namespace(
+            "rust",
+            crate::path_utils::rel_path_string(file),
+            start_byte,
+            end_byte,
+            ResolutionNamespace::Value,
+        );
+        let lexical = self.selected.ready.lexical_source();
+        match self
+            .selected
+            .ready
+            .lookup_locator(&lexical, &locator, self.cancellation)?
+        {
+            LocatedSemantic::Found(reference) => Ok(Some(reference)),
+            LocatedSemantic::Cancelled => Ok(None),
+            LocatedSemantic::Missing => Err(StoreError::new(format!(
+                "forward reference has no canonical source site: {locator:?}"
+            ))),
+        }
     }
 
     fn resolve_references(
         &mut self,
         references: &[SemanticId],
     ) -> Result<Option<Vec<ReferenceResolution>>> {
-        self.on_own_connection(None, |queries| queries.held_resolve_references(references))
+        self.held_resolve_references(references)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -5147,7 +5129,7 @@ impl SelectedRustReverseQueries for RustReverseQueries<'_, '_, '_> {
 
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
     #[doc(hidden)]
-    pub fn with_rust_row_reverse_queries<'a, T>(
+    pub fn with_rust_row_reverse_queries<'a, T, Frame>(
         mut self,
         admitted: Option<&'a HashSet<ProjectFile>>,
         cancellation: &'a CancellationToken,
@@ -5157,12 +5139,16 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
             &[&SelectedSemanticLocator],
         ) -> Result<RustReverseConfirmation>
         + Sync,
+        frame: impl FnOnce(&SelectedResolutionOperation<'store, 'input>) -> Result<Frame>,
         run: impl FnOnce(&mut dyn SelectedRustReverseQueries) -> Result<T>,
     ) -> Result<SelectedResolutionOperationOutcome<T>> {
         self.ready
             .inventory
             .connection()
             .execute_batch(GAP_CANDIDATE_SITES_SCHEMA_SQL)?;
+        // Enter only after self has reached its final address. The guard is
+        // dropped before cleanup consumes the operation or touches writer loans.
+        let frame = frame(&self)?;
         let mut queries = RustReverseQueries {
             selected: &mut self,
             cancellation,
@@ -5173,14 +5159,15 @@ impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
             #[cfg(any(test, feature = "test-support"))]
             definition_mounts: HashSet::default(),
         };
-        queries.selected.ready.inventory.lend_writer()?;
         let result = run(&mut queries)?;
         let unavailable = queries.unavailable.take();
         let stale = queries.stale.take();
         drop(queries);
-        self.ready.inventory.end_writer_loan()?;
+        drop(frame);
         self.ready.inventory.with_owned_temp_write(|connection| {
-            connection.execute(CLEAR_GAP_CANDIDATE_SITES_SQL, [])?;
+            connection
+                .prepare_cached(CLEAR_GAP_CANDIDATE_SITES_SQL)?
+                .execute([])?;
             Ok(())
         })?;
         drop(self.ready.rust_caller_context.get_mut().take());
@@ -5236,6 +5223,17 @@ mod tests {
 
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#9755: reverse confirmation attached a second trace on one connection")]
+    fn reverse_sql_trace_attaches_once_per_connection() {
+        let connection = brokk_bifrost_core::cache_db::open_in_memory_store_connection().unwrap();
+        attach_reverse_sql_work_trace(&connection);
+        attach_reverse_sql_work_trace(&connection);
+        assert_eq!(REVERSE_SQL_GUARD.with(|slot| slot.borrow().len()), 1);
+        detach_reverse_sql_work_trace(&connection);
+        assert!(REVERSE_SQL_GUARD.with(|slot| slot.borrow().is_empty()));
+    }
 
     #[test]
     #[hardwon("#5142: reverse name closure walked all hosts once per queued name")]
@@ -5389,11 +5387,6 @@ mod tests {
             // and runs none of the closure.
             let plan = explain_pin(&connection, &gaps_query);
             assert!(
-                plan.iter()
-                    .any(|line| line.contains("resolution_root_route_segments_reference")),
-                "{state:?}: qualified gaps must seek routes by source site: {plan:?}"
-            );
-            assert!(
                 plan.iter().any(|line| {
                     line.contains("SEARCH candidate USING PRIMARY KEY (target_key=?")
                 }),
@@ -5510,11 +5503,8 @@ mod tests {
         for state in PlannerStatisticsState::BOTH {
             state.install(&connection);
             let plan = explain_pin(&connection, &gaps_query);
-            for cte in [
-                "qualified_routes",
-                "external_roots",
-                "out_of_scope_local_alias_roots",
-            ] {
+            {
+                let cte = "out_of_scope_local_alias_roots";
                 assert!(
                     plan.iter()
                         .any(|line| line == &format!("MATERIALIZE {cte}")),

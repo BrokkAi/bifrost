@@ -146,6 +146,7 @@ pub struct SelectedSemanticLocator {
     reference_namespace: Option<ResolutionNamespace>,
     fallback_reference_namespace: Option<ResolutionNamespace>,
     call_argument_ordinal: Option<u32>,
+    call_result_query: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -181,6 +182,7 @@ impl SelectedSemanticLocator {
             reference_namespace: None,
             fallback_reference_namespace: None,
             call_argument_ordinal: None,
+            call_result_query: false,
         }
     }
 
@@ -266,6 +268,16 @@ impl SelectedSemanticLocator {
         self.call_argument_ordinal
     }
 
+    #[doc(hidden)]
+    pub fn for_call_result(mut self) -> Self {
+        self.call_result_query = true;
+        self
+    }
+
+    pub(crate) const fn is_call_result_query(&self) -> bool {
+        self.call_result_query
+    }
+
     pub(crate) const fn reference_namespace(&self) -> Option<ResolutionNamespace> {
         self.reference_namespace
     }
@@ -312,6 +324,7 @@ impl SelectedSemanticLocator {
             reference_namespace: None,
             fallback_reference_namespace: None,
             call_argument_ordinal: None,
+            call_result_query: false,
         }
     }
 
@@ -513,6 +526,7 @@ pub enum SelectedNodeProvenance {
     Stage(SelectedStageIdentityProvenance<ResolutionNodeIdentity>),
     UniversalRoot,
     ContextBoundary,
+    ModelDefinition(SemanticId),
 }
 
 impl SelectedNodeProvenance {
@@ -579,6 +593,7 @@ pub(crate) enum SelectedNodeMount {
     FragmentLocal(SelectedResolutionMount),
     UniversalRoot,
     ContextBoundary,
+    ModelDefinition(SemanticId),
 }
 
 /// Checked operation-local correspondence between selected storage coordinates
@@ -1201,6 +1216,20 @@ impl MountRebaser {
         );
     }
 
+    /// A provider-admitted definition belongs only to this operation. Its
+    /// semantic is the model token registered by the selected authority.
+    pub(crate) fn register_model_definition(&mut self, node: BindingNodeId, token: SemanticId) {
+        assert_eq!(node.ordinal(), None);
+        assert_eq!(token.ordinal(), None);
+        assert_ne!(node, BindingNodeId::universal_root());
+        register_runtime(
+            &mut self.nodes_by_runtime,
+            node,
+            SelectedNodeProvenance::ModelDefinition(token),
+            "binding node",
+        );
+    }
+
     /// The mount one runtime semantic belongs to, or the shared identity it is.
     ///
     /// This is total and opens nothing: the operation's own registrations
@@ -1248,6 +1277,9 @@ impl MountRebaser {
             Some(SelectedNodeProvenance::UniversalRoot) => Some(SelectedNodeMount::UniversalRoot),
             Some(SelectedNodeProvenance::ContextBoundary) => {
                 Some(SelectedNodeMount::ContextBoundary)
+            }
+            Some(SelectedNodeProvenance::ModelDefinition(token)) => {
+                Some(SelectedNodeMount::ModelDefinition(*token))
             }
             None => self
                 .mount_for_ordinal(node.ordinal())
@@ -1909,6 +1941,13 @@ pub struct ResolutionIdentityCatalogBuilder<'a> {
     // paths. Memoize before hashing; this map is dropped when finish seals
     // the catalog and is never retained by a mounted selection.
     source_scope_nodes: HashMap<ResolutionScopeId, BindingNodeId>,
+    // The same memo for the identities lowering asks for most often: every
+    // fact naming a site or a type slot asks again, and hashing an identity
+    // costs far more than finding it (#9628).
+    gap_reason_semantics: HashMap<(ResolutionSiteId, LoweringGapOrigin), SemanticId>,
+    definition_semantics: HashMap<ResolutionSiteId, SemanticId>,
+    type_slot_semantics:
+        HashMap<brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotId, SemanticId>,
     paths: HashMap<PartialPathId, ResolutionPathIdentity>,
     paths_by_identity: HashMap<ResolutionPathIdentity, PartialPathId>,
     stack_variables: HashMap<StackVariableId, ResolutionStackVariableIdentity>,
@@ -1980,6 +2019,9 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
             site_nodes: HashMap::default(),
             source_scope_ordinals: HashMap::default(),
             source_scope_nodes: HashMap::default(),
+            gap_reason_semantics: HashMap::default(),
+            definition_semantics: HashMap::default(),
+            type_slot_semantics: HashMap::default(),
             paths: HashMap::default(),
             paths_by_identity: HashMap::default(),
             stack_variables: HashMap::default(),
@@ -2035,6 +2077,9 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
         site: ResolutionSiteId,
         origin: LoweringGapOrigin,
     ) -> SemanticId {
+        if let Some(&reason) = self.gap_reason_semantics.get(&(site, origin)) {
+            return reason;
+        }
         let reason = self.semantic(super::fact_lowering::gap_reason_semantic_identity(
             site, origin,
         ));
@@ -2045,7 +2090,31 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
                 "one gap reason retains one exact lowering provenance"
             );
         }
+        self.gap_reason_semantics.insert((site, origin), reason);
         reason
+    }
+
+    /// The semantic of the definition at one site.
+    pub(crate) fn definition_semantic(&mut self, site: ResolutionSiteId) -> SemanticId {
+        if let Some(&semantic) = self.definition_semantics.get(&site) {
+            return semantic;
+        }
+        let semantic = self.semantic(super::fact_lowering::definition_semantic_identity(site));
+        self.definition_semantics.insert(site, semantic);
+        semantic
+    }
+
+    /// The semantic of one type slot's frontier.
+    pub(crate) fn type_slot_semantic(
+        &mut self,
+        slot: brokk_bifrost_core::analyzer::resolution_facts::ResolutionTypeSlotId,
+    ) -> SemanticId {
+        if let Some(&semantic) = self.type_slot_semantics.get(&slot) {
+            return semantic;
+        }
+        let semantic = self.semantic(super::fact_lowering::type_slot_semantic_identity(slot));
+        self.type_slot_semantics.insert(slot, semantic);
+        semantic
     }
 
     /// The digest that names one shared name this blob mentions.
@@ -2190,10 +2259,9 @@ impl<'a> ResolutionIdentityCatalogBuilder<'a> {
     /// The semantic of one definition site. See
     /// [`Self::source_reference_semantic`].
     pub(crate) fn source_definition_semantic(&mut self, site: ResolutionSiteId) -> SemanticId {
-        self.source_semantic(
-            site,
-            super::fact_lowering::definition_semantic_identity(site),
-        )
+        let semantic = self.definition_semantic(site);
+        self.record_site_semantic(site, semantic);
+        semantic
     }
 
     /// Register a source site without an identifier at its reserved catalog

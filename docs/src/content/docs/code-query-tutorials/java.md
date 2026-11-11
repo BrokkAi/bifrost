@@ -515,16 +515,16 @@ with `inside` to reach one specific scope.
 }
 ```
 
-## Unsupported Keyword Arguments
+## Keyword Arguments
 
-Java has positional arguments but no keyword-argument syntax. Asking for `kwargs` produces a capability diagnostic and no pretend match.
+Java method calls have positional arguments only, so a `call` with `kwargs` matches nothing. The adapter supports the `kwargs` role for annotation arguments, where each `name = value` pair is named, so the query returns no results and no capability diagnostic. To match a named annotation argument, put `kwargs` on a `decorator` pattern.
 
-<!-- code-query-case:unsupported-kwargs:rql -->
+<!-- code-query-case:call-kwargs:rql -->
 ```lisp
 (language java (call :callee "post" :kwargs [(path (name "path"))]))
 ```
 
-<!-- code-query-case:unsupported-kwargs:json -->
+<!-- code-query-case:call-kwargs:json -->
 ```json
 {
   "languages": ["java"],
@@ -536,19 +536,11 @@ Java has positional arguments but no keyword-argument syntax. Asking for `kwargs
 }
 ```
 
-<!-- code-query-case:unsupported-kwargs:expected -->
+<!-- code-query-case:call-kwargs:expected -->
 ```json
 {
   "results": [],
-  "truncated": false,
-  "diagnostics": [
-    {
-      "code": "unsupported_structural_feature",
-      "impact": "incomplete",
-      "language": "java",
-      "message": "structural adapter for java does not support role(s): kwargs"
-    }
-  ]
+  "truncated": false
 }
 ```
 

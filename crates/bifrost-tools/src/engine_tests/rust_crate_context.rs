@@ -22,6 +22,163 @@ mod tests {
     use rusqlite::types::Value;
 
     #[test]
+    fn residual_import_routes_seek_one_module_of_a_large_crate() {
+        let mut source = String::from(
+            "macro_rules! allowed { ($($item:item)*) => { $( #[allow(dead_code)] $item )* }; }\nallowed! { pub mod undecided; }\nmod definitions {\n",
+        );
+        for name in 0..8 {
+            source.push_str(&format!("pub struct T{name} {{ field: i32 }}\n"));
+        }
+        source.push_str("pub fn value() {}\n}\n");
+        for module in 0..12 {
+            source.push_str(&format!("mod m{module} {{\n"));
+            for name in 0..8 {
+                source.push_str(&format!(
+                    "use crate::definitions::T{name} as Alias{name};\n"
+                ));
+            }
+            source.push_str("use crate::undecided as Uncertain;\nuse crate::definitions::value as Alias3;\nfn nested() { use crate::definitions::T7 as Alias3; }\n}\n");
+        }
+        let project = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname='residual'\nversion='0.1.0'\nedition='2021'\n",
+            )
+            .file("src/undecided.rs", "pub fn item() {}")
+            .file("src/lib.rs", &source)
+            .file("src/main.rs", &source)
+            .file("src/edited.rs", source.replace("Alias", "Renamed"))
+            .build();
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let store = analyzer.store().unwrap();
+        let conn = store.conn.lock().unwrap();
+        brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::prepare_pin_context(&conn);
+        conn.execute("INSERT INTO selected_workspace_revisions SELECT workspace_id,lang,generation,revision FROM workspace_heads WHERE lang='rust'", []).unwrap();
+        brokk_bifrost_analysis::analyzer::store::fill_selected_rust_units(&conn).unwrap();
+        let (topology, blob, scope): (i64, i64, i64) = conn.query_row(
+            "SELECT topology_id,blob_id,binder_scope FROM rust_crate_imports WHERE module_path='crate::m6' AND bound_name='Alias3' AND namespace='type' ORDER BY binder_scope,topology_id LIMIT 1", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        let edited_blob: i64 = conn.query_row("SELECT blob.id FROM selected_workspace_file_versions AS file JOIN blobs AS blob ON blob.blob_oid=file.blob_oid AND blob.lang=file.lang WHERE file.rel_path='src/edited.rs'", [], |row| row.get(0)).unwrap();
+        for state in PlannerStatisticsState::BOTH {
+            state.install(&conn);
+            for name in [
+                "rust_point_module_import_prefix_starts",
+                "rust_point_macro_gated_import_route",
+            ] {
+                for selected_blob in [blob, edited_blob] {
+                    let mut pin = pinned_queries()
+                        .into_iter()
+                        .find(|pin| pin.name == name)
+                        .unwrap();
+                    pin.params = vec![
+                        Value::Integer(topology),
+                        Value::Text("crate::m6".into()),
+                        Value::Integer(blob),
+                        Value::Integer(scope),
+                        Value::Text("Alias3".into()),
+                    ];
+                    if name == "rust_point_module_import_prefix_starts" {
+                        pin.params.push(Value::Text("type".into()));
+                    }
+                    pin.params.push(Value::Integer(selected_blob));
+                    if selected_blob != blob {
+                        pin.params[4] = Value::Text("Renamed3".into());
+                    }
+                    if name == "rust_point_macro_gated_import_route" {
+                        pin.params[4] = Value::Text("Uncertain".into());
+                    }
+                    let plan = explain_pin(&conn, &pin);
+                    eprintln!("{state:?} {name}: {plan:?}");
+                    assert!(plan.iter().any(|step| step.contains("SEARCH unit USING INDEX selected_rust_unit_summaries_topology (topology_id=?)")), "{state:?} {name}: {plan:?}");
+                    assert!(
+                        !plan.iter().any(|step| step.starts_with("SCAN unit")),
+                        "{state:?} {name}: {plan:?}"
+                    );
+                    for bound in [
+                        "summary_id=? AND module_path=? AND member_ordinal=? AND binder_scope=? AND namespace=? AND bound_name=?",
+                        "summary_id=? AND module_path=? AND member_ordinal=? AND binder_scope=? AND namespace=?",
+                    ] {
+                        assert!(
+                            plan.iter().any(|step| step.contains(&format!(
+                                "rust_resolution_unit_summary_import_routes_module_scope ({bound})"
+                            ))),
+                            "{state:?} {name}: {plan:?}"
+                        );
+                    }
+                    let run = |sql: &str| {
+                        let mut statement = conn.prepare(sql).unwrap();
+                        let mut rows = statement
+                            .query(rusqlite::params_from_iter(&pin.params))
+                            .unwrap();
+                        let mut count = 0;
+                        while rows.next().unwrap().is_some() {
+                            count += 1;
+                        }
+                        drop(rows);
+                        (
+                            count,
+                            statement.get_status(rusqlite::StatementStatus::VmStep),
+                        )
+                    };
+                    let (count, steps) = run(&pin.sql);
+                    if name == "rust_point_module_import_prefix_starts" {
+                        for predicate in [
+                            "unit.topology_id=?1",
+                            "imports.binder_scope=?4",
+                            if selected_blob == blob {
+                                "imports.bound_name=?5"
+                            } else {
+                                "selected.bound_name=?5"
+                            },
+                            "imports.namespace=?6",
+                        ] {
+                            let mutant = pin.sql.replace(
+                                predicate,
+                                if predicate == "imports.namespace=?6" {
+                                    "imports.namespace='wrong'"
+                                } else {
+                                    "1=1"
+                                },
+                            );
+                            assert_ne!(
+                                run(&mutant).0,
+                                count,
+                                "{state:?}: surviving mutation {predicate}"
+                            );
+                        }
+                        let mutant = pin.sql.replace(
+                            "imports.summary_id=unit.summary_id",
+                            "imports.summary_id=-1",
+                        );
+                        assert_eq!(
+                            run(&mutant).0,
+                            0,
+                            "{state:?}: wrong summary must lose the binding"
+                        );
+                    }
+                    // The macro reader stays dormant until its wrapped-detail defect (#11233) is fixed.
+                    assert_eq!(
+                        count,
+                        usize::from(name == "rust_point_module_import_prefix_starts"),
+                        "{state:?} {name}"
+                    );
+                    // The member-first primary key cannot narrow module_path.
+                    // This negative control must do work across the other eleven modules.
+                    let wrong = pin.sql.replace("AS imports", "AS imports INDEXED BY sqlite_autoindex_rust_resolution_unit_summary_import_routes_1");
+                    let (_, wrong_steps) = run(&wrong);
+                    assert!(
+                        name == "rust_point_macro_gated_import_route" || steps + 20 < wrong_steps,
+                        "{state:?} {name}: indexed={steps}, primary={wrong_steps} VM steps"
+                    );
+                    eprintln!(
+                        "{state:?} {name} selected={selected_blob}: rows={count}, indexed={steps}, primary={wrong_steps} VM steps"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     #[hardwon(
         "#5658: P3's published readers dropped #[macro_use] extern crate macros; the 41-state differential had no macro_use extern crate"
     )]
@@ -954,6 +1111,10 @@ mod tests {
     /// qualified reference, and the answer is the boundary that declaration
     /// permits, as for `Host::ITEM`.
     #[test]
+    #[hardwon(
+        "#9300: an unrecorded Deref::Target read left w.run unresolved under the semi-naive worklist"
+    )]
+    #[hardwon("#9300: semi-naive rounds dropped clean references' obligations and cycle reasons")]
     fn a_method_the_indexed_rows_cannot_supply_is_an_open_boundary() {
         use brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus;
 
@@ -1017,13 +1178,64 @@ mod tests {
                 "{label}: {outcome:?}"
             );
         }
-        let outcome = qualified_member_outcome(
-            &[(
-                "t.rs",
-                "struct Item;\nimpl Item { fn run(&self) {} }\nstruct Wrapper(Item);\nimpl std::ops::Deref for Wrapper { type Target = Item; fn deref(&self) -> &Item { &self.0 } }\nfn caller(w: Wrapper) { w.run(); }\n",
-            )],
+        let deref = [(
             "t.rs",
-            "w.run",
+            "struct Item;\nimpl Item { fn run(&self) {} }\nstruct Wrapper(Item);\nimpl std::ops::Deref for Wrapper { type Target = Item; fn deref(&self) -> &Item { &self.0 } }\nfn caller(w: Wrapper) { w.run(); }\n",
+        )];
+        let _ =
+            brokk_bifrost_analysis::analyzer::resolution::assert_full_typed_round_parity_for_test(
+                || {
+                    let answer = qualified_member_outcome(&deref, "t.rs", "w.run");
+                    (
+                        answer.status,
+                        answer
+                            .definitions
+                            .iter()
+                            .map(|definition| definition.fq_name())
+                            .collect::<Vec<_>>(),
+                        answer
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| {
+                                (
+                                    diagnostic.kind.clone(),
+                                    diagnostic.message.clone(),
+                                    diagnostic.claim.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                },
+            );
+        let outcome = qualified_member_outcome(&deref, "t.rs", "w.run");
+        let full_pass =
+            brokk_bifrost_analysis::analyzer::resolution::with_full_typed_pass_for_test(|| {
+                qualified_member_outcome(&deref, "t.rs", "w.run")
+            });
+        assert_eq!(outcome.status, full_pass.status);
+        assert_eq!(
+            outcome
+                .definitions
+                .iter()
+                .map(|definition| (definition.kind(), definition.fq_name()))
+                .collect::<Vec<_>>(),
+            full_pass
+                .definitions
+                .iter()
+                .map(|definition| (definition.kind(), definition.fq_name()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            outcome
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (&diagnostic.kind, &diagnostic.message, &diagnostic.claim))
+                .collect::<Vec<_>>(),
+            full_pass
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (&diagnostic.kind, &diagnostic.message, &diagnostic.claim))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             outcome.status,
@@ -1137,7 +1349,7 @@ mod tests {
         };
         const ONE: &str = "struct Foo;\ntrait Trait {\n    fn frobnicate(&self) {}\n}\nimpl Trait for Foo {}\n\nfn bar(foo: Foo) {\n    foo.frobnicate();\n}\n";
         let project = InlineTestProject::new().file("t.rs", ONE).build();
-        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
         let result = scan_usages_by_location(
             workspace.analyzer(),
             ScanUsagesByLocationParams {
@@ -1155,7 +1367,7 @@ mod tests {
         assert_eq!(result.summary.found, 1, "{result:#?}");
         let entry = &result.results[0];
         assert_eq!(entry.symbol.as_deref(), Some("Trait.frobnicate"));
-        assert!(entry.complete, "{entry:#?}");
+        assert!(entry.completion.is_complete(), "{entry:#?}");
         assert_eq!(entry.total_hits, Some(1), "{entry:#?}");
         let hits = &entry.files[0].hits;
         assert_eq!(
@@ -1578,6 +1790,42 @@ mod tests {
         let text = |value: &str| Value::Text(value.to_owned());
         for state in PlannerStatisticsState::BOTH {
             state.install(&conn);
+            for (name, sql) in [
+                (
+                    "macro_gated_unmounted_file",
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::MACRO_GATED_UNMOUNTED_FILE_SQL_FOR_TEST,
+                ),
+                (
+                    "inactive_cfg_unmounted_file",
+                    brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_crate_context::INACTIVE_CFG_UNMOUNTED_FILE_SQL_FOR_TEST,
+                ),
+            ] {
+                let explain = format!("EXPLAIN QUERY PLAN {sql}");
+                let mut statement = conn.prepare(&explain).unwrap();
+                let plan = statement
+                    .query_map(["src/lib.rs"], |row| row.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                eprintln!("{state:?} {name}: {plan:?}");
+                for scanned_table in [
+                    "resolution_unit_summary_placements",
+                    "rust_resolution_unit_summary_placement_attributes",
+                    "resolution_unit_summary_containers",
+                    "resolution_unit_summary_members",
+                    "rust_resolution_unit_summary_gaps",
+                    "SCAN parent",
+                    "SCAN member",
+                    "SCAN gap",
+                ] {
+                    assert!(
+                        !plan.iter().any(|step| {
+                            step.starts_with("SCAN ") && step.contains(scanned_table)
+                        }),
+                        "{state:?} {name} scans {scanned_table}: {plan:?}"
+                    );
+                }
+            }
             let scope_pins = [
                 brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::PinnedQuery {
                     name: "rust_scope_detached_summary".to_owned(),

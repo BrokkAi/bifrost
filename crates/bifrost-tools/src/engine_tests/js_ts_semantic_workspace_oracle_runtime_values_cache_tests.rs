@@ -32,7 +32,7 @@ mod js_ts_extraction_cache_tests {
         oracle: &WorkspaceSemanticOracle<'_>,
         dialect: LanguageDialect,
         source: &str,
-    ) -> Arc<RuntimeSyntaxSnapshot> {
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<RuntimeSyntaxSnapshot>> {
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
         let outcome = oracle

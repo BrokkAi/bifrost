@@ -181,6 +181,20 @@ def main() -> None:
     if structural_match.provenance != [] or structural_match.provenance_truncated:
         raise AssertionError("omitted result provenance did not receive its Python defaults")
 
+    flow_witness_raw = raw_by_type["flow_witness"]
+    flow_witness = next(
+        result
+        for result in decoded.results
+        if isinstance(result, models.CodeQueryFlowWitness)
+    )
+    if [step.summary_fingerprint for step in flow_witness.steps] != [
+        "fixture-selected-summary",
+        None,
+    ]:
+        raise AssertionError("selected and absent summary provenance did not survive decoding")
+    if "summary_fingerprint" in flow_witness_raw["steps"][1]:
+        raise AssertionError("an absent summary fingerprint reached the witness wire row")
+
     decorated_raw = raw_by_type["decorated_parameter"]
     decorated = next(
         result

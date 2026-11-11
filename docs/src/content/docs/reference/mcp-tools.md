@@ -132,7 +132,7 @@ protocol details.
 | Instructions | Routing text for the selected toolsets. A named-workspace server adds a sentence that tells the agent to set `workspace`. |
 | Resources | One resource: `bifrost://agent-guidance/agents.md` (`text/markdown`), the text shown on [Agent Instructions](/agents/) |
 | Annotations | Every tool has `readOnlyHint: true`, except `refresh` and `activate_workspace`, which have `readOnlyHint: false`. Every tool has `destructiveHint: false`, `idempotentHint: true`, and `openWorldHint: false`. |
-| Output schemas | JSON Schema 2020-12 `outputSchema` for `search_symbols`, `get_definitions_by_location`, `get_active_workspace`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `list_policies`, `report_test_assertion_smells`, and `report_structural_clone_smells`. Other tools return `structuredContent` without a published schema. |
+| Output schemas | JSON Schema 2020-12 `outputSchema` for `search_symbols`, `get_definitions_by_location`, `get_symbol_locations`, `get_symbol_ancestors`, `get_active_workspace`, `list_function_sources`, `analyze_diff`, `score_diff`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `list_policies`, `report_test_assertion_smells`, and `report_structural_clone_smells`. Other tools return `structuredContent` without a published schema. |
 | Cache hints (`2026-07-28` clients) | `tools/list` is `private` for five minutes. The agent-guidance resource is `public` for one hour. Tool results are not cacheable. |
 
 ## Result conventions
@@ -217,8 +217,9 @@ Output: `sources` (each with `label`, `path`, `start_line`, `end_line`,
 `text`), `not_found`, and `ambiguous` (at most 25 candidates per name; the
 note gives the true count).
 
-Completeness: `complete` is false when a lookup was cancelled; `incomplete`
-lists each affected target with `reason: "cancelled"`. A glob that matches
+Completeness: `complete` is false when a lookup was cancelled or an analyzer
+read recorded incompleteness; `incomplete` lists each affected target with
+`reason: "cancelled"` or `reason: "read_incomplete"` and its `detail`. A glob that matches
 more than 10 files is skipped and listed in `too_broad` (`target`, `matched`,
 `cap`, `matched_kind`, `sample`, `note`). `ambiguous_paths` lists path inputs
 that match more than one file.
@@ -435,6 +436,11 @@ caller-to-callee hops from those roots. The graph still resolves referenced
 files as needed, so a narrow path or depth does not make resolution cost
 proportional to a changed line range. `usage_graph` is not an inbound fan-in
 query; use `scan_usages_by_location` for caller questions.
+
+Scope: optional `scope_obligations` lists `{code, message}` assumptions relative
+to which the graph is complete. These are not incompleteness reasons. Python
+reports selected-environment openness, dynamic receiver mutation, and unplaced
+source paths here while retaining their authored declarations and references.
 
 Completeness: `complete` is false when any part of the graph is missing.
 `incomplete_reasons` lists each gap as `{code, message}`, including
@@ -719,7 +725,7 @@ category, or ID values are invalid-params errors. No other property is
 allowed.
 
 Output: `status` (`clean`, `finding`, `unreliable`), `exit_status` (`0`, `1`,
-`2`), `report` (the schema-5 policy report), `request_correlation_id`
+`2`), `report` (the schema-7 policy report), `request_correlation_id`
 (`sha256:` of the JSON-RPC request ID), and `stage_timings` when requested.
 Each run in `report.runs` has a `completion` state; see
 [Agent Result Safety](/agent-result-safety/). With no budget configured, a

@@ -739,8 +739,8 @@ fn related_files_by_usage(
     rank_usage_graph_with_cancellation(ranking_graph, seed_weights, k, cancellation)
 }
 
-fn rank_usage_graph_with_cancellation<G: AsRef<UsageRankingGraph>>(
-    graph: Cancellable<G>,
+fn rank_usage_graph_with_cancellation(
+    graph: Cancellable<Arc<brokk_bifrost_core::retention_budget::Accounted<UsageRankingGraph>>>,
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
     cancellation: &CancellationToken,
@@ -751,7 +751,7 @@ fn rank_usage_graph_with_cancellation<G: AsRef<UsageRankingGraph>>(
         Cancellable::Cancelled => return Cancellable::Cancelled,
     };
     match related_files_by_usage_graph_with_cancellation(
-        ranking_graph.as_ref(),
+        &ranking_graph,
         seed_weights,
         k,
         UsageReferenceWeights::CALIBRATED,
@@ -773,9 +773,8 @@ fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> Arc<UsageRankingGraph>
         &CancellationToken::default(),
     ) {
         Cancellable::Complete(graph) => Arc::new(graph),
-        Cancellable::Incomplete(_) => {
-            unreachable!("exact usage graph construction cannot be incomplete")
-        }
+        // Selected-environment obligations can leave a reconciled graph open.
+        Cancellable::Incomplete(graph) => Arc::new(graph),
         Cancellable::Cancelled => {
             unreachable!("default cancellation token cannot cancel usage graph construction")
         }
@@ -787,7 +786,7 @@ fn build_usage_ranking_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
     cancellation: &CancellationToken,
-) -> Cancellable<Arc<UsageRankingGraph>> {
+) -> Cancellable<Arc<brokk_bifrost_core::retention_budget::Accounted<UsageRankingGraph>>> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     build_usage_ranking_graph_with_kind_and_cancellation(
@@ -805,7 +804,7 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
     seed_weights: &HashMap<ProjectFile, f64>,
     graph_kind: WorkspaceUsageGraphKind,
     cancellation: &CancellationToken,
-) -> Cancellable<Arc<UsageRankingGraph>> {
+) -> Cancellable<Arc<brokk_bifrost_core::retention_budget::Accounted<UsageRankingGraph>>> {
     let selected_ecosystems: BTreeSet<_> = seed_weights
         .keys()
         .map(|file| {
@@ -846,7 +845,7 @@ pub(crate) fn acquire_file_usage_graph_with_cancellation(
     token: QueryToken<'_>,
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
     cancellation: &CancellationToken,
-) -> Cancellable<Arc<UsageRankingGraph>> {
+) -> Cancellable<Arc<brokk_bifrost_core::retention_budget::Accounted<UsageRankingGraph>>> {
     acquire_usage_ranking_graph_with_cancellation(
         analyzer,
         token,
@@ -864,7 +863,7 @@ fn acquire_usage_ranking_graph_with_cancellation(
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
     graph_kind: WorkspaceUsageGraphKind,
     cancellation: &CancellationToken,
-) -> Cancellable<Arc<UsageRankingGraph>> {
+) -> Cancellable<Arc<brokk_bifrost_core::retention_budget::Accounted<UsageRankingGraph>>> {
     let acquisition = acquire_usage_ranking_graph_from_builder(
         analyzer,
         selected_ecosystems,
@@ -912,7 +911,10 @@ fn acquire_usage_ranking_graph_from_builder<E>(
     producer: WorkspaceUsageGraphProducer,
     cancellation: &CancellationToken,
     mut build: impl FnMut() -> Result<WorkspaceUsageGraphCacheBuildOutcome, E>,
-) -> Result<UsageGraphAcquisition<Arc<UsageRankingGraph>>, E> {
+) -> Result<
+    UsageGraphAcquisition<Arc<brokk_bifrost_core::retention_budget::Accounted<UsageRankingGraph>>>,
+    E,
+> {
     let cache = analyzer
         .snapshot_caches()
         .map(|caches| caches.usage_graphs());
@@ -997,10 +999,17 @@ fn acquire_usage_ranking_graph_from_builder<E>(
             let build_outcome = build_result?;
             match build_outcome {
                 WorkspaceUsageGraphCacheBuildOutcome::Complete(graph) => {
-                    UsageGraphAcquisition::Complete(Arc::new(graph), None)
+                    UsageGraphAcquisition::Complete(
+                        Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                            graph,
+                        )),
+                        None,
+                    )
                 }
                 WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph) => {
-                    UsageGraphAcquisition::Incomplete(Arc::new(graph))
+                    UsageGraphAcquisition::Incomplete(Arc::new(
+                        brokk_bifrost_core::retention_budget::Accounted::uncharged(graph),
+                    ))
                 }
                 WorkspaceUsageGraphCacheBuildOutcome::Cancelled => UsageGraphAcquisition::Cancelled,
                 WorkspaceUsageGraphCacheBuildOutcome::Stale => UsageGraphAcquisition::Stale,
@@ -3382,21 +3391,13 @@ mod tests {
 
     use crate::relevance::weighted_page_rank;
 
-    use brokk_bifrost_analysis::analyzer::multi_analyzer::AnalyzerDelegate;
-
     use brokk_bifrost_core::analyzer::model::Language;
-
-    use brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer;
 
     use brokk_bifrost_core::analyzer::project::OverlayProject;
 
     use brokk_bifrost_core::analyzer::project::Project;
 
     use brokk_bifrost_core::analyzer::model::ProjectFile;
-
-    use brokk_bifrost_python_analysis::analyzer::python::PythonAnalyzer;
-
-    use brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer;
 
     use brokk_bifrost_core::analyzer::project::TestProject;
 
@@ -3413,7 +3414,6 @@ mod tests {
     use brokk_bifrost_core::cancellation::CancellationToken;
     use brokk_bifrost_core::test_support::write_file;
     use git2::{Repository, Signature};
-    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3869,21 +3869,19 @@ func run() {
         );
         write_file(root, "py_target.py", "def target():\n    pass\n");
 
-        let project = TestProject::new(root.to_path_buf(), Language::Rust);
-        let analyzer = MultiAnalyzer::new(BTreeMap::from([
-            (
-                Language::Python,
-                AnalyzerDelegate::new(PythonAnalyzer::from_project(project.clone())),
-            ),
-            (
-                Language::Rust,
-                AnalyzerDelegate::new(RustAnalyzer::from_project(project)),
-            ),
-        ]));
+        // Native Python requires cold reconciliation and a selected summary, supplied by WorkspaceAnalyzer.
+        let project = TestProject::from_root_with_inferred_languages(root).unwrap();
+        let workspace =
+            brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
+                Arc::new(project),
+                brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            )
+            .unwrap();
+        let analyzer = workspace.analyzer();
         let seed_weights = hash_map([(rust_seed.clone(), 1.0)]);
 
         let selected_graph = match crate::relevance::build_usage_ranking_graph_with_cancellation(
-            &analyzer,
+            analyzer,
             &seed_weights,
             &brokk_bifrost_core::cancellation::CancellationToken::default(),
         ) {
@@ -3892,7 +3890,7 @@ func run() {
             crate::relevance::Cancellable::Cancelled => panic!("uncancelled selected graph build"),
         };
         let warm_graph = match crate::relevance::build_usage_ranking_graph_with_cancellation(
-            &analyzer,
+            analyzer,
             &seed_weights,
             &brokk_bifrost_core::cancellation::CancellationToken::default(),
         ) {
@@ -3903,7 +3901,7 @@ func run() {
             }
         };
         assert!(Arc::ptr_eq(&selected_graph, &warm_graph));
-        let all_graph = crate::relevance::build_usage_ranking_graph(&analyzer);
+        let all_graph = crate::relevance::build_usage_ranking_graph(analyzer);
 
         assert_eq!(
             vec![brokk_bifrost_analysis::analyzer::usages::workspace_graph::UsageEcosystem::Rust],

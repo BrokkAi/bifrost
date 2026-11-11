@@ -9,6 +9,7 @@ pub mod file_tools;
 pub mod function_sources;
 pub mod model_context;
 pub mod relevance;
+pub mod result_incomplete;
 pub mod searchtools;
 pub mod searchtools_render;
 pub mod symbol_rename;

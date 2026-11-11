@@ -160,6 +160,7 @@ fn incomplete_symbol_index_still_reviews_later_go_summary_declarations() {
         &crate::test_support::evaluation_options("2026-07-27"),
         PolicyHostActivationContext::new(Some(&config), Some(&activation), &[], None),
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("policy evaluation");
     let summaries = outcome

@@ -42,7 +42,7 @@ use brokk_bifrost_analysis::analyzer::usages::native_incoming::{
 };
 
 use brokk_bifrost_analysis::analyzer::usages::call_relations::{
-    CallRelationResult, CallerInventoryCoverage,
+    CallRelationResult, CallRelationService, CallerInventoryCoverage,
 };
 
 use brokk_bifrost_core::analyzer::usages::model::UsageProofAuthority;
@@ -60,6 +60,10 @@ use brokk_bifrost_core::hash::HashMap;
 pub(crate) struct RustNativeCallRelations;
 
 impl CallRelationProvider for RustNativeCallRelations {
+    fn supports_incoming_in_file(&self) -> bool {
+        true
+    }
+
     /// Canonical inverse rows carry real proof tiers, so an omission this
     /// provider reports is a gap in an inventory it claims to have enumerated.
     fn proof_authority(&self) -> UsageProofAuthority {
@@ -129,6 +133,157 @@ impl CallRelationProvider for RustNativeCallRelations {
         result
     }
 
+    fn incoming_in_file(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        forward: &EdgeDerivationResult,
+        targets: &[CodeUnit],
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<Vec<CallRelationResult>> {
+        let fallback = CancellationToken::new();
+        let cancellation = cancellation.unwrap_or(&fallback);
+        let unavailable_all = |kind: &str, message: &str| {
+            targets
+                .iter()
+                .map(|target| unavailable(kind, message, target))
+                .collect()
+        };
+        let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+            return Some(unavailable_all(
+                "native_analyzer_unavailable",
+                "Rust analyzer is unavailable",
+            ));
+        };
+        // `forward` was resolved from unit summary rows (re-exports and globs
+        // are summary joins), which no file key names.
+        rust.record_forward_scope_reads(file);
+        // The dispatch question concerns the target's own contract and owner
+        // rows, not the file, so only the selected operation can answer it.
+        let selected = with_rust_selected_reverse_queries(rust, cancellation, |queries| {
+            let queries = queries.selected_queries();
+            let mut results = Vec::with_capacity(targets.len());
+            // One pass over the file's edges, so a target costs only its own.
+            let mut edges_by_target: HashMap<&CodeUnit, Vec<_>> = HashMap::default();
+            for edge in &forward.edges {
+                edges_by_target.entry(&edge.target).or_default().push(edge);
+            }
+            let mut remaining = limits;
+            for target in targets {
+                let limits = remaining;
+                if let Some(result) = CallRelationService::incoming_preflight(target, limits) {
+                    results.push(result);
+                    continue;
+                }
+                let mut result = CallRelationResult {
+                    caller_inventory: if forward.completeness.is_complete() {
+                        CallerInventoryCoverage::Complete
+                    } else {
+                        CallerInventoryCoverage::Incomplete
+                    },
+                    diagnostics: incomplete_diagnostics(forward, target),
+                    ..CallRelationResult::default()
+                };
+                // Each edge carries itself as metadata: only the call sites the
+                // projection keeps unproven need their reference, and an import
+                // or type edge at the same token can have one per namespace.
+                let rows = edges_by_target
+                    .get(target)
+                    .into_iter()
+                    .flatten()
+                    .map(|edge| (*edge, *edge));
+                let mut dispatch = |target: &CodeUnit| queries.unenumerable_member_dispatch(target);
+                let mut projection = RustIncomingProjection(rust, &mut dispatch);
+                if let Some(diagnostic) = projection.file_inventory_diagnostic(file, target) {
+                    result.caller_inventory = CallerInventoryCoverage::Incomplete;
+                    if !result.diagnostics.contains(&diagnostic) {
+                        result.diagnostics.push(diagnostic);
+                    }
+                }
+                let Some(sites) = project_selected_incoming(
+                    &mut projection,
+                    target,
+                    rows,
+                    limits,
+                    cancellation,
+                    &mut result,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let mut references = Vec::new();
+                for edge in finish_incoming_sites(sites, &mut result) {
+                    let Some(reference) = queries.call_reference_in_file(
+                        &edge.site.file,
+                        edge.site.range.start_byte,
+                        edge.site.range.end_byte,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    references.push(reference);
+                }
+                let Some(result) = finish_rust_incoming(
+                    references,
+                    result,
+                    target,
+                    queries,
+                    limits,
+                    cancellation,
+                )?
+                else {
+                    return Ok(None);
+                };
+                remaining.max_files = remaining
+                    .max_files
+                    .saturating_sub(result.work.scanned_files);
+                remaining.max_source_bytes = remaining
+                    .max_source_bytes
+                    .saturating_sub(result.work.scanned_source_bytes);
+                remaining.max_candidates = remaining
+                    .max_candidates
+                    .saturating_sub(result.work.examined_candidates);
+                results.push(result);
+            }
+            Ok(Some(results))
+        });
+        let mut results = match selected {
+            RustSelectedReverseOutcome::Ready(Some(results)) => results,
+            RustSelectedReverseOutcome::Ready(None) => targets
+                .iter()
+                .map(|_| CallRelationResult {
+                    caller_inventory: CallerInventoryCoverage::Incomplete,
+                    cancelled: true,
+                    ..CallRelationResult::default()
+                })
+                .collect(),
+            RustSelectedReverseOutcome::Unavailable(reason) => {
+                unavailable_all("native_unavailable", &reason)
+            }
+            RustSelectedReverseOutcome::Stale(reason) => unavailable_all("native_stale", &reason),
+            RustSelectedReverseOutcome::StoreError(reason) => {
+                unavailable_all("native_store_error", &reason)
+            }
+            RustSelectedReverseOutcome::Cancelled => targets
+                .iter()
+                .map(|_| CallRelationResult {
+                    caller_inventory: CallerInventoryCoverage::Incomplete,
+                    cancelled: true,
+                    ..CallRelationResult::default()
+                })
+                .collect(),
+        };
+        if cancellation.is_cancelled() {
+            for result in &mut results {
+                result.sites.clear();
+                result.cancelled = true;
+                result.caller_inventory = CallerInventoryCoverage::Incomplete;
+            }
+        }
+        Some(results)
+    }
+
     fn outgoing(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -181,10 +336,6 @@ pub(crate) fn project_rust_rich_call_relation(
     limits: brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits,
     cancellation: &CancellationToken,
 ) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CallRelationResult>> {
-    use brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH;
-
-    use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
-
     assert_eq!(selected.edges.len(), references.len());
     let mut result = CallRelationResult {
         caller_inventory: if matches!(selected.completeness, EdgeCompleteness::Complete) {
@@ -207,7 +358,25 @@ pub(crate) fn project_rust_rich_call_relation(
     else {
         return Ok(None);
     };
-    let incomplete_binding_references = finish_incoming_sites(sites, &mut result);
+    let references = finish_incoming_sites(sites, &mut result);
+    finish_rust_incoming(references, result, target, queries, limits, cancellation)
+}
+
+/// Both incoming directions finish with the same binding rechecks of the
+/// deduplicated sites that stayed unproven, given by their references.
+fn finish_rust_incoming(
+    incomplete_binding_references: Vec<
+        brokk_bifrost_analysis::analyzer::resolution::model::SemanticId,
+    >,
+    mut result: CallRelationResult,
+    target: &CodeUnit,
+    queries: &mut dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::rust_reverse::SelectedRustReverseQueries,
+    limits: CallRelationLimits,
+    cancellation: &CancellationToken,
+) -> brokk_bifrost_analysis::analyzer::store::Result<Option<CallRelationResult>> {
+    use brokk_bifrost_analysis::analyzer::resolution::batch::MAX_REFERENCE_SEEDS_PER_BATCH;
+    use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
+
     let mut time_budget_exhausted = false;
     let mut omitted_by_lane = HashMap::<&str, usize>::default();
     let projection_limits_exceeded = result.truncated;
@@ -307,6 +476,33 @@ struct RustIncomingProjection<'a>(
 
 impl IncomingCallProjection for RustIncomingProjection<'_> {
     type Error = brokk_bifrost_analysis::analyzer::store::StoreError;
+
+    fn file_inventory_diagnostic(
+        &mut self,
+        file: &ProjectFile,
+        target: &CodeUnit,
+    ) -> Option<CallRelationDiagnostic> {
+        let recovered = self
+            .0
+            .structural_fact_providers()
+            .into_iter()
+            .any(|provider| {
+                provider
+                    .structural_facts(file)
+                    .is_some_and(|facts| !facts.recovered_regions().is_empty())
+            });
+        recovered.then(|| {
+            let reason = EdgeIncompleteReason::InverseIndexResolutionIncomplete;
+            diagnostic(
+                incomplete_reason_kind(&reason),
+                format!(
+                    "selected Rust reverse call inventory for {} is incomplete: {reason:?}",
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
+            )
+        })
+    }
 
     fn unenumerable_dispatch(&mut self, target: &CodeUnit) -> Result<bool, Self::Error> {
         // The answer reads the target blob's contract and owner rows.
@@ -462,6 +658,9 @@ fn incomplete_reason_kind(reason: &EdgeIncompleteReason) -> &'static str {
         }
         EdgeIncompleteReason::InverseIndexResolutionIncomplete => {
             "inverse_index_resolution_incomplete"
+        }
+        EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
+            "inverse_index_query_obligations_outstanding"
         }
         EdgeIncompleteReason::InverseIndexAdmissionIncomplete => {
             "inverse_index_admission_incomplete"

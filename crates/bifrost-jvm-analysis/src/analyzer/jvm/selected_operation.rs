@@ -12,6 +12,8 @@ use brokk_bifrost_analysis::analyzer::store::{Result, WorkspaceSnapshots};
 use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::cancellation::CancellationToken;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Arc;
 
 pub(crate) enum SelectedJvmOperationOutcome<'store, 'project> {
     Ready(Box<SelectedResolutionOperation<'store, 'project>>),
@@ -86,6 +88,73 @@ impl<'a, A: LanguageAdapter> SelectedJvmRecipe<'a, A> {
                 .analyzer_store()
                 .open_selected_resolution_operation(input, cancellation)?
             {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => {
+                    SelectedJvmOperationOutcome::Ready(operation)
+                }
+                SelectedResolutionOperationOpenOutcome::Cancelled => {
+                    SelectedJvmOperationOutcome::Cancelled
+                }
+                SelectedResolutionOperationOpenOutcome::Stale(reason) => {
+                    SelectedJvmOperationOutcome::Stale(reason)
+                }
+                SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
+                    SelectedJvmOperationOutcome::Unavailable(reason)
+                }
+            },
+        )
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
+    pub(crate) fn open_with_inherited_tier_knowledge_for_test(
+        &self,
+        cancellation: &CancellationToken,
+        knowledge: Arc<
+            brokk_bifrost_analysis::analyzer::resolution::tier_evaluator::InheritedTierKnowledge,
+        >,
+    ) -> Result<SelectedJvmOperationOutcome<'a, 'a>> {
+        let inner = self.inner;
+        let snapshots = &self.snapshots;
+        let (masks, content_mounts) =
+            match inner.selected_resolution_overlay_inputs(snapshots, cancellation)? {
+                SelectedResolutionOverlayInputsOutcome::Ready {
+                    masks,
+                    content_mounts,
+                } => (masks, content_mounts),
+                SelectedResolutionOverlayInputsOutcome::Cancelled => {
+                    return Ok(SelectedJvmOperationOutcome::Cancelled);
+                }
+                SelectedResolutionOverlayInputsOutcome::Stale(reason) => {
+                    return Ok(SelectedJvmOperationOutcome::Stale(reason));
+                }
+                SelectedResolutionOverlayInputsOutcome::Unavailable(reason) => {
+                    return Ok(SelectedJvmOperationOutcome::Unavailable(reason));
+                }
+            };
+        let languages = [
+            ("java", Language::Java),
+            ("kotlin", Language::Kotlin),
+            ("scala", Language::Scala),
+        ]
+        .into_iter()
+        .filter(|(storage, _)| snapshots.contains_key(*storage))
+        .map(|(storage, language)| SelectedResolutionLanguage::new(storage, language))
+        .collect::<Vec<_>>();
+        let input = SelectedResolutionOperationInput::new(
+            inner.project(),
+            inner.workspace_id(),
+            snapshots,
+            &languages,
+            &masks,
+        )
+        .with_content_mounts(content_mounts);
+        Ok(
+            match inner
+                .analyzer_store()
+                .open_selected_resolution_operation_with_inherited_tier_knowledge_for_test(
+                    input,
+                    cancellation,
+                    knowledge,
+                )? {
                 SelectedResolutionOperationOpenOutcome::Ready(operation) => {
                     SelectedJvmOperationOutcome::Ready(operation)
                 }

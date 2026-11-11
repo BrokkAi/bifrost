@@ -584,6 +584,7 @@ impl<'plan> ValueFlowProblem<'plan> {
                 call,
                 edge.boundary(),
                 edge.kind(),
+                edge.caller_conversion_may_run_user_code(),
                 flow.carrier,
                 |transfer| {
                     let transferred = ActiveFlow {
@@ -1474,7 +1475,7 @@ pub(crate) fn kills_target(rule: &super::plan::LocalRuleView) -> bool {
         rule.source != rule.target,
         rule.strong_update,
         rule.direct_cell_overwrite,
-    )
+    ) && !rule.joins_same_event_alternative
 }
 
 /// Whether a by-value relation consumes the value held by its source. The rule
@@ -1557,6 +1558,7 @@ mod tests {
             policy_local: false,
             strong_update: false,
             direct_cell_overwrite: false,
+            joins_same_event_alternative: false,
         }
     }
 

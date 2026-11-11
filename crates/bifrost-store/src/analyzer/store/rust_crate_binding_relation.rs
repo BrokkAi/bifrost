@@ -888,11 +888,12 @@ pub(super) fn derive(conn: &Connection, edition: &str, _crate_name: &str, cfg: &
     ] {
         conn.prepare_cached(sql)?.execute([])?;
     }
-    conn.execute(super::binding_authority::LOCAL_DECLARATIONS_SQL, [cfg])?;
-    conn.execute(
+    conn.prepare_cached(super::binding_authority::LOCAL_DECLARATIONS_SQL)?
+        .execute([cfg])?;
+    conn.prepare_cached(
         "INSERT OR IGNORE INTO cr_binding_targets SELECT * FROM cr_authority_local_seeds",
-        [],
-    )?;
+    )?
+    .execute([])?;
     let absolute_anchor = crate::analyzer::resolution::root_import_anchor_semantic_identity(
         brokk_bifrost_core::analyzer::resolution_facts::ResolutionRootImportAnchor::Absolute,
     )
@@ -1412,35 +1413,12 @@ pub(super) const MACRO_OPEN_NAMES_SQL: &str = "INSERT OR IGNORE INTO cr_binding_
 mod edge_input_tests {
     use super::*;
     use crate::analyzer::store::AnalyzerStore;
-    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
     use std::collections::BTreeSet;
-    use std::sync::{Arc, Mutex};
 
     /// The tables a statement reads and writes, as SQLite reports them while
     /// compiling it, through the views it expands and the triggers it fires.
     fn accesses(conn: &Connection, sql: &str) -> (BTreeSet<String>, BTreeSet<String>) {
-        let seen = Arc::new(Mutex::new((BTreeSet::new(), BTreeSet::new())));
-        let sink = Arc::clone(&seen);
-        conn.authorizer(Some(move |context: AuthContext<'_>| {
-            let mut seen = sink.lock().expect("authorizer sink");
-            match context.action {
-                AuthAction::Read { table_name, .. } => {
-                    seen.0.insert(table_name.to_owned());
-                }
-                AuthAction::Insert { table_name }
-                | AuthAction::Update { table_name, .. }
-                | AuthAction::Delete { table_name } => {
-                    seen.1.insert(table_name.to_owned());
-                }
-                _ => {}
-            }
-            Authorization::Allow
-        }))
-        .unwrap();
-        conn.prepare(sql).unwrap();
-        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
-            .unwrap();
-        seen.lock().expect("authorizer sink").clone()
+        crate::analyzer::store::connection_authorizer::record_accesses(conn, sql)
     }
 
     // The fixpoint skips rebuilding edges after a round whose passes wrote no

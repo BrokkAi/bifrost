@@ -24,7 +24,9 @@ use super::kinds::{NormalizedKind, Role};
 use super::occurrences::OccurrenceRole;
 use super::provider::LiveRegistration;
 use crate::analyzer::Range;
+use crate::analyzer::canonical_hash::CanonicalHasher;
 use crate::analyzer::semantic::ContentIdentity;
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_core::analyzer::structural::callable::{
@@ -37,7 +39,7 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub struct RoleTarget {
     pub role: Role,
-    pub spread: bool,
+    pub mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode,
     pub keyword: Option<Span>,
     pub node: Option<u32>,
     pub span: Span,
@@ -234,7 +236,7 @@ fn materialize_rows(
             let range = source_facts.occurrence(role.occurrence).range;
             RoleTarget {
                 role: role.role,
-                spread: role.spread,
+                mode: role.mode,
                 keyword: role.keyword.map(|keyword| {
                     let range = source_facts.occurrence(keyword).range;
                     Span {
@@ -323,16 +325,53 @@ fn append_syntax_error_facts(
 #[derive(Debug)]
 pub struct FileFacts {
     pub(super) live_registration: std::sync::OnceLock<LiveRegistration>,
+    pub(super) charge: brokk_bifrost_core::retention_budget::AllocationCharge,
     source: String,
     source_identity: ContentIdentity,
     line_starts: Vec<usize>,
     nodes: Vec<NormalizedNode>,
     roles: CompactRows<RoleTarget>,
     occurrence_roles: CompactRows<OccurrenceRole>,
+    role_coverage: Vec<(
+        u32,
+        Role,
+        brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage,
+    )>,
     recovered_regions: Vec<RecoveredRegion>,
 }
 
+impl brokk_bifrost_core::retention_budget::SelfCharged for FileFacts {
+    fn allocation_charge(&self) -> &brokk_bifrost_core::retention_budget::AllocationCharge {
+        &self.charge
+    }
+}
+
 impl FileFacts {
+    /// Stable selected structural content, independent of store row IDs and
+    /// analyzer generations. The posting index and its replay both consume
+    /// this same completed FileFacts snapshot.
+    pub fn selection_digest(&self) -> StableDigest {
+        let mut hasher = CanonicalHasher::new(b"bifrost-structural-file-selection:v2");
+        hasher.field("source", self.source.as_bytes());
+        for (ordinal, node) in self.nodes.iter().enumerate() {
+            hasher.field("node_ordinal", &(ordinal as u64).to_be_bytes());
+            hasher.field("node", format!("{node:?}").as_bytes());
+            for role in self.roles(ordinal as u32) {
+                hasher.field("role", format!("{role:?}").as_bytes());
+            }
+            for role in self.occurrence_roles(ordinal as u32) {
+                hasher.field("occurrence_role", format!("{role:?}").as_bytes());
+            }
+        }
+        for region in &self.recovered_regions {
+            hasher.field("recovery", format!("{region:?}").as_bytes());
+        }
+        for outcome in &self.role_coverage {
+            hasher.field("role_coverage", format!("{outcome:?}").as_bytes());
+        }
+        StableDigest::from_array(hasher.finish())
+    }
+
     pub(crate) fn new(
         source: String,
         line_starts: Vec<usize>,
@@ -377,15 +416,24 @@ impl FileFacts {
             "recovered regions must lie inside the {}-byte source: {recovered_regions:?}",
             source.len()
         );
+        // Matchers binary-search the regions, as hydration already requires.
+        assert!(
+            recovered_regions
+                .windows(2)
+                .all(|pair| pair[0].range.end_byte <= pair[1].range.start_byte),
+            "recovered regions must be in source order without overlaps: {recovered_regions:?}"
+        );
         let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
             live_registration: std::sync::OnceLock::new(),
+            charge: Default::default(),
             source,
             source_identity,
             line_starts,
             nodes,
             roles,
             occurrence_roles,
+            role_coverage: Vec::new(),
             recovered_regions,
         }
     }
@@ -400,7 +448,7 @@ impl FileFacts {
     ) -> Self {
         let line_starts = compute_line_starts(&source);
         let (nodes, roles) = materialize_rows(&source_facts, &rows);
-        let (_, _, occurrence_roles, recovered_regions) = rows.into_parts();
+        let (_, _, occurrence_roles, role_coverage, recovered_regions) = rows.into_parts();
         let recovered_regions = recovered_regions
             .into_iter()
             .map(|span| RecoveredRegion {
@@ -415,14 +463,16 @@ impl FileFacts {
             .collect::<Vec<_>>();
         let (nodes, roles, occurrence_roles) =
             append_syntax_error_facts(nodes, roles, occurrence_roles, &recovered_regions);
-        Self::new(
+        let mut facts = Self::new(
             source,
             line_starts,
             nodes,
             roles,
             occurrence_roles,
             recovered_regions,
-        )
+        );
+        facts.role_coverage = role_coverage;
+        facts
     }
 
     /// Bind source-local rows to the exact selected parse before publication.
@@ -510,7 +560,7 @@ impl FileFacts {
                         StructuralFactsPersistenceError::invalid("structural role row exceeds u32")
                     })?,
                     role: target.role.code(),
-                    spread: target.spread,
+                    mode: target.mode,
                     keyword: target.keyword.map(persist_span).transpose()?,
                     node: target.node,
                     span: persist_span(target.span)?,
@@ -557,6 +607,22 @@ impl FileFacts {
             nodes,
             roles,
             occurrence_roles,
+            role_coverage: self
+                .role_coverage
+                .iter()
+                .map(|&(owner, role, coverage)| {
+                    use super::kinds::RoleCoverage;
+                    match coverage {
+                        RoleCoverage::Complete => (owner, role.code(), 0, None),
+                        RoleCoverage::Incomplete(gaps) => (
+                            owner,
+                            role.code(),
+                            1,
+                            Some(gaps.iter().map(|gap| gap.code()).collect()),
+                        ),
+                    }
+                })
+                .collect(),
             recovered_regions,
         })
     }
@@ -578,6 +644,72 @@ impl FileFacts {
         let node_count = u32::try_from(persisted.nodes.len()).map_err(|_| {
             StructuralFactsPersistenceError::invalid("structural facts node count exceeds u32")
         })?;
+        use super::kinds::{RoleCoverage, RoleCoverageGap, RoleCoverageGaps};
+        let mut coverage = Vec::with_capacity(persisted.role_coverage.len());
+        let span_only_edges = persisted
+            .roles
+            .iter()
+            .filter(|edge| edge.node.is_none())
+            .map(|edge| (edge.source_node_id, edge.role))
+            .collect::<crate::hash::HashSet<_>>();
+        let mut previous = None;
+        for &(owner, role_code, state, ref reasons) in &persisted.role_coverage {
+            let role = Role::from_code(role_code)
+                .ok_or_else(|| StructuralFactsPersistenceError::invalid("unknown coverage role"))?;
+            let pair = (owner, role);
+            if previous.is_some_and(|prior| prior >= pair) {
+                return Err(StructuralFactsPersistenceError::invalid(
+                    "coverage pairs are duplicate or unordered",
+                ));
+            }
+            previous = Some(pair);
+            let owner_kind = persisted
+                .nodes
+                .get(owner as usize)
+                .and_then(|node| NormalizedKind::from_code(node.kind))
+                .ok_or_else(|| {
+                    StructuralFactsPersistenceError::invalid("coverage owner node is invalid")
+                })?;
+            if !role.has_coverage() || !role.valid_for(owner_kind) {
+                return Err(StructuralFactsPersistenceError::invalid(
+                    "coverage role is invalid for owner kind",
+                ));
+            }
+            let outcome = match (state, reasons) {
+                (0, None) => RoleCoverage::Complete,
+                (1, Some(codes)) if !codes.is_empty() => {
+                    let mut previous_code = None;
+                    let mut gaps: Option<RoleCoverageGaps> = None;
+                    for &code in codes {
+                        if previous_code.is_some_and(|prior| prior >= code) {
+                            return Err(StructuralFactsPersistenceError::invalid(
+                                "coverage reasons are unordered",
+                            ));
+                        }
+                        previous_code = Some(code);
+                        let gap = RoleCoverageGap::from_code(code).ok_or_else(|| {
+                            StructuralFactsPersistenceError::invalid("unknown coverage reason")
+                        })?;
+                        match &mut gaps {
+                            Some(set) => set.insert(gap),
+                            None => gaps = Some(RoleCoverageGaps::new(gap)),
+                        }
+                    }
+                    RoleCoverage::Incomplete(gaps.expect("nonempty reasons"))
+                }
+                _ => {
+                    return Err(StructuralFactsPersistenceError::invalid(
+                        "invalid coverage state or reasons",
+                    ));
+                }
+            };
+            if outcome == RoleCoverage::Complete && span_only_edges.contains(&(owner, role_code)) {
+                return Err(StructuralFactsPersistenceError::invalid(
+                    "complete coverage has span-only role edge",
+                ));
+            }
+            coverage.push((owner, role, outcome));
+        }
         let line_starts = compute_line_starts(&source);
         let mut nodes: Vec<NormalizedNode> = Vec::with_capacity(persisted.nodes.len());
         for (id, node) in persisted.nodes.into_iter().enumerate() {
@@ -780,7 +912,7 @@ impl FileFacts {
                             target.role
                         ))
                     })?,
-                    spread: target.spread,
+                    mode: target.mode,
                     keyword: target
                         .keyword
                         .map(|span| hydrate_span(span, &source))
@@ -874,14 +1006,16 @@ impl FileFacts {
 
         let (nodes, roles, occurrence_roles) =
             append_syntax_error_facts(nodes, roles, occurrence_roles, &recovered_regions);
-        Ok(Self::new(
+        let mut facts = Self::new(
             source,
             line_starts,
             nodes,
             roles,
             occurrence_roles,
             recovered_regions,
-        ))
+        );
+        facts.role_coverage = coverage;
+        Ok(facts)
     }
 
     pub fn nodes(&self) -> &[NormalizedNode] {
@@ -907,6 +1041,27 @@ impl FileFacts {
     /// Empty for every node the adapter did not classify.
     pub fn occurrence_roles(&self, id: u32) -> &[OccurrenceRole] {
         self.occurrence_roles.row(id as usize)
+    }
+
+    pub fn role_coverage(
+        &self,
+        owner: u32,
+        role: Role,
+    ) -> Option<brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage> {
+        self.role_coverage
+            .binary_search_by_key(&(owner, role), |&(owner, role, _)| (owner, role))
+            .ok()
+            .map(|index| self.role_coverage[index].2)
+    }
+
+    pub fn role_coverage_rows(
+        &self,
+    ) -> &[(
+        u32,
+        Role,
+        brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage,
+    )] {
+        &self.role_coverage
     }
 
     /// Total occurrence-role classifications retained across this file.
@@ -1029,7 +1184,7 @@ mod tests {
     fn role_target(role: Role, start_byte: usize) -> RoleTarget {
         RoleTarget {
             role,
-            spread: false,
+            mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain,
             keyword: None,
             node: None,
             span: Span {
@@ -1135,7 +1290,7 @@ mod tests {
         roles.push_row([
             RoleTarget {
                 role: Role::Callee,
-                spread: false,
+                mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain,
                 keyword: None,
                 node: None,
                 span: Span {
@@ -1149,7 +1304,7 @@ mod tests {
             },
             RoleTarget {
                 role: Role::Kwarg,
-                spread: true,
+                mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Spread,
                 keyword: Some(Span {
                     start_byte: 0,
                     end_byte: 1,
@@ -1177,6 +1332,56 @@ mod tests {
             occurrence_roles.finish(),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn persisted_role_coverage_rejects_invalid_rows() {
+        let fixture = relational_fixture();
+        // Coverage needs an owner whose kind takes a coverage role, so the
+        // fixture's call is persisted as a method for this test.
+        let method_rows = || {
+            let mut rows = fixture.persisted_rows().unwrap();
+            rows.nodes[0].kind = NormalizedKind::Method.code();
+            rows
+        };
+        let parameters = Role::Parameters.code();
+        let valid = (0, parameters, 0, None);
+        let mut rows = method_rows();
+        rows.role_coverage.push(valid.clone());
+        let hydrated = FileFacts::from_persisted_rows(fixture.source().into(), rows).unwrap();
+        assert_eq!(
+            hydrated.role_coverage(0, Role::Parameters),
+            Some(crate::analyzer::structural::kinds::RoleCoverage::Complete)
+        );
+
+        let bad = [
+            vec![(2, parameters, 0, None)],
+            vec![(0, Role::Members.code(), 0, None)],
+            vec![(0, Role::Callee.code(), 0, None)],
+            // A list role valid for the owner but without a coverage producer.
+            vec![(0, Role::Arg.code(), 0, None)],
+            vec![valid.clone(), valid.clone()],
+            vec![(1, parameters, 0, None), valid.clone()],
+            vec![(0, parameters, 0, Some(vec![0]))],
+            vec![(0, parameters, 1, None)],
+            vec![(0, parameters, 1, Some(vec![]))],
+            vec![(0, parameters, 1, Some(vec![1, 0]))],
+            vec![(0, parameters, 1, Some(vec![0, 0]))],
+            vec![(0, parameters, 1, Some(vec![7]))],
+            vec![(0, parameters, 2, None)],
+        ];
+        for coverage in bad {
+            let mut rows = method_rows();
+            rows.role_coverage = coverage.clone();
+            assert!(
+                FileFacts::from_persisted_rows(fixture.source().into(), rows).is_err(),
+                "{coverage:?}"
+            );
+        }
+        let mut rows = method_rows();
+        rows.roles[0].role = parameters;
+        rows.role_coverage.push(valid);
+        assert!(FileFacts::from_persisted_rows(fixture.source().into(), rows).is_err());
     }
 
     #[test]
@@ -1341,6 +1546,7 @@ mod tests {
                     nodes: Vec::new(),
                     roles: Vec::new(),
                     occurrence_roles: Vec::new(),
+                    role_coverage: Vec::new(),
                     recovered_regions: vec![super::PersistedRecoveredRegion {
                         span: PersistedSpan {
                             start: span.start_byte as u32,
@@ -1398,7 +1604,7 @@ mod tests {
         for node in 0..original.nodes().len() as u32 {
             for (actual, expected) in decoded.roles(node).iter().zip(original.roles(node)) {
                 assert_eq!(actual.role, expected.role);
-                assert_eq!(actual.spread, expected.spread);
+                assert_eq!(actual.mode, expected.mode);
                 assert_eq!(actual.keyword, expected.keyword);
                 assert_eq!(actual.node, expected.node);
                 assert_eq!(actual.span, expected.span);

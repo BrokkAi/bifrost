@@ -309,6 +309,53 @@ func caller() {
     );
 }
 
+#[test]
+#[hardwon(
+    "#10181: the result-slot lookup must abstain at an ordinal the obligation has no slot for"
+)]
+fn go_point_callable_result_slot_reads_ordinal_slots_and_abstains_beyond_results() {
+    let source = r#"package consumer
+type Res struct{}
+func OpenRes() (*Res, error) { return nil, nil }
+func caller() {
+	var r *Res
+	var err error
+	r, err = OpenRes()
+	_, _ = r, err
+}
+"#;
+    let (fixture, analyzer) = fixture(source);
+    let cancellation = CancellationToken::new();
+    let GoNativePointRequestOpen::Ready(request) =
+        GoNativePointRequest::open_for_file(&analyzer, &fixture.file(CALLER), None, &cancellation)
+            .unwrap()
+    else {
+        panic!("the caller context must be ready");
+    };
+    let call = source.rfind("OpenRes").unwrap();
+    let reference = request
+        .operation
+        .go_point_reference_at(CALLER, call, call + "OpenRes".len(), &cancellation)
+        .unwrap()
+        .expect("the call callee is a persisted reference");
+    let slot = |ordinal| {
+        request
+            .operation
+            .go_point_callable_result_slot(CALLER, reference, ordinal, &cancellation)
+            .unwrap()
+    };
+
+    let first = slot(0);
+    let second = slot(1);
+    assert!(first.is_some(), "ordinal 0 reads the call's result slot");
+    assert!(
+        second.is_some(),
+        "ordinal 1 reads element 0 of the extra slots"
+    );
+    assert_ne!(first, second, "each result ordinal has its own slot");
+    assert_eq!(slot(2), None, "the call has no third result slot");
+}
+
 fn go_types_generic_answers(source: &str) -> std::collections::HashMap<String, String> {
     let oracle = r##"
 package main
@@ -485,7 +532,8 @@ fn complete_with_evidence(
 #[test]
 fn go_native_point_projects_direct_composite_type_shapes() {
     use brokk_bifrost_analysis::analyzer::resolution::{
-        FactIntrinsicTypeDescriptor, FactProjectedTypeNodeForm, FactProjectedTypeShape,
+        CanonicalChannelDirection, FactIntrinsicTypeDescriptor, FactProjectedTypeNodeForm,
+        FactProjectedTypeShape,
     };
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeTypes;
     type Projected = (
@@ -633,9 +681,8 @@ fn go_native_point_projects_direct_composite_type_shapes() {
     };
     assert_component(&values, element, "int");
 
-    // This records the current boundary, not a goal: function signatures only
-    // project the intrinsic leaf because they have no component rows, and
-    // channels project Unsupported.
+    // Function signatures project the intrinsic leaf because they have no
+    // component rows. Directional channels project their typed Element.
     let callback = resolve("callback");
     let root = root_form(&callback);
     assert_eq!(root, FactProjectedTypeNodeForm::Leaf);
@@ -652,7 +699,11 @@ fn go_native_point_projects_direct_composite_type_shapes() {
             && intrinsic.spelling() == "function-type"
     }));
     let stream = resolve("stream");
-    assert_eq!(root_form(&stream), FactProjectedTypeNodeForm::Unsupported);
+    let FactProjectedTypeNodeForm::Channel { direction, element } = root_form(&stream) else {
+        panic!("chan int must project as Channel: {:?}", root_form(&stream));
+    };
+    assert_eq!(direction, CanonicalChannelDirection::Both);
+    assert_component(&stream, element, "int");
 }
 
 #[test]
@@ -2414,7 +2465,7 @@ func use(s Service) { _ = s.ID }
 /// shadow the promoted field.
 fn refused_package_member_fixture() -> crate::inline_project::BuiltInlineTestProject {
     let refused = format!(
-        "package consumer\n\nfunc (Service) ID() {{}}\n\nvar blob = `{}`\n",
+        "package consumer\n\nfunc (Service) ID() {{}}\n\nvar blob{} int8\n",
         "A".repeat(20_000)
     );
     InlineTestProject::with_language(Language::Go)
@@ -3682,6 +3733,8 @@ func (cache *Cache[K, V]) get(key K, values ...Option[K, V]) *Item[K, V] {
     // since #6925 kept field names out of type-syntax lookup.
     // Import-free point requests now use demand scheduling too. Keep its
     // work pinned alongside the exact method-value answer below.
+    // After the master merge, same-round typed slot wakes no longer add a
+    // completed demand-scheduler round for this query; both budgets use 107.
     let expected_resolution_rounds = 107;
     assert_eq!(default_work.resolution_rounds, expected_resolution_rounds);
     let wide_method_value = resolve_at(
@@ -4601,4 +4654,300 @@ func f(p string) {
             assert!(observed, "native evidence must be read: {outcome:?}");
         }
     }
+}
+
+#[test]
+#[hardwon("#9163: a Go point republish between operation open and projection mixed model sets")]
+fn go_point_answer_keeps_model_snapshot_after_republish() {
+    let source = "package consumer\nimport \"sync\"\ntype Pool struct { once sync.Once }\nfunc (p *Pool) use() { p.once.Do(func() {}) }\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let _catalog = activate_receiver_models_for_test(analyzer);
+    let selected = analyzer
+        .active_semantic_model_snapshot()
+        .expect("activated models");
+    let overlay = analyzer
+        .semantic_model_overlay()
+        .expect("activated overlay");
+    let expected_key = brokk_bifrost_analysis::analyzer::ReadKey::Models(
+        brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(
+            selected.active_models().active_model_set_hash(),
+        ),
+    );
+    let file = fixture.file(CALLER);
+    let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source).unwrap();
+    let site = site_for(source, "Do");
+    let baseline = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {},
+    ));
+    let ledger = Arc::new(brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger::new());
+    let _ledger_scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_read_ledger(
+        analyzer,
+        Arc::clone(&ledger),
+    );
+    let resolution = complete_with_evidence(resolve_go_definition_with_evidence_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: ReceiverAnalysisBudget::default(),
+            cancellation: None,
+        },
+        || {
+            assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
+            assert!(Arc::ptr_eq(
+                analyzer
+                    .active_query_semantic_model_snapshot()
+                    .expect("pinned selection")
+                    .expect("active model snapshot")
+                    .semantic_model_overlay()
+                    .expect("pinned overlay"),
+                &overlay
+            ));
+        },
+    ));
+    assert_eq!(
+        resolution.outcome.resolved_reference_target(),
+        Some("sync.Once.Do")
+    );
+    assert_eq!(resolution.outcome.status, baseline.outcome.status);
+    assert_eq!(
+        format!("{:?}", resolution.outcome.definitions),
+        format!("{:?}", baseline.outcome.definitions)
+    );
+    assert_eq!(
+        format!("{:?}", resolution.outcome.diagnostics),
+        format!("{:?}", baseline.outcome.diagnostics)
+    );
+    let model_keys: Vec<_> = ledger
+        .keys()
+        .into_iter()
+        .filter(|key| matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
+        .collect();
+    assert_eq!(model_keys, [expected_key]);
+    assert!(analyzer.semantic_model_overlay().is_none());
+}
+
+#[test]
+#[hardwon(
+    "#9224: G2 hierarchy and member-family provider entries read the selected model without pinning it"
+)]
+fn go_hierarchy_entries_preserve_outer_model_selection() {
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyOutcome;
+
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/hierarchy\n\ngo 1.22\n")
+        .file(
+            CALLER,
+            "package consumer\ntype Worker struct{}\nfunc (Worker) Run() {}\n",
+        )
+        .build();
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let _catalog = activate_receiver_models_for_test(analyzer);
+    let old_overlay = analyzer.semantic_model_overlay().expect("first overlay");
+    assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
+    let _catalog2 = activate_receiver_models_for_test(analyzer);
+    let current = analyzer.semantic_model_overlay().expect("second overlay");
+    assert!(!Arc::ptr_eq(&old_overlay, &current));
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer).unwrap();
+    let member = go
+        .declarations(&fixture.file(CALLER))
+        .into_iter()
+        .find(|unit| {
+            unit.is_function()
+                && unit.identifier() == "Run"
+                && unit.owner_identifier() == Some("Worker")
+        })
+        .unwrap();
+    let owner = go
+        .declarations(&fixture.file(CALLER))
+        .into_iter()
+        .find(|unit| unit.identifier() == "Worker")
+        .unwrap();
+
+    let _outer = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
+        analyzer,
+        Some(Arc::clone(&old_overlay)),
+    );
+    let family = super::super::native_hierarchy::member_family(go, &member, None);
+    assert_eq!(
+        family.outcome,
+        MemberFamilyOutcome::Incomplete,
+        "{member:?} {family:?}"
+    );
+    let mut hierarchy = None;
+    super::super::native_hierarchy::with_native_query(go, Some(&owner), &mut |query| {
+        hierarchy = Some(query.direct_ancestors(&owner));
+    });
+    assert!(!hierarchy.unwrap().open.is_empty());
+    drop(_outer);
+
+    let _compatible =
+        brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
+            analyzer,
+            Some(Arc::clone(&current)),
+        );
+    let _pin =
+        brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(analyzer)
+            .expect("compatible selection");
+    assert!(Arc::ptr_eq(
+        &super::super::selected_go_model_overlay(analyzer).unwrap(),
+        &current
+    ));
+    let mut hierarchy = None;
+    super::super::native_hierarchy::with_native_query(go, Some(&owner), &mut |query| {
+        hierarchy = Some(query.direct_ancestors(&owner));
+    });
+    assert!(hierarchy.is_some());
+}
+
+#[test]
+fn go_model_scope_preserves_outer_selection_and_lazy_receiver() {
+    use brokk_bifrost_analysis::analyzer::languages::ReceiverRequest;
+    use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+    let source = "package consumer\nimport \"sync\"\ntype Pool struct { once sync.Once }\nfunc (p *Pool) use() { p.once.Do(func() {}) }\n";
+    let fixture = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.test/native\n\ngo 1.22\n")
+        .file(CALLER, source)
+        .build();
+    let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let _catalog = activate_receiver_models_for_test(analyzer);
+    let old_overlay = analyzer.semantic_model_overlay().expect("first overlay");
+    {
+        let _none = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, None);
+        let ledger = Arc::new(brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger::new());
+        let _ledger_scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_read_ledger(
+            analyzer,
+            Arc::clone(&ledger),
+        );
+        assert!(
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+                analyzer
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(super::super::selected_go_model_snapshot(analyzer).is_none());
+        // Pinning and selecting record no model read.
+        assert!(
+            ledger
+                .keys()
+                .iter()
+                .all(|key| !matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
+        );
+        // Reading the overlay records that no model set is active.
+        assert!(analyzer.semantic_model_overlay().is_none());
+        assert_eq!(
+            ledger
+                .keys()
+                .into_iter()
+                .filter(|key| matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
+                .collect::<Vec<_>>(),
+            vec![brokk_bifrost_analysis::analyzer::ReadKey::Models(
+                brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(None)
+            )]
+        );
+    }
+    {
+        let _same =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
+                analyzer,
+                Some(Arc::clone(&old_overlay)),
+            );
+        let _inner =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+                analyzer,
+            )
+            .expect("same overlay may nest");
+        assert!(Arc::ptr_eq(
+            &super::super::selected_go_model_overlay(analyzer).unwrap(),
+            &old_overlay
+        ));
+    }
+    assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
+    let _catalog2 = activate_receiver_models_for_test(analyzer);
+    let new_overlay = analyzer.semantic_model_overlay().expect("second overlay");
+    assert!(!Arc::ptr_eq(&old_overlay, &new_overlay));
+    assert_eq!(
+        old_overlay.active_model_set_hash(),
+        new_overlay.active_model_set_hash()
+    );
+    {
+        let _old =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
+                analyzer,
+                Some(Arc::clone(&old_overlay)),
+            );
+        assert!(
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+                analyzer
+            )
+            .is_err()
+        );
+    }
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer).unwrap();
+    let cancellation = CancellationToken::new();
+    let snapshot;
+    let request;
+    {
+        let _scope =
+            brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+                analyzer,
+            )
+            .unwrap();
+        snapshot = super::super::selected_go_model_snapshot(analyzer);
+        let GoNativePointRequestOpen::Ready(opened) = GoNativePointRequest::open(
+            go,
+            super::super::selected_go_model_overlay(analyzer),
+            &cancellation,
+        )
+        .unwrap() else {
+            panic!("selected receiver request");
+        };
+        request = opened;
+    }
+    let mut lazy = GoScopedReceiverRequest {
+        analyzer,
+        snapshot,
+        request,
+    };
+    assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
+    let file = fixture.file(CALLER);
+    let tree = crate::analyzer::usages::get_definition::go::parse_go_tree(source).unwrap();
+    let site = site_for(source, "Do");
+    let query = BoundedReceiverQuery {
+        analyzer,
+        file: &file,
+        source,
+        tree: Some(&tree),
+        site: &site,
+        budget: ReceiverAnalysisBudget::default(),
+        cancellation: None,
+    };
+    let answer = complete(ReceiverRequest::resolve_definition(&mut lazy, query));
+    assert_eq!(answer.resolved_reference_target(), Some("sync.Once.Do"));
+    let _old = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_semantic_model_overlay(
+        analyzer,
+        Some(old_overlay),
+    );
+    let refused = complete(ReceiverRequest::resolve_definition(&mut lazy, query));
+    assert_eq!(refused.status, DefinitionLookupStatus::Unavailable);
 }

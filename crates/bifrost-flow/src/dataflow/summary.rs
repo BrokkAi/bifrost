@@ -1,5 +1,7 @@
 //! Demand-driven in-memory summary tabulation.
 
+use crate::analyzer::{IAnalyzer, ReadKey, ReadLedger, capture_query_reads};
+use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -33,10 +35,42 @@ use super::{
 
 const ZERO_FACT_ID: FactId = FactId::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static CANCEL_NEXT_REUSABLE_ENTRY_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAST_REUSABLE_ENTRY_RESERVATION: std::cell::Cell<Option<SolverWork>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn cancel_next_reusable_entry_before_commit() {
+    CANCEL_NEXT_REUSABLE_ENTRY_BEFORE_COMMIT.with(|armed| armed.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn take_last_reusable_entry_reservation() -> Option<SolverWork> {
+    LAST_REUSABLE_ENTRY_RESERVATION.with(std::cell::Cell::take)
+}
+
 type CachedCallOutcome = Arc<SemanticOutcome<CallTransferSet>>;
 type CachedExitOutcome = Arc<SemanticOutcome<Arc<IcfgExitProfile>>>;
 type ExitCacheKey = (ProcedureHandle, ProgramPointId, ProgramPointId);
 type ProviderCacheLookup<T> = Result<(T, bool), SolverTermination>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberReadReceipt {
+    pub keys: HashSet<ReadKey>,
+    pub channels: ReadChannels,
+}
+
+impl MemberReadReceipt {
+    fn absorb(&mut self, reads: &ReadLedger) {
+        self.keys.extend(reads.keys());
+        let channels = reads.channels();
+        self.channels.unattributed_reads |= usize::from(channels.unattributed_reads != 0);
+        self.channels.execution_dependences |= usize::from(channels.execution_dependences != 0);
+        self.channels.reuse_refused |= channels.reuse_refused;
+    }
+}
 
 fn edge_needs_coverage(
     request: &DataflowRequest<'_>,
@@ -56,6 +90,27 @@ pub struct ReusableEndSummary<Fact> {
     pub exit_kind: crate::analyzer::semantic::ReturnTransferKind,
     pub exit_fact: Fact,
     pub qualities: Box<[PathQuality]>,
+    pub evidence: Option<Box<[QualityEvidence<Fact>]>>,
+}
+
+/// A complete, live witness for one quality in a reusable row.
+///
+/// Under strict witness retention every row of a served entry carries one of
+/// these for each quality in its `qualities`, paired by quality, never by
+/// position. The solver validates and stages them before it installs the
+/// entry; any row without matching evidence makes the lookup a miss.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityEvidence<Fact> {
+    pub quality: PathQuality,
+    pub fragment: WitnessFragment<Fact>,
+}
+
+/// A callee-relative path from its entry fact to a row's fact: a seed at the
+/// callee entry, then edges, as a body solve's reconstruction emits them.
+/// A truncated, gap-bearing or omitted path is never a fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessFragment<Fact> {
+    pub steps: Box<[super::ReusableWitnessStep<Fact>]>,
 }
 
 /// One query-visible internal observation retained by a reusable summary.
@@ -72,6 +127,7 @@ pub struct ReusableReachedFact<Fact> {
     pub point: ProgramPointHandle,
     pub fact: Fact,
     pub qualities: Box<[PathQuality]>,
+    pub evidence: Option<Box<[QualityEvidence<Fact>]>>,
 }
 
 /// Whether a summarized callee sits in a call cycle that contains the procedure
@@ -289,13 +345,28 @@ impl<Fact> SummaryPointSeed<Fact> {
 ///
 /// The root's declared entry point is implicit. The distinguished zero fact is
 /// always added as its own relative entry relation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SummarySolveInput<'input, Fact> {
     root: &'input ProcedureHandle,
     entry_facts: &'input [Fact],
     point_seeds: &'input [SummaryPointSeed<Fact>],
     witness_retention: WitnessRetentionLimits,
     call_context_limits: Option<OracleLimits>,
+    member_read_analyzer: Option<&'input dyn IAnalyzer>,
+}
+
+impl<Fact: std::fmt::Debug> std::fmt::Debug for SummarySolveInput<'_, Fact> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SummarySolveInput")
+            .field("root", &self.root)
+            .field("entry_facts", &self.entry_facts)
+            .field("point_seeds", &self.point_seeds)
+            .field("witness_retention", &self.witness_retention)
+            .field("call_context_limits", &self.call_context_limits)
+            .field("member_read_receipts", &self.member_read_analyzer.is_some())
+            .finish()
+    }
 }
 
 impl<'input, Fact> SummarySolveInput<'input, Fact> {
@@ -306,6 +377,7 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
             point_seeds: &[],
             witness_retention: WitnessRetentionLimits::disabled(),
             call_context_limits: None,
+            member_read_analyzer: None,
         }
     }
 
@@ -313,6 +385,12 @@ impl<'input, Fact> SummarySolveInput<'input, Fact> {
     /// Reusable context-independent summaries are refused in this mode.
     pub const fn with_call_context(mut self, limits: OracleLimits) -> Self {
         self.call_context_limits = Some(limits);
+        self
+    }
+
+    /// Accumulate the analyzer reads made while processing each member.
+    pub const fn with_member_read_receipts(mut self, analyzer: &'input dyn IAnalyzer) -> Self {
+        self.member_read_analyzer = Some(analyzer);
         self
     }
 
@@ -381,6 +459,125 @@ struct EndSummaryRow {
     exit: Arc<IcfgExitProfile>,
     qualities: PathQualityFrontier,
     witnesses: WitnessAlternatives,
+}
+
+/// Whether `evidence` is complete, valid witness evidence for one reusable row.
+///
+/// There must be exactly one fragment for each quality in `qualities`, and
+/// each fragment must be the path a body solve would have retained for that
+/// quality: a seed at the callee entry with the entry fact, then edges with
+/// point and fact continuity, ending at the row's point with the row's fact,
+/// within the default reconstruction step limit, and degrading to exactly
+/// the quality it serves. Gap, omitted and receiver steps are never part of an
+/// admitted fragment: a body solve's Step nodes never carry them.
+fn reusable_row_evidence_admits<Fact: Eq>(
+    evidence: Option<&[QualityEvidence<Fact>]>,
+    qualities: &[PathQuality],
+    entry_point: &ProgramPointHandle,
+    entry_fact: &Fact,
+    end_point: &ProgramPointHandle,
+    end_fact: &Fact,
+) -> bool {
+    let Some(evidence) = evidence else {
+        return false;
+    };
+    let served = qualities.iter().copied().collect::<HashSet<_>>();
+    let carried = evidence
+        .iter()
+        .map(|evidence| evidence.quality)
+        .collect::<HashSet<_>>();
+    if served != carried || carried.len() != evidence.len() {
+        return false;
+    }
+    evidence.iter().all(|evidence| {
+        fragment_quality(
+            &evidence.fragment.steps,
+            entry_point,
+            entry_fact,
+            end_point,
+            end_fact,
+        ) == Some(evidence.quality)
+    })
+}
+
+/// The quality of a structurally valid fragment, or `None` when it is not one.
+fn fragment_quality<Fact: Eq>(
+    steps: &[super::ReusableWitnessStep<Fact>],
+    entry_point: &ProgramPointHandle,
+    entry_fact: &Fact,
+    end_point: &ProgramPointHandle,
+    end_fact: &Fact,
+) -> Option<PathQuality> {
+    let (seed, edges) = steps.split_first()?;
+    if steps.len() > super::WitnessReconstructionLimits::default().max_steps()
+        || seed.kind != super::SummaryWitnessStepKind::Seed
+        || &seed.source != entry_point
+        || seed.target.is_some()
+        || seed.origin.is_some()
+        || seed.boundary.is_some()
+        || seed.receiver_operand.is_some()
+        || !matches!(seed.proof, ProofStatus::Proven)
+        || !matches!(seed.completeness, EvidenceCompleteness::Complete)
+        || &seed.input_fact != entry_fact
+        || &seed.output_fact != entry_fact
+    {
+        return None;
+    }
+    let mut quality = PathQuality::PROVEN_COMPLETE;
+    let mut previous = seed;
+    for step in edges {
+        if !matches!(step.kind, super::SummaryWitnessStepKind::Edge(_))
+            || step.target.is_none()
+            || step.receiver_operand.is_some()
+            || &step.source != previous.output_point()
+            || step.input_fact != previous.output_fact
+        {
+            return None;
+        }
+        quality = quality.through_evidence(&step.proof, &step.completeness);
+        previous = step;
+    }
+    (previous.output_point() == end_point && &previous.output_fact == end_fact).then_some(quality)
+}
+
+/// Stage an admitted fragment as a chain of Step nodes and return the last
+/// node with its quality. A cap refusal leaves the staged nodes uncommitted.
+fn stage_fragment_chain<Fact: Copy + Eq + std::hash::Hash>(
+    arena: &WitnessArena,
+    steps: &[super::ReusableWitnessStep<Fact>],
+    fact_ids: &HashMap<Fact, FactId>,
+    remaining_relations: Option<usize>,
+    staged_nodes: &mut Vec<(WitnessEvidenceId, WitnessEvidenceNode)>,
+    staged_bytes: &mut usize,
+) -> Result<Option<(WitnessEvidenceId, PathQuality)>, SummaryDataflowError> {
+    let mut predecessor = None;
+    for step in steps {
+        let node = WitnessEvidenceNode::fragment_step(
+            predecessor,
+            step.bind(fact_ids[&step.input_fact], fact_ids[&step.output_fact]),
+        );
+        let quality = node.quality();
+        let id = arena
+            .stage_fragment_node(
+                node,
+                remaining_relations,
+                WitnessStaging::new(staged_nodes, staged_bytes),
+            )
+            .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow { index })?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        predecessor = Some((id, quality));
+    }
+    Ok(Some(predecessor.expect("admitted fragments are not empty")))
+}
+
+// A reusable entry is prepared in full before any of its rows enter the solver.
+struct PreparedReusableExit {
+    key: EndSummaryKey,
+    exit: Arc<IcfgExitProfile>,
+    quality: PathQuality,
+    frontier_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -607,7 +804,7 @@ struct StagedIncomingPublication {
     activated_evidence: Option<WitnessEvidenceId>,
 }
 
-struct SummaryState<Fact> {
+struct SummaryState<'a, Fact> {
     zero_fact: Fact,
     facts: Vec<Fact>,
     fact_ids: HashMap<Fact, FactId>,
@@ -632,10 +829,22 @@ struct SummaryState<Fact> {
     incoming_ids: HashMap<IncomingKey, usize>,
     incoming_by_entry: HashMap<EntryKey, Vec<usize>>,
     reusable_entries: HashSet<EntryKey>,
+    /// Reusable entries installed without witness evidence, which happens only
+    /// under best-effort retention. Only these may apply a summary without
+    /// active summary evidence.
+    evidence_free_entries: HashSet<EntryKey>,
+    caller_conversions: HashSet<CallSiteHandle>,
     call_cache: HashMap<(CallSiteHandle, usize), CachedCallOutcome>,
     exit_cache: HashMap<ExitCacheKey, CachedExitOutcome>,
     call_to_return_cache: HashMap<(CallSiteHandle, usize), Arc<[ProcedureIcfgEdge]>>,
     matched_return_cache: HashMap<MatchedReturnCacheKey, Arc<CachedMatchedReturnProjection>>,
+    member_read_analyzer: Option<&'a dyn IAnalyzer>,
+    member_receipts: Option<HashMap<ProcedureHandle, MemberReadReceipt>>,
+    active_member: Option<ProcedureHandle>,
+    call_receipts: HashMap<(CallSiteHandle, usize), Arc<ReadLedger>>,
+    exit_receipts: HashMap<ExitCacheKey, Arc<ReadLedger>>,
+    call_to_return_receipts: HashMap<(CallSiteHandle, usize), Vec<Arc<ReadLedger>>>,
+    matched_return_receipts: HashMap<MatchedReturnCacheKey, Vec<Arc<ReadLedger>>>,
     transfer_scratch: TransferScratch<Fact>,
     unproven_edges: HashSet<Arc<SummaryEdge>>,
     partial_edges: HashSet<Arc<SummaryEdge>>,
@@ -643,14 +852,50 @@ struct SummaryState<Fact> {
     metrics: SummaryMetrics,
     witness_arena: WitnessArena,
     best_effort_witness_retention: bool,
+    complete_reusable_evidence: bool,
     witness_retention_truncated: bool,
 }
 
-impl<Fact> SummaryState<Fact>
+impl<'a, Fact> SummaryState<'a, Fact>
 where
     Fact: Copy + Eq + std::hash::Hash + Ord,
 {
-    fn new(zero_fact: Fact, witness_retention: WitnessRetentionLimits) -> Self {
+    fn capture_member<T>(
+        &mut self,
+        member: ProcedureHandle,
+        work: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let Some(analyzer) = self.member_read_analyzer else {
+            return work(self);
+        };
+        let previous = self.active_member.replace(member.clone());
+        let (result, reads) = capture_query_reads(analyzer, || work(self));
+        self.active_member = previous;
+        self.member_receipts
+            .as_mut()
+            .expect("enabled receipts")
+            .entry(member)
+            .or_default()
+            .absorb(&reads);
+        result
+    }
+
+    fn absorb_cached_reads(&mut self, reads: &ReadLedger) {
+        if let Some(member) = &self.active_member {
+            self.member_receipts
+                .as_mut()
+                .expect("enabled receipts")
+                .entry(member.clone())
+                .or_default()
+                .absorb(reads);
+        }
+    }
+
+    fn new(
+        zero_fact: Fact,
+        witness_retention: WitnessRetentionLimits,
+        member_read_analyzer: Option<&'a dyn IAnalyzer>,
+    ) -> Self {
         let best_effort_witness_retention = witness_retention.is_best_effort();
         Self {
             zero_fact,
@@ -673,10 +918,19 @@ where
             incoming_ids: HashMap::default(),
             incoming_by_entry: HashMap::default(),
             reusable_entries: HashSet::default(),
+            evidence_free_entries: HashSet::default(),
+            caller_conversions: HashSet::default(),
             call_cache: HashMap::default(),
             exit_cache: HashMap::default(),
             call_to_return_cache: HashMap::default(),
             matched_return_cache: HashMap::default(),
+            member_read_analyzer,
+            member_receipts: member_read_analyzer.map(|_| HashMap::default()),
+            active_member: None,
+            call_receipts: HashMap::default(),
+            exit_receipts: HashMap::default(),
+            call_to_return_receipts: HashMap::default(),
+            matched_return_receipts: HashMap::default(),
             transfer_scratch: TransferScratch::new(),
             unproven_edges: HashSet::default(),
             partial_edges: HashSet::default(),
@@ -684,6 +938,7 @@ where
             metrics: SummaryMetrics::default(),
             witness_arena: WitnessArena::new(witness_retention),
             best_effort_witness_retention,
+            complete_reusable_evidence: witness_retention.requires_complete_reusable_evidence(),
             witness_retention_truncated: false,
         }
     }
@@ -1323,23 +1578,36 @@ where
             .procedure()
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope summary call"))?;
-        if let Some(cached) = self.call_cache.get(&(origin.clone(), context)) {
+        if let Some(cached) = self.call_cache.get(&(origin.clone(), context)).cloned() {
+            if let Some(reads) = self.call_receipts.get(&(origin.clone(), context)).cloned() {
+                self.absorb_cached_reads(&reads);
+            }
             self.metrics.provider_cache_hits = self.metrics.provider_cache_hits.saturating_add(1);
-            return Ok(Ok((Arc::clone(cached), false)));
+            return Ok(Ok((cached, false)));
         }
         if let Some(termination) = self.reserve_provider_materialization(request) {
             return Ok(Err(termination));
         }
         let mut semantic_request = SemanticRequest::new(semantic_budget, request.cancellation);
-        let outcome = provider
-            .call_transfers_in_context(
+        let mut build = || {
+            provider.call_transfers_in_context(
                 point.procedure(),
                 call,
                 &self.contexts[context],
                 &mut semantic_request,
-            )?
-            .map(canonicalize_call_transfer_set);
+            )
+        };
+        let (outcome, reads) = if let Some(analyzer) = self.member_read_analyzer {
+            let (outcome, reads) = capture_query_reads(analyzer, build);
+            (outcome?, Some(reads))
+        } else {
+            (build()?, None)
+        };
+        let outcome = outcome.map(canonicalize_call_transfer_set);
         if let Some(transfers) = outcome.available_value() {
+            if transfers.caller_conversion_may_run_user_code {
+                self.caller_conversions.insert(origin.clone());
+            }
             let semantic_call = point
                 .procedure()
                 .semantics()
@@ -1355,7 +1623,10 @@ where
         }
         let outcome = Arc::new(outcome);
         self.call_cache
-            .insert((origin, context), Arc::clone(&outcome));
+            .insert((origin.clone(), context), Arc::clone(&outcome));
+        if let Some(reads) = reads {
+            self.call_receipts.insert((origin, context), reads);
+        }
         Ok(Ok((outcome, true)))
     }
 
@@ -1374,21 +1645,127 @@ where
             return Ok(Err(SolverTermination::Cancelled));
         }
         let cache_key = (point.procedure().clone(), entry.id(), point.id());
-        if let Some(cached) = self.exit_cache.get(&cache_key) {
+        if let Some(cached) = self.exit_cache.get(&cache_key).cloned() {
+            if let Some(reads) = self.exit_receipts.get(&cache_key).cloned() {
+                self.absorb_cached_reads(&reads);
+            }
             self.metrics.provider_cache_hits = self.metrics.provider_cache_hits.saturating_add(1);
-            return Ok(Ok((Arc::clone(cached), false)));
+            return Ok(Ok((cached, false)));
         }
         if let Some(termination) = self.reserve_provider_materialization(request) {
             return Ok(Err(termination));
         }
         let mut semantic_request = SemanticRequest::new(semantic_budget, request.cancellation);
-        let outcome = provider.exit_profile(entry, point, &mut semantic_request)?;
+        let mut build = || provider.exit_profile(entry, point, &mut semantic_request);
+        let (outcome, reads) = if let Some(analyzer) = self.member_read_analyzer {
+            let (outcome, reads) = capture_query_reads(analyzer, build);
+            (outcome?, Some(reads))
+        } else {
+            (build()?, None)
+        };
         if let Some(profile) = outcome.available_value() {
             crate::analyzer::semantic::icfg::validate_exit_profile(entry, point, profile)?;
         }
         let outcome = Arc::new(outcome.map(Arc::new));
-        self.exit_cache.insert(cache_key, Arc::clone(&outcome));
+        self.exit_cache
+            .insert(cache_key.clone(), Arc::clone(&outcome));
+        if let Some(reads) = reads {
+            self.exit_receipts.insert(cache_key, reads);
+        }
         Ok(Ok((outcome, true)))
+    }
+
+    fn process_queued<P, Provider, Reusable>(
+        &mut self,
+        queued: QueuedPath,
+        provider: &Provider,
+        reusable: &mut Reusable,
+        problem: &P,
+        semantic_budget: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, SummaryDataflowError>
+    where
+        P: DistributiveDataflowProblem<Fact = Fact>,
+        Provider: IcfgProvider + ?Sized,
+        Reusable: ReusableSummaryProvider<Fact> + ?Sized,
+    {
+        if request.cancellation.is_cancelled() {
+            return Ok(Some(SolverTermination::Cancelled));
+        }
+        if queued.key.point == queued.key.entry.entry_point
+            && self.reusable_entries.contains(&queued.key.entry)
+        {
+            return Ok(None);
+        }
+        let frontier = *self
+            .reached
+            .get(&queued.key)
+            .expect("queued summary paths remain in the reached table");
+        if !frontier.contains(queued.quality) {
+            return Ok(None);
+        }
+        match (self.witness_arena.is_enabled(), queued.evidence) {
+            (true, Some(evidence))
+                if self
+                    .path_witnesses
+                    .get(&queued.key)
+                    .is_some_and(|witnesses| witnesses.contains(queued.quality, evidence)) => {}
+            (true, _) => {
+                return Err(SummaryDataflowError::WitnessInvariant(
+                    "queued path does not have active witness evidence",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(SummaryDataflowError::WitnessInvariant(
+                    "disabled witness retention queued an evidence ID",
+                ));
+            }
+            (false, None) => {}
+        }
+
+        let procedure = self.procedures[queued.key.entry.procedure].clone();
+        let point = procedure
+            .point_handle(queued.key.point)
+            .ok_or_else(|| SemanticProviderError::internal("summary worklist point is stale"))?;
+        let fact = self.facts[queued.key.fact.index()];
+
+        if queued.key.entry.entry_fact == ZERO_FACT_ID
+            && queued.key.fact == ZERO_FACT_ID
+            && let Some(termination) =
+                self.activate_point_seeds(&point, queued.key.entry, queued.quality, request)?
+        {
+            return Ok(Some(termination));
+        }
+
+        if is_procedure_exit(&point) {
+            if let Some(termination) =
+                self.process_exit(provider, &point, queued, problem, semantic_budget, request)?
+            {
+                return Ok(Some(termination));
+            }
+            return Ok(None);
+        }
+
+        if let Some(call) = crate::analyzer::semantic::icfg::invoked_call_at(&point)? {
+            if let Some(termination) = self.process_call(
+                provider,
+                reusable,
+                problem,
+                &point,
+                call,
+                queued,
+                fact,
+                semantic_budget,
+                request,
+            )? {
+                return Ok(Some(termination));
+            }
+        } else if let Some(termination) =
+            self.process_local_edges(problem, &point, queued, None, request)?
+        {
+            return Ok(Some(termination));
+        }
+        Ok(None)
     }
 
     fn propagate<P, Provider, Reusable>(
@@ -1405,80 +1782,18 @@ where
         Reusable: ReusableSummaryProvider<Fact> + ?Sized,
     {
         while let Some(queued) = self.worklist.pop_front() {
-            if request.cancellation.is_cancelled() {
-                return Ok(SolverTermination::Cancelled);
-            }
-            if queued.key.point == queued.key.entry.entry_point
-                && self.reusable_entries.contains(&queued.key.entry)
-            {
-                continue;
-            }
-            let frontier = *self
-                .reached
-                .get(&queued.key)
-                .expect("queued summary paths remain in the reached table");
-            if !frontier.contains(queued.quality) {
-                continue;
-            }
-            match (self.witness_arena.is_enabled(), queued.evidence) {
-                (true, Some(evidence))
-                    if self
-                        .path_witnesses
-                        .get(&queued.key)
-                        .is_some_and(|witnesses| witnesses.contains(queued.quality, evidence)) => {}
-                (true, _) => {
-                    return Err(SummaryDataflowError::WitnessInvariant(
-                        "queued path does not have active witness evidence",
-                    ));
-                }
-                (false, Some(_)) => {
-                    return Err(SummaryDataflowError::WitnessInvariant(
-                        "disabled witness retention queued an evidence ID",
-                    ));
-                }
-                (false, None) => {}
-            }
-
-            let procedure = self.procedures[queued.key.entry.procedure].clone();
-            let point = procedure.point_handle(queued.key.point).ok_or_else(|| {
-                SemanticProviderError::internal("summary worklist point is stale")
-            })?;
-            let fact = self.facts[queued.key.fact.index()];
-
-            if queued.key.entry.entry_fact == ZERO_FACT_ID
-                && queued.key.fact == ZERO_FACT_ID
-                && let Some(termination) =
-                    self.activate_point_seeds(&point, queued.key.entry, queued.quality, request)?
-            {
-                return Ok(termination);
-            }
-
-            if is_procedure_exit(&point) {
-                if let Some(termination) =
-                    self.process_exit(provider, &point, queued, problem, semantic_budget, request)?
-                {
-                    return Ok(termination);
-                }
-                continue;
-            }
-
-            if let Some(call) = crate::analyzer::semantic::icfg::invoked_call_at(&point)? {
-                if let Some(termination) = self.process_call(
+            let member = self.procedures[queued.key.entry.procedure].clone();
+            let result = self.capture_member(member, |state| {
+                state.process_queued(
+                    queued,
                     provider,
                     reusable,
                     problem,
-                    &point,
-                    call,
-                    queued,
-                    fact,
                     semantic_budget,
                     request,
-                )? {
-                    return Ok(termination);
-                }
-            } else if let Some(termination) =
-                self.process_local_edges(problem, &point, queued, None, request)?
-            {
+                )
+            });
+            if let Some(termination) = result? {
                 return Ok(termination);
             }
         }
@@ -1604,6 +1919,7 @@ where
         if let Some(transfers) = outcome.available_value() {
             let call_to_return_edges = if newly_materialized {
                 let mut projected_edges = Vec::new();
+                let mut projection_reads = Vec::new();
                 for boundary in &transfers.boundaries {
                     if request.cancellation.is_cancelled() {
                         return Ok(Some(SolverTermination::Cancelled));
@@ -1620,11 +1936,20 @@ where
                     ) {
                         return Ok(Some(termination));
                     }
-                    let projection = crate::analyzer::semantic::icfg::project_call_boundary(
-                        caller,
-                        semantic_call,
-                        boundary,
-                    )?;
+                    let project = || {
+                        crate::analyzer::semantic::icfg::project_call_boundary(
+                            caller,
+                            semantic_call,
+                            boundary,
+                        )
+                    };
+                    let projection = if let Some(analyzer) = self.member_read_analyzer {
+                        let (projection, reads) = capture_query_reads(analyzer, project);
+                        projection_reads.push(reads);
+                        projection?
+                    } else {
+                        project()?
+                    };
                     for boundary in projection.boundaries {
                         if let Some(termination) =
                             self.observe_boundary(boundary, queued.key.entry.context, request)
@@ -1682,6 +2007,16 @@ where
                         });
                     }
                 }
+                // A model replaces the callee, not caller-side argument evaluation.
+                if transfers.caller_conversion_may_run_user_code {
+                    for edge in &mut projected_edges {
+                        if matches!(edge.completeness, EvidenceCompleteness::Complete) {
+                            edge.completeness = EvidenceCompleteness::Partial(
+                                "an argument conversion may run user code".into(),
+                            );
+                        }
+                    }
+                }
                 projected_edges.sort_by(compare_procedure_edges);
                 projected_edges.dedup();
                 for edge in &projected_edges {
@@ -1699,8 +2034,27 @@ where
                     (origin.clone(), queued.key.entry.context),
                     Arc::clone(&projected_edges),
                 );
+                if let Some(reads) = self
+                    .call_receipts
+                    .get(&(origin.clone(), queued.key.entry.context))
+                {
+                    projection_reads.push(Arc::clone(reads));
+                }
+                if self.member_read_analyzer.is_some() {
+                    self.call_to_return_receipts
+                        .insert((origin.clone(), queued.key.entry.context), projection_reads);
+                }
                 projected_edges
             } else {
+                if let Some(reads) = self
+                    .call_to_return_receipts
+                    .get(&(origin.clone(), queued.key.entry.context))
+                    .cloned()
+                {
+                    for receipt in &reads {
+                        self.absorb_cached_reads(receipt);
+                    }
+                }
                 self.call_to_return_cache
                     .get(&(origin.clone(), queued.key.entry.context))
                     .cloned()
@@ -1750,6 +2104,7 @@ where
                     .quality
                     .through_evidence(&edge.proof, &edge.completeness);
                 let descriptor = descriptor(&edge)
+                    .with_caller_conversion(self.caller_conversions.contains(&origin))
                     .with_call_transfer(transfer)
                     .with_call_context(&self.contexts[queued.key.entry.context])
                     .with_summary_entry_fact(self.facts[queued.key.entry.entry_fact.index()]);
@@ -1873,7 +2228,15 @@ where
             }) {
                 continue;
             }
-            let projected = (edge.kind, edge.target_point);
+            let proven = crate::analyzer::semantic::statement_entries::control_edge_proves_route(
+                semantics,
+                edge.evidence,
+            );
+            let projected = (
+                edge.kind,
+                edge.target_point,
+                (!proven).then_some(edge.evidence),
+            );
             if previous_projected == Some(projected) {
                 continue;
             }
@@ -1881,13 +2244,24 @@ where
             let target = procedure.point_handle(edge.target_point).ok_or_else(|| {
                 SemanticProviderError::internal("summary local edge target is stale")
             })?;
+            let evidence = semantics
+                .evidence_row(edge.evidence)
+                .expect("validated local edge has evidence");
             let owned = ProcedureIcfgEdge {
                 source: point.clone(),
                 target,
                 kind: IcfgEdgeKind::Intraprocedural(edge.kind),
                 origin: None,
-                proof: ProofStatus::Proven,
-                completeness: EvidenceCompleteness::Complete,
+                proof: if proven {
+                    ProofStatus::Proven
+                } else {
+                    evidence.proof.clone()
+                },
+                completeness: if proven {
+                    EvidenceCompleteness::Complete
+                } else {
+                    evidence.completeness.clone()
+                },
                 boundary: None,
             };
             if let Some(termination) = self.propagate_owned_edge(
@@ -1928,7 +2302,13 @@ where
         }
         let output_quality = input_quality.through_evidence(&edge.proof, &edge.completeness);
         let target = edge.target.id();
-        let flow = descriptor(edge).with_summary_entry_fact(self.facts[entry.entry_fact.index()]);
+        let flow = descriptor(edge)
+            .with_caller_conversion(
+                edge.origin
+                    .as_ref()
+                    .is_some_and(|call| self.caller_conversions.contains(call)),
+            )
+            .with_summary_entry_fact(self.facts[entry.entry_fact.index()]);
         let outputs = match evaluate_transfer(
             problem,
             flow,
@@ -2009,11 +2389,6 @@ where
                 entry_fact: entry_fact_id,
             };
             if self.reusable_entries.contains(&entry) {
-                continue;
-            }
-            if self.witness_arena.is_enabled() && !self.best_effort_witness_retention {
-                self.metrics.reusable_summary_misses =
-                    self.metrics.reusable_summary_misses.saturating_add(1);
                 continue;
             }
             let root = self.procedures[self.root].clone();
@@ -2131,119 +2506,482 @@ where
                     self.metrics.reusable_summary_misses.saturating_add(1);
                 continue;
             }
-            if self.witness_arena.is_enabled() {
-                self.mark_reusable_witnesses_omitted();
-            }
-
-            let mut facts = summary
-                .exits
-                .iter()
-                .map(|row| row.exit_fact)
-                .chain(summary.reached.iter().map(|row| row.fact))
-                .collect::<Vec<_>>();
-            facts.sort_unstable();
-            facts.dedup();
-            let Some(staged) = self.stage_facts(&facts, request)? else {
-                return Ok(Some(SolverTermination::Cancelled));
-            };
-            let staged_ids = facts
-                .iter()
-                .copied()
-                .zip(staged.ids.iter().copied())
-                .collect::<HashMap<_, _>>();
-            let new_reached_states = summary
-                .reached
-                .iter()
-                .filter(|row| {
-                    !self.reached.contains_key(&PathEdgeKey {
-                        entry,
-                        point: row.point.id(),
-                        fact: staged_ids[&row.fact],
-                    })
-                })
-                .count();
-            if let Some(termination) = self.reserve_publication(
-                SolverWork {
-                    interned_facts: staged.new_facts.len(),
-                    reached_states: new_reached_states,
-                    ..SolverWork::default()
-                },
-                0,
-                request,
-            ) {
-                return Ok(Some(termination));
-            }
-            self.commit_facts(staged.new_facts);
-            self.reusable_entries.insert(entry);
-            self.metrics.reusable_summary_hits =
-                self.metrics.reusable_summary_hits.saturating_add(1);
-
-            for row in summary.reached {
-                let fact = self.fact_ids[&row.fact];
-                let path = PathEdgeKey {
-                    entry,
-                    point: row.point.id(),
-                    fact,
-                };
-                let frontier = self.reached.entry(path).or_default();
-                for quality in row.qualities {
-                    frontier.insert(quality);
-                }
-                self.metrics.reusable_observations =
-                    self.metrics.reusable_observations.saturating_add(1);
-            }
-
-            for row in summary.exits {
-                let exit_point = match row.exit_kind {
-                    crate::analyzer::semantic::ReturnTransferKind::Normal => {
-                        transfer.callee.semantics().normal_exit_point()
-                    }
-                    crate::analyzer::semantic::ReturnTransferKind::Exceptional => {
-                        transfer.callee.semantics().exceptional_exit_point()
-                    }
-                };
-                let exit_point = transfer.callee.point_handle(exit_point).ok_or_else(|| {
-                    SemanticProviderError::internal("reusable callee exit point is stale")
-                })?;
-                let (outcome, _) = match self.cached_exit_profile(
+            let member = transfer.callee.clone();
+            if let Some(termination) = self.capture_member(member, |state| {
+                state.install_reusable_entry(
                     provider,
-                    &transfer.callee_entry,
-                    &exit_point,
+                    problem,
+                    transfer,
+                    entry,
+                    summary,
                     semantic_budget,
                     request,
-                )? {
-                    Ok(outcome) => outcome,
-                    Err(termination) => return Ok(Some(termination)),
-                };
-                if let Some(termination) = self.observe_semantic_outcome(
-                    &exit_point,
-                    None,
-                    entry.context,
-                    outcome.as_ref(),
-                    request,
-                ) {
-                    return Ok(Some(termination));
+                )
+            })? {
+                return Ok(Some(termination));
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_reusable_entry<P, Provider>(
+        &mut self,
+        provider: &Provider,
+        problem: &P,
+        transfer: &CallTransfer,
+        entry: EntryKey,
+        summary: ReusableProcedureSummary<Fact>,
+        semantic_budget: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, SummaryDataflowError>
+    where
+        P: DistributiveDataflowProblem<Fact = Fact>,
+        Provider: IcfgProvider + ?Sized,
+    {
+        // Every served entry must bring complete, valid evidence. A bounded
+        // arena may refuse the hit before committing any row or witness node.
+        if self.complete_reusable_evidence && !self.witness_arena.is_enabled() {
+            self.metrics.reusable_summary_misses =
+                self.metrics.reusable_summary_misses.saturating_add(1);
+            return Ok(None);
+        }
+        let strict = self.witness_arena.is_enabled() && self.complete_reusable_evidence;
+        let entry_fact = self.facts[entry.entry_fact.index()];
+        // Prepare profiles and post-gap qualities before admitting any row.
+        // Provider callbacks and their request-local caches may already have run.
+        let mut boundaries = HashSet::default();
+        let mut exit_rows = Vec::new();
+        for (index, row) in summary.exits.iter().enumerate() {
+            let point_id = match row.exit_kind {
+                crate::analyzer::semantic::ReturnTransferKind::Normal => {
+                    transfer.callee.semantics().normal_exit_point()
                 }
-                let Some(exit) = outcome.available_value().cloned() else {
-                    continue;
-                };
-                let path = PathEdgeKey {
+                crate::analyzer::semantic::ReturnTransferKind::Exceptional => {
+                    transfer.callee.semantics().exceptional_exit_point()
+                }
+            };
+            let point = transfer.callee.point_handle(point_id).ok_or_else(|| {
+                SemanticProviderError::internal("reusable callee exit point is stale")
+            })?;
+            let (outcome, _) = match self.cached_exit_profile(
+                provider,
+                &transfer.callee_entry,
+                &point,
+                semantic_budget,
+                request,
+            )? {
+                Ok(value) => value,
+                Err(termination) => return Ok(Some(termination)),
+            };
+            let status = SummarySemanticStatus::from_outcome(outcome.as_ref());
+            if !status.is_complete() {
+                boundaries.insert(SummaryBoundary::new(
+                    point.clone(),
+                    None,
+                    SummaryBoundaryKind::Semantic(status),
+                    &self.contexts[entry.context],
+                ));
+            }
+            let Some(exit) = outcome.available_value().cloned() else {
+                continue;
+            };
+            if strict
+                && !reusable_row_evidence_admits(
+                    row.evidence.as_deref(),
+                    &row.qualities,
+                    &transfer.callee_entry,
+                    &entry_fact,
+                    &point,
+                    &row.exit_fact,
+                )
+            {
+                self.metrics.reusable_summary_misses =
+                    self.metrics.reusable_summary_misses.saturating_add(1);
+                return Ok(None);
+            }
+            exit_rows.push((index, point, exit));
+        }
+        if strict
+            && summary.reached.iter().any(|row| {
+                !reusable_row_evidence_admits(
+                    row.evidence.as_deref(),
+                    &row.qualities,
+                    &transfer.callee_entry,
+                    &entry_fact,
+                    &row.point,
+                    &row.fact,
+                )
+            })
+        {
+            self.metrics.reusable_summary_misses =
+                self.metrics.reusable_summary_misses.saturating_add(1);
+            return Ok(None);
+        }
+
+        let mut facts = summary
+            .exits
+            .iter()
+            .map(|row| row.exit_fact)
+            .chain(summary.reached.iter().map(|row| row.fact))
+            .collect::<Vec<_>>();
+        if strict {
+            let evidence = summary
+                .exits
+                .iter()
+                .filter_map(|row| row.evidence.as_deref())
+                .chain(
+                    summary
+                        .reached
+                        .iter()
+                        .filter_map(|row| row.evidence.as_deref()),
+                );
+            for step in evidence
+                .flatten()
+                .flat_map(|evidence| evidence.fragment.steps.iter())
+            {
+                facts.push(step.input_fact);
+                facts.push(step.output_fact);
+            }
+        }
+        facts.sort_unstable();
+        facts.dedup();
+        let Some(staged) = self.stage_facts(&facts, request)? else {
+            return Ok(Some(SolverTermination::Cancelled));
+        };
+        let staged_ids = facts
+            .iter()
+            .copied()
+            .zip(staged.ids.iter().copied())
+            .collect::<HashMap<_, _>>();
+        let mut frontiers = HashMap::<EndSummaryKey, PathQualityFrontier>::default();
+        let mut prepared = Vec::new();
+        for (index, point, exit) in &exit_rows {
+            let row = &summary.exits[*index];
+            let key = EndSummaryKey {
+                entry,
+                exit_point: point.id(),
+                exit_fact: staged_ids[&row.exit_fact],
+            };
+            for &quality in row.qualities.iter() {
+                let quality = WitnessEvidenceNode::end_summary_quality(quality, exit);
+                let frontier = frontiers.entry(key).or_insert_with(|| {
+                    self.summary_ids
+                        .get(&key)
+                        .map(|&id| self.summaries[id].qualities)
+                        .unwrap_or_default()
+                });
+                let changed = frontier.insert(quality);
+                prepared.push(PreparedReusableExit {
+                    key,
+                    exit: Arc::clone(exit),
+                    quality,
+                    frontier_changed: changed,
+                });
+            }
+        }
+        let mut reached_frontiers = HashMap::<PathEdgeKey, PathQualityFrontier>::default();
+        for row in &summary.reached {
+            let key = PathEdgeKey {
+                entry,
+                point: row.point.id(),
+                fact: staged_ids[&row.fact],
+            };
+            let frontier = reached_frontiers
+                .entry(key)
+                .or_insert_with(|| self.reached.get(&key).copied().unwrap_or_default());
+            for &quality in row.qualities.iter() {
+                frontier.insert(quality);
+            }
+        }
+        let new_reached_states = reached_frontiers
+            .keys()
+            .filter(|key| !self.reached.contains_key(key))
+            .count();
+        let new_end_summaries = frontiers
+            .keys()
+            .filter(|key| !self.summary_ids.contains_key(key))
+            .count();
+        let new_boundaries = boundaries
+            .iter()
+            .filter(|boundary| !self.boundaries.contains(*boundary))
+            .count();
+
+        // Stage the admitted evidence as ordinary witness nodes, inside the one
+        // installation reservation below.
+        let mut staged_witness_nodes = Vec::new();
+        let mut staged_witness_bytes = 0usize;
+        let mut exit_witnesses = HashMap::<EndSummaryKey, WitnessAlternatives>::default();
+        let mut activated = HashMap::<(EndSummaryKey, PathQuality), WitnessEvidenceId>::default();
+        let mut reached_witnesses = HashMap::<PathEdgeKey, WitnessAlternatives>::default();
+        if strict {
+            for (index, point, exit) in &exit_rows {
+                let row = &summary.exits[*index];
+                let key = EndSummaryKey {
                     entry,
-                    point: exit_point.id(),
-                    fact: self.fact_ids[&row.exit_fact],
+                    exit_point: point.id(),
+                    exit_fact: staged_ids[&row.exit_fact],
                 };
-                for quality in row.qualities {
-                    if let Some(termination) = self.publish_end_summary(
-                        path,
-                        Arc::clone(&exit),
-                        quality,
-                        None,
-                        problem,
-                        request,
-                    )? {
-                        return Ok(Some(termination));
+                let frontier = frontiers[&key];
+                let witnesses = exit_witnesses.entry(key).or_insert_with(|| {
+                    let mut witnesses = self
+                        .summary_ids
+                        .get(&key)
+                        .map(|&id| self.summaries[id].witnesses.clone())
+                        .unwrap_or_default();
+                    witnesses.retain_frontier(frontier);
+                    witnesses
+                });
+                for evidence in row
+                    .evidence
+                    .as_deref()
+                    .expect("strict evidence was admitted")
+                {
+                    let Some((last, last_quality)) = stage_fragment_chain(
+                        &self.witness_arena,
+                        &evidence.fragment.steps,
+                        &staged_ids,
+                        self.request_witness_staging_capacity(request),
+                        &mut staged_witness_nodes,
+                        &mut staged_witness_bytes,
+                    )?
+                    else {
+                        self.metrics.reusable_summary_misses =
+                            self.metrics.reusable_summary_misses.saturating_add(1);
+                        return Ok(None);
+                    };
+                    debug_assert_eq!(last_quality, evidence.quality);
+                    let end = WitnessEvidenceNode::end_summary(
+                        last,
+                        last_quality,
+                        transfer.callee_entry.clone(),
+                        entry.entry_fact,
+                        Arc::clone(exit),
+                        key.exit_fact,
+                    );
+                    let end_quality = end.quality();
+                    let admission = self
+                        .witness_arena
+                        .stage_candidate(
+                            witnesses,
+                            end_quality,
+                            WitnessCandidateBudget::new(
+                                WitnessEvidenceNode::end_summary_retained_bytes(),
+                                self.request_witness_staging_capacity(request),
+                            ),
+                            |existing| {
+                                existing.matches_end_summary_derivation(
+                                    last,
+                                    last_quality,
+                                    &transfer.callee_entry,
+                                    entry.entry_fact,
+                                    exit,
+                                    key.exit_fact,
+                                )
+                            },
+                            || end,
+                            WitnessStaging::new(
+                                &mut staged_witness_nodes,
+                                &mut staged_witness_bytes,
+                            ),
+                        )
+                        .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow {
+                            index,
+                        })?;
+                    match admission {
+                        WitnessAdmission::Retained(id) => {
+                            activated.insert((key, end_quality), id);
+                        }
+                        WitnessAdmission::Duplicate | WitnessAdmission::Truncated => {
+                            self.metrics.reusable_summary_misses =
+                                self.metrics.reusable_summary_misses.saturating_add(1);
+                            return Ok(None);
+                        }
+                        WitnessAdmission::Exhausted => {
+                            if self.best_effort_witness_retention {
+                                self.metrics.reusable_summary_misses =
+                                    self.metrics.reusable_summary_misses.saturating_add(1);
+                                return Ok(None);
+                            }
+                            return Err(SummaryDataflowError::WitnessInvariant(
+                                "strict witness retention exhausted without a solver budget",
+                            ));
+                        }
                     }
                 }
+            }
+            for row in &summary.reached {
+                let key = PathEdgeKey {
+                    entry,
+                    point: row.point.id(),
+                    fact: staged_ids[&row.fact],
+                };
+                let frontier = reached_frontiers[&key];
+                let witnesses = reached_witnesses.entry(key).or_insert_with(|| {
+                    let mut witnesses = self.path_witnesses.get(&key).cloned().unwrap_or_default();
+                    witnesses.retain_frontier(frontier);
+                    witnesses
+                });
+                for evidence in row
+                    .evidence
+                    .as_deref()
+                    .expect("strict evidence was admitted")
+                {
+                    let (prefix, last) = evidence
+                        .fragment
+                        .steps
+                        .split_last()
+                        .map(|(last, prefix)| (prefix, last))
+                        .expect("admitted fragments are not empty");
+                    let predecessor = if prefix.is_empty() {
+                        None
+                    } else {
+                        let Some(predecessor) = stage_fragment_chain(
+                            &self.witness_arena,
+                            prefix,
+                            &staged_ids,
+                            self.request_witness_staging_capacity(request),
+                            &mut staged_witness_nodes,
+                            &mut staged_witness_bytes,
+                        )?
+                        else {
+                            self.metrics.reusable_summary_misses =
+                                self.metrics.reusable_summary_misses.saturating_add(1);
+                            return Ok(None);
+                        };
+                        Some(predecessor)
+                    };
+                    let step =
+                        last.bind(staged_ids[&last.input_fact], staged_ids[&last.output_fact]);
+                    let node = WitnessEvidenceNode::fragment_step(predecessor, step);
+                    debug_assert_eq!(node.quality(), evidence.quality);
+                    let bytes = node.retained_bytes();
+                    let admission = self
+                        .witness_arena
+                        .stage_candidate(
+                            witnesses,
+                            evidence.quality,
+                            WitnessCandidateBudget::new(
+                                bytes,
+                                self.request_witness_staging_capacity(request),
+                            ),
+                            |existing| existing == &node,
+                            || node.clone(),
+                            WitnessStaging::new(
+                                &mut staged_witness_nodes,
+                                &mut staged_witness_bytes,
+                            ),
+                        )
+                        .map_err(|index| SummaryDataflowError::WitnessEvidenceIdOverflow {
+                            index,
+                        })?;
+                    if admission == WitnessAdmission::Exhausted {
+                        if self.best_effort_witness_retention {
+                            self.metrics.reusable_summary_misses =
+                                self.metrics.reusable_summary_misses.saturating_add(1);
+                            return Ok(None);
+                        }
+                        return Err(SummaryDataflowError::WitnessInvariant(
+                            "strict witness retention exhausted without a solver budget",
+                        ));
+                    }
+                    // A duplicate is an identical alternative the solver already
+                    // retains, for example the seed at a leaf entry, so the
+                    // row's evidence is complete, as in a fresh solve. A
+                    // truncated alternative is not. Unlike an exit row, a
+                    // reached row needs no evidence id to activate.
+                    if admission == WitnessAdmission::Truncated {
+                        self.metrics.reusable_summary_misses =
+                            self.metrics.reusable_summary_misses.saturating_add(1);
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        let installation_work = SolverWork {
+            interned_facts: staged.new_facts.len(),
+            reached_states: new_reached_states,
+            end_summaries: new_end_summaries,
+            coverage_rows: new_boundaries,
+            ..SolverWork::default()
+        };
+        #[cfg(test)]
+        LAST_REUSABLE_ENTRY_RESERVATION.with(|last| {
+            last.set(Some(SolverWork {
+                witness_relations: staged_witness_nodes.len(),
+                ..installation_work
+            }));
+        });
+        if let Some(termination) =
+            self.reserve_publication(installation_work, staged_witness_nodes.len(), request)
+        {
+            return Ok(Some(termination));
+        }
+        #[cfg(test)]
+        CANCEL_NEXT_REUSABLE_ENTRY_BEFORE_COMMIT.with(|armed| {
+            if armed.replace(false) {
+                request.cancellation.cancel();
+            }
+        });
+        if request.cancellation.is_cancelled() {
+            return Ok(Some(SolverTermination::Cancelled));
+        }
+        // The entire entry is now a nonfallible commit. Applications below
+        // consume their ordinary budgets and never cause a fresh body solve.
+        self.commit_facts(staged.new_facts);
+        self.boundaries.extend(boundaries);
+        for (id, node) in staged_witness_nodes {
+            self.witness_arena.commit(id, node);
+        }
+        for (key, frontier) in reached_frontiers {
+            self.reached.insert(key, frontier);
+            if let Some(witnesses) = reached_witnesses.remove(&key) {
+                self.witness_arena.mark_alternatives_truncated(&witnesses);
+                self.path_witnesses.insert(key, witnesses);
+            }
+        }
+        self.metrics.reusable_observations = self
+            .metrics
+            .reusable_observations
+            .saturating_add(summary.reached.len());
+        let mut installed = HashSet::default();
+        for row in &prepared {
+            let key = row.key;
+            if !installed.insert(key) {
+                continue;
+            }
+            let qualities = frontiers[&key];
+            let witnesses = exit_witnesses.remove(&key).unwrap_or_else(|| {
+                self.summary_ids
+                    .get(&key)
+                    .map(|&id| self.summaries[id].witnesses.clone())
+                    .unwrap_or_default()
+            });
+            self.witness_arena.mark_alternatives_truncated(&witnesses);
+            self.install_end_summary_row(key, Arc::clone(&row.exit), qualities, witnesses);
+        }
+        self.reusable_entries.insert(entry);
+        if self.witness_arena.is_enabled() && !strict {
+            self.evidence_free_entries.insert(entry);
+            self.mark_reusable_witnesses_omitted();
+        }
+        self.metrics.reusable_summary_hits = self.metrics.reusable_summary_hits.saturating_add(1);
+        for row in prepared {
+            if !row.frontier_changed {
+                continue;
+            }
+            let evidence = activated.get(&(row.key, row.quality)).copied();
+            debug_assert!(!strict || evidence.is_some());
+            if let Some(termination) = self.propagate_end_summary(
+                self.summary_ids[&row.key],
+                row.quality,
+                evidence,
+                row.frontier_changed,
+                problem,
+                request,
+            )? {
+                return Ok(Some(termination));
             }
         }
         Ok(None)
@@ -2425,6 +3163,7 @@ where
         }
         *request.budget = (*probe_request.budget).clone();
         if self.witness_arena.is_enabled() {
+            self.evidence_free_entries.insert(entry);
             self.mark_reusable_witnesses_omitted();
         }
         self.commit_facts(staged.new_facts);
@@ -2958,7 +3697,7 @@ where
         let mut staged_witness_bytes = 0usize;
         let mut activated_evidence = None;
         let mut witness_exhausted = false;
-        let reusable_entry = self.reusable_entries.contains(&path.entry);
+        let reusable_entry = self.evidence_free_entries.contains(&path.entry);
         if self.witness_arena.is_enabled() && qualities.contains(quality) && !reusable_entry {
             let predecessor =
                 predecessor_evidence.ok_or(SummaryDataflowError::WitnessInvariant(
@@ -3047,11 +3786,37 @@ where
             }
             self.witness_arena.mark_alternatives_truncated(&witnesses);
         }
-        let summary_id = if let Some(id) = existing {
+        let summary_id = self.install_end_summary_row(key, exit, qualities, witnesses);
+
+        self.propagate_end_summary(
+            summary_id,
+            quality,
+            activated_evidence,
+            frontier_changed,
+            problem,
+            request,
+        )
+    }
+
+    fn install_end_summary_row(
+        &mut self,
+        key: EndSummaryKey,
+        exit: Arc<IcfgExitProfile>,
+        qualities: PathQualityFrontier,
+        mut witnesses: WitnessAlternatives,
+    ) -> usize {
+        let existing = self.summary_ids.get(&key).copied();
+        let frontier_changed = existing
+            .map(|id| self.summaries[id].qualities != qualities)
+            .unwrap_or(true);
+        if frontier_changed {
+            witnesses.retain_frontier(qualities);
+        }
+        if let Some(id) = existing {
             if frontier_changed {
                 self.summaries[id].qualities = qualities;
             }
-            if self.witness_arena.is_enabled() && witnesses_changed {
+            if self.witness_arena.is_enabled() && self.summaries[id].witnesses != witnesses {
                 self.summaries[id].witnesses = witnesses;
             }
             id
@@ -3073,8 +3838,23 @@ where
                 .or_default()
                 .push(id);
             id
-        };
+        }
+    }
 
+    fn propagate_end_summary<P>(
+        &mut self,
+        summary_id: usize,
+        quality: PathQuality,
+        activated_evidence: Option<WitnessEvidenceId>,
+        frontier_changed: bool,
+        problem: &P,
+        request: &mut DataflowRequest<'_>,
+    ) -> Result<Option<SolverTermination>, SummaryDataflowError>
+    where
+        P: DistributiveDataflowProblem<Fact = Fact>,
+    {
+        let key = self.summaries[summary_id].key;
+        let reusable_entry = self.evidence_free_entries.contains(&key.entry);
         let incoming_ids = self
             .incoming_by_entry
             .get(&key.entry)
@@ -3183,7 +3963,7 @@ where
                         .ids(summary_quality)
                         .to_vec();
                     if summary_evidence.is_empty()
-                        && self.reusable_entries.contains(&entry)
+                        && self.evidence_free_entries.contains(&entry)
                         && let Some(termination) = self.apply_summary(
                             incoming,
                             summary,
@@ -3265,18 +4045,32 @@ where
                 callee_exit: summary.exit.callee_exit().clone(),
             }
         };
-        if let Some(projection) = self.matched_return_cache.get(&key) {
-            return Ok(Some(Arc::clone(projection)));
+        if let Some(projection) = self.matched_return_cache.get(&key).cloned() {
+            if let Some(reads) = self.matched_return_receipts.get(&key).cloned() {
+                for receipt in &reads {
+                    self.absorb_cached_reads(receipt);
+                }
+            }
+            return Ok(Some(projection));
         }
         if request.cancellation.is_cancelled() {
             return Ok(None);
         }
 
+        let mut projection_reads = None;
         let projection = {
             let incoming = &self.incoming[incoming_id];
             let summary = &self.summaries[summary_id];
             let transfer = self.cached_incoming_transfer(incoming)?;
-            let projection = match summary.exit.project_matched_return(transfer)? {
+            let project = || summary.exit.project_matched_return(transfer);
+            let projected = if let Some(analyzer) = self.member_read_analyzer {
+                let (projected, reads) = capture_query_reads(analyzer, project);
+                projection_reads = Some(reads);
+                projected?
+            } else {
+                project()?
+            };
+            let projection = match projected {
                 MatchedReturnProjection::Edge {
                     edge,
                     implicit_abort_only,
@@ -3301,7 +4095,25 @@ where
         // This method is reached only after one summary-application charge, so
         // retained fact-independent projections cannot outgrow that budget.
         self.matched_return_cache
-            .insert(key, Arc::clone(&projection));
+            .insert(key.clone(), Arc::clone(&projection));
+        if self.member_read_analyzer.is_some() {
+            let mut reads = Vec::new();
+            if let Some(call) = self.call_receipts.get(&(key.origin.clone(), key.context)) {
+                reads.push(Arc::clone(call));
+            }
+            let exit_key = (
+                key.callee_exit.procedure().clone(),
+                key.callee_entry.id(),
+                key.callee_exit.id(),
+            );
+            if let Some(exit) = self.exit_receipts.get(&exit_key) {
+                reads.push(Arc::clone(exit));
+            }
+            if let Some(projection) = projection_reads {
+                reads.push(projection);
+            }
+            self.matched_return_receipts.insert(key, reads);
+        }
         Ok(Some(projection))
     }
 
@@ -3321,7 +4133,7 @@ where
         P: DistributiveDataflowProblem<Fact = Fact>,
     {
         let reusable_summary = self
-            .reusable_entries
+            .evidence_free_entries
             .contains(&self.summaries[summary_id].key.entry);
         if self.witness_arena.is_enabled()
             && (incoming_evidence.is_none_or(|evidence| {
@@ -3387,6 +4199,10 @@ where
                     .through_evidence(edge.proof(), edge.completeness());
                 let target = edge.target().id();
                 let flow = summary_descriptor(edge)
+                    .with_caller_conversion(
+                        edge.origin()
+                            .is_some_and(|call| self.caller_conversions.contains(call)),
+                    )
                     .with_call_context(&self.contexts[caller.context])
                     .with_summary_entry_fact(self.facts[summary_entry_fact.index()]);
                 let outputs = match evaluate_transfer(
@@ -3634,6 +4450,7 @@ where
             self.boundaries.into_iter().collect(),
         );
         SummaryDataflowResult::from_parts(
+            self.member_receipts,
             self.facts,
             reached,
             end_summaries,
@@ -3647,6 +4464,7 @@ where
             witness_store,
             self.witness_retention_truncated,
         )
+        .with_caller_conversions(self.caller_conversions)
     }
 }
 
@@ -3689,8 +4507,14 @@ where
 {
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
-    let mut state = SummaryState::new(problem.zero_fact(), input.witness_retention());
-    let termination = if let Some(termination) = state.initialize(input, request)? {
+    let mut state = SummaryState::new(
+        problem.zero_fact(),
+        input.witness_retention(),
+        input.member_read_analyzer,
+    );
+    let root = input.root().clone();
+    let initialization = state.capture_member(root, |state| state.initialize(input, request));
+    let termination = if let Some(termination) = initialization? {
         termination
     } else {
         state.propagate(provider, reusable, problem, semantic_budget, request)?
@@ -3725,18 +4549,26 @@ where
     let initial_work = request.budget.used();
     let initial_semantic_work = semantic_budget.used();
     let root_reuse_eligible = input.entry_facts().is_empty() && input.point_seeds().is_empty();
-    let mut state = SummaryState::new(problem.zero_fact(), input.witness_retention());
-    let termination = if let Some(termination) = state.initialize(input, request)? {
+    let mut state = SummaryState::new(
+        problem.zero_fact(),
+        input.witness_retention(),
+        input.member_read_analyzer,
+    );
+    let root = input.root().clone();
+    let initialization = state.capture_member(root, |state| state.initialize(input, request));
+    let termination = if let Some(termination) = initialization? {
         termination
     } else {
         let root_termination = if root_reuse_eligible {
-            state.apply_reusable_root_summary(
-                provider,
-                reusable,
-                problem,
-                semantic_budget,
-                request,
-            )?
+            state.capture_member(input.root().clone(), |state| {
+                state.apply_reusable_root_summary(
+                    provider,
+                    reusable,
+                    problem,
+                    semantic_budget,
+                    request,
+                )
+            })?
         } else {
             None
         };

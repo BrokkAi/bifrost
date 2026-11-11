@@ -94,6 +94,67 @@ pub(super) type GoReceiverAnchorTypesMemo = super::super::selected_read_memo::Ex
     Option<GoReceiverAnchorTypes>,
 >;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct GoPointReceiverAnchorReadKey {
+    context_id: i64,
+    package_id: i64,
+    source_role: String,
+    caller_mount: SelectedResolutionMountOrdinal,
+    anchor_kind: u8,
+    owner_type_name: String,
+    anchor_name: String,
+    scope: [u8; 32],
+    stage_epoch: (u64, u64),
+}
+
+pub(super) type GoPointReceiverAnchorMemo = super::super::selected_read_memo::ExactReadMemo<
+    GoPointReceiverAnchorReadKey,
+    Option<(SelectedResolutionMountOrdinal, i64, GoReceiverAnchorRole)>,
+>;
+
+#[derive(Default)]
+pub(super) struct GoPointReceiverAnchorStats {
+    pub operation_id: u64,
+    pub questions: usize,
+    pub hits: usize,
+    pub misses: usize,
+    pub refused: usize,
+    pub admitted: usize,
+    pub unique_keys:
+        super::super::selected_read_memo::ExactReadMemo<GoPointReceiverAnchorReadKey, ()>,
+    pub unique_count: usize,
+    pub unique_truncated: bool,
+}
+
+impl GoPointReceiverAnchorStats {
+    pub fn new() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let mut stats = Self::default();
+        stats.operation_id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+    }
+}
+
+impl Drop for GoPointReceiverAnchorStats {
+    fn drop(&mut self) {
+        if self.questions > 0 {
+            crate::profiling::note_with(|| {
+                format!(
+                    "go.receiver_anchor operation={:#x} questions={} hits={} misses={} refused={} unique_keys_at_least={} unique_truncated={} admitted_keys={}",
+                    self.operation_id,
+                    self.questions,
+                    self.hits,
+                    self.misses,
+                    self.refused,
+                    self.unique_count,
+                    self.unique_truncated,
+                    self.admitted,
+                )
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum GoReceiverAnchorMember {
@@ -551,7 +612,8 @@ WHERE mounted.mount_ordinal=?1 AND mounted.storage_language=?4
 "#;
 
 const GO_POINT_CALLABLE_RESULT_SLOT: &str = r#"
-SELECT obligation.result_slot
+SELECT CASE WHEN ?3=0 THEN obligation.result_slot
+            ELSE json_extract(obligation.type_argument_slots, '$[4][' || (?3-1) || ']') END
 FROM temp.selected_resolution_mounts mounted
 JOIN main.resolution_call_obligations obligation
   ON obligation.blob_id=mounted.blob_id AND obligation.callee_reference=?2
@@ -853,6 +915,7 @@ impl SelectedResolutionOperation<'_, '_> {
         &self,
         caller_path: &str,
         reference: SemanticId,
+        result_ordinal: u32,
         cancellation: &CancellationToken,
     ) -> Result<Option<SemanticId>> {
         if cancellation.is_cancelled() {
@@ -871,15 +934,17 @@ impl SelectedResolutionOperation<'_, '_> {
             .prepare_cached(GO_POINT_CALLABLE_RESULT_SLOT)?;
         let mut rows = statement.query(rusqlite::params![
             caller.ordinal().get(),
-            i64::from(reference_key)
+            i64::from(reference_key),
+            i64::from(result_ordinal)
         ])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let slot: i64 = row.get(0)?;
+        let slot: Option<i64> = row.get(0)?;
         if rows.next()?.is_some() || cancellation.is_cancelled() {
             return Ok(None);
         }
+        let Some(slot) = slot else { return Ok(None) };
         Ok(Some(SemanticId::local(
             caller.ordinal().get(),
             u32::try_from(slot).expect("a Go result slot has a nonnegative local identity"),
@@ -1087,33 +1152,117 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             return Ok(None);
         };
-        let mut statement = self
-            .ready
-            .inventory
-            .connection()
-            .prepare_cached(GO_POINT_RECEIVER_ANCHOR)?;
-        let mut rows = statement.query(rusqlite::params![
+        let key = GoPointReceiverAnchorReadKey {
             context_id,
             package_id,
-            source_role,
-            caller.ordinal().get(),
-            i64::from(anchor_kind),
-            owner_type_name,
-            anchor_name
-        ])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
+            source_role: source_role.clone(),
+            caller_mount: caller.ordinal(),
+            anchor_kind,
+            owner_type_name: owner_type_name.to_owned(),
+            anchor_name: anchor_name.to_owned(),
+            scope: self.ready.inventory.scope_identity(),
+            stage_epoch: self.ready.inventory.staged_read_epoch(),
         };
-        let mount = SelectedResolutionMountOrdinal::new(row.get(0)?);
-        let definition_key: i64 = row.get(1)?;
-        let role: i64 = row.get(2)?;
-        if rows.next()?.is_some() || cancellation.is_cancelled() {
+        if let Some(stats) = self.go_point_receiver_anchor_stats.borrow_mut().as_mut() {
+            stats.questions += 1;
+            if stats.unique_keys.get(&key).is_none() {
+                let bytes = std::mem::size_of::<GoPointReceiverAnchorReadKey>()
+                    + key.source_role.len()
+                    + key.owner_type_name.len()
+                    + key.anchor_name.len();
+                if stats
+                    .unique_keys
+                    .insert_bounded_weighed(key.clone(), (), bytes)
+                {
+                    stats.unique_count += 1;
+                } else {
+                    stats.unique_truncated = true;
+                }
+            }
+        }
+        let cached = self
+            .go_point_receiver_anchor_memo
+            .borrow()
+            .get(&key)
+            .copied();
+        let answer = if let Some(answer) = cached {
+            if let Some(stats) = self.go_point_receiver_anchor_stats.borrow_mut().as_mut() {
+                stats.hits += 1;
+            }
+            answer
+        } else {
+            if let Some(stats) = self.go_point_receiver_anchor_stats.borrow_mut().as_mut() {
+                stats.misses += 1;
+            }
+            let mut statement = self
+                .ready
+                .inventory
+                .connection()
+                .prepare_cached(GO_POINT_RECEIVER_ANCHOR)?;
+            let mut rows = statement.query(rusqlite::params![
+                context_id,
+                package_id,
+                source_role,
+                caller.ordinal().get(),
+                i64::from(anchor_kind),
+                owner_type_name,
+                anchor_name
+            ])?;
+            let first = if let Some(row) = rows.next()? {
+                let mount = SelectedResolutionMountOrdinal::new(row.get(0)?);
+                let definition_key: i64 = row.get(1)?;
+                let role: i64 = row.get(2)?;
+                Some((mount, definition_key, role))
+            } else {
+                None
+            };
+            let answer = if let Some((mount, definition_key, role)) = first {
+                if rows.next()?.is_some() {
+                    None
+                } else {
+                    Some((
+                        mount,
+                        definition_key,
+                        match role {
+                            0 => GoReceiverAnchorRole::FieldType,
+                            2 => GoReceiverAnchorRole::CallableResult,
+                            _ => unreachable!(
+                                "the Go receiver anchor query selects field or callable rows"
+                            ),
+                        },
+                    ))
+                }
+            } else {
+                None
+            };
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let bytes = std::mem::size_of::<GoPointReceiverAnchorReadKey>()
+                + std::mem::size_of::<
+                    Option<(SelectedResolutionMountOrdinal, i64, GoReceiverAnchorRole)>,
+                >()
+                + key.source_role.len()
+                + key.owner_type_name.len()
+                + key.anchor_name.len();
+            if !self
+                .go_point_receiver_anchor_memo
+                .borrow_mut()
+                .insert_bounded_weighed(key, answer, bytes)
+            {
+                if let Some(stats) = self.go_point_receiver_anchor_stats.borrow_mut().as_mut() {
+                    stats.refused += 1;
+                }
+            } else if let Some(stats) = self.go_point_receiver_anchor_stats.borrow_mut().as_mut() {
+                stats.admitted += 1;
+            }
+            answer
+        };
+        if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let role = match role {
-            0 => GoReceiverAnchorRole::FieldType,
-            2 => GoReceiverAnchorRole::CallableResult,
-            _ => unreachable!("the Go receiver anchor query selects field or callable rows"),
+        let Some((mount, definition_key, role)) = answer else {
+            return Ok(None);
         };
         Ok(Some((
             package_id,

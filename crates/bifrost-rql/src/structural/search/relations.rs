@@ -1,6 +1,7 @@
 use super::super::matcher::{
     CallableSignatureFacts, CallableSignatureOracle, DeclarationOwnerOracle,
 };
+use super::dispatch::DispatchProof;
 use super::*;
 use crate::analyzer::DeclarationKind;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
@@ -48,6 +49,213 @@ pub(super) fn direct_member_expansions(
     (expansions, exhausted)
 }
 
+/// Enumerate exact Rust call facts owned by this callable. Target resolution is
+/// per site, using the same dispatcher as `dispatch-targets`; a missing
+/// indexed callee never removes the source call from the relation.
+fn rust_source_call_site_expansions(
+    analyzer: &dyn IAnalyzer,
+    declaration: &DeclarationValue,
+    filter: &CallSiteTraversalFilter,
+    max_outputs: usize,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    semantic: &mut Option<SemanticQueryContext<'_>>,
+) -> (Vec<PipelineExpansion>, bool) {
+    let file = declaration.unit.source();
+    let Some(facts) = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == Language::Rust)
+        .and_then(|provider| provider.structural_facts(file))
+    else {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::CallRelationParseFailed,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "rust",
+            message: format!(
+                "call-sites-from could not read call facts for {}",
+                declaration.unit.fq_name()
+            ),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
+        return (Vec::new(), true);
+    };
+    let Some(semantic) = semantic.as_mut() else {
+        return (Vec::new(), true);
+    };
+    let mut expansions = Vec::new();
+    let mut seen = HashSet::default();
+    let mut exhausted = false;
+    for (node_index, node) in facts.nodes().iter().enumerate() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            exhausted = true;
+            break;
+        }
+        if !node.kind.satisfies(NormalizedKind::Call)
+            || node.range.start_byte < declaration.range.start_byte
+            || node.range.end_byte > declaration.range.end_byte
+        {
+            continue;
+        }
+        // A call inside a closure or nested function belongs to that callable,
+        // not its lexical outer function, until a call edge reaches it.
+        let mut parent = node.parent;
+        let mut nested_callable = false;
+        while let Some(parent_id) = parent {
+            let owner = facts.node(parent_id);
+            if owner.kind.satisfies(NormalizedKind::Callable)
+                && (owner.range.start_byte != declaration.range.start_byte
+                    || owner.range.end_byte != declaration.range.end_byte)
+            {
+                nested_callable = true;
+                break;
+            }
+            parent = owner.parent;
+        }
+        if nested_callable {
+            continue;
+        }
+        if node.construct.as_deref() == Some("rust_macro_invocation") {
+            // The invocation is a source call, but its token tree can hide
+            // further calls that the structural inventory cannot enumerate.
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::CallRelationAnalysisFailed,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "rust",
+                message: format!(
+                    "call-sites-from cannot enumerate calls inside Rust macro invocation at byte {}",
+                    node.range.start_byte
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            }));
+        }
+        let Some(shape) = crate::analyzer::usages::call_shape::call_shape_for_call(
+            &facts,
+            file,
+            u32::try_from(node_index).expect("facts IDs fit u32"),
+        ) else {
+            exhausted = true;
+            continue;
+        };
+        let range = shape.outcome.range;
+        if !seen.insert((range.start_byte, range.end_byte)) {
+            continue;
+        }
+        let (answer, cause) = semantic.dispatch_at_source_with_cause(file, range);
+        let semantic_identity = semantic.call_site_identity_at_source(file, range);
+        if cause.execution_cause().is_some() {
+            exhausted = true;
+        }
+        let mut emit =
+            |callee: Option<CodeUnit>, target: CallSiteTargetEvidence, proof: UsageProof| {
+                if filter.proof.is_some_and(|selected| selected != proof) {
+                    return;
+                }
+                if expansions.len() >= max_outputs {
+                    exhausted = true;
+                    return;
+                }
+                let kind = if callee.as_ref().is_some_and(CodeUnit::is_class) {
+                    CallSyntaxKind::Constructor
+                } else if shape.outcome.receiver_range.is_some() {
+                    CallSyntaxKind::Method
+                } else {
+                    CallSyntaxKind::Function
+                };
+                let arguments = shape
+                    .arguments
+                    .iter()
+                    .map(
+                        |arg| crate::analyzer::usages::call_relations::CallArgument {
+                            range: arg.range,
+                            name: arg.name.clone(),
+                            position: arg.name.is_none().then_some(arg.argument_index),
+                            formal_index: None,
+                            formal_name: None,
+                            variadic: false,
+                            spread: arg.spread,
+                        },
+                    )
+                    .collect();
+                let site = CallSite {
+                    file: file.clone(),
+                    range,
+                    callee_range: shape.outcome.callee_range.unwrap_or(range),
+                    caller: declaration.unit.clone(),
+                    callee: callee.unwrap_or_else(|| CodeUnit::file_scope(file.clone())),
+                    kind,
+                    proof,
+                    receiver: shape.outcome.receiver_range,
+                    arguments,
+                };
+                let mut value = CallSiteValue::new(
+                    site,
+                    CallBindingStatus::Unavailable,
+                    semantic_identity.clone(),
+                    CallSiteIdentityFacts::default(),
+                );
+                value.6 = Some(target);
+                expansions.push(pipeline_expansion(PipelineValue::CallSite(value)));
+            };
+        if answer.arms.is_empty() {
+            emit(
+                None,
+                CallSiteTargetEvidence {
+                    target_id: None,
+                    target_fq_name: None,
+                    boundary_kind: Some("unresolved"),
+                    proof: "unproven",
+                    completeness: "partial",
+                    coverage: answer.coverage.label(),
+                    reason: Some(answer.coverage_reasons.join("; ")),
+                },
+                UsageProof::Unproven,
+            );
+        }
+        for arm in &answer.arms {
+            let proof = if arm.proof == DispatchProof::Proven {
+                UsageProof::Proven
+            } else {
+                UsageProof::Unproven
+            };
+            emit(
+                arm.target_unit.clone(),
+                CallSiteTargetEvidence {
+                    target_id: Some(arm.target_id.clone()),
+                    target_fq_name: arm
+                        .external_callee_identity
+                        .as_ref()
+                        .map(|identity| format!("{}.{}", identity.owner_fqn(), identity.member())),
+                    boundary_kind: if arm.target_unit.is_some() {
+                        None
+                    } else {
+                        Some(
+                            arm.boundary_kind
+                                .map_or("unmaterialized", |kind| kind.label()),
+                        )
+                    },
+                    proof: arm.proof.label(),
+                    completeness: arm.completeness.label(),
+                    coverage: answer.coverage.label(),
+                    reason: None,
+                },
+                proof,
+            );
+        }
+    }
+    (expansions, exhausted)
+}
+
 pub(super) fn reference_expansion(
     value: PipelineValue,
     site: ReferenceSiteValue,
@@ -76,6 +284,19 @@ pub(super) fn call_site_expansions(
     semantic: &mut Option<SemanticQueryContext<'_>>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::CallSitesTo(_));
+    if !incoming
+        && crate::analyzer::common::language_for_file(declaration.unit.source()) == Language::Rust
+    {
+        return rust_source_call_site_expansions(
+            analyzer,
+            declaration,
+            filter,
+            max_outputs,
+            cancellation,
+            diagnostics,
+            semantic,
+        );
+    }
     let result = cached_call_relation(
         analyzer,
         token,
@@ -358,7 +579,7 @@ pub(super) fn cached_call_relation(
         let result = if let Some(result) = results.get(unit) {
             if let Some(layer) = layer {
                 layer.record_hit(
-                    Some(call_relation_result_complete(result)),
+                    Some(call_relation_result_complete(result, incoming)),
                     result.sites.len(),
                 );
             }
@@ -423,7 +644,7 @@ pub(super) fn cached_call_relation(
                 } else {
                     &mut profile.outgoing_call
                 };
-                layer.record_build(Some(call_relation_result_complete(&result)));
+                layer.record_build(Some(call_relation_result_complete(&result, incoming)));
             }
             results.insert(unit.clone(), result.clone());
             result
@@ -435,6 +656,29 @@ pub(super) fn cached_call_relation(
         };
         if reported.insert(unit.clone()) {
             let language = crate::analyzer::common::language_for_file(unit.source()).config_label();
+            if incoming
+                && result.proof_authority == UsageProofAuthority::Native
+                && result.caller_inventory != CallerInventoryCoverage::Complete
+                && !result.truncated
+                && !result.cancelled
+            {
+                diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language,
+                    message: format!(
+                        "native incoming caller inventory is {:?} for {}",
+                        result.caller_inventory,
+                        unit.fq_name()
+                    ),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                }));
+            }
             diagnostics.extend(
                 result
                     .diagnostics
@@ -474,8 +718,11 @@ pub(super) fn mark_proven_call_ambiguity_incomplete(
     }
 }
 
-pub(super) fn call_relation_result_complete(result: &CallRelationResult) -> bool {
-    !result.truncated
+pub(super) fn call_relation_result_complete(result: &CallRelationResult, incoming: bool) -> bool {
+    (!incoming
+        || result.proof_authority != UsageProofAuthority::Native
+        || result.caller_inventory == CallerInventoryCoverage::Complete)
+        && !result.truncated
         && !result.cancelled
         && result.diagnostics.iter().all(|diagnostic| {
             map_call_relation_diagnostic_code(diagnostic.code).1
@@ -510,6 +757,10 @@ pub(super) fn map_call_relation_diagnostic_code(
         CallRelationDiagnosticCode::AnalysisFailed => (
             CodeQueryDiagnosticCode::CallRelationAnalysisFailed,
             CodeQueryDiagnosticImpact::Incomplete,
+        ),
+        CallRelationDiagnosticCode::ExternalBoundary => (
+            CodeQueryDiagnosticCode::CallRelationCandidatesOmitted,
+            CodeQueryDiagnosticImpact::Advisory,
         ),
     }
 }
@@ -631,13 +882,324 @@ pub(super) fn charge_reference_scan(
         .allows(0)
 }
 
-pub(super) fn reference_hit_matches(hit: &ReferenceHit, filter: &ReferenceTraversalFilter) -> bool {
+pub(super) fn classified_reference_kind_matches(
+    kind: brokk_bifrost_core::analyzer::usages::model::ReferenceFacets,
+    requested: &[ReferenceKind],
+    file: &ProjectFile,
+    range: Range,
+    unclassified: &mut Vec<String>,
+) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    use brokk_bifrost_core::analyzer::usages::model::{ReferenceKindSet, Truth};
+    match kind.matches(ReferenceKindSet::from_kinds(requested.iter().copied())) {
+        Truth::True => true,
+        Truth::False => false,
+        Truth::Unknown => {
+            unclassified.push(format!(
+                "{}:{}@{}",
+                crate::path_utils::workspace_relative_slash_path(file.rel_path()),
+                range.start_line,
+                range.start_byte
+            ));
+            false
+        }
+    }
+}
+
+pub(super) fn report_unclassified_reference_kinds(
+    requested: &[ReferenceKind],
+    mut unclassified: Vec<String>,
+    language: Language,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) {
+    if unclassified.is_empty() {
+        return;
+    }
+    unclassified.sort();
+    unclassified.dedup();
+    let mut kinds: Vec<_> = requested
+        .iter()
+        .map(|kind| reference_kind_label(*kind))
+        .collect();
+    kinds.sort();
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::ReferenceKindUndecided,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: language.config_label(),
+        message: format!(
+            "reference sites without a classified kind could not be excluded for requested kinds {kinds:?}: {unclassified:?}"
+        ),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    }));
+}
+
+fn report_undecided_enclosing_patterns(
+    mut sites: Vec<String>,
+    language: Language,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) {
+    if sites.is_empty() {
+        return;
+    }
+    sites.sort();
+    sites.dedup();
+    diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::EnclosingPatternUndecided,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: language.config_label(),
+        message: format!("enclosing declaration patterns were undecidable at sites {sites:?}"),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    }));
+}
+
+pub(super) fn reference_hit_matches(
+    hit: &ReferenceHit,
+    filter: &ReferenceTraversalFilter,
+    unclassified: &mut Vec<String>,
+) -> bool {
     hit.usage_kind.included_in(filter.surface)
         && filter.proof.is_none_or(|proof| proof == hit.proof)
-        && (filter.reference_kinds.is_empty()
-            || hit
-                .kind
-                .is_some_and(|kind| filter.reference_kinds.contains(&kind)))
+        && classified_reference_kind_matches(
+            hit.kind,
+            &filter.reference_kinds,
+            &hit.file,
+            hit.range,
+            unclassified,
+        )
+}
+
+/// The exact declaration-to-fact join shared by enclosing filters and the
+/// nonlexical owner oracle. Never accept a covering ancestor as the owner.
+fn exact_declaration_fact_nodes(facts: &FileFacts, ranges: &[Range]) -> Vec<u32> {
+    facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, fact)| {
+            fact.kind.satisfies(NormalizedKind::Declaration) && ranges.contains(&fact.range)
+        })
+        .map(|(node, _)| u32::try_from(node).expect("FileFacts node ids fit in u32"))
+        .collect()
+}
+
+/// The same exact-range declaration join as [`exact_declaration_fact_nodes`],
+/// indexed once per file for callers that join many owners.
+fn declaration_facts_by_range(facts: &FileFacts) -> HashMap<Range, Vec<u32>> {
+    let mut declarations = HashMap::<Range, Vec<u32>>::default();
+    for (node, fact) in facts.nodes().iter().enumerate() {
+        if fact.kind.satisfies(NormalizedKind::Declaration) {
+            declarations
+                .entry(fact.range)
+                .or_default()
+                .push(u32::try_from(node).expect("FileFacts node ids fit in u32"));
+        }
+    }
+    declarations
+}
+
+/// Evaluates one `:enclosing` pattern for the rows of one expansion call.
+///
+/// A row's owner is joined to the one same-file declaration fact whose range
+/// is exactly one of the owner's ranges. A file-scope or synthetic owner
+/// proves the pattern false; a missing or ambiguous fact, or a pattern answer
+/// the matcher cannot decide, leaves the row undecided: it is withheld and its
+/// site is reported. Per file the evaluator keeps the facts, an exact-range
+/// index of declaration facts and the oracles the pattern needs; per owner it
+/// keeps the outcome, so rows that share an owner are evaluated once. It lives
+/// for one call and is dropped with it.
+pub(super) struct EnclosingPatternEvaluator<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    pattern: &'a EnclosingPattern,
+    files: HashMap<ProjectFile, Option<EnclosingFile<'a>>>,
+    /// `Some(matched)` when decided, `None` when undecided.
+    owners: HashMap<CodeUnit, Option<bool>>,
+    undecided: Vec<String>,
+}
+
+struct EnclosingFile<'a> {
+    facts: Arc<FileFacts>,
+    declarations: HashMap<Range, Vec<u32>>,
+    signature: Option<FileCallableSignatureOracle<'a>>,
+    local_value: Option<super::python_variables::PythonLocalValueOracle>,
+    recorded_argument_modes:
+        &'static [brokk_bifrost_core::analyzer::structural::facts::ArgumentMode],
+}
+
+impl<'a> EnclosingPatternEvaluator<'a> {
+    pub(super) fn new(analyzer: &'a dyn IAnalyzer, pattern: &'a EnclosingPattern) -> Self {
+        Self {
+            analyzer,
+            pattern,
+            files: HashMap::default(),
+            owners: HashMap::default(),
+            undecided: Vec::new(),
+        }
+    }
+
+    /// Whether the row whose enclosing unit is `owner` is kept.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn keeps(
+        &mut self,
+        environment_cache: &mut super::environment::EnvironmentTraversalCache,
+        owner: Option<&CodeUnit>,
+        site: String,
+        budget: &mut CodeQueryExecutionBudget,
+        limits: CodeQueryExecutionLimits,
+        cancellation: Option<&CancellationToken>,
+        diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    ) -> bool {
+        let Some(owner) = owner.filter(|unit| !unit.is_synthetic() && !unit.is_file_scope()) else {
+            return false;
+        };
+        let outcome = match self.owners.get(owner) {
+            Some(outcome) => *outcome,
+            None => {
+                let outcome = self.evaluate(
+                    environment_cache,
+                    owner,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                );
+                self.owners.insert(owner.clone(), outcome);
+                outcome
+            }
+        };
+        if outcome.is_none() {
+            self.undecided.push(site);
+        }
+        outcome == Some(true)
+    }
+
+    /// Withholds a row whose owner cannot be classified at all.
+    pub(super) fn withhold(&mut self, site: String) {
+        self.undecided.push(site);
+    }
+
+    pub(super) fn finish(self, language: Language, diagnostics: &mut Vec<CodeQueryDiagnostic>) {
+        report_undecided_enclosing_patterns(self.undecided, language, diagnostics);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate(
+        &mut self,
+        environment_cache: &mut super::environment::EnvironmentTraversalCache,
+        owner: &CodeUnit,
+        budget: &mut CodeQueryExecutionBudget,
+        limits: CodeQueryExecutionLimits,
+        cancellation: Option<&CancellationToken>,
+        diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    ) -> Option<bool> {
+        let analyzer = self.analyzer;
+        let enclosing: &'a EnclosingPattern = self.pattern;
+        let pattern = &enclosing.pattern;
+        let file = self
+            .files
+            .entry(owner.source().clone())
+            .or_insert_with(|| {
+                let language = crate::analyzer::common::language_for_file(owner.source());
+                let provider = analyzer
+                    .structural_fact_providers()
+                    .into_iter()
+                    .find(|provider| provider.structural_language() == language)?;
+                analyzer.record_read(provider.structural_file_read_key(owner.source())?);
+                let facts = provider.structural_facts(owner.source())?;
+                let declarations = declaration_facts_by_range(&facts);
+                let signature = pattern
+                    .constrains_callable_signature()
+                    .then(|| FileCallableSignatureOracle::for_file(analyzer, owner.source()));
+                let local_value = (pattern.constrains_local_value()
+                    && language == Language::Python)
+                    .then(|| {
+                        super::python_variables::file_local_value_oracle(
+                            analyzer,
+                            environment_cache,
+                            owner.source(),
+                            &facts,
+                            diagnostics,
+                        )
+                    })
+                    .flatten();
+                Some(EnclosingFile {
+                    facts,
+                    declarations,
+                    signature,
+                    local_value,
+                    recorded_argument_modes: provider.structural_recorded_argument_modes(),
+                })
+            })
+            .as_ref()?;
+        let ranges = analyzer.ranges_of(owner);
+        let mut nodes = ranges
+            .iter()
+            .filter_map(|range| file.declarations.get(range))
+            .flatten();
+        let (Some(node), None) = (nodes.next(), nodes.next()) else {
+            return None;
+        };
+        let incomplete = super::super::matcher::CallableSignatureIncomplete::default();
+        let previous_work = budget.fact_nodes.saturating_add(budget.examined_references);
+        let mut examined = u64::try_from(previous_work).unwrap_or(u64::MAX);
+        let mut budget_stopped = false;
+        let (matched, unknown) = incomplete.isolated(|| {
+            let matched = super::super::matcher::match_owner_pattern(
+                pattern,
+                &file.facts,
+                *node,
+                &mut Vec::new(),
+                super::super::matcher::PatternEvalInputs {
+                    examined_facts: &mut examined,
+                    cancellation,
+                    max_examined_facts: u64::try_from(limits.max_fact_nodes).unwrap_or(u64::MAX),
+                    oracle: file
+                        .signature
+                        .as_ref()
+                        .map(|oracle| oracle as &dyn CallableSignatureOracle),
+                    selection_applications: None,
+                    local_value_oracle: file
+                        .local_value
+                        .as_ref()
+                        .map(|oracle| oracle as &dyn super::super::matcher::LocalValueOracle),
+                    incomplete: &incomplete,
+                    recorded_argument_modes: file.recorded_argument_modes,
+                },
+            );
+            budget_stopped = incomplete.fact_budget_exhausted.get();
+            matched
+        });
+        budget.fact_nodes = budget.fact_nodes.saturating_add(
+            usize::try_from(examined)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(previous_work),
+        );
+        // The matcher reports its own budget stop, which leaves only a
+        // non-match undecided; a match it found is proven. Usage equal to the
+        // limit is within the budget, so a walk that finished on its last
+        // permitted fact keeps its answer.
+        if (budget_stopped && !matched)
+            || examined > u64::try_from(limits.max_fact_nodes).unwrap_or(u64::MAX)
+        {
+            push_budget_diagnostic(diagnostics, budget);
+            return None;
+        }
+        if incomplete.cancelled.get() {
+            return None;
+        }
+        (matched || !unknown).then_some(matched)
+    }
 }
 
 pub(super) fn reference_site_value(
@@ -665,7 +1227,7 @@ pub(super) fn reference_site_value(
             enclosing,
             usage_kind: hit.usage_kind,
             proof: hit.proof,
-            reference_kind: hit.kind,
+            reference_facets: hit.kind,
         },
         enclosing_projection_omitted,
     )
@@ -730,13 +1292,14 @@ pub(super) fn outbound_reference_expansions(
         outbound.insert(source_file.clone(), hits);
     }
     let mut sites = Vec::new();
+    let mut unclassified = Vec::new();
     let mut omitted = 0usize;
     for hit in outbound
         .get(declaration.unit.source())
         .into_iter()
         .flatten()
         .filter(|hit| hit.enclosing_unit == declaration.unit)
-        .filter(|hit| reference_hit_matches(hit, filter))
+        .filter(|hit| reference_hit_matches(hit, filter, &mut unclassified))
     {
         let Some(target) = indexed.get(analyzer, &hit.resolved) else {
             omitted = omitted.saturating_add(1);
@@ -750,6 +1313,12 @@ pub(super) fn outbound_reference_expansions(
         );
         sites.push(site);
     }
+    report_unclassified_reference_kinds(
+        &filter.reference_kinds,
+        unclassified,
+        crate::analyzer::common::language_for_file(declaration.unit.source()),
+        diagnostics,
+    );
     if omitted > 0 {
         exhausted = true;
         diagnostics
@@ -801,9 +1370,19 @@ pub(super) fn sort_reference_sites(sites: &mut [ReferenceSiteValue]) {
             })
             .then_with(|| usage_proof_label(left.proof).cmp(usage_proof_label(right.proof)))
             .then_with(|| {
-                left.reference_kind
+                left.reference_facets
+                    .known()
+                    .iter()
+                    .next()
                     .map(reference_kind_label)
-                    .cmp(&right.reference_kind.map(reference_kind_label))
+                    .cmp(
+                        &right
+                            .reference_facets
+                            .known()
+                            .iter()
+                            .next()
+                            .map(reference_kind_label),
+                    )
             })
     });
 }
@@ -1183,10 +1762,248 @@ impl EnclosingDeclarationIndex {
     }
 }
 
+/// Resolution's answer for every selection of `file` whose call-ness depends
+/// on the member it resolves to (Scala's `entry.getName`, #9479).
+///
+/// Each candidate is one `FieldAccess` fact the language hook names. Its
+/// member leaf is resolved through the query-local call-target cache: a
+/// member proven callable makes the selection a call, a member proven to be
+/// a field, value, type or package makes it a field read, and anything the
+/// resolver did not decide stays undecided so matching reports it incomplete.
+/// Nothing is retained after the query.
+pub(super) fn selection_applications_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    facts: &FileFacts,
+    bindings: &mut CallBindingCache,
+    owned_calls: Option<&OwnedCallAnchors>,
+    #[cfg(any(test, feature = "test-support"))] candidate_probe: Option<&CallBindingCandidateProbe>,
+    cancellation: Option<&CancellationToken>,
+) -> super::super::matcher::SelectionApplications {
+    use super::super::matcher::SelectionApplication;
+    let mut applications = super::super::matcher::SelectionApplications::default();
+    let language = crate::analyzer::common::language_for_file(file);
+    if !crate::analyzer::languages::language_knowledge(language)
+        .is_some_and(|knowledge| knowledge.has_resolution_decided_applications())
+    {
+        return applications;
+    }
+    let selections = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.kind == NormalizedKind::FieldAccess
+                && owned_calls.is_none_or(|owned| owned.contains(file, node.range))
+        })
+        .map(|(id, node)| {
+            (
+                u32::try_from(id).expect("facts arena node IDs fit u32"),
+                node.range,
+            )
+        })
+        .collect::<Vec<_>>();
+    if selections.is_empty() {
+        return applications;
+    }
+    let Some(tree) = parse_tree_for_language(file, language, facts.source()) else {
+        for (id, _) in selections {
+            applications.insert(id, SelectionApplication::Undecided);
+        }
+        return applications;
+    };
+    let members = selections
+        .into_iter()
+        .filter_map(|(id, range)| Some((id, selection_member_range(file, &tree, range)?)))
+        .collect::<Vec<_>>();
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(probe) = candidate_probe {
+        probe.record(members.len());
+    }
+    bindings.prefetch_call_targets_in_file(
+        analyzer,
+        file,
+        members.iter().map(|(_, member)| *member),
+        cancellation,
+    );
+    for (id, member) in members {
+        applications.insert(
+            id,
+            resolved_selection_application(analyzer, file, member, bindings, cancellation),
+        );
+    }
+    applications
+}
+
+/// Resolution's answer for the one selection fact `node`, or `None` when it
+/// is not a resolution-decided selection. Single rows (a `call_shape` input)
+/// parse their own tree; whole-file matching uses
+/// [`selection_applications_for_file`].
+pub(super) fn selection_application_at(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    facts: &FileFacts,
+    node: u32,
+    bindings: &mut CallBindingCache,
+    cancellation: Option<&CancellationToken>,
+) -> Option<super::super::matcher::SelectionApplication> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let fact = facts.node(node);
+    if fact.kind != NormalizedKind::FieldAccess
+        || !crate::analyzer::languages::language_knowledge(language)
+            .is_some_and(|knowledge| knowledge.has_resolution_decided_applications())
+    {
+        return None;
+    }
+    let Some(tree) = parse_tree_for_language(file, language, facts.source()) else {
+        return Some(super::super::matcher::SelectionApplication::Undecided);
+    };
+    let member = selection_member_range(file, &tree, fact.range)?;
+    Some(resolved_selection_application(
+        analyzer,
+        file,
+        member,
+        bindings,
+        cancellation,
+    ))
+}
+
+/// The member leaf of the resolution-decided selection spelled exactly at
+/// `range`, or `None` when no such selection is there.
+fn selection_member_range(
+    file: &ProjectFile,
+    tree: &tree_sitter::Tree,
+    range: Range,
+) -> Option<Range> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let node =
+        brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range(tree.root_node(), &range)?;
+    crate::analyzer::usages::get_definition::call_sites::resolution_decided_application(
+        node, language,
+    )
+    .map(brokk_bifrost_core::analyzer::usages::reference_site::node_range)
+}
+
+fn resolved_selection_application(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    member: Range,
+    bindings: &mut CallBindingCache,
+    cancellation: Option<&CancellationToken>,
+) -> super::super::matcher::SelectionApplication {
+    bindings
+        .resolved_call_target(analyzer, file, member, cancellation)
+        .map_or(
+            super::super::matcher::SelectionApplication::Undecided,
+            |target| selection_application_of(&target),
+        )
+}
+
+fn selection_application_of(
+    target: &crate::analyzer::usages::get_definition::CallTargetLookupOutcome,
+) -> super::super::matcher::SelectionApplication {
+    use super::super::matcher::SelectionApplication;
+    let outcome = &target.outcome;
+    // An exact external call proof selects one callable member by itself; the
+    // navigation status beside it describes the external boundary it crosses.
+    if target.exact_external_call.is_some() {
+        return SelectionApplication::Call;
+    }
+    if outcome.status != DefinitionLookupStatus::Resolved {
+        return SelectionApplication::Undecided;
+    }
+    // No definition, or a mix of callables and values, decides nothing.
+    let definitions = &outcome.definitions;
+    let decided = !definitions.is_empty();
+    if decided && definitions.iter().all(CodeUnit::is_function) {
+        SelectionApplication::Call
+    } else if decided && !definitions.iter().any(CodeUnit::is_function) {
+        SelectionApplication::NotCall
+    } else {
+        SelectionApplication::Undecided
+    }
+}
+
 /// Exact-range lookup from a callable fact onto persisted signature metadata.
+fn match_instantiated_type(
+    actual: &brokk_bifrost_analysis::analyzer::usages::call_conversion::RustProjectedType,
+    expected: &crate::query::InstantiatedType,
+    path: Vec<usize>,
+) -> (Option<bool>, Vec<Vec<usize>>) {
+    use crate::query::{CallIdentity, ResolvedCallIdentityKind};
+    use brokk_bifrost_analysis::analyzer::usages::call_conversion::RustProjectedType;
+    let mut reads = vec![path.clone()];
+    let (kind, identity, arguments) = match actual {
+        RustProjectedType::Declaration(declaration) => (
+            ResolvedCallIdentityKind::WorkspaceDeclaration,
+            declaration.declaration_id().to_string(),
+            &[][..],
+        ),
+        RustProjectedType::AppliedDeclaration {
+            declaration,
+            arguments,
+        } => (
+            ResolvedCallIdentityKind::WorkspaceDeclaration,
+            declaration.declaration_id().to_string(),
+            arguments.as_slice(),
+        ),
+        RustProjectedType::Model {
+            symbol, arguments, ..
+        } => (
+            ResolvedCallIdentityKind::ActiveSemanticModel,
+            symbol.clone(),
+            arguments.as_slice(),
+        ),
+        _ => return (None, reads),
+    };
+    let matches = if expected.resolved_identities.is_empty() {
+        match &expected.identity {
+            CallIdentity::Qualified {
+                resolved: Some(resolved),
+                ..
+            } => resolved.kind == kind && resolved.identity == identity,
+            CallIdentity::Stable(stable) => stable == &identity,
+            _ => return (None, reads),
+        }
+    } else {
+        expected
+            .resolved_identities
+            .iter()
+            .any(|candidate| candidate.kind == kind && candidate.identity == identity)
+    };
+    if !matches {
+        return (Some(false), reads);
+    }
+    // Canonical nominal arguments include defaults and Unknown leaves for
+    // existing unproved components. An absent declared slot is a proven mismatch;
+    // deciding it requires only the nominal head's evidence.
+    if expected.arguments.len() > arguments.len() {
+        return (Some(false), reads);
+    }
+    let mut complete = true;
+    for (index, expected) in expected.arguments.iter().enumerate() {
+        let mut child_path = path.clone();
+        child_path.push(index);
+        let actual = &arguments[index];
+        let (matched, child_reads) = match_instantiated_type(actual, expected, child_path);
+        if matched == Some(false) {
+            reads.truncate(1);
+            reads.extend(child_reads);
+            return (Some(false), reads);
+        }
+        if matched.is_none() {
+            complete = false;
+        }
+        reads.extend(child_reads);
+    }
+    (complete.then_some(true), reads)
+}
+
 pub(super) struct FileCallableSignatureOracle<'a> {
     analyzer: &'a dyn IAnalyzer,
     index: EnclosingDeclarationIndex,
+    file: ProjectFile,
+    sources: brokk_bifrost_analysis::analyzer::usages::call_conversion::CallConversionCache,
 }
 
 impl<'a> FileCallableSignatureOracle<'a> {
@@ -1194,11 +2011,48 @@ impl<'a> FileCallableSignatureOracle<'a> {
         Self {
             analyzer,
             index: EnclosingDeclarationIndex::for_file(analyzer, file),
+            file: file.clone(),
+            sources: Default::default(),
         }
     }
 }
 
 impl CallableSignatureOracle for FileCallableSignatureOracle<'_> {
+    fn qualifying_type_matches(
+        &self,
+        range: Range,
+        expected: &crate::query::InstantiatedType,
+    ) -> Option<bool> {
+        // The final matcher verdict, rather than an optional native probe,
+        // publishes incompleteness. All deciding read keys still reach its ledger.
+        let _scope = crate::analyzer::AnalyzerQueryScope::for_advisory_read(self.analyzer);
+        let parsed = self.sources.source(self.analyzer, &self.file)?;
+        let call = parsed
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)?;
+        if call.byte_range() != (range.start_byte..range.end_byte) {
+            return None;
+        }
+        let language = crate::analyzer::common::language_for_file(&self.file);
+        let support = crate::analyzer::languages::language_support(language)?;
+        match support.call_qualifying_type(
+            self.analyzer,
+            &self.sources,
+            &self.file,
+            &parsed.source,
+            call,
+        ) {
+            Ok(Some(proof)) => {
+                let (matched, paths) = match_instantiated_type(&proof.ty, expected, Vec::new());
+                proof.replay(self.analyzer, &paths);
+                matched
+            }
+            Ok(None) => Some(false),
+            Err(_) => None,
+        }
+    }
+
     fn lookup(&self, range: Range) -> Option<CallableSignatureFacts> {
         let declaration = self.index.exact(range)?;
         let entries = self.analyzer.signature_metadata(&declaration.unit);
@@ -1266,6 +2120,8 @@ impl DeclarationOwnerOracle for NonLexicalDeclarationOwnerOracle<'_> {
         captures: &mut Vec<super::super::matcher::CaptureBinding>,
         examined_facts: &mut u64,
         incomplete: &super::super::matcher::CallableSignatureIncomplete,
+        cancellation: Option<&CancellationToken>,
+        max_examined_facts: u64,
     ) -> bool {
         let Some(member) = self.declarations.exact(declaration) else {
             return false;
@@ -1281,12 +2137,17 @@ impl DeclarationOwnerOracle for NonLexicalDeclarationOwnerOracle<'_> {
         if !declaration_owner_may_be_non_lexical(language) {
             return false;
         }
-        let Some(facts) = self
+        let Some((facts, recorded_argument_modes)) = self
             .analyzer
             .structural_fact_providers()
             .into_iter()
             .find(|provider| provider.structural_language() == language)
-            .and_then(|provider| provider.structural_facts(owner.source()))
+            .and_then(|provider| {
+                let modes = provider.structural_recorded_argument_modes();
+                provider
+                    .structural_facts(owner.source())
+                    .map(|facts| (facts, modes))
+            })
         else {
             return false;
         };
@@ -1297,13 +2158,7 @@ impl DeclarationOwnerOracle for NonLexicalDeclarationOwnerOracle<'_> {
             .as_ref()
             .map(|oracle| oracle as &dyn CallableSignatureOracle);
         let owner_ranges = self.analyzer.ranges_of(&owner);
-        for (node, fact) in facts.nodes().iter().enumerate() {
-            if !fact.kind.satisfies(NormalizedKind::Declaration)
-                || !owner_ranges.contains(&fact.range)
-            {
-                continue;
-            }
-            let node = u32::try_from(node).expect("FileFacts node ids fit in u32");
+        for node in exact_declaration_fact_nodes(&facts, &owner_ranges) {
             if super::super::matcher::match_owner_pattern(
                 pattern,
                 &facts,
@@ -1311,9 +2166,13 @@ impl DeclarationOwnerOracle for NonLexicalDeclarationOwnerOracle<'_> {
                 captures,
                 super::super::matcher::PatternEvalInputs {
                     examined_facts,
+                    cancellation,
+                    max_examined_facts,
                     oracle: signature_oracle,
+                    selection_applications: None,
                     local_value_oracle: None,
                     incomplete,
+                    recorded_argument_modes,
                 },
             ) {
                 return true;
@@ -1372,6 +2231,37 @@ pub(super) fn enclosing_declaration_value(
     declarations_by_file: &mut HashMap<ProjectFile, EnclosingDeclarationIndex>,
 ) -> (Option<DeclarationValue>, bool) {
     let declarations = declaration_index_for_seed(analyzer, seed, declarations_by_file);
+    let fact = seed.facts.node(seed.fact_match.node);
+    if fact.kind == NormalizedKind::Decorator
+        && crate::analyzer::common::language_for_file(&seed.file) == Language::Rust
+    {
+        // Rust outer attributes precede the declaration's indexed range.
+        // Use the structural decorator role to select the decorated owner;
+        // ordinary lexical containment cannot find this relationship.
+        let mut owners = seed
+            .facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(index, owner)| {
+                owner.kind.satisfies(NormalizedKind::Declaration)
+                    && seed
+                        .facts
+                        .role_targets(*index as u32, Role::Decorator)
+                        .any(|target| target.node == Some(seed.fact_match.node))
+            })
+            .map(|(_, owner)| owner.range)
+            .collect::<Vec<_>>();
+        owners.sort_by_key(|range| (range.start_byte, range.end_byte));
+        owners.dedup_by_key(|range| (range.start_byte, range.end_byte));
+        let selected = match owners.as_slice() {
+            [range] => declarations.exact(*range),
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            return (Some(selected), declarations.projection_omitted);
+        }
+    }
     (
         declarations
             .enclosing(seed_range(seed))

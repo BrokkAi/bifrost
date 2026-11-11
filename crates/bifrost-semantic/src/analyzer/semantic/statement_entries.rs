@@ -6,13 +6,14 @@
 
 use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError;
 
-use crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmRequest;
+use crate::analyzer::semantic::cfg_algorithms::{CfgAlgorithmRequest, forward_reachability};
 
 use crate::analyzer::semantic::cfg_algorithms::Reachability;
 
 use crate::analyzer::semantic::ContentIdentity;
 
 use crate::analyzer::semantic::EvidenceCompleteness;
+use crate::analyzer::semantic::EvidenceId;
 
 use crate::analyzer::semantic::OverlaySnapshotId;
 
@@ -49,6 +50,8 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_core::analyzer::model::Range;
 
 use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::HashSet;
+use std::collections::VecDeque;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -148,6 +151,14 @@ pub enum StatementVerdict {
     Open(&'static str),
 }
 
+/// CodeQL-style first visible node of an unreachable control-flow region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionFirstVerdict {
+    First,
+    NotFirst,
+    Open,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StatementCoordinates {
     pub start_line: usize,
@@ -162,6 +173,7 @@ pub struct StatementAssessment {
     pub coordinates: StatementCoordinates,
     pub kind: &'static str,
     pub verdict: StatementVerdict,
+    pub region_first: Option<RegionFirstVerdict>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +200,107 @@ pub mod reason {
     pub const CONTROL_FRONTIER_INCOMPLETE: &str = "control_frontier_incomplete";
 }
 
+/// Points reachable from entry using only proven control edges. Candidate
+/// routes still participate in value propagation, but do
+/// not establish that their destination executes.
+pub fn proven_control_reachable_points(semantics: &ProcedureSemantics) -> HashSet<ProgramPointId> {
+    let mut reached = HashSet::default();
+    let mut pending = VecDeque::from([semantics.entry_point()]);
+    while let Some(point) = pending.pop_front() {
+        if !reached.insert(point) {
+            continue;
+        }
+        pending.extend(semantics.successor_edges(point).filter_map(|(_, edge)| {
+            control_edge_proves_route(semantics, edge.evidence).then_some(edge.target_point)
+        }));
+    }
+    reached
+}
+
+/// Edge completeness describes inherited point facts; only proof says whether
+/// the edge establishes a route.
+pub fn control_edge_proves_route(semantics: &ProcedureSemantics, evidence: EvidenceId) -> bool {
+    semantics
+        .evidence_row(evidence)
+        .expect("validated control evidence")
+        .proof
+        == ProofStatus::Proven
+}
+
+/// Candidate routes indexed by the points they can reach. Construction charges
+/// the caller's CFG budget once per candidate edge, never per queried anchor.
+#[derive(Debug)]
+pub struct CandidateControlRouteIndex {
+    by_evidence: HashMap<EvidenceId, HashSet<ProgramPointId>>,
+    candidate_evidence: HashSet<EvidenceId>,
+}
+
+impl CandidateControlRouteIndex {
+    pub fn build_empty() -> Self {
+        Self {
+            by_evidence: HashMap::default(),
+            candidate_evidence: HashSet::default(),
+        }
+    }
+    pub fn build(
+        semantics: &ProcedureSemantics,
+        request: &mut CfgAlgorithmRequest<'_>,
+    ) -> Result<Self, CfgAlgorithmError<ProgramPointId>> {
+        let candidates = semantics
+            .control_edges()
+            .iter()
+            .filter(|edge| !control_edge_proves_route(semantics, edge.evidence))
+            .collect::<Vec<_>>();
+        let candidate_evidence = candidates.iter().map(|edge| edge.evidence).collect();
+        if candidates.is_empty() {
+            return Ok(Self {
+                by_evidence: HashMap::default(),
+                candidate_evidence,
+            });
+        }
+        let from_entry = forward_reachability(semantics, semantics.entry_point(), request)?;
+        let mut by_evidence = HashMap::<EvidenceId, HashSet<ProgramPointId>>::default();
+        for edge in candidates {
+            request.visit_edge::<ProgramPointId>()?;
+            if !from_entry.contains(semantics, edge.source_point) {
+                continue;
+            }
+            let reached = forward_reachability(semantics, edge.target_point, request)?;
+            let points = by_evidence.entry(edge.evidence).or_default();
+            for point in semantics.points() {
+                request.visit_node::<ProgramPointId>()?;
+                if reached.contains(semantics, point.id) {
+                    points.insert(point.id);
+                }
+            }
+        }
+        Ok(Self {
+            by_evidence,
+            candidate_evidence,
+        })
+    }
+
+    pub fn has_candidate_edge(&self, evidence: EvidenceId) -> bool {
+        self.candidate_evidence.contains(&evidence)
+    }
+
+    pub fn has_candidates(&self) -> bool {
+        !self.candidate_evidence.is_empty()
+    }
+
+    pub fn contains(&self, evidence: EvidenceId, anchor: ProgramPointId) -> bool {
+        self.by_evidence
+            .get(&evidence)
+            .is_some_and(|points| points.contains(&anchor))
+    }
+
+    pub fn any_at(&self, anchor: ProgramPointId) -> bool {
+        self.by_evidence
+            .values()
+            .any(|points| points.contains(&anchor))
+    }
+}
+
 #[doc(hidden)]
 pub fn algorithm_open_reason(error: CfgAlgorithmError<ProgramPointId>) -> &'static str {
     match error {
@@ -205,6 +318,12 @@ pub fn scan_control_evidence(
     reachable: &Reachability<ProgramPointId>,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<Option<&'static str>, CfgAlgorithmError<ProgramPointId>> {
+    let candidate_evidence = semantics
+        .control_edges()
+        .iter()
+        .filter(|edge| !control_edge_proves_route(semantics, edge.evidence))
+        .map(|edge| edge.evidence)
+        .collect::<HashSet<_>>();
     let complete_evidence = |id| {
         let evidence = semantics
             .evidence_row(id)
@@ -214,6 +333,9 @@ pub fn scan_control_evidence(
     };
     for gap in semantics.gaps() {
         request.visit_node::<ProgramPointId>()?;
+        if candidate_evidence.contains(&gap.evidence) {
+            continue;
+        }
         // Reachability depends only on the retained successor topology. A
         // retained-topology gap keeps every successor, and a non-rejoining
         // exceptional exit omits only a route that enters no handler or
@@ -245,7 +367,7 @@ pub fn scan_control_evidence(
         if !reachable.contains(semantics, point.id) {
             continue;
         }
-        if !complete_evidence(point.evidence) {
+        if !complete_evidence(point.evidence) && !candidate_evidence.contains(&point.evidence) {
             return Ok(Some(reason::CONTROL_EVIDENCE_INCOMPLETE));
         }
         if point.id != semantics.normal_exit_point()
@@ -257,7 +379,10 @@ pub fn scan_control_evidence(
     }
     for edge in semantics.control_edges() {
         request.visit_edge::<ProgramPointId>()?;
-        if reachable.contains(semantics, edge.source_point) && !complete_evidence(edge.evidence) {
+        if reachable.contains(semantics, edge.source_point)
+            && !control_edge_proves_route(semantics, edge.evidence)
+            && !candidate_evidence.contains(&edge.evidence)
+        {
             return Ok(Some(reason::CONTROL_EVIDENCE_INCOMPLETE));
         }
     }

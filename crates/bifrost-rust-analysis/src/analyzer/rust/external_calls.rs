@@ -19,6 +19,9 @@ use crate::analyzer::semantic_model::{
     SemanticModelCallableMatch, SemanticModelSymbolKind,
 };
 use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+    RustReexportLookup, RustReexportNamespace,
+};
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 
@@ -100,38 +103,30 @@ pub(crate) fn call_path_for_site<'tree>(
 #[allow(clippy::too_many_arguments)]
 fn native_external_root(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
     root: Node<'_>,
     cancellation: Option<&CancellationToken>,
     imports: Option<&[ImportInfo]>,
-    operation_factory: Option<&native_points::RustDefinitionOperationFactory<'_>>,
-    mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
-    >,
+    operation_factory: &native_points::RustDefinitionOperationFactory<'_>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
 ) -> bool {
     let selected_imports;
     let imports = if let Some(imports) = imports {
         imports
-    } else if let Some(selected) = operation.as_deref_mut() {
+    } else {
         let cancellation = cancellation.cloned().unwrap_or_default();
         let Some(imports) = crate::analyzer::rust::std_types::selected_import_infos(
             analyzer,
-            selected,
+            operation,
             file,
             &cancellation,
         ) else {
             return false;
         };
         selected_imports = imports;
-        &selected_imports
-    } else {
-        let provider = analyzer.import_analysis_provider_for_file(file);
-        selected_imports = provider
-            .map(|provider| provider.import_info_of(token, file))
-            .unwrap_or_default();
         &selected_imports
     };
     native_external_root_with_resolver(
@@ -142,15 +137,7 @@ fn native_external_root(
         root,
         cancellation,
         imports,
-        |query| match operation {
-            Some(operation) => operation_factory
-                .expect("a selected Rust operation has its factory")
-                .resolve(operation, query),
-            None => match operation_factory {
-                Some(factory) => factory.resolve_bounded(query),
-                None => native_points::resolve_rust_definition_bounded(query),
-            },
-        },
+        |query| operation_factory.resolve(operation, query),
     )
 }
 
@@ -267,10 +254,28 @@ fn canonical_rust_external_owner_components(
     tree: &Tree,
     owners: &[Node<'_>],
     cancellation: Option<&CancellationToken>,
-    operation_factory: Option<&native_points::RustDefinitionOperationFactory<'_>>,
-    operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
-    >,
+    operation_factory: &native_points::RustDefinitionOperationFactory<'_>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+) -> Vec<String> {
+    canonical_rust_external_owner_components_with_resolver(
+        analyzer,
+        file,
+        source,
+        tree,
+        owners,
+        cancellation,
+        |query| operation_factory.resolve(operation, query),
+    )
+}
+
+fn canonical_rust_external_owner_components_with_resolver(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    owners: &[Node<'_>],
+    cancellation: Option<&CancellationToken>,
+    resolve: impl FnOnce(BoundedReceiverQuery<'_>) -> BoundedResolution<DefinitionLookupOutcome>,
 ) -> Vec<String> {
     let components = owners
         .iter()
@@ -301,15 +306,7 @@ fn canonical_rust_external_owner_components(
         budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
         cancellation,
     };
-    let resolution = match operation {
-        Some(operation) => operation_factory
-            .expect("a selected Rust operation has its factory")
-            .resolve(operation, query),
-        None => match operation_factory {
-            Some(factory) => factory.resolve_bounded(query),
-            None => native_points::resolve_rust_definition_bounded(query),
-        },
-    };
+    let resolution = resolve(query);
     crate::analyzer::rust::std_types::observe_proof_resolution(&resolution);
     let BoundedResolution::Complete { value, .. } = resolution else {
         return components;
@@ -352,32 +349,78 @@ fn canonical_rust_external_owner_components(
             .collect::<Vec<_>>();
         if let [subject] = subjects.as_slice() {
             // This dotted identity belongs to the resolver, not source syntax.
-            return subject
-                .split('.')
-                .map(str::to_owned)
-                .chain(components.iter().skip(1).cloned())
-                .collect();
+            if let Some(path) = brokk_bifrost_analysis::analyzer::semantic_model::rust_qualified_path::RustQualifiedPath::parse(subject) {
+                return path
+                    .segments()
+                    .iter()
+                    .map(|segment| (*segment).to_owned())
+                    .chain(components.iter().skip(1).cloned())
+                    .collect();
+            }
         }
     }
     components
 }
 
 fn external_call_proof_and_identity(
+    analyzer: &dyn IAnalyzer,
     owner_components: &[String],
     member: &str,
     parameter_count: u32,
-) -> (ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity) {
-    (
+    cancellation: Option<&CancellationToken>,
+) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+    let written_owner = owner_components.join(".");
+    let qualified_name = format!("{written_owner}.{member}");
+    let canonical = if let Some(overlay) = analyzer.semantic_model_overlay() {
+        let owner_lookup = overlay.rust_reexport_lookup_recording_with_cancellation(
+            &written_owner,
+            RustReexportNamespace::TypeOrModule,
+            cancellation,
+        );
+        let local_type_owner = owner_components.len() > 1
+            && matches!(owner_lookup, RustReexportLookup::Absent)
+            && overlay
+                .symbols_named(&written_owner)
+                .records
+                .iter()
+                .any(|symbol| symbol.kind.is_type_declaration() && symbol.kind != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Module);
+        if local_type_owner {
+            None
+        } else {
+            match overlay.rust_reexport_lookup_recording_with_cancellation(
+                &qualified_name,
+                RustReexportNamespace::Value,
+                cancellation,
+            ) {
+                RustReexportLookup::Bound { symbol } => Some(symbol.qualified_name.clone()),
+                RustReexportLookup::Absent => match owner_lookup {
+                    RustReexportLookup::Bound { symbol } => {
+                        Some(format!("{}.{}", symbol.qualified_name, member))
+                    }
+                    RustReexportLookup::Absent => None,
+                    RustReexportLookup::MissingEvidence(_) => return None,
+                },
+                RustReexportLookup::MissingEvidence(_) => return None,
+            }
+        }
+    } else {
+        None
+    };
+    let canonical_parts = canonical
+        .as_deref()
+        .and_then(brokk_bifrost_analysis::analyzer::semantic_model::rust_qualified_path::RustQualifiedPath::parse)
+        .and_then(|path| path.parent_and_member());
+    let (owner, member) = canonical_parts
+        .as_ref()
+        .map(|(owner, member)| (owner.as_str(), *member))
+        .unwrap_or((&written_owner, member));
+    Some((
         ExactExternalCallProof::rust_external_call(
-            format!("{}::{member}", owner_components.join("::")),
+            format!("{}::{member}", owner.replace('.', "::")),
             parameter_count,
         ),
-        ResolverOwnedExternalCalleeIdentity::new(
-            Language::Rust,
-            owner_components.join("."),
-            member,
-        ),
-    )
+        ResolverOwnedExternalCalleeIdentity::new(Language::Rust, owner, member),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -390,13 +433,8 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
     site: &ResolvedReferenceSite,
     receiver_facts: impl FnOnce() -> Option<Arc<crate::analyzer::rust::semantic::RustReceiverTypeFacts>>,
     cancellation: Option<&CancellationToken>,
-    operation_factory: Option<&'factory native_points::RustDefinitionOperationFactory<'analyzer>>,
-    mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            'selection,
-        >,
-    >,
+    operation_factory: &'factory native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
     let callee = call_path_for_site(tree, site)?;
     if callee.kind() == "field_expression" {
@@ -407,7 +445,7 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
             site,
             cancellation,
             operation_factory,
-            operation.as_deref_mut(),
+            &mut *operation,
         ) {
             return Some(proof);
         }
@@ -432,7 +470,8 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
         tree,
         site,
         operation_factory,
-        operation.as_deref_mut(),
+        &mut *operation,
+        cancellation,
     ) {
         return Some(proof);
     }
@@ -464,7 +503,7 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
             "",
             Some(&external_site),
             operation_factory,
-            operation.as_deref_mut(),
+            &mut *operation,
         )
     {
         return Some((
@@ -483,7 +522,7 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
         cancellation,
         None,
         operation_factory,
-        operation.as_deref_mut(),
+        &mut *operation,
     ) {
         return None;
     }
@@ -499,8 +538,13 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
         operation,
     );
     let member = rust_node_text(*terminal, source);
-    let declared =
-        rust_external_callable_declaration(analyzer, &owner_components, member, parameter_count);
+    let declared = rust_external_callable_declaration(
+        analyzer,
+        &owner_components,
+        member,
+        parameter_count,
+        cancellation,
+    );
     if !rust_external_identity_is_unmodeled_std_path(
         analyzer,
         rust_node_text(*root, source),
@@ -513,11 +557,13 @@ pub(crate) fn resolve_exact_rust_external_call_with_operation<'analyzer, 'factor
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return None;
     }
-    Some(external_call_proof_and_identity(
+    external_call_proof_and_identity(
+        analyzer,
         &owner_components,
         member,
         parameter_count,
-    ))
+        cancellation,
+    )
 }
 
 /// Select a member written through a proven nominal type, such as
@@ -529,13 +575,9 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
-    factory: Option<&native_points::RustDefinitionOperationFactory<'analyzer>>,
-    mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            '_,
-        >,
-    >,
+    factory: &native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
     let callee = call_path_for_site(tree, site)?;
     let terminal = callee.child_by_field_name("name")?;
@@ -549,13 +591,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
         }
     }
     let overlay = analyzer.semantic_model_overlay()?;
-    let resolve_owner = |node: Node<'_>,
-                         mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            '_,
-        >,
-    >| {
+    let resolve_owner = |node: Node<'_>, operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>| {
         let owners = rust_path_segments(node)?;
         let root = *owners.first()?;
         let components = canonical_rust_external_owner_components(
@@ -566,7 +602,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             &owners,
             None,
             factory,
-            operation.as_deref_mut(),
+            &mut *operation,
         );
         let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(analyzer);
         let token = brokk_bifrost_core::analyzer::query_token::QueryScope::token(&scope);
@@ -590,7 +626,10 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
                 return None;
             }
             let active = analyzer.active_semantic_models()?;
-            let declarations = active.types_with_id(&symbol.id);
+            let mut declarations = active.types_with_id(&symbol.id);
+            declarations.records.retain(|record| {
+                brokk_bifrost_core::analyzer::model::semantic_pack_realm(&record.shard.manifest.language) == "rust"
+            });
             if declarations.records.is_empty()
                 || declarations
                     .records
@@ -608,10 +647,10 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
         source,
         qualifier,
         factory,
-        operation.as_deref_mut(),
+        &mut *operation,
         None,
     )
-    .or_else(|| resolve_owner(qualifier, operation.as_deref_mut()))?;
+    .or_else(|| resolve_owner(qualifier, &mut *operation))?;
     let mut symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&owner)?;
     // A bare/imported trait path fixes the trait, while its explicit self
     // supplies the implementing type. A bracketed type fixes that type itself.
@@ -619,7 +658,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
         trait_node = Some(qualifier);
     }
     let constraint = if let Some(node) = trait_node {
-        let trait_owner = resolve_owner(node, operation.as_deref_mut())?;
+        let trait_owner = resolve_owner(node, &mut *operation)?;
         let symbol = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(&trait_owner)?;
         if symbol.kind != SemanticModelSymbolKind::Trait {
             return None;
@@ -638,7 +677,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
     if symbol.kind == SemanticModelSymbolKind::Trait {
         let member = rust_node_text(terminal, source);
         let members = overlay
-            .members_of(&symbol.id)
+            .members_of_in_family(&symbol.id, "rust")
             .records
             .into_iter()
             .filter(|record| {
@@ -663,7 +702,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
                     source,
                     ty,
                     factory,
-                    operation.as_deref_mut(),
+                    &mut *operation,
                     None,
                 )
             })?;
@@ -692,9 +731,10 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
             has_receiver,
             parameter_count,
             factory,
-            operation.as_deref_mut(),
+            &mut *operation,
             constraint.as_ref(),
             None,
+            cancellation,
         ) {
             if selected.is_some() {
                 return None;
@@ -717,7 +757,7 @@ pub(crate) fn exact_rust_external_type_call_with_operation<'analyzer>(
                         source,
                         ty,
                         factory,
-                        operation.as_deref_mut(),
+                        &mut *operation,
                         None,
                     )
                 })?;
@@ -751,13 +791,8 @@ fn exact_rust_external_receiver_call<'analyzer>(
     callee: Node<'_>,
     receiver_facts: &crate::analyzer::rust::semantic::RustReceiverTypeFacts,
     cancellation: Option<&CancellationToken>,
-    operation_factory: Option<&native_points::RustDefinitionOperationFactory<'analyzer>>,
-    mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            '_,
-        >,
-    >,
+    operation_factory: &native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
     let receiver = callee.child_by_field_name("value")?;
     let member_node = callee.child_by_field_name("field")?;
@@ -780,7 +815,7 @@ fn exact_rust_external_receiver_call<'analyzer>(
                 source,
                 ty,
                 operation_factory,
-                operation.as_deref_mut(),
+                &mut *operation,
                 cancellation,
             )
         })?;
@@ -796,12 +831,14 @@ fn exact_rust_external_receiver_call<'analyzer>(
         operation,
         None,
         None,
+        cancellation,
     )?;
     if !rust_external_bound_receiver_callable_declaration(
         &overlay,
         &owner.owner,
         member,
         parameter_count,
+        cancellation,
     ) || cancellation.is_some_and(CancellationToken::is_cancelled)
     {
         return None;
@@ -822,10 +859,9 @@ pub(crate) fn rust_import_binder_external_callee(
     imports: &[ImportInfo],
     member: &str,
     owner_components: &[String],
-    operation_factory: Option<&native_points::RustDefinitionOperationFactory<'_>>,
-    operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
-    >,
+    operation_factory: &native_points::RustDefinitionOperationFactory<'_>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'_, '_>,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
     let source = site.source;
     let tree = site.tree;
@@ -858,15 +894,18 @@ pub(crate) fn rust_import_binder_external_callee(
             owner_components,
             member,
             parameter_count,
+            cancellation,
         ))
     {
         return None;
     }
-    Some(external_call_proof_and_identity(
+    external_call_proof_and_identity(
+        analyzer,
         owner_components,
         member,
         parameter_count,
-    ))
+        cancellation,
+    )
 }
 
 /// The parser-backed route of one import binder, shared by member selection
@@ -941,13 +980,8 @@ pub(crate) fn exact_rust_external_method_call_with_operation<'analyzer, 'factory
     source: &str,
     site: &ResolvedReferenceSite,
     cancellation: Option<&CancellationToken>,
-    operation_factory: Option<&'factory native_points::RustDefinitionOperationFactory<'analyzer>>,
-    operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            'selection,
-        >,
-    >,
+    operation_factory: &'factory native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
 ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
     exact_rust_external_method_call_attempt_with_operation(
         analyzer,
@@ -972,35 +1006,24 @@ pub(crate) fn exact_rust_external_method_call_attempt_with_operation<
     source: &str,
     site: &ResolvedReferenceSite,
     cancellation: Option<&CancellationToken>,
-    operation_factory: Option<&'factory native_points::RustDefinitionOperationFactory<'analyzer>>,
-    mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            'selection,
-        >,
-    >,
+    operation_factory: &'factory native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
 ) -> crate::analyzer::rust::std_types::RustProofAttempt<(
     ExactExternalCallProof,
     ResolverOwnedExternalCalleeIdentity,
 )> {
     crate::analyzer::rust::std_types::completed_proof(cancellation, || {
         let method = site.focus_start_byte..site.focus_end_byte;
-        let (owner, arity) = match operation.as_deref_mut() {
-            Some(operation) => {
-                crate::analyzer::rust::std_types::rust_method_receiver_owner_with_operation(
-                    analyzer,
-                    file,
-                    source,
-                    method,
-                    operation_factory.expect("a selected Rust operation has its factory"),
-                    operation,
-                    cancellation,
-                )
-            }
-            None => crate::analyzer::rust::std_types::rust_method_receiver_owner(
-                analyzer, file, source, method,
-            ),
-        }?;
+        let (owner, arity) =
+            crate::analyzer::rust::std_types::rust_method_receiver_owner_with_operation(
+                analyzer,
+                file,
+                source,
+                method,
+                operation_factory,
+                &mut *operation,
+                cancellation,
+            )?;
         let member = source.get(site.focus_start_byte..site.focus_end_byte)?;
         let owner = owner.key();
         let parameter_count = u32::try_from(arity).ok()?;
@@ -1016,6 +1039,7 @@ pub(crate) fn exact_rust_external_method_call_attempt_with_operation<
             operation,
             None,
             None,
+            cancellation,
         )?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return None;
@@ -1032,6 +1056,7 @@ fn rust_external_callable_declaration(
     owner_components: &[String],
     member: &str,
     parameter_count: u32,
+    cancellation: Option<&CancellationToken>,
 ) -> bool {
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return false;
@@ -1050,9 +1075,14 @@ fn rust_external_callable_declaration(
     ) {
         return false;
     }
-    let Some(callable) =
-        rust_external_callable_match_with_overlay(&overlay, &owner, member, parameter_count, false)
-    else {
+    let Some(callable) = rust_external_callable_match_with_overlay(
+        &overlay,
+        &owner,
+        member,
+        parameter_count,
+        false,
+        cancellation,
+    ) else {
         return false;
     };
     match callable.disposition {
@@ -1081,8 +1111,16 @@ fn rust_external_identity_is_unmodeled_std_path(
     let owner = RustOverlayCrates::pack_name(owner_components);
     let language = LanguageDialect::from(Language::Rust).semantic_pack_label();
     if analyzer.active_semantic_models().is_some_and(|active| {
-        active.has_receiverless_procedure_summary_member(language, &owner, member)
-            || active.gapped_member_surface(&owner, member).is_some()
+        let modeled = match active
+            .has_receiverless_procedure_summary_member(language, &owner, member)
+        {
+            brokk_bifrost_analysis::analyzer::store::active_models::FamilyPresence::Present => true,
+            brokk_bifrost_analysis::analyzer::store::active_models::FamilyPresence::Absent => false,
+            brokk_bifrost_analysis::analyzer::store::active_models::FamilyPresence::Open(open) => {
+                unreachable!("a Rust realm question has no JVM-family part: {open:?}")
+            }
+        };
+        modeled || active.gapped_member_surface(&owner, member).is_some()
     }) {
         return false;
     }
@@ -1091,12 +1129,12 @@ fn rust_external_identity_is_unmodeled_std_path(
     };
     let member_name = format!("{owner}.{member}");
     let owner_is_declared = overlay
-        .symbols_named(&owner)
+        .symbols_named_for(&owner, "rust")
         .records
         .into_iter()
         .any(|symbol| symbol.language == language && symbol.qualified_name == owner);
     let member_is_declared = overlay
-        .symbols_named(&member_name)
+        .symbols_named_for(&member_name, "rust")
         .records
         .into_iter()
         .any(|symbol| symbol.language == language && symbol.qualified_name == member_name);
@@ -1108,10 +1146,16 @@ fn rust_external_bound_receiver_callable_declaration(
     owner: &str,
     member: &str,
     parameter_count: u32,
+    cancellation: Option<&CancellationToken>,
 ) -> bool {
-    let Some(callable) =
-        rust_external_callable_match_with_overlay(overlay, owner, member, parameter_count, true)
-    else {
+    let Some(callable) = rust_external_callable_match_with_overlay(
+        overlay,
+        owner,
+        member,
+        parameter_count,
+        true,
+        cancellation,
+    ) else {
         return false;
     };
     if callable.disposition != SemanticModelCallableDisposition::Unique {
@@ -1129,18 +1173,68 @@ fn rust_external_callable_match_with_overlay(
     member: &str,
     parameter_count: u32,
     has_receiver: bool,
+    cancellation: Option<&CancellationToken>,
 ) -> Option<SemanticModelCallableMatch> {
-    let owner = RustOverlayCrates::new(Some(overlay)).referenceable_symbol(owner)?;
-    let callable = overlay.callable_for_application(
-        SemanticModelCallableKey::new(
-            Language::Rust.config_label(),
-            &owner.qualified_name,
-            member,
-            has_receiver,
-            parameter_count,
-        ),
-        &SemanticModelCallApplication::positional(parameter_count),
+    // Preserve the written facade route before owner canonicalization. A
+    // module reexport selects its provider only on the complete call path.
+    let written_path = format!("{owner}.{member}");
+    let reexported = match overlay.rust_reexport_lookup_recording_with_cancellation(
+        &written_path,
+        RustReexportNamespace::Value,
+        cancellation,
+    ) {
+        RustReexportLookup::Bound { symbol } => Some(symbol),
+        RustReexportLookup::Absent => None,
+        RustReexportLookup::MissingEvidence(_) => return None,
+    };
+    let reexported_owner = if reexported.is_none() {
+        match overlay.rust_reexport_lookup_recording_with_cancellation(
+            owner,
+            RustReexportNamespace::TypeOrModule,
+            cancellation,
+        ) {
+            RustReexportLookup::Bound { symbol } => Some(symbol),
+            RustReexportLookup::Absent => None,
+            RustReexportLookup::MissingEvidence(_) => return None,
+        }
+    } else {
+        None
+    };
+    let owner = RustOverlayCrates::new(Some(overlay)).referenceable_symbol(owner);
+    let (callable_owner, callable_member) = reexported
+        .as_ref()
+        .and_then(|symbol| {
+            brokk_bifrost_analysis::analyzer::semantic_model::rust_qualified_path::RustQualifiedPath::parse(
+                &symbol.qualified_name,
+            )
+            .and_then(|path| path.parent_and_member())
+            .map(|(owner, member)| (owner, member.to_owned()))
+        })
+        .or_else(|| reexported_owner.as_ref().map(|owner| (owner.qualified_name.clone(), member.to_owned())))
+        .or_else(|| owner.map(|owner| (owner.qualified_name.clone(), member.to_owned())))?;
+    let key = SemanticModelCallableKey::new(
+        Language::Rust.config_label(),
+        &callable_owner,
+        &callable_member,
+        has_receiver,
+        parameter_count,
     );
+    let application = SemanticModelCallApplication::positional(parameter_count);
+    let callable = if let Some(symbol) = reexported.as_ref() {
+        overlay.callable_for_selected_rust_reexport_application(
+            key,
+            &application,
+            (
+                symbol.provenance.pack_digest.as_str(),
+                symbol.provenance.record_id.as_str(),
+            ),
+            cancellation,
+        )
+    } else if let Some(owner) = reexported_owner {
+        overlay.callable_for_rust_reexported_owner_application(key, &application, owner)
+    } else {
+        overlay.callable_for_selected_application(key, &application, None)
+    };
     // A private or crate-visible member of a public owner is not an external API.
     callable
         .records

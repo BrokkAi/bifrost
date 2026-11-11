@@ -110,6 +110,7 @@ mod rust_indirect_table_tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .unwrap()
             .remove("rust")

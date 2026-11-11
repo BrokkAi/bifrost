@@ -61,6 +61,9 @@ impl StoreLanguageAdapter for JavaRanges {
 }
 
 impl LanguageAdapter for JavaRanges {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        JavaAdapter.line_data_kinds()
+    }
     fn query_directory(&self) -> &'static str {
         JavaAdapter.query_directory()
     }
@@ -526,15 +529,8 @@ impl LanguageAdapter for CancellablePython {
     ) -> Option<&'static brokk_bifrost_analysis::analyzer::cognitive_complexity::Config> {
         self.delegate.cognitive_complexity_config()
     }
-    fn supports_structural_line_data(&self) -> bool {
-        true
-    }
-    fn is_structural_line_data(
-        &self,
-        node: tree_sitter::Node<'_>,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> std::ops::ControlFlow<(), bool> {
-        self.delegate.is_structural_line_data(node, should_stop)
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        self.delegate.line_data_kinds()
     }
     fn parser_included_ranges_from_tree(
         &self,
@@ -678,6 +674,9 @@ impl StoreLanguageAdapter for CancellableStorage {
     }
 }
 impl LanguageAdapter for CancellableStorage {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        JavaAdapter.line_data_kinds()
+    }
     fn query_directory(&self) -> &'static str {
         JavaAdapter.query_directory()
     }
@@ -941,10 +940,22 @@ fn retained_fill_reads_the_ordinary_file_state_snapshot_and_records_the_read() {
         keys.iter()
             .any(|key| matches!(key, ReadKey::File { rel_path: read, .. } if **read == *rel_path))
     };
-    let _request = AnalyzerQueryScope::new(&analyzer);
+    let request = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
     analyzer.inner().bulk_file_states_for_query(
         [primed.clone(), partial.clone()],
         BulkFileStateSource::Include,
+    );
+    assert!(
+        request
+            .captured_read_incompleteness()
+            .iter()
+            .any(|reason| matches!(
+                reason,
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                    _
+                )
+            )),
+        "the bulk request records the parse-incomplete state"
     );
     let published = analyzer
         .inner()

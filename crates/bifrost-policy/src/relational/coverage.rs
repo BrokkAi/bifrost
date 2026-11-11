@@ -209,7 +209,7 @@ impl RelationCoverage {
         let mut coverage = match completion {
             CodeQueryCompletion::Complete if !truncated => Self::exhaustive(),
             CodeQueryCompletion::ProvenSubset { .. } => Self::proven_subset(),
-            _ => Self::incomplete(crate::evaluator::incomplete_reasons(completion, truncated)),
+            _ => Self::incomplete(crate::evaluator::incomplete_reasons(completion)),
         };
         for row in rows {
             // A family that runs no solver enumerates no partition, and adds no

@@ -1,0 +1,40 @@
+{
+  "root": 0,
+  "crate_version": "1.0.0",
+  "includes_private": true,
+  "index": {
+    "0": {
+      "id": 0,
+      "crate_id": 0,
+      "name": "sqlx",
+      "span": null,
+      "visibility": "public",
+      "docs": null,
+      "links": {},
+      "attrs": [],
+      "deprecation": null,
+      "inner": {
+        "module": {
+          "is_crate": true,
+          "items": [],
+          "is_stripped": false
+        }
+      }
+    }
+  },
+  "paths": {
+    "0": {
+      "crate_id": 0,
+      "path": [
+        "sqlx"
+      ],
+      "kind": "module"
+    }
+  },
+  "external_crates": {},
+  "format_version": 61,
+  "target": {
+    "triple": "x86_64-unknown-linux-gnu",
+    "target_features": []
+  }
+}

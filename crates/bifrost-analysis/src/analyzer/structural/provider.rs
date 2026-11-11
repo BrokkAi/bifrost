@@ -24,7 +24,9 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use crate::analyzer::{IAnalyzer, QueryScope};
 use crate::cancellation::CancellationToken;
-use moka::sync::Cache;
+use brokk_bifrost_core::retention_budget::{
+    AllocationCharge, BudgetRegion, RetentionBudget, SharedAllocation,
+};
 use rayon::prelude::*;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -44,9 +46,15 @@ pub struct StructuralFactSnapshotCache {
 }
 
 impl StructuralFactSnapshotCache {
-    pub(crate) fn new(memo_budget_bytes: u64) -> Self {
+    pub(crate) fn new(
+        memo_budget_bytes: u64,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Self {
         Self {
-            inner: super::index::SnapshotStructuralIndexCache::new(memo_budget_bytes),
+            inner: super::index::SnapshotStructuralIndexCache::new_with_budget(
+                memo_budget_bytes,
+                budget,
+            ),
         }
     }
 
@@ -83,6 +91,12 @@ fn source_bytes(file: &ProjectFile) -> u64 {
 
 pub trait StructuralFactProvider: Send + Sync {
     fn structural_language(&self) -> Language;
+
+    fn structural_recorded_argument_modes(
+        &self,
+    ) -> &'static [brokk_bifrost_core::analyzer::structural::facts::ArgumentMode] {
+        &[]
+    }
 
     /// Every analyzed file of this provider's language, unsorted; callers
     /// order for determinism.
@@ -204,7 +218,26 @@ pub trait StructuralFactProvider: Send + Sync {
 
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
 
+    /// Conservative default for providers without an adapter census.
+    fn structural_emitted_kinds(&self) -> Vec<NormalizedKind> {
+        brokk_bifrost_core::analyzer::structural::kinds::ALL_KINDS.to_vec()
+    }
+
+    fn structural_supports_declaration_modifiers(&self, _kind: NormalizedKind) -> bool {
+        false
+    }
+
+    fn structural_supports_declaration_type_kind(&self, _kind: NormalizedKind) -> bool {
+        false
+    }
+
     fn structural_supports_role(&self, role: Role) -> bool;
+
+    /// Roles whose absence this provider's facts prove; see
+    /// `StructuralSpec::certified_roles`.
+    fn structural_certified_roles(&self) -> &'static [Role] {
+        &[]
+    }
 
     /// Whether exact normalized boolean-literal values are available. The
     /// default is unsupported for external providers so exact-value queries
@@ -277,6 +310,19 @@ pub trait StructuralFactProvider: Send + Sync {
     /// content it had since replaced.
     fn structural_content_identity(&self) -> Option<WorkspaceContentIdentity> {
         None
+    }
+
+    /// Selection authority excluding file content. Inventories bind their
+    /// selected file facts separately so an unrelated edit does not move it.
+    fn structural_selection_authority(
+        &self,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        None
+    }
+
+    /// Whether selected sources are indexed or carry explained refusals.
+    fn structural_inventory_complete(&self) -> bool {
+        false
     }
 
     /// The selected file input used by a narrowed posting-index read, even
@@ -384,7 +430,8 @@ pub enum StructuralSourceLimitedOutcome {
 /// Follows the moka weigher idiom of the per-language memo caches
 /// (`src/analyzer/java/cache.rs`).
 pub struct StructuralFactsCache {
-    cache: Cache<StructuralSnapshotKey, Arc<FileFacts>>,
+    cache: BudgetRegion<StructuralSnapshotKey, SharedAllocation<FileFacts>>,
+    budget: RetentionBudget,
     live: Arc<Mutex<LiveFacts>>,
     extractions: AtomicU64,
     hydrations: AtomicU64,
@@ -454,18 +501,11 @@ pub(crate) fn hash_source(source: &str) -> u64 {
     hasher.finish()
 }
 
-fn weigh_entry(_key: &StructuralSnapshotKey, value: &Arc<FileFacts>) -> u32 {
-    let bytes = std::mem::size_of::<StructuralSnapshotKey>() as u64 + value.estimated_bytes();
-    bytes.clamp(1, u32::MAX as u64) as u32
-}
-
 impl StructuralFactsCache {
-    pub(crate) fn new(budget_bytes: u64) -> Self {
+    pub(crate) fn new(budget: &RetentionBudget) -> Self {
         Self {
-            cache: Cache::builder()
-                .max_capacity(budget_bytes.max(1))
-                .weigher(weigh_entry)
-                .build(),
+            cache: budget.region("analysis.structural_facts", None),
+            budget: budget.clone(),
             live: Arc::new(Mutex::new(LiveFacts::default())),
             extractions: AtomicU64::new(0),
             hydrations: AtomicU64::new(0),
@@ -478,6 +518,7 @@ impl StructuralFactsCache {
     pub(crate) fn sharing_entries(&self) -> Self {
         Self {
             cache: self.cache.clone(),
+            budget: self.budget.clone(),
             live: Arc::clone(&self.live),
             extractions: AtomicU64::new(0),
             hydrations: AtomicU64::new(0),
@@ -558,7 +599,8 @@ impl StructuralFactsCache {
             let mut live = self.live.lock().expect("live facts lock poisoned");
             if let Some(facts) = live.entries.get(&key).and_then(Weak::upgrade) {
                 drop(live);
-                self.cache.insert(key, Arc::clone(&facts));
+                self.cache
+                    .insert(key, SharedAllocation::new(Arc::clone(&facts)));
                 return Ok((facts, StructuralFactsCacheOutcome::MemoryHit));
             }
             if let Some(slot) = live.building.get(&key) {
@@ -602,7 +644,14 @@ impl StructuralFactsCache {
                 });
             }
         };
-        let (facts, outcome) = build()?;
+        let (mut facts, outcome) = build()?;
+        let bytes = usize::try_from(facts.estimated_bytes())
+            .unwrap_or(usize::MAX)
+            .saturating_add(std::mem::size_of::<FileFacts>())
+            .saturating_add(key.blob.lang.capacity().saturating_mul(2));
+        Arc::get_mut(&mut facts)
+            .expect("fresh facts have one owner")
+            .charge = AllocationCharge::acquire(&self.budget, bytes);
         let existing = {
             let mut live = self.live.lock().expect("live facts lock poisoned");
             // Re-entrant and cancelled no-slot builds can publish first.
@@ -622,30 +671,48 @@ impl StructuralFactsCache {
         };
         // In particular, drop a losing allocation only after unlocking.
         let facts = existing.unwrap_or(facts);
-        self.cache.insert(key, Arc::clone(&facts));
+        self.cache
+            .insert(key, SharedAllocation::new(Arc::clone(&facts)));
         Ok((facts, outcome))
     }
 
     #[doc(hidden)]
     pub fn get(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
-        self.cache.get(key)
+        self.cache.get(key).map(|value| Arc::clone(value.arc()))
     }
+
+    /// Bounded maintenance passes the heap test may take while waiting for an
+    /// invalidated entry's value to be released. The bound only exists so an
+    /// unrelated holder cannot spin the helper forever.
+    #[cfg(any(test, feature = "test-support"))]
+    const HEAP_TEST_RELEASE_PASSES: usize = 1024;
 
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn take_for_heap_test(&self, key: &StructuralSnapshotKey) -> Option<Arc<FileFacts>> {
-        let facts = self.cache.get(key)?;
-        let capacity = self
-            .cache
-            .policy()
-            .max_capacity()
-            .expect("structural facts have an explicit byte cap");
-        assert!(u64::from(weigh_entry(key, &facts)) <= capacity);
+        let facts = self.cache.get(key)?.arc().clone();
         // Called only after the original heap measurement. Hand the entry's
         // ownership to the test so its destructor can attribute actual bytes
         // without counting cache maintenance as request-owned releases.
         self.cache.invalidate(key);
-        self.cache.run_pending_tasks();
+        // Invalidation removes the entry, but moka reads an invalidated
+        // bucket's value out and defers destroying it on crossbeam-epoch's
+        // garbage list. A maintenance pass advances the global epoch by at
+        // most one, and a participant pinned in an older epoch can stall that
+        // advance, so one pass is not guaranteed to run the value's
+        // destructor. Keep taking maintenance passes until the cache no
+        // longer owns the allocation. The bound only stops an outside holder
+        // from spinning this helper; the caller's assertion still rejects it.
+        for _ in 0..Self::HEAP_TEST_RELEASE_PASSES {
+            self.cache.run_pending_tasks();
+            if Arc::strong_count(&facts) == 1 {
+                return Some(facts);
+            }
+            // A thread that pinned an older epoch must reach its unpin point
+            // before the next pass can advance the epoch and reclaim the
+            // deferred value.
+            std::thread::yield_now();
+        }
         Some(facts)
     }
 
@@ -865,6 +932,14 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
 impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
     fn structural_language(&self) -> Language {
         self.adapter().language()
+    }
+
+    fn structural_recorded_argument_modes(
+        &self,
+    ) -> &'static [brokk_bifrost_core::analyzer::structural::facts::ArgumentMode] {
+        self.adapter()
+            .structural_spec()
+            .map_or(&[], |spec| spec.recorded_argument_modes())
     }
 
     fn structural_files(&self) -> Vec<ProjectFile> {
@@ -1298,10 +1373,36 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             .is_some_and(|spec| spec.supports_kind(kind))
     }
 
-    fn structural_supports_role(&self, role: Role) -> bool {
+    fn structural_emitted_kinds(&self) -> Vec<NormalizedKind> {
+        self.adapter().structural_spec().map_or_else(
+            || brokk_bifrost_core::analyzer::structural::kinds::ALL_KINDS.to_vec(),
+            |spec| spec.emitted_kinds(),
+        )
+    }
+
+    fn structural_supports_declaration_modifiers(&self, kind: NormalizedKind) -> bool {
         self.adapter()
             .structural_spec()
-            .is_some_and(|spec| spec.supports_role(role))
+            .is_some_and(|spec| spec.authoritative_modifier_kinds().contains(&kind))
+    }
+
+    fn structural_supports_declaration_type_kind(&self, kind: NormalizedKind) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.authoritative_type_kind_kinds().contains(&kind))
+    }
+
+    fn structural_supports_role(&self, role: Role) -> bool {
+        self.adapter().structural_spec().is_some_and(|spec| {
+            spec.supports_role(role)
+                && (!role.has_coverage() || !spec.certified_role_kinds(role).is_empty())
+        })
+    }
+
+    fn structural_certified_roles(&self) -> &'static [Role] {
+        self.adapter()
+            .structural_spec()
+            .map_or(&[], |spec| spec.certified_roles())
     }
 
     fn structural_supports_boolean_literal_value(&self) -> bool {
@@ -1388,6 +1489,16 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         ))
     }
 
+    fn structural_selection_authority(
+        &self,
+    ) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+        Some(TreeSitterAnalyzer::structural_selection_authority(self))
+    }
+
+    fn structural_inventory_complete(&self) -> bool {
+        self.indexed_source_inventory_complete()
+    }
+
     fn structural_file_read_key(&self, file: &ProjectFile) -> Option<crate::analyzer::ReadKey> {
         Some(match self.resolve_live_oid_for_file(file) {
             Some(oid) => self.file_read_key(file, oid, self.selected_parse_variant(file)?),
@@ -1446,7 +1557,7 @@ mod tests {
 
     #[test]
     fn structural_facts_cache_reuses_live_allocations_after_eviction() {
-        let cache = StructuralFactsCache::new(1024 * 1024);
+        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
         let shared = cache.sharing_entries();
         let source = "live facts";
         let key = &StructuralSnapshotKey::for_test(source, "typescript");
@@ -1486,7 +1597,7 @@ mod tests {
     #[test]
     #[hardwon("#7445: dead live-facts registry entries outlived the query that held them")]
     fn structural_facts_cache_releases_registrations_and_capacity() {
-        let cache = StructuralFactsCache::new(1024 * 1024);
+        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
         let holders: Vec<_> = (0..128)
             .map(|index| {
                 let source = format!("live facts {index}");
@@ -1545,7 +1656,7 @@ mod tests {
     fn structural_facts_cache_cancelled_waiter_leaves_blocked_leader() {
         use std::sync::mpsc;
 
-        let cache = StructuralFactsCache::new(1024 * 1024);
+        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
         let key = &StructuralSnapshotKey::for_test("cancelled waiter", "typescript");
         let cancellation = CancellationToken::new();
         let (started_tx, started_rx) = mpsc::channel();
@@ -1609,7 +1720,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         for fail_leader in [false, true] {
-            let cache = StructuralFactsCache::new(1024 * 1024);
+            let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
             let key = &StructuralSnapshotKey::for_test("shared build", "typescript");
             let builds = AtomicU64::new(0);
             let (started_tx, started_rx) = mpsc::channel();
@@ -1683,7 +1794,7 @@ mod tests {
 
     #[test]
     fn structural_facts_cache_reentrant_build_adopts_inner_allocation() {
-        let cache = StructuralFactsCache::new(1024 * 1024);
+        let cache = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
         let key = &StructuralSnapshotKey::for_test("reentrant", "typescript");
         let mut inner = None;
         let (outer, _) = cache
@@ -1710,7 +1821,7 @@ mod tests {
     fn structural_facts_cache_reports_exact_materialization_outcomes() {
         let source = "export function demo() {}\n";
         let key = &StructuralSnapshotKey::for_test(source, "typescript");
-        let hydrated = StructuralFactsCache::new(1024 * 1024);
+        let hydrated = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
 
         assert!(hydrated.get(key).is_none());
         let (facts, outcome) = hydrated.materialize(
@@ -1735,7 +1846,7 @@ mod tests {
                 .is_none()
         );
 
-        let extracted = StructuralFactsCache::new(1024 * 1024);
+        let extracted = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
         let (facts, outcome) =
             extracted.materialize(key.clone(), || None, || Some(empty_facts(source)));
         assert!(facts.is_some());
@@ -1749,7 +1860,7 @@ mod tests {
         assert!(shared.get(key).is_some());
         assert_eq!(shared.extraction_count(), 0);
 
-        let unavailable = StructuralFactsCache::new(1024 * 1024);
+        let unavailable = StructuralFactsCache::new(&RetentionBudget::new(1024 * 1024));
         let (facts, outcome) = unavailable.materialize(
             StructuralSnapshotKey::for_test("other\n", "typescript"),
             || None,

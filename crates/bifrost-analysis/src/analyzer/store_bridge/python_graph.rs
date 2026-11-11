@@ -21,6 +21,11 @@ struct PythonGraphStageAdapter<'a> {
     environment: PythonSelectedEnvironment,
 }
 impl GraphStageAdapter for PythonGraphStageAdapter<'_> {
+    // Not yet: on Django, the whole graph staged in file chunks differed from
+    // the same graph staged with one worker (edges drawn in one run were
+    // withheld or unproven in the other), so a file's results can depend on
+    // which roots share its operation. Stage the environment as one unit
+    // until per-root results are shown to be independent of their chunk.
     const FILE_CHUNKS_REPRODUCE_UNIT: bool = false;
     type Unit = ();
     type Payload = GraphStageBatches<NativeGraphBatch>;
@@ -162,13 +167,14 @@ impl GraphUnitRules for PythonGraphUnitRules {
         )
     }
 }
-/// Reuse analyzer read capture and shared graph admission/replay, at width one.
+/// Reuse analyzer read capture and shared graph admission/replay.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_python_graph_units(
     operation: &SelectedResolutionOperation<'_, '_>,
     analyzer: &dyn IAnalyzer,
     environment: PythonSelectedEnvironment,
     files: &[ProjectFile],
+    worker_count: usize,
     cancellation: &CancellationToken,
     sink: &mut dyn FnMut(&FactReferenceBatchAnswer, &FactReferenceEdgeBatch) -> Result<()>,
 ) -> Result<SelectedResolutionOperationOutcome<GraphStageResult>> {
@@ -181,7 +187,7 @@ pub fn stage_python_graph_units(
         },
         files,
         MAX_REFERENCE_SEEDS_PER_BATCH,
-        1,
+        worker_count,
         cancellation,
         &mut SelectedResolutionContextMetrics,
         |payload| payload.replay(cancellation, |batch| sink(&batch.source, &batch.edges)),

@@ -1,9 +1,13 @@
+absent-intermediate:
+nested/one/two/Source.cs: proven=1 open=0
+nested/one/two/Extra.cs: proven=0 open=0
+project=Some("nested/one/two/App.csproj") items=[(Include, "nested/one/two/Source.cs")]
 resolved:
 src/App/Source.cs: proven=1 open=0
 src/App/Extra.cs: proven=0 open=0
 conditioned/Source.cs: proven=1 open=0
-project=Some("src/App/App.csproj") items=[(Include, "src/App/Source.cs")]
 project=Some("conditioned/Conditional.csproj") items=[(Include, "conditioned/Source.cs")]
+project=Some("src/App/App.csproj") items=[(Include, "src/App/Source.cs")]
 missing:
 other/Source.cs: proven=0 open=1
 project=Some("other/Other.csproj") items=[(DefaultTree, "other"), (OpenTree, "")]

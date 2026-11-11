@@ -4,7 +4,7 @@
 //! language-policy semantics. Keeping these checks here lets Android and
 //! Spring policies share one relation without scanning source text.
 
-use super::configuration::ConfigurationFactValue;
+use super::configuration::{ConfigurationFactValue, ScalarValue};
 use crate::query::ConfigurationFactsFilter;
 use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationDocumentFacts, ConfigurationFact, ConfigurationFactId, ConfigurationMemberRole,
@@ -22,16 +22,18 @@ pub(super) fn has_xml_relation_filter(filter: &ConfigurationFactsFilter) -> bool
         || has_peer_relation(filter)
 }
 
-/// Apply the XML-only relation axes in a configuration seed filter.
+/// Apply the XML-only relation axes in a configuration seed filter. `Err`
+/// means a value-reading axis would read a scalar the decoder cannot decode,
+/// so the relation is undecided.
 pub(super) fn matches_xml_relations(
     value: &ConfigurationFactValue,
     filter: &ConfigurationFactsFilter,
-) -> bool {
+) -> Result<bool, ()> {
     if !has_xml_relation_filter(filter) {
-        return true;
+        return Ok(true);
     }
     if value.format() != crate::query::domain::ConfigurationFormat::Xml {
-        return false;
+        return Ok(false);
     }
     if !filter.xml_parent_keys.is_empty()
         && !filter
@@ -39,13 +41,90 @@ pub(super) fn matches_xml_relations(
             .iter()
             .any(|key| containing_element_key(value) == Some(key.as_str()))
     {
-        return false;
+        return Ok(false);
     }
     if !filter.xml_preceding_sibling_keys.is_empty()
         && !has_preceding_element_sibling(value, &filter.xml_preceding_sibling_keys)
     {
+        return Ok(false);
+    }
+    if relation_reads_undecodable(value, filter) {
+        return Err(());
+    }
+    Ok(matches_value_relations(value, filter))
+}
+
+/// Whether a value-reading axis of `filter` would read an XML scalar the
+/// decoder cannot decode (a DTD entity, for example). Those axes read such a
+/// scalar as no value at all, so neither their match nor their non-match is
+/// decided. Sibling-attribute values read the fact's own siblings; reference
+/// axes read every source and target attribute of the document; peer axes
+/// compare whole element subtrees, so they read every scalar.
+fn relation_reads_undecodable(
+    value: &ConfigurationFactValue,
+    filter: &ConfigurationFactsFilter,
+) -> bool {
+    let undecodable = |fact_id: ConfigurationFactId| {
+        matches!(scalar_at(value, fact_id), ScalarValue::Undecodable)
+    };
+    let sibling_values = !filter.xml_sibling_attribute_values.is_empty()
+        || !filter.xml_sibling_attribute_values_ignore_case.is_empty();
+    if sibling_values
+        && let Some((members, target)) = containing_members(value)
+        && members.iter().any(|member_id| {
+            member_id.index() != target
+                && matches!(
+                    value.document.fact(*member_id).map(ConfigurationFact::kind),
+                    Some(ConfigurationNodeKind::Member {
+                        role: ConfigurationMemberRole::XmlAttribute,
+                        key,
+                        value: Some(member_value),
+                    }) if (filter.xml_sibling_attribute_keys.is_empty()
+                        || filter
+                            .xml_sibling_attribute_keys
+                            .iter()
+                            .any(|candidate| candidate == key.text()))
+                        && undecodable(*member_value)
+                )
+        })
+    {
+        return true;
+    }
+    let references = has_reference_relation(filter);
+    let peers = has_peer_relation(filter);
+    if !references && !peers {
         return false;
     }
+    value
+        .document
+        .facts()
+        .iter()
+        .enumerate()
+        .any(|(index, fact)| match fact.kind() {
+            ConfigurationNodeKind::Scalar { .. } if peers => {
+                undecodable(ConfigurationFactId::new(index).expect("XML fact index is finite"))
+            }
+            ConfigurationNodeKind::Member {
+                role: ConfigurationMemberRole::XmlAttribute,
+                key,
+                value: Some(member_value),
+            } if references => {
+                filter
+                    .xml_reference_source_keys
+                    .iter()
+                    .chain(&filter.xml_reference_target_keys)
+                    .any(|candidate| candidate == key.text())
+                    && undecodable(*member_value)
+            }
+            _ => false,
+        })
+}
+
+/// The value-reading relation axes, over decoded scalars only.
+fn matches_value_relations(
+    value: &ConfigurationFactValue,
+    filter: &ConfigurationFactsFilter,
+) -> bool {
     if has_sibling_attribute_filter(filter)
         && !has_matching_sibling_attribute(
             value,
@@ -236,7 +315,7 @@ fn has_matching_sibling_attribute(
     })
 }
 
-fn scalar_value_at(value: &ConfigurationFactValue, fact_id: ConfigurationFactId) -> Option<String> {
+fn scalar_at(value: &ConfigurationFactValue, fact_id: ConfigurationFactId) -> ScalarValue {
     let candidate = ConfigurationFactValue {
         file: value.file.clone(),
         document: value.document.clone(),
@@ -244,6 +323,10 @@ fn scalar_value_at(value: &ConfigurationFactValue, fact_id: ConfigurationFactId)
         index: fact_id.index(),
     };
     candidate.scalar_value()
+}
+
+fn scalar_value_at(value: &ConfigurationFactValue, fact_id: ConfigurationFactId) -> Option<String> {
+    scalar_at(value, fact_id).decoded()
 }
 
 fn has_reference_relation(filter: &ConfigurationFactsFilter) -> bool {

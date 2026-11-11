@@ -64,6 +64,7 @@ fn explanation_selection_registers_every_input_and_refuses_ambiguity() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     );
     assert_eq!(
         result.unwrap_err(),
@@ -80,6 +81,7 @@ fn explanation_selection_registers_every_input_and_refuses_ambiguity() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap_err();
     assert!(
@@ -103,6 +105,7 @@ fn loaded_finding_obeys_generation_and_caller_bounds() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let registry = crate::test_support::registry_with_policy("test:host-bounds", POLICY, "policy");
     let policy = registry.policies().next().expect("loaded policy");
@@ -214,6 +217,7 @@ fn why_not_error_advertises_only_why_not_families() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap_err();
     assert_eq!(
@@ -272,6 +276,7 @@ fn timed_out_host_request_reaches_bounded_explanation() {
         None,
         Some(&timeout),
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     );
     let explanation = result.expect("timeout must remain a structured incomplete result");
     assert_eq!(
@@ -293,6 +298,7 @@ fn timed_out_ranking_reports_incomplete_work() {
         None,
         Some(&timeout),
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     );
     let ranking = result.expect("timeout must remain a structured incomplete result");
     assert!(
@@ -472,6 +478,7 @@ fn rank_authored(
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("ranking")
 }
@@ -546,6 +553,7 @@ fn ranked_seed_search_stays_within_authored_file_scope() {
         None,
         None,
         &ExplanationLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("ranking");
     let NearMissEnumeration::PolicySeed { scope, .. } = ranking.enumeration() else {

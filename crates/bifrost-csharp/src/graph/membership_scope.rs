@@ -65,7 +65,7 @@ pub struct MembershipScopedSource<'a> {
     type_identities: Arc<CaptureScopedMemo<Mutex<VisibilityAnswers<String>>>>,
     /// Request-lifetime direct ancestors derived through this view, with
     /// whether the derivation admitted doubt.
-    direct_ancestors: Arc<CaptureScopedMemo<Mutex<HashMap<CodeUnit, DoubtedAncestors>>>>,
+    direct_ancestors: Arc<CaptureScopedMemo<Mutex<DirectAncestors>>>,
     /// Declarations admitted although their membership is unproven. An
     /// `AtomicUsize` for the same `Sync` reason as `answers`.
     doubt: Arc<AtomicUsize>,
@@ -74,8 +74,99 @@ pub struct MembershipScopedSource<'a> {
     usage_static_types: CaptureScopedMemo<OnceLock<std::sync::Arc<Vec<CodeUnit>>>>,
 }
 
-/// Direct ancestors and whether deriving them admitted doubt.
-type DoubtedAncestors = (Vec<CodeUnit>, bool);
+/// A derived value and whether deriving it admitted a declaration of
+/// unproven membership. Built only by [`MembershipScopedSource::doubted`].
+#[derive(Clone, Debug)]
+pub struct Doubted<T> {
+    value: T,
+    doubted: bool,
+}
+
+impl<T> Doubted<T> {
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn doubted(&self) -> bool {
+        self.doubted
+    }
+
+    pub fn into_parts(self) -> (T, bool) {
+        (self.value, self.doubted)
+    }
+}
+
+impl<T> Doubted<Option<T>> {
+    /// `None` when the derivation produced no value; the doubt it admitted
+    /// was already counted when it ran.
+    pub fn transpose(self) -> Option<Doubted<T>> {
+        let doubted = self.doubted;
+        self.value.map(|value| Doubted { value, doubted })
+    }
+}
+
+/// A per-scan cache of derivations through a [`MembershipScopedSource`].
+///
+/// A hit replays the doubt its derivation admitted when it was computed, so
+/// a doubtful answer stays unproven at every site that reuses it.
+pub struct DoubtMemo<K, V>(HashMap<K, Doubted<V>>);
+
+impl<K, V> Default for DoubtMemo<K, V> {
+    fn default() -> Self {
+        Self(HashMap::default())
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> DoubtMemo<K, V> {
+    /// The cached answer for `key`, replaying its doubt into `membership`.
+    pub fn get(&self, key: &K, membership: &MembershipScopedSource<'_>) -> Option<&V> {
+        let entry = self.0.get(key)?;
+        if entry.doubted {
+            membership.add_doubt();
+        }
+        Some(&entry.value)
+    }
+
+    pub fn insert(&mut self, key: K, derived: Doubted<V>) -> &V {
+        match self.0.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(derived);
+                &entry.into_mut().value
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => &entry.insert(derived).value,
+        }
+    }
+
+    /// The cached answer for `key`, or `derive` measured and cached.
+    pub fn get_or_derive(
+        &mut self,
+        key: K,
+        membership: &MembershipScopedSource<'_>,
+        derive: impl FnOnce() -> V,
+    ) -> &V {
+        if self.0.contains_key(&key) {
+            return self
+                .get(&key, membership)
+                .expect("a contained key has an entry");
+        }
+        let derived = membership.doubted(derive);
+        self.insert(key, derived)
+    }
+}
+
+/// The doubt count when one reference site started. A site is proven only
+/// while no derivation for it admitted doubt.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SiteDoubt(usize);
+
+impl SiteDoubt {
+    pub fn tripped(self, membership: &MembershipScopedSource<'_>) -> bool {
+        membership.doubt() > self.0
+    }
+}
+
+/// Direct ancestors by type, with the doubt each derivation admitted.
+type DirectAncestors = DoubtMemo<CodeUnit, Vec<CodeUnit>>;
 
 type VisibilityAnswers<K> = HashMap<K, Option<CSharpCompilationVisibility>>;
 
@@ -102,29 +193,34 @@ impl<'a> MembershipScopedSource<'a> {
     }
 
     /// Number of unproven-membership declarations (and failed membership reads)
-    /// admitted so far.
+    /// admitted so far, for diagnostics. Proof gates read doubt through
+    /// [`Self::doubted`] and [`SiteDoubt`], never by comparing counts.
     pub fn doubt(&self) -> usize {
         self.doubt.load(Ordering::Relaxed)
     }
 
-    /// Record doubt carried by a cached derivation.
-    pub fn add_doubt(&self) {
+    /// Record doubt from an open source surface whose derivation is measured
+    /// by the caller's `DoubtMemo`.
+    pub(super) fn add_doubt(&self) {
         self.doubt.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Run `derive` and report whether it admitted doubt, so a cache of its
-    /// answer can carry the doubt to every later use.
-    pub fn measured<T>(&self, derive: impl FnOnce() -> T) -> (T, bool) {
+    /// Run `derive` and record whether it admitted doubt. This is the only
+    /// way to build a [`Doubted`], so a [`DoubtMemo`] cannot hold an answer
+    /// whose doubt was never measured.
+    pub fn doubted<T>(&self, derive: impl FnOnce() -> T) -> Doubted<T> {
         let before = self.doubt();
         let value = derive();
-        (value, self.doubt() > before)
+        Doubted {
+            value,
+            doubted: self.doubt() > before,
+        }
     }
 
-    /// Replay doubt a cached derivation recorded when it was computed.
-    pub fn replay(&self, doubted: bool) {
-        if doubted {
-            self.add_doubt();
-        }
+    /// Start measuring one reference site: a hit whose derivation admits
+    /// doubt after this point is not proven.
+    pub fn site(&self) -> SiteDoubt {
+        SiteDoubt(self.doubt())
     }
 
     /// The membership of `unit`'s file for the reference, `None` for a
@@ -623,8 +719,15 @@ impl CodeUnitIndex for MembershipScopedSource<'_> {
 }
 
 impl ImportAnalysisProvider for MembershipScopedSource<'_> {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        Arc::new(self.admit_set(self.inner.imported_code_units_of(file).iter().cloned()))
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+            || -> HashSet<CodeUnit> {
+                self.admit_set(self.inner.imported_code_units_of(file).iter().cloned())
+            },
+        )
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -857,19 +960,20 @@ impl TypeHierarchyProvider for MembershipScopedSource<'_> {
                     let cached = direct_ancestors_memo
                         .lock()
                         .expect("direct ancestor cache poisoned")
-                        .get(code_unit)
+                        .get(code_unit, self)
                         .cloned();
-                    if let Some((ancestors, doubted)) = cached {
-                        self.replay(doubted);
+                    if let Some(ancestors) = cached {
                         return ancestors;
                     }
-                    let (ancestors, doubted) =
-                        self.measured(|| self.inner.direct_ancestors_through(self, code_unit));
+                    // Derive outside the lock: the derivation reads this view's
+                    // hierarchy again.
+                    let derived =
+                        self.doubted(|| self.inner.direct_ancestors_through(self, code_unit));
                     direct_ancestors_memo
                         .lock()
                         .expect("direct ancestor cache poisoned")
-                        .insert(code_unit.clone(), (ancestors.clone(), doubted));
-                    ancestors
+                        .insert(code_unit.clone(), derived)
+                        .clone()
                 },
             )
         };
@@ -936,6 +1040,26 @@ impl TypeHierarchyProvider for MembershipScopedSource<'_> {
 }
 
 impl CSharpSource for MembershipScopedSource<'_> {
+    fn record_pack_open(&self, reason: &'static str) {
+        self.inner.record_pack_open(reason);
+    }
+    fn fenced_pack_owner_exists(&self, owner_fqn: &str) -> bool {
+        self.inner.fenced_pack_owner_exists(owner_fqn)
+    }
+    fn pack_open_reason(&self, owner_fqn: &str, member: Option<&str>) -> Option<&'static str> {
+        self.inner.pack_open_reason(owner_fqn, member)
+    }
+    fn model_extension_methods(
+        &self,
+        member: &str,
+    ) -> crate::graph::resolver::CSharpModelExtensionMethods {
+        self.inner.model_extension_methods(member)
+    }
+
+    fn fenced_pack_active(&self) -> bool {
+        self.inner.fenced_pack_active()
+    }
+
     fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
         self.read_capability.clone()
     }

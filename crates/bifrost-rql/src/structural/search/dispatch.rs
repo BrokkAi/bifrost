@@ -17,9 +17,47 @@
 use super::*;
 
 use crate::analyzer::semantic::{
-    CandidateCoverage, ExactExternalProcedureTarget, ResolverOwnedExternalCalleeIdentity,
-    SemanticLocator, UnmaterializedExternalTarget,
+    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, ProofStatus,
+    ResolverOwnedExternalCalleeIdentity, SemanticLocator, SemanticOutcome,
+    UnmaterializedExternalTarget,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DispatchStatus {
+    Resolved,
+    Ambiguous,
+    Unknown,
+    Unsupported,
+    Unproven,
+    ExceededBudget,
+    Cancelled,
+}
+
+impl DispatchStatus {
+    pub(super) fn from_outcome<T>(outcome: &SemanticOutcome<T>) -> Self {
+        match outcome {
+            SemanticOutcome::Complete { .. } => Self::Resolved,
+            SemanticOutcome::Ambiguous { .. } => Self::Ambiguous,
+            SemanticOutcome::Unknown { .. } => Self::Unknown,
+            SemanticOutcome::Unsupported { .. } => Self::Unsupported,
+            SemanticOutcome::Unproven { .. } => Self::Unproven,
+            SemanticOutcome::ExceededBudget { .. } => Self::ExceededBudget,
+            SemanticOutcome::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Ambiguous => "ambiguous",
+            Self::Unknown => "unknown",
+            Self::Unsupported => "unsupported",
+            Self::Unproven => "unproven",
+            Self::ExceededBudget => "exceeded_budget",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
 
 /// Typed boundary vocabulary retained until the public row rendering boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +134,8 @@ impl DispatchSiteValue {
 #[derive(Debug, Clone)]
 pub(super) struct DispatchTargetValue {
     pub(super) site: DispatchSiteValue,
+    /// Exact structural root whose traversal reached this arm.
+    pub(super) root_id: String,
     pub(super) ordinal: usize,
 }
 
@@ -142,6 +182,7 @@ pub(super) const DISPATCH_ARM_LABELS: &[&str] = &["proven_dispatch", "may_dispat
 #[derive(Debug, Clone)]
 pub(super) struct DispatchSiteAnswer {
     pub(super) outcome: &'static str,
+    pub(super) status: DispatchStatus,
     pub(super) coverage: CandidateCoverage,
     /// Detailed oracle reasons retained for source-attributed effect diagnostics.
     pub(super) coverage_reasons: Vec<String>,
@@ -171,12 +212,13 @@ impl DispatchSiteAnswer {
     /// The answer for a site whose dispatch never ran to a published result.
     /// It states the typed reason and retains no arm.
     pub(super) fn interrupted(
-        outcome: &'static str,
+        status: DispatchStatus,
         semantic_unsupported: Option<&'static str>,
         exceeded_limit: Option<&'static str>,
     ) -> Self {
         Self {
-            outcome,
+            outcome: status.label(),
+            status,
             coverage: CandidateCoverage::Open,
             coverage_reasons: Vec::new(),
             call_site_count: 0,
@@ -195,7 +237,9 @@ impl DispatchSiteAnswer {
     /// published separately so an assertion can also read the exact one that
     /// kept the arm open.
     pub(super) fn dispatch_label(&self, arm: &DispatchArm) -> &'static str {
-        if self.coverage.is_exhaustive() && arm.proof == "proven" && arm.completeness == "complete"
+        if self.coverage.is_exhaustive()
+            && arm.proof == DispatchProof::Proven
+            && arm.completeness == DispatchCompleteness::Complete
         {
             "proven_dispatch"
         } else {
@@ -211,6 +255,9 @@ pub(super) struct DispatchArm {
     pub(super) call_context: usize,
     /// Exact source-backed target retained without pinning its artifact.
     pub(super) target_procedure: Option<brokk_bifrost_flow::value_flow::DurableProcedureKey>,
+    /// The exact selected semantic locator. A local source procedure has no
+    /// indexed CodeUnit, so its durable key and locator remain the typed join.
+    pub(super) target_locator: Option<SemanticLocator>,
     /// The oracle's complete typed boundary, independent of its row label.
     pub(super) boundary: Option<crate::analyzer::semantic::DispatchBoundaryKind>,
     /// Canonical execution timing for this particular target arm. A targeted
@@ -238,9 +285,61 @@ pub(super) struct DispatchArm {
     /// rather than re-derived from `target_path`, which is a synthetic
     /// provenance path and carries no member identity at all.
     pub(super) unmaterialized_target: Option<UnmaterializedExternalTarget>,
-    pub(super) proof: &'static str,
-    pub(super) completeness: &'static str,
+    pub(super) proof: DispatchProof,
+    pub(super) completeness: DispatchCompleteness,
     pub(super) boundary_kind: Option<DispatchBoundaryClass>,
+    pub(super) boundary_reason: Option<crate::analyzer::semantic::DispatchBoundaryPartialCause>,
+}
+
+/// Whether one dispatch arm is proven. The rendered label is derived from the
+/// variant, so a label and a flag cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DispatchProof {
+    Proven,
+    Unproven,
+}
+
+impl DispatchProof {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Proven => "proven",
+            Self::Unproven => "unproven",
+        }
+    }
+}
+
+impl From<&ProofStatus> for DispatchProof {
+    fn from(status: &ProofStatus) -> Self {
+        match status {
+            ProofStatus::Proven => Self::Proven,
+            ProofStatus::Unproven(_) => Self::Unproven,
+        }
+    }
+}
+
+/// Whether one dispatch arm's evidence is complete; see [`DispatchProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DispatchCompleteness {
+    Complete,
+    Partial,
+}
+
+impl DispatchCompleteness {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+impl From<&EvidenceCompleteness> for DispatchCompleteness {
+    fn from(completeness: &EvidenceCompleteness) -> Self {
+        match completeness {
+            EvidenceCompleteness::Complete => Self::Complete,
+            EvidenceCompleteness::Partial(_) => Self::Partial,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +411,7 @@ pub(super) fn dispatch_expansions_for_input(
             pipeline_expansion(PipelineValue::DispatchTarget(Box::new(
                 DispatchTargetValue {
                     site: site.clone(),
+                    root_id: site.site_id.clone(),
                     ordinal,
                 },
             )))

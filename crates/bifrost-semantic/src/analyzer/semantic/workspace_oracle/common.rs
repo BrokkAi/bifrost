@@ -79,6 +79,23 @@ impl WorkStager {
         }
     }
 
+    /// Run a query whose answer the caller reduces to a value that holds no
+    /// rows. The admissions the query leaves with no registered holder are
+    /// scratch: refund them on every exit, keeping performed work, peaks and the
+    /// census of artifacts and owners the query registered. A caller that keeps
+    /// the answer must not use this, because the answer's rows are then held.
+    #[doc(hidden)]
+    pub fn with_scratch_admissions<T>(
+        &mut self,
+        cancellation: &brokk_bifrost_core::CancellationToken,
+        query: impl FnOnce(&mut SemanticRequest<'_>) -> T,
+    ) -> T {
+        let mark = self.budget.scratch_mark();
+        let result = query(&mut self.request(cancellation));
+        self.budget.release_scratch_since(&mark);
+        result
+    }
+
     #[track_caller]
     #[doc(hidden)]
     pub fn admit(&mut self, work: SemanticWork) -> Result<(), Interruption> {
@@ -189,6 +206,7 @@ mod tests {
     use crate::analyzer::semantic::workspace_oracle::common::*;
 
     use brokk_bifrost_core::cancellation::CancellationToken;
+    use std::sync::Arc;
 
     #[test]
     fn work_stager_propagates_the_complete_artifact_collector() {
@@ -204,5 +222,54 @@ mod tests {
             .expect("staged workspace-oracle requests retain the collector");
 
         assert!(propagated.shares_state(&collector));
+    }
+
+    fn evidence(rows: usize) -> SemanticWork {
+        SemanticWork {
+            evidence: rows,
+            ..SemanticWork::default()
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10530: a query reduced to a flag left its publication census on the ledger, so later Output units paid for it"
+    )]
+    fn scratch_admissions_are_refunded_on_every_exit_and_owned_rows_are_kept() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::uniform(1_000).unwrap();
+        let mut staged = WorkStager::new(&SemanticRequest::new(&mut budget, &cancellation));
+
+        // An answer that was reduced to a value without rows closes on success.
+        let flag = staged.with_scratch_admissions(&cancellation, |request| {
+            request.budget.admit(evidence(10)).unwrap();
+            true
+        });
+        assert!(flag);
+        assert_eq!(staged.budget.resident().evidence, 0);
+
+        // It closes on the error exit as well.
+        let failed: Result<(), ()> = staged.with_scratch_admissions(&cancellation, |request| {
+            request.budget.admit(evidence(7)).unwrap();
+            Err(())
+        });
+        assert!(failed.is_err());
+        assert_eq!(staged.budget.resident().evidence, 0);
+
+        // Rows a registered holder owns stay, and only the rest is refunded.
+        let owner = Arc::new(());
+        staged.with_scratch_admissions(&cancellation, |request| {
+            let before = request.budget.replay_snapshot();
+            request.budget.admit(evidence(5)).unwrap();
+            request.budget.bind_replay_holder(&owner, &before);
+            request.budget.admit(evidence(3)).unwrap();
+        });
+        assert_eq!(staged.budget.resident().evidence, 5);
+
+        // Performed work and cumulative telemetry are never refunded.
+        assert_eq!(staged.budget.used().evidence, 25);
+        assert_eq!(staged.budget.performed().evidence, 25);
+        drop(owner);
+        assert_eq!(staged.budget.resident().evidence, 0);
     }
 }

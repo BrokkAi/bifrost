@@ -1,7 +1,9 @@
 //! Legacy/custom Projects without a recorder slot enter analysis through this facade.
 use super::{Language, Project, ProjectFile, ProjectSourceSnapshot};
 use brokk_bifrost_core::analyzer::project::AsProject;
-use brokk_bifrost_core::analyzer::project::{ProjectCoverage, WorkspaceOverlayContent};
+use brokk_bifrost_core::analyzer::project::{
+    ProjectCoverage, SharedWorkspaceFileListing, WorkspaceOverlayContent,
+};
 use brokk_bifrost_core::analyzer::project_reads::{ProjectReadSlot, ReadCapability, listing_read};
 use std::collections::BTreeSet;
 use std::io;
@@ -23,6 +25,10 @@ struct ProjectReadFacade {
     project_reads: ProjectReadSlot,
 }
 impl Project for ProjectReadFacade {
+    fn directory_entries(&self, parent: &Path) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.delegate.directory_entries(parent)
+    }
+
     fn ignore_rules_digest(&self) -> std::io::Result<[u8; 32]> {
         let _project_read = self
             .project_read_slot()
@@ -60,6 +66,35 @@ impl Project for ProjectReadFacade {
             .project_read_slot()
             .map(|slot| slot.inventory(self.as_project()));
         self.delegate.all_files_shared()
+    }
+    fn cached_omissions_if_available(
+        &self,
+    ) -> io::Result<Option<Arc<Vec<brokk_bifrost_core::analyzer::project::WorkspaceFileOmission>>>>
+    {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        self.delegate.cached_omissions_if_available()
+    }
+    fn cached_listing_if_available(&self) -> io::Result<Option<SharedWorkspaceFileListing>> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        self.delegate.cached_listing_if_available()
+    }
+    fn cached_analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> io::Result<Option<BTreeSet<ProjectFile>>> {
+        let _project_read = listing_read(self);
+        self.delegate.cached_analyzable_files_from(files, language)
+    }
+    fn all_files_with_omissions(&self) -> io::Result<SharedWorkspaceFileListing> {
+        let _project_read = self
+            .project_read_slot()
+            .map(|slot| slot.inventory(self.as_project()));
+        self.delegate.all_files_with_omissions()
     }
     fn workspace_file_listing_count(&self) -> usize {
         self.delegate.workspace_file_listing_count()
@@ -135,6 +170,18 @@ impl Project for ProjectReadFacade {
     fn invalidate_cached_file_listing(&self) {
         self.delegate.invalidate_cached_file_listing();
     }
+    fn revalidate_symlink_omissions(&self, changed: &BTreeSet<ProjectFile>) {
+        self.delegate.revalidate_symlink_omissions(changed);
+    }
+
+    fn has_exact_directory_entry(&self, file: &ProjectFile) -> std::io::Result<bool> {
+        self.delegate.has_exact_directory_entry(file)
+    }
+
+    fn update_cached_listing_for_resolved_path(&self, file: &ProjectFile) -> bool {
+        self.delegate.update_cached_listing_for_resolved_path(file)
+    }
+
     fn update_cached_listing_for_path(&self, path: &Path) -> bool {
         self.delegate.update_cached_listing_for_path(path)
     }
@@ -194,5 +241,30 @@ impl Project for ProjectReadFacade {
             || self.delegate.read_source_snapshot_limited(file, max),
             |source| source.as_ref().map(ProjectSourceSnapshot::oid),
         )
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::project::{FilesystemProject, WorkspaceFileOmissionReason};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#9737: the read facade discarded symlink omissions")]
+    fn facade_forwards_listing_omissions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("source.rs"), "fn source() {}\n").unwrap();
+        std::os::unix::fs::symlink(root.join("source.rs"), root.join("linked.rs")).unwrap();
+        let inner: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let facade = ProjectReadFacade {
+            delegate: inner,
+            project_reads: ProjectReadSlot::default(),
+        };
+        let (_, omissions) = facade.all_files_with_omissions().unwrap();
+        assert!(omissions.iter().any(|omission| {
+            omission.path == Path::new("linked.rs")
+                && omission.reason == WorkspaceFileOmissionReason::Symlink
+        }));
     }
 }

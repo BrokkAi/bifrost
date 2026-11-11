@@ -21,6 +21,9 @@ use brokk_bifrost_analysis::analyzer::common::serialized_json_len;
 use brokk_bifrost_flow::dataflow::{
     PathQuality, SummaryWitness, SummaryWitnessStep, SummaryWitnessStepKind,
 };
+use brokk_bifrost_flow::taint::output_product::{
+    OutputCompletenessRow, OutputOriginRow, OutputProofRow, OutputReportRow, OutputWitnessStepRow,
+};
 use brokk_bifrost_flow::taint::{
     SourceEventKey, TaintAnalysisPlan, TaintFindingReport, TaintModelError,
 };
@@ -293,6 +296,7 @@ pub(super) fn map_witness_step_kind<T>(
 ) -> T {
     match kind {
         SummaryWitnessStepKind::Seed => seed,
+        SummaryWitnessStepKind::ModeledReceiver => edge("modeled_receiver"),
         SummaryWitnessStepKind::Edge(kind) => edge(kind.label()),
         SummaryWitnessStepKind::EndSummaryGap(kind) => end_summary_gap(match kind {
             ReturnTransferKind::Normal => "normal",
@@ -337,6 +341,341 @@ pub(super) fn public_flow_witness_step(
     public.input = Some(project_fact(step.input_fact()));
     public.output = Some(project_fact(step.output_fact()));
     public
+}
+
+/// The composed Output product carries the same source mappings as a live
+/// witness. Project directly from them so a reused anchor loads no artifact.
+fn public_output_witness_step(
+    workspace: &WorkspaceAnalyzer,
+    step: &OutputWitnessStepRow,
+) -> super::CodeQueryFlowWitnessStep {
+    use super::CodeQueryFlowWitnessStepKind;
+    let kind = match step.kind.as_str() {
+        "seed" => CodeQueryFlowWitnessStepKind::Seed,
+        "end_summary_gap:normal" => CodeQueryFlowWitnessStepKind::EndSummaryGap {
+            return_kind: "normal",
+        },
+        "end_summary_gap:exceptional" => CodeQueryFlowWitnessStepKind::EndSummaryGap {
+            return_kind: "exceptional",
+        },
+        "edge:modeled_receiver" => CodeQueryFlowWitnessStepKind::Edge {
+            edge_kind: "modeled_receiver",
+        },
+        edge => {
+            let edge_kind = match edge {
+                "edge:normal" => "normal",
+                "edge:conditional_true" => "conditional_true",
+                "edge:conditional_false" => "conditional_false",
+                "edge:switch_case" => "switch_case",
+                "edge:loop_back" => "loop_back",
+                "edge:exceptional" => "exceptional",
+                "edge:cleanup" => "cleanup",
+                "edge:async_normal" => "async_normal",
+                "edge:async_exceptional" => "async_exceptional",
+                "edge:call_to_entry" => "call_to_entry",
+                "edge:normal_return" => "normal_return",
+                "edge:exceptional_return" => "exceptional_return",
+                "edge:call_to_normal_continuation" => "call_to_normal_continuation",
+                "edge:call_to_exceptional_continuation" => "call_to_exceptional_continuation",
+                _ => unreachable!("validated Output witness step has a known kind"),
+            };
+            CodeQueryFlowWitnessStepKind::Edge { edge_kind }
+        }
+    };
+    let source = step
+        .source
+        .clone()
+        .decode()
+        .expect("validated Output source locator");
+    let target = step.target.as_ref().map(|row| {
+        row.clone()
+            .decode()
+            .expect("validated Output target locator")
+    });
+    let origin = step.origin.as_ref().map(|row| {
+        row.clone()
+            .decode()
+            .expect("validated Output origin locator")
+    });
+    let proof = match &step.proof {
+        OutputProofRow::Proven => ProofStatus::Proven,
+        OutputProofRow::Unproven(reason) => ProofStatus::Unproven(reason.clone().into()),
+    };
+    let completeness = match &step.completeness {
+        OutputCompletenessRow::Complete => EvidenceCompleteness::Complete,
+        OutputCompletenessRow::Partial(reason) => {
+            EvidenceCompleteness::Partial(reason.clone().into())
+        }
+    };
+    super::CodeQueryFlowWitnessStep {
+        kind,
+        summary_fingerprint: step.summary_fingerprint.clone(),
+        source: public_source_site(workspace, &source),
+        source_symbol: Some(public_symbol_site(workspace, &source)),
+        target: target
+            .as_ref()
+            .map(|locator| public_source_site(workspace, locator)),
+        target_symbol: target
+            .as_ref()
+            .map(|locator| public_symbol_site(workspace, locator)),
+        origin: origin
+            .as_ref()
+            .map(|locator| public_source_site(workspace, locator)),
+        origin_symbol: origin
+            .as_ref()
+            .map(|locator| public_symbol_site(workspace, locator)),
+        boundary: step.boundary.clone(),
+        input: Some(CodeQueryFlowFactSymbol::Zero),
+        output: Some(CodeQueryFlowFactSymbol::Zero),
+        evidence: public_evidence(&proof, &completeness),
+    }
+}
+
+/// Project the validated pre-projection content of one composed output site.
+/// Fresh and reused sites both enter here after encoding and decode.
+pub fn project_output_report(
+    workspace: &WorkspaceAnalyzer,
+    report: &OutputReportRow,
+    projection_scope: &str,
+    limits: CodeQueryTaintProjectionLimits,
+) -> Vec<CodeQueryTaintFinding> {
+    let mut projected = Vec::new();
+    for findings in report
+        .findings
+        .chunk_by(|left, right| left.sink == right.sink)
+    {
+        let sink = findings[0]
+            .sink
+            .decode_key()
+            .expect("validated Output sink event");
+        let site = sink.site();
+        let mut reached = BTreeSet::<String>::new();
+        let mut origins_by_event = BTreeMap::<
+            brokk_bifrost_flow::value_flow::ValueFlowEventKey,
+            (
+                BTreeSet<String>,
+                Vec<(
+                    &OutputOriginRow,
+                    &brokk_bifrost_flow::taint::output_product::OutputWitnessRow,
+                )>,
+            ),
+        >::new();
+        let mut proven = true;
+        let mut complete = report.complete;
+        let mut origins_truncated = false;
+        let mut witnesses_truncated = false;
+        for finding in findings {
+            reached.extend(finding.classes.iter().cloned());
+            proven &= finding.proven;
+            complete &= finding.complete
+                && !finding.origin_truncated
+                && !finding.witness_truncated
+                && !finding.witness_unavailable;
+            origins_truncated |= finding.origin_truncated;
+            witnesses_truncated |= finding.witness_truncated || finding.witness_unavailable;
+            for origin in &finding.origins {
+                let entry = origins_by_event
+                    .entry(
+                        origin
+                            .event
+                            .decode_key()
+                            .expect("validated Output origin event"),
+                    )
+                    .or_default();
+                entry.0.extend(origin.classes.iter().cloned());
+                for &index in &origin.witness_paths {
+                    let witness = &report.witnesses[index];
+                    if !entry
+                        .1
+                        .iter()
+                        .any(|(_, existing)| std::ptr::eq(*existing, witness))
+                    {
+                        entry.1.push((origin, witness));
+                    }
+                }
+            }
+        }
+        let reached_labels = reached.into_iter().collect::<Vec<_>>();
+        let sink_event_id = public_taint_event_id(projection_scope, "sink", &sink);
+        let origin_event_ids = origins_by_event
+            .keys()
+            .map(|event| public_taint_event_id(projection_scope, "source", event))
+            .collect::<Vec<_>>();
+        let finding_id = public_taint_finding_id(
+            projection_scope,
+            &sink_event_id,
+            &reached_labels,
+            &origin_event_ids,
+        );
+        origins_truncated |= origins_by_event.len() > limits.max_origins_per_finding;
+        let mut origins = Vec::new();
+        let mut retained = Vec::new();
+        for (event, (labels, witnesses)) in
+            origins_by_event.iter().take(limits.max_origins_per_finding)
+        {
+            let event_id = public_taint_event_id(projection_scope, "source", event);
+            let labels = labels.iter().cloned().collect::<Vec<_>>();
+            origins.push(CodeQueryTaintOrigin {
+                id: public_taint_origin_id(&finding_id, &event_id, &labels),
+                event_id,
+                labels,
+                site: public_source_site(workspace, event.site()),
+            });
+            for pair in witnesses {
+                if !retained.iter().any(
+                    |(_, existing): &(
+                        _,
+                        &brokk_bifrost_flow::taint::output_product::OutputWitnessRow,
+                    )| std::ptr::eq(*existing, pair.1),
+                ) {
+                    retained.push(*pair);
+                }
+            }
+        }
+        origins.sort_by(|left, right| left.id.cmp(&right.id));
+        witnesses_truncated |= retained.len() > limits.max_witnesses_per_finding;
+        let mut witnesses = Vec::new();
+        for (index, (_origin, witness)) in retained
+            .into_iter()
+            .take(limits.max_witnesses_per_finding)
+            .enumerate()
+        {
+            let mut steps = Vec::new();
+            let mut witness_bytes = 0usize;
+            let mut omitted_steps = 0usize;
+            let mut projection_cause = None;
+            for (step_index, step) in witness.steps.iter().enumerate() {
+                let public = public_output_witness_step(workspace, step);
+                let bytes = serialized_json_len(&public);
+                if steps.len() == limits.max_steps_per_witness {
+                    projection_cause = Some("projection_step_limit");
+                    omitted_steps = witness.steps.len() - step_index;
+                    break;
+                }
+                if bytes > limits.max_witness_bytes.saturating_sub(witness_bytes) {
+                    projection_cause = Some("projection_byte_limit");
+                    omitted_steps = witness.steps.len() - step_index;
+                    break;
+                }
+                witness_bytes = witness_bytes.saturating_add(bytes);
+                steps.push(public);
+            }
+            let truncated = witness.truncation_cause.is_some() || omitted_steps > 0;
+            let truncation_cause = witness
+                .truncation_cause
+                .clone()
+                .or_else(|| projection_cause.map(str::to_owned));
+            witnesses_truncated |= truncated;
+            witnesses.push(CodeQueryTaintWitness {
+                id: public_taint_witness_id(&finding_id, index, witness.quality()),
+                finding_id: finding_id.clone(),
+                witness_index: index,
+                path: site.path().as_str().to_owned(),
+                language: site.language().config_label(),
+                range: locator_range(workspace, site),
+                evidence: public_taint_quality(
+                    witness.quality(),
+                    truncated,
+                    truncation_cause.as_deref(),
+                ),
+                steps,
+                retained_bytes: witness_bytes,
+                truncated,
+                omitted_steps_lower_bound: witness
+                    .omitted_steps_lower_bound
+                    .saturating_add(omitted_steps),
+                alternatives_truncated: witness.alternatives_truncated,
+                retention_truncated: witness.retention_truncated(),
+                truncation_cause,
+            });
+        }
+        complete &= !origins_truncated && !witnesses_truncated;
+        projected.push(CodeQueryTaintFinding {
+            id: finding_id,
+            path: site.path().as_str().to_owned(),
+            language: site.language().config_label(),
+            range: locator_range(workspace, site),
+            sink_event_id,
+            sink: public_source_site(workspace, site),
+            reached_labels,
+            origins,
+            origins_truncated,
+            witnesses,
+            witnesses_truncated,
+            evidence: CodeQuerySemanticEvidence::new(
+                if proven {
+                    CodeQuerySemanticProof::Proven
+                } else {
+                    CodeQuerySemanticProof::Unproven
+                },
+                if complete {
+                    CodeQuerySemanticCompleteness::Complete
+                } else {
+                    CodeQuerySemanticCompleteness::Partial
+                },
+                (!complete)
+                    .then(|| "taint finding or retained origin evidence is incomplete".to_owned()),
+            ),
+            ambiguous: !proven,
+        });
+    }
+    projected
+}
+
+pub(crate) fn project_output_reports_bounded(
+    workspace: &WorkspaceAnalyzer,
+    output: &crate::structural::analysis_context::TaintOutputRows,
+    limits: CodeQueryTaintProjectionLimits,
+    max_findings: usize,
+    max_projected_bytes: usize,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedTaintProjection {
+    let mut findings = Vec::new();
+    let mut retained_bytes = 0usize;
+    let mut truncated = false;
+    let mut cancelled = false;
+    for row in &output.rows {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break;
+        }
+        let locator = row
+            .anchor
+            .clone()
+            .decode()
+            .expect("validated Output anchor");
+        for public in project_output_report(workspace, row, &output.projection_scope, limits) {
+            if findings.len() == max_findings {
+                truncated = true;
+                break;
+            }
+            let bytes = if max_projected_bytes == usize::MAX {
+                0
+            } else {
+                serialized_json_len(&public)
+            };
+            if bytes > max_projected_bytes.saturating_sub(retained_bytes) {
+                truncated = true;
+                break;
+            }
+            retained_bytes = retained_bytes.saturating_add(bytes);
+            let span = locator.anchor().span();
+            findings.push(ProjectedTaintFinding {
+                public,
+                file: locator_file(workspace, &locator),
+                byte_span: span.start_byte() as usize..span.end_byte() as usize,
+            });
+        }
+        if truncated {
+            break;
+        }
+    }
+    BoundedTaintProjection {
+        findings,
+        retained_bytes,
+        truncated,
+        cancelled,
+    }
 }
 
 /// Project one retained diagnostic-neutral report into the public taint query
@@ -775,6 +1114,26 @@ fn public_taint_event(
     phase: brokk_bifrost_flow::value_flow::ValueFlowObservationPhase,
     carrier: &brokk_bifrost_flow::value_flow::ValueFlowCarrier,
 ) -> CodeQueryFlowEvent {
+    public_taint_event_from_key(
+        workspace,
+        projection_scope,
+        role,
+        key,
+        phase,
+        &carrier
+            .stable_key()
+            .expect("validated taint event carrier has stable identity"),
+    )
+}
+
+fn public_taint_event_from_key(
+    workspace: &WorkspaceAnalyzer,
+    projection_scope: &str,
+    role: &str,
+    key: &brokk_bifrost_flow::value_flow::ValueFlowEventKey,
+    phase: brokk_bifrost_flow::value_flow::ValueFlowObservationPhase,
+    carrier: &brokk_bifrost_flow::value_flow::ValueFlowCarrierKey,
+) -> CodeQueryFlowEvent {
     let locator = key.site();
     CodeQueryFlowEvent {
         id: public_taint_event_id(projection_scope, role, key),
@@ -790,12 +1149,7 @@ fn public_taint_event(
             }
         },
         ordinal: key.ordinal(),
-        carrier: public_carrier_symbol(
-            workspace,
-            &carrier
-                .stable_key()
-                .expect("validated taint event carrier has stable identity"),
-        ),
+        carrier: public_carrier_symbol(workspace, carrier),
     }
 }
 

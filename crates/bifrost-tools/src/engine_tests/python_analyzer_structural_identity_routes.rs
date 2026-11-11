@@ -49,8 +49,8 @@ mod python_residency_tests {
     }
     /// A computed `__all__` settles no name's membership, so the facade's
     /// site-anchored relations report incomplete instead of guessing. The
-    /// declaration-anchored relations are untouched by that gap, and the site
-    /// still carries the plain import its occurrence role already states.
+    /// nested-owner relations are untouched by that gap, and the site still
+    /// carries the plain import its occurrence role already states.
     #[test]
     fn python_computed_all_leaves_site_relations_incomplete() {
         let rows = python_facade("__all__ = build_exports()\nimport pkg.impl as impl\n").rows(2);
@@ -79,6 +79,107 @@ mod python_residency_tests {
             1,
             "rows: {:?}",
             rows.rows
+        );
+    }
+    #[test]
+    fn python_partial_all_scopes_export_uncertainty_to_unproven_names() {
+        use brokk_bifrost_analysis::analyzer::structural::identity_routes::identity_routes_from;
+        use brokk_bifrost_analysis::cancellation::CancellationToken;
+        use brokk_bifrost_core::analyzer::structural::routes::RouteTermination;
+
+        let fixture = python_facade(concat!(
+            "class Listed: pass\n",
+            "class Hidden:\n    def nested(self): pass\n",
+            "class Later: pass\n",
+            "__all__ = ['Listed', 'impl']\n",
+            "__all__ += computed()\n",
+            "__all__ += [computed(), 'Later']\n",
+            "import pkg.impl as impl\n",
+            "from pkg.impl import Widget as Widget\n",
+            "from pkg.impl import Widget as Unknown\n",
+        ));
+        let rows = fixture.rows(2);
+        let exports = rows_of_kind(&rows, RouteHopKind::Export);
+        assert_eq!(exports.len(), 2, "rows: {:?}", rows.rows);
+        let routes = identity_routes_from(
+            fixture.analyzer(),
+            &exports[0].from,
+            Some(&[RouteHopKind::Export]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.termination == RouteTermination::Terminal),
+            "{routes:?}"
+        );
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.termination != RouteTermination::Incomplete),
+            "{routes:?}"
+        );
+        for name in ["Listed", "Later", "Hidden", "nested"] {
+            let routes = identity_routes_from(
+                fixture.analyzer(),
+                &RouteEndpoint::Declaration(fixture.declaration(name)),
+                Some(&[RouteHopKind::Export]),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                routes
+                    .iter()
+                    .any(|route| route.termination == RouteTermination::Incomplete),
+                name == "Hidden",
+                "{name}: {routes:?}"
+            );
+        }
+        let reexports = rows_of_kind(&rows, RouteHopKind::ReExport);
+        assert!(!reexports.is_empty(), "rows: {:?}", rows.rows);
+        for row in reexports {
+            let routes = identity_routes_from(
+                fixture.analyzer(),
+                &row.from,
+                Some(&[
+                    RouteHopKind::Import,
+                    RouteHopKind::Export,
+                    RouteHopKind::ReExport,
+                    RouteHopKind::Alias,
+                ]),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert!(
+                routes
+                    .iter()
+                    .any(|route| route.termination == RouteTermination::Terminal),
+                "{routes:?}"
+            );
+            assert!(
+                routes
+                    .iter()
+                    .all(|route| route.termination != RouteTermination::Incomplete),
+                "{routes:?}"
+            );
+        }
+        let unknown = rows_of_kind(&rows, RouteHopKind::Import)
+            .into_iter()
+            .find(|row| matches!(&row.from, RouteEndpoint::Site { name, .. } if name == "Widget"))
+            .expect("unclassified import still carries Import");
+        let routes = identity_routes_from(
+            fixture.analyzer(),
+            &unknown.from,
+            Some(&[RouteHopKind::ReExport]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.termination == RouteTermination::Incomplete),
+            "{routes:?}"
         );
     }
 }

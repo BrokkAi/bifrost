@@ -59,7 +59,8 @@ macro_rules! setup_fn {
 #[divan::bench(args = [setup_fn!(setup::target)])]
 fn bench() {}
 "#;
-        let state = parsed_fixture_state(&RustAdapter, "benches/throughput.rs", source);
+        let state =
+            parsed_fixture_state(&RustAdapter::for_tests(), "benches/throughput.rs", source);
         let facts = state.source_facts.as_ref().expect("Rust source facts");
         let occurrences = facts.occurrences.occurrences();
         let primary_ranges = occurrences
@@ -95,7 +96,7 @@ fn bench() {}
         let db = temp.path().join("source-facts.db");
         let source = "pub fn target() {}\npub fn caller() { target(); }\n";
         let content_oid = oid(source.as_bytes());
-        let state = parsed_fixture_state(&RustAdapter, "src/lib.rs", source);
+        let state = parsed_fixture_state(&RustAdapter::for_tests(), "src/lib.rs", source);
         let canonical = state.source_facts.as_ref().expect("Rust canonical facts");
         let expected =
             brokk_bifrost_analysis::analyzer::structural::facts::FileFacts::from_source_and_rows(
@@ -118,7 +119,7 @@ fn bench() {}
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .unwrap();
@@ -175,7 +176,7 @@ fn bench() {}
             let mut failed = AnalyzerStore::prepare_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 Arc::clone(&state),
             )
             .unwrap();
@@ -354,7 +355,7 @@ fn bench() {}
             .ensure_language_epoch_value("rust", "rust-fact-probe-test-v1")
             .expect("Rust fact probe generation");
         let state = parsed_fixture_state(
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             "src/lib.rs",
             "pub fn target() {}\npub fn caller() { target(); }\n",
         );
@@ -370,7 +371,7 @@ fn bench() {}
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(content_oid, "rust"),
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .expect("persist production Rust fact probe fixture");
@@ -456,8 +457,14 @@ fn bench() {}
         let source = "pub fn helper() -> u8 { 1 }\npub fn spawn() -> u8 {\n    let value = {\n        #[cfg(test)]\n        use crate::helper;\n        helper()\n    };\n    value\n}\n";
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let content = oid(source);
-        let snapshot =
-            persist_alias_fixture(&store, content, "rust", &RustAdapter, "src/lib.rs", source);
+        let snapshot = persist_alias_fixture(
+            &store,
+            content,
+            "rust",
+            &RustAdapter::for_tests(),
+            "src/lib.rs",
+            source,
+        );
         assert_eq!(snapshot.publication_state, "complete");
 
         // The omitted-binder and placement-boundary evidence this pins is
@@ -497,11 +504,17 @@ fn bench() {}
                   impl<'a, A, const N: usize> Mixed<'a, A, /* const position */ N, Box<X>> { fn g(&self) {} }\n\
                   impl<'a, A> Mixed<'a, A, 1, Y> { fn h(&self) {} }\n\
                   impl S<_, Y> { fn inferred(&self) {} }\n";
-        let state = parsed_fixture_state(&RustAdapter, "src/lib.rs", source);
+        let state = parsed_fixture_state(&RustAdapter::for_tests(), "src/lib.rs", source);
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let content = oid(source.as_bytes());
-        let publication =
-            persist_alias_fixture(&store, content, "rust", &RustAdapter, "src/lib.rs", source);
+        let publication = persist_alias_fixture(
+            &store,
+            content,
+            "rust",
+            &RustAdapter::for_tests(),
+            "src/lib.rs",
+            source,
+        );
         assert_eq!(publication.publication_state, "complete");
         let facts = &state.resolution_facts;
         let spelling = |site: i64| {
@@ -651,8 +664,14 @@ fn bench() {}
         const SOURCE: &str = "pub mod inner {\n    pub struct Thing {\n        pub field: u32,\n    }\n    impl Thing {\n        pub fn make(value: u32) -> Self {\n            Self { field: value }\n        }\n        pub fn read(&self) -> u32 {\n            self.field\n        }\n    }\n    pub trait Read {\n        fn read(&self) -> u32;\n    }\n    impl Read for Thing {\n        fn read(&self) -> u32 {\n            self.field\n        }\n    }\n}\nuse inner::{Read, Thing};\npub fn use_it(thing: &Thing) -> u32 {\n    Read::read(thing) + Thing::make(1).read()\n}\n";
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let content = oid(SOURCE);
-        let snapshot =
-            persist_alias_fixture(&store, content, "rust", &RustAdapter, "src/lib.rs", SOURCE);
+        let snapshot = persist_alias_fixture(
+            &store,
+            content,
+            "rust",
+            &RustAdapter::for_tests(),
+            "src/lib.rs",
+            SOURCE,
+        );
         assert_eq!(snapshot.publication_state, "complete");
 
         store.conn.execute(|conn| {
@@ -672,7 +691,7 @@ fn bench() {}
                 let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0)).unwrap();
                 assert_eq!(count, 0, "{table} must not grow per Rust blob");
             }
-            conn.prepare("SELECT configuration, target_framework, symbols_closed, open_reason, symbol_set_digest FROM csharp_compilations").unwrap();
+            conn.prepare("SELECT configuration, target_framework, symbols_closed, open_reason, symbol_set_digest, named_open_symbols FROM csharp_compilations").unwrap();
             conn.prepare("SELECT compilation_id, symbol, source FROM csharp_compilation_symbols").unwrap();
         });
         let persisted = store.conn.execute(|conn| {
@@ -721,6 +740,10 @@ fn bench() {}
                 "resolution_semantic_catalog",
             ),
             ("expected_node_catalog_count", "resolution_node_catalog"),
+            (
+                "expected_reference_execution_context_count",
+                "resolution_reference_execution_contexts",
+            ),
             (
                 "expected_contract_reference_count",
                 "resolution_contract_references",
@@ -1145,13 +1168,13 @@ fn bench() {}
             } else {
                 (format!("src/scale_{index:04}.rs"), scale(index))
             };
-            let state = parsed_fixture_state(&RustAdapter, &path, &source);
+            let state = parsed_fixture_state(&RustAdapter::for_tests(), &path, &source);
             store
                 .write_parsed_blob_at_generation(
                     &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(source.as_bytes()), "rust"),
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .expect("persist one scale workspace blob");

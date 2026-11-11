@@ -9,6 +9,7 @@ use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason;
+use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
 use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
 
@@ -296,7 +297,20 @@ pub(crate) fn outgoing(
                             continue;
                         }
                     }
-                    if answer.resolution.call_target_completion() != ResolutionCompletion::Complete {
+                    let external_leaf = matches!(answer.resolution.call_target_completion(),
+                        ResolutionCompletion::Incomplete(reasons) if reasons.iter().all(|reason|
+                            matches!(reason, ResolutionIncompleteReason::OpenBoundary {
+                                status: BoundaryStatus::ExternalDeclaredUnindexed, ..
+                            }))
+                    ) && answer.definitions.is_empty();
+                    if external_leaf {
+                        result.external_terminal_sites.push((caller.source().clone(), shape.outcome.range));
+                        result.diagnostics.push(CallRelationDiagnostic::new(
+                            CallRelationDiagnosticCode::ExternalBoundary,
+                            format!("native call at {callee_range:?} reaches a declared external terminal"),
+                            caller.fq_name().to_string(),
+                        ));
+                    } else if answer.resolution.call_target_completion() != ResolutionCompletion::Complete {
                         result.diagnostics.push(diagnostic("native_call_resolution_incomplete", format!(
                             "call resolution at {callee_range:?}: {:?}; receiver dispositions: {:?}",
                             answer.resolution.call_target_completion(), answer.resolution.callable_receiver_dispositions(),
@@ -316,7 +330,7 @@ pub(crate) fn outgoing(
                             reason_kind: None,
                         });
                     }
-                    if !answer.lexical_definitions.is_empty() || answer.definitions.is_empty() {
+                    if !external_leaf && (!answer.lexical_definitions.is_empty() || answer.definitions.is_empty()) {
                         result.diagnostics.push(diagnostic("native_call_target_unavailable", format!("call at {callee_range:?} has no complete callable unit projection"), caller));
                     }
                     let mut definitions = answer.definitions;
@@ -371,6 +385,15 @@ pub(crate) fn outgoing(
             result.truncated = true;
             result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
             result.diagnostics[0].reason_kind = None;
+            result
+        }
+        BoundedResolution::Unavailable { reason, .. } => {
+            let mut result = failed(
+                "native_input_unavailable",
+                format!("input unavailable: {reason}"),
+                caller,
+            );
+            result.truncated = true;
             result
         }
         BoundedResolution::Complete {

@@ -87,7 +87,7 @@ mod js_ts_extraction_root {
     });
         store
             .conn
-            .execute(|conn| {
+            .execute_fixture(|conn| {
                 conn.execute("DELETE FROM blobs", [])?;
                 let count: i64 =
                     conn.query_row("SELECT COUNT(*) FROM source_js_ts_manifests", [], |row| {

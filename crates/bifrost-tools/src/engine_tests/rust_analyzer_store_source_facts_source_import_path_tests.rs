@@ -26,7 +26,7 @@ mod source_import_path_tests {
         let source = "fn main() {}\n";
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
         let file = fixture.file("src/lib.rs");
-        let mut state = parse_state(&RustAdapter, &file);
+        let mut state = parse_state(&RustAdapter::for_tests(), &file);
         let source_facts = state
             .source_facts
             .as_mut()
@@ -107,7 +107,7 @@ mod source_import_path_tests {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -117,7 +117,7 @@ mod source_import_path_tests {
         let typed = reopened
             .hydrate_file_state(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &file,
             )
             .unwrap()

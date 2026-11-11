@@ -2610,7 +2610,7 @@ pub(in crate::analyzer::semantic_model::csmi) fn export_document(
         } else {
             CsmiCoverageStatus::Partial
         },
-        limitations: if manifest.completeness == Completeness::Partial {
+        limitations: if manifest.completeness != Completeness::Complete {
             vec![CsmiLimitation {
                 kind: "coverage-limited".to_owned(),
                 diagnostic: None,

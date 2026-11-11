@@ -20,21 +20,23 @@ use brokk_bifrost_core::{
 };
 use brokk_bifrost_ruby::graph::RubyGraphSource;
 use brokk_bifrost_ruby::graph::extractor::{
-    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
-    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
+    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_method_node_for_ranges,
+    ruby_receiver_type, ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
 };
 use brokk_bifrost_ruby::graph::resolver::{
     ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
     ruby_field_target as ruby_field_target_from_code_unit,
 };
 use brokk_bifrost_ruby::graph::syntax::{
+    block_positional_parameters as ruby_block_positional_parameters,
     is_call_method_identifier as ruby_is_call_method_identifier,
     is_declaration_constant as ruby_is_declaration_constant,
     is_declaration_identifier as ruby_is_declaration_identifier,
     is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
     is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
-    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
+    method_yield_sites as ruby_method_yield_sites, node_text as ruby_node_text,
     symbol_or_string_value as ruby_symbol_or_string_value,
+    yield_argument_for_block_parameter as ruby_yield_argument_for_block_parameter,
 };
 use std::sync::Arc;
 use tree_sitter::{Node, Tree};
@@ -72,7 +74,7 @@ use brokk_bifrost_core::analyzer::usages::reference_site::node_range as ruby_nod
 use brokk_bifrost_ruby::graph::resolver::{
     RubyMethodFind, RubyMethodLookupMode, ruby_dispatch_matches_lookup_mode,
 };
-use brokk_bifrost_ruby::graph::scope::{RubyScopeExit, exit_scope};
+use brokk_bifrost_ruby::graph::scope::{RubyScopeFrame, RubyScopeStack};
 use brokk_bifrost_ruby::mixins::ruby_forward_superclass_targets;
 
 mod instance_fields;
@@ -1069,12 +1071,9 @@ struct BoundedRubyLookupContext<'a, 'tree> {
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'tree>,
-    lexical_stack: Vec<String>,
-    method_stack: Vec<RubyReceiverMode>,
-    receiver_context: Vec<RubyReceiverMode>,
+    scope: RubyScopeStack<()>,
     local_scopes: Vec<HashMap<Box<str>, Option<RubyReceiverType>>>,
     instance_fields: Option<RubyInstanceFields>,
-    exits: Vec<BoundedRubyExit>,
     focus_start: usize,
     inference_depth: usize,
 }
@@ -1092,12 +1091,9 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
             file,
             source,
             root,
-            lexical_stack: Vec::new(),
-            method_stack: Vec::new(),
-            receiver_context: Vec::new(),
+            scope: RubyScopeStack::default(),
             local_scopes: vec![HashMap::default()],
             instance_fields: None,
-            exits: Vec::new(),
             focus_start,
             inference_depth: 0,
         }
@@ -1164,37 +1160,25 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
                 let owner = node
                     .child_by_field_name("name")
                     .and_then(|name| self.resolve_constant_owner(name));
-                if let Some(owner) = owner.as_ref() {
-                    self.lexical_stack.push(owner.clone());
-                }
-                self.receiver_context.push(RubyReceiverMode::Instance);
-                self.exits.push(BoundedRubyExit::Type {
-                    has_lexical_owner: owner.is_some(),
-                });
+                self.scope.enter_type(owner, ());
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "method" | "singleton_method" => {
-                self.method_stack.push(ruby_method_receiver_mode(
-                    node,
-                    self.receiver_context.last().copied(),
-                ));
+                self.scope.enter_method(node, ());
                 self.local_scopes.push(HashMap::default());
                 self.seed_parameter_shadows(node);
-                self.exits.push(BoundedRubyExit::Method);
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "singleton_class" => {
-                self.method_stack.push(RubyReceiverMode::Class);
-                self.receiver_context.push(RubyReceiverMode::Class);
+                self.scope.enter_singleton_class(());
                 self.local_scopes.push(HashMap::default());
-                self.exits.push(BoundedRubyExit::SingletonClass);
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
                 let inherited = self.local_scopes.last().cloned().unwrap_or_default();
                 self.local_scopes.push(inherited);
                 self.seed_parameter_shadows(node);
-                self.exits.push(BoundedRubyExit::LocalScope);
+                self.scope.enter_block();
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -1204,35 +1188,10 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
     }
 
     fn exit(&mut self) {
-        match self.exits.pop() {
-            Some(BoundedRubyExit::Type { has_lexical_owner }) => {
-                assert!(
-                    matches!(
-                        self.receiver_context.pop(),
-                        Some(RubyReceiverMode::Instance)
-                    ),
-                    "type receiver context must match its exit"
-                );
-                if has_lexical_owner {
-                    self.lexical_stack.pop();
-                }
-            }
-            Some(BoundedRubyExit::Method) => {
-                self.method_stack.pop();
-                self.local_scopes.pop();
-            }
-            Some(BoundedRubyExit::SingletonClass) => {
-                assert!(
-                    matches!(self.receiver_context.pop(), Some(RubyReceiverMode::Class)),
-                    "singleton-class receiver context must match its exit"
-                );
-                self.method_stack.pop();
-                self.local_scopes.pop();
-            }
-            Some(BoundedRubyExit::LocalScope) => {
-                self.local_scopes.pop();
-            }
-            None => {}
+        // A type body keeps the enclosing local bindings in this bounded
+        // walk; every other scope pushed one.
+        if !matches!(self.scope.exit(), RubyScopeFrame::Type { .. }) {
+            self.local_scopes.pop();
         }
     }
 
@@ -1288,7 +1247,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
     }
 
     fn enclosing_receiver(&self) -> Option<RubyReceiverType> {
-        ruby_enclosing_receiver(&self.lexical_stack, &self.method_stack)
+        ruby_enclosing_receiver(self.scope.lexical(), self.scope.method_mode())
     }
 
     fn constant_receiver_type(&self, node: Node<'_>) -> Option<RubyReceiverType> {
@@ -1311,7 +1270,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
                 return None;
             }
             if !path.absolute {
-                for lexical in &self.lexical_stack {
+                for lexical in self.scope.lexical() {
                     if !self
                         .provider
                         .fqn(&format!("{lexical}${relative}"))
@@ -1587,7 +1546,8 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
         let mut candidates = Vec::new();
         if !path.absolute {
             candidates.extend(
-                self.lexical_stack
+                self.scope
+                    .lexical()
                     .iter()
                     .rev()
                     .map(|owner| format!("{owner}${relative}")),
@@ -1675,13 +1635,6 @@ enum BoundedRubyWalkAction {
     Skip,
 }
 
-enum BoundedRubyExit {
-    Type { has_lexical_owner: bool },
-    Method,
-    SingletonClass,
-    LocalScope,
-}
-
 fn ruby_smallest_named_node_covering_bounded<'tree>(
     provider: &RubyDefinitionProvider<'_>,
     node: Node<'tree>,
@@ -1758,7 +1711,6 @@ pub(crate) fn resolve_ruby(
         );
     };
     let context = RubyLookupContext::build(
-        analyzer,
         &semantic,
         file,
         source,
@@ -1913,7 +1865,7 @@ fn ruby_constant_outcome(
 ) -> DefinitionLookupOutcome {
     let raw = ruby_node_text(node, source);
     if let Some(unit) =
-        semantic.resolve_constant(file, visible_files, &context.lexical_stack, node, source)
+        semantic.resolve_constant(file, visible_files, context.scope.lexical(), node, source)
     {
         return candidates_outcome(vec![unit]);
     }
@@ -1950,7 +1902,7 @@ fn ruby_constant_path_leaves_the_workspace(
         '_,
         brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
     >,
-    context: &RubyLookupContext<'_>,
+    context: &RubyLookupContext<'_, '_>,
     node: Node<'_>,
     source: &str,
 ) -> bool {
@@ -1960,7 +1912,7 @@ fn ruby_constant_path_leaves_the_workspace(
     else {
         return false;
     };
-    !semantic.declares_constant_anywhere(&context.lexical_stack, owner, source)
+    !semantic.declares_constant_anywhere(context.scope.lexical(), owner, source)
 }
 
 fn ruby_autoload_symbol_outcome(
@@ -1982,7 +1934,7 @@ fn ruby_autoload_symbol_outcome(
         );
     };
     let Some(unit) =
-        semantic.resolve_constant_name(file, visible_files, &context.lexical_stack, &name)
+        semantic.resolve_constant_name(file, visible_files, context.scope.lexical(), &name)
     else {
         return no_definition(
             "no_indexed_definition",
@@ -2004,9 +1956,11 @@ fn ruby_field_outcome(
     source: &str,
 ) -> DefinitionLookupOutcome {
     let raw = ruby_node_text(node, source);
-    let Some((owner, scope)) =
-        ruby_field_reference_owner_and_scope(&context.lexical_stack, &context.method_stack, node)
-    else {
+    let Some((owner, scope)) = ruby_field_reference_owner_and_scope(
+        context.scope.lexical(),
+        context.scope.method_mode(),
+        node,
+    ) else {
         return no_definition(
             "unsupported_ruby_receiver",
             format!("receiver for Ruby field `{raw}` is not resolved"),
@@ -2191,7 +2145,7 @@ fn ruby_unresolved_receiver_outcome(
         '_,
         brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'_>,
     >,
-    context: &RubyLookupContext<'_>,
+    context: &RubyLookupContext<'_, '_>,
     receiver: Option<Node<'_>>,
     member: &str,
     source: &str,
@@ -2207,7 +2161,7 @@ fn ruby_unresolved_receiver_outcome(
     else {
         return unresolved();
     };
-    if semantic.declares_constant_anywhere(&context.lexical_stack, receiver, source) {
+    if semantic.declares_constant_anywhere(context.scope.lexical(), receiver, source) {
         return unresolved();
     }
     let receiver_text = ruby_node_text(receiver, source);
@@ -2318,6 +2272,19 @@ pub(crate) fn exact_ruby_external_call(
     if member.is_static() != (receiver.mode == RubyReceiverMode::Class) {
         return None;
     }
+    // #9336: the model answers for the singleton method only while the
+    // workspace leaves it alone. The caller's file carries the #3494
+    // method-table rules, including refinements active at the call. The
+    // workspace declares nothing for an external constant, so a rewrite can
+    // also sit in any other file; the memoized workspace scan reads those.
+    if receiver.mode == RubyReceiverMode::Class
+        && (!ruby_caller_file_keeps_method_table(&provider, file, root, call, source, member_name)
+            || !ruby.external_singleton_mutation_free(&owner.qualified_name, member_name, &|| {
+                cancellation.is_none_or(|cancellation| !cancellation.is_cancelled())
+            }))
+    {
+        return None;
+    }
     let proof = ExactExternalCallProof::ruby_bound_external_member(
         &owner.qualified_name,
         &member.name,
@@ -2345,7 +2312,7 @@ fn ruby_bare_core_method_is_proven(
     source: &str,
 ) -> bool {
     if ruby_has_active_refinement(context.root, call, source)
-        || ruby_has_dynamic_bare_dispatch(context.root, &context.lexical_stack, call, source)
+        || ruby_has_dynamic_bare_dispatch(context.root, context.scope.lexical(), call, source)
         || ruby_has_unknown_receiver_ancestry(provider, context, call, source)
     {
         return false;
@@ -2757,7 +2724,9 @@ const RUBY_METHOD_TABLE_DEFINERS: &[&str] = &[
 /// file -- is not seen. That is the stated limit of the proof, not an
 /// oversight: an unbounded workspace scan per call is not an option, and the
 /// files that declare the owner and call it are where Ruby code rewrites a
-/// class in practice.
+/// class in practice. A constant that only an activated model declares has no
+/// declaring file, so its singleton calls read every workspace file once per
+/// snapshot instead (see [`ruby_file_keeps_external_singleton`]).
 pub(crate) fn ruby_member_selection_closed(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -2797,9 +2766,6 @@ pub(crate) fn ruby_member_selection_closed(
     let Some(receiver_node) = call.child_by_field_name("receiver") else {
         return false;
     };
-    if ruby_has_active_refinement(root, call, source) {
-        return false;
-    }
     let member = ruby_node_text(callee, source);
     let context =
         BoundedRubyLookupContext::build(&provider, file, source, root, site.focus_start_byte);
@@ -2858,14 +2824,16 @@ pub(crate) fn ruby_member_selection_closed(
         }
     }
     scope_files.iter().all(|scope_file| {
+        if scope_file == file {
+            return ruby_caller_file_keeps_method_table(
+                &provider, file, root, call, source, member,
+            );
+        }
         let Some(facts) = ruby.source_facts(scope_file) else {
             return false;
         };
         if facts.has_parse_errors || facts.runtime_boundary.is_some() {
             return false;
-        }
-        if scope_file == file {
-            return ruby_scope_file_keeps_method_table(&provider, root, source, member);
         }
         let Ok(scope_source) = analyzer.project().read_source(scope_file) else {
             return false;
@@ -3016,6 +2984,25 @@ fn ruby_local_writes_are_exact_constructions(
     true
 }
 
+/// Whether the file that writes `call` keeps the method table `call` selects
+/// from: it parses, has no runtime load or evaluation boundary, activates no
+/// refinement around the call, and rewrites no method named `member`.
+fn ruby_caller_file_keeps_method_table(
+    provider: &RubyDefinitionProvider<'_>,
+    file: &ProjectFile,
+    root: Node<'_>,
+    call: Node<'_>,
+    source: &str,
+    member: &str,
+) -> bool {
+    provider
+        .ruby
+        .source_facts(file)
+        .is_some_and(|facts| !facts.has_parse_errors && facts.runtime_boundary.is_none())
+        && !ruby_has_active_refinement(root, call, source)
+        && ruby_scope_file_keeps_method_table(provider, root, source, member)
+}
+
 /// Whether one file in the analysis scope leaves the called member's method
 /// table as the declaration index records it. See
 /// [`ruby_member_selection_closed`] for the rules.
@@ -3103,6 +3090,165 @@ fn ruby_definer_names_avoid(call: Node<'_>, source: &str, member: &str) -> bool 
         ruby_symbol_or_string_value(argument, source)
             .is_some_and(|name| name != member && member.strip_suffix('=') != Some(&name))
     })
+}
+
+/// Calls on a constant, beyond the evaluators, that change its singleton
+/// method lookup or hand the constant itself to a block.
+const RUBY_SINGLETON_TABLE_WRITERS: &[&str] = &[
+    "extend",
+    "prepend",
+    "include",
+    "module_function",
+    "private_class_method",
+    "public_class_method",
+    "tap",
+    "then",
+    "yield_self",
+    "itself",
+];
+
+/// Calls that run source text, or read, write or remove a constant by name.
+const RUBY_REFLECTIVE_REWRITERS: &[&str] = &[
+    "eval",
+    "instance_eval",
+    "class_eval",
+    "module_eval",
+    "const_get",
+    "const_set",
+    "remove_const",
+];
+
+/// Whether one workspace file leaves the singleton method `member` of the
+/// external constant `owner` (its `::`-joined model path) as the activated
+/// model declares it (#9336).
+///
+/// The workspace declares nothing for an external constant, so a rewrite can
+/// sit in any file (`config/initializers/patch.rb`). This reads every
+/// reference to the constant, and every call that could reach it without one:
+///
+/// * A reference may receive an ordinary call, name the object of a
+///   `def Owner.other`, be the name or superclass of a declaration (a
+///   workspace declaration of the constant already takes precedence over the
+///   model), or be a constant argument of `include`/`extend`/`prepend`. It
+///   may not receive an evaluator, a writer from
+///   [`RUBY_SINGLETON_TABLE_WRITERS`] or a definer that can name `member`,
+///   open `class << Owner` or `def Owner.member`, and it may not escape as a
+///   value (an assignment, an argument, a constant reassignment).
+/// * Source-text evaluation (`eval`, a string `class_eval`) keeps it open
+///   anywhere, as do `const_set`/`remove_const` of a run-time name and
+///   `const_get`/`const_set`/`remove_const` or a `send` of one of them that
+///   names the constant literally.
+///
+/// A relative reference matches every constant path it can end; that only
+/// keeps more calls open. Reflection that computes a constant name at run
+/// time and reads it (`Object.const_get(name)`), or a method name it sends
+/// (`receiver.send(name)`), is not followed. A file over `max_nodes` keeps
+/// the member open.
+pub(crate) fn ruby_file_keeps_external_singleton(
+    root: Node<'_>,
+    source: &str,
+    owner: &str,
+    member: &str,
+    max_nodes: usize,
+) -> bool {
+    let names_owner = |path: &str, absolute: bool| {
+        owner
+            .strip_suffix(path)
+            .is_some_and(|prefix| prefix.is_empty() || (!absolute && prefix.ends_with("::")))
+    };
+    let mut pending = vec![root];
+    let mut visited = 0usize;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > max_nodes {
+            return false;
+        }
+        match node.kind() {
+            "call" => {
+                let method = node
+                    .child_by_field_name("method")
+                    .map_or("", |method| ruby_node_text(method, source));
+                let arguments = node.child_by_field_name("arguments");
+                let first_name = arguments
+                    .and_then(|arguments| arguments.named_child(0))
+                    .and_then(|argument| ruby_symbol_or_string_value(argument, source));
+                let reflective = match method {
+                    "eval" => true,
+                    // A block body is ordinary code this walk reads; an
+                    // argument is source text it cannot.
+                    "instance_eval" | "class_eval" | "module_eval" => arguments.is_some(),
+                    "const_get" => first_name.is_some_and(|name| {
+                        names_owner(name.trim_start_matches("::"), name.starts_with("::"))
+                    }),
+                    "const_set" | "remove_const" => first_name.is_none_or(|name| {
+                        names_owner(name.trim_start_matches("::"), name.starts_with("::"))
+                    }),
+                    "send" | "__send__" | "public_send" => first_name
+                        .is_some_and(|name| RUBY_REFLECTIVE_REWRITERS.contains(&name.as_str())),
+                    _ => false,
+                };
+                if reflective {
+                    return false;
+                }
+            }
+            "constant" | "scope_resolution"
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind() != "scope_resolution") =>
+            {
+                let path = brokk_bifrost_ruby::declarations::extract_name_path(node, source);
+                if names_owner(&path.segments.join("::"), path.absolute)
+                    && !ruby_reference_keeps_singleton(node, source, member)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        push_named_children_reversed_as(node, &mut pending, |child| child);
+    }
+    true
+}
+
+/// Whether one reference to an external constant leaves its singleton method
+/// `member` alone. See [`ruby_file_keeps_external_singleton`] for the rules.
+fn ruby_reference_keeps_singleton(reference: Node<'_>, source: &str, member: &str) -> bool {
+    let Some(parent) = reference.parent() else {
+        return false;
+    };
+    let is_field = |field| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == reference.id())
+    };
+    match parent.kind() {
+        "call" if is_field("receiver") => {
+            let method = parent
+                .child_by_field_name("method")
+                .map_or("", |method| ruby_node_text(method, source));
+            if RUBY_METHOD_TABLE_DEFINERS.contains(&method) {
+                return ruby_definer_names_avoid(parent, source, member);
+            }
+            !RUBY_METHOD_TABLE_EVALUATORS.contains(&method)
+                && !RUBY_SINGLETON_TABLE_WRITERS.contains(&method)
+        }
+        "singleton_method" if is_field("object") => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| ruby_node_text(name, source) != member),
+        "class" | "module" if is_field("name") => true,
+        "superclass" => true,
+        "argument_list" => parent.parent().is_some_and(|call| {
+            call.kind() == "call"
+                && call.child_by_field_name("receiver").is_none()
+                && call.child_by_field_name("method").is_some_and(|method| {
+                    matches!(
+                        ruby_node_text(method, source),
+                        "include" | "extend" | "prepend"
+                    )
+                })
+        }),
+        _ => false,
+    }
 }
 
 /// A splat, keyword group or block argument does not prove written positional
@@ -3295,34 +3441,51 @@ fn ruby_stage_member_attribution(
     );
 }
 
-struct RubyLookupContext<'a> {
-    semantic: &'a RubySemanticIndex<
+/// How many callees deep a block parameter's type may follow `yield`s: a
+/// callee's yielded value can itself be a block parameter typed by its own
+/// callee's `yield`.
+const RUBY_YIELD_DEPTH: usize = 4;
+
+struct RubyLookupContext<'s, 'a> {
+    semantic: &'s RubySemanticIndex<
         'a,
         brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'a>,
     >,
-    file: &'a ProjectFile,
-    source: &'a str,
-    visible_files: &'a HashSet<ProjectFile>,
+    file: &'s ProjectFile,
+    source: &'s str,
+    visible_files: &'s HashSet<ProjectFile>,
     locals: LocalInferenceEngine<String>,
-    lexical_stack: Vec<String>,
-    method_stack: Vec<RubyReceiverMode>,
-    receiver_context: Vec<RubyReceiverMode>,
-    exits: Vec<RubyScopeExit>,
+    scope: RubyScopeStack<LocalInferenceEngine<String>>,
     focus_start: usize,
+    yield_depth: usize,
 }
 
-impl<'a> RubyLookupContext<'a> {
+impl<'s, 'a> RubyLookupContext<'s, 'a> {
     fn build(
-        _analyzer: &'a dyn IAnalyzer,
-        semantic: &'a RubySemanticIndex<
+        semantic: &'s RubySemanticIndex<
             'a,
             brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'a>,
         >,
-        file: &'a ProjectFile,
-        source: &'a str,
-        visible_files: &'a HashSet<ProjectFile>,
+        file: &'s ProjectFile,
+        source: &'s str,
+        visible_files: &'s HashSet<ProjectFile>,
         root: Node<'_>,
         focus_start: usize,
+    ) -> Self {
+        Self::build_at_yield_depth(semantic, file, source, visible_files, root, focus_start, 0)
+    }
+
+    fn build_at_yield_depth(
+        semantic: &'s RubySemanticIndex<
+            'a,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AnalyzerMemoAttribution<'a>,
+        >,
+        file: &'s ProjectFile,
+        source: &'s str,
+        visible_files: &'s HashSet<ProjectFile>,
+        root: Node<'_>,
+        focus_start: usize,
+        yield_depth: usize,
     ) -> Self {
         let mut context = Self {
             semantic,
@@ -3330,11 +3493,9 @@ impl<'a> RubyLookupContext<'a> {
             source,
             visible_files,
             locals: LocalInferenceEngine::new(LocalInferenceConfig::default()),
-            lexical_stack: Vec::new(),
-            method_stack: Vec::new(),
-            receiver_context: Vec::new(),
-            exits: Vec::new(),
+            scope: RubyScopeStack::default(),
             focus_start,
+            yield_depth,
         };
         context.walk_to_focus(root);
         context
@@ -3381,36 +3542,29 @@ impl<'a> RubyLookupContext<'a> {
         match node.kind() {
             "class" | "module" => {
                 let owner = self.type_owner(node);
-                if let Some(owner) = owner.as_ref() {
-                    self.lexical_stack.push(owner.clone());
-                }
-                self.receiver_context.push(RubyReceiverMode::Instance);
-                self.exits.push(RubyScopeExit::Type {
-                    has_lexical_owner: owner.is_some(),
-                    locals: std::mem::take(&mut self.locals),
-                });
+                self.scope
+                    .enter_type(owner, std::mem::take(&mut self.locals));
                 return RubyWalkAction::DescendWithExit;
             }
             "method" | "singleton_method" => {
                 let locals = std::mem::take(&mut self.locals);
                 self.seed_parameter_shadows(node);
-                self.method_stack.push(ruby_method_receiver_mode(
-                    node,
-                    self.receiver_context.last().copied(),
-                ));
-                self.exits.push(RubyScopeExit::Method { locals });
+                self.scope.enter_method(node, locals);
                 return RubyWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 let locals = std::mem::take(&mut self.locals);
-                self.method_stack.push(RubyReceiverMode::Class);
-                self.receiver_context.push(RubyReceiverMode::Class);
-                self.exits.push(RubyScopeExit::SingletonClass { locals });
+                self.scope.enter_singleton_class(locals);
                 return RubyWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
+                let yielded = self.yielded_block_parameter_owners(node);
                 self.locals.enter_scope();
-                self.exits.push(RubyScopeExit::LocalScope);
+                ruby_seed_parameter_shadows(&mut self.locals, node, self.source);
+                for (name, owner) in yielded {
+                    self.locals.seed_symbol(name, owner);
+                }
+                self.scope.enter_block();
                 return RubyWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -3419,14 +3573,125 @@ impl<'a> RubyLookupContext<'a> {
         RubyWalkAction::Descend
     }
 
+    /// The instance class of each positional parameter of `block` that every
+    /// `yield` of the one method the block is passed to binds to the same
+    /// workspace class. Each yielded argument is typed in the callee's own
+    /// scope, at its `yield`. A parameter with any untyped, disagreeing or
+    /// unfixed yielded value, or a callee whose block can be called another
+    /// way, stays an unknown local.
+    fn yielded_block_parameter_owners(&self, block: Node<'_>) -> Vec<(String, String)> {
+        if self.yield_depth >= RUBY_YIELD_DEPTH {
+            return Vec::new();
+        }
+        let Some(call) = block.parent().filter(|call| {
+            call.kind() == "call" && call.child_by_field_name("block") == Some(block)
+        }) else {
+            return Vec::new();
+        };
+        let Some(parameters) = ruby_block_positional_parameters(block) else {
+            return Vec::new();
+        };
+        if parameters.is_empty() || ruby_is_dynamic_dispatch(call, self.source) {
+            return Vec::new();
+        }
+        let Some(method) = call.child_by_field_name("method") else {
+            return Vec::new();
+        };
+        let member = ruby_node_text(method, self.source);
+        let receiver_node = call.child_by_field_name("receiver");
+        let Some(receiver) = (match receiver_node {
+            Some(receiver) => self.receiver_type(receiver),
+            None => self.enclosing_receiver(),
+        }) else {
+            return Vec::new();
+        };
+        let candidates = self.semantic.graph.with_definitions(|support| {
+            if receiver_node.is_some() {
+                self.semantic.resolve_method_candidates(
+                    support,
+                    self.visible_files,
+                    &receiver,
+                    member,
+                )
+            } else {
+                self.semantic.resolve_bare_method_candidates(
+                    support,
+                    self.visible_files,
+                    &receiver,
+                    member,
+                )
+            }
+        });
+        let [callee] = candidates.as_slice() else {
+            return Vec::new();
+        };
+        if !callee.is_function() {
+            return Vec::new();
+        }
+        let Ok(callee_source) = self
+            .semantic
+            .graph
+            .index
+            .project()
+            .read_source(callee.source())
+        else {
+            return Vec::new();
+        };
+        let Some(callee_tree) = parse_ruby_tree(&callee_source) else {
+            return Vec::new();
+        };
+        let callee_root = callee_tree.root_node();
+        let Some(callee_method) =
+            ruby_method_node_for_ranges(callee_root, &self.semantic.graph.index.ranges(callee))
+                .filter(|method| !method.has_error())
+        else {
+            return Vec::new();
+        };
+        let Some(yields) = ruby_method_yield_sites(callee_method) else {
+            return Vec::new();
+        };
+        let Some(callee_visible) = self.semantic.visible_files_from(callee.source()) else {
+            return Vec::new();
+        };
+        let yield_contexts = yields
+            .iter()
+            .map(|site| {
+                RubyLookupContext::build_at_yield_depth(
+                    self.semantic,
+                    callee.source(),
+                    &callee_source,
+                    &callee_visible,
+                    callee_root,
+                    site.start_byte(),
+                    self.yield_depth + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let count = parameters.len();
+        parameters
+            .iter()
+            .enumerate()
+            .filter_map(|(index, parameter)| {
+                let mut owners = yields.iter().zip(&yield_contexts).map(|(site, context)| {
+                    let argument = ruby_yield_argument_for_block_parameter(*site, count, index)?;
+                    context
+                        .receiver_type(argument)
+                        .filter(|receiver| receiver.mode == RubyReceiverMode::Instance)
+                        .map(|receiver| receiver.owner_fq_name)
+                });
+                let first = owners.next()??;
+                owners
+                    .all(|owner| owner.as_deref() == Some(first.as_str()))
+                    .then(|| (ruby_node_text(*parameter, self.source).to_owned(), first))
+            })
+            .collect()
+    }
+
     fn exit(&mut self) {
-        exit_scope(
-            self.exits.pop(),
-            &mut self.receiver_context,
-            &mut self.lexical_stack,
-            &mut self.method_stack,
-            &mut self.locals,
-        );
+        match self.scope.exit().into_saved() {
+            Some(enclosing) => self.locals = enclosing,
+            None => self.locals.exit_scope(),
+        }
     }
 
     fn type_owner(&self, node: Node<'_>) -> Option<String> {
@@ -3434,7 +3699,7 @@ impl<'a> RubyLookupContext<'a> {
             self.semantic,
             self.file,
             self.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             node,
             self.source,
         )
@@ -3445,16 +3710,16 @@ impl<'a> RubyLookupContext<'a> {
             self.semantic,
             self.file,
             self.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             &self.locals,
-            &self.method_stack,
+            self.scope.method_mode(),
             node,
             self.source,
         )
     }
 
     fn enclosing_receiver(&self) -> Option<RubyReceiverType> {
-        ruby_enclosing_receiver(&self.lexical_stack, &self.method_stack)
+        ruby_enclosing_receiver(self.scope.lexical(), self.scope.method_mode())
     }
 
     fn seed_assignment(&mut self, node: Node<'_>) {
@@ -3462,8 +3727,8 @@ impl<'a> RubyLookupContext<'a> {
             self.semantic,
             self.file,
             self.visible_files,
-            &self.lexical_stack,
-            &self.method_stack,
+            self.scope.lexical(),
+            self.scope.method_mode(),
             &mut self.locals,
             node,
             self.source,
@@ -3475,7 +3740,7 @@ impl<'a> RubyLookupContext<'a> {
     }
 }
 
-impl RubyCompletedLocals for RubyLookupContext<'_> {
+impl RubyCompletedLocals for RubyLookupContext<'_, '_> {
     fn step(&self) -> bool {
         true
     }

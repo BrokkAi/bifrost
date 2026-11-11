@@ -593,7 +593,7 @@ fn external_member_lookup(
     kind: MemberAccessKind,
     member: &str,
 ) -> MemberLookup {
-    let owners = overlay.symbols_with_id(owner_id).records;
+    let owners = overlay.symbols_with_id_for(owner_id, "php").records;
     let [owner] = owners.as_slice() else {
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
     };
@@ -612,7 +612,7 @@ fn external_member_lookup(
     let mut incompatible = false;
     for candidate_owner in &surface.closure {
         let records = overlay
-            .members_of(&candidate_owner.id)
+            .members_of_in_family(&candidate_owner.id, "php")
             .records
             .into_iter()
             .filter(|symbol| member_name_matches(kind, &symbol.name, member))
@@ -665,7 +665,7 @@ fn external_member_lookup(
     };
     let has_magic = surface.closure.iter().any(|candidate_owner| {
         overlay
-            .members_of(&candidate_owner.id)
+            .members_of_for(&candidate_owner.id, "php")
             .records
             .iter()
             .any(|symbol| {
@@ -1081,7 +1081,7 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
                 let ClassIdentity::External { symbol_id, .. } = external else {
                     unreachable!("external ancestors retain external identities")
                 };
-                let owners = overlay.symbols_with_id(symbol_id).records;
+                let owners = overlay.symbols_with_id_in_family(symbol_id, "php").records;
                 let [owner] = owners.as_slice() else {
                     unresolved_base = true;
                     continue;
@@ -1090,7 +1090,7 @@ impl TypeFlowAdapter for PhpTypeFlowAdapter {
                 unresolved_base |= !surface.gaps.is_empty();
                 dynamic_attributes |= surface.closure.iter().any(|candidate_owner| {
                     overlay
-                        .members_of(&candidate_owner.id)
+                        .members_of_for(&candidate_owner.id, "php")
                         .records
                         .iter()
                         .any(|symbol| {

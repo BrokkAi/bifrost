@@ -2236,6 +2236,7 @@ impl SummaryDimensionCoverage {
 /// Stable reusable semantic effects for one exact procedure validity key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticProcedureSummary {
+    model_receipt: crate::model_attribution::ModelReceipt,
     key: ProcedureSummaryKey,
     composition_root: ProcedureSummaryKey,
     recursive_topology: Box<[SummaryRecursiveEdge]>,
@@ -2369,6 +2370,7 @@ impl SemanticProcedureSummary {
         }
 
         Ok(Self {
+            model_receipt: Default::default(),
             key,
             composition_root,
             recursive_topology,
@@ -2378,6 +2380,15 @@ impl SemanticProcedureSummary {
             completeness,
             coverage,
         })
+    }
+
+    pub fn model_receipt(&self) -> &crate::model_attribution::ModelReceipt {
+        &self.model_receipt
+    }
+
+    pub fn with_model_receipt(mut self, receipt: crate::model_attribution::ModelReceipt) -> Self {
+        self.model_receipt = receipt;
+        self
     }
 
     pub fn key(&self) -> &ProcedureSummaryKey {
@@ -2453,6 +2464,9 @@ impl SemanticProcedureSummary {
             )
             .saturating_add(completeness_heap_bytes(&self.completeness))
             .saturating_add(self.coverage.retained_bytes())
+            .saturating_add(crate::model_attribution::model_receipt_heap_bytes(
+                &self.model_receipt,
+            ))
     }
 
     /// Whether two revisions of one procedure publish the same summary output.
@@ -2479,6 +2493,7 @@ impl SemanticProcedureSummary {
             && self.effects == other.effects
             && self.completeness == other.completeness
             && self.coverage == other.coverage
+            && self.model_receipt == other.model_receipt
     }
 
     /// A checkout-independent digest of what this summary answers, for a read
@@ -2512,7 +2527,7 @@ impl SemanticProcedureSummary {
     /// verification would report a change that is not one.
     pub fn public_content_digest(&self) -> StableDigest {
         let mut bytes = Vec::new();
-        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-content-v3");
+        push_digest_part(&mut bytes, b"bifrost-procedure-summary-public-content-v4");
         push_digest_part(&mut bytes, self.key.identity.read_fingerprint().as_bytes());
         push_digest_part(&mut bytes, &(self.dependencies.len() as u64).to_le_bytes());
         for dependency in &self.dependencies {
@@ -2553,6 +2568,28 @@ impl SemanticProcedureSummary {
                 }
             }
         }
+        push_digest_part(
+            &mut bytes,
+            &[u8::from(self.model_receipt.approximate_contributed)],
+        );
+        push_digest_part(&mut bytes, &[u8::from(self.model_receipt.truncated)]);
+        push_digest_part(
+            &mut bytes,
+            &(self.model_receipt.total_lower_bound as u64).to_le_bytes(),
+        );
+        for item in &self.model_receipt.contributors {
+            push_digest_part(&mut bytes, &[item.role as u8]);
+            push_digest_part(&mut bytes, item.pack_digest.as_bytes());
+            push_digest_part(&mut bytes, item.record_id.as_bytes());
+            push_digest_part(&mut bytes, item.built_from.as_bytes());
+            push_digest_part(&mut bytes, item.resolved.as_bytes());
+            push_digest_part(&mut bytes, item.direction.as_bytes());
+            for kind in &item.mismatch_kinds {
+                push_digest_part(&mut bytes, kind.as_bytes());
+            }
+            push_digest_part(&mut bytes, item.selection_rule_id.as_bytes());
+            push_digest_part(&mut bytes, &item.selection_rule_version.to_le_bytes());
+        }
         StableDigest::sha256(bytes)
     }
 
@@ -2590,6 +2627,13 @@ impl SemanticProcedureSummary {
                 .join_alternatives(&other.coverage)
                 .map_err(SummaryCompositionError::InvalidResult)?,
         )
+        .map(|summary| {
+            summary.with_model_receipt(crate::model_attribution::model_receipt_merge(
+                &self.model_receipt,
+                &other.model_receipt,
+                crate::model_attribution::SUMMARY_RECEIPT_CAP,
+            ))
+        })
         .map_err(SummaryCompositionError::InvalidResult)
     }
 
@@ -2673,6 +2717,17 @@ impl SemanticProcedureSummary {
             dependencies.into_vec(),
             coverage,
         )
+        .map(|summary| {
+            summary.with_model_receipt(if invoked {
+                crate::model_attribution::model_receipt_merge(
+                    &self.model_receipt,
+                    &next.model_receipt,
+                    crate::model_attribution::SUMMARY_RECEIPT_CAP,
+                )
+            } else {
+                self.model_receipt.clone()
+            })
+        })
         .map_err(SummaryCompositionError::InvalidResult)
     }
 }
@@ -2871,23 +2926,40 @@ fn is_identity_actual_to_formal_mapping(mapping: &[u32]) -> bool {
         .all(|(actual, formal)| usize::try_from(*formal).ok() == Some(actual))
 }
 
+/// Whether a summary can be read through a non-identity actual-to-formal
+/// mapping. Transfers and effects both name formal ports; call-site readers
+/// translate a transfer's ports through the mapping and match a sanitize
+/// effect against the transfer's formal ports, so any effect whose ports are
+/// formal parameters, the receiver or a return is mapping-independent. A
+/// capture or heap port, and a concurrency effect, has no proven translation.
 fn mapped_summary_uses_supported_transfer_ports(
     summary: &SemanticProcedureSummary,
     formal_parameter_count: usize,
 ) -> bool {
-    summary.effects().is_empty()
-        && summary.transfers().iter().all(|transfer| {
-            [transfer.input(), transfer.exit().port()]
-                .into_iter()
-                .all(|port| match port {
-                    SummaryPort::Parameter(ordinal) => usize::try_from(*ordinal)
-                        .is_ok_and(|ordinal| ordinal < formal_parameter_count),
-                    SummaryPort::Capture(_) | SummaryPort::Heap(_) => false,
-                    SummaryPort::Receiver
-                    | SummaryPort::NormalReturn
-                    | SummaryPort::IndexedNormalReturn(_)
-                    | SummaryPort::ExceptionalReturn => true,
-                })
+    let supported = |port: &SummaryPort| match port {
+        SummaryPort::Parameter(ordinal) => {
+            usize::try_from(*ordinal).is_ok_and(|ordinal| ordinal < formal_parameter_count)
+        }
+        SummaryPort::Capture(_) | SummaryPort::Heap(_) => false,
+        SummaryPort::Receiver
+        | SummaryPort::NormalReturn
+        | SummaryPort::IndexedNormalReturn(_)
+        | SummaryPort::ExceptionalReturn => true,
+    };
+    summary
+        .transfers()
+        .iter()
+        .all(|transfer| supported(transfer.input()) && supported(transfer.exit().port()))
+        && summary.effects().iter().all(|effect| match effect.key() {
+            SummaryEffectKey::Allocation { output: port, .. }
+            | SummaryEffectKey::Escape { input: port, .. }
+            | SummaryEffectKey::UnknownCall { input: port, .. }
+            | SummaryEffectKey::AmbiguousCall { input: port, .. } => supported(port),
+            SummaryEffectKey::Sanitize { input, output, .. } => {
+                supported(input) && supported(output)
+            }
+            SummaryEffectKey::Call { .. } | SummaryEffectKey::UnknownCallBoundary { .. } => true,
+            SummaryEffectKey::Concurrency(_) => false,
         })
 }
 
@@ -2969,7 +3041,42 @@ pub(crate) fn canonical_semantic_summaries_by_artifact(
     ),
     SemanticSummarySetValidationError,
 > {
-    let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, true)?;
+    canonical_semantic_summaries_by_artifact_admitted(summaries, |summary| {
+        summary.completeness().is_complete()
+    })
+}
+
+pub(crate) fn canonical_protocol_summaries_by_artifact(
+    summaries: Vec<&SemanticProcedureSummary>,
+) -> Result<
+    (
+        Box<[&SemanticProcedureSummary]>,
+        SemanticSummaryArtifactIndex,
+    ),
+    SemanticSummarySetValidationError,
+> {
+    canonical_semantic_summaries_by_artifact_admitted(summaries, |summary| {
+        matches!(
+            summary.coverage().state(SummaryDimension::Protocol),
+            SummaryDimensionState::Complete
+        )
+    })
+}
+
+fn canonical_semantic_summaries_by_artifact_admitted(
+    summaries: Vec<&SemanticProcedureSummary>,
+    admitted: impl Fn(&SemanticProcedureSummary) -> bool,
+) -> Result<
+    (
+        Box<[&SemanticProcedureSummary]>,
+        SemanticSummaryArtifactIndex,
+    ),
+    SemanticSummarySetValidationError,
+> {
+    if summaries.iter().any(|summary| !admitted(summary)) {
+        return Err(SemanticSummarySetValidationError::Incomplete);
+    }
+    let summaries = canonicalize_semantic_summary_items(summaries, |summary| *summary, false)?;
     let mut by_artifact: SemanticSummaryArtifactIndex = HashMap::default();
     for (index, summary) in summaries.iter().enumerate() {
         if by_artifact
@@ -2996,6 +3103,12 @@ struct ExternalSummaryEntry {
 /// [`crate::analyzer::semantic::ProcedureHandle`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalSemanticSummarySet {
+    receiver_adjustments: Box<
+        [(
+            StableDigest,
+            Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
+        )],
+    >,
     entries: Box<[ExternalSummaryEntry]>,
     fingerprint: ExternalSummarySetFingerprint,
     compatibility: Option<ExternalSummaryCompatibilityKey>,
@@ -3004,6 +3117,7 @@ pub struct ExternalSemanticSummarySet {
 impl Default for ExternalSemanticSummarySet {
     fn default() -> Self {
         Self {
+            receiver_adjustments: Box::default(),
             entries: Box::default(),
             fingerprint: ExternalSummarySetFingerprint::hash_bytes(
                 b"bifrost-external-summary-set/v1\0",
@@ -3177,10 +3291,67 @@ impl ExternalSemanticSummarySet {
             }
         }
         Ok(Self {
+            receiver_adjustments: Box::default(),
             entries: entries.into_boxed_slice(),
             fingerprint: ExternalSummarySetFingerprint::hash_bytes(bytes),
             compatibility: Some(compatibility),
         })
+    }
+
+    pub fn with_receiver_adjustments(
+        mut self,
+        mut chains: Vec<(
+            StableDigest,
+            Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
+        )>,
+    ) -> Result<Self, ExternalSummarySetError> {
+        chains.sort_unstable_by_key(|(call, _)| *call);
+        if chains
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+        {
+            return Err(ExternalSummarySetError::AmbiguousTarget);
+        }
+        chains.dedup();
+        if !chains.is_empty() {
+            let mut bytes = self.fingerprint.as_bytes().to_vec();
+            for (call, chain) in &chains {
+                bytes.extend_from_slice(call.as_bytes());
+                bytes.extend_from_slice(&(chain.len() as u64).to_le_bytes());
+                for step in chain.iter() {
+                    bytes.extend_from_slice(step.fingerprint().as_bytes());
+                    let Some(summary) = self.summary_for(&step.summary_locator()) else {
+                        return Err(ExternalSummarySetError::InvalidTargetAlias);
+                    };
+                    let SummaryOrigin::External(origin) = summary.origin() else {
+                        return Err(ExternalSummarySetError::InvalidTargetAlias);
+                    };
+                    if !summary.completeness().is_complete()
+                        || !step.matches_origin(
+                            origin.model().as_str(),
+                            &origin.content().to_string(),
+                            origin.contract_version(),
+                        )
+                    {
+                        return Err(ExternalSummarySetError::InvalidTargetAlias);
+                    }
+                }
+            }
+            self.fingerprint = ExternalSummarySetFingerprint::hash_bytes(bytes);
+            self.receiver_adjustments = chains.into_boxed_slice();
+        }
+        Ok(self)
+    }
+
+    pub fn receiver_adjustments_for_call(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+    ) -> &[crate::analyzer::semantic_model::ReceiverAdjustment] {
+        let key = crate::analyzer::semantic_model::receiver_adjustment_call_identity(call);
+        self.receiver_adjustments
+            .binary_search_by_key(&key, |(call, _)| *call)
+            .ok()
+            .map_or(&[], |index| &self.receiver_adjustments[index].1)
     }
 
     /// The summary that closes one dispatch boundary, with its
@@ -3246,34 +3417,48 @@ impl ExternalSemanticSummarySet {
     /// Conservative retained heap estimate for the set's boxed entries and
     /// their owned target and summary metadata.
     pub(crate) fn retained_heap_bytes(&self) -> usize {
-        size_of_val(self.entries.as_ref()).saturating_add(
-            self.entries
+        let adjustment_bytes = size_of_val(self.receiver_adjustments.as_ref())
+            + self
+                .receiver_adjustments
                 .iter()
-                .map(
-                    |ExternalSummaryEntry {
-                         target,
-                         summary,
-                         actual_to_formal: mapping,
-                     }| {
-                        target
-                            .path
-                            .as_str()
-                            .len()
-                            .saturating_add(declaration_locator_heap_bytes(&target.declaration))
-                            .saturating_add(
-                                mapping
-                                    .as_ref()
-                                    .map_or(0, |mapping| size_of_val(mapping.as_ref())),
-                            )
-                            .saturating_add(
-                                summary
-                                    .retained_bytes()
-                                    .saturating_sub(size_of::<SemanticProcedureSummary>()),
-                            )
-                    },
-                )
-                .fold(0_usize, usize::saturating_add),
-        )
+                .map(|(_, steps)| {
+                    size_of_val(steps.as_ref())
+                        + steps
+                            .iter()
+                            .map(|step| step.retained_heap_bytes())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        adjustment_bytes
+            .saturating_add(size_of_val(self.entries.as_ref()))
+            .saturating_add(
+                self.entries
+                    .iter()
+                    .map(
+                        |ExternalSummaryEntry {
+                             target,
+                             summary,
+                             actual_to_formal: mapping,
+                         }| {
+                            target
+                                .path
+                                .as_str()
+                                .len()
+                                .saturating_add(declaration_locator_heap_bytes(&target.declaration))
+                                .saturating_add(
+                                    mapping
+                                        .as_ref()
+                                        .map_or(0, |mapping| size_of_val(mapping.as_ref())),
+                                )
+                                .saturating_add(
+                                    summary
+                                        .retained_bytes()
+                                        .saturating_sub(size_of::<SemanticProcedureSummary>()),
+                                )
+                        },
+                    )
+                    .fold(0_usize, usize::saturating_add),
+            )
     }
 }
 

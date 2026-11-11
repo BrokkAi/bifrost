@@ -16,6 +16,10 @@ use crate::analyzer::store::WorkspaceSnapshotId;
 use crate::analyzer::store::resolution_lexical::NodeSourceScopes;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 
+#[cfg(any(test, feature = "test-support"))]
+pub static CSHARP_DEMAND_INSTALLER_RUNS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // A package scope has a route row: the global namespace yields one NULL
 // segment through the LEFT JOIN. No route row means a type or block scope.
 pub const NAMESPACE_ROUTE: &str = "SELECT s.spelling FROM main.resolution_package_routes r
@@ -52,6 +56,9 @@ const TYPE_EXPLICIT_BASE_LIST: &str = "SELECT base.raw
  WHERE scope.blob_id=?1 AND scope.scope_head_node_key=?2 AND scope.scope_kind='type_body'
  ORDER BY base.ordinal";
 
+const EXTERN_ALIAS_COUNT: &str = "SELECT count(*) FROM resolution_extern_aliases
+ WHERE blob_id=?1 AND scope=?2 AND name=?3";
+
 /// One open using-tier obligation, retained with its structured lookup level.
 #[derive(Clone, Debug)]
 pub struct CSharpUsingTierGap {
@@ -72,6 +79,10 @@ pub const CSHARP_DEMAND_INSTALLER: NativeDemandInstaller =
     NativeDemandInstaller(&CSharpDemandInstaller);
 
 impl DemandInstall for CSharpDemandInstaller {
+    fn pre_admit(&self, ready: &ReadySelectedResolution<'_, '_>) -> Result<bool> {
+        Ok(ready.certified_csharp_view()?.is_some())
+    }
+
     fn selected_target_completion(
         &self,
         preparation: &dyn std::any::Any,
@@ -136,16 +147,21 @@ impl DemandInstall for CSharpDemandInstaller {
         cancellation: &CancellationToken,
         session: Option<&ResolutionSession>,
     ) -> Result<NativeDemandPreparationOutcome> {
+        #[cfg(any(test, feature = "test-support"))]
+        CSHARP_DEMAND_INSTALLER_RUNS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if cancellation.is_cancelled() || session.is_some_and(|session| !session.scope_step()) {
             return Ok(NativeDemandPreparationOutcome::Cancelled);
         }
         let ready = &operation.ready;
         let available = match ready.snapshot("csharp") {
             Some(snapshot) => {
-                match super::super::csharp_compilation::CSharpCompilationView::selected(
-                    ready.inventory.connection(),
-                    snapshot,
-                )? {
+                match ready.certified_csharp_view()?.map(|handle| {
+                    super::super::csharp_compilation::CSharpCompilationView::certified(
+                        ready.inventory.connection(),
+                        snapshot,
+                        &handle,
+                    )
+                }) {
                     Some(view) => match view.selected_compilations_of(
                         &ready.inventory,
                         caller.to_str().expect("persisted caller paths are UTF-8"),
@@ -238,6 +254,7 @@ impl DemandInstall for CSharpDemandInstaller {
                 &source,
                 paths,
                 typed,
+                &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
                 ForwardOperationArtifactContext {
                     cancellation,
                     session,
@@ -249,6 +266,7 @@ impl DemandInstall for CSharpDemandInstaller {
                 &source,
                 paths,
                 typed,
+                &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
                 cancellation,
                 session,
                 |operation| run(operation, &mut provider),
@@ -283,13 +301,20 @@ enum CSharpImportKey {
 }
 
 // One authored route, evaluated only in this point request and placement.
+struct CSharpAliasTier {
+    tier: RouteEdgeTier,
+    namespace_path: Vec<String>,
+    namespace_level: bool,
+    has_alias: bool,
+}
+
 struct CSharpImportTarget {
     metadata_key: Option<CSharpImportKey>,
     fragment: BindingFragmentId,
     compilation_id: i64,
     site: u32,
     scope: ResolutionScopeId,
-    absolute: bool,
+    anchor: ResolutionRootImportAnchor,
     route: Vec<ResolutionLookupSemanticRecipe>,
 }
 impl CSharpImportTarget {
@@ -321,7 +346,7 @@ impl CSharpImportTarget {
             compilation_id: placement.compilation_id,
             site: 0,
             scope: ResolutionScopeId::new(1),
-            absolute: true,
+            anchor: ResolutionRootImportAnchor::Absolute,
             route: entry
                 .1
                 .iter()
@@ -382,9 +407,10 @@ impl CSharpImportTarget {
         route: &super::imports::ImportRoute,
         names: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self> {
-        let absolute = match route.anchor.as_str() {
-            "absolute" => true,
-            "lexical" => false,
+        let anchor = match route.anchor.as_str() {
+            "absolute" => ResolutionRootImportAnchor::Absolute,
+            "lexical" => ResolutionRootImportAnchor::Lexical,
+            "alias_qualified" => ResolutionRootImportAnchor::AliasQualified,
             _ => return Err(StoreError::corrupt("C# alias route has an invalid anchor")),
         };
         let target = Self {
@@ -393,7 +419,7 @@ impl CSharpImportTarget {
             compilation_id,
             site: route.site,
             scope: ResolutionScopeId::new(route.scope),
-            absolute,
+            anchor,
             route: names
                 .into_iter()
                 .map(|name| {
@@ -536,6 +562,10 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
         let mut units = CSharpUnitReader::new(
             &self.ready.inventory,
             self.snapshot,
+            &self
+                .ready
+                .certified_csharp_view()?
+                .ok_or_else(|| StoreError::corrupt("C# demand lost certified view"))?,
             &self.ready.context_identities,
         )?;
         if let SelectedCSharpMembership::Proven(membership) =
@@ -651,7 +681,9 @@ impl<'store, 'input> DemandRules for CSharpRules<'_, 'store, 'input> {
         }
         let open_label = if !matches!(
             source.anchor,
-            ResolutionRootImportAnchor::Lexical | ResolutionRootImportAnchor::Absolute
+            ResolutionRootImportAnchor::Lexical
+                | ResolutionRootImportAnchor::Absolute
+                | ResolutionRootImportAnchor::AliasQualified
         ) {
             Some("csharp_source_anchor_unmodeled")
         } else if source.is_import {
@@ -803,7 +835,13 @@ impl HalfRules for CSharpHalf<'_, '_, '_> {
         let mut stack = Vec::new();
         loop {
             let mut pending = Vec::new();
-            let tier = self.lookup_tiers(
+            let lookup_tiers = if self.source.anchor == ResolutionRootImportAnchor::AliasQualified {
+                Self::alias_qualified_tiers
+            } else {
+                Self::lookup_tiers
+            };
+            let tier = lookup_tiers(
+                self,
                 self.fragment,
                 placement,
                 scope,
@@ -1199,7 +1237,7 @@ impl CSharpHalf<'_, '_, '_> {
         }
         let external_before = self.rules.external_observations.get();
         let mut completion = ResolutionCompletion::Complete;
-        let (starts, residual) = if alias.absolute {
+        let (starts, residual) = if alias.anchor == ResolutionRootImportAnchor::Absolute {
             (
                 vec![RouteLocation::Container {
                     unit: placement.compilation_id,
@@ -1217,7 +1255,13 @@ impl CSharpHalf<'_, '_, '_> {
                         self.rules.cancellation,
                     )
                 },
-                |scope, depth| match self.lookup_tiers(
+                |scope, depth| match (if alias.anchor == ResolutionRootImportAnchor::AliasQualified
+                {
+                    Self::alias_qualified_tiers
+                } else {
+                    Self::lookup_tiers
+                })(
+                    self,
                     alias.fragment,
                     placement,
                     scope,
@@ -1348,17 +1392,16 @@ impl CSharpHalf<'_, '_, '_> {
         })
     }
     #[allow(clippy::too_many_arguments)]
-    fn lookup_tiers(
+    fn alias_tier(
         &self,
         fragment: BindingFragmentId,
         placement: &CSharpUnitPlacement,
         scope: ResolutionScopeId,
-        depth: u32,
         lookup: &ResolutionLookupSemanticRecipe,
         excluded: Option<ResolutionScopeId>,
         resolved: &HashMap<CSharpImportKey, (Vec<RouteLocation>, ResolutionCompletion)>,
         pending: &mut Vec<CSharpImportTarget>,
-    ) -> Result<Read<Vec<LexicalStartTier<Rank, ()>>>> {
+    ) -> Result<Read<CSharpAliasTier>> {
         let rules = self.rules;
         if !rules.session.scope_step() || rules.cancellation.is_cancelled() {
             return Ok(Read::Cancelled(cancelled_completion()));
@@ -1404,7 +1447,6 @@ impl CSharpHalf<'_, '_, '_> {
         let namespace_path = path.into_iter().flatten().collect::<Vec<_>>();
         if namespace_level && namespace_path.is_empty() && excluded != Some(scope) {
             let Some(globals) = self.units.borrow_mut().global_usings(
-                rules.snapshot,
                 placement,
                 rules.cancellation,
                 rules.session,
@@ -1427,90 +1469,6 @@ impl CSharpHalf<'_, '_, '_> {
             aliases.retain(|(origin, route)| {
                 seen.insert((*origin, route.site, placement.compilation_id))
             });
-        }
-        let inventory_coverage = tier.coverage.clone();
-        if namespace_level {
-            let path = &namespace_path;
-            #[cfg(any(test, feature = "test-support"))]
-            rules.visited.borrow_mut().push(Some(path.clone()));
-            let route = CSharpRouteRules {
-                half: self,
-                fragment,
-                placement,
-            };
-            let location = RouteLocation::Container {
-                unit: placement.compilation_id,
-                container: serde_json::to_string(&path).expect("namespace segments serialize"),
-            };
-            tier = match route.step(&location, lookup)? {
-                Read::Ready {
-                    mut value,
-                    completion,
-                } => {
-                    value.coverage = value
-                        .coverage
-                        .combine(&completion)
-                        .combine(&inventory_coverage);
-                    value
-                }
-                Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
-                Read::Unavailable { reason, completion } => {
-                    return Ok(Read::Unavailable { reason, completion });
-                }
-            };
-        } else {
-            #[cfg(any(test, feature = "test-support"))]
-            rules.visited.borrow_mut().push(None);
-            let semantic = lookup.semantic(&rules.ready.shared_names());
-            let Some((paths, completion)) =
-                scope_binding_paths(rules.base, head, semantic, rules.cancellation)?
-            else {
-                return Ok(Read::Cancelled(cancelled_completion()));
-            };
-            tier.coverage = completion;
-            for path in paths {
-                if !path.end().symbols().fixed().is_empty() {
-                    continue;
-                }
-                for row in rules
-                    .base
-                    .classify_endpoint_nodes(&[path.end().node()], rules.cancellation)?
-                {
-                    if let Some(definition) = row.definition() {
-                        tier.coverage = tier.coverage.combine(path.completion());
-                        tier.edges.push(RouteLocation::Owner {
-                            definition,
-                            scope: Some(path.end().node()),
-                        });
-                    }
-                }
-            }
-            if tier.edges.is_empty() {
-                let mut statement = rules
-                    .ready
-                    .inventory
-                    .connection()
-                    .prepare_cached(TYPE_WITH_EXPLICIT_BASES)?;
-                let types = statement.query_map(
-                    rusqlite::params![mount.blob_id(), head.local_key()],
-                    |row| row.get::<_, String>(0),
-                )?;
-                for name in types {
-                    // Inherited nested types are M6, including source bases.
-                    // Without an explicit base list the implicit System.Object,
-                    // System.ValueType or System.Enum base has no nested types.
-                    self.record_obligation(
-                        scope,
-                        "csharp_inherited_types_unmodeled",
-                        &format!(
-                            "{}: {} may be inherited by type {}",
-                            mount.persisted_relative_path(),
-                            lookup.spelling(),
-                            name?
-                        ),
-                    );
-                }
-            }
         }
         for (origin, alias) in &aliases {
             let key = CSharpImportKey::Authored(*origin, alias.site, placement.compilation_id);
@@ -1617,7 +1575,222 @@ impl CSharpHalf<'_, '_, '_> {
                 ));
             }
         }
-        if namespace_level && tier.edges.is_empty() && aliases.is_empty() && !has_metadata_alias {
+        let has_alias = has_metadata_alias || !aliases.is_empty();
+        Ok(Read::ready(CSharpAliasTier {
+            tier,
+            namespace_path,
+            namespace_level,
+            has_alias,
+        }))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn alias_qualified_tiers(
+        &self,
+        fragment: BindingFragmentId,
+        placement: &CSharpUnitPlacement,
+        scope: ResolutionScopeId,
+        depth: u32,
+        lookup: &ResolutionLookupSemanticRecipe,
+        excluded: Option<ResolutionScopeId>,
+        resolved: &HashMap<CSharpImportKey, (Vec<RouteLocation>, ResolutionCompletion)>,
+        pending: &mut Vec<CSharpImportTarget>,
+    ) -> Result<Read<Vec<LexicalStartTier<Rank, ()>>>> {
+        let CSharpAliasTier {
+            mut tier,
+            namespace_path,
+            has_alias,
+            ..
+        } = match self.alias_tier(
+            fragment, placement, scope, lookup, excluded, resolved, pending,
+        )? {
+            Read::Ready { value, .. } => value,
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+            Read::Unavailable { .. } => unreachable!("alias inventory does not suspend"),
+        };
+        let mount = self
+            .rules
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(fragment.ordinal()))?;
+        let extern_count: u32 = self
+            .rules
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(EXTERN_ALIAS_COUNT)?
+            .query_row(
+                rusqlite::params![mount.blob_id(), scope.get(), lookup.spelling()],
+                |row| row.get(0),
+            )?;
+        let diagnostic = if extern_count > 0 && has_alias {
+            Some((
+                "csharp_alias_conflict",
+                "CS1537: extern and using aliases conflict",
+            ))
+        } else if extern_count > 0 {
+            Some((
+                "csharp_extern_alias_unindexed",
+                "extern alias provider inventory is unindexed",
+            ))
+        } else if tier
+            .edges
+            .iter()
+            .any(|location| matches!(location, RouteLocation::Owner { .. }))
+        {
+            Some((
+                "csharp_alias_qualified_type",
+                "CS0431: a type alias cannot qualify ::",
+            ))
+        } else if tier.edges.len() > 1 {
+            Some((
+                "csharp_alias_ambiguous",
+                "alias does not denote one namespace",
+            ))
+        } else {
+            None
+        };
+        if let Some((code, evidence)) = diagnostic {
+            tier.edges.clear();
+            tier.coverage = tier.coverage.combine(&self.using_obligation(
+                placement,
+                scope,
+                &namespace_path,
+                lookup,
+                code,
+                &format!("{}: {evidence}", lookup.spelling()),
+            ));
+        }
+        tier.blocks_fallback =
+            has_alias || extern_count > 0 || tier.coverage != ResolutionCompletion::Complete;
+        Ok(Read::ready(vec![LexicalStartTier {
+            ranked: RankedLexicalTier {
+                rank: Rank { depth, rank: 0 },
+                tier,
+                providers: Vec::new(),
+            },
+            head: None,
+        }]))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_tiers(
+        &self,
+        fragment: BindingFragmentId,
+        placement: &CSharpUnitPlacement,
+        scope: ResolutionScopeId,
+        depth: u32,
+        lookup: &ResolutionLookupSemanticRecipe,
+        excluded: Option<ResolutionScopeId>,
+        resolved: &HashMap<CSharpImportKey, (Vec<RouteLocation>, ResolutionCompletion)>,
+        pending: &mut Vec<CSharpImportTarget>,
+    ) -> Result<Read<Vec<LexicalStartTier<Rank, ()>>>> {
+        let rules = self.rules;
+        let CSharpAliasTier {
+            mut tier,
+            namespace_path,
+            namespace_level,
+            has_alias,
+        } = match self.alias_tier(
+            fragment, placement, scope, lookup, excluded, resolved, pending,
+        )? {
+            Read::Ready { value, .. } => value,
+            Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+            Read::Unavailable { .. } => unreachable!("alias inventory does not suspend"),
+        };
+        let inventory_coverage = tier.coverage.clone();
+        let lexical = rules.ready.lexical_source();
+        let Some(head) = lexical.scope_head_node_of(fragment, scope, rules.cancellation)? else {
+            return Ok(Read::Cancelled(cancelled_completion()));
+        };
+        let mount = rules
+            .ready
+            .inventory
+            .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(fragment.ordinal()))?;
+        let alias_edges = std::mem::take(&mut tier.edges);
+        if namespace_level {
+            let path = &namespace_path;
+            #[cfg(any(test, feature = "test-support"))]
+            rules.visited.borrow_mut().push(Some(path.clone()));
+            let route = CSharpRouteRules {
+                half: self,
+                fragment,
+                placement,
+            };
+            let location = RouteLocation::Container {
+                unit: placement.compilation_id,
+                container: serde_json::to_string(&path).expect("namespace segments serialize"),
+            };
+            tier = match route.step(&location, lookup)? {
+                Read::Ready {
+                    mut value,
+                    completion,
+                } => {
+                    value.coverage = value
+                        .coverage
+                        .combine(&completion)
+                        .combine(&inventory_coverage);
+                    value
+                }
+                Read::Cancelled(completion) => return Ok(Read::Cancelled(completion)),
+                Read::Unavailable { reason, completion } => {
+                    return Ok(Read::Unavailable { reason, completion });
+                }
+            };
+        } else {
+            #[cfg(any(test, feature = "test-support"))]
+            rules.visited.borrow_mut().push(None);
+            let semantic = lookup.semantic(&rules.ready.shared_names());
+            let Some((paths, completion)) =
+                scope_binding_paths(rules.base, head, semantic, rules.cancellation)?
+            else {
+                return Ok(Read::Cancelled(cancelled_completion()));
+            };
+            tier.coverage = completion;
+            for path in paths {
+                if !path.end().symbols().fixed().is_empty() {
+                    continue;
+                }
+                for row in rules
+                    .base
+                    .classify_endpoint_nodes(&[path.end().node()], rules.cancellation)?
+                {
+                    if let Some(definition) = row.definition() {
+                        tier.coverage = tier.coverage.combine(path.completion());
+                        tier.edges.push(RouteLocation::Owner {
+                            definition,
+                            scope: Some(path.end().node()),
+                        });
+                    }
+                }
+            }
+            if tier.edges.is_empty() {
+                let mut statement = rules
+                    .ready
+                    .inventory
+                    .connection()
+                    .prepare_cached(TYPE_WITH_EXPLICIT_BASES)?;
+                let types = statement.query_map(
+                    rusqlite::params![mount.blob_id(), head.local_key()],
+                    |row| row.get::<_, String>(0),
+                )?;
+                for name in types {
+                    // Inherited nested types are M6, including source bases.
+                    // Without an explicit base list the implicit System.Object,
+                    // System.ValueType or System.Enum base has no nested types.
+                    self.record_obligation(
+                        scope,
+                        "csharp_inherited_types_unmodeled",
+                        &format!(
+                            "{}: {} may be inherited by type {}",
+                            mount.persisted_relative_path(),
+                            lookup.spelling(),
+                            name?
+                        ),
+                    );
+                }
+            }
+        }
+        tier.edges.extend(alias_edges);
+        if namespace_level && tier.edges.is_empty() && !has_alias {
             // A namespace miss cannot exclude a type in an unindexed
             // assembly. Keep searching outward, retaining this obligation.
             // A source match stays closed: it wins over an imported type
@@ -1637,8 +1810,7 @@ impl CSharpHalf<'_, '_, '_> {
                 ),
             );
         }
-        tier.blocks_fallback = has_metadata_alias
-            || !aliases.is_empty()
+        tier.blocks_fallback = has_alias
             || !tier.edges.is_empty()
             || (namespace_level && tier.coverage != ResolutionCompletion::Complete);
         let mut tiers = Vec::new();
@@ -1717,7 +1889,6 @@ impl CSharpHalf<'_, '_, '_> {
             .collect::<Result<Vec<_>>>()?;
         if namespace.is_empty() {
             let Some(globals) = self.units.borrow_mut().global_usings(
-                rules.snapshot,
                 placement,
                 rules.cancellation,
                 rules.session,
@@ -2341,6 +2512,7 @@ pub fn probe_type(
             &source,
             &lexical,
             &ready.typed_source(),
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
             cancellation,
             &session,
             |facts| {
@@ -2403,4 +2575,16 @@ pub fn probe_type(
             },
         )
     }
+}
+
+/// Test the C# installer's selected configuration admission without a source lookup.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn probe_configuration_admission(
+    operation: &SelectedResolutionOperation<'_, '_>,
+) -> Result<bool> {
+    operation
+        .ready
+        .certified_csharp_view()
+        .map(|view| view.is_some())
 }

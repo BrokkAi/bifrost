@@ -339,16 +339,34 @@ fn named_workspace_descriptors(
 ///
 /// This is the authorization record for every tool call: Bifrost analyzes a
 /// directory only because one of these sources granted it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspaceBindingSource {
+///
+/// Each source carries exactly the data that belongs to it, so a binding
+/// cannot hold Codex sandbox metadata under client roots, or a revocation
+/// count under a Codex binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspaceBinding {
     /// Nothing is bound. Every workspace tool is refused.
-    None,
+    Unbound,
     /// The operator passed `--root`, so the client cannot change the scope.
     ExplicitRoot,
     /// The MCP client answered `roots/list`.
-    ClientRoots,
+    ClientRoots {
+        /// The revocation count this binding was made under.
+        ///
+        /// Compared against [`RootsRevocations::observed`], which the
+        /// transport increments in wire order. A request that sees a higher
+        /// count knows the client revoked this scope before the request
+        /// arrived, whatever order the notification handler and this request
+        /// happen to be scheduled in.
+        bound_at_revocation: u64,
+    },
     /// A Codex client supplied sandbox metadata on a `tools/call`.
-    CodexSandboxState,
+    CodexSandbox {
+        /// The `sandboxCwd` URI the client sent.
+        cwd_uri: String,
+        /// The root that URI bound.
+        root: PathBuf,
+    },
 }
 
 /// Per-connection workspace authorization state.
@@ -380,16 +398,7 @@ struct ConnectionState {
     /// handle stored here is genuinely connection-negotiation state, not
     /// something the stateless path is missing.
     negotiated: Option<NegotiatedConnection>,
-    workspace_binding_source: WorkspaceBindingSource,
-    codex_sandbox_cwd_uri: Option<String>,
-    codex_sandbox_root: Option<PathBuf>,
-    /// The revocation count the current binding was made under.
-    ///
-    /// Compared against [`RootsRevocations::observed`], which the transport
-    /// increments in wire order. A request that sees a higher count knows the
-    /// client revoked this scope before the request arrived, whatever order
-    /// the notification handler and this request happen to be scheduled in.
-    bound_at_revocation: u64,
+    binding: WorkspaceBinding,
 }
 
 /// What a completed `initialize` established about this client.
@@ -408,14 +417,11 @@ impl ConnectionState {
         Self {
             accepts_client_roots,
             negotiated: None,
-            workspace_binding_source: if accepts_client_roots {
-                WorkspaceBindingSource::None
+            binding: if accepts_client_roots {
+                WorkspaceBinding::Unbound
             } else {
-                WorkspaceBindingSource::ExplicitRoot
+                WorkspaceBinding::ExplicitRoot
             },
-            codex_sandbox_cwd_uri: None,
-            codex_sandbox_root: None,
-            bound_at_revocation: 0,
         }
     }
 
@@ -430,7 +436,7 @@ impl ConnectionState {
     /// left such a client bound from its own roots and then immediately
     /// refused for "workspace metadata missing".
     fn accepts_codex_sandbox_state(&self) -> bool {
-        if self.workspace_binding_source == WorkspaceBindingSource::ClientRoots {
+        if matches!(self.binding, WorkspaceBinding::ClientRoots { .. }) {
             return false;
         }
         self.accepts_client_roots
@@ -441,9 +447,7 @@ impl ConnectionState {
     }
 
     fn clear_binding(&mut self) {
-        self.workspace_binding_source = WorkspaceBindingSource::None;
-        self.codex_sandbox_cwd_uri = None;
-        self.codex_sandbox_root = None;
+        self.binding = WorkspaceBinding::Unbound;
     }
 }
 
@@ -681,6 +685,27 @@ impl RootsActivations {
 /// Every send happens on the request's own async task, never from the
 /// blocking analyzer task, so progress delivery can neither occupy an
 /// analyzer permit nor delay cooperative cancellation.
+/// How a request ended, sent as `request_status` on its final workspace-build
+/// notification. A request that is still running or that succeeded sends none.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestOutcome {
+    Cancelled,
+    Failed,
+}
+
+impl RequestOutcome {
+    /// The outcome of a request that returned an error: a cancelled request
+    /// reports the cancellation, not the error it caused.
+    fn after_error(cancelled: bool) -> Self {
+        if cancelled {
+            Self::Cancelled
+        } else {
+            Self::Failed
+        }
+    }
+}
+
 struct ProgressReporter {
     peer: rmcp::service::Peer<RoleServer>,
     token: rmcp::model::ProgressToken,
@@ -799,7 +824,11 @@ impl ProgressReporter {
         self.workspace(service, None).await;
     }
 
-    async fn workspace(&self, service: &SearchToolsService, request_status: Option<&str>) {
+    async fn workspace(
+        &self,
+        service: &SearchToolsService,
+        request_status: Option<RequestOutcome>,
+    ) {
         if service.workspace_generation() != self.workspace_generation {
             return;
         }
@@ -962,9 +991,7 @@ impl BifrostMcpHandler {
             if self.client_roots_binding_is_stale(&state) {
                 self.revoke_client_roots(&mut state);
             }
-            if !state.accepts_client_roots
-                || state.workspace_binding_source != WorkspaceBindingSource::None
-            {
+            if !state.accepts_client_roots || state.binding != WorkspaceBinding::Unbound {
                 return;
             }
             let Some(negotiated) = state.negotiated.as_ref() else {
@@ -1003,7 +1030,7 @@ impl BifrostMcpHandler {
         };
 
         let mut state = self.workspace.lock().await;
-        if state.workspace_binding_source != WorkspaceBindingSource::None {
+        if state.binding != WorkspaceBinding::Unbound {
             // A concurrent call already negotiated a workspace. Its binding is
             // as good as the one this answer would produce.
             return;
@@ -1033,8 +1060,11 @@ impl BifrostMcpHandler {
     /// the runtime happens to poll first -- which is the whole point, since
     /// `rmcp` dispatches notifications and requests on separate tasks.
     fn client_roots_binding_is_stale(&self, state: &ConnectionState) -> bool {
-        state.workspace_binding_source == WorkspaceBindingSource::ClientRoots
-            && state.bound_at_revocation != self.roots_revocations.observed()
+        matches!(
+            state.binding,
+            WorkspaceBinding::ClientRoots { bound_at_revocation }
+                if bound_at_revocation != self.roots_revocations.observed()
+        )
     }
 
     /// Drop the client-roots scope and stop any work admitted against it.
@@ -1085,10 +1115,9 @@ impl BifrostMcpHandler {
                         workspace_id: 0,
                         generation: self.service.workspace_generation(),
                     });
-                    state.workspace_binding_source = WorkspaceBindingSource::ClientRoots;
-                    state.codex_sandbox_cwd_uri = None;
-                    state.codex_sandbox_root = None;
-                    state.bound_at_revocation = self.roots_revocations.observed();
+                    state.binding = WorkspaceBinding::ClientRoots {
+                        bound_at_revocation: self.roots_revocations.observed(),
+                    };
                     eprintln!(
                         "bifrost: bound MCP workspace source=roots/list root={}",
                         escape_terminal_text(root.to_string_lossy().as_ref())
@@ -1137,10 +1166,9 @@ impl BifrostMcpHandler {
         };
 
         let active_root = self.service.active_workspace_root();
-        if state.workspace_binding_source == WorkspaceBindingSource::CodexSandboxState
-            && state.codex_sandbox_cwd_uri.as_deref() == Some(sandbox_cwd)
-            && state.codex_sandbox_root.is_some()
-            && active_root.as_ref() == state.codex_sandbox_root.as_ref()
+        if let WorkspaceBinding::CodexSandbox { cwd_uri, root } = &state.binding
+            && cwd_uri == sandbox_cwd
+            && active_root.as_ref() == Some(root)
         {
             return Ok(());
         }
@@ -1169,7 +1197,7 @@ impl BifrostMcpHandler {
         // the binding can only be Codex or nothing), and two adjacent copies of
         // a security teardown guarded differently is how they drift apart.
         if self.service.active_workspace_root().is_some()
-            || state.workspace_binding_source != WorkspaceBindingSource::None
+            || state.binding != WorkspaceBinding::Unbound
         {
             self.revoke_workspace(state, "the previous workspace reason=metadata changed");
             log_codex_workspace_event(
@@ -1180,9 +1208,10 @@ impl BifrostMcpHandler {
 
         match self.service.bind_client_workspace(candidate) {
             Ok(root) => {
-                state.workspace_binding_source = WorkspaceBindingSource::CodexSandboxState;
-                state.codex_sandbox_cwd_uri = Some(sandbox_cwd.to_string());
-                state.codex_sandbox_root = Some(root.clone());
+                state.binding = WorkspaceBinding::CodexSandbox {
+                    cwd_uri: sandbox_cwd.to_string(),
+                    root: root.clone(),
+                };
                 log_codex_workspace_event(
                     &format!(
                         "bound MCP workspace source={CODEX_SANDBOX_STATE_META_CAPABILITY} root={}",
@@ -1212,7 +1241,7 @@ impl BifrostMcpHandler {
         thread_id: Option<&str>,
         reason: &str,
     ) {
-        if state.workspace_binding_source != WorkspaceBindingSource::CodexSandboxState {
+        if !matches!(state.binding, WorkspaceBinding::CodexSandbox { .. }) {
             return;
         }
         self.revoke_workspace(state, &format!("the Codex workspace reason={reason}"));
@@ -1236,9 +1265,7 @@ impl BifrostMcpHandler {
         request: &CallToolRequestParams,
         context: &RequestContext<RoleServer>,
     ) -> Option<rmcp::model::InputRequiredResult> {
-        if !state.accepts_client_roots
-            || state.workspace_binding_source != WorkspaceBindingSource::None
-        {
+        if !state.accepts_client_roots || state.binding != WorkspaceBinding::Unbound {
             return None;
         }
         // Gate on the negotiated revision rather than letting rmcp reject the
@@ -1337,7 +1364,7 @@ impl BifrostMcpHandler {
 
         self.reconcile_codex_sandbox_workspace(state, meta)?;
 
-        if state.workspace_binding_source == WorkspaceBindingSource::None {
+        if state.binding == WorkspaceBinding::Unbound {
             return Err(unbound_workspace_error());
         }
         let Some(workspace_root) = self.service.active_workspace_root() else {
@@ -1345,10 +1372,10 @@ impl BifrostMcpHandler {
         };
 
         if name == "activate_workspace" {
-            let authority = match state.workspace_binding_source {
-                WorkspaceBindingSource::ClientRoots => Some("MCP client roots"),
-                WorkspaceBindingSource::CodexSandboxState => Some("Codex sandbox metadata"),
-                WorkspaceBindingSource::None | WorkspaceBindingSource::ExplicitRoot => None,
+            let authority = match state.binding {
+                WorkspaceBinding::ClientRoots { .. } => Some("MCP client roots"),
+                WorkspaceBinding::CodexSandbox { .. } => Some("Codex sandbox metadata"),
+                WorkspaceBinding::Unbound | WorkspaceBinding::ExplicitRoot => None,
             };
             if let Some(authority) = authority {
                 return Ok(PreparedToolCall::Reply(tool_error_result(format!(
@@ -1626,7 +1653,7 @@ impl BifrostMcpHandler {
                 biased;
                 () = request_cancelled.cancelled() => {
                     bifrost_cancellation.cancel();
-                    if let Some(progress) = progress { progress.workspace(&service, Some("cancelled")).await; }
+                    if let Some(progress) = progress { progress.workspace(&service, Some(RequestOutcome::Cancelled)).await; }
                     return Err(ErrorData::internal_error("the tool call was cancelled", None));
                 }
                 Some(phase) = phase_rx.recv() => {
@@ -1645,8 +1672,8 @@ impl BifrostMcpHandler {
                     progress.unwrap().workspace_tick(&service).await;
                 }
                 output = &mut output => {
-                    if let Some(progress) = progress { progress.workspace(&service, if bifrost_cancellation.is_cancelled() { Some("cancelled") }
-                        else if matches!(&output, Err(_) | Ok(Err(_))) { Some("failed") }
+                    if let Some(progress) = progress { progress.workspace(&service, if bifrost_cancellation.is_cancelled() { Some(RequestOutcome::Cancelled) }
+                        else if matches!(&output, Err(_) | Ok(Err(_))) { Some(RequestOutcome::Failed) }
                         else { None }).await; }
                     break output.map_err(|error| {
                     ErrorData::internal_error(format!("MCP tool execution panicked: {error}"), None)
@@ -1667,7 +1694,7 @@ impl BifrostMcpHandler {
                     // error response, and never again after it -- the loop
                     // that forwards the analyzer's phases ends here.
                     if let Some(progress) = progress {
-                        progress.workspace(&service, Some("cancelled")).await;
+                        progress.workspace(&service, Some(RequestOutcome::Cancelled)).await;
                         progress.phase(format!("cancelling {name}")).await;
                     }
                     // The budget this request was accepted under, not a second
@@ -1973,13 +2000,10 @@ async fn run_tool_as_task(
         progress
             .workspace(
                 &service,
-                ready.as_ref().err().map(|_| {
-                    if cancellation.is_cancelled() {
-                        "cancelled"
-                    } else {
-                        "failed"
-                    }
-                }),
+                ready
+                    .as_ref()
+                    .err()
+                    .map(|_| RequestOutcome::after_error(cancellation.is_cancelled())),
             )
             .await;
     }
@@ -2642,13 +2666,10 @@ impl ServerHandler for BifrostMcpHandler {
                 progress
                     .workspace(
                         &service,
-                        readiness.as_ref().err().map(|_| {
-                            if context.ct.is_cancelled() {
-                                "cancelled"
-                            } else {
-                                "failed"
-                            }
-                        }),
+                        readiness
+                            .as_ref()
+                            .err()
+                            .map(|_| RequestOutcome::after_error(context.ct.is_cancelled())),
                     )
                     .await;
             }
@@ -2680,11 +2701,7 @@ impl ServerHandler for BifrostMcpHandler {
                         progress
                             .workspace(
                                 &service,
-                                Some(if context.ct.is_cancelled() {
-                                    "cancelled"
-                                } else {
-                                    "failed"
-                                }),
+                                Some(RequestOutcome::after_error(context.ct.is_cancelled())),
                             )
                             .await;
                     }

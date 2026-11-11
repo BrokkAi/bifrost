@@ -12,12 +12,29 @@ use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
 use crate::analyzer::Language;
-use brokk_bifrost_rql::{CodeQuerySeed, OccurrenceFilter};
+use brokk_bifrost_rql::{CodeQuerySeed, OccurrenceFilter, Pattern};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum KindRequirement {
+    Any,
+    Named(NormalizedKind),
+}
+
+impl KindRequirement {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "any emitted kind",
+            Self::Named(kind) => kind.label(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum QueryFeature {
     Kind(NormalizedKind),
     Role(Role),
+    DeclarationModifiers(KindRequirement),
+    DeclarationTypeKind(KindRequirement),
     /// Exact language-neutral value of a normalized boolean literal.
     BooleanLiteralValue,
     /// AST-backed modifier state of callable facts.
@@ -90,46 +107,45 @@ pub(crate) struct QueryFeatures {
 
 impl QueryFeatures {
     pub(crate) fn for_query(query: &CodeQuerySeed) -> Self {
-        let features = query
-            .referenced_kinds()
-            .into_iter()
-            .map(QueryFeature::Kind)
-            .chain(query.used_roles().into_iter().map(QueryFeature::Role))
-            .chain(
-                query
-                    .constrains_boolean_value()
-                    .then_some(QueryFeature::BooleanLiteralValue),
-            )
-            .chain(
-                query
-                    .constrains_async_callable()
-                    .then_some(QueryFeature::AsyncCallableValue),
-            )
-            .chain(
-                query
-                    .constrains_string_value()
-                    .then_some(QueryFeature::StringLiteralValue),
-            );
-        let features = features.chain(
-            query
-                .constrains_assignment_shape()
-                .then_some(QueryFeature::AssignmentShape),
-        );
-        let features = features.chain(
-            query
-                .constrains_integer_literal_value()
-                .then_some(QueryFeature::IntegerLiteralValue),
-        );
-        let features = features.chain(
-            query
-                .constrains_unsafe_context()
-                .then_some(QueryFeature::UnsafeContext),
-        );
-        let features = features.chain(
-            query
-                .constrains_duplicate_dictionary_key()
-                .then_some(QueryFeature::DuplicateDictionaryKey),
-        );
+        let mut features = Vec::new();
+        query.walk_patterns(|pattern, role, effective_kinds| {
+            features.extend(pattern.kinds.iter().copied().map(QueryFeature::Kind));
+            features.extend(pattern.not_kinds.iter().copied().map(QueryFeature::Kind));
+            features.extend(role.map(QueryFeature::Role));
+            collect_declaration_attribute_features(pattern, effective_kinds, &mut features);
+            if pattern.boolean_value.is_some() {
+                features.push(QueryFeature::BooleanLiteralValue);
+            }
+            if pattern.is_async.is_some() {
+                features.push(QueryFeature::AsyncCallableValue);
+            }
+            if pattern.string_value.is_some() {
+                features.push(QueryFeature::StringLiteralValue);
+            }
+            if pattern.unsafe_context.is_some() {
+                features.push(QueryFeature::UnsafeContext);
+            }
+            if pattern.duplicate_key.is_some() {
+                features.push(QueryFeature::DuplicateDictionaryKey);
+            }
+            if pattern.integer_value.is_some()
+                || pattern.integer_has_any_bits.is_some()
+                || pattern.integer_has_all_bits.is_some()
+                || pattern.integer_has_no_bits.is_some()
+            {
+                features.push(QueryFeature::IntegerLiteralValue);
+            }
+            if pattern.assignment_target_kind.is_some()
+                || pattern.assignment_value_kind.is_some()
+                || pattern.assignment_target_unstarred_count.is_some()
+                || pattern.assignment_value_unstarred_count.is_some()
+                || pattern.assignment_target_starred.is_some()
+                || pattern.assignment_value_starred.is_some()
+                || pattern.assignment_unstarred_count_mismatch.is_some()
+            {
+                features.push(QueryFeature::AssignmentShape);
+            }
+        });
         Self::new(features)
     }
 
@@ -166,6 +182,8 @@ impl QueryFeatures {
             match feature {
                 QueryFeature::Kind(kind) => unsupported.kinds.push(kind),
                 QueryFeature::Role(role) => unsupported.roles.push(role),
+                QueryFeature::DeclarationModifiers(kind) => unsupported.modifiers.push(kind),
+                QueryFeature::DeclarationTypeKind(kind) => unsupported.type_kinds.push(kind),
                 QueryFeature::BooleanLiteralValue => unsupported.boolean_literal_value = true,
                 QueryFeature::AsyncCallableValue => unsupported.async_callable_value = true,
                 QueryFeature::UnsafeContext => unsupported.unsafe_context = true,
@@ -187,10 +205,39 @@ impl QueryFeatures {
     }
 }
 
+fn collect_declaration_attribute_features(
+    pattern: &Pattern,
+    effective_kinds: &[NormalizedKind],
+    features: &mut Vec<QueryFeature>,
+) {
+    if pattern.modifier.is_none() && pattern.type_kind.is_none() {
+        return;
+    }
+    let requirements = if effective_kinds.is_empty() {
+        vec![KindRequirement::Any]
+    } else {
+        effective_kinds
+            .iter()
+            .copied()
+            .map(KindRequirement::Named)
+            .collect()
+    };
+    for requirement in requirements {
+        if pattern.modifier.is_some() {
+            features.push(QueryFeature::DeclarationModifiers(requirement));
+        }
+        if pattern.type_kind.is_some() {
+            features.push(QueryFeature::DeclarationTypeKind(requirement));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UnsupportedQueryFeatures {
     kinds: Vec<NormalizedKind>,
     roles: Vec<Role>,
+    modifiers: Vec<KindRequirement>,
+    type_kinds: Vec<KindRequirement>,
     boolean_literal_value: bool,
     async_callable_value: bool,
     unsafe_context: bool,
@@ -220,6 +267,17 @@ impl UnsupportedQueryFeatures {
                 language,
                 unsupported: UnsupportedFeatureGroup::Roles(self.roles),
             });
+        }
+        for (requirements, axis) in [
+            (self.modifiers, "declaration modifiers"),
+            (self.type_kinds, "declaration type kind"),
+        ] {
+            if !requirements.is_empty() {
+                diagnostics.push(QueryCapabilityDiagnostic {
+                    language,
+                    unsupported: UnsupportedFeatureGroup::DeclarationAttributes(axis, requirements),
+                });
+            }
         }
         if self.boolean_literal_value {
             diagnostics.push(QueryCapabilityDiagnostic {
@@ -318,6 +376,12 @@ impl QueryCapabilityDiagnostic {
 
     pub(crate) fn message(&self) -> String {
         match &self.unsupported {
+            UnsupportedFeatureGroup::DeclarationAttributes(axis, requirements) => format!(
+                "structural adapter for {} does not support {} for kind requirement(s): {}",
+                self.language.config_label(),
+                axis,
+                labels(requirements.iter().copied().map(KindRequirement::label))
+            ),
             UnsupportedFeatureGroup::Kinds(kinds) => format!(
                 "structural adapter for {} does not support kind(s): {}",
                 self.language.config_label(),
@@ -392,6 +456,7 @@ impl QueryCapabilityDiagnostic {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UnsupportedFeatureGroup {
+    DeclarationAttributes(&'static str, Vec<KindRequirement>),
     Kinds(Vec<NormalizedKind>),
     Roles(Vec<Role>),
     BooleanLiteralValue,

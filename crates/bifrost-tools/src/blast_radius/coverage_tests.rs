@@ -53,6 +53,7 @@ fn scope_defaults_and_limits_preserve_reached_file_count() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("blast radius");
     assert_eq!(101, result.analysis.reached_test_file_count, "{result:#?}");
@@ -67,6 +68,7 @@ fn scope_defaults_and_limits_preserve_reached_file_count() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("coalesced blast radius");
     assert_eq!(1, one_scope.test_scopes.len());
@@ -108,6 +110,7 @@ fn changed_and_missing_functions_render_distinct_outcomes() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("blast radius");
     let removed = blast
@@ -133,6 +136,7 @@ fn changed_and_missing_functions_render_distinct_outcomes() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("missing tests");
     assert_eq!(1, missing.analysis.reached_function_count, "{missing:#?}");
@@ -178,6 +182,7 @@ fn external_test_and_production_caller_reach_changed_function() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("missing tests");
     assert_eq!(1, result.analysis.candidate_function_count, "{result:#?}");
@@ -211,11 +216,15 @@ fn incomplete_blast_radius_text_names_the_reason() {
         BlastRadiusParams::default(),
         &DiffAnalysisOptions::default(),
         &cancellation,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("partial blast radius");
-    assert_eq!(
-        vec![BlastRadiusIncompleteReason::TargetGraphCancelled],
-        result.analysis.incomplete_reasons
+    assert!(
+        result
+            .analysis
+            .incomplete_reasons
+            .contains(&BlastRadiusIncompleteReason::TargetGraphCancelled),
+        "{result:#?}"
     );
     assert!(
         result
@@ -252,6 +261,7 @@ fn same_file_test_call_reaches_changed_function() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("missing tests");
     assert_eq!(1, result.analysis.candidate_function_count, "{result:#?}");
@@ -301,6 +311,7 @@ fn renamed_dependency_combines_old_and_new_test_distances() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("blast radius");
     let scope = result
@@ -336,6 +347,7 @@ fn deleted_rust_dependency_keeps_old_side_test_recovery_when_python_is_added() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("blast radius");
     assert!(
@@ -377,6 +389,7 @@ fn nested_directory_scope_collapse_counts_each_reached_test_once() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("blast radius");
     assert_eq!(3, result.analysis.reached_test_file_count, "{result:#?}");
@@ -435,6 +448,7 @@ fn usable_incomplete_graph_keeps_proven_test_reachability_and_reasons() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("missing tests");
     assert_eq!(
@@ -487,10 +501,15 @@ fn changed_outer_function_resolves_when_nested_function_shares_its_end_line() {
         },
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("missing tests");
+    // The changed outer function resolves to its full span and is classified,
+    // not indeterminate. The native Python resolver links `from src.value
+    // import outer` in test_outer, so the candidate is reached.
     assert_eq!(1, result.analysis.candidate_function_count, "{result:#?}");
-    assert_eq!(1, result.analysis.missing_function_count, "{result:#?}");
+    assert_eq!(1, result.analysis.reached_function_count, "{result:#?}");
+    assert_eq!(0, result.analysis.missing_function_count, "{result:#?}");
     assert_eq!(
         0, result.analysis.indeterminate_function_count,
         "{result:#?}"

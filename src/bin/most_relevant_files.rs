@@ -87,19 +87,28 @@ fn run() -> Result<(), String> {
                     .filter(|language| *language != Language::None)
             })
             .collect();
+        // A one-shot ranking run owns its retention budget.
+        let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
+            AnalyzerConfig::default().retention_budget_bytes(),
+        );
         if matches!(
             ranking_mode,
             MostRelevantFilesRankingMode::UsageGraph
                 | MostRelevantFilesRankingMode::UsageGraphExact
         ) || seed_languages.is_empty()
         {
-            WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
-                .map_err(|error| format!("failed to build the analyzer workspace: {error}"))?
+            WorkspaceAnalyzer::build_persisted_with_budget(
+                project,
+                AnalyzerConfig::default(),
+                &budget,
+            )
+            .map_err(|error| format!("failed to build the analyzer workspace: {error}"))?
         } else {
-            WorkspaceAnalyzer::build_persisted_for_languages(
+            WorkspaceAnalyzer::build_persisted_for_languages_with_budget(
                 project,
                 AnalyzerConfig::default(),
                 &seed_languages,
+                &budget,
             )
             .map_err(|error| format!("failed to build the analyzer workspace: {error}"))?
         }

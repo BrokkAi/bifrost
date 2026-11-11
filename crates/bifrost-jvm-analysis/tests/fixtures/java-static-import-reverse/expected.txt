@@ -1,0 +1,5 @@
+src/main/java/p/C.java:70..71: m
+src/main/java/q/Qualified.java:47..48: m
+src/main/java/q/Single.java:61..62: m
+src/main/java/q/Star.java:59..60: m
+completeness: Incomplete { reasons: [InverseIndexReferenceEnumerationIncomplete, InverseIndexResolutionIncomplete] }

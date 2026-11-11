@@ -7,11 +7,12 @@
 
 use brokk_bifrost_core::analyzer::rust_facts::{
     RustAliasSourceFact, RustCallableParameterSourceFact, RustCallableSourceFact,
-    RustDeclarationGenericsSourceFact, RustGenericParameterSourceFact, RustImplSourceFact,
-    RustItemBodyChildSourceFact, RustItemImportContextFact, RustItemMacroExpansion,
-    RustItemMacroSourceFact, RustItemMacroSourcePosition, RustItemSourceFacts, RustItemSyntaxFact,
-    RustMacroParseFailure, RustSourceContextFact, RustSourceContextKind, RustSourceNameFact,
-    RustTraitSourceFact, RustValueSourceFact,
+    RustDeclarationGenericsSourceFact, RustGenericParameterSourceFact, RustImplCensusBoundary,
+    RustImplCensusBoundaryKind, RustImplSourceFact, RustItemBodyChildSourceFact,
+    RustItemImportContextFact, RustItemMacroExpansion, RustItemMacroSourceFact,
+    RustItemMacroSourcePosition, RustItemSourceFacts, RustItemSyntaxFact, RustMacroParseFailure,
+    RustSourceContextFact, RustSourceContextKind, RustSourceNameFact, RustTraitSourceFact,
+    RustValueSourceFact,
 };
 use brokk_bifrost_core::analyzer::source_facts::PrimarySourceFactCollector;
 use brokk_bifrost_core::analyzer::source_facts::{
@@ -65,6 +66,28 @@ pub(crate) struct RustItemSourceCollector {
 impl RustItemSourceCollector {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn record_primary_census_node(&mut self, node: Node<'_>, source: &str) {
+        if node.kind() == "macro_invocation" {
+            self.facts
+                .impl_census_boundaries
+                .push(RustImplCensusBoundary {
+                    kind: RustImplCensusBoundaryKind::Macro,
+                    start_byte: node.start_byte(),
+                });
+        }
+        if node.is_error() || node.is_missing() || (node.parent().is_none() && node.has_error()) {
+            self.facts
+                .impl_census_boundaries
+                .push(RustImplCensusBoundary {
+                    kind: RustImplCensusBoundaryKind::SyntaxError,
+                    start_byte: node.start_byte(),
+                });
+        }
+        if matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+            self.record_census_attribute(node, source);
+        }
     }
 
     pub(crate) fn enter(
@@ -173,6 +196,62 @@ impl RustItemSourceCollector {
             self.context_fact_indices
                 .pop()
                 .expect("Rust source item context facts unwind with their context");
+        }
+    }
+
+    fn record_census_attribute(&mut self, node: Node<'_>, source: &str) {
+        let Some(attributes) =
+            crate::resolution::rust_effective_attributes(std::iter::once(node), source)
+        else {
+            self.facts
+                .impl_census_boundaries
+                .push(RustImplCensusBoundary {
+                    kind: RustImplCensusBoundaryKind::ExpandingAttribute,
+                    start_byte: node.start_byte(),
+                });
+            return;
+        };
+        for attribute in attributes {
+            let name = (attribute.path.len() == 1)
+                .then(|| crate::declarations::rust_node_text(attribute.path[0], source));
+            let internal = name.is_some_and(|name| {
+                name == "lang"
+                    || name == "no_core"
+                    || name.starts_with("rustc_")
+                    || (name == "feature"
+                        && attribute.arguments.is_some_and(|args| {
+                            let mut stack = vec![args];
+                            while let Some(current) = stack.pop() {
+                                if current.kind() == "identifier"
+                                    && crate::declarations::rust_node_text(current, source)
+                                        == "lang_items"
+                                {
+                                    return true;
+                                }
+                                stack.extend(current.children(&mut current.walk()));
+                            }
+                            false
+                        }))
+            });
+            let kind = if name == Some("derive") {
+                Some(RustImplCensusBoundaryKind::Derive)
+            } else if internal {
+                Some(RustImplCensusBoundaryKind::InternalAttribute)
+            } else if name == Some("no_std") {
+                None
+            } else if !crate::resolution::rust_effective_attribute_is_inert(&attribute, source) {
+                Some(RustImplCensusBoundaryKind::ExpandingAttribute)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.facts
+                    .impl_census_boundaries
+                    .push(RustImplCensusBoundary {
+                        kind,
+                        start_byte: node.start_byte(),
+                    });
+            }
         }
     }
 

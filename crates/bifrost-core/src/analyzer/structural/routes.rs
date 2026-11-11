@@ -281,6 +281,8 @@ pub enum CuratedExportSurface {
     Absent,
     /// The file names one, and every member was read from the parse tree.
     Listed(HashSet<String>),
+    /// Known members of a surface whose remaining members are computed.
+    PartiallyListed(HashSet<String>),
     /// The file names one whose members the adapter cannot read.
     Unreadable,
 }
@@ -292,6 +294,7 @@ impl CuratedExportSurface {
         match self {
             Self::Absent => Some(false),
             Self::Listed(names) => Some(names.contains(name)),
+            Self::PartiallyListed(names) => names.contains(name).then_some(true),
             Self::Unreadable => None,
         }
     }

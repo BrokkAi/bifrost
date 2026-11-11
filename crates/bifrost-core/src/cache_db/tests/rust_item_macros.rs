@@ -199,3 +199,180 @@ fn sealed_macro_route_source_rows_remain_immutable_after_rebuild() {
         );
     }
 }
+
+#[test]
+fn rust_impl_census_schema_enforces_foreign_keys_and_read_family_shape() {
+    let conn = current_rust_connection();
+    let blob_id = seed_macro_route(&conn, "rust-impl-census-schema", Some(0));
+    assert!(conn.execute(
+        "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(999999,1,0,0)",
+        [],
+    ).is_err());
+    for (version, impls, boundaries) in [(2, 0, 0), (1, -1, 0), (1, 0, -1)] {
+        assert!(conn.execute(
+            "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(?1,?2,?3,?4)",
+            params![blob_id, version, impls, boundaries],
+        ).is_err());
+    }
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(?1,1,0,1)",
+        [blob_id],
+    ).unwrap();
+    assert!(conn.execute(
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte) VALUES(999999,0,0,0)",
+        [],
+    ).is_err());
+    for (ordinal, kind, start) in [(-1, 0, 0), (0, 5, 0), (0, 0, -1)] {
+        assert!(conn.execute(
+            "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte) VALUES(?1,?2,?3,?4)",
+            params![blob_id, ordinal, kind, start],
+        ).is_err());
+    }
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte) VALUES(?1,0,2,7)",
+        [blob_id],
+    ).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT kind,start_byte FROM source_rust_impl_census_boundaries WHERE blob_id=?1",
+            [blob_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap(),
+        (2, 7)
+    );
+
+    let digest = [1u8; 32];
+    let insert = "INSERT INTO policy_read_keys(
+        key_digest,kind,family,subject,digest,copy_owning_unit,copy_target_unit,
+        copy_module_path,copy_target_identity_digest,copy_census_version,
+        copy_config_digest,copy_producer_digest)
+        VALUES(?1,'lookup',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)";
+    assert!(
+        conn.execute(
+            insert,
+            params![
+                digest,
+                "rust_copy_absence",
+                digest,
+                digest,
+                digest,
+                digest,
+                "crate",
+                digest,
+                Option::<i64>::None,
+                digest,
+                digest
+            ]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            insert,
+            params![
+                digest, "other", digest, digest, digest, digest, "crate", digest, 1, digest, digest
+            ]
+        )
+        .is_err()
+    );
+    conn.execute(
+        insert,
+        params![
+            digest,
+            "rust_copy_absence",
+            digest,
+            digest,
+            digest,
+            digest,
+            "crate",
+            digest,
+            1,
+            digest,
+            digest
+        ],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE policy_read_keys SET copy_target_unit=NULL WHERE key_digest=?1",
+            [digest],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+#[hardwon("#9263: storage review found published census rows could be mutated after sealing")]
+fn sealed_rust_impl_census_rows_are_immutable() {
+    let conn = current_rust_connection();
+    let blob_id = seed_macro_route(&conn, "rust-impl-census-sealed", Some(0));
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(?1,1,0,1)",
+        [blob_id],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte) VALUES(?1,0,2,7)",
+        [blob_id],
+    ).unwrap();
+    seal_rust_source_manifest(&conn, blob_id).unwrap();
+
+    for sql in [
+        "UPDATE source_rust_impl_census_boundaries SET kind=3 WHERE blob_id=?1",
+        "UPDATE source_rust_impl_census_boundaries SET start_byte=8 WHERE blob_id=?1",
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id,ordinal,kind,start_byte) VALUES(?1,1,2,9)",
+        "DELETE FROM source_rust_impl_census_boundaries WHERE blob_id=?1",
+        "UPDATE source_rust_impl_census_files SET boundary_count=2 WHERE blob_id=?1",
+        "DELETE FROM source_rust_impl_census_files WHERE blob_id=?1",
+        "INSERT INTO source_rust_impl_census_files(blob_id,census_version,impl_count,boundary_count) VALUES(?1,1,0,1)",
+    ] {
+        let error = conn.execute(sql, [blob_id]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("sealed source facts are immutable")
+                || error
+                    .to_string()
+                    .contains("sealed Rust item facts are immutable"),
+            "{sql}: {error}"
+        );
+    }
+}
+
+#[test]
+fn populated_version_one_rust_facts_survive_migration_without_relabeling() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    configure_connection(&mut conn).unwrap();
+    conn.execute_batch(BASELINE_SCHEMA_SQL).unwrap();
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version < 252)
+    {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", 250).unwrap();
+    let blob_id = seed_macro_route(&conn, "rust-census-version-one", Some(0));
+    seal_rust_source_manifest(&conn, blob_id).unwrap();
+
+    migrate(&mut conn).unwrap();
+    let (version, macro_rows): (i64, i64) = conn
+        .query_row(
+            "SELECT item.facts_version,
+                    (SELECT COUNT(*) FROM source_rust_macro_definitions WHERE blob_id=item.blob_id)
+               FROM source_rust_item_manifests AS item WHERE item.blob_id=?1",
+            [blob_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((version, macro_rows), (1, 1));
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM source_rust_impl_census_files WHERE blob_id=?1",
+            [blob_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
+    );
+    validate_foreign_keys(&conn).unwrap();
+}

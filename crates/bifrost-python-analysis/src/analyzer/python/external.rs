@@ -61,6 +61,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackLimits;
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyPackProduction;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::DependencyProvenance;
+use brokk_bifrost_analysis::analyzer::semantic_model::dependency::ASSUMED_DEPENDENCY_PROVENANCE_KEY;
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact;
 
@@ -269,6 +270,9 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -530,6 +534,9 @@ schema_version:
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -703,6 +710,9 @@ schema_version:
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -876,7 +886,7 @@ fn python_dependency_production_request(
         activation: vec![
             brokk_bifrost_semantic::analyzer::semantic_model::dependency::activation_selector_for_evidence(&dependency.evidence),
         ],
-        provenance: Provenance {
+        provenance: Provenance { rust_artifact_approximation: None,
             source: "exact local Python environment artifact".to_owned(),
             revision: None,
         },
@@ -889,7 +899,7 @@ fn python_dependency_production_request(
 }
 
 fn combine_completeness(left: Completeness, right: Completeness) -> Completeness {
-    if left == Completeness::Partial || right == Completeness::Partial {
+    if left != Completeness::Complete || right != Completeness::Complete {
         Completeness::Partial
     } else {
         Completeness::Complete
@@ -1858,6 +1868,8 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         }
         let guard = self.guard_of(guard).cloned();
         self.types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -3067,9 +3079,27 @@ const SETUP_CFG_FILE_NAME: &str = "setup.cfg";
 const SETUP_PY_FILE_NAME: &str = "setup.py";
 const CPYTHON_TOOLCHAIN_NAME: &str = "cpython";
 /// The released typeshed standard-library pack a declared `cpython` version
-/// selects (`semantic-packs/python/typeshed-stdlib-*.json`).
+/// selects (authored in `BrokkAi/bifrost-packs`).
 const PYTHON_STDLIB_PACK_ID: &str = "bifrost.python-stdlib";
 const MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES: u64 = 256 * 1024;
+/// The CPython version assumed for a Python workspace that declares none.
+///
+/// Most Python repositories never state an interpreter version, and every
+/// standard-library pack is keyed to a `cpython` toolchain version, so
+/// refusing to assume one left those workspaces with no standard-library
+/// model at all: `unittest.TestCase` and every other stdlib base stayed
+/// unknown. An assumed version is weaker than a declared one, and the
+/// dependency records that it was assumed, but it selects the same packs a
+/// workspace declaring this version would.
+///
+/// 3.13.5 is the CPython release the open Python packs in
+/// `BrokkAi/bifrost-packs` were extracted from and verified against. Every
+/// one of their toolchain requirements admits it, including the observed
+/// runtime-base pack's exact `=3.13.5` pin that models `unittest.TestCase`.
+/// Assuming any other release would select a strict subset of those models
+/// with no better claim to match the workspace. Move it only when those packs
+/// move to a new reference release.
+const ASSUMED_CPYTHON_VERSION: Version = Version::new(3, 13, 5);
 
 /// Resolve the standard-library dependency a workspace *declares* rather than
 /// installs: an exact `cpython` toolchain pin read from `.python-version`, from
@@ -3329,26 +3359,11 @@ fn declared_python_stdlib_dependency(
     source_file: &str,
     declared: &str,
 ) -> ResolvedDependency {
-    ResolvedDependency {
-        id: format!("python:stdlib:declared:cpython:{version}"),
-        evidence: SemanticModelActivationEvidence {
-            language: "python".to_owned(),
-            ecosystem: "python".to_owned(),
-            package: None,
-            module: None,
-            toolchain: Some(CatalogCoordinate {
-                name: CPYTHON_TOOLCHAIN_NAME.to_owned(),
-                version: Some(version.clone()),
-            }),
-            // The workspace declares a version, not a platform. Leaving the
-            // target unpinned keeps platform-guarded declarations active and
-            // read-incomplete instead of provably dropped, per the pack's
-            // one-way honesty rule (semantic-packs/python/README.md).
-            target: None,
-            configuration: None,
-            artifact_sha256: None,
-        },
-        provenance: vec![
+    let id = format!("python:stdlib:declared:cpython:{version}");
+    python_stdlib_dependency(
+        id,
+        version.clone(),
+        vec![
             DependencyProvenance {
                 key: "python.toolchain_declaration".to_owned(),
                 value: source_file.to_owned(),
@@ -3362,6 +3377,52 @@ fn declared_python_stdlib_dependency(
                 value: version.to_string(),
             },
         ],
+    )
+}
+
+/// The standard-library dependency of a Python workspace that declares no
+/// CPython version: [`ASSUMED_CPYTHON_VERSION`], with provenance that says so.
+fn assumed_python_stdlib_dependency() -> ResolvedDependency {
+    python_stdlib_dependency(
+        format!("python:stdlib:assumed:cpython:{ASSUMED_CPYTHON_VERSION}"),
+        ASSUMED_CPYTHON_VERSION,
+        vec![DependencyProvenance {
+            key: ASSUMED_DEPENDENCY_PROVENANCE_KEY.to_owned(),
+            value: format!(
+                "{ASSUMED_CPYTHON_VERSION}; the workspace declares no CPython version in \
+                 {PYTHON_VERSION_FILE_NAME}, {PYPROJECT_FILE_NAME}, {SETUP_CFG_FILE_NAME} \
+                 or {SETUP_PY_FILE_NAME}"
+            ),
+        }],
+    )
+}
+
+fn python_stdlib_dependency(
+    id: String,
+    version: Version,
+    provenance: Vec<DependencyProvenance>,
+) -> ResolvedDependency {
+    ResolvedDependency {
+        id,
+        evidence: SemanticModelActivationEvidence {
+            language: "python".to_owned(),
+            ecosystem: "python".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: CPYTHON_TOOLCHAIN_NAME.to_owned(),
+                version: Some(version.clone()),
+            }),
+            // The workspace declares a version, not a platform. Leaving the
+            // target unpinned keeps platform-guarded declarations active and
+            // read-incomplete instead of provably dropped, per the pack's
+            // one-way honesty rule: an unpinned platform guard is never
+            // treated as proof that a declaration is absent.
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance,
         artifacts: Vec::new(),
         scope: DependencyScope::Unknown,
         declared_by: None,
@@ -3369,15 +3430,21 @@ fn declared_python_stdlib_dependency(
 }
 
 /// The discovery outcome for a workspace with no configured Python
-/// environment: the declared-toolchain route alone (#1869). A workspace that
-/// declares nothing resolves nothing and stays complete, but it still records
-/// that it selects no standard-library pack, and why (#3464).
+/// environment: the declared-toolchain route (#1869). A Python workspace that
+/// declares nothing resolves the [`ASSUMED_CPYTHON_VERSION`] standard library
+/// instead of none. A declaration discovery refuses to read is not silence:
+/// it selects no standard-library pack and records why (#3464).
 fn resolve_declared_python_stdlib_outcome(project: &dyn Project) -> DependencyDiscoveryOutcome {
     let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
-    let expectation = match resolve_declared_python_stdlib_dependency(
+    let has_python = project.analyzer_languages().contains(&Language::Python);
+    let resolved = match resolve_declared_python_stdlib_dependency(
         project.root(),
         &mut outcome.profile.metadata_inputs_considered,
     ) {
+        Ok(None) if has_python => Ok(Some(assumed_python_stdlib_dependency())),
+        resolved => resolved,
+    };
+    let expectation = match resolved {
         Ok(Some(dependency)) => {
             let expectation = StandardLibraryPackExpectation::declared(
                 Language::Python,
@@ -3388,14 +3455,9 @@ fn resolve_declared_python_stdlib_outcome(project: &dyn Project) -> DependencyDi
             outcome.profile.dependencies_resolved = 1;
             expectation
         }
-        Ok(None) => StandardLibraryPackExpectation::not_selected(
-            Language::Python,
-            PYTHON_STDLIB_PACK_ID,
-            format!(
-                "the workspace declares no CPython version in {PYTHON_VERSION_FILE_NAME}, \
-                 {PYPROJECT_FILE_NAME}, {SETUP_CFG_FILE_NAME} or {SETUP_PY_FILE_NAME}"
-            ),
-        ),
+        // Only a workspace without Python sources gets here, and it records
+        // no expectation below.
+        Ok(None) => return outcome,
         Err(diagnostic) => {
             let expectation = StandardLibraryPackExpectation::not_selected(
                 Language::Python,
@@ -3407,7 +3469,7 @@ fn resolve_declared_python_stdlib_outcome(project: &dyn Project) -> DependencyDi
             expectation
         }
     };
-    if project.analyzer_languages().contains(&Language::Python) {
+    if has_python {
         outcome.expect_standard_library_pack(expectation);
     }
     outcome
@@ -3439,6 +3501,9 @@ pub fn resolve_python_semantic_pack_dependencies(
     let Some(environment) = &config.environment else {
         return resolve_declared_python_stdlib_outcome(project);
     };
+    // Installed distribution and artifact discovery walks external trees
+    // recursively; the capture cannot certify their membership.
+    brokk_bifrost_analysis::analyzer::dependency_support::refuse_external_discovery_reads();
     let mut state = DiscoveryState::new(environment, limits);
     if state.cancelled(cancellation) {
         return state.cancelled_outcome();
@@ -4561,6 +4626,7 @@ from ...escape import Bad
                 artifact_sha256: None,
             }],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },
@@ -4766,6 +4832,7 @@ from ...escape import Bad
                     artifact_sha256: None,
                 }],
                 provenance: Provenance {
+                    rust_artifact_approximation: None,
                     source: "fixture".to_owned(),
                     revision: None,
                 },
@@ -5216,6 +5283,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                     artifact_sha256: None,
                 }],
                 provenance: Provenance {
+                    rust_artifact_approximation: None,
                     source: "fixture".to_owned(),
                     revision: None,
                 },
@@ -5433,6 +5501,7 @@ setup(name=\"fixture\", packages=[\"fixture\"], python_requires=\">=3.11\")
                     artifact_sha256: None,
                 }],
                 provenance: Provenance {
+                    rust_artifact_approximation: None,
                     source: "fixture".to_owned(),
                     revision: None,
                 },

@@ -22,10 +22,10 @@ use serde_json::{Value, json};
 
 use crate::CancellationToken;
 use crate::analyzer::resolution::{
-    BatchCandidateRequest, BindingFragmentId, BindingNodeId, EndpointSignature, PartialPath,
-    PartialPathId, PartialScopedSymbol, PrecedenceStep, ResolutionCompletion,
-    ResolutionIncompleteReason, SemanticId, SharedNameId, StackPattern, StackVariableId,
-    WitnessStep,
+    BatchCandidateRequest, BindingFragmentId, BindingNodeId, EndpointSignature,
+    LexicalChoiceRecord, PartialPath, PartialPathId, PartialScopedSymbol, PrecedenceStep,
+    ResolutionCompletion, ResolutionIncompleteReason, SemanticId, SharedNameId, StackPattern,
+    StackVariableId, WitnessStep,
 };
 use crate::analyzer::store::resolution_prepare::resolution_rows::{
     RootKeyBuilder, candidate_outcome_code, code, from_code,
@@ -285,6 +285,29 @@ pub fn encode_path(path: &PartialPath) -> String {
     cells.push(completion_cell(path.completion()));
     cells.push(json!(i64::from(path.owner_continued())));
     cells.push(json!(path.root_import_activation()));
+    cells.push(json!([
+        path.lexical_choices()
+            .iter()
+            .map(|record| json!([
+                record.source_fragment.ordinal(),
+                encode_path_id(record.source_path),
+                encode_node(record.owner),
+                record.segment_position,
+                record
+                    .precedence
+                    .iter()
+                    .map(|step| json!([
+                        code(ALL_PRECEDENCE_TIERS, step.tier),
+                        step.ordinal,
+                        encode_semantic(step.semantic),
+                    ]))
+                    .collect::<Vec<_>>(),
+                completion_cell(&ResolutionCompletion::incomplete([record.reason])),
+            ]))
+            .collect::<Vec<_>>(),
+        path.addressed_lexical_choice(),
+        path.segment_count(),
+    ]));
     serde_json::to_string(&cells).expect("a structured stage path serializes to JSON")
 }
 
@@ -293,8 +316,8 @@ pub fn decode_path(start: i64, end: i64, body: &str) -> PartialPath {
     let document: Value = serde_json::from_str(body).expect("a stage path body is valid JSON");
     let cells = array(&document, "path body");
     assert!(
-        matches!(cells.len(), 11..=13),
-        "a stage path body has eleven legacy, twelve, or thirteen positions"
+        matches!(cells.len(), 11..=14),
+        "a stage path body has eleven through fourteen positions"
     );
     let precedence = array(&cells[8], "precedence")
         .iter()
@@ -363,7 +386,7 @@ pub fn decode_path(start: i64, end: i64, body: &str) -> PartialPath {
         u32::try_from(integer(cell, "root import activation"))
             .expect("a root import activation fits a source offset")
     });
-    let path = PartialPath::new(
+    let mut path = PartialPath::new(
         endpoint_from_cells(decode_node(start), &cells[..4]),
         endpoint_from_cells(decode_node(end), &cells[4..8]),
         precedence,
@@ -371,6 +394,59 @@ pub fn decode_path(start: i64, end: i64, body: &str) -> PartialPath {
         completion_from_cell(&cells[10]),
     )
     .with_root_import_activation(root_import_activation);
+    if let Some(metadata) = cells.get(13) {
+        let metadata = array(metadata, "lexical metadata");
+        assert_eq!(metadata.len(), 3);
+        let records = array(&metadata[0], "lexical records")
+            .iter()
+            .map(|record| {
+                let record = array(record, "lexical record");
+                assert_eq!(record.len(), 6);
+                let reason = match completion_from_cell(&record[5]) {
+                    ResolutionCompletion::Incomplete(reasons) if reasons.iter().count() == 1 => {
+                        reasons.iter().next().copied().expect("one reason")
+                    }
+                    other => panic!("a stage lexical record has one reason: {other:?}"),
+                };
+                LexicalChoiceRecord {
+                    source_fragment: BindingFragmentId::at_ordinal(
+                        u32::try_from(integer(&record[0], "source fragment"))
+                            .expect("fragment ordinal fits u32"),
+                    ),
+                    source_path: decode_path_id(integer(&record[1], "source path")),
+                    owner: decode_node(integer(&record[2], "owner")),
+                    segment_position: u32::try_from(integer(&record[3], "segment position"))
+                        .expect("segment position fits u32"),
+                    precedence: array(&record[4], "lexical precedence")
+                        .iter()
+                        .map(|step| {
+                            let step = array(step, "lexical precedence step");
+                            assert_eq!(step.len(), 3);
+                            PrecedenceStep {
+                                tier: from_code(
+                                    ALL_PRECEDENCE_TIERS,
+                                    integer(&step[0], "tier"),
+                                    "tier",
+                                ),
+                                ordinal: u32::try_from(integer(&step[1], "ordinal"))
+                                    .expect("ordinal fits u32"),
+                                semantic: decode_semantic(integer(&step[2], "semantic")),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    reason,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let addressed = metadata[1]
+            .as_u64()
+            .map(|value| usize::try_from(value).expect("address fits usize"));
+        let count =
+            u32::try_from(integer(&metadata[2], "segment count")).expect("segment count fits u32");
+        path = path.with_lexical_metadata(records, addressed, count);
+    }
     if owner_continued {
         path.with_owner_continued()
     } else {
@@ -378,8 +454,9 @@ pub fn decode_path(start: i64, end: i64, body: &str) -> PartialPath {
     }
 }
 
-// Tags 0..=3 retain the durable reason vocabulary's order. The three additional
-// tags are private stage vocabulary, not new durable completion kinds.
+// Tags 0..=3 retain the durable reason vocabulary's order. The four additional
+// tags are private stage vocabulary, not new durable completion kinds. Tags are
+// appended and never renumbered; the decoder rejects an unknown tag.
 fn completion_cell(completion: &ResolutionCompletion) -> Value {
     let ResolutionCompletion::Incomplete(reasons) = completion else {
         return Value::Null;
@@ -420,6 +497,9 @@ fn completion_cell(completion: &ResolutionCompletion) -> Value {
                         "an unmounted-file reason identifies a selected fragment"
                     );
                     json!([6, fragment.ordinal()])
+                }
+                ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => {
+                    json!([7, encode_semantic(*semantic)])
                 }
             })
             .collect(),
@@ -466,6 +546,9 @@ fn completion_from_cell(cell: &Value) -> ResolutionCompletion {
                     ResolutionIncompleteReason::UnmountedFile {
                         fragment: BindingFragmentId::at_ordinal(ordinal),
                     }
+                }
+                7 => {
+                    ResolutionIncompleteReason::ReceiverSubclassObligation(decode_semantic(payload))
                 }
                 other => panic!("unknown stage completion tag: {other}"),
             }

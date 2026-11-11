@@ -73,6 +73,70 @@ pub(crate) fn attribute_payload(node: Node<'_>) -> Option<Node<'_>> {
         .or_else(|| node.child_by_field_name("expression"))
 }
 
+/// A const value has no identity when its declared type is built only from
+/// primitive scalars and shared `str` references, through arrays and tuples:
+/// such a value holds no reference to a place, no function and no interior
+/// mutability. Any other type (a path, a non-str reference, a slice, a
+/// function pointer, a generic) is not proved identity-free. Rust lets an item
+/// or import shadow a primitive name (`type u8 = &'static AtomicUsize;`), so
+/// `primitive_unbound` must confirm that each written primitive, `str`
+/// included, names the built-in type at its own site.
+pub fn const_type_is_identity_free<'tree, E>(
+    ty: Node<'tree>,
+    source: &str,
+    mut primitive_unbound: impl FnMut(Node<'tree>) -> Result<bool, E>,
+) -> Result<bool, E> {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            "primitive_type" => {
+                if !matches!(
+                    crate::declarations::rust_node_text(ty, source),
+                    "bool"
+                        | "char"
+                        | "i8"
+                        | "i16"
+                        | "i32"
+                        | "i64"
+                        | "i128"
+                        | "isize"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "u128"
+                        | "usize"
+                        | "f32"
+                        | "f64"
+                ) || !primitive_unbound(ty)?
+                {
+                    return Ok(false);
+                }
+            }
+            "reference_type" => {
+                let referent = ty.child_by_field_name("type").filter(|referent| {
+                    referent.kind() == "primitive_type"
+                        && crate::declarations::rust_node_text(*referent, source) == "str"
+                });
+                let shared = !ty
+                    .named_children(&mut ty.walk())
+                    .any(|child| child.kind() == "mutable_specifier");
+                match referent {
+                    Some(referent) if shared && primitive_unbound(referent)? => {}
+                    _ => return Ok(false),
+                }
+            }
+            "array_type" => match ty.child_by_field_name("element") {
+                Some(element) => pending.push(element),
+                None => return Ok(false),
+            },
+            "tuple_type" => pending.extend(ty.named_children(&mut ty.walk())),
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// The containing syntax node outside an attribute wrapper owned by `node`.
 /// Payload and wrapper expose the same attributes, so ancestry consumers must
 /// cross that boundary once rather than applying its predicates twice.
@@ -102,7 +166,7 @@ pub fn outer_attributes<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<'
     outer_attributes_with_parent(node, parent)
 }
 
-pub(crate) fn outer_attributes_with_parent<'tree>(
+pub fn outer_attributes_with_parent<'tree>(
     node: Node<'tree>,
     parent: Option<Node<'tree>>,
 ) -> impl Iterator<Item = Node<'tree>> {
@@ -704,4 +768,92 @@ mod tests {
                 .is_none()
         );
     }
+}
+
+/// What a literal token fixes about its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustLiteralType {
+    /// A primitive, behind this many reference layers (`"x"` is `&str`).
+    Exact {
+        primitive: &'static str,
+        reference_layers: i8,
+    },
+    /// An unsuffixed integer or float: inference picks its type.
+    InferredNumeric,
+    /// A literal kind the model has no type for, such as a byte string.
+    Unsupported,
+}
+
+/// The type a literal's own token fixes, or `None` for a non-literal.
+///
+/// tree-sitter keeps a literal's suffix and prefix inside its one token, so
+/// they are read from the token's spelling against Rust's fixed vocabularies,
+/// as the Java producer reads an integer literal's `L`. A hexadecimal integer
+/// takes no float suffix: `0x1f32` is an unsuffixed integer whose digits end
+/// in `f32`.
+pub fn rust_literal_type(node: Node<'_>, source: &str) -> Option<RustLiteralType> {
+    const INTEGER_SUFFIXES: [&str; 12] = [
+        "u128", "usize", "u16", "u32", "u64", "u8", "i128", "isize", "i16", "i32", "i64", "i8",
+    ];
+    const FLOAT_SUFFIXES: [&str; 2] = ["f32", "f64"];
+    let token = crate::declarations::rust_node_text(node, source);
+    let exact = |primitive, reference_layers| RustLiteralType::Exact {
+        primitive,
+        reference_layers,
+    };
+    let suffixed = |suffixes: &[&'static str]| {
+        suffixes
+            .iter()
+            .copied()
+            .find(|suffix| token.ends_with(suffix))
+            .map_or(RustLiteralType::InferredNumeric, |suffix| exact(suffix, 0))
+    };
+    Some(match node.kind() {
+        "boolean_literal" => exact("bool", 0),
+        "char_literal" if token.starts_with('\'') => exact("char", 0),
+        "string_literal" | "raw_string_literal"
+            if token.starts_with('"') || token.starts_with('r') =>
+        {
+            exact("str", 1)
+        }
+        "char_literal" | "string_literal" | "raw_string_literal" => RustLiteralType::Unsupported,
+        "integer_literal" if token.starts_with("0x") || token.starts_with("0X") => {
+            suffixed(&INTEGER_SUFFIXES)
+        }
+        "integer_literal" => {
+            let suffixes = INTEGER_SUFFIXES
+                .iter()
+                .chain(&FLOAT_SUFFIXES)
+                .copied()
+                .collect::<Vec<_>>();
+            suffixed(&suffixes)
+        }
+        "float_literal" => suffixed(&FLOAT_SUFFIXES),
+        _ => return None,
+    })
+}
+
+/// Whether a crate root's effective inner attributes retain a canonical
+/// standard type in its implicit prelude. Conditional disabling attributes
+/// conservatively disable the proof as well.
+pub fn rust_implicit_prelude_contains_type(root: Node<'_>, source: &str, name: &str) -> bool {
+    debug_assert_eq!(root.kind(), "source_file");
+    let Some(attributes) = crate::resolution::rust_effective_attributes(
+        root.named_children(&mut root.walk())
+            .filter(|node| node.kind() == "inner_attribute_item"),
+        source,
+    ) else {
+        return false;
+    };
+    let has = |name| {
+        attributes.iter().any(|attribute| {
+            attribute.path.len() == 1
+                && crate::declarations::rust_node_text(attribute.path[0], source) == name
+        })
+    };
+    if has("no_implicit_prelude") || has("no_core") {
+        return false;
+    }
+    matches!(name, "Option" | "Result")
+        || (!has("no_std") && matches!(name, "String" | "Vec" | "Box"))
 }

@@ -99,7 +99,9 @@ mod rust_departing_root_tests {
                 });
             let before_publication = rusqlite::Connection::open_in_memory().unwrap();
             before_publication.execute_batch("CREATE TABLE resolution_identities(id INTEGER PRIMARY KEY,identity_digest BLOB NOT NULL UNIQUE)").unwrap();
-            let names = SharedNameTable::new(SharedNameCache::default());
+            let names = SharedNameTable::new(SharedNameCache::new(
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            ));
             let request = names.interner(&before_publication).intern(digest);
             assert!(!request.is_interned());
             let reader = SelectedResolutionAuthority::new(

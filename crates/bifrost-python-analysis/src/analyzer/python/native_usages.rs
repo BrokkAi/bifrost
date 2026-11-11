@@ -28,8 +28,6 @@ use brokk_bifrost_core::analyzer::usages::model::{
     FuzzyResult, UsageAnalysisDiagnostic, UsageProofAuthority,
 };
 use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -62,18 +60,13 @@ impl GraphUsageAnalyzer for PythonNativeUsageStrategy {
                     Ok(PythonNativeOpen::Ready(request)) => {
                         let files = python.analyzed_files().into_iter().collect();
                         let scope = UsageScanScope::with_cancellation(&files, cancellation);
-                        let session = ResolutionSession::bounded(
-                            ReceiverAnalysisBudget::default(),
-                            Some(cancellation),
-                        );
                         request
                             .operation
-                            .python_reverse_targets(
+                            .python_reverse_targets_in_scope(
                                 &request.environment,
                                 &targets,
                                 &scope,
                                 PythonReverseLimits::default(),
-                                &session,
                             )
                             .map_err(|error| {
                                 Box::new(DIAGNOSTICS.failure(
@@ -291,16 +284,12 @@ fn find_usages_in_request(
     let Some(primary) = overloads.first() else {
         return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
     };
-    let cancellation = scope.cancellation().cloned().unwrap_or_default();
     let targets = unique_targets(overloads);
-    let session =
-        ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
-    let result = match request.operation.python_reverse_targets(
+    let result = match request.operation.python_reverse_targets_in_scope(
         &request.environment,
         &targets,
         scope,
         PythonReverseLimits::default(),
-        &session,
     ) {
         Ok(result) => result,
         Err(error) => {
@@ -330,22 +319,14 @@ fn project_usage_result(
         }
     };
     let mut pending = NativeUsagePending::new(targets);
-    for kind in [
-        "python_environment_open",
-        "python_unknown_placement",
-        "python_dynamic_receiver_mutation_open",
-    ] {
-        let obligations = projected
-            .query_obligations
-            .iter()
-            .filter(|label| label.starts_with(kind))
-            .collect::<Vec<_>>();
-        if !obligations.is_empty() {
-            pending.diagnostics.push(DIAGNOSTICS.diagnostic(
-                primary,
-                kind,
-                format!("{obligations:?}"),
-            ));
+    for obligation in &projected.query_obligations {
+        let kind = obligation
+            .split_once(':')
+            .map_or(obligation.as_str(), |(kind, _)| kind);
+        if !super::query_reason_is_scope(kind) {
+            pending
+                .diagnostics
+                .push(DIAGNOSTICS.diagnostic(primary, kind, obligation.clone()));
         }
     }
     for (target, answer) in projected.targets {
@@ -430,9 +411,6 @@ mod tests {
 
     #[test]
     fn prepared_reverse_is_consumed_once_and_file_truncation_is_explicit() {
-        if !super::super::trial_native_python_selected() {
-            return;
-        }
         let fixture = InlineTestProject::with_language(Language::Python)
             .file("model.py", "def pick(): pass\n")
             .file("a.py", "from model import pick\nx = pick()\n")
@@ -467,33 +445,20 @@ mod tests {
                 100,
             )
         };
-        let GraphUsageOutcome::Resolved(FuzzyResult::Incomplete {
-            hits_by_overload,
-            unproven_by_overload,
-            diagnostics,
-            ..
-        }) = outcome
-        else {
-            panic!("prepared sites must run and retain query obligations: {outcome:?}");
+        let GraphUsageOutcome::Resolved(result) = outcome else {
+            panic!("prepared sites must run within the selected environment: {outcome:?}");
         };
-        assert!(
-            hits_by_overload
-                .values()
-                .map(|hits| hits.len())
-                .sum::<usize>()
-                + unproven_by_overload
-                    .values()
-                    .map(|hits| hits.len())
-                    .sum::<usize>()
-                >= 2
-        );
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.reason_kind == "python_environment_open")
-                .count(),
-            1
-        );
+        assert!(result.all_hits_including_imports().len() >= 2);
+        if let FuzzyResult::Incomplete { diagnostics, .. } = &result {
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| !super::super::query_reason_is_scope(
+                        &diagnostic.reason_kind
+                    )),
+                "scope obligations are not reference losses: {diagnostics:?}"
+            );
+        }
         let query = {
             let _profile = sql_profile::request_scope("python_reverse_file_budget");
             UsageFinder::new().query(python, &targets, 1, 100)

@@ -7,9 +7,13 @@
 //! behaviour belongs in `crate::analyzer::{java, scala, kotlin}`.
 
 pub(crate) mod authority;
+pub(crate) mod build_scripts;
+pub mod catalog_reader;
 pub(crate) mod dependency_discovery;
+pub mod dependency_evidence;
 #[doc(hidden)]
 pub mod external;
+mod gradle_sbt_evidence;
 pub(crate) mod hierarchy;
 pub(crate) mod import_routes;
 pub(crate) mod java_artifact;
@@ -24,9 +28,15 @@ pub(crate) mod producer_codes;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
 pub(crate) mod scala_collection_contracts;
+pub(crate) mod scala_owner_inventory;
+// M2-core builds this capture seam before discovery is routed through it.
+#[allow(dead_code)]
+pub(crate) mod selected_inputs;
 pub(crate) mod selected_operation;
+pub(crate) mod selection_codec;
 pub(crate) mod toolchains_document;
 pub(crate) mod topology;
+pub(crate) mod verified_selection;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -171,6 +181,7 @@ pub(crate) fn jdk_artifact_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "OpenJDK".to_owned(),
             revision: Some(format!("jdk-{version}")),
         },
@@ -399,6 +410,10 @@ pub(crate) fn failed_with_diagnostics(
 pub(crate) fn is_jvm_configuration_input_path(path: &std::path::Path) -> bool {
     dependency_discovery::is_jvm_dependency_input_path(path)
         || path == std::path::Path::new(".bifrost/jvm-toolchains.json")
+        || dependency_evidence::is_jvm_runtime_pin(path)
+        || path
+            .file_name()
+            .is_some_and(|name| name == "build.sbt" || name == "build.sbt.lock")
 }
 
 /// Classify a peeked `OnceLock<JvmExternalDeclarationIndex>` cell for the
@@ -492,8 +507,16 @@ impl JvmActiveSemanticModel for JvmOverlayModel {
         // posting would let any dependency type that happens to share a short
         // name silence a real error. Only the qualified spellings count: the
         // declared one, and the aliases, which are qualified too.
-        let declarations = overlay
-            .symbols_named(fqn)
+        let named = overlay.symbols_named(fqn);
+        if matches!(
+            named.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        ) {
+            return JvmModelDisposition::Open;
+        }
+        let declarations = named
             .records
             .iter()
             .filter(|symbol| {
@@ -536,7 +559,7 @@ pub(crate) fn native_member_attribution(
         } else {
             MemberDispatchTier::InheritedOrPromoted
         },
-        relation: HierarchyRelation::Supertype,
+        relations: vec![HierarchyRelation::Supertype; context.owner_path.len() - 1],
         precedence_tier: if direct {
             PrecedenceTier::OwnMember
         } else {
@@ -622,10 +645,17 @@ pub(crate) mod dependency_packs {
             &self,
             config: &AnalyzerConfig,
             project: &dyn Project,
+            digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
-            resolve_jvm_semantic_pack_dependencies(&config.jvm, project, limits, cancellation)
+            resolve_jvm_semantic_pack_dependencies(
+                &config.jvm,
+                project,
+                digests,
+                limits,
+                cancellation,
+            )
         }
     }
 

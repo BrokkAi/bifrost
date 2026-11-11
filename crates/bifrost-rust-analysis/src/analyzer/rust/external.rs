@@ -47,17 +47,39 @@ use crate::analyzer::rust::RustdocJsonPackProducer;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustDependencyPackAdapter;
 
+/// Changes in the Rustdoc declaration producer for identical artifact bytes.
+pub(crate) const RUST_PACK_PRODUCER_VERSION: &str =
+    concat!(env!("CARGO_PKG_VERSION"), "+rust-pack-3");
+
 impl DependencyPackAdapter for RustDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-rust-dependency"
     }
 
     fn producer(&self) -> Producer {
-        Producer::for_name("bifrost-rustdoc-json")
+        Producer {
+            name: "bifrost-rustdoc-json".to_owned(),
+            version: RUST_PACK_PRODUCER_VERSION.to_owned(),
+        }
+    }
+
+    fn adapter_version(&self) -> &str {
+        RUST_PACK_PRODUCER_VERSION
+    }
+
+    /// The production key is minted before the artifact is read, so it admits
+    /// every supported schema up to the highest one this producer may write.
+    fn production_schema_version(&self, _dependency: &ResolvedDependency) -> u32 {
+        super::rustdoc_artifact::RUSTDOC_PACK_MAX_SCHEMA_VERSION
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
         dependency.evidence.language == "rust" && dependency.evidence.ecosystem == "cargo"
+    }
+
+    /// An exact `Cargo.lock` package coordinate names no artifact.
+    fn installed_packs_only(&self, dependency: &ResolvedDependency) -> bool {
+        dependency.artifacts.is_empty() && dependency.evidence.package.is_some()
     }
 
     fn produce(
@@ -90,12 +112,15 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
             cancellation,
             artifact.exact(),
         );
-        debug_assert_eq!(
-            production.artifact_sha256.as_deref(),
-            Some(artifact.sha256())
-        );
+        if production.pack.is_some() {
+            debug_assert_eq!(
+                production.artifact_sha256.as_deref(),
+                Some(artifact.sha256())
+            );
+        }
         let mut diagnostics = production.diagnostics;
         if let Some(pack) = production.pack.as_mut() {
+            pack.producer = self.producer();
             normalize_artifact_locator_paths(
                 pack,
                 &format!("sha256-{}.rustdoc.json", artifact.sha256()),
@@ -279,6 +304,19 @@ fn apply_cargo_dependency_spellings(
 fn rust_dependency_production_request(
     dependency: &ResolvedDependency,
 ) -> ArtifactProductionRequest {
+    let approximation = dependency
+        .artifacts
+        .first()
+        .and_then(|artifact| artifact.rust_artifact_approximation.as_ref());
+    let mut selector = brokk_bifrost_semantic::analyzer::semantic_model::dependency::activation_selector_for_evidence(&dependency.evidence);
+    if let Some(record) = approximation {
+        if let Some(package) = &mut selector.package {
+            package.version = Some(record.activation_version_requirement.clone());
+        }
+        if let Some(module) = &mut selector.module {
+            module.version = Some(record.activation_version_requirement.clone());
+        }
+    }
     ArtifactProductionRequest {
         path: PathBuf::new(),
         artifact_kind: ExternalArtifactKind::RustdocJson,
@@ -303,21 +341,27 @@ fn rust_dependency_production_request(
                 .into_iter()
                 .collect(),
         },
-        activation: vec![
-            brokk_bifrost_semantic::analyzer::semantic_model::dependency::activation_selector_for_evidence(&dependency.evidence),
-        ],
+        activation: vec![selector],
         provenance: Provenance {
+            rust_artifact_approximation: dependency
+                .artifacts
+                .first()
+                .and_then(|artifact| artifact.rust_artifact_approximation.clone()),
             source: dependency
                 .provenance
                 .iter()
                 .find(|entry| entry.key == "cargo.source")
                 .map(|entry| entry.value.clone())
                 .unwrap_or_else(|| "exact Cargo dependency".to_owned()),
-            revision: dependency
-                .provenance
-                .iter()
-                .find(|entry| entry.key == "cargo.checksum")
-                .map(|entry| entry.value.clone()),
+            revision: approximation
+                .map(|record| record.original_sha256.clone())
+                .or_else(|| {
+                    dependency
+                        .provenance
+                        .iter()
+                        .find(|entry| entry.key == "cargo.checksum")
+                        .map(|entry| entry.value.clone())
+                }),
         },
         license: "NOASSERTION".to_owned(),
         safety: Safety {
@@ -329,13 +373,15 @@ fn rust_dependency_production_request(
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_semantic::analyzer::semantic_model::RustArtifactApproximation;
+    use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
 
     use crate::analyzer::rust::test_support::rustdoc_item as item;
 
     use crate::analyzer::rust::external::*;
     use rustdoc_types::{
-        Crate as RustdocCrate, Id, ItemEnum, ItemKind, ItemSummary, Module, Struct, StructKind,
-        Target, Visibility as RustVisibility,
+        Crate as RustdocCrate, Id, ItemEnum, ItemKind, ItemSummary, Module, Path as RustdocPath,
+        Struct, StructKind, Target, Type, TypeAlias, Visibility as RustVisibility,
     };
     use semver::Version;
     use std::collections::HashMap as StdHashMap;
@@ -472,6 +518,42 @@ mod tests {
         }
     }
 
+    fn rustdoc_alias_document() -> RustdocCrate {
+        let mut document = rustdoc_document(false);
+        let ItemEnum::Module(module) = &mut document.index.get_mut(&Id(0)).unwrap().inner else {
+            panic!("crate root is a module");
+        };
+        module.items.push(Id(3));
+        document.index.insert(
+            Id(3),
+            item(
+                3,
+                Some("Alias"),
+                RustVisibility::Public,
+                ItemEnum::TypeAlias(TypeAlias {
+                    type_: Type::ResolvedPath(RustdocPath {
+                        path: "widget::Widget".to_owned(),
+                        id: Id(1),
+                        args: None,
+                    }),
+                    generics: rustdoc_types::Generics {
+                        params: Vec::new(),
+                        where_predicates: Vec::new(),
+                    },
+                }),
+            ),
+        );
+        document.paths.insert(
+            Id(3),
+            ItemSummary {
+                crate_id: 0,
+                path: vec!["widget".to_owned(), "Alias".to_owned()],
+                kind: ItemKind::TypeAlias,
+            },
+        );
+        document
+    }
+
     fn dependency(path: PathBuf, feature: &str) -> ResolvedDependency {
         let version = Version::parse("1.2.3").unwrap();
         ResolvedDependency {
@@ -504,6 +586,188 @@ mod tests {
             scope: crate::analyzer::topology::DependencyScope::Unknown,
             declared_by: None,
         }
+    }
+
+    #[test]
+    fn alias_target_pack_is_admitted_by_the_production_key() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("widget.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&rustdoc_alias_document()).unwrap(),
+        )
+        .unwrap();
+        let dependency = dependency(path.clone(), "default");
+        let artifact =
+            brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact(
+                &path,
+                &ArtifactProducerLimits::default(),
+            )
+            .unwrap();
+        let exact = ExactDependencyArtifact::from_exact(
+            DependencyArtifactRole::Reference,
+            ExternalArtifactKind::RustdocJson,
+            None,
+            artifact,
+        );
+        let produced = RustDependencyPackAdapter
+            .produce(
+                &dependency,
+                &[exact],
+                &ArtifactProducerLimits::default(),
+                None,
+            )
+            .pack
+            .unwrap_or_else(|| panic!("an alias-target pack must be produced"));
+        assert_eq!(produced.schema_version, 32);
+        assert!(
+            produced.schema_version
+                <= RustDependencyPackAdapter.production_schema_version(&dependency)
+        );
+    }
+
+    #[test]
+    fn approximate_generated_pack_bytes_depend_on_artifact_not_resolved_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("widget.json");
+        let bytes = serde_json::to_vec(&rustdoc_document(false)).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let sha = brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+            &brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(&bytes),
+        );
+        let make = |resolved: &str| {
+            let mut dependency = dependency(path.clone(), "default");
+            dependency.id =
+                format!("rust:widget@{resolved}:widget:x86_64-unknown-linux-gnu:default");
+            let version = Version::parse(resolved).unwrap();
+            dependency.evidence.package.as_mut().unwrap().version = Some(version.clone());
+            dependency.evidence.module.as_mut().unwrap().version = Some(version);
+            dependency.artifacts[0].rust_artifact_approximation = Some(RustArtifactApproximation {
+                built_from_version: "1.2.3".to_owned(),
+                built_from_features: vec!["default".to_owned()],
+                built_from_cfgs: vec!["docsrs".to_owned()],
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                format_version: rustdoc_types::FORMAT_VERSION,
+                toolchain: "nightly-2026-08-24".to_owned(),
+                docsrs_build: true,
+                original_sha256: sha.clone(),
+                produced_sha256: sha.clone(),
+                activation_version_requirement: ">=1.0.0, <2.0.0".to_owned(),
+                mismatch_kinds: Vec::new(),
+                selection_rule_id: "cargo-compatible-nearest".to_owned(),
+                selection_rule_version: 1,
+            });
+            dependency
+        };
+        let mut first = rust_dependency_production_request(&make("1.2.4"));
+        let mut second = rust_dependency_production_request(&make("1.2.5"));
+        assert_eq!(first, second);
+        first.path = path.clone();
+        second.path = path.clone();
+        let first_product = RustdocJsonPackProducer
+            .produce_exact_artifact(&first, &ArtifactProducerLimits::default());
+        let first_pack = first_product
+            .pack
+            .unwrap_or_else(|| panic!("{:?}", first_product.diagnostics));
+        assert_eq!(first_pack.schema_version, 28);
+        let mut decoded_payloads = Vec::new();
+        for schema_version in [28, 29, 32] {
+            let mut relabelled = first_pack.clone();
+            relabelled.schema_version = schema_version;
+            let compiled = crate::analyzer::semantic_model::compile_pack(
+                &relabelled,
+                &crate::analyzer::semantic_model::CompilerOptions::default(),
+            )
+            .unwrap();
+            let limits = crate::analyzer::semantic_model::DecodeLimits::default();
+            let manifest =
+                brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_manifest(
+                    &compiled.manifest_bytes,
+                    &limits,
+                )
+                .unwrap();
+            assert!(manifest.rust_external_reexports.is_empty());
+            let payloads = compiled
+                .shards
+                .iter()
+                .map(|shard| {
+                    let decoded = brokk_bifrost_semantic::analyzer::semantic_model::artifact::decode_shard_for_manifest(
+                        &manifest,
+                        &shard.descriptor,
+                        &shard.bytes,
+                        &limits,
+                    )
+                    .unwrap();
+                    serde_json::to_value(decoded.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            decoded_payloads.push(payloads);
+        }
+        assert_eq!(decoded_payloads[0], decoded_payloads[1]);
+        assert_eq!(decoded_payloads[0], decoded_payloads[2]);
+        let second_product = RustdocJsonPackProducer
+            .produce_exact_artifact(&second, &ArtifactProducerLimits::default());
+        let second_pack = second_product
+            .pack
+            .unwrap_or_else(|| panic!("{:?}", second_product.diagnostics));
+        assert_eq!(
+            serde_json::to_vec(&first_pack).unwrap(),
+            serde_json::to_vec(&second_pack).unwrap()
+        );
+
+        let mut exact_interval = first.clone();
+        exact_interval
+            .provenance
+            .rust_artifact_approximation
+            .as_mut()
+            .unwrap()
+            .activation_version_requirement = "=1.2.3".to_owned();
+        for selector in &mut exact_interval.activation {
+            selector.package.as_mut().unwrap().version = Some("=1.2.3".to_owned());
+            selector.module.as_mut().unwrap().version = Some("=1.2.3".to_owned());
+        }
+        let exact_interval_product = RustdocJsonPackProducer
+            .produce_exact_artifact(&exact_interval, &ArtifactProducerLimits::default());
+        assert!(
+            exact_interval_product.pack.is_some(),
+            "{:?}",
+            exact_interval_product.diagnostics
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let limits = DependencyPackLimits::default();
+        let activate = |resolved: &str| {
+            let prepared = prepare_dependency_semantic_packs(
+                &catalog,
+                &RustDependencyPackAdapter,
+                &[make(resolved)],
+                &limits,
+                None,
+            );
+            assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+            let request = prepared
+                .compose_activation_request(SemanticModelActivationRequest {
+                    approximate_standard_libraries: Vec::new(),
+                    bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                    evidence: Vec::new(),
+                    controls: Vec::new(),
+                    limits: Default::default(),
+                })
+                .unwrap();
+            let cancellation = CancellationToken::new();
+            match resolve_active_semantic_models(&catalog, &request, &cancellation) {
+                SemanticModelResolutionOutcome::Ready(active) => {
+                    assert!(active.shards()[0].approximate);
+                    let report = format!("{:#?}", active.activation_report());
+                    assert!(report.contains(&format!("resolved={resolved}")), "{report}");
+                    active.active_model_set_hash().to_owned()
+                }
+                outcome => panic!("expected approximate Rust model, got {outcome:#?}"),
+            }
+        };
+        let first_hash = activate("1.2.4");
+        assert_eq!(first_hash, activate("1.2.4"));
+        assert_ne!(first_hash, activate("1.2.5"));
     }
 
     /// A dependency whose rustdoc run saw `produced` while Cargo resolves
@@ -665,10 +929,15 @@ mod tests {
         );
         assert_eq!(active.types_named("widget.Widget").records.len(), 1);
         let active = std::sync::Arc::new(active);
-        let overlay =
-            SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 * 1024 * 1024)
-                .unwrap();
-        let widget = overlay.symbols_named("widget.Widget");
+        let overlay = SemanticModelOverlay::build(
+            &analyzer,
+            &active,
+            &cancellation,
+            64 * 1024 * 1024,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let widget = overlay.symbols_named_in_family("widget.Widget", "rust");
         assert_eq!(widget.records.len(), 1, "{:#?}", overlay.symbols());
         assert!(
             widget.records[0]
@@ -801,12 +1070,17 @@ mod tests {
                 outcome => panic!("expected ready Rust dependency model, got {outcome:#?}"),
             };
             let active = std::sync::Arc::new(active);
-            let overlay =
-                SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 * 1024 * 1024)
-                    .unwrap();
+            let overlay = SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &cancellation,
+                64 * 1024 * 1024,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
             let publishes_crate_root = |spelling: &str| {
                 overlay
-                    .symbols_named(spelling)
+                    .symbols_named_in_family(spelling, "rust")
                     .records
                     .iter()
                     .any(|symbol| symbol.qualified_name == spelling)
@@ -822,7 +1096,10 @@ mod tests {
                 overlay.symbols()
             );
             assert_eq!(
-                overlay.symbols_named("widget.Widget").records.len(),
+                overlay
+                    .symbols_named_in_family("widget.Widget", "rust")
+                    .records
+                    .len(),
                 1,
                 "the pack's own recorded path stays resolvable: {:#?}",
                 overlay.symbols()

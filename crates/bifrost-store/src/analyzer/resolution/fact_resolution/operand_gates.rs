@@ -9,8 +9,11 @@ impl FactEvaluation<'_, '_> {
     pub(super) fn evaluate_operand_gates(
         &mut self,
         incoming: &[InternedFactRow<SelectedTypedRow<LoweredTypeTransfer>>],
+        answers: &AnswerMap,
         previous: &StateMap,
         states: &mut StateMap,
+        dirty_slots: &HashSet<SemanticId>,
+        slot_reads: &mut HashMap<SemanticId, TypedItemReads>,
     ) -> StoreResult<bool> {
         for selected in incoming {
             if !selected.get(self.session).row().kind().is_operand_gate() {
@@ -21,7 +24,18 @@ impl FactEvaluation<'_, '_> {
                 return Ok(false);
             }
             let output = gate.rule().target_slot();
+            if !dirty_slots.contains(&output) {
+                continue;
+            }
             let input = gate.source_slot();
+            slot_reads.entry(output).or_default().states.insert(input);
+            let _reads = TypedSlotReadScope::new(
+                answers,
+                previous,
+                &self.query_obligations,
+                [output],
+                slot_reads,
+            );
             let Some(state) = states.get(&output).cloned() else {
                 continue;
             };
@@ -529,10 +543,13 @@ mod tests {
                     .typed
                     .source_row_fragments
                     .insert(identity, fragment);
-                service
-                    .typed
-                    .member_scope_by_definition
-                    .insert(identity, BindingNodeId::for_test(identity.to_string()));
+                service.typed.member_scope_by_definition.insert(
+                    identity,
+                    crate::analyzer::resolution::LoweredMemberScopeProperty::new(
+                        identity,
+                        BindingNodeId::for_test(identity.to_string()),
+                    ),
+                );
             }
             let mut states = StateMap::default();
             if linked {
@@ -587,10 +604,13 @@ mod tests {
                 .typed
                 .source_row_fragments
                 .insert(identity, fragment);
-            service
-                .typed
-                .member_scope_by_definition
-                .insert(identity, BindingNodeId::for_test(identity.to_string()));
+            service.typed.member_scope_by_definition.insert(
+                identity,
+                crate::analyzer::resolution::LoweredMemberScopeProperty::new(
+                    identity,
+                    BindingNodeId::for_test(identity.to_string()),
+                ),
+            );
         }
         service
             .typed
@@ -700,11 +720,17 @@ mod tests {
             )),
         )]
         .into_iter()
-        .collect();
+        .collect::<AnswerMap>();
         assert!(
             evaluation
-                .apply_contextual_declaration_access(&mut answers, &StateMap::default())
+                .apply_contextual_declaration_access(
+                    &[reference],
+                    &mut answers,
+                    &StateMap::default(),
+                    false,
+                )
                 .unwrap()
+                .is_some()
         );
         let answer = &answers[&reference];
         assert_eq!(

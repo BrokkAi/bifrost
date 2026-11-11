@@ -336,15 +336,14 @@ impl AnalyzerStore {
     }
 }
 
-/// A single-connection store's selected operation already owns its writer mutex.
+/// A test-only single-connection store's selected operation already owns its writer mutex.
 /// No publisher can run until it releases that connection, so recheck on it.
 pub(crate) fn go_context_status_on(
     conn: &rusqlite::Connection,
     identity: &GoContextIdentity,
     cancellation: &CancellationToken,
 ) -> Result<GoContextHeadStatus> {
-    let current: bool = conn.query_row(
-        RECHECK_CONTEXT_SQL,
+    let current: bool = conn.prepare_cached(RECHECK_CONTEXT_SQL)?.query_row(
         params![
             identity.selection_id,
             identity.context_id,
@@ -572,8 +571,8 @@ impl AnalyzerStore {
     ) -> Result<Option<GoContextIdentity>> {
         let conn = self.read_conn()?;
         let selected = conn
+            .prepare_cached(SELECT_CONTEXT_SQL)?
             .query_row(
-                SELECT_CONTEXT_SQL,
                 params![
                     snapshot.workspace_id.as_str(),
                     snapshot.generation.get(),
@@ -741,10 +740,9 @@ impl AnalyzerStore {
             else {
                 return Ok(None);
             };
-            Ok(conn.query_row(
-                "SELECT blob_oid FROM workspace_file_versions
+            Ok(conn.prepare_cached("SELECT blob_oid FROM workspace_file_versions
                  WHERE workspace_id=?1 AND lang='go' AND generation=?2 AND input_kind='configuration'
-                   AND rel_path=?3 AND valid_from<=?4 AND (valid_until IS NULL OR ?4<valid_until)",
+                   AND rel_path=?3 AND valid_from<=?4 AND (valid_until IS NULL OR ?4<valid_until)")?.query_row(
                 params![snapshot.workspace_id.as_str(), snapshot.generation.get(), crate::path_utils::workspace_relative_slash_path(&relative), snapshot.revision],
                 |row| row.get(0),
             ).optional()?)
@@ -901,25 +899,25 @@ impl AnalyzerStore {
                     )
                 });
                 let member = if let Some(relative) = &relative {
-                    conn.query_row(
-                        CANONICAL_SOURCE_SQL,
-                        params![
-                            snapshot.workspace_id.as_str(),
-                            snapshot.generation.get(),
-                            crate::path_utils::workspace_relative_slash_path(relative),
-                            snapshot.revision
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, Option<String>>(3)?,
-                                row.get::<_, Option<i64>>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()?
+                    conn.prepare_cached(CANONICAL_SOURCE_SQL)?
+                        .query_row(
+                            params![
+                                snapshot.workspace_id.as_str(),
+                                snapshot.generation.get(),
+                                crate::path_utils::workspace_relative_slash_path(relative),
+                                snapshot.revision
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                    row.get::<_, Option<String>>(3)?,
+                                    row.get::<_, Option<i64>>(4)?,
+                                ))
+                            },
+                        )
+                        .optional()?
                 } else {
                     None
                 };
@@ -1006,8 +1004,8 @@ impl AnalyzerStore {
                     // packages that compile the file, and names its reason.
                     let refusal = match &relative {
                         Some(relative) => conn
+                            .prepare_cached(REFUSED_INPUT_SQL)?
                             .query_row(
-                                REFUSED_INPUT_SQL,
                                 params![
                                     snapshot.workspace_id.as_str(),
                                     snapshot.generation.get(),
@@ -1270,46 +1268,45 @@ impl AnalyzerStore {
                 conn, snapshot.revision, &input_digest, &digest, &cancellation,
                 |tx| {
                     super::require_current_generation(tx, "go", snapshot.generation)?;
-                    let revision: Option<i64> = tx.query_row(
-                        "SELECT revision FROM workspace_heads WHERE workspace_id=?1 AND lang='go' AND generation=?2",
+                    let revision: Option<i64> = tx.prepare_cached("SELECT revision FROM workspace_heads WHERE workspace_id=?1 AND lang='go' AND generation=?2")?.query_row(
                         params![snapshot.workspace_id.as_str(),snapshot.generation.get()], |row|row.get(0),
                     ).optional()?;
                     if revision != Some(snapshot.revision) { return Ok(None); }
-            tx.execute("INSERT OR IGNORE INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_version) VALUES(?1,'go',?2,?3,?4,?5,?6,?7)",
+            tx.prepare_cached("INSERT OR IGNORE INTO go_context_selections(workspace_id,lang,generation,base_profile_digest,domain_dir,gowork_path,profile_digest,derivation_version) VALUES(?1,'go',?2,?3,?4,?5,?6,?7)")?.execute(
                 params![snapshot.workspace_id.as_str(),snapshot.generation.get(),base_profile,domain.directory,domain.gowork_path,profile,DERIVATION_VERSION])?;
-            let selection_id: i64 = tx.query_row("SELECT selection_id FROM go_context_selections WHERE workspace_id=?1 AND lang='go' AND generation=?2 AND base_profile_digest=?3 AND domain_dir=?4 AND gowork_path=?5 AND derivation_version=?6",
+            let selection_id: i64 = tx.prepare_cached("SELECT selection_id FROM go_context_selections WHERE workspace_id=?1 AND lang='go' AND generation=?2 AND base_profile_digest=?3 AND domain_dir=?4 AND gowork_path=?5 AND derivation_version=?6")?.query_row(
                 params![snapshot.workspace_id.as_str(),snapshot.generation.get(),base_profile,domain.directory,domain.gowork_path,DERIVATION_VERSION],|row|row.get(0))?;
                     Ok(Some(selection_id))
                 },
                 |tx, selection_id| {
-            tx.execute("INSERT INTO go_context_publications(selection_id,workspace_id,lang,generation,valid_from,input_digest,publication_digest,complete,gaps) VALUES(?1,?2,'go',?3,?4,?5,?6,?7,jsonb(?8))",
+            tx.prepare_cached("INSERT INTO go_context_publications(selection_id,workspace_id,lang,generation,valid_from,input_digest,publication_digest,complete,gaps) VALUES(?1,?2,'go',?3,?4,?5,?6,?7,jsonb(?8))")?.execute(
                 params![selection_id,snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,input_digest,digest,context_complete,context_gaps])?;
             let context_id = tx.last_insert_rowid();
                     Ok(context_id)
                 },
                 |tx, context_id| {
             for (directory, module) in &domain.modules {
-                tx.execute("INSERT INTO go_context_domain_modules(context_id,module_dir,module_path) VALUES(?1,?2,?3)",params![context_id,directory,module])?;
+                tx.prepare_cached("INSERT INTO go_context_domain_modules(context_id,module_dir,module_path) VALUES(?1,?2,?3)")?.execute(params![context_id,directory,module])?;
             }
                 for row in &normalized {
                     if cancellation.is_cancelled() { return Ok(false); }
                     let gaps = serde_json::to_string(&row.gaps).expect("Go package gap evidence is JSON");
                     let unit_key = go_package_unit_key(&row.import_path, &row.for_test, &row.files);
-                    tx.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,provider_kind,provider_module_path,provider_module_version,provider_provenance,unit_key) VALUES(?1,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12,?13)",
+                    tx.prepare_cached("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,provider_kind,provider_module_path,provider_module_version,provider_provenance,unit_key) VALUES(?1,?2,?3,?4,?5,?6,?7,jsonb(?8),?9,?10,?11,?12,?13)")?.execute(
                         params![context_id,row.import_path,row.name,row.for_test,row.directory.to_string_lossy(),row.provider,row.complete,gaps,row.provider_kind,row.provider_module_path,row.provider_module_version,row.provider_provenance,unit_key.as_slice()])?;
                     let package_id = tx.last_insert_rowid();
-                    for (file,role) in &row.files { tx.execute("INSERT INTO go_package_files(package_id,rel_path,source_role) VALUES(?1,?2,?3)",params![package_id,file,role])?; }
+                    for (file,role) in &row.files { tx.prepare_cached("INSERT INTO go_package_files(package_id,rel_path,source_role) VALUES(?1,?2,?3)")?.execute(params![package_id,file,role])?; }
                 }
                 for row in &normalized {
-                    let importer: i64 = tx.query_row("SELECT package_id FROM go_package_instances WHERE context_id=?1 AND tool_import_path=?2",params![context_id,row.import_path],|value|value.get(0))?;
+                    let importer: i64 = tx.prepare_cached("SELECT package_id FROM go_package_instances WHERE context_id=?1 AND tool_import_path=?2")?.query_row(params![context_id,row.import_path],|value|value.get(0))?;
                     for ((role,spelling),target) in &row.imports {
                             if cancellation.is_cancelled() { return Ok(false); }
-                            let target: Option<(i64,bool)> = tx.query_row("SELECT package_id,complete FROM go_package_instances WHERE context_id=?1 AND tool_import_path=?2",params![context_id,target],|value|Ok((value.get(0)?,value.get(1)?))).optional()?;
+                            let target: Option<(i64,bool)> = tx.prepare_cached("SELECT package_id,complete FROM go_package_instances WHERE context_id=?1 AND tool_import_path=?2")?.query_row(params![context_id,target],|value|Ok((value.get(0)?,value.get(1)?))).optional()?;
                             let complete = row.complete && target.is_some_and(|(_,complete)|complete);
                             let evidence = row.relative_refusals.get(&(*role, spelling.clone()))
                                 .map_or_else(|| json!(spelling), |refusal| json!(refusal));
                             let gaps = if complete { "[]".to_owned() } else { serde_json::to_string(&json!([{"code":"incomplete_import_provider","evidence":evidence}])).expect("Go gap evidence is JSON") };
-                            tx.execute("INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps) VALUES(?1,?2,?3,?4,?5,?6,jsonb(?7))",params![context_id,importer,spelling,role,target.map(|(id,_)|id),complete,gaps])?;
+                            tx.prepare_cached("INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps) VALUES(?1,?2,?3,?4,?5,?6,jsonb(?7))")?.execute(params![context_id,importer,spelling,role,target.map(|(id,_)|id),complete,gaps])?;
                     }
                 }
                     Ok(true)
@@ -1749,11 +1746,10 @@ impl AnalyzerStore {
         let conn = self.read_conn()?;
         let revision = context_id
             .map(|context_id| {
-                conn.query_row(
+                conn.prepare_cached(
                     "SELECT valid_from FROM go_context_publications WHERE context_id=?1",
-                    [context_id],
-                    |row| row.get::<_, i64>(0),
-                )
+                )?
+                .query_row([context_id], |row| row.get::<_, i64>(0))
             })
             .transpose()?;
         let boundaries = conn
@@ -1819,14 +1815,14 @@ impl AnalyzerStore {
                 // context version. Both digests come from the same source parse
                 // authority as transient placement. Missing versions or NULL
                 // digests, including new unsaved files, never prove equality.
-                let same_disk_header: bool = conn.query_row(
+                let same_disk_header: bool = conn.prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM workspace_file_versions recorded
                      JOIN blobs old_blob ON old_blob.blob_oid=recorded.blob_oid AND old_blob.lang=recorded.lang AND old_blob.parse_variant=x'' AND old_blob.generation=recorded.generation
                      JOIN source_go_manifests old ON old.blob_id=old_blob.id
                      JOIN blobs new_blob ON new_blob.blob_oid=?5 AND new_blob.lang=recorded.lang AND new_blob.parse_variant=x'' AND new_blob.generation=recorded.generation
                      JOIN source_go_manifests new ON new.blob_id=new_blob.id AND new.membership_digest=old.membership_digest
                      WHERE recorded.workspace_id=?1 AND recorded.lang='go' AND recorded.generation=?2
-                       AND recorded.input_kind='source' AND recorded.rel_path=?3 AND recorded.blob_oid=?4)",
+                       AND recorded.input_kind='source' AND recorded.rel_path=?3 AND recorded.blob_oid=?4)")?.query_row(
                     params![snapshot.workspace_id.as_str(),snapshot.generation.get(),file.path,file.disk_oid,file.oid],
                     |row|row.get(0),
                 )?;
@@ -2025,11 +2021,11 @@ impl AnalyzerStore {
             .collect::<Vec<_>>();
         let domains = serde_json::to_string(&domains).expect("Go domains are JSON values");
         self.conn.execute(move |conn| -> Result<()> {
-            conn.execute("UPDATE go_context_publications SET valid_until=?3 WHERE valid_until IS NULL
+            conn.prepare_cached("UPDATE go_context_publications SET valid_until=?3 WHERE valid_until IS NULL
               AND valid_from<=?3 AND selection_id IN(SELECT selection_id FROM go_context_selections s
                 WHERE s.workspace_id=?1 AND s.generation=?2 AND s.base_profile_digest=?4
                   AND NOT EXISTS(SELECT 1 FROM json_each(?5) domain
-                    WHERE json_extract(domain.value,'$[0]')=s.domain_dir AND json_extract(domain.value,'$[1]')=s.gowork_path))",
+                    WHERE json_extract(domain.value,'$[0]')=s.domain_dir AND json_extract(domain.value,'$[1]')=s.gowork_path))")?.execute(
                 params![snapshot.workspace_id.as_str(),snapshot.generation.get(),snapshot.revision,base,domains])?;
             Ok(())
         })

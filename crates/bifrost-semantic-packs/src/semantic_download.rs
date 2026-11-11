@@ -74,9 +74,9 @@ struct AttemptKey {
 static ATTEMPTED_REQUESTS: OnceLock<Mutex<HashSet<AttemptKey>>> = OnceLock::new();
 /// The release checksum sidecar this process resolved, or the error that
 /// resolving it produced. See [`ReleaseChecksumMemoTransport`].
-type ReleaseChecksumMemo = Mutex<Option<Result<Vec<u8>, DownloadError>>>;
+type ReleaseChecksumMemo = OnceLock<Result<Vec<u8>, DownloadError>>;
 
-static RELEASE_CHECKSUM: ReleaseChecksumMemo = Mutex::new(None);
+static RELEASE_CHECKSUM: ReleaseChecksumMemo = OnceLock::new();
 
 /// The request and immutable release identity that key one negative-cache
 /// entry. `path` is absent only when this host has no machine-local cache root.
@@ -423,12 +423,10 @@ impl HttpTransport for ReleaseChecksumMemoTransport<'_> {
         if url != release_asset_url(CHECKSUM_NAME) {
             return self.inner.fetch(url, max_bytes);
         }
-        // Holding the lock across the fetch makes concurrent acquisitions
-        // wait for one request instead of each sending their own.
+        // Concurrent acquisitions block in `get_or_init` until the one
+        // request in flight resolves, instead of each sending their own.
         self.memo
-            .lock()
-            .expect("release checksum mutex poisoned")
-            .get_or_insert_with(|| {
+            .get_or_init(|| {
                 let bytes = self.inner.fetch(url, max_bytes)?;
                 parse_checksum_sidecar(&bytes, ARCHIVE_NAME)?;
                 Ok(bytes)
@@ -1133,7 +1131,12 @@ mod tests {
             &format!("={version}"),
         );
         let root = directory.path().join("bundle");
-        let bundle = generate_release_bundle(&root, &[input]).unwrap();
+        let bundle = generate_release_bundle(
+            &root,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         let generated = bundle.index.generated_productions.first().unwrap();
         let key = GeneratedProductionKey::new(
             generated.input_digest.clone(),
@@ -1205,6 +1208,7 @@ mod tests {
             },
             activation: vec![activation.clone()],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },
@@ -1228,6 +1232,7 @@ mod tests {
                 spec_path: spec,
                 artifact_path: stubs,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         let merged_root = directory.path().join("merged");
@@ -2131,7 +2136,7 @@ mod tests {
         let checksum_url = release_asset_url(CHECKSUM_NAME);
         // An unpublished release: the fake has no checksum response.
         let unpublished = FakeTransport::new(HashMap::new());
-        let memo = ReleaseChecksumMemo::new(None);
+        let memo = ReleaseChecksumMemo::new();
         let transport = ReleaseChecksumMemoTransport {
             inner: &unpublished,
             memo: &memo,
@@ -2173,7 +2178,7 @@ mod tests {
             checksum_url.clone(),
             format!("{digest}  {ARCHIVE_NAME}\n").into_bytes(),
         )]));
-        let next_memo = ReleaseChecksumMemo::new(None);
+        let next_memo = ReleaseChecksumMemo::new();
         let next_process = ReleaseChecksumMemoTransport {
             inner: &published,
             memo: &next_memo,

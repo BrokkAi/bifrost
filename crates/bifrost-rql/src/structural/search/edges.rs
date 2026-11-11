@@ -27,7 +27,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
-use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
+use brokk_bifrost_rql::schema::usage_proof_label;
 #[cfg(any(test, feature = "test-support"))]
 use serde::Serialize;
 use std::sync::Arc;
@@ -416,6 +416,7 @@ impl EdgeTraversalCache {
                 | EdgeIncompleteReason::ForwardMetadataIncomplete
                 | EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
                 | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding
                 | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
                 | EdgeIncompleteReason::InverseIndexMetadataIncomplete
                 | EdgeIncompleteReason::InverseIndexTargetUncovered
@@ -544,6 +545,9 @@ fn selected_global_reason(reason: &EdgeIncompleteReason) -> Option<SelectedGloba
         EdgeIncompleteReason::InverseIndexResolutionIncomplete => {
             Some(SelectedGlobalIncompleteReason::Resolution)
         }
+        EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
+            Some(SelectedGlobalIncompleteReason::Resolution)
+        }
         EdgeIncompleteReason::InverseIndexMetadataIncomplete => {
             Some(SelectedGlobalIncompleteReason::Metadata)
         }
@@ -598,6 +602,9 @@ fn incomplete_reason_label(reason: &EdgeIncompleteReason) -> String {
         EdgeIncompleteReason::InverseIndexResolutionIncomplete => {
             "selected inverse index resolution was incomplete".to_string()
         }
+        EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding => {
+            "selected inverse edge has outstanding query obligations".to_string()
+        }
         EdgeIncompleteReason::InverseIndexAdmissionIncomplete => {
             "selected inverse index edge admission was incomplete".to_string()
         }
@@ -635,12 +642,8 @@ impl EdgeValue {
             file: self.row.site.file.clone(),
             start_byte: self.row.site.range.start_byte,
             end_byte: self.row.site.range.end_byte,
+            source: self.row.site.enclosing.clone(),
             target: self.target.unit.clone(),
-            reference_kind: self.row.reference_kind.map(|kind| kind as u8),
-            proof: self.row.proof,
-            usage_kind: self.row.usage_kind,
-            site_class: self.row.site_class,
-            owner_relation: self.row.owner_relation,
             provenance: self.row.provenance,
         }
     }
@@ -655,32 +658,29 @@ impl EdgeValue {
         digest.push(rel_path_string(&row.site.file).as_bytes());
         digest.push(&row.site.range.start_byte.to_le_bytes());
         digest.push(&row.site.range.end_byte.to_le_bytes());
-        digest.push(self.target.unit.fq_name().as_bytes());
+        digest.push(self.target.unit.declaration_id().as_str().as_bytes());
         digest.push(
-            row.reference_kind
-                .map_or("", reference_kind_label)
+            row.site
+                .enclosing
+                .as_ref()
+                .map_or_else(String::new, |source| {
+                    source.declaration_id().as_str().to_string()
+                })
                 .as_bytes(),
         );
-        digest.push(row.usage_kind.wire_label().as_bytes());
         digest.push(row.provenance.label().as_bytes());
         digest.finish().to_string()
     }
 }
 
-/// Dedup identity: every compared field of the canonical row. Two rows that
-/// disagree on proof, kind, or classification are two answers, which is the
-/// entire point of the domain.
+/// Identity of a reference occurrence, independent of its classification.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct EdgeKey {
     pub(super) file: ProjectFile,
     pub(super) start_byte: usize,
     pub(super) end_byte: usize,
+    pub(super) source: Option<CodeUnit>,
     pub(super) target: CodeUnit,
-    pub(super) reference_kind: Option<u8>,
-    pub(super) proof: crate::analyzer::usages::UsageProof,
-    pub(super) usage_kind: crate::analyzer::usages::UsageHitKind,
-    pub(super) site_class: super::super::edges::SiteClass,
-    pub(super) owner_relation: super::super::edges::OwnerRelation,
     pub(super) provenance: super::super::edges::EdgeProvenance,
 }
 
@@ -703,7 +703,7 @@ pub(super) fn public_edge(
         end_byte: row.site.range.end_byte,
         target,
         enclosing_declaration: enclosing,
-        reference_kind: row.reference_kind.map(reference_kind_label),
+        reference_facets: row.reference_kind.into(),
         proof: usage_proof_label(row.proof),
         usage_kind: row.usage_kind.wire_label(),
         site_class: row.site_class.label(),

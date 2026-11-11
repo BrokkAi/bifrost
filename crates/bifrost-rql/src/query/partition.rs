@@ -1,15 +1,42 @@
 //! Whether a plan's rows can be produced one seed file at a time.
 //!
 //! An incremental policy evaluation executes a sliceable plan once per seed
-//! file. Ordinary plans merge in seed order; eligible unions restore authored
-//! branch order before seed order and first-writer deduplication. Eligibility
-//! is a property of the plan structure, never of the policy that authored it.
+//! file. Ordinary plans and file-local excepts merge in seed order; eligible
+//! unions restore authored branch order before first-writer deduplication.
+//! Eligibility is a property of the plan structure, never of the policy that authored it.
 //! The caller must also prove cumulative budget headroom before using a merge.
 
 use super::ir::{CodeQueryPlan, CodeQueryPlanSource, QueryValueKind, SetOperator};
 use super::schema::{QueryStepOp, QueryStepShape};
 
 impl CodeQueryPlan {
+    /// Classify the forward form of an incoming call-site frontier. Targets
+    /// are evaluated over the workspace; only the resulting sites are local.
+    /// Set and cross-domain sources remain conservative until their executor
+    /// can preserve an independent scope for each operand.
+    pub fn is_reverse_in_file(&self, supports: impl Fn(crate::analyzer::Language) -> bool) -> bool {
+        let CodeQueryPlanSource::Seed(seed) = &self.source else {
+            return false;
+        };
+        if seed.languages.is_empty() || !seed.languages.iter().copied().all(supports) {
+            return false;
+        }
+        let Some(cut) = self
+            .steps
+            .iter()
+            .position(|step| step.op() == QueryStepOp::CallSitesTo)
+        else {
+            return false;
+        };
+        self.steps[..cut]
+            .iter()
+            .all(|step| !step.op().rows_may_leave_seed_file())
+            && self.steps[cut + 1..]
+                .iter()
+                .all(|step| matches!(step.op(), QueryStepOp::Filter | QueryStepOp::Project))
+            && PlanPartitioning::classify(self).is_by_seed()
+    }
+
     /// Whether execution needs the class-set workspace field-index prepass.
     ///
     /// This is an execution requirement, separate from whether result rows
@@ -48,13 +75,16 @@ pub enum PlanPartitioning {
     /// The plan is an all-union composition whose leaves may be executed per
     /// seed file and merged in branch order before first-writer deduplication.
     BySeedUnion,
+    /// A file-local set tree with a root union, executed as authored in each
+    /// file before branch-ordered merging.
+    BySeedSetUnion,
     /// The plan is `A except B...` over rows whose set-difference key names
-    /// their file. Its rows are the minuend's rows in the minuend's seed order,
-    /// so one execution per seed file merges exactly as a `BySeed` plan's
-    /// does, with the fair-share proof a set source needs.
+    /// their file. A union minuend runs in full in each seed file. The merge
+    /// follows one deterministic seed order, with the fair-share proof a set
+    /// source needs; cross-file result order is not a contract.
     BySeedExcept,
-    /// An intersect whose operand plans can be evaluated per seed, with the
-    /// intersect and its suffix evaluated once after operand merging.
+    /// A root set operator whose operand plans can be evaluated per seed, with the
+    /// set operation and its suffix evaluated once after operand merging.
     /// `classify_for_prefix` is the opt-in entry point; ordinary policy
     /// admission continues to treat this plan as whole until it has a
     /// continuation executor.
@@ -64,13 +94,20 @@ pub enum PlanPartitioning {
 }
 
 /// A stable logical cut within the query plan. The initial continuation
-/// supports only an intersect at the root of the source tree.
+/// supports a set operator at the root of the source tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntersectCut {
     Root,
 }
 
 impl IntersectCut {
+    pub fn operator(self, plan: &CodeQueryPlan) -> SetOperator {
+        let CodeQueryPlanSource::Set { op, .. } = &plan.source else {
+            panic!("prefix cut requires a set source");
+        };
+        *op
+    }
+
     /// Operand plans in whole-run branch order. The caller must preserve this
     /// order when it assembles the continuation's typed operand products.
     pub fn operands(self, plan: &CodeQueryPlan) -> &[CodeQueryPlan] {
@@ -78,11 +115,11 @@ impl IntersectCut {
             (
                 Self::Root,
                 CodeQueryPlanSource::Set {
-                    op: SetOperator::Intersect,
+                    op: SetOperator::Intersect | SetOperator::Union | SetOperator::Except,
                     branches,
                 },
             ) => branches,
-            _ => panic!("intersect cut must name an intersect source"),
+            _ => panic!("prefix cut must name a set source"),
         }
     }
 }
@@ -151,13 +188,20 @@ impl PlanPartitioning {
     /// operand still requires whole execution.
     pub fn classify_for_prefix(plan: &CodeQueryPlan) -> Self {
         if let CodeQueryPlanSource::Set {
-            op: SetOperator::Intersect,
+            op: op @ (SetOperator::Intersect | SetOperator::Union | SetOperator::Except),
             branches,
         } = &plan.source
             && branches
                 .iter()
                 .all(|branch| Self::classify(branch).is_by_seed())
             && branches.iter().all(Self::supports_intersect_prefix)
+            && (matches!(op, SetOperator::Intersect)
+                || branches.iter().all(|branch| {
+                    matches!(
+                        branch.value_kind(),
+                        QueryValueKind::Declaration | QueryValueKind::Occurrence
+                    )
+                }))
             && plan.steps.iter().all(|step| {
                 step.op() != QueryStepOp::DecoratorBindings
                     && !step.op().is_registration_dependent()
@@ -210,8 +254,9 @@ impl PlanPartitioning {
 
     /// Classify `plan` from its source kind and its steps.
     ///
-    /// Set plans are `Whole` unless they are unions whose leaves are all
-    /// seed-partitionable and use one comparator family. A suffix that observes
+    /// Set plans are `Whole` unless they are eligible unions or file-local
+    /// excepts. Their leaves must be seed-partitionable with one comparator
+    /// family. A suffix that observes
     /// merged rows runs through the shared set executor in each seed file, so
     /// filters see the first representative after evidence merging. Every row
     /// in that shape must stay in its seed file, preventing cross-unit keys.
@@ -257,6 +302,12 @@ impl PlanPartitioning {
             },
             CodeQueryPlanSource::Set { .. } => match Self::classify_union_with_detail(plan) {
                 Ok(_) => Self::BySeedUnion,
+                Err(PlanWidenDetail::UnionNestedSet) => {
+                    match Self::classify_file_local_set_tree(plan) {
+                        Ok(_) => Self::BySeedSetUnion,
+                        Err(detail) => Self::Whole(detail),
+                    }
+                }
                 Err(detail) => Self::Whole(detail),
             },
             _ => Self::classify_leaf(plan),
@@ -269,10 +320,8 @@ impl PlanPartitioning {
     /// composition's frontier, which binds the endpoints of one blob.
     ///
     /// This differs from [`Self::classify`] on purpose. A unit's per-seed
-    /// rows must merge into the whole execution's rows exactly, with their
-    /// order, first-writer deduplication and cross-seed membership, so units
-    /// accept only the excepts whose merged order is a seed order
-    /// ([`Self::classify_except`]). A
+    /// rows must preserve each key's representative, evidence and cross-seed
+    /// membership, while a per-file consumer only needs that file's rows. A
     /// consumer of one file needs only that file's rows. A set-difference key
     /// that names the row's file (structural matches, occurrences, bindings,
     /// files: `PipelineKey` in `structural/search/mod.rs`; Python rule facts,
@@ -339,7 +388,10 @@ impl PlanPartitioning {
 
     /// Whether this plan may be executed one seed file at a time.
     pub const fn is_by_seed(self) -> bool {
-        matches!(self, Self::BySeed | Self::BySeedUnion | Self::BySeedExcept)
+        matches!(
+            self,
+            Self::BySeed | Self::BySeedUnion | Self::BySeedSetUnion | Self::BySeedExcept
+        )
     }
 
     /// Whether this plan is an eligible all-union composition.
@@ -495,7 +547,16 @@ impl PlanPartitioning {
             unreachable!("except classifier requires an except source");
         };
         if matches!(&minuend.source, CodeQueryPlanSource::Set { .. }) {
-            return Err(PlanWidenDetail::ExceptNonLeafMinuend);
+            if !matches!(
+                &minuend.source,
+                CodeQueryPlanSource::Set {
+                    op: SetOperator::Union,
+                    ..
+                }
+            ) {
+                return Err(PlanWidenDetail::ExceptNonLeafMinuend);
+            }
+            return Self::classify_file_local_set_tree(plan);
         }
         if let Self::Whole(detail) = Self::classify_leaf(minuend) {
             return Err(detail);
@@ -542,6 +603,124 @@ impl PlanPartitioning {
                     return Err(PlanWidenDetail::ExceptNonSeedBranch);
                 }
                 pending.extend(current.source.child_plans());
+            }
+        }
+        Self::fair_share_divisor(plan).ok_or(PlanWidenDetail::DivisorOverflow)
+    }
+
+    /// A union minuend is distributive over seed files only when every value
+    /// retained or tested by a set operation carries its producing file. An
+    /// intersect minuend stays Whole: its complete empty operand can skip
+    /// later branches in one seed while the whole run evaluates them. Run
+    /// the original tree in each file: moving a suffix to a branch would
+    /// change which duplicate supplies the payload (#5310).
+    fn classify_file_local_set_tree(plan: &CodeQueryPlan) -> Result<usize, PlanWidenDetail> {
+        let file_keyed = |kind| {
+            matches!(
+                kind,
+                QueryValueKind::StructuralMatch
+                    | QueryValueKind::Declaration
+                    | QueryValueKind::Occurrence
+                    | QueryValueKind::Binding
+                    | QueryValueKind::File
+                    | QueryValueKind::PythonRuleFact
+            )
+        };
+        let root_is_union = matches!(
+            plan.source,
+            CodeQueryPlanSource::Set {
+                op: SetOperator::Union,
+                ..
+            }
+        );
+        let mut pending = vec![plan];
+        let mut comparator = None;
+        while let Some(current) = pending.pop() {
+            if current
+                .steps
+                .iter()
+                .any(|step| step.op().rows_may_leave_seed_file())
+            {
+                return Err(PlanWidenDetail::ExceptRowsLeaveSeedFile);
+            }
+            match &current.source {
+                CodeQueryPlanSource::Set {
+                    op: SetOperator::Intersect,
+                    ..
+                } => return Err(PlanWidenDetail::ExceptNonLeafMinuend),
+                CodeQueryPlanSource::Set { op, branches } => {
+                    let kind = branches[0].value_kind();
+                    // This is the actual set-difference key family, including
+                    // Binding's separate difference key. The unit codec's
+                    // corresponding keys also contain the file (or a
+                    // file-derived id for declarations and Python facts).
+                    if !file_keyed(kind)
+                        || branches.iter().any(|branch| branch.value_kind() != kind)
+                    {
+                        return Err(PlanWidenDetail::ExceptNonFileKeyedRows);
+                    }
+                    // These suffixes retain both set and row identities.
+                    // ResolvedValue retains the selected structural row and
+                    // is admitted only for a mixed root union; the 3a root
+                    // except keeps its narrower suffix contract.
+                    if current.steps.iter().any(|step| match op {
+                        SetOperator::Union => {
+                            if root_is_union {
+                                step.op() != QueryStepOp::Project
+                            } else {
+                                step.op() != QueryStepOp::Filter
+                            }
+                        }
+                        SetOperator::Except => {
+                            step.op() != QueryStepOp::Filter
+                                && !(root_is_union && step.op() == QueryStepOp::ResolvedValue)
+                        }
+                        SetOperator::Intersect => unreachable!(),
+                    }) {
+                        return Err(PlanWidenDetail::ExceptNonLocalSuffix);
+                    }
+                    let mut output = kind;
+                    for step in &current.steps {
+                        output = step.output_kind(output).expect("validated set step");
+                        if !file_keyed(output) {
+                            return Err(PlanWidenDetail::ExceptNonFileKeyedRows);
+                        }
+                    }
+                    pending.extend(branches.iter().rev());
+                }
+                _ => {
+                    if let Self::Whole(detail) = Self::classify_leaf(current) {
+                        return Err(detail);
+                    }
+                    // No intermediate step may create a cross-file key, even
+                    // if a later step returns to a file-keyed output.
+                    let mut source = current.clone();
+                    source.steps.clear();
+                    let mut kind = source.value_kind();
+                    if !file_keyed(kind) {
+                        return Err(PlanWidenDetail::ExceptNonFileKeyedRows);
+                    }
+                    for step in &current.steps {
+                        kind = step
+                            .output_kind(kind)
+                            .expect("a validated query has typed steps");
+                        if !file_keyed(kind) {
+                            return Err(PlanWidenDetail::ExceptNonFileKeyedRows);
+                        }
+                    }
+                    if current.steps.iter().any(|step| {
+                        step.op() == QueryStepOp::AbsentMember
+                            || step.op() == QueryStepOp::DecoratorBindings
+                            || step.op().is_registration_dependent()
+                    }) {
+                        return Err(PlanWidenDetail::ExceptNonSeedBranch);
+                    }
+                    let leaf_comparator = matches!(&current.source, CodeQueryPlanSource::Seed(_));
+                    if comparator.is_some_and(|known| known != leaf_comparator) {
+                        return Err(PlanWidenDetail::UnionMixedComparatorFamilies);
+                    }
+                    comparator = Some(leaf_comparator);
+                }
             }
         }
         Self::fair_share_divisor(plan).ok_or(PlanWidenDetail::DivisorOverflow)
@@ -744,6 +923,70 @@ mod tests {
     }
 
     #[test]
+    fn mixed_union_requires_every_branch_to_retain_file_owned_rows() {
+        let local = plan(json!({
+            "union": [
+                { "except": [
+                    { "match": { "kind": "function" } },
+                    { "match": { "kind": "function", "name": "absent" } }
+                ] },
+                { "except": [
+                    { "union": [
+                        { "match": { "kind": "function" } },
+                        { "match": { "kind": "function", "name": "absent" } }
+                    ] },
+                    { "match": { "kind": "function", "name": "skip" } }
+                ] }
+            ]
+        }));
+        assert_eq!(
+            PlanPartitioning::classify(&local),
+            PlanPartitioning::BySeedSetUnion
+        );
+        let intersect = plan(json!({
+            "union": [
+                { "except": [
+                    { "match": { "kind": "function" } },
+                    { "intersect": [
+                        { "match": { "kind": "function" } },
+                        { "match": { "kind": "function" } }
+                    ] }
+                ] },
+                { "match": { "kind": "function" } }
+            ]
+        }));
+        assert!(matches!(
+            PlanPartitioning::classify(&intersect),
+            PlanPartitioning::Whole(_)
+        ));
+    }
+
+    #[test]
+    fn console_shaped_resolved_value_branch_is_file_local_only_under_root_union() {
+        let branch = "(resolved-value :resolves-to \"System.Console.Out\" :proof exact
+            (except
+              (language csharp (field_access :object (name \"Console\") :field (name \"Out\")))
+              (language csharp (field_access :object (name \"Other\") :field (name \"Out\")))))";
+        let query = CodeQuery::from_sexp(&format!(
+            "(union
+              (except
+                (language csharp (call :callee (name \"WriteLine\")))
+                (language csharp (call :callee (name \"Main\"))))
+              {branch})"
+        ))
+        .expect("console-shaped set parses");
+        assert_eq!(
+            PlanPartitioning::classify(&query.plan),
+            PlanPartitioning::BySeedSetUnion
+        );
+        let root_except = CodeQuery::from_sexp(branch).expect("root except parses");
+        assert!(matches!(
+            PlanPartitioning::classify(&root_except.plan),
+            PlanPartitioning::Whole(_)
+        ));
+    }
+
+    #[test]
     #[hardwon("#5310: filters at any union node must observe merged first-writer representatives")]
     fn filters_at_root_or_nested_union_nodes_use_post_merge_execution() {
         let leaf = json!({ "match": { "kind": "function" } });
@@ -846,15 +1089,16 @@ mod tests {
             Some(4)
         );
 
-        // A union minuend orders its rows branch-major across every file.
+        // The full set tree runs inside each seed file, so branch order still
+        // chooses the representative of a repeated key within that file.
         let union_minuend = plan(json!({
             "except": [{ "union": [leaf.clone(), leaf.clone()] }, leaf.clone()]
         }));
         assert!(PlanPartitioning::restricts_to_seed_file(&union_minuend));
-        assert!(matches!(
+        assert_eq!(
             PlanPartitioning::classify(&union_minuend),
-            PlanPartitioning::Whole(_)
-        ));
+            PlanPartitioning::BySeedExcept
+        );
         let declaration = json!({
             "match": { "kind": "function" },
             "steps": [{ "op": "enclosing_decl" }]

@@ -230,6 +230,42 @@ mod jvm_extraction_tests {
                 )
             ]
         );
+        let (ordinary_mount, ordinary_node) = selection.connection().query_row(
+            "SELECT mount.mount_ordinal, path.start_node FROM temp.selected_resolution_mounts mount
+             JOIN main.resolution_paths path ON path.blob_id=mount.blob_id
+             WHERE path.start_node >= 0 LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+        ).expect("fixture has a persisted candidate path");
+        let ordinary_request = [BatchCandidateRequest::new(
+            0,
+            EndpointSignature::new(
+                BindingNodeId::local(ordinary_mount, ordinary_node),
+                StackPattern::closed([]),
+                StackPattern::closed([]),
+            ),
+        )];
+        let mut first_ordinary = Vec::new();
+        source
+            .visit_forward_candidate_match_pages(&ordinary_request, &cancellation, &mut |page| {
+                first_ordinary.extend_from_slice(page);
+                Ok(true)
+            })
+            .unwrap();
+        let candidate_fills = selection.forward_candidate_row_memo_counts_for_test().0;
+        assert!(candidate_fills > 0, "cold forward candidate read must fill");
+        let mut repeated_ordinary = Vec::new();
+        source
+            .visit_forward_candidate_match_pages(&ordinary_request, &cancellation, &mut |page| {
+                repeated_ordinary.extend_from_slice(page);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(repeated_ordinary, first_ordinary);
+        assert_eq!(
+            selection.forward_candidate_row_memo_counts_for_test().0,
+            candidate_fills
+        );
         for limit in 0..=8 {
             let budget = ReceiverAnalysisBudget {
                 max_scope_nodes: limit,
@@ -320,6 +356,30 @@ mod jvm_extraction_tests {
         terminal,
         brokk_bifrost_analysis::analyzer::store::resolution_lexical::CandidatePageVisit::Cancelled
     );
+        selection.with_owned_temp_write(|connection| {
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_producers(host_ordinal,bridge_identity,content_digest)
+                 VALUES(0,?1,?2)",
+                params![[250u8; 32].as_slice(), [251u8; 32].as_slice()],
+            )?;
+            Ok(())
+        }).unwrap();
+        let mut after_stage_write = Vec::new();
+        source
+            .visit_forward_candidate_match_pages(
+                &ordinary_request,
+                &CancellationToken::default(),
+                &mut |page| {
+                    after_stage_write.extend_from_slice(page);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(after_stage_write, first_ordinary);
+        assert_eq!(
+            selection.forward_candidate_row_memo_counts_for_test().0,
+            candidate_fills
+        );
     }
     #[test]
     fn scope_batch_preserves_catalog_host_and_absent_internal_scope() {
@@ -556,6 +616,16 @@ mod jvm_extraction_tests {
             source.close_completion(&completion, &cancellation).unwrap(),
             Some(ResolutionCompletion::incomplete(retained))
         );
+        let closed_fills = selection.closed_reason_memo_counts_for_test().0;
+        assert!(closed_fills > 0, "cold closed-reason read fills");
+        assert_eq!(
+            source.close_completion(&completion, &cancellation).unwrap(),
+            Some(ResolutionCompletion::incomplete(retained))
+        );
+        assert_eq!(
+            selection.closed_reason_memo_counts_for_test().0,
+            closed_fills
+        );
         assert_eq!(
             source
                 .close_completion(
@@ -567,6 +637,19 @@ mod jvm_extraction_tests {
                 .unwrap(),
             Some(ResolutionCompletion::Complete)
         );
+        selection.with_owned_temp_write(|connection| {
+            connection.execute(
+                "INSERT INTO temp.selected_resolution_stage_closed_reasons(producer_id,semantic_key,semantic_shared)
+                 SELECT producer_id,?1,NULL FROM temp.selected_resolution_stage_producers LIMIT 1",
+                [codec::encode_semantic(other)],
+            )?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            source.close_completion(&completion, &cancellation).unwrap(),
+            Some(ResolutionCompletion::incomplete([retained[1]]))
+        );
+        assert!(selection.closed_reason_memo_counts_for_test().0 > closed_fills);
         cancellation.cancel();
         assert!(
             source
@@ -575,6 +658,118 @@ mod jvm_extraction_tests {
                 .is_none()
         );
     }
+    #[test]
+    fn ordinary_reference_spelling_hits_keep_authority() {
+        let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(1);
+        let selection = fixture.open_ready(&[]);
+        let (ordinal, key) = selection
+            .connection()
+            .query_row(
+                "SELECT mount.mount_ordinal, semantic.semantic_key
+             FROM temp.selected_resolution_mounts mount
+             JOIN main.resolution_semantic_sites semantic ON semantic.blob_id=mount.blob_id
+             WHERE semantic.semantic_role='reference' LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .expect("fixture has an ordinary reference");
+        let source = SelectedResolutionLexicalSource::new_on_demand(&selection);
+        let cancellation = CancellationToken::new();
+        let reference = SemanticId::local(ordinal, key);
+        let first = source
+            .reference_lookup_spellings(
+                &[reference],
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                &cancellation,
+            )
+            .unwrap();
+        let fills = selection.reference_spelling_memo_counts_for_test().0;
+        assert!(fills > 0, "cold spelling read fills");
+        let second = source
+            .reference_lookup_spellings(
+                &[reference],
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace::Type,
+                &cancellation,
+            )
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(selection.reference_spelling_memo_counts_for_test().0, fills);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9439: site zero and range zero reused different semantic-site SQL answers"
+    )]
+    fn semantic_site_memo_distinguishes_site_and_range_predicates_in_both_orders() {
+        use brokk_bifrost_analysis::analyzer::resolution::fact_lowering::LoweredSemanticRole;
+        use brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator;
+        use brokk_bifrost_analysis::analyzer::store::resolution_lexical::SelectedSemanticLookupOutcome;
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId;
+        use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+        let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
+            1,
+            "class Model { int value; int f() { return value; } }",
+        );
+        fixture.store.conn.execute_fixture(|connection| {
+            // Keep a valid published site at key zero, but give it a range
+            // different from 0..0. Both locator forms bind (blob, 0, 0, 0).
+            let changed = connection.execute(
+                "UPDATE resolution_sites SET role=0,site_kind=(SELECT site_kind FROM resolution_sites WHERE role=0 AND site_kind IS NOT NULL LIMIT 1),start_byte=1,end_byte=2,unqualified=1 WHERE site=0",
+                [],
+            ).unwrap();
+            assert_eq!(changed, 1, "fixture has a dense site zero");
+        });
+        let cancellation = CancellationToken::default();
+        let session = ResolutionSession::unbounded();
+        for site_first in [true, false] {
+            let selection = fixture.open_ready(&[]);
+            let mount = &selection.mounts().unwrap()[0];
+            let site = SelectedSemanticLocator::new(
+                mount.storage_language(),
+                mount.persisted_relative_path(),
+                ResolutionSiteId::new(0),
+                LoweredSemanticRole::Reference,
+            );
+            let range = SelectedSemanticLocator::for_reference_range(
+                mount.storage_language(),
+                mount.persisted_relative_path(),
+                0,
+                0,
+            );
+            let source = SelectedResolutionLexicalSource::new_on_demand(&selection);
+            let (first, second) = if site_first {
+                (&site, &range)
+            } else {
+                (&range, &site)
+            };
+            let first_result = source
+                .lookup_semantic_sites(first, &cancellation, &session)
+                .unwrap();
+            let second_result = source
+                .lookup_semantic_sites(second, &cancellation, &session)
+                .unwrap();
+            let (site_result, range_result) = if site_first {
+                (first_result, second_result)
+            } else {
+                (second_result, first_result)
+            };
+            let SelectedSemanticLookupOutcome::Found(rows) = site_result else {
+                panic!("site zero must select its own persisted row: {site_result:?}");
+            };
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].semantic(),
+                SemanticId::local(mount.ordinal().get(), 0)
+            );
+            assert!(matches!(
+                range_result,
+                SelectedSemanticLookupOutcome::Missing
+            ));
+            assert_eq!(selection.semantic_site_memo_counts_for_test().0, 2);
+        }
+    }
+
     #[test]
     fn same_range_stage_locators_preserve_distinct_capsule_identities() {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::custom_source(
@@ -601,6 +796,8 @@ mod jvm_extraction_tests {
         let ordinary_before = source
             .lookup_semantic_sites(&ordinary_locator, &cancellation, &session)
             .unwrap();
+        let site_fills = selection.semantic_site_memo_counts_for_test().0;
+        assert!(site_fills > 0, "cold ordinary site must fill the memo");
         let first = SemanticId::operation_local((1 << 53) + 401);
         let second = SemanticId::operation_local((1 << 53) + 402);
         let first_node = BindingNodeId::operation_local((1 << 53) + 403);
@@ -634,6 +831,7 @@ mod jvm_extraction_tests {
                 .unwrap(),
             ordinary_before
         );
+        assert_eq!(selection.semantic_site_memo_counts_for_test().0, site_fills);
         let range_locator = brokk_bifrost_analysis::analyzer::resolution::local_identity::SelectedSemanticLocator::for_reference_range(
         mount.storage_language(),
         mount.persisted_relative_path(),
@@ -1092,6 +1290,7 @@ mod jvm_extraction_tests {
         assert_eq!(
             rows,
             vec![Some(ReferenceSeedRow {
+                prefix_reference: None,
                 host: fragment,
                 node,
                 metadata: None
@@ -1904,7 +2103,7 @@ mod jvm_extraction_tests {
         );
             // This is a planner fixture: create the ordinary reason-key relation before
             // selection opens. Constructor and cache lifecycle laws are separate tests.
-            fixture.store.conn.execute(move |connection| {
+            fixture.store.conn.execute_fixture(move |connection| {
         let blobs = connection.prepare("SELECT blob_id FROM resolution_fragment_interiors").unwrap().query_map([],|row|row.get::<_,i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         for blob in blobs {
             for index in 0..128 {

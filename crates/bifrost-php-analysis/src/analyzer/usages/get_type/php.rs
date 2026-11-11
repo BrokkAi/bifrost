@@ -72,7 +72,7 @@ pub(crate) fn resolve_php_type_bounded(
             && let PhpOverlayType::Indexed(symbol_id) =
                 php_overlay_type(Some(&overlay), &resolution.fqn)
         {
-            let records = overlay.symbols_with_id(&symbol_id).records;
+            let records = overlay.symbols_with_id_for(&symbol_id, "php").records;
             if let [symbol] = records.as_slice()
                 && symbol.language == "php"
                 && symbol.kind == SemanticModelSymbolKind::Class

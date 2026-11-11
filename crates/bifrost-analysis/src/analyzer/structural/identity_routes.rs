@@ -135,7 +135,7 @@ pub(crate) fn canonical_member_digest_from_identity(
         hasher.update(b"overload-discriminator");
         hasher.update(discriminator);
     }
-    format!("{:x}", hasher.finalize())
+    crate::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into())
 }
 
 /// One concrete source location of a canonical declaration.
@@ -279,8 +279,9 @@ pub enum RouteRelationIncompleteReason {
     /// themselves incomplete for the roles they need.
     OccurrenceRowsIncomplete,
     /// The adapter could not say which indirection relation at least one
-    /// import site participates in, so the site-anchored relations are less
-    /// than the whole truth. A Python module whose `__all__` the source
+    /// indirection site participates in, or could not read a source export
+    /// surface, so the site-anchored relations are less than the whole truth.
+    /// A Python module whose `__all__` the source
     /// computes is the case this exists for: membership decides whether an
     /// import re-exports, and an unreadable `__all__` settles it neither way.
     IndirectionUnclassified,
@@ -344,6 +345,11 @@ impl RouteRelationCompleteness {
 pub struct RouteRelationsFileResult {
     pub rows: Vec<RouteRelationRow>,
     pub completeness: RouteRelationCompleteness,
+    // Traversal reads one endpoint's producers, not every producer in a file.
+    // Unadvertised relations remain unsupported for every endpoint kind.
+    incomplete_site_relations: Vec<RouteHopKind>,
+    incomplete_declaration_relations: Vec<RouteHopKind>,
+    incomplete_endpoints: Vec<(EndpointKey, RouteHopKind)>,
 }
 
 /// The derivation was cancelled before the rows were complete.
@@ -378,27 +384,34 @@ pub fn route_relations_for_file(
         .collect();
 
     let mut rows = Vec::new();
+    let mut incomplete_site_relations = Vec::new();
+    let mut incomplete_declaration_relations = Vec::new();
+    let mut incomplete_endpoints = Vec::new();
 
     // Site-anchored relations (import, export, re-export, import alias) come
     // from occurrence rows, whose reference resolution is the producer that
     // knows each site's target.
-    let needs_occurrences = [
+    let site_relations = [
         RouteHopKind::Import,
         RouteHopKind::Export,
         RouteHopKind::ReExport,
         RouteHopKind::Alias,
-    ]
-    .iter()
-    .any(|relation| support.supports_relation(*relation));
+    ];
+    let needs_occurrences = site_relations
+        .iter()
+        .any(|relation| support.supports_relation(*relation));
     if needs_occurrences {
         let occurrences =
             occurrences_for_file(analyzer, file, cancellation).map_err(|_| RoutesCancelled)?;
-        if !occurrences.completeness.is_complete() {
-            let needed = [OccurrenceRole::ImportTarget, OccurrenceRole::ImportAlias];
-            if needed
-                .iter()
-                .any(|&role| !occurrences.completeness.covers(role))
+        for relation in site_relations {
+            if support.supports_relation(relation)
+                && (!occurrences
+                    .completeness
+                    .covers(OccurrenceRole::ImportTarget)
+                    || (relation == RouteHopKind::Alias
+                        && !occurrences.completeness.covers(OccurrenceRole::ImportAlias)))
             {
+                incomplete_site_relations.push(relation);
                 super::note_once(
                     &mut reasons,
                     RouteRelationIncompleteReason::OccurrenceRowsIncomplete,
@@ -412,7 +425,7 @@ pub fn route_relations_for_file(
             .and_then(|provider| provider.structural_facts(file));
         match facts {
             Some(facts) => {
-                if let Some(reason) = site_relation_rows(
+                let unclassified = site_relation_rows(
                     spec,
                     file,
                     &facts,
@@ -420,25 +433,90 @@ pub fn route_relations_for_file(
                     &occurrences.rows,
                     support,
                     &mut rows,
-                ) {
-                    super::note_once(&mut reasons, reason);
+                );
+                let source_exports = parse_tree_for_language(file, language, facts.source())
+                    .and_then(|tree| spec.source_export_facts(tree.root_node(), facts.source()));
+                let source_incomplete = source_exports
+                    .as_ref()
+                    .is_some_and(|exports| !exports.complete);
+                // Only source-export producers opt into endpoint-scoped
+                // classification. Other adapters retain their established
+                // file-scoped completeness and row production.
+                if let Some(exports) = source_exports {
+                    source_export_rows(
+                        analyzer,
+                        file,
+                        exports,
+                        &mut rows,
+                        &mut incomplete_endpoints,
+                    );
+                    for endpoint in &unclassified {
+                        for relation in [
+                            RouteHopKind::Import,
+                            RouteHopKind::Export,
+                            RouteHopKind::ReExport,
+                        ] {
+                            if support.supports_relation(relation) {
+                                incomplete_endpoints.push((endpoint.clone(), relation));
+                            }
+                        }
+                    }
+                } else if !unclassified.is_empty() {
+                    for relation in [
+                        RouteHopKind::Import,
+                        RouteHopKind::Export,
+                        RouteHopKind::ReExport,
+                    ] {
+                        if support.supports_relation(relation) {
+                            super::note_once(&mut incomplete_site_relations, relation);
+                        }
+                    }
+                }
+                if source_incomplete || !unclassified.is_empty() || !incomplete_endpoints.is_empty()
+                {
+                    super::note_once(
+                        &mut reasons,
+                        RouteRelationIncompleteReason::IndirectionUnclassified,
+                    );
                 }
             }
-            None => super::note_once(
-                &mut reasons,
-                RouteRelationIncompleteReason::FactsUnavailable,
-            ),
+            None => {
+                for relation in site_relations {
+                    if support.supports_relation(relation) {
+                        super::note_once(&mut incomplete_site_relations, relation);
+                    }
+                }
+                super::note_once(
+                    &mut reasons,
+                    RouteRelationIncompleteReason::FactsUnavailable,
+                );
+            }
         }
         // Alias declarations (type aliases) also read the occurrence rows.
         if support.supports_relation(RouteHopKind::Alias) {
+            if analyzer.type_alias_provider().is_some()
+                && !occurrences.completeness.covers(OccurrenceRole::TypeOperand)
+            {
+                incomplete_declaration_relations.push(RouteHopKind::Alias);
+                super::note_once(
+                    &mut reasons,
+                    RouteRelationIncompleteReason::OccurrenceRowsIncomplete,
+                );
+            }
             type_alias_rows(analyzer, file, &occurrences.rows, &mut rows);
         }
     }
 
     declaration_relation_rows(analyzer, file, support, &mut rows, &mut reasons);
+    if reasons.contains(&RouteRelationIncompleteReason::PeerOccurrenceUnclassified) {
+        incomplete_declaration_relations.push(RouteHopKind::DeclarationDefinitionPeer);
+    }
 
     Ok(RouteRelationsFileResult {
         rows,
+        incomplete_site_relations,
+        incomplete_declaration_relations,
+        incomplete_endpoints,
         completeness: if reasons.is_empty() {
             RouteRelationCompleteness::Complete
         } else {
@@ -453,6 +531,9 @@ pub fn route_relations_for_file(
 fn unavailable(reason: RouteRelationIncompleteReason) -> RouteRelationsFileResult {
     RouteRelationsFileResult {
         rows: Vec::new(),
+        incomplete_endpoints: Vec::new(),
+        incomplete_site_relations: super::routes::ALL_ROUTE_HOP_KINDS.to_vec(),
+        incomplete_declaration_relations: super::routes::ALL_ROUTE_HOP_KINDS.to_vec(),
         completeness: RouteRelationCompleteness::Incomplete {
             unsupported_relations: super::routes::ALL_ROUTE_HOP_KINDS.to_vec(),
             reasons: vec![reason],
@@ -464,8 +545,7 @@ fn unavailable(reason: RouteRelationIncompleteReason) -> RouteRelationsFileResul
 /// alias rows from import-alias tokens paired with the target of the same
 /// import declaration.
 ///
-/// Returns the reason these rows are less than the whole truth, when the
-/// adapter could not classify some site's indirection.
+/// Returns the sites whose indirection the adapter could not classify.
 fn site_relation_rows(
     spec: &dyn StructuralSpec,
     file: &ProjectFile,
@@ -474,7 +554,7 @@ fn site_relation_rows(
     occurrence_rows: &[OccurrenceRow],
     support: &super::routes::IdentityRouteSupport,
     rows: &mut Vec<RouteRelationRow>,
-) -> Option<RouteRelationIncompleteReason> {
+) -> Vec<EndpointKey> {
     let tree = parse_tree_for_language(file, language, facts.source());
     // The file's curated export surface (Python's `__all__`) decides which of
     // its imports forward identity onward, so the adapter reads it once here
@@ -508,7 +588,7 @@ fn site_relation_rows(
     // An unclassified site still carries the plain import its occurrence role
     // already states, but the file can no longer claim its site-anchored
     // relations are the whole truth.
-    let mut unclassified = None;
+    let mut unclassified = Vec::new();
     for &(row, _, units) in &target_rows {
         let classified = tree
             .as_ref()
@@ -518,7 +598,7 @@ fn site_relation_rows(
             })
             .and_then(|token| spec.indirection_relation(token, facts.source(), &surface));
         if classified.is_none() {
-            unclassified = Some(RouteRelationIncompleteReason::IndirectionUnclassified);
+            unclassified.push(EndpointKey::Site(file.clone(), row.range));
         }
         let relation = classified.unwrap_or(RouteHopKind::Import);
         debug_assert!(
@@ -585,6 +665,84 @@ fn site_relation_rows(
     }
 
     unclassified
+}
+
+/// Literal source exports have their own sites, separate from import sites.
+/// The source-export hook is currently supplied only by Python. Imported
+/// bindings remain the import producer's ReExport rows.
+fn source_export_rows(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    exports: super::materialization::SourceExportFacts,
+    rows: &mut Vec<RouteRelationRow>,
+    incomplete: &mut Vec<(EndpointKey, RouteHopKind)>,
+) {
+    use super::materialization::{SourceExportBindingKind, SourceExportLocalDefinition};
+    let declarations = analyzer.declarations(file);
+    for export in &exports.exports {
+        let site = RouteEndpoint::Site {
+            file: file.clone(),
+            range: export.range,
+            name: export.exported_name.clone(),
+        };
+        match &export.local_definition {
+            SourceExportLocalDefinition::Defined { binding }
+                if binding.kind == SourceExportBindingKind::Import => {}
+            SourceExportLocalDefinition::Defined { binding } => {
+                let targets: Vec<_> = declarations
+                    .iter()
+                    .filter(|unit| {
+                        unit.identifier() == binding.name
+                            && analyzer.ranges_of(unit).iter().any(|range| {
+                                range.start_byte <= binding.range.start_byte
+                                    && range.end_byte >= binding.range.end_byte
+                            })
+                    })
+                    .collect();
+                if targets.is_empty() {
+                    incomplete.push((site.key(), RouteHopKind::Export));
+                }
+                for target in targets {
+                    rows.push(RouteRelationRow {
+                        kind: RouteHopKind::Export,
+                        from: site.clone(),
+                        to: RouteEndpoint::Declaration(target.clone()),
+                        provenance: RouteProvenance {
+                            file: file.clone(),
+                            range: Some(export.range),
+                        },
+                    });
+                }
+            }
+            SourceExportLocalDefinition::Unknown => {
+                incomplete.push((site.key(), RouteHopKind::Export))
+            }
+            SourceExportLocalDefinition::Undefined => {}
+        }
+    }
+    if !exports.complete {
+        let declaration_owners: HashSet<_> = declarations
+            .iter()
+            .filter(|unit| !unit.is_module() && !unit.is_file_scope())
+            .map(|unit| unit.fq())
+            .collect();
+        for unit in &declarations {
+            let nested = unit
+                .fq()
+                .parent()
+                .is_some_and(|parent| declaration_owners.contains(&parent));
+            if !unit.is_module()
+                && !unit.is_file_scope()
+                && !nested
+                && !exports
+                    .exports
+                    .iter()
+                    .any(|export| export.exported_name == unit.identifier())
+            {
+                incomplete.push((EndpointKey::Declaration(unit.clone()), RouteHopKind::Export));
+            }
+        }
+    }
 }
 
 /// Whether the alias token and the target token belong to the same alias
@@ -790,7 +948,7 @@ pub fn identity_routes_from(
     kinds: Option<&[RouteHopKind]>,
     cancellation: &CancellationToken,
 ) -> Result<Vec<IdentityRoute>, RoutesCancelled> {
-    let mut rows_by_file: HashMap<ProjectFile, Vec<RouteRelationRow>> = HashMap::default();
+    let mut rows_by_file: HashMap<ProjectFile, RouteRelationsFileResult> = HashMap::default();
     let mut routes = Vec::new();
     // Each frame: the endpoint to expand, the hops taken to reach it, and the
     // endpoint keys on the current path (for cycle detection).
@@ -812,17 +970,44 @@ pub fn identity_routes_from(
         let file_rows = match rows_by_file.entry(file.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(route_relations_for_file(analyzer, &file, cancellation)?.rows)
+                entry.insert(route_relations_for_file(analyzer, &file, cancellation)?)
             }
         };
+        // Known hops remain usable witnesses, but missing hops cannot prove
+        // absence when any requested relation is incomplete for this file.
+        let incomplete = match &endpoint {
+            RouteEndpoint::Site { .. } => &file_rows.incomplete_site_relations,
+            RouteEndpoint::Declaration(_) => &file_rows.incomplete_declaration_relations,
+        };
+        let unsupported = match &file_rows.completeness {
+            RouteRelationCompleteness::Complete => &[][..],
+            RouteRelationCompleteness::Incomplete {
+                unsupported_relations,
+                ..
+            } => unsupported_relations.as_slice(),
+        };
+        let complete = !incomplete
+            .iter()
+            .chain(unsupported)
+            .any(|kind| kinds.is_none_or(|kinds| kinds.contains(kind)))
+            && !file_rows.incomplete_endpoints.iter().any(|(key, kind)| {
+                *key == endpoint.key() && kinds.is_none_or(|kinds| kinds.contains(kind))
+            });
+        if !complete {
+            routes.push(IdentityRoute {
+                hops: hops.clone(),
+                termination: RouteTermination::Incomplete,
+            });
+        }
         let outgoing: Vec<RouteRelationRow> = file_rows
+            .rows
             .iter()
             .filter(|row| row.from == endpoint)
             .filter(|row| kinds.is_none_or(|kinds| kinds.contains(&row.kind)))
             .cloned()
             .collect();
         if outgoing.is_empty() {
-            if !hops.is_empty() {
+            if complete && !hops.is_empty() {
                 routes.push(IdentityRoute {
                     hops,
                     termination: RouteTermination::Terminal,
@@ -1045,7 +1230,9 @@ pub(super) mod tests {
         fn imported_code_units_of(
             &self,
             _: &ProjectFile,
-        ) -> std::sync::Arc<crate::hash::HashSet<CodeUnit>> {
+        ) -> std::sync::Arc<
+            brokk_bifrost_core::retention_budget::Accounted<crate::hash::HashSet<CodeUnit>>,
+        > {
             unimplemented!()
         }
         fn referencing_files_of(&self, _: &ProjectFile) -> crate::hash::HashSet<ProjectFile> {
@@ -1064,7 +1251,11 @@ pub(super) mod tests {
             Some(self)
         }
 
-        fn update(&self, _: &BTreeSet<ProjectFile>) -> Self {
+        fn update_with_listing(
+            &self,
+            _: &BTreeSet<ProjectFile>,
+            _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self {
             unimplemented!()
         }
         fn update_all(&self) -> Self {

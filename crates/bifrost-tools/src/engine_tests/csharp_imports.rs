@@ -61,7 +61,11 @@ fn csharp_import_rules_join_real_scopes_and_activation() {
     let snapshots = store
         .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".to_owned()])
         .unwrap();
-    let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
     let cancellation = CancellationToken::new();
     let project = fixture.project_dyn();
     let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
@@ -108,7 +112,7 @@ fn csharp_import_rules_join_real_scopes_and_activation() {
     let local = precedences(at("Local /* alias expression */"));
     let invoke = precedences(at("Invoke()"));
     let state = brokk_bifrost_analysis::analyzer::store::test_support::parse_state(
-        &CSharpAdapter,
+        &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
         &fixture.file("Imports.cs"),
     );
     let facts = &state.resolution_facts;

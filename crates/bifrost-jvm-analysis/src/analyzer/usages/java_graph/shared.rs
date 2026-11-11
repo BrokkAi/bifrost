@@ -28,8 +28,6 @@ use brokk_bifrost_analysis::analyzer::usages::java_usage_evidence_cache::JavaUsa
 
 use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
 
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
-
 use brokk_bifrost_core::analyzer::usages::outcome::GraphFailureReason;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphUsageOutcome;
@@ -57,10 +55,10 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+use brokk_bifrost_core::analyzer::usages::accumulator::{UsageAccumulator, UsageFlow};
 use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_jvm::java::graph::extractor::JavaFileEvidenceBuildOutcome;
 use brokk_bifrost_jvm::java::graph::extractor::OwnedReturnTypeCaches;
-use brokk_bifrost_jvm::java::graph::extractor::{JavaFileEvidenceBuildOutcome, ScanState};
-use std::collections::BTreeSet;
 
 pub(crate) struct JavaQueryResolver<'a> {
     java: &'a JavaAnalyzer,
@@ -193,17 +191,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         files.sort();
         files.dedup();
         drop(select_files_scope);
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
+        let mut usages = UsageAccumulator::bounded(max_usages);
         let mut relational_session = None;
         let return_caches = OwnedReturnTypeCaches::new(self.java.read_capability());
         for file in &files {
@@ -255,7 +243,11 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                                 lifecycle, wait.waits, wait.wait_ns
                             )
                         });
-                        merge_java_cached_file_evidence(&evidence, &mut state);
+                        if merge_java_cached_file_evidence(&evidence, &mut usages)
+                            == UsageFlow::LimitReached
+                        {
+                            break;
+                        }
                     }
                     JavaUsageEvidenceCacheAcquisition::Omitted(reason) => {
                         brokk_bifrost_core::profiling::note_with(|| {
@@ -313,7 +305,11 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                                 "JavaUsageGraphStrategy",
                             );
                         }
-                        merge_java_file_evidence(evidence, &mut state);
+                        if merge_java_file_evidence(evidence, &mut usages)
+                            == UsageFlow::LimitReached
+                        {
+                            break;
+                        }
                     }
                     JavaFileEvidenceBuildOutcome::Cancelled => break,
                     JavaFileEvidenceBuildOutcome::Omitted(reason) => {
@@ -330,16 +326,13 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                     }
                 }
             }
-            if *state.limit_exceeded {
-                break;
-            }
         }
         let _scala_scope = brokk_bifrost_core::profiling::scope("java_graph::scan_scala_files");
         let scala_complete = crate::analyzer::usages::java_graph::scan_scala_files_for_java_target(
             analyzer,
             candidate_files,
             &spec,
-            &mut state,
+            &mut usages,
             None,
         );
         drop(_scala_scope);
@@ -358,31 +351,11 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             analyzer,
             candidate_files,
             target,
-            max_usages,
-            state.hits,
-            state.unproven_hits,
-            state.raw_match_count,
-            state.limit_exceeded,
+            &mut usages,
         );
         drop(_kotlin_scope);
 
-        let external_callsites =
-            brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(&hits);
-        if limit_exceeded || external_callsites > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: target.short_name().to_string(),
-                total_callsites: external_callsites,
-                limit: max_usages,
-                sample_hits: hits,
-            });
-        }
-
-        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
-            target.clone(),
-            hits,
-            unproven_hits,
-            scan_scope.max_unproven(),
-        ))
+        GraphUsageOutcome::Resolved(usages.finish(target, scan_scope.max_unproven()))
     }
 }
 

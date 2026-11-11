@@ -136,7 +136,7 @@ pub fn python_type_parameter_binds_name_at_bounded(
         if matches!(
             parent.kind(),
             "class_definition" | "function_definition" | "type_alias_statement"
-        ) && let Some(parameters) = parent.child_by_field_name("type_parameters")
+        ) && let Some(parameters) = python_type_parameters(parent)
             && !(parameters.start_byte() <= reference.start_byte()
                 && reference.end_byte() <= parameters.end_byte())
         {
@@ -238,6 +238,21 @@ fn python_name_resolution_at_in_functions_bounded(
     Some(PythonLexicalNameResolution::Unbound)
 }
 
+/// The grammar places alias formals inside the alias's left-hand generic type.
+/// All binder consumers use this same structured interpretation.
+pub(crate) fn python_type_parameters(owner: Node<'_>) -> Option<Node<'_>> {
+    owner.child_by_field_name("type_parameters").or_else(|| {
+        if owner.kind() != "type_alias_statement" {
+            return None;
+        }
+        let left = owner.child_by_field_name("left")?;
+        let generic = left.named_child(0)?;
+        (generic.kind() == "generic_type")
+            .then(|| named_children_iter(generic).find(|node| node.kind() == "type_parameter"))
+            .flatten()
+    })
+}
+
 /// Whether this identifier is the binder (rather than a bound/constraint use)
 /// of one structured PEP 695 type parameter.
 pub fn python_is_type_parameter_binder(node: Node<'_>) -> bool {
@@ -249,7 +264,7 @@ pub fn python_is_type_parameter_binder(node: Node<'_>) -> bool {
         if matches!(
             parent.kind(),
             "class_definition" | "function_definition" | "type_alias_statement"
-        ) && let Some(parameters) = parent.child_by_field_name("type_parameters")
+        ) && let Some(parameters) = python_type_parameters(parent)
             && parameters.start_byte() <= node.start_byte()
             && node.end_byte() <= parameters.end_byte()
         {
@@ -270,7 +285,7 @@ pub fn python_is_type_parameter_binder(node: Node<'_>) -> bool {
     false
 }
 
-fn python_type_parameter_binder_node(parameter: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn python_type_parameter_binder_node(parameter: Node<'_>) -> Option<Node<'_>> {
     if parameter.kind() == "identifier" {
         Some(parameter)
     } else {

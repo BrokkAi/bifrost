@@ -22,6 +22,22 @@ type OutputSchemaSource = fn() -> Value;
 
 const OUTPUT_SCHEMAS: &[(&str, OutputSchemaSource)] = &[
     (
+        "analyze_diff",
+        generate_output_schema::<brokk_bifrost_tools::diff_analysis::DiffAnalysisResult>,
+    ),
+    (
+        "get_symbol_locations",
+        generate_output_schema::<brokk_bifrost_tools::searchtools::SymbolLocationsResult>,
+    ),
+    (
+        "get_symbol_ancestors",
+        generate_output_schema::<brokk_bifrost_tools::searchtools::SymbolAncestorsResult>,
+    ),
+    (
+        "score_diff",
+        generate_output_schema::<brokk_bifrost_tools::diff_scoring::DiffScoreResult>,
+    ),
+    (
         "list_function_sources",
         generate_output_schema::<brokk_bifrost_tools::function_sources::ListFunctionSourcesResult>,
     ),

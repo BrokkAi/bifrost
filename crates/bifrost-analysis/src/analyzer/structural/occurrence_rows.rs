@@ -552,6 +552,21 @@ fn classify_rows(
         {
             continue;
         }
+        if spec.language() == crate::Language::Rust
+            && roles.contains(&OccurrenceRole::Binder)
+            && roles.contains(&OccurrenceRole::PatternPosition)
+        {
+            // Rust emits both possible classes for an unresolved bare
+            // pattern. Neither inventory can claim complete absence until
+            // the value-namespace selection is known. Reuse the existing
+            // per-role gap that query consumers already propagate.
+            for role in [OccurrenceRole::Binder, OccurrenceRole::PatternPosition] {
+                let reason = OccurrenceIncompleteReason::NamespaceUnknown(role);
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+            }
+        }
         let normalized = facts.node(node);
         let declared_kind = declared_fact_kind(facts, node);
         for &role in roles {
@@ -793,6 +808,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unresolved_rust_pattern_marks_binder_and_reference_inventories_open() {
+        use super::super::extract::extract_file_facts;
+        let spec = &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC;
+        let facts = extract_file_facts(
+            spec,
+            &tree_sitter_rust::LANGUAGE.into(),
+            "use dep::D; fn f(v: i32) { match v { D => {}, _ => {} } }",
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path(), "example.rs");
+        let mut reasons = vec![];
+        let rows = classify_rows(spec, &file, &facts, None, None, &mut reasons);
+        let pattern = rows
+            .iter()
+            .filter(|row| row.raw_spelling == "D")
+            .collect::<Vec<_>>();
+        assert!(pattern.iter().any(|row| row.role == OccurrenceRole::Binder));
+        assert!(
+            pattern
+                .iter()
+                .any(|row| row.role == OccurrenceRole::PatternPosition)
+        );
+        for role in [OccurrenceRole::Binder, OccurrenceRole::PatternPosition] {
+            assert!(reasons.contains(&OccurrenceIncompleteReason::NamespaceUnknown(role)));
+        }
+    }
+
+    #[test]
     fn persisted_multi_role_tokens_preserve_the_role_address_relation() {
         use super::super::extract::extract_file_facts;
         use super::super::occurrences::ALL_OCCURRENCE_ROLES;
@@ -915,7 +959,7 @@ mod tests {
                 hash.update((field.len() as u64).to_le_bytes());
                 hash.update(field);
             }
-            format!("{:x}", hash.finalize())
+            crate::analyzer::canonical_hash::lower_hex_string(&hash.finalize().into())
         }
         for source in [b"".as_slice(), b"class Widget {}".as_slice()] {
             let content = ContentIdentity::hash_bytes(source);

@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use super::{PolicyRenderError, SarifToolIdentity, write_policy_sarif};
 use crate::{
-    CatalogRegistryLimits, DefaultPolicyEvaluator, EvidenceRef, PolicyBudget, PolicyDiagnostic,
-    PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
+    CatalogRegistryLimits, DefaultPolicyEvaluator, EvidenceRef, FindingLocationBound, PolicyBudget,
+    PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
     PolicyEvaluationContext, PolicyEvaluator, PolicyFinding, PolicyIncompleteReason,
     PolicyLocationRelationship, PolicyRegistry, PolicyRegistryLimits, PolicyReportDiagnostic,
     PolicyReportDiagnosticCode, PolicyReportDocument, PolicyRuleDescriptor, PolicyRun,
-    PolicyRunCompletion, PolicyRunScope, PolicySourceIdentity, PolicyWorkReport,
-    RelatedPolicyLocation, TaintCatalogRegistry,
+    PolicyRunCompletion, PolicyRunScope, PolicySourceIdentity, PolicySubjectVerdict,
+    PolicySubjectVerdicts, PolicyWorkReport, RelatedPolicyLocation, SubjectEnumeration,
+    SubjectSelectorEnumeration, SubjectVerdict, TaintCatalogRegistry,
 };
 use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, TestProject};
 use brokk_bifrost_js_ts_analysis::TypescriptAnalyzer;
@@ -61,6 +62,7 @@ fn evaluated_report_with_policy(source: &str) -> PolicyReportDocument {
                 cvss_overlays: &[],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )
@@ -84,6 +86,48 @@ fn replace_run(report: &PolicyReportDocument, run: PolicyRun) -> PolicyReportDoc
         None,
     )
     .unwrap()
+}
+
+#[test]
+fn subject_enumeration_and_undecided_site_are_rendered_in_sarif() {
+    let base = evaluated_report();
+    let run = base.runs()[0].clone();
+    let subjects = PolicySubjectVerdicts::new(
+        vec![SubjectSelectorEnumeration {
+            selector: "source".to_owned(),
+            enumeration: SubjectEnumeration::Certified,
+        }],
+        vec![PolicySubjectVerdict {
+            selector: "source".to_owned(),
+            location: crate::test_support::policy_test_location("app.ts", 1, 2, 1),
+            verdict: SubjectVerdict::Undecided {
+                reasons: vec!["silent_drop".to_owned()],
+                finding_location_bound: FindingLocationBound::Unbounded,
+            },
+        }],
+    );
+    let run = run
+        .with_subjects(subjects, &PolicyBudget::default())
+        .unwrap();
+    let report = replace_run(&base, run);
+    let value = render(&report, &SarifToolIdentity::default());
+
+    assert_eq!(
+        value["runs"][0]["properties"]["subjects"][0]["subjects"]["selectors"][0]["enumeration"],
+        "certified"
+    );
+    let notifications = value["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+        .as_array()
+        .unwrap();
+    let notification = notifications
+        .iter()
+        .find(|notification| notification["descriptor"]["id"] == "BIFROST_POLICY_SUBJECT_UNDECIDED")
+        .unwrap();
+    assert_eq!(notification["level"], "warning");
+    assert_eq!(
+        notification["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+        "app.ts"
+    );
 }
 
 #[test]

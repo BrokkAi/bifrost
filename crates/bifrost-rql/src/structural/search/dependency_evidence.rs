@@ -32,6 +32,9 @@ enum VersionRange {
     Npm(brokk_bifrost_js_ts_analysis::dependency_evidence::NpmVersionRange),
     Nuget(brokk_bifrost_csharp_analysis::dependency_evidence::NugetVersionRange),
     Go(brokk_bifrost_go_analysis::analyzer::GoVersionRange),
+    Ruby(brokk_bifrost_ruby_analysis::analyzer::RubyVersionRange),
+    Composer(brokk_bifrost_php_analysis::analyzer::ComposerVersionRange),
+    Maven(brokk_bifrost_jvm_analysis::analyzer::MavenVersionRange),
 }
 
 /// Parse one validated range with its ecosystem's own version semantics.
@@ -51,6 +54,24 @@ fn version_range(ecosystem: &str, requirement: &str) -> VersionRange {
         | brokk_bifrost_go_analysis::analyzer::GO_TOOLCHAIN_ECOSYSTEM => VersionRange::Go(
             brokk_bifrost_go_analysis::analyzer::GoVersionRange::parse(ecosystem, requirement)
                 .expect("validated Go range"),
+        ),
+        brokk_bifrost_ruby_analysis::analyzer::RUBYGEMS_ECOSYSTEM
+        | brokk_bifrost_ruby_analysis::analyzer::RUBY_TOOLCHAIN_ECOSYSTEM => VersionRange::Ruby(
+            brokk_bifrost_ruby_analysis::analyzer::RubyVersionRange::parse(ecosystem, requirement)
+                .expect("validated Ruby range"),
+        ),
+        brokk_bifrost_php_analysis::analyzer::COMPOSER_ECOSYSTEM
+        | brokk_bifrost_php_analysis::analyzer::PHP_TOOLCHAIN_ECOSYSTEM => VersionRange::Composer(
+            brokk_bifrost_php_analysis::analyzer::ComposerVersionRange::parse(
+                ecosystem,
+                requirement,
+            )
+            .expect("validated Composer range"),
+        ),
+        brokk_bifrost_jvm_analysis::analyzer::MAVEN_ECOSYSTEM
+        | brokk_bifrost_jvm_analysis::analyzer::JVM_TOOLCHAIN_ECOSYSTEM => VersionRange::Maven(
+            brokk_bifrost_jvm_analysis::analyzer::MavenVersionRange::parse(ecosystem, requirement)
+                .expect("validated Maven range"),
         ),
         "cargo" | brokk_bifrost_rust_analysis::analyzer::RUST_TOOLCHAIN_ECOSYSTEM => {
             VersionRange::Cargo(
@@ -91,7 +112,8 @@ fn matches(
         && axis(&filter.exact_versions, row.exact_version.as_deref())
         && axis(&filter.sources, row.source.as_deref())
         && axis(&filter.declared_by, row.declared_by.as_deref())
-        && axis(&filter.scopes, Some(row.scope.label())))
+        && axis(&filter.scopes, Some(row.scope.label()))
+        && lock_association_matches(row, &filter.lock_associations))
     {
         return Ok(false);
     }
@@ -107,6 +129,18 @@ fn matches(
         (Err(unresolved), _) | (_, Err(unresolved)) => Err(unresolved),
         (Ok(_), Ok(true)) => Ok(true),
     }
+}
+
+/// Whether a Cargo row's recorded lock association is one of `wanted`. A
+/// member owns its direct lock instance and every transitive copy through
+/// `declared_by`; the association is what tells them apart (#9919). The
+/// producer records it on every declaration and owned lock row, so a row
+/// without one (an unowned lock instance) is a definite non-match.
+fn lock_association_matches(row: &DependencyEvidence, wanted: &[String]) -> bool {
+    wanted.is_empty()
+        || row.conditions.iter().any(|condition| {
+            condition.kind == "cargo.lock_association" && wanted.contains(&condition.value)
+        })
 }
 
 /// Whether the manifest that owns this Cargo row requests any of `features`
@@ -190,6 +224,20 @@ fn version_matches(row: &DependencyEvidence, ranges: &[VersionRange]) -> Result<
                 brokk_bifrost_go_analysis::analyzer::go_dependency_version_matches(row, range)?
                     .ok_or(NO_EXACT)?
             }
+            VersionRange::Ruby(range) => {
+                brokk_bifrost_ruby_analysis::analyzer::ruby_dependency_version_matches(row, range)?
+                    .ok_or(NO_EXACT)?
+            }
+            VersionRange::Composer(range) => {
+                brokk_bifrost_php_analysis::analyzer::composer_dependency_version_matches(
+                    row, range,
+                )?
+                .ok_or(NO_EXACT)?
+            }
+            VersionRange::Maven(range) => {
+                brokk_bifrost_jvm_analysis::analyzer::maven_dependency_version_matches(row, range)?
+                    .ok_or(NO_EXACT)?
+            }
             VersionRange::Cargo(range) => {
                 let raw = row.exact_version.as_deref().ok_or(NO_EXACT)?;
                 let version = semver::Version::parse(raw).map_err(|e| e.to_string())?;
@@ -210,7 +258,7 @@ pub(super) fn execute_dependency_evidence_seed(
         .cancellation
         .is_some_and(CancellationToken::is_cancelled)
     {
-        return cancelled_plan_execution();
+        return PlanExecution::cancelled(Vec::new());
     }
     let cap = terminal_cap.unwrap_or(limits.max_pipeline_rows).min(
         limits
@@ -252,12 +300,7 @@ pub(super) fn execute_dependency_evidence_seed(
                 }),
                 Some(DerivationExecutionCause::Provider),
             ));
-            return PlanExecution {
-                rows: Vec::new(),
-                truncated: true,
-                cancelled: false,
-                pipeline_halted: false,
-            };
+            return PlanExecution::truncated(Vec::new());
         }
     };
     let mut incomplete = !evidence.complete();
@@ -316,7 +359,7 @@ pub(super) fn execute_dependency_evidence_seed(
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return cancelled_plan_execution();
+            return PlanExecution::cancelled(Vec::new());
         }
         let file = ProjectFile::new(state.analyzer.project().root(), row.build_file.clone());
         if !seed.where_globs.matches(&rel_path_string(&file)) {
@@ -380,12 +423,7 @@ pub(super) fn execute_dependency_evidence_seed(
             false,
         );
     }
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 pub(super) fn public_row(value: &DependencyEvidenceValue) -> results::CodeQueryDependencyEvidence {
     let row = &value.row;

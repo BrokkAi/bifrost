@@ -1,4 +1,4 @@
-use crate::bindings::python_direct_scope_bindings_bounded;
+use crate::bindings::{PythonLexicalScopeInventory, python_direct_scope_bindings_bounded};
 use crate::imports::{python_import_infos_from_node, python_import_syntaxes_from_node};
 use crate::syntax::{
     PythonOverloadDecoratorBindings, PythonOverloadDecoratorName, expression_name_node,
@@ -23,13 +23,16 @@ use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
-use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::tree_walk::{
+    ParentIndex, WalkControl, node_range, walk_named_tree_preorder,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::source_properties::{python_annotation_references, python_return_type_identity};
@@ -147,14 +150,24 @@ pub fn python_import_root_with_inputs(
     relative_path: &Path,
     inputs: &impl PythonImportRootInputs,
 ) -> std::io::Result<PathBuf> {
+    python_import_root_selection_with_inputs(root, relative_path, inputs)
+        .map(|selection| selection.0)
+}
+
+/// Select canonical placement and preserve whether a manifest declared it.
+pub fn python_import_root_selection_with_inputs(
+    root: &Path,
+    relative_path: &Path,
+    inputs: &impl PythonImportRootInputs,
+) -> std::io::Result<(PathBuf, Option<PathBuf>)> {
     let Some(parent_rel) = relative_path.parent() else {
-        return Ok(PathBuf::new());
+        return Ok((PathBuf::new(), None));
     };
     if parent_rel.as_os_str().is_empty() {
-        return Ok(PathBuf::new());
+        return Ok((PathBuf::new(), None));
     }
     if let Some(import_root_rel) = python_configured_import_root(root, parent_rel, inputs)? {
-        return Ok(import_root_rel);
+        return Ok((import_root_rel.clone(), Some(import_root_rel)));
     }
     let mut effective_package_root_rel: Option<&Path> = None;
     for path in parent_rel.ancestors() {
@@ -162,10 +175,11 @@ pub fn python_import_root_with_inputs(
             effective_package_root_rel = Some(path);
         }
     }
-    Ok(effective_package_root_rel
+    let root = effective_package_root_rel
         .and_then(Path::parent)
         .unwrap_or_else(|| Path::new(""))
-        .to_path_buf())
+        .to_path_buf();
+    Ok((root, None))
 }
 
 fn python_package_components_for_file(file: &ProjectFile, import_root_rel: &Path) -> Vec<String> {
@@ -786,6 +800,12 @@ pub fn python_is_decorated_function_boundary(node: Node<'_>) -> bool {
         .any(|child| child.kind() == "function_definition")
 }
 
+fn scope_global_names(node: Node<'_>, source: &str) -> Rc<HashSet<String>> {
+    let inventory = PythonLexicalScopeInventory::collect_bounded(node, source, [], || true)
+        .expect("unbounded directive inventory");
+    Rc::new(inventory.global_names().map(str::to_owned).collect())
+}
+
 #[derive(Clone)]
 pub struct Scope {
     kind: ScopeKind,
@@ -798,6 +818,8 @@ pub struct Scope {
     fq: FqName,
     code_unit: Option<CodeUnit>,
     method_receiver: Option<String>,
+    // Frames share one scope inventory rather than copying directive names.
+    globals: Rc<HashSet<String>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -825,6 +847,7 @@ where
     source_imports: Vec<SourceImportFact>,
     generic_imports: Vec<SourceImportId>,
     source_declaration_units: Vec<(SourceDeclarationId, CodeUnit)>,
+    receiver_field_owners: HashMap<CodeUnit, (SourceDeclarationId, CodeUnit)>,
     // Source links can outlive the indexed unit when an enclosing class is replaced.
     // This membership belongs only to the current file walk.
     source_declaration_unit_keys: HashSet<CodeUnit>,
@@ -1108,6 +1131,24 @@ where
                     container_depth: module_control_depth,
                 }
             }
+            "type_alias_statement" => {
+                for binding in python_direct_scope_bindings_bounded(node, self.source, || true)
+                    .expect("unbounded alias binding collection")
+                {
+                    self.visit_named_value(
+                        node,
+                        binding.declaration,
+                        scope,
+                        module_control_depth,
+                        CodeUnitType::Class,
+                    );
+                }
+                DeclarationChildren {
+                    body: None,
+                    container_scope: None,
+                    container_depth: module_control_depth,
+                }
+            }
             "import_statement" | "import_from_statement" => DeclarationChildren {
                 body: None,
                 container_scope: None,
@@ -1257,6 +1298,7 @@ where
                 fq,
                 code_unit: Some(code_unit),
                 method_receiver: None,
+                globals: scope_global_names(node, self.source),
             });
         }
         DeclarationChildren {
@@ -1298,11 +1340,7 @@ where
         // local binding of its enclosing function, not a member of any owner,
         // so it mints no declaration and no procedure key; `@x.setter` is a
         // write into its class's attribute rather than a callable member.
-        let capture = !python_is_property_mutator(range_node, self.source)
-            && ((scope.is_empty() && module_control_depth <= 1)
-                || scope
-                    .last()
-                    .is_some_and(|parent| parent.kind == ScopeKind::Class));
+        let property_accessor = python_property_accessor(range_node, self.source);
         let short_name = if let Some(parent) = scope.last() {
             match parent.kind {
                 ScopeKind::Class => format!("{}.{}", parent.path, name),
@@ -1332,6 +1370,28 @@ where
                 .with_pushed(segment_interner().intern(name, SegmentKind::Member))
         };
 
+        let property_field = property_accessor
+            .and_then(|_| scope.last())
+            .filter(|parent| parent.kind == ScopeKind::Class)
+            .and_then(|parent| parent.code_unit.as_ref())
+            .and_then(|owner| self.parsed.children.get(owner))
+            .and_then(|children| {
+                children
+                    .iter()
+                    .rev()
+                    .find(|unit| unit.is_field() && unit.fq() == &fq)
+            })
+            .cloned();
+        // An unrelated user decorator named getter still declares a function.
+        // Setter/deleter admission keeps the existing exclusion when no field
+        // is available to link.
+        let capture = property_field.is_none()
+            && !matches!(property_accessor, Some("setter" | "deleter"))
+            && ((scope.is_empty() && module_control_depth <= 1)
+                || scope
+                    .last()
+                    .is_some_and(|parent| parent.kind == ScopeKind::Class));
+
         if capture {
             let code_unit_type = if python_function_has_property_decorator(node, self.source) {
                 CodeUnitType::Field
@@ -1355,6 +1415,7 @@ where
             let replaces_declaration = self.parsed.contains_declaration(&code_unit);
             let replaces_links = self.source_declaration_unit_keys.contains(&code_unit);
             if replaces_declaration {
+                let previous_ranges = self.parsed.declaration_ranges(&code_unit).to_vec();
                 self.parsed.replace_code_unit(
                     code_unit.clone(),
                     range_node,
@@ -1362,6 +1423,9 @@ where
                     None,
                     None,
                 );
+                for range in previous_ranges {
+                    self.parsed.add_declaration_range(&code_unit, range);
+                }
             } else {
                 self.parsed
                     .add_code_unit(code_unit.clone(), range_node, self.source, None, None);
@@ -1430,6 +1494,7 @@ where
                     .is_some_and(|parent| parent.kind == ScopeKind::Class)
                     .then(|| python_instance_method_receiver_name(node, self.source))
                     .flatten(),
+                globals: scope_global_names(node, self.source),
             });
             return DeclarationChildren {
                 body: node
@@ -1440,6 +1505,15 @@ where
             };
         }
 
+        if let Some(field) = property_field {
+            // Accessors assign the same public member but retain their own
+            // authored identities and unknown decorated runtime values.
+            self.record_source_declaration(range_node, Some(name_node), field.clone(), None);
+            // The function belongs to the property. Its decorator expressions
+            // execute outside that definition and remain usages of the member.
+            self.parsed.add_declaration_range(&field, node_range(node));
+        }
+
         let mut next_scope = scope.to_vec();
         next_scope.push(Scope {
             kind: ScopeKind::Function,
@@ -1447,6 +1521,7 @@ where
             fq,
             code_unit: None,
             method_receiver: None,
+            globals: scope_global_names(node, self.source),
         });
         DeclarationChildren {
             body: node
@@ -1466,7 +1541,7 @@ where
         let Some(assignment) = node.named_child(0) else {
             return;
         };
-        if assignment.kind() != "assignment" {
+        if !matches!(assignment.kind(), "assignment" | "augmented_assignment") {
             return;
         }
         let targets = python_chained_assignment_targets(assignment);
@@ -1480,61 +1555,87 @@ where
             .iter()
             .flat_map(|left| collect_assigned_name_nodes(*left, self.source));
         for name_node in names {
-            let name = py_node_text(name_node, self.source).trim().to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let (short_name, fq) = if let Some(parent) = scope.last() {
-                if parent.kind != ScopeKind::Class {
-                    continue;
-                }
-                (
-                    format!("{}.{}", parent.path, name),
-                    parent
-                        .fq
-                        .clone()
-                        .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
-                )
-            } else if module_control_depth <= 1 {
-                (
-                    name.clone(),
-                    self.module_fq
-                        .clone()
-                        .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
-                )
-            } else {
-                continue;
-            };
-            let code_unit = CodeUnit::new_fq(
-                self.file.clone(),
+            self.visit_named_value(
+                node,
+                name_node,
+                scope,
+                module_control_depth,
                 CodeUnitType::Field,
-                self.package_name.to_string(),
-                short_name,
-                fq,
             );
-            // Reassigning a module or class attribute does not mint a new
-            // logical member. Keep every writer's range and exact
-            // SourceDeclarationId: references between assignments select the
-            // active writer, and the native bridge looks up each writer's
-            // exact declaration.
+        }
+    }
+
+    fn visit_named_value(
+        &mut self,
+        node: Node<'_>,
+        name_node: Node<'_>,
+        scope: &[Scope],
+        module_control_depth: usize,
+        kind: CodeUnitType,
+    ) {
+        let name = py_node_text(name_node, self.source).trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let global = scope
+            .last()
+            .is_some_and(|parent| parent.globals.contains(&name));
+        let (short_name, fq) = if let Some(parent) = scope.last().filter(|_| !global) {
+            if parent.kind != ScopeKind::Class {
+                return;
+            }
+            (
+                format!("{}.{}", parent.path, name),
+                parent
+                    .fq
+                    .clone()
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
+            )
+        } else if global || module_control_depth <= 1 {
+            (
+                name.clone(),
+                self.module_fq
+                    .clone()
+                    .with_pushed(segment_interner().intern(&name, SegmentKind::Member)),
+            )
+        } else {
+            return;
+        };
+        let code_unit = CodeUnit::new_fq(
+            self.file.clone(),
+            kind,
+            self.package_name.to_string(),
+            short_name,
+            fq,
+        );
+        // Reassigning a module or class attribute does not mint a new
+        // logical member. Keep every writer's range and exact
+        // SourceDeclarationId: references between assignments select the
+        // active writer, and the native bridge looks up each writer's
+        // exact declaration.
+        // A redirected writer executes inside its function. Its exact source
+        // declaration links to the module field without adding a nested field
+        // range that would replace that function as the enclosing usage owner.
+        if !global || !self.parsed.contains_declaration(&code_unit) {
             self.parsed
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed.add_signature(
                 code_unit.clone(),
                 py_node_text(node, self.source).trim().to_string(),
             );
-            self.record_source_declaration(node, Some(name_node), code_unit.clone(), None);
-            if let Some(module) = &self.module
-                && scope.is_empty()
-            {
-                self.parsed.add_child(module.clone(), code_unit.clone());
-            }
-            if let Some(parent) = scope.last()
-                && parent.kind == ScopeKind::Class
-                && let Some(parent_cu) = &parent.code_unit
-            {
-                self.parsed.add_child(parent_cu.clone(), code_unit);
-            }
+        }
+        self.record_source_declaration(node, Some(name_node), code_unit.clone(), None);
+        if let Some(module) = &self.module
+            && (scope.is_empty() || global)
+        {
+            self.parsed.add_child(module.clone(), code_unit.clone());
+        }
+        if let Some(parent) = scope.last()
+            && !global
+            && parent.kind == ScopeKind::Class
+            && let Some(parent_cu) = &parent.code_unit
+        {
+            self.parsed.add_child(parent_cu.clone(), code_unit);
         }
     }
 
@@ -1576,7 +1677,10 @@ where
                     Some(parent_cu.clone()),
                     Some(parent_cu.clone()),
                 );
-                self.record_source_declaration(node, Some(node), code_unit.clone(), None);
+                let declaration =
+                    self.record_source_declaration(node, Some(node), code_unit.clone(), None);
+                self.receiver_field_owners
+                    .insert(code_unit.clone(), (declaration, parent_cu.clone()));
             }
             self.parsed.add_signature(
                 code_unit.clone(),
@@ -1620,6 +1724,7 @@ where
             &mut ParsedFile,
             &mut PrimarySourceFactCollector<'source>,
             &[(SourceDeclarationId, CodeUnit)],
+            &HashMap<CodeUnit, (SourceDeclarationId, CodeUnit)>,
         ) -> NativeSourceBridges,
     ) {
         let PythonVisitor {
@@ -1631,6 +1736,7 @@ where
             source_imports,
             generic_imports,
             source_declaration_units,
+            mut receiver_field_owners,
             python_source_facts,
             python_callable_return_by_node: _,
             overload_decorators,
@@ -1641,8 +1747,23 @@ where
         let structural = structural
             .finish(root)
             .expect("Python structural fact collection must finish");
-        let (native_site_occurrences, native_declaration_sources) =
-            native_step(parsed, &mut source_facts, &source_declaration_units);
+        // Class replacement can withdraw a field and later reuse its public
+        // CodeUnit for a class-dictionary write. Only still-published receiver
+        // declarations belong to the instance-field admission map.
+        receiver_field_owners.retain(|unit, (declaration, _)| {
+            let source = source_facts.declaration(*declaration);
+            let range = source_facts.occurrence(source.occurrence).range;
+            parsed
+                .ranges
+                .get(unit)
+                .is_some_and(|ranges| ranges.contains(&range))
+        });
+        let (native_site_occurrences, native_declaration_sources) = native_step(
+            parsed,
+            &mut source_facts,
+            &source_declaration_units,
+            &receiver_field_owners,
+        );
         let occurrences = source_facts.finish();
         assert!(
             python_source_facts.valid_links(&occurrences),
@@ -1697,40 +1818,34 @@ type NativeSourceBridges = (
     Vec<(ResolutionSiteId, SourceDeclarationId)>,
 );
 
-/// Build production Python declarations and source facts without native facts.
-/// Native publication starts with Python's first production native reader.
+/// Build coordinated production Python declarations, source and native facts.
 pub fn parse_python_file(
     project: &dyn Project,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
 ) -> ParsedFile {
-    parse_python_file_with_step(project, file, source, tree, |_, _, _| Default::default())
-}
-
-/// Build coordinated Python source and native facts for producer validation.
-/// Production callers keep using [`parse_python_file`] until the reader switch.
-#[cfg(any(test, feature = "test-support"))]
-pub fn parse_python_file_with_native_facts(
-    project: &dyn Project,
-    file: &ProjectFile,
-    source: &str,
-    tree: &Tree,
-) -> ParsedFile {
-    parse_python_file_with_step(project, file, source, tree, |parsed, collector, units| {
-        // Class replacement withdraws old descendant CodeUnits, while their
-        // source occurrences and lexical identities remain in the native facts.
-        let (facts, occurrences, declarations) = crate::resolution::produce(
-            tree.root_node(),
-            source,
-            collector,
-            units
-                .iter()
-                .filter(|(_, unit)| parsed.contains_declaration(unit)),
-        );
-        parsed.resolution_facts = facts;
-        (occurrences, declarations)
-    })
+    parse_python_file_with_step(
+        project,
+        file,
+        source,
+        tree,
+        |parsed, collector, units, receiver_fields| {
+            // Class replacement withdraws old descendant CodeUnits, while their
+            // source occurrences and lexical identities remain in the native facts.
+            let (facts, occurrences, declarations) = crate::resolution::produce(
+                tree.root_node(),
+                source,
+                collector,
+                units
+                    .iter()
+                    .filter(|(_, unit)| parsed.contains_declaration(unit)),
+                receiver_fields,
+            );
+            parsed.resolution_facts = facts;
+            (occurrences, declarations)
+        },
+    )
 }
 
 fn parse_python_file_with_step<'source>(
@@ -1742,6 +1857,7 @@ fn parse_python_file_with_step<'source>(
         &mut ParsedFile,
         &mut PrimarySourceFactCollector<'source>,
         &[(SourceDeclarationId, CodeUnit)],
+        &HashMap<CodeUnit, (SourceDeclarationId, CodeUnit)>,
     ) -> NativeSourceBridges,
 ) -> ParsedFile {
     let module_components = python_module_components(project, file);
@@ -1784,6 +1900,7 @@ fn parse_python_file_with_step<'source>(
         source_imports: Vec::new(),
         generic_imports: Vec::new(),
         source_declaration_units: Vec::new(),
+        receiver_field_owners: HashMap::default(),
         source_declaration_unit_keys: HashSet::default(),
         python_source_facts: PythonSourceFacts::default(),
         python_callable_return_by_node: HashMap::default(),
@@ -2149,12 +2266,18 @@ pub fn python_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn python_is_property_mutator(node: Node<'_>, source: &str) -> bool {
-    python_header_with_decorators(node, source)
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with('@'))
-        .any(|decorator| decorator.ends_with(".setter") || decorator.ends_with(".deleter"))
+fn python_property_accessor<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .filter_map(|decorator| decorator.named_child(0))
+        .filter(|expression| expression.kind() == "attribute")
+        .filter_map(|expression| expression.child_by_field_name("attribute"))
+        .map(|accessor| py_node_text(accessor, source))
+        .filter(|accessor| matches!(*accessor, "getter" | "setter" | "deleter"))
+        // Any setter/deleter keeps the existing capture exclusion, even with
+        // another getter decorator on the same definition.
+        .min_by_key(|accessor| *accessor == "getter")
 }
 
 pub fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
@@ -2425,7 +2548,7 @@ mod primary_tests {
     fn parse_native(source: &str) -> ParsedFile {
         let file = ProjectFile::new(std::env::temp_dir(), "m4.py");
         let tree = parse_python_tree(source).expect("Python fixture tree");
-        parse_python_file_with_native_facts(
+        parse_python_file(
             &brokk_bifrost_core::analyzer::project::TestProject::new(
                 file.root(),
                 brokk_bifrost_core::analyzer::Language::Python,
@@ -2918,18 +3041,87 @@ mod primary_tests {
 
     #[test]
     fn empty_and_recovered_python_publish_canonical_structural_facts() {
-        for source in [
-            "",
-            "class Broken(:\n    pass\ndef valid(value):\n    return value\n",
-            "def broken(:\n    pass\n",
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            PythonNativeCuratedSurface, PythonNativeWildcardPolicy, ResolutionGapKind,
+            ResolutionScopeKind, ResolutionSiteKind,
+        };
+
+        for (source, expected_declarations) in [
+            ("", Vec::new()),
+            (
+                "class Broken(:\n    pass\ndef valid(value):\n    return value\n",
+                vec![
+                    (ResolutionSiteKind::TypeDeclaration, "Broken"),
+                    (ResolutionSiteKind::CallableDeclaration, "valid"),
+                    (ResolutionSiteKind::ValueDeclaration, "value"),
+                ],
+            ),
+            (
+                "def broken(:\n    pass\n",
+                vec![(ResolutionSiteKind::CallableDeclaration, "broken")],
+            ),
         ] {
             let parsed = parse(source);
             let facts = parsed.source_facts.expect("complete producer publication");
             assert_eq!(facts.source_bytes, source.len());
             assert!(facts.python.is_some());
-            assert_eq!(parsed.resolution_facts, Default::default());
-            assert!(facts.native_site_occurrences.is_empty());
-            assert!(facts.native_declaration_sources.is_empty());
+            let resolution = &parsed.resolution_facts;
+            let module = resolution
+                .scopes
+                .iter()
+                .find(|scope| scope.parent.is_none())
+                .expect("canonical module scope, including recovered roots");
+            assert_eq!(module.kind, ResolutionScopeKind::CompilationUnit);
+            assert_eq!((module.start_byte, module.end_byte), (0, source.len()));
+            let module_site = resolution
+                .sites
+                .iter()
+                .find(|site| Some(site.id) == module.owner)
+                .expect("module declaration owns the scope");
+            assert_eq!(module_site.kind, ResolutionSiteKind::ModuleDeclaration);
+            assert_eq!(module_site.scope, module.id);
+            assert_eq!(
+                (module_site.start_byte, module_site.end_byte),
+                (0, source.len())
+            );
+            assert_eq!(resolution.python_export_surfaces.len(), 1);
+            let exports = &resolution.python_export_surfaces[0];
+            assert_eq!(exports.module_scope, module.id);
+            assert_eq!(exports.curated, PythonNativeCuratedSurface::Absent);
+            assert_eq!(
+                exports.wildcard_policy,
+                PythonNativeWildcardPolicy::PublicNames
+            );
+            assert_eq!(facts.native_site_occurrences.len(), resolution.sites.len());
+            assert!(
+                facts
+                    .native_declaration_sources
+                    .iter()
+                    .any(|(site, _)| *site == module_site.id),
+                "the module must have a canonical source declaration"
+            );
+            let declarations = resolution
+                .sites
+                .iter()
+                .filter(|site| {
+                    matches!(
+                        site.kind,
+                        ResolutionSiteKind::TypeDeclaration
+                            | ResolutionSiteKind::CallableDeclaration
+                            | ResolutionSiteKind::ValueDeclaration
+                    )
+                })
+                .map(|site| (site.kind, &source[site.start_byte..site.end_byte]))
+                .collect::<Vec<_>>();
+            assert_eq!(declarations, expected_declarations);
+            assert_eq!(
+                resolution
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.kind == ResolutionGapKind::MalformedSyntax),
+                !source.is_empty(),
+                "recovered trees retain malformed-syntax evidence"
+            );
             assert!(
                 facts
                     .occurrences

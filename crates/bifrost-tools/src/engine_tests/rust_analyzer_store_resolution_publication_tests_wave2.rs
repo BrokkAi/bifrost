@@ -230,6 +230,86 @@ mod rust_departing_wave2_root_tests {
         );
     }
 
+    /// The repair of a capsule whose manifest is not complete deletes its blob
+    /// row, which cascades away the name rows of any file version that mounts
+    /// the same content. That version must stop being a blob_pending or known
+    /// inventory in the same transaction.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10325: a capsule repair delete cascaded away name rows without withdrawing the inventory state"
+    )]
+    fn capsule_repair_withdraws_the_inventory_of_files_mounting_its_content() {
+        crate::engine_tests::rust_analyzer_store_resolution_operation_tests::rust_departing_root_tests::with_dense_selected_macro_fixture(
+            |store, owner, fixtures| {
+                let fixture = fixtures.last().unwrap();
+                let witness = ready(
+                    store
+                        .publish_selected_resolution_capsule(
+                            owner,
+                            &fixture.host_path,
+                            prepared_capsule(fixture),
+                            &CancellationToken::default(),
+                        )
+                        .unwrap(),
+                )
+                .into_parts()
+                .0;
+                let oid = witness.blob_oid().to_string();
+                let blob_id = witness.blob_id();
+                let workspace_id = owner.workspace_id.as_str().to_owned();
+                let (lang, generation, revision) = (owner.lang.clone(), owner.generation.0, owner.revision);
+                let state = |store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore| {
+                    store.conn.execute(|conn| {
+                        conn.query_row(
+                            "SELECT definition_inventory_state FROM workspace_file_versions WHERE rel_path = 'mounted/capsule.rs'",
+                            [],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .unwrap()
+                    })
+                };
+                store.conn.execute_fixture(move |conn| {
+                    let tx = conn.transaction().unwrap();
+                    tx.execute(
+                        "INSERT INTO workspace_file_versions(
+                           workspace_id, lang, generation, input_kind, rel_path, blob_oid,
+                           projection_digest, valid_from, file_present)
+                         VALUES(?1, ?2, ?3, 'source', 'mounted/capsule.rs', ?4, '0000000000000000000000000000000000000000000000000000000000000000', ?5, NULL)",
+                        rusqlite::params![workspace_id, lang, generation, oid, revision],
+                    )
+                    .unwrap();
+                    let version = tx.last_insert_rowid();
+                    brokk_bifrost_analysis::analyzer::store::replace_workspace_file_definition_inventory(
+                        &tx,
+                        version,
+                        &[],
+                        brokk_bifrost_analysis::analyzer::store::DefinitionInventoryState::ProjectionComplete,
+                    )
+                    .unwrap();
+                    tx.execute(
+                        "UPDATE resolution_fragment_interiors SET publication_state = 'building' WHERE blob_id = ?1",
+                        [blob_id],
+                    )
+                    .unwrap();
+                    tx.commit().unwrap();
+                });
+                assert_eq!(state(store).as_deref(), Some("blob_pending"));
+                ready(
+                    store
+                        .publish_selected_resolution_capsule(
+                            owner,
+                            &fixture.host_path,
+                            prepared_capsule(fixture),
+                            &CancellationToken::default(),
+                        )
+                        .unwrap(),
+                )
+                .into_parts();
+                assert_eq!(state(store).as_deref(), Some("names_withdrawn"));
+            },
+        );
+    }
+
     #[test]
     fn changed_complete_capsule_input_preserves_original_content_and_roots() {
         crate::engine_tests::rust_analyzer_store_resolution_operation_tests::rust_departing_root_tests::with_dense_selected_macro_fixture(

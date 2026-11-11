@@ -17,7 +17,9 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
-use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::kinds::{
+    NormalizedKind, Role, RoleCoverageGap, RoleCoverageGaps,
+};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
@@ -35,7 +37,7 @@ use brokk_bifrost_core::analyzer::structural::routes::{
     CuratedExportSurface, DEEP_IDENTITY_AXES, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{
-    ImplicitScopeBinder, RoleSink, StructuralSpec,
+    CoveredChildDisposition, ImplicitScopeBinder, RoleSink, StructuralSpec,
 };
 use brokk_bifrost_core::analyzer::tree_walk::last_named_child;
 use brokk_bifrost_core::analyzer::tree_walk::named_children_iter;
@@ -53,6 +55,50 @@ const JAVA_PATH_CHAIN: &[(&str, Option<&str>)] = &[
 pub struct JavaStructuralSpec;
 
 pub static JAVA_STRUCTURAL_SPEC: JavaStructuralSpec = JavaStructuralSpec;
+
+fn java_member_child<'tree>(child: Node<'tree>) -> CoveredChildDisposition<'tree> {
+    match child.kind() {
+        "method_declaration"
+        | "constructor_declaration"
+        | "compact_constructor_declaration"
+        | "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration" => CoveredChildDisposition::Include(child),
+        "field_declaration" | "constant_declaration" => {
+            let mut cursor = child.walk();
+            let mut declarators = Vec::new();
+            for declaration in child.named_children(&mut cursor) {
+                if declaration.kind() == "variable_declarator" {
+                    declarators.push(declaration);
+                } else if declaration.kind() == "variable_declaration" {
+                    let mut inner = declaration.walk();
+                    declarators.extend(
+                        declaration
+                            .named_children(&mut inner)
+                            .filter(|node| node.kind() == "variable_declarator"),
+                    );
+                }
+            }
+            if declarators.is_empty() || declarators.iter().any(|node| node.is_missing()) {
+                CoveredChildDisposition::Gap(RoleCoverageGap::Recovery)
+            } else {
+                CoveredChildDisposition::IncludeMany(declarators)
+            }
+        }
+        "static_initializer" | "block" => {
+            CoveredChildDisposition::Exclude("Java initializers are not declared members")
+        }
+        "enum_constant" | "annotation_type_element_declaration" => {
+            CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild)
+        }
+        _ if child.is_error() || child.is_missing() => {
+            CoveredChildDisposition::Gap(RoleCoverageGap::Recovery)
+        }
+        _ => CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild),
+    }
+}
 
 /// Whether Java syntax directly discards an invocation's normal result.
 ///
@@ -719,8 +765,87 @@ impl StructuralSpec for JavaStructuralSpec {
         Some(self)
     }
 
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded regex facts beyond the grammar kind table.
+        &[
+            NormalizedKind::Comparison,
+            NormalizedKind::Declaration,
+            NormalizedKind::RegexAlternation,
+            NormalizedKind::RegexAnchor,
+            NormalizedKind::RegexCharacterClass,
+            NormalizedKind::RegexCharacterRange,
+            NormalizedKind::RegexEscape,
+            NormalizedKind::RegexGroup,
+            NormalizedKind::RegexIncomplete,
+            NormalizedKind::RegexLiteral,
+            NormalizedKind::RegexPattern,
+            NormalizedKind::RegexQuantifier,
+            NormalizedKind::RegexRiskBackspaceEscape,
+            NormalizedKind::RegexRiskBadTag,
+            NormalizedKind::RegexRiskDuplicateClassCharacter,
+            NormalizedKind::RegexRiskExponential,
+            NormalizedKind::RegexRiskHostname,
+            NormalizedKind::RegexRiskIncompleteSpecialGroup,
+            NormalizedKind::RegexRiskPolynomial,
+            NormalizedKind::RegexRiskRange,
+            NormalizedKind::RegexRiskUnmatchableCaret,
+            NormalizedKind::RegexRiskUnmatchableDollar,
+            NormalizedKind::RegexSequence,
+            NormalizedKind::RegexWildcard,
+        ]
+    }
+
+    fn authoritative_modifier_kinds(&self) -> &'static [NormalizedKind] {
+        // Calls, identifiers, literals, comments, and recovery nodes cannot own declaration attributes.
+        // Declaration kinds below are audited against all grammar producers of their exact kind.
+        &[
+            NormalizedKind::Method,
+            NormalizedKind::Constructor,
+            NormalizedKind::Parameter,
+            NormalizedKind::Class,
+            NormalizedKind::Assignment,
+            NormalizedKind::Declaration,
+            NormalizedKind::Call,
+            NormalizedKind::Identifier,
+            NormalizedKind::StringLiteral,
+            NormalizedKind::NumericLiteral,
+            NormalizedKind::BooleanLiteral,
+            NormalizedKind::NullLiteral,
+            NormalizedKind::Comment,
+            NormalizedKind::SyntaxError,
+        ]
+    }
+
+    fn authoritative_type_kind_kinds(&self) -> &'static [NormalizedKind] {
+        // Calls, identifiers, literals, comments, and recovery nodes cannot own declaration attributes.
+        // Declaration kinds below are audited against all grammar producers of their exact kind.
+        &[
+            NormalizedKind::Class,
+            NormalizedKind::Call,
+            NormalizedKind::Identifier,
+            NormalizedKind::StringLiteral,
+            NormalizedKind::NumericLiteral,
+            NormalizedKind::BooleanLiteral,
+            NormalizedKind::NullLiteral,
+            NormalizedKind::Comment,
+            NormalizedKind::SyntaxError,
+        ]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         JAVA_KIND_TABLE
+    }
+
+    fn certified_role_kinds(&self, role: Role) -> &'static [NormalizedKind] {
+        match role {
+            Role::Parameters => &[
+                NormalizedKind::Method,
+                NormalizedKind::Constructor,
+                NormalizedKind::Lambda,
+            ],
+            Role::Members => &[NormalizedKind::Class],
+            _ => &[],
+        }
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
@@ -794,10 +919,6 @@ impl StructuralSpec for JavaStructuralSpec {
             "object_creation_expression" => Some("java_object_creation"),
             _ => None,
         }
-    }
-
-    fn supports_role(&self, role: Role) -> bool {
-        brokk_bifrost_core::analyzer::structural::spec::supports_role_without_kwarg(role)
     }
 
     /// Java spells its non-ordinary call shapes as distinct grammar nodes, so
@@ -905,6 +1026,111 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if matches!(
+            kind,
+            NormalizedKind::Method | NormalizedKind::Constructor | NormalizedKind::Lambda
+        ) {
+            let mut gaps = Vec::new();
+            if node.has_error() {
+                // A malformed body does not invalidate an intact written parameter list.
+                if node
+                    .child_by_field_name("parameters")
+                    .is_none_or(|list| list.has_error())
+                {
+                    gaps.push(RoleCoverageGap::Recovery);
+                }
+            }
+            if node.kind() == "compact_constructor_declaration" {
+                gaps.push(RoleCoverageGap::UnsupportedOrigin);
+            }
+            let container = node.child_by_field_name("parameters").ok_or_else(|| {
+                RoleCoverageGaps::new(if node.kind() == "compact_constructor_declaration" {
+                    RoleCoverageGap::UnsupportedOrigin
+                } else {
+                    RoleCoverageGap::Recovery
+                })
+            });
+            let mut header_cursor = node.walk();
+            if node.named_children(&mut header_cursor).any(|child| {
+                Some(child) != node.child_by_field_name("parameters")
+                    && Some(child) != node.child_by_field_name("body")
+                    && (child.is_missing() || child.has_error())
+            }) {
+                gaps.push(RoleCoverageGap::Recovery);
+            }
+            if container
+                .as_ref()
+                .is_ok_and(|list| matches!(list.kind(), "identifier" | "inferred_parameters"))
+            {
+                gaps.push(RoleCoverageGap::UnrepresentedChild);
+            }
+            sink.covered_list(Role::Parameters, container, &gaps, |child| {
+                match child.kind() {
+                    "formal_parameter" | "spread_parameter" => {
+                        CoveredChildDisposition::Include(child)
+                    }
+                    "receiver_parameter" => CoveredChildDisposition::Exclude(
+                        "Java receiver parameter names the receiver, not an invocation slot",
+                    ),
+                    "identifier" | "inferred_parameters" => {
+                        CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild)
+                    }
+                    _ => CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild),
+                }
+            });
+        }
+        if kind == NormalizedKind::Class {
+            let body = node.child_by_field_name("body");
+            let mut gaps = Vec::new();
+            let mut enum_members = Vec::new();
+            let mut header_cursor = node.walk();
+            if node
+                .named_children(&mut header_cursor)
+                .any(|child| Some(child) != body && (child.is_missing() || child.has_error()))
+            {
+                gaps.push(RoleCoverageGap::Recovery);
+            }
+            if let Some(body) = body {
+                if node.kind() == "enum_declaration" {
+                    // The helper flattens enum_body_declarations while preserving source order.
+                    for child in super::declarations::class_like_body_children_rev(body)
+                        .into_iter()
+                        .rev()
+                    {
+                        if child
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "enum_body_declarations")
+                        {
+                            match java_member_child(child) {
+                                CoveredChildDisposition::Include(target) => {
+                                    enum_members.push(target)
+                                }
+                                CoveredChildDisposition::IncludeMany(targets) => {
+                                    enum_members.extend(targets)
+                                }
+                                CoveredChildDisposition::Gap(gap) => gaps.push(gap),
+                                CoveredChildDisposition::Exclude(_) => {}
+                            }
+                        }
+                    }
+                }
+                if body.has_error() {
+                    gaps.push(RoleCoverageGap::Recovery);
+                }
+            }
+            let container = body.ok_or_else(|| RoleCoverageGaps::new(RoleCoverageGap::Recovery));
+            sink.covered_list(Role::Members, container, &gaps, |child| {
+                if child.kind() == "enum_body_declarations" {
+                    if enum_members.is_empty() {
+                        CoveredChildDisposition::Exclude("empty enum declaration section")
+                    } else {
+                        CoveredChildDisposition::IncludeMany(std::mem::take(&mut enum_members))
+                    }
+                } else {
+                    java_member_child(child)
+                }
+            });
+        }
         if let Some(role) = java_occurrence_role(node) {
             sink.occurrence_role(node, role);
         }
@@ -1116,6 +1342,32 @@ impl StructuralSpec for JavaStructuralSpec {
             NormalizedKind::Decorator => {
                 if let Some(name) = expression_name_node(node) {
                     sink.set_name(name);
+                }
+                if let Some(arguments) = node.child_by_field_name("arguments") {
+                    for argument in
+                        brokk_bifrost_core::analyzer::tree_walk::named_children_iter(arguments)
+                    {
+                        if !sink.should_continue() {
+                            break;
+                        }
+                        if argument.is_extra() {
+                            continue;
+                        }
+                        if argument.kind() == "element_value_pair" {
+                            if let (Some(key), Some(value)) = (
+                                argument.child_by_field_name("key"),
+                                argument.child_by_field_name("value"),
+                            ) {
+                                sink.kwarg(key, value);
+                            }
+                        } else {
+                            sink.argument_maybe_named(
+                                argument,
+                                expression_name_node(argument),
+                                false,
+                            );
+                        }
+                    }
                 }
             }
             NormalizedKind::Lambda => {

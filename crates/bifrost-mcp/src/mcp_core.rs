@@ -78,7 +78,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     descriptors.push(rename_symbol_descriptor());
     descriptors.push(tool_descriptor(
         "usage_graph",
-        "Build a rooted caller->callee reference graph. With paths, declarations in those files are roots and depth bounds outbound expansion; without paths, every workspace declaration is a root and depth 1 is the complete workspace graph. This is a batch analysis, not a normal file-localization lookup. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Edges reuse scan-usage resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
+        "Build a rooted caller->callee reference graph. With paths, declarations in those files are roots and depth bounds outbound expansion; without paths, every workspace declaration is a root and depth 1 is the complete workspace graph. This is a batch analysis, not a normal file-localization lookup. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Optional scope_obligations lists {code, message} assumptions relative to which the graph is complete; these are not incompleteness. Edges reuse scan-usage resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
         json!({
             "type": "object",
             "properties": {

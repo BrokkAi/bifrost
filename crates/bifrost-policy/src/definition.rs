@@ -86,6 +86,8 @@ pub struct PolicyDefinition {
     /// property of the analysis the policy declares, and stored here because
     /// it applies to every analysis kind.
     pub on_unknown: OnUnknownSpec,
+    /// A match policy may require an unbounded call closure to be proven.
+    pub completion_on_depth_bound_reached: bool,
     pub classification: Option<PolicyClassificationSpec>,
     pub report: PolicyReportOptions,
 }
@@ -159,6 +161,7 @@ pub struct TaintSetSegments {
     pub sources: &'static str,
     pub sinks: &'static str,
     pub sanitizers: &'static str,
+    pub barriers: &'static str,
     pub entry_points: &'static str,
     pub transforms: &'static str,
     pub external_models: &'static str,
@@ -169,16 +172,29 @@ pub const TAINT_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sources: "sources",
     sinks: "sinks",
     sanitizers: "sanitizers",
+    barriers: "barriers",
     entry_points: "entry_points",
     transforms: "transforms",
     external_models: "external_models",
     stores: "stores",
 };
 
+pub const WITHOUT_FLOW_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
+    sources: "without_flow/sources",
+    sinks: "sinks",
+    sanitizers: "without_flow/sanitizers",
+    barriers: "without_flow/barriers",
+    entry_points: "without_flow/entry_points",
+    transforms: "without_flow/transforms",
+    external_models: "without_flow/external_models",
+    stores: "without_flow/stores",
+};
+
 pub const FLOW_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
     sources: "origins",
     sinks: "observations",
     sanitizers: "kills",
+    barriers: "barriers",
     entry_points: "entry_points",
     transforms: "transforms",
     external_models: "external_models",
@@ -271,6 +287,9 @@ pub enum ResolvedPolicyLocatorRole {
 pub enum ResolvedPolicyLocatorKind {
     WorkspaceDeclaration,
     ActiveSemanticModel,
+    /// The known members of an overload family that no active model
+    /// certifies complete; its matches are possible (#10761).
+    PossibleSemanticModel,
 }
 
 /// The typed identity selected for one authored locator. Model provenance is
@@ -1500,6 +1519,8 @@ pub struct PolicyMetadata {
     pub description: Option<String>,
     pub help_uri: Option<String>,
     pub tags: Vec<String>,
+    /// A bounded authored explanation that this policy selects only proven rows.
+    pub proven_subset_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1741,6 +1762,41 @@ impl TaintThreatModel {
     }
 }
 
+/// A secondary taint configuration whose demand is supplied by the primary
+/// policy's exact sink binding. It deliberately has no sink selectors.
+#[derive(Debug, Clone)]
+pub struct TaintWithoutFlowSpec {
+    pub sources: TaintEndpointSet<TaintSourceSpec>,
+    pub sanitizers: TaintEndpointSet<TaintSanitizerSpec>,
+    pub barriers: TaintEndpointSet<TaintBarrierSpec>,
+    pub transforms: TaintEndpointSet<TaintTransformSpec>,
+    pub external_models: TaintEndpointSet<TaintExternalModelSpec>,
+}
+
+impl TaintWithoutFlowSpec {
+    /// Reuse the taint resolver with an empty sink set. The compiled B plan
+    /// receives A's bound sink group later, so B cannot select sinks itself.
+    pub(crate) fn as_taint_spec(&self, primary: &TaintPolicySpec) -> TaintPolicySpec {
+        TaintPolicySpec {
+            mode: primary.mode,
+            call_modeling: primary.call_modeling,
+            threat_models: primary.threat_models.clone(),
+            sources: self.sources.clone(),
+            sinks: TaintEndpointSet::default(),
+            sanitizers: self.sanitizers.clone(),
+            barriers: self.barriers.clone(),
+            entry_points: TaintEndpointSet::default(),
+            transforms: self.transforms.clone(),
+            external_models: self.external_models.clone(),
+            store_writes: Vec::new(),
+            store_reads: Vec::new(),
+            store_include_files: Vec::new(),
+            finding_combinations: Vec::new(),
+            without_flow: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TaintPolicySpec {
     pub mode: MayMode,
@@ -1764,6 +1820,7 @@ pub struct TaintPolicySpec {
     /// live beside those vectors instead of changing the solver-facing shape.
     pub store_include_files: Vec<EndpointSetFileRef>,
     pub finding_combinations: Vec<FindingCombinationSpec>,
+    pub without_flow: Option<Box<TaintWithoutFlowSpec>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2372,6 +2429,7 @@ impl InconclusivePolicy {
 
 #[derive(Debug, Clone)]
 pub struct TypestateAutomatonSpec {
+    pub event_set: Option<TypestateEventSetSpec>,
     pub states: Vec<TypestateStateId>,
     pub initial: TypestateStateId,
     pub accepting_states: Vec<TypestateStateId>,
@@ -2384,9 +2442,17 @@ pub struct TypestateAutomatonSpec {
 #[derive(Debug, Clone)]
 pub struct TypestateEventSpec {
     pub id: TypestateEventId,
+    pub semantic_effect: Option<String>,
     pub trigger: TypestateEventTrigger,
     pub applies_to_subjects: Option<EndpointPredicate>,
     pub supersedes: Vec<TypestateEventId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypestateEventSetSpec {
+    pub name: String,
+    pub version: u32,
+    pub effects: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

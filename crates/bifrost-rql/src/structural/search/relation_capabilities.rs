@@ -26,6 +26,28 @@ pub(super) fn preflight(
     preflight_plan(plan, files, workspace, &mut reported, diagnostics);
 }
 
+/// Only these steps need dialect coverage before any seed produces rows.
+pub(super) fn needs_file_inventory(plan: &CodeQueryPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        if plan.steps.iter().any(|step| {
+            matches!(
+                step,
+                QueryStep::StatementFacts(_)
+                    | QueryStep::AssignmentRelations(_)
+                    | QueryStep::BranchRelations(_)
+                    | QueryStep::FailureHandlerState
+                    | QueryStep::NilnessOperations
+                    | QueryStep::SwitchCoverage
+            )
+        }) {
+            return true;
+        }
+        pending.extend(plan.source.child_plans());
+    }
+    false
+}
+
 fn preflight_plan(
     plan: &CodeQueryPlan,
     files: &[ProjectFile],

@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod js_ts_extraction_tests {
-    use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::QueryScope;
 
     use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
@@ -61,16 +60,25 @@ mod js_ts_extraction_tests {
         ];
 
         for case in cases {
-            let mut project = InlineTestProject::with_language(case.language);
-            for (path, contents) in case.files {
-                project = project.file(*path, *contents);
+            let mut fixture =
+                brokk_bifrost_analysis::test_support::AnalyzerFixture::new_for_language(
+                    case.language,
+                    case.files,
+                );
+            if case.language == Language::Python {
+                crate::engine_tests::python_analyzer_semantic_workspace_oracle_dispatch::runtime_fixture::activate(
+                    &mut fixture, case.caller, &["httpx"], "get", &["url"],
+                );
             }
-            let project = project.build();
-            let workspace = project.workspace_analyzer(
-                brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+            let analyzer = fixture.analyzer.analyzer();
+            let file = brokk_bifrost_core::analyzer::model::ProjectFile::new(
+                analyzer.project().root(),
+                if case.language == Language::Python {
+                    "src/app.py"
+                } else {
+                    case.caller
+                },
             );
-            let analyzer = workspace.analyzer();
-            let file = project.file(case.caller);
             let source = Arc::<str>::from(
                 case.files
                     .iter()
@@ -109,6 +117,9 @@ mod js_ts_extraction_tests {
                         )
                     });
                     assert_eq!(proof.canonical_callee(), canonical, "{outcome:?}");
+                    if case.language == Language::Python {
+                        assert!(proof.python_runtime_artifact().is_some(), "{outcome:?}");
+                    }
                     assert_ne!(
                         outcome.call_application,
                         CallApplicationKind::Unknown,

@@ -235,7 +235,7 @@ mod python_tests {
                 );
             }
         }
-        store.conn.execute(|conn| {
+        store.conn.execute_fixture(|conn| {
         let costs=conn.prepare("SELECT marker.logical_rows,marker.payload_bytes,cost.logical_rows,cost.payload_bytes FROM source_python_manifests marker JOIN source_python_costs cost ON cost.blob_id=marker.blob_id").unwrap()
             .query_map([],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         assert!(costs.iter().all(|(a,b,c,d)|(a,b)==(c,d)),"{costs:?}");

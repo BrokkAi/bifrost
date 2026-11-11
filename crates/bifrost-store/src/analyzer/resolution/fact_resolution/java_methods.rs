@@ -795,6 +795,8 @@ impl FactEvaluation<'_, '_> {
             unreachable!("two parameter lookups were collected");
         };
         if left.lookup_decisions_equal_with_poll(right, &mut || self.poll_cancelled()) != Some(true)
+            || self.poll_cancelled()
+            || left.lexical_choice_coverage != right.lexical_choice_coverage
         {
             return Ok(false);
         }

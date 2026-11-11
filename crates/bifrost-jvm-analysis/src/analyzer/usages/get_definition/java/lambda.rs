@@ -206,6 +206,7 @@ pub fn java_expression_lambda_result_use(
                     TypeRef::Declared { id, .. } => models.symbols_with_id(id),
                     _ => return None,
                 };
+                if matches!(candidates.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) { return None; }
                 let [target] = candidates.records.as_slice() else {
                     return None;
                 };
@@ -357,10 +358,12 @@ pub fn java_expression_lambda_result_use(
     })();
     match session.finish(resolved) {
         BoundedResolution::Complete { value, work } => {
+            // Resolution rounds are iterations, not lambda lookup expansion.
             let spent = work
                 .setup_nodes
                 .saturating_add(work.scope_nodes)
-                .saturating_add(work.summary_expansions);
+                .saturating_add(work.summary_expansions)
+                .saturating_add(work.hierarchy_order_steps);
             let Some(remaining) = remaining_work.checked_sub(spent) else {
                 *remaining_work = 0;
                 return None;
@@ -368,7 +371,9 @@ pub fn java_expression_lambda_result_use(
             *remaining_work = remaining;
             value
         }
-        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
+        BoundedResolution::Exceeded { .. }
+        | BoundedResolution::Unavailable { .. }
+        | BoundedResolution::Cancelled { .. } => {
             *remaining_work = 0;
             None
         }
@@ -387,11 +392,18 @@ fn selected_symbol(
     let JvmExternalDeclarationSource::SemanticPack {
         pack_id,
         declaration_id,
+        ..
     } = ty.source()
     else {
         return None;
     };
     let found = models.symbols_with_id(declaration_id);
+    if matches!(
+        found.disposition,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return None;
+    }
     let [symbol] = found.records.as_slice() else {
         return None;
     };
@@ -623,6 +635,12 @@ fn source_functional_result_use(
         .find(|child| child.kind() == "extends_interfaces");
     let body = owner.child_by_field_name("body")?;
     let object_members = models.members_of(&object.id);
+    if matches!(
+        object_members.disposition,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return None;
+    }
     let mut selected = None;
     let mut has_instance_method = false;
     let mut cursor = body.walk();

@@ -131,6 +131,9 @@ const SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE: u64 = 456;
 
 const MAX_FINDINGS: usize = 1_000;
 
+/// Maximum retained subject verdicts, with undecided candidates retained first.
+pub const MAX_SUBJECT_VERDICTS: usize = 1_000;
+
 // The findings lane is a floor as well, for the same reason as the scan lanes
 // (#1771) and the semantic lanes (#1936), and it is the one output lane that is
 // deliberately request-wide rather than per-batch (#2208): it caps how much one

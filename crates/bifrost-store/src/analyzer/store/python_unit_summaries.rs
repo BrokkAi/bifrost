@@ -1,9 +1,9 @@
+//! Production Python environment summaries. Reconciliation stages file-local
+//! inputs in SQL and persists outputs without retaining a workspace index.
 // Python-only summaries use the empty parse variant.
-//! Dormant Python environment summaries. The unstable native validation entry
-//! stages file-local inputs in SQL; only the shared reconciler persists outputs.
-//! No production parser, reader or workspace-build hook invokes this module.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,6 +13,7 @@ use crate::hash::{HashMap, HashSet};
 
 use super::AnalyzerStore;
 use super::Result;
+#[cfg(any(test, feature = "test-support"))]
 use super::WorkspaceId;
 use super::WorkspaceSnapshotId;
 use super::unit_summaries::{
@@ -21,13 +22,14 @@ use super::unit_summaries::{
 };
 use crate::CancellationToken;
 
+#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::Language;
 use brokk_bifrost_core::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Authority for placement, separate from execution or installed-provider proof.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PythonSummaryAuthority {
     /// Selected Project packaging and package-marker evidence; order is unknown.
     Workspace,
@@ -48,7 +50,7 @@ impl PythonSummaryAuthority {
 }
 
 /// Runtime and typing inventories never stand in for one another.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PythonSummaryObservation {
     Runtime,
     Typing,
@@ -63,7 +65,7 @@ impl PythonSummaryObservation {
 }
 
 /// Selected inputs only. Roots are configuration, not a retained module index.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PythonSummaryProfile {
     pub authority: PythonSummaryAuthority,
     pub observation: PythonSummaryObservation,
@@ -143,6 +145,7 @@ pub(crate) const STAGING: &str = "
 CREATE TEMP TABLE IF NOT EXISTS py_env_files(
  rel_path TEXT PRIMARY KEY, blob_id INTEGER NOT NULL, blob_oid TEXT NOT NULL, scope INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE TEMP TABLE IF NOT EXISTS py_env_declared_roots(rel_path TEXT PRIMARY KEY, root_path TEXT NOT NULL) WITHOUT ROWID;
 CREATE TEMP TABLE IF NOT EXISTS py_env_roots(slot INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
 CREATE TEMP TABLE IF NOT EXISTS py_env_candidates(
  container TEXT PRIMARY KEY, module TEXT NOT NULL, parent TEXT NOT NULL, depth INTEGER NOT NULL,
@@ -152,6 +155,11 @@ CREATE TEMP TABLE IF NOT EXISTS py_env_candidates(
 CREATE INDEX IF NOT EXISTS temp.py_env_candidates_name ON py_env_candidates(module,root,kind);
 CREATE INDEX IF NOT EXISTS temp.py_env_candidates_path ON py_env_candidates(rel_path,blob_id);
 CREATE INDEX IF NOT EXISTS temp.py_env_candidates_parent ON py_env_candidates(parent,state,root);
+CREATE TEMP TABLE IF NOT EXISTS py_env_spellings(
+ module TEXT NOT NULL, source_root TEXT NOT NULL, target TEXT NOT NULL, admitted INTEGER NOT NULL,
+ PRIMARY KEY(module,source_root,target)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS temp.py_env_spellings_target ON py_env_spellings(target,module,source_root);
 CREATE TEMP TABLE IF NOT EXISTS py_env_imports(
  rel_path TEXT NOT NULL, site INTEGER NOT NULL, level INTEGER NOT NULL, form TEXT NOT NULL,
  requested TEXT NOT NULL, bound TEXT NOT NULL, PRIMARY KEY(rel_path,site)
@@ -179,7 +187,7 @@ CREATE TEMP TABLE IF NOT EXISTS py_env_routes(
 ) WITHOUT ROWID;";
 const CLEAR: &str = "DELETE FROM temp.py_env_route_inputs; DELETE FROM temp.py_env_routes; DELETE FROM temp.py_env_names;
 DELETE FROM temp.py_env_surfaces; DELETE FROM temp.py_env_segments; DELETE FROM temp.py_env_imports;
-DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM temp.py_env_files;";
+DELETE FROM temp.py_env_declared_roots; DELETE FROM temp.py_env_spellings; DELETE FROM temp.py_env_candidates; DELETE FROM temp.py_env_roots; DELETE FROM temp.py_env_files;";
 
 pub(crate) const SELECT_FILES: &str = "SELECT f.rel_path,f.blob_oid,b.id,s.format
 FROM workspace_file_versions AS f
@@ -347,7 +355,11 @@ impl PythonEnvironmentSnapshotInputs {
             }
             let path: String = row.get(0)?;
             let kind: String = row.get(1)?;
-            if kind == "configuration" {
+            if kind == "configuration"
+                && Path::new(&path)
+                    .file_name()
+                    .is_none_or(|name| name != "__init__.py")
+            {
                 let oid: String = row.get(2)?;
                 let bytes: Option<Vec<u8>> = row.get(3)?;
                 let bytes = bytes.ok_or_else(|| {
@@ -393,11 +405,11 @@ impl AnalyzerStore {
             staging: None,
         };
         let conn = self.read_conn()?;
-        let epoch: String = conn.query_row(
-            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
-            [],
-            |row| row.get(0),
-        )?;
+        let epoch: String = conn
+            .prepare_cached(
+                "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
+            )?
+            .query_row([], |row| row.get(0))?;
         Ok(language
             .live_summary(&conn, snapshot, &epoch, &unit_key())?
             .map(|(id, _)| id))
@@ -413,7 +425,9 @@ impl AnalyzerStore {
         cancellation: &CancellationToken,
     ) -> Result<PythonSummaryReceipt>
     where
-        F: Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PathBuf> + Send + 'static,
+        F: Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PythonWorkspaceRoot>
+            + Send
+            + 'static,
     {
         profile.validate();
         let started = Instant::now();
@@ -453,11 +467,13 @@ impl AnalyzerStore {
 
 /// Explicit native test path. All source metadata is TEMP and must be restaged
 /// after reconcile; persisted summary outputs can be read without that metadata.
+#[cfg(any(test, feature = "test-support"))]
 pub struct PythonEnvironmentPublication {
     pub store: AnalyzerStore,
     pub snapshot: WorkspaceSnapshotId,
     pub profile: PythonSummaryProfile,
 }
+#[cfg(any(test, feature = "test-support"))]
 impl PythonEnvironmentPublication {
     pub fn open(
         path: &Path,
@@ -681,7 +697,15 @@ fn place_file(
     Ok(())
 }
 
-type WorkspaceRoot = dyn Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PathBuf> + Send;
+/// One file's canonical placement and the manifest authority that selected it.
+#[derive(Debug)]
+pub struct PythonWorkspaceRoot {
+    pub canonical: PathBuf,
+    pub declared: Option<PathBuf>,
+}
+
+type WorkspaceRoot =
+    dyn Fn(&Path, &PythonEnvironmentSnapshotInputs) -> Result<PythonWorkspaceRoot> + Send;
 
 struct PythonEnvironmentStaging {
     workspace_root: Box<WorkspaceRoot>,
@@ -692,7 +716,7 @@ struct PythonUnitSummaries {
     profile: PythonSummaryProfile,
     staging: Option<PythonEnvironmentStaging>,
 }
-const LIVE: &str = unit_summaries::live_summary_select!("?8");
+pub(super) const LIVE: &str = unit_summaries::live_summary_select!("?8");
 impl UnitSummaryLanguage for PythonUnitSummaries {
     fn lang(&self) -> &'static str {
         "python"
@@ -714,8 +738,8 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         unit: &[u8; 32],
     ) -> Result<Option<(i64, Vec<u8>)>> {
         Ok(conn
+            .prepare_cached(LIVE)?
             .query_row(
-                LIVE,
                 params![
                     snapshot.workspace_id.as_str(),
                     "python",
@@ -750,6 +774,8 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         ])?;
         let mut roots_batch = StagingRows::new(stage_roots_prefix(), STAGE_ROOT_ROW);
         let mut candidates = StagingRows::new(stage_candidates_prefix(), STAGE_CANDIDATE_ROW);
+        let mut declared_roots =
+            StagingRows::new("INSERT INTO temp.py_env_declared_roots VALUES", "(?,?)");
         while let Some(row) = rows.next()? {
             check_cancelled(&staging.cancellation)?;
             let path: String = row.get(0)?;
@@ -764,7 +790,15 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
                 )));
             };
             let roots = if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
-                vec![(staging.workspace_root)(Path::new(&path), &inputs)?]
+                let selection = (staging.workspace_root)(Path::new(&path), &inputs)?;
+                if let Some(root) = selection.declared {
+                    declared_roots.push(
+                        conn,
+                        (path.clone(), portable(&root)),
+                        &staging.cancellation,
+                    )?;
+                }
+                vec![selection.canonical]
             } else {
                 self.profile.roots.clone()
             };
@@ -779,16 +813,14 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
             )?;
         }
         check_cancelled(&staging.cancellation)?;
-        conn.execute(
-            STAGE_FILES,
-            params![
-                snapshot.workspace_id.as_str(),
-                snapshot.generation.get(),
-                snapshot.revision
-            ],
-        )?;
+        conn.prepare_cached(STAGE_FILES)?.execute(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.get(),
+            snapshot.revision
+        ])?;
         roots_batch.flush(conn, &staging.cancellation)?;
         candidates.flush(conn, &staging.cancellation)?;
+        declared_roots.flush(conn, &staging.cancellation)?;
         for sql in [
             STAGE_IMPORTS,
             STAGE_SEGMENTS,
@@ -798,37 +830,43 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
             STAGE_WILDCARD_NAMES,
         ] {
             check_cancelled(&staging.cancellation)?;
-            conn.execute(sql, [])?;
+            conn.prepare_cached(sql)?.execute([])?;
         }
         check_cancelled(&staging.cancellation)?;
-        let members: i64 = conn.query_row("SELECT count(*) FROM temp.py_env_files", [], |row| {
-            row.get(0)
-        })?;
+        let members: i64 = conn
+            .prepare_cached("SELECT count(*) FROM temp.py_env_files")?
+            .query_row([], |row| row.get(0))?;
         if members == 0 {
             return Ok(());
         }
-        conn.execute("INSERT INTO temp.unit_summary_work VALUES(1)", [])?;
+        conn.prepare_cached("INSERT INTO temp.unit_summary_work VALUES(1)")?
+            .execute([])?;
         // Component traversal is a Python filesystem placement rule. The shared
         // summary driver still owns recursion scheduling, publication and reuse.
         // Only the current depth's query rows live on the Rust heap.
-        let max_depth: i64 = conn.query_row(
-            "SELECT coalesce(max(depth),0) FROM temp.py_env_candidates",
-            [],
-            |row| row.get(0),
-        )?;
+        let max_depth: i64 = conn
+            .prepare_cached("SELECT coalesce(max(depth),0) FROM temp.py_env_candidates")?
+            .query_row([], |row| row.get(0))?;
         for depth in 1..=max_depth {
             // A child is admitted only by selected regular/namespace parents
             // from the SAME root. A module file is not a package search path.
-            conn.execute("UPDATE temp.py_env_candidates AS child SET state='alternative' WHERE depth=?1 AND (parent='' OR EXISTS(SELECT 1 FROM temp.py_env_candidates AS parent WHERE parent.module=child.parent AND parent.root=child.root AND parent.kind IN ('package','namespace') AND parent.state IN ('selected','alternative')))", [depth])?;
+            conn.prepare_cached("UPDATE temp.py_env_candidates AS child SET state='alternative' WHERE depth=?1 AND (parent='' OR EXISTS(SELECT 1 FROM temp.py_env_candidates AS parent WHERE parent.module=child.parent AND parent.root=child.root AND parent.kind IN ('package','namespace') AND parent.state IN ('selected','alternative')))")?.execute( [depth])?;
             // In one root, a regular package wins over its same-name module and
             // provisional namespace portion; a module wins over namespace.
-            conn.execute("UPDATE temp.py_env_candidates AS candidate SET state='shadowed' WHERE depth=?1 AND state='alternative' AND EXISTS(SELECT 1 FROM temp.py_env_candidates AS winner WHERE winner.module=candidate.module AND winner.root=candidate.root AND winner.state='alternative' AND (CASE winner.kind WHEN 'package' THEN 0 WHEN 'module' THEN 1 ELSE 2 END)<(CASE candidate.kind WHEN 'package' THEN 0 WHEN 'module' THEN 1 ELSE 2 END))", [depth])?;
+            conn.prepare_cached("UPDATE temp.py_env_candidates AS candidate SET state='shadowed' WHERE depth=?1 AND state='alternative' AND EXISTS(SELECT 1 FROM temp.py_env_candidates AS winner WHERE winner.module=candidate.module AND winner.root=candidate.root AND winner.state='alternative' AND (CASE winner.kind WHEN 'package' THEN 0 WHEN 'module' THEN 1 ELSE 2 END)<(CASE candidate.kind WHEN 'package' THEN 0 WHEN 'module' THEN 1 ELSE 2 END))")?.execute( [depth])?;
             if self.profile.ordered {
-                conn.execute("UPDATE temp.py_env_candidates AS candidate SET state='shadowed' WHERE depth=?1 AND state='alternative' AND EXISTS(SELECT 1 FROM temp.py_env_candidates AS winner WHERE winner.module=candidate.module AND winner.state='alternative' AND winner.kind<>'namespace' AND (candidate.kind='namespace' OR winner.root<candidate.root))", [depth])?;
+                conn.prepare_cached("UPDATE temp.py_env_candidates AS candidate SET state='shadowed' WHERE depth=?1 AND state='alternative' AND EXISTS(SELECT 1 FROM temp.py_env_candidates AS winner WHERE winner.module=candidate.module AND winner.state='alternative' AND winner.kind<>'namespace' AND (candidate.kind='namespace' OR winner.root<candidate.root))")?.execute( [depth])?;
             }
-            conn.execute("UPDATE temp.py_env_candidates AS candidate SET state='selected' WHERE depth=?1 AND state='alternative' AND (parent='' OR EXISTS(SELECT 1 FROM temp.py_env_candidates AS enclosing WHERE enclosing.module=candidate.parent AND enclosing.root=candidate.root AND enclosing.state='selected')) AND (NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS other WHERE other.module=candidate.module AND other.state='alternative' AND other.container<>candidate.container) OR NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS concrete WHERE concrete.module=candidate.module AND concrete.state='alternative' AND concrete.kind<>'namespace'))", [depth])?;
+            conn.prepare_cached("UPDATE temp.py_env_candidates AS candidate SET state='selected' WHERE depth=?1 AND state='alternative' AND (parent='' OR EXISTS(SELECT 1 FROM temp.py_env_candidates AS enclosing WHERE enclosing.module=candidate.parent AND enclosing.root=candidate.root AND enclosing.state='selected')) AND (NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS other WHERE other.module=candidate.module AND other.state='alternative' AND other.container<>candidate.container) OR NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS concrete WHERE concrete.module=candidate.module AND concrete.state='alternative' AND concrete.kind<>'namespace'))")?.execute( [depth])?;
+        }
+        if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
+            stage_spellings(conn, &inputs, &staging.cancellation)?;
         }
         build_routes(conn, &staging.cancellation)?;
+        if matches!(self.profile.authority, PythonSummaryAuthority::Workspace) {
+            narrow_workspace_routes(conn, &staging.cancellation)?;
+            add_spelling_routes(conn, &staging.cancellation)?;
+        }
         Ok(())
     }
     fn clear_stage(&self, conn: &Connection) -> Result<()> {
@@ -842,7 +880,9 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         unit_id: i64,
     ) -> Result<UnitInputs> {
         let members = conn
-            .prepare("SELECT blob_id,blob_oid,rel_path FROM temp.py_env_files ORDER BY rel_path")?
+            .prepare_cached(
+                "SELECT blob_id,blob_oid,rel_path FROM temp.py_env_files ORDER BY rel_path",
+            )?
             .query_map([], |row| {
                 Ok(UnitMember {
                     blob_id: row.get(0)?,
@@ -856,8 +896,9 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
             path: String::new(),
             parent_path: None,
         }];
-        let mut statement = conn
-            .prepare("SELECT DISTINCT module,parent FROM temp.py_env_candidates ORDER BY module")?;
+        let mut statement = conn.prepare_cached(
+            "SELECT DISTINCT module,parent FROM temp.py_env_candidates ORDER BY module",
+        )?;
         for row in statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })? {
@@ -873,7 +914,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         }
         let mut placements = Vec::new();
         let ordinals = super::unit_summaries::member_ordinals(&members);
-        let mut statement=conn.prepare("SELECT container,module,blob_id,rel_path,scope FROM temp.py_env_candidates ORDER BY container")?;
+        let mut statement=conn.prepare_cached("SELECT container,module,blob_id,rel_path,scope FROM temp.py_env_candidates ORDER BY container")?;
         for row in statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -933,7 +974,7 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
     ) -> Result<UnitOutputs> {
         let mut gaps = vec![UnitGap { kind:"python_environment_open",subject:"provider/activation/package_path".into(),
             detail:"{\"activation\":\"unproven\",\"package_path\":\"dynamic_uninspected\",\"external_providers\":\"unacquired\"}".into() }];
-        let mut statement=conn.prepare("SELECT rel_path FROM temp.py_env_files AS files WHERE NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS provider WHERE provider.blob_id IS NOT NULL AND provider.rel_path=files.rel_path) ORDER BY rel_path")?;
+        let mut statement=conn.prepare_cached("SELECT rel_path FROM temp.py_env_files AS files WHERE NOT EXISTS(SELECT 1 FROM temp.py_env_candidates AS provider WHERE provider.blob_id IS NOT NULL AND provider.rel_path=files.rel_path) ORDER BY rel_path")?;
         for row in statement.query_map([], |row| row.get::<_, String>(0))? {
             gaps.push(UnitGap {
                 kind: "python_unknown_placement",
@@ -964,30 +1005,29 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
     ) -> Result<usize> {
         let before = conn.total_changes();
         // Replacement of a corrupt/incomplete shared summary may reuse its id.
-        conn.execute(
-            "DELETE FROM python_unit_summary_roots WHERE summary_id=?1",
-            [summary],
-        )?;
-        let mut roots = conn.prepare("SELECT slot,path FROM temp.py_env_roots ORDER BY slot")?;
+        conn.prepare_cached("DELETE FROM python_unit_summary_roots WHERE summary_id=?1")?
+            .execute([summary])?;
+        let mut roots =
+            conn.prepare_cached("SELECT slot,path FROM temp.py_env_roots ORDER BY slot")?;
         for row in roots.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })? {
             let (slot, path) = row?;
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO python_unit_summary_roots VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![
-                    summary,
-                    slot,
-                    path,
-                    self.profile.authority.label(),
-                    self.profile.ordered,
-                    self.profile.observation.label(),
-                    self.profile.target_digest.as_slice()
-                ],
-            )?;
+            )?
+            .execute(params![
+                summary,
+                slot,
+                path,
+                self.profile.authority.label(),
+                self.profile.ordered,
+                self.profile.observation.label(),
+                self.profile.target_digest.as_slice()
+            ])?;
         }
         let ordinals = super::unit_summaries::member_ordinals(&unit.members);
-        let mut statement=conn.prepare("SELECT container,module,parent,root,kind,state,rel_path,blob_id,provider_digest FROM temp.py_env_candidates ORDER BY container")?;
+        let mut statement=conn.prepare_cached("SELECT container,module,parent,root,kind,state,rel_path,blob_id,provider_digest FROM temp.py_env_candidates ORDER BY container")?;
         for row in statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1003,18 +1043,19 @@ impl UnitSummaryLanguage for PythonUnitSummaries {
         })? {
             let (container, module, parent, root, kind, state, path, blob, digest) = row?;
             let ordinal = blob.map(|blob| ordinals[&(blob, path.as_str(), "python")] as i64);
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO python_unit_summary_providers VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![
-                    summary, container, module, parent, root, kind, state, path, ordinal, digest
-                ],
-            )?;
+            )?
+            .execute(params![
+                summary, container, module, parent, root, kind, state, path, ordinal, digest
+            ])?;
         }
+        conn.prepare_cached("INSERT INTO python_unit_summary_spellings SELECT ?1,module,source_root,target,admitted FROM temp.py_env_spellings")?.execute( [summary])?;
         for (ordinal, member) in unit.members.iter().enumerate() {
-            conn.execute("INSERT INTO python_unit_summary_imports SELECT ?1,?2,site,importer,target,module,level,requested,bound,form,state FROM temp.py_env_routes WHERE rel_path=?3", params![summary,ordinal as i64,member.rel_path])?;
+            conn.prepare_cached("INSERT INTO python_unit_summary_imports SELECT ?1,?2,site,importer,target,module,level,requested,bound,form,state FROM temp.py_env_routes WHERE rel_path=?3")?.execute( params![summary,ordinal as i64,member.rel_path])?;
         }
-        conn.execute("INSERT INTO python_unit_summary_surfaces SELECT ?1,providers.container,surfaces.surface,surfaces.policy FROM temp.py_env_candidates AS providers JOIN temp.py_env_surfaces AS surfaces ON surfaces.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL", [summary])?;
-        conn.execute("INSERT INTO python_unit_summary_export_names SELECT ?1,providers.container,names.surface,names.name,names.site FROM temp.py_env_candidates AS providers JOIN temp.py_env_names AS names ON names.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL", [summary])?;
+        conn.prepare_cached("INSERT INTO python_unit_summary_surfaces SELECT ?1,providers.container,surfaces.surface,surfaces.policy FROM temp.py_env_candidates AS providers JOIN temp.py_env_surfaces AS surfaces ON surfaces.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL")?.execute( [summary])?;
+        conn.prepare_cached("INSERT INTO python_unit_summary_export_names SELECT ?1,providers.container,names.surface,names.name,names.site FROM temp.py_env_candidates AS providers JOIN temp.py_env_names AS names ON names.rel_path=providers.rel_path WHERE providers.blob_id IS NOT NULL")?.execute( [summary])?;
         Ok((conn.total_changes() - before) as usize)
     }
 }
@@ -1024,6 +1065,145 @@ fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
         return Err(StoreError::cancelled(
             python_binding_rows::ENVIRONMENT_SOURCE_CANCELLED,
         ));
+    }
+    Ok(())
+}
+
+// One selected file's path and one candidate's package chain at a time. Lookup
+// spellings are rows; they never become additional providers or placements.
+fn stage_spellings(
+    conn: &Connection,
+    inputs: &PythonEnvironmentSnapshotInputs,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut providers = conn.prepare_cached("SELECT provider.container,provider.rel_path,declared.root_path FROM temp.py_env_candidates provider LEFT JOIN temp.py_env_declared_roots declared ON declared.rel_path=provider.rel_path WHERE provider.blob_id IS NOT NULL ORDER BY provider.container")?;
+    let mut rows = providers.query([])?;
+    let mut spellings = StagingRows::new(
+        "INSERT OR IGNORE INTO temp.py_env_spellings VALUES",
+        "(?,?,?,?)",
+    );
+    while let Some(row) = rows.next()? {
+        check_cancelled(cancellation)?;
+        let target: String = row.get(0)?;
+        let path: String = row.get(1)?;
+        let path = Path::new(&path);
+        let parent = path.parent().expect("source parent");
+        let mut components = parent
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if path.file_stem().is_none_or(|stem| stem != "__init__") {
+            components.push(
+                path.file_stem()
+                    .expect("Python stem")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        let declared = row.get::<_, Option<String>>(2)?.map(PathBuf::from);
+        for dropped in 1..components.len() {
+            let root = path.components().take(dropped).collect::<PathBuf>();
+            let module = components[dropped..].join(".");
+            let mut chain = true;
+            let mut directory = Some(parent);
+            while let Some(current) = directory {
+                if !inputs.contains(&current.join("__init__.py")) {
+                    chain = false;
+                    break;
+                }
+                if current == root {
+                    break;
+                }
+                directory = current.parent();
+            }
+            let admitted = if let Some(declared) = &declared {
+                if declared == &root {
+                    true
+                } else if let Ok(implied) = root.strip_prefix(declared) {
+                    let repeated = implied
+                        .components()
+                        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    let repeated_shape =
+                        !repeated.is_empty() && components[dropped..].starts_with(&repeated);
+                    if chain
+                        && repeated_shape
+                        && root.file_name().is_some_and(|name| {
+                            inputs.contains(&root.join(name).join("__init__.py"))
+                        })
+                    {
+                        let expected = root.join(implied);
+                        let mut statement = conn.prepare_cached("SELECT extension.directory FROM temp.py_env_files marker JOIN python_package_path_extensions extension ON extension.blob_id=marker.blob_id WHERE marker.rel_path=?1 ORDER BY extension.ordinal")?;
+                        let mut extensions =
+                            statement.query([portable(&root.join("__init__.py"))])?;
+                        let mut retained = false;
+                        while let Some(extension) = extensions.next()? {
+                            check_cancelled(cancellation)?;
+                            let relative: String = extension.get(0)?;
+                            if brokk_bifrost_core::path_utils::normalize_relative_path_from(
+                                &root,
+                                Path::new(&relative),
+                            )
+                            .as_ref()
+                                == Some(&expected)
+                            {
+                                retained = true;
+                                break;
+                            }
+                        }
+                        retained && inputs.contains(&expected.join("__init__.py"))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                chain
+            };
+            spellings.push(
+                conn,
+                (module, portable(&root), target.clone(), admitted),
+                cancellation,
+            )?;
+        }
+    }
+    spellings.flush(conn, cancellation)
+}
+
+// Exact routes have already been narrowed by canonical root. Only an exact
+// miss can recover through aliases, narrowed by their own implied roots.
+fn add_spelling_routes(conn: &Connection, cancellation: &CancellationToken) -> Result<()> {
+    let mut contexts = conn.prepare_cached("SELECT context.rel_path,context.site,context.importer,context.module FROM temp.py_env_route_inputs context JOIN temp.py_env_imports authored ON authored.rel_path=context.rel_path AND authored.site=context.site WHERE context.valid AND authored.level=0 AND instr(context.module,'.')>0 AND NOT EXISTS(SELECT 1 FROM temp.py_env_routes exact WHERE exact.rel_path=context.rel_path AND exact.site=context.site AND exact.importer=context.importer AND exact.target<>'')")?;
+    let mut rows = contexts.query([])?;
+    while let Some(row) = rows.next()? {
+        check_cancelled(cancellation)?;
+        let path: String = row.get(0)?;
+        let site: i64 = row.get(1)?;
+        let importer: String = row.get(2)?;
+        let module: String = row.get(3)?;
+        let mut candidates = conn
+            .prepare_cached(
+                "SELECT target,source_root,admitted FROM temp.py_env_spellings WHERE module=?1",
+            )?
+            .query_map([&module], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        brokk_bifrost_python::graph_support::retain_nearest_owning_root(
+            Path::new(&path),
+            &mut candidates,
+            |candidate| candidate.1.clone(),
+        );
+        candidates.retain(|candidate| candidate.2);
+        let [candidate] = candidates.as_slice() else {
+            continue;
+        };
+        conn.prepare_cached("UPDATE temp.py_env_routes SET target=?4,state='activation_open' WHERE rel_path=?1 AND site=?2 AND importer=?3 AND target=''")?.execute( params![path,site,importer,candidate.0])?;
     }
     Ok(())
 }
@@ -1073,10 +1253,62 @@ fn build_routes(conn: &Connection, cancellation: &CancellationToken) -> Result<(
     check_cancelled(cancellation)?;
     contexts.flush(conn, cancellation)?;
     check_cancelled(cancellation)?;
-    conn.execute(STAGE_ROUTES, [])?;
+    conn.prepare_cached(STAGE_ROUTES)?.execute([])?;
     check_cancelled(cancellation)?;
-    conn.execute(STAGE_UNPLACED_ROUTES, [])?;
+    conn.prepare_cached(STAGE_UNPLACED_ROUTES)?.execute([])?;
     check_cancelled(cancellation)?;
+    Ok(())
+}
+
+// Global providers stay plural. Each import selects its owning source root,
+// leaving genuine cross-root imports ambiguous when no candidate root owns it.
+fn narrow_workspace_routes(conn: &Connection, cancellation: &CancellationToken) -> Result<()> {
+    let mut contexts = conn.prepare_cached(
+        "SELECT rel_path,site,importer FROM temp.py_env_route_inputs WHERE valid",
+    )?;
+    let mut rows = contexts.query([])?;
+    while let Some(row) = rows.next()? {
+        check_cancelled(cancellation)?;
+        let path: String = row.get(0)?;
+        let site: i64 = row.get(1)?;
+        let importer: String = row.get(2)?;
+        let mut candidates = conn
+            .prepare_cached(
+                "SELECT route.target,roots.path FROM temp.py_env_routes route
+             JOIN temp.py_env_candidates provider ON provider.container=route.target
+             JOIN temp.py_env_roots roots ON roots.slot=provider.root
+             WHERE route.rel_path=?1 AND route.site=?2 AND route.importer=?3",
+            )?
+            .query_map(params![path, site, importer], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let original_len = candidates.len();
+        brokk_bifrost_python::graph_support::retain_nearest_owning_root(
+            Path::new(&path),
+            &mut candidates,
+            |candidate| candidate.1.clone(),
+        );
+        if candidates.len() != original_len {
+            let retained = candidates
+                .iter()
+                .map(|candidate| &candidate.0)
+                .collect::<Vec<_>>();
+            conn.prepare_cached(
+                "DELETE FROM temp.py_env_routes WHERE rel_path=?1 AND site=?2 AND importer=?3
+                 AND target NOT IN (SELECT value FROM json_each(?4))",
+            )?
+            .execute(params![
+                path,
+                site,
+                importer,
+                serde_json::to_string(&retained).expect("container names are JSON strings")
+            ])?;
+        }
+    }
     Ok(())
 }
 
@@ -1085,6 +1317,7 @@ fn staging_input_digest(conn: &Connection) -> Result<[u8; 32]> {
         conn,
         &[
             "SELECT path FROM temp.py_env_roots ORDER BY path",
+            "SELECT module,source_root,target,admitted FROM temp.py_env_spellings ORDER BY module,source_root,target",
             "SELECT rel_path,surface,policy FROM temp.py_env_surfaces ORDER BY rel_path,surface",
             "SELECT rel_path,surface,name,site FROM temp.py_env_names ORDER BY rel_path,surface,name",
             "SELECT rel_path,site,level,form,requested,bound FROM temp.py_env_imports ORDER BY rel_path,site",
@@ -1097,6 +1330,7 @@ fn public_surface_digest(conn: &Connection) -> Result<[u8; 32]> {
         conn,
         &[
             "SELECT path FROM temp.py_env_roots ORDER BY path",
+            "SELECT module,source_root,target,admitted FROM temp.py_env_spellings ORDER BY module,source_root,target",
             "SELECT container,module,parent,root,kind,state,rel_path,provider_digest FROM temp.py_env_candidates ORDER BY container",
             "SELECT rel_path,surface,policy FROM temp.py_env_surfaces AS surfaces WHERE EXISTS(SELECT 1 FROM temp.py_env_candidates AS provider WHERE provider.blob_id IS NOT NULL AND provider.rel_path=surfaces.rel_path) ORDER BY rel_path,surface",
             "SELECT rel_path,surface,name FROM temp.py_env_names AS names WHERE EXISTS(SELECT 1 FROM temp.py_env_candidates AS provider WHERE provider.blob_id IS NOT NULL AND provider.rel_path=names.rel_path) ORDER BY rel_path,surface,name",
@@ -1109,7 +1343,7 @@ fn hash_queries(conn: &Connection, queries: &[&str]) -> Result<[u8; 32]> {
     for (ordinal, query) in queries.iter().enumerate() {
         // Relation positions belong to this derivation version, not SQL spelling.
         hash.field("relation", &(ordinal as u64).to_be_bytes());
-        let mut statement = conn.prepare(query)?;
+        let mut statement = conn.prepare_cached(query)?;
         let columns = statement.column_count();
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
@@ -1129,6 +1363,7 @@ fn hash_queries(conn: &Connection, queries: &[&str]) -> Result<[u8; 32]> {
     Ok(hash.finish())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn render(
     conn: &Connection,
     snapshot: &WorkspaceSnapshotId,
@@ -1139,11 +1374,11 @@ fn render(
         profile: profile.clone(),
         staging: None,
     };
-    let epoch: String = conn.query_row(
-        "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
-        [],
-        |row| row.get(0),
-    )?;
+    let epoch: String = conn
+        .prepare_cached(
+            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
+        )?
+        .query_row([], |row| row.get(0))?;
     let Some((summary, digest)) = language.live_summary(conn, snapshot, &epoch, &unit_key())?
     else {
         return Ok("no live Python environment\n".into());
@@ -1186,7 +1421,7 @@ fn render(
     ];
     for (label, query) in queries {
         writeln!(output, "[{label}]").expect("String write");
-        let mut statement = conn.prepare(query)?;
+        let mut statement = conn.prepare_cached(query)?;
         let columns = statement.column_count();
         let mut rows = statement.query([summary])?;
         while let Some(row) = rows.next()? {
@@ -1218,11 +1453,11 @@ pub(crate) fn selected_binding_summary(
     snapshot: &WorkspaceSnapshotId,
     profile: &PythonSummaryProfile,
 ) -> Result<Option<i64>> {
-    let epoch: String = conn.query_row(
-        "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
-        [],
-        |row| row.get(0),
-    )?;
+    let epoch: String = conn
+        .prepare_cached(
+            "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='python'",
+        )?
+        .query_row([], |row| row.get(0))?;
     PythonUnitSummaries {
         profile: profile.clone(),
         staging: None,

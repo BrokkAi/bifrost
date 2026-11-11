@@ -1,60 +1,31 @@
-//! One weighted retention budget for the store's cross-request relation caches.
+//! The store's cross-request relation caches, as regions of the owner's retention budget.
 
-#[cfg(any(test, feature = "test-support"))]
 use super::python_binding_rows::PythonBindingRows;
 use super::resolution_operation::PreparedMacroIncludeOverlay;
 use super::resolution_operation::go_named::{
     GoPreparedContextCacheKey, GoPreparedImportContextSnapshot,
 };
+use super::schema_lease::{LastTemp, LastTempKey};
 use super::semantic_composition::{
     ComposedGroup, ComposedGroupCacheKey, CompositionDiscoveryCacheKey, CompositionGroupKey,
-    SearchCandidateStream, SemanticOverlayBuildIdentity,
+    RequestSourceAnchorsKey, SearchCandidateKey, SearchCandidateStream, SourceAnchors,
 };
 use crate::analyzer::resolution::SharedNameId;
-use moka::sync::Cache;
+use brokk_bifrost_core::retention_budget::{
+    BudgetRegion, BudgetedValue, RegionStats, Retained, RetentionBudget,
+};
 use std::sync::Arc;
 
-/// Estimated retained storage, including inline payload and owned allocations.
-/// This is an allocation census, not RSS; callers may pin evicted values.
-pub trait RetainedBytes {
-    fn retained_bytes(&self) -> usize;
+pub use brokk_bifrost_core::retention_budget::{ENTRY_OVERHEAD_BYTES, RetainedBytes};
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+struct PythonBindingRowsKey {
+    blob_oid: [u8; 20],
+    format: i64,
 }
-
-/// Moka entry bookkeeping, enum tags/padding, and one Arc control block.
-/// Payloads charge their own inline storage; this deliberately conservative
-/// allowance is an estimate, independent of allocator and Moka internals.
-const ENTRY_OVERHEAD_BYTES: usize = 512;
-
-#[derive(Clone, Eq, PartialEq, Hash)]
-enum StoreCacheKey {
-    SearchCandidates(SemanticOverlayBuildIdentity),
-    ComposedGroup(ComposedGroupCacheKey),
-    CompositionDiscovery(CompositionDiscoveryCacheKey),
-    SharedName([u8; 32]),
-    GoPreparedContext(GoPreparedContextCacheKey),
-    RustMacroIncludeOverlay([u8; 32]),
-    #[cfg(any(test, feature = "test-support"))]
-    PythonBindingRows {
-        blob_oid: [u8; 20],
-        format: i64,
-    },
-}
-
-#[derive(Clone)]
-enum StoreCacheValue {
-    SearchCandidates(Arc<SearchCandidateStream>),
-    ComposedGroup(Arc<ComposedGroup>),
-    CompositionDiscovery(Arc<Vec<CompositionGroupKey>>),
-    SharedName(SharedNameId),
-    GoPreparedContext(Arc<GoPreparedImportContextSnapshot>),
-    RustMacroIncludeOverlay(Arc<PreparedMacroIncludeOverlay>),
-    #[cfg(any(test, feature = "test-support"))]
-    PythonBindingRows(Arc<PythonBindingRows>),
-}
-
-impl RetainedBytes for [u8; 32] {
+impl RetainedBytes for PythonBindingRowsKey {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
+        std::mem::size_of::<Self>()
     }
 }
 impl RetainedBytes for SharedNameId {
@@ -62,42 +33,24 @@ impl RetainedBytes for SharedNameId {
         std::mem::size_of_val(self)
     }
 }
-impl RetainedBytes for StoreCacheKey {
-    fn retained_bytes(&self) -> usize {
-        match self {
-            Self::SharedName(key) | Self::RustMacroIncludeOverlay(key) => key.retained_bytes(),
-            Self::GoPreparedContext(key) => key.retained_bytes(),
-            Self::SearchCandidates(key) => key.retained_bytes(),
-            Self::ComposedGroup(key) => key.retained_bytes(),
-            Self::CompositionDiscovery(key) => key.retained_bytes(),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::PythonBindingRows { blob_oid, format } => {
-                std::mem::size_of_val(blob_oid) + std::mem::size_of_val(format)
-            }
-        }
-    }
-}
-impl RetainedBytes for StoreCacheValue {
-    fn retained_bytes(&self) -> usize {
-        match self {
-            Self::SharedName(value) => value.retained_bytes(),
-            Self::SearchCandidates(value) => value.retained_bytes(),
-            Self::ComposedGroup(value) => value.retained_bytes(),
-            Self::CompositionDiscovery(value) => value.retained_bytes(),
-            Self::GoPreparedContext(value) => value.retained_bytes(),
-            Self::RustMacroIncludeOverlay(value) => value.retained_bytes(),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::PythonBindingRows(value) => value.retained_bytes(),
-        }
-    }
-}
 
-/// Every clone shares the same cache and accounting; a request's name table
-/// carries a handle so interning participates in the store's eviction order.
+/// The store's cross-request relation caches, one region of the owner's
+/// retention budget per kind, so they trade space with each other and with
+/// every other cache of the same owner. Every clone shares the same regions;
+/// a request's name table carries a handle so interning participates in the
+/// same eviction order.
 #[derive(Clone)]
 pub struct StoreCacheBudget {
-    entries: Cache<StoreCacheKey, StoreCacheValue>,
-    budget_bytes: u64,
+    pub pinned_readers: BudgetRegion<u64, super::model_catalog::PreparedPinnedReader>,
+    search_candidates: BudgetRegion<SearchCandidateKey, SearchCandidateStream>,
+    composed_groups: BudgetRegion<ComposedGroupCacheKey, ComposedGroup>,
+    composition_discovery: BudgetRegion<CompositionDiscoveryCacheKey, Vec<CompositionGroupKey>>,
+    request_source_anchors: BudgetRegion<RequestSourceAnchorsKey, SourceAnchors>,
+    shared_names: BudgetRegion<[u8; 32], SharedNameId>,
+    go_prepared_contexts: BudgetRegion<GoPreparedContextCacheKey, GoPreparedImportContextSnapshot>,
+    rust_macro_include_overlays: BudgetRegion<[u8; 32], PreparedMacroIncludeOverlay>,
+    python_binding_rows: BudgetRegion<PythonBindingRowsKey, PythonBindingRows>,
+    last_temp_schemas: BudgetRegion<LastTempKey, LastTemp>,
     composition_stats: Arc<CompositionCacheCounters>,
     #[cfg(any(test, feature = "test-support"))]
     allocated: Arc<std::sync::atomic::AtomicI64>,
@@ -110,27 +63,24 @@ pub struct StoreCacheBudget {
 impl std::fmt::Debug for StoreCacheBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StoreCacheBudget")
-            .field("budget_bytes", &self.budget_bytes)
+            .field("regions", &self.region_stats())
             .finish_non_exhaustive()
     }
 }
-impl Default for StoreCacheBudget {
-    fn default() -> Self {
-        Self::new(
-            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default()
-                .store_cache_budget_bytes(),
-        )
-    }
-}
 impl StoreCacheBudget {
-    pub fn new(budget_bytes: u64) -> Self {
+    pub fn new(budget: &RetentionBudget) -> Self {
         Self {
-            budget_bytes,
+            pinned_readers: budget.region("store.pinned-readers", Some(8)),
+            search_candidates: budget.region("store.search-candidates", None),
+            composed_groups: budget.region("store.composed-groups", None),
+            composition_discovery: budget.region("store.composition-discovery", None),
+            request_source_anchors: budget.region("store.request-source-anchors", None),
+            shared_names: budget.region("store.shared-names", None),
+            go_prepared_contexts: budget.region("store.go-prepared-contexts", None),
+            rust_macro_include_overlays: budget.region("store.rust-macro-include-overlays", None),
+            python_binding_rows: budget.region("store.python-binding-rows", None),
+            last_temp_schemas: budget.region("store.last-temp-schemas", None),
             composition_stats: Arc::default(),
-            entries: Cache::builder()
-                .max_capacity(budget_bytes)
-                .weigher(entry_weight)
-                .build(),
             #[cfg(any(test, feature = "test-support"))]
             allocated: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -140,57 +90,92 @@ impl StoreCacheBudget {
         }
     }
 
+    /// Every region's statistics, in a fixed order.
+    pub fn region_stats(&self) -> Vec<(&'static str, RegionStats)> {
+        vec![
+            (self.pinned_readers.name(), self.pinned_readers.stats()),
+            (
+                self.search_candidates.name(),
+                self.search_candidates.stats(),
+            ),
+            (self.composed_groups.name(), self.composed_groups.stats()),
+            (
+                self.request_source_anchors.name(),
+                self.request_source_anchors.stats(),
+            ),
+            (
+                self.composition_discovery.name(),
+                self.composition_discovery.stats(),
+            ),
+            (self.shared_names.name(), self.shared_names.stats()),
+            (
+                self.go_prepared_contexts.name(),
+                self.go_prepared_contexts.stats(),
+            ),
+            (
+                self.rust_macro_include_overlays.name(),
+                self.rust_macro_include_overlays.stats(),
+            ),
+            (
+                self.python_binding_rows.name(),
+                self.python_binding_rows.stats(),
+            ),
+            (
+                self.last_temp_schemas.name(),
+                self.last_temp_schemas.stats(),
+            ),
+        ]
+    }
+
     pub fn search_candidates(
         &self,
-        build: SemanticOverlayBuildIdentity,
-    ) -> Option<Arc<SearchCandidateStream>> {
-        let result = match self.entries.get(&StoreCacheKey::SearchCandidates(build)) {
-            Some(StoreCacheValue::SearchCandidates(value)) => Some(value),
-            None => None,
-            _ => unreachable!("search candidate key has a scalar stream value"),
-        };
+        key: SearchCandidateKey,
+    ) -> Option<Retained<SearchCandidateStream>> {
+        let result = self.search_candidates.get(&key);
         self.composition_stats.search[result.is_some() as usize]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         result
     }
+
+    pub fn request_source_anchors(
+        &self,
+        key: &RequestSourceAnchorsKey,
+    ) -> Option<Retained<SourceAnchors>> {
+        self.request_source_anchors.get(key)
+    }
+
+    pub fn insert_request_source_anchors(
+        &self,
+        key: RequestSourceAnchorsKey,
+        value: SourceAnchors,
+    ) -> BudgetedValue<SourceAnchors> {
+        self.request_source_anchors.insert(key, value)
+    }
     pub fn insert_search_candidates(
         &self,
-        build: SemanticOverlayBuildIdentity,
-        value: Arc<SearchCandidateStream>,
-    ) {
-        self.admit(
-            StoreCacheKey::SearchCandidates(build),
-            StoreCacheValue::SearchCandidates(value),
-        );
+        key: SearchCandidateKey,
+        value: SearchCandidateStream,
+    ) -> BudgetedValue<SearchCandidateStream> {
+        self.search_candidates.insert(key, value)
     }
-    pub fn composed_group(&self, key: &ComposedGroupCacheKey) -> Option<Arc<ComposedGroup>> {
-        let result = match self.entries.get(&StoreCacheKey::ComposedGroup(key.clone())) {
-            Some(StoreCacheValue::ComposedGroup(value)) => Some(value),
-            None => None,
-            _ => unreachable!("composition key has a composition value"),
-        };
+    pub fn composed_group(&self, key: &ComposedGroupCacheKey) -> Option<Retained<ComposedGroup>> {
+        let result = self.composed_groups.get(key);
         self.composition_stats.group[result.is_some() as usize]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         result
     }
-    pub fn insert_composed_group(&self, key: ComposedGroupCacheKey, value: Arc<ComposedGroup>) {
-        self.admit(
-            StoreCacheKey::ComposedGroup(key),
-            StoreCacheValue::ComposedGroup(value),
-        );
+    pub fn insert_composed_group(
+        &self,
+        key: ComposedGroupCacheKey,
+        value: ComposedGroup,
+    ) -> BudgetedValue<ComposedGroup> {
+        self.composed_groups.insert(key, value)
     }
     pub fn composition_discovery(
         &self,
         key: &CompositionDiscoveryCacheKey,
-    ) -> Option<Arc<Vec<CompositionGroupKey>>> {
-        let result = match self
-            .entries
-            .get(&StoreCacheKey::CompositionDiscovery(key.clone()))
-        {
-            Some(StoreCacheValue::CompositionDiscovery(value)) => Some(value),
-            None => None,
-            _ => unreachable!("discovery key has a discovery value"),
-        };
+    ) -> Option<Retained<Vec<CompositionGroupKey>>> {
+        let result = self.composition_discovery.get(key);
         self.composition_stats.discovery[result.is_some() as usize]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         result
@@ -198,17 +183,14 @@ impl StoreCacheBudget {
     pub fn insert_composition_discovery(
         &self,
         key: CompositionDiscoveryCacheKey,
-        value: Arc<Vec<CompositionGroupKey>>,
-    ) {
-        self.admit(
-            StoreCacheKey::CompositionDiscovery(key),
-            StoreCacheValue::CompositionDiscovery(value),
-        );
+        value: Vec<CompositionGroupKey>,
+    ) -> BudgetedValue<Vec<CompositionGroupKey>> {
+        self.composition_discovery.insert(key, value)
     }
     #[doc(hidden)]
     pub fn composition_cache_stats(&self) -> CompositionCacheStats {
         use std::sync::atomic::Ordering::Relaxed;
-        self.entries.run_pending_tasks();
+        let resident = |stats: RegionStats| stats.accounted_bytes - stats.deferred_bytes;
         CompositionCacheStats {
             group_hits: self.composition_stats.group[1].load(Relaxed),
             group_misses: self.composition_stats.group[0].load(Relaxed),
@@ -216,96 +198,70 @@ impl StoreCacheBudget {
             discovery_misses: self.composition_stats.discovery[0].load(Relaxed),
             search_hits: self.composition_stats.search[1].load(Relaxed),
             search_misses: self.composition_stats.search[0].load(Relaxed),
-            search_retained_bytes: self
-                .entries
-                .iter()
-                .filter(|(key, _)| matches!(key.as_ref(), StoreCacheKey::SearchCandidates(_)))
-                .map(|(key, value)| entry_weight(&key, &value) as u64)
+            search_retained_bytes: resident(self.search_candidates.stats()),
+            retained_bytes: self
+                .region_stats()
+                .into_iter()
+                .map(|(_, stats)| resident(stats))
                 .sum(),
-            retained_bytes: self.entries.weighted_size(),
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn python_binding_rows(
         &self,
         blob_oid: [u8; 20],
         format: i64,
-    ) -> Option<Arc<PythonBindingRows>> {
-        match self
-            .entries
-            .get(&StoreCacheKey::PythonBindingRows { blob_oid, format })
-        {
-            Some(StoreCacheValue::PythonBindingRows(value)) => Some(value),
-            None => None,
-            _ => unreachable!("a Python binding key has a Python binding value"),
-        }
+    ) -> Option<Retained<PythonBindingRows>> {
+        self.python_binding_rows
+            .get(&PythonBindingRowsKey { blob_oid, format })
     }
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn insert_python_binding_rows(
         &self,
         blob_oid: [u8; 20],
         format: i64,
-        value: Arc<PythonBindingRows>,
-    ) {
-        self.admit(
-            StoreCacheKey::PythonBindingRows { blob_oid, format },
-            StoreCacheValue::PythonBindingRows(value),
-        );
+        value: PythonBindingRows,
+    ) -> BudgetedValue<PythonBindingRows> {
+        self.python_binding_rows
+            .insert(PythonBindingRowsKey { blob_oid, format }, value)
+    }
+
+    pub(super) fn last_temp_schema(&self, key: &LastTempKey) -> Option<Retained<LastTemp>> {
+        self.last_temp_schemas.get(key)
+    }
+    pub(super) fn insert_last_temp_schema(&self, key: LastTempKey, value: LastTemp) {
+        drop(self.last_temp_schemas.insert(key, value));
+    }
+
+    /// Evict the TEMP schema region, as memory pressure would.
+    #[cfg(test)]
+    pub(super) fn evict_classifier_regions_for_test(&self) {
+        self.last_temp_schemas.evict_all_for_test();
     }
 
     pub(crate) fn shared_name(&self, digest: [u8; 32]) -> Option<SharedNameId> {
-        self.charged(
-            || match self.entries.get(&StoreCacheKey::SharedName(digest)) {
-                Some(StoreCacheValue::SharedName(value)) => Some(value),
-                None => None,
-                _ => unreachable!("a shared-name key has a shared-name value"),
-            },
-        )
+        self.charged(|| self.shared_names.get(&digest).map(|id| *id))
     }
     pub(crate) fn insert_shared_name(&self, digest: [u8; 32], value: SharedNameId) {
-        self.charged(|| {
-            self.admit(
-                StoreCacheKey::SharedName(digest),
-                StoreCacheValue::SharedName(value),
-            )
-        });
+        self.charged(|| drop(self.shared_names.insert(digest, value)));
     }
     pub(crate) fn go_prepared_context(
         &self,
         key: &GoPreparedContextCacheKey,
-    ) -> Option<Arc<GoPreparedImportContextSnapshot>> {
-        match self
-            .entries
-            .get(&StoreCacheKey::GoPreparedContext(key.clone()))
-        {
-            Some(StoreCacheValue::GoPreparedContext(value)) => Some(value),
-            None => None,
-            _ => unreachable!("a Go context key has a Go context value"),
-        }
+    ) -> Option<Retained<GoPreparedImportContextSnapshot>> {
+        self.go_prepared_contexts.get(key)
     }
     pub(crate) fn insert_go_prepared_context(
         &self,
         key: GoPreparedContextCacheKey,
-        value: Arc<GoPreparedImportContextSnapshot>,
+        value: GoPreparedImportContextSnapshot,
     ) {
-        self.admit(
-            StoreCacheKey::GoPreparedContext(key),
-            StoreCacheValue::GoPreparedContext(value),
-        );
+        drop(self.go_prepared_contexts.insert(key, value));
     }
     pub(super) fn rust_macro_include_overlay(
         &self,
         key: &[u8; 32],
-    ) -> Option<Arc<PreparedMacroIncludeOverlay>> {
-        let result = match self
-            .entries
-            .get(&StoreCacheKey::RustMacroIncludeOverlay(*key))
-        {
-            Some(StoreCacheValue::RustMacroIncludeOverlay(value)) => Some(value),
-            None => None,
-            _ => unreachable!("an overlay key has an overlay value"),
-        };
+    ) -> Option<Retained<PreparedMacroIncludeOverlay>> {
+        let result = self.rust_macro_include_overlays.get(key);
         #[cfg(any(test, feature = "test-support"))]
         if result.is_some() {
             self.overlay_hits
@@ -316,44 +272,21 @@ impl StoreCacheBudget {
     pub(super) fn insert_rust_macro_include_overlay(
         &self,
         key: [u8; 32],
-        value: Arc<PreparedMacroIncludeOverlay>,
+        value: PreparedMacroIncludeOverlay,
     ) {
-        self.admit(
-            StoreCacheKey::RustMacroIncludeOverlay(key),
-            StoreCacheValue::RustMacroIncludeOverlay(value),
-        );
+        drop(self.rust_macro_include_overlays.insert(key, value));
         #[cfg(any(test, feature = "test-support"))]
         self.overlay_inserts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    /// The resident bytes of every region, excluding evicted values that a
+    /// caller still holds.
     #[cfg(any(test, feature = "test-support"))]
     pub fn weighted_bytes(&self) -> u64 {
-        self.entries.run_pending_tasks();
-        self.entries.weighted_size()
-    }
-    /// Per-entry weights for manual corpus measurements, in stable order.
-    #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn entry_weights_for_test(&self) -> Vec<(&'static str, u32)> {
-        self.entries.run_pending_tasks();
-        let mut weights = self
-            .entries
-            .iter()
-            .map(|(key, value)| {
-                let kind = match &*key {
-                    StoreCacheKey::SharedName(_) => "shared-name",
-                    StoreCacheKey::ComposedGroup(_) => "composed-group",
-                    StoreCacheKey::CompositionDiscovery(_) => "composition-discovery",
-                    StoreCacheKey::SearchCandidates(_) => "search-candidates",
-                    StoreCacheKey::GoPreparedContext(_) => "go-context",
-                    StoreCacheKey::RustMacroIncludeOverlay(_) => "rust-overlay",
-                    StoreCacheKey::PythonBindingRows { .. } => "python-binding-rows",
-                };
-                (kind, entry_weight(&key, &value))
-            })
-            .collect::<Vec<_>>();
-        weights.sort_unstable();
-        weights
+        self.region_stats()
+            .into_iter()
+            .map(|(_, stats)| stats.accounted_bytes - stats.deferred_bytes)
+            .sum()
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn allocated_bytes(&self) -> i64 {
@@ -369,16 +302,6 @@ impl StoreCacheBudget {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Every consumer inserts through here. Moka applies capacity maintenance
-    /// asynchronously, so an entry heavier than the whole budget would stay
-    /// visible to the next reader; refuse it instead and let it be reread.
-    fn admit(&self, key: StoreCacheKey, value: StoreCacheValue) {
-        if entry_bytes(&key, &value) as u64 > self.budget_bytes {
-            return;
-        }
-        self.entries.insert(key, value);
-    }
-
     fn charged<T>(&self, operation: impl FnOnce() -> T) -> T {
         #[cfg(any(test, feature = "test-support"))]
         let before = super::resolution_operation::heap_pin_bytes();
@@ -390,16 +313,6 @@ impl StoreCacheBudget {
         );
         result
     }
-}
-
-fn entry_bytes(key: &StoreCacheKey, value: &StoreCacheValue) -> usize {
-    key.retained_bytes()
-        .saturating_add(value.retained_bytes())
-        .saturating_add(ENTRY_OVERHEAD_BYTES)
-}
-
-fn entry_weight(key: &StoreCacheKey, value: &StoreCacheValue) -> u32 {
-    entry_bytes(key, value).min(u32::MAX as usize) as u32
 }
 
 /// Temporary census for a single value. Aliases of shared immutable backing
@@ -502,6 +415,45 @@ pub fn retained_read_key(heap: &mut RetainedHeap, key: &crate::analyzer::read_le
             heap.add_entries(1);
         }
         ReadKey::Lookup { question, .. } => match question {
+            LookupQuestion::CertifiedDefinition {
+                name, delegates, ..
+            } => {
+                heap.add(name.len().saturating_add(
+                    delegates.capacity() * std::mem::size_of::<crate::analyzer::Language>(),
+                ));
+                heap.add_entries(2);
+            }
+            LookupQuestion::StoredSemanticIrPublication(question) => {
+                heap.add(
+                    question
+                        .rel_path
+                        .len()
+                        .saturating_add(question.storage_language.len()),
+                );
+                heap.add_entries(2);
+            }
+            // #9737 M3: persisted derivation replay is not available yet.
+            LookupQuestion::Derivation(question) => {
+                if let Some(path) = &question.rel_path {
+                    heap.add(path.len());
+                    heap.add_entries(1);
+                }
+                if let Some(name) = &question.name {
+                    heap.add(name.len());
+                    heap.add_entries(1);
+                }
+            }
+            LookupQuestion::StructuralName { name, .. }
+            | LookupQuestion::StructuralRoleName { name, .. } => {
+                heap.add(name.len());
+                heap.add_entries(1);
+            }
+            LookupQuestion::StructuralRecovered { .. }
+            | LookupQuestion::ExternalSelection { .. } => {}
+            LookupQuestion::RustCopyAbsence { module_path, .. } => {
+                heap.add(module_path.len());
+                heap.add_entries(1);
+            }
             LookupQuestion::Name { name, .. } => {
                 heap.add(name.len());
                 heap.add_entries(1);
@@ -519,7 +471,9 @@ pub fn retained_read_key(heap: &mut RetainedHeap, key: &crate::analyzer::read_le
                     heap.add_entries(1);
                 }
             }
-            LookupQuestion::File { rel_path } | LookupQuestion::CallSite { rel_path, .. } => {
+            LookupQuestion::RustPlacedDeclaration { rel_path, .. }
+            | LookupQuestion::File { rel_path }
+            | LookupQuestion::CallSite { rel_path, .. } => {
                 heap.add(rel_path.len());
                 heap.add_entries(1);
             }

@@ -127,7 +127,6 @@ fn python_module_mutation_hazard_bounded(
 /// Native producers reuse the same selected-node hazard classification. This
 /// retains unknown lexical binders during parsing rather than reparsing a file
 /// to certify a later builtin lookup. Global directives have binding events.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn python_module_dynamic_write_candidate(node: Node<'_>, source: &str) -> bool {
     matches!(
         python_module_mutation_hazard_bounded(node, source, || true),

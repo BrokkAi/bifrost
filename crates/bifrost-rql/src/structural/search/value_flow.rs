@@ -23,7 +23,8 @@ use crate::analyzer::semantic::{
     WorkspaceIcfgProvider,
 };
 use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
-use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
+use crate::analyzer::workspace::CompositionReadiness;
+use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 use crate::structural::analysis_context::{
@@ -119,30 +120,51 @@ pub fn with_fresh_icfg_value_flow_results_for_test<T>(run: impl FnOnce() -> T) -
     result
 }
 
-fn select_value_flow_engine(plan: &ValueFlowPlan, witnesses: bool) -> ValueFlowEngine {
+fn select_value_flow_engine(
+    workspace: &WorkspaceAnalyzer,
+    plan: &ValueFlowPlan,
+    witnesses: bool,
+) -> Result<ValueFlowEngine, crate::analyzer::semantic::SemanticProviderError> {
     if FORCE_ICFG_FOR_TEST.get() {
-        return ValueFlowEngine::Icfg {
+        return Ok(ValueFlowEngine::Icfg {
             reason: "test override".into(),
-        };
+        });
     }
     if witnesses {
-        return ValueFlowEngine::Icfg {
+        return Ok(ValueFlowEngine::Icfg {
             reason: "witness projection".into(),
-        };
+        });
     }
     if let Some(reason) = plan.composition_exclusion() {
-        return ValueFlowEngine::Icfg {
+        return Ok(ValueFlowEngine::Icfg {
             reason: format!("{reason:?}"),
-        };
+        });
     }
-    if plan.root().artifact().key().language()
-        != crate::analyzer::semantic::SemanticLanguage::Standard(Language::Rust)
-    {
-        return ValueFlowEngine::Icfg {
-            reason: "language admission".into(),
-        };
-    }
-    ValueFlowEngine::Composition
+    Ok(
+        match workspace.composition_readiness(plan.root().artifact().key())? {
+            CompositionReadiness::Ready => ValueFlowEngine::Composition,
+            CompositionReadiness::Language => ValueFlowEngine::Icfg {
+                reason: "language admission".into(),
+            },
+            CompositionReadiness::NoRows => ValueFlowEngine::Icfg {
+                reason: "no rows".into(),
+            },
+        },
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn selected_value_flow_engine_for_test(
+    workspace: &WorkspaceAnalyzer,
+    plan: &ValueFlowPlan,
+    witnesses: bool,
+) -> Result<String, crate::analyzer::semantic::SemanticProviderError> {
+    Ok(
+        match select_value_flow_engine(workspace, plan, witnesses)? {
+            ValueFlowEngine::Composition => "composition".into(),
+            ValueFlowEngine::Icfg { reason } => format!("icfg:{reason}"),
+        },
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -226,7 +248,20 @@ impl ValueFlowQueryState {
             workspace,
             active_semantic_model_snapshot,
         );
-        match select_value_flow_engine(&plan, self.witness_requested) {
+        let engine = match select_value_flow_engine(workspace, &plan, self.witness_requested) {
+            Ok(engine) => engine,
+            Err(error) => {
+                self.work.failed_solves = self.work.failed_solves.saturating_add(1);
+                push_deduplicated_diagnostic(
+                    &mut self.diagnostics,
+                    CodeQueryDiagnosticCode::ValueFlowProviderFailed,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    format!("value-flow readiness failed: {error}"),
+                );
+                return Vec::new();
+            }
+        };
+        match engine {
             ValueFlowEngine::Composition => {
                 return self.composed_endpoints(
                     workspace,
@@ -400,6 +435,7 @@ impl ValueFlowQueryState {
             plan,
             SemanticExecutionBudget::new(max_materialized_files),
             limits.max_endpoints,
+            limits.max_retained_bytes,
         );
         let budget = CompositionBudget {
             max_procedures: semantic_budget.remaining().procedures,
@@ -1631,6 +1667,9 @@ pub(crate) fn public_witness_step(
     );
     CodeQueryFlowWitnessStep {
         kind,
+        summary_fingerprint: step
+            .summary()
+            .map(|summary| summary.fingerprint().to_string()),
         source: public_program_point_site(workspace, step.source()),
         source_symbol: None,
         target: step

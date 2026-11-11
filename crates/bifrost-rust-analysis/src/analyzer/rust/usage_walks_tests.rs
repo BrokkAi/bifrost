@@ -33,18 +33,183 @@ mod tests {
     };
     use brokk_bifrost_rust::usage::{usage_binding_seeds, usage_importers};
     use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
-    use brokk_bifrost_rust::usage_walks::RustUsageWalks;
+    use brokk_bifrost_rust::usage_walks::{RustUsageWalks, Walked};
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
-        crate::analyzer::rust::test_support::project(files)
+    fn project(
+        files: &[(&str, &str)],
+    ) -> (
+        crate::analyzer::rust::test_support::CertifiedFixture,
+        RustAnalyzer,
+    ) {
+        crate::analyzer::rust::test_support::certified_project(files)
+    }
+
+    #[test]
+    fn incomplete_declaration_facts_replay_unattributed_reads_to_later_consumers() {
+        use super::super::DECLARATION_FACT_DERIVATIONS;
+        use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
+        use brokk_bifrost_analysis::analyzer::common::capture_query_cache_build;
+        use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+
+        use brokk_bifrost_core::analyzer::project::{Project, TestProject};
+        struct UncertifiedProject(TestProject);
+        impl Project for UncertifiedProject {
+            fn root(&self) -> &std::path::Path {
+                self.0.root()
+            }
+            fn analyzer_languages(&self) -> BTreeSet<Language> {
+                self.0.analyzer_languages()
+            }
+            fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.0.all_files()
+            }
+            fn analyzable_files(
+                &self,
+                language: Language,
+            ) -> std::io::Result<BTreeSet<ProjectFile>> {
+                self.0.analyzable_files(language)
+            }
+            fn file_by_rel_path(&self, path: &std::path::Path) -> Option<ProjectFile> {
+                self.0.file_by_rel_path(path)
+            }
+            // Keep the default unknown omission: enumeration alone is not a
+            // claim that this custom project's listing is certified.
+        }
+        // An uncertified listing isolates stable source-listing incompleteness.
+        let (_temp, analyzer) = crate::analyzer::rust::test_support::project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"memo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", ""),
+            ("src/refused.rs", "pub fn present() {}"),
+        ]);
+        drop(analyzer);
+        let analyzer = RustAnalyzer::new(std::sync::Arc::new(UncertifiedProject(
+            TestProject::new(_temp.path(), Language::Rust),
+        )));
+        let selected = file(&analyzer, "src/lib.rs");
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+        DECLARATION_FACT_DERIVATIONS.with(|count| count.set(0));
+        let mut first_consumer = None;
+        for _ in 0..4 {
+            let ((facts, receipt), ledger) = capture_query_reads(&analyzer, || {
+                capture_query_cache_build(&analyzer, || {
+                    analyzer.rust_declaration_facts_of(&selected)
+                })
+            });
+            facts.expect("declaration facts");
+            // Each capture is a separate policy consumer in this request. The
+            // cold fill and memo hits must charge the same unsafe-to-persist
+            // evidence, including the keys and the unattributed crossing.
+            assert_eq!(DECLARATION_FACT_DERIVATIONS.with(|count| count.get()), 1);
+            assert!(ledger.unattributed_reads() > 0);
+            assert!(ledger.publishable_keys().is_none());
+            let evidence = (ledger.unattributed_reads(), ledger.keys());
+            assert!(!evidence.1.is_empty());
+            if let Some(first) = &first_consumer {
+                assert_eq!(&evidence, first);
+            } else {
+                first_consumer = Some(evidence);
+            }
+            assert!(
+                receipt
+                    .stable_reasons()
+                    .iter()
+                    .any(|reason| matches!(reason, QueryReadIncomplete::SemanticEvidenceGap(_))),
+                "{:?}",
+                receipt.stable_reasons()
+            );
+        }
+        // The listing gap is stable for the request, so one derivation serves
+        // all four asks, and each hit still reports the gap.
+        assert_eq!(DECLARATION_FACT_DERIVATIONS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11069: wrapped declaration facts dropped the allocation's retention refusal"
+    )]
+    fn uncharged_declaration_facts_are_not_retained_across_requests() {
+        use super::super::DECLARATION_FACT_DERIVATIONS;
+
+        fn derivations_with_budget(budget_bytes: u64) -> usize {
+            let temp = tempfile::tempdir().expect("fixture tempdir");
+            let root = temp.path().canonicalize().expect("canonical fixture root");
+            std::fs::create_dir_all(root.join("src")).expect("create source directory");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"retention\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .expect("write manifest");
+            std::fs::write(root.join("src/lib.rs"), "pub struct Marker;\n").expect("write source");
+            let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig {
+                retention_budget_bytes: Some(budget_bytes),
+                ..Default::default()
+            };
+            let (_workspace, analyzer) =
+                crate::analyzer::rust::test_support::certified_analyzer_with_config(&root, config);
+            let selected = file(&analyzer, "src/lib.rs");
+
+            DECLARATION_FACT_DERIVATIONS.with(|count| count.set(0));
+            for _ in 0..2 {
+                let scope = AnalyzerQueryScope::new(&analyzer);
+                analyzer
+                    .rust_declaration_facts_of(&selected)
+                    .expect("declaration facts");
+                assert!(scope.store_error().is_none(), "{:?}", scope.store_error());
+            }
+            DECLARATION_FACT_DERIVATIONS.with(|count| count.get())
+        }
+
+        assert_eq!(derivations_with_budget(5168), 2);
+        assert_eq!(derivations_with_budget(64 * 1024 * 1024), 1);
+    }
+
+    #[test]
+    #[hardwon(
+        "#9737: c2 named a nonexistent <dir>/lib.rs for an orphan asset and run_policy failed"
+    )]
+    fn orphan_asset_owner_walk_never_reads_synthetic_parent() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"bat_like\"\nversion = \"0.1.0\"\nedition = \"2024\"\nbuild = \"build/main.rs\"\n")
+            .file("src/lib.rs", "pub fn library() {}\n")
+            .file("build/main.rs", "mod application; fn main() {}\n")
+            .file("build/application.rs", "pub fn build() {}\n")
+            .file("assets/theme_preview.rs", "pub fn preview() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("fixture walks");
+        walks
+            .owner_roots_of(&file(&analyzer, "assets/theme_preview.rs"))
+            .unwrap_or_else(|error| {
+                panic!("orphan owner walk: {error:?}; {:?}", scope.store_error())
+            });
+        assert!(scope.store_error().is_none(), "{:?}", scope.store_error());
+        let selected = file(&analyzer, "assets/theme_preview.rs");
+        let store = analyzer.analyzer_store();
+        store.reset_parsed_blob_point_contains_queries_for_test();
+        for _ in 0..32 {
+            assert!(walks.is_analyzed(&selected));
+            assert!(!walks.is_analyzed(&fixture.file("assets/lib.rs")));
+        }
+        let probes = store.parsed_blob_point_contains_queries_for_test();
+        eprintln!("walker membership point queries: {probes}");
+        assert_eq!(probes, 0, "membership must use the live selection");
     }
 
     /// Build one strongly connected module graph with `modules` nodes and the
     /// requested number of forward neighbours from each node.
-    fn cyclic_project(modules: usize, neighbours: usize) -> (tempfile::TempDir, RustAnalyzer) {
+    fn cyclic_project(
+        modules: usize,
+        neighbours: usize,
+    ) -> (
+        crate::analyzer::rust::test_support::CertifiedFixture,
+        RustAnalyzer,
+    ) {
         let mut lib = String::new();
         for index in 0..modules {
             lib.push_str(&format!("pub mod m{index};\n"));
@@ -66,7 +231,13 @@ mod tests {
         project(&borrowed)
     }
 
-    fn binding_edge_project() -> (BuiltInlineTestProject, RustAnalyzer) {
+    fn binding_edge_project() -> (
+        (
+            BuiltInlineTestProject,
+            brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        ),
+        RustAnalyzer,
+    ) {
         let project = InlineTestProject::with_language(Language::Rust)
             .file("src/lib.rs", "pub mod service;\npub mod consumer;\n")
             .file("src/service.rs", "pub struct Widget;\n")
@@ -75,9 +246,10 @@ mod tests {
                 "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
             )
             .build();
-        let analyzer = RustAnalyzer::new(project.project_dyn());
+        let (workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(project.root());
         assert_eq!(analyzer.get_analyzed_files().len(), 3);
-        (project, analyzer)
+        ((project, workspace), analyzer)
     }
 
     fn identity_named(
@@ -112,7 +284,8 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             .file("src/generated.rs", "fn generated(_: Thing) {}")
             .file("src/local.rs", "fn local(_: Thing) {}")
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(fixture.root());
         assert_eq!(analyzer.get_analyzed_files().len(), 3);
         let scope = AnalyzerQueryScope::new(&analyzer);
         let includes = RustIncludeRoutes::new(&analyzer, scope.token()).unwrap();
@@ -717,13 +890,15 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
         "#3363: macro-use visibility must select the exact invocation target"
     )]
     fn macro_use_module_route_selects_the_exact_invocation_target() {
-        let (_temp, analyzer) = project(&[
-            (
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
                 "src/lib.rs",
                 "#[macro_use]\nmod macros;\nfn use_it() { m_macro!(); }\n",
-            ),
-            ("src/macros.rs", "macro_rules! m_macro { () => {} }\n"),
-        ]);
+            )
+            .file("src/macros.rs", "macro_rules! m_macro { () => {} }\n")
+            .build();
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(fixture.root());
         let scope = AnalyzerQueryScope::new(&analyzer);
         let walks = RustUsageWalks::new(&analyzer, scope.token()).expect("fixture walks");
         let macro_file = file(&analyzer, "macros.rs");
@@ -814,7 +989,8 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             .file("src/lib.rs", "include!(\"generated.rs\");\n")
             .file("src/generated.rs", "pub fn generated() {}\n")
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(fixture.root());
         assert_eq!(analyzer.get_analyzed_files().len(), 2);
         let scope = AnalyzerQueryScope::new(&analyzer);
         let includes = RustIncludeRoutes::new(&analyzer, scope.token()).unwrap();
@@ -858,15 +1034,15 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             .expect("Cargo routes available for the fixture")
             .files_in_module_package("service");
         assert!(
-            Arc::ptr_eq(&first, &second),
+            Walked::ptr_eq(&first, &second),
             "a second walker in the same generation must hit the cache"
         );
         // Both the file whose package IS the module and the file that
         // declares `mod service;` back it, which is what `RustModuleFiles`
         // held in its two maps.
         assert_eq!(
-            *first,
-            vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")],
+            first.as_slice(),
+            vec![file(&analyzer, "lib.rs"), file(&analyzer, "service.rs")].as_slice(),
             "files were {first:?}"
         );
 
@@ -876,7 +1052,7 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             .expect("Cargo routes available after update")
             .files_in_module_package("service");
         assert!(
-            !Arc::ptr_eq(&first, &after),
+            !Walked::ptr_eq(&first, &after),
             "a generation bump must not serve the previous generation's entry"
         );
         assert_eq!(*after, *first, "the answer itself is unchanged");
@@ -947,8 +1123,9 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
             walks
                 .bindings_at(&head, &module)
                 .expect("uncancelled cyclic walk")
-                .as_ref()
-                .clone()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
         };
         assert!(
             complete.iter().any(|binding| binding.name == "Item1"),
@@ -981,10 +1158,11 @@ mod hidden { use crate::other::Thing; }include!("generated.rs");"#,
         let after = RustUsageWalks::new(&updated, updated_scope.token())
             .expect("Cargo routes available after update");
         assert_eq!(
-            *after
+            after
                 .bindings_at(&head, &module)
-                .expect("uncancelled walk after cancellation"),
-            complete,
+                .expect("uncancelled walk after cancellation")
+                .as_slice(),
+            complete.as_slice(),
             "a cancelled walk must not memoize its truncated answer"
         );
     }

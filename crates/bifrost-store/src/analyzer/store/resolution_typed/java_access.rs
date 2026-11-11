@@ -71,7 +71,7 @@ WITH RECURSIVE seeds(mount_ordinal, semantic_key, blob_id, language, package, ow
         semantic.semantic_role
  FROM json_each(?1) AS request
  CROSS JOIN temp.selected_resolution_mounts AS mount
-   ON mount.mount_ordinal=json_extract(request.value, '$[0]') AND mount.semantic_language IN ('java','scala')
+  ON mount.mount_ordinal=json_extract(request.value, '$[0]') AND mount.semantic_language IN ('java','scala','kotlin')
  CROSS JOIN main.resolution_fragment_interiors AS interior
    ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
   AND interior.semantic_language=mount.semantic_language
@@ -94,7 +94,7 @@ WITH RECURSIVE seeds(mount_ordinal, semantic_key, blob_id, language, package, ow
 )
 SELECT owners.mount_ordinal, owners.semantic_key, owners.language, owners.package,
        owners.seed_owner, owners.owner, parent.owner_definition_semantic_key,
-       scope.definition_semantic_key, owners.semantic_role
+       scope.definition_semantic_key, owners.semantic_role, scope.scope_head_node_key
 FROM owners
 LEFT JOIN main.resolution_member_owner_properties AS parent
   ON parent.blob_id=owners.blob_id AND parent.definition_semantic_key=owners.owner
@@ -160,9 +160,11 @@ WITH seeds AS MATERIALIZED (
  WHERE EXISTS (SELECT 1 FROM main.resolution_member_scope_properties AS body
    WHERE body.blob_id=semantic.blob_id AND body.definition_semantic_key=semantic.semantic_key AND body.scope_kind='type_body')
 )
-SELECT seeds.mount_ordinal, seeds.semantic_key, seeds.package, templates.owner
+SELECT seeds.mount_ordinal, seeds.semantic_key, seeds.package, templates.owner, body.scope_head_node_key
 FROM seeds LEFT JOIN templates
  ON templates.mount_ordinal=seeds.mount_ordinal AND templates.semantic_key=seeds.semantic_key
+LEFT JOIN main.resolution_member_scope_properties AS body
+ ON body.blob_id=seeds.blob_id AND body.definition_semantic_key=templates.owner AND body.scope_kind='type_body'
 ORDER BY seeds.mount_ordinal, seeds.semantic_key, templates.ordinal DESC
 "#;
 
@@ -258,6 +260,7 @@ struct JvmAccessEndpointFacts {
     parents: HashMap<SemanticId, Option<SemanticId>>,
     templates: HashSet<SemanticId>,
     lexical_templates: Vec<SemanticId>,
+    template_heads: HashMap<SemanticId, BindingNodeId>,
 }
 
 pub(super) fn read_jvm(
@@ -283,7 +286,7 @@ pub(super) fn read_jvm(
             let Some(rules) = nominal_language_rules(language) else {
                 continue;
             };
-            if !rules.has_declaration_access_endpoints() {
+            if !rules.has_declaration_access_endpoints() && language != Language::Kotlin {
                 continue;
             }
             let Some(provenance) = source
@@ -321,6 +324,7 @@ pub(super) fn read_jvm(
                 assert!(
                     nominal_language_rules(language)
                         .is_some_and(|rules| rules.has_declaration_access_endpoints())
+                        || language == Language::Kotlin
                 );
                 let seed_owner = row
                     .get::<_, Option<u32>>(4)?
@@ -343,6 +347,7 @@ pub(super) fn read_jvm(
                     parent,
                     template,
                     row.get::<_, String>(8)? == "definition",
+                    row.get::<_, Option<u32>>(9)?,
                 ));
             }
 
@@ -361,6 +366,7 @@ pub(super) fn read_jvm(
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<u32>>(3)?
                             .map(|key| SemanticId::local(ordinal.get(), key)),
+                        row.get::<_, Option<u32>>(4)?,
                     ));
                 }
             }
@@ -369,7 +375,9 @@ pub(super) fn read_jvm(
         let Some((rows, lexical_templates)) = rows else {
             return Ok(None);
         };
-        for (semantic, language, package, seed_owner, owner, parent, template, definition) in rows {
+        for (semantic, language, package, seed_owner, owner, parent, template, definition, head) in
+            rows
+        {
             let endpoint = result
                 .entry(semantic)
                 .or_insert_with(|| JvmAccessEndpointFacts {
@@ -380,6 +388,7 @@ pub(super) fn read_jvm(
                     parents: HashMap::default(),
                     templates: HashSet::default(),
                     lexical_templates: Vec::new(),
+                    template_heads: HashMap::default(),
                 });
             assert_eq!(endpoint.language, language);
             assert_eq!(endpoint.package, package);
@@ -392,49 +401,55 @@ pub(super) fn read_jvm(
             }
             if let Some(template) = template {
                 endpoint.templates.insert(template);
+                if let Some(head) = head {
+                    let head =
+                        BindingNodeId::local(template.ordinal().expect("local template"), head);
+                    if let Some(previous) = endpoint.template_heads.insert(template, head) {
+                        assert_eq!(previous, head);
+                    }
+                }
             }
         }
-        for (semantic, package, template) in lexical_templates {
+        for (semantic, package, template, head) in lexical_templates {
             let Some(endpoint) = result.get_mut(&semantic) else {
                 continue;
             };
             endpoint.package = package;
             if let Some(template) = template {
                 endpoint.lexical_templates.push(template);
+                if let Some(head) = head {
+                    let head =
+                        BindingNodeId::local(template.ordinal().expect("local template"), head);
+                    if let Some(previous) = endpoint.template_heads.insert(template, head) {
+                        assert_eq!(previous, head);
+                    }
+                }
             }
         }
     }
     let endpoints = result
         .into_iter()
         .map(|(semantic, facts)| {
-            let mut enclosing_templates = Vec::new();
-            let mut current = facts.seed_owner;
-            if facts.definition && current == Some(semantic) && facts.templates.contains(&semantic)
-            {
-                current = facts.parents.get(&semantic).copied().flatten();
-            }
-            let mut visited = HashSet::default();
-            while let Some(owner) = current {
-                assert!(
-                    visited.insert(owner),
-                    "selected declaration owners are acyclic"
+            let enclosing_templates =
+                crate::analyzer::store::resolution_operation::declaration_access::owner_templates(
+                    semantic,
+                    facts.seed_owner,
+                    facts.definition,
+                    &facts.parents,
+                    &facts.templates,
+                    facts.lexical_templates,
                 );
-                if facts.templates.contains(&owner) {
-                    enclosing_templates.push(owner);
-                }
-                current = facts.parents.get(&owner).copied().flatten();
-            }
-            for template in facts.lexical_templates {
-                if !enclosing_templates.contains(&template) {
-                    enclosing_templates.push(template);
-                }
-            }
+            let enclosing_template_heads = enclosing_templates
+                .iter()
+                .map(|template| facts.template_heads.get(template).copied())
+                .collect();
             JvmAccessEndpoint {
                 semantic,
                 language: facts.language,
                 package: facts.package,
                 outermost_type: enclosing_templates.last().copied(),
                 enclosing_templates,
+                enclosing_template_heads,
             }
         })
         .collect();

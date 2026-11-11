@@ -56,32 +56,6 @@ const CSMI_SEMANTIC_PACK_SOURCE_COMPONENTS = new Set([
   ...SEMANTIC_PACK_SOURCE_COMPONENTS,
   "csmi",
 ]);
-const PINNED_SEMANTIC_PACK_PATHS = [
-  {
-    prefixes: ["semantic-packs/jvm/"],
-    paths: ["scripts/public/build-pinned-jvm-semantic-packs.sh"],
-    components: new Set(["semantic_pack_jvm"]),
-    reason: "pinned JVM semantic-pack input or builder",
-  },
-  {
-    prefixes: ["semantic-packs/python/"],
-    paths: ["scripts/public/build-pinned-python-semantic-packs.sh"],
-    components: new Set(["semantic_pack_python"]),
-    reason: "pinned Python semantic-pack input or builder",
-  },
-  {
-    prefixes: ["semantic-packs/typescript/"],
-    paths: ["scripts/public/build-pinned-typescript-semantic-packs.sh"],
-    components: new Set(["semantic_pack_typescript"]),
-    reason: "pinned TypeScript semantic-pack input or builder",
-  },
-  {
-    prefixes: ["semantic-packs/rust/"],
-    paths: ["scripts/public/build-pinned-rust-semantic-packs.sh"],
-    components: new Set(["semantic_pack_rust"]),
-    reason: "pinned Rust semantic-pack input or builder",
-  },
-];
 const EXTRACTED_LANGUAGE_PATHS = [
   {
     prefixes: [
@@ -249,12 +223,6 @@ function isRustPath(path) {
   ]);
 }
 
-function classifyPinnedSemanticPackPath(path) {
-  return PINNED_SEMANTIC_PACK_PATHS.find(
-    ({ prefixes = [], paths = [] }) => paths.includes(path) || startsWithAny(path, prefixes),
-  );
-}
-
 function classifyExtractedLanguagePath(path) {
   return EXTRACTED_LANGUAGE_PATHS.find(({ prefixes }) => startsWithAny(path, prefixes));
 }
@@ -302,13 +270,6 @@ function classifyPath(path) {
     return {
       components: SEMANTIC_PACK_SOURCE_COMPONENTS,
       reason: "semantic-pack compiler or runtime source",
-    };
-  }
-  const pinnedSemanticPack = classifyPinnedSemanticPackPath(path);
-  if (pinnedSemanticPack) {
-    return {
-      components: pinnedSemanticPack.components,
-      reason: pinnedSemanticPack.reason,
     };
   }
   const extractedLanguage = classifyExtractedLanguagePath(path);

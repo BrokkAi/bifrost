@@ -303,6 +303,8 @@ impl SelectedResolutionTypedSource<'_, '_> {
                                     indirection,
                                 })
                             }
+                            // Model channels have no typed identity proof here, even when
+                            // source components carry a direction.
                             _ => None,
                         }
                     } else if memo.descriptors.contains_key(&identity) {

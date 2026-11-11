@@ -85,6 +85,10 @@ pub use crate::analyzer::semantic::workspace_oracle::value_flow::implicit_abort_
 
 pub use crate::analyzer::semantic::workspace_oracle::value_flow::value_flow_capabilities_are_open;
 
+pub use crate::analyzer::semantic::workspace_oracle::value_flow::{
+    ClosedOriginEdge, closed_value_origin, closed_value_origin_at_capture,
+};
+
 #[doc(hidden)]
 pub struct DispatchMaterializationTimer {
     #[doc(hidden)]
@@ -123,6 +127,8 @@ pub struct IncomingActualCache {
 /// the same allocation, retained only for the artifact-union accounting pass.
 #[doc(hidden)]
 pub struct IncomingActualMemoEntry {
+    #[doc(hidden)]
+    pub admission: super::SemanticMemoAdmission,
     replay: Arc<
         brokk_bifrost_core::analyzer::memo_attribution::ReplayingMemoEntry<
             Arc<heap::IncomingActualSet>,
@@ -142,8 +148,13 @@ impl IncomingActualMemoEntry {
             >,
         >,
         accounted: Arc<heap::IncomingActualSet>,
+        admission: super::SemanticMemoAdmission,
     ) -> Self {
-        Self { replay, accounted }
+        Self {
+            replay,
+            accounted,
+            admission,
+        }
     }
 
     #[doc(hidden)]

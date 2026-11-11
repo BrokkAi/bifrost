@@ -26,13 +26,13 @@ pub fn selected_reverse_reference_file<'a>(
 /// LanguageSupport. A missing facade or package-object bridge is an error,
 /// whereas a reference explicitly outside a declaration has no enclosing unit.
 pub fn selected_reverse_reference_owner(
-    file: &crate::analyzer::structural::reference_edges::SelectedReferenceFileProjection<'_>,
+    file: &ProjectFile,
     owner: ReverseEnclosingUnit,
 ) -> Result<Option<CodeUnit>> {
     if matches!(owner, ReverseEnclosingUnit::MissingSource) {
         return Err(StoreError::corrupt(format!(
             "selected reverse caller owner is absent from selected source: {}",
-            file.file
+            file
         )));
     }
     owner.into_unit()

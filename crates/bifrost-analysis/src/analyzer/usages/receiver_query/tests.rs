@@ -60,6 +60,7 @@ fn receiver_semantic_bridge_uses_every_receiver_limit() {
         max_targets: 3,
         max_summary_expansions: 9,
         max_scope_nodes: 17,
+        max_hierarchy_order_work: 17,
         max_resolution_rounds: ReceiverAnalysisBudget::default().max_resolution_rounds,
         max_hierarchy_order_steps: ReceiverAnalysisBudget::default().max_hierarchy_order_steps,
     })

@@ -62,6 +62,7 @@ fn supplied_model_persistence_publishes_the_active_set_to_its_store() {
         &options,
         context,
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("cold policy evaluation");
     assert_eq!(cold.report().runs()[0].findings().len(), 1);
@@ -81,6 +82,7 @@ fn supplied_model_persistence_publishes_the_active_set_to_its_store() {
         &options,
         context,
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("warm policy evaluation");
     assert_eq!(warm.report().runs()[0].findings().len(), 1);

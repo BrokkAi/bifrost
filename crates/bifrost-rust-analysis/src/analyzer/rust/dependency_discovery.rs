@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +12,11 @@ use brokk_bifrost_analysis::analyzer::dependency_support::dependency_diagnostic 
 
 use brokk_bifrost_analysis::analyzer::dependency_support::dependency_provenance_entry;
 
-use brokk_bifrost_analysis::analyzer::dependency_support::read_evidence_file_with_budget;
+use crate::analyzer::semantic_model::ExternalDiscoveryRead;
+use brokk_bifrost_analysis::analyzer::dependency_support::{
+    declare_external_discovery_reads_complete, read_external_evidence_file_with_budget,
+    refuse_external_discovery_reads, report_external_discovery_read,
+};
 
 use brokk_bifrost_analysis::analyzer::dependency_support::require_non_empty_evidence_field;
 
@@ -41,6 +45,10 @@ use crate::analyzer::semantic_model::ResolvedDependency;
 use crate::analyzer::semantic_model::ResolvedDependencyArtifact;
 
 use crate::analyzer::semantic_model::SemanticModelActivationEvidence;
+use crate::analyzer::semantic_model::{
+    CargoPackageId, CargoResolveEdge, CargoResolveView, CargoSelectedPackage,
+    RustCargoArtifactTuple, RustSelectedCargoGraph,
+};
 
 use crate::analyzer::semantic_model::StandardLibraryPackExpectation;
 use crate::analyzer::topology::DependencyScope;
@@ -53,11 +61,18 @@ use brokk_bifrost_core::analyzer::project::Project;
 
 use brokk_bifrost_core::analyzer::config::RustAnalyzerConfig;
 
+use brokk_bifrost_core::analyzer::config::RustArtifactApproximationClaim;
 use brokk_bifrost_core::analyzer::config::RustDependencyApiEvidence;
 
 use brokk_bifrost_core::hash::HashMap;
 
 use brokk_bifrost_core::hash::HashSet;
+
+mod docsrs_evidence;
+pub use docsrs_evidence::{
+    DocsRsArtifactInput, DocsRsAuthority, DocsRsBindingOutcome, DocsRsBindingRow,
+    bind_docsrs_artifacts,
+};
 
 const CARGO_METADATA_FORMAT_VERSION: u32 = 1;
 const MINIMUM_LOCKFILE_VERSION: u32 = 3;
@@ -68,7 +83,7 @@ pub const RUST_STDLIB_TOOLCHAIN_NAME: &str = "rust";
 pub const RUST_STDLIB_TOOLCHAIN_VERSION: &str = "1.100.0-nightly";
 pub const RUST_STDLIB_RUSTC_COMMIT: &str = "fb6531d55";
 /// The rustdoc standard-library pack a pinned `rust-toolchain.toml` selects
-/// (`semantic-packs/rust/rust-stdlib-*.json`).
+/// (authored in `BrokkAi/bifrost-packs`).
 pub const RUST_STDLIB_PACK_ID: &str = "bifrost.rust-stdlib";
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +245,8 @@ struct RustdocVersionEnvelope {
     crate_version: Option<String>,
     #[serde(default)]
     target: Option<RustdocTargetEnvelope>,
+    #[serde(default)]
+    external_crates: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +264,10 @@ struct DecodedRustdocArtifact {
     format_version: u32,
     crate_version: Option<String>,
     target: String,
+    sha256: String,
+    approximation: Option<RustArtifactApproximationClaim>,
+    cfgs: Vec<String>,
+    has_external_reexports: bool,
 }
 
 #[derive(Debug)]
@@ -256,12 +277,368 @@ struct DecodedRustDependencyEvidence {
     artifacts: Vec<DecodedRustdocArtifact>,
 }
 
+/// The resolved half is computed from Cargo/lock and the artifact half is
+/// checked against the JSON and its bytes. This is the runtime record, not an
+/// assertion supplied by the acquisition host.
+#[derive(Debug)]
+struct RustResolvedArtifactApproximation {
+    package_id: String,
+    resolved_version: String,
+    resolved_features: Vec<String>,
+    resolved_target: String,
+    artifact_version: String,
+    artifact_features: Vec<String>,
+    artifact_cfgs: Vec<String>,
+    artifact_toolchain: String,
+    artifact_format_version: u32,
+    artifact_target: String,
+    docsrs_build: bool,
+    artifact_sha256: String,
+    activation_version_requirement: String,
+    direction: &'static str,
+    mismatch_kinds: Vec<&'static str>,
+    selection_rule_id: String,
+    selection_rule_version: u32,
+}
+
+impl RustResolvedArtifactApproximation {
+    fn pack_record(
+        &self,
+    ) -> brokk_bifrost_semantic::analyzer::semantic_model::RustArtifactApproximation {
+        use brokk_bifrost_semantic::analyzer::semantic_model::RustArtifactMismatchKind;
+        brokk_bifrost_semantic::analyzer::semantic_model::RustArtifactApproximation {
+            built_from_version: self.artifact_version.clone(),
+            built_from_features: self.artifact_features.clone(),
+            built_from_cfgs: self.artifact_cfgs.clone(),
+            target: self.artifact_target.clone(),
+            format_version: self.artifact_format_version,
+            toolchain: self.artifact_toolchain.clone(),
+            docsrs_build: self.docsrs_build,
+            original_sha256: self.artifact_sha256.clone(),
+            produced_sha256: self.artifact_sha256.clone(),
+            activation_version_requirement: self.activation_version_requirement.clone(),
+            mismatch_kinds: self
+                .mismatch_kinds
+                .iter()
+                // Version mismatch belongs to resolved Y, so it cannot be
+                // frozen into a pack that may activate for several Y values.
+                .filter(|kind| **kind != "version-nearby")
+                .map(|kind| match *kind {
+                    "feature-superset" => RustArtifactMismatchKind::FeatureSuperset,
+                    _ => unreachable!("validated approximation mismatch kind"),
+                })
+                .collect(),
+            selection_rule_id: self.selection_rule_id.clone(),
+            selection_rule_version: self.selection_rule_version,
+        }
+    }
+    fn provenance(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("rust.approximation.package_id", self.package_id.clone()),
+            (
+                "rust.approximation.resolved_version",
+                self.resolved_version.clone(),
+            ),
+            (
+                "rust.approximation.resolved_features",
+                self.resolved_features.join(","),
+            ),
+            (
+                "rust.approximation.resolved_target",
+                self.resolved_target.clone(),
+            ),
+            (
+                "rust.approximation.artifact_version",
+                self.artifact_version.clone(),
+            ),
+            (
+                "rust.approximation.artifact_features",
+                self.artifact_features.join(","),
+            ),
+            (
+                "rust.approximation.artifact_cfgs",
+                self.artifact_cfgs.join(","),
+            ),
+            (
+                "rust.approximation.artifact_toolchain",
+                self.artifact_toolchain.clone(),
+            ),
+            (
+                "rust.approximation.artifact_format_version",
+                self.artifact_format_version.to_string(),
+            ),
+            (
+                "rust.approximation.artifact_target",
+                self.artifact_target.clone(),
+            ),
+            (
+                "rust.approximation.docsrs_build",
+                self.docsrs_build.to_string(),
+            ),
+            (
+                "rust.approximation.artifact_sha256",
+                self.artifact_sha256.clone(),
+            ),
+            (
+                "rust.approximation.activation_version_requirement",
+                self.activation_version_requirement.clone(),
+            ),
+            ("rust.approximation.direction", self.direction.to_owned()),
+            (
+                "rust.approximation.mismatch_kinds",
+                self.mismatch_kinds.join(","),
+            ),
+            (
+                "rust.approximation.selection_rule_id",
+                self.selection_rule_id.clone(),
+            ),
+            (
+                "rust.approximation.selection_rule_version",
+                self.selection_rule_version.to_string(),
+            ),
+        ]
+    }
+}
+
+fn validate_rust_artifact_approximation(
+    artifact: &DecodedRustdocArtifact,
+    package: &CargoMetadataPackage,
+    node: &CargoMetadataNode,
+    resolved_version: &semver::Version,
+    resolved_target: &str,
+) -> Result<Option<RustResolvedArtifactApproximation>, DependencyPackDiagnostic> {
+    let mut resolved_features = node.features.clone();
+    resolved_features.sort();
+    resolved_features.dedup();
+    let exact_version = artifact.crate_version.as_deref() == Some(package.version.as_str());
+    let exact_features = artifact.enabled_features == resolved_features;
+    let Some(claim) = &artifact.approximation else {
+        // A narrower exact-version artifact retains the existing partial-pack
+        // path: it cannot prove absence for features it never saw. A superset
+        // claims full authority and therefore needs an approximation record.
+        if exact_version
+            && artifact
+                .enabled_features
+                .iter()
+                .all(|feature| resolved_features.contains(feature))
+        {
+            return Ok(None);
+        }
+        return Err(diagnostic(
+            "rust.rustdoc.approximation_record_required",
+            Some(&artifact.path),
+            "rustdoc version or feature mismatch requires a checked approximation record",
+        ));
+    };
+    let invalid = |reason: &str| {
+        diagnostic(
+            "rust.rustdoc.invalid_approximation_record",
+            Some(&artifact.path),
+            reason,
+        )
+    };
+    let artifact_version = artifact
+        .crate_version
+        .as_deref()
+        .ok_or_else(|| invalid("rustdoc JSON has no crate version"))?;
+    if claim.artifact_version != artifact_version
+        || claim.artifact_sha256 != artifact.sha256
+        || claim.artifact_features != artifact.enabled_features
+        || claim.artifact_cfgs != artifact.cfgs
+        || claim.selection_rule_id != "cargo-compatible-nearest"
+        || claim.selection_rule_version != 1
+    {
+        return Err(invalid(
+            "artifact claim disagrees with observed JSON, digest, features or selection rule",
+        ));
+    }
+    if !resolved_features
+        .iter()
+        .all(|feature| artifact.enabled_features.contains(feature))
+    {
+        return Err(invalid(
+            "artifact features are narrower than Cargo-resolved features",
+        ));
+    }
+    let built_version = semver::Version::parse(artifact_version)
+        .map_err(|_| invalid("artifact crate version is invalid semver"))?;
+    if !same_cargo_compatibility_family(&built_version, resolved_version) {
+        return Err(invalid(
+            "artifact version is outside Cargo compatibility range",
+        ));
+    }
+    validate_approximate_activation_range(
+        &built_version,
+        resolved_version,
+        &claim.activation_version_requirement,
+    )
+    .map_err(|reason| invalid(&reason))?;
+    let direction = match built_version.cmp(resolved_version) {
+        std::cmp::Ordering::Less => "older_artifact",
+        std::cmp::Ordering::Greater => "newer_artifact",
+        std::cmp::Ordering::Equal => "same_version",
+    };
+    let mut mismatch_kinds = Vec::new();
+    if !exact_version {
+        mismatch_kinds.push("version-nearby");
+    }
+    if !exact_features {
+        mismatch_kinds.push("feature-superset");
+    }
+    Ok(Some(RustResolvedArtifactApproximation {
+        package_id: package.id.clone(),
+        resolved_version: package.version.clone(),
+        resolved_features,
+        resolved_target: resolved_target.to_owned(),
+        artifact_version: artifact_version.to_owned(),
+        artifact_features: artifact.enabled_features.clone(),
+        artifact_cfgs: claim.artifact_cfgs.clone(),
+        artifact_toolchain: artifact.toolchain.clone(),
+        artifact_format_version: artifact.format_version,
+        artifact_target: artifact.target.clone(),
+        docsrs_build: claim.docsrs_build,
+        artifact_sha256: artifact.sha256.clone(),
+        activation_version_requirement: claim.activation_version_requirement.clone(),
+        direction,
+        mismatch_kinds,
+        selection_rule_id: claim.selection_rule_id.clone(),
+        selection_rule_version: claim.selection_rule_version,
+    }))
+}
+
+fn same_cargo_compatibility_family(left: &semver::Version, right: &semver::Version) -> bool {
+    if !left.pre.is_empty() || !right.pre.is_empty() {
+        return left == right;
+    }
+    left.major == right.major
+        && (left.major > 0
+            || (left.minor == right.minor && (left.minor > 0 || left.patch == right.patch)))
+}
+
+fn compatibility_bounds(
+    version: &semver::Version,
+) -> Result<Option<(semver::Version, semver::Version)>, String> {
+    if !version.pre.is_empty() {
+        return Ok(None);
+    }
+    if version.major > 0 {
+        let next = version
+            .major
+            .checked_add(1)
+            .ok_or("major version overflow")?;
+        Ok(Some((
+            semver::Version::new(version.major, 0, 0),
+            semver::Version::new(next, 0, 0),
+        )))
+    } else if version.minor > 0 {
+        let next = version
+            .minor
+            .checked_add(1)
+            .ok_or("minor version overflow")?;
+        Ok(Some((
+            semver::Version::new(0, version.minor, 0),
+            semver::Version::new(0, next, 0),
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn validate_approximate_activation_range(
+    built: &semver::Version,
+    resolved: &semver::Version,
+    requirement: &str,
+) -> Result<(), String> {
+    let parsed = semver::VersionReq::parse(requirement)
+        .map_err(|_| "invalid approximation activation requirement")?;
+    if !parsed.matches(built) || !parsed.matches(resolved) {
+        return Err(
+            "approximation interval does not contain artifact and resolved versions".into(),
+        );
+    }
+    let Some((family_lower, family_upper)) = compatibility_bounds(built)? else {
+        return (requirement == format!("={built}") && built == resolved)
+            .then_some(())
+            .ok_or_else(|| "0.0.z and prerelease artifacts require exact activation".into());
+    };
+    let (lower, upper) = requirement
+        .strip_prefix(">=")
+        .and_then(|body| body.split_once(", <"))
+        .ok_or("approximation interval must be a canonical disjoint range")?;
+    let lower = semver::Version::parse(lower).map_err(|_| "invalid range lower bound")?;
+    let upper = semver::Version::parse(upper).map_err(|_| "invalid range upper bound")?;
+    if lower < family_lower || lower > *built || upper <= *built || upper > family_upper {
+        return Err("approximation interval crosses a breaking boundary or excludes X".into());
+    }
+    Ok(())
+}
+
+/// Build disjoint, canonical activation intervals from the pinned artifact
+/// set. The lowest artifact in each compatibility family covers older Y.
+pub fn build_disjoint_rustdoc_activation_ranges(
+    available: &[semver::Version],
+) -> Result<Vec<(semver::Version, String)>, String> {
+    let mut versions = available.to_vec();
+    versions.sort();
+    if versions.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate rustdoc artifact version".into());
+    }
+    versions
+        .iter()
+        .enumerate()
+        .map(|(index, version)| {
+            let Some((family_lower, family_upper)) = compatibility_bounds(version)? else {
+                return Ok((version.clone(), format!("={version}")));
+            };
+            let previous_in_family =
+                index > 0 && same_cargo_compatibility_family(&versions[index - 1], version);
+            let lower = if previous_in_family {
+                version.clone()
+            } else {
+                family_lower
+            };
+            let upper = versions
+                .get(index + 1)
+                .filter(|next| same_cargo_compatibility_family(version, next))
+                .cloned()
+                .unwrap_or(family_upper);
+            Ok((version.clone(), format!(">={lower}, <{upper}")))
+        })
+        .collect()
+}
+
+/// Deterministic offline artifact choice. Exact wins, then the nearest older
+/// compatible build, then the nearest newer one. The caller pins the chosen
+/// bytes; runtime never queries docs.rs or redoes this search.
+pub fn choose_nearest_compatible_rustdoc_version(
+    resolved: &semver::Version,
+    available: &[semver::Version],
+) -> Result<Option<semver::Version>, String> {
+    let mut candidates = available
+        .iter()
+        .filter(|candidate| same_cargo_compatibility_family(candidate, resolved))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort();
+    if candidates.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate compatible rustdoc artifact version".into());
+    }
+    Ok(candidates
+        .iter()
+        .rev()
+        .find(|candidate| *candidate <= resolved)
+        .or_else(|| candidates.first())
+        .cloned())
+}
+
 pub fn resolve_rust_semantic_pack_dependencies(
     config: &RustAnalyzerConfig,
     project: &dyn Project,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
+    RUST_CARGO_ROWS
+        .with(|slot| *slot.borrow_mut() = CargoResolveView::from_rows(Vec::new(), Vec::new()));
     let mut dependencies = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let mut metadata_inputs_considered = 0_usize;
@@ -383,7 +760,40 @@ pub fn resolve_rust_semantic_pack_dependencies(
     if let Some(expectation) = stdlib_expectation {
         outcome.expect_standard_library_pack(expectation);
     }
+    let view = RUST_CARGO_ROWS.with(|slot| {
+        std::mem::replace(
+            &mut *slot.borrow_mut(),
+            CargoResolveView::from_rows(Vec::new(), Vec::new()),
+        )
+    });
+    if !view.is_empty() {
+        match RustSelectedCargoGraph::from_cargo_resolve(view) {
+            Ok(graph) => {
+                brokk_bifrost_analysis::analyzer::semantic_model::publish_rust_selected_cargo_graph(
+                    graph,
+                )
+            }
+            Err(error) => {
+                outcome.complete = false;
+                if outcome.diagnostics.len() < limits.max_diagnostics {
+                    outcome.diagnostics.push(diagnostic(
+                        "rust.metadata.ambiguous_cargo_graph",
+                        None,
+                        format!("Cargo graph cannot identify selected Rust artifacts: {error:?}"),
+                    ));
+                } else {
+                    outcome.suppressed_diagnostics.errors =
+                        outcome.suppressed_diagnostics.errors.saturating_add(1);
+                }
+            }
+        }
+    }
+    declare_external_discovery_reads_complete();
     outcome
+}
+
+thread_local! {
+    static RUST_CARGO_ROWS: std::cell::RefCell<CargoResolveView> = std::cell::RefCell::new(CargoResolveView::from_rows(Vec::new(), Vec::new()));
 }
 
 fn resolve_rust_stdlib_dependency(
@@ -395,6 +805,7 @@ fn resolve_rust_stdlib_dependency(
     let path = project.root().join("rust-toolchain.toml");
     match std::fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => {
+            refuse_external_discovery_reads();
             return Err(diagnostic(
                 "rust.toolchain.not_file",
                 Some(&path),
@@ -403,17 +814,26 @@ fn resolve_rust_stdlib_dependency(
         }
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {
+            report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                absolute_path: path.clone(),
+            });
             let legacy_path = project.root().join("rust-toolchain");
             match std::fs::symlink_metadata(&legacy_path) {
                 Ok(_) => {
+                    refuse_external_discovery_reads();
                     return Err(diagnostic(
                         "rust.toolchain.legacy_pin",
                         Some(&legacy_path),
                         "rust-toolchain declares a pin; exact stdlib discovery requires rust-toolchain.toml",
                     ));
                 }
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                        absolute_path: legacy_path.clone(),
+                    });
+                }
                 Err(error) => {
+                    refuse_external_discovery_reads();
                     return Err(diagnostic(
                         "rust.toolchain.metadata",
                         Some(&legacy_path),
@@ -430,6 +850,7 @@ fn resolve_rust_stdlib_dependency(
             ));
         }
         Err(error) => {
+            refuse_external_discovery_reads();
             return Err(diagnostic(
                 "rust.toolchain.metadata",
                 Some(&path),
@@ -437,8 +858,13 @@ fn resolve_rust_stdlib_dependency(
             ));
         }
     }
-    let artifact =
-        read_evidence_file_with_budget("Rust", &path, limits, evidence_bytes_read, cancellation)?;
+    let artifact = read_external_evidence_file_with_budget(
+        "Rust",
+        &path,
+        limits,
+        evidence_bytes_read,
+        cancellation,
+    )?;
     let source = std::str::from_utf8(artifact.bytes()).map_err(|error| {
         diagnostic(
             "rust.toolchain.invalid_utf8",
@@ -552,6 +978,7 @@ fn resolve_rust_dependency_evidence(
     validate_selected_targets(evidence, &packages_by_id)?;
     let reachable = reachable_package_ids(evidence, &nodes_by_id)?;
     let mut resolved = Vec::with_capacity(decoded.artifacts.len());
+    let mut selected = Vec::with_capacity(decoded.artifacts.len());
     for artifact in decoded.artifacts {
         let package = packages_by_id
             .get(artifact.package_id.as_str())
@@ -588,16 +1015,6 @@ fn resolve_rust_dependency_evidence(
                 )
             })?;
         let lock_package = exact_lock_package(package, &decoded.lockfile, &evidence.lockfile_path)?;
-        if artifact.crate_version.as_deref() != Some(package.version.as_str()) {
-            return Err(diagnostic(
-                "rust.rustdoc.version_mismatch",
-                Some(&artifact.path),
-                format!(
-                    "rustdoc crate version {:?} does not match Cargo package version {}",
-                    artifact.crate_version, package.version
-                ),
-            ));
-        }
         if !package.targets.iter().any(|target| {
             target.name.replace('-', "_") == artifact.crate_name.replace('-', "_")
                 && target
@@ -624,6 +1041,13 @@ fn resolve_rust_dependency_evidence(
                 ),
             )
         })?;
+        let approximation = validate_rust_artifact_approximation(
+            &artifact,
+            package,
+            node,
+            &version,
+            &evidence.target,
+        )?;
 
         let selected_roots = evidence
             .selected_targets
@@ -689,6 +1113,17 @@ fn resolve_rust_dependency_evidence(
             artifact.format_version,
         );
         push_provenance(&mut provenance, "rustdoc.target", &artifact.target);
+        if artifact.has_external_reexports {
+            push_provenance(&mut provenance, "rustdoc.external_reexports", "format-61");
+        }
+        for cfg in &artifact.cfgs {
+            push_provenance(&mut provenance, "rustdoc.cfg", cfg);
+        }
+        if let Some(record) = &approximation {
+            for (key, value) in record.provenance() {
+                push_provenance(&mut provenance, key, value);
+            }
+        }
         provenance.sort_by(|left, right| (&left.key, &left.value).cmp(&(&right.key, &right.value)));
         provenance.dedup();
 
@@ -696,6 +1131,24 @@ fn resolve_rust_dependency_evidence(
             "none".to_owned()
         } else {
             artifact.enabled_features.join(",")
+        };
+        let mut reference_artifact = ResolvedDependencyArtifact::file(
+            DependencyArtifactRole::Reference,
+            ExternalArtifactKind::RustdocJson,
+            artifact.path,
+        );
+        reference_artifact.rust_artifact_approximation = approximation
+            .as_ref()
+            .map(RustResolvedArtifactApproximation::pack_record);
+        let tuple = RustCargoArtifactTuple {
+            version: package.version.clone(),
+            resolved_features: node.features.clone(),
+            artifact_features: artifact.enabled_features.clone(),
+            target: evidence.target.clone(),
+            toolchain: artifact.toolchain.clone(),
+            format_version: artifact.format_version,
+            sha256: artifact.sha256.clone(),
+            exact: approximation.is_none(),
         };
         resolved.push(ResolvedDependency {
             id: format!(
@@ -723,15 +1176,59 @@ fn resolve_rust_dependency_evidence(
                 artifact_sha256: None,
             },
             provenance,
-            artifacts: vec![ResolvedDependencyArtifact::file(
-                DependencyArtifactRole::Reference,
-                ExternalArtifactKind::RustdocJson,
-                artifact.path,
-            )],
+            artifacts: vec![reference_artifact],
             scope: DependencyScope::Unknown,
             declared_by: None,
         });
+        selected.push(CargoSelectedPackage {
+            evidence: resolved.last().expect("just pushed").evidence.clone(),
+            package_id: CargoPackageId(package.id.clone()),
+            artifact: tuple,
+        });
     }
+    let edges = decoded
+        .metadata
+        .resolve
+        .as_ref()
+        .expect("resolve checked")
+        .nodes
+        .iter()
+        .filter(|node| reachable.contains(node.id.as_str()))
+        .flat_map(|node| {
+            node.deps.iter().map(move |dep| CargoResolveEdge {
+                source: CargoPackageId(node.id.clone()),
+                dependency_name: dep.name.clone(),
+                target: CargoPackageId(dep.pkg.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let crate_names = decoded
+        .metadata
+        .packages
+        .iter()
+        .filter_map(|package| {
+            package
+                .targets
+                .iter()
+                .find(|target| {
+                    target.kind.iter().any(|kind| {
+                        matches!(
+                            kind.as_str(),
+                            "lib" | "rlib" | "dylib" | "cdylib" | "proc-macro"
+                        )
+                    })
+                })
+                .map(|target| (CargoPackageId(package.id.clone()), target.name.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    RUST_CARGO_ROWS.with(|slot| {
+        let mut view = slot.borrow_mut();
+        view.extend(CargoResolveView::from_rows_with_crate_names(
+            selected,
+            edges,
+            crate_names,
+        ));
+    });
     Ok(resolved)
 }
 
@@ -758,7 +1255,7 @@ fn decode_rust_dependency_evidence(
         ));
     }
 
-    let metadata_artifact = read_evidence_file_with_budget(
+    let metadata_artifact = read_external_evidence_file_with_budget(
         "Rust",
         &evidence.metadata_path,
         limits,
@@ -784,7 +1281,7 @@ fn decode_rust_dependency_evidence(
         ));
     }
 
-    let lockfile_artifact = read_evidence_file_with_budget(
+    let lockfile_artifact = read_external_evidence_file_with_budget(
         "Rust",
         &evidence.lockfile_path,
         limits,
@@ -822,7 +1319,7 @@ fn decode_rust_dependency_evidence(
             ));
         }
 
-        let artifact = read_evidence_file_with_budget(
+        let artifact = read_external_evidence_file_with_budget(
             "Rust",
             &binding.rustdoc_json_path,
             limits,
@@ -869,6 +1366,10 @@ fn decode_rust_dependency_evidence(
         let mut enabled_features = binding.enabled_features.clone();
         enabled_features.sort();
         enabled_features.dedup();
+        // Envelope-only, conservative provenance probe. The producer owns
+        // full Rustdoc decoding and exact carrier extraction. A nonempty
+        // external-crate table may carry an external Use or inlined item.
+        let has_external_reexports = !envelope.external_crates.is_empty();
         artifacts.push(DecodedRustdocArtifact {
             package_id: binding.package_id.clone(),
             crate_name: binding.crate_name.clone(),
@@ -878,6 +1379,10 @@ fn decode_rust_dependency_evidence(
             format_version: envelope.format_version,
             crate_version: envelope.crate_version,
             target: artifact_target.triple,
+            sha256: artifact.sha256().to_owned(),
+            approximation: binding.approximation.clone(),
+            cfgs: binding.rustdoc_cfgs.clone(),
+            has_external_reexports,
         });
     }
 
@@ -1081,6 +1586,7 @@ fn cancelled_diagnostic(path: Option<&Path>) -> DependencyPackDiagnostic {
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_analysis::IAnalyzer;
     use std::collections::HashMap;
     use std::fs;
 
@@ -1100,8 +1606,24 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::project::TestProject;
 
+    use crate::analyzer::rust::host_target_triple;
+
     const PACKAGE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index#widget@1.2.3";
-    const TARGET: &str = "x86_64-unknown-linux-gnu";
+
+    /// The target a build that names no target compiles for, which the host
+    /// rustdoc also emits.
+    fn host_target() -> &'static str {
+        host_target_triple()
+    }
+
+    /// A built-in target that differs from the host target.
+    fn non_host_target() -> &'static str {
+        if host_target() == "x86_64-unknown-linux-gnu" {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+    }
 
     #[test]
     fn exact_evidence_decodes_supported_metadata_lockfile_and_rustdoc() {
@@ -1145,7 +1667,7 @@ mod tests {
         assert_eq!(decoded.artifacts[0].crate_name, "widget");
         assert_eq!(decoded.artifacts[0].enabled_features, ["derive"]);
         assert_eq!(decoded.artifacts[0].toolchain, "nightly-2026-07-14");
-        assert_eq!(decoded.artifacts[0].target, TARGET);
+        assert_eq!(decoded.artifacts[0].target, host_target());
     }
 
     #[test]
@@ -1167,7 +1689,7 @@ mod tests {
         assert_eq!(dependency.evidence.ecosystem, "cargo");
         assert_eq!(dependency.evidence.package.as_ref().unwrap().name, "widget");
         assert_eq!(dependency.evidence.module.as_ref().unwrap().name, "widget");
-        assert_eq!(dependency.evidence.target.as_deref(), Some(TARGET));
+        assert_eq!(dependency.evidence.target.as_deref(), Some(host_target()));
         assert_eq!(
             dependency.evidence.configuration.as_deref(),
             Some("library")
@@ -1195,6 +1717,181 @@ mod tests {
                 .provenance
                 .iter()
                 .any(|entry| { entry.key == "cargo.feature" && entry.value == "derive" })
+        );
+    }
+
+    #[test]
+    fn rustdoc_selection_prefers_exact_then_nearest_older_then_newer_within_compatibility() {
+        let version = |text| semver::Version::parse(text).unwrap();
+        let available = vec![version("0.4.23"), version("0.4.27"), version("0.5.0")];
+        assert_eq!(
+            choose_nearest_compatible_rustdoc_version(&version("0.4.25"), &available).unwrap(),
+            Some(version("0.4.23"))
+        );
+        assert_eq!(
+            choose_nearest_compatible_rustdoc_version(&version("0.4.22"), &available).unwrap(),
+            Some(version("0.4.23"))
+        );
+        assert_eq!(
+            choose_nearest_compatible_rustdoc_version(&version("0.4.27"), &available).unwrap(),
+            Some(version("0.4.27"))
+        );
+        assert_eq!(
+            choose_nearest_compatible_rustdoc_version(&version("0.6.0"), &available).unwrap(),
+            None
+        );
+        assert!(
+            choose_nearest_compatible_rustdoc_version(
+                &version("0.4.25"),
+                &[version("0.4.23"), version("0.4.23")]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            build_disjoint_rustdoc_activation_ranges(&available).unwrap(),
+            vec![
+                (version("0.4.23"), ">=0.4.0, <0.4.27".to_owned()),
+                (version("0.4.27"), ">=0.4.27, <0.5.0".to_owned()),
+                (version("0.5.0"), ">=0.5.0, <0.6.0".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rustdoc_version_and_feature_mismatch_need_checked_record() {
+        let mut fixture = EvidenceFixture::new();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&fixture.rustdoc_path).unwrap()).unwrap();
+        json["crate_version"] = serde_json::Value::String("1.2.2".to_owned());
+        fs::write(&fixture.rustdoc_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        let digest = decoded.artifacts[0].sha256.clone();
+        assert_eq!(
+            resolve_rust_dependency_evidence(&fixture.evidence, decoded)
+                .unwrap_err()
+                .code,
+            "rust.rustdoc.approximation_record_required"
+        );
+
+        fixture.evidence.packages[0].rustdoc_cfgs = vec!["docsrs".to_owned()];
+        fixture.evidence.packages[0].approximation = Some(RustArtifactApproximationClaim {
+            artifact_version: "1.2.2".to_owned(),
+            artifact_features: vec!["derive".to_owned()],
+            artifact_cfgs: vec!["docsrs".to_owned()],
+            docsrs_build: true,
+            artifact_sha256: digest,
+            activation_version_requirement: ">=1.0.0, <2.0.0".to_owned(),
+            selection_rule_id: "cargo-compatible-nearest".to_owned(),
+            selection_rule_version: 1,
+        });
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        let resolved = resolve_rust_dependency_evidence(&fixture.evidence, decoded).unwrap();
+        assert!(
+            resolved[0]
+                .provenance
+                .iter()
+                .any(|entry| entry.key == "rust.approximation.direction"
+                    && entry.value == "older_artifact")
+        );
+        fixture.evidence.packages[0]
+            .approximation
+            .as_mut()
+            .unwrap()
+            .artifact_cfgs = vec!["different".to_owned()];
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_rust_dependency_evidence(&fixture.evidence, decoded)
+                .unwrap_err()
+                .code,
+            "rust.rustdoc.invalid_approximation_record"
+        );
+        fixture.evidence.packages[0]
+            .approximation
+            .as_mut()
+            .unwrap()
+            .artifact_cfgs = vec!["docsrs".to_owned()];
+        fixture.evidence.packages[0]
+            .approximation
+            .as_mut()
+            .unwrap()
+            .artifact_sha256 = "wrong".into();
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_rust_dependency_evidence(&fixture.evidence, decoded)
+                .unwrap_err()
+                .code,
+            "rust.rustdoc.invalid_approximation_record"
+        );
+    }
+
+    #[test]
+    fn rustdoc_feature_superset_alone_needs_approximation_record() {
+        let mut fixture = EvidenceFixture::new();
+        fixture.evidence.packages[0]
+            .enabled_features
+            .push("serde".to_owned());
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_rust_dependency_evidence(&fixture.evidence, decoded)
+                .unwrap_err()
+                .code,
+            "rust.rustdoc.approximation_record_required"
+        );
+    }
+
+    #[test]
+    fn narrower_exact_version_artifact_keeps_partial_pack_path() {
+        let mut fixture = EvidenceFixture::new();
+        fixture.evidence.packages[0].enabled_features.clear();
+        let decoded = decode_rust_dependency_evidence(
+            &fixture.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        let resolved = resolve_rust_dependency_evidence(&fixture.evidence, decoded).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].artifacts[0]
+                .rust_artifact_approximation
+                .is_none()
+        );
+        assert!(
+            resolved[0]
+                .provenance
+                .iter()
+                .any(|entry| entry.key == "cargo.metadata_feature" && entry.value == "derive")
         );
     }
 
@@ -1305,13 +2002,55 @@ mod tests {
         assert_eq!(outcome.profile.dependencies_resolved, 2);
         assert_eq!(outcome.dependencies.len(), 2);
         assert!(outcome.dependencies.iter().any(|dependency| dependency.id
-            == "rust:widget@1.2.3:widget:x86_64-unknown-linux-gnu:derive"));
+            == format!("rust:widget@1.2.3:widget:{}:derive", host_target())));
         assert!(
             outcome
                 .dependencies
                 .iter()
                 .any(|dependency| dependency.id == "rust:stdlib:nightly-2026-08-24")
         );
+    }
+
+    #[test]
+    fn cargo_external_reads_track_configured_lock_without_unrelated_source() {
+        use crate::analyzer::semantic_model::DependencyDiscoveryEvidence;
+        use brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads;
+
+        let fixture = EvidenceFixture::new();
+        fixture.write_exact_toolchain();
+        let external = tempfile::tempdir().unwrap();
+        let lock = external.path().join("Cargo.lock");
+        fs::copy(&fixture.evidence.lockfile_path, &lock).unwrap();
+        let source = fixture._root.path().join("edited.rs");
+        fs::write(&source, "fn old() {}\n").unwrap();
+        let mut configured = fixture.evidence.clone();
+        configured.lockfile_path = lock.clone();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let config = RustAnalyzerConfig {
+            dependency_api_evidence: vec![configured],
+        };
+        let identity = || {
+            let (outcome, reads) = capture_external_discovery_reads(|| {
+                resolve_rust_semantic_pack_dependencies(
+                    &config,
+                    &project,
+                    &DependencyPackLimits::default(),
+                    None,
+                )
+            });
+            assert!(outcome.complete, "diagnostics: {:?}", outcome.diagnostics);
+            let evidence = DependencyDiscoveryEvidence::from_outcome(&outcome)
+                .with_external_reads(reads.keys, reads.complete);
+            assert!(evidence.carry_eligible_external_reads().is_some());
+            evidence.external_read_identity
+        };
+        let first = identity();
+        fs::write(&source, "fn new() {}\n").unwrap();
+        assert_eq!(first, identity());
+        let mut contents = fs::read(&lock).unwrap();
+        contents.extend_from_slice(b"\n# changed\n");
+        fs::write(&lock, contents).unwrap();
+        assert_ne!(first, identity());
     }
 
     #[test]
@@ -1504,7 +2243,7 @@ mod tests {
     #[test]
     fn rustdoc_target_must_match_selected_target() {
         let fixture = EvidenceFixture::new();
-        fixture.write_rustdoc("aarch64-apple-darwin");
+        fixture.write_rustdoc(non_host_target());
 
         let diagnostic = decode_rust_dependency_evidence(
             &fixture.evidence,
@@ -1515,6 +2254,242 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(diagnostic.code, "rust.rustdoc.target_mismatch");
+    }
+
+    #[test]
+    fn docsrs_adapter_binds_only_exact_test_built_public_api_evidence() {
+        use flate2::{Compression, write::GzEncoder};
+        use sha2::{Digest, Sha256};
+        use std::process::Command;
+
+        let fixture = EvidenceFixture::new();
+        let root = fixture._root.path();
+        let source = root.join("lib.rs");
+        fs::write(&source, "pub fn clean(input: u8) -> u8 { input }\n").unwrap();
+        let rustdoc_dir = root.join("rustdoc");
+        fs::create_dir(&rustdoc_dir).unwrap();
+        let status = Command::new("rustdoc")
+            .env("RUSTC_BOOTSTRAP", "1")
+            .args([
+                "--edition",
+                "2024",
+                "--crate-type",
+                "lib",
+                "--crate-name",
+                "widget",
+                "--crate-version",
+                "1.2.3",
+                "--output-format",
+                "json",
+                "-Z",
+                "unstable-options",
+                "--target",
+                host_target(),
+                "-o",
+            ])
+            .arg(&rustdoc_dir)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let json_path = rustdoc_dir.join("widget.json");
+        let json_hash = brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(fs::read(&json_path).unwrap()).into(),
+        );
+
+        let archive_path = root.join("widget-1.2.3.crate");
+        let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        for (path, bytes) in [
+            (
+                "widget-1.2.3/Cargo.toml.orig",
+                b"[package]\nname = \"widget\"\nversion = \"1.2.3\"\n[features]\nderive = []\n"
+                    .as_slice(),
+            ),
+            (
+                "widget-1.2.3/src/lib.rs",
+                b"pub fn clean(input: u8) -> u8 { input }\n".as_slice(),
+            ),
+            (
+                "widget-1.2.3/LICENSE",
+                b"SPDX-License-Identifier: MIT\n".as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
+        let archive = tar.into_inner().unwrap().finish().unwrap();
+        fs::write(&archive_path, &archive).unwrap();
+        let archive_hash = brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(&archive).into(),
+        );
+        fs::write(&fixture.evidence.lockfile_path, format!("version = 4\n\n[[package]]\nname = \"widget\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{archive_hash}\"\n")).unwrap();
+
+        let mut evidence = fixture.evidence.clone();
+        evidence.packages.clear();
+        let input = DocsRsArtifactInput {
+            package_id: PACKAGE_ID.into(),
+            crate_name: "widget".into(),
+            crate_archive_path: archive_path,
+            crate_archive_sha256: archive_hash,
+            rustdoc_json_path: json_path,
+            rustdoc_json_sha256: json_hash,
+            docsrs_resolved_features: vec!["derive".into()],
+            rustdoc_toolchain: "rustdoc 1.99.1 test fixture".into(),
+            rustdoc_format_version: rustdoc_types::FORMAT_VERSION,
+            docsrs_url: format!(
+                "https://docs.rs/crate/widget/1.2.3/json/{}.gz",
+                rustdoc_types::FORMAT_VERSION
+            ),
+            target: host_target().into(),
+            docsrs_cfg: true,
+            authority: DocsRsAuthority::Exact,
+        };
+        let bound = bind_docsrs_artifacts(evidence.clone(), std::slice::from_ref(&input)).unwrap();
+        assert_eq!(bound.rows[0].status, "admitted");
+        let decoded = decode_rust_dependency_evidence(
+            &bound.evidence,
+            &DependencyPackLimits::default(),
+            &mut 0,
+            None,
+        )
+        .unwrap();
+        let resolved = resolve_rust_dependency_evidence(&bound.evidence, decoded).unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0]
+                .provenance
+                .iter()
+                .any(|p| p.key == "rustdoc.cfg" && p.value == "docsrs")
+        );
+        let catalog = crate::analyzer::semantic_model::SemanticPackCatalog::open_ephemeral(
+            crate::analyzer::semantic_model::CatalogOptions::default(),
+        )
+        .unwrap();
+        let prepared = crate::analyzer::semantic_model::prepare_dependency_semantic_packs(
+            &catalog,
+            &crate::analyzer::rust::RustDependencyPackAdapter,
+            &resolved,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.profile.generated_packs, 1);
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn call() -> u8 { renamed_widget::clean(1) }\n",
+        )
+        .unwrap();
+        let project = std::sync::Arc::new(TestProject::new(root.to_path_buf(), Language::Rust));
+        let analyzer = crate::analyzer::rust::RustAnalyzer::new_with_config(
+            project,
+            crate::analyzer::AnalyzerConfig {
+                rust: RustAnalyzerConfig {
+                    dependency_api_evidence: vec![bound.evidence.clone()],
+                },
+                ..Default::default()
+            },
+        );
+        let request = prepared
+            .compose_activation_request(
+                crate::analyzer::semantic_model::SemanticModelActivationRequest {
+                    approximate_standard_libraries: Vec::new(),
+                    bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                    evidence: Vec::new(),
+                    controls: Vec::new(),
+                    limits: Default::default(),
+                },
+            )
+            .unwrap();
+        let activation = crate::analyzer::semantic_model::acquire_active_semantic_models(
+            &analyzer,
+            &catalog,
+            None,
+            &request,
+            &brokk_bifrost_core::CancellationToken::default(),
+        );
+        assert!(matches!(
+            activation,
+            crate::analyzer::semantic_model::SemanticModelRuntimeOutcome::Ready { .. }
+        ));
+        let overlay = analyzer.semantic_model_overlay().unwrap();
+        assert_eq!(
+            overlay
+                .symbols_named_in_family("renamed_widget.clean", "rust")
+                .records
+                .len(),
+            1
+        );
+        let crates = crate::analyzer::rust::crate_identity::RustOverlayCrates::new(Some(&overlay));
+        assert!(
+            crates
+                .referenceable_symbol("renamed_widget.clean")
+                .is_some()
+        );
+        assert!(crates.referenceable_symbol("widget.clean").is_none());
+        let duplicate =
+            bind_docsrs_artifacts(evidence.clone(), &[input.clone(), input.clone()]).unwrap();
+        assert_eq!(duplicate.rows.len(), 2);
+        assert_eq!(duplicate.evidence.packages.len(), 1);
+        assert!(
+            duplicate.rows[1]
+                .status
+                .contains("duplicate package/crate binding")
+        );
+
+        let mut cases = Vec::new();
+        let mut wrong_feature = input.clone();
+        wrong_feature.docsrs_resolved_features.clear();
+        cases.push(wrong_feature);
+        let mut wrong_target = input.clone();
+        wrong_target.target = non_host_target().into();
+        cases.push(wrong_target);
+        let mut wrong_format = input.clone();
+        wrong_format.rustdoc_format_version += 1;
+        cases.push(wrong_format);
+        let mut wrong_cfg = input.clone();
+        wrong_cfg.docsrs_cfg = false;
+        cases.push(wrong_cfg);
+        let mut wrong_hash = input.clone();
+        wrong_hash.rustdoc_json_sha256 = "0".repeat(64);
+        cases.push(wrong_hash);
+        let mut wrong_url = input.clone();
+        wrong_url.docsrs_url = "https://example.invalid/widget.json".into();
+        cases.push(wrong_url);
+        let mut wrong_version = input.clone();
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&input.rustdoc_json_path).unwrap()).unwrap();
+        document["crate_version"] = json!("1.2.4");
+        let wrong_version_bytes = serde_json::to_vec(&document).unwrap();
+        wrong_version.rustdoc_json_path = root.join("wrong-version.json");
+        fs::write(&wrong_version.rustdoc_json_path, &wrong_version_bytes).unwrap();
+        wrong_version.rustdoc_json_sha256 =
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(&wrong_version_bytes).into(),
+            );
+        cases.push(wrong_version);
+        let mut approximate = input.clone();
+        approximate.authority = DocsRsAuthority::Approximate {
+            resolved_version: "1.2.3".into(),
+            built_from_version: "1.2.4".into(),
+            mismatch_kinds: vec!["version".into()],
+            direction: "newer_artifact".into(),
+            selection_rule_id: "nearest-compatible".into(),
+            selection_rule_version: 1,
+        };
+        cases.push(approximate);
+        for bad in cases {
+            let outcome = bind_docsrs_artifacts(evidence.clone(), &[bad]).unwrap();
+            assert!(outcome.evidence.packages.is_empty(), "{:#?}", outcome.rows);
+            assert!(
+                outcome.rows[0]
+                    .status
+                    .starts_with("missing_declaration_evidence:")
+            );
+        }
     }
     struct EvidenceFixture {
         _root: TempDir,
@@ -1536,7 +2511,7 @@ mod tests {
             let evidence = RustDependencyApiEvidence {
                 metadata_path,
                 lockfile_path,
-                target: TARGET.to_owned(),
+                target: host_target().to_owned(),
                 configuration: "library".to_owned(),
                 selected_targets: vec![RustSelectedTarget {
                     package_id: "path+file:///workspace#consumer@0.1.0".to_owned(),
@@ -1550,6 +2525,8 @@ mod tests {
                     rustdoc_json_path: rustdoc_path.clone(),
                     rustdoc_toolchain: "nightly-2026-07-14".to_owned(),
                     rustdoc_format_version: rustdoc_types::FORMAT_VERSION,
+                    rustdoc_cfgs: Vec::new(),
+                    approximation: None,
                 }],
             };
             let fixture = Self {
@@ -1558,7 +2535,7 @@ mod tests {
                 evidence,
             };
             fixture.write_metadata(true);
-            fixture.write_rustdoc(TARGET);
+            fixture.write_rustdoc(host_target());
             fixture
         }
 
@@ -1637,4 +2614,11 @@ mod tests {
             fs::write(&self.rustdoc_path, serde_json::to_vec(&document).unwrap()).unwrap();
         }
     }
+}
+#[test]
+fn rustdoc_provenance_probe_does_not_decode_the_item_index() {
+    let bytes = br#"{"format_version":61,"target":{"triple":"x86_64-unknown-linux-gnu"},"external_crates":{"1":{"name":"core"}},"index":"not a rustdoc index"}"#;
+    let envelope: RustdocVersionEnvelope = serde_json::from_slice(bytes).unwrap();
+    assert!(!envelope.external_crates.is_empty());
+    assert!(serde_json::from_slice::<rustdoc_types::Crate>(bytes).is_err());
 }

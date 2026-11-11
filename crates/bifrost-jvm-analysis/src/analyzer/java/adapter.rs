@@ -23,6 +23,26 @@ use tree_sitter::Tree;
 pub struct JavaAdapter;
 
 impl LanguageAdapter for JavaAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[
+                "string_literal",
+                "character_literal",
+                "decimal_integer_literal",
+                "hex_integer_literal",
+                "octal_integer_literal",
+                "binary_integer_literal",
+                "decimal_floating_point_literal",
+                "hex_floating_point_literal",
+            ],
+            interpolations: &["string_interpolation"],
+            composites: &[
+                ("array_initializer", &["{", "}", ","]),
+                ("unary_expression", &["-", "+"]),
+            ],
+        }
+    }
+
     /// Relative to `brokk-bifrost-jvm`'s crate root: the `.scm` assets moved
     /// with the vendored grammars and are embedded there.
     fn query_directory(&self) -> &'static str {

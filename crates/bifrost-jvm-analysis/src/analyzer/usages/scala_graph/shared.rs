@@ -11,6 +11,7 @@ use brokk_bifrost_analysis::analyzer::relational_frontier::RelationalFrontierSes
 use brokk_bifrost_analysis::analyzer::relational_frontier::RelationalItemFrontierOutcome;
 
 use brokk_bifrost_core::analyzer::common::language_for_file;
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 
@@ -310,9 +311,9 @@ pub(crate) fn prepare_scala_files(
 /// What one file's walk produced, per target.
 pub(crate) struct ScalaFileScan {
     pub(crate) hits: Vec<BTreeSet<UsageHit>>,
-    pub(crate) observed_hits: BTreeSet<UsageHit>,
+    /// The external-surface hits across targets, against the callsite budget.
+    pub(crate) observed: UsageAccumulator,
     pub(crate) unproven_hits: BTreeSet<UsageHit>,
-    pub(crate) limit_exceeded: bool,
 }
 
 /// One usage query's Scala frontier: the relational session plus the resolved
@@ -394,7 +395,7 @@ impl<'a> ScalaFrontierScan<'a> {
         prepared: &[PreparedScalaFile],
         catalog: &ScalaQueryTargetCatalog,
         target_count: usize,
-        max_usages: usize,
+        budget: UsageAccumulator,
         realm_languages: Option<&[Language]>,
         keep_unproven: bool,
     ) -> RelationalItemFrontierOutcome<ScalaFileScan> {
@@ -451,7 +452,7 @@ impl<'a> ScalaFrontierScan<'a> {
                     }),
                 };
                 let mut hits = vec![BTreeSet::new(); target_count];
-                let mut observed_hits = BTreeSet::new();
+                let mut observed = budget.empty_like();
                 let mut unproven_hits = BTreeSet::new();
                 let mut sink = ScalaQueryHitSink {
                     tree: &item.tree,
@@ -464,13 +465,11 @@ impl<'a> ScalaFrontierScan<'a> {
                     catalog,
                     eligibility: &item.eligibility,
                     hits: &mut hits,
-                    observed_hits: &mut observed_hits,
+                    observed: &mut observed,
                     unproven_hits: keep_unproven.then_some(&mut unproven_hits),
                     enclosing_cache: HashMap::default(),
                     relevant_names: relevant_names.clone(),
                     allow_all_names: false,
-                    max_usages,
-                    limit_exceeded: false,
                 };
                 {
                     let _scope = brokk_bifrost_core::profiling::scope(
@@ -490,13 +489,11 @@ impl<'a> ScalaFrontierScan<'a> {
                         parent_index,
                     );
                 }
-                let limit_exceeded = sink.limit_exceeded;
                 drop(sink);
                 ScalaFileScan {
                     hits,
-                    observed_hits,
+                    observed,
                     unproven_hits,
-                    limit_exceeded,
                 }
             })
     }
@@ -607,7 +604,7 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             &prepared_files,
             &catalog,
             overloads.len(),
-            max_usages,
+            UsageAccumulator::bounded(max_usages),
             None,
             false,
         ) {
@@ -627,47 +624,46 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             }
         };
         let mut hits = vec![BTreeSet::new(); overloads.len()];
-        let mut observed_hits = BTreeSet::new();
-        let mut limit_exceeded = false;
+        let mut observed = UsageAccumulator::bounded(max_usages);
         for file_scan in file_results.into_iter().flatten() {
             for (target_hits, file_target_hits) in hits.iter_mut().zip(file_scan.hits) {
                 target_hits.extend(file_target_hits);
             }
-            observed_hits.extend(file_scan.observed_hits);
-            limit_exceeded |= file_scan.limit_exceeded;
+            observed.absorb(file_scan.observed);
         }
-        // A Scala class is equally nameable from Kotlin source, and the three JVM
-        // languages share one candidate space, so find-references on a Scala type
-        // must see its Kotlin call sites too (#1239 milestone 4). Kotlin's own
-        // scan resolves those names, so what is added here is the file set.
-        if !limit_exceeded
+        // A Scala class is equally nameable from Java and Kotlin source, and the
+        // three JVM languages share one candidate space, so find-references on a
+        // Scala type must see those call sites too (#1239 milestone 4). Each
+        // language's own scan resolves the names it reads, so what is added here
+        // is the file set.
+        if !observed.limit_reached()
             && !scan_scope.is_cancelled()
             && let Some(target) = overloads.first().filter(|target| target.is_class())
         {
-            let mut cross_unproven = BTreeSet::new();
-            let mut cross_raw = 0usize;
+            // The cross scans add to the class's own hits, against the budget
+            // those hits already spent. Their unproven hits are dropped like the
+            // Scala walk's own: a Scala query reports proven hits only.
+            let mut cross = observed.empty_like();
+            cross.merge(std::mem::take(&mut hits[0]), [], 0);
+            crate::analyzer::usages::java_graph::scan_java_files_for_foreign_type(
+                analyzer,
+                token,
+                candidate_files,
+                target,
+                &mut cross,
+            );
             crate::analyzer::usages::kotlin_graph::scan_kotlin_files_for_jvm_type(
                 analyzer,
                 candidate_files,
                 target,
-                max_usages,
-                &mut hits[0],
-                &mut cross_unproven,
-                &mut cross_raw,
-                &mut limit_exceeded,
+                &mut cross,
             );
-            observed_hits.extend(hits[0].iter().cloned());
+            hits[0] = cross.hits().clone();
+            observed.absorb(cross);
         }
 
-        let external_callsites =
-            brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(&observed_hits);
-        if limit_exceeded || external_callsites > max_usages {
-            return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-                short_name: overloads[0].short_name().to_string(),
-                total_callsites: external_callsites,
-                limit: max_usages,
-                sample_hits: observed_hits,
-            });
+        if observed.limit_reached() {
+            return GraphUsageOutcome::Resolved(observed.finish(&overloads[0], 0));
         }
         let hits_by_overload = overloads.iter().cloned().zip(hits).collect();
 

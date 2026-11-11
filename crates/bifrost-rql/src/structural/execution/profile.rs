@@ -1261,6 +1261,7 @@ mod public_contract_tests {
 
     fn result() -> CodeQueryResult {
         CodeQueryResult {
+            depth_bound_status: None,
             session_subset: None,
             results: Vec::new(),
             truncated: true,

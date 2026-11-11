@@ -43,6 +43,12 @@ pub struct RelativeImportGap {
     pub kind: RelativeImportGapKind,
 }
 
+/// Relative import route evidence for one usage-graph request: the importer's
+/// workspace-relative path, the path-bearing gap when an admitted use demands
+/// the route (`None` records an unused import), and the route's open-resolution label.
+#[doc(hidden)]
+pub type RelativeImportRouteEvidence = (String, Option<RelativeImportGap>, String);
+
 /// The precise binding for `name`. Shared by the per-language receiver typing.
 ///
 /// Every caller reads an engine that seeds one target per symbol

@@ -2,6 +2,7 @@ use crate::analyzer::{CodeUnit, ProjectFile, Range};
 use crate::hash::HashMap;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
+use std::ops::Not;
 
 /// Immutable metadata describing a single usage occurrence.
 ///
@@ -151,7 +152,7 @@ pub struct UsageHit {
     pub reason_kind: Option<String>,
     /// Structured source-reference classification when the analyzer can
     /// determine it without guessing from source text.
-    pub reference_kind: Option<ReferenceKind>,
+    pub reference_kind: ReferenceFacets,
 }
 
 impl UsageHit {
@@ -175,7 +176,7 @@ impl UsageHit {
             kind: UsageHitKind::Reference,
             proof: UsageProof::Proven,
             reason_kind: None,
-            reference_kind: None,
+            reference_kind: facets_from_classified(None),
         }
     }
 
@@ -243,7 +244,7 @@ impl UsageHit {
     }
 
     pub fn with_reference_kind(mut self, kind: ReferenceKind) -> Self {
-        self.reference_kind = Some(kind);
+        self.reference_kind = facets_from_classified(Some(kind));
         self
     }
 
@@ -258,7 +259,10 @@ impl UsageHit {
     /// surfaces cannot drift apart on it again.
     pub fn is_lsp_reference_site(&self) -> bool {
         self.kind.included_in(UsageHitSurface::LspReferences)
-            && self.reference_kind != Some(ReferenceKind::SelfTypeAlias)
+            && !self
+                .reference_kind
+                .known()
+                .contains(ReferenceKind::SelfTypeAlias)
     }
 }
 
@@ -301,13 +305,151 @@ pub enum ReferenceKind {
     Inheritance,
 }
 
+impl ReferenceKind {
+    pub const ALL: [Self; 9] = [
+        Self::MethodCall,
+        Self::ConstructorCall,
+        Self::FieldRead,
+        Self::FieldWrite,
+        Self::TypeReference,
+        Self::SelfTypeAlias,
+        Self::StaticReference,
+        Self::SuperCall,
+        Self::Inheritance,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacetProof {
+    Present,
+    Absent,
+    Undecided,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ReferenceKindSet(u16);
+
+impl std::fmt::Debug for ReferenceKindSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+impl ReferenceKindSet {
+    pub fn from_kinds(kinds: impl IntoIterator<Item = ReferenceKind>) -> Self {
+        let mut bits = 0;
+        for kind in kinds {
+            bits |= 1 << (kind as u16);
+        }
+        assert_eq!(bits & !0x1ff, 0);
+        Self(bits)
+    }
+
+    pub fn contains(self, kind: ReferenceKind) -> bool {
+        self.0 & (1 << (kind as u16)) != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = ReferenceKind> {
+        ReferenceKind::ALL
+            .into_iter()
+            .filter(move |kind| self.contains(*kind))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReferenceFacets {
+    known: ReferenceKindSet,
+    undecided: ReferenceKindSet,
+}
+
+impl ReferenceFacets {
+    pub fn from_proofs(proofs: [FacetProof; 9]) -> Self {
+        let mut known = 0;
+        let mut undecided = 0;
+        for (index, proof) in proofs.into_iter().enumerate() {
+            match proof {
+                FacetProof::Present => known |= 1 << index,
+                FacetProof::Undecided => undecided |= 1 << index,
+                FacetProof::Absent => {}
+            }
+        }
+        assert_eq!(known & undecided, 0);
+        assert_eq!((known | undecided) & !0x1ff, 0);
+        Self {
+            known: ReferenceKindSet(known),
+            undecided: ReferenceKindSet(undecided),
+        }
+    }
+
+    pub fn with_present(self, facet: ReferenceKind) -> Self {
+        Self::from_proofs(ReferenceKind::ALL.map(|kind| {
+            if kind == facet || self.known.contains(kind) {
+                FacetProof::Present
+            } else if self.undecided.contains(kind) {
+                FacetProof::Undecided
+            } else {
+                FacetProof::Absent
+            }
+        }))
+    }
+
+    pub fn known(self) -> ReferenceKindSet {
+        self.known
+    }
+    pub fn undecided(self) -> ReferenceKindSet {
+        self.undecided
+    }
+    pub fn matches(self, requested: ReferenceKindSet) -> Truth {
+        if self.known.0 & requested.0 != 0 {
+            Truth::True
+        } else if self.undecided.0 & requested.0 != 0 {
+            Truth::Unknown
+        } else {
+            Truth::False
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Not for Truth {
+    type Output = Self;
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// Preserve only a classifier's positive evidence; other facets remain open.
+pub fn facets_from_classified(kind: Option<ReferenceKind>) -> ReferenceFacets {
+    ReferenceFacets::from_proofs(ReferenceKind::ALL.map(|facet| {
+        if kind == Some(facet) {
+            FacetProof::Present
+        } else {
+            FacetProof::Undecided
+        }
+    }))
+}
+
 /// A resolved reference emitted by graph strategies before rendering as a usage hit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReferenceHit {
     pub file: ProjectFile,
     pub range: Range,
     pub enclosing_unit: CodeUnit,
-    pub kind: Option<ReferenceKind>,
+    pub kind: ReferenceFacets,
     pub resolved: CodeUnit,
     pub confidence: u32,
     pub usage_kind: UsageHitKind,
@@ -327,7 +469,7 @@ pub struct ReferenceCandidate {
     pub qualifier: Option<String>,
     pub owner_identifier: Option<String>,
     pub instance_receiver: bool,
-    pub kind: ReferenceKind,
+    pub kind: ReferenceFacets,
     pub range: Range,
     pub enclosing_unit: CodeUnit,
 }
@@ -345,7 +487,7 @@ pub struct ReceiverTargetRef {
 pub struct ResolvedReceiverCandidate {
     pub identifier: String,
     pub receiver_target: ReceiverTargetRef,
-    pub kind: ReferenceKind,
+    pub kind: ReferenceFacets,
     pub range: Range,
     pub enclosing_unit: CodeUnit,
     pub confidence: u32,
@@ -732,9 +874,9 @@ mod tests {
         ] {
             let mut hit = reference.clone();
             hit.kind = kind;
-            hit.reference_kind = Some(ReferenceKind::TypeReference);
+            hit.reference_kind = facets_from_classified(Some(ReferenceKind::TypeReference));
             assert!(hit.is_lsp_reference_site(), "explicit reference: {kind:?}");
-            hit.reference_kind = Some(ReferenceKind::SelfTypeAlias);
+            hit.reference_kind = facets_from_classified(Some(ReferenceKind::SelfTypeAlias));
             assert!(!hit.is_lsp_reference_site(), "self alias: {kind:?}");
         }
         assert!(reference.is_lsp_reference_site());

@@ -47,7 +47,7 @@ pub struct RustDeclarationScope {
 }
 
 pub struct RustDeclarationTypeIndex {
-    facts: Arc<RustHierarchySourceFacts>,
+    facts: Arc<brokk_bifrost_core::retention_budget::Accounted<RustHierarchySourceFacts>>,
     pub contexts: RustSourceContextIndex,
     declarations: RustSourceDeclarationIndex,
     annotations: HashMap<SourceDeclarationId, AnnotationRow>,
@@ -105,7 +105,7 @@ impl RustSourceDeclarationIndex {
 
 impl RustDeclarationTypeIndex {
     pub fn new(
-        facts: Arc<RustHierarchySourceFacts>,
+        facts: Arc<brokk_bifrost_core::retention_budget::Accounted<RustHierarchySourceFacts>>,
         keep_going: &dyn Fn() -> bool,
     ) -> Result<Self, RustCargoRouteError> {
         let contexts = RustSourceContextIndex::new(&facts, keep_going)?;
@@ -202,7 +202,9 @@ impl RustDeclarationTypeIndex {
         Ok(index)
     }
 
-    pub fn facts(&self) -> &Arc<RustHierarchySourceFacts> {
+    pub fn facts(
+        &self,
+    ) -> &Arc<brokk_bifrost_core::retention_budget::Accounted<RustHierarchySourceFacts>> {
         &self.facts
     }
 

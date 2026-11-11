@@ -53,7 +53,7 @@ fn bound_scope(
     .unwrap_or(ResolutionScopeId::new(0))
 }
 
-fn reference(t: &Typed<'_, '_, '_>, node: Node<'_>) -> Option<ResolutionSiteId> {
+fn reference(t: &Typed<'_, '_, '_, '_>, node: Node<'_>) -> Option<ResolutionSiteId> {
     let node = if node.kind() == "attribute" {
         node.child_by_field_name("attribute")?
     } else {
@@ -67,7 +67,10 @@ fn reference(t: &Typed<'_, '_, '_>, node: Node<'_>) -> Option<ResolutionSiteId> 
 // API authority asks for the callee value, not the result of invoking it.
 // Keep the original call reference and publish an independent binding read at
 // the structurally selected token, using the ordinary value/member contracts.
-fn callee_binding_reference(t: &mut Typed<'_, '_, '_>, node: Node<'_>) -> Option<ResolutionSiteId> {
+fn callee_binding_reference(
+    t: &mut Typed<'_, '_, '_, '_>,
+    node: Node<'_>,
+) -> Option<ResolutionSiteId> {
     let original = reference(t, node)?;
     let mut identifier =
         *t.p.facts
@@ -102,7 +105,7 @@ fn callee_binding_reference(t: &mut Typed<'_, '_, '_>, node: Node<'_>) -> Option
     Some(site)
 }
 
-fn names(t: &mut Typed<'_, '_, '_>, node: Node<'_>) -> PythonMemberNames {
+fn names(t: &mut Typed<'_, '_, '_, '_>, node: Node<'_>) -> PythonMemberNames {
     let literal = PYTHON_STRUCTURAL_SPEC.string_literal_value(node, t.p.source);
     if let Some(literal) = literal {
         return PythonMemberNames::Exact(vec![t.p.facts.intern_name(&mut t.p.names, &literal)]);
@@ -191,7 +194,7 @@ fn dictionary_owner<'tree>(node: Node<'tree>, source: &str) -> Option<Node<'tree
         .flatten()
 }
 
-fn mapping_names(t: &mut Typed<'_, '_, '_>, args: &[Node<'_>]) -> PythonMemberNames {
+fn mapping_names(t: &mut Typed<'_, '_, '_, '_>, args: &[Node<'_>]) -> PythonMemberNames {
     let mut keys = Vec::new();
     let mut seen = HashSet::default();
     for arg in args {
@@ -230,7 +233,11 @@ fn mapping_names(t: &mut Typed<'_, '_, '_>, args: &[Node<'_>]) -> PythonMemberNa
     PythonMemberNames::Exact(keys)
 }
 
-pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &HashMap<usize, u32>) {
+pub(super) fn produce(
+    t: &mut Typed<'_, '_, '_, '_>,
+    nodes: &[Node<'_>],
+    events: &HashMap<usize, u32>,
+) {
     let mut parents: Vec<_> = t.p.facts.scopes.iter().map(|scope| scope.parent).collect();
     for continuation in &t.p.facts.scope_continuations {
         parents[continuation.scope.index()] = continuation.parent;
@@ -310,6 +317,61 @@ pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &Ha
         }
     }
     for node in nodes.iter().copied() {
+        if node.kind() == "assignment"
+            && let Some(left) = node
+                .child_by_field_name("left")
+                .filter(|left| left.kind() == "subscript")
+            && let Some(key) = left.child_by_field_name("subscript").filter(|key| {
+                key.kind() == "identifier" && key.utf8_text(t.p.source.as_bytes()) == Ok("__name__")
+            })
+            && let Some(registry) = left
+                .child_by_field_name("value")
+                .filter(|value| value.kind() == "attribute")
+            && registry
+                .child_by_field_name("attribute")
+                .is_some_and(|name| name.utf8_text(t.p.source.as_bytes()) == Ok("modules"))
+            && let Some(owner) = registry
+                .child_by_field_name("object")
+                .filter(|owner| owner.kind() == "identifier")
+            && let Some(value) = node.child_by_field_name("right")
+        {
+            let registry_reference = t.reference(
+                owner,
+                ResolutionSiteKind::ValueReference,
+                ResolutionNamespace::Value,
+            );
+            let key_reference = t.reference(
+                key,
+                ResolutionSiteKind::ValueReference,
+                ResolutionNamespace::Value,
+            );
+            let value_slot = t.expression(value);
+            let value_site = t.p.facts.type_slots[value_slot.index()].site;
+            let value_reference = t
+                .p
+                .facts
+                .identifiers
+                .iter()
+                .any(|identifier| {
+                    identifier.site == value_site && identifier.role.publishes_semantic_reference()
+                })
+                .then_some(value_site);
+            let statement = node
+                .parent()
+                .filter(|parent| parent.kind() == "expression_statement")
+                .unwrap_or(node);
+            let top_level = statement
+                .parent()
+                .is_some_and(|parent| parent.kind() == "module");
+            t.p.facts
+                .python_module_registry_writes
+                .push(PythonModuleRegistryWriteFact {
+                    registry_reference,
+                    key_reference,
+                    value_reference,
+                    top_level,
+                });
+        }
         if python_node_is_in_annotation(node) {
             continue;
         }
@@ -574,7 +636,7 @@ pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &Ha
                 PythonMemberForm::Getattr | PythonMemberForm::Setattr | PythonMemberForm::Delattr
             ) && let PythonMemberNames::Exact(exact) = &names
                 && let [member] = exact.as_slice()
-                && let Some(receiver) = receiver_slot
+                && let Some(receiver_slot) = receiver_slot
             {
                 t.p.facts.sites[name_site.index()].kind = ResolutionSiteKind::MemberReference;
                 t.p.facts.identifiers.push(PositionedIdentifierFact {
@@ -582,8 +644,13 @@ pub(super) fn produce(t: &mut Typed<'_, '_, '_>, nodes: &[Node<'_>], events: &Ha
                     name: *member,
                     role: ResolutionIdentifierRole::Reference,
                     namespace: ResolutionNamespace::Value,
-                    qualifier: Some(receiver),
+                    qualifier: Some(receiver_slot),
                 });
+                // Preserve the same lexical module continuation as an attribute
+                // read. Receiver selection still decides namespace versus value.
+                if form == PythonMemberForm::Getattr {
+                    t.attribute_root(receiver.expect("member operation receiver"), name_site);
+                }
                 let value =
                     t.p.facts
                         .allocate_type_slot(name_site, ResolutionTypeSlotRole::ExpressionValue);

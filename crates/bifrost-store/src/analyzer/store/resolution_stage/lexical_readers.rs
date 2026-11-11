@@ -1250,7 +1250,9 @@ pub(in crate::analyzer::store) fn close_completions(
                 if cancellation.is_cancelled() {
                     return Ok(None);
                 }
-                if let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason {
+                if let ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) = reason
+                {
                     semantics.insert(*semantic);
                 }
             }
@@ -1273,23 +1275,51 @@ pub(in crate::analyzer::store) fn close_completions(
     {
         return Ok(Some(completions.to_vec()));
     }
-    let Some(closed) = read(selection, cancellation, |connection| {
-        let mut closed = Vec::new();
-        let mut statement=connection.prepare_cached("SELECT input.key FROM json_each(?1) input WHERE EXISTS(SELECT 1 FROM temp.selected_resolution_stage_closed_reasons reason WHERE reason.semantic_key IS input.value->>0 AND reason.semantic_shared IS input.value->>1)")?;
-        let mut rows = statement.query([parameters])?;
-        while let Some(row) = rows.next()? {
-            if cancellation.is_cancelled() {
-                return Ok(None);
+    let memo_key = (selection.staged_read_epoch(), parameters.clone());
+    let cached = selection
+        .closed_reason_reads
+        .borrow()
+        .get(&memo_key)
+        .cloned();
+    let closed_indices = if let Some(indices) = cached {
+        indices
+    } else {
+        let Some(indices) = read(selection, cancellation, |connection| {
+            let mut indices = Vec::new();
+            let mut statement=connection.prepare_cached("SELECT input.key FROM json_each(?1) input WHERE EXISTS(SELECT 1 FROM temp.selected_resolution_stage_closed_reasons reason WHERE reason.semantic_key IS input.value->>0 AND reason.semantic_shared IS input.value->>1)")?;
+            let mut rows = statement.query([&parameters])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(None);
+                }
+                indices.push(row.get::<_, usize>(0)?);
             }
-            closed.push(ResolutionIncompleteReason::UnsupportedSemantic(
-                semantics[row.get::<_, usize>(0)?],
-            ));
+            Ok(Some(indices))
+        })?
+        else {
+            return Ok(None);
+        };
+        if !cancellation.is_cancelled() {
+            selection
+                .closed_reason_reads
+                .borrow_mut()
+                .insert_bounded_weighed(
+                    memo_key,
+                    indices.clone(),
+                    parameters
+                        .len()
+                        .saturating_add(indices.len().saturating_mul(8)),
+                );
         }
-        Ok(Some(closed))
-    })?
-    else {
-        return Ok(None);
+        indices
     };
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let closed = closed_indices
+        .into_iter()
+        .map(|index| ResolutionIncompleteReason::UnsupportedSemantic(semantics[index]))
+        .collect::<Vec<_>>();
     let mut result = Vec::with_capacity(completions.len());
     for completion in completions {
         if cancellation.is_cancelled() {
@@ -1611,12 +1641,13 @@ pub struct ReferenceSeedRow {
     pub host: BindingFragmentId,
     pub node: BindingNodeId,
     pub metadata: Option<crate::analyzer::resolution::FactReferenceSiteMetadata>,
+    pub prefix_reference: Option<Option<crate::analyzer::resolution::SemanticId>>,
 }
 
 pub(in crate::analyzer::store) const REFERENCE_SEED_ROWS_SQL: &str = r#"
 SELECT input.key,producer.host_ordinal,node.node,
  site.source_site,site.namespace,site.site_kind,site.start_byte,site.end_byte,site.unqualified,
- site.owner_kind,site.owner_key,site.owner_shared,site.receiver_origin,site.go_spelling_namespace,site.go_package_qualifier
+ site.owner_kind,site.owner_key,site.owner_shared,site.receiver_origin,site.go_spelling_namespace,site.go_package_qualifier,site.prefix_key,site.prefix_shared
 FROM json_each(?1) input
 CROSS JOIN temp.selected_resolution_stage_nodes node
  ON node.kind_semantic_key IS input.value->>0 AND node.kind_shared_id IS input.value->>1
@@ -1708,6 +1739,18 @@ pub fn reference_seed_rows(
                     host: BindingFragmentId::at_ordinal(row.get(1)?),
                     node: codec::decode_node(row.get(2)?),
                     metadata,
+                    prefix_reference: match (
+                        row.get::<_, Option<i64>>(15)?,
+                        row.get::<_, Option<i64>>(16)?,
+                    ) {
+                        (None, None) => None,
+                        (Some(-1), None) => Some(None),
+                        (Some(key), None) if key >= 0 => Some(Some(codec::decode_semantic(key))),
+                        (None, Some(_)) => {
+                            return Err(StoreError::new("stage prefix must be blob-local"));
+                        }
+                        _ => return Err(StoreError::new("invalid stage prefix coordinate")),
+                    },
                 };
                 if let Some(previous) = &result[ordinal] {
                     if previous != &current {
@@ -2009,11 +2052,7 @@ pub(in crate::analyzer::store) fn reference_inventory_completion(
 ) -> Result<crate::analyzer::resolution::ResolutionCompletion> {
     use crate::analyzer::resolution::ResolutionIncompleteReason;
     let fragments = fragment_ordinals_json(fragments);
-    let wanted_hosts = wanted_hosts_cte(":fragments");
-    let gap_sql = format!(
-        "WITH {wanted_hosts}, raw_gaps(host,reason_key,origin) AS (SELECT mount.mount_ordinal,:local_base+(mount.mount_ordinal<<32)+fact.reason,reason.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=host.mount_ordinal CROSS JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.covers IN(0,1) JOIN main.resolution_gap_reasons reason ON reason.blob_id=fact.blob_id AND reason.reason=fact.reason UNION ALL SELECT fact.host_ordinal,fact.reason_key,fact.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_gaps fact ON fact.host_ordinal=host.mount_ordinal AND fact.covers IN(0,1)) SELECT g.reason_key FROM raw_gaps g WHERE {}",
-        super::frontier_completion::effective_gap_remains_sql()
-    );
+    let gap_sql = reference_inventory_completion_sql();
     let mut reasons = Vec::new();
     let result = with_resolution_read_progress_handler(
         selection.connection(),
@@ -2045,6 +2084,14 @@ pub(in crate::analyzer::store) fn reference_inventory_completion(
         reasons.push(ResolutionIncompleteReason::Cancelled);
     }
     Ok(super::completion_from_reasons(reasons))
+}
+
+pub(in crate::analyzer::store) fn reference_inventory_completion_sql() -> String {
+    let wanted_hosts = wanted_hosts_cte(":fragments");
+    format!(
+        "WITH {wanted_hosts}, raw_gaps(host,reason_key,origin) AS (SELECT mount.mount_ordinal,:local_base+(mount.mount_ordinal<<32)+fact.reason,reason.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_mounts mount ON mount.mount_ordinal=host.mount_ordinal CROSS JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.covers IN(0,1) CROSS JOIN main.resolution_gap_reasons reason ON reason.blob_id=fact.blob_id AND reason.reason=fact.reason UNION ALL SELECT fact.host_ordinal,fact.reason_key,fact.origin FROM wanted_hosts host CROSS JOIN temp.selected_resolution_stage_gaps fact ON fact.host_ordinal=host.mount_ordinal AND fact.covers IN(0,1)) SELECT g.reason_key FROM raw_gaps g WHERE {}",
+        super::frontier_completion::effective_gap_remains_sql()
+    )
 }
 
 pub(in crate::analyzer::store) fn reference_inventory(

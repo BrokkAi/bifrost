@@ -85,6 +85,7 @@ fn overwritten_property_reports_unknown_computed_keys_incomplete() {
 #[test]
 fn misspelled_identifier_skips_parts_the_identifier_dictionary_accepts() {
     use crate::structural::identifier_dictionary::IdentifierDictionary;
+    use crate::structural::identifier_typos::IdentifierTypoTable;
     use crate::structural::search::units::{
         CodeQueryExecutionScope, execute_code_query_unit, plan_seed_files,
     };
@@ -123,24 +124,27 @@ fn misspelled_identifier_skips_parts_the_identifier_dictionary_accepts() {
             .collect::<Vec<_>>()
     };
 
+    let typos = IdentifierTypoTable::parse("lenght length\n").unwrap();
     let unrelated = IdentifierDictionary::parse("total\n").unwrap().dictionary;
     let accepted = IdentifierDictionary::parse("# our spelling\nLenght\n")
         .unwrap()
         .dictionary;
-    assert_eq!(
-        flagged_lines(CodeQueryExecutionScope::for_seed_files(&files, &files)),
-        [3]
-    );
+    let scope = || CodeQueryExecutionScope::for_seed_files(&files, &files);
+    // No typo table: nothing is a known misspelling.
+    assert_eq!(flagged_lines(scope()), Vec::<usize>::new());
+    assert_eq!(flagged_lines(scope().with_identifier_typos(&typos)), [3]);
     assert_eq!(
         flagged_lines(
-            CodeQueryExecutionScope::for_seed_files(&files, &files)
+            scope()
+                .with_identifier_typos(&typos)
                 .with_identifier_dictionary(&unrelated)
         ),
         [3]
     );
     assert_eq!(
         flagged_lines(
-            CodeQueryExecutionScope::for_seed_files(&files, &files)
+            scope()
+                .with_identifier_typos(&typos)
                 .with_identifier_dictionary(&accepted)
         ),
         Vec::<usize>::new()

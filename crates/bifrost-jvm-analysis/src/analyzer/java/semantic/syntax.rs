@@ -5,9 +5,7 @@ use brokk_bifrost_analysis::analyzer::common::is_comment_kind;
 pub(super) use brokk_bifrost_jvm::java::declarations::java_field_access_is_selector_object;
 use brokk_bifrost_semantic::analyzer::semantic::lowering::field_matches;
 
-pub(in crate::analyzer::java::semantic) fn declaration_container_kind(
-    node: Node<'_>,
-) -> Option<DeclarationSegmentKind> {
+pub(crate) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
     match node.kind() {
         "class_declaration"
         | "interface_declaration"
@@ -57,69 +55,14 @@ pub(in crate::analyzer::java::semantic) fn callable_shape<'tree>(
     Node<'tree>,
     ProcedureProperties,
 )> {
-    let (kind, segment_kind, body, is_static) = match node.kind() {
-        "method_declaration" => (
-            ProcedureKind::Method,
-            DeclarationSegmentKind::Method,
-            node.child_by_field_name("body")?,
-            has_modifier(node, "static"),
-        ),
-        "constructor_declaration" => (
-            ProcedureKind::Constructor,
-            DeclarationSegmentKind::Constructor,
-            node.child_by_field_name("body")?,
-            false,
-        ),
-        "compact_constructor_declaration" => (
-            ProcedureKind::Constructor,
-            DeclarationSegmentKind::Constructor,
-            node.child_by_field_name("body")?,
-            false,
-        ),
-        "lambda_expression" => (
-            ProcedureKind::Lambda,
-            DeclarationSegmentKind::Lambda,
-            node.child_by_field_name("body")?,
-            false,
-        ),
-        "static_initializer" => (
-            ProcedureKind::Initializer,
-            DeclarationSegmentKind::Initializer,
-            first_named_child(node)?,
-            true,
-        ),
-        "block"
-            if node
-                .parent()
-                .is_some_and(|parent| parent.kind() == "class_body") =>
-        {
-            (
-                ProcedureKind::Initializer,
-                DeclarationSegmentKind::Initializer,
-                node,
-                false,
-            )
-        }
-        "variable_declarator"
-            if node.parent().is_some_and(|parent| {
-                matches!(parent.kind(), "field_declaration" | "constant_declaration")
-            }) =>
-        {
-            let field = node.parent().expect("guarded field-declaration parent");
-            (
-                ProcedureKind::Initializer,
-                DeclarationSegmentKind::Initializer,
-                node.child_by_field_name("value")?,
-                field.kind() == "constant_declaration" || has_modifier(field, "static"),
-            )
-        }
-        "enum_constant" => (
-            ProcedureKind::Initializer,
-            DeclarationSegmentKind::Initializer,
-            node,
-            true,
-        ),
-        _ => return None,
+    let (kind, body, is_static) =
+        brokk_bifrost_jvm::java::callable_shape::java_callable_shape(node)?;
+    let segment_kind = match kind {
+        ProcedureKind::Method => DeclarationSegmentKind::Method,
+        ProcedureKind::Constructor => DeclarationSegmentKind::Constructor,
+        ProcedureKind::Lambda => DeclarationSegmentKind::Lambda,
+        ProcedureKind::Initializer => DeclarationSegmentKind::Initializer,
+        _ => unreachable!("Java callable grammar has only four kinds"),
     };
     let dispatch_extensibility = if kind == ProcedureKind::Constructor
         || is_static

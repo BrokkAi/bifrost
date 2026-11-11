@@ -73,6 +73,13 @@ use crate::analyzer::semantic::EvidenceCompleteness;
 
 use crate::analyzer::semantic::EvidenceId;
 
+use crate::analyzer::semantic::{
+    CallControlBranch, CallControlDisposition, CallControlKind, CallTargetObligation,
+    FootprintClass, FootprintDisposition, FootprintExclusion, FootprintRefusal,
+    ProcedureCallControlCoverage, ProcedureFootprintCoverage, call_target_gap_pair,
+    present_footprint_classes,
+};
+
 use crate::analyzer::semantic::ExecutionTiming;
 
 use crate::analyzer::semantic::FormalMultiplicity;
@@ -187,6 +194,211 @@ pub struct NormalizedConditionGuard {
     pub holds_on_false_arm: bool,
 }
 
+#[cfg(test)]
+mod call_control_boundary_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::language_knowledge::{LanguageKnowledge, ParserFlavor};
+    use brokk_bifrost_rust::RustKnowledge;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10473: a re-registration that consumed a node did not re-check the claims nested in it"
+    )]
+    fn final_merged_boundary_claims_detect_contradictions() {
+        let parent = FootprintBoundaryClaim {
+            node_id: 1,
+            start: 0,
+            end: 10,
+            disposition: BoundaryDisposition::Lowered,
+            consumed: false,
+            branch: None,
+        };
+        let child = FootprintBoundaryClaim {
+            node_id: 2,
+            start: 2,
+            end: 3,
+            disposition: BoundaryDisposition::ExcludedOwnedElsewhere,
+            ..parent
+        };
+        let consumed_parent = FootprintBoundaryClaim {
+            consumed: true,
+            ..parent
+        };
+        // A zero-length claim overlaps a range only strictly inside it, as in
+        // the pairwise rule `a.start < b.end && b.start < a.end`: at a parent's
+        // start it touches nothing, so it must not meet same-start ancestors.
+        let empty_at = |at: usize, consumed: bool| FootprintBoundaryClaim {
+            node_id: 3,
+            start: at,
+            end: at,
+            consumed,
+            ..child
+        };
+        for (claims, expected) in [
+            (vec![parent, empty_at(0, true)], false),
+            (vec![consumed_parent, empty_at(0, false)], false),
+            (vec![consumed_parent, empty_at(2, false)], true),
+            (vec![parent, child, consumed_parent], true),
+            (vec![consumed_parent, child], true),
+            (vec![child, consumed_parent], true),
+            (
+                vec![
+                    consumed_parent,
+                    FootprintBoundaryClaim {
+                        disposition: parent.disposition,
+                        ..child
+                    },
+                ],
+                false,
+            ),
+            (
+                vec![
+                    consumed_parent,
+                    FootprintBoundaryClaim {
+                        start: 10,
+                        end: 12,
+                        ..child
+                    },
+                ],
+                false,
+            ),
+            (
+                vec![
+                    parent,
+                    FootprintBoundaryClaim {
+                        start: 9,
+                        end: 12,
+                        ..child
+                    },
+                ],
+                true,
+            ),
+        ] {
+            let mut account = FootprintBoundaryAccount::default();
+            for claim in claims {
+                account.register(claim);
+            }
+            assert_eq!(
+                account.has_contradiction(),
+                expected,
+                "{:?}",
+                account.claims
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9550: consumed outer calls hid nested call syntax from scoped enumeration"
+    )]
+    fn consumed_outer_call_still_enumerates_inner_call() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&RustKnowledge.parser_language(ParserFlavor::Default))
+            .unwrap();
+        let tree = parser.parse("fn f() { outer(inner()); }", None).unwrap();
+        let function = tree.root_node().named_child(0).unwrap();
+        let mut account = FootprintBoundaryAccount::default();
+        let mut stack = vec![function];
+        while let Some(node) = stack.pop() {
+            account.register(FootprintBoundaryClaim {
+                node_id: node.id(),
+                start: node.start_byte(),
+                end: node.end_byte(),
+                disposition: BoundaryDisposition::Lowered,
+                consumed: node.kind() == "call_expression",
+                branch: None,
+            });
+            if node.kind() != "call_expression" {
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+        let (_, coverage) = account.assemble(function, |node| {
+            if node.kind() == "call_expression" {
+                (
+                    CallControlKind::ExplicitCall,
+                    CallControlDisposition::Represented,
+                )
+            } else {
+                (
+                    CallControlKind::Syntax,
+                    CallControlDisposition::AffirmativelyExcluded(
+                        crate::analyzer::semantic::FootprintExclusion::NoInstance,
+                    ),
+                )
+            }
+        });
+        assert_eq!(
+            coverage
+                .branches
+                .iter()
+                .filter(|b| b.kind == CallControlKind::ExplicitCall)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unvisited_branch_refuses_but_enumerated_boundary_admits() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&RustKnowledge.parser_language(ParserFlavor::Default))
+            .unwrap();
+        let tree = parser.parse("fn f() {}", None).unwrap();
+        let function = tree.root_node().named_child(0).unwrap();
+        let mut account = FootprintBoundaryAccount::default();
+        let mut stack = vec![function];
+        while let Some(node) = stack.pop() {
+            account.register(FootprintBoundaryClaim {
+                node_id: node.id(),
+                start: node.start_byte(),
+                end: node.end_byte(),
+                disposition: BoundaryDisposition::Lowered,
+                consumed: false,
+                branch: None,
+            });
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let refused_effect = FootprintBoundaryAccount {
+            claims: account.claims.clone(),
+            formal_slots: Some(Err(FootprintRefusal::FormalSlotsUnavailable)),
+            ..FootprintBoundaryAccount::default()
+        };
+        fn classify(_: Node<'_>) -> (CallControlKind, CallControlDisposition) {
+            (
+                CallControlKind::Syntax,
+                CallControlDisposition::AffirmativelyExcluded(
+                    crate::analyzer::semantic::FootprintExclusion::NoInstance,
+                ),
+            )
+        }
+        let (_, covered) = account.assemble(function, classify);
+        assert_eq!(covered.source_boundary, Ok(()));
+        assert_eq!(covered.admission, Ok(()));
+        let (_, refused) = refused_effect.assemble(function, classify);
+        assert_eq!(refused.source_boundary, Ok(()));
+        assert_eq!(refused.admission, Ok(()));
+
+        let mut missing = FootprintBoundaryAccount::default();
+        missing.register(FootprintBoundaryClaim {
+            node_id: function.id(),
+            start: function.start_byte(),
+            end: function.end_byte(),
+            disposition: BoundaryDisposition::Lowered,
+            consumed: false,
+            branch: None,
+        });
+        let (_, uncovered) = missing.assemble(function, classify);
+        assert_eq!(
+            uncovered.source_boundary,
+            Err(FootprintRefusal::UnaccountedSourceNode)
+        );
+        assert!(uncovered.admission.is_err());
+    }
+}
+
 impl NormalizedConditionGuard {
     /// The predicate already states the condition's own polarity.
     pub const fn folded(predicate: GuardPredicate, subject: Option<ValueId>) -> Self {
@@ -216,8 +428,18 @@ pub struct MissingGuardOperand<'tree> {
 
 /// Peel transparent parentheses and logical negation without recursion.
 pub fn peel_guard_condition<'tree>(
+    node: Node<'tree>,
+    syntax: &GuardConditionSyntax,
+) -> Result<(Node<'tree>, bool), MissingGuardOperand<'tree>> {
+    peel_guard_condition_visiting(node, syntax, |_| {})
+}
+
+/// [`peel_guard_condition`] that also reports each wrapper it passes through,
+/// outermost first, so a caller can account for the peeled nodes.
+pub fn peel_guard_condition_visiting<'tree>(
     mut node: Node<'tree>,
     syntax: &GuardConditionSyntax,
+    mut visit_wrapper: impl FnMut(Node<'tree>),
 ) -> Result<(Node<'tree>, bool), MissingGuardOperand<'tree>> {
     let mut negated = false;
     loop {
@@ -229,21 +451,25 @@ pub fn peel_guard_condition<'tree>(
                     |child| !brokk_bifrost_core::analyzer::tree_walk::is_comment_kind(child.kind()),
                 ),
             };
-            node = inner.ok_or(MissingGuardOperand {
+            let inner = inner.ok_or(MissingGuardOperand {
                 node,
                 field: syntax.parenthesis_field.unwrap_or("value"),
             })?;
+            visit_wrapper(node);
+            node = inner;
         } else if syntax.negation_kinds.contains(&node.kind())
             && node
                 .child_by_field_name(syntax.operator_field)
                 .is_some_and(|operator| operator.kind() == syntax.negation_operator)
         {
-            node = node
-                .child_by_field_name(syntax.operand_field)
-                .ok_or(MissingGuardOperand {
-                    node,
-                    field: syntax.operand_field,
-                })?;
+            let operand =
+                node.child_by_field_name(syntax.operand_field)
+                    .ok_or(MissingGuardOperand {
+                        node,
+                        field: syntax.operand_field,
+                    })?;
+            visit_wrapper(node);
+            node = operand;
             negated = !negated;
         } else {
             return Ok((node, negated));
@@ -1598,6 +1824,68 @@ where
 #[doc(hidden)]
 pub const RECEIVER_CAPTURE_DESTINATION: MemoryLocationId = MemoryLocationId::new(0);
 
+/// The scoped call/control proof computed from a lowered procedure.
+#[doc(hidden)]
+pub struct ScopedCallControlAccounting {
+    pub obligations: Vec<CallTargetObligation>,
+    pub covered_gap_ids: brokk_bifrost_core::hash::HashSet<SemanticGapId>,
+    pub unaccounted_gap_ids: brokk_bifrost_core::hash::HashSet<SemanticGapId>,
+    pub missing_unknown_pair: bool,
+}
+
+/// Account for call target gaps in the scoped proof.
+#[doc(hidden)]
+pub fn scoped_call_control_accounting(
+    call_sites: &[SemanticCallSite],
+    gaps: &[SemanticGap],
+) -> ScopedCallControlAccounting {
+    let mut covered_gap_ids = brokk_bifrost_core::hash::HashSet::default();
+    let mut obligations = Vec::new();
+    let mut missing_unknown_pair = false;
+    for call in call_sites {
+        if let Some((gap, callable_gap)) = call_target_gap_pair(call, gaps) {
+            covered_gap_ids.insert(gap.id);
+            covered_gap_ids.insert(callable_gap.id);
+            for related_gap in gaps.iter().filter(|related_gap| {
+                related_gap.subject == SemanticGapSubject::Value(call.callee)
+                    && related_gap.capability == SemanticCapability::CallableReferences
+                    && related_gap.kind == SemanticGapKind::Unknown
+            }) {
+                covered_gap_ids.insert(related_gap.id);
+            }
+            obligations.push(CallTargetObligation {
+                call: call.id,
+                gap: gap.id,
+                impacts: gap.impacts,
+            });
+        } else if matches!(call.declared_targets, CallableTargetResolution::Unknown) {
+            missing_unknown_pair = true;
+        }
+        for gap in gaps.iter().filter(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(call.id)
+                && gap.capability == SemanticCapability::DynamicDispatch
+        }) {
+            covered_gap_ids.insert(gap.id);
+            obligations.push(CallTargetObligation {
+                call: call.id,
+                gap: gap.id,
+                impacts: gap.impacts,
+            });
+        }
+    }
+    let unaccounted_gap_ids = gaps
+        .iter()
+        .filter(|gap| !covered_gap_ids.contains(&gap.id))
+        .map(|gap| gap.id)
+        .collect();
+    ScopedCallControlAccounting {
+        obligations,
+        covered_gap_ids,
+        unaccounted_gap_ids,
+        missing_unknown_pair,
+    }
+}
+
 /// Adapter-supplied values needed to publish one ordinary call row and its
 /// matched continuation events. Syntax evaluation and control edges remain
 /// adapter-owned.
@@ -1729,6 +2017,290 @@ pub fn extend_scope_frames<T: Clone>(
 }
 
 /// Source-anchor-aware emission state shared by every language adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchClass {
+    Identifier,
+    Literal,
+    Type,
+    Block,
+    ExpressionStatement,
+    DirectCall,
+    UnitReturn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryDisposition {
+    Lowered,
+    ExcludedOwnedElsewhere,
+    ExcludedNoEffect(BranchClass),
+    Refused(FootprintRefusal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FootprintBoundaryClaim {
+    node_id: usize,
+    start: usize,
+    end: usize,
+    disposition: BoundaryDisposition,
+    consumed: bool,
+    branch: Option<BranchClass>,
+}
+
+#[derive(Default)]
+struct FootprintBoundaryAccount {
+    claims: Vec<FootprintBoundaryClaim>,
+    claim_indices: HashMap<usize, usize>,
+    scoped_nodes: brokk_bifrost_core::hash::HashSet<usize>,
+    classes: [Option<FootprintDisposition>; 15],
+    formal_slots: Option<Result<usize, FootprintRefusal>>,
+    contradiction: bool,
+}
+
+impl FootprintBoundaryAccount {
+    fn register(&mut self, claim: FootprintBoundaryClaim) {
+        if let Some(&index) = self.claim_indices.get(&claim.node_id) {
+            let existing = &mut self.claims[index];
+            if existing.disposition != claim.disposition
+                || (existing.branch.is_some()
+                    && claim.branch.is_some()
+                    && existing.branch != claim.branch)
+            {
+                self.contradiction = true;
+            }
+            existing.consumed |= claim.consumed;
+            existing.branch = existing.branch.or(claim.branch);
+            return;
+        }
+        self.claim_indices.insert(claim.node_id, self.claims.len());
+        self.claims.push(claim);
+    }
+
+    fn has_contradiction(&self) -> bool {
+        if self.contradiction {
+            return true;
+        }
+        // Sorting references preserves registration order for coverage consumers.
+        let mut ordered: Vec<_> = self.claims.iter().collect();
+        ordered.sort_unstable_by_key(|c| (c.start, std::cmp::Reverse(c.end), c.node_id));
+        // Counts let a popped ancestor remove its value without scanning the stack.
+        // The value domain is bounded by the disposition and branch enums.
+        let mut values: Vec<(BoundaryDisposition, Option<BranchClass>, usize, usize)> = Vec::new();
+        let mut stack: Vec<&FootprintBoundaryClaim> = Vec::new();
+        let mut earlier_values = Vec::new();
+        let mut current_start = None;
+        for claim in ordered {
+            while stack
+                .last()
+                .is_some_and(|ancestor| ancestor.end <= claim.start)
+            {
+                let ancestor = stack.pop().unwrap();
+                let value = values
+                    .iter_mut()
+                    .find(|v| v.0 == ancestor.disposition && v.1 == ancestor.branch)
+                    .unwrap();
+                value.2 -= 1;
+                value.3 -= usize::from(ancestor.consumed);
+            }
+            if current_start != Some(claim.start) {
+                earlier_values.clone_from(&values);
+                current_start = Some(claim.start);
+            }
+            if stack
+                .last()
+                .is_some_and(|ancestor| ancestor.end < claim.end)
+            {
+                return true;
+            }
+            // Empty intervals overlap only ancestors that started strictly earlier.
+            let ancestors = if claim.start == claim.end {
+                &earlier_values
+            } else {
+                &values
+            };
+            if ancestors
+                .iter()
+                .any(|&(disposition, branch, all, consumed)| {
+                    (if claim.consumed { all } else { consumed }) > 0
+                        && (disposition != claim.disposition
+                            || (branch.is_some()
+                                && claim.branch.is_some()
+                                && branch != claim.branch))
+                })
+            {
+                return true;
+            }
+            if claim.start == claim.end {
+                continue;
+            }
+            if let Some(value) = values
+                .iter_mut()
+                .find(|v| v.0 == claim.disposition && v.1 == claim.branch)
+            {
+                value.2 += 1;
+                value.3 += usize::from(claim.consumed);
+            } else {
+                values.push((
+                    claim.disposition,
+                    claim.branch,
+                    1,
+                    usize::from(claim.consumed),
+                ));
+            }
+            stack.push(claim);
+        }
+        false
+    }
+
+    fn assemble<F>(
+        self,
+        boundary: Node<'_>,
+        classify: F,
+    ) -> (ProcedureFootprintCoverage, ProcedureCallControlCoverage)
+    where
+        F: for<'tree> Fn(Node<'tree>) -> (CallControlKind, CallControlDisposition),
+    {
+        let mut result = ProcedureFootprintCoverage::unclassified();
+        let mut call_control = ProcedureCallControlCoverage::default();
+        if self.claims.is_empty() {
+            return (result, call_control);
+        }
+        result.boundary = if self.has_contradiction() {
+            Err(FootprintRefusal::ContradictoryOwnership)
+        } else {
+            Ok(())
+        };
+        let mut source_boundary = result.boundary;
+        if self
+            .claims
+            .iter()
+            .any(|claim| claim.start < boundary.start_byte() || claim.end > boundary.end_byte())
+        {
+            result.boundary = Err(FootprintRefusal::ContradictoryOwnership);
+            source_boundary = Err(FootprintRefusal::ContradictoryOwnership);
+        }
+        let claims: HashMap<usize, FootprintBoundaryClaim> = self
+            .claims
+            .iter()
+            .copied()
+            .map(|claim| (claim.node_id, claim))
+            .collect();
+        let mut stack = vec![boundary];
+        while let Some(node) = stack.pop() {
+            if !node.is_named() {
+                continue;
+            }
+            let claim = claims.get(&node.id());
+            if claim.is_none() {
+                if !self.scoped_nodes.contains(&node.id()) && source_boundary.is_ok() {
+                    source_boundary = Err(FootprintRefusal::UnaccountedSourceNode);
+                }
+                if result.boundary.is_ok() {
+                    result.boundary = Err(FootprintRefusal::UnaccountedSourceNode);
+                }
+                if !self.scoped_nodes.contains(&node.id()) {
+                    continue;
+                }
+            }
+            let (kind, mut disposition) = classify(node);
+            // The selected callable owns its own body. This exception applies
+            // only to callable declarations, never to initializer fragments.
+            if node.id() == boundary.id() && kind == CallControlKind::NestedCallable {
+                disposition = CallControlDisposition::Represented;
+            }
+            call_control.branches.push(CallControlBranch {
+                start: node.start_byte(),
+                end: node.end_byte(),
+                kind,
+                disposition,
+            });
+            if let Some(FootprintBoundaryClaim {
+                disposition: BoundaryDisposition::Refused(reason),
+                ..
+            }) = claim
+                && result.boundary.is_ok()
+            {
+                result.boundary = Err(*reason);
+            }
+            if claim.is_some_and(|claim| {
+                claim.consumed
+                    || matches!(claim.disposition, BoundaryDisposition::ExcludedNoEffect(_))
+                    || (matches!(
+                        claim.disposition,
+                        BoundaryDisposition::ExcludedOwnedElsewhere
+                    ) && node.child_by_field_name("body").is_none())
+            }) {
+                // Lowering consumption and footprint exclusion do not prove call
+                // enumeration. Inspect descendants without changing the full walk.
+                let mut descendants = Vec::new();
+                let mut cursor = node.walk();
+                descendants.extend(node.named_children(&mut cursor));
+                while let Some(descendant) = descendants.pop() {
+                    let (kind, disposition) = classify(descendant);
+                    call_control.branches.push(CallControlBranch {
+                        start: descendant.start_byte(),
+                        end: descendant.end_byte(),
+                        kind,
+                        disposition,
+                    });
+                    let mut cursor = descendant.walk();
+                    descendants.extend(descendant.named_children(&mut cursor));
+                }
+                continue;
+            }
+            let owned_body = if claim.is_some_and(|claim| {
+                matches!(
+                    claim.disposition,
+                    BoundaryDisposition::ExcludedOwnedElsewhere
+                )
+            }) {
+                node.child_by_field_name("body").map(|body| body.id())
+            } else {
+                None
+            };
+            if claim.is_some_and(|claim| {
+                matches!(
+                    claim.disposition,
+                    BoundaryDisposition::ExcludedOwnedElsewhere
+                )
+            }) && owned_body.is_none()
+            {
+                continue;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if Some(child.id()) != owned_body {
+                    stack.push(child);
+                }
+            }
+        }
+        if let Some(Err(reason)) = self.formal_slots
+            && result.boundary.is_ok()
+        {
+            result.boundary = Err(reason);
+        }
+        for class in FootprintClass::ALL {
+            if let Some(disposition) = self.classes[(class.code() - 1) as usize] {
+                result.classes[(class.code() - 1) as usize] = disposition;
+            }
+        }
+        call_control.source_boundary = source_boundary;
+        call_control.admission = source_boundary;
+        if call_control.admission.is_ok()
+            && let Some(reason) = call_control.branches.iter().find_map(|branch| {
+                if let CallControlDisposition::Refused(reason) = branch.disposition {
+                    Some(reason)
+                } else {
+                    None
+                }
+            })
+        {
+            call_control.admission = Err(reason);
+        }
+        (result, call_control)
+    }
+}
+
+/// Source-anchor-aware emission state shared by every language adapter.
 #[doc(hidden)]
 pub struct ProcedureLoweringSession<'a> {
     #[doc(hidden)]
@@ -1746,11 +2318,211 @@ pub struct ProcedureLoweringSession<'a> {
     next_guard: usize,
     next_switch_fact: usize,
     source_occurrences: HashMap<(usize, usize), u32>,
+    footprint: FootprintBoundaryAccount,
     #[doc(hidden)]
     pub cancellation: &'a CancellationToken,
 }
 
 impl<'a> ProcedureLoweringSession<'a> {
+    pub fn footprint_register(&mut self, node: Node<'_>, disposition: BoundaryDisposition) {
+        self.footprint.register(FootprintBoundaryClaim {
+            node_id: node.id(),
+            start: node.start_byte(),
+            end: node.end_byte(),
+            disposition,
+            consumed: false,
+            branch: None,
+        });
+    }
+
+    pub fn footprint_consume_subtree(&mut self, node: Node<'_>, branch: BranchClass) {
+        self.footprint.register(FootprintBoundaryClaim {
+            node_id: node.id(),
+            start: node.start_byte(),
+            end: node.end_byte(),
+            disposition: BoundaryDisposition::Lowered,
+            consumed: true,
+            branch: Some(branch),
+        });
+    }
+
+    /// Claim syntax visited by lowering for the scoped proof only. The full
+    /// footprint retains its own independent source ownership result.
+    pub fn footprint_refuse_subtree_for_scoped(&mut self, node: Node<'_>) {
+        let mut stack = vec![node];
+        while let Some(node) = stack.pop() {
+            if node.is_named() {
+                self.footprint.scoped_nodes.insert(node.id());
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+        }
+    }
+
+    /// Claim one node visited by lowering for the scoped proof only. Unlike
+    /// `footprint_refuse_subtree_for_scoped`, each child still needs its own
+    /// claim, so syntax that lowering did not visit stays unaccounted.
+    pub fn footprint_refuse_node_for_scoped(&mut self, node: Node<'_>) {
+        self.footprint.scoped_nodes.insert(node.id());
+    }
+
+    pub fn footprint_formal_slots(&mut self, outcome: Result<usize, FootprintRefusal>) {
+        if let Some(previous) = self.footprint.formal_slots
+            && previous != outcome
+        {
+            self.footprint.contradiction = true;
+        }
+        self.footprint.formal_slots = Some(outcome);
+        self.footprint_class(
+            FootprintClass::FormalSlots,
+            match outcome {
+                Ok(_) => FootprintDisposition::Represented,
+                Err(reason) => FootprintDisposition::Refused(reason),
+            },
+        );
+    }
+
+    pub fn footprint_class(&mut self, class: FootprintClass, disposition: FootprintDisposition) {
+        let slot = &mut self.footprint.classes[(class.code() - 1) as usize];
+        if let Some(previous) = slot
+            && *previous != disposition
+        {
+            self.footprint.contradiction = true;
+        }
+        *slot = Some(disposition);
+    }
+
+    /// Set each listed class from the lowered rows: `Represented` when
+    /// `present_footprint_classes` finds a witnessing row, and
+    /// `Excluded(NoInstance)` otherwise. Only the five classes that a row
+    /// family witnesses may be listed. The exclusion is as sound as the
+    /// source-boundary account: every effect of a claimed node is a row or a
+    /// gap, and `assemble_footprint` refuses the boundary for any gap that is
+    /// not a call-target obligation.
+    pub fn footprint_classes_from_rows(
+        &mut self,
+        parts: &ProcedureSemanticsParts,
+        classes: &[FootprintClass],
+    ) {
+        let present = present_footprint_classes(parts);
+        for &class in classes {
+            assert!(
+                matches!(
+                    class,
+                    FootprintClass::MemoryWrite
+                        | FootprintClass::MemoryRead
+                        | FootprintClass::StaticGlobal
+                        | FootprintClass::PublicationEscape
+                        | FootprintClass::DeferredExecution
+                ),
+                "{class:?} is not witnessed by a row family"
+            );
+            self.footprint_class(
+                class,
+                if present.contains(&class) {
+                    FootprintDisposition::Represented
+                } else {
+                    FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
+                },
+            );
+        }
+    }
+
+    /// Consume the transient account after the adapter finishes its CFG.
+    pub fn assemble_footprint<F>(
+        &mut self,
+        parts: &mut ProcedureSemanticsParts,
+        boundary: Node<'_>,
+        classify: F,
+    ) where
+        F: for<'tree> Fn(Node<'tree>) -> (CallControlKind, CallControlDisposition),
+    {
+        let account = std::mem::take(&mut self.footprint);
+        let (footprint, call_control) = account.assemble(boundary, classify);
+        parts.footprint_coverage = footprint;
+        parts.call_control_coverage = call_control;
+        let unrepresented_call = parts
+            .call_control_coverage
+            .branches
+            .iter()
+            .filter(|branch| {
+                branch.kind == CallControlKind::ExplicitCall
+                    && branch.disposition == CallControlDisposition::Represented
+            })
+            .any(|branch| {
+                !parts.call_sites.iter().any(|call| {
+                    parts
+                        .source_mappings
+                        .get(call.source.index())
+                        .is_some_and(|mapping| {
+                            let span = mapping.locator.anchor().span();
+                            mapping.kind == SourceMappingKind::Exact
+                                && span.start_byte() as usize == branch.start
+                                && span.end_byte() as usize == branch.end
+                        })
+                })
+            });
+        if unrepresented_call && parts.call_control_coverage.admission.is_ok() {
+            parts.call_control_coverage.admission = Err(FootprintRefusal::RelevantGap);
+        }
+        let mut target_gap_ids = brokk_bifrost_core::hash::HashSet::default();
+        for call in &parts.call_sites {
+            let Some((gap, callable_gap)) = call_target_gap_pair(call, &parts.gaps) else {
+                break;
+            };
+            target_gap_ids.insert(gap.id);
+            target_gap_ids.insert(callable_gap.id);
+            parts
+                .footprint_coverage
+                .call_target_obligations
+                .push(CallTargetObligation {
+                    call: call.id,
+                    gap: gap.id,
+                    impacts: gap.impacts,
+                });
+        }
+        let scoped = scoped_call_control_accounting(&parts.call_sites, &parts.gaps);
+        parts
+            .call_control_coverage
+            .call_target_obligations
+            .extend(scoped.obligations);
+        if (scoped.missing_unknown_pair || !scoped.unaccounted_gap_ids.is_empty())
+            && parts.call_control_coverage.admission.is_ok()
+        {
+            parts.call_control_coverage.admission = Err(FootprintRefusal::RelevantGap);
+        }
+        if parts
+            .gaps
+            .iter()
+            .any(|gap| !target_gap_ids.contains(&gap.id))
+            && parts.footprint_coverage.boundary.is_ok()
+        {
+            parts.footprint_coverage.boundary = Err(FootprintRefusal::RelevantGap);
+        }
+    }
+
+    /// Record the known normal-resumption alternative for a suspended
+    /// generator and connect it to the adapter's normal continuation. This
+    /// does not model a complete generator lifecycle or its abrupt paths.
+    #[doc(hidden)]
+    pub fn add_partial_generator_normal_continuation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        next: ControlTarget,
+        detail: &str,
+    ) -> Result<(), ProcedureLoweringError> {
+        self.record_gap(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::GeneratorSuspension,
+            SemanticGapKind::Unsupported,
+            detail,
+        )?;
+        self.add_target_edge(builder, point, next)
+    }
+
     /// Seed the exact procedure provenance, entry/exit points, and function
     /// completion scope used by every production adapter.
     #[doc(hidden)]
@@ -1917,6 +2689,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             next_guard: 0,
             next_switch_fact: 0,
             source_occurrences: HashMap::default(),
+            footprint: FootprintBoundaryAccount::default(),
             cancellation,
         };
         Ok((
@@ -2255,6 +3028,8 @@ impl<'a> ProcedureLoweringSession<'a> {
         let id = ValueId::try_from_index(self.next_value)
             .map_err(|_| ProcedureLoweringError::Invalid("too many semantic values".into()))?;
         builder.add_value(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id,
             kind,
             source: metadata.source,
@@ -2752,6 +3527,32 @@ impl<'a> ProcedureLoweringSession<'a> {
             .map(|_| ())
     }
 
+    /// Record an exceeded-budget gap with the structured measurement the IR
+    /// contract requires for that outcome.
+    #[doc(hidden)]
+    pub fn record_exceeded_budget_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        subject: SemanticGapSubject,
+        capability: SemanticCapability,
+        exceeded: SemanticBudgetExceeded,
+        detail: impl Into<Box<str>>,
+    ) -> Result<(), ProcedureLoweringError> {
+        self.add_gap_with_exact_impacts_and_discharge(
+            builder,
+            point,
+            subject,
+            capability,
+            SemanticGapImpacts::for_gap(capability, subject),
+            SemanticGapKind::ExceededBudget,
+            Some(exceeded),
+            SemanticGapDischarge::None,
+            detail,
+        )
+        .map(|_| ())
+    }
+
     #[doc(hidden)]
     pub fn add_unhandled_control_syntax_gap(
         &mut self,
@@ -2947,6 +3748,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             capability,
             impacts,
             kind,
+            None,
             SemanticGapDischarge::ModeledEffectPartition,
             detail,
         )
@@ -2974,6 +3776,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             capability,
             impacts,
             kind,
+            None,
             SemanticGapDischarge::ModeledEffectPartition,
             detail,
         )
@@ -2999,6 +3802,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             capability,
             SemanticGapImpacts::for_gap(capability, subject).union(additional_impacts),
             kind,
+            None,
             discharge,
             detail,
         )
@@ -3013,6 +3817,7 @@ impl<'a> ProcedureLoweringSession<'a> {
         capability: SemanticCapability,
         impacts: SemanticGapImpacts,
         kind: SemanticGapKind,
+        budget: Option<SemanticBudgetExceeded>,
         discharge: SemanticGapDischarge,
         detail: impl Into<Box<str>>,
     ) -> Result<SemanticGapId, ProcedureLoweringError> {
@@ -3026,7 +3831,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             capability,
             impacts,
             kind,
-            budget: None,
+            budget,
             discharge,
             detail: detail.into(),
             source: metadata.source,
@@ -3064,6 +3869,59 @@ impl<'a> ProcedureLoweringSession<'a> {
         target: ControlTarget,
     ) -> Result<(), ProcedureLoweringError> {
         self.add_edge(builder, source_point, target.point, target.kind)
+    }
+
+    /// Add a candidate control route whose target carries the exact gap.
+    #[doc(hidden)]
+    pub fn add_unproven_target_edge(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        source_point: ProgramPointId,
+        target_point: ProgramPointId,
+        kind: ControlEdgeKind,
+        capability: SemanticCapability,
+        reason: &str,
+    ) -> Result<(), ProcedureLoweringError> {
+        let source = self.metadata(source_point)?.source;
+        let evidence = EvidenceId::try_from_index(self.next_evidence)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many evidence rows".into()))?;
+        builder.add_evidence(Evidence {
+            id: evidence,
+            proof: ProofStatus::Unproven(reason.into()),
+            completeness: EvidenceCompleteness::Partial(reason.into()),
+            sources: Box::new([source]),
+        })?;
+        self.next_evidence += 1;
+        builder.add_edge(ControlEdge {
+            source_point,
+            target_point,
+            kind,
+            source,
+            evidence,
+        })?;
+        let id = SemanticGapId::try_from_index(self.next_gap)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many semantic gaps".into()))?;
+        builder.add_gap(SemanticGap {
+            id,
+            point: target_point,
+            subject: SemanticGapSubject::Point,
+            capability,
+            impacts: SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Point),
+            kind: SemanticGapKind::Unproven,
+            budget: None,
+            discharge: SemanticGapDischarge::None,
+            detail: reason.into(),
+            source,
+            evidence,
+        })?;
+        self.next_gap += 1;
+        self.append_effect_with_metadata(
+            builder,
+            target_point,
+            PointMetadata { source, evidence },
+            SemanticEffect::Gap { gap: id },
+        )?;
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -3228,6 +4086,28 @@ impl<'a> ProcedureLoweringSession<'a> {
         execution_timing: ExecutionTiming,
     ) -> Result<CallSiteId, ProcedureLoweringError> {
         let metadata = self.metadata(call.point)?;
+        self.add_call_site_with_metadata(builder, call, execution_timing, metadata)
+    }
+
+    /// Publish a synthetic call with its own source anchor while retaining
+    /// the cleanup point's enclosing structural source and evidence.
+    #[doc(hidden)]
+    pub fn add_call_site_at_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: CallSiteScaffold,
+        metadata: PointMetadata,
+    ) -> Result<CallSiteId, ProcedureLoweringError> {
+        self.add_call_site_with_metadata(builder, call, ExecutionTiming::SameEvaluation, metadata)
+    }
+
+    fn add_call_site_with_metadata(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        call: CallSiteScaffold,
+        execution_timing: ExecutionTiming,
+        metadata: PointMetadata,
+    ) -> Result<CallSiteId, ProcedureLoweringError> {
         let id = self.next_call_site_id()?;
         self.publish_call_site(
             builder,

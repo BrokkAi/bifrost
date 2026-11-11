@@ -7,7 +7,10 @@
 //! later binds.
 
 use crate::constructor_site::ConstructorSite;
-use brokk_bifrost_core::analyzer::model::{DeclarationKind, JavaTypeConstructorShape};
+use crate::resolution_scan_index::ResolutionScanIndex;
+use brokk_bifrost_core::analyzer::model::{
+    DeclarationKind, JavaTypeConstructorShape, ProcedureKind,
+};
 use brokk_bifrost_core::analyzer::resolution_facts::{
     BindingProjectionFact, BindingProjectionKind, DeclarationTypeRole, DeclarationTypeSlotFact,
     FileResolutionFacts, IntrinsicTypeKind, IntrinsicTypeSeedFact, PositionedIdentifierFact,
@@ -24,6 +27,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberOwnerFact,
     ResolutionMemberQualifierCompatibility, ResolutionNameId, ResolutionNamespace,
     ResolutionPackageFact, ResolutionPackageMemberFact, ResolutionPackageSegmentFact,
+    ResolutionReferenceExecutionContextFact, ResolutionReferenceExecutionDisposition,
     ResolutionReferenceOwnerFact, ResolutionRootExportFact, ResolutionRootImportAnchor,
     ResolutionRootImportDemandFact, ResolutionRootImportFact, ResolutionRootImportKind,
     ResolutionRootImportKindFact, ResolutionRootImportSegmentFact, ResolutionRootReferenceFact,
@@ -33,7 +37,7 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ResolutionTypeComponentFact, ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
     ResolutionTypeRelationId, ResolutionTypeSlotFact, ResolutionTypeSlotId, ResolutionTypeSlotRole,
     ResolutionTypeTransferFact, ResolutionTypeTransferKind, ResolutionTypeTransferValueTransform,
-    ResolutionVisibilityEligibilityFact, dense_ordinal,
+    ResolutionVisibilityEligibilityFact, dense_ordinal, emit_positioned_root_prefixes,
 };
 use brokk_bifrost_core::analyzer::source_facts::{
     PrimarySourceFactCollector, SourceDeclarationId, SourceFactRows, SourceOccurrenceId,
@@ -138,6 +142,32 @@ pub(super) struct JavaResolutionExtraction {
     pub declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
 }
 
+#[derive(Clone, Copy)]
+struct JavaExecutionFrame {
+    disposition: ResolutionReferenceExecutionDisposition,
+    procedure_kind: Option<ProcedureKind>,
+    initializer_is_static: Option<bool>,
+    callable_node: Option<usize>,
+}
+
+impl JavaExecutionFrame {
+    fn unknown() -> Self {
+        Self {
+            disposition: ResolutionReferenceExecutionDisposition::Unknown,
+            procedure_kind: None,
+            initializer_is_static: None,
+            callable_node: None,
+        }
+    }
+
+    fn non_executable() -> Self {
+        Self {
+            disposition: ResolutionReferenceExecutionDisposition::NonExecutable,
+            ..Self::unknown()
+        }
+    }
+}
+
 pub(super) struct JavaResolutionBuilder<'source> {
     source: &'source str,
     source_collector: PrimarySourceFactCollector<'source>,
@@ -146,7 +176,13 @@ pub(super) struct JavaResolutionBuilder<'source> {
     site_occurrences: Vec<SourceOccurrenceId>,
     declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
     declaration_sites: HashMap<usize, ResolutionSiteId>,
+    execution_stack: Vec<JavaExecutionFrame>,
+    execution_invalid_stack: Vec<bool>,
+    execution_by_node: HashMap<usize, JavaExecutionFrame>,
+    pending_execution_sites: Vec<(ResolutionSiteId, usize)>,
+    anonymous_supertype_sites: HashSet<ResolutionSiteId>,
     facts: FileResolutionFacts,
+    scan_index: ResolutionScanIndex,
     type_identifiers: HashSet<String>,
     name_ids: HashMap<String, ResolutionNameId>,
     scope_stack: Vec<ResolutionScopeId>,
@@ -159,6 +195,9 @@ pub(super) struct JavaResolutionBuilder<'source> {
     declaration_contexts: Vec<ResolutionSiteId>,
     reference_enclosing_declaration_overrides: Vec<ResolutionSiteId>,
     body_scopes: HashMap<usize, ResolutionScopeId>,
+    /// Every type body published as its owner's TypeBody scope, for the
+    /// member-type coverage pass after the walk.
+    member_type_bodies: Vec<crate::member_type_coverage::MemberTypeBody>,
     declaration_type_slots: HashMap<ResolutionSiteId, ResolutionTypeSlotId>,
     type_slots_by_node: HashMap<usize, ResolutionTypeSlotId>,
     expression_slots_by_node: HashMap<usize, ResolutionTypeSlotId>,
@@ -259,6 +298,49 @@ fn insert_source_shape<T>(shapes: &mut HashMap<usize, T>, node: Node<'_>, shape:
     );
 }
 
+/// Java's type-body members (JLS 8.1.6, 9.1.4, 8.9.1, 9.6.1). An enum
+/// constant's class body is its own synthetic owner, so the constant is a value
+/// member of the enum.
+pub(crate) const JAVA_MEMBER_TYPE_CENSUS: crate::member_type_coverage::MemberTypeCensus =
+    crate::member_type_coverage::MemberTypeCensus {
+        type_bodies: &[
+            "class_body",
+            "interface_body",
+            "enum_body",
+            "annotation_type_body",
+        ],
+        wrappers: &["enum_body_declarations"],
+        type_declarations: &[
+            "class_declaration",
+            "interface_declaration",
+            "enum_declaration",
+            "record_declaration",
+            "annotation_type_declaration",
+        ],
+        non_type_members: &[
+            "field_declaration",
+            "method_declaration",
+            "constructor_declaration",
+            "compact_constructor_declaration",
+            "static_initializer",
+            "block",
+            "constant_declaration",
+            "annotation_type_element_declaration",
+            "enum_constant",
+        ],
+        trivia: &["line_comment", "block_comment"],
+        opaque: &[],
+        entry_bodies: &[],
+        declaration_site: java_member_type_site,
+    };
+
+/// The lowerer gives a Java type declaration the site of its spelled name.
+fn java_member_type_site(declaration: Node<'_>) -> Option<Node<'_>> {
+    declaration
+        .child_by_field_name("name")
+        .filter(|name| is_spelled_identifier(*name))
+}
+
 impl<'source> JavaResolutionBuilder<'source> {
     pub(super) fn new(root: Node<'_>, source: &'source str) -> Self {
         let root_scope = ResolutionScopeId::new(0);
@@ -307,7 +389,13 @@ impl<'source> JavaResolutionBuilder<'source> {
             site_occurrences: Vec::new(),
             declaration_sources: Vec::new(),
             declaration_sites: HashMap::default(),
+            execution_stack: Vec::new(),
+            execution_invalid_stack: Vec::new(),
+            execution_by_node: HashMap::default(),
+            pending_execution_sites: Vec::new(),
+            anonymous_supertype_sites: HashSet::default(),
             facts,
+            scan_index: ResolutionScanIndex::default(),
             type_identifiers: HashSet::default(),
             name_ids: HashMap::default(),
             scope_stack: vec![root_scope],
@@ -320,6 +408,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             declaration_contexts: Vec::new(),
             reference_enclosing_declaration_overrides: Vec::new(),
             body_scopes: HashMap::default(),
+            member_type_bodies: Vec::new(),
             declaration_type_slots: HashMap::default(),
             type_slots_by_node: HashMap::default(),
             expression_slots_by_node: HashMap::default(),
@@ -345,6 +434,88 @@ impl<'source> JavaResolutionBuilder<'source> {
             source_callable_shapes: HashMap::default(),
             type_parameter_positions: HashMap::default(),
         }
+    }
+
+    pub(super) fn enter_execution_node(&mut self, node: Node<'_>) {
+        let mut frame = self
+            .execution_stack
+            .last()
+            .copied()
+            .unwrap_or_else(JavaExecutionFrame::unknown);
+        let invalid = node.is_error()
+            || node.is_missing()
+            || self
+                .execution_invalid_stack
+                .last()
+                .copied()
+                .unwrap_or(false);
+        if invalid {
+            frame = JavaExecutionFrame::unknown();
+        } else if matches!(
+            node.kind(),
+            "annotation"
+                | "marker_annotation"
+                | "import_declaration"
+                | "package_declaration"
+                | "annotation_type_declaration"
+                | "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "method_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration"
+                | "lambda_expression"
+                | "field_declaration"
+                | "constant_declaration"
+                | "annotation_type_element_declaration"
+        ) {
+            frame = JavaExecutionFrame::non_executable();
+        } else if node.kind() == "block"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "class_body")
+        {
+            frame = JavaExecutionFrame {
+                disposition: ResolutionReferenceExecutionDisposition::Callable,
+                procedure_kind: Some(ProcedureKind::Initializer),
+                initializer_is_static: Some(false),
+                callable_node: None,
+            };
+        } else if let Some(parent) = node.parent()
+            && let Some((kind, body, is_static)) =
+                crate::java::callable_shape::java_callable_shape(parent)
+            && body.id() == node.id()
+        {
+            frame = JavaExecutionFrame {
+                disposition: ResolutionReferenceExecutionDisposition::Callable,
+                procedure_kind: Some(kind),
+                initializer_is_static: (kind == ProcedureKind::Initializer).then_some(is_static),
+                callable_node: matches!(kind, ProcedureKind::Method | ProcedureKind::Constructor)
+                    .then_some(parent.id()),
+            };
+        } else if let Some(parent) = node.parent()
+            && parent.kind() == "enum_constant"
+        {
+            if node.kind() == "class_body" {
+                frame = JavaExecutionFrame::non_executable();
+            } else if node.kind() == "argument_list" {
+                frame = JavaExecutionFrame {
+                    disposition: ResolutionReferenceExecutionDisposition::Callable,
+                    procedure_kind: Some(ProcedureKind::Initializer),
+                    initializer_is_static: Some(true),
+                    callable_node: None,
+                };
+            }
+        }
+        assert!(self.execution_by_node.insert(node.id(), frame).is_none());
+        self.execution_stack.push(frame);
+    }
+
+    pub(super) fn exit_execution_node(&mut self) {
+        self.execution_stack
+            .pop()
+            .expect("Java execution frame exit balances entry");
     }
 
     pub(super) fn source_collector_mut(&mut self) -> &mut PrimarySourceFactCollector<'source> {
@@ -457,7 +628,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         );
     }
 
-    pub(super) fn finish(mut self) -> JavaResolutionExtraction {
+    pub(super) fn finish(mut self, tree_root: Node<'_>) -> JavaResolutionExtraction {
         assert_eq!(
             self.scope_stack.len(),
             1,
@@ -475,6 +646,41 @@ impl<'source> JavaResolutionBuilder<'source> {
         assert!(self.declaration_contexts.is_empty());
         assert!(self.reference_enclosing_declaration_overrides.is_empty());
         assert_eq!(self.unsupported_implicit_receiver_context_depth, 0);
+        assert!(self.execution_stack.is_empty());
+        assert!(self.execution_invalid_stack.is_empty());
+        for (reference, node_id) in std::mem::take(&mut self.pending_execution_sites) {
+            let frame = self.execution_by_node.get(&node_id).unwrap_or_else(|| {
+                panic!("Java reference {reference} node {node_id} has no execution frame")
+            });
+            let frame = if self.anonymous_supertype_sites.contains(&reference) {
+                JavaExecutionFrame::unknown()
+            } else {
+                *frame
+            };
+            // The grammar also admits a top-level main method that the
+            // resolution producer does not publish as a callable declaration.
+            // Its runtime caller identity is not established by this relation.
+            let frame = if frame
+                .callable_node
+                .is_some_and(|node| !self.declaration_sites.contains_key(&node))
+            {
+                JavaExecutionFrame::unknown()
+            } else {
+                frame
+            };
+            let callable_site = frame
+                .callable_node
+                .map(|node| self.declaration_sites[&node]);
+            self.facts
+                .reference_execution_contexts
+                .push(ResolutionReferenceExecutionContextFact {
+                    reference,
+                    disposition: frame.disposition,
+                    procedure_kind: frame.procedure_kind,
+                    initializer_is_static: frame.initializer_is_static,
+                    callable_site,
+                });
+        }
         // Implicit superclass facts are emitted when the type exits. Delay
         // connecting super receivers until the file walk has published them.
         let superclass_slots = self
@@ -502,7 +708,9 @@ impl<'source> JavaResolutionBuilder<'source> {
                 .or_default()
                 .push(*argument);
         }
-        for (owner, receiver) in std::mem::take(&mut self.super_receivers) {
+        let super_receivers = std::mem::take(&mut self.super_receivers);
+        self.scan_index.invalidate_super_receivers();
+        for (owner, receiver) in super_receivers {
             if let Some(&(reference, superclass)) = superclass_slots.get(&owner) {
                 // The superclass reference selects its nominal identity. Its
                 // original slot also carries the enclosing type's hierarchy
@@ -610,6 +818,12 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.site_occurrences.len(),
             self.facts.sites.len(),
             "Java native sites must have one canonical source occurrence each"
+        );
+        self.facts.member_type_coverage = crate::member_type_coverage::member_type_coverage(
+            tree_root,
+            &self.member_type_bodies,
+            &self.facts,
+            &JAVA_MEMBER_TYPE_CENSUS,
         );
         let java_source_facts = self.source_types.finish();
         let source_facts = self.source_collector.finish();
@@ -1093,7 +1307,14 @@ impl<'source> JavaResolutionBuilder<'source> {
             "field_declaration" | "constant_declaration" | "local_variable_declaration" => {
                 self.lower_variable_declaration(node)
             }
-            "enum_constant" => self.lower_enum_constant(node),
+            "enum_constant" => {
+                self.lower_enum_constant(node);
+                if let Some(arguments) = node.child_by_field_name("arguments") {
+                    for argument in named_children(arguments) {
+                        self.lower_expression(argument);
+                    }
+                }
+            }
             "return_statement" => self.lower_return(node),
             "superclass" | "super_interfaces" | "extends_interfaces" => {
                 self.lower_inheritance_clause(node)
@@ -1680,6 +1901,28 @@ impl<'source> JavaResolutionBuilder<'source> {
             },
             route_segments,
         );
+        for (index, &site) in qualified_sites
+            .iter()
+            .enumerate()
+            .take(qualified_sites.len() - 1)
+        {
+            let preceding_site = if index == 0 {
+                root_reference
+            } else {
+                qualified_sites[index - 1]
+            };
+            assert!(self.scan_index.has_identifier_qualifier_site(
+                &self.facts,
+                site,
+                ResolutionIdentifierRole::Reference,
+                preceding_site,
+            ));
+            assert!(!self.scan_index.has_root_reference(&self.facts, site));
+            // The intermediate written type segment is a distinct reference;
+            // its preceding segment's projected identity feeds this qualifier.
+            // Only the terminal above owns the lexical root path.
+            self.facts.typed_receiver_prefix_absences.push(site);
+        }
         self.add_gap(root_reference, ResolutionGapKind::AmbiguousQualifiedType);
         for site in qualified_sites {
             self.add_gap(site, ResolutionGapKind::AmbiguousQualifiedType);
@@ -1906,20 +2149,18 @@ impl<'source> JavaResolutionBuilder<'source> {
             // Import path segments name canonical types independently of lexical names
             // in the importing file. Keep its binder separate from this source
             // reference so usage consumers retain the import edge kind.
-            for (position, &(segment, _)) in segments.iter().enumerate() {
-                let slot = self.lower_plain_type_reference(segment);
-                let reference = self.slot(slot).site;
-                self.record_rooted_type_route(
-                    ResolutionRootReferenceFact {
-                        reference,
-                        root_scope,
-                        anchor: ResolutionRootImportAnchor::Absolute,
-                        prefix_reference: None,
-                        owner_continued: false,
-                    },
-                    names[..position].to_vec(),
-                );
-            }
+            emit_positioned_root_prefixes(
+                self,
+                segments,
+                &names,
+                root_scope,
+                ResolutionRootImportAnchor::Absolute,
+                |producer, &(segment, _), _| {
+                    let slot = producer.lower_plain_type_reference(segment);
+                    Some(producer.slot(slot).site)
+                },
+                |producer| &mut producer.facts,
+            );
         }
         // The source route is exact, but selecting its destination package,
         // owner, and declaration inventory remains operation-local.
@@ -2435,6 +2676,7 @@ impl<'source> JavaResolutionBuilder<'source> {
                     reference: site,
                     owner,
                 });
+            self.pending_execution_sites.push((site, node.id()));
         }
         name
     }
@@ -2790,6 +3032,11 @@ impl<'source> JavaResolutionBuilder<'source> {
                 body.end_byte(),
             );
             self.body_scopes.insert(body.id(), body_scope);
+            self.member_type_bodies
+                .push(crate::member_type_coverage::MemberTypeBody::new(
+                    declaration,
+                    body,
+                ));
             if is_static_nested {
                 assert!(
                     self.unsupported_implicit_receiver_scopes.insert(body_scope),
@@ -2937,12 +3184,27 @@ impl<'source> JavaResolutionBuilder<'source> {
         let has_explicit_superclass = if parent.kind() == "object_creation_expression" {
             if let Some(type_node) = parent.child_by_field_name("type") {
                 self.add_supertype(declaration, type_node, ResolutionSupertypeKind::Superclass);
+                // The written supertype's navigation owner is the synthetic body.
+                // Its implicit super-constructor invocation has no caller frame here.
+                if let Some(reference) = self
+                    .facts
+                    .supertypes
+                    .last()
+                    .filter(|supertype| supertype.subtype == declaration)
+                    .map(|supertype| supertype.supertype_reference)
+                {
+                    assert!(self.anonymous_supertype_sites.insert(reference));
+                }
                 true
             } else {
                 false
             }
         } else {
             let reference = self.add_site(body, ResolutionSiteKind::TypeReference);
+            // The enum body has an implicit supertype invocation, not an
+            // executable frame established by this source position.
+            self.pending_execution_sites.push((reference, body.id()));
+            assert!(self.anonymous_supertype_sites.insert(reference));
             let name = enclosing
                 .and_then(|context| context.name)
                 .expect("enum constant bodies are nested under their declaring enum");
@@ -2974,6 +3236,11 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.body_scopes.insert(body.id(), body_scope).is_none(),
             "one type-body scope per synthetic Java class body"
         );
+        self.member_type_bodies
+            .push(crate::member_type_coverage::MemberTypeBody::new(
+                declaration,
+                body,
+            ));
         self.type_contexts.push(TypeContext {
             declaration,
             body_scope: Some(body_scope),
@@ -3281,6 +3548,11 @@ impl<'source> JavaResolutionBuilder<'source> {
             output,
             kind: BindingProjectionKind::TargetDeclaredValueType,
         });
+        // A switch label is selected through the selector expression's typed
+        // slot. That slot supplies its completion even when the selector is
+        // missing or open; the label owns no lexical root route of its own.
+        assert_ne!(self.slot(qualifier).site, reference);
+        self.facts.typed_receiver_prefix_absences.push(reference);
         self.expression_slots_by_node.insert(node.id(), output);
     }
 
@@ -5524,7 +5796,7 @@ impl<'source> JavaResolutionBuilder<'source> {
             }
         }
         let constructor = terminal.kind() == "new";
-        let qualifier = if matches!(receiver.kind(), "this" | "super") {
+        let receiver_input = if matches!(receiver.kind(), "this" | "super") {
             None
         } else if self.is_type_syntax(receiver.kind()) {
             Some(self.lower_type(receiver))
@@ -5544,7 +5816,7 @@ impl<'source> JavaResolutionBuilder<'source> {
         let qualifier = if receiver.kind() == "super" {
             Some(self.lower_super_receiver(reference))
         } else {
-            qualifier.map(|input| {
+            receiver_input.map(|input| {
                 if constructor {
                     input
                 } else {
@@ -5574,6 +5846,31 @@ impl<'source> JavaResolutionBuilder<'source> {
             },
             qualifier,
         );
+        let typed_receiver = match receiver.kind() {
+            "super" => qualifier.is_some_and(|slot| {
+                self.scan_index
+                    .has_super_receiver(&self.super_receivers, slot)
+            }),
+            "this" => false,
+            _ => receiver_input.is_some_and(|input| {
+                self.slot(input).site != reference
+                    && qualifier.is_some_and(|output| {
+                        constructor && output == input
+                            || self.scan_index.has_transfer(
+                                &self.facts,
+                                input,
+                                output,
+                                ResolutionTypeTransferKind::Receiver,
+                            )
+                    })
+            }),
+        };
+        if typed_receiver && !self.scan_index.has_root(&self.facts, reference) {
+            // The method-reference receiver's separate type/value slot (or
+            // selected supertype slot) feeds this terminal reference. Its
+            // completion remains on that slot; ::member owns no root path.
+            self.facts.typed_receiver_prefix_absences.push(reference);
+        }
         if constructor {
             // Position the reference on `new`, but look up the owner's constructor
             // name, just as an ordinary object creation does.
@@ -5625,6 +5922,143 @@ impl<'source> JavaResolutionBuilder<'source> {
             self.add_gap(site, ResolutionGapKind::MalformedSyntax);
         }
         output
+    }
+
+    // Each field in a lexical name chain has its own positioned reference
+    // and projected value slot. The terminal value reaches the call receiver
+    // through a real transfer; no prefix is owned by the callee itself.
+    fn non_owning_field_chain(
+        &mut self,
+        object: Node<'_>,
+        receiver: ResolutionTypeSlotId,
+    ) -> Option<Vec<ResolutionSiteId>> {
+        if object.kind() != "field_access" || object.has_error() {
+            return None;
+        }
+        let terminal = *self.expression_slots_by_node.get(&object.id())?;
+        self.scan_index
+            .has_transfer(
+                &self.facts,
+                terminal,
+                receiver,
+                ResolutionTypeTransferKind::Receiver,
+            )
+            .then_some(())?;
+        let mut current = object;
+        let mut segments = Vec::new();
+        while current.kind() == "field_access" {
+            let field = current.child_by_field_name("field")?;
+            let object = current.child_by_field_name("object")?;
+            if field.is_missing() || field.has_error() {
+                return None;
+            }
+            let output = *self.expression_slots_by_node.get(&current.id())?;
+            let input = *self.expression_slots_by_node.get(&object.id())?;
+            let site = self.slot(output).site;
+            let fact = self.site(site);
+            if fact.kind != ResolutionSiteKind::MemberReference
+                || fact.start_byte != field.start_byte()
+                || fact.end_byte != field.end_byte()
+                || !self.scan_index.has_projection(&self.facts, site, output)
+            {
+                return None;
+            }
+            let qualifier = self.scan_index.first_qualifier(
+                &self.facts,
+                site,
+                ResolutionIdentifierRole::Reference,
+            )??;
+            if self.slot(qualifier).site != site
+                || !self.scan_index.has_transfer(
+                    &self.facts,
+                    input,
+                    qualifier,
+                    ResolutionTypeTransferKind::Receiver,
+                )
+            {
+                return None;
+            }
+            segments.push(site);
+            current = object;
+        }
+        if current.kind() != "identifier" || current.has_error() {
+            return None;
+        }
+        let output = *self.expression_slots_by_node.get(&current.id())?;
+        let site = self.slot(output).site;
+        if self.site(site).kind != ResolutionSiteKind::ValueReference
+            || !self.scan_index.has_identifier(
+                &self.facts,
+                site,
+                ResolutionIdentifierRole::Reference,
+            )
+        {
+            return None;
+        }
+        segments.push(site);
+        segments.reverse();
+        Some(segments)
+    }
+
+    // A scoped constructed type is a separate typed reference at every
+    // segment. Its terminal projected type is exactly the constructor
+    // reference's qualifier, so the constructor owns no second lexical chain.
+    fn non_owning_scoped_type_chain(
+        &mut self,
+        type_node: Node<'_>,
+        constructed_type: ResolutionTypeSlotId,
+    ) -> Option<Vec<ResolutionSiteId>> {
+        if type_node.kind() != "scoped_type_identifier" || type_node.has_error() {
+            return None;
+        }
+        let terminal = *self.type_slots_by_node.get(&type_node.id())?;
+        if terminal != constructed_type {
+            return None;
+        }
+        let mut current = type_node;
+        let mut segments = Vec::new();
+        while current.kind() == "scoped_type_identifier" {
+            let (scope, name) = scoped_type_parts(current)?;
+            if name.is_missing() || name.has_error() {
+                return None;
+            }
+            let output = *self.type_slots_by_node.get(&current.id())?;
+            let input = *self.type_slots_by_node.get(&scope.id())?;
+            let site = self.slot(output).site;
+            let fact = self.site(site);
+            if fact.kind != ResolutionSiteKind::MemberReference
+                || fact.start_byte != name.start_byte()
+                || fact.end_byte != name.end_byte()
+                || !self.scan_index.has_projection(&self.facts, site, output)
+                || !self.scan_index.has_identifier_qualifier(
+                    &self.facts,
+                    site,
+                    ResolutionIdentifierRole::Reference,
+                    Some(input),
+                )
+            {
+                return None;
+            }
+            segments.push(site);
+            current = scope;
+        }
+        if current.kind() != "type_identifier" || current.has_error() {
+            return None;
+        }
+        let output = *self.type_slots_by_node.get(&current.id())?;
+        let site = self.slot(output).site;
+        if self.site(site).kind != ResolutionSiteKind::TypeReference
+            || !self.scan_index.has_identifier(
+                &self.facts,
+                site,
+                ResolutionIdentifierRole::Reference,
+            )
+        {
+            return None;
+        }
+        segments.push(site);
+        segments.reverse();
+        Some(segments)
     }
 
     fn finish_method_invocation(&mut self, node: Node<'_>) {
@@ -5682,6 +6116,56 @@ impl<'source> JavaResolutionBuilder<'source> {
             result,
             explicit_type_argument_count(node),
         );
+        let chain_segments = object
+            .zip(receiver)
+            .and_then(|(object, receiver)| self.non_owning_field_chain(object, receiver));
+        let typed_receiver = object.zip(receiver).is_some_and(|(object, receiver)| {
+            if object.kind() == "super" {
+                // The pending supertype projection feeds this receiver slot
+                // after hierarchy facts are complete. A missing supertype
+                // leaves its gap on that same slot.
+                return self
+                    .scan_index
+                    .has_super_receiver(&self.super_receivers, receiver);
+            }
+            if object.is_missing()
+                || object.has_error()
+                || object.kind() == "field_access" && chain_segments.is_none()
+            {
+                return false;
+            }
+            let Some(&input) = self.expression_slots_by_node.get(&object.id()) else {
+                return false;
+            };
+            self.slot(input).site != callee
+                && self.scan_index.has_transfer(
+                    &self.facts,
+                    input,
+                    receiver,
+                    ResolutionTypeTransferKind::Receiver,
+                )
+        });
+        let has_own_root = self.scan_index.has_root(&self.facts, callee);
+        if !has_own_root
+            && typed_receiver
+            && self
+                .facts
+                .calls
+                .last()
+                .is_some_and(|row| row.callee == callee && row.receiver == receiver)
+            && self.scan_index.has_identifier_qualifier(
+                &self.facts,
+                callee,
+                ResolutionIdentifierRole::Reference,
+                receiver,
+            )
+        {
+            // The receiver has its own reference authority and feeds the
+            // callee's actual qualifier/call slot. Even a lexical name chain
+            // transfers its open terminal answer here; the callee has no own
+            // root path to protect separately.
+            self.facts.typed_receiver_prefix_absences.push(callee);
+        }
         self.facts
             .engine_rule_eligibilities
             .push(ResolutionEngineRuleEligibilityFact {
@@ -5713,11 +6197,13 @@ impl<'source> JavaResolutionBuilder<'source> {
         };
         let reference =
             self.add_site_in_scope(field, ResolutionSiteKind::MemberReference, reference_scope);
+        let mut receiver_source_site = None;
         let qualifier = object.and_then(|object| {
             if explicit_this {
                 None
             } else {
                 let input = self.expression_slot(object);
+                receiver_source_site = Some(self.slot(input).site);
                 let output = self.add_slot(reference, ResolutionTypeSlotRole::Receiver);
                 self.add_transfer(input, output, ResolutionTypeTransferKind::Receiver);
                 Some(output)
@@ -5751,6 +6237,16 @@ impl<'source> JavaResolutionBuilder<'source> {
         });
         self.expression_slots_by_node.insert(node.id(), output);
         self.record_qualified_type_root(node, reference);
+        if qualifier.is_some()
+            && receiver_source_site.is_some_and(|site| site != reference)
+            && object.is_some_and(|object| !object.is_missing() && !object.has_error())
+            && !self.scan_index.has_root(&self.facts, reference)
+        {
+            // The object expression has its own site and transfers its typed
+            // value into this field's qualifier. This field owns no separate
+            // lexical route; a qualified type root above takes precedence.
+            self.facts.typed_receiver_prefix_absences.push(reference);
+        }
     }
 
     fn add_member_type_reference(
@@ -5818,6 +6314,16 @@ impl<'source> JavaResolutionBuilder<'source> {
                     ResolutionTypeTransferValueTransform::StaticTypeObject,
                 );
                 self.add_member_type_reference(reference, member_type, name, qualifier);
+                if !self.scan_index.has_root(&self.facts, reference)
+                    && self.scan_index.has_identifier_qualifier(
+                        &self.facts,
+                        reference,
+                        ResolutionIdentifierRole::Reference,
+                        Some(qualifier),
+                    )
+                {
+                    self.facts.typed_receiver_prefix_absences.push(reference);
+                }
             } else {
                 self.lower_unsupported_type(member_type);
             }
@@ -5893,6 +6399,27 @@ impl<'source> JavaResolutionBuilder<'source> {
             result,
             explicit_type_argument_count(node),
         );
+        let chain_segments = self.non_owning_scoped_type_chain(type_node, constructed_type);
+        let has_own_root = self.scan_index.has_root(&self.facts, callee);
+        if !has_own_root
+            && (type_node.kind() == "type_identifier" || chain_segments.is_some())
+            && self
+                .facts
+                .calls
+                .last()
+                .is_some_and(|row| row.callee == callee)
+            && self.scan_index.has_identifier_qualifier(
+                &self.facts,
+                callee,
+                ResolutionIdentifierRole::Reference,
+                Some(constructed_type),
+            )
+        {
+            // The constructed type's terminal reference projects into this
+            // exact qualifier slot. Its lexical head remains independently
+            // open when necessary; the constructor owns no additional root.
+            self.facts.typed_receiver_prefix_absences.push(callee);
+        }
         self.facts
             .engine_rule_eligibilities
             .push(ResolutionEngineRuleEligibilityFact {
@@ -6466,6 +6993,195 @@ mod tests {
         let facts = parse_once(source);
         assert_eq!(facts, parse_once(source), "fact rows must be deterministic");
         facts
+    }
+
+    #[test]
+    fn member_type_census_classifies_every_java_type_body_member() {
+        crate::member_type_coverage::assert_census_covers_grammar(
+            tree_sitter_java::NODE_TYPES,
+            &JAVA_MEMBER_TYPE_CENSUS,
+        );
+    }
+
+    #[test]
+    fn java_execution_context_grammar_boundary() {
+        let source = include_str!("../../tests/fixtures/execution_context.java");
+        let facts = parse(source);
+        let contexts = &facts.reference_execution_contexts;
+        assert!(!contexts.is_empty());
+        for row in contexts {
+            assert_eq!(facts.sites[row.reference.index()].id, row.reference);
+            assert_eq!(
+                row.disposition == ResolutionReferenceExecutionDisposition::Callable,
+                row.procedure_kind.is_some()
+            );
+            assert_eq!(
+                row.initializer_is_static.is_some(),
+                row.procedure_kind == Some(ProcedureKind::Initializer),
+                "{row:?}"
+            );
+            if matches!(
+                row.procedure_kind,
+                Some(ProcedureKind::Method | ProcedureKind::Constructor)
+            ) {
+                let owner = facts
+                    .reference_owners
+                    .iter()
+                    .find(|owner| owner.reference == row.reference)
+                    .unwrap();
+                assert_eq!(row.callable_site, owner.owner, "{row:?}");
+            }
+            if matches!(
+                row.procedure_kind,
+                Some(ProcedureKind::Lambda | ProcedureKind::Initializer)
+            ) {
+                assert_eq!(row.callable_site, None, "{row:?}");
+            }
+            if row.disposition != ResolutionReferenceExecutionDisposition::Callable {
+                assert_eq!(row.callable_site, None, "{row:?}");
+            }
+        }
+        assert!(
+            contexts.iter().any(
+                |row| row.disposition == ResolutionReferenceExecutionDisposition::NonExecutable
+            )
+        );
+        let at = |line: usize| {
+            contexts
+                .iter()
+                .filter(|row| {
+                    let site = &facts.sites[row.reference.index()];
+                    source[..site.start_byte]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1
+                        == line
+                        && &source[site.start_byte..site.end_byte] == "target"
+                })
+                .collect::<Vec<_>>()
+        };
+        for (line, kind, is_static) in [
+            (6, ProcedureKind::Initializer, Some(true)),
+            (7, ProcedureKind::Initializer, Some(false)),
+            (8, ProcedureKind::Initializer, Some(true)),
+            (9, ProcedureKind::Initializer, Some(false)),
+            (10, ProcedureKind::Constructor, None),
+            (12, ProcedureKind::Method, None),
+            (13, ProcedureKind::Lambda, None),
+            (14, ProcedureKind::Method, None),
+            (16, ProcedureKind::Method, None),
+            (21, ProcedureKind::Initializer, Some(true)),
+        ] {
+            let rows = at(line);
+            assert_eq!(rows.len(), 1, "line {line}: {rows:?}");
+            assert_eq!(rows[0].procedure_kind, Some(kind), "line {line}");
+            assert_eq!(rows[0].initializer_is_static, is_static, "line {line}");
+        }
+        let enum_rows = at(20);
+        assert_eq!(
+            enum_rows.len(),
+            2,
+            "enum arguments and member: {enum_rows:?}"
+        );
+        assert!(
+            enum_rows
+                .iter()
+                .any(|row| row.procedure_kind == Some(ProcedureKind::Initializer)
+                    && row.initializer_is_static == Some(true))
+        );
+        assert!(
+            enum_rows
+                .iter()
+                .any(|row| row.procedure_kind == Some(ProcedureKind::Method))
+        );
+        let line_rows = |line: usize, spelling: &str| {
+            contexts
+                .iter()
+                .filter(|row| {
+                    let site = &facts.sites[row.reference.index()];
+                    source[..site.start_byte]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1
+                        == line
+                        && &source[site.start_byte..site.end_byte] == spelling
+                })
+                .collect::<Vec<_>>()
+        };
+        for (line, kind) in [
+            (22, ProcedureKind::Lambda),
+            (23, ProcedureKind::Method),
+            (25, ProcedureKind::Method),
+        ] {
+            let rows = line_rows(line, "target");
+            assert_eq!(rows.len(), 1, "new boundary line {line}: {rows:?}");
+            assert_eq!(
+                rows[0].procedure_kind,
+                Some(kind),
+                "new boundary line {line}"
+            );
+        }
+        let enum_calls = line_rows(24, "target");
+        assert_eq!(
+            enum_calls.len(),
+            2,
+            "enum anonymous argument and member: {enum_calls:?}"
+        );
+        assert!(
+            enum_calls
+                .iter()
+                .any(|row| row.procedure_kind == Some(ProcedureKind::Initializer)
+                    && row.initializer_is_static == Some(true))
+        );
+        assert!(
+            enum_calls
+                .iter()
+                .any(|row| row.procedure_kind == Some(ProcedureKind::Method))
+        );
+        let annotation = line_rows(25, "Mark");
+        assert_eq!(annotation.len(), 1);
+        assert_eq!(
+            annotation[0].disposition,
+            ResolutionReferenceExecutionDisposition::NonExecutable
+        );
+        let enum_supertype = line_rows(24, "Parent");
+        assert!(
+            enum_supertype
+                .iter()
+                .any(|row| row.disposition == ResolutionReferenceExecutionDisposition::Unknown)
+        );
+        let anonymous_type = line_rows(15, "Parent");
+        assert_eq!(anonymous_type.len(), 2);
+        assert!(anonymous_type.iter().any(|row| row.disposition
+            == ResolutionReferenceExecutionDisposition::Unknown
+            && row.procedure_kind.is_none()));
+        let ordinary_type = line_rows(16, "Parent");
+        assert_eq!(ordinary_type.len(), 2);
+        assert!(
+            ordinary_type
+                .iter()
+                .all(|row| row.procedure_kind == Some(ProcedureKind::Method))
+        );
+        let anonymous_calls = at(15);
+        assert_eq!(anonymous_calls.len(), 2);
+        assert!(
+            anonymous_calls
+                .iter()
+                .all(|row| row.procedure_kind == Some(ProcedureKind::Method))
+        );
+        for (line, spelling) in [(1, "List"), (3, "Mark"), (11, "List")] {
+            let rows = line_rows(line, spelling);
+            assert!(!rows.is_empty(), "missing {spelling} on line {line}");
+            for row in rows {
+                assert_eq!(
+                    row.disposition,
+                    ResolutionReferenceExecutionDisposition::NonExecutable,
+                    "{line} {spelling}"
+                );
+            }
+        }
     }
 
     #[test]

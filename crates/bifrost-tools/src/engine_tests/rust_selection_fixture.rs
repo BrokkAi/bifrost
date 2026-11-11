@@ -42,7 +42,8 @@ pub fn with_store(
                         )
                     }
                     Language::Rust => {
-                        let state = parsed_fixture_state(&RustAdapter, "src/Model.rs", source);
+                        let state =
+                            parsed_fixture_state(&RustAdapter::for_tests(), "src/Model.rs", source);
                         store.write_parsed_blob_at_generation(
                             &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
                             &brokk_bifrost_core::gitblob::BlobKey::unvaried(
@@ -50,7 +51,7 @@ pub fn with_store(
                                 storage_language,
                             ),
                             generation,
-                            &RustAdapter,
+                            &RustAdapter::for_tests(),
                             &state,
                         )
                     }
@@ -115,7 +116,7 @@ pub(super) fn write_rust_fixture_blob(
     storage_language: &str,
     generation: GenerationId,
 ) {
-    let state = parsed_fixture_state(&RustAdapter, "src/model.rs", "struct Model;\n");
+    let state = parsed_fixture_state(&RustAdapter::for_tests(), "src/model.rs", "struct Model;\n");
     store
         .write_parsed_blob_at_generation(
             &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
@@ -124,7 +125,7 @@ pub(super) fn write_rust_fixture_blob(
                 storage_language,
             ),
             generation,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             &state,
         )
         .expect("persist selected-resolution fixture blob");

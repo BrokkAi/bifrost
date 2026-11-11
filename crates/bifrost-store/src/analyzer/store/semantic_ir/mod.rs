@@ -21,12 +21,17 @@ use rusqlite::{OptionalExtension, ToSql, TransactionBehavior, params};
 
 use super::{AnalyzerStore, Result, StoreError};
 use crate::CancellationToken;
+use crate::analyzer::semantic::CallTargetObligation;
 use crate::analyzer::semantic::partial_flow::fixpoint::ProcedurePartialFlows;
 use crate::analyzer::semantic::service::SemanticAdapterIdentity;
 use crate::analyzer::semantic::{
     ContentIdentity, LengthDelimitedDigest, ProcedureId, ProcedureSemanticsParts,
     SemanticBudgetExceeded, SemanticCapability, SemanticIrVersion, SemanticLanguage, StableDigest,
     WorkspaceMountId, WorkspaceRelativePath,
+};
+use crate::analyzer::semantic::{
+    FOOTPRINT_COVERAGE_CONTRACT_VERSION, FootprintClass, FootprintDisposition, FootprintExclusion,
+    FootprintRefusal, SemanticGapSubject,
 };
 use codes::RowCode;
 
@@ -56,7 +61,33 @@ use codes::RowCode;
 /// Version 13 (#9162): every builtin seed of one port shares one seed key, so
 /// two relations naming one post-call or entry heap port publish one flow row
 /// per (from, to). Version 12 is retired (coordinator ruling, 2026-11-02).
-const SEMANTIC_IR_ROWS_VERSION: u32 = 13;
+/// Version 14 (#8388, coordinator-assigned; 12 retired, 13 is #9186): a formal's direct stores are
+/// separated from stores into its local copy, and post-call storage sharing
+/// is asked only for members the callee writes. Both can change persisted
+/// partial-flow coverage and ICFG-backed call-rule projection.
+// #8386: Rust receiver mode is stored on the receiver value row.
+// Version 16 (#9183): each procedure publishes a typed footprint witness.
+// Version 18 was held by #9925 before later master rows landed.
+// Version 19 (#9794): value-flow rows can carry the ByValueCapture kind.
+// Version 20 (#10095): scoped call coverage includes identifier-receiver selectors.
+// Version 21 (#10200): Rust zero-parameter callable cleanup coverage.
+// Version 22 (#9925, coordinator-assigned): OwnershipUnknown follows ByValueCapture
+// in the persisted ValueFlowKind tag order.
+// Version 23 (#10461): a parse-time head whose candidate set was truncated by a
+// constant limit is stored as Truncated instead of Complete.
+// Version 24 (#10466): a rejected return member is a content gap (coverage Open),
+// so its head is stored Complete and open, not Truncated.
+// Version 25 (#10539): the parse-time fixpoint joins the alternatives of one
+// event instead of letting each kill the last, so stored heads gain flows.
+// Version 26 (#10582): scalar static classes and relational declared result classes
+// (above #10539, which takes 25).
+// Version 27 (#10563): stored partial-flow heads change for a procedure with a store
+// through a reference prefix followed by a read through that cell (above #10582, which
+// takes 26).
+// Version 28 (#10683): a procedure whose initialized let copies a nested initializer
+// stored a Truncated head; an identity prefix store no longer cycles, so the head is
+// Complete with its flows (above #10563, which takes 27).
+const SEMANTIC_IR_ROWS_VERSION: u32 = 28;
 
 /// What a parse-time lowerer produced for one blob.
 #[derive(Debug)]
@@ -118,7 +149,29 @@ impl PreparedSemanticIr {
         let mut go_predeclared_builtins = "[]".to_owned();
         let mut rows = encode::EncodedRows::default();
         match outcome {
-            SemanticIrLoweringOutcome::Complete { parts } => {
+            SemanticIrLoweringOutcome::Complete { mut parts } => {
+                for procedure in &mut parts {
+                    refuse_contradictory_footprint_rows(procedure);
+                    let coverage = &procedure.footprint_coverage;
+                    assert_eq!(
+                        coverage.contract_version,
+                        FOOTPRINT_COVERAGE_CONTRACT_VERSION
+                    );
+                    for obligation in &coverage.call_target_obligations {
+                        let call = procedure.call_sites.get(obligation.call.index());
+                        let gap = procedure.gaps.get(obligation.gap.index());
+                        assert_eq!(call.map(|call| call.id), Some(obligation.call));
+                        assert_eq!(gap.map(|gap| gap.id), Some(obligation.gap));
+                        let gap = gap.expect("footprint obligation gap exists");
+                        assert_eq!(gap.subject, SemanticGapSubject::CallSite(obligation.call));
+                        assert_eq!(gap.impacts, obligation.impacts);
+                        // No assertion on the CallTarget disposition: a target
+                        // gap stays an obligation for its call until dispatch
+                        // closes it, whether the class is Represented or
+                        // Refused, and refuse_contradictory_footprint_rows
+                        // refuses the boundary of an Excluded class with calls.
+                    }
+                }
                 procedure_count = parts.len();
                 let encoded = encode::encode(&parts, partial_flows, content);
                 go_predeclared_builtins = encoded.go_predeclared_builtins;
@@ -182,6 +235,47 @@ impl PreparedSemanticIr {
                 )
             })
             .collect()
+    }
+}
+
+/// A class assertion cannot prove source exhaustiveness here, but it must
+/// agree with the corresponding IR row family before its witness is stored.
+fn refuse_contradictory_footprint_rows(procedure: &mut ProcedureSemanticsParts) {
+    let present = crate::analyzer::semantic::present_footprint_classes(procedure);
+    let coverage = &mut procedure.footprint_coverage;
+    let contradiction = FootprintClass::ALL.into_iter().any(|class| {
+        let index = (class.code() - 1) as usize;
+        if !matches!(
+            class,
+            FootprintClass::MemoryWrite
+                | FootprintClass::MemoryRead
+                | FootprintClass::PublicationEscape
+                | FootprintClass::StaticGlobal
+                | FootprintClass::Capture
+                | FootprintClass::NestedCall
+                | FootprintClass::CallTarget
+                | FootprintClass::NormalExit
+                | FootprintClass::ExceptionalExit
+                | FootprintClass::DeferredExecution
+        ) {
+            return false;
+        }
+        match coverage.classes[index] {
+            // Represented means every encountered instance was handled; a class
+            // with no instances satisfies that claim.
+            FootprintDisposition::Represented => false,
+            FootprintDisposition::Excluded(FootprintExclusion::NoInstance) => {
+                present.contains(&class)
+            }
+            FootprintDisposition::Excluded(_) | FootprintDisposition::Refused(_) => false,
+        }
+    });
+    if contradiction {
+        coverage.boundary = Err(FootprintRefusal::ContradictoryOwnership);
+        debug_assert!(matches!(
+            coverage.boundary,
+            Err(FootprintRefusal::ContradictoryOwnership)
+        ));
     }
 }
 
@@ -249,17 +343,130 @@ pub fn insert_semantic_ir_tx(
     if cancellation.is_cancelled() {
         return Ok(false);
     }
-    let sealed = tx
-        .prepare_cached(
-            "UPDATE semantic_ir_publications SET publication_state = 'complete'
-             WHERE blob_id = ?1 AND publication_state = 'building'",
-        )?
-        .execute([blob_id])?;
-    assert_eq!(
-        sealed, 1,
-        "semantic IR head for blob {blob_id} was not building"
-    );
+    // The digest is taken before the seal, so the head is sealed and digested
+    // by one UPDATE and a complete head never has a NULL digest.
+    let row_digest = sealed_publication_digest(tx, blob_id)?;
+    super::publication::seal(
+        tx,
+        "semantic_ir_publications",
+        "blob_id",
+        blob_id,
+        &[("row_digest", &row_digest.as_bytes().as_slice())],
+    )?;
     Ok(true)
+}
+
+/// Recompute a test-mutated publication with the production sealing digest.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn reseal_publication_for_test(conn: &mut rusqlite::Connection, blob_id: i64) -> Result<()> {
+    let tx = conn.transaction()?;
+    let row_digest = sealed_publication_digest(&tx, blob_id)?;
+    tx.execute(
+        "UPDATE semantic_ir_publications SET row_digest = ?2 WHERE blob_id = ?1",
+        params![blob_id, row_digest.as_bytes().as_slice()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Hash SQLite's final values, including JSONB after `jsonb(?)` and the
+/// derived counts written to the sealed head. Each table is read in primary
+/// key order; the blob id is deliberately omitted because identical blobs
+/// can have different local row ids after replacement.
+///
+/// A table contributes its column names once and then one digest update per
+/// row. Per-cell updates made sealing a large share of parse-time
+/// publication: a corpus of a few hundred million cells became billions of
+/// tiny SHA-256 updates (#10379).
+fn sealed_publication_digest(tx: &rusqlite::Transaction<'_>, blob_id: i64) -> Result<StableDigest> {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost-semantic-ir-sealed-publication-rows-v2");
+    let head_columns = [
+        "lang",
+        "producer_epoch",
+        "content_digest",
+        "source_bytes",
+        "outcome",
+        "detail",
+        "budget_dimension",
+        "budget_limit",
+        "budget_attempted",
+        "procedure_count",
+        "logical_rows",
+        "payload_bytes",
+        "go_predeclared_builtins",
+        "publication_state",
+    ];
+    // The digest describes the sealed head, so it hashes the state the seal
+    // writes rather than the stored one. The seal computes it while the head
+    // is still building and writes both in one UPDATE.
+    let (stored_columns, state_column) = head_columns.split_at(head_columns.len() - 1);
+    assert_eq!(state_column, ["publication_state"]);
+    let head_sql = format!(
+        "SELECT {}, '{}' FROM semantic_ir_publications WHERE blob_id = ?1",
+        stored_columns.join(", "),
+        super::publication::PublicationState::Complete.as_sql()
+    );
+    digest.push(b"semantic_ir_publications");
+    hash_stored_rows(tx, &head_sql, blob_id, &head_columns, &mut digest)?;
+    for &table in Table::ALL {
+        let spec = table.spec();
+        digest.push(spec.name.as_bytes());
+        let sql = format!(
+            "SELECT {} FROM {} WHERE blob_id = ?1 ORDER BY {}",
+            spec.columns.join(", "),
+            spec.name,
+            spec.order_by
+        );
+        hash_stored_rows(tx, &sql, blob_id, spec.columns, &mut digest)?;
+    }
+    Ok(digest.finish())
+}
+
+fn hash_stored_rows(
+    tx: &rusqlite::Transaction<'_>,
+    sql: &str,
+    blob_id: i64,
+    columns: &[&str],
+    digest: &mut LengthDelimitedDigest,
+) -> Result<()> {
+    for column in columns {
+        digest.push(column.as_bytes());
+    }
+    let mut statement = tx.prepare_cached(sql)?;
+    let mut rows = statement.query([blob_id])?;
+    // The column count is fixed and every variable-length value carries its
+    // length, so one row's encoding is unambiguous within the table.
+    let mut encoded = Vec::new();
+    while let Some(row) = rows.next()? {
+        encoded.clear();
+        for index in 0..columns.len() {
+            match row.get_ref(index)? {
+                rusqlite::types::ValueRef::Null => encoded.push(0),
+                rusqlite::types::ValueRef::Integer(value) => {
+                    encoded.push(1);
+                    encoded.extend_from_slice(&value.to_le_bytes());
+                }
+                rusqlite::types::ValueRef::Real(value) => {
+                    encoded.push(2);
+                    encoded.extend_from_slice(&value.to_bits().to_le_bytes());
+                }
+                rusqlite::types::ValueRef::Text(value) => {
+                    encoded.push(3);
+                    encoded.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                    encoded.extend_from_slice(value);
+                }
+                rusqlite::types::ValueRef::Blob(value) => {
+                    encoded.push(4);
+                    encoded.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                    encoded.extend_from_slice(value);
+                }
+            }
+        }
+        digest.push(&encoded);
+    }
+    digest.push(b"end-table");
+    Ok(())
 }
 
 /// The producer epoch of a lowerer's stored rows: the adapter, the IR
@@ -302,6 +509,118 @@ pub enum SemanticIrPublicationOutcome {
     Panicked(String),
 }
 
+/// Unfiltered state of an exact stored publication key. A non-Present result
+/// is not evidence of absence for a reusable semantic answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum SemanticIrHeadObservation {
+    Missing,
+    StaleEpoch,
+    NotComplete,
+    LegacyNoDigest,
+    Present {
+        blob_id: i64,
+        active_epoch: String,
+        row_digest: StableDigest,
+        content: ContentIdentity,
+        source_bytes: usize,
+    },
+}
+
+fn observe_semantic_ir_head(
+    tx: &rusqlite::Connection,
+    key: &super::BlobKey,
+) -> Result<SemanticIrHeadObservation> {
+    let head = tx
+        .query_row(
+            "SELECT publications.blob_id, publications.producer_epoch,
+                publications.publication_state, publications.outcome, publications.row_digest,
+                publications.content_digest, epochs.producer_epoch, publications.source_bytes
+           FROM blobs
+           JOIN semantic_ir_publications AS publications ON publications.blob_id = blobs.id
+           LEFT JOIN semantic_ir_producer_epochs AS epochs ON epochs.lang = publications.lang
+          WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2 AND blobs.parse_variant = ?3",
+            params![key.oid.to_string(), key.lang, key.variant],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        blob_id,
+        producer_epoch,
+        state,
+        outcome,
+        row_digest,
+        content,
+        active_epoch,
+        source_bytes,
+    )) = head
+    else {
+        return Ok(SemanticIrHeadObservation::Missing);
+    };
+    let Some(active_epoch) = active_epoch else {
+        return Ok(SemanticIrHeadObservation::StaleEpoch);
+    };
+    if producer_epoch != active_epoch {
+        return Ok(SemanticIrHeadObservation::StaleEpoch);
+    }
+    if super::publication::PublicationState::from_sql(&state)?
+        != super::publication::PublicationState::Complete
+        || outcome != 0
+    {
+        return Ok(SemanticIrHeadObservation::NotComplete);
+    }
+    let Some(row_digest) = row_digest else {
+        return Ok(SemanticIrHeadObservation::LegacyNoDigest);
+    };
+    let row_digest: [u8; 32] = row_digest.try_into().map_err(|value: Vec<u8>| {
+        StoreError::new(format!("semantic IR row digest has {} bytes", value.len()))
+    })?;
+    let content: [u8; 32] = content.try_into().map_err(|value: Vec<u8>| {
+        StoreError::new(format!(
+            "semantic IR source digest has {} bytes",
+            value.len()
+        ))
+    })?;
+    Ok(SemanticIrHeadObservation::Present {
+        blob_id,
+        active_epoch,
+        row_digest: StableDigest::from_array(row_digest),
+        content: ContentIdentity::from_digest(StableDigest::from_array(content)),
+        source_bytes: i64_to_usize(source_bytes),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum StoredFootprintRefusal {
+    CoverageUnavailable,
+    OldContract,
+    UnknownCode,
+    DuplicateClass,
+    MissingClass,
+    RefusedCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum StoredFootprintCoverage {
+    Admitted {
+        call_target_obligations: Vec<CallTargetObligation>,
+    },
+    Refused(StoredFootprintRefusal),
+}
+
 /// The mount a reader serves the rows under. Stored locators carry no mount
 /// or language, and no path when it is the blob's own; the decoder takes
 /// them from here.
@@ -316,6 +635,25 @@ pub struct SemanticIrMountScope {
     pub language: SemanticLanguage,
     #[doc(hidden)]
     pub content: ContentIdentity,
+}
+
+/// Locator fields known before the publication's source identity is observed.
+#[derive(Clone, Debug)]
+pub struct SemanticIrMountFields {
+    pub mount: WorkspaceMountId,
+    pub path: WorkspaceRelativePath,
+    pub language: SemanticLanguage,
+}
+
+impl SemanticIrMountFields {
+    fn with_content(&self, content: ContentIdentity) -> SemanticIrMountScope {
+        SemanticIrMountScope {
+            mount: self.mount,
+            path: self.path.clone(),
+            language: self.language,
+            content,
+        }
+    }
 }
 
 impl SemanticIrMountScope {
@@ -350,6 +688,215 @@ pub(super) const SEMANTIC_IR_PUBLICATION_SQL: &str = "SELECT publications.blob_i
    AND publications.producer_epoch = epochs.producer_epoch";
 
 impl AnalyzerStore {
+    /// Decode a whole publication under the content observed in this snapshot.
+    #[doc(hidden)]
+    pub fn read_semantic_ir_with_observed_scope(
+        &self,
+        key: &super::BlobKey,
+        fields: &SemanticIrMountFields,
+    ) -> Result<(
+        SemanticIrHeadObservation,
+        Option<Vec<ProcedureSemanticsParts>>,
+    )> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let parts = match &observation {
+            SemanticIrHeadObservation::Present {
+                blob_id, content, ..
+            } => decode::read_and_decode(&tx, *blob_id, &fields.with_content(*content))?,
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, parts))
+    }
+
+    /// Decode one procedure's flows under the content observed in this snapshot.
+    #[doc(hidden)]
+    pub fn read_partial_flows_with_observed_scope(
+        &self,
+        key: &super::BlobKey,
+        fields: &SemanticIrMountFields,
+        procedure: ProcedureId,
+    ) -> Result<(SemanticIrHeadObservation, Option<ProcedurePartialFlows>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let flows = match &observation {
+            SemanticIrHeadObservation::Present {
+                blob_id, content, ..
+            } => decode::read_partial_flows(
+                &tx,
+                *blob_id,
+                &fields.with_content(*content),
+                procedure.get(),
+            )?,
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, flows))
+    }
+
+    /// Decode one procedure under the content observed in this snapshot.
+    #[doc(hidden)]
+    pub fn read_semantic_ir_procedure_with_observed_scope(
+        &self,
+        key: &super::BlobKey,
+        fields: &SemanticIrMountFields,
+        procedure: ProcedureId,
+    ) -> Result<(SemanticIrHeadObservation, Option<ProcedureSemanticsParts>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let parts = match &observation {
+            SemanticIrHeadObservation::Present {
+                blob_id, content, ..
+            } => decode::read_one_procedure(
+                &tx,
+                *blob_id,
+                &fields.with_content(*content),
+                procedure.get(),
+            )?,
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, parts))
+    }
+
+    /// Observe an exact head and active epoch in one SQLite snapshot, without
+    /// decoding its children. The lookup has no validity filter.
+    #[doc(hidden)]
+    pub fn semantic_ir_head_observation(
+        &self,
+        key: &super::BlobKey,
+    ) -> Result<SemanticIrHeadObservation> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        tx.commit()?;
+        Ok(observation)
+    }
+
+    /// Observe the head and decode its complete child set from one snapshot.
+    /// The caller binds its selected file and variant to `key` before use.
+    #[doc(hidden)]
+    pub fn read_semantic_ir_with_observation(
+        &self,
+        key: &super::BlobKey,
+        scope: &SemanticIrMountScope,
+    ) -> Result<(
+        SemanticIrHeadObservation,
+        Option<Vec<ProcedureSemanticsParts>>,
+    )> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let parts = match &observation {
+            SemanticIrHeadObservation::Present { blob_id, .. } => {
+                decode::read_and_decode(&tx, *blob_id, scope)?
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, parts))
+    }
+
+    /// Observe and decode one procedure's partial flows in the same snapshot.
+    #[doc(hidden)]
+    pub fn read_partial_flows_with_observation(
+        &self,
+        key: &super::BlobKey,
+        scope: &SemanticIrMountScope,
+        procedure: ProcedureId,
+    ) -> Result<(SemanticIrHeadObservation, Option<ProcedurePartialFlows>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let flows = match &observation {
+            SemanticIrHeadObservation::Present { blob_id, .. } => {
+                decode::read_partial_flows(&tx, *blob_id, scope, procedure.get())?
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, flows))
+    }
+
+    /// Observe and decode one procedure's semantic parts in the same snapshot.
+    #[doc(hidden)]
+    pub fn read_semantic_ir_procedure_with_observation(
+        &self,
+        key: &super::BlobKey,
+        scope: &SemanticIrMountScope,
+        procedure: ProcedureId,
+    ) -> Result<(SemanticIrHeadObservation, Option<ProcedureSemanticsParts>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let parts = match &observation {
+            SemanticIrHeadObservation::Present { blob_id, .. } => {
+                decode::read_one_procedure(&tx, *blob_id, scope, procedure.get())?
+            }
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, parts))
+    }
+
+    /// Read one selected complete publication and its footprint in one snapshot.
+    #[doc(hidden)]
+    pub fn read_footprint_coverage(
+        &self,
+        key: &super::BlobKey,
+        content: ContentIdentity,
+        procedure: ProcedureId,
+    ) -> Result<StoredFootprintCoverage> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let result = decode::read_footprint_coverage(&tx, key, content, procedure)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Observe the selected head and read its footprint in the same snapshot.
+    /// A replaced or absent head cannot supply coverage for this observation.
+    #[doc(hidden)]
+    pub fn read_footprint_coverage_with_observation(
+        &self,
+        key: &super::BlobKey,
+        content: ContentIdentity,
+        procedure: ProcedureId,
+    ) -> Result<(SemanticIrHeadObservation, Option<StoredFootprintCoverage>)> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let observation = observe_semantic_ir_head(&tx, key)?;
+        let coverage = match &observation {
+            SemanticIrHeadObservation::Present {
+                content: observed, ..
+            } if *observed == content => Some(decode::read_footprint_coverage(
+                &tx, key, content, procedure,
+            )?),
+            _ => None,
+        };
+        tx.commit()?;
+        Ok((observation, coverage))
+    }
+
+    /// Read the independent scoped call/control claim from one complete publication.
+    #[doc(hidden)]
+    pub fn read_call_control_coverage(
+        &self,
+        key: &super::BlobKey,
+        content: ContentIdentity,
+        procedure: ProcedureId,
+    ) -> Result<StoredFootprintCoverage> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let result = decode::read_call_control_coverage(&tx, key, content, procedure)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Install the active producer epoch for one storage language. Returns
     /// whether it changed. Heads written under another epoch stop being
     /// valid; replacing their blob removes them.
@@ -461,6 +1008,25 @@ impl AnalyzerStore {
             .into_iter()
             .map(|(procedure, flows)| (ProcedureId::new(procedure), flows))
             .collect())
+    }
+
+    /// Decode one procedure from its rows in a single read transaction.
+    #[doc(hidden)]
+    pub fn read_semantic_ir_procedure(
+        &self,
+        blob_id: i64,
+        scope: &SemanticIrMountScope,
+        procedure: ProcedureId,
+    ) -> Result<ProcedureSemanticsParts> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let parts = decode::read_one_procedure(&tx, blob_id, scope, procedure.get())?;
+        tx.commit()?;
+        parts.ok_or_else(|| {
+            StoreError::new(format!(
+                "semantic IR rows of blob {blob_id} are no longer published"
+            ))
+        })
     }
 
     /// Every row of one blob, read in one transaction and decoded into the
@@ -595,12 +1161,15 @@ tables! {
     Procedures => "semantic_ir_procedures" [
         "procedure", "locator", "lexical_parent", "kind", "is_async", "is_generator",
         "is_static", "is_synthetic", "invocation", "dispatch_extensibility", "call_boundary",
-        "receiver_binding", "construction_return", "source", "evidence",
+        "receiver_binding", "construction_return", "source", "evidence", "has_declared_results",
     ] jsonb [] order "procedure";
+    ResultTypeClasses => "semantic_ir_result_type_classes" [
+        "procedure", "ordinal", "class",
+    ] jsonb [] order "procedure, ordinal";
     Values => "semantic_ir_values" [
         "procedure", "value", "kind", "ordinal", "multiplicity", "rest_domain",
         "rest_domain_text", "name", "passing_mode", "flag", "magnitude", "float_bits", "text",
-        "source", "evidence",
+        "source", "evidence", "static_type_class", "static_origin_call", "static_origin_ordinal",
     ] jsonb [] order "procedure, value";
     Allocations => "semantic_ir_allocations" [
         "procedure", "allocation", "point", "result", "kind", "kind_text", "source", "evidence",
@@ -727,6 +1296,13 @@ tables! {
     ReceiverTypeFacts => "semantic_ir_receiver_type_facts" [
         "procedure", "call_site", "member", "receiver_type",
     ] jsonb ["receiver_type"] order "procedure, call_site";
+    GuardedPatternProjections => "semantic_ir_guarded_pattern_projections" [
+        "procedure", "ordinal", "point", "whole_value", "binder", "pattern_source",
+        "binder_source", "path_len", "status",
+    ] jsonb [] order "procedure, ordinal";
+    GuardedPatternSteps => "semantic_ir_guarded_pattern_steps" [
+        "procedure", "candidate", "step", "kind", "tuple_ordinal", "named_text",
+    ] jsonb [] order "procedure, candidate, step";
     PartialPorts => "semantic_ir_ports" [
         "procedure", "port", "kind", "a", "b", "root", "selectors", "tail",
     ] jsonb ["selectors"] order "procedure, port";
@@ -737,6 +1313,24 @@ tables! {
         "procedure", "outcome", "detail", "open", "relations_complete", "port_count", "flow_count",
         "discharged_gaps",
     ] jsonb ["discharged_gaps"] order "procedure";
+    FootprintCoverage => "semantic_ir_footprint_coverage" [
+        "procedure", "contract_version", "boundary_disposition", "boundary_reason",
+    ] jsonb [] order "procedure";
+    FootprintCoverageClasses => "semantic_ir_footprint_coverage_classes" [
+        "procedure", "class", "disposition", "reason",
+    ] jsonb [] order "procedure, class";
+    FootprintCallTargetObligations => "semantic_ir_footprint_call_target_obligations" [
+        "procedure", "call_site", "gap", "impacts",
+    ] jsonb [] order "procedure, call_site, gap";
+    CallControlCoverage => "semantic_ir_call_control_coverage" [
+        "procedure", "contract_version", "source_boundary", "source_reason", "admission", "admission_reason", "obligation_count",
+    ] jsonb [] order "procedure";
+    CallControlClasses => "semantic_ir_call_control_classes" [
+        "procedure", "class", "disposition", "reason",
+    ] jsonb [] order "procedure, class";
+    CallControlObligations => "semantic_ir_call_control_obligations" [
+        "procedure", "call_site", "gap", "impacts",
+    ] jsonb [] order "procedure, call_site, gap";
 }
 
 fn usize_to_i64(value: usize) -> i64 {

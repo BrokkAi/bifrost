@@ -1,5 +1,8 @@
 // Boundary-visible child modules keep their qualified paths when short names collide.
 #![allow(ambiguous_glob_reexports)]
+// SemanticArtifact's charge is mutable accounting state; ProcedureHandle hashing
+// and equality use its immutable identity, never that charge.
+#![allow(clippy::mutable_key_type)]
 
 //! Language-neutral executable semantics and adapter contracts.
 
@@ -89,7 +92,9 @@ pub use crate::analyzer::semantic::render::*;
 pub use crate::analyzer::semantic::service::SemanticCacheRevivalCensus;
 #[cfg(any(test, feature = "test-support"))]
 pub use crate::analyzer::semantic::service::SemanticMaterializationCensus;
-pub use crate::analyzer::semantic::service::semantic_artifact_retained_bytes;
+pub use crate::analyzer::semantic::service::{
+    procedure_parts_retained_bytes, semantic_artifact_retained_bytes,
+};
 
 pub use crate::analyzer::semantic::statement_entries::*;
 
@@ -167,6 +172,7 @@ pub mod call_relations;
 pub mod common;
 #[doc(hidden)]
 pub mod content_identity;
+pub mod derivation;
 #[doc(hidden)]
 pub mod digest;
 #[doc(hidden)]

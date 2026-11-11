@@ -1,3 +1,4 @@
+use crate::bindings::python_is_type_parameter_binder;
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -6,13 +7,29 @@ use tree_sitter::{Node, Tree};
 
 /// A decoded module/member route, with Python identifier-valued segments.
 /// This classifies an API string value rather than parsing source syntax.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn is_python_member_path(value: &str) -> bool {
     static IDENTIFIER: std::sync::LazyLock<::regex::Regex> = std::sync::LazyLock::new(|| {
         ::regex::Regex::new(r"\A[_\p{XID_Start}]\p{XID_Continue}*\z")
             .expect("Python identifier value regex")
     });
     value.contains('.') && value.split('.').all(|part| IDENTIFIER.is_match(part))
+}
+
+/// The lexical class that owns a function, including definitions in compound
+/// class-body statements. Compound suites do not introduce Python scopes.
+pub(crate) fn python_method_owner(definition: Node<'_>) -> Option<Node<'_>> {
+    debug_assert_eq!(definition.kind(), "function_definition");
+    let mut current = definition;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "class_definition" => {
+                return (parent.child_by_field_name("body") == Some(current)).then_some(parent);
+            }
+            "function_definition" | "lambda" | "module" => return None,
+            _ => current = parent,
+        }
+    }
+    None
 }
 
 /// The operands of a Python conditional expression (`value if test else
@@ -22,7 +39,7 @@ pub(crate) fn is_python_member_path(value: &str) -> bool {
 /// can only be selected positionally. Skipping extras is required: a backslash
 /// line continuation before `else` otherwise appears as a fourth named child
 /// and trips the operand-count check (#4797).
-pub(crate) fn python_conditional_expression_operands(node: Node<'_>) -> Option<[Node<'_>; 3]> {
+pub fn python_conditional_expression_operands(node: Node<'_>) -> Option<[Node<'_>; 3]> {
     assert_eq!(node.kind(), "conditional_expression");
     let mut cursor = node.walk();
     let operands: Vec<Node<'_>> = node
@@ -51,7 +68,6 @@ pub(crate) fn python_parameter_name_bounded(
 }
 
 /// The exact binder token, shared by signature and native lexical production.
-#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn python_parameter_node(node: Node<'_>) -> Option<Node<'_>> {
     python_parameter_node_bounded(node, || true).expect("unbounded parameter token lookup")
 }
@@ -451,6 +467,14 @@ pub fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tree>> {
     Some(expression)
 }
 
+/// Whether a named node can carry a Python source reference at the selected range.
+/// Soft keywords used as names parse as `keyword_identifier`, and deferred
+/// annotation strings can name a reference even without an identifier node.
+pub fn python_node_can_be_reference(node: Node<'_>) -> bool {
+    matches!(node.kind(), "identifier" | "keyword_identifier")
+        || (node.kind() == "string_content" && python_node_is_in_annotation(node))
+}
+
 /// Whether `node` is contained by a parser field that Python evaluates as an
 /// annotation rather than as an ordinary expression.
 pub fn python_node_is_in_annotation(node: Node<'_>) -> bool {
@@ -630,6 +654,94 @@ pub(crate) fn python_contains_all_identifier(node: Node<'_>, source: &str) -> bo
         }
     });
     found
+}
+
+pub fn is_declaration_identifier(node: Node<'_>) -> bool {
+    let contains = |container: Node<'_>| {
+        container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
+    };
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "class_definition" | "function_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id())
+                    || python_is_type_parameter_binder(node);
+            }
+            "parameters"
+            | "lambda_parameters"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => return true,
+            "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
+                return parent.child_by_field_name("name").is_some_and(contains);
+            }
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                return parent.child_by_field_name("left").is_some_and(contains);
+            }
+            "named_expression" => {
+                return parent.child_by_field_name("name").is_some_and(contains);
+            }
+            "aliased_import" | "import_from_statement" | "import_statement" => return true,
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "parenthesized_expression"
+            | "type"
+            | "type_parameter"
+            | "constrained_type" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Whether an attribute call uses the conventional Python receiver name.
+pub fn python_attribute_callee_uses_self_or_cls_bounded(source: &str, callee: Node<'_>) -> bool {
+    let Some(object) = callee.child_by_field_name("object") else {
+        return false;
+    };
+    object.kind() == "identifier" && matches!(node_text(object, source), "self" | "cls")
+}
+
+/// Whether an attribute callee names a nested class in its enclosing class.
+pub fn python_attribute_callee_names_enclosing_nested_class_bounded(
+    source: &str,
+    callee: Node<'_>,
+) -> bool {
+    let Some(attribute) = callee.child_by_field_name("attribute") else {
+        return false;
+    };
+    let name = node_text(attribute, source);
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "class_definition" {
+            let Some(body) = node.child_by_field_name("body") else {
+                return false;
+            };
+            let mut cursor = body.walk();
+            return body.named_children(&mut cursor).any(|member| {
+                member.kind() == "class_definition"
+                    && member
+                        .child_by_field_name("name")
+                        .is_some_and(|class_name| node_text(class_name, source) == name)
+            });
+        }
+        ancestor = node.parent();
+    }
+    false
+}
+
+/// Whether an attribute expression reaches a nested class of the enclosing
+/// class through `self` or `cls`. Instance writes or subclass overrides can
+/// shadow such a class, so no single class answers for it.
+pub fn python_attribute_names_nested_class_through_current_receiver_bounded(
+    source: &str,
+    expression: Node<'_>,
+) -> bool {
+    expression.kind() == "attribute"
+        && python_attribute_callee_uses_self_or_cls_bounded(source, expression)
+        && python_attribute_callee_names_enclosing_nested_class_bounded(source, expression)
 }
 
 #[cfg(test)]

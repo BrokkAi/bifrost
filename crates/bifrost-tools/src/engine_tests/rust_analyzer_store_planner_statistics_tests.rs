@@ -81,6 +81,7 @@ mod rust_departing_tests_tests {
         // revision. Both reader pools must invalidate that identical selection.
         store
             .execute_selection_publication(|conn| -> brokk_bifrost_analysis::analyzer::store::Result<()> {
+                brokk_bifrost_analysis::analyzer::store::sealed_families::fixture_rows(conn, |conn| {
                 let tx = conn.transaction()?;
                 tx.execute(
                     brokk_bifrost_analysis::analyzer::store::unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL,
@@ -92,6 +93,7 @@ mod rust_departing_tests_tests {
                 )?;
                 tx.commit()?;
                 Ok(())
+                })
             })
             .unwrap();
         let mut ordinary = store.read_conn_for_workspace(&snapshots).unwrap();
@@ -219,7 +221,9 @@ mod rust_departing_tests_tests {
             );
             let fill = brokk_bifrost_analysis::analyzer::store::rust_selected_units_fill_sql();
             let units_select = fill
-                .split_once("INSERT INTO temp.selected_rust_unit_summaries\n")
+                .split_once(
+                    brokk_bifrost_analysis::analyzer::store::rust_selected_units_insert_marker(),
+                )
                 .unwrap()
                 .1
                 .split_once(';')
@@ -245,12 +249,12 @@ mod rust_departing_tests_tests {
         // writer after exercising the real read-only selection lifecycle.
         let conn = store.conn.lock().unwrap();
         prepare_pin_context(&conn);
+        brokk_bifrost_analysis::analyzer::store::clear_selected_rust_units_for_test(&conn).unwrap();
         conn.execute_batch(
             "DELETE FROM temp.selected_resolution_mounts;
                             DELETE FROM temp.selected_rust_transient_placement_attributes;
 DELETE FROM temp.selected_resolution_transient_placements;
                             DELETE FROM temp.selected_rust_unit_closure;
-                            DELETE FROM temp.selected_rust_unit_summaries;
                             DELETE FROM temp.selected_workspace_revisions;",
         )
         .unwrap();

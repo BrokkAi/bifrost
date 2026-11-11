@@ -91,9 +91,12 @@ class CodeQueryAbsentMemberWitnessStatus(StrEnum):
 
 
 class CodeQueryDiagnosticCode(StrEnum):
+    POLICY_DECLARED_PROVEN_SUBSET = 'policy_declared_proven_subset'
     INVALID_PLAN = 'invalid_plan'
     CANCELLED = 'cancelled'
     UNSUPPORTED_STRUCTURAL_FEATURE = 'unsupported_structural_feature'
+    QUALIFYING_TYPE_UNRESOLVED = 'qualifying_type_unresolved'
+    STRUCTURAL_ROLE_COVERAGE_INCOMPLETE = 'structural_role_coverage_incomplete'
     MISSING_STRUCTURAL_ADAPTER = 'missing_structural_adapter'
     RECOVERED_SYNTAX_INCOMPLETE = 'recovered_syntax_incomplete'
     UNSUPPORTED_IMPORT_ANALYSIS = 'unsupported_import_analysis'
@@ -109,6 +112,7 @@ class CodeQueryDiagnosticCode(StrEnum):
     SEMANTIC_BUDGET_EXHAUSTED = 'semantic_budget_exhausted'
     SEMANTIC_PROVIDER_FAILED = 'semantic_provider_failed'
     SEMANTIC_PACK_ACQUISITION_PENDING = 'semantic_pack_acquisition_pending'
+    SEMANTIC_PACK_ACTIVATION_FAILED = 'semantic_pack_activation_failed'
     WORKSPACE_SEMANTIC_MODELS_NOT_LOADED = 'workspace_semantic_models_not_loaded'
     UNRESOLVED_PROTOCOL_REFERENCE = 'unresolved_protocol_reference'
     TYPESTATE_REGISTRATION_STALE = 'typestate_registration_stale'
@@ -146,12 +150,18 @@ class CodeQueryDiagnosticCode(StrEnum):
     CALL_RELATION_TARGETS_AMBIGUOUS = 'call_relation_targets_ambiguous'
     CALL_RELATION_CANDIDATE_LIMIT = 'call_relation_candidate_limit'
     CALL_RELATION_ANALYSIS_FAILED = 'call_relation_analysis_failed'
+    RENDERED_CAPTURES_TRUNCATED = 'rendered_captures_truncated'
     REFERENCE_SOURCE_BYTES_TRUNCATED = 'reference_source_bytes_truncated'
     REFERENCE_CANDIDATE_FILES_TRUNCATED = 'reference_candidate_files_truncated'
     REFERENCE_CANDIDATES_OMITTED = 'reference_candidates_omitted'
     REFERENCE_TARGETS_AMBIGUOUS = 'reference_targets_ambiguous'
     REFERENCE_CALLSITE_LIMIT = 'reference_callsite_limit'
     REFERENCE_ANALYSIS_FAILED = 'reference_analysis_failed'
+    REFERENCE_KIND_UNDECIDED = 'reference_kind_undecided'
+    ENCLOSING_PATTERN_UNDECIDED = 'enclosing_pattern_undecided'
+    IDENTICAL_CAPTURES_OPEN = 'identical_captures_open'
+    ROW_PREDICATE_UNDECIDED = 'row_predicate_undecided'
+    MEMBER_FORM_UNDECIDED = 'member_form_undecided'
     USES_PARSER_UNSUPPORTED = 'uses_parser_unsupported'
     USES_CANDIDATE_LIMIT = 'uses_candidate_limit'
     USES_TARGETS_AMBIGUOUS = 'uses_targets_ambiguous'
@@ -329,6 +339,12 @@ class ConversionUnknownVariant1(StrEnum):
     CANCELLED = 'cancelled'
 
 
+class DepthBoundStatus(StrEnum):
+    REACHED = 'reached'
+    NOT_REACHED = 'not_reached'
+    UNKNOWN = 'unknown'
+
+
 class JavaAnnotationTypeStatus(StrEnum):
     RESOLVED = 'resolved'
     AMBIGUOUS = 'ambiguous'
@@ -466,6 +482,7 @@ class CodeQueryAssignmentRelation:
     procedure_id: str
     proof: str
     range: CodeQueryRange
+    read_event: CodeQueryStateEventRef | None
     reason: str | None
     relation_kind: str
     replacement_events: list[CodeQueryStateEventRef]
@@ -490,6 +507,7 @@ class CodeQueryBinding:
     end_byte: int
     hoisting: str
     id: str
+    immediate_parent_kind: str | None
     import_: CodeQueryImportBinder | None
     kind: str
     language: str
@@ -502,6 +520,8 @@ class CodeQueryBinding:
     source_order: int
     start_byte: int
     visibility: str
+    whole_let_initializer: bool
+    whole_match_arm_identifier: bool
     provenance: list[CodeQueryProvenance]
     provenance_truncated: bool
 
@@ -904,11 +924,14 @@ class CodeQueryCallShape:
 class CodeQueryCallSite:
     argument_identity: str | None
     arguments: list[CodeQueryCallArgument]
+    boundary_kind: str | None
     call_kind: str
-    callee: CodeQueryDeclaration2
+    callee: CodeQueryDeclaration2 | None
     callee_range: CodeQueryRange
     caller: CodeQueryDeclaration2
     caller_parameter_identity: str | None
+    completeness: str
+    coverage: str
     language: str
     path: str
     program_point_id: str | None
@@ -917,6 +940,9 @@ class CodeQueryCallSite:
     receiver: CodeQueryRange | None
     receiver_kind: str
     site_id: str | None
+    target_fq_name: str | None
+    target_id: str | None
+    target_reason: str | None
     provenance: list[CodeQueryProvenance]
     provenance_truncated: bool
 
@@ -1042,6 +1068,7 @@ class CodeQueryCandidateRefVariant1:
 @dataclass(frozen=True)
 class CodeQueryCandidateRefVariant2:
     name: str
+    provider: ModelProvider
     symbol_id: str
 
     @classmethod
@@ -1136,6 +1163,7 @@ class CodeQueryClassSetRow:
 @dataclass(frozen=True)
 class CodeQueryConfigurationFact:
     completeness: str
+    directory: str
     end_byte: int
     fact_id: str
     fact_provenance: str
@@ -1166,6 +1194,7 @@ class CodeQueryConfigurationFact:
 @dataclass(frozen=True)
 class CodeQueryConfigurationFact2:
     completeness: str
+    directory: str
     end_byte: int
     fact_id: str
     fact_provenance: str
@@ -1513,6 +1542,7 @@ class CodeQueryDispatchOutcome:
 @dataclass(frozen=True)
 class CodeQueryDispatchTarget:
     boundary_kind: str | None
+    boundary_reason: str | None
     completeness: str
     coverage: str
     dispatch: str
@@ -1520,8 +1550,11 @@ class CodeQueryDispatchTarget:
     ordinal: int
     path: str
     proof: str
+    range: CodeQueryRange
+    root_id: str
     site_ast_id: str | None
     site_id: str
+    target_count: int | None
     target_declaration: CodeQueryDeclaration2 | None
     target_fq_name: str | None
     target_id: str
@@ -2026,6 +2059,7 @@ class CodeQueryFlowWitnessStep:
     output: CodeQueryFlowFactSymbolVariant1 | CodeQueryFlowFactSymbolVariant2 | CodeQueryFlowFactSymbolVariant3 | None
     source: CodeQuerySourceSite
     source_symbol: CodeQueryFlowSymbolSite | None
+    summary_fingerprint: str | None
     target: CodeQuerySourceSite | None
     target_symbol: CodeQueryFlowSymbolSite | None
 
@@ -2391,6 +2425,7 @@ class CodeQueryMemberTarget:
     id: str
     kind: str
     language: str | None
+    member_form: str | None
     name: str
     node_range: CodeQueryRange | None
     path: str | None
@@ -2405,6 +2440,7 @@ class CodeQueryMemberTarget:
     semantic_model: SemanticModelProvenance | None
     signature: str | None
     start_line: int | None
+    trivial_property: bool | None
 
     @classmethod
     def from_dict(cls, data: Any) -> CodeQueryMemberTarget:
@@ -3128,7 +3164,7 @@ class CodeQueryReferenceEdge:
     path: str
     proof: str
     range: CodeQueryRange
-    reference_kind: str | None
+    reference_facets: CodeQueryReferenceFacets
     site_class: str
     start_byte: int
     target: CodeQueryDeclaration2
@@ -3142,13 +3178,23 @@ class CodeQueryReferenceEdge:
 
 
 @dataclass(frozen=True)
+class CodeQueryReferenceFacets:
+    known: list[str]
+    undecided: list[str]
+
+    @classmethod
+    def from_dict(cls, data: Any) -> CodeQueryReferenceFacets:
+        return _decode_code_query_reference_facets(data, 'CodeQueryReferenceFacets')
+
+
+@dataclass(frozen=True)
 class CodeQueryReferenceSite:
     enclosing_declaration: CodeQueryDeclaration2 | None
     language: str
     path: str
     proof: str
     range: CodeQueryRange
-    reference_kind: str | None
+    reference_facets: CodeQueryReferenceFacets
     target: CodeQueryDeclaration2
     usage_kind: str
     provenance: list[CodeQueryProvenance]
@@ -3202,6 +3248,7 @@ class CodeQueryResolutionCandidate:
 
 @dataclass(frozen=True)
 class CodeQueryResult:
+    depth_bound_status: DepthBoundStatus | None
     diagnostics: list[CodeQueryDiagnostic]
     results: list[CodeQueryStructuralMatch | CodeQueryDeclaration | CodeQueryProcedure | CodeQueryProgramPoint | CodeQueryControlEdge | CodeQueryTypestateFinding | CodeQueryTypestateWitness | CodeQueryFlowEndpoint | CodeQueryFlowWitness | CodeQueryClassSetRow | CodeQueryAbsentMemberFinding | CodeQueryAbsentMemberWitness | CodeQueryTaintFinding | CodeQueryFile | CodeQueryDependencyEvidence | CodeQueryConfigurationFact | CodeQueryReferenceSite | CodeQueryCallSite | CodeQueryExpressionSite | CodeQueryJsxAttributeValue | CodeQueryReceiverAnalysis | CodeQueryMemberTargetAnalysis | CodeQueryReceiverOutcome | CodeQueryReceiverEvidence | CodeQueryPointsToCandidate | CodeQueryFieldWriteValue | CodeQueryKeyedReadValue | CodeQueryCallShape | CodeQueryCallResult | CodeQueryCallArgumentGroup | CodeQueryCallArgument2 | CodeQueryCallBinding | CodeQueryCallEffect | CodeQueryCallResultContract | CodeQueryCallResultObligation | CodeQueryResultSubjectUse | CodeQueryResultContractUse | CodeQueryResultContractFailureUse | CodeQueryNilnessOperation | CodeQuerySwitchCoverage | CodeQueryAssignmentRelation | CodeQueryDetachedTaskTransfer | CodeQueryProcedureEffect | CodeQueryCallableSignature | CodeQueryLiteralOccurrence | CodeQueryCallableMetrics | CodeQuerySignatureParameter | CodeQueryDecoratedParameter | CodeQueryCallableApplicability | CodeQueryOverloadSelection | CodeQueryMemberSelection | CodeQueryDispatchOutcome | CodeQueryDispatchTarget | CodeQueryMemberFamily | CodeQueryMemberFamilyEdge | CodeQueryPythonHierarchyFact | CodeQueryOccurrence | CodeQueryLexicalScope | CodeQueryBinding | CodeQueryResolutionCandidate | CodeQueryCandidateHop | CodeQueryGenerationSite | CodeQueryExport | CodeQueryDeclarationState | CodeQueryReferenceEdge | CodeQueryStateEvent | CodeQueryBindingInitializerCall | CodeQueryFlowRelation | CodeQueryControlRelation | CodeQueryBranchRelation | CodeQueryLoopRelation | CodeQueryCppExpression | CodeQueryFailureHandlerState | CodeQueryStatementReachability | CodeQueryPendingCleanupFlow | CodeQueryPythonRuleFact | CodeQueryRustMarkerImpl | CodeQueryRustPointerFinding | CodeQueryGuard | CodeQueryRewritePath | CodeQueryQualifiedPath | CodeQueryPathSegment | CodeQuerySourceSet | CodeQueryBuildTarget | CodeQueryTopologyEdge | CodeQueryBuildConfiguration | CodeQueryCrossDomain]
     session_subset: SubsetCoverage | None
@@ -3339,7 +3386,7 @@ class CodeQueryResultRefVariant13:
     path: str
     proof: str
     range: CodeQueryRange
-    reference_kind: str | None
+    reference_facets: CodeQueryReferenceFacets
     target_fq_name: str
     target_id: str | None
     usage_kind: str | None
@@ -4088,8 +4135,10 @@ class CodeQueryResultRefVariant60:
     ast_id: str | None
     id: str
     path: str
+    proof: str
     provenance: str
     range: CodeQueryRange
+    reference_facets: CodeQueryReferenceFacets
     target_fq_name: str
 
     @classmethod
@@ -4759,6 +4808,7 @@ class CodeQueryStatementReachability:
     procedure_id: str
     range: CodeQueryRange
     reason: str | None
+    region_first: str | None
     statement_kind: str
     verdict: str
     provenance: list[CodeQueryProvenance]
@@ -5206,6 +5256,17 @@ class JavaAnnotationArtifactVariant3:
     @classmethod
     def from_dict(cls, data: Any) -> JavaAnnotationArtifactVariant3:
         return _decode_java_annotation_artifact_variant3(data, 'JavaAnnotationArtifactVariant3')
+
+
+@dataclass(frozen=True)
+class ModelProvider:
+    pack_digest: str
+    pack_id: str
+    pack_version: str
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ModelProvider:
+        return _decode_model_provider(data, 'ModelProvider')
 
 
 @dataclass(frozen=True)
@@ -5728,6 +5789,7 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
         'procedure_id',
         'proof',
         'range',
+        'read_event',
         'reason',
         'relation_kind',
         'replacement_events',
@@ -5772,6 +5834,10 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
     procedure_id_value = _decode_string(value['procedure_id'], f"{prefix}.procedure_id")
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    if 'read_event' in value:
+        read_event_value = _decode_defs_code_query_result_item_union_40_properties_read_event(value['read_event'], f"{prefix}.read_event")
+    else:
+        read_event_value = None
     if 'reason' in value:
         reason_value = _decode_defs_code_query_result_item_union_40_properties_reason(value['reason'], f"{prefix}.reason")
     else:
@@ -5809,6 +5875,7 @@ def _decode_code_query_assignment_relation(value: Any, prefix: str = 'CodeQueryA
         procedure_id=procedure_id_value,
         proof=proof_value,
         range=range_value,
+        read_event=read_event_value,
         reason=reason_value,
         relation_kind=relation_kind_value,
         replacement_events=replacement_events_value,
@@ -5831,6 +5898,7 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
         'end_byte',
         'hoisting',
         'id',
+        'immediate_parent_kind',
         'import',
         'kind',
         'language',
@@ -5843,6 +5911,8 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
         'source_order',
         'start_byte',
         'visibility',
+        'whole_let_initializer',
+        'whole_match_arm_identifier',
         'provenance',
         'provenance_truncated',
     }
@@ -5866,6 +5936,8 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
         'source_order',
         'start_byte',
         'visibility',
+        'whole_let_initializer',
+        'whole_match_arm_identifier',
     }
     missing = required - actual
     if missing:
@@ -5880,6 +5952,10 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
     end_byte_value = _decode_defs_code_query_result_item_union_58_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
     hoisting_value = _decode_string(value['hoisting'], f"{prefix}.hoisting")
     id_value = _decode_string(value['id'], f"{prefix}.id")
+    if 'immediate_parent_kind' in value:
+        immediate_parent_kind_value = _decode_defs_code_query_result_item_union_58_properties_immediate_parent_kind(value['immediate_parent_kind'], f"{prefix}.immediate_parent_kind")
+    else:
+        immediate_parent_kind_value = None
     if 'import' in value:
         import__value = _decode_defs_code_query_result_item_union_58_properties_import(value['import'], f"{prefix}.import")
     else:
@@ -5901,6 +5977,8 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
     source_order_value = _decode_defs_code_query_result_item_union_58_properties_source_order(value['source_order'], f"{prefix}.source_order")
     start_byte_value = _decode_defs_code_query_result_item_union_58_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
     visibility_value = _decode_string(value['visibility'], f"{prefix}.visibility")
+    whole_let_initializer_value = _decode_boolean(value['whole_let_initializer'], f"{prefix}.whole_let_initializer")
+    whole_match_arm_identifier_value = _decode_boolean(value['whole_match_arm_identifier'], f"{prefix}.whole_match_arm_identifier")
     if 'provenance' in value:
         provenance_value = _decode_defs_code_query_result_item_union_58_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
@@ -5917,6 +5995,7 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
         end_byte=end_byte_value,
         hoisting=hoisting_value,
         id=id_value,
+        immediate_parent_kind=immediate_parent_kind_value,
         import_=import__value,
         kind=kind_value,
         language=language_value,
@@ -5929,6 +6008,8 @@ def _decode_code_query_binding(value: Any, prefix: str = 'CodeQueryBinding') -> 
         source_order=source_order_value,
         start_byte=start_byte_value,
         visibility=visibility_value,
+        whole_let_initializer=whole_let_initializer_value,
+        whole_match_arm_identifier=whole_match_arm_identifier_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
     )
@@ -7565,11 +7646,14 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
     expected = {
         'argument_identity',
         'arguments',
+        'boundary_kind',
         'call_kind',
         'callee',
         'callee_range',
         'caller',
         'caller_parameter_identity',
+        'completeness',
+        'coverage',
         'language',
         'path',
         'program_point_id',
@@ -7578,6 +7662,9 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
         'receiver',
         'receiver_kind',
         'site_id',
+        'target_fq_name',
+        'target_id',
+        'target_reason',
         'provenance',
         'provenance_truncated',
     }
@@ -7587,9 +7674,10 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
         'call_kind',
-        'callee',
         'callee_range',
         'caller',
+        'completeness',
+        'coverage',
         'language',
         'path',
         'proof',
@@ -7607,14 +7695,23 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
         arguments_value = _decode_defs_code_query_result_item_union_17_properties_arguments(value['arguments'], f"{prefix}.arguments")
     else:
         arguments_value = _decode_defs_code_query_result_item_union_17_properties_arguments([], f"{prefix}.arguments")
+    if 'boundary_kind' in value:
+        boundary_kind_value = _decode_defs_code_query_result_item_union_17_properties_boundary_kind(value['boundary_kind'], f"{prefix}.boundary_kind")
+    else:
+        boundary_kind_value = None
     call_kind_value = _decode_string(value['call_kind'], f"{prefix}.call_kind")
-    callee_value = _decode_code_query_declaration2(value['callee'], f"{prefix}.callee")
+    if 'callee' in value:
+        callee_value = _decode_defs_code_query_result_item_union_17_properties_callee(value['callee'], f"{prefix}.callee")
+    else:
+        callee_value = None
     callee_range_value = _decode_code_query_range(value['callee_range'], f"{prefix}.callee_range")
     caller_value = _decode_code_query_declaration2(value['caller'], f"{prefix}.caller")
     if 'caller_parameter_identity' in value:
         caller_parameter_identity_value = _decode_defs_code_query_result_item_union_17_properties_caller_parameter_identity(value['caller_parameter_identity'], f"{prefix}.caller_parameter_identity")
     else:
         caller_parameter_identity_value = None
+    completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
+    coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
     language_value = _decode_string(value['language'], f"{prefix}.language")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     if 'program_point_id' in value:
@@ -7632,6 +7729,18 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
         site_id_value = _decode_defs_code_query_result_item_union_17_properties_site_id(value['site_id'], f"{prefix}.site_id")
     else:
         site_id_value = None
+    if 'target_fq_name' in value:
+        target_fq_name_value = _decode_defs_code_query_result_item_union_17_properties_target_fq_name(value['target_fq_name'], f"{prefix}.target_fq_name")
+    else:
+        target_fq_name_value = None
+    if 'target_id' in value:
+        target_id_value = _decode_defs_code_query_result_item_union_17_properties_target_id(value['target_id'], f"{prefix}.target_id")
+    else:
+        target_id_value = None
+    if 'target_reason' in value:
+        target_reason_value = _decode_defs_code_query_result_item_union_17_properties_target_reason(value['target_reason'], f"{prefix}.target_reason")
+    else:
+        target_reason_value = None
     if 'provenance' in value:
         provenance_value = _decode_defs_code_query_result_item_union_17_properties_provenance(value['provenance'], f"{prefix}.provenance")
     else:
@@ -7643,11 +7752,14 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
     return CodeQueryCallSite(
         argument_identity=argument_identity_value,
         arguments=arguments_value,
+        boundary_kind=boundary_kind_value,
         call_kind=call_kind_value,
         callee=callee_value,
         callee_range=callee_range_value,
         caller=caller_value,
         caller_parameter_identity=caller_parameter_identity_value,
+        completeness=completeness_value,
+        coverage=coverage_value,
         language=language_value,
         path=path_value,
         program_point_id=program_point_id_value,
@@ -7656,6 +7768,9 @@ def _decode_code_query_call_site(value: Any, prefix: str = 'CodeQueryCallSite') 
         receiver=receiver_value,
         receiver_kind=receiver_kind_value,
         site_id=site_id_value,
+        target_fq_name=target_fq_name_value,
+        target_id=target_id_value,
+        target_reason=target_reason_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
     )
@@ -8112,6 +8227,7 @@ def _decode_code_query_candidate_ref_variant2(value: Any, prefix: str = 'CodeQue
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'name',
+        'provider',
         'symbol_id',
     }
     actual = set(value)
@@ -8120,15 +8236,18 @@ def _decode_code_query_candidate_ref_variant2(value: Any, prefix: str = 'CodeQue
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
         'name',
+        'provider',
         'symbol_id',
     }
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     name_value = _decode_string(value['name'], f"{prefix}.name")
+    provider_value = _decode_model_provider(value['provider'], f"{prefix}.provider")
     symbol_id_value = _decode_string(value['symbol_id'], f"{prefix}.symbol_id")
     return CodeQueryCandidateRefVariant2(
         name=name_value,
+        provider=provider_value,
         symbol_id=symbol_id_value,
     )
 
@@ -8388,6 +8507,7 @@ def _decode_code_query_configuration_fact(value: Any, prefix: str = 'CodeQueryCo
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'completeness',
+        'directory',
         'end_byte',
         'fact_id',
         'fact_provenance',
@@ -8416,6 +8536,7 @@ def _decode_code_query_configuration_fact(value: Any, prefix: str = 'CodeQueryCo
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
         'completeness',
+        'directory',
         'end_byte',
         'fact_id',
         'fact_provenance',
@@ -8432,6 +8553,7 @@ def _decode_code_query_configuration_fact(value: Any, prefix: str = 'CodeQueryCo
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
+    directory_value = _decode_string(value['directory'], f"{prefix}.directory")
     end_byte_value = _decode_defs_code_query_result_item_union_15_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
     fact_id_value = _decode_string(value['fact_id'], f"{prefix}.fact_id")
     fact_provenance_value = _decode_string(value['fact_provenance'], f"{prefix}.fact_provenance")
@@ -8485,6 +8607,7 @@ def _decode_code_query_configuration_fact(value: Any, prefix: str = 'CodeQueryCo
         provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
     return CodeQueryConfigurationFact(
         completeness=completeness_value,
+        directory=directory_value,
         end_byte=end_byte_value,
         fact_id=fact_id_value,
         fact_provenance=fact_provenance_value,
@@ -8513,6 +8636,7 @@ def _decode_code_query_configuration_fact2(value: Any, prefix: str = 'CodeQueryC
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'completeness',
+        'directory',
         'end_byte',
         'fact_id',
         'fact_provenance',
@@ -8539,6 +8663,7 @@ def _decode_code_query_configuration_fact2(value: Any, prefix: str = 'CodeQueryC
         raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
     required = {
         'completeness',
+        'directory',
         'end_byte',
         'fact_id',
         'fact_provenance',
@@ -8555,6 +8680,7 @@ def _decode_code_query_configuration_fact2(value: Any, prefix: str = 'CodeQueryC
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
+    directory_value = _decode_string(value['directory'], f"{prefix}.directory")
     end_byte_value = _decode_defs_code_query_configuration_fact_properties_end_byte(value['end_byte'], f"{prefix}.end_byte")
     fact_id_value = _decode_string(value['fact_id'], f"{prefix}.fact_id")
     fact_provenance_value = _decode_string(value['fact_provenance'], f"{prefix}.fact_provenance")
@@ -8600,6 +8726,7 @@ def _decode_code_query_configuration_fact2(value: Any, prefix: str = 'CodeQueryC
         value_id_value = None
     return CodeQueryConfigurationFact2(
         completeness=completeness_value,
+        directory=directory_value,
         end_byte=end_byte_value,
         fact_id=fact_id_value,
         fact_provenance=fact_provenance_value,
@@ -9929,6 +10056,7 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
         'boundary_kind',
+        'boundary_reason',
         'completeness',
         'coverage',
         'dispatch',
@@ -9936,8 +10064,11 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         'ordinal',
         'path',
         'proof',
+        'range',
+        'root_id',
         'site_ast_id',
         'site_id',
+        'target_count',
         'target_declaration',
         'target_fq_name',
         'target_id',
@@ -9957,6 +10088,8 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         'ordinal',
         'path',
         'proof',
+        'range',
+        'root_id',
         'site_id',
         'target_id',
         'target_path',
@@ -9968,6 +10101,10 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         boundary_kind_value = _decode_defs_code_query_result_item_union_52_properties_boundary_kind(value['boundary_kind'], f"{prefix}.boundary_kind")
     else:
         boundary_kind_value = None
+    if 'boundary_reason' in value:
+        boundary_reason_value = _decode_defs_code_query_result_item_union_52_properties_boundary_reason(value['boundary_reason'], f"{prefix}.boundary_reason")
+    else:
+        boundary_reason_value = None
     completeness_value = _decode_string(value['completeness'], f"{prefix}.completeness")
     coverage_value = _decode_string(value['coverage'], f"{prefix}.coverage")
     dispatch_value = _decode_string(value['dispatch'], f"{prefix}.dispatch")
@@ -9975,11 +10112,17 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
     ordinal_value = _decode_defs_code_query_result_item_union_52_properties_ordinal(value['ordinal'], f"{prefix}.ordinal")
     path_value = _decode_string(value['path'], f"{prefix}.path")
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
+    range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    root_id_value = _decode_string(value['root_id'], f"{prefix}.root_id")
     if 'site_ast_id' in value:
         site_ast_id_value = _decode_defs_code_query_result_item_union_52_properties_site_ast_id(value['site_ast_id'], f"{prefix}.site_ast_id")
     else:
         site_ast_id_value = None
     site_id_value = _decode_string(value['site_id'], f"{prefix}.site_id")
+    if 'target_count' in value:
+        target_count_value = _decode_defs_code_query_result_item_union_52_properties_target_count(value['target_count'], f"{prefix}.target_count")
+    else:
+        target_count_value = None
     if 'target_declaration' in value:
         target_declaration_value = _decode_defs_code_query_result_item_union_52_properties_target_declaration(value['target_declaration'], f"{prefix}.target_declaration")
     else:
@@ -10000,6 +10143,7 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         provenance_truncated_value = _decode_boolean(False, f"{prefix}.provenance_truncated")
     return CodeQueryDispatchTarget(
         boundary_kind=boundary_kind_value,
+        boundary_reason=boundary_reason_value,
         completeness=completeness_value,
         coverage=coverage_value,
         dispatch=dispatch_value,
@@ -10007,8 +10151,11 @@ def _decode_code_query_dispatch_target(value: Any, prefix: str = 'CodeQueryDispa
         ordinal=ordinal_value,
         path=path_value,
         proof=proof_value,
+        range=range_value,
+        root_id=root_id_value,
         site_ast_id=site_ast_id_value,
         site_id=site_id_value,
+        target_count=target_count_value,
         target_declaration=target_declaration_value,
         target_fq_name=target_fq_name_value,
         target_id=target_id_value,
@@ -11548,6 +11695,7 @@ def _decode_code_query_flow_witness_step(value: Any, prefix: str = 'CodeQueryFlo
         'output',
         'source',
         'source_symbol',
+        'summary_fingerprint',
         'target',
         'target_symbol',
     }
@@ -11590,6 +11738,10 @@ def _decode_code_query_flow_witness_step(value: Any, prefix: str = 'CodeQueryFlo
         source_symbol_value = _decode_defs_code_query_flow_witness_step_properties_source_symbol(value['source_symbol'], f"{prefix}.source_symbol")
     else:
         source_symbol_value = None
+    if 'summary_fingerprint' in value:
+        summary_fingerprint_value = _decode_defs_code_query_flow_witness_step_properties_summary_fingerprint(value['summary_fingerprint'], f"{prefix}.summary_fingerprint")
+    else:
+        summary_fingerprint_value = None
     if 'target' in value:
         target_value = _decode_defs_code_query_flow_witness_step_properties_target(value['target'], f"{prefix}.target")
     else:
@@ -11608,6 +11760,7 @@ def _decode_code_query_flow_witness_step(value: Any, prefix: str = 'CodeQueryFlo
         output=output_value,
         source=source_value,
         source_symbol=source_symbol_value,
+        summary_fingerprint=summary_fingerprint_value,
         target=target_value,
         target_symbol=target_symbol_value,
     )
@@ -12876,6 +13029,7 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         'id',
         'kind',
         'language',
+        'member_form',
         'name',
         'node_range',
         'path',
@@ -12890,6 +13044,7 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         'semantic_model',
         'signature',
         'start_line',
+        'trivial_property',
     }
     actual = set(value)
     unexpected = actual - expected
@@ -12899,7 +13054,9 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         'fq_name',
         'id',
         'kind',
+        'member_form',
         'name',
+        'trivial_property',
     }
     missing = required - actual
     if missing:
@@ -12919,6 +13076,7 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         language_value = _decode_defs_code_query_member_target_properties_language(value['language'], f"{prefix}.language")
     else:
         language_value = None
+    member_form_value = _decode_defs_code_query_member_target_properties_member_form(value['member_form'], f"{prefix}.member_form")
     name_value = _decode_string(value['name'], f"{prefix}.name")
     if 'node_range' in value:
         node_range_value = _decode_defs_code_query_member_target_properties_node_range(value['node_range'], f"{prefix}.node_range")
@@ -12972,6 +13130,7 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         start_line_value = _decode_defs_code_query_member_target_properties_start_line(value['start_line'], f"{prefix}.start_line")
     else:
         start_line_value = None
+    trivial_property_value = _decode_defs_code_query_member_target_properties_trivial_property(value['trivial_property'], f"{prefix}.trivial_property")
     return CodeQueryMemberTarget(
         declaration=declaration_value,
         end_line=end_line_value,
@@ -12979,6 +13138,7 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         id=id_value,
         kind=kind_value,
         language=language_value,
+        member_form=member_form_value,
         name=name_value,
         node_range=node_range_value,
         path=path_value,
@@ -12993,6 +13153,7 @@ def _decode_code_query_member_target(value: Any, prefix: str = 'CodeQueryMemberT
         semantic_model=semantic_model_value,
         signature=signature_value,
         start_line=start_line_value,
+        trivial_property=trivial_property_value,
     )
 
 def _decode_code_query_member_target_analysis(value: Any, prefix: str = 'CodeQueryMemberTargetAnalysis') -> CodeQueryMemberTargetAnalysis:
@@ -15745,7 +15906,7 @@ def _decode_code_query_reference_edge(value: Any, prefix: str = 'CodeQueryRefere
         'path',
         'proof',
         'range',
-        'reference_kind',
+        'reference_facets',
         'site_class',
         'start_byte',
         'target',
@@ -15767,6 +15928,7 @@ def _decode_code_query_reference_edge(value: Any, prefix: str = 'CodeQueryRefere
         'path',
         'proof',
         'range',
+        'reference_facets',
         'site_class',
         'start_byte',
         'target',
@@ -15792,10 +15954,7 @@ def _decode_code_query_reference_edge(value: Any, prefix: str = 'CodeQueryRefere
     path_value = _decode_string(value['path'], f"{prefix}.path")
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    if 'reference_kind' in value:
-        reference_kind_value = _decode_defs_code_query_result_item_union_64_properties_reference_kind(value['reference_kind'], f"{prefix}.reference_kind")
-    else:
-        reference_kind_value = None
+    reference_facets_value = _decode_code_query_reference_facets(value['reference_facets'], f"{prefix}.reference_facets")
     site_class_value = _decode_string(value['site_class'], f"{prefix}.site_class")
     start_byte_value = _decode_defs_code_query_result_item_union_64_properties_start_byte(value['start_byte'], f"{prefix}.start_byte")
     target_value = _decode_code_query_declaration2(value['target'], f"{prefix}.target")
@@ -15820,13 +15979,38 @@ def _decode_code_query_reference_edge(value: Any, prefix: str = 'CodeQueryRefere
         path=path_value,
         proof=proof_value,
         range=range_value,
-        reference_kind=reference_kind_value,
+        reference_facets=reference_facets_value,
         site_class=site_class_value,
         start_byte=start_byte_value,
         target=target_value,
         usage_kind=usage_kind_value,
         provenance=provenance_value,
         provenance_truncated=provenance_truncated_value,
+    )
+
+def _decode_code_query_reference_facets(value: Any, prefix: str = 'CodeQueryReferenceFacets') -> CodeQueryReferenceFacets:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'known',
+        'undecided',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'known',
+        'undecided',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    known_value = _decode_defs_code_query_reference_facets_properties_known(value['known'], f"{prefix}.known")
+    undecided_value = _decode_defs_code_query_reference_facets_properties_undecided(value['undecided'], f"{prefix}.undecided")
+    return CodeQueryReferenceFacets(
+        known=known_value,
+        undecided=undecided_value,
     )
 
 def _decode_code_query_reference_site(value: Any, prefix: str = 'CodeQueryReferenceSite') -> CodeQueryReferenceSite:
@@ -15838,7 +16022,7 @@ def _decode_code_query_reference_site(value: Any, prefix: str = 'CodeQueryRefere
         'path',
         'proof',
         'range',
-        'reference_kind',
+        'reference_facets',
         'target',
         'usage_kind',
         'provenance',
@@ -15853,6 +16037,7 @@ def _decode_code_query_reference_site(value: Any, prefix: str = 'CodeQueryRefere
         'path',
         'proof',
         'range',
+        'reference_facets',
         'target',
         'usage_kind',
     }
@@ -15867,10 +16052,7 @@ def _decode_code_query_reference_site(value: Any, prefix: str = 'CodeQueryRefere
     path_value = _decode_string(value['path'], f"{prefix}.path")
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    if 'reference_kind' in value:
-        reference_kind_value = _decode_defs_code_query_result_item_union_16_properties_reference_kind(value['reference_kind'], f"{prefix}.reference_kind")
-    else:
-        reference_kind_value = None
+    reference_facets_value = _decode_code_query_reference_facets(value['reference_facets'], f"{prefix}.reference_facets")
     target_value = _decode_code_query_declaration2(value['target'], f"{prefix}.target")
     usage_kind_value = _decode_string(value['usage_kind'], f"{prefix}.usage_kind")
     if 'provenance' in value:
@@ -15887,7 +16069,7 @@ def _decode_code_query_reference_site(value: Any, prefix: str = 'CodeQueryRefere
         path=path_value,
         proof=proof_value,
         range=range_value,
-        reference_kind=reference_kind_value,
+        reference_facets=reference_facets_value,
         target=target_value,
         usage_kind=usage_kind_value,
         provenance=provenance_value,
@@ -16052,6 +16234,7 @@ def _decode_code_query_result(value: Any, prefix: str = 'CodeQueryResult') -> Co
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
     expected = {
+        'depth_bound_status',
         'diagnostics',
         'results',
         'session_subset',
@@ -16068,6 +16251,10 @@ def _decode_code_query_result(value: Any, prefix: str = 'CodeQueryResult') -> Co
     missing = required - actual
     if missing:
         raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    if 'depth_bound_status' in value:
+        depth_bound_status_value = _decode_properties_depth_bound_status(value['depth_bound_status'], f"{prefix}.depth_bound_status")
+    else:
+        depth_bound_status_value = None
     if 'diagnostics' in value:
         diagnostics_value = _decode_properties_diagnostics(value['diagnostics'], f"{prefix}.diagnostics")
     else:
@@ -16079,6 +16266,7 @@ def _decode_code_query_result(value: Any, prefix: str = 'CodeQueryResult') -> Co
         session_subset_value = None
     truncated_value = _decode_boolean(value['truncated'], f"{prefix}.truncated")
     return CodeQueryResult(
+        depth_bound_status=depth_bound_status_value,
         diagnostics=diagnostics_value,
         results=results_value,
         session_subset=session_subset_value,
@@ -16554,7 +16742,7 @@ def _decode_code_query_result_ref_variant13(value: Any, prefix: str = 'CodeQuery
         'path',
         'proof',
         'range',
-        'reference_kind',
+        'reference_facets',
         'target_fq_name',
         'target_id',
         'usage_kind',
@@ -16567,6 +16755,7 @@ def _decode_code_query_result_ref_variant13(value: Any, prefix: str = 'CodeQuery
         'path',
         'proof',
         'range',
+        'reference_facets',
         'target_fq_name',
     }
     missing = required - actual
@@ -16575,10 +16764,7 @@ def _decode_code_query_result_ref_variant13(value: Any, prefix: str = 'CodeQuery
     path_value = _decode_string(value['path'], f"{prefix}.path")
     proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
-    if 'reference_kind' in value:
-        reference_kind_value = _decode_defs_code_query_result_ref_union_12_properties_reference_kind(value['reference_kind'], f"{prefix}.reference_kind")
-    else:
-        reference_kind_value = None
+    reference_facets_value = _decode_code_query_reference_facets(value['reference_facets'], f"{prefix}.reference_facets")
     target_fq_name_value = _decode_string(value['target_fq_name'], f"{prefix}.target_fq_name")
     if 'target_id' in value:
         target_id_value = _decode_defs_code_query_result_ref_union_12_properties_target_id(value['target_id'], f"{prefix}.target_id")
@@ -16592,7 +16778,7 @@ def _decode_code_query_result_ref_variant13(value: Any, prefix: str = 'CodeQuery
         path=path_value,
         proof=proof_value,
         range=range_value,
-        reference_kind=reference_kind_value,
+        reference_facets=reference_facets_value,
         target_fq_name=target_fq_name_value,
         target_id=target_id_value,
         usage_kind=usage_kind_value,
@@ -18846,8 +19032,10 @@ def _decode_code_query_result_ref_variant60(value: Any, prefix: str = 'CodeQuery
         'ast_id',
         'id',
         'path',
+        'proof',
         'provenance',
         'range',
+        'reference_facets',
         'target_fq_name',
     }
     actual = set(value)
@@ -18857,8 +19045,10 @@ def _decode_code_query_result_ref_variant60(value: Any, prefix: str = 'CodeQuery
     required = {
         'id',
         'path',
+        'proof',
         'provenance',
         'range',
+        'reference_facets',
         'target_fq_name',
     }
     missing = required - actual
@@ -18870,15 +19060,19 @@ def _decode_code_query_result_ref_variant60(value: Any, prefix: str = 'CodeQuery
         ast_id_value = None
     id_value = _decode_string(value['id'], f"{prefix}.id")
     path_value = _decode_string(value['path'], f"{prefix}.path")
+    proof_value = _decode_string(value['proof'], f"{prefix}.proof")
     provenance_value = _decode_string(value['provenance'], f"{prefix}.provenance")
     range_value = _decode_code_query_range(value['range'], f"{prefix}.range")
+    reference_facets_value = _decode_code_query_reference_facets(value['reference_facets'], f"{prefix}.reference_facets")
     target_fq_name_value = _decode_string(value['target_fq_name'], f"{prefix}.target_fq_name")
     return CodeQueryResultRefVariant60(
         ast_id=ast_id_value,
         id=id_value,
         path=path_value,
+        proof=proof_value,
         provenance=provenance_value,
         range=range_value,
+        reference_facets=reference_facets_value,
         target_fq_name=target_fq_name_value,
     )
 
@@ -20950,6 +21144,7 @@ def _decode_code_query_statement_reachability(value: Any, prefix: str = 'CodeQue
         'procedure_id',
         'range',
         'reason',
+        'region_first',
         'statement_kind',
         'verdict',
         'provenance',
@@ -20980,6 +21175,10 @@ def _decode_code_query_statement_reachability(value: Any, prefix: str = 'CodeQue
         reason_value = _decode_defs_code_query_result_item_union_73_properties_reason(value['reason'], f"{prefix}.reason")
     else:
         reason_value = None
+    if 'region_first' in value:
+        region_first_value = _decode_defs_code_query_result_item_union_73_properties_region_first(value['region_first'], f"{prefix}.region_first")
+    else:
+        region_first_value = None
     statement_kind_value = _decode_string(value['statement_kind'], f"{prefix}.statement_kind")
     verdict_value = _decode_string(value['verdict'], f"{prefix}.verdict")
     if 'provenance' in value:
@@ -20997,6 +21196,7 @@ def _decode_code_query_statement_reachability(value: Any, prefix: str = 'CodeQue
         procedure_id=procedure_id_value,
         range=range_value,
         reason=reason_value,
+        region_first=region_first_value,
         statement_kind=statement_kind_value,
         verdict=verdict_value,
         provenance=provenance_value,
@@ -22737,8 +22937,8 @@ def _decode_defs_code_query_declaration_properties_start_line(value: Any, prefix
     return value
 
 def _decode_defs_code_query_diagnostic_code(value: Any, prefix: str = 'CodeQueryDiagnosticCode') -> CodeQueryDiagnosticCode:
-    values_repr = "['invalid_plan', 'cancelled', 'unsupported_structural_feature', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query']"
-    if value not in ('invalid_plan', 'cancelled', 'unsupported_structural_feature', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query'):
+    values_repr = "['policy_declared_proven_subset', 'invalid_plan', 'cancelled', 'unsupported_structural_feature', 'qualifying_type_unresolved', 'structural_role_coverage_incomplete', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'semantic_pack_activation_failed', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'rendered_captures_truncated', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'reference_kind_undecided', 'enclosing_pattern_undecided', 'identical_captures_open', 'row_predicate_undecided', 'member_form_undecided', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query']"
+    if value not in ('policy_declared_proven_subset', 'invalid_plan', 'cancelled', 'unsupported_structural_feature', 'qualifying_type_unresolved', 'structural_role_coverage_incomplete', 'missing_structural_adapter', 'recovered_syntax_incomplete', 'unsupported_import_analysis', 'dynamic_import_target', 'hierarchy_incomplete', 'semantic_results_omitted', 'semantic_workspace_required', 'no_enclosing_procedure', 'semantic_capability_unsupported', 'semantic_analysis_partial', 'call_binding_dispatch_partial', 'call_binding_selector_rejected', 'semantic_budget_exhausted', 'semantic_provider_failed', 'semantic_pack_acquisition_pending', 'semantic_pack_activation_failed', 'workspace_semantic_models_not_loaded', 'unresolved_protocol_reference', 'typestate_registration_stale', 'typestate_handle_stale', 'typestate_root_mismatch', 'typestate_capability_unsupported', 'typestate_analysis_partial', 'typestate_provider_failed', 'typestate_solver_budget_exhausted', 'typestate_finding_budget_exhausted', 'typestate_witness_truncated', 'unresolved_value_flow_plan_reference', 'value_flow_registration_stale', 'value_flow_handle_stale', 'value_flow_root_mismatch', 'value_flow_capability_unsupported', 'value_flow_analysis_partial', 'value_flow_provider_failed', 'value_flow_solver_budget_exhausted', 'value_flow_witness_truncated', 'type_flow_witness_truncated', 'type_flow_witness_unavailable', 'unresolved_taint_result_reference', 'taint_registration_stale', 'taint_handle_stale', 'taint_root_mismatch', 'taint_plan_report_mismatch', 'taint_projection_failed', 'taint_finding_truncated', 'receiver_analysis_partial', 'receiver_analysis_failed', 'call_relation_budget_exhausted', 'call_relation_parse_failed', 'call_relation_candidates_omitted', 'call_relation_targets_ambiguous', 'call_relation_candidate_limit', 'call_relation_analysis_failed', 'rendered_captures_truncated', 'reference_source_bytes_truncated', 'reference_candidate_files_truncated', 'reference_candidates_omitted', 'reference_targets_ambiguous', 'reference_callsite_limit', 'reference_analysis_failed', 'reference_kind_undecided', 'enclosing_pattern_undecided', 'identical_captures_open', 'row_predicate_undecided', 'member_form_undecided', 'uses_parser_unsupported', 'uses_candidate_limit', 'uses_targets_ambiguous', 'uses_candidates_omitted', 'execution_budget_exhausted', 'pipeline_budget_exhausted', 'import_graph_budget_exhausted', 'occurrence_role_unsupported', 'occurrence_resolution_incomplete', 'occurrence_row_budget_exhausted', 'environment_axis_unsupported', 'materialization_axis_unsupported', 'materialization_derivation_incomplete', 'materialization_row_budget_exhausted', 'environment_derivation_incomplete', 'environment_row_budget_exhausted', 'resolution_trace_incomplete', 'python_hierarchy_derivation_incomplete', 'edge_axis_unsupported', 'edge_derivation_incomplete', 'flow_state_axis_unsupported', 'flow_state_derivation_incomplete', 'rewrite_domain_unsupported', 'rewrite_path_derivation_incomplete', 'control_relation_derivation_incomplete', 'branch_relation_derivation_incomplete', 'loop_relation_derivation_incomplete', 'failure_handler_derivation_incomplete', 'statement_reachability_derivation_incomplete', 'pending_cleanup_flow_derivation_incomplete', 'control_relation_exit_partition_partial', 'topology_derivation_incomplete', 'topology_ownership_ambiguous', 'identity_axis_unsupported', 'path_derivation_incomplete', 'effect_derivation_incomplete', 'result_contract_derivation_incomplete', 'result_obligation_derivation_incomplete', 'effect_budget_exhausted', 'call_shape_coverage_incomplete', 'jsx_projection_incomplete', 'cross_domain_binding_unproven', 'cross_domain_key_unsupported', 'cross_domain_document_incomplete', 'cross_domain_correlation_ambiguous', 'result_limit_reached', 'broad_query'):
         raise DecoderError(f"{prefix}: expected one of {values_repr}")
     return CodeQueryDiagnosticCode(value)
 
@@ -23326,6 +23526,16 @@ def _decode_defs_code_query_flow_witness_step_properties_source_symbol(value: An
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_flow_witness_step_properties_summary_fingerprint(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_flow_witness_step_properties_target(value: Any, prefix: str = "union") -> CodeQuerySourceSite | None:
     errors = []
     try:
@@ -23496,6 +23706,16 @@ def _decode_defs_code_query_member_target_properties_language(value: Any, prefix
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_member_target_properties_member_form(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_member_target_properties_node_range(value: Any, prefix: str = "union") -> CodeQueryRange | None:
     errors = []
     try:
@@ -23641,6 +23861,16 @@ def _decode_defs_code_query_member_target_properties_start_line_union_0(value: A
     if value < 0:
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
+
+def _decode_defs_code_query_member_target_properties_trivial_property(value: Any, prefix: str = "union") -> bool | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_boolean(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 class CodeQueryOccurrenceTarget(metaclass=_TaggedUnionMeta):
     @classmethod
@@ -24105,6 +24335,22 @@ def _decode_defs_code_query_receiver_value_union_5_properties_receiver_value_kin
     if value != 'factory_return':
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
+
+def _decode_defs_code_query_reference_facets_properties_known(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+def _decode_defs_code_query_reference_facets_properties_undecided(value: Any, prefix: str = "array") -> list[str]:
+    if not isinstance(value, list):
+        raise TypeDecoderError(f"{prefix}: expected array")
+    return [
+        _decode_string(item, f"{prefix}[{index}]")
+        for index, item in enumerate(value)
+    ]
 
 class CodeQueryResultItem(metaclass=_TaggedUnionMeta):
     @classmethod
@@ -24648,16 +24894,6 @@ def _decode_defs_code_query_result_item_union_16_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
-def _decode_defs_code_query_result_item_union_16_properties_reference_kind(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
 def _decode_defs_code_query_result_item_union_16_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'reference_site'"
     if value != 'reference_site':
@@ -24681,6 +24917,28 @@ def _decode_defs_code_query_result_item_union_17_properties_arguments(value: Any
         _decode_code_query_call_argument(item, f"{prefix}[{index}]")
         for index, item in enumerate(value)
     ]
+
+def _decode_defs_code_query_result_item_union_17_properties_boundary_kind(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_17_properties_callee(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
+    errors = []
+    try:
+        return _decode_code_query_declaration2(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_result_item_union_17_properties_caller_parameter_identity(value: Any, prefix: str = "union") -> str | None:
     if value is None:
@@ -24729,6 +24987,36 @@ def _decode_defs_code_query_result_item_union_17_properties_result_type(value: A
     return value
 
 def _decode_defs_code_query_result_item_union_17_properties_site_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_17_properties_target_fq_name(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_17_properties_target_id(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_17_properties_target_reason(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -27314,6 +27602,18 @@ def _decode_defs_code_query_result_item_union_40_properties_provenance(value: An
         for index, item in enumerate(value)
     ]
 
+def _decode_defs_code_query_result_item_union_40_properties_read_event(value: Any, prefix: str = "union") -> CodeQueryStateEventRef | None:
+    errors = []
+    try:
+        return _decode_code_query_state_event_ref(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_40_properties_reason(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
@@ -28384,6 +28684,16 @@ def _decode_defs_code_query_result_item_union_52_properties_boundary_kind(value:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
+def _decode_defs_code_query_result_item_union_52_properties_boundary_reason(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_52_properties_ordinal(value: Any, prefix: str = 'int') -> int:
     value = _decode_integer(value, prefix)
     if value < 0:
@@ -28413,6 +28723,22 @@ def _decode_defs_code_query_result_item_union_52_properties_site_ast_id(value: A
     except DecoderError as error:
         errors.append(str(error))
     raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_52_properties_target_count(value: Any, prefix: str = "union") -> int | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_defs_code_query_result_item_union_52_properties_target_count_union_0(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_52_properties_target_count_union_0(value: Any, prefix: str = 'int') -> int:
+    value = _decode_integer(value, prefix)
+    if value < 0:
+        raise DecoderError(f"{prefix}: value is below the minimum")
+    return value
 
 def _decode_defs_code_query_result_item_union_52_properties_target_declaration(value: Any, prefix: str = "union") -> CodeQueryDeclaration2 | None:
     errors = []
@@ -29192,6 +29518,16 @@ def _decode_defs_code_query_result_item_union_58_properties_end_byte(value: Any,
         raise DecoderError(f"{prefix}: value is below the minimum")
     return value
 
+def _decode_defs_code_query_result_item_union_58_properties_immediate_parent_kind(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
 def _decode_defs_code_query_result_item_union_58_properties_import(value: Any, prefix: str = "union") -> CodeQueryImportBinder | None:
     errors = []
     try:
@@ -29667,16 +30003,6 @@ def _decode_defs_code_query_result_item_union_64_properties_provenance(value: An
         _decode_code_query_provenance(item, f"{prefix}[{index}]")
         for index, item in enumerate(value)
     ]
-
-def _decode_defs_code_query_result_item_union_64_properties_reference_kind(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_defs_code_query_result_item_union_64_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'reference_edge'"
@@ -30409,6 +30735,16 @@ def _decode_defs_code_query_result_item_union_73_properties_provenance(value: An
     ]
 
 def _decode_defs_code_query_result_item_union_73_properties_reason(value: Any, prefix: str = "union") -> str | None:
+    if value is None:
+        return None
+    errors = []
+    try:
+        return _decode_string(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
+
+def _decode_defs_code_query_result_item_union_73_properties_region_first(value: Any, prefix: str = "union") -> str | None:
     if value is None:
         return None
     errors = []
@@ -32494,16 +32830,6 @@ def _decode_defs_code_query_result_ref_union_11_properties_result_type(value: An
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
-def _decode_defs_code_query_result_ref_union_12_properties_reference_kind(value: Any, prefix: str = "union") -> str | None:
-    if value is None:
-        return None
-    errors = []
-    try:
-        return _decode_string(value, prefix)
-    except DecoderError as error:
-        errors.append(str(error))
-    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
-
 def _decode_defs_code_query_result_ref_union_12_properties_result_type(value: Any, prefix: str = "const") -> str:
     expected_repr = "'reference_site'"
     if value != 'reference_site':
@@ -34012,6 +34338,12 @@ def _decode_defs_conversion_unknown_union_1(value: Any, prefix: str = "const") -
         raise DecoderError(f"{prefix}: expected {expected_repr}")
     return value
 
+def _decode_defs_depth_bound_status(value: Any, prefix: str = 'DepthBoundStatus') -> DepthBoundStatus:
+    values_repr = "['reached', 'not_reached', 'unknown']"
+    if value not in ('reached', 'not_reached', 'unknown'):
+        raise DecoderError(f"{prefix}: expected one of {values_repr}")
+    return DepthBoundStatus(value)
+
 class JavaAnnotationArtifact(metaclass=_TaggedUnionMeta):
     @classmethod
     def from_dict(cls, data: Any) -> JavaAnnotationArtifact:
@@ -34559,6 +34891,35 @@ def _decode_java_annotation_artifact_variant3(value: Any, prefix: str = 'JavaAnn
         pack_id=pack_id_value,
     )
 
+def _decode_model_provider(value: Any, prefix: str = 'ModelProvider') -> ModelProvider:
+    if not isinstance(value, dict):
+        raise TypeDecoderError(f"{prefix}: expected object")
+    expected = {
+        'pack_digest',
+        'pack_id',
+        'pack_version',
+    }
+    actual = set(value)
+    unexpected = actual - expected
+    if unexpected:
+        raise DecoderError(f"{prefix}: unexpected object keys: {sorted(unexpected)!r}")
+    required = {
+        'pack_digest',
+        'pack_id',
+        'pack_version',
+    }
+    missing = required - actual
+    if missing:
+        raise MissingKeyError(f"{prefix}: missing required keys: {sorted(missing)!r}")
+    pack_digest_value = _decode_string(value['pack_digest'], f"{prefix}.pack_digest")
+    pack_id_value = _decode_string(value['pack_id'], f"{prefix}.pack_id")
+    pack_version_value = _decode_string(value['pack_version'], f"{prefix}.pack_version")
+    return ModelProvider(
+        pack_digest=pack_digest_value,
+        pack_id=pack_id_value,
+        pack_version=pack_version_value,
+    )
+
 def _decode_parameter(value: Any, prefix: str = 'Parameter') -> Parameter:
     if not isinstance(value, dict):
         raise TypeDecoderError(f"{prefix}: expected object")
@@ -34609,6 +34970,18 @@ def _decode_parameter(value: Any, prefix: str = 'Parameter') -> Parameter:
         type=type_value,
         variadic=variadic_value,
     )
+
+def _decode_properties_depth_bound_status(value: Any, prefix: str = "union") -> DepthBoundStatus | None:
+    errors = []
+    try:
+        return _decode_defs_depth_bound_status(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    try:
+        return _decode_null(value, prefix)
+    except DecoderError as error:
+        errors.append(str(error))
+    raise DecoderError(f"{prefix}: did not match any union variant: {'; '.join(errors)}")
 
 def _decode_properties_diagnostics(value: Any, prefix: str = "array") -> list[CodeQueryDiagnostic]:
     if not isinstance(value, list):

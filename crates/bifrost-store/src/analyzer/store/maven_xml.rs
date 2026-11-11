@@ -143,6 +143,9 @@ pub struct XmlNode {
     pub name: String,
     pub text: String,
     pub children: Vec<XmlNode>,
+    /// Source bytes of the whole element, from its start tag through its end
+    /// tag, so a reader can cite exactly what it interpreted.
+    pub range: std::ops::Range<usize>,
 }
 
 impl XmlNode {
@@ -171,7 +174,10 @@ pub fn parse_xml(source: &str) -> Option<XmlNode> {
     let mut buffer = Vec::new();
     let mut nodes = 0usize;
     loop {
-        match reader.read_event_into(&mut buffer).ok()? {
+        let start_byte = usize::try_from(reader.buffer_position()).ok()?;
+        let event = reader.read_event_into(&mut buffer).ok()?;
+        let end_byte = usize::try_from(reader.buffer_position()).ok()?;
+        match event {
             Event::Start(start) => {
                 nodes = nodes.checked_add(1)?;
                 if nodes > MAX_MAVEN_XML_NODES || stack.len() >= MAX_MAVEN_XML_DEPTH {
@@ -179,6 +185,7 @@ pub fn parse_xml(source: &str) -> Option<XmlNode> {
                 }
                 stack.push(XmlNode {
                     name: local_xml_name(start.name().as_ref())?,
+                    range: start_byte..end_byte,
                     ..XmlNode::default()
                 });
             }
@@ -189,6 +196,7 @@ pub fn parse_xml(source: &str) -> Option<XmlNode> {
                 }
                 let node = XmlNode {
                     name: local_xml_name(empty.name().as_ref())?,
+                    range: start_byte..end_byte,
                     ..XmlNode::default()
                 };
                 if let Some(parent) = stack.last_mut() {
@@ -218,7 +226,8 @@ pub fn parse_xml(source: &str) -> Option<XmlNode> {
                 }
             }
             Event::End(_) => {
-                let node = stack.pop()?;
+                let mut node = stack.pop()?;
+                node.range.end = end_byte;
                 if let Some(parent) = stack.last_mut() {
                     parent.children.push(node);
                 } else if root.replace(node).is_some() {

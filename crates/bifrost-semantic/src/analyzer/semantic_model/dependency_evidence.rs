@@ -191,6 +191,8 @@ pub enum VersionComparator {
     Greater,
     GreaterOrEqual,
     Equal,
+    /// Composer's `!=`; `parse_version_comparators` does not produce it.
+    NotEqual,
 }
 
 impl VersionComparator {
@@ -202,6 +204,7 @@ impl VersionComparator {
             Self::Greater => ordering == Ordering::Greater,
             Self::GreaterOrEqual => ordering != Ordering::Less,
             Self::Equal => ordering == Ordering::Equal,
+            Self::NotEqual => ordering != Ordering::Equal,
         }
     }
 }
@@ -238,6 +241,59 @@ pub fn parse_version_comparators<V>(
         };
         bounds.push((comparator, parse_version(version)?));
         index += 1;
+    }
+    Ok(bounds)
+}
+
+/// Parse one interval in the bracket notation NuGet and Maven share:
+/// `[1.0,2.0)`, `(,1.0]`, `[1.0,)` and the exact `[1.2.3]`. `(1.0)` is empty
+/// and a lower bound above the upper one is an error. `parse_version` supplies
+/// the ecosystem's own version grammar.
+pub fn parse_version_interval<V: Ord>(
+    text: &str,
+    parse_version: impl Fn(&str) -> Result<V, String>,
+) -> Result<Vec<(VersionComparator, V)>, String> {
+    let invalid = || format!("{text:?} is not interval notation");
+    let inclusive_lower = text.starts_with('[');
+    let inclusive_upper = text.ends_with(']');
+    if !text.starts_with(['[', '(']) || !text.ends_with([']', ')']) || text.len() < 2 {
+        return Err(invalid());
+    }
+    let inner = &text[1..text.len() - 1];
+    let Some((lower, upper)) = inner.split_once(',') else {
+        if !(inclusive_lower && inclusive_upper) {
+            return Err(invalid());
+        }
+        return Ok(vec![(
+            VersionComparator::Equal,
+            parse_version(inner.trim())?,
+        )]);
+    };
+    let (lower, upper) = (lower.trim(), upper.trim());
+    if (lower.is_empty() && upper.is_empty()) || upper.contains(',') {
+        return Err(invalid());
+    }
+    let mut bounds = Vec::new();
+    if !lower.is_empty() {
+        let comparator = if inclusive_lower {
+            VersionComparator::GreaterOrEqual
+        } else {
+            VersionComparator::Greater
+        };
+        bounds.push((comparator, parse_version(lower)?));
+    }
+    if !upper.is_empty() {
+        let comparator = if inclusive_upper {
+            VersionComparator::LessOrEqual
+        } else {
+            VersionComparator::Less
+        };
+        bounds.push((comparator, parse_version(upper)?));
+    }
+    if let [(_, lower), (_, upper)] = bounds.as_slice()
+        && lower > upper
+    {
+        return Err(format!("{text:?} has a lower bound above its upper bound"));
     }
     Ok(bounds)
 }

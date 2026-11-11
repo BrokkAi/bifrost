@@ -373,7 +373,14 @@ impl S{index:04} {{ pub fn shared_route(&self) -> usize {{ {index} }} }}
         let tree = parser
             .parse(source, None)
             .expect("parse the oracle fixture");
-        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
         let unit_keys = parsed_unit_keys(&parsed);
         let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
             BindingFragmentId::for_test(path.as_bytes()),
@@ -700,7 +707,14 @@ fn rust_first_tranche_survives_common_lowering_and_bundle_preparation() {
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .expect("configure Rust parser");
     let tree = parser.parse(source, None).expect("parse Rust fixture");
-    let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+    let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+        &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+        ),
+        &file,
+        source,
+        &tree,
+    );
     let unit_keys = parsed_unit_keys(&parsed);
     let facts = parsed.resolution_facts;
 
@@ -852,7 +866,14 @@ fn unresolved_expression_macro_does_not_duplicate_reverse_gap_candidate() {
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .expect("configure Rust parser");
     let tree = parser.parse(source, None).expect("parse Rust fixture");
-    let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+    let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+        &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+        ),
+        &file,
+        source,
+        &tree,
+    );
     let source_facts = parsed
         .source_facts
         .as_ref()
@@ -921,7 +942,14 @@ fn rust_m6a_first_tranche_facts_all_prepare() {
             *path,
         );
         let tree = parser.parse(source, None).expect("parse Rust spike file");
-        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
         let unit_keys = parsed_unit_keys(&parsed);
         let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
             BindingFragmentId::for_test(path.as_bytes()),

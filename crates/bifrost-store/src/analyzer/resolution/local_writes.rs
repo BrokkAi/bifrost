@@ -27,13 +27,8 @@ pub(super) fn attach_local_writes<'facts>(
     lexical: &LoweredResolutionFragment,
     identities: &mut ResolutionIdentityCatalogBuilder<'_>,
 ) -> Cow<'facts, FileResolutionFacts> {
-    if facts.local_writes.is_empty()
-        && !facts
-            .binding_events
-            .iter()
-            .any(|event| event.value.is_some())
-    {
-        return Cow::Borrowed(facts);
+    if facts.local_writes.is_empty() {
+        return attach_binding_values(facts, lexical.language());
     }
 
     let identifiers = facts
@@ -46,11 +41,7 @@ pub(super) fn attach_local_writes<'facts>(
         .iter()
         .map(|site| (site.id, site))
         .collect::<HashMap<_, _>>();
-    let slots = facts
-        .type_slots
-        .iter()
-        .map(|slot| (slot.id, *slot))
-        .collect::<HashMap<_, _>>();
+    let slots = slots_by_id(facts);
     let references = lexical
         .semantics()
         .iter()
@@ -150,19 +141,8 @@ pub(super) fn attach_local_writes<'facts>(
     )]);
     let engine = BatchResolutionEngine::new(&source);
     let cancellation = crate::CancellationToken::new();
-    let mut inputs = HashMap::<ResolutionSiteId, Vec<ResolutionTypeSlotId>>::default();
+    let mut inputs = binding_value_inputs(facts, &slots);
     let mut failed_sites = HashSet::default();
-    // Binding events carry exact, source-proven identity even when the ordered
-    // scope timeline cannot yet prove the runtime availability of that slot.
-    for event in &facts.binding_events {
-        if let Some(value) = event.value {
-            assert!(matches!(
-                slots[&value].role,
-                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
-            ));
-            inputs.entry(event.slot).or_default().push(value);
-        }
-    }
     for write in &facts.local_writes {
         let reference = references[&write.target].semantic();
         let answer = engine
@@ -211,6 +191,79 @@ pub(super) fn attach_local_writes<'facts>(
         }
     }
 
+    Cow::Owned(normalized_facts(
+        facts,
+        lexical.language(),
+        &slots,
+        inputs,
+        failed_sites,
+    ))
+}
+
+/// Attach valued binding events when the file has no local writes.
+///
+/// Only a local write needs its target resolved through the lexical graph; a
+/// binding event names its slot directly. So these files normalize before
+/// lexical lowering and lower once (#9628).
+pub(super) fn attach_binding_values(
+    facts: &FileResolutionFacts,
+    language: brokk_bifrost_core::analyzer::Language,
+) -> Cow<'_, FileResolutionFacts> {
+    assert!(facts.local_writes.is_empty());
+    if !facts
+        .binding_events
+        .iter()
+        .any(|event| event.value.is_some())
+    {
+        return Cow::Borrowed(facts);
+    }
+    let slots = slots_by_id(facts);
+    let inputs = binding_value_inputs(facts, &slots);
+    Cow::Owned(normalized_facts(
+        facts,
+        language,
+        &slots,
+        inputs,
+        HashSet::default(),
+    ))
+}
+
+fn slots_by_id(
+    facts: &FileResolutionFacts,
+) -> HashMap<ResolutionTypeSlotId, ResolutionTypeSlotFact> {
+    facts
+        .type_slots
+        .iter()
+        .map(|slot| (slot.id, *slot))
+        .collect()
+}
+
+/// Binding events carry exact, source-proven identity even when the ordered
+/// scope timeline cannot yet prove the runtime availability of that slot.
+fn binding_value_inputs(
+    facts: &FileResolutionFacts,
+    slots: &HashMap<ResolutionTypeSlotId, ResolutionTypeSlotFact>,
+) -> HashMap<ResolutionSiteId, Vec<ResolutionTypeSlotId>> {
+    let mut inputs = HashMap::<ResolutionSiteId, Vec<ResolutionTypeSlotId>>::default();
+    for event in &facts.binding_events {
+        if let Some(value) = event.value {
+            assert!(matches!(
+                slots[&value].role,
+                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+            ));
+            inputs.entry(event.slot).or_default().push(value);
+        }
+    }
+    inputs
+}
+
+fn normalized_facts(
+    facts: &FileResolutionFacts,
+    language: brokk_bifrost_core::analyzer::Language,
+    slots: &HashMap<ResolutionTypeSlotId, ResolutionTypeSlotFact>,
+    inputs: HashMap<ResolutionSiteId, Vec<ResolutionTypeSlotId>>,
+    failed_sites: HashSet<ResolutionSiteId>,
+) -> FileResolutionFacts {
     let mut normalized = facts.clone();
     normalized.local_writes.clear();
     let mut seen_gaps = normalized.gaps.iter().cloned().collect::<HashSet<_>>();
@@ -267,7 +320,7 @@ pub(super) fn attach_local_writes<'facts>(
             id.checked_add(1).expect("local write slot IDs fit u32")
         });
     let initializer_decides_type =
-        crate::analyzer::semantic::languages::language_knowledge(lexical.language())
+        crate::analyzer::semantic::languages::language_knowledge(language)
             .is_some_and(|knowledge| knowledge.inferred_local_type_is_initializer_type());
     let mut written = inputs.into_iter().collect::<Vec<_>>();
     written.sort_unstable_by_key(|(site, _)| *site);
@@ -383,7 +436,7 @@ pub(super) fn attach_local_writes<'facts>(
                 ));
         }
     }
-    Cow::Owned(normalized)
+    normalized
 }
 
 fn append_slot(

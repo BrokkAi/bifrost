@@ -10,8 +10,8 @@
 
 use super::callable::{CallSiteContext, CallSiteFacts};
 use super::edges::ReferenceEdgeSupport;
-use super::facts::{AssignmentShape, IntegerLiteralValue, Span};
-use super::kinds::{NormalizedKind, Role};
+use super::facts::{ArgumentMode, AssignmentShape, IntegerLiteralValue, Span};
+use super::kinds::{NormalizedKind, Role, RoleCoverage, RoleCoverageGap, RoleCoverageGaps};
 use super::materialization::{DeclarationMaterializationSupport, SourceExportFacts};
 use super::occurrences::{
     Namespace, OccurrenceRole, OccurrenceRoleSupport, default_occurrence_namespace,
@@ -233,14 +233,73 @@ impl EmbeddedSyntaxForest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingSyntax {
+    pub immediate_parent_kind: String,
+    pub whole_let_initializer: bool,
+    pub whole_match_arm_identifier: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingCandidateVerdict {
+    Binding,
+    ValueItem,
+    Open,
+}
+
 pub trait StructuralSpec: Send + Sync + 'static {
     fn language(&self) -> Language;
+
+    /// Passing modes whose absence from argument role edges this adapter can
+    /// prove. An adapter may declare a mode only when every argument container
+    /// in its grammar emits an argument edge carrying that mode; no adapter
+    /// has been audited to that standard yet, so the default declares none.
+    fn recorded_argument_modes(&self) -> &'static [ArgumentMode] {
+        &[]
+    }
 
     /// Grammar-specific node-type name → normalized kind. Compiled once per
     /// extraction into an id-indexed lookup via `Language::id_for_node_kind`;
     /// a per-language test must assert every entry resolves (id != 0) so
     /// grammar bumps that rename nodes fail loudly.
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)];
+
+    /// Exact kinds produced outside the kind table by refinement or embedded facts.
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        &[]
+    }
+
+    fn emitted_kinds(&self) -> Vec<NormalizedKind> {
+        let mut kinds = self
+            .kind_table()
+            .iter()
+            .map(|(_, kind)| *kind)
+            .collect::<Vec<_>>();
+        kinds.extend_from_slice(self.extra_emitted_kinds());
+        kinds.push(NormalizedKind::SyntaxError);
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+    }
+
+    fn emits_kind(&self, kind: NormalizedKind) -> bool {
+        kind == NormalizedKind::SyntaxError
+            || self
+                .kind_table()
+                .iter()
+                .any(|(_, candidate)| *candidate == kind)
+            || self.extra_emitted_kinds().contains(&kind)
+    }
+
+    /// Exact emitted kinds for which every modifier value is recorded or known empty.
+    fn authoritative_modifier_kinds(&self) -> &'static [NormalizedKind] {
+        &[]
+    }
+
+    /// Exact emitted kinds for which every type-kind value is recorded or known empty.
+    fn authoritative_type_kind_kinds(&self) -> &'static [NormalizedKind] {
+        &[]
+    }
 
     /// Byte ranges of `source` the parser may read, or `None` to parse the
     /// whole file.
@@ -253,8 +312,8 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
-    /// Conditional-compilation evidence for this file. It is query-time data,
-    /// not part of persisted structural rows.
+    /// Conditional-compilation evidence for this file. Consumers may persist
+    /// conservative coverage gaps derived from its uncertain regions.
     fn preprocess(
         &self,
         _source: &str,
@@ -338,6 +397,18 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
+    /// Per-file variant for adapters whose construct labels need a bounded
+    /// preparation result. The default preserves every existing adapter.
+    fn generator_construct_with_context(
+        &self,
+        node: Node<'_>,
+        kind: NormalizedKind,
+        source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<&'static str> {
+        self.generator_construct(node, kind, source)
+    }
+
     /// Per-file knowledge this adapter needs before it can classify any call
     /// site, gathered once from the file's own parse tree.
     ///
@@ -348,6 +419,18 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// list is a fact about the file's `#define`s, not about the call.
     fn call_site_context(&self, _root: Node<'_>, _source: &str) -> CallSiteContext {
         CallSiteContext::default()
+    }
+
+    /// Bounded variant used by structural extraction. Language adapters with
+    /// a whole-file preparation pass can stop before the collector is built.
+    fn call_site_context_limited(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        _max_work_items: usize,
+        _cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Result<CallSiteContext, super::collector::StructuralFactCollectorStop> {
+        Ok(self.call_site_context(root, source))
     }
 
     /// What this adapter's grammar says about the call site at `node`, whose
@@ -385,6 +468,20 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// query that asks for it.
     fn supports_role(&self, _role: Role) -> bool {
         true
+    }
+
+    /// Exact normalized owner kinds for which this adapter certifies a list role.
+    /// The default certifies nothing.
+    fn certified_role_kinds(&self, _role: Role) -> &'static [NormalizedKind] {
+        &[]
+    }
+
+    /// Roles for which this adapter emits an edge from every construct that
+    /// has the role, so that the absence of an edge is proof (see
+    /// `Role::absence_needs_certification`). Declare a role only when every
+    /// grammar form that can carry it is handled; the default declares none.
+    fn certified_roles(&self) -> &'static [Role] {
+        &[]
     }
 
     /// Whether this adapter can state the exact language-neutral value of
@@ -664,6 +761,64 @@ pub trait StructuralSpec: Send + Sync + 'static {
         None
     }
 
+    /// A syntax-classified binder that intentionally introduces no value.
+    /// Unlike an unknown activation, this is a complete exclusion.
+    fn binding_candidate_excluded(&self, _binder: Node<'_>) -> bool {
+        false
+    }
+
+    /// Resolve a syntax-only binder candidate during the file-local query.
+    /// `Open` cannot be interpreted as a complete absence of a binding.
+    fn binding_candidate_verdict(
+        &self,
+        _root: Node<'_>,
+        _source: &str,
+        _binder: Node<'_>,
+    ) -> BindingCandidateVerdict {
+        BindingCandidateVerdict::Binding
+    }
+
+    /// Request-local batch of binder verdicts, in `binders` order. Languages
+    /// with scope-wide lexical selection can index each scope once; the
+    /// default preserves every existing per-node adapter result.
+    fn binding_candidate_verdicts(
+        &self,
+        root: Node<'_>,
+        source: &str,
+        binders: &[Node<'_>],
+    ) -> Vec<BindingCandidateVerdict> {
+        binders
+            .iter()
+            .map(|binder| self.binding_candidate_verdict(root, source, *binder))
+            .collect()
+    }
+
+    /// Source-byte anchor shared by all occurrences of one logical binder.
+    /// `None` means syntax cannot prove the identity; callers must keep the
+    /// binding environment incomplete rather than infer absence of use.
+    fn logical_binding_anchor(&self, binder: Node<'_>, _source: &str) -> Option<(usize, usize)> {
+        Some((binder.start_byte(), binder.end_byte()))
+    }
+
+    /// Request-local batch of source anchors, in `binders` order. Adapters
+    /// with shared pattern identity may override this to walk each pattern
+    /// once; the default preserves existing language behavior.
+    fn logical_binding_anchors(
+        &self,
+        binders: &[Node<'_>],
+        source: &str,
+    ) -> Vec<Option<(usize, usize)>> {
+        binders
+            .iter()
+            .map(|binder| self.logical_binding_anchor(*binder, source))
+            .collect()
+    }
+
+    /// Syntax that belongs to the binder, independent of name resolution.
+    fn binding_syntax(&self, _binder: Node<'_>) -> Option<BindingSyntax> {
+        None
+    }
+
     /// What lexical binding, if any, a declaration-name token introduces.
     ///
     /// Most declaration names are not pure binders: their occurrence role
@@ -879,11 +1034,18 @@ impl CompiledKinds {
 #[derive(Debug, Clone, Copy)]
 pub struct PendingRoleTarget {
     pub role: Role,
-    pub spread: bool,
+    pub mode: ArgumentMode,
     pub keyword: Option<SourceOccurrenceId>,
-    pub target_node: usize,
+    pub target: PendingRoleTargetKind,
     pub occurrence: SourceOccurrenceId,
     pub name: Option<SourceOccurrenceId>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub enum PendingRoleTargetKind {
+    Node(usize),
+    Span,
 }
 
 /// An occurrence-role classification captured before the collector has built
@@ -901,19 +1063,30 @@ pub struct PendingOccurrenceRole {
 pub struct RoleSink<'a> {
     source: &'a str,
     parents: &'a crate::analyzer::tree_walk::ParentIndex<'a>,
+    call_site_context: Option<&'a CallSiteContext>,
     source_facts: &'a mut dyn SourceOccurrenceSink,
     name: Option<SourceOccurrenceId>,
     roles: Vec<PendingRoleTarget>,
     occurrence_roles: Vec<PendingOccurrenceRole>,
+    coverage: Vec<(Role, RoleCoverage, Option<Span>)>,
     max_roles: usize,
     cancellation: Option<&'a CancellationToken>,
     stop: Option<RoleSinkStop>,
+}
+
+/// The adapter's explicit treatment of one direct child of a covered list.
+pub enum CoveredChildDisposition<'tree> {
+    Include(Node<'tree>),
+    IncludeMany(Vec<Node<'tree>>),
+    Exclude(&'static str),
+    Gap(RoleCoverageGap),
 }
 
 pub type RoleSinkParts = (
     Option<SourceOccurrenceId>,
     Vec<PendingRoleTarget>,
     Vec<PendingOccurrenceRole>,
+    Vec<(Role, RoleCoverage, Option<Span>)>,
     Option<RoleSinkStop>,
 );
 
@@ -924,6 +1097,62 @@ pub enum RoleSinkStop {
 }
 
 impl<'a> RoleSink<'a> {
+    /// Visit each direct named, non-extra child of a certified written list.
+    /// `container` is an error when the list has no syntactic container; the
+    /// adapter supplies the precise refusal gap in that case.
+    pub fn covered_list<'tree>(
+        &mut self,
+        role: Role,
+        container: Result<Node<'tree>, RoleCoverageGaps>,
+        owner_gaps: &[RoleCoverageGap],
+        mut disposition: impl FnMut(Node<'tree>) -> CoveredChildDisposition<'tree>,
+    ) -> RoleCoverage {
+        debug_assert!(role.has_coverage());
+        let mut coverage = RoleCoverage::Complete;
+        for &gap in owner_gaps {
+            coverage.add_gap(gap);
+        }
+        let container = match container {
+            Ok(container) => container,
+            Err(gaps) => {
+                for gap in gaps.iter() {
+                    coverage.add_gap(gap);
+                }
+                self.coverage.push((role, coverage, None));
+                return coverage;
+            }
+        };
+        let mut cursor = container.walk();
+        for child in container
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+        {
+            if child.is_error() || child.is_missing() {
+                coverage.add_gap(RoleCoverageGap::Recovery);
+                continue;
+            }
+            match disposition(child) {
+                CoveredChildDisposition::Include(target) => self.role(role, target),
+                CoveredChildDisposition::IncludeMany(targets) => {
+                    debug_assert!(!targets.is_empty());
+                    for target in targets {
+                        self.role(role, target);
+                    }
+                }
+                CoveredChildDisposition::Exclude(rule) => debug_assert!(!rule.is_empty()),
+                CoveredChildDisposition::Gap(gap) => coverage.add_gap(gap),
+            }
+        }
+        self.coverage.push((
+            role,
+            coverage,
+            Some(Span {
+                start_byte: container.start_byte(),
+                end_byte: container.end_byte(),
+            }),
+        ));
+        coverage
+    }
     pub fn new(
         source: &'a str,
         source_facts: &'a mut dyn SourceOccurrenceSink,
@@ -937,11 +1166,26 @@ impl<'a> RoleSink<'a> {
             name: None,
             roles: Vec::new(),
             occurrence_roles: Vec::new(),
+            coverage: Vec::new(),
             max_roles,
             cancellation,
             stop: None,
             parents,
+            call_site_context: None,
         }
+    }
+
+    pub fn with_call_site_context(mut self, context: &'a CallSiteContext) -> Self {
+        self.call_site_context = Some(context);
+        self
+    }
+
+    pub fn binding_candidate_verdict_at(
+        &self,
+        syntax_id: usize,
+    ) -> Option<BindingCandidateVerdict> {
+        self.call_site_context
+            .and_then(|context| context.binding_candidate_verdict_at(syntax_id))
     }
 
     /// Source snapshot for adapters whose selected AST node contains an
@@ -979,15 +1223,14 @@ impl<'a> RoleSink<'a> {
         });
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (
-        Option<SourceOccurrenceId>,
-        Vec<PendingRoleTarget>,
-        Vec<PendingOccurrenceRole>,
-        Option<RoleSinkStop>,
-    ) {
-        (self.name, self.roles, self.occurrence_roles, self.stop)
+    pub fn into_parts(self) -> RoleSinkParts {
+        (
+            self.name,
+            self.roles,
+            self.occurrence_roles,
+            self.coverage,
+            self.stop,
+        )
     }
 
     /// Poll cancellation and the role-edge admission cap before adapters
@@ -1010,6 +1253,12 @@ impl<'a> RoleSink<'a> {
         true
     }
 
+    /// Stop extraction as exceeded when an adapter's own bounded walk runs past
+    /// its limit, so the file fails closed rather than silently losing a role.
+    pub fn stop_exceeded(&mut self) {
+        self.stop.get_or_insert(RoleSinkStop::Exceeded);
+    }
+
     /// Set the fact's own name from the given node's span.
     pub fn set_name(&mut self, name_node: Node<'_>) {
         self.name = Some(self.source_facts.intern_node(name_node));
@@ -1017,12 +1266,12 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge without a derived name.
     pub fn role(&mut self, role: Role, target: Node<'_>) {
-        let _ = self.push(role, false, None, target, None);
+        let _ = self.push(role, ArgumentMode::Plain, None, target, None);
     }
 
     /// Attach a role edge whose name is the span of `name_node`.
     pub fn role_named(&mut self, role: Role, target: Node<'_>, name_node: Node<'_>) {
-        let _ = self.push(role, false, None, target, Some(name_node));
+        let _ = self.push(role, ArgumentMode::Plain, None, target, Some(name_node));
     }
 
     /// Attach the terminal name of a path and, when it spans multiple nodes,
@@ -1045,7 +1294,24 @@ impl<'a> RoleSink<'a> {
     /// Attach an argument role, preserving whether it came from a
     /// spread/unpack expression.
     pub fn argument_maybe_named(&mut self, target: Node<'_>, name: Option<Node<'_>>, spread: bool) {
-        let _ = self.push(Role::Arg, spread, None, target, name);
+        self.argument_with_mode(
+            target,
+            name,
+            if spread {
+                ArgumentMode::Spread
+            } else {
+                ArgumentMode::Plain
+            },
+        );
+    }
+
+    pub fn argument_with_mode(
+        &mut self,
+        target: Node<'_>,
+        name: Option<Node<'_>>,
+        mode: ArgumentMode,
+    ) {
+        let _ = self.push(Role::Arg, mode, None, target, name);
     }
 
     /// Attach a role edge with a derived name when the language spec found
@@ -1060,13 +1326,17 @@ impl<'a> RoleSink<'a> {
 
     /// Attach a role edge whose name is a precise span inside `target`.
     pub fn role_named_span(&mut self, role: Role, target: Node<'_>, name: Span) {
-        let _ = self.push_span(role, false, None, target, name);
+        let _ = self.push_span(role, ArgumentMode::Plain, None, target, name);
     }
 
     /// Attach a keyword-argument edge (`shell=True` → keyword `shell`,
     /// target the value node).
     pub fn kwarg(&mut self, keyword_node: Node<'_>, value: Node<'_>) {
-        let _ = self.push(Role::Kwarg, false, Some(keyword_node), value, None);
+        self.kwarg_with_mode(keyword_node, value, ArgumentMode::Plain);
+    }
+
+    pub fn kwarg_with_mode(&mut self, keyword_node: Node<'_>, value: Node<'_>, mode: ArgumentMode) {
+        let _ = self.push(Role::Kwarg, mode, Some(keyword_node), value, None);
     }
 
     /// Attach a keyword whose decoded name occupies an exact source subspan.
@@ -1083,9 +1353,43 @@ impl<'a> RoleSink<'a> {
         let occurrence = self.source_facts.intern_node(value);
         self.roles.push(PendingRoleTarget {
             role: Role::Kwarg,
-            spread: false,
+            mode: ArgumentMode::Plain,
             keyword: Some(keyword),
-            target_node: value.id(),
+            target: PendingRoleTargetKind::Node(value.id()),
+            occurrence,
+            name: None,
+        });
+    }
+
+    /// Attach a positional argument represented by an exact source span.
+    pub fn argument_span(&mut self, value: Span) {
+        self.push_argument_span(None, value);
+    }
+
+    /// Attach a keyword argument whose value has no single covering AST node.
+    pub fn kwarg_value_span(&mut self, keyword: Node<'_>, value: Span) {
+        self.push_argument_span(Some(keyword), value);
+    }
+
+    fn push_argument_span(&mut self, keyword: Option<Node<'_>>, value: Span) {
+        assert!(value.start_byte <= value.end_byte && value.end_byte <= self.source.len());
+        if !self.should_continue() {
+            return;
+        }
+        let occurrence = self.source_facts.intern_subspan_bytes(
+            value.start_byte,
+            value.end_byte,
+            SourceOccurrenceProvenance::ExplicitSubspan,
+        );
+        self.roles.push(PendingRoleTarget {
+            role: if keyword.is_some() {
+                Role::Kwarg
+            } else {
+                Role::Arg
+            },
+            mode: ArgumentMode::Plain,
+            keyword: keyword.map(|node| self.source_facts.intern_node(node)),
+            target: PendingRoleTargetKind::Span,
             occurrence,
             name: None,
         });
@@ -1094,7 +1398,7 @@ impl<'a> RoleSink<'a> {
     fn push(
         &mut self,
         role: Role,
-        spread: bool,
+        mode: ArgumentMode,
         keyword: Option<Node<'_>>,
         target: Node<'_>,
         name: Option<Node<'_>>,
@@ -1107,9 +1411,9 @@ impl<'a> RoleSink<'a> {
         let name = name.map(|node| self.source_facts.intern_node(node));
         self.roles.push(PendingRoleTarget {
             role,
-            spread,
+            mode,
             keyword,
-            target_node: target.id(),
+            target: PendingRoleTargetKind::Node(target.id()),
             occurrence,
             name,
         });
@@ -1119,7 +1423,7 @@ impl<'a> RoleSink<'a> {
     fn push_span(
         &mut self,
         role: Role,
-        spread: bool,
+        mode: ArgumentMode,
         keyword: Option<Node<'_>>,
         target: Node<'_>,
         name: Span,
@@ -1136,9 +1440,9 @@ impl<'a> RoleSink<'a> {
         );
         self.roles.push(PendingRoleTarget {
             role,
-            spread,
+            mode,
             keyword,
-            target_node: target.id(),
+            target: PendingRoleTargetKind::Node(target.id()),
             occurrence,
             name: Some(name),
         });

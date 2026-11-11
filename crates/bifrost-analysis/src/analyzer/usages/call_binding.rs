@@ -302,6 +302,12 @@ pub enum CallBindingTarget {
         layout: FormalParameterLayout,
         receiver: CallReceiverBinding,
     },
+    /// A selected source procedure with no indexed callable declaration.
+    /// The caller has separately proved the exact lexical application.
+    ResolvedSourceProcedure {
+        layout: FormalParameterLayout,
+        receiver: CallReceiverBinding,
+    },
     /// The callee resolves, but nothing recorded its formal parameter list.
     FormalsUnrecorded { unit: CodeUnit },
     /// An exact external callee resolves, but nothing recorded its formal
@@ -337,8 +343,9 @@ pub enum CallReceiverBinding {
     Actual {
         range: Range,
         /// The callee declares its receiver as the first ordinary parameter
-        /// (Python's `self` and `cls`), so that slot is not available to the
-        /// written actuals.
+        /// (Python's `self` and `cls`, or the `this` parameter of a C#
+        /// extension method called in reduced form), so that slot is not
+        /// available to the written actuals.
         declared_first_ordinary: bool,
     },
     /// The language fills the position with no source syntax: a Python
@@ -462,7 +469,10 @@ pub fn call_binding_report(
             layout,
             receiver,
         } => (Some(unit), layout, receiver, true),
-        CallBindingTarget::ResolvedExternal { layout, receiver } => (None, layout, receiver, false),
+        CallBindingTarget::ResolvedExternal { layout, receiver }
+        | CallBindingTarget::ResolvedSourceProcedure { layout, receiver } => {
+            (None, layout, receiver, false)
+        }
         CallBindingTarget::FormalsUnrecorded { unit } => {
             return base(
                 Some(unit),

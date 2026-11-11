@@ -53,8 +53,7 @@ UNION ALL
 -- crate rows, so the module is open for this request. The persisted file's
 -- invocations left behind its frontier are the ones the crate accounted for.
 SELECT json_object('evidence', json_array(json_object(
-         'member_blob', member.blob_id, 'selected_blob', mount.blob_id,
-         'reason', 'EditedMacroHost')))
+         'rel_path', member.rel_path, 'reason', 'EditedMacroHost')))
 FROM targets
 CROSS JOIN selected_rust_unit_summaries AS unit ON unit.topology_id=targets.topology_id
 CROSS JOIN main.rust_unit_summary_placements AS source

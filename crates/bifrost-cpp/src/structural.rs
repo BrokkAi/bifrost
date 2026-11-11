@@ -1498,6 +1498,11 @@ impl StructuralSpec for CppStructuralSpec {
         cpp_string_literal_value(node, source)
     }
 
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::Constructor, NormalizedKind::Method]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         CPP_KIND_TABLE
     }
@@ -2651,7 +2656,7 @@ const char *mixed = R"(\u0041)" "\u0042";
         for (_, node, kind) in extractions {
             CPP_STRUCTURAL_SPEC.extract(node, kind, &mut sink);
         }
-        let (_, _, occurrences, stop) = sink.into_parts();
+        let (_, _, occurrences, _, stop) = sink.into_parts();
         assert_eq!(stop, None);
 
         let roles_at = |needle: &str| {

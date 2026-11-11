@@ -592,6 +592,7 @@ pub struct LoweredPackageObjectExport {
 #[doc(hidden)]
 pub struct LoweredSharedLanguageFacts {
     pub(crate) aliases: Vec<LoweredJvmAlias>,
+    pub(crate) extern_aliases: Vec<(u32, u32, String)>,
     pub(crate) compilation_imports:
         Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionCompilationImportFact>,
     pub(crate) call_argument_lists: Vec<LoweredCallArgumentList>,
@@ -754,6 +755,12 @@ pub struct LoweredCommonFacts {
     #[doc(hidden)]
     pub package_references: Vec<LoweredPackageReference>,
     #[doc(hidden)]
+    pub(crate) reference_execution_contexts: Vec<
+        brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionContextFact,
+    >,
+    pub lexical_package_contexts:
+        Vec<brokk_bifrost_core::analyzer::resolution_facts::ResolutionLexicalPackageContextFact>,
+    #[doc(hidden)]
     pub package_members: Vec<LoweredPackageMember>,
     pub(crate) package_routes: Vec<LoweredPackageRoute>,
     #[doc(hidden)]
@@ -779,6 +786,12 @@ impl LoweredCommonFacts {
         mut declared_root_routes: Vec<LoweredDeclaredRootRoute>,
         mut root_import_provenance: Vec<LoweredRootImportProvenance>,
         mut package_references: Vec<LoweredPackageReference>,
+        reference_execution_contexts: Vec<
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionContextFact,
+        >,
+        lexical_package_contexts: Vec<
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionLexicalPackageContextFact,
+        >,
         mut package_members: Vec<LoweredPackageMember>,
         mut package_routes: Vec<LoweredPackageRoute>,
         mut go_package_imports: Vec<LoweredGoPackageImport>,
@@ -950,6 +963,8 @@ impl LoweredCommonFacts {
             declared_root_routes,
             root_import_provenance,
             package_references,
+            reference_execution_contexts,
+            lexical_package_contexts,
             package_members,
             package_routes,
             go_package_imports,
@@ -1052,7 +1067,7 @@ fn lower_shared_language_facts(
                 call: argument.call,
                 list_ordinal: argument.list_ordinal,
                 ordinal: argument.ordinal,
-                value: identities.semantic(type_slot_semantic_identity(argument.value)),
+                value: identities.type_slot_semantic(argument.value),
                 label,
             }
         })
@@ -1256,9 +1271,7 @@ fn lower_shared_language_facts(
             assert!(type_slots.contains(&receiver.receiver_type));
             LoweredExtensionReceiver {
                 callable: receiver.callable,
-                receiver_type: identities.semantic(type_slot_semantic_identity(
-                    receiver.receiver_type,
-                )),
+                receiver_type: identities.type_slot_semantic(receiver.receiver_type),
             }
         })
         .collect::<Vec<_>>();
@@ -1353,7 +1366,7 @@ fn lower_shared_language_facts(
             let mut slot_semantic = |slot: Option<_>| {
                 slot.map(|slot| {
                     assert!(type_slots.contains(&slot));
-                    identities.semantic(type_slot_semantic_identity(slot))
+                    identities.type_slot_semantic(slot)
                 })
             };
             LoweredInvocationRole {
@@ -1403,6 +1416,11 @@ fn lower_shared_language_facts(
 
     LoweredSharedLanguageFacts {
         aliases: lowered_aliases,
+        extern_aliases: facts
+            .extern_aliases
+            .iter()
+            .map(|f| (f.site.get(), f.scope.get(), names[&f.name].to_string()))
+            .collect(),
         compilation_imports: facts.compilation_imports.clone(),
         call_argument_lists,
         call_arguments,
@@ -1520,10 +1538,10 @@ pub(crate) fn lower_common_resolution_facts(
             assert!(type_slots.contains(&fact.owner_type));
             LoweredDeferredMemberOwner {
                 definition: definition_semantic_for_site(&declarations, identities, fact.member),
-                owner_frontier: identities.semantic(type_slot_semantic_identity(fact.owner_type)),
+                owner_frontier: identities.type_slot_semantic(fact.owner_type),
                 hierarchy_frontier: hierarchy_by_member
                     .get(&fact.member)
-                    .map(|&slot| identities.semantic(type_slot_semantic_identity(slot))),
+                    .map(|&slot| identities.type_slot_semantic(slot)),
                 lookup: identities.lookup_semantic(
                     language,
                     member_lookup_namespace(fact.kind),
@@ -1564,14 +1582,12 @@ pub(crate) fn lower_common_resolution_facts(
             }
             LoweredDeclaredTypeRelation {
                 relation: identities.semantic(type_relation_semantic_identity(fact.id)),
-                subject_frontier: identities.semantic(type_slot_semantic_identity(fact.subject)),
+                subject_frontier: identities.type_slot_semantic(fact.subject),
                 kind: fact.kind,
                 target_reference: fact
                     .target_reference
                     .map(|site| identities.source_reference_semantic(site)),
-                target_frontier: fact
-                    .target
-                    .map(|slot| identities.semantic(type_slot_semantic_identity(slot))),
+                target_frontier: fact.target.map(|slot| identities.type_slot_semantic(slot)),
             }
         })
         .collect::<Vec<_>>();
@@ -2065,6 +2081,8 @@ pub(crate) fn lower_common_resolution_facts(
         declared_root_routes,
         root_import_provenance,
         package_references,
+        facts.reference_execution_contexts.clone(),
+        facts.lexical_package_contexts.clone(),
         package_members,
         package_routes,
         go_package_imports,

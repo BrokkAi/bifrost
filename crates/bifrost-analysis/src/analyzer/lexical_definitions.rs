@@ -31,6 +31,14 @@ struct ParameterBinding<'tree> {
     kind: DeclarationKind,
 }
 
+struct ParameterDeclaration<'tree> {
+    declaration: Node<'tree>,
+    names: Vec<Node<'tree>>,
+    kind: DeclarationKind,
+    positions: usize,
+    variadic: Option<FormalVariadicKind>,
+}
+
 pub use crate::analyzer::semantic::lexical_definitions::FormalParameterSlot;
 
 pub use crate::analyzer::semantic::lexical_definitions::FormalVariadicKind;
@@ -113,88 +121,45 @@ fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
     } else {
         None
     };
-    let lambda = is_lambda_owner(language, owner.kind());
-    let (ordinary_roots, receiver_roots) =
-        parameter_roots_with_step(language, owner, &mut scope_step)?;
-    let mut bindings = Vec::new();
-    for (root, forced_kind) in ordinary_roots.into_iter().map(|root| (root, None)).chain(
-        receiver_roots
-            .into_iter()
-            .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
-    ) {
-        bindings.extend(parameter_bindings_with_step(
-            language,
-            root,
-            lambda,
-            forced_kind,
-            &mut scope_step,
-        )?);
-    }
-    bindings.sort_by_key(|binding| {
-        (
-            binding.declaration.start_byte(),
-            binding.name.start_byte(),
-            binding.name.end_byte(),
-        )
-    });
+    let declarations =
+        parameter_declarations_for_owner_with_step(language, owner, source, &mut scope_step)?;
 
     let mut slots: Vec<(FormalParameterSlot, Node<'tree>)> = Vec::new();
-    for binding in bindings {
-        let Some(name) = source.get(binding.name.byte_range()) else {
-            continue;
-        };
-        let receiver = binding.kind == DeclarationKind::ReceiverParameter;
-        let declaration_range = node_range(binding.declaration);
-        let variadic = is_variadic_parameter(language, binding.declaration);
-        let passing_mode = formal_parameter_passing_mode(language, binding.declaration);
-        let default_range = parameter_default_range(language, binding.declaration);
-        let can_share_slot = language != Language::Go;
-        if language == Language::Rust && binding.name.kind() == "_" {
+    for declaration in declarations {
+        let names = declaration
+            .names
+            .iter()
+            .filter(|name| !(language == Language::Rust && name.kind() == "_"))
+            .map(|name| source.get(name.byte_range()).map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        let receiver = declaration.kind == DeclarationKind::ReceiverParameter;
+        let declaration_range = node_range(declaration.declaration);
+        if !scope_step() {
+            return None;
+        }
+        let passing_mode = formal_parameter_passing_mode(language, declaration.declaration);
+        if !scope_step() {
+            return None;
+        }
+        let default_range = parameter_default_range(language, declaration.declaration);
+        for position in 0..declaration.positions {
             slots.push((
                 FormalParameterSlot {
-                    names: Vec::new(),
+                    names: if language == Language::Go {
+                        names.get(position).cloned().into_iter().collect()
+                    } else {
+                        names.clone()
+                    },
                     declaration_range,
                     receiver,
-                    variadic,
+                    variadic: declaration.variadic,
                     passing_mode,
                     default_range,
                 },
-                binding.declaration,
+                declaration.declaration,
             ));
-            continue;
         }
-        if can_share_slot
-            && let Some((slot, _)) = slots.last_mut()
-            && slot.declaration_range.start_byte == declaration_range.start_byte
-            && slot.declaration_range.end_byte == declaration_range.end_byte
-            && slot.receiver == receiver
-        {
-            if !slot.names.iter().any(|candidate| candidate == name) {
-                slot.names.push(name.to_owned());
-            }
-            slot.variadic = slot.variadic.or(variadic);
-            debug_assert_eq!(slot.passing_mode, passing_mode);
-            continue;
-        }
-        slots.push((
-            FormalParameterSlot {
-                names: vec![name.to_owned()],
-                declaration_range,
-                receiver,
-                variadic,
-                passing_mode,
-                default_range,
-            },
-            binding.declaration,
-        ));
     }
-    slots.sort_unstable_by_key(|(slot, _)| {
-        (
-            slot.declaration_range.start_byte,
-            slot.declaration_range.end_byte,
-        )
-    });
-
     let (slots, nodes): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
     Some((
         FormalParameterLayout {
@@ -323,11 +288,11 @@ pub fn parameter_owner_for_range<'tree>(
     best.map(|(_, owner)| owner)
 }
 
-/// Resolve `identifier` at the supplied byte range to the nearest lexical
-/// parameter binding.  `None` means that the structured syntax did not prove a
-/// lexical answer, so callers should continue with ordinary indexed lookup.
-/// A nearer local declaration is reported separately so callers do not fall
-/// through and accidentally resolve an outer parameter or workspace symbol.
+/// Best-effort lexical binding at the supplied byte range. `None` includes an
+/// unavailable layout or visibility proof, so it does not prove absence.
+/// Consumers that authorize indexed or outer lookup from absence must use
+/// [`resolve_lexical_binding_with_visibility`] and preserve its refusal.
+/// A nearer local declaration is reported separately from a parameter.
 #[doc(hidden)]
 pub fn resolve_lexical_binding(
     language: Language,
@@ -337,21 +302,52 @@ pub fn resolve_lexical_binding(
     focus_end: usize,
     identifier: &str,
 ) -> Option<LexicalBindingResolution> {
+    resolve_lexical_binding_with_visibility(
+        language,
+        root,
+        source,
+        focus_start,
+        focus_end,
+        identifier,
+    )
+    .ok()
+    .flatten()
+}
+
+/// Resolve a lexical binding while preserving an unavailable parameter layout
+/// or pattern visibility as a refusal, distinct from a proved absent binding.
+#[doc(hidden)]
+pub fn resolve_lexical_binding_with_visibility(
+    language: Language,
+    root: Node<'_>,
+    source: &str,
+    focus_start: usize,
+    focus_end: usize,
+    identifier: &str,
+) -> Result<Option<LexicalBindingResolution>, LexicalBindingUnproven> {
     if language == Language::None
         || focus_start > focus_end
         || focus_end > source.len()
         || identifier.is_empty()
     {
-        return None;
+        return Ok(None);
     }
 
-    let focus = smallest_named_node(root, focus_start, focus_end)?;
+    let Some(focus) = smallest_named_node(root, focus_start, focus_end) else {
+        return Ok(None);
+    };
     if language == Language::Cpp
         && let Some(definition) = c_label_binding(focus, source, identifier)
     {
-        return Some(LexicalBindingResolution::OtherLocal(definition));
+        return Ok(Some(LexicalBindingResolution::OtherLocal(definition)));
     }
-    resolve_lexical_binding_from_focus(language, focus, source, focus_start, identifier)
+    resolve_lexical_binding_from_focus_with_visibility(
+        language,
+        focus,
+        source,
+        focus_start,
+        identifier,
+    )
 }
 
 /// Resolve a C statement label from the label/goto grammar nodes that own it.
@@ -483,6 +479,7 @@ pub fn c_label_usage_ranges(
 /// Resolve a lexical binding when a language adapter has structurally proven
 /// that a grammar recovery node, rather than the smallest named leaf, carries
 /// the value role at `focus_start`.
+/// `None` includes refusal; proof-sensitive consumers use the typed variant.
 #[doc(hidden)]
 pub fn resolve_lexical_binding_from_focus(
     language: Language,
@@ -502,14 +499,14 @@ pub fn resolve_lexical_binding_from_focus(
     .flatten()
 }
 
-/// A pattern could shadow this name, but its visibility was not established.
-/// No declaration identity or outer-binding fallback is justified.
+/// A binding may shadow this name, but its parameter layout or pattern
+/// visibility was not established. No outer-binding fallback is justified.
 #[derive(Debug, Clone, Copy)]
 #[doc(hidden)]
-pub struct LexicalPatternVisibilityUnproven;
+pub struct LexicalBindingUnproven;
 
-/// The same lexical search, preserving a visibility refusal for consumers
-/// that must not reinterpret it as a proved field or absent capture.
+/// The same lexical search, preserving a binding refusal for consumers that
+/// must not reinterpret it as a proved field or absent capture.
 #[doc(hidden)]
 pub fn resolve_lexical_binding_from_focus_with_visibility(
     language: Language,
@@ -517,8 +514,36 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
     source: &str,
     focus_start: usize,
     identifier: &str,
-) -> Result<Option<LexicalBindingResolution>, LexicalPatternVisibilityUnproven> {
-    debug_assert!(focus.start_byte() <= focus_start && focus_start < focus.end_byte());
+) -> Result<Option<LexicalBindingResolution>, LexicalBindingUnproven> {
+    resolve_lexical_binding_with_candidate_index(
+        language,
+        focus,
+        source,
+        focus_start,
+        identifier,
+        None,
+    )
+}
+
+/// The shared lexical search with optional exact-tree structural preparation.
+/// Admission must be performed by the owner before retaining preparation.
+#[doc(hidden)]
+pub fn resolve_lexical_binding_with_candidate_index(
+    language: Language,
+    focus: Node<'_>,
+    source: &str,
+    focus_start: usize,
+    identifier: &str,
+    mut index: Option<&mut LexicalScopeCandidateIndex>,
+) -> Result<Option<LexicalBindingResolution>, LexicalBindingUnproven> {
+    // A grammar-inserted MISSING node, such as the iterable of a recovered
+    // `for (String key : )`, is zero-width and focused at its own start. Its
+    // empty name matches no binding; an unproven enclosing owner still refuses.
+    debug_assert!(
+        focus.start_byte() <= focus_start
+            && (focus_start < focus.end_byte()
+                || (focus.is_missing() && focus_start == focus.end_byte()))
+    );
     if !focus_can_resolve_lexical(language, focus) {
         return Ok(None);
     }
@@ -536,7 +561,7 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
     for node in &ancestors {
         if (is_lexical_scope(language, node.kind())
             || patterns.is_some_and(|patterns| (patterns.is_scope)(node.kind())))
-            && let Some(definition) = scope_matching_local(
+            && let Some(definition) = scope_matching_local_prepared(
                 language,
                 *node,
                 source,
@@ -544,13 +569,14 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
                 focus_start,
                 identifier,
                 patterns,
+                index.as_deref_mut(),
             )?
         {
             return Ok(Some(LexicalBindingResolution::OtherLocal(definition)));
         }
 
         if is_parameter_owner(language, node.kind())
-            && let Some(binding) = matching_parameter(language, *node, source, identifier)
+            && let Some(binding) = matching_parameter(language, *node, source, identifier)?
         {
             return Ok(Some(LexicalBindingResolution::Parameter(
                 LexicalDefinition {
@@ -570,7 +596,7 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
         && let Some(fragment) = cpp_recovered_function_body(focus, focus_start)
     {
         if let Some(body) = fragment.child_by_field_name("body")
-            && let Some(definition) = scope_matching_local(
+            && let Some(definition) = scope_matching_local_prepared(
                 language,
                 body,
                 source,
@@ -578,11 +604,12 @@ pub fn resolve_lexical_binding_from_focus_with_visibility(
                 focus_start,
                 identifier,
                 patterns,
+                index,
             )?
         {
             return Ok(Some(LexicalBindingResolution::OtherLocal(definition)));
         }
-        if let Some(binding) = matching_parameter(language, fragment, source, identifier) {
+        if let Some(binding) = matching_parameter(language, fragment, source, identifier)? {
             return Ok(Some(LexicalBindingResolution::Parameter(
                 LexicalDefinition {
                     source_file: None,
@@ -757,42 +784,88 @@ fn matching_parameter<'tree>(
     owner: Node<'tree>,
     source: &str,
     identifier: &str,
-) -> Option<ParameterBinding<'tree>> {
+) -> Result<Option<ParameterBinding<'tree>>, LexicalBindingUnproven> {
     if language_support_for_hook(language, "parameter_owner_has_lexical_bindings")
         .is_some_and(|support| !support.parameter_owner_has_lexical_bindings(owner))
     {
+        return Ok(None);
+    }
+    let roots = parameter_roots_with_step(language, owner, &mut || true)
+        .expect("unbounded parameter traversal cannot stop");
+    // C++ writes a callable's parameter list in its declarator. An owner with
+    // no list there declares no parameters: parser recovery builds such a
+    // `function_definition` around a namespace-opening or class-decorating
+    // macro token, and its body holds namespace-scope declarations. It has no
+    // formal layout, but it shadows nothing. A malformed written list still
+    // refuses below.
+    if language == Language::Cpp && roots.0.is_empty() {
+        return Ok(None);
+    }
+    // Collect the whole owner before matching. A later malformed declaration
+    // cannot turn an earlier name into a complete binding decision.
+    let declarations =
+        parameter_declarations_from_roots(language, owner, roots, source, &mut || true)
+            .ok_or(LexicalBindingUnproven)?;
+    for declaration in declarations {
+        for name in declaration.names {
+            if identifier_matches(language, name, source, identifier) {
+                return Ok(Some(ParameterBinding {
+                    name,
+                    declaration: declaration.declaration,
+                    kind: declaration.kind,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parameter_declarations_for_owner_with_step<'tree>(
+    language: Language,
+    owner: Node<'tree>,
+    source: &str,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<Vec<ParameterDeclaration<'tree>>> {
+    let roots = parameter_roots_with_step(language, owner, scope_step)?;
+    parameter_declarations_from_roots(language, owner, roots, source, scope_step)
+}
+
+fn parameter_declarations_from_roots<'tree>(
+    language: Language,
+    owner: Node<'tree>,
+    (ordinary_roots, receiver_roots): (Vec<Node<'tree>>, Vec<Node<'tree>>),
+    source: &str,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<Vec<ParameterDeclaration<'tree>>> {
+    let lambda = is_lambda_owner(language, owner.kind());
+    if ordinary_roots.is_empty()
+        && matches!(language, Language::Go | Language::Rust | Language::Cpp)
+        && !(language == Language::Cpp && owner.kind() == "lambda_expression" && !owner.has_error())
+    {
         return None;
     }
-    let lambda = is_lambda_owner(language, owner.kind());
-    let (ordinary_roots, receiver_roots) = parameter_roots(language, owner);
-
-    // Scala lambda parameters are repeated fields and can be naked identifiers
-    // or a bindings node; the field walk above captures both.
-    let mut best = None;
+    let mut declarations = Vec::new();
     for (root, forced_kind) in ordinary_roots.into_iter().map(|root| (root, None)).chain(
         receiver_roots
             .into_iter()
             .map(|root| (root, Some(DeclarationKind::ReceiverParameter))),
     ) {
-        for binding in parameter_bindings(language, root, lambda, forced_kind) {
-            if identifier_matches(language, binding.name, source, identifier) {
-                best = Some(binding);
-                break;
-            }
-        }
-        if best.is_some() {
-            break;
-        }
+        declarations.extend(parameter_declarations_with_step(
+            language,
+            root,
+            lambda,
+            forced_kind,
+            source,
+            scope_step,
+        )?);
     }
-    best
-}
-
-fn parameter_roots<'tree>(
-    language: Language,
-    owner: Node<'tree>,
-) -> (Vec<Node<'tree>>, Vec<Node<'tree>>) {
-    parameter_roots_with_step(language, owner, &mut || true)
-        .expect("unbounded parameter traversal cannot stop")
+    declarations.sort_by_key(|declaration| {
+        (
+            declaration.declaration.start_byte(),
+            declaration.declaration.end_byte(),
+        )
+    });
+    Some(declarations)
 }
 
 fn parameter_roots_with_step<'tree>(
@@ -971,27 +1044,58 @@ fn parameter_default_range(language: Language, parameter: Node<'_>) -> Option<Ra
     value.map(node_range)
 }
 
-fn parameter_bindings(
+#[cfg(test)]
+fn parameter_bindings<'tree>(
     language: Language,
-    root: Node<'_>,
+    root: Node<'tree>,
     lambda: bool,
     forced_kind: Option<DeclarationKind>,
-) -> Vec<ParameterBinding<'_>> {
-    parameter_bindings_with_step(language, root, lambda, forced_kind, &mut || true)
-        .expect("unbounded parameter traversal cannot stop")
+    source: &str,
+) -> Vec<ParameterBinding<'tree>> {
+    parameter_bindings_with_step(language, root, lambda, forced_kind, source, &mut || true)
+        .expect("valid fixture parameter declarations")
 }
 
+#[cfg(test)]
 fn parameter_bindings_with_step<'tree>(
     language: Language,
     root: Node<'tree>,
     lambda: bool,
     forced_kind: Option<DeclarationKind>,
+    source: &str,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<Vec<ParameterBinding<'tree>>> {
+    let declarations =
+        parameter_declarations_with_step(language, root, lambda, forced_kind, source, scope_step)?;
+    Some(
+        declarations
+            .into_iter()
+            .flat_map(|declaration| {
+                declaration
+                    .names
+                    .into_iter()
+                    .map(move |name| ParameterBinding {
+                        name,
+                        declaration: declaration.declaration,
+                        kind: declaration.kind,
+                    })
+            })
+            .collect(),
+    )
+}
+
+fn parameter_declarations_with_step<'tree>(
+    language: Language,
+    root: Node<'tree>,
+    lambda: bool,
+    forced_kind: Option<DeclarationKind>,
+    source: &str,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Option<Vec<ParameterDeclaration<'tree>>> {
     if !scope_step() {
         return None;
     }
-    let mut bindings = Vec::new();
+    let mut declarations = Vec::new();
     if !is_parameter_container(language, root.kind())
         && is_direct_parameter_binding(language, root.kind())
     {
@@ -1000,25 +1104,158 @@ fn parameter_bindings_with_step<'tree>(
         } else {
             DeclarationKind::Parameter
         });
-        for name in binding_name_nodes_with_step(language, root, true, scope_step)? {
-            bindings.push(ParameterBinding {
-                name,
-                declaration: root,
-                kind,
-            });
-        }
-        return Some(bindings);
+        declarations.push(ParameterDeclaration {
+            names: binding_name_nodes_with_step(language, root, true, scope_step)?,
+            declaration: root,
+            kind,
+            positions: 1,
+            variadic: is_variadic_parameter(language, root),
+        });
+        return Some(declarations);
     }
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if !scope_step() {
             return None;
         }
+        // The C++ formal-role reader below refuses every recovery node except
+        // the exact shapes it proves, so it owns that decision for C++ lists.
+        if is_parameter_container(language, node.kind())
+            && (node.is_missing() || node.has_error() && language != Language::Cpp)
+        {
+            return None;
+        }
         if node != root && is_parameter_owner(language, node.kind()) {
             continue;
         }
 
+        if language == Language::Go && node.kind() == "parameter_list" {
+            // The Go adapter already classifies each grouped declaration by its
+            // grammar fields. Its type child points back to the exact
+            // declaration, including when no name was written.
+            for child in node.children(&mut node.walk()) {
+                if !scope_step() {
+                    return None;
+                }
+                if child.has_error() || child.is_missing() {
+                    return None;
+                }
+                if child.is_named()
+                    && !matches!(
+                        child.kind(),
+                        "parameter_declaration" | "variadic_parameter_declaration" | "comment"
+                    )
+                {
+                    return None;
+                }
+                for field_child in child.children(&mut child.walk()) {
+                    if !scope_step() || field_child.has_error() || field_child.is_missing() {
+                        return None;
+                    }
+                }
+            }
+            for syntax in brokk_bifrost_go::declarations::go_parameter_syntax(node) {
+                if !scope_step() {
+                    return None;
+                }
+                let ty = syntax.type_node?;
+                let declaration = ty.parent()?;
+                if !matches!(
+                    declaration.kind(),
+                    "parameter_declaration" | "variadic_parameter_declaration"
+                ) || declaration.child_by_field_name("type") != Some(ty)
+                    || ty.has_error()
+                    || ty.is_missing()
+                {
+                    return None;
+                }
+                let positions = syntax.name_nodes.len().max(1);
+                declarations.push(ParameterDeclaration {
+                    declaration,
+                    names: syntax.name_nodes,
+                    kind: forced_kind.unwrap_or(if lambda {
+                        DeclarationKind::LambdaParameter
+                    } else {
+                        DeclarationKind::Parameter
+                    }),
+                    positions,
+                    variadic: syntax.variadic.then_some(FormalVariadicKind::Positional),
+                });
+            }
+            continue;
+        }
+
+        if language == Language::Cpp && matches!(node.kind(), "parameter_list" | "parameters") {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if !scope_step() {
+                    return None;
+                }
+                match brokk_bifrost_cpp::declarations::cpp_formal_role_with_step(
+                    child,
+                    source,
+                    &mut *scope_step,
+                ) {
+                    Ok(brokk_bifrost_cpp::declarations::CppFormalRole::Declared {
+                        parameter,
+                        name,
+                        receiver,
+                        variadic,
+                        ..
+                    }) => {
+                        declarations.push(ParameterDeclaration {
+                            names: name.into_iter().collect(),
+                            declaration: parameter,
+                            kind: if receiver {
+                                DeclarationKind::ReceiverParameter
+                            } else {
+                                forced_kind.unwrap_or(if lambda {
+                                    DeclarationKind::LambdaParameter
+                                } else {
+                                    DeclarationKind::Parameter
+                                })
+                            },
+                            positions: 1,
+                            variadic: variadic.then_some(FormalVariadicKind::Positional),
+                        });
+                    }
+                    Ok(brokk_bifrost_cpp::declarations::CppFormalRole::Ellipsis) => {
+                        declarations.push(ParameterDeclaration {
+                            names: Vec::new(),
+                            declaration: child,
+                            kind: DeclarationKind::Parameter,
+                            positions: 1,
+                            variadic: Some(FormalVariadicKind::Positional),
+                        });
+                    }
+                    Ok(
+                        brokk_bifrost_cpp::declarations::CppFormalRole::Void
+                        | brokk_bifrost_cpp::declarations::CppFormalRole::Other,
+                    ) => {}
+                    Err(_) => return None,
+                }
+            }
+            continue;
+        }
+
         if is_parameter_declaration(language, node.kind()) {
+            if node.has_error() || node.is_missing() {
+                return None;
+            }
+            let required_fields: &[&str] = match (language, node.kind()) {
+                (Language::Go, _) => &["type"],
+                (Language::Rust, "parameter") => &["pattern", "type"],
+                _ => &[],
+            };
+            for field in required_fields {
+                if !scope_step()
+                    || node
+                        .child_by_field_name(field)
+                        .is_none_or(|child| child.has_error() || child.is_missing())
+                {
+                    return None;
+                }
+            }
             let kind = forced_kind.unwrap_or_else(|| {
                 if matches!(
                     (language, node.kind()),
@@ -1031,13 +1268,24 @@ fn parameter_bindings_with_step<'tree>(
                     DeclarationKind::Parameter
                 }
             });
-            for name in binding_name_nodes_with_step(language, node, true, scope_step)? {
-                bindings.push(ParameterBinding {
-                    name,
-                    declaration: node,
-                    kind,
-                });
-            }
+            let names = binding_name_nodes_with_step(language, node, true, scope_step)?;
+            let positions = if language == Language::Go {
+                names.len().max(1)
+            } else {
+                1
+            };
+            declarations.push(ParameterDeclaration {
+                names,
+                declaration: node,
+                kind,
+                positions,
+                variadic: {
+                    if !scope_step() {
+                        return None;
+                    }
+                    is_variadic_parameter(language, node)
+                },
+            });
             continue;
         }
 
@@ -1045,27 +1293,273 @@ fn parameter_bindings_with_step<'tree>(
         // naked binding pattern directly beneath their parameter container.
         if is_parameter_container(language, root.kind())
             && node != root
-            && is_direct_parameter_binding(language, node.kind())
+            && (is_direct_parameter_binding(language, node.kind())
+                || language == Language::Rust
+                    && root.kind() == "closure_parameters"
+                    && node.kind() == "_")
         {
-            for name in binding_name_nodes_with_step(language, node, true, scope_step)? {
-                bindings.push(ParameterBinding {
-                    name,
-                    declaration: node,
-                    kind: forced_kind.unwrap_or(if lambda {
-                        DeclarationKind::LambdaParameter
-                    } else {
-                        DeclarationKind::Parameter
-                    }),
-                });
-            }
+            declarations.push(ParameterDeclaration {
+                names: if node.kind() == "_" {
+                    Vec::new()
+                } else {
+                    binding_name_nodes_with_step(language, node, true, scope_step)?
+                },
+                declaration: node,
+                kind: forced_kind.unwrap_or(if lambda {
+                    DeclarationKind::LambdaParameter
+                } else {
+                    DeclarationKind::Parameter
+                }),
+                positions: 1,
+                variadic: is_variadic_parameter(language, node),
+            });
             continue;
         }
 
-        if !push_named_children_with_step(node, &[], &mut stack, scope_step) {
+        if language == Language::Rust && node.kind() == "closure_parameters" {
+            for child in node.children(&mut node.walk()) {
+                if !scope_step() {
+                    return None;
+                }
+                if child.kind() == "_" || child.is_named() {
+                    stack.push(child);
+                }
+            }
+        } else if !push_named_children_with_step(node, &[], &mut stack, scope_step) {
             return None;
         }
     }
-    Some(bindings)
+    Some(declarations)
+}
+
+/// Structural preparation. Shared entries live in the provider retention budget
+/// and use content and structural scope keys; eviction only causes rebuilding.
+#[derive(Default)]
+#[doc(hidden)]
+pub struct LexicalScopeCandidateIndex {
+    scopes: crate::hash::HashMap<usize, IndexedLexicalScope>,
+    shared: Option<(LexicalIndexCache, crate::analyzer::semantic::StableDigest)>,
+    work: LexicalIndexWork,
+}
+
+/// Deterministic work owned by this exact-tree index, never global telemetry.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LexicalIndexWork {
+    pub scope_builds: usize,
+    pub build_visits: usize,
+    pub candidate_examinations: usize,
+}
+
+/// Provider-owned, content-keyed and evictable structural scope cache.
+#[doc(hidden)]
+pub type LexicalIndexCache = brokk_bifrost_core::retention_budget::BudgetRegion<
+    crate::analyzer::semantic::StableDigest,
+    IndexedLexicalScope,
+>;
+
+#[doc(hidden)]
+pub fn lexical_index_cache(
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+) -> LexicalIndexCache {
+    budget.region("semantic.lexical_indexes", None)
+}
+
+impl LexicalScopeCandidateIndex {
+    pub fn shared(
+        cache: LexicalIndexCache,
+        content: crate::analyzer::semantic::StableDigest,
+    ) -> Self {
+        Self {
+            shared: Some((cache, content)),
+            ..Self::default()
+        }
+    }
+    pub fn work(&self) -> LexicalIndexWork {
+        self.work
+    }
+}
+
+#[derive(Default)]
+pub struct IndexedLexicalScope {
+    nodes: Vec<IndexedLexicalNode>,
+    names: crate::hash::HashMap<String, Vec<usize>>,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for IndexedLexicalScope {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.nodes.capacity() * std::mem::size_of::<IndexedLexicalNode>()
+            + self.names.capacity() * std::mem::size_of::<(String, Vec<usize>)>()
+            + self
+                .names
+                .iter()
+                .map(|(name, entries)| {
+                    name.capacity() + entries.capacity() * std::mem::size_of::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
+type SelectedLexicalPaths<'a> =
+    crate::hash::HashMap<(usize, usize, u16), Vec<&'a IndexedLexicalNode>>;
+
+struct IndexedLexicalNode {
+    id: (usize, usize, u16),
+    range: std::ops::Range<usize>,
+    parent: Option<usize>,
+}
+
+impl IndexedLexicalScope {
+    fn build(language: Language, scope: Node<'_>, source: &str) -> Self {
+        let patterns = language_support_for_hook(language, "lexical_pattern_bindings")
+            .and_then(|support| support.lexical_pattern_bindings());
+        let mut result = Self::default();
+        let mut stack = Vec::new();
+        stack.extend(
+            (0..scope.named_child_count())
+                .rev()
+                .map(|i| (scope.named_child(i).expect("named child exists"), None)),
+        );
+        while let Some((node, parent)) = stack.pop() {
+            let index = result.nodes.len();
+            result.nodes.push(IndexedLexicalNode {
+                id: (node.start_byte(), node.end_byte(), node.kind_id()),
+                range: node.byte_range(),
+                parent,
+            });
+            let mut names = Vec::new();
+            if matches!(language, Language::JavaScript | Language::TypeScript)
+                && matches!(
+                    node.kind(),
+                    "function_declaration" | "generator_function_declaration" | "class_declaration"
+                )
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                names.push(name);
+            }
+            // This check precedes pruning just as hoisting does in the reference.
+            if is_parameter_owner(language, node.kind())
+                || is_nested_scope(language, node.kind())
+                || is_parameter_declaration(language, node.kind())
+            {
+                for name in names {
+                    result.add_name(language, name, source, index);
+                }
+                continue;
+            }
+            if patterns
+                .and_then(|p| (p.declaration_for_name)(node))
+                .is_some()
+            {
+                names.push(node);
+            }
+            if is_local_declaration(language, node.kind()) {
+                names.extend(binding_name_nodes(language, node, false));
+            }
+            for name in names {
+                result.add_name(language, name, source, index);
+            }
+            // Focus-dependent pruning is deliberately deferred to lookup.
+            // Retain the ancestor chain once, rather than copying it per name.
+            stack.extend((0..node.named_child_count()).rev().map(|i| {
+                (
+                    node.named_child(i).expect("named child exists"),
+                    Some(index),
+                )
+            }));
+        }
+        result
+    }
+
+    fn add_name(&mut self, language: Language, name: Node<'_>, source: &str, index: usize) {
+        if let Some(text) = source.get(name.byte_range()) {
+            let text = if language == Language::Php {
+                text.strip_prefix('$').unwrap_or(text)
+            } else {
+                text
+            };
+            self.names.entry(text.to_owned()).or_default().push(index);
+        }
+    }
+
+    fn selected_paths(
+        &self,
+        language: Language,
+        identifier: &str,
+    ) -> Option<SelectedLexicalPaths<'_>> {
+        let identifier = if language == Language::Php {
+            identifier.strip_prefix('$').unwrap_or(identifier)
+        } else {
+            identifier
+        };
+        let mut selected = crate::hash::HashSet::default();
+        for &candidate in self.names.get(identifier).into_iter().flatten() {
+            let mut cursor = Some(candidate);
+            while let Some(index) = cursor {
+                if !selected.insert(index) {
+                    break;
+                }
+                cursor = self.nodes[index].parent;
+            }
+        }
+        let mut selected: Vec<_> = selected.into_iter().collect();
+        selected.sort_unstable();
+        // Tree-sitter can nest nodes that share a byte range and kind during
+        // error recovery. Keying children by that structural id would then
+        // merge two parents' buckets and could re-visit a node through its own
+        // bucket. The reference walk has no such mapping, so fall back to it.
+        let mut ids = crate::hash::HashSet::default();
+        if selected
+            .iter()
+            .any(|&index| !ids.insert(self.nodes[index].id))
+        {
+            return None;
+        }
+        let mut children =
+            crate::hash::HashMap::<(usize, usize, u16), Vec<&IndexedLexicalNode>>::default();
+        for index in selected {
+            let node = &self.nodes[index];
+            let parent = node
+                .parent
+                .map(|i| self.nodes[i].id)
+                .unwrap_or((usize::MAX, 0, 0));
+            children.entry(parent).or_default().push(node);
+        }
+        Some(children)
+    }
+}
+
+fn candidate_children<'tree>(
+    scope: Node<'tree>,
+    node: Node<'tree>,
+    selected: Option<&SelectedLexicalPaths<'_>>,
+) -> Vec<Node<'tree>> {
+    if let Some(selected) = selected {
+        let key = if node.id() == scope.id() {
+            (usize::MAX, 0, 0)
+        } else {
+            (node.start_byte(), node.end_byte(), node.kind_id())
+        };
+        return selected
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .rev()
+            .map(|entry| {
+                let mut found = scope
+                    .named_descendant_for_byte_range(entry.range.start, entry.range.end)
+                    .expect("indexed node belongs to scope");
+                while (found.start_byte(), found.end_byte(), found.kind_id()) != entry.id {
+                    found = found.parent().expect("indexed node id belongs to scope");
+                }
+                found
+            })
+            .collect();
+    }
+    (0..node.named_child_count())
+        .rev()
+        .map(|i| node.named_child(i).expect("named child exists"))
+        .collect()
 }
 
 /// The local binder in `scope` that a read of `identifier` at `focus_start`
@@ -1082,7 +1576,7 @@ fn scope_matching_local(
     focus_start: usize,
     identifier: &str,
     patterns: Option<LexicalPatternBindings>,
-) -> Result<Option<LexicalDefinition>, LexicalPatternVisibilityUnproven> {
+) -> Result<Option<LexicalDefinition>, LexicalBindingUnproven> {
     // Read the guards from the reference itself. A recovered function body is
     // not an ancestor of the statements the parser cut loose from it, so
     // locating the reference inside `scope` would answer `None` there and drop
@@ -1152,7 +1646,7 @@ fn scope_matching_local(
             && node.start_byte() < focus_start
             && identifier_matches(language, node, source, identifier)
             && nearest_before.is_none_or(|(best, _)| node.start_byte() > best.start_byte())
-            && (patterns.visible_at)(declaration, focus).ok_or(LexicalPatternVisibilityUnproven)?
+            && (patterns.visible_at)(declaration, focus).ok_or(LexicalBindingUnproven)?
         {
             nearest_before = Some((node, declaration));
         }
@@ -1205,8 +1699,7 @@ fn scope_matching_local(
                 if let Some(patterns) = patterns
                     && let Some(pattern) = (patterns.declaration_for_name)(name)
                     && (!pattern_bindings_visible
-                        || !(patterns.visible_at)(pattern, focus)
-                            .ok_or(LexicalPatternVisibilityUnproven)?)
+                        || !(patterns.visible_at)(pattern, focus).ok_or(LexicalBindingUnproven)?)
                 {
                     continue;
                 }
@@ -1240,6 +1733,251 @@ fn scope_matching_local(
                 pattern_bindings_visible,
             )
         }));
+    }
+    let Some((name, declaration)) = nearest_before
+        .or(first_any)
+        .or(hoisted)
+        .or_else(|| js_ts_hoisted_var_binder(language, scope, source, focus_start, identifier))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(LexicalDefinition {
+        source_file: None,
+        identifier: identifier.to_owned(),
+        kind: if patterns
+            .and_then(|patterns| (patterns.declaration_for_name)(name))
+            .is_some()
+        {
+            DeclarationKind::PatternVariable
+        } else {
+            local_declaration_kind(declaration.kind())
+        },
+        name_range: node_range(name),
+        declaration_range: node_range(declaration),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scope_matching_local_prepared(
+    language: Language,
+    scope: Node<'_>,
+    source: &str,
+    focus: Node<'_>,
+    focus_start: usize,
+    identifier: &str,
+    patterns: Option<LexicalPatternBindings>,
+    index: Option<&mut LexicalScopeCandidateIndex>,
+) -> Result<Option<LexicalDefinition>, LexicalBindingUnproven> {
+    if index.is_none() {
+        return scope_matching_local(
+            language,
+            scope,
+            source,
+            focus,
+            focus_start,
+            identifier,
+            patterns,
+        );
+    }
+    // Read the guards from the reference itself. A recovered function body is
+    // not an ancestor of the statements the parser cut loose from it, so
+    // locating the reference inside `scope` would answer `None` there and drop
+    // the guard test that keeps a contradicting branch's declaration out.
+    let reference_guards = (language == Language::Cpp)
+        .then(|| preprocessor_guard_environment(focus, source))
+        .flatten();
+    let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
+    let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
+    let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
+    let mut shared_value = None;
+    let prepared = index.and_then(|index| {
+        let prepared = if let Some((cache, content)) = &index.shared {
+            let mut key =
+                crate::analyzer::semantic::LengthDelimitedDigest::new(b"lexical.scope.v1");
+            key.push(content.as_bytes());
+            key.push(&scope.start_byte().to_le_bytes());
+            key.push(&scope.end_byte().to_le_bytes());
+            key.push(&scope.kind_id().to_le_bytes());
+            let key = key.finish();
+            shared_value = Some(if let Some(value) = cache.get(&key) {
+                brokk_bifrost_core::retention_budget::BudgetedValue::Retained(value)
+            } else {
+                let prepared = IndexedLexicalScope::build(language, scope, source);
+                {
+                    index.work.scope_builds += 1;
+                    index.work.build_visits += prepared.nodes.len();
+                }
+                cache.insert(key, prepared)
+            });
+            if matches!(
+                shared_value,
+                Some(brokk_bifrost_core::retention_budget::BudgetedValue::RequestOwned { .. })
+            ) {
+                return None;
+            }
+            &**shared_value.as_ref().unwrap()
+        } else {
+            index.scopes.entry(scope.id()).or_insert_with(|| {
+                let prepared = IndexedLexicalScope::build(language, scope, source);
+                {
+                    index.work.scope_builds += 1;
+                    index.work.build_visits += prepared.nodes.len();
+                }
+                prepared
+            })
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let name = if language == Language::Php {
+                identifier.strip_prefix('$').unwrap_or(identifier)
+            } else {
+                identifier
+            };
+            index.work.candidate_examinations += prepared.names.get(name).map_or(0, Vec::len);
+        }
+        Some(prepared)
+    });
+    let selected = prepared
+        .as_ref()
+        .and_then(|scope| scope.selected_paths(language, identifier));
+    let mut stack = Vec::new();
+    stack.extend(
+        candidate_children(scope, scope, selected.as_ref())
+            .into_iter()
+            .map(|node| (node, true, true)),
+    );
+    while let Some((node, ordinary_bindings_visible, pattern_bindings_visible)) = stack.pop() {
+        // Function declarations are hoisted and class declarations shadow through their TDZ,
+        // so source order does not limit declaration-name visibility.
+        if hoisted.is_none()
+            && js_ts_scope_declaration_matches(language, node, source, identifier)
+            && let Some(name) = node.child_by_field_name("name")
+        {
+            hoisted = Some((name, node));
+        }
+        if is_parameter_owner(language, node.kind())
+            || is_nested_scope(language, node.kind())
+            || is_parameter_declaration(language, node.kind())
+        {
+            continue;
+        }
+        if let Some(patterns) = patterns
+            && (patterns.is_scope)(node.kind())
+            && !is_local_declaration(language, node.kind())
+        {
+            // Inspect pattern binders in every admitted scope. Ordinary
+            // locals remain confined; a pattern can cross this boundary only
+            // when its language permits it and proves reference visibility.
+            let contains_focus = node.start_byte() <= focus_start && focus_start < node.end_byte();
+            let bindings_visible = pattern_bindings_visible
+                && (contains_focus || (patterns.bindings_may_escape_scope)(node.kind()));
+            stack.extend(
+                candidate_children(scope, node, selected.as_ref())
+                    .into_iter()
+                    .map(|child| (child, false, bindings_visible)),
+            );
+            continue;
+        }
+        let starts_after_focus = node.start_byte() > focus_start;
+        let support = language_support_for_hook(language, "local_declaration_binding_scope");
+        let binding_scope =
+            support.and_then(|support| support.local_declaration_binding_scope(node));
+        if starts_after_focus
+            && binding_scope.is_none()
+            && !support
+                .is_some_and(|support| support.knowledge().scans_local_declarations_after_focus())
+        {
+            continue;
+        }
+        if pattern_bindings_visible
+            && let Some(patterns) = patterns
+            && let Some(declaration) = (patterns.declaration_for_name)(node)
+            && node.start_byte() < focus_start
+            && identifier_matches(language, node, source, identifier)
+            && nearest_before.is_none_or(|(best, _)| node.start_byte() > best.start_byte())
+            && (patterns.visible_at)(declaration, focus).ok_or(LexicalBindingUnproven)?
+        {
+            nearest_before = Some((node, declaration));
+        }
+        if is_local_declaration(language, node.kind()) {
+            if binding_scope.is_some_and(|binding| binding.scope.id() != scope.id()) {
+                continue;
+            }
+            if starts_after_focus && binding_scope.is_none() {
+                continue;
+            }
+            if language == Language::Rust && node.end_byte() > focus_start {
+                continue;
+            }
+            if crate::analyzer::languages::language_knowledge(language)
+                .is_some_and(|support| support.skips_local_declaration(node, source))
+            {
+                continue;
+            }
+            if language == Language::Cpp
+                && reference_guards.as_ref().is_some_and(|reference| {
+                    !preprocessor_guard_environment(node, source).is_some_and(|required| {
+                        guard_requirements_hold_at_reference(&required, Some(reference))
+                    })
+                })
+            {
+                continue;
+            }
+            if language == Language::Scala
+                && node.kind() == "enumerator"
+                && !scala_enumerator_binding_visible_at(node, focus_start)
+            {
+                continue;
+            }
+            if language == Language::Scala
+                && matches!(node.kind(), "val_definition" | "var_definition")
+                && (!scala_has_value_definition_keyword(node)
+                    || node.child_by_field_name("pattern").is_none())
+            {
+                continue;
+            }
+            for name in binding_name_nodes(language, node, false) {
+                if !identifier_matches(language, name, source, identifier)
+                    || (!ordinary_bindings_visible
+                        && patterns
+                            .and_then(|patterns| (patterns.declaration_for_name)(name))
+                            .is_none())
+                {
+                    continue;
+                }
+                if let Some(patterns) = patterns
+                    && let Some(pattern) = (patterns.declaration_for_name)(name)
+                    && (!pattern_bindings_visible
+                        || !(patterns.visible_at)(pattern, focus).ok_or(LexicalBindingUnproven)?)
+                {
+                    continue;
+                }
+                if first_any.is_none() {
+                    first_any = Some((name, node));
+                }
+                if name.start_byte() < focus_start
+                    && nearest_before.is_none_or(|(best, _)| name.start_byte() > best.start_byte())
+                {
+                    nearest_before = Some((name, node));
+                }
+            }
+            if patterns.is_some()
+                && node.start_byte() <= focus_start
+                && focus_start < node.end_byte()
+            {
+                stack.extend(
+                    candidate_children(scope, node, selected.as_ref())
+                        .into_iter()
+                        .map(|child| (child, false, pattern_bindings_visible)),
+                );
+            }
+            continue;
+        }
+        stack.extend(
+            candidate_children(scope, node, selected.as_ref())
+                .into_iter()
+                .map(|child| (child, ordinary_bindings_visible, pattern_bindings_visible)),
+        );
     }
     let Some((name, declaration)) = nearest_before
         .or(first_any)
@@ -1988,6 +2726,21 @@ mod tests {
     use crate::analyzer::test_support::first_named_kind;
 
     #[test]
+    #[hardwon("#10738: nested recovery nodes sharing one structural id risk the reference walk")]
+    fn duplicate_structural_ids_fall_back_to_the_reference_walk() {
+        let mut scope = IndexedLexicalScope::default();
+        for _ in 0..2 {
+            scope.nodes.push(IndexedLexicalNode {
+                id: (0, 10, 1),
+                range: 0..10,
+                parent: None,
+            });
+        }
+        scope.names.insert("x".to_owned(), vec![0, 1]);
+        assert!(scope.selected_paths(Language::Rust, "x").is_none());
+    }
+
+    #[test]
     fn formal_layouts_preserve_grammar_declaration_boundaries() {
         let _rules = crate::analyzer::languages::neutral_fixture::neutral_rules_fixture(&[
             Language::JavaScript,
@@ -2067,7 +2820,7 @@ mod tests {
                 "{source}"
             );
             if language == Language::Java && owner_kind == "method_declaration" {
-                let mut bindings = parameter_bindings(language, parameters, false, None);
+                let mut bindings = parameter_bindings(language, parameters, false, None, source);
                 bindings.sort_by_key(|binding| binding.declaration.start_byte());
                 assert_eq!(bindings.len(), declarations.len());
                 for (binding, (declaration, names)) in

@@ -162,6 +162,10 @@ pub enum BlastRadiusIncompleteReason {
     CompilationScopeUnresolved,
     UnresolvedChangedPaths,
     UnresolvedBasePaths,
+    /// The changed-callable symbol analysis read incomplete evidence or was
+    /// cancelled. It describes the reported callables, not the file graph,
+    /// so `graph_completion` stays as the graph traversal left it.
+    SymbolChangesIncomplete,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -253,13 +257,15 @@ struct TargetEvidence {
     unresolved: Vec<String>,
     graph_cancelled: bool,
     graph_incomplete: bool,
-    graph: Option<Arc<WorkspaceUsageRankingGraph>>,
+    graph: Option<Arc<brokk_bifrost_core::retention_budget::Accounted<WorkspaceUsageRankingGraph>>>,
 }
 
 enum TargetFileDependencyAnalyzer<'a> {
     Live(&'a dyn IAnalyzer),
     Revision {
-        analyzer: RevisionAnalyzer,
+        // Boxed: the Windows build's RevisionAnalyzer makes this variant big
+        // enough to trip clippy::large_enum_variant.
+        analyzer: Box<RevisionAnalyzer>,
         // Keep the materialized tree alive until every analyzer query ends.
         _image: RevisionImage,
     },
@@ -311,10 +317,14 @@ fn build_target_file_dependency_analyzer<'a>(
     let _phase = prepared
         .shared_cache()
         .map(|cache| cache.enter_phase("building the target revision analyzer"));
-    let analyzer =
-        build_file_dependency_analyzer(&image, prepared.shared_cache(), &target_languages)?;
+    let analyzer = build_file_dependency_analyzer(
+        &image,
+        prepared.shared_cache(),
+        &target_languages,
+        prepared.retention_budget(),
+    )?;
     Ok(TargetFileDependencyAnalyzer::Revision {
-        analyzer,
+        analyzer: Box::new(analyzer),
         _image: image,
     })
 }
@@ -338,6 +348,7 @@ pub fn blast_radius_at_root(
     params: BlastRadiusParams,
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<BlastRadiusResult, String> {
     params.validate()?;
     let prepared = PreparedDiff::at_root(
@@ -348,6 +359,7 @@ pub fn blast_radius_at_root(
         },
         options,
         cancellation,
+        retention_budget,
     )?;
 
     let target_paths = target_diff_paths(&prepared);
@@ -410,8 +422,12 @@ pub fn blast_radius_at_root(
         let _phase = prepared
             .shared_cache()
             .map(|cache| cache.enter_phase("building the base revision analyzer"));
-        let base_workspace =
-            build_file_dependency_analyzer(&base_image, prepared.shared_cache(), &base_languages)?;
+        let base_workspace = build_file_dependency_analyzer(
+            &base_image,
+            prepared.shared_cache(),
+            &base_languages,
+            prepared.retention_budget(),
+        )?;
         let base_analyzer = base_workspace.analyzer();
         let base_scope = AnalyzerQueryScope::new(base_analyzer);
         let base_files = resolve_seed_files(base_analyzer, &base_paths);
@@ -469,9 +485,14 @@ pub fn blast_radius_at_root(
                     });
             }
         }
+        if !crate::result_incomplete::query_read_incomplete(&base_scope).is_empty() {
+            reasons.insert(BlastRadiusIncompleteReason::CompilationScopeUnresolved);
+        }
     }
 
-    let symbol_changes = analyze_prepared_symbol_changes(&prepared, true)?.into_symbol_changes();
+    let symbol_changes = analyze_prepared_symbol_changes(&prepared, true)?;
+    let symbol_changes_incomplete = !symbol_changes.incomplete().is_empty();
+    let symbol_changes = symbol_changes.into_symbol_changes();
     let changed_callables = changed_callables(&symbol_changes);
     let analyzer_paths = target_analyzer
         .analyzed_files()
@@ -483,12 +504,15 @@ pub fn blast_radius_at_root(
         &analyzer_paths,
         params.max_scopes,
     );
-    let incomplete_reasons = reasons.into_iter().collect::<Vec<_>>();
-    let graph_completion = if incomplete_reasons.is_empty() {
+    let graph_completion = if reasons.is_empty() {
         FileGraphCompletion::Complete
     } else {
         FileGraphCompletion::Incomplete
     };
+    if symbol_changes_incomplete {
+        reasons.insert(BlastRadiusIncompleteReason::SymbolChangesIncomplete);
+    }
+    let incomplete_reasons = reasons.into_iter().collect::<Vec<_>>();
 
     Ok(BlastRadiusResult {
         endpoints: BlastRadiusEndpoints {
@@ -516,6 +540,7 @@ fn collect_target_evidence(
     paths: &BTreeSet<String>,
     cancellation: &CancellationToken,
 ) -> TargetEvidence {
+    let scope = AnalyzerQueryScope::new(analyzer);
     let seed_files = resolve_seed_files(analyzer, paths);
     let analyzer_changed_test_paths = seed_files
         .iter()
@@ -538,7 +563,6 @@ fn collect_target_evidence(
         .cloned()
         .collect::<Vec<_>>();
     let ecosystems = ecosystems_for_files(seed_files.values());
-    let scope = AnalyzerQueryScope::new(analyzer);
     let (graph, graph_incomplete) = match acquire_file_usage_graph_with_cancellation(
         analyzer,
         scope.token(),
@@ -587,7 +611,8 @@ fn collect_target_evidence(
         target_nodes: graph_paths,
         unresolved,
         graph_cancelled: false,
-        graph_incomplete,
+        graph_incomplete: graph_incomplete
+            || !crate::result_incomplete::query_read_incomplete(&scope).is_empty(),
         graph: Some(graph),
     }
 }
@@ -1239,6 +1264,7 @@ mod tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &cancellation,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect_err("a request that cannot take the build lock must report the lock");
         drop(held);
@@ -1290,6 +1316,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1374,6 +1401,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1440,6 +1468,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1504,6 +1533,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1578,6 +1608,7 @@ ruleTester.run("prefer-template", rule, { valid: [], invalid: [] });
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1656,6 +1687,7 @@ assert.strictEqual(runtime(), 2);
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1732,6 +1764,7 @@ assert.strictEqual(runtime(), 2);
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -1805,6 +1838,7 @@ assert.strictEqual(runtime(), 2);
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -1889,6 +1923,7 @@ assert.strictEqual(runtime(), 2);
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2122,6 +2157,7 @@ assert.strictEqual(runtime(), 2);
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2162,6 +2198,7 @@ assert.strictEqual(runtime(), 2);
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable deletion recovery");
 
@@ -2214,6 +2251,7 @@ assert.strictEqual(runtime(), 2);
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius");
 
@@ -2258,6 +2296,7 @@ mod tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2307,6 +2346,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2376,6 +2416,7 @@ mod inline_tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2414,6 +2455,7 @@ mod inline_tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2458,6 +2500,7 @@ mod inline_tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &cancellation,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("partial blast radius");
 
@@ -2510,6 +2553,7 @@ mod inline_tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("blast radius");
 
@@ -2552,6 +2596,7 @@ mod inline_tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("commit blast radius");
         let by_tree = blast_radius_at_root(
@@ -2564,6 +2609,7 @@ mod inline_tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("tree blast radius");
 
@@ -2629,6 +2675,7 @@ mod inline_tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("renamed-test blast radius");
 
@@ -2670,6 +2717,7 @@ mod inline_tests {
             BlastRadiusParams::default(),
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("removed-test blast radius");
 
@@ -2874,6 +2922,7 @@ mod inline_tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("immutable blast radius")
     }
@@ -3088,6 +3137,7 @@ mod inline_tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect_err("a blocked shared cache must fail the request, not downgrade it");
 

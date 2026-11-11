@@ -1,0 +1,171 @@
+defaulted-later:
+App/A.cs: member
+never-assigned:
+App/A.cs: unproven
+gap=open_default_glob "Directory.Build.props": BaseIntermediateOutputPath assignment is conditioned, late or unknown: obj\$(LibFramework)\
+gap=open_default_glob "Directory.Build.props": BaseOutputPath assignment is conditioned, late or unknown: bin\$(LibFramework)\
+gap=open_default_glob "Directory.Build.props": DefaultItemExcludes assignment is conditioned, late or unknown: $(DefaultItemExcludes);obj\**;bin\**
+other-project-never-assigned:
+App/A.cs: member
+nested-decided-by-known-parts:
+App/A.cs: member
+function-and-false:
+App/A.cs: member
+unknown-decides-or:
+App/A.cs: unproven
+gap=open_default_glob "Directory.Build.props": BaseIntermediateOutputPath assignment is conditioned, late or unknown: obj\$(LibFramework)\
+gap=open_default_glob "Directory.Build.props": BaseOutputPath assignment is conditioned, late or unknown: bin\$(LibFramework)\
+gap=open_default_glob "Directory.Build.props": DefaultItemExcludes assignment is conditioned, late or unknown: $(DefaultItemExcludes);obj\**;bin\**
+item-property-later:
+App/Generated/B.cs: member
+item-property-unassigned:
+App/Generated/B.cs: unproven
+gap=unsupported_project_items "App/App.csproj": open Compile item: [("Include", "$(Gen)\\B.cs")]
+item-condition-on-later:
+App/C.cs: member
+item-condition-off-later:
+App/C.cs: outside
+item-condition-numeric-spelling:
+App/C.cs: unproven
+gap=unsupported_project_items "App/App.csproj": open Compile item: [("Include", "C.cs"), ("Condition", "'$(N)'=='1'")]
+import-order:
+App/A.cs: unproven
+gap=open_default_glob "App/Mode.props": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
+sdk-property:
+App/A.cs: unproven
+gap=open_default_glob "Directory.Build.props": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
+true-guard:
+App/A.cs: unproven
+gap=open_default_glob "Directory.Build.props": EnableDefaultCompileItems assignment is conditioned, late or unknown: false
+group-entry:
+App/A.cs: member
+configuration-open: named-open=["DEBUG", "RELEASE"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Decided(Some(1))]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(0))]
+MODERN: [Decided(Some(1))]
+configuration-expansion: named-open=[]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Undecided(DecisionReason { unknown_symbols: {"Debug"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Undecided(DecisionReason { unknown_symbols: {"TRACE"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Undecided(DecisionReason { unknown_symbols: {"TEST_FOO_BAR_BAZ"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+UNRELATED: [Undecided(DecisionReason { unknown_symbols: {"UNRELATED"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+NET8_0_OR_GREATER: [Undecided(DecisionReason { unknown_symbols: {"NET8_0_OR_GREATER"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+MODERN: [Undecided(DecisionReason { unknown_symbols: {"MODERN"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+configuration-alias: named-open=[]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Undecided(DecisionReason { unknown_symbols: {"Debug"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Undecided(DecisionReason { unknown_symbols: {"TRACE"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Undecided(DecisionReason { unknown_symbols: {"TEST_FOO_BAR_BAZ"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+UNRELATED: [Undecided(DecisionReason { unknown_symbols: {"UNRELATED"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+NET8_0_OR_GREATER: [Undecided(DecisionReason { unknown_symbols: {"NET8_0_OR_GREATER"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+MODERN: [Undecided(DecisionReason { unknown_symbols: {"MODERN"}, open_reasons: {"dynamic_property"}, disagreeing_owners: [], invalid_condition: false })]
+configuration-explicit: named-open=["RELEASE"]
+DEBUG: [Decided(Some(0))]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Decided(Some(1))]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(0))]
+MODERN: [Decided(Some(1))]
+configuration-authored: named-open=["DEBUG", "RELEASE", "STAGING", "TEST_FOO_BAR_BAZ"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Undecided(DecisionReason { unknown_symbols: {"TEST_FOO_BAR_BAZ"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(0))]
+MODERN: [Decided(Some(1))]
+configuration-disabled: named-open=[]
+DEBUG: [Decided(Some(1))]
+Debug: [Decided(Some(1))]
+RELEASE: [Decided(Some(1))]
+TRACE: [Decided(Some(0))]
+STAGING: [Decided(Some(1))]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(0))]
+MODERN: [Decided(Some(1))]
+configuration-condition: named-open=[]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Undecided(DecisionReason { unknown_symbols: {"Debug"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Undecided(DecisionReason { unknown_symbols: {"TRACE"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Undecided(DecisionReason { unknown_symbols: {"TEST_FOO_BAR_BAZ"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+UNRELATED: [Undecided(DecisionReason { unknown_symbols: {"UNRELATED"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+NET8_0_OR_GREATER: [Undecided(DecisionReason { unknown_symbols: {"NET8_0_OR_GREATER"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+MODERN: [Undecided(DecisionReason { unknown_symbols: {"MODERN"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+framework-multiple: named-open=["DEBUG", "RELEASE"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Decided(Some(1))]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Undecided(DecisionReason { unknown_symbols: {}, open_reasons: {}, disagreeing_owners: ["Append/Append.csproj [TargetFramework=net8.0]", "Append/Append.csproj [TargetFramework=netstandard2.0]"], invalid_condition: false })]
+MODERN: [Decided(Some(1))]
+framework-single: named-open=["DEBUG", "RELEASE"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Decided(Some(1))]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(0))]
+MODERN: [Decided(Some(1))]
+framework-conditioned-constants: named-open=["DEBUG", "RELEASE"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Undecided(DecisionReason { unknown_symbols: {"Debug"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Undecided(DecisionReason { unknown_symbols: {"TRACE"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Undecided(DecisionReason { unknown_symbols: {"TEST_FOO_BAR_BAZ"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+UNRELATED: [Undecided(DecisionReason { unknown_symbols: {"UNRELATED"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: [], invalid_condition: false })]
+NET8_0_OR_GREATER: [Undecided(DecisionReason { unknown_symbols: {"NET8_0_OR_GREATER"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: ["Append/Append.csproj [TargetFramework=net6.0]", "Append/Append.csproj [TargetFramework=net8.0]"], invalid_condition: false })]
+MODERN: [Undecided(DecisionReason { unknown_symbols: {"MODERN"}, open_reasons: {"unsupported_framework"}, disagreeing_owners: ["Append/Append.csproj [TargetFramework=net6.0]", "Append/Append.csproj [TargetFramework=net8.0]"], invalid_condition: false })]
+framework-defines-disabled: named-open=["DEBUG", "RELEASE"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Decided(Some(1))]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(1))]
+MODERN: [Decided(Some(1))]
+configuration-default: named-open=["DEBUG", "RELEASE", "STAGING"]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Decided(Some(1))]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Decided(Some(0))]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Decided(Some(1))]
+UNRELATED: [Decided(Some(1))]
+NET8_0_OR_GREATER: [Decided(Some(0))]
+MODERN: [Decided(Some(1))]
+configuration-composite: named-open=[]
+DEBUG: [Undecided(DecisionReason { unknown_symbols: {"DEBUG"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+Debug: [Undecided(DecisionReason { unknown_symbols: {"Debug"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+RELEASE: [Undecided(DecisionReason { unknown_symbols: {"RELEASE"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+TRACE: [Undecided(DecisionReason { unknown_symbols: {"TRACE"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+STAGING: [Undecided(DecisionReason { unknown_symbols: {"STAGING"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+TEST_FOO_BAR_BAZ: [Undecided(DecisionReason { unknown_symbols: {"TEST_FOO_BAR_BAZ"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+UNRELATED: [Undecided(DecisionReason { unknown_symbols: {"UNRELATED"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+NET8_0_OR_GREATER: [Undecided(DecisionReason { unknown_symbols: {"NET8_0_OR_GREATER"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]
+MODERN: [Undecided(DecisionReason { unknown_symbols: {"MODERN"}, open_reasons: {"condition"}, disagreeing_owners: [], invalid_condition: false })]

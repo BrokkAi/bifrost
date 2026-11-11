@@ -528,12 +528,10 @@ fn effective_library_selection_for_config_with_reads(
         );
     };
     let mut budget = MAX_CONFIG_READS;
-    let Some(effective) = resolve_effective(&config, &[], &mut budget, &root, reads) else {
-        return TypeScriptLibrarySelection::incomplete(
-            "tsconfig could not be parsed or its extends chain is unavailable",
-        );
-    };
-    effective.library_selection()
+    match resolve_effective(&config, &[], &mut budget, &root, reads) {
+        Ok(effective) => effective.library_selection(),
+        Err(refusal) => TypeScriptLibrarySelection::incomplete(refusal.diagnostic()),
+    }
 }
 
 /// Pick the alias entry that best matches `specifier` and return its replacements. Exact
@@ -580,13 +578,15 @@ fn best_match(entries: &[AliasEntry], specifier: &str) -> Option<Vec<String>> {
 
 /// Parse a config file and flatten its `extends` chain into a single alias map.
 /// `canonical_root` bounds `extends` resolution to the repo (see [`existing_config_path`]).
+/// A refused config contributes no aliases, exactly like a config without
+/// `paths`; ordinary module resolution applies to both.
 fn build_alias_map(
     config_path: &Path,
     canonical_root: &Path,
     reads: &mut HashSet<PathBuf>,
 ) -> Option<AliasMap> {
     let mut budget = MAX_CONFIG_READS;
-    let effective = resolve_effective(config_path, &[], &mut budget, canonical_root, reads)?;
+    let effective = resolve_effective(config_path, &[], &mut budget, canonical_root, reads).ok()?;
     let (paths_dir, entries) = effective.paths?;
     if entries.is_empty() {
         return None;
@@ -600,6 +600,61 @@ fn build_alias_map(
     Some(AliasMap { base_dir, entries })
 }
 
+/// Why a config contributed nothing. Each kind has one fixed diagnostic with
+/// no path in it, so certificates over the diagnostics hash the kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigRefusal {
+    DepthLimit,
+    Cycle,
+    ReadBudget,
+    TooLarge,
+    Unreadable,
+    Malformed,
+}
+
+impl ConfigRefusal {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::DepthLimit => "tsconfig extends chain exceeds the depth limit",
+            Self::Cycle => "tsconfig extends chain contains a cycle",
+            Self::ReadBudget => "tsconfig extends graph exceeds the configuration read limit",
+            Self::TooLarge => "tsconfig exceeds the configuration size limit",
+            Self::Unreadable => "tsconfig could not be read",
+            Self::Malformed => "tsconfig is not valid JSONC",
+        }
+    }
+}
+
+/// Why a resolved config cannot select TypeScript libraries. Aliases from
+/// the parts that did resolve still apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigDefect {
+    /// An `extends` parent was refused.
+    Parent(ConfigRefusal),
+    NotAnObject,
+    MalformedExtends,
+    UnresolvedExtends,
+    MalformedCompilerOptions,
+}
+
+impl ConfigDefect {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Parent(refusal) => refusal.diagnostic(),
+            Self::NotAnObject => "tsconfig root is not a JSON object",
+            Self::MalformedExtends => {
+                "tsconfig extends must be a nonempty string or an array of nonempty strings"
+            }
+            Self::UnresolvedExtends => {
+                "tsconfig extends target is missing or outside the workspace"
+            }
+            Self::MalformedCompilerOptions => {
+                "tsconfig contains malformed or unsupported compilerOptions"
+            }
+        }
+    }
+}
+
 /// `compilerOptions` values that survive the `extends` merge, each tagged with the
 /// absolute directory of the config file that declared them (so relative `baseUrl`/`paths`
 /// resolve against the right location).
@@ -609,7 +664,8 @@ struct EffectiveConfig {
     paths: Option<(PathBuf, Vec<AliasEntry>)>,
     lib: Option<LibrarySetting>,
     target: Option<TargetSetting>,
-    library_invalid: bool,
+    /// Every defect along the `extends` graph, in merge order.
+    defects: Vec<ConfigDefect>,
 }
 
 #[derive(Debug, Clone)]
@@ -629,21 +685,31 @@ impl EffectiveConfig {
     /// Used to merge `extends` parents left-to-right (rightmost wins) and to apply the
     /// child config over its inherited base. Fields are independent: a `baseUrl` from one
     /// config and `paths` from another both survive, matching `tsc`.
-    fn overlay(self, later: EffectiveConfig) -> EffectiveConfig {
+    fn overlay(mut self, later: EffectiveConfig) -> EffectiveConfig {
+        self.defects.extend(later.defects);
         EffectiveConfig {
             base_url: later.base_url.or(self.base_url),
             paths: later.paths.or(self.paths),
             lib: later.lib.or(self.lib),
             target: later.target.or(self.target),
-            library_invalid: self.library_invalid || later.library_invalid,
+            defects: self.defects,
         }
     }
 
     fn library_selection(self) -> TypeScriptLibrarySelection {
-        if self.library_invalid {
-            return TypeScriptLibrarySelection::incomplete(
-                "tsconfig contains malformed or unsupported compilerOptions",
-            );
+        if !self.defects.is_empty() {
+            let mut diagnostics = Vec::new();
+            for defect in self.defects {
+                let diagnostic = defect.diagnostic().to_owned();
+                if !diagnostics.contains(&diagnostic) {
+                    diagnostics.push(diagnostic);
+                }
+            }
+            return TypeScriptLibrarySelection {
+                libraries: Vec::new(),
+                explicit: false,
+                diagnostics,
+            };
         }
         if let Some(lib) = self.lib {
             return match lib {
@@ -676,25 +742,30 @@ fn resolve_effective(
     budget: &mut u32,
     canonical_root: &Path,
     reads: &mut HashSet<PathBuf>,
-) -> Option<EffectiveConfig> {
-    if ancestors.len() > MAX_EXTENDS_DEPTH
-        || ancestors.iter().any(|seen| seen == config_path)
-        || *budget == 0
-    {
-        return None;
+) -> Result<EffectiveConfig, ConfigRefusal> {
+    if ancestors.len() > MAX_EXTENDS_DEPTH {
+        return Err(ConfigRefusal::DepthLimit);
+    }
+    if ancestors.iter().any(|seen| seen == config_path) {
+        return Err(ConfigRefusal::Cycle);
+    }
+    if *budget == 0 {
+        return Err(ConfigRefusal::ReadBudget);
     }
     *budget -= 1;
     reads.insert(config_path.to_path_buf().normalize());
 
     // Cap the read so a hostile repo can't OOM the analyzer with a giant config.
-    if std::fs::metadata(config_path).ok()?.len() > MAX_CONFIG_BYTES {
-        return None;
+    let metadata = std::fs::metadata(config_path).map_err(|_| ConfigRefusal::Unreadable)?;
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigRefusal::TooLarge);
     }
-    let text = std::fs::read_to_string(config_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&strip_jsonc(&text)).ok()?;
+    let text = std::fs::read_to_string(config_path).map_err(|_| ConfigRefusal::Unreadable)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&strip_jsonc(&text)).map_err(|_| ConfigRefusal::Malformed)?;
     if !value.is_object() {
-        return Some(EffectiveConfig {
-            library_invalid: true,
+        return Ok(EffectiveConfig {
+            defects: vec![ConfigDefect::NotAnObject],
             ..EffectiveConfig::default()
         });
     }
@@ -715,19 +786,19 @@ fn resolve_effective(
         Some(value) => match extends_targets(value) {
             Ok(targets) => targets,
             Err(()) => {
-                inherited.library_invalid = true;
+                inherited.defects.push(ConfigDefect::MalformedExtends);
                 Vec::new()
             }
         },
     };
     for target in extends {
         let Some(path) = resolve_extends_path(&dir, &target, canonical_root, reads) else {
-            inherited.library_invalid = true;
+            inherited.defects.push(ConfigDefect::UnresolvedExtends);
             continue;
         };
         match resolve_effective(&path, &chain, budget, canonical_root, reads) {
-            Some(parent) => inherited = inherited.overlay(parent),
-            None => inherited.library_invalid = true,
+            Ok(parent) => inherited = inherited.overlay(parent),
+            Err(refusal) => inherited.defects.push(ConfigDefect::Parent(refusal)),
         }
     }
 
@@ -771,7 +842,7 @@ fn resolve_effective(
                 ),
             },
         );
-    let own_library_invalid = compiler_options_malformed
+    let own_compiler_options_malformed = compiler_options_malformed
         || compiler_options.is_some_and(|opts| {
             opts.get("lib").is_some_and(|value| {
                 !value.is_array()
@@ -790,9 +861,13 @@ fn resolve_effective(
         paths: own_paths,
         lib: own_lib,
         target: own_target,
-        library_invalid: own_library_invalid,
+        defects: if own_compiler_options_malformed {
+            vec![ConfigDefect::MalformedCompilerOptions]
+        } else {
+            Vec::new()
+        },
     };
-    Some(inherited.overlay(own))
+    Ok(inherited.overlay(own))
 }
 
 /// `extends` may be a single string or (TS 5.0+) an array of strings applied left to right

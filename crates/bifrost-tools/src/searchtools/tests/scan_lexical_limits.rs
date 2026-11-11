@@ -38,9 +38,13 @@ fn c_label_source_at_byte_limit_is_scanned() {
             &context,
         );
         let entry = &result.results[0];
-        assert_eq!(entry.incomplete_reason, expected_reason, "{result:#?}");
+        assert_eq!(
+            entry.completion.incomplete_reason(),
+            expected_reason,
+            "{result:#?}"
+        );
         if expected_reason.is_none() {
-            assert!(entry.complete, "{result:#?}");
+            assert!(entry.completion.is_complete(), "{result:#?}");
             assert_eq!(entry.total_hits, Some(1), "{result:#?}");
         }
     }
@@ -130,7 +134,7 @@ fn candidate_file_limit_reports_candidate_files() {
     );
     assert_eq!(result.results.len(), 1, "{result:#?}");
     assert_eq!(
-        result.results[0].incomplete_reason,
+        result.results[0].completion.incomplete_reason(),
         Some(ScanUsagesIncompleteReason::CandidateFiles),
         "{result:#?}"
     );

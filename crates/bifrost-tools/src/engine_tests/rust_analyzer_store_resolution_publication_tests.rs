@@ -66,11 +66,11 @@ mod rust_departing_root_tests {
     const HOST: &str = "src/lib.rs";
 
     fn prepared(snapshot: &WorkspaceSnapshotId) -> PreparedParsedBlob {
-        let state = parsed_fixture_state(&RustAdapter, HOST, SOURCE);
+        let state = parsed_fixture_state(&RustAdapter::for_tests(), HOST, SOURCE);
         AnalyzerStore::prepare_parsed_blob(
             &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE.as_bytes()), "rust"),
             snapshot.generation,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             state,
         )
         .unwrap()
@@ -433,7 +433,7 @@ mod rust_departing_root_tests {
         let StoredCascadeCost::Known(replaced) = costs[0] else {
             panic!("complete fast replacement cost")
         };
-        let deleted_rows = store.conn.execute(|conn| {
+        let deleted_rows = store.conn.execute_fixture(|conn| {
         let tables = conn
             .prepare(
                 "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
@@ -517,12 +517,12 @@ mod rust_departing_root_tests {
             })
             .unwrap();
         let source = "pub fn caf\u{e9}() {}\npub fn entr\u{e9}e() { caf\u{e9}(); let na\u{ef}ve = 1; let _ = na\u{ef}ve; }\n";
-        let state = parsed_fixture_state(&RustAdapter, HOST, source);
+        let state = parsed_fixture_state(&RustAdapter::for_tests(), HOST, source);
         let oid = oid(source.as_bytes());
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
             snapshot.generation,
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             state,
         )
         .unwrap();
@@ -765,7 +765,7 @@ mod rust_departing_root_tests {
         let snapshot = owner(&store, '9');
         let witness = publish(&store, &snapshot).into_parts().0;
         let blob_id = witness.blob_id();
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
         conn.execute("INSERT INTO resolution_identities(identity_digest) VALUES(?1)", [[0xee_u8;32].as_slice()]).unwrap();
         let foreign_shared = conn.last_insert_rowid();
         let query = brokk_bifrost_analysis::analyzer::store::planner_statistics::pinned_plans::pinned("resolution_node_catalog_payload_by_key");
@@ -846,7 +846,7 @@ mod rust_departing_root_tests {
             let store = AnalyzerStore::open_ephemeral().unwrap();
             let snapshot = owner(&store, '7');
             let blob_id = publish(&store, &snapshot).witness().blob_id();
-            let measured_seek_steps = store.conn.execute(move |conn| {
+            let measured_seek_steps = store.conn.execute_fixture(move |conn| {
             // Relational access fixture only: this transaction is rolled back,
             // and no modified building fragment is admitted as complete.
             let tx=conn.unchecked_transaction().unwrap();
@@ -955,8 +955,8 @@ mod rust_departing_root_tests {
         let parsed = AnalyzerStore::prepare_parsed_blob(
             &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid(SOURCE.as_bytes()), "rust"),
             snapshot.generation,
-            &RustAdapter,
-            parsed_fixture_state(&RustAdapter, HOST, SOURCE),
+            &RustAdapter::for_tests(),
+            parsed_fixture_state(&RustAdapter::for_tests(), HOST, SOURCE),
         )
         .unwrap();
         let expected_projection_rows = parsed.rust_facts.logical_rows();
@@ -975,7 +975,7 @@ mod rust_departing_root_tests {
         .0;
         let blob_id = witness.blob_id();
         let raw_oid = witness.blob_oid().to_string();
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
         // Discover actual stored scalar types instead of copying production byte expressions.
         let mut projection_rows=0;
         let mut projection_bytes=0;

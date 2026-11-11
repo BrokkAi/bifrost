@@ -603,6 +603,8 @@ fn import_semantic_document(
             .cloned()
             .unwrap_or_else(|| symbol.id.clone());
         types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -1012,6 +1014,7 @@ fn import_semantic_document(
         .provenance_records
         .first()
         .map(|record| Provenance {
+            rust_artifact_approximation: None,
             source: record.producer.identifier.clone(),
             revision: record
                 .invocation_id
@@ -1019,6 +1022,7 @@ fn import_semantic_document(
                 .or_else(|| Some(record.producer.version.clone())),
         })
         .unwrap_or_else(|| Provenance {
+            rust_artifact_approximation: None,
             source: "csmi".to_owned(),
             revision: None,
         });
@@ -1303,6 +1307,9 @@ fn import_semantic_document(
         carried_sources: Vec::new(),
         cpp_portability,
         python_correspondence: None,
+        rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
         shards,
     };
     pack.python_correspondence = python_correspondence;
@@ -2798,6 +2805,8 @@ fn summary_from_csmi(
         concurrency_effects: Vec::new(),
         returned_callables: Vec::new(),
         declared_effects: Vec::new(),
+        subject_effects: Vec::new(),
+        lifecycle_coverage: Vec::new(),
         preconditions: None,
         result_contracts: Vec::new(),
         result_use_obligations: Vec::new(),
@@ -2914,6 +2923,8 @@ fn import_value_transfer_facts(
                     copy: None,
                     move_semantics: None,
                     drop_glue: None,
+                    drop_effects: None,
+                    drop_review: None,
                 });
                 match (payload.aspect, payload.semantics) {
                     (CsmiTypeValueSemanticsAspect::Copy, CsmiTypeSemantics::Trivial {}) => {

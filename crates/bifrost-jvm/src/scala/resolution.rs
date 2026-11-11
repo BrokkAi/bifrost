@@ -54,9 +54,52 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use crate::constructor_site::ConstructorSite;
+use crate::resolution_scan_index::ResolutionScanIndex;
 use crate::scala::imports::scala_export_info_from_node;
 use crate::scala::structural::{SCALA_STRUCTURAL_SPEC, scala_occurrence_role};
 use crate::scala::supertypes::{scala_self_type_lookup_nodes, scala_supertype_lookup_nodes};
+
+/// Scala templates, enum bodies and anonymous instance bodies.
+pub(crate) const SCALA_MEMBER_TYPE_CENSUS: crate::member_type_coverage::MemberTypeCensus =
+    crate::member_type_coverage::MemberTypeCensus {
+        type_bodies: &["template_body", "with_template_body", "enum_body"],
+        wrappers: &["enum_case_definitions"],
+        type_declarations: &[
+            "class_definition", "trait_definition", "enum_definition",
+            "type_definition",
+        ],
+        // An enum case is a member of the enum's companion, not of the enum
+        // class; the lowerer moves its member row to the companion.
+        non_type_members: &[
+            "object_definition", "simple_enum_case", "full_enum_case", "function_definition",
+            "function_declaration", "val_definition", "var_definition",
+            "val_declaration", "var_declaration", "given_definition",
+            "extension_definition", "import_declaration", "annotation", "modifiers",
+            "ascription_expression", "assignment_expression", "block", "boolean_literal",
+            "call_expression", "case_block", "character_literal", "do_while_expression",
+            "field_expression", "floating_point_literal", "for_expression",
+            "generic_function", "identifier", "if_expression", "infix_expression",
+            "instance_expression", "integer_literal", "interpolated_string_expression",
+            "lambda_expression", "macro_body", "match_expression", "method_value",
+            "null_literal", "operator_identifier", "parenthesized_expression",
+            "postfix_expression", "prefix_expression", "quote_expression",
+            "return_expression", "self_type", "splice_expression", "string",
+            "throw_expression", "try_expression", "tuple_expression", "unit",
+            "while_expression", "wildcard", "xml_expression",
+        ],
+        trivia: &["comment"],
+        opaque: &[
+            ("export_declaration", brokk_bifrost_core::analyzer::resolution_facts::MemberTypesOpenReason::ExportClause),
+            ("package_clause", brokk_bifrost_core::analyzer::resolution_facts::MemberTypesOpenReason::UnrecognizedForm),
+            ("package_object", brokk_bifrost_core::analyzer::resolution_facts::MemberTypesOpenReason::UnrecognizedForm),
+        ],
+        entry_bodies: &[],
+        declaration_site: scala_member_type_site,
+    };
+
+fn scala_member_type_site(declaration: Node<'_>) -> Option<Node<'_>> {
+    declaration_name(declaration).map(|_| declaration)
+}
 
 pub(super) struct ScalaResolutionExtraction {
     pub facts: FileResolutionFacts,
@@ -121,6 +164,7 @@ struct ScalaResolutionBuilder<'a, 'source> {
     source: &'source str,
     collector: &'a mut PrimarySourceFactCollector<'source>,
     facts: FileResolutionFacts,
+    scan_index: ResolutionScanIndex,
     site_occurrences: Vec<SourceOccurrenceId>,
     declaration_sources: Vec<(ResolutionSiteId, SourceDeclarationId)>,
     name_ids: HashMap<String, ResolutionNameId>,
@@ -130,6 +174,7 @@ struct ScalaResolutionBuilder<'a, 'source> {
     package_declarations: HashMap<usize, ResolutionSiteId>,
     scopes_by_node: HashMap<usize, ResolutionScopeId>,
     package_objects: Vec<(ResolutionSiteId, ResolutionScopeId)>,
+    member_type_bodies: Vec<crate::member_type_coverage::MemberTypeBody>,
     expression_slots_by_node: HashMap<usize, ResolutionTypeSlotId>,
     call_result_slots_by_node: HashMap<usize, ResolutionTypeSlotId>,
     qualified_type_prefixes: HashMap<usize, ResolutionSiteId>,
@@ -164,6 +209,7 @@ pub(super) fn extract_scala_resolution<'source>(
     parsed: &ParsedFile,
     source_declarations: &brokk_bifrost_core::analyzer::scala_facts::ScalaSourceFacts,
     collector: &mut PrimarySourceFactCollector<'source>,
+    package_contexts: &crate::scala::graph::syntax::ScalaPackageContextIndex,
 ) -> ScalaResolutionExtraction {
     let root_scope = ResolutionScopeId::new(0);
     let root_occurrence = collector.intern_node(root);
@@ -184,6 +230,7 @@ pub(super) fn extract_scala_resolution<'source>(
             }],
             ..FileResolutionFacts::default()
         },
+        scan_index: ResolutionScanIndex::default(),
         site_occurrences: Vec::new(),
         declaration_sources: Vec::new(),
         name_ids: HashMap::default(),
@@ -193,6 +240,7 @@ pub(super) fn extract_scala_resolution<'source>(
         package_declarations: HashMap::default(),
         scopes_by_node: HashMap::default(),
         package_objects: Vec::new(),
+        member_type_bodies: Vec::new(),
         expression_slots_by_node: HashMap::default(),
         call_result_slots_by_node: HashMap::default(),
         qualified_type_prefixes: HashMap::default(),
@@ -236,7 +284,40 @@ pub(super) fn extract_scala_resolution<'source>(
     // Companion relations and projected aliases must exist before regions are
     // copied from their canonical source declarations.
     builder.finish_access_boundaries(root, source_declarations);
+    // The AST package index is the authority at each exact reference site,
+    // including qualified heads and references outside declaration ranges.
+    let mut contexts = std::collections::BTreeMap::new();
+    for identifier in &builder.facts.identifiers {
+        if identifier.role != ResolutionIdentifierRole::Reference {
+            continue;
+        }
+        let site = &builder.facts.sites[identifier.site.index()];
+        if site.start_byte == site.end_byte || site.end_byte > source.len() {
+            continue;
+        }
+        let prefixes = package_contexts
+            .prefixes_at(site.start_byte as usize)
+            .to_vec();
+        if let Some(previous) = contexts.insert(identifier.site, prefixes.clone()) {
+            assert_eq!(previous, prefixes, "one package context per reference site");
+        }
+    }
+    builder.facts.lexical_package_contexts = contexts
+        .into_iter()
+        .map(|(reference, prefixes)| {
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionLexicalPackageContextFact {
+                reference,
+                prefixes,
+            }
+        })
+        .collect();
     builder.validate();
+    builder.facts.member_type_coverage = crate::member_type_coverage::member_type_coverage(
+        root,
+        &builder.member_type_bodies,
+        &builder.facts,
+        &SCALA_MEMBER_TYPE_CENSUS,
+    );
     crate::implicit_supertype::publish_written_supertype_names(&mut builder.facts);
     ScalaResolutionExtraction {
         facts: builder.facts,
@@ -822,6 +903,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 self.facts
                     .identifiers
                     .retain(|identifier| identifier.site != declared);
+                self.scan_index.invalidate_identifiers();
                 self.facts
                     .binders
                     .retain(|binder| binder.declaration != declared);
@@ -1797,6 +1879,21 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             let value = self.projected_identity_slot(site, namespace);
             self.expression_slots_by_node.insert(node.id(), value);
         }
+        if reads_value && !is_call_target(node) && !is_assignment_target(node) {
+            // SLS 2.13 6.26 Method Conversions: a bare term can bind a method
+            // before evaluation, implicit application, or eta expansion is
+            // decided. Preserve the no-list syntax; this is not `m()`.
+            let output = self.add_slot(site, ResolutionTypeSlotRole::ExpressionValue);
+            self.facts.binding_projections.push(BindingProjectionFact {
+                reference: site,
+                output,
+                kind: if bare_reference_has_no_expected_type(node, self.source) {
+                    BindingProjectionKind::BareTermBindingNoExpectedType
+                } else {
+                    BindingProjectionKind::BareTermBinding
+                },
+            });
+        }
         if let (Some(segments), Some(anchor)) = (qualified_route_segments, qualified_anchor) {
             if qualifier.is_some() {
                 self.gap(site, ResolutionGapKind::AmbiguousQualifiedType);
@@ -1809,6 +1906,72 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 false,
                 anchor,
             );
+        }
+        if qualifier.is_some()
+            && receiver.is_some_and(|receiver| {
+                if matches!(receiver.kind(), "call_expression" | "instance_expression") {
+                    let selected_slot = self
+                        .call_result_slots_by_node
+                        .get(&receiver.id())
+                        .or_else(|| self.expression_slots_by_node.get(&receiver.id()))
+                        .copied();
+                    return selected_slot == qualifier
+                        && selected_slot.is_some_and(|slot| {
+                            self.facts.type_slots[slot.index()].site != site
+                                && (self.call_result_slots_by_node.contains_key(&receiver.id())
+                                    || self.scan_index.has_transfer_output(
+                                        &self.facts,
+                                        slot,
+                                        ResolutionTypeTransferKind::Construction,
+                                    ))
+                        });
+                }
+                let mut current = receiver;
+                let mut expected =
+                    self.facts.type_slots[qualifier.expect("qualified receiver slot").index()].site;
+                loop {
+                    let node = if current.kind() == "field_expression" {
+                        let Some(field) = current.child_by_field_name("field") else {
+                            return false;
+                        };
+                        field
+                    } else if current.kind() == "identifier" {
+                        current
+                    } else {
+                        return false;
+                    };
+                    let Some(&segment) = self.sites_by_node.get(&node.id()) else {
+                        return false;
+                    };
+                    if segment != expected {
+                        return false;
+                    }
+                    let Some(identifier_qualifier) = self.scan_index.first_qualifier(
+                        &self.facts,
+                        segment,
+                        ResolutionIdentifierRole::Reference,
+                    ) else {
+                        return false;
+                    };
+                    if current.kind() == "identifier" {
+                        return true;
+                    }
+                    let Some(next) = current.child_by_field_name("value") else {
+                        return false;
+                    };
+                    let Some(slot) = identifier_qualifier else {
+                        return false;
+                    };
+                    expected = self.facts.type_slots[slot.index()].site;
+                    current = next;
+                }
+            })
+            && !self.scan_index.has_root(&self.facts, site)
+        {
+            // Each lexical segment or completed call/construction has its own
+            // selected slot feeding this site's qualifier. This site owns no
+            // root route; explicit roots above remain authoritative.
+            self.facts.typed_receiver_prefix_absences.push(site);
         }
         if namespace == ResolutionNamespace::Callable {
             self.facts
@@ -2422,6 +2585,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                 ResolutionNamespace::Type,
                 ResolutionNamespace::Value,
                 ResolutionNamespace::Callable,
+                ResolutionNamespace::Package,
             ] {
                 self.facts
                     .root_import_demands
@@ -2637,6 +2801,29 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
         });
         self.scope_ranges.push(node_range(node));
         self.scopes_by_node.insert(node.id(), id);
+        if kind == ResolutionScopeKind::TypeBody {
+            let canonical_owner =
+                anonymous_owner.or_else(|| self.declaration_sites.get(&node.id()).copied());
+            if let Some(owner) = canonical_owner {
+                let body = if anonymous_owner.is_some() {
+                    Some(node)
+                } else {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor).find(|child| {
+                        matches!(
+                            child.kind(),
+                            "template_body" | "with_template_body" | "enum_body"
+                        )
+                    })
+                };
+                if let Some(body) = body {
+                    self.member_type_bodies
+                        .push(crate::member_type_coverage::MemberTypeBody::new(
+                            owner, body,
+                        ));
+                }
+            }
+        }
         if node.kind() == "package_object"
             && let Some(package_object) = self.declaration_sites.get(&node.id()).copied()
         {
@@ -3105,6 +3292,7 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
     /// select.
     fn finish_super_receivers(&mut self) {
         let pending = std::mem::take(&mut self.super_receivers);
+        self.scan_index.invalidate_super_receivers();
         for (owner, receiver) in pending {
             let site = self.facts.type_slots[receiver.index()].site;
             let references = self
@@ -3571,6 +3759,11 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     .collect::<Vec<_>>()
             });
             companions.insert(enum_site, (companion, scope, node, route));
+            // The companion's member types include the cases written in the
+            // enum body, which its own body census does not see, so it gets
+            // no coverage claim.
+            self.member_type_bodies
+                .retain(|body| body.owner() != companion);
         }
         // Only cases are static members of the companion. Written enum
         // methods and fields remain instance members of the enum class.
@@ -3985,6 +4178,11 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
             ResolutionNamespace::Constructor,
             Some(constructed_type),
         );
+        if matches!(head.kind(), "identifier" | "type_identifier") {
+            // The simple constructed type is resolved by constructed_type;
+            // constructor lookup has no second lexical prefix of its own.
+            self.facts.typed_receiver_prefix_absences.push(callee);
+        }
         self.gap(callee, ResolutionGapKind::UnsupportedCallApplicability);
         self.facts
             .reference_owners
@@ -4513,6 +4711,37 @@ impl<'collector, 'source> ScalaResolutionBuilder<'collector, 'source> {
                     addressable: false,
                 },
             });
+            // SLS 2.13 section 6.26.2 (Method Conversions, Evaluation): a
+            // parameterless method of type => T evaluates to T at a bare use.
+            // An empty parameter list, type parameters, or an extension receiver
+            // instead needs application or type inference evidence.
+            let mut parameter_cursor = node.walk();
+            let has_parameter_list = node
+                .children_by_field_name("parameters", &mut parameter_cursor)
+                .any(|child| child.kind() == "parameters");
+            if !has_parameter_list
+                && type_parameter_count(node) == 0
+                && enclosing_extension_definition(node).is_none()
+            {
+                let evaluated = self.add_slot(callable, ResolutionTypeSlotRole::DeclaredValue);
+                self.facts
+                    .declaration_type_slots
+                    .push(DeclarationTypeSlotFact {
+                        declaration: callable,
+                        slot: evaluated,
+                        role: DeclarationTypeRole::EvaluatedValue,
+                    });
+                self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                    input,
+                    output: evaluated,
+                    kind: ResolutionTypeTransferKind::DeclaredType,
+                    indirection_delta: 0,
+                    reference_indirection_delta: 0,
+                    value_transform: ResolutionTypeTransferValueTransform::ToRuntime {
+                        addressable: false,
+                    },
+                });
+            }
             let signature = self
                 .facts
                 .callable_signatures
@@ -7230,6 +7459,57 @@ fn is_call_target(node: Node<'_>) -> bool {
     false
 }
 
+fn is_assignment_target(node: Node<'_>) -> bool {
+    let mut expression = node;
+    while let Some(parent) = expression.parent() {
+        if parent.kind() == "field_expression"
+            && parent.child_by_field_name("field") == Some(expression)
+        {
+            expression = parent;
+            continue;
+        }
+        return parent.kind() == "assignment_expression"
+            && !is_named_argument(parent)
+            && parent.child_by_field_name("left") == Some(expression);
+    }
+    false
+}
+
+fn bare_reference_has_no_expected_type(node: Node<'_>, source: &str) -> bool {
+    let mut expression = node;
+    while let Some(parent) = expression.parent() {
+        match parent.kind() {
+            "parenthesized_expression" => expression = parent,
+            "field_expression" if parent.child_by_field_name("field") == Some(expression) => {
+                expression = parent;
+            }
+            "field_expression" => {
+                return parent.child_by_field_name("value") == Some(expression);
+            }
+            "infix_expression" => {
+                // SLS 2.13 6.12.3: a colon-ending infix operator is applied
+                // on the right operand, so the left operand is an argument
+                // and may receive its formal's expected type. The right
+                // operand of a left-associative operator is likewise an
+                // argument; neither earns a no-expected-type certificate.
+                return parent.child_by_field_name("left") == Some(expression)
+                    && super::graph::syntax::infix_operator(source, parent)
+                        .is_some_and(|operator| !operator.ends_with(':'));
+            }
+            "val_definition" | "var_definition" => {
+                return parent.child_by_field_name("value") == Some(expression)
+                    && parent.child_by_field_name("type").is_none();
+            }
+            "block" | "indented_block" => {
+                return expression.next_named_sibling().is_some();
+            }
+            "template_body" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn scala_callable_receiver_origin(node: Node<'_>) -> ResolutionCallableReceiverOrigin {
     let receiver = node
         .parent()
@@ -7564,6 +7844,15 @@ fn enclosing_extension_definition(mut node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_type_census_classifies_every_scala_type_body_member() {
+        crate::member_type_coverage::assert_census_covers_grammar(
+            brokk_tree_sitter_scala::NODE_TYPES,
+            &SCALA_MEMBER_TYPE_CENSUS,
+        );
+    }
+
     use brokk_bifrost_core::analyzer::model::ProjectFile;
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
@@ -9935,6 +10224,9 @@ object Writes {
             facts.sites[named.site.index()].kind,
             ResolutionSiteKind::CallableDeclaration
         );
+        assert!(facts.declaration_type_slots.iter().any(|slot| {
+            slot.declaration == named.site && slot.role == DeclarationTypeRole::EvaluatedValue
+        }));
         assert!(facts.binders.iter().any(|binder| {
             binder.declaration == named.site && binder.kind == ResolutionBinderKind::Callable
         }));
@@ -10812,5 +11104,42 @@ object Writes {
             owner_segments(nested_apply),
             ["example", "Outer$NestedCase$"]
         );
+    }
+    #[test]
+    #[hardwon(
+        "#6792: right-associative infix arguments must not prune eta-compatible bare methods"
+    )]
+    fn right_associative_infix_argument_keeps_expected_type_open() {
+        // SLS 2.13 6.12.3: `+:` is invoked on `sink`, with `choose` as
+        // its by-name argument. The formal can supply a function expected
+        // type, so the parameterized `choose` must remain available.
+        let source = r#"object Infix {
+  def choose: String = "value"
+  def choose(x: Int): String = x.toString
+  object sink {
+    def +:(f: => (Int => String)): String = f(1)
+  }
+  val result = choose +: sink
+}"#;
+        let parsed = parse(source);
+        let facts = &parsed.resolution_facts;
+        let start = source.find("choose +: sink").expect("infix argument");
+        let reference = facts
+            .identifiers
+            .iter()
+            .find(|identifier| {
+                identifier.role == ResolutionIdentifierRole::Reference
+                    && facts.sites[identifier.site.index()].start_byte == start
+            })
+            .expect("bare method reference")
+            .site;
+        assert!(facts.binding_projections.iter().any(|projection| {
+            projection.reference == reference
+                && projection.kind == BindingProjectionKind::BareTermBinding
+        }));
+        assert!(!facts.binding_projections.iter().any(|projection| {
+            projection.reference == reference
+                && projection.kind == BindingProjectionKind::BareTermBindingNoExpectedType
+        }));
     }
 }

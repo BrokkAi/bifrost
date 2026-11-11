@@ -12,6 +12,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct JavascriptKnowledge;
 
 impl LanguageKnowledge for JavascriptKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }
@@ -77,6 +83,12 @@ impl LanguageKnowledge for JavascriptKnowledge {
 pub struct TypescriptKnowledge;
 
 impl LanguageKnowledge for TypescriptKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }

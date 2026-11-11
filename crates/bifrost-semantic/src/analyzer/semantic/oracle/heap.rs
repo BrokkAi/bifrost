@@ -47,6 +47,8 @@ use crate::analyzer::semantic::oracle::relation::validate_retained_relation_aren
 pub enum AliasRelation {
     MustAlias,
     MayAlias,
+    /// The paths cannot denote the same logical referent at this observation.
+    /// This does not prove distinct numeric addresses or unequal pointers.
     Disjoint,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

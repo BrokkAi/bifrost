@@ -14,6 +14,7 @@ use crate::analyzer::semantic_model::model::CallableValuesFamily;
 use crate::analyzer::semantic_model::validate::is_canonical_relative_path;
 use crate::analyzer::store::SemanticPackActivationSourceKind;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::*;
+use brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen;
 use rusqlite::Connection;
 use rusqlite::params;
 use serde::Deserialize;
@@ -726,6 +727,14 @@ pub enum CatalogPackSourceKind {
 }
 
 impl CatalogPackSourceKind {
+    pub const fn shard_database(self) -> super::active_models::CatalogShardDatabase {
+        use super::active_models::CatalogShardDatabase;
+        match self {
+            Self::Embedded | Self::EphemeralWorkspace => CatalogShardDatabase::Session,
+            _ => CatalogShardDatabase::Durable,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Installed => "installed",
@@ -777,6 +786,195 @@ impl From<SessionPackSourceKind> for CatalogPackSourceKind {
     }
 }
 
+/// Open a private active view over a durable catalog and its shared session rows.
+pub fn open_active_reader_connection(
+    root: &std::path::Path,
+    session_catalog: &Mutex<Option<SessionSemanticCatalog>>,
+) -> Result<Connection, CatalogError> {
+    let mut session = session_catalog
+        .lock()
+        .expect("session semantic catalog mutex poisoned");
+    if session.is_none() {
+        *session = Some(open_session_semantic_catalog()?);
+    }
+    let connection = brokk_bifrost_semantic::analyzer::semantic_model::catalog::db::open(
+        root,
+        CatalogOpenMode::ReadOnly,
+    )?;
+    brokk_bifrost_core::cache_db::sql_profile::install_catalog_active(&connection);
+    // db::open also sets query_only, which forbids TEMP writes. The main
+    // file remains protected by SQLITE_OPEN_READ_ONLY; membership is TEMP.
+    connection
+        .pragma_update(None, "query_only", false)
+        .map_err(|error| CatalogError::sqlite("enable active TEMP membership", error))?;
+    rows::attach_session_rows(
+        &connection,
+        session.as_ref().expect("session catalog initialized"),
+    )?;
+    Ok(connection)
+}
+
+/// Validation witness for a prepared pinned-reader connection. File identities
+/// are process-local witnesses, never persisted cache identities.
+#[derive(Clone)]
+pub struct PinnedReaderValidation {
+    files: Vec<(
+        PathBuf,
+        Option<brokk_bifrost_core::content_digest::FileIdentity>,
+    )>,
+    versions: (i64, i64),
+}
+
+impl PinnedReaderValidation {
+    pub fn capture(connection: &Connection) -> Result<Self, CatalogError> {
+        let files = connection
+            .prepare("PRAGMA database_list")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| CatalogError::sqlite("list pinned reader databases", error))?
+            .into_iter()
+            .filter(|(name, _)| name == "main" || name == "session")
+            .map(|(_, path)| PathBuf::from(path))
+            .collect::<Vec<_>>();
+        let files = Self::capture_files(files)?;
+        assert_eq!(files.len(), 2, "pinned reader attaches main and session");
+        Ok(Self {
+            files,
+            versions: Self::versions(connection)?,
+        })
+    }
+
+    fn capture_files(
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<
+        Vec<(
+            PathBuf,
+            Option<brokk_bifrost_core::content_digest::FileIdentity>,
+        )>,
+        CatalogError,
+    > {
+        paths
+            .into_iter()
+            .map(|path| {
+                let metadata = std::fs::metadata(&path).map_err(|error| {
+                    CatalogError::Integrity(format!(
+                        "stat pinned reader database {path:?}: {error}"
+                    ))
+                })?;
+                Ok((
+                    path,
+                    brokk_bifrost_core::content_digest::file_identity(&metadata),
+                ))
+            })
+            .collect()
+    }
+
+    fn versions(connection: &Connection) -> Result<(i64, i64), CatalogError> {
+        // SQLite's table-valued user_version pragma accepts no schema argument.
+        // Qualifying the virtual table still reads main, so use explicit pragmas.
+        let main = connection
+            .query_row("PRAGMA main.user_version", [], |row| row.get(0))
+            .map_err(|error| CatalogError::sqlite("validate main catalog version", error))?;
+        let session = connection
+            .query_row("PRAGMA session.user_version", [], |row| row.get(0))
+            .map_err(|error| CatalogError::sqlite("validate session catalog version", error))?;
+        Ok((main, session))
+    }
+
+    /// A false result discards the prepared connection before starting a read.
+    pub fn matches(&self, connection: &Connection) -> Result<bool, CatalogError> {
+        if Self::versions(connection)? != self.versions {
+            return Ok(false);
+        }
+        for (path, recorded) in &self.files {
+            // Unsupported platforms/files have unknown identity. In that case
+            // user_version is the only available validation witness.
+            if let Some(recorded) = recorded {
+                let current = std::fs::metadata(path).map_err(|error| {
+                    CatalogError::Integrity(format!(
+                        "stat pinned reader database {path:?}: {error}"
+                    ))
+                })?;
+                if brokk_bifrost_core::content_digest::file_identity(&current).as_ref()
+                    != Some(recorded)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Prepare request-independent TEMP schema for a pinned reader. No read
+/// transaction is held until the caller begins and pins its own snapshot.
+pub fn prepare_pinned_reader_connection(
+    root: &std::path::Path,
+    session_catalog: &Mutex<Option<SessionSemanticCatalog>>,
+) -> Result<Connection, CatalogError> {
+    prepare_validated_pinned_reader_connection(root, session_catalog)
+        .map(|(connection, _)| connection)
+}
+
+/// Preserve the replacement guard's witness through checkout and check-in.
+pub fn prepare_validated_pinned_reader_connection(
+    root: &std::path::Path,
+    session_catalog: &Mutex<Option<SessionSemanticCatalog>>,
+) -> Result<(Connection, PinnedReaderValidation), CatalogError> {
+    for _attempt in 0..2 {
+        let session_path = {
+            let mut session = session_catalog
+                .lock()
+                .expect("session semantic catalog mutex poisoned");
+            if session.is_none() {
+                *session = Some(open_session_semantic_catalog()?);
+            }
+            session
+                .as_ref()
+                .expect("session catalog initialized")
+                .path
+                .clone()
+        };
+        let before =
+            PinnedReaderValidation::capture_files([root.join("catalog.db"), session_path])?;
+        let connection = prepare_pinned_reader_connection_once(root, session_catalog)?;
+        let after = PinnedReaderValidation::capture(&connection)?;
+        // Comparing paths as well as file identities also detects replacement of
+        // the session catalog while preparation was outside its owner lock.
+        if before == after.files && after.matches(&connection)? {
+            return Ok((connection, after));
+        }
+        // Drop the suspect handle before retrying the complete preparation.
+    }
+    Err(CatalogError::Unavailable)
+}
+
+fn prepare_pinned_reader_connection_once(
+    root: &std::path::Path,
+    session_catalog: &Mutex<Option<SessionSemanticCatalog>>,
+) -> Result<Connection, CatalogError> {
+    let connection = open_active_reader_connection(root, session_catalog)?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .map_err(|error| CatalogError::sqlite("bound pinned catalog wait", error))?;
+    connection
+        .execute_batch(
+            "CREATE TEMP TABLE expected_catalog_shards(
+            ordinal INTEGER NOT NULL, kind TEXT NOT NULL,
+            production_digest TEXT, manifest_digest TEXT,
+            shard_key INTEGER, status TEXT NOT NULL
+            CHECK(status IN ('present','missing','quarantined','stale'))
+        ) STRICT",
+        )
+        .map_err(|error| CatalogError::sqlite("create expected membership", error))?;
+    Ok(connection)
+}
+
 /// A cloneable SQL-only bridge for active runtime publication.
 ///
 /// The reader owns fixed database handles and, for an ephemeral catalog, the
@@ -784,9 +982,212 @@ impl From<SessionPackSourceKind> for CatalogPackSourceKind {
 /// workspace-sized source index.
 #[derive(Clone)]
 pub struct CatalogRuntimeSourceReader {
+    pub root: PathBuf,
     pub connection: Arc<Mutex<Connection>>,
     pub session_catalog: Arc<Mutex<Option<SessionSemanticCatalog>>>,
     pub _ephemeral_root: Option<Arc<TempDir>>,
+}
+
+/// One statement's column names and values, released from the reader lock.
+#[derive(Debug)]
+pub struct OwnedCatalogRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<rusqlite::types::Value>>,
+}
+
+pub struct OwnedCatalogRow<'a> {
+    columns: &'a [String],
+    values: &'a [rusqlite::types::Value],
+}
+
+pub trait OwnedCatalogColumn {
+    fn position(self, columns: &[String]) -> rusqlite::Result<usize>;
+}
+
+impl OwnedCatalogColumn for usize {
+    fn position(self, columns: &[String]) -> rusqlite::Result<usize> {
+        if self < columns.len() {
+            Ok(self)
+        } else {
+            Err(rusqlite::Error::InvalidColumnIndex(self))
+        }
+    }
+}
+
+impl OwnedCatalogColumn for &str {
+    fn position(self, columns: &[String]) -> rusqlite::Result<usize> {
+        columns
+            .iter()
+            .position(|column| column == self)
+            .ok_or_else(|| rusqlite::Error::InvalidColumnName(self.to_owned()))
+    }
+}
+
+impl<'a> OwnedCatalogRow<'a> {
+    pub fn column_index(&self, name: &str) -> rusqlite::Result<usize> {
+        name.position(self.columns)
+    }
+
+    pub fn get<I: OwnedCatalogColumn, T: rusqlite::types::FromSql>(
+        &self,
+        index: I,
+    ) -> rusqlite::Result<T> {
+        let index = index.position(self.columns)?;
+        let value = rusqlite::types::ValueRef::from(&self.values[index]);
+        T::column_result(value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+        })
+    }
+}
+
+impl OwnedCatalogRows {
+    pub fn iter(&self) -> impl Iterator<Item = OwnedCatalogRow<'_>> {
+        self.rows.iter().map(|values| OwnedCatalogRow {
+            columns: &self.columns,
+            values,
+        })
+    }
+}
+
+/// Bindings use names because catalog questions are shared by both readers.
+pub trait CatalogRowReader: Send + Sync {
+    /// Missing coordinates admitted for this request; never selection records.
+    fn jvm_unresolved_coordinates(&self) -> &[String] {
+        &[]
+    }
+
+    fn owned_rows(
+        &self,
+        statement: &str,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedCatalogRows, CatalogError>;
+}
+
+/// Identity of the catalog rows visible to one JVM request reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReaderBinding(pub [u8; 32]);
+
+#[derive(Clone)]
+pub struct RequestRowReader {
+    pub reader: Arc<dyn CatalogRowReader + Send + Sync>,
+    pub binding: ReaderBinding,
+}
+
+/// The owner of a request's JVM-family catalog rows (#9559). It never creates a request.
+pub trait RequestRowReaderSource: std::fmt::Debug + Send + Sync {
+    fn identity(&self) -> Option<[u8; 32]> {
+        None
+    }
+    /// Whether this source hands back the activation reader itself, so the
+    /// activation owner also owns the request-owned shards.
+    fn reads_through_activation(&self) -> bool {
+        false
+    }
+    fn jvm_reader(
+        &self,
+        activation: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+    ) -> Result<RequestRowReader, FamilyOpen>;
+}
+
+#[derive(Debug)]
+pub struct RefusingRowReaderSource {
+    pub reason: FamilyOpen,
+}
+
+impl RequestRowReaderSource for RefusingRowReaderSource {
+    fn identity(&self) -> Option<[u8; 32]> {
+        Some(
+            brokk_bifrost_core::analyzer::canonical_hash::hash_domain_bytes(
+                b"jvm-refusing-row-source-v1",
+                self.reason.reason.as_bytes(),
+            ),
+        )
+    }
+    fn jvm_reader(
+        &self,
+        _activation: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+    ) -> Result<RequestRowReader, FamilyOpen> {
+        Err(self.reason)
+    }
+}
+
+/// The 3b-3 placeholder: every shard stays on the activation reader until
+/// sub-step (e) replaces this with the request's pinned reader.
+#[derive(Debug)]
+pub struct ActivationRowReaderSource {
+    reader: Arc<CatalogRuntimeSourceReader>,
+    binding: ReaderBinding,
+}
+
+impl ActivationRowReaderSource {
+    pub fn new(reader: Arc<CatalogRuntimeSourceReader>, active_model_set_hash: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"activation-row-reader-v1");
+        digest.update(active_model_set_hash.as_bytes());
+        Self {
+            reader,
+            binding: ReaderBinding(digest.finalize().into()),
+        }
+    }
+}
+
+impl RequestRowReaderSource for ActivationRowReaderSource {
+    fn reads_through_activation(&self) -> bool {
+        true
+    }
+    fn jvm_reader(
+        &self,
+        _activation: &crate::analyzer::store::active_models::ResolvedActiveSemanticModels,
+    ) -> Result<RequestRowReader, FamilyOpen> {
+        Ok(RequestRowReader {
+            reader: self.reader.clone(),
+            binding: self.binding,
+        })
+    }
+}
+
+impl CatalogRowReader for CatalogRuntimeSourceReader {
+    fn owned_rows(
+        &self,
+        statement: &str,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedCatalogRows, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("active semantic reader mutex poisoned");
+        let mut query = connection
+            .prepare_cached(statement)
+            .map_err(|error| CatalogError::sqlite("prepare semantic scalar question", error))?;
+        let columns = query
+            .column_names()
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>();
+        let mut cursor = query
+            .query(bindings)
+            .map_err(|error| CatalogError::sqlite("query semantic scalar question", error))?;
+        let mut rows = Vec::new();
+        while let Some(row) = cursor
+            .next()
+            .map_err(|error| CatalogError::sqlite("step semantic scalar question", error))?
+        {
+            if cancellation.is_cancelled() {
+                return Err(CatalogError::Cancelled);
+            }
+            let mut values = Vec::with_capacity(columns.len());
+            for index in 0..columns.len() {
+                values.push(row.get(index).map_err(|error| {
+                    CatalogError::sqlite("read semantic scalar question", error)
+                })?);
+            }
+            rows.push(values);
+        }
+        Ok(OwnedCatalogRows { columns, rows })
+    }
 }
 
 impl fmt::Debug for CatalogRuntimeSourceReader {
@@ -805,32 +1206,64 @@ pub struct CatalogRawRecord<T> {
 }
 
 /// A published active set has no per-question recovery from lost storage.
-/// Never turn a failed read into a pack-blind empty semantic answer.
+/// Never turn a failed read into a pack-blind empty semantic answer. An open
+/// JVM-family part is not lost storage: it is returned so the caller can carry
+/// it in its typed result.
 pub fn semantic_catalog_question<T>(
     statement: &str,
     key: impl fmt::Debug,
     answer: Result<T, CatalogError>,
-) -> T {
-    answer.unwrap_or_else(|error| {
-        panic!("active semantic question {statement}, key {key:?}: {error:?}")
-    })
+) -> Result<T, FamilyOpen> {
+    match answer {
+        Ok(answer) => Ok(answer),
+        Err(CatalogError::FamilyOpen(open)) => Err(open),
+        Err(CatalogError::Cancelled) => Err(FamilyOpen::jvm_cancelled()),
+        Err(error) => panic!("active semantic question {statement}, key {key:?}: {error:?}"),
+    }
 }
 
-impl CatalogRuntimeSourceReader {
+/// Bounded questions are limited by their bindings, and their callers observe
+/// cancellation between questions, so a bounded question itself never stops.
+static UNCANCELLED_QUESTION: std::sync::LazyLock<CancellationToken> =
+    std::sync::LazyLock::new(CancellationToken::new);
+
+/// Decoding shared by every catalog row reader, so the activation and a
+/// request's pinned reader answer one statement identically.
+impl dyn CatalogRowReader + '_ {
+    pub fn payload_family_presence(
+        &self,
+        identity: super::active_models::CatalogShardRowIdentity,
+        family: brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily,
+    ) -> Result<bool, CatalogError> {
+        let source = match identity.database {
+            super::active_models::CatalogShardDatabase::Durable => "durable",
+            super::active_models::CatalogShardDatabase::Session => "session",
+        };
+        let rows = self.owned_rows(
+            statements::PAYLOAD_FAMILY_PRESENCE,
+            rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key,
+            ":family": family.as_str() },
+            &UNCANCELLED_QUESTION,
+        )?;
+        rows.iter()
+            .next()
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+            .and_then(|row| row.get(0))
+            .map_err(|error| CatalogError::sqlite("read semantic payload family presence", error))
+    }
     /// Decode the result of one named product statement. Nothing is retained
     /// across questions. Source database is part of every physical row identity.
     pub fn raw_records<T: serde::de::DeserializeOwned>(
         &self,
         statement: &str,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
         shards: &[Arc<super::active_models::ActiveSemanticModelShard>],
     ) -> Result<Vec<CatalogRawRecord<T>>, CatalogError> {
         self.raw_rows(statement, bindings, shards, |row| {
             let json: String = row.get("record_json")?;
             serde_json::from_str(&json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    row.as_ref()
-                        .column_index("record_json")
+                    row.column_index("record_json")
                         .expect("record column exists"),
                     rusqlite::types::Type::Text,
                     Box::new(error),
@@ -839,29 +1272,47 @@ impl CatalogRuntimeSourceReader {
         })
     }
 
-    /// Stream scalar columns until the visitor has its answer or is cancelled.
-    /// The visitor must not issue another question on this same connection.
-    pub fn visit_scalar_rows(
+    /// Request-local scalar projections which do not publish record handles.
+    pub fn scalar_question<T>(
         &self,
         statement: &str,
-        bindings: impl rusqlite::Params,
-        mut visit: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<bool>,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
+        mut read: impl FnMut(&OwnedCatalogRow<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>, CatalogError> {
+        self.owned_rows(statement, bindings, &UNCANCELLED_QUESTION)?
+            .iter()
+            .map(|row| {
+                read(&row)
+                    .map_err(|error| CatalogError::sqlite("read semantic scalar question", error))
+            })
+            .collect()
+    }
+
+    /// Visit one statement's rows after the reader has released them, so the
+    /// visitor never runs under a reader lock. The reader observes
+    /// `cancellation` between rows; a read the caller cancelled visits nothing,
+    /// and the caller observes its own token afterwards.
+    pub fn visit_owned_rows(
+        &self,
+        statement: &str,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
+        cancellation: Option<&CancellationToken>,
+        mut visit: impl FnMut(&OwnedCatalogRow<'_>) -> rusqlite::Result<bool>,
     ) -> Result<(), CatalogError> {
-        let connection = self
-            .connection
-            .lock()
-            .expect("active semantic reader mutex poisoned");
-        let mut query = connection
-            .prepare_cached(statement)
-            .map_err(|error| CatalogError::sqlite("prepare semantic scalar question", error))?;
-        let mut rows = query
-            .query(bindings)
-            .map_err(|error| CatalogError::sqlite("query semantic scalar question", error))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| CatalogError::sqlite("step semantic scalar question", error))?
-        {
-            if !visit(row)
+        let rows = match self.owned_rows(
+            statement,
+            bindings,
+            cancellation.unwrap_or(&UNCANCELLED_QUESTION),
+        ) {
+            Err(CatalogError::Cancelled)
+                if cancellation.is_some_and(CancellationToken::is_cancelled) =>
+            {
+                return Ok(());
+            }
+            rows => rows?,
+        };
+        for row in rows.iter() {
+            if !visit(&row)
                 .map_err(|error| CatalogError::sqlite("read semantic scalar question", error))?
             {
                 break;
@@ -870,40 +1321,19 @@ impl CatalogRuntimeSourceReader {
         Ok(())
     }
 
-    /// Request-local scalar projections which do not publish record handles.
-    pub fn scalar_question<T>(
-        &self,
-        statement: &str,
-        bindings: impl rusqlite::Params,
-        mut read: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-    ) -> Result<Vec<T>, CatalogError> {
-        let mut result = Vec::new();
-        self.visit_scalar_rows(statement, bindings, |row| {
-            result.push(read(row)?);
-            Ok(true)
-        })?;
-        Ok(result)
-    }
-
     /// Column-only questions (relations, names and payload projections) use the
     /// same active-set/metadata join without inventing persisted JSON records.
     pub fn raw_rows<T>(
         &self,
         statement: &str,
-        bindings: impl rusqlite::Params,
+        bindings: &[(&str, &dyn rusqlite::ToSql)],
         shards: &[Arc<super::active_models::ActiveSemanticModelShard>],
-        decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        decode: impl Fn(&OwnedCatalogRow<'_>) -> rusqlite::Result<T>,
     ) -> Result<Vec<CatalogRawRecord<T>>, CatalogError> {
         use super::active_models::CatalogShardDatabase;
-        let connection = self
-            .connection
-            .lock()
-            .expect("active semantic reader mutex poisoned");
-        let mut query = connection
-            .prepare_cached(statement)
-            .map_err(|error| CatalogError::sqlite("prepare raw semantic question", error))?;
-        let rows = query
-            .query_map(bindings, |row| {
+        self.owned_rows(statement, bindings, &UNCANCELLED_QUESTION)?
+            .iter()
+            .map(|row| {
                 let source: String = row.get("source_db")?;
                 let shard_key: i64 = row.get("shard_key")?;
                 let database = match source.as_str() {
@@ -920,12 +1350,13 @@ impl CatalogRuntimeSourceReader {
                     })
                     .expect("active row belongs to selected shard metadata");
                 Ok(CatalogRawRecord {
-                    record: Arc::new(decode(row)?),
+                    record: Arc::new(decode(&row)?),
                     shard: Arc::clone(&shard.metadata),
                 })
             })
-            .map_err(|error| CatalogError::sqlite("query raw semantic records", error))?;
-        rows.map(|row| row.map_err(|error| CatalogError::sqlite("read raw semantic record", error)))
+            .map(|record: rusqlite::Result<_>| {
+                record.map_err(|error| CatalogError::sqlite("read raw semantic record", error))
+            })
             .collect()
     }
 
@@ -1027,21 +1458,18 @@ impl CatalogRuntimeSourceReader {
             CatalogShardDatabase::Durable => "durable",
             CatalogShardDatabase::Session => "session",
         };
-        let connection = self
-            .connection
-            .lock()
-            .expect("active semantic reader mutex poisoned");
-        let mut query = connection
-            .prepare_cached(statement)
-            .map_err(|error| CatalogError::sqlite("prepare summary shard order", error))?;
-        let rows = query
-            .query_map(
-                rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key },
-                |row| Ok((row.get("model_id")?, row.get("record_id")?)),
-            )
-            .map_err(|error| CatalogError::sqlite("query summary shard order", error))?;
-        rows.map(|row| row.map_err(|error| CatalogError::sqlite("read summary shard order", error)))
-            .collect()
+        self.owned_rows(
+            statement,
+            rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key },
+            &UNCANCELLED_QUESTION,
+        )?
+        .iter()
+        .map(|row| {
+            row.get("model_id")
+                .and_then(|model_id| Ok((model_id, row.get("record_id")?)))
+                .map_err(|error| CatalogError::sqlite("read summary shard order", error))
+        })
+        .collect()
     }
 
     /// Exact payload presence, including present-empty payloads, from the marker.
@@ -1049,29 +1477,41 @@ impl CatalogRuntimeSourceReader {
         &self,
         identity: super::active_models::CatalogShardRowIdentity,
     ) -> Result<bool, CatalogError> {
-        self.payload_family_presence(identity,
+        (self as &dyn CatalogRowReader).payload_family_presence(identity,
             brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily::CallableValues)
     }
+}
 
-    pub fn payload_family_presence(
+/// Callable-value and Go source reads run several bounded statements on the
+/// activation's own connection. They are not JVM row reads, so they stay on
+/// the activation reader.
+impl CatalogRuntimeSourceReader {
+    /// Reopen an independent view using already admitted shard identities.
+    /// Existing readers retain their original membership.
+    pub fn reopen_with_shard_keys(
         &self,
-        identity: super::active_models::CatalogShardRowIdentity,
-        family: brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily,
-    ) -> Result<bool, CatalogError> {
-        let source = match identity.database {
-            super::active_models::CatalogShardDatabase::Durable => "durable",
-            super::active_models::CatalogShardDatabase::Session => "session",
-        };
-        self.connection
-            .lock()
-            .expect("catalog reader mutex poisoned")
-            .query_row(
-                statements::PAYLOAD_FAMILY_PRESENCE,
-                rusqlite::named_params! { ":source_db": source, ":shard_key": identity.shard_key,
-                ":family": family.as_str() },
-                |row| row.get(0),
-            )
-            .map_err(|error| CatalogError::sqlite("read semantic payload family presence", error))
+        shards: impl IntoIterator<Item = crate::analyzer::store::active_models::CatalogShardRowIdentity>,
+    ) -> Result<Self, CatalogError> {
+        use crate::analyzer::store::active_models::CatalogShardDatabase;
+        let connection = open_active_reader_connection(&self.root, &self.session_catalog)?;
+        for shard in shards {
+            let source = match shard.database {
+                CatalogShardDatabase::Durable => "durable",
+                CatalogShardDatabase::Session => "session",
+            };
+            connection
+                .execute(
+                    "INSERT INTO temp.active_shards(source_db, shard_key) VALUES (?1, ?2)",
+                    params![source, shard.shard_key],
+                )
+                .map_err(|error| CatalogError::sqlite("reopen active shard membership", error))?;
+        }
+        Ok(Self {
+            root: self.root.clone(),
+            connection: Arc::new(Mutex::new(connection)),
+            session_catalog: Arc::clone(&self.session_catalog),
+            _ephemeral_root: self._ephemeral_root.as_ref().map(Arc::clone),
+        })
     }
 
     pub fn query_callable_values(
@@ -1247,7 +1687,11 @@ mod semantic_row_plan_tests {
     use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
 
     fn seed(connection: &Connection) {
-        connection.execute_batch(r#"
+        seed_records(connection, 256);
+    }
+
+    fn seed_records(connection: &Connection, records: usize) {
+        connection.execute_batch(&r#"
             INSERT INTO catalog_packs(manifest_digest,state) VALUES(printf('%064d',1),'verified');
             INSERT INTO catalog_pack_shards(manifest_digest,shard_id) VALUES(printf('%064d',1),'s');
             INSERT INTO catalog_semantic_rows_indexed_shards(shard_key,manifest_digest,shard_id,index_version) VALUES(1,printf('%064d',1),'s',4);
@@ -1265,7 +1709,7 @@ mod semantic_row_plan_tests {
             INSERT INTO catalog_procedure_summaries(shard_key,language,target_path,target_symbol,owner_fqn,member,has_receiver,declared_arity,variadic,minimum_actual_count,record_json)
             SELECT 1,'rust','path'||record_key,'symbol'||record_key,'Owner'||record_key,'name'||record_key,0,0,0,0,
               json_object('id','sum'||record_key,'model_id','pack.sum'||record_key) FROM catalog_declaration_types;
-        "#).unwrap();
+        "#.replace("v<256", &format!("v<{records}"))).unwrap();
     }
 
     #[test]
@@ -1409,6 +1853,30 @@ mod semantic_row_plan_tests {
                         "{state}: requested IDs must be decoded once: {plan:?}"
                     );
                 }
+                // A dotted name runs these once per dot boundary, so a scan
+                // here multiplies by every policy locator (#10397).
+                if [
+                    "semantic_member_owner_name",
+                    "semantic_member_qualified",
+                    "semantic_member_alias_qualified",
+                ]
+                .contains(&query.name.as_str())
+                {
+                    // Inside the active views every record table is `r`. The
+                    // split join seeked `r` on `shard_key` alone, which walks
+                    // the whole shard, with the split table as the inner loop.
+                    assert!(
+                        plan.iter().all(|line| !line.starts_with("SCAN r")
+                            && !(line.starts_with("SEARCH r ") && line.ends_with("(shard_key=?)"))
+                            && !line.contains("VIRTUAL TABLE")
+                            && !line.contains("MATERIALIZE")
+                            && !line.contains("CO-ROUTINE")
+                            && !line.contains("AUTOMATIC")),
+                        "{state} {}: member lookups must seek every record table: {plan:?}",
+                        query.name
+                    );
+                    eprintln!("{state} {}: member lookup plan: {plan:?}", query.name);
+                }
                 if query.name == "semantic_summary_id" {
                     let keyed = plan
                         .iter()
@@ -1430,5 +1898,130 @@ mod semantic_row_plan_tests {
                     .unwrap_or_else(|error| panic!("{name}: {error}"));
             }
         }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10397: dotted member lookup scanned the catalog for every split"
+    )]
+    fn dotted_member_lookup_steps_do_not_grow_with_the_catalog() {
+        use brokk_bifrost_semantic::analyzer::semantic::oracle::dispatch::owner_member_splits;
+        use rusqlite::StatementStatus;
+        // `RowOverlay::symbols_named` runs these three statements for each dot
+        // boundary of a qualified name.
+        let lookup = |records: usize, state: PlannerStatisticsState| {
+            let durable = open_session_semantic_catalog().unwrap();
+            let session = open_session_semantic_catalog().unwrap();
+            for connection in [&durable.connection, &session.connection] {
+                seed_records(connection, records);
+                connection
+                    .execute_batch(
+                        "UPDATE catalog_declaration_names SET name='std.io.'||name;
+                         UPDATE catalog_declaration_members SET owner_id='Type'||record_key;",
+                    )
+                    .unwrap();
+            }
+            rows::attach_session_rows(&durable.connection, &session).unwrap();
+            for source in ["durable", "session"] {
+                rows::select_active_shard_source(
+                    &durable.connection,
+                    &format!("{:064}", 1),
+                    "s",
+                    source,
+                )
+                .unwrap();
+            }
+            state.install(&durable.connection);
+            let (mut found, mut vm_steps, mut scan_steps) = (0, 0, 0);
+            for (owner, member) in owner_member_splits("std.io.Type17.name17") {
+                for sql in [
+                    statements::MEMBERS_QUALIFIED,
+                    statements::MEMBERS_ALIAS_QUALIFIED,
+                    statements::MEMBERS_BY_OWNER_NAME,
+                ] {
+                    let mut statement = durable.connection.prepare(sql).unwrap();
+                    found += statement
+                        .query(rusqlite::params![owner, member])
+                        .unwrap()
+                        .mapped(|_| Ok(()))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                        .len();
+                    vm_steps += statement.get_status(StatementStatus::VmStep);
+                    scan_steps += statement.get_status(StatementStatus::FullscanStep);
+                }
+            }
+            (found, vm_steps, scan_steps)
+        };
+        // Index depth can add a few VM steps; a catalog scan multiplies them
+        // by the record count.
+        for state in PlannerStatisticsState::BOTH {
+            let small = lookup(256, state);
+            let large = lookup(16384, state);
+            assert!(
+                small.0 > 0,
+                "{state}: the qualified member must be found: {small:?}"
+            );
+            assert!(
+                small.0 == large.0 && small.2 == large.2 && large.1 < 2 * small.1,
+                "{state}: (rows, VM steps, full-scan steps) grew with the catalog: \
+                 256 records {small:?}, 16384 records {large:?}"
+            );
+            eprintln!(
+                "{state}: dotted member lookup (rows, VM steps, full-scan steps): 256 records {small:?}, 16384 records {large:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pinned_validation_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_validation_checks_versions_and_file_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("catalog.db");
+        let session = root.path().join("session.db");
+        let connection = Connection::open(&main).unwrap();
+        connection
+            .execute("ATTACH ?1 AS session", [session.to_str().unwrap()])
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA main.user_version=7; PRAGMA session.user_version=3")
+            .unwrap();
+        let witness = PinnedReaderValidation::capture(&connection).unwrap();
+        assert!(witness.matches(&connection).unwrap());
+        connection
+            .execute_batch("PRAGMA session.user_version=4")
+            .unwrap();
+        assert!(!witness.matches(&connection).unwrap());
+        let witness = PinnedReaderValidation::capture(&connection).unwrap();
+        connection
+            .execute_batch("PRAGMA main.user_version=8")
+            .unwrap();
+        assert!(!witness.matches(&connection).unwrap());
+        #[cfg(unix)]
+        {
+            let witness = PinnedReaderValidation::capture(&connection).unwrap();
+            let replacement = root.path().join("replacement.db");
+            Connection::open(&replacement)
+                .unwrap()
+                .execute_batch("PRAGMA user_version=8")
+                .unwrap();
+            std::fs::rename(&replacement, &main).unwrap();
+            assert!(!witness.matches(&connection).unwrap());
+        }
+    }
+}
+
+/// An idle prepared reader, evictable by the store retention budget.
+pub struct PreparedPinnedReader {
+    pub connection: std::sync::Mutex<Option<(Connection, PinnedReaderValidation)>>,
+}
+impl brokk_bifrost_core::retention_budget::RetainedBytes for PreparedPinnedReader {
+    fn retained_bytes(&self) -> usize {
+        // Two attached databases each use SQLite's default 2 MiB page cache.
+        4 * 1024 * 1024 + std::mem::size_of::<Self>()
     }
 }

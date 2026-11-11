@@ -75,15 +75,15 @@ pub(super) fn publishes_collection_receiver(owner: &str) -> bool {
 /// unit, and the unit-level imports that precede it.
 #[derive(Debug, Clone)]
 pub(super) struct ScalaArtifactTypeScope {
-    name: String,
-    module: bool,
+    pub(super) name: String,
+    pub(super) module: bool,
     /// Parser-established package scopes, outermost to innermost.
     package_prefixes: Vec<String>,
     /// Top-level types of the same compilation unit, by simple name.
     same_unit: HashMap<String, String>,
     explicit_imports: Vec<(String, Vec<String>)>,
     wildcard_imports: Vec<Vec<String>>,
-    supertypes: Vec<ScalaTypeExpressionPath>,
+    pub(super) supertypes: Vec<ScalaTypeExpressionPath>,
     /// The single parent an `object` applies, as in
     /// `object Map extends MapFactory.Delegate[Map](HashMap)`.
     parent_application: Option<ScalaParentApplication>,
@@ -108,8 +108,12 @@ pub(super) fn scala_artifact_type_scope(
     parsed: &ParsedFile,
     module: bool,
     supertypes: Vec<ScalaTypeExpressionPath>,
+    lexical_prefixes: &[String],
     same_unit: &HashMap<String, String>,
 ) -> ScalaArtifactTypeScope {
+    // A declaration without parents has no supertype lookup path. Its
+    // parser-established package contexts still name every package clause
+    // in scope, as successive clauses (`package scala` / `package sys`) open.
     let package_prefixes = parsed
         .supertype_lookup_paths
         .get(declaration)
@@ -117,6 +121,7 @@ pub(super) fn scala_artifact_type_scope(
         .and_then(|path| ScalaSupertypeLookupPath::decode(path))
         .map(|path| path.package_prefixes().to_vec())
         .filter(|prefixes| !prefixes.is_empty())
+        .or_else(|| (!lexical_prefixes.is_empty()).then(|| lexical_prefixes.to_vec()))
         .unwrap_or_else(|| vec![parsed.package_name.clone()]);
     let mut explicit_imports = Vec::new();
     let mut wildcard_imports = Vec::new();
@@ -203,16 +208,24 @@ fn stable_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
 
 /// The qualified names one artifact declares, which is everything the
 /// resolver may bind a spelled name to.
-struct ArtifactNames<'facts> {
-    types: HashMap<&'facts str, &'facts TypeFact>,
+pub(super) struct ArtifactNames<'facts> {
+    pub(super) types: HashMap<&'facts str, &'facts TypeFact>,
     packages: HashSet<String>,
     modules: HashSet<&'facts str>,
 }
 
 impl<'facts> ArtifactNames<'facts> {
     fn new(types: &'facts [TypeFact], scopes: &'facts [ScalaArtifactTypeScope]) -> Self {
+        Self::from_facts(types, scopes)
+    }
+
+    pub(super) fn from_facts(
+        types: impl IntoIterator<Item = &'facts TypeFact>,
+        scopes: impl IntoIterator<Item = &'facts ScalaArtifactTypeScope>,
+    ) -> Self {
+        let scopes = scopes.into_iter().collect::<Vec<_>>();
         let mut packages = HashSet::default();
-        for scope in scopes {
+        for scope in &scopes {
             for prefix in &scope.package_prefixes {
                 let mut package = prefix.as_str();
                 while !package.is_empty() && packages.insert(package.to_owned()) {
@@ -225,7 +238,7 @@ impl<'facts> ArtifactNames<'facts> {
         }
         Self {
             types: types
-                .iter()
+                .into_iter()
                 .map(|fact| (fact.name.as_str(), fact))
                 .collect(),
             packages,
@@ -237,13 +250,17 @@ impl<'facts> ArtifactNames<'facts> {
         }
     }
 
-    fn knows(&self, qualified: &str) -> bool {
+    pub(super) fn knows(&self, qualified: &str) -> bool {
         self.types.contains_key(qualified) || self.packages.contains(qualified)
     }
 
     /// The qualified type a written path names from `scope`, when Scala's
     /// binding precedence selects exactly one declaration of this artifact.
-    fn resolve_type(&self, scope: &ScalaArtifactTypeScope, segments: &[String]) -> Option<String> {
+    pub(super) fn resolve_type(
+        &self,
+        scope: &ScalaArtifactTypeScope,
+        segments: &[String],
+    ) -> Option<String> {
         let (root, rest) = segments.split_first()?;
         let qualified = qualify(&self.resolve_root(scope, root)?, rest);
         self.types
@@ -254,7 +271,8 @@ impl<'facts> ArtifactNames<'facts> {
     /// Bind the first segment of a written path. Definitions of the same
     /// compilation unit win, then explicit imports, then wildcard imports,
     /// then package members from the innermost package scope outward, then
-    /// the root package and the implicit `scala._` import. A binding this
+    /// the root package and the implicit `Predef._` and `scala._` imports,
+    /// the nearer one first. A binding this
     /// artifact cannot enumerate -- an import of an unknown entity, or a
     /// wildcard over one -- leaves the name unresolved rather than letting a
     /// lower-precedence declaration answer for it.
@@ -293,8 +311,69 @@ impl<'facts> ArtifactNames<'facts> {
             .iter()
             .rev()
             .map(|package| qualify(package, &[root.to_owned()]))
-            .chain([root.to_owned(), qualify("scala", &[root.to_owned()])])
+            .chain([
+                root.to_owned(),
+                qualify("scala.Predef", &[root.to_owned()]),
+                qualify("scala", &[root.to_owned()]),
+            ])
             .find(|candidate| self.knows(candidate))
+    }
+
+    /// The qualified name a written type path names from `scope`, also when
+    /// it names a type outside this artifact.
+    ///
+    /// An artifact declaration answers as [`Self::resolve_type`] does. A name
+    /// outside the artifact is proven only by spelling it completely: an
+    /// explicit import of an absolute path, or a qualified path whose root no
+    /// same-unit type, import, wildcard or package of this artifact can bind.
+    /// A simple name the artifact does not declare may be any member of an
+    /// enclosing package or of an implicit root import on the classpath, so it
+    /// stays unresolved.
+    pub(super) fn resolve_named_type(
+        &self,
+        scope: &ScalaArtifactTypeScope,
+        segments: &[String],
+    ) -> Option<String> {
+        if let Some(qualified) = self.resolve_type(scope, segments) {
+            return Some(qualified);
+        }
+        let (root, rest) = segments.split_first()?;
+        if scope.same_unit.contains_key(root) || !self.binds_no_relative_root(scope, root) {
+            return None;
+        }
+        let explicit = scope
+            .explicit_imports
+            .iter()
+            .filter(|(bound, _)| bound == root)
+            .collect::<Vec<_>>();
+        match explicit.as_slice() {
+            [] => {}
+            [(_, path)] => {
+                let (path_root, _) = path.split_first()?;
+                return (self.resolve_import_path(scope, path).is_none()
+                    && self.binds_no_relative_root(scope, path_root))
+                .then(|| qualify(&path.join("."), rest));
+            }
+            _ => return None,
+        }
+        // Any wildcard import may supply the root, unless this artifact
+        // enumerates the imported entity and it has no such member.
+        let wildcard_may_bind = scope.wildcard_imports.iter().any(|prefix| {
+            self.resolve_import_path(scope, prefix)
+                .is_none_or(|prefix| self.knows(&qualify(&prefix, std::slice::from_ref(root))))
+        });
+        (!rest.is_empty() && !wildcard_may_bind).then(|| segments.join("."))
+    }
+
+    /// Whether no package scope of `scope`, nor the root package, has a member
+    /// `root` that this artifact declares.
+    fn binds_no_relative_root(&self, scope: &ScalaArtifactTypeScope, root: &str) -> bool {
+        !scope
+            .package_prefixes
+            .iter()
+            .map(|package| qualify(package, &[root.to_owned()]))
+            .chain([root.to_owned()])
+            .any(|candidate| self.knows(&candidate))
     }
 
     /// An import path is resolved from the importing package outward, then
@@ -317,7 +396,7 @@ impl<'facts> ArtifactNames<'facts> {
     }
 }
 
-fn qualify(prefix: &str, rest: &[String]) -> String {
+pub(super) fn qualify(prefix: &str, rest: &[String]) -> String {
     std::iter::once(prefix)
         .filter(|prefix| !prefix.is_empty())
         .chain(rest.iter().map(String::as_str))
@@ -329,21 +408,21 @@ fn qualify(prefix: &str, rest: &[String]) -> String {
 /// whose spelled name this artifact cannot resolve. Each unresolved parent is
 /// its own base, so it is never deduplicated against another.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LinearBase {
+pub(super) enum LinearBase {
     Type(String),
     Unresolved(usize),
 }
 
 /// One parent edge: the resolved parent, or `None`, with the type arguments
 /// the child applies to it.
-type ParentEdge = (Option<String>, Vec<ScalaTypeExpressionPath>);
+pub(super) type ParentEdge = (Option<String>, Vec<ScalaTypeExpressionPath>);
 
 /// The linearization `L(C) = C, L(Tn) +> ... +> L(T1)` (SLS 5.1.2), where
 /// `a +> b` keeps the elements of `a` absent from `b`, followed by `b`.
 ///
 /// The walk is iterative and memoized per type. A cycle, an oversized
 /// closure, or a type without a scope returns `None`.
-fn linearization(
+pub(super) fn linearization(
     root: &str,
     parents_of: &impl Fn(&str) -> Option<Vec<ParentEdge>>,
 ) -> Option<Vec<LinearBase>> {

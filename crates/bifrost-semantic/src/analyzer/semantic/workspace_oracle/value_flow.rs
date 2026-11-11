@@ -22,6 +22,150 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+/// Which globally unique value writer a caller is allowed to follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ClosedOriginEdge {
+    Follow,
+    Refuse,
+}
+
+/// Trace one value through a globally closed chain of paired assignments and
+/// flows. The classifier decides the meaning of a flow; the scan, quality,
+/// writer, cycle and stop rules are shared by all clients.
+#[doc(hidden)]
+pub fn closed_value_origin(
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    start: crate::analyzer::semantic::ValueId,
+    terminal: impl Fn(crate::analyzer::semantic::ValueId) -> bool,
+    classify: impl Fn(&crate::analyzer::semantic::ValueFlowKind) -> ClosedOriginEdge,
+    cancellation: &brokk_bifrost_core::CancellationToken,
+    charge: impl FnMut(crate::analyzer::semantic::SemanticWork) -> Result<(), Interruption>,
+) -> Result<Option<crate::analyzer::semantic::ValueId>, Interruption> {
+    closed_value_origin_at_capture(
+        procedure,
+        start,
+        terminal,
+        |kind, _, _| classify(kind),
+        |_, _| true,
+        cancellation,
+        charge,
+    )
+}
+
+/// The same closed-origin proof restricted to write events reaching a capture.
+#[doc(hidden)]
+pub fn closed_value_origin_at_capture(
+    procedure: &crate::analyzer::semantic::ProcedureHandle,
+    start: crate::analyzer::semantic::ValueId,
+    terminal: impl Fn(crate::analyzer::semantic::ValueId) -> bool,
+    classify: impl Fn(
+        &crate::analyzer::semantic::ValueFlowKind,
+        crate::analyzer::semantic::ValueId,
+        crate::analyzer::semantic::ValueId,
+    ) -> ClosedOriginEdge,
+    include_write: impl Fn(crate::analyzer::semantic::ProgramPointId, usize) -> bool,
+    cancellation: &brokk_bifrost_core::CancellationToken,
+    mut charge: impl FnMut(crate::analyzer::semantic::SemanticWork) -> Result<(), Interruption>,
+) -> Result<Option<crate::analyzer::semantic::ValueId>, Interruption> {
+    use crate::analyzer::semantic::{
+        SemanticEffect, SemanticGapImpact, SemanticGapSubject, SemanticIncompleteSubject,
+        SemanticWork,
+    };
+    let semantics = procedure.semantics();
+    let event_count = semantics
+        .points()
+        .iter()
+        .map(|point| point.events.len())
+        .sum();
+    let census = SemanticWork {
+        events: semantics.incomplete_facts().len() + semantics.gaps().len(),
+        ..Default::default()
+    };
+    charge(census)?;
+    let mut current = start;
+    let mut seen = HashSet::new();
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        if !seen.insert(current) {
+            return Ok(None);
+        }
+        if semantics.incomplete_facts().iter().any(|fact| {
+            matches!(fact.subject, SemanticIncompleteSubject::Procedure)
+                || matches!(fact.subject, SemanticIncompleteSubject::Value(value) if value == current)
+        }) || semantics.gaps().iter().any(|gap| {
+            (gap.impacts.contains(SemanticGapImpact::ValueFlow)
+                || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+                || gap.impacts.contains(SemanticGapImpact::CallEvaluation))
+                && (matches!(gap.subject, SemanticGapSubject::Procedure | SemanticGapSubject::Point)
+                    || matches!(gap.subject, SemanticGapSubject::Value(value) if value == current))
+        }) {
+            return Ok(None);
+        }
+        let scan = SemanticWork {
+            events: event_count,
+            ..Default::default()
+        };
+        charge(scan)?;
+        let mut source = None;
+        let mut writers = 0;
+        for point in semantics.points() {
+            if cancellation.is_cancelled() {
+                return Err(Interruption::Cancelled);
+            }
+            for (index, event) in point.events.iter().enumerate() {
+                if !include_write(point.id, index) {
+                    continue;
+                }
+                let complete = semantics
+                    .evidence_row(event.evidence)
+                    .is_some_and(|evidence| {
+                        evidence
+                            .proof
+                            .establishes_complete_evidence(&evidence.completeness)
+                    });
+                match &event.effect {
+                    SemanticEffect::Assignment { target, value } if *target == current => {
+                        let paired = point.events.get(index + 1).is_some_and(|next| {
+                            matches!(&next.effect, SemanticEffect::ValueFlow { kind, source, target }
+                                if *source == *value && *target == current
+                                    && classify(kind, *source, *target) == ClosedOriginEdge::Follow)
+                        });
+                        if !complete || !paired {
+                            return Ok(None);
+                        }
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: value,
+                        target,
+                    } if *target == current => {
+                        if !complete || classify(kind, *value, *target) != ClosedOriginEdge::Follow
+                        {
+                            return Ok(None);
+                        }
+                        writers += 1;
+                        source = Some(*value);
+                    }
+                    SemanticEffect::MemoryLoad { result, .. } if *result == current => {
+                        return Ok(None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if terminal(current) {
+            return Ok((writers == 0).then_some(current));
+        }
+        if writers != 1 {
+            return Ok(None);
+        }
+        current = source.expect("one accepted flow has one source");
+    }
+}
+
 use crate::analyzer::semantic::AsyncResumeKind;
 
 use crate::analyzer::semantic::workspace_oracle::common::Interruption;
@@ -75,6 +219,8 @@ use crate::analyzer::semantic::CallArgumentMapping;
 use crate::analyzer::semantic::CallBinding;
 
 use crate::analyzer::semantic::CallBindings;
+
+use crate::analyzer::semantic::CallContinuationKind;
 
 use crate::analyzer::semantic::CallSiteId;
 
@@ -172,6 +318,8 @@ use crate::analyzer::semantic::SemanticWork;
 
 use crate::analyzer::semantic::SynchronizationPayload;
 
+use crate::analyzer::semantic::ValueTransfer;
+
 use crate::analyzer::semantic::ValueFlowEndpoint;
 
 use crate::analyzer::semantic::ValueFlowKind;
@@ -251,8 +399,11 @@ pub fn merge_gap_quality(
     })
 }
 
+mod closed_containers;
+
 #[derive(Clone)]
 struct FlowRelationDraft {
+    original_cell: Option<AbstractLocation>,
     payload: ValueFlowRelationPayload,
     memory_origin: Option<MemoryRelationOrigin>,
     evidence: Vec<EvidenceHandle>,
@@ -385,6 +536,11 @@ pub struct LocalStoreBases {
     /// Values that own a language binding rather than naming one temporary
     /// occurrence of that binding.
     binding_values: HashSet<ValueId>,
+    /// Parameter and receiver formals.
+    formal_values: HashSet<ValueId>,
+    /// Parameter and receiver flows, as (target, source) pairs in target
+    /// order: reads of a formal and, in some adapters, writes back to it.
+    formal_flows: Box<[(ValueId, ValueId)]>,
     /// Values a call or a memory load produces, which the trace would follow
     /// out of this procedure or open.
     foreign: HashSet<ValueId>,
@@ -394,9 +550,22 @@ pub struct LocalStoreBases {
     escaped: HashSet<ValueId>,
 }
 
+/// The sources of the (target, source) `edges`, sorted by target, that
+/// produce `value`.
+fn producers(
+    edges: &[(ValueId, ValueId)],
+    value: ValueId,
+) -> impl Iterator<Item = &(ValueId, ValueId)> {
+    let start = edges.partition_point(|(target, _)| *target < value);
+    edges[start..]
+        .iter()
+        .take_while(move |(target, _)| *target == value)
+}
+
 impl LocalStoreBases {
     fn derive(semantics: &crate::analyzer::semantic::ProcedureSemantics) -> Self {
         let mut copies = Vec::new();
+        let mut formal_flows = Vec::new();
         let mut backing_aliases = Vec::new();
         let mut foreign = HashSet::new();
         let mut escaped = HashSet::new();
@@ -471,6 +640,11 @@ impl LocalStoreBases {
                         copies.push((target, source));
                         backing_aliases.push((source, target));
                     }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Parameter | ValueFlowKind::Receiver,
+                        source,
+                        target,
+                    } => formal_flows.push((target, source)),
                     SemanticEffect::MemoryLoad { result, .. } => {
                         foreign.insert(result);
                     }
@@ -520,6 +694,8 @@ impl LocalStoreBases {
         }
         copies.sort_unstable();
         copies.dedup();
+        formal_flows.sort_unstable();
+        formal_flows.dedup();
         let mut forward_copies = copies
             .iter()
             .map(|(target, source)| (*source, *target))
@@ -540,6 +716,17 @@ impl LocalStoreBases {
                 .then_some(value.id)
             })
             .collect();
+        let formal_values = semantics
+            .values()
+            .iter()
+            .filter_map(|value| {
+                matches!(
+                    value.kind,
+                    SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
+                )
+                .then_some(value.id)
+            })
+            .collect();
         Self {
             copies: copies.into_boxed_slice(),
             forward_copies: forward_copies.into_boxed_slice(),
@@ -550,6 +737,8 @@ impl LocalStoreBases {
             array_allocation_results,
             slice_allocation_results,
             binding_values,
+            formal_values,
+            formal_flows: formal_flows.into_boxed_slice(),
             foreign,
             escaped,
         }
@@ -692,6 +881,73 @@ impl LocalStoreBases {
             }
         }
         true
+    }
+
+    /// Whether the store at `point` to `location` overwrites one exact member
+    /// of the object a formal names (#9651).
+    ///
+    /// Every backward producer chain from the store's base must end at the
+    /// same parameter or receiver formal, and the procedure must never rebind
+    /// that formal or let its binding escape by address or capture. The base
+    /// then names one object for the whole invocation, whatever the caller
+    /// passed, so the formal-relative carrier stands for exactly the location
+    /// the store writes. The heap oracle cannot certify this: the object
+    /// comes from the caller, which binds its own actual at the call. A store
+    /// whose point records unresolved dispatch or field memory (an accessor,
+    /// an overloaded assignment, a `DerefMut` projection) stays weak.
+    #[doc(hidden)]
+    pub fn holds_formal_member_overwrite(
+        &self,
+        procedure: &ProcedureHandle,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> bool {
+        let Some(MemoryLocationKind::Field { base, .. }) = procedure
+            .semantics()
+            .memory_location(location)
+            .map(|row| &row.kind)
+        else {
+            return false;
+        };
+        if procedure.semantics().gaps().iter().any(|gap| {
+            gap.point == point
+                && matches!(
+                    gap.capability,
+                    SemanticCapability::Calls | SemanticCapability::FieldMemory
+                )
+        }) {
+            return false;
+        }
+        let mut pending = vec![*base];
+        let mut seen = HashSet::new();
+        let mut roots = HashSet::new();
+        while let Some(value) = pending.pop() {
+            if !seen.insert(value) {
+                continue;
+            }
+            if self.foreign.contains(&value)
+                || self.escaped.contains(&value)
+                || self.allocation_results.contains(&value)
+            {
+                return false;
+            }
+            let mut sources = producers(&self.copies, value)
+                .chain(producers(&self.formal_flows, value))
+                .peekable();
+            if self.formal_values.contains(&value) {
+                // A flow into the formal rebinds it.
+                if sources.peek().is_some() {
+                    return false;
+                }
+                roots.insert(value);
+                continue;
+            }
+            if sources.peek().is_none() {
+                return false;
+            }
+            pending.extend(sources.map(|(_, source)| *source));
+        }
+        roots.len() == 1
     }
 
     /// Whether `base` is backed by exactly one fresh local array whose
@@ -841,6 +1097,19 @@ impl LocalStoreBases {
 const HANDLER_SELECTION_UNPROVEN: &str =
     "handler selection is not proven: the thrown value may bind to any reachable catch clause";
 
+/// The value a call's exceptional continuation receives from its callee, when
+/// the call names one (#8804).
+fn exceptional_continuation_thrown(
+    procedure: &ProcedureHandle,
+    call_site: CallSiteId,
+) -> Option<ValueId> {
+    procedure
+        .semantics()
+        .call_site(call_site)
+        .expect("a validated call continuation names a live call site")
+        .thrown
+}
+
 /// Where a thrown value can be bound by a handler of the same procedure
 /// (#2446).
 ///
@@ -885,9 +1154,9 @@ struct HandlerBindings {
     /// Throw point -> the handler bindings that point's exception route can
     /// reach, in dispatcher alternative order and without repeats.
     by_throw_point: HashMap<ProgramPointId, Box<[ValueId]>>,
-    /// Handler binding -> the thrown value the runtime copies into it, for the
-    /// one throw that reaches it. A binding more than one throw reaches has no
-    /// single origin and is [`LoadOrigin::Ambiguous`].
+    /// Handler binding -> the thrown value the runtime copies into it. A
+    /// binding more than one throw reaches is one of their values, which is
+    /// [`LoadOrigin::Definitions`].
     ///
     /// This is what makes a field read through the binding observe the object
     /// the throw carried. Without it the access-path resolver roots
@@ -1025,9 +1294,7 @@ impl HandlerBindings {
                     binder_origins
                         .entry(*binder)
                         .and_modify(|existing| {
-                            if *existing != LoadOrigin::Value(thrown) {
-                                *existing = LoadOrigin::Ambiguous;
-                            }
+                            merge_load_origin(existing, LoadOrigin::Value(thrown))
                         })
                         .or_insert(LoadOrigin::Value(thrown));
                 }
@@ -1696,26 +1963,28 @@ pub fn value_traces_to_modeled_read_partition(procedure: &ProcedureHandle, base:
 pub fn abort_paths_run_user_code(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
 ) -> bool {
-    let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
-    let mut budget = CfgAlgorithmBudget::uniform(usize::MAX);
-    match abort_paths_run_user_code_bounded(
-        semantics,
-        &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
-    ) {
-        Ok(runs_user_code) => runs_user_code,
-        Err(CfgAlgorithmError::InvalidNode(point)) => {
-            unreachable!("validated procedure has an invalid abort-path point {point}")
+    semantics.memoized_abort_paths_run_user_code(|| {
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let mut budget = CfgAlgorithmBudget::uniform(usize::MAX);
+        match abort_paths_run_user_code_bounded(
+            semantics,
+            &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+        ) {
+            Ok(runs_user_code) => runs_user_code,
+            Err(CfgAlgorithmError::InvalidNode(point)) => {
+                unreachable!("validated procedure has an invalid abort-path point {point}")
+            }
+            Err(CfgAlgorithmError::Cancelled { .. }) => {
+                unreachable!("an uncancelled abort-path traversal cannot be cancelled")
+            }
+            Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
+                unreachable!(
+                    "the unbounded abort-path traversal exceeded its {:?} limit: {exceeded:?}",
+                    exceeded.limit_kind
+                )
+            }
         }
-        Err(CfgAlgorithmError::Cancelled { .. }) => {
-            unreachable!("an uncancelled abort-path traversal cannot be cancelled")
-        }
-        Err(CfgAlgorithmError::ExceededBudget(exceeded)) => {
-            unreachable!(
-                "the unbounded abort-path traversal exceeded its {:?} limit: {exceeded:?}",
-                exceeded.limit_kind
-            )
-        }
-    }
+    })
 }
 
 /// Whether an exceptional or cleanup route can run user code, under one
@@ -1840,14 +2109,18 @@ pub fn implicit_dispatch_receiver_actual<'caller>(
     callee: &ProcedureHandle,
     callee_receiver: &crate::analyzer::semantic::SemanticValue,
 ) -> Option<&'caller crate::analyzer::semantic::SemanticValue> {
-    if callee_receiver.kind != (SemanticValueKind::Receiver { dispatch: true }) {
+    if !matches!(
+        callee_receiver.kind,
+        SemanticValueKind::Receiver { dispatch: true, .. }
+    ) {
         return None;
     }
-    let caller_receiver = caller
-        .semantics()
-        .values()
-        .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver { dispatch: true })?;
+    let caller_receiver = caller.semantics().values().iter().find(|value| {
+        matches!(
+            value.kind,
+            SemanticValueKind::Receiver { dispatch: true, .. }
+        )
+    })?;
     let caller_locator = caller.semantics().locator();
     let callee_locator = callee.semantics().locator();
     let (_, caller_parent) = caller_locator.declaration().segments().split_last()?;
@@ -1887,7 +2160,7 @@ fn location_value_reads(location: &MemoryLocationKind) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum LoadOrigin {
     Unique(MemoryLocationId),
@@ -1919,13 +2192,39 @@ pub enum LoadOrigin {
     /// an exact root with no definition and be answered as a proven absence.
     /// The producer states those contents by storing into the destination's own
     /// member locations at the copy point, which is what this variant requires.
-    Separated {
+    Separated(SeparatedTransfer),
+    /// Exhaustive separated definitions of one destination value.
+    SeparatedDefinitions(Box<[SeparatedTransfer]>),
+    /// A plain assignment awaits its immediately following separated transfer.
+    /// If no such transfer arrives, finalization makes this ambiguous.
+    SeparatedPending {
+        transfers: Box<[SeparatedTransfer]>,
         source: ValueId,
     },
+    /// More than one unconditional copy defines this value, each from a
+    /// different source, in first-seen order and without repeats.
+    ///
+    /// The set is exhaustive: every definition the procedure states is in it,
+    /// so the value is exactly one of them at any read. A member access
+    /// through it is resolved once per definition as a finite alternative,
+    /// rather than stopping on a summarized root as [`Self::Ambiguous`] does.
+    /// A catch parameter that several throws reach is the motivating shape
+    /// (#7960, #8836).
+    Definitions(Box<[ValueId]>),
     Ambiguous,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct SeparatedTransfer {
+    source: ValueId,
+    destination: ValueId,
+    point: ProgramPointId,
+    transfer: ValueTransfer,
+    stores: Box<[MemoryLocationId]>,
+}
+
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub enum AccessPathRootDraft {
     Value(ValueId),
@@ -1936,7 +2235,7 @@ pub enum AccessPathRootDraft {
     Capture(MemoryLocationId),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[doc(hidden)]
 pub enum AccessSelectorDraft {
     Field(SemanticLocator),
@@ -1951,12 +2250,18 @@ pub enum AccessSelectorDraft {
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct AccessPathDraft {
+    /// Source-named coordinate before a prefix redirect; never a flow arm.
+    pub original_cell: Option<Box<AccessPathDraft>>,
     #[doc(hidden)]
     pub root: AccessPathRootDraft,
     #[doc(hidden)]
     pub selectors: Vec<AccessSelectorDraft>,
     #[doc(hidden)]
     pub tail: AccessPathTail,
+    /// A store reaches a cell the path continues through and cannot be
+    /// followed, so members stored there cannot be proven absent.
+    #[doc(hidden)]
+    pub opaque_prefix: bool,
 }
 
 #[derive(Debug)]
@@ -1966,26 +2271,213 @@ pub enum AccessPathResolution {
     Interrupted(Interruption),
 }
 
-/// What one backward scan over a procedure's events establishes about its
-/// values.
+/// One selector of a cell, reduced to what decides whether two cells may be
+/// one cell. Field and property selectors compare by identity; an index
+/// compares by the constant it denotes, or may equal any index otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CellSelector {
+    Field(SemanticLocator),
+    Property(String),
+    Index(CellIndex),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CellIndex {
+    /// An index with a known integer value.
+    Constant(u128),
+    /// A constant index value that language lowering canonicalizes, so two
+    /// accesses name the same index only when they share this value.
+    Canonical(ValueId),
+    /// An index value that may equal any other.
+    Exact(ValueId),
+    Any,
+}
+
+impl CellSelector {
+    /// The selector with its index erased, so cells that may alias hash alike.
+    fn erased(&self) -> Self {
+        match self {
+            Self::Index(_) => Self::Index(CellIndex::Any),
+            other => other.clone(),
+        }
+    }
+
+    fn may_equal(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Field(left), Self::Field(right)) => left == right,
+            (Self::Property(left), Self::Property(right)) => left == right,
+            (Self::Index(CellIndex::Constant(left)), Self::Index(CellIndex::Constant(right))) => {
+                left == right
+            }
+            (Self::Index(CellIndex::Canonical(left)), Self::Index(CellIndex::Canonical(right))) => {
+                left == right
+            }
+            (Self::Index(_), Self::Index(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The root of a resolved access path, as far as two accesses of one
+/// procedure can be compared.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CellRoot {
+    Value(ValueId),
+    Port(ProcedurePortKind),
+    Allocation(crate::analyzer::semantic::AllocationId),
+    Static(SemanticLocator),
+    LexicalCell(MemoryLocationId),
+    Capture(MemoryLocationId),
+}
+
+impl CellRoot {
+    fn of(root: &AccessPathRootDraft) -> Self {
+        match root {
+            AccessPathRootDraft::Value(value) => Self::Value(*value),
+            AccessPathRootDraft::ProcedurePort(kind) => Self::Port(*kind),
+            AccessPathRootDraft::Allocation(allocation) => Self::Allocation(*allocation),
+            AccessPathRootDraft::Static(member) => Self::Static(member.clone()),
+            AccessPathRootDraft::LexicalCell(cell) => Self::LexicalCell(*cell),
+            AccessPathRootDraft::Capture(cell) => Self::Capture(*cell),
+        }
+    }
+}
+
+/// What a store put into one cell, as far as a read through the cell can
+/// follow it.
+#[derive(Debug)]
+struct PrefixStore {
+    /// The stored cell's path below its root, root-nearest selector first.
+    selectors: Vec<CellSelector>,
+    /// The stored value, or `None` when the store cannot be followed: it
+    /// copied an inline aggregate, or its language states nothing about
+    /// whether it copied.
+    followed: Option<ValueId>,
+}
+
+/// One way a strict-prefix cell may have been written.
+#[derive(Debug, Clone, Copy)]
+struct PrefixCandidate {
+    /// How many root-nearest selectors the prefix cell consumes.
+    depth: usize,
+    followed: Option<ValueId>,
+}
+
+/// The stores to the cells a longer access path may continue through.
 ///
-/// Both facts are read off the same event, so they are derived by one
-/// traversal rather than two. A second pass would not only cost a second walk;
-/// it would charge a second program-point census against the caller's semantic
-/// budget, which is a published cost model (`#2295`) and not free to move.
-/// One member slot of one container, identified within a single procedure by
-/// the base value and the member declaration the locator anchors on.
-type MemberSlot = (ValueId, u32, u32);
+/// A store of a reference puts the stored object's identity into a cell, so a
+/// path that continues *through* that cell names storage the stored value
+/// names. Carriers meet only on equal paths, so without this index the
+/// continuation path never meets the stored value's own members and a read
+/// through the cell looks like proven absence. Cells are keyed by their
+/// resolved root and selectors, so every access of one procedure that names
+/// the cell finds the same stores.
+///
+/// The index is flow-insensitive, like the other facts of a procedure: every
+/// store to a cell that may be the prefix is a candidate. That is a may
+/// answer: the original path is always an alternative because the index cannot
+/// prove that any store ran before the read. An overwritten store only adds a flow.
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct PrefixStores {
+    /// An unenumerated store may reach any prefix in this procedure.
+    incomplete: bool,
+    cells: HashMap<(CellRoot, Vec<CellSelector>), Vec<PrefixStore>>,
+    /// The index values of this procedure that are constants.
+    constant_indexes: HashSet<ValueId>,
+}
+
+impl PrefixStores {
+    fn cell_selector(
+        &self,
+        selector: &AccessSelectorDraft,
+        exact_integer: impl Fn(ValueId) -> Option<u128>,
+    ) -> CellSelector {
+        match selector {
+            AccessSelectorDraft::Field(member) => CellSelector::Field(member.clone()),
+            AccessSelectorDraft::Property(key) => CellSelector::Property(key.clone()),
+            // An aggregate location is the one cell holding every element, so
+            // any index names it.
+            AccessSelectorDraft::Index {
+                identity: crate::analyzer::semantic::IndexedLocationIdentity::Aggregate,
+                ..
+            } => CellSelector::Index(CellIndex::Any),
+            AccessSelectorDraft::Index {
+                constant: Some(constant),
+                ..
+            } => CellSelector::Index(CellIndex::Constant(*constant)),
+            AccessSelectorDraft::Index {
+                value: Some(value), ..
+            } => CellSelector::Index(match exact_integer(*value) {
+                Some(constant) => CellIndex::Constant(constant),
+                None if self.constant_indexes.contains(value) => CellIndex::Canonical(*value),
+                None => CellIndex::Exact(*value),
+            }),
+            AccessSelectorDraft::Index { .. } => CellSelector::Index(CellIndex::Any),
+        }
+    }
+
+    /// Every store to a strict prefix of the path `root` + `selectors`, where
+    /// `selectors` runs from the leaf toward the root, shortest prefix first.
+    fn candidates(
+        &self,
+        root: CellRoot,
+        selectors: &VecDeque<AccessSelectorDraft>,
+        exact_integer: impl Fn(ValueId) -> Option<u128>,
+    ) -> Vec<PrefixCandidate> {
+        if (self.cells.is_empty() && !self.incomplete) || selectors.len() < 2 {
+            return Vec::new();
+        }
+        let path = selectors
+            .iter()
+            .rev()
+            .map(|selector| self.cell_selector(selector, &exact_integer))
+            .collect::<Vec<_>>();
+        self.candidates_for_path(root, &path)
+    }
+
+    fn candidates_for_path(&self, root: CellRoot, path: &[CellSelector]) -> Vec<PrefixCandidate> {
+        let mut candidates = Vec::new();
+        if self.incomplete && path.len() >= 2 {
+            candidates.push(PrefixCandidate {
+                depth: 1,
+                followed: None,
+            });
+        }
+        for depth in 1..path.len() {
+            let prefix = &path[..depth];
+            let key = (
+                root.clone(),
+                prefix.iter().map(CellSelector::erased).collect(),
+            );
+            for store in self.cells.get(&key).into_iter().flatten() {
+                if store
+                    .selectors
+                    .iter()
+                    .zip(prefix)
+                    .all(|(stored, read)| stored.may_equal(read))
+                {
+                    candidates.push(PrefixCandidate {
+                        depth,
+                        followed: store.followed,
+                    });
+                }
+            }
+        }
+        candidates
+    }
+}
 
 /// The per-procedure origin facts one access-path walk resolves against: where
-/// each value came from, and which member slots hold a copied reference.
+/// each value came from, and which stores can reach a cell a path continues
+/// through.
 #[derive(Clone, Copy)]
 #[doc(hidden)]
 pub struct ValueOriginFacts<'facts> {
     #[doc(hidden)]
     pub load_origins: &'facts HashMap<ValueId, LoadOrigin>,
     #[doc(hidden)]
-    pub copied_reference_members: &'facts HashMap<MemberSlot, ValueId>,
+    pub prefix_stores: &'facts PrefixStores,
     #[doc(hidden)]
     pub binding_origins: Option<&'facts BindingOriginIndex>,
 }
@@ -1996,12 +2488,12 @@ pub struct ProcedureValueFacts {
     /// more than one event defines it differently.
     #[doc(hidden)]
     pub load_origins: HashMap<ValueId, LoadOrigin>,
-    /// Reference-typed members a by-value copy duplicated, and the reference
-    /// each one received. Copying a reference member duplicates the reference,
-    /// not the object it names, so a path that continues *through* the
-    /// destination member names the same storage the source member names.
+    /// The stores to cells that a longer path may continue through. A store of
+    /// a reference duplicates the reference, not the object it names, so a
+    /// path that continues through the cell names the same storage the stored
+    /// value names.
     #[doc(hidden)]
-    pub copied_reference_members: HashMap<MemberSlot, ValueId>,
+    pub prefix_stores: PrefixStores,
     /// Values some consumption reads as a whole object (#2444 slice 2): a call
     /// argument, a call receiver, a returned value, or a value stored as a
     /// whole. These are the reads a container collapse is published at, and
@@ -2071,7 +2563,7 @@ pub fn procedure_value_facts(
     // defines would resolve to `Ambiguous` through the same merge rule as any
     // other conflicting origin.
     let mut origins = seeded.clone();
-    let mut copied_reference_members = HashMap::<MemberSlot, ValueId>::new();
+    let mut member_stores = Vec::<(MemoryLocationId, ValueId, Option<MemoryLocationId>)>::new();
     let mut whole_container_reads = HashSet::new();
     let mut go_assignment_conversions = HashSet::new();
     let semantics = procedure.semantics();
@@ -2127,7 +2619,13 @@ pub fn procedure_value_facts(
                     } else {
                         LoadOrigin::Value(value)
                     };
-                    Some((target, origin))
+                    if point.events.iter().any(|event| matches!(event.effect,
+                        SemanticEffect::ValueFlow { kind: ValueFlowKind::Transfer(_), source, target: destination }
+                            if source == value && destination == target)) {
+                        None
+                    } else {
+                        Some((target, origin))
+                    }
                 }
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::Local,
@@ -2139,7 +2637,13 @@ pub fn procedure_value_facts(
                         nested_entries: 1,
                         ..SemanticWork::default()
                     })?;
-                    Some((target, LoadOrigin::Value(value)))
+                    if point.events.iter().any(|event| matches!(event.effect,
+                        SemanticEffect::ValueFlow { kind: ValueFlowKind::Transfer(_), source, target: destination }
+                            if source == value && destination == target)) {
+                        None
+                    } else {
+                        Some((target, LoadOrigin::Value(value)))
+                    }
                 }
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::BackingStore { offset },
@@ -2232,7 +2736,7 @@ pub fn procedure_value_facts(
                     }
                 }
                 SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Transfer(_),
+                    kind: ValueFlowKind::Transfer(transfer),
                     source,
                     target,
                 } => {
@@ -2244,7 +2748,39 @@ pub fn procedure_value_facts(
                     Some((
                         target,
                         if stated_contents.contains(&target) {
-                            LoadOrigin::Separated { source }
+                            let stores = point
+                                .events
+                                .iter()
+                                .filter_map(|event| {
+                                    let SemanticEffect::MemoryStore { location, .. } = event.effect
+                                    else {
+                                        return None;
+                                    };
+                                    let location_row = semantics.memory_location(location)?;
+                                    match location_row.kind {
+                                        MemoryLocationKind::Field { base, .. }
+                                        | MemoryLocationKind::Index { base, .. }
+                                        | MemoryLocationKind::Property { base, .. }
+                                            if base == target =>
+                                        {
+                                            Some(location)
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            charge(SemanticWork {
+                                memory_locations: stores.len(),
+                                nested_entries: stores.len(),
+                                ..SemanticWork::default()
+                            })?;
+                            LoadOrigin::Separated(SeparatedTransfer {
+                                source,
+                                destination: target,
+                                point: point.id,
+                                transfer,
+                                stores: stores.into_boxed_slice(),
+                            })
                         } else {
                             LoadOrigin::Ambiguous
                         },
@@ -2296,19 +2832,34 @@ pub fn procedure_value_facts(
                         values: 1,
                         ..SemanticWork::default()
                     })?;
-                    // A copy that duplicates a reference member states so on the
-                    // destination location, which is the only thing that lets a
-                    // path through that member reach the object both members
-                    // name.
+                    // A store to a member, element or property is a candidate
+                    // for the cell a longer path continues through. Which of
+                    // them can be followed is decided once every origin is
+                    // known.
                     if let SemanticEffect::MemoryStore { location, .. } = event.effect
-                        && let Some(slot) = reference_member_slot(semantics, location)
+                        && let Some(row) = semantics.memory_location(location)
+                        && matches!(
+                            row.kind,
+                            MemoryLocationKind::Field { .. }
+                                | MemoryLocationKind::Index { .. }
+                                | MemoryLocationKind::Property { .. }
+                        )
                     {
                         charge(SemanticWork {
                             memory_locations: 1,
                             nested_entries: 1,
                             ..SemanticWork::default()
                         })?;
-                        copied_reference_members.insert(slot, source);
+                        let copied_from =
+                            event_index.checked_sub(1).and_then(|previous| {
+                                match point.events[previous].effect {
+                                    SemanticEffect::MemoryLoad {
+                                        location, result, ..
+                                    } if result == source => Some(location),
+                                    _ => None,
+                                }
+                            });
+                        member_stores.push((location, source, copied_from));
                     }
                     whole_container_reads.insert(source);
                     None
@@ -2331,9 +2882,14 @@ pub fn procedure_value_facts(
             if let Some((value, origin)) = origin {
                 origins
                     .entry(value)
-                    .and_modify(|existing| merge_load_origin(existing, origin))
+                    .and_modify(|existing| merge_load_origin(existing, origin.clone()))
                     .or_insert(origin);
             }
+        }
+    }
+    for origin in origins.values_mut() {
+        if matches!(origin, LoadOrigin::SeparatedPending { .. }) {
+            *origin = LoadOrigin::Ambiguous;
         }
     }
     // A Go assignment conversion is structured data dependence without exact
@@ -2365,32 +2921,232 @@ pub fn procedure_value_facts(
             pending.push(*source);
         }
     }
+    let prefix_stores = prefix_stores(procedure, &origins, &member_stores, cancellation, charge)?;
     Ok(ProcedureValueFacts {
         load_origins: origins,
-        copied_reference_members,
+        prefix_stores,
         whole_container_reads,
     })
 }
 
-/// The member slot a store names when the producer states that storing there
-/// duplicates a reference rather than an inline value.
-fn reference_member_slot(
-    semantics: &crate::analyzer::semantic::ProcedureSemantics,
-    location: MemoryLocationId,
-) -> Option<MemberSlot> {
-    let location = semantics.memory_location(location)?;
-    if location.value_copy != MemoryValueCopy::Reference {
-        return None;
+/// Index the member stores of one procedure by the cell they write, when some
+/// access continues through a loaded value at all.
+///
+/// A store is followable when the stored value names the object a path
+/// through the cell reaches: the producer states a reference or a backing
+/// store, or states nothing and the language never copies an object on
+/// assignment. An inline aggregate copy, and a store that states nothing in a
+/// language that may copy, are recorded as not followable so a read through
+/// the cell is reported partial instead of proving the stored members absent.
+fn prefix_stores(
+    procedure: &ProcedureHandle,
+    origins: &HashMap<ValueId, LoadOrigin>,
+    member_stores: &[(MemoryLocationId, ValueId, Option<MemoryLocationId>)],
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
+) -> Result<PrefixStores, Interruption> {
+    let mut stores = PrefixStores::default();
+    if member_stores.is_empty() {
+        return Ok(stores);
     }
-    let MemoryLocationKind::Field { base, member } = &location.kind else {
-        return None;
-    };
-    let span = member.anchor().span();
-    Some((*base, span.start_byte(), span.end_byte()))
+    // Index values that language lowering canonicalizes as constants.
+    stores.constant_indexes = semantics_constant_indexes(procedure.semantics());
+    let semantics = procedure.semantics();
+    let exact_integer = |value| exact_unsigned_integer_origin(semantics, origins, value);
+    // Only a base that is itself a loaded value lets a path continue through a
+    // cell; without one, no access has a strict-prefix cell.
+    let mut continues_through_a_load = false;
+    for location in semantics.memory_locations() {
+        charge(SemanticWork {
+            memory_locations: 1,
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
+        let (MemoryLocationKind::Field { base, .. }
+        | MemoryLocationKind::Index { base, .. }
+        | MemoryLocationKind::Property { base, .. }) = location.kind
+        else {
+            continue;
+        };
+        if matches!(
+            walk_value_origin(
+                origins,
+                base,
+                &mut HashSet::new(),
+                exact_integer,
+                &[],
+                &mut 0
+            ),
+            ValueOriginWalk::Load { .. }
+        ) {
+            continues_through_a_load = true;
+            break;
+        }
+    }
+    if !continues_through_a_load {
+        return Ok(stores);
+    }
+    use brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores;
+    let unmarked_stores = crate::analyzer::semantic::languages::language_knowledge(
+        procedure.artifact().key().language().language(),
+    )
+    .map_or(UnmarkedMemberStores::Opaque, |knowledge| {
+        knowledge.unmarked_member_stores()
+    });
+    if unmarked_stores == UnmarkedMemberStores::Unindexed
+        && !member_stores.iter().any(|&(location, _, _)| {
+            matches!(
+                semantics
+                    .memory_location(location)
+                    .expect("a recorded member store names a validated location")
+                    .value_copy,
+                MemoryValueCopy::Reference | MemoryValueCopy::BackingStore { .. }
+            )
+        })
+    {
+        return Ok(stores);
+    }
+    let unmarked_stores_share_object = unmarked_stores == UnmarkedMemberStores::Followable;
+    let binding_origins = BindingOriginIndex::from_semantics(semantics);
+    // The stores are keyed by their own unredirected path.
+    let unredirected = PrefixStores::default();
+    for &(location, stored, copied_from) in member_stores {
+        let row = semantics
+            .memory_location(location)
+            .expect("a recorded member store names a validated location");
+        let followed = match row.value_copy {
+            MemoryValueCopy::Reference | MemoryValueCopy::BackingStore { .. } => Some(stored),
+            MemoryValueCopy::Unknown if unmarked_stores_share_object => Some(stored),
+            MemoryValueCopy::Unknown | MemoryValueCopy::Value => None,
+        };
+        // A copied field can canonicalize to its source cell. Such an
+        // identity store does not redirect a longer access through that cell.
+        // Only an adjacent load/store pair proves no write intervened.
+        let copied_from = match copied_from {
+            Some(location) => {
+                match resolve_access_path(
+                    location,
+                    ValueOriginFacts {
+                        load_origins: origins,
+                        prefix_stores: &unredirected,
+                        binding_origins: Some(&binding_origins),
+                    },
+                    PREFIX_STORE_SELECTOR_LIMIT,
+                    cancellation,
+                    |id| semantics.memory_location(id).map(|row| &row.kind),
+                    exact_integer,
+                    &mut charge,
+                )
+                .expect("a stored load names a validated location")
+                {
+                    AccessPathResolution::Resolved(draft)
+                        if draft.tail == AccessPathTail::Exact =>
+                    {
+                        Some((
+                            CellRoot::of(&draft.root),
+                            draft
+                                .selectors
+                                .iter()
+                                .map(|selector| stores.cell_selector(selector, exact_integer))
+                                .collect::<Vec<_>>(),
+                        ))
+                    }
+                    AccessPathResolution::Interrupted(stop) => return Err(stop),
+                    AccessPathResolution::Resolved(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let (plans, truncated) = alternative_choice_plans(
+            location,
+            origins,
+            &unredirected,
+            |id| semantics.memory_location(id).map(|row| &row.kind),
+            exact_integer,
+            PREFIX_STORE_SELECTOR_LIMIT,
+            cancellation,
+        );
+        stores.incomplete |= truncated;
+        for choices in plans {
+            let resolution = resolve_access_path_with_choice(
+                location,
+                AccessPathResolutionInputs {
+                    origins: ValueOriginFacts {
+                        load_origins: origins,
+                        prefix_stores: &unredirected,
+                        binding_origins: Some(&binding_origins),
+                    },
+                    selector_limit: PREFIX_STORE_SELECTOR_LIMIT,
+                    cancellation,
+                    choices: &choices,
+                },
+                |id| semantics.memory_location(id).map(|row| &row.kind),
+                exact_integer,
+                &mut charge,
+            )
+            .expect("a recorded member store names a validated location");
+            let draft = match resolution {
+                AccessPathResolution::Resolved(draft) => draft,
+                AccessPathResolution::Interrupted(stop) => return Err(stop),
+            };
+            let selectors = draft
+                .selectors
+                .iter()
+                .map(|selector| stores.cell_selector(selector, exact_integer))
+                .collect::<Vec<_>>();
+            let root = CellRoot::of(&draft.root);
+            if draft.tail == AccessPathTail::Exact
+                && selectors.iter().all(|selector| {
+                    !matches!(
+                        selector,
+                        CellSelector::Index(CellIndex::Any | CellIndex::Exact(_))
+                    )
+                })
+                && copied_from
+                    .as_ref()
+                    .is_some_and(|(source_root, source_selectors)| {
+                        source_root == &root && source_selectors == &selectors
+                    })
+            {
+                continue;
+            }
+            let key = (root, selectors.iter().map(CellSelector::erased).collect());
+            stores.cells.entry(key).or_default().push(PrefixStore {
+                selectors,
+                followed,
+            });
+        }
+    }
+    Ok(stores)
 }
 
+fn semantics_constant_indexes(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+) -> HashSet<ValueId> {
+    semantics
+        .memory_locations()
+        .iter()
+        .filter_map(|location| match location.kind {
+            MemoryLocationKind::Index {
+                index: Some(index), ..
+            } => Some(index),
+            _ => None,
+        })
+        .filter(|index| {
+            semantics
+                .value(*index)
+                .is_some_and(|value| value.kind.is_constant())
+        })
+        .collect()
+}
+
+/// The longest selector chain a recorded store path keeps. A read path is
+/// truncated at the oracle's own limit from its leaf end, so a prefix near the
+/// root is never lost by that truncation.
+const PREFIX_STORE_SELECTOR_LIMIT: usize = 32;
+
 fn merge_load_origin(existing: &mut LoadOrigin, incoming: LoadOrigin) {
-    match (*existing, incoming) {
+    match (&*existing, &incoming) {
         (left, right) if left == right => {}
         (
             LoadOrigin::Value(left),
@@ -2400,8 +3156,8 @@ fn merge_load_origin(existing: &mut LoadOrigin, incoming: LoadOrigin) {
             },
         ) if left == right => {
             *existing = LoadOrigin::BackingStore {
-                source: right,
-                offset,
+                source: *right,
+                offset: *offset,
             };
         }
         (LoadOrigin::BackingStore { source: left, .. }, LoadOrigin::Value(right))
@@ -2409,11 +3165,194 @@ fn merge_load_origin(existing: &mut LoadOrigin, incoming: LoadOrigin) {
         // The transfer and the assignment it must immediately follow are two
         // events for one definition, so the transfer's separated identity
         // stands instead of making the pair ambiguous.
-        (LoadOrigin::Value(left), LoadOrigin::Separated { source: right }) if left == right => {
-            *existing = LoadOrigin::Separated { source: right };
+        (LoadOrigin::Value(left), LoadOrigin::Separated(transfer)) if left == &transfer.source => {
+            *existing = incoming;
         }
-        (LoadOrigin::Separated { source: left }, LoadOrigin::Value(right)) if left == right => {}
+        (LoadOrigin::Separated(transfer), LoadOrigin::Value(right))
+            if &transfer.source == right => {}
+        (LoadOrigin::SeparatedDefinitions(transfers), LoadOrigin::Value(right))
+            if transfers.iter().any(|transfer| &transfer.source == right) => {}
+        (
+            LoadOrigin::Separated(_) | LoadOrigin::SeparatedDefinitions(_),
+            LoadOrigin::Value(source),
+        ) => {
+            let transfers = match std::mem::replace(existing, LoadOrigin::Ambiguous) {
+                LoadOrigin::Separated(transfer) => vec![transfer].into_boxed_slice(),
+                LoadOrigin::SeparatedDefinitions(transfers) => transfers,
+                _ => unreachable!(),
+            };
+            *existing = LoadOrigin::SeparatedPending {
+                transfers,
+                source: *source,
+            };
+        }
+        (LoadOrigin::SeparatedPending { source, .. }, LoadOrigin::Separated(transfer))
+            if source == &transfer.source =>
+        {
+            let LoadOrigin::SeparatedPending { transfers, .. } =
+                std::mem::replace(existing, LoadOrigin::Ambiguous)
+            else {
+                unreachable!()
+            };
+            let mut transfers = transfers.into_vec();
+            let LoadOrigin::Separated(transfer) = incoming else {
+                unreachable!()
+            };
+            if !transfers.contains(&transfer) {
+                transfers.push(transfer);
+            }
+            *existing = LoadOrigin::SeparatedDefinitions(transfers.into_boxed_slice());
+        }
+        (
+            LoadOrigin::Separated(_) | LoadOrigin::SeparatedDefinitions(_),
+            LoadOrigin::Separated(_),
+        ) => {
+            let mut transfers = match std::mem::replace(existing, LoadOrigin::Ambiguous) {
+                LoadOrigin::Separated(transfer) => vec![transfer],
+                LoadOrigin::SeparatedDefinitions(transfers) => transfers.into_vec(),
+                _ => unreachable!(),
+            };
+            let LoadOrigin::Separated(transfer) = incoming else {
+                unreachable!()
+            };
+            if !transfers.contains(&transfer) {
+                transfers.push(transfer);
+            }
+            *existing = LoadOrigin::SeparatedDefinitions(transfers.into_boxed_slice());
+        }
+        // Plain copies from different sources are a finite set of
+        // definitions, not an unknown one.
+        (
+            LoadOrigin::Value(_) | LoadOrigin::Definitions(_),
+            LoadOrigin::Value(_) | LoadOrigin::Definitions(_),
+        ) => {
+            let mut sources = Vec::new();
+            for origin in [std::mem::replace(existing, LoadOrigin::Ambiguous), incoming] {
+                match origin {
+                    LoadOrigin::Value(source) => sources.push(source),
+                    LoadOrigin::Definitions(more) => sources.extend(more),
+                    _ => unreachable!("only plain copies reach the definition merge"),
+                }
+            }
+            let mut seen = HashSet::new();
+            sources.retain(|source| seen.insert(*source));
+            *existing = LoadOrigin::Definitions(sources.into_boxed_slice());
+        }
         _ => *existing = LoadOrigin::Ambiguous,
+    }
+}
+
+/// Follow only unconditional value aliases. A separated definition's source
+/// has a different object identity, so it must never be followed here.
+fn separated_return_definitions(
+    origins: &HashMap<ValueId, LoadOrigin>,
+    start: ValueId,
+) -> Option<&[SeparatedTransfer]> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        match origins.get(&current) {
+            Some(LoadOrigin::Value(next)) => current = *next,
+            Some(LoadOrigin::SeparatedDefinitions(transfers)) => return Some(transfers),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Object roots a finite origin choice can present at a whole-value read.
+/// A separated copy contributes its destination, never its source object.
+struct ReturnCandidates<'a> {
+    roots: HashSet<ValueId>,
+    /// The transfer that defined each separated destination root.
+    transfers: HashMap<ValueId, &'a SeparatedTransfer>,
+    /// Every leaf of the finite choice is an exact root (a separated
+    /// destination, or a local allocation result), so the roots enumerate
+    /// every object the read can denote.
+    exhaustive: bool,
+}
+
+fn return_candidate_roots<'a>(
+    origins: &'a HashMap<ValueId, LoadOrigin>,
+    local_allocations: &HashSet<ValueId>,
+    start: ValueId,
+) -> ReturnCandidates<'a> {
+    let mut candidates = ReturnCandidates {
+        roots: HashSet::new(),
+        transfers: HashMap::new(),
+        exhaustive: true,
+    };
+    let mut seen = HashSet::new();
+    let mut pending = vec![start];
+    while let Some(value) = pending.pop() {
+        if !seen.insert(value) {
+            continue;
+        }
+        match origins.get(&value) {
+            Some(LoadOrigin::Value(source)) => pending.push(*source),
+            Some(LoadOrigin::Definitions(sources)) => pending.extend(sources.iter().copied()),
+            Some(LoadOrigin::SeparatedDefinitions(transfers)) => {
+                for transfer in transfers {
+                    candidates.roots.insert(transfer.destination);
+                    candidates.transfers.insert(transfer.destination, transfer);
+                }
+            }
+            Some(LoadOrigin::Separated(transfer)) => {
+                candidates.roots.insert(value);
+                candidates.transfers.insert(value, transfer);
+            }
+            // Only an allocation effect in this procedure proves that the
+            // value denotes an object whose members were stored locally.
+            // Parameters and call results can also lack a load origin.
+            None => {
+                candidates.roots.insert(value);
+                if !local_allocations.contains(&value) {
+                    candidates.exhaustive = false;
+                }
+            }
+            Some(_) => {
+                candidates.roots.insert(value);
+                candidates.exhaustive = false;
+            }
+        }
+    }
+    candidates
+}
+
+/// Records that a stored member of a returned join was not transported to the
+/// return port (#9766). The gap is a property of the procedure's content, not of
+/// a limit, so the caller passes the content flag unless a capacity bound may
+/// have shaped the decision (see the call site).
+fn mark_rejected_return_member_incomplete(
+    incomplete: &mut bool,
+    has_stored_contents: bool,
+    candidate: Option<ValueId>,
+    roots: &HashSet<ValueId>,
+) {
+    if has_stored_contents && candidate.is_some_and(|value| roots.contains(&value)) {
+        *incomplete = true;
+    }
+}
+
+#[cfg(test)]
+mod separated_member_guard_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#9766: a rejected candidate return member was silently completed")]
+    fn rejected_candidate_member_opens_boundary_coverage() {
+        let candidate = ValueId::new(1);
+        let unrelated = ValueId::new(2);
+        let roots = HashSet::from([candidate]);
+        let mut incomplete = false;
+        mark_rejected_return_member_incomplete(&mut incomplete, true, Some(unrelated), &roots);
+        assert!(!incomplete, "an unrelated store must not open the return");
+        mark_rejected_return_member_incomplete(&mut incomplete, true, Some(candidate), &roots);
+        assert!(
+            incomplete,
+            "a rejected candidate must keep coverage incomplete"
+        );
     }
 }
 
@@ -2438,6 +3377,33 @@ pub fn exact_unsigned_integer_origin(
             Some(LoadOrigin::Value(source)) => current = *source,
             _ => return None,
         }
+    }
+}
+
+/// The selector a location adds to an access path, if it is a member, element
+/// or property access.
+fn selector_draft(kind: &MemoryLocationKind) -> Option<AccessSelectorDraft> {
+    match kind {
+        MemoryLocationKind::Property { key, .. } => {
+            Some(AccessSelectorDraft::Property(key.clone()))
+        }
+        MemoryLocationKind::Field { member, .. } => {
+            Some(AccessSelectorDraft::Field(member.clone()))
+        }
+        MemoryLocationKind::Index {
+            index,
+            constant_index,
+            identity,
+            ..
+        } => Some(AccessSelectorDraft::Index {
+            value: *index,
+            constant: *constant_index,
+            identity: *identity,
+        }),
+        MemoryLocationKind::Dereference { .. }
+        | MemoryLocationKind::Static { .. }
+        | MemoryLocationKind::LexicalCell { .. }
+        | MemoryLocationKind::Capture { .. } => None,
     }
 }
 
@@ -2491,6 +3457,20 @@ enum ValueOriginWalk {
 enum AlternativeChoice {
     Source,
     Allocation,
+    /// The definition at this position of a [`LoadOrigin::Definitions`] set.
+    Definition(usize),
+}
+
+impl AlternativeChoice {
+    /// Whether the choice is a backing-store candidate, which may name storage
+    /// the access never touches. A definition choice is one arm of an
+    /// exhaustive set, so the union of its arms is the exact answer.
+    fn is_backing_store_candidate(self) -> bool {
+        match self {
+            Self::Source | Self::Allocation => true,
+            Self::Definition(_) => false,
+        }
+    }
 }
 
 /// Walk one value back through the unconditional copies that define it.
@@ -2560,7 +3540,7 @@ fn walk_value_origin(
                             summarized: false,
                         };
                     }
-                    None => {
+                    Some(AlternativeChoice::Definition(_)) | None => {
                         return ValueOriginWalk::Root {
                             value: current,
                             offset,
@@ -2576,15 +3556,38 @@ fn walk_value_origin(
                     offset,
                 };
             }
-            Some(LoadOrigin::Separated { .. }) => {
+            Some(LoadOrigin::Separated(_) | LoadOrigin::SeparatedDefinitions(_)) => {
                 return ValueOriginWalk::Root {
                     value: current,
                     offset,
                     summarized: false,
                 };
             }
+            Some(LoadOrigin::Definitions(sources)) if visited.insert(current) => {
+                let choice = choices.get(*choice_index).copied();
+                *choice_index = (*choice_index).saturating_add(1);
+                // A plan is enumerated along the same chain this walk takes,
+                // so its choice here is a definition of this set. A choice
+                // that is not stops on a summarized root, as an unplanned
+                // walk does.
+                match choice.and_then(|choice| match choice {
+                    AlternativeChoice::Definition(position) => sources.get(position),
+                    AlternativeChoice::Source | AlternativeChoice::Allocation => None,
+                }) {
+                    Some(source) => current = *source,
+                    None => {
+                        return ValueOriginWalk::Root {
+                            value: current,
+                            offset,
+                            summarized: true,
+                        };
+                    }
+                }
+            }
             Some(LoadOrigin::Value(_))
             | Some(LoadOrigin::BackingStore { .. })
+            | Some(LoadOrigin::Definitions(_))
+            | Some(LoadOrigin::SeparatedPending { .. })
             | Some(LoadOrigin::Ambiguous) => {
                 return ValueOriginWalk::Root {
                     value: current,
@@ -2603,23 +3606,53 @@ fn walk_value_origin(
     }
 }
 
-/// The member a copied reference redirects to, when the retained path still
-/// continues through it.
-fn copied_reference_redirect(
-    selectors: &VecDeque<AccessSelectorDraft>,
-    copied_reference_members: &HashMap<MemberSlot, ValueId>,
-    base: ValueId,
-) -> Option<ValueId> {
-    if selectors.len() < 2 {
-        return None;
+/// What a walk does at a root that a longer path still continues through.
+enum PrefixStep {
+    /// No store reaches a strict prefix of the path.
+    Unchanged,
+    /// A prefix cell holds this value; the walk continues from it with the
+    /// prefix selectors consumed.
+    Follow(ValueId),
+    /// A store reaches a prefix cell and cannot be followed, so the stored
+    /// members cannot be proven absent.
+    Opaque,
+}
+
+/// Take the redirect through a strict-prefix cell at `root`, consuming the
+/// prefix's selectors.
+///
+/// Every nonempty candidate set is a may-choice: position zero keeps the
+/// original path, and later positions follow stores. The flow-insensitive index
+/// cannot prove a store ran before the read. A walk with no plan entry is
+/// reported opaque rather than silently taking an arm.
+fn follow_prefix_store(
+    prefix_stores: &PrefixStores,
+    root: CellRoot,
+    selectors: &mut VecDeque<AccessSelectorDraft>,
+    choices: &[AlternativeChoice],
+    choice_index: &mut usize,
+    exact_integer: impl Fn(ValueId) -> Option<u128>,
+) -> PrefixStep {
+    let candidates = prefix_stores.candidates(root, selectors, exact_integer);
+    if candidates.is_empty() {
+        return PrefixStep::Unchanged;
     }
-    let AccessSelectorDraft::Field(member) = selectors.back()? else {
-        return None;
+    let choice = choices.get(*choice_index).copied();
+    *choice_index = (*choice_index).saturating_add(1);
+    let candidate = match choice {
+        Some(AlternativeChoice::Definition(0)) => return PrefixStep::Unchanged,
+        Some(AlternativeChoice::Definition(position)) => candidates.get(position - 1).copied(),
+        _ => None,
     };
-    let span = member.anchor().span();
-    copied_reference_members
-        .get(&(base, span.start_byte(), span.end_byte()))
-        .copied()
+    match candidate.and_then(|candidate| Some((candidate.depth, candidate.followed?))) {
+        Some((depth, value)) => {
+            for _ in 0..depth {
+                selectors.pop_back();
+            }
+            PrefixStep::Follow(value)
+        }
+        None => PrefixStep::Opaque,
+    }
 }
 
 #[doc(hidden)]
@@ -2664,7 +3697,7 @@ fn resolve_access_path_with_choice<'location>(
         origins:
             ValueOriginFacts {
                 load_origins,
-                copied_reference_members,
+                prefix_stores,
                 binding_origins,
             },
         selector_limit,
@@ -2677,6 +3710,8 @@ fn resolve_access_path_with_choice<'location>(
     let mut choice_index = 0usize;
     let mut selectors = VecDeque::new();
     let mut summarized = false;
+    let mut opaque_prefix = false;
+    let mut original_cell = None;
 
     let root = 'locations: loop {
         if cancellation.is_cancelled() {
@@ -2703,43 +3738,13 @@ fn resolve_access_path_with_choice<'location>(
             visited.insert(current),
             "access-path cycles are stopped before revisiting a location"
         );
+        if let Some(selector) = selector_draft(kind) {
+            retain_selector(&mut selectors, selector, selector_limit, &mut summarized);
+        }
         let mut base = match kind {
-            MemoryLocationKind::Property { base, key } => {
-                retain_selector(
-                    &mut selectors,
-                    AccessSelectorDraft::Property(key.clone()),
-                    selector_limit,
-                    &mut summarized,
-                );
-                *base
-            }
-            MemoryLocationKind::Field { base, member } => {
-                retain_selector(
-                    &mut selectors,
-                    AccessSelectorDraft::Field(member.clone()),
-                    selector_limit,
-                    &mut summarized,
-                );
-                *base
-            }
-            MemoryLocationKind::Index {
-                base,
-                index,
-                constant_index,
-                identity,
-            } => {
-                retain_selector(
-                    &mut selectors,
-                    AccessSelectorDraft::Index {
-                        value: *index,
-                        constant: *constant_index,
-                        identity: *identity,
-                    },
-                    selector_limit,
-                    &mut summarized,
-                );
-                *base
-            }
+            MemoryLocationKind::Property { base, .. }
+            | MemoryLocationKind::Field { base, .. }
+            | MemoryLocationKind::Index { base, .. } => *base,
             MemoryLocationKind::Dereference { address } => {
                 let unique_binding_cell = binding_origins.and_then(|origins| {
                     origins
@@ -2770,19 +3775,54 @@ fn resolve_access_path_with_choice<'location>(
                 }
             }
             MemoryLocationKind::Static { member } => {
-                break AccessPathRootDraft::Static(member.clone());
+                match redirect_at_root(
+                    prefix_stores,
+                    AccessPathRootDraft::Static(member.clone()),
+                    &mut selectors,
+                    choices,
+                    &mut choice_index,
+                    exact_integer,
+                    &mut opaque_prefix,
+                    &mut original_cell,
+                ) {
+                    Ok(stored) => stored,
+                    Err(root) => break 'locations root,
+                }
             }
             MemoryLocationKind::LexicalCell { .. } => {
-                break AccessPathRootDraft::LexicalCell(current);
+                match redirect_at_root(
+                    prefix_stores,
+                    AccessPathRootDraft::LexicalCell(current),
+                    &mut selectors,
+                    choices,
+                    &mut choice_index,
+                    exact_integer,
+                    &mut opaque_prefix,
+                    &mut original_cell,
+                ) {
+                    Ok(stored) => stored,
+                    Err(root) => break 'locations root,
+                }
             }
             MemoryLocationKind::Capture { .. } => {
-                break AccessPathRootDraft::Capture(current);
+                match redirect_at_root(
+                    prefix_stores,
+                    AccessPathRootDraft::Capture(current),
+                    &mut selectors,
+                    choices,
+                    &mut choice_index,
+                    exact_integer,
+                    &mut opaque_prefix,
+                    &mut original_cell,
+                ) {
+                    Ok(stored) => stored,
+                    Err(root) => break 'locations root,
+                }
             }
         };
 
-        // Each redirect below drops the member selector it consumed, so the
-        // walk cannot revisit one and terminates in the retained selector
-        // count.
+        // Each prefix redirect drops the selectors it consumed, so the walk
+        // cannot revisit one and terminates in the retained selector count.
         loop {
             match walk_value_origin(
                 load_origins,
@@ -2798,20 +3838,22 @@ fn resolve_access_path_with_choice<'location>(
                     summarized: joined,
                 } => {
                     summarized |= joined || !apply_backing_offset(&mut selectors, offset);
-                    // A by-value copy duplicates a reference-typed member as the
-                    // reference it holds, so the destination member and the source
-                    // member name one object. A path that continues *through* that
-                    // member therefore names the storage the source member names.
-                    // The member slot itself stays distinct, which is why this
-                    // applies only while a selector below it is still retained.
-                    if let Some(source) =
-                        copied_reference_redirect(&selectors, copied_reference_members, value)
-                    {
-                        selectors.pop_back();
-                        base = source;
-                        continue;
+                    match redirect_at_root(
+                        prefix_stores,
+                        AccessPathRootDraft::Value(value),
+                        &mut selectors,
+                        choices,
+                        &mut choice_index,
+                        exact_integer,
+                        &mut opaque_prefix,
+                        &mut original_cell,
+                    ) {
+                        Ok(stored) => {
+                            base = stored;
+                            continue;
+                        }
+                        Err(root) => break 'locations root,
                     }
-                    break 'locations AccessPathRootDraft::Value(value);
                 }
                 ValueOriginWalk::Port {
                     kind,
@@ -2819,7 +3861,22 @@ fn resolve_access_path_with_choice<'location>(
                     summarized: joined,
                 } => {
                     summarized |= joined || !apply_backing_offset(&mut selectors, offset);
-                    break 'locations AccessPathRootDraft::ProcedurePort(kind);
+                    match redirect_at_root(
+                        prefix_stores,
+                        AccessPathRootDraft::ProcedurePort(kind),
+                        &mut selectors,
+                        choices,
+                        &mut choice_index,
+                        exact_integer,
+                        &mut opaque_prefix,
+                        &mut original_cell,
+                    ) {
+                        Ok(stored) => {
+                            base = stored;
+                            continue;
+                        }
+                        Err(root) => break 'locations root,
+                    }
                 }
                 ValueOriginWalk::Allocation {
                     allocation,
@@ -2827,7 +3884,22 @@ fn resolve_access_path_with_choice<'location>(
                     summarized: joined,
                 } => {
                     summarized |= joined || !apply_backing_offset(&mut selectors, offset);
-                    break 'locations AccessPathRootDraft::Allocation(allocation);
+                    match redirect_at_root(
+                        prefix_stores,
+                        AccessPathRootDraft::Allocation(allocation),
+                        &mut selectors,
+                        choices,
+                        &mut choice_index,
+                        exact_integer,
+                        &mut opaque_prefix,
+                        &mut original_cell,
+                    ) {
+                        Ok(stored) => {
+                            base = stored;
+                            continue;
+                        }
+                        Err(root) => break 'locations root,
+                    }
                 }
                 ValueOriginWalk::Load {
                     location,
@@ -2846,7 +3918,11 @@ fn resolve_access_path_with_choice<'location>(
         }
     };
 
+    if summarized && let Some(original) = original_cell.as_mut() {
+        original.tail = AccessPathTail::Summary;
+    }
     Ok(AccessPathResolution::Resolved(AccessPathDraft {
+        original_cell,
         root,
         selectors: selectors.into_iter().rev().collect(),
         tail: if summarized {
@@ -2854,106 +3930,298 @@ fn resolve_access_path_with_choice<'location>(
         } else {
             AccessPathTail::Exact
         },
+        opaque_prefix,
     }))
+}
+
+/// Apply the strict-prefix redirect at the root `root` a walk reached.
+///
+/// `Ok` is the value the walk continues from, `Err` the root the path ends
+/// at. An unfollowable store marks the path opaque, so the relation is
+/// partial. The path keeps its exact selectors: it is the cell the access
+/// names, and what is unknown is only what an unfollowed store put below it.
+#[allow(clippy::too_many_arguments)]
+fn redirect_at_root(
+    prefix_stores: &PrefixStores,
+    root: AccessPathRootDraft,
+    selectors: &mut VecDeque<AccessSelectorDraft>,
+    choices: &[AlternativeChoice],
+    choice_index: &mut usize,
+    exact_integer: impl Fn(ValueId) -> Option<u128>,
+    opaque_prefix: &mut bool,
+    original_cell: &mut Option<Box<AccessPathDraft>>,
+) -> Result<ValueId, AccessPathRootDraft> {
+    let original_selectors = selectors.iter().rev().cloned().collect();
+    match follow_prefix_store(
+        prefix_stores,
+        CellRoot::of(&root),
+        selectors,
+        choices,
+        choice_index,
+        exact_integer,
+    ) {
+        PrefixStep::Follow(stored) => {
+            original_cell.get_or_insert_with(|| {
+                Box::new(AccessPathDraft {
+                    original_cell: None,
+                    root: root.clone(),
+                    selectors: original_selectors,
+                    tail: AccessPathTail::Exact,
+                    opaque_prefix: false,
+                })
+            });
+            Ok(stored)
+        }
+        PrefixStep::Unchanged => Err(root),
+        PrefixStep::Opaque => {
+            *opaque_prefix = true;
+            Err(root)
+        }
+    }
 }
 
 fn apply_backing_offset(
     selectors: &mut VecDeque<AccessSelectorDraft>,
     offset: Option<u128>,
 ) -> bool {
-    let Some(offset) = offset else {
-        return false;
-    };
-    if offset == 0 {
+    if offset == Some(0) {
         return true;
     }
     let Some(AccessSelectorDraft::Index {
-        constant: Some(index),
-        ..
+        value, constant, ..
     }) = selectors.back_mut()
     else {
         return false;
     };
-    let Some(translated) = index.checked_add(offset) else {
-        return false;
-    };
-    *index = translated;
-    true
+    if let (Some(offset), Some(index)) = (offset, constant.as_mut())
+        && let Some(translated) = index.checked_add(offset)
+    {
+        *index = translated;
+        return true;
+    }
+    // An index the offset cannot translate (an unknown offset, or a
+    // non-constant index past a nonzero one) may name any element, so the
+    // prefix lookup and the redirect must not keep the untranslated index.
+    *value = None;
+    *constant = None;
+    false
 }
 
 /// Enumerate the finite alternative choices reachable from a memory location.
 /// The worklist keeps nested alternatives distinct: an outer retained arm can
 /// still encounter an inner fresh arm. The returned boolean records a breadth
 /// truncation without hiding the candidates already retained.
+///
+/// This mirrors the walk in [`resolve_access_path_with_choice`] step for step,
+/// including the selectors it retains, because a strict-prefix redirect depends
+/// on them: every root reached by a prefix candidate is a choice point, with
+/// the original path first and then the stores. The index is flow-insensitive
+/// and cannot prove a store ran before the read.
 fn alternative_choice_plans<'location>(
     location: MemoryLocationId,
     load_origins: &HashMap<ValueId, LoadOrigin>,
+    prefix_stores: &PrefixStores,
     location_kind: impl Fn(MemoryLocationId) -> Option<&'location MemoryLocationKind>,
+    exact_integer: impl Fn(ValueId) -> Option<u128> + Copy,
     limit: usize,
+    cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
 ) -> (Vec<Vec<AlternativeChoice>>, bool) {
+    /// The choices taken so far and the cells the path retains, leaf first.
+    type Walk = (Vec<AlternativeChoice>, Vec<CellSelector>);
     enum Pending {
-        Location(MemoryLocationId, Vec<AlternativeChoice>),
-        Value(ValueId, Vec<AlternativeChoice>),
+        Location(MemoryLocationId, Walk),
+        Value(ValueId, Walk),
+    }
+    /// Continue past a root the walk reached: through the stores that reach a
+    /// strict prefix of the path, or to the end of the plan.
+    fn at_root(
+        prefix_stores: &PrefixStores,
+        root: CellRoot,
+        (choices, cells): Walk,
+        pending: &mut Vec<Pending>,
+        plans: &mut Vec<Vec<AlternativeChoice>>,
+    ) {
+        let path = cells.iter().rev().cloned().collect::<Vec<_>>();
+        let candidates = if path.len() < 2 {
+            Vec::new()
+        } else {
+            prefix_stores.candidates_for_path(root, &path)
+        };
+        if candidates.is_empty() {
+            plans.push(choices);
+            return;
+        }
+        let mut original_choices = choices.clone();
+        original_choices.push(AlternativeChoice::Definition(0));
+        plans.push(original_choices);
+        for (position, candidate) in candidates.iter().enumerate() {
+            let mut choices = choices.clone();
+            choices.push(AlternativeChoice::Definition(position + 1));
+            match candidate.followed {
+                Some(stored) => {
+                    let mut cells = cells.clone();
+                    cells.truncate(cells.len() - candidate.depth);
+                    pending.push(Pending::Value(stored, (choices, cells)));
+                }
+                None => plans.push(choices),
+            }
+        }
     }
     let limit = limit.max(2);
-    let mut pending = vec![Pending::Location(location, Vec::new())];
+    let mut pending = vec![Pending::Location(location, (Vec::new(), Vec::new()))];
     let mut seen = HashSet::new();
+    let mut expanded = HashSet::new();
     let mut plans = Vec::new();
     let mut truncated = false;
+    let mut steps = 0_usize;
     while let Some(state) = pending.pop() {
-        let (tag, id, choices) = match &state {
-            Pending::Location(location, choices) => (0_u8, location.index(), choices),
-            Pending::Value(value, choices) => (1_u8, value.index(), choices),
+        steps += 1;
+        if cancellation.is_cancelled() || steps > limit.saturating_mul(64) {
+            truncated = true;
+            break;
+        }
+        let (tag, id, cells) = match &state {
+            Pending::Location(location, (_, cells)) => (0_u8, location.index(), cells.clone()),
+            Pending::Value(value, (_, cells)) => (1_u8, value.index(), cells.clone()),
         };
-        if !seen.insert((tag, id, choices.len())) {
+        if !seen.insert((tag, id, cells)) {
+            truncated = true;
             continue;
         }
         match state {
-            Pending::Location(current, choices) => {
+            Pending::Location(current, (choices, mut cells)) => {
                 let Some(kind) = location_kind(current) else {
                     plans.push(choices);
                     continue;
                 };
-                let Some(base) = (match kind {
+                if let Some(selector) = selector_draft(kind) {
+                    cells.push(prefix_stores.cell_selector(&selector, exact_integer));
+                }
+                let walk = (choices, cells);
+                match kind {
                     MemoryLocationKind::Field { base, .. }
                     | MemoryLocationKind::Index { base, .. }
-                    | MemoryLocationKind::Property { base, .. } => Some(*base),
-                    MemoryLocationKind::Dereference { .. } => None,
-                    MemoryLocationKind::Static { .. }
-                    | MemoryLocationKind::LexicalCell { .. }
-                    | MemoryLocationKind::Capture { .. } => None,
-                }) else {
-                    plans.push(choices);
-                    continue;
-                };
-                pending.push(Pending::Value(base, choices));
+                    | MemoryLocationKind::Property { base, .. } => {
+                        pending.push(Pending::Value(*base, walk));
+                    }
+                    MemoryLocationKind::Dereference { .. } => plans.push(walk.0),
+                    MemoryLocationKind::Static { member } => at_root(
+                        prefix_stores,
+                        CellRoot::Static(member.clone()),
+                        walk,
+                        &mut pending,
+                        &mut plans,
+                    ),
+                    MemoryLocationKind::LexicalCell { .. } => at_root(
+                        prefix_stores,
+                        CellRoot::LexicalCell(current),
+                        walk,
+                        &mut pending,
+                        &mut plans,
+                    ),
+                    MemoryLocationKind::Capture { .. } => at_root(
+                        prefix_stores,
+                        CellRoot::Capture(current),
+                        walk,
+                        &mut pending,
+                        &mut plans,
+                    ),
+                }
             }
-            Pending::Value(value, choices) => match load_origins.get(&value) {
-                Some(LoadOrigin::Value(next))
-                | Some(LoadOrigin::BackingStore { source: next, .. }) => {
-                    pending.push(Pending::Value(*next, choices));
+            Pending::Value(value, (choices, mut cells)) => {
+                // The walk applies the backing-store offsets it passed to the
+                // selector nearest the root once, where it stops; adding each
+                // step as it is passed gives the same sum.
+                let step = |offset: &BackingStoreOffset| match offset {
+                    BackingStoreOffset::Zero => Some(0),
+                    BackingStoreOffset::Constant(step) => Some(*step),
+                    BackingStoreOffset::Value(value) => exact_integer(*value),
+                };
+                // Mirrors apply_backing_offset: an index the step cannot
+                // translate may name any element.
+                fn shift(cells: &mut [CellSelector], step: Option<u128>) {
+                    if step == Some(0) {
+                        return;
+                    }
+                    if let Some(CellSelector::Index(index)) = cells.last_mut() {
+                        *index = match (step, &*index) {
+                            (Some(step), CellIndex::Constant(constant)) => constant
+                                .checked_add(step)
+                                .map_or(CellIndex::Any, CellIndex::Constant),
+                            _ => CellIndex::Any,
+                        };
+                    }
                 }
-                Some(LoadOrigin::Unique(next)) => {
-                    pending.push(Pending::Location(*next, choices));
+                match load_origins.get(&value) {
+                    Some(LoadOrigin::Value(next)) => {
+                        pending.push(Pending::Value(*next, (choices, cells)));
+                    }
+                    Some(LoadOrigin::BackingStore {
+                        source: next,
+                        offset,
+                    }) => {
+                        shift(&mut cells, step(offset));
+                        pending.push(Pending::Value(*next, (choices, cells)));
+                    }
+                    Some(LoadOrigin::Unique(next)) => {
+                        pending.push(Pending::Location(*next, (choices, cells)));
+                    }
+                    Some(LoadOrigin::BackingStoreAlternative {
+                        source,
+                        offset,
+                        allocation,
+                    }) => {
+                        let mut allocation_choices = choices.clone();
+                        allocation_choices.push(AlternativeChoice::Allocation);
+                        let mut source_choices = choices;
+                        source_choices.push(AlternativeChoice::Source);
+                        let allocation_cells = cells.clone();
+                        shift(&mut cells, step(offset));
+                        pending.push(Pending::Value(*source, (source_choices, cells)));
+                        at_root(
+                            prefix_stores,
+                            CellRoot::Allocation(*allocation),
+                            (allocation_choices, allocation_cells),
+                            &mut pending,
+                            &mut plans,
+                        );
+                    }
+                    // A definition set met again on this walk is a copy cycle. The
+                    // plan stops there, and its walk stops on a summarized root.
+                    Some(LoadOrigin::Definitions(_)) if !expanded.insert(value) => {
+                        truncated = true;
+                        plans.push(choices);
+                    }
+                    Some(LoadOrigin::Definitions(sources)) => {
+                        for (position, source) in sources.iter().enumerate() {
+                            let mut definition_choices = choices.clone();
+                            definition_choices.push(AlternativeChoice::Definition(position));
+                            pending
+                                .push(Pending::Value(*source, (definition_choices, cells.clone())));
+                        }
+                    }
+                    Some(LoadOrigin::ProcedurePort(kind)) => at_root(
+                        prefix_stores,
+                        CellRoot::Port(*kind),
+                        (choices, cells),
+                        &mut pending,
+                        &mut plans,
+                    ),
+                    Some(LoadOrigin::Separated(_) | LoadOrigin::SeparatedDefinitions(_))
+                    | Some(LoadOrigin::SeparatedPending { .. })
+                    | Some(LoadOrigin::Ambiguous)
+                    | None => at_root(
+                        prefix_stores,
+                        CellRoot::Value(value),
+                        (choices, cells),
+                        &mut pending,
+                        &mut plans,
+                    ),
                 }
-                Some(LoadOrigin::BackingStoreAlternative { source, .. }) => {
-                    let mut source_choices = choices.clone();
-                    source_choices.push(AlternativeChoice::Source);
-                    pending.push(Pending::Value(*source, source_choices));
-                    let mut allocation_choices = choices;
-                    allocation_choices.push(AlternativeChoice::Allocation);
-                    plans.push(allocation_choices);
-                }
-                Some(LoadOrigin::ProcedurePort(_))
-                | Some(LoadOrigin::Separated { .. })
-                | Some(LoadOrigin::Ambiguous)
-                | None => {
-                    plans.push(choices);
-                }
-            },
+            }
         }
         if plans.len() >= limit {
-            truncated = !pending.is_empty();
+            truncated |= !pending.is_empty();
             break;
         }
     }
@@ -3223,6 +4491,7 @@ fn element_read_base_value(
 struct ContainerElement {
     location: AbstractLocation,
     has_stored_contents: bool,
+    store_locations: HashSet<MemoryLocationId>,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
 }
@@ -3250,11 +4519,12 @@ struct ContainerElements {
 }
 
 impl ContainerElements {
-    fn record_store(&mut self, endpoint: &ValueFlowEndpoint) {
+    fn record_store(&mut self, endpoint: &ValueFlowEndpoint, store_location: MemoryLocationId) {
         if let ValueFlowEndpoint::Location(location) = endpoint
             && let Some(index) = self.seen.get(location.as_ref())
         {
             self.elements[*index].has_stored_contents = true;
+            self.elements[*index].store_locations.insert(store_location);
         }
     }
 
@@ -3286,6 +4556,7 @@ impl ContainerElements {
                 self.elements.push(ContainerElement {
                     location: location.as_ref().clone(),
                     has_stored_contents: false,
+                    store_locations: HashSet::new(),
                     proof: proof.clone(),
                     completeness: completeness.clone(),
                 });
@@ -3509,6 +4780,7 @@ fn backing_store_alternative_location(
     materialize_abstract_location(
         procedure,
         AccessPathDraft {
+            original_cell: None,
             root,
             selectors,
             tail: if summarized {
@@ -3516,6 +4788,7 @@ fn backing_store_alternative_location(
             } else {
                 AccessPathTail::Exact
             },
+            opaque_prefix: false,
         },
         limits,
     )
@@ -3563,6 +4836,8 @@ fn materialize_flow_snapshot(
     discharged_gaps: Vec<crate::analyzer::semantic::SemanticGapId>,
     unproven_go_builtin_assumptions: bool,
     member_receivers: Vec<crate::analyzer::semantic::MemberReceiverFlow>,
+    collection_cells: Vec<crate::analyzer::semantic::CollectionCellBinding>,
+    execution_dependent: bool,
 ) -> Result<ValueFlowSnapshot, SemanticProviderError> {
     let records = drafts
         .iter()
@@ -3600,7 +4875,7 @@ fn materialize_flow_snapshot(
             let id = arena
                 .handle(id)
                 .expect("value-flow record was inserted into the arena");
-            Ok(match draft.memory_origin {
+            let mut relation = match draft.memory_origin {
                 Some(_) => {
                     let seal = id
                         .record()
@@ -3610,7 +4885,9 @@ fn materialize_flow_snapshot(
                     ValueFlowRelation::sealed(id, draft.payload, seal)
                 }
                 None => ValueFlowRelation::unsealed(id, draft.payload),
-            })
+            };
+            relation.original_cell = draft.original_cell;
+            Ok(relation)
         })
         .collect::<Result<Vec<_>, SemanticProviderError>>()?;
     ValueFlowSnapshot::with_member_receivers_and_discharged_gaps(
@@ -3621,18 +4898,23 @@ fn materialize_flow_snapshot(
         limits,
         discharged_gaps,
         member_receivers,
+        collection_cells,
+        execution_dependent,
     )
     .map(|snapshot| snapshot.with_unproven_go_builtin_assumptions(unproven_go_builtin_assumptions))
     .map_err(|error| internal_contract("invalid value-flow snapshot", error))
 }
 
 fn publish_flow_outcome(
-    snapshot: ValueFlowSnapshot,
+    mut snapshot: ValueFlowSnapshot,
     interrupted: Option<Interruption>,
     has_unproven_relation: bool,
     gap_quality: Option<GapOutcomeQuality>,
     work: SemanticWork,
 ) -> SemanticOutcome<ValueFlowSnapshot> {
+    if interrupted.is_some() || snapshot.coverage() == CandidateCoverage::Truncated {
+        snapshot.mark_execution_dependent();
+    }
     let quality = merge_relation_quality(gap_quality, has_unproven_relation);
     match interrupted {
         Some(Interruption::Budget(exceeded)) => SemanticOutcome::ExceededBudget {
@@ -3994,10 +5276,33 @@ pub struct LocalCallableTarget {
     pub closure: ProcedureHandle,
     #[doc(hidden)]
     pub creation: ValueHandle,
+    /// The exact creation event in `creation.procedure()`.
+    #[doc(hidden)]
+    pub creation_point: ProgramPointId,
+    #[doc(hidden)]
+    pub creation_event_index: usize,
     #[doc(hidden)]
     pub captures: Box<[MemoryLocationId]>,
     #[doc(hidden)]
     pub capture_bindings: Box<[CaptureBinding]>,
+}
+
+/// Result of a source-backed gap discharge proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapDischargeVerdict {
+    Discharged,
+    Undischarged,
+    RefusedByRequestLimit,
+}
+
+impl From<bool> for GapDischargeVerdict {
+    fn from(discharged: bool) -> Self {
+        if discharged {
+            Self::Discharged
+        } else {
+            Self::Undischarged
+        }
+    }
 }
 
 /// The answers the value-flow relation projection takes from outside the
@@ -4080,7 +5385,10 @@ pub trait RelationProjectionHost {
         gap: &crate::analyzer::semantic::SemanticGap,
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, SemanticProviderError>;
+    ) -> Result<
+        crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict,
+        SemanticProviderError,
+    >;
 
     /// Whether an implicit-drop gap is discharged because the procedure's
     /// drops run no user code. `inert` memoizes the per-procedure answer
@@ -4091,15 +5399,79 @@ pub trait RelationProjectionHost {
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
         inert: &mut Option<bool>,
-    ) -> Result<bool, SemanticProviderError>;
+    ) -> Result<
+        crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict,
+        SemanticProviderError,
+    >;
 
     fn residual_conversion_discharged(
         &self,
         _gap: &crate::analyzer::semantic::SemanticGap,
         _procedure: &ProcedureHandle,
         _request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, SemanticProviderError> {
-        Ok(false)
+    ) -> Result<
+        crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict,
+        SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Undischarged)
+    }
+
+    /// Whether the active semantic models may publish a complete
+    /// collection-flow contract. A false answer promises that
+    /// [`Self::collection_flow_contract`] returns `None` for every call in
+    /// this projection, so the closed-container proof can decide every
+    /// allocation is unbound without resolving its calls (#11092). Parse-time
+    /// hosts abstain.
+    fn may_have_complete_collection_flow_contracts(&self) -> bool {
+        false
+    }
+
+    /// The exact class a constructor call instantiates, when dispatch proves
+    /// it (#10989). Parse-time hosts abstain.
+    fn constructed_class(
+        &self,
+        _call: &crate::analyzer::semantic::CallSiteHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<Box<str>>, SemanticProviderError> {
+        Ok(None)
+    }
+
+    /// The complete collection-flow contract of the member `call` selects on
+    /// a receiver whose exact runtime class is `receiver_class` (#10989).
+    ///
+    /// The caller proves the receiver's class; the host answers only when
+    /// dispatch names exactly one external member owned by that class, so an
+    /// unknown override cannot be selected instead. Parse-time hosts abstain:
+    /// pack content is not part of the identity of stored partial-flow rows,
+    /// so it must not reach them.
+    fn collection_flow_contract(
+        &self,
+        _call: &crate::analyzer::semantic::CallSiteHandle,
+        _receiver_class: &str,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        Option<Arc<crate::analyzer::semantic_model::CollectionFlowContract>>,
+        SemanticProviderError,
+    > {
+        Ok(None)
+    }
+
+    /// Whether a field or index memory gap is retired because the workspace
+    /// resolver proves that the location's member names one declaration in
+    /// this procedure (#9402). `proven` memoizes the procedure's retired gaps
+    /// across the gaps of one sweep. Parse-time hosts have no resolver and
+    /// abstain.
+    fn resolved_member_identity_discharged(
+        &self,
+        _gap: &crate::analyzer::semantic::SemanticGap,
+        _procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+        _proven: &mut Option<Vec<SemanticGapId>>,
+    ) -> Result<
+        crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict,
+        SemanticProviderError,
+    > {
+        Ok(crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Undischarged)
     }
 
     /// Whether the heap oracle certifies one exact store as a strong update.
@@ -4129,6 +5501,7 @@ pub trait RelationProjectionHost {
 /// the host's discharge predicates and the procedure's own proofs.
 #[doc(hidden)]
 pub struct GapSweep {
+    pub execution_dependent: bool,
     #[doc(hidden)]
     pub open: bool,
     /// Whether a recorded Go builtin assumption survived the package proof.
@@ -4182,6 +5555,7 @@ pub fn sweep_procedure_gaps(
     request: &mut SemanticRequest<'_>,
 ) -> Result<GapSweep, SemanticProviderError> {
     let mut store_bases: Option<LocalStoreBases> = None;
+    let mut execution_dependent = false;
     let mut open = false;
     let mut relevant_gaps = Vec::new();
     let mut gap_quality = None;
@@ -4207,6 +5581,7 @@ pub fn sweep_procedure_gaps(
     if interrupted.is_none() {
         let abort_user_code = abort_paths_run_user_code(procedure.semantics());
         let mut inert_drops = None;
+        let mut member_identities = None;
         for gap in procedure.semantics().gaps() {
             if request.cancellation.is_cancelled() {
                 interrupted = Some(Interruption::Cancelled);
@@ -4250,18 +5625,44 @@ pub fn sweep_procedure_gaps(
                     let before = staged.budget.used();
                     let relevant = {
                         let mut nested = staged.request(request.cancellation);
-                        !host.residual_conversion_discharged(gap, procedure, &mut nested)?
-                            && !host.external_constant_field_read_discharged(
-                                gap,
-                                procedure,
-                                &mut nested,
-                            )?
-                            && !host.inert_drop_glue_discharged(
-                                gap,
-                                procedure,
-                                &mut nested,
-                                &mut inert_drops,
-                            )?
+                        let mut relevant = true;
+                        for predicate in 0..4 {
+                            let verdict = match predicate {
+                                0 => host.residual_conversion_discharged(
+                                    gap,
+                                    procedure,
+                                    &mut nested,
+                                )?,
+                                1 => host.external_constant_field_read_discharged(
+                                    gap,
+                                    procedure,
+                                    &mut nested,
+                                )?,
+                                2 => host.inert_drop_glue_discharged(
+                                    gap,
+                                    procedure,
+                                    &mut nested,
+                                    &mut inert_drops,
+                                )?,
+                                _ => host.resolved_member_identity_discharged(
+                                    gap,
+                                    procedure,
+                                    &mut nested,
+                                    &mut member_identities,
+                                )?,
+                            };
+                            match verdict {
+                                GapDischargeVerdict::Discharged => {
+                                    relevant = false;
+                                    break;
+                                }
+                                GapDischargeVerdict::Undischarged => {}
+                                GapDischargeVerdict::RefusedByRequestLimit => {
+                                    execution_dependent = true
+                                }
+                            }
+                        }
+                        relevant
                     };
                     staged.work = staged
                         .work
@@ -4274,11 +5675,13 @@ pub fn sweep_procedure_gaps(
             open |= relevant;
             if relevant {
                 relevant_gaps.push(gap.id);
+                execution_dependent |= gap.kind == SemanticGapKind::ExceededBudget;
                 gap_quality = merge_gap_quality(gap_quality, gap);
             }
         }
     }
     Ok(GapSweep {
+        execution_dependent: execution_dependent || interrupted.is_some(),
         open,
         unproven_go_builtin_assumptions,
         relevant_gaps,
@@ -4296,6 +5699,13 @@ pub struct ProcedureOpenness {
     pub open: bool,
     /// The gaps that keep the procedure open.
     pub relevant_gaps: Vec<SemanticGapId>,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for ProcedureOpenness {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.relevant_gaps.capacity() * std::mem::size_of::<SemanticGapId>())
+    }
 }
 
 #[doc(hidden)]
@@ -4347,6 +5757,7 @@ pub fn project_procedure_relations(
         }
         _ => {}
     }
+    let mut execution_dependent = !matches!(runtime_outcome, SemanticOutcome::Complete { .. });
     let runtime_reads = runtime_outcome.available_value();
     let mut open = value_flow_capabilities_are_open(procedure);
     let mut gap_quality = None;
@@ -4379,6 +5790,7 @@ pub fn project_procedure_relations(
             &mut staged,
             request,
         )?;
+        execution_dependent |= sweep.execution_dependent;
         store_bases = sweep.store_bases;
         open |= sweep.open;
         gap_quality = sweep.gap_quality;
@@ -4415,7 +5827,7 @@ pub fn project_procedure_relations(
     // event order still collapses.
     let ProcedureValueFacts {
         load_origins,
-        copied_reference_members,
+        prefix_stores,
         whole_container_reads,
     } = if interrupted.is_none() {
         match procedure_value_facts(
@@ -4433,7 +5845,7 @@ pub fn project_procedure_relations(
                 interrupted = Some(stop);
                 ProcedureValueFacts {
                     load_origins: HashMap::new(),
-                    copied_reference_members: HashMap::new(),
+                    prefix_stores: PrefixStores::default(),
                     whole_container_reads: HashSet::new(),
                 }
             }
@@ -4441,14 +5853,14 @@ pub fn project_procedure_relations(
     } else {
         ProcedureValueFacts {
             load_origins: HashMap::new(),
-            copied_reference_members: HashMap::new(),
+            prefix_stores: PrefixStores::default(),
             whole_container_reads: HashSet::new(),
         }
     };
     let binding_origins = BindingOriginIndex::from_semantics(procedure.semantics());
     let origins = ValueOriginFacts {
         load_origins: &load_origins,
-        copied_reference_members: &copied_reference_members,
+        prefix_stores: &prefix_stores,
         binding_origins: Some(&binding_origins),
     };
     let exact_integer =
@@ -4457,6 +5869,11 @@ pub fn project_procedure_relations(
     let mut drafts = Vec::new();
     let mut retained_evidence = 0usize;
     let mut truncated = false;
+    // A stored member of a returned join that the return projection could not
+    // transport (#9766). It is a content gap, so the coverage is Open, but the
+    // relation list lacks a relation, which the snapshot records for readers
+    // that treat an Open snapshot's relations as complete.
+    let mut untransported_return_member = false;
     // #2444 slice 2: the member carriers this procedure named, and the
     // events that read a whole value some consumption passes on. The
     // collapse relations that join them are published after this pass,
@@ -4491,7 +5908,10 @@ pub fn project_procedure_relations(
             }
             let mut access_path = None;
             let mut alternative_access_paths = Vec::new();
+            let mut original_cell = None;
             let mut alternative_paths_truncated = false;
+            let mut backing_store_candidates = false;
+            let mut opaque_prefix = false;
             let relation_work = match &event.effect {
                 SemanticEffect::Assignment { .. } | SemanticEffect::ValueFlow { .. } => {
                     Some(SemanticWork {
@@ -4525,16 +5945,23 @@ pub fn project_procedure_relations(
                     let (plans, plans_truncated) = alternative_choice_plans(
                         *location,
                         &load_origins,
+                        &prefix_stores,
                         |id| {
                             procedure
                                 .semantics()
                                 .memory_location(id)
                                 .map(|row| &row.kind)
                         },
+                        exact_integer,
                         limits.provenance_records(),
+                        request.cancellation,
                     );
                     let has_alternative = plans.iter().any(|plan| !plan.is_empty());
                     alternative_paths_truncated = plans_truncated;
+                    backing_store_candidates = plans
+                        .iter()
+                        .flatten()
+                        .any(|choice| choice.is_backing_store_candidate());
                     let mut paths = Vec::new();
                     if has_alternative {
                         for plan in plans {
@@ -4591,7 +6018,14 @@ pub fn project_procedure_relations(
                             }
                         }
                     }
-                    let resolved = paths.remove(0);
+                    opaque_prefix = paths.iter().any(|path| path.opaque_prefix);
+                    let mut resolved = paths.remove(0);
+                    if matches!(event.effect, SemanticEffect::MemoryLoad { .. })
+                        && let Some(original) = resolved.original_cell.take()
+                    {
+                        original_cell =
+                            Some(materialize_abstract_location(procedure, *original, limits)?.0);
+                    }
                     alternative_access_paths = paths;
                     let work = SemanticWork {
                         values: 1,
@@ -4658,6 +6092,17 @@ pub fn project_procedure_relations(
                     nested_entries: 1,
                     ..SemanticWork::default()
                 }),
+                SemanticEffect::CallContinuation {
+                    call_site,
+                    kind: CallContinuationKind::Exceptional,
+                } if exceptional_continuation_thrown(procedure, *call_site).is_some() => {
+                    Some(SemanticWork {
+                        values: 1,
+                        evidence: 1,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })
+                }
                 SemanticEffect::Entry
                 | SemanticEffect::NormalExit
                 | SemanticEffect::ExceptionalExit
@@ -4712,15 +6157,28 @@ pub fn project_procedure_relations(
                 }
             );
             let (proof, mut completeness) = evidence_quality(std::slice::from_ref(&evidence));
-            if alternative_relation
-                || !alternative_access_paths.is_empty()
-                || alternative_paths_truncated
-            {
+            // The arms of a definition set are exhaustive, so publishing every
+            // one of them is the complete answer. Only a backing-store
+            // candidate, which may name storage the access never touches,
+            // leaves the relation partial.
+            if alternative_relation || backing_store_candidates || alternative_paths_truncated {
                 completeness = EvidenceCompleteness::Partial(
                     "backing-store alternative retains both access-path candidates".into(),
                 );
                 open = true;
             }
+            // A store to a cell the access continues through cannot be
+            // followed on at least one candidate path, so the members it
+            // stored cannot be proven absent from the read.
+            if opaque_prefix {
+                completeness = EvidenceCompleteness::Partial(
+                    "a store to a prefix of the access path cannot be followed".into(),
+                );
+                open = true;
+            }
+            // An access with more than one candidate target writes only one of
+            // them, so none of its stores may overwrite what a target held.
+            let single_target = alternative_access_paths.is_empty() && !alternative_paths_truncated;
             let mut exact_index = false;
             /// One relation derived from the event being projected, rather
             /// than from the event's own endpoints.
@@ -4812,6 +6270,16 @@ pub fn project_procedure_relations(
                     false,
                 ),
                 SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::OwnershipUnknown,
+                    source,
+                    target,
+                } => (
+                    ValueFlowRelationKind::OwnershipUnknown,
+                    ValueFlowEndpoint::for_value(value_handle(procedure, *source)?),
+                    ValueFlowEndpoint::for_value(value_handle(procedure, *target)?),
+                    false,
+                ),
+                SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
                     source,
                     target,
@@ -4867,7 +6335,10 @@ pub fn project_procedure_relations(
                     false,
                 ),
                 SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::LanguageDefined | ValueFlowKind::IntegerOffset { .. },
+                    kind:
+                        ValueFlowKind::LanguageDefined
+                        | ValueFlowKind::ByValueCapture
+                        | ValueFlowKind::IntegerOffset { .. },
                     source,
                     target,
                 } => (
@@ -4999,9 +6470,11 @@ pub fn project_procedure_relations(
                         let (target, _) = materialize_abstract_location(
                             procedure,
                             AccessPathDraft {
+                                original_cell: None,
                                 root: AccessPathRootDraft::LexicalCell(target),
                                 selectors: Vec::new(),
                                 tail: AccessPathTail::Exact,
+                                opaque_prefix: false,
                             },
                             limits,
                         )?;
@@ -5128,6 +6601,30 @@ pub fn project_procedure_relations(
                         false,
                     )
                 }
+                // #8804: a call's exceptional continuation receives the
+                // callee's exception in the call's `thrown` value. Whether a
+                // local handler catches it is the control flow's business, as
+                // for a local `throw`: the port carrier only reaches this
+                // procedure's exceptional exit on a path that leaves it. This
+                // is what relays a callee's exception through an intermediate
+                // procedure. It rides the continuation event rather than a
+                // synthetic `Throw`, because throw-site search and quality
+                // rules read `Throw` as a source-level throw statement.
+                SemanticEffect::CallContinuation {
+                    call_site,
+                    kind: CallContinuationKind::Exceptional,
+                } => (
+                    ValueFlowRelationKind::ExceptionalReturn,
+                    ValueFlowEndpoint::Value(value_handle(
+                        procedure,
+                        exceptional_continuation_thrown(procedure, *call_site)
+                            .expect("an exceptional continuation relation was classified with its thrown value"),
+                    )?),
+                    ValueFlowEndpoint::Port(ProcedurePortHandle::exceptional_return(
+                        procedure.clone(),
+                    )),
+                    false,
+                ),
                 // The value a normal resume produces is computed from the
                 // value the matching suspend awaited: a task's or promise's
                 // completion, a future's output. It is a different object, so
@@ -5168,6 +6665,7 @@ pub fn project_procedure_relations(
             // #2444: the store's own strong-update verdict, asked only for a
             // store that could hold one. Everything else keeps joining.
             let strong_update = if kind == ValueFlowRelationKind::MemoryStore
+                && single_target
                 && matches!(proof, ProofStatus::Proven)
                 && matches!(completeness, EvidenceCompleteness::Complete)
                 && let SemanticEffect::MemoryStore {
@@ -5207,7 +6705,10 @@ pub fn project_procedure_relations(
             container_elements.observe(&source, &proof, &completeness);
             container_elements.observe(&target, &proof, &completeness);
             if kind == ValueFlowRelationKind::MemoryStore {
-                container_elements.record_store(&target);
+                let SemanticEffect::MemoryStore { location, .. } = event.effect else {
+                    unreachable!("memory store relation has a store event")
+                };
+                container_elements.record_store(&target, location);
             }
             if let Some(read) = match event.effect {
                 SemanticEffect::Assignment { target, .. }
@@ -5242,6 +6743,7 @@ pub fn project_procedure_relations(
                 _ => None,
             };
             let direct_cell_store = kind == ValueFlowRelationKind::MemoryStore
+                && single_target
                 && matches!(proof, ProofStatus::Proven)
                 && matches!(completeness, EvidenceCompleteness::Complete)
                 && matches!(&event.effect, SemanticEffect::MemoryStore { location, .. }
@@ -5283,6 +6785,7 @@ pub fn project_procedure_relations(
                 )
             });
             let draft = FlowRelationDraft {
+                original_cell,
                 payload: ValueFlowRelationPayload {
                     point: relation_point.clone(),
                     event_index: relation_event,
@@ -5322,6 +6825,7 @@ pub fn project_procedure_relations(
                     )
                 });
                 let draft = FlowRelationDraft {
+                    original_cell: None,
                     payload: ValueFlowRelationPayload {
                         point: relation_point.clone(),
                         event_index: relation_event,
@@ -5360,6 +6864,12 @@ pub fn project_procedure_relations(
     // own event, which is what makes the solver ask what the member holds
     // *at the read* rather than what was ever written into it.
     if interrupted.is_none() && !truncated && !container_elements.elements.is_empty() {
+        let local_allocations: HashSet<_> = procedure
+            .semantics()
+            .allocations()
+            .iter()
+            .map(|allocation| allocation.result)
+            .collect();
         'reads: for read in &container_reads {
             if request.cancellation.is_cancelled() {
                 interrupted = Some(Interruption::Cancelled);
@@ -5472,14 +6982,88 @@ pub fn project_procedure_relations(
                 ),
                 _ => None,
             };
+            let separated = return_port
+                .as_ref()
+                .and_then(|_| separated_return_definitions(&load_origins, read.value));
+            let candidate_roots = return_port
+                .as_ref()
+                .map(|_| return_candidate_roots(&load_origins, &local_allocations, read.value));
             for element in &container_elements.elements {
+                // All separated definitions name the same destination object.
+                // Admit a member only when one transfer's own copy point
+                // stored it; the transfer source's member stores do not count.
+                let stated_by_alternative = separated.is_none_or(|transfers| {
+                    transfers.iter().any(|transfer| {
+                        transfer
+                            .stores
+                            .iter()
+                            .any(|store| element.store_locations.contains(store))
+                    })
+                });
+                // A join presents one of finitely many objects: the values its
+                // definitions name, or separated copies' destinations. When
+                // every alternative is an exact root, a member stored on one of
+                // them is a member of the returned value under that choice.
+                let via_alternative = candidate_roots.as_ref().is_some_and(|candidates| {
+                    candidates.exhaustive
+                        && match element.location.path().root() {
+                            AccessPathRoot::Value(value)
+                                if candidates.roots.contains(&value.id()) =>
+                            {
+                                // A separated destination's member counts only
+                                // when its own copy stored it, never through
+                                // the source object.
+                                candidates
+                                    .transfers
+                                    .get(&value.id())
+                                    .is_none_or(|transfer| {
+                                        transfer
+                                            .stores
+                                            .iter()
+                                            .any(|store| element.store_locations.contains(store))
+                                    })
+                            }
+                            _ => false,
+                        }
+                });
+                let admitted_by_root = element.location.path().root() == &root
+                    && (return_port.is_none() || stated_by_alternative);
                 // A return projection needs producer-stated contents.
                 // Merely observing a field does not establish a stored
                 // payload to transport into a new return-port location.
                 if (return_port.is_some() && !element.has_stored_contents)
-                    || element.location.path().root() != &root
+                    || !(admitted_by_root || via_alternative)
                     || !selectors_extend(element.location.path().selectors(), &prefix)
                 {
+                    // A summarized return can include a stored member rooted
+                    // at a candidate source. Do not silently complete it if
+                    // this projection cannot transport that member.
+                    if let Some(candidates) = &candidate_roots {
+                        let candidate = match element.location.path().root() {
+                            AccessPathRoot::Value(value) => Some(value.id()),
+                            _ => None,
+                        };
+                        // The gap is content: coverage Open plus the snapshot's
+                        // untransported-member flag, with no execution marker.
+                        // Both paths come from the retained-selector
+                        // window, so one at the window's length may have been
+                        // cut by that cap and the decision may then depend on
+                        // `limits`. That is a real cap and truncates.
+                        let path_cap = limits.access_path_length();
+                        let gap = if element.location.path().selectors().len() >= path_cap
+                            || prefix.len() >= path_cap
+                        {
+                            &mut truncated
+                        } else {
+                            &mut untransported_return_member
+                        };
+                        mark_rejected_return_member_incomplete(
+                            gap,
+                            element.has_stored_contents,
+                            candidate,
+                            &candidates.roots,
+                        );
+                    }
                     continue;
                 }
                 if let Err(stop) = staged.admit(SemanticWork {
@@ -5504,7 +7088,9 @@ pub fn project_procedure_relations(
                     }
                 };
                 let completeness = match (&read.completeness, &element.completeness) {
-                    _ if summarized => EvidenceCompleteness::Partial(
+                    // An exhaustive choice of separated destinations names
+                    // each object exactly, so the member is not summarized.
+                    _ if summarized && !via_alternative => EvidenceCompleteness::Partial(
                         "the whole value read does not resolve to one proven object".into(),
                     ),
                     (EvidenceCompleteness::Complete, EvidenceCompleteness::Complete) => {
@@ -5557,6 +7143,7 @@ pub fn project_procedure_relations(
                     _ => None,
                 };
                 let draft = FlowRelationDraft {
+                    original_cell: None,
                     payload: ValueFlowRelationPayload {
                         point: read.point.clone(),
                         event_index: read.event_index,
@@ -5671,17 +7258,34 @@ pub fn project_procedure_relations(
             let call = procedure
                 .call_site_handle(call.id)
                 .expect("a projected call exists");
+            // What the host admitted while building the flow (the dispatch, the
+            // locations query whose answers it reduces to endpoints, the scanned
+            // selection events) is scratch and must not stay on the ledger. The
+            // flow's own storage endpoints survive into the snapshot, so they
+            // are charged as soon as the flow is kept, whether or not the
+            // publication below runs to the end (#10530).
+            let mark = staged.budget.scratch_mark();
             let outcome = host.member_receiver_flow(
                 &call,
                 context,
                 place,
                 &mut staged.request(request.cancellation),
                 limits,
-            )?;
+            );
+            staged.budget.release_scratch_since(&mark);
+            let outcome = outcome?;
             staged.work = staged.work.conservative_add(outcome.work());
             match outcome {
                 SemanticOutcome::Complete { value, .. } => {
+                    execution_dependent |= !value.selection_is_complete();
                     open |= !value.selection_is_complete();
+                    if let Err(stop) = staged.admit(SemanticWork {
+                        nested_entries: value.retained_entries(),
+                        ..SemanticWork::default()
+                    }) {
+                        interrupted = Some(stop);
+                        break;
+                    }
                     member_receivers.push(value);
                 }
                 SemanticOutcome::Cancelled { .. } => {
@@ -5693,8 +7297,16 @@ pub fn project_procedure_relations(
                     break;
                 }
                 other => {
+                    execution_dependent = true;
                     open = true;
                     if let Some(value) = other.available_value() {
+                        if let Err(stop) = staged.admit(SemanticWork {
+                            nested_entries: value.retained_entries(),
+                            ..SemanticWork::default()
+                        }) {
+                            interrupted = Some(stop);
+                            break;
+                        }
                         member_receivers.push(value.clone());
                     }
                 }
@@ -5718,6 +7330,7 @@ pub fn project_procedure_relations(
                 .call_site(receiver.call().id())
                 .expect("a projected member call exists");
             let draft = FlowRelationDraft {
+                original_cell: None,
                 payload: ValueFlowRelationPayload {
                     point: transfer.point,
                     event_index: transfer.event_index,
@@ -5740,6 +7353,54 @@ pub fn project_procedure_relations(
             }
         }
     }
+    // #10989: a closed local container's Keyed contract stores and loads
+    // per-key cells at each bound call's normal continuation.
+    let mut collection_cells = if interrupted.is_none() && !truncated {
+        closed_containers::closed_container_cells(
+            host,
+            procedure,
+            limits,
+            &mut staged.request(request.cancellation),
+        )?
+    } else {
+        Vec::new()
+    };
+    // A bound call's summary no longer applies, so its cell relations are
+    // published all together or the binding is dropped with them.
+    let cells_start = drafts.len();
+    'cells: for binding in &collection_cells {
+        let call = procedure
+            .semantics()
+            .call_site(binding.call().id())
+            .expect("a bound container call exists");
+        for transfer in binding.transfers() {
+            let draft = FlowRelationDraft {
+                original_cell: None,
+                payload: ValueFlowRelationPayload {
+                    point: transfer.point.clone(),
+                    event_index: transfer.event_index,
+                    kind: ValueFlowRelationKind::LanguageDefined,
+                    transfer: None,
+                    source: transfer.source.clone(),
+                    target: transfer.target.clone(),
+                    collapse_read: None,
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Complete,
+                    strong_update: false,
+                    direct_cell_overwrite: false,
+                },
+                memory_origin: None,
+                evidence: vec![evidence_handle(procedure, call.evidence)?],
+            };
+            if !push_flow_relation(&mut drafts, &mut retained_evidence, limits, draft) {
+                truncated = true;
+                drafts.truncate(cells_start);
+                collection_cells.clear();
+                break 'cells;
+            }
+        }
+    }
+    open |= untransported_return_member;
     let has_unproven_relation = drafts.iter().any(|draft| {
         !matches!(draft.payload.proof, ProofStatus::Proven)
             || !matches!(draft.payload.completeness, EvidenceCompleteness::Complete)
@@ -5760,7 +7421,10 @@ pub fn project_procedure_relations(
         discharged_gaps,
         unproven_go_builtin_assumptions,
         member_receivers,
-    )?;
+        collection_cells,
+        execution_dependent,
+    )?
+    .with_untransported_return_member(untransported_return_member);
     if interrupted.is_none() && request.cancellation.is_cancelled() {
         interrupted = Some(Interruption::Cancelled);
     }

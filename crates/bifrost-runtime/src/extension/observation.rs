@@ -353,8 +353,12 @@ impl ExtensionWorkspace {
                 });
                 continue;
             }
-            let actual =
-                StableDigest::parse(format!("{:x}", Sha256::digest(bytes))).expect("sha256");
+            let actual = StableDigest::parse(
+                brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                    &Sha256::digest(bytes).into(),
+                ),
+            )
+            .expect("sha256");
             if actual != record.source.content_sha256 {
                 outcomes.push(ObservationMappingOutcome::Stale {
                     record_id: record.record_id.clone(),
@@ -710,8 +714,12 @@ fn canonical_bytes(v: &impl Serialize) -> Result<Vec<u8>, ObservationCodecError>
         .map_err(|error| ObservationCodecError::new(error.to_string()))
 }
 fn digest(v: &impl Serialize) -> Result<StableDigest, ObservationCodecError> {
-    StableDigest::parse(format!("{:x}", Sha256::digest(canonical_bytes(v)?)))
-        .map_err(ObservationCodecError::new)
+    StableDigest::parse(
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(canonical_bytes(v)?).into(),
+        ),
+    )
+    .map_err(ObservationCodecError::new)
 }
 fn result_digest(v: &ObservationMappingResult) -> Result<StableDigest, ObservationCodecError> {
     let mut json =

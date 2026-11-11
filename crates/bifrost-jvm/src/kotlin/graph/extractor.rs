@@ -35,14 +35,13 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, walk_tree_iterative,
 };
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
-use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 use tree_sitter::Node;
 
@@ -65,14 +64,6 @@ const SCOPE_NODES: &[&str] = &[
     "secondary_constructor",
 ];
 
-pub struct ScanState<'a> {
-    pub max_usages: usize,
-    pub hits: &'a mut BTreeSet<UsageHit>,
-    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub raw_match_count: &'a mut usize,
-    pub limit_exceeded: &'a mut bool,
-}
-
 pub struct ScanCtx<'a> {
     pub graph: &'a KotlinGraphSource<'a>,
     pub file: &'a ProjectFile,
@@ -80,11 +71,7 @@ pub struct ScanCtx<'a> {
     pub line_starts: &'a [usize],
     pub spec: &'a TargetSpec,
     pub names: &'a KotlinNameResolver<'a>,
-    pub hits: &'a mut BTreeSet<UsageHit>,
-    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub raw_match_count: &'a mut usize,
-    pub max_usages: usize,
-    pub limit_exceeded: &'a mut bool,
+    pub usages: &'a mut UsageAccumulator,
     pub enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
     /// Value bindings visible at the node being visited, and what type each one
     /// has when the scan could establish it.
@@ -173,9 +160,9 @@ pub fn scan_parsed_file(
     line_starts: &[usize],
     root: Node<'_>,
     spec: &TargetSpec,
-    state: &mut ScanState<'_>,
+    usages: &mut UsageAccumulator,
 ) {
-    if *state.limit_exceeded {
+    if usages.limit_reached() {
         return;
     }
     let names = KotlinNameResolver::new(graph, token, file, root, source);
@@ -187,11 +174,7 @@ pub fn scan_parsed_file(
         line_starts,
         spec,
         names: &names,
-        hits: state.hits,
-        unproven_hits: state.unproven_hits,
-        raw_match_count: state.raw_match_count,
-        max_usages: state.max_usages,
-        limit_exceeded: state.limit_exceeded,
+        usages,
         enclosing_cache: HashMap::default(),
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         receiver_match_cache: HashMap::default(),
@@ -230,7 +213,7 @@ fn walk(
         root,
         &mut state,
         |node, (ctx, type_parameters)| {
-            if *ctx.limit_exceeded {
+            if ctx.usages.limit_reached() {
                 return TreeWalkAction::Stop;
             }
             let enters_value_scope = SCOPE_NODES.contains(&node.kind());

@@ -7,13 +7,16 @@
 //! the scan while keeping request policy out of the reusable value.
 
 use super::model::UsageHit;
-use crate::analyzer::complete_value_cache::{
-    CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
-};
+use crate::analyzer::common::{ReplayableQueryCacheValue, capture_replayable_query_cache_value};
+use crate::analyzer::complete_value_cache::CompleteValueWait;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::semantic::ids::StableDigest;
 use crate::analyzer::{CodeUnit, DeclarationId, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
+use brokk_bifrost_core::retention_budget::{
+    Accounted, BudgetedValue, RetainedBytes, RetentionBudget, SelfCharged, SharedAllocation,
+};
 use std::collections::BTreeSet;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -22,7 +25,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A bump here invalidates every retained value, including values carried
 /// through an analyzer update.
 pub(crate) const JAVA_USAGE_EVIDENCE_REPRESENTATION_VERSION: u32 = 1;
-pub(crate) const DEFAULT_MAX_RETAINED_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The semantic family named by [`JavaUsageEvidenceCacheKey`]. Keeping the
 /// family in the key prevents an accidentally shared cache from treating a
@@ -98,7 +100,7 @@ impl JavaUsageEvidenceTargetKey {
         Self::from_target_ids(target_ids, structured_target_fingerprint)
     }
 
-    fn retained_bytes(&self) -> u64 {
+    fn estimated_retained_bytes(&self) -> u64 {
         (size_of::<Self>() as u64).saturating_add(
             self.target_ids
                 .iter()
@@ -153,10 +155,16 @@ impl JavaUsageEvidenceCacheKey {
         }
     }
 
-    fn retained_bytes(&self) -> u64 {
+    fn estimated_retained_bytes(&self) -> u64 {
         (size_of::<Self>() as u64)
             .saturating_add(self.file.retained_bytes() as u64)
-            .saturating_add(self.target.retained_bytes())
+            .saturating_add(self.target.estimated_retained_bytes())
+    }
+}
+
+impl RetainedBytes for JavaUsageEvidenceCacheKey {
+    fn retained_bytes(&self) -> usize {
+        self.estimated_retained_bytes().min(usize::MAX as u64) as usize
     }
 }
 
@@ -186,10 +194,16 @@ impl JavaFileUsageEvidence {
         }
     }
 
-    fn retained_bytes(&self) -> u64 {
+    fn estimated_retained_bytes(&self) -> u64 {
         (size_of::<Self>() as u64)
             .saturating_add(retained_hit_set_bytes(&self.hits))
             .saturating_add(retained_hit_set_bytes(&self.unproven_hits))
+    }
+}
+
+impl RetainedBytes for JavaFileUsageEvidence {
+    fn retained_bytes(&self) -> usize {
+        self.estimated_retained_bytes().min(usize::MAX as u64) as usize
     }
 }
 
@@ -233,7 +247,6 @@ pub enum JavaUsageEvidenceOmission {
     ClassRange,
     RelationalFrontier,
     UnavailableCapability,
-    InternalSafetyCap,
     Failed,
 }
 
@@ -255,7 +268,7 @@ pub enum JavaUsageEvidenceCacheLifecycle {
 #[doc(hidden)]
 pub enum JavaUsageEvidenceCacheAcquisition {
     Ready {
-        evidence: Arc<JavaFileUsageEvidence>,
+        evidence: Arc<Accounted<ReplayableQueryCacheValue<JavaFileUsageEvidence>>>,
         lifecycle: JavaUsageEvidenceCacheLifecycle,
         wait: CompleteValueWait,
     },
@@ -309,28 +322,37 @@ impl AtomicJavaUsageEvidenceCacheStats {
     }
 }
 
+type JavaEvidenceValues = BudgetedValueCache<
+    JavaUsageEvidenceCacheKey,
+    SharedAllocation<Accounted<ReplayableQueryCacheValue<JavaFileUsageEvidence>>>,
+>;
+
+impl RetainedBytes for ReplayableQueryCacheValue<JavaFileUsageEvidence> {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self
+                .value()
+                .retained_bytes()
+                .saturating_sub(size_of::<JavaFileUsageEvidence>())
+            + self.retained_receipt_bytes()
+    }
+}
+
 #[doc(hidden)]
 /// Snapshot-owned complete Java evidence with cancellation-aware single-flight.
 pub struct SnapshotJavaUsageEvidenceCache {
-    max_retained_bytes: u64,
-    values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo<
-        CompleteValueCache<JavaUsageEvidenceCacheKey, JavaFileUsageEvidence>,
-    >,
+    budget: RetentionBudget,
+    values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo<JavaEvidenceValues>,
     stats: AtomicJavaUsageEvidenceCacheStats,
 }
 
 impl SnapshotJavaUsageEvidenceCache {
-    pub(crate) fn new(max_retained_bytes: u64) -> Self {
+    pub(crate) fn new(budget: &RetentionBudget) -> Self {
         Self {
-            max_retained_bytes,
+            budget: budget.clone(),
             values: crate::analyzer::workspace_authority::WorkspaceAuthorityMemo::new(
                 crate::analyzer::WorkspaceFactFamily::JavaUsageEvidence,
-                CompleteValueCache::new(
-                    max_retained_bytes,
-                    |key: &JavaUsageEvidenceCacheKey, evidence: &Arc<JavaFileUsageEvidence>| {
-                        retained_bytes(key, evidence).clamp(1, u32::MAX as u64) as u32
-                    },
-                ),
+                BudgetedValueCache::new(budget.region("analysis.java_usage_evidence", None)),
             ),
             stats: AtomicJavaUsageEvidenceCacheStats::default(),
         }
@@ -354,14 +376,24 @@ impl SnapshotJavaUsageEvidenceCache {
         let languages = analyzer.languages().into_iter().collect::<Vec<_>>();
         self.values.read(
             &crate::analyzer::workspace_authority::memo_attribution(analyzer),
-            |values| self.acquire_value(values, key, cancellation, build, content_is_current),
+            |values| {
+                self.acquire_value(
+                    values,
+                    analyzer,
+                    key,
+                    cancellation,
+                    build,
+                    content_is_current,
+                )
+            },
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&languages),
         )
     }
 
     fn acquire_value(
         &self,
-        values: &CompleteValueCache<JavaUsageEvidenceCacheKey, JavaFileUsageEvidence>,
+        values: &JavaEvidenceValues,
+        analyzer: &dyn crate::analyzer::IAnalyzer,
         key: JavaUsageEvidenceCacheKey,
         cancellation: &CancellationToken,
         build: impl FnOnce() -> JavaUsageEvidenceBuildOutcome,
@@ -369,23 +401,33 @@ impl SnapshotJavaUsageEvidenceCache {
     ) -> JavaUsageEvidenceCacheAcquisition {
         let (acquisition, wait) = values.acquire(&key, cancellation);
         match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
+            BudgetedValueAcquisition::Cached { value } => {
                 if !content_is_current() {
                     self.stats.stale.fetch_add(1, Ordering::Relaxed);
                     JavaUsageEvidenceCacheAcquisition::Stale
                 } else {
                     self.stats.hits.fetch_add(1, Ordering::Relaxed);
                     JavaUsageEvidenceCacheAcquisition::Ready {
-                        evidence: value,
+                        evidence: {
+                            value.arc().replay();
+                            Arc::clone(value.arc())
+                        },
                         lifecycle: JavaUsageEvidenceCacheLifecycle::Hit,
                         wait,
                     }
                 }
             }
-            CompleteValueAcquisition::Leader { permit } => {
+            BudgetedValueAcquisition::Leader { permit } => {
                 self.stats.builds.fetch_add(1, Ordering::Relaxed);
-                match build() {
-                    JavaUsageEvidenceBuildOutcome::Complete(evidence) => {
+                let attempt = capture_replayable_query_cache_value(analyzer, || Ok(build()));
+                let admitted = attempt.is_ok();
+                let entry = attempt.unwrap_or_else(std::convert::identity);
+                match entry.replay() {
+                    JavaUsageEvidenceBuildOutcome::Complete(_) => {
+                        let entry = entry.map(|outcome| match outcome {
+                            JavaUsageEvidenceBuildOutcome::Complete(evidence) => evidence,
+                            _ => unreachable!("complete outcome was checked"),
+                        });
                         if cancellation.is_cancelled() {
                             self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
                             return JavaUsageEvidenceCacheAcquisition::Cancelled;
@@ -394,32 +436,41 @@ impl SnapshotJavaUsageEvidenceCache {
                             self.stats.stale.fetch_add(1, Ordering::Relaxed);
                             return JavaUsageEvidenceCacheAcquisition::Stale;
                         }
-                        let retained_bytes = retained_bytes(&key, &evidence);
-                        let evidence = Arc::new(evidence);
-                        if retained_bytes > self.max_retained_bytes {
+                        let entry = Arc::new(Accounted::charged(&self.budget, entry));
+                        let charged = entry.allocation_charge().is_charged();
+                        let evidence = Arc::clone(&entry);
+                        let retained = if admitted && charged {
+                            matches!(
+                                permit.publish_complete(SharedAllocation::new(Arc::clone(&entry))),
+                                BudgetedValue::Retained(_)
+                            )
+                        } else {
+                            permit.publish_request_owned(SharedAllocation::new(Arc::clone(&entry)));
+                            false
+                        };
+                        if !retained {
                             self.stats
                                 .uncached_over_budget
                                 .fetch_add(1, Ordering::Relaxed);
-                            return JavaUsageEvidenceCacheAcquisition::Ready {
-                                evidence,
-                                lifecycle: JavaUsageEvidenceCacheLifecycle::UncachedOverBudget,
-                                wait,
-                            };
                         }
-                        permit.publish_complete(Arc::clone(&evidence));
+
                         if !content_is_current() {
                             self.stats.stale.fetch_add(1, Ordering::Relaxed);
                             return JavaUsageEvidenceCacheAcquisition::Stale;
                         }
                         JavaUsageEvidenceCacheAcquisition::Ready {
                             evidence,
-                            lifecycle: JavaUsageEvidenceCacheLifecycle::Built,
+                            lifecycle: if retained {
+                                JavaUsageEvidenceCacheLifecycle::Built
+                            } else {
+                                JavaUsageEvidenceCacheLifecycle::UncachedOverBudget
+                            },
                             wait,
                         }
                     }
                     JavaUsageEvidenceBuildOutcome::Omitted(reason) => {
                         self.stats.omitted.fetch_add(1, Ordering::Relaxed);
-                        JavaUsageEvidenceCacheAcquisition::Omitted(reason)
+                        JavaUsageEvidenceCacheAcquisition::Omitted(*reason)
                     }
                     JavaUsageEvidenceBuildOutcome::Cancelled => {
                         self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -427,11 +478,11 @@ impl SnapshotJavaUsageEvidenceCache {
                     }
                 }
             }
-            CompleteValueAcquisition::Rejected => {
+            BudgetedValueAcquisition::Rejected => {
                 self.stats.omitted.fetch_add(1, Ordering::Relaxed);
                 JavaUsageEvidenceCacheAcquisition::Omitted(JavaUsageEvidenceOmission::Failed)
             }
-            CompleteValueAcquisition::Cancelled => {
+            BudgetedValueAcquisition::Cancelled => {
                 self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
                 JavaUsageEvidenceCacheAcquisition::Cancelled
             }
@@ -454,31 +505,27 @@ impl SnapshotJavaUsageEvidenceCache {
             &crate::analyzer::workspace_authority::memo_attribution(
                 &crate::analyzer::MultiAnalyzer::default(),
             ),
-            |values| values.len_for_test(),
+            |values| values.region().stats().entries as u64,
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn waiting_count_for_test(&self) -> usize {
+    pub(crate) fn waiting_count_for_test(&self, key: &JavaUsageEvidenceCacheKey) -> usize {
         self.values.read(
             &crate::analyzer::workspace_authority::memo_attribution(
                 &crate::analyzer::MultiAnalyzer::default(),
             ),
-            |values| values.waiting_count_for_test(),
+            |values| values.waiters_for_test(key),
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
         )
     }
 }
 
-fn retained_bytes(key: &JavaUsageEvidenceCacheKey, evidence: &JavaFileUsageEvidence) -> u64 {
-    key.retained_bytes()
-        .saturating_add(evidence.retained_bytes())
-}
-
+#[cfg(any(test, feature = "test-support"))]
 impl Default for SnapshotJavaUsageEvidenceCache {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_RETAINED_BYTES)
+        Self::new(&RetentionBudget::for_tests())
     }
 }
 
@@ -486,6 +533,7 @@ impl Default for SnapshotJavaUsageEvidenceCache {
 mod tests {
     use super::*;
     use crate::analyzer::model::CodeUnitType;
+    use brokk_bifrost_test_macros::hardwon;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::thread;
 
@@ -520,16 +568,19 @@ mod tests {
         JavaFileUsageEvidence::new(BTreeSet::from([hit]), BTreeSet::new(), 1)
     }
 
-    fn wait_for_follower(cache: &SnapshotJavaUsageEvidenceCache) {
+    fn wait_for_follower(cache: &SnapshotJavaUsageEvidenceCache, key: &JavaUsageEvidenceCacheKey) {
         brokk_bifrost_core::test_support::wait_for_nonzero_count(
-            || cache.waiting_count_for_test(),
+            || cache.waiting_count_for_test(key),
             "follower did not enter single-flight wait",
         );
     }
 
     fn ready(
         acquisition: JavaUsageEvidenceCacheAcquisition,
-    ) -> (Arc<JavaFileUsageEvidence>, JavaUsageEvidenceCacheLifecycle) {
+    ) -> (
+        Arc<Accounted<ReplayableQueryCacheValue<JavaFileUsageEvidence>>>,
+        JavaUsageEvidenceCacheLifecycle,
+    ) {
         match acquisition {
             JavaUsageEvidenceCacheAcquisition::Ready {
                 evidence,
@@ -545,8 +596,135 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#9546: refused Java usage reads were published as reusable evidence")]
+    fn refused_producer_recomputes_and_bounded_hit_replays_receipt() {
+        let analyzer = crate::analyzer::MultiAnalyzer::default();
+        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::for_tests());
+        let values = BudgetedValueCache::new(
+            cache
+                .budget
+                .region("analysis.java_usage_evidence.test", None),
+        );
+        let cancellation = CancellationToken::default();
+        let key = key(42);
+        let refused = cache.acquire_value(
+            &values,
+            &analyzer,
+            key.clone(),
+            &cancellation,
+            || {
+                crate::analyzer::i_analyzer::record_reuse_refusal(|| true, Vec::new);
+                JavaUsageEvidenceBuildOutcome::Complete(evidence(1))
+            },
+            || true,
+        );
+        assert_eq!(
+            JavaUsageEvidenceCacheLifecycle::UncachedOverBudget,
+            ready(refused).1
+        );
+        assert_eq!(0, values.region().stats().entries);
+
+        let (_, built_reads) = crate::analyzer::capture_query_reads(&analyzer, || {
+            ready(cache.acquire_value(
+                &values,
+                &analyzer,
+                key.clone(),
+                &cancellation,
+                || {
+                    crate::analyzer::i_analyzer::record_unattributed_reads(1, || true, Vec::new);
+                    JavaUsageEvidenceBuildOutcome::Complete(evidence(2))
+                },
+                || true,
+            ))
+        });
+        assert!(built_reads.channels().unattributed_reads > 0);
+        assert_eq!(1, values.region().stats().entries);
+        assert_eq!(2, cache.stats_for_test().builds);
+
+        let (_, hit_reads) = crate::analyzer::capture_query_reads(&analyzer, || {
+            let (_, lifecycle) = ready(cache.acquire_value(
+                &values,
+                &analyzer,
+                key,
+                &cancellation,
+                || panic!("bounded receipt must hit"),
+                || true,
+            ));
+            assert_eq!(JavaUsageEvidenceCacheLifecycle::Hit, lifecycle);
+        });
+        assert!(hit_reads.channels().unattributed_reads > 0);
+    }
+
+    #[test]
+    #[hardwon(
+        "#9546: review found retained Java usage evidence with receipts pinned against eviction"
+    )]
+    fn receipt_carrying_evidence_is_evicted_to_admit_new_evidence() {
+        let analyzer = crate::analyzer::MultiAnalyzer::default();
+        let sample = capture_replayable_query_cache_value(&analyzer, || {
+            crate::analyzer::i_analyzer::record_unattributed_reads(1, || true, Vec::new);
+            Ok::<_, JavaFileUsageEvidence>(evidence(1))
+        })
+        .expect("bounded receipt");
+        assert!(sample.retained_receipt_bytes() > 0);
+        let key_bytes = key(1).retained_bytes() as u64;
+        let allocation_bytes = sample.retained_bytes() as u64;
+        let budget = RetentionBudget::new(
+            allocation_bytes
+                + 2 * (key_bytes
+                    + brokk_bifrost_core::retention_budget::ENTRY_OVERHEAD_BYTES as u64)
+                + 128,
+        );
+        let cache = SnapshotJavaUsageEvidenceCache::new(&budget);
+        let values =
+            BudgetedValueCache::new(budget.region("analysis.java_usage_evidence.evict_test", None));
+        let cancellation = CancellationToken::default();
+        let build = |seed| {
+            crate::analyzer::i_analyzer::record_unattributed_reads(1, || true, Vec::new);
+            JavaUsageEvidenceBuildOutcome::Complete(evidence(seed))
+        };
+        let first = ready(cache.acquire_value(
+            &values,
+            &analyzer,
+            key(1),
+            &cancellation,
+            || build(1),
+            || true,
+        ));
+        assert_eq!(JavaUsageEvidenceCacheLifecycle::Built, first.1);
+        drop(first);
+        let second = ready(cache.acquire_value(
+            &values,
+            &analyzer,
+            key(2),
+            &cancellation,
+            || build(2),
+            || true,
+        ));
+        assert_eq!(JavaUsageEvidenceCacheLifecycle::Built, second.1);
+        drop(second);
+        budget.run_pending_tasks();
+        assert_eq!(1, values.region().stats().entries);
+        assert_eq!(1, values.region().stats().evictions);
+        assert_eq!(
+            JavaUsageEvidenceCacheLifecycle::Hit,
+            ready(cache.acquire_value(
+                &values,
+                &analyzer,
+                key(2),
+                &cancellation,
+                || panic!("new evidence must be retained"),
+                || true,
+            ))
+            .1
+        );
+    }
+
+    #[test]
     fn same_key_coalesces_and_hands_followers_the_same_evidence_arc() {
-        let cache = Arc::new(SnapshotJavaUsageEvidenceCache::new(1024 * 1024));
+        let cache = Arc::new(SnapshotJavaUsageEvidenceCache::new(
+            &RetentionBudget::for_tests(),
+        ));
         let cancellation = CancellationToken::default();
         let key = key(1);
         let (leader, _) = cache.values.read(
@@ -556,7 +734,7 @@ mod tests {
             |values| values.acquire(&key, &cancellation),
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
         );
-        let CompleteValueAcquisition::Leader { permit } = leader else {
+        let BudgetedValueAcquisition::Leader { permit } = leader else {
             panic!("first exact key must lead")
         };
 
@@ -571,10 +749,16 @@ mod tests {
                 || true,
             )
         });
-        wait_for_follower(&cache);
+        wait_for_follower(&cache, &key);
 
-        let built = Arc::new(evidence(1));
-        permit.publish_complete(Arc::clone(&built));
+        let entry = capture_replayable_query_cache_value(
+            &crate::analyzer::MultiAnalyzer::default(),
+            || Ok(evidence(1)),
+        )
+        .expect("test receipt is bounded");
+        let entry = Arc::new(Accounted::charged(&cache.budget, entry));
+        let built = Arc::clone(&entry);
+        permit.publish_complete(SharedAllocation::new(entry));
         let (received, lifecycle) = ready(follower.join().expect("follower thread"));
         assert!(Arc::ptr_eq(&built, &received));
         assert_eq!(JavaUsageEvidenceCacheLifecycle::Hit, lifecycle);
@@ -583,7 +767,7 @@ mod tests {
 
     #[test]
     fn target_content_file_and_policy_dimensions_isolate_entries() {
-        let cache = SnapshotJavaUsageEvidenceCache::new(1024 * 1024);
+        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::for_tests());
         let cancellation = CancellationToken::default();
         let builds = AtomicUsize::new(0);
         let base = key(1);
@@ -634,7 +818,7 @@ mod tests {
 
     #[test]
     fn cancelled_leader_and_omitted_value_are_never_published() {
-        let cache = SnapshotJavaUsageEvidenceCache::new(1024 * 1024);
+        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::for_tests());
         let cancellation = CancellationToken::default();
         let cancelled = cache.acquire(
             &crate::analyzer::MultiAnalyzer::default(),
@@ -657,7 +841,6 @@ mod tests {
             JavaUsageEvidenceOmission::ClassRange,
             JavaUsageEvidenceOmission::RelationalFrontier,
             JavaUsageEvidenceOmission::UnavailableCapability,
-            JavaUsageEvidenceOmission::InternalSafetyCap,
             JavaUsageEvidenceOmission::Failed,
         ];
         for (index, reason) in omissions.into_iter().enumerate() {
@@ -678,7 +861,7 @@ mod tests {
 
     #[test]
     fn stale_content_does_not_publish_and_can_retry_when_current() {
-        let cache = SnapshotJavaUsageEvidenceCache::new(1024 * 1024);
+        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::for_tests());
         let cancellation = CancellationToken::default();
         let current = AtomicBool::new(false);
         let stale = cache.acquire(
@@ -705,7 +888,7 @@ mod tests {
 
     #[test]
     fn oversized_complete_evidence_is_returned_but_not_retained() {
-        let cache = SnapshotJavaUsageEvidenceCache::new(1);
+        let cache = SnapshotJavaUsageEvidenceCache::new(&RetentionBudget::new(1));
         let cancellation = CancellationToken::default();
         let first = ready(cache.acquire(
             &crate::analyzer::MultiAnalyzer::default(),
@@ -733,7 +916,9 @@ mod tests {
 
     #[test]
     fn cancelled_follower_does_not_cancel_a_valid_leader() {
-        let cache = Arc::new(SnapshotJavaUsageEvidenceCache::new(1024 * 1024));
+        let cache = Arc::new(SnapshotJavaUsageEvidenceCache::new(
+            &RetentionBudget::for_tests(),
+        ));
         let cancellation = CancellationToken::default();
         let key = key(1);
         let (acquisition, _) = cache.values.read(
@@ -743,7 +928,7 @@ mod tests {
             |values| values.acquire(&key, &cancellation),
             |_| crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[]),
         );
-        let CompleteValueAcquisition::Leader { permit } = acquisition else {
+        let BudgetedValueAcquisition::Leader { permit } = acquisition else {
             panic!("first exact key must lead")
         };
 
@@ -760,15 +945,21 @@ mod tests {
                 || true,
             )
         });
-        wait_for_follower(&cache);
+        wait_for_follower(&cache, &key);
         follower_cancellation.cancel();
         assert!(matches!(
             follower.join().expect("cancelled follower thread"),
             JavaUsageEvidenceCacheAcquisition::Cancelled
         ));
 
-        let built = Arc::new(evidence(1));
-        permit.publish_complete(Arc::clone(&built));
+        let entry = capture_replayable_query_cache_value(
+            &crate::analyzer::MultiAnalyzer::default(),
+            || Ok(evidence(1)),
+        )
+        .expect("test receipt is bounded");
+        let entry = Arc::new(Accounted::charged(&cache.budget, entry));
+        let built = Arc::clone(&entry);
+        permit.publish_complete(SharedAllocation::new(entry));
         let (received, lifecycle) = ready(cache.acquire(
             &crate::analyzer::MultiAnalyzer::default(),
             key,

@@ -1348,7 +1348,10 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                 CodeQueryResultValue::CallSite { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let caller = sanitize_terminal_text(&value.caller.fq_name);
-                    let callee = sanitize_terminal_text(&value.callee.fq_name);
+                    let callee = sanitize_terminal_text(value.callee.as_ref().map_or(
+                        value.target_fq_name.as_deref().unwrap_or("<unresolved>"),
+                        |callee| callee.fq_name.as_str(),
+                    ));
                     out.push_str(&format!(
                         "{}:{}:{}\n  {} {} -> {} ({})\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
@@ -2497,8 +2500,9 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.usage_kind,
                     ));
                     out.push_str(&format!(
-                        "  kind {}, site {}, relation {}, generation {}\n",
-                        value.reference_kind.unwrap_or("unclassified"),
+                        "  kind known={:?}, undecided={:?}, site {}, relation {}, generation {}\n",
+                        value.reference_facets.known,
+                        value.reference_facets.undecided,
                         value.site_class,
                         value.owner_relation,
                         value.generation,
@@ -2825,6 +2829,11 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                 out.push_str(&format!("  {summary}\n"));
             }
         }
+    }
+
+    if let Some(status) = output.depth_bound_status {
+        out.push_str(status.answer_text());
+        out.push('\n');
     }
 
     for diagnostic in &output.diagnostics {
@@ -3515,6 +3524,7 @@ mod tests {
         let output = render_code_query_repl_output(
             &CodeQueryResult {
                 session_subset: None,
+                depth_bound_status: None,
                 results: vec![CodeQueryResultItem {
                     value: CodeQueryResultValue::StructuralMatch {
                         value: matched.clone(),
@@ -3533,5 +3543,21 @@ mod tests {
         assert!(!output.contains('\u{07}'), "{output:?}");
         assert!(output.contains("\\x1b"), "{output}");
         assert!(output.contains("\\x07"), "{output}");
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "93df5f3cf606: interactive RQL text omitted answer-level depth completion"
+    )]
+    fn repl_depth_status_uses_shared_answer_line() {
+        let result = CodeQueryResult {
+            depth_bound_status: Some(brokk_bifrost::rql::DepthBoundStatus::Unknown),
+            ..Default::default()
+        };
+        for color in [false, true] {
+            assert_eq!(
+                render_code_query_repl_output(&result, color),
+                result.render_text()
+            );
+        }
     }
 }

@@ -145,16 +145,39 @@ pub struct ReplayableQueryCacheValue<T> {
 }
 
 impl<T> ReplayableQueryCacheValue<T> {
+    pub(crate) fn map<U>(self, map: impl FnOnce(T) -> U) -> ReplayableQueryCacheValue<U> {
+        ReplayableQueryCacheValue {
+            value: map(self.value),
+            receipt: self.receipt,
+        }
+    }
+
     pub fn retained_receipt_bytes(&self) -> usize {
+        self.receipt.retained_bytes()
+    }
+
+    /// The retained answer without replaying its receipt, for retention
+    /// accounting only. Answers read by a query go through [`Self::replay`].
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn replay(&self) -> &T {
+        self.receipt.replay();
+        &self.value
+    }
+}
+
+impl QueryCacheBuildReceipt {
+    fn retained_bytes(&self) -> usize {
         let mut heap = crate::analyzer::store::cache_budget::RetainedHeap::default();
-        heap.slice(&self.receipt.keys);
-        for key in self.receipt.keys.iter() {
+        heap.slice(&self.keys);
+        for key in self.keys.iter() {
             crate::analyzer::store::cache_budget::retained_read_key(&mut heap, key);
         }
         std::mem::size_of::<QueryCacheBuildReceipt>()
             + heap.total()
             + self
-                .receipt
                 .reasons
                 .iter()
                 .map(|reason| {
@@ -173,11 +196,29 @@ impl<T> ReplayableQueryCacheValue<T> {
                 })
                 .sum::<usize>()
     }
+}
 
-    pub fn replay(&self) -> &T {
-        self.receipt.replay();
-        &self.value
+const MAX_REPLAYABLE_RECEIPT_BYTES: usize = 1 << 20;
+
+/// Retain a receipt only within the byte cap; refuse rather than truncate. An
+/// unattributed crossing is kept and replayed on every hit: the enclosing
+/// ledger, not this cell, refuses durable reuse of such an answer.
+fn replayable_receipt_admitted(receipt: &QueryCacheBuildReceipt) -> bool {
+    if receipt.channels.reuse_refused {
+        return false;
     }
+    let receipt_bytes = receipt.retained_bytes();
+    if receipt_bytes > MAX_REPLAYABLE_RECEIPT_BYTES {
+        crate::profiling::note_with(|| {
+            format!(
+                "policy.units unbounded origin={}:{} cause=cache_fill receipt_bytes={receipt_bytes} cap={MAX_REPLAYABLE_RECEIPT_BYTES}",
+                file!(),
+                line!()
+            )
+        });
+        return false;
+    }
+    true
 }
 
 impl<T> std::ops::Deref for ReplayableQueryCacheValue<T> {
@@ -206,7 +247,17 @@ pub fn replayable_query_cache_cell<T: Clone + Send + Sync + 'static>(
         let _fill = crate::analyzer::AnalyzerQueryScope::for_retained_fill(analyzer);
         let (attempt, mut receipt) =
             capture_query_cache_build(analyzer, || replayable_query_cache_fill(analyzer, build));
-        let attempt = attempt.inspect(|_| receipt.keys = Arc::default());
+        let attempt = attempt.and_then(|value| {
+            // A retained cell hit uses the enclosing authority memo. An
+            // unretained wave waiter still needs the original read keys.
+            let keys = std::mem::take(&mut receipt.keys);
+            if replayable_receipt_admitted(&receipt) {
+                Ok(value)
+            } else {
+                receipt.keys = keys;
+                Err(value)
+            }
+        });
         let receipt = Arc::new(receipt);
         let entry = |value| ReplayableQueryCacheValue {
             value,
@@ -215,7 +266,10 @@ pub fn replayable_query_cache_cell<T: Clone + Send + Sync + 'static>(
         attempt.map(entry).map_err(entry)
     });
     let value = match result {
-        Ok(value) => cell.value.get_or_init(|| value.as_ref().clone()).clone(),
+        Ok(value) => {
+            cell.value.get_or_init(|| value.as_ref().clone());
+            value.as_ref().clone()
+        }
         Err(failure) => failure.as_ref().clone(),
     };
     // A cold builder already forwarded its reads and reasons. Only another
@@ -233,8 +287,8 @@ pub fn replayable_query_cache_cell<T: Clone + Send + Sync + 'static>(
 pub struct QueryCacheBuildReceipt {
     keys: Arc<[crate::analyzer::ReadKey]>,
     reasons: Vec<crate::analyzer::QueryReadIncomplete>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
+    runtime_cache_touched: bool,
 }
 
 impl QueryCacheBuildReceipt {
@@ -244,26 +298,34 @@ impl QueryCacheBuildReceipt {
     }
 
     pub fn has_execution_dependences(&self) -> bool {
-        self.execution_dependences > 0
+        self.channels.execution_dependences > 0
             || self
                 .reasons
                 .iter()
                 .any(|reason| reason.is_execution_dependent())
     }
     pub fn is_complete(&self) -> bool {
-        self.reasons.is_empty() && self.execution_dependences == 0
+        self.reasons.is_empty()
+            && self.channels.execution_dependences == 0
+            && !self.channels.reuse_refused
     }
 
     pub fn unattributed_reads(&self) -> usize {
-        self.unattributed_reads
+        self.channels.unattributed_reads
     }
 
     pub fn replay(&self) {
+        if self.runtime_cache_touched {
+            crate::analyzer::i_analyzer::record_runtime_cache_touch_on_current_contexts();
+        }
         replay_query_cache_stable_reasons(&self.reasons);
         crate::analyzer::i_analyzer::replay_query_read_receipt_on_current_contexts(
             &self.keys,
-            self.unattributed_reads,
-            self.execution_dependences,
+            self.channels.unattributed_reads,
+            self.channels.execution_dependences,
+            self.channels.budget_dependences,
+            self.channels.reuse_refused,
+            self.channels.persistence_refusals,
         );
     }
 }
@@ -296,8 +358,8 @@ pub fn capture_query_cache_build<T>(
         QueryCacheBuildReceipt {
             keys: Arc::from(reads.keys()),
             reasons,
-            unattributed_reads: reads.unattributed_reads(),
-            execution_dependences: reads.execution_dependences(),
+            channels: reads.channels(),
+            runtime_cache_touched: reads.runtime_cache_touched(),
         },
     )
 }
@@ -436,6 +498,7 @@ pub fn replayable_query_cache_fill<T>(
     if incomplete
         || snapshot_changed
         || reads.execution_dependences() > 0
+        || reads.reuse_refused()
         || analyzer
             .active_query_cancellation()
             .is_some_and(|token| token.is_cancelled())
@@ -461,14 +524,39 @@ pub fn replayable_query_cache_value<T>(
     build: impl FnOnce() -> T,
 ) -> Result<ReplayableQueryCacheValue<T>, ReplayableQueryCacheValue<T>> {
     let _fill = crate::analyzer::AnalyzerQueryScope::for_retained_fill(analyzer);
-    let (attempt, receipt) =
-        capture_query_cache_build(analyzer, || replayable_query_cache_fill(analyzer, build));
+    capture_replayable_query_cache_value(analyzer, || replayable_query_cache_fill(analyzer, build))
+}
+
+/// Capture a complete-only cache value in the caller's request domain.
+/// The receipt preserves the fill's reads without changing request-local memo
+/// ownership while computing the answer.
+#[doc(hidden)]
+pub fn complete_replayable_query_cache_value<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> T,
+) -> Result<ReplayableQueryCacheValue<T>, ReplayableQueryCacheValue<T>> {
+    capture_replayable_query_cache_value(analyzer, || complete_query_cache_fill(analyzer, build))
+}
+
+pub(crate) fn capture_replayable_query_cache_value<T>(
+    analyzer: &dyn IAnalyzer,
+    build: impl FnOnce() -> Result<T, T>,
+) -> Result<ReplayableQueryCacheValue<T>, ReplayableQueryCacheValue<T>> {
+    let (attempt, receipt) = capture_query_cache_build(analyzer, build);
+    let admitted = attempt.is_ok()
+        && !receipt.has_execution_dependences()
+        && replayable_receipt_admitted(&receipt);
+    let value = attempt.unwrap_or_else(std::convert::identity);
     let receipt = Arc::new(receipt);
     let entry = |value| ReplayableQueryCacheValue {
         value,
         receipt: Arc::clone(&receipt),
     };
-    attempt.map(entry).map_err(entry)
+    if admitted {
+        Ok(entry(value))
+    } else {
+        Err(entry(value))
+    }
 }
 
 /// Preserve the complete-only answer while retaining a stable failed outcome.
@@ -715,6 +803,7 @@ impl<'a> QueryCacheFill<'a> {
             && !snapshot_changed
             && !cancelled
             && self.reads.execution_dependences() == 0
+            && !self.reads.reuse_refused()
     }
 }
 
@@ -1507,6 +1596,123 @@ mod tests {
     use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use crate::analyzer::{CodeUnit, CodeUnitType, Language, ProjectFile};
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn query_cell_hit_replays_another_units_runtime_cache_touch() {
+        use crate::analyzer::workspace::EmptyAnalyzer;
+        use crate::analyzer::{IAnalyzer, TestProject, capture_query_reads};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let analyzer =
+            EmptyAnalyzer::new(Arc::new(TestProject::new(root.path(), Language::CSharp)));
+        let cell = super::QueryCacheCell::new();
+        let (_, first) = capture_query_reads(&analyzer, || {
+            super::replayable_query_cache_cell(&analyzer, &cell, || {
+                analyzer.mark_runtime_cache_touched();
+                Arc::new(42)
+            })
+        });
+        let (value, second) = capture_query_reads(&analyzer, || {
+            super::replayable_query_cache_cell(&analyzer, &cell, || panic!("must hit"))
+        });
+        let (_, independent) = capture_query_reads(&analyzer, || ());
+        assert_eq!(*value, 42);
+        assert!(first.runtime_cache_touched());
+        assert!(second.runtime_cache_touched());
+        assert!(!independent.runtime_cache_touched());
+        assert_eq!(second.channels(), independent.channels());
+    }
+
+    #[test]
+    fn replayable_receipt_admission_caps_bytes_and_keeps_unattributed_reads() {
+        use super::{QueryCacheBuildReceipt, replayable_receipt_admitted};
+        use crate::analyzer::QueryReadIncomplete;
+        use std::sync::Arc;
+
+        let mut receipt = QueryCacheBuildReceipt {
+            keys: Arc::default(),
+            reasons: vec![QueryReadIncomplete::SemanticEvidenceGap("x".into())],
+            channels: Default::default(),
+            runtime_cache_touched: false,
+        };
+        assert!(replayable_receipt_admitted(&receipt));
+        receipt.channels.unattributed_reads = 1;
+        assert!(replayable_receipt_admitted(&receipt));
+        receipt.channels.unattributed_reads = 0;
+        receipt.channels.reuse_refused = true;
+        assert!(!replayable_receipt_admitted(&receipt));
+        receipt.channels.reuse_refused = false;
+        receipt.reasons = vec![QueryReadIncomplete::SemanticEvidenceGap(
+            "x".repeat(super::MAX_REPLAYABLE_RECEIPT_BYTES).into(),
+        )];
+        assert!(receipt.retained_bytes() > super::MAX_REPLAYABLE_RECEIPT_BYTES);
+        assert!(!replayable_receipt_admitted(&receipt));
+        assert_eq!(
+            receipt.reasons.len(),
+            1,
+            "refusal must not truncate evidence"
+        );
+    }
+
+    #[test]
+    fn full_builder_returns_its_own_value_and_receipt_after_a_competing_publish() {
+        use super::{QueryCacheBuildReceipt, QueryCacheCell, ReplayableQueryCacheValue};
+        use crate::analyzer::i_analyzer::AnalyzerQueryScope;
+        use crate::analyzer::workspace::EmptyAnalyzer;
+        use crate::analyzer::{QueryReadIncomplete, TestProject};
+        use std::sync::{Arc, mpsc};
+
+        let root = tempfile::tempdir().unwrap();
+        let analyzer = Arc::new(EmptyAnalyzer::new(Arc::new(TestProject::new(
+            root.path(),
+            Language::CSharp,
+        ))));
+        let cell = Arc::new(QueryCacheCell::new());
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let full_analyzer = Arc::clone(&analyzer);
+        let full_cell = Arc::clone(&cell);
+
+        let full = std::thread::spawn(move || {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&*full_analyzer);
+            let value = super::replayable_query_cache_cell(&*full_analyzer, &full_cell, || {
+                crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(
+                    QueryReadIncomplete::SemanticEvidenceGap("full".into()),
+                );
+                started_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                Arc::new(vec![2])
+            });
+            (value, scope.captured_read_incompleteness())
+        });
+        started_rx.recv().unwrap();
+        cell.get_or_init(|| ReplayableQueryCacheValue {
+            value: Arc::new(vec![1]),
+            receipt: Arc::new(QueryCacheBuildReceipt {
+                keys: Arc::default(),
+                reasons: vec![QueryReadIncomplete::SemanticEvidenceGap("publisher".into())],
+                channels: Default::default(),
+                runtime_cache_touched: false,
+            }),
+        });
+        resume_tx.send(()).unwrap();
+        let (value, reasons) = full.join().unwrap();
+        assert_eq!(*value, vec![2]);
+        assert_eq!(
+            reasons,
+            vec![QueryReadIncomplete::SemanticEvidenceGap("full".into())]
+        );
+        let hit_scope = AnalyzerQueryScope::capturing_read_incompleteness(&*analyzer);
+        let hit = super::replayable_query_cache_cell(&*analyzer, &cell, || {
+            panic!("published entry must be used")
+        });
+        assert_eq!(*hit, vec![1]);
+        assert_eq!(
+            hit_scope.captured_read_incompleteness(),
+            vec![QueryReadIncomplete::SemanticEvidenceGap("publisher".into())]
+        );
+    }
 
     #[test]
     fn scala_companion_segments_match_object_declarations() {

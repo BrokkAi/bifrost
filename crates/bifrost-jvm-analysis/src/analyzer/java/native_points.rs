@@ -7,6 +7,7 @@ use brokk_bifrost_core::analyzer::model::DeclarationKind;
 use crate::analyzer::java::imports::JavaTypeResolution;
 
 use crate::analyzer::jvm::external::JvmExternalMember;
+use crate::analyzer::jvm::external::QueryGapRecorder;
 
 use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
 
@@ -25,6 +26,7 @@ use brokk_bifrost_analysis::analyzer::native_points::unavailable_definition;
 use brokk_bifrost_analysis::analyzer::native_points::unavailable_type;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
+use brokk_bifrost_analysis::analyzer::resolution::SelectedExplicitImportBoundary;
 use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::JavaExternalStaticImportBoundary;
@@ -87,6 +89,9 @@ pub fn resolve_java_definition_bounded(
             work,
         },
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
     }
 }
@@ -182,6 +187,8 @@ enum JavaNativePointStop {
         brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit,
         ReceiverAnalysisWork,
     ),
+    #[allow(dead_code)]
+    Unavailable(&'static str, ReceiverAnalysisWork),
     Cancelled(ReceiverAnalysisWork),
 }
 
@@ -197,6 +204,24 @@ pub(crate) fn resolve_java_definition_with_evidence_in_batch(
     batch: Option<&NativePointBatch>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<JavaNativeDefinitionResolution> {
+    let Ok(_model_scope) =
+        brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            query.analyzer,
+        )
+    else {
+        return BoundedResolution::Complete {
+            value: JavaNativeDefinitionResolution {
+                outcome: unavailable_definition(
+                    query.site,
+                    "native_stale",
+                    "selected model authority changed".into(),
+                ),
+                evidence: CallEvidence::default(),
+                call_binding_reason_digests: Vec::new(),
+            },
+            work: ReceiverAnalysisWork::default(),
+        };
+    };
     let anchored = java_creation_keyword_anchor(query);
     let query = match &anchored {
         Some(site) => BoundedReceiverQuery { site, ..query },
@@ -284,8 +309,11 @@ fn resolve_java_definition_with_evidence_uncached(
         },
         after_open,
         |answer| {
-            let binding = answer.argument_binding.as_ref()?;
-            Some(NativeExternalArgumentBinding {
+            let boundary = answer.explicit_import_boundary.clone();
+            let Some(binding) = answer.argument_binding.as_ref() else {
+                return (None, boundary);
+            };
+            let binding = NativeExternalArgumentBinding {
                 completion: binding.completion().clone(),
                 reason_digests: answer.argument_reason_digests.clone(),
                 static_type_qualifier_reason_digests: answer
@@ -300,31 +328,40 @@ fn resolve_java_definition_with_evidence_uncached(
                     .iter()
                     .map(|member| member.identity.clone())
                     .collect(),
-            })
+            };
+            (Some(binding), boundary)
         },
     );
-    let (resolution, argument_binding) = match resolution {
+    let (resolution, (argument_binding, explicit_import_boundary)) = match resolution {
         BoundedResolution::Complete {
-            value: (outcome, binding),
+            value: (outcome, projected),
             work,
         } => (
             BoundedResolution::Complete {
                 value: outcome,
                 work,
             },
-            binding.flatten(),
+            projected.unwrap_or_default(),
         ),
         BoundedResolution::Cancelled { work } => return BoundedResolution::Cancelled { work },
         BoundedResolution::Exceeded { limit, work } => {
             return BoundedResolution::Exceeded { limit, work };
+        }
+        BoundedResolution::Unavailable { reason, work } => {
+            return BoundedResolution::Unavailable { reason, work };
         }
     };
 
     let resolution =
         crate::analyzer::jvm::native_points::project_jvm_declaration_site(query, resolution);
     let resolution = apply_static_import_boundary(&site_text, &external_static_imports, resolution);
-    let resolution =
-        apply_explicit_type_import_boundary(java, query, &open_jvm_alias_imports, resolution);
+    let resolution = apply_explicit_type_import_boundary(
+        java,
+        query,
+        &open_jvm_alias_imports,
+        explicit_import_boundary,
+        resolution,
+    );
     match resolution {
         BoundedResolution::Complete { mut value, work } => {
             let mut call_binding_reason_digests = Vec::new();
@@ -344,6 +381,12 @@ fn resolve_java_definition_with_evidence_uncached(
                         work: nested_work,
                     };
                 }
+                Err(JavaNativePointStop::Unavailable(reason, nested_work)) => {
+                    return BoundedResolution::Unavailable {
+                        reason,
+                        work: nested_work,
+                    };
+                }
                 Err(JavaNativePointStop::Cancelled(nested_work)) => {
                     return BoundedResolution::Cancelled { work: nested_work };
                 }
@@ -359,14 +402,29 @@ fn resolve_java_definition_with_evidence_uncached(
             }
         }
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
     }
 }
 
+/// Project a Java import boundary onto an answer with no target. A scoped
+/// type whose qualifier is outside the workspace is a type-context route. A
+/// simple type name uses the store's simple-type-name decision, which names
+/// the winning single-type import. An ambiguous `N.member` prefix is a
+/// different question (JLS 6.5.2): no type-name decision reclassifies it, so
+/// it keeps the store's Incomplete answer until a prefix decision proves it.
+///
+/// An import declaration's own target name is still answered here from the
+/// analyzer's import declarations (#9546 follow-up): the store has no link
+/// from that terminal reference to its binder, so its boundary is not part
+/// of the simple-type-name decision.
 fn apply_explicit_type_import_boundary(
     java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
     open_jvm_alias_imports: &[String],
+    explicit_import_boundary: Option<SelectedExplicitImportBoundary>,
     resolution: BoundedResolution<DefinitionLookupOutcome>,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
     let BoundedResolution::Complete { mut value, work } = resolution else {
@@ -435,101 +493,73 @@ fn apply_explicit_type_import_boundary(
         });
         return BoundedResolution::Complete { value, work };
     }
-    let Some((owner_node, member_node)) = java_imported_type_route_nodes(focus) else {
-        return BoundedResolution::Complete { value, work };
-    };
-    let Some(simple_name) = query
-        .source
-        .get(owner_node.start_byte()..owner_node.end_byte())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    else {
-        return BoundedResolution::Complete { value, work };
-    };
-    let Some(owner) = java.explicit_imported_type_fqn(token, query.file, simple_name) else {
-        return BoundedResolution::Complete { value, work };
-    };
-    if open_jvm_alias_imports.iter().any(|alias| alias == &owner) {
-        return BoundedResolution::Complete { value, work };
-    }
-    let overlay = query.analyzer.semantic_model_overlay();
-    let resolved_owner =
-        java.resolve_type_name_with_external(token, overlay.clone(), query.file, &owner);
-    if matches!(&resolved_owner, Some(JavaTypeResolution::Source(_))) {
-        return BoundedResolution::Complete { value, work };
-    }
-
-    let (subject, written_route, role, external_target) = if let Some(member_node) = member_node {
-        let Some(member) = query
+    if java_is_import_target_name(focus) {
+        let Some(simple_name) = query
             .source
-            .get(member_node.start_byte()..member_node.end_byte())
+            .get(focus.start_byte()..focus.end_byte())
             .map(str::trim)
             .filter(|name| !name.is_empty())
         else {
             return BoundedResolution::Complete { value, work };
         };
-        let member_fqn = format!("{owner}.{member}");
-        if matches!(&resolved_owner, Some(JavaTypeResolution::External(_))) {
-            let nested_type = java.resolve_type_name_with_external(
-                token,
-                overlay.clone(),
-                query.file,
-                &member_fqn,
-            );
-            let external_member =
-                java.resolve_member_name_with_external(token, overlay, query.file, &member_fqn);
-            if nested_type.is_none() && external_member.is_none() {
-                brokk_bifrost_analysis::analyzer::usages::get_definition::record_native_external_route(member_fqn);
+        let Some(owner) = java.explicit_imported_type_fqn(token, query.file, simple_name) else {
+            return BoundedResolution::Complete { value, work };
+        };
+        if open_jvm_alias_imports.iter().any(|alias| alias == &owner) {
+            return BoundedResolution::Complete { value, work };
+        }
+        let external_target = match java.resolve_type_name_with_external(
+            token,
+            query.analyzer.semantic_model_overlay(),
+            query.file,
+            &owner,
+        ) {
+            Some(JavaTypeResolution::Source(_)) => {
                 return BoundedResolution::Complete { value, work };
             }
-            let target = external_member
-                .map(|member| member.fqn().to_owned())
-                .or_else(|| match nested_type {
-                    Some(JavaTypeResolution::External(nested)) => Some(nested.fqn().to_owned()),
-                    Some(JavaTypeResolution::Source(_)) | None => None,
-                });
-            (
-                member_fqn,
-                format!("{simple_name}.{member}"),
-                ClaimSubjectRole::Member,
-                target,
-            )
-        } else {
-            (
-                member_fqn,
-                format!("{simple_name}.{member}"),
-                ClaimSubjectRole::Member,
-                None,
-            )
-        }
-    } else {
-        let target = match resolved_owner {
             Some(JavaTypeResolution::External(external)) => Some(external.fqn().to_owned()),
-            Some(JavaTypeResolution::Source(_)) | None => None,
+            None => None,
         };
-        (
-            owner,
-            simple_name.to_owned(),
-            ClaimSubjectRole::Type,
-            target,
-        )
+        crate::analyzer::jvm::native_points::project_jvm_external_boundary(
+            &mut value,
+            query.site,
+            simple_name,
+            external_target.as_deref(),
+            None,
+        );
+        value
+            .diagnostics
+            .insert(0, java_imported_type_boundary_diagnostic(owner));
+        return BoundedResolution::Complete { value, work };
+    }
+    let Some(boundary) = explicit_import_boundary else {
+        return BoundedResolution::Complete { value, work };
     };
-
     crate::analyzer::jvm::native_points::project_jvm_external_boundary(
         &mut value,
         query.site,
-        &written_route,
-        external_target.as_deref(),
+        &boundary.simple_name,
+        boundary.external_target.as_deref(),
         None,
     );
-    value.diagnostics.insert(0, DefinitionLookupDiagnostic {
+    value.diagnostics.insert(
+        0,
+        java_imported_type_boundary_diagnostic(boundary.imported_fqn.to_string()),
+    );
+    BoundedResolution::Complete { value, work }
+}
+
+fn java_imported_type_boundary_diagnostic(subject: String) -> DefinitionLookupDiagnostic {
+    DefinitionLookupDiagnostic {
         kind: "java_imported_type_external_boundary".into(),
         message: format!(
             "`{subject}` is reached through an explicit Java type import not indexed in this workspace; its declaration may be outside the indexed workspace, including when only a partial workspace is indexed"
         ),
-        claim: Some(UnindexedClaim::external_boundary(subject, role)),
-    });
-    BoundedResolution::Complete { value, work }
+        claim: Some(UnindexedClaim::external_boundary(
+            subject,
+            ClaimSubjectRole::Type,
+        )),
+    }
 }
 
 fn java_scoped_external_type_route(
@@ -613,42 +643,6 @@ fn java_is_import_target_name(focus: tree_sitter::Node<'_>) -> bool {
     }
     path.parent()
         .is_some_and(|parent| parent.kind() == "import_declaration")
-}
-
-fn java_imported_type_route_nodes(
-    focus: tree_sitter::Node<'_>,
-) -> Option<(tree_sitter::Node<'_>, Option<tree_sitter::Node<'_>>)> {
-    if focus.kind() == "type_identifier" {
-        return Some((focus, None));
-    }
-    if java_is_import_target_name(focus) {
-        return Some((focus, None));
-    }
-    let expression = match focus.kind() {
-        "field_access" | "method_invocation" => Some(focus),
-        "identifier" => focus.parent().filter(|parent| match parent.kind() {
-            "field_access" => {
-                parent.child_by_field_name("object") == Some(focus)
-                    || parent.child_by_field_name("field") == Some(focus)
-            }
-            "method_invocation" => {
-                parent.child_by_field_name("object") == Some(focus)
-                    || parent.child_by_field_name("name") == Some(focus)
-            }
-            _ => false,
-        }),
-        _ => None,
-    }?;
-    let owner = expression.child_by_field_name("object")?;
-    if owner.kind() != "identifier" {
-        return None;
-    }
-    let member = match expression.kind() {
-        "field_access" => expression.child_by_field_name("field"),
-        "method_invocation" => expression.child_by_field_name("name"),
-        _ => None,
-    }?;
-    Some((owner, Some(member)))
 }
 
 fn native_external_member_inventory_selected(outcome: &DefinitionLookupOutcome) -> bool {
@@ -860,8 +854,16 @@ fn java_native_call_evidence(
             let external_call = if receiver.is_some() {
                 match receiver_type.as_ref() {
                     Some(
-                        JavaNativeReceiverResolution::External { owner, form }
-                        | JavaNativeReceiverResolution::ParameterizedCallResult { owner, form },
+                        JavaNativeReceiverResolution::External {
+                            owner,
+                            form,
+                            arguments,
+                        }
+                        | JavaNativeReceiverResolution::ParameterizedCallResult {
+                            owner,
+                            form,
+                            arguments,
+                        },
                     ) => java_native_external_method_resolution(
                         java,
                         query,
@@ -870,6 +872,7 @@ fn java_native_call_evidence(
                         member_name,
                         &actual_types,
                         *form,
+                        arguments.as_deref(),
                     ),
                     Some(
                         JavaNativeReceiverResolution::Typed | JavaNativeReceiverResolution::Untyped,
@@ -898,6 +901,7 @@ fn java_native_call_evidence(
                             member_name,
                             &actual_types,
                             JavaNativeReceiverForm::TypeQualifier,
+                            None,
                         )
                     })
                 }
@@ -920,6 +924,7 @@ fn java_native_call_evidence(
                     selected_member,
                     &actual_types,
                     JavaNativeReceiverForm::BoundValue,
+                    None,
                 )
                 .or_else(|| {
                     java_native_external_method_resolution(
@@ -930,6 +935,7 @@ fn java_native_call_evidence(
                         selected_member,
                         &actual_types,
                         JavaNativeReceiverForm::TypeQualifier,
+                        None,
                     )
                 })
             });
@@ -1052,7 +1058,6 @@ fn publish_java_unmodeled_receiver_boundary(
 ) {
     let reference = outcome.reference.get_or_insert_with(|| query.site.clone());
     reference.text = member.to_owned();
-    outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
     if outcome
         .diagnostics
         .iter()
@@ -1105,6 +1110,28 @@ fn publish_java_imported_bound_boundary(
     let Some(type_name) = java_type_name_from_node(type_node, query.source) else {
         return;
     };
+    // A parameter declared directly with a single-type import has an import
+    // owner even when that owner's members are not indexed (JLS 7.5.1).
+    // Keep this distinct from an unbounded type parameter or a call result,
+    // neither of which proves an imported owner.
+    if let Some(site) = java_constructor_type_terminal(type_node)
+        && let Some(value) = java_native_expression_value_type_at_node(query, site)
+        && value
+            .value_types
+            .types
+            .iter()
+            .all(|ty| ty.definitions.is_empty())
+        && value
+            .value_types
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "jvm-import-owner-open")
+        && let Some(canonical) = java.explicit_imported_type_fqn(token, query.file, &type_name)
+        && value.value_types.types.iter().all(|ty| ty.fqn == canonical)
+    {
+        outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
+        return;
+    }
     let Some(parameter) = java_type_parameter_in_scope(type_node, query.source, &type_name) else {
         return;
     };
@@ -1141,6 +1168,9 @@ fn publish_java_imported_bound_boundary(
         let Some(canonical) = canonical else {
             continue;
         };
+        // This bound was proved to name an unindexed import. An unbounded
+        // type variable never reaches this branch and remains incomplete.
+        outcome.status = DefinitionLookupStatus::UnresolvableImportBoundary;
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
             kind: "java_native_imported_receiver_bound".into(),
             message: format!(
@@ -1349,12 +1379,14 @@ fn java_native_external_receiver_from_identifier(
         return Some(JavaNativeReceiverResolution::External {
             owner: owner.fqn().to_owned(),
             form: JavaNativeReceiverForm::BoundValue,
+            arguments: None,
         });
     }
     let owner = java_native_external_type(java, query, token, name)?;
     Some(JavaNativeReceiverResolution::External {
         owner: owner.fqn().to_owned(),
         form: JavaNativeReceiverForm::TypeQualifier,
+        arguments: None,
     })
 }
 
@@ -1375,6 +1407,7 @@ fn java_native_external_receiver_from_type_qualifier(
     Some(JavaNativeReceiverResolution::External {
         owner: owner.fqn().to_owned(),
         form: JavaNativeReceiverForm::TypeQualifier,
+        arguments: None,
     })
 }
 
@@ -1405,11 +1438,13 @@ fn java_native_external_receiver_from_site_type(
                         JavaNativeReceiverResolution::ParameterizedCallResult {
                             owner: owner.fqn().to_owned(),
                             form: JavaNativeReceiverForm::BoundValue,
+                            arguments: Some(arguments),
                         }
                     }
                     Some(owner) => JavaNativeReceiverResolution::External {
                         owner: owner.fqn().to_owned(),
                         form: JavaNativeReceiverForm::BoundValue,
+                        arguments: None,
                     },
                     None => JavaNativeReceiverResolution::Typed,
                 },
@@ -1421,6 +1456,58 @@ fn java_native_external_receiver_from_site_type(
     if matches!(receiver.kind(), "this" | "super") {
         return Ok(JavaNativeReceiverResolution::Typed);
     }
+    let mut receiver_expression = receiver;
+    while receiver_expression.kind() == "parenthesized_expression" {
+        let Some(inner) = receiver_expression.named_child(0) else {
+            return Ok(JavaNativeReceiverResolution::Untyped);
+        };
+        receiver_expression = inner;
+    }
+    // An anonymous creation's value is the anonymous class, which its
+    // declaration types through the site path below; only a named class
+    // creation takes its receiver from the constructor binding (#10021).
+    // Some(proof) below requires Selected, the unique applicable complete
+    // binding; Witnessed (applicable with open alternatives) yields None.
+    // Java constructors are not inherited, so that exact owner's class is
+    // the class created here.
+    if receiver_expression.kind() == "object_creation_expression"
+        && !named_children(receiver_expression)
+            .into_iter()
+            .any(|child| child.kind() == "class_body")
+        && let Some(type_node) = receiver_expression.child_by_field_name("type")
+        && let Some(type_name) =
+            java_native_constructor_type_name(query, receiver_expression, type_node)
+        && java_native_external_type(java, query, token, &type_name).is_some()
+    {
+        let actuals =
+            java_native_call_argument_types(java, query, token, receiver_expression, batch)?;
+        let binding = java_native_external_constructor_proof(
+            java,
+            query,
+            token,
+            receiver_expression,
+            &type_name,
+            actuals.as_deref(),
+        );
+        if let Some((Some(_proof), owner, _)) = binding.as_ref() {
+            return Ok(JavaNativeReceiverResolution::External {
+                owner: owner.clone(),
+                form: JavaNativeReceiverForm::BoundValue,
+                // A creation's explicit or inferred type arguments are not
+                // bound yet (#7860), so its members keep unsubstituted
+                // signatures.
+                arguments: None,
+            });
+        }
+        // A witnessed binding has an applicable target despite open
+        // alternatives. A rejected binding has none. Reuse the same
+        // refusal rule as nested argument conversion without resolving
+        // the call again while the site's store reader is held.
+        if java_native_creation_constructor_refused(false, false, false, binding.is_some()) {
+            return Ok(JavaNativeReceiverResolution::Untyped);
+        }
+    }
+
     let Some(site_node) = java_native_receiver_type_site_node(receiver) else {
         return Ok(JavaNativeReceiverResolution::Untyped);
     };
@@ -1443,7 +1530,10 @@ fn java_native_external_receiver_from_site_type(
         );
         let receiver_target_kind = value.value_types.target_kind.clone();
         let static_type = value.static_type;
-        let Some(TypeRef::Named { name, .. }) = static_type else {
+        let Some(TypeRef::Named {
+            name, arguments, ..
+        }) = static_type
+        else {
             return if matches!(static_type, Some(TypeRef::Declared { .. })) {
                 JavaNativeReceiverResolution::Typed
             } else {
@@ -1455,6 +1545,9 @@ fn java_native_external_receiver_from_site_type(
         };
         JavaNativeReceiverResolution::External {
             owner: owner.fqn().to_owned(),
+            // Only the store-projected Applied shape supplies exact arguments.
+            // The AST-declared fallback deliberately supplies none.
+            arguments: (!arguments.is_empty()).then_some(arguments),
             // Only name-like references can denote a static type qualifier.
             form: if is_type_name && receiver_target_kind == TypeLookupTargetKind::TypeReference {
                 JavaNativeReceiverForm::TypeQualifier
@@ -1525,6 +1618,9 @@ fn java_native_expression_value_type_at_node_in_batch(
         BoundedResolution::Exceeded { limit, work } => {
             Err(JavaNativePointStop::Exceeded(limit, work))
         }
+        BoundedResolution::Unavailable { reason, work } => {
+            Err(JavaNativePointStop::Unavailable(reason, work))
+        }
         BoundedResolution::Cancelled { work } => Err(JavaNativePointStop::Cancelled(work)),
     }
 }
@@ -1556,10 +1652,12 @@ enum JavaNativeReceiverResolution {
     External {
         owner: String,
         form: JavaNativeReceiverForm,
+        arguments: Option<Vec<TypeRef>>,
     },
     ParameterizedCallResult {
         owner: String,
         form: JavaNativeReceiverForm,
+        arguments: Option<Vec<TypeRef>>,
     },
     Typed,
     Untyped,
@@ -1581,7 +1679,7 @@ fn java_native_external_type(
             .as_ref()
             .and_then(|evidence| evidence.artifact_sha256.as_deref()),
     )? {
-        JavaTypeResolution::External(external) => Some(external),
+        JavaTypeResolution::External(external) => Some(external.into_type()),
         JavaTypeResolution::Source(_) => None,
     }
 }
@@ -1603,7 +1701,7 @@ fn java_native_static_external_type(
             .external_declarations_for_source_jdk(query.analyzer.semantic_model_overlay(), digest),
         None => java.external_declarations(query.analyzer.semantic_model_overlay()),
     };
-    surface.get(fqn)
+    surface.get(&QueryGapRecorder::new(java), fqn)
 }
 
 enum JavaNativeExternalInvocation {
@@ -1622,6 +1720,10 @@ struct JavaNativeExternalMethodResolution {
     invocation: JavaNativeExternalInvocation,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "receiver owner, arguments, and call context are independent selection inputs"
+)]
 fn java_native_external_method_resolution(
     java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
@@ -1630,7 +1732,9 @@ fn java_native_external_method_resolution(
     member: &str,
     actual_types: &[TypeRef],
     form: JavaNativeReceiverForm,
+    receiver_arguments: Option<&[TypeRef]>,
 ) -> Option<JavaNativeExternalMethodResolution> {
+    let query_owner = owner;
     let canonical = format!("{owner}.{member}");
     let selected = java.selected_jdk_artifact_for_file(query.analyzer, query.file);
     let resolved: JvmExternalMember = java.resolve_member_name_with_selected_jdk(
@@ -1665,8 +1769,18 @@ fn java_native_external_method_resolution(
             .active_semantic_model_snapshot()
             .map(|snapshot| std::sync::Arc::clone(snapshot.active_models())),
     );
-    let (selection, model_member_selection) =
-        resolved.invocation_with_diagnostics(bound_receiver, actual_types, Some(&surface));
+    let owner_bindings = receiver_arguments
+        .and_then(|arguments| surface.java_owner_bindings(query_owner, owner, arguments));
+    let (selection, model_member_selection) = if let Some(bindings) = owner_bindings.as_ref() {
+        resolved.invocation_with_bound_diagnostics(
+            bound_receiver,
+            actual_types,
+            Some(&surface),
+            Some(bindings),
+        )
+    } else {
+        resolved.invocation_with_diagnostics(bound_receiver, actual_types, Some(&surface))
+    };
     record_external_invocation(
         query.site.focus_start_byte,
         owner,
@@ -1710,6 +1824,7 @@ fn java_native_external_method_resolution(
                     bound_receiver,
                     actual_types,
                     Some(&surface),
+                    owner_bindings.as_ref(),
                 )
             })
             .or_else(|| {
@@ -1717,6 +1832,7 @@ fn java_native_external_method_resolution(
                     bound_receiver,
                     actual_types,
                     Some(&surface),
+                    owner_bindings.as_ref(),
                 )
             }),
     )
@@ -1724,8 +1840,17 @@ fn java_native_external_method_resolution(
         artifact.artifact_sha256.as_deref() == resolved.jdk_artifact_sha256()
             && resolved.jdk_artifact_sha256().is_some()
     }));
+    let mut proof = proof;
+    proof.type_argument_bindings = owner_bindings.as_ref().and_then(|bindings| {
+        resolved.selected_type_argument_bindings(bound_receiver, actual_types, &surface, bindings)
+    });
     let dispatch_closed = resolved
-        .non_overridable_for_argument_types(bound_receiver, actual_types, Some(&surface))
+        .non_overridable_for_argument_types(
+            bound_receiver,
+            actual_types,
+            Some(&surface),
+            owner_bindings.as_ref(),
+        )
         .is_some();
     Some(JavaNativeExternalMethodResolution {
         model_member_selection: None,
@@ -1855,6 +1980,15 @@ fn java_native_argument_type(
     )
 }
 
+fn java_native_creation_constructor_refused(
+    exact_external_call: bool,
+    has_definition: bool,
+    has_lexical_definition: bool,
+    has_modeled_definition: bool,
+) -> bool {
+    !exact_external_call && !has_definition && !has_lexical_definition && !has_modeled_definition
+}
+
 fn java_native_argument_type_with_call_reasons(
     _java: &JavaAnalyzer,
     query: BoundedReceiverQuery<'_>,
@@ -1924,6 +2058,19 @@ fn java_native_argument_type_with_call_reasons(
             };
             match resolve_java_definition_with_evidence_in_batch(call_query, batch, || {}) {
                 BoundedResolution::Complete { value, .. } => {
+                    if expression.kind() == "object_creation_expression"
+                        && java_native_creation_constructor_refused(
+                            value.evidence.exact_external_call().is_some(),
+                            !value.outcome.definitions.is_empty(),
+                            value.outcome.lexical_definition.is_some(),
+                            !value.outcome.modeled_definitions.is_empty(),
+                        )
+                    {
+                        // No constructor accepts these actuals, so the creation
+                        // is erroneous and its value proves no outer conversion
+                        // (#3699, #10021).
+                        return None;
+                    }
                     if let Some(proof) = value.evidence.exact_external_call() {
                         call_binding_reason_digests
                             .extend_from_slice(&value.call_binding_reason_digests);
@@ -1944,10 +2091,21 @@ fn java_native_argument_type_with_call_reasons(
                             .analyzer_store()
                             .selected_external_member_return_type(identity)
                         {
-                            Ok(ty) => ty.map(|term| {
-                                crate::analyzer::jvm::external::normalize_jvm_model_type_ref(
-                                    query.analyzer.semantic_model_overlay().as_deref(),
-                                    &term,
+                            Ok(ty) => ty.and_then(|term| {
+                                let term = if let Some(bindings) = &proof.type_argument_bindings {
+                                    let bindings = bindings
+                                        .iter()
+                                        .map(|(name, ty)| (name.to_string(), ty.clone()))
+                                        .collect();
+                                    term.substitute(&bindings, 64)?
+                                } else {
+                                    term
+                                };
+                                Some(
+                                    crate::analyzer::jvm::external::normalize_jvm_model_type_ref(
+                                        query.analyzer.semantic_model_overlay().as_deref(),
+                                        &term,
+                                    ),
                                 )
                             }),
                             Err(error) => {
@@ -1965,6 +2123,10 @@ fn java_native_argument_type_with_call_reasons(
                 }
                 BoundedResolution::Exceeded { limit, work } => {
                     stopped = Some(JavaNativePointStop::Exceeded(limit, work));
+                    return None;
+                }
+                BoundedResolution::Unavailable { reason, work } => {
+                    stopped = Some(JavaNativePointStop::Unavailable(reason, work));
                     return None;
                 }
                 BoundedResolution::Cancelled { work } => {
@@ -2004,6 +2166,10 @@ fn java_native_argument_type_with_call_reasons(
                 BoundedResolution::Complete { value, .. } => value.static_type,
                 BoundedResolution::Exceeded { limit, work } => {
                     stopped = Some(JavaNativePointStop::Exceeded(limit, work));
+                    None
+                }
+                BoundedResolution::Unavailable { reason, work } => {
+                    stopped = Some(JavaNativePointStop::Unavailable(reason, work));
                     None
                 }
                 BoundedResolution::Cancelled { work } => {
@@ -2133,6 +2299,7 @@ fn java_native_external_constructor_proof(
         "<init>",
         actual_types,
         JavaNativeReceiverForm::BoundValue,
+        None,
     )?;
     match resolution.invocation {
         JavaNativeExternalInvocation::Selected { proof, .. } => {
@@ -2266,6 +2433,20 @@ pub(crate) fn resolve_java_type_bounded(
     query: BoundedReceiverQuery<'_>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<TypeLookupOutcome> {
+    let Ok(_model_scope) =
+        brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            query.analyzer,
+        )
+    else {
+        return BoundedResolution::Complete {
+            value: unavailable_type(
+                query.site,
+                "native_stale",
+                "selected model authority changed".into(),
+            ),
+            work: ReceiverAnalysisWork::default(),
+        };
+    };
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(query.analyzer) else {
         return BoundedResolution::Complete {
             value: unavailable_type(
@@ -2414,6 +2595,9 @@ fn java_observed_value_type(
                     canonical: canonical_name.clone(),
                 }
             }
+            SelectedNativeDefinition::ExternalOwner { owner, .. } => ObservedValueType::Named {
+                canonical: owner.owner_fqn.to_string(),
+            },
         };
     }
     // An identity without a selected nominal declaration is not a named proof.
@@ -2531,18 +2715,24 @@ pub(super) fn observed_value_type(
         BoundedResolution::Complete { work, .. }
         | BoundedResolution::Cancelled { work }
         | BoundedResolution::Exceeded { work, .. } => work,
+        BoundedResolution::Unavailable { work, .. } => work,
     };
     request.budget.charge_work(SemanticWork {
-        events: work.scope_nodes,
+        events: work.scope_nodes.saturating_add(work.hierarchy_order_steps),
         ..Default::default()
     });
-    if !request.charge_execution_traversal(work.scope_nodes) {
+    if !request
+        .charge_execution_traversal(work.scope_nodes.saturating_add(work.hierarchy_order_steps))
+    {
         return Ok(ObservedValueType::Undecided(BudgetExceeded));
     }
     Ok(match result {
         BoundedResolution::Complete { value, .. } => value,
         BoundedResolution::Cancelled { .. } => ObservedValueType::Undecided(Cancelled),
         BoundedResolution::Exceeded { .. } => ObservedValueType::Undecided(BudgetExceeded),
+        BoundedResolution::Unavailable { .. } => {
+            ObservedValueType::Undecided(UnavailableObservation)
+        }
     })
 }
 

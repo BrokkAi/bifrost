@@ -222,7 +222,7 @@ mod jvm_extraction_tests {
             );
         }
 
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
             conn.execute("DELETE FROM blobs WHERE id = ?1", [primary_blob_id])
                 .expect("delete published primary blob");
             for table in [
@@ -381,7 +381,7 @@ mod jvm_extraction_tests {
             prepare(optional_oid, with_projection(&state), &generations, &[]),
         );
         let optional_oid_text = optional_oid.to_string();
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
             conn.execute(
                 "UPDATE resolution_fragment_interiors
              SET producer_epoch = 'legacy-resolution-bundle'
@@ -434,7 +434,7 @@ mod jvm_extraction_tests {
         );
 
         let optional_oid_text = optional_oid.to_string();
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
             conn.execute(
                 "UPDATE resolution_fragment_interiors
              SET producer_epoch = 'legacy-resolution-bundle-again'

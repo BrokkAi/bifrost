@@ -1,16 +1,26 @@
 //! Shared snapshot, publication, and complete-cache mechanics for language lowerers.
 
-use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValuePermit};
 use crate::analyzer::{IAnalyzer, QueryScope};
-use brokk_bifrost_core::gitblob::{BlobKey, ParseVariant};
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValuePermit};
+use brokk_bifrost_core::gitblob::BlobKey;
 
+use crate::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey};
 use crate::analyzer::semantic::partial_flow::ProcedurePartialFlows;
-use crate::analyzer::semantic::{
-    ContentIdentity, ProcedureId, SemanticArtifact, SemanticArtifactKey, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork, StableDigest,
+use crate::analyzer::semantic::read_ledger::{
+    REFUSED_PROVENANCE, StoredSemanticIrPublicationAnswer, StoredSemanticIrPublicationQuestion,
 };
+use crate::analyzer::semantic::{
+    ContentIdentity, ProcedureHandle, ProcedureId, ProcedureSemanticsParts, SemanticArtifact,
+    SemanticArtifactKey, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
+    StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+};
+use crate::analyzer::semantic::{
+    StoredSemanticIrObservation, StoredSemanticIrPublicationHead, StoredSemanticIrRead,
+    StoredSemanticIrSelection, classify,
+};
+use crate::analyzer::store::semantic_ir::SemanticIrHeadObservation;
 use crate::analyzer::store::semantic_ir::{
-    SemanticIrMountScope, SemanticIrPublication, SemanticIrPublicationOutcome,
+    SemanticIrMountFields, SemanticIrMountScope, StoredFootprintCoverage, StoredFootprintRefusal,
 };
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSourceFailure, PreparedSourceOrigin, PreparedSyntaxLimitedOutcome,
@@ -18,9 +28,107 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{
     LanguageAdapter, LanguageDialect, ProjectFile, ProjectSourceOrigin, TreeSitterAnalyzer,
 };
+use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::path_utils::rel_path_string;
 pub use brokk_bifrost_semantic::analyzer::semantic::service::*;
-use git2::Oid;
 use std::sync::Arc;
+
+pub use brokk_bifrost_semantic::analyzer::semantic::{
+    FootprintAdmission, FootprintAdmissionRefusal,
+};
+
+impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
+    pub fn stored_footprint_coverage(
+        &self,
+        procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<FootprintAdmission, SemanticProviderError> {
+        let key = procedure.artifact().key();
+        let file = ProjectFile::new(self.project().root().to_path_buf(), key.path().as_path());
+        let Some(result) = admitted_stored_child(
+            self,
+            &file,
+            *key.revision().content().as_bytes(),
+            |store, blob| {
+                store.read_footprint_coverage_with_observation(
+                    blob,
+                    key.revision().content(),
+                    procedure.id(),
+                )
+            },
+        )?
+        else {
+            return Ok(FootprintAdmission::Refused(
+                FootprintAdmissionRefusal::CoverageUnavailable,
+            ));
+        };
+        Ok(match result {
+            StoredFootprintCoverage::Admitted {
+                call_target_obligations,
+            } => FootprintAdmission::Admitted {
+                call_target_obligations,
+            },
+            StoredFootprintCoverage::Refused(reason) => FootprintAdmission::Refused(match reason {
+                StoredFootprintRefusal::CoverageUnavailable => {
+                    FootprintAdmissionRefusal::CoverageUnavailable
+                }
+                StoredFootprintRefusal::OldContract => FootprintAdmissionRefusal::OldContract,
+                StoredFootprintRefusal::UnknownCode => FootprintAdmissionRefusal::UnknownCode,
+                StoredFootprintRefusal::DuplicateClass => FootprintAdmissionRefusal::DuplicateClass,
+                StoredFootprintRefusal::MissingClass => FootprintAdmissionRefusal::MissingClass,
+                StoredFootprintRefusal::RefusedCoverage => {
+                    FootprintAdmissionRefusal::RefusedCoverage
+                }
+            }),
+        })
+    }
+    pub fn stored_call_control_coverage(
+        &self,
+        procedure: &ProcedureHandle,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<FootprintAdmission, SemanticProviderError> {
+        let key = procedure.artifact().key();
+        let file = ProjectFile::new(self.project().root().to_path_buf(), key.path().as_path());
+        let Some(oid) = self.reusable_live_oid(&file) else {
+            return Ok(FootprintAdmission::Refused(
+                FootprintAdmissionRefusal::CoverageUnavailable,
+            ));
+        };
+        let variant = self.selected_parse_variant(&file).ok_or_else(|| {
+            SemanticProviderError::internal(format!(
+                "selected parse variant unreadable for {file:?}"
+            ))
+        })?;
+        let blob = BlobKey {
+            oid,
+            lang: self.adapter().storage_language_key_for_file(&file).into(),
+            variant,
+        };
+        let result = self
+            .analyzer_store()
+            .read_call_control_coverage(&blob, key.revision().content(), procedure.id())
+            .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
+        Ok(match result {
+            StoredFootprintCoverage::Admitted {
+                call_target_obligations,
+            } => FootprintAdmission::Admitted {
+                call_target_obligations,
+            },
+            StoredFootprintCoverage::Refused(reason) => FootprintAdmission::Refused(match reason {
+                StoredFootprintRefusal::CoverageUnavailable => {
+                    FootprintAdmissionRefusal::CoverageUnavailable
+                }
+                StoredFootprintRefusal::OldContract => FootprintAdmissionRefusal::OldContract,
+                StoredFootprintRefusal::UnknownCode => FootprintAdmissionRefusal::UnknownCode,
+                StoredFootprintRefusal::DuplicateClass => FootprintAdmissionRefusal::DuplicateClass,
+                StoredFootprintRefusal::MissingClass => FootprintAdmissionRefusal::MissingClass,
+                StoredFootprintRefusal::RefusedCoverage => {
+                    FootprintAdmissionRefusal::RefusedCoverage
+                }
+            }),
+        })
+    }
+}
 
 #[doc(hidden)]
 pub use primary_declarations::lower_with_primary_declarations;
@@ -196,37 +304,73 @@ pub(crate) fn materialize_with_lowerer_inner<A: LanguageAdapter>(
     // A blob whose complete semantic IR rows the store holds is served from
     // those rows: its source is neither read nor parsed.
     if let Some(oid) = analyzer.reusable_live_oid(file) {
-        let Some(publication) = complete_semantic_ir_publication(
+        let fields = SemanticIrMountFields {
+            mount: WorkspaceMountId::from_root(file.root()),
+            path: WorkspaceRelativePath::try_from_path(file.rel_path())
+                .expect("validated semantic path"),
+            language: LanguageDialect::for_path(analyzer.adapter().language(), file.rel_path()),
+        };
+        let (read, parts) = stored_semantic_ir_publication_read(
             analyzer,
             file,
-            oid,
-            analyzer.selected_parse_variant(file).ok_or_else(|| {
-                SemanticProviderError::internal(format!(
-                    "selected parse variant unreadable for {file:?}"
-                ))
-            })?,
-        )?
-        else {
-            note_serve(
-                &SERVE_COUNTS.rows_misses,
-                "rows_miss",
-                file.rel_path().display(),
-            );
-            return materialize_with_lowerer_after_miss(
-                analyzer,
-                cache,
-                lowerer,
-                file,
-                request,
-                started_work,
-            );
+            |store, blob| store.read_semantic_ir_with_observed_scope(blob, &fields),
+            None,
+            request.cancellation,
+        )?;
+        let (content, source_bytes, parts, built_from) = match read {
+            StoredSemanticIrRead::Observed(observation) => match &observation.head {
+                StoredSemanticIrPublicationHead::Present {
+                    content,
+                    source_bytes,
+                    ..
+                } => {
+                    record_stored_publication(analyzer, &observation, *content);
+                    let built_from = publication_built_from(&observation, *content);
+                    (
+                        ContentIdentity::from_digest(StableDigest::from_array(*content)),
+                        *source_bytes,
+                        parts.expect("complete publication has rows"),
+                        built_from,
+                    )
+                }
+                _ => {
+                    note_serve(
+                        &SERVE_COUNTS.rows_misses,
+                        "rows_miss",
+                        file.rel_path().display(),
+                    );
+                    return materialize_with_lowerer_after_miss(
+                        analyzer,
+                        cache,
+                        lowerer,
+                        file,
+                        request,
+                        started_work,
+                    );
+                }
+            },
+            StoredSemanticIrRead::Refused => {
+                analyzer.refuse_read_reuse();
+                note_serve(
+                    &SERVE_COUNTS.rows_misses,
+                    "rows_miss",
+                    file.rel_path().display(),
+                );
+                return materialize_with_lowerer_after_miss(
+                    analyzer,
+                    cache,
+                    lowerer,
+                    file,
+                    request,
+                    started_work,
+                );
+            }
         };
         note_serve(
             &SERVE_COUNTS.rows_hits,
             "rows_hit",
             file.rel_path().display(),
         );
-        let content = publication.content;
         analyzer.semantic_source_digests().record(
             BlobKey {
                 oid,
@@ -249,31 +393,39 @@ pub(crate) fn materialize_with_lowerer_inner<A: LanguageAdapter>(
             None,
             lowerer.identity(),
         )?;
-        let (acquisition, _cache_wait) = cache.acquire(&key, request.cancellation);
+        let (acquisition, _cache_wait) = cache.acquire(
+            &ProvenancedArtifactKey {
+                artifact: key.clone(),
+                built_from,
+            },
+            request.cancellation,
+        );
         let staged_budget = request.budget.clone();
         let outcome = match acquisition {
-            CompleteValueAcquisition::Cached { value: artifact } => publish_cached(
+            BudgetedValueAcquisition::Cached { value: artifact } => publish_cached(
                 cache,
-                artifact,
+                Arc::clone(artifact.arc()),
                 SemanticWork::default(),
                 staged_budget,
                 request,
             ),
-            CompleteValueAcquisition::Leader { permit } => publish_from_semantic_ir_rows(
+            BudgetedValueAcquisition::Leader { permit } => publish_from_semantic_ir_rows(
                 analyzer,
+                cache,
                 lowerer,
                 key,
-                &publication,
-                permit,
+                source_bytes,
+                parts,
+                Some(permit),
                 SemanticWork::default(),
                 staged_budget,
                 started_work,
                 request,
             ),
-            CompleteValueAcquisition::Rejected => {
+            BudgetedValueAcquisition::Rejected => {
                 unreachable!("semantic artifact cache never publishes rejected flights")
             }
-            CompleteValueAcquisition::Cancelled => Ok(SemanticOutcome::Cancelled {
+            BudgetedValueAcquisition::Cancelled => Ok(SemanticOutcome::Cancelled {
                 partial: None,
                 work: SemanticWork::default(),
             }),
@@ -384,79 +536,152 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
         content,
     );
     let key = semantic_artifact_key_for_prepared(file, &prepared, content, identity)?;
-    let (acquisition, cache_wait) = cache.acquire(&key, request.cancellation);
-    if cache_wait.wait_ns > 0 {
-        crate::profiling::note_with(|| {
-            format!(
-                "semantic.complete_cache_wait waits={} wait_ns={}",
-                cache_wait.waits, cache_wait.wait_ns
-            )
-        });
-    }
-    let permit = match acquisition {
-        CompleteValueAcquisition::Cached { value: artifact } => {
+    // The selected live OID can be reread under the same authority as other
+    // stored readers. A byte OID alone supplies no reusable selection.
+    let fields = SemanticIrMountFields {
+        mount: key.mount(),
+        path: key.path().clone(),
+        language: key.language(),
+    };
+    let (read, parts) = if analyzer.reusable_live_oid(file).is_some() {
+        stored_semantic_ir_publication_read(
+            analyzer,
+            file,
+            |store, blob| store.read_semantic_ir_with_observed_scope(blob, &fields),
+            None,
+            request.cancellation,
+        )?
+    } else {
+        analyzer.refuse_read_reuse();
+        // Content-addressed rows remain usable, but this read is unrecorded
+        // because a byte OID is not an authoritative live selection.
+        let blob = BlobKey {
+            oid: source_identity,
+            lang: analyzer
+                .adapter()
+                .storage_language_key_for_file(file)
+                .into(),
+            variant: prepared.parse_variant(),
+        };
+        let (head, parts) = if matches!(prepared.origin(), PreparedSourceOrigin::Disk) {
+            analyzer
+                .analyzer_store()
+                .read_semantic_ir_with_observed_scope(&blob, &fields)
+                .map_err(|error| SemanticProviderError::internal(error.to_string()))?
+        } else {
+            (SemanticIrHeadObservation::Missing, None)
+        };
+        let read = match head {
+            SemanticIrHeadObservation::Present {
+                active_epoch,
+                row_digest,
+                content: observed,
+                source_bytes,
+                ..
+            } => StoredSemanticIrRead::Observed(Box::new(StoredSemanticIrObservation {
+                selection: StoredSemanticIrSelection {
+                    rel_path: rel_path_string(file).into_boxed_str(),
+                    oid: source_identity,
+                    storage_language: blob.lang.into(),
+                    variant: prepared.parse_variant(),
+                },
+                head: StoredSemanticIrPublicationHead::Present {
+                    active_epoch: active_epoch.into_boxed_str(),
+                    row_digest: *row_digest.as_bytes(),
+                    content: *observed.as_bytes(),
+                    source_bytes,
+                },
+                source_content: None,
+                rows: None,
+            })),
+            _ => StoredSemanticIrRead::Refused,
+        };
+        (read, parts)
+    };
+    let built_from = read_built_from(&read, *content.as_bytes());
+    let permit = {
+        let (acquisition, cache_wait) = cache.acquire(
+            &ProvenancedArtifactKey {
+                artifact: key.clone(),
+                built_from,
+            },
+            request.cancellation,
+        );
+        if cache_wait.wait_ns > 0 {
+            crate::profiling::note_with(|| {
+                format!(
+                    "semantic.complete_cache_wait waits={} wait_ns={}",
+                    cache_wait.waits, cache_wait.wait_ns
+                )
+            });
+        }
+        match acquisition {
+            BudgetedValueAcquisition::Cached { value: artifact } => {
+                if let StoredSemanticIrRead::Observed(observation) = &read
+                    && analyzer.reusable_live_oid(file).is_some()
+                {
+                    record_stored_publication(analyzer, observation, *content.as_bytes());
+                }
+                drop(prepared);
+                let outcome = publish_cached(
+                    cache,
+                    Arc::clone(artifact.arc()),
+                    source_work,
+                    staged_budget,
+                    request,
+                );
+                request.budget.record_performed_work(source_work);
+                observe_complete_artifact(file, &outcome, request);
+                return outcome;
+            }
+            BudgetedValueAcquisition::Leader { permit: leader } => Some(leader),
+            BudgetedValueAcquisition::Rejected => {
+                unreachable!("semantic artifact cache never publishes rejected flights")
+            }
+            BudgetedValueAcquisition::Cancelled => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work: source_work,
+                });
+            }
+        }
+    };
+    if let StoredSemanticIrRead::Observed(observation) = read {
+        let answer = classify(&observation, *content.as_bytes());
+        if analyzer.reusable_live_oid(file).is_some() {
+            record_stored_publication(analyzer, &observation, *content.as_bytes());
+        }
+        if matches!(answer, StoredSemanticIrPublicationAnswer::Present { .. }) {
+            let StoredSemanticIrPublicationHead::Present { source_bytes, .. } = observation.head
+            else {
+                unreachable!()
+            };
+            note_serve(
+                &SERVE_COUNTS.rows_hits,
+                "rows_hit",
+                file.rel_path().display(),
+            );
             drop(prepared);
-            let outcome = publish_cached(cache, artifact, source_work, staged_budget, request);
-            request.budget.record_performed_work(source_work);
+            let mut staged_budget = staged_budget;
+            staged_budget.record_performed_work(source_work);
+            let outcome = publish_from_semantic_ir_rows(
+                analyzer,
+                cache,
+                lowerer,
+                key,
+                source_bytes,
+                parts.expect("complete publication has rows"),
+                permit,
+                source_work,
+                staged_budget,
+                started_work,
+                request,
+            );
             observe_complete_artifact(file, &outcome, request);
             return outcome;
         }
-        CompleteValueAcquisition::Leader { permit } => permit,
-        CompleteValueAcquisition::Rejected => {
-            unreachable!("semantic artifact cache never publishes rejected flights")
-        }
-        CompleteValueAcquisition::Cancelled => {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: None,
-                work: source_work,
-            });
-        }
-    };
-
-    if request.cancellation.is_cancelled() {
-        request.budget.record_performed_work(source_work);
-        return Ok(SemanticOutcome::Cancelled {
-            partial: None,
-            work: source_work,
-        });
-    }
-
-    // A file that had no reusable blob was parsed above. Its blob may still
-    // have complete rows, which serve the artifact without lowering.
-    if analyzer.reusable_live_oid(file).is_none()
-        && matches!(prepared.origin(), PreparedSourceOrigin::Disk)
-        && let Some(publication) = complete_semantic_ir_publication(
-            analyzer,
-            file,
-            source_identity,
-            prepared.parse_variant(),
-        )?
-    {
-        assert_eq!(
-            publication.content, content,
-            "semantic IR rows for blob {source_identity} must describe its parsed source"
-        );
-        note_serve(
-            &SERVE_COUNTS.rows_hits,
-            "rows_hit",
-            file.rel_path().display(),
-        );
-        drop(prepared);
-        let mut staged_budget = staged_budget;
-        staged_budget.record_performed_work(source_work);
-        let outcome = publish_from_semantic_ir_rows(
-            analyzer,
-            lowerer,
-            key,
-            &publication,
-            permit,
-            source_work,
-            staged_budget,
-            started_work,
-            request,
-        );
-        observe_complete_artifact(file, &outcome, request);
-        return outcome;
+    } else {
+        analyzer.refuse_read_reuse();
     }
 
     producer_budget
@@ -545,6 +770,7 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     let produced = {
         let mut producer_request = SemanticRequest::new(&mut producer_budget, request.cancellation);
         publish_lowered(
+            cache.retention_budget(),
             key,
             lowerer.capabilities(),
             lowered,
@@ -556,7 +782,9 @@ pub(crate) fn materialize_with_lowerer_after_miss<A: LanguageAdapter>(
     };
     let outcome = match produced {
         SemanticOutcome::Complete { value, work } => {
-            permit.publish_complete(Arc::clone(&value));
+            if let Some(permit) = permit {
+                cache.publish(permit, &value);
+            }
             let census = value.work();
             request
                 .budget
@@ -627,29 +855,274 @@ pub(crate) fn served_from_unchanged_source<A: LanguageAdapter>(
         None,
         lowerer.identity(),
     )?;
-    Ok(cache.get_ready(&key, request.cancellation))
+    let (read, _) = stored_semantic_ir_publication_read(
+        analyzer,
+        file,
+        |store, blob| {
+            store
+                .semantic_ir_head_observation(blob)
+                .map(|head| (head, None::<()>))
+        },
+        None,
+        request.cancellation,
+    )?;
+    if matches!(read, StoredSemanticIrRead::Refused) {
+        analyzer.refuse_read_reuse();
+    }
+    let built_from = read_built_from(&read, *content.as_bytes());
+    let hit = cache.get_ready(
+        &ProvenancedArtifactKey {
+            artifact: key,
+            built_from,
+        },
+        request.cancellation,
+    );
+    if hit.is_some()
+        && let StoredSemanticIrRead::Observed(observation) = &read
+    {
+        record_stored_publication(analyzer, observation, *content.as_bytes());
+    }
+    Ok(hit)
 }
 
 /// The blob's complete semantic IR rows under the active producer epoch. Any
 /// other publication outcome is not served: the caller lowers the file.
-pub(crate) fn complete_semantic_ir_publication<A: LanguageAdapter>(
+/// Bind selection, one SQLite observation, and the post-observation selection.
+pub fn stored_semantic_ir_publication_read<A: LanguageAdapter, T>(
     analyzer: &TreeSitterAnalyzer<A>,
     file: &ProjectFile,
-    oid: Oid,
-    variant: ParseVariant,
-) -> Result<Option<SemanticIrPublication>, SemanticProviderError> {
-    let storage_language = analyzer.adapter().storage_language_key_for_file(file);
-    let publication = analyzer
-        .analyzer_store()
-        .semantic_ir_publication(&BlobKey {
-            oid,
-            lang: storage_language.into(),
-            variant,
+    child_read: impl FnOnce(
+        &crate::analyzer::store::AnalyzerStore,
+        &BlobKey,
+    )
+        -> crate::analyzer::store::Result<(SemanticIrHeadObservation, Option<T>)>,
+    source_byte_cap: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<(StoredSemanticIrRead, Option<T>), SemanticProviderError> {
+    if validate_semantic_file(analyzer, file).is_err() {
+        return Ok((StoredSemanticIrRead::Refused, None));
+    }
+    let sample = || {
+        Some(StoredSemanticIrSelection {
+            rel_path: rel_path_string(file).into_boxed_str(),
+            oid: analyzer.reusable_live_oid(file)?,
+            storage_language: analyzer
+                .adapter()
+                .storage_language_key_for_file(file)
+                .into(),
+            variant: {
+                let selected = analyzer.selected_parse_variant(file)?;
+                #[cfg(any(test, feature = "test-support"))]
+                let selected =
+                    STORED_READ_VARIANT_OVERRIDE.with(|slot| slot.get().unwrap_or(selected));
+                selected
+            },
         })
+    };
+    if cancellation.is_cancelled() {
+        return Ok((StoredSemanticIrRead::Refused, None));
+    }
+    let Some(selection) = sample() else {
+        return Ok((StoredSemanticIrRead::Refused, None));
+    };
+    let key = BlobKey {
+        oid: selection.oid,
+        lang: selection.storage_language.as_ref().into(),
+        variant: selection.variant,
+    };
+    let store = analyzer.analyzer_store();
+    let (observation, child) = child_read(store, &key)
         .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
-    Ok(publication.filter(|publication| {
-        matches!(publication.outcome, SemanticIrPublicationOutcome::Complete)
-    }))
+    #[cfg(any(test, feature = "test-support"))]
+    STORED_READ_AFTER_OBSERVATION.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    if cancellation.is_cancelled() || sample().as_ref() != Some(&selection) {
+        return Ok((StoredSemanticIrRead::Refused, None));
+    }
+    let mut source_content = None;
+    let head = match observation {
+        SemanticIrHeadObservation::Missing => StoredSemanticIrPublicationHead::NoHead,
+        SemanticIrHeadObservation::StaleEpoch => StoredSemanticIrPublicationHead::StaleEpoch,
+        SemanticIrHeadObservation::NotComplete | SemanticIrHeadObservation::LegacyNoDigest => {
+            return Ok((StoredSemanticIrRead::Refused, None));
+        }
+        SemanticIrHeadObservation::Present {
+            active_epoch,
+            row_digest,
+            content,
+            source_bytes,
+            ..
+        } => StoredSemanticIrPublicationHead::Present {
+            active_epoch: active_epoch.into_boxed_str(),
+            row_digest: *row_digest.as_bytes(),
+            content: *content.as_bytes(),
+            source_bytes,
+        },
+    };
+    if matches!(
+        head,
+        StoredSemanticIrPublicationHead::NoHead | StoredSemanticIrPublicationHead::StaleEpoch
+    ) && let Some(cap) = source_byte_cap
+    {
+        if cancellation.is_cancelled() {
+            return Ok((StoredSemanticIrRead::Refused, None));
+        }
+        let Ok(Some((oid, snapshot))) = analyzer.source_snapshot_limited(file, cap) else {
+            return Ok((StoredSemanticIrRead::Refused, None));
+        };
+        if oid != selection.oid
+            || cancellation.is_cancelled()
+            || sample().as_ref() != Some(&selection)
+        {
+            return Ok((StoredSemanticIrRead::Refused, None));
+        }
+        source_content = Some(
+            *ContentIdentity::from_source_bytes(
+                snapshot.into_source().as_bytes(),
+                analyzer.adapter().language(),
+                selection.variant,
+            )
+            .as_bytes(),
+        );
+    }
+    Ok((
+        StoredSemanticIrRead::Observed(Box::new(StoredSemanticIrObservation {
+            selection,
+            head,
+            source_content,
+            rows: None,
+        })),
+        child,
+    ))
+}
+
+fn publication_built_from(
+    observation: &StoredSemanticIrObservation,
+    subject: [u8; 32],
+) -> StableDigest {
+    StoredSemanticIrPublicationQuestion::new(
+        observation.selection.rel_path.clone(),
+        observation.selection.storage_language.clone(),
+        subject,
+        observation.selection.variant,
+    )
+    .built_from_digest(&classify(observation, subject))
+}
+
+fn read_built_from(read: &StoredSemanticIrRead, subject: [u8; 32]) -> StableDigest {
+    match read {
+        StoredSemanticIrRead::Observed(observation) => publication_built_from(observation, subject),
+        StoredSemanticIrRead::Refused => *REFUSED_PROVENANCE,
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9784: review found a row-built artifact sharing REFUSED cache provenance"
+    )]
+    fn observed_rows_use_publication_provenance_without_live_authority() {
+        let observation = |row_digest| {
+            StoredSemanticIrRead::Observed(Box::new(StoredSemanticIrObservation {
+                selection: StoredSemanticIrSelection {
+                    rel_path: "Sample.java".into(),
+                    oid: git2::Oid::zero(),
+                    storage_language: "java".into(),
+                    variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                },
+                head: StoredSemanticIrPublicationHead::Present {
+                    active_epoch: "test".into(),
+                    row_digest,
+                    content: [1; 32],
+                    source_bytes: 10,
+                },
+                source_content: None,
+                rows: None,
+            }))
+        };
+        let first = read_built_from(&observation([2; 32]), [1; 32]);
+        let second = read_built_from(&observation([3; 32]), [1; 32]);
+        assert_ne!(first, second);
+        assert_ne!(first, *REFUSED_PROVENANCE);
+        assert_ne!(second, *REFUSED_PROVENANCE);
+        assert_eq!(
+            read_built_from(&StoredSemanticIrRead::Refused, [1; 32]),
+            *REFUSED_PROVENANCE
+        );
+    }
+}
+
+fn record_stored_publication<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    observation: &StoredSemanticIrObservation,
+    subject: [u8; 32],
+) {
+    let question = StoredSemanticIrPublicationQuestion::new(
+        observation.selection.rel_path.clone(),
+        observation.selection.storage_language.clone(),
+        subject,
+        observation.selection.variant,
+    );
+    analyzer.record_read(ReadKey::lookup(
+        LookupKind::StoredSemanticIrPublication,
+        LookupQuestion::StoredSemanticIrPublication(question),
+        classify(observation, subject).canonical_digest(),
+    ));
+}
+
+fn admitted_stored_child<A: LanguageAdapter, T>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+    subject: [u8; 32],
+    child_read: impl FnOnce(
+        &crate::analyzer::store::AnalyzerStore,
+        &BlobKey,
+    )
+        -> crate::analyzer::store::Result<(SemanticIrHeadObservation, Option<T>)>,
+) -> Result<Option<T>, SemanticProviderError> {
+    let (read, child) = stored_semantic_ir_publication_read(
+        analyzer,
+        file,
+        child_read,
+        None,
+        &CancellationToken::default(),
+    )?;
+    let StoredSemanticIrRead::Observed(observation) = read else {
+        analyzer.refuse_read_reuse();
+        return Ok(None);
+    };
+    let present = matches!(
+        classify(&observation, subject),
+        StoredSemanticIrPublicationAnswer::Present { .. }
+    );
+    record_stored_publication(analyzer, &observation, subject);
+    if present { Ok(child) } else { Ok(None) }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static STORED_READ_AFTER_OBSERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static STORED_READ_VARIANT_OVERRIDE: std::cell::Cell<Option<brokk_bifrost_core::gitblob::ParseVariant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn on_stored_read_after_observation(hook: impl FnOnce() + 'static) {
+    STORED_READ_AFTER_OBSERVATION.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn override_stored_read_variant(variant: Option<brokk_bifrost_core::gitblob::ParseVariant>) {
+    STORED_READ_VARIANT_OVERRIDE.with(|slot| slot.set(variant));
 }
 
 /// One procedure's stored partial flows, when the file's complete publication
@@ -662,35 +1135,40 @@ pub(crate) fn stored_partial_flows<A: LanguageAdapter>(
     key: &SemanticArtifactKey,
     procedure: ProcedureId,
 ) -> Result<Option<ProcedurePartialFlows>, SemanticProviderError> {
-    let Some(oid) = analyzer.reusable_live_oid(file) else {
-        return Ok(None);
-    };
-    let Some(publication) = complete_semantic_ir_publication(
-        analyzer,
-        file,
-        oid,
-        analyzer.selected_parse_variant(file).ok_or_else(|| {
-            SemanticProviderError::internal(format!(
-                "selected parse variant unreadable for {file:?}"
-            ))
-        })?,
-    )?
-    else {
-        return Ok(None);
-    };
-    if publication.content != key.revision().content() {
-        return Ok(None);
-    }
     let scope = SemanticIrMountScope {
         mount: key.mount(),
         path: key.path().clone(),
         language: key.language(),
         content: key.revision().content(),
     };
-    analyzer
-        .analyzer_store()
-        .read_partial_flows(publication.blob_id, procedure, &scope)
-        .map_err(|error| SemanticProviderError::internal(error.to_string()))
+    admitted_stored_child(
+        analyzer,
+        file,
+        *key.revision().content().as_bytes(),
+        |store, blob| store.read_partial_flows_with_observation(blob, &scope, procedure),
+    )
+}
+
+/// Decode the selected procedure without reconstructing every procedure of
+/// the blob. Publication and content checks match the whole-blob reader.
+pub(crate) fn stored_semantic_ir_procedure<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+    key: &SemanticArtifactKey,
+    procedure: ProcedureId,
+) -> Result<Option<ProcedureSemanticsParts>, SemanticProviderError> {
+    let scope = SemanticIrMountScope {
+        mount: key.mount(),
+        path: key.path().clone(),
+        language: key.language(),
+        content: key.revision().content(),
+    };
+    admitted_stored_child(
+        analyzer,
+        file,
+        *key.revision().content().as_bytes(),
+        |store, blob| store.read_semantic_ir_procedure_with_observation(blob, &scope, procedure),
+    )
 }
 
 /// Whether the file's complete semantic IR publication carries the content of
@@ -700,54 +1178,46 @@ pub(crate) fn has_complete_semantic_ir_rows<A: LanguageAdapter>(
     file: &ProjectFile,
     key: &SemanticArtifactKey,
 ) -> Result<bool, SemanticProviderError> {
-    let Some(oid) = analyzer.reusable_live_oid(file) else {
-        return Ok(false);
-    };
-    let Some(publication) = complete_semantic_ir_publication(
+    Ok(admitted_stored_child(
         analyzer,
         file,
-        oid,
-        analyzer.selected_parse_variant(file).ok_or_else(|| {
-            SemanticProviderError::internal(format!(
-                "selected parse variant unreadable for {file:?}"
-            ))
-        })?,
+        *key.revision().content().as_bytes(),
+        |store, blob| {
+            store
+                .semantic_ir_head_observation(blob)
+                .map(|head| (head, Some(())))
+        },
     )?
-    else {
-        return Ok(false);
-    };
-    Ok(publication.content == key.revision().content())
+    .is_some())
 }
 
 /// Decodes one blob's rows and publishes them as the artifact that lowering
 /// the same source produces. The caller holds the flight `permit` for `key`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn publish_from_semantic_ir_rows<A: LanguageAdapter>(
-    analyzer: &TreeSitterAnalyzer<A>,
+pub(crate) fn publish_from_semantic_ir_rows(
+    analyzer: &TreeSitterAnalyzer<impl LanguageAdapter>,
+    cache: &CompleteSemanticArtifactCache,
     lowerer: &dyn ProgramSemanticsLowerer,
     key: SemanticArtifactKey,
-    publication: &SemanticIrPublication,
-    permit: CompleteValuePermit<SemanticArtifactKey, SemanticArtifact>,
+    source_bytes: usize,
+    parts: Vec<ProcedureSemanticsParts>,
+    permit: Option<
+        BudgetedValuePermit<
+            ProvenancedArtifactKey,
+            brokk_bifrost_store::analyzer::semantic::service::CachedSemanticArtifact,
+        >,
+    >,
     source_work: SemanticWork,
     staged_budget: crate::analyzer::semantic::SemanticBudget,
     started_work: SemanticWork,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-    let scope = SemanticIrMountScope {
-        mount: key.mount(),
-        path: key.path().clone(),
-        language: key.language(),
-        content: key.revision().content(),
-    };
-    let parts = analyzer
-        .analyzer_store()
-        .read_semantic_ir(publication.blob_id, &scope)
-        .map_err(|error| SemanticProviderError::internal(error.to_string()))?;
     let work = SemanticWork {
-        source_bytes: publication.source_bytes,
+        source_bytes,
         ..SemanticWork::default()
     };
     let outcome = publish_lowered(
+        analyzer.analyzer_store().retention_budget(),
         key,
         lowerer.capabilities(),
         SemanticOutcome::Complete { value: parts, work },
@@ -756,8 +1226,10 @@ pub(crate) fn publish_from_semantic_ir_rows<A: LanguageAdapter>(
         staged_budget,
         request,
     );
-    if let Ok(SemanticOutcome::Complete { value, .. }) = &outcome {
-        permit.publish_complete(Arc::clone(value));
+    if let Ok(SemanticOutcome::Complete { value, .. }) = &outcome
+        && let Some(permit) = permit
+    {
+        cache.publish(permit, value);
     }
     outcome
 }

@@ -292,6 +292,10 @@ fn project_rust_graph_in_operation(
     cancellation: &CancellationToken,
     progress: &mut dyn FnMut(),
 ) -> Result<RustNativeWorkspaceGraphOutcome> {
+    // Route questions asked by the projection borrow this operation's
+    // selection. The frame is a local, so it drops before the operation, which
+    // checks that no frame outlives it.
+    let _frame = rust.operation_read_frame(&operation)?;
     let mut admitted_callers = HashSet::default();
     for file in root_files {
         if cancellation.is_cancelled() {

@@ -12,6 +12,10 @@ use crate::analyzer::usages::get_definition::{
     resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::usages::python_class_hierarchy::PythonHierarchyOutcome;
+use brokk_bifrost_analysis::analyzer::structural::branch_relations::ReferenceProofs;
+use brokk_bifrost_analysis::analyzer::structural::identity::{
+    ComparisonContext, IdentityVerdict, StandardIdentityBudget, compare_trees,
+};
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::resolution::BindingKind;
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -30,15 +34,6 @@ const REQUIRED_PYTHON_OCCURRENCE_ROLES: [OccurrenceRole; 4] = [
     OccurrenceRole::NonlocalDirective,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OperandIdentity {
-    Binding(String),
-    AttributePath {
-        binding: String,
-        members: Vec<String>,
-    },
-}
-
 enum BindingLookup {
     Bound(BindingValue),
     NoBinding,
@@ -46,15 +41,8 @@ enum BindingLookup {
 }
 
 enum OperandShape {
-    Name {
-        node: u32,
-        spelling: String,
-    },
-    AttributePath {
-        root: u32,
-        root_spelling: String,
-        members: Vec<String>,
-    },
+    Name { node: u32, spelling: String },
+    AttributePath { root: u32, root_spelling: String },
 }
 
 enum SelfAttributeWitness {
@@ -991,6 +979,7 @@ pub(super) fn identical_operands_expansions(
     let Some((left, right)) = comparison_operands(seed, diagnostics) else {
         return Vec::new();
     };
+    let (left_operand, right_operand) = (left, right);
     let Some(left) = operand_shape(seed, left) else {
         return Vec::new();
     };
@@ -999,10 +988,56 @@ pub(super) fn identical_operands_expansions(
     };
     let (left_root, left_spelling) = operand_root(&left);
     let (right_root, right_spelling) = operand_root(&right);
-    if left_spelling != right_spelling || !same_path_shape(&left, &right) {
+    // The public relation admits only bare names and static attribute paths.
+    // Different root tokens are outside it even when a shared comparison
+    // cannot resolve one of their bindings.
+    if left_spelling != right_spelling {
         return Vec::new();
     }
 
+    let Some(env) = complete_binding_environment(analyzer, environment_cache, seed, diagnostics)
+    else {
+        return Vec::new();
+    };
+    let Some(syntax) = parse_comparison_source(analyzer, environment_cache, seed, diagnostics)
+    else {
+        return Vec::new();
+    };
+    let root = syntax.root_node();
+    let left_range = seed.facts.node(left_operand).range;
+    let right_range = seed.facts.node(right_operand).range;
+    let (Some(left_node), Some(right_node)) = (
+        exact_ast_node(root, left_range.start_byte, left_range.end_byte),
+        exact_ast_node(root, right_range.start_byte, right_range.end_byte),
+    ) else {
+        resolution_incomplete(
+            diagnostics,
+            brokk_bifrost_rql::Incompleteness::Content,
+            seed,
+            "the operand AST range is unavailable",
+        );
+        return Vec::new();
+    };
+    // Python supplies no branch reference-site or current-object-field hooks.
+    // The range proof collector therefore produces no sites for these operands.
+    let proofs = ReferenceProofs::default();
+    let mut work = StandardIdentityBudget::standard();
+    let verdict = compare_trees(
+        left_node,
+        right_node,
+        &ComparisonContext {
+            language: seed.language,
+            owner_region: seed.facts.node(seed.fact_match.node).range,
+            source: seed.facts.source(),
+            env: &env,
+            members: &proofs,
+            enclosing_binders: &[],
+        },
+        &mut work,
+    );
+    if verdict == IdentityVerdict::Distinct {
+        return Vec::new();
+    }
     let Some(occurrences) = identity_occurrences(
         analyzer,
         occurrence_cache,
@@ -1013,9 +1048,6 @@ pub(super) fn identical_operands_expansions(
     ) else {
         return Vec::new();
     };
-    if complete_binding_environment(analyzer, environment_cache, seed, diagnostics).is_none() {
-        return Vec::new();
-    }
     let left_binding = binding_for_identifier(
         analyzer,
         environment_cache,
@@ -1034,30 +1066,22 @@ pub(super) fn identical_operands_expansions(
         true,
         diagnostics,
     );
-    let (BindingLookup::Bound(left_binding), BindingLookup::Bound(right_binding)) =
-        (left_binding, right_binding)
-    else {
+    let (BindingLookup::Bound(_), BindingLookup::Bound(_)) = (left_binding, right_binding) else {
         return Vec::new();
     };
-    let identity = match left {
-        OperandShape::Name { .. } => OperandIdentity::Binding(left_binding.id()),
-        OperandShape::AttributePath { members, .. } => OperandIdentity::AttributePath {
-            binding: left_binding.id(),
-            members,
-        },
-    };
-    let other_identity = match right {
-        OperandShape::Name { .. } => OperandIdentity::Binding(right_binding.id()),
-        OperandShape::AttributePath { members, .. } => OperandIdentity::AttributePath {
-            binding: right_binding.id(),
-            members,
-        },
-    };
-    if identity == other_identity {
+    if verdict == IdentityVerdict::Identical {
         vec![pipeline_expansion(PipelineValue::StructuralMatch(
             Arc::clone(seed),
         ))]
     } else {
+        if let IdentityVerdict::Open(reason) = verdict {
+            resolution_incomplete(
+                diagnostics,
+                brokk_bifrost_rql::Incompleteness::Content,
+                seed,
+                &format!("operand structural identity is unresolved: {reason:?}"),
+            );
+        }
         Vec::new()
     }
 }
@@ -1246,30 +1270,25 @@ fn comparison_operands(
 }
 
 fn operand_shape(seed: &SeedMatch, mut node: u32) -> Option<OperandShape> {
-    let mut members = Vec::new();
+    let mut has_member = false;
     loop {
         let fact = seed.facts.node(node);
         match fact.kind {
             NormalizedKind::Identifier => {
                 let spelling = fact_text(&seed.facts, fact.range.start_byte, fact.range.end_byte)?;
-                return Some(if members.is_empty() {
+                return Some(if !has_member {
                     OperandShape::Name { node, spelling }
                 } else {
-                    members.reverse();
                     OperandShape::AttributePath {
                         root: node,
                         root_spelling: spelling,
-                        members,
                     }
                 });
             }
             NormalizedKind::FieldAccess => {
                 let field = role_target(&seed.facts, node, Role::Field)?;
-                members.push(fact_text(
-                    &seed.facts,
-                    field.span.start_byte,
-                    field.span.end_byte,
-                )?);
+                fact_text(&seed.facts, field.span.start_byte, field.span.end_byte)?;
+                has_member = true;
                 node = role_target_node(&seed.facts, node, Role::Object)?;
             }
             _ => return None,
@@ -1285,17 +1304,6 @@ fn operand_root(shape: &OperandShape) -> (u32, &str) {
             root_spelling,
             ..
         } => (*root, root_spelling),
-    }
-}
-
-fn same_path_shape(left: &OperandShape, right: &OperandShape) -> bool {
-    match (left, right) {
-        (OperandShape::Name { .. }, OperandShape::Name { .. }) => true,
-        (
-            OperandShape::AttributePath { members: left, .. },
-            OperandShape::AttributePath { members: right, .. },
-        ) => left == right,
-        _ => false,
     }
 }
 

@@ -11,16 +11,20 @@ readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 publish = true
+# `tests/` holds fixtures that in-crate tests read through `include_bytes!`;
+# the release package check rejects any `tests/` path in a crate archive.
+exclude = ["tests/**"]
 
 [lib]
 name = "brokk_bifrost_flow"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.1" }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.1" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.2" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.2" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-sha2 = "0.10.8"
+semver = "1.0.28"
+sha2 = "0.11"
 tempfile = "3.23.0"
 tree-sitter = "0.25.10"
 workspace-hack.workspace = true
@@ -37,11 +41,11 @@ test-support = [
 ]
 
 [dev-dependencies]
-brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.2", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
 proptest = "1.11"
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.1", features = ["test-support"] }
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.2", features = ["test-support"] }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.2", features = ["test-support"] }
 
 [lints]
 workspace = true

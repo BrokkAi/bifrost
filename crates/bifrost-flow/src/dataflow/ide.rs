@@ -299,6 +299,7 @@ impl<'input, Fact, Value> IdeSummarySolveInput<'input, Fact, Value> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TransferKey<Fact> {
+    pub(crate) caller_conversion_may_run_user_code: bool,
     pub(crate) edge: ProcedureIcfgEdge,
     pub(crate) call_transfer: Option<CallTransfer>,
     pub(crate) caller_context: Option<crate::analyzer::semantic::OracleCallContext>,
@@ -666,6 +667,7 @@ where
                     _ => None,
                 };
                 let key = TransferKey {
+                    caller_conversion_may_run_user_code: edge.caller_conversion_may_run_user_code(),
                     edge: owned_edge(edge),
                     call_transfer: edge.call_transfer().cloned(),
                     caller_context,
@@ -1389,6 +1391,7 @@ where
                     exit_kind: row.exit_kind,
                     exit_fact: row.exit_fact,
                     qualities: row.qualities.clone(),
+                    evidence: None,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -1399,6 +1402,7 @@ where
                     point: row.point.clone(),
                     fact: row.fact,
                     qualities: row.qualities.clone(),
+                    evidence: None,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -2355,6 +2359,9 @@ where
                                 continue;
                             };
                             let return_key = TransferKey {
+                                caller_conversion_may_run_user_code: record
+                                    .key
+                                    .caller_conversion_may_run_user_code,
                                 edge: return_edge,
                                 call_transfer: None,
                                 caller_context: record.key.caller_context.clone(),

@@ -64,7 +64,8 @@ pub(crate) const ROW_ENUM_LITERAL: RowLiteralForm = RowLiteralForm {
 /// The single RQL schema version. The pre-1.0 lineage (versions 2 through 13,
 /// every step auto-compatible with the next) carried no information, so it
 /// was collapsed to this one version. Mint a new version only when an
-/// existing query stops parsing or changes meaning.
+/// existing query stops parsing or changes meaning. An evaluator correction that
+/// withholds a row it cannot decide and reports incompleteness is not a meaning change.
 const RQL_SCHEMA_VERSION: u32 = 1;
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] =
     &[SchemaVersionDescriptor::new(RQL_SCHEMA_VERSION, None, true)];
@@ -374,6 +375,9 @@ impl ReceiverTypeConstraintForm {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
+    InstantiatedType,
+    InstantiatedTypeList,
+    CallIdentityList,
     Query,
     QueryList,
     QuerySteps,
@@ -397,6 +401,7 @@ pub enum ValueShape {
     PermissionBitMask,
     NonNegativeInteger,
     Arity,
+    Count,
     ResultDetail,
     ExecutionMode,
     SchemaVersion,
@@ -428,6 +433,7 @@ pub enum ValueShape {
     ExportFormList,
     ExportNameList,
     DeclarationOriginList,
+    MemberFormList,
     ConfigurationFormatList,
     ConfigurationNodeKindList,
     ConfigurationRoleList,
@@ -836,7 +842,8 @@ query_step_ops! {
     Filter { shape: RowLocal, label: "filter", signature: "row -> row", description: "Retain rows satisfying every typed predicate over the input row's public field schema." }
     Project { shape: RowLocal, label: "project", signature: "row -> projected_row", description: "Publish selected public row fields, optionally under new field names, while preserving the row's source and evidence anchor." }
     CaptureAnchor { shape: RowLocal, label: "anchor", signature: "structural_match -> structural_match", description: "For each distinct node bound to the named positive pattern capture, retain the structural match with that node's source range as its reported anchor." }
-    ConfigurationAbsence { shape: RowLocal, label: "configuration_absence", signature: "configuration_fact -> configuration_fact", description: "Apply a document-scoped anti-join to configuration facts. The inner configuration-facts query must select document roots; the result is retained only when no authored fact in that same document matches the filter. Incomplete ingestion is never treated as absence." }
+    IdenticalCaptures { shape: RowLocal, label: "identical_captures", signature: "structural_match -> structural_match", description: "Keep a row if any left/right capture-node pair is structurally identical; drop it only if all pairs are distinct, otherwise withhold it. Leaves, including literals, compare by source token: 0x10 and 16 are distinct spellings, not a claim of different runtime values." }
+    ConfigurationAbsence { shape: RowLocal, label: "configuration_absence", signature: "configuration_fact -> configuration_fact", description: "Retain any configuration fact when no authored fact in the selected document or subtree matches the filter. Incomplete ingestion is never treated as absence." }
     StatementFacts { shape: RowLocal, label: "statement_facts", signature: "structural_match -> structural_match", description: "Retain structural matches for one registered CodeQL statement fact. Shared shapes are supplied by C++ and Java; goto and alloca require C++. Nested-loop binding proofs are shared by C++, C# and Java." }
     CppFacts { shape: RowLocal, label: "cpp_facts", signature: "structural_match -> structural_match", description: "Retain C++ structural matches that satisfy one registered CodeQL class-rule fact." }
     EnclosingDecl { shape: RowLocal, label: "enclosing_decl", signature: "structural_match|dispatch_target -> declaration", description: "Map source-backed matches and dispatch targets to their smallest real enclosing declarations." }
@@ -883,7 +890,7 @@ query_step_ops! {
     Callers { shape: DerivedValue, label: "callers", signature: "declaration -> declaration", description: "Traverse resolved incoming call edges to caller declarations, optionally to a bounded depth." }
     Callees { shape: RowLocal, label: "callees", signature: "declaration -> declaration | procedure -> procedure", description: "Traverse resolved outgoing call edges from declarations. For an exact procedure row, also follow callback arguments only when the resolved callee body invokes the corresponding formal and points-to identity matches a source-backed callable creation." }
     CallSitesTo { shape: DerivedValue, label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration, with semantic identity when available." }
-    CallSitesFrom { shape: RowLocal, label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration, with semantic identity when available." }
+    CallSitesFrom { shape: RowLocal, label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration, with semantic identity when available." , semantic: [Dispatch] }
     CallInput { shape: RowLocal, label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
     JsxAttributeValue { shape: RowLocal, label: "jsx_attribute_value", signature: "structural_match -> jsx_attribute_value", description: "Project the exact normalized expression operand of JSX attributes, with intrinsic/component/unknown element identity and explicit incompleteness for unresolved semantic cases." }
     ReceiverTargets { shape: DerivedValue, label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
@@ -1142,7 +1149,9 @@ macro_rules! rql_forms {
             /// equality between two registry labels.
             pub fn property(self) -> Option<RqlProperty> {
                 match self {
-                    Self::Where
+                    Self::InstantiatedType
+                    | Self::Qualified
+                    | Self::Where
                     | Self::Language
                     | Self::Limit
                     | Self::ResultDetail
@@ -1157,6 +1166,7 @@ macro_rules! rql_forms {
                     | Self::Filter
                     | Self::Project
                     | Self::Anchor
+                    | Self::IdenticalCaptures
                     | Self::CppFacts
                     | Self::EnclosingDecl
                     | Self::ProcedureOf
@@ -1374,9 +1384,12 @@ macro_rules! rql_forms {
                     Self::LocalValue => Some(RqlProperty::LocalValue),
                     Self::Capture => Some(RqlProperty::Capture),
                     Self::Has => Some(RqlProperty::Has),
+                    Self::Each => Some(RqlProperty::Each),
+                    Self::ArgumentMode => Some(RqlProperty::ArgumentMode),
                     Self::NotHas => Some(RqlProperty::NotHas),
                     Self::NotKind => Some(RqlProperty::NotKind),
                     Self::Arity => Some(RqlProperty::Arity),
+                    Self::Count => Some(RqlProperty::Count),
                     Self::Visibility => Some(RqlProperty::Visibility),
                     Self::ParameterType => Some(RqlProperty::ParameterType),
                     Self::ParameterTypeRegex => Some(RqlProperty::ParameterTypeRegex),
@@ -1505,6 +1518,14 @@ rql_forms! {
         signature: "(anchor :capture \"name\" query)",
         description: (QueryStepOp::CaptureAnchor),
         step: CaptureAnchor,
+    }
+    IdenticalCaptures {
+        labels: ["identical-captures", "identical_captures"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(identical-captures :left \"left\" :right \"right\" query)",
+        description: (QueryStepOp::IdenticalCaptures),
+        step: IdenticalCaptures,
     }
     StatementFacts {
         labels: ["statement-facts", "statement_facts"],
@@ -2655,15 +2676,15 @@ rql_forms! {
         labels: ["configuration-facts", "configuration_facts"],
         class: Wrapper,
         shape: ConfigurationFactsFilter,
-        signature: "(configuration-facts [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:value ...] [:value-ignore-case ...] [:value-lt ...] [:value-le ...] [:value-gt ...] [:value-ge ...] [:xml-parent-key ...] [:xml-preceding-sibling-key ...] [:xml-sibling-attribute-key ...] [:xml-sibling-attribute-value ...] [:xml-sibling-attribute-value-ignore-case ...] [:xml-reference-source-key ...] [:xml-reference-target-key ...] [:xml-reference-target-element-key ...] [:xml-reference-target-child-key ...] [:xml-peer-element-key ...] [:xml-peer-attribute-key ...] [:xml-peer-child-key ...] [:xml-peer-min-shared-children N] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...])",
+        signature: "(configuration-facts [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:value ...] [:value-ignore-case ...] [:value/regex ...] [:value-lt ...] [:value-le ...] [:value-gt ...] [:value-ge ...] [:xml-parent-key ...] [:xml-preceding-sibling-key ...] [:xml-sibling-attribute-key ...] [:xml-sibling-attribute-value ...] [:xml-sibling-attribute-value-ignore-case ...] [:xml-reference-source-key ...] [:xml-reference-target-key ...] [:xml-reference-target-element-key ...] [:xml-reference-target-child-key ...] [:xml-peer-element-key ...] [:xml-peer-attribute-key ...] [:xml-peer-child-key ...] [:xml-peer-min-shared-children N] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...])",
         description: "Seed authored configuration-document facts with exact key/value, numeric value, XML structure, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers.",
     }
     ConfigurationAbsence {
         labels: ["configuration-absence", "configuration_absence"],
         class: Wrapper,
         shape: Query,
-        signature: "(configuration-absence [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:value ...] [:value-ignore-case ...] [:value-lt ...] [:value-le ...] [:value-gt ...] [:value-ge ...] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...] query)",
-        description: "Apply a document-scoped anti-join to configuration facts. The inner configuration-facts query must select document roots; the result is retained only when no authored fact in that same document matches the filter. Incomplete ingestion is never treated as absence.",
+        signature: "(configuration-absence [:scope document|subtree] [:format ...] [:node-kind ...] [:role ...] [:scalar-kind ...] [:key ...] [:value ...] [:value-ignore-case ...] [:value/regex ...] [:value-lt ...] [:value-le ...] [:value-gt ...] [:value-ge ...] [:xml-parent-key ...] [:route ...] [:fact-ordinal ...] [:provenance ...] [:completeness ...] query)",
+        description: "Retain any configuration fact when no authored fact in the selected document or subtree matches the filter. Incomplete ingestion is never treated as absence.",
         step: ConfigurationAbsence,
     }
     Correlate {
@@ -3018,14 +3039,14 @@ rql_forms! {
         labels: ["type-kind", "type_kind"],
         class: Predicate,
         shape: String,
-        signature: "(type-kind class|interface|enum|record|annotation)",
+        signature: "(type-kind class|struct|interface|enum|record|annotation)",
         description: "Match the persisted source form of a type declaration.",
     }
     Modifier {
         labels: ["modifier"],
         class: Predicate,
         shape: String,
-        signature: "(modifier static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private)",
+        signature: "(modifier static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private|readonly|const|extern|ref|async|file|fixed|internal|new|override|partial|required|unsafe|virtual|in|out|params|this|scoped|global)",
         description: "Match a declaration by a modifier read from its structured modifier nodes.",
     }
     DuplicateKey {
@@ -3154,6 +3175,20 @@ rql_forms! {
         signature: "(or pattern ...)",
         description: "Require at least one nested pattern to match the same node.",
     }
+    InstantiatedType {
+        labels: ["instantiated-type", "instantiated_type"],
+        class: Predicate,
+        shape: InstantiatedType,
+        signature: "(instantiated-type :identity identity :arguments [instantiated-type ...])",
+        description: "Constrain a canonical nominal type and listed declared type-parameter slots. Unlisted trailing slots are unconstrained.",
+    }
+    Qualified {
+        labels: ["qualified"],
+        class: Predicate,
+        shape: String,
+        signature: "(qualified \"locator\")",
+        description: "Resolve a qualified locator to canonical identities at the loaded-policy boundary; never compare display names at execution.",
+    }
     LocalValue {
         labels: ["local-value", "local_value"],
         class: Predicate,
@@ -3175,6 +3210,20 @@ rql_forms! {
         signature: "(has descendant-pattern)",
         description: "Require a matching descendant somewhere below this pattern.",
     }
+    ArgumentMode {
+        labels: ["argument-mode", "argument_mode"],
+        class: Predicate,
+        shape: StringList,
+        signature: "(argument-mode ref out in spread plain)",
+        description: "Match an argument value by its adapter-recorded passing mode.",
+    }
+    Each {
+        labels: ["each"],
+        class: Predicate,
+        shape: Pattern,
+        signature: "(each pattern)",
+        description: "Require a match at this node or any descendant and capture every matching node.",
+    }
     NotHas {
         labels: ["not-has", "not_has"],
         class: Predicate,
@@ -3195,6 +3244,13 @@ rql_forms! {
         shape: Arity,
         signature: "(arity count | :min count :max count)",
         description: "Match a call by its positional argument count, or a collection literal by its element count: an exact count, or inclusive :min/:max bounds.",
+    }
+    Count {
+        labels: ["count"],
+        class: Predicate,
+        shape: Count,
+        signature: "(count :role pattern :min N :max M)",
+        description: "Count matching direct children in a list role with inclusive bounds.",
     }
     Visibility {
         labels: ["visibility"],
@@ -3222,7 +3278,7 @@ rql_forms! {
         class: Predicate,
         shape: String,
         signature: "(language-rule \"cpp/rule\"|\"cs/rule\"|\"java/rule\"|\"js/rule\")",
-        description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language.",
+        description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language. C# missing-xmldoc-parameter finds source method and constructor parameters without a nonempty matching XML param tag; unknown-xmldoc-parameter reports a declaration once even when its documentation names several unknown parameters; CodeQL reports one row per tag, all on the same declaration. C# missing-xmldoc-type-parameter checks only generic types and methods, as in CodeQL, and finds their type parameters without a nonempty matching XML typeparam tag; unknown-xmldoc-type-parameter checks only generic types and methods, as in CodeQL, and reports a declaration once even when its documentation names several unknown parameters; CodeQL reports one row per tag, all on the same declaration. Param and typeparam opening tags are collected on any documentation line, including inside another element such as example, for CodeQL line-model parity. Any inheritdoc element in the declaration documentation, including one nested in another tag, suppresses both missing-tag rules for CodeQL parity; the C# compiler uses a narrower scope. Findings from /** */ documentation comments are a Bifrost extension that CodeQL does not model.",
     }
     BodyState {
         labels: ["body-state", "body_state"],
@@ -3357,13 +3413,13 @@ rql_properties! {
     TypeKind {
         labels: ["type-kind", "type_kind"],
         shape: String,
-        signature: ":type-kind class|interface|enum|record|annotation",
+        signature: ":type-kind class|struct|interface|enum|record|annotation",
         description: "Match the persisted source form of a type declaration.",
     }
     Modifier {
         labels: ["modifier"],
         shape: String,
-        signature: ":modifier static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private",
+        signature: ":modifier static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private|readonly|const|extern|ref|async|file|fixed|internal|new|override|partial|required|unsafe|virtual|in|out|params|this|scoped|global",
         description: "Match a declaration by a modifier read from its structured modifier nodes.",
     }
     DuplicateKey {
@@ -3474,6 +3530,24 @@ rql_properties! {
         signature: ":or [pattern ...]",
         description: "Require at least one nested pattern to match the same node.",
     }
+    QualifyingType {
+        labels: ["qualifying-type", "qualifying_type"],
+        shape: InstantiatedType,
+        signature: ":qualifying-type (instantiated-type :identity identity :arguments [...])",
+        description: "Constrain the canonical alias-expanded static type qualifying an associated call. Unsupported receiver forms are partial.",
+    }
+    InstantiatedIdentity {
+        labels: ["identity"],
+        shape: CallIdentity,
+        signature: ":identity (qualified \"locator\")|stableIdentity",
+        description: "Select a canonical nominal type identity in an instantiated-type constraint.",
+    }
+    InstantiatedArguments {
+        labels: ["arguments"],
+        shape: InstantiatedTypeList,
+        signature: ":arguments [instantiated-type ...]",
+        description: "Constrain declared type parameters positionally, excluding lifetimes. Unlisted trailing slots are unconstrained.",
+    }
     LocalValue {
         labels: ["local-value", "local_value"],
         shape: Pattern,
@@ -3498,6 +3572,12 @@ rql_properties! {
         signature: ":arity count",
         description: "Match a call by its exact positional argument count, or a collection literal by its exact element count.",
     }
+    Count {
+        labels: ["count"],
+        shape: Count,
+        signature: ":count [:role pattern :min N :max M]",
+        description: "Count matching direct children in a list role with inclusive bounds.",
+    }
     Visibility {
         labels: ["visibility"],
         shape: DeclaredVisibilityList,
@@ -3520,7 +3600,7 @@ rql_properties! {
         labels: ["language-rule", "language_rule"],
         shape: String,
         signature: ":language-rule \"cpp/rule\"|\"cs/rule\"|\"java/rule\"|\"js/rule\"",
-        description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language.",
+        description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language. C# missing-xmldoc-parameter finds source method and constructor parameters without a nonempty matching XML param tag; unknown-xmldoc-parameter reports a declaration once even when its documentation names several unknown parameters; CodeQL reports one row per tag, all on the same declaration. C# missing-xmldoc-type-parameter checks only generic types and methods, as in CodeQL, and finds their type parameters without a nonempty matching XML typeparam tag; unknown-xmldoc-type-parameter checks only generic types and methods, as in CodeQL, and reports a declaration once even when its documentation names several unknown parameters; CodeQL reports one row per tag, all on the same declaration. Param and typeparam opening tags are collected on any documentation line, including inside another element such as example, for CodeQL line-model parity. Any inheritdoc element in the declaration documentation, including one nested in another tag, suppresses both missing-tag rules for CodeQL parity; the C# compiler uses a narrower scope. Findings from /** */ documentation comments are a Bifrost extension that CodeQL does not model.",
     }
     BodyState {
         labels: ["body-state", "body_state"],
@@ -3539,6 +3619,18 @@ rql_properties! {
         shape: Pattern,
         signature: ":has pattern",
         description: "Require a matching descendant.",
+    }
+    ArgumentMode {
+        labels: ["argument-mode", "argument_mode"],
+        shape: StringList,
+        signature: ":argument-mode [ref out in spread plain]",
+        description: "Match an argument value by its adapter-recorded passing mode.",
+    }
+    Each {
+        labels: ["each"],
+        shape: Pattern,
+        signature: ":each pattern",
+        description: "Require a match at this node or any descendant and capture every matching node.",
     }
     NotHas {
         labels: ["not-has", "not_has"],
@@ -3622,8 +3714,8 @@ json_fields! {
     Paths { label: "paths", shape: PathFilter, signature: "\"paths\": { \"min_segments\": N }", description: "Seed qualified-path rows directly from workspace facts." }
     GenerationSites { label: "generation_sites", shape: GenerationSiteFilter, signature: "\"generation_sites\": { \"kind\": [...], \"input\": [...] }", description: "Seed generation-site rows directly from recorded materialization provenance." }
     Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
-    DependencyEvidence { label: "dependency_evidence", shape: DependencyEvidenceFilter, signature: "\"dependency_evidence\": { \"ecosystems\": [...], \"packages\": [...], \"kinds\": [...], \"exact_versions\": [...], \"version_ranges\": [...], \"sources\": [...], \"declared_by\": [...], \"scopes\": [...] }", description: "Read stored static dependency evidence with exact identity, ownership, scope and provenance. Uncertainty remains explicit." }
-    ConfigurationFacts { label: "configuration_facts", shape: ConfigurationFactsFilter, signature: "\"configuration_facts\": { \"formats\": [...], \"node_kinds\": [...], \"roles\": [...], \"scalar_kinds\": [...], \"keys\": [...], \"values\": [...], \"values_ignore_case\": [...], \"value_lt\": \"number\", \"value_le\": \"number\", \"value_gt\": \"number\", \"value_ge\": \"number\", \"xml_parent_keys\": [...], \"xml_preceding_sibling_keys\": [...], \"xml_sibling_attribute_keys\": [...], \"xml_sibling_attribute_values\": [...], \"xml_sibling_attribute_values_ignore_case\": [...], \"xml_reference_source_keys\": [...], \"xml_reference_target_keys\": [...], \"xml_reference_target_element_keys\": [...], \"xml_reference_target_child_keys\": [...], \"xml_peer_element_keys\": [...], \"xml_peer_attribute_keys\": [...], \"xml_peer_child_keys\": [...], \"xml_peer_min_shared_children\": 3, \"routes\": [...], \"fact_ordinals\": [...], \"provenances\": [...], \"completenesses\": [...] }", description: "Seed authored configuration-document facts with exact key/value, XML structural relations, same-document references, peer child-set comparisons, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers." }
+    DependencyEvidence { label: "dependency_evidence", shape: DependencyEvidenceFilter, signature: "\"dependency_evidence\": { \"ecosystems\": [...], \"packages\": [...], \"kinds\": [...], \"exact_versions\": [...], \"version_ranges\": [...], \"sources\": [...], \"declared_by\": [...], \"scopes\": [...], \"features\": [...], \"lock_associations\": [...] }", description: "Read stored static dependency evidence with exact identity, ownership, scope and provenance. Uncertainty remains explicit." }
+    ConfigurationFacts { label: "configuration_facts", shape: ConfigurationFactsFilter, signature: "\"configuration_facts\": { \"formats\": [...], \"node_kinds\": [...], \"roles\": [...], \"scalar_kinds\": [...], \"keys\": [...], \"values\": [...], \"values_ignore_case\": [...], \"value_regex\": \"pattern\", \"value_lt\": \"number\", \"value_le\": \"number\", \"value_gt\": \"number\", \"value_ge\": \"number\", \"xml_parent_keys\": [...], \"xml_preceding_sibling_keys\": [...], \"xml_sibling_attribute_keys\": [...], \"xml_sibling_attribute_values\": [...], \"xml_sibling_attribute_values_ignore_case\": [...], \"xml_reference_source_keys\": [...], \"xml_reference_target_keys\": [...], \"xml_reference_target_element_keys\": [...], \"xml_reference_target_child_keys\": [...], \"xml_peer_element_keys\": [...], \"xml_peer_attribute_keys\": [...], \"xml_peer_child_keys\": [...], \"xml_peer_min_shared_children\": 3, \"routes\": [...], \"fact_ordinals\": [...], \"provenances\": [...], \"completenesses\": [...] }", description: "Seed authored configuration-document facts with exact key/value, XML structural relations, same-document references, peer child-set comparisons, route, node, provenance, and document-completeness constraints. Unsupported formats and recovered documents remain typed diagnostics instead of becoming clean empty answers." }
     Correlate { label: "correlate", shape: CrossDomainCorrelation, signature: "\"correlate\": { \"relation\": { \"configuration_key\": { \"documents\": [\"path\", ...] } }, \"code\": { query }, \"configuration\": { query } }", description: "Use a registered structural relation to pair input evidence, retaining dependency witnesses whenever mitigation cannot be proved." }
     RequireBoth { label: "require_both", shape: CrossDomainRequirement, signature: "\"require_both\": { \"code\": { query }, \"configuration\": { query } }", description: "Require a programming-code query and a configuration query to both produce rows, without pairing them." }
 }
@@ -3659,6 +3751,7 @@ json_fields! {
     Depth { label: "depth", shape: PositiveInteger, signature: "\"depth\": positive integer", description: "Traverse all hierarchy edges from distance one through this depth." }
     Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
     ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
+    Enclosing { label: "enclosing", shape: Pattern, signature: "\"enclosing\": structural pattern", description: "Keep reference or edge rows whose enclosing declaration matches this structural pattern." }
     Proof { label: "proof", shape: UsageProof, signature: "\"proof\": \"proven\" | \"unproven\"", description: "Restrict traversal to one usage-proof tier." }
     Completeness { label: "completeness", shape: CallTraversalCompleteness, signature: "\"completeness\": \"exhaustive\" | \"proven_subset\"", description: "Require exhaustive call discovery or intentionally report only resolved proven callers." }
     Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
@@ -3678,6 +3771,8 @@ json_fields! {
     IndexMax { label: "index_max", shape: NonNegativeInteger, signature: "\"index_max\": non-negative integer", description: "Set the inclusive maximum index accepted by a static-index key family." }
     SourceOrigin { label: "source_origin", shape: RuntimeSourceOrigin, signature: "\"source_origin\": \"pristine_input\"", description: "Require the modeled pristine runtime-input origin." }
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
+    LeftCapture { label: "left", shape: CaptureName, signature: "\"left\": \"declared_name\"", description: "Select the left positive structural capture." }
+    RightCapture { label: "right", shape: CaptureName, signature: "\"right\": \"declared_name\"", description: "Select the right positive structural capture." }
     ReceiverIdentityId { label: "receiver_identity_id", shape: String, signature: "\"receiver_identity_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven receiver identity equals this exact analyzer or semantic-model identity." }
     MemberTargetId { label: "member_target_id", shape: String, signature: "\"member_target_id\": \"stable-id\"", description: "Retain field-write rows whose already-proven static member identity equals this exact analyzer or semantic-model identity." }
     ProtocolRef { label: "protocol_ref", shape: ProtocolRef, signature: "\"protocol_ref\": \"namespace:name\"", description: "Select one host-registered compiled protocol and binding plan." }
@@ -3702,6 +3797,8 @@ json_fields! {
     DeclarationOrigins { label: "origin", shape: DeclarationOriginList, signature: "\"origin\": [\"generated\", ...]", description: "Restrict declaration-state rows to one or more origins." }
     DeclarationOnly { label: "declaration_only", shape: Boolean, signature: "\"declaration_only\": true | false", description: "Restrict declaration-state rows by their declaration-only flag." }
     ConfigGated { label: "config_gated", shape: Boolean, signature: "\"config_gated\": true | false", description: "Restrict declaration-state rows by their configuration gate." }
+    MemberForms { label: "member_form", shape: MemberFormList, signature: "\"member_form\": [\"field\", \"property\", ...]", description: "Keep member-target rows whose single exact target has one of these declaration forms. A row whose form cannot be decided is withheld and reported as member_form_undecided, not kept or dropped." }
+    TrivialProperty { label: "trivial_property", shape: Boolean, signature: "\"trivial_property\": true | false", description: "Keep member-target rows whose single exact target is (true) or is not (false) a trivial C# property. A row whose triviality cannot be decided is withheld and reported as member_form_undecided." }
     EdgeUsageKinds { label: "usage", shape: UsageKindList, signature: "\"usage\": [\"reference\", \"self_receiver\", ...]", description: "Restrict edge rows to one or more usage kinds." }
     EdgeRelations { label: "relation", shape: OwnerRelationList, signature: "\"relation\": [\"same_owner\", ...]", description: "Restrict edge rows to one or more owner relations between the site's encloser and the target." }
     EdgeSiteClasses { label: "site_class", shape: SiteClassList, signature: "\"site_class\": [\"use_site\", ...]", description: "Restrict edge rows to use sites or declaration sites." }
@@ -3716,7 +3813,7 @@ json_fields! {
     FailureUseConsumers { label: "consumer", shape: FailureUseConsumerList, signature: "\"consumer\": [\"return\", \"returned_call_argument\", \"call_argument\"]", description: "Restrict failure-use rows to one or more structured consumer classes." }
     BranchRelations { label: "branch_relation", shape: BranchRelationKindList, signature: "\"branch_relation\": [\"identical_bodies\", ...]", description: "Restrict branch-relation rows to one or more relation families." }
     ControlRelations { label: "control_relation", shape: ControlRelationKindList, signature: "\"control_relation\": [\"dominates\", ...]", description: "Restrict control-relation rows to one or more relations." }
-    AssignmentRelations { label: "assignment_relation", shape: AssignmentRelationKindList, signature: "\"assignment_relation\": [\"self_assignment\", \"self_initializer\", \"failed_swap\", \"overwritten_unread\"]", description: "Select assignment obligations before deriving coverage. With no selection, only self-assignment is derived. Self-initializer is currently a bounded C/C++ local declaration slice; overwritten-unread supports ordinary locals in C, C++, C#, Go, Java, JavaScript, Kotlin, PHP, Python, Ruby, Rust, Scala, and TypeScript." }
+    AssignmentRelations { label: "assignment_relation", shape: AssignmentRelationKindList, signature: "\"assignment_relation\": [\"self_assignment\", \"self_initializer\", \"failed_swap\", \"overwritten_unread\", \"dead_write\"]", description: "Select assignment obligations before deriving coverage. With no selection, only self-assignment is derived. Dead-write means no explicit source-level read (access, move, borrow, compound-assignment LHS, capture) is reachable from the write; implicit drops are excluded. It does not prove the value has no observable use or effect and must never authorize deletion or optimization of the write, since Drop can observe it." }
     CppProvenance { label: "cpp_provenance_rule", shape: CppProvenanceRuleList, signature: "\"cpp_provenance_rule\": [\"incorrect_pointer_scaling_char\", ...]", description: "Select direct C/C++ provenance rule families." }
     ControlExitPartitions { label: "exit_partition", shape: ControlExitPartitionList, signature: "\"exit_partition\": [\"normal_and_exceptional\"]", description: "Restrict control-relation rows to one or more exit partitions the claim was computed against." }
     ResolvesTo { label: "resolves_to", shape: CallIdentity, signature: "\"resolves_to\": { \"stable\" | \"qualified\" | \"workspace_declaration\" | \"active_semantic_model\": \"identity\" }", description: "Select one stable identity, qualified locator, or resolved typed identity." }
@@ -3783,6 +3880,7 @@ json_fields! {
     Keys { label: "keys", shape: ConfigurationKeyList, signature: "\"keys\": [\"host\", ...]", description: "Restrict facts to one or more exact configuration keys." }
     Values { label: "values", shape: StringList, signature: "\"values\": [\"true\", ...]", description: "Restrict scalar-bearing facts to one or more exact decoded XML scalar values." }
     ValuesIgnoreCase { label: "values_ignore_case", shape: StringList, signature: "\"values_ignore_case\": [\"true\", ...]", description: "Restrict scalar-bearing facts to one or more decoded XML scalar values using case-insensitive equality." }
+    ValueRegex { label: "value_regex", shape: String, signature: "\"value_regex\": \"(?i)^true$\"", description: "Restrict scalar-bearing facts to decoded values matching a regex." }
     ValueLt { label: "value_lt", shape: String, signature: "\"value_lt\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values less than the bound." }
     ValueLe { label: "value_le", shape: String, signature: "\"value_le\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values less than or equal to the bound." }
     ValueGt { label: "value_gt", shape: String, signature: "\"value_gt\": \"number\"", description: "Restrict scalar-bearing facts to finite numeric values greater than the bound." }
@@ -3990,6 +4088,10 @@ const CAPTURE_ANCHOR_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::requi
     QueryStepField::Capture,
     &[":capture"],
 )];
+const IDENTICAL_CAPTURES_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::required(QueryStepField::LeftCapture, &[":left"]),
+    QueryStepOption::required(QueryStepField::RightCapture, &[":right"]),
+];
 const PROGRAM_POINT_BY_ID_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
     QueryStepField::ProgramPointId,
     &[":id"],
@@ -4126,6 +4228,23 @@ pub const REWRITE_PATH_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::RewriteOutcomes, &[":outcome", ":outcomes"]),
 ];
 
+/// The declaration forms a `member-targets` step can filter on (#10229), in
+/// the order the member-target rows report them.
+pub const MEMBER_FORM_LABELS: &[&str] = &["field", "property", "method", "event", "other"];
+
+/// The options of `member-targets` besides `:capture`, which every receiver
+/// step takes and which is validated apart from this registry.
+pub const MEMBER_TARGETS_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(
+        QueryStepField::MemberForms,
+        &[":member-form", ":member_form"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::TrivialProperty,
+        &[":trivial-property", ":trivial_property"],
+    ),
+];
+
 /// Options of the `binding-of` step (#1474).
 pub const BINDING_OF_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
     QueryStepField::IncludeShadowed,
@@ -4192,6 +4311,7 @@ pub fn configuration_facts_field_for_rql_label(
         | ":value_ignore_case"
         | ":values-ignore-case"
         | ":values_ignore_case" => Some(ConfigurationFactsFilterField::ValuesIgnoreCase),
+        ":value/regex" => Some(ConfigurationFactsFilterField::ValueRegex),
         ":value-lt" | ":value_lt" => Some(ConfigurationFactsFilterField::ValueLt),
         ":value-le" | ":value_le" => Some(ConfigurationFactsFilterField::ValueLe),
         ":value-gt" | ":value_gt" => Some(ConfigurationFactsFilterField::ValueGt),
@@ -4393,6 +4513,7 @@ impl QueryStepOp {
             Self::Filter => FILTER_STEP_OPTIONS,
             Self::Project => PROJECT_STEP_OPTIONS,
             Self::CaptureAnchor => CAPTURE_ANCHOR_STEP_OPTIONS,
+            Self::IdenticalCaptures => IDENTICAL_CAPTURES_STEP_OPTIONS,
             Self::ProgramPointById => PROGRAM_POINT_BY_ID_STEP_OPTIONS,
             Self::StatementFacts => STATEMENT_FACTS_STEP_OPTIONS,
             Self::CppFacts => CPP_FACTS_STEP_OPTIONS,
@@ -4421,6 +4542,7 @@ impl QueryStepOp {
             Self::CppProvenance => CPP_PROVENANCE_STEP_OPTIONS,
             Self::RewritePathsOf => REWRITE_PATH_STEP_OPTIONS,
             Self::AbsentMember => ABSENT_MEMBER_STEP_OPTIONS,
+            Self::MemberTargets => MEMBER_TARGETS_STEP_OPTIONS,
             _ => &[],
         }
     }
@@ -4442,7 +4564,7 @@ pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[
     ReferenceKind::Inheritance,
 ];
 
-/// The value domain the `reference_kind` row fields publish (issue #2515), in
+/// The canonical order of reference facet labels (issue #2515), in
 /// [`ALL_REFERENCE_KINDS`] order. Pinned by a unit test.
 pub const REFERENCE_KIND_LABELS: &[&str] = &[
     "method_call",
@@ -4612,6 +4734,9 @@ pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str
             .map(|kind| kind.label())
             .collect();
     }
+    if field == QueryStepField::MemberForms {
+        return MEMBER_FORM_LABELS.to_vec();
+    }
     if field == QueryStepField::FindingProof {
         return AbsentMemberProofFilter::ALL
             .iter()
@@ -4636,6 +4761,7 @@ pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str
             AssignmentRelationKind::SelfInitializer,
             AssignmentRelationKind::FailedSwap,
             AssignmentRelationKind::OverwrittenUnread,
+            AssignmentRelationKind::DeadWrite,
         ]
         .iter()
         .map(|kind| kind.label())
@@ -4805,6 +4931,14 @@ json_fields! {
 }
 
 json_fields! {
+    InstantiatedTypeField,
+    ALL_INSTANTIATED_TYPE_FIELDS,
+    Identity { label: "identity", shape: CallIdentity, signature: "\"identity\": { \"qualified\": \"locator\" }", description: "Select a canonical nominal identity." }
+    Arguments { label: "arguments", shape: InstantiatedTypeList, signature: "\"arguments\": [instantiated-type, ...]", description: "Constrain listed type-parameter slots in declaration order." }
+    ResolvedIdentities { label: "resolved_identities", shape: CallIdentityList, signature: "\"resolved_identities\": [identity, ...]", description: "Canonical identities selected at the loaded-policy boundary." }
+}
+
+json_fields! {
     PatternField,
     ALL_PATTERN_FIELDS,
     Kind { label: "kind", shape: KindList, signature: "\"kind\": \"kind\" | [\"kinds\", ...]", description: "Match one or more normalized node kinds." }
@@ -4812,8 +4946,8 @@ json_fields! {
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
     UnsafeContext { label: "unsafe_context", shape: Boolean, signature: "\"unsafe_context\": true | false", description: "Match Rust calls inside unsafe blocks or unsafe functions; unsupported on non-call patterns and other languages." }
     Async { label: "async", shape: Boolean, signature: "\"async\": true | false", description: "Match a callable by its AST-backed async modifier." }
-    TypeKind { label: "type_kind", shape: String, signature: "\"type_kind\": \"class\" | \"interface\" | \"enum\" | \"record\" | \"annotation\"", description: "Match the persisted source form of a type declaration." }
-    Modifier { label: "modifier", shape: String, signature: "\"modifier\": static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private", description: "Match a declaration by a modifier read from its structured modifier nodes." }
+    TypeKind { label: "type_kind", shape: String, signature: "\"type_kind\": \"class\" | \"struct\" | \"interface\" | \"enum\" | \"record\" | \"annotation\"", description: "Match the persisted source form of a type declaration." }
+    Modifier { label: "modifier", shape: String, signature: "\"modifier\": static|abstract|final|volatile|synchronized|transient|native|strictfp|default|sealed|non-sealed|public|protected|private|readonly|const|extern|ref|async|file|fixed|internal|new|override|partial|required|unsafe|virtual|in|out|params|this|scoped|global", description: "Match a declaration by a modifier read from its structured modifier nodes." }
     StringValue { label: "string_value", shape: StringPredicate, signature: "\"string_value\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a normalized string literal by its decoded value." }
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
     CommentBlockText { label: "comment_block_text", shape: RegexPredicate, signature: "\"comment_block_text\": { \"regex\": \"pattern\" }", description: "Match a comment using the source text of its maximal consecutive comment block." }
@@ -4834,15 +4968,19 @@ json_fields! {
     Index { label: "index", shape: NonNegativeInteger, signature: "\"index\": non-negative integer", description: "Match a child at this exact zero-based position in its parent's ordered list role, such as elements." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
     Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count, or a collection literal by its element count: an exact count, or inclusive min/max bounds." }
+    Count { label: "count", shape: Count, signature: "\"count\": { \"role\": list-role, \"pattern\": pattern, \"min\": N, \"max\": M }", description: "Count matching direct children in a list role with inclusive bounds." }
     Visibility { label: "visibility", shape: DeclaredVisibilityList, signature: "\"visibility\": \"public\" | [\"public\", \"protected\", ...]", description: "Match a callable declaration by the visibility its adapter recorded from modifiers." }
     ParameterType { label: "parameter_type", shape: StringPredicate, signature: "\"parameter_type\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity." }
     Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }
+    ArgumentMode { label: "argument_mode", shape: StringList, signature: "\"argument_mode\": [\"ref\", ...]", description: "Match an argument value by its adapter-recorded passing mode." }
+    Each { label: "each", shape: Pattern, signature: "\"each\": { pattern }", description: "Require a match at this node or any descendant and capture every matching node." }
     NotHas { label: "not_has", shape: Pattern, signature: "\"not_has\": { pattern }", description: "Exclude nodes containing a matching descendant." }
     Not { label: "not", shape: Pattern, signature: "\"not\": { pattern }", description: "Exclude nodes matching the nested pattern." }
     All { label: "all", shape: PatternList, signature: "\"all\": [{ pattern }, ...]", description: "Require every nested pattern to match the same node." }
     Any { label: "any", shape: PatternList, signature: "\"any\": [{ pattern }, ...]", description: "Require at least one nested pattern to match the same node." }
+    QualifyingType { label: "qualifying_type", shape: InstantiatedType, signature: "\"qualifying_type\": { \"identity\": identity, \"arguments\": [instantiated-type, ...] }", description: "Constrain the canonical static type qualifying an associated call, after alias expansion." }
     LocalValue { label: "local_value", shape: Pattern, signature: "\"local_value\": { pattern }", description: "Match the unique direct function-local assignment value guaranteed before this read by unconditional or earlier same-suite execution." }
-    LanguageRule { label: "language_rule", shape: String, signature: "\"language_rule\": \"cpp/rule\" | \"cs/rule\" | \"java/rule\" | \"js/rule\"", description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language." }
+    LanguageRule { label: "language_rule", shape: String, signature: "\"language_rule\": \"cpp/rule\" | \"cs/rule\" | \"java/rule\" | \"js/rule\" | \"rust/rule\"", description: "Apply one closed relation from the language-rule registry to the root structural seed; the id prefix selects its language. C# missing-xmldoc-parameter finds source method and constructor parameters without a nonempty matching XML param tag; unknown-xmldoc-parameter reports a declaration once even when its documentation names several unknown parameters; CodeQL reports one row per tag, all on the same declaration. C# missing-xmldoc-type-parameter checks only generic types and methods, as in CodeQL, and finds their type parameters without a nonempty matching XML typeparam tag; unknown-xmldoc-type-parameter checks only generic types and methods, as in CodeQL, and reports a declaration once even when its documentation names several unknown parameters; CodeQL reports one row per tag, all on the same declaration. Param and typeparam opening tags are collected on any documentation line, including inside another element such as example, for CodeQL line-model parity. Any inheritdoc element in the declaration documentation, including one nested in another tag, suppresses both missing-tag rules for CodeQL parity; the C# compiler uses a narrower scope. Findings from /** */ documentation comments are a Bifrost extension that CodeQL does not model." }
     BodyState { label: "body_state", shape: String, signature: "\"body_state\": \"empty\" | \"comment-only\" | \"code\"", description: "Match the structured state of a directly-owned branch or loop block." }
     BodyOwner { label: "body_owner", shape: String, signature: "\"body_owner\": \"if-consequence\" | \"if-alternative\" | \"loop-body\"", description: "Restrict a body-state match to its structured if or loop owner role." }
 }
@@ -4854,7 +4992,7 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
     use std::collections::HashSet;
 
-    /// The `reference_kind` row fields publish this list as their value
+    /// The `reference_facets` result fields publish this list as their value
     /// domain, so it must stay the exact image of `reference_kind_label` over
     /// the registry (issue #2515).
     #[test]
@@ -5024,6 +5162,7 @@ json_fields! {
  DeclaredBy { label: "declared_by", shape: StringList, signature: "\"declared_by\": [\"...\"]", description: "Established owning BuildProject IDs; lock co-occurrence never creates ownership." }
  Scopes { label: "scopes", shape: StringList, signature: "\"scopes\": [\"...\"]", description: "Recorded compile, test, unknown or other dependency scope, without enabled configuration inference." }
  Features { label: "features", shape: StringList, signature: "\"features\": [\"...\"]", description: "Features the owning manifest requests of the package; requires exactly the cargo ecosystem axis. A match proves a request, not an enabled build feature; defaults, member feature tables and the package's own feature implications leave other rows unknown." }
+ LockAssociations { label: "lock_associations", shape: StringList, signature: "\"lock_associations\": [\"...\"]", description: "How a Cargo row is tied to its member's lock: exact (the declaration's own lock instance), transitive (an instance that instance reaches through lock dependencies), ambiguous or unresolved; requires exactly the cargo ecosystem axis. Rows with no association, such as unowned lock instances, never match." }
 }
 pub fn dependency_evidence_field_for_rql_label(
     label: &str,
@@ -5038,13 +5177,22 @@ pub fn dependency_evidence_field_for_rql_label(
         ":declared-by" | ":declared_by" => Some(DependencyEvidenceFilterField::DeclaredBy),
         ":scope" | ":scopes" => Some(DependencyEvidenceFilterField::Scopes),
         ":feature" | ":features" => Some(DependencyEvidenceFilterField::Features),
+        ":lock-association" | ":lock_associations" => {
+            Some(DependencyEvidenceFilterField::LockAssociations)
+        }
         _ => None,
     }
 }
 
 /// Source forms accepted by the declaration type-kind property.
-pub(crate) const DECLARATION_TYPE_KINDS: &[&str] =
-    &["class", "interface", "enum", "record", "annotation"];
+pub(crate) const DECLARATION_TYPE_KINDS: &[&str] = &[
+    "class",
+    "struct",
+    "interface",
+    "enum",
+    "record",
+    "annotation",
+];
 
 #[cfg(test)]
 mod authoring_tests;

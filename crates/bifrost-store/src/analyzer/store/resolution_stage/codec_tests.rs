@@ -1,4 +1,5 @@
 use super::*;
+use brokk_bifrost_test_macros::hardwon;
 
 fn runtime_path(
     variables: [Option<StackVariableId>; 3],
@@ -82,6 +83,33 @@ fn round_trip(path: &PartialPath) -> PartialPath {
     )
 }
 
+#[test]
+#[hardwon(
+    "#9002: repeated lexical uses of one source row lost their addressed occurrence during stage round trip"
+)]
+fn lexical_occurrences_round_trip_with_exact_address() {
+    let reason = ResolutionIncompleteReason::UnsupportedSemantic(SemanticId::local(31, 19));
+    let path = runtime_path(
+        [None, None, None],
+        ResolutionCompletion::incomplete([reason]),
+    );
+    let record = LexicalChoiceRecord {
+        source_fragment: BindingFragmentId::at_ordinal(31),
+        source_path: PartialPathId::local(31, 9),
+        reason,
+        owner: path.start().node(),
+        precedence: path.precedence()[..1].to_vec().into_boxed_slice(),
+        segment_position: 0,
+    };
+    let path = path
+        .with_lexical_choice(record.clone(), false)
+        .with_lexical_choice(record, true);
+    let decoded = round_trip(&path);
+    assert_eq!(decoded, path);
+    assert_eq!(decoded.lexical_choices().len(), 2);
+    assert_eq!(decoded.addressed_lexical_choice(), Some(1));
+}
+
 fn all_reasons() -> Vec<ResolutionIncompleteReason> {
     let mut reasons = vec![
         ResolutionIncompleteReason::CyclicExpansion(PartialPathId::local((1 << 22) + 43, 47)),
@@ -103,6 +131,7 @@ fn all_reasons() -> Vec<ResolutionIncompleteReason> {
             ResolutionIncompleteReason::UnsupportedSemantic(semantic),
             ResolutionIncompleteReason::CyclicPrefixDependency(semantic),
             ResolutionIncompleteReason::ReceiverBudgetExhausted(semantic),
+            ResolutionIncompleteReason::ReceiverSubclassObligation(semantic),
         ]);
         reasons.extend(
             ALL_BOUNDARY_STATUSES
@@ -300,7 +329,7 @@ fn malformed_nested_cells_and_cancelled_completion_are_rejected() {
     for invalid in [
         "null",
         "[[]]",
-        "[[7,0]]",
+        "[[8,0]]",
         "[[0,-1]]",
         "[[1,0,0]]",
         "[[2,0]]",

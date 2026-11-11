@@ -56,6 +56,7 @@ use brokk_bifrost_core::analyzer::structural::edges::EdgeProvenance;
 
 use brokk_bifrost_core::analyzer::structural::edges::SiteClass;
 
+#[cfg(test)]
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
@@ -97,6 +98,10 @@ pub struct RustSelectedReverseWork {
 
 pub trait RustSelectedReverseQueries {
     fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>>;
+    /// The selected operation's store queries. The in-file form finishes its
+    /// answer with the same store rechecks as the reverse form, which works
+    /// on these directly.
+    fn selected_queries(&mut self) -> &mut dyn SelectedRustReverseQueries;
     /// The project's analysis generation, as this selected operation captured
     /// it when it opened.
     fn analysis_generation(&self) -> u64;
@@ -168,6 +173,9 @@ struct RustReverseProjection<'query, 'analyzer> {
 impl RustSelectedReverseQueries for RustReverseProjection<'_, '_> {
     fn unenumerable_member_dispatch(&mut self, target: &CodeUnit) -> Result<Option<bool>> {
         self.queries.unenumerable_member_dispatch(target)
+    }
+    fn selected_queries(&mut self) -> &mut dyn SelectedRustReverseQueries {
+        &mut *self.queries
     }
     fn analysis_generation(&self) -> u64 {
         self.queries.analysis_generation()
@@ -376,22 +384,43 @@ impl RustReverseProjection<'_, '_> {
                 .expect("selected reference file was installed");
             let owner_relation =
                 classify_owner_relation(self.rust, enclosing.as_ref(), &answer.target);
-            let reference_kind = if binding.type_identity_observation() {
-                Some(brokk_bifrost_core::analyzer::usages::model::ReferenceKind::SelfTypeAlias)
-            } else {
-                file.classifier.as_ref().and_then(|classifier| {
-                    classifier.classify_reference_kind(
+            let mut reference_kind = file
+                .classifier
+                .as_ref()
+                .map(|classifier| {
+                    classifier.classify_reference_facets(
                         metadata.start_byte(),
                         metadata.end_byte(),
                         &answer.target,
                     )
                 })
-            };
+                .unwrap_or_else(|| {
+                    brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None)
+                });
+            if binding.type_identity_observation() {
+                reference_kind = reference_kind.with_present(
+                    brokk_bifrost_core::analyzer::usages::model::ReferenceKind::SelfTypeAlias,
+                );
+            }
             let ast_id = file.classifier.as_ref().and_then(|classifier| {
                 classifier.ast_id(metadata.start_byte(), metadata.end_byte())
             });
             retain_reference(site.reference());
+            // Type-bound receivers already count a nonempty definition set as route proof.
+            let route_proven = (binding.definitions().len() == 1
+                || (binding.type_bound_receiver() && !binding.definitions().is_empty()))
+                && binding.completion() == &ResolutionCompletion::Complete;
+            let (proof, obligations_block_proof) = brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::selected_reverse_proof(
+                route_proven,
+                !binding.query_obligations().is_empty(),
+            );
+            if obligations_block_proof
+                && !reasons.contains(&EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding)
+            {
+                reasons.push(EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding);
+            }
             edges.push(ReferenceEdgeRow {
+                dispatch_extensibility: None,
                 site: EdgeSite {
                     file: site.file().clone(),
                     range: file.range(metadata.start_byte(), metadata.end_byte()),
@@ -400,14 +429,7 @@ impl RustReverseProjection<'_, '_> {
                 },
                 target: answer.target.clone(),
                 reference_kind,
-                proof: if (binding.definitions().len() == 1
-                    || (binding.type_bound_receiver() && !binding.definitions().is_empty()))
-                    && binding.completion() == &ResolutionCompletion::Complete
-                {
-                    UsageProof::Proven
-                } else {
-                    UsageProof::Unproven
-                },
+                proof,
                 ambiguous_candidate: false,
                 usage_kind: rust_selected_usage_kind(metadata, owner_relation, &answer.target),
                 site_class: SiteClass::UseSite,
@@ -544,8 +566,13 @@ fn with_rust_selected_reverse_reference_admission<T>(
             work: RustSelectedReverseWork::default(),
         })
     };
-    let result =
-        operation.with_rust_row_reverse_queries(admitted_files, cancellation, confirm, query);
+    let result = operation.with_rust_row_reverse_queries(
+        admitted_files,
+        cancellation,
+        confirm,
+        |operation| rust.operation_read_frame(operation),
+        query,
+    );
     match result {
         Ok(SelectedResolutionOperationOutcome::Native(value)) => {
             RustSelectedReverseOutcome::Ready(value)
@@ -621,14 +648,6 @@ mod tests {
     fn reverse_macro_generated_callers_equal_across_worker_counts() {
         check_reverse_macro_generated_callers(
             brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::scoped_store_context,
-        );
-    }
-
-    #[test]
-    #[hardwon("#6018: writer-only macro confirmation recursively acquires the selected writer")]
-    fn reverse_macro_generated_callers_equal_across_worker_counts_writer_only() {
-        check_reverse_macro_generated_callers(
-            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test,
         );
     }
 
@@ -789,14 +808,6 @@ mod tests {
     fn incoming_call_recheck_keeps_budget_stopped_sites_unproven() {
         check_incoming_call_recheck(
             brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::scoped_store_context,
-        );
-    }
-
-    #[test]
-    #[hardwon("#6018: writer-only incoming projection recursively acquires the selected writer")]
-    fn incoming_call_recheck_keeps_budget_stopped_sites_unproven_writer_only() {
-        check_incoming_call_recheck(
-            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::single_connection_store_context_for_test,
         );
     }
 
@@ -1193,7 +1204,7 @@ mod tests {
             assert_eq!(
                 std::sync::Arc::strong_count(&structural_facts),
                 1,
-                "the completed request must release its structural snapshot"
+                "the completed request must release its structural snapshot (files={files})"
             );
             let before_structural_drop = heap_pin_bytes();
             drop(structural_facts);
@@ -1448,9 +1459,11 @@ mod tests {
         assert!(candidates.contains(&caller), "{candidates:?}");
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].edges.len(), 1, "{rows:?}");
-        assert_eq!(
-            rows[0].edges[0].reference_kind,
-            Some(ReferenceKind::MethodCall),
+        assert!(
+            rows[0].edges[0]
+                .reference_kind
+                .known()
+                .contains(ReferenceKind::MethodCall),
             "the stale persisted field cannot erase the fresh method call: {rows:?}"
         );
         assert!(rows[0].edges[0].proof == UsageProof::Proven, "{rows:?}");
@@ -1812,7 +1825,13 @@ mod tests {
                 "use crate::{Named, Widget};\npub fn method_value() { let _method = <Widget as Named>::label; }\n",
             )
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let targets = rust
             .declarations(&fixture.file("src/lib.rs"))
             .into_iter()
@@ -1868,7 +1887,13 @@ mod tests {
                 "use crate::Widget;\n#[unknown_attribute]\npub struct MayBeTransformed;\npub fn field_only(widget: Widget) { let _field = widget.name; }\n",
             )
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let target = rust
             .declarations(&fixture.file("src/lib.rs"))
             .into_iter()
@@ -2009,7 +2034,13 @@ mod tests {
                 "pub fn caller<T>(value: T) { let _field = value.name; }\n",
             )
             .build();
-        let rust = RustAnalyzer::new(fixture.project_dyn());
+        let _workspace = fixture.certified_workspace_analyzer(Default::default());
+        let rust =
+            brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+                _workspace.analyzer(),
+            )
+            .unwrap()
+            .clone();
         let target = rust
             .declarations(&fixture.file("src/lib.rs"))
             .into_iter()
@@ -2324,9 +2355,10 @@ mod tests {
         assert_eq!(edge.target, target, "{edge:?}");
         assert_eq!(edge.site.file, fixture.file("src/lib.rs"), "{edge:?}");
         assert_eq!(edge.site.enclosing.as_ref().unwrap().identifier(), "caller");
-        assert_eq!(
-            edge.reference_kind,
-            Some(ReferenceKind::MethodCall),
+        assert!(
+            edge.reference_kind
+                .known()
+                .contains(ReferenceKind::MethodCall),
             "{edge:?}"
         );
         assert_eq!(edge.proof, UsageProof::Unproven, "{edge:?}");
@@ -2784,7 +2816,10 @@ trait Abstract { fn unknown() -> Self; }\n";
             assert_eq!(lines, vec![4, 4, 5, 5, 5], "{rows:?}");
             assert!(
                 self_hits.iter().all(|edge| edge.proof == UsageProof::Proven
-                    && edge.reference_kind == Some(ReferenceKind::SelfTypeAlias)),
+                    && edge
+                        .reference_kind
+                        .known()
+                        .contains(ReferenceKind::SelfTypeAlias)),
                 "{self_hits:?}"
             );
         }

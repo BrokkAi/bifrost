@@ -208,6 +208,9 @@ fn complete_native_result<T>(result: BoundedResolution<T>, kind: &str) -> T {
         BoundedResolution::Exceeded { limit, .. } => {
             panic!("expected complete native {kind}, exceeded {limit:?}")
         }
+        BoundedResolution::Unavailable { reason, .. } => {
+            panic!("expected complete native {kind}, unavailable: {reason}")
+        }
         BoundedResolution::Cancelled { .. } => panic!("expected complete native {kind}"),
     }
 }
@@ -739,6 +742,9 @@ fn native_import_alternatives_share_one_terminal_budget_and_cancellation() {
             }
             BoundedResolution::Complete { value, .. } => assert_eq!(value.definitions.len(), 2),
             BoundedResolution::Exceeded { limit, .. } => panic!("cancellation exceeded {limit:?}"),
+            BoundedResolution::Unavailable { reason, .. } => {
+                panic!("cancellation input unavailable: {reason}")
+            }
         }
     }
     assert!(cancelled_with_resolution_work);
@@ -1282,14 +1288,65 @@ fn native_imported_enum_has_no_bare_callable_value() {
 
 #[test]
 #[hardwon("28289e10b43a: macro evidence was lost from an open export inventory")]
+#[hardwon("#7040: a public diagnostic exposed a store-local blob row id")]
 fn native_open_export_inventory_carries_macro_evidence() {
     let source = "mod provider { generate!(); } use crate::provider::Missing;";
-    let outcome = complete_definition(run_definition_at_site(
-        source,
-        &reference_site(source, "Missing"),
-        ReceiverAnalysisBudget::default(),
-        None,
-    ));
+    let query = |unrelated_first| {
+        let mut project = InlineTestProject::with_language(Language::Rust);
+        if unrelated_first {
+            project = project.file("src/aaa.rs", "pub fn probe() { absent(); }");
+        }
+        let fixture = project.file("src/lib.rs", source).build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        if unrelated_first {
+            let unrelated_source = "pub fn probe() { absent(); }";
+            let unrelated_file = fixture.file("src/aaa.rs");
+            let unrelated_tree = rust_tree(unrelated_source);
+            let _ = complete_definition(resolve_rust_definition_bounded(
+                crate::analyzer::rust::test_support::bounded_receiver_query(
+                    &analyzer,
+                    &unrelated_file,
+                    unrelated_source,
+                    Some(&unrelated_tree),
+                    &reference_site(unrelated_source, "absent"),
+                    ReceiverAnalysisBudget::default(),
+                    None,
+                ),
+            ));
+        }
+        let file = fixture.file("src/lib.rs");
+        let tree = rust_tree(source);
+        let outcome = complete_definition(resolve_rust_definition_bounded(
+            crate::analyzer::rust::test_support::bounded_receiver_query(
+                &analyzer,
+                &file,
+                source,
+                Some(&tree),
+                &reference_site(source, "Missing"),
+                ReceiverAnalysisBudget::default(),
+                None,
+            ),
+        ));
+        let connection = analyzer.analyzer_store().active_read_conn().unwrap();
+        let blob: i64 = connection
+            .query_row(
+                "SELECT blob.id FROM workspace_file_versions AS file \
+             JOIN blobs AS blob ON blob.lang=file.lang AND blob.blob_oid=file.blob_oid \
+               AND blob.parse_variant=x'' \
+             WHERE file.lang='rust' AND file.rel_path='src/lib.rs' \
+             ORDER BY file.valid_from DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (outcome, blob)
+    };
+    let (outcome, first_blob) = query(false);
+    let (shifted, shifted_blob) = query(true);
+    assert_ne!(
+        first_blob, shifted_blob,
+        "the two stores must allocate different blob IDs"
+    );
     assert_eq!(
         outcome.status,
         DefinitionLookupStatus::Incomplete,
@@ -1302,9 +1359,16 @@ fn native_open_export_inventory_carries_macro_evidence() {
         .unwrap_or_else(|| {
             panic!("open inventory must retain its invocation evidence: {outcome:#?}")
         });
+    let shifted_diagnostic = shifted
+        .diagnostics
+        .iter()
+        .find(|candidate| candidate.kind == "UnsupportedMacroGeneratedModule")
+        .expect("shifted store must retain the same macro diagnostic");
+    assert_eq!(diagnostic.message, shifted_diagnostic.message);
     let detail: serde_json::Value = serde_json::from_str(&diagnostic.message).unwrap();
     let evidence = &detail["evidence"][0];
-    assert!(evidence["member_blob"].is_i64(), "{detail}");
+    assert_eq!(evidence["member_path"], "src/lib.rs", "{detail}");
+    assert!(evidence.get("member_blob").is_none(), "{detail}");
     assert!(evidence["invocation_occurrence"].is_u64(), "{detail}");
     assert_eq!(evidence["replay_covered"], false, "{detail}");
 }
@@ -4550,4 +4614,388 @@ fn rust_definition_batch_reuses_one_selected_operation_per_file() {
             separate.definitions[0].declaration_id(),
         );
     }
+}
+
+#[test]
+#[hardwon("#8410: repeated Rust macro points rebuilt the same frontier across policy units")]
+fn repeated_macro_point_reads_match_unshared_preparation() {
+    use brokk_bifrost_analysis::analyzer::ReadLedger;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_macro_frontier_cache_counts_for_test;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_macro_frontier_data_version_misses_for_test;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+
+    let source = "macro_rules! identity { ($value:expr) => { $value }; } \
+                  pub struct Item; pub fn run() { \
+                  let _first = identity!(Item); let _second = identity!(Item); }";
+    let (project, _) = rust_source_project(source);
+    let workspace =
+        project.workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let file = project.file("src/lib.rs");
+    let sites = source
+        .match_indices("Item")
+        .skip(1)
+        .map(|(start, name)| DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(start + name.len()),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 2);
+    let run = || {
+        let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+            analyzer,
+            Arc::new(ReadLedger::new()),
+            "policy=test.macro-frontier partition=src/lib.rs".to_owned(),
+        );
+        sites
+            .iter()
+            .map(|request| {
+                let (answer, reads) = capture_query_reads(analyzer, || {
+                    resolve_definition_batch_with_source(
+                        analyzer,
+                        vec![request.clone()],
+                        file.clone(),
+                        Arc::from(source),
+                    )
+                });
+                assert_eq!(answer.len(), 1, "{answer:#?}");
+                assert_eq!(
+                    answer[0].status,
+                    DefinitionLookupStatus::Resolved,
+                    "{answer:#?}"
+                );
+                assert_eq!(answer[0].definitions.len(), 1, "{answer:#?}");
+                assert_eq!(answer[0].definitions[0].terminal_name(), "Item");
+                (
+                    format!("{answer:?}"),
+                    format!("{:?}", reads.keys()),
+                    reads.unattributed_reads(),
+                    reads.execution_dependences(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    set_macro_frontier_cache_disabled_for_test(true);
+    let _ = take_macro_frontier_cache_counts_for_test();
+    let _ = take_macro_frontier_data_version_misses_for_test();
+    let unshared = run();
+    let (unshared_hits, unshared_preparations) = take_macro_frontier_cache_counts_for_test();
+    set_macro_frontier_cache_disabled_for_test(false);
+    let shared = run();
+    let (shared_hits, shared_preparations) = take_macro_frontier_cache_counts_for_test();
+
+    assert_eq!(unshared, shared, "per-site answers and all read channels");
+    assert_eq!(unshared_hits, 0);
+    assert!(
+        unshared_preparations >= 2,
+        "both unshared sites prepare a macro frontier"
+    );
+    assert_eq!(
+        shared_preparations, 1,
+        "the second site adopts the first frontier"
+    );
+    assert_eq!(shared_hits, 1, "one exact-set reader cache hit");
+
+    workspace
+        .store()
+        .expect("inline workspace has a store")
+        .advance_data_version_for_test();
+    let (after_write_answer, after_write_reads) = capture_query_reads(analyzer, || {
+        resolve_definition_batch_with_source(
+            analyzer,
+            vec![sites[0].clone()],
+            file.clone(),
+            Arc::from(source),
+        )
+    });
+    let after_write = (
+        format!("{after_write_answer:?}"),
+        format!("{:?}", after_write_reads.keys()),
+        after_write_reads.unattributed_reads(),
+        after_write_reads.execution_dependences(),
+    );
+    let (after_write_hits, after_write_preparations) = take_macro_frontier_cache_counts_for_test();
+    assert_eq!(after_write, shared[0]);
+    assert_eq!(after_write_hits, 0, "main.data_version changed");
+    assert_eq!(
+        after_write_preparations, 1,
+        "writer commit forces preparation"
+    );
+    assert_eq!(take_macro_frontier_data_version_misses_for_test(), 1);
+}
+
+#[test]
+#[hardwon("#9239: retained Rust macro frontiers skipped derive-helper closure on warm readers")]
+fn retained_macro_frontier_preserves_derive_helper_decisions() {
+    use brokk_bifrost_analysis::analyzer::ReadLedger;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionStageOutcome, take_macro_frontier_cache_counts_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+
+    let source = "use super::*; pub struct Item { value: Value } \
+                  pub fn f(item: &mut Item) { if let Value::Flow { value } = &mut item.value { let _ = value; } } \
+                  #[derive(Debug, Serialize)] #[serde(tag = \"result_type\")] \
+                  pub enum Value { Flow { value: u8 } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"derive_frontier\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nserde = \"1\"\n",
+        )
+        .file("src/lib.rs", "mod results; use serde::Serialize;")
+        .file("src/results.rs", source)
+        .build();
+    let rust = RustAnalyzer::new(project.project_dyn());
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let file = project.file("src/results.rs");
+    let start = source.find("Value::Flow").unwrap() + "Value::".len();
+    let request = DefinitionLookupRequest {
+        file: file.clone(),
+        line: None,
+        column: None,
+        start_byte: Some(start),
+        end_byte: Some(start + "Flow".len()),
+    };
+    let lookup = || {
+        let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+            analyzer,
+            Arc::new(ReadLedger::new()),
+            "policy=test.derive-helper".to_owned(),
+        );
+        let answer = resolve_definition_batch_with_source(
+            analyzer,
+            vec![request.clone()],
+            file.clone(),
+            Arc::from(source),
+        );
+        assert_eq!(answer.len(), 1);
+        assert_eq!(
+            answer[0].status,
+            DefinitionLookupStatus::Resolved,
+            "{answer:#?}"
+        );
+        assert_eq!(answer[0].definitions[0].terminal_name(), "Flow");
+        format!("{answer:?}")
+    };
+    set_macro_frontier_cache_disabled_for_test(false);
+    let _ = take_macro_frontier_cache_counts_for_test();
+    let prepare = || {
+        let cancellation = CancellationToken::new();
+        let report = rust.open_selected_rust_operation(&cancellation);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap()
+        else {
+            panic!("selected Rust operation must open");
+        };
+        let operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        assert!(matches!(
+            operation
+                .prepare_selected_macro_frontiers_for_files(&[file.rel_path()], &cancellation)
+                .unwrap(),
+            SelectedResolutionStageOutcome::Ready
+        ));
+        let enabled = operation.derive_helper_decisions_enabled_for_test();
+        operation.observe_macro_retention_result(true);
+        enabled
+    };
+    assert!(
+        prepare(),
+        "cold preparation enables derive-helper decisions"
+    );
+    assert!(prepare(), "adoption restores derive-helper decisions");
+    assert_eq!(take_macro_frontier_cache_counts_for_test().0, 1);
+    let warm = lookup();
+    set_macro_frontier_cache_disabled_for_test(true);
+    let cold = lookup();
+    set_macro_frontier_cache_disabled_for_test(false);
+    assert_eq!(cold, warm);
+}
+
+#[test]
+#[hardwon(
+    "#10225: an unusable macro frontier closed the pooled reader, five fresh connections per procedure"
+)]
+fn incomplete_macro_frontier_clears_and_reuses_reader() {
+    use brokk_bifrost_analysis::analyzer::ReadLedger;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        SelectedResolutionStageOutcome, take_macro_reader_discards_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::store::resolution_selection::set_force_macro_reader_close_for_test;
+    use brokk_bifrost_analysis::analyzer::store::take_pooled_reader_closes_for_test;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+
+    let source = "mod plain; macro_rules! identity { ($value:expr) => { $value }; } \
+                  pub struct Item; pub fn run() { let _ = identity!(Item); }";
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"macro_reader_clear\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .file("src/lib.rs", source)
+        .file("src/plain.rs", "pub fn plain() -> u32 { 1 }")
+        .build();
+    let rust = RustAnalyzer::new(fixture.project_dyn());
+    let project = fixture;
+    let analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer = &rust;
+    let file = project.file("src/lib.rs");
+    let cancellation = CancellationToken::new();
+    let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+        analyzer,
+        Arc::new(ReadLedger::new()),
+        "policy=test.macro-reader-clear".to_owned(),
+    );
+    let _ = take_macro_reader_discards_for_test();
+    let _ = take_pooled_reader_closes_for_test();
+    let first_serial = {
+        let report = rust.open_selected_rust_operation(&cancellation);
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap()
+        else {
+            panic!("selected Rust operation must open");
+        };
+        let operation = (*operation).with_macro_frontier_reads(Box::new(analyzer));
+        assert!(
+            operation
+                .ensure_selected_rust_inputs(&cancellation)
+                .unwrap()
+        );
+        assert!(matches!(
+            operation
+                .prepare_selected_macro_frontiers_for_files(&[file.rel_path()], &cancellation)
+                .unwrap(),
+            SelectedResolutionStageOutcome::Ready
+        ));
+        let first_serial = operation
+            .pooled_reader_serial_for_test()
+            .expect("pooled reader");
+        operation.observe_macro_retention_result(false);
+        drop(operation);
+        assert!(
+            rust.analyzer_store()
+                .idle_resolution_reader_serials_for_test()
+                .contains(&first_serial)
+        );
+        assert_eq!(
+            rust.analyzer_store()
+                .idle_resolution_reader_serials_for_test(),
+            vec![first_serial]
+        );
+        first_serial
+    };
+    assert_eq!(take_macro_reader_discards_for_test(), 0);
+    // A failed baseline check closes the reader without counting a macro
+    // discard, so this is what proves the cleaned reader went back to the pool.
+    assert_eq!(take_pooled_reader_closes_for_test(), 0);
+    let report = rust.open_selected_rust_operation(&cancellation);
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = report.outcome.unwrap() else {
+        panic!("next Rust operation must open");
+    };
+    assert_eq!(
+        operation.pooled_reader_serial_for_test(),
+        Some(first_serial)
+    );
+    drop(operation);
+    let lookup = || {
+        let start = source.rfind("Item").unwrap();
+        let answer = resolve_definition_batch_with_source(
+            analyzer,
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + 4),
+            }],
+            file.clone(),
+            Arc::from(source),
+        );
+        assert_eq!(
+            answer[0].status,
+            DefinitionLookupStatus::Resolved,
+            "{answer:#?}"
+        );
+        format!("{answer:?}")
+    };
+    let pooled = lookup();
+    let report = rust.open_selected_rust_operation(&cancellation);
+    let SelectedResolutionOperationOpenOutcome::Ready(close_operation) = report.outcome.unwrap()
+    else {
+        panic!("pooled Rust operation must open before forced close");
+    };
+    set_force_macro_reader_close_for_test(true);
+    drop(close_operation);
+    let report = rust.open_selected_rust_operation(&cancellation);
+    let SelectedResolutionOperationOpenOutcome::Ready(fresh_operation) = report.outcome.unwrap()
+    else {
+        panic!("fresh Rust operation must open");
+    };
+    drop(fresh_operation);
+    let fresh = lookup();
+    set_force_macro_reader_close_for_test(false);
+    assert_eq!(pooled, fresh);
+}
+
+#[test]
+#[hardwon("#9239: a failed post-copy macro cap returned grown TEMP pages to the reader pool")]
+fn macro_post_copy_cap_failure_discards_reader() {
+    use brokk_bifrost_analysis::analyzer::ReadLedger;
+    use brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+        set_macro_post_copy_cap_failure_for_test, take_macro_reader_discards_for_test,
+    };
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::{
+        DefinitionLookupRequest, resolve_definition_batch_with_source,
+    };
+
+    let source = "macro_rules! identity { ($value:expr) => { $value }; } \
+                  pub struct Item; pub fn run() { let _ = identity!(Item); }";
+    let (project, _) = rust_source_project(source);
+    let workspace =
+        project.workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let file = project.file("src/lib.rs");
+    let _unit = AnalyzerQueryScope::with_policy_unit_read_ledger(
+        analyzer,
+        Arc::new(ReadLedger::new()),
+        "policy=test.macro-cap".to_owned(),
+    );
+    let start = source.rfind("Item").unwrap();
+    let _ = take_macro_reader_discards_for_test();
+    set_macro_post_copy_cap_failure_for_test(true);
+    let answer = resolve_definition_batch_with_source(
+        analyzer,
+        vec![DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start),
+            end_byte: Some(start + 4),
+        }],
+        file,
+        Arc::from(source),
+    );
+    set_macro_post_copy_cap_failure_for_test(false);
+    assert_eq!(
+        answer[0].status,
+        DefinitionLookupStatus::Resolved,
+        "{answer:#?}"
+    );
+    assert_eq!(take_macro_reader_discards_for_test(), 1);
 }

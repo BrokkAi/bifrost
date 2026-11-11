@@ -192,6 +192,11 @@ pub fn prepare_lexical_fragment(
                 (2, key, shared)
             }
         };
+        let (prefix_key, prefix_shared) = match semantic.prefix_reference() {
+            None => (None, None),
+            Some(None) => (Some(-1), None),
+            Some(Some(prefix)) => semantic_cells(prefix),
+        };
         result.semantics.push(json!([
             key,
             shared,
@@ -213,7 +218,9 @@ pub fn prepare_lexical_fragment(
                 .and_then(|row| row.go_spelling_namespace())
                 .map(resolution_rows::namespace_code),
             semantic.go_definition_namespaces().map(|set| set.bits()),
-            metadata.is_some_and(|row| row.go_package_qualifier())
+            metadata.is_some_and(|row| row.go_package_qualifier()),
+            prefix_key,
+            prefix_shared
         ]));
     }
     for (ordinal, gap) in fragment.gaps().iter().enumerate() {
@@ -448,7 +455,7 @@ impl PreparedStageLexical {
         if cancellation.is_cancelled() {
             return Ok(false);
         }
-        connection.prepare_cached("INSERT INTO temp.selected_resolution_stage_semantics(host_ordinal,producer_id,sequence,semantic_key,semantic_shared,node,source_site,role,namespace,site_kind,start_byte,end_byte,unqualified,owner_kind,owner_key,owner_shared,receiver_origin,go_spelling_namespace,go_definition_namespaces,go_package_qualifier) SELECT ?1,?2,key,value->>0,value->>1,value->>2,value->>3,value->>4,value->>5,value->>6,value->>7,value->>8,value->>9,value->>10,value->>11,value->>12,value->>13,value->>14,value->>15,value->>16 FROM json_each(?3)")?.execute(params![host.get(),producer,serde_json::to_string(&self.semantics).expect("stage semantics serialize")])?;
+        connection.prepare_cached("INSERT INTO temp.selected_resolution_stage_semantics(host_ordinal,producer_id,sequence,semantic_key,semantic_shared,node,source_site,role,namespace,site_kind,start_byte,end_byte,unqualified,owner_kind,owner_key,owner_shared,receiver_origin,go_spelling_namespace,go_definition_namespaces,go_package_qualifier,prefix_key,prefix_shared) SELECT ?1,?2,key,value->>0,value->>1,value->>2,value->>3,value->>4,value->>5,value->>6,value->>7,value->>8,value->>9,value->>10,value->>11,value->>12,value->>13,value->>14,value->>15,value->>16,value->>17,value->>18 FROM json_each(?3)")?.execute(params![host.get(),producer,serde_json::to_string(&self.semantics).expect("stage semantics serialize")])?;
         if cancellation.is_cancelled() {
             return Ok(false);
         }

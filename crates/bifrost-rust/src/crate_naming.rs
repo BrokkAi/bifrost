@@ -6,58 +6,52 @@
 //! naming from the nearest Cargo manifest instead: a file's package and the
 //! `crate::` root it resolves against are both anchored on the crate name.
 //!
-//! Deliberately **not** built on [`super::cargo_routes::RustCargoRouteIndex`]:
-//! naming is reached from inside the rayon build, and the route index lives
-//! behind a `PoolSafeMemo` (see the comment on `RustAnalyzer::cargo_routes`),
-//! so consulting it here would risk re-entering the pool. Everything below is a
-//! filesystem ancestor walk plus pure manifest interpretation, mirroring the Go
-//! precedent in `go/packages.rs`.
-//!
-//! `with_rust_package_components` (`declarations.rs`) and
-//! `rust_crate_root_package` (`imports.rs`) are the two consumers; both fall
-//! back to the legacy path-derived scheme when this module answers `None`.
-//!
-//! Live naming results use bounded caches invalidated per analyzer generation. The resolvers ask for a
-//! file's naming once per resolved type node and once per import segment, and a
-//! `scan_usages` profile of this repository (#2632) put a quarter of all CPU in
-//! the ancestor walk below: one `is_file` syscall per directory level, one
-//! `stat` on the manifest it lands on, and the manifest mutex, repeated for
-//! every question about every file. Nothing a memo holds can change within a
-//! generation, so [`invalidate`] at the generation boundary is what makes the
-//! per-call filesystem work unnecessary rather than merely cheap.
+//! Naming walks captured configuration during indexing and the same published
+//! configuration in SQL afterwards, so a store-backed generation never reads
+//! the live filesystem. Caches with no generation authority read files directly.
+//! Each adapter binding owns fresh bounded naming caches, so misses and evictions
+//! cannot observe another generation's manifests. Both answers and their walk
+//! receipts use the owner's existing retention budget.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::LazyLock;
 #[cfg(test)]
 use std::sync::RwLock;
-use std::sync::{Arc, LazyLock};
-use std::time::SystemTime;
 
 use brokk_bifrost_core::analyzer::fq_name::FqName;
 #[cfg(test)]
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
+use brokk_bifrost_core::analyzer::project::IdentityWalkInput;
 use brokk_bifrost_core::analyzer::{PackageAnchor, ProjectFile};
 #[cfg(test)]
 use brokk_bifrost_core::hash::HashMap;
-use moka::sync::Cache;
+use brokk_bifrost_core::retention_budget::{Accounted, RetentionBudget};
 
 use crate::cargo_manifest::{RustCargoManifestDocument, normalize_crate_name};
 use crate::selected_context::RustSelectedManifestMount;
+use crate::usage_walks::WalkCache;
 
 /// Directory names that Cargo gives their own target tree, relative to the
 /// manifest directory. A file directly in one of them is a target root and is
 /// its own `crate::` root (`benches/b.rs` sees its own consts under
 /// `crate::`); the shared modules beside it (`tests/common/mod.rs`) keep the
 /// kind-level root so cross-target references still name one file.
-const TARGET_DIRECTORIES: [&str; 3] = ["tests", "examples", "benches"];
+const TARGET_DIRECTORIES: [&str; 3] = [
+    brokk_bifrost_core::analyzer::project::RUST_TARGET_LAYOUT_DIRECTORIES[0],
+    brokk_bifrost_core::analyzer::project::RUST_TARGET_LAYOUT_DIRECTORIES[1],
+    brokk_bifrost_core::analyzer::project::RUST_TARGET_LAYOUT_DIRECTORIES[2],
+];
 
 /// Cargo naming reconstructed from one selected operation's exact inputs.
 ///
 /// This authority is deliberately separate from [`rust_crate_paths`]. The
-/// latter is the generation-scoped live-filesystem cache used while indexing;
+/// latter is the generation-scoped captured configuration cache used while indexing;
 /// selected resolution must name a persisted row from the selected manifest
 /// bytes and selected source paths instead. In particular, changing a dirty
 /// manifest changes this value for one operation without invalidating or
-/// mutating the live naming cache.
+/// mutating the generation naming cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RustSelectedCargoNaming {
     crates: Box<[RustSelectedCrateNaming]>,
@@ -114,6 +108,25 @@ impl RustSelectedCargoNaming {
         })
     }
 
+    /// Build from the package naming records of selected manifests.
+    pub fn from_naming_records(
+        source_paths: impl IntoIterator<Item = PathBuf>,
+        records: &[(PathBuf, String, PathBuf)],
+    ) -> Self {
+        Self {
+            source_paths: source_paths.into_iter().collect(),
+            crates: records
+                .iter()
+                .map(|(path, name, library)| RustSelectedCrateNaming {
+                    manifest_path: path.clone(),
+                    directory: path.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+                    crate_name: name.clone(),
+                    library_path: library.clone(),
+                })
+                .collect(),
+        }
+    }
+
     /// Resolve the package prefix for a selected persisted unit.
     ///
     /// `None` is a structured selected-input gap: the file is absent from the
@@ -127,23 +140,7 @@ impl RustSelectedCargoNaming {
         _content_qualifier: &str,
         relative_path: &Path,
     ) -> Option<FqName> {
-        if !self.source_paths.contains(relative_path) {
-            return None;
-        }
-        let paths = match self.crate_for(relative_path) {
-            Some(selected_crate) => {
-                let relative = relative_path.strip_prefix(&selected_crate.directory).ok()?;
-                classify_selected(
-                    relative,
-                    selected_crate.crate_name.as_str(),
-                    &selected_crate.directory,
-                    &selected_crate.library_path,
-                    &self.source_paths,
-                )
-            }
-            None if self.has_package_manifest_for(relative_path) => return None,
-            None => path_derived_paths(relative_path),
-        };
+        let paths = self.crate_paths(relative_path)?;
         let components = match anchor {
             PackageAnchor::OwnModule { pop } => {
                 let keep = paths.package.len().saturating_sub(usize::from(pop));
@@ -152,6 +149,51 @@ impl RustSelectedCargoNaming {
             PackageAnchor::CrateRoot => &paths.crate_root,
         };
         Some(FqName::from_package_components(components))
+    }
+
+    /// The dotted package name of a selected file: the selected equivalent of
+    /// `rust_package_name_with`. `None` has the meaning given for
+    /// [`Self::resolve_package_anchor`].
+    pub fn package_name(&self, relative_path: &Path) -> Option<String> {
+        Some(self.crate_paths(relative_path)?.package.join("."))
+    }
+
+    /// Paths whose selected presence determines this member's target naming.
+    pub fn path_probes(&self, relative_path: &Path) -> Vec<PathBuf> {
+        let probes = std::cell::RefCell::new(Vec::new());
+        let _paths = self.crate_paths_with_probe(relative_path, |path| {
+            probes.borrow_mut().push(path.to_owned())
+        });
+        probes.into_inner()
+    }
+
+    fn crate_paths(&self, relative_path: &Path) -> Option<CratePaths> {
+        self.crate_paths_with_probe(relative_path, |_| {})
+    }
+
+    fn crate_paths_with_probe(
+        &self,
+        relative_path: &Path,
+        probe: impl Fn(&Path),
+    ) -> Option<CratePaths> {
+        if !self.source_paths.contains(relative_path) {
+            return None;
+        }
+        match self.crate_for(relative_path) {
+            Some(selected_crate) => {
+                let relative = relative_path.strip_prefix(&selected_crate.directory).ok()?;
+                Some(classify_selected(
+                    relative,
+                    selected_crate.crate_name.as_str(),
+                    &selected_crate.directory,
+                    &selected_crate.library_path,
+                    &self.source_paths,
+                    probe,
+                ))
+            }
+            None if self.has_package_manifest_for(relative_path) => None,
+            None => Some(path_derived_paths(relative_path)),
+        }
     }
 
     fn crate_for(&self, relative_path: &Path) -> Option<&RustSelectedCrateNaming> {
@@ -249,171 +291,26 @@ pub(super) struct CratePaths {
     pub(super) crate_root: Vec<String>,
 }
 
-/// Crate-aware package and `crate::` root for `file`, or `None` when no
-/// `Cargo.toml` governs it.
-///
-/// `None` means "not a Cargo-managed file"; callers fall back to the legacy
-/// path-derived scheme, which this module deliberately does not reimplement.
-///
-/// Shared behind an `Arc` because the same file is named thousands of times per
-/// scan and the components below are the only allocation in the answer.
-pub(super) fn rust_crate_paths(file: &ProjectFile) -> Option<Arc<CratePaths>> {
-    if let Some(memoized) = CRATE_PATHS_BY_FILE.get(file) {
-        return memoized;
-    }
-    let paths = derive_crate_paths(file).map(Arc::new);
-    CRATE_PATHS_BY_FILE.insert(file.clone(), paths.clone());
-    paths
-}
-
-fn derive_crate_paths(file: &ProjectFile) -> Option<CratePaths> {
-    let nearest = nearest_crate(file)?;
-    let relative = file.rel_path().strip_prefix(&nearest.directory).ok()?;
-    Some(classify(
-        &file.root().join(&nearest.directory),
-        relative,
-        nearest.crate_name.clone(),
-        &nearest.library_path,
-    ))
-}
-
-/// Name of the crate `file` belongs to, i.e. the identifier its own code may
-/// spell in place of `crate` (`wasm_bindgen::foo` from inside `wasm-bindgen`).
-/// `None` when no manifest governs the file.
-pub(super) fn rust_file_crate_name(file: &ProjectFile) -> Option<String> {
-    nearest_crate(file).map(|nearest| nearest.crate_name.clone())
-}
-
-/// Kind-level root (`C.tests`, `C.benches`, `C.examples`) of the multi-target
-/// directory holding `file`, when that is not already the file's own
-/// `crate::` root.
-///
-/// A target root file owns its `crate::` root so sibling targets stay isolated,
-/// but the modules they share (`tests/common/mod.rs`) have a single identity
-/// under the kind root. This is therefore the second candidate for anything
-/// that resolves a name out of a target root file: own root first, kind root on
-/// a miss. `None` for files that already sit at the kind root, for `src/`
-/// files, and for manifest-less trees.
-pub(super) fn rust_target_kind_root(file: &ProjectFile) -> Option<Vec<String>> {
-    let nearest = nearest_crate(file)?;
-    let relative = file.rel_path().strip_prefix(&nearest.directory).ok()?;
-    let head = relative
-        .components()
-        .find_map(|component| match component {
-            Component::Normal(component) => Some(component.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .filter(|head| TARGET_DIRECTORIES.contains(&head.as_str()))?;
-    let kind_root = rust_target_kind_root_components(&nearest.crate_name, &head);
-    (rust_crate_paths(file)?.crate_root != kind_root).then_some(kind_root)
-}
-
-/// The manifest that governs some directory: where it sits, relative to the
-/// workspace root, and the crate name it declares.
-#[derive(Debug, PartialEq, Eq)]
-struct NearestCrate {
-    directory: PathBuf,
-    crate_name: String,
-    library_path: PathBuf,
-}
-
-/// Nearest ancestor directory holding a `Cargo.toml` that names a crate, paired
-/// with that crate's name. A `[workspace]`-only manifest names no crate, so the
-/// walk continues upward past it.
-///
-/// Every directory the walk passes through shares the manifest it lands on, so
-/// one walk fills bounded cache entries for that chain. Later lookups reuse
-/// them until invalidation or eviction. Without that, the walk ran once per question
-/// about every file and paid one `is_file` syscall per level each time.
-fn nearest_crate(file: &ProjectFile) -> Option<Arc<NearestCrate>> {
-    let root = file.root();
-    let start = file.rel_path().parent().unwrap_or_else(|| Path::new(""));
-    if let Some(memoized) = memoized_nearest_crate(root, start) {
-        return memoized;
-    }
-    let mut walked: Vec<PathBuf> = Vec::new();
-    let mut directory = Some(start);
-    let nearest = loop {
-        let Some(relative) = directory else {
-            break None;
-        };
-        // `start` is already known to miss; anything above it may not be.
-        if !walked.is_empty()
-            && let Some(memoized) = memoized_nearest_crate(root, relative)
-        {
-            break memoized;
-        }
-        walked.push(relative.to_path_buf());
-        #[cfg(test)]
-        record_manifest_probe(root);
-        let manifest = root.join(relative).join("Cargo.toml");
-        if manifest.is_file()
-            && let Some(naming) = cached_manifest_naming(&manifest)
-        {
-            break Some(Arc::new(NearestCrate {
-                directory: relative.to_path_buf(),
-                crate_name: naming.crate_name.clone(),
-                library_path: naming.library_path.clone(),
-            }));
-        }
-        directory = relative.parent();
-    };
-    for directory in walked {
-        NEAREST_CRATE_BY_DIRECTORY.insert((root.to_path_buf(), directory), nearest.clone());
-    }
-    nearest
-}
-
-/// `None` when the memo has never been asked about `directory`, `Some(answer)`
-/// otherwise -- including `Some(None)` for a directory with no manifest above
-/// it, which is as expensive to rediscover as any other answer.
-fn memoized_nearest_crate(root: &Path, directory: &Path) -> Option<Option<Arc<NearestCrate>>> {
-    NEAREST_CRATE_BY_DIRECTORY.get(&(root.to_path_buf(), directory.to_path_buf()))
-}
-
-/// Split `relative` (a path below the manifest directory) into the crate-aware
-/// package and `crate::` root. `manifest_root` is the absolute manifest
-/// directory, used only for layout probes.
-fn classify(
-    manifest_root: &Path,
-    relative: &Path,
-    crate_name: String,
-    library_path: &Path,
-) -> CratePaths {
-    classify_with_target_probe(
-        relative,
-        crate_name,
-        library_path,
-        |kind_directory, target| {
-            manifest_root
-                .join(kind_directory)
-                .join(target)
-                .join("main.rs")
-                .is_file()
-        },
-    )
-}
-
-/// The selected equivalent of [`classify`]. The source inventory is the only
-/// target-layout authority; this closure never probes the live filesystem.
+/// Classify using the selected inventory, recording each target-layout probe.
 fn classify_selected(
     relative: &Path,
     crate_name: &str,
     manifest_directory: &Path,
     library_path: &Path,
     source_paths: &std::collections::BTreeSet<PathBuf>,
+    probe: impl Fn(&Path),
 ) -> CratePaths {
     classify_with_target_probe(
         relative,
         crate_name.to_string(),
         library_path,
         |kind_directory, target| {
-            source_paths.contains(
-                &manifest_directory
-                    .join(kind_directory)
-                    .join(target)
-                    .join("main.rs"),
-            )
+            let path = manifest_directory
+                .join(kind_directory)
+                .join(target)
+                .join("main.rs");
+            probe(&path);
+            source_paths.contains(&path)
         },
     )
 }
@@ -486,7 +383,9 @@ fn classify_with_target_probe(
                 package: package_of(&tail),
                 crate_root: target_root(
                     &crate_name,
-                    Path::new("src/bin"),
+                    Path::new(
+                        brokk_bifrost_core::analyzer::project::RUST_TARGET_LAYOUT_DIRECTORIES[3],
+                    ),
                     "bin",
                     below_bin,
                     &has_target_main,
@@ -558,7 +457,7 @@ fn rust_target_kind_root_components(crate_name: &str, kind: &str) -> Vec<String>
 /// `[workspace]`-only manifest.
 ///
 /// Selected operations can pass their exact retained manifest here instead of
-/// consulting the generation-scoped filesystem cache below.
+/// consulting the generation-scoped configuration cache below.
 pub fn rust_manifest_crate_name(manifest: &RustCargoManifestDocument) -> Option<String> {
     let package_name = manifest.package_name()?;
     Some(
@@ -573,49 +472,288 @@ pub fn rust_manifest_crate_name(manifest: &RustCargoManifestDocument) -> Option<
 /// repeats one naming query; selected resolution still reads its SQLite rows.
 const NAMING_CACHE_ENTRIES: u64 = 4096;
 
-#[derive(Clone, Debug)]
-struct ManifestNaming {
+type DirectoryKey = (PathBuf, PathBuf);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NearestCrate {
+    directory: PathBuf,
     crate_name: String,
     library_path: PathBuf,
 }
-
-type ManifestKey = (PathBuf, Option<SystemTime>);
-static MANIFEST_NAMING: LazyLock<Cache<ManifestKey, Option<Arc<ManifestNaming>>>> =
-    LazyLock::new(|| Cache::new(NAMING_CACHE_ENTRIES));
-type DirectoryKey = (PathBuf, PathBuf);
-static NEAREST_CRATE_BY_DIRECTORY: LazyLock<Cache<DirectoryKey, Option<Arc<NearestCrate>>>> =
-    LazyLock::new(|| Cache::new(NAMING_CACHE_ENTRIES));
-static CRATE_PATHS_BY_FILE: LazyLock<Cache<ProjectFile, Option<Arc<CratePaths>>>> =
-    LazyLock::new(|| Cache::new(NAMING_CACHE_ENTRIES));
-
-/// Forget live-filesystem naming results at the analyzer generation boundary.
-pub fn invalidate() {
-    MANIFEST_NAMING.invalidate_all();
-    NEAREST_CRATE_BY_DIRECTORY.invalidate_all();
-    CRATE_PATHS_BY_FILE.invalidate_all();
+/// The answer and receipt are produced together, including cached misses.
+/// Each directory shares the full receipt allocation and selects its suffix.
+#[derive(Clone)]
+struct NearestCrateEntry {
+    nearest: Option<NearestCrate>,
+    inputs: Arc<[IdentityWalkInput]>,
+    offset: usize,
 }
 
-fn cached_manifest_naming(manifest: &Path) -> Option<Arc<ManifestNaming>> {
-    let modified = std::fs::metadata(manifest)
-        .and_then(|metadata| metadata.modified())
-        .ok();
-    let key = (manifest.to_path_buf(), modified);
-    if let Some(cached) = MANIFEST_NAMING.get(&key) {
+fn naming_weight(bytes: usize) -> u32 {
+    bytes.min(u32::MAX as usize) as u32
+}
+
+/// Immutable manifest authority for one naming generation. Missing paths are
+/// absent even when a later disk edit creates them.
+pub trait RustManifestSource: Send + Sync {
+    fn retained_bytes(&self) -> usize {
+        0
+    }
+    fn lists_path(&self, file: &ProjectFile) -> bool {
+        file.root().join(file.rel_path()).is_file()
+    }
+    fn bytes(&self, file: &ProjectFile) -> std::io::Result<Option<Vec<u8>>>;
+}
+
+impl<F> RustManifestSource for F
+where
+    F: Fn(&ProjectFile) -> std::io::Result<Option<Vec<u8>>> + Send + Sync,
+{
+    fn bytes(&self, file: &ProjectFile) -> std::io::Result<Option<Vec<u8>>> {
+        self(file)
+    }
+}
+
+pub struct RustCrateNamingCaches {
+    budget: RetentionBudget,
+    source: Arc<dyn RustManifestSource>,
+    _source_charge: brokk_bifrost_core::retention_budget::AllocationCharge,
+    nearest_crate: WalkCache<DirectoryKey, NearestCrateEntry>,
+    crate_paths: WalkCache<ProjectFile, CratePaths>,
+}
+
+impl RustCrateNamingCaches {
+    /// Caches with no generation authority: an ownerless adapter, or one not
+    /// yet bound to a project. They read manifests from the file system, as a
+    /// project that is not store-backed would. An analyzer generation binds
+    /// its own source through `for_source` and never uses this reader.
+    pub fn new(budget: &RetentionBudget) -> Self {
+        Self::with_source(
+            budget,
+            Arc::new(
+                |file: &ProjectFile| match std::fs::read(file.root().join(file.rel_path())) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                },
+            ),
+        )
+    }
+
+    pub fn for_source(&self, source: Arc<dyn RustManifestSource>) -> Self {
+        Self::with_source(&self.budget, source)
+    }
+
+    pub fn with_source(budget: &RetentionBudget, source: Arc<dyn RustManifestSource>) -> Self {
+        Self {
+            budget: budget.clone(),
+            _source_charge:
+                brokk_bifrost_core::retention_budget::AllocationCharge::acquire_required(
+                    budget,
+                    source.retained_bytes(),
+                ),
+            source,
+            nearest_crate: WalkCache::new_capped(
+                budget,
+                "rust.crate_naming.nearest_crate",
+                Some(NAMING_CACHE_ENTRIES as usize),
+                |_, value| {
+                    naming_weight(
+                        size_of::<NearestCrateEntry>()
+                            + value.nearest.as_ref().map_or(0, |nearest| {
+                                nearest.directory.capacity()
+                                    + nearest.crate_name.capacity()
+                                    + nearest.library_path.capacity()
+                            })
+                            // Charge the full shared allocation for each entry.
+                            + std::mem::size_of_val(value.inputs.as_ref())
+                            + value.inputs.iter().map(|input| match input {
+                                IdentityWalkInput::File { rel_path, .. }
+                                | IdentityWalkInput::PathAbsent { rel_path } => rel_path.capacity(),
+                                IdentityWalkInput::Unavailable => 0,
+                            }).sum::<usize>(),
+                    )
+                },
+            ),
+            crate_paths: WalkCache::new_capped(
+                budget,
+                "rust.crate_naming.crate_paths",
+                Some(NAMING_CACHE_ENTRIES as usize),
+                |_, value| {
+                    // The vectors' buffers and each string's full capacity.
+                    let strings = |parts: &Vec<String>| {
+                        brokk_bifrost_core::hash::vec_slot_bytes(parts)
+                            + parts.iter().map(String::capacity).sum::<usize>()
+                    };
+                    naming_weight(
+                        size_of::<CratePaths>()
+                            + strings(&value.package)
+                            + strings(&value.crate_root),
+                    )
+                },
+            ),
+        }
+    }
+
+    /// Each naming cache's name and its count of reads answered from a kept
+    /// entry, for the hit-path read parity test.
+    pub fn hit_counts(&self) -> [(&'static str, u64); 2] {
+        [self.nearest_crate.hit_count(), self.crate_paths.hit_count()]
+    }
+
+    /// Evict naming answers without changing their immutable manifest authority.
+    /// Updates bind fresh caches rather than mutating older generations.
+    pub fn invalidate_all(&self) {
+        self.nearest_crate.invalidate_all();
+        self.crate_paths.invalidate_all();
+    }
+}
+
+pub(super) fn rust_crate_paths_with(
+    caches: &RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Option<Arc<Accounted<CratePaths>>> {
+    if let Some(cached) = caches.crate_paths.get_optional(file) {
         return cached;
     }
-    let naming = std::fs::read(manifest)
-        .ok()
-        .and_then(|source_bytes| {
-            RustCargoManifestDocument::from_source_bytes(source_bytes.into_boxed_slice()).ok()
+    let paths = derive_crate_paths_with(caches, file);
+    caches.crate_paths.keep_optional(file.clone(), paths)
+}
+
+fn derive_crate_paths_with(
+    caches: &RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Option<CratePaths> {
+    let nearest = nearest_crate_with(caches, file)?;
+    let relative = file.rel_path().strip_prefix(&nearest.directory).ok()?;
+    Some(classify_with_target_probe(
+        relative,
+        nearest.crate_name.clone(),
+        &nearest.library_path,
+        |kind, target| {
+            caches.source.lists_path(&ProjectFile::new(
+                file.root(),
+                nearest.directory.join(kind).join(target).join("main.rs"),
+            ))
+        },
+    ))
+}
+
+#[allow(dead_code)] // Used when the remaining Rust query callers move onto the handle.
+pub(super) fn rust_file_crate_name_with(
+    caches: &RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Option<String> {
+    nearest_crate_with(caches, file).map(|nearest| nearest.crate_name.clone())
+}
+
+#[allow(dead_code)] // Used when the remaining Rust query callers move onto the handle.
+pub(super) fn rust_target_kind_root_with(
+    caches: &RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Option<Vec<String>> {
+    let nearest = nearest_crate_with(caches, file)?;
+    let relative = file.rel_path().strip_prefix(&nearest.directory).ok()?;
+    let head = relative
+        .components()
+        .find_map(|component| match component {
+            Component::Normal(component) => Some(component.to_string_lossy().into_owned()),
+            _ => None,
         })
-        .and_then(|document| {
-            Some(Arc::new(ManifestNaming {
-                crate_name: rust_manifest_crate_name(&document)?,
-                library_path: document.library_path().ok()?.to_path_buf(),
-            }))
-        });
-    MANIFEST_NAMING.insert(key, naming.clone());
-    naming
+        .filter(|head| TARGET_DIRECTORIES.contains(&head.as_str()))?;
+    let kind_root = rust_target_kind_root_components(&nearest.crate_name, &head);
+    (rust_crate_paths_with(caches, file)?.crate_root != kind_root).then_some(kind_root)
+}
+
+/// Replay all ancestor probes behind a file's generation-scoped identity.
+/// Eviction re-probes the same captured or stored configuration, keeping the
+/// answer and receipt together; the analyzer checks reads against its snapshot.
+pub fn rust_file_identity_inputs_with(
+    caches: &RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Vec<IdentityWalkInput> {
+    let entry = nearest_crate_entry_with(caches, file);
+    entry.inputs[entry.offset..].to_vec()
+}
+
+fn nearest_crate_with(caches: &RustCrateNamingCaches, file: &ProjectFile) -> Option<NearestCrate> {
+    nearest_crate_entry_with(caches, file).nearest.clone()
+}
+
+fn nearest_crate_entry_with(
+    caches: &RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> Arc<Accounted<NearestCrateEntry>> {
+    let root = file.root();
+    let start = file.rel_path().parent().unwrap_or_else(|| Path::new(""));
+    let key = |directory: &Path| (root.to_path_buf(), directory.to_path_buf());
+    if let Some(entry) = caches.nearest_crate.get(&key(start)) {
+        return entry;
+    }
+    let mut walked = Vec::new();
+    let mut inputs = Vec::new();
+    let mut directory = Some(start);
+    let nearest = loop {
+        let Some(relative) = directory else {
+            break None;
+        };
+        if !walked.is_empty()
+            && let Some(entry) = caches.nearest_crate.get(&key(relative))
+        {
+            inputs.extend_from_slice(&entry.inputs[entry.offset..]);
+            break entry.nearest.clone();
+        }
+        walked.push((relative.to_path_buf(), inputs.len()));
+        #[cfg(test)]
+        record_manifest_probe(root);
+        let path = relative.join("Cargo.toml");
+        let rel_path = brokk_bifrost_core::path_utils::workspace_relative_slash_path(&path);
+        match caches.source.bytes(&ProjectFile::new(root, &path)) {
+            Ok(Some(source)) => {
+                let blob = git2::Oid::hash_object(git2::ObjectType::Blob, &source)
+                    .expect("hashing captured manifest");
+                inputs.push(IdentityWalkInput::File {
+                    rel_path,
+                    blob: blob.as_bytes().try_into().expect("blob width"),
+                    content_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                        &source,
+                    ),
+                });
+                if let Ok(document) =
+                    RustCargoManifestDocument::from_source_bytes(source.into_boxed_slice())
+                    && let Some(crate_name) = rust_manifest_crate_name(&document)
+                    && let Ok(library_path) = document.library_path()
+                {
+                    break Some(NearestCrate {
+                        directory: relative.to_path_buf(),
+                        crate_name,
+                        library_path: library_path.to_path_buf(),
+                    });
+                }
+            }
+            Ok(None) => {
+                inputs.push(IdentityWalkInput::PathAbsent { rel_path });
+            }
+            Err(_) => {
+                // Preserve naming's ancestor search, but refuse attribution
+                // when a probe cannot supply its bytes.
+                inputs.push(IdentityWalkInput::Unavailable);
+            }
+        }
+        directory = relative.parent();
+    };
+    let inputs: Arc<[IdentityWalkInput]> = inputs.into();
+    let mut result = None;
+    for (directory, offset) in walked.into_iter().rev() {
+        result = Some(caches.nearest_crate.keep(
+            key(&directory),
+            NearestCrateEntry {
+                nearest: nearest.clone(),
+                inputs: inputs.clone(),
+                offset,
+            },
+        ));
+    }
+    result.expect("the starting directory was probed")
 }
 
 #[cfg(test)]
@@ -646,6 +784,7 @@ mod tests {
     struct Fixture {
         _root: tempfile::TempDir,
         root: PathBuf,
+        caches: RustCrateNamingCaches,
     }
 
     impl Fixture {
@@ -658,11 +797,21 @@ mod tests {
                 std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
                 std::fs::write(&path, contents).expect("write fixture");
             }
-            Self { _root: temp, root }
+            Self {
+                _root: temp,
+                root,
+                caches: RustCrateNamingCaches::with_source(&RetentionBudget::for_tests(), {
+                    let inputs = files
+                        .iter()
+                        .map(|(path, source)| (PathBuf::from(path), source.as_bytes().to_vec()))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    Arc::new(move |file: &ProjectFile| Ok(inputs.get(file.rel_path()).cloned()))
+                }),
+            }
         }
 
-        fn paths(&self, relative: &str) -> Option<Arc<CratePaths>> {
-            rust_crate_paths(&ProjectFile::new(self.root.clone(), relative))
+        fn paths(&self, relative: &str) -> Option<Arc<Accounted<CratePaths>>> {
+            rust_crate_paths_with(&self.caches, &ProjectFile::new(self.root.clone(), relative))
         }
 
         /// Ancestor-walk manifest probes charged to this fixture's root so far.
@@ -765,15 +914,10 @@ mod tests {
         );
     }
 
-    /// The memos answer from the last generation until the generation
-    /// boundary drops them, which is the whole point of not stat-ing a
-    /// manifest per call. `RustAnalyzer` construction and update call
-    /// `invalidate`, so an edit between two builds is picked up.
+    /// Eviction must keep naming tied to its captured inputs after disk edits.
     #[test]
-    #[hardwon(
-        "78436c5a27bb: crate naming stayed stale after manifest edits until generation invalidation"
-    )]
-    fn editing_a_manifest_renames_the_crate_after_invalidation() {
+    #[hardwon("#10596: crate naming read new Cargo.toml bytes for an older generation")]
+    fn eviction_keeps_the_captured_manifest_after_disk_edits() {
         let _exclusive = exclusive_memo();
         let fixture = Fixture::new(&[("Cargo.toml", MANIFEST), ("src/lib.rs", "")]);
         assert_eq!(fixture.resolved("src/lib.rs").0, components("wasm_bindgen"));
@@ -791,8 +935,8 @@ mod tests {
             "the memo answers for the whole generation",
         );
 
-        invalidate();
-        assert_eq!(fixture.resolved("src/lib.rs").0, components("other"));
+        fixture.caches.invalidate_all();
+        assert_eq!(fixture.resolved("src/lib.rs").0, components("wasm_bindgen"));
     }
 
     /// The cost this module exists to remove: the ancestor walk used to run
@@ -811,7 +955,7 @@ mod tests {
             ("crates/a/Cargo.toml", "[package]\nname = \"member-a\"\n"),
             ("crates/b/Cargo.toml", "[package]\nname = \"member-b\"\n"),
         ]);
-        invalidate();
+        fixture.caches.invalidate_all();
         assert_eq!(fixture.manifest_probes(), 0, "a fresh fixture root");
 
         // Two crates, two directories each, 50 files per directory.
@@ -853,6 +997,15 @@ mod tests {
 
         for file in &files {
             fixture.resolved(file);
+            let file = ProjectFile::new(fixture.root.clone(), file);
+            let first = rust_file_identity_inputs_with(&fixture.caches, &file);
+            let second = rust_file_identity_inputs_with(&fixture.caches, &file);
+            assert!(!first.is_empty(), "the walk records its manifest probes");
+            assert_eq!(
+                first.len(),
+                second.len(),
+                "warm identity reads retain the receipt"
+            );
         }
         assert_eq!(
             fixture.manifest_probes(),

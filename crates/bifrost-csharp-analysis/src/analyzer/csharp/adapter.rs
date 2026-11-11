@@ -15,7 +15,7 @@ use brokk_bifrost_core::analyzer::fq_name::FqName;
 
 use brokk_bifrost_core::analyzer::model::Language;
 
-use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::LanguageAdapter;
+use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_csharp::adapter::{
@@ -35,7 +35,55 @@ use brokk_bifrost_csharp::syntax::strip_csharp_generic_arity;
 
 #[derive(Debug, Clone, Default)]
 #[doc(hidden)]
-pub struct CSharpAdapter;
+pub struct CSharpAdapter {
+    trial: brokk_bifrost_core::analyzer::config::CSharpNativeTrial,
+}
+
+#[allow(non_upper_case_globals)]
+pub const CSharpAdapter: CSharpAdapter = CSharpAdapter {
+    trial: brokk_bifrost_core::analyzer::config::CSharpNativeTrial::Off,
+};
+
+impl CSharpAdapter {
+    pub fn from_config(
+        config: &brokk_bifrost_core::analyzer::config::CSharpAnalyzerConfig,
+    ) -> Self {
+        Self {
+            trial: config.native_trial,
+        }
+    }
+
+    pub(crate) fn semantic_lowerer(&self) -> super::semantic::CSharpSemanticLowerer {
+        super::semantic::CSharpSemanticLowerer::for_trial(self.trial)
+    }
+}
+
+// Reproduce a pre-hold cache in tests. This guard lets a fixture publish
+// native facts independently of the analyzer's trial configuration.
+#[cfg(any(test, feature = "test-support"))]
+static LEGACY_NATIVE_FIXTURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct LegacyNativeFixtureGuard;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for LegacyNativeFixtureGuard {
+    fn drop(&mut self) {
+        LEGACY_NATIVE_FIXTURE.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl CSharpAdapter {
+    pub fn legacy_native_fixture_guard() -> LegacyNativeFixtureGuard {
+        assert!(
+            !LEGACY_NATIVE_FIXTURE.swap(true, std::sync::atomic::Ordering::SeqCst),
+            "legacy C# fixture already active"
+        );
+        LegacyNativeFixtureGuard
+    }
+}
 
 use brokk_bifrost_analysis::analyzer::store::{
     AnalyzerStore, GenerationId, StoreError, WorkspaceConfigurationInput, WorkspaceId,
@@ -106,6 +154,7 @@ impl CSharpAdapter {
                 Ok(SymbolEnvironment {
                     compilation_key: environment.owner_key,
                     defined: environment.symbols.into_iter().collect(),
+                    named_open: environment.named_open.into_iter().collect(),
                     closed: environment.closed,
                     open_reason: environment.open_reason,
                 })
@@ -116,6 +165,59 @@ impl CSharpAdapter {
 }
 
 impl LanguageAdapter for CSharpAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[
+                "string_literal",
+                "verbatim_string_literal",
+                "raw_string_literal",
+                "interpolated_string_expression",
+                "character_literal",
+                "integer_literal",
+                "real_literal",
+            ],
+            interpolations: &["interpolation"],
+            composites: &[
+                ("initializer_expression", &["{", "}", ","]),
+                ("prefix_unary_expression", &["-", "+"]),
+            ],
+        }
+    }
+
+    fn for_config(self, config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig) -> Self {
+        Self::from_config(&config.csharp)
+    }
+
+    fn record_read_obligation(
+        &self,
+        analyzer: &TreeSitterAnalyzer<Self>,
+        key: &brokk_bifrost_analysis::analyzer::ReadKey,
+    ) {
+        use brokk_bifrost_analysis::analyzer::ReadKey;
+        match key {
+            ReadKey::File {
+                language: Language::CSharp,
+                rel_path,
+                parse_variant,
+                ..
+            } => {
+                analyzer.record_csharp_unseen_branch_obligation(Some((rel_path, *parse_variant)));
+            }
+            ReadKey::Scope { languages, .. } if languages.contains(&Language::CSharp) => {
+                analyzer.record_csharp_unseen_branch_obligation(None);
+            }
+            ReadKey::File { .. }
+            | ReadKey::Scope { .. }
+            | ReadKey::Index { .. }
+            | ReadKey::PathAbsent { .. }
+            | ReadKey::Lookup { .. }
+            | ReadKey::Artifact { .. }
+            | ReadKey::Models(..)
+            | ReadKey::Policy { .. }
+            | ReadKey::Configuration(..)
+            | ReadKey::Epoch(..) => {}
+        }
+    }
     fn derive_parse_configuration(
         &self,
         store: &AnalyzerStore,
@@ -175,7 +277,14 @@ impl LanguageAdapter for CSharpAdapter {
             variant: ParseVariant::Digest(scan.decisions.decision_digest),
             assignment_digest: Some(scan.decisions.assignment_digest),
             condition_symbols: scan.decisions.referenced_symbols.iter().cloned().collect(),
-            undecided_chains,
+            undecided_scan: Some(
+                brokk_bifrost_analysis::analyzer::store::CSharpUndecidedScan {
+                    oid: git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes())
+                        .expect("C# scan source hashes as a Git blob"),
+                    variant: ParseVariant::Digest(scan.decisions.decision_digest),
+                    chains: undecided_chains,
+                },
+            ),
             preprocessor: Some(std::sync::Arc::new(scan)),
         })
     }
@@ -212,7 +321,7 @@ impl LanguageAdapter for CSharpAdapter {
             variant: key.variant,
             assignment_digest: Some(digest),
             condition_symbols: symbols,
-            undecided_chains: Vec::new(),
+            undecided_scan: None,
             preprocessor: None,
         }))
     }
@@ -312,7 +421,7 @@ impl LanguageAdapter for CSharpAdapter {
         )>,
     ) {
         #[cfg(any(test, feature = "test-support"))]
-        if super::trial_native_csharp_selected() {
+        if self.trial.is_on() || LEGACY_NATIVE_FIXTURE.load(std::sync::atomic::Ordering::SeqCst) {
             let scan = preprocessor
                 .expect("C# preprocessing precedes parsing")
                 .as_any()
@@ -392,16 +501,23 @@ impl LanguageAdapter for CSharpAdapter {
     }
 }
 
-static CSHARP_SEMANTIC_LOWERER: super::semantic::CSharpSemanticLowerer =
-    super::semantic::CSharpSemanticLowerer;
-
 impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for CSharpAdapter {
+    fn resolution_producer_epoch(&self) -> &'static str {
+        if self.trial.is_on() {
+            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch()
+        } else {
+            brokk_bifrost_analysis::analyzer::store::resolution::resolution_bundle_epoch(
+                Language::CSharp,
+            )
+        }
+    }
+
     fn parse_time_semantic_lowerer(
         &self,
     ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer> {
         Some(
             brokk_bifrost_analysis::analyzer::semantic::service::ParseTimeSemanticLowerer::new(
-                &CSHARP_SEMANTIC_LOWERER,
+                self.semantic_lowerer().as_static(),
             ),
         )
     }
@@ -426,5 +542,72 @@ impl brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter for CSharpAda
     }
     fn persist_content_stable_lookup_keys(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod trial_identity_tests {
+    use super::CSharpAdapter;
+    use brokk_bifrost_analysis::analyzer::semantic::ids::ContentIdentity;
+    use brokk_bifrost_analysis::analyzer::semantic::service::{
+        ProgramSemanticsLowerer, semantic_artifact_key_from_content,
+    };
+    use brokk_bifrost_analysis::analyzer::store::StoreLanguageAdapter;
+    use brokk_bifrost_core::analyzer::config::{CSharpAnalyzerConfig, CSharpNativeTrial};
+    use brokk_bifrost_core::analyzer::model::{Language, LanguageDialect};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7314: cross-flag C# parsed rows and semantic artifacts shared an identity")]
+    fn trial_and_plain_have_distinct_parse_and_semantic_identities() {
+        use crate::inline_project::InlineTestProject;
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "class A {}")
+            .build();
+        let file = fixture
+            .project_dyn()
+            .analyzable_files(Language::CSharp)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let plain = CSharpAdapter::from_config(&CSharpAnalyzerConfig {
+            native_trial: CSharpNativeTrial::Off,
+            ..Default::default()
+        });
+        let trial = CSharpAdapter::from_config(&CSharpAnalyzerConfig {
+            native_trial: CSharpNativeTrial::On,
+            ..Default::default()
+        });
+        assert_ne!(
+            plain.resolution_producer_epoch(),
+            trial.resolution_producer_epoch()
+        );
+        let plain_lowerer = plain.semantic_lowerer();
+        let trial_lowerer = trial.semantic_lowerer();
+        assert_ne!(
+            plain_lowerer.identity().configuration,
+            trial_lowerer.identity().configuration
+        );
+        let key_for = |lowerer: &super::super::semantic::CSharpSemanticLowerer| {
+            semantic_artifact_key_from_content(
+                &file,
+                LanguageDialect::Standard(Language::CSharp),
+                ContentIdentity::hash_bytes(b"class A {}"),
+                None,
+                lowerer.identity(),
+            )
+            .unwrap()
+        };
+        assert_ne!(key_for(&plain_lowerer), key_for(&trial_lowerer));
+        let plain_ir =
+            brokk_bifrost_analysis::analyzer::store::semantic_ir::semantic_ir_producer_epoch(
+                &plain_lowerer.identity(),
+            );
+        let trial_ir =
+            brokk_bifrost_analysis::analyzer::store::semantic_ir::semantic_ir_producer_epoch(
+                &trial_lowerer.identity(),
+            );
+        assert_ne!(plain_ir, trial_ir);
     }
 }

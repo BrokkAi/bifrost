@@ -165,7 +165,7 @@ where
 {
     entries: Cache<K, ReadyValue<V>>,
     retain: fn(Arc<V>) -> Arc<dyn Send + Sync>,
-    in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
+    in_flight: FlightMap<K, Arc<V>>,
     live: Arc<Mutex<HashMap<K, Weak<V>>>>,
     #[cfg(any(test, feature = "test-support"))]
     revival_tracker: Arc<Mutex<CompleteValueRevivalTracker<K, V>>>,
@@ -300,7 +300,7 @@ where
                     match in_flight.get(key) {
                         Some(flight) => (None, Some(Arc::clone(flight)), false),
                         None => {
-                            let flight = Arc::new(InFlightMaterialization::new());
+                            let flight = Arc::new(Flight::new());
                             in_flight.insert(key.clone(), Arc::clone(&flight));
                             (None, Some(flight), true)
                         }
@@ -332,14 +332,14 @@ where
             let followed = flight.wait(cancellation);
             wait.record(started);
             match followed {
-                FlightWait::Completed(value) => {
+                Follow::Completed(value) => {
                     return (CompleteValueAcquisition::Cached { value }, wait);
                 }
-                FlightWait::Retry => {}
-                FlightWait::Rejected => {
+                Follow::Retry => {}
+                Follow::Rejected => {
                     return (CompleteValueAcquisition::Rejected, wait);
                 }
-                FlightWait::Cancelled => {
+                Follow::Cancelled => {
                     return (CompleteValueAcquisition::Cancelled, wait);
                 }
             }
@@ -452,73 +452,137 @@ where
             .lock()
             .expect("complete-value single-flight map mutex poisoned")
             .values()
-            .map(|flight| {
-                flight
-                    .state
-                    .lock()
-                    .expect("complete-value single-flight state mutex poisoned")
-                    .waiters
-            })
+            .map(|flight| flight.waiters())
             .sum()
     }
 }
 
-struct InFlightMaterialization<V> {
-    state: Mutex<InFlightState<V>>,
+/// The running flights of one cache, by key.
+pub(crate) type FlightMap<K, V> = Arc<Mutex<HashMap<K, Arc<Flight<V>>>>>;
+
+/// One build of one key, shared by its leader and every follower.
+///
+/// The leader's permit drives the state from `Running` to exactly one terminal
+/// state: it publishes a value or a rejection, or it is dropped without either
+/// (`Abandoned`, which makes followers retry). Followers wait until the state
+/// leaves `Running`. Shared with [`crate::budgeted_value_cache`].
+pub(crate) struct Flight<V> {
+    state: Mutex<FlightState<V>>,
     wake: Condvar,
+    #[cfg(any(test, feature = "test-support"))]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
-struct InFlightState<V> {
-    running: bool,
-    waiters: usize,
-    completed: Option<Arc<V>>,
-    rejected: bool,
-}
-
-impl<V> InFlightMaterialization<V> {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(InFlightState {
-                running: true,
-                waiters: 0,
-                completed: None,
-                rejected: false,
-            }),
-            wake: Condvar::new(),
-        }
-    }
-
-    fn wait(&self, cancellation: &CancellationToken) -> FlightWait<V> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("complete-value single-flight state mutex poisoned");
-        state.waiters = state.waiters.saturating_add(1);
-        while state.running && !cancellation.is_cancelled() {
-            let (next, _) = self
-                .wake
-                .wait_timeout(state, CANCELLATION_POLL)
-                .expect("complete-value single-flight state mutex poisoned while waiting");
-            state = next;
-        }
-        state.waiters = state.waiters.saturating_sub(1);
-        if cancellation.is_cancelled() {
-            FlightWait::Cancelled
-        } else if let Some(value) = &state.completed {
-            FlightWait::Completed(Arc::clone(value))
-        } else if state.rejected {
-            FlightWait::Rejected
-        } else {
-            FlightWait::Retry
-        }
-    }
-}
-
-enum FlightWait<V> {
-    Completed(Arc<V>),
+enum FlightState<V> {
+    /// `fenced`: the key or the whole cache was invalidated while this flight
+    /// ran, so its value is for its own callers only and must not be retained.
+    Running {
+        fenced: bool,
+    },
+    Completed(V),
     Rejected,
+    Abandoned,
+}
+
+/// What a follower observed when its flight left `Running`.
+pub(crate) enum Follow<V> {
+    Completed(V),
+    Rejected,
+    /// The leader stopped without publishing; take the leadership or join a
+    /// newer flight.
     Retry,
     Cancelled,
+}
+
+impl<V> Flight<V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(FlightState::Running { fenced: false }),
+            wake: Condvar::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FlightState<V>> {
+        self.state
+            .lock()
+            .expect("single-flight state mutex poisoned")
+    }
+
+    /// Keep a still-running build from retaining its value. A flight that
+    /// already finished is left alone: its value was published before the
+    /// invalidation, which removes it from the cache.
+    pub(crate) fn fence(&self) {
+        if let FlightState::Running { fenced } = &mut *self.lock() {
+            *fenced = true;
+        }
+    }
+
+    pub(crate) fn reject(&self) {
+        let mut state = self.lock();
+        assert!(
+            matches!(*state, FlightState::Running { .. }),
+            "a flight publishes once, while it runs"
+        );
+        *state = FlightState::Rejected;
+    }
+
+    /// End the flight when its permit is dropped, and wake every follower.
+    pub(crate) fn finish(&self) {
+        let mut state = self.lock();
+        if matches!(*state, FlightState::Running { .. }) {
+            *state = FlightState::Abandoned;
+        }
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn waiters(&self) -> usize {
+        self.waiters.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<V: Clone> Flight<V> {
+    /// Complete the flight with the value `publish` returns. `publish` runs
+    /// under the state lock and receives whether the flight was fenced, so a
+    /// concurrent [`Self::fence`] either happens first or after the value is
+    /// stored.
+    pub(crate) fn complete_with(&self, publish: impl FnOnce(bool) -> V) -> V {
+        let mut state = self.lock();
+        let FlightState::Running { fenced } = *state else {
+            panic!("a flight publishes once, while it runs");
+        };
+        let value = publish(fenced);
+        *state = FlightState::Completed(value.clone());
+        value
+    }
+
+    pub(crate) fn wait(&self, cancellation: &CancellationToken) -> Follow<V> {
+        let mut state = self.lock();
+        #[cfg(any(test, feature = "test-support"))]
+        self.waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        while matches!(*state, FlightState::Running { .. }) && !cancellation.is_cancelled() {
+            (state, _) = self
+                .wake
+                .wait_timeout(state, CANCELLATION_POLL)
+                .expect("single-flight state mutex poisoned while waiting");
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if cancellation.is_cancelled() {
+            return Follow::Cancelled;
+        }
+        match &*state {
+            FlightState::Completed(value) => Follow::Completed(value.clone()),
+            FlightState::Rejected => Follow::Rejected,
+            FlightState::Abandoned => Follow::Retry,
+            FlightState::Running { .. } => unreachable!("the wait loop exits only after Running"),
+        }
+    }
 }
 
 /// Leadership for one exact key. Dropping this without publication is the
@@ -528,10 +592,10 @@ where
     K: Eq + Hash,
 {
     key: K,
-    flight: Arc<InFlightMaterialization<V>>,
+    flight: Arc<Flight<Arc<V>>>,
     entries: Cache<K, ReadyValue<V>>,
     retain: fn(Arc<V>) -> Arc<dyn Send + Sync>,
-    in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
+    in_flight: FlightMap<K, Arc<V>>,
     live: Arc<Mutex<HashMap<K, Weak<V>>>>,
 }
 
@@ -557,22 +621,14 @@ where
         if live.len() > LIVE_REGISTRY_SWEEP_KEYS {
             live.retain(|_, weak| weak.strong_count() > 0);
         }
-        self.flight
-            .state
-            .lock()
-            .expect("complete-value single-flight state mutex poisoned")
-            .completed = Some(value);
+        self.flight.complete_with(|_| value);
     }
 
     /// Hand the current flight's deterministic rejection to its followers
     /// without retaining a value in the ready cache. The owner is responsible
     /// for keeping the exact-key reason available after this permit is dropped.
     pub fn publish_rejected(self) {
-        self.flight
-            .state
-            .lock()
-            .expect("complete-value single-flight state mutex poisoned")
-            .rejected = true;
+        self.flight.reject();
     }
 }
 
@@ -593,14 +649,7 @@ where
                 in_flight.remove(&self.key);
             }
         }
-        let mut state = self
-            .flight
-            .state
-            .lock()
-            .expect("complete-value single-flight state mutex poisoned");
-        state.running = false;
-        drop(state);
-        self.flight.wake.notify_all();
+        self.flight.finish();
     }
 }
 
@@ -669,6 +718,66 @@ mod tests {
         assert!(Arc::ptr_eq(&built, &value));
         assert_eq!(wait.waits, 1);
         assert!(wait.wait_ns > 0);
+    }
+
+    #[test]
+    #[hardwon("#10202: a cache clone must revive a live value after ready eviction")]
+    fn clone_revives_the_originals_live_value_after_eviction() {
+        let cache = cache(1, 1);
+        let clone = cache.clone();
+        let key = "shared-live".to_string();
+        let cancellation = CancellationToken::default();
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let held = Arc::new(7);
+        permit.publish_complete(Arc::clone(&held));
+
+        cache.evict_for_test(&key);
+        let (CompleteValueAcquisition::Cached { value: revived }, _) =
+            clone.acquire(&key, &cancellation)
+        else {
+            panic!("the clone must revive the held value")
+        };
+        assert!(Arc::ptr_eq(&held, &revived));
+
+        cache.evict_for_test(&key);
+        let (CompleteValueAcquisition::Cached { value: original }, _) =
+            cache.acquire(&key, &cancellation)
+        else {
+            panic!("the original must also revive the held value")
+        };
+        assert!(Arc::ptr_eq(&held, &original));
+    }
+
+    #[test]
+    #[hardwon("#10202: pre-cancelled acquisition must stop before a cold or ready key")]
+    fn pre_cancelled_acquisition_precedes_cold_and_ready_keys() {
+        let cache = cache(1, 1);
+        let key = "cancel-first".to_string();
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        let live = CancellationToken::default();
+
+        assert!(matches!(
+            cache.acquire(&key, &cancelled).0,
+            CompleteValueAcquisition::Cancelled
+        ));
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &live) else {
+            panic!("the live cold request must lead")
+        };
+        let held = Arc::new(11);
+        permit.publish_complete(Arc::clone(&held));
+
+        assert!(matches!(
+            cache.acquire(&key, &cancelled).0,
+            CompleteValueAcquisition::Cancelled
+        ));
+        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &live) else {
+            panic!("the live request must find the resident value")
+        };
+        assert!(Arc::ptr_eq(&held, &value));
     }
 
     #[test]

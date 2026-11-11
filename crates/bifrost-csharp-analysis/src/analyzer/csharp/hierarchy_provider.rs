@@ -12,12 +12,15 @@ use brokk_bifrost_core::analyzer::model::CodeUnit;
 
 use brokk_bifrost_core::analyzer::capabilities::DescendantIndexScope;
 
-use brokk_bifrost_core::analyzer::capabilities::{HierarchyAnswer, TypeHierarchyProvider};
+use brokk_bifrost_core::analyzer::capabilities::{
+    HierarchyAnswer, HierarchyOpenReason, TypeHierarchyProvider,
+};
 
 use brokk_bifrost_core::analyzer::capabilities::build_direct_descendant_index;
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
+use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::hierarchy::logical_direct_ancestors;
 use std::sync::Arc;
 
@@ -65,19 +68,38 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Result<HierarchyAnswer, brokk_bifrost_core::analyzer::capabilities::Cancelled> {
-        self.memo_caches.direct_descendant_index.read(
-            &memo_attribution(self),
-            |direct_descendant_index_memo| {
-                brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
-                    self,
-                    scope,
-                    code_unit,
-                    direct_descendant_index_memo,
-                    || build_direct_descendant_index(self, self, scope),
-                    |_| {},
-                )
-            },
-            |_| AuthorityInputs::SourceOf(&[brokk_bifrost_core::analyzer::model::Language::CSharp]),
-        )
+        self.memo_caches
+            .direct_descendant_index
+            .read(
+                &memo_attribution(self),
+                |direct_descendant_index_memo| {
+                    brokk_bifrost_analysis::analyzer::common::complete_descendant_query(
+                        self,
+                        scope,
+                        code_unit,
+                        direct_descendant_index_memo,
+                        || build_direct_descendant_index(self, self, scope),
+                        |_| {},
+                    )
+                },
+                |_| {
+                    AuthorityInputs::SourceOf(&[
+                        brokk_bifrost_core::analyzer::model::Language::CSharp,
+                    ])
+                },
+            )
+            .map(|mut answer| {
+                if self.pack_open_reason(&code_unit.fq_name(), None).is_some()
+                    || answer
+                        .edges
+                        .iter()
+                        .any(|edge| self.pack_open_reason(&edge.fq_name(), None).is_some())
+                {
+                    answer
+                        .open
+                        .push(HierarchyOpenReason::DescendantIndexUnavailable);
+                }
+                answer
+            })
     }
 }

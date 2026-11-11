@@ -525,6 +525,7 @@ fn pack_source(
             toolchains: Vec::new(),
         },
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "bifrost:summary-foundry/fixture".to_owned(),
             revision: Some(entry.id.clone()),
         },
@@ -537,6 +538,9 @@ fn pack_source(
         carried_sources: Vec::new(),
         cpp_portability: None,
         python_correspondence: None,
+        rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
         shards: vec![AuthoredShard {
             id: "summaries.fixture".to_owned(),
             activation: vec![ActivationSelector {
@@ -578,6 +582,8 @@ fn pack_source(
                     concurrency_effects: Vec::new(),
                     returned_callables: Vec::new(),
                     declared_effects: Vec::new(),
+                    subject_effects: Vec::new(),
+                    lifecycle_coverage: Vec::new(),
                     preconditions: None,
                     result_contracts: Vec::new(),
                     result_use_obligations: Vec::new(),

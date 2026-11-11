@@ -231,6 +231,9 @@ pub fn resolve_go_external_field<'a>(
 fn model_overlay_gap(error: SemanticModelOverlayBuildError) -> GoExternalFieldGap {
     match error {
         SemanticModelOverlayBuildError::Cancelled => GoExternalFieldGap::Cancelled,
+        SemanticModelOverlayBuildError::Open(open) => {
+            unreachable!("a Go-selected overlay read has no JVM-family part: {open:?}")
+        }
         SemanticModelOverlayBuildError::RetainedBytesExceeded(_)
         | SemanticModelOverlayBuildError::GoSurfaceTraversalExceeded => {
             GoExternalFieldGap::BudgetExhausted
@@ -579,6 +582,17 @@ pub fn bind_go_aggregate_operand_source(
     brokk_bifrost_analysis::analyzer::semantic::SemanticProviderError,
 > {
     use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::exact_source_for_procedure;
+    let _model_scope =
+        match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            workspace.analyzer(),
+        ) {
+            Ok(scope) => scope,
+            Err(_) => {
+                return Ok(GoAggregateSourceBinding::Incomplete(
+                    GoExternalFieldGap::SourceStateUnknown,
+                ));
+            }
+        };
     let incomplete = |gap| GoAggregateSourceBinding::Incomplete(gap);
     if cancellation.is_cancelled() {
         return Ok(incomplete(GoExternalFieldGap::Cancelled));
@@ -837,6 +851,9 @@ pub fn bind_go_aggregate_operand_source(
         brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete { value, .. } => value,
         brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Exceeded { .. } => {
             return Ok(incomplete(GoExternalFieldGap::BudgetExhausted));
+        }
+        brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Unavailable { .. } => {
+            return Ok(incomplete(GoExternalFieldGap::InitializerUnavailable));
         }
         brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Cancelled { .. } => {
             return Ok(incomplete(GoExternalFieldGap::Cancelled));
@@ -2896,6 +2913,8 @@ mod tests {
         let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
         for id in 0..5 {
             parts.values.push(SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(id),
                 kind: SemanticValueKind::Local,
                 source: SourceMappingId::new(0),
@@ -2976,6 +2995,8 @@ mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             for id in 0..2 {
                 parts.values.push(SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(id),
                     kind: SemanticValueKind::Temporary,
                     source: SourceMappingId::new(0),

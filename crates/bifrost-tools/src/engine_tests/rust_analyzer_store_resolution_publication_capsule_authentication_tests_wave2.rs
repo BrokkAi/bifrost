@@ -147,7 +147,7 @@ mod rust_departing_wave2_capsule_authentication_tests_tests {
                     );
                 }
                 let dense = fixture.dense;
-                store.conn.execute(move |conn| {
+                store.conn.execute_fixture(move |conn| {
                 assert_eq!(verify_capsule_artifact(conn,cached.witness(),&dense,&CancellationToken::default()).unwrap(),Verified);
                 let tx = conn.unchecked_transaction().unwrap();
                 tx.execute("UPDATE resolution_fragment_interiors SET publication_state='building' WHERE blob_id=?1",[witness.blob_id()]).unwrap();

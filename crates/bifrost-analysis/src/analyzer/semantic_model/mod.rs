@@ -21,8 +21,12 @@ pub mod catalog;
 pub mod csmi;
 #[doc(hidden)]
 pub mod dependency;
+pub mod rust_cargo_graph;
+pub mod rust_qualified_path;
+pub use rust_cargo_graph::*;
 #[doc(hidden)]
 pub mod overlay;
+pub mod python_runtime_bases;
 #[doc(hidden)]
 pub mod runtime;
 pub use artifact::ArtifactEncoding;

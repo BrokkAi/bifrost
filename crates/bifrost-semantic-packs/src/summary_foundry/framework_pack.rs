@@ -490,6 +490,7 @@ impl PackIdentity {
                 toolchains: self.toolchains.clone(),
             },
             Provenance {
+                rust_artifact_approximation: None,
                 source: self.provenance_source.clone(),
                 revision: Some("framework-decls".to_owned()),
             },

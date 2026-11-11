@@ -159,7 +159,7 @@ pub(crate) use brokk_bifrost_core::analyzer::usages::common::enclosing_owner_cha
 
 // These maps belong to one usage operation, which can serve several nested
 // read captures. Each immutable answer carries its own transitive inputs.
-pub(super) type QueryReadMemo<K, V> = crate::analyzer::workspace_authority::ReplayingMemo<
+pub(crate) type QueryReadMemo<K, V> = crate::analyzer::workspace_authority::ReplayingMemo<
     std::sync::Mutex<
         crate::hash::HashMap<
             K,
@@ -173,13 +173,47 @@ pub(super) type QueryReadMemo<K, V> = crate::analyzer::workspace_authority::Repl
     >,
 >;
 
-pub(super) fn query_read_memo<K, V>() -> QueryReadMemo<K, V> {
+pub(crate) fn query_read_memo<K, V>() -> QueryReadMemo<K, V> {
     crate::analyzer::workspace_authority::ReplayingMemo::new(std::sync::Mutex::new(
         crate::hash::HashMap::default(),
     ))
 }
 
-pub(super) fn query_memo_value<K: Clone + Eq + std::hash::Hash, V>(
+// Recursive expression proofs can ask this same memo about a child. Build
+// outside its lock; concurrent immutable fills may race, and the retained
+// entry always carries the complete receipt of the fill that won insertion.
+pub(crate) fn query_reentrant_memo_value<K: Clone + Eq + std::hash::Hash, V>(
+    memo: &QueryReadMemo<K, V>,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    key: &K,
+    build: impl FnOnce() -> V,
+    retain: impl FnOnce(&V) -> bool,
+) -> impl std::ops::Deref<Target = V> {
+    memo.read(
+        &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+        |entries, capture| {
+            if let Some(value) = entries
+                .lock()
+                .expect("usage read memo poisoned")
+                .get(key)
+                .cloned()
+            {
+                return Ok::<_, std::convert::Infallible>(value);
+            }
+            let value = std::sync::Arc::new(capture.build(build));
+            if !retain(value.value()) {
+                return Ok(value);
+            }
+            let mut entries = entries.lock().expect("usage read memo poisoned");
+            Ok(std::sync::Arc::clone(
+                entries.entry(key.clone()).or_insert(value),
+            ))
+        },
+    )
+    .expect("usage memo acquisition is infallible")
+}
+
+pub(crate) fn query_memo_value<K: Clone + Eq + std::hash::Hash, V>(
     memo: &QueryReadMemo<K, V>,
     analyzer: &dyn crate::analyzer::IAnalyzer,
     key: &K,
@@ -197,6 +231,28 @@ pub(super) fn query_memo_value<K: Clone + Eq + std::hash::Hash, V>(
         },
     )
     .expect("usage memo acquisition is infallible")
+}
+
+/// Like [`query_memo_value`], but an `Err` answer (such as a cancellation) is
+/// returned without being retained, so a later request recomputes it.
+pub(crate) fn query_memo_result<K: Clone + Eq + std::hash::Hash, V, E>(
+    memo: &QueryReadMemo<K, V>,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    key: &K,
+    build: impl FnOnce() -> Result<V, E>,
+) -> Result<impl std::ops::Deref<Target = V>, E> {
+    memo.read(
+        &crate::analyzer::workspace_authority::memo_attribution(analyzer),
+        |entries, capture| {
+            let mut entries = entries.lock().expect("usage read memo poisoned");
+            if let Some(entry) = entries.get(key) {
+                return Ok(std::sync::Arc::clone(entry));
+            }
+            let entry = std::sync::Arc::new(capture.try_build(build)?);
+            entries.insert(key.clone(), std::sync::Arc::clone(&entry));
+            Ok(entry)
+        },
+    )
 }
 
 /// A shared replay wrapper for the inputs of mutable request state. These
@@ -229,6 +285,18 @@ pub fn capture_memo_reads<T>(
         )
         .expect("request input capture is infallible");
     (value.expect("request builder ran"), reads)
+}
+
+/// Whether a native answer's diagnostic reports that the operation itself
+/// failed: a stale selection, a store error or an unavailable native engine. A
+/// retained native request is released after one. Any other completed answer,
+/// including an incomplete or unprojectable one, leaves the request and its
+/// completed candidate artifacts usable for the next site.
+pub fn is_native_operation_failure(kind: &str) -> bool {
+    matches!(
+        kind,
+        "native_stale" | "native_store_error" | "native_unavailable"
+    )
 }
 
 pub fn replay_memo_reads(reads: &QueryMemoReads, analyzer: &dyn crate::analyzer::IAnalyzer) {
@@ -277,6 +345,28 @@ mod memo_read_tests {
                 capture_query_reads(&analyzer, || replay_memo_reads(&receipt, &analyzer));
             assert_eq!(reads.keys(), vec![key.clone()]);
             assert_eq!(reads.unattributed_reads(), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_operation_failure_tests {
+    use super::is_native_operation_failure;
+
+    // The shared native point layer (native_points.rs) reports these three kinds
+    // when the operation itself failed. An unprojectable or missing answer is
+    // not one, so a retained request keeps its candidate artifacts after it.
+    #[test]
+    fn only_operation_failures_release_a_retained_request() {
+        for kind in ["native_stale", "native_store_error", "native_unavailable"] {
+            assert!(is_native_operation_failure(kind), "{kind}");
+        }
+        for kind in [
+            "native_type_projection_unavailable",
+            "native_reference_missing",
+            "incomplete_binding",
+        ] {
+            assert!(!is_native_operation_failure(kind), "{kind}");
         }
     }
 }

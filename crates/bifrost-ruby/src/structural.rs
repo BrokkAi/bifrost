@@ -976,6 +976,11 @@ impl StructuralSpec for RubyStructuralSpec {
         ruby_integer_literal_value(node, source)
     }
 
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::Import]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         RUBY_KIND_TABLE
     }

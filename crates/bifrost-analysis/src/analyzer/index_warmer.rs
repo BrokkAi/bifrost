@@ -40,25 +40,104 @@ pub struct IndexWarmer {
 
 #[derive(Default)]
 struct IndexWarmerState {
-    running: bool,
-    pending: Option<Arc<WorkspaceAnalyzer>>,
-    attempted_snapshot: Weak<WorkspaceAnalyzer>,
-    attempted_kinds: u8,
+    worker: Worker,
+    claims: Claims,
+}
+
+/// The warm thread. A snapshot can wait only behind a running warm.
+#[derive(Default)]
+enum Worker {
+    #[default]
+    Idle,
+    Running {
+        pending: Option<Arc<WorkspaceAnalyzer>>,
+    },
+}
+
+/// The index kinds already attempted for the most recently claimed snapshot.
+/// A weak identity never holds a superseded workspace (or its SQLite handles).
+#[derive(Default)]
+struct Claims {
+    snapshot: Weak<WorkspaceAnalyzer>,
+    kinds: u8,
 }
 
 const QUERY: u8 = 1;
 const STRUCTURAL: u8 = 2;
 
-impl IndexWarmerState {
-    // A weak identity never holds a superseded workspace (or its SQLite handles).
+impl Claims {
     fn claim(&mut self, snapshot: &Arc<WorkspaceAnalyzer>, outstanding: u8) -> bool {
-        if !self.attempted_snapshot.ptr_eq(&Arc::downgrade(snapshot)) {
-            self.attempted_snapshot = Arc::downgrade(snapshot);
-            self.attempted_kinds = 0;
+        if !self.snapshot.ptr_eq(&Arc::downgrade(snapshot)) {
+            self.reset(snapshot);
         }
-        let new_kinds = outstanding & !self.attempted_kinds;
-        self.attempted_kinds |= outstanding;
+        let new_kinds = outstanding & !self.kinds;
+        self.kinds |= outstanding;
         new_kinds != 0
+    }
+
+    fn reset(&mut self, snapshot: &Arc<WorkspaceAnalyzer>) {
+        self.snapshot = Arc::downgrade(snapshot);
+        self.kinds = 0;
+    }
+}
+
+impl IndexWarmerState {
+    /// Claims the snapshot's outstanding kinds. Returns true when the caller
+    /// must start the warm thread; a running thread picks the snapshot up as
+    /// its trailing warm instead.
+    fn schedule(&mut self, snapshot: &Arc<WorkspaceAnalyzer>, outstanding: u8) -> bool {
+        if !self.claims.claim(snapshot, outstanding) {
+            return false;
+        }
+        match &mut self.worker {
+            Worker::Running { pending } => {
+                *pending = Some(Arc::clone(snapshot));
+                false
+            }
+            Worker::Idle => {
+                self.worker = Worker::Running { pending: None };
+                true
+            }
+        }
+    }
+
+    /// Ends a warm of `current` that returned. Returns the snapshot to warm
+    /// next, or `None` after the worker went idle.
+    fn finish_warmed(
+        &mut self,
+        current: &Arc<WorkspaceAnalyzer>,
+        outstanding: impl FnOnce() -> u8,
+    ) -> Option<Arc<WorkspaceAnalyzer>> {
+        if self.claims.snapshot.ptr_eq(&Arc::downgrade(current)) {
+            // A retained index may become outstanding again on this
+            // snapshot when a new structural posting is requested.
+            // Refused indexes remain outstanding and keep their claim.
+            self.claims.kinds &= outstanding();
+        }
+        let Worker::Running { pending } = &mut self.worker else {
+            unreachable!("only the running warm thread finishes a warm");
+        };
+        let next = pending.take();
+        if next.is_none() {
+            self.worker = Worker::Idle;
+        }
+        next
+    }
+
+    /// Ends a warm of `current` that panicked. A panicking index build
+    /// installs nothing, so the same panic resurfaces in whichever request
+    /// first demands the index. Clear this snapshot's claim so a later
+    /// schedule can retry. Restore its identity first: scheduling a pending
+    /// snapshot may have moved the claim, and that pending snapshot must be
+    /// able to reclaim on its next schedule.
+    ///
+    /// The worker goes idle and drops the pending snapshot rather than warming
+    /// it: after a panic nothing is warmed until the next schedule
+    /// (`pending_snapshot_can_reclaim_after_a_warm_panics`).
+    fn finish_panicked(&mut self, current: &Arc<WorkspaceAnalyzer>) {
+        self.claims.reset(current);
+        assert!(matches!(self.worker, Worker::Running { .. }));
+        self.worker = Worker::Idle;
     }
 }
 
@@ -100,14 +179,9 @@ impl IndexWarmer {
             return;
         }
         let mut state = self.state.lock().expect("index warmer lock poisoned");
-        if !state.claim(&snapshot, outstanding) {
+        if !state.schedule(&snapshot, outstanding) {
             return;
         }
-        if state.running {
-            state.pending = Some(snapshot);
-            return;
-        }
-        state.running = true;
         drop(state);
         let warmer = Arc::clone(self);
         // Keep background warming off the global Rayon pool used by
@@ -163,21 +237,11 @@ impl IndexWarmer {
                 }));
                 let mut state = warmer.state.lock().expect("index warmer lock poisoned");
                 if let Err(panic) = outcome {
-                    // A panicking index build installs nothing, so the same
-                    // panic resurfaces in whichever request first demands the
-                    // index. Clear this snapshot's claim so a later schedule
-                    // can retry. Restore its identity first: scheduling a
-                    // pending snapshot may have moved the claim, and that
-                    // pending snapshot must be able to reclaim on its next
-                    // schedule. The panic
-                    // hook has already reported the original panic, and this
-                    // contextual diagnostic explains why the server remains
-                    // alive rather than unwinding through Rayon's unowned
-                    // spawn, which would abort the process.
-                    state.attempted_snapshot = Arc::downgrade(&current);
-                    state.attempted_kinds = 0;
-                    state.pending = None;
-                    state.running = false;
+                    // The panic hook has already reported the original panic,
+                    // and the contextual diagnostic below explains why the
+                    // server remains alive rather than unwinding through
+                    // Rayon's unowned spawn, which would abort the process.
+                    state.finish_panicked(&current);
                     // Release the snapshot before publishing idle. On Windows,
                     // it can own SQLite handles that prevent temporary cleanup.
                     drop(current);
@@ -197,18 +261,11 @@ impl IndexWarmer {
                         .swap(0, std::sync::atomic::Ordering::AcqRel),
                     std::sync::atomic::Ordering::AcqRel,
                 );
-                if state.attempted_snapshot.ptr_eq(&Arc::downgrade(&current)) {
-                    // A retained index may become outstanding again on this
-                    // snapshot when a new structural posting is requested.
-                    // Refused indexes remain outstanding and keep their claim.
-                    state.attempted_kinds &= warmer.outstanding(&current);
-                }
+                next = state.finish_warmed(&current, || warmer.outstanding(&current));
                 // Release the snapshot before publishing idle. On Windows,
                 // it can own SQLite handles that prevent temporary cleanup.
                 drop(current);
-                next = state.pending.take();
                 if next.is_none() {
-                    state.running = false;
                     warmer.idle.notify_all();
                 }
             }
@@ -232,13 +289,15 @@ impl IndexWarmer {
         let state = self.state.lock().expect("index warmer lock poisoned");
         let (state, timeout) = self
             .idle
-            .wait_timeout_while(state, Duration::from_secs(30), |state| state.running)
+            .wait_timeout_while(state, Duration::from_secs(30), |state| {
+                matches!(state.worker, Worker::Running { .. })
+            })
             .expect("index warmer lock poisoned while waiting for idle");
         assert!(
             !timeout.timed_out(),
             "background index warm did not complete"
         );
-        assert!(!state.running);
+        assert!(matches!(state.worker, Worker::Idle));
     }
 }
 
@@ -379,7 +438,7 @@ mod capture_tests {
         let warmer = IndexWarmer::new();
         let (_, reads) = capture_query_reads(&analyzer, || {
             warmer.wait_until_idle();
-            assert!(warmer.state.lock().unwrap().pending.is_none());
+            assert!(matches!(warmer.state.lock().unwrap().worker, Worker::Idle));
         });
         assert!(reads.keys().is_empty());
     }

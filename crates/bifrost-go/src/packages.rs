@@ -49,8 +49,57 @@ pub struct GoWorkspacePathIndex {
     vendor_roots: Vec<PathBuf>,
     representative_by_directory: HashMap<PathBuf, ProjectFile>,
     exact_import_paths: HashSet<String>,
-    complete: bool,
-    completion: Vec<(u8, String)>,
+    /// Why the inventory is not whole; empty when it is. Structural gaps come
+    /// first in discovery order, then the read gaps in their stable order.
+    gaps: Vec<GoWorkspacePathGap>,
+}
+
+/// One reason the workspace path inventory cannot prove a package absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoWorkspacePathGap {
+    /// The whole-workspace file listing failed.
+    FileListing,
+    /// A listed `go.mod` was unreadable or lexically invalid, or a named
+    /// module's path violates Go's module-path element restrictions.
+    ModuleRoots,
+    /// A Go file inside a named module supplied no nonempty `package` clause
+    /// and was not refused by source admission.
+    MissingPackageClause(ProjectFile),
+    /// A read issued while the index was built was incomplete.
+    Read(GoReadGap),
+}
+
+/// A position-free read gap, ordered and hashed by kind and then detail.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GoReadGap {
+    pub kind: GoReadGapKind,
+    /// A workspace-relative path or a stable gap description.
+    pub detail: String,
+}
+
+/// Declaration order is the stable order of the hashed kind codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GoReadGapKind {
+    StructureUnavailable,
+    ArtifactUnavailable,
+    SemanticEvidenceGap,
+}
+
+impl GoReadGap {
+    /// The bytes certificates have always hashed for a gap: a kind code,
+    /// then the detail.
+    pub fn hash_into(
+        &self,
+        hash: &mut brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher,
+    ) {
+        let code: u8 = match self.kind {
+            GoReadGapKind::StructureUnavailable => 1,
+            GoReadGapKind::ArtifactUnavailable => 2,
+            GoReadGapKind::SemanticEvidenceGap => 3,
+        };
+        hash.value(&[code]);
+        hash.value(self.detail.as_bytes());
+    }
 }
 
 impl GoWorkspacePathIndex {
@@ -61,7 +110,13 @@ impl GoWorkspacePathIndex {
         use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
         use brokk_bifrost_core::path_utils::{rel_path_string, workspace_relative_slash_path};
         let mut hash = CanonicalHasher::new(b"go-workspace-paths-v3");
-        hash.value(&[u8::from(self.complete)]);
+        // The v3 layout keeps structural completeness as a leading byte and
+        // lists only the read gaps at the end.
+        let structurally_complete = self
+            .gaps
+            .iter()
+            .all(|gap| matches!(gap, GoWorkspacePathGap::Read(_)));
+        hash.value(&[u8::from(structurally_complete)]);
         for root in &self.module_roots {
             hash.value(root.import_path.as_bytes());
             hash.value(workspace_relative_slash_path(&root.workspace_dir).as_bytes());
@@ -85,31 +140,40 @@ impl GoWorkspacePathIndex {
             hash.value(dir.as_bytes());
             hash.value(file.as_bytes());
         });
-        hash.sequence("completion", &self.completion, |hash, (kind, detail)| {
-            hash.value(&[*kind]);
-            hash.value(detail.as_bytes());
-        });
+        let read_gaps = self
+            .gaps
+            .iter()
+            .filter_map(|gap| match gap {
+                GoWorkspacePathGap::Read(gap) => Some(gap),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        hash.sequence("completion", &read_gaps, |hash, gap| gap.hash_into(hash));
         hash.finish()
-    }
-
-    pub fn set_completion(&mut self, completion: Vec<(u8, String)>) {
-        self.completion = completion;
     }
 
     /// `refused_sources` are the sources that source admission refused at the
     /// selected revision. They supply no `package` clause and no facts, but
     /// they are explained exclusions rather than missing inventory.
+    /// `captured_read_gaps` runs once, after the last `declared_package` call,
+    /// so it sees every read the build issued; it returns them sorted and
+    /// deduplicated.
     pub fn build(
         project: &dyn Project,
         mut declared_package: impl FnMut(&ProjectFile) -> Option<String>,
         refused_sources: &HashSet<ProjectFile>,
+        captured_read_gaps: impl FnOnce() -> Vec<GoReadGap>,
     ) -> Self {
-        let (files, complete) = match project.all_files() {
-            Ok(files) => (files, true),
-            Err(_) => (Default::default(), false),
-        };
+        let mut gaps = Vec::new();
+        let files = project.all_files().unwrap_or_else(|_| {
+            gaps.push(GoWorkspacePathGap::FileListing);
+            Default::default()
+        });
         let (module_roots, unnamed_module_roots, module_roots_complete) =
             go_module_roots_from_files(project, &files);
+        if !module_roots_complete {
+            gaps.push(GoWorkspacePathGap::ModuleRoots);
+        }
         let mut vendor_roots = files
             .iter()
             .filter_map(|file| go_vendor_root(file.rel_path()).map(Path::to_path_buf))
@@ -145,8 +209,7 @@ impl GoWorkspacePathIndex {
             vendor_roots,
             representative_by_directory,
             exact_import_paths: HashSet::default(),
-            complete: complete && module_roots_complete,
-            completion: Vec::new(),
+            gaps: Vec::new(),
         };
         let mut exact_import_paths = HashSet::default();
         for file in &go_files {
@@ -167,7 +230,7 @@ impl GoWorkspacePathIndex {
                             exact_import_paths.insert(package);
                         }
                     }
-                    None => index.complete = false,
+                    None => gaps.push(GoWorkspacePathGap::MissingPackageClause(file.clone())),
                 }
                 continue;
             };
@@ -179,6 +242,13 @@ impl GoWorkspacePathIndex {
             exact_import_paths.insert(canonical);
         }
         index.exact_import_paths = exact_import_paths;
+        let read_gaps = captured_read_gaps();
+        assert!(
+            read_gaps.is_sorted() && read_gaps.windows(2).all(|pair| pair[0] != pair[1]),
+            "read gaps must be sorted and deduplicated: {read_gaps:?}"
+        );
+        gaps.extend(read_gaps.into_iter().map(GoWorkspacePathGap::Read));
+        index.gaps = gaps;
         index
     }
 
@@ -187,14 +257,30 @@ impl GoWorkspacePathIndex {
     /// `go.mod` was readable and lexically valid, each named module's decoded
     /// path satisfies Go's module-path element restrictions, and every Go file
     /// inside a named module supplied a nonempty parsed `package` clause or
-    /// was refused by source admission.
+    /// was refused by source admission, and no read issued while building was
+    /// incomplete.
     /// A valid manifest without a module directive is an unnamed module
     /// boundary, so its files are excluded from the package inventory. Other
     /// go.mod directives are not semantically validated. When this is false,
     /// positive lookup evidence remains usable, but a missing package is not
     /// proof that the package is absent.
     pub const fn is_complete(&self) -> bool {
-        self.complete
+        self.gaps.is_empty()
+    }
+
+    /// Inventory authority for a usage graph that reports these source
+    /// exclusions by name. Resolution, hierarchy and reverse imports keep
+    /// `is_complete`: an excluded source can still hold a declaration that
+    /// shadows a selected target, an implementation, or a reference.
+    pub fn is_complete_excluding_sources(&self, excluded: &HashSet<ProjectFile>) -> bool {
+        self.gaps.iter().all(|gap| match gap {
+            GoWorkspacePathGap::Read(gap) if gap.kind == GoReadGapKind::StructureUnavailable => {
+                excluded
+                    .iter()
+                    .any(|file| brokk_bifrost_core::path_utils::rel_path_string(file) == gap.detail)
+            }
+            _ => false,
+        })
     }
 
     pub fn import_files(&self, source_file: &ProjectFile, import_path: &str) -> Vec<ProjectFile> {
@@ -748,19 +834,7 @@ impl std::ops::Deref for GoModuleInputs {
     }
 }
 
-/// The exact non-source probes behind a cached nearest-module answer.
-#[derive(Clone, Debug)]
-pub enum GoModuleInput {
-    File {
-        rel_path: String,
-        blob: [u8; 20],
-        content_digest: [u8; 32],
-    },
-    PathAbsent {
-        rel_path: String,
-    },
-    Unavailable,
-}
+pub use brokk_bifrost_core::analyzer::project::IdentityWalkInput as GoModuleInput;
 
 /// Replays the receipt, including negative probes, while the entry is resident.
 /// An evicted entry is re-probed from disk and its newly computed receipt is
@@ -1293,6 +1367,7 @@ mod tests {
             &project,
             |_| Some("pkg".to_owned()),
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
         assert!(complete.is_complete());
         assert!(complete.exact_package_exists("example.com/repo/pkg"));
@@ -1301,6 +1376,7 @@ mod tests {
             &UnlistableProject { delegate: project },
             |_| Some("pkg".to_owned()),
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
         assert!(!incomplete.is_complete());
         assert!(!incomplete.exact_package_exists("example.com/repo/pkg"));
@@ -1323,6 +1399,7 @@ mod tests {
             &UnreadableManifestProject { delegate: project },
             |_| Some("pkg".to_owned()),
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
         assert!(!incomplete.is_complete());
         assert!(!incomplete.exact_package_exists("example.com/repo/pkg"));
@@ -1360,6 +1437,7 @@ mod tests {
                 )
             },
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
 
         assert!(index.is_complete());
@@ -1431,6 +1509,7 @@ mod tests {
                 )
             },
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
         assert_eq!(
             index.canonical_package_name(&ordinary, "ordinary_test"),
@@ -1823,6 +1902,7 @@ mod tests {
                 }
             },
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
 
         assert!(index.is_complete());

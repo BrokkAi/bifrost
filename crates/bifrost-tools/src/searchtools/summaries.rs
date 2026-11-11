@@ -73,22 +73,17 @@ fn summary_read_reason(
     reason: QueryReadIncomplete,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> SummaryIncompleteReason {
-    match reason {
-        QueryReadIncomplete::Cancelled
-            if cancellation.is_some_and(|token| token.is_timed_out()) =>
-        {
+    match reason.label() {
+        "cancelled" if cancellation.is_some_and(|token| token.is_timed_out()) => {
             SummaryIncompleteReason::TimeBudget
         }
-        QueryReadIncomplete::Cancelled => SummaryIncompleteReason::Cancelled,
-        QueryReadIncomplete::StructureUnavailable(_) => {
-            SummaryIncompleteReason::StructureUnavailable
-        }
-        QueryReadIncomplete::SemanticEvidenceUnavailable(_) => {
-            SummaryIncompleteReason::SemanticEvidenceUnavailable
-        }
-        QueryReadIncomplete::ArtifactUnavailable(_) => SummaryIncompleteReason::ArtifactUnavailable,
-        QueryReadIncomplete::SemanticEvidenceGap(_) => SummaryIncompleteReason::SemanticEvidenceGap,
-        QueryReadIncomplete::StoreFailure(_) => SummaryIncompleteReason::StoreFailure,
+        "cancelled" => SummaryIncompleteReason::Cancelled,
+        "structure_unavailable" => SummaryIncompleteReason::StructureUnavailable,
+        "semantic_evidence_unavailable" => SummaryIncompleteReason::SemanticEvidenceUnavailable,
+        "artifact_unavailable" => SummaryIncompleteReason::ArtifactUnavailable,
+        "semantic_evidence_gap" => SummaryIncompleteReason::SemanticEvidenceGap,
+        "store_failure" => SummaryIncompleteReason::StoreFailure,
+        label => unreachable!("unregistered query read reason: {label}"),
     }
 }
 
@@ -1483,6 +1478,27 @@ fn most_relevant_files_with_ranker(
         files.clear();
         complete = false;
         incomplete_reason = Some(most_relevant_files_incomplete_reason(cancellation));
+    }
+
+    let incomplete = crate::result_incomplete::query_read_incomplete(&scope);
+    if !incomplete.is_empty() {
+        complete = false;
+        use MostRelevantFilesIncompleteReason as R;
+        incomplete_reason = Some(
+            if incomplete.iter().any(|entry| {
+                entry.reason == crate::result_incomplete::ToolResultIncompleteReason::Cancelled
+            }) {
+                most_relevant_files_incomplete_reason(cancellation)
+            } else {
+                match incomplete_reason {
+                    Some(reason @ (R::Cancelled | R::TimeBudget)) => reason,
+                    Some(R::HistoryUnavailable | R::UsageGraphIncompleteAndHistoryUnavailable) => {
+                        R::UsageGraphIncompleteAndHistoryUnavailable
+                    }
+                    _ => R::UsageGraphIncomplete,
+                }
+            },
+        );
     }
 
     Ok(MostRelevantFilesResult {

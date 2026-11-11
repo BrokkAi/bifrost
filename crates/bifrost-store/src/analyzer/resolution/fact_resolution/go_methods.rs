@@ -723,6 +723,7 @@ impl FactEvaluation<'_, '_> {
             InternedFactRow<SelectedTypedRow<LoweredCallableSignatureProperty>>,
         >,
         states: &StateMap,
+        provider: Option<&dyn DemandRootProvider>,
     ) -> StoreResult<Option<ResolutionAnswer>> {
         if answer.targets().len() < 2 {
             return Ok(Some(answer));
@@ -776,8 +777,12 @@ impl FactEvaluation<'_, '_> {
                 };
                 let base_signature = base_signature.get(self.session).row().clone();
                 let derived_signature = derived_signature.get(self.session).row().clone();
-                if self.go_compare_signature_types(&base_signature, &derived_signature, states)?
-                    == GoMethodSatisfaction::Satisfies
+                if self.go_compare_signature_types(
+                    &base_signature,
+                    &derived_signature,
+                    states,
+                    provider,
+                )? == GoMethodSatisfaction::Satisfies
                 {
                     break;
                 }
@@ -1012,6 +1017,7 @@ impl FactEvaluation<'_, '_> {
         receiver: ResolutionSlotValue,
         rows: &[LoweredDeferredMemberOwner],
         states: &StateMap,
+        provider: Option<&dyn DemandRootProvider>,
     ) -> StoreResult<GoMemberSearchPreparation> {
         let root = receiver.ty().identity();
         let mut receiver_is_interface = false;
@@ -1524,7 +1530,7 @@ impl FactEvaluation<'_, '_> {
                 let signatures = signatures.into_iter().map(|row| (row.get(self.session).row().definition(), row)).collect();
                 let Some(answer) = self.filter_go_interface_methods(
                     ResolutionAnswer::new(definitions, Vec::new(), completion),
-                    &signatures, states,
+                    &signatures, states, provider,
                 )? else {
                     return Ok(GoMemberSearchPreparation::Missing);
                 };
@@ -1885,7 +1891,11 @@ impl FactResolutionOperation<'_> {
                 result.receiver_is_interface = matches!(evaluation.session.go_member_declarations.get(&receiver.identity()),
                     Some(Some(declaration)) if matches!(declaration.kind, GoMemberDeclarationKind::Interface { .. }));
                 let search = loop {
-                    match evaluation.go_receiver_members(request.reference, request.lookup, request.values[0], &rows, states)? {
+                    let preparation = {
+                        let provider = provider.borrow();
+                        evaluation.go_receiver_members(request.reference, request.lookup, request.values[0], &rows, states, Some(&**provider))?
+                    };
+                    match preparation {
                         GoMemberSearchPreparation::Ready(search) => break search,
                         GoMemberSearchPreparation::Missing | GoMemberSearchPreparation::Pending => return Ok(()),
                         GoMemberSearchPreparation::AwaitingHierarchy(roots) => {
@@ -1994,6 +2004,9 @@ impl FactResolutionOperation<'_> {
         {
             Some(BoundedResolution::Exceeded { .. }) => Some(
                 ResolutionIncompleteReason::ReceiverBudgetExhausted(request.reference),
+            ),
+            Some(BoundedResolution::Unavailable { .. }) => Some(
+                ResolutionIncompleteReason::UnsupportedSemantic(request.reference),
             ),
             Some(BoundedResolution::Cancelled { .. }) => {
                 Some(ResolutionIncompleteReason::Cancelled)
@@ -2528,6 +2541,7 @@ impl FactEvaluation<'_, '_> {
         required: SemanticId,
         states: &StateMap,
         method_identity: &mut impl FnMut(SemanticId) -> StoreResult<Option<(String, i64)>>,
+        provider: Option<&dyn DemandRootProvider>,
     ) -> StoreResult<GoMethodSatisfaction> {
         use GoMethodSatisfaction::*;
         let Some((required_name, required_package)) = method_identity(required)? else {
@@ -2560,7 +2574,7 @@ impl FactEvaluation<'_, '_> {
         else {
             return Ok(Inconclusive("method signature is unavailable"));
         };
-        self.go_compare_signature_types(candidate_signature, required_signature, states)
+        self.go_compare_signature_types(candidate_signature, required_signature, states, provider)
     }
 
     fn go_compare_signature_types(
@@ -2568,6 +2582,7 @@ impl FactEvaluation<'_, '_> {
         candidate_signature: &LoweredCallableSignatureProperty,
         required_signature: &LoweredCallableSignatureProperty,
         states: &StateMap,
+        provider: Option<&dyn DemandRootProvider>,
     ) -> StoreResult<GoMethodSatisfaction> {
         use GoMethodSatisfaction::*;
         if candidate_signature.parameters().len() != required_signature.parameters().len()
@@ -2627,6 +2642,7 @@ impl FactEvaluation<'_, '_> {
                                         states,
                                         candidate_signature,
                                         candidate_complete,
+                                        provider,
                                     )?,
                                     None => None,
                                 };
@@ -2637,6 +2653,7 @@ impl FactEvaluation<'_, '_> {
                                         states,
                                         required_signature,
                                         required_complete,
+                                        provider,
                                     )?,
                                     None => None,
                                 };
@@ -2665,6 +2682,7 @@ impl FactEvaluation<'_, '_> {
         states: &StateMap,
         signature: &LoweredCallableSignatureProperty,
         inventory: Option<bool>,
+        provider: Option<&dyn DemandRootProvider>,
     ) -> StoreResult<Option<CanonicalTypeIdentity>> {
         if !shape.supported() {
             return Ok(None);
@@ -2720,6 +2738,87 @@ impl FactEvaluation<'_, '_> {
                 continue;
             }
             let identity = node.identity();
+            // A repeated semantic may have a different slot provenance. Check
+            // each occurrence before canonical identity deduplication.
+            if self
+                .session
+                .context_identities
+                .as_ref()
+                .is_some_and(|identities| {
+                    identities.external_owner_language(identity)
+                        == Some(super::super::ExternalOwnerLanguage::Go)
+                        && identities.external_owner_identity(identity).is_some()
+                })
+            {
+                let Some(provider) = provider else {
+                    return Ok(None);
+                };
+                let read = self.session.projections_for_outputs(&[node.slot()])?;
+                let Some(projections) = self.accept_session_read(read) else {
+                    return Ok(None);
+                };
+                let mut provenance = projections
+                    .iter()
+                    .filter_map(|selected| {
+                        let row = selected.get(self.session).row();
+                        matches!(
+                            row.kind(),
+                            BindingProjectionKind::TargetTypeIdentity
+                                | BindingProjectionKind::TargetNominalTypeIdentity
+                        )
+                        .then_some((row.reference(), row.output_slot()))
+                    })
+                    .collect::<Vec<_>>();
+                if provenance.len() != 1 || projections.len() != 1 {
+                    provenance.clear();
+                    let read = self.session.transfers_to_targets(&[node.slot()])?;
+                    let Some(transfers) = self.accept_session_read(read) else {
+                        return Ok(None);
+                    };
+                    let matching = transfers
+                        .iter()
+                        .filter_map(|selected| {
+                            let row = selected.get(self.session).row();
+                            (row.kind() == ResolutionTypeTransferKind::DeclaredType
+                                && row.rule().target_slot() == node.slot()
+                                && row.rule().completion() == &ResolutionCompletion::Complete
+                                && row.rule().reference_indirection_delta() == 0
+                                && row.rule().indirection_delta() == 0
+                                && row.rule().value_transform()
+                                    != TypeTransferValueTransform::ToNoValue)
+                                .then_some(row.source_slot())
+                        })
+                        .collect::<Vec<_>>();
+                    let [source] = matching.as_slice() else {
+                        return Ok(None);
+                    };
+                    let read = self.session.projections_for_outputs(&[*source])?;
+                    let Some(source_rows) = self.accept_session_read(read) else {
+                        return Ok(None);
+                    };
+                    let [selected] = &*source_rows else {
+                        return Ok(None);
+                    };
+                    let row = selected.get(self.session).row();
+                    if !matches!(row.kind(), BindingProjectionKind::TargetTypeIdentity | BindingProjectionKind::TargetNominalTypeIdentity)
+                        || states.get(source).is_none_or(|state| state.completion() != &ResolutionCompletion::Complete
+                            || !matches!(state.possible_values(), [value] if value.ty().identity() == identity)) {
+                        return Ok(None);
+                    }
+                    provenance.push((row.reference(), row.output_slot()));
+                }
+                let [(reference, slot)] = provenance.as_slice() else {
+                    return Ok(None);
+                };
+                // The projected shape does not carry the model declaration kind;
+                // the certifier still checks the independently selected semantic.
+                if provider
+                    .certify_external_owner(*reference, *slot, identity, None)
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+            }
             if leaves.contains_key(&identity) {
                 continue;
             }
@@ -2844,9 +2943,10 @@ impl FactEvaluation<'_, '_> {
                 .into_iter()
                 .map(|row| *row.get(self.session).row())
                 .collect::<Vec<_>>();
-            for row in &rows {
-                self.demand_slot(row.owner_frontier());
-            }
+            // Owner frontiers are not demanded here. go_receiver_members demands
+            // only the frontiers its selected source owner proof cannot decide
+            // (Unknown, or Matches without complete placement); a proven
+            // DoesNotMatch or a complete Matches never reads its slot.
             let definitions = rows.iter().map(|row| row.definition()).collect::<Vec<_>>();
             if !self.session.ensure_go_member_declarations(&definitions)? {
                 return Ok(None);
@@ -2858,6 +2958,7 @@ impl FactEvaluation<'_, '_> {
                     receiver,
                     &rows,
                     states,
+                    Some(&*provider),
                 )? {
                     GoMemberSearchPreparation::Ready(search) => break Some(search),
                     GoMemberSearchPreparation::Missing | GoMemberSearchPreparation::Pending => {
@@ -2892,6 +2993,7 @@ impl FactEvaluation<'_, '_> {
                 required,
                 states,
                 method_identity,
+                Some(&*provider),
             )? {
                 DoesNotSatisfy => mismatch = true,
                 Inconclusive(reason) => {

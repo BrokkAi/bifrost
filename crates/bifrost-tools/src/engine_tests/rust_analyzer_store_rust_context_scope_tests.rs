@@ -60,7 +60,7 @@ fn host(value: u8) {
             .file("src/lib.rs", CONTEXT_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let source = state
             .source_facts
             .as_ref()
@@ -87,7 +87,7 @@ fn host(value: u8) {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("publish canonical context fixture");
@@ -98,7 +98,7 @@ fn host(value: u8) {
     fn rust_primary_contexts_reopen_respect_half_open_spans_and_provenance() {
         let (fixture, store, oid) = publish_context_fixture();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let source = state.source_facts.as_ref().unwrap();
         let target = source
             .rust_items
@@ -230,7 +230,7 @@ fn host(value: u8) {
     fn rust_primary_contexts_require_fresh_item_publication_and_recover() {
         let (fixture, store, oid) = publish_context_fixture();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let generation = store.current_generation("rust").unwrap();
         let expected = store
             .rust_primary_contexts_at(
@@ -268,7 +268,7 @@ fn host(value: u8) {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -290,7 +290,7 @@ fn host(value: u8) {
     fn rust_primary_contexts_cancel_before_and_during_rows_then_retry() {
         let (fixture, store, oid) = publish_context_fixture();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let source = state.source_facts.as_ref().unwrap();
         let point = source
             .rust_items
@@ -459,12 +459,12 @@ fn host(value: u8) {
         let mut oids = Vec::new();
         for (index, source) in sources.iter().enumerate() {
             let file = fixture.file(format!("src/context_plan_{index}.rs"));
-            let state = parse_state(&RustAdapter, &file);
+            let state = parse_state(&RustAdapter::for_tests(), &file);
             let oid = oid_for(source.as_bytes());
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .unwrap_or_else(|error| panic!("populate context plan fixture {index}: {error}"));

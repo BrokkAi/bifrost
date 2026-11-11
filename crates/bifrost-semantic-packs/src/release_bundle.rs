@@ -36,7 +36,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::AnalyzerConfig;
@@ -44,24 +44,28 @@ use brokk_bifrost_analysis::analyzer::FileSetProject;
 use brokk_bifrost_analysis::analyzer::Language;
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic_model::GoPinnedPackage as AnalysisGoPinnedPackage;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelMatchDisposition;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AcquisitionReceiptRelease, AcquisitionReceiptSource, ActivationSelector, ArtifactEncoding,
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
-    AuthoredSemanticModelPack, CatalogCoordinate, CatalogOptions, Compatibility,
+    AuthoredSemanticModelPack, CatalogCoordinate, CatalogLeaseToken, CatalogOptions, Compatibility,
     CompiledPackManifest, CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits,
     DependencyArtifactRole, DependencyPackLimits, DurablePackSource, DurablePackSourceKind,
-    ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
+    ExactArtifact, ExactDependencyArtifact, ExpectedReleaseInstall, ExternalArtifactKind,
     GENERATED_PRODUCTION_CACHE_VERSION, GeneratedProductionKey, PackExtractionAccounting,
     PackExtractionGap, PackExtractionSourceEntry, ProcedureSummaryMemberKey, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
+    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels, ReuseDecision,
     SEMANTIC_MODEL_SCHEMA_VERSION, SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS, Safety,
     SemanticModelActivationControl, SemanticModelActivationEvidence,
     SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
     SemanticModelPackSelector, SemanticModelResolutionOutcome, SemanticModelRuntimeOutcome,
     SemanticPackCatalog, acquire_active_semantic_models, compile_exact_dependency_production,
-    compile_pack, decode_manifest, decode_validated_shard_for_manifest, lowest_schema_version,
-    pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
-    resolve_active_semantic_models, verify_recorded_generated_production_digest,
+    compile_pack, decode_manifest, lowest_schema_version, pack_rejects_are_warning_only,
+    read_exact_artifact, read_exact_source_set, resolve_active_semantic_models,
+    verify_recorded_generated_production_digest,
+};
+use brokk_bifrost_analysis::analyzer::store::active_models::{
+    ActivatedSemanticModelRecord, SemanticModelMatch,
 };
 use brokk_bifrost_jvm_analysis::analyzer::JavaJarPackProducer;
 use brokk_bifrost_jvm_analysis::analyzer::JdkSourceArchiveLayout;
@@ -560,6 +564,45 @@ struct VerifiedBundleHeader {
     rejects: ReleaseBundleRejects,
 }
 
+struct VerifiedStartupBundle {
+    header: VerifiedBundleHeader,
+    curated_manifests: Vec<(CompiledPackManifest, Vec<u8>)>,
+}
+
+/// Verify the startup envelope and assets consumed by installation. Reused
+/// shards are not consumed, so corruption in their bundle files is not detected.
+/// Stored objects are independently verified on every read.
+fn verify_release_bundle_for_startup(
+    output_root: &Path,
+    current_cache_version: u32,
+) -> Result<VerifiedStartupBundle, BundleError> {
+    let index = read_release_bundle_index(output_root)?;
+    let generated_reuse =
+        generated_production_reuse(&index.generated_productions, current_cache_version)?;
+    verify_selected_checksums(output_root, &index)?;
+    let rejects = verify_rejects(output_root, &index)?;
+    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
+    verify_measurements(&measurements_path, &index)?;
+    let mut curated_manifests = Vec::with_capacity(index.packs.len());
+    for pack in &index.packs {
+        let (manifest, bytes) = read_compiled_manifest(output_root, &pack.pack_id, &pack.manifest)?;
+        verify_release_pack_metadata(output_root, pack, &manifest)?;
+        verify_indexed_shards(&pack.pack_id, &manifest, &pack.shards)?;
+        curated_manifests.push((manifest, bytes));
+    }
+    for generated in &index.generated_productions {
+        verify_generated_production_identity(&index, generated)?;
+    }
+    Ok(VerifiedStartupBundle {
+        header: VerifiedBundleHeader {
+            index,
+            generated_reuse,
+            rejects,
+        },
+        curated_manifests,
+    })
+}
+
 /// Acquisition verified the whole release envelope, but decoded only packs
 /// that can satisfy this exact request. It cannot be passed to the exhaustive
 /// release installer or used as a proof for another request.
@@ -714,6 +757,7 @@ pub(crate) fn jdk_generated_bundle_input(
         },
         activation: vec![activation],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "fixture".to_owned(),
             revision: Some("fixture-v1".to_owned()),
         },
@@ -794,6 +838,7 @@ impl Error for BundleError {}
 pub fn generate_release_bundle(
     output_root: &Path,
     inputs: &[BundleInput],
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<ReleaseBundle, BundleError> {
     if inputs.is_empty() {
         return Err(BundleError::new(
@@ -806,6 +851,7 @@ pub fn generate_release_bundle(
         .iter()
         .map(|input| read_and_validate_spec(&input.spec_path))
         .collect::<Result<Vec<_>, BundleError>>()?;
+    validate_rust_codeql_stdlib_coupling(&specs)?;
     assert_eq!(
         inputs.len(),
         specs.len(),
@@ -816,7 +862,8 @@ pub fn generate_release_bundle(
     let mut measurements = Vec::with_capacity(inputs.len());
     let mut rejects = Vec::with_capacity(inputs.len());
     for (input, spec) in inputs.iter().zip(&specs) {
-        let (pack, measurement, pack_rejects) = generate_one(output_root, input, spec)?;
+        let (pack, measurement, pack_rejects) =
+            generate_one(output_root, input, spec, retention_budget)?;
         packs.push(pack);
         measurements.push(measurement);
         rejects.push(pack_rejects);
@@ -871,6 +918,65 @@ pub fn generate_release_bundle(
     verify_release_bundle_for_generation(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
 }
 
+/// The CodeQL Rust summary pack carries no declarations. Its proof is the
+/// bundled pinned stdlib source set, named exactly in producer provenance.
+/// Keep this check at release generation so an independently authored summary
+/// artifact cannot silently pair with another stdlib document set.
+// This module also builds without release-tooling, when summary_foundry is
+// absent. The independent release gate pins the same CodeQL revision.
+const RUST_CODEQL_COMMIT: &str = "1be292a1e54696ca543b4ad0f9b4537b9687caa7";
+
+fn validate_rust_codeql_stdlib_coupling(specs: &[PinnedPackSpec]) -> Result<(), BundleError> {
+    let Some(summary) = specs
+        .iter()
+        .find(|spec| spec.pack_id == "codeql.rust-stdlib.summaries")
+    else {
+        return Ok(());
+    };
+    if !matches!(summary.kind, PinnedPackKind::AuthoredSemanticModel { .. }) {
+        return Err(BundleError::new(
+            "CodeQL Rust summaries must be an authored summary-only pack",
+        ));
+    }
+    let stdlib = specs
+        .iter()
+        .find(|spec| spec.pack_id == "bifrost.rust-stdlib")
+        .ok_or_else(|| {
+            BundleError::new("CodeQL Rust summaries require bundled bifrost.rust-stdlib")
+        })?;
+    if !matches!(stdlib.kind, PinnedPackKind::RustdocJsonSet { .. }) {
+        return Err(BundleError::new(
+            "CodeQL Rust summaries require the pinned rustdoc source set",
+        ));
+    }
+    let expected = format!(
+        "https://github.com/github/codeql (MIT); stdlib {}@{} source-set {}",
+        stdlib.pack_id, stdlib.pack_version, stdlib.artifact.sha256,
+    );
+    if summary.provenance.source != expected
+        || summary.provenance.revision.as_deref() != Some(RUST_CODEQL_COMMIT)
+        || summary.activation != stdlib.activation
+        || summary.compatibility != stdlib.compatibility
+    {
+        return Err(BundleError::new(
+            "CodeQL Rust summary provenance, activation or compatibility differs from bundled stdlib authority",
+        ));
+    }
+    // Authored shards may override the top-level activation. The authored-pack
+    // reader proves that each shard repeats its pin, so every pin must also
+    // repeat the stdlib source set's selector before release generation.
+    if let PinnedPackKind::AuthoredSemanticModel {
+        shard_activation_pins: Some(pins),
+    } = &summary.kind
+        && pins.iter().any(|pin| pin.activation != stdlib.activation)
+    {
+        return Err(BundleError::new(
+            "CodeQL Rust summary shard activation differs from bundled stdlib authority",
+        ));
+    }
+    Ok(())
+}
+
 fn read_and_validate_spec(spec_path: &Path) -> Result<PinnedPackSpec, BundleError> {
     let spec_bytes = fs::read(spec_path)
         .map_err(|error| BundleError::new(format!("read spec {}: {error}", spec_path.display())))?;
@@ -885,6 +991,7 @@ fn generate_one(
     output_root: &Path,
     input: &BundleInput,
     spec: &PinnedPackSpec,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<(ReleasePack, ReleasePackMeasurement, ReleasePackRejects), BundleError> {
     if !matches!(&spec.kind, PinnedPackKind::AuthoredSemanticModel { .. })
         && spec.compatibility.bifrost.is_some()
@@ -965,10 +1072,8 @@ fn generate_one(
                     "producer did not retain the pinned artifact identity",
                 ));
             }
-            // Producers write the current schema version. A release pack
-            // declares the lowest version its content needs instead, so the
-            // release requires only readers that content actually needs and
-            // older engines can still select it (#6251). Compilation below
+            // A release pack declares the lowest version its content needs,
+            // so older engines can still select it (#6251). Compilation below
             // validates again at the lowered version. Authored packs keep the
             // version their author chose.
             authored.schema_version =
@@ -998,7 +1103,7 @@ fn generate_one(
             BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
         })?;
     let elapsed = started.elapsed();
-    let runtime_measurement = measure_runtime(spec, &compiled, &cancellation)?;
+    let runtime_measurement = measure_runtime(spec, &compiled, &cancellation, retention_budget)?;
 
     let (manifest, manifest_semantic_sha256, manifest_content_sha256, shards) =
         write_compiled_assets(output_root, &compiled)?;
@@ -1727,6 +1832,14 @@ fn validate_pinned_shard_activation_pins(
 }
 
 fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleError> {
+    // #10189: distribution waits for per-lookup OPEN in Match and Assertion.
+    // This also rejects a pinned imported MaD pack before content generation.
+    if spec.provenance.is_close_match_approximation() {
+        return Err(BundleError::new(format!(
+            "spec {} cannot distribute an approximate Rust dependency artifact until causal attribution is available for every consuming family (#10189, #10198, #10212)",
+            spec_path.display()
+        )));
+    }
     if !matches!(spec.schema_version, 1 | PACK_SPEC_SCHEMA_VERSION) {
         return Err(BundleError::new(format!(
             "spec {} has unsupported schema version {}",
@@ -2179,6 +2292,7 @@ fn measure_runtime(
     spec: &PinnedPackSpec,
     compiled: &CompiledSemanticModelPack,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<RuntimeMeasurement, BundleError> {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
         .map_err(|error| BundleError::new(format!("open measurement catalog: {error}")))?;
@@ -2271,7 +2385,8 @@ fn measure_runtime(
         .map(|query| measure_lookup(active, query))
         .collect::<Result<Vec<_>, BundleError>>()?;
     let report = active.activation_report();
-    let overlay_measurement = measure_overlay_publication(&catalog, &request, cancellation)?;
+    let overlay_measurement =
+        measure_overlay_publication(&catalog, &request, cancellation, retention_budget)?;
     Ok(RuntimeMeasurement {
         activation_micros,
         activation_selection_nanos: report.phase_measurements.selection_nanos,
@@ -2291,6 +2406,7 @@ fn measure_overlay_publication(
     catalog: &SemanticPackCatalog,
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<
     brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayMeasurement,
     BundleError,
@@ -2319,10 +2435,12 @@ fn measure_overlay_publication(
         root.path().to_path_buf(),
         [measurement_source],
     ));
-    let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
-        .map_err(|error| {
-        BundleError::new(format!("build overlay measurement analyzer: {error}"))
-    })?;
+    let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun_with_budget(
+        project,
+        AnalyzerConfig::default(),
+        retention_budget,
+    )
+    .map_err(|error| BundleError::new(format!("build overlay measurement analyzer: {error}")))?;
     let outcome =
         acquire_active_semantic_models(analyzer.analyzer(), catalog, None, request, cancellation);
     let SemanticModelRuntimeOutcome::Ready { snapshot, .. } = outcome else {
@@ -2379,13 +2497,23 @@ fn measure_lookup(
 }
 
 fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLookupQuery) -> u64 {
+    // Verification activates the bundle with one reader and no request, so
+    // no question has an open JVM-family part and a count is never partial.
+    fn complete(disposition: SemanticModelMatchDisposition) {
+        assert!(
+            !matches!(disposition, SemanticModelMatchDisposition::Open(_)),
+            "a release bundle's single reader never reports an open part"
+        );
+    }
+    fn records<T>(matched: SemanticModelMatch<T>) -> Vec<ActivatedSemanticModelRecord<T>> {
+        complete(matched.disposition);
+        matched.records
+    }
     let count = match query {
-        PinnedLookupQuery::Type { name } => active.types_named(name).records.len(),
-        PinnedLookupQuery::Member { owner, name } => active
-            .types_named(owner)
-            .records
+        PinnedLookupQuery::Type { name } => records(active.types_named(name)).len(),
+        PinnedLookupQuery::Member { owner, name } => records(active.types_named(owner))
             .iter()
-            .map(|owner| active.members_named(&owner.record.id, name).records.len())
+            .map(|owner| records(active.members_named(&owner.record.id, name)).len())
             .sum(),
         PinnedLookupQuery::Procedure {
             language,
@@ -2393,27 +2521,35 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
             name,
             has_receiver,
             parameter_count,
-        } => active
-            .procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+        } => {
+            let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
                 language,
                 owner,
                 name,
                 *has_receiver,
                 *parameter_count,
-            ))
-            .records
-            .len(),
-        PinnedLookupQuery::Rule { id } => active.rules_with_id(id).records.len(),
-        PinnedLookupQuery::RuntimeExposure { exposure_id } => active
-            .runtime_values()
-            .map(|(payload, _)| {
-                payload
-                    .exposures
-                    .iter()
-                    .filter(|exposure| exposure.exposure_id == *exposure_id)
-                    .count()
-            })
-            .sum(),
+            ));
+            complete(matched.disposition);
+            matched.records.len()
+        }
+        PinnedLookupQuery::Rule { id } => records(active.rules_with_id(id)).len(),
+        PinnedLookupQuery::RuntimeExposure { exposure_id } => {
+            let values = active.runtime_values();
+            assert!(
+                values.jvm_open.is_none(),
+                "a release bundle's single reader never reports an open part"
+            );
+            values.rows
+        }
+        .into_iter()
+        .map(|(payload, _)| {
+            payload
+                .exposures
+                .iter()
+                .filter(|exposure| exposure.exposure_id == *exposure_id)
+                .count()
+        })
+        .sum(),
     };
     count.try_into().unwrap_or(u64::MAX)
 }
@@ -2429,6 +2565,8 @@ pub(crate) fn verify_release_bundle_for_install(
     verify_release_bundle_for_cache_version(output_root, GENERATED_PRODUCTION_CACHE_VERSION)
 }
 
+/// Verify the complete release, including every listed asset checksum. Callers
+/// requiring full distribution integrity use this rather than startup verification.
 fn verify_release_bundle_for_cache_version(
     output_root: &Path,
     current_cache_version: u32,
@@ -2465,6 +2603,34 @@ fn verify_release_bundle_for_cache_version(
     })
 }
 
+enum ReleaseSelection<'a> {
+    #[cfg(feature = "download")]
+    Acquisition(&'a AcquisitionReceiptRequest),
+    Startup(&'a brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage),
+}
+
+fn release_entry_selected(
+    selection: ReleaseSelection<'_>,
+    language: &str,
+    ecosystem: &str,
+    production_digest: Option<&str>,
+) -> bool {
+    match selection {
+        ReleaseSelection::Startup(coverage) => match production_digest {
+            Some(digest) => coverage.covers_production(digest, language, ecosystem),
+            None => coverage.covers_entry(language, ecosystem),
+        },
+        #[cfg(feature = "download")]
+        ReleaseSelection::Acquisition(AcquisitionReceiptRequest::DeclaredPack(query)) => {
+            language == query.language && ecosystem == query.ecosystem
+        }
+        #[cfg(feature = "download")]
+        ReleaseSelection::Acquisition(AcquisitionReceiptRequest::GeneratedProduction(key)) => {
+            production_digest == Some(key.production_digest())
+        }
+    }
+}
+
 #[cfg(feature = "download")]
 pub(crate) fn verify_release_bundle_for_acquisition(
     output_root: &Path,
@@ -2482,10 +2648,12 @@ pub(crate) fn verify_release_bundle_for_acquisition(
             read_compiled_manifest(output_root, &pack.pack_id, &pack.manifest)?;
         verify_release_pack_metadata(output_root, pack, &manifest)?;
         verify_indexed_shards(&pack.pack_id, &manifest, &pack.shards)?;
-        if let AcquisitionReceiptRequest::DeclaredPack(query) = request
-            && manifest.language == query.language
-            && manifest.ecosystem == query.ecosystem
-        {
+        if release_entry_selected(
+            ReleaseSelection::Acquisition(request),
+            &manifest.language,
+            &manifest.ecosystem,
+            None,
+        ) {
             let compiled = read_compiled_pack_from_manifest(
                 output_root,
                 &pack.pack_id,
@@ -2512,14 +2680,12 @@ pub(crate) fn verify_release_bundle_for_acquisition(
             read_compiled_manifest(output_root, &generated.pack_id, &generated.manifest)?;
         verify_generated_manifest_metadata(generated, &manifest)?;
         verify_indexed_shards(&generated.pack_id, &manifest, &generated.shards)?;
-        let selected = match request {
-            AcquisitionReceiptRequest::GeneratedProduction(key) => {
-                generated.production_digest == key.production_digest()
-            }
-            AcquisitionReceiptRequest::DeclaredPack(query) => {
-                manifest.language == query.language && manifest.ecosystem == query.ecosystem
-            }
-        };
+        let selected = release_entry_selected(
+            ReleaseSelection::Acquisition(request),
+            &manifest.language,
+            &manifest.ecosystem,
+            Some(&generated.production_digest),
+        );
         if selected {
             let compiled = read_compiled_pack_from_manifest(
                 output_root,
@@ -2544,6 +2710,12 @@ fn verify_release_pack_metadata(
     pack: &ReleasePack,
     manifest: &CompiledPackManifest,
 ) -> Result<(), BundleError> {
+    if manifest.provenance.is_close_match_approximation() {
+        return Err(BundleError::new(format!(
+            "release pack {}@{} cannot distribute an approximate Rust dependency artifact until causal attribution is available for every consuming family (#10189, #10198, #10212)",
+            pack.pack_id, pack.pack_version
+        )));
+    }
     if manifest.pack_id != pack.pack_id
         || manifest.version != pack.pack_version
         || manifest.semantic_sha256 != pack.manifest_semantic_sha256
@@ -3030,7 +3202,7 @@ fn verify_generated_production_identity(
     // Otherwise the bundle ships a production that can never activate,
     // silently -- the way #2756 shipped 3,535 suppressed JDK rejects behind
     // an empty diagnostics list.
-    if generated.completeness == Completeness::Partial
+    if generated.completeness != Completeness::Complete
         && !extraction.warning_only_and_fully_accounted()
     {
         return Err(BundleError::new(format!(
@@ -3140,7 +3312,7 @@ fn verify_rejects(
                 pack.pack_id, pack.pack_version
             )));
         }
-        if pack.completeness == Completeness::Partial
+        if pack.completeness != Completeness::Complete
             && !extraction.warning_only_and_fully_accounted()
         {
             return Err(BundleError::new(format!(
@@ -3251,6 +3423,23 @@ pub fn install_release_bundle(
     .map(|proof| proof.installations)
 }
 
+/// Install or exactly reuse the startup release, returning owned leases for
+/// the caller to retain through activation publication.
+#[cfg(feature = "download")]
+pub fn install_release_bundle_with_leases(
+    bundle_root: &Path,
+    catalog: &SemanticPackCatalog,
+    coverage: &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage,
+) -> Result<(Vec<ReleasePackInstallation>, Vec<CatalogLeaseToken>), BundleError> {
+    let (proof, tokens) = install_startup_bundle(
+        bundle_root,
+        catalog,
+        GENERATED_PRODUCTION_CACHE_VERSION,
+        coverage,
+    )?;
+    Ok((proof.installations, tokens))
+}
+
 #[cfg(all(test, feature = "download"))]
 pub(crate) fn install_release_bundle_with_proof(
     bundle_root: &Path,
@@ -3278,6 +3467,285 @@ fn install_release_bundle_for_cache_version(
         verify_release_bundle_for_cache_version(bundle_root, current_cache_version)?
     };
     install_verified_release_bundle(verified, catalog, receipt_release)
+}
+
+#[cfg(test)]
+thread_local! {
+    static STARTUP_CURATED_SHARD_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn install_startup_bundle(
+    bundle_root: &Path,
+    catalog: &SemanticPackCatalog,
+    current_cache_version: u32,
+    coverage: &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage,
+) -> Result<(BundleInstallationProof, Vec<CatalogLeaseToken>), BundleError> {
+    let verified = {
+        let _scope =
+            brokk_bifrost_analysis::profiling::scope("semantic_pack.release_bundle.verify_startup");
+        verify_release_bundle_for_startup(bundle_root, current_cache_version)?
+    };
+    let VerifiedStartupBundle {
+        header,
+        curated_manifests,
+    } = verified;
+    let VerifiedBundleHeader {
+        index,
+        generated_reuse,
+        rejects,
+    } = header;
+    let checksums = fs::read_to_string(bundle_root.join("SHA256SUMS"))
+        .map_err(|error| BundleError::new(format!("read SHA256SUMS: {error}")))?
+        .lines()
+        .map(|line| {
+            let (digest, path) = line.split_once("  ").expect("verified SHA256SUMS line");
+            (path.to_owned(), digest.to_owned())
+        })
+        .collect::<HashMap<_, _>>();
+    let mut leases = Vec::new();
+    let install = (|| -> Result<BundleInstallationProof, BundleError> {
+        let mut installed =
+            Vec::with_capacity(index.packs.len() + index.generated_productions.len());
+        for ((pack, rejects), (manifest, manifest_bytes)) in index
+            .packs
+            .iter()
+            .zip(&rejects.packs)
+            .zip(curated_manifests)
+        {
+            if !release_entry_selected(
+                ReleaseSelection::Startup(coverage),
+                &manifest.language,
+                &manifest.ecosystem,
+                None,
+            ) {
+                continue;
+            }
+            let extraction = extraction_accounting(&rejects.rejects, rejects.suppressed_rejects);
+            let source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id, pack.pack_version, pack.manifest.sha256
+                ),
+            };
+            let shard_digests = manifest
+                .shards
+                .iter()
+                .map(|descriptor| {
+                    pack.shards
+                        .iter()
+                        .find(|shard| shard.shard_id == descriptor.shard_id)
+                        .expect("verified index has every manifest shard")
+                        .asset
+                        .sha256
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let expected = ExpectedReleaseInstall {
+                manifest: &manifest,
+                manifest_bytes: &manifest_bytes,
+                manifest_object_digest: &pack.manifest.sha256,
+                shard_digests: &shard_digests,
+            };
+            let decision = catalog
+                .exact_release_install_reusable(&expected, &source, &extraction)
+                .map_err(|error| {
+                    BundleError::new(format!(
+                        "check {}@{}: {error}",
+                        pack.pack_id, pack.pack_version
+                    ))
+                })?;
+            let manifest_digest = match decision {
+                ReuseDecision::Reusable { lease } | ReuseDecision::Repaired { lease, .. } => {
+                    leases.push(lease.into_token(manifest.content_sha256.clone()));
+                    manifest.content_sha256.clone()
+                }
+                ReuseDecision::Install | ReuseDecision::StaleOrUnavailable => {
+                    let _scope = brokk_bifrost_analysis::profiling::scope(
+                        "semantic_pack.release_bundle.read_decode_install",
+                    );
+                    for shard in &pack.shards {
+                        if checksums.get(&shard.asset.path) != Some(&shard.asset.sha256) {
+                            return Err(BundleError::new(format!(
+                                "checksum for {} does not match SHA256SUMS",
+                                shard.asset.path
+                            )));
+                        }
+                    }
+                    #[cfg(test)]
+                    STARTUP_CURATED_SHARD_DECODES
+                        .with(|count| count.set(count.get() + pack.shards.len() as u64));
+                    let compiled = read_compiled_pack_from_manifest(
+                        bundle_root,
+                        &pack.pack_id,
+                        manifest,
+                        manifest_bytes,
+                        &pack.shards,
+                    )?;
+                    let digest = catalog
+                        .install_release(&compiled, &source, &extraction)
+                        .map_err(|error| {
+                            BundleError::new(format!(
+                                "install {}@{}: {error}",
+                                pack.pack_id, pack.pack_version
+                            ))
+                        })?
+                        .manifest_digest;
+                    leases.push(
+                        catalog
+                            .lease(&digest, "release-bootstrap", Duration::from_secs(300))
+                            .map_err(|error| BundleError::new(error.to_string()))?
+                            .into_token(digest.clone()),
+                    );
+                    digest
+                }
+            };
+            installed.push(ReleasePackInstallation {
+                diagnostics: Vec::new(),
+                pack_id: pack.pack_id.clone(),
+                pack_version: pack.pack_version.clone(),
+                manifest_digest,
+            });
+        }
+        // Keep the existing generated-production path in this bounded prototype.
+        for (generated, reuse) in index.generated_productions.iter().zip(generated_reuse) {
+            if reuse != GeneratedProductionReuse::Eligible {
+                continue;
+            }
+            if checksums.get(&generated.manifest.path) != Some(&generated.manifest.sha256) {
+                return Err(BundleError::new(format!(
+                    "checksum for {} does not match SHA256SUMS",
+                    generated.manifest.path
+                )));
+            }
+            let (manifest, manifest_bytes) =
+                read_compiled_manifest(bundle_root, &generated.pack_id, &generated.manifest)?;
+            verify_generated_manifest_metadata(generated, &manifest)?;
+            verify_indexed_shards(&generated.pack_id, &manifest, &generated.shards)?;
+            if !release_entry_selected(
+                ReleaseSelection::Startup(coverage),
+                &manifest.language,
+                &manifest.ecosystem,
+                Some(&generated.production_digest),
+            ) {
+                continue;
+            }
+            let key = GeneratedProductionKey::new(
+                generated.input_digest.clone(),
+                generated.producer_name.clone(),
+                generated.producer_version.clone(),
+                generated.schema_version,
+            )
+            .map_err(|error| {
+                BundleError::new(format!("invalid generated production key: {error}"))
+            })?;
+            let source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release-generated:{}@{}:{}",
+                    generated.source_pack_id,
+                    generated.source_pack_version,
+                    generated.production_digest
+                ),
+            };
+            let extraction =
+                extraction_accounting(&generated.rejects, generated.suppressed_rejects);
+            let shard_digests = manifest
+                .shards
+                .iter()
+                .map(|descriptor| {
+                    generated
+                        .shards
+                        .iter()
+                        .find(|shard| shard.shard_id == descriptor.shard_id)
+                        .expect("verified generated index has every manifest shard")
+                        .asset
+                        .sha256
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let expected = ExpectedReleaseInstall {
+                manifest: &manifest,
+                manifest_bytes: &manifest_bytes,
+                manifest_object_digest: &generated.manifest.sha256,
+                shard_digests: &shard_digests,
+            };
+            if catalog
+                .generated_production(&key)
+                .map_err(|error| BundleError::new(error.to_string()))?
+                .is_some_and(|production| production.manifest_digest == manifest.content_sha256)
+            {
+                match catalog
+                    .exact_release_install_reusable(&expected, &source, &extraction)
+                    .map_err(|error| BundleError::new(error.to_string()))?
+                {
+                    ReuseDecision::Reusable { lease } | ReuseDecision::Repaired { lease, .. } => {
+                        leases.push(lease.into_token(manifest.content_sha256.clone()));
+                        installed.push(ReleasePackInstallation {
+                            diagnostics: Vec::new(),
+                            pack_id: generated.pack_id.clone(),
+                            pack_version: generated.pack_version.clone(),
+                            manifest_digest: manifest.content_sha256,
+                        });
+                        continue;
+                    }
+                    ReuseDecision::Install | ReuseDecision::StaleOrUnavailable => {}
+                }
+            }
+            for shard in &generated.shards {
+                if checksums.get(&shard.asset.path) != Some(&shard.asset.sha256) {
+                    return Err(BundleError::new(format!(
+                        "checksum for {} does not match SHA256SUMS",
+                        shard.asset.path
+                    )));
+                }
+            }
+            let compiled = read_compiled_pack_from_manifest(
+                bundle_root,
+                &generated.pack_id,
+                manifest,
+                manifest_bytes,
+                &generated.shards,
+            )?;
+            let installation = catalog
+                .install_release_generated(&key, &compiled, &source, &extraction)
+                .map_err(|error| {
+                    BundleError::new(format!(
+                        "install generated {}@{}: {error}",
+                        generated.pack_id, generated.pack_version
+                    ))
+                })?;
+            leases.push(
+                catalog
+                    .lease(
+                        &installation.install.manifest_digest,
+                        "release-bootstrap",
+                        Duration::from_secs(300),
+                    )
+                    .map_err(|error| BundleError::new(error.to_string()))?
+                    .into_token(installation.install.manifest_digest.clone()),
+            );
+            installed.push(ReleasePackInstallation {
+                diagnostics: installation.install.diagnostics,
+                pack_id: generated.pack_id.clone(),
+                pack_version: generated.pack_version.clone(),
+                manifest_digest: installation.install.manifest_digest,
+            });
+        }
+        Ok(BundleInstallationProof {
+            installations: installed,
+            sources: Vec::new(),
+        })
+    })();
+    match install {
+        Ok(proof) => Ok((proof, leases)),
+        Err(error) => match catalog.release_leases(&leases) {
+            Ok(()) => Err(error),
+            Err(release_error) => Err(BundleError::new(format!(
+                "{error}; release bootstrap leases: {release_error}"
+            ))),
+        },
+    }
 }
 
 #[cfg(feature = "download")]
@@ -3550,7 +4018,6 @@ fn read_compiled_pack_from_manifest(
     manifest_bytes: Vec<u8>,
     indexed_shards: &[ReleaseShard],
 ) -> Result<CompiledSemanticModelPack, BundleError> {
-    let limits = DecodeLimits::default();
     verify_indexed_shards(pack_id, &manifest, indexed_shards)?;
     let shards = manifest
         .shards
@@ -3561,11 +4028,6 @@ fn read_compiled_pack_from_manifest(
                 .find(|shard| shard.shard_id == descriptor.shard_id)
                 .expect("validated shard index contains every manifest shard");
             let bytes = verify_asset(bundle_root, &indexed.asset)?;
-            // decode_manifest already validated the whole inventory. Keep the
-            // per-shard checks without walking every manifest ID again.
-            decode_validated_shard_for_manifest(&manifest, descriptor, &bytes, &limits).map_err(
-                |error| BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id)),
-            )?;
             Ok(
                 brokk_bifrost_analysis::analyzer::semantic_model::CompiledShardArtifact {
                     descriptor: descriptor.clone(),
@@ -3574,11 +4036,19 @@ fn read_compiled_pack_from_manifest(
             )
         })
         .collect::<Result<Vec<_>, BundleError>>()?;
-    Ok(CompiledSemanticModelPack {
+    let pack = CompiledSemanticModelPack {
         manifest,
         manifest_bytes,
         shards,
-    })
+    };
+    // The catalog boundary validates shard-local evidence and whole-pack
+    // invariants together, including alias edges across shard boundaries.
+    brokk_bifrost_analysis::analyzer::semantic_model::catalog::validate_pack(
+        &pack,
+        &DecodeLimits::default(),
+    )
+    .map_err(|error| BundleError::new(format!("validate compiled pack {pack_id}: {error}")))?;
+    Ok(pack)
 }
 
 fn verify_indexed_shards(
@@ -3646,6 +4116,68 @@ fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<()
         return Err(BundleError::new(
             "SHA256SUMS does not list the release assets exactly once in canonical order",
         ));
+    }
+    Ok(())
+}
+
+fn verify_selected_checksums(
+    output_root: &Path,
+    index: &ReleaseBundleIndex,
+) -> Result<(), BundleError> {
+    let checksum_path = safe_asset_path(output_root, Path::new("SHA256SUMS"))?;
+    let checksum_text = fs::read_to_string(&checksum_path)
+        .map_err(|error| BundleError::new(format!("read {}: {error}", checksum_path.display())))?;
+    let expected_paths = release_asset_paths(index);
+    let mut actual_paths = Vec::new();
+    let consumed = std::iter::once("index.json")
+        .chain(std::iter::once("rejects.json"))
+        .chain(index.packs.iter().flat_map(|pack| {
+            std::iter::once(pack.manifest.path.as_str())
+                .chain(pack.notices.iter().map(|notice| notice.asset.path.as_str()))
+        }))
+        .collect::<HashSet<_>>();
+    let mut hashed_bytes = 0u64;
+    for (line_number, line) in checksum_text.lines().enumerate() {
+        let (sha256, path) = line.split_once("  ").ok_or_else(|| {
+            BundleError::new(format!("invalid SHA256SUMS line {}", line_number + 1))
+        })?;
+        validate_sha256("checksum", sha256)?;
+        let asset_path = safe_asset_path(output_root, Path::new(path))?;
+        if consumed.contains(path) {
+            let (actual_sha256, bytes) = sha256_file(&asset_path)?;
+            hashed_bytes += bytes;
+            if actual_sha256 != sha256 {
+                return Err(BundleError::new(format!(
+                    "checksum for {path} does not match SHA256SUMS"
+                )));
+            }
+        }
+        actual_paths.push(path.to_owned());
+    }
+    if actual_paths != expected_paths {
+        return Err(BundleError::new(
+            "SHA256SUMS does not list the release assets exactly once in canonical order",
+        ));
+    }
+    if std::env::var_os("BIFROST_TIMING").is_some() {
+        let duplicate_asset_hash_bytes = index
+            .packs
+            .iter()
+            .map(|pack| {
+                pack.manifest.bytes
+                    + pack
+                        .notices
+                        .iter()
+                        .map(|notice| notice.asset.bytes)
+                        .sum::<u64>()
+            })
+            .sum::<u64>();
+        eprintln!(
+            "6397-m0 bundle_hashed_bytes={} header_hashed_bytes={} manifest_notice_rehash_bytes={}",
+            hashed_bytes + duplicate_asset_hash_bytes,
+            hashed_bytes,
+            duplicate_asset_hash_bytes
+        );
     }
     Ok(())
 }
@@ -4003,7 +4535,12 @@ fn sha256_file(path: &Path) -> Result<(String, u64), BundleError> {
         hasher.update(&buffer[..read]);
         bytes = bytes.saturating_add(read as u64);
     }
-    Ok((format!("{:x}", hasher.finalize()), bytes))
+    Ok((
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        ),
+        bytes,
+    ))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -4029,11 +4566,991 @@ fn render_diagnostics(diagnostics: &[ProducerDiagnostic]) -> String {
 mod tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredPayload;
+    #[cfg(feature = "download")]
+    use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode;
+    use brokk_bifrost_analysis::analyzer::semantic_model::decode_validated_shard_for_manifest;
     use brokk_bifrost_analysis::analyzer::semantic_model::{NameSelector, VersionConstraint};
     use brokk_bifrost_analysis::test_support::ruby_gem_archive;
     use brokk_bifrost_analysis::test_support::write_zip;
     use brokk_bifrost_test_macros::hardwon;
     use tempfile::tempdir;
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn scoped_release_activation_matches_whole_release_golden() {
+        use brokk_bifrost_analysis::analyzer::Language;
+        use brokk_bifrost_analysis::analyzer::packs_document::{
+            ReleaseCoverage, parse_workspace_packs_config, release_coverage,
+        };
+
+        // All inputs are test-only: the JDK source archive is made by the
+        // existing fixture builder, and the npm and Ruby artifacts below are
+        // minimal API examples from this module's producer tests.
+        let fixture = tempdir().unwrap();
+        let (jdk, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let npm_root = fixture.path().join("widget");
+        fs::create_dir_all(&npm_root).unwrap();
+        fs::write(
+            npm_root.join("package.json"),
+            r#"{"name":"widget","version":"1.2.3","types":"index.d.ts"}"#,
+        )
+        .unwrap();
+        fs::write(
+            npm_root.join("index.d.ts"),
+            "export declare class Widget { render(width: number): string; }\n",
+        )
+        .unwrap();
+        let npm_sha = read_exact_source_set(
+            &npm_root,
+            &[PathBuf::from("package.json"), PathBuf::from("index.d.ts")],
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let npm_spec = fixture.path().join("widget.json");
+        let npm = pinned_spec(
+            "widget-npm-fixture",
+            "1.2.3",
+            "npm",
+            PinnedPackKind::NpmPackage {
+                manifest: "package.json".to_owned(),
+                declarations: vec![PinnedNpmDeclaration {
+                    module: "widget".to_owned(),
+                    path: "index.d.ts".to_owned(),
+                }],
+            },
+            PinnedArtifact {
+                file_name: "widget".to_owned(),
+                sha256: npm_sha.clone(),
+                url: Some("https://example.invalid/widget.tgz".to_owned()),
+                container: None,
+            },
+            "node",
+            "widget",
+            vec![PinnedLookupQuery::Type {
+                name: "widget.Widget".to_owned(),
+            }],
+        );
+        fs::write(&npm_spec, serde_json::to_vec(&npm).unwrap()).unwrap();
+        let ruby_artifact = fixture.path().join("unused.gem");
+        fs::write(
+            &ruby_artifact,
+            ruby_gem_archive(&[("sig/unused.rbs", b"class Unused\nend\n")]),
+        )
+        .unwrap();
+        let (ruby_sha, _) = sha256_file(&ruby_artifact).unwrap();
+        let ruby_spec = fixture.path().join("unused.json");
+        let ruby = pinned_spec(
+            "unused-ruby-fixture",
+            "1.2.3",
+            "rubygems",
+            PinnedPackKind::RubyGemArchive,
+            PinnedArtifact {
+                file_name: "unused.gem".to_owned(),
+                sha256: ruby_sha,
+                url: Some("https://example.invalid/unused.gem".to_owned()),
+                container: None,
+            },
+            "ruby",
+            "unused",
+            vec![PinnedLookupQuery::Type {
+                name: "Unused".to_owned(),
+            }],
+        );
+        fs::write(&ruby_spec, serde_json::to_vec(&ruby).unwrap()).unwrap();
+        let bundle = fixture.path().join("bundle");
+        generate_release_bundle(
+            &bundle,
+            &[
+                jdk,
+                BundleInput {
+                    spec_path: npm_spec,
+                    artifact_path: npm_root,
+                },
+                BundleInput {
+                    spec_path: ruby_spec,
+                    artifact_path: ruby_artifact,
+                },
+            ],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            workspace.join("Main.java"),
+            "class Main { Object value; }\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("main.ts"),
+            "import { Widget } from 'widget';\nlet value: Widget;\n",
+        )
+        .unwrap();
+        let languages = fs::read_dir(&workspace)
+            .unwrap()
+            .map(|entry| Language::from_path(&entry.unwrap().path()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            languages,
+            BTreeSet::from([Language::Java, Language::TypeScript])
+        );
+        let narrowed =
+            parse_workspace_packs_config(r#"{"schema_version":1,"ecosystems":["jvm"]}"#).unwrap();
+        let evidence = vec![SemanticModelActivationEvidence {
+            language: "typescript".to_owned(),
+            ecosystem: "npm".to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        }];
+        let scoped = release_coverage(&languages, Some(&narrowed), &evidence);
+        assert!(scoped.covers_entry("java", "jdk"));
+        assert!(scoped.covers_entry("typescript", "npm"));
+        assert!(!scoped.covers_entry("ruby", "rubygems"));
+
+        let render = |coverage: &ReleaseCoverage| {
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let (installed, leases) =
+                install_release_bundle_with_leases(&bundle, &catalog, coverage).unwrap();
+            let mut request = package_activation_request(
+                "typescript",
+                "npm",
+                "widget",
+                "node",
+                "1.2.3",
+                None,
+                Some(npm_sha.clone()),
+            );
+            request.evidence.push(SemanticModelActivationEvidence {
+                language: "java".to_owned(),
+                ecosystem: "jdk".to_owned(),
+                package: None,
+                module: None,
+                toolchain: Some(CatalogCoordinate {
+                    name: "jdk".to_owned(),
+                    version: Some(Version::parse("21.0.8").unwrap()),
+                }),
+                target: Some("jvm".to_owned()),
+                configuration: None,
+                artifact_sha256: None,
+            });
+            let SemanticModelResolutionOutcome::Ready(models) =
+                resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+            else {
+                panic!("fixture TypeScript model must activate");
+            };
+            let mut active = models
+                .shards
+                .iter()
+                .map(|shard| format!("{}@{}", shard.manifest.pack_id, shard.manifest.version))
+                .collect::<Vec<_>>();
+            active.sort();
+            active.dedup();
+            let count = models.types_named("widget.Widget").records.len();
+            catalog.release_leases(&leases).unwrap();
+            (
+                installed.len(),
+                format!(
+                    "active packs: {}\nwidget.Widget types: {count}\n",
+                    active.join(", ")
+                ),
+            )
+        };
+        let (whole_count, whole) = render(&ReleaseCoverage::WholeRelease);
+        let (scoped_count, scoped_answer) = render(&scoped);
+        assert!(scoped_count < whole_count);
+        assert_eq!(whole, scoped_answer);
+        assert_eq!(
+            include_str!("../testdata/scoped-release-parity/expected.txt"),
+            scoped_answer
+        );
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn scoped_release_installs_only_selected_entries() {
+        use brokk_bifrost_analysis::analyzer::packs_document::{CoveredRelease, ReleaseCoverage};
+        let fixture = tempdir().unwrap();
+        let (input, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let bundle = fixture.path().join("bundle");
+        let release = generate_release_bundle(
+            &bundle,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let manifest = read_compiled_manifest(
+            &bundle,
+            &release.index.packs[0].pack_id,
+            &release.index.packs[0].manifest,
+        )
+        .unwrap()
+        .0;
+        let generated = &release.index.generated_productions[0];
+        let mut selected = CoveredRelease::default();
+        selected.languages.insert(manifest.language.clone());
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let coverage = ReleaseCoverage::Covered(CoveredRelease::default());
+        STARTUP_CURATED_SHARD_DECODES.with(|count| count.set(0));
+        let (none, leases) =
+            install_release_bundle_with_leases(&bundle, &catalog, &coverage).unwrap();
+        assert!(none.is_empty());
+        assert!(leases.is_empty());
+        STARTUP_CURATED_SHARD_DECODES.with(|count| assert_eq!(count.get(), 0));
+        let (all, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &catalog,
+            &ReleaseCoverage::Covered(selected.clone()),
+        )
+        .unwrap();
+        assert_eq!(all.len(), 2);
+        catalog.release_leases(&leases).unwrap();
+        let (whole, leases) =
+            install_release_bundle_with_leases(&bundle, &catalog, &ReleaseCoverage::WholeRelease)
+                .unwrap();
+        assert_eq!(whole, all);
+        catalog.release_leases(&leases).unwrap();
+
+        let other = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let mut by_digest = CoveredRelease::default();
+        by_digest
+            .productions
+            .insert(generated.production_digest.clone());
+        let (only_generated, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &other,
+            &ReleaseCoverage::Covered(by_digest),
+        )
+        .unwrap();
+        assert_eq!(only_generated.len(), 1);
+        assert_eq!(only_generated[0].pack_id, generated.pack_id);
+        other.release_leases(&leases).unwrap();
+
+        let pair_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let mut by_pair = CoveredRelease::default();
+        by_pair
+            .pairs
+            .insert((manifest.language.clone(), manifest.ecosystem.clone()));
+        let (pair, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &pair_catalog,
+            &ReleaseCoverage::Covered(by_pair),
+        )
+        .unwrap();
+        assert_eq!(pair.len(), 2);
+        pair_catalog.release_leases(&leases).unwrap();
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn scoped_release_growth_reuses_existing_entry() {
+        use brokk_bifrost_analysis::analyzer::packs_document::{CoveredRelease, ReleaseCoverage};
+        let fixture = tempdir().unwrap();
+        let (jdk, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let python_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/authored-model");
+        let python = BundleInput {
+            spec_path: python_root.join("unittest-assertions-2026.9.7.spec.json"),
+            artifact_path: python_root.join("unittest-assertions-2026.9.7.json"),
+        };
+        let bundle = fixture.path().join("bundle");
+        let release = generate_release_bundle(
+            &bundle,
+            &[jdk, python],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        assert_eq!(release.index.packs.len(), 2);
+        let catalog_root = fixture.path().join("catalog");
+        let mut selected = CoveredRelease::default();
+        selected.languages.insert("java".to_owned());
+        let first = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (initial, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &first,
+            &ReleaseCoverage::Covered(selected.clone()),
+        )
+        .unwrap();
+        assert_eq!(initial.len(), 2);
+        first.release_leases(&leases).unwrap();
+        drop(first);
+        let guard = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+        for (position, pack) in initial.iter().enumerate() {
+            for table in [
+                "catalog_pack_shards",
+                "catalog_semantic_rows_indexed_shards",
+                "catalog_selectors",
+                "catalog_selector_targets",
+                "catalog_selector_configurations",
+                "catalog_routing_keys",
+            ] {
+                for (operation, row) in [("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")] {
+                    guard.execute_batch(&format!(
+                        "CREATE TRIGGER guard_{table}_{operation}_{position} BEFORE {operation} ON {table} \
+                         WHEN {row}.manifest_digest = '{}' BEGIN SELECT RAISE(ABORT, 'reused pack install write'); END;",
+                        pack.manifest_digest,
+                    )).unwrap();
+                }
+            }
+        }
+        selected.languages.insert("python".to_owned());
+        let second = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        STARTUP_CURATED_SHARD_DECODES.with(|count| count.set(0));
+        let (grown, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &second,
+            &ReleaseCoverage::Covered(selected),
+        )
+        .unwrap();
+        assert_eq!(grown.len(), 3);
+        assert!(initial.iter().all(|entry| grown.contains(entry)));
+        assert_eq!(second.shard_validation_count(), 0);
+        STARTUP_CURATED_SHARD_DECODES.with(|count| assert_eq!(count.get(), 1));
+        second.release_leases(&leases).unwrap();
+    }
+
+    #[cfg(feature = "download")]
+    mod changed_release_controls {
+        use super::*;
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::ExpectedReleaseInstall;
+
+        #[test]
+        fn changed_release_metadata_refuses_exact_reuse() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            let release = generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let (_, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            catalog.release_leases(&leases).unwrap();
+            let pack = &release.index.packs[0];
+            let manifest_bytes = fs::read(bundle.join(&pack.manifest.path)).unwrap();
+            let manifest = decode_manifest(&manifest_bytes, &DecodeLimits::default()).unwrap();
+            let shard_digests = manifest
+                .shards
+                .iter()
+                .map(|descriptor| {
+                    pack.shards
+                        .iter()
+                        .find(|shard| shard.shard_id == descriptor.shard_id)
+                        .unwrap()
+                        .asset
+                        .sha256
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let expected = ExpectedReleaseInstall {
+                manifest: &manifest,
+                manifest_bytes: &manifest_bytes,
+                manifest_object_digest: &pack.manifest.sha256,
+                shard_digests: &shard_digests,
+            };
+            let source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id, pack.pack_version, pack.manifest.sha256
+                ),
+            };
+            let unchanged = extraction_accounting(&[], 0);
+            match catalog
+                .exact_release_install_reusable(&expected, &source, &unchanged)
+                .unwrap()
+            {
+                ReuseDecision::Reusable { lease } => lease.release().unwrap(),
+                _ => panic!("unchanged pack should be reusable"),
+            }
+            let changed_manifest = ExpectedReleaseInstall {
+                manifest_object_digest: &"0".repeat(64),
+                ..expected
+            };
+            assert!(matches!(
+                catalog
+                    .exact_release_install_reusable(&changed_manifest, &source, &unchanged)
+                    .unwrap(),
+                ReuseDecision::Install
+            ));
+            let changed_rejects = extraction_accounting(&[], 1);
+            assert!(matches!(
+                catalog
+                    .exact_release_install_reusable(&expected, &source, &changed_rejects)
+                    .unwrap(),
+                ReuseDecision::Install
+            ));
+            let changed_index_source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id,
+                    pack.pack_version,
+                    "0".repeat(64)
+                ),
+            };
+            assert!(matches!(
+                catalog
+                    .exact_release_install_reusable(&expected, &changed_index_source, &unchanged)
+                    .unwrap(),
+                ReuseDecision::Install
+            ));
+            assert!(catalog.sql_statement_count() > 0);
+            assert!(catalog.object_read_count() > 0);
+        }
+
+        #[test]
+        fn corrupt_stored_object_refuses_reuse() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            let release = generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let catalog_root = fixture.path().join("catalog");
+            let first = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let (_, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &first,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            first.release_leases(&leases).unwrap();
+            drop(first);
+
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            let relative: String = connection.query_row("SELECT o.relative_path FROM catalog_pack_shards s JOIN catalog_objects o ON o.stored_digest=s.stored_digest WHERE s.manifest_digest=?1 LIMIT 1", [&release.index.packs[0].manifest_content_sha256], |row| row.get(0)).unwrap();
+            fs::write(catalog_root.join(&relative), b"corrupt stored shard").unwrap();
+            drop(connection);
+            let second = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let pack = &release.index.packs[0];
+            let manifest_bytes = fs::read(bundle.join(&pack.manifest.path)).unwrap();
+            let manifest = decode_manifest(&manifest_bytes, &DecodeLimits::default()).unwrap();
+            let shard_digests = manifest
+                .shards
+                .iter()
+                .map(|descriptor| {
+                    pack.shards
+                        .iter()
+                        .find(|shard| shard.shard_id == descriptor.shard_id)
+                        .unwrap()
+                        .asset
+                        .sha256
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let expected = ExpectedReleaseInstall {
+                manifest: &manifest,
+                manifest_bytes: &manifest_bytes,
+                manifest_object_digest: &pack.manifest.sha256,
+                shard_digests: &shard_digests,
+            };
+            let source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id, pack.pack_version, pack.manifest.sha256
+                ),
+            };
+            assert!(matches!(
+                second
+                    .exact_release_install_reusable(
+                        &expected,
+                        &source,
+                        &extraction_accounting(&[], 0)
+                    )
+                    .unwrap(),
+                ReuseDecision::Install
+            ));
+            let result = install_release_bundle_with_leases(
+                &bundle,
+                &second,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            );
+            if let Ok((_, leases)) = result {
+                second.release_leases(&leases).unwrap();
+            }
+            assert!(second.object_read_count() > 0);
+        }
+
+        #[test]
+        fn malformed_stale_generated_identity_fails_startup() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            let mut release = generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            release.index.generated_productions[0].cache_version += 1;
+            release.index.generated_productions[0].production_digest = "0".repeat(64);
+            fs::write(
+                bundle.join("index.json"),
+                json_bytes(&release.index).unwrap(),
+            )
+            .unwrap();
+            fs::remove_file(bundle.join("SHA256SUMS")).unwrap();
+            write_checksums(&bundle, &release.index).unwrap();
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let error = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .err()
+            .expect("malformed stale identity must fail");
+            assert!(error.to_string().contains("production digest"), "{error}");
+        }
+
+        #[test]
+        fn missing_certificate_and_marker_have_exact_repair_counts() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            let release = generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let catalog_root = fixture.path().join("catalog");
+            let first = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let (_, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &first,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            first.release_leases(&leases).unwrap();
+            drop(first);
+            let pack = &release.index.packs[0];
+            let manifest_bytes = fs::read(bundle.join(&pack.manifest.path)).unwrap();
+            let manifest = decode_manifest(&manifest_bytes, &DecodeLimits::default()).unwrap();
+            let shard_digests = manifest
+                .shards
+                .iter()
+                .map(|descriptor| {
+                    pack.shards
+                        .iter()
+                        .find(|shard| shard.shard_id == descriptor.shard_id)
+                        .unwrap()
+                        .asset
+                        .sha256
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let expected = ExpectedReleaseInstall {
+                manifest: &manifest,
+                manifest_bytes: &manifest_bytes,
+                manifest_object_digest: &pack.manifest.sha256,
+                shard_digests: &shard_digests,
+            };
+            let source = DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id, pack.pack_version, pack.manifest.sha256
+                ),
+            };
+            let extraction = extraction_accounting(&[], 0);
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            assert_eq!(connection.execute("DELETE FROM catalog_shard_validations WHERE (manifest_digest, shard_id, validation_version) = (SELECT manifest_digest, shard_id, validation_version FROM catalog_shard_validations WHERE manifest_digest=?1 LIMIT 1)", [&manifest.content_sha256]).unwrap(), 1);
+            assert_eq!(connection.execute("DELETE FROM catalog_semantic_rows_indexed_shards WHERE rowid=(SELECT rowid FROM catalog_semantic_rows_indexed_shards WHERE manifest_digest=?1 LIMIT 1)", [&manifest.content_sha256]).unwrap(), 1);
+            drop(connection);
+            let repairing = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            match repairing
+                .exact_release_install_reusable(&expected, &source, &extraction)
+                .unwrap()
+            {
+                ReuseDecision::Repaired {
+                    lease,
+                    decoded: 1,
+                    reconciled: 1,
+                } => lease.release().unwrap(),
+                _ => panic!("expected exactly one decoded certificate and reconciled marker"),
+            }
+            drop(repairing);
+            let repeat = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            match repeat
+                .exact_release_install_reusable(&expected, &source, &extraction)
+                .unwrap()
+            {
+                ReuseDecision::Reusable { lease } => lease.release().unwrap(),
+                _ => panic!("repair must make the next handle reusable"),
+            }
+            assert_eq!(repeat.shard_validation_count(), 0);
+        }
+    }
+
+    #[cfg(feature = "download")]
+    mod changed_startup_controls {
+        use super::*;
+
+        fn refresh_checksums(root: &Path, index: &ReleaseBundleIndex) {
+            fs::remove_file(root.join("SHA256SUMS")).unwrap();
+            write_checksums(root, index).unwrap();
+        }
+
+        fn publish_index(root: &Path, index: &ReleaseBundleIndex) {
+            fs::write(root.join("index.json"), json_bytes(index).unwrap()).unwrap();
+            refresh_checksums(root, index);
+        }
+
+        fn copy_bundle(source: &Path, destination: &Path) {
+            fs::create_dir_all(destination).unwrap();
+            let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
+            while let Some((from, to)) = pending.pop() {
+                for entry in fs::read_dir(from).unwrap() {
+                    let entry = entry.unwrap();
+                    let target = to.join(entry.file_name());
+                    if entry.file_type().unwrap().is_dir() {
+                        fs::create_dir_all(&target).unwrap();
+                        pending.push((entry.path(), target));
+                    } else {
+                        fs::copy(entry.path(), target).unwrap();
+                    }
+                }
+            }
+        }
+
+        fn install(root: &Path, database: &Path) -> (Vec<ReleasePackInstallation>, u64, u64, u64) {
+            let before = STARTUP_CURATED_SHARD_DECODES.with(std::cell::Cell::get);
+            let catalog = SemanticPackCatalog::open(
+                database,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let (installed, leases) = install_release_bundle_with_leases(
+                root,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            let counts = (
+                STARTUP_CURATED_SHARD_DECODES.with(std::cell::Cell::get) - before,
+                catalog.sql_statement_count(),
+                catalog.object_read_count(),
+            );
+            catalog.release_leases(&leases).unwrap();
+            (installed, counts.0, counts.1, counts.2)
+        }
+
+        fn shard_keys(database: &Path, manifest_digest: &str) -> Vec<i64> {
+            let connection = rusqlite::Connection::open(database.join("catalog.db")).unwrap();
+            let mut statement = connection
+                .prepare("SELECT shard_key FROM catalog_semantic_rows_indexed_shards WHERE manifest_digest = ?1 ORDER BY shard_id")
+                .unwrap();
+            statement
+                .query_map([manifest_digest], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        fn activated_digests(database: &Path, version: &str, artifact_sha256: &str) -> Vec<String> {
+            let catalog = SemanticPackCatalog::open(
+                database,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let request = SemanticModelActivationRequest {
+                approximate_standard_libraries: Vec::new(),
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "java".to_owned(),
+                    ecosystem: "jdk".to_owned(),
+                    package: None,
+                    module: Some(CatalogCoordinate {
+                        name: "java.base".to_owned(),
+                        version: None,
+                    }),
+                    toolchain: Some(CatalogCoordinate {
+                        name: "jdk".to_owned(),
+                        version: Some(Version::parse(version).unwrap()),
+                    }),
+                    target: Some("jvm".to_owned()),
+                    configuration: None,
+                    artifact_sha256: Some(artifact_sha256.to_owned()),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            };
+            let SemanticModelResolutionOutcome::Ready(active) =
+                resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+            else {
+                panic!("{version}: activation was not ready");
+            };
+            let mut digests = active
+                .shards()
+                .iter()
+                .map(|shard| shard.manifest.content_sha256.clone())
+                .collect::<Vec<_>>();
+            digests.sort();
+            digests
+        }
+
+        #[test]
+        fn changed_release_startup_reuses_unchanged_pack() {
+            let fixture = tempdir().unwrap();
+            let left = fixture.path().join("left");
+            let right = fixture.path().join("right");
+            fs::create_dir_all(&left).unwrap();
+            fs::create_dir_all(&right).unwrap();
+            let (left_input, _) = jdk_generated_bundle_input(&left, "21.0.8", ">=21.0.0, <22.0.0");
+            let (right_input, _) =
+                jdk_generated_bundle_input(&right, "21.0.9", ">=21.0.0, <22.0.0");
+            let inputs = [left_input.clone(), right_input];
+            let baseline = fixture.path().join("baseline");
+            let release = generate_release_bundle(
+                &baseline,
+                &inputs,
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            assert_eq!(release.index.packs.len(), 2);
+
+            // Case 1: change one artifact, preserving its pack coordinate.
+            let changed_input_root = fixture.path().join("changed-input");
+            fs::create_dir_all(&changed_input_root).unwrap();
+            let (changed_input, _) =
+                jdk_generated_bundle_input(&changed_input_root, "21.0.8", ">=21.0.0, <22.0.0");
+            crate::zip_test_support::write_zip_unwrap(
+                &changed_input.artifact_path,
+                &[
+                    (
+                        "java.base/module-info.java",
+                        "module java.base { exports java.lang; }",
+                    ),
+                    (
+                        "java.base/java/lang/Object.java",
+                        "package java.lang; public class Object { public int hashCode() { return 1; } }",
+                    ),
+                ],
+                zip::write::SimpleFileOptions::default(),
+            );
+            let (digest, _) = sha256_file(&changed_input.artifact_path).unwrap();
+            let mut spec: PinnedPackSpec =
+                serde_json::from_slice(&fs::read(&changed_input.spec_path).unwrap()).unwrap();
+            spec.artifact.sha256 = digest;
+            fs::write(&changed_input.spec_path, json_bytes(&spec).unwrap()).unwrap();
+            let changed = fixture.path().join("changed");
+            let changed_release = generate_release_bundle(
+                &changed,
+                &[changed_input.clone(), inputs[1].clone()],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            assert_ne!(
+                release.index.packs[0].manifest.sha256,
+                changed_release.index.packs[0].manifest.sha256
+            );
+            assert_eq!(
+                release.index.packs[1].manifest.sha256,
+                changed_release.index.packs[1].manifest.sha256
+            );
+
+            for (case, root) in [
+                ("manifest", &changed),
+                ("rejects", &baseline),
+                ("distribution", &baseline),
+            ] {
+                let db = fixture.path().join(format!("catalog-{case}"));
+                let (first, _, _, _) = install(&baseline, &db);
+                let unchanged_activation =
+                    activated_digests(&db, "21.0.9", &release.index.packs[1].artifact.sha256);
+                let before = first
+                    .iter()
+                    .map(|pack| shard_keys(&db, &pack.manifest_digest))
+                    .collect::<Vec<_>>();
+                assert!(before.iter().all(|keys| !keys.is_empty()));
+                let guard = rusqlite::Connection::open(db.join("catalog.db")).unwrap();
+                let protected = if case == "distribution" {
+                    &first[..]
+                } else {
+                    &first[1..]
+                };
+                for pack in protected {
+                    for table in [
+                        "catalog_pack_shards",
+                        "catalog_semantic_rows_indexed_shards",
+                        "catalog_selectors",
+                        "catalog_selector_targets",
+                        "catalog_selector_configurations",
+                        "catalog_routing_keys",
+                    ] {
+                        for (operation, row) in
+                            [("INSERT", "NEW"), ("UPDATE", "OLD"), ("DELETE", "OLD")]
+                        {
+                            guard.execute_batch(&format!(
+                                "CREATE TRIGGER guard_{table}_{operation}_{} BEFORE {operation} ON {table}
+                                 WHEN {row}.manifest_digest = '{}' BEGIN SELECT RAISE(ABORT, 'reused pack install write'); END;",
+                                pack.manifest_digest, pack.manifest_digest
+                            )).unwrap();
+                        }
+                    }
+                }
+                let scenario = fixture.path().join(format!("case-{case}"));
+                copy_bundle(root, &scenario);
+                if case == "rejects" {
+                    let mut rejects = release.rejects.clone();
+                    rejects.packs[0].suppressed_rejects += 1;
+                    fs::write(scenario.join("rejects.json"), json_bytes(&rejects).unwrap())
+                        .unwrap();
+                    refresh_checksums(&scenario, &release.index);
+                }
+                if case == "distribution" {
+                    let mut index = release.index.clone();
+                    index.packs[0].artifact.url =
+                        Some("https://example.invalid/mirror.zip".to_owned());
+                    publish_index(&scenario, &index);
+                }
+                let (second, decodes, statements, reads) = install(&scenario, &db);
+                assert!(statements > 0 && reads > 0, "{case}: counters did not run");
+                if case == "distribution" {
+                    assert_eq!(second, first);
+                    assert_eq!(decodes, 0);
+                    for (pack, keys) in second.iter().zip(&before) {
+                        assert_eq!(&shard_keys(&db, &pack.manifest_digest), keys);
+                    }
+                } else {
+                    assert_eq!(second[1], first[1], "{case}: unchanged pack changed");
+                    assert_eq!(
+                        shard_keys(&db, &second[1].manifest_digest),
+                        before[1],
+                        "{case}: unchanged pack was reinstalled"
+                    );
+                    if case == "manifest" {
+                        assert_ne!(
+                            shard_keys(&db, &second[0].manifest_digest),
+                            before[0],
+                            "{case}: changed pack was wrongly reused"
+                        );
+                    } else {
+                        let catalog = SemanticPackCatalog::open(
+                            &db,
+                            CatalogOpenMode::ReadWrite,
+                            CatalogOptions::default(),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            catalog
+                                .extraction_accounting(&second[0].manifest_digest)
+                                .unwrap()
+                                .unwrap()
+                                .suppressed_reject_count,
+                            1
+                        );
+                    }
+                    assert_eq!(
+                        decodes,
+                        release.index.packs[0].shards.len() as u64,
+                        "{case}: decoded the wrong set of curated packs"
+                    );
+                    let fresh_db = fixture.path().join(format!("fresh-{case}"));
+                    let (fresh, _, _, _) = install(&scenario, &fresh_db);
+                    assert_eq!(second, fresh, "{case}: changed install differs from fresh");
+                    // #9564 tracks activation when an earlier release source still exists.
+                    let changed_artifact_sha256 = if case == "manifest" {
+                        &changed_release.index.packs[0].artifact.sha256
+                    } else {
+                        &release.index.packs[0].artifact.sha256
+                    };
+                    assert!(
+                        activated_digests(&db, "21.0.8", changed_artifact_sha256)
+                            .contains(&second[0].manifest_digest),
+                        "{case}: changed manifest is not activated"
+                    );
+                    assert_eq!(
+                        activated_digests(&db, "21.0.9", &release.index.packs[1].artifact.sha256),
+                        unchanged_activation,
+                        "{case}: unchanged pack activation changed"
+                    );
+                }
+            }
+
+            // Case 3b: semantic index metadata must agree with the same manifest.
+            let mut incompatible = release.index.clone();
+            incompatible.packs[0].manifest_semantic_sha256 = "0".repeat(64);
+            let invalid = fixture.path().join("invalid");
+            copy_bundle(&baseline, &invalid);
+            publish_index(&invalid, &incompatible);
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let error = install_release_bundle_with_leases(
+                &invalid,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .err()
+            .expect("semantic metadata mismatch must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("release index metadata does not match manifest"),
+                "{error}"
+            );
+            assert_eq!(catalog.shard_validation_count(), 0);
+        }
+    }
 
     fn selector(package: &str, toolchain: &str, version: &str) -> ActivationSelector {
         ActivationSelector {
@@ -4079,6 +5596,7 @@ mod tests {
             },
             activation: vec![selector(package, toolchain, version)],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },
@@ -4091,6 +5609,61 @@ mod tests {
             measurement_activation: selector(package, toolchain, version),
             measurement_queries,
         }
+    }
+
+    #[test]
+    fn codeql_rust_summary_release_requires_matching_stdlib_source_set() {
+        let mut stdlib = pinned_spec(
+            "bifrost.rust-stdlib",
+            "1.100.0-nightly",
+            "cargo",
+            PinnedPackKind::RustdocJsonSet {
+                crates: vec![PinnedRustdocCrate {
+                    name: "std".into(),
+                    path: "std.json".into(),
+                }],
+            },
+            PinnedArtifact {
+                file_name: "stdlib".into(),
+                sha256: "a".repeat(64),
+                url: None,
+                container: None,
+            },
+            "rust",
+            "stdlib",
+            Vec::new(),
+        );
+        let mut summary = stdlib.clone();
+        summary.pack_id = "codeql.rust-stdlib.summaries".into();
+        summary.kind = PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: None,
+        };
+        summary.provenance.source = format!(
+            "https://github.com/github/codeql (MIT); stdlib {}@{} source-set {}",
+            stdlib.pack_id, stdlib.pack_version, stdlib.artifact.sha256
+        );
+        summary.provenance.revision = Some(RUST_CODEQL_COMMIT.into());
+        assert!(validate_rust_codeql_stdlib_coupling(&[summary.clone(), stdlib.clone()]).is_ok());
+        summary.kind = PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(vec![PinnedShardActivationPin {
+                shard_id: "summary".into(),
+                activation: stdlib.activation.clone(),
+            }]),
+        };
+        assert!(validate_rust_codeql_stdlib_coupling(&[summary.clone(), stdlib.clone()]).is_ok());
+        if let PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: Some(pins),
+        } = &mut summary.kind
+        {
+            pins[0].activation.clear();
+        }
+        assert!(validate_rust_codeql_stdlib_coupling(&[summary.clone(), stdlib.clone()]).is_err());
+        summary.kind = PinnedPackKind::AuthoredSemanticModel {
+            shard_activation_pins: None,
+        };
+        stdlib.artifact.sha256 = "b".repeat(64);
+        assert!(validate_rust_codeql_stdlib_coupling(&[summary.clone(), stdlib]).is_err());
+        assert!(validate_rust_codeql_stdlib_coupling(&[summary]).is_err());
     }
 
     fn authored_spec(
@@ -4315,7 +5888,12 @@ mod tests {
             artifact_path,
         };
 
-        let bundle = generate_release_bundle(&bundle_path, &[input]).unwrap();
+        let bundle = generate_release_bundle(
+            &bundle_path,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_eq!(bundle.index.packs.len(), 1);
         assert_eq!(bundle.index.packs[0].shards.len(), 2);
         assert_eq!(verify_release_bundle(&bundle_path).unwrap(), bundle);
@@ -4511,11 +6089,10 @@ mod tests {
     #[test]
     fn authored_python_assertion_pack_is_pinned_and_override_closed() {
         let spec: PinnedPackSpec = serde_json::from_str(include_str!(
-            "../../../semantic-packs/python/unittest-assertions-2026.9.7.spec.json"
+            "../testdata/authored-model/unittest-assertions-2026.9.7.spec.json"
         ))
         .unwrap();
-        let source =
-            include_bytes!("../../../semantic-packs/python/unittest-assertions-2026.9.7.json");
+        let source = include_bytes!("../testdata/authored-model/unittest-assertions-2026.9.7.json");
         assert_eq!(sha256_bytes(source), spec.artifact.sha256);
         let fixture = tempdir().unwrap();
         let artifact_path = fixture.path().join(&spec.artifact.file_name);
@@ -4620,11 +6197,11 @@ mod tests {
     #[hardwon("#3543: release measurement ignored the selector's pinned artifact digest")]
     fn authored_model_measurement_uses_external_artifact_pin() {
         let mut spec: PinnedPackSpec = serde_json::from_str(include_str!(
-            "../../../semantic-packs/python/unittest-assertions-2026.9.7.spec.json"
+            "../testdata/authored-model/unittest-assertions-2026.9.7.spec.json"
         ))
         .unwrap();
         let mut authored: AuthoredSemanticModelPack = serde_json::from_slice(include_bytes!(
-            "../../../semantic-packs/python/unittest-assertions-2026.9.7.json"
+            "../testdata/authored-model/unittest-assertions-2026.9.7.json"
         ))
         .unwrap();
         let external_artifact_sha256 = "a".repeat(64);
@@ -4652,6 +6229,7 @@ mod tests {
                 spec_path,
                 artifact_path,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         assert_eq!(bundle.index.packs.len(), 1);
@@ -4668,6 +6246,704 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "download")]
+    #[test]
+    #[hardwon(
+        "#6397: repeat release installation replaced shard rows and cascaded semantic publication"
+    )]
+    fn startup_release_reuse_preserves_curated_and_generated_publication() {
+        let fixture = tempdir().unwrap();
+        let (input, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let bundle = fixture.path().join("bundle");
+        generate_release_bundle(
+            &bundle,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let catalog_root = fixture.path().join("catalog");
+        let first_catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (first, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &first_catalog,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        assert_eq!(first.len(), 2);
+        first_catalog.release_leases(&leases).unwrap();
+        drop(first_catalog);
+
+        let keys = || {
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            let mut statement = connection
+                .prepare(
+                    "SELECT manifest_digest, shard_id, shard_key
+                 FROM catalog_semantic_rows_indexed_shards
+                 ORDER BY manifest_digest, shard_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let original_keys = keys();
+        assert!(!original_keys.is_empty());
+        let second_catalog = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (second, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &second_catalog,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second_catalog.shard_validation_count(), 0);
+        second_catalog.release_leases(&leases).unwrap();
+        assert_eq!(keys(), original_keys);
+    }
+
+    #[cfg(feature = "download")]
+    mod review_fix_controls {
+        use super::*;
+        use brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage;
+
+        #[test]
+        #[hardwon("#6397: typed shard corruption survived release reinstall")]
+        fn typed_shard_corruption_refuses_reinstall() {
+            for column in ["record_count", "content_digest"] {
+                let fixture = tempdir().unwrap();
+                let (input, _) =
+                    jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+                let bundle = fixture.path().join("bundle");
+                generate_release_bundle(
+                    &bundle,
+                    &[input],
+                    &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+                )
+                .unwrap();
+                let catalog_root = fixture.path().join("catalog");
+                let catalog = SemanticPackCatalog::open(
+                    &catalog_root,
+                    CatalogOpenMode::ReadWrite,
+                    CatalogOptions::default(),
+                )
+                .unwrap();
+                let (_, leases) = install_release_bundle_with_leases(
+                    &bundle,
+                    &catalog,
+                    &ReleaseCoverage::WholeRelease,
+                )
+                .unwrap();
+                catalog.release_leases(&leases).unwrap();
+                let connection =
+                    rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+                let value = if column == "record_count" {
+                    "999999".to_owned()
+                } else {
+                    format!("'{}'", "0".repeat(64))
+                };
+                connection.execute_batch(&format!(
+                    "UPDATE catalog_pack_shards SET {column} = {value} WHERE rowid = (SELECT rowid FROM catalog_pack_shards LIMIT 1)"
+                )).unwrap();
+                let error = install_release_bundle_with_leases(
+                    &bundle,
+                    &catalog,
+                    &ReleaseCoverage::WholeRelease,
+                )
+                .err()
+                .expect("corrupt typed shard must fail");
+                assert!(
+                    error.to_string().contains("differs from release manifest"),
+                    "{error}"
+                );
+            }
+        }
+
+        const PUBLICATION_TABLES: &[&str] = &[
+            "catalog_packs",
+            "catalog_pack_shards",
+            "catalog_semantic_rows_indexed_shards",
+            "catalog_selectors",
+            "catalog_selector_targets",
+            "catalog_selector_configurations",
+            "catalog_routing_keys",
+            "catalog_sources",
+        ];
+
+        fn guard_publication(connection: &rusqlite::Connection) {
+            for table in PUBLICATION_TABLES {
+                for operation in ["INSERT", "UPDATE", "DELETE"] {
+                    connection.execute_batch(&format!(
+                        "CREATE TRIGGER guard_{table}_{operation} BEFORE {operation} ON {table} \
+                         BEGIN SELECT RAISE(ABORT, 'repeat publication write'); END"
+                    )).unwrap();
+                }
+            }
+        }
+
+        #[test]
+        #[hardwon("#6397: a failed multi-pack bootstrap left earlier pack leases until expiry")]
+        fn failed_second_pack_releases_first_lease() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            let release = generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let shard = &release.index.generated_productions[0].shards[0];
+            let checksums_path = bundle.join("SHA256SUMS");
+            let original = fs::read_to_string(&checksums_path).unwrap();
+            let bad = original.replace(
+                &format!("{}  {}", shard.asset.sha256, shard.asset.path),
+                &format!("{}  {}", "0".repeat(64), shard.asset.path),
+            );
+            assert_ne!(bad, original);
+            fs::write(checksums_path, bad).unwrap();
+            let catalog_root = fixture.path().join("catalog");
+            let catalog = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let error = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .err()
+            .expect("wrong checksum must fail");
+            assert!(
+                error.to_string().contains("does not match SHA256SUMS"),
+                "{error}"
+            );
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            let packs: i64 = connection
+                .query_row("SELECT count(*) FROM catalog_packs", [], |row| row.get(0))
+                .unwrap();
+            assert!(
+                packs > 0,
+                "the first pack must have installed before the failure"
+            );
+            let leases: i64 = connection
+                .query_row("SELECT count(*) FROM catalog_leases", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(leases, 0);
+        }
+
+        #[test]
+        fn fresh_handle_repeat_has_no_publication_writes_or_curated_decodes() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let catalog_root = fixture.path().join("catalog");
+            let first = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let (_, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &first,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            first.release_leases(&leases).unwrap();
+            drop(first);
+            let guard = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            guard_publication(&guard);
+            let repeat = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            STARTUP_CURATED_SHARD_DECODES.with(|count| count.set(0));
+            let (_, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &repeat,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            assert_eq!(STARTUP_CURATED_SHARD_DECODES.with(|count| count.get()), 0);
+            repeat.release_leases(&leases).unwrap();
+        }
+    }
+
+    #[cfg(feature = "download")]
+    mod race_controls {
+        use super::*;
+        use std::sync::{Arc, Barrier};
+
+        fn audit_publication(root: &std::path::Path) {
+            let connection = rusqlite::Connection::open(root.join("catalog.db")).unwrap();
+            connection.execute_batch("CREATE TABLE publication_audit(table_name TEXT NOT NULL, operation TEXT NOT NULL)").unwrap();
+            for table in [
+                "catalog_packs",
+                "catalog_pack_shards",
+                "catalog_semantic_rows_indexed_shards",
+                "catalog_selectors",
+                "catalog_selector_targets",
+                "catalog_selector_configurations",
+                "catalog_routing_keys",
+                "catalog_sources",
+            ] {
+                for operation in ["INSERT", "UPDATE", "DELETE"] {
+                    connection
+                        .execute_batch(&format!(
+                            "CREATE TRIGGER audit_{table}_{operation} AFTER {operation} ON {table} \
+                         BEGIN INSERT INTO publication_audit VALUES ('{table}', '{operation}'); END"
+                        ))
+                        .unwrap();
+                }
+            }
+        }
+
+        fn publication_writes(root: &std::path::Path) -> Vec<(String, String, i64)> {
+            let connection = rusqlite::Connection::open(root.join("catalog.db")).unwrap();
+            let mut statement = connection.prepare("SELECT table_name, operation, count(*) FROM publication_audit GROUP BY table_name, operation ORDER BY table_name, operation").unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        fn prepared_release() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let catalog_root = fixture.path().join("catalog");
+            (fixture, bundle, catalog_root)
+        }
+
+        fn curated_member(
+            install: &ReleasePackInstallation,
+            release: &ReleaseBundle,
+        ) -> brokk_bifrost_analysis::analyzer::store::SemanticPackActiveReference {
+            use brokk_bifrost_analysis::analyzer::store::{
+                SemanticPackActivationSourceKind, SemanticPackActiveReference,
+            };
+            let pack = &release.index.packs[0];
+            SemanticPackActiveReference {
+                manifest_digest: install.manifest_digest.clone(),
+                source_kind: SemanticPackActivationSourceKind::PreShipped,
+                source_id: format!(
+                    "release:{}@{}:{}",
+                    pack.pack_id, pack.pack_version, pack.manifest.sha256
+                ),
+                workspace_produced: false,
+            }
+        }
+
+        #[test]
+        fn quarantined_pack_cannot_activate_and_retry_redecides() {
+            use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+            let (fixture, bundle, catalog_root) = prepared_release();
+            let release = verify_release_bundle(&bundle).unwrap();
+            let catalog = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let (installed, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            let member = curated_member(&installed[0], &release);
+            let store = AnalyzerStore::open_persistent(&fixture.path().join("store.db")).unwrap();
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            connection
+                .execute(
+                    "UPDATE catalog_packs SET state='quarantined' WHERE manifest_digest=?1",
+                    [&member.manifest_digest],
+                )
+                .unwrap();
+            assert!(matches!(catalog.replace_workspace_active_set("race-a", &store, std::slice::from_ref(&member)), Err(brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogError::Unavailable)));
+            assert!(store.semantic_pack_active_set().unwrap().is_none());
+            let current: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM catalog_activations WHERE scope_id='race-a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(current, 0);
+            catalog.release_leases(&leases).unwrap();
+            let (retried, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            assert_eq!(retried[0].manifest_digest, member.manifest_digest);
+            catalog
+                .replace_workspace_active_set("race-a", &store, &[member])
+                .unwrap();
+            assert!(store.semantic_pack_active_set().unwrap().is_some());
+            catalog.release_leases(&leases).unwrap();
+        }
+
+        #[test]
+        fn store_publication_failure_is_reconciled_before_ready() {
+            use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+            let (fixture, bundle, catalog_root) = prepared_release();
+            let release = verify_release_bundle(&bundle).unwrap();
+            let catalog = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let (installed, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            let member = curated_member(&installed[0], &release);
+            let store_path = fixture.path().join("store.db");
+            let store = AnalyzerStore::open_persistent(&store_path).unwrap();
+            let store_connection = rusqlite::Connection::open(&store_path).unwrap();
+            store_connection.execute_batch("CREATE TRIGGER fail_active_member BEFORE INSERT ON semantic_pack_active_members BEGIN SELECT RAISE(ABORT, 'race-b injected store failure'); END;").unwrap();
+            assert!(matches!(catalog.replace_workspace_active_set("race-b", &store, &[member]), Err(brokk_bifrost_analysis::analyzer::semantic_model::catalog::CatalogError::Integrity(_))));
+            assert!(store.semantic_pack_active_set().unwrap().is_none());
+            catalog
+                .reconcile_workspace_active_set("race-b", &store)
+                .unwrap();
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            let current: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM catalog_activations WHERE scope_id='race-b'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(current, 0);
+            catalog.release_leases(&leases).unwrap();
+        }
+
+        #[test]
+        fn simultaneous_release_install_reuses_one_publication() {
+            let fixture = tempdir().unwrap();
+            let (input, _) =
+                jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+            let bundle = fixture.path().join("bundle");
+            generate_release_bundle(
+                &bundle,
+                &[input],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
+            let catalog_root = fixture.path().join("catalog");
+            let setup = SemanticPackCatalog::open(
+                &catalog_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            drop(setup);
+            audit_publication(&catalog_root);
+            let barrier = Arc::new(Barrier::new(2));
+            let workers = (0..2)
+                .map(|_| {
+                    let bundle = bundle.clone();
+                    let catalog_root = catalog_root.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let catalog = SemanticPackCatalog::open(
+                            &catalog_root,
+                            CatalogOpenMode::ReadWrite,
+                            CatalogOptions::default(),
+                        )
+                        .unwrap();
+                        barrier.wait();
+                        let result = install_release_bundle_with_leases(&bundle, &catalog, &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease).unwrap();
+                        catalog.release_leases(&result.1).unwrap();
+                        result.0
+                    })
+                })
+                .collect::<Vec<_>>();
+            let results = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(results[0], results[1]);
+            let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+            let count: i64 = connection
+                .query_row("SELECT count(*) FROM catalog_leases", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+            let reservations: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM catalog_install_object_reservations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reservations, 0);
+            let packs: i64 = connection
+                .query_row("SELECT count(*) FROM catalog_packs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(packs, results[0].len() as i64);
+            let rows = |root: &std::path::Path| {
+                let connection = rusqlite::Connection::open(root.join("catalog.db")).unwrap();
+                let mut statement = connection.prepare("SELECT manifest_digest, shard_id, shard_key FROM catalog_semantic_rows_indexed_shards ORDER BY manifest_digest, shard_id").unwrap();
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            let single_root = fixture.path().join("single-catalog");
+            let single = SemanticPackCatalog::open(
+                &single_root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            audit_publication(&single_root);
+            let (baseline, leases) = install_release_bundle_with_leases(
+                &bundle,
+                &single,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .unwrap();
+            single.release_leases(&leases).unwrap();
+            assert_eq!(results[0], baseline);
+            assert_eq!(rows(&catalog_root), rows(&single_root));
+            let concurrent_writes = publication_writes(&catalog_root);
+            let single_writes = publication_writes(&single_root);
+            assert!(!single_writes.is_empty());
+            assert_eq!(
+                concurrent_writes, single_writes,
+                "only one worker may publish each row"
+            );
+        }
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn startup_rejects_wrong_consumed_shard_checksums_and_corrupt_assets() {
+        let fixture = tempdir().unwrap();
+        let (input, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let bundle = fixture.path().join("bundle");
+        let release = generate_release_bundle(
+            &bundle,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+
+        for shard in [
+            &release.index.packs[0].shards[0],
+            &release.index.generated_productions[0].shards[0],
+        ] {
+            let checksums_path = bundle.join("SHA256SUMS");
+            let original = fs::read_to_string(&checksums_path).unwrap();
+            let bad = original.replace(
+                &format!("{}  {}", shard.asset.sha256, shard.asset.path),
+                &format!("{}  {}", "0".repeat(64), shard.asset.path),
+            );
+            assert_ne!(bad, original);
+            fs::write(&checksums_path, bad).unwrap();
+            let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+            let error = install_release_bundle_with_leases(
+                &bundle,
+                &catalog,
+                &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+            )
+            .err()
+            .expect("wrong checksum must fail");
+            assert!(
+                error.to_string().contains("does not match SHA256SUMS"),
+                "{error}"
+            );
+            fs::write(checksums_path, original).unwrap();
+        }
+
+        let shard = &release.index.packs[0].shards[0];
+        let asset = bundle.join(&shard.asset.path);
+        let original = fs::read(&asset).unwrap();
+        fs::write(&asset, b"corrupt shard").unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let error = install_release_bundle_with_leases(
+            &bundle,
+            &catalog,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .err()
+        .expect("corrupt consumed asset must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its declared digest and size"),
+            "{error}"
+        );
+        fs::write(asset, original).unwrap();
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn startup_reuse_does_not_read_unconsumed_bundle_shard() {
+        let fixture = tempdir().unwrap();
+        let (input, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let bundle = fixture.path().join("bundle");
+        let release = generate_release_bundle(
+            &bundle,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let catalog_root = fixture.path().join("catalog");
+        let first = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (installed, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &first,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        first.release_leases(&leases).unwrap();
+        drop(first);
+
+        let shard = &release.index.packs[0].shards[0];
+        fs::write(bundle.join(&shard.asset.path), b"corrupt unconsumed shard").unwrap();
+        let second = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (reused, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &second,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        assert_eq!(reused, installed);
+        assert_eq!(second.shard_validation_count(), 0);
+        second.release_leases(&leases).unwrap();
+    }
+
+    #[cfg(feature = "download")]
+    #[test]
+    fn startup_repairs_missing_certificate_and_publication_marker() {
+        let fixture = tempdir().unwrap();
+        let (input, _) = jdk_generated_bundle_input(fixture.path(), "21.0.8", ">=21.0.0, <22.0.0");
+        let bundle = fixture.path().join("bundle");
+        generate_release_bundle(
+            &bundle,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let catalog_root = fixture.path().join("catalog");
+        let first = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (_, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &first,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        first.release_leases(&leases).unwrap();
+        drop(first);
+
+        let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+        assert_eq!(connection.execute("DELETE FROM catalog_shard_validations WHERE (manifest_digest, shard_id, validation_version) = (SELECT manifest_digest, shard_id, validation_version FROM catalog_shard_validations LIMIT 1)", []).unwrap(), 1);
+        assert_eq!(connection.execute("DELETE FROM catalog_semantic_rows_indexed_shards WHERE rowid = (SELECT rowid FROM catalog_semantic_rows_indexed_shards LIMIT 1)", []).unwrap(), 1);
+        drop(connection);
+
+        let repairing = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (_, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &repairing,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        assert!(repairing.shard_validation_count() > 0);
+        repairing.release_leases(&leases).unwrap();
+        drop(repairing);
+        let connection = rusqlite::Connection::open(catalog_root.join("catalog.db")).unwrap();
+        let missing: i64 = connection.query_row("SELECT count(*) FROM catalog_pack_shards AS s LEFT JOIN catalog_semantic_rows_indexed_shards AS m ON m.manifest_digest=s.manifest_digest AND m.shard_id=s.shard_id WHERE m.shard_id IS NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(missing, 0);
+        drop(connection);
+
+        let repeat = SemanticPackCatalog::open(
+            &catalog_root,
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let (_, leases) = install_release_bundle_with_leases(
+            &bundle,
+            &repeat,
+            &brokk_bifrost_analysis::analyzer::packs_document::ReleaseCoverage::WholeRelease,
+        )
+        .unwrap();
+        assert_eq!(repeat.shard_validation_count(), 0);
+        repeat.release_leases(&leases).unwrap();
+    }
+
     #[test]
     fn jdk_generated_production_is_deterministic_verifiable_and_installable() {
         let fixture = tempdir().unwrap();
@@ -4678,8 +6954,18 @@ mod tests {
         let artifact_path = input.artifact_path.clone();
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, std::slice::from_ref(&input)).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let measurements: ReleaseBundleMeasurements =
             serde_json::from_slice(&fs::read(first.join("measurements.json")).unwrap()).unwrap();
@@ -5242,6 +7528,7 @@ mod tests {
             },
             activation: vec![activation.clone()],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },
@@ -5271,6 +7558,7 @@ mod tests {
                 spec_path: spec,
                 artifact_path: artifact,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         let original = &bundle.index.generated_productions[0];
@@ -5402,6 +7690,7 @@ mod tests {
             },
             activation: vec![activation.clone()],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },
@@ -5428,8 +7717,12 @@ mod tests {
             artifact_path: artifact,
         };
         let output = fixture.path().join("bundle");
-        let error = generate_release_bundle(&output, std::slice::from_ref(&input))
-            .expect_err("a curated partial pack with an unnamed reject must fail the bundle gate");
+        let error = generate_release_bundle(
+            &output,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .expect_err("a curated partial pack with an unnamed reject must fail the bundle gate");
         let message = error.to_string();
         assert!(
             message.contains("not activation-ready") && message.contains("bifrost.jdk"),
@@ -5482,8 +7775,18 @@ mod tests {
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         assert_eq!(first_bundle.rejects.packs.len(), 1);
         assert!(first_bundle.rejects.packs[0].rejects.is_empty());
@@ -5549,6 +7852,7 @@ mod tests {
                 spec_path: spec,
                 artifact_path: artifact,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         let pack = &bundle.index.packs[0];
@@ -5676,8 +7980,18 @@ mod tests {
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "python");
@@ -5893,6 +8207,7 @@ mod tests {
                 spec_path: spec,
                 artifact_path: root,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         assert_eq!(bundle.index.packs.len(), 1);
@@ -5964,43 +8279,6 @@ mod tests {
             error.to_string().contains("duplicate TypeScript library"),
             "{error}"
         );
-    }
-
-    /// Every checked-in pinned spec must parse and validate through the same
-    /// release tooling that builds the published bundle, so an unbounded or
-    /// unparseable version requirement fails here rather than at release time
-    /// (#3465). `semantic-packs/python` is not listed: that directory mixes an
-    /// authored semantic-model pack with its `.spec.json`, so "every JSON file
-    /// is a pinned spec" is not true there.
-    #[test]
-    #[hardwon("#3465: shipped pack specs must use bounded compatible version ranges")]
-    fn checked_in_pinned_specs_parse_and_validate_through_release_tooling() {
-        let semantic_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../semantic-packs");
-        for ecosystem in ["jvm", "php", "typescript", "rust"] {
-            let directory = semantic_packs.join(ecosystem);
-            let mut paths = fs::read_dir(&directory)
-                .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                })
-                .collect::<Vec<_>>();
-            paths.sort();
-            assert!(!paths.is_empty(), "no checked-in {ecosystem} specs found");
-            let specs = paths
-                .into_iter()
-                .map(|path| {
-                    let bytes = fs::read(&path).unwrap();
-                    let spec: PinnedPackSpec = serde_json::from_slice(&bytes)
-                        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
-                    (path, spec)
-                })
-                .collect::<Vec<_>>();
-            for (path, spec) in specs {
-                validate_spec(&spec, &path)
-                    .unwrap_or_else(|error| panic!("validate {}: {error}", path.display()));
-            }
-        }
     }
 
     fn assert_installed_bundle_resolves_type(
@@ -6102,6 +8380,7 @@ mod tests {
                 spec_path: spec,
                 artifact_path: root,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap_err();
         assert!(!error.to_string().contains("unsupported_artifact_kind"));
@@ -6147,8 +8426,18 @@ mod tests {
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "ruby");
@@ -6227,8 +8516,18 @@ mod tests {
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "typescript");
@@ -6302,8 +8601,18 @@ mod tests {
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "go");
@@ -6376,8 +8685,18 @@ mod tests {
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
-        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        let first_bundle = generate_release_bundle(
+            &first,
+            std::slice::from_ref(&input),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
+        let second_bundle = generate_release_bundle(
+            &second,
+            &[input],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
         let pack = &first_bundle.index.packs[0];
         assert_eq!(pack.language, "php");
@@ -6437,6 +8756,7 @@ mod tests {
                 spec_path: spec,
                 artifact_path: artifact,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
 
@@ -6626,6 +8946,7 @@ trait RepeatedLists {
                 spec_path: spec,
                 artifact_path: artifact,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
 
@@ -6715,6 +9036,7 @@ trait RepeatedLists {
                 spec_path: spec,
                 artifact_path: source_root,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
 
@@ -6890,6 +9212,7 @@ trait RepeatedLists {
                 spec_path: scala_spec,
                 artifact_path: scala_artifact,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         let java_bundle = fixture.path().join("java-bundle");
@@ -6899,6 +9222,7 @@ trait RepeatedLists {
                 spec_path: java_spec,
                 artifact_path: java_artifact,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
 
@@ -6975,6 +9299,50 @@ trait RepeatedLists {
     }
 
     #[test]
+    fn approximate_rust_dependency_spec_is_held_before_distribution() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            RustArtifactApproximation, RustArtifactMismatchKind,
+        };
+        let mut spec = pinned_spec(
+            "fixture",
+            "1.0.0",
+            "cargo",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "artifact.jar".to_owned(),
+                sha256: "a".repeat(64),
+                url: None,
+                container: None,
+            },
+            "rust",
+            "sqlx",
+            vec![PinnedLookupQuery::Type {
+                name: "sqlx::Query".to_owned(),
+            }],
+        );
+        spec.provenance.rust_artifact_approximation = Some(RustArtifactApproximation {
+            built_from_version: "0.8.1".to_owned(),
+            built_from_features: Vec::new(),
+            built_from_cfgs: Vec::new(),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            format_version: 61,
+            toolchain: "nightly".to_owned(),
+            docsrs_build: true,
+            original_sha256: "a".repeat(64),
+            produced_sha256: "b".repeat(64),
+            activation_version_requirement: ">=0.8.1,<0.9.0".to_owned(),
+            mismatch_kinds: vec![RustArtifactMismatchKind::VersionNearby],
+            selection_rule_id: "cargo-compatible-nearest".to_owned(),
+            selection_rule_version: 1,
+        });
+        let error = validate_spec(&spec, Path::new("sqlx-approximate.json")).unwrap_err();
+        assert!(
+            error.to_string().contains("#10189, #10198, #10212"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn spec_validation_rejects_unknown_family_and_missing_or_placeholder_license() {
         let fixture = tempdir().unwrap();
         fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
@@ -7010,6 +9378,7 @@ trait RepeatedLists {
                     spec_path,
                     artifact_path: artifact.clone(),
                 }],
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
             )
         };
         let valid_json = serde_json::to_value(&valid).unwrap();
@@ -7076,5 +9445,107 @@ trait RepeatedLists {
         assert!(validate_release_notices(&[notice("../NOTICE.txt")]).is_err());
         assert!(validate_release_notices(&[notice("z.txt"), notice("a.txt")]).is_err());
         assert!(validate_release_notices(&[notice("NOTICE.txt"), notice("NOTICE.txt")]).is_err());
+    }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "39f8b66779f6: release verification accepted alias cycles across shards"
+    )]
+    fn release_pack_reader_rejects_cross_shard_alias_cycles() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::artifact::{
+            canonical_json, compiled_from_wire, content_digest, manifest_content_digest,
+            manifest_semantic_digest, payload_inventory, read_shard_wire, semantic_digest,
+        };
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            AuthoredPayload, CompiledPayload, CompressionPolicy, TypeRef,
+        };
+        let mut authored: AuthoredSemanticModelPack = serde_json::from_value(serde_json::json!({
+            "schema_version":32,"pack_id":"test.aliases","version":"1.0.0",
+            "producer":{"name":"test-only","version":"1.0.0"},"language":"java","ecosystem":"maven",
+            "compatibility":{"toolchains":[]},"provenance":{"source":"test-only aliases"},
+            "license":"NOASSERTION","completeness":"complete","safety":{"generated_code_only":false,"review_required":false},
+            "shards":[{"id":"aliases.0","activation":[{"targets":["test-only"]}],"payload":{"kind":"declaration_facts","types":[{
+                "id":"alias.0","name":"example.First","type_kind":"type_alias","visibility":"public",
+                "alias_target":{"kind":"named","name":"java.lang.String"},
+                "locator":{"kind":"artifact","path":"test-only","symbol":"example.First"}
+            }],"members":[],"relations":[]}}]
+        })).unwrap();
+        let mut second = authored.shards[0].clone();
+        second.id = "aliases.1".into();
+        let AuthoredPayload::DeclarationFacts { types, .. } = &mut second.payload else {
+            unreachable!()
+        };
+        types[0].id = "alias.1".into();
+        types[0].name = "example.Second".into();
+        authored.shards.push(second);
+        let mut pack = compile_pack(
+            &authored,
+            &CompilerOptions {
+                compression: CompressionPolicy::AlwaysRaw,
+                ..CompilerOptions::default()
+            },
+        )
+        .unwrap();
+        let root = tempdir().unwrap();
+        let mut indexed = Vec::new();
+        for (index, artifact) in pack.shards.iter_mut().enumerate() {
+            let (wire, _) = read_shard_wire(
+                &artifact.descriptor,
+                &artifact.bytes,
+                &DecodeLimits::default(),
+            )
+            .unwrap();
+            let mut shard = compiled_from_wire(wire);
+            let CompiledPayload::DeclarationFacts { types, .. } = &mut shard.payload else {
+                unreachable!()
+            };
+            Arc::make_mut(&mut types[0]).alias_target = Some(TypeRef::Declared {
+                id: format!("alias.{}", 1 - index),
+                arguments: vec![],
+                nullable: false,
+            });
+            artifact.bytes = canonical_json(&shard).unwrap();
+            let descriptor = &mut artifact.descriptor;
+            descriptor.referenced_ids = payload_inventory(&shard.payload).1;
+            descriptor.raw_size = artifact.bytes.len() as u64;
+            descriptor.stored_size = descriptor.raw_size;
+            descriptor.content_sha256 = content_digest(&artifact.bytes);
+            descriptor.stored_sha256 = descriptor.content_sha256.clone();
+            descriptor.semantic_sha256 = semantic_digest(&shard).unwrap();
+            let path = format!("shard-{index}.json");
+            fs::write(root.path().join(&path), &artifact.bytes).unwrap();
+            indexed.push(ReleaseShard {
+                shard_id: descriptor.shard_id.clone(),
+                asset: ReleaseAsset {
+                    path,
+                    sha256: descriptor.stored_sha256.clone(),
+                    bytes: descriptor.stored_size,
+                },
+                encoding: descriptor.encoding,
+                raw_bytes: descriptor.raw_size,
+                records: descriptor.record_count,
+                semantic_sha256: descriptor.semantic_sha256.clone(),
+                content_sha256: descriptor.content_sha256.clone(),
+            });
+        }
+        pack.manifest.shards = pack
+            .shards
+            .iter()
+            .map(|shard| shard.descriptor.clone())
+            .collect();
+        pack.manifest.semantic_sha256 = manifest_semantic_digest(&pack.manifest).unwrap();
+        pack.manifest.content_sha256 = manifest_content_digest(&pack.manifest).unwrap();
+        let bytes = canonical_json(&pack.manifest).unwrap();
+        let error = read_compiled_pack_from_manifest(
+            root.path(),
+            "test.aliases",
+            pack.manifest,
+            bytes,
+            &indexed,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("declaration.alias_target_cycle"),
+            "{error}"
+        );
     }
 }

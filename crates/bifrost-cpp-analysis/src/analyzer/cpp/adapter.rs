@@ -36,16 +36,8 @@ pub(crate) const CPP_C_STORAGE_LANGUAGE_KEY: &str = "cpp:c";
 pub struct CppAdapter;
 
 impl LanguageAdapter for CppAdapter {
-    fn supports_structural_line_data(&self) -> bool {
-        true
-    }
-
-    fn is_structural_line_data(
-        &self,
-        node: tree_sitter::Node<'_>,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> std::ops::ControlFlow<(), bool> {
-        brokk_bifrost_cpp::adapter::is_numeric_initializer_data(node, should_stop)
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_cpp::adapter::CPP_LINE_DATA_KINDS
     }
 
     /// Relative to `brokk-bifrost-cpp`'s crate root: the `.scm` assets moved

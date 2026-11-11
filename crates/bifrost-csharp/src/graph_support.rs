@@ -33,6 +33,7 @@ use crate::imports::{
     csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_alias_from_node,
     csharp_using_namespace,
 };
+use crate::namespace_regions::CSharpFileScopedNamespaces;
 use crate::syntax::{
     csharp_arity_preserving_full_name, csharp_normalize_full_name, csharp_type_node_segments,
     csharp_using_directive_is_global, csharp_using_directive_is_static,
@@ -61,6 +62,20 @@ use tree_sitter::Node;
 /// different filtering, ordering, fallback or index -- are recorded on the
 /// methods themselves.
 pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProvider {
+    fn record_pack_open(&self, reason: &'static str);
+    fn fenced_pack_owner_exists(&self, owner_fqn: &str) -> bool;
+    /// True while any active C# semantic pack is `Fenced`.
+    fn fenced_pack_active(&self) -> bool;
+    /// Fence-derived pack openness for one exact owner FQN and optional member family.
+    /// The reason is deterministic for the active build; None means no pack fence is open.
+    fn pack_open_reason(&self, owner_fqn: &str, member: Option<&str>) -> Option<&'static str>;
+    /// The static extension methods named `member` that active C# semantic
+    /// models declare, for extension lookup to place in its scope walk.
+    fn model_extension_methods(
+        &self,
+        member: &str,
+    ) -> crate::graph::resolver::CSharpModelExtensionMethods;
+
     /// Read attribution tied to this source's exact generation and query registry.
     fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability;
 
@@ -202,9 +217,10 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
         limit: usize,
     ) -> LimitedQueryRows<ImportInfo>;
 
-    /// Every file's import records in one store walk, so the `global using`
-    /// cells need not iterate [`Self::all_files`] themselves. `limit` caps rows
-    /// and `continue_query` is polled for cancellation.
+    /// Import records of the selected files from [`Self::all_files`] in that
+    /// canonical order. The limited per-file reader keeps its row-byte budget;
+    /// `limit` caps inspected files and rows, and `continue_query` is polled
+    /// between files.
     fn workspace_import_info_limited(
         &self,
         limit: usize,
@@ -345,8 +361,8 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
         namespaces
     }
 
-    /// [`Self::global_using_namespaces`] under a budget, from one store-wide
-    /// import walk. It fills the same memo cell when the batch completes.
+    /// [`Self::global_using_namespaces`] under a budget, over the same selected
+    /// file enumeration. It fills the same memo cell when the batch completes.
     fn global_using_namespaces_limited(
         &self,
         limit: usize,
@@ -358,8 +374,8 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// as a default over the budgeted spelling below.
     fn global_using_aliases(&self) -> std::sync::Arc<HashMap<String, String>>;
 
-    /// [`Self::global_using_aliases`] under a budget, as pairs, from one
-    /// store-wide import walk. It fills the same memo cell when the batch
+    /// [`Self::global_using_aliases`] under a budget, as pairs, over the same
+    /// selected file enumeration. It fills the same memo cell when the batch
     /// completes.
     fn global_using_aliases_limited(
         &self,
@@ -1161,10 +1177,19 @@ pub fn compute_global_using_namespaces(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
 ) -> HashSet<String> {
-    source
-        .all_files()
+    collect_global_using_namespaces(
+        source
+            .all_files()
+            .into_iter()
+            .flat_map(|file| source.import_info_of(token, &file).into_iter()),
+    )
+}
+
+fn collect_global_using_namespaces(
+    imports: impl IntoIterator<Item = ImportInfo>,
+) -> HashSet<String> {
+    imports
         .into_iter()
-        .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_namespace(&import))
         .filter_map(|namespace| normalize_global_using_target(&namespace))
@@ -1178,13 +1203,7 @@ pub fn compute_global_using_namespaces_limited(
     continue_query: &mut dyn FnMut() -> bool,
 ) -> LimitedQueryRows<String> {
     let imports = source.workspace_import_info_limited(limit, continue_query);
-    let namespaces: HashSet<_> = imports
-        .rows
-        .into_iter()
-        .filter(|import| import.is_global)
-        .filter_map(|import| csharp_using_namespace(&import))
-        .filter_map(|namespace| normalize_global_using_target(&namespace))
-        .collect();
+    let namespaces = collect_global_using_namespaces(imports.rows);
     if !imports.complete {
         return LimitedQueryRows::incomplete(namespaces.into_iter().collect(), imports.inspected);
     }
@@ -1196,10 +1215,19 @@ pub fn compute_global_using_aliases(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
 ) -> HashMap<String, String> {
-    source
-        .all_files()
+    collect_global_using_aliases(
+        source
+            .all_files()
+            .into_iter()
+            .flat_map(|file| source.import_info_of(token, &file).into_iter()),
+    )
+}
+
+fn collect_global_using_aliases(
+    imports: impl IntoIterator<Item = ImportInfo>,
+) -> HashMap<String, String> {
+    imports
         .into_iter()
-        .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.is_global)
         .filter_map(|import| csharp_using_alias_from_import(&import))
         .collect()
@@ -1212,12 +1240,7 @@ pub fn compute_global_using_aliases_limited(
     continue_query: &mut dyn FnMut() -> bool,
 ) -> LimitedQueryRows<(String, String)> {
     let imports = source.workspace_import_info_limited(limit, continue_query);
-    let aliases: HashMap<_, _> = imports
-        .rows
-        .iter()
-        .filter(|import| import.is_global)
-        .filter_map(csharp_using_alias_from_import)
-        .collect();
+    let aliases = collect_global_using_aliases(imports.rows);
     if !imports.complete {
         return LimitedQueryRows::incomplete(aliases.into_iter().collect(), imports.inspected);
     }
@@ -1230,10 +1253,23 @@ pub fn compute_global_static_using_type_names(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
 ) -> Vec<String> {
-    let mut names = compute_global_static_using_targets(source, token)
+    collect_global_static_using_type_names(
+        source
+            .all_files()
+            .into_iter()
+            .flat_map(|file| source.import_info_of(token, &file)),
+    )
+}
+
+fn collect_global_static_using_type_names(
+    imports: impl IntoIterator<Item = ImportInfo>,
+) -> Vec<String> {
+    let mut names: Vec<_> = imports
         .into_iter()
+        .filter(|import| import.is_global)
+        .filter_map(|import| normalized_static_using_target(&import))
         .filter(|target| !target.is_empty())
-        .collect::<Vec<_>>();
+        .collect();
     names.sort();
     names.dedup();
     names
@@ -1258,15 +1294,7 @@ pub fn compute_global_static_using_type_names_limited(
     continue_query: &mut dyn FnMut() -> bool,
 ) -> LimitedQueryRows<String> {
     let imports = source.workspace_import_info_limited(limit, continue_query);
-    let mut type_names: Vec<_> = imports
-        .rows
-        .iter()
-        .filter(|import| import.is_global)
-        .filter_map(normalized_static_using_target)
-        .filter(|target| !target.is_empty())
-        .collect();
-    type_names.sort();
-    type_names.dedup();
+    let type_names = collect_global_static_using_type_names(imports.rows);
     if !imports.complete {
         return LimitedQueryRows::incomplete(type_names, imports.inspected);
     }
@@ -1579,25 +1607,12 @@ fn namespace_scope_nodes<'tree>(
     }
     namespace_nodes.reverse();
 
-    // File-scoped namespaces govern following compilation-unit siblings.
-    // On malformed repeated declarations, this context and transient lookup
-    // use the nearest preceding scope. Persisted naming cumulatively joins
-    // those declarations (#8957).
-    let mut file_scoped = None;
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if !continue_lookup() {
-            return None;
-        }
-        if child.start_byte() > node.start_byte() {
-            break;
-        }
-        if child.kind() == "file_scoped_namespace_declaration"
-            && child.end_byte() <= node.start_byte()
-        {
-            file_scoped = Some(child);
-        }
-    }
+    // A file-scoped namespace governs its following compilation-unit
+    // siblings; on malformed repeated declarations lookup takes the nearest
+    // preceding one (see `namespace_regions`).
+    let file_scoped =
+        CSharpFileScopedNamespaces::through(root, node.start_byte(), &mut *continue_lookup)?
+            .nearest_at(node.start_byte());
     Some((root, file_scoped, namespace_nodes))
 }
 

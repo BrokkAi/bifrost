@@ -1,5 +1,6 @@
 //! On-demand, typed Python rule facts projected from one exact query input.
 
+use super::dispatch::{DispatchCompleteness, DispatchProof};
 use super::procedure_return_profile::reachable_points;
 use super::python_class_hierarchy::{
     HierarchyDecision, hierarchy_premise, member_premise, override_premise,
@@ -5147,7 +5148,7 @@ fn exact_local_dispatch_target(
     let [arm] = answer.arms.as_slice() else {
         return (None, dispatch_incompleteness);
     };
-    if arm.proof != "proven" || arm.completeness != "complete" {
+    if arm.proof != DispatchProof::Proven || arm.completeness != DispatchCompleteness::Complete {
         return (None, dispatch_incompleteness);
     }
     (

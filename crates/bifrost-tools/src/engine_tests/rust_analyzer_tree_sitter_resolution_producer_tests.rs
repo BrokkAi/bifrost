@@ -79,7 +79,14 @@ passthrough! {
                 .set_language(&tree_sitter_rust::LANGUAGE.into())
                 .unwrap();
             let tree = parser.parse(source, None).unwrap();
-            brokk_bifrost_rust::declarations::parse_rust_file(&fixture.file(path), source, &tree)
+            brokk_bifrost_rust::declarations::parse_rust_file_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                &fixture.file(path),
+                source,
+                &tree,
+            )
         };
         let first = parse("src/first.rs");
         let second = parse("src/second.rs");
@@ -176,7 +183,7 @@ passthrough! {
         let fixture = InlineTestProject::with_language(Language::Rust)
             .file("src/lib.rs", source)
             .build();
-        let disk = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter);
+        let disk = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter::for_tests());
         let file = fixture.file("src/lib.rs");
         let overlay = Arc::new(brokk_bifrost_core::analyzer::project::OverlayProject::new(
             fixture.project_dyn(),
@@ -259,7 +266,7 @@ mod third { pub type SelfSuper = self::super::z::T; }
             "workspace indexing should retain the type alias"
         );
 
-        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter::for_tests());
         let parsed = analyzer
             .fetch_file_state(&file)
             .expect("indexed Rust file state");
@@ -366,7 +373,7 @@ mod third { pub type SelfSuper = self::super::z::T; }
             .build();
         assert_eq!(fixture.languages(), BTreeSet::from([Language::Rust]));
 
-        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(fixture.project_dyn(), RustAdapter::for_tests());
         assert_eq!(
             analyzer.state.persistence_stats.failed_blobs,
             0,
@@ -400,7 +407,14 @@ mod third { pub type SelfSuper = self::super::z::T; }
                 .fetch_file_state(&file)
                 .unwrap_or_else(|| panic!("Rust fixture state is available for {path}"));
             let tree = parser.parse(source, None).expect("parse Rust spike file");
-            let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+            let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                &file,
+                source,
+                &tree,
+            );
             assert!(!parsed.resolution_facts.is_empty());
             assert!(!parsed.resolution_facts.scopes.is_empty());
             // `app/src/tests.rs` is `assert_ne!(super::selected::VALUE, 0)` and
@@ -586,7 +600,7 @@ passthrough! {
         cold_context.build_tier_access = Arc::new(AnalyzerBuildTierAccess::new_active());
         let cold = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
-            RustAdapter,
+            RustAdapter::for_tests(),
             AnalyzerConfig {
                 parallelism: Some(1),
                 ..AnalyzerConfig::default()
@@ -914,7 +928,7 @@ passthrough! {
         warm_context.build_tier_access = Arc::new(AnalyzerBuildTierAccess::new_active());
         let mut warm = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
-            RustAdapter,
+            RustAdapter::for_tests(),
             AnalyzerConfig {
                 parallelism: Some(1),
                 ..AnalyzerConfig::default()
@@ -959,7 +973,7 @@ passthrough! {
             let context = revision_image_store_context(project.as_ref(), Arc::clone(&store));
             let disk = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
                 project,
-                RustAdapter,
+                RustAdapter::for_tests(),
                 AnalyzerConfig::default(),
                 context,
                 None,

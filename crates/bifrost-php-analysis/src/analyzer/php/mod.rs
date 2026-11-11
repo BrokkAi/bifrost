@@ -28,10 +28,11 @@ use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 pub mod adapter;
 mod clones;
 pub mod dependency_discovery;
+pub mod dependency_evidence;
 pub(crate) mod diagnostics;
 mod external;
 mod imports;
-mod semantic;
+pub(crate) mod semantic;
 mod source_artifact;
 pub(crate) mod source_publication;
 #[doc(hidden)]
@@ -235,7 +236,10 @@ pub struct PhpAnalyzer {
     /// file's blob, so both cells are built fresh by `update` rather than
     /// invalidated per changed file -- the same lifetime `direct_ancestors`
     /// has.
-    imported_code_units: BoundedMemo<ProjectFile, Arc<HashSet<CodeUnit>>>,
+    imported_code_units: BoundedMemo<
+        ProjectFile,
+        Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
+    >,
     /// Which files import each file, inverted from `imported_code_units` over
     /// the whole workspace in one pass.
     reverse_import_index: Arc<WorkspaceAuthorityMemo<PoolSafeMemo<ReverseImports>>>,
@@ -290,10 +294,12 @@ impl PhpAnalyzer {
         clone
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         TreeSitterAnalyzer::wrap_with_config(
             config,
@@ -362,7 +368,10 @@ impl PhpAnalyzer {
             )),
             imported_code_units: Arc::new(ReplayingMemo::new(build_weighted_cache(
                 memo_budget / 8,
-                |_key, entry: &MemoEntry<Arc<HashSet<CodeUnit>>>| {
+                |_key,
+                 entry: &MemoEntry<
+                    Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
+                >| {
                     u32::try_from(entry.retained_bytes(|key| {
                         let mut heap = RetainedHeap::default();
                         retained_read_key(&mut heap, key);
@@ -380,6 +389,7 @@ impl PhpAnalyzer {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
@@ -724,6 +734,25 @@ impl CodeUnitIndex for PhpAnalyzer {
 impl IAnalyzer for PhpAnalyzer {
     brokk_bifrost_analysis::forward_query_read_ledger!();
 
+    fn dependency_file_evidence(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence,
+    > {
+        self.inner.dependency_file_evidence()
+    }
+
+    fn dependency_file_locations(
+        &self,
+    ) -> brokk_bifrost_analysis::analyzer::store::Result<
+        Vec<(
+            String,
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyEvidenceLocation,
+        )>,
+    > {
+        self.inner.dependency_file_locations()
+    }
+
     delegate_inner_procedure_fact_methods!();
 
     forward_relational_definition_batch!();
@@ -805,9 +834,13 @@ impl IAnalyzer for PhpAnalyzer {
         fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            let inner = self.inner.update(changed_files);
+            let inner = self.inner.update_with_listing(changed_files, listing);
             let composer_autoload = if changed_files
                 .iter()
                 .any(PhpComposerAutoload::manifest_changed)
@@ -972,6 +1005,19 @@ static PHP_USAGE_STRATEGY: PhpUsageGraphStrategy = PhpUsageGraphStrategy::new();
 pub struct PhpSupport;
 
 impl LanguageSupport for PhpSupport {
+    fn policy_lowering_identity(
+        &self,
+        _models: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity> {
+        Some(
+            brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer::identity(
+                &semantic::PhpSemanticLowerer,
+            ),
+        )
+    }
+
     fn workspace_semantic_diagnostics(
         &self,
         workspace: &brokk_bifrost_analysis::analyzer::multi_analyzer::MultiAnalyzer,
@@ -1291,6 +1337,7 @@ mod dependency_packs {
             &self,
             config: &AnalyzerConfig,
             project: &dyn Project,
+            _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {
@@ -1304,7 +1351,52 @@ mod dependency_packs {
     }
 }
 
-impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PhpSupport {}
+impl brokk_bifrost_analysis::analyzer::store::StoreLanguageSupport for PhpSupport {
+    /// Composer manifests, lockfiles and runtime pins feed static dependency
+    /// evidence, so each revision retains their exact bytes.
+    fn is_configuration_input_path(&self, path: &std::path::Path) -> bool {
+        dependency_evidence::is_composer_dependency_input(path)
+    }
+
+    /// A `.php-version` pin applies from a project's directory upward and is
+    /// a dotfile a listing may omit.
+    fn include_native_metadata_paths(
+        &self,
+        project: &dyn brokk_bifrost_analysis::analyzer::Project,
+        _files: &std::collections::BTreeSet<ProjectFile>,
+        inputs: &mut std::collections::BTreeSet<ProjectFile>,
+    ) -> std::io::Result<()> {
+        use brokk_bifrost_analysis::analyzer::store::workspace_inputs::metadata_ancestor_directories;
+        let directories = metadata_ancestor_directories(
+            inputs
+                .iter()
+                .filter(|file| dependency_evidence::is_composer_project_input(file.rel_path())),
+        );
+        for directory in directories {
+            if let Some(file) = project.file_by_rel_path(&directory.join(".php-version")) {
+                inputs.insert(file);
+            }
+        }
+        Ok(())
+    }
+
+    fn selected_dependency_file_evidence(
+        &self,
+        _root: &std::path::Path,
+        selected: &[(
+            ProjectFile,
+            brokk_bifrost_analysis::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
+        )],
+        limits: &brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidenceLimits,
+    ) -> brokk_bifrost_analysis::analyzer::semantic_model::DependencyFileEvidence {
+        let selected = selected
+            .iter()
+            .map(|(file, source, _)| (file.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        dependency_evidence::collect_composer_dependency_evidence(&selected, limits)
+    }
+}
 
 #[cfg(test)]
 mod source_fact_tests;
@@ -1355,8 +1447,9 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for PhpA
     fn update(
         &self,
         changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
-        Box::new(IAnalyzer::update(self, changed_files))
+        Box::new(IAnalyzer::update_with_listing(self, changed_files, listing))
     }
 
     fn update_all_with_progress(

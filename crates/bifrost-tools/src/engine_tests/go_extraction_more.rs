@@ -852,7 +852,7 @@ func Make() *Outer { return &Outer{} }
             );
             store
                 .conn
-                .execute(|conn| {
+                .execute_fixture(|conn| {
                     conn.execute("DELETE FROM blobs", [])?;
                     let count: i64 =
                         conn.query_row("SELECT COUNT(*) FROM source_go_manifests", [], |row| {

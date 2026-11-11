@@ -28,9 +28,11 @@ pub(super) type AttributedRuntimeWriteFootprintCache = WorkspaceAuthorityMemo<
     brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::runtime_values::WorkspaceRuntimeWriteFootprintCache,
 >;
 
-pub(super) fn attributed_runtime_write_footprint_cache() -> AttributedRuntimeWriteFootprintCache {
+pub(super) fn attributed_runtime_write_footprint_cache(
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+) -> AttributedRuntimeWriteFootprintCache {
     WorkspaceAuthorityMemo::new(WorkspaceFactFamily::RuntimeRootWriteFootprint,
-        brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::runtime_values::workspace_runtime_write_footprint_cache())
+        brokk_bifrost_semantic::analyzer::semantic::workspace_oracle::runtime_values::workspace_runtime_write_footprint_cache(budget))
 }
 
 fn footprint_digest(
@@ -191,7 +193,8 @@ impl WorkspaceSemanticOracle<'_> {
     }
 }
 
-use crate::analyzer::complete_value_cache::CompleteValueAcquisition;
+use brokk_bifrost_core::budgeted_value_cache::BudgetedValueAcquisition;
+use brokk_bifrost_core::retention_budget::{Accounted, SelfCharged, SharedAllocation};
 impl WorkspaceSemanticOracle<'_> {
     #[doc(hidden)]
     pub fn runtime_syntax_for_source(
@@ -199,57 +202,69 @@ impl WorkspaceSemanticOracle<'_> {
         dialect: LanguageDialect,
         source: &str,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<SemanticOutcome<Arc<RuntimeSyntaxSnapshot>>, SemanticProviderError> {
-        let before = request.budget.replay_snapshot();
+    ) -> Result<SemanticOutcome<Arc<Accounted<RuntimeSyntaxSnapshot>>>, SemanticProviderError> {
         let mut identity =
             LengthDelimitedDigest::new(b"bifrost.runtime-syntax.v4-returned-refinement-census");
         identity.push(dialect.stable_label().as_bytes());
         identity.push(source.as_bytes());
         let key = identity.finish();
-        let (acquisition, _) = self.runtime_syntax.acquire(&key, request.cancellation);
-        let permit = match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
-                let repeat = request.budget.has_replay_holder(&value.owner);
-                let mut replay = value.work;
-                if repeat {
-                    replay.retained = SemanticWork::default();
-                }
-                let work = replay.cumulative;
-                let charge = request.budget.replay_continuation(replay);
-                if let Err(exceeded) = charge {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                if !repeat {
-                    request
+        self.workspace.analyzer().mark_runtime_cache_touched();
+        let permit = loop {
+            let (acquisition, _) = self.runtime_syntax.acquire(&key, request.cancellation);
+            match acquisition {
+                BudgetedValueAcquisition::Cached { value }
+                    if request
                         .budget
-                        .track_replay_holder(&value.owner, value.work.retained);
-                    request.budget.record_charged_artifact(key);
+                        .admit_memo_hit(&value.arc().admission)
+                        .is_ok() =>
+                {
+                    let value = value.arc().clone();
+                    let (replay, repeat) =
+                        request.budget.replay_for_holder(&value.owner, value.work);
+                    let work = replay.cumulative;
+                    let charge = request.budget.replay_continuation(replay);
+                    if let Err(exceeded) = charge {
+                        return Ok(SemanticOutcome::ExceededBudget {
+                            partial: None,
+                            exceeded,
+                            work,
+                        });
+                    }
+                    if !repeat {
+                        request
+                            .budget
+                            .track_replay_holder(&value.owner, value.work.retained);
+                        request.budget.record_charged_artifact(key);
+                    }
+                    // The execution ledger measures traversal actually performed;
+                    // reuse imports the census but only performs one lookup.
+                    if !request.charge_execution_traversal(1) {
+                        return Ok(SemanticOutcome::Unproven {
+                            partial: value,
+                            work,
+                        });
+                    }
+                    return Ok(SemanticOutcome::Complete { value, work });
                 }
-                // The execution ledger measures traversal actually performed;
-                // reuse imports the census but only performs one lookup.
-                if !request.charge_execution_traversal(1) {
-                    return Ok(SemanticOutcome::Unproven {
-                        partial: value,
-                        work,
+                BudgetedValueAcquisition::Cached { .. } => {
+                    self.runtime_syntax.invalidate(&key);
+                    brokk_bifrost_core::profiling::note(
+                        "semantic.memo_admission_eviction.runtime_syntax",
+                    );
+                }
+                BudgetedValueAcquisition::Leader { permit } => break permit,
+                BudgetedValueAcquisition::Cancelled => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: SemanticWork::default(),
                     });
                 }
-                return Ok(SemanticOutcome::Complete { value, work });
-            }
-            CompleteValueAcquisition::Leader { permit } => permit,
-            CompleteValueAcquisition::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-            CompleteValueAcquisition::Rejected => {
-                unreachable!("runtime syntax never rejects a flight")
+                BudgetedValueAcquisition::Rejected => {
+                    unreachable!("runtime syntax never rejects a flight")
+                }
             }
         };
+        let before = request.budget.replay_snapshot();
         let mut work = SemanticWork {
             source_bytes: source.len(),
             ..SemanticWork::default()
@@ -307,23 +322,30 @@ impl WorkspaceSemanticOracle<'_> {
             });
         }
         let traversed = request.charge_execution_traversal(facts.visited_nodes);
-        let replay = request.budget.replay_since(&before);
+        let mut replay = request.budget.replay_since(&before);
         let owner = Arc::new(());
-        request.budget.bind_replay_holder(&owner, &before);
-        let value = Arc::new(RuntimeSyntaxSnapshot {
+        replay.retained = request.budget.bind_replay_holder(&owner, &before);
+        let complete = traversed && facts.complete;
+        let snapshot = RuntimeSyntaxSnapshot {
             facts,
             has_error: tree.root_node().has_error(),
             work: replay,
+            admission: request.budget.memo_admission_since(&before, &owner),
             owner,
+        };
+        let value = Arc::new(if complete {
+            Accounted::charged(self.workspace.retention_budget(), snapshot)
+        } else {
+            Accounted::uncharged(snapshot)
         });
-        if !traversed || !value.facts.complete {
+        if !complete {
             return Ok(SemanticOutcome::Unproven {
                 partial: value,
                 work,
             });
         }
         request.budget.record_charged_artifact(key);
-        permit.publish_complete(Arc::clone(&value));
+        permit.publish_complete(SharedAllocation::new(Arc::clone(&value)));
         Ok(SemanticOutcome::Complete { value, work })
     }
 
@@ -339,12 +361,13 @@ impl WorkspaceSemanticOracle<'_> {
         current: &ProjectFile,
         request: &mut SemanticRequest<'_>,
     ) -> Result<(WorkspaceRuntimeWriteFootprint, SemanticWork), SemanticProviderError> {
+        self.workspace.analyzer().mark_runtime_cache_touched();
         self.runtime_write_footprints.read(
             &memo_attribution(self.workspace.analyzer()),
             |memo| {
                 let (acquisition, _) = memo.acquire(current, request.cancellation);
                 let permit = match acquisition {
-                    CompleteValueAcquisition::Cached { value } => {
+                    BudgetedValueAcquisition::Cached { value } => {
                         let work = SemanticWork {
                             nested_entries: 1,
                             ..SemanticWork::default()
@@ -352,8 +375,8 @@ impl WorkspaceSemanticOracle<'_> {
                         request.budget.charge_work(work);
                         return Ok((*value, work));
                     }
-                    CompleteValueAcquisition::Leader { permit } => permit,
-                    CompleteValueAcquisition::Cancelled | CompleteValueAcquisition::Rejected => {
+                    BudgetedValueAcquisition::Leader { permit } => permit,
+                    BudgetedValueAcquisition::Cancelled | BudgetedValueAcquisition::Rejected => {
                         return Ok((
                             WorkspaceRuntimeWriteFootprint::CoverageLimited,
                             SemanticWork::default(),
@@ -362,7 +385,7 @@ impl WorkspaceSemanticOracle<'_> {
                 };
                 let (footprint, work) = self.scan_workspace_runtime_writes(current, request)?;
                 if footprint != WorkspaceRuntimeWriteFootprint::CoverageLimited {
-                    permit.publish_complete(Arc::new(footprint));
+                    permit.publish_complete(footprint);
                 }
                 Ok((footprint, work))
             },
@@ -428,7 +451,8 @@ impl WorkspaceSemanticOracle<'_> {
     /// the procedure's raw gaps without the snapshot sweep, such as exit
     /// profiles. A procedure with no `InertDropGlue` obligation answers
     /// `false` without reading its source.
-    pub(crate) fn procedure_drops_proven_inert(
+    #[doc(hidden)]
+    pub fn procedure_drops_proven_inert(
         &self,
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
@@ -444,7 +468,7 @@ impl WorkspaceSemanticOracle<'_> {
             self.workspace,
             request,
             &mut None,
-        )
+        ).map(|verdict| verdict == crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict::Discharged)
     }
 
     /// Ordinary semantic consumers pay no parse cost when the captured model
@@ -454,10 +478,10 @@ impl WorkspaceSemanticOracle<'_> {
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<RuntimeKeyedReadResult>, SemanticProviderError> {
-        if !self
-            .active_semantic_models()
-            .is_some_and(|active| active.runtime_values().next().is_some())
-        {
+        if !self.active_semantic_models().is_some_and(|active| {
+            let values = active.runtime_values();
+            values.jvm_open.is_some() || !values.rows.is_empty()
+        }) {
             return Ok(SemanticOutcome::Complete {
                 value: RuntimeKeyedReadResult::default(),
                 work: SemanticWork::default(),
@@ -513,9 +537,10 @@ impl WorkspaceSemanticOracle<'_> {
             }
             Ok(Some(source)) => source,
         };
+        self.workspace.analyzer().mark_runtime_cache_touched();
         let (acquisition, _) = self.runtime_reads.acquire(procedure, request.cancellation);
         let permit = match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
+            BudgetedValueAcquisition::Cached { value } => {
                 debug_assert!(
                     value.limitations.is_empty(),
                     "only complete runtime reads are cached"
@@ -541,14 +566,14 @@ impl WorkspaceSemanticOracle<'_> {
                     work,
                 });
             }
-            CompleteValueAcquisition::Leader { permit } => permit,
-            CompleteValueAcquisition::Cancelled => {
+            BudgetedValueAcquisition::Leader { permit } => permit,
+            BudgetedValueAcquisition::Cancelled => {
                 return Ok(SemanticOutcome::Cancelled {
                     partial: None,
                     work: SemanticWork::default(),
                 });
             }
-            CompleteValueAcquisition::Rejected => {
+            BudgetedValueAcquisition::Rejected => {
                 return Ok(SemanticOutcome::Unknown {
                     partial: None,
                     work: SemanticWork::default(),
@@ -557,7 +582,11 @@ impl WorkspaceSemanticOracle<'_> {
         };
         let outcome = self.build_runtime_reads(procedure, &file, &source, request)?;
         if let SemanticOutcome::Complete { value, .. } = &outcome {
-            permit.publish_complete(Arc::new(value.clone()));
+            if procedure.artifact().allocation_charge().is_charged() {
+                permit.publish_complete(value.clone());
+            } else {
+                permit.publish_request_owned(value.clone());
+            }
         }
         Ok(outcome)
     }
@@ -783,7 +812,8 @@ impl WorkspaceSemanticOracle<'_> {
                 .push(RuntimeReadLimitation::ActivationConflict);
             return Ok(());
         }
-        if active.runtime_contracts().next().is_some() {
+        let contracts = active.runtime_contracts();
+        if contracts.jvm_open.is_some() || !contracts.rows.is_empty() {
             // Portable bindings carry producer-owned locator schemes and effect
             // evidence. Until those join this artifact through a supported
             // producer adapter, catalog presence cannot authorize a native load
@@ -794,7 +824,14 @@ impl WorkspaceSemanticOracle<'_> {
             return Ok(());
         }
         let mut matches = Vec::new();
-        for (payload, shard) in active.runtime_values() {
+        let values = active.runtime_values();
+        if values.jvm_open.is_some() {
+            result
+                .limitations
+                .push(RuntimeReadLimitation::ActivationUnsupported);
+            return Ok(());
+        }
+        for (payload, shard) in values.rows {
             for (exposure_index, exposure) in payload.exposures.iter().enumerate() {
                 if exposure.binding_name != read.root_name
                     || !exposure
@@ -1159,6 +1196,77 @@ mod syntax_memo_input_tests {
     use crate::CancellationToken;
     use crate::analyzer::semantic::SemanticBudget;
     use crate::analyzer::{Language, WorkspaceAnalyzer, capture_query_reads};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10893: holder replay charged restored dependency census twice"
+    )]
+    fn runtime_syntax_holder_replay_dependency_parity() {
+        let census = SemanticWork {
+            evidence: 20,
+            ..Default::default()
+        };
+        let scratch = SemanticWork {
+            evidence: 80,
+            ..Default::default()
+        };
+        let retained = SemanticWork {
+            evidence: 1,
+            ..Default::default()
+        };
+        for inherited in [false, true] {
+            let dependency = Arc::new(());
+            let holder = Arc::new(());
+            let mut fill = SemanticBudget::uniform(150).unwrap();
+            if inherited {
+                fill.admit(census).unwrap();
+                fill.track_replay_holder(&dependency, census);
+            }
+            let before = fill.replay_snapshot();
+            if inherited {
+                assert!(fill.has_replay_holder(&dependency));
+            }
+            if !inherited {
+                fill.admit(census).unwrap();
+                fill.track_replay_holder(&dependency, census);
+            }
+            fill.admit(scratch).unwrap();
+            fill.admit(retained).unwrap();
+            fill.release_admission(scratch);
+            let mut replay = fill.replay_since(&before);
+            replay.retained = fill.bind_replay_holder(&holder, &before);
+            let admission = fill.memo_admission_since(&before, &holder);
+            for limit in [100, 101] {
+                let mut warm = SemanticBudget::uniform(limit).unwrap();
+                let accepted = warm.admit_memo_hit(&admission).is_ok();
+                assert_eq!(accepted, limit == 101);
+                assert_eq!(warm.refusal_count(), 0);
+                let mut cold = SemanticBudget::uniform(limit).unwrap();
+                cold.admit(census).unwrap();
+                cold.track_replay_holder(&dependency, census);
+                let cold_before = cold.replay_snapshot();
+                cold.admit(scratch).unwrap();
+                assert_eq!(cold.admit(retained).is_ok(), accepted);
+                if accepted {
+                    cold.release_admission(scratch);
+                    cold.bind_replay_holder(&holder, &cold_before);
+                    let (replay, already) = warm.replay_for_holder(&holder, replay);
+                    assert!(!already);
+                    warm.replay_continuation(replay).unwrap();
+                    warm.track_replay_holder(&holder, replay.retained);
+                    assert_eq!(warm.resident(), cold.resident());
+                    assert_eq!(warm.resident_peak(), cold.resident_peak());
+                    assert!(warm.has_replay_holder(&dependency));
+                    assert!(warm.has_replay_holder(&holder));
+                    // An inherited dependency predates the replay's telemetry
+                    // interval. Admission restores residency without new work.
+                    if !inherited {
+                        assert_eq!(warm.used(), cold.used());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn runtime_syntax_hits_use_the_exact_source_and_dialect() {

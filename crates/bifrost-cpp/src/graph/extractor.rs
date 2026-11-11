@@ -34,18 +34,17 @@ use brokk_bifrost_core::analyzer::tree_walk::{
     ParentIndex, WalkControl, children_iter, first_named_child_of_kind, parent_if_field,
     push_named_children_reversed, root_node, walk_named_tree_preorder,
 };
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
-use brokk_bifrost_core::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tree_sitter::Node;
@@ -64,14 +63,6 @@ pub fn reset_type_reference_candidate_scan_count_for_test() {
 #[cfg(any(test, feature = "test-support"))]
 pub fn type_reference_candidate_scan_count_for_test() -> usize {
     TYPE_REFERENCE_CANDIDATE_SCAN_COUNT.with(Cell::get)
-}
-
-pub struct ScanState<'a> {
-    pub max_usages: usize,
-    pub hits: &'a mut BTreeSet<UsageHit>,
-    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub raw_match_count: &'a mut usize,
-    pub limit_exceeded: &'a mut bool,
 }
 
 pub struct ScanCtx<'a> {
@@ -101,12 +92,7 @@ pub struct ScanCtx<'a> {
     using_enum_owners: ScopedUsingEnumOwners,
     semantic_using_enum_owners: SemanticUsingEnumOwners,
     needs_using_enum_member_resolution: bool,
-    pub hits: &'a mut BTreeSet<UsageHit>,
-    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub raw_match_count: &'a mut usize,
-    pub max_usages: usize,
-    pub external_hit_count: usize,
-    pub limit_exceeded: &'a mut bool,
+    pub usages: &'a mut UsageAccumulator,
     pub enclosing_cache: CaptureScopedMemo<RefCell<HashMap<(usize, usize), EnclosingContext>>>,
     pub enclosing_owner_cache: CaptureScopedMemo<RefCell<HashMap<CodeUnit, Option<CodeUnit>>>>,
     lexical_scope_cache: LexicalScopeCache,
@@ -147,9 +133,9 @@ pub fn scan_prepared_file(
     class_ranges: Option<&ClassRangeIndex>,
     spec: &TargetSpec,
     target_group: &HashSet<CodeUnit>,
-    state: &mut ScanState<'_>,
+    usages: &mut UsageAccumulator,
 ) {
-    if *state.limit_exceeded {
+    if usages.limit_reached() {
         return;
     }
     let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
@@ -237,11 +223,6 @@ pub fn scan_prepared_file(
         file,
         prepared.source(),
     );
-    let external_hit_count = state
-        .hits
-        .iter()
-        .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-        .count();
     let mut ctx = ScanCtx {
         analyzer: *analyzer,
         visibility,
@@ -264,12 +245,7 @@ pub fn scan_prepared_file(
         using_enum_owners: ScopedUsingEnumOwners::new(),
         semantic_using_enum_owners: SemanticUsingEnumOwners::new(),
         needs_using_enum_member_resolution,
-        hits: state.hits,
-        unproven_hits: state.unproven_hits,
-        raw_match_count: state.raw_match_count,
-        max_usages: state.max_usages,
-        external_hit_count,
-        limit_exceeded: state.limit_exceeded,
+        usages,
         enclosing_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
         enclosing_owner_cache: CaptureScopedMemo::new(RefCell::new(HashMap::default())),
         lexical_scope_cache: LexicalScopeCache::new(visibility, file),
@@ -296,7 +272,7 @@ pub fn scan_prepared_file(
 /// node makes generated tables needlessly expensive.
 fn scan_macro_nodes(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
     walk_named_tree_preorder(root, true, |node| {
-        if *ctx.limit_exceeded {
+        if ctx.usages.limit_reached() {
             return WalkControl::Break;
         }
         maybe_record_macro_hit(node, ctx);
@@ -420,7 +396,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
         }
     }
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     let mut stack = vec![Frame::new(node)];
@@ -459,7 +435,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             maybe_record_hit(node, ctx);
         }
         if let Some(child) = current.previous_child.take()
-            && !*ctx.limit_exceeded
+            && !ctx.usages.limit_reached()
             && translation_unit
             && macro_fractured_function(child)
             && macro_fracture_boundary(child).is_some()
@@ -474,7 +450,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             current.fractured_function_scope = true;
         }
         // Unwind every entered scope once the hit limit has been reached.
-        if !*ctx.limit_exceeded
+        if !ctx.usages.limit_reached()
             && let Some(child) = current.next_child.take()
         {
             current.next_child = child.next_named_sibling();
@@ -1077,7 +1053,7 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.spec.target.source(),
             &ctx.target_macro_declaration_bytes,
         ) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_hit(node, ctx);
             return;
         }
@@ -1090,7 +1066,7 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             OrdinaryMacroReferenceResolution::Resolved(unit)
                 if ctx.target_group.contains(&unit) =>
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_hit(node, ctx);
             }
             OrdinaryMacroReferenceResolution::Ambiguous
@@ -1098,7 +1074,7 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .visibility
                     .macro_target_is_visible_candidate(ctx.file, &ctx.spec.target) =>
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(node, ctx);
             }
             OrdinaryMacroReferenceResolution::Resolved(_)
@@ -1129,7 +1105,7 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.spec.target.source(),
         &ctx.target_macro_declaration_bytes,
     ) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_hit(node, ctx);
     } else if ctx.visibility.macro_name_may_be_bound_at(
         ctx.file,
@@ -1139,7 +1115,7 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .visibility
         .macro_target_is_visible_candidate(ctx.file, &ctx.spec.target)
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_unproven_hit(node, ctx);
     }
 }
@@ -1180,7 +1156,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.recovered_sentinel_scope(type_node).as_deref(),
         ) && type_resolution_matches_target(type_node, &unit, &candidates, ctx)
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit(type_node, ctx);
         }
         return;
@@ -1230,7 +1206,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     terminal,
                 )
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(terminal, ctx);
             } else if ctx
                 .visibility
@@ -1244,13 +1220,13 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             {
                 // The structured owner and terminal identify a candidate, but
                 // do not establish its conditional availability.
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(terminal, ctx);
             }
             return;
         }
         if let Some(scopes) = static_qualifier_type_scopes_for_components(node, owner, ctx) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             for scope in scopes {
                 push_type_hit(scope, ctx);
             }
@@ -1262,7 +1238,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && let Some(value) = qualified_callable_value(node)
         && let Some(owner_hit) = target_guided_qualified_value_owner_hit(value.qualified, ctx)
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         match owner_hit {
             TargetGuidedQualifiedValueOwnerHit::Proven(scope) => push_type_hit(scope, ctx),
             TargetGuidedQualifiedValueOwnerHit::Unproven(scope) => push_unproven_hit(scope, ctx),
@@ -1312,7 +1288,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if let Some(hit) = target_guided_static_cast_alias_type_descriptor(node, ctx) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_type_hit(hit, ctx);
         return;
     }
@@ -1352,7 +1328,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if let LexicalTypeResolution::Resolved { unit, .. } = resolution
             && same_visible_symbol(&unit, &ctx.spec.target)
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit(type_node, ctx);
         }
         return;
@@ -1377,7 +1353,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.recovered_sentinel_scope(node).as_deref(),
         ) && type_resolution_matches_target(node, &unit, &candidates, ctx)
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit(node, ctx);
         }
         return;
@@ -1476,7 +1452,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             node,
         )
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         let mut matched_owner = false;
         for (owner_node, owner) in owners.owners {
             if same_visible_symbol(&owner, &ctx.spec.target) {
@@ -1501,7 +1477,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && is_declaration_name(node)
         && let Some(owner) = indexed_out_of_line_template_owner_hit(node, ctx)
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_type_hit(owner, ctx);
         return;
     }
@@ -1522,7 +1498,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if let Some(scope) = target_guided_dependent_alias_qualifier_scope(node, ctx) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_unproven_hit(scope, ctx);
         return;
     }
@@ -1534,7 +1510,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         )
         && let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx)
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         for scope in scopes {
             push_type_hit(scope, ctx);
         }
@@ -1542,12 +1518,12 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if !recovered_type && is_nested_type_node(node) {
         if let Some(hit) = out_of_line_dependent_return_template_owner(node, ctx) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit(hit, ctx);
             return;
         }
         if let Some(hit) = target_guided_nested_type_terminal_hit(node, ctx) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit(hit, ctx);
             return;
         }
@@ -1616,7 +1592,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         if nested_alias_qualifier {
             let template = nested_template.expect("a nested alias qualifier has a template node");
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             let hit = target_guided_missing_alias_rhs_type_leaf(template, ctx)
                 .unwrap_or_else(|| type_reference_hit_node(template));
             push_type_hit(hit, ctx);
@@ -1638,7 +1614,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx,
             )
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             let hit = template
                 .child_by_field_name("name")
                 .filter(|name| name.kind() == "type_identifier")
@@ -1649,7 +1625,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if let Some(template) = nested_template
             && let Some(_resolution) = resolve_nested_template_type_for_target(template, ctx)
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             let hit =
                 target_guided_missing_alias_rhs_type_leaf(template, ctx).unwrap_or_else(|| {
                     if ctx.visibility.is_template_specialization(&ctx.spec.target) {
@@ -1691,15 +1667,15 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             )
             && type_resolution_matches_target(node, &unit, &candidates, ctx)
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_resolved_type_hit(node, &candidates, ctx);
         } else if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             for scope in scopes {
                 push_type_hit(scope, ctx);
             }
         } else if let Some(owner_hit) = target_guided_qualified_value_owner_hit(node, ctx) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             match owner_hit {
                 TargetGuidedQualifiedValueOwnerHit::Proven(scope) => push_type_hit(scope, ctx),
                 TargetGuidedQualifiedValueOwnerHit::Unproven(scope) => {
@@ -1710,7 +1686,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if let Some((hit, proven)) = target_guided_alias_template_reference(node, ctx) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         if proven {
             push_type_hit(hit, ctx);
         } else {
@@ -1734,20 +1710,20 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             for (owner_node, owner) in owners.owners {
                 if same_visible_symbol(&owner, &ctx.spec.target) {
                     matched_owner = true;
-                    *ctx.raw_match_count += 1;
+                    ctx.usages.note_raw_match();
                     push_guarded_owner_hit(owner_node, &owner, node, ctx);
                 }
             }
         }
         if !matched_owner && let Some(scopes) = target_guided_qualifier_type_scopes(node, ctx) {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             for scope in scopes {
                 push_hit(scope, ctx);
             }
         } else if !matched_owner
             && let Some(scope) = target_guided_unproven_out_of_line_owner(node, ctx)
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_unproven_hit(scope, ctx);
         }
         return;
@@ -1815,7 +1791,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .and_then(|components| components.last().copied())
                 .filter(|terminal| node_text(*terminal, ctx.source) == ctx.spec.target.identifier())
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(terminal, ctx);
                 return;
             }
@@ -1825,7 +1801,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         LexicalTypeResolution::Resolved {
             unit, candidates, ..
         } if type_resolution_matches_target(node, &unit, &candidates, ctx) => {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
                 for scope in scopes {
                     push_type_hit(scope, ctx);
@@ -1841,43 +1817,43 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ..
         } => {
             if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
             } else if let Some(hit) =
                 target_guided_unproven_alias_type_reference(node, &candidates, ctx)
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(hit, ctx);
             } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx)
                 .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(leaf, ctx);
             } else if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(leaf, ctx);
             }
             return;
         }
         LexicalTypeResolution::Ambiguous => {
             if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
             } else if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(leaf, ctx);
             } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx)
                 .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
                 .or_else(|| target_guided_ambiguous_owned_alias_type_leaf(node, ctx))
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(leaf, ctx);
             } else if guarded_alias_alternatives_include_target(hit_node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(type_reference_hit_node(hit_node), ctx);
             }
             return;
@@ -1890,22 +1866,22 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
             ) && same_visible_symbol(&unit, &ctx.spec.target)
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(hit_node, ctx);
                 return;
             }
             if let Some(leaf) = target_guided_compatible_foreign_import_type_leaf(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(leaf, ctx);
                 return;
             }
             if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(leaf, ctx);
                 return;
             }
             if let Some(leaf) = target_guided_missing_type_leaf(node, ctx) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(leaf, ctx);
                 return;
             }
@@ -1941,7 +1917,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     &ctx.spec.target,
                 )
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_unproven_hit(type_reference_hit_node(hit_node), ctx);
                 return;
             }
@@ -1955,12 +1931,12 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .visibility
         .parser_alias_resolves_to_type(ctx.file, text, &ctx.spec.target)
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_type_hit(type_reference_hit_node(hit_node), ctx);
         return;
     }
     if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         for scope in scopes {
             push_type_hit(scope, ctx);
         }
@@ -1969,7 +1945,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !name_mentions(text, &ctx.spec.member_name) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if !ctx.visibility.external_type_candidate_visible_in_context(
         &ctx.analyzer,
         ctx.file,
@@ -2022,7 +1998,7 @@ fn maybe_record_object_macro_replacement_type_hits(node: Node<'_>, ctx: &mut Sca
                 continue;
             }
             let range = &reference.component_ranges[component_count - 1];
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit_range(node, range.start, range.end, ctx);
         }
     }
@@ -2526,7 +2502,7 @@ fn maybe_record_recovered_macro_return_type_hit(return_type: Node<'_>, ctx: &mut
             return_type,
         )
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_type_hit(return_type, ctx);
         return;
     }
@@ -2552,7 +2528,7 @@ fn maybe_record_recovered_macro_return_type_hit(return_type: Node<'_>, ctx: &mut
                 .iter()
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)))
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_type_hit(return_type, ctx);
     }
 }
@@ -3165,7 +3141,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
         return;
     }
     if let Some(scopes) = static_qualifier_type_scopes(function, ctx) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         for scope in scopes {
             push_type_hit(scope, ctx);
         }
@@ -3219,7 +3195,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
             function,
         )
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         push_type_hit(terminal, ctx);
         return;
     }
@@ -3236,7 +3212,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
     match call_resolution {
         BareCallTargetResolution::Type(unit) => {
             if same_visible_symbol(&unit, &ctx.spec.target) {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(function, ctx);
                 return;
             }
@@ -3280,14 +3256,14 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
                 .iter()
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
         {
-            *ctx.raw_match_count += 1;
+            ctx.usages.note_raw_match();
             push_type_hit(function, ctx);
         }
         LexicalTypeResolution::Missing => {
             if let Some(hit) = target_guided_nested_type_terminal_hit(terminal, ctx)
                 .or_else(|| target_guided_missing_direct_temporary_type(function, ctx))
             {
-                *ctx.raw_match_count += 1;
+                ctx.usages.note_raw_match();
                 push_type_hit(hit, ctx);
             }
         }
@@ -6437,7 +6413,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !name_mentions(text, &ctx.spec.member_name) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
         match ctx
             .visibility
@@ -6656,7 +6632,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
         match ctx
             .visibility
@@ -6835,7 +6811,7 @@ fn maybe_record_recovered_error_free_function_call(node: Node<'_>, ctx: &mut Sca
         {
             continue;
         }
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         if block_call_envelope
             && let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
             && ctx
@@ -7092,7 +7068,7 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
         return;
     }
     if let Some(kind) = recovered_callable_declaration_kind(node, ctx) {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         match kind {
             RecoveredCallableDeclarationKind::Declaration => push_declared_reference_hit(node, ctx),
             RecoveredCallableDeclarationKind::Definition => {
@@ -7108,7 +7084,7 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     if is_call_callee_node(node) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if ctx.visibility.contains_named_symbol(
         ctx.file,
         text,
@@ -7260,7 +7236,7 @@ fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut Sc
     if linked_declaration.is_none() {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     push_declaration_reference_hit(node, ctx);
 }
 
@@ -7272,7 +7248,7 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
     if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if !function_definition_signature_matches_target(node, ctx) {
         return;
     }
@@ -7324,7 +7300,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if !name_matches_callable(text, &ctx.spec.member_name) {
             return;
         }
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
             match ctx
                 .visibility
@@ -7362,7 +7338,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
         match ctx
             .visibility
@@ -7508,7 +7484,7 @@ fn maybe_record_function_macro_replacement_method_hits(node: Node<'_>, ctx: &mut
     };
     let locals = macro_replacement_local_receivers(statements, &body, ctx);
     for (current, member, receiver) in candidates {
-        if *ctx.limit_exceeded {
+        if ctx.usages.limit_reached() {
             return;
         }
         let range = body.file_range(member, replacement_start);
@@ -7517,7 +7493,7 @@ fn maybe_record_function_macro_replacement_method_hits(node: Node<'_>, ctx: &mut
             Some(node_text(member, &body.source)),
             "macro replacement member range must spell the member name"
         );
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         // The replacement's own macro environment is the one at the definition,
         // not at the sentinel offsets the recovered call carries.
         let arity_evidence = ctx.visibility.call_arity_evidence_at(
@@ -7709,7 +7685,7 @@ fn maybe_record_recovered_relational_template_method_hit(
     if !callable_node_matches(call.member, &ctx.spec.member_name, ctx.source) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if !ctx
         .visibility
         .callable_is_template_declaration(&ctx.analyzer, &ctx.spec.target)
@@ -7792,7 +7768,7 @@ fn maybe_record_using_callable_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(target_owner) = ctx.spec.owner.as_ref() else {
         return;
     };
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     let owner_resolution = qualified_owner_components(imported, ctx.source)
         .map(|qualified| {
             let lexical_scope = match enclosing_lexical_scope_components(
@@ -7909,7 +7885,7 @@ fn maybe_record_qualified_method_value_hit(
     if !name_matches_callable(node_text(member, ctx.source), &ctx.spec.member_name) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     let resolution =
         qualified_callable_value_resolution(qualified, node_text(member, ctx.source), ctx);
     match resolution {
@@ -8020,7 +7996,7 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !callable_node_matches(function, &ctx.spec.member_name, ctx.source) {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if !function_definition_signature_matches_target(node, ctx) {
         return;
     }
@@ -8271,7 +8247,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if global_field_resolves_to_target(node, ctx) {
         push_hit(node, ctx);
     } else if global_field_is_known_non_target(node, ctx) {
@@ -8460,7 +8436,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if node_text(field, ctx.source) != ctx.spec.member_name {
             return;
         }
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         if !ctx.visibility.declaration_guards_compatible_at_reference(
             &ctx.analyzer,
             ctx.file,
@@ -8514,7 +8490,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && let Some(designator_owner) =
             designated_initializer_owner(&ctx.analyzer, ctx.visibility, ctx.file, ctx.source, node)
     {
-        *ctx.raw_match_count += 1;
+        ctx.usages.note_raw_match();
         match designator_owner {
             DesignatedInitializerOwner::Resolved(owner)
                 if ctx
@@ -8553,7 +8529,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     if is_structurally_qualified(node) {
         match qualified_owner_resolution(node, ctx) {
             QualifiedOwnerResolution::Target => push_hit(node, ctx),
@@ -8655,7 +8631,7 @@ fn maybe_record_c_offsetof_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    *ctx.raw_match_count += 1;
+    ctx.usages.note_raw_match();
     let Some((type_reference, member)) = c_offsetof_member_parts(node) else {
         push_unproven_hit(node, ctx);
         return;

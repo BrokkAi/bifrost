@@ -159,7 +159,7 @@ mod jvm_registry_tests {
 
         let base = binding(&env, "base");
         assert_eq!(base.kind, BindingKind::Parameter);
-        assert_eq!(base.hoisting, HoistingClass::ScopeWide);
+        assert_eq!(base.hoisting, HoistingClass::SourceOrder);
         let given = env.scope(base.declaring_scope);
         assert_ne!(
             given.index, template.index,
@@ -169,11 +169,15 @@ mod jvm_registry_tests {
             &source[given.range.start_byte..given.range.end_byte],
             "given ordering(using base: Int): Ord[Int] = build(base)"
         );
-        assert_eq!(base.activation, given.range);
+        assert_eq!(
+            &source[base.activation.start_byte..base.activation.end_byte],
+            ": Ord[Int] = build(base)"
+        );
+        assert_eq!(base.activation.end_byte, given.range.end_byte);
 
         let value = binding(&env, "value");
         assert_eq!(value.kind, BindingKind::Parameter);
-        assert_eq!(value.hoisting, HoistingClass::ScopeWide);
+        assert_eq!(value.hoisting, HoistingClass::SourceOrder);
         let extension = env.scope(value.declaring_scope);
         assert_ne!(
             extension.index, template.index,
@@ -184,10 +188,15 @@ mod jvm_registry_tests {
                 .starts_with("extension (value: String)"),
             "the extension group is the scope: {extension:?}"
         );
-        assert_eq!(value.activation, extension.range);
+        assert!(
+            source[value.activation.start_byte..value.activation.end_byte].starts_with(" {\n"),
+            "the extension parameter begins after its own clause: {value:?}"
+        );
+        assert_eq!(value.activation.end_byte, extension.range.end_byte);
 
         let sep = binding(&env, "sep");
         assert_eq!(sep.kind, BindingKind::Parameter);
+        assert_eq!(sep.hoisting, HoistingClass::SourceOrder);
         assert_eq!(
             env.scope(sep.declaring_scope).anchor.kind(),
             Some(NormalizedKind::Method),

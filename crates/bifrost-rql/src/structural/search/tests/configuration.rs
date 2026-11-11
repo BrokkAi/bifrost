@@ -337,6 +337,37 @@ fn xml_scalar_value_predicates_support_exact_case_insensitive_and_numeric_matchi
         insensitive.render_text()
     );
 
+    let regex = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &configuration_query(json!({
+            "formats": ["xml"],
+            "keys": ["enabled"],
+            "value_regex": "(?i)^\\s*true\\s*$"
+        })),
+    );
+    assert_eq!(
+        configuration_rows(&regex).len(),
+        1,
+        "{}",
+        regex.render_text()
+    );
+
+    let absent = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_sexp(
+            r#"(configuration-absence :scope subtree :format xml :node-kind member :role xml_attribute :key "enabled" :value/regex "(?i)^true$" (configuration-facts :format xml :node-kind member :role xml_element :key "httpRuntime"))"#,
+        )
+        .expect("configuration absence regex query"),
+    );
+    assert_eq!(
+        configuration_rows(&absent).len(),
+        1,
+        "{}",
+        absent.render_text()
+    );
+
     let numeric = execute_workspace(
         &workspace,
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
@@ -931,9 +962,15 @@ fn json_empty_and_recovered_keys_stay_queryable_members() {
 }
 
 #[test]
+#[hardwon(
+    "1674bb68311e: a replayed document's incomplete diagnostic was suppressed for every attempt after the first"
+)]
 fn one_execution_ingests_each_configuration_document_once() {
     // Two seeds over the same recovered document share the per-execution
-    // ingestion memo, so the typed gap is reported once rather than per seed.
+    // ingestion memo, so the document is read once. Each seed still reports
+    // the typed gap under its own branch: a branch's diagnostics can stand
+    // alone (an `except` exclusion, a retried attempt), and a request-wide
+    // record of what was reported used to leave the replaying branch clean.
     let project = InlineTestProject::with_language(Language::Rust)
         .file("src/lib.rs", "pub fn ignored() {}\n")
         .file("config.json", r#"{"host": "kept.example", "broken": }"#)
@@ -959,17 +996,14 @@ fn one_execution_ingests_each_configuration_document_once() {
         "{}",
         result.render_text()
     );
-    assert_eq!(
-        result
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code
-                == CodeQueryDiagnosticCode::SemanticAnalysisPartial)
-            .count(),
-        1,
-        "{:?}",
-        result.diagnostics
-    );
+    let mut branches = result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticAnalysisPartial)
+        .map(|diagnostic| diagnostic.branch.clone())
+        .collect::<Vec<_>>();
+    branches.sort();
+    assert_eq!(branches, [vec![0], vec![1]], "{:?}", result.diagnostics);
 }
 
 /// A production-shaped Spring Boot application document: dotted keys, both

@@ -29,6 +29,8 @@ use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicab
 
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::PartialOrder;
 
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::ReferenceConversion;
+
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionAnswer;
 
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
@@ -218,15 +220,25 @@ impl CallApplicabilityAdapter for JavaCallApplicabilityAdapter {
         }
     }
 
-    fn proves_reference_conversion(
+    /// A failed strict conversion may still apply in a loose invocation
+    /// phase, so Java proves conversions here and never refutes them.
+    fn reference_conversion(
         &self,
         evaluation: &mut FactEvaluation<'_, '_>,
         operand_slots: [SemanticId; 2],
         source: brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef,
         target: brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef,
         states: &StateMap,
-    ) -> Result<Option<bool>> {
-        evaluation.java_strict_reference_conversion(operand_slots, source, target, states)
+    ) -> Result<Option<ReferenceConversion>> {
+        Ok(evaluation
+            .java_strict_reference_conversion(operand_slots, source, target, states)?
+            .map(|proven| {
+                if proven {
+                    ReferenceConversion::Proven
+                } else {
+                    ReferenceConversion::Unproven
+                }
+            }))
     }
 
     fn candidate_formal_is_subtype(

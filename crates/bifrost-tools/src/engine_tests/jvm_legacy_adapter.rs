@@ -27,6 +27,9 @@ pub(crate) mod jvm_adapter_helper {
     #[doc(hidden)]
     pub struct LegacyJavaFixtureAdapter;
     impl LanguageAdapter for LegacyJavaFixtureAdapter {
+        fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            JavaAdapter.line_data_kinds()
+        }
         fn query_directory(&self) -> &'static str {
             JavaAdapter.query_directory()
         }

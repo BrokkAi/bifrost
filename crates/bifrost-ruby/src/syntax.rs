@@ -12,6 +12,37 @@ pub fn call_method_node(node: Node<'_>) -> Option<Node<'_>> {
     node.child_by_field_name("method")
 }
 
+/// Whether a call's receiver can select one of `Kernel`'s module functions
+/// (`load`, `require`, `require_relative`, `eval`).
+///
+/// `module_function` makes each a private instance method of `Kernel` and a
+/// public singleton method of `Kernel` itself. A private method is selected
+/// only with no receiver or the literal `self`, so `Kernel` and `::Kernel` are
+/// the only explicit receivers that reach these functions. Any other receiver
+/// (`Marshal.load`, `JSON.load`, `loader.require`) selects its own public
+/// method or raises `NoMethodError`. A constant or local that aliases the
+/// `Kernel` module object is not recognized.
+pub fn ruby_call_selects_kernel_function(call: Node<'_>, source: &str) -> bool {
+    let Some(receiver) = call.child_by_field_name("receiver") else {
+        return true;
+    };
+    let constant = match receiver.kind() {
+        "self" => return true,
+        "constant" => receiver,
+        "scope_resolution" if receiver.child_by_field_name("scope").is_none() => {
+            let Some(name) = receiver.child_by_field_name("name") else {
+                return false;
+            };
+            name
+        }
+        _ => return false,
+    };
+    constant.kind() == "constant"
+        && constant
+            .utf8_text(source.as_bytes())
+            .is_ok_and(|name| name == "Kernel")
+}
+
 /// Return only the binding-name nodes owned by a Ruby formal parameter list.
 /// The callback is charged for each visited node and inspected parameter
 /// child, allowing bounded callers to keep their budget at the call site.

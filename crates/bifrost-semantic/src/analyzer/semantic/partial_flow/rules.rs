@@ -54,7 +54,9 @@ use crate::analyzer::semantic::ValueTransfer;
 ///
 /// `distinct_endpoints` is whether the rule's source and target are different
 /// carriers. The flags are the rule's `strong_update` and
-/// `direct_cell_overwrite` verdicts.
+/// `direct_cell_overwrite` verdicts. A rule that joins a same-event group
+/// (see [`joins_same_event_alternatives`]) does not kill even when this says
+/// it would; its caller applies that decision.
 pub fn kills_target(
     kind: ValueFlowRelationKind,
     distinct_endpoints: bool,
@@ -64,7 +66,9 @@ pub fn kills_target(
     // Parameter and receiver relations copy between a boundary port and a
     // value carrier. A return writes the one pending return slot: cleanup can
     // replace it before the invocation exits. Mutually exclusive returns still
-    // join through control flow, but a later return kills the earlier value.
+    // join through control flow, but a later return event kills the earlier
+    // value. Several returns of one event (the arms of a returned join) are
+    // alternatives of that one write.
     match kind {
         ValueFlowRelationKind::Assignment
         | ValueFlowRelationKind::Parameter
@@ -73,6 +77,113 @@ pub fn kills_target(
         ValueFlowRelationKind::MemoryStore => strong_update || direct_cell_overwrite,
         _ => false,
     }
+}
+
+/// Whether a relation adds to the value its event writes instead of being one
+/// way the event writes it.
+///
+/// A `ContainerCollapse` is published at the event that consumes a whole
+/// container, with the consumed value as its target. That value may be the very
+/// one the event assigns, so the collapse shares the assignment's point, event
+/// index and target. It adds the container's members to whatever the event
+/// leaves in the target; it is not a second execution that preserves the old
+/// value. Every other kind describes the target's new value under one
+/// execution, so those are alternatives (see [`joins_same_event_alternatives`]).
+///
+/// An event's rules are applied one after another, so a supplement must be
+/// applied after the alternatives: an alternative that kills would otherwise
+/// erase what the supplement had added. Both rule orders sort supplements last
+/// within an event.
+pub fn is_same_event_supplement(kind: ValueFlowRelationKind) -> bool {
+    kind == ValueFlowRelationKind::ContainerCollapse
+}
+
+/// One rule of an event, reduced to what [`joins_same_event_alternatives`]
+/// decides on.
+#[derive(Debug, Clone, Copy)]
+pub struct SameEventRule<T> {
+    pub target: T,
+    /// The rule's source is its target carrier.
+    pub self_source: bool,
+    /// [`kills_target`] with the join flag off.
+    pub would_kill: bool,
+    /// [`is_same_event_supplement`] of the rule's kind.
+    pub supplement: bool,
+}
+
+/// Reduce a production relation to the inputs used by the shared same-event
+/// alternative decision.
+pub fn same_event_rule<T: Copy + Eq>(
+    kind: ValueFlowRelationKind,
+    source: T,
+    target: T,
+    strong_update: bool,
+    direct_cell_overwrite: bool,
+) -> SameEventRule<T> {
+    SameEventRule {
+        target,
+        self_source: source == target,
+        would_kill: kills_target(kind, source != target, strong_update, direct_cell_overwrite),
+        supplement: is_same_event_supplement(kind),
+    }
+}
+
+/// Which of one event's rules join at their target instead of killing it.
+///
+/// The rules of one event that write one target are of two roles. Alternatives
+/// are simultaneous ways the event writes the target, so its facts afterwards
+/// are the union of what each leaves. Supplements add to whatever the
+/// alternatives leave. `event` lists the event's rules in application order;
+/// the result is parallel to it. A group is decided as a whole, so the answer
+/// does not depend on which rule comes first:
+///
+/// - A supplement always joins and never changes the decision: it is not a way
+///   the event writes the target, so it can neither kill nor keep the old value.
+/// - Several alternatives that would all kill: the first kills and the rest
+///   join, so the target ends up holding the union of their sources.
+/// - Several alternatives, some of which would not kill (a weak store, a
+///   capture): a weak alternative keeps the prior facts, so none of them kills.
+/// - A target that one of its rules also reads as a source joins as a whole,
+///   even when that rule is alone. The transfer's new value includes the old
+///   value then, so joining gives the right facts, and a kill could erase the
+///   value the rule reads.
+/// - Otherwise a lone alternative keeps its own verdict.
+pub fn joins_same_event_alternatives<T: Copy + Eq + std::hash::Hash>(
+    event: &[SameEventRule<T>],
+) -> Vec<bool> {
+    struct Group {
+        alternatives: usize,
+        self_sourced: bool,
+        all_kill: bool,
+    }
+    let mut groups: HashMap<T, Group> = HashMap::new();
+    for rule in event {
+        let group = groups.entry(rule.target).or_insert(Group {
+            alternatives: 0,
+            self_sourced: false,
+            all_kill: true,
+        });
+        group.self_sourced |= rule.self_source;
+        if !rule.supplement {
+            group.alternatives += 1;
+            group.all_kill &= rule.would_kill;
+        }
+    }
+    let mut killer_taken = HashSet::new();
+    event
+        .iter()
+        .map(|rule| {
+            let group = &groups[&rule.target];
+            if rule.supplement || group.self_sourced {
+                return true;
+            }
+            if group.alternatives == 1 {
+                return false;
+            }
+            // The first alternative of an all-killing group is the killer.
+            !group.all_kill || !killer_taken.insert(rule.target)
+        })
+        .collect()
 }
 
 /// Whether a by-value relation consumes the value held by its source.
@@ -388,4 +499,101 @@ pub fn conditional_guard_edge_kills(
         }
     }
     answer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SameEventRule, joins_same_event_alternatives};
+    use brokk_bifrost_test_macros::hardwon;
+
+    fn alternative(target: u32, self_source: bool, would_kill: bool) -> SameEventRule<u32> {
+        SameEventRule {
+            target,
+            self_source,
+            would_kill,
+            supplement: false,
+        }
+    }
+
+    fn supplement(target: u32) -> SameEventRule<u32> {
+        SameEventRule {
+            target,
+            self_source: false,
+            would_kill: false,
+            supplement: true,
+        }
+    }
+
+    /// A weak alternative keeps the prior facts, so a group that mixes it with
+    /// a killing assignment kills nothing, whichever one comes first.
+    #[test]
+    fn mixed_group_kills_nothing_in_either_order() {
+        let weak_then_strong = [alternative(7, false, false), alternative(7, false, true)];
+        let strong_then_weak = [alternative(7, false, true), alternative(7, false, false)];
+        assert_eq!(
+            joins_same_event_alternatives(&weak_then_strong),
+            [true, true]
+        );
+        assert_eq!(
+            joins_same_event_alternatives(&strong_then_weak),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn all_killing_group_kills_once_and_a_lone_rule_keeps_its_verdict() {
+        let strong = [
+            alternative(7, false, true),
+            alternative(7, false, true),
+            alternative(8, false, false),
+        ];
+        assert_eq!(joins_same_event_alternatives(&strong), [false, true, false]);
+    }
+
+    /// A supplement joins without changing the decision over the alternatives,
+    /// wherever it sits in the event.
+    #[hardwon("#10539: a container-collapse supplement cancelled the assignment's kill")]
+    #[test]
+    fn supplement_joins_and_leaves_the_alternatives_decision_alone() {
+        assert_eq!(
+            joins_same_event_alternatives(&[alternative(7, false, true), supplement(7)]),
+            [false, true]
+        );
+        assert_eq!(
+            joins_same_event_alternatives(&[supplement(7), alternative(7, false, true)]),
+            [true, false]
+        );
+        assert_eq!(
+            joins_same_event_alternatives(&[
+                alternative(7, false, true),
+                supplement(7),
+                alternative(7, false, true),
+            ]),
+            [false, true, true]
+        );
+        assert_eq!(
+            joins_same_event_alternatives(&[alternative(7, false, false), supplement(7)]),
+            [false, true]
+        );
+        assert_eq!(
+            joins_same_event_alternatives(&[
+                alternative(7, false, true),
+                alternative(7, false, false),
+                supplement(7),
+            ]),
+            [true, true, true]
+        );
+        assert_eq!(joins_same_event_alternatives(&[supplement(7)]), [true]);
+    }
+
+    /// A rule that reads its own target joins even when it is the only rule:
+    /// the new value includes the old one, and a kill could erase what the
+    /// rule reads.
+    #[test]
+    fn lone_self_sourced_rule_joins() {
+        assert_eq!(
+            joins_same_event_alternatives(&[alternative(7, true, true)]),
+            [true]
+        );
+    }
 }

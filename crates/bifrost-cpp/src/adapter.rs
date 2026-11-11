@@ -4,7 +4,10 @@
 //! `analyzer/cpp/adapter.rs`; every answer it gives comes from here or from
 //! [`crate::test_detection`] and [`crate::queries`].
 
-use crate::declarations::{parse_cpp_readings, parse_cpp_readings_with_object_macro_fields};
+use crate::declarations::{
+    CppCallableObserver, parse_cpp_readings, parse_cpp_readings_observed,
+    parse_cpp_readings_with_object_macro_fields,
+};
 use crate::graph::syntax::ObjectMacroReplacement;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::cognitive_complexity;
@@ -50,6 +53,29 @@ pub fn parse_cpp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFi
         tree,
         LanguageDialect::for_path(Language::Cpp, file.rel_path()),
     )
+}
+
+/// External header extraction observes owned callable facts while the selected
+/// parser tree is live; ordinary parsing uses the no-op declaration observer.
+pub(crate) fn parse_cpp_file_with_callable_observer(
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    observer: &dyn CppCallableObserver,
+) -> ParsedFile {
+    let root = tree.root_node();
+    let ancestry = ParentIndex::new(root);
+    parse_cpp_readings_observed(
+        file,
+        source,
+        root,
+        &ancestry,
+        &[LanguageDialect::for_path(Language::Cpp, file.rel_path())],
+        HashMap::default(),
+        observer,
+    )
+    .pop()
+    .expect("one dialect reading")
 }
 
 /// Extract a source after seeding its object-like field-list environment from
@@ -160,56 +186,24 @@ pub fn cpp_extract_call_receiver(reference: &str) -> Option<String> {
         .map(|(receiver, _)| receiver.to_string())
 }
 
-/// Whether this complete subtree is numeric initializer data. No source-text
-/// classification or semantic inertness claim is involved.
-pub fn is_numeric_initializer_data(
-    node: Node<'_>,
-    should_stop: &mut dyn FnMut() -> bool,
-) -> std::ops::ControlFlow<(), bool> {
-    use std::ops::ControlFlow;
-    if node.kind() != "initializer_list" {
-        return ControlFlow::Continue(false);
-    }
-    use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
-    let mut result = ControlFlow::Continue(true);
-    walk_tree_preorder(node, true, |current| {
-        if should_stop() {
-            result = ControlFlow::Break(());
-            return WalkControl::Break;
-        }
-        if current.is_error() || current.is_missing() {
-            result = ControlFlow::Continue(false);
-            return WalkControl::Break;
-        }
-        let allowed = match current.kind() {
-            "initializer_list" => true,
-            "number_literal" => current.child_count() == 0,
-            "unary_expression" => {
-                current.child_count() == 2
-                    && current
-                        .child_by_field_name("operator")
-                        .is_some_and(|op| matches!(op.kind(), "+" | "-"))
-                    && current
-                        .child_by_field_name("argument")
-                        .is_some_and(|arg| arg.kind() == "number_literal")
-            }
-            "{" | "}" | "," => current
-                .parent()
-                .is_some_and(|parent| parent.kind() == "initializer_list"),
-            "+" | "-" => current
-                .parent()
-                .is_some_and(|parent| parent.kind() == "unary_expression"),
-            _ => false,
-        };
-        if allowed {
-            WalkControl::Continue
-        } else {
-            result = ControlFlow::Continue(false);
-            WalkControl::Break
-        }
-    });
-    result
-}
+/// C and C++ data literals, and initializer lists of them such as generated
+/// numeric tables. No source-text classification or semantic inertness claim
+/// is involved.
+pub const CPP_LINE_DATA_KINDS: brokk_bifrost_core::analyzer::tree_walk::LineDataKinds =
+    brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        literals: &[
+            "string_literal",
+            "raw_string_literal",
+            "char_literal",
+            "number_literal",
+        ],
+        interpolations: &[],
+        composites: &[
+            ("initializer_list", &["{", "}", ","]),
+            ("unary_expression", &["-", "+"]),
+            ("concatenated_string", &[]),
+        ],
+    };
 
 #[cfg(test)]
 mod tests {
@@ -218,17 +212,16 @@ mod tests {
     fn numeric_initializer_grammar_and_cancellation() {
         use crate::grammar_test_support::{SOURCE, at, field, nodes, tree};
 
+        use brokk_bifrost_core::analyzer::tree_walk::maximal_data_subtrees;
         use std::ops::ControlFlow;
         let parsed = tree(SOURCE);
         // Independent, complete preorder manifests (unnamed punctuation included).
-        // `polls` is the admissible prefix plus its first rejected node, or the
-        // whole manifest for an admitted initializer. Comments conservatively
-        // prevent numeric-data pruning; identifiers, calls and recovery do too.
+        // The shared walk polls once per manifest node. Comments, identifiers,
+        // calls and recovery keep an initializer from being excluded whole.
         let cases = [
             (
                 499..517,
                 true,
-                16,
                 &[
                     ("initializer_list", 499..517),
                     ("{", 499..500),
@@ -251,7 +244,6 @@ mod tests {
             (
                 535..552,
                 false,
-                5,
                 &[
                     ("initializer_list", 535..552),
                     ("{", 535..536),
@@ -265,7 +257,6 @@ mod tests {
             (
                 568..575,
                 false,
-                3,
                 &[
                     ("initializer_list", 568..575),
                     ("{", 568..569),
@@ -276,7 +267,6 @@ mod tests {
             (
                 591..599,
                 false,
-                3,
                 &[
                     ("initializer_list", 591..599),
                     ("{", 591..592),
@@ -291,7 +281,6 @@ mod tests {
             (
                 616..622,
                 false,
-                5,
                 &[
                     ("initializer_list", 616..622),
                     ("{", 616..617),
@@ -305,7 +294,6 @@ mod tests {
             (
                 640..645,
                 false,
-                4,
                 &[
                     ("initializer_list", 640..645),
                     ("{", 640..641),
@@ -318,7 +306,6 @@ mod tests {
             (
                 662..672,
                 true,
-                10,
                 &[
                     ("initializer_list", 662..672),
                     ("{", 662..663),
@@ -335,7 +322,6 @@ mod tests {
             (
                 696..704,
                 false,
-                3,
                 &[
                     ("initializer_list", 696..704),
                     ("{", 696..697),
@@ -349,7 +335,7 @@ mod tests {
                 ][..],
             ),
         ];
-        for (span, admitted, polls, manifest) in cases {
+        for (span, admitted, manifest) in cases {
             let initializer = at(parsed.root_node(), "initializer_list", span.clone());
             let actual = nodes(initializer);
             assert_eq!(
@@ -384,18 +370,24 @@ mod tests {
                 }
             }
             let mut visited = 0;
-            assert_eq!(
-                crate::adapter::is_numeric_initializer_data(initializer, &mut || {
+            let selected =
+                maximal_data_subtrees(initializer, &CPP_LINE_DATA_KINDS, |_| true, &mut || {
                     visited += 1;
                     false
-                }),
-                ControlFlow::Continue(admitted)
+                });
+            let ControlFlow::Continue(selected) = selected else {
+                panic!("an unstopped walk completes");
+            };
+            assert_eq!(
+                selected.iter().any(|subtree| subtree.range == span),
+                admitted,
+                "{span:?}"
             );
-            assert_eq!(visited, polls, "poll manifest for {span:?}");
-            for cancel_at in 1..=polls {
+            assert_eq!(visited, manifest.len(), "poll manifest for {span:?}");
+            for cancel_at in 1..=manifest.len() {
                 let mut visited = 0;
                 assert_eq!(
-                    crate::adapter::is_numeric_initializer_data(initializer, &mut || {
+                    maximal_data_subtrees(initializer, &CPP_LINE_DATA_KINDS, |_| true, &mut || {
                         visited += 1;
                         visited == cancel_at
                     }),

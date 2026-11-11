@@ -15,6 +15,9 @@ use brokk_bifrost_core::analyzer::parsed_file::{
 use brokk_bifrost_core::analyzer::source_facts::{PrimarySourceFactCollector, SourceImportId};
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::child_by_field_or_first_named_child;
 use brokk_bifrost_core::analyzer::structural::collector::StructuralFactCollector;
+use brokk_bifrost_core::analyzer::structural::conditional_regions::{
+    Activation, ConditionalRegions,
+};
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::structural::spec::{CompiledKinds, StructuralSpec};
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -26,6 +29,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::graph_support::csharp_enclosing_namespace_path;
 use crate::imports::csharp_import_info_from_using_directive;
+use crate::namespace_regions::CSharpFileScopedNamespaces;
 use crate::syntax::{
     csharp_attribute_type_names, csharp_constant_pattern_type_candidate,
     csharp_default_member_visibility, csharp_has_modifier, csharp_identifier_text as cs_ident_text,
@@ -52,6 +56,20 @@ pub const CSHARP_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
     is_identifier_kind: csharp_identifier_like_node_kind,
     prefix: "@",
 };
+
+/// Whether a tree-sitter C# node kind declares a type: class, interface,
+/// struct, enum, record or record struct.
+fn is_csharp_type_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "record_struct_declaration"
+    )
+}
 
 /// Build the structured namespace-path prefix for a C# declaration.
 ///
@@ -306,6 +324,7 @@ impl CSharpDeclarationProperties {
             "method_declaration"
                 | "constructor_declaration"
                 | "property_declaration"
+                | "indexer_declaration"
                 | "event_declaration"
                 | "field_declaration"
                 | "event_field_declaration"
@@ -371,15 +390,7 @@ impl CSharpVisitor<'_, '_, '_> {
         let mut owner = None;
         let mut nested_type = false;
         while let Some(parent) = current {
-            if matches!(
-                parent.kind(),
-                "class_declaration"
-                    | "interface_declaration"
-                    | "struct_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "record_struct_declaration"
-            ) {
+            if is_csharp_type_declaration(parent.kind()) {
                 if owner.is_none() {
                     owner = parent.child_by_field_name("name");
                 } else {
@@ -463,7 +474,7 @@ impl CSharpVisitor<'_, '_, '_> {
         // are following SIBLINGS, not children. Apply its namespace to everything after
         // it so their package_name is populated. Block namespaces keep a body and flow
         // through `queue_namespace`.
-        let mut current = scope;
+        let mut current = scope.clone();
         let mut scoped: Vec<CSharpWork<'tree>> = Vec::with_capacity(children.len());
         // The type declaration a following `global_statement` would belong to
         // if parser recovery truncated it, read through
@@ -475,26 +486,23 @@ impl CSharpVisitor<'_, '_, '_> {
         for child in children {
             match child.kind() {
                 "file_scoped_namespace_declaration" => {
-                    if let Some(namespace_path) = self.namespace_scope_path(child) {
-                        let package_name =
-                            csharp_join_namespace(&current.package_name, &namespace_path);
-                        let mut lexical_scope = current.lexical_scope.clone();
-                        lexical_scope.extend(namespace_path);
-                        current = CSharpScope {
-                            package_name,
-                            lexical_scope,
-                            enclosing_type: current.enclosing_type.clone(),
+                    // Persisted naming joins every file-scoped declaration that
+                    // governs the following siblings (`namespace_regions`).
+                    current = scope.clone();
+                    for declaration in
+                        CSharpFileScopedNamespaces::of_node(child).governing_at(child.end_byte())
+                    {
+                        let Some(namespace_path) = self.namespace_scope_path(*declaration) else {
+                            continue;
                         };
+                        current.package_name =
+                            csharp_join_namespace(&current.package_name, &namespace_path);
+                        current.lexical_scope.extend(namespace_path);
                     }
                     preceding_type = None;
                     continue;
                 }
-                "class_declaration"
-                | "interface_declaration"
-                | "struct_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "record_struct_declaration" => preceding_type = Some(child),
+                kind if is_csharp_type_declaration(kind) => preceding_type = Some(child),
                 "namespace_declaration" => preceding_type = None,
                 "global_statement" => {
                     if let Some(owner) = preceding_type
@@ -605,6 +613,7 @@ impl CSharpVisitor<'_, '_, '_> {
             }
             "constructor_declaration" => self.visit_constructor(node, scope),
             "property_declaration" => self.visit_property(node, scope),
+            "indexer_declaration" => self.visit_indexer(node, scope),
             "field_declaration" => self.visit_field_declaration(node, scope),
             "enum_member_declaration" => self.visit_enum_member(node, scope),
             "using_directive" => self.visit_using_directive(node),
@@ -882,15 +891,22 @@ impl CSharpVisitor<'_, '_, '_> {
         if name != enclosing.declared_name {
             return;
         }
+        // #9911: static and parameterless instance constructors have the same
+        // parameter key, but designate distinct declarations.
+        let member_name = if self.current_properties.is_static {
+            "<static-constructor>"
+        } else {
+            name
+        };
         let fq = parent
             .fq()
             .clone()
-            .with_pushed(segment_interner().intern(name, SegmentKind::Member));
+            .with_pushed(segment_interner().intern(member_name, SegmentKind::Member));
         let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Function,
             scope.package_name.clone(),
-            format!("{}.{}", parent.short_name(), name),
+            format!("{}.{}", parent.short_name(), member_name),
             Some(csharp_parameter_key(node, self.source)),
             false,
             fq,
@@ -927,10 +943,6 @@ impl CSharpVisitor<'_, '_, '_> {
     }
 
     fn visit_property(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
-        let Some(enclosing) = &scope.enclosing_type else {
-            return;
-        };
-        let parent = &enclosing.unit;
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -938,6 +950,22 @@ impl CSharpVisitor<'_, '_, '_> {
         if name.is_empty() {
             return;
         }
+        self.add_property_member(node, scope, name);
+    }
+
+    /// An indexer is the property the CLR names `Item` (#9402). Declaring it
+    /// under that name is what lets `typed["key"]` resolve to the declared
+    /// `this[...]` accessor pair, the same member metadata names for an
+    /// external indexer. Overloads by parameter type share the one member.
+    fn visit_indexer(&mut self, node: Node<'_>, scope: &CSharpScope<'_>) {
+        self.add_property_member(node, scope, crate::syntax::CSHARP_INDEXER_MEMBER_NAME);
+    }
+
+    fn add_property_member(&mut self, node: Node<'_>, scope: &CSharpScope<'_>, name: &str) {
+        let Some(enclosing) = &scope.enclosing_type else {
+            return;
+        };
+        let parent = &enclosing.unit;
         let fq = parent
             .fq()
             .clone()
@@ -1807,7 +1835,7 @@ fn csharp_parameter_has_optional_attribute(parameter: Node<'_>, source: &str) ->
     false
 }
 
-fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
+pub(crate) fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
     let mut cursor = parameters.walk();
     parameters
         .children(&mut cursor)
@@ -1821,7 +1849,7 @@ fn csharp_parameter_list_has_params(parameters: Node<'_>) -> bool {
 /// admits the list as a plain named child (`repeat(choice($.type_parameter_list,
 /// $.parameter_list))`) with no field name, so the field lookup alone cannot see
 /// it (#1797).
-fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+pub(crate) fn csharp_parameter_list_node<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
     node.child_by_field_name("parameters")
         .or_else(|| first_named_child_of_kind(node, "parameter_list"))
 }
@@ -1878,7 +1906,7 @@ pub fn csharp_callable_parameter_type_nodes(node: Node<'_>) -> Vec<Option<Node<'
     types
 }
 
-fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+pub(crate) fn csharp_parameter_label_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     let Some(parameters) = csharp_parameter_list_node(node) else {
         return Vec::new();
     };
@@ -2609,5 +2637,345 @@ mod declaration_boundary_tests {
             }
         }
         assert_eq!(found, ["Kept"], "{}", tree.root_node().to_sexp());
+    }
+}
+/// Each owner's directly declared fields, collected once per owner per file.
+#[derive(Default)]
+pub struct MemberFieldMemo {
+    #[cfg(test)]
+    scans: usize,
+    owners: HashMap<usize, HashMap<String, (usize, bool)>>,
+}
+
+/// Classify a source member without consulting its presentation CodeUnit kind.
+/// CodeQL's TrivialProperty is auto read/write or a getter and setter using
+/// the same field (Property.qll:151-180,506-565,610-615). A member that is not
+/// a property is not a trivial property.
+///
+/// Preprocessing removed the inactive branches before the tree was built, so
+/// an undecided `#if` leaves no node to see. `regions` is the prepared
+/// syntax's conditional-compilation evidence
+/// (`PreparedSyntaxTree::conditional_regions`): a member whose declaration
+/// header (everything before its body or accessor list) holds undecided text
+/// could declare another kind of member in the other branch, so both answers
+/// are unknown, and a property with undecided text anywhere in its
+/// declaration could have another accessor body, so its triviality is
+/// unknown. So is the triviality of a property whose syntax recovery left an
+/// error or a missing token.
+pub fn member_declaration_form(
+    node: Node<'_>,
+    source: &str,
+    regions: &ConditionalRegions,
+    memo: &mut MemberFieldMemo,
+) -> (Option<&'static str>, Option<bool>) {
+    let form = match node.kind() {
+        "field_declaration" | "variable_declarator" | "enum_member_declaration" => "field",
+        "property_declaration" => "property",
+        "method_declaration"
+        | "operator_declaration"
+        | "conversion_operator_declaration"
+        | "constructor_declaration"
+        | "destructor_declaration" => "method",
+        "event_declaration" | "event_field_declaration" => "event",
+        _ => "other",
+    };
+    // A shared prefix such as `public` can precede an `#if` whose branches
+    // declare a property and a field, so the whole header decides the form.
+    let header_end = node
+        .named_children(&mut node.walk())
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "block" | "arrow_expression_clause" | "accessor_list"
+            )
+        })
+        .map_or(node.end_byte(), |body| body.start_byte());
+    if regions.activation_at(node.start_byte()) == Activation::Uncertain
+        || regions.has_uncertain_text(node.start_byte()..header_end)
+    {
+        return (None, None);
+    }
+    if form != "property" {
+        return (Some(form), Some(false));
+    }
+    if regions.has_uncertain_text(node.byte_range()) || node.has_error() {
+        return (Some(form), None);
+    }
+    let modifiers =
+        brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(
+            node, source,
+        );
+    if modifiers
+        .iter()
+        .any(|modifier| matches!(modifier.as_str(), "abstract" | "extern"))
+    {
+        return (Some(form), Some(false));
+    }
+    let mut getter = None;
+    let mut setter = None;
+    let mut any_body = false;
+    let mut cursor = node.walk();
+    for list in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "accessor_list")
+    {
+        let mut list_cursor = list.walk();
+        for accessor in list.named_children(&mut list_cursor) {
+            if accessor.kind() != "accessor_declaration" {
+                continue;
+            }
+            let head = accessor
+                .children(&mut accessor.walk())
+                .find(|child| matches!(child.kind(), "get" | "set" | "init"));
+            let body = accessor
+                .named_children(&mut accessor.walk())
+                .find(|child| matches!(child.kind(), "block" | "arrow_expression_clause"));
+            any_body |= body.is_some();
+            match head.map(|child| child.kind()) {
+                Some("get") => getter = Some(body),
+                Some("set" | "init") => setter = Some(body),
+                _ => return (Some(form), None),
+            }
+        }
+    }
+    let (Some(getter), Some(setter)) = (getter, setter) else {
+        return (Some(form), Some(false));
+    };
+    if !any_body {
+        if modifiers.iter().any(|modifier| modifier == "partial") {
+            return (Some(form), None);
+        }
+        let mut ancestor = node.parent();
+        while ancestor.is_some_and(|parent| !is_csharp_type_declaration(parent.kind())) {
+            ancestor = ancestor.and_then(|parent| parent.parent());
+        }
+        if ancestor.is_some_and(|parent| parent.kind() == "interface_declaration") {
+            return (Some(form), Some(false));
+        }
+        return (Some(form), Some(true));
+    }
+    // The pinned CodeQL extractor has no model of C# 14's contextual `field`
+    // keyword, which names a synthesized backing field in any accessor shape:
+    // `get; set => field = value;` or `get => field + 1;`. Preserve unknown
+    // before any definite verdict. Only a bare, unescaped `field` outside a
+    // member name is the keyword: `@field` and `this.field` name a declared
+    // field.
+    if [getter, setter].into_iter().flatten().any(|body| {
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && source.get(node.byte_range()) == Some("field")
+                && node.parent().is_none_or(|parent| {
+                    parent.kind() != "member_access_expression"
+                        || parent.child_by_field_name("name") != Some(node)
+                })
+            {
+                return true;
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        false
+    }) {
+        return (Some(form), None);
+    }
+    let (Some(getter), Some(setter)) = (getter, setter) else {
+        return (Some(form), Some(false));
+    };
+    fn single_expression<'tree>(node: Node<'tree>, statement_kind: &str) -> Option<Node<'tree>> {
+        let statement = if node.kind() == "block" {
+            let mut cursor = node.walk();
+            let mut children = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "comment");
+            let only = children.next()?;
+            if children.next().is_some() || only.kind() != statement_kind {
+                return None;
+            }
+            only
+        } else {
+            node
+        };
+        // A comment before the expression is an extra child, not the expression.
+        statement
+            .named_children(&mut statement.walk())
+            .find(|child| child.kind() != "comment")
+    }
+    // The identifier an accessor expression uses to name a field. A bare
+    // `value` inside a setter or `init` accessor is the implicit parameter, so
+    // only `this.value` names a field there.
+    fn field_name_node<'tree>(
+        node: Node<'tree>,
+        source: &str,
+        in_setter: bool,
+    ) -> Option<Node<'tree>> {
+        match node.kind() {
+            "identifier" => (!in_setter || cs_ident_text(node, source) != "value").then_some(node),
+            "member_access_expression" => {
+                let receiver = unparenthesized(node.child_by_field_name("expression")?);
+                if receiver.kind() != "this" {
+                    return None;
+                }
+                node.child_by_field_name("name")
+            }
+            _ => None,
+        }
+    }
+    // Parentheses do not change what an accessor reads or writes:
+    // `get => (f)` and `set => f = (value)` are the trivial shapes.
+    fn unparenthesized(mut node: Node<'_>) -> Node<'_> {
+        while node.kind() == "parenthesized_expression" {
+            let Some(inner) = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() != "comment")
+            else {
+                break;
+            };
+            node = inner;
+        }
+        node
+    }
+    if [getter, setter].into_iter().any(|body| {
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if node.kind().contains("preproc") {
+                return true;
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        false
+    }) {
+        return (Some(form), None);
+    }
+    let getter_expression = single_expression(getter, "return_statement").map(unparenthesized);
+    let setter_assignment = single_expression(setter, "expression_statement")
+        .map(unparenthesized)
+        .filter(|expr| {
+            expr.kind() == "assignment_expression"
+                && expr
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "=")
+        });
+    let setter_target = setter_assignment
+        .and_then(|expr| expr.child_by_field_name("left"))
+        .map(unparenthesized);
+    let getter_node = getter_expression.and_then(|expr| field_name_node(expr, source, false));
+    let setter_node = setter_target.and_then(|left| field_name_node(left, source, true));
+    // Names compare after verbatim-identifier canonicalization: `@f` is `f`.
+    let getter_field = getter_node.map(|name| cs_ident_text(name, source));
+    let setter_field = setter_node.map(|name| cs_ident_text(name, source));
+    let setter_value = setter_assignment
+        .and_then(|expr| expr.child_by_field_name("right"))
+        .map(unparenthesized)
+        .filter(|right| right.kind() == "identifier")
+        .map(|right| cs_ident_text(right, source));
+    if getter_expression
+        .is_some_and(|expr| expr.kind() == "member_access_expression" && getter_field.is_none())
+        || setter_target
+            .is_some_and(|expr| expr.kind() == "member_access_expression" && setter_field.is_none())
+    {
+        return (Some(form), None);
+    }
+    if let Some(field) = getter_field
+        && setter_field == Some(field)
+        && setter_value == Some("value")
+    {
+        // CodeQL resolves an actual Field, not merely equal identifier text.
+        // Prove a directly declared field before returning true; inherited or
+        // otherwise unresolved references remain unknown.
+        let mut owner = node.parent();
+        while owner.is_some_and(|ancestor| !is_csharp_type_declaration(ancestor.kind())) {
+            owner = owner.and_then(|ancestor| ancestor.parent());
+        }
+        // The nearest type declares the property. An interface or enum holds
+        // no instance field to prove, so the answer stays unknown; skipping
+        // past it would count an enclosing type's fields.
+        let Some(owner) = owner
+            .filter(|owner| !matches!(owner.kind(), "interface_declaration" | "enum_declaration"))
+        else {
+            return (Some(form), None);
+        };
+        let fields = memo.owners.entry(owner.id()).or_insert_with(|| {
+            #[cfg(test)]
+            {
+                memo.scans += 1;
+            }
+            let mut fields = HashMap::default();
+            for body in owner
+                .named_children(&mut owner.walk())
+                .filter(|child| child.kind() == "declaration_list")
+            {
+                for declaration in body
+                    .named_children(&mut body.walk())
+                    .filter(|child| child.kind() == "field_declaration")
+                {
+                    for variable_declaration in declaration
+                        .named_children(&mut declaration.walk())
+                        .filter(|child| child.kind() == "variable_declaration")
+                    {
+                        for declarator in variable_declaration
+                            .named_children(&mut variable_declaration.walk())
+                            .filter(|child| child.kind() == "variable_declarator")
+                        {
+                            if let Some(name) = declarator.child_by_field_name("name") {
+                                let entry = fields
+                                    .entry(cs_ident_text(name, source).to_owned())
+                                    .or_insert((0, false));
+                                entry.0 += 1;
+                                entry.1 |= regions.activation_at(declaration.start_byte())
+                                    == Activation::Uncertain
+                                    || regions.has_uncertain_text(declaration.byte_range());
+                            }
+                        }
+                    }
+                }
+            }
+            fields
+        });
+        let (count, uncertain) = fields.get(field).copied().unwrap_or_default();
+        return (Some(form), (count == 1 && !uncertain).then_some(true));
+    }
+    (Some(form), Some(false))
+}
+
+#[cfg(test)]
+mod member_field_memo_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10229: backing-field classification rescanned all fields for every property")]
+    fn many_properties_scan_owner_fields_once() {
+        let mut source = String::from("class C { int @f;");
+        for index in 0..100 {
+            source.push_str(&format!("int P{index} {{ get => f; set => @f = value; }}"));
+        }
+        source.push('}');
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let mut memo = MemberFieldMemo::default();
+        let mut stack = vec![tree.root_node()];
+        let mut properties = 0;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "property_declaration" {
+                assert_eq!(
+                    member_declaration_form(
+                        node,
+                        &source,
+                        &ConditionalRegions::default(),
+                        &mut memo
+                    ),
+                    (Some("property"), Some(true))
+                );
+                properties += 1;
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
+        assert_eq!(properties, 100);
+        assert_eq!(memo.scans, 1);
+        assert_eq!(memo.owners.len(), 1);
     }
 }

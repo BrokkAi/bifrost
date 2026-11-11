@@ -1,5 +1,9 @@
 use crate::analyzer::jvm::equivalent_java_type_identity;
+use crate::analyzer::jvm::selection_codec as codec;
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::ProjectedNativeModelMember;
+use brokk_bifrost_core::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
+use brokk_bifrost_core::content_digest::ContentDigestCache;
+use sha2::{Digest, Sha256};
 // Only the test-support invocation diagnostics (`invocation_with_diagnostics`
 // and `invocation_diagnostic_family`) name the selection type.
 #[cfg(any(test, feature = "test-support"))]
@@ -11,7 +15,9 @@ use brokk_bifrost_analysis::analyzer::dependency_support::resolve_dependency_pat
 
 use crate::analyzer::jvm::dependency_discovery::discover_build_tools;
 
-use crate::analyzer::jvm::dependency_discovery::discover_metadata;
+use crate::analyzer::jvm::dependency_discovery::{
+    DiscoveryInputs, LiveDiscoveryInputs, discover_metadata,
+};
 
 use crate::analyzer::jvm::java_artifact::JavaClassSurfaceOutcome;
 
@@ -92,7 +98,7 @@ use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifact
 
 use brokk_bifrost_semantic::analyzer::semantic_model::producer::ExternalArtifactPackProducer;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::HierarchyFact;
+use brokk_bifrost_analysis::analyzer::semantic_model::{HierarchyFact, HierarchyKind};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::Locator;
 
@@ -113,6 +119,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::Provenance;
 use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependency;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependencyArtifact;
+use brokk_bifrost_analysis::analyzer::semantic_model::ResolvedDependencyArtifactInput;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::Safety;
 
@@ -153,7 +160,7 @@ use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::declarations::{
     class_like_body_children_rev, determine_package_name, explicit_java_source_visibility,
     is_class_like_declaration_kind, node_text, parse_tree,
@@ -164,6 +171,7 @@ use semver::Version;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -179,7 +187,7 @@ use brokk_bifrost_analysis::analyzer::topology::DependencyScope;
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
-const MAX_INDEX_ARTIFACTS: usize = 128;
+pub(super) const MAX_INDEX_ARTIFACTS: usize = 128;
 const MAX_SOURCE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ANALYZER_SOURCE_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
@@ -210,11 +218,222 @@ const MAX_ARTIFACT_MEMBERS: usize = 32_768;
 /// and may disagree, so a cycle is possible; the visited set already stops one,
 /// and this bounds the work of a wide but acyclic hierarchy as well.
 const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
-const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v2";
+// #10470: the dispatch identity binds the full attributed lookup gap set.
+// v4: master moved this domain to v3 (fd6c7963fd); max of both sides + 1.
+const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v4";
 const JVM_EXTERNAL_INDEX_MEMO_DOMAIN: &[u8] = b"bifrost-jvm-external-index-memo/v1";
+const JVM_EXTERNAL_GAP_IDENTITY_DOMAIN: &[u8] = b"bifrost-jvm-external-gap-identity/v1";
 /// Domain of the read-free identity of one JDK's selected JMOD set.
 const JDK_JMOD_SET_SOURCE_IDENTITY_DOMAIN: &[u8] = b"bifrost-jvm.jdk-jmod-set-source-identity/v1";
 const JDK_DISCOVERY_HOME_ID_DOMAIN: &[u8] = b"bifrost-jvm.jdk-discovery-home-id/v1";
+/// Domains of the content digests that pin a JDK's artifacts (#9559). Each one
+/// names the framing it computes, so a cached digest can never be reused under
+/// another framing: the exact source-set v1 frame over the home's `jmods/*.jmod`
+/// members in UTF-8 byte order of their names, and the unframed SHA-256 of the
+/// `src.zip` bytes.
+const JDK_JMOD_SET_DIGEST_DOMAIN: &[u8] = b"bifrost-jvm.jdk-jmod-set-digest/v1";
+const JDK_SOURCE_ZIP_DIGEST_DOMAIN: &[u8] = b"bifrost-jvm.jdk-source-zip-digest/v1";
+
+/// Whom a production diagnostic is about.
+///
+/// A lookup may skip a gap only when it proves that nothing the gap concerns
+/// can change its answer. Today only a gap about one declared dependency
+/// artifact can be proven irrelevant, and only to a lookup of a type in an
+/// unshadowable JDK package (#10470). Everything the producers cannot name
+/// stays `Unattributed`, which no lookup ever skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapAttribution {
+    /// A declared dependency whose artifact the index could not use.
+    Dependency,
+    /// The JDK itself: no home, an invalid JMOD set.
+    Jdk,
+    /// Anything else, including entry caps, unreadable entries and the entry
+    /// that stands for diagnostics discovery suppressed.
+    Unattributed,
+}
+
+impl GapAttribution {
+    fn tag(self) -> &'static [u8] {
+        match self {
+            Self::Dependency => b"dependency",
+            Self::Jdk => b"jdk",
+            Self::Unattributed => b"unattributed",
+        }
+    }
+}
+
+/// One production diagnostic with the structured facts a lookup needs to
+/// decide whether to record it.
+///
+/// The coordinate of a declared dependency travels here as a field, so no
+/// reader parses it back out of the message text.
+#[derive(Debug, Clone)]
+pub(crate) struct IndexGap {
+    diagnostic: ProducerDiagnostic,
+    dependency_id: Option<String>,
+}
+
+impl std::ops::Deref for IndexGap {
+    type Target = ProducerDiagnostic;
+
+    fn deref(&self) -> &ProducerDiagnostic {
+        &self.diagnostic
+    }
+}
+
+impl From<ProducerDiagnostic> for IndexGap {
+    fn from(diagnostic: ProducerDiagnostic) -> Self {
+        Self {
+            diagnostic,
+            dependency_id: None,
+        }
+    }
+}
+
+impl IndexGap {
+    fn from_discovery(diagnostic: DependencyPackDiagnostic) -> Self {
+        let dependency_id = diagnostic.dependency_id.clone();
+        Self {
+            diagnostic: discovery_producer_diagnostic(diagnostic),
+            dependency_id,
+        }
+    }
+
+    pub(crate) fn dependency_id(&self) -> Option<&str> {
+        self.dependency_id.as_deref()
+    }
+
+    /// Derived from the diagnostic code and its structured coordinate; the
+    /// message is never read.
+    pub(crate) fn attribution(&self) -> GapAttribution {
+        let code = self.diagnostic.code.as_str();
+        if code == super::producer_codes::JVM_DEPENDENCY_UNRESOLVED.code
+            && self.dependency_id.is_some()
+        {
+            GapAttribution::Dependency
+        } else if [
+            super::producer_codes::JDK_HOME_UNAVAILABLE.code,
+            super::producer_codes::JDK_HOME_INVALID.code,
+            super::producer_codes::JDK_JMODS_INVALID.code,
+        ]
+        .contains(&code)
+        {
+            GapAttribution::Jdk
+        } else {
+            GapAttribution::Unattributed
+        }
+    }
+
+    /// Whether a lookup records this diagnostic as a gap in its answer.
+    ///
+    /// These retained boundary statuses are not provider failures. In
+    /// particular an unacquired JDK remains a query obligation, rather than
+    /// invalidating unrelated workspace-only reads.
+    ///
+    /// A declaration-scoped warning names the one declaration whose facts it
+    /// degraded, and the producer already folded that loss into the
+    /// declaration itself: an unresolved or undecodable signature clears
+    /// `callable_family_complete`, `values_complete` or `callables_complete`,
+    /// which the index carries as the owner's own `shapes_incomplete`. A read
+    /// that consults the declaration sees that; a read that never does must not
+    /// become incomplete because of it. Recording it for every lookup made one
+    /// anonymous dependency class's erased signature drop every name-selected
+    /// taint endpoint in the workspace (#10388).
+    pub(crate) fn is_recorded(&self) -> bool {
+        let code = self.diagnostic.code.as_str();
+        !(code == super::producer_codes::JDK_HOME_UNAVAILABLE.code
+            || code == super::producer_codes::JAVA_SOURCE_BINARY_CONFLICT.code
+            || matches!(code, "artifact.kind" | "artifact.role")
+            || self.diagnostic.declaration.is_some())
+    }
+
+    fn push_identity(&self, digest: &mut LengthDelimitedDigest) {
+        digest.push(self.diagnostic.code.as_bytes());
+        digest.push(match self.diagnostic.severity {
+            ProducerDiagnosticSeverity::Warning => b"warning",
+            ProducerDiagnosticSeverity::Error => b"error",
+        });
+        digest.push(self.attribution().tag());
+        push_optional_bytes(digest, self.dependency_id.as_deref().map(str::as_bytes));
+        digest.push(&[u8::from(self.is_recorded())]);
+    }
+}
+
+/// The sink a Java, Kotlin or Scala lookup reports the index's gaps to.
+///
+/// It wraps the analyzer only to reach the current query contexts: gaps go to
+/// the request that is reading, never to the warm index and never as a
+/// broadcast. The index is one value shared by every request, so it keeps no
+/// handle of its own.
+#[derive(Clone, Copy)]
+pub(crate) struct QueryGapRecorder<'a> {
+    sink: GapSink<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum GapSink<'a> {
+    Analyzer(&'a dyn brokk_bifrost_analysis::analyzer::IAnalyzer),
+    /// A hand-written fake for tests that look names up without an analyzer.
+    #[cfg(test)]
+    Collect(&'a std::cell::RefCell<Vec<brokk_bifrost_analysis::analyzer::QueryReadIncomplete>>),
+}
+
+impl<'a> QueryGapRecorder<'a> {
+    pub(crate) fn new(analyzer: &'a dyn brokk_bifrost_analysis::analyzer::IAnalyzer) -> Self {
+        Self {
+            sink: GapSink::Analyzer(analyzer),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn collecting(
+        reasons: &'a std::cell::RefCell<Vec<brokk_bifrost_analysis::analyzer::QueryReadIncomplete>>,
+    ) -> Self {
+        Self {
+            sink: GapSink::Collect(reasons),
+        }
+    }
+
+    fn record(self, index: &JvmExternalDeclarationIndex, include: impl Fn(&IndexGap) -> bool) {
+        for gap in index
+            .production_diagnostics
+            .iter()
+            .filter(|gap| gap.is_recorded() && include(gap))
+        {
+            self.record_gap(gap);
+        }
+    }
+
+    fn record_gap(&self, gap: &IndexGap) {
+        self.record_reason(super::producer_codes::classify(gap));
+    }
+
+    fn record_reason(&self, reason: brokk_bifrost_analysis::analyzer::QueryReadIncomplete) {
+        match self.sink {
+            GapSink::Analyzer(analyzer) => analyzer.record_query_incomplete(reason),
+            #[cfg(test)]
+            GapSink::Collect(reasons) => {
+                let mut reasons = reasons.borrow_mut();
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+            }
+        }
+    }
+
+    /// Every gap the index carries. This is what an answer that depends on the
+    /// whole classpath records.
+    pub(crate) fn all(self, index: &JvmExternalDeclarationIndex) {
+        self.record(index, |_| true);
+    }
+
+    /// Every gap not attributed to a declared dependency artifact. Only a
+    /// lookup that proves no dependency artifact can change its answer may use
+    /// this.
+    fn non_dependency(self, index: &JvmExternalDeclarationIndex) {
+        self.record(index, |gap| gap.attribution() != GapAttribution::Dependency);
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
@@ -228,7 +447,11 @@ pub(crate) struct JvmExternalDeclarationIndex {
     /// not the same as an owner that declares no members: see
     /// [`JvmIndexedOwnerSurface`].
     members_by_owner: HashMap<String, JvmIndexedOwnerSurface>,
-    production_diagnostics: Vec<ProducerDiagnostic>,
+    production_diagnostics: Vec<IndexGap>,
+    /// A Maven build file configures the compiler with a platform override
+    /// (`--patch-module`, `--upgrade-module-path`, `-Xbootclasspath/p|a`, an
+    /// endorsed-standards directory). Gradle compile options are not read.
+    platform_override: bool,
     /// Stable, path-independent identity of the effective declaration surface
     /// this index exposes to type, member, and hierarchy resolution.
     dispatch_behavior_identity: OnceLock<StableDigest>,
@@ -252,51 +475,42 @@ pub fn external_index_build_count_for_test() -> usize {
 
 pub(crate) fn get_or_build_external_declaration_index(
     analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
-    index: &brokk_bifrost_analysis::analyzer::common::QueryCacheCell<
-        brokk_bifrost_analysis::analyzer::common::ReplayableQueryCacheValue<
-            Arc<JvmExternalDeclarationIndex>,
-        >,
-    >,
+    slot: &crate::analyzer::jvm::authority::JvmExternalIndexSlot,
     authority: (
         brokk_bifrost_core::analyzer::model::Language,
         brokk_bifrost_analysis::analyzer::WorkspaceFactFamily,
     ),
-    inputs: &crate::analyzer::jvm::hierarchy::RawDerivedMemo<(), ()>,
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
     store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
 ) -> Arc<JvmExternalDeclarationIndex> {
-    crate::analyzer::jvm::authority::initialize_external_index(
-        analyzer,
-        authority,
-        index,
-        inputs,
-        || {
-            #[cfg(any(test, feature = "test-support"))]
-            EXTERNAL_INDEX_BUILDS.set(EXTERNAL_INDEX_BUILDS.get() + 1);
-            let value = JvmExternalDeclarationIndex::build_for_project_with_inventory(
-                config, project, store,
-            )
-            .unwrap_or_else(|error| {
-                analyzer.record_query_failure(error.clone());
-                eprintln!("JVM external inventory publication failed: {error}");
-                JvmExternalDeclarationIndex::build_for_project(config, project)
-            });
-            for diagnostic in &value.production_diagnostics {
-                // These retained boundary statuses are not provider failures.
-                // In particular an unacquired JDK remains a query obligation,
-                // rather than invalidating unrelated workspace-only reads.
-                if diagnostic.code == super::producer_codes::JDK_HOME_UNAVAILABLE.code
-                    || diagnostic.code == super::producer_codes::JAVA_SOURCE_BINARY_CONFLICT.code
-                    || matches!(diagnostic.code.as_str(), "artifact.kind" | "artifact.role")
-                {
-                    continue;
-                }
-                analyzer.record_query_incomplete(super::producer_codes::classify(diagnostic));
+    slot.get_or_build(analyzer, authority, || {
+        #[cfg(any(test, feature = "test-support"))]
+        EXTERNAL_INDEX_BUILDS.set(EXTERNAL_INDEX_BUILDS.get() + 1);
+        let value =
+            JvmExternalDeclarationIndex::build_for_project_with_inventory(config, project, store)
+                .unwrap_or_else(|error| {
+                    analyzer.record_query_failure(error.clone());
+                    eprintln!("JVM external inventory publication failed: {error}");
+                    JvmExternalDeclarationIndex::build_for_project(config, project)
+                });
+        // Stable gaps go to the lookups that read them, never to the building
+        // query. An execution-dependent gap (an archive entry that could not be
+        // read, an inspection that stopped) may not repeat, so the fill must
+        // not be retained: recording it here makes the retained cell refuse
+        // the fill, and the next request rebuilds the index (#8201).
+        for gap in value
+            .production_diagnostics
+            .iter()
+            .filter(|gap| gap.is_recorded())
+        {
+            let reason = super::producer_codes::classify(gap);
+            if reason.is_execution_dependent() {
+                analyzer.record_query_incomplete(reason);
             }
-            value
-        },
-    )
+        }
+        value
+    })
 }
 
 pub(crate) fn java_inventory_providers(
@@ -424,10 +638,16 @@ impl JavaArtifactFacts {
         owner_package: &str,
         budget: &mut MemberBudget,
     ) -> JvmIndexedOwnerSurface {
+        // The complete inventory when the artifact has one; otherwise the
+        // declared edges a source jar records, which member lookup still
+        // walks while the hierarchy stays incomplete.
         let supertypes = self
             .types
             .get(owner_fqn)
-            .map(|fact| hierarchy_type_names(&fact.hierarchy))
+            .map(|fact| match &fact.jvm_inventory {
+                Some(inventory) => hierarchy_type_names(&inventory.supertypes),
+                None => hierarchy_type_names(&fact.hierarchy),
+            })
             .unwrap_or_default();
         let hierarchy_complete = self
             .types
@@ -563,6 +783,10 @@ pub(crate) enum JvmExternalDeclarationSource {
     SemanticPack {
         pack_id: String,
         declaration_id: String,
+        /// The declaration came from a pack activated for the JDK itself, as
+        /// opposed to a library pack. Only a JDK pack can speak for a `java.*`
+        /// type (#10470).
+        jdk: bool,
     },
 }
 
@@ -666,27 +890,30 @@ impl JvmDependencyPackAdapter {
     /// Read one JDK's exported JMOD declarations for offline pack producers.
     /// Uses the same bounded readers and diagnostics as runtime acquisition.
     pub fn read_jdk_jmod_declarations(home: &Path) -> Result<ArtifactProduction, String> {
-        let release = read_jdk_release(home)?;
+        let mut probes = Vec::new();
+        let release = read_jdk_release(home, &mut probes)?;
         if release.version.components.first() != Some(&21) {
             return Err(format!(
                 "CodeQL JDK 21 expansion requires JDK 21, got {}",
                 release.version.raw
             ));
         }
-        let jmods =
-            discover_jdk_jmods(home)?.ok_or_else(|| format!("no jmods in {}", home.display()))?;
+        let jmods = discover_jdk_jmods(home, &mut probes)?
+            .ok_or_else(|| format!("no jmods in {}", home.display()))?;
         let paths = jmods
             .into_iter()
             .map(|jmod| jmod.relative_path)
             .collect::<Vec<_>>();
         let limits = DependencyPackLimits::default();
         let artifact =
-            brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_source_set(
+            brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_source_set_seekable_while(
                 home,
                 &paths,
                 limits.max_source_files_per_artifact,
                 limits.max_source_path_depth,
+                limits.max_total_artifact_bytes,
                 &limits.producer,
+                || false,
             )
             .map_err(|error| format!("read JDK JMODs: {error:?}"))?;
         let dependency = resolved_jdk_dependency(release.version, None);
@@ -721,12 +948,92 @@ impl JvmDependencyPackAdapter {
     }
 }
 
+/// Dependency discovery for activation: the discovered JDK's artifacts are
+/// pinned to content digests, because the JDK production key and the catalog
+/// expectation bind them (#9559).
 pub fn resolve_jvm_semantic_pack_dependencies(
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+    digests: &ContentDigestCache,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyDiscoveryOutcome {
+    let mut outcome =
+        resolve_jvm_semantic_pack_dependencies_unpinned(config, project, limits, cancellation);
+    if outcome.cancelled {
+        return outcome;
+    }
+    // Pin failures leave a dependency unpinned; the probes they record belong
+    // to the JDK question, which this outcome does not carry.
+    let mut probes = Vec::new();
+    let mut pass_bytes = 0;
+    for dependency in &mut outcome.dependencies {
+        if pin_jdk_artifacts(
+            dependency,
+            digests,
+            limits,
+            cancellation,
+            &mut probes,
+            &mut pass_bytes,
+        )
+        .is_break()
+        {
+            return cancelled_discovery("JVM dependency discovery was cancelled while pinning");
+        }
+    }
+    outcome
+}
+
+/// Dependency discovery for readers of the dependency list and diagnostics
+/// only: the external declaration index and the dependencies question read no
+/// JDK content pin (JDK artifacts never become index artifacts, and the JDK is
+/// not part of the dependencies answer), so the JDK jars and JMODs are not
+/// hashed.
+fn resolve_jvm_semantic_pack_dependencies_unpinned(
     config: &JvmAnalyzerConfig,
     project: &dyn Project,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
+    resolve_jvm_semantic_pack_dependencies_traced(
+        config,
+        project,
+        &LiveDiscoveryInputs(project),
+        limits,
+        cancellation,
+        None,
+    )
+}
+
+fn resolve_jvm_semantic_pack_dependencies_traced(
+    config: &JvmAnalyzerConfig,
+    project: &dyn Project,
+    inputs: &dyn DiscoveryInputs,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    mut trace: Option<&mut DependencyDiscoveryTrace>,
+) -> DependencyDiscoveryOutcome {
+    use brokk_bifrost_analysis::analyzer::dependency_support::{
+        refuse_external_discovery_reads, report_external_discovery_read,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ExternalDiscoveryRead, UnverifiableDiscoveryRead,
+    };
+    for name in [
+        "JAVA_HOME",
+        "HOME",
+        "USERPROFILE",
+        "GRADLE_USER_HOME",
+        "PATH",
+        "MAVEN_OPTS",
+        "GRADLE_OPTS",
+        "JAVA_TOOL_OPTIONS",
+    ] {
+        report_external_discovery_read(ExternalDiscoveryRead::Environment {
+            name: name.into(),
+            value: std::env::var_os(name),
+        });
+    }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
@@ -736,7 +1043,15 @@ pub fn resolve_jvm_semantic_pack_dependencies(
     // merged coordinate list has already lost which file each came from.
     let mut declarations = brokk_bifrost_core::hash::HashMap::default();
     if config.dependency_discovery.mode != JvmDependencyDiscoveryMode::Disabled {
-        let discovered = discover_metadata(project);
+        let discovered = discover_metadata(inputs);
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.partial_manifests.extend(
+                discovered
+                    .partial_manifests
+                    .iter()
+                    .map(|file| file.rel_path().to_path_buf()),
+            );
+        }
         declarations.clone_from(&discovered.declarations);
         discovered.merge_into(&mut dependencies);
     }
@@ -744,7 +1059,14 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
     if config.dependency_discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools {
-        discover_build_tools(project, &config.dependency_discovery).merge_into(&mut dependencies);
+        discover_build_tools(inputs, &config.dependency_discovery).merge_into(&mut dependencies);
+    }
+    if !dependencies.coordinates.is_empty() {
+        // Coordinate lookup traverses the Maven repository and Gradle cache.
+        report_external_discovery_read(ExternalDiscoveryRead::Unverifiable(
+            UnverifiableDiscoveryRead::ExternalCacheWalk,
+        ));
+        refuse_external_discovery_reads();
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
@@ -753,7 +1075,28 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         .artifact_paths
         .len()
         .saturating_add(dependencies.coordinates.len());
-    let resolved = resolve_configured_artifacts(&dependencies, project.root());
+    if let Some(trace) = trace.as_deref_mut() {
+        trace
+            .coordinates
+            .extend(dependencies.coordinates.iter().cloned());
+        for artifact in &dependencies.artifact_paths {
+            trace
+                .explicit_paths
+                .push(resolve_path(project.root(), &artifact.artifact_path));
+            if let Some(source) = &artifact.source_artifact_path {
+                trace
+                    .explicit_paths
+                    .push(resolve_path(project.root(), source));
+            }
+        }
+    }
+    let resolved = resolve_configured_artifacts_traced(
+        &dependencies,
+        project.root(),
+        trace
+            .as_deref_mut()
+            .map(|trace| &mut trace.resolution_steps),
+    );
     let mut resolved_coordinates = brokk_bifrost_core::hash::HashSet::default();
     for artifact in &resolved {
         if let Some(coordinate) = &artifact.coordinate {
@@ -828,15 +1171,28 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         }
         resolved.push(dependency);
     }
-    let jdk_discovery = discover_jdk_semantic_pack_dependencies(
-        config,
-        project.root(),
-        config
-            .standard_library_discovery
-            .discover_java_home
-            .then(|| std::env::var_os("JAVA_HOME"))
-            .flatten(),
-    );
+    if let Some(trace) = trace.as_deref_mut() {
+        // The dependencies question is answered before the JDK joins the
+        // outcome: JDK configuration is not in its digest, and the JDK has
+        // its own question.
+        trace.dependencies_discovered = !dependency_limit_hit
+            && !diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == DependencyPackDiagnosticSeverity::Error
+                    && (diagnostic.code != super::producer_codes::JVM_DEPENDENCY_UNRESOLVED.code
+                        || diagnostic.dependency_id.is_none())
+            });
+        trace.unresolved_coordinates = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == super::producer_codes::JVM_DEPENDENCY_UNRESOLVED.code
+            })
+            .filter_map(|diagnostic| diagnostic.dependency_id.clone())
+            .collect();
+        trace.unresolved_coordinates.sort();
+        trace.unresolved_coordinates.dedup();
+    }
+    let dependency_diagnostic_count = diagnostics.len();
+    let jdk_discovery = discover_configured_jdk(config, project.root());
     metadata_inputs_considered =
         metadata_inputs_considered.saturating_add(jdk_discovery.inputs_considered);
     resolved.extend(jdk_discovery.dependencies);
@@ -875,8 +1231,31 @@ pub fn resolve_jvm_semantic_pack_dependencies(
     // errors that decide the outcome, so bound it through the shared collector
     // instead of truncating: an error must keep a slot.
     let mut bounded = BoundedDependencyDiagnostics::new(limits);
-    for diagnostic in diagnostics {
+    let mut retained_dependencies = 0;
+    for (position, diagnostic) in diagnostics.into_iter().enumerate() {
+        if position >= dependency_diagnostic_count
+            && diagnostic.severity == DependencyPackDiagnosticSeverity::Error
+            && bounded.diagnostics.len() == limits.max_diagnostics
+            && bounded
+                .diagnostics
+                .iter()
+                .rposition(|kept| kept.severity == DependencyPackDiagnosticSeverity::Warning)
+                .is_some_and(|evicted| evicted < retained_dependencies)
+        {
+            // A JDK error can evict a dependency-origin warning from the
+            // shared bound. JDK-origin suppression alone is not a dependency gap.
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.dependencies_discovered = false;
+            }
+            retained_dependencies -= 1;
+        }
         bounded.push(diagnostic);
+        if position + 1 == dependency_diagnostic_count {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.dependencies_discovered &= bounded.suppressed.total() == 0;
+            }
+            retained_dependencies = bounded.diagnostics.len();
+        }
     }
     let (diagnostics, bounded_suppressed) = bounded.finish();
     suppressed_diagnostics += bounded_suppressed;
@@ -908,11 +1287,40 @@ fn jvm_coordinate_id(coordinate: &JvmMavenCoordinate) -> String {
     )
 }
 
+/// The JDK question's answer: what discovery consulted and what it selected.
+/// Each selected dependency keeps its version and its artifacts' content pins
+/// (the framed digest of the JMOD set, the digest of `src.zip`), so two JDKs
+/// at the same paths with different contents give different answers, and a
+/// later transcript can be checked against a fresh discovery. An artifact
+/// that could not be pinned keeps its metadata source identity instead.
+#[derive(Debug)]
+pub(super) struct SelectedJdk {
+    pub(super) inputs: JdkInputsConsumed,
+    #[allow(dead_code)] // The query-owned transcript is consumed by the later verifier.
+    pub(super) dependencies: Vec<ResolvedDependency>,
+}
+
 #[derive(Debug, Default)]
 struct JdkDiscovery {
     dependencies: Vec<ResolvedDependency>,
     diagnostics: Vec<DependencyPackDiagnostic>,
     inputs_considered: usize,
+    inputs: JdkInputsConsumed,
+}
+
+/// JDK discovery as the configuration asks for it, reading `JAVA_HOME` only
+/// when discovery is told to. The artifacts are not pinned to content digests;
+/// [`pin_jdk_discovery`] does that for the paths that consume the pins.
+fn discover_configured_jdk(config: &JvmAnalyzerConfig, project_root: &Path) -> JdkDiscovery {
+    discover_jdk_semantic_pack_dependencies(
+        config,
+        project_root,
+        config
+            .standard_library_discovery
+            .discover_java_home
+            .then(|| std::env::var_os("JAVA_HOME"))
+            .flatten(),
+    )
 }
 
 fn discover_jdk_semantic_pack_dependencies(
@@ -920,6 +1328,7 @@ fn discover_jdk_semantic_pack_dependencies(
     project_root: &Path,
     java_home: Option<OsString>,
 ) -> JdkDiscovery {
+    let consulted_java_home = java_home.clone();
     let mut candidates: Vec<(PathBuf, bool)> = config
         .standard_library_discovery
         .jdk_homes
@@ -941,16 +1350,29 @@ fn discover_jdk_semantic_pack_dependencies(
         !candidates.is_empty() || config.standard_library_discovery.discover_java_home;
     let mut discovery = JdkDiscovery {
         inputs_considered: candidates.len(),
+        inputs: JdkInputsConsumed {
+            java_home: consulted_java_home,
+            candidates: candidates.clone(),
+            probes: Vec::new(),
+            complete: false,
+        },
         ..JdkDiscovery::default()
     };
     let mut seen_homes = brokk_bifrost_core::hash::HashSet::default();
     let mut dependency_homes = Vec::new();
     for (candidate, configured) in candidates {
-        let home = fs::canonicalize(&candidate).unwrap_or(candidate);
+        let canonical = fs::canonicalize(&candidate);
+        record_external_probe(
+            &mut discovery.inputs.probes,
+            &candidate,
+            ExternalProbeOperation::Canonicalize,
+            &canonical,
+        );
+        let home = canonical.unwrap_or(candidate);
         if !seen_homes.insert(home.clone()) {
             continue;
         }
-        let release = match read_jdk_release(&home) {
+        let release = match read_jdk_release(&home, &mut discovery.inputs.probes) {
             Ok(release) => release,
             Err(message) => {
                 discovery.diagnostics.push(DependencyPackDiagnostic {
@@ -970,9 +1392,18 @@ fn discover_jdk_semantic_pack_dependencies(
         let version = release.version.clone();
         let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
             .into_iter()
-            .find(|path| path.is_file());
+            .find(|path| {
+                let metadata = fs::metadata(path);
+                record_external_probe(
+                    &mut discovery.inputs.probes,
+                    path,
+                    ExternalProbeOperation::File,
+                    &metadata,
+                );
+                metadata.is_ok_and(|metadata| metadata.is_file())
+            });
         let dependency = if !configured {
-            match discover_jdk_jmods(&home) {
+            match discover_jdk_jmods(&home, &mut discovery.inputs.probes) {
                 Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home.clone(), jmods),
                 Ok(None) => resolved_jdk_dependency(version.clone(), source),
                 Err(message) => {
@@ -988,7 +1419,7 @@ fn discover_jdk_semantic_pack_dependencies(
             }
         } else if let Some(source) = source {
             let mut dependency = resolved_jdk_dependency(version.clone(), Some(source));
-            match discover_jdk_jmods(&home) {
+            match discover_jdk_jmods(&home, &mut discovery.inputs.probes) {
                 Ok(Some(jmods)) => dependency
                     .artifacts
                     .push(jdk_jmod_set_artifact(&release, &home, &jmods)),
@@ -1007,7 +1438,7 @@ fn discover_jdk_semantic_pack_dependencies(
             }
             dependency
         } else {
-            match discover_jdk_jmods(&home) {
+            match discover_jdk_jmods(&home, &mut discovery.inputs.probes) {
                 Ok(Some(jmods)) => resolved_jdk_jmod_dependency(&release, home.clone(), jmods),
                 Ok(None) => resolved_jdk_dependency(version.clone(), None),
                 Err(message) => {
@@ -1027,7 +1458,7 @@ fn discover_jdk_semantic_pack_dependencies(
             }
         };
         // Distinct homes can report the same version while carrying different
-        // source or JMOD artifacts. Preparation supplies the exact digest;
+        // source or JMOD artifacts. Each artifact carries its content pin;
         // coalescing by release version here would erase one source binding.
         dependency_homes.push(home);
         discovery.dependencies.push(dependency);
@@ -1057,7 +1488,317 @@ fn discover_jdk_semantic_pack_dependencies(
                 .to_owned(),
         });
     }
+    discovery.inputs.complete = jdk_inputs_complete(&discovery);
     discovery
+}
+
+/// A home, JMOD or source-archive probe that failed left an input unread,
+/// whether the home was configured (an error) or came from JAVA_HOME (a
+/// warning), and whether or not a diagnostic names it.
+fn jdk_inputs_complete(discovery: &JdkDiscovery) -> bool {
+    !discovery.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == super::producer_codes::JDK_HOME_INVALID.code
+            || diagnostic.code == super::producer_codes::JDK_JMODS_INVALID.code
+    }) && !discovery
+        .inputs
+        .probes
+        .iter()
+        .any(|probe| matches!(probe.outcome, ExternalProbeOutcome::Unreadable))
+}
+
+/// Pin every discovered JDK dependency to its content digests. Only activation
+/// and the JDK question apply this: the production key, the catalog
+/// expectation and certification bind the pins. A member that cannot be
+/// hashed records an `Unreadable` probe, so the inputs are re-judged. `Break`
+/// means the token was cancelled while pinning.
+fn pin_jdk_discovery(
+    discovery: &mut JdkDiscovery,
+    digests: &ContentDigestCache,
+    cancellation: Option<&CancellationToken>,
+) -> ControlFlow<()> {
+    let limits = DependencyPackLimits::default();
+    let mut pass_bytes = 0;
+    for dependency in &mut discovery.dependencies {
+        pin_jdk_artifacts(
+            dependency,
+            digests,
+            &limits,
+            cancellation,
+            &mut discovery.inputs.probes,
+            &mut pass_bytes,
+        )?;
+    }
+    discovery.inputs.complete = jdk_inputs_complete(discovery);
+    ControlFlow::Continue(())
+}
+
+/// The member path capture frames: normalized components joined by `/`, so the
+/// spelling does not depend on the platform separator.
+fn framed_member_path(relative_path: &Path) -> String {
+    relative_path
+        .components()
+        .map(|part| {
+            part.as_os_str()
+                .to_str()
+                .expect("selected JDK member names were checked to be UTF-8")
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Digests actually computed (cache misses) on this thread.
+    static JDK_DIGEST_COMPUTATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Finishes a JDK digest the cache could not serve.
+fn finish_jdk_digest(hasher: Sha256) -> [u8; 32] {
+    #[cfg(test)]
+    JDK_DIGEST_COMPUTATIONS.set(JDK_DIGEST_COMPUTATIONS.get() + 1);
+    brokk_bifrost_semantic::analyzer::semantic_model::producer::finish_digest(hasher)
+}
+
+/// Record an input selection listed moments ago and could not read. Whatever
+/// the error kind, even a vanished member is an unread input, never an absent
+/// candidate, so the answer is incomplete.
+fn push_unreadable_probe(
+    probes: &mut Vec<ExternalPathProbe>,
+    path: PathBuf,
+    operation: ExternalProbeOperation,
+) {
+    probes.push(ExternalPathProbe {
+        path,
+        operation,
+        outcome: ExternalProbeOutcome::Unreadable,
+    });
+}
+
+/// Pin each artifact of a JDK dependency to the digest capture will compute
+/// (#9559), so a JMOD or `src.zip` replaced between selection and capture
+/// fails as `artifact.digest_changed` instead of being parsed under a
+/// selection that bound only its metadata. The digests stream the opened files
+/// through the store's cache: a second selection of unchanged, old files reads
+/// nothing.
+///
+/// A dependency is pinned all or nothing. The catalog expectation wants the
+/// pinned production key only for a fully pinned dependency, and the metadata
+/// source identity only for a wholly unpinned one, so a half-pinned JDK would
+/// expect a production that no installed pack matches. A dependency stays
+/// unpinned (uncertified, on its metadata identity) when capture would refuse
+/// a pin for another reason: capture requires the pinned path to be its own
+/// canonical path (a symlinked `src.zip`, as on Debian), and it refuses an
+/// artifact over the producer limits, which are checked from metadata before
+/// any byte is hashed. A member that cannot be read records an `Unreadable`
+/// file probe for that member, which makes the answer incomplete.
+fn pin_jdk_artifacts(
+    dependency: &mut ResolvedDependency,
+    digests: &ContentDigestCache,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    probes: &mut Vec<ExternalPathProbe>,
+    pass_bytes: &mut u64,
+) -> ControlFlow<()> {
+    use brokk_bifrost_semantic::analyzer::semantic_model::producer::{
+        hash_exact_file, hash_source_member, source_set_hasher,
+    };
+    let is_cancelled = || cancellation.is_some_and(CancellationToken::is_cancelled);
+    let mut total_bytes = 0u64;
+    // The member sizes the limits were checked against, per JDK artifact.
+    let mut listed_sizes = Vec::new();
+    for artifact in &dependency.artifacts {
+        let (member_paths, per_artifact_limit) = match (&artifact.input, artifact.kind) {
+            (
+                ResolvedDependencyArtifactInput::SourceSet {
+                    root,
+                    relative_paths,
+                },
+                ExternalArtifactKind::JdkJmodSet,
+            ) => (
+                relative_paths
+                    .iter()
+                    .map(|member| root.join(member))
+                    .collect::<Vec<_>>(),
+                limits.max_total_artifact_bytes,
+            ),
+            (ResolvedDependencyArtifactInput::File(file), ExternalArtifactKind::JdkSourceZip) => {
+                (vec![file.clone()], limits.producer.max_artifact_bytes)
+            }
+            _ => continue,
+        };
+        let path = artifact.path();
+        match fs::canonicalize(path) {
+            Ok(canonical) if canonical == path => {}
+            Ok(_) => return ControlFlow::Continue(()),
+            Err(_) => {
+                push_unreadable_probe(
+                    probes,
+                    path.to_path_buf(),
+                    ExternalProbeOperation::Canonicalize,
+                );
+                return ControlFlow::Continue(());
+            }
+        }
+        let mut artifact_bytes = 0u64;
+        let mut sizes = Vec::with_capacity(member_paths.len());
+        for member in &member_paths {
+            match fs::metadata(member) {
+                Ok(metadata) => {
+                    sizes.push(metadata.len());
+                    artifact_bytes = artifact_bytes.saturating_add(metadata.len());
+                }
+                Err(_) => {
+                    push_unreadable_probe(probes, member.clone(), ExternalProbeOperation::File);
+                    return ControlFlow::Continue(());
+                }
+            }
+        }
+        listed_sizes.push(sizes);
+        total_bytes = total_bytes.saturating_add(artifact_bytes);
+        if artifact_bytes > per_artifact_limit || total_bytes > limits.max_total_artifact_bytes {
+            return ControlFlow::Continue(());
+        }
+    }
+
+    if total_bytes > limits.max_total_artifact_bytes.saturating_sub(*pass_bytes) {
+        return ControlFlow::Continue(());
+    }
+    *pass_bytes += total_bytes;
+
+    let mut listed_sizes = listed_sizes.into_iter();
+    let mut pins = Vec::with_capacity(dependency.artifacts.len());
+    for artifact in &dependency.artifacts {
+        // A cache hit reads nothing, so the token is also checked here.
+        if is_cancelled() {
+            return ControlFlow::Break(());
+        }
+        let path = artifact.path().to_path_buf();
+        // The members hashed before a failure, so the next one is the culprit.
+        let mut visited = 0usize;
+        let (digest, member_paths) = match (&artifact.input, artifact.kind) {
+            (
+                ResolvedDependencyArtifactInput::SourceSet {
+                    root,
+                    relative_paths,
+                },
+                ExternalArtifactKind::JdkJmodSet,
+            ) => {
+                let listed = listed_sizes.next().expect("one size list per JDK artifact");
+                (
+                    digests.digest(
+                        JDK_JMOD_SET_DIGEST_DOMAIN,
+                        root,
+                        relative_paths,
+                        source_set_hasher,
+                        |hasher, member| {
+                            hash_source_member(
+                                hasher,
+                                &framed_member_path(member.relative_path),
+                                listed_member_size(&listed, visited, member.size)?,
+                                &mut CancellableRead::new(member.file, cancellation),
+                            )?;
+                            visited += 1;
+                            Ok(())
+                        },
+                        finish_jdk_digest,
+                    ),
+                    relative_paths
+                        .iter()
+                        .map(|member| root.join(member))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            (ResolvedDependencyArtifactInput::File(file), ExternalArtifactKind::JdkSourceZip) => {
+                let listed = listed_sizes.next().expect("one size list per JDK artifact");
+                (
+                    digests.digest(
+                        JDK_SOURCE_ZIP_DIGEST_DOMAIN,
+                        file.parent()
+                            .expect("a source archive has a parent directory"),
+                        &[PathBuf::from(
+                            file.file_name()
+                                .expect("a source archive path names a file"),
+                        )],
+                        |_| Sha256::new(),
+                        |hasher, member| {
+                            hash_exact_file(
+                                hasher,
+                                listed_member_size(&listed, visited, member.size)?,
+                                &mut CancellableRead::new(member.file, cancellation),
+                            )?;
+                            visited += 1;
+                            Ok(())
+                        },
+                        finish_jdk_digest,
+                    ),
+                    vec![file.clone()],
+                )
+            }
+            _ => continue,
+        };
+        match digest {
+            Ok(digest) => pins.push(lower_hex_string(&digest)),
+            Err(_) if is_cancelled() => return ControlFlow::Break(()),
+            Err(_) => {
+                let culprit = member_paths.get(visited).unwrap_or(&path).clone();
+                push_unreadable_probe(probes, culprit, ExternalProbeOperation::File);
+                return ControlFlow::Continue(());
+            }
+        }
+    }
+    let mut pins = pins.into_iter();
+    for artifact in &mut dependency.artifacts {
+        if matches!(
+            artifact.kind,
+            ExternalArtifactKind::JdkJmodSet | ExternalArtifactKind::JdkSourceZip
+        ) {
+            artifact.source_identity = None;
+            artifact.expected_sha256 = Some(pins.next().expect("one pin per JDK artifact"));
+        }
+    }
+    assert!(pins.next().is_none(), "one pin per JDK artifact");
+    ControlFlow::Continue(())
+}
+
+/// The size the limits were checked against for the `index`th member. A member
+/// opened with another size changed after that check, so it is not hashed:
+/// the read stays bounded by the checked size.
+fn listed_member_size(listed: &[u64], index: usize, opened: u64) -> std::io::Result<u64> {
+    match listed.get(index) {
+        Some(&size) if size == opened => Ok(size),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "a JDK artifact member changed size after its limits were checked",
+        )),
+    }
+}
+
+/// Reads through to a file, refusing each read after the token is cancelled,
+/// so a cancelled pin stops between chunks instead of finishing a JMOD.
+struct CancellableRead<'a, R> {
+    inner: R,
+    cancellation: Option<&'a CancellationToken>,
+}
+
+impl<'a, R> CancellableRead<'a, R> {
+    fn new(inner: R, cancellation: Option<&'a CancellationToken>) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+}
+
+impl<R: Read> Read for CancellableRead<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(std::io::Error::other("JDK pinning was cancelled"));
+        }
+        self.inner.read(buffer)
+    }
 }
 
 /// The discovered home of one JDK dependency, derived only from the artifact
@@ -1104,9 +1845,14 @@ struct JdkJmodFile {
     modified: Option<SystemTime>,
 }
 
-fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<JdkJmodFile>>, String> {
+fn discover_jdk_jmods(
+    home: &Path,
+    probes: &mut Vec<ExternalPathProbe>,
+) -> Result<Option<Vec<JdkJmodFile>>, String> {
     let jmods = home.join("jmods");
-    let metadata = match fs::symlink_metadata(&jmods) {
+    let metadata = fs::symlink_metadata(&jmods);
+    record_external_probe(probes, &jmods, ExternalProbeOperation::List, &metadata);
+    let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("could not inspect JDK jmods directory: {error}")),
@@ -1133,8 +1879,10 @@ fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<JdkJmodFile>>, String> {
         if !name.ends_with(".jmod") {
             continue;
         }
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("could not inspect JDK jmod {name}: {error}"))?;
+        let metadata = fs::symlink_metadata(&path);
+        record_external_probe(probes, &path, ExternalProbeOperation::File, &metadata);
+        let metadata =
+            metadata.map_err(|error| format!("could not inspect JDK jmod {name}: {error}"))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             continue;
         }
@@ -1144,7 +1892,15 @@ fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<JdkJmodFile>>, String> {
             modified: metadata.modified().ok(),
         });
     }
-    paths.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    // Capture orders the framed members by the UTF-8 bytes of their names, and
+    // the pinned digest must visit them in the same order. Every name here was
+    // checked to be UTF-8 above, so the encoded bytes are UTF-8 bytes.
+    paths.sort_unstable_by(|left, right| {
+        left.relative_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(right.relative_path.as_os_str().as_encoded_bytes())
+    });
     if paths.len() > MAX_JDK_JMOD_FILES {
         return Err(format!(
             "JDK jmods directory contains more than {MAX_JDK_JMOD_FILES} bounded archives"
@@ -1224,11 +1980,21 @@ struct JdkRelease {
     bytes: Vec<u8>,
 }
 
-fn read_jdk_release(home: &Path) -> Result<JdkRelease, String> {
+fn read_jdk_release(
+    home: &Path,
+    probes: &mut Vec<ExternalPathProbe>,
+) -> Result<JdkRelease, String> {
     const MAX_RELEASE_BYTES: u64 = 64 * 1024;
 
     let release_path = home.join("release");
-    let metadata = fs::metadata(&release_path)
+    let metadata = fs::metadata(&release_path);
+    record_external_probe(
+        probes,
+        &release_path,
+        ExternalProbeOperation::File,
+        &metadata,
+    );
+    let metadata = metadata
         .map_err(|error| format!("JDK home does not contain a readable release file: {error}"))?;
     if !metadata.is_file() || metadata.len() > MAX_RELEASE_BYTES {
         return Err("JDK release file is not a bounded regular file".to_owned());
@@ -1416,6 +2182,12 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
         Producer::for_name("bifrost-jvm-dependency")
     }
 
+    /// Only JDK artifacts carry pins, and selection computes them from the
+    /// opened files through the content-digest cache ([`pin_jdk_artifacts`]).
+    fn reuses_productions_by_pinned_key(&self) -> bool {
+        true
+    }
+
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
         !matches!(dependency.evidence.language.as_str(), "scala" | "kotlin")
             || dependency.artifacts.iter().any(|artifact| {
@@ -1502,7 +2274,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                 production.artifact_sha256.as_deref(),
                 Some(artifact.sha256())
             );
-            partial |= production.completeness == Completeness::Partial;
+            partial |= production.completeness != Completeness::Complete;
             diagnostics.extend(production.diagnostics);
             suppressed_diagnostics += production.suppressed_diagnostics;
             match (artifact.role(), production.pack) {
@@ -1793,7 +2565,7 @@ fn jvm_dependency_production_request(dependency: &ResolvedDependency) -> Artifac
         activation: vec![
             brokk_bifrost_semantic::analyzer::semantic_model::dependency::activation_selector_for_evidence(&dependency.evidence),
         ],
-        provenance: Provenance {
+        provenance: Provenance { rust_artifact_approximation: None,
             source: "exact local JVM dependency".to_owned(),
             revision: None,
         },
@@ -2192,9 +2964,11 @@ fn external_index_memo() -> &'static Mutex<HashMap<StableDigest, Arc<JvmExternal
 /// index.
 fn external_index_memo_key(
     artifacts: &[ResolvedJvmArtifact],
-    diagnostics: &[ProducerDiagnostic],
+    diagnostics: &[IndexGap],
+    platform_override: bool,
 ) -> StableDigest {
     let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_INDEX_MEMO_DOMAIN);
+    digest.push(&[u8::from(platform_override)]);
     digest.push(&(artifacts.len() as u64).to_le_bytes());
     for artifact in artifacts {
         push_artifact_file_evidence(&mut digest, &artifact.artifact_path);
@@ -2223,6 +2997,7 @@ fn external_index_memo_key(
             diagnostic.declaration.as_deref().map(str::as_bytes),
         );
         digest.push(diagnostic.message.as_bytes());
+        push_optional_bytes(&mut digest, diagnostic.dependency_id().map(str::as_bytes));
     }
     digest.finish()
 }
@@ -2257,7 +3032,520 @@ fn push_artifact_file_evidence(digest: &mut LengthDelimitedDigest, path: &Path) 
     }
 }
 
+#[allow(dead_code)] // Milestone 1 captures typed selection evidence for the later verifier.
+#[derive(Debug)]
+pub(super) enum ExternalSelectionFailure {
+    Discovery,
+    UnresolvedCoordinates(Vec<String>),
+    /// A workspace manifest discovery could not read in full.
+    PartialManifest(PathBuf),
+    ArtifactRead(PathBuf),
+    /// More artifacts than the inventory reads.
+    ArtifactLimit,
+    /// A resolution probe failed for a reason other than absence, so
+    /// restoring access could change what resolution selects.
+    UnreadableProbe(PathBuf),
+}
+
+/// Every reason a selection is not complete, in the order selection met
+/// them: discovery, unresolved coordinates, partial manifests and unreadable
+/// probes in input order, then artifact reads in artifact order, then the
+/// artifact limit. The same inputs give the same order, so the answer digest
+/// is stable.
+#[derive(Debug, Default)]
+pub(super) struct ExternalSelectionCompleteness {
+    failures: Vec<ExternalSelectionFailure>,
+}
+
+impl ExternalSelectionCompleteness {
+    pub(super) fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub(super) fn only_unresolved_coordinates(&self) -> Option<&[String]> {
+        match self.failures.as_slice() {
+            [ExternalSelectionFailure::UnresolvedCoordinates(coordinates)] => Some(coordinates),
+            _ => None,
+        }
+    }
+
+    pub(super) fn record(&mut self, failure: ExternalSelectionFailure) {
+        self.failures.push(failure);
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(super) struct ExternalPathProbe {
+    pub(super) path: PathBuf,
+    pub(super) operation: ExternalProbeOperation,
+    outcome: ExternalProbeOutcome,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(super) enum ExternalProbeOperation {
+    Canonicalize,
+    List,
+    File,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ExternalProbeOutcome {
+    Found,
+    Absent,
+    Unreadable,
+}
+
+impl ExternalPathProbe {
+    fn hash_into(&self, hash: &mut CanonicalHasher) {
+        let Self {
+            path,
+            operation,
+            outcome,
+        } = self;
+        codec::path(hash, "path", path);
+        codec::text(
+            hash,
+            "operation",
+            match operation {
+                ExternalProbeOperation::Canonicalize => "canonicalize",
+                ExternalProbeOperation::List => "list",
+                ExternalProbeOperation::File => "file",
+            },
+        );
+        codec::text(
+            hash,
+            "outcome",
+            match outcome {
+                ExternalProbeOutcome::Found => "found",
+                ExternalProbeOutcome::Absent => "absent",
+                ExternalProbeOutcome::Unreadable => "unreadable",
+            },
+        );
+    }
+}
+
+fn record_external_probe(
+    steps: &mut Vec<ExternalPathProbe>,
+    path: &Path,
+    operation: ExternalProbeOperation,
+    result: &std::io::Result<impl Sized>,
+) {
+    let outcome = match result {
+        Ok(_) => ExternalProbeOutcome::Found,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ExternalProbeOutcome::Absent,
+        Err(_) => ExternalProbeOutcome::Unreadable,
+    };
+    steps.push(ExternalPathProbe {
+        path: path.to_path_buf(),
+        operation,
+        outcome,
+    });
+}
+
+#[allow(dead_code)] // The query-owned transcript is consumed by the later verifier.
+#[derive(Debug)]
+pub(super) struct ExternalInputsConsumed {
+    explicit_paths: Vec<PathBuf>,
+    repository_roots: Vec<PathBuf>,
+    pub(super) gradle_cache_roots: Vec<PathBuf>,
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+    gradle_user_home: Option<std::ffi::OsString>,
+    coordinates: Vec<JvmMavenCoordinate>,
+    /// Workspace-relative manifests discovery could not read in full.
+    partial_manifests: Vec<PathBuf>,
+    pub(super) resolution_steps: Vec<ExternalPathProbe>,
+    artifact_probes: Vec<PathBuf>,
+}
+
+impl ExternalInputsConsumed {
+    /// Every field is destructured so a new field fails to compile until it is
+    /// hashed or excluded here.
+    ///
+    /// Order. `explicit_paths`, the two root lists and `resolution_steps` keep
+    /// their order: roots are searched first to last and the probes record that
+    /// search. `artifact_probes` follows the selected dependency order, which
+    /// `productions` also hashes in order. `coordinates` and
+    /// `partial_manifests` are sets whose order discovery does not promise, so
+    /// they are sorted by byte order.
+    fn hash_into(&self, hash: &mut CanonicalHasher) {
+        let Self {
+            explicit_paths,
+            repository_roots,
+            gradle_cache_roots,
+            home,
+            userprofile,
+            gradle_user_home,
+            coordinates,
+            partial_manifests,
+            resolution_steps,
+            artifact_probes,
+        } = self;
+        codec::paths(hash, "explicit_paths", explicit_paths);
+        codec::paths(hash, "repository_roots", repository_roots);
+        codec::paths(hash, "gradle_cache_roots", gradle_cache_roots);
+        codec::optional_os(hash, "home", home);
+        codec::optional_os(hash, "userprofile", userprofile);
+        codec::optional_os(hash, "gradle_user_home", gradle_user_home);
+        let mut sorted: Vec<&JvmMavenCoordinate> = coordinates.iter().collect();
+        sorted.sort_unstable_by(|a, b| {
+            (&a.group_id, &a.artifact_id, &a.version).cmp(&(
+                &b.group_id,
+                &b.artifact_id,
+                &b.version,
+            ))
+        });
+        hash.sequence("coordinates", &sorted, |hash, value| {
+            let JvmMavenCoordinate {
+                group_id,
+                artifact_id,
+                version,
+            } = value;
+            codec::text(hash, "group_id", group_id);
+            codec::text(hash, "artifact_id", artifact_id);
+            codec::text(hash, "version", version);
+        });
+        codec::sorted_paths(hash, "partial_manifests", partial_manifests);
+        hash.sequence("resolution_steps", resolution_steps, |hash, value| {
+            value.hash_into(hash)
+        });
+        codec::paths(hash, "artifact_probes", artifact_probes);
+    }
+}
+
+/// What JDK discovery consulted, in order: `JAVA_HOME` when discovery reads
+/// it, the candidate homes (with whether each was configured), and every
+/// filesystem probe. They answer the separate JDK question, so they are not
+/// part of the dependency record.
+#[allow(dead_code)] // The query-owned transcript is consumed by the later verifier.
+#[derive(Debug, Default)]
+pub(super) struct JdkInputsConsumed {
+    java_home: Option<OsString>,
+    candidates: Vec<(PathBuf, bool)>,
+    probes: Vec<ExternalPathProbe>,
+    /// No home, JMOD or source-archive probe failed. False until JDK
+    /// discovery finishes.
+    pub(super) complete: bool,
+}
+
+impl JdkInputsConsumed {
+    /// `candidates` keeps discovery's order: it is the order of the home
+    /// de-duplication, so the first of two homes that canonicalize equal is
+    /// the one whose dependencies the answer lists. The canonical homes
+    /// themselves appear in `JdkDiscovery::dependencies` artifact paths.
+    fn hash_into(&self, hash: &mut CanonicalHasher) {
+        let Self {
+            java_home,
+            candidates,
+            probes,
+            complete,
+        } = self;
+        codec::optional_os(hash, "java_home", java_home);
+        hash.sequence("candidates", candidates, |hash, (path, configured)| {
+            codec::path(hash, "home", path);
+            codec::flag(hash, "configured", *configured);
+        });
+        hash.sequence("probes", probes, |hash, probe| probe.hash_into(hash));
+        codec::flag(hash, "complete", *complete);
+    }
+}
+
+/// The query-local sink that dependency discovery fills when its caller
+/// records a selection.
+#[derive(Debug, Default)]
+struct DependencyDiscoveryTrace {
+    coordinates: Vec<JvmMavenCoordinate>,
+    partial_manifests: Vec<PathBuf>,
+    explicit_paths: Vec<PathBuf>,
+    resolution_steps: Vec<ExternalPathProbe>,
+    /// Whether dependency discovery completed without the dependency limit,
+    /// an error other than an attributed unresolved coordinate, or a
+    /// suppressed dependency diagnostic. False until discovery reaches that
+    /// point, so a cancelled discovery leaves it incomplete.
+    dependencies_discovered: bool,
+    unresolved_coordinates: Vec<String>,
+}
+
+/// One selected artifact as the selection records it, after its capture has
+/// been handed to the caller and dropped.
+#[allow(dead_code)] // The query-owned transcript is consumed by the later verifier.
+#[derive(Debug)]
+struct SelectedExternalArtifactRecord {
+    path: PathBuf,
+    kind: ExternalArtifactKind,
+    provider_id: String,
+}
+
+/// One selected artifact with its captured bytes. The selection hands each
+/// capture to its caller as soon as it is read. The verified selection retains
+/// only digest metadata and the production key after each capture.
+pub(super) struct SelectedExternalArtifact {
+    path: PathBuf,
+    kind: ExternalArtifactKind,
+    provider_id: String,
+    exact: brokk_bifrost_semantic::analyzer::semantic_model::producer::ExactArtifact,
+}
+
+struct SelectedProductionArtifact {
+    role: DependencyArtifactRole,
+    kind: ExternalArtifactKind,
+    module: Option<String>,
+    sha256: String,
+}
+
+pub(super) struct ExternalInventorySelection {
+    #[allow(dead_code)] // The query-owned transcript is consumed by the later verifier.
+    artifacts: Vec<SelectedExternalArtifactRecord>,
+    /// One slot per selected dependency, including dependencies without a
+    /// producible pack. Exact captures are released after the key is minted.
+    productions: Vec<(
+        ResolvedDependency,
+        Vec<SelectedProductionArtifact>,
+        Option<brokk_bifrost_semantic::analyzer::semantic_model::catalog::GeneratedProductionKey>,
+    )>,
+    provider_ids: Vec<String>,
+    #[allow(dead_code)] // The query-owned transcript is consumed by the later verifier.
+    pub(super) inputs: ExternalInputsConsumed,
+    #[allow(dead_code)] // The current index still uses its existing receipt.
+    pub(super) completeness: ExternalSelectionCompleteness,
+}
+
+impl ExternalInventorySelection {
+    #[cfg(test)]
+    pub(super) fn empty_for_catalog_reader_test() -> Self {
+        Self {
+            artifacts: Vec::new(),
+            productions: Vec::new(),
+            provider_ids: Vec::new(),
+            inputs: ExternalInputsConsumed {
+                explicit_paths: Vec::new(),
+                repository_roots: Vec::new(),
+                gradle_cache_roots: Vec::new(),
+                home: None,
+                userprofile: None,
+                gradle_user_home: None,
+                coordinates: Vec::new(),
+                partial_manifests: Vec::new(),
+                resolution_steps: Vec::new(),
+                artifact_probes: Vec::new(),
+            },
+            completeness: ExternalSelectionCompleteness::default(),
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn with_generated_key_for_catalog_reader_test(
+        mut self,
+        key: brokk_bifrost_semantic::analyzer::semantic_model::catalog::GeneratedProductionKey,
+    ) -> Self {
+        self.productions.push((
+            ResolvedDependency::undeclared_scope(
+                "test-provider".into(),
+                brokk_bifrost_semantic::analyzer::semantic_model::runtime::SemanticModelActivationEvidence {
+                    language: "java".into(), ecosystem: "maven".into(), package: None,
+                    module: None, toolchain: None, target: None, configuration: None,
+                    artifact_sha256: None,
+                },
+                Vec::new(), Vec::new(),
+            ),
+            Vec::new(), Some(key),
+        ));
+        self
+    }
+    #[allow(dead_code)] // Consumed by the request-owned catalog reader in P2.
+    pub(super) fn generated_production_keys(
+        &self,
+    ) -> Vec<
+        Option<brokk_bifrost_semantic::analyzer::semantic_model::catalog::GeneratedProductionKey>,
+    > {
+        self.productions
+            .iter()
+            .map(|(_, _, key)| key.clone())
+            .collect()
+    }
+
+    /// The canonical digest of this answer, codec version in the domain. Every
+    /// field of the selection is hashed or named as excluded below; the codec
+    /// functions in `selection_codec` do the same for the nested types.
+    pub(super) fn answer_digest(&self, complete: bool, certified: bool) -> [u8; 32] {
+        self.answer_digest_in(codec::DEPENDENCIES_ANSWER_DOMAIN, complete, certified)
+    }
+
+    fn answer_digest_in(&self, domain: &[u8], complete: bool, certified: bool) -> [u8; 32] {
+        let Self {
+            artifacts,
+            productions,
+            // The sorted, de-duplicated provider ids of `artifacts`, so a
+            // function of a hashed field.
+            provider_ids: _,
+            inputs,
+            completeness,
+        } = self;
+        let mut hash = CanonicalHasher::new(domain);
+        codec::flag(&mut hash, "complete", complete);
+        codec::flag(&mut hash, "certified", certified);
+        let ExternalSelectionCompleteness { failures } = completeness;
+        hash.sequence("failures", failures, |hash, failure| match failure {
+            ExternalSelectionFailure::UnresolvedCoordinates(coordinates) => {
+                codec::text(hash, "failure", "unresolved-coordinates");
+                hash.sequence("coordinates", coordinates, |hash, coordinate| {
+                    codec::text(hash, "coordinate", coordinate);
+                });
+            }
+            ExternalSelectionFailure::Discovery => codec::text(hash, "failure", "discovery"),
+            ExternalSelectionFailure::PartialManifest(path) => {
+                codec::text(hash, "failure", "partial_manifest");
+                codec::path(hash, "path", path);
+            }
+            ExternalSelectionFailure::ArtifactRead(path) => {
+                codec::text(hash, "failure", "artifact_read");
+                codec::path(hash, "path", path);
+            }
+            ExternalSelectionFailure::ArtifactLimit => {
+                codec::text(hash, "failure", "artifact_limit")
+            }
+            ExternalSelectionFailure::UnreadableProbe(path) => {
+                codec::text(hash, "failure", "unreadable_probe");
+                codec::path(hash, "path", path);
+            }
+        });
+        inputs.hash_into(&mut hash);
+        hash.sequence("artifacts", artifacts, |hash, artifact| {
+            let SelectedExternalArtifactRecord {
+                path,
+                kind,
+                provider_id,
+            } = artifact;
+            codec::path(hash, "path", path);
+            codec::artifact_kind(hash, "kind", *kind);
+            codec::text(hash, "provider_id", provider_id);
+        });
+        // The dependency order is part of the answer: catalog expectations and
+        // generated production keys are indexed by it.
+        hash.sequence(
+            "productions",
+            productions,
+            |hash, (dependency, artifacts, key)| {
+                codec::resolved_dependency(hash, dependency);
+                hash.sequence("exact_artifacts", artifacts, |hash, artifact| {
+                    let SelectedProductionArtifact {
+                        role,
+                        kind,
+                        module,
+                        sha256,
+                    } = artifact;
+                    codec::artifact_role(hash, "role", *role);
+                    codec::artifact_kind(hash, "kind", *kind);
+                    codec::optional_text(hash, "module", module.as_deref());
+                    codec::text(hash, "sha256", sha256);
+                });
+                // The key folds the producer name, producer version and schema
+                // version around the input digest, so hashing it all binds a
+                // producer change that the dependency fields do not show.
+                codec::flag(hash, "has_key", key.is_some());
+                if let Some(key) = key {
+                    codec::text(hash, "key_input_digest", key.input_digest());
+                    codec::text(hash, "key_producer_name", key.producer_name());
+                    codec::text(hash, "key_producer_version", key.producer_version());
+                    hash.field("key_schema_version", &key.schema_version().to_be_bytes());
+                }
+            },
+        );
+        hash.finish()
+    }
+}
+
+impl SelectedJdk {
+    /// Whether every artifact of every selected JDK is pinned to the content
+    /// digest selection computed. A JDK with no artifact (no `jmods` directory
+    /// and no `src.zip`, each with its probe recorded) has nothing to pin: that
+    /// negative answer is certified together with its probes.
+    pub(super) fn every_artifact_pinned(&self) -> bool {
+        self.dependencies.iter().all(|dependency| {
+            dependency
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.expected_sha256.is_some())
+        })
+    }
+
+    #[allow(dead_code)] // Consumed by the later pinned JVM reader routing slice.
+    pub(super) fn catalog_expectations(
+        &self,
+    ) -> Vec<brokk_bifrost_analysis::analyzer::semantic_model::catalog::ExpectedCatalogEntry> {
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::ExpectedCatalogEntry;
+        use brokk_bifrost_semantic::analyzer::semantic_model::dependency::{
+            dependency_source_identity, pinned_generated_production_key,
+        };
+
+        let adapter = JvmDependencyPackAdapter;
+        let producer = adapter.producer();
+        let limits = DependencyPackLimits::default();
+        self.dependencies
+            .iter()
+            .map(|dependency| {
+                // A pinned dependency expects the production keyed by the
+                // digests it is pinned to, so a pack installed for other bytes
+                // never matches. One that capture cannot pin keeps the
+                // metadata identity.
+                if dependency.artifacts.is_empty()
+                    || dependency
+                        .artifacts
+                        .iter()
+                        .any(|artifact| artifact.expected_sha256.is_none())
+                {
+                    return ExpectedCatalogEntry::SourceIdentity {
+                        producer: producer.clone(),
+                        source_identity: dependency_source_identity(&adapter, dependency, &limits)
+                            .map(|identity| identity.as_str().to_owned()),
+                    };
+                }
+                match pinned_generated_production_key(&adapter, dependency, &limits)
+                    .expect("a pinned JDK dependency has a valid production key")
+                {
+                    Some(key) => ExpectedCatalogEntry::Production {
+                        production_digest: key.production_digest,
+                    },
+                    None => ExpectedCatalogEntry::MissingProduction,
+                }
+            })
+            .collect()
+    }
+
+    /// The canonical digest of the JDK answer. `certified` is bound as well
+    /// (see `verify_jdk`), so a certified answer never equals an uncertified
+    /// one over the same selection.
+    pub(super) fn answer_digest(&self, complete: bool, certified: bool) -> [u8; 32] {
+        self.answer_digest_in(codec::JDK_ANSWER_DOMAIN, complete, certified)
+    }
+
+    fn answer_digest_in(&self, domain: &[u8], complete: bool, certified: bool) -> [u8; 32] {
+        let Self {
+            inputs,
+            dependencies,
+        } = self;
+        let mut hash = CanonicalHasher::new(domain);
+        codec::flag(&mut hash, "complete", complete);
+        codec::flag(&mut hash, "certified", certified);
+        inputs.hash_into(&mut hash);
+        // Discovery order is the candidate order after de-duplication.
+        hash.sequence("dependencies", dependencies, codec::resolved_dependency);
+        hash.finish()
+    }
+}
+
 impl JvmExternalDeclarationIndex {
+    #[cfg(test)]
+    pub(super) fn add_discovery_gap_for_catalog_reader_test(
+        &mut self,
+        diagnostic: DependencyPackDiagnostic,
+    ) {
+        self.production_diagnostics
+            .push(IndexGap::from_discovery(diagnostic));
+    }
+
     #[cfg(test)]
     pub(crate) fn build(config: &JvmExternalDependencies, project_root: &Path) -> Self {
         let artifacts = resolve_configured_artifacts(config, project_root);
@@ -2284,7 +3572,7 @@ impl JvmExternalDeclarationIndex {
     ) -> Arc<Self> {
         let discovery = {
             let _timing = brokk_bifrost_core::profiling::scope("jvm_external_index.discovery");
-            resolve_jvm_semantic_pack_dependencies(
+            resolve_jvm_semantic_pack_dependencies_unpinned(
                 config,
                 project,
                 &DependencyPackLimits::default(),
@@ -2296,12 +3584,39 @@ impl JvmExternalDeclarationIndex {
             .iter()
             .filter_map(jvm_artifact_from_dependency)
             .collect();
-        let diagnostics: Vec<ProducerDiagnostic> = discovery
+        let suppressed = discovery.suppressed_diagnostics.total();
+        let mut diagnostics: Vec<IndexGap> = discovery
             .diagnostics
             .into_iter()
-            .map(discovery_producer_diagnostic)
+            .map(IndexGap::from_discovery)
             .collect();
-        let key = external_index_memo_key(&artifacts, &diagnostics);
+        // Discovery bounds its diagnostic list, so with enough unresolved
+        // coordinates the bound fills before a later error is seen. The count
+        // survives; the entry stands for whatever it hid, and nothing can
+        // attribute it, so no lookup skips it.
+        if suppressed > 0 {
+            diagnostics.push(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: super::producer_codes::JVM_DISCOVERY_SUPPRESSED.code.to_owned(),
+                    location: None,
+                    source_entry: None,
+                    declaration: None,
+                    message: format!(
+                        "dependency discovery suppressed {suppressed} diagnostics beyond its bound, so the index cannot say which dependencies they concern"
+                    ),
+                }
+                .into(),
+            );
+        }
+        // The Maven compiler configuration is read from the same build files
+        // discovery reads. Gradle compile options are not read (#10492).
+        let platform_override = config.dependency_discovery.mode
+            != JvmDependencyDiscoveryMode::Disabled
+            && super::dependency_discovery::maven_platform_override_visible(&LiveDiscoveryInputs(
+                project,
+            ));
+        let key = external_index_memo_key(&artifacts, &diagnostics, platform_override);
         let memo = external_index_memo();
         if let Some(index) = memo.lock().expect("external index memo poisoned").get(&key) {
             return Arc::clone(index);
@@ -2310,6 +3625,7 @@ impl JvmExternalDeclarationIndex {
             brokk_bifrost_core::profiling::scope("jvm_external_index.build_from_artifacts");
         let mut index = Self::build_from_artifacts(artifacts);
         index.production_diagnostics.extend(diagnostics);
+        index.platform_override = platform_override;
         let index = Arc::new(index);
         if index
             .production_diagnostics
@@ -2326,6 +3642,168 @@ impl JvmExternalDeclarationIndex {
         )
     }
 
+    /// Select once for inventory publication. Each artifact's bytes are
+    /// captured once and handed to `visit` before the next artifact is read.
+    /// Provider identity and production use the same capture. The returned
+    /// selection retains ordered dependencies and exact artifacts for keys.
+    pub(super) fn select_external_inventory<E>(
+        config: &JvmAnalyzerConfig,
+        project: &dyn Project,
+        inputs: &dyn DiscoveryInputs,
+        mut visit: impl FnMut(SelectedExternalArtifact) -> Result<(), E>,
+    ) -> Result<ExternalInventorySelection, E> {
+        let mut trace = DependencyDiscoveryTrace::default();
+        let discovery = resolve_jvm_semantic_pack_dependencies_traced(
+            config,
+            project,
+            inputs,
+            &DependencyPackLimits::default(),
+            None,
+            Some(&mut trace),
+        );
+        let DependencyDiscoveryTrace {
+            coordinates,
+            partial_manifests,
+            explicit_paths,
+            resolution_steps,
+            dependencies_discovered,
+            unresolved_coordinates,
+        } = trace;
+        let mut inputs = ExternalInputsConsumed {
+            explicit_paths,
+            repository_roots: repository_roots(&config.external_dependencies),
+            gradle_cache_roots: gradle_cache_roots(&config.external_dependencies),
+            home: std::env::var_os("HOME"),
+            userprofile: std::env::var_os("USERPROFILE"),
+            gradle_user_home: std::env::var_os("GRADLE_USER_HOME"),
+            coordinates,
+            partial_manifests,
+            resolution_steps,
+            artifact_probes: Vec::new(),
+        };
+        let mut completeness = ExternalSelectionCompleteness::default();
+        if !dependencies_discovered {
+            completeness.record(ExternalSelectionFailure::Discovery);
+        }
+        if !unresolved_coordinates.is_empty() {
+            completeness.record(ExternalSelectionFailure::UnresolvedCoordinates(
+                unresolved_coordinates,
+            ));
+        }
+        for manifest in &inputs.partial_manifests {
+            completeness.record(ExternalSelectionFailure::PartialManifest(manifest.clone()));
+        }
+        for probe in &inputs.resolution_steps {
+            if matches!(probe.outcome, ExternalProbeOutcome::Unreadable) {
+                completeness.record(ExternalSelectionFailure::UnreadableProbe(
+                    probe.path.clone(),
+                ));
+            }
+        }
+        let limits = ArtifactProducerLimits::default();
+        let pack_limits = DependencyPackLimits::default();
+        let adapter = JvmDependencyPackAdapter;
+        let mut artifacts = Vec::new();
+        let mut productions = Vec::new();
+        let mut selected = discovery.dependencies.iter().filter_map(|dependency| {
+            jvm_artifact_from_dependency(dependency).map(|artifact| (dependency, artifact))
+        });
+        for (dependency, artifact) in selected.by_ref().take(MAX_INDEX_ARTIFACTS) {
+            let mut exact_artifacts = Vec::new();
+            for path in std::iter::once(artifact.artifact_path.as_path())
+                .chain(artifact.source_artifact_path.as_deref())
+            {
+                inputs.artifact_probes.push(path.to_path_buf());
+                match brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact(path, &limits) {
+                    Ok(exact) => {
+                        let resolved = dependency.artifacts.iter().find(|entry| entry.path() == path)
+                            .expect("selected artifact must come from the resolved dependency");
+                        exact_artifacts.push(ExactDependencyArtifact {
+                            role: resolved.role, kind: resolved.kind,
+                            module: resolved.module.clone(), artifact: exact.clone(),
+                        });
+                        let kind = if is_source_jar(path) { ExternalArtifactKind::JavaSourceJar } else { ExternalArtifactKind::JavaClassJar };
+                        let provider_id = exact.sha256().to_owned();
+                        artifacts.push(SelectedExternalArtifactRecord {
+                            path: path.to_path_buf(),
+                            kind,
+                            provider_id: provider_id.clone(),
+                        });
+                        visit(SelectedExternalArtifact {
+                            path: path.to_path_buf(),
+                            kind,
+                            provider_id,
+                            exact,
+                        })?;
+                    }
+                    Err(_) => {
+                        completeness.record(ExternalSelectionFailure::ArtifactRead(path.to_path_buf()));
+                    }
+                }
+            }
+            exact_artifacts.sort_by_key(|exact: &ExactDependencyArtifact| {
+                dependency
+                    .artifacts
+                    .iter()
+                    .position(|resolved| resolved.path() == exact.path())
+                    .expect("exact artifact must belong to the selected dependency")
+            });
+            let key = (adapter.can_produce(dependency)
+                && exact_artifacts.len() == dependency.artifacts.len())
+                .then(|| brokk_bifrost_semantic::analyzer::semantic_model::dependency::generated_production_key(
+                    &adapter, dependency, &exact_artifacts, &pack_limits,
+                ).ok())
+                .flatten();
+            let digests = exact_artifacts
+                .iter()
+                .map(|artifact| SelectedProductionArtifact {
+                    role: artifact.role,
+                    kind: artifact.kind,
+                    module: artifact.module.clone(),
+                    sha256: artifact.sha256().to_owned(),
+                })
+                .collect();
+            productions.push((dependency.clone(), digests, key));
+        }
+        if selected.next().is_some() {
+            completeness.record(ExternalSelectionFailure::ArtifactLimit);
+        }
+        let mut provider_ids: Vec<_> = artifacts
+            .iter()
+            .map(|artifact| artifact.provider_id.clone())
+            .collect();
+        provider_ids.sort_unstable();
+        provider_ids.dedup();
+        Ok(ExternalInventorySelection {
+            artifacts,
+            productions,
+            provider_ids,
+            inputs,
+            completeness,
+        })
+    }
+
+    /// The JDK question's selection: JDK discovery alone, which reads no
+    /// workspace manifest, dependency artifact or build tool.
+    pub(super) fn select_jdk(
+        config: &JvmAnalyzerConfig,
+        project: &dyn Project,
+        digests: &ContentDigestCache,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<SelectedJdk, ()> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(());
+        }
+        let mut discovery = discover_configured_jdk(config, project.root());
+        if pin_jdk_discovery(&mut discovery, digests, cancellation).is_break() {
+            return Err(());
+        }
+        Ok(SelectedJdk {
+            inputs: discovery.inputs,
+            dependencies: discovery.dependencies,
+        })
+    }
+
     /// Direct artifact indexing publishes the same relational inventory before
     /// the name-grouped dispatch surface discards overload coordinates. Only
     /// bounded provider identities survive publication in the existing index.
@@ -2334,86 +3812,64 @@ impl JvmExternalDeclarationIndex {
         project: &dyn Project,
         store: &brokk_bifrost_analysis::analyzer::store::AnalyzerStore,
     ) -> brokk_bifrost_analysis::analyzer::store::Result<Arc<Self>> {
-        let discovery = resolve_jvm_semantic_pack_dependencies(
-            config,
-            project,
-            &DependencyPackLimits::default(),
-            None,
-        );
         let limits = ArtifactProducerLimits::default();
-        let mut providers = Vec::new();
-        for artifact in discovery
-            .dependencies
-            .iter()
-            .filter_map(jvm_artifact_from_dependency)
-            .take(MAX_INDEX_ARTIFACTS)
-        {
-            for path in std::iter::once(artifact.artifact_path.as_path())
-                .chain(artifact.source_artifact_path.as_deref())
-            {
-                // Scala source-only indexes do not assert a Java member inventory.
-                let kind = if is_source_jar(path) {
-                    ExternalArtifactKind::JavaSourceJar
-                } else {
-                    ExternalArtifactKind::JavaClassJar
+        let selection = Self::select_external_inventory::<
+            brokk_bifrost_analysis::analyzer::store::StoreError,
+        >(config, project, &LiveDiscoveryInputs(project), |selected| {
+            let path = selected.path.as_path();
+            let kind = selected.kind;
+            let exact = selected.exact;
+            let provider = selected.provider_id;
+            let exists: bool = store.read_conn()?.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1)",
+                [&provider],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                let request = ArtifactProductionRequest {
+                    path: path.to_path_buf(),
+                    artifact_kind: kind,
+                    pack_id: "bifrost.external.java".to_owned(),
+                    pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    ecosystem: "maven".to_owned(),
+                    compatibility: Compatibility {
+                        bifrost: None,
+                        toolchains: Vec::new(),
+                    },
+                    activation: Vec::new(),
+                    provenance: Provenance {
+                        rust_artifact_approximation: None,
+                        source: "local dependency artifact".to_owned(),
+                        revision: None,
+                    },
+                    license: "NOASSERTION".to_owned(),
+                    safety: Safety {
+                        generated_code_only: false,
+                        review_required: false,
+                    },
                 };
-                let exact = match brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_artifact(path, &limits) {
-                    Ok(exact) => exact,
-                    Err(_) => continue, // Existing index diagnostics describe unread artifacts.
-                };
-                let provider = exact.sha256().to_owned();
-                let exists: bool = store.read_conn()?.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM jvm_external_owners WHERE provider_id=?1)",
-                    [&provider],
-                    |row| row.get(0),
-                )?;
-                if !exists {
-                    let request = ArtifactProductionRequest {
-                        path: path.to_path_buf(),
-                        artifact_kind: kind,
-                        pack_id: "bifrost.external.java".to_owned(),
-                        pack_version: env!("CARGO_PKG_VERSION").to_owned(),
-                        ecosystem: "maven".to_owned(),
-                        compatibility: Compatibility {
-                            bifrost: None,
-                            toolchains: Vec::new(),
-                        },
-                        activation: Vec::new(),
-                        provenance: Provenance {
-                            source: "local dependency artifact".to_owned(),
-                            revision: None,
-                        },
-                        license: "NOASSERTION".to_owned(),
-                        safety: Safety {
-                            generated_code_only: false,
-                            review_required: false,
-                        },
-                    };
-                    let production = JavaJarPackProducer
-                        .produce_loaded_artifact(&request, &limits, None, &exact);
-                    if let Some(pack) = production.pack {
-                        for shard in pack.shards {
-                            if let AuthoredPayload::DeclarationFacts { types, members, .. } =
-                                shard.payload
-                            {
-                                store.publish_jvm_external_inventory_facts(
+                let production =
+                    JavaJarPackProducer.produce_loaded_artifact(&request, &limits, None, &exact);
+                if let Some(pack) = production.pack {
+                    for shard in pack.shards {
+                        if let AuthoredPayload::DeclarationFacts { types, members, .. } =
+                            shard.payload
+                        {
+                            store.publish_jvm_external_inventory_facts(
                                     provider.clone(),
                                     &types,
                                     &members,
                                     production.completeness
                                         == brokk_bifrost_analysis::analyzer::semantic_model::Completeness::Complete,
                                 )?;
-                            }
                         }
                     }
                 }
-                providers.push(provider);
             }
-        }
-        providers.sort_unstable();
-        providers.dedup();
+            Ok(())
+        })?;
         let mut index = (*Self::build_for_project(config, project)).clone();
-        index.inventory_providers = providers;
+        index.inventory_providers = selection.provider_ids;
         let providers = serde_json::to_string(&index.inventory_providers)
             .expect("string provider identities serialize");
         let conn = store.read_conn()?;
@@ -2505,7 +3961,7 @@ impl JvmExternalDeclarationIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn production_diagnostics(&self) -> &[ProducerDiagnostic] {
+    pub(crate) fn production_diagnostics(&self) -> &[IndexGap] {
         &self.production_diagnostics
     }
 
@@ -2524,25 +3980,52 @@ impl JvmExternalDeclarationIndex {
         self.production_diagnostics.len()
     }
 
+    /// Digest of the index's attributed diagnostics and the build model's platform
+    /// override: everything that decides which lookups record a gap, and which.
+    ///
+    /// Each diagnostic contributes its code, severity, attribution, the
+    /// coordinate of the declared dependency it concerns when it has one, and
+    /// whether a lookup records it. The coordinate is hashed, not only the
+    /// attribution: otherwise replacing one missing jar with another, with the
+    /// index contents unchanged, would keep the identity, and a reused result
+    /// would name the wrong jar. Artifact paths and messages are absent. The list
+    /// is the one the lookups record from, so the identity and the recorded gaps
+    /// cannot disagree.
+    pub(crate) fn gap_identity(&self) -> StableDigest {
+        let mut gaps = self.production_diagnostics.iter().collect::<Vec<_>>();
+        gaps.sort_by_key(|gap| {
+            (
+                gap.code.as_str(),
+                gap.dependency_id(),
+                gap.attribution().tag(),
+                matches!(gap.severity, ProducerDiagnosticSeverity::Error),
+                gap.is_recorded(),
+            )
+        });
+        let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_GAP_IDENTITY_DOMAIN);
+        digest.push(&[u8::from(self.platform_override)]);
+        digest.push(&(gaps.len() as u64).to_le_bytes());
+        for gap in gaps {
+            gap.push_identity(&mut digest);
+        }
+        digest.finish()
+    }
+
     /// Stable identity of every retained fact that can change external JVM
     /// dispatch behavior.
     ///
     /// Artifact paths and archive entry names are intentionally absent. Once
     /// an artifact has produced this surface, moving identical bytes does not
     /// change any resolver answer and should continue to reuse cached flow
-    /// results. A single incomplete marker captures the only diagnostic state
-    /// the resolution boundary observes: whether any producer diagnostic made
-    /// a negative lookup uncertain.
+    /// results. The attributed diagnostics enter through [`Self::gap_identity`]:
+    /// two different missing sets with identical types differ, because a lookup
+    /// that was complete under one must be partial under the other.
     /// Pure checksum of this immutable index, with no Project or analyzer reads.
     /// The selecting analyzer records external authority inputs even on hits.
     pub(crate) fn dispatch_behavior_identity(&self) -> StableDigest {
         *self.dispatch_behavior_identity.get_or_init(|| {
             let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN);
-            digest.push(if self.production_diagnostics.is_empty() {
-                b"complete"
-            } else {
-                b"incomplete"
-            });
+            digest.push(self.gap_identity().as_bytes());
 
             let mut types = self.types_by_fqn.iter().collect::<Vec<_>>();
             types.sort_unstable_by_key(|(fqn, _)| *fqn);
@@ -3092,7 +4575,11 @@ impl JvmExternalDeclarationIndex {
                 &external_type.fqn,
                 JvmIndexedOwnerSurface {
                     members,
-                    supertypes: hierarchy_type_names(&surface.hierarchy),
+                    // As above: the inventory, or a source jar's declared edges.
+                    supertypes: match &surface.jvm_inventory {
+                        Some(inventory) => hierarchy_type_names(&inventory.supertypes),
+                        None => hierarchy_type_names(&surface.hierarchy),
+                    },
                     hierarchy_complete: surface
                         .jvm_inventory
                         .as_ref()
@@ -3101,6 +4588,11 @@ impl JvmExternalDeclarationIndex {
             );
             self.insert(external_type);
         }
+        enclosing_scopes.report_unread(
+            &mut producer_diagnostics,
+            None,
+            super::producer_codes::JAVA_ARCHIVE_ENTRY_READ.code,
+        );
         if record_limit_hit {
             producer_diagnostics.warning(
                 super::producer_codes::LIMIT_RECORDS.code,
@@ -3112,7 +4604,8 @@ impl JvmExternalDeclarationIndex {
             );
         }
         let (diagnostics, _) = producer_diagnostics.finish();
-        self.production_diagnostics.extend(diagnostics);
+        self.production_diagnostics
+            .extend(diagnostics.into_iter().map(IndexGap::from));
         self.note_bounded_artifact(artifact_path, skipped_entries, member_budget);
         total_bytes
     }
@@ -3128,7 +4621,12 @@ impl JvmExternalDeclarationIndex {
             // keeps every positive declaration either read produced, which is
             // the only direction this surface ever moves.
             Some(existing) => {
-                existing.hierarchy_complete &= surface.hierarchy_complete;
+                existing.hierarchy_complete &= surface.hierarchy_complete
+                    && existing.supertypes.len() == surface.supertypes.len()
+                    && existing
+                        .supertypes
+                        .iter()
+                        .all(|parent| surface.supertypes.contains(parent));
                 for (name, member) in surface.members {
                     existing.members.entry(name).or_insert(member);
                 }
@@ -3164,16 +4662,19 @@ impl JvmExternalDeclarationIndex {
         }) {
             return;
         }
-        self.production_diagnostics.push(ProducerDiagnostic {
-            severity: ProducerDiagnosticSeverity::Warning,
-            source_entry: None,
-            code: super::producer_codes::JVM_INDEX_CAPPED_ENTRIES
-                .code
-                .to_owned(),
-            location: Some(location),
-            declaration: None,
-            message,
-        });
+        self.production_diagnostics.push(
+            ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                source_entry: None,
+                code: super::producer_codes::JVM_INDEX_CAPPED_ENTRIES
+                    .code
+                    .to_owned(),
+                location: Some(location),
+                declaration: None,
+                message,
+            }
+            .into(),
+        );
     }
 
     fn note_bounded_artifact(
@@ -3183,28 +4684,34 @@ impl JvmExternalDeclarationIndex {
         member_budget: MemberBudget,
     ) {
         if skipped_entries > 0 {
-            self.production_diagnostics.push(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Warning,
+            self.production_diagnostics.push(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
                     source_entry: None,
-                code: super::producer_codes::JVM_INDEX_UNREAD_ENTRIES.code.to_owned(),
-                location: Some(artifact_path.to_string_lossy().into_owned()),
-                declaration: None,
-                message: format!(
-                    "archive read or malformed content prevented reading {skipped_entries} archive entries, so this artifact declares types and members the index never read"
-                ),
-            });
+                    code: super::producer_codes::JVM_INDEX_UNREAD_ENTRIES.code.to_owned(),
+                    location: Some(artifact_path.to_string_lossy().into_owned()),
+                    declaration: None,
+                    message: format!(
+                        "archive read or malformed content prevented reading {skipped_entries} archive entries, so this artifact declares types and members the index never read"
+                    ),
+                }
+                .into(),
+            );
         }
         if member_budget.exhausted {
-            self.production_diagnostics.push(ProducerDiagnostic {
-                severity: ProducerDiagnosticSeverity::Warning,
+            self.production_diagnostics.push(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
                     source_entry: None,
-                code: super::producer_codes::LIMIT_ARTIFACT_MEMBERS.code.to_owned(),
-                location: Some(artifact_path.to_string_lossy().into_owned()),
-                declaration: None,
-                message: format!(
-                    "bounded index read stopped after {MAX_ARTIFACT_MEMBERS} member declarations from this artifact"
-                ),
-            });
+                    code: super::producer_codes::LIMIT_ARTIFACT_MEMBERS.code.to_owned(),
+                    location: Some(artifact_path.to_string_lossy().into_owned()),
+                    declaration: None,
+                    message: format!(
+                        "bounded index read stopped after {MAX_ARTIFACT_MEMBERS} member declarations from this artifact"
+                    ),
+                }
+                .into(),
+            );
         }
     }
 
@@ -3222,7 +4729,7 @@ impl JvmExternalDeclarationIndex {
             &ArtifactProducerLimits::default(),
         );
         self.production_diagnostics
-            .extend(production.diagnostics.iter().cloned());
+            .extend(production.diagnostics.iter().cloned().map(IndexGap::from));
         let mut types = HashMap::default();
         let mut members = Vec::new();
         for shard in production.pack.into_iter().flat_map(|pack| pack.shards) {
@@ -3254,7 +4761,7 @@ impl JvmExternalDeclarationIndex {
             &ArtifactProducerLimits::default(),
         );
         self.production_diagnostics
-            .extend(production.diagnostics.iter().cloned());
+            .extend(production.diagnostics.iter().cloned().map(IndexGap::from));
         production
             .pack
             .into_iter()
@@ -3399,6 +4906,141 @@ fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
     }
 }
 
+/// A JDK-pack type in an unshadowable package that a lookup reached in a scope
+/// where nothing can shadow its name: through a single-type import after
+/// `UnshadowedScope::check` held, or as a type a member signature of such an
+/// owner names. Holding one is the proof; its field is private and only
+/// [`JvmExternalDeclarations::resolve_explicit_import_in_unshadowed_scope`] and
+/// [`UnshadowedJdkOwner::signature_type`] construct it.
+///
+/// A JDK class's members, member types and supertypes are all JDK, so a lookup
+/// on it cannot be changed by a dependency jar. Dispatch families are a
+/// different question (a workspace type can override through a missing jar),
+/// and keep every gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnshadowedJdkOwner {
+    owner: JvmExternalType,
+}
+
+impl std::ops::Deref for UnshadowedJdkOwner {
+    type Target = JvmExternalType;
+
+    fn deref(&self) -> &JvmExternalType {
+        &self.owner
+    }
+}
+
+impl UnshadowedJdkOwner {
+    /// The type a member signature names (a return, parameter or thrown type),
+    /// resolved by canonical name inside the JDK pack, when it is a JDK-pack
+    /// class in an unshadowable package.
+    ///
+    /// This is a witness for the class and nothing else. It is never given for
+    /// a type variable or for a type argument substituted from the use site:
+    /// those follow their own origin. A declared local type (`InputStream in =
+    /// ...`) is a use-site name and goes through the ladder, not through here.
+    pub(crate) fn signature_type(
+        &self,
+        declarations: &JvmExternalDeclarations<'_>,
+        member: &JvmExternalMember,
+        type_ref: &TypeRef,
+    ) -> Option<UnshadowedJdkOwner> {
+        // Only a member the JDK pack itself declares has a JDK declaration's
+        // own signature; a member from any other origin names whatever it names.
+        member.jdk_artifact_sha256()?;
+        let TypeRef::Named { name, .. } = type_ref else {
+            return None;
+        };
+        // Only direct declared terms carry the owner's witness. A substituted
+        // type argument is not a declaration-owned signature type.
+        let names_type = |term: &TypeRef| {
+            let mut term = term;
+            while let TypeRef::Array { element } = term {
+                term = element;
+            }
+            matches!(term, TypeRef::Named { name: declared, .. } if declared == name)
+        };
+        if !member.returns.as_ref().is_some_and(names_type)
+            && !member.call_shapes.iter().any(|shape| {
+                shape.returns.as_ref().is_some_and(names_type)
+                    || shape.parameters.iter().any(names_type)
+            })
+        {
+            return None;
+        }
+        declarations
+            .pack_declaration(name)
+            .filter(JvmExternalType::is_unshadowable_jdk)
+            .map(|owner| UnshadowedJdkOwner { owner })
+    }
+
+    /// The only way to obtain the narrowed proof state. It counts the
+    /// diagnostics that are not attributed to a declared dependency artifact,
+    /// because no dependency artifact can change what this owner's name means.
+    pub(crate) fn retained_index_state(
+        &self,
+        retained: Option<&JvmExternalDeclarationIndex>,
+    ) -> brokk_bifrost_jvm::proof::JvmRetainedExternalIndex {
+        use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
+        match retained {
+            None => JvmRetainedExternalIndex::Unbuilt,
+            Some(index)
+                if index
+                    .production_diagnostics
+                    .iter()
+                    .any(|gap| gap.attribution() != GapAttribution::Dependency) =>
+            {
+                JvmRetainedExternalIndex::Partial
+            }
+            Some(_) => JvmRetainedExternalIndex::Complete,
+        }
+    }
+}
+
+/// What a single-type import resolves to in an unshadowed scope. Only
+/// `resolve_explicit_import_in_unshadowed_scope` returns one. Its
+/// `Unshadowed` arm is the witness and cannot be built by a caller; its
+/// `Ordinary` arm is a plain type whose lookup recorded every gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExplicitImportHit {
+    Unshadowed(UnshadowedJdkOwner),
+    Ordinary(JvmExternalType),
+}
+
+impl std::ops::Deref for ExplicitImportHit {
+    type Target = JvmExternalType;
+
+    fn deref(&self) -> &JvmExternalType {
+        match self {
+            Self::Unshadowed(owner) => &owner.owner,
+            Self::Ordinary(external_type) => external_type,
+        }
+    }
+}
+
+impl From<JvmExternalType> for ExplicitImportHit {
+    fn from(external_type: JvmExternalType) -> Self {
+        Self::Ordinary(external_type)
+    }
+}
+
+impl ExplicitImportHit {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn into_type(self) -> JvmExternalType {
+        match self {
+            Self::Unshadowed(owner) => owner.owner,
+            Self::Ordinary(external_type) => external_type,
+        }
+    }
+
+    pub(crate) fn witness(&self) -> Option<&UnshadowedJdkOwner> {
+        match self {
+            Self::Unshadowed(owner) => Some(owner),
+            Self::Ordinary(_) => None,
+        }
+    }
+}
+
 /// The external declaration surface one JVM lookup reads: the artifact-derived
 /// index first, then the declaration facts the activated semantic packs
 /// publish (#1893).
@@ -3489,27 +5131,52 @@ impl<'a> JvmExternalDeclarations<'a> {
             })
     }
 
+    /// Return a class binding only when projection and every receiver argument
+    /// are fully known. The caller must supply arguments from an exact Applied
+    /// receiver shape; only then can a substituted formal be Inapplicable.
+    /// Bind only exact, closed receiver arguments. A substituted formal may
+    /// reject a call only after this provenance check succeeds.
     #[cfg(any(test, feature = "test-support"))]
-    fn java_nominal_widening(
+    pub(crate) fn java_owner_bindings(
+        &self,
+        written_owner: &str,
+        declaring_owner: &str,
+        arguments: &[TypeRef],
+    ) -> Option<std::collections::HashMap<String, TypeRef>> {
+        let source = TypeRef::named(written_owner);
+        let target = TypeRef::named(declaring_owner);
+        let answer = self.java_hierarchy_answer(&source, &target).ok()??;
+        let witness = answer.witness?;
+        let positions = Self::project_java_arguments(&witness, arguments.len())?;
+        let parameters = witness.type_parameters.last()?.as_ref()?;
+        java_bind_projected_arguments(parameters, &positions, arguments)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_hierarchy_answer(
         &self,
         actual: &TypeRef,
         formal: &TypeRef,
-    ) -> Result<bool, ConversionUnknown> {
+    ) -> Result<
+        Option<brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyAnswer>,
+        ConversionUnknown,
+    > {
         let (source, target) = (
             java_external_reference_name(actual).ok_or(ConversionUnknown::UnresolvedSourceType)?,
             java_external_reference_name(formal).ok_or(ConversionUnknown::UnresolvedTargetType)?,
         );
         let source_type = self
-            .get(source)
+            .declaration(source)
             .ok_or(ConversionUnknown::UnresolvedSourceType)?;
-        let nominal = match &source_type.source {
+        match &source_type.source {
             JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } => {
                 let overlay = self
                     .packs
                     .as_ref()
                     .ok_or(ConversionUnknown::IncompleteHierarchy)?;
-                let source_symbol = overlay
-                    .symbols_with_id(declaration_id)
+                let matched = overlay.symbols_with_id(declaration_id);
+                if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) { return Err(ConversionUnknown::IncompleteHierarchy); }
+                let source_symbol = matched
                     .records
                     .into_iter()
                     .find(|symbol| self.admits_pack_symbol(symbol))
@@ -3522,8 +5189,9 @@ impl<'a> JvmExternalDeclarations<'a> {
                 else {
                     return Err(ConversionUnknown::UnsupportedConversion);
                 };
-                let target_symbol = overlay
-                    .symbols_with_id(declaration_id)
+                let matched = overlay.symbols_with_id(declaration_id);
+                if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) { return Err(ConversionUnknown::IncompleteHierarchy); }
+                let target_symbol = matched
                     .records
                     .into_iter()
                     .find(|symbol| self.admits_pack_symbol(symbol))
@@ -3543,25 +5211,78 @@ impl<'a> JvmExternalDeclarations<'a> {
                         None,
                     ),
                 };
+                Ok(Some(answer))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_hierarchy_incomplete_cause(
+        reason: brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyIncomplete,
+    ) -> ConversionUnknown {
+        use brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyIncomplete;
+        match reason {
+            JavaHierarchyIncomplete::MissingHierarchy => ConversionUnknown::IncompleteHierarchy,
+            JavaHierarchyIncomplete::GenericSubstitution => ConversionUnknown::GenericSubstitution,
+            JavaHierarchyIncomplete::Ambiguous => ConversionUnknown::AmbiguousBinding,
+            JavaHierarchyIncomplete::BudgetExhausted => ConversionUnknown::BudgetExhausted,
+            JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn project_java_arguments(
+        witness: &brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyWitness,
+        actual_count: usize,
+    ) -> Option<Vec<usize>> {
+        debug_assert_eq!(witness.type_parameters.len(), witness.edges.len() + 1);
+        let parameters = witness.type_parameters.first()?.as_ref()?;
+        if parameters.len() != actual_count {
+            return None;
+        }
+        let mut positions: Vec<usize> = (0..actual_count).collect();
+        for (edge, parameters) in witness.edges.iter().zip(&witness.type_parameters) {
+            let parameters = parameters.as_ref()?;
+            let arguments = match &edge.target {
+                TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => arguments,
+                _ => return None,
+            };
+            positions = arguments
+                .iter()
+                .map(|argument| {
+                    let TypeRef::TypeParameter { name } = argument else {
+                        return None;
+                    };
+                    let index = parameters.iter().position(|parameter| parameter == name)?;
+                    positions.get(index).copied()
+                })
+                .collect::<Option<Vec<_>>>()?;
+        }
+        if witness.type_parameters.last()?.is_none() {
+            return None;
+        }
+        Some(positions)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_nominal_widening(
+        &self,
+        actual: &TypeRef,
+        formal: &TypeRef,
+    ) -> Result<bool, ConversionUnknown> {
+        let (source, target) = (
+            java_external_reference_name(actual).ok_or(ConversionUnknown::UnresolvedSourceType)?,
+            java_external_reference_name(formal).ok_or(ConversionUnknown::UnresolvedTargetType)?,
+        );
+        let nominal = match self.java_hierarchy_answer(actual, formal)? {
+            Some(answer) => {
                 if answer.witness.is_some() {
                     Ok(true)
                 } else if answer.incomplete.is_empty() {
                     Ok(false)
                 } else {
-                    use brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyIncomplete;
-                    Err(match answer.incomplete[0] {
-                        JavaHierarchyIncomplete::MissingHierarchy => {
-                            ConversionUnknown::IncompleteHierarchy
-                        }
-                        JavaHierarchyIncomplete::GenericSubstitution => {
-                            ConversionUnknown::GenericSubstitution
-                        }
-                        JavaHierarchyIncomplete::Ambiguous => ConversionUnknown::AmbiguousBinding,
-                        JavaHierarchyIncomplete::BudgetExhausted => {
-                            ConversionUnknown::BudgetExhausted
-                        }
-                        JavaHierarchyIncomplete::Cancelled => ConversionUnknown::Cancelled,
-                    })
+                    Err(Self::java_hierarchy_incomplete_cause(answer.incomplete[0]))
                 }
             }
             _ => {
@@ -3597,56 +5318,440 @@ impl<'a> JvmExternalDeclarations<'a> {
         }
     }
 
-    /// Whether no surface can answer anything, so a caller may skip the ladder
-    /// altogether.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.artifacts.is_empty() && self.packs.is_none()
+    #[cfg(any(test, feature = "test-support"))]
+    fn java_different_owner_arguments(
+        &self,
+        actual: &TypeRef,
+        formal: &TypeRef,
+    ) -> Result<brokk_bifrost_jvm::java::conversion::JavaDifferentOwner, ConversionUnknown> {
+        use brokk_bifrost_jvm::java::conversion::JavaDifferentOwner;
+        match self.java_hierarchy_answer(actual, formal)? {
+            Some(answer) => {
+                if let Some(witness) = answer.witness {
+                    let count = match actual {
+                        TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                            arguments.len()
+                        }
+                        _ => return Err(ConversionUnknown::GenericSubstitution),
+                    };
+                    return Self::project_java_arguments(&witness, count)
+                        .map(JavaDifferentOwner::Projected)
+                        .ok_or(ConversionUnknown::GenericSubstitution);
+                }
+                if answer.incomplete.is_empty() {
+                    Ok(JavaDifferentOwner::Incompatible)
+                } else {
+                    Err(Self::java_hierarchy_incomplete_cause(answer.incomplete[0]))
+                }
+            }
+            None => match self.java_nominal_widening(actual, formal) {
+                Ok(false) => Ok(JavaDifferentOwner::Incompatible),
+                Ok(true) => Err(ConversionUnknown::GenericSubstitution),
+                Err(cause) => Err(cause),
+            },
+        }
     }
 
-    pub(crate) fn get(&self, fqn: &str) -> Option<JvmExternalType> {
+    /// Whether no surface can answer anything, so a caller may skip the external
+    /// tiers altogether.
+    ///
+    /// An empty surface is not the answer "nothing is declared": it is what a
+    /// project with only missing jars and no JDK pack looks like. The caller is
+    /// about to return unresolved, so the gaps are recorded here, before the
+    /// early return that no lookup function would otherwise reach.
+    pub(crate) fn empty_surface(&self, recorder: &QueryGapRecorder<'_>) -> bool {
+        let empty = self.artifacts.is_empty() && self.packs.is_none();
+        if empty {
+            self.record_dependency_gaps(recorder);
+        }
+        empty
+    }
+
+    fn record_dependency_gaps(&self, recorder: &QueryGapRecorder<'_>) {
+        recorder.all(&self.artifacts);
+        if let Some(overlay) = &self.packs {
+            let coordinates = match overlay.jvm_unresolved_coordinates() {
+                Ok(coordinates) => coordinates,
+                Err(open) => {
+                    recorder.record_reason(brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay::open_read_incompleteness(open));
+                    return;
+                }
+            };
+            for coordinate in coordinates {
+                if self.artifacts.production_diagnostics.iter().any(|gap| {
+                    gap.attribution() == GapAttribution::Dependency
+                        && gap.dependency_id() == Some(coordinate.as_str())
+                }) {
+                    continue;
+                }
+                let gap = IndexGap::from_discovery(DependencyPackDiagnostic {
+                    severity: DependencyPackDiagnosticSeverity::Error,
+                    code: super::producer_codes::JVM_DEPENDENCY_UNRESOLVED
+                        .code
+                        .to_owned(),
+                    dependency_id: Some(coordinate.clone()),
+                    location: None,
+                    message: format!("exact local artifact was not found for {coordinate}"),
+                });
+                recorder.record_gap(&gap);
+            }
+        }
+        // JvmExternalGaps remains the retained index's set. The admitted
+        // incomplete selection refuses reuse, so these extra gaps cannot go stale.
+    }
+
+    /// Records every gap the index carries, for an outcome that depends on the
+    /// whole classpath without a lookup of its own.
+    pub(crate) fn record_all_gaps(&self, recorder: &QueryGapRecorder<'_>) {
+        self.record_dependency_gaps(recorder);
+    }
+
+    /// The one declaration of `fqn`, with no gap recorded. Private, so a public
+    /// lookup that forgot to record cannot exist: every function below records
+    /// before it answers.
+    fn declaration(&self, fqn: &str) -> Option<JvmExternalType> {
         if let Some(external_type) = self.artifacts.get(fqn) {
             return Some(external_type.clone());
         }
         self.pack_declaration(fqn)
     }
 
+    fn accessible_declaration(&self, fqn: &str, access_package: &str) -> Option<JvmExternalType> {
+        self.declaration(fqn)
+            .filter(|external_type| external_type.is_accessible_from_package(access_package))
+    }
+
+    /// Records every gap the index carries: the answer depends on the whole
+    /// classpath, so a missing jar can change it.
+    pub(crate) fn get(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        fqn: &str,
+    ) -> Option<JvmExternalType> {
+        self.record_dependency_gaps(recorder);
+        self.declaration(fqn)
+    }
+
+    /// Read both sources on every query, including absence, before selecting facts.
+    pub(crate) fn hierarchy_supertypes(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        fqn: &str,
+    ) -> Option<brokk_bifrost_jvm::ExternalSupertypeFacts> {
+        self.get(recorder, fqn)?;
+        let artifact = self.artifacts.members_by_owner.get(fqn);
+        if let Some(overlay) = &self.packs {
+            let matched = qualified_model_symbols(overlay, fqn);
+            if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) { return None; }
+            let declarations = matched
+                .records
+                .iter()
+                .filter(|symbol| self.admits_pack_symbol(symbol))
+                .collect::<Vec<_>>();
+            if declarations.len() > 1
+                || declarations
+                    .iter()
+                    .any(|symbol| symbol.provenance.ambiguous)
+            {
+                return None;
+            }
+        }
+        let pack = self.pack_declaration(fqn);
+        let pack_parents = if let Some(pack) = &pack {
+            let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } = &pack.source
+            else {
+                unreachable!()
+            };
+            let overlay = self.packs.as_ref()?;
+            let matched = overlay.symbols_with_id(declaration_id);
+            if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) { return None; }
+            let symbols = matched
+                .records
+                .into_iter()
+                .filter(|symbol| self.admits_pack_symbol(symbol))
+                .collect::<Vec<_>>();
+            let [symbol] = symbols.as_slice() else {
+                return None;
+            };
+            let (edges, mut complete) = overlay.java_direct_hierarchy(symbol).ok()?;
+            let mut parents = Vec::new();
+            for edge in edges {
+                if !matches!(
+                    edge.hierarchy_kind,
+                    HierarchyKind::Extends | HierarchyKind::Implements
+                ) {
+                    continue;
+                }
+                let ty = normalize_jvm_model_type_ref(Some(overlay), &edge.target);
+                let TypeRef::Named { name, .. } = ty else {
+                    complete = false;
+                    continue;
+                };
+                parents.push(name);
+            }
+            Some(brokk_bifrost_jvm::ExternalSupertypeFacts {
+                supertypes: parents,
+                complete,
+            })
+        } else {
+            None
+        };
+        match (artifact, pack_parents) {
+            (Some(surface), pack) => {
+                let mut facts = brokk_bifrost_jvm::ExternalSupertypeFacts {
+                    supertypes: surface.supertypes.clone(),
+                    complete: surface.hierarchy_complete,
+                };
+                if let Some(pack) = pack {
+                    let left = facts.supertypes.iter().collect::<HashSet<_>>();
+                    let right = pack.supertypes.iter().collect::<HashSet<_>>();
+                    facts.complete &= pack.complete && left == right;
+                    let mut seen = facts.supertypes.iter().cloned().collect::<HashSet<_>>();
+                    facts.supertypes.extend(
+                        pack.supertypes
+                            .into_iter()
+                            .filter(|parent| seen.insert(parent.clone())),
+                    );
+                }
+                Some(facts)
+            }
+            (None, parents) => parents,
+        }
+    }
+
     pub(crate) fn resolve_explicit_import(
         &self,
+        recorder: &QueryGapRecorder<'_>,
         import_path: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
-        self.resolve_qualified_name(import_path, access_package)
+        self.resolve_qualified_name(recorder, import_path, access_package)
     }
 
     pub(crate) fn resolve_wildcard_import(
         &self,
+        recorder: &QueryGapRecorder<'_>,
         package_name: &str,
         short_name: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
-        self.resolve_qualified_name(&qualified_name(package_name, short_name), access_package)
+        self.resolve_qualified_name(
+            recorder,
+            &qualified_name(package_name, short_name),
+            access_package,
+        )
     }
 
     pub(crate) fn resolve_same_package(
         &self,
+        recorder: &QueryGapRecorder<'_>,
         package_name: &str,
         short_name: &str,
     ) -> Option<JvmExternalType> {
-        self.resolve_qualified_name(&qualified_name(package_name, short_name), package_name)
+        self.resolve_qualified_name(
+            recorder,
+            &qualified_name(package_name, short_name),
+            package_name,
+        )
     }
 
-    pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<JvmExternalType> {
-        self.get(&qualified_name("java.lang", short_name))
+    pub(crate) fn resolve_java_lang(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        short_name: &str,
+    ) -> Option<JvmExternalType> {
+        self.record_dependency_gaps(recorder);
+        self.declaration(&qualified_name("java.lang", short_name))
             .filter(is_public_external_type)
     }
 
     pub(crate) fn resolve_qualified_name(
         &self,
+        recorder: &QueryGapRecorder<'_>,
         fqn: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
-        self.get(fqn)
-            .filter(|external_type| external_type.is_accessible_from_package(access_package))
+        self.record_dependency_gaps(recorder);
+        self.accessible_declaration(fqn, access_package)
+    }
+
+    /// A single-type import resolved where nothing in scope can shadow its name
+    /// (`scope` is the proof). When the hit is a JDK-pack type in an
+    /// unshadowable package, a missing dependency jar cannot change the answer,
+    /// so only the gaps not attributed to a dependency artifact are recorded.
+    /// Any other hit, and a miss, record every gap: an artifact-origin hit could
+    /// be outranked by the same name in a missing jar earlier on the classpath
+    /// (and this surface consults the artifact map before the JDK pack), and a
+    /// miss is a bound miss.
+    pub(crate) fn resolve_explicit_import_in_unshadowed_scope(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        import_path: &str,
+        access_package: &str,
+        scope: crate::analyzer::java::unshadowed::UnshadowedScope,
+    ) -> Option<ExplicitImportHit> {
+        assert!(
+            import_path == scope.simple_name()
+                || import_path
+                    .rsplit_once('.')
+                    .is_some_and(|(_, simple)| simple == scope.simple_name()),
+            "the scope was checked for {:?}, not for the import {import_path:?}",
+            scope.simple_name()
+        );
+        match self.accessible_declaration(import_path, access_package) {
+            Some(external_type) if external_type.is_unshadowable_jdk() => {
+                recorder.non_dependency(&self.artifacts);
+                Some(ExplicitImportHit::Unshadowed(UnshadowedJdkOwner {
+                    owner: external_type,
+                }))
+            }
+            Some(external_type) => {
+                self.record_dependency_gaps(recorder);
+                Some(ExplicitImportHit::Ordinary(external_type))
+            }
+            None => {
+                self.record_dependency_gaps(recorder);
+                None
+            }
+        }
+    }
+
+    /// The member `member_name` names on `owner`, over the owner's whole
+    /// inherited surface. Records every gap: the owner is not known to be a JDK
+    /// type that no jar can touch.
+    pub(crate) fn resolve_member_of_owner(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        owner: &JvmExternalType,
+        member_name: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalMember> {
+        self.record_dependency_gaps(recorder);
+        self.artifact_member(owner, member_name)
+            .or_else(|| self.pack_member(owner, member_name))
+            .and_then(|member| member.accessible_from_package(access_package))
+    }
+
+    /// The member `member_name` names on an owner reached through its witness.
+    /// A JDK class's members and supertypes are all JDK, so only the gaps not
+    /// attributed to a dependency artifact are recorded. This answers which
+    /// declaration a name denotes; the set of overriding methods a virtual call
+    /// can dispatch to is another question and keeps every gap.
+    pub(crate) fn resolve_member_of_unshadowed_owner(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        owner: &UnshadowedJdkOwner,
+        member_name: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalMember> {
+        recorder.non_dependency(&self.artifacts);
+        self.pack_member(&owner.owner, member_name)
+            .and_then(|member| member.accessible_from_package(access_package))
+    }
+
+    /// The JDK-pack type a canonical fully qualified name denotes, when it is a
+    /// `java.*` type no jar can touch.
+    ///
+    /// A canonical name is absolute: no type in scope obscures it, so there is
+    /// no scope to prove. What remains is the package rule and the platform
+    /// override. The artifact map would win an ordinary lookup of the same name
+    /// (the reverse of Java's precedence), so a name an artifact also declares
+    /// is left to the ordinary lookup, which records every gap.
+    pub(crate) fn resolve_canonical_jdk_owner(&self, fqn: &str) -> Option<UnshadowedJdkOwner> {
+        if self.platform_override_visible() || self.artifacts.get(fqn).is_some() {
+            return None;
+        }
+        self.pack_declaration(fqn)
+            .filter(JvmExternalType::is_unshadowable_jdk)
+            .map(|owner| UnshadowedJdkOwner { owner })
+    }
+
+    /// A model signature names an absolute declaration, never a use-site
+    /// spelling. Look in artifacts before packs, as in `get`. Only a JDK-pack
+    /// hit with a derived signature witness narrows its gap receipt.
+    pub(crate) fn resolve_model_signature_type(
+        &self,
+        recorder: &QueryGapRecorder<'_>,
+        name: &str,
+        witness: Option<&UnshadowedJdkOwner>,
+    ) -> Option<JvmExternalType> {
+        let declaration = self.declaration(name);
+        if declaration.as_ref().is_some_and(|declaration| {
+            declaration.is_unshadowable_jdk()
+                && witness.is_some_and(|witness| witness.owner == *declaration)
+        }) {
+            recorder.non_dependency(&self.artifacts);
+        } else {
+            self.record_dependency_gaps(recorder);
+        }
+        declaration
+    }
+
+    /// Whether the build model shows a platform override, which refuses the
+    /// reduced gap rule (see [`JvmExternalType::is_unshadowable_jdk`]).
+    pub(crate) fn platform_override_visible(&self) -> bool {
+        self.artifacts.platform_override
+    }
+
+    /// Whether the JDK pack proves that `owner_fqn` and every supertype it
+    /// inherits declare no member type named `name`.
+    ///
+    /// The proof needs the pack's owner surface to be gap-free: a surface that
+    /// cannot prove absence for any member kind refuses, which fails closed.
+    pub(crate) fn jdk_owner_has_no_member_type(&self, owner_fqn: &str, name: &str) -> bool {
+        use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open;
+        let Some(overlay) = self.packs.as_ref() else {
+            return false;
+        };
+        let Some(owner) = self
+            .pack_declaration(owner_fqn)
+            .filter(JvmExternalType::is_unshadowable_jdk)
+        else {
+            return false;
+        };
+        let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } = &owner.source
+        else {
+            return false;
+        };
+        let matched = overlay.symbols_with_id(declaration_id);
+        if matches!(matched.disposition, Open(_)) {
+            return false;
+        }
+        let Some(owner_symbol) = matched
+            .records
+            .into_iter()
+            .find(|symbol| self.admits_pack_symbol(symbol))
+        else {
+            return false;
+        };
+        let surface = overlay.owner_surface(&owner_symbol);
+        if !surface.proves_absence() {
+            return false;
+        }
+        surface
+            .closure
+            .iter()
+            .filter(|declaring| self.admits_pack_symbol(declaring))
+            .all(|declaring| {
+                let nested = qualified_model_symbols(
+                    overlay,
+                    &qualified_name(&declaring.qualified_name, name),
+                );
+                if matches!(nested.disposition, Open(_))
+                    || nested
+                        .records
+                        .iter()
+                        .any(|symbol| pack_type_kind(symbol.kind).is_some())
+                {
+                    return false;
+                }
+                let members = overlay.members_of(&declaring.id);
+                !matches!(members.disposition, Open(_))
+                    && !members
+                        .records
+                        .iter()
+                        .any(|member| member.name == name && pack_type_kind(member.kind).is_some())
+            })
     }
 
     /// The external member a written `Owner.member` spelling names (#1900).
@@ -3677,6 +5782,7 @@ impl<'a> JvmExternalDeclarations<'a> {
     /// it was before.
     pub(crate) fn resolve_member_spelling(
         &self,
+        recorder: &QueryGapRecorder<'_>,
         spelling: &str,
         access_package: &str,
         resolve_owner: impl FnOnce(&str) -> Option<JvmExternalType>,
@@ -3685,10 +5791,11 @@ impl<'a> JvmExternalDeclarations<'a> {
         if owner_spelling.is_empty() || member_name.is_empty() {
             return None;
         }
+        // The caller's own ladder resolves the owner and records its gaps; the
+        // member lookup records every gap too, because the owner is not known
+        // to be a JDK type no jar can touch.
         let owner = resolve_owner(owner_spelling)?;
-        self.artifact_member(&owner, member_name)
-            .or_else(|| self.pack_member(&owner, member_name))
-            .and_then(|member| member.accessible_from_package(access_package))
+        self.resolve_member_of_owner(recorder, &owner, member_name, access_package)
     }
 
     /// The member the indexed artifacts declare on `owner` (#1900).
@@ -3726,7 +5833,17 @@ impl<'a> JvmExternalDeclarations<'a> {
     /// read one activated set the same way.
     fn pack_declaration(&self, fqn: &str) -> Option<JvmExternalType> {
         let overlay = self.packs.as_ref()?;
-        let mut declarations = qualified_model_symbols(overlay, fqn)
+        let matched = qualified_model_symbols(overlay, fqn);
+        if matches!(
+            matched.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        ) {
+            return None;
+        }
+        let mut declarations = matched
+            .records
             .into_iter()
             .filter(|symbol| self.admits_pack_symbol(symbol))
             .filter_map(|symbol| pack_external_type(&symbol));
@@ -3769,21 +5886,31 @@ impl<'a> JvmExternalDeclarations<'a> {
         else {
             return None;
         };
-        let owner_symbol = overlay
-            .symbols_with_id(declaration_id)
+        let matched = overlay.symbols_with_id(declaration_id);
+        if matches!(
+            matched.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        ) {
+            return None;
+        }
+        let owner_symbol = matched
             .records
             .into_iter()
             .find(|symbol| self.admits_pack_symbol(symbol))?;
         let surface = overlay.owner_surface(&owner_symbol);
-        surface
+        let member_surfaces = surface
             .closure
             .iter()
             .filter(|declaring| self.admits_pack_symbol(declaring))
-            .find_map(|declaring| {
-                let matched = overlay
-                    .members_of(&declaring.id)
-                    .records
-                    .into_iter()
+            .map(|declaring| (declaring, overlay.members_of(&declaring.id)))
+            .collect::<Vec<_>>();
+        if member_surfaces.iter().any(|(_, members)| matches!(members.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_))) {
+            return None;
+        }
+        member_surfaces.into_iter().find_map(|(declaring, members)| {
+                let matched = members.records.into_iter()
                     .filter(|symbol| {
                         symbol.name == member_name
                             && self.admits_pack_symbol(symbol)
@@ -3835,6 +5962,7 @@ impl<'a> JvmExternalDeclarations<'a> {
                         non_overridable: symbol.non_overridable,
                         parameter_count,
                         has_type_parameters: !signature.type_parameters.is_empty(),
+                        type_parameters: signature.type_parameters.clone(),
                         parameters: signature
                             .parameters
                             .iter()
@@ -3973,6 +6101,7 @@ struct JvmExternalCallShape {
     parameter_count: u32,
     parameters: Vec<TypeRef>,
     has_type_parameters: bool,
+    type_parameters: Vec<String>,
     is_static: bool,
     variadic: bool,
     /// The type this overload's own declaration writes as its return type.
@@ -4087,7 +6216,7 @@ impl JvmExternalMember {
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
     ) -> Option<u32> {
-        self.invocation_for_argument_types(instance_receiver, actuals, surface)
+        self.invocation_for_argument_types_bound(instance_receiver, actuals, surface, None)
             .ok()
             .map(|shape| shape.parameter_count)
     }
@@ -4098,10 +6227,19 @@ impl JvmExternalMember {
         instance_receiver: bool,
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
+        owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
     ) -> Option<&brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence> {
-        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?
-            .non_overridable
-            .as_ref()
+        // Read the evidence of the overload the bound selection chose, not of
+        // the overload the unsubstituted formals would select.
+        self.invocation_for_argument_types_bound(
+            instance_receiver,
+            actuals,
+            surface,
+            owner_bindings,
+        )
+        .ok()?
+        .non_overridable
+        .as_ref()
     }
 
     /// Reuse the writer's owner-member order for the overload selected by the
@@ -4113,11 +6251,18 @@ impl JvmExternalMember {
         instance_receiver: bool,
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
+        owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
     ) -> Option<brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity>
     {
-        self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?
-            .inventory_identity
-            .clone()
+        self.invocation_for_argument_types_bound(
+            instance_receiver,
+            actuals,
+            surface,
+            owner_bindings,
+        )
+        .ok()?
+        .inventory_identity
+        .clone()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4127,13 +6272,20 @@ impl JvmExternalMember {
         instance_receiver: bool,
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
+        owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
     ) -> Option<brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity>
     {
         use brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalMemberIdentity;
 
         use brokk_bifrost_analysis::analyzer::resolution::fact_source::ExternalOwnerIdentity;
-        let shape =
-            self.applicable_shape_for_argument_types(instance_receiver, actuals, surface)?;
+        let shape = self
+            .invocation_for_argument_types_bound(
+                instance_receiver,
+                actuals,
+                surface,
+                owner_bindings,
+            )
+            .ok()?;
         let (owner_fqn, member_name) = self.fqn.rsplit_once('.')?;
         let mut selected = None;
         for owner in active.types_named(owner_fqn).records {
@@ -4154,7 +6306,15 @@ impl JvmExternalMember {
                 .filter(|member| member.owner == owner.record.id && member.guard.is_none())
                 .enumerate()
             {
-                if member.name != member_name || member.is_static != shape.is_static {
+                // Fields count toward the ordinal, as in the store's member
+                // rows, but never match a call. A field is recorded with an
+                // empty parameter list, so `HashMap.entrySet` or
+                // `ArrayList.size` would otherwise tie with the zero-argument
+                // method of the same name and leave no identity (#7860).
+                if member.name != member_name
+                    || member.is_static != shape.is_static
+                    || !callable_member_kind(member.member_kind)
+                {
                     continue;
                 }
                 let Some(signature) = &member.signature else {
@@ -4278,14 +6438,34 @@ impl JvmExternalMember {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn applicable_shape_for_argument_types(
+    pub(crate) fn selected_type_argument_bindings(
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
-        surface: Option<&JvmExternalDeclarations<'_>>,
-    ) -> Option<&JvmExternalCallShape> {
-        self.invocation_for_argument_types(instance_receiver, actuals, surface)
-            .ok()
+        surface: &JvmExternalDeclarations<'_>,
+        owner_bindings: &std::collections::HashMap<String, TypeRef>,
+    ) -> Option<brokk_bifrost_analysis::analyzer::usages::get_definition::ExternalCallTypeBindings>
+    {
+        let shape = self
+            .invocation_for_argument_types_bound(
+                instance_receiver,
+                actuals,
+                Some(surface),
+                Some(owner_bindings),
+            )
+            .ok()?;
+        let mut bindings = owner_bindings.clone();
+        for name in &shape.type_parameters {
+            bindings.insert(name.clone(), TypeRef::TypeParameter { name: name.clone() });
+        }
+        let mut ordered = bindings.into_iter().collect::<Vec<_>>();
+        ordered.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Some(
+            ordered
+                .into_iter()
+                .map(|(name, term)| (name.into_boxed_str(), term))
+                .collect(),
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4298,7 +6478,26 @@ impl JvmExternalMember {
         Result<u32, JavaExternalInvocationFailure>,
         Option<Box<ProjectedNativeModelMemberSelection>>,
     ) {
-        match self.invocation_for_argument_types(instance_receiver, actuals, surface) {
+        self.invocation_with_bound_diagnostics(instance_receiver, actuals, surface, None)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn invocation_with_bound_diagnostics(
+        &self,
+        instance_receiver: bool,
+        actuals: &[TypeRef],
+        surface: Option<&JvmExternalDeclarations<'_>>,
+        owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
+    ) -> (
+        Result<u32, JavaExternalInvocationFailure>,
+        Option<Box<ProjectedNativeModelMemberSelection>>,
+    ) {
+        match self.invocation_for_argument_types_bound(
+            instance_receiver,
+            actuals,
+            surface,
+            owner_bindings,
+        ) {
             Ok(shape) => (Ok(shape.parameter_count), None),
             Err(failure) => (
                 Err(failure.cause),
@@ -4368,12 +6567,15 @@ impl JvmExternalMember {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    fn invocation_for_argument_types(
+    fn invocation_for_argument_types_bound(
         &self,
         instance_receiver: bool,
         actuals: &[TypeRef],
         surface: Option<&JvmExternalDeclarations<'_>>,
+        owner_bindings: Option<&std::collections::HashMap<String, TypeRef>>,
     ) -> Result<&JvmExternalCallShape, JavaExternalInvocationAssessment> {
+        // Formals equal to every actual's static type mention no owner type
+        // variable, so receiver bindings cannot change this exact selection.
         if let Some(selected) = self.exact_shape_for_argument_types(instance_receiver, actuals) {
             return Ok(selected);
         }
@@ -4396,12 +6598,31 @@ impl JvmExternalMember {
                 candidates.push(shape);
             }
         }
+        let substituted = candidates
+            .iter()
+            .map(|shape| {
+                let mut bindings = owner_bindings.cloned().unwrap_or_default();
+                for name in &shape.type_parameters {
+                    bindings.insert(name.clone(), TypeRef::TypeParameter { name: name.clone() });
+                }
+                shape
+                    .parameters
+                    .iter()
+                    .map(|formal| {
+                        formal
+                            .substitute(&bindings, 64)
+                            .unwrap_or_else(|| formal.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let selected = select_java_external_invocation(
             actuals,
             &candidates
                 .iter()
-                .map(|shape| JavaExternalSignature {
-                    parameters: &shape.parameters,
+                .zip(&substituted)
+                .map(|(shape, parameters)| JavaExternalSignature {
+                    parameters,
                     variadic: shape.variadic,
                     has_type_parameters: shape.has_type_parameters,
                 })
@@ -4766,6 +6987,29 @@ pub(crate) fn java_external_conversion_in(
         fn named(&self, ty: Self::Type) -> bool {
             matches!(ty, TypeRef::Named { .. })
         }
+        fn arguments(&self, ty: Self::Type) -> Option<Vec<Self::Type>> {
+            match ty {
+                TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                    Some(arguments.iter().collect())
+                }
+                _ => None,
+            }
+        }
+        fn wildcard(
+            &self,
+            ty: Self::Type,
+        ) -> Option<brokk_bifrost_jvm::java::conversion::JavaWildcard<Self::Type>> {
+            use brokk_bifrost_jvm::java::conversion::JavaWildcard;
+            match ty {
+                TypeRef::Wildcard { variance, bound } => match (variance, bound.as_deref()) {
+                    (brokk_bifrost_semantic::analyzer::semantic_model::model::WildcardVariance::Any, _) => Some(JavaWildcard::Any),
+                    (brokk_bifrost_semantic::analyzer::semantic_model::model::WildcardVariance::Extends, Some(bound)) => Some(JavaWildcard::Extends(bound)),
+                    (brokk_bifrost_semantic::analyzer::semantic_model::model::WildcardVariance::Super, Some(bound)) => Some(JavaWildcard::Super(bound)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
         fn nominal_widening(
             &mut self,
             a: Self::Type,
@@ -4783,6 +7027,34 @@ pub(crate) fn java_external_conversion_in(
                     Ok(None)
                 }
             }
+        }
+        fn different_owner_arguments(
+            &mut self,
+            actual: Self::Type,
+            formal: Self::Type,
+        ) -> Result<brokk_bifrost_jvm::java::conversion::JavaDifferentOwner, Self::Error> {
+            use brokk_bifrost_jvm::java::conversion::JavaDifferentOwner;
+            let answer = self
+                .surface
+                .map_or(Err(ConversionUnknown::IncompleteHierarchy), |surface| {
+                    surface.java_different_owner_arguments(actual, formal)
+                });
+            Ok(match answer {
+                Ok(JavaDifferentOwner::Projected(positions)) => {
+                    if let TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } =
+                        formal
+                        && positions.len() != arguments.len()
+                    {
+                        self.cause = Some(ConversionUnknown::GenericSubstitution);
+                    }
+                    JavaDifferentOwner::Projected(positions)
+                }
+                Ok(result) => result,
+                Err(cause) => {
+                    self.cause = Some(cause);
+                    JavaDifferentOwner::Open
+                }
+            })
         }
         fn boxed_widening(
             &mut self,
@@ -4841,6 +7113,51 @@ pub(crate) fn java_external_conversion_in(
         }
         Err(error) => match error {},
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn java_bind_projected_arguments(
+    parameters: &[String],
+    positions: &[usize],
+    arguments: &[TypeRef],
+) -> Option<std::collections::HashMap<String, TypeRef>> {
+    if arguments.is_empty() || parameters.len() != positions.len() {
+        return None;
+    }
+    for argument in arguments {
+        let mut pending = vec![argument];
+        while let Some(term) = pending.pop() {
+            match term {
+                // Unknown is not an exact binding: it would make every
+                // selection, return and conversion substitution claim an
+                // exact type that the receiver did not establish.
+                TypeRef::Wildcard { .. }
+                | TypeRef::TypeParameter { .. }
+                | TypeRef::Projection { .. }
+                | TypeRef::Unknown => return None,
+                TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                    pending.extend(arguments)
+                }
+                TypeRef::Array { element }
+                | TypeRef::ByRef { element, .. }
+                | TypeRef::Pointer { element }
+                | TypeRef::Slice { element }
+                | TypeRef::FixedArray { element, .. }
+                | TypeRef::Channel { element, .. } => pending.push(element),
+                TypeRef::Map { key, value } => pending.extend([key.as_ref(), value.as_ref()]),
+                TypeRef::Tuple { elements } => pending.extend(elements),
+                TypeRef::Function { parameters, result } => {
+                    pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                    pending.extend(result.iter().map(Box::as_ref));
+                }
+            }
+        }
+    }
+    parameters
+        .iter()
+        .zip(positions)
+        .map(|(name, index)| Some((name.clone(), arguments.get(*index)?.clone())))
+        .collect()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -4988,6 +7305,7 @@ fn external_call_shape(
         non_overridable,
         parameter_count,
         has_type_parameters: !signature.type_parameters.is_empty(),
+        type_parameters: signature.type_parameters.clone(),
         parameters: signature
             .parameters
             .iter()
@@ -5093,6 +7411,7 @@ fn pack_external_type(
         source: JvmExternalDeclarationSource::SemanticPack {
             pack_id: symbol.provenance.pack_id.clone(),
             declaration_id: symbol.id.clone(),
+            jdk: symbol.provenance.activation.matched_evidence.ecosystem == "jdk",
         },
     })
 }
@@ -5150,6 +7469,21 @@ impl SourceJarLanguage {
 
 #[allow(dead_code)]
 impl JvmExternalType {
+    /// Whether an activated JDK pack declared this type in a `java.*` package.
+    ///
+    /// Only the JDK's built-in loaders define a `java.*` class
+    /// (`ClassLoader.preDefineClass`), so no jar on the class path or module
+    /// path can supply or split such a package, unless the build configures a
+    /// platform override (see [`JvmExternalDeclarations::platform_override_visible`]).
+    /// `javax.*` and `jdk.*` are protected only when their module is resolved
+    /// for the analyzed code, which the index does not model.
+    pub(crate) fn is_unshadowable_jdk(&self) -> bool {
+        matches!(
+            self.source,
+            JvmExternalDeclarationSource::SemanticPack { jdk: true, .. }
+        ) && (self.package_name == "java" || self.package_name.starts_with("java."))
+    }
+
     pub(crate) fn package_name(&self) -> &str {
         &self.package_name
     }
@@ -5224,13 +7558,31 @@ fn can_read_entry(
     true
 }
 
+#[cfg(test)]
 fn resolve_configured_artifacts(
     config: &JvmExternalDependencies,
     project_root: &Path,
 ) -> Vec<ResolvedJvmArtifact> {
+    resolve_configured_artifacts_traced(config, project_root, None)
+}
+
+fn resolve_configured_artifacts_traced(
+    config: &JvmExternalDependencies,
+    project_root: &Path,
+    mut trace: Option<&mut Vec<ExternalPathProbe>>,
+) -> Vec<ResolvedJvmArtifact> {
     let mut artifacts = Vec::new();
     for artifact in &config.artifact_paths {
-        artifacts.push(resolve_explicit_artifact(artifact, project_root));
+        let resolved = resolve_explicit_artifact(artifact, project_root);
+        if let Some(steps) = trace.as_deref_mut() {
+            for path in std::iter::once(resolved.artifact_path.as_path())
+                .chain(resolved.source_artifact_path.as_deref())
+            {
+                let metadata = fs::metadata(path);
+                record_external_probe(steps, path, ExternalProbeOperation::File, &metadata);
+            }
+        }
+        artifacts.push(resolved);
     }
 
     let repository_roots = repository_roots(config);
@@ -5238,7 +7590,9 @@ fn resolve_configured_artifacts(
     for coordinate in &config.coordinates {
         let mut resolved = false;
         for root in &repository_roots {
-            if let Some(artifact) = resolve_coordinate(root, coordinate) {
+            if let Some(artifact) =
+                resolve_coordinate_traced(root, coordinate, trace.as_deref_mut())
+            {
                 artifacts.push(artifact);
                 resolved = true;
                 break;
@@ -5246,7 +7600,8 @@ fn resolve_configured_artifacts(
         }
         if !resolved {
             for root in &gradle_cache_roots {
-                let gradle_artifacts = resolve_gradle_coordinate(root, coordinate);
+                let gradle_artifacts =
+                    resolve_gradle_coordinate_traced(root, coordinate, trace.as_deref_mut());
                 if !gradle_artifacts.is_empty() {
                     artifacts.extend(gradle_artifacts);
                     break;
@@ -5321,6 +7676,7 @@ fn local_jvm_artifact_production_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "local dependency artifact".to_owned(),
             revision: None,
         },
@@ -5332,15 +7688,33 @@ fn local_jvm_artifact_production_request(
     }
 }
 
+#[cfg(test)]
 fn resolve_coordinate(
     repository_root: &Path,
     coordinate: &JvmMavenCoordinate,
+) -> Option<ResolvedJvmArtifact> {
+    resolve_coordinate_traced(repository_root, coordinate, None)
+}
+
+fn resolve_coordinate_traced(
+    repository_root: &Path,
+    coordinate: &JvmMavenCoordinate,
+    mut trace: Option<&mut Vec<ExternalPathProbe>>,
 ) -> Option<ResolvedJvmArtifact> {
     if !is_safe_maven_coordinate(coordinate) {
         return None;
     }
 
-    let repository_root = repository_root.canonicalize().ok()?;
+    let canonical_root = repository_root.canonicalize();
+    if let Some(steps) = trace.as_deref_mut() {
+        record_external_probe(
+            steps,
+            repository_root,
+            ExternalProbeOperation::Canonicalize,
+            &canonical_root,
+        );
+    }
+    let repository_root = canonical_root.ok()?;
     let mut directory = repository_root.clone();
     for segment in coordinate.group_id.split('.') {
         directory.push(segment);
@@ -5349,12 +7723,48 @@ fn resolve_coordinate(
     directory.push(&coordinate.version);
 
     let (jar_name, sources_name) = maven_coordinate_jar_names(coordinate);
-    let artifact_path = canonical_file_under(&repository_root, &directory.join(jar_name))?;
-    if !artifact_path.is_file() {
+    let binary_candidate = directory.join(jar_name);
+    let binary_result = binary_candidate.canonicalize();
+    if let Some(steps) = trace.as_deref_mut() {
+        record_external_probe(
+            steps,
+            &binary_candidate,
+            ExternalProbeOperation::Canonicalize,
+            &binary_result,
+        );
+    }
+    let artifact_path = binary_result.ok()?;
+    if !artifact_path.starts_with(&repository_root) {
         return None;
     }
-    let source_artifact_path =
-        canonical_file_under(&repository_root, &directory.join(sources_name));
+    let binary_is_file = artifact_path.is_file();
+    if let Some(steps) = trace.as_deref_mut() {
+        steps.push(ExternalPathProbe {
+            path: artifact_path.clone(),
+            operation: ExternalProbeOperation::File,
+            outcome: if binary_is_file {
+                ExternalProbeOutcome::Found
+            } else {
+                ExternalProbeOutcome::Absent
+            },
+        });
+    }
+    if !binary_is_file {
+        return None;
+    }
+    let source_candidate = directory.join(sources_name);
+    let source_result = source_candidate.canonicalize();
+    if let Some(steps) = trace {
+        record_external_probe(
+            steps,
+            &source_candidate,
+            ExternalProbeOperation::Canonicalize,
+            &source_result,
+        );
+    }
+    let source_artifact_path = source_result
+        .ok()
+        .filter(|path| path.starts_with(&repository_root));
     Some(ResolvedJvmArtifact {
         artifact_path,
         source_artifact_path,
@@ -5379,11 +7789,6 @@ fn is_safe_maven_path_segment(segment: &str) -> bool {
         && segment != ".."
         && !segment.contains('/')
         && !segment.contains('\\')
-}
-
-fn canonical_file_under(root: &Path, path: &Path) -> Option<PathBuf> {
-    let canonical = path.canonicalize().ok()?;
-    canonical.starts_with(root).then_some(canonical)
 }
 
 fn is_source_jar(path: &Path) -> bool {
@@ -5609,44 +8014,122 @@ fn gradle_cache_roots(config: &JvmExternalDependencies) -> Vec<PathBuf> {
         .collect()
 }
 
-fn resolve_gradle_coordinate(
+fn resolve_gradle_coordinate_traced(
     cache_root: &Path,
     coordinate: &JvmMavenCoordinate,
+    mut trace: Option<&mut Vec<ExternalPathProbe>>,
 ) -> Vec<ResolvedJvmArtifact> {
     if !is_safe_maven_coordinate(coordinate) {
         return Vec::new();
     }
-    let Ok(cache_root) = cache_root.canonicalize() else {
+    let canonical_root = cache_root.canonicalize();
+    if let Some(steps) = trace.as_deref_mut() {
+        record_external_probe(
+            steps,
+            cache_root,
+            ExternalProbeOperation::Canonicalize,
+            &canonical_root,
+        );
+    }
+    let Ok(cache_root) = canonical_root else {
         return Vec::new();
     };
     let coordinate_directory = cache_root
         .join(&coordinate.group_id)
         .join(&coordinate.artifact_id)
         .join(&coordinate.version);
-    let Ok(hash_directories) = coordinate_directory.read_dir() else {
+    let listing = coordinate_directory.read_dir();
+    if let Some(steps) = trace.as_deref_mut() {
+        record_external_probe(
+            steps,
+            &coordinate_directory,
+            ExternalProbeOperation::List,
+            &listing,
+        );
+    }
+    let Ok(hash_directories) = listing else {
         return Vec::new();
     };
 
     let mut jars = Vec::new();
-    for hash_directory in hash_directories.filter_map(Result::ok) {
-        let Ok(file_type) = hash_directory.file_type() else {
+    for hash_directory in hash_directories {
+        let Ok(hash_directory) = hash_directory else {
+            if let Some(steps) = trace.as_deref_mut() {
+                steps.push(ExternalPathProbe {
+                    path: coordinate_directory.clone(),
+                    operation: ExternalProbeOperation::List,
+                    outcome: ExternalProbeOutcome::Unreadable,
+                });
+            }
+            continue;
+        };
+        let file_type = hash_directory.file_type();
+        if let Some(steps) = trace.as_deref_mut() {
+            record_external_probe(
+                steps,
+                &hash_directory.path(),
+                ExternalProbeOperation::File,
+                &file_type,
+            );
+        }
+        let Ok(file_type) = file_type else {
             continue;
         };
         if !file_type.is_dir() {
             continue;
         }
-        let Ok(entries) = hash_directory.path().read_dir() else {
+        let listing = hash_directory.path().read_dir();
+        if let Some(steps) = trace.as_deref_mut() {
+            record_external_probe(
+                steps,
+                &hash_directory.path(),
+                ExternalProbeOperation::List,
+                &listing,
+            );
+        }
+        let Ok(entries) = listing else {
             continue;
         };
-        for entry in entries.filter_map(Result::ok) {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                if let Some(steps) = trace.as_deref_mut() {
+                    steps.push(ExternalPathProbe {
+                        path: hash_directory.path(),
+                        operation: ExternalProbeOperation::List,
+                        outcome: ExternalProbeOutcome::Unreadable,
+                    });
+                }
+                continue;
+            };
             let path = entry.path();
             if path.extension().is_none_or(|extension| extension != "jar") {
                 continue;
             }
-            let Some(path) = canonical_file_under(&cache_root, &path) else {
+            let canonical = path.canonicalize();
+            if let Some(steps) = trace.as_deref_mut() {
+                record_external_probe(
+                    steps,
+                    &path,
+                    ExternalProbeOperation::Canonicalize,
+                    &canonical,
+                );
+            }
+            let Some(path) = canonical.ok().filter(|path| path.starts_with(&cache_root)) else {
                 continue;
             };
-            if path.is_file() {
+            let is_file = path.is_file();
+            if let Some(steps) = trace.as_deref_mut() {
+                steps.push(ExternalPathProbe {
+                    path: path.clone(),
+                    operation: ExternalProbeOperation::File,
+                    outcome: if is_file {
+                        ExternalProbeOutcome::Found
+                    } else {
+                        ExternalProbeOutcome::Absent
+                    },
+                });
+            }
+            if is_file {
                 jars.push(path);
             }
         }
@@ -6013,7 +8496,12 @@ pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
     let super_name_index = utf8_index(&mut pool, &mut next_index, class.super_internal_name);
     pool.push(CONSTANT_CLASS);
     pool.extend_from_slice(&super_name_index.to_be_bytes());
-    let super_class_index = next_index;
+    // JVMS 4.1: Object alone has no superclass.
+    let super_class_index = if class.internal_name == "java/lang/Object" {
+        0
+    } else {
+        next_index
+    };
     next_index += 1;
     let mut method_indexes = Vec::with_capacity(class.methods.len());
     for method in class.methods {
@@ -6150,9 +8638,8 @@ pub(crate) fn normalize_jvm_model_type_ref(
         {
             let selected = overlay.and_then(|overlay| {
                 let matched = overlay.symbols_with_id(id);
-                let [symbol] = matched.records.as_slice() else {
-                    return None;
-                };
+                if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) { return None; }
+                let [symbol] = matched.records.as_slice() else { return None; };
                 (symbol.kind.is_type_declaration() && !symbol.provenance.ambiguous)
                     .then(|| symbol.qualified_name.clone())
             });
@@ -6262,12 +8749,706 @@ pub(crate) fn select_java_external_model_invocation(
     Some((selected, layout))
 }
 
+/// A budget-charged digest cache for tests that run JDK discovery with no store.
+#[cfg(test)]
+pub(super) fn test_digests() -> ContentDigestCache {
+    ContentDigestCache::new(&brokk_bifrost_core::retention_budget::RetentionBudget::new(
+        64 << 20,
+    ))
+}
+
+/// JDK discovery followed by the pinning step, as activation and the JDK
+/// question run it.
+#[cfg(test)]
+fn discover_and_pin_jdk(
+    config: &JvmAnalyzerConfig,
+    project_root: &Path,
+    java_home: Option<OsString>,
+    digests: &ContentDigestCache,
+) -> JdkDiscovery {
+    let mut discovery = discover_jdk_semantic_pack_dependencies(config, project_root, java_home);
+    assert!(pin_jdk_discovery(&mut discovery, digests, None).is_continue());
+    discovery
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn java_supertype_argument_projection_table() {
+        use super::*;
+        use brokk_bifrost_analysis::analyzer::semantic_model::JavaHierarchyWitness;
+        use brokk_bifrost_semantic::analyzer::semantic_model::model::{
+            HierarchyFact, HierarchyKind,
+        };
+        let parameter = |name: &str| TypeRef::TypeParameter { name: name.into() };
+        let edge = |arguments| HierarchyFact {
+            hierarchy_kind: HierarchyKind::Extends,
+            target: TypeRef::Named {
+                name: "Target".into(),
+                arguments,
+                nullable: false,
+            },
+            declaration_ordinal: None,
+        };
+        let witness = |parameters: Vec<Option<Vec<String>>>, edges: Vec<HierarchyFact>| {
+            JavaHierarchyWitness {
+                declarations: Vec::new(),
+                type_parameters: parameters,
+                edges,
+            }
+        };
+        let names = |names: &[&str]| Some(names.iter().map(|name| (*name).into()).collect());
+        let cases = [
+            (
+                witness(
+                    vec![names(&["E"]), names(&["E"]), names(&["E"]), names(&["E"])],
+                    vec![
+                        edge(vec![parameter("E")]),
+                        edge(vec![parameter("E")]),
+                        edge(vec![parameter("E")]),
+                    ],
+                ),
+                1,
+                Some(vec![0]),
+            ),
+            (
+                witness(
+                    vec![names(&["A", "B"]), names(&["X", "Y"])],
+                    vec![edge(vec![parameter("B"), parameter("A")])],
+                ),
+                2,
+                Some(vec![1, 0]),
+            ),
+            (
+                witness(vec![names(&["E"]), names(&["E"])], vec![edge(vec![])]),
+                1,
+                Some(vec![]),
+            ),
+            (
+                witness(
+                    vec![names(&["E"]), names(&["E"])],
+                    vec![edge(vec![TypeRef::named("String")])],
+                ),
+                1,
+                None,
+            ),
+            (
+                witness(
+                    vec![names(&["E"]), names(&["E"])],
+                    vec![edge(vec![TypeRef::Named {
+                        name: "Box".into(),
+                        arguments: vec![parameter("E")],
+                        nullable: false,
+                    }])],
+                ),
+                1,
+                None,
+            ),
+            (
+                witness(
+                    vec![names(&["E"]), names(&["E"])],
+                    vec![edge(vec![parameter("Missing")])],
+                ),
+                1,
+                None,
+            ),
+            (
+                witness(vec![None, names(&["E"])], vec![edge(vec![parameter("E")])]),
+                1,
+                None,
+            ),
+            (
+                witness(
+                    vec![names(&["E"]), names(&["E"])],
+                    vec![edge(vec![parameter("E")])],
+                ),
+                2,
+                None,
+            ),
+        ];
+        for (witness, actual_count, expected) in cases {
+            assert_eq!(
+                JvmExternalDeclarations::project_java_arguments(&witness, actual_count),
+                expected
+            );
+        }
+    }
+    #[test]
+    fn java_receiver_binding_and_substitution_rules() {
+        use super::*;
+        use brokk_bifrost_analysis::analyzer::semantic_model::WildcardVariance;
+        let string = TypeRef::named("java.lang.String");
+        let integer = TypeRef::named("java.lang.Integer");
+        let generic = TypeRef::TypeParameter {
+            name: "CallerT".into(),
+        };
+        let wildcard = TypeRef::Wildcard {
+            variance: WildcardVariance::Any,
+            bound: None,
+        };
+        let cases = [
+            (
+                vec!["T".into(), "U".into()],
+                vec![0, 1],
+                vec![string.clone(), integer.clone()],
+                true,
+            ),
+            (
+                vec!["T".into(), "U".into()],
+                vec![1, 0],
+                vec![string.clone(), integer.clone()],
+                true,
+            ),
+            (
+                vec!["T".into(), "U".into()],
+                vec![0],
+                vec![string.clone()],
+                false,
+            ),
+            (vec!["T".into()], vec![0], vec![wildcard], false),
+            (
+                vec!["T".into()],
+                vec![0],
+                vec![TypeRef::Array {
+                    element: Box::new(generic),
+                }],
+                false,
+            ),
+        ];
+        for (parameters, positions, arguments, expected) in cases {
+            let bindings = java_bind_projected_arguments(&parameters, &positions, &arguments);
+            assert_eq!(bindings.is_some(), expected);
+            if let Some(bindings) = bindings {
+                for (name, index) in parameters.iter().zip(positions) {
+                    assert_eq!(
+                        TypeRef::TypeParameter { name: name.clone() }.substitute(&bindings, 64),
+                        Some(arguments[index].clone())
+                    );
+                }
+            }
+        }
+        let mut bindings = java_bind_projected_arguments(&["T".into()], &[0], &[string]).unwrap();
+        bindings.insert("T".into(), TypeRef::TypeParameter { name: "T".into() });
+        assert_eq!(
+            TypeRef::TypeParameter { name: "T".into() }.substitute(&bindings, 64),
+            Some(TypeRef::TypeParameter { name: "T".into() })
+        );
+        assert_eq!(
+            TypeRef::TypeParameter {
+                name: "EnclosingT".into()
+            }
+            .substitute(&bindings, 64),
+            None
+        );
+    }
+    #[test]
+    fn selected_production_keys_match_preparation_in_order_and_keep_missing_slots() {
+        use super::*;
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_core::analyzer::project::TestProject;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["First", "Second"]
+            .into_iter()
+            .map(|name| {
+                let path = root.path().join(format!("{name}.jar"));
+                let class = test_class_file_bytes(&TestClassFile {
+                    internal_name: &format!("sample/{name}"),
+                    super_internal_name: "java/lang/Object",
+                    methods: &[],
+                    private_nested: false,
+                });
+                write_zip_entry(&path, &format!("sample/{name}.class"), &class);
+                path
+            })
+            .collect();
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            external_dependencies: JvmExternalDependencies {
+                artifact_paths: paths
+                    .iter()
+                    .map(|path| JvmExternalArtifact {
+                        artifact_path: path.clone(),
+                        ..JvmExternalArtifact::default()
+                    })
+                    .collect(),
+                ..JvmExternalDependencies::default()
+            },
+            dependency_discovery:
+                brokk_bifrost_core::analyzer::config::JvmDependencyDiscoveryConfig {
+                    mode: JvmDependencyDiscoveryMode::Disabled,
+                    ..Default::default()
+                },
+            standard_library_discovery:
+                brokk_bifrost_core::analyzer::config::JvmStandardLibraryDiscoveryConfig {
+                    discover_java_home: false,
+                    ..Default::default()
+                },
+        };
+        let selection =
+            JvmExternalDeclarationIndex::select_external_inventory::<std::convert::Infallible>(
+                &config,
+                &project,
+                &LiveDiscoveryInputs(&project),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let dependencies: Vec<_> = selection
+            .productions
+            .iter()
+            .map(|(dependency, _, _)| dependency.clone())
+            .collect();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &dependencies,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let keys = selection.generated_production_keys();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(prepared.packs.len(), 2, "{prepared:?}");
+        for key in &keys {
+            let key = key.as_ref().expect("selected production key");
+            assert_eq!(key.schema_version(), 22);
+            assert_eq!(
+                *key,
+                brokk_bifrost_semantic::analyzer::semantic_model::catalog::GeneratedProductionKey::new(
+                    key.input_digest(),
+                    key.producer_name(),
+                    key.producer_version(),
+                    22,
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(
+            keys,
+            prepared
+                .packs
+                .iter()
+                .map(|pack| Some(pack.production.key.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            selection
+                .productions
+                .iter()
+                .all(|(_, _, key)| key.is_some())
+        );
+    }
+
+    #[test]
+    fn selection_digest_includes_probe_manifest_and_provider() {
+        use super::*;
+        let mut selection = ExternalInventorySelection {
+            artifacts: vec![SelectedExternalArtifactRecord {
+                path: PathBuf::from("lib.jar"),
+                kind: ExternalArtifactKind::JavaClassJar,
+                provider_id: "provider-a".to_owned(),
+            }],
+            provider_ids: vec!["provider-a".to_owned()],
+            productions: Vec::new(),
+            inputs: ExternalInputsConsumed {
+                explicit_paths: Vec::new(),
+                repository_roots: Vec::new(),
+                gradle_cache_roots: Vec::new(),
+                home: None,
+                userprofile: None,
+                gradle_user_home: None,
+                coordinates: Vec::new(),
+                partial_manifests: Vec::new(),
+                resolution_steps: vec![ExternalPathProbe {
+                    path: PathBuf::from("missing"),
+                    operation: ExternalProbeOperation::File,
+                    outcome: ExternalProbeOutcome::Absent,
+                }],
+                artifact_probes: Vec::new(),
+            },
+            completeness: ExternalSelectionCompleteness::default(),
+        };
+        let baseline = selection.answer_digest(true, true);
+        assert_eq!(baseline, selection.answer_digest(true, true));
+        selection.inputs.resolution_steps[0].outcome = ExternalProbeOutcome::Unreadable;
+        assert_ne!(baseline, selection.answer_digest(true, true));
+        selection.inputs.resolution_steps[0].outcome = ExternalProbeOutcome::Absent;
+        selection
+            .inputs
+            .partial_manifests
+            .push(PathBuf::from("pom.xml"));
+        assert_ne!(baseline, selection.answer_digest(true, true));
+        selection.inputs.partial_manifests.clear();
+        selection.artifacts[0].provider_id = "provider-b".to_owned();
+        assert_ne!(baseline, selection.answer_digest(true, true));
+    }
+
+    fn codec_test_inputs() -> ExternalInputsConsumed {
+        ExternalInputsConsumed {
+            explicit_paths: vec![PathBuf::from("explicit")],
+            repository_roots: vec![PathBuf::from("repo-a"), PathBuf::from("repo-b")],
+            gradle_cache_roots: vec![PathBuf::from("gradle-a")],
+            home: Some(OsString::from("/home/user")),
+            userprofile: None,
+            gradle_user_home: None,
+            coordinates: vec![
+                JvmMavenCoordinate {
+                    group_id: "g".into(),
+                    artifact_id: "a".into(),
+                    version: "1".into(),
+                },
+                JvmMavenCoordinate {
+                    group_id: "g".into(),
+                    artifact_id: "b".into(),
+                    version: "1".into(),
+                },
+            ],
+            partial_manifests: vec![PathBuf::from("a/pom.xml"), PathBuf::from("b/pom.xml")],
+            resolution_steps: vec![ExternalPathProbe {
+                path: PathBuf::from("repo-a/g"),
+                operation: ExternalProbeOperation::List,
+                outcome: ExternalProbeOutcome::Found,
+            }],
+            artifact_probes: vec![PathBuf::from("x.jar"), PathBuf::from("y.jar")],
+        }
+    }
+
+    fn codec_test_dependency(id: &str) -> ResolvedDependency {
+        ResolvedDependency::undeclared_scope(
+            id.to_owned(),
+            brokk_bifrost_semantic::analyzer::semantic_model::runtime::SemanticModelActivationEvidence {
+                language: "java".into(), ecosystem: "maven".into(), package: None,
+                module: None, toolchain: None, target: None, configuration: None,
+                artifact_sha256: None,
+            },
+            Vec::new(),
+            vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Binary,
+                ExternalArtifactKind::JavaClassJar,
+                PathBuf::from(format!("{id}.jar")),
+            )],
+        )
+    }
+
+    fn codec_test_selection() -> ExternalInventorySelection {
+        let key =
+            brokk_bifrost_semantic::analyzer::semantic_model::catalog::GeneratedProductionKey::new(
+                "a".repeat(64),
+                "producer",
+                "1",
+                22,
+            )
+            .unwrap();
+        ExternalInventorySelection {
+            artifacts: vec![SelectedExternalArtifactRecord {
+                path: PathBuf::from("x.jar"),
+                kind: ExternalArtifactKind::JavaClassJar,
+                provider_id: "p".to_owned(),
+            }],
+            productions: vec![
+                (
+                    codec_test_dependency("one"),
+                    vec![SelectedProductionArtifact {
+                        role: DependencyArtifactRole::Binary,
+                        kind: ExternalArtifactKind::JavaClassJar,
+                        module: Some("m".into()),
+                        sha256: "s".repeat(64),
+                    }],
+                    Some(key),
+                ),
+                (codec_test_dependency("two"), Vec::new(), None),
+            ],
+            provider_ids: vec!["p".to_owned()],
+            inputs: codec_test_inputs(),
+            completeness: ExternalSelectionCompleteness::default(),
+        }
+    }
+
+    fn codec_test_jdk() -> SelectedJdk {
+        SelectedJdk {
+            inputs: JdkInputsConsumed {
+                java_home: Some(OsString::from("/jdk")),
+                candidates: vec![
+                    (PathBuf::from("/jdk-a"), true),
+                    (PathBuf::from("/jdk"), false),
+                ],
+                probes: vec![ExternalPathProbe {
+                    path: PathBuf::from("/jdk-a"),
+                    operation: ExternalProbeOperation::Canonicalize,
+                    outcome: ExternalProbeOutcome::Found,
+                }],
+                complete: true,
+            },
+            dependencies: vec![codec_test_dependency("jdk-a"), codec_test_dependency("jdk")],
+        }
+    }
+
+    #[test]
+    fn answer_codec_version_complete_and_certified_change_the_digest() {
+        let selection = codec_test_selection();
+        let current = selection.answer_digest(true, true);
+        assert_eq!(current, selection.answer_digest(true, true));
+        assert_ne!(current, selection.answer_digest(false, true));
+        assert_ne!(current, selection.answer_digest(true, false));
+        assert_ne!(
+            current,
+            selection.answer_digest_in(
+                b"bifrost-external-selection-answer:dependencies:v1",
+                true,
+                true
+            )
+        );
+        let jdk = codec_test_jdk();
+        let current = jdk.answer_digest(true, false);
+        assert_ne!(current, jdk.answer_digest(false, false));
+        assert_ne!(current, jdk.answer_digest(true, true));
+        assert_ne!(
+            current,
+            jdk.answer_digest_in(b"bifrost-external-selection-answer:jdk:v1", true, false)
+        );
+        // The two answers never share a preimage.
+        assert_ne!(
+            codec_test_selection().answer_digest(true, false),
+            jdk.answer_digest(true, false)
+        );
+    }
+
+    #[test]
+    fn every_selection_field_reaches_the_dependencies_digest() {
+        type Mutation = (&'static str, fn(&mut ExternalInventorySelection));
+        let mutations: &[Mutation] = &[
+            ("artifacts.path", |s| {
+                s.artifacts[0].path = PathBuf::from("z.jar")
+            }),
+            ("artifacts.kind", |s| {
+                s.artifacts[0].kind = ExternalArtifactKind::JavaSourceJar
+            }),
+            ("artifacts.provider_id", |s| {
+                s.artifacts[0].provider_id = "q".into()
+            }),
+            ("completeness.open", |s| {
+                s.completeness.record(ExternalSelectionFailure::Discovery)
+            }),
+            ("completeness.unresolved", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::UnresolvedCoordinates(vec![
+                        "g:a:1".into(),
+                    ]));
+            }),
+            ("completeness.unresolved.coordinate", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::UnresolvedCoordinates(vec![
+                        "g:b:1".into(),
+                    ]));
+            }),
+            ("completeness.limit", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactLimit)
+            }),
+            ("completeness.read", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactRead(PathBuf::from(
+                        "x.jar",
+                    )))
+            }),
+            ("completeness.read.path", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactRead(PathBuf::from(
+                        "y.jar",
+                    )))
+            }),
+            ("completeness.partial", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::PartialManifest(PathBuf::from(
+                        "x.jar",
+                    )))
+            }),
+            ("completeness.unreadable", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::UnreadableProbe(PathBuf::from(
+                        "x.jar",
+                    )))
+            }),
+            // A later failure must not replace an earlier one, and the order
+            // the selection met them is part of the answer.
+            ("completeness.read_then_limit", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactRead(PathBuf::from(
+                        "x.jar",
+                    )));
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactLimit);
+            }),
+            ("completeness.limit_then_read", |s| {
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactLimit);
+                s.completeness
+                    .record(ExternalSelectionFailure::ArtifactRead(PathBuf::from(
+                        "x.jar",
+                    )));
+            }),
+            ("inputs.explicit_paths", |s| s.inputs.explicit_paths.clear()),
+            ("inputs.repository_roots.order", |s| {
+                s.inputs.repository_roots.reverse()
+            }),
+            ("inputs.gradle_cache_roots", |s| {
+                s.inputs.gradle_cache_roots.clear()
+            }),
+            ("inputs.home", |s| s.inputs.home = None),
+            ("inputs.userprofile", |s| {
+                s.inputs.userprofile = Some(OsString::from("p"))
+            }),
+            ("inputs.gradle_user_home", |s| {
+                s.inputs.gradle_user_home = Some(OsString::from("g"))
+            }),
+            ("inputs.coordinates", |s| {
+                s.inputs.coordinates.pop();
+            }),
+            ("inputs.partial_manifests", |s| {
+                s.inputs.partial_manifests.clear()
+            }),
+            ("inputs.resolution_steps.operation", |s| {
+                s.inputs.resolution_steps[0].operation = ExternalProbeOperation::File
+            }),
+            ("inputs.resolution_steps.path", |s| {
+                s.inputs.resolution_steps[0].path = PathBuf::from("elsewhere")
+            }),
+            ("inputs.artifact_probes.order", |s| {
+                s.inputs.artifact_probes.reverse()
+            }),
+            ("productions.order", |s| s.productions.reverse()),
+            ("productions.dependency", |s| {
+                s.productions[0].0.id = "three".into()
+            }),
+            ("productions.artifact.role", |s| {
+                s.productions[0].1[0].role = DependencyArtifactRole::Runtime
+            }),
+            ("productions.artifact.kind", |s| {
+                s.productions[0].1[0].kind = ExternalArtifactKind::JavaSourceJar
+            }),
+            ("productions.artifact.module", |s| {
+                s.productions[0].1[0].module = None
+            }),
+            ("productions.artifact.sha256", |s| {
+                s.productions[0].1[0].sha256 = "t".repeat(64)
+            }),
+            ("productions.key", |s| s.productions[0].2 = None),
+            ("productions.key.producer_version", |s| {
+                s.productions[0].2 = Some(
+                    brokk_bifrost_semantic::analyzer::semantic_model::catalog::GeneratedProductionKey::new(
+                        "a".repeat(64), "producer", "2", 22,
+                    )
+                    .unwrap(),
+                )
+            }),
+        ];
+        let base = codec_test_selection().answer_digest(true, true);
+        let mut seen = std::collections::HashMap::new();
+        for (name, mutate) in mutations {
+            let mut changed = codec_test_selection();
+            mutate(&mut changed);
+            let changed = changed.answer_digest(true, true);
+            assert_ne!(base, changed, "{name} does not reach the digest");
+            if let Some(other) = seen.insert(changed, *name) {
+                panic!("{name} and {other} give the same digest");
+            }
+        }
+    }
+
+    #[test]
+    fn every_jdk_field_reaches_the_digest() {
+        type Mutation = (&'static str, fn(&mut SelectedJdk));
+        let mutations: &[Mutation] = &[
+            ("java_home", |j| j.inputs.java_home = None),
+            ("candidates.order", |j| j.inputs.candidates.reverse()),
+            ("candidates.configured", |j| j.inputs.candidates[1].1 = true),
+            ("candidates.path", |j| {
+                j.inputs.candidates[0].0 = PathBuf::from("/other")
+            }),
+            ("probes.outcome", |j| {
+                j.inputs.probes[0].outcome = ExternalProbeOutcome::Absent
+            }),
+            ("probes.operation", |j| {
+                j.inputs.probes[0].operation = ExternalProbeOperation::List
+            }),
+            ("complete", |j| j.inputs.complete = false),
+            ("dependencies.order", |j| j.dependencies.reverse()),
+            ("dependencies.id", |j| j.dependencies[0].id = "other".into()),
+            ("dependencies.artifact.kind", |j| {
+                j.dependencies[0].artifacts[0].kind = ExternalArtifactKind::JdkJmodSet
+            }),
+            ("dependencies.scope", |j| {
+                j.dependencies[0].scope =
+                    brokk_bifrost_analysis::analyzer::topology::DependencyScope::Test
+            }),
+        ];
+        let base = codec_test_jdk().answer_digest(true, false);
+        let mut seen = std::collections::HashMap::new();
+        for (name, mutate) in mutations {
+            let mut changed = codec_test_jdk();
+            mutate(&mut changed);
+            let changed = changed.answer_digest(true, false);
+            assert_ne!(base, changed, "{name} does not reach the digest");
+            if let Some(other) = seen.insert(changed, *name) {
+                panic!("{name} and {other} give the same digest");
+            }
+        }
+    }
+
+    /// Where order is not part of the answer, equal selections built in
+    /// different input orders give equal digests.
+    #[test]
+    fn set_valued_selection_inputs_hash_independent_of_order() {
+        let base = codec_test_selection().answer_digest(true, true);
+        let mut reordered = codec_test_selection();
+        reordered.inputs.coordinates.reverse();
+        reordered.inputs.partial_manifests.reverse();
+        assert_eq!(base, reordered.answer_digest(true, true));
+    }
 
     use crate::analyzer::jvm::external::python_test_support::*;
 
     use crate::analyzer::jvm::external::*;
+    use brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads;
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ExternalDiscoveryRead, UnverifiableDiscoveryRead,
+    };
+
+    #[test]
+    fn jvm_coordinate_discovery_refuses_external_carry() {
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let mut config = JvmAnalyzerConfig::default();
+        config.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
+        config
+            .external_dependencies
+            .coordinates
+            .push(JvmMavenCoordinate {
+                group_id: "example".into(),
+                artifact_id: "missing".into(),
+                version: "1".into(),
+            });
+        config.external_dependencies.repository_roots = vec![root.path().join("repository")];
+        config.external_dependencies.gradle_cache_roots = vec![root.path().join("gradle")];
+        let (_, reads) = capture_external_discovery_reads(|| {
+            resolve_jvm_semantic_pack_dependencies(
+                &config,
+                &project,
+                &test_digests(),
+                &DependencyPackLimits::default(),
+                None,
+            )
+        });
+        assert!(!reads.complete);
+        assert!(reads.keys.iter().any(|read| matches!(
+            read,
+            ExternalDiscoveryRead::Unverifiable(UnverifiableDiscoveryRead::ExternalCacheWalk)
+        )));
+    }
 
     use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
 
@@ -6464,13 +9645,23 @@ mod tests {
         let analyzer = JavaAnalyzer::from_project(TestProject::new(root.path(), Language::Java));
         let active = Arc::new(active);
         let overlay = Arc::new(
-            SemanticModelOverlay::build(&analyzer, &active, &cancellation, 64 << 20)
-                .expect("fixture overlay"),
+            SemanticModelOverlay::build(
+                &analyzer,
+                &active,
+                &cancellation,
+                64 << 20,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .expect("fixture overlay"),
         );
         let artifacts = JvmExternalDeclarationIndex::default();
         let surface = JvmExternalDeclarations::new(&artifacts, Some(overlay));
+        let gaps = std::cell::RefCell::new(Vec::new());
+        let recorder = QueryGapRecorder::collecting(&gaps);
         let member = surface
-            .resolve_member_spelling("example.Overloads.pick", "client", |name| surface.get(name))
+            .resolve_member_spelling(&recorder, "example.Overloads.pick", "client", |name| {
+                surface.get(&recorder, name)
+            })
             .expect("the public overload remains visible");
         assert_eq!(
             member.applicable_parameter_count_for_argument_types(
@@ -6637,7 +9828,12 @@ mod tests {
             );
         }
         assert_eq!(
-            member.non_overridable_for_argument_types(false, &[named("java.lang.String")], None),
+            member.non_overridable_for_argument_types(
+                false,
+                &[named("java.lang.String")],
+                None,
+                None
+            ),
             None,
             "selection must not fabricate independent finality evidence"
         );
@@ -6672,6 +9868,7 @@ mod tests {
                 parameter_count: 0,
                 parameters: Vec::new(),
                 has_type_parameters: false,
+                type_parameters: Vec::new(),
                 is_static: true,
                 variadic: false,
                 returns: Some(returned.clone()),
@@ -6728,6 +9925,48 @@ mod tests {
         assert_ne!(identities[0], identities[1]);
     }
 
+    fn missing_dependency_gap(coordinate: &str) -> IndexGap {
+        IndexGap::from_discovery(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Error,
+            code: super::super::producer_codes::JVM_DEPENDENCY_UNRESOLVED
+                .code
+                .to_owned(),
+            dependency_id: Some(coordinate.to_owned()),
+            location: None,
+            message: "the artifact is not in any configured repository".to_owned(),
+        })
+    }
+
+    /// Two indexes with the same types and different missing sets must have
+    /// different dispatch identities: an ICFG-keyed product computed where a
+    /// lookup was complete would otherwise be reused where that lookup must be
+    /// partial, and a reused partial answer would name the wrong jar. The
+    /// coordinate is part of the identity, not only the attribution.
+    #[test]
+    fn dispatch_identity_follows_the_missing_set_when_the_types_are_the_same() {
+        let identity = |coordinates: &[&str]| {
+            let mut index = JvmExternalDeclarationIndex::build_from_artifacts(Vec::new());
+            index.production_diagnostics.extend(
+                coordinates
+                    .iter()
+                    .map(|coordinate| missing_dependency_gap(coordinate)),
+            );
+            index.dispatch_behavior_identity()
+        };
+        let none = identity(&[]);
+        let a = identity(&["org.example:a:1"]);
+        let b = identity(&["org.example:b:1"]);
+        let ab = identity(&["org.example:a:1", "org.example:b:1"]);
+        let ba = identity(&["org.example:b:1", "org.example:a:1"]);
+        let all = [none, a, b, ab];
+        for (i, left) in all.iter().enumerate() {
+            for right in &all[i + 1..] {
+                assert_ne!(left, right, "{all:?}");
+            }
+        }
+        assert_eq!(ab, ba, "the digest sorts the missing set");
+    }
+
     #[test]
     #[hardwon(
         "#3422: Checks missing toolchain diagnostics include actionable configuration guidance"
@@ -6735,7 +9974,7 @@ mod tests {
     fn missing_jdk_discovery_explains_how_to_activate_stdlib_packs() {
         let config = JvmAnalyzerConfig::default();
         let root = tempfile::tempdir().expect("temp root");
-        let discovery = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+        let discovery = discover_and_pin_jdk(&config, root.path(), None, &test_digests());
 
         let diagnostic = discovery
             .diagnostics
@@ -6821,15 +10060,20 @@ mod tests {
             "SELECT callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn='com.example.probe.Registry'",
             [provider], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
         assert_eq!(coverage, (true, true, true, true));
+        let gaps = std::cell::RefCell::new(Vec::new());
         let declared = JvmExternalDeclarations::new(stored.as_ref(), None)
-            .resolve_member_spelling("com.example.probe.Registry.register", "app", |owner| {
-                stored.get(owner).cloned()
-            })
+            .resolve_member_spelling(
+                &QueryGapRecorder::collecting(&gaps),
+                "com.example.probe.Registry.register",
+                "app",
+                |owner| stored.get(owner).cloned(),
+            )
             .unwrap();
         let identity = declared
             .direct_inventory_identity_for_argument_types(
                 false,
                 &[TypeRef::named("java.lang.String")],
+                None,
                 None,
             )
             .expect("direct overload has its durable member coordinate");
@@ -6844,9 +10088,16 @@ mod tests {
             index.get("com.example.probe.Registry").is_some(),
             "the type half still indexes the owner"
         );
-        let owner = |spelling: &str| surface.resolve_qualified_name(spelling, "app");
+        let gaps = std::cell::RefCell::new(Vec::new());
+        let recorder = QueryGapRecorder::collecting(&gaps);
+        let owner = |spelling: &str| surface.resolve_qualified_name(&recorder, spelling, "app");
         let member = surface
-            .resolve_member_spelling("com.example.probe.Registry.register", "app", owner)
+            .resolve_member_spelling(
+                &recorder,
+                "com.example.probe.Registry.register",
+                "app",
+                owner,
+            )
             .expect("the class jar declares the member");
         assert_eq!(member.fqn(), "com.example.probe.Registry.register");
 
@@ -6854,7 +10105,7 @@ mod tests {
         // a reference spells it through the subclass exactly as it spells a
         // declared member.
         let inherited = surface
-            .resolve_member_spelling("com.example.probe.Registry.reset", "app", owner)
+            .resolve_member_spelling(&recorder, "com.example.probe.Registry.reset", "app", owner)
             .expect("the base class in the same jar declares the member");
         assert_eq!(inherited.fqn(), "com.example.probe.BaseRegistry.reset");
 
@@ -6862,13 +10113,23 @@ mod tests {
         // decided, and the spelling stays exactly as unknown as before.
         assert!(
             surface
-                .resolve_member_spelling("com.example.probe.Registry.absent", "app", owner)
+                .resolve_member_spelling(
+                    &recorder,
+                    "com.example.probe.Registry.absent",
+                    "app",
+                    owner
+                )
                 .is_none()
         );
         // An owner nothing indexed answers nothing at all.
         assert!(
             surface
-                .resolve_member_spelling("com.example.probe.Missing.register", "app", owner)
+                .resolve_member_spelling(
+                    &recorder,
+                    "com.example.probe.Missing.register",
+                    "app",
+                    owner
+                )
                 .is_none()
         );
         // A class the index deliberately publishes for nobody -- the private
@@ -6913,11 +10174,16 @@ mod tests {
                 .is_none(),
             "a refused entry declares no member surface"
         );
+        let gaps = std::cell::RefCell::new(Vec::new());
+        let recorder = QueryGapRecorder::collecting(&gaps);
         assert!(
             surface
-                .resolve_member_spelling("com.example.probe.Registry.register", "app", |spelling| {
-                    surface.resolve_qualified_name(spelling, "app")
-                })
+                .resolve_member_spelling(
+                    &recorder,
+                    "com.example.probe.Registry.register",
+                    "app",
+                    |spelling| surface.resolve_qualified_name(&recorder, spelling, "app")
+                )
                 .is_none()
         );
         let diagnostics = index.production_diagnostics();
@@ -6987,11 +10253,16 @@ mod tests {
             index.get("com.example.probe.Registry").is_some(),
             "the type half still indexes the owner; only members were bounded"
         );
+        let gaps = std::cell::RefCell::new(Vec::new());
+        let recorder = QueryGapRecorder::collecting(&gaps);
         assert!(
             surface
-                .resolve_member_spelling("com.example.probe.Registry.register", "app", |spelling| {
-                    surface.resolve_qualified_name(spelling, "app")
-                })
+                .resolve_member_spelling(
+                    &recorder,
+                    "com.example.probe.Registry.register",
+                    "app",
+                    |spelling| surface.resolve_qualified_name(&recorder, spelling, "app")
+                )
                 .is_none(),
             "the member fell past the per-artifact bound"
         );
@@ -7001,6 +10272,41 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "limit.artifact_members"),
             "a bounded member read must be recorded, not look complete: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn jdk_suppression_does_not_change_dependency_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let project = TestProject::new(root.path(), Language::Java);
+        let mut config = JvmAnalyzerConfig::default();
+        config.standard_library_discovery.discover_java_home = false;
+        let select = |config: &JvmAnalyzerConfig| {
+            JvmExternalDeclarationIndex::select_external_inventory(
+                config,
+                &project,
+                &LiveDiscoveryInputs(&project),
+                |_| Ok::<_, std::convert::Infallible>(()),
+            )
+            .unwrap()
+        };
+        let baseline = select(&config);
+        config.standard_library_discovery.jdk_homes = (0..=DependencyPackLimits::default()
+            .max_diagnostics)
+            .map(|index| root.path().join(format!("absent-jdk-{index}")))
+            .collect();
+        let discovery = resolve_jvm_semantic_pack_dependencies_unpinned(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert!(discovery.suppressed_diagnostics.total() > 0);
+        let selection = select(&config);
+        assert!(selection.completeness.is_complete());
+        assert_eq!(
+            baseline.answer_digest(true, false),
+            selection.answer_digest(true, false)
         );
     }
 
@@ -7056,7 +10362,13 @@ mod tests {
         };
         let limits = DependencyPackLimits::default();
 
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
 
         assert!(discovered.complete, "{:#?}", discovered.diagnostics);
         assert_eq!(discovered.dependencies.len(), 1);
@@ -7095,7 +10407,13 @@ mod tests {
             CatalogOptions::default(),
         )
         .unwrap();
-        let again = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let again = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         let reused = prepare_dependency_semantic_packs(
             &catalog,
             &JvmDependencyPackAdapter,
@@ -7109,6 +10427,36 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(reused.profile.artifacts_read, 0);
         assert_eq!(reused.packs[0].evidence, prepared.packs[0].evidence);
+
+        let selected =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        let expectations = selected.catalog_expectations();
+        let brokk_bifrost_analysis::analyzer::semantic_model::catalog::ExpectedCatalogEntry::Production {
+            production_digest,
+        } = &expectations[0] else {
+            panic!("a pinned JDK expects the production keyed by its content digests");
+        };
+        assert_eq!(
+            production_digest,
+            prepared.packs[0].production.key.production_digest()
+        );
+        let reader = catalog
+            .pinned_jvm_reader(
+                &expectations,
+                brokk_bifrost_analysis::CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(reader.membership[0].ordinal, 0);
+        assert_eq!(
+            reader.membership[0].status,
+            brokk_bifrost_analysis::analyzer::semantic_model::catalog::PinnedCatalogStatus::Present
+        );
+        assert_eq!(
+            reader.membership[0].production_digest.as_deref(),
+            Some(prepared.packs[0].production.key.production_digest())
+        );
+        drop(reader);
 
         // Cross the generated source-archive, compiler, activation, and SQLite
         // inventory boundary, including overloads and repeat publication.
@@ -7189,14 +10537,17 @@ mod tests {
                 &active,
                 &CancellationToken::default(),
                 128 * 1024 * 1024,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
             )
             .unwrap(),
         );
         let index = JvmExternalDeclarationIndex::default();
         let declarations = JvmExternalDeclarations::new(&index, Some(overlay));
+        let gaps = std::cell::RefCell::new(Vec::new());
+        let recorder = QueryGapRecorder::collecting(&gaps);
         let member = declarations
-            .resolve_member_spelling("java.lang.Object.echo", "app", |owner| {
-                declarations.resolve_qualified_name(owner, "app")
+            .resolve_member_spelling(&recorder, "java.lang.Object.echo", "app", |owner| {
+                declarations.resolve_qualified_name(&recorder, owner, "app")
             })
             .unwrap();
         let string = TypeRef::Named {
@@ -7210,10 +10561,10 @@ mod tests {
             nullable: false,
         };
         let string_identity = member
-            .inventory_identity_for_argument_types(&active, true, &[string], None)
+            .inventory_identity_for_argument_types(&active, true, &[string], None, None)
             .unwrap();
         let integer_identity = member
-            .inventory_identity_for_argument_types(&active, true, &[integer], None)
+            .inventory_identity_for_argument_types(&active, true, &[integer], None, None)
             .unwrap();
         assert_eq!(string_identity.owner, integer_identity.owner);
         assert_ne!(
@@ -7319,7 +10670,13 @@ mod tests {
             ..JvmAnalyzerConfig::default()
         };
         let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         assert!(discovered.complete, "{:#?}", discovered.diagnostics);
         assert_eq!(discovered.dependencies.len(), 2);
         assert_ne!(
@@ -7631,7 +10988,13 @@ mod tests {
             ..JvmAnalyzerConfig::default()
         };
         let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         assert!(discovered.complete, "{:#?}", discovered.diagnostics);
         assert_eq!(discovered.dependencies.len(), 1);
         assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
@@ -7675,7 +11038,7 @@ mod tests {
                 ),
             ],
         );
-        let source_discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+        let source_discovered = discover_and_pin_jdk(&config, root.path(), None, &test_digests());
         assert_eq!(source_discovered.dependencies[0].artifacts.len(), 2);
         assert_eq!(
             source_discovered.dependencies[0].artifacts[0].kind,
@@ -7699,13 +11062,14 @@ mod tests {
     /// catalog instead of reading the JMOD set again (#3429).
     ///
     /// Reading every JMOD of a real JDK is the whole cost of a
-    /// zero-configuration JDK pack, and the pack is identified by the release
-    /// digest plus each selected archive's path, length, and modification time.
-    /// The catalog is reopened between the two preparations, so only what the
-    /// first process wrote to disk can serve the second.
-    #[hardwon("#3006: jdk jmod set source identity serves a second production without reading")]
+    /// zero-configuration JDK pack. Selection pins the set to its framed
+    /// content digest, and the pack is found under the production key those
+    /// pins form, so the second preparation captures nothing. The catalog is
+    /// reopened between the two preparations, so only what the first process
+    /// wrote to disk can serve the second.
+    #[hardwon("#3006: a jdk jmod set serves a second production without reading")]
     #[test]
-    fn jdk_jmod_set_source_identity_serves_a_second_production_without_reading() {
+    fn jdk_jmod_set_pin_serves_a_second_production_without_reading() {
         use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode;
 
         use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
@@ -7717,12 +11081,19 @@ mod tests {
         use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
 
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("jdk-21");
+        // Pinning requires the canonical path (macOS temp roots sit under a /var link).
+        let home = root.path().canonicalize().unwrap().join("jdk-21");
         write_test_jdk_jmods(&home, &["java.sql.jmod"]);
         let config = test_jdk_config(&home);
         let project = TestProject::new(root.path(), Language::Java);
         let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         assert!(discovered.complete, "{:#?}", discovered.diagnostics);
         assert_eq!(discovered.dependencies.len(), 1);
         assert_eq!(
@@ -7761,7 +11132,13 @@ mod tests {
             CatalogOptions::default(),
         )
         .unwrap();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         let second = prepare_dependency_semantic_packs(
             &catalog,
             &JvmDependencyPackAdapter,
@@ -7780,6 +11157,41 @@ mod tests {
         );
         assert_eq!(first.packs[0].production, second.packs[0].production);
         assert_eq!(first.evidence, second.evidence);
+        let selected =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        let reader = catalog
+            .pinned_jvm_reader(
+                &selected.catalog_expectations(),
+                brokk_bifrost_analysis::CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            reader.membership[0].status,
+            brokk_bifrost_analysis::analyzer::semantic_model::catalog::PinnedCatalogStatus::Present
+        );
+        drop(reader);
+        // A pack installed for other bytes is not matched: the expectation is
+        // the production key of the digest the current files give, even when
+        // the replacement has the same name and length.
+        let mut other = fs::read(home.join("jmods/java.sql.jmod")).unwrap();
+        other[0] ^= 0xff;
+        fs::write(home.join("jmods/java.sql.jmod"), other).unwrap();
+        let changed =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        let reader = catalog
+            .pinned_jvm_reader(
+                &changed.catalog_expectations(),
+                brokk_bifrost_analysis::CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(reader.membership.len(), 1);
+        assert_eq!(reader.membership[0].ordinal, 0);
+        assert_eq!(
+            reader.membership[0].status,
+            brokk_bifrost_analysis::analyzer::semantic_model::catalog::PinnedCatalogStatus::Missing
+        );
     }
 
     /// A JDK whose selected JMOD set changed is a different JDK: its packs are
@@ -7799,7 +11211,7 @@ mod tests {
         use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
 
         let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("jdk-21");
+        let home = root.path().canonicalize().unwrap().join("jdk-21");
         write_test_jdk_jmods(&home, &["java.sql.jmod"]);
         let config = test_jdk_config(&home);
         let project = TestProject::new(root.path(), Language::Java);
@@ -7811,7 +11223,13 @@ mod tests {
             CatalogOptions::default(),
         )
         .unwrap();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         let first = prepare_dependency_semantic_packs(
             &catalog,
             &JvmDependencyPackAdapter,
@@ -7833,7 +11251,13 @@ mod tests {
             CatalogOptions::default(),
         )
         .unwrap();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         assert_eq!(discovered.dependencies.len(), 1);
         let second = prepare_dependency_semantic_packs(
             &catalog,
@@ -7853,6 +11277,511 @@ mod tests {
             first.packs[0].production.key.input_digest(),
             second.packs[0].production.key.input_digest()
         );
+    }
+
+    /// Selection and capture are two implementations of one frame: the pin
+    /// selection streams from the opened files must equal the digest capture
+    /// reports for the same set, and the production key built from the pins
+    /// must equal the key built from the captured bytes.
+    #[test]
+    fn the_selection_pin_equals_the_digest_capture_computes() {
+        use brokk_bifrost_semantic::analyzer::semantic_model::dependency::{
+            generated_production_key, pinned_generated_production_key,
+        };
+        use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_source_set_seekable_while;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap().join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod", "java.logging.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
+        let dependency = &discovered.dependencies[0];
+        let artifact = &dependency.artifacts[0];
+        let ResolvedDependencyArtifactInput::SourceSet {
+            root: set_root,
+            relative_paths,
+        } = &artifact.input
+        else {
+            panic!("a JDK without sources selects its JMOD set");
+        };
+        let exact = read_exact_source_set_seekable_while(
+            set_root,
+            relative_paths,
+            512,
+            limits.max_source_path_depth,
+            limits.max_total_artifact_bytes,
+            &limits.producer,
+            || false,
+        )
+        .unwrap();
+        assert_eq!(artifact.expected_sha256.as_deref(), Some(exact.sha256()));
+        assert!(artifact.source_identity.is_none());
+        let from_pins =
+            pinned_generated_production_key(&JvmDependencyPackAdapter, dependency, &limits)
+                .unwrap()
+                .expect("a pinned JDK produces");
+        let from_bytes = generated_production_key(
+            &JvmDependencyPackAdapter,
+            dependency,
+            &[ExactDependencyArtifact {
+                role: artifact.role,
+                kind: artifact.kind,
+                module: None,
+                artifact: exact,
+            }],
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(from_pins.production_digest, from_bytes.production_digest);
+    }
+
+    /// A JMOD swapped for other bytes of the same length between selection and
+    /// capture must not be parsed under the pin selection computed.
+    #[hardwon(
+        "#9559: a JMOD replaced between JDK listing and capture could be parsed under a selection that bound only its metadata"
+    )]
+    #[test]
+    fn a_jmod_replaced_between_selection_and_capture_fails_the_pin() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOpenMode;
+        use brokk_bifrost_analysis::analyzer::semantic_model::CatalogOptions;
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
+        use brokk_bifrost_analysis::analyzer::semantic_model::dependency::prepare_dependency_semantic_packs;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap().join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let selected =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        let jmod = home.join("jmods/java.sql.jmod");
+        let modified = fs::metadata(&jmod).unwrap().modified().unwrap();
+        let mut replacement = fs::read(&jmod).unwrap();
+        replacement[0] ^= 0xff;
+        fs::write(&jmod, &replacement).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&jmod)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+
+        let catalog = SemanticPackCatalog::open(
+            &root.path().join("catalog"),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &selected.dependencies,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(prepared.packs.is_empty(), "{:#?}", prepared.packs);
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "artifact.digest_changed"),
+            "{:#?}",
+            prepared.diagnostics
+        );
+        // No answer certified for the old bytes describes the new ones: a
+        // fresh selection pins the replacement, and its answer differs.
+        let fresh =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        assert_ne!(
+            selected.answer_digest(true, true),
+            fresh.answer_digest(true, true)
+        );
+    }
+
+    /// A second selection of an unchanged, old JDK streams nothing: the
+    /// store-owned cache serves its digests. Files younger than the cache's
+    /// racy window, and filesystems outside its allowlist, are hashed every time.
+    #[test]
+    fn a_second_selection_of_an_unchanged_jdk_does_not_hash_again() {
+        use brokk_bifrost_core::content_digest::on_trusted_local_file_system;
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let home = root_path.join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(&root_path, Language::Java);
+        let digests = test_digests();
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        let computed = || JDK_DIGEST_COMPUTATIONS.get();
+        let before = computed();
+        let first =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &digests, None).unwrap();
+        assert_eq!(computed() - before, 1, "the JMOD set is hashed once");
+        let second =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &digests, None).unwrap();
+        let expected_second = if on_trusted_local_file_system(&home.join("jmods")) {
+            0
+        } else {
+            1
+        };
+        assert_eq!(computed() - before - 1, expected_second);
+        assert_eq!(
+            first.answer_digest(true, true),
+            second.answer_digest(true, true)
+        );
+        // Changing a member invalidates it.
+        let jmod = home.join("jmods/java.sql.jmod");
+        let mut other = fs::read(&jmod).unwrap();
+        other[0] ^= 0xff;
+        fs::write(&jmod, other).unwrap();
+        let before = computed();
+        let third =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &digests, None).unwrap();
+        assert_eq!(computed() - before, 1);
+        assert_ne!(
+            first.answer_digest(true, true),
+            third.answer_digest(true, true)
+        );
+    }
+
+    /// Only the paths that consume the pins hash the JDK: activation and the
+    /// JDK question. The external declaration index and the dependencies
+    /// question read the dependency list and diagnostics, never a pin, so they
+    /// compute no JDK digest. Each path gets a fresh cache, so a miss is
+    /// certain whether or not the file system is one the cache trusts.
+    #[test]
+    fn only_activation_and_the_jdk_question_hash_the_jdk() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let home = root_path.join("jdk-21");
+        write_test_jdk_jmods(&home, &["java.sql.jmod"]);
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(&root_path, Language::Java);
+        let computed = || JDK_DIGEST_COMPUTATIONS.get();
+
+        let before = computed();
+        let index = JvmExternalDeclarationIndex::build_for_project(&config, &project);
+        assert_eq!(computed() - before, 0, "the index build hashes no JDK");
+        assert!(
+            index.production_diagnostics.is_empty(),
+            "{:?}",
+            index.production_diagnostics
+        );
+
+        let before = computed();
+        JvmExternalDeclarationIndex::select_external_inventory::<std::convert::Infallible>(
+            &config,
+            &project,
+            &LiveDiscoveryInputs(&project),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            computed() - before,
+            0,
+            "the dependencies question hashes no JDK"
+        );
+
+        let before = computed();
+        let activation = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &DependencyPackLimits::default(),
+            None,
+        );
+        assert_eq!(computed() - before, 1, "activation pins the JMOD set");
+        assert!(
+            activation.dependencies[0].artifacts[0]
+                .expected_sha256
+                .is_some()
+        );
+
+        let before = computed();
+        let jdk = JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+            .unwrap();
+        assert_eq!(computed() - before, 1, "the JDK question pins the JMOD set");
+        assert!(jdk.every_artifact_pinned());
+    }
+
+    /// A member that cannot be hashed leaves its artifact unpinned and records
+    /// an unreadable probe for that member, even when it vanished (NotFound),
+    /// because a selected input that was not read is not an absent one.
+    #[test]
+    fn an_unhashable_member_records_an_unreadable_probe_and_no_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("jmods/a.jmod"), b"a").unwrap();
+        let mut dependency = resolved_jdk_dependency(JdkVersion::parse("21.0.8").unwrap(), None);
+        dependency.artifacts = vec![ResolvedDependencyArtifact::source_set(
+            DependencyArtifactRole::Binary,
+            ExternalArtifactKind::JdkJmodSet,
+            home.clone(),
+            vec![
+                PathBuf::from("jmods/a.jmod"),
+                PathBuf::from("jmods/vanished.jmod"),
+            ],
+        )];
+        let mut probes = Vec::new();
+        assert!(
+            pin_jdk_artifacts(
+                &mut dependency,
+                &test_digests(),
+                &DependencyPackLimits::default(),
+                None,
+                &mut probes,
+                &mut 0,
+            )
+            .is_continue()
+        );
+        assert!(dependency.artifacts[0].expected_sha256.is_none());
+        assert_eq!(probes.len(), 1, "{probes:?}");
+        assert_eq!(probes[0].path, home.join("jmods/vanished.jmod"));
+        assert!(matches!(
+            probes[0].outcome,
+            ExternalProbeOutcome::Unreadable
+        ));
+    }
+
+    /// Capture requires a pinned path to be its own canonical path, so a
+    /// symlinked source archive (Debian installs one) stays on its metadata
+    /// identity, unpinned, and the JDK answer stays uncertified.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_source_archive_stays_unpinned() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let home = root_path.join("jdk-21");
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(root_path.join("real-src.zip"), b"archive").unwrap();
+        std::os::unix::fs::symlink(root_path.join("real-src.zip"), home.join("lib/src.zip"))
+            .unwrap();
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(&root_path, Language::Java);
+        let selected =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        assert!(selected.inputs.complete);
+        let artifact = &selected.dependencies[0].artifacts[0];
+        assert_eq!(artifact.kind, ExternalArtifactKind::JdkSourceZip);
+        assert_eq!(artifact.path(), home.join("lib/src.zip").as_path());
+        assert!(artifact.expected_sha256.is_none());
+        assert!(!selected.every_artifact_pinned());
+    }
+
+    /// A JDK with JMODs and a symlinked `src.zip` (Debian) must not be half
+    /// pinned: the catalog expectation wants the pinned key only for a fully
+    /// pinned dependency, so pinning the JMOD set alone would expect a missing
+    /// production and make the reader refuse every active shard. The whole
+    /// dependency keeps its metadata identity and the answer stays uncertified.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_source_archive_leaves_the_whole_jdk_unpinned() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::ExpectedCatalogEntry;
+
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let home = root_path.join("jdk-21");
+        fs::create_dir_all(home.join("lib")).unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"jmod bytes").unwrap();
+        fs::write(root_path.join("real-src.zip"), b"archive").unwrap();
+        std::os::unix::fs::symlink(root_path.join("real-src.zip"), home.join("lib/src.zip"))
+            .unwrap();
+        let config = test_jdk_config(&home);
+        let project = TestProject::new(&root_path, Language::Java);
+        let selected =
+            JvmExternalDeclarationIndex::select_jdk(&config, &project, &test_digests(), None)
+                .unwrap();
+        assert!(selected.inputs.complete);
+        let artifacts = &selected.dependencies[0].artifacts;
+        assert_eq!(artifacts.len(), 2, "{artifacts:?}");
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| artifact.expected_sha256.is_none()
+                    && artifact.source_identity.is_some()),
+            "{artifacts:?}"
+        );
+        assert!(!selected.every_artifact_pinned());
+        let expectations = selected.catalog_expectations();
+        assert!(
+            matches!(
+                expectations.as_slice(),
+                [ExpectedCatalogEntry::SourceIdentity {
+                    source_identity: Some(_),
+                    ..
+                }]
+            ),
+            "{expectations:?}"
+        );
+    }
+
+    /// An artifact over a producer limit is not pinned, and nothing is hashed
+    /// for it or for the other artifacts of its dependency.
+    #[test]
+    fn an_artifact_over_the_producer_limit_is_not_hashed() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("jmods/a.jmod"), b"a").unwrap();
+        fs::write(home.join("src.zip"), b"eight by").unwrap();
+        let mut dependency = resolved_jdk_dependency(JdkVersion::parse("21.0.8").unwrap(), None);
+        dependency.artifacts = vec![
+            ResolvedDependencyArtifact::source_set(
+                DependencyArtifactRole::Binary,
+                ExternalArtifactKind::JdkJmodSet,
+                home.clone(),
+                vec![PathBuf::from("jmods/a.jmod")],
+            ),
+            ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Sources,
+                ExternalArtifactKind::JdkSourceZip,
+                home.join("src.zip"),
+            ),
+        ];
+        let mut limits = DependencyPackLimits::default();
+        limits.producer.max_artifact_bytes = 4;
+        let before = JDK_DIGEST_COMPUTATIONS.get();
+        let mut probes = Vec::new();
+        assert!(
+            pin_jdk_artifacts(
+                &mut dependency,
+                &test_digests(),
+                &limits,
+                None,
+                &mut probes,
+                &mut 0
+            )
+            .is_continue()
+        );
+        assert_eq!(JDK_DIGEST_COMPUTATIONS.get() - before, 0);
+        assert!(probes.is_empty(), "{probes:?}");
+        assert!(
+            dependency
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.expected_sha256.is_none())
+        );
+
+        // Within the limits, the same dependency pins every artifact.
+        assert!(
+            pin_jdk_artifacts(
+                &mut dependency,
+                &test_digests(),
+                &DependencyPackLimits::default(),
+                None,
+                &mut probes,
+                &mut 0,
+            )
+            .is_continue()
+        );
+        assert!(
+            dependency
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.expected_sha256.is_some())
+        );
+    }
+
+    /// Pinning observes the discovery's cancellation: a token cancelled before
+    /// pinning breaks it and sets no pin, even when the digest cache could
+    /// serve every artifact without a read.
+    #[test]
+    fn a_cancelled_token_stops_pinning() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("jmods/a.jmod"), b"a").unwrap();
+        let mut dependency = resolved_jdk_dependency(JdkVersion::parse("21.0.8").unwrap(), None);
+        dependency.artifacts = vec![ResolvedDependencyArtifact::source_set(
+            DependencyArtifactRole::Binary,
+            ExternalArtifactKind::JdkJmodSet,
+            home.clone(),
+            vec![PathBuf::from("jmods/a.jmod")],
+        )];
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut probes = Vec::new();
+        assert!(
+            pin_jdk_artifacts(
+                &mut dependency,
+                &test_digests(),
+                &DependencyPackLimits::default(),
+                Some(&token),
+                &mut probes,
+                &mut 0,
+            )
+            .is_break()
+        );
+        assert!(dependency.artifacts[0].expected_sha256.is_none());
+        assert!(probes.is_empty(), "{probes:?}");
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#9559: JDK pinning reset its byte budget per dependency")]
+    fn jdk_pinning_budget_spans_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let mut dependencies = Vec::new();
+        for name in ["first.zip", "second.zip", "small.zip"] {
+            fs::write(
+                home.join(name),
+                if name == "small.zip" {
+                    &b"x"[..]
+                } else {
+                    &b"four"[..]
+                },
+            )
+            .unwrap();
+            let mut dependency =
+                resolved_jdk_dependency(JdkVersion::parse("21.0.8").unwrap(), None);
+            dependency.artifacts = vec![ResolvedDependencyArtifact::file(
+                DependencyArtifactRole::Sources,
+                ExternalArtifactKind::JdkSourceZip,
+                home.join(name),
+            )];
+            dependencies.push(dependency);
+        }
+        let limits = DependencyPackLimits {
+            max_total_artifact_bytes: 5,
+            ..Default::default()
+        };
+        let digests = test_digests();
+        let mut total = 0;
+        let mut probes = Vec::new();
+        for (index, dependency) in dependencies.iter_mut().enumerate() {
+            let before = JDK_DIGEST_COMPUTATIONS.get();
+            assert!(
+                pin_jdk_artifacts(dependency, &digests, &limits, None, &mut probes, &mut total)
+                    .is_continue()
+            );
+            assert_eq!(
+                dependency.artifacts[0].expected_sha256.is_some(),
+                index != 1
+            );
+            assert_eq!(
+                JDK_DIGEST_COMPUTATIONS.get() - before,
+                usize::from(index != 1)
+            );
+        }
+        assert_eq!(total, 5);
     }
 
     fn test_jdk_config(home: &Path) -> JvmAnalyzerConfig {
@@ -7906,10 +11835,11 @@ mod tests {
         fs::write(home.join("jmods/java.base.jmod"), b"exact binary input").unwrap();
         let config = JvmAnalyzerConfig::default();
 
-        let discovered = discover_jdk_semantic_pack_dependencies(
+        let discovered = discover_and_pin_jdk(
             &config,
             root.path(),
             Some(home.as_os_str().to_owned()),
+            &test_digests(),
         );
 
         assert!(discovered.diagnostics.is_empty());
@@ -7943,10 +11873,11 @@ mod tests {
         fs::write(home.join("lib/src.zip"), b"candidate source names").unwrap();
         fs::write(home.join("jmods/java.base.jmod"), b"exact binary input").unwrap();
 
-        let discovered = discover_jdk_semantic_pack_dependencies(
+        let discovered = discover_and_pin_jdk(
             &JvmAnalyzerConfig::default(),
             root.path(),
             Some(home.as_os_str().to_owned()),
+            &test_digests(),
         );
 
         assert!(discovered.diagnostics.is_empty());
@@ -7966,10 +11897,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let missing = root.path().join("not-a-jdk");
 
-        let discovered = discover_jdk_semantic_pack_dependencies(
+        let discovered = discover_and_pin_jdk(
             &JvmAnalyzerConfig::default(),
             root.path(),
             Some(missing.as_os_str().to_owned()),
+            &test_digests(),
         );
 
         assert!(discovered.dependencies.is_empty());
@@ -7993,10 +11925,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = write_jdk_release(root.path(), "21.0.12.1");
 
-        let discovered = discover_jdk_semantic_pack_dependencies(
+        let discovered = discover_and_pin_jdk(
             &JvmAnalyzerConfig::default(),
             root.path(),
             Some(home.as_os_str().to_owned()),
+            &test_digests(),
         );
 
         assert!(
@@ -8044,7 +11977,7 @@ mod tests {
             ..JvmAnalyzerConfig::default()
         };
 
-        let discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+        let discovered = discover_and_pin_jdk(&config, root.path(), None, &test_digests());
 
         assert!(
             discovered.diagnostics.is_empty(),
@@ -8063,10 +11996,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = write_jdk_release(root.path(), "21");
 
-        let discovered = discover_jdk_semantic_pack_dependencies(
+        let discovered = discover_and_pin_jdk(
             &JvmAnalyzerConfig::default(),
             root.path(),
             Some(home.as_os_str().to_owned()),
+            &test_digests(),
         );
 
         assert!(
@@ -8095,10 +12029,11 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let home = write_jdk_release(root.path(), java_version);
 
-            let discovered = discover_jdk_semantic_pack_dependencies(
+            let discovered = discover_and_pin_jdk(
                 &JvmAnalyzerConfig::default(),
                 root.path(),
                 Some(home.as_os_str().to_owned()),
+                &test_digests(),
             );
 
             assert!(
@@ -8471,6 +12406,7 @@ mod tests {
         let dependencies = resolve_jvm_semantic_pack_dependencies(
             &config,
             &project,
+            &test_digests(),
             &DependencyPackLimits::default(),
             None,
         );
@@ -8863,10 +12799,20 @@ mod tests {
                 },
         };
         let limits = DependencyPackLimits::default();
-        let first_dependencies =
-            resolve_jvm_semantic_pack_dependencies(&config(first_binary), &project, &limits, None);
-        let second_dependencies =
-            resolve_jvm_semantic_pack_dependencies(&config(second_binary), &project, &limits, None);
+        let first_dependencies = resolve_jvm_semantic_pack_dependencies(
+            &config(first_binary),
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
+        let second_dependencies = resolve_jvm_semantic_pack_dependencies(
+            &config(second_binary),
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
         let first = prepare_dependency_semantic_packs(
             &catalog,
@@ -8997,6 +12943,56 @@ mod tests {
             ));
         }
         assert!(index.get("scala.example.Hidden").is_none());
+    }
+
+    #[test]
+    #[hardwon(
+        "de7bf58da4ba: source-jar owners lost their declared supertypes, hiding inherited members"
+    )]
+    fn source_jar_owner_keeps_declared_supertypes_for_member_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source_jar = root.join("dependency-sources.jar");
+        write_zip_entries(
+            &source_jar,
+            &[
+                (
+                    "com/example/dep/Base.java",
+                    b"package com.example.dep; public class Base { public void run() {} }",
+                ),
+                (
+                    "com/example/dep/Sub.java",
+                    b"package com.example.dep; public class Sub extends Base {}",
+                ),
+            ],
+        );
+        let index = JvmExternalDeclarationIndex::build(
+            &JvmExternalDependencies {
+                artifact_paths: vec![JvmExternalArtifact {
+                    artifact_path: source_jar,
+                    source_artifact_path: None,
+                    ..JvmExternalArtifact::default()
+                }],
+                ..JvmExternalDependencies::default()
+            },
+            &root,
+        );
+        assert!(matches!(
+            index
+                .get("com.example.dep.Sub")
+                .map(JvmExternalType::source),
+            Some(JvmExternalDeclarationSource::SourceJar { .. })
+        ));
+        // A source jar has no complete inventory, so its hierarchy stays
+        // incomplete, but member lookup still follows the declared edge.
+        assert!(
+            index.member("com.example.dep.Sub", "run").is_some(),
+            "{:?}",
+            index
+                .members_by_owner
+                .get("com.example.dep.Sub")
+                .map(|surface| &surface.supertypes)
+        );
     }
 
     const KOTLIN_DEPENDENCY_SOURCE: &str = "package kotlin.example\n\
@@ -9468,7 +13464,13 @@ trait RefreshedNeighbor {
             ..Default::default()
         };
         let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         assert!(discovered.complete, "{discovered:#?}");
         assert_eq!(discovered.dependencies.len(), 1, "{discovered:#?}");
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -9524,7 +13526,13 @@ trait RefreshedNeighbor {
         };
         let project = TestProject::new(root.path(), Language::Java);
         let limits = DependencyPackLimits::default();
-        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovered = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
         assert_eq!(discovered.dependencies.len(), 1);
         fs::remove_file(home.join("jmods/java.base.jmod")).unwrap();
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
@@ -9649,7 +13657,13 @@ trait RefreshedNeighbor {
                 },
         };
         let limits = DependencyPackLimits::default();
-        let discovery = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        let discovery = resolve_jvm_semantic_pack_dependencies(
+            &config,
+            &project,
+            &test_digests(),
+            &limits,
+            None,
+        );
 
         assert!(!discovery.complete);
         assert!(discovery.dependencies.is_empty());
@@ -9876,7 +13890,7 @@ trait RefreshedNeighbor {
         pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
             .unwrap();
         let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
-        assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
+        assert!(!initial_index.shares_index_with(&updated.external_index));
         assert!(updated.is_known_type_name_in_file(token, None, &app, "ExternalService"));
 
         app.write(
@@ -9884,15 +13898,17 @@ trait RefreshedNeighbor {
         )
         .unwrap();
         let java_only = updated.update(&BTreeSet::from([app]));
-        assert!(Arc::ptr_eq(
-            &updated.external_index,
-            &java_only.external_index
-        ));
+        assert!(
+            updated
+                .external_index
+                .shares_index_with(&java_only.external_index)
+        );
         let refreshed = java_only.update_all();
-        assert!(!Arc::ptr_eq(
-            &java_only.external_index,
-            &refreshed.external_index
-        ));
+        assert!(
+            !java_only
+                .external_index
+                .shares_index_with(&refreshed.external_index)
+        );
     }
 
     #[test]

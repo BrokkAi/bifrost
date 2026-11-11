@@ -152,8 +152,8 @@ impl Drop for RetainedExclusiveReader {
 ///
 /// Persistent stores share a process-local actor for their canonical cache
 /// path. Ephemeral stores retain a local mutex because their backing database
-/// is unique, and because the in-memory fallback must route reads through the
-/// same connection.
+/// is unique; the test-only single-connection store also routes reads through
+/// that mutex.
 #[doc(hidden)]
 pub enum StoreWriter {
     Local(Mutex<Connection>),
@@ -161,7 +161,7 @@ pub enum StoreWriter {
 }
 
 impl StoreWriter {
-    fn reader_exclusion_identity(&self) -> usize {
+    pub(super) fn reader_exclusion_identity(&self) -> usize {
         match self {
             Self::Local(conn) => conn as *const Mutex<Connection> as usize,
             Self::Persistent(writer) => Arc::as_ptr(writer) as usize,
@@ -192,6 +192,7 @@ impl StoreWriter {
     }
 
     pub(super) fn local(conn: Connection) -> Self {
+        super::sealed_families::install(&conn);
         Self::Local(Mutex::new(conn))
     }
 
@@ -220,6 +221,7 @@ impl StoreWriter {
         }
 
         let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
+        super::sealed_families::install(&conn);
         {
             let _scope = crate::profiling::scope("cache_db.repair_planner_statistics");
             repair_planner_statistics_on_open(&conn);
@@ -240,14 +242,35 @@ impl StoreWriter {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> T + Send + 'static,
     {
+        // A certifying Rust forward build must publish nothing to main while
+        // it builds; its observer forbids store writes.
+        assert!(
+            !brokk_bifrost_core::attribution::store_writes_forbidden(),
+            "a certifying forward build may not dispatch store writes"
+        );
         self.assert_no_retained_exclusive_reader();
         match self {
             Self::Local(conn) => {
                 let mut conn = conn.lock().expect("analyzer store mutex poisoned");
-                job(&mut conn)
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut conn)));
+                drop(conn);
+                super::sealed_families::check();
+                outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             }
             Self::Persistent(writer) => writer.execute(job),
         }
+    }
+
+    /// Write fixture rows in tests only. The scope ends before the job returns.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn execute_fixture<T, F>(&self, job: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> T + Send + 'static,
+    {
+        self.execute(|conn| super::sealed_families::fixture_rows(conn, job))
     }
 
     pub(super) fn repair_prepared_blob(
@@ -265,8 +288,9 @@ impl StoreWriter {
         }
     }
 
-    /// Local-connection access for the in-memory reader fallback and existing
-    /// ephemeral-store SQL tests. Persistent callers must use `execute`.
+    /// Local-connection access for the test-only in-memory reader store and
+    /// existing ephemeral-store SQL tests. Persistent callers must use
+    /// `execute`.
     #[doc(hidden)]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, Connection>> {
         self.assert_no_retained_exclusive_reader();
@@ -281,10 +305,10 @@ impl StoreWriter {
     /// [`Self::lock`] for a caller that holds a request's cancellation.
     ///
     /// `Mutex::lock` cannot be interrupted, so a request that waits there for
-    /// the in-memory fallback's only connection stays parked until the holder
-    /// is done, whatever its own deadline says. Polling makes the wait
-    /// answerable to the caller's cancellation. `None` means it was cancelled
-    /// before the connection became free.
+    /// the test-only single-connection store's only connection stays parked
+    /// until the holder is done, whatever its own deadline says. Polling makes
+    /// the wait answerable to the caller's cancellation. `None` means it was
+    /// cancelled before the connection became free.
     pub(super) fn lock_cancellable(
         &self,
         cancellation: &crate::CancellationToken,
@@ -514,6 +538,10 @@ impl PersistentWriter {
         let (reply_tx, reply_rx) = sync_channel::<Result<T, Box<dyn Any + Send>>>(1);
         let envelope: WriterJob = Box::new(move |conn| {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(conn)));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::sealed_families::check();
+                outcome.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            }));
             if reply_tx.send(outcome).is_err() {
                 eprintln!("persistent analyzer writer execute caller dropped its reply channel");
             }

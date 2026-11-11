@@ -99,7 +99,7 @@ fn mcp_run_policy_reports_the_forbidden_transitive_effect() {
     assert_eq!(structured["exit_status"], 1, "{structured}");
 
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 6);
+    assert_eq!(report["schema_version"], 7);
     assert_eq!(
         report["evaluation"]["evaluation_date"], "2026-08-20",
         "{report}"

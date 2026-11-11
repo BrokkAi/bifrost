@@ -23,6 +23,289 @@ use crate::{
     PolicyRunCompletion, PolicyWorkReport, SchemaVersionOrigin, SchemaVersionResolution,
 };
 
+pub(crate) fn close_match_snapshot()
+-> std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot> {
+    close_match_snapshot_with_completeness("complete")
+}
+
+pub(crate) fn close_match_snapshot_with_completeness(
+    completeness: &str,
+) -> std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot> {
+    rust_dependency_snapshot(completeness, true, &["0.4.25"], false)
+}
+
+pub(crate) fn close_match_snapshot_with_versions(
+    versions: &[&str],
+) -> std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot> {
+    rust_dependency_snapshot("complete", true, versions, false)
+}
+
+pub(crate) fn close_match_callable_snapshot()
+-> std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot> {
+    rust_dependency_snapshot("complete", true, &["0.4.25"], true)
+}
+
+pub(crate) fn exact_rust_dependency_snapshot()
+-> std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot> {
+    rust_dependency_snapshot("complete", false, &["0.4.25"], false)
+}
+
+pub(crate) fn close_match_callable_pack()
+-> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    rust_dependency_compiled_pack("complete", true, true)
+}
+
+pub(crate) fn exact_other_callable_pack()
+-> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    rust_dependency_compiled_pack_for_package("complete", false, true, "other")
+}
+
+/// The close-match `widget` pack with a fieldless enum `widget::Flag` beside
+/// its callable: a declaration a value-type barrier could consult if type
+/// resolution read model declarations.
+pub(crate) fn close_match_enum_pack()
+-> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    compile_rust_dependency_pack(
+        "complete",
+        true,
+        true,
+        "widget",
+        &[serde_json::json!({
+            "id": "type.widget.flag", "name": "Flag", "type_kind": "enum",
+            "visibility": "public", "aliases": [],
+            "locator": {"kind": "artifact", "path": "rustdoc/api.json", "symbol": "widget.Flag"}
+        })],
+        0,
+    )
+}
+
+fn rust_dependency_compiled_pack(
+    completeness: &str,
+    approximate: bool,
+    include_callable: bool,
+) -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    rust_dependency_compiled_pack_for_package(completeness, approximate, include_callable, "widget")
+}
+
+fn rust_dependency_compiled_pack_for_package(
+    completeness: &str,
+    approximate: bool,
+    include_callable: bool,
+    package: &str,
+) -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    compile_rust_dependency_pack(completeness, approximate, include_callable, package, &[], 0)
+}
+
+/// The close-match `widget` pack whose `build` takes one positional argument,
+/// so a call that passes a value to it binds completely.
+pub(crate) fn close_match_unary_callable_pack()
+-> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    compile_rust_dependency_pack("complete", true, true, "widget", &[], 1)
+}
+
+/// The exact `other` pack whose `build` takes one positional argument.
+pub(crate) fn exact_other_unary_callable_pack()
+-> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    compile_rust_dependency_pack("complete", false, true, "other", &[], 1)
+}
+
+/// A pack whose one complete `std.string.String.replace` summary covers
+/// overrides, activated by the `widget` package. Close-match when
+/// `approximate`, exact otherwise. It declares no type or member, so a call it
+/// makes exact takes its declaration from another pack.
+pub(crate) fn widget_override_summary_pack(
+    approximate: bool,
+) -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CompilerOptions, RustArtifactApproximation, RustArtifactMismatchKind, SourceFormat,
+        compile_source,
+    };
+    use serde_json::json;
+    let (provenance, compatibility) = if approximate {
+        let claim = RustArtifactApproximation {
+            built_from_version: "0.4.23".to_owned(),
+            built_from_features: vec!["std".to_owned()],
+            built_from_cfgs: vec!["docsrs".to_owned()],
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            format_version: 61,
+            toolchain: "nightly-2026-08-24".to_owned(),
+            docsrs_build: true,
+            original_sha256: "11".repeat(32),
+            produced_sha256: "11".repeat(32),
+            activation_version_requirement: ">=0.4.0, <0.5.0".to_owned(),
+            mismatch_kinds: vec![RustArtifactMismatchKind::VersionNearby],
+            selection_rule_id: "cargo-compatible-nearest".to_owned(),
+            selection_rule_version: 1,
+        };
+        (
+            json!({"source": "test:close-match", "rust_artifact_approximation": claim}),
+            json!({"toolchains": []}),
+        )
+    } else {
+        (
+            json!({"source": "test:exact"}),
+            json!({"bifrost": "*", "toolchains": []}),
+        )
+    };
+    let source = json!({
+        "schema_version": if approximate { 28 } else { 2 },
+        "pack_id": "test.widget-replace-summary",
+        "version": "1.0.0",
+        "producer": {"name": "test-fixture", "version": "1.0.0"},
+        "language": "rust", "ecosystem": "cargo",
+        "compatibility": compatibility,
+        "provenance": provenance,
+        "license": "NOASSERTION", "completeness": "complete",
+        "safety": {"generated_code_only": false, "review_required": false},
+        "shards": [{
+            "id": "summaries.rust.replace",
+            "activation": [{"package": {"name": "widget"}}],
+            "payload": {
+                "kind": "procedure_summaries",
+                "summaries": [{
+                    "id": "summary.widget.string-replace",
+                    "target": {
+                        "path": "library/alloc/src/string.rs",
+                        "symbol": "std.string.String.replace",
+                        "has_receiver": true,
+                        "parameter_count": 2
+                    },
+                    "completeness": "complete",
+                    "covers_overrides": true,
+                    "locations": [],
+                    "transfers": [{
+                        "input": {"kind": "parameter", "ordinal": 0},
+                        "exit_kind": "normal",
+                        "output": {"kind": "normal_return"}
+                    }],
+                    "effects": []
+                }]
+            }
+        }]
+    });
+    compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&source).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("override summary fixture: {diagnostics:#?}"))
+}
+
+fn compile_rust_dependency_pack(
+    completeness: &str,
+    approximate: bool,
+    include_callable: bool,
+    package: &str,
+    extra_types: &[serde_json::Value],
+    callable_parameters: usize,
+) -> brokk_bifrost_analysis::analyzer::semantic_model::CompiledSemanticModelPack {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CompilerOptions, RustArtifactApproximation, RustArtifactMismatchKind, SourceFormat,
+        compile_source,
+    };
+    use serde_json::json;
+    let approximation = RustArtifactApproximation {
+        built_from_version: "0.4.23".to_owned(),
+        built_from_features: vec!["std".to_owned()],
+        built_from_cfgs: vec!["docsrs".to_owned()],
+        target: "x86_64-unknown-linux-gnu".to_owned(),
+        format_version: 61,
+        toolchain: "nightly-2026-08-24".to_owned(),
+        docsrs_build: true,
+        original_sha256: "11".repeat(32),
+        produced_sha256: "11".repeat(32),
+        activation_version_requirement: ">=0.4.0, <0.5.0".to_owned(),
+        mismatch_kinds: vec![RustArtifactMismatchKind::VersionNearby],
+        selection_rule_id: "cargo-compatible-nearest".to_owned(),
+        selection_rule_version: 1,
+    };
+    let provenance = if approximate {
+        json!({"source": "test:close-match", "rust_artifact_approximation": approximation})
+    } else {
+        json!({"source": "test:exact"})
+    };
+    let compatibility = if approximate {
+        json!({"toolchains": []})
+    } else {
+        json!({"bifrost": "*", "toolchains": []})
+    };
+    let members = if include_callable {
+        vec![json!({
+            "id": format!("member.{package}.build"), "owner": format!("type.{package}.root"),
+            "name": "build", "member_kind": "function", "visibility": "public",
+            "is_static": true,
+            "signature": {"parameters": (0..callable_parameters).map(|_| json!({
+                "type": {"kind": "named", "name": "()"}, "passing_mode": "positional_only"
+            })).collect::<Vec<_>>()},
+            "locator": {"kind": "artifact", "path": "rustdoc/api.json", "symbol": format!("{package}.build")}
+        })]
+    } else {
+        Vec::new()
+    };
+    let mut types = vec![json!({
+        "id": format!("type.{package}.root"), "name": package, "type_kind": "module",
+        "visibility": "public", "aliases": [],
+        "locator": {"kind": "artifact", "path": "rustdoc/api.json", "symbol": package}
+    })];
+    types.extend(extra_types.iter().cloned());
+    let source = json!({
+        "schema_version": if approximate { 28 } else { 2 },
+        "pack_id": if package == "widget" { "test.close-match-widget".to_owned() } else { format!("test.exact-{package}") },
+        "version": "1.0.0",
+        "producer": {"name": "test-fixture", "version": "1.0.0"},
+        "language": "rust", "ecosystem": "cargo",
+        "compatibility": compatibility,
+        "provenance": provenance,
+        "license": "NOASSERTION", "completeness": completeness,
+        "safety": {"generated_code_only": false, "review_required": false},
+        "shards": [{
+            "id": "declarations.rust.external",
+            "activation": [{"package": {"name": package}}],
+            "payload": {"kind": "declaration_facts", "types": types, "members": members, "relations": []}
+        }]
+    });
+    compile_source(
+        SourceFormat::Json,
+        &serde_json::to_vec(&source).unwrap(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("close-match fixture: {diagnostics:#?}"))
+}
+
+fn rust_dependency_snapshot(
+    completeness: &str,
+    approximate: bool,
+    versions: &[&str],
+    include_callable: bool,
+) -> std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot> {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogCoordinate, CatalogPackSourceKind, SemanticModelActivationEvidence,
+        test_snapshot_from_compiled_pack_with_evidences,
+    };
+    let compiled = rust_dependency_compiled_pack(completeness, approximate, include_callable);
+    let evidences = versions
+        .iter()
+        .map(|version| SemanticModelActivationEvidence {
+            language: "rust".to_owned(),
+            ecosystem: "cargo".to_owned(),
+            package: Some(CatalogCoordinate {
+                name: "widget".to_owned(),
+                version: Some(semver::Version::parse(version).unwrap()),
+            }),
+            module: None,
+            toolchain: None,
+            target: Some("x86_64-unknown-linux-gnu".to_owned()),
+            configuration: None,
+            artifact_sha256: None,
+        })
+        .collect();
+    test_snapshot_from_compiled_pack_with_evidences(
+        compiled,
+        evidences,
+        CatalogPackSourceKind::EphemeralWorkspace,
+    )
+}
+
 #[path = "../../../test-support/cvss_vectors.rs"]
 pub(crate) mod cvss_vectors;
 
@@ -231,6 +514,7 @@ pub(crate) fn load_match_policy(source: &str) -> LoadedPolicy {
         Vec::new(),
         Vec::new(),
         PolicyPrecedenceManifest::default(),
+        None,
         None,
         None,
     )

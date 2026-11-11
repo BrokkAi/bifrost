@@ -1,7 +1,9 @@
+use super::dispatch::{DispatchCompleteness, DispatchProof};
 use super::results::CodeQueryConfigurationFact;
 use super::results::CodeQueryCrossDomain;
 use super::results::CodeQueryMatchRelations;
 use super::results::CodeQueryPointsToCandidate;
+use super::results::CodeQueryReferenceFacets;
 use super::results::CodeQueryRuntimeKeyedReadValue;
 use super::results::CodeQuerySourceSpan;
 use super::*;
@@ -32,6 +34,27 @@ pub(super) fn insert_pipeline_row(
     traces: Vec<PipelineTrace>,
     provenance_truncated: bool,
 ) {
+    if let PipelineValue::DispatchTarget(target) = &value
+        && !traces.is_empty()
+    {
+        for trace in traces {
+            let mut target = target.clone();
+            let fact = trace.seed.facts.node(trace.seed.fact_match.node);
+            let span = trace.seed.fact_match.display_span(&trace.seed.facts);
+            target.root_id = match_id(&rel_path_string(&trace.seed.file), fact.kind.label(), span);
+            merge_pipeline_row(
+                rows,
+                indexes,
+                PipelineRow {
+                    value: PipelineValue::DispatchTarget(target),
+                    traces: vec![trace],
+                    provenance_truncated,
+                    row_projection: Vec::new(),
+                },
+            );
+        }
+        return;
+    }
     merge_pipeline_row(
         rows,
         indexes,
@@ -871,7 +894,7 @@ struct RenderedReferenceSiteMetadata {
     path: String,
     range: CodeQueryRange,
     proof: &'static str,
-    reference_kind: Option<&'static str>,
+    reference_facets: CodeQueryReferenceFacets,
 }
 
 fn render_reference_site_metadata(
@@ -883,7 +906,7 @@ fn render_reference_site_metadata(
         path: rel_path_string(&site.file),
         range: render_reference_range(analyzer, site, cache),
         proof: usage_proof_label(site.proof),
-        reference_kind: site.reference_kind.map(reference_kind_label),
+        reference_facets: site.reference_facets.into(),
     }
 }
 
@@ -903,7 +926,7 @@ pub(super) fn render_reference_site_ref(
         usage_kind: (site.usage_kind != UsageHitKind::Reference)
             .then(|| site.usage_kind.wire_label()),
         proof: metadata.proof,
-        reference_kind: metadata.reference_kind,
+        reference_facets: metadata.reference_facets,
     }
 }
 
@@ -916,7 +939,11 @@ pub(super) fn render_call_site_ref(
         path: rel_path_string(&site.0.file),
         range: render_source_range(analyzer, &site.0.file, &site.0.range, cache),
         caller_fq_name: site.0.caller.fq_name(),
-        callee_fq_name: site.0.callee.fq_name(),
+        callee_fq_name: site
+            .6
+            .as_ref()
+            .and_then(|target| target.target_fq_name.clone())
+            .unwrap_or_else(|| site.0.callee.fq_name()),
         proof: usage_proof_label(site.0.proof),
     }
 }
@@ -1168,6 +1195,8 @@ pub(super) fn render_edge_ref(
         range: render_source_range(analyzer, &row.site.file, &row.site.range, cache),
         target_fq_name: value.target.unit.fq_name(),
         provenance: row.provenance.label(),
+        proof: usage_proof_label(row.proof),
+        reference_facets: row.reference_kind.into(),
     }
 }
 
@@ -1424,7 +1453,12 @@ pub(super) fn render_trace_candidate_ref(
         TraceCandidateRef::Intrinsic { name } => {
             CodeQueryCandidateRef::Intrinsic { name: name.clone() }
         }
-        TraceCandidateRef::Modeled { symbol_id, name } => CodeQueryCandidateRef::Modeled {
+        TraceCandidateRef::Modeled {
+            provider,
+            symbol_id,
+            name,
+        } => CodeQueryCandidateRef::Modeled {
+            provider: provider.clone(),
             symbol_id: symbol_id.clone(),
             name: name.clone(),
         },
@@ -1498,7 +1532,10 @@ pub(super) fn render_dispatch_outcome(
         path: rel_path_string(&value.file),
         language: crate::analyzer::common::language_for_file(&value.file).config_label(),
         range: render_source_range(analyzer, &value.file, &value.range, cache),
-        outcome: answer.outcome,
+        outcome: {
+            debug_assert_eq!(answer.outcome, answer.status.label());
+            answer.status.label()
+        },
         coverage: answer.coverage.label(),
         call_site_count: answer.call_site_count,
         target_count: answer.arms.len(),
@@ -1526,7 +1563,14 @@ pub(super) fn render_dispatch_target(
         site_id: site.site_id.clone(),
         site_ast_id: site.site_ast_id.clone(),
         path: rel_path_string(&site.file),
+        range: render_source_range(analyzer, &site.file, &site.range, cache),
+        root_id: value.root_id.clone(),
         ordinal: value.ordinal,
+        target_count: site
+            .answer
+            .coverage
+            .is_exhaustive()
+            .then_some(site.answer.arms.len()),
         target_id: arm.target_id.clone(),
         target_path: arm.target_path.clone(),
         target_fq_name: arm
@@ -1537,11 +1581,12 @@ pub(super) fn render_dispatch_target(
             .target_unit
             .as_ref()
             .and_then(|unit| render_unit_declaration(analyzer, unit, detail, cache)),
-        proof: arm.proof,
-        completeness: arm.completeness,
+        proof: arm.proof.label(),
+        completeness: arm.completeness.label(),
         coverage: site.answer.coverage.label(),
         dispatch: site.answer.dispatch_label(arm),
         boundary_kind: arm.boundary_kind.map(|kind| kind.label()),
+        boundary_reason: arm.boundary_reason.map(|reason| reason.label()),
     }
 }
 
@@ -2238,17 +2283,43 @@ pub(super) fn render_configuration_fact(
                 ) => u32::try_from(*index).ok(),
                 _ => None,
             });
+    let path = rel_path_string(&value.file);
+    let directory = value
+        .file
+        .rel_path()
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| rel_path_string(&value.file.with_rel_path(parent)))
+        .unwrap_or_default();
+    let file_name = rel_path_string(
+        &value.file.with_rel_path(
+            value
+                .file
+                .rel_path()
+                .file_name()
+                .expect("configuration fact file has a name"),
+        ),
+    );
+    debug_assert_eq!(
+        path,
+        if directory.is_empty() {
+            file_name
+        } else {
+            format!("{directory}/{file_name}")
+        }
+    );
     CodeQueryConfigurationFact {
         id: value.id(),
         fact_id: value.fact_id(),
         parent_id: value.parent_id(),
         value_id: value.member_value_id(),
-        path: rel_path_string(&value.file),
+        path,
+        directory,
         format: format.label(),
         node_kind: node_kind_label(fact.kind()),
         role: role.map(crate::query::schema::configuration_member_role_label),
         scalar_kind: scalar_kind.map(crate::query::schema::configuration_scalar_kind_label),
-        value: value.scalar_value(),
+        value: value.scalar_value().decoded(),
         provenance: "authored",
         completeness: match value.completeness() {
             crate::query::ConfigurationCompletenessFilter::Complete => "complete",
@@ -2419,7 +2490,13 @@ fn exact_semantic_model_declaration(
     Box<crate::analyzer::semantic_model::SemanticModelProvenance>,
 )> {
     analyzer.semantic_model_overlay().and_then(|overlay| {
-        let matched = overlay.symbols_named(fq_name);
+        let matched = overlay.symbols_named_in_family(
+            fq_name,
+            brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(
+                declaration.unit.source().language(),
+            )
+            .semantic_pack_label(),
+        );
         if matched.disposition
             != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
         {
@@ -2464,20 +2541,78 @@ pub(super) fn augment_public_result_with_semantic_overlay(
         return;
     };
 
+    // Whether one of this function's own overlay reads was open. The query's
+    // recorded completion is not used: it also carries reasons from reads
+    // made before augmentation.
+    let is_open =
+        |disposition: &crate::analyzer::semantic_model::SemanticModelOverlayDisposition| {
+            matches!(
+                disposition,
+                crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+            )
+        };
+    let mut open = false;
+
     // Search also admits aliases; recheck the root predicate on every candidate.
+    // The readable records of an open lookup are only candidates (an unread
+    // contributor could change their composition or make them conflict), so
+    // they are withheld and the result reports the omission. A single-family
+    // seed reads only that family; a mixed seed keeps the workspace read.
+    let family_language = seed
+        .languages
+        .first()
+        .map(|language| {
+            brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(*language)
+                .semantic_pack_label()
+        })
+        .filter(|first| {
+            seed.languages.iter().all(|language| {
+                brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                    brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(*language)
+                        .semantic_pack_label(),
+                ) == brokk_bifrost_core::analyzer::model::semantic_pack_realm(first)
+            })
+        });
     let candidates = match seed.root.name.as_ref() {
-        Some(crate::query::StringPredicate::Exact(name)) => overlay.symbols_named(name).records,
+        Some(crate::query::StringPredicate::Exact(name)) => {
+            let matched = match family_language {
+                Some(language) => overlay.symbols_named_in_family(name, language),
+                None => overlay.symbols_named(name),
+            };
+            if is_open(&matched.disposition) {
+                open = true;
+                Vec::new()
+            } else {
+                matched.records
+            }
+        }
         _ => {
             let patterns = crate::analyzer::SearchSymbolPatternBatch::compile(
                 vec![".*".to_owned()],
                 false,
                 None,
             );
-            overlay
-                .search_with_limit_filter(&patterns, usize::MAX, None, |symbol| {
-                    model_pattern_matches(&seed.root, symbol)
-                })
-                .0
+            let include = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol| {
+                model_pattern_matches(&seed.root, symbol)
+            };
+            let (records, _, complete) = match family_language {
+                Some(language) => overlay.search_with_limit_filter_in_family(
+                    &patterns,
+                    usize::MAX,
+                    None,
+                    language,
+                    include,
+                ),
+                None => overlay.search_with_limit_filter(&patterns, usize::MAX, None, include),
+            };
+            // As for an exact name: an unread row could make a returned
+            // record ambiguous or compose with it, so none is emitted.
+            if complete {
+                records
+            } else {
+                open = true;
+                Vec::new()
+            }
         }
     };
     let mut roots = Vec::new();
@@ -2504,16 +2639,23 @@ pub(super) fn augment_public_result_with_semantic_overlay(
     for root in roots {
         match traversal {
             None => modeled.push(root),
-            Some(QueryStep::Members) => modeled.extend(
-                overlay
-                    .members_of(&root.id)
-                    .records
-                    .into_iter()
-                    .filter(|symbol| !symbol.provenance.ambiguous),
-            ),
+            Some(QueryStep::Members) => {
+                let members = overlay.members_of_in_family(&root.id, &root.language);
+                if is_open(&members.disposition) {
+                    open = true;
+                } else {
+                    modeled.extend(
+                        members
+                            .records
+                            .into_iter()
+                            .filter(|symbol| !symbol.provenance.ambiguous),
+                    );
+                }
+            }
             Some(QueryStep::Owner) => {
                 if let Some(owner) = root.owner_id.as_deref() {
-                    let matched = overlay.symbols_with_id(owner);
+                    let matched = overlay.symbols_with_id_in_family(owner, &root.language);
+                    open |= is_open(&matched.disposition);
                     if matched.disposition
                         == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
                     {
@@ -2525,12 +2667,14 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                 let hierarchy_result = model_hierarchy_symbols(&overlay, &root, *hierarchy, true);
                 modeled.extend(hierarchy_result.symbols);
                 ambiguous_match |= hierarchy_result.ambiguous;
+                open |= hierarchy_result.open;
                 missing_names.extend(hierarchy_result.missing_names);
             }
             Some(QueryStep::Subtypes(hierarchy)) => {
                 let hierarchy_result = model_hierarchy_symbols(&overlay, &root, *hierarchy, false);
                 modeled.extend(hierarchy_result.symbols);
                 ambiguous_match |= hierarchy_result.ambiguous;
+                open |= hierarchy_result.open;
                 missing_names.extend(hierarchy_result.missing_names);
             }
             Some(_) => unreachable!("model overlay traversal was validated above"),
@@ -2639,12 +2783,55 @@ pub(super) fn augment_public_result_with_semantic_overlay(
                 withheld_rows_path: None,
             }));
     }
+    // A read stopped by the enclosing operation's cancellation reports the
+    // cancellation, not an incomplete semantic-model inventory.
+    if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(None) {
+        if !result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled)
+        {
+            result
+                .diagnostics
+                .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                    incompleteness: Incompleteness::Operational(
+                        DerivationExecutionCause::Cancelled,
+                    ),
+                    related: Vec::new(),
+                    source: None,
+                    code: CodeQueryDiagnosticCode::Cancelled,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: "workspace",
+                    message: "semantic-model augmentation was cancelled".to_string(),
+                    exhausted_roots: Vec::new(),
+                    withheld_rows_path: None,
+                }));
+        }
+    } else if open {
+        result
+            .diagnostics
+            .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: "semantic-model inventory is incomplete".to_string(),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            }));
+    }
 }
 
 struct ModelHierarchyResult {
     symbols: Vec<Arc<crate::analyzer::semantic_model::SemanticModelSymbol>>,
     missing_names: Vec<String>,
     ambiguous: bool,
+    /// A relation or endpoint read was open, so the walk is incomplete.
+    open: bool,
 }
 
 fn model_hierarchy_symbols(
@@ -2663,16 +2850,26 @@ fn model_hierarchy_symbols(
     visited.insert(root.id.clone());
     let mut symbols = Vec::new();
     let mut ambiguous = false;
+    let mut open = false;
     let mut missing_names = Vec::new();
     while let Some((id, depth)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
         }
         let relations = if supertypes {
-            overlay.relations_from(&id)
+            overlay.relations_from_for(&id, &root.language)
         } else {
-            overlay.relations_to(&id)
+            overlay.relations_to_for(&id, &root.language)
         };
+        // An open read's relations are candidates only, so they are withheld
+        // and the walk reports itself incomplete.
+        if matches!(
+            relations.disposition,
+            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+        ) {
+            open = true;
+            continue;
+        }
         for relation in relations.records {
             if relation.provenance.ambiguous {
                 ambiguous = true;
@@ -2689,9 +2886,21 @@ fn model_hierarchy_symbols(
             } else {
                 &relation.from
             };
-            let mut matched = overlay.symbols_with_id(endpoint);
-            if matched.records.is_empty() {
-                matched = overlay.symbols_named(endpoint);
+            let is_open = |matched: &crate::analyzer::semantic_model::SemanticModelOverlayMatch<
+                crate::analyzer::semantic_model::SemanticModelSymbol,
+            >| {
+                matches!(
+                    matched.disposition,
+                    crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+                )
+            };
+            let mut matched = overlay.symbols_with_id_in_family(endpoint, &root.language);
+            if matched.records.is_empty() && !is_open(&matched) {
+                matched = overlay.symbols_named_in_family(endpoint, &root.language);
+            }
+            if is_open(&matched) {
+                open = true;
+                continue;
             }
             if matched.disposition
                 != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
@@ -2714,6 +2923,7 @@ fn model_hierarchy_symbols(
         symbols,
         missing_names,
         ambiguous,
+        open,
     }
 }
 
@@ -2821,7 +3031,7 @@ pub(super) fn render_reference_site(
             .map(|declaration| render_declaration(analyzer, declaration, detail, cache)),
         usage_kind: site.usage_kind.wire_label(),
         proof: metadata.proof,
-        reference_kind: metadata.reference_kind,
+        reference_facets: metadata.reference_facets,
     }
 }
 
@@ -2832,7 +3042,12 @@ pub(super) fn render_call_site(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryCallSite {
     let caller = declaration_value_for_unit(analyzer, &site.0.caller, site.0.range);
-    let callee = declaration_value_for_unit(analyzer, &site.0.callee, site.0.callee_range);
+    let callee = site
+        .6
+        .as_ref()
+        .filter(|target| target.boundary_kind.is_some() || target.reason.is_some())
+        .is_none()
+        .then(|| declaration_value_for_unit(analyzer, &site.0.callee, site.0.callee_range));
     CodeQueryCallSite {
         site_id: site.4.clone(),
         program_point_id: site.3.clone(),
@@ -2841,7 +3056,24 @@ pub(super) fn render_call_site(
         range: render_source_range(analyzer, &site.0.file, &site.0.range, cache),
         callee_range: render_source_range(analyzer, &site.0.file, &site.0.callee_range, cache),
         caller: render_declaration(analyzer, &caller, detail, cache),
-        callee: render_declaration(analyzer, &callee, detail, cache),
+        callee: callee
+            .as_ref()
+            .map(|callee| render_declaration(analyzer, callee, detail, cache)),
+        target_id: site.6.as_ref().and_then(|target| target.target_id.clone()),
+        target_fq_name: site
+            .6
+            .as_ref()
+            .and_then(|target| target.target_fq_name.clone()),
+        boundary_kind: site.6.as_ref().and_then(|target| target.boundary_kind),
+        target_reason: site.6.as_ref().and_then(|target| target.reason.clone()),
+        completeness: site
+            .6
+            .as_ref()
+            .map_or("complete", |target| target.completeness),
+        coverage: site
+            .6
+            .as_ref()
+            .map_or("exhaustive", |target| target.coverage),
         call_kind: call_syntax_kind_label(site.0.kind),
         proof: usage_proof_label(site.0.proof),
         receiver_kind: site.5.receiver_kind,
@@ -2997,6 +3229,7 @@ pub(super) fn render_receiver_analysis(
         ReceiverQueryAnalysis::Values(outcome) => {
             let rendered = outcome
                 .values()
+                .or_else(|| outcome.possible_candidates())
                 .into_iter()
                 .flatten()
                 .map(|value| render_receiver_value(analyzer, value, fallback, detail, cache))
@@ -3039,12 +3272,20 @@ pub(super) fn render_member_target_analysis(
     };
     let member_targets = outcome
         .values()
+        .or_else(|| outcome.possible_candidates())
         .into_iter()
         .flatten()
         .map(|target| {
-            render_member_target(analyzer, target, value.report.site.range, detail, cache)
+            render_member_target(
+                analyzer,
+                target,
+                value.member_form(target),
+                value.report.site.range,
+                detail,
+                cache,
+            )
         })
-        .collect();
+        .collect::<Vec<_>>();
     let (outcome, reason, limit) = receiver_outcome_metadata(outcome);
     let coverage = receiver_coverage(value, outcome);
     CodeQueryMemberTargetAnalysis {
@@ -3071,6 +3312,7 @@ pub(super) fn render_member_target_analysis(
 pub(super) fn render_member_target(
     analyzer: &dyn IAnalyzer,
     target: &ReceiverMemberTarget,
+    (member_form, trivial_property): MemberForm,
     fallback: Range,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
@@ -3085,6 +3327,8 @@ pub(super) fn render_member_target(
             let rendered = render_declaration(analyzer, &declaration, detail, cache);
             CodeQueryMemberTarget {
                 id: target.member_identity_id(),
+                member_form,
+                trivial_property,
                 path: Some(rendered.path.clone()),
                 language: Some(rendered.language),
                 start_line: Some(rendered.start_line),
@@ -3135,6 +3379,8 @@ pub(super) fn render_member_target(
                 };
             CodeQueryMemberTarget {
                 id: member.id.clone(),
+                member_form: None,
+                trivial_property: None,
                 path: None,
                 language: model_language_label(&member.language),
                 start_line: None,
@@ -3198,6 +3444,7 @@ pub(super) fn render_field_write_value(
         member_target: render_member_target(
             analyzer,
             &value.target,
+            value.analysis.member_form(&value.target),
             value.analysis.report.site.range,
             detail,
             cache,
@@ -3367,12 +3614,15 @@ fn render_receiver_site(
     }
 }
 
-fn receiver_coverage(value: &ReceiverAnalysisValue, outcome: &str) -> &'static str {
+pub(super) fn receiver_coverage(value: &ReceiverAnalysisValue, outcome: &str) -> &'static str {
     if outcome == "unsupported" {
         "unsupported"
     } else if outcome == "exceeded_budget" || value.report.candidates_truncated {
         "truncated"
-    } else if value.report.semantic_unsupported.is_some() || outcome == "ambiguous" {
+    } else if value.report.semantic_unsupported.is_some()
+        || outcome == "ambiguous"
+        || outcome == "incomplete"
+    {
         "open"
     } else if outcome == "unknown" {
         "unknown"
@@ -3563,10 +3813,14 @@ pub(super) fn render_call_binding(
         declared_target_id: value.site.declared_target_id.clone(),
         semantic_target_id: value.site.semantic_target_id.clone(),
         target_origin: value.site.target_origin,
-        dispatch_outcome: value.site.dispatch.outcome,
-        dispatch_coverage: value.site.dispatch.coverage,
-        dispatch_proof: value.site.dispatch.proof,
-        dispatch_completeness: value.site.dispatch.completeness,
+        dispatch_outcome: value.site.dispatch.status.label(),
+        dispatch_coverage: value.site.dispatch.coverage_status.label(),
+        dispatch_proof: value.site.dispatch.proof.map(DispatchProof::label),
+        dispatch_completeness: value
+            .site
+            .dispatch
+            .completeness
+            .map(DispatchCompleteness::label),
         dispatch_target_count: value.site.dispatch.target_count,
         dispatch_targets_truncated: value.site.dispatch.targets_truncated,
         selector_exact: value.site.selector.exact,
@@ -3666,7 +3920,7 @@ pub(super) fn render_call_effect(
         captures: value
             .seed
             .as_ref()
-            .map(|seed| render_captures(&seed.fact_match, detail))
+            .map(|seed| render_captures(&seed.fact_match, detail, cache))
             .unwrap_or_default(),
     }
 }
@@ -3874,6 +4128,13 @@ pub(super) fn render_assignment_relation(
                 )
             })
             .collect(),
+        read_event: value.read_event.as_ref().map(|event| {
+            flow_state::state_event_ref(
+                &value.procedure_id,
+                event,
+                render_source_range(analyzer, &event.site.file, &event.site.range, cache),
+            )
+        }),
     }
 }
 
@@ -4387,6 +4648,7 @@ pub(super) fn receiver_query_outcome_label(analysis: &ReceiverQueryAnalysis) -> 
 pub(super) const RECEIVER_OUTCOME_LABELS: &[&str] = &[
     "precise",
     "ambiguous",
+    "incomplete",
     "unknown",
     "unsupported",
     "exceeded_budget",
@@ -4398,6 +4660,7 @@ pub(super) fn receiver_outcome_metadata<T>(
     match outcome {
         ReceiverAnalysisOutcome::Precise(_) => ("precise", None, None),
         ReceiverAnalysisOutcome::Ambiguous(_) => ("ambiguous", None, None),
+        ReceiverAnalysisOutcome::Incomplete { .. } => ("incomplete", None, None),
         ReceiverAnalysisOutcome::Unknown => ("unknown", None, None),
         ReceiverAnalysisOutcome::Unsupported { reason } => ("unsupported", Some(*reason), None),
         ReceiverAnalysisOutcome::ExceededBudget { limit } => {
@@ -4519,6 +4782,22 @@ pub(super) fn provider_supports_feature(
 ) -> bool {
     match feature {
         QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
+        QueryFeature::DeclarationModifiers(requirement) => provider
+            .structural_emitted_kinds()
+            .into_iter()
+            .filter(|kind| match requirement {
+                super::super::capabilities::KindRequirement::Any => true,
+                super::super::capabilities::KindRequirement::Named(named) => kind.satisfies(named),
+            })
+            .all(|kind| provider.structural_supports_declaration_modifiers(kind)),
+        QueryFeature::DeclarationTypeKind(requirement) => provider
+            .structural_emitted_kinds()
+            .into_iter()
+            .filter(|kind| match requirement {
+                super::super::capabilities::KindRequirement::Any => true,
+                super::super::capabilities::KindRequirement::Named(named) => kind.satisfies(named),
+            })
+            .all(|kind| provider.structural_supports_declaration_type_kind(kind)),
         QueryFeature::Role(role) => provider.structural_supports_role(role),
         QueryFeature::BooleanLiteralValue => provider.structural_supports_boolean_literal_value(),
         QueryFeature::AsyncCallableValue => provider.structural_supports_async_callable_value(),
@@ -4848,7 +5127,7 @@ pub(super) fn render_match(
     let span = fact_match.display_span(facts);
     let range = range_for_span(facts, span);
     let path = rel_path_string(file);
-    let captures = render_captures(fact_match, detail);
+    let captures = render_captures(fact_match, detail, cache);
     let full_detail = matches!(detail, CodeQueryResultDetail::Full);
     let node_range = full_detail.then_some(range);
     let decorator_spans: Vec<_> = if full_detail {
@@ -4897,32 +5176,63 @@ pub(super) fn render_match(
     }
 }
 
-fn render_captures(fact_match: &FactMatch, detail: CodeQueryResultDetail) -> Vec<CodeQueryCapture> {
+fn render_captures(
+    fact_match: &FactMatch,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> Vec<CodeQueryCapture> {
     let full_detail = matches!(detail, CodeQueryResultDetail::Full);
-    fact_match
+    use super::super::matcher::{
+        EACH_CAPTURE_BINDING_OVERHEAD_BYTES, MAX_RENDERED_CAPTURE_BYTES_PER_RESPONSE,
+    };
+    if !fact_match.captures.is_empty()
+        && cache.rendered_capture_bytes >= MAX_RENDERED_CAPTURE_BYTES_PER_RESPONSE
+    {
+        cache.capture_truncated_rows += 1;
+        return Vec::new();
+    }
+    let mut truncated = false;
+    let captures = fact_match
         .captures
         .iter()
-        .map(|capture| CodeQueryCapture {
-            name: capture.name.clone(),
-            text: snippet(&capture.text),
-            start_line: capture.start_line,
-            range: full_detail.then_some(CodeQueryRange {
+        .map_while(|capture| {
+            let text = snippet(&capture.text);
+            let charge = text
+                .len()
+                .saturating_add(EACH_CAPTURE_BINDING_OVERHEAD_BYTES);
+            if cache.rendered_capture_bytes.saturating_add(charge)
+                > MAX_RENDERED_CAPTURE_BYTES_PER_RESPONSE
+            {
+                cache.rendered_capture_bytes = MAX_RENDERED_CAPTURE_BYTES_PER_RESPONSE;
+                truncated = true;
+                return None;
+            }
+            cache.rendered_capture_bytes += charge;
+            Some(CodeQueryCapture {
+                name: capture.name.clone(),
+                text,
                 start_line: capture.start_line,
-                start_column: capture.start_column,
-                end_line: capture.end_line,
-                end_column: capture.end_column,
-            }),
-            kind: if full_detail {
-                capture.kind.map(|kind| kind.label())
-            } else {
-                None
-            },
-            ast_id: full_detail
-                .then_some(capture.node)
-                .flatten()
-                .map(|node| super::super::occurrence_rows::ast_id(capture.source_identity, node)),
+                range: full_detail.then_some(CodeQueryRange {
+                    start_line: capture.start_line,
+                    start_column: capture.start_column,
+                    end_line: capture.end_line,
+                    end_column: capture.end_column,
+                }),
+                kind: if full_detail {
+                    capture.kind.map(|kind| kind.label())
+                } else {
+                    None
+                },
+                ast_id: full_detail.then_some(capture.node).flatten().map(|node| {
+                    super::super::occurrence_rows::ast_id(capture.source_identity, node)
+                }),
+            })
         })
-        .collect()
+        .collect();
+    if truncated {
+        cache.capture_truncated_rows += 1;
+    }
+    captures
 }
 
 pub(super) fn match_id(path: &str, kind: &str, span: Span) -> String {

@@ -11,7 +11,7 @@ use crate::analyzer::jvm::java_artifact::class_surface;
 
 use crate::analyzer::jvm::java_artifact::class_surface_facts;
 
-use crate::analyzer::jvm::java_artifact::zip_directory_status_with_limits;
+use crate::analyzer::jvm::java_artifact::zip_directory_status_seekable;
 
 use crate::analyzer::jvm::equivalent_java_type_identity;
 
@@ -66,14 +66,114 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::hash::HashSet;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use zip::ZipArchive;
 
+// Bound ZIP directory allocation, individual inflation, and aggregate class
+// output separately; raw JMOD bytes are charged by acquisition instead.
 const MAX_JMOD_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_JMOD_CLASS_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_JMOD_TOTAL_CLASS_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_JMOD_CENTRAL_DIRECTORY_BYTES: u64 = 32 * 1024 * 1024;
 const MODULE_INFO_ENTRY: &str = "classes/module-info.class";
+
+#[derive(Debug)]
+struct JmodReadCancelled;
+
+impl std::fmt::Display for JmodReadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JMOD read cancelled")
+    }
+}
+
+impl std::error::Error for JmodReadCancelled {}
+
+fn cancelled_jmod_read(
+    cancellation: Option<&CancellationToken>,
+    error: Option<&(dyn std::error::Error + 'static)>,
+) -> bool {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return true;
+    }
+    let mut current = error;
+    while let Some(cause) = current {
+        if let Some(zip::result::ZipError::Io(inner)) =
+            cause.downcast_ref::<zip::result::ZipError>()
+        {
+            current = Some(inner);
+            continue;
+        }
+        if cause.downcast_ref::<JmodReadCancelled>().is_some()
+            || cause
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::get_ref)
+                .is_some_and(|inner| inner.downcast_ref::<JmodReadCancelled>().is_some())
+        {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
+}
+
+struct CancellableArchive<R> {
+    inner: R,
+    cancellation: Option<CancellationToken>,
+}
+
+impl<R: Read> Read for CancellableArchive<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(io::Error::other(JmodReadCancelled));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for CancellableArchive<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(io::Error::other(JmodReadCancelled));
+        }
+        self.inner.seek(position)
+    }
+}
+
+fn read_decoded_entry(
+    reader: &mut impl Read,
+    max_entry: u64,
+    aggregate: &mut u64,
+    max_aggregate: u64,
+    cancellation: Option<&CancellationToken>,
+) -> io::Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(io::Error::other(JmodReadCancelled));
+        }
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(result);
+        }
+        *aggregate = aggregate.saturating_add(read as u64);
+        if result.len() as u64 + read as u64 > max_entry || *aggregate > max_aggregate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "JMOD decoded entry exceeded bound",
+            ));
+        }
+        result.extend_from_slice(&buffer[..read]);
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct JdkJmodSetPackProducer;
@@ -394,6 +494,9 @@ schema_version:
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards,
             }),
             completeness,
@@ -508,17 +611,14 @@ fn load_jmod_entry(
             budget,
         ));
     };
-    let bytes = source_entry.bytes();
-    if zip_directory_status_with_limits(
-        bytes,
-        MAX_JMOD_ARCHIVE_ENTRIES,
-        MAX_JMOD_CENTRAL_DIRECTORY_BYTES,
-    ) == crate::analyzer::jvm::java_artifact::ZipDirectoryStatus::Exceeded
-    {
+    let Ok(reader) = source_entry.reader() else {
+        if cancelled_jmod_read(cancellation, None) {
+            return None;
+        }
         diagnostics.error(
-            "limit.archive_directory",
+            "jdk.jmod.open",
             Some(relative_path.to_owned()),
-            "JDK JMOD central directory exceeds bounded entry or byte limits",
+            "could not open captured JMOD",
         );
         return Some(loaded_without_surfaces(
             Some(module),
@@ -526,10 +626,55 @@ fn load_jmod_entry(
             records_before,
             budget,
         ));
+    };
+    let mut reader = CancellableArchive {
+        inner: reader,
+        cancellation: cancellation.cloned(),
+    };
+    let directory_status = zip_directory_status_seekable(
+        &mut reader,
+        MAX_JMOD_ARCHIVE_ENTRIES,
+        MAX_JMOD_CENTRAL_DIRECTORY_BYTES,
+        || cancellation.is_some_and(CancellationToken::is_cancelled),
+    );
+    if cancelled_jmod_read(cancellation, None) {
+        return None;
     }
-    let mut archive = match ZipArchive::new(Cursor::new(bytes)) {
+    match directory_status {
+        crate::analyzer::jvm::java_artifact::ZipDirectoryStatus::Valid => {}
+        crate::analyzer::jvm::java_artifact::ZipDirectoryStatus::Exceeded => {
+            diagnostics.error(
+                "limit.archive_directory",
+                Some(relative_path.to_owned()),
+                "JDK JMOD central directory exceeds bounded entry or byte limits",
+            );
+            return Some(loaded_without_surfaces(
+                Some(module),
+                diagnostics,
+                records_before,
+                budget,
+            ));
+        }
+        crate::analyzer::jvm::java_artifact::ZipDirectoryStatus::Invalid => {
+            diagnostics.error(
+                "jdk.jmod.invalid",
+                Some(relative_path.to_owned()),
+                "JDK JMOD has no valid bounded central directory",
+            );
+            return Some(loaded_without_surfaces(
+                Some(module),
+                diagnostics,
+                records_before,
+                budget,
+            ));
+        }
+    }
+    let mut archive = match ZipArchive::new(reader) {
         Ok(archive) => archive,
-        Err(_) => {
+        Err(error) => {
+            if cancelled_jmod_read(cancellation, Some(&error)) {
+                return None;
+            }
             diagnostics.error(
                 "jdk.jmod.invalid",
                 Some(relative_path.to_owned()),
@@ -553,16 +698,26 @@ fn load_jmod_entry(
     }
     // The module descriptor decides which packages reach the pack, so it is
     // read before any class entry.
+    let mut total_class_bytes = 0u64;
     let module_info = match archive.by_name(MODULE_INFO_ENTRY) {
         Ok(mut entry) => {
-            let mut bytes = Vec::new();
-            if entry
-                .by_ref()
-                .take(MAX_JMOD_CLASS_ENTRY_BYTES.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .is_err()
-                || bytes.len() as u64 > MAX_JMOD_CLASS_ENTRY_BYTES
-            {
+            let bytes = read_decoded_entry(
+                &mut entry,
+                MAX_JMOD_CLASS_ENTRY_BYTES,
+                &mut total_class_bytes,
+                MAX_JMOD_TOTAL_CLASS_BYTES,
+                cancellation,
+            );
+            if cancelled_jmod_read(
+                cancellation,
+                bytes
+                    .as_ref()
+                    .err()
+                    .map(|error| error as &dyn std::error::Error),
+            ) {
+                return None;
+            }
+            if bytes.is_err() {
                 diagnostics.error(
                     "jdk.jmod.module_info",
                     Some(format!("{relative_path}:{MODULE_INFO_ENTRY}")),
@@ -570,10 +725,15 @@ fn load_jmod_entry(
                 );
                 None
             } else {
-                Some(bytes)
+                bytes.ok()
             }
         }
-        Err(_) => None,
+        Err(error) => {
+            if cancelled_jmod_read(cancellation, Some(&error)) {
+                return None;
+            }
+            None
+        }
     };
     let Some(exported_packages) = module_info
         .as_deref()
@@ -591,7 +751,6 @@ fn load_jmod_entry(
             budget,
         ));
     };
-    let mut total_class_bytes = 0u64;
     let mut class_entries = Vec::new();
     for index in 0..entry_limit {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -600,6 +759,15 @@ fn load_jmod_entry(
         let entry_name = archive
             .name_for_index(index)
             .expect("an index below the archive length names an entry");
+        if cancelled_jmod_read(
+            cancellation,
+            entry_name
+                .as_ref()
+                .err()
+                .map(|error| error as &dyn std::error::Error),
+        ) {
+            return None;
+        }
         let entry_name = match entry_name {
             Ok(name) => name,
             Err(error) => {
@@ -624,6 +792,9 @@ fn load_jmod_entry(
         }
         let class_entry = class_entry.name;
         let Ok(mut entry) = archive.by_index(index) else {
+            if cancelled_jmod_read(cancellation, None) {
+                return None;
+            }
             diagnostics.warning(
                 "jdk.jmod.entry",
                 Some(relative_path.to_owned()),
@@ -640,22 +811,30 @@ fn load_jmod_entry(
             );
             continue;
         }
-        total_class_bytes = next_total;
-        let mut class_bytes = Vec::with_capacity(entry.size() as usize);
-        if entry
-            .by_ref()
-            .take(MAX_JMOD_CLASS_ENTRY_BYTES.saturating_add(1))
-            .read_to_end(&mut class_bytes)
-            .is_err()
-            || class_bytes.len() as u64 > MAX_JMOD_CLASS_ENTRY_BYTES
-        {
+        let class_bytes = read_decoded_entry(
+            &mut entry,
+            MAX_JMOD_CLASS_ENTRY_BYTES,
+            &mut total_class_bytes,
+            MAX_JMOD_TOTAL_CLASS_BYTES,
+            cancellation,
+        );
+        if cancelled_jmod_read(
+            cancellation,
+            class_bytes
+                .as_ref()
+                .err()
+                .map(|error| error as &dyn std::error::Error),
+        ) {
+            return None;
+        }
+        let Ok(class_bytes) = class_bytes else {
             diagnostics.warning(
                 "jdk.jmod.entry_read",
                 Some(format!("{relative_path}:{class_entry}")),
                 "could not read bounded JMOD class entry bytes",
             );
             continue;
-        }
+        };
         class_entries.push((class_entry, class_bytes));
     }
     class_entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
@@ -664,8 +843,9 @@ fn load_jmod_entry(
     let mut surfaces = Vec::new();
     let mut parsed = Vec::new();
     let mut enclosing_scopes = super::java_artifact::EnclosingScopeResolver::default();
+    enclosing_scopes.limit_rereads_to(MAX_JMOD_TOTAL_CLASS_BYTES - total_class_bytes);
     for (class_entry, class_bytes) in class_entries {
-        let surface = match class_surface(
+        let outcome = class_surface(
             relative_path,
             &class_entry,
             &class_bytes,
@@ -681,7 +861,11 @@ fn load_jmod_entry(
             &mut budget.remaining,
             &mut budget.exhausted,
             &mut diagnostics,
-        ) {
+        );
+        if cancelled_jmod_read(cancellation, None) {
+            return None;
+        }
+        let surface = match outcome {
             JavaClassSurfaceOutcome::Declared(surface) => surface,
             JavaClassSurfaceOutcome::Excluded | JavaClassSurfaceOutcome::Skipped => continue,
             JavaClassSurfaceOutcome::Invalid => {
@@ -695,6 +879,7 @@ fn load_jmod_entry(
         };
         parsed.push(surface);
     }
+    enclosing_scopes.report_unread(&mut diagnostics, Some(relative_path), "jdk.jmod.entry_read");
     // Parsing reports before any surface is retained, and a module can retain
     // none, so what it reported travels with the read rather than with the
     // first retained surface.
@@ -1199,7 +1384,9 @@ mod tests {
 
     use brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_pack;
 
-    use brokk_bifrost_semantic::analyzer::semantic_model::producer::read_exact_source_set;
+    use brokk_bifrost_semantic::analyzer::semantic_model::producer::{
+        read_exact_source_set, read_exact_source_set_seekable_while,
+    };
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1578,12 +1765,14 @@ mod tests {
             .collect::<Vec<_>>();
         relative_paths.sort();
         let limits = DependencyPackLimits::default();
-        let artifact = read_exact_source_set(
+        let artifact = read_exact_source_set_seekable_while(
             &home,
             &relative_paths,
-            limits.max_source_files_per_artifact,
+            limits.max_source_files_per_artifact.min(512),
             limits.max_source_path_depth,
+            limits.max_total_artifact_bytes,
             &limits.producer,
+            || false,
         )
         .unwrap();
         let production = JdkJmodSetPackProducer.produce_loaded_artifact(
@@ -1834,5 +2023,214 @@ mod tests {
         )
         .expect_err("the bounded source-set reader must reject oversized JMOD input");
         assert_eq!(error.code, "limit.artifact_bytes");
+    }
+
+    #[test]
+    #[hardwon(
+        "#9171: native-library bytes blocked exact JMOD acquisition before indexed classes could be produced"
+    )]
+    fn streamed_jmod_admits_skipped_native_payload_and_hashes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let jmods = root.path().join("jmods");
+        fs::create_dir(&jmods).unwrap();
+        let path = jmods.join("java.base.jmod");
+        let class = test_class_file_bytes(&TestClassFile {
+            internal_name: "java/lang/Object",
+            super_internal_name: "java/lang/Object",
+            methods: &[],
+            private_nested: false,
+        });
+        let limits = ArtifactProducerLimits {
+            max_artifact_bytes: 1024,
+            ..ArtifactProducerLimits::default()
+        };
+        let relative = [PathBuf::from("jmods/java.base.jmod")];
+        write_jmod(&path, &[("classes/java/lang/Object.class", class.clone())]);
+        let mut scopes = super::super::java_artifact::EnclosingScopeResolver::default();
+        scopes.limit_rereads_to(0);
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        assert!(
+            scopes
+                .parameters(
+                    &super::super::java_artifact::EnclosingScope {
+                        class: "java/lang/Object".to_owned(),
+                        method: None,
+                    },
+                    &mut archive,
+                    "classes/",
+                    64
+                )
+                .is_none()
+        );
+        let small = read_exact_source_set(root.path(), &relative, 1, 8, &limits).unwrap();
+        let small_production = JdkJmodSetPackProducer.produce_loaded_artifact(
+            &request(root.path()),
+            &limits,
+            None,
+            &small,
+        );
+        assert_eq!(
+            small_production.completeness,
+            Completeness::Complete,
+            "{:?}",
+            small_production.diagnostics
+        );
+        let captured_small = read_exact_source_set_seekable_while(
+            root.path(),
+            &relative,
+            1,
+            8,
+            4096,
+            &limits,
+            || false,
+        )
+        .unwrap();
+        let captured_small_production = JdkJmodSetPackProducer.produce_loaded_artifact(
+            &request(root.path()),
+            &limits,
+            None,
+            &captured_small,
+        );
+        assert_eq!(captured_small.sha256(), small.sha256());
+        assert_eq!(
+            captured_small_production.completeness,
+            small_production.completeness
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                captured_small_production.pack.as_ref().unwrap().shards[0].payload
+            ),
+            format!(
+                "{:?}",
+                small_production.pack.as_ref().unwrap().shards[0].payload
+            )
+        );
+        let mut previous_digest = None;
+        for native in [vec![1_u8; 2048], vec![2_u8; 2048]] {
+            write_jmod(
+                &path,
+                &[
+                    ("classes/java/lang/Object.class", class.clone()),
+                    ("lib/libjvm.so", native),
+                ],
+            );
+            let error = read_exact_source_set(root.path(), &relative, 1, 8, &limits).unwrap_err();
+            assert_eq!(error.code, "limit.artifact_bytes");
+            let captured = read_exact_source_set_seekable_while(
+                root.path(),
+                &relative,
+                1,
+                8,
+                4096,
+                &limits,
+                || false,
+            )
+            .unwrap();
+            let produced = JdkJmodSetPackProducer.produce_loaded_artifact(
+                &request(root.path()),
+                &limits,
+                None,
+                &captured,
+            );
+            assert_eq!(
+                produced.completeness,
+                Completeness::Complete,
+                "{:?}",
+                produced.diagnostics
+            );
+            assert_eq!(
+                format!("{:?}", produced.pack.as_ref().unwrap().shards[0].payload),
+                format!(
+                    "{:?}",
+                    small_production.pack.as_ref().unwrap().shards[0].payload
+                )
+            );
+            assert_ne!(captured.sha256(), small.sha256());
+            if let Some(previous) = previous_digest.replace(captured.sha256().to_owned()) {
+                assert_ne!(previous, captured.sha256());
+            }
+        }
+    }
+
+    #[test]
+    #[hardwon("#9171: cancelled JMOD reads returned Interrupted, which read_exact retries forever")]
+    fn cancelled_archive_reads_return_promptly_from_zip_and_entries() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        struct CancelAfterRead {
+            inner: Cursor<Vec<u8>>,
+            token: CancellationToken,
+            armed: Arc<AtomicBool>,
+        }
+        impl Read for CancelAfterRead {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let length = buffer.len().min(1);
+                let read = self.inner.read(&mut buffer[..length])?;
+                if read != 0 && self.armed.load(Ordering::SeqCst) {
+                    self.token.cancel();
+                }
+                Ok(read)
+            }
+        }
+        impl Seek for CancelAfterRead {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("classes/module-info.class", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&vec![42_u8; 1024]).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let token = CancellationToken::new();
+            let reader = CancelAfterRead {
+                inner: Cursor::new(bytes.clone()),
+                token: token.clone(),
+                armed: Arc::new(AtomicBool::new(true)),
+            };
+            let result = zip::ZipArchive::new(CancellableArchive {
+                inner: reader,
+                cancellation: Some(token.clone()),
+            });
+            sender
+                .send(result.as_ref().err().is_some_and(|error| {
+                    cancelled_jmod_read(None, Some(error))
+                        && cancelled_jmod_read(Some(&token), Some(error))
+                }))
+                .unwrap();
+
+            let token = CancellationToken::new();
+            let armed = Arc::new(AtomicBool::new(false));
+            let reader = CancelAfterRead {
+                inner: Cursor::new(bytes),
+                token: token.clone(),
+                armed: armed.clone(),
+            };
+            let mut archive = zip::ZipArchive::new(CancellableArchive {
+                inner: reader,
+                cancellation: Some(token.clone()),
+            })
+            .unwrap();
+            let mut entry = archive.by_name("classes/module-info.class").unwrap();
+            armed.store(true, Ordering::SeqCst);
+            let mut aggregate = 0;
+            let result = read_decoded_entry(&mut entry, 2048, &mut aggregate, 2048, Some(&token));
+            sender
+                .send(result.as_ref().err().is_some_and(|error| {
+                    cancelled_jmod_read(None, Some(error))
+                        && cancelled_jmod_read(Some(&token), Some(error))
+                }))
+                .unwrap();
+        });
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 }

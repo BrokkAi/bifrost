@@ -104,7 +104,7 @@ fn dump_stored_structural_rows() -> DumpResult<()> {
             Language::Kotlin => publish(&store, &file, &brokk_bifrost_jvm_analysis::analyzer::kotlin::adapter::KotlinAdapter)?,
             Language::Scala => publish(&store, &file, &brokk_bifrost_jvm_analysis::analyzer::scala::adapter::ScalaAdapter)?,
             Language::Go => publish(&store, &file, &brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter)?,
-            Language::Rust => publish(&store, &file, &brokk_bifrost_rust_analysis::analyzer::rust::adapter::RustAdapter)?,
+            Language::Rust => publish(&store, &file, &brokk_bifrost_rust_analysis::analyzer::rust::adapter::RustAdapter::for_tests())?,
             Language::Cpp => publish(&store, &file, &brokk_bifrost_cpp_analysis::analyzer::cpp::adapter::CppAdapter)?,
             Language::Php => publish(&store, &file, &brokk_bifrost_php_analysis::analyzer::php::adapter::PhpAdapter)?,
             Language::Ruby => publish(&store, &file, &brokk_bifrost_ruby_analysis::analyzer::ruby::adapter::RubyAdapter)?,

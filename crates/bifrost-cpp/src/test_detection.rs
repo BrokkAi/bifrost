@@ -18,6 +18,7 @@ use brokk_bifrost_core::analyzer::test_assertions::{
     normalize_assertion_expression,
 };
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
+use brokk_bifrost_core::path_utils::rel_path_string;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -134,7 +135,10 @@ fn analyze_cpp_test_case(
     weights: &TestAssertionWeights,
     out: &mut Vec<TestAssertionSmell>,
 ) {
-    let symbol = file.to_string();
+    // C++ test macros declare no named code unit, so the file is the symbol.
+    // Render it slash-separated: `ProjectFile`'s `Display` uses the OS
+    // separator, which made the report differ on Windows.
+    let symbol = rel_path_string(file);
     let assertions: Vec<_> = collect_cpp_assertions(body, weights)
         .into_iter()
         .map(|assertion| TestAssertionSignal {

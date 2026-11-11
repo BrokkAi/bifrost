@@ -86,6 +86,7 @@ mod tests {
     /// `signature_metadata_limited`, `signatures_limited`, and
     /// `declaration_ranges_limited` need an analyzer and a `CodeUnit`. Each is pinned by its
     /// own behavior test instead.
+    // Python production now publishes native graph and dead-code capabilities.
     const CAPABILITY_MATRIX: &str = "\
 language   | ecosystem            | pass   | graph  | sep | strategy | bulk   | recv | facts | hl  | tflow | overlays
 Java       | Jvm                  | Java   | legacy | .   | yes      | Java   | -    | -     | yes | - | yes
@@ -93,7 +94,7 @@ Go         | Go                   | Go     | native | /   | yes      | Go     | 
 Cpp        | Cpp                  | Cpp    | legacy | ::  | -        | Cpp    | yes  | -     | yes | - | -
 JavaScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes | -
 TypeScript | JavaScriptTypeScript | JsTs   | legacy | .   | yes      | JsTs   | -    | yes   | yes | yes | -
-Python     | Python               | Python | legacy | .   | -        | Python | yes  | -     | yes | yes | yes
+Python     | Python               | Python | native | .   | yes      | Python | yes  | -     | yes | yes | yes
 Rust       | Rust                 | Rust   | native | .   | yes      | Rust   | yes  | -     | yes | - | yes
 Php        | Php                  | Php    | legacy | .   | yes      | Php    | yes  | -     | yes | yes | -
 Scala      | Jvm                  | Scala  | legacy | .   | yes      | Scala  | yes  | -     | yes | - | yes

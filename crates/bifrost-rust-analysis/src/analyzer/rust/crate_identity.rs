@@ -45,12 +45,15 @@
 use crate::analyzer::semantic_model::SemanticModelCompleteness;
 use std::sync::Arc;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
+use brokk_bifrost_analysis::analyzer::semantic_model::overlay::{
+    RustReexportLookup, RustReexportNamespace, SemanticModelOverlay,
+    SemanticModelOverlayDisposition,
+};
 
 use crate::analyzer::semantic_model::SemanticModelSymbol;
 
 use crate::analyzer::semantic_model::SemanticModelSymbolKind;
-use brokk_bifrost_rust::diagnostics::RustCrateSurface;
+use brokk_bifrost_rust::diagnostics::{RustCrateSurface, RustPathPublication};
 
 /// The activated overlay, read as a Cargo crate index.
 #[derive(Clone, Copy)]
@@ -83,7 +86,9 @@ impl<'a> RustOverlayCrates<'a> {
     /// trace nor a diagnostic picks an arbitrary winner between, say, two
     /// versions of the same crate.
     pub(crate) fn unique_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
-        self.overlay?.symbols_named(qualified_name).unique()
+        self.overlay?
+            .symbols_named_in_family(qualified_name, "rust")
+            .unique()
     }
 
     /// The unique symbol a Rust reference may resolve to: one visible, public
@@ -121,7 +126,7 @@ impl<'a> RustOverlayCrates<'a> {
     fn publishes_crate_root(&self, root: &str) -> bool {
         self.overlay.is_some_and(|overlay| {
             overlay
-                .symbols_named(root)
+                .symbols_named_for(root, "rust")
                 .records
                 .iter()
                 .any(|symbol| Self::names_crate_root(symbol, root))
@@ -138,10 +143,47 @@ impl<'a> RustOverlayCrates<'a> {
     /// in each of them.
     #[doc(hidden)]
     pub fn referenceable_symbol(&self, qualified_name: &str) -> Option<Arc<SemanticModelSymbol>> {
+        self.referenceable_symbol_in_namespace(qualified_name, RustReexportNamespace::Unknown)
+    }
+
+    pub(crate) fn referenceable_symbol_in_namespace(
+        &self,
+        qualified_name: &str,
+        namespace: RustReexportNamespace,
+    ) -> Option<Arc<SemanticModelSymbol>> {
         let root = qualified_name.split('.').next()?;
-        self.publishes_crate_root(root)
-            .then(|| self.visible_symbol(qualified_name))
-            .flatten()
+        if !self.publishes_crate_root(root) {
+            return None;
+        }
+        match self
+            .overlay?
+            .rust_reexport_lookup_recording(qualified_name, namespace)
+        {
+            RustReexportLookup::Bound { symbol } => return Some(symbol),
+            RustReexportLookup::MissingEvidence(_) => return None,
+            RustReexportLookup::Absent => {}
+        }
+        if namespace == RustReexportNamespace::Unknown {
+            return self.visible_symbol(qualified_name);
+        }
+        let matched = self
+            .overlay?
+            .symbols_named_in_family(qualified_name, "rust");
+        if matches!(
+            matched.disposition,
+            SemanticModelOverlayDisposition::Open(_)
+        ) {
+            return None;
+        }
+        let mut candidates = matched
+            .records
+            .into_iter()
+            .filter(|symbol| namespace.accepts(symbol.kind));
+        let symbol = candidates.next()?;
+        if candidates.next().is_some() || symbol.provenance.ambiguous {
+            return None;
+        }
+        SemanticModelOverlay::symbol_is_visible_public(&symbol, "rust").then_some(symbol)
     }
 
     /// How completely the activated packs describe `crate_name`.
@@ -155,7 +197,7 @@ impl<'a> RustOverlayCrates<'a> {
     pub(crate) fn crate_surface(&self, crate_name: &str) -> RustCrateSurface {
         let roots = self
             .overlay
-            .map(|overlay| overlay.symbols_named(crate_name))
+            .map(|overlay| overlay.symbols_named_for(crate_name, "rust"))
             .map(|matched| {
                 matched
                     .records
@@ -173,11 +215,9 @@ impl<'a> RustOverlayCrates<'a> {
         // answer here together, and an item missing from the partial one is not
         // thereby missing from the crate.
         //
-        // The rustdoc producer records a pack partial whenever it emitted any
-        // diagnostic: a glob or cross-crate re-export it could not follow, a
-        // blanket impl it could not project, or -- see `rust::external` -- a
-        // feature set that is not the one Cargo resolves for this workspace.
-        // Any of those means a miss against this surface is not proof.
+        // Real declaration-extraction limits make the surface partial. Route
+        // uncertainty is tracked separately by `publishes_path`, so ordinary
+        // declarations remain complete when a re-export cannot be expanded.
         if roots.contains(&SemanticModelCompleteness::Partial) {
             return RustCrateSurface::Uncertain {
                 detail: format!(
@@ -190,9 +230,28 @@ impl<'a> RustOverlayCrates<'a> {
 
     /// Whether the packs publish the path `segments` spells as a visible,
     /// public Rust declaration this workspace can name.
-    pub(crate) fn publishes_path(&self, segments: &[String]) -> bool {
-        self.referenceable_symbol(&Self::pack_name(segments))
-            .is_some()
+    pub(crate) fn publishes_path(&self, segments: &[String]) -> RustPathPublication {
+        let path = Self::pack_name(segments);
+        let Some(root) = segments.first() else {
+            return RustPathPublication::NotPublished;
+        };
+        if !self.publishes_crate_root(root) {
+            return RustPathPublication::NotPublished;
+        }
+        let Some(overlay) = self.overlay else {
+            return RustPathPublication::NotPublished;
+        };
+        match overlay.rust_reexport_lookup_recording(&path, RustReexportNamespace::Unknown) {
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::RustReexportLookup::Bound { .. } => RustPathPublication::Published,
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::RustReexportLookup::MissingEvidence(reason) => RustPathPublication::Unknown { detail: format!("Rust re-export route for `{path}` lacks exact evidence: {reason:?}") },
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::RustReexportLookup::Absent => {
+                if self.visible_symbol(&path).is_some() {
+                    RustPathPublication::Published
+                } else {
+                    RustPathPublication::NotPublished
+                }
+            }
+        }
     }
 
     /// Whether the packs publish `segments` as a module.
@@ -202,7 +261,10 @@ impl<'a> RustOverlayCrates<'a> {
     /// a trait bound or a `Deref` chain can supply a method that the type's
     /// own impls never mention, so a miss under a type owner is never proof.
     pub(crate) fn is_module_surface(&self, segments: &[String]) -> bool {
-        self.referenceable_symbol(&Self::pack_name(segments))
-            .is_some_and(|symbol| symbol.kind == SemanticModelSymbolKind::Module)
+        self.referenceable_symbol_in_namespace(
+            &Self::pack_name(segments),
+            RustReexportNamespace::TypeOrModule,
+        )
+        .is_some_and(|symbol| symbol.kind == SemanticModelSymbolKind::Module)
     }
 }

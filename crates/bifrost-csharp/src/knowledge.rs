@@ -9,6 +9,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct CSharpKnowledge;
 
 impl LanguageKnowledge for CSharpKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn models_compose_from_catalog_rows(&self) -> bool {
         true
     }

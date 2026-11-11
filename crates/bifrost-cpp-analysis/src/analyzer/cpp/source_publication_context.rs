@@ -238,7 +238,7 @@ pub(crate) fn insert(
 }
 
 pub(crate) fn read(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     blob_id: i64,
     facts: &mut CppSourceFacts,
     keep_going: &dyn Fn() -> bool,

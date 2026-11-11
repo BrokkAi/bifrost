@@ -28,10 +28,11 @@
 
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, DenseBidirectionalGraph,
-    Dominators, GenKillFacts, Reachability, ReachingSets, dominators, forward_reachability,
-    reaching_definitions, reverse_reachability,
+    Dominators, FeasibleSuccessors, GenKillFacts, LiveValueSets, Reachability, ReachingSets,
+    dominators, forward_reachability, live_values, reaching_definitions, reverse_reachability,
 };
 use crate::analyzer::semantic::derive_property_reaching_over_graph;
+use crate::analyzer::semantic::statement_entries::CandidateControlRouteIndex;
 use crate::analyzer::semantic::{
     BindingOriginIndex, CallContinuationKind, CallInvocationMode, CallSiteHandle, CallSiteId,
     CallToReturnModel, CallTransferSet, CallableTarget, CallableTargetResolution,
@@ -50,6 +51,7 @@ use crate::analyzer::semantic::{
 use crate::analyzer::semantic_model::{
     ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey, ResolvedActiveSemanticModels,
 };
+use crate::analyzer::store::active_models::FamilyPresence;
 use crate::analyzer::usages::CallRelationLimits;
 use crate::analyzer::usages::call_shape::{CallShapeReport, call_shapes_in_file};
 use crate::analyzer::usages::effects::{
@@ -829,6 +831,23 @@ pub enum OverwrittenUnreadAnswer {
     },
 }
 
+/// Source-level write liveness. `Dead` means no explicit access, move, borrow,
+/// compound-assignment load, or capture can read this value on a modeled
+/// continuation. Implicit drops are excluded. In particular this is not a
+/// claim that the value has no observable effect: a destructor can observe it.
+/// Consumers must never use `Dead` to delete or optimize a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeadWriteAnswer {
+    Dead,
+    Live {
+        read_event: usize,
+    },
+    Unreachable,
+    Open {
+        reasons: Vec<FlowStateIncompleteReason>,
+    },
+}
+
 /// Exact syntax spans supplied from the same source snapshot as a semantic
 /// procedure. The adapter supplies AST fields, not searched source text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1040,10 +1059,30 @@ impl FlowStateDerivation {
             .cloned()
             .collect::<Vec<_>>();
         let semantics = procedure.semantics();
+        if request.candidate_routes.as_ref().map(|(key, _)| key) != Some(procedure) {
+            let index = match CandidateControlRouteIndex::build(
+                semantics,
+                &mut CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation),
+            ) {
+                Ok(index) => index,
+                Err(error) => {
+                    let mut reasons = Vec::new();
+                    push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                    return BindingInitializationAnswer::Open { reasons };
+                }
+            };
+            request.candidate_routes = Some((procedure.clone(), index));
+        }
+        let candidate_paths = &request.candidate_routes.as_ref().expect("indexed routes").1;
         // A discharged control gap still omits edges. They cannot uninitialize
         // the binding, but they can make a modeled-unreachable event reachable.
         let mut omitted_control = Vec::new();
         for gap in semantics.gaps() {
+            if candidate_paths.has_candidate_edge(gap.evidence)
+                && !candidate_paths.contains(gap.evidence, self.event(event).point)
+            {
+                continue;
+            }
             let axes = capability_axes_blocked_by(gap.capability);
             if !(axes.contains(&FlowStateAxis::BindingEvents)
                 || axes.contains(&FlowStateAxis::ReachingRelation)
@@ -1612,6 +1651,316 @@ impl FlowStateDerivation {
         }
     }
 
+    /// Classify one ordinary binding establishment by explicit source reads.
+    /// This relation is shared across languages; syntax qualification belongs
+    /// to the caller. An unmodeled drop does not affect source read liveness.
+    pub fn dead_write_local(
+        &self,
+        procedure: &ProcedureHandle,
+        establishment_event: usize,
+        request: &mut FlowStateRequest<'_>,
+    ) -> DeadWriteAnswer {
+        self.dead_write_local_with_macro_sources(procedure, establishment_event, &[], &[], request)
+    }
+
+    /// `macro_sources` are AST-verified macro invocation source mappings;
+    /// `safe_macro_sources` are the subset resolved to local macro_rules with
+    /// no identifier token spelling this binding. Both are query-time source
+    /// evidence and are used only for this explicit-read relation.
+    pub fn dead_write_local_with_macro_sources(
+        &self,
+        procedure: &ProcedureHandle,
+        establishment_event: usize,
+        macro_sources: &[SourceMappingId],
+        safe_macro_sources: &[SourceMappingId],
+        request: &mut FlowStateRequest<'_>,
+    ) -> DeadWriteAnswer {
+        self.dead_write_local_with_feasible_edges(
+            procedure,
+            establishment_event,
+            macro_sources,
+            safe_macro_sources,
+            &[],
+            request,
+        )
+    }
+
+    /// Dead-write liveness over the shared feasible-successor view.
+    pub fn dead_write_local_with_feasible_edges(
+        &self,
+        procedure: &ProcedureHandle,
+        establishment_event: usize,
+        macro_sources: &[SourceMappingId],
+        safe_macro_sources: &[SourceMappingId],
+        infeasible_edges: &[ControlEdgeId],
+        request: &mut FlowStateRequest<'_>,
+    ) -> DeadWriteAnswer {
+        assert_eq!(self.procedure, procedure.id());
+        assert!(
+            self.procedure_artifact
+                .upgrade()
+                .is_some_and(|artifact| Arc::ptr_eq(&artifact, procedure.artifact()))
+        );
+        let origin = self.event(establishment_event);
+        assert_eq!(origin.event_class, StateEventClass::Establish);
+        let FlowSubject::Binding { value: binding } = origin.subject else {
+            panic!("dead-write proof requires an ordinary binding");
+        };
+        let semantics = procedure.semantics();
+        assert!(matches!(
+            semantics.value(binding).expect("binding exists").kind,
+            SemanticValueKind::Local | SemanticValueKind::Parameter { .. }
+        ));
+        let procedure_key = (
+            Arc::as_ptr(procedure.artifact()) as usize,
+            procedure.id(),
+            self.generation,
+        );
+        let procedure_index = request
+            .dead_write_procedure_cache
+            .entry(procedure_key)
+            .or_insert_with(|| Arc::new(dead_write_procedure_index(self, procedure)))
+            .clone();
+        let mut omitted_edges = self
+            .control_edge_mask
+            .omitted
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        omitted_edges.extend_from_slice(infeasible_edges);
+        omitted_edges.sort_unstable();
+        omitted_edges.dedup();
+        let macro_points = macro_sources
+            .iter()
+            .filter(|source| safe_macro_sources.binary_search(source).is_err())
+            .flat_map(|source| procedure_index.macro_gap_points_by_source.get(source))
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut entry_reachable = None;
+        let mut gap_reachable = HashMap::default();
+        if !macro_points.is_empty() {
+            let entry = match self.cached_dead_write_reachability(
+                procedure,
+                procedure_key,
+                &omitted_edges,
+                infeasible_edges,
+                semantics.entry_point(),
+                request,
+            ) {
+                Ok(reachable) => reachable,
+                Err(error) => {
+                    let mut reasons = Vec::new();
+                    push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                    return DeadWriteAnswer::Open { reasons };
+                }
+            };
+            for point in macro_points {
+                if !entry.membership()[point.index()] {
+                    continue;
+                }
+                let reachable = match self.cached_dead_write_reachability(
+                    procedure,
+                    procedure_key,
+                    &omitted_edges,
+                    infeasible_edges,
+                    point,
+                    request,
+                ) {
+                    Ok(reachable) => reachable,
+                    Err(error) => {
+                        let mut reasons = Vec::new();
+                        push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                        return DeadWriteAnswer::Open { reasons };
+                    }
+                };
+                gap_reachable.insert(point, reachable);
+            }
+            entry_reachable = Some(entry);
+        }
+        let mut reasons = self
+            .overwrite_observation_completeness(procedure)
+            .reasons()
+            .iter()
+            .filter(|reason| {
+                !matches!(
+                    reason,
+                    FlowStateIncompleteReason::BindingWithoutEstablishment { .. }
+                ) && (reason.blocks(FlowStateAxis::BindingEvents)
+                    || reason.blocks(FlowStateAxis::ReachingRelation)
+                    || matches!(
+                        reason,
+                        FlowStateIncompleteReason::LoweringGap {
+                            capability: SemanticCapability::Captures,
+                            ..
+                        }
+                    ))
+            })
+            .filter(|reason| {
+                !drop_omission_gap(semantics, reason)
+                    && !(procedure.artifact().key().language().language() == Language::Rust
+                        && nonrejoining_rust_abort_gap(semantics, reason))
+                    && !opaque_macro_gap_irrelevant(
+                        semantics,
+                        reason,
+                        macro_sources,
+                        safe_macro_sources,
+                        // A macro before this write may suppress the write
+                        // itself. Only a macro unreachable from procedure
+                        // entry can be discarded on CFG grounds.
+                        |point| {
+                            entry_reachable
+                                .as_ref()
+                                .is_some_and(|reachable| reachable.membership()[point.index()])
+                        },
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Closure cells and address-taken bindings have reads outside the
+        // ordinary binding event vocabulary, so absence is not provable.
+        if procedure_index.escaped_bindings.contains(&binding) {
+            reasons.push(FlowStateIncompleteReason::BindingStateNotClosed { binding });
+        }
+        // The established overwrite proof already checked these same
+        // binding events and places point-local gaps only in the value's
+        // live region. A later gap after the replacement cannot read this
+        // value. Reuse that complete certificate before applying this
+        // relation's otherwise conservative procedure-wide gap gate.
+        if !reasons.is_empty()
+            // The overwrite certificate starts at this establishment. An
+            // opaque macro reachable before it may return without executing
+            // the write at all; the suffix certificate cannot prove that
+            // source-level reachability. Keep that macro gap Open.
+            && !reasons.iter().any(|reason| {
+                let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+                    return false;
+                };
+                gaps.iter().any(|id| {
+                    semantics.gap(*id).is_some_and(|gap| {
+                        macro_sources.binary_search(&gap.source).is_ok()
+                            && entry_reachable.as_ref().is_some_and(|reachable|
+                                reachable.membership()[gap.point.index()])
+                            && gap_reachable.get(&gap.point).is_some_and(|reachable: &Arc<Reachability<ProgramPointId>>|
+                                reachable.membership()[origin.point.index()])
+                    })
+                })
+            })
+            && matches!(
+                self.overwritten_unread_local(procedure, establishment_event, request),
+                OverwrittenUnreadAnswer::Proven { .. }
+            )
+        {
+            return DeadWriteAnswer::Dead;
+        }
+        if !reasons.is_empty() {
+            return DeadWriteAnswer::Open { reasons };
+        }
+        // All establishments of this binding share entry reachability,
+        // ordered read/write events and the backward may-liveness solve.
+        // Cache only within the request and retain its artifact identity.
+        let reachable = entry_reachable.map_or_else(
+            || {
+                self.cached_dead_write_reachability(
+                    procedure,
+                    procedure_key,
+                    &omitted_edges,
+                    infeasible_edges,
+                    semantics.entry_point(),
+                    request,
+                )
+            },
+            Ok,
+        );
+        let key = (procedure_key, binding, omitted_edges);
+        let prepared = if let Some(entry) = request.dead_write_cache.get(&key) {
+            entry.outcome.clone()
+        } else {
+            let outcome = reachable.and_then(|reachable| {
+                let mut cfg_request =
+                    CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
+                with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+                    let graph = &FeasibleSuccessors::new(graph, infeasible_edges.iter().copied());
+                    prepare_dead_write_over_graph(
+                        graph,
+                        &self.events,
+                        &self.event_keys,
+                        procedure_index
+                            .events_by_binding
+                            .get(&binding)
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[]),
+                        reachable,
+                        &mut cfg_request,
+                    )
+                })
+                .map(Arc::new)
+            });
+            request.dead_write_cache.insert(
+                key,
+                DeadWriteCacheEntry {
+                    _artifact: Arc::clone(procedure.artifact()),
+                    outcome: outcome.clone(),
+                },
+            );
+            outcome
+        };
+        let result = prepared.and_then(|prepared| {
+            let mut cfg_request =
+                CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
+            with_control_graph!(semantics, &self.control_edge_mask, |graph| {
+                let graph = &FeasibleSuccessors::new(graph, infeasible_edges.iter().copied());
+                dead_write_from_prepared(
+                    graph,
+                    &self.events,
+                    &self.event_keys,
+                    establishment_event,
+                    &prepared,
+                    &mut cfg_request,
+                )
+            })
+        });
+        match result {
+            Ok(answer) => answer,
+            Err(error) => {
+                let mut reasons = Vec::new();
+                push_algorithm_reason(error, FlowStateAxis::ReachingRelation, &mut reasons);
+                DeadWriteAnswer::Open { reasons }
+            }
+        }
+    }
+
+    fn cached_dead_write_reachability(
+        &self,
+        procedure: &ProcedureHandle,
+        procedure_key: DeadWriteProcedureKey,
+        omitted_edges: &[ControlEdgeId],
+        infeasible_edges: &[ControlEdgeId],
+        start: ProgramPointId,
+        request: &mut FlowStateRequest<'_>,
+    ) -> Result<Arc<Reachability<ProgramPointId>>, CfgAlgorithmError<ProgramPointId>> {
+        let key = (procedure_key, omitted_edges.to_vec(), start);
+        if let Some(entry) = request.dead_write_reachability_cache.get(&key) {
+            return entry.outcome.clone();
+        }
+        let mut cfg_request =
+            CfgAlgorithmRequest::new(&mut request.cfg_budget, request.cancellation);
+        let outcome =
+            with_control_graph!(procedure.semantics(), &self.control_edge_mask, |graph| {
+                let graph = &FeasibleSuccessors::new(graph, infeasible_edges.iter().copied());
+                forward_reachability(graph, start, &mut cfg_request)
+            })
+            .map(Arc::new);
+        request.dead_write_reachability_cache.insert(
+            key,
+            DeadWriteReachabilityCacheEntry {
+                _artifact: Arc::clone(procedure.artifact()),
+                outcome: outcome.clone(),
+            },
+        );
+        outcome
+    }
+
     /// Join an exact source loop to its body and own repeat edge, then ask
     /// whether the body can reach that edge before leaving this invocation of
     /// the loop. The source adapter must validate the prepared syntax against
@@ -1876,6 +2225,7 @@ impl FlowStateDerivation {
                     SemanticEffect::ValueFlow {
                         kind:
                             ValueFlowKind::Transfer(_)
+                            | ValueFlowKind::OwnershipUnknown
                             | ValueFlowKind::ReferenceBoxing
                             | ValueFlowKind::ReferenceUnboxing,
                         source,
@@ -4517,13 +4867,21 @@ impl FileFlowState {
 }
 
 /// Borrowed controls for one derivation.
+type DeadWriteProcedureKey = (usize, ProcedureId, u64);
+type DeadWriteControlKey = (DeadWriteProcedureKey, Vec<ControlEdgeId>, ProgramPointId);
+type DeadWriteBindingKey = (DeadWriteProcedureKey, ValueId, Vec<ControlEdgeId>);
+
 #[derive(Debug)]
 pub struct FlowStateRequest<'request> {
     pub cancellation: &'request CancellationToken,
+    dead_write_procedure_cache: HashMap<DeadWriteProcedureKey, Arc<DeadWriteProcedureIndex>>,
+    dead_write_reachability_cache: HashMap<DeadWriteControlKey, DeadWriteReachabilityCacheEntry>,
+    dead_write_cache: HashMap<DeadWriteBindingKey, DeadWriteCacheEntry>,
     /// The CFG-algorithm budget stays crate-private: it is this crate's own
     /// work vocabulary, and an out-of-crate caller configures a derivation
     /// through [`FlowStateRequest::new`], not by naming budget dimensions.
     pub(crate) cfg_budget: CfgAlgorithmBudget,
+    candidate_routes: Option<(ProcedureHandle, CandidateControlRouteIndex)>,
     control_projection: Option<&'request FlowControlProjection>,
     /// Outer `None` means this raw derivation did not select semantic models.
     /// `Some(None)` deliberately freezes no publication; `Some(Some(_))`
@@ -4540,7 +4898,11 @@ impl<'request> FlowStateRequest<'request> {
     pub fn new(cancellation: &'request CancellationToken) -> Self {
         Self {
             cancellation,
+            dead_write_procedure_cache: HashMap::default(),
+            dead_write_reachability_cache: HashMap::default(),
+            dead_write_cache: HashMap::default(),
             cfg_budget: CfgAlgorithmBudget::default(),
+            candidate_routes: None,
             control_projection: None,
             active_semantic_model_snapshot: None,
             nonreturn_discovery_cache: None,
@@ -4623,6 +4985,18 @@ fn normal_continuation_absence_accepts(
     normal_continuation_absence_accepts_arity(models, shape, has_receiver, shape.arguments.len())
 }
 
+/// Go's absence candidates come from a Go-realm question, which never reaches
+/// the JVM-family owner and so is never open.
+fn go_has_normal_continuation_absence_candidates(models: &ResolvedActiveSemanticModels) -> bool {
+    match models.has_normal_continuation_absence_candidates(Language::Go.config_label()) {
+        FamilyPresence::Present => true,
+        FamilyPresence::Absent => false,
+        FamilyPresence::Open(open) => {
+            unreachable!("a Go realm question has no JVM-family part: {open:?}")
+        }
+    }
+}
+
 fn normal_continuation_absence_accepts_arity(
     models: &ResolvedActiveSemanticModels,
     shape: &CallShapeReport,
@@ -4636,18 +5010,21 @@ fn normal_continuation_absence_accepts_arity(
         return false;
     };
     let language = crate::analyzer::common::language_for_file(&shape.outcome.file).config_label();
-    models
-        .normal_continuation_absence_candidate_owners(language, member, has_receiver)
-        .iter()
-        .any(|owner| {
-            models.proves_normal_continuation_absent(ProcedureSummaryMemberKey::new(
-                language,
-                owner,
-                member,
-                has_receiver,
-                parameter_count,
-            ))
-        })
+    // An open owner list proves nothing, so the call keeps its continuation.
+    let Ok(owners) =
+        models.normal_continuation_absence_candidate_owners(language, member, has_receiver)
+    else {
+        return false;
+    };
+    owners.iter().any(|owner| {
+        models.proves_normal_continuation_absent(ProcedureSummaryMemberKey::new(
+            language,
+            owner,
+            member,
+            has_receiver,
+            parameter_count,
+        ))
+    })
 }
 
 fn normal_continuation_absence_accepts_written_or_implicit_receiver(
@@ -4927,9 +5304,7 @@ fn derive_modeled_control_projection(
     if crate::analyzer::common::language_for_file(file) != Language::Go {
         return ModeledControlProjectionDerivation::default();
     }
-    if !models.has_normal_continuation_absence_candidates(Language::Go.config_label())
-        || cancellation.is_cancelled()
-    {
+    if !go_has_normal_continuation_absence_candidates(models) || cancellation.is_cancelled() {
         return ModeledControlProjectionDerivation::default();
     }
 
@@ -5454,9 +5829,7 @@ fn derive_workspace_nonreturn_projection(
     let language = crate::analyzer::common::language_for_file(file);
     let go_models_can_diverge = language == Language::Go
         && snapshot.is_some_and(|snapshot| {
-            snapshot
-                .active_models()
-                .has_normal_continuation_absence_candidates(Language::Go.config_label())
+            go_has_normal_continuation_absence_candidates(snapshot.active_models())
         });
     let python_source_can_diverge = language == Language::Python
         && python_has_local_nonreturn_candidate(artifact, requested_procedure);
@@ -6617,9 +6990,7 @@ fn flow_state_for_materialized_outcome(
     let python_has_modeled_or_source_nonreturn = language == Language::Python
         && python_has_local_nonreturn_candidate(&artifact, requested_procedure);
     let go_has_nonreturn_models = active_snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot
-            .active_models()
-            .has_normal_continuation_absence_candidates(Language::Go.config_label())
+        go_has_normal_continuation_absence_candidates(snapshot.active_models())
     });
     if python_has_modeled_or_source_nonreturn
         || (language == Language::Go && go_has_nonreturn_models)
@@ -8803,6 +9174,334 @@ struct OverwrittenUnreadWalkInputs<'a> {
     establishment_event: usize,
     binding: ValueId,
     gaps_by_point: &'a BTreeMap<ProgramPointId, Vec<SemanticGapId>>,
+}
+
+fn drop_omission_gap(semantics: &ProcedureSemantics, reason: &FlowStateIncompleteReason) -> bool {
+    let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+        return false;
+    };
+    !gaps.is_empty()
+        && gaps.iter().all(|id| {
+            semantics.gap(*id).is_some_and(|gap| {
+                [
+                    "implicit Drop order and cleanup routing are not lowered",
+                    "resource release depends on inferred types and Drop implementations",
+                    "implicit Drop::drop invocations are not emitted as fabricated call sites",
+                    "destructor unwinding and destructor panic routing are not lowered",
+                ]
+                .iter()
+                .any(|suffix| gap.detail.ends_with(suffix))
+                    && matches!(
+                        gap.capability,
+                        SemanticCapability::CleanupControlFlow
+                            | SemanticCapability::ResourceManagement
+                            | SemanticCapability::Calls
+                            | SemanticCapability::ExceptionalControlFlow
+                    )
+            })
+        })
+}
+
+/// Rust's non-rejoining exceptional-flow discharge describes only an abort
+/// route out of this procedure, including routes with inert binding drops or
+/// other exit-only cleanup. That route cannot reach an explicit source read.
+/// Other gaps at the same point are checked independently, including opaque
+/// macro gaps; this certificate does not make a write safe to delete.
+fn nonrejoining_rust_abort_gap(
+    semantics: &ProcedureSemantics,
+    reason: &FlowStateIncompleteReason,
+) -> bool {
+    let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+        return false;
+    };
+    !gaps.is_empty()
+        && gaps.iter().all(|id| {
+            semantics.gap(*id).is_some_and(|gap| {
+                gap.subject == SemanticGapSubject::Point
+                    && gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.kind == SemanticGapKind::Unsupported
+                    && matches!(
+                        gap.discharge,
+                        SemanticGapDischarge::NonRejoiningExceptionalExit
+                            | SemanticGapDischarge::NonRejoiningExceptionalExitAfterInertDrops
+                            | SemanticGapDischarge::ExitOnlyProcedureCompletion
+                    )
+            })
+        })
+}
+
+fn opaque_macro_gap_irrelevant(
+    semantics: &ProcedureSemantics,
+    reason: &FlowStateIncompleteReason,
+    macro_sources: &[SourceMappingId],
+    safe_macro_sources: &[SourceMappingId],
+    reaches: impl Fn(ProgramPointId) -> bool,
+) -> bool {
+    let FlowStateIncompleteReason::LoweringGap { gaps, .. } = reason else {
+        return false;
+    };
+    !gaps.is_empty()
+        && gaps.iter().all(|id| {
+            semantics.gap(*id).is_some_and(|gap| {
+                gap.subject == SemanticGapSubject::Point
+                    && gap.capability == SemanticCapability::NormalControlFlow
+                    && gap.kind == SemanticGapKind::Unsupported
+                    && macro_sources.binary_search(&gap.source).is_ok()
+                    && (safe_macro_sources.binary_search(&gap.source).is_ok()
+                        || !reaches(gap.point))
+            })
+        })
+}
+
+#[derive(Debug)]
+struct DeadWritePrepared {
+    reachable: Arc<Reachability<ProgramPointId>>,
+    ordered: Vec<Vec<(u32, usize, StateEventClass)>>,
+    liveness: LiveValueSets,
+    distance_to_read: Vec<usize>,
+    witness_by_point: Vec<Option<usize>>,
+}
+
+#[derive(Debug)]
+struct DeadWriteProcedureIndex {
+    _artifact: Arc<SemanticArtifact>,
+    events_by_binding: HashMap<ValueId, Vec<usize>>,
+    escaped_bindings: HashSet<ValueId>,
+    macro_gap_points_by_source: HashMap<SourceMappingId, Vec<ProgramPointId>>,
+}
+
+#[derive(Debug)]
+struct DeadWriteReachabilityCacheEntry {
+    _artifact: Arc<SemanticArtifact>,
+    outcome: Result<Arc<Reachability<ProgramPointId>>, CfgAlgorithmError<ProgramPointId>>,
+}
+
+fn dead_write_procedure_index(
+    derivation: &FlowStateDerivation,
+    procedure: &ProcedureHandle,
+) -> DeadWriteProcedureIndex {
+    let semantics = procedure.semantics();
+    let mut events_by_binding: HashMap<ValueId, Vec<usize>> = HashMap::default();
+    for event in &derivation.events {
+        if let FlowSubject::Binding { value } = event.subject
+            && (event.event_class == StateEventClass::Establish
+                || event.event_class == StateEventClass::Read
+                    && event.read_cause != Some(StateEventReadCause::ScopeEndDrop))
+        {
+            events_by_binding
+                .entry(value)
+                .or_default()
+                .push(event.event);
+        }
+    }
+    let mut escaped_bindings = HashSet::default();
+    for location in semantics.memory_locations() {
+        match location.kind {
+            MemoryLocationKind::LexicalCell { binding }
+            | MemoryLocationKind::Capture {
+                binding: Some(binding),
+                ..
+            } => {
+                escaped_bindings.insert(binding);
+            }
+            _ => {}
+        }
+    }
+    for capture in semantics.captures() {
+        match capture.captured {
+            crate::analyzer::semantic::CaptureSource::Value(value)
+                if capture.mode != crate::analyzer::semantic::CaptureMode::Value =>
+            {
+                escaped_bindings.insert(value);
+            }
+            crate::analyzer::semantic::CaptureSource::Location(location) => {
+                if let Some(MemoryLocationKind::LexicalCell { binding }) = semantics
+                    .memory_location(location)
+                    .map(|location| &location.kind)
+                {
+                    escaped_bindings.insert(*binding);
+                }
+            }
+            _ => {}
+        }
+    }
+    for event in semantics.points().iter().flat_map(|point| &point.events) {
+        if let SemanticEffect::Assignment { target, value } = event.effect
+            && semantics
+                .value(target)
+                .is_some_and(|target| target.kind == SemanticValueKind::Address)
+        {
+            escaped_bindings.insert(value);
+        }
+    }
+    let mut macro_gap_points_by_source: HashMap<SourceMappingId, Vec<ProgramPointId>> =
+        HashMap::default();
+    for gap in semantics.gaps() {
+        if gap.subject == SemanticGapSubject::Point
+            && gap.capability == SemanticCapability::NormalControlFlow
+            && gap.kind == SemanticGapKind::Unsupported
+        {
+            macro_gap_points_by_source
+                .entry(gap.source)
+                .or_default()
+                .push(gap.point);
+        }
+    }
+    for points in macro_gap_points_by_source.values_mut() {
+        points.sort_unstable();
+        points.dedup();
+    }
+    DeadWriteProcedureIndex {
+        _artifact: Arc::clone(procedure.artifact()),
+        events_by_binding,
+        escaped_bindings,
+        macro_gap_points_by_source,
+    }
+}
+
+#[derive(Debug)]
+struct DeadWriteCacheEntry {
+    // Keep the pointer-keyed semantic artifact alive for this request.
+    _artifact: Arc<SemanticArtifact>,
+    outcome: Result<Arc<DeadWritePrepared>, CfgAlgorithmError<ProgramPointId>>,
+}
+
+fn prepare_dead_write_over_graph<G>(
+    graph: &G,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    binding_event_ids: &[usize],
+    reachable: Arc<Reachability<ProgramPointId>>,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<DeadWritePrepared, CfgAlgorithmError<ProgramPointId>>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+{
+    let mut ordered = vec![Vec::<(u32, usize, StateEventClass)>::new(); graph.node_count()];
+    for &event_id in binding_event_ids {
+        request.visit_pair()?;
+        let event = &events[event_id];
+        let key = &event_keys[event_id];
+        ordered[event.point.index()].push((key.event_index, event.event, event.event_class));
+    }
+    for row in &mut ordered {
+        row.sort_unstable_by_key(|entry| entry.0);
+    }
+    let mut facts = GenKillFacts::new(graph.node_count(), 1);
+    for (index, row) in ordered.iter().enumerate() {
+        if let Some(&(_, _, class)) = row.first() {
+            if class == StateEventClass::Read {
+                facts.record_generated(index, 0);
+            }
+            if class == StateEventClass::Establish {
+                facts.record_killed(index, 0);
+            }
+        }
+    }
+    let liveness = live_values(graph, &facts, request)?;
+    // A reverse multi-source walk records one shortest explicit read witness
+    // for every live point. Establishments are barriers. Successor order
+    // resolves equal-distance ties just as the forward witness walk did.
+    let mut distance_to_read = vec![usize::MAX; graph.node_count()];
+    let mut witness_by_point = vec![None; graph.node_count()];
+    let mut queue = VecDeque::new();
+    let mut reached_order = Vec::new();
+    for (index, row) in ordered.iter().enumerate() {
+        if let Some(&(_, read_event, StateEventClass::Read)) = row.first() {
+            distance_to_read[index] = 0;
+            witness_by_point[index] = Some(read_event);
+            queue.push_back(index);
+        }
+    }
+    while let Some(index) = queue.pop_front() {
+        request.visit_node()?;
+        reached_order.push(index);
+        let point = graph.node_at(index).expect("dense control point exists");
+        for (_, predecessor) in graph.predecessors(point) {
+            request.visit_pair()?;
+            let preceding = predecessor.index();
+            if distance_to_read[preceding] != usize::MAX
+                || ordered[preceding]
+                    .first()
+                    .is_some_and(|entry| entry.2 == StateEventClass::Establish)
+                || !liveness.live_in(preceding, 0)
+            {
+                continue;
+            }
+            distance_to_read[preceding] = distance_to_read[index] + 1;
+            queue.push_back(preceding);
+        }
+    }
+    for index in reached_order {
+        if distance_to_read[index] == 0 {
+            continue;
+        }
+        let point = graph.node_at(index).expect("dense control point exists");
+        for (_, successor) in graph.successors(point) {
+            request.visit_pair()?;
+            if distance_to_read[successor.index()] != usize::MAX
+                && distance_to_read[successor.index()] + 1 == distance_to_read[index]
+            {
+                witness_by_point[index] = witness_by_point[successor.index()];
+                break;
+            }
+        }
+    }
+    Ok(DeadWritePrepared {
+        reachable,
+        ordered,
+        liveness,
+        distance_to_read,
+        witness_by_point,
+    })
+}
+
+fn dead_write_from_prepared<G>(
+    graph: &G,
+    events: &[StateEventRow],
+    event_keys: &[SemanticEventKey],
+    establishment_event: usize,
+    prepared: &DeadWritePrepared,
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<DeadWriteAnswer, CfgAlgorithmError<ProgramPointId>>
+where
+    G: DenseBidirectionalGraph<Node = ProgramPointId, Edge = ControlEdgeId>,
+{
+    let origin = &events[establishment_event];
+    if !prepared.reachable.contains(graph, origin.point) {
+        return Ok(DeadWriteAnswer::Unreachable);
+    }
+    let ordered = &prepared.ordered;
+    let liveness = &prepared.liveness;
+    // The first dynamic visit starts just after the selected establishment.
+    // A loop back edge enters the point from its beginning as usual.
+    let origin_index = event_keys[establishment_event].event_index;
+    let same_point = &ordered[origin.point.index()];
+    let next_index = same_point.partition_point(|entry| entry.0 <= origin_index);
+    if let Some(&(_, event, class)) = same_point.get(next_index) {
+        request.visit_pair()?;
+        if class == StateEventClass::Read {
+            return Ok(DeadWriteAnswer::Live { read_event: event });
+        }
+        if class == StateEventClass::Establish {
+            return Ok(DeadWriteAnswer::Dead);
+        }
+    }
+    let mut best_distance = usize::MAX;
+    let mut witness = None;
+    for (_, successor) in graph.successors(origin.point) {
+        request.visit_pair()?;
+        let index = successor.index();
+        if liveness.live_in(index, 0) && prepared.distance_to_read[index] < best_distance {
+            best_distance = prepared.distance_to_read[index];
+            witness = prepared.witness_by_point[index];
+        }
+    }
+    Ok(
+        witness.map_or(DeadWriteAnswer::Dead, |read_event| DeadWriteAnswer::Live {
+            read_event,
+        }),
+    )
 }
 
 fn overwritten_unread_over_graph<G>(
@@ -11610,6 +12309,17 @@ class Sample {
                 first.event,
                 &mut FlowStateRequest::new(&cancellation),
             );
+            if matches!(answer, OverwrittenUnreadAnswer::Proven { .. }) {
+                let dead = derivation.dead_write_local(
+                    &procedure,
+                    first.event,
+                    &mut FlowStateRequest::new(&cancellation),
+                );
+                assert!(
+                    matches!(dead, DeadWriteAnswer::Dead),
+                    "{method}: overwritten_unread must imply Dead, got {dead:?}"
+                );
+            }
             let valid = match expected {
                 "proven" => matches!(answer, OverwrittenUnreadAnswer::Proven { .. }),
                 "read" => matches!(answer, OverwrittenUnreadAnswer::ReadBeforeOverwrite { .. }),
@@ -11870,9 +12580,9 @@ fn blocked(mut low: usize, flag: bool) -> (usize, usize) {
     const { 1 };
     (low, low)
 }
-fn add_scalar(mut low: usize) -> (usize, usize) {
+fn add_scalar(mut low: usize) -> Option<usize> {
     low = low;
-    (low, low)
+    unresolved_value
 }
 "#;
 
@@ -11965,10 +12675,8 @@ fn add_scalar(mut low: usize) -> (usize, usize) {
     }
 
     #[test]
-    #[hardwon(
-        "#6409: a tail-expression gap after the read kept a self-assignment's initialization open"
-    )]
-    fn initialization_ignores_a_tail_expression_gap_after_the_read() {
+    #[hardwon("#6409: a Values gap after the read kept a self-assignment's initialization open")]
+    fn initialization_ignores_a_value_gap_after_the_read() {
         let fixture = Fixture::new(
             Language::Rust,
             &[("src/lib.rs", RUST_INITIALIZATION_GAP_REACHABILITY)],
@@ -11997,11 +12705,26 @@ fn add_scalar(mut low: usize) -> (usize, usize) {
             .semantics()
             .gaps()
             .iter()
-            .find(|gap| {
-                gap.capability == SemanticCapability::Values
-                    && gap.detail.starts_with("tail-expression result transfer")
+            .find(|gap| match gap.subject {
+                SemanticGapSubject::Value(value)
+                    if gap.capability == SemanticCapability::Values =>
+                {
+                    let value = procedure.semantics().value(value).unwrap();
+                    let span = procedure
+                        .semantics()
+                        .source_mapping(value.source)
+                        .unwrap()
+                        .locator
+                        .anchor()
+                        .span();
+                    span.start_byte() as usize > read_at
+                        && &RUST_INITIALIZATION_GAP_REACHABILITY
+                            [span.start_byte() as usize..span.end_byte() as usize]
+                            == "unresolved_value"
+                }
+                _ => false,
             })
-            .expect("the implicit return still publishes its Values gap");
+            .expect("the unresolved value has a Values gap after the read");
         assert!(matches!(gap.subject, SemanticGapSubject::Value(_)));
         assert_eq!(
             derivation.binding_initialization_at_read(
@@ -16150,6 +16873,7 @@ func detached(helper func()) { go helper() }
             models
                 .active_models()
                 .normal_continuation_absence_candidate_owners("go", "Exit", false)
+                .expect("a Go realm question is never open")
                 .is_empty(),
             "only effective unique claims may trigger call-shape and dispatch work"
         );

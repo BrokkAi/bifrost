@@ -109,6 +109,9 @@ fn convert(
                                 },
                             );
                         }
+                        SelectedNativeDefinition::ExternalOwner { owner, .. } => {
+                            external.insert(id, owner);
+                        }
                         SelectedNativeDefinition::Lexical(_) => {
                             answer.open.extend(stopped().open);
                         }
@@ -122,6 +125,10 @@ fn convert(
     }
     let mut parents = Vec::new();
     for parent in raw.parents {
+        let selected_owner = (parent.targets.is_empty()
+            && parent.kind != Some(ResolutionSupertypeKind::ImplicitSuperclass))
+        .then(|| operation.jvm_hierarchy_reference_owner(parent.reference))
+        .flatten();
         let mut mapped = MappedParent {
             kind: parent.kind,
             ordinal: parent.parent_ordinal,
@@ -158,6 +165,12 @@ fn convert(
                 mapped.complete = false;
             }
         }
+        if let Some(owner) = selected_owner {
+            mapped.unread.push(UnreadMemberFamilyAncestor {
+                name: owner.owner_fqn.to_string(),
+                inventory: overridable_method_inventory(&owner.owner_fqn),
+            });
+        }
         parents.push(mapped);
     }
     normalize(&mut parents);
@@ -177,7 +190,15 @@ fn convert(
         if let Some(root) = parent.intrinsic_root {
             assert_eq!(root.provider_id.as_ref(), "jvm-intrinsic");
             assert!(parent.complete && parent.alternatives == 1);
-            assert!(parent.targets.is_empty() && parent.unread.is_empty());
+            assert!(parent.targets.is_empty());
+            // The Java member-family query can nominate an intrinsic root as
+            // unread. Ordinary direct-ancestor queries leave this empty.
+            answer.open.extend(
+                parent
+                    .unread
+                    .into_iter()
+                    .map(HierarchyOpenReason::UnreadAncestor),
+            );
             continue;
         }
         if parent.alternatives > 1 {
@@ -202,13 +223,14 @@ fn convert(
 }
 
 struct NativeQuery<'a> {
-    ancestors: &'a mut dyn FnMut(&CodeUnit) -> HierarchyAnswer,
+    direct_ancestors: &'a mut dyn FnMut(&CodeUnit) -> HierarchyAnswer,
+    member_family_ancestors: &'a mut dyn FnMut(&CodeUnit) -> HierarchyAnswer,
     descendants: &'a mut dyn FnMut(&CodeUnit, &CancellationToken) -> HierarchyAnswer,
     cancellation: &'a CancellationToken,
 }
 impl HierarchyQuery for NativeQuery<'_> {
     fn direct_ancestors(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
-        (self.ancestors)(unit)
+        (self.direct_ancestors)(unit)
     }
     fn direct_descendants(&mut self, unit: &CodeUnit) -> HierarchyAnswer {
         (self.descendants)(unit, self.cancellation)
@@ -226,7 +248,7 @@ impl HierarchyQuery for NativeQuery<'_> {
         brokk_bifrost_analysis::analyzer::i_analyzer::scope_filter_descendant_answer(answer, scope)
     }
     fn member_family_ancestors(&mut self, unit: &CodeUnit) -> MemberFamilyAncestors {
-        let answer = self.direct_ancestors(unit);
+        let answer = (self.member_family_ancestors)(unit);
         MemberFamilyAncestors {
             resolved: answer.edges,
             ambiguous: answer.ambiguous,
@@ -246,14 +268,16 @@ impl HierarchyQuery for NativeQuery<'_> {
 pub(crate) fn with_native_query<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     root: Option<&CodeUnit>,
-    normalize: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
+    normalize_direct: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
+    normalize_member_family: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
     run: &mut dyn FnMut(&mut dyn HierarchyQuery),
 ) {
-    let result = open_native_query(inner, root, normalize, run);
+    let result = open_native_query(inner, root, normalize_direct, normalize_member_family, run);
     if let Err(error) = result {
         inner.record_query_failure(error);
         run(&mut NativeQuery {
-            ancestors: &mut |_| stopped(),
+            direct_ancestors: &mut |_| stopped(),
+            member_family_ancestors: &mut |_| stopped(),
             descendants: &mut |_, _| unavailable(),
             cancellation: &CancellationToken::default(),
         });
@@ -263,7 +287,8 @@ pub(crate) fn with_native_query<A: LanguageAdapter>(
 fn open_native_query<A: LanguageAdapter>(
     inner: &TreeSitterAnalyzer<A>,
     root: Option<&CodeUnit>,
-    normalize: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
+    normalize_direct: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
+    normalize_member_family: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
     run: &mut dyn FnMut(&mut dyn HierarchyQuery),
 ) -> Result<()> {
     let cancellation = inner.active_query_cancellation().unwrap_or_default();
@@ -291,7 +316,8 @@ fn open_native_query<A: LanguageAdapter>(
     } else {
         let Some(caller) = operation.mounts()?.first() else {
             run(&mut NativeQuery {
-                ancestors: &mut |_| stopped(),
+                direct_ancestors: &mut |_| stopped(),
+                member_family_ancestors: &mut |_| stopped(),
                 descendants: &mut |_, _| unavailable(),
                 cancellation: &CancellationToken::default(),
             });
@@ -343,7 +369,10 @@ fn open_native_query<A: LanguageAdapter>(
         &mut HierarchyReadCapture(inner, &export_root_reads),
         |query| {
             let query = std::cell::RefCell::new(query);
-            let mut ancestors = |unit: &CodeUnit| {
+            let resolve_ancestors = |
+                unit: &CodeUnit,
+                normalize: &mut dyn FnMut(&CodeUnit, &mut Vec<MappedParent>),
+            | {
                 let mut resolve = || -> Result<HierarchyAnswer> {
                     // The caller may supply a previously hydrated owner. Name
                     // its source inside this query's read attribution frame.
@@ -367,6 +396,12 @@ fn open_native_query<A: LanguageAdapter>(
                         stopped()
                     }
                 }
+            };
+            let mut direct_ancestors = |unit: &CodeUnit| {
+                resolve_ancestors(unit, normalize_direct)
+            };
+            let mut member_family_ancestors = |unit: &CodeUnit| {
+                resolve_ancestors(unit, normalize_member_family)
             };
             let descendant_session = ResolutionSession::bounded(
                 brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(),
@@ -427,7 +462,7 @@ fn open_native_query<A: LanguageAdapter>(
                     Err(error) => { inner.record_query_failure(error); stopped() }
                 }
             };
-            run(&mut NativeQuery { ancestors: &mut ancestors, descendants: &mut descendants, cancellation: &cancellation });
+            run(&mut NativeQuery { direct_ancestors: &mut direct_ancestors, member_family_ancestors: &mut member_family_ancestors, descendants: &mut descendants, cancellation: &cancellation });
             Ok(())
         },
     )

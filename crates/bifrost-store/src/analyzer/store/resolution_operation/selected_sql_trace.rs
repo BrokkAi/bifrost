@@ -135,7 +135,8 @@ impl Default for ProductionSelectedSqlTraceContext {
 }
 
 thread_local! {
-    static PRODUCTION_SELECTED_SQL_TRACE: RefCell<Option<Box<ProductionSelectedSqlTraceContext>>> =
+    static PRODUCTION_SELECTED_SQL_GUARD: RefCell<Option<brokk_bifrost_core::cache_db::sql_profile::ListenerGuard>> = const { RefCell::new(None) };
+    static PRODUCTION_SELECTED_SQL_TRACE: RefCell<Option<std::sync::Arc<ProductionSelectedSqlTraceContext>>> =
         const { RefCell::new(None) };
     #[cfg(any(test, feature = "test-support"))]
     static TRACE_CONTEXT_PUBLICATION_WORK: std::cell::Cell<bool> =
@@ -191,115 +192,87 @@ pub fn context_publication_work(session: &ResolutionSession) -> Option<ReceiverA
     TRACE_CONTEXT_PUBLICATION_WORK.with(|enabled| enabled.get().then(|| session.finish(()).work()))
 }
 
-unsafe extern "C" fn record_production_selected_sql(
-    event: std::ffi::c_uint,
-    context: *mut std::ffi::c_void,
-    statement: *mut std::ffi::c_void,
-    raw_sql: *mut std::ffi::c_void,
-) -> std::ffi::c_int {
-    let result = std::panic::catch_unwind(|| {
-        assert!(!context.is_null(), "SQLite trace must have shared state");
-        // SAFETY: registration owns this stable boxed context until it removes
-        // the callback; SQLite invokes the callback synchronously per statement.
-        let trace = unsafe { &*context.cast::<ProductionSelectedSqlTraceContext>() };
-        match event {
-            rusqlite::ffi::SQLITE_TRACE_STMT => {
-                assert!(!raw_sql.is_null(), "SQLite statement trace must name SQL");
-                // SAFETY: SQLITE_TRACE_STMT supplies a callback-lifetime SQL C string.
-                let sql = unsafe { std::ffi::CStr::from_ptr(raw_sql.cast()) }
-                    .to_string_lossy()
-                    .into_owned();
-                if TRACE_SELECTED_MOUNT_CALLERS.with(std::cell::Cell::get)
-                    && sql.starts_with("SELECT mount_ordinal,fragment_id,workspace_id")
-                    && sql.contains("FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1")
-                {
-                    eprintln!(
-                        "selected mount-record caller: {}",
-                        std::backtrace::Backtrace::force_capture()
-                    );
-                }
-                assert!(!statement.is_null());
-                let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
-                let mut executions = trace
+fn record_production_selected_sql(
+    trace: &ProductionSelectedSqlTraceContext,
+    event: brokk_bifrost_core::cache_db::sql_profile::ListenerEvent<'_>,
+) {
+    use brokk_bifrost_core::cache_db::sql_profile::ListenerEvent;
+    let result = std::panic::catch_unwind(|| match event {
+        ListenerEvent::Statement { statement, sql } => {
+            let sql = sql
+                .expect("SQLite statement trace must name SQL")
+                .to_owned();
+            if TRACE_SELECTED_MOUNT_CALLERS.with(std::cell::Cell::get)
+                && sql.starts_with("SELECT mount_ordinal,fragment_id,workspace_id")
+                && sql.contains("FROM temp.selected_resolution_mounts WHERE mount_ordinal=?1")
+            {
+                eprintln!(
+                    "selected mount-record caller: {}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
+            let mut executions = trace
+                .executions
+                .lock()
+                .expect("production SQL trace executions lock");
+            executions.insert(statement, cost.statements.len());
+            cost.statements.push(sql);
+            cost.rows_by_statement.push(0);
+        }
+        ListenerEvent::Row { statement, sql } => {
+            let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
+            cost.decoded_rows = cost
+                .decoded_rows
+                .checked_add(1)
+                .expect("production selected decoded row count fits usize");
+            if let Some(sql) = sql {
+                let execution = trace
                     .executions
                     .lock()
-                    .expect("production SQL trace executions lock");
-                executions.insert(statement as usize, cost.statements.len());
-                cost.statements.push(sql);
-                cost.rows_by_statement.push(0);
+                    .expect("production SQL trace executions lock")
+                    .get(&statement)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!("a named row requires its traced execution: {sql:?}")
+                    });
+                cost.rows_by_statement[execution] += 1;
+            } else {
+                cost.internal_schema_rows += 1;
             }
-            rusqlite::ffi::SQLITE_TRACE_ROW => {
-                let mut cost = trace.cost.lock().expect("production SQL trace cost lock");
-                cost.decoded_rows = cost
-                    .decoded_rows
-                    .checked_add(1)
-                    .expect("production selected decoded row count fits usize");
-                // SAFETY: SQLITE_TRACE_ROW supplies a live sqlite3_stmt.
-                let sql = unsafe { rusqlite::ffi::sqlite3_sql(statement.cast()) };
-                // Bundled SQLite skips SetSql while init.busy, suppressing
-                // STMT in OP_Init; OP_ResultRow still emits every ROW.
-                if sql.is_null() {
-                    cost.internal_schema_rows += 1;
-                } else {
-                    let execution = trace
-                        .executions
-                        .lock()
-                        .expect("production SQL trace executions lock")
-                        .get(&(statement as usize))
-                        .copied()
-                        .unwrap_or_else(|| {
-                            // SAFETY: sqlite3_sql text lives with this statement.
-                            let sql = unsafe { std::ffi::CStr::from_ptr(sql) };
-                            panic!("a named row requires its traced execution: {sql:?}");
-                        });
-                    cost.rows_by_statement[execution] += 1;
-                }
-            }
-            _ => unreachable!("production selected SQL trace registered known events only"),
         }
+        ListenerEvent::Profile { .. } => {}
     });
     if result.is_err() {
-        // SAFETY: the registered trace context outlives this callback.
-        unsafe { &*context.cast::<ProductionSelectedSqlTraceContext>() }
-            .failed
-            .store(true, Ordering::SeqCst);
+        trace.failed.store(true, Ordering::SeqCst);
     }
-    0
 }
 
 #[doc(hidden)]
 pub fn begin_production_selected_sql_trace_on_connection(connection: &rusqlite::Connection) {
-    let context = PRODUCTION_SELECTED_SQL_TRACE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        assert!(slot.is_none(), "production selected SQL trace cannot nest");
-        *slot = Some(Box::default());
-        slot.as_deref_mut()
-            .expect("production selected SQL trace is installed")
-            as *mut ProductionSelectedSqlTraceContext
+    let context = std::sync::Arc::new(ProductionSelectedSqlTraceContext::default());
+    PRODUCTION_SELECTED_SQL_TRACE.with(|slot| {
+        assert!(
+            slot.borrow_mut()
+                .replace(std::sync::Arc::clone(&context))
+                .is_none(),
+            "production selected SQL trace cannot nest"
+        );
     });
-    // SAFETY: the connection outlives the callback; its user pointer names
-    // the stable Box retained until the callback is removed.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(
-            connection.handle(),
-            rusqlite::ffi::SQLITE_TRACE_STMT | rusqlite::ffi::SQLITE_TRACE_ROW,
-            Some(record_production_selected_sql),
-            context.cast(),
-        )
-    };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    let guard = brokk_bifrost_core::cache_db::sql_profile::attach_listener(
+        connection,
+        std::sync::Arc::new(move |event| {
+            record_production_selected_sql(&context, event);
+        }),
+    );
+    PRODUCTION_SELECTED_SQL_GUARD.with(|slot| assert!(slot.borrow_mut().replace(guard).is_none()));
 }
 
 #[doc(hidden)]
 pub fn finish_production_selected_sql_trace_on_connection(
-    connection: &rusqlite::Connection,
+    _connection: &rusqlite::Connection,
 ) -> ProductionSelectedSqlCost {
-    // SAFETY: this is the connection registered above. A zero mask removes
-    // the callback before its shared context is freed.
-    let status = unsafe {
-        rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut())
-    };
-    assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+    PRODUCTION_SELECTED_SQL_GUARD.with(|slot| assert!(slot.borrow_mut().take().is_some()));
     let cost = checkpoint_production_selected_sql_trace();
     PRODUCTION_SELECTED_SQL_TRACE.with(|slot| {
         slot.borrow_mut()

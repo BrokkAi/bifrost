@@ -10,6 +10,7 @@ fn report_for_file(root: &Path, path: PathBuf) -> PolicyBatchOutcome {
         root,
         &[path],
         &crate::test_support::evaluation_options("2026-07-27"),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap()
 }
@@ -69,6 +70,7 @@ fn loaded_policy_path_uses_normalized_source_identity() {
             PathBuf::from("other.rqlp"),
         ],
         &crate::test_support::evaluation_options("2026-07-27"),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
     let diagnostics = outcome.report().diagnostics();
@@ -92,8 +94,13 @@ fn match_policy_reports_requested_range_as_workspace_scope() {
     .unwrap();
     let options = crate::test_support::evaluation_options("2026-07-27")
         .with_range(PolicyRangeRequest::Files(vec!["app.ts".to_owned()]));
-    let outcome =
-        evaluate_policy_files(root.path(), &[PathBuf::from("policy.rqlp")], &options).unwrap();
+    let outcome = evaluate_policy_files(
+        root.path(),
+        &[PathBuf::from("policy.rqlp")],
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .unwrap();
     let runs = outcome.report().runs();
     assert_eq!(runs.len(), 1);
     let scope = runs[0].scope().expect("requested range is reported");
@@ -121,8 +128,13 @@ fn diff_with_no_runnable_base_marks_report_unreliable() {
     run_git(root.path(), &["commit", "-m", "base"]);
     let options =
         crate::test_support::evaluation_options("2026-07-27").with_diff_base("HEAD".to_owned());
-    let outcome =
-        evaluate_policy_files(root.path(), &[PathBuf::from("policy.rqlp")], &options).unwrap();
+    let outcome = evaluate_policy_files(
+        root.path(),
+        &[PathBuf::from("policy.rqlp")],
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .unwrap();
     assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
     assert!(outcome.report().diff().expect("diff review").degraded());
     assert!(
@@ -172,7 +184,13 @@ fn built_in_scope_uses_manifest_category() {
         .collect::<Vec<_>>();
     let options =
         crate::test_support::evaluation_options("2026-07-27").with_builtin_selection(record);
-    let outcome = evaluate_policy_inputs(root.path(), &inputs, &options).unwrap();
+    let outcome = evaluate_policy_inputs(
+        root.path(),
+        &inputs,
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .unwrap();
     assert!(
         outcome.report().scope()[0].applied(),
         "{:#?}",
@@ -356,6 +374,7 @@ fn incomplete_head_does_not_mark_absent_baseline_finding() {
         &crate::test_support::evaluation_options("2026-07-27"),
         batch_budget,
         PolicyRegistryLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
     let run = &outcome.report().runs()[0];
@@ -396,6 +415,7 @@ fn one_subset_run_makes_mixed_batch_unreliable() {
         root.path(),
         &[PathBuf::from("subset.rqlp"), PathBuf::from("clean.rqlp")],
         &crate::test_support::evaluation_options("2026-07-27"),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
     let runs = outcome.report().runs();
@@ -496,6 +516,7 @@ fn unqualified_diff_base_keeps_tree_diagnostics() {
         &crate::test_support::evaluation_options("2026-07-27").with_diff_base("HEAD".to_owned()),
         budget,
         PolicyRegistryLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
     let unqualified = outcome
@@ -560,6 +581,7 @@ fn truncated_base_diagnostics_remain_unqualified_on_reuse() {
             &options,
             budget,
             PolicyRegistryLimits::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         let review = outcome.report().diff().expect("diff review");
@@ -618,7 +640,7 @@ fn completed_unqualified_persisted_base_is_not_admitted() {
         .unwrap();
     let policies = [policy];
     let subtree = resolve_revision_subtree(root.path(), "HEAD").unwrap();
-    let inputs = WorkspaceUnitInputs::of(&workspace, None);
+    let inputs = WorkspaceUnitInputs::of(&workspace, None, None);
     let mut key = base_evaluation_key(
         &crate::test_support::evaluation_options("2026-07-27"),
         None,
@@ -690,6 +712,104 @@ fn completed_unqualified_persisted_base_is_not_admitted() {
     );
 }
 
+/// A stored evaluation row is selected by its key alone, with no read
+/// verification, so a query-time dispatch change that moves the ICFG provider
+/// pair (and no policy substrate token) must make the row unreachable.
+/// Moving the literals in a test is not possible, so the bumped pair is stated
+/// through the key seam; the row itself is the one a real run stored.
+#[test]
+fn stored_evaluation_row_is_not_served_under_a_bumped_icfg_pair() {
+    use brokk_bifrost_analysis::analyzer::semantic::icfg::{
+        WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN, WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+    };
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("app.ts"), "export function target() {}\n").unwrap();
+    std::fs::write(
+        root.path().join("policy.rqlp"),
+        r#"(policy :schema-version 1 :id "test.persisted" :name "Persisted" :message "M" :severity warning :analysis (analysis :type match :selector (rql :schema-version 1 (function :name "target"))))"#,
+    )
+    .unwrap();
+    run_git(root.path(), &["init"]);
+    run_git(root.path(), &["config", "user.email", "test@example.com"]);
+    run_git(root.path(), &["config", "user.name", "Test User"]);
+    run_git(root.path(), &["add", "."]);
+    run_git(root.path(), &["commit", "-m", "base"]);
+    let options =
+        crate::test_support::evaluation_options("2026-07-27").with_diff_base("HEAD".to_owned());
+    let outcome = evaluate_policy_files_with_limits(
+        root.path(),
+        &[PathBuf::from("policy.rqlp")],
+        &options,
+        PolicyBatchBudget::default(),
+        PolicyRegistryLimits::default(),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.incremental().expect("incremental review").base(),
+        IncrementalBaseState::Evaluated
+    );
+
+    let workspace = WorkspaceAnalyzer::build_persisted(
+        Arc::new(owned_policy_project(root.path()).unwrap()),
+        AnalyzerConfig::default(),
+    )
+    .unwrap();
+    let activation = activate_owned_policy_workspace(
+        root.path(),
+        &workspace,
+        None,
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    let models = ready_policy_semantic_model_snapshot(activation.as_ref());
+    let inputs = WorkspaceUnitInputs::of(&workspace, models.as_deref(), None);
+    let tree_id = resolve_revision_subtree(root.path(), "HEAD")
+        .unwrap()
+        .tree_id()
+        .to_string();
+    let with_pair = |behavior: &[u8], read: &[u8]| PolicyEvaluationRowKey {
+        base_tree_oid: tree_id.clone(),
+        ..base_evaluation_key_under_icfg_domains(&options, None, inputs, (behavior, read))
+    };
+    let current = with_pair(
+        WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN,
+        WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+    );
+    assert_eq!(
+        current,
+        PolicyEvaluationRowKey {
+            base_tree_oid: tree_id.clone(),
+            ..base_evaluation_key(&options, None, inputs)
+        }
+    );
+    let bumped_behavior = [WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN, b"-next"].concat();
+    let bumped_read = [WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN, b"-next"].concat();
+    // Either half alone is enough to change the key, because they rotate
+    // together by convention but are independent literals.
+    let bumped = with_pair(&bumped_behavior, &bumped_read);
+    let behavior_only = with_pair(
+        &bumped_behavior,
+        WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+    );
+    let read_only = with_pair(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN, &bumped_read);
+    for other in [&bumped, &behavior_only, &read_only] {
+        assert_ne!(&current, other);
+    }
+
+    let store = workspace.store().expect("persisted store");
+    assert!(
+        store.policy_evaluation_for_key(&current).unwrap().is_some(),
+        "the real run stored its base row under the current pair"
+    );
+    for other in [&bumped, &behavior_only, &read_only] {
+        assert!(
+            store.policy_evaluation_for_key(other).unwrap().is_none(),
+            "a row stored under the old pair must not be served under {other:?}"
+        );
+    }
+}
+
 fn conflicting_schema_report() -> PolicyBatchOutcome {
     report_for_document(
         r#"(policy :id "test.conflict" :name "Conflict" :message "M" :severity warning :analysis (analysis :type match :rql-schema-version 1 :selector (rql :schema-version 3 (call))))"#,
@@ -731,6 +851,7 @@ fn control_character_policy_filename_is_rejected() {
         root.path(),
         &[input],
         &crate::test_support::evaluation_options("2026-07-27"),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .unwrap();
     let diagnostics = outcome.report().diagnostics();

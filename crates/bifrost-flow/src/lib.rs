@@ -1,5 +1,9 @@
 //! Flow-analysis engines and host-owned reusable state for Bifrost.
 
+// ProcedureHandle keys hash immutable identity; lazy callable-selection
+// dominance is derived state and is excluded from equality and hashing.
+#![allow(clippy::mutable_key_type)]
+
 #[cfg(test)]
 use brokk_bifrost_tools as _;
 use std::sync::Arc;
@@ -12,6 +16,7 @@ pub mod composition;
 pub mod dataflow;
 pub mod detached_task;
 pub mod flow_state;
+pub mod model_attribution;
 mod ordering;
 pub mod scalar_state;
 mod semantic_summary;
@@ -31,6 +36,7 @@ pub use semantic_summary::{
     ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
     ExactProcedureSummaryTargetBinding, ProcedureSummaryBindingError,
     bind_active_unmaterialized_procedure_summaries, bind_compiled_procedure_summaries,
+    bind_compiled_receiver_adjustment_summary,
 };
 
 /// Reusable flow caches owned by one logical workspace.

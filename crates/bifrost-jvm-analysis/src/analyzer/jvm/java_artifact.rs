@@ -81,7 +81,8 @@ use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
 use jclassfile::fields::{FieldFlags, FieldInfo};
 use jclassfile::methods::{MethodFlags, MethodInfo};
-use std::io::{Cursor, Read};
+use std::collections::BTreeSet;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use tree_sitter::Node;
 use zip::ZipArchive;
 
@@ -120,12 +121,52 @@ struct JavaApiMember {
     is_virtual: bool,
     non_overridable:
         Option<brokk_bifrost_analysis::analyzer::semantic_model::NonOverridableEvidence>,
-    /// Whether exact binary metadata accounted for this member's complete
-    /// owner/name callable family. Source declarations cannot make this claim
-    /// independently of the binary artifact they describe.
+    /// Whether the producer accounted for this member's complete owner/name
+    /// callable family; set by `CallableFamilyCoverage::certify`.
     callable_family_complete: bool,
     signature: Option<Signature>,
     locator: Locator,
+}
+
+/// Which owner/name callable families one owner's producer accounted for.
+///
+/// A family is complete when the owner's declarations were read in full and
+/// no declaration with that name failed to decode. Both the class-file and the
+/// source producers record failures here and certify members through
+/// `certify`, so a family claim means the same thing in either kind of pack.
+/// A declaration the producer omits on purpose (a synthetic or bridge method,
+/// or a source member outside the public API surface) is not a failure: it is
+/// not part of the family that callers outside the owner can select.
+#[derive(Default)]
+struct CallableFamilyCoverage {
+    owner_incomplete: bool,
+    incomplete_names: HashSet<String>,
+}
+
+impl CallableFamilyCoverage {
+    /// The owner's declarations could not all be read, so no family is known.
+    fn mark_owner_incomplete(&mut self) {
+        self.owner_incomplete = true;
+    }
+
+    /// A declaration named `name` could not be represented.
+    fn mark_name_incomplete(&mut self, name: &str) {
+        self.incomplete_names.insert(name.to_owned());
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.owner_incomplete && self.incomplete_names.is_empty()
+    }
+
+    /// Certifies each member whose family is complete. A truncated record
+    /// budget leaves every family open.
+    fn certify(&self, members: &mut [JavaApiMember], record_limit_hit: bool) {
+        let owner_complete = !self.owner_incomplete && !record_limit_hit;
+        for member in members {
+            member.callable_family_complete =
+                owner_complete && !self.incomplete_names.contains(&member.name);
+        }
+    }
 }
 
 brokk_bifrost_semantic::implement_external_artifact_pack_producer!(JavaJarPackProducer, produce);
@@ -393,6 +434,11 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::TypeScriptLibrarySet => unreachable!(),
             }
         }
+        enclosing_scopes.report_unread(
+            &mut diagnostics,
+            None,
+            super::producer_codes::JAVA_ARCHIVE_ENTRY_READ.code,
+        );
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
             let known_types = source_entries
                 .iter()
@@ -412,7 +458,7 @@ impl JavaJarPackProducer {
                         limits,
                     );
                 }
-                declarations.extend(source_api_types(
+                let mut source_declarations = source_api_types(
                     &entry_name,
                     &source,
                     &known_types,
@@ -420,7 +466,19 @@ impl JavaJarPackProducer {
                     &mut remaining_records,
                     &mut record_limit_hit,
                     &mut diagnostics,
-                ));
+                );
+                // A published sources jar is not the compiler input of its
+                // class jar: an annotation processor such as Lombok adds
+                // overloads the source never declares. The class jar
+                // certifies those families instead. A JDK src.zip is the
+                // source the JDK was compiled from, so its claims stand.
+                for member in source_declarations
+                    .iter_mut()
+                    .flat_map(|declaration| declaration.members.iter_mut())
+                {
+                    member.callable_family_complete = false;
+                }
+                declarations.extend(source_declarations);
             }
         }
         if record_limit_hit {
@@ -507,6 +565,76 @@ pub(crate) fn zip_directory_status_with_limits(
         return ZipDirectoryStatus::Invalid;
     };
     let Some(directory_bytes) = little_u64(bytes, zip64_offset + 40) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    if entries <= max_entries as u64 && directory_bytes <= max_directory_bytes {
+        ZipDirectoryStatus::Valid
+    } else {
+        ZipDirectoryStatus::Exceeded
+    }
+}
+
+/// The same bounded EOCD/ZIP64 preflight for a seekable exact archive. Only
+/// the EOCD tail and fixed-width ZIP64 record are read before ZipArchive.
+pub(crate) fn zip_directory_status_seekable<R: Read + Seek>(
+    reader: &mut R,
+    max_entries: usize,
+    max_directory_bytes: u64,
+    mut cancelled: impl FnMut() -> bool,
+) -> ZipDirectoryStatus {
+    if cancelled() {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let Ok(len) = reader.seek(SeekFrom::End(0)) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    let tail_len = len.min(u16::MAX as u64 + 22) as usize;
+    if reader.seek(SeekFrom::Start(len - tail_len as u64)).is_err() {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let mut tail = vec![0; tail_len];
+    if cancelled() || reader.read_exact(&mut tail).is_err() || cancelled() {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let Some(eocd) = (0..tail.len().saturating_sub(3))
+        .rev()
+        .find(|&offset| tail.get(offset..offset + 4) == Some(b"PK\x05\x06"))
+    else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    let (Some(entries), Some(directory_bytes)) =
+        (little_u16(&tail, eocd + 10), little_u32(&tail, eocd + 12))
+    else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    if entries != u16::MAX && directory_bytes != u32::MAX {
+        return if usize::from(entries) <= max_entries
+            && u64::from(directory_bytes) <= max_directory_bytes
+        {
+            ZipDirectoryStatus::Valid
+        } else {
+            ZipDirectoryStatus::Exceeded
+        };
+    }
+    let locator = eocd.saturating_sub(20);
+    if tail.get(locator..locator + 4) != Some(b"PK\x06\x07") {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let Some(offset) = little_u64(&tail, locator + 8) else {
+        return ZipDirectoryStatus::Invalid;
+    };
+    if offset.checked_add(56).is_none_or(|end| end > len)
+        || reader.seek(SeekFrom::Start(offset)).is_err()
+        || cancelled()
+    {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let mut record = [0_u8; 56];
+    if reader.read_exact(&mut record).is_err() || cancelled() || &record[..4] != b"PK\x06\x06" {
+        return ZipDirectoryStatus::Invalid;
+    }
+    let (Some(entries), Some(directory_bytes)) = (little_u64(&record, 32), little_u64(&record, 40))
+    else {
         return ZipDirectoryStatus::Invalid;
     };
     if entries <= max_entries as u64 && directory_bytes <= max_directory_bytes {
@@ -643,6 +771,8 @@ pub(crate) fn java_api_facts(
             .expect("parsed Java type receives an id")
             .clone();
         types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: declaration.jvm_inventory.map(|inventory| *inventory),
@@ -929,7 +1059,7 @@ pub(crate) fn source_api_types(
             if !take_record(remaining_records, record_limit_hit) {
                 break;
             }
-            let members = source_members(
+            let (mut members, mut callable_families) = source_members(
                 node,
                 source,
                 &resolution,
@@ -943,6 +1073,13 @@ pub(crate) fn source_api_types(
                 diagnostics,
                 source_path,
             );
+            // Error recovery can swallow a declaration, and the class-file
+            // producer likewise leaves families open for an unresolved
+            // hierarchy.
+            if root.has_error() || !hierarchy_complete {
+                callable_families.mark_owner_incomplete();
+            }
+            callable_families.certify(&mut members, *record_limit_hit);
             // Reconcile the complete direct AST method inventory with the
             // retained records. Unsupported signatures or budget truncation
             // reduce the retained count and cannot silently license absence.
@@ -1039,9 +1176,10 @@ fn source_members(
     record_limit_hit: &mut bool,
     diagnostics: &mut BoundedProducerDiagnostics,
     source_path: &str,
-) -> Vec<JavaApiMember> {
+) -> (Vec<JavaApiMember>, CallableFamilyCoverage) {
+    let mut callable_families = CallableFamilyCoverage::default();
     let Some(body) = owner.child_by_field_name("body") else {
-        return Vec::new();
+        return (Vec::new(), callable_families);
     };
     let interface_owner = matches!(
         source_type_kind(owner.kind()),
@@ -1070,6 +1208,11 @@ fn source_members(
             )
         })
         .flatten();
+    if owner_kind == TypeKind::Record && record_components.is_none() {
+        // Neither the canonical constructor nor the implicit accessors,
+        // whose names are the components', can be emitted.
+        callable_families.mark_owner_incomplete();
+    }
     for node in named_children_iter(body) {
         match node.kind() {
             "method_declaration"
@@ -1080,6 +1223,7 @@ fn source_members(
                 let constructor = compact || node.kind() == "constructor_declaration";
                 has_constructor |= constructor;
                 let Some(name_node) = node.child_by_field_name("name") else {
+                    callable_families.mark_owner_incomplete();
                     continue;
                 };
                 let declared_name = node_text(name_node, source).trim();
@@ -1097,7 +1241,10 @@ fn source_members(
                 let parameters = if compact {
                     match record_components.clone() {
                         Some(components) => components,
-                        None => continue,
+                        None => {
+                            callable_families.mark_name_incomplete(name);
+                            continue;
+                        }
                     }
                 } else {
                     let Some(parameters) = source_parameters(
@@ -1111,6 +1258,7 @@ fn source_members(
                         source_path,
                         &format!("{owner_name}.{declared_name}"),
                     ) else {
+                        callable_families.mark_name_incomplete(name);
                         continue;
                     };
                     parameters
@@ -1143,6 +1291,7 @@ fn source_members(
                         format!("{owner_name}.{declared_name}"),
                         format!("could not represent return type for {owner_name}.{declared_name}"),
                     );
+                    callable_families.mark_name_incomplete(name);
                     continue;
                 }
                 let modifiers = java_modifier_keywords(node).collect::<Vec<_>>();
@@ -1409,7 +1558,7 @@ fn source_members(
             },
         );
     }
-    result
+    (result, callable_families)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2236,7 +2385,7 @@ pub(crate) fn class_surface(
     jar_name: &str,
     class_entry: &str,
     bytes: &[u8],
-    resolve_enclosing: &mut dyn FnMut(&str) -> Vec<String>,
+    resolve_enclosing: &mut dyn FnMut(&EnclosingScope) -> Option<Vec<String>>,
     max_depth: usize,
     remaining_records: &mut usize,
     record_limit_hit: &mut bool,
@@ -2336,19 +2485,85 @@ pub(crate) fn class_surface_facts(
     java_api_facts(vec![declaration], max_records, diagnostics)
 }
 
-/// Artifact-local memo of lexical generic scopes. Never retained by the index.
-#[derive(Default)]
-pub(crate) struct EnclosingScopeResolver {
-    scopes: HashMap<String, (Vec<String>, Option<String>)>,
+/// The lexical generic scope a class file is declared in: a class, and for a
+/// local or anonymous class the method or constructor whose body declares it
+/// (JVMS 4.7.7 `EnclosingMethod`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EnclosingScope {
+    pub(crate) class: String,
+    /// Method name followed by its descriptor, as `EnclosingMethod` names it.
+    /// `None` for a member class, and for a local or anonymous class declared
+    /// in an initializer (`method_index` 0).
+    pub(crate) method: Option<String>,
 }
 
-fn enclosing_class(class: &ClassFile) -> Option<String> {
-    if class
-        .attributes()
-        .iter()
-        .any(|a| matches!(a, Attribute::EnclosingMethod { .. }))
+/// One class read by the resolver: its own type parameters, the scope it is
+/// itself declared in, and the methods that can enclose a local class with
+/// scope effects (a generic method declares type parameters; a static method
+/// hides the class's).
+struct ResolvedScope {
+    type_parameters: Vec<String>,
+    parent: Option<EnclosingScope>,
+    methods: HashMap<String, (Vec<String>, bool)>,
+}
+
+/// Artifact-local memo of lexical generic scopes. Never retained by the index.
+///
+/// An outer class that cannot be reread leaves its nested classes' scopes
+/// unknown. The resolver remembers it, answers `None` for every scope chain
+/// through it, and names it in the diagnostics its caller emits, whatever the
+/// budget.
+#[derive(Default)]
+pub(crate) struct EnclosingScopeResolver {
+    /// `None` memoizes an outer class whose reread failed or was refused.
+    scopes: HashMap<String, Option<ResolvedScope>>,
+    budget: RereadBudget,
+    limit_hit: BTreeSet<String>,
+    failed: BTreeSet<String>,
+}
+
+/// Decoded bytes the resolver may spend rereading outer classes. Each reread
+/// is also bounded by `MAX_CLASS_ENTRY_BYTES`.
+#[derive(Default)]
+enum RereadBudget {
+    #[default]
+    Unlimited,
+    Remaining(u64),
+}
+
+/// The scope whose type variables a class's signatures may name. A local or
+/// anonymous class sees its enclosing method's type parameters and, unless
+/// that method is static, its enclosing class's chain; a non-static member
+/// class sees its outer class's chain; a static member or top-level class
+/// sees none.
+fn enclosing_scope(class: &ClassFile) -> Option<EnclosingScope> {
+    if let Some((class_index, method_index)) =
+        class
+            .attributes()
+            .iter()
+            .find_map(|attribute| match attribute {
+                Attribute::EnclosingMethod {
+                    class_index,
+                    method_index,
+                } => Some((*class_index, *method_index)),
+                _ => None,
+            })
     {
-        return None;
+        let method = match class.constant_pool().get(method_index as usize) {
+            Some(ConstantPool::NameAndType {
+                name_index,
+                descriptor_index,
+            }) => Some(format!(
+                "{}{}",
+                utf8_at(class, *name_index)?,
+                utf8_at(class, *descriptor_index)?
+            )),
+            _ => None,
+        };
+        return Some(EnclosingScope {
+            class: class_name_at(class, class_index)?,
+            method,
+        });
     }
     let name = class_name_at(class, class.this_class())?;
     class.attributes().iter().find_map(|attribute| {
@@ -2363,64 +2578,179 @@ fn enclosing_class(class: &ClassFile) -> Option<String> {
                     .contains(NestedClassFlags::ACC_STATIC))
             .then(|| class_name_at(class, entry.outer_class_info_index()))
             .flatten()
+            .map(|class| EnclosingScope {
+                class,
+                method: None,
+            })
         })
     })
 }
 
 impl EnclosingScopeResolver {
+    /// JMOD reads have already spent their main class-output budget. Charge
+    /// outer-class fallback reads to its remainder instead of allowing an
+    /// unbounded series of repeated decompressions.
+    pub(crate) fn limit_rereads_to(&mut self, remaining: u64) {
+        self.budget = RereadBudget::Remaining(remaining);
+    }
+
+    /// Report every outer class this artifact could not reread. `read_code`
+    /// is the caller's archive entry-read code.
+    pub(crate) fn report_unread(
+        &self,
+        diagnostics: &mut BoundedProducerDiagnostics,
+        location: Option<&str>,
+        read_code: &str,
+    ) {
+        if !self.limit_hit.is_empty() {
+            diagnostics.warning(
+                "limit.archive_bytes",
+                location.map(str::to_owned),
+                format!(
+                    "enclosing-class rereads exceeded the decoded-byte budget: {:?}",
+                    self.limit_hit
+                ),
+            );
+        }
+        if !self.failed.is_empty() {
+            diagnostics.warning(
+                read_code,
+                location.map(str::to_owned),
+                format!(
+                    "could not read bounded enclosing-class bytes: {:?}",
+                    self.failed
+                ),
+            );
+        }
+    }
+
+    /// The type parameters `scope` makes visible, innermost first, or `None`
+    /// when some class on its enclosing chain could not be reread.
     pub(crate) fn parameters<R: std::io::Read + std::io::Seek>(
         &mut self,
-        outer: &str,
+        scope: &EnclosingScope,
         archive: &mut ZipArchive<R>,
         prefix: &str,
         max_depth: usize,
-    ) -> Vec<String> {
-        let mut outer = Some(outer.to_owned());
+    ) -> Option<Vec<String>> {
+        let mut next = Some(scope.clone());
         let mut names = Vec::new();
         let mut visited = HashSet::default();
-        while let Some(name) = outer {
-            if !visited.insert(name.clone()) {
+        while let Some(scope) = next {
+            if !visited.insert(scope.class.clone()) {
                 break;
             }
-            if !self.scopes.contains_key(&name) {
-                let Ok(mut entry) = archive.by_name(&format!("{prefix}{name}.class")) else {
-                    break;
-                };
-                if entry.size() > MAX_CLASS_ENTRY_BYTES {
-                    break;
-                }
-                let mut bytes = Vec::new();
-                if entry
-                    .by_ref()
-                    .take(MAX_CLASS_ENTRY_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .is_err()
-                    || bytes.len() as u64 > MAX_CLASS_ENTRY_BYTES
-                {
-                    break;
-                }
-                let Ok(class) = jclassfile::class_file::parse(&bytes) else {
-                    break;
-                };
-                let parameters = signature_attribute(class.attributes(), &class)
-                    .and_then(|signature| {
-                        let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
-                        cursor.parse_class_signature().filter(|_| cursor.at_end())
-                    })
-                    .map(|(parameters, _)| parameters)
-                    .unwrap_or_default();
-                self.scopes
-                    .insert(name.clone(), (parameters, enclosing_class(&class)));
+            if !self.scopes.contains_key(&scope.class) {
+                let resolved = self.read_scope(&scope.class, archive, prefix, max_depth);
+                self.scopes.insert(scope.class.clone(), resolved);
             }
-            let (parameters, parent) = &self.scopes[&name];
-            for parameter in parameters {
+            let resolved = self.scopes[&scope.class].as_ref()?;
+            let method = scope
+                .method
+                .as_ref()
+                .and_then(|method| resolved.methods.get(method));
+            let class_parameters = match method {
+                Some((parameters, is_static)) => {
+                    for parameter in parameters {
+                        if !names.contains(parameter) {
+                            names.push(parameter.clone());
+                        }
+                    }
+                    // A static method's body sees no instance type variables
+                    // of its class or of the classes enclosing it.
+                    if *is_static {
+                        break;
+                    }
+                    &resolved.type_parameters
+                }
+                None => &resolved.type_parameters,
+            };
+            for parameter in class_parameters {
                 if !names.contains(parameter) {
                     names.push(parameter.clone());
                 }
             }
-            outer = parent.clone();
+            next = resolved.parent.clone();
         }
-        names
+        Some(names)
+    }
+
+    fn read_scope<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        name: &str,
+        archive: &mut ZipArchive<R>,
+        prefix: &str,
+        max_depth: usize,
+    ) -> Option<ResolvedScope> {
+        let Ok(mut entry) = archive.by_name(&format!("{prefix}{name}.class")) else {
+            self.failed.insert(name.to_owned());
+            return None;
+        };
+        let allowed = match self.budget {
+            RereadBudget::Unlimited => MAX_CLASS_ENTRY_BYTES,
+            RereadBudget::Remaining(remaining) => remaining.min(MAX_CLASS_ENTRY_BYTES),
+        };
+        if entry.size() > allowed {
+            self.limit_hit.insert(name.to_owned());
+            return None;
+        }
+        let mut bytes = Vec::new();
+        if entry
+            .by_ref()
+            .take(allowed.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            self.failed.insert(name.to_owned());
+            return None;
+        }
+        if bytes.len() as u64 > allowed {
+            self.limit_hit.insert(name.to_owned());
+            return None;
+        }
+        if let RereadBudget::Remaining(remaining) = &mut self.budget {
+            *remaining -= bytes.len() as u64;
+        }
+        let Ok(class) = jclassfile::class_file::parse(&bytes) else {
+            self.failed.insert(name.to_owned());
+            return None;
+        };
+        let type_parameters = signature_attribute(class.attributes(), &class)
+            .and_then(|signature| {
+                let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
+                cursor.parse_class_signature().filter(|_| cursor.at_end())
+            })
+            .map(|(parameters, _)| parameters)
+            .unwrap_or_default();
+        let mut methods = HashMap::default();
+        for method in class.methods() {
+            let is_static = method.access_flags().contains(MethodFlags::ACC_STATIC);
+            let parameters = signature_attribute(method.attributes(), &class)
+                .and_then(|signature| {
+                    let mut cursor = SignatureCursor::new(signature.as_bytes(), max_depth);
+                    cursor.parse_method_signature().filter(|_| cursor.at_end())
+                })
+                .map(|(parameters, _, _)| parameters)
+                .unwrap_or_default();
+            if !is_static && parameters.is_empty() {
+                continue;
+            }
+            let (Some(method_name), Some(descriptor)) = (
+                utf8_at(&class, method.name_index()),
+                utf8_at(&class, method.descriptor_index()),
+            ) else {
+                continue;
+            };
+            methods.insert(
+                format!("{method_name}{descriptor}"),
+                (parameters, is_static),
+            );
+        }
+        Some(ResolvedScope {
+            type_parameters,
+            parent: enclosing_scope(&class),
+            methods,
+        })
     }
 }
 
@@ -2429,7 +2759,7 @@ fn class_api_type(
     jar_name: &str,
     class_entry: &str,
     bytes: &[u8],
-    resolve_enclosing: &mut dyn FnMut(&str) -> Vec<String>,
+    resolve_enclosing: &mut dyn FnMut(&EnclosingScope) -> Option<Vec<String>>,
     max_depth: usize,
     remaining_records: &mut usize,
     record_limit_hit: &mut bool,
@@ -2448,9 +2778,16 @@ fn class_api_type(
     let Some(internal_name) = class_name_at(&class_file, class_file.this_class()) else {
         return ClassEntryResult::Invalid;
     };
-    let enclosing_type_parameters = enclosing_class(&class_file)
-        .map(|outer| resolve_enclosing(&outer))
-        .unwrap_or_default();
+    // An unreadable enclosing chain leaves the class's scope unknown: its
+    // signatures may name type variables nobody can account for, so no family
+    // of this owner is certified. The resolver's caller reports the class it
+    // could not reread.
+    let (enclosing_type_parameters, enclosing_scope_known) =
+        match enclosing_scope(&class_file).map(|scope| resolve_enclosing(&scope)) {
+            Some(Some(parameters)) => (parameters, true),
+            Some(None) => (Vec::new(), false),
+            None => (Vec::new(), true),
+        };
     let name = binary_declared_class_name(&class_file, &internal_name);
     let visibility = binary_class_visibility(&class_file, &internal_name);
     let class_signature =
@@ -2493,11 +2830,14 @@ fn class_api_type(
     for relation in &mut hierarchy {
         normalize_binary_type_ref(&mut relation.target, &class_file);
     }
-    let mut all_callable_families_complete = hierarchy_unresolved.is_none();
+    let mut callable_families = CallableFamilyCoverage::default();
+    if hierarchy_unresolved.is_some() || !enclosing_scope_known {
+        callable_families.mark_owner_incomplete();
+    }
     if signature_attribute(class_file.attributes(), &class_file).is_some()
         && !class_signature_decoded
     {
-        all_callable_families_complete = false;
+        callable_families.mark_owner_incomplete();
         diagnostics.warning_for_declaration(
             super::producer_codes::JAVA_CLASS_UNSUPPORTED_SIGNATURE.code,
             Some(class_entry.to_owned()),
@@ -2506,7 +2846,6 @@ fn class_api_type(
         );
     }
     let mut members = Vec::new();
-    let mut incomplete_callable_names = HashSet::default();
     let mut field_types_complete = true;
     for field in class_file.fields() {
         if let Some(member) = class_field_member(
@@ -2538,8 +2877,7 @@ fn class_api_type(
             &class_file,
             method,
             max_depth,
-            &mut all_callable_families_complete,
-            &mut incomplete_callable_names,
+            &mut callable_families,
             diagnostics,
         ) {
             if !take_record(remaining_records, record_limit_hit) {
@@ -2548,11 +2886,7 @@ fn class_api_type(
             members.push(member);
         }
     }
-    all_callable_families_complete &= !*record_limit_hit;
-    for member in &mut members {
-        member.callable_family_complete =
-            all_callable_families_complete && !incomplete_callable_names.contains(&member.name);
-    }
+    callable_families.certify(&mut members, *record_limit_hit);
     let type_kind = if class_file
         .attributes()
         .iter()
@@ -2588,8 +2922,7 @@ fn class_api_type(
                 .filter(|field| !field.access_flags().contains(FieldFlags::ACC_SYNTHETIC))
                 .count();
     let callables_complete = !*record_limit_hit
-        && all_callable_families_complete
-        && incomplete_callable_names.is_empty()
+        && callable_families.is_complete()
         && members
             .iter()
             .filter(|member| {
@@ -2907,8 +3240,7 @@ fn class_method_member(
     class_file: &ClassFile,
     method: &MethodInfo,
     max_depth: usize,
-    all_callable_families_complete: &mut bool,
-    incomplete_callable_names: &mut HashSet<String>,
+    callable_families: &mut CallableFamilyCoverage,
     diagnostics: &mut BoundedProducerDiagnostics,
 ) -> Option<JavaApiMember> {
     let flags = method.access_flags();
@@ -2917,7 +3249,7 @@ fn class_method_member(
         return None;
     }
     let Some(binary_name) = utf8_at(class_file, method.name_index()) else {
-        *all_callable_families_complete = false;
+        callable_families.mark_owner_incomplete();
         diagnostics.warning_for_declaration(
             super::producer_codes::JAVA_CLASS_UNSUPPORTED_METHOD_NAME.code,
             Some(class_entry.to_owned()),
@@ -2930,7 +3262,7 @@ fn class_method_member(
         return None;
     }
     let Some(descriptor) = utf8_at(class_file, method.descriptor_index()) else {
-        incomplete_callable_names.insert(binary_name.to_owned());
+        callable_families.mark_name_incomplete(binary_name);
         diagnostics.warning_for_declaration(
             super::producer_codes::JAVA_CLASS_UNSUPPORTED_METHOD_SIGNATURE.code,
             Some(class_entry.to_owned()),
@@ -2949,7 +3281,7 @@ fn class_method_member(
                 parameters.iter().chain(returns),
                 &[owner_type_parameters, type_parameters],
             ) {
-                incomplete_callable_names.insert(binary_name.to_owned());
+                callable_families.mark_name_incomplete(binary_name);
                 report_unresolved_parameter(
                     class_file,
                     class_entry,
@@ -2969,7 +3301,7 @@ fn class_method_member(
             let Some((parameters, returns)) =
                 cursor.parse_method_descriptor().filter(|_| cursor.at_end())
             else {
-                incomplete_callable_names.insert(binary_name.to_owned());
+                callable_families.mark_name_incomplete(binary_name);
                 diagnostics.warning_for_declaration(
                     super::producer_codes::JAVA_CLASS_UNSUPPORTED_METHOD_SIGNATURE.code,
                     Some(class_entry.to_owned()),
@@ -3442,6 +3774,159 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     #[test]
+    #[hardwon(
+        "#9901: anonymous classes ignored their EnclosingMethod, so method and class type variables marked the JDK incomplete"
+    )]
+    fn local_class_signatures_resolve_through_enclosing_method() {
+        let entries: &[(&str, &[u8])] = &[
+            (
+                "enclosing/Pipeline.class",
+                include_bytes!("fixtures/enclosing-signature/enclosing/Pipeline.class"),
+            ),
+            (
+                "enclosing/Pipeline$1.class",
+                include_bytes!("fixtures/enclosing-signature/enclosing/Pipeline$1.class"),
+            ),
+            (
+                "enclosing/Pipeline$2.class",
+                include_bytes!("fixtures/enclosing-signature/enclosing/Pipeline$2.class"),
+            ),
+            (
+                "enclosing/Pipeline$2$1.class",
+                include_bytes!("fixtures/enclosing-signature/enclosing/Pipeline$2$1.class"),
+            ),
+            (
+                "enclosing/Pipeline$3.class",
+                include_bytes!("fixtures/enclosing-signature/enclosing/Pipeline$3.class"),
+            ),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let jar = temp.path().join("pipeline.jar");
+        brokk_bifrost_analysis::test_support::zip_helpers::write_zip_unwrap(
+            &jar,
+            entries,
+            SimpleFileOptions::default(),
+        );
+        let production = JavaJarPackProducer.produce_exact_artifact(
+            &request(jar.clone(), ExternalArtifactKind::JavaClassJar),
+            &ArtifactProducerLimits::default(),
+        );
+        assert_eq!(
+            production.completeness,
+            Completeness::Complete,
+            "{:?}",
+            production.diagnostics
+        );
+        // The anonymous classes are omitted from the projection; read each
+        // one at the class-file boundary to check the scope it resolved.
+        let limits = ArtifactProducerLimits::default();
+        let mut archive = ZipArchive::new(fs::File::open(&jar).unwrap()).unwrap();
+        let mut scopes = EnclosingScopeResolver::default();
+        let mut scope_of = |entry: &str| {
+            let mut remaining = limits.max_records;
+            let mut truncated = false;
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            let bytes = entries.iter().find(|(name, _)| *name == entry).unwrap().1;
+            let ClassEntryResult::Declaration(declaration) = class_api_type(
+                "pipeline.jar",
+                entry,
+                bytes,
+                &mut |scope| scopes.parameters(scope, &mut archive, "", limits.max_signature_depth),
+                limits.max_signature_depth,
+                &mut remaining,
+                &mut truncated,
+                &mut diagnostics,
+            ) else {
+                panic!("{entry} must decode");
+            };
+            let inventory = declaration.jvm_inventory.unwrap();
+            assert!(inventory.callables_complete, "{entry}");
+            inventory.enclosing_type_parameters
+        };
+        // In the constructor: the class's T.
+        assert_eq!(scope_of("enclosing/Pipeline$1.class"), ["T"]);
+        // In the generic instance method map: its R, then the class's T.
+        assert_eq!(scope_of("enclosing/Pipeline$2.class"), ["R", "T"]);
+        // Nested in Pipeline$2.wrap, which declares nothing: the chain
+        // continues through Pipeline$2's own EnclosingMethod.
+        assert_eq!(scope_of("enclosing/Pipeline$2$1.class"), ["R", "T"]);
+        // In the static generic method each: its S, and not the class's T.
+        assert_eq!(scope_of("enclosing/Pipeline$3.class"), ["S"]);
+    }
+
+    #[test]
+    #[hardwon(
+        "d746d47df946: jar-path outer-class reread failures were not recorded, so callable families stayed complete"
+    )]
+    fn an_unreadable_outer_class_certifies_no_inner_callable_family() {
+        let inner: &[u8] =
+            include_bytes!("fixtures/enclosing-signature/enclosing/Outer$Inner.class");
+        // The constructor `Inner(Outer)` names no type variable, so only the
+        // unknown enclosing scope can withhold its family's certificate.
+        for outer in [None, Some(b"not a class file".as_slice())] {
+            let mut entries = vec![("enclosing/Outer$Inner.class", inner)];
+            entries.extend(outer.map(|bytes| ("enclosing/Outer.class", bytes)));
+            let temp = tempfile::tempdir().unwrap();
+            let jar = temp.path().join("enclosing.jar");
+            brokk_bifrost_analysis::test_support::zip_helpers::write_zip_unwrap(
+                &jar,
+                &entries,
+                SimpleFileOptions::default(),
+            );
+            let production = JavaJarPackProducer.produce_exact_artifact(
+                &request(jar.clone(), ExternalArtifactKind::JavaClassJar),
+                &ArtifactProducerLimits::default(),
+            );
+            assert_eq!(production.completeness, Completeness::Partial, "{outer:?}");
+            assert!(
+                production
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code
+                        == super::super::producer_codes::JAVA_ARCHIVE_ENTRY_READ.code
+                        && diagnostic.message.contains("enclosing/Outer")),
+                "{:?}",
+                production.diagnostics
+            );
+            let limits = ArtifactProducerLimits::default();
+            let mut archive = ZipArchive::new(fs::File::open(&jar).unwrap()).unwrap();
+            let mut scopes = EnclosingScopeResolver::default();
+            let mut remaining = limits.max_records;
+            let mut truncated = false;
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            let ClassEntryResult::Declaration(declaration) = class_api_type(
+                "enclosing.jar",
+                "enclosing/Outer$Inner.class",
+                inner,
+                &mut |scope| scopes.parameters(scope, &mut archive, "", limits.max_signature_depth),
+                limits.max_signature_depth,
+                &mut remaining,
+                &mut truncated,
+                &mut diagnostics,
+            ) else {
+                panic!("the inner class must decode");
+            };
+            assert!(
+                declaration
+                    .members
+                    .iter()
+                    .any(|member| member.member_kind == MemberKind::Constructor),
+                "{:#?}",
+                declaration.members
+            );
+            assert!(
+                declaration
+                    .members
+                    .iter()
+                    .all(|member| !member.callable_family_complete),
+                "{outer:?}: {:#?}",
+                declaration.members
+            );
+            assert!(!declaration.jvm_inventory.unwrap().callables_complete);
+        }
+    }
+
+    #[test]
     #[hardwon("#8415: the class-file reader silently erased valid enclosing-scope Signatures")]
     fn enclosing_signature_scope_class_file_boundary() {
         let entries: &[(&str, &[u8])] = &[
@@ -3572,20 +4057,18 @@ mod tests {
             .find(|member| member.owner == shadow.id && member.name == "get")
             .unwrap();
         assert_eq!(get.signature.as_ref().unwrap().returns, Some(t));
+        // Local's `T` is Outer's, reached through its EnclosingMethod (#9901).
         assert!(
-            production
+            !production
                 .diagnostics
                 .iter()
-                .any(
-                    |diagnostic| diagnostic.code == "java.class.unresolved_type_parameter"
-                        && diagnostic.message.contains("Outer.local")
-                        && diagnostic.message.contains('T')
-                ),
+                .any(|diagnostic| diagnostic.code == "java.class.unresolved_type_parameter"),
             "{:?}",
             production.diagnostics
         );
         // Local classes are omitted from the public projection. Inspect the
-        // same class-file boundary directly to check its incomplete inventory.
+        // same class-file boundary directly: without its enclosing scope the
+        // local class's inventory is incomplete.
         let limits = ArtifactProducerLimits::default();
         let mut remaining = limits.max_records;
         let mut truncated = false;
@@ -3594,7 +4077,7 @@ mod tests {
             "enclosing.jar",
             entries[2].0,
             entries[2].1,
-            &mut |_| Vec::new(),
+            &mut |_| Some(Vec::new()),
             limits.max_signature_depth,
             &mut remaining,
             &mut truncated,
@@ -3811,7 +4294,9 @@ mod tests {
         let path = PathBuf::from(path);
         let bytes = fs::read(&path).unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(&bytes).into()
+            ),
             "5440baccc6c54b18671ab9cb9bf6ffdd7698d3a85ee74faa0b47b111312f200c"
         );
         let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
@@ -3823,7 +4308,9 @@ mod tests {
             .read_to_string(&mut source)
             .unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(source.as_bytes())),
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(source.as_bytes()).into()
+            ),
             "a39ef7455400ad8ef34cb6343c4a8ec2ae8332992cd825c5ed6580e85c07fc0d"
         );
         let tree = parse_tree(&source).unwrap();
@@ -3868,7 +4355,9 @@ mod tests {
             .join("jmods/java.sql.jmod");
         let binary_bytes = fs::read(jmod).unwrap();
         assert_eq!(
-            format!("{:x}", Sha256::digest(&binary_bytes)),
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(&binary_bytes).into()
+            ),
             "bb044edbda73bba35f2cd5c5c482652322f9c07cf353a2ae0ecc5ba79a791ec8"
         );
         let mut binary = ZipArchive::new(Cursor::new(binary_bytes)).unwrap();
@@ -3882,7 +4371,7 @@ mod tests {
             "java.sql.jmod",
             "classes/java/sql/Statement.class",
             &class,
-            &mut |_| Vec::new(),
+            &mut |_| Some(Vec::new()),
             limits.max_signature_depth,
             &mut remaining,
             &mut truncated,
@@ -4004,7 +4493,7 @@ mod tests {
                 "java.base.jmod",
                 &entry,
                 &bytes,
-                &mut |_| Vec::new(),
+                &mut |_| Some(Vec::new()),
                 limits.max_signature_depth,
                 &mut remaining,
                 &mut truncated,
@@ -4143,7 +4632,7 @@ mod tests {
             "fixture.jar",
             entry,
             &bytes,
-            &mut |_| Vec::new(),
+            &mut |_| Some(Vec::new()),
             limits.max_signature_depth,
             &mut remaining_records,
             &mut record_limit_hit,
@@ -4188,7 +4677,7 @@ mod tests {
             "fixture.jar",
             entry,
             &bytes,
-            &mut |_| Vec::new(),
+            &mut |_| Some(Vec::new()),
             limits.max_signature_depth,
             &mut remaining_records,
             &mut record_limit_hit,

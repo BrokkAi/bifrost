@@ -78,10 +78,26 @@ fn control_child_guards(
         } else {
             None
         };
-        if node.has_error()
-            || node.kind() == "assert_statement"
-            || (node.kind() == "conditional_expression" && operands.is_none())
-        {
+        if node.kind() == "assert_statement" && !node.has_error() {
+            // Assertions may be disabled by -O. Their expressions execute in
+            // an ordinary conditional region, not an unknown binding scope.
+            temporal::predicate(p, node, site);
+            let id = dense_ordinal(p.facts.python_guards.len(), "assertion execution guards");
+            p.facts.python_guards.push(PythonNativeGuardFact {
+                id,
+                parent,
+                site,
+                execution_scope: scope,
+                kind: PythonNativeGuardKind::IfTrue,
+                arm_ordinal: 0,
+                predicate: Some(site),
+            });
+            for child in named_children_iter(node) {
+                children.insert(child.id(), id);
+            }
+            return children;
+        }
+        if node.has_error() || (node.kind() == "conditional_expression" && operands.is_none()) {
             let id = dense_ordinal(p.facts.python_guards.len(), "conditional activation guards");
             p.facts.python_guards.push(PythonNativeGuardFact {
                 id,

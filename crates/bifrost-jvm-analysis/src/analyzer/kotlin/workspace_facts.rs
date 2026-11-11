@@ -337,14 +337,13 @@ mod external_receipt_budget_tests {
             .file("pom.xml", "<project/>")
             .build();
         let config = brokk_bifrost_analysis::analyzer::AnalyzerConfig {
-            memo_cache_budget_bytes: Some(8),
+            retention_budget_bytes: Some(4 * (8)),
             ..Default::default()
         };
         let analyzer = KotlinAnalyzer::new_with_config(project.project_arc(), config);
         crate::analyzer::jvm::authority::assert_receipt_loss_refuses_live_index(
             &analyzer,
             &analyzer.external_index,
-            &analyzer.external_inputs,
             || {
                 analyzer.external_declaration_index();
             },

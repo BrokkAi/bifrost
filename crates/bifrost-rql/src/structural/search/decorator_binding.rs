@@ -289,7 +289,7 @@ pub(super) fn formal_annotation_match(
         facts,
         fact_match: FactMatch {
             node: u32::try_from(node).expect("structural node ids fit u32"),
-            captures: Vec::new(),
+            captures: Arc::from([]),
             reported_range: None,
             heuristic: None,
         },

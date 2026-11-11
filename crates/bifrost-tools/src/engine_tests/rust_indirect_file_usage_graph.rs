@@ -82,8 +82,13 @@ mod contract_tests {
     }
 
     impl ImportAnalysisProvider for TestImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            Arc::new(HashSet::default())
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> { HashSet::default() },
+            )
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -242,7 +247,11 @@ mod contract_tests {
             }
         }
 
-        fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self
+        fn update_with_listing(
+            &self,
+            _changed_files: &BTreeSet<ProjectFile>,
+            _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self
         where
             Self: Sized,
         {

@@ -233,6 +233,30 @@ pub fn rust_format_macro_arguments(
     Ok(macro_arguments_from_operands(invocation, source, &operands))
 }
 
+/// The log grammar has an optional target prefix, an optional level (for
+/// log!), and a required literal format string. Reject all other shapes.
+pub fn rust_logging_format_operand(
+    invocation: Node<'_>,
+    source: &str,
+    arguments: &[RustFormatMacroArgument],
+) -> Option<usize> {
+    let path = invocation.child_by_field_name("macro")?;
+    let name = *crate::graph_support::rust_path_segments(path)?.last()?;
+    let name = crate::declarations::rust_node_text(name, source);
+    rust_logging_macro("log", name)?;
+    let tree = crate::declarations::rust_macro_invocation_arguments(invocation)?;
+    let (tokens, _) = crate::macro_matcher::interior_tokens(tree);
+    if tokens.iter().any(|token| token.kind() == ";") {
+        return None;
+    }
+    let target = matches!(tokens.as_slice(), [first, colon, ..] if first.kind() == "identifier" && crate::declarations::rust_node_text(*first, source) == "target" && colon.kind() == ":");
+    let index = usize::from(target) + usize::from(name == "log");
+    arguments
+        .get(index)
+        .filter(|argument| matches!(argument.value_kind, "string_literal" | "raw_string_literal"))
+        .map(|_| index)
+}
+
 pub fn rust_matches_macro_scrutinee(
     invocation: Node<'_>,
     source: &str,

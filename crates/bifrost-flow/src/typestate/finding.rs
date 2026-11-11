@@ -18,7 +18,251 @@ use super::{
     ProtocolStateId, ProtocolTerminalObservationSpec, TypestateBindingPlan,
     TypestateEventBindingId, TypestateFact, TypestateFlowProblemError, TypestateSubjectId,
     TypestateSummaryResult, TypestateTerminalBindingId, TypestateUncertaintySet,
+    TypestateViolation,
 };
+use crate::taint::compose::HopQuality;
+
+/// One retained composed path and its already projected witness.
+pub struct ComposedTerminalPath {
+    pub fact: TypestateFact,
+    pub first_unproven: Box<[super::FirstUnprovenEvent]>,
+    pub quality: HopQuality,
+    pub witness: SummaryWitness,
+    pub relation_sites: Box<[(super::FirstUnprovenRelationKind, SemanticLocator)]>,
+}
+
+impl ComposedTerminalPath {
+    fn event_admitted(
+        &self,
+        subject: TypestateSubjectId,
+        binding_definitive: bool,
+        event: &super::FirstUnprovenEvent,
+    ) -> bool {
+        let certain = binding_definitive
+            && self.quality.is_certain()
+            && self.fact.uncertainty().is_empty()
+            && !self.fact.abstained();
+        match event {
+            super::FirstUnprovenEvent::None => certain,
+            super::FirstUnprovenEvent::Relation(relation) => relation.subject() == subject,
+            super::FirstUnprovenEvent::Lost => false,
+        }
+    }
+
+    pub fn admitted(&self, subject: TypestateSubjectId, binding_definitive: bool) -> bool {
+        self.first_unproven
+            .iter()
+            .any(|event| self.event_admitted(subject, binding_definitive, event))
+    }
+
+    pub fn all_admitted(&self, subject: TypestateSubjectId, binding_definitive: bool) -> bool {
+        !self.first_unproven.is_empty()
+            && self
+                .first_unproven
+                .iter()
+                .all(|event| self.event_admitted(subject, binding_definitive, event))
+    }
+}
+
+/// Build a terminal finding from object-search paths without rerunning a
+/// solver. Each witness is the search's retained hop derivation.
+pub fn composed_terminal_finding(
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    terminal_id: TypestateTerminalBindingId,
+    paths: &[ComposedTerminalPath],
+    analysis_complete: bool,
+) -> Option<TypestateFinding> {
+    let binding = bindings
+        .terminal_binding(terminal_id)
+        .expect("composed terminal names a compiled binding");
+    let expectation = protocol
+        .terminal_expectation(binding.expectation())
+        .expect("terminal binding names a compiled expectation");
+    let binding_definitive = binding.quality().is_definitive()
+        && bindings
+            .subject(binding.subject())
+            .is_some_and(|subject| subject.quality().is_definitive());
+    let mut actual_states = Vec::new();
+    let mut uncertainty = TypestateUncertaintySet::default();
+    let mut abstained = false;
+    let mut failing_proven = false;
+    let mut all_paths_definitive = binding_definitive && !paths.is_empty();
+    let mut witnesses = Vec::new();
+    let mut failing_paths = 0_usize;
+    let mut relation_sites = Vec::new();
+    for path in paths {
+        let fact = path.fact;
+        let state = fact
+            .state_observation()
+            .map(|(_, state, _, _)| state)
+            .or_else(|| fact.terminal_observation().map(|(_, state)| state));
+        let Some(state) = state else {
+            continue;
+        };
+        let definitive = binding_definitive
+            && path.quality.is_certain()
+            && fact.uncertainty().is_empty()
+            && !fact.abstained();
+        if expectation.expected_states().binary_search(&state).is_err()
+            && !path.admitted(binding.subject(), binding_definitive)
+        {
+            continue;
+        }
+        actual_states.push(state);
+        uncertainty = uncertainty.union(fact.uncertainty());
+        abstained |= fact.abstained();
+        all_paths_definitive &= definitive;
+        if expectation.expected_states().binary_search(&state).is_err() {
+            failing_paths += 1;
+            for (kind, site) in path.relation_sites.iter() {
+                if relation_sites
+                    .iter()
+                    .filter(|(retained, _)| retained == kind)
+                    .count()
+                    < MAX_TYPESTATE_WITNESSES_PER_FINDING
+                    && !relation_sites.contains(&(*kind, site.clone()))
+                {
+                    relation_sites.push((*kind, site.clone()));
+                }
+            }
+            failing_proven |= definitive;
+            if witnesses.len() < MAX_TYPESTATE_WITNESSES_PER_FINDING {
+                witnesses.push(TypestateFindingWitness {
+                    observed_state: Some(state),
+                    witness: TypestateWitness::from_summary(
+                        path.witness.clone(),
+                        fact.uncertainty(),
+                        fact.abstained(),
+                    ),
+                });
+            }
+        }
+    }
+    actual_states.sort_unstable();
+    actual_states.dedup();
+    let failing = actual_states
+        .iter()
+        .filter(|state| expectation.expected_states().binary_search(state).is_err())
+        .count();
+    let certainty = terminal_finding_certainty(
+        protocol.semantics().analysis_mode,
+        analysis_complete,
+        failing,
+        actual_states.len(),
+        failing_proven,
+        all_paths_definitive,
+    )?;
+    Some(TypestateFinding {
+        subject: binding.subject(),
+        site: binding.site().identity().clone(),
+        kind: TypestateFindingKind::TerminalExpectation {
+            binding: terminal_id,
+            expectation: binding.expectation(),
+            actual_states: actual_states.into_boxed_slice(),
+        },
+        certainty,
+        evidence: TypestateFindingEvidence {
+            path_proven: failing_proven,
+            path_proven_complete: failing_proven && all_paths_definitive,
+            analysis_complete,
+            uncertainty,
+            abstained,
+        },
+        omitted_witnesses: failing_paths.saturating_sub(witnesses.len()),
+        witnesses: witnesses.into_boxed_slice(),
+        relation_sites: relation_sites.into_boxed_slice(),
+    })
+}
+
+pub fn composed_error_finding(
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    violation: TypestateViolation,
+    paths: &[ComposedTerminalPath],
+    analysis_complete: bool,
+    has_competing_outcome: bool,
+) -> Option<TypestateFinding> {
+    let binding = bindings
+        .event_binding(violation.event_binding())
+        .expect("composed violation names a compiled event binding");
+    let binding_definitive = binding.quality().is_definitive()
+        && bindings
+            .subject(binding.subject())
+            .is_some_and(|subject| subject.quality().is_definitive());
+    let mut uncertainty = TypestateUncertaintySet::default();
+    let mut abstained = false;
+    let mut proven = false;
+    let mut proven_complete = false;
+    let mut witnesses = Vec::new();
+    let mut admitted_paths = 0_usize;
+    let mut relation_sites = Vec::new();
+    for path in paths {
+        if !path.admitted(binding.subject(), binding_definitive) {
+            continue;
+        }
+        admitted_paths += 1;
+        for (kind, site) in path.relation_sites.iter() {
+            if relation_sites
+                .iter()
+                .filter(|(retained, _)| retained == kind)
+                .count()
+                < MAX_TYPESTATE_WITNESSES_PER_FINDING
+                && !relation_sites.contains(&(*kind, site.clone()))
+            {
+                relation_sites.push((*kind, site.clone()));
+            }
+        }
+        uncertainty = uncertainty.union(path.fact.uncertainty());
+        abstained |= path.fact.abstained();
+        let definitive =
+            binding_definitive && path.fact.uncertainty().is_empty() && !path.fact.abstained();
+        proven |= definitive && path.quality.proven;
+        proven_complete |= definitive && path.quality.is_certain();
+        if witnesses.len() < MAX_TYPESTATE_WITNESSES_PER_FINDING {
+            witnesses.push(TypestateFindingWitness {
+                observed_state: None,
+                witness: TypestateWitness::from_summary(
+                    path.witness.clone(),
+                    path.fact.uncertainty(),
+                    path.fact.abstained(),
+                ),
+            });
+        }
+    }
+    let aggregate = ViolationAggregate {
+        uncertainty,
+        abstained,
+        has_definite_proven_path: proven,
+        has_definite_proven_complete_path: proven_complete,
+    };
+    (admitted_paths > 0).then_some(TypestateFinding {
+        subject: binding.subject(),
+        site: binding.site().identity().clone(),
+        kind: TypestateFindingKind::ErrorTransition {
+            binding: binding.id(),
+            event: binding.event(),
+            from: violation.from(),
+            to: violation.to(),
+        },
+        certainty: error_transition_certainty(
+            protocol.semantics().analysis_mode,
+            analysis_complete,
+            &aggregate,
+            has_competing_outcome,
+        ),
+        evidence: TypestateFindingEvidence {
+            path_proven: proven,
+            path_proven_complete: proven_complete,
+            analysis_complete,
+            uncertainty,
+            abstained,
+        },
+        witnesses: witnesses.into_boxed_slice(),
+        omitted_witnesses: admitted_paths.saturating_sub(MAX_TYPESTATE_WITNESSES_PER_FINDING),
+        relation_sites: relation_sites.into_boxed_slice(),
+    })
+}
 
 pub const MAX_TYPESTATE_FINDINGS: usize = 4_096;
 pub const MAX_TYPESTATE_FINDING_CANDIDATES: usize = 8_192;
@@ -188,9 +432,14 @@ pub struct TypestateFinding {
     evidence: TypestateFindingEvidence,
     witnesses: Box<[TypestateFindingWitness]>,
     omitted_witnesses: usize,
+    relation_sites: Box<[(super::FirstUnprovenRelationKind, SemanticLocator)]>,
 }
 
 impl TypestateFinding {
+    pub fn relation_sites(&self) -> &[(super::FirstUnprovenRelationKind, SemanticLocator)] {
+        &self.relation_sites
+    }
+
     pub const fn subject(&self) -> TypestateSubjectId {
         self.subject
     }
@@ -1351,6 +1600,7 @@ fn materialize_findings(
             evidence: finding.evidence,
             witnesses: witnesses.into_boxed_slice(),
             omitted_witnesses: finding.omitted_witnesses,
+            relation_sites: Box::new([]),
         });
     }
     Ok((materialized, retained_expansions, retained_bytes))

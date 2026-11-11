@@ -7,13 +7,14 @@ use super::ir::{
     ConfigurationCodeRelation, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
     ConfigurationFactsSeed, ConfigurationKeyRelation, ConfigurationNodeKindFilter,
     ConfigurationRouteFilter, ConfigurationRouteSegmentFilter, ControlRelationFilter,
-    CppProvenanceFilter, CrossDomainCorrelation, CrossDomainRelation, CrossDomainRequirement,
-    DEFAULT_LIMIT, DeclarationModifier, DeclarationStateFilter, DecoratorBindingFilter,
-    DependencyConfigurationRelation, DependencyEvidenceFilter, DependencyEvidenceSeed, EdgeFilter,
-    ExportFilter, ExportSeed, FailureUseConsumer, FailureUseProvenance, FieldWriteValueTraversal,
-    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    JsxAttributeValueTraversal, KeyedReadKeySelector, KeyedReadValueTraversal, LanguageRule,
-    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
+    CountPredicate, CppProvenanceFilter, CrossDomainCorrelation, CrossDomainRelation,
+    CrossDomainRequirement, DEFAULT_LIMIT, DeclarationModifier, DeclarationStateFilter,
+    DecoratorBindingFilter, DependencyConfigurationRelation, DependencyEvidenceFilter,
+    DependencyEvidenceSeed, EdgeFilter, EnclosingPattern, ExportFilter, ExportSeed,
+    FailureUseConsumer, FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter,
+    GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal,
+    KeyedReadKeySelector, KeyedReadValueTraversal, LanguageRule, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
     MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_CONFIGURATION_VALUE_LENGTH,
     MAX_CORRELATION_DOCUMENTS, MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
@@ -30,12 +31,12 @@ use super::ir::{
     ValueFlowTraversal, WitnessTraversal, intersect_language_scopes,
 };
 use super::schema::{
-    ALL_QUERY_PLAN_SOURCES, ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField,
-    QueryStepField, StringPredicateField, call_traversal_completeness_from_label,
-    configuration_member_role_from_label, configuration_provenance_from_label,
-    configuration_scalar_kind_from_label, jsx_element_identity_from_label,
-    reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
-    usage_proof_from_label, usage_surface_from_label,
+    ALL_QUERY_PLAN_SOURCES, ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, MEMBER_FORM_LABELS,
+    PatternField, QueryField, QueryStepField, StringPredicateField,
+    call_traversal_completeness_from_label, configuration_member_role_from_label,
+    configuration_provenance_from_label, configuration_scalar_kind_from_label,
+    jsx_element_identity_from_label, reference_kind_from_label, rql_schema_version_registry,
+    usage_kind_from_label, usage_proof_from_label, usage_surface_from_label,
 };
 use super::{child_path, index_path};
 use brokk_bifrost_core::analyzer::Language;
@@ -341,6 +342,14 @@ fn decode_plan(
                 "pattern must not be empty",
             ));
         }
+        super::ir::validate_each_capture_scopes(
+            [&root_pattern]
+                .into_iter()
+                .chain(inside.iter())
+                .chain(inside_decl.iter())
+                .chain(not_inside.iter()),
+            path,
+        )?;
         CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
             where_globs: fields
                 .where_globs
@@ -1167,6 +1176,15 @@ pub(super) fn decode_decorator_binding_filter(
     })
 }
 
+fn decode_enclosing_pattern(value: &Value, path: &str) -> Result<EnclosingPattern, QueryError> {
+    let pattern = decode_pattern(value, path, &mut QueryBudget::default(), 0, false)?;
+    super::ir::validate_each_capture_scopes([&pattern], path)?;
+    Ok(EnclosingPattern {
+        canonical: super::json::pattern_to_json(&pattern),
+        pattern,
+    })
+}
+
 pub(super) fn decode_edge_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1176,6 +1194,7 @@ pub(super) fn decode_edge_filter(
         path,
         &[
             "reference_kinds",
+            "enclosing",
             "proof",
             "surface",
             "usage",
@@ -1216,6 +1235,12 @@ pub(super) fn decode_edge_filter(
             "reference kind",
             reference_kind_from_label,
         )?,
+        enclosing: object
+            .get("enclosing")
+            .map(|value| {
+                decode_enclosing_pattern(value, &child_path(path, "enclosing")).map(Box::new)
+            })
+            .transpose()?,
         proof,
         surface,
         usage_kinds: decode_environment_axis(
@@ -1675,9 +1700,12 @@ fn decode_configuration_numeric_bound(
         return Ok(None);
     };
     let field_path = child_path(path, field);
-    let value = value
-        .as_str()
-        .ok_or_else(|| QueryError::new(&field_path, "expected a finite numeric bound string"))?;
+    let value = value.as_str().ok_or_else(|| {
+        QueryError::new(
+            &field_path,
+            "expected a decimal numeric bound string whose exponent fits a 64-bit integer",
+        )
+    })?;
     if value.len() > MAX_CONFIGURATION_VALUE_LENGTH {
         return Err(QueryError::new(
             &field_path,
@@ -1686,10 +1714,13 @@ fn decode_configuration_numeric_bound(
             ),
         ));
     }
-    if !value.parse::<f64>().is_ok_and(|number| number.is_finite()) {
+    // The configuration number grammar decides, so a bound the evaluation
+    // cannot compare never reaches it.
+    if brokk_bifrost_analysis::analyzer::configuration::ConfigurationNumber::parse(value).is_none()
+    {
         return Err(QueryError::new(
             &field_path,
-            "expected a finite numeric bound string",
+            "expected a decimal numeric bound string whose exponent fits a 64-bit integer",
         ));
     }
     Ok(Some(value.to_string()))
@@ -1852,6 +1883,38 @@ fn decode_configuration_routes(
     Ok(routes)
 }
 
+const CONFIGURATION_FACTS_FILTER_FIELDS: &[&str] = &[
+    "formats",
+    "node_kinds",
+    "roles",
+    "scalar_kinds",
+    "keys",
+    "values",
+    "values_ignore_case",
+    "value_regex",
+    "value_lt",
+    "value_le",
+    "value_gt",
+    "value_ge",
+    "xml_parent_keys",
+    "xml_preceding_sibling_keys",
+    "xml_sibling_attribute_keys",
+    "xml_sibling_attribute_values",
+    "xml_sibling_attribute_values_ignore_case",
+    "xml_reference_source_keys",
+    "xml_reference_target_keys",
+    "xml_reference_target_element_keys",
+    "xml_reference_target_child_keys",
+    "xml_peer_element_keys",
+    "xml_peer_attribute_keys",
+    "xml_peer_child_keys",
+    "xml_peer_min_shared_children",
+    "routes",
+    "fact_ordinals",
+    "provenances",
+    "completenesses",
+];
+
 pub(super) fn decode_configuration_facts_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1859,39 +1922,11 @@ pub(super) fn decode_configuration_facts_filter(
     reject_unknown_filter_fields(
         object,
         path,
-        &[
-            "formats",
-            "node_kinds",
-            "roles",
-            "scalar_kinds",
-            "keys",
-            "values",
-            "values_ignore_case",
-            "value_lt",
-            "value_le",
-            "value_gt",
-            "value_ge",
-            "xml_parent_keys",
-            "xml_preceding_sibling_keys",
-            "xml_sibling_attribute_keys",
-            "xml_sibling_attribute_values",
-            "xml_sibling_attribute_values_ignore_case",
-            "xml_reference_source_keys",
-            "xml_reference_target_keys",
-            "xml_reference_target_element_keys",
-            "xml_reference_target_child_keys",
-            "xml_peer_element_keys",
-            "xml_peer_attribute_keys",
-            "xml_peer_child_keys",
-            "xml_peer_min_shared_children",
-            "routes",
-            "fact_ordinals",
-            "provenances",
-            "completenesses",
-        ],
+        CONFIGURATION_FACTS_FILTER_FIELDS,
         "configuration facts",
     )?;
     Ok(ConfigurationFactsFilter {
+        absence_scope: super::ir::ConfigurationAbsenceScope::Document,
         formats: decode_configuration_enum_axis(
             object,
             path,
@@ -1923,6 +1958,21 @@ pub(super) fn decode_configuration_facts_filter(
         keys: decode_configuration_keys(object, path)?,
         values: decode_configuration_values(object, path, "values")?,
         values_ignore_case: decode_configuration_values(object, path, "values_ignore_case")?,
+        value_regex: object
+            .get("value_regex")
+            .map(|value| {
+                let field_path = child_path(path, "value_regex");
+                let source = value
+                    .as_str()
+                    .ok_or_else(|| QueryError::new(&field_path, "expected a regex string"))?;
+                reject_too_long(source, &field_path, MAX_STRING_PREDICATE_LENGTH, "regex")?;
+                Regex::new(source)
+                    .map(super::ir::ConfigurationValueRegex)
+                    .map_err(|error| {
+                        QueryError::new(&field_path, format!("invalid regex: {error}"))
+                    })
+            })
+            .transpose()?,
         value_lt: decode_configuration_numeric_bound(object, path, "value_lt")?,
         value_le: decode_configuration_numeric_bound(object, path, "value_le")?,
         value_gt: decode_configuration_numeric_bound(object, path, "value_gt")?,
@@ -2328,9 +2378,17 @@ fn decode_call_identity(
                 identity: identity.to_owned(),
             }),
         })),
+        "possible_semantic_model" => Ok(Some(CallIdentity::Qualified {
+            value: identity.to_owned(),
+            source_range: None,
+            resolved: Some(super::ir::ResolvedCallIdentity {
+                kind: super::ir::ResolvedCallIdentityKind::PossibleSemanticModel,
+                identity: identity.to_owned(),
+            }),
+        })),
         _ => Err(QueryError::new(
             value_path,
-            "call identity key must be stable, qualified, workspace_declaration, or active_semantic_model",
+            "call identity key must be stable, qualified, workspace_declaration, active_semantic_model, or possible_semantic_model",
         )),
     }
 }
@@ -2704,6 +2762,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             super::schema::QueryStepOp::Filter => QueryStep::Filter(Vec::new()),
             super::schema::QueryStepOp::Project => QueryStep::Project(Vec::new()),
             super::schema::QueryStepOp::CaptureAnchor => QueryStep::CaptureAnchor(String::new()),
+            super::schema::QueryStepOp::IdenticalCaptures => QueryStep::IdenticalCaptures {
+                left: String::new(),
+                right: String::new(),
+            },
             super::schema::QueryStepOp::ConfigurationAbsence => {
                 QueryStep::ConfigurationAbsence(Box::default())
             }
@@ -2808,6 +2870,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let row_filter = matches!(step, QueryStep::Filter(_));
         let row_project = matches!(step, QueryStep::Project(_));
         let capture_anchor = matches!(step, QueryStep::CaptureAnchor(_));
+        let identical_captures = matches!(step, QueryStep::IdenticalCaptures { .. });
         let program_point_by_id = matches!(step, QueryStep::ProgramPointById { .. });
         let configuration_absence = matches!(step, QueryStep::ConfigurationAbsence(_));
         let statement_facts = matches!(step, QueryStep::StatementFacts(_));
@@ -2845,25 +2908,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let absent_member = matches!(step, QueryStep::AbsentMember(_));
         for key in object.keys() {
             if configuration_absence
-                && key != "op"
-                && matches!(
-                    key.as_str(),
-                    "formats"
-                        | "node_kinds"
-                        | "roles"
-                        | "scalar_kinds"
-                        | "keys"
-                        | "values"
-                        | "values_ignore_case"
-                        | "value_lt"
-                        | "value_le"
-                        | "value_gt"
-                        | "value_ge"
-                        | "routes"
-                        | "fact_ordinals"
-                        | "provenances"
-                        | "completenesses"
-                )
+                && (key == "scope" || CONFIGURATION_FACTS_FILTER_FIELDS.contains(&key.as_str()))
             {
                 continue;
             }
@@ -2928,6 +2973,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::SourceOrigin,
                 ) if keyed_read_value => {}
                 Some(QueryStepField::Capture) if receiver || capture_anchor => {}
+                Some(QueryStepField::MemberForms | QueryStepField::TrivialProperty)
+                    if matches!(step, QueryStep::MemberTargets(_)) => {}
+                Some(QueryStepField::LeftCapture | QueryStepField::RightCapture)
+                    if identical_captures => {}
                 Some(QueryStepField::ProtocolRef) if typestate => {}
                 Some(QueryStepField::PlanRef) if value_flow => {}
                 Some(QueryStepField::TaintRef) if taint => {}
@@ -2965,8 +3014,10 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Proof
                     | QueryStepField::Surface,
                 ) if reference => {}
+                Some(QueryStepField::Enclosing) if matches!(step, QueryStep::ReferencesOf(_)) => {}
                 Some(
                     QueryStepField::ReferenceKinds
+                    | QueryStepField::Enclosing
                     | QueryStepField::Proof
                     | QueryStepField::Surface
                     | QueryStepField::EdgeUsageKinds
@@ -2994,6 +3045,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     QueryStepField::Depth
                     | QueryStepField::Transitive
                     | QueryStepField::ReferenceKinds
+                    | QueryStepField::Enclosing
                     | QueryStepField::Proof
                     | QueryStepField::Completeness
                     | QueryStepField::Surface
@@ -3004,6 +3056,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ElementName
                     | QueryStepField::PropertyName
                     | QueryStepField::Capture
+                    | QueryStepField::LeftCapture
+                    | QueryStepField::RightCapture
                     | QueryStepField::ReceiverIdentityId
                     | QueryStepField::MemberTargetId
                     | QueryStepField::Runtime
@@ -3036,6 +3090,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::DeclarationOrigins
                     | QueryStepField::DeclarationOnly
                     | QueryStepField::ConfigGated
+                    | QueryStepField::MemberForms
+                    | QueryStepField::TrivialProperty
                     | QueryStepField::EdgeUsageKinds
                     | QueryStepField::EdgeRelations
                     | QueryStepField::EdgeSiteClasses
@@ -3097,10 +3153,24 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         } else if configuration_absence {
             let mut filter_object = object.clone();
             filter_object.remove("op");
-            step = QueryStep::ConfigurationAbsence(Box::new(decode_configuration_facts_filter(
-                &filter_object,
-                &entry_path,
-            )?));
+            let scope = match filter_object.remove("scope") {
+                None => super::ir::ConfigurationAbsenceScope::Document,
+                Some(Value::String(scope)) if scope == "document" => {
+                    super::ir::ConfigurationAbsenceScope::Document
+                }
+                Some(Value::String(scope)) if scope == "subtree" => {
+                    super::ir::ConfigurationAbsenceScope::Subtree
+                }
+                _ => {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "scope"),
+                        "expected document or subtree",
+                    ));
+                }
+            };
+            let mut filter = decode_configuration_facts_filter(&filter_object, &entry_path)?;
+            filter.absence_scope = scope;
+            step = QueryStep::ConfigurationAbsence(Box::new(filter));
         } else if statement_facts {
             let field = QueryStepField::StatementFactKind.json_label();
             let kind_path = child_path(&entry_path, field);
@@ -3389,6 +3459,12 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 _ => unreachable!("hierarchy step filtered above"),
             };
         } else if reference {
+            if !matches!(step, QueryStep::ReferencesOf(_)) && object.contains_key("enclosing") {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "enclosing"),
+                    "enclosing is only supported on references_of, edges_of, and edges_from",
+                ));
+            }
             let reference_kinds = match object.get("reference_kinds") {
                 Some(value) => {
                     let values = value.as_array().ok_or_else(|| {
@@ -3447,6 +3523,17 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 .unwrap_or_default();
             let filter = ReferenceTraversalFilter {
                 reference_kinds,
+                enclosing: if matches!(step, QueryStep::ReferencesOf(_)) {
+                    object
+                        .get("enclosing")
+                        .map(|value| {
+                            decode_enclosing_pattern(value, &child_path(&entry_path, "enclosing"))
+                                .map(Box::new)
+                        })
+                        .transpose()?
+                } else {
+                    None
+                },
                 proof,
                 surface,
             };
@@ -3813,6 +3900,22 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 key: Some(key),
                 pristine_input,
             });
+        } else if identical_captures {
+            let read_capture = |field: &str| -> Result<String, QueryError> {
+                let field_path = child_path(&entry_path, field);
+                let shape = QueryStepField::Capture.value_shape();
+                object
+                    .get(field)
+                    .ok_or_else(|| QueryError::new(&field_path, "required field is missing"))?
+                    .as_str()
+                    .filter(|name| shape.accepts_string(name))
+                    .map(str::to_owned)
+                    .ok_or_else(|| QueryError::new(field_path, "expected a valid capture name"))
+            };
+            step = QueryStep::IdenticalCaptures {
+                left: read_capture("left")?,
+                right: read_capture("right")?,
+            };
         } else if capture_anchor {
             let path = child_path(&entry_path, "capture");
             let shape = QueryStepField::Capture.value_shape();
@@ -3853,7 +3956,34 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                         })
                 })
                 .transpose()?;
-            let filter = ReceiverTraversalFilter { capture };
+            let member_form = decode_environment_axis(
+                object,
+                &entry_path,
+                "member_form",
+                "member form",
+                |label| {
+                    MEMBER_FORM_LABELS
+                        .iter()
+                        .copied()
+                        .find(|known| *known == label)
+                },
+            )?;
+            let trivial_property = object
+                .get("trivial_property")
+                .map(|value| {
+                    value.as_bool().ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&entry_path, "trivial_property"),
+                            "expected a boolean",
+                        )
+                    })
+                })
+                .transpose()?;
+            let filter = ReceiverTraversalFilter {
+                capture,
+                member_form,
+                trivial_property,
+            };
             step = match step {
                 QueryStep::ReceiverTargets(_) => QueryStep::ReceiverTargets(filter),
                 QueryStep::PointsTo(_) => QueryStep::PointsTo(filter),
@@ -3949,11 +4079,15 @@ struct PatternFields<'a> {
     assignment_unstarred_count_mismatch: Option<&'a Value>,
     index: Option<&'a Value>,
     arity: Option<&'a Value>,
+    count: Option<&'a Value>,
     visibility: Option<&'a Value>,
     parameter_type: Option<&'a Value>,
     capture: Option<&'a Value>,
     has: Option<&'a Value>,
+    each: Option<&'a Value>,
+    argument_mode: Option<&'a Value>,
     local_value: Option<&'a Value>,
+    qualifying_type: Option<&'a Value>,
     not_has: Option<&'a Value>,
     not: Option<&'a Value>,
     all: Option<&'a Value>,
@@ -4008,10 +4142,14 @@ fn collect_pattern_fields<'a>(
                 }
                 PatternField::Index => fields.index = Some(value),
                 PatternField::Arity => fields.arity = Some(value),
+                PatternField::Count => fields.count = Some(value),
                 PatternField::Visibility => fields.visibility = Some(value),
                 PatternField::ParameterType => fields.parameter_type = Some(value),
                 PatternField::Capture => fields.capture = Some(value),
                 PatternField::Has => fields.has = Some(value),
+                PatternField::Each => fields.each = Some(value),
+                PatternField::ArgumentMode => fields.argument_mode = Some(value),
+                PatternField::QualifyingType => fields.qualifying_type = Some(value),
                 PatternField::LocalValue => fields.local_value = Some(value),
                 PatternField::NotHas => fields.not_has = Some(value),
                 PatternField::Not => fields.not = Some(value),
@@ -4028,6 +4166,104 @@ fn collect_pattern_fields<'a>(
         }
     }
     Ok(fields)
+}
+
+fn decode_instantiated_type(
+    value: &Value,
+    path: &str,
+    budget: &mut QueryBudget,
+    depth: usize,
+) -> Result<super::ir::InstantiatedType, QueryError> {
+    use super::schema::InstantiatedTypeField;
+    if depth > MAX_PATTERN_DEPTH || budget.pattern_nodes >= MAX_PATTERN_NODES {
+        return Err(QueryError::new(
+            path,
+            "instantiated-type nesting or node budget exceeded",
+        ));
+    }
+    budget.pattern_nodes += 1;
+    let object = as_object(value, path)?;
+    for key in object.keys() {
+        if InstantiatedTypeField::from_label(key).is_none() {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown instantiated-type field",
+            ));
+        }
+    }
+    let identity =
+        decode_call_identity(object, path, InstantiatedTypeField::Identity.label(), true)?
+            .expect("required identity");
+    if matches!(
+        &identity,
+        CallIdentity::Qualified {
+            resolved: Some(super::ir::ResolvedCallIdentity {
+                kind: super::ir::ResolvedCallIdentityKind::PossibleSemanticModel,
+                ..
+            }),
+            ..
+        }
+    ) {
+        return Err(QueryError::new(
+            child_path(path, "identity"),
+            "a type identity must be canonical, not a possible callable family",
+        ));
+    }
+    let arguments = match object.get(InstantiatedTypeField::Arguments.label()) {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| QueryError::new(child_path(path, "arguments"), "expected an array"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                decode_instantiated_type(
+                    value,
+                    &index_path(&child_path(path, "arguments"), index),
+                    budget,
+                    depth + 1,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let mut resolved_identities = Vec::new();
+    if let Some(value) = object.get(InstantiatedTypeField::ResolvedIdentities.label()) {
+        let values = value.as_array().ok_or_else(|| {
+            QueryError::new(child_path(path, "resolved_identities"), "expected an array")
+        })?;
+        if values.len() > MAX_PATTERN_NODES {
+            return Err(QueryError::new(path, "too many resolved type identities"));
+        }
+        for (index, value) in values.iter().enumerate() {
+            let object = Map::from_iter([("identity".to_owned(), value.clone())]);
+            match decode_call_identity(
+                &object,
+                &index_path(&child_path(path, "resolved_identities"), index),
+                "identity",
+                true,
+            )? {
+                Some(CallIdentity::Qualified {
+                    resolved: Some(identity),
+                    ..
+                }) if identity.kind
+                    != super::ir::ResolvedCallIdentityKind::PossibleSemanticModel =>
+                {
+                    resolved_identities.push(identity)
+                }
+                _ => {
+                    return Err(QueryError::new(
+                        path,
+                        "resolved type identity must be a workspace declaration or active semantic-model identity",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(super::ir::InstantiatedType {
+        identity,
+        arguments,
+        resolved_identities,
+    })
 }
 
 fn decode_pattern(
@@ -4357,6 +4593,50 @@ fn decode_pattern(
         .arity
         .map(|value| decode_arity_constraint(value, &child_path(path, "arity")))
         .transpose()?;
+    let count = fields
+        .count
+        .map(|value| {
+            let count_path = child_path(path, "count");
+            let object = as_object(value, &count_path)?;
+            reject_unknown_filter_fields(
+                object,
+                &count_path,
+                &["role", "pattern", "min", "max"],
+                "count",
+            )?;
+            let role_path = child_path(&count_path, "role");
+            let role = object
+                .get("role")
+                .and_then(Value::as_str)
+                .and_then(Role::from_label)
+                .filter(|role| Role::list_target_roles().contains(role))
+                .ok_or_else(|| QueryError::new(&role_path, "count role must be a list role"))?;
+            let pattern_path = child_path(&count_path, "pattern");
+            let child = object
+                .get("pattern")
+                .ok_or_else(|| QueryError::new(&pattern_path, "count requires a pattern"))?;
+            let child = decode_pattern(child, &pattern_path, budget, depth + 1, false)?;
+            if !object.contains_key("min") && !object.contains_key("max") {
+                return Err(QueryError::new(&count_path, "count requires min or max"));
+            }
+            let min = object
+                .get("min")
+                .map(|value| decode_count_bound(value, &child_path(&count_path, "min")))
+                .transpose()?
+                .unwrap_or(0);
+            let max = object
+                .get("max")
+                .map(|value| decode_count_bound(value, &child_path(&count_path, "max")))
+                .transpose()?;
+            if max.is_some_and(|max| min > max) {
+                return Err(QueryError::new(
+                    &count_path,
+                    "count min must not exceed max",
+                ));
+            }
+            Ok(CountPredicate::new(role, child, min, max))
+        })
+        .transpose()?;
 
     let visibility = match fields.visibility {
         None => Vec::new(),
@@ -4393,6 +4673,33 @@ fn decode_pattern(
         .transpose()?;
 
     let has = decode_boxed_sub_pattern(fields.has, path, "has", budget, depth + 1)?;
+    let each = decode_boxed_sub_pattern(fields.each, path, "each", budget, depth + 1)?;
+    let argument_modes = fields
+        .argument_mode
+        .map(|value| decode_argument_modes(value, &child_path(path, "argument_mode")))
+        .transpose()?
+        .unwrap_or_default();
+    let qualifying_type = fields
+        .qualifying_type
+        .map(|value| {
+            if kinds.is_empty()
+                || kinds
+                    .iter()
+                    .any(|kind| !kind.satisfies(NormalizedKind::Call))
+            {
+                return Err(QueryError::new(
+                    child_path(path, "qualifying_type"),
+                    "qualifying_type requires kind call",
+                ));
+            }
+            decode_instantiated_type(
+                value,
+                &child_path(path, "qualifying_type"),
+                budget,
+                depth + 1,
+            )
+        })
+        .transpose()?;
     let local_value =
         decode_boxed_sub_pattern(fields.local_value, path, "local_value", budget, depth + 1)?;
     let not_has = decode_boxed_sub_pattern(fields.not_has, path, "not_has", budget, depth + 1)?;
@@ -4430,10 +4737,14 @@ fn decode_pattern(
         assignment_unstarred_count_mismatch,
         index,
         arity,
+        count,
         visibility,
         parameter_type,
         capture,
         has,
+        each,
+        argument_modes,
+        qualifying_type,
         local_value,
         not_has,
         not,
@@ -4498,6 +4809,13 @@ fn decode_arity_bound(value: &Value, path: &str) -> Result<u32, QueryError> {
         ));
     }
     Ok(count as u32)
+}
+
+fn decode_count_bound(value: &Value, path: &str) -> Result<u32, QueryError> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| QueryError::new(path, "count bound must be a non-negative 32-bit integer"))
 }
 
 fn decode_bool(value: &Value, path: &str) -> Result<bool, QueryError> {
@@ -4864,6 +5182,7 @@ fn decode_role_fields(
                 Role::Body => pattern.body = Some(sub_pattern),
                 Role::Label => pattern.label = Some(sub_pattern),
                 Role::Binding => pattern.binding = Some(sub_pattern),
+                Role::InitializerOf => pattern.initializer_of = Some(sub_pattern),
 
                 Role::Arg
                 | Role::Kwarg
@@ -4873,6 +5192,8 @@ fn decode_role_fields(
                 | Role::Children
                 | Role::Indices
                 | Role::Dimensions
+                | Role::Parameters
+                | Role::Members
                 | Role::Part
                 | Role::TypeArguments => {
                     unreachable!("non-single role")
@@ -4912,6 +5233,8 @@ fn decode_role_fields(
                 Role::Part => pattern.parts = patterns,
                 Role::Indices => pattern.indices = patterns,
                 Role::Dimensions => pattern.dimensions = patterns,
+                Role::Parameters => pattern.parameters = patterns,
+                Role::Members => pattern.members = patterns,
 
                 Role::TypeArguments => pattern.type_arguments = patterns,
                 Role::Callee
@@ -4934,7 +5257,8 @@ fn decode_role_fields(
                 | Role::Alternative
                 | Role::Body
                 | Role::Label
-                | Role::Binding => unreachable!("non-list role"),
+                | Role::Binding
+                | Role::InitializerOf => unreachable!("non-list role"),
             }
         }
     }
@@ -5000,6 +5324,7 @@ pub(super) fn validate_dependency_evidence_filter(
         ("declared_by", &filter.declared_by),
         ("scopes", &filter.scopes),
         ("features", &filter.features),
+        ("lock_associations", &filter.lock_associations),
     ] {
         if values.len() > 128 || values.iter().any(String::is_empty) {
             return Err(QueryError::new(
@@ -5035,16 +5360,34 @@ pub(super) fn validate_dependency_evidence_filter(
         [ecosystem] if ecosystem == brokk_bifrost_go_analysis::analyzer::GO_MODULE_ECOSYSTEM
             || ecosystem == brokk_bifrost_go_analysis::analyzer::GO_TOOLCHAIN_ECOSYSTEM
     );
+    let ruby_ecosystem = matches!(
+        filter.ecosystems.as_slice(),
+        [ecosystem] if ecosystem == brokk_bifrost_ruby_analysis::analyzer::RUBYGEMS_ECOSYSTEM
+            || ecosystem == brokk_bifrost_ruby_analysis::analyzer::RUBY_TOOLCHAIN_ECOSYSTEM
+    );
+    let composer_ecosystem = matches!(
+        filter.ecosystems.as_slice(),
+        [ecosystem] if ecosystem == brokk_bifrost_php_analysis::analyzer::COMPOSER_ECOSYSTEM
+            || ecosystem == brokk_bifrost_php_analysis::analyzer::PHP_TOOLCHAIN_ECOSYSTEM
+    );
+    let maven_ecosystem = matches!(
+        filter.ecosystems.as_slice(),
+        [ecosystem] if ecosystem == brokk_bifrost_jvm_analysis::analyzer::MAVEN_ECOSYSTEM
+            || ecosystem == brokk_bifrost_jvm_analysis::analyzer::JVM_TOOLCHAIN_ECOSYSTEM
+    );
     if !filter.version_ranges.is_empty()
         && filter.ecosystems != ["cargo"]
         && filter.ecosystems != [brokk_bifrost_rust_analysis::analyzer::RUST_TOOLCHAIN_ECOSYSTEM]
         && filter.ecosystems != ["npm"]
         && filter.ecosystems != ["nuget"]
         && !go_ecosystem
+        && !ruby_ecosystem
+        && !composer_ecosystem
+        && !maven_ecosystem
     {
         return Err(QueryError::new(
             child_path(path, "version_ranges"),
-            "version_ranges requires exactly one supported ecosystem: cargo, rust-toolchain, npm, nuget, go-module or go-toolchain",
+            "version_ranges requires exactly one supported ecosystem: cargo, rust-toolchain, npm, nuget, go-module, go-toolchain, rubygems, ruby-toolchain, composer, php-toolchain, maven or jvm-toolchain",
         ));
     }
     // Only Cargo records which features a declaration requests.
@@ -5053,6 +5396,24 @@ pub(super) fn validate_dependency_evidence_filter(
             child_path(path, "features"),
             "features requires exactly the cargo ecosystem",
         ));
+    }
+    // Only Cargo ties a declaration and its member's lock instances together
+    // through a recorded association (#9919).
+    if !filter.lock_associations.is_empty() && filter.ecosystems != ["cargo"] {
+        return Err(QueryError::new(
+            child_path(path, "lock_associations"),
+            "lock_associations requires exactly the cargo ecosystem",
+        ));
+    }
+    for (index, association) in filter.lock_associations.iter().enumerate() {
+        if !brokk_bifrost_rust_analysis::analyzer::CARGO_LOCK_ASSOCIATIONS
+            .contains(&association.as_str())
+        {
+            return Err(QueryError::new(
+                index_path(&child_path(path, "lock_associations"), index),
+                "unknown Cargo lock association",
+            ));
+        }
     }
     for (index, range) in filter.version_ranges.iter().enumerate() {
         let error = if filter.ecosystems == ["npm"] {
@@ -5065,6 +5426,24 @@ pub(super) fn validate_dependency_evidence_filter(
         } else if go_ecosystem {
             brokk_bifrost_go_analysis::analyzer::GoVersionRange::parse(&filter.ecosystems[0], range)
                 .err()
+        } else if ruby_ecosystem {
+            brokk_bifrost_ruby_analysis::analyzer::RubyVersionRange::parse(
+                &filter.ecosystems[0],
+                range,
+            )
+            .err()
+        } else if composer_ecosystem {
+            brokk_bifrost_php_analysis::analyzer::ComposerVersionRange::parse(
+                &filter.ecosystems[0],
+                range,
+            )
+            .err()
+        } else if maven_ecosystem {
+            brokk_bifrost_jvm_analysis::analyzer::MavenVersionRange::parse(
+                &filter.ecosystems[0],
+                range,
+            )
+            .err()
         } else {
             semver::VersionReq::parse(range)
                 .err()
@@ -5078,4 +5457,44 @@ pub(super) fn validate_dependency_evidence_filter(
         }
     }
     Ok(())
+}
+
+fn decode_argument_modes(
+    value: &Value,
+    path: &str,
+) -> Result<Vec<brokk_bifrost_core::analyzer::structural::facts::ArgumentMode>, QueryError> {
+    use brokk_bifrost_core::analyzer::structural::facts::ArgumentMode;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(path, "argument_mode must be a nonempty array"))?;
+    if entries.is_empty() || entries.len() > 5 {
+        return Err(QueryError::new(
+            path,
+            "argument_mode must list one to five modes",
+        ));
+    }
+    let mut modes = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let mode = match entry.as_str() {
+            Some("plain") => ArgumentMode::Plain,
+            Some("spread") => ArgumentMode::Spread,
+            Some("ref") => ArgumentMode::Ref,
+            Some("out") => ArgumentMode::Out,
+            Some("in") => ArgumentMode::In,
+            _ => {
+                return Err(QueryError::new(
+                    index_path(path, index),
+                    "expected plain, spread, ref, out, or in",
+                ));
+            }
+        };
+        if modes.contains(&mode) {
+            return Err(QueryError::new(
+                index_path(path, index),
+                "duplicate argument mode",
+            ));
+        }
+        modes.push(mode);
+    }
+    Ok(modes)
 }

@@ -2648,6 +2648,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
     fn enter(&mut self, node: Node<'tree>, native_active: bool) -> TreeWalkAction {
         // Capture source-owned declaration properties before either projection
         // applies its own admission or suppression rules.
+        self.resolution.enter_execution_node(node);
         self.capture_source_type_facts(node);
         self.capture_source_properties(node);
         let enclosing = *self
@@ -2714,6 +2715,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
     }
 
     fn exit(&mut self, native_exit: bool) {
+        self.resolution.exit_execution_node();
         assert!(self.structural_parents.pop().is_some());
         if self
             .source_visibility_exits
@@ -2748,7 +2750,7 @@ impl<'tree, 'source, 'parsed> JavaPrimaryParseState<'tree, 'source, 'parsed> {
             .structural
             .finish(root)
             .expect("complete Java preparation has no structural admission limit");
-        let native: JavaResolutionExtraction = self.resolution.finish();
+        let native: JavaResolutionExtraction = self.resolution.finish(root);
         let source_imports = std::mem::take(&mut self.source_imports);
         let generic_imports = std::mem::take(&mut self.generic_imports);
         self.parsed.source_declaration_units = std::mem::take(&mut self.source_declaration_units);
@@ -2902,12 +2904,17 @@ fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) 
             // the hierarchy free to link a class to its own element type, and
             // left an unresolvable type parameter (`extends SetView<E>`) looking
             // like a supertype outside the workspace (#2161).
-            "type_arguments" => return WalkControl::SkipChildren,
+            "type_arguments" | "annotation" | "marker_annotation" => {
+                return WalkControl::SkipChildren;
+            }
             "type_identifier" | "scoped_type_identifier" => {
                 let text = node_text(node, source).trim();
                 if !text.is_empty() {
                     raw.push(text.to_string());
                 }
+                // The selected type already includes its qualified name.
+                // Its nested type nodes are name components, not more supertypes.
+                return WalkControl::SkipChildren;
             }
             _ => {}
         }
@@ -3097,6 +3104,28 @@ mod source_shape_tests {
             "src/Fixture.java",
         );
         parse_java_file(&file, source, &tree)
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10497: qualified supertype components became independent hierarchy edges"
+    )]
+    fn raw_hierarchy_names_are_whole_types() {
+        for (syntax, expected) in [
+            ("extends org.example.Base", "org.example.Base"),
+            ("extends Outer.Inner", "Outer.Inner"),
+            ("extends a.b.Outer.Inner<T>", "a.b.Outer.Inner"),
+            ("implements @Ann a.b.C", "a.b.C"),
+        ] {
+            let parsed = parse(&format!("class Foo {syntax} {{}}"));
+            let parents = parsed
+                .raw_supertypes
+                .iter()
+                .find(|(unit, _)| unit.short_name() == "Foo")
+                .unwrap()
+                .1;
+            assert_eq!(parents, &[expected], "{syntax}");
+        }
     }
 
     #[test]

@@ -1,20 +1,22 @@
+use crate::usage_walks::WalkCache;
 use brokk_bifrost_core::analyzer::common::{
     parse_source_range_with_cancellation, parse_source_region,
 };
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPathKind};
 use brokk_bifrost_core::analyzer::parsed_file::SourceImportFact;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
-use brokk_bifrost_core::analyzer::weighted_cache::{build_weighted_cache, weight_source_text};
 use brokk_bifrost_core::hash::HashMap;
-use moka::sync::Cache;
+use brokk_bifrost_core::retention_budget::{Accounted, RetainedBytes, RetentionBudget};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::imports::{
     RustImportBindingName, rust_import_binding_name, rust_imports_from_use_declaration,
 };
-use crate::syntax::{outer_attributes, outer_attributes_with_parent, unwrap_attributes};
+use crate::syntax::{
+    const_type_is_identity_free, outer_attributes, outer_attributes_with_parent, unwrap_attributes,
+};
 
 /// Re-exported from core, where the persisted `rust_import_targets` row shape
 /// that carries it lives. Kept spelled here because every reader of a cfg
@@ -253,55 +255,188 @@ pub(crate) fn rust_effective_cfg_condition_with_cache(
 /// their source length; the parsed trees they hold are several times larger, so
 /// keep this comfortably below the process's memory budget. 32 MiB covers every
 /// Rust file of a large workspace (Bifrost's own `src/` is ~20 MiB) in one pass.
-const RUST_TREE_CACHE_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
-
-static RUST_TREES: OnceLock<Cache<Arc<str>, Option<Tree>>> = OnceLock::new();
 static RUST_TREE_PARSES: AtomicUsize = AtomicUsize::new(0);
 static RUST_TREE_PARSE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static RUST_TREE_PARSED_BYTES: AtomicUsize = AtomicUsize::new(0);
-static RUST_SCOPE_INDEXES: OnceLock<Cache<Arc<str>, Arc<RustLexicalScopeIndex>>> = OnceLock::new();
 static RUST_SCOPE_INDEX_BUILDS: AtomicUsize = AtomicUsize::new(0);
 
-fn rust_scope_index_cache() -> &'static Cache<Arc<str>, Arc<RustLexicalScopeIndex>> {
-    RUST_SCOPE_INDEXES.get_or_init(|| {
-        build_weighted_cache(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES, weight_source_text)
-    })
+/// Parse and lexical indexes retained by one Rust analyzer's budget.
+pub struct RustLexicalCaches {
+    trees: WalkCache<SourceKey, SourceCached<Option<Tree>>>,
+    scope_indexes: WalkCache<SourceKey, SourceCached<RustLexicalScopeIndex>>,
+    use_statements: WalkCache<SourceKey, SourceCached<Vec<RustUseStatement>>>,
+    /// Whole-file `use` scans this cache performed (a cache miss), for tests and
+    /// telemetry that check several lookups share one scan.
+    use_scans: AtomicUsize,
 }
 
-/// The [`RustLexicalScopeIndex`] for `source`, memoized on the exact source
-/// bytes like [`parse_rust_tree`].
-///
-/// Building the index walks the whole file tree. The definition resolvers ask
-/// a shadowing question once per reference site, and each ask rebuilt the
-/// index from scratch, so resolving every occurrence of a file — the unified
-/// reference engine's `usage_graph` shape — walked the file once per
-/// occurrence. On `analyze_diff` endpoint graphs over Rust workspaces that
-/// quadratic blowup did not finish inside a five-minute budget (public
-/// issue #11). The index is a pure function of the source bytes, so the memo
-/// is observationally identical, and the weighted cache ages stale entries
-/// out exactly like the parse memo above.
-///
-/// `root` must be the root node of a parse of exactly `source` — the same
-/// contract every existing caller already satisfied, asserted here because a
-/// mismatched pair would poison the memo for that source text.
-pub fn rust_lexical_scope_index(root: Node<'_>, source: &str) -> Arc<RustLexicalScopeIndex> {
-    // The root node of a parse spans first token to last token, so only
-    // parentlessness and the source bound are checkable here.
-    debug_assert!(
-        root.parent().is_none() && root.end_byte() <= source.len(),
-        "rust_lexical_scope_index needs the whole-source parse root: root spans {}..{} over {} source bytes",
-        root.start_byte(),
-        root.end_byte(),
-        source.len(),
-    );
-    let cache = rust_scope_index_cache();
-    if let Some(cached) = cache.get(source) {
+impl RustLexicalCaches {
+    /// How many whole-file `use` scans this cache has performed.
+    pub fn use_statement_scans(&self) -> usize {
+        self.use_scans.load(Ordering::Relaxed)
+    }
+
+    pub fn new(budget: &RetentionBudget) -> Self {
+        Self {
+            trees: WalkCache::new(budget, "rust.lexical.trees", weigh_tree),
+            scope_indexes: WalkCache::new(budget, "rust.lexical.scope_indexes", weigh_scope_index),
+            use_statements: WalkCache::new(
+                budget,
+                "rust.lexical.use_statements",
+                weigh_use_statements,
+            ),
+            use_scans: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// A lexical cache key: the source's length and fast hash. A lookup computes
+/// it without copying the source, and a hit counts only when the cached entry's
+/// own source equals the asked source, so a hash collision is a miss.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SourceKey {
+    len: usize,
+    hash: u64,
+}
+
+impl SourceKey {
+    fn of(source: &str) -> Self {
+        Self {
+            len: source.len(),
+            hash: brokk_bifrost_core::hash::hash_one(source),
+        }
+    }
+}
+
+impl RetainedBytes for SourceKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// A cached lexical value together with the source it was computed from.
+pub struct SourceCached<T> {
+    source: Arc<str>,
+    value: T,
+}
+
+impl<T> std::ops::Deref for SourceCached<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+fn cached_for<T: Send + Sync + 'static>(
+    cache: &WalkCache<SourceKey, SourceCached<T>>,
+    source: &str,
+) -> Option<Arc<Accounted<SourceCached<T>>>> {
+    cache
+        .get(&SourceKey::of(source))
+        .filter(|cached| &*cached.source == source)
+}
+
+fn keep_for<T: Send + Sync + 'static>(
+    cache: &WalkCache<SourceKey, SourceCached<T>>,
+    source: &str,
+    value: T,
+) -> Arc<Accounted<SourceCached<T>>> {
+    cache.keep(
+        SourceKey::of(source),
+        SourceCached {
+            source: Arc::from(source),
+            value,
+        },
+    )
+}
+
+/// An estimate of one tree-sitter node's heap allocation. The library allocates
+/// a tree's internal nodes separately, so a tree retains several times its
+/// source; the cache charges the source plus this per node.
+const TREE_SITTER_NODE_BYTES: usize = 80;
+
+fn to_weight(bytes: usize) -> u32 {
+    bytes.min(u32::MAX as usize) as u32
+}
+
+fn weigh_tree(_: &SourceKey, cached: &SourceCached<Option<Tree>>) -> u32 {
+    let nodes = cached
+        .value
+        .as_ref()
+        .map_or(0, |tree| tree.root_node().descendant_count());
+    to_weight(
+        cached
+            .source
+            .len()
+            .saturating_add(nodes.saturating_mul(TREE_SITTER_NODE_BYTES)),
+    )
+}
+
+fn weigh_scope_index(_: &SourceKey, cached: &SourceCached<RustLexicalScopeIndex>) -> u32 {
+    let index = &cached.value;
+    let names = index.items.keys().map(String::capacity).sum::<usize>();
+    to_weight(
+        cached
+            .source
+            .len()
+            .saturating_add(brokk_bifrost_core::hash::map_of_vec_slot_bytes(
+                &index.items,
+            ))
+            .saturating_add(names)
+            .saturating_add(brokk_bifrost_core::hash::vec_slot_bytes(&index.modules)),
+    )
+}
+
+fn weigh_use_statements(_: &SourceKey, cached: &SourceCached<Vec<RustUseStatement>>) -> u32 {
+    // An import's identifier, alias and structured path are spelled inside its
+    // snippet, so three times the snippet bounds its strings.
+    let imports = cached
+        .value
+        .iter()
+        .map(|statement| {
+            brokk_bifrost_core::hash::vec_slot_bytes(&statement.imports).saturating_add(
+                statement
+                    .imports
+                    .iter()
+                    .map(|import| import.raw_snippet.capacity().saturating_mul(3))
+                    .sum::<usize>(),
+            )
+        })
+        .sum::<usize>();
+    to_weight(
+        cached
+            .source
+            .len()
+            .saturating_add(brokk_bifrost_core::hash::vec_slot_bytes(&cached.value))
+            .saturating_add(imports),
+    )
+}
+
+pub fn parse_rust_tree_with(caches: &RustLexicalCaches, source: &str) -> Option<Tree> {
+    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    if let Some(cached) = cached_for(&caches.trees, source) {
+        return cached.value.clone();
+    }
+    let parsed = parse_rust_tree_uncached(source);
+    keep_for(&caches.trees, source, parsed.clone());
+    parsed
+}
+
+pub fn rust_lexical_scope_index_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+) -> Arc<Accounted<SourceCached<RustLexicalScopeIndex>>> {
+    debug_assert!(root.parent().is_none() && root.end_byte() <= source.len());
+    if let Some(cached) = cached_for(&caches.scope_indexes, source) {
         return cached;
     }
     RUST_SCOPE_INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
-    let index = Arc::new(RustLexicalScopeIndex::new(root, source));
-    cache.insert(Arc::from(source), Arc::clone(&index));
-    index
+    keep_for(
+        &caches.scope_indexes,
+        source,
+        RustLexicalScopeIndex::new(root, source),
+    )
 }
 
 /// Number of lexical scope indexes actually built since the last reset — the
@@ -312,12 +447,6 @@ pub fn rust_scope_index_build_count_for_test() -> usize {
     RUST_SCOPE_INDEX_BUILDS.load(Ordering::Relaxed)
 }
 
-fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
-    RUST_TREES.get_or_init(|| {
-        build_weighted_cache(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES, weight_source_text)
-    })
-}
-
 pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
     RUST_TREE_PARSES.fetch_add(1, Ordering::Relaxed);
     RUST_TREE_PARSED_BYTES.fetch_add(source.len(), Ordering::Relaxed);
@@ -326,35 +455,6 @@ pub(crate) fn parse_rust_tree_uncached(source: &str) -> Option<Tree> {
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .ok()?;
     parser.parse(source, None)
-}
-
-/// Parse `source` as Rust, memoized on the exact source bytes.
-///
-/// This is a pure function of its argument, but the Rust usage and definition
-/// resolvers reach it once per *reference site* and once per *candidate
-/// declaration* — `rust_visible_import_resolution`, `lexical_package_at`, and
-/// every `is_rust_*_declaration` shape predicate re-parse the whole enclosing
-/// file each time they are asked a question about it. On a workspace-wide
-/// `scan_usages` that turned into hundreds of thousands of whole-file parses
-/// (issue #1219: ~20 minutes at 1200-1600% CPU on Bifrost's own tree, with
-/// tree-sitter parsing dominating every stack sample).
-///
-/// Memoizing here is observationally identical — the same source bytes always
-/// produce the same tree — and collapses that to one parse per distinct source.
-/// The key is the source text itself, so there is no hash-collision risk and no
-/// invalidation to get wrong: edited content is simply a different key, and the
-/// weighted cache ages stale entries out. `Tree::clone` is a refcount bump
-/// (`ts_tree_copy`), which is also tree-sitter's documented way to hand one
-/// parse to several threads.
-pub fn parse_rust_tree(source: &str) -> Option<Tree> {
-    RUST_TREE_PARSE_REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let cache = rust_tree_cache();
-    if let Some(cached) = cache.get(source) {
-        return cached;
-    }
-    let parsed = parse_rust_tree_uncached(source);
-    cache.insert(Arc::from(source), parsed.clone());
-    parsed
 }
 
 /// Parse only `[start, end)` of `source` as Rust via included ranges: node
@@ -445,9 +545,6 @@ pub fn reset_rust_tree_parse_counters_for_test() {
     RUST_TREE_PARSE_REQUESTS.store(0, Ordering::Relaxed);
     RUST_TREE_PARSED_BYTES.store(0, Ordering::Relaxed);
     RUST_SCOPE_INDEX_BUILDS.store(0, Ordering::Relaxed);
-    // Concurrent tests share the process-wide memo, so a build-count pin must
-    // start from a cold cache for its own distinct sources.
-    rust_scope_index_cache().invalidate_all();
 }
 
 pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
@@ -607,114 +704,13 @@ struct RustUseStatement {
     scope_range: Option<(usize, usize)>,
 }
 
-static RUST_USE_STATEMENTS: OnceLock<Cache<Arc<str>, Arc<Vec<RustUseStatement>>>> = OnceLock::new();
-
-fn rust_use_statement_cache() -> &'static Cache<Arc<str>, Arc<Vec<RustUseStatement>>> {
-    RUST_USE_STATEMENTS.get_or_init(|| {
-        build_weighted_cache(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES, weight_source_text)
-    })
-}
-
-/// Every `use` declaration in `source` with its visibility-gating ranges,
-/// memoized on the exact source bytes like [`parse_rust_tree`] and
-/// [`rust_lexical_scope_index`].
-///
-/// A binder's visibility filter is a pure function of the reference's
-/// enclosing `mod` range and scope containment, so per-reference binder
-/// questions filter this index instead of re-walking the file and re-parsing
-/// each visible `use` per ask — the second whole-file-per-occurrence cost in
-/// the public issue #11 `analyze_diff` profile. `root` must be the root node
-/// of a parse of exactly `source`, as for [`rust_lexical_scope_index`].
-fn rust_use_statements(root: Node<'_>, source: &str) -> Arc<Vec<RustUseStatement>> {
-    debug_assert!(
-        root.parent().is_none() && root.end_byte() <= source.len(),
-        "rust_use_statements needs the whole-source parse root",
-    );
-    let cache = rust_use_statement_cache();
-    if let Some(cached) = cache.get(source) {
-        return cached;
-    }
-    let mut statements = Vec::new();
-    // The same source-order traversal as `collect_visible_use_statements`,
-    // minus its byte-position pruning: a pruned-away subtree can only hold
-    // statements the visibility filter rejects, so filtering this complete
-    // index reproduces the pruned walk's output exactly.
-    let mut stack = vec![(root, None, None)];
-    while let Some((raw_node, mod_range, scope_range)) = stack.pop() {
-        let node = unwrap_attributes(raw_node);
-        if node.kind() == "use_declaration" {
-            statements.push(RustUseStatement {
-                imports: rust_imports_from_use_declaration(node, source),
-                mod_range,
-                scope_range,
-            });
-            continue;
-        }
-        let child_mod_range = if node.kind() == "mod_item" {
-            Some((node.start_byte(), node.end_byte()))
-        } else {
-            mod_range
-        };
-        let child_scope_range = if lexical_scope_kind(node.kind()) {
-            Some((node.start_byte(), node.end_byte()))
-        } else {
-            scope_range
-        };
-        let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
-        stack.extend(
-            children
-                .into_iter()
-                .rev()
-                .map(|child| (child, child_mod_range, child_scope_range)),
-        );
-    }
-    let statements = Arc::new(statements);
-    cache.insert(Arc::from(source), Arc::clone(&statements));
-    statements
-}
-
-/// The scope-start byte of each binder's enclosing visibility scope, so
-/// `self`/`super` module specifiers can be resolved against the lexical
-/// module the import actually lives in (not just the file package).
-pub fn visible_import_binders_with_scopes_in_tree(
-    root: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-) -> Vec<(usize, ImportBinder)> {
-    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
-    let mut by_scope: HashMap<(usize, usize), ImportBinder> = HashMap::default();
-    for statement in rust_use_statements(root, source).iter() {
-        if !use_statement_visible_at(
-            reference_byte,
-            reference_mod_range,
-            statement.mod_range,
-            statement.scope_range,
-        ) {
-            continue;
-        }
-        let scope = statement
-            .scope_range
-            .unwrap_or((root.start_byte(), root.end_byte()));
-        let binder = by_scope.entry(scope).or_default();
-        for import in &statement.imports {
-            insert_rust_import_binding(binder, import);
-        }
-    }
-    let mut binders: Vec<_> = by_scope.into_iter().collect();
-    binders.sort_by_key(|((start, end), _)| (end.saturating_sub(*start), *start));
-    binders
-        .into_iter()
-        .map(|((start, _), binder)| (start, binder))
-        .collect()
-}
-
 /// The file package plus the inline `mod` path enclosing `byte` — the
 /// lexical package a nested import's `self`/`super` specifiers resolve
 /// against (`super` from `mod tests` is the file's own module, not the
 /// file's parent).
 pub fn lexical_package_at(file_package: &str, source: &str, byte: usize) -> String {
-    let Some(tree) = parse_rust_tree(source) else {
+    // Standalone source has no lexical cache owner.
+    let Some(tree) = parse_rust_tree_uncached(source) else {
         return file_package.to_string();
     };
     lexical_package_in_tree(file_package, tree.root_node(), source, byte)
@@ -754,29 +750,6 @@ pub fn lexical_package_in_tree(
     } else {
         format!("{}.{}", file_package, modules.join("."))
     }
-}
-
-pub fn visible_import_binder_in_tree(
-    root: Node<'_>,
-    source: &str,
-    reference_byte: usize,
-) -> ImportBinder {
-    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
-    let mut binder = ImportBinder::empty();
-    for statement in rust_use_statements(root, source).iter() {
-        if !use_statement_visible_at(
-            reference_byte,
-            reference_mod_range,
-            statement.mod_range,
-            statement.scope_range,
-        ) {
-            continue;
-        }
-        for import in &statement.imports {
-            insert_rust_import_binding(&mut binder, import);
-        }
-    }
-    binder
 }
 
 pub(crate) fn use_statement_visible_at(
@@ -861,7 +834,7 @@ impl RustLexicalScopeIndex {
                         child_scope_end = body.end_byte();
                     }
                 }
-                "function_signature_item" => {
+                "function_signature_item" | "static_item" | "const_item" => {
                     index.add_item_binding(node, scope_start, scope_end, source, module);
                 }
                 "block" | "declaration_list" => {
@@ -899,6 +872,15 @@ impl RustLexicalScopeIndex {
 
     pub fn item_bound_at(&self, name: &str, byte: usize) -> bool {
         self.item_visible_at(name, byte, |_| true)
+    }
+
+    /// A conservative shadow check including items in every enclosing scope.
+    pub fn item_bound_in_enclosing_scope(&self, name: &str, byte: usize) -> bool {
+        self.items.get(name).is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.start <= byte && byte < item.end)
+        })
     }
 
     /// Whether this exact declaration is visible, rather than another item
@@ -1019,47 +1001,232 @@ where
             "cfg" | "inline" | "doc" | "allow" | "warn" | "deny" | "forbid" | "expect"
             | "must_use" | "cold" | "track_caller" | "deprecated" | "repr" | "non_exhaustive" => {}
             "test" => {
-                // Unlike inert attributes, the built-in test macro can be
-                // shadowed. Reuse the macro producer's structured import
-                // binding projection, including aliases and grouped imports.
-                let mut parent = node.parent();
-                while let Some(scope) = parent {
-                    charge(1)?;
-                    let mut cursor = scope.walk();
-                    for raw in scope.named_children(&mut cursor) {
-                        charge(1)?;
-                        let item = unwrap_attributes(raw);
-                        if item.kind() == "macro_definition"
-                            && item.child_by_field_name("name").is_some_and(|name| {
-                                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
-                                    crate::declarations::rust_node_text(name, source),
-                                ) == "test"
-                            })
-                        {
-                            return Ok(false);
-                        }
-                        if item.kind() == "use_declaration" {
-                            for import in crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
-                                item, source, &mut *charge,
-                            )? {
-                                charge(1)?;
-                                if !import.import.module_self
-                                    && import.import.binding_name().named().is_some_and(|name| {
-                                        brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(name) == "test"
-                                    })
-                                {
-                                    return Ok(false);
-                                }
-                            }
-                        }
-                    }
-                    parent = scope.parent();
+                if !rust_test_attribute_unshadowed_bounded(
+                    node.parent().unwrap_or(node),
+                    source,
+                    charge,
+                )? {
+                    return Ok(false);
                 }
             }
             _ => return Ok(false),
         }
     }
     Ok(true)
+}
+
+/// Built-in `test` is inert only when no local macro, named import, or glob
+/// import can claim its attribute name. This source-only scope proof is shared
+/// with the structural binding-access producer.
+pub(crate) fn rust_test_attribute_unshadowed_bounded<F, E>(
+    node: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let mut parent = Some(node);
+    while let Some(scope) = parent {
+        if !rust_test_scope_unshadowed_bounded(scope, source, charge)? {
+            return Ok(false);
+        }
+        parent = scope.parent();
+    }
+    Ok(true)
+}
+
+pub(crate) fn rust_test_scope_unshadowed_bounded<F, E>(
+    scope: Node<'_>,
+    source: &str,
+    charge: &mut F,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    charge(1)?;
+    let mut cursor = scope.walk();
+    for raw in scope.named_children(&mut cursor) {
+        charge(1)?;
+        let item = unwrap_attributes(raw);
+        // An item invocation can add a named import or definition in this scope.
+        if rust_item_macro_invocation(item) {
+            return Ok(false);
+        }
+        if item.kind() == "macro_definition"
+            && item.child_by_field_name("name").is_some_and(|name| {
+                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                    crate::declarations::rust_node_text(name, source),
+                ) == "test"
+            })
+        {
+            return Ok(false);
+        }
+        if item.kind() == "use_declaration" {
+            for import in crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+                item,
+                source,
+                &mut *charge,
+            )? {
+                charge(1)?;
+                if !import.import.module_self
+                    && match import.import.binding_name() {
+                        RustImportBindingName::Glob => rust_glob_may_shadow_test(
+                            scope,
+                            import.import.path(),
+                            source,
+                            charge,
+                            &mut std::collections::HashSet::new(),
+                        )?,
+                        RustImportBindingName::Named(name) => {
+                            crate::imports::rust_binding_name_matches(&name, "test")
+                        }
+                        RustImportBindingName::Unnamed => false,
+                    }
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn rust_item_macro_invocation(item: Node<'_>) -> bool {
+    item.kind() == "macro_invocation"
+        || (item.kind() == "expression_statement"
+            && item
+                .named_child(0)
+                .is_some_and(|child| child.kind() == "macro_invocation"))
+}
+
+/// A local glob contributes `test` only if its file-local target does. An
+/// external or unresolved target is opaque because it may export an attribute
+/// macro. Cycles through local globs add no new names on a repeated scope.
+fn rust_glob_may_shadow_test<F, E>(
+    site_scope: Node<'_>,
+    path: &[String],
+    source: &str,
+    charge: &mut F,
+    visited: &mut std::collections::HashSet<usize>,
+) -> Result<bool, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let mut pending = vec![(site_scope, path.to_vec())];
+    while let Some((scope, path)) = pending.pop() {
+        let Some(target) = rust_local_glob_scope(scope, &path, source, charge)? else {
+            return Ok(true);
+        };
+        if !visited.insert(target.id()) {
+            continue;
+        }
+        let mut cursor = target.walk();
+        for raw in target.named_children(&mut cursor) {
+            charge(1)?;
+            let item = unwrap_attributes(raw);
+            // The expansion may export `test`, even when no written item does.
+            if rust_item_macro_invocation(item) {
+                return Ok(true);
+            }
+            if item.child_by_field_name("name").is_some_and(|name| {
+                brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                    crate::declarations::rust_node_text(name, source),
+                ) == "test"
+            }) {
+                return Ok(true);
+            }
+            if item.kind() != "use_declaration" {
+                continue;
+            }
+            for import in crate::imports::rust_imports_with_visibility_from_use_declaration_bounded(
+                item,
+                source,
+                &mut *charge,
+            )? {
+                charge(1)?;
+                match import.import.binding_name() {
+                    RustImportBindingName::Named(name)
+                        if crate::imports::rust_binding_name_matches(&name, "test") =>
+                    {
+                        return Ok(true);
+                    }
+                    RustImportBindingName::Glob => {
+                        pending.push((target, import.import.path().to_vec()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn rust_local_glob_scope<'tree, F, E>(
+    site_scope: Node<'tree>,
+    path: &[String],
+    source: &str,
+    charge: &mut F,
+) -> Result<Option<Node<'tree>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let mut current = Some(site_scope);
+    let module = loop {
+        let Some(node) = current else { return Ok(None) };
+        charge(1)?;
+        if rust_lexical_scope_is_module_boundary(node) {
+            break node;
+        }
+        current = node.parent();
+    };
+    let mut scope = module;
+    let mut segments = path.iter().map(String::as_str).peekable();
+    match segments.peek().copied() {
+        Some("crate") => {
+            // This source-only proof has no crate identity. A source_file root
+            // can be an out-of-line module, not the crate root.
+            return Ok(None);
+        }
+        Some("self") => {
+            segments.next();
+        }
+        Some("super") => {
+            while segments.peek().copied() == Some("super") {
+                segments.next();
+                let Some(parent) = scope.parent().and_then(|node| node.parent()) else {
+                    return Ok(None);
+                };
+                scope = parent;
+            }
+        }
+        _ => {}
+    }
+    for segment in segments {
+        let mut found = None;
+        let mut seen = false;
+        let mut cursor = scope.walk();
+        for raw in scope.named_children(&mut cursor) {
+            charge(1)?;
+            let item = unwrap_attributes(raw);
+            if item.kind() == "mod_item"
+                && item.child_by_field_name("name").is_some_and(|name| {
+                    brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                        crate::declarations::rust_node_text(name, source),
+                    ) == segment
+                })
+            {
+                if seen {
+                    return Ok(None);
+                }
+                seen = true;
+                found = item.child_by_field_name("body");
+            }
+        }
+        let Some(next) = found else { return Ok(None) };
+        scope = next;
+    }
+    Ok(Some(scope))
 }
 
 // At a selected site's ancestors, activation attributes need a selected
@@ -1487,7 +1654,9 @@ where
                     RustImportBindingName::Glob => {
                         return Ok(ControlFlow::Break(RustTypeHead::Unknown));
                     }
-                    RustImportBindingName::Named(binding) if binding == name => {
+                    RustImportBindingName::Named(binding)
+                        if crate::imports::rust_binding_name_matches(&binding, name) =>
+                    {
                         if item.has_error() || outer_attributes(item).next().is_some() {
                             return Ok(ControlFlow::Break(RustTypeHead::Unknown));
                         }
@@ -1620,7 +1789,9 @@ where
                 }
                 RustLexicalSelectionEvent::Import(_, leaf) => match leaf.import.binding_name() {
                     RustImportBindingName::Glob => true,
-                    RustImportBindingName::Named(binding) => binding == name,
+                    RustImportBindingName::Named(binding) => {
+                        crate::imports::rust_binding_name_matches(&binding, name)
+                    }
                     RustImportBindingName::Unnamed => false,
                 },
                 RustLexicalSelectionEvent::ScopeEnd => false,
@@ -1635,22 +1806,548 @@ where
     Ok(matches!(selection, RustLexicalSelection::Complete))
 }
 
-/// Recognize a bare pattern name occupied by a value item rather than a
-/// binding. Shorthand struct fields force binding syntax and bypass lookup.
-/// Unknown selections retain the caller's tentative binding and its gaps.
-#[doc(hidden)]
-pub fn rust_pattern_identifier_is_value_item_bounded<'tree, F, E>(
+/// Classify a bare pattern name. Named imports are unresolved here because
+/// their targets may be constants, constructors, or ordinary names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustPatternName {
+    ValueItem,
+    Binding,
+    Unknown,
+}
+
+/// The item selected by a value-position bare name in this source file.
+/// Imports remain unknown because this file does not know their target kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RustValueName<'tree> {
+    Constant,
+    Callable(Node<'tree>),
+    PreludeCallable,
+    Static,
+    Unknown,
+}
+
+fn rust_is_associated_member(item: Node<'_>) -> bool {
+    crate::syntax::parent_outside_attributes(item).is_some_and(|scope| {
+        scope.kind() == "declaration_list"
+            && scope
+                .parent()
+                .is_some_and(|owner| matches!(owner.kind(), "impl_item" | "trait_item"))
+    })
+}
+
+/// Select a same-file type item at a value path's owner site. Imports,
+/// shadowing parameters, ambiguity, and opaque syntax do not prove an item.
+pub fn rust_value_owner_item_bounded<'tree, F, E>(
     root: Node<'tree>,
     source: &str,
-    name: Node<'tree>,
+    site: Node<'tree>,
+    name: &str,
+    charge: &mut F,
+) -> Result<Option<Node<'tree>>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    Ok(
+        match rust_type_head_at_bounded(
+            root,
+            source,
+            site,
+            name,
+            &RustTypeHeadMemo::default(),
+            charge,
+        )? {
+            RustTypeHead::Item(item) => Some(item),
+            _ => None,
+        },
+    )
+}
+
+/// Whether the primitive type name written at `ty` names the built-in type
+/// there: no item or import in scope shadows it.
+pub fn rust_primitive_type_is_unbound_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    ty: Node<'tree>,
     charge: &mut F,
 ) -> Result<bool, E>
 where
     F: FnMut(usize) -> Result<(), E>,
 {
+    let name = crate::declarations::rust_node_text(ty, source);
+    Ok(matches!(
+        rust_type_head_at_bounded(root, source, ty, name, &RustTypeHeadMemo::default(), charge)?,
+        RustTypeHead::Unbound
+    ))
+}
+
+pub fn rust_value_name_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    site: Node<'tree>,
+    charge: &mut F,
+) -> Result<RustValueName<'tree>, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    use std::ops::ControlFlow;
+    let text = crate::declarations::rust_node_text(site, source);
+    let selected = visit_rust_lexical_selection_bounded(
+        root,
+        source,
+        site,
+        charge,
+        |event, charge| {
+            let classification = match event {
+                RustLexicalSelectionEvent::Parameter(parameter)
+                    if parameter.kind() == "const_parameter"
+                        && parameter.child_by_field_name("name").is_some_and(|name| {
+                            crate::declarations::rust_node_text(name, source) == text
+                        }) =>
+                {
+                    Some(RustValueName::Unknown)
+                }
+                // `extern { fn f(); static S: T; }` declares its members in
+                // the enclosing scope's value namespace. Their targets are not
+                // modeled here, so such a member occupies the name as Unknown.
+                RustLexicalSelectionEvent::Item(item) if item.kind() == "foreign_mod_item" => {
+                    let mut occupied = false;
+                    if let Some(body) = item.child_by_field_name("body") {
+                        let mut cursor = body.walk();
+                        for member in body.named_children(&mut cursor) {
+                            charge(1)?;
+                            let member = unwrap_attributes(member);
+                            if matches!(member.kind(), "function_signature_item" | "static_item")
+                                && member.child_by_field_name("name").is_some_and(|name| {
+                                    crate::declarations::rust_node_text(name, source) == text
+                                })
+                            {
+                                occupied = true;
+                                break;
+                            }
+                        }
+                    }
+                    occupied.then_some(RustValueName::Unknown)
+                }
+                RustLexicalSelectionEvent::Item(item)
+                    if item.child_by_field_name("name").is_some_and(|name| {
+                        crate::declarations::rust_node_text(name, source) == text
+                    }) && !rust_is_associated_member(item) =>
+                {
+                    if outer_attributes(item).next().is_some() {
+                        return Ok(ControlFlow::Break(RustValueName::Unknown));
+                    }
+                    // In a block, a statement macro after the item can expand
+                    // to a `let` of this name that shadows it from there on.
+                    // The scope visit stops at the item, before reaching the
+                    // macro. Module scopes hold no `let`, and a macro-made
+                    // duplicate item there is a compile error.
+                    if item.parent().is_some_and(|scope| scope.kind() == "block") {
+                        let mut later = item.next_named_sibling();
+                        while let Some(statement) = later {
+                            charge(1)?;
+                            if statement.has_error()
+                                || statement.kind() == "macro_invocation"
+                                || (statement.kind() == "expression_statement"
+                                    && statement
+                                        .named_child(0)
+                                        .is_some_and(|child| child.kind() == "macro_invocation"))
+                            {
+                                return Ok(ControlFlow::Break(RustValueName::Unknown));
+                            }
+                            later = statement.next_named_sibling();
+                        }
+                    }
+                    match item.kind() {
+                        "const_item" => {
+                            let identity_free = match item.child_by_field_name("type") {
+                                Some(ty) => const_type_is_identity_free(ty, source, |leaf| {
+                                    rust_primitive_type_is_unbound_bounded(
+                                        root, source, leaf, charge,
+                                    )
+                                })?,
+                                None => false,
+                            };
+                            Some(if identity_free {
+                                RustValueName::Constant
+                            } else {
+                                RustValueName::Unknown
+                            })
+                        }
+                        "function_item" => Some(RustValueName::Callable(item)),
+                        "struct_item" if item.child_by_field_name("body").is_none() => {
+                            Some(RustValueName::Constant)
+                        }
+                        // A tuple struct's name is also its constructor function in
+                        // the value namespace, so it occupies the name; its target is
+                        // not modeled here.
+                        "struct_item" => Some(RustValueName::Unknown),
+                        "static_item" => Some(RustValueName::Static),
+                        _ => None,
+                    }
+                }
+                RustLexicalSelectionEvent::Import(_, leaf)
+                    if matches!(leaf.import.binding_name(), RustImportBindingName::Named(binding) if binding == text)
+                        || matches!(leaf.import.binding_name(), RustImportBindingName::Glob) =>
+                {
+                    Some(RustValueName::Unknown)
+                }
+                _ => None,
+            };
+            Ok(classification.map_or(ControlFlow::Continue(()), ControlFlow::Break))
+        },
+    )?;
+    Ok(match selected {
+        RustLexicalSelection::Selected(kind) => kind,
+        RustLexicalSelection::Complete
+            if crate::prelude::rust_prelude_candidate(
+                text,
+                crate::prelude::RustPreludeNamespace::Value,
+            ) =>
+        {
+            if text == "None" {
+                RustValueName::Constant
+            } else {
+                RustValueName::PreludeCallable
+            }
+        }
+        _ => RustValueName::Unknown,
+    })
+}
+
+#[doc(hidden)]
+pub fn rust_pattern_name_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    name: Node<'tree>,
+    charge: &mut F,
+) -> Result<RustPatternName, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let (selection, prelude_constructor, saw_glob) =
+        rust_pattern_name_selection_bounded(root, source, name, charge)?;
+    // A glob import can bring a constant, unit struct or unit variant of this
+    // name into scope, which makes the pattern a comparison rather than a
+    // binding, as a named import can (#10269). A braced struct defines no
+    // value item, so the walk continues past it to an outer item.
+    Ok(match selection {
+        _ if saw_glob => RustPatternName::Unknown,
+        RustLexicalSelection::Selected(classification) => classification,
+        RustLexicalSelection::Complete | RustLexicalSelection::Unknown => {
+            if prelude_constructor {
+                RustPatternName::ValueItem
+            } else {
+                RustPatternName::Binding
+            }
+        }
+    })
+}
+
+/// Strict pattern classification for consumers that must preserve unknown
+/// imports and incomplete lexical walks as open binding identities.
+#[doc(hidden)]
+pub fn rust_pattern_name_strict_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    name: Node<'tree>,
+    charge: &mut F,
+) -> Result<RustPatternName, E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
+    let (selection, prelude_constructor, saw_glob) =
+        rust_pattern_name_selection_bounded(root, source, name, charge)?;
+    Ok(match selection {
+        RustLexicalSelection::Selected(_) if saw_glob => RustPatternName::Unknown,
+        RustLexicalSelection::Selected(classification) => classification,
+        RustLexicalSelection::Unknown => RustPatternName::Unknown,
+        RustLexicalSelection::Complete if saw_glob => RustPatternName::Unknown,
+        RustLexicalSelection::Complete if prelude_constructor => RustPatternName::ValueItem,
+        RustLexicalSelection::Complete => RustPatternName::Binding,
+    })
+}
+
+/// Request-local index for repeated strict pattern classifications. The
+/// grammar's scope contents are independent of the candidate name, so each
+/// scope is scanned once and indexed by its written item/import names. The
+/// prefix work at each selection is retained: the same per-candidate bound
+/// still yields Open at exactly the old cutoff.
+#[derive(Default)]
+pub(crate) struct RustStrictPatternIndex {
+    scopes: HashMap<usize, RustPatternScopeSummary>,
+    inner_attributes: HashMap<usize, (bool, usize)>,
+    #[cfg(test)]
+    pub(crate) scope_scans: usize,
+    #[cfg(test)]
+    pub(crate) source_file_scans: usize,
+}
+
+#[derive(Default)]
+struct RustPatternScopeSummary {
+    selected: HashMap<String, (RustPatternName, bool, usize)>,
+    saw_glob: bool,
+    unknown: bool,
+    work: usize,
+}
+
+enum IndexedPatternStop<E> {
+    PerCandidate,
+    External(E),
+}
+
+impl RustStrictPatternIndex {
+    pub(crate) fn classify(
+        &mut self,
+        root: Node<'_>,
+        source: &str,
+        name: Node<'_>,
+    ) -> RustPatternName {
+        self.classify_bounded(root, source, name, &mut |_| Ok::<(), ()>(()))
+            .unwrap_or(RustPatternName::Unknown)
+    }
+
+    /// Bounded request preparation: a scope summary is charged as it is
+    /// indexed, so cancellation and work exhaustion stop the scan itself.
+    pub(crate) fn classify_with_budget<E>(
+        &mut self,
+        root: Node<'_>,
+        source: &str,
+        name: Node<'_>,
+        charge_work: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<RustPatternName, E> {
+        match self.classify_bounded(root, source, name, charge_work) {
+            Ok(result) => Ok(result),
+            Err(IndexedPatternStop::PerCandidate) => Ok(RustPatternName::Unknown),
+            Err(IndexedPatternStop::External(stop)) => Err(stop),
+        }
+    }
+
+    fn classify_bounded<E>(
+        &mut self,
+        root: Node<'_>,
+        source: &str,
+        name: Node<'_>,
+        charge_work: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<RustPatternName, IndexedPatternStop<E>> {
+        use std::ops::ControlFlow;
+        let work = std::cell::Cell::new(0usize);
+        let mut charge = |amount: usize| -> Result<(), IndexedPatternStop<E>> {
+            work.set(work.get().saturating_add(amount));
+            if work.get() > 100_000 {
+                return Err(IndexedPatternStop::PerCandidate);
+            }
+            charge_work(amount).map_err(IndexedPatternStop::External)
+        };
+        // Replaying a cached summary still applies the per-candidate bound,
+        // but its syntax was already charged to this file's preparation.
+        let replay = |amount: usize| -> Result<(), IndexedPatternStop<E>> {
+            work.set(work.get().saturating_add(amount));
+            (work.get() <= 100_000)
+                .then_some(())
+                .ok_or(IndexedPatternStop::PerCandidate)
+        };
+        charge(1)?;
+        if !matches!(name.kind(), "identifier" | "shorthand_field_identifier")
+            || name.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "mut_pattern" | "ref_pattern" | "captured_pattern"
+                )
+            })
+        {
+            return Ok(RustPatternName::Binding);
+        }
+        let text = brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+            crate::declarations::rust_node_text(name, source),
+        );
+        let prelude_constructor =
+            text == "None" || crate::prelude::rust_std_constructor_fact(text).is_some();
+        let scopes =
+            match rust_lexical_scope_chain_bounded(root, source, name, &mut charge, &mut |_, _| {
+                Ok(ControlFlow::<RustPatternName>::Continue(()))
+            })? {
+                ControlFlow::Continue(scopes) => scopes,
+                ControlFlow::Break(_) => return Ok(RustPatternName::Unknown),
+            };
+        for scope in &scopes {
+            let (known, cost) = if let Some(cached) = self.inner_attributes.get(&scope.id()) {
+                *cached
+            } else {
+                let mut cost = 0;
+                let known =
+                    rust_scope_inner_attributes_known_bounded(*scope, source, &mut |amount| {
+                        cost += amount;
+                        charge(amount)
+                    })?;
+                self.inner_attributes.insert(scope.id(), (known, cost));
+                (known, 0)
+            };
+            replay(cost)?;
+            if !known {
+                return Ok(RustPatternName::Unknown);
+            }
+        }
+        let mut saw_glob = false;
+        for scope in scopes {
+            let cached = self.scopes.contains_key(&scope.id());
+            if !cached {
+                // A scope's summary and Open outcome must not depend on the
+                // prefix work of whichever candidate first reached it.
+                let candidate_work = work.replace(0);
+                let summary = match RustPatternScopeSummary::new(scope, source, &mut charge) {
+                    Ok(summary) => summary,
+                    Err(IndexedPatternStop::PerCandidate) => RustPatternScopeSummary {
+                        unknown: true,
+                        work: work.get(),
+                        ..RustPatternScopeSummary::default()
+                    },
+                    Err(stop) => return Err(stop),
+                };
+                work.set(candidate_work);
+                self.scopes.insert(scope.id(), summary);
+                #[cfg(test)]
+                {
+                    self.scope_scans += 1;
+                    if scope.kind() == "source_file" {
+                        self.source_file_scans += 1;
+                    }
+                }
+            }
+            let summary = &self.scopes[&scope.id()];
+            if let Some(&(selection, glob_before, cost)) = summary.selected.get(text) {
+                replay(cost)?;
+                return Ok(if saw_glob || glob_before {
+                    RustPatternName::Unknown
+                } else {
+                    selection
+                });
+            }
+            replay(summary.work)?;
+            if summary.unknown {
+                return Ok(RustPatternName::Unknown);
+            }
+            saw_glob |= summary.saw_glob;
+            if rust_lexical_scope_is_module_boundary(scope) {
+                break;
+            }
+        }
+        charge(0)?;
+        Ok(if saw_glob {
+            RustPatternName::Unknown
+        } else if prelude_constructor {
+            RustPatternName::ValueItem
+        } else {
+            RustPatternName::Binding
+        })
+    }
+}
+
+impl RustPatternScopeSummary {
+    fn new<E>(
+        scope: Node<'_>,
+        source: &str,
+        charge_work: &mut impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        use std::cell::Cell;
+        use std::ops::ControlFlow;
+        let work = Cell::new(0usize);
+        let mut summary = Self::default();
+        let mut charge = |amount: usize| -> Result<(), E> {
+            work.set(work.get().saturating_add(amount));
+            charge_work(amount)
+        };
+        let result = visit_rust_lexical_scope_bounded(
+            scope,
+            source,
+            &mut charge,
+            &mut |event, _| {
+                match event {
+                    RustLexicalSelectionEvent::Parameter(parameter)
+                        if parameter.kind() == "const_parameter" =>
+                    {
+                        if let Some(name) = parameter.child_by_field_name("name") {
+                            summary
+                                .selected
+                                .entry(brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(crate::declarations::rust_node_text(name, source)).to_owned())
+                                .or_insert((
+                                    RustPatternName::ValueItem,
+                                    summary.saw_glob,
+                                    work.get(),
+                                ));
+                        }
+                    }
+                    RustLexicalSelectionEvent::Item(item) => {
+                        let associated = crate::syntax::parent_outside_attributes(item)
+                            .is_some_and(|owner| {
+                                owner.kind() == "declaration_list"
+                                    && owner.parent().is_some_and(|parent| {
+                                        matches!(parent.kind(), "impl_item" | "trait_item")
+                                    })
+                            });
+                        if !associated {
+                            let selection = match item.kind() {
+                                "function_item" => Some(RustPatternName::Binding),
+                                "const_item" | "static_item" => Some(RustPatternName::ValueItem),
+                                "struct_item"
+                                    if !(0..item.named_child_count()).any(|index| {
+                                        item.named_child(index).is_some_and(|child| {
+                                            child.kind() == "field_declaration_list"
+                                        })
+                                    }) =>
+                                {
+                                    Some(RustPatternName::ValueItem)
+                                }
+                                _ => None,
+                            };
+                            if let Some(selection) = selection
+                                && let Some(name) = item.child_by_field_name("name")
+                            {
+                                summary
+                                    .selected
+                                    .entry(
+                                        brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(crate::declarations::rust_node_text(name, source))
+                                            .to_owned(),
+                                    )
+                                    .or_insert((selection, summary.saw_glob, work.get()));
+                            }
+                        }
+                    }
+                    RustLexicalSelectionEvent::Import(_, leaf) => {
+                        match leaf.import.binding_name() {
+                            RustImportBindingName::Glob => summary.saw_glob = true,
+                            RustImportBindingName::Named(binding) => {
+                                summary.selected.entry(binding.to_string()).or_insert((
+                                    RustPatternName::Unknown,
+                                    summary.saw_glob,
+                                    work.get(),
+                                ));
+                            }
+                            RustImportBindingName::Unnamed => {}
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(ControlFlow::<()>::Continue(()))
+            },
+        );
+        summary.unknown = matches!(result?, ControlFlow::Break(RustLexicalSelection::Unknown));
+        summary.work = work.get();
+        Ok(summary)
+    }
+}
+
+fn rust_pattern_name_selection_bounded<'tree, F, E>(
+    root: Node<'tree>,
+    source: &str,
+    name: Node<'tree>,
+    charge: &mut F,
+) -> Result<(RustLexicalSelection<RustPatternName>, bool, bool), E>
+where
+    F: FnMut(usize) -> Result<(), E>,
+{
     use std::ops::ControlFlow;
     charge(1)?;
-    if name.kind() != "identifier"
+    if !matches!(name.kind(), "identifier" | "shorthand_field_identifier")
         || name.parent().is_some_and(|parent| {
             matches!(
                 parent.kind(),
@@ -1658,66 +2355,90 @@ where
             )
         })
     {
-        return Ok(false);
+        return Ok((
+            RustLexicalSelection::Selected(RustPatternName::Binding),
+            false,
+            false,
+        ));
     }
-    let text = crate::declarations::rust_node_text(name, source);
+    let text = brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+        crate::declarations::rust_node_text(name, source),
+    );
     // Constructors occupy pattern position, while prelude functions such as
     // `drop` can be shadowed by a binding. Select lexical items before falling
     // through to the prelude, so a written function can shadow `None` too.
     let prelude_constructor =
         text == "None" || crate::prelude::rust_std_constructor_fact(text).is_some();
-    let selection = visit_rust_lexical_selection_bounded(
-        root,
-        source,
-        name,
-        charge,
-        |event, _| {
+    let mut saw_glob = false;
+    let selection =
+        visit_rust_lexical_selection_bounded(root, source, name, charge, |event, _| {
             let occupied = match event {
                 RustLexicalSelectionEvent::Parameter(parameter) => {
                     parameter.kind() == "const_parameter"
                         && parameter.child_by_field_name("name").is_some_and(|name| {
-                            crate::declarations::rust_node_text(name, source) == text
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                crate::declarations::rust_node_text(name, source),
+                            ) == text
                         })
                 }
                 RustLexicalSelectionEvent::Item(item) => {
                     // Associated members require `Self::`; they are not
                     // unqualified value bindings in an implementation body.
-                    if crate::syntax::parent_outside_attributes(item).is_some_and(|scope| {
-                        scope.kind() == "declaration_list"
-                            && scope.parent().is_some_and(|owner| {
-                                matches!(owner.kind(), "impl_item" | "trait_item")
-                            })
-                    }) {
+                    if rust_is_associated_member(item) {
                         return Ok(ControlFlow::Continue(()));
                     }
                     if item.kind() == "function_item"
                         && item.child_by_field_name("name").is_some_and(|name| {
-                            crate::declarations::rust_node_text(name, source) == text
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                crate::declarations::rust_node_text(name, source),
+                            ) == text
                         })
                     {
-                        return Ok(ControlFlow::Break(false));
+                        return Ok(ControlFlow::Break(RustPatternName::Binding));
+                    }
+                    if item.kind() == "struct_item"
+                        && item.child_by_field_name("name").is_some_and(|name| {
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                crate::declarations::rust_node_text(name, source),
+                            ) == text
+                        })
+                        && (0..item.named_child_count()).any(|index| {
+                            item.named_child(index)
+                                .is_some_and(|child| child.kind() == "field_declaration_list")
+                        })
+                    {
+                        // A braced struct has no value constructor. Keep
+                        // searching for an outer const or function item.
+                        return Ok(ControlFlow::Continue(()));
                     }
                     matches!(item.kind(), "const_item" | "static_item" | "struct_item")
                         && item.child_by_field_name("name").is_some_and(|name| {
-                            crate::declarations::rust_node_text(name, source) == text
+                            brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix(
+                                crate::declarations::rust_node_text(name, source),
+                            ) == text
                         })
                 }
-                RustLexicalSelectionEvent::Import(_, leaf) => {
-                    matches!(leaf.import.binding_name(), RustImportBindingName::Named(binding) if binding == text)
-                }
+                RustLexicalSelectionEvent::Import(_, leaf) => match leaf.import.binding_name() {
+                    RustImportBindingName::Glob => {
+                        saw_glob = true;
+                        false
+                    }
+                    RustImportBindingName::Named(binding)
+                        if crate::imports::rust_binding_name_matches(&binding, text) =>
+                    {
+                        return Ok(ControlFlow::Break(RustPatternName::Unknown));
+                    }
+                    _ => false,
+                },
                 _ => false,
             };
             Ok(if occupied {
-                ControlFlow::Break(true)
+                ControlFlow::Break(RustPatternName::ValueItem)
             } else {
                 ControlFlow::Continue(())
             })
-        },
-    )?;
-    Ok(match selection {
-        RustLexicalSelection::Selected(occupied) => occupied,
-        RustLexicalSelection::Complete | RustLexicalSelection::Unknown => prelude_constructor,
-    })
+        })?;
+    Ok((selection, prelude_constructor, saw_glob))
 }
 
 /// Select the nearest value binding visible at a use. Like the scope index,
@@ -1897,6 +2618,7 @@ fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> b
                             | "tuple_pattern"
                             | "struct_pattern"
                             | "ref_pattern"
+                            | "reference_pattern"
                             | "mut_pattern"
                     )
                 }));
@@ -1916,6 +2638,7 @@ fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> b
                                 | "or_pattern"
                                 | "captured_pattern"
                                 | "ref_pattern"
+                                | "reference_pattern"
                                 | "mut_pattern"
                         )
                 }));
@@ -1977,6 +2700,7 @@ pub fn rust_pattern_binding_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
                             | "tuple_pattern"
                             | "struct_pattern"
                             | "ref_pattern"
+                            | "reference_pattern"
                             | "mut_pattern"
                     )
                 }));
@@ -1996,6 +2720,7 @@ pub fn rust_pattern_binding_identifiers(node: Node<'_>) -> Vec<Node<'_>> {
                                 | "or_pattern"
                                 | "captured_pattern"
                                 | "ref_pattern"
+                                | "reference_pattern"
                                 | "mut_pattern"
                         )
                 }));
@@ -2016,6 +2741,274 @@ mod tests {
 
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    fn test_scope_proof(source: &str) -> bool {
+        let tree = parse_rust_tree_uncached(source).unwrap();
+        rust_test_scope_unshadowed_bounded(tree.root_node(), source, &mut |_| Ok::<_, ()>(()))
+            .unwrap()
+    }
+
+    #[test]
+    #[hardwon("#10389: a raw alias of an imported constant blocks the flat binding proof")]
+    fn raw_imported_constant_blocks_flat_binding_proof() {
+        let source = "use m::C as r#type; fn f() { let r#type = 1; }";
+        let tree = parse_rust_tree_uncached(source).unwrap();
+        let root = tree.root_node();
+        let mut stack = vec![root];
+        let mut candidate = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && node.parent().is_some_and(|p| p.kind() == "let_declaration")
+            {
+                candidate = Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(
+            !rust_pattern_identifier_binding_bounded(
+                root,
+                source,
+                candidate.unwrap(),
+                &mut |_| Ok::<_, ()>(())
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#10389: crate globs in an out-of-line module cannot resolve against that file's root"
+    )]
+    fn test_attribute_crate_glob_needs_crate_root_evidence() {
+        assert!(!test_scope_proof(
+            "mod m {} use crate::m::*; #[test] fn t() {}"
+        ));
+    }
+
+    #[test]
+    #[hardwon("#10389: a glob target's item macro may expand to an attribute import")]
+    fn test_attribute_glob_target_item_macro_is_open() {
+        assert!(!test_scope_proof(
+            "mod m { foo!(); } use m::*; #[test] fn t() {}"
+        ));
+        assert!(test_scope_proof(
+            "mod m { macro_rules! foo { () => {} } } use m::*; #[test] fn t() {}"
+        ));
+    }
+
+    #[test]
+    #[hardwon("#10389: cfg-alternative modules can export different attribute macros")]
+    fn test_attribute_duplicate_module_declarations_are_open() {
+        assert!(!test_scope_proof(
+            "#[cfg(a)] mod m {} #[cfg(b)] mod m { macro_rules! test { () => {} } } use m::*; #[test] fn t() {}"
+        ));
+    }
+
+    #[test]
+    #[hardwon("#10389: an enclosing item macro may expand to a test attribute import")]
+    fn test_attribute_enclosing_item_macro_is_open() {
+        assert!(!test_scope_proof("my_macro!(); #[test] fn t() {}"));
+        assert!(test_scope_proof(
+            "macro_rules! other { () => {} } #[test] fn t() {}"
+        ));
+    }
+
+    #[test]
+    #[hardwon("#10389: glob-linked modules use bounded stack space for test attributes")]
+    fn test_attribute_glob_chain_is_stack_safe() {
+        let source = format!(
+            "mod m0 {{ macro_rules! test {{ () => {{}} }} }} {}",
+            (1..128)
+                .map(|i| format!("mod m{i} {{ use super::m{}::*; }}", i - 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_uncached(&source).unwrap();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut work = 0usize;
+                let mut charge = |amount| -> Result<(), ()> {
+                    work += amount;
+                    (work < 100_000).then_some(()).ok_or(())
+                };
+                assert_eq!(
+                    rust_glob_may_shadow_test(
+                        tree.root_node(),
+                        &["m127".to_owned()],
+                        &source,
+                        &mut charge,
+                        &mut std::collections::HashSet::new(),
+                    ),
+                    Ok(true)
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[hardwon("#10389: cached Rust scope scans consume file preparation once")]
+    fn indexed_pattern_scope_reuse_charges_only_new_scans() {
+        let source = format!(
+            "{}fn f(v: i32) {{ match v {{ {} }} }}",
+            (0..600)
+                .map(|i| format!("const ITEM_{i}: i32 = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            (0..128)
+                .map(|i| format!("candidate_{i} => (),"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_uncached(&source).unwrap();
+        let root = tree.root_node();
+        let mut stack = vec![root];
+        let mut candidates = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && source
+                    .get(node.byte_range())
+                    .is_some_and(|text| text.starts_with("candidate_"))
+            {
+                candidates.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(candidates.len(), 128);
+        let mut index = RustStrictPatternIndex::default();
+        let mut charged = 0usize;
+        for candidate in candidates {
+            let result = index.classify_with_budget(root, &source, candidate, &mut |amount| {
+                charged += amount;
+                (charged <= 100_000).then_some(()).ok_or(())
+            });
+            assert_eq!(result.unwrap(), RustPatternName::Binding);
+        }
+        assert_eq!(index.source_file_scans, 1);
+        assert!(charged < 100_000, "duplicate scope charges: {charged}");
+    }
+
+    #[test]
+    #[hardwon("#10389: an over-budget Rust scope scan is cached as Open")]
+    fn indexed_pattern_over_budget_scope_is_not_rescanned() {
+        let source = format!(
+            "{}fn f(v: i32) {{ match v {{ first => (), second => () }} }}",
+            (0..60_000)
+                .map(|i| format!("const ITEM_{i}: i32 = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_uncached(&source).unwrap();
+        let root = tree.root_node();
+        let mut stack = vec![root];
+        let mut candidates = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && source
+                    .get(node.byte_range())
+                    .is_some_and(|text| text == "first" || text == "second")
+            {
+                candidates.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(candidates.len(), 2);
+        let mut index = RustStrictPatternIndex::default();
+        for candidate in candidates {
+            assert_eq!(
+                index.classify(root, &source, candidate),
+                RustPatternName::Unknown
+            );
+        }
+        assert_eq!(index.source_file_scans, 1);
+    }
+
+    #[test]
+    #[hardwon("#10389: indexed Rust scope verdicts do not depend on first candidate work")]
+    fn indexed_pattern_scope_verdicts_match_independent_queries() {
+        let source = format!(
+            "{}fn f(v: i32) {{ match v {{ first => (), second => () }} }}",
+            (0..45_000)
+                .map(|i| format!("const ITEM_{i}: i32 = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_uncached(&source).unwrap();
+        let root = tree.root_node();
+        let mut stack = vec![root];
+        let mut candidates = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && source
+                    .get(node.byte_range())
+                    .is_some_and(|text| text == "first" || text == "second")
+            {
+                candidates.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(candidates.len(), 2);
+        let mut shared = RustStrictPatternIndex::default();
+        for candidate in candidates {
+            let independent = RustStrictPatternIndex::default().classify(root, &source, candidate);
+            assert_eq!(shared.classify(root, &source, candidate), independent);
+        }
+        assert_eq!(shared.source_file_scans, 1);
+    }
+
+    #[test]
+    #[hardwon("#10389: indexed Rust scope summaries stop during large scans")]
+    fn indexed_pattern_scope_scan_honors_work_limit_and_cancellation() {
+        let source = format!(
+            "{}fn f(v: i32) {{ match v {{ candidate => () }} }}",
+            (0..4_000)
+                .map(|i| format!("const ITEM_{i}: i32 = {i};"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let tree = parse_rust_tree_uncached(&source).unwrap();
+        let root = tree.root_node();
+        let mut stack = vec![root];
+        let mut candidate = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && source.get(node.byte_range()) == Some("candidate") {
+                candidate = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let candidate = candidate.unwrap();
+        let mut index = RustStrictPatternIndex::default();
+        let mut charged = 0usize;
+        let limited = index.classify_with_budget(root, &source, candidate, &mut |amount| {
+            charged += amount;
+            (charged <= 300).then_some(()).ok_or(())
+        });
+        assert!(limited.is_err());
+        assert!(charged <= 301, "scope scan overran the work cap: {charged}");
+        assert_eq!(index.source_file_scans, 0);
+
+        let token = brokk_bifrost_core::CancellationToken::new();
+        let mut index = RustStrictPatternIndex::default();
+        let mut charged = 0usize;
+        let cancelled = index.classify_with_budget(root, &source, candidate, &mut |amount| {
+            charged += amount;
+            if charged >= 300 {
+                token.cancel();
+            }
+            (!token.is_cancelled()).then_some(()).ok_or(())
+        });
+        assert!(cancelled.is_err());
+        assert!(token.is_cancelled());
+        assert_eq!(index.source_file_scans, 0);
+    }
 
     #[test]
     #[hardwon(
@@ -2101,7 +3094,8 @@ mod selected {
         let reference_byte = source.find("marker").expect("reference marker");
         let tree = parse_rust_tree_uncached(&source).expect("parse Rust fixture");
         let root = tree.root_node();
-        let binder = visible_import_binder_in_tree(root, &source, reference_byte);
+        let caches = RustLexicalCaches::new(&RetentionBudget::for_tests());
+        let binder = visible_import_binder_in_tree_with(&caches, root, &source, reference_byte);
         let visible: Vec<&str> = ["ModuleWide", "Local", "TrailingModuleWide"]
             .into_iter()
             .filter(|name| binder.bindings.contains_key(*name))
@@ -2117,8 +3111,11 @@ mod selected {
         // The statement index behind the binder is memoized on the source
         // bytes: a second question about the same source must reuse it rather
         // than re-walking the file (public issue #11).
-        let first = rust_use_statements(root, &source);
-        let second = rust_use_statements(root, &source);
+        let caches = RustLexicalCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        );
+        let first = rust_use_statements_with(&caches, root, &source);
+        let second = rust_use_statements_with(&caches, root, &source);
         assert!(
             Arc::ptr_eq(&first, &second),
             "expected the use-statement index to be shared across asks"
@@ -2357,4 +3354,283 @@ mod qs3_pattern_contract {
             }
         }
     }
+}
+
+fn rust_use_statements_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+) -> Arc<Accounted<SourceCached<Vec<RustUseStatement>>>> {
+    debug_assert!(
+        root.parent().is_none() && root.end_byte() <= source.len(),
+        "rust_use_statements needs the whole-source parse root",
+    );
+    if let Some(cached) = cached_for(&caches.use_statements, source) {
+        return cached;
+    }
+    caches.use_scans.fetch_add(1, Ordering::Relaxed);
+    let mut statements = Vec::new();
+    // The same source-order traversal as `collect_visible_use_statements`,
+    // minus its byte-position pruning: a pruned-away subtree can only hold
+    // statements the visibility filter rejects, so filtering this complete
+    // index reproduces the pruned walk's output exactly.
+    let mut stack = vec![(root, None, None)];
+    while let Some((raw_node, mod_range, scope_range)) = stack.pop() {
+        let node = unwrap_attributes(raw_node);
+        if matches!(node.kind(), "use_declaration" | "extern_crate_declaration") {
+            let imports = if node.kind() == "use_declaration" {
+                rust_imports_from_use_declaration(node, source)
+            } else {
+                crate::imports::rust_import_projection(node, source, "")
+                    .into_iter()
+                    .map(|projected| projected.import.info)
+                    .collect()
+            };
+            statements.push(RustUseStatement {
+                imports,
+                mod_range,
+                scope_range,
+            });
+            continue;
+        }
+        let child_mod_range = if node.kind() == "mod_item" {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            mod_range
+        };
+        let child_scope_range = if lexical_scope_kind(node.kind()) {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            scope_range
+        };
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, child_mod_range, child_scope_range)),
+        );
+    }
+    keep_for(&caches.use_statements, source, statements)
+}
+
+pub fn visible_import_binders_with_scopes_in_tree_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> Vec<(usize, ImportBinder)> {
+    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
+    let mut by_scope: HashMap<(usize, usize), ImportBinder> = HashMap::default();
+    for statement in rust_use_statements_with(caches, root, source).iter() {
+        // Extern-crate declarations are indexed for type identity, but do not
+        // introduce entries (including empty scopes) in the legacy use binder.
+        if statement.imports.iter().all(|import| {
+            import.path.as_ref().is_some_and(|path| {
+                path.kind
+                    == Some(
+                        brokk_bifrost_core::analyzer::model::StructuredImportPathKind::ExternCrate,
+                    )
+            })
+        }) {
+            continue;
+        }
+        if !use_statement_visible_at(
+            reference_byte,
+            reference_mod_range,
+            statement.mod_range,
+            statement.scope_range,
+        ) {
+            continue;
+        }
+        let scope = statement
+            .scope_range
+            .unwrap_or((root.start_byte(), root.end_byte()));
+        let binder = by_scope.entry(scope).or_default();
+        for import in &statement.imports {
+            insert_rust_import_binding(binder, import);
+        }
+    }
+    let mut binders: Vec<_> = by_scope.into_iter().collect();
+    binders.sort_by_key(|((start, end), _)| (end.saturating_sub(*start), *start));
+    binders
+        .into_iter()
+        .map(|((start, _), binder)| (start, binder))
+        .collect()
+}
+
+/// What the `use` declarations visible at a reference bind a name to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustVisibleUse {
+    /// No visible `use` binds the name and no visible glob could supply it.
+    Unbound,
+    /// A visible glob in a scope that binds nothing else of that name could
+    /// supply it.
+    GlobMayBind,
+    /// The innermost scope that binds the name binds it to this item path.
+    Named {
+        segments: Vec<String>,
+        is_global: bool,
+    },
+    /// Bound, but not to an item path: a namespace alias or a `self` import.
+    Namespace,
+}
+
+/// The binding of `name` visible at `reference_byte`, innermost scope first,
+/// with the item path carried as structured segments. A binding in a scope
+/// that does not contain the reference is never consulted.
+pub fn visible_use_for_name_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    name: &str,
+) -> RustVisibleUse {
+    use crate::imports::{RustImportBindingName, rust_import_binding_name};
+    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
+    #[derive(Default)]
+    struct Scope {
+        named: Option<RustVisibleUse>,
+        glob: bool,
+    }
+    let mut by_scope: HashMap<(usize, usize), Scope> = HashMap::default();
+    for statement in rust_use_statements_with(caches, root, source).iter() {
+        if !use_statement_visible_at(
+            reference_byte,
+            reference_mod_range,
+            statement.mod_range,
+            statement.scope_range,
+        ) {
+            continue;
+        }
+        let scope = by_scope
+            .entry(
+                statement
+                    .scope_range
+                    .unwrap_or((root.start_byte(), root.end_byte())),
+            )
+            .or_default();
+        for import in &statement.imports {
+            match rust_import_binding_name(import) {
+                RustImportBindingName::Glob => scope.glob = true,
+                RustImportBindingName::Unnamed => {}
+                RustImportBindingName::Named(bound) if bound == name => {
+                    let Some(path) = import.path.as_ref() else {
+                        scope.named = Some(RustVisibleUse::Namespace);
+                        continue;
+                    };
+                    let last = path.segments.last().map(String::as_str).unwrap_or_default();
+                    // The binder files a lowercase unaliased name, a `self`
+                    // import and a single unanchored segment as a namespace.
+                    let item = (path.segments.len() > 1 || import.is_global)
+                        && last != "self"
+                        && (import.alias.is_some()
+                            || last
+                                .chars()
+                                .any(|ch| !(ch.is_ascii_lowercase() || ch == '_')));
+                    scope.named = Some(if item {
+                        RustVisibleUse::Named {
+                            segments: path.segments.clone(),
+                            is_global: import.is_global,
+                        }
+                    } else {
+                        RustVisibleUse::Namespace
+                    });
+                }
+                RustImportBindingName::Named(_) => {}
+            }
+        }
+    }
+    let mut scopes = by_scope.into_iter().collect::<Vec<_>>();
+    scopes.sort_by_key(|((start, end), _)| (end.saturating_sub(*start), *start));
+    for (_, scope) in scopes {
+        if let Some(bound) = scope.named {
+            return bound;
+        }
+        if scope.glob {
+            return RustVisibleUse::GlobMayBind;
+        }
+    }
+    RustVisibleUse::Unbound
+}
+
+pub fn lexical_package_at_with(
+    caches: &RustLexicalCaches,
+    file_package: &str,
+    source: &str,
+    byte: usize,
+) -> String {
+    let Some(tree) = parse_rust_tree_with(caches, source) else {
+        return file_package.to_string();
+    };
+    lexical_package_in_tree(file_package, tree.root_node(), source, byte)
+}
+
+/// Parser-owned declarations for visible imports binding `name`.
+pub fn visible_import_declarations_in_tree_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    name: &str,
+) -> Vec<brokk_bifrost_core::analyzer::model::ImportInfo> {
+    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
+    rust_use_statements_with(caches, root, source)
+        .iter()
+        .filter(|statement| {
+            use_statement_visible_at(
+                reference_byte,
+                reference_mod_range,
+                statement.mod_range,
+                statement.scope_range,
+            )
+        })
+        .flat_map(|statement| &statement.imports)
+        .filter(|import| import.local_name() == Some(name))
+        .cloned()
+        .collect()
+}
+
+/// Parser-owned paths of visible imports binding `name`, including aliases.
+pub fn visible_import_paths_in_tree_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    name: &str,
+) -> Vec<Vec<String>> {
+    visible_import_declarations_in_tree_with(caches, root, source, reference_byte, name)
+        .into_iter()
+        .map(|import| {
+            import
+                .path
+                .expect("Rust import has a structured path")
+                .segments
+        })
+        .collect()
+}
+
+pub fn visible_import_binder_in_tree_with(
+    caches: &RustLexicalCaches,
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> ImportBinder {
+    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
+    let mut binder = ImportBinder::empty();
+    for statement in rust_use_statements_with(caches, root, source).iter() {
+        if !use_statement_visible_at(
+            reference_byte,
+            reference_mod_range,
+            statement.mod_range,
+            statement.scope_range,
+        ) {
+            continue;
+        }
+        for import in &statement.imports {
+            insert_rust_import_binding(&mut binder, import);
+        }
+    }
+    binder
 }

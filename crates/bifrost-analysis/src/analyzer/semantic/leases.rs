@@ -86,6 +86,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10893: artifact hits must face the cold publication census"
+    )]
+    fn complete_artifact_hits_and_publish_cached_preserve_cold_boundary() {
+        use crate::analyzer::semantic::service::{CompleteSemanticArtifactCache, publish_cached};
+        use crate::analyzer::semantic::{
+            SemanticBudget, SemanticOutcome, SemanticRequest, SemanticWork,
+        };
+        let artifact = artifact("boundary.ts", "");
+        let census = artifact.work();
+        let peak = census.owned_text_bytes;
+        assert!(peak > 1);
+        let cancellation = crate::cancellation::CancellationToken::default();
+        let cache = CompleteSemanticArtifactCache::new(u64::MAX);
+        for limit in [peak - 1, peak] {
+            let mut cold = SemanticBudget::uniform(limit).unwrap();
+            let cold_result = SemanticArtifact::try_new_with_budget(
+                artifact.key().clone(),
+                SemanticCapabilities::default(),
+                Vec::new(),
+                &mut cold,
+            );
+            let mut warm = SemanticBudget::uniform(limit).unwrap();
+            let hit = warm.charge_complete_artifact(&artifact);
+            assert_eq!(cold_result.is_ok(), hit.is_ok(), "artifact limit={limit}");
+            assert_eq!(hit.is_ok(), limit == peak);
+            let mut published = SemanticBudget::uniform(limit).unwrap();
+            let staged = published.clone();
+            let outcome = publish_cached(
+                &cache,
+                Arc::clone(&artifact),
+                SemanticWork::default(),
+                staged,
+                &mut SemanticRequest::new(&mut published, &cancellation),
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(outcome, SemanticOutcome::Complete { .. }),
+                cold_result.is_ok(),
+                "publish_cached limit={limit}"
+            );
+        }
+    }
+
+    #[test]
     fn distinct_allocations_with_the_same_key_are_retained_separately() {
         let file = file("src/twins.ts");
         let first = artifact("src/twins.ts", "export const twins = 1;\n");

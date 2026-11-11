@@ -235,8 +235,24 @@ fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &s
                 &child_path("require_both.configuration".to_owned()),
             );
         }
-        CodeQueryPlanSource::Seed(_)
-        | CodeQueryPlanSource::Occurrences(_)
+        CodeQueryPlanSource::Seed(seed) => {
+            for (pattern, field) in std::iter::once((&mut seed.root, "match"))
+                .chain(seed.inside.iter_mut().map(|pattern| (pattern, "inside")))
+                .chain(
+                    seed.inside_decl
+                        .iter_mut()
+                        .map(|pattern| (pattern, "inside_decl")),
+                )
+                .chain(
+                    seed.not_inside
+                        .iter_mut()
+                        .map(|pattern| (pattern, "not_inside")),
+                )
+            {
+                annotate_pattern_qualifying_ranges(pattern, expr, &child_path(field.to_owned()));
+            }
+        }
+        CodeQueryPlanSource::Occurrences(_)
         | CodeQueryPlanSource::Scopes(_)
         | CodeQueryPlanSource::Bindings(_)
         | CodeQueryPlanSource::Paths(_)
@@ -252,6 +268,26 @@ fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &s
     };
     for (index, step) in plan.steps.iter_mut().enumerate() {
         match step {
+            QueryStep::ReferencesOf(filter)
+            | QueryStep::UsedBy(filter)
+            | QueryStep::Uses(filter) => {
+                if let Some(enclosing) = &mut filter.enclosing {
+                    annotate_pattern_qualifying_ranges(
+                        &mut enclosing.pattern,
+                        expr,
+                        &format!("{steps_path}[{index}].enclosing"),
+                    );
+                }
+            }
+            QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
+                if let Some(enclosing) = &mut filter.enclosing {
+                    annotate_pattern_qualifying_ranges(
+                        &mut enclosing.pattern,
+                        expr,
+                        &format!("{steps_path}[{index}].enclosing"),
+                    );
+                }
+            }
             QueryStep::ResolvedCall(filter) => {
                 annotate_call_identity_range(
                     &mut filter.resolves_to,
@@ -280,6 +316,25 @@ fn annotate_call_identity_ranges(plan: &mut CodeQueryPlan, expr: &Expr, path: &s
             _ => {}
         }
     }
+}
+
+fn annotate_pattern_qualifying_ranges(pattern: &mut super::ir::Pattern, expr: &Expr, path: &str) {
+    pattern
+        .visit_qualifying_types_mut_with_path::<std::convert::Infallible>(path, &mut |ty, path| {
+            let mut pending = vec![(ty, path.to_owned())];
+            while let Some((ty, path)) = pending.pop() {
+                annotate_call_identity_range(
+                    &mut ty.identity,
+                    expr,
+                    &format!("{path}.identity.qualified"),
+                );
+                for (index, argument) in ty.arguments.iter_mut().enumerate() {
+                    pending.push((argument, format!("{path}.arguments[{index}]")));
+                }
+            }
+            Ok(())
+        })
+        .expect("source annotation cannot fail");
 }
 
 fn annotate_call_identity_range(identity: &mut CallIdentity, expr: &Expr, path: &str) {
@@ -543,6 +598,25 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String("anchor".to_string()));
             step.insert("capture".to_string(), Value::String(capture));
             append_step(expr, &items[3], step)
+        }
+        RqlForm::IdenticalCaptures => {
+            if items.len() != 6
+                || items[1].as_symbol() != Some(":left")
+                || items[3].as_symbol() != Some(":right")
+            {
+                return Err(lower_error(
+                    expr,
+                    "(identical-captures ...) expects :left, a capture name, :right, a capture name, and a query",
+                ));
+            }
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String("identical_captures".to_string()),
+            );
+            step.insert("left".to_string(), Value::String(string_arg(&items[2])?));
+            step.insert("right".to_string(), Value::String(string_arg(&items[4])?));
+            append_step(expr, &items[5], step)
         }
         RqlForm::StatementFacts => {
             if items.len() != 4 || items[1].as_symbol() != Some(":kind") {
@@ -913,6 +987,9 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                         "surface",
                         Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
                     ),
+                    ":enclosing" if matches!(form, RqlForm::ReferencesOf) => {
+                        ("enclosing", pattern_to_json(&pair[1])?)
+                    }
                     _ => {
                         return Err(lower_error(
                             &pair[0],
@@ -1223,39 +1300,52 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             Ok(Some(Value::Object(query)))
         }
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
-            let (query_expr, capture) = match items.len() {
-                2 => (&items[1], None),
-                4 if items[1].as_symbol() == Some(":capture") => {
-                    (&items[3], Some(symbol_or_string(&items[2])?))
-                }
-                _ => {
-                    return Err(lower_error(
-                        expr,
-                        format!(
-                            "({head} ...) expects an optional :capture name followed by a query"
-                        ),
-                    ));
-                }
-            };
-            let op = match form {
-                RqlForm::ReceiverTargets => "receiver_targets",
-                RqlForm::PointsTo => "points_to",
-                RqlForm::MemberTargets => "member_targets",
-                _ => unreachable!("receiver wrapper filtered above"),
-            };
-            let mut query = query_object(query_expr)?;
-            let mut step = Map::new();
-            step.insert("op".to_string(), Value::String(op.to_string()));
-            if let Some(capture) = capture {
-                step.insert("capture".to_string(), Value::String(capture));
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
             }
-            query
-                .entry("steps".to_string())
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()
-                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
-                .push(Value::Object(step));
-            Ok(Some(Value::Object(query)))
+            let op = form
+                .query_step_op()
+                .expect("receiver wrappers declare a query step");
+            let accepted = if form == RqlForm::MemberTargets {
+                ":capture, :member-form, and :trivial-property"
+            } else {
+                ":capture"
+            };
+            let mut step = Map::new();
+            step.insert("op".to_string(), Value::String(op.label().to_string()));
+            for pair in items[1..items.len() - 1].as_chunks::<2>().0 {
+                let (key_expr, key, value) = filter_option_pair(pair, head)?;
+                let unknown =
+                    || lower_error(key_expr, format!("({head} ...) accepts only {accepted}"));
+                let (field, value) = if key == ":capture" {
+                    (
+                        QueryStepField::Capture.label(),
+                        Value::String(symbol_or_string(value)?),
+                    )
+                } else {
+                    let option = op.option_for_rql_label(key).ok_or_else(unknown)?;
+                    let value = match option.field() {
+                        QueryStepField::MemberForms => filter_labels_value(value)?,
+                        QueryStepField::TrivialProperty => match value.as_symbol() {
+                            Some("true") => Value::Bool(true),
+                            Some("false") => Value::Bool(false),
+                            _ => {
+                                return Err(lower_error(
+                                    value,
+                                    format!("{key} must be true or false"),
+                                ));
+                            }
+                        },
+                        _ => unreachable!("member-targets registry holds its two options"),
+                    };
+                    (option.field().label(), value)
+                };
+                insert_unique(&mut step, field, value).at(key_expr)?;
+            }
+            append_step(expr, &items[items.len() - 1], step)
         }
         RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
@@ -1694,8 +1784,32 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                     format!("({head} ...) expects filter options followed by a query"),
                 ));
             }
-            let mut step =
-                configuration_facts_filter_to_json(expr, head, &items[1..items.len() - 1])?;
+            let mut scope = None;
+            let mut filter_options = Vec::new();
+            let options = &items[1..items.len() - 1];
+            if !options.len().is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    "configuration-absence options must be pairs",
+                ));
+            }
+            for pair in options.as_chunks::<2>().0 {
+                if pair[0].as_symbol() == Some(":scope") {
+                    let label = pair[1].as_symbol().ok_or_else(|| {
+                        lower_error(&pair[1], ":scope must be document or subtree")
+                    })?;
+                    if label != "document" && label != "subtree" {
+                        return Err(lower_error(&pair[1], ":scope must be document or subtree"));
+                    }
+                    scope = Some(label);
+                } else {
+                    filter_options.extend_from_slice(pair);
+                }
+            }
+            let mut step = configuration_facts_filter_to_json(expr, head, &filter_options)?;
+            if let Some(scope) = scope {
+                step.insert("scope".to_string(), Value::String(scope.to_string()));
+            }
             step.insert(
                 "op".to_string(),
                 Value::String(QueryStepOp::ConfigurationAbsence.label().to_string()),
@@ -1869,6 +1983,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                         "surface",
                         Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
                     ),
+                    ":enclosing" => ("enclosing", pattern_to_json(&pair[1])?),
                     _ => {
                         return Err(lower_error(
                             &pair[0],
@@ -2041,12 +2156,17 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Not
         | RqlForm::All
         | RqlForm::Any
+        | RqlForm::InstantiatedType
+        | RqlForm::Qualified
         | RqlForm::LocalValue
         | RqlForm::Capture
         | RqlForm::Has
+        | RqlForm::Each
+        | RqlForm::ArgumentMode
         | RqlForm::NotHas
         | RqlForm::NotKind
         | RqlForm::Arity
+        | RqlForm::Count
         | RqlForm::Visibility
         | RqlForm::ParameterType
         | RqlForm::ParameterTypeRegex
@@ -2406,6 +2526,13 @@ fn configuration_facts_filter_to_json(
                 })?],
             };
             Value::Array(labels.into_iter().map(Value::String).collect())
+        } else if field == ConfigurationFactsFilterField::ValueRegex {
+            Value::String(
+                pair[1]
+                    .as_string()
+                    .ok_or_else(|| lower_error(&pair[1], format!("{key} must be a regex string")))?
+                    .to_string(),
+            )
         } else if field == ConfigurationFactsFilterField::XmlPeerMinSharedChildren {
             number_value(&pair[1], key)?
         } else if field == ConfigurationFactsFilterField::FactOrdinals {
@@ -2425,13 +2552,17 @@ fn configuration_facts_filter_to_json(
                 | ConfigurationFactsFilterField::ValueGt
                 | ConfigurationFactsFilterField::ValueGe
         ) {
-            let value = pair[1].as_string().ok_or_else(|| {
-                lower_error(&pair[1], format!("{key} must be a finite numeric string"))
-            })?;
-            if !value.parse::<f64>().is_ok_and(|number| number.is_finite()) {
+            let value = pair[1]
+                .as_string()
+                .ok_or_else(|| lower_error(&pair[1], format!("{key} must be a decimal numeric bound string whose exponent fits a 64-bit integer")))?;
+            if brokk_bifrost_analysis::analyzer::configuration::ConfigurationNumber::parse(value)
+                .is_none()
+            {
                 return Err(lower_error(
                     &pair[1],
-                    format!("{key} must be a finite numeric string"),
+                    format!(
+                        "{key} must be a decimal numeric bound string whose exponent fits a 64-bit integer"
+                    ),
                 ));
             }
             Value::String(value.to_string())
@@ -2711,6 +2842,13 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         ));
     }
     match form {
+        RqlForm::InstantiatedType | RqlForm::Qualified => {
+            return Err(lower_error(
+                expr,
+                "type-constraint forms are only valid inside qualifying-type",
+            ));
+        }
+
         RqlForm::Name => {
             expect_len(expr, items, 2, "name")?;
             insert_unique(&mut object, "name", Value::String(string_arg(&items[1])?)).at(expr)?;
@@ -2947,14 +3085,14 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             )
             .at(expr)?;
         }
-        RqlForm::Has | RqlForm::NotHas => {
+        RqlForm::Has | RqlForm::Each | RqlForm::NotHas => {
             expect_len(expr, items, 2, head)?;
             insert_unique(
                 &mut object,
-                if form == RqlForm::Has {
-                    "has"
-                } else {
-                    "not_has"
+                match form {
+                    RqlForm::Has => "has",
+                    RqlForm::Each => "each",
+                    _ => "not_has",
                 }
                 .to_string(),
                 pattern_to_json(&items[1])?,
@@ -2967,6 +3105,22 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         }
         RqlForm::Arity => {
             insert_unique(&mut object, "arity", arity_value(expr, &items[1..])?).at(expr)?;
+        }
+        RqlForm::Count => {
+            insert_unique(&mut object, "count", count_value(expr, &items[1..])?).at(expr)?;
+        }
+        RqlForm::ArgumentMode => {
+            insert_unique(
+                &mut object,
+                "argument_mode",
+                Value::Array(
+                    items[1..]
+                        .iter()
+                        .map(|item| symbol_or_string(item).map(Value::String))
+                        .collect::<LowerResult<Vec<_>>>()?,
+                ),
+            )
+            .at(expr)?;
         }
         RqlForm::Visibility => {
             expect_len(expr, items, 2, "visibility")?;
@@ -3033,6 +3187,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::Filter
         | RqlForm::Project
         | RqlForm::Anchor
+        | RqlForm::IdenticalCaptures
         | RqlForm::StatementFacts
         | RqlForm::EnclosingDecl
         | RqlForm::ProcedureOf
@@ -3270,6 +3425,15 @@ fn insert_keyword(
             .is_some_and(|kind| Role::Value.valid_for(kind));
     if !value_is_role_pattern && let Some(property) = RqlProperty::from_label(key) {
         return match property {
+            RqlProperty::QualifyingType => insert_unique(
+                object,
+                "qualifying_type",
+                instantiated_type_value(value, 0)?,
+            )
+            .at(key_expr),
+            RqlProperty::InstantiatedIdentity | RqlProperty::InstantiatedArguments => Err(
+                lower_error(key_expr, "property is only valid inside instantiated-type"),
+            ),
             RqlProperty::Name => {
                 insert_unique(object, "name", Value::String(string_arg(value)?)).at(key_expr)
             }
@@ -3403,6 +3567,28 @@ fn insert_keyword(
             RqlProperty::Arity => {
                 insert_unique(object, "arity", arity_property_value(value)?).at(key_expr)
             }
+            RqlProperty::Count => {
+                let items = value
+                    .as_sequence()
+                    .ok_or_else(|| lower_error(value, ":count requires a vector"))?;
+                insert_unique(object, "count", count_value(value, items)?).at(key_expr)
+            }
+            RqlProperty::ArgumentMode => {
+                let entries = value
+                    .as_sequence()
+                    .ok_or_else(|| lower_error(value, ":argument-mode requires a vector"))?;
+                insert_unique(
+                    object,
+                    "argument_mode",
+                    Value::Array(
+                        entries
+                            .iter()
+                            .map(|item| symbol_or_string(item).map(Value::String))
+                            .collect::<LowerResult<Vec<_>>>()?,
+                    ),
+                )
+                .at(key_expr)
+            }
             RqlProperty::Visibility => {
                 insert_unique(object, "visibility", visibility_value(value)?).at(key_expr)
             }
@@ -3433,6 +3619,9 @@ fn insert_keyword(
             )
             .at(key_expr),
             RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?).at(key_expr),
+            RqlProperty::Each => {
+                insert_unique(object, "each", pattern_to_json(value)?).at(key_expr)
+            }
             RqlProperty::NotHas => {
                 insert_unique(object, "not_has", pattern_to_json(value)?).at(key_expr)
             }
@@ -3731,6 +3920,42 @@ fn arity_value(expr: &Expr, tail: &[Expr]) -> LowerResult<Value> {
             ));
         };
         insert_unique(&mut object, field, Value::Number(count.into())).at(&pair[0])?;
+    }
+    Ok(Value::Object(object))
+}
+
+fn count_value(expr: &Expr, tail: &[Expr]) -> LowerResult<Value> {
+    if tail.len() < 4 || !(tail.len() - 2).is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            "count requires :role pattern and at least one bound",
+        ));
+    }
+    let role = tail[0]
+        .as_symbol()
+        .ok_or_else(|| lower_error(&tail[0], "count role must be a keyword"))?;
+    let role = role
+        .strip_prefix(':')
+        .ok_or_else(|| lower_error(&tail[0], "count role must be a keyword"))?;
+    if !Role::from_label(role).is_some_and(|role| Role::list_target_roles().contains(&role)) {
+        return Err(lower_error(&tail[0], "count role must be a list role"));
+    }
+    let mut object = Map::new();
+    object.insert("role".to_string(), json!(role));
+    object.insert("pattern".to_string(), pattern_to_json(&tail[1])?);
+    for pair in tail[2..].as_chunks::<2>().0 {
+        let key = pair[0]
+            .as_symbol()
+            .ok_or_else(|| lower_error(&pair[0], "count bound must be :min or :max"))?;
+        let field = match key {
+            ":min" => "min",
+            ":max" => "max",
+            _ => return Err(lower_error(&pair[0], "count bound must be :min or :max")),
+        };
+        let count = pair[1]
+            .as_number()
+            .ok_or_else(|| lower_error(&pair[1], "count bound must be a non-negative integer"))?;
+        insert_unique(&mut object, field, json!(count)).at(&pair[0])?;
     }
     Ok(Value::Object(object))
 }
@@ -4077,6 +4302,85 @@ fn call_identity_value(expr: &Expr, context: &str) -> LowerResult<Value> {
     let mut identity = Map::new();
     identity.insert(kind.to_owned(), Value::String(value.clone()));
     Ok(Value::Object(identity))
+}
+
+pub(super) fn instantiated_type_value(expr: &Expr, depth: usize) -> LowerResult<Value> {
+    if depth > super::ir::MAX_PATTERN_DEPTH {
+        return Err(lower_error(
+            expr,
+            "instantiated-type nesting exceeds the pattern limit",
+        ));
+    }
+    let ExprKind::List(items) = &expr.kind else {
+        return Err(lower_error(expr, "expected an instantiated-type form"));
+    };
+    if items
+        .first()
+        .and_then(Expr::as_symbol)
+        .and_then(RqlForm::from_label)
+        != Some(RqlForm::InstantiatedType)
+    {
+        return Err(lower_error(expr, "expected an instantiated-type form"));
+    }
+    let mut object = Map::new();
+    if (items.len() - 1) % 2 != 0 {
+        return Err(lower_error(
+            expr,
+            "instantiated-type requires property/value pairs",
+        ));
+    }
+    for pair in items[1..].as_chunks::<2>().0 {
+        let property = pair[0]
+            .as_symbol()
+            .and_then(|key| key.strip_prefix(':'))
+            .and_then(RqlProperty::from_label);
+        match property {
+            Some(RqlProperty::InstantiatedIdentity) => {
+                let ExprKind::List(identity) = &pair[1].kind else {
+                    return Err(lower_error(
+                        &pair[1],
+                        "identity requires (qualified \"locator\")",
+                    ));
+                };
+                expect_len(&pair[1], identity, 2, "qualified")?;
+                if identity[0].as_symbol().and_then(RqlForm::from_label) != Some(RqlForm::Qualified)
+                {
+                    return Err(lower_error(
+                        &pair[1],
+                        "identity requires a qualified locator",
+                    ));
+                }
+                string_arg(&identity[1])?;
+                insert_unique(
+                    &mut object,
+                    "identity",
+                    call_identity_value(&identity[1], "qualified")?,
+                )
+                .at(&pair[0])?;
+            }
+            Some(RqlProperty::InstantiatedArguments) => {
+                let arguments = pair[1]
+                    .as_sequence()
+                    .ok_or_else(|| lower_error(&pair[1], "arguments requires a vector"))?;
+                insert_unique(
+                    &mut object,
+                    "arguments",
+                    Value::Array(
+                        arguments
+                            .iter()
+                            .map(|argument| instantiated_type_value(argument, depth + 1))
+                            .collect::<LowerResult<_>>()?,
+                    ),
+                )
+                .at(&pair[0])?;
+            }
+            _ => return Err(lower_error(&pair[0], "unknown instantiated-type property")),
+        }
+    }
+    if !object.contains_key("identity") {
+        return Err(lower_error(expr, "instantiated-type requires identity"));
+    }
+    Ok(Value::Object(object))
 }
 
 fn receiver_type_value(expr: &Expr, context: &str) -> LowerResult<Value> {

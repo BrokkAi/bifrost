@@ -35,7 +35,6 @@ pub const CSHARP_INACTIVE_BRANCHES_DETAIL: &str =
 pub struct PreprocessorScan {
     pub decisions: PreprocessorDecisions,
     pub undecided_chains: Vec<UndecidedChain>,
-    pub has_unseen_branch: bool,
     /// Byte ranges the parser may read, or `None` when the file has no
     /// directives at all and must simply be parsed whole.
     pub included_ranges: Option<Vec<tree_sitter::Range>>,
@@ -147,6 +146,13 @@ pub struct UndecidedChain {
 }
 
 impl PreprocessorScan {
+    /// Whether an undecided chain omitted a branch holding more than comments.
+    pub fn has_unseen_branch(&self) -> bool {
+        self.undecided_chains
+            .iter()
+            .any(|chain| chain.omitted_nonblank)
+    }
+
     /// Activation comes from the same decisions that selected the parser ranges.
     pub fn chain_activations(
         &self,
@@ -206,7 +212,8 @@ impl PreprocessorScan {
 /// producer must list in `defined` only symbols defined under every evaluation
 /// of its unknown parts (for example, proven implicit framework symbols).
 /// Missing symbols in an open environment are unknown. In a closed environment
-/// every missing symbol is false. Explicit file-local undefinitions remain false.
+/// named-open symbols are unknown and other missing symbols are false.
+/// Explicit file-local undefinitions remain false.
 /// The empty compilation key and `no_owning_compilation` reason are reserved for
 /// the evaluator's synthetic no-owner environment. Real owners use non-empty
 /// compilation keys and discovery's fixed set of open reason labels.
@@ -214,6 +221,7 @@ impl PreprocessorScan {
 pub struct SymbolEnvironment {
     pub compilation_key: String,
     pub defined: std::collections::BTreeSet<String>,
+    pub named_open: std::collections::BTreeSet<String>,
     pub closed: bool,
     pub open_reason: Option<String>,
 }
@@ -385,16 +393,40 @@ fn evaluate_condition(
 struct OwnerState<'a> {
     owner: &'a SymbolEnvironment,
     local: std::collections::HashMap<String, Option<bool>>,
-    decisions: Vec<ChainDecision>,
-    remaining: Vec<Option<bool>>,
-    active: Vec<Option<bool>>,
+    /// Per-chain state for this owner, indexed by chain.
+    chains: Vec<OwnerChain>,
 }
+
+/// One owner's reading of one conditional chain.
+struct OwnerChain {
+    decision: ChainDecision,
+    remaining: Remaining,
+    /// Whether the branch currently open is active for this owner: `None`
+    /// when that depends on a symbol or branch this owner cannot decide.
+    active: Option<bool>,
+}
+
+/// Whether a later branch of a chain can still be taken for one owner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Remaining {
+    /// Every earlier branch is definitely inactive.
+    Open,
+    /// An earlier branch was definitely taken.
+    Taken,
+    /// An earlier branch may or may not have been taken.
+    Unknown,
+}
+
 impl OwnerState<'_> {
+    fn active(&self, chain: usize) -> Option<bool> {
+        self.chains[chain].active
+    }
+
     fn lookup(&self, name: &str) -> Option<bool> {
         self.local.get(name).copied().unwrap_or_else(|| {
             if self.owner.defined.contains(name) {
                 Some(true)
-            } else if self.owner.closed {
+            } else if self.owner.closed && !self.owner.named_open.contains(name) {
                 Some(false)
             } else {
                 None
@@ -408,14 +440,19 @@ impl OwnerState<'_> {
         parent: Option<usize>,
         condition: Option<&str>,
     ) {
-        let parent_active = parent.map_or(Some(true), |p| self.active[p]);
-        while self.decisions.len() <= chain {
-            self.decisions.push(ChainDecision::Decided(None));
-            self.remaining.push(Some(true));
-            self.active.push(Some(false));
+        let parent_active = parent.map_or(Some(true), |p| self.active(p));
+        // A stray `#elif`/`#else` with no open chain numbers a chain no owner
+        // evaluates, so chain indices can skip; fill them as never taken.
+        while self.chains.len() <= chain {
+            self.chains.push(OwnerChain {
+                decision: ChainDecision::Decided(None),
+                remaining: Remaining::Open,
+                active: Some(false),
+            });
         }
-        if self.remaining[chain] == Some(false) || parent_active == Some(false) {
-            self.active[chain] = Some(false);
+        let remaining = self.chains[chain].remaining;
+        if remaining == Remaining::Taken || parent_active == Some(false) {
+            self.chains[chain].active = Some(false);
             return;
         }
         let mut used = std::collections::BTreeSet::new();
@@ -423,20 +460,21 @@ impl OwnerState<'_> {
             None => (Some(true), false),
             Some(condition) => evaluate_condition(condition, |name| self.lookup(name), &mut used),
         };
-        self.active[chain] = if value == Some(false) {
+        let uncertain = parent_active.is_none() || remaining == Remaining::Unknown;
+        self.chains[chain].active = if value == Some(false) {
             Some(false)
-        } else if parent_active.is_none() || self.remaining[chain].is_none() {
+        } else if uncertain {
             None
         } else {
             value
         };
-        if parent_active.is_none() || self.remaining[chain].is_none() || value.is_none() {
-            let mut reason = match &self.decisions[chain] {
+        if uncertain || value.is_none() {
+            let mut reason = match &self.chains[chain].decision {
                 ChainDecision::Undecided(r) => r.clone(),
                 _ => DecisionReason::default(),
             };
             if let Some(p) = parent
-                && let ChainDecision::Undecided(r) = &self.decisions[p]
+                && let ChainDecision::Undecided(r) = &self.chains[p].decision
             {
                 reason.unknown_symbols.extend(r.unknown_symbols.clone());
                 reason.open_reasons.extend(r.open_reasons.clone());
@@ -449,26 +487,29 @@ impl OwnerState<'_> {
             if let Some(label) = &self.owner.open_reason {
                 reason.open_reasons.insert(label.clone());
             }
-            self.decisions[chain] = ChainDecision::Undecided(reason);
-            self.remaining[chain] = None;
+            self.chains[chain].decision = ChainDecision::Undecided(reason);
+            self.chains[chain].remaining = Remaining::Unknown;
         } else if value == Some(true) {
-            self.decisions[chain] = ChainDecision::Decided(Some(index));
-            self.remaining[chain] = Some(false);
+            self.chains[chain].decision = ChainDecision::Decided(Some(index));
+            self.chains[chain].remaining = Remaining::Taken;
         }
     }
 }
 
+// M10a0 cost condition: retain ONE product per file. Merge decisions across
+// owning framework instances here; disagreement remains undecided, rather than
+// parsing and storing a separate file product for each instance.
 fn merge_decision(owners: &[OwnerState<'_>], chain: usize) -> ChainDecision {
-    let first = &owners[0].decisions[chain];
+    let first = &owners[0].chains[chain].decision;
     if matches!(first, ChainDecision::Decided(_))
-        && owners.iter().all(|o| &o.decisions[chain] == first)
+        && owners.iter().all(|o| &o.chains[chain].decision == first)
     {
         return first.clone();
     }
     let mut reason = DecisionReason::default();
     let mut decided = Vec::new();
     for owner in owners {
-        match &owner.decisions[chain] {
+        match &owner.chains[chain].decision {
             ChainDecision::Undecided(r) => {
                 reason.unknown_symbols.extend(r.unknown_symbols.clone());
                 reason.open_reasons.extend(r.open_reasons.clone());
@@ -503,6 +544,7 @@ fn with_owner_environments<T>(
     let unowned = SymbolEnvironment {
         compilation_key: String::new(),
         defined: Default::default(),
+        named_open: Default::default(),
         closed: false,
         open_reason: Some(
             match ownership {
@@ -589,7 +631,7 @@ fn finish_decisions(
     );
     let chains: Vec<_> = (0..count)
         .map(|chain| {
-            if owners[0].decisions.len() <= chain {
+            if owners[0].chains.len() <= chain {
                 ChainDecision::Decided(None)
             } else {
                 merge_decision(owners, chain)
@@ -642,12 +684,44 @@ enum LexMode {
 struct ChainState {
     chain: usize,
     index: usize,
-    /// True when the branch currently open emits source.
-    branch_active: bool,
-    /// True once some branch of this chain has been chosen as the active one.
-    chosen: bool,
-    /// True when the region enclosing this whole chain is active.
-    parent_active: bool,
+    branch: BranchState,
+}
+
+/// Where the merged reading is within one conditional chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BranchState {
+    /// The region enclosing the chain is inactive, so no branch emits source.
+    ParentInactive,
+    /// No branch has emitted source yet, including the one now open.
+    Waiting,
+    /// The branch now open emits source.
+    Active,
+    /// An earlier branch emitted source; this and every later branch do not.
+    Finished,
+}
+
+impl BranchState {
+    fn opened(region_active: bool, possibly_active: bool) -> Self {
+        match (region_active, possibly_active) {
+            (false, _) => Self::ParentInactive,
+            (true, true) => Self::Active,
+            (true, false) => Self::Waiting,
+        }
+    }
+
+    /// The state after the next `#elif` or `#else`.
+    fn next(self, possibly_active: bool) -> Self {
+        match self {
+            Self::ParentInactive => Self::ParentInactive,
+            Self::Waiting if possibly_active => Self::Active,
+            Self::Waiting => Self::Waiting,
+            Self::Active | Self::Finished => Self::Finished,
+        }
+    }
+
+    fn emits(self) -> bool {
+        self == Self::Active
+    }
 }
 
 /// Scan and decide in one source-order pass over the original bytes.
@@ -675,9 +749,7 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
         .map(|owner| OwnerState {
             owner,
             local: Default::default(),
-            decisions: Vec::new(),
-            remaining: Vec::new(),
-            active: Vec::new(),
+            chains: Vec::new(),
         })
         .collect();
     let mut referenced_symbols = std::collections::BTreeSet::new();
@@ -707,7 +779,7 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
             None => source.len(),
         };
         let line = &source[line_start..line_end];
-        let region_active = stack.last().is_none_or(|state| state.branch_active);
+        let region_active = stack.last().is_none_or(|state| state.branch.emits());
 
         let is_directive = mode == LexMode::Normal && line.trim_start().starts_with('#');
         if is_directive {
@@ -735,7 +807,7 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
                 for owner in &mut owners {
                     let active = stack
                         .last()
-                        .map_or(Some(true), |state| owner.active[state.chain]);
+                        .map_or(Some(true), |state| owner.active(state.chain));
                     if active != Some(false) {
                         owner
                             .local
@@ -751,14 +823,11 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
                     for owner in &mut owners {
                         owner.branch(chain, 0, parent, Some(condition));
                     }
-                    let active =
-                        region_active && owners.iter().any(|o| o.active[chain] != Some(false));
+                    let possibly_active = owners.iter().any(|o| o.active(chain) != Some(false));
                     stack.push(ChainState {
                         chain,
                         index: 0,
-                        branch_active: active,
-                        chosen: active,
-                        parent_active: region_active,
+                        branch: BranchState::opened(region_active, possibly_active),
                     });
                 }
                 "elif" | "else" => {
@@ -773,11 +842,9 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
                                 (keyword != "else").then_some(condition),
                             );
                         }
-                        let active = state.parent_active
-                            && !state.chosen
-                            && owners.iter().any(|o| o.active[state.chain] != Some(false));
-                        state.branch_active = active;
-                        state.chosen |= active;
+                        let possibly_active =
+                            owners.iter().any(|o| o.active(state.chain) != Some(false));
+                        state.branch = state.branch.next(possibly_active);
                     }
                 }
                 "endif" => {
@@ -821,11 +888,11 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
                     directive: keyword.to_owned(),
                     closing_directive: None,
                     definitely_inactive: owners.iter().all(|o| {
-                        o.active
+                        o.chains
                             .get(chain)
-                            .is_none_or(|active| *active == Some(false))
+                            .is_none_or(|state| state.active == Some(false))
                     }),
-                    kept: stack.last().is_some_and(|state| state.branch_active),
+                    kept: stack.last().is_some_and(|state| state.branch.emits()),
                 });
             }
         } else if region_active {
@@ -848,7 +915,6 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
         return PreprocessorScan {
             decisions,
             undecided_chains: Vec::new(),
-            has_unseen_branch: false,
             included_ranges: None,
             has_inactive_regions: false,
             branches,
@@ -882,11 +948,9 @@ fn scan_with_owners(source: &str, owners: &[&SymbolEnvironment]) -> Preprocessor
             })
         })
         .collect();
-    let has_unseen_branch = undecided_chains.iter().any(|chain| chain.omitted_nonblank);
     PreprocessorScan {
         decisions,
         undecided_chains,
-        has_unseen_branch,
         included_ranges: Some(build_ranges(bytes, &kept)),
         has_inactive_regions,
         branches,
@@ -1352,12 +1416,12 @@ mod tests {
         );
         assert_eq!(comment_only.undecided_chains.len(), 1);
         assert!(!comment_only.undecided_chains[0].omitted_nonblank);
-        assert!(!comment_only.has_unseen_branch);
+        assert!(!comment_only.has_unseen_branch());
         let code =
             scan_preprocessor("#if UNKNOWN\nint kept;\n#else\n// omitted\nint unseen;\n#endif\n");
         assert_eq!(code.undecided_chains.len(), 1);
         assert!(code.undecided_chains[0].omitted_nonblank);
-        assert!(code.has_unseen_branch);
+        assert!(code.has_unseen_branch());
     }
 
     #[test]

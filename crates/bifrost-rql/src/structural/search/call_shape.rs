@@ -22,7 +22,13 @@
 //! separates them.
 
 use super::*;
-use brokk_bifrost_core::analyzer::structural::callable::{CallKind, CallShapeCoverage};
+use crate::analyzer::resolution::ResolutionCompletion;
+use crate::analyzer::usages::get_definition::CallApplicationKind;
+use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
+use brokk_bifrost_core::analyzer::resolution_facts::ResolutionMemberKind;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallShapeCoverage, CalleeProvenance, CalleeProvenanceFact, CalleeTypeShape,
+};
 
 /// Derive call-shape expansions for one pipeline input position.
 ///
@@ -70,17 +76,37 @@ pub(super) fn call_shape_expansions_for_input(
             }
         },
     };
-    let call_id = known_node
-        .filter(|&node| facts.node(node).kind.satisfies(NormalizedKind::Call))
-        .map(|node| spawn_operand_call(&facts, node).unwrap_or(node))
-        .or_else(|| innermost_call_for_range(&facts, range));
-    let Some(call_id) = call_id else {
-        return Vec::new();
-    };
-    let Some(mut report) =
-        crate::analyzer::usages::call_shape::call_shape_for_call(&facts, file, call_id)
-    else {
-        return Vec::new();
+    // A selection that resolution admits as a parameterless call (#9479) is
+    // its own call site; it must not fall through to the call enclosing it.
+    let selection_call = known_node.filter(|&node| {
+        super::relations::selection_application_at(
+            analyzer,
+            file,
+            &facts,
+            node,
+            bindings,
+            cancellation,
+        ) == Some(super::super::matcher::SelectionApplication::Call)
+    });
+    let (call_id, mut report) = if let Some(selection) = selection_call {
+        (
+            selection,
+            crate::analyzer::usages::call_shape::selection_call_shape(&facts, file, selection),
+        )
+    } else {
+        let call_id = known_node
+            .filter(|&node| facts.node(node).kind.satisfies(NormalizedKind::Call))
+            .map(|node| spawn_operand_call(&facts, node).unwrap_or(node))
+            .or_else(|| innermost_call_for_range(&facts, range));
+        let Some(call_id) = call_id else {
+            return Vec::new();
+        };
+        let Some(report) =
+            crate::analyzer::usages::call_shape::call_shape_for_call(&facts, file, call_id)
+        else {
+            return Vec::new();
+        };
+        (call_id, report)
     };
     // Go's sole written call argument may supply several producer-proven
     // results. Reuse its ordinary persisted actuals, without consulting an
@@ -132,6 +158,72 @@ pub(super) fn call_shape_expansions_for_input(
                     && !class.provenance.ambiguous);
         if unique_source_class || unique_model_class {
             report.outcome.call_kind = CallKind::Constructor;
+        }
+    }
+    // Refine only undecided method provenance with the resolver's complete,
+    // closed declaration proof. The binding cache also replays query reads on hits.
+    if crate::analyzer::common::language_for_file(file) == Language::Rust
+        && report.outcome.coverage.is_exact()
+        && report.outcome.receiver_range.is_some()
+        && report
+            .outcome
+            .callee_provenance
+            .as_ref()
+            .is_some_and(|fact| fact.provenance == CalleeProvenance::Unknown)
+        && let Some(callee_range) = report.outcome.callee_range
+        && let Some(lookup) =
+            bindings.resolved_call_target(analyzer, file, callee_range, cancellation)
+        && lookup.outcome.status == DefinitionLookupStatus::Resolved
+        && lookup.outcome.diagnostics.is_empty()
+        && !lookup.truncated
+        && !lookup.structure_unavailable
+        && !lookup.unproven_link_unit
+        && cancellation.is_none_or(|token| !token.is_cancelled())
+        // Incumbent Rust supplies completeness through status and gap diagnostics;
+        // selected-native answers additionally carry an explicit completion.
+        && lookup
+            .native_resolution
+            .as_ref()
+            .is_none_or(|native| matches!(native.completion, ResolutionCompletion::Complete))
+        && lookup.call_application == CallApplicationKind::BoundReceiver
+        && lookup.dispatch_extensibility == Some(DispatchExtensibility::Closed)
+    {
+        let mut definitions = lookup.outcome.definitions;
+        definitions.sort();
+        definitions.dedup();
+        let source_method = lookup.outcome.modeled_definitions.is_empty()
+            && matches!(definitions.as_slice(), [definition]
+                if lookup.source_member_evidence.as_deref().is_some_and(|evidence|
+                    !evidence.is_empty() && evidence.iter().all(|member|
+                        member.definition == *definition
+                        && member.kind == ResolutionMemberKind::Method
+                        && member.call_application == CallApplicationKind::BoundReceiver)));
+        let external_method = definitions.is_empty()
+            && lookup.outcome.modeled_definitions.len() == 1
+            && lookup.exact_external_call.as_ref().is_some_and(|proof| {
+                proof.call_application() == CallApplicationKind::BoundReceiver
+                    && proof.dispatch_extensibility() == Some(DispatchExtensibility::Closed)
+            });
+        if (source_method || external_method)
+            && bindings.receiver_type_parameter_dependency(
+                analyzer,
+                file,
+                report.outcome.receiver_range.expect("receiver guarded"),
+            ) == crate::analyzer::languages::ReceiverTypeParameterDependency::No
+        {
+            debug_assert!(
+                report
+                    .outcome
+                    .callee_provenance
+                    .as_ref()
+                    .is_some_and(|fact| fact.provenance == CalleeProvenance::Unknown)
+            );
+            report.outcome.callee_provenance = Some(CalleeProvenanceFact {
+                provenance: CalleeProvenance::Declared,
+                supplier: None,
+                shape: CalleeTypeShape::Nominal,
+                bounds: Vec::new(),
+            });
         }
     }
     let outcome = &report.outcome;

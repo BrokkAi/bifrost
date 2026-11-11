@@ -22,13 +22,18 @@
 //! in a [`CompositionMemo`] the policy run holds across its composed batches.
 
 use super::taint_policy::language_intrinsic_call;
+use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::semantic::IntrinsicCall;
 use brokk_bifrost_analysis::analyzer::semantic::type_flow::file_for_locator;
+use brokk_bifrost_analysis::analyzer::workspace_authority::{
+    ReplayingMemo, ReplayingMemoEntry, memo_attribution,
+};
 use brokk_bifrost_rust_analysis::analyzer::rust::semantic::canonical_returned_field_member;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use brokk_bifrost_analysis::analyzer::languages::language_support_for_hook;
 use brokk_bifrost_analysis::analyzer::semantic::partial_flow::ports::call_port_values;
 use brokk_bifrost_analysis::analyzer::semantic::partial_flow::rules::{
     GuardEdgeKill, conditional_guard_edge_kills,
@@ -40,25 +45,32 @@ use brokk_bifrost_analysis::analyzer::semantic::partial_flow::{
     file_local_procedure_relations, observation_value,
 };
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::ProcedureOpenness;
+use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
+    ProcedureRangeLookupStatus, procedures_for_definition_with_limits,
+};
 use brokk_bifrost_analysis::analyzer::semantic::{
     BarrierObservation, CallArgumentEndpoint, CallInvocationMode, CallSiteHandle, CallSiteId,
     CallStorageRelationIndex, CandidateCoverage, DispatchBoundary, DispatchBoundaryKind,
-    DispatchResult, EvidenceCompleteness, LenientValueTypeBarriers, ObservationPhase,
-    OracleCallContext, ProcedureHandle, ProcedureInvocationKind, ProgramPointId, ProofStatus,
-    SemanticArtifactKey, SemanticExecutionBudget, SemanticOutcome, SemanticRequest,
-    StrictValueTypeBarriers, ValueFlowEndpoint, ValueTypeBarrierDecision, ValueTypeBarrierFilter,
-    ValueTypeBarrierReason, ValueTypePredicate,
+    DispatchOracle, DispatchResult, DurableCallContext, EvidenceCompleteness,
+    LenientValueTypeBarriers, ObservationPhase, OracleCallContext, ProcedureHandle,
+    ProcedureInvocationKind, ProgramPointId, ProofStatus, SemanticArtifactKey, SemanticCapability,
+    SemanticExecutionBudget, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticOutcome, SemanticRequest, StrictValueTypeBarriers, ValueFlowEndpoint,
+    ValueTypeBarrierDecision, ValueTypeBarrierFilter, ValueTypeBarrierReason, ValueTypePredicate,
 };
-use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_flow::composition::CallStructureProvider;
 use brokk_bifrost_flow::dataflow::{
     CuratedCallModel, ExternalSemanticSummarySet, SemanticInputStatus, SemanticProcedureSummary,
     SummaryEffect, SummaryEffectKey, SummaryExitKind, SummaryOrigin, SummaryPort, SummaryTransfer,
     UnmodeledCallBehavior,
 };
 use brokk_bifrost_flow::taint::compose::{
-    BoundSource, CallModel, Callers, Completeness, CompositionProvider, Dispatch, FallbackPorts,
-    HopQuality, InteriorFlows, InteriorObservation, InteriorSeed, ModelTransfer, Openness,
-    ProcedureEndpoints, StoreChannelLink, StoreChannelLinks, StoreWriteObservation,
+    BoundSource, CallModel, Callers, Completeness, CompositionProvider, Dispatch, ExecutionArm,
+    ExecutionCallableInstance, ExecutionDispatch, ExecutionDispatchOutcome,
+    ExecutionEndpointStatus, ExecutionEndpoints, ExecutionTarget, FallbackPorts, HopQuality,
+    InteriorFlows, InteriorObservation, InteriorSeed, InvocationSite, Invocations, ModelTransfer,
+    Openness, ProcedureEndpoints, StoreChannelLink, StoreChannelLinks, StoreWriteObservation,
     ValueTypeBarrierCheck, taint_model_kill,
 };
 use brokk_bifrost_flow::taint::{
@@ -75,11 +87,13 @@ use crate::resolved::ResolvedEndpointIdentity;
 use crate::taint_policy::{
     BoundExternalModel, CallResolutionDiscoveryEvidence, CompiledStoreEnd, CompiledTaintEndpoint,
     DiscoveryMaterializationCache, ExternalCallSeams, FrontierEndpoint, FrontierEndpointBinder,
-    FrontierSelector, PolicyDiscoveryProvider, RefusalNotice, SanitizerDecline,
+    FrontierGap, FrontierSelector, PolicyDiscoveryProvider, RefusalNotice, SanitizerDecline,
     TaintPolicyCompileError, UnjudgedSource, intrinsic_call_model,
     intrinsic_format_result_identity,
 };
 use crate::units::WidenReason;
+
+impl CallStructureProvider for PolicyDiscoveryProvider<'_, '_> {}
 
 #[derive(Default)]
 struct ProjectionCounter {
@@ -182,6 +196,12 @@ pub(crate) struct PolicyCompositionProvider<'a> {
     binder: RefCell<FrontierEndpointBinder<'a>>,
     /// The policy whose endpoints the binder matches, the memo's key.
     policy: PolicyId,
+    /// The frontier matches this provider's search consulted, whether the
+    /// run memo held them or this provider built them. The provider answers
+    /// one Output, so these are the only matches whose refusals the Output
+    /// depends on; the memo's other matches belong to Outputs that ran
+    /// before this one and must not leak into its product.
+    consulted_matches: RefCell<BTreeSet<ConsultedMatch>>,
     /// The run's frontier matches and dispatches, shared with the run's other
     /// batches.
     memo: &'a CompositionMemo,
@@ -204,6 +224,8 @@ pub(crate) struct PolicyCompositionProvider<'a> {
     excluded_callers: RefCell<Vec<(ProjectFile, brokk_bifrost_analysis::analyzer::Range)>>,
     store_writes: Vec<StoreWriteObservation>,
     store_links: HashMap<(DurableProcedureKey, PartialFlowPort), StoreChannelLinks>,
+    store_by_read: HashMap<(DurableProcedureKey, PartialFlowPort), HashSet<String>>,
+    consulted_stores: RefCell<HashSet<String>>,
     store_calls: HashSet<DurableCallSiteKey>,
 }
 
@@ -220,24 +242,462 @@ pub(crate) struct PolicyCompositionProvider<'a> {
 ///   and the model lookup read one answer, so a call is dispatched once per
 ///   policy run. A call's models depend on the policy (its bound external
 ///   models and label universe), so the answer is keyed by policy too.
-/// - Each call's Rust std builtin classification, which reads only the
-///   call's source and resolution and so is shared by every policy.
+/// - Each call's Rust std builtin classification, which reads the call's
+///   source and the workspace resolution of its method name and so is shared
+///   by every policy.
+///
+/// Every entry carries the reads of its own build. The unit that fills an
+/// entry records them as it builds; every later unit that hits the entry
+/// replays them, so the read set of a unit does not depend on which unit
+/// reached the shared entry first (#7262).
+type ExecutionDiscovery = (
+    Vec<brokk_bifrost_flow::taint::compose::ExecutionReach>,
+    Vec<brokk_bifrost_flow::taint::compose::Incompleteness>,
+);
+type ExecutionDiscoveryKey = (PolicyId, usize, usize, usize);
+type ExecutionDiscoveryEntry =
+    Arc<AdmittedMemoEntry<ReplayingMemoEntry<ExecutionDiscovery, ReadKey>>>;
+
 #[derive(Default)]
 pub(crate) struct CompositionMemo {
+    /// Execution-root discovery depends on the policy's label universe and
+    /// the composition limits, not on the anchors a search selects, so every
+    /// Output anchor of the policy run reads one answer.
+    execution: RefCell<HashMap<ExecutionDiscoveryKey, ExecutionDiscoveryEntry>>,
     matches:
-        RefCell<HashMap<(PolicyId, SemanticArtifactKey, FrontierSelector), Arc<FrontierMatch>>>,
-    widened: RefCell<HashMap<(PolicyId, FrontierSelector), Arc<WidenedRows>>>,
-    dispatches: RefCell<HashMap<(PolicyId, DurableCallSiteKey), Arc<MemoizedDispatch>>>,
-    std_builtins: RefCell<HashMap<DurableCallSiteKey, Option<IntrinsicCall>>>,
+        RefCell<HashMap<(PolicyId, SemanticArtifactKey, FrontierSelector), FrontierMatchEntry>>,
+    refusal_history: RefCell<HashMap<PolicyId, Vec<RefusalNotice>>>,
+    widened: RefCell<HashMap<(PolicyId, FrontierSelector), WidenedRowsEntry>>,
+    dispatches: RefCell<HashMap<(PolicyId, DurableCallSiteKey), Arc<DispatchEntry>>>,
+    std_builtins: RefCell<HashMap<DurableCallSiteKey, Arc<StdBuiltinEntry>>>,
     /// The evidence of each frontier matched-value source that reached a
     /// sink, by policy, endpoint and selected site. Judging one is a
     /// points-to question, so the run asks it once for a site however many
     /// batches report a flow from it.
-    evidence: RefCell<HashMap<EvidenceKey, HopQuality>>,
+    evidence: RefCell<HashMap<EvidenceKey, Arc<EvidenceEntry>>>,
+    /// Reads answered from a kept entry, per map, for the hit-path read
+    /// parity test.
+    hits: MemoHits,
+    /// The order test's handle for this run, if a test asked for one.
+    #[cfg(any(test, feature = "test-support"))]
+    order_probe: Option<crate::taint_policy::OutputOrderProbe>,
+}
+
+#[derive(Default)]
+struct MemoHits {
+    execution: Cell<u64>,
+    matches: Cell<u64>,
+    widened: Cell<u64>,
+    dispatches: Cell<u64>,
+    std_builtins: Cell<u64>,
+    evidence: Cell<u64>,
+}
+
+type DispatchEntry = AdmittedMemoEntry<ReplayingMemoEntry<MemoizedDispatch, ReadKey>>;
+type StdBuiltinEntry = ReplayingMemoEntry<Option<IntrinsicCall>, ReadKey>;
+type EvidenceEntry = AdmittedMemoEntry<ReplayingMemoEntry<HopQuality, ReadKey>>;
+
+type AdmittedReplayEntry<T> = Arc<AdmittedMemoEntry<ReplayingMemoEntry<T, ReadKey>>>;
+
+/// A cold fill's admission travels with its value, independently of read replay.
+pub(crate) struct AdmittedMemoEntry<T> {
+    value: Arc<T>,
+    admission: brokk_bifrost_analysis::analyzer::semantic::SemanticMemoAdmission,
+}
+impl<T> std::ops::Deref for AdmittedMemoEntry<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+/// Borrow the ledger only for capture/probe, never across the cold build.
+/// Rejected entries and borrowed handles close before the replacement fill.
+pub(crate) fn read_admitted<K: Eq + std::hash::Hash, T: Send + Sync + 'static, E>(
+    entries: &RefCell<HashMap<K, Arc<AdmittedMemoEntry<T>>>>,
+    key: K,
+    reacquirer: Option<&dyn brokk_bifrost_analysis::analyzer::semantic::MemoDependencyReacquirer>,
+    with_budget: impl Fn(
+        &mut dyn FnMut(&mut brokk_bifrost_analysis::analyzer::semantic::SemanticBudget),
+    ),
+    build: impl FnOnce() -> Result<T, E>,
+    keep: impl FnOnce(&T) -> bool,
+    hit: impl FnOnce(),
+) -> Result<Arc<AdmittedMemoEntry<T>>, E> {
+    let cached = entries.borrow().get(&key).cloned();
+    if let Some(entry) = cached {
+        let mut accepted = false;
+        with_budget(&mut |budget| {
+            accepted = budget
+                .admit_memo_hit_with(&entry.admission, reacquirer)
+                .is_ok()
+        });
+        if accepted {
+            hit();
+            return Ok(entry);
+        }
+        entries.borrow_mut().remove(&key);
+        drop(entry);
+    }
+    let mut before = None;
+    with_budget(&mut |budget| {
+        before = Some(budget.replay_snapshot());
+    });
+    let value = Arc::new(build()?);
+    let mut admission = None;
+    with_budget(&mut |budget| {
+        admission = Some(budget.memo_admission_since(before.as_ref().unwrap(), &value))
+    });
+    let entry = Arc::new(AdmittedMemoEntry {
+        value,
+        admission: admission.unwrap(),
+    });
+    if keep(&entry.value) {
+        entries.borrow_mut().insert(key, Arc::clone(&entry));
+    }
+    Ok(entry)
+}
+
+/// The entry of `entries` under `key`, built by `build` when absent and kept
+/// when `keep` accepts the built value. The build records its reads into the
+/// entry, and every read replays them into the current capture, whether this
+/// read built the entry or found it.
+fn read_shared<K: Eq + std::hash::Hash, V: Send + Sync + 'static, E>(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    entries: &RefCell<HashMap<K, AdmittedReplayEntry<V>>>,
+    hits: &Cell<u64>,
+    key: K,
+    with_budget: impl Fn(
+        &mut dyn FnMut(&mut brokk_bifrost_analysis::analyzer::semantic::SemanticBudget),
+    ),
+    build: impl FnOnce() -> Result<V, E>,
+    keep: impl FnOnce(&V) -> bool,
+) -> Result<impl std::ops::Deref<Target = V>, E> {
+    let capability = memo_attribution(analyzer);
+    ReplayingMemo::new(()).read(&capability, |_, capture| {
+        let entry = read_admitted(
+            entries,
+            key,
+            None,
+            with_budget,
+            || capture.try_build(build),
+            |entry| keep(entry.value()),
+            || hits.set(hits.get() + 1),
+        )?;
+        Ok(Arc::clone(&entry.value))
+    })
+}
+
+fn read_shared_unbudgeted<K: Eq + std::hash::Hash, V, E>(
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    entries: &RefCell<HashMap<K, Arc<ReplayingMemoEntry<V, ReadKey>>>>,
+    hits: &Cell<u64>,
+    key: K,
+    build: impl FnOnce() -> Result<V, E>,
+    keep: impl FnOnce(&V) -> bool,
+) -> Result<impl std::ops::Deref<Target = V>, E> {
+    let capability = memo_attribution(analyzer);
+    ReplayingMemo::new(()).read(&capability, |_, capture| {
+        if let Some(entry) = entries.borrow().get(&key) {
+            hits.set(hits.get() + 1);
+            return Ok(Arc::clone(entry));
+        }
+        let entry = Arc::new(capture.try_build(build)?);
+        if keep(entry.value()) {
+            entries.borrow_mut().insert(key, Arc::clone(&entry));
+        }
+        Ok(entry)
+    })
+}
+
+/// The refusals of `entries`, one notice per refused row. A verdict from a build
+/// that depended on its execution describes this run, not the recorded inputs,
+/// so it is operational. When two matches refuse the same row, the operational
+/// notice is the one kept: sorting puts it first, and de-duplication keeps the
+/// first of a run.
+fn merged_refusals<'m>(
+    entries: impl Iterator<Item = &'m FrontierMatchEntry>,
+) -> Vec<RefusalNotice> {
+    let mut messages = entries
+        .flat_map(|entry| {
+            let execution_dependent = entry.execution_dependent();
+            entry.value().refusals.iter().cloned().map(move |refusal| {
+                if execution_dependent {
+                    refusal.into_operational()
+                } else {
+                    refusal
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    normalize_refusals(&mut messages);
+    messages
+}
+
+fn normalize_refusals(messages: &mut Vec<RefusalNotice>) {
+    use brokk_bifrost_flow::taint::compose::IncompleteCause;
+    messages.sort_by(|left, right| {
+        left.message.cmp(&right.message).then_with(|| {
+            (left.cause() == IncompleteCause::Content)
+                .cmp(&(right.cause() == IncompleteCause::Content))
+        })
+    });
+    messages.dedup_by(|left, right| left.message == right.message);
+}
+
+impl CompositionMemo {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_order_probe(
+        mut self,
+        probe: Option<crate::taint_policy::OutputOrderProbe>,
+    ) -> Self {
+        self.order_probe = probe;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn order_probe(&self) -> Option<&crate::taint_policy::OutputOrderProbe> {
+        self.order_probe.as_ref()
+    }
+
+    /// Report-only history, independent of memo rollback and unit diagnostics.
+    pub(crate) fn run_refusal_messages(&self, policy: &PolicyId) -> Vec<RefusalNotice> {
+        self.refusal_history
+            .borrow()
+            .get(policy)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn record_refusals(&self, policy: &PolicyId, entry: &FrontierMatchEntry) {
+        let mut history = self.refusal_history.borrow_mut();
+        let notices = history.entry(policy.clone()).or_default();
+        notices.extend(merged_refusals(std::iter::once(entry)));
+        normalize_refusals(notices);
+    }
+
+    pub(crate) fn execution_discovery<E>(
+        &self,
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+        key: ExecutionDiscoveryKey,
+        with_budget: impl Fn(
+            &mut dyn FnMut(&mut brokk_bifrost_analysis::analyzer::semantic::SemanticBudget),
+        ),
+        build: impl FnOnce() -> Result<ExecutionDiscovery, E>,
+    ) -> Result<ExecutionDiscovery, E> {
+        // A discovery with an operational gap is not kept: another unit
+        // repeats it under its own budget and decides its own stop.
+        let result = read_shared(
+            analyzer,
+            &self.execution,
+            &self.hits.execution,
+            key,
+            with_budget,
+            build,
+            |discovery| {
+                !discovery.1.iter().any(|gap| {
+                    matches!(
+                        gap.cause(),
+                        brokk_bifrost_flow::taint::compose::IncompleteCause::Operational(_)
+                    )
+                })
+            },
+        )?;
+        Ok((*result).clone())
+    }
+
+    /// Retry overlays see only the charged entries present at batch entry.
+    /// Values are immutable replay receipts; cloning their Arcs preserves reads.
+    pub(crate) fn retry_overlay(&self, checkpoint: &ChargedEntriesCheckpoint) -> Self {
+        let overlay = Self {
+            execution: RefCell::new(self.execution.borrow().clone()),
+            matches: RefCell::new(self.matches.borrow().clone()),
+            widened: RefCell::new(self.widened.borrow().clone()),
+            dispatches: RefCell::new(self.dispatches.borrow().clone()),
+            evidence: RefCell::new(self.evidence.borrow().clone()),
+            std_builtins: RefCell::new(self.std_builtins.borrow().clone()),
+            #[cfg(any(test, feature = "test-support"))]
+            order_probe: self.order_probe.clone(),
+            ..Self::default()
+        };
+        overlay.restore_charged_entries(checkpoint);
+        overlay
+    }
+
+    pub(crate) fn merge_retry_history(&self, overlay: &Self) {
+        let mut history = self.refusal_history.borrow_mut();
+        for (policy, additions) in overlay.refusal_history.borrow().iter() {
+            let notices = history.entry(policy.clone()).or_default();
+            notices.extend(additions.iter().cloned());
+            normalize_refusals(notices);
+        }
+    }
+
+    /// Publish charged entries only after their unit completes. A stopped
+    /// overlay is dropped together with restoration of its budget checkpoint.
+    pub(crate) fn merge_retry_overlay(&self, overlay: Self) {
+        self.merge_retry_history(&overlay);
+        self.execution
+            .borrow_mut()
+            .extend(overlay.execution.into_inner());
+        self.matches
+            .borrow_mut()
+            .extend(overlay.matches.into_inner());
+        self.widened
+            .borrow_mut()
+            .extend(overlay.widened.into_inner());
+        self.dispatches
+            .borrow_mut()
+            .extend(overlay.dispatches.into_inner());
+        self.evidence
+            .borrow_mut()
+            .extend(overlay.evidence.into_inner());
+    }
+
+    /// The keys of `policy`'s entries whose hit skips a semantic charge. These
+    /// are the maps a search fills while it charges the run's budget; a hit
+    /// there lets a later search skip a charge a from-scratch run pays.
+    /// `std_builtins` is not one: it takes no budget. An earlier batch of the
+    /// same policy (its sinks split across root plans) may already hold
+    /// entries; a from-scratch run holds them too, so they stay.
+    pub(crate) fn charged_entries_checkpoint(&self, policy: &PolicyId) -> ChargedEntriesCheckpoint {
+        fn keys<K: Clone + Eq + std::hash::Hash, V>(
+            map: &RefCell<HashMap<K, V>>,
+            owner: impl Fn(&K) -> bool,
+        ) -> HashSet<K> {
+            map.borrow()
+                .keys()
+                .filter(|key| owner(key))
+                .cloned()
+                .collect()
+        }
+        ChargedEntriesCheckpoint {
+            policy: policy.clone(),
+            execution: keys(&self.execution, |key| &key.0 == policy),
+            matches: keys(&self.matches, |key| &key.0 == policy),
+            widened: keys(&self.widened, |key| &key.0 == policy),
+            dispatches: keys(&self.dispatches, |key| &key.0 == policy),
+            evidence: keys(&self.evidence, |key| &key.0 == policy),
+        }
+    }
+
+    /// Drop the entries of the checkpoint's policy that were added after it,
+    /// when the budget their charges were made against is restored. Entries
+    /// are only ever inserted, so this undoes the abandoned attempt exactly.
+    /// Reusing one would let the fallback skip a charge a from-scratch run
+    /// pays, and the ledger would then bill a later search for rows the
+    /// skipped one had already paid for (#10560).
+    pub(crate) fn restore_charged_entries(&self, checkpoint: &ChargedEntriesCheckpoint) {
+        let policy = &checkpoint.policy;
+        self.execution
+            .borrow_mut()
+            .retain(|key, _| &key.0 != policy || checkpoint.execution.contains(key));
+        self.matches
+            .borrow_mut()
+            .retain(|key, _| &key.0 != policy || checkpoint.matches.contains(key));
+        self.widened
+            .borrow_mut()
+            .retain(|key, _| &key.0 != policy || checkpoint.widened.contains(key));
+        self.dispatches
+            .borrow_mut()
+            .retain(|key, _| &key.0 != policy || checkpoint.dispatches.contains(key));
+        self.evidence
+            .borrow_mut()
+            .retain(|key, _| &key.0 != policy || checkpoint.evidence.contains(key));
+    }
+}
+
+/// One policy's charged memo keys at a point in the run; see
+/// [`CompositionMemo::charged_entries_checkpoint`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChargedEntriesCheckpoint {
+    policy: PolicyId,
+    execution: HashSet<ExecutionDiscoveryKey>,
+    matches: HashSet<(PolicyId, SemanticArtifactKey, FrontierSelector)>,
+    widened: HashSet<(PolicyId, FrontierSelector)>,
+    dispatches: HashSet<(PolicyId, DurableCallSiteKey)>,
+    evidence: HashSet<EvidenceKey>,
+}
+
+#[cfg(test)]
+impl PolicyCompositionProvider<'_> {
+    /// Plant a frontier match in the run memo, built by a capture that did or
+    /// did not depend on its execution.
+    pub(crate) fn plant_match_for_test(
+        &self,
+        artifact: &SemanticArtifactKey,
+        selector: FrontierSelector,
+        refusals: Vec<RefusalNotice>,
+        gaps: Vec<FrontierGap>,
+        execution_dependent: bool,
+    ) {
+        let capability = memo_attribution(self.workspace.analyzer());
+        let entry = ReplayingMemoEntry::capture(&capability, || {
+            if execution_dependent {
+                self.workspace.analyzer().mark_execution_dependent();
+            }
+            Arc::new(FrontierMatch {
+                by_procedure: HashMap::new(),
+                gaps,
+                file_slice_executed: true,
+                refusals,
+            })
+        });
+        let entry = Arc::new(entry);
+        let mut binder = self.binder.borrow_mut();
+        let budget = binder.semantic_budget();
+        let before = budget.replay_snapshot();
+        let admission = budget.memo_admission_since(&before, &entry);
+        let entry = Arc::new(AdmittedMemoEntry {
+            value: entry,
+            admission,
+        });
+        self.memo.record_refusals(&self.policy, &entry);
+        self.memo
+            .matches
+            .borrow_mut()
+            .insert((self.policy.clone(), artifact.clone(), selector), entry);
+    }
+
+    /// Record that this provider's search consulted a planted match.
+    pub(crate) fn consult_for_test(
+        &self,
+        artifact: &SemanticArtifactKey,
+        selector: FrontierSelector,
+    ) {
+        self.consulted_matches
+            .borrow_mut()
+            .insert((artifact.clone(), selector));
+    }
+
+    /// The gaps a consult of a planted match sees.
+    pub(crate) fn consulted_gaps_for_test(
+        &self,
+        artifact: &SemanticArtifactKey,
+        selector: FrontierSelector,
+    ) -> Vec<FrontierGap> {
+        let (matched, execution_dependent) = self
+            .frontier_match(artifact, selector)
+            .expect("a planted match is served from the memo");
+        matched.gaps_for(execution_dependent).collect()
+    }
 }
 
 #[cfg(test)]
 impl CompositionMemo {
+    /// Each map's name and its count of reads answered from a kept entry.
+    pub(crate) fn hit_counts_for_test(&self) -> [(&'static str, u64); 6] {
+        let hits = &self.hits;
+        [
+            ("execution", hits.execution.get()),
+            ("matches", hits.matches.get()),
+            ("widened", hits.widened.get()),
+            ("dispatches", hits.dispatches.get()),
+            ("std_builtins", hits.std_builtins.get()),
+            ("evidence", hits.evidence.get()),
+        ]
+    }
+
     pub(crate) fn dispatch_calls_for_test(&self) -> Vec<DurableCallSiteKey> {
         self.dispatches
             .borrow()
@@ -266,19 +726,43 @@ type EvidenceKey = (
     usize,
 );
 
+/// One frontier match as a provider consults it: the blob and the selector.
+/// The policy is the provider's own.
+type ConsultedMatch = (SemanticArtifactKey, FrontierSelector);
+
+/// A frontier match and the reads of its own build. A widened selection's
+/// reads stay in its own [`WidenedRowsEntry`], shared by every blob.
+type FrontierMatchEntry = Arc<AdmittedMemoEntry<ReplayingMemoEntry<Arc<FrontierMatch>, ReadKey>>>;
+type WidenedRowsEntry = Arc<AdmittedMemoEntry<ReplayingMemoEntry<Arc<WidenedRows>, ReadKey>>>;
+
 /// What one selector bound in one blob.
 struct FrontierMatch {
     by_procedure: HashMap<DurableProcedureKey, Vec<FrontierEndpoint>>,
-    gaps: Vec<String>,
+    gaps: Vec<FrontierGap>,
+    file_slice_executed: bool,
     /// Per-row refusals must survive an earlier first-cause diagnostic.
     refusals: Vec<RefusalNotice>,
+}
+
+impl FrontierMatch {
+    /// The match's gaps as one consult sees them. A match built by an
+    /// execution-dependent capture certifies nothing about a refused row.
+    fn gaps_for(&self, execution_dependent: bool) -> impl Iterator<Item = FrontierGap> + '_ {
+        self.gaps.iter().cloned().map(move |gap| {
+            if execution_dependent {
+                gap.into_operational()
+            } else {
+                gap
+            }
+        })
+    }
 }
 
 /// One unsliceable selector's workspace-wide rows by file, and the reasons
 /// its evaluation may have missed a row.
 struct WidenedRows {
     by_file: HashMap<ProjectFile, Vec<crate::taint_policy::SelectedSite>>,
-    gaps: Vec<String>,
+    gaps: Vec<FrontierGap>,
 }
 
 /// One dispatched call as the composition's diagnostics need it.
@@ -449,6 +933,7 @@ impl<'a> PolicyCompositionProvider<'a> {
             dispatched: RefCell::new(HashMap::new()),
             dispatch_boundaries: RefCell::new(Vec::new()),
             policy: binder.policy_id().clone(),
+            consulted_matches: RefCell::new(BTreeSet::new()),
             binder: RefCell::new(binder),
             memo,
             endpoint_evaluations: Cell::new(0),
@@ -459,6 +944,8 @@ impl<'a> PolicyCompositionProvider<'a> {
             excluded_callers: RefCell::new(Vec::new()),
             store_writes: Vec::new(),
             store_links: HashMap::new(),
+            store_by_read: HashMap::new(),
+            consulted_stores: RefCell::new(HashSet::new()),
             store_calls: HashSet::new(),
         }
     }
@@ -497,6 +984,10 @@ impl<'a> PolicyCompositionProvider<'a> {
                 brokk_bifrost_flow::composition::result_port(row, read.call.id(), value.id())
                     .expect("a bound store read output is a call result");
             let key = (read.call.procedure().durable_key(), output);
+            self.store_by_read
+                .entry(key.clone())
+                .or_default()
+                .insert(read.channel.store().to_owned());
             let answer = self.store_links.entry(key).or_default();
             if !matches!(read.proof, ProofStatus::Proven)
                 || !matches!(read.completeness, EvidenceCompleteness::Complete)
@@ -515,6 +1006,16 @@ impl<'a> PolicyCompositionProvider<'a> {
                         write: index,
                         write_call: write.call.durable_key(),
                         read_call: read.call.durable_key(),
+                        write_site: write
+                            .call
+                            .locator()
+                            .expect("a selected store write call has a locator")
+                            .clone(),
+                        read_site: read
+                            .call
+                            .locator()
+                            .expect("a selected store read call has a locator")
+                            .clone(),
                         read_origin: brokk_bifrost_flow::taint::SourceEventKey::new(
                             read.event.clone(),
                         ),
@@ -571,59 +1072,136 @@ impl<'a> PolicyCompositionProvider<'a> {
         self.frontier_sources.borrow().clone()
     }
 
+    pub(crate) fn frontier_source_count(&self) -> usize {
+        self.frontier_sources.borrow().len()
+    }
+
+    /// Stores whose read outputs the current anchor search consulted, even
+    /// when no writer reached that read and the anchor stayed clean.
+    pub(crate) fn consulted_stores(&self) -> Vec<String> {
+        let mut stores = self
+            .consulted_stores
+            .borrow()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        stores.sort();
+        stores
+    }
+
     /// What `selector` bound in the blob `artifact`, evaluated once per blob
     /// in the run: sliced to the blob when the selector's query allows it,
-    /// otherwise from the selector's workspace-wide rows of that file.
+    /// otherwise from the selector's workspace-wide rows of that file. The flag
+    /// is whether the build of the match depended on its execution; if it did,
+    /// no refusal or refusal-derived gap in the match is content.
     fn frontier_match(
         &self,
         artifact: &SemanticArtifactKey,
         selector: FrontierSelector,
-    ) -> Result<Arc<FrontierMatch>, TaintPolicyCompileError> {
+    ) -> Result<(Arc<FrontierMatch>, bool), TaintPolicyCompileError> {
+        // Record the consult before the memo lookup: a hit and a build both
+        // make this Output depend on the match, and the entry replays the
+        // reads of its build into this Output's capture either way.
+        self.consulted_matches
+            .borrow_mut()
+            .insert((artifact.clone(), selector));
         let key = (self.policy.clone(), artifact.clone(), selector);
-        if let Some(matched) = self.memo.matches.borrow().get(&key) {
-            return Ok(Arc::clone(matched));
-        }
+        let capability = memo_attribution(self.workspace.analyzer());
+        // A widened selection is one workspace answer for every blob. Read it
+        // outside the per-blob entry: each use replays the shared entry's reads
+        // into the current capture, and no blob entry retains a copy of them.
+        let reason = self.binder.borrow().widen_reason(selector)?;
+        let widened = reason
+            .map(|reason| self.widened_rows(selector, reason))
+            .transpose()?;
+        let mut execution_dependent = false;
+        let result = ReplayingMemo::new(()).read(&capability, |_, capture| {
+            let entry = read_admitted(
+                &self.memo.matches,
+                key,
+                None,
+                |f| f(self.binder.borrow_mut().semantic_budget()),
+                || {
+                    capture.try_build(|| {
+                        self.build_frontier_match(artifact, selector, widened.as_ref())
+                    })
+                },
+                |_| true,
+                || self.memo.hits.matches.set(self.memo.hits.matches.get() + 1),
+            )?;
+            execution_dependent = entry.execution_dependent();
+            self.memo.record_refusals(&self.policy, &entry);
+            Ok::<_, TaintPolicyCompileError>(Arc::clone(&entry.value))
+        })?;
+        Ok((Arc::clone(&result), execution_dependent))
+    }
+
+    /// The selector's workspace-wide rows, evaluated once per policy run. The
+    /// read replays the shared entry's reads into the current capture.
+    fn widened_rows(
+        &self,
+        selector: FrontierSelector,
+        reason: crate::units::WidenReason,
+    ) -> Result<Arc<WidenedRows>, TaintPolicyCompileError> {
+        let widened_key = (self.policy.clone(), selector);
+        let capability = memo_attribution(self.workspace.analyzer());
+        ReplayingMemo::new(())
+            .read(&capability, |_, capture| {
+                let entry = read_admitted(
+                    &self.memo.widened,
+                    widened_key,
+                    None,
+                    |f| f(self.binder.borrow_mut().semantic_budget()),
+                    || {
+                        capture.try_build(|| {
+                            let mut binder = self.binder.borrow_mut();
+                            self.endpoint_widened.borrow_mut().push((selector, reason));
+                            let _timing = brokk_bifrost_analysis::profiling::scope(
+                                "taint.compose.endpoints.widened",
+                            );
+                            let mut by_file: HashMap<ProjectFile, Vec<_>> = HashMap::new();
+                            for site in binder.select_workspace(selector)? {
+                                by_file.entry(site.file.clone()).or_default().push(site);
+                            }
+                            // Gaps of the one workspace-wide evaluation belong
+                            // to every blob it answers.
+                            let gaps = binder.bind(selector, Vec::new())?.gaps;
+                            Ok::<_, TaintPolicyCompileError>(Arc::new(WidenedRows {
+                                by_file,
+                                gaps,
+                            }))
+                        })
+                    },
+                    |_| true,
+                    || self.memo.hits.widened.set(self.memo.hits.widened.get() + 1),
+                )?;
+                Ok(Arc::clone(&entry.value))
+            })
+            .map(|rows| Arc::clone(&rows))
+    }
+
+    fn build_frontier_match(
+        &self,
+        artifact: &SemanticArtifactKey,
+        selector: FrontierSelector,
+        widened: Option<&Arc<WidenedRows>>,
+    ) -> Result<Arc<FrontierMatch>, TaintPolicyCompileError> {
         let root = self.workspace.analyzer().project().root();
         let file = ProjectFile::new(root.to_path_buf(), artifact.path().as_path());
         let mut binder = self.binder.borrow_mut();
-        let (sites, mut gaps) = match binder.widen_reason(selector)? {
+        let (sites, mut gaps, file_slice_executed) = match widened {
             None => {
                 self.endpoint_evaluations
                     .set(self.endpoint_evaluations.get() + 1);
                 let _timing =
                     brokk_bifrost_analysis::profiling::scope("taint.compose.endpoints.select");
-                (binder.select_in_file(selector, &file)?, Vec::new())
+                (binder.select_in_file(selector, &file)?, Vec::new(), true)
             }
-            Some(reason) => {
-                let widened_key = (self.policy.clone(), selector);
-                let cached = self.memo.widened.borrow().get(&widened_key).cloned();
-                let rows = match cached {
-                    Some(rows) => rows,
-                    None => {
-                        self.endpoint_widened.borrow_mut().push((selector, reason));
-                        let _timing = brokk_bifrost_analysis::profiling::scope(
-                            "taint.compose.endpoints.widened",
-                        );
-                        let mut by_file: HashMap<ProjectFile, Vec<_>> = HashMap::new();
-                        for site in binder.select_workspace(selector)? {
-                            by_file.entry(site.file.clone()).or_default().push(site);
-                        }
-                        // Gaps of the one workspace-wide evaluation belong
-                        // to every blob it answers.
-                        let gaps = binder.bind(selector, Vec::new())?.gaps;
-                        let rows = Arc::new(WidenedRows { by_file, gaps });
-                        self.memo
-                            .widened
-                            .borrow_mut()
-                            .insert(widened_key, Arc::clone(&rows));
-                        rows
-                    }
-                };
-                (
-                    rows.by_file.get(&file).cloned().unwrap_or_default(),
-                    rows.gaps.clone(),
-                )
-            }
+            Some(rows) => (
+                rows.by_file.get(&file).cloned().unwrap_or_default(),
+                rows.gaps.clone(),
+                false,
+            ),
         };
         let bound = {
             let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.endpoints.bind");
@@ -640,30 +1218,57 @@ impl<'a> PolicyCompositionProvider<'a> {
         let matched = Arc::new(FrontierMatch {
             by_procedure,
             gaps,
+            file_slice_executed,
             refusals: bound.refusals,
         });
-        self.memo
-            .matches
-            .borrow_mut()
-            .insert(key, Arc::clone(&matched));
         Ok(matched)
     }
 
-    /// Every refused frontier row of this policy, including cached matches
-    /// served by earlier batches. The run retains them independently of its
-    /// first path-relevant incompleteness (#4919).
+    /// Refusals of this search only, including on the fresh projection path.
     pub(crate) fn refusal_messages(&self) -> Vec<RefusalNotice> {
-        let mut messages = self
-            .memo
+        self.consulted_refusal_messages()
+    }
+
+    /// The refusals of the frontier matches this provider's search consulted:
+    /// the rows of the blobs and selectors one Output depends on, however the
+    /// run memo came to hold them. Unlike [`Self::refusal_messages`] the answer
+    /// is the same whichever Outputs of the run were computed first.
+    pub(crate) fn consulted_refusal_messages(&self) -> Vec<RefusalNotice> {
+        let matches = self.memo.matches.borrow();
+        merged_refusals(self.consulted_matches.borrow().iter().filter_map(
+            |(artifact, selector)| matches.get(&(self.policy.clone(), artifact.clone(), *selector)),
+        ))
+    }
+
+    /// Observed source-selector evaluations, including those served by the run memo.
+    pub(crate) fn source_gap_observations(&self) -> Vec<(usize, String, bool, Vec<String>)> {
+        self.memo
             .matches
             .borrow()
             .iter()
-            .filter(|((policy, _, _), _)| policy == &self.policy)
-            .flat_map(|(_, matched)| matched.refusals.iter().cloned())
-            .collect::<Vec<_>>();
-        messages.sort_by(|left, right| left.message.cmp(&right.message));
-        messages.dedup_by(|left, right| left.message == right.message);
-        messages
+            .filter_map(|((policy, artifact, selector), matched)| {
+                let super::taint_policy::FrontierSelector::Source(index) = selector else {
+                    return None;
+                };
+                (policy == &self.policy).then(|| {
+                    (
+                        *index,
+                        artifact
+                            .path()
+                            .as_path()
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                        matched.value().file_slice_executed,
+                        matched
+                            .value()
+                            .gaps
+                            .iter()
+                            .map(|gap| gap.message.clone())
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// The partial-flow answers so far: `(read from the store, computed at
@@ -727,6 +1332,12 @@ impl<'a> PolicyCompositionProvider<'a> {
     /// The first failure this provider hit.
     pub(crate) fn failure(&self) -> Option<TaintPolicyCompileError> {
         self.discovery.poisoned()
+    }
+
+    /// The semantic budget refusal behind [`Self::failure`], when the first
+    /// failure was one.
+    pub(crate) fn discovery_stop(&self) -> Option<crate::taint_policy::DiscoveryStop> {
+        self.discovery.stop()
     }
 
     /// The live handle of a procedure whose flows this provider served. Its
@@ -891,23 +1502,68 @@ impl brokk_bifrost_flow::composition::CallModelSource for PolicyCompositionProvi
             // A selected store end replaces this call's value transfer.
             return Ok(brokk_bifrost_flow::composition::CallModelDecision {
                 model: Some(CallModel {
+                    summary: None,
+                    summary_target: None,
                     transfers: Vec::new(),
+                    writeback: Box::default(),
+                    receiver_reads: Box::default(),
                     proven: true,
                     completeness: Completeness::Complete,
+                    retains_dispatch: false,
                     authored: None,
                 }),
                 continuation: HopQuality::CERTAIN,
             });
         }
         let models = self.call_models(call, answer)?;
+        // Use the ordinary summary-to-call-model application for each
+        // adjustment, with its return bound to the original receiver port.
+        // All admitted records are complete Identity summaries. Fold only the
+        // resulting proven identity self-transfer; keeping it as a receiver
+        // write would incorrectly manufacture a mutation for a read-only view.
+        if let Some(summaries) = &models.summaries {
+            for step in summaries.receiver_adjustments_for_call(call) {
+                let summary = summaries
+                    .summary_for(&step.summary_locator())
+                    .ok_or_else(|| {
+                        TaintPolicyCompileError::Model(
+                            "receiver adjustment lost its bound summary".to_owned(),
+                        )
+                    })?;
+                let projected = call_model(
+                    call,
+                    summary.transfers(),
+                    summary.effects(),
+                    SummaryCallBinding::receiver_adjustment(),
+                    true,
+                    None,
+                    self.plan.universe(),
+                );
+                // Ordinary model rows retain authored (not derived) proof
+                // status. The selected complete std contract authorizes this
+                // adjustment; do not promote its transfer evidence to Proven.
+                if !projected.completeness.is_complete()
+                    || !matches!(projected.transfers.as_slice(), [transfer]
+                        if transfer.actual == transfer.output
+                            && transfer.function == taint_model_kill(self.plan.universe(), &[]))
+                {
+                    return Err(TaintPolicyCompileError::Model(
+                        "receiver adjustment is not a complete identity self-transfer".to_owned(),
+                    ));
+                }
+            }
+        }
+        let model = covering_model(
+            &models,
+            call,
+            answer.available_value(),
+            self.plan.universe(),
+        );
+        let continuation =
+            continuation_quality(&models, model.as_ref(), call, answer.available_value());
         Ok(brokk_bifrost_flow::composition::CallModelDecision {
-            continuation: continuation_quality(&models, call, answer.available_value()),
-            model: covering_model(
-                &models,
-                call,
-                answer.available_value(),
-                self.plan.universe(),
-            ),
+            continuation,
+            model,
         })
     }
 
@@ -923,19 +1579,19 @@ impl brokk_bifrost_flow::composition::CallModelSource for PolicyCompositionProvi
             answer.available_value(),
             self.plan.universe(),
         )
-        .is_some())
+        .is_some_and(|model| !model.retains_dispatch))
     }
 }
 
 impl brokk_bifrost_flow::composition::LocalOpennessClient<PolicyDiscoveryProvider<'_, '_>>
     for PolicyCompositionProvider<'_>
 {
-    fn relations_complete(
+    fn relations_head(
         &self,
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, TaintPolicyCompileError> {
-        Ok(self.partial_flows(procedure, request)?.relations_complete)
+    ) -> Result<Arc<ProcedurePartialFlows>, TaintPolicyCompileError> {
+        self.partial_flows(procedure, request)
     }
 
     fn openness_sweep(
@@ -947,15 +1603,12 @@ impl brokk_bifrost_flow::composition::LocalOpennessClient<PolicyDiscoveryProvide
         self.openness_sweep(procedure, handle, request)
     }
 
-    fn dispatch_complete(
+    fn dispatch_completeness(
         &self,
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, TaintPolicyCompileError> {
-        Ok(matches!(
-            self.dispatch(call, request)?.completeness,
-            Completeness::Complete
-        ))
+    ) -> Result<Completeness, TaintPolicyCompileError> {
+        Ok(self.dispatch(call, request)?.0.completeness)
     }
 }
 
@@ -963,6 +1616,297 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
     type Error = TaintPolicyCompileError;
     type Fact = TaintClassSet;
     type Function = TaintEdgeFunction;
+
+    fn execution_discovery<E>(
+        &self,
+        budget: brokk_bifrost_flow::taint::compose::CompositionBudget,
+        request: &mut SemanticRequest<'_>,
+        build: impl FnOnce(
+            &mut SemanticRequest<'_>,
+        ) -> Result<
+            (
+                Vec<brokk_bifrost_flow::taint::compose::ExecutionReach>,
+                Vec<brokk_bifrost_flow::taint::compose::Incompleteness>,
+            ),
+            E,
+        >,
+    ) -> Result<ExecutionDiscovery, E> {
+        let key = (
+            self.policy.clone(),
+            budget.max_procedures,
+            budget.max_hops,
+            budget.max_callers_per_procedure,
+        );
+        let request = RefCell::new(request);
+        self.memo.execution_discovery(
+            self.workspace.analyzer(),
+            key,
+            |f| f(request.borrow_mut().budget),
+            || build(&mut request.borrow_mut()),
+        )
+    }
+
+    fn admitted_execution_roots(
+        &self,
+        max_examined: usize,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<brokk_bifrost_flow::taint::compose::ExecutionRootInventory, Self::Error> {
+        let (roots, causes) =
+            PolicyCompositionProvider::admitted_execution_roots(self, max_examined, request)?;
+        Ok(brokk_bifrost_flow::taint::compose::ExecutionRootInventory {
+            roots,
+            coverage: if causes.is_empty() {
+                Completeness::Complete
+            } else {
+                Completeness::operational(
+                    brokk_bifrost_flow::taint::compose::OperationalCause::Provider,
+                    causes.join("; "),
+                )
+            },
+        })
+    }
+
+    fn invocations(
+        &self,
+        procedure: &DurableProcedureKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Invocations, Self::Error> {
+        let handle = self.procedure(procedure, request)?;
+        let semantics = handle.semantics();
+        let mut reasons = Vec::new();
+        for capability in [SemanticCapability::Procedures, SemanticCapability::Calls] {
+            if !handle.artifact().capabilities().is_available(capability) {
+                reasons.push(format!("unavailable execution capability {capability:?}"));
+            }
+        }
+        // A gap the lowering left because it ran out of budget is a budget
+        // stop: a larger budget can lower the body fully.
+        let mut budget_gap = false;
+        for gap in semantics.gaps() {
+            if (gap.capability == SemanticCapability::Calls
+                && !matches!(gap.subject, SemanticGapSubject::CallSite(_)))
+                || gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+            {
+                budget_gap |= gap.kind == SemanticGapKind::ExceededBudget;
+                reasons.push(format!(
+                    "execution gap at point {:?}: capability {:?}, kind {:?}",
+                    gap.point, gap.capability, gap.kind
+                ));
+            }
+        }
+        reasons.sort();
+        // This is an inventory of body-owned calls, not lexical children.
+        // The finite cap also bounds one provider answer before the search
+        // applies its total hop budget.
+        const MAX_INVOCATIONS: usize = 512;
+        if semantics.call_sites().len() > MAX_INVOCATIONS {
+            reasons.push("execution invocation inventory exceeded 512 calls".to_owned());
+        }
+        let sites = semantics
+            .call_sites()
+            .iter()
+            .take(MAX_INVOCATIONS)
+            .map(|call| InvocationSite {
+                call: (procedure.clone(), call.id),
+                source_site: call.id,
+                mode: call.invocation_mode,
+            })
+            .collect();
+        Ok(Invocations {
+            sites,
+            coverage: if reasons.is_empty() {
+                Completeness::Complete
+            } else {
+                if semantics.call_sites().len() > MAX_INVOCATIONS {
+                    Completeness::operational(
+                        brokk_bifrost_flow::taint::compose::OperationalCause::Budget(
+                            brokk_bifrost_flow::taint::compose::BudgetLane::Hops,
+                        ),
+                        format!("{reasons:?}"),
+                    )
+                } else if budget_gap {
+                    Completeness::operational(
+                        brokk_bifrost_flow::taint::compose::OperationalCause::Budget(
+                            brokk_bifrost_flow::taint::compose::BudgetLane::Semantic,
+                        ),
+                        format!("{reasons:?}"),
+                    )
+                } else {
+                    Completeness::content(format!("{reasons:?}"))
+                }
+            },
+        })
+    }
+
+    fn execution_dispatch(
+        &self,
+        call: &DurableCallSiteKey,
+        incoming: Option<&brokk_bifrost_flow::taint::compose::ExecutionArmContext>,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionDispatch<Self::Function>, Self::Error> {
+        let oracle = self.workspace.semantic_oracle_provider();
+        let mut prior_calls = Vec::new();
+        if let Some(incoming) = incoming {
+            for step in incoming.certificate.prefix.iter() {
+                let owner = self.procedure(&step.call.0, request)?;
+                prior_calls.push(
+                    owner
+                        .call_site_handle(step.call.1)
+                        .expect("an execution prefix names an existing call"),
+                );
+            }
+        }
+        let context = OracleCallContext::bounded(prior_calls, *oracle.limits());
+        let (site, answer) = if incoming.is_some() {
+            let handle = self.procedure(&call.0, request)?;
+            let site = handle
+                .call_site_handle(call.1)
+                .expect("an invocation row belongs to its procedure");
+            let answer = oracle
+                .resolve_call_in_context(&site, &context, request)
+                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
+            (site, answer)
+        } else {
+            let raw = CallStructureProvider::dispatch(&self.discovery, call, request)?;
+            (raw.handle, raw.answer)
+        };
+        let handle = site.procedure().clone();
+        let row = handle
+            .semantics()
+            .call_site(call.1)
+            .expect("an invocation row belongs to its procedure");
+        let result = answer.available_value();
+        let coverage = result.map_or(CandidateCoverage::Open, |result| result.coverage());
+        // A singleton complete target set is a restriction of this
+        // invocation certificate, not a claim about existential paths in
+        // general. Unresolved and multiple-arm dispatches remain open.
+        let candidate = result.and_then(|result| {
+            if !answer.is_complete()
+                || result.coverage() != CandidateCoverage::Exhaustive
+                || !result.boundaries().is_empty()
+            {
+                return None;
+            }
+            let [candidate] = result.candidates() else {
+                return None;
+            };
+            (candidate.proof() == &ProofStatus::Proven
+                && candidate.completeness() == &EvidenceCompleteness::Complete)
+                .then_some(candidate)
+        });
+        // A budget or cancellation stop while proving the callable instance
+        // is operational too; without it the arm would look complete.
+        let mut instance_stop = None;
+        let instance = if let Some(candidate) = candidate
+            && candidate.target().semantics().lexical_parent().is_some()
+        {
+            if let Some(returned) = result.and_then(DispatchResult::returned_callable)
+                && returned.closure().durable_key() == candidate.target().durable_key()
+            {
+                Some(ExecutionCallableInstance {
+                    producer: returned.producer_callee().durable_key(),
+                    creation_point: returned.creation_point(),
+                    creation_event_index: returned.creation_event_index(),
+                    creation_value: returned.creation_value(),
+                    capture_bindings: returned.capture_bindings().into(),
+                    factory_call: Some(returned.producer().durable_key()),
+                })
+            } else {
+                let local = self
+                    .workspace
+                    .semantic_oracle_provider()
+                    .local_callable_target(&handle, row.callee, request)
+                    .map_err(|error| {
+                        TaintPolicyCompileError::SemanticProvider(error.to_string())
+                    })?;
+                match local {
+                    SemanticOutcome::Complete {
+                        value: Some(local), ..
+                    } if local.closure.durable_key() == candidate.target().durable_key() => {
+                        Some(ExecutionCallableInstance {
+                            producer: handle.durable_key(),
+                            creation_point: local.creation_point,
+                            creation_event_index: local.creation_event_index,
+                            creation_value: local.creation.id(),
+                            capture_bindings: local.capture_bindings,
+                            factory_call: None,
+                        })
+                    }
+                    SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                        instance_stop = Some(ExecutionDispatchOutcome::Budget(
+                            format!("{exceeded:?}").into(),
+                        ));
+                        None
+                    }
+                    SemanticOutcome::Cancelled { .. } => {
+                        instance_stop = Some(ExecutionDispatchOutcome::Cancelled(
+                            "callable instance lookup cancelled".into(),
+                        ));
+                        None
+                    }
+                    _ => None,
+                }
+            }
+        } else {
+            None
+        };
+        Ok(ExecutionDispatch {
+            arms: candidate
+                .map(|candidate| ExecutionArm {
+                    target: ExecutionTarget::Procedure(Box::new(candidate.target().durable_key())),
+                    function: TaintEdgeFunction::identity(self.plan.universe()),
+                    quality: HopQuality::CERTAIN,
+                    timing: row.execution_timing,
+                    instance,
+                    context: DurableCallContext::of(&context)
+                        .expect("a resolved call context has a durable identity"),
+                })
+                .into_iter()
+                .collect(),
+            residuals: result
+                .into_iter()
+                .flat_map(|result| {
+                    result
+                        .boundaries()
+                        .iter()
+                        .map(|boundary| boundary.kind.clone())
+                })
+                .collect(),
+            coverage,
+            // A budget or cancellation stop in call resolution is operational,
+            // even when it left no truncated candidate set behind.
+            outcome: match &answer {
+                SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                    ExecutionDispatchOutcome::Budget(format!("{exceeded:?}").into())
+                }
+                SemanticOutcome::Cancelled { .. } => {
+                    ExecutionDispatchOutcome::Cancelled("call resolution cancelled".into())
+                }
+                _ => instance_stop.unwrap_or_else(|| {
+                    if candidate.is_some() {
+                        ExecutionDispatchOutcome::Complete
+                    } else {
+                        ExecutionDispatchOutcome::Unsupported(
+                            "no exact singleton invocation".into(),
+                        )
+                    }
+                }),
+            },
+        })
+    }
+
+    fn execution_endpoints(
+        &self,
+        _target: &ExecutionTarget,
+        _incoming: Option<&brokk_bifrost_flow::taint::compose::ExecutionArmContext>,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionEndpoints<Self::Fact>, Self::Error> {
+        Ok(ExecutionEndpoints {
+            sources: Vec::new(),
+            status: ExecutionEndpointStatus::Absent,
+            covers_overrides: false,
+        })
+    }
 
     fn store_writes(&self) -> Vec<StoreWriteObservation> {
         self.store_writes.clone()
@@ -973,10 +1917,13 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         procedure: &DurableProcedureKey,
         output: &PartialFlowPort,
     ) -> StoreChannelLinks {
-        self.store_links
-            .get(&(procedure.clone(), output.clone()))
-            .cloned()
-            .unwrap_or_default()
+        let key = (procedure.clone(), output.clone());
+        if let Some(stores) = self.store_by_read.get(&key) {
+            self.consulted_stores
+                .borrow_mut()
+                .extend(stores.iter().cloned());
+        }
+        self.store_links.get(&key).cloned().unwrap_or_default()
     }
 
     fn canonical_returned_field(
@@ -1040,6 +1987,16 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             .semantics()
             .call_site(call)
             .expect("a call belongs to its procedure");
+        // An addressable receiver may be passed by address even when its
+        // value alone looks isolated. The selected callee binding decides
+        // whether it is a reference or a copy after dispatch.
+        if call
+            .member_selection
+            .as_ref()
+            .is_some_and(|selection| selection.receiver_place.is_some())
+        {
+            return Ok(true);
+        }
         Ok(call
             .receiver
             .into_iter()
@@ -1056,6 +2013,179 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                     &index,
                 ) != brokk_bifrost_analysis::analyzer::semantic::CallStorageSharing::Isolated
             }))
+    }
+
+    fn may_have_modeled_storage_output(
+        &self,
+        procedure: &ProcedureHandle,
+        call: CallSiteId,
+    ) -> bool {
+        use brokk_bifrost_analysis::analyzer::semantic::CallableTarget;
+
+        let row = procedure
+            .semantics()
+            .call_site(call)
+            .expect("a sibling call belongs to its procedure");
+        if self.external_models.iter().any(|model| {
+            model.call.durable_key() == (procedure.durable_key(), call)
+                && model.writes_call_storage()
+        }) {
+            return true;
+        }
+        let summaries = self.plan.value_flow().external_summaries();
+        let writes_storage = |summary: &SemanticProcedureSummary| {
+            summary.transfers().iter().any(|transfer| {
+                matches!(
+                    transfer.exit().port(),
+                    SummaryPort::Receiver | SummaryPort::Parameter(_)
+                )
+            })
+        };
+        if row.declared_targets.candidates().iter().any(|target| {
+            let locator = match target {
+                CallableTarget::External(locator) | CallableTarget::Unmaterialized(locator) => {
+                    locator
+                }
+                _ => return false,
+            };
+            summaries.summary_for(locator).is_some_and(writes_storage)
+        }) {
+            return true;
+        }
+        row.member_selection.as_ref().is_some_and(|selection| {
+            self.binder
+                .borrow()
+                .has_active_summary_member(&selection.member)
+                || summaries.entries().any(|(_, summary)| {
+                    writes_storage(summary)
+                        && summary
+                            .key()
+                            .declaration()
+                            .segments()
+                            .last()
+                            .and_then(|segment| segment.name())
+                            == Some(selection.member.as_ref())
+                })
+        })
+    }
+
+    fn call_input_storage_overlap(
+        &self,
+        procedure: &ProcedureHandle,
+        value: brokk_bifrost_analysis::analyzer::semantic::ValueId,
+        selectors: &[brokk_bifrost_analysis::analyzer::semantic::partial_flow::HeapSelector],
+        tail: brokk_bifrost_analysis::analyzer::semantic::AccessPathTail,
+        call: CallSiteId,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<brokk_bifrost_analysis::analyzer::semantic::CallStorageSharing, Self::Error> {
+        use brokk_bifrost_analysis::analyzer::semantic::CallStorageSharing;
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::heap_selectors;
+        use brokk_bifrost_analysis::analyzer::semantic::partial_flow::ports::heap_ports_overlap;
+        use brokk_bifrost_flow::value_flow::{ValueFlowPlanLimits, caller_storage_locations};
+
+        let row = procedure
+            .semantics()
+            .call_site(call)
+            .expect("a sibling call belongs to its procedure");
+        if row.receiver.is_none() && row.arguments.is_empty() {
+            return Ok(CallStorageSharing::Isolated);
+        }
+        let outcome =
+            self.discovery
+                .procedure_snapshot(procedure, &OracleCallContext::empty(), request)?;
+        let Some(snapshot) = outcome.available_value() else {
+            return Ok(CallStorageSharing::Unknown);
+        };
+        let read = CallArgumentEndpoint::Value(
+            procedure
+                .value_handle(value)
+                .expect("a reader value belongs to its procedure"),
+        );
+        let read_locations =
+            caller_storage_locations(&read, snapshot, ValueFlowPlanLimits::default());
+        let index = self.call_storage_index(procedure, snapshot);
+        let mut complete = outcome.is_complete()
+            && read_locations.complete
+            && read_locations
+                .locations
+                .iter()
+                .any(|location| location.proven_complete);
+        let mut possible_input = false;
+        for (ordinal, input) in row
+            .receiver
+            .into_iter()
+            .chain(row.arguments.iter().map(|argument| argument.value))
+            .enumerate()
+        {
+            let input = CallArgumentEndpoint::Value(
+                procedure
+                    .value_handle(input)
+                    .expect("a call input belongs to its procedure"),
+            );
+            let auto_addressed_receiver = ordinal == 0
+                && row.receiver.is_some()
+                && row
+                    .member_selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.receiver_place.is_some());
+            if !auto_addressed_receiver
+                && brokk_bifrost_analysis::analyzer::semantic::argument_shares_storage_with_formal(
+                    &input,
+                    brokk_bifrost_analysis::analyzer::semantic::CallPassingMode::Value,
+                    brokk_bifrost_analysis::analyzer::semantic::CallWrittenMember::MayTraverseReferent,
+                    snapshot,
+                    &index,
+                ) == CallStorageSharing::Isolated
+            {
+                continue;
+            }
+            possible_input = true;
+            let candidate =
+                caller_storage_locations(&input, snapshot, ValueFlowPlanLimits::default());
+            complete &= candidate.complete;
+            for read in read_locations
+                .locations
+                .iter()
+                .filter(|location| location.proven_complete)
+            {
+                for written in candidate
+                    .locations
+                    .iter()
+                    .filter(|location| location.proven_complete)
+                {
+                    if read.location.path().root() != written.location.path().root() {
+                        continue;
+                    }
+                    let mut read_selectors =
+                        heap_selectors(read.location.path().selectors()).into_vec();
+                    read_selectors.extend_from_slice(selectors);
+                    let read_heap = PartialFlowPort::Heap {
+                        root: Box::new(PartialFlowPort::Receiver),
+                        selectors: read_selectors.into_boxed_slice(),
+                        tail: if read.location.path().tail()
+                            == brokk_bifrost_analysis::analyzer::semantic::AccessPathTail::Summary
+                        {
+                            read.location.path().tail()
+                        } else {
+                            tail
+                        },
+                    };
+                    let written_heap = PartialFlowPort::Heap {
+                        root: Box::new(PartialFlowPort::Receiver),
+                        selectors: heap_selectors(written.location.path().selectors()),
+                        tail: written.location.path().tail(),
+                    };
+                    if heap_ports_overlap(&read_heap, &written_heap) {
+                        return Ok(CallStorageSharing::Shares);
+                    }
+                }
+            }
+        }
+        Ok(if !possible_input || complete {
+            CallStorageSharing::Isolated
+        } else {
+            CallStorageSharing::Unknown
+        })
     }
 
     fn filter_value_type_barriers(&self, chop: &HashSet<DurableProcedureKey>) {
@@ -1341,12 +2471,9 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 )?
                 .partial
             } else {
-                let mut open = (*baseline).clone();
-                open.outcome = PartialFlowOutcome::Error;
-                open.detail = Some("conditional sanitizer projection unavailable".into());
-                open.open = true;
-                open.relations_complete = false;
-                open
+                (*baseline)
+                    .clone()
+                    .with_failed_projection("conditional sanitizer projection unavailable".into())
             };
             projected.push((Some(function), Arc::new(partial)));
         }
@@ -1372,10 +2499,13 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 .procedure_snapshot(&handle, &OracleCallContext::empty(), request)?;
         let Some(snapshot) = outcome.available_value() else {
             self.interior_cost.record(interior_cpu_start);
-            return Ok(brokk_bifrost_flow::composition::incomplete_interior(
-                handle,
-                "the procedure's value-flow snapshot is unavailable",
-            ));
+            return Ok(
+                brokk_bifrost_flow::composition::unavailable_snapshot_interior(
+                    handle,
+                    SemanticInputStatus::from_outcome(&outcome),
+                    "the procedure's value-flow snapshot is unavailable",
+                ),
+            );
         };
         let flows = brokk_bifrost_flow::composition::interior_from_snapshot(
             self,
@@ -1432,8 +2562,9 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                     request,
                 )?
             } else {
-                brokk_bifrost_flow::composition::incomplete_interior(
+                brokk_bifrost_flow::composition::unavailable_snapshot_interior(
                     handle.clone(),
+                    SemanticInputStatus::from_outcome(&outcome),
                     "conditional sanitizer projection unavailable",
                 )
             };
@@ -1459,10 +2590,13 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?;
         let Some(snapshot) = outcome.available_value() else {
             self.interior_cost.record(interior_cpu_start);
-            return Ok(brokk_bifrost_flow::composition::incomplete_interior(
-                handle,
-                "file-local witness relations are unavailable",
-            ));
+            return Ok(
+                brokk_bifrost_flow::composition::unavailable_snapshot_interior(
+                    handle,
+                    SemanticInputStatus::from_outcome(&outcome),
+                    "file-local witness relations are unavailable",
+                ),
+            );
         };
         let flows = brokk_bifrost_flow::composition::interior_from_snapshot(
             self,
@@ -1518,8 +2652,9 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                     request,
                 )?
             } else {
-                brokk_bifrost_flow::composition::incomplete_interior(
+                brokk_bifrost_flow::composition::unavailable_snapshot_interior(
                     handle.clone(),
+                    SemanticInputStatus::from_outcome(&outcome),
                     "conditional sanitizer witness projection unavailable",
                 )
             };
@@ -1532,29 +2667,34 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         &self,
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Dispatch, Self::Error> {
+    ) -> Result<(Dispatch, Option<CallModel>), Self::Error> {
         let key = (self.policy.clone(), call.clone());
-        let memoized = self.memo.dispatches.borrow().get(&key).cloned();
-        let memoized = match memoized {
-            // The run memo outlives each batch's discovery materialization.
-            // Re-resolving here would charge the next batch for the same call.
-            Some(memoized) => memoized,
-            None => {
-                let memoized = Arc::new(self.dispatch_uncached(call, request)?);
+        // The run memo outlives each batch's discovery materialization.
+        // Admitted hits replay the fill's reads; rejected entries recompute
+        // under the consuming request's ledger.
+        let request = RefCell::new(request);
+        let memoized = read_shared(
+            self.workspace.analyzer(),
+            &self.memo.dispatches,
+            &self.memo.hits.dispatches,
+            key,
+            |f| f(request.borrow_mut().budget),
+            || {
+                let memoized = self.dispatch_uncached(call, &mut request.borrow_mut())?;
                 self.dispatches_made.set(self.dispatches_made.get() + 1);
-                self.memo
-                    .dispatches
-                    .borrow_mut()
-                    .insert(key, Arc::clone(&memoized));
-                memoized
-            }
-        };
+                Ok::<_, TaintPolicyCompileError>(memoized)
+            },
+            // Keep dispatches for later batches whose dependencies remain
+            // resident, avoiding repeated work when admission succeeds (#9095).
+            |_| true,
+        )?;
         let (record, boundaries) = &memoized.record;
         self.record_dispatch(call, record, boundaries);
+        // `authored_models` reads every dispatched call's model.
         self.models
             .borrow_mut()
             .insert(call.clone(), memoized.model.clone());
-        Ok(memoized.dispatch.clone())
+        Ok((memoized.dispatch.clone(), memoized.model.clone()))
     }
 
     fn callers(
@@ -1562,9 +2702,13 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Callers, Self::Error> {
-        brokk_bifrost_flow::composition::callers(
+        CallStructureProvider::callers(
             &self.discovery,
-            self,
+            |call, answer| {
+                brokk_bifrost_flow::composition::CallModelSource::covers_caller_candidate(
+                    self, call, answer,
+                )
+            },
             procedure,
             self.max_callers_per_procedure,
             &self.execution_budget,
@@ -1578,19 +2722,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         procedure: &DurableProcedureKey,
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<DurableProcedureKey>, Self::Error> {
-        let handle = self.procedure(procedure, request)?;
-        Ok(handle
-            .semantics()
-            .lexical_parent()
-            .map(|parent| (procedure.0.clone(), parent)))
-    }
-
-    fn model(&self, call: &DurableCallSiteKey) -> Option<CallModel> {
-        self.models
-            .borrow()
-            .get(call)
-            .expect("the search asks a call's model only after its dispatch")
-            .clone()
+        CallStructureProvider::lexical_parent(&self.discovery, procedure, request)
     }
 
     fn authored_models(&self) -> Vec<Box<[AuthoredArmClosure]>> {
@@ -1650,7 +2782,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
         let mut endpoints = Vec::new();
         let mut gaps = Vec::new();
         for selector in selectors {
-            let matched = self.frontier_match(&procedure.0, selector)?;
+            let (matched, execution_dependent) = self.frontier_match(&procedure.0, selector)?;
             endpoints.extend(
                 matched
                     .by_procedure
@@ -1659,7 +2791,7 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                     .flatten()
                     .cloned(),
             );
-            gaps.extend(matched.gaps.iter().cloned());
+            gaps.extend(matched.gaps_for(execution_dependent));
         }
         endpoints.extend(self.binder.borrow().entry_points_in(procedure));
         let (mut answer, sources, unjudged) =
@@ -1671,9 +2803,21 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
                 .map(|source| (source.origin.clone(), source)),
         );
         if !gaps.is_empty() {
-            answer.completeness = incomplete(format!(
-                "the policy endpoints of this procedure may be incomplete: {gaps:?}"
-            ));
+            let content = gaps.iter().all(FrontierGap::is_content);
+            gaps.sort_by(|a, b| a.message.cmp(&b.message));
+            let message = format!(
+                "the policy endpoints of this procedure may be incomplete: {:?}",
+                gaps.iter().map(|gap| &gap.message).collect::<Vec<_>>()
+            );
+            answer.completeness = if content {
+                Completeness::content(message)
+            } else {
+                Completeness::operational(
+                    brokk_bifrost_flow::taint::compose::OperationalCause::Provider,
+                    message,
+                )
+            }
+            .preserving_operational_cause(&answer.completeness);
         }
         Ok(answer)
     }
@@ -1695,21 +2839,108 @@ impl CompositionProvider for PolicyCompositionProvider<'_> {
             selection.span.start,
             selection.span.end,
         );
-        if let Some(quality) = self.memo.evidence.borrow().get(&key) {
-            return Ok(*quality);
-        }
-        self.source_evidence_resolved
-            .set(self.source_evidence_resolved.get() + 1);
-        let quality = {
-            let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.points_to");
-            self.binder.borrow_mut().source_evidence(selection)?
-        };
-        self.memo.evidence.borrow_mut().insert(key, quality);
-        Ok(quality)
+        let quality = read_shared(
+            self.workspace.analyzer(),
+            &self.memo.evidence,
+            &self.memo.hits.evidence,
+            key,
+            |f| f(self.binder.borrow_mut().semantic_budget()),
+            || {
+                self.source_evidence_resolved
+                    .set(self.source_evidence_resolved.get() + 1);
+                let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.points_to");
+                self.binder.borrow_mut().source_evidence(selection)
+            },
+            |_| true,
+        )?;
+        Ok(*quality)
     }
 }
 
 impl PolicyCompositionProvider<'_> {
+    /// Only authored policy entries and Go runtime/harness entries can start
+    /// an execution certificate. A bounded, incomplete survey never refutes
+    /// a root already admitted by positive evidence.
+    pub(crate) fn admitted_execution_roots(
+        &self,
+        max_examined: usize,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<(Vec<DurableProcedureKey>, Vec<&'static str>), TaintPolicyCompileError> {
+        let mut roots = self.binder.borrow().execution_entry_roots();
+        let mut examined = 0usize;
+        let mut causes = Vec::new();
+        let mut note = |cause| {
+            if !causes.contains(&cause) {
+                causes.push(cause);
+            }
+        };
+        let analyzer = self.workspace.analyzer();
+        'files: for file in analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| file.language() == Language::Go)
+        {
+            let mut artifact = None;
+            for declaration in analyzer.declarations(&file) {
+                if request.cancellation.is_cancelled() {
+                    note("execution-root survey cancelled");
+                    break 'files;
+                }
+                if examined >= max_examined {
+                    note("execution-root census limit reached");
+                    break 'files;
+                }
+                examined += 1;
+                let support = language_support_for_hook(Language::Go, "implicit_entry_point")
+                    .expect("Go semantic files have registered language support");
+                match support.implicit_entry_point(analyzer, &declaration) {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => {
+                        note("Go entry-point evidence unknown");
+                        continue;
+                    }
+                }
+                if artifact.is_none() {
+                    let outcome = self
+                        .workspace
+                        .materialize_program_semantics(&file, request)
+                        .map_err(|error| {
+                            TaintPolicyCompileError::SemanticProvider(error.to_string())
+                        })?;
+                    if !outcome.is_complete() {
+                        note("Go entry semantic artifact incomplete");
+                    }
+                    artifact = outcome.available_value().cloned();
+                }
+                let Some(artifact) = &artifact else {
+                    note("Go entry semantic artifact unavailable");
+                    continue;
+                };
+                let lookup = procedures_for_definition_with_limits(
+                    analyzer,
+                    &declaration,
+                    artifact,
+                    max_examined.saturating_sub(examined),
+                    request.cancellation,
+                );
+                examined += lookup.examined;
+                if lookup.status != ProcedureRangeLookupStatus::Complete {
+                    note("Go entry procedure lookup incomplete");
+                    continue;
+                }
+                if lookup.handles.len() != 1 {
+                    note("Go entry procedure is not unique");
+                    continue;
+                }
+                roots.push(lookup.handles[0].durable_key());
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        Ok((roots, causes))
+    }
+
     /// Dispatch one call the run memo does not hold: resolve it, decide its
     /// models, and bind each candidate.
     fn dispatch_uncached(
@@ -1718,10 +2949,11 @@ impl PolicyCompositionProvider<'_> {
         request: &mut SemanticRequest<'_>,
     ) -> Result<MemoizedDispatch, TaintPolicyCompileError> {
         let _timing = brokk_bifrost_analysis::profiling::scope("taint.compose.dispatch");
-        let local = brokk_bifrost_flow::composition::dispatch_uncached(
+        let raw = CallStructureProvider::dispatch(&self.discovery, call, request)?;
+        let local = brokk_bifrost_flow::composition::dispatch_from_structure(
             &self.discovery,
             self,
-            call,
+            raw,
             request,
         )?;
         Ok(MemoizedDispatch {
@@ -1821,19 +3053,21 @@ impl PolicyCompositionProvider<'_> {
         &self,
         call: &CallSiteHandle,
     ) -> Result<Option<IntrinsicCall>, TaintPolicyCompileError> {
-        let key = call.durable_key();
-        if let Some(builtin) = self.memo.std_builtins.borrow().get(&key) {
-            return Ok(builtin.clone());
-        }
-        let _timing =
-            brokk_bifrost_analysis::profiling::scope("taint.compose.call_models.std_builtin");
-        let builtin = language_intrinsic_call(self.workspace, call)
-            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
-        self.memo
-            .std_builtins
-            .borrow_mut()
-            .insert(key, builtin.clone());
-        Ok(builtin)
+        let builtin = read_shared_unbudgeted(
+            self.workspace.analyzer(),
+            &self.memo.std_builtins,
+            &self.memo.hits.std_builtins,
+            call.durable_key(),
+            || {
+                let _timing = brokk_bifrost_analysis::profiling::scope(
+                    "taint.compose.call_models.std_builtin",
+                );
+                language_intrinsic_call(self.workspace, call)
+                    .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))
+            },
+            |_| true,
+        )?;
+        Ok(builtin.clone())
     }
 
     /// Keep the first record of a dispatched call and its boundaries.
@@ -1928,6 +3162,7 @@ impl PolicyCompositionProvider<'_> {
 /// value across the call anyway, so that call is neither proven nor complete.
 fn continuation_quality(
     models: &CallModels,
+    model: Option<&CallModel>,
     call: &CallSiteHandle,
     result: Option<&DispatchResult>,
 ) -> HopQuality {
@@ -1939,11 +3174,52 @@ fn continuation_quality(
         .semantics()
         .call_site(call.id())
         .expect("a dispatched call is a call of its procedure");
-    let replaced = models.curated.is_some();
-    let proven_model = models
+    let curated_proven = models
         .curated
         .as_ref()
         .is_some_and(CuratedCallModel::is_proven_complete);
+    // A transfer's quality does not certify the call's continuation. An
+    // authored closure certifies a residual arm only when covering-model
+    // selection proved every other arm. An exact external arm needs its own
+    // override-coverage claim and complete call evidence; the summary's data
+    // transfer alone does not certify its continuation.
+    let authored_closed = model.is_some_and(|model| {
+        let residual = result
+            .boundaries()
+            .iter()
+            .any(|boundary| matches!(boundary.kind, DispatchBoundaryKind::Unresolved));
+        model.completeness.is_complete()
+            && model
+                .authored
+                .as_ref()
+                .is_some_and(|closures| !closures.is_empty())
+            && result.boundaries().iter().all(|boundary| {
+                matches!(boundary.kind, DispatchBoundaryKind::Unresolved)
+                    || boundary.proof == ProofStatus::Proven
+            })
+            && (residual
+                || (models.resolved_external
+                    && model.authored.as_ref().is_some_and(|closures| {
+                        closures.iter().all(|closure| closure.origin().covers_overrides())
+                    })
+                    && brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::scoped_call_dispatch_gap(call.procedure().semantics(), row).is_none()
+                    && [row.evidence, row.target_evidence].iter().all(|evidence| {
+                        let evidence = call
+                            .procedure()
+                            .semantics()
+                            .evidence_row(*evidence)
+                            .expect("a call names live evidence");
+                        evidence.proof == ProofStatus::Proven
+                            && evidence.completeness == EvidenceCompleteness::Complete
+                    })
+                    && result.boundaries().iter().all(|boundary| {
+                        models
+                            .summary_for_boundary(&boundary.kind)
+                            .is_some_and(|(summary, _)| summary.effects().is_empty())
+                    })))
+    });
+    let replaced = models.curated.is_some() || authored_closed;
+    let proven_model = curated_proven || authored_closed;
     let mut boundaries = result
         .boundaries()
         .iter()
@@ -1980,14 +3256,14 @@ fn continuation_quality(
     best
 }
 
-/// The model that covers a call, if any.
+/// The selected model for a call, if any.
 ///
 /// A curated model of the call replaces the call outright, as the ICFG
-/// engine's `call_replaced_by_model` does. Otherwise a bound external summary
-/// covers the call when it closes every boundary the call leaves open: each
-/// such boundary is proven, the call has no resolved candidate body, and
-/// exactly one summary closes the open boundaries and is itself complete. Any
-/// other case is no model, and the call stays a boundary.
+/// engine's `call_replaced_by_model` does. One selected partial summary yields
+/// a retains-dispatch model: its declared transfers join the original dispatch,
+/// candidate bodies and residual, and its completeness stays partial. Two
+/// partial boundaries yield no model. A complete bound summary replaces only a
+/// candidate-free call when it closes every open boundary with proven coverage.
 fn covering_model(
     models: &CallModels,
     call: &CallSiteHandle,
@@ -2006,11 +3282,75 @@ fn covering_model(
         )));
     }
     let result = result?;
+    // A partial summary states usable positive edges, but cannot cover the
+    // boundary. Keep the original candidates, dispatch and unmodeled residual.
+    let mut partial = None;
+    for boundary in result.boundaries() {
+        if let Some((summary, mapping)) = models.summary_for_boundary(&boundary.kind)
+            && !summary.completeness().is_complete()
+            && partial
+                .replace((summary, mapping, boundary.kind.clone()))
+                .is_some()
+        {
+            return None;
+        }
+    }
+    if let Some((summary, mapping, target)) = partial {
+        let mut model = models.with_receiver_storage(call_model(
+            call,
+            summary.transfers(),
+            summary.effects(),
+            mapping,
+            summary
+                .transfers()
+                .iter()
+                .all(|transfer| transfer.evidence().is_proven()),
+            Some(Box::default()),
+            universe,
+        ));
+        model.completeness =
+            Completeness::content("the selected procedure summary has unknown effects");
+        model.retains_dispatch = true;
+        model.summary = Some(summary.key().clone());
+        model.summary_target = Some(target);
+        return Some(model);
+    }
+    // Complete summaries are replacement models only for a candidate-free
+    // call. A body candidate still owns its original dispatch path.
     if !result.candidates().is_empty() {
+        return None;
+    }
+    let kinds = result
+        .boundaries()
+        .iter()
+        .map(|boundary| &boundary.kind)
+        .collect::<Vec<_>>();
+    let has_residual = kinds
+        .iter()
+        .any(|kind| matches!(kind, DispatchBoundaryKind::Unresolved));
+    let closures = if has_residual {
+        authored_call_closures(
+            call,
+            &kinds,
+            models.summaries.as_ref()?,
+            models.resolved_external,
+        )
+    } else {
+        Vec::new()
+    };
+    // One authored closure can discharge both the named external arm and its
+    // residual implementation-family arm; the shared helper deduplicates it.
+    if has_residual && closures.is_empty() {
         return None;
     }
     let mut covering = None;
     for boundary in result.boundaries() {
+        if has_residual && matches!(boundary.kind, DispatchBoundaryKind::Unresolved) {
+            // An authored summary of the sibling external member closes this
+            // otherwise open implementation-family arm only when every arm
+            // passed the shared closure guards above.
+            continue;
+        }
         if boundary.proof != ProofStatus::Proven {
             return None;
         }
@@ -2032,9 +3372,7 @@ fn covering_model(
         }
     }
     let (summary, mapping) = covering?;
-    if !summary.completeness().is_complete() {
-        return None;
-    }
+    debug_assert!(summary.completeness().is_complete());
     // An authored summary is a claim, not a derived body (#1916); the
     // closures it gives the call's boundaries are what a finding through it
     // and a run resting on it name.
@@ -2043,18 +3381,18 @@ fn covering_model(
         SummaryOrigin::External(_)
     )
     .then(|| {
-        let kinds = result
-            .boundaries()
-            .iter()
-            .map(|boundary| &boundary.kind)
-            .collect::<Vec<_>>();
         let summaries = models
             .summaries
             .as_ref()
             .expect("a covering summary is one of the call's bound summaries");
-        authored_call_closures(call, &kinds, summaries, models.resolved_external).into_boxed_slice()
+        if has_residual {
+            closures.into_boxed_slice()
+        } else {
+            authored_call_closures(call, &kinds, summaries, models.resolved_external)
+                .into_boxed_slice()
+        }
     });
-    Some(models.with_receiver_storage(call_model(
+    let mut model = models.with_receiver_storage(call_model(
         call,
         summary.transfers(),
         summary.effects(),
@@ -2062,7 +3400,21 @@ fn covering_model(
         true,
         authored,
         universe,
-    )))
+    ));
+    model.summary = Some(summary.key().clone());
+    if has_residual {
+        // The override closure proves the member behavior, not which
+        // implementation's receiver or argument storage the write reaches.
+        // Keep the transfer for path discovery, then withhold only paths
+        // whose accepted label actually depends on that output.
+        for transfer in &mut model.transfers {
+            transfer.unresolved_output_storage = matches!(
+                transfer.output,
+                PartialFlowPort::CallReceiver { .. } | PartialFlowPort::CallArgument { .. }
+            );
+        }
+    }
+    Some(model)
 }
 
 /// The models of one call (`PolicyCompositionProvider::call_models`).
@@ -2082,14 +3434,16 @@ struct CallModels {
 impl CallModels {
     fn with_receiver_storage(&self, mut model: CallModel) -> CallModel {
         if !self.receiver_storage_available
-            && model
-                .transfers
-                .iter()
-                .any(|transfer| matches!(transfer.actual, PartialFlowPort::CallReceiver { .. }))
+            && model.transfers.iter().any(|transfer| {
+                matches!(transfer.actual, PartialFlowPort::CallReceiver { .. })
+                    || matches!(transfer.output, PartialFlowPort::CallReceiver { .. })
+            })
         {
-            model.completeness = incomplete("the member receiver storage is not proven");
+            model.completeness = content_incomplete("the member receiver storage is not proven")
+                .preserving_operational_cause(&model.completeness);
             model.transfers.retain(|transfer| {
                 !matches!(transfer.actual, PartialFlowPort::CallReceiver { .. })
+                    && !matches!(transfer.output, PartialFlowPort::CallReceiver { .. })
             });
         }
         model
@@ -2110,8 +3464,7 @@ impl CallModels {
 }
 
 /// A model from one summary's transfers and effects, read at one call. A
-/// transfer whose input the call does not bind, or whose output is not the
-/// normal return, is incomplete: the composition does not carry that port.
+/// transfer whose input or output the call does not bind is incomplete.
 fn call_model(
     call: &CallSiteHandle,
     transfers: &[SummaryTransfer],
@@ -2156,15 +3509,64 @@ fn call_model(
             transfer.input(),
             SummaryPort::Receiver | SummaryPort::Parameter(_)
         );
-        if exit.kind() != SummaryExitKind::Normal
-            || exit.port() != &SummaryPort::NormalReturn
-            || !input_carried
-        {
-            completeness = incomplete("the model writes a port the composition does not carry");
+        if exit.kind() != SummaryExitKind::Normal || !input_carried {
+            completeness =
+                content_incomplete("the model writes a port the composition does not carry");
             continue;
         }
+        let output_port = if actual_to_formal.is_receiver_adjustment()
+            && matches!(exit.port(), SummaryPort::NormalReturn)
+        {
+            &SummaryPort::Receiver
+        } else {
+            exit.port()
+        };
+        let output = match (row, output_port) {
+            (Some(row), SummaryPort::NormalReturn) if row.result.is_some() => {
+                Some(PartialFlowPort::CallResult {
+                    call: call.id(),
+                    ordinal: None,
+                })
+            }
+            (Some(row), SummaryPort::IndexedNormalReturn(ordinal))
+                if row.normal_result(*ordinal as usize).is_some() =>
+            {
+                Some(PartialFlowPort::CallResult {
+                    call: call.id(),
+                    ordinal: Some(*ordinal),
+                })
+            }
+            (Some(row), SummaryPort::Receiver) => actual_to_formal
+                .receiver_value(call)
+                .or(row.receiver)
+                .and_then(|receiver| {
+                    if row.receiver == Some(receiver) {
+                        Some(PartialFlowPort::CallReceiver { call: call.id() })
+                    } else {
+                        row.arguments
+                            .iter()
+                            .position(|argument| argument.value == receiver)
+                            .map(|index| PartialFlowPort::CallArgument {
+                                call: call.id(),
+                                ordinal: u32::try_from(index).expect("argument index fits u32"),
+                            })
+                    }
+                }),
+            (Some(row), SummaryPort::Parameter(formal)) => actual_to_formal
+                .parameter_index(call, *formal)
+                .filter(|index| *index < row.arguments.len())
+                .map(|index| PartialFlowPort::CallArgument {
+                    call: call.id(),
+                    ordinal: u32::try_from(index).expect("argument index fits u32"),
+                }),
+            _ => None,
+        };
+        let Some(output) = output else {
+            completeness = content_incomplete("the model writes an output the call does not bind");
+            continue;
+        };
         let Some(actual) = actual else {
-            completeness = incomplete("the model reads an input the call does not bind");
+            completeness = content_incomplete("the model reads an input the call does not bind");
             continue;
         };
         let mut removed = BTreeSet::new();
@@ -2175,26 +3577,32 @@ fn call_model(
                 removed: labels,
             } = effect.key()
                 && input == transfer.input()
-                && output == &SummaryPort::NormalReturn
+                && output == exit.port()
             {
                 removed.extend(labels.iter().cloned());
             }
         }
         model_transfers.push(ModelTransfer {
             actual,
+            output,
             function: taint_model_kill(universe, &removed.into_iter().collect::<Vec<_>>()),
+            proven: transfer.evidence().is_proven(),
+            unresolved_output_storage: false,
         });
     }
     CallModel {
+        summary: None,
+        summary_target: None,
         transfers: model_transfers,
+        writeback: Box::default(),
+        receiver_reads: Box::default(),
         proven,
         completeness,
         authored,
+        retains_dispatch: false,
     }
 }
 
-fn incomplete(reason: impl Into<Box<str>>) -> Completeness {
-    Completeness::Incomplete {
-        reason: reason.into(),
-    }
+fn content_incomplete(reason: impl Into<Box<str>>) -> Completeness {
+    Completeness::content(reason)
 }

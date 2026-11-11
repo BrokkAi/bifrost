@@ -10,6 +10,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct RustKnowledge;
 
 impl LanguageKnowledge for RustKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn scalar_object_field_is_copy(&self, kind: ScalarObjectFieldKind) -> bool {
         matches!(
             kind,

@@ -32,6 +32,22 @@ use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::lookup_suffix_candid
 pub struct ScalaAdapter;
 
 impl LanguageAdapter for ScalaAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[
+                "string",
+                "integer_literal",
+                "floating_point_literal",
+                "character_literal",
+            ],
+            interpolations: &[],
+            composites: &[
+                ("tuple_expression", &["(", ")", ","]),
+                ("prefix_expression", &["-", "+"]),
+            ],
+        }
+    }
+
     /// Relative to `brokk-bifrost-jvm`'s crate root: the `.scm` assets moved
     /// with the vendored grammars and are embedded there.
     fn query_directory(&self) -> &'static str {

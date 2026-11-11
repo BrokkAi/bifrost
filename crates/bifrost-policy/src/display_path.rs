@@ -7,6 +7,7 @@ use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic::{IcfgEdgeKind, SemanticLocator};
 use brokk_bifrost_flow::dataflow::{SummaryWitness, SummaryWitnessStepKind};
+use brokk_bifrost_flow::taint::output_product::OutputWitnessRow;
 use serde::{Serialize, Serializer};
 
 use crate::finding::PolicySourceLocation;
@@ -288,6 +289,15 @@ pub(crate) fn project_taint_display_candidate(
                 ))
             }
             SummaryWitnessStepKind::Edge(IcfgEdgeKind::Intraprocedural(_)) => None,
+            SummaryWitnessStepKind::ModeledReceiver => step.receiver_operand().map(|locator| {
+                raw_step(
+                    workspace,
+                    TaintDisplayStepKind::Propagation,
+                    locator,
+                    "receiver operand",
+                    true,
+                )
+            }),
             SummaryWitnessStepKind::Edge(
                 IcfgEdgeKind::CallToNormalContinuation
                 | IcfgEdgeKind::CallToExceptionalContinuation,
@@ -304,6 +314,123 @@ pub(crate) fn project_taint_display_candidate(
         intermediate,
         TaintDisplayStep::new(TaintDisplayStepKind::Sink, sink_location, sink_label),
         finding_incomplete || witness.truncated(),
+        complete_anchors,
+    ))
+}
+
+pub(crate) fn project_output_display_candidate(
+    workspace: &WorkspaceAnalyzer,
+    origin: &SemanticLocator,
+    sink: &SemanticLocator,
+    witness_id: WitnessId,
+    witness: &OutputWitnessRow,
+    finding_incomplete: bool,
+) -> Result<TaintDisplayCandidate, String> {
+    let origin_location = super::semantic_identity::policy_location(workspace, origin)?;
+    let sink_location = super::semantic_identity::policy_location(workspace, sink)?;
+    let origin_excerpt = super::semantic_identity::source_excerpt(workspace, origin)
+        .filter(|excerpt| !excerpt.trim().is_empty());
+    let sink_excerpt = super::semantic_identity::source_excerpt(workspace, sink)
+        .filter(|excerpt| !excerpt.trim().is_empty());
+    let complete_anchors = origin_excerpt.is_some() && sink_excerpt.is_some();
+    let mut intermediate = Vec::new();
+    for step in &witness.steps {
+        let projected = match step.kind.as_str() {
+            "seed" => None,
+            "edge:call_to_entry" => step.origin.as_ref().map(|call| {
+                let locator = call
+                    .clone()
+                    .decode()
+                    .expect("validated Output call locator");
+                raw_step(
+                    workspace,
+                    TaintDisplayStepKind::Call,
+                    &locator,
+                    "call boundary",
+                    true,
+                )
+            }),
+            "edge:normal_return" | "edge:exceptional_return" => step.origin.as_ref().map(|call| {
+                let locator = call
+                    .clone()
+                    .decode()
+                    .expect("validated Output call locator");
+                let excerpt = locator_label(workspace, &locator, "call boundary");
+                RawDisplayStep {
+                    step: TaintDisplayStep::new(
+                        TaintDisplayStepKind::Return,
+                        super::semantic_identity::policy_location(workspace, &locator)
+                            .expect("validated Output call locator has a location"),
+                        format!("return from {excerpt}"),
+                    ),
+                    informative: true,
+                }
+            }),
+            kind if kind.starts_with("end_summary_gap:") => {
+                let locator = step
+                    .source
+                    .clone()
+                    .decode()
+                    .map_err(|error| format!("{error:?}"))?;
+                Some(raw_step(
+                    workspace,
+                    TaintDisplayStepKind::Return,
+                    &locator,
+                    "taint summary boundary",
+                    true,
+                ))
+            }
+            "edge:modeled_receiver" => {
+                let operand = step
+                    .modeled_receiver_operand()
+                    .ok_or("missing modeled receiver operand")?;
+                let locator = operand
+                    .clone()
+                    .decode()
+                    .map_err(|error| format!("{error:?}"))?;
+                Some(raw_step(
+                    workspace,
+                    TaintDisplayStepKind::Propagation,
+                    &locator,
+                    "receiver operand",
+                    true,
+                ))
+            }
+            "edge:call_to_normal_continuation" | "edge:call_to_exceptional_continuation" => None,
+            _ if step.input_fact != step.output_fact => {
+                let locator = step
+                    .source
+                    .clone()
+                    .decode()
+                    .map_err(|error| format!("{error:?}"))?;
+                Some(raw_step(
+                    workspace,
+                    TaintDisplayStepKind::Propagation,
+                    &locator,
+                    "taint propagation",
+                    true,
+                ))
+            }
+            _ => None,
+        };
+        if let Some(projected) = projected {
+            intermediate.push(projected);
+        }
+    }
+    Ok(project_display_rows(
+        witness_id,
+        TaintDisplayStep::new(
+            TaintDisplayStepKind::Source,
+            origin_location,
+            origin_excerpt.unwrap_or_else(|| "taint source".to_owned()),
+        ),
+        intermediate,
+        TaintDisplayStep::new(
+            TaintDisplayStepKind::Sink,
+            sink_location,
+            sink_excerpt.unwrap_or_else(|| "taint sink".to_owned()),
+        ),
+        finding_incomplete || witness.truncation_cause.is_some(),
         complete_anchors,
     ))
 }

@@ -204,34 +204,41 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        if !self.canonical_sources_ready() {
-            return Arc::new(HashSet::default());
-        }
-        let value = self
-            .imported_code_units
-            .read(&memo_attribution(self), |cache, capture| {
-                Ok::<_, std::convert::Infallible>(cache.get(file).unwrap_or_else(|| {
-                    let cache_fill =
-                        brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-                    let entry = Arc::new(capture.build_weighted(|| {
-                        let value = {
-                            let scope = AnalyzerQueryScope::new(self);
-                            let token = scope.token();
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            if !self.canonical_sources_ready() {
+                return Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                    HashSet::default(),
+                ));
+            }
+            let value = self
+                    .imported_code_units
+                    .read(&memo_attribution(self), |cache, capture| {
+                        Ok::<_, std::convert::Infallible>(cache.get(file).unwrap_or_else(|| {
+                            let cache_fill =
+                                brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                            let entry = Arc::new(capture.build_weighted(|| {
+                                let value = {
+                                    let scope = AnalyzerQueryScope::new(self);
+                                    let token = scope.token();
 
-                            Arc::new(ruby_effective_imported_code_units(self, token, file))
-                        };
-                        let bytes = weight_code_unit_set(file, &value) as usize;
-                        (value, bytes)
-                    }));
-                    if cache_fill.is_complete() {
-                        cache.insert(file.clone(), Arc::clone(&entry));
-                    }
-                    entry
-                }))
-            })
-            .expect("import memo build is infallible");
-        Arc::clone(&value)
+                                    Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(ruby_effective_imported_code_units(self, token, file)))
+                                };
+                                let bytes = brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(&value) as usize;
+                                (value, bytes)
+                            }));
+                            if cache_fill.is_complete() {
+                                cache.insert(file.clone(), Arc::clone(&entry));
+                            }
+                            entry
+                        }))
+                    })
+                    .expect("import memo build is infallible");
+            Arc::clone(&value)
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

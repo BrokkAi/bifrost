@@ -157,6 +157,7 @@ pub fn rename_symbol(
     selection: RenameSelection,
     new_name: &str,
 ) -> Result<RenameResult, RenameFailure> {
+    let scope = brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(analyzer);
     let source = read_source(project, &file)?;
     let line_starts = compute_line_starts(&source);
     let cursor = rename_cursor_for_selection(file, source, line_starts, selection)?;
@@ -259,6 +260,13 @@ pub fn rename_symbol(
         old_name,
         files,
     };
+    let incomplete = crate::result_incomplete::query_read_incomplete(&scope);
+    if !incomplete.is_empty() {
+        return Err(RenameFailure {
+            kind: "incomplete_analysis",
+            message: format!("rename requires complete structured evidence: {incomplete:?}"),
+        });
+    }
     Ok(result)
 }
 

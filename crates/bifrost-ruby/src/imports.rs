@@ -46,6 +46,13 @@ pub(crate) fn parse_ruby_load_syntax<'tree>(
         "autoload" => RubyLoadKind::Autoload,
         _ => return None,
     };
+    // `Module#autoload` is public, so a module receiver still declares an
+    // autoload; the other three are `Kernel` functions.
+    if kind != RubyLoadKind::Autoload
+        && !crate::syntax::ruby_call_selects_kernel_function(node, source)
+    {
+        return None;
+    }
     let arguments = crate::syntax::ruby_call_arguments(node);
     let path_index = usize::from(kind == RubyLoadKind::Autoload);
     let argument = *arguments.get(path_index)?;

@@ -104,6 +104,10 @@ pub enum JvmModelDisposition {
     /// declaration it denotes is not decided. That is ambiguity, not absence,
     /// and must never become an unrecognized-symbol error.
     Conflicting { declarations: usize },
+    /// The published model could not be read in full for this name, so it may
+    /// or may not be declared. Like ambiguity, never an unrecognized-symbol
+    /// error, and never a selection.
+    Open,
 }
 
 /// What the analyzer has *retained* about the JVM dependency surface, read
@@ -273,6 +277,11 @@ pub fn prove_against_active_model(
         Ok(JvmModelDisposition::Conflicting { declarations }) => JvmNameProof::Ambiguous {
             boundaries: vec![BoundaryStatus::ExternalIndexed; declarations],
         },
+        // A model read that is open proves nothing either way, like a
+        // truncated discovery below.
+        Ok(JvmModelDisposition::Open) => JvmNameProof::Incomplete(JvmProofGap::ExternalBoundary {
+            boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+        }),
         // A truncated discovery left coordinates the build declares and no
         // pack covers (#2887), so the published surface's silence is the same
         // silence a partially read jar index gives: the name may be in the

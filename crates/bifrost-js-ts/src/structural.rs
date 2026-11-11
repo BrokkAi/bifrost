@@ -310,7 +310,7 @@ fn js_ts_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLi
             _ => return None,
         };
         (
-            js_ts_numeric_target(node.child_by_field_name("argument")?)?,
+            js_ts_unwrap_parenthesized(node.child_by_field_name("argument")?)?,
             negative,
         )
     } else {
@@ -353,7 +353,7 @@ fn js_ts_integer_literal_value(node: Node<'_>, source: &str) -> Option<IntegerLi
     Some(if negative { value.negated() } else { value })
 }
 
-fn js_ts_numeric_target(mut node: Node<'_>) -> Option<Node<'_>> {
+fn js_ts_unwrap_parenthesized(mut node: Node<'_>) -> Option<Node<'_>> {
     while node.kind() == "parenthesized_expression" {
         node = first_named_child(node)?;
     }
@@ -367,7 +367,7 @@ fn js_ts_signed_numeric_unary(node: Node<'_>) -> bool {
             .is_some_and(|operator| matches!(operator.kind(), "+" | "-"))
         && node
             .child_by_field_name("argument")
-            .and_then(js_ts_numeric_target)
+            .and_then(js_ts_unwrap_parenthesized)
             .is_some_and(|argument| argument.kind() == "number")
 }
 
@@ -383,7 +383,7 @@ fn js_ts_is_inside_signed_numeric_wrapper<'tree>(
         js_ts_signed_numeric_unary(parent)
             && parent
                 .child_by_field_name("argument")
-                .and_then(js_ts_numeric_target)
+                .and_then(js_ts_unwrap_parenthesized)
                 .is_some_and(|argument| argument.id() == node.id())
     })
 }
@@ -1088,6 +1088,13 @@ impl JsTsStructuralSpec {
                 if let Some(name) = first_named_child(node).and_then(expression_name_node) {
                     sink.set_name(name);
                 }
+                if let Some(call) = first_named_child(node)
+                    .and_then(js_ts_unwrap_parenthesized)
+                    .filter(|child| child.kind() == "call_expression")
+                    && let Some(arguments) = call.child_by_field_name("arguments")
+                {
+                    attach_argument_roles(sink, arguments);
+                }
             }
             NormalizedKind::ForLoop => {
                 if let Some(right) = node.child_by_field_name("right") {
@@ -1188,6 +1195,47 @@ impl StructuralSpec for JsTsStructuralSpec {
             modifiers: brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(node, source),
             type_kind: None,
         })
+    }
+
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[
+            NormalizedKind::Constructor,
+            NormalizedKind::ObjectProperty,
+            NormalizedKind::Parameter,
+        ]
+    }
+
+    fn authoritative_modifier_kinds(&self) -> &'static [NormalizedKind] {
+        // Calls, identifiers, literals, comments, and recovery nodes cannot own declaration attributes.
+        // Declaration kinds below are audited against all grammar producers of their exact kind.
+        &[
+            NormalizedKind::Method,
+            NormalizedKind::Constructor,
+            NormalizedKind::Call,
+            NormalizedKind::Identifier,
+            NormalizedKind::StringLiteral,
+            NormalizedKind::NumericLiteral,
+            NormalizedKind::BooleanLiteral,
+            NormalizedKind::NullLiteral,
+            NormalizedKind::Comment,
+            NormalizedKind::SyntaxError,
+        ]
+    }
+
+    fn authoritative_type_kind_kinds(&self) -> &'static [NormalizedKind] {
+        // Calls, identifiers, literals, comments, and recovery nodes cannot own declaration attributes.
+        // Declaration kinds below are audited against all grammar producers of their exact kind.
+        &[
+            NormalizedKind::Call,
+            NormalizedKind::Identifier,
+            NormalizedKind::StringLiteral,
+            NormalizedKind::NumericLiteral,
+            NormalizedKind::BooleanLiteral,
+            NormalizedKind::NullLiteral,
+            NormalizedKind::Comment,
+            NormalizedKind::SyntaxError,
+        ]
     }
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {

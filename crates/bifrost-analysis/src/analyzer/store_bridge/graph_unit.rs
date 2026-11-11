@@ -311,7 +311,8 @@ pub(crate) fn project_native_graph_definitions(
                                             .catalog_mut()
                                             .insert_graph_declaration(semantic, unit)?,
                                         SelectedNativeDefinition::Lexical(_)
-                                        | SelectedNativeDefinition::Intrinsic { .. } => {
+                                        | SelectedNativeDefinition::Intrinsic { .. }
+                                        | SelectedNativeDefinition::ExternalOwner { .. } => {
                                             edge_projector
                                                 .catalog_mut()
                                                 .insert_out_of_graph_declaration(semantic)
@@ -340,6 +341,9 @@ pub(crate) fn project_native_graph_definitions(
                                                     }
                                                     SelectedNativeDefinition::Lexical(_)
                                                     | SelectedNativeDefinition::Intrinsic {
+                                                        ..
+                                                    }
+                                                    | SelectedNativeDefinition::ExternalOwner {
                                                         ..
                                                     } => edge_projector
                                                         .catalog_mut()

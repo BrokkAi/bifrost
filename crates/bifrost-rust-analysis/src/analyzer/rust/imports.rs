@@ -1,7 +1,7 @@
 //! `ImportAnalysisProvider` for Rust: the memoization shell around
 //! [`brokk_bifrost_rust::imports`].
 //!
-//! Only the caching stays here. The two moka caches are analyzer state, so each
+//! Only the caching stays here. The two budgeted caches are analyzer state, so each
 //! method below fetches or fills a cache slot and hands the actual resolution to
 //! the Rust crate through the [`RustSource`] the analyzer implements.
 
@@ -29,12 +29,12 @@ use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::rust_facts::{RustCfgInstruction, RustVisibility};
 use brokk_bifrost_core::hash::HashSet;
-use brokk_bifrost_rust::declarations::rust_package_name;
+use brokk_bifrost_rust::graph_support::RustPackageFileIndex;
 use brokk_bifrost_rust::imports::RustImportBindingName;
 use brokk_bifrost_rust::imports::{
-    resolve_rust_import_fq_name, resolve_rust_module_path_with_crate,
-    resolve_rust_module_segments_with_crate, rust_could_import_file, rust_crate_root_package,
-    rust_imported_code_units,
+    resolve_rust_import_fq_name_with, resolve_rust_module_path_with_crate,
+    resolve_rust_module_segments_with_crate, rust_could_import_file_with,
+    rust_imported_code_units_with,
 };
 use brokk_bifrost_rust::lexical_scope::RustCfgCondition;
 use brokk_bifrost_rust::usage::{
@@ -89,8 +89,14 @@ impl ImportAnalysisProvider for RustAnalyzer {
     ) -> Option<brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<String>>> {
         let mut keys = brokk_bifrost_core::hash::HashMap::default();
         for file in files {
-            let crate_root = rust_crate_root_package(file);
-            let package = rust_package_name(file);
+            let crate_root = brokk_bifrost_rust::imports::rust_crate_root_package_with(
+                &self.inner.adapter().naming,
+                file,
+            );
+            let package = brokk_bifrost_rust::declarations::rust_package_name_with(
+                &self.inner.adapter().naming,
+                file,
+            );
             let module = ModuleKey::with_crate_root(&crate_root, &package);
             keys.insert(
                 file.clone(),
@@ -262,6 +268,549 @@ impl ImportAnalysisProvider for RustAnalyzer {
             brokk_bifrost_core::analyzer::capabilities::ImportResolutionDependencies,
         >,
     > {
+        // One usage read frame holds the selection open for the per-file route
+        // reads below.
+        let mut dependencies = None;
+        brokk_bifrost_rust::graph_support::with_usage_read_frame(self, || {
+            dependencies = self.import_resolution_dependencies_in_read_frame(
+                files,
+                selected_ordinals,
+                cancellation,
+            );
+        });
+        dependencies
+    }
+
+    fn for_each_import_edge_facts_from_infos(
+        &self,
+        files: &[ProjectFile],
+        _import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        selected_ordinals: &brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<u32>>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        visit: &mut dyn FnMut(&ProjectFile, Vec<ImportedFileEdgeFacts>) -> bool,
+    ) -> Option<()> {
+        // One usage read frame holds the selection open for the package and
+        // route questions below; a frame is per thread, so each rayon task of
+        // a whole-workspace batch opens its own.
+        brokk_bifrost_rust::graph_support::with_usage_read_frame(self, || {
+            let scope = cancellation.map_or_else(
+                || AnalyzerQueryScope::new(self),
+                |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
+            );
+            let token = scope.token();
+            let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
+            if files.is_empty() {
+                return Some(());
+            }
+            let package_files = RustPackageFileIndex::new(self, token, Some(&keep_going));
+            let Some(surface_rows) =
+                persisted_binding_surface_rows_for_files(self, files, &keep_going)
+            else {
+                return cancellation
+                    .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
+                    .then_some(());
+            };
+            let queries = RustUsageQueries::new(self);
+            for file in files {
+                if !keep_going() {
+                    return Some(());
+                }
+                let bindings = match queries.import_bindings_of(file) {
+                    Ok(bindings) => bindings,
+                    Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
+                        return Some(());
+                    }
+                    Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
+                        return None;
+                    }
+                };
+                let Some(facts) = rust_import_edge_facts_from_summary(
+                    &self.inner.adapter().naming,
+                    &package_files,
+                    file,
+                    &bindings,
+                    &surface_rows,
+                    selected_ordinals.get(file).map(Vec::as_slice),
+                    &keep_going,
+                ) else {
+                    if !keep_going() {
+                        return Some(());
+                    }
+                    return None;
+                };
+                if !visit(file, facts) {
+                    break;
+                }
+            }
+            Some(())
+        })
+    }
+
+    fn imported_file_edge_provenance_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashMap<ProjectFile, Vec<serde_json::Value>>> {
+        // One usage read frame holds the selection open for the package and
+        // route questions below; a frame is per thread, so each rayon task of
+        // a whole-workspace batch opens its own.
+        brokk_bifrost_rust::graph_support::with_usage_read_frame(self, || {
+            let scope = AnalyzerQueryScope::new(self);
+            let keep_going = || true;
+            let package_files = RustPackageFileIndex::new(self, scope.token(), Some(&keep_going));
+            let Some(surface_rows) = persisted_binding_surface_rows_for_files(
+                self,
+                std::slice::from_ref(file),
+                &keep_going,
+            ) else {
+                return direct_import_file_edges(
+                    &self.inner.adapter().naming,
+                    &package_files,
+                    file,
+                    imports,
+                );
+            };
+            let queries = RustUsageQueries::new(self);
+            let bindings = match queries.import_bindings_of(file) {
+                Ok(bindings) => bindings,
+                Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
+                    return direct_import_file_edges(
+                        &self.inner.adapter().naming,
+                        &package_files,
+                        file,
+                        imports,
+                    );
+                }
+                Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
+                    unreachable!("uncancelled Rust provenance query cannot be cancelled")
+                }
+            };
+            let Some(facts) = rust_import_edge_facts_from_summary(
+                &self.inner.adapter().naming,
+                &package_files,
+                file,
+                &bindings,
+                &surface_rows,
+                None,
+                &keep_going,
+            ) else {
+                return direct_import_file_edges(
+                    &self.inner.adapter().naming,
+                    &package_files,
+                    file,
+                    imports,
+                );
+            };
+            let mut edges = HashMap::default();
+            for fact in facts {
+                for (target, provenance) in fact.edges {
+                    edges
+                        .entry(target)
+                        .or_insert_with(Vec::new)
+                        .extend(provenance);
+                }
+            }
+            Some(edges)
+        })
+    }
+
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        if let Some(cached) = self.imported_code_units.get(file) {
+            return cached.arc().clone();
+        }
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+
+        let resolved =
+            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
+                Arc::new(brokk_bifrost_core::retention_budget::Accounted::charged(
+                    self.inner.analyzer_store().retention_budget(),
+                    rust_imported_code_units_with(
+                        &self.inner.adapter().naming,
+                        self,
+                        file,
+                        &self.inner.import_info_of(token, file),
+                    ),
+                ))
+            });
+        match resolved {
+            Ok(resolved) => {
+                {
+                    let cache_key = file.clone();
+                    let cache_value = Arc::clone(&resolved);
+                    if cache_fill.is_complete() {
+                        self.imported_code_units.insert(
+                            cache_key,
+                            brokk_bifrost_core::retention_budget::SharedAllocation::new(
+                                cache_value,
+                            ),
+                        );
+                    }
+                };
+                resolved
+            }
+            Err(resolved) => resolved,
+        }
+    }
+
+    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        if let Some(cached) = self.referencing_files.get(file) {
+            return (*cached).clone();
+        }
+        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+
+        let referencing = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
+            self,
+            || match self.live_path_snapshot().oid_for_path(file) {
+                Some(oid) => {
+                    self.inner
+                        .analyzer_store()
+                        .rust_summary_importing_file_paths(
+                            self.inner.selected_workspace_snapshots().as_ref(),
+                            &oid.to_string(),
+                            &brokk_bifrost_core::path_utils::rel_path_string(file),
+                            &self
+                                .inner
+                                .declarations(file)
+                                .iter()
+                                .map(|unit| (unit.identifier().to_owned(), unit.fq_name()))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map(|paths| {
+                            paths
+                                .into_iter()
+                                .map(|path| ProjectFile::new(file.root().to_path_buf(), path))
+                                .collect()
+                        })
+                        .unwrap_or_else(|error| {
+                            self.inner.record_store_error(error.context(format!(
+                                "reading live Rust summary importers for {file:?}"
+                            )));
+                            HashSet::default()
+                        })
+                }
+                None => HashSet::default(),
+            },
+        );
+        match referencing {
+            Ok(referencing) => {
+                {
+                    let cache_key = file.clone();
+                    let cache_value = referencing.clone();
+                    if cache_fill.is_complete() {
+                        self.referencing_files.insert(cache_key, cache_value);
+                    }
+                };
+                referencing
+            }
+            Err(referencing) => referencing,
+        }
+    }
+
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
+    }
+
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        // One usage read frame holds the selection open for the package and
+        // route questions below; a frame is per thread, so each rayon task of
+        // a whole-workspace batch opens its own.
+        brokk_bifrost_rust::graph_support::with_usage_read_frame(self, || {
+            let scope = AnalyzerQueryScope::new(self);
+            let package_files = RustPackageFileIndex::new(self, scope.token(), None);
+            let mut imported_files =
+                direct_imported_files(&self.inner.adapter().naming, &package_files, file, imports)?;
+            if imports.is_empty() {
+                return Some(imported_files);
+            }
+            let Some(surface_rows) =
+                persisted_binding_surface_rows_for_files(self, std::slice::from_ref(file), &|| {
+                    true
+                })
+            else {
+                return Some(imported_files);
+            };
+            for row in surface_rows {
+                if row.source_import_ordinal.is_some() {
+                    imported_files
+                        .insert(ProjectFile::new(file.root().to_path_buf(), row.origin_file));
+                }
+            }
+            Some(imported_files)
+        })
+    }
+
+    fn for_each_imported_files_from_infos(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        visit: &mut dyn FnMut(&ProjectFile, HashSet<ProjectFile>) -> bool,
+    ) -> Option<()> {
+        let mut visit_edges =
+            |file: &ProjectFile, edges: HashMap<ProjectFile, Vec<serde_json::Value>>| {
+                visit(file, edges.into_keys().collect())
+            };
+        self.for_each_imported_file_edges_from_infos(
+            files,
+            import_infos,
+            cancellation,
+            &mut visit_edges,
+        )
+    }
+
+    fn for_each_imported_file_edges_from_infos(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        visit: &mut dyn FnMut(&ProjectFile, HashMap<ProjectFile, Vec<serde_json::Value>>) -> bool,
+    ) -> Option<()> {
+        // One usage read frame holds the selection open for the package and
+        // route questions below; a frame is per thread, so each rayon task of
+        // a whole-workspace batch opens its own.
+        brokk_bifrost_rust::graph_support::with_usage_read_frame(self, || {
+            let scope = cancellation.map_or_else(
+                || AnalyzerQueryScope::new(self),
+                |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
+            );
+            let token = scope.token();
+            let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
+            let package_files = RustPackageFileIndex::new(self, token, Some(&keep_going));
+            let surface_rows =
+                match persisted_binding_surface_rows_for_files(self, files, &keep_going) {
+                    Some(rows) => rows,
+                    None if !keep_going() => return Some(()),
+                    None => Vec::new(),
+                };
+            let queries = RustUsageQueries::new(self);
+            for file in files {
+                if cancellation
+                    .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
+                {
+                    return Some(());
+                }
+                let owned_imports;
+                let imports = if let Some(imports) = import_infos.and_then(|infos| infos.get(file))
+                {
+                    imports.as_slice()
+                } else {
+                    owned_imports = self.inner.import_info_of(token, file);
+                    &owned_imports
+                };
+                let Some(mut imported_edges) = direct_import_file_edges(
+                    &self.inner.adapter().naming,
+                    &package_files,
+                    file,
+                    imports,
+                ) else {
+                    if !keep_going() {
+                        return Some(());
+                    }
+                    return None;
+                };
+                if !imports.is_empty() && !surface_rows.is_empty() {
+                    let bindings = match queries.import_bindings_of(file) {
+                        Ok(bindings) => bindings,
+                        Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
+                            return Some(());
+                        }
+                        Err(
+                            brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable,
+                        ) => {
+                            if !visit(file, imported_edges) {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(route_facts) = rust_import_origin_route_facts_from_summary(
+                        file,
+                        &bindings,
+                        &surface_rows,
+                        None,
+                        &keep_going,
+                    ) else {
+                        if !keep_going() {
+                            return Some(());
+                        }
+                        return None;
+                    };
+                    for route_edges in route_facts.into_values() {
+                        for (target, provenance) in route_edges {
+                            imported_edges.entry(target).or_default().extend(provenance);
+                        }
+                    }
+                }
+                if !visit(file, imported_edges) {
+                    break;
+                }
+            }
+            Some(())
+        })
+    }
+
+    fn additional_direct_file_dependencies(
+        &self,
+        files: &[ProjectFile],
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) -> Option<brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies> {
+        use rayon::prelude::*;
+
+        // The module declarations each selected file writes, from the units
+        // that hold the file. The batch may demand every unit, and each file
+        // runs in its own usage read frame; the routes it reads live in the
+        // request memos of this scope, so nothing outlives the call.
+        let _scope = AnalyzerQueryScope::with_cancellation(self, cancellation);
+        let keep_going = || !cancellation.is_cancelled();
+        let selected: HashSet<_> = files.iter().cloned().collect();
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
+        let per_file = files
+            .par_iter()
+            .map(|file| {
+                context.run(|| {
+                    if cancellation.is_cancelled() {
+                        return None;
+                    }
+                    brokk_bifrost_rust::graph_support::with_usage_read_frame(self, || {
+                        match self.file_routes(file, Some(&keep_going)) {
+                            Ok(routes) => {
+                                let declarations = routes.module_declarations_declared_in(file);
+                                let targets = declarations
+                                    .declarations
+                                    .into_iter()
+                                    .map(|declaration| declaration.target_file)
+                                    .filter(|target| selected.contains(target))
+                                    .collect::<Vec<_>>();
+                                Some((file, targets, declarations.complete))
+                            }
+                            Err(
+                                brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled,
+                            ) => None,
+                            // The route reader records the publication error on
+                            // the query. Preserve incompleteness here so no
+                            // caller caches an empty graph.
+                            Err(
+                                brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable,
+                            ) => Some((file, Vec::new(), false)),
+                        }
+                    })
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut complete = true;
+        let mut dependencies: brokk_bifrost_core::hash::HashMap<ProjectFile, HashSet<ProjectFile>> =
+            brokk_bifrost_core::hash::HashMap::default();
+        for (file, targets, file_complete) in per_file {
+            complete &= file_complete;
+            if !targets.is_empty() {
+                dependencies
+                    .entry(file.clone())
+                    .or_default()
+                    .extend(targets);
+            }
+        }
+        Some(if complete {
+            brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::complete(
+                dependencies,
+            )
+        } else {
+            brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::incomplete(
+                dependencies,
+            )
+        })
+    }
+
+    fn could_import_file(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> bool {
+        rust_could_import_file_with(
+            &self.inner.adapter().naming,
+            self,
+            source_file,
+            imports,
+            target,
+        )
+    }
+
+    /// Rust answers "could this file import the target" by resolving each
+    /// `use` path to an fq name and asking the store which files define it,
+    /// so the shared candidate walk charged one `definition_candidates` query
+    /// per `use` statement in the workspace (#1748). Every path the walk will
+    /// ask about is derivable from the import facts it already has, so resolve
+    /// them all here and hand the whole set to one batched store read.
+    fn prefetch_import_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
+    ) {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        use rayon::prelude::*;
+
+        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
+        let mut fq_names: Vec<String> = files
+            .par_iter()
+            .flat_map_iter(|file| {
+                context.run(|| {
+                    if cancellation.is_cancelled() {
+                        return Vec::new().into_iter();
+                    }
+                    let package = brokk_bifrost_rust::declarations::rust_package_name_with(
+                        &self.inner.adapter().naming,
+                        file,
+                    );
+                    let imports = import_infos
+                        .and_then(|infos| infos.get(file).cloned())
+                        .unwrap_or_else(|| self.inner.import_info_of(token, file));
+                    imports
+                        .iter()
+                        .filter_map(|import| {
+                            resolve_rust_import_fq_name_with(
+                                &self.inner.adapter().naming,
+                                file,
+                                &package,
+                                import,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                })
+            })
+            .collect();
+        if cancellation.is_cancelled() {
+            return;
+        }
+        fq_names.sort_unstable();
+        fq_names.dedup();
+        self.inner.prefetch_definitions(&fq_names);
+    }
+}
+
+impl RustAnalyzer {
+    fn import_resolution_dependencies_in_read_frame(
+        &self,
+        files: &[ProjectFile],
+        selected_ordinals: &brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<u32>>,
+        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+    ) -> Option<
+        brokk_bifrost_core::hash::HashMap<
+            ProjectFile,
+            brokk_bifrost_core::analyzer::capabilities::ImportResolutionDependencies,
+        >,
+    > {
         if files.is_empty() {
             return Some(brokk_bifrost_core::hash::HashMap::default());
         }
@@ -270,7 +819,26 @@ impl ImportAnalysisProvider for RustAnalyzer {
             |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
         );
         let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        let cargo_routes = self.cargo_routes_while(&keep_going).ok()?;
+        // The crate root a file's first import segment names, from the units
+        // that hold the file. `None` is unavailable: a partial answer may have
+        // omitted the root, and the import graph reports that as unknown.
+        let foreign_root = |file: &ProjectFile, first: &String| -> Option<Option<ProjectFile>> {
+            let segments = std::slice::from_ref(first);
+            let answer = brokk_bifrost_rust::graph_support::with_unscoped_libraries(
+                self,
+                file,
+                Some(&keep_going),
+                |routes, unscoped| {
+                    routes.resolve_crate_root_file_segments_with_kind_or_unscoped(
+                        file, segments, unscoped,
+                    )
+                },
+            )
+            .ok()?;
+            answer
+                .complete
+                .then_some(answer.value.map(|(root, _)| root))
+        };
         if !keep_going() {
             return None;
         }
@@ -348,9 +916,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 let Some(first) = target.module_path.first() else {
                     continue;
                 };
-                if let Some((root, _)) = cargo_routes
-                    .resolve_crate_root_file_segments_with_kind(&file, std::slice::from_ref(first))
-                {
+                if let Some(root) = foreign_root(&file, first)? {
                     foreign_roots.push(brokk_bifrost_core::path_utils::rel_path_string(&root));
                 }
             }
@@ -406,6 +972,13 @@ impl ImportAnalysisProvider for RustAnalyzer {
                     continue;
                 }
                 let root_lookup_names = target.imported_name.iter().cloned().collect::<Vec<_>>();
+                let root_member = match target.module_path.first() {
+                    Some(first) => foreign_root(file, first)?.and_then(|root| {
+                        completeness_by_path
+                            .get(&brokk_bifrost_core::path_utils::rel_path_string(&root))
+                    }),
+                    None => None,
+                };
                 append_rust_summary_import_module_candidates(
                     &mut module_candidates,
                     &mut seen_module_candidates,
@@ -416,14 +989,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
                     &package_components,
                     &root_components,
                     &root_lookup_names,
-                    target.module_path.first().and_then(|first| {
-                        let (root, _) = cargo_routes.resolve_crate_root_file_segments_with_kind(
-                            file,
-                            std::slice::from_ref(first),
-                        )?;
-                        completeness_by_path
-                            .get(&brokk_bifrost_core::path_utils::rel_path_string(&root))
-                    }),
+                    root_member,
                 );
             }
         }
@@ -478,6 +1044,13 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 serde_json::from_str(&route_member.package_components).ok()?;
             let root_components: Vec<String> =
                 serde_json::from_str(&route_member.root_components).ok()?;
+            let root_member = match target.module_path.first() {
+                Some(first) => foreign_root(&route_file, first)?.and_then(|root| {
+                    completeness_by_path
+                        .get(&brokk_bifrost_core::path_utils::rel_path_string(&root))
+                }),
+                None => None,
+            };
             append_rust_summary_import_module_candidates(
                 &mut module_candidates,
                 &mut seen_module_candidates,
@@ -488,14 +1061,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 &package_components,
                 &root_components,
                 &[row.route_name.clone(), row.origin_name.clone()],
-                target.module_path.first().and_then(|first| {
-                    let (root, _) = cargo_routes.resolve_crate_root_file_segments_with_kind(
-                        &route_file,
-                        std::slice::from_ref(first),
-                    )?;
-                    completeness_by_path
-                        .get(&brokk_bifrost_core::path_utils::rel_path_string(&root))
-                }),
+                root_member,
             );
         }
         let candidates = module_candidates
@@ -654,426 +1220,6 @@ impl ImportAnalysisProvider for RustAnalyzer {
             facts.missing_module_path_keys.dedup();
         }
         Some(dependencies)
-    }
-
-    fn for_each_import_edge_facts_from_infos(
-        &self,
-        files: &[ProjectFile],
-        _import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
-        selected_ordinals: &brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<u32>>,
-        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-        visit: &mut dyn FnMut(&ProjectFile, Vec<ImportedFileEdgeFacts>) -> bool,
-    ) -> Option<()> {
-        let scope = cancellation.map_or_else(
-            || AnalyzerQueryScope::new(self),
-            |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
-        );
-        let token = scope.token();
-        let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        if files.is_empty() {
-            return Some(());
-        }
-        let package_files = match self.package_file_index_while(token, &keep_going) {
-            Ok(files) => files,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                return Some(());
-            }
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                return None;
-            }
-        };
-        let Some(surface_rows) = persisted_binding_surface_rows_for_files(self, files, &keep_going)
-        else {
-            return cancellation
-                .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
-                .then_some(());
-        };
-        let queries = RustUsageQueries::new(self);
-        for file in files {
-            if !keep_going() {
-                return Some(());
-            }
-            let bindings = match queries.import_bindings_of(file) {
-                Ok(bindings) => bindings,
-                Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                    return Some(());
-                }
-                Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                    return None;
-                }
-            };
-            let Some(facts) = rust_import_edge_facts_from_summary(
-                &package_files,
-                file,
-                &bindings,
-                &surface_rows,
-                selected_ordinals.get(file).map(Vec::as_slice),
-                &keep_going,
-            ) else {
-                if !keep_going() {
-                    return Some(());
-                }
-                return None;
-            };
-            if !visit(file, facts) {
-                break;
-            }
-        }
-        Some(())
-    }
-
-    fn imported_file_edge_provenance_from_infos(
-        &self,
-        file: &ProjectFile,
-        imports: &[ImportInfo],
-    ) -> Option<HashMap<ProjectFile, Vec<serde_json::Value>>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let keep_going = || true;
-        let package_files = self
-            .package_file_index_while(scope.token(), &keep_going)
-            .ok()?;
-        let Some(surface_rows) =
-            persisted_binding_surface_rows_for_files(self, std::slice::from_ref(file), &keep_going)
-        else {
-            return Some(direct_import_file_edges(&package_files, file, imports));
-        };
-        let queries = RustUsageQueries::new(self);
-        let bindings = match queries.import_bindings_of(file) {
-            Ok(bindings) => bindings,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                return Some(direct_import_file_edges(&package_files, file, imports));
-            }
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                unreachable!("uncancelled Rust provenance query cannot be cancelled")
-            }
-        };
-        let Some(facts) = rust_import_edge_facts_from_summary(
-            &package_files,
-            file,
-            &bindings,
-            &surface_rows,
-            None,
-            &keep_going,
-        ) else {
-            return Some(direct_import_file_edges(&package_files, file, imports));
-        };
-        let mut edges = HashMap::default();
-        for fact in facts {
-            for (target, provenance) in fact.edges {
-                edges
-                    .entry(target)
-                    .or_insert_with(Vec::new)
-                    .extend(provenance);
-            }
-        }
-        Some(edges)
-    }
-
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        if let Some(cached) = self.imported_code_units.get(file) {
-            return cached;
-        }
-        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-
-        let resolved =
-            brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(self, || {
-                Arc::new(rust_imported_code_units(
-                    self,
-                    file,
-                    &self.inner.import_info_of(token, file),
-                ))
-            });
-        match resolved {
-            Ok(resolved) => {
-                {
-                    let cache_key = file.clone();
-                    let cache_value = Arc::clone(&resolved);
-                    if cache_fill.is_complete() {
-                        self.imported_code_units.insert(cache_key, cache_value);
-                    }
-                };
-                resolved
-            }
-            Err(resolved) => resolved,
-        }
-    }
-
-    fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        if let Some(cached) = self.referencing_files.get(file) {
-            return (*cached).clone();
-        }
-        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-
-        let referencing = brokk_bifrost_analysis::analyzer::common::complete_query_cache_fill(
-            self,
-            || match self.live_path_snapshot().oid_for_path(file) {
-                Some(oid) => {
-                    self.inner
-                        .analyzer_store()
-                        .rust_summary_importing_file_paths(
-                            self.inner.selected_workspace_snapshots().as_ref(),
-                            &oid.to_string(),
-                            &brokk_bifrost_core::path_utils::rel_path_string(file),
-                            &self
-                                .inner
-                                .declarations(file)
-                                .iter()
-                                .map(|unit| (unit.identifier().to_owned(), unit.fq_name()))
-                                .collect::<Vec<_>>(),
-                        )
-                        .map(|paths| {
-                            paths
-                                .into_iter()
-                                .map(|path| ProjectFile::new(file.root().to_path_buf(), path))
-                                .collect()
-                        })
-                        .unwrap_or_else(|error| {
-                            self.inner.record_store_error(error.context(format!(
-                                "reading live Rust summary importers for {file:?}"
-                            )));
-                            HashSet::default()
-                        })
-                }
-                None => HashSet::default(),
-            },
-        );
-        match referencing {
-            Ok(referencing) => {
-                {
-                    let cache_key = file.clone();
-                    let cache_value = Arc::new(referencing.clone());
-                    if cache_fill.is_complete() {
-                        self.referencing_files.insert(cache_key, cache_value);
-                    }
-                };
-                referencing
-            }
-            Err(referencing) => referencing,
-        }
-    }
-
-    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(token, file)
-    }
-
-    fn imported_files_from_infos(
-        &self,
-        file: &ProjectFile,
-        imports: &[ImportInfo],
-    ) -> Option<HashSet<ProjectFile>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let package_files = self
-            .package_file_index_while(scope.token(), &|| true)
-            .ok()?;
-        let mut imported_files = direct_imported_files(&package_files, file, imports);
-        if imports.is_empty() {
-            return Some(imported_files);
-        }
-        let Some(surface_rows) =
-            persisted_binding_surface_rows_for_files(self, std::slice::from_ref(file), &|| true)
-        else {
-            return Some(imported_files);
-        };
-        for row in surface_rows {
-            if row.source_import_ordinal.is_some() {
-                imported_files.insert(ProjectFile::new(file.root().to_path_buf(), row.origin_file));
-            }
-        }
-        Some(imported_files)
-    }
-
-    fn for_each_imported_files_from_infos(
-        &self,
-        files: &[ProjectFile],
-        import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
-        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-        visit: &mut dyn FnMut(&ProjectFile, HashSet<ProjectFile>) -> bool,
-    ) -> Option<()> {
-        let mut visit_edges =
-            |file: &ProjectFile, edges: HashMap<ProjectFile, Vec<serde_json::Value>>| {
-                visit(file, edges.into_keys().collect())
-            };
-        self.for_each_imported_file_edges_from_infos(
-            files,
-            import_infos,
-            cancellation,
-            &mut visit_edges,
-        )
-    }
-
-    fn for_each_imported_file_edges_from_infos(
-        &self,
-        files: &[ProjectFile],
-        import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
-        cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
-        visit: &mut dyn FnMut(&ProjectFile, HashMap<ProjectFile, Vec<serde_json::Value>>) -> bool,
-    ) -> Option<()> {
-        let scope = cancellation.map_or_else(
-            || AnalyzerQueryScope::new(self),
-            |cancellation| AnalyzerQueryScope::with_cancellation(self, cancellation),
-        );
-        let token = scope.token();
-        let keep_going = || cancellation.is_none_or(|token| !token.is_cancelled());
-        let package_files = match self.package_file_index_while(token, &keep_going) {
-            Ok(files) => files,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                return Some(());
-            }
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                return None;
-            }
-        };
-        let surface_rows = match persisted_binding_surface_rows_for_files(self, files, &keep_going)
-        {
-            Some(rows) => rows,
-            None if !keep_going() => return Some(()),
-            None => Vec::new(),
-        };
-        let queries = RustUsageQueries::new(self);
-        for file in files {
-            if cancellation
-                .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
-            {
-                return Some(());
-            }
-            let owned_imports;
-            let imports = if let Some(imports) = import_infos.and_then(|infos| infos.get(file)) {
-                imports.as_slice()
-            } else {
-                owned_imports = self.inner.import_info_of(token, file);
-                &owned_imports
-            };
-            let mut imported_edges = direct_import_file_edges(&package_files, file, imports);
-            if !imports.is_empty() && !surface_rows.is_empty() {
-                let bindings = match queries.import_bindings_of(file) {
-                    Ok(bindings) => bindings,
-                    Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => {
-                        return Some(());
-                    }
-                    Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                        if !visit(file, imported_edges) {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let Some(route_facts) = rust_import_origin_route_facts_from_summary(
-                    file,
-                    &bindings,
-                    &surface_rows,
-                    None,
-                    &keep_going,
-                ) else {
-                    if !keep_going() {
-                        return Some(());
-                    }
-                    return None;
-                };
-                for route_edges in route_facts.into_values() {
-                    for (target, provenance) in route_edges {
-                        imported_edges.entry(target).or_default().extend(provenance);
-                    }
-                }
-            }
-            if !visit(file, imported_edges) {
-                break;
-            }
-        }
-        Some(())
-    }
-
-    fn additional_direct_file_dependencies(
-        &self,
-        files: &[ProjectFile],
-        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-    ) -> Option<brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies> {
-        let routes = match self.cargo_routes_while(&|| !cancellation.is_cancelled()) {
-            Ok(routes) => routes,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Cancelled) => return None,
-            Err(brokk_bifrost_rust::graph_support::RustCargoRouteError::Unavailable) => {
-                // The route reader records the publication error on the query.
-                // Preserve incompleteness here so no caller caches an empty graph.
-                return Some(brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::incomplete(
-                    brokk_bifrost_core::hash::HashMap::default(),
-                ));
-            }
-        };
-        let selected: HashSet<_> = files.iter().cloned().collect();
-        let mut dependencies: brokk_bifrost_core::hash::HashMap<ProjectFile, HashSet<ProjectFile>> =
-            brokk_bifrost_core::hash::HashMap::default();
-        for declaration in routes.external_module_declarations() {
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            if selected.contains(&declaration.declaring_file)
-                && selected.contains(&declaration.target_file)
-            {
-                dependencies
-                    .entry(declaration.declaring_file.clone())
-                    .or_default()
-                    .insert(declaration.target_file.clone());
-            }
-        }
-        Some(
-            brokk_bifrost_core::analyzer::capabilities::AdditionalFileDependencies::complete(
-                dependencies,
-            ),
-        )
-    }
-
-    fn could_import_file(
-        &self,
-        source_file: &ProjectFile,
-        imports: &[ImportInfo],
-        target: &ProjectFile,
-    ) -> bool {
-        rust_could_import_file(self, source_file, imports, target)
-    }
-
-    /// Rust answers "could this file import the target" by resolving each
-    /// `use` path to an fq name and asking the store which files define it,
-    /// so the shared candidate walk charged one `definition_candidates` query
-    /// per `use` statement in the workspace (#1748). Every path the walk will
-    /// ask about is derivable from the import facts it already has, so resolve
-    /// them all here and hand the whole set to one batched store read.
-    fn prefetch_import_targets(
-        &self,
-        files: &[ProjectFile],
-        import_infos: Option<&brokk_bifrost_core::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
-        cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
-    ) {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        use rayon::prelude::*;
-
-        let context = brokk_bifrost_core::analyzer::carried_context::CarriedContext::current();
-        let mut fq_names: Vec<String> = files
-            .par_iter()
-            .flat_map_iter(|file| {
-                context.run(|| {
-                    if cancellation.is_cancelled() {
-                        return Vec::new().into_iter();
-                    }
-                    let package = rust_package_name(file);
-                    let imports = import_infos
-                        .and_then(|infos| infos.get(file).cloned())
-                        .unwrap_or_else(|| self.inner.import_info_of(token, file));
-                    imports
-                        .iter()
-                        .filter_map(|import| resolve_rust_import_fq_name(file, &package, import))
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                })
-            })
-            .collect();
-        if cancellation.is_cancelled() {
-            return;
-        }
-        fq_names.sort_unstable();
-        fq_names.dedup();
-        self.inner.prefetch_definitions(&fq_names);
     }
 }
 
@@ -1510,46 +1656,63 @@ fn hash_usize(hasher: &mut CanonicalHasher, name: &str, value: usize) {
     hasher.field(name, &value.to_be_bytes());
 }
 
+/// The files an import path names, or `None` when the package questions behind
+/// the answer failed or were incomplete. Every caller reports `None` as an
+/// unavailable edge answer, which its consumer treats as unknown, so an omitted
+/// member is never read as an import that resolves to nothing.
+fn complete_direct_import_files(
+    caches: &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches,
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex<'_>,
+    file: &ProjectFile,
+    segments: &[String],
+) -> Option<Vec<ProjectFile>> {
+    let answer = brokk_bifrost_rust::graph_support::resolve_direct_import_files_with(
+        caches,
+        package_files,
+        file,
+        segments,
+    )
+    .ok()?;
+    answer.complete.then_some(answer.value)
+}
+
 fn direct_imported_files(
-    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex,
+    caches: &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches,
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex<'_>,
     file: &ProjectFile,
     imports: &[ImportInfo],
-) -> HashSet<ProjectFile> {
-    imports
-        .iter()
-        .filter_map(|import| import.path.as_ref())
-        .flat_map(|path| {
-            brokk_bifrost_rust::graph_support::resolve_direct_import_files(
-                package_files,
-                file,
-                &path.segments,
-            )
-        })
-        .collect()
+) -> Option<HashSet<ProjectFile>> {
+    let mut files = HashSet::default();
+    for path in imports.iter().filter_map(|import| import.path.as_ref()) {
+        files.extend(complete_direct_import_files(
+            caches,
+            package_files,
+            file,
+            &path.segments,
+        )?);
+    }
+    Some(files)
 }
 
 fn direct_import_file_edges(
-    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex,
+    caches: &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches,
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex<'_>,
     file: &ProjectFile,
     imports: &[ImportInfo],
-) -> HashMap<ProjectFile, Vec<serde_json::Value>> {
+) -> Option<HashMap<ProjectFile, Vec<serde_json::Value>>> {
     let mut edges = HashMap::default();
     for import in imports {
         let Some(path) = import.path.as_ref() else {
             continue;
         };
-        for target in brokk_bifrost_rust::graph_support::resolve_direct_import_files(
-            package_files,
-            file,
-            &path.segments,
-        ) {
+        for target in complete_direct_import_files(caches, package_files, file, &path.segments)? {
             edges
                 .entry(target)
                 .or_insert_with(Vec::new)
                 .push(serde_json::json!({ "kind": "rust_import_fact", "fact": import }));
         }
     }
-    edges
+    Some(edges)
 }
 
 fn persisted_binding_surface_rows_for_files(
@@ -1604,7 +1767,8 @@ fn persisted_binding_surface_rows_for_files(
 }
 
 fn rust_import_edge_facts_from_summary(
-    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex,
+    caches: &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches,
+    package_files: &brokk_bifrost_rust::graph_support::RustPackageFileIndex<'_>,
     file: &ProjectFile,
     bindings: &[RustImportBinding],
     surface_rows: &[RustSummaryBindingSurfaceRow],
@@ -1641,11 +1805,7 @@ fn rust_import_edge_facts_from_summary(
         let edges = by_ordinal
             .get_mut(ordinal)
             .expect("selected Rust import ordinal was initialized");
-        for target in brokk_bifrost_rust::graph_support::resolve_direct_import_files(
-            package_files,
-            file,
-            &binding.path,
-        ) {
+        for target in complete_direct_import_files(caches, package_files, file, &binding.path)? {
             edges
                 .entry(target)
                 .or_insert_with(Vec::new)
@@ -1753,6 +1913,7 @@ fn rust_import_origin_route_facts_from_summary(
 
 #[cfg(test)]
 fn rust_import_edge_facts_for_file(
+    naming: &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches,
     walks: &RustUsageWalks<'_>,
     file: &ProjectFile,
     selected_ordinals: Option<&[u32]>,
@@ -1790,11 +1951,13 @@ fn rust_import_edge_facts_for_file(
         let edges = by_ordinal
             .get_mut(ordinal)
             .expect("selected Rust import ordinal was initialized");
-        for target in brokk_bifrost_rust::graph_support::resolve_direct_import_files(
+        let files = brokk_bifrost_rust::graph_support::resolve_direct_import_files_with(
+            naming,
             walks.package_files(),
             file,
             &binding.path,
-        ) {
+        )?;
+        for target in files.value {
             edges
                 .entry(target)
                 .or_insert_with(Vec::new)
@@ -2050,8 +2213,9 @@ mod tests {
                 "use crate::facade::Renamed as Consumed; pub fn consumer(_: Consumed) {}\n",
             )
             .build();
-        let workspace = project
-            .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+        let workspace = project.certified_workspace_analyzer(
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+        );
         let analyzer = resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
             .expect("workspace contains the Rust analyzer");
         let files = analyzer.inner.all_files();
@@ -2124,8 +2288,9 @@ mod tests {
                 "use crate::facade::Renamed as Local; fn use_item(_: Local) {}\n",
             )
             .build();
-        let workspace = project
-            .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+        let workspace = project.certified_workspace_analyzer(
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+        );
         let analyzer = resolve_analyzer::<RustAnalyzer>(workspace.analyzer())
             .expect("workspace contains the Rust analyzer");
         let files = analyzer.inner.all_files();
@@ -2172,9 +2337,7 @@ mod tests {
             }
             normalized
         };
-        let package_files = analyzer
-            .package_file_index_while(scope.token(), &|| true)
-            .expect("fixture package members are published");
+        let package_files = RustPackageFileIndex::new(analyzer, scope.token(), None);
         let mut actual_bulk_edges = HashMap::default();
         analyzer
             .for_each_imported_file_edges_from_infos(&files, None, None, &mut |file, edges| {
@@ -2252,8 +2415,14 @@ mod tests {
                  walk-only missing modules={walk_missing:#?}; \
                  summary-only missing modules={summary_missing:#?}"
             );
-            let walk_edges = rust_import_edge_facts_for_file(&walks, file, None, &|| true)
-                .expect("legacy walk enumerates import edge facts");
+            let walk_edges = rust_import_edge_facts_for_file(
+                &analyzer.inner.adapter().naming,
+                &walks,
+                file,
+                None,
+                &|| true,
+            )
+            .expect("legacy walk enumerates import edge facts");
             let summary_edges = actual_edge_facts
                 .get(file)
                 .expect("summary reader returns each requested file");
@@ -2274,8 +2443,13 @@ mod tests {
             );
 
             let imports = analyzer.inner.import_info_of(scope.token(), file);
-            let expected_imported = direct_imported_files(&package_files, file, &imports);
-            let mut expected_imported = expected_imported;
+            let mut expected_imported = direct_imported_files(
+                &analyzer.inner.adapter().naming,
+                &package_files,
+                file,
+                &imports,
+            )
+            .expect("fixture package members are published and complete");
             for route in walks
                 .origin_routes_of(file)
                 .expect("legacy walk enumerates origin routes")
@@ -2307,14 +2481,20 @@ mod tests {
                  walk-only={walk_only:#?}; summary-only={summary_only:#?}"
             );
 
-            let expected_provenance = rust_import_edge_facts_for_file(&walks, file, None, &|| true)
-                .expect("legacy walk enumerates imported-file provenance")
-                .into_iter()
-                .flat_map(|fact| fact.edges)
-                .fold(HashMap::default(), |mut all, (target, values)| {
-                    all.entry(target).or_insert_with(Vec::new).extend(values);
-                    all
-                });
+            let expected_provenance = rust_import_edge_facts_for_file(
+                &analyzer.inner.adapter().naming,
+                &walks,
+                file,
+                None,
+                &|| true,
+            )
+            .expect("legacy walk enumerates imported-file provenance")
+            .into_iter()
+            .flat_map(|fact| fact.edges)
+            .fold(HashMap::default(), |mut all, (target, values)| {
+                all.entry(target).or_insert_with(Vec::new).extend(values);
+                all
+            });
             let actual_provenance = analyzer
                 .imported_file_edge_provenance_from_infos(file, &imports)
                 .expect("live summary rows provide imported-file provenance");
@@ -2325,7 +2505,13 @@ mod tests {
                 "persisted versus walk imported-file provenance differs for {file:?}"
             );
 
-            let mut expected_bulk = direct_import_file_edges(&package_files, file, &imports);
+            let mut expected_bulk = direct_import_file_edges(
+                &analyzer.inner.adapter().naming,
+                &package_files,
+                file,
+                &imports,
+            )
+            .expect("fixture package members are published and complete");
             for route in walks
                 .origin_routes_of(file)
                 .expect("legacy walk enumerates bulk origin routes")

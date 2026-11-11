@@ -261,6 +261,9 @@ pub fn compile_pack(
         safety: normalized.safety,
         cpp_portability: normalized.cpp_portability,
         python_correspondence: normalized.python_correspondence,
+        rust_external_reexports: normalized.rust_external_reexports,
+        rust_external_reexports_truncated: normalized.rust_external_reexports_truncated,
+        rust_external_reexports_glob_incomplete: normalized.rust_external_reexports_glob_incomplete,
         carried_sources: normalized.carried_sources,
         source_inputs: None,
         semantic_sha256: String::new(),
@@ -632,7 +635,14 @@ fn compile_procedure_summary(
     Ok(CompiledProcedureSummary {
         id: summary.id.clone(),
         model_id: format!("{pack_id}#{}", summary.id),
-        contract_version: PROCEDURE_SUMMARY_CONTRACT_VERSION,
+        // #9431: claim-free summaries retain their v1 compiled identity.
+        contract_version: if summary.subject_effects.is_empty()
+            && summary.lifecycle_coverage.is_empty()
+        {
+            1
+        } else {
+            PROCEDURE_SUMMARY_CONTRACT_VERSION
+        },
         content_sha256,
         target: CompiledProcedureTarget {
             path: summary.target.path.clone(),
@@ -655,6 +665,8 @@ fn compile_procedure_summary(
         concurrency_effects: summary.concurrency_effects.clone(),
         returned_callables: summary.returned_callables.clone(),
         declared_effects: summary.declared_effects.clone(),
+        subject_effects: summary.subject_effects.clone(),
+        lifecycle_coverage: summary.lifecycle_coverage.clone(),
         preconditions: summary.preconditions.clone(),
         result_contracts: summary.result_contracts.clone(),
         result_use_obligations: summary.result_use_obligations.clone(),
@@ -842,6 +854,43 @@ mod extraction_contract_tests {
         ArtifactExtraction, ArtifactExtractionKind, DecodeLimits, decode_manifest,
         decode_shard_for_manifest,
     };
+
+    #[test]
+    fn rust_approximation_pack_requires_schema_28() {
+        let source = include_bytes!("../../../tests/fixtures/extraction-contract.json");
+        let mut pack: AuthoredSemanticModelPack = serde_json::from_slice(source).unwrap();
+        pack.compatibility.bifrost = None;
+        pack.provenance.rust_artifact_approximation = Some(
+            crate::analyzer::semantic_model::model::RustArtifactApproximation {
+                built_from_version: "0.4.23".to_owned(),
+                built_from_features: vec!["std".to_owned()],
+                built_from_cfgs: vec!["docsrs".to_owned()],
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                format_version: 61,
+                toolchain: "nightly-2026-08-24".to_owned(),
+                docsrs_build: true,
+                original_sha256: "11".repeat(32),
+                produced_sha256: "11".repeat(32),
+                activation_version_requirement: ">=0.4.0, <0.5.0".to_owned(),
+                mismatch_kinds: Vec::new(),
+                selection_rule_id: "cargo-compatible-nearest".to_owned(),
+                selection_rule_version: 1,
+            },
+        );
+        pack.schema_version = 27;
+        let rejected = compile_pack(&pack, &CompilerOptions::default()).unwrap_err();
+        assert!(rejected.iter().any(|diagnostic| {
+            diagnostic.code == "provenance.rust_artifact_approximation_schema_version"
+        }));
+
+        pack.schema_version = 28;
+        let compiled = compile_pack(&pack, &CompilerOptions::default()).unwrap();
+        assert_eq!(compiled.manifest.schema_version, 28);
+        let mut old_manifest = compiled.manifest.clone();
+        old_manifest.schema_version = 26;
+        let old_bytes = serde_json::to_vec(&old_manifest).unwrap();
+        assert!(decode_manifest(&old_bytes, &DecodeLimits::default()).is_err());
+    }
 
     #[test]
     fn extraction_is_producer_only_and_part_of_both_semantic_identities() {

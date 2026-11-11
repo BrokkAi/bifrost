@@ -33,11 +33,12 @@ use brokk_bifrost::policy::{
     BuiltInPolicyCatalogManifest, BuiltInPolicySelection, BuiltInPolicySelectionRecord,
     ExplanationCandidate, ExplanationGeneration, ExplanationLimits, ExplanationTarget,
     FlowExplanationCandidate, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
-    MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
-    PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource, PolicyBatchOutcome,
-    PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExecutionStage,
-    PolicyFailOn, PolicyFindingId, PolicyOnInconclusive, PolicyRangeRequest, PolicyRenderError,
-    PolicyScopeOptions, PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
+    InlineSuppressionPrefix, MAX_RQLP_SOURCE_BYTES, NearMissCandidates, POLICY_EXIT_CLEAN,
+    POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
+    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
+    PolicyExecutionStage, PolicyFailOn, PolicyFindingId, PolicyInlineSuppressionOptions,
+    PolicyOnInconclusive, PolicyRangeRequest, PolicyRenderError, PolicyScopeOptions,
+    PolicyScopeSource, PolicySourceIdentity, PolicySourceIdentityResolution,
     PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity, built_in_policy_catalog,
     escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs, policy_bundles,
     policy_source_identity, rank_policy_near_misses, relation_schema_catalog, write_policy_human,
@@ -136,6 +137,10 @@ fn main() -> ExitCode {
         })
     } else {
         brokk_bifrost::ensure_global_rayon_pool();
+        // The CLI process owns one retention budget for every analyzer it builds.
+        let retention_budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
+            brokk_bifrost_analysis::AnalyzerConfig::default().retention_budget_bytes(),
+        );
         // Windows gives the main thread a 1 MiB stack, Linux 8 MiB. RQL
         // policy lowering recurses once per query nesting level with large
         // frames, and overflowed on Windows (#4573). Run with the Linux
@@ -143,7 +148,7 @@ fn main() -> ExitCode {
         std::thread::Builder::new()
             .name("bifrost-cli".into())
             .stack_size(CLI_STACK_BYTES)
-            .spawn(move || run(args.into_iter()))
+            .spawn(move || run(args.into_iter(), &retention_budget))
             .expect("spawn the CLI thread")
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -168,58 +173,6 @@ fn main() -> ExitCode {
     }
 }
 
-fn acquire_open_packs_for_process() -> Result<(), String> {
-    const SEMANTIC_BUNDLE_ENV: &str = "BIFROST_OPEN_SEMANTIC_PACK_BUNDLE";
-    const SEMANTIC_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
-
-    if open_packs_disabled() {
-        return Ok(());
-    }
-    if std::env::var_os(SEMANTIC_BUNDLE_ENV).is_some()
-        || brokk_bifrost::policy::policy_pack_roots_from_env()
-            .map_err(|error| error.to_string())?
-            .is_some()
-    {
-        return Ok(());
-    }
-    let profile = brokk_bifrost::open_pack_engine_profile();
-    match brokk_bifrost_semantic_packs::download::prepare_open_packs_for_runtime(&profile) {
-        Ok(brokk_bifrost_semantic_packs::download::OpenPackRuntimeOutcome::Selected(selection)) => {
-            let selection = *selection;
-            // Set the roots before semantic catalogs or workspaces initialize.
-            unsafe {
-                if let Some(bundle_root) = selection.semantic_bundle_root.as_ref() {
-                    std::env::set_var(SEMANTIC_BUNDLE_ENV, bundle_root);
-                }
-                if let Some(policy_root) = selection.policy_pack_root.as_ref() {
-                    std::env::set_var(brokk_bifrost::policy::POLICY_PACK_ROOT_ENV, policy_root);
-                }
-                if let Some(bundle_root) = selection.policy_bundle_root.as_ref() {
-                    std::env::set_var(brokk_bifrost::policy::POLICY_BUNDLE_ROOT_ENV, bundle_root);
-                }
-                if std::env::var_os(SEMANTIC_CACHE_ROOT_ENV).is_none() {
-                    std::env::set_var(SEMANTIC_CACHE_ROOT_ENV, selection.semantic_cache_root);
-                }
-            }
-            Ok(())
-        }
-        Ok(brokk_bifrost_semantic_packs::download::OpenPackRuntimeOutcome::Unselected {
-            kind,
-            message,
-        }) => {
-            if should_warn_open_pack_fallback(&kind, open_packs_offline_requested()) {
-                eprintln!(
-                    "[bifrost] Open-pack acquisition {kind}: {message}. Continuing without \
-                     semantic packs; set BIFROST_OPEN_SEMANTIC_PACK_BUNDLE to an extracted \
-                     packs release to use one offline."
-                );
-            }
-            Ok(())
-        }
-        Err(error) => Err(format!("open pack acquisition failed: {error}")),
-    }
-}
-
 fn install_semantic_model_packs_for_process() -> Result<(), String> {
     brokk_bifrost::install_bifrost_semantic_model_packs().map_err(|error| error.to_string())
 }
@@ -228,37 +181,11 @@ fn tool_activates_open_packs(tool_name: &str) -> bool {
     tool_name == "run_policy"
 }
 
-fn open_packs_disabled() -> bool {
-    matches!(
-        std::env::var("BIFROST_OPEN_PACKS_DISABLE").as_deref(),
-        Ok("1" | "true")
-    )
-}
-
-fn open_packs_offline_requested() -> bool {
-    matches!(
-        std::env::var("BIFROST_OPEN_PACKS_OFFLINE").as_deref(),
-        Ok("1" | "true")
-    ) || std::env::var("BIFROST_LAUNCHER_AUTO_INSTALL").as_deref() == Ok("0")
-}
-
-fn should_warn_open_pack_fallback(
-    kind: &brokk_bifrost_semantic_packs::download::OpenPackFallbackKind,
-    offline_requested: bool,
-) -> bool {
-    use brokk_bifrost_semantic_packs::download::OpenPackFallbackKind;
-
-    match kind {
-        OpenPackFallbackKind::NetworkUnavailable => true,
-        OpenPackFallbackKind::OfflineCacheMiss => !offline_requested,
-        OpenPackFallbackKind::Disabled
-        | OpenPackFallbackKind::NoCompatibleRelease
-        | OpenPackFallbackKind::Pending
-        | OpenPackFallbackKind::Unsupported => false,
-    }
-}
-
-fn run(args: impl Iterator<Item = String>) -> Result<CliRunResult, CliRunError> {
+fn run(
+    args: impl Iterator<Item = String>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+) -> Result<CliRunResult, CliRunError> {
+    let _product_entry = brokk_bifrost_analysis::analyzer::enter_product_entry();
     let args = args.collect::<Vec<_>>();
     if let Some(result) = run_portable_runtime_command(&args) {
         return result.map_err(|message| CliRunError {
@@ -270,17 +197,21 @@ fn run(args: impl Iterator<Item = String>) -> Result<CliRunResult, CliRunError> 
     // flag surface stays untouched: everywhere else the word remains an
     // unknown argument exactly as before the subcommand existed.
     if args.first().map(String::as_str) == Some("scan") {
-        return run_scan(args.into_iter().skip(1)).map_err(|message| CliRunError {
-            message,
-            // A scan failure reports through the policy exit contract: its
-            // run is a policy evaluation, so its errors are unreliable runs.
-            policy_invocation: true,
+        return run_scan(args.into_iter().skip(1), retention_budget).map_err(|message| {
+            CliRunError {
+                message,
+                // A scan failure reports through the policy exit contract: its
+                // run is a policy evaluation, so its errors are unreliable runs.
+                policy_invocation: true,
+            }
         });
     }
     let policy_invocation = has_policy_syntax(&args);
-    run_inner(args.into_iter(), policy_invocation).map_err(|message| CliRunError {
-        message,
-        policy_invocation,
+    run_inner(args.into_iter(), policy_invocation, retention_budget).map_err(|message| {
+        CliRunError {
+            message,
+            policy_invocation,
+        }
     })
 }
 
@@ -357,7 +288,7 @@ fn policy_source_identity_json(args: &[String]) -> Result<Value, String> {
         "format": "bifrost_policy_source_identity/v1",
         "source_id": report.source_identity.as_str(),
         "policy_file": args[1],
-        "source_sha256": format!("{:x}", Sha256::digest(&source)),
+        "source_sha256": brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(&Sha256::digest(&source).into()),
         "authored_hash": report.authored_hash.to_string(),
         "resolved": resolved,
         "provenance": {
@@ -629,7 +560,11 @@ fn executable_sha256() -> Result<String, String> {
         }
         hasher.update(&buffer[..bytes_read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        ),
+    )
 }
 
 fn remove_prepare_output(path: &Path) -> Result<(), String> {
@@ -744,6 +679,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--on-inconclusive"
                 | "--suppressions-file"
                 | "--scope-file"
+                | "--inline-suppression-prefix"
                 | "--baseline-file"
                 | "--accept-current"
                 | "--evaluation-date"
@@ -796,6 +732,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--on-inconclusive"
             | "--suppressions-file"
             | "--scope-file"
+            | "--inline-suppression-prefix"
             | "--baseline-file"
             | "--evaluation-date"
             | "--diff-base"
@@ -843,6 +780,7 @@ fn parse_explain_position(flag: &str, value: &str) -> Result<(String, u64, Optio
 fn run_inner(
     mut args: impl Iterator<Item = String>,
     policy_invocation: bool,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<CliRunResult, String> {
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
@@ -875,6 +813,8 @@ fn run_inner(
     let mut policy_suppressions_seen = false;
     let mut policy_scope = PolicyScopeOptions::default();
     let mut policy_scope_seen = false;
+    let mut policy_inline_suppressions = PolicyInlineSuppressionOptions::default();
+    let mut policy_inline_suppressions_seen = false;
     let mut policy_baseline = PolicyBaselineOptions::default();
     let mut policy_baseline_seen = false;
     let mut accept_current = false;
@@ -1150,6 +1090,18 @@ fn run_inner(
                 policy_scope = PolicyScopeOptions::new(source);
                 policy_scope_seen = true;
             }
+            "--inline-suppression-prefix" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--inline-suppression-prefix requires a word".to_string())?;
+                if policy_inline_suppressions_seen {
+                    return Err("--inline-suppression-prefix may only be provided once".to_string());
+                }
+                let prefix = InlineSuppressionPrefix::new(&value)
+                    .map_err(|error| format!("Invalid --inline-suppression-prefix: {error}"))?;
+                policy_inline_suppressions = PolicyInlineSuppressionOptions::new(prefix);
+                policy_inline_suppressions_seen = true;
+            }
             "--baseline-file" => {
                 let value = args
                     .next()
@@ -1347,6 +1299,7 @@ fn run_inner(
                 || policy_on_inconclusive_seen
                 || policy_suppressions_seen
                 || policy_scope_seen
+                || policy_inline_suppressions_seen
                 || policy_baseline_seen
                 || accept_current
                 || policy_evaluation_date.is_some()
@@ -1435,6 +1388,7 @@ fn run_inner(
                 || policy_on_inconclusive_seen
                 || policy_suppressions_seen
                 || policy_scope_seen
+                || policy_inline_suppressions_seen
                 || policy_baseline_seen
                 || accept_current
                 || policy_evaluation_date.is_some()
@@ -1447,7 +1401,7 @@ fn run_inner(
                 || !tool_sources.is_empty()
             {
                 return Err(
-                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --on-inconclusive, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --policy-cost-hints, --policy-deadlines-ms, --verbose, --color, or --sources"
+                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --on-inconclusive, --suppressions-file, --scope-file, --inline-suppression-prefix, --baseline-file, --accept-current, --evaluation-date, --diff-base, --policy-timings, --policy-cost-hints, --policy-deadlines-ms, --verbose, --color, or --sources"
                         .to_string(),
                 );
             }
@@ -1465,7 +1419,7 @@ fn run_inner(
                     .to_string(),
             );
         }
-        acquire_open_packs_for_process()?;
+        brokk_bifrost::open_packs::acquire_open_packs()?;
         install_semantic_model_packs_for_process()?;
         // Policy-bundle entries run only when named by ID; they never widen a
         // default, pack, or category selection.
@@ -1525,6 +1479,7 @@ fn run_inner(
                     &target,
                     explain_generation,
                     policy_output,
+                    retention_budget,
                 ),
                 ExplanationMode::NearMiss(max_candidates) => run_policy_near_miss_mode(
                     &root,
@@ -1532,6 +1487,7 @@ fn run_inner(
                     max_candidates,
                     explain_generation,
                     policy_output,
+                    retention_budget,
                 ),
             };
             return Ok(CliRunResult::PolicyStatus(status));
@@ -1545,6 +1501,7 @@ fn run_inner(
                 evaluation_date: policy_evaluation_date,
                 suppressions: policy_suppressions,
                 scope: policy_scope,
+                inline_suppressions: policy_inline_suppressions,
                 baseline: policy_baseline,
                 accept_current,
                 diff_base: policy_diff_base,
@@ -1561,6 +1518,7 @@ fn run_inner(
                 builtin_selection,
             },
             &policy_inputs,
+            retention_budget,
         );
         return Ok(CliRunResult::PolicyStatus(status));
     }
@@ -1628,7 +1586,7 @@ fn run_inner(
         })?;
         normalize_tool_arguments_for_cli(&tool_name, tool_args.clone(), &canonical_root)?;
         if tool_activates_open_packs(&tool_name) {
-            acquire_open_packs_for_process()?;
+            brokk_bifrost::open_packs::acquire_open_packs()?;
         }
         install_semantic_model_packs_for_process()?;
         return run_tool(
@@ -1681,7 +1639,10 @@ fn run_inner(
     let diff_snapshot_object_dir = diff_snapshot_object_dir
         .map(validate_diff_snapshot_object_dir)
         .transpose()?;
-    acquire_open_packs_for_process()?;
+    // The transport answers `initialize` and `tools/list` without waiting
+    // for the network; consumers of the packs wait for, or report, the
+    // acquisition instead (#11030).
+    brokk_bifrost::open_packs::start_open_pack_acquisition()?;
     install_semantic_model_packs_for_process()?;
     if named_workspaces.is_empty() {
         run_stdio_server_with_build_identity(
@@ -1716,7 +1677,10 @@ fn run_inner(
 /// empty activated pack set, the run evaluates nothing, and the exit status
 /// is clean rather than an error, so the surface exists before the shipped
 /// content does.
-fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, String> {
+fn run_scan(
+    mut args: impl Iterator<Item = String>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+) -> Result<CliRunResult, String> {
     let mut path: Option<PathBuf> = None;
     let mut list_builtin = false;
     let mut format = PolicyOutputFormat::Human;
@@ -1861,7 +1825,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
         return Err(format!("scan path is not a directory: {}", root.display()));
     }
 
-    acquire_open_packs_for_process()?;
+    brokk_bifrost::open_packs::acquire_open_packs()?;
     install_semantic_model_packs_for_process()?;
     let catalog = built_in_policy_catalog().map_err(|error| error.to_string())?;
     let document = catalog.document();
@@ -1911,6 +1875,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             evaluation_date,
             suppressions: PolicySuppressionOptions::default(),
             scope: PolicyScopeOptions::default(),
+            inline_suppressions: PolicyInlineSuppressionOptions::default(),
             baseline: PolicyBaselineOptions::default(),
             accept_current: false,
             diff_base: None,
@@ -1927,6 +1892,7 @@ fn run_scan(mut args: impl Iterator<Item = String>) -> Result<CliRunResult, Stri
             sources: Vec::new(),
         },
         &policy_inputs,
+        retention_budget,
     );
     Ok(CliRunResult::PolicyStatus(status))
 }
@@ -2180,6 +2146,7 @@ fn run_policy_explain_mode(
     target: &ExplanationTarget,
     generation: Option<ExplanationGeneration>,
     output: Option<PathBuf>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> u8 {
     let explanation = match explain_policy_inputs(
         root,
@@ -2190,6 +2157,7 @@ fn run_policy_explain_mode(
         None,
         None,
         &ExplanationLimits::default(),
+        retention_budget,
     ) {
         Ok(explanation) => explanation,
         Err(error) => return policy_explanation_failure("explanation", error),
@@ -2220,6 +2188,7 @@ fn run_policy_near_miss_mode(
     max_candidates: usize,
     generation: Option<ExplanationGeneration>,
     output: Option<PathBuf>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> u8 {
     let ranking = match rank_policy_near_misses(
         root,
@@ -2230,6 +2199,7 @@ fn run_policy_near_miss_mode(
         None,
         None,
         &ExplanationLimits::default().with_max_near_miss_candidates(max_candidates),
+        retention_budget,
     ) {
         Ok(ranking) => ranking,
         Err(error) => return policy_explanation_failure("near-miss ranking", error),
@@ -2310,6 +2280,7 @@ struct PolicyModeRequest {
     evaluation_date: Option<PolicyEvaluationDate>,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
+    inline_suppressions: PolicyInlineSuppressionOptions,
     baseline: PolicyBaselineOptions,
     accept_current: bool,
     diff_base: Option<String>,
@@ -2326,7 +2297,11 @@ struct PolicyModeRequest {
     builtin_selection: Option<BuiltInPolicySelectionRecord>,
 }
 
-fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluationInput]) -> u8 {
+fn run_policy_mode(
+    request: PolicyModeRequest,
+    policy_inputs: &[PolicyEvaluationInput],
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+) -> u8 {
     let evaluation_date = match request.evaluation_date {
         Some(date) => date,
         None => {
@@ -2346,6 +2321,7 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
     let mut options =
         PolicyEvaluationOptions::with_suppressions(evaluation_date, request.suppressions.clone())
             .with_scope(request.scope.clone())
+            .with_inline_suppressions(request.inline_suppressions.clone())
             .with_baseline(request.baseline.clone())
             .with_required_schema_versions(request.require_explicit_schema_versions)
             .with_fail_on(request.fail_on)
@@ -2364,7 +2340,7 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
         options = options.with_builtin_selection(selection.clone());
     }
     let evaluation = if request.sources.is_empty() {
-        evaluate_policy_inputs(&request.root, policy_inputs, &options)
+        evaluate_policy_inputs(&request.root, policy_inputs, &options, retention_budget)
             .map_err(|error| error.to_string())
     } else {
         create_scoped_service(request.root.clone(), &request.sources, None).and_then(|service| {
@@ -2897,6 +2873,9 @@ OPTIONS:
                            .bifrost/suppressions.private.json, .bifrost/suppressions.local.json
     --scope-file PATH      Load directory acceptance and root exclusions from a workspace-relative JSON file
                            (default: .bifrost/policy-scope.json)
+    --inline-suppression-prefix WORD
+                           Accept findings with `// WORD: ignore[policy.id, ...] -- reason`
+                           comments instead of `// bifrost: ignore ...`
     --baseline-file PATH   Load bulk-accepted finding identities from this workspace-relative
                            JSON file (default: .bifrost/baseline.json)
     --accept-current       Run the selected policies and write the baseline document accepting
@@ -2962,8 +2941,9 @@ OPTIONS:
                            exits 0 even when its outcome is failed or unknown and even when a
                            ranking is empty, and only a failure to produce one exits 2. They
                            exclude each other, and none can be combined with --format,
-                           --fail-on, --suppressions-file, --scope-file, --baseline-file,
-                           --accept-current, --evaluation-date, --diff-base, --policy-timings,
+                           --fail-on, --suppressions-file, --scope-file,
+                           --inline-suppression-prefix, --baseline-file, --accept-current,
+                           --evaluation-date, --diff-base, --policy-timings,
                            --policy-cost-hints, --policy-deadlines-ms, --verbose, --color, or
                            --sources
     --output PATH          Atomically write policy output to PATH instead of stdout
@@ -3047,35 +3027,6 @@ mod portable_runtime_cli_tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
-
-    #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "#4625: pack fallback diagnostics polluted expected quiet policy output"
-    )]
-    fn runtime_pack_fallback_warnings_match_the_outcome_policy() {
-        use brokk_bifrost_semantic_packs::download::OpenPackFallbackKind as Kind;
-
-        for kind in [
-            Kind::Disabled,
-            Kind::NoCompatibleRelease,
-            Kind::Pending,
-            Kind::Unsupported,
-        ] {
-            assert!(!should_warn_open_pack_fallback(&kind, false), "{kind:?}");
-        }
-        assert!(should_warn_open_pack_fallback(
-            &Kind::NetworkUnavailable,
-            false
-        ));
-        assert!(should_warn_open_pack_fallback(
-            &Kind::OfflineCacheMiss,
-            false
-        ));
-        assert!(!should_warn_open_pack_fallback(
-            &Kind::OfflineCacheMiss,
-            true
-        ));
-    }
 
     #[test]
     fn only_the_one_shot_policy_tool_requires_open_pack_acquisition() {
@@ -3183,6 +3134,7 @@ mod portable_runtime_cli_tests {
                 spec_path,
                 artifact_path,
             }],
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("generate native release bundle");
         bundle_root
@@ -3372,7 +3324,10 @@ mod policy_explain_cli_tests {
     };
 
     fn run_error(args: &[&str]) -> String {
-        match run(args.iter().map(|argument| (*argument).to_string())) {
+        match run(
+            args.iter().map(|argument| (*argument).to_string()),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        ) {
             Err(error) => {
                 assert!(error.policy_invocation, "{args:?} is a policy invocation");
                 error.message
@@ -3619,6 +3574,7 @@ mod policy_explain_exit_status_tests {
             &ExplanationTarget::Candidate(candidate),
             None,
             Some(destination.clone()),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         );
         assert_eq!(status, POLICY_EXIT_CLEAN);
 
@@ -3649,6 +3605,7 @@ mod policy_explain_exit_status_tests {
                 &ExplanationTarget::Candidate(candidate.clone()),
                 Some(generation),
                 None,
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
             ),
             POLICY_EXIT_CLEAN
         );
@@ -3665,6 +3622,7 @@ mod policy_explain_exit_status_tests {
                         .expect("a well-formed generation")
                 ),
                 None,
+                &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
             ),
             POLICY_EXIT_UNRELIABLE,
             "a workspace that moved is a failure to answer, not an answer"
@@ -3685,6 +3643,7 @@ mod policy_explain_exit_status_tests {
             &ExplanationTarget::Candidate(candidate),
             None,
             None,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);
     }
@@ -3702,6 +3661,7 @@ mod policy_explain_exit_status_tests {
             4,
             None,
             Some(destination.clone()),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         );
         assert_eq!(status, POLICY_EXIT_CLEAN);
 
@@ -3735,6 +3695,7 @@ mod policy_explain_exit_status_tests {
             4,
             None,
             None,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);
     }

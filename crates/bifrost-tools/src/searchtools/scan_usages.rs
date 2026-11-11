@@ -282,10 +282,8 @@ pub struct ScanUsagesEntry {
     pub input: ScanUsagesInput,
     pub input_kind: ScanUsagesInputKind,
     pub status: ScanUsagesStatus,
-    #[serde(skip_serializing_if = "is_true")]
-    pub complete: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_reason: Option<ScanUsagesIncompleteReason>,
+    #[serde(flatten)]
+    pub completion: Completion<ScanUsagesIncompleteReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1331,9 +1329,8 @@ fn mark_incomplete(
     reason: ScanUsagesIncompleteReason,
     surface: ScanUsagesSurface,
 ) -> bool {
-    let mut changed = entry.complete || entry.incomplete_reason != Some(reason);
-    entry.complete = false;
-    entry.incomplete_reason = Some(reason);
+    let mut changed = entry.completion.incomplete_reason() != Some(reason);
+    entry.completion = Completion::incomplete(reason);
     let recovery = incomplete_recovery_message(reason, surface);
     if entry.message.is_none() {
         entry.message = Some(recovery);
@@ -1755,8 +1752,15 @@ pub(crate) fn resolve_scan_usages_target(
 
     if let Some(overlay) = analyzer.semantic_model_overlay() {
         let path = rel_path_string(&file);
-        let mut modeled = overlay
-            .symbols_at_authored_path(&path)
+        let authored = overlay.symbols_at_authored_path(&path);
+        // A possible record of an open lookup is a candidate, never the target.
+        let authored_open = matches!(
+            authored.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        );
+        let mut modeled = authored
             .records
             .into_iter()
             .filter(|symbol| {
@@ -1785,7 +1789,7 @@ pub(crate) fn resolve_scan_usages_target(
             .collect::<Vec<_>>();
         modeled.sort_by(|left, right| left.id.cmp(&right.id));
         modeled.dedup_by(|left, right| left.id == right.id);
-        if modeled.len() == 1 && !modeled[0].provenance.ambiguous {
+        if !authored_open && modeled.len() == 1 && !modeled[0].provenance.ambiguous {
             let symbol = modeled[0].clone();
             return ScanUsageTargetResolution::Modeled {
                 symbol: symbol.qualified_name.clone(),
@@ -2243,6 +2247,25 @@ pub fn scan_usages_by_reference_with_cancellation(
     )
 }
 
+fn fold_scan_usages_entry_read_gap(
+    entry: &mut ScanUsagesEntry,
+    incomplete: &crate::result_incomplete::ToolResultIncomplete,
+) {
+    entry.completion.mark_incomplete(match incomplete.reason {
+        crate::result_incomplete::ToolResultIncompleteReason::Cancelled => {
+            ScanUsagesIncompleteReason::Cancelled
+        }
+        crate::result_incomplete::ToolResultIncompleteReason::StructureUnavailable => {
+            ScanUsagesIncompleteReason::SourceUnavailable
+        }
+        _ => ScanUsagesIncompleteReason::SemanticAnalysis,
+    });
+    withdraw_absence(entry);
+    entry
+        .notes
+        .push(format!("structured evidence incomplete: {incomplete:?}"));
+}
+
 pub(crate) fn scan_usages_by_reference_with_context(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2444,295 +2467,269 @@ fn scan_usages_backend_on_pool(
     let mut work_entries = Vec::new();
     let mut resolved_targets = Vec::new();
 
+    // Candidate inventory, path selection and reference-only sibling coverage
+    // determine the search domain of every target in this batch.
+    let shared_gap = _analyzer_query.read_completion().err().filter(|reason| {
+        !matches!(
+            reason,
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+        )
+    });
+    let mut resolution_gaps = HashMap::default();
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     for request in targets {
-        if context.cancellation.is_cancelled() {
-            work_entries.push(incomplete_work_entry(
-                request,
-                None,
-                context.interruption_reason(),
-            ));
-            continue;
-        }
-        let target = match &request.input {
-            ScanUsagesInput::Target(target) => target.clone(),
-            ScanUsagesInput::Symbol(_) => unreachable!("target request has target input"),
-        };
-        let resolution = {
-            let _scope = profiling::scope("searchtools::scan_usages_target_resolution");
-            resolve_scan_usages_target(analyzer, token, &resolver, target)
-        };
-        if context.cancellation.is_cancelled() {
-            work_entries.push(incomplete_work_entry(
-                request,
-                None,
-                context.interruption_reason(),
-            ));
-            continue;
-        }
-        match resolution {
-            ScanUsageTargetResolution::Lexical {
-                symbol,
-                file,
-                definition,
-            } => {
-                let scan = if definition.kind == DeclarationKind::StatementLabel {
-                    lexical_label_usage_rows
-                } else {
-                    macro_lexical_usage_rows
-                };
-                let (rows, incomplete_reason, truncated) = scan(
-                    analyzer,
-                    &file,
-                    &definition,
-                    query_scope.path_filter.as_deref(),
-                    include_tests,
-                    context,
-                );
-                if let Some(reason) = incomplete_reason {
-                    work_entries.push(incomplete_work_entry(request, Some(symbol), reason));
-                    continue;
-                }
-                let resolved_definition = ResolvedUsageDefinition {
-                    fq_name: symbol.clone(),
-                    path: rel_path_string(&file),
-                    line: definition.name_range.start_line,
-                };
-                let state = SymbolUsageRenderState::new(
-                    symbol.clone(),
-                    Some(resolved_definition),
-                    false,
-                    0,
-                    rows,
-                    0,
-                    Vec::new(),
-                    None,
-                    None,
-                    Vec::new(),
-                    include_same_owner,
-                );
-                if truncated {
-                    work_entries.push(ScanUsagesWorkEntry::TooManyCallsites {
-                        request,
-                        state,
-                        short_name: symbol,
-                        total_callsites: context.max_callsites.saturating_add(1),
-                        limit: context.max_callsites,
-                        target_is_method: false,
-                    });
-                } else {
-                    work_entries.push(ScanUsagesWorkEntry::Usage {
-                        request,
-                        state,
-                        candidate_files_sample: None,
-                        target_is_method: false,
-                        incomplete_reason: None,
-                    });
-                }
-            }
-            ScanUsageTargetResolution::Resolved { symbol, overloads } => {
-                resolved_targets.push(IndexedResolvedScanTarget {
+        let index = request.index;
+        let resolution_scope = AnalyzerQueryScope::new(analyzer);
+        'resolution: {
+            if context.cancellation.is_cancelled() {
+                work_entries.push(incomplete_work_entry(
                     request,
+                    None,
+                    context.interruption_reason(),
+                ));
+                break 'resolution;
+            }
+            let target = match &request.input {
+                ScanUsagesInput::Target(target) => target.clone(),
+                ScanUsagesInput::Symbol(_) => unreachable!("target request has target input"),
+            };
+            let resolution = {
+                let _scope = profiling::scope("searchtools::scan_usages_target_resolution");
+                resolve_scan_usages_target(analyzer, token, &resolver, target)
+            };
+            if context.cancellation.is_cancelled() {
+                work_entries.push(incomplete_work_entry(
+                    request,
+                    None,
+                    context.interruption_reason(),
+                ));
+                break 'resolution;
+            }
+            match resolution {
+                ScanUsageTargetResolution::Lexical {
                     symbol,
-                    overloads,
-                    location_selected: true,
-                });
-            }
-            ScanUsageTargetResolution::Modeled { symbol, definition } => {
-                work_entries.push(ScanUsagesWorkEntry::Usage {
-                    request,
-                    state: SymbolUsageRenderState::new(
-                        symbol,
-                        Some(definition),
+                    file,
+                    definition,
+                } => {
+                    let scan = if definition.kind == DeclarationKind::StatementLabel {
+                        lexical_label_usage_rows
+                    } else {
+                        macro_lexical_usage_rows
+                    };
+                    let (rows, incomplete_reason, truncated) = scan(
+                        analyzer,
+                        &file,
+                        &definition,
+                        query_scope.path_filter.as_deref(),
+                        include_tests,
+                        context,
+                    );
+                    if let Some(reason) = incomplete_reason {
+                        work_entries.push(incomplete_work_entry(request, Some(symbol), reason));
+                        break 'resolution;
+                    }
+                    let resolved_definition = ResolvedUsageDefinition {
+                        fq_name: symbol.clone(),
+                        path: rel_path_string(&file),
+                        line: definition.name_range.start_line,
+                    };
+                    let state = SymbolUsageRenderState::new(
+                        symbol.clone(),
+                        Some(resolved_definition),
                         false,
                         0,
-                        Vec::new(),
+                        rows,
                         0,
                         Vec::new(),
                         None,
                         None,
                         Vec::new(),
                         include_same_owner,
-                    ),
-                    candidate_files_sample: None,
-                    target_is_method: false,
-                    incomplete_reason: None,
-                });
+                    );
+                    if truncated {
+                        work_entries.push(ScanUsagesWorkEntry::TooManyCallsites {
+                            request,
+                            state,
+                            short_name: symbol,
+                            total_callsites: context.max_callsites.saturating_add(1),
+                            limit: context.max_callsites,
+                            target_is_method: false,
+                        });
+                    } else {
+                        work_entries.push(ScanUsagesWorkEntry::Usage {
+                            request,
+                            state,
+                            candidate_files_sample: None,
+                            target_is_method: false,
+                            incomplete_reason: None,
+                        });
+                    }
+                }
+                ScanUsageTargetResolution::Resolved { symbol, overloads } => {
+                    resolved_targets.push(IndexedResolvedScanTarget {
+                        request,
+                        symbol,
+                        overloads,
+                        location_selected: true,
+                    });
+                }
+                ScanUsageTargetResolution::Modeled { symbol, definition } => {
+                    work_entries.push(ScanUsagesWorkEntry::Usage {
+                        request,
+                        state: SymbolUsageRenderState::new(
+                            symbol,
+                            Some(definition),
+                            false,
+                            0,
+                            Vec::new(),
+                            0,
+                            Vec::new(),
+                            None,
+                            None,
+                            Vec::new(),
+                            include_same_owner,
+                        ),
+                        candidate_files_sample: None,
+                        target_is_method: false,
+                        incomplete_reason: None,
+                    });
+                }
+                ScanUsageTargetResolution::NotFound(item) => {
+                    work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
+                }
+                ScanUsageTargetResolution::Ambiguous(item) => {
+                    work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                        request,
+                        item,
+                        incomplete_reason: None,
+                    });
+                }
+                ScanUsageTargetResolution::Failure(failure) => {
+                    work_entries.push(ScanUsagesWorkEntry::Failure {
+                        request,
+                        failure,
+                        incomplete_reason: None,
+                    });
+                }
             }
-            ScanUsageTargetResolution::NotFound(item) => {
-                work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
-            }
-            ScanUsageTargetResolution::Ambiguous(item) => {
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
-                    request,
-                    item,
-                    incomplete_reason: None,
-                });
-            }
-            ScanUsageTargetResolution::Failure(failure) => {
-                work_entries.push(ScanUsagesWorkEntry::Failure {
-                    request,
-                    failure,
-                    incomplete_reason: None,
-                });
-            }
+        }
+        if let Some(reason) = resolution_scope
+            .read_completion()
+            .err()
+            .or_else(|| shared_gap.clone())
+            && !matches!(
+                reason,
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+            )
+        {
+            resolution_gaps.insert(index, reason);
         }
     }
 
     for request in symbols {
-        let symbol = request.label.clone();
-        if context.cancellation.is_cancelled() {
-            work_entries.push(incomplete_work_entry(
-                request,
-                Some(symbol),
-                context.interruption_reason(),
-            ));
-            continue;
-        }
-        if symbol.trim().is_empty() {
-            work_entries.push(ScanUsagesWorkEntry::NotFound {
-                request,
-                item: NotFoundInput {
-                    input: symbol,
-                    note: Some("symbol must not be empty".to_string()),
-                },
-            });
-            continue;
-        }
-        let (anchor, lookup) = match split_workspace_definition_selector(analyzer, &symbol) {
-            DefinitionSelector::Name(name) => (None, name),
-            DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
-        };
-        let (kind, bare_lookup) = split_kind_qualified_lookup(lookup);
-        // Resolution is inside the scan's budget, not beside it. A file anchor
-        // is part of resolution itself: filter candidates to that file before
-        // the resolver decides whether the spelling is ambiguous. Otherwise a
-        // global namesake can reject the path#symbol recovery before the later
-        // anchor narrowing ever runs.
-        //
-        // An anchored miss still runs the global lookup once for the existing
-        // "defined elsewhere" diagnostic. Normalize its ambiguous candidates
-        // into one candidate list; the anchor branch below will find that none
-        // live in the requested file and report the scoped miss rather than a
-        // global ambiguity.
-        let keep_scanning = || !context.cancellation.is_cancelled();
-        let resolution_budget =
-            FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES);
-        let resolution = {
-            let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
-            match anchor.as_deref() {
-                Some(anchor) => match resolve_codeunit_fuzzy_bounded_with(
-                    analyzer,
-                    bare_lookup,
-                    |unit| {
-                        rel_path_string(unit.source()) == anchor
-                            && kind.is_none_or(|kind| unit.kind() == kind)
-                    },
-                    resolution_budget,
-                ) {
-                    Ok(CodeUnitResolution::NotFound) => {
-                        resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget)
-                            .map(|global| match global {
-                                CodeUnitResolution::Ambiguous(candidates) => {
-                                    CodeUnitResolution::Resolved(candidates)
-                                }
-                                other => other,
-                            })
-                    }
-                    scoped => scoped,
-                },
-                None => resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget),
-            }
-        };
-        let resolution = match resolution {
-            Ok(resolution) => resolution,
-            // The budget expired mid-resolution. Reported through the same
-            // incomplete entry a budget expiry anywhere else in the scan uses.
-            Err(FuzzyResolveStop::Cancelled) => {
+        let index = request.index;
+        let resolution_scope = AnalyzerQueryScope::new(analyzer);
+        'resolution: {
+            let symbol = request.label.clone();
+            if context.cancellation.is_cancelled() {
                 work_entries.push(incomplete_work_entry(
                     request,
                     Some(symbol),
                     context.interruption_reason(),
                 ));
-                continue;
+                break 'resolution;
             }
-            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
-                let item = too_many_resolution_candidates_symbol(symbol, total, limit);
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+            if symbol.trim().is_empty() {
+                work_entries.push(ScanUsagesWorkEntry::NotFound {
                     request,
-                    item,
-                    incomplete_reason: Some(ScanUsagesIncompleteReason::ResolutionCandidates),
+                    item: NotFoundInput {
+                        input: symbol,
+                        note: Some("symbol must not be empty".to_string()),
+                    },
                 });
-                continue;
+                break 'resolution;
             }
-        };
-        if context.cancellation.is_cancelled() {
-            work_entries.push(incomplete_work_entry(
-                request,
-                Some(symbol),
-                context.interruption_reason(),
-            ));
-            continue;
-        }
-        let overloads = match resolution {
-            CodeUnitResolution::Resolved(overloads) => overloads,
-            CodeUnitResolution::Ambiguous(candidate_targets) => {
-                let groups = distinct_definitions(analyzer, token, candidate_targets);
-                let item = ambiguous_usage_symbol_from_groups(
-                    analyzer,
-                    ScanUsagesSurface::Reference,
-                    symbol.clone(),
-                    symbol,
-                    groups,
-                    "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
-                );
-                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
-                    request,
-                    item,
-                    incomplete_reason: None,
-                });
-                continue;
-            }
-            CodeUnitResolution::NotFound => {
-                let item = unsupported_path_qualified_scan_symbol(&resolver, &symbol)
-                    .unwrap_or_else(|| {
-                        path_like_symbol_not_found_input(
-                            symbol.clone(),
-                            PathLikeSymbolGuidanceContext::ScanUsages,
-                        )
-                    });
-                work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
-                continue;
-            }
-        };
-
-        let overloads = match anchor {
-            // A file-anchored selector picks one definition from a prior
-            // ambiguous result; narrow to that file before scanning.
-            Some(anchor) => {
-                let not_found =
-                    scan_usages_anchor_not_found_input(symbol.clone(), &anchor, lookup, &overloads);
-                let narrowed: Vec<CodeUnit> = overloads
-                    .into_iter()
-                    .filter(|unit| rel_path_string(unit.source()) == anchor)
-                    .collect();
-                let narrowed = prefer_exact_lookup_matches(narrowed, lookup);
-                if narrowed.is_empty() {
-                    work_entries.push(ScanUsagesWorkEntry::NotFound {
-                        request,
-                        item: not_found,
-                    });
-                    continue;
+            let (anchor, lookup) = match split_workspace_definition_selector(analyzer, &symbol) {
+                DefinitionSelector::Name(name) => (None, name),
+                DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
+            };
+            let (kind, bare_lookup) = split_kind_qualified_lookup(lookup);
+            // Resolution is inside the scan's budget, not beside it. A file anchor
+            // is part of resolution itself: filter candidates to that file before
+            // the resolver decides whether the spelling is ambiguous. Otherwise a
+            // global namesake can reject the path#symbol recovery before the later
+            // anchor narrowing ever runs.
+            //
+            // An anchored miss still runs the global lookup once for the existing
+            // "defined elsewhere" diagnostic. Normalize its ambiguous candidates
+            // into one candidate list; the anchor branch below will find that none
+            // live in the requested file and report the scoped miss rather than a
+            // global ambiguity.
+            let keep_scanning = || !context.cancellation.is_cancelled();
+            let resolution_budget =
+                FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES);
+            let resolution = {
+                let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
+                match anchor.as_deref() {
+                    Some(anchor) => match resolve_codeunit_fuzzy_bounded_with(
+                        analyzer,
+                        bare_lookup,
+                        |unit| {
+                            rel_path_string(unit.source()) == anchor
+                                && kind.is_none_or(|kind| unit.kind() == kind)
+                        },
+                        resolution_budget,
+                    ) {
+                        Ok(CodeUnitResolution::NotFound) => {
+                            resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget)
+                                .map(|global| match global {
+                                    CodeUnitResolution::Ambiguous(candidates) => {
+                                        CodeUnitResolution::Resolved(candidates)
+                                    }
+                                    other => other,
+                                })
+                        }
+                        scoped => scoped,
+                    },
+                    None => {
+                        resolve_codeunit_fuzzy_bounded(analyzer, bare_lookup, resolution_budget)
+                    }
                 }
-                narrowed
+            };
+            let resolution = match resolution {
+                Ok(resolution) => resolution,
+                // The budget expired mid-resolution. Reported through the same
+                // incomplete entry a budget expiry anywhere else in the scan uses.
+                Err(FuzzyResolveStop::Cancelled) => {
+                    work_entries.push(incomplete_work_entry(
+                        request,
+                        Some(symbol),
+                        context.interruption_reason(),
+                    ));
+                    break 'resolution;
+                }
+                Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                    let item = too_many_resolution_candidates_symbol(symbol, total, limit);
+                    work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                        request,
+                        item,
+                        incomplete_reason: Some(ScanUsagesIncompleteReason::ResolutionCandidates),
+                    });
+                    break 'resolution;
+                }
+            };
+            if context.cancellation.is_cancelled() {
+                work_entries.push(incomplete_work_entry(
+                    request,
+                    Some(symbol),
+                    context.interruption_reason(),
+                ));
+                break 'resolution;
             }
-            // A bare name resolving to module-scoped definitions in different
-            // files (two JS/TS files exporting `Anchor`) is several distinct
-            // symbols, not one with overloads; surface them as selectable
-            // candidates rather than scanning a conflation of all of them.
-            None => {
-                let groups = distinct_definitions(analyzer, token, overloads);
-                if groups.len() > 1 {
+            let overloads = match resolution {
+                CodeUnitResolution::Resolved(overloads) => overloads,
+                CodeUnitResolution::Ambiguous(candidate_targets) => {
+                    let groups = distinct_definitions(analyzer, token, candidate_targets);
                     let item = ambiguous_usage_symbol_from_groups(
                         analyzer,
                         ScanUsagesSurface::Reference,
@@ -2746,18 +2743,89 @@ fn scan_usages_backend_on_pool(
                         item,
                         incomplete_reason: None,
                     });
-                    continue;
+                    break 'resolution;
                 }
-                groups.into_iter().flat_map(|(_, units)| units).collect()
-            }
-        };
+                CodeUnitResolution::NotFound => {
+                    let item = unsupported_path_qualified_scan_symbol(&resolver, &symbol)
+                        .unwrap_or_else(|| {
+                            path_like_symbol_not_found_input(
+                                symbol.clone(),
+                                PathLikeSymbolGuidanceContext::ScanUsages,
+                            )
+                        });
+                    work_entries.push(ScanUsagesWorkEntry::NotFound { request, item });
+                    break 'resolution;
+                }
+            };
 
-        resolved_targets.push(IndexedResolvedScanTarget {
-            request,
-            symbol,
-            overloads,
-            location_selected: false,
-        });
+            let overloads = match anchor {
+                // A file-anchored selector picks one definition from a prior
+                // ambiguous result; narrow to that file before scanning.
+                Some(anchor) => {
+                    let not_found = scan_usages_anchor_not_found_input(
+                        symbol.clone(),
+                        &anchor,
+                        lookup,
+                        &overloads,
+                    );
+                    let narrowed: Vec<CodeUnit> = overloads
+                        .into_iter()
+                        .filter(|unit| rel_path_string(unit.source()) == anchor)
+                        .collect();
+                    let narrowed = prefer_exact_lookup_matches(narrowed, lookup);
+                    if narrowed.is_empty() {
+                        work_entries.push(ScanUsagesWorkEntry::NotFound {
+                            request,
+                            item: not_found,
+                        });
+                        break 'resolution;
+                    }
+                    narrowed
+                }
+                // A bare name resolving to module-scoped definitions in different
+                // files (two JS/TS files exporting `Anchor`) is several distinct
+                // symbols, not one with overloads; surface them as selectable
+                // candidates rather than scanning a conflation of all of them.
+                None => {
+                    let groups = distinct_definitions(analyzer, token, overloads);
+                    if groups.len() > 1 {
+                        let item = ambiguous_usage_symbol_from_groups(
+                            analyzer,
+                            ScanUsagesSurface::Reference,
+                            symbol.clone(),
+                            symbol,
+                            groups,
+                            "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.",
+                        );
+                        work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                            request,
+                            item,
+                            incomplete_reason: None,
+                        });
+                        break 'resolution;
+                    }
+                    groups.into_iter().flat_map(|(_, units)| units).collect()
+                }
+            };
+
+            resolved_targets.push(IndexedResolvedScanTarget {
+                request,
+                symbol,
+                overloads,
+                location_selected: false,
+            });
+        }
+        if let Some(reason) = resolution_scope
+            .read_completion()
+            .err()
+            .or_else(|| shared_gap.clone())
+            && !matches!(
+                reason,
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+            )
+        {
+            resolution_gaps.insert(index, reason);
+        }
     }
 
     // Resolved symbols in one request are independent semantic questions over
@@ -2774,6 +2842,11 @@ fn scan_usages_backend_on_pool(
                 if context.cancellation.is_cancelled() {
                     return (resolved, None);
                 }
+                // A source this target's scan read incompletely (for example a
+                // C# `#if` branch that was never parsed) can hide usages or
+                // choose the FQNs rendered for them. Each target collects its
+                // own gaps; cancellation is reported by the context instead.
+                let target_scope = AnalyzerQueryScope::new(analyzer);
                 // Location selection starts from physical extraction rows. Give
                 // both scan entry points the same structural target before usage
                 // resolution, while range and signature reads retain provenance.
@@ -2799,7 +2872,13 @@ fn scan_usages_backend_on_pool(
                     Some(context.max_source_bytes),
                 );
                 let interrupted = context.cancellation.is_cancelled();
-                (resolved, Some((query, interrupted)))
+                let read_gap = target_scope.read_completion().err().filter(|reason| {
+                    !matches!(
+                        reason,
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+                    )
+                });
+                (resolved, Some((query, interrupted, read_gap)))
             })
         })
         .collect();
@@ -2811,7 +2890,7 @@ fn scan_usages_backend_on_pool(
             overloads,
             location_selected,
         } = resolved;
-        let Some((query, interrupted)) = query else {
+        let Some((query, interrupted, read_gap)) = query else {
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
@@ -2870,6 +2949,19 @@ fn scan_usages_backend_on_pool(
             Some(format!("Usage analysis is incomplete: {diagnostics:?}"))
         } else {
             None
+        };
+        let semantic_note = match read_gap.or_else(|| resolution_gaps.remove(&request.index)) {
+            Some(reason) => {
+                incomplete_reason.get_or_insert(ScanUsagesIncompleteReason::SemanticAnalysis);
+                let gap_note = format!(
+                    "A scanned source was read incompletely, so usages may be missing: {reason:?}"
+                );
+                Some(match semantic_note {
+                    Some(note) => format!("{note} {gap_note}"),
+                    None => gap_note,
+                })
+            }
+            None => semantic_note,
         };
         match query.result {
             FuzzyResult::Success {
@@ -2980,6 +3072,33 @@ fn scan_usages_backend_on_pool(
                     limit,
                     target_is_method,
                 });
+            }
+        }
+    }
+
+    for entry in &mut work_entries {
+        if let Some(reason) = resolution_gaps.remove(&entry.index()) {
+            match entry {
+                ScanUsagesWorkEntry::Usage {
+                    incomplete_reason, ..
+                }
+                | ScanUsagesWorkEntry::Ambiguous {
+                    incomplete_reason, ..
+                }
+                | ScanUsagesWorkEntry::Failure {
+                    incomplete_reason, ..
+                } => {
+                    incomplete_reason.get_or_insert(ScanUsagesIncompleteReason::SemanticAnalysis);
+                }
+                ScanUsagesWorkEntry::NotFound { request, .. } => {
+                    *entry = ScanUsagesWorkEntry::Incomplete {
+                        request: request.clone(),
+                        symbol: None,
+                        reason: ScanUsagesIncompleteReason::SemanticAnalysis,
+                        message: format!("Target resolution read incomplete evidence: {reason:?}"),
+                    };
+                }
+                _ => {}
             }
         }
     }
@@ -3168,11 +3287,16 @@ fn raw_reference_files(
 }
 
 fn raw_reference_incomplete_reason(entry: &ScanUsagesEntry) -> Option<String> {
+    let incomplete_reason = entry.completion.incomplete_reason();
+    if incomplete_reason == Some(ScanUsagesIncompleteReason::SemanticAnalysis) {
+        // Keep named resolver stop reasons on the raw batch surface.
+        return Some(format!("SemanticAnalysis: {:?}", entry.notes));
+    }
     match entry.status {
         ScanUsagesStatus::Found
         | ScanUsagesStatus::VerifiedAbsent
         | ScanUsagesStatus::NoExternalUsages => {
-            entry.incomplete_reason.map(|reason| format!("{reason:?}"))
+            incomplete_reason.map(|reason| format!("{reason:?}"))
         }
         status => Some(match entry.message.as_deref() {
             Some(message) => format!("scan status {status:?}: {message}"),
@@ -3219,7 +3343,7 @@ pub struct UsageGraphNode {
 /// One concrete reference site behind a [`UsageGraphEdge`]: the workspace-relative
 /// file `path` and the 1-based `line` where the reference occurs. Lines match the
 /// `line` of a [`scan_usages`] hit and a node's `start_line`.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord, schemars::JsonSchema)]
 pub struct UsageGraphCallSite {
     pub path: String,
     pub line: usize,
@@ -3285,6 +3409,12 @@ pub struct UsageGraphFileNote {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct UsageGraphScopeObligation {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct UsageGraphIncompleteReason {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovery_error: Option<String>,
@@ -3424,6 +3554,9 @@ fn render_usage_graph_withheld_references<'a>(
 /// The resolved definition/reference graph for the whole workspace.
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageGraphResult {
+    /// The graph is complete relative to these stated assumptions; they are not incompleteness.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scope_obligations: Vec<UsageGraphScopeObligation>,
     /// Add a candidate edge from `from_id` to every node whose terminal name
     /// matches `name`, or directly to `to_id`. When `from_id` is absent, treat
     /// the file's declarations as possible callers.
@@ -3455,6 +3588,7 @@ pub struct UsageGraphCSharpCompilation {
     pub configuration: String,
     pub target_framework: Option<String>,
     pub defined_symbols: Vec<String>,
+    pub named_open_symbols: Vec<String>,
     pub closed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_reason: Option<String>,
@@ -3476,6 +3610,7 @@ fn usage_graph_csharp_compilations(
                     configuration: compilation.configuration,
                     target_framework: compilation.target_framework,
                     defined_symbols: compilation.symbols,
+                    named_open_symbols: compilation.named_open,
                     closed: compilation.closed,
                     open_reason: compilation.open_reason,
                 })
@@ -3670,6 +3805,7 @@ pub(crate) fn selected_usage_graph_result(
     cancellation: &CancellationToken,
 ) -> Option<UsageGraphResult> {
     let SelectedWorkspaceUsageGraphProjection {
+        scope_obligations,
         mut nodes,
         edges,
         forward_completeness,
@@ -3791,6 +3927,13 @@ pub(crate) fn selected_usage_graph_result(
         incomplete,
         cancellation,
     )?;
+    result.scope_obligations = scope_obligations
+        .into_iter()
+        .map(|obligation| UsageGraphScopeObligation {
+            code: obligation.code,
+            message: obligation.message,
+        })
+        .collect();
     result.withheld_references = public_withheld;
     result.withheld_references_complete = unresolved_names.is_some();
     record_graph_domain_failures(&mut result, domain_discovery_failures);
@@ -4568,6 +4711,14 @@ fn usage_graph_with_passes(
                             declarations.push((node.primary.clone(), node.primary_range));
                         }
                     }
+                    missing_relative_imports.extend(
+                        projection
+                            .relative_import_routes
+                            .iter()
+                            .filter_map(|(path, gap, _)| {
+                                gap.as_ref().map(|gap| (path.clone(), gap.clone()))
+                            }),
+                    );
                     native_projections.push(projection);
                     continue;
                 }
@@ -5540,6 +5691,16 @@ fn usage_graph_with_passes(
         truncated_by_id,
         incomplete,
     );
+    result.scope_obligations = native_projections
+        .iter()
+        .flat_map(|projection| projection.scope_obligations.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|obligation| UsageGraphScopeObligation {
+            code: obligation.code,
+            message: obligation.message,
+        })
+        .collect();
     result
         .incomplete_reasons
         .extend(missing_relative_imports.into_iter().map(|(path, gap)| {
@@ -5556,6 +5717,7 @@ fn usage_graph_with_passes(
             }
         }));
     result.complete = result.incomplete_reasons.is_empty();
+
     result.withheld_references = public_withheld;
     result.withheld_references_complete = legacy_withheld_complete
         && unavailable_passes.is_empty()
@@ -5919,6 +6081,7 @@ fn finalize_usage_graph_result(
         }
     };
     let result = UsageGraphResult {
+        scope_obligations: Vec::new(),
         withheld_references: Vec::new(),
         withheld_references_complete: incomplete_reasons.is_empty(),
         complete: incomplete_reasons.is_empty(),
@@ -6132,6 +6295,7 @@ fn finalize_selected_usage_graph_result(
         return None;
     }
     Some(UsageGraphResult {
+        scope_obligations: Vec::new(),
         withheld_references: Vec::new(),
         withheld_references_complete: incomplete_reasons.is_empty(),
         session_subset: None,
@@ -6613,6 +6777,9 @@ pub(crate) fn external_usage_definition_ranges(
     }
 }
 
+pub(crate) const PYTHON_USAGE_SCOPE_NOTE: &str =
+    "Python usages are relative to the selected environment.";
+
 pub(crate) fn render_scan_usages_with_budget(
     entries: Vec<ScanUsagesWorkEntry>,
     scope: ScanUsagesScope,
@@ -6626,6 +6793,15 @@ pub(crate) fn render_scan_usages_with_budget(
             for entry in &mut results {
                 downgrade_for_unmatched_paths(entry, surface);
             }
+        }
+        // State the Python scope once without changing completeness. Entry notes
+        // are rendered by both MCP and CLI and do not imply a lost reference.
+        if let Some(entry) = results.iter_mut().find(|entry| {
+            entry.definition_path.as_deref().is_some_and(|path| {
+                Language::from_path(std::path::Path::new(path)) == Language::Python
+            })
+        }) {
+            entry.notes.push(PYTHON_USAGE_SCOPE_NOTE.into());
         }
         let summary = build_scan_usages_summary(&results);
         let result = ScanUsagesResult {
@@ -6659,7 +6835,7 @@ pub(crate) fn render_scan_usages_with_budget(
 /// `unverified_absent` with the same `scan_incomplete` caveat every other
 /// short scan uses; a hit that was actually found stays found, since an
 /// unsearched selector cannot unfind it.
-fn downgrade_for_unmatched_paths(entry: &mut ScanUsagesEntry, surface: ScanUsagesSurface) {
+fn withdraw_absence(entry: &mut ScanUsagesEntry) {
     if matches!(
         entry.status,
         ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::NoExternalUsages
@@ -6675,10 +6851,17 @@ fn downgrade_for_unmatched_paths(entry: &mut ScanUsagesEntry, surface: ScanUsage
             .absence_caveats
             .push(ScanUsagesAbsenceCaveat::ScanIncomplete);
     }
+}
+
+fn downgrade_for_unmatched_paths(entry: &mut ScanUsagesEntry, surface: ScanUsagesSurface) {
+    withdraw_absence(entry);
     // A scan that also ran out of time or budget keeps that reason: it is the
     // more specific account of what was not searched, and the entry is already
     // incomplete either way.
-    if entry.incomplete_reason.is_none() {
+    if matches!(
+        entry.completion.incomplete_reason(),
+        None | Some(ScanUsagesIncompleteReason::SemanticAnalysis)
+    ) {
         mark_incomplete(entry, ScanUsagesIncompleteReason::UnmatchedPaths, surface);
     }
 }
@@ -6714,7 +6897,7 @@ pub(crate) fn build_scan_usages_summary(results: &[ScanUsagesEntry]) -> ScanUsag
             _ => None,
         })
         .sum();
-    let partial = results.iter().any(|entry| !entry.complete);
+    let partial = results.iter().any(|entry| !entry.completion.is_complete());
     ScanUsagesSummary {
         requested,
         resolved,
@@ -6781,7 +6964,7 @@ pub(crate) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             )
         }
         ScanUsagesWorkEntry::NotFound { request, item } => {
-            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::NotFound, true);
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::NotFound);
             result.message = Some(match item.note.as_deref() {
                 Some(note) => format!("{}: {note}", item.input),
                 None => item.input.clone(),
@@ -6793,7 +6976,7 @@ pub(crate) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             item,
             incomplete_reason,
         } => {
-            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Ambiguous, true);
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Ambiguous);
             result.symbol = Some(item.symbol.clone());
             result.short_name = Some(item.short_name.clone());
             result.candidate_targets = item.candidate_targets.clone();
@@ -6803,11 +6986,10 @@ pub(crate) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             result.candidates = item.candidates.clone();
             result.too_many_candidates = item.too_many_candidates;
             result.definition_sites_excluded = item.definition_sites_excluded;
-            result.complete = incomplete_reason.is_none() && !item.candidate_files_truncated;
-            result.incomplete_reason = incomplete_reason.or_else(|| {
+            result.completion = Completion::from_reason(incomplete_reason.or_else(|| {
                 item.candidate_files_truncated
                     .then_some(ScanUsagesIncompleteReason::CandidateFiles)
-            });
+            }));
             result.message = Some(item.note.clone().unwrap_or_else(|| {
                 match request.surface {
                     ScanUsagesSurface::Reference => "Ambiguous; re-call scan_usages_by_reference with one symbol from candidate_targets.".to_string(),
@@ -6821,16 +7003,12 @@ pub(crate) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             failure,
             incomplete_reason,
         } => {
-            let mut result = scan_usages_entry_base(
-                request,
-                ScanUsagesStatus::Failure,
-                incomplete_reason.is_none() && !failure.candidate_files_truncated,
-            );
-            result.incomplete_reason = incomplete_reason.or_else(|| {
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Failure);
+            result.completion = Completion::from_reason(incomplete_reason.or_else(|| {
                 failure
                     .candidate_files_truncated
                     .then_some(ScanUsagesIncompleteReason::CandidateFiles)
-            });
+            }));
             result.symbol = Some(failure.symbol.clone());
             result.fq_name = Some(failure.fq_name.clone());
             result.reason_kind = Some(failure.reason_kind.clone());
@@ -6847,9 +7025,9 @@ pub(crate) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             reason,
             message,
         } => {
-            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Failure, false);
+            let mut result = scan_usages_entry_base(request, ScanUsagesStatus::Failure);
             result.symbol.clone_from(symbol);
-            result.incomplete_reason = Some(*reason);
+            result.completion = Completion::incomplete(*reason);
             result.reason_kind = Some(
                 match reason {
                     ScanUsagesIncompleteReason::Cancelled => "cancelled",
@@ -6893,12 +7071,11 @@ pub(crate) fn classify_usage_entry(
             .is_some()
             .then_some(ScanUsagesIncompleteReason::ResponseBudget)
     });
-    let complete = !too_many_callsites && incomplete_reason.is_none();
 
     if too_many_callsites {
         let (short_name, total_callsites, limit) =
             callsite_cap.expect("too_many_callsites entry includes cap details");
-        let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites, false);
+        let mut result = scan_usages_entry_base(request, ScanUsagesStatus::TooManyCallsites);
         populate_usage_payload(&mut result, usage, target_is_method, &[], request.surface);
         result.short_name = Some(short_name);
         result.total_callsites = Some(total_callsites);
@@ -6934,7 +7111,10 @@ pub(crate) fn classify_usage_entry(
     // unverified-absence caveats.
     let status = if usage.total_hits > 0 {
         ScanUsagesStatus::Found
-    } else if incomplete_reason == Some(ScanUsagesIncompleteReason::TimeBudget) {
+    } else if matches!(
+        incomplete_reason,
+        Some(ScanUsagesIncompleteReason::TimeBudget | ScanUsagesIncompleteReason::SemanticAnalysis)
+    ) {
         ScanUsagesStatus::UnverifiedAbsent
     } else if usage.same_owner_sites.is_some_and(|count| count > 0) {
         ScanUsagesStatus::NoExternalUsages
@@ -6944,7 +7124,7 @@ pub(crate) fn classify_usage_entry(
         ScanUsagesStatus::UnverifiedAbsent
     };
 
-    let mut result = scan_usages_entry_base(request, status, complete);
+    let mut result = scan_usages_entry_base(request, status);
     if usage.candidate_files_truncated {
         result.candidate_files_sample = candidate_files_sample;
     }
@@ -7080,14 +7260,12 @@ pub(crate) fn scan_usages_unverified_absence_message(
 pub(crate) fn scan_usages_entry_base(
     request: &ScanUsageRequest,
     status: ScanUsagesStatus,
-    complete: bool,
 ) -> ScanUsagesEntry {
     ScanUsagesEntry {
         input: request.input.clone(),
         input_kind: request.input_kind,
         status,
-        complete,
-        incomplete_reason: None,
+        completion: Completion::COMPLETE,
         symbol: None,
         short_name: None,
         total_hits: None,
@@ -7329,56 +7507,104 @@ fn attach_model_relations(analyzer: &dyn IAnalyzer, result: &mut ScanUsagesResul
     result.summary = build_scan_usages_summary(&result.results);
 }
 
+fn mark_model_relations_incomplete(entry: &mut ScanUsagesEntry) {
+    // A model read stopped by the operation's cancellation reports the
+    // cancellation, not missing semantic analysis.
+    entry.completion.mark_incomplete(
+        if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(None) {
+            ScanUsagesIncompleteReason::Cancelled
+        } else {
+            ScanUsagesIncompleteReason::SemanticAnalysis
+        },
+    );
+    if matches!(
+        entry.status,
+        ScanUsagesStatus::VerifiedAbsent | ScanUsagesStatus::NoExternalUsages
+    ) {
+        entry.status = ScanUsagesStatus::UnverifiedAbsent;
+    }
+    entry
+        .notes
+        .push("Modeled relations are incomplete; absence could not be verified.".to_string());
+}
+
 fn attach_model_relations_to_entries(
     analyzer: &dyn IAnalyzer,
     overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
     scope: &ScanUsagesScope,
     entries: &mut [ScanUsagesEntry],
 ) {
-    const MAX_MODEL_RELATIONS_PER_SYMBOL: usize = 256;
-
-    let whole_workspace = scope.whole_workspace;
     for entry in entries {
-        let input = match &entry.input {
-            ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
-            ScanUsagesInput::Target(_) => entry
-                .fq_name
-                .as_deref()
-                .or(entry.symbol.as_deref())
-                .unwrap_or_default(),
-        };
-        let authored_target = entry.fq_name.is_some()
+        let entry_scope = AnalyzerQueryScope::new(analyzer);
+        attach_model_relations_to_entry(analyzer, overlay, scope, entry);
+        if let Err(reason) = entry_scope.read_completion()
             && !matches!(
-                entry.status,
-                ScanUsagesStatus::NotFound
-                    | ScanUsagesStatus::Ambiguous
-                    | ScanUsagesStatus::Failure
-            );
-        let mut symbol = if input.starts_with("bifrost-model://") {
-            overlay.symbols_at_uri(input)
-        } else {
-            entry
-                .fq_name
-                .as_deref()
-                .map(|name| overlay.symbols_named(name))
-                .filter(|matched| !matched.records.is_empty())
-                .unwrap_or_else(|| overlay.symbols_named(input))
-        };
-        if symbol.records.is_empty() {
-            symbol = overlay.symbols_with_id(input);
-        }
-        if symbol.disposition
-            != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                reason,
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+            )
         {
-            if symbol.disposition
+            fold_scan_usages_entry_read_gap(entry, &reason.into());
+        }
+    }
+}
+
+fn attach_model_relations_to_entry(
+    analyzer: &dyn IAnalyzer,
+    overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
+    scope: &ScanUsagesScope,
+    entry: &mut ScanUsagesEntry,
+) {
+    const MAX_MODEL_RELATIONS_PER_SYMBOL: usize = 256;
+    let whole_workspace = scope.whole_workspace;
+    let input = match &entry.input {
+        ScanUsagesInput::Symbol(symbol) => symbol.as_str(),
+        ScanUsagesInput::Target(_) => entry
+            .fq_name
+            .as_deref()
+            .or(entry.symbol.as_deref())
+            .unwrap_or_default(),
+    };
+    let authored_target = entry.fq_name.is_some()
+        && !matches!(
+            entry.status,
+            ScanUsagesStatus::NotFound | ScanUsagesStatus::Ambiguous | ScanUsagesStatus::Failure
+        );
+    // An open lookup is not a miss, so it never falls back to another
+    // spelling that could answer as if it were complete.
+    let is_open =
+        |matched: &brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayMatch<
+            _,
+        >| {
+            matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_))
+        };
+    let mut symbol = if input.starts_with("bifrost-model://") {
+        overlay.symbols_at_uri(input)
+    } else {
+        entry
+            .fq_name
+            .as_deref()
+            .map(|name| overlay.symbols_named(name))
+            .filter(|matched| !matched.records.is_empty() || is_open(matched))
+            .unwrap_or_else(|| overlay.symbols_named(input))
+    };
+    if symbol.records.is_empty() && !is_open(&symbol) {
+        symbol = overlay.symbols_with_id(input);
+    }
+    if symbol.disposition
+        != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+    {
+        if symbol.disposition
                 == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
                 && authored_target
                 && whole_workspace
             {
                 let authored_name = entry.fq_name.as_deref().unwrap_or_default();
-                let mut inverse_relations = overlay
-                    .relations_to(authored_name)
-                    .records
+                let matched = overlay.relations_to(authored_name);
+                if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                    mark_model_relations_incomplete(entry);
+                    return;
+                }
+                let mut inverse_relations = matched.records
                     .into_iter()
                     // Navigation locates a modeled declaration's authored anchor; only an
                     // explicit reference relation makes that declaration an inverse usage.
@@ -7395,7 +7621,7 @@ fn attach_model_relations_to_entries(
                         "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
                             .to_string(),
                     );
-                    continue;
+                    return;
                 }
                 let mut modeled_references = BTreeMap::<String, Vec<UsageLocation>>::new();
                 for relation in &inverse_relations {
@@ -7463,9 +7689,23 @@ fn attach_model_relations_to_entries(
                     );
                     entry.status = ScanUsagesStatus::Found;
                 }
-                continue;
+                return;
             }
-            if symbol.disposition
+        if is_open(&symbol) {
+            // An open lookup proves neither the target nor its absence, so an
+            // authored miss becomes an incomplete answer, as other
+            // incomplete resolutions report it.
+            if entry.status == ScanUsagesStatus::NotFound {
+                entry.status = ScanUsagesStatus::Failure;
+                entry.reason_kind = Some("semantic_incomplete".to_owned());
+                entry.message = Some(
+                        "the semantic-model inventory is incomplete, so the target could not be resolved"
+                            .to_owned(),
+                    );
+            }
+            mark_model_relations_incomplete(entry);
+        }
+        if symbol.disposition
                 == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict
             {
                 if authored_target {
@@ -7481,87 +7721,104 @@ fn attach_model_relations_to_entries(
                     );
                 }
             }
-            continue;
-        }
-        let model_symbol = &symbol.records[0];
-        if whole_workspace {
-            let authored_references = authored_model_references(analyzer, overlay, model_symbol);
-            let authored_hits = authored_references
-                .iter()
-                .map(|file| file.hits.len())
-                .sum::<usize>();
-            if authored_hits != 0 {
-                entry.files.extend(authored_references);
-                entry
-                    .files
-                    .sort_by(|left, right| left.path.cmp(&right.path));
-                entry.symbol = Some(model_symbol.qualified_name.clone());
-                entry.fq_name = Some(model_symbol.qualified_name.clone());
-                entry.total_hits = Some(
-                    entry
-                        .total_hits
-                        .unwrap_or_default()
-                        .saturating_add(authored_hits),
-                );
-                entry.status = ScanUsagesStatus::Found;
-                entry.message = None;
-                entry.notes.push(
-                    "Workspace references were matched through structured definition resolution."
-                        .to_owned(),
-                );
-            }
-        }
-        let relations = overlay.relations_to(&model_symbol.id);
-        if relations
-            .records
+        return;
+    }
+    let model_symbol = &symbol.records[0];
+    if whole_workspace {
+        let authored_references = authored_model_references(analyzer, overlay, model_symbol);
+        let authored_hits = authored_references
             .iter()
-            .any(|relation| relation.provenance.ambiguous)
-        {
-            if authored_target {
-                entry.notes.push(
-                    "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
-                        .to_string(),
-                );
-            } else {
-                entry.status = ScanUsagesStatus::Ambiguous;
-                entry.message = Some(
-                    "conflicting active semantic-model relations prevent an authoritative usage result"
-                        .to_string(),
-                );
-            }
-            continue;
-        }
-        let total_model_relations = relations.records.len();
-        entry.model_relations = relations
-            .records
-            .into_iter()
-            .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
-            .collect();
-        entry.model_relations_omitted =
-            total_model_relations.saturating_sub(entry.model_relations.len());
-        if !entry.model_relations.is_empty() {
+            .map(|file| file.hits.len())
+            .sum::<usize>();
+        if authored_hits != 0 {
+            entry.files.extend(authored_references);
+            entry
+                .files
+                .sort_by(|left, right| left.path.cmp(&right.path));
             entry.symbol = Some(model_symbol.qualified_name.clone());
             entry.fq_name = Some(model_symbol.qualified_name.clone());
             entry.total_hits = Some(
                 entry
                     .total_hits
                     .unwrap_or_default()
-                    .saturating_add(entry.model_relations.len()),
+                    .saturating_add(authored_hits),
             );
             entry.status = ScanUsagesStatus::Found;
+            entry.message = None;
             entry.notes.push(
-                "Model relations are semantic facts and do not claim authored source hit text."
-                    .to_string(),
+                "Workspace references were matched through structured definition resolution."
+                    .to_owned(),
             );
-        } else if entry.status == ScanUsagesStatus::NotFound {
+        }
+    }
+    let relations = overlay.relations_to_for(&model_symbol.id, &model_symbol.language);
+    if matches!(
+        relations.disposition,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        // The target resolved even though its inbound relations are open,
+        // so the entry names it instead of reporting it missing.
+        if entry.status == ScanUsagesStatus::NotFound {
             entry.status = ScanUsagesStatus::UnverifiedAbsent;
             entry.symbol = Some(model_symbol.qualified_name.clone());
             entry.fq_name = Some(model_symbol.qualified_name.clone());
             entry.message = Some(
-                "the semantic-model declaration resolved, but the active packs contain no modeled inbound relation"
+                    "the semantic-model declaration resolved, but its modeled inbound relations are incomplete"
+                        .to_string(),
+                );
+        }
+        mark_model_relations_incomplete(entry);
+        return;
+    }
+    if relations
+        .records
+        .iter()
+        .any(|relation| relation.provenance.ambiguous)
+    {
+        if authored_target {
+            entry.notes.push(
+                    "Conflicting modeled relations were omitted; authored usage resolution retained precedence."
+                        .to_string(),
+                );
+        } else {
+            entry.status = ScanUsagesStatus::Ambiguous;
+            entry.message = Some(
+                "conflicting active semantic-model relations prevent an authoritative usage result"
                     .to_string(),
             );
         }
+        return;
+    }
+    let total_model_relations = relations.records.len();
+    entry.model_relations = relations
+        .records
+        .into_iter()
+        .take(MAX_MODEL_RELATIONS_PER_SYMBOL)
+        .collect();
+    entry.model_relations_omitted =
+        total_model_relations.saturating_sub(entry.model_relations.len());
+    if !entry.model_relations.is_empty() {
+        entry.symbol = Some(model_symbol.qualified_name.clone());
+        entry.fq_name = Some(model_symbol.qualified_name.clone());
+        entry.total_hits = Some(
+            entry
+                .total_hits
+                .unwrap_or_default()
+                .saturating_add(entry.model_relations.len()),
+        );
+        entry.status = ScanUsagesStatus::Found;
+        entry.notes.push(
+            "Model relations are semantic facts and do not claim authored source hit text."
+                .to_string(),
+        );
+    } else if entry.status == ScanUsagesStatus::NotFound {
+        entry.status = ScanUsagesStatus::UnverifiedAbsent;
+        entry.symbol = Some(model_symbol.qualified_name.clone());
+        entry.fq_name = Some(model_symbol.qualified_name.clone());
+        entry.message = Some(
+                "the semantic-model declaration resolved, but the active packs contain no modeled inbound relation"
+                    .to_string(),
+            );
     }
 }
 
@@ -8125,10 +8382,6 @@ pub(crate) fn some_if_nonzero(value: usize) -> Option<usize> {
     (value > 0).then_some(value)
 }
 
-pub(crate) fn is_true(value: &bool) -> bool {
-    *value
-}
-
 pub(crate) fn too_many_callsites_note(limit: usize) -> String {
     format!(
         "Stopped after the {limit}-callsite cap for this high-fanout symbol. Re-call with narrower `paths` or a more specific declaration; exhaustive output is intentionally suppressed for this query."
@@ -8302,6 +8555,9 @@ mod tests {
     }
 
     #[test]
+    #[hardwon(
+        "8b8dd8e00072: #2772 raw semantic incompleteness discarded named resolver diagnostics"
+    )]
     fn semantic_incomplete_scan_retains_hits_and_never_verifies_absence() {
         let hit = UsageHitRow {
             path: "src/lib.rs".to_string(),
@@ -8343,10 +8599,16 @@ mod tests {
                 incomplete_reason: Some(ScanUsagesIncompleteReason::SemanticAnalysis),
             });
             assert_eq!(entry.status, status);
+            assert!(
+                raw_reference_incomplete_reason(&entry)
+                    .unwrap()
+                    .contains("Unresolved structured reference"),
+                "raw scans must preserve the cause of semantic incompleteness: {entry:?}"
+            );
             assert_eq!(entry.total_hits, Some(count));
-            assert!(!entry.complete);
+            assert!(!entry.completion.is_complete());
             assert_eq!(
-                entry.incomplete_reason,
+                entry.completion.incomplete_reason(),
                 Some(ScanUsagesIncompleteReason::SemanticAnalysis)
             );
             assert!(
@@ -8402,6 +8664,8 @@ mod tests {
         let mut raw_proven_inbound = vec![0; nodes.len()];
         raw_proven_inbound[target_index] = raw_truncated_inbound.unwrap_or(sites.len());
         SelectedWorkspaceUsageGraphProjection {
+            relative_import_routes: Vec::new(),
+            scope_obligations: Vec::new(),
             nodes,
             raw_proven_inbound,
             admitted_callers: HashSet::from_iter([caller_file]),
@@ -8743,6 +9007,88 @@ mod tests {
         }
     }
 
+    #[test]
+    #[hardwon(
+        "#10594: a read gap left no_external_usages and verified_absent without the scan_incomplete caveat"
+    )]
+    fn read_gap_withdraws_same_owner_absence() {
+        use crate::inline_project::InlineTestProject;
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("Cargo.toml", "[package]\nname = \"gap\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+            .file("src/lib.rs", "#[path = \"unproven.inc\"] mod missing;\npub struct Worker;\nimpl Worker { pub fn collect_it(&self) {}\npub fn caller(&self) { self.collect_it(); } }\npub fn unused() {}\n")
+            .build();
+        let workspace = fixture.certified_workspace_analyzer(Default::default());
+        let result = scan_usages_by_reference(
+            workspace.analyzer(),
+            ScanUsagesByReferenceParams {
+                symbols: vec!["collect_it".into(), "unused".into()],
+                include_tests: false,
+                include_same_owner: false,
+                paths: None,
+            },
+        );
+        assert_eq!(result.results.len(), 2, "{result:#?}");
+        for entry in &result.results {
+            assert_eq!(
+                entry.status,
+                ScanUsagesStatus::UnverifiedAbsent,
+                "{result:#?}"
+            );
+            assert!(
+                entry
+                    .absence_caveats
+                    .contains(&ScanUsagesAbsenceCaveat::ScanIncomplete),
+                "{result:#?}"
+            );
+        }
+        assert!(result.summary.partial, "{result:#?}");
+        assert_eq!(result.summary.no_external_usages, 0);
+        assert_eq!(result.summary.verified_absent, 0);
+    }
+
+    #[test]
+    #[hardwon("#10594: an outer read gap contaminated independently completed reference entries")]
+    fn raw_reference_entries_ignore_unowned_outer_read_gaps() {
+        let (_fixture, analyzer) = soft_deadline_partial_fixture();
+        let params = ScanUsagesByLocationParams {
+            targets: vec![ScanUsagesTarget {
+                path: "src/target.rs".into(),
+                line: 1,
+                column: None,
+                symbol: None,
+            }],
+            include_tests: true,
+            paths: None,
+            include_same_owner: false,
+        };
+        let complete = scan_usage_reference_sites_by_location(
+            &analyzer,
+            params.clone(),
+            CancellationToken::default(),
+        );
+        assert!(complete[0].incomplete_reason.is_none(), "{complete:#?}");
+        let query = AnalyzerQueryScope::new(&analyzer);
+        let context = ScanUsagesExecutionContext::with_cancellation(CancellationToken::default());
+        let (entries, scope) = scan_usages_backend_on_pool(
+            &analyzer,
+            query.token(),
+            true,
+            None,
+            Vec::new(),
+            vec![ScanUsageRequest::target(0, params.targets[0].clone())],
+            false,
+            &context,
+        );
+        analyzer.record_query_incomplete(
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(
+                "unread external references".into(),
+            ),
+        );
+        let raw = collect_scan_usages_reference_sites(&analyzer, entries, scope, &context);
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].incomplete_reason.is_none(), "{raw:#?}");
+    }
+
     /// A crate whose caller module holds enough proved sites that a mid-scan
     /// cancellation can land after some of them are recorded.
     fn partial_scan_fixture() -> (tempfile::TempDir, RustAnalyzer) {
@@ -8799,7 +9145,13 @@ mod tests {
                 "use crate::target::collect_it;\npub fn call_b() -> i32 { collect_it() }\n",
             )
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        // Complete usage answers require a certified Rust source listing.
+        let workspace = fixture.certified_workspace_analyzer(Default::default());
+        let analyzer = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            RustAnalyzer,
+        >(workspace.analyzer())
+        .expect("fixture contains Rust")
+        .clone();
         (fixture, analyzer)
     }
 
@@ -8857,7 +9209,7 @@ mod tests {
     ) {
         let complete_entry = &complete.results[0];
         assert_eq!(ScanUsagesStatus::Found, complete_entry.status);
-        assert!(complete_entry.complete);
+        assert!(complete_entry.completion.is_complete());
         let complete_hits = complete_entry
             .total_hits
             .expect("complete scan counts hits");
@@ -8865,10 +9217,10 @@ mod tests {
 
         let entry = &partial.results[0];
         assert_eq!(ScanUsagesStatus::Found, entry.status);
-        assert!(!entry.complete);
+        assert!(!entry.completion.is_complete());
         assert_eq!(
             Some(ScanUsagesIncompleteReason::TimeBudget),
-            entry.incomplete_reason
+            entry.completion.incomplete_reason()
         );
         assert!(
             entry.total_hits.is_some_and(|hits| hits <= complete_hits),
@@ -8955,10 +9307,10 @@ mod tests {
             entry.status,
             "{result:#?}"
         );
-        assert!(!entry.complete);
+        assert!(!entry.completion.is_complete());
         assert_eq!(
             Some(ScanUsagesIncompleteReason::TimeBudget),
-            entry.incomplete_reason
+            entry.completion.incomplete_reason()
         );
         assert!(result.summary.partial);
         assert!(!entry.absence_caveats.is_empty());
@@ -8986,7 +9338,7 @@ mod tests {
                 CancellationToken::cancel_after_checks_for_test(checks),
             );
             let entry = &result.results[0];
-            if entry.complete {
+            if entry.completion.is_complete() {
                 continue;
             }
             assert_ne!(
@@ -9160,6 +9512,8 @@ mod tests {
                 let edge_count = edges.len();
                 Ok(SelectedWorkspaceUsageGraphProjectionOutcome::Complete(
                     SelectedWorkspaceUsageGraphProjection {
+                        relative_import_routes: Vec::new(),
+                        scope_obligations: Vec::new(),
                         nodes: catalog.nodes,
                         edges,
                         same_owner_edges: Vec::new(),
@@ -9373,6 +9727,7 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("556c42b478b1: #7272 native Python point budget discarded later caller files")]
     fn batch_reference_sites_preserve_files_beyond_interactive_limit() {
         let mut sources = vec![(
             "app.py".to_string(),
@@ -9413,7 +9768,13 @@ mod tests {
         let raw =
             scan_usage_reference_sites_by_location(analyzer, params, CancellationToken::default());
         assert_eq!(raw.len(), 1);
-        assert!(raw[0].incomplete_reason.is_none(), "{raw:?}");
+        // Scope is not a reference loss. Preserve independent losses and keep
+        // this scan's budget checks separate from its complete positive sites.
+        let reason = raw[0].incomplete_reason.as_deref().unwrap_or_default();
+        assert!(!reason.contains("python_environment_open"), "{raw:?}");
+        assert!(!reason.contains("budget_exceeded"), "{raw:?}");
+        assert!(!reason.contains("session_stopped"), "{raw:?}");
+        assert!(!reason.contains("scan_limit"), "{raw:?}");
         assert_eq!(raw[0].files.len(), 25, "{raw:?}");
         for (index, file) in raw[0].files.iter().enumerate() {
             assert_eq!(file.path, format!("caller_{index:02}.py"));

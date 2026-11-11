@@ -81,6 +81,7 @@ use brokk_bifrost_analysis::analyzer::structural::reference_edges::classify_owne
 
 use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 
+#[cfg(test)]
 use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
@@ -528,8 +529,9 @@ fn go_selected_inverse_in_context(
         ));
     }
     // Projection reads structural facts through the analyzer. Release the
-    // selected reader first: an in-memory store uses the writer connection
-    // for reads and cannot acquire it again while this operation holds it.
+    // selected reader first: a test-only single-connection store uses the
+    // writer connection for reads and cannot acquire it again while this
+    // operation holds it.
     // Publication authority of every bound context is rechecked below.
     let bound_contexts = operation.bound_go_context_publications();
     drop(operation);
@@ -1047,8 +1049,8 @@ fn project_confirmed_references(
             );
         }
         let owner_relation = classify_owner_relation(go, owner.as_ref(), target);
-        let reference_kind = projected_file.classifier.as_ref().and_then(|classifier| {
-            classifier.classify_reference_kind(metadata.start_byte(), metadata.end_byte(), target)
+        let reference_kind = projected_file.classifier.as_ref().map(|classifier| {
+            classifier.classify_reference_facets(metadata.start_byte(), metadata.end_byte(), target)
         });
         let ast_id = projected_file
             .classifier
@@ -1060,7 +1062,20 @@ fn project_confirmed_references(
                 EdgeIncompleteReason::InverseIndexMetadataIncomplete,
             );
         }
+        let (proof, obligations_block_proof) = brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::selected_reverse_proof(
+            directly_bound
+                && answer.binding().targets().len() == 1
+                && answer.binding().completion() == &ResolutionCompletion::Complete,
+            !answer.query_obligations.is_empty(),
+        );
+        if obligations_block_proof {
+            push_reason(
+                &mut reasons,
+                EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding,
+            );
+        }
         let mut edge = ReferenceEdgeRow {
+            dispatch_extensibility: None,
             site: EdgeSite {
                 file,
                 range: projected_file.range(metadata.start_byte(), metadata.end_byte()),
@@ -1068,15 +1083,10 @@ fn project_confirmed_references(
                 enclosing: owner,
             },
             target: target.clone(),
-            reference_kind,
-            proof: if directly_bound
-                && answer.binding().targets().len() == 1
-                && answer.binding().completion() == &ResolutionCompletion::Complete
-            {
-                UsageProof::Proven
-            } else {
-                UsageProof::Unproven
-            },
+            reference_kind: reference_kind.unwrap_or_else(|| {
+                brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None)
+            }),
+            proof,
             ambiguous_candidate: false,
             usage_kind: if interface_dispatch {
                 // A compatible family member is a possible runtime usage,
@@ -2394,9 +2404,10 @@ func use() {
             .iter()
             .find(|edge| edge.site.file == fixture.file("app/app.go") && edge.target == target)
             .expect("the generic imported call must be forward-confirmed");
-        assert_eq!(
-            edge.reference_kind,
-            Some(brokk_bifrost_core::analyzer::usages::model::ReferenceKind::MethodCall),
+        assert!(
+            edge.reference_kind
+                .known()
+                .contains(brokk_bifrost_core::analyzer::usages::model::ReferenceKind::MethodCall),
             "generic selector calls retain their call classification: {edge:#?}"
         );
         let facts = analyzer
@@ -2527,22 +2538,8 @@ var value b.T
         let definition_plan = brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::last_go_reverse_definition_plan_for_test();
         eprintln!("selected Go alias-definition EXPLAIN QUERY PLAN: {definition_plan:#?}");
         assert!(
-            definition_plan
-                .iter()
-                .any(|detail| detail.contains("semantic")),
-            "alias lexical projection must plan its populated semantic-site lookup: {definition_plan:#?}"
-        );
-        assert!(
-            definition_plan
-                .iter()
-                .any(|detail| detail.contains("bridge")),
-            "alias lexical projection must plan its populated source-declaration bridge lookup: {definition_plan:#?}"
-        );
-        assert!(
-            definition_plan
-                .iter()
-                .any(|detail| detail.contains("declaration")),
-            "alias lexical projection must plan its populated declaration-name lookup: {definition_plan:#?}"
+            definition_plan.is_empty(),
+            "the alias Field unit should use its selected bridge without a lexical fallback: {definition_plan:#?}"
         );
         let candidates = brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::last_go_reverse_candidate_paths_for_test();
         assert!(

@@ -30,7 +30,7 @@ mod rust_departing_tests_tests {
         let fixture = InlineTestProject::new()
             .file("src/lib.rs", IMPORT_SOURCE)
             .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let expected = state
             .source_facts
             .as_ref()
@@ -74,7 +74,7 @@ mod rust_departing_tests_tests {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("canonical import fixture publishes");
@@ -90,13 +90,13 @@ mod rust_departing_tests_tests {
         let fixture = InlineTestProject::new()
             .file("src/lib.rs", IMPORT_SOURCE)
             .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let oid = oid_for(IMPORT_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral analyzer store");
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("canonical import fixture publishes");

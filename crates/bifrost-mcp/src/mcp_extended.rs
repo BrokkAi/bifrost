@@ -9,10 +9,11 @@ use brokk_bifrost_rql::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_CONFIGURATION_FACTS_FILTER_FIELDS,
     ALL_CROSS_DOMAIN_RELATION_FIELDS, ALL_QUERY_PLAN_SOURCES, ALL_QUERY_STEP_OPS,
     ALL_REFERENCE_KINDS, ALL_USAGE_KINDS, ConfigurationFactsFilterField, ExportFilterField,
-    GenerationSiteFilterField, QueryField, QueryStepField, control_relation_filter_labels,
-    environment_filter_labels, export_form_labels, flow_state_filter_labels,
-    generation_input_labels, generation_kind_labels, occurrence_filter_labels,
-    reference_kind_label, rewrite_path_filter_labels, supported_query_schema_versions,
+    GenerationSiteFilterField, QueryField, QueryStepField, constrained_step_option_labels,
+    control_relation_filter_labels, environment_filter_labels, export_form_labels,
+    flow_state_filter_labels, generation_input_labels, generation_kind_labels,
+    occurrence_filter_labels, reference_kind_label, rewrite_path_filter_labels,
+    supported_query_schema_versions,
 };
 use serde_json::{Value, json};
 
@@ -150,10 +151,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .filter(|op| op.allows_call_site_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
+    // `member_targets` has its own variant below: it alone takes the
+    // `member_form` and `trivial_property` options.
     let receiver_steps = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
-        .filter(|op| op.allows_receiver_options())
+        .filter(|op| op.allows_receiver_options() && op.label() != "member_targets")
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let field_write_value_steps = ALL_QUERY_STEP_OPS
@@ -377,6 +380,27 @@ fn query_step_input_variants() -> Vec<Value> {
                     "type": "string",
                     "minLength": capture_name_minimum,
                     "maxLength": capture_name_maximum
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "const": "member_targets" },
+                "capture": {
+                    "type": "string",
+                    "minLength": capture_name_minimum,
+                    "maxLength": capture_name_maximum
+                },
+                "member_form": constrained_label_array(
+                    constrained_step_option_labels(QueryStepField::MemberForms),
+                    QueryStepField::MemberForms.description()
+                ),
+                "trivial_property": {
+                    "type": "boolean",
+                    "description": QueryStepField::TrivialProperty.description()
                 }
             },
             "required": ["op"],
@@ -937,6 +961,12 @@ fn configuration_facts_axis_schema(field: ConfigurationFactsFilterField) -> Valu
         | ConfigurationFactsFilterField::ValueGe => {
             json!({ "type": "number", "description": description })
         }
+        ConfigurationFactsFilterField::ValueRegex => json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_STRING_PREDICATE_LENGTH,
+            "description": description
+        }),
         ConfigurationFactsFilterField::XmlPeerMinSharedChildren => {
             json!({ "type": "integer", "minimum": 0, "description": description })
         }
@@ -1536,6 +1566,14 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn configuration_value_regex_schema_matches_decoder_shape_and_bound() {
+        let schema = configuration_facts_axis_schema(ConfigurationFactsFilterField::ValueRegex);
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["minLength"], 1);
+        assert_eq!(schema["maxLength"], MAX_STRING_PREDICATE_LENGTH);
+    }
+
+    #[test]
     #[hardwon(
         "#3839: the query_code schema omitted generation_sites, exports, configuration_facts, correlate, and require_both"
     )]
@@ -1716,10 +1754,23 @@ mod tests {
             .unwrap()
             .iter()
             .find(|variant| {
-                variant["properties"]["op"]["enum"]
-                    == json!(["receiver_targets", "points_to", "member_targets"])
+                variant["properties"]["op"]["enum"] == json!(["receiver_targets", "points_to"])
             })
             .expect("receiver traversal schema");
+        let member_targets_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["op"]["const"] == "member_targets")
+            .expect("member-targets traversal schema");
+        assert_eq!(
+            member_targets_variant["properties"]["member_form"]["items"]["enum"],
+            json!(["field", "property", "method", "event", "other"])
+        );
+        assert_eq!(
+            member_targets_variant["properties"]["trivial_property"]["type"],
+            "boolean"
+        );
         assert_eq!(receiver_variant["properties"]["capture"]["minLength"], 1);
         let typestate_variant = steps["items"]["oneOf"]
             .as_array()

@@ -40,6 +40,342 @@ use crate::analyzer::semantic::provider::SemanticBudgetExceeded;
 
 pub use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
 
+pub const FOOTPRINT_COVERAGE_CONTRACT_VERSION: u32 = 1;
+
+/// The complete set of footprint claims required by contract version 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FootprintClass {
+    FormalSlots,
+    SignatureAttributesTransforms,
+    MemoryWrite,
+    MemoryRead,
+    PublicationEscape,
+    StaticGlobal,
+    Capture,
+    NestedCall,
+    CallTarget,
+    NormalExit,
+    ExceptionalExit,
+    CleanupDropUnwind,
+    ConversionInitialization,
+    DeferredExecution,
+    NestedCallableOwnership,
+}
+
+impl FootprintClass {
+    pub const ALL: [Self; 15] = [
+        Self::FormalSlots,
+        Self::SignatureAttributesTransforms,
+        Self::MemoryWrite,
+        Self::MemoryRead,
+        Self::PublicationEscape,
+        Self::StaticGlobal,
+        Self::Capture,
+        Self::NestedCall,
+        Self::CallTarget,
+        Self::NormalExit,
+        Self::ExceptionalExit,
+        Self::CleanupDropUnwind,
+        Self::ConversionInitialization,
+        Self::DeferredExecution,
+        Self::NestedCallableOwnership,
+    ];
+
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::FormalSlots => 1,
+            Self::SignatureAttributesTransforms => 2,
+            Self::MemoryWrite => 3,
+            Self::MemoryRead => 4,
+            Self::PublicationEscape => 5,
+            Self::StaticGlobal => 6,
+            Self::Capture => 7,
+            Self::NestedCall => 8,
+            Self::CallTarget => 9,
+            Self::NormalExit => 10,
+            Self::ExceptionalExit => 11,
+            Self::CleanupDropUnwind => 12,
+            Self::ConversionInitialization => 13,
+            Self::DeferredExecution => 14,
+            Self::NestedCallableOwnership => 15,
+        }
+    }
+
+    pub fn from_code(code: i64) -> Option<Self> {
+        let class = Self::ALL.into_iter().find(|class| class.code() == code)?;
+        debug_assert_eq!(class.code(), code);
+        Some(class)
+    }
+}
+
+/// Footprint classes witnessed by the lowered IR rows of a procedure.
+pub fn present_footprint_classes(
+    parts: &ProcedureSemanticsParts,
+) -> std::collections::HashSet<FootprintClass> {
+    let mut present = std::collections::HashSet::new();
+    for point in &parts.points {
+        for event in &point.events {
+            match &event.effect {
+                SemanticEffect::MemoryStore { .. } => {
+                    present.insert(FootprintClass::MemoryWrite);
+                    present.insert(FootprintClass::PublicationEscape);
+                }
+                SemanticEffect::MemoryLoad { .. } => {
+                    present.insert(FootprintClass::MemoryRead);
+                }
+                SemanticEffect::CaptureBind { .. } => {
+                    present.insert(FootprintClass::Capture);
+                    present.insert(FootprintClass::PublicationEscape);
+                }
+                // A keyed operand of an aggregate is an initializing write to
+                // the aggregate, like a field store.
+                SemanticEffect::AggregateInitializer { .. } => {
+                    present.insert(FootprintClass::MemoryWrite);
+                    present.insert(FootprintClass::PublicationEscape);
+                }
+                // A multi-value return publishes through indexed flows and
+                // carries `ProcedureReturn { value: None }`.
+                SemanticEffect::ProcedureReturn { value: Some(_) }
+                | SemanticEffect::Throw { value: Some(_) }
+                | SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. },
+                    ..
+                } => {
+                    present.insert(FootprintClass::PublicationEscape);
+                }
+                SemanticEffect::NormalExit => {
+                    present.insert(FootprintClass::NormalExit);
+                }
+                SemanticEffect::ExceptionalExit => {
+                    present.insert(FootprintClass::ExceptionalExit);
+                }
+                _ => {}
+            }
+        }
+    }
+    if parts
+        .memory_locations
+        .iter()
+        .any(|location| matches!(location.kind, MemoryLocationKind::Static { .. }))
+    {
+        present.insert(FootprintClass::StaticGlobal);
+    }
+    if !parts.captures.is_empty() {
+        present.insert(FootprintClass::Capture);
+        present.insert(FootprintClass::PublicationEscape);
+    }
+    if !parts.call_sites.is_empty() {
+        present.insert(FootprintClass::NestedCall);
+        present.insert(FootprintClass::CallTarget);
+    }
+    if parts.call_sites.iter().any(|call| {
+        matches!(call.invocation_mode, CallInvocationMode::Detached)
+            || matches!(
+                call.execution_timing,
+                ExecutionTiming::SameInvocation
+                    | ExecutionTiming::LaterSameTurn
+                    | ExecutionTiming::AfterSuspension
+                    | ExecutionTiming::DifferentTask
+                    | ExecutionTiming::DifferentThread
+                    | ExecutionTiming::DeferredCallback
+                    | ExecutionTiming::GeneratorResume
+                    | ExecutionTiming::CancellationCleanup
+            )
+    }) {
+        present.insert(FootprintClass::DeferredExecution);
+    }
+    present
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FootprintExclusion {
+    NoInstance,
+    NoDropGlue,
+}
+
+impl FootprintExclusion {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::NoInstance => 1,
+            Self::NoDropGlue => 2,
+        }
+    }
+
+    pub fn from_code(code: i64) -> Option<Self> {
+        let reason = match code {
+            1 => Self::NoInstance,
+            2 => Self::NoDropGlue,
+            _ => return None,
+        };
+        debug_assert_eq!(reason.code(), code);
+        Some(reason)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FootprintRefusal {
+    UnclassifiedBranch,
+    FormalSlotsUnavailable,
+    UnaccountedSourceNode,
+    ContradictoryOwnership,
+    RelevantGap,
+}
+
+impl FootprintRefusal {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::UnclassifiedBranch => 1,
+            Self::FormalSlotsUnavailable => 2,
+            Self::UnaccountedSourceNode => 3,
+            Self::ContradictoryOwnership => 4,
+            Self::RelevantGap => 5,
+        }
+    }
+
+    pub fn from_code(code: i64) -> Option<Self> {
+        let reason = match code {
+            1 => Self::UnclassifiedBranch,
+            2 => Self::FormalSlotsUnavailable,
+            3 => Self::UnaccountedSourceNode,
+            4 => Self::ContradictoryOwnership,
+            5 => Self::RelevantGap,
+            _ => return None,
+        };
+        debug_assert_eq!(reason.code(), code);
+        Some(reason)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FootprintDisposition {
+    Represented,
+    Excluded(FootprintExclusion),
+    Refused(FootprintRefusal),
+}
+
+impl FootprintDisposition {
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Represented => 1,
+            Self::Excluded(_) => 2,
+            Self::Refused(_) => 3,
+        }
+    }
+
+    pub fn from_code(code: i64, reason: Option<i64>) -> Option<Self> {
+        let disposition = match (code, reason) {
+            (1, None) => Self::Represented,
+            (2, Some(reason)) => Self::Excluded(FootprintExclusion::from_code(reason)?),
+            (3, Some(reason)) => Self::Refused(FootprintRefusal::from_code(reason)?),
+            _ => return None,
+        };
+        debug_assert_eq!(disposition.code(), code);
+        Some(disposition)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcedureFootprintCoverage {
+    pub contract_version: u32,
+    pub boundary: Result<(), FootprintRefusal>,
+    pub classes: [FootprintDisposition; 15],
+    pub call_target_obligations: Vec<CallTargetObligation>,
+}
+
+/// Transient proof about the selected source procedure, independent of the
+/// full effect footprint. M2 publishes this as relational coverage rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcedureCallControlCoverage {
+    pub source_boundary: Result<(), FootprintRefusal>,
+    pub branches: Vec<CallControlBranch>,
+    pub call_target_obligations: Vec<CallTargetObligation>,
+    pub admission: Result<(), FootprintRefusal>,
+}
+
+impl Default for ProcedureCallControlCoverage {
+    fn default() -> Self {
+        Self {
+            source_boundary: Err(FootprintRefusal::UnclassifiedBranch),
+            branches: Vec::new(),
+            call_target_obligations: Vec::new(),
+            admission: Err(FootprintRefusal::UnclassifiedBranch),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallControlKind {
+    Syntax,
+    ExplicitCall,
+    Control,
+    InitializationConversion,
+    Deferred,
+    Callback,
+    NestedCallable,
+    ImplicitAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallControlDisposition {
+    Represented,
+    AffirmativelyExcluded(FootprintExclusion),
+    Refused(FootprintRefusal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallControlBranch {
+    pub start: usize,
+    pub end: usize,
+    pub kind: CallControlKind,
+    pub disposition: CallControlDisposition,
+}
+
+impl ProcedureFootprintCoverage {
+    pub fn unclassified() -> Self {
+        Self {
+            contract_version: FOOTPRINT_COVERAGE_CONTRACT_VERSION,
+            boundary: Err(FootprintRefusal::UnclassifiedBranch),
+            classes: [FootprintDisposition::Refused(FootprintRefusal::UnclassifiedBranch); 15],
+            call_target_obligations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallTargetObligation {
+    pub call: CallSiteId,
+    pub gap: SemanticGapId,
+    pub impacts: SemanticGapImpacts,
+}
+
+/// The unresolved-target gap pair of one call site: its unique Unknown Calls
+/// gap and its callee's unique Unknown callable-reference gap. A declared
+/// discharge is not required here; the obligation stays open until the
+/// query-time proof discharges the call. Both coverage writers and the
+/// footprint reader apply this pairing.
+pub fn call_target_gap_pair<'a>(
+    call: &SemanticCallSite,
+    gaps: &'a [SemanticGap],
+) -> Option<(&'a SemanticGap, &'a SemanticGap)> {
+    let mut resolution = gaps.iter().filter(|gap| {
+        gap.point == call.point
+            && gap.subject == SemanticGapSubject::CallSite(call.id)
+            && gap.capability == SemanticCapability::Calls
+            && gap.kind == SemanticGapKind::Unknown
+    });
+    let mut callable = gaps.iter().filter(|gap| {
+        gap.point == call.point
+            && gap.subject == SemanticGapSubject::Value(call.callee)
+            && gap.capability == SemanticCapability::CallableReferences
+            && gap.kind == SemanticGapKind::Unknown
+    });
+    let pair = (resolution.next()?, callable.next()?);
+    if resolution.next().is_some() || callable.next().is_some() {
+        return None;
+    }
+    Some(pair)
+}
+
 /// A stable category for one validation failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticIrErrorKind {
@@ -169,49 +505,7 @@ impl fmt::Display for SemanticIrError {
 }
 
 impl std::error::Error for SemanticIrError {}
-/// The language-neutral shape of an executable body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProcedureKind {
-    Function,
-    Method,
-    Constructor,
-    Initializer,
-    LocalFunction,
-    Lambda,
-    Closure,
-    Accessor,
-    Operator,
-}
-
-impl ProcedureKind {
-    /// The value domain the `procedure.procedure_kind` row field publishes
-    /// (issue #2515).
-    pub const LABELS: &'static [&'static str] = &[
-        "function",
-        "method",
-        "constructor",
-        "initializer",
-        "local_function",
-        "lambda",
-        "closure",
-        "accessor",
-        "operator",
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Function => "function",
-            Self::Method => "method",
-            Self::Constructor => "constructor",
-            Self::Initializer => "initializer",
-            Self::LocalFunction => "local_function",
-            Self::Lambda => "lambda",
-            Self::Closure => "closure",
-            Self::Accessor => "accessor",
-            Self::Operator => "operator",
-        }
-    }
-}
+pub use brokk_bifrost_core::analyzer::model::ProcedureKind;
 
 /// Whether a procedure's authored body and signature describe the callable
 /// boundary that a call observes.
@@ -507,6 +801,17 @@ impl FormalMultiplicity {
     }
 }
 
+/// The declared ownership form of a method's receiver. This declaration is
+/// not evidence that a particular call actually borrowed or moved its value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ReceiverMode {
+    #[default]
+    Unknown,
+    SharedBorrow,
+    MutableBorrow,
+    Owned,
+}
+
 /// The semantic role of a value row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticValueKind {
@@ -533,6 +838,7 @@ pub enum SemanticValueKind {
     /// binds like a parameter and is never the caller's own `this`.
     Receiver {
         dispatch: bool,
+        mode: ReceiverMode,
     },
     Return,
     Temporary,
@@ -696,12 +1002,42 @@ impl SemanticValueKind {
     }
 }
 
+/// How a value of a static type is represented, from its underlying type and
+/// independent of payload identity. A consumer decides from it whether a
+/// conversion copies the value or keeps its identity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum StaticTypeClass {
+    /// Not proven: an unresolved or generic type, or a value whose static
+    /// type the producer could not follow.
+    #[default]
+    Unknown = 0,
+    Interface = 1,
+    Pointer = 2,
+    /// A handle whose copies share one referent: a function, map, channel
+    /// or slice.
+    Reference = 3,
+    /// Copied on assignment: a struct, array or basic type.
+    Value = 4,
+}
+
+/// Where a consumer finds the static type of a value whose class the
+/// producer left `Unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StaticTypeOrigin {
+    /// The `ordinal`th normal result of `call`; the class is the callee's
+    /// declared result class.
+    CallResult { call: CallSiteId, ordinal: u32 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticValue {
     pub id: ValueId,
     pub kind: SemanticValueKind,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
+    pub static_type_class: StaticTypeClass,
+    pub static_type_origin: Option<StaticTypeOrigin>,
 }
 
 /// The abstract allocation represented by an allocation-site row.
@@ -1694,8 +2030,10 @@ pub enum SemanticGapDischarge {
     /// parameters and `let` bindings, so the abort route runs user code only
     /// if one of those drops does.
     NonRejoiningExceptionalExitAfterInertDrops,
-    /// The enclosing function's declared return type makes the residual
-    /// conversion a no-user-code transfer.
+    /// A conversion the lowering kept as a value transfer is a no-user-code
+    /// transfer once the language's query-time type proof holds: the
+    /// enclosing function's declared return type for Rust's `?`, the
+    /// initializer's resolved type for a typed C# local.
     ResidualConversion,
 }
 
@@ -2064,6 +2402,10 @@ impl ValueTransfer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowKind {
     Local,
+    /// The target receives the exact logical value selected from a field, but
+    /// Copy versus Move and the source place's later state are unresolved.
+    /// This is neither an alias nor an identity-separating transfer proof.
+    OwnershipUnknown,
     /// The target receives the source's value in a distinct storage/object
     /// identity.
     ///
@@ -2114,6 +2456,9 @@ pub enum ValueFlowKind {
     /// its payload identity, but the wrapper itself remains a separate value.
     ReferenceUnboxing,
     LanguageDefined,
+    /// The target copies the source at capture time. Referent identity is
+    /// preserved only when a language hook proves a static reference type.
+    ByValueCapture,
 }
 
 impl ValueFlowKind {
@@ -2124,11 +2469,13 @@ impl ValueFlowKind {
         match self {
             Self::Transfer(transfer) => transfer.preserves_runtime_class(),
             Self::BackingStore { .. }
+            | Self::OwnershipUnknown
             | Self::IntegerOffset { .. }
             | Self::ReferenceBoxing
             | Self::ReferenceUnboxing
             | Self::BackingStoreAlternative { .. }
-            | Self::LanguageDefined => false,
+            | Self::LanguageDefined
+            | Self::ByValueCapture => false,
             Self::Local
             | Self::Parameter
             | Self::Receiver
@@ -2140,6 +2487,7 @@ impl ValueFlowKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::OwnershipUnknown => "ownership_unknown",
             Self::Transfer(_) => "transfer",
             Self::BackingStore { .. } => "backing_store",
             Self::IntegerOffset { .. } => "integer_offset",
@@ -2151,8 +2499,15 @@ impl ValueFlowKind {
             Self::ReferenceBoxing => "reference_boxing",
             Self::ReferenceUnboxing => "reference_unboxing",
             Self::LanguageDefined => "language_defined",
+            Self::ByValueCapture => "by_value_capture",
         }
     }
+}
+
+/// One reason shared by consumers that need Copy/Move or identity evidence
+/// after an exact pattern-value projection. The value relation remains proven.
+pub fn ownership_unknown_reason(point: ProgramPointId) -> String {
+    format!("ownership of the projected value at {point} is unknown")
 }
 
 /// A structured operation on a value or binding without claiming that it
@@ -3137,8 +3492,38 @@ pub struct CallReceiverTypeFact {
 /// Mutable construction parts. Once accepted by
 /// [`crate::analyzer::semantic::SemanticArtifact::try_new`],
 /// every collection is boxed and only shared immutably.
+/// A syntax-derived projection that has no value-flow meaning until selected
+/// declaration authority proves the constructor, field, and binding mode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GuardedPatternProjection {
+    /// Dense, deterministic ordinal within the procedure. Virtual event IDs
+    /// derive from this ordinal after selected admission.
+    pub ordinal: u32,
+    pub point: ProgramPointId,
+    pub whole_value: ValueId,
+    pub binder: ValueId,
+    pub pattern_source: SourceMappingId,
+    pub binder_source: SourceMappingId,
+    pub declared_path_len: u8,
+    pub path: Box<[PatternProjectionStep]>,
+    pub status: PatternProjectionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PatternProjectionStep {
+    Tuple(u32),
+    Named(Box<str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PatternProjectionStatus {
+    Unevaluated,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcedureSemanticsParts {
+    /// None means unavailable signature; Some([]) means declared zero results.
+    pub declared_result_classes: Option<Box<[StaticTypeClass]>>,
     pub id: ProcedureId,
     pub locator: SemanticLocator,
     /// Query-time source regions this procedure does not lower. Nested
@@ -3148,6 +3533,10 @@ pub struct ProcedureSemanticsParts {
     pub lexical_parent: Option<ProcedureId>,
     pub kind: ProcedureKind,
     pub properties: ProcedureProperties,
+    /// Per-procedure lowering witness. The source-boundary account is discarded
+    /// before this result leaves the lowerer.
+    pub footprint_coverage: ProcedureFootprintCoverage,
+    pub call_control_coverage: ProcedureCallControlCoverage,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
     pub values: Vec<SemanticValue>,
@@ -3176,6 +3565,8 @@ pub struct ProcedureSemanticsParts {
     /// Written receiver types of method calls, in increasing call-site order
     /// with at most one fact per call site.
     pub receiver_type_facts: Vec<CallReceiverTypeFact>,
+    /// Guarded syntax candidates; these are never active IR effects.
+    pub guarded_pattern_projections: Vec<GuardedPatternProjection>,
     /// Go builtin-shaped calls this procedure's file-local lowerer omitted as
     /// runtime calls. Workspace queries validate these names against the
     /// package declaration index.
@@ -3193,10 +3584,13 @@ impl ProcedureSemanticsParts {
         Self {
             id,
             locator,
+            declared_result_classes: None,
             source_range_holes: Vec::new(),
             lexical_parent: None,
             kind,
             properties: ProcedureProperties::default(),
+            footprint_coverage: ProcedureFootprintCoverage::unclassified(),
+            call_control_coverage: ProcedureCallControlCoverage::default(),
             source,
             evidence,
             values: Vec::new(),
@@ -3223,6 +3617,7 @@ impl ProcedureSemanticsParts {
             pointer_invalidations: Vec::new(),
             incomplete_facts: Vec::new(),
             receiver_type_facts: Vec::new(),
+            guarded_pattern_projections: Vec::new(),
             go_predeclared_builtin_assumptions: Vec::new(),
         }
     }

@@ -87,8 +87,7 @@ impl CppAnalyzer {
                     Arc::new(CachedFileRead {
                         value: Arc::new(built),
                         reads: reads.keys().into(),
-                        unattributed_reads: reads.unattributed_reads(),
-                        execution_dependences: reads.execution_dependences(),
+                        channels: reads.channels(),
                         incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
                     })
                 })
@@ -129,8 +128,7 @@ impl CppAnalyzer {
                     Arc::new(CachedFileRead {
                         value: Arc::new(resolved),
                         reads: reads.keys().into(),
-                        unattributed_reads: reads.unattributed_reads(),
-                        execution_dependences: reads.execution_dependences(),
+                        channels: reads.channels(),
                         incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
                     })
                 })

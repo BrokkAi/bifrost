@@ -248,9 +248,11 @@ impl Default for SemanticModelRuntimeLimits {
     }
 }
 
-/// A request to select a named pack without claiming installed coordinates.
+/// An unknown toolchain whose assumption is selected by a standard-library pack.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ApproximateSemanticModelExpectation {
+    /// Other toolchain-keyed packs use the version selected by this stdlib.
+    pub toolchain: Option<String>,
     pub language: String,
     pub ecosystem: String,
     pub pack_id: String,
@@ -272,6 +274,7 @@ pub enum SemanticModelActivationStatus {
     Active,
     Disabled,
     Incompatible,
+    ApproximateDistributedBlocked,
     ReviewRequired,
     Shadowed,
     Conflict,
@@ -419,11 +422,84 @@ pub fn evidence_is_exact_python_distribution_artifact(
     crate::analyzer::semantic_model::csmi::validate_python_artifact(&artifact).is_ok()
 }
 
+/// The C# semantic-pack label used by scoped fence dispositions.
+pub const CSHARP_SEMANTIC_PACK_LANGUAGE: &str = "csharp";
+/// A C# fence never opens another language's rows.
+pub const CSHARP_SEMANTIC_PACK_LANGUAGES: &[&str] = &[CSHARP_SEMANTIC_PACK_LANGUAGE];
+
+/// A semantic question is incomplete. Content gaps cover the listed languages.
+/// Read failures and cancellations cover every language: a failed merged read
+/// can discard other owners' rows too. The languages remain the family label
+/// for diagnostics. An open C# pack fence is a content gap. A single reader
+/// never reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FamilyOpenCause {
+    Content,
+    ReadFailure,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FamilyOpen {
+    cause: FamilyOpenCause,
+    pub reason: &'static str,
+    /// The semantic-pack family labels for diagnostics.
+    pub languages: &'static [&'static str],
+}
+
+impl FamilyOpen {
+    /// The JVM-family part could not be read.
+    pub const fn jvm(reason: &'static str) -> Self {
+        Self {
+            reason,
+            languages: &brokk_bifrost_core::analyzer::model::JVM_SEMANTIC_PACK_LANGUAGES,
+            cause: FamilyOpenCause::ReadFailure,
+        }
+    }
+
+    /// A content fact that leaves the listed languages open.
+    pub const fn content(reason: &'static str, languages: &'static [&'static str]) -> Self {
+        Self {
+            reason,
+            languages,
+            cause: FamilyOpenCause::Content,
+        }
+    }
+
+    /// A temporary cancellation outcome, which must never be retained.
+    pub const fn jvm_cancelled() -> Self {
+        Self {
+            cause: FamilyOpenCause::Cancelled,
+            ..Self::jvm("JVM catalog cancelled")
+        }
+    }
+
+    /// Preserve cancellation when combining incomplete parts of a question.
+    pub const fn merge(self, other: Self) -> Self {
+        if other.is_cancellation() { other } else { self }
+    }
+
+    pub const fn is_cancellation(self) -> bool {
+        matches!(self.cause, FamilyOpenCause::Cancelled)
+    }
+
+    /// Whether rows of `language` may be missing.
+    pub fn covers(&self, language: &str) -> bool {
+        match self.cause {
+            FamilyOpenCause::Content => self.languages.contains(&language),
+            FamilyOpenCause::ReadFailure | FamilyOpenCause::Cancelled => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticModelMatchDisposition {
     Empty,
     Unique,
     Conflict,
+    /// Candidates may be missing, so the records are only possible
+    /// candidates: never a selection, a conflict or an absence.
+    Open(FamilyOpen),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -969,7 +1045,7 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     controls.sort_unstable();
     controls.dedup();
     let mut hasher = Sha256::new();
-    hasher.update(b"bifrost.semantic-model.runtime-request.v3\0");
+    hasher.update(b"bifrost.semantic-model.runtime-request.v4\0");
     hash_key_part(&mut hasher, &request.bifrost_version.to_string());
     hasher.update(
         (crate::analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.len() as u64)
@@ -984,6 +1060,7 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     }
     hasher.update((approximate_standard_libraries.len() as u64).to_be_bytes());
     for expectation in &approximate_standard_libraries {
+        hash_optional_key_part(&mut hasher, expectation.toolchain.as_deref());
         hash_key_part(&mut hasher, &expectation.language);
         hash_key_part(&mut hasher, &expectation.ecosystem);
         hash_key_part(&mut hasher, &expectation.pack_id);
@@ -1005,7 +1082,7 @@ pub fn runtime_request_key(request: &SemanticModelActivationRequest) -> Result<S
     ] {
         hasher.update(limit.to_be_bytes());
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into()))
 }
 
 #[doc(hidden)]
@@ -1230,6 +1307,16 @@ pub fn strict_activation_match(
     let scoped = |row: &&SemanticModelActivationEvidence| {
         semantic_pack_language(&row.language) == manifest.language
             && row.ecosystem == manifest.ecosystem
+            && manifest
+                .provenance
+                .rust_artifact_approximation
+                .as_ref()
+                .is_none_or(|claim| {
+                    row.package
+                        .as_ref()
+                        .and_then(|package| package.version.as_ref())
+                        .is_some_and(|version| claim.activation_reason(version).is_ok())
+                })
             && toolchains.iter().all(|(constraint, requirement)| {
                 row.toolchain.as_ref().is_some_and(|toolchain| {
                     toolchain.name == constraint.name
@@ -1732,6 +1819,7 @@ mod semantic_diagnostic_runtime_tests {
         };
         let exact_key = runtime_request_key(&request).unwrap();
         let expectation = ApproximateSemanticModelExpectation {
+            toolchain: Some("rust".into()),
             language: "rust".to_owned(),
             ecosystem: "cargo".to_owned(),
             pack_id: "bifrost.rust-stdlib".to_owned(),
@@ -1740,6 +1828,9 @@ mod semantic_diagnostic_runtime_tests {
             .approximate_standard_libraries
             .push(expectation.clone());
         let approximate_key = runtime_request_key(&request).unwrap();
+        request.approximate_standard_libraries[0].toolchain = None;
+        assert_ne!(approximate_key, runtime_request_key(&request).unwrap());
+        request.approximate_standard_libraries[0].toolchain = Some("rust".into());
         assert_ne!(exact_key, approximate_key);
         request
             .approximate_standard_libraries
@@ -1776,6 +1867,182 @@ mod semantic_diagnostic_runtime_tests {
         let _supported_schemas_are_bound_by_runtime_request_key =
             crate::analyzer::semantic_model::SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS;
     }
+}
+
+/// Query-time evidence for one admitted implicit receiver call. Deliberately
+/// not serializable: parse-time facts never depend on the active model set.
+/// The compact selected-summary identity is rechecked when the ordinary
+/// procedure-summary binder consumes the record in the same active model set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReceiverAdjustment {
+    member_id: Box<str>,
+    path: Box<str>,
+    symbol: Box<str>,
+    model_id: Box<str>,
+    content: Box<str>,
+    contract_version: u32,
+}
+
+impl ReceiverAdjustment {
+    /// The caller separately proves std trait applicability and the exact
+    /// member. A summary never substitutes for callable-family completeness.
+    pub fn from_selected(
+        member: &crate::analyzer::semantic_model::MemberFact,
+        summary: &CompiledProcedureSummary,
+    ) -> Option<Self> {
+        let crate::analyzer::semantic_model::Locator::Artifact { path, symbol } = &member.locator
+        else {
+            return None;
+        };
+        (member.callable_family_complete
+            && is_complete_receiver_identity_summary(summary)
+            && summary.target.path == *path
+            && summary.target.symbol == *symbol)
+            .then(|| Self {
+                member_id: member.id.clone().into(),
+                path: path.clone().into(),
+                symbol: symbol.clone().into(),
+                model_id: summary.model_id.clone().into(),
+                content: summary.content_sha256.clone().into(),
+                contract_version: summary.contract_version,
+            })
+    }
+
+    pub fn summary_target(&self) -> ProcedureSummaryTargetKey<'_> {
+        ProcedureSummaryTargetKey::new("rust", &self.path, &self.symbol, true, 0)
+    }
+
+    pub fn matches_summary(&self, summary: &CompiledProcedureSummary) -> bool {
+        is_complete_receiver_identity_summary(summary)
+            && summary.target.path == self.path.as_ref()
+            && summary.target.symbol == self.symbol.as_ref()
+            && summary.model_id == self.model_id.as_ref()
+            && summary.content_sha256 == self.content.as_ref()
+            && summary.contract_version == self.contract_version
+    }
+
+    pub fn matches_origin(&self, model: &str, content: &str, contract_version: u32) -> bool {
+        self.model_id.as_ref() == model
+            && self.content.as_ref() == content
+            && self.contract_version == contract_version
+    }
+
+    /// A summary procedure identity, not a synthetic IR call site. The exact
+    /// selected declaration id is opaque and never parsed as a source spelling.
+    pub fn summary_locator(&self) -> crate::analyzer::semantic::SemanticLocator {
+        use crate::analyzer::semantic::*;
+        let anchor = modeled_external_zero_source_anchor();
+        let declaration = DeclarationLocator::new(vec![
+            DeclarationSegment::named(
+                DeclarationSegmentKind::Method,
+                self.member_id.clone(),
+                anchor,
+                0,
+            )
+            .expect("validated member identity"),
+        ])
+        .expect("one exact member");
+        SemanticLocator::new(
+            unmaterialized_external_mount(),
+            WorkspaceRelativePath::new(&self.path).expect("validated artifact path"),
+            SemanticLanguage::Standard(brokk_bifrost_core::analyzer::Language::Rust),
+            declaration,
+            SemanticRole::Procedure,
+            anchor,
+        )
+    }
+
+    pub fn fingerprint(&self) -> crate::analyzer::semantic::StableDigest {
+        let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
+            b"bifrost-receiver-adjustment:v1",
+        );
+        for value in [
+            &self.member_id,
+            &self.path,
+            &self.symbol,
+            &self.model_id,
+            &self.content,
+        ] {
+            digest.push(value.as_bytes());
+        }
+        digest.push(&self.contract_version.to_le_bytes());
+        digest.finish()
+    }
+
+    pub fn retained_heap_bytes(&self) -> usize {
+        let Self {
+            member_id,
+            path,
+            symbol,
+            model_id,
+            content,
+            contract_version: _,
+        } = self;
+        member_id.len() + path.len() + symbol.len() + model_id.len() + content.len()
+    }
+}
+
+/// Call-scoped identity for query-time receiver evidence. Dense IDs stay within
+/// the exact versioned caller artifact, as in CallSiteHandle::durable_key.
+pub fn receiver_adjustment_call_identity(
+    call: &crate::analyzer::semantic::CallSiteHandle,
+) -> crate::analyzer::semantic::StableDigest {
+    let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
+        b"bifrost-receiver-adjustment-call:v1",
+    );
+    digest.push(call.procedure().artifact().key().fingerprint().as_bytes());
+    digest.push(&call.procedure().id().get().to_le_bytes());
+    digest.push(&call.id().get().to_le_bytes());
+    digest.finish()
+}
+
+/// Whether an already selected exact member summary can describe an implicit
+/// receiver adjustment without introducing an unmodeled effect or a new value.
+///
+/// This is only the summary contract. The caller must independently prove the
+/// selected trait implementation, exact member identity, activation, and
+/// callable-family completeness. In particular a companion summary cannot
+/// certify a declaration's callable family. `Preserving` does not establish
+/// object identity; only the documented receiver-to-return `Identity` does.
+pub fn is_complete_receiver_identity_summary(summary: &CompiledProcedureSummary) -> bool {
+    use crate::analyzer::semantic_model::{
+        CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryOutput, Completeness,
+        SummaryValuePreservation, SummaryValueTransferKind,
+    };
+    summary.completeness == Completeness::Complete
+        && summary.target.has_receiver
+        && summary.target.parameter_count == 0
+        && !summary.target.variadic
+        && !summary.normal_continuation_absent
+        && summary.normal_result_count.is_none_or(|count| count == 1)
+        // An omitted implicit call must not hide another summary vocabulary's
+        // effects, callbacks, preconditions, or result-use obligations.
+        && summary.locations.is_empty()
+        && summary.transfer_partitions.is_empty()
+        && summary.returned_callables.is_empty()
+        && summary.declared_effects.is_empty()
+        && summary.subject_effects.is_empty()
+        && summary.lifecycle_coverage.is_empty()
+        && summary.preconditions.as_ref().is_none_or(|conditions| conditions.is_empty())
+        && summary.result_contracts.is_empty()
+        && summary.result_use_obligations.is_empty()
+        && summary.conditional_result_refinements.is_empty()
+        && summary.conditional_indirect_writes.is_empty()
+        && summary.normal_return_refinements.is_empty()
+        && summary.normal_return_type_refinements.is_empty()
+        && summary.class_decorator_identity.is_none()
+        && summary.effects.is_empty()
+        && summary.ordinary_heap_unchanged
+        && summary.no_concurrency_effects
+        && summary.concurrency_effects.is_empty()
+        && matches!(summary.transfers.as_slice(), [transfer]
+        if matches!(transfer.input, CompiledSummaryInput::Receiver {})
+            && transfer.exit_kind == CompiledSummaryExitKind::Normal
+            && matches!(transfer.output, CompiledSummaryOutput::NormalReturn {})
+            && transfer.value_transfer.as_ref().is_some_and(|value|
+                matches!(value.kind, SummaryValueTransferKind::Conversion {
+                    preservation: SummaryValuePreservation::Identity
+                })))
 }
 
 /// The conflict gate for procedure-summary lookup (#1871). The canonical member
@@ -1845,6 +2112,8 @@ mod procedure_claim_agreement_tests {
             concurrency_effects: Vec::new(),
             returned_callables: Vec::new(),
             declared_effects: Vec::new(),
+            subject_effects: Vec::new(),
+            lifecycle_coverage: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
             result_use_obligations: Vec::new(),
@@ -1904,6 +2173,83 @@ mod procedure_claim_agreement_tests {
             procedure_claims_agree(&left, &right),
             "two explicit absence claims make one runtime claim"
         );
+    }
+
+    #[test]
+    fn receiver_adjustment_authored_fixture_compiles_without_a_new_schema() {
+        use crate::analyzer::semantic_model::compiler::{CompilerOptions, compile_source};
+        use crate::analyzer::semantic_model::source::SourceFormat;
+        let bytes =
+            include_bytes!("../../../tests/fixtures/semantic-model-packs/receiver-adjustment.json");
+        compile_source(SourceFormat::Json, bytes, &CompilerOptions::default())
+            .expect("existing summary schema expresses the reviewed Identity adjustment");
+    }
+
+    #[test]
+    fn receiver_adjustment_requires_a_complete_same_object_summary() {
+        use crate::analyzer::semantic_model::{
+            SummaryValuePreservation, SummaryValueTransfer, SummaryValueTransferKind,
+            SummaryValueTransferOperation,
+        };
+        let mut summary = overload("deref", "String.deref");
+        summary.target.has_receiver = true;
+        summary.target.parameter_count = 0;
+        summary.ordinary_heap_unchanged = true;
+        summary.no_concurrency_effects = true;
+        summary.transfers = vec![transfer(CompiledSummaryInput::Receiver {})];
+        summary.transfers[0].value_transfer = Some(SummaryValueTransfer {
+            kind: SummaryValueTransferKind::Conversion {
+                preservation: SummaryValuePreservation::Identity,
+            },
+            operation: SummaryValueTransferOperation::None {},
+        });
+        assert!(is_complete_receiver_identity_summary(&summary));
+        let mut changed = summary.clone();
+        changed.transfers[0].value_transfer.as_mut().unwrap().kind =
+            SummaryValueTransferKind::Conversion {
+                preservation: SummaryValuePreservation::Preserving,
+            };
+        assert!(
+            !is_complete_receiver_identity_summary(&changed),
+            "preserving dependency is not same-object identity"
+        );
+        let mut changed = summary.clone();
+        changed.transfers.push(changed.transfers[0].clone());
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.transfers[0].input = CompiledSummaryInput::Parameter { ordinal: 0 };
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.transfers[0].exit_kind = CompiledSummaryExitKind::Exceptional;
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.transfers[0].value_transfer = None;
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.effects.push(
+            crate::analyzer::semantic_model::CompiledSummaryEffect::UnknownCallBoundary {
+                event: "unaccounted-call".into(),
+            },
+        );
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.normal_result_count = Some(2);
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.ordinary_heap_unchanged = false;
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.no_concurrency_effects = false;
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.completeness = Completeness::Partial;
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.normal_continuation_absent = true;
+        assert!(!is_complete_receiver_identity_summary(&changed));
+        let mut changed = summary.clone();
+        changed.target.variadic = true;
+        assert!(!is_complete_receiver_identity_summary(&changed));
     }
 
     #[test]

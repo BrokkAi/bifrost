@@ -136,7 +136,7 @@ passthrough! {
             .file("src/lib.rs", MACRO_CONTEXT_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let parsed = state.source_facts.as_ref().expect("Rust source facts");
 
         let root = assert_macro_context(
@@ -210,7 +210,7 @@ passthrough! {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("publish macro context fixture");
@@ -221,7 +221,9 @@ passthrough! {
 
         let reopened = AnalyzerStore::open_persistent(&path).expect("reopen macro context store");
         let actual = reopened
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert_eq!(actual.items.contexts, expected_contexts);
@@ -269,13 +271,13 @@ passthrough! {
             .file("src/lib.rs", MACRO_CONTEXT_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let oid = oid_for(MACRO_CONTEXT_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -285,7 +287,13 @@ passthrough! {
 
         assert!(
             store
-                .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_hierarchy_source_facts(
+                    oid,
+                    generation,
+                    &RustAdapter::for_tests(),
+                    &file,
+                    &|| true
+                )
                 .is_err(),
             "stale macro context marker must block hierarchy hydration"
         );
@@ -304,12 +312,14 @@ passthrough! {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let repaired = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert!(!repaired.items.macro_definitions.is_empty());
@@ -331,19 +341,21 @@ passthrough! {
     fn empty_macro_context_product_reopens_and_repairs_after_stale_marker() {
         let fixture = InlineTestProject::new().file("src/lib.rs", "").build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let oid = oid_for(b"");
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         let fresh = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert!(fresh.items.macro_definitions.is_empty());
@@ -351,18 +363,26 @@ passthrough! {
         clear_macro_context_marker(&store);
         assert!(
             store
-                .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_hierarchy_source_facts(
+                    oid,
+                    generation,
+                    &RustAdapter::for_tests(),
+                    &file,
+                    &|| true
+                )
                 .is_err()
         );
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let repaired = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert!(repaired.items.macro_definitions.is_empty());

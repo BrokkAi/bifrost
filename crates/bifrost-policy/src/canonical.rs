@@ -587,6 +587,15 @@ fn policy_definition_to_json(definition: &PolicyDefinition) -> Value {
         "tags",
         string_set(definition.metadata.tags.iter().map(String::as_str)),
     );
+    insert_option(
+        &mut object,
+        "coverage",
+        definition
+            .metadata
+            .proven_subset_reason
+            .as_ref()
+            .map(|reason| json!({"type": "proven_subset", "reason": reason})),
+    );
     insert(
         &mut object,
         "analysis",
@@ -600,6 +609,13 @@ fn policy_definition_to_json(definition: &PolicyDefinition) -> Value {
         "on_unknown",
         (definition.on_unknown.verdict != UnknownVerdict::Abstain)
             .then(|| json!({ "verdict": definition.on_unknown.verdict.label() })),
+    );
+    insert_option(
+        &mut object,
+        "completion",
+        definition
+            .completion_on_depth_bound_reached
+            .then(|| json!({ "inconclusive_on": ["depth_bound_reached"] })),
     );
     insert_option(
         &mut object,
@@ -939,6 +955,55 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                     finding_combination_to_json,
                 ),
             );
+            if let Some(without) = &spec.without_flow {
+                let mut secondary = Map::new();
+                insert(
+                    &mut secondary,
+                    "sources",
+                    endpoint_set_to_json(
+                        &without.sources,
+                        |left, right| left.id.cmp(&right.id),
+                        taint_source_to_json,
+                    ),
+                );
+                insert(
+                    &mut secondary,
+                    "sanitizers",
+                    endpoint_set_to_json(
+                        &without.sanitizers,
+                        |left, right| left.id.cmp(&right.id),
+                        taint_sanitizer_to_json,
+                    ),
+                );
+                insert(
+                    &mut secondary,
+                    "barriers",
+                    endpoint_set_to_json(
+                        &without.barriers,
+                        |left, right| left.id.cmp(&right.id),
+                        taint_barrier_to_json,
+                    ),
+                );
+                insert(
+                    &mut secondary,
+                    "transforms",
+                    endpoint_set_to_json(
+                        &without.transforms,
+                        |left, right| left.id.cmp(&right.id),
+                        taint_transform_to_json,
+                    ),
+                );
+                insert(
+                    &mut secondary,
+                    "external_models",
+                    endpoint_set_to_json(
+                        &without.external_models,
+                        |left, right| left.id.cmp(&right.id),
+                        taint_external_model_to_json,
+                    ),
+                );
+                insert(&mut object, "without_flow", Value::Object(secondary));
+            }
             Value::Object(object)
         }
         PolicyAnalysis::Flow { spec } => {
@@ -1179,6 +1244,7 @@ pub(crate) fn resolved_locator_to_json(locator: &ResolvedPolicyLocator) -> Value
     let kind = match locator.kind {
         ResolvedPolicyLocatorKind::WorkspaceDeclaration => "workspace_declaration",
         ResolvedPolicyLocatorKind::ActiveSemanticModel => "active_semantic_model",
+        ResolvedPolicyLocatorKind::PossibleSemanticModel => "possible_semantic_model",
     };
     let constraint = match locator.constraint {
         ReceiverTypeConstraintKind::Exact => "exact",
@@ -2348,7 +2414,7 @@ fn call_modeling_to_json(call_modeling: CallModelingSpec) -> Value {
 }
 
 fn typestate_automaton_to_json(automaton: &TypestateAutomatonSpec) -> Value {
-    typestate_automaton_projection_to_json(
+    let mut value = typestate_automaton_projection_to_json(
         id_set(automaton.states.iter().map(TypestateStateId::as_str)),
         automaton.initial.as_str(),
         id_set(
@@ -2373,7 +2439,12 @@ fn typestate_automaton_to_json(automaton: &TypestateAutomatonSpec) -> Value {
             |left, right| left.id.cmp(&right.id),
             typestate_terminal_expectation_to_json,
         ),
-    )
+    );
+    if let Some(set) = &automaton.event_set {
+        value["event_set"] =
+            json!({"name": set.name, "version": set.version, "effects": set.effects});
+    }
+    value
 }
 
 pub(crate) fn typestate_automaton_projection_to_json(
@@ -2399,6 +2470,11 @@ pub(crate) fn typestate_automaton_projection_to_json(
 fn typestate_event_to_json(event: &TypestateEventSpec) -> Value {
     let mut object = Map::new();
     insert(&mut object, "id", json!(event.id.as_str()));
+    insert_option(
+        &mut object,
+        "semantic_effect",
+        event.semantic_effect.as_ref().map(|effect| json!(effect)),
+    );
     insert(
         &mut object,
         "trigger",
@@ -3064,6 +3140,7 @@ mod tests {
             },
             description: None,
             help_uri: None,
+            proven_subset_reason: None,
             tags: vec![
                 "security".to_string(),
                 "audit".to_string(),
@@ -3084,6 +3161,7 @@ mod tests {
                     },
                 },
                 on_unknown: OnUnknownSpec::default(),
+                completion_on_depth_bound_reached: false,
                 classification: None,
                 report: PolicyReportOptions::default(),
             }),
@@ -3237,9 +3315,11 @@ mod tests {
                         store_reads: vec![],
                         store_include_files: vec![],
                         finding_combinations: vec![],
+                        without_flow: None,
                     },
                 },
                 on_unknown: OnUnknownSpec::default(),
+                completion_on_depth_bound_reached: false,
                 classification: None,
                 report: PolicyReportOptions::default(),
             }),
@@ -3333,6 +3413,7 @@ mod tests {
                             escape: InconclusivePolicy::Inconclusive,
                         },
                         automaton: TypestateAutomatonSpec {
+                            event_set: None,
                             states: vec![closed.clone(), open.clone()],
                             initial: open.clone(),
                             accepting_states: vec![closed.clone()],
@@ -3365,6 +3446,7 @@ mod tests {
                     },
                 },
                 on_unknown: OnUnknownSpec::default(),
+                completion_on_depth_bound_reached: false,
                 classification: None,
                 report: PolicyReportOptions::default(),
             }),
@@ -3562,6 +3644,7 @@ mod tests {
                 },
             },
             on_unknown: OnUnknownSpec::default(),
+            completion_on_depth_bound_reached: false,
             classification: Some(PolicyClassificationSpec {
                 fallback: TaxonomyClassificationSpec {
                     taxonomy: "Bifrost".to_string(),

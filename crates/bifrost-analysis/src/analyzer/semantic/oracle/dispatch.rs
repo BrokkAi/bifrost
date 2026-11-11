@@ -85,6 +85,22 @@ impl ResolverOwnedExternalCalleeIdentity {
     }
 }
 
+/// Why one boundary remains partial despite a proven target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchBoundaryPartialCause {
+    ExternalBodyUnavailable,
+}
+
+impl DispatchBoundaryPartialCause {
+    pub const LABELS: &'static [&'static str] = &["external_body_unavailable"];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ExternalBodyUnavailable => "external_body_unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchBoundary {
     pub kind: DispatchBoundaryKind,
@@ -107,6 +123,8 @@ pub struct DispatchBoundary {
     pub unmaterialized_external_target: Option<UnmaterializedExternalTarget>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
+    /// A typed cause only; a consumer must separately prove its discharge.
+    pub partial_cause: Option<DispatchBoundaryPartialCause>,
     pub provenance: Box<[OracleRelationHandle]>,
 }
 
@@ -171,6 +189,14 @@ impl DispatchBoundary {
     /// provider-owned rows.
     #[doc(hidden)]
     pub fn validate_for_call(&self, call: &CallSiteHandle) -> Result<(), OracleContractError> {
+        if self.partial_cause == Some(DispatchBoundaryPartialCause::ExternalBodyUnavailable)
+            && (!matches!(self.kind, DispatchBoundaryKind::External(Some(_)))
+                || self.unmaterialized_external_target.is_none()
+                || self.proof != ProofStatus::Proven
+                || !matches!(self.completeness, EvidenceCompleteness::Partial(_)))
+        {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
         let external_identity_is_valid = match (
             &self.external_callee_identity,
             &self.kind,
@@ -291,6 +317,38 @@ impl DispatchResult {
         coverage: CandidateCoverage,
         limits: OracleLimits,
     ) -> Result<Self, OracleContractError> {
+        let mut boundaries = boundaries;
+        for boundary in &mut boundaries {
+            let count = boundary
+                .exact_external_target()
+                .map(|target| target.receiver_adjustments().len())
+                .or_else(|| {
+                    boundary
+                        .unmaterialized_external_target()
+                        .map(|target| target.receiver_adjustments.len())
+                })
+                .unwrap_or(0);
+            let limit = crate::analyzer::store::language_support::MAX_EXPLICIT_RECEIVER_STEPS;
+            if count > limit {
+                return Err(OracleContractError::LimitExceeded {
+                    dimension: "receiver_adjustment_steps",
+                    limit,
+                    attempted: count,
+                });
+            }
+            if let Some(target) = &mut boundary.exact_external_target
+                && !target.receiver_adjustments().is_empty()
+            {
+                target.receiver_adjustment_call =
+                    Some(crate::analyzer::semantic_model::receiver_adjustment_call_identity(call));
+            }
+            if let Some(target) = &mut boundary.unmaterialized_external_target
+                && !target.receiver_adjustments.is_empty()
+            {
+                target.receiver_adjustment_call =
+                    Some(crate::analyzer::semantic_model::receiver_adjustment_call_identity(call));
+            }
+        }
         let mut unique_targets = std::collections::HashSet::new();
         if candidates
             .iter()
@@ -411,7 +469,17 @@ impl DispatchResult {
         &mut self,
         preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
     ) {
-        if self.proven_receiver_shape() != Some(true) || self.candidates.len() > 1 {
+        let selected_rust_method = matches!(self.candidates.as_ref(), [candidate]
+            if self.coverage == CandidateCoverage::Exhaustive
+                && self.boundaries.is_empty()
+                && candidate.proof() == &ProofStatus::Proven
+                && candidate.completeness() == &EvidenceCompleteness::Complete
+                && candidate.receiver_owner_relation()
+                    == crate::analyzer::semantic::ReceiverOwnerRelation::Direct
+                && candidate.target().artifact().key().language()
+                    == SemanticLanguage::Standard(Language::Rust)
+                && candidate.target().semantics().kind() == ProcedureKind::Method);
+        if self.proven_receiver_shape() != Some(true) && !selected_rust_method {
             return;
         }
         self.member_receiver_preparation = preparation;

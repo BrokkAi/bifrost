@@ -73,6 +73,7 @@ pub use crate::analyzer::semantic::partial_flow::ports::call_input_value;
 
 pub use crate::analyzer::semantic::partial_flow::ports::heap_selectors;
 
+use crate::analyzer::semantic::workspace_oracle::value_flow::GapDischargeVerdict;
 use std::collections::HashSet;
 
 use crate::analyzer::semantic::workspace_oracle::Interruption;
@@ -125,8 +126,9 @@ use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 ///
 /// Every question the file cannot answer gets the conservative answer: no
 /// runtime refinements, no discharge and no refuted catch binding. It proves
-/// only a closed Rust value object's exact local member overwrite; other
-/// stores remain weak without the workspace heap oracle.
+/// only an exact member overwrite through an unrebound formal and a closed
+/// Rust value object's exact local member overwrite; other stores remain weak
+/// without the workspace heap oracle.
 #[allow(
     dead_code,
     reason = "the parse-time partial-flow writer will construct the host; the tree is \
@@ -205,8 +207,8 @@ impl RelationProjectionHost for FileLocalProjectionHost<'_> {
         _gap: &SemanticGap,
         _procedure: &ProcedureHandle,
         _request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, SemanticProviderError> {
-        Ok(false)
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
+        Ok(GapDischargeVerdict::Undischarged)
     }
 
     fn inert_drop_glue_discharged(
@@ -215,8 +217,8 @@ impl RelationProjectionHost for FileLocalProjectionHost<'_> {
         _procedure: &ProcedureHandle,
         _request: &mut SemanticRequest<'_>,
         _inert: &mut Option<bool>,
-    ) -> Result<bool, SemanticProviderError> {
-        Ok(false)
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
+        Ok(GapDischargeVerdict::Undischarged)
     }
 
     fn store_holds_strong_update(
@@ -232,6 +234,9 @@ impl RelationProjectionHost for FileLocalProjectionHost<'_> {
         _staged: &mut WorkStager,
         _cancellation: &brokk_bifrost_core::cancellation::CancellationToken,
     ) -> Result<bool, StrongUpdateStop> {
+        if bases.holds_formal_member_overwrite(procedure, point.id(), location) {
+            return Ok(true);
+        }
         let rust = procedure.semantics().locator().language()
             == crate::analyzer::semantic::SemanticLanguage::Standard(
                 brokk_bifrost_core::analyzer::model::Language::Rust,

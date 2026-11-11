@@ -1827,6 +1827,39 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
         let direct = java_native_expression_value_type_at_node(query, value_site)
             .expect("the expression query completes");
         eprintln!("nested {method} direct value: {:?}", direct.value_types);
+        if method == "typeQualified" {
+            let BoundedResolution::Complete { value: stored, .. } = stored else {
+                panic!("type-qualified stored argument did not finish");
+            };
+            for outcome in [&stored.value_types, &direct.value_types] {
+                assert_eq!(
+                    outcome.status,
+                    brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupStatus::Incomplete,
+                    "{outcome:?}"
+                );
+                let candidates = outcome
+                    .types
+                    .iter()
+                    .map(|ty| ty.fqn.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(candidates, ["Types.Nested"], "{outcome:?}");
+                assert_eq!(outcome.diagnostics.len(), 2, "{outcome:?}");
+                let unsupported = outcome
+                    .diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.kind == "UnsupportedSemantic")
+                    .expect("qualified-prefix obligation");
+                let payload: serde_json::Value =
+                    serde_json::from_str(&unsupported.message).expect("structured diagnostic");
+                assert_eq!(payload["semantic"], "ambiguous_qualified_type");
+                assert!(
+                    outcome
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| { diagnostic.kind == "incomplete_native_type" })
+                );
+            }
+        }
         assert_eq!(
             direct.static_type, actual,
             "expression and actual coordinates retain the same static type: {method}"
@@ -1849,9 +1882,11 @@ fn java_native_nested_creation_actual_never_borrows_an_imported_type() {
         known_owner.is_some() && known_owner != imported,
         "the known enclosing instance supplies Holder.Input, never the imported Input: {known_owner:?}"
     );
+    // S3 prefix reclassification discharges the qualified-prefix obligation and restores
+    // the static type; S2 keeps that obligation Open.
     assert!(
-        type_qualified.is_some() && type_qualified != imported && type_qualified != known_owner,
-        "a type-qualified creation supplies its own nested type: {type_qualified:?}"
+        type_qualified.is_none() && type_qualified != imported && type_qualified != known_owner,
+        "a type-qualified creation never borrows either Input type: {type_qualified:?}"
     );
     // #5344: both focused selectors must finish, not just retain the right target.
     let creation = source
@@ -2092,20 +2127,32 @@ fn java_native_type_prefix_obscures_package_only_after_complete_lookup() {
         .iter()
         .find(|diagnostic| diagnostic.kind == "incomplete_binding")
         .expect("unproved prefix retains its incompleteness reasons");
-    // MissingTypes prefix ambiguity, the unresolved on-demand import that
-    // may supply MissingTypes, Nested constructor applicability, and Nested
-    // type ambiguity all remain open without a binding for MissingTypes.
+    // Continuations of an open head carry the head's protected reason.
+    // See "Open heads in qualified JVM names" in the name-resolution design.
     // #8487 records the unacquired import alternatives as OpenBoundary facts
     // and carries their acquisition subjects as query obligations.
     assert_eq!(
-        binding.message.matches("UnsupportedSemantic:").count(),
-        3,
-        "{missing:?}"
+        binding.message,
+        "selected native binding is incomplete: Incomplete [OpenBoundary: semantic: external_declared_unindexed, OpenBoundary: semantic: external_declared_unindexed, UnsupportedSemantic: Use.java:1:170, UnsupportedSemantic: Use.java:1:183, UnsupportedSemantic: Use.java:1:183, UnsupportedSemantic: semantic]"
     );
     assert_eq!(
-        binding.message.matches("OpenBoundary:").count(),
-        2,
-        "{missing:?}"
+        missing
+            .outcome
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.kind.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "UnsupportedCallApplicability",
+            "UnsupportedSemantic",
+            "UnsupportedSemantic",
+            "UnsupportedSemantic",
+            "jvm-package-provider-unacquired",
+            "jvm-package-provider-unacquired",
+            "incomplete_binding",
+            "query_obligation",
+            "query_obligation"
+        ]
     );
     assert!(
         missing.outcome.diagnostics.iter().any(|diagnostic| {
@@ -2180,7 +2227,7 @@ fn java_native_prefix_export_uses_selected_answer_on_replay() {
                     (DefinitionLookupStatus::Incomplete, 1, 1)
                 }
                 ("unacquired competing prefix", "child") => {
-                    (DefinitionLookupStatus::Incomplete, 3, 2)
+                    (DefinitionLookupStatus::Incomplete, 4, 2)
                 }
                 _ => (DefinitionLookupStatus::Resolved, 0, 0),
             };
@@ -2204,6 +2251,34 @@ fn java_native_prefix_export_uses_selected_answer_on_replay() {
                 expected.2,
                 "{label} {recipient}: {before:?}"
             );
+            if (label, recipient) == ("unacquired competing prefix", "child") {
+                // Continuations of an open head carry the head's protected reason.
+                // See "Open heads in qualified JVM names" in the name-resolution design.
+                assert_eq!(
+                    message,
+                    "selected native binding is incomplete: Incomplete [OpenBoundary: semantic: external_declared_unindexed, OpenBoundary: semantic: external_declared_unindexed, UnsupportedSemantic: Use.java:1:46, UnsupportedSemantic: Use.java:1:59, UnsupportedSemantic: Use.java:1:59, UnsupportedSemantic: semantic]"
+                );
+                assert_eq!(
+                    before
+                        .outcome
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.kind.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "UnsupportedCallApplicability",
+                        "UnsupportedSemantic",
+                        "UnsupportedSemantic",
+                        "UnsupportedSemantic",
+                        "jvm-package-provider-unacquired",
+                        "jvm-package-provider-unacquired",
+                        "incomplete_binding",
+                        "query_obligation",
+                        "query_obligation"
+                    ]
+                );
+                assert!(before.outcome.diagnostics.iter().any(|diagnostic| diagnostic.kind == "query_obligation" && diagnostic.message == "jvm-package-provider-unacquired:MissingTypes.Nested:unacquired"));
+            }
             if label == "unacquired competing prefix" {
                 assert!(before.outcome.diagnostics.iter().any(|diagnostic| diagnostic.kind == "query_obligation" && diagnostic.message == "jvm-package-provider-unacquired:absent.MissingTypes:unacquired"), "{label} {recipient}: {before:?}");
             }

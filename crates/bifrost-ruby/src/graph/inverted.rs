@@ -17,10 +17,10 @@ use crate::graph::extractor::{
 use crate::graph::resolver::{
     ReceiverMode, ReceiverType, RubySemanticIndex, resolve_constant_reference,
 };
-use crate::graph::scope::{RubyScopeExit, exit_scope, ruby_type_body_declaration};
+use crate::graph::scope::{RubyScopeStack, ruby_type_body_declaration};
 use crate::graph::syntax::{
     dynamic_dispatch_target_argument, is_bare_method_reference_identifier,
-    is_dynamic_dispatch_method, method_receiver_mode, node_text, ruby_call_is_same_owner,
+    is_dynamic_dispatch_method, node_text, ruby_call_is_same_owner,
 };
 use crate::graph_support::RubySource;
 use crate::syntax::ruby_semantic_identifier_range;
@@ -81,10 +81,7 @@ impl<A: MemoAttribution> RubyEdgeScan<'_, A> {
         let mut state = RubyEdgeWalkState {
             scan: self,
             locals: LocalInferenceEngine::new(LocalInferenceConfig::default()),
-            lexical_stack: Vec::new(),
-            method_stack: Vec::new(),
-            receiver_context: Vec::new(),
-            exits: Vec::new(),
+            scope: RubyScopeStack::default(),
         };
         walk_tree_iterative(
             root,
@@ -138,47 +135,32 @@ impl RubyEdgeEvidence<'_> {
 struct RubyEdgeWalkState<'scan, 'ctx, A: MemoAttribution> {
     scan: &'scan mut RubyEdgeScan<'ctx, A>,
     locals: LocalInferenceEngine<String>,
-    lexical_stack: Vec<String>,
-    method_stack: Vec<ReceiverMode>,
-    receiver_context: Vec<ReceiverMode>,
-    exits: Vec<RubyScopeExit>,
+    scope: RubyScopeStack<LocalInferenceEngine<String>>,
 }
 
 impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
     fn enter(&mut self, node: Node<'_>) -> TreeWalkAction {
         if let Some(declaration) = ruby_type_body_declaration(node) {
             let owner = self.type_owner(declaration);
-            if let Some(owner) = owner.as_ref() {
-                self.lexical_stack.push(owner.clone());
-            }
-            self.receiver_context.push(ReceiverMode::Instance);
-            self.exits.push(RubyScopeExit::Type {
-                has_lexical_owner: owner.is_some(),
-                locals: std::mem::take(&mut self.locals),
-            });
+            self.scope
+                .enter_type(owner, std::mem::take(&mut self.locals));
             return TreeWalkAction::DescendWithExit;
         }
         match node.kind() {
             "method" | "singleton_method" => {
                 let locals = std::mem::take(&mut self.locals);
                 self.seed_parameter_shadows(node);
-                self.method_stack.push(method_receiver_mode(
-                    node,
-                    self.receiver_context.last().copied(),
-                ));
-                self.exits.push(RubyScopeExit::Method { locals });
+                self.scope.enter_method(node, locals);
                 return TreeWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 let locals = std::mem::take(&mut self.locals);
-                self.method_stack.push(ReceiverMode::Class);
-                self.receiver_context.push(ReceiverMode::Class);
-                self.exits.push(RubyScopeExit::SingletonClass { locals });
+                self.scope.enter_singleton_class(locals);
                 return TreeWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
                 self.locals.enter_scope();
-                self.exits.push(RubyScopeExit::LocalScope);
+                self.scope.enter_block();
                 return TreeWalkAction::DescendWithExit;
             }
             "assignment" => self.seed_assignment(node),
@@ -189,13 +171,10 @@ impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
     }
 
     fn exit(&mut self) {
-        exit_scope(
-            self.exits.pop(),
-            &mut self.receiver_context,
-            &mut self.lexical_stack,
-            &mut self.method_stack,
-            &mut self.locals,
-        );
+        match self.scope.exit().into_saved() {
+            Some(enclosing) => self.locals = enclosing,
+            None => self.locals.exit_scope(),
+        }
     }
 
     fn type_owner(&self, node: Node<'_>) -> Option<String> {
@@ -203,7 +182,7 @@ impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             node,
             self.scan.evidence.source,
         )
@@ -219,7 +198,7 @@ impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             node,
             self.scan.evidence.source,
         ) else {
@@ -384,16 +363,16 @@ impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
+            self.scope.lexical(),
             &self.locals,
-            &self.method_stack,
+            self.scope.method_mode(),
             node,
             self.scan.evidence.source,
         )
     }
 
     fn enclosing_receiver(&self, byte: usize) -> Option<ReceiverType> {
-        ruby_enclosing_receiver(&self.lexical_stack, &self.method_stack).or_else(|| {
+        ruby_enclosing_receiver(self.scope.lexical(), self.scope.method_mode()).or_else(|| {
             self.scan
                 .class_ranges
                 .enclosing(byte)
@@ -416,8 +395,8 @@ impl<A: MemoAttribution> RubyEdgeWalkState<'_, '_, A> {
             self.scan.semantic,
             self.scan.file,
             &self.scan.visible_files,
-            &self.lexical_stack,
-            &self.method_stack,
+            self.scope.lexical(),
+            self.scope.method_mode(),
             &mut self.locals,
             node,
             self.scan.evidence.source,

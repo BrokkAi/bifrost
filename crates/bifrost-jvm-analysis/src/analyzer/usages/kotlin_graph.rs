@@ -85,9 +85,10 @@ use brokk_bifrost_core::analyzer::model::Language;
 
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
-use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_parsed_file};
+use brokk_bifrost_jvm::kotlin::graph::extractor::scan_parsed_file;
 use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
 
 #[cfg(test)]
@@ -175,15 +176,6 @@ pub(crate) fn prepare_kotlin_scan_files(
         .collect()
 }
 
-/// One file's owned scan result: proven hits, unproven hits, the raw match
-/// count, and whether this file alone exceeded the usage limit.
-pub(crate) type KotlinFileScanOutput = (
-    std::collections::BTreeSet<brokk_bifrost_core::analyzer::usages::model::UsageHit>,
-    std::collections::BTreeSet<brokk_bifrost_core::analyzer::usages::model::UsageHit>,
-    usize,
-    bool,
-);
-
 /// Scan every prepared file against `spec` over immutable frontier snapshots.
 ///
 /// The per-file sequential loop this replaces converged each file's frontier
@@ -198,22 +190,14 @@ pub(crate) fn scan_kotlin_files_replayable(
     token: QueryToken<'_>,
     prepared: &[PreparedKotlinScanFile],
     spec: &TargetSpec,
-    max_usages: usize,
+    budget: &UsageAccumulator,
 ) -> brokk_bifrost_analysis::analyzer::relational_frontier::RelationalItemFrontierOutcome<
-    KotlinFileScanOutput,
+    UsageAccumulator,
 > {
     relational_session.resolve_owned_items("kotlin_file_scan", prepared, |prepared, frontier| {
-        let mut hits = std::collections::BTreeSet::new();
-        let mut unproven_hits = std::collections::BTreeSet::new();
-        let mut raw_match_count = 0usize;
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
+        // Each file stops on its own once it alone exceeds the budget; the
+        // merge in `kotlin_graph::shared` decides the query's answer.
+        let mut usages = budget.empty_like();
         scan_parsed_file(
             &kotlin_graph_source(analyzer, frontier.as_ref()),
             token,
@@ -222,9 +206,9 @@ pub(crate) fn scan_kotlin_files_replayable(
             &prepared.parsed.line_starts,
             prepared.parsed.tree.root_node(),
             spec,
-            &mut state,
+            &mut usages,
         );
-        (hits, unproven_hits, raw_match_count, limit_exceeded)
+        usages
     })
 }
 

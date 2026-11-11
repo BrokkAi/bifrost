@@ -100,7 +100,7 @@ impl<'a> RubyOverlayConstants<'a> {
     pub(crate) fn publishes_type(&self, constant_path: &str) -> bool {
         self.overlay.is_some_and(|overlay| {
             !overlay
-                .symbols_with_id(&Self::declaration_id(constant_path))
+                .symbols_with_id_in_family(&Self::declaration_id(constant_path), "ruby")
                 .records
                 .is_empty()
         })
@@ -116,7 +116,7 @@ impl<'a> RubyOverlayConstants<'a> {
     #[doc(hidden)]
     pub fn unique_type(&self, constant_path: &str) -> Option<Arc<SemanticModelSymbol>> {
         self.overlay?
-            .symbols_with_id(&Self::declaration_id(constant_path))
+            .symbols_with_id_in_family(&Self::declaration_id(constant_path), "ruby")
             .unique()
     }
 
@@ -172,7 +172,7 @@ impl<'a> RubyOverlayConstants<'a> {
                 arguments,
                 nullable: false,
             } if arguments.is_empty() => {
-                let matched = self.overlay?.symbols_with_id(id);
+                let matched = self.overlay?.symbols_with_id_in_family(id, "ruby");
                 if matched.disposition != SemanticModelOverlayDisposition::Unique {
                     return None;
                 }
@@ -197,7 +197,7 @@ impl<'a> RubyOverlayConstants<'a> {
     pub(crate) fn conflicts(&self, constant_path: &str) -> bool {
         self.overlay.is_some_and(|overlay| {
             overlay
-                .symbols_with_id(&Self::declaration_id(constant_path))
+                .symbols_with_id_in_family(&Self::declaration_id(constant_path), "ruby")
                 .disposition
                 == SemanticModelOverlayDisposition::Conflict
         })
@@ -216,9 +216,13 @@ impl<'a> RubyOverlayConstants<'a> {
         let Some(overlay) = self.overlay else {
             return false;
         };
-        overlay.members_of(&owner.id).records.iter().any(|member| {
-            member.name == terminal || member.aliases.iter().any(|alias| alias == terminal)
-        })
+        overlay
+            .members_of_in_family(&owner.id, "ruby")
+            .records
+            .iter()
+            .any(|member| {
+                member.name == terminal || member.aliases.iter().any(|alias| alias == terminal)
+            })
     }
 
     /// The surface `Owner::CONST` searches: the owner plus every ancestor on
@@ -272,13 +276,43 @@ impl<'a> RubyOverlayConstants<'a> {
                 });
             }
             searched.push(Arc::clone(&symbol));
-            for relation in overlay.relations_from(&symbol.id).records {
+            let relations = overlay.relations_from_for(&symbol.id, "ruby");
+            if matches!(
+                relations.disposition,
+                SemanticModelOverlayDisposition::Open(_)
+            ) {
+                open.get_or_insert_with(|| {
+                    format!(
+                        "the hierarchy relations of `{}` could not be read in full",
+                        symbol.qualified_name
+                    )
+                });
+            }
+            for relation in relations.records {
                 if !CONSTANT_LOOKUP_EDGES.contains(&relation.kind.as_str()) {
                     continue;
                 }
-                let mut matched = overlay.symbols_with_id(&relation.to);
-                if matched.records.is_empty() {
-                    matched = overlay.symbols_named(&relation.to);
+                let mut matched = overlay.symbols_with_id_in_family(&relation.to, "ruby");
+                if matched.records.is_empty()
+                    && !matches!(
+                        matched.disposition,
+                        SemanticModelOverlayDisposition::Open(_)
+                    )
+                {
+                    matched = overlay.symbols_named_in_family(&relation.to, "ruby");
+                }
+                // An open lookup leaves the ancestor's declarations partly
+                // unread, so the surface is open whatever it returned.
+                if matches!(
+                    matched.disposition,
+                    SemanticModelOverlayDisposition::Open(_)
+                ) {
+                    open.get_or_insert_with(|| {
+                        format!(
+                            "the ancestor `{}` of `{}` could not be read in full",
+                            relation.to, symbol.qualified_name
+                        )
+                    });
                 }
                 match matched.records.first().cloned() {
                     Some(ancestor) => queue.push(ancestor),

@@ -56,7 +56,10 @@ pub(crate) struct JsTsMemoCaches {
         Arc<brokk_bifrost_js_ts::source_facts::JsTsFileSourceFacts>,
     >,
     /// Declarations imported by a file, keyed by importing file.
-    pub(crate) imported_code_units: AttributedCache<ProjectFile, HashSet<CodeUnit>>,
+    pub(crate) imported_code_units: AttributedCache<
+        ProjectFile,
+        brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>,
+    >,
     /// Raw file-path resolution targets of a file's imports (module specifier -> file), keyed by the
     /// importing file. Distinct from `imported_code_units`: this is a file-level check (does an import
     /// statement's path resolve to this file) used by `could_import_file`, not a symbol-level one --

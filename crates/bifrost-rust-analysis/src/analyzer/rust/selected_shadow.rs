@@ -211,6 +211,9 @@ pub fn selected_rust_definition_shadow_result_with_after_open(
         BoundedResolution::Exceeded { limit, work } => {
             RustDefinitionShadowResult::Exceeded { limit, work }
         }
+        BoundedResolution::Unavailable { reason, .. } => {
+            RustDefinitionShadowResult::Unavailable(format!("input unavailable: {reason}"))
+        }
         BoundedResolution::Cancelled { work } => RustDefinitionShadowResult::Cancelled { work },
         BoundedResolution::Complete {
             value: SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile,

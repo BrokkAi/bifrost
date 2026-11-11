@@ -1649,7 +1649,11 @@ mod tests {
                     .collect(),
             )
         }
-        fn update(&self, _: &BTreeSet<ProjectFile>) -> Self {
+        fn update_with_listing(
+            &self,
+            _: &BTreeSet<ProjectFile>,
+            _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self {
             unimplemented!()
         }
         fn update_all(&self) -> Self {
@@ -1729,6 +1733,7 @@ mod tests {
         fn update(
             &self,
             _: &BTreeSet<crate::ProjectFile>,
+            _: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
         ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
             unimplemented!()
         }

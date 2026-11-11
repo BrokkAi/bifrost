@@ -106,9 +106,14 @@ mod jvm_registry_tests {
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
         let active = std::sync::Arc::new(active);
-        let overlay =
-            SemanticModelOverlay::build(workspace.analyzer(), &active, &cancellation, 1 << 26)
-                .unwrap();
+        let overlay = SemanticModelOverlay::build(
+            workspace.analyzer(),
+            &active,
+            &cancellation,
+            1 << 26,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         let factory = overlay
             .symbols()
             .into_iter()
@@ -133,7 +138,7 @@ mod jvm_registry_tests {
             query.publications[0].rows.executable_coverage,
             CsmiCoverageStatus::Unknown
         );
-        let reader = active.source_reader().unwrap();
+        let reader = active.activation_reader().unwrap();
         let reader_query = activated_returned_callable_targets_from_reader(
             reader,
             &active,

@@ -22,7 +22,7 @@ use brokk_bifrost_analysis::analyzer::declared_scalar::DeclaredScalarType;
 
 use brokk_bifrost_analysis::analyzer::declared_scalar::binding_nodes;
 
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 
 use brokk_bifrost_analysis::analyzer::semantic::cfg::CleanupRegionId;
 
@@ -94,7 +94,8 @@ use brokk_bifrost_core::hash::HashSet;
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
 // The lowerer reaches receiverless-loop recognition: a declared loop is not Kernel#loop.
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v15";
+// #9447: structured formal roles and refusal change semantic payloads.
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v16";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -1017,7 +1018,7 @@ fn callable_source_anchor(
     )
 }
 
-struct RubySemanticLowerer;
+pub(crate) struct RubySemanticLowerer;
 
 impl ProgramSemanticsLowerer for RubySemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -1056,6 +1057,12 @@ impl ProgramSemanticsLowerer for RubySemanticLowerer {
                 }
                 ProcedureEnumeration::Cancelled { work } => {
                     return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Unknown { work } => {
+                    return Ok(SemanticOutcome::Unknown {
                         partial: None,
                         work,
                     });
@@ -1747,7 +1754,7 @@ fn lower_procedure<'tree, 'request>(
         function_value_targets: indexes.function_value_targets,
     };
     context.controls.insert(function_scope, Box::new([]));
-    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    context.emit_procedure_inputs(&mut builder, entry, spec.callable)?;
     context.emit_local_bindings(&mut builder, spec.callable)?;
 
     if has_parameter_defaults {
@@ -1941,6 +1948,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
     ) -> Result<(), RubyLoweringError> {
         // `self` exists in every Ruby execution context, including singleton
@@ -1951,26 +1959,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let receiver = self.session.add_value_with_metadata(
             builder,
             receiver_metadata,
-            SemanticValueKind::Receiver { dispatch: true },
+            SemanticValueKind::Receiver {
+                dispatch: true,
+                mode: Default::default(),
+            },
         )?;
         self.receiver = Some(receiver);
         self.parameters.insert("self".into(), receiver);
 
-        let layout = formal_parameter_slots_for_owner(Language::Ruby, callable, self.source)
-            .unwrap_or_default();
+        if self.session.cancellation().is_cancelled() {
+            return Err(RubyLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let layout =
+            formal_parameter_slots_for_owner_with_nodes(Language::Ruby, callable, self.source);
+        if self.session.cancellation().is_cancelled() {
+            return Err(RubyLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = match layout {
+            Some(slots) => slots,
+            None if matches!(
+                callable.kind(),
+                "program" | "class" | "module" | "singleton_class"
+            ) =>
+            {
+                Vec::new()
+            }
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "Ruby callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
+        };
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
+        for (slot, declaration) in slots {
             if self.session.cancellation().is_cancelled() {
                 return Err(RubyLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            let declaration = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
             let mapping_node = slot
                 .names
                 .iter()

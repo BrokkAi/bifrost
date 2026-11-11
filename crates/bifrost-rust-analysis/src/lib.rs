@@ -7,9 +7,13 @@ pub mod analyzer {
         RustSelectedReverseOutcome, RustSelectedReverseQueries, with_rust_selected_reverse_queries,
     };
     pub use rust::{
-        RUST_TOOLCHAIN_ECOSYSTEM, RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext,
-        RustReferenceNamespace, RustdocJsonPackProducer, acquire_rust_file_dependency_evidence,
-        failure_handlers::rust_failure_handler_body_shapes,
+        CARGO_LOCK_ASSOCIATIONS, RUST_TOOLCHAIN_ECOSYSTEM, RustAnalyzer, RustDependencyPackAdapter,
+        RustReferenceContext, RustReferenceNamespace, RustdocJsonPackProducer,
+        acquire_rust_file_dependency_evidence,
+        failure_handlers::{
+            RustFailureIdentities, rust_failure_handler_body_shapes,
+            rust_failure_handler_identities,
+        },
         resolve_rust_semantic_pack_dependencies, rust_declaration_is_enum_variant,
         rust_declaration_matches_reference_namespace, rust_file_dependency_evidence,
         rust_reference_namespace,

@@ -75,6 +75,9 @@ fn outcome<T: std::fmt::Debug>(value: &ReceiverAnalysisOutcome<T>) -> String {
     match value {
         ReceiverAnalysisOutcome::Precise(values) => format!("Precise({values:#?})"),
         ReceiverAnalysisOutcome::Ambiguous(values) => format!("Ambiguous({values:#?})"),
+        ReceiverAnalysisOutcome::Incomplete { candidates } => {
+            format!("Incomplete({candidates:#?})")
+        }
         ReceiverAnalysisOutcome::Unknown => "Unknown".into(),
         ReceiverAnalysisOutcome::Unsupported { reason } => format!("Unsupported({reason})"),
         ReceiverAnalysisOutcome::ExceededBudget { limit } => format!("ExceededBudget({limit})"),
@@ -240,6 +243,7 @@ fn large_budget() -> ReceiverAnalysisBudget {
         max_summary_expansions: default.max_summary_expansions * 100,
         max_resolution_rounds: default.max_resolution_rounds * 100,
         max_scope_nodes: default.max_scope_nodes * 100,
+        max_hierarchy_order_work: default.max_hierarchy_order_work * 100,
         max_hierarchy_order_steps: default.max_hierarchy_order_steps * 100,
         ..default
     }

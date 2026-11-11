@@ -238,7 +238,7 @@ schema_version:
                 language: "go".to_owned(),
                 ecosystem: dependency.evidence.ecosystem.clone(),
                 compatibility: request.compatibility,
-                provenance: Provenance {
+                provenance: Provenance { rust_artifact_approximation: None,
                     source: format!("exact local Go dependency sha256:{}", artifact.sha256()),
                     revision: None,
                 },
@@ -251,6 +251,9 @@ schema_version:
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: request.activation,
@@ -382,6 +385,9 @@ schema_version:
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -996,6 +1002,8 @@ fn module_type_drafts(
                 TypeDraft {
                     import_path: package.import_path.clone(),
                     fact: TypeFact {
+                        alias_target: None,
+                        tuple_fields: None,
                         implemented_traits_complete: false,
                         generic_trait_impls_complete: false,
                         jvm_inventory: None,
@@ -1253,6 +1261,8 @@ fn collect_type_draft(
     types.push(TypeDraft {
         import_path: parsed.import_path.clone(),
         fact: TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -2903,6 +2913,7 @@ var privateValue int
                 toolchains: Vec::new(),
             },
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "test".to_owned(),
                 revision: None,
             },
@@ -2915,6 +2926,9 @@ var privateValue int
             carried_sources: Vec::new(),
             cpp_portability: None,
             python_correspondence: None,
+            rust_external_reexports: Vec::new(),
+            rust_external_reexports_truncated: false,
+            rust_external_reexports_glob_incomplete: false,
             shards: vec![AuthoredShard {
                 id: "go".to_owned(),
                 activation: vec![ActivationSelector {

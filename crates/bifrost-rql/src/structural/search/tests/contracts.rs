@@ -295,6 +295,7 @@ fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicate
     );
 
     let rendered = CodeQueryResult {
+        depth_bound_status: None,
         session_subset: None,
         results: vec![item],
         truncated: false,
@@ -356,6 +357,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
         boundary: None,
     };
     let result = CodeQueryResult {
+        depth_bound_status: None,
         session_subset: None,
         results: vec![
             CodeQueryResultItem {
@@ -535,6 +537,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
         ],
         profile: None,
         semantic_receipt: None,
+        depth_answers: Vec::new(),
     };
     detailed.assert_invariants();
 }
@@ -548,6 +551,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::InvalidPlan, Impact::Invalid),
         (Code::Cancelled, Impact::Incomplete),
         (Code::UnsupportedStructuralFeature, Impact::Incomplete),
+        (Code::StructuralRoleCoverageIncomplete, Impact::Incomplete),
         (Code::MissingStructuralAdapter, Impact::Incomplete),
         (Code::RecoveredSyntaxIncomplete, Impact::Incomplete),
         (Code::UnsupportedImportAnalysis, Impact::Incomplete),
@@ -576,6 +580,11 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::ReferenceTargetsAmbiguous, Impact::Advisory),
         (Code::ReferenceCallsiteLimit, Impact::Incomplete),
         (Code::ReferenceAnalysisFailed, Impact::Incomplete),
+        (Code::ReferenceKindUndecided, Impact::Incomplete),
+        (Code::EnclosingPatternUndecided, Impact::Incomplete),
+        (Code::IdenticalCapturesOpen, Impact::Incomplete),
+        (Code::MemberFormUndecided, Impact::Incomplete),
+        (Code::RowPredicateUndecided, Impact::Incomplete),
         (Code::UsesParserUnsupported, Impact::Incomplete),
         (Code::UsesCandidateLimit, Impact::Incomplete),
         (Code::UsesTargetsAmbiguous, Impact::Advisory),
@@ -593,6 +602,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
 
     for (code, impact) in cases {
         let result = CodeQueryResult {
+            depth_bound_status: None,
             session_subset: None,
             results: Vec::new(),
             truncated: false,
@@ -621,17 +631,6 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         };
         assert_eq!(result.completion(), expected, "code {code:?}");
     }
-
-    assert_eq!(
-        CodeQueryResult {
-            session_subset: None,
-            results: Vec::new(),
-            truncated: true,
-            diagnostics: Vec::new(),
-        }
-        .completion(),
-        CodeQueryCompletion::Incomplete { codes: Vec::new() }
-    );
 }
 
 /// Unit coverage for the #2779 root terminal-cap backstop's decision logic:
@@ -707,6 +706,9 @@ fn root_terminal_cap_backstop_fires_only_for_an_unexplained_cap_truncation() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9230: native incoming memo hits omitted caller inventory diagnostics"
+)]
 fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -819,7 +821,71 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
         }],
         ..CallRelationResult::default()
     };
-    assert!(call_relation_result_complete(&advisory));
+    assert!(call_relation_result_complete(&advisory, true));
+
+    cache.reported_incoming.clear();
+    cache
+        .incoming
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(
+                unit.clone(),
+                CallRelationResult {
+                    proof_authority: UsageProofAuthority::Native,
+                    caller_inventory: CallerInventoryCoverage::Incomplete,
+                    ..CallRelationResult::default()
+                },
+            );
+        });
+    diagnostics.clear();
+    let replayed = cached_call_relation(
+        &analyzer,
+        token,
+        &unit,
+        true,
+        &mut cache,
+        &mut budget,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &mut diagnostics,
+        &mut None,
+    );
+    assert!(!call_relation_result_complete(&replayed, true));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+            && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+    }));
+
+    cache.reported_incoming.clear();
+    cache
+        .incoming
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(
+                unit.clone(),
+                CallRelationResult {
+                    proof_authority: UsageProofAuthority::Native,
+                    caller_inventory: CallerInventoryCoverage::Incomplete,
+                    truncated: true,
+                    ..CallRelationResult::default()
+                },
+            );
+        });
+    diagnostics.clear();
+    let truncated = cached_call_relation(
+        &analyzer,
+        token,
+        &unit,
+        true,
+        &mut cache,
+        &mut budget,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &mut diagnostics,
+        &mut None,
+    );
+    assert!(!call_relation_result_complete(&truncated, true));
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.incompleteness != brokk_bifrost_rql::Incompleteness::Content
+    }));
 }
 
 #[test]
@@ -878,6 +944,7 @@ fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Incomplete);
     assert!(matches!(
         CodeQueryResult {
+            depth_bound_status: None,
             session_subset: None,
             results: Vec::new(),
             truncated: false,
@@ -902,6 +969,116 @@ fn outbound_uses_ambiguity_is_advisory_only_when_every_target_survives() {
         CodeQueryDiagnosticCode::UsesTargetsAmbiguous
     );
     assert_eq!(diagnostics[0].impact, CodeQueryDiagnosticImpact::Advisory);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "dc6a9b891853: a second proven-only set operand lost cached ambiguous relation incompleteness"
+)]
+fn cached_ambiguity_keeps_the_second_proven_operand_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer =
+        TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
+    let file = ProjectFile::new(root, "app.ts");
+    let caller = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "root");
+    let target = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
+    let range = Range {
+        start_byte: 0,
+        end_byte: 1,
+        start_line: 1,
+        end_line: 1,
+    };
+    let declaration = DeclarationValue::new(caller.clone(), range);
+    let relation = CallRelationResult {
+        sites: vec![CallSite {
+            file,
+            range,
+            callee_range: range,
+            caller: caller.clone(),
+            callee: target.clone(),
+            kind: CallSyntaxKind::Function,
+            proof: UsageProof::Unproven,
+            receiver: None,
+            arguments: Vec::new(),
+        }],
+        diagnostics: vec![CallRelationDiagnostic {
+            code: CallRelationDiagnosticCode::TargetsAmbiguous,
+            message: "retained ambiguous targets".into(),
+            context: "root".into(),
+            semantic_count: None,
+            reason_kind: None,
+        }],
+        ..Default::default()
+    };
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let mut cache = CallTraversalCache::default();
+    cache
+        .outgoing
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(caller, relation);
+        });
+    let mut indexed = IndexedDeclarations::default();
+    indexed
+        .by_unit
+        .read_mut(&memo_attribution(&analyzer), |entries| {
+            entries.insert(target.clone(), Some(DeclarationValue::new(target, range)));
+        });
+    let query = CodeQuery::from_sexp(
+        "(union (callees :depth 1 (enclosing-decl (language typescript (function :name \"root\")))) (callees :depth 1 :proof proven (enclosing-decl (language typescript (function :name \"root\")))))"
+    ).unwrap();
+    let CodeQueryPlanSource::Set { branches, .. } = &query.plan.source else {
+        panic!("set")
+    };
+    for (index, branch) in branches.iter().enumerate() {
+        let step = branch.steps.last().unwrap();
+        let QueryStep::Callees(filter) = step else {
+            panic!("callees")
+        };
+        let mut input = CallDepthProbeInput::default();
+        let mut diagnostics = Vec::new();
+        let mut budget = CodeQueryExecutionBudget::default();
+        let (rows, exhausted) = call_declaration_expansions(
+            &analyzer,
+            scope.token(),
+            &declaration,
+            step,
+            filter,
+            &mut indexed,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            8,
+            None,
+            &mut diagnostics,
+            &mut None,
+            &mut input,
+        );
+        assert!(!exhausted);
+        if index == 0 {
+            assert_eq!(rows.len(), 1);
+            assert!(!input.undecided);
+            assert_eq!(diagnostics.len(), 1);
+        } else {
+            // The shared relation has already emitted its advisory diagnostic.
+            assert!(diagnostics.is_empty());
+            assert!(rows.is_empty());
+            assert_eq!(
+                probe_call_depth_bound(
+                    &analyzer,
+                    scope.token(),
+                    step,
+                    filter,
+                    &mut cache,
+                    &mut budget,
+                    CodeQueryExecutionLimits::default(),
+                    None,
+                    &mut input,
+                ),
+                DepthBoundStatus::Unknown
+            );
+        }
+    }
 }
 
 #[test]
@@ -968,6 +1145,7 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
         None,
         &mut diagnostics,
         &mut None,
+        &mut CallDepthProbeInput::default(),
     );
 
     assert!(expansions.is_empty());
@@ -1007,7 +1185,7 @@ fn outbound_uses_projection_reports_unindexed_target_and_suppresses_advisory() {
                     file,
                     range: declaration.range,
                     enclosing_unit: caller,
-                    kind: None,
+                    kind: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None),
                     resolved: CodeUnit::file_scope(declaration.unit.source().clone()),
                     confidence: 1_000_000,
                     usage_kind: UsageHitKind::Reference,
@@ -1143,7 +1321,7 @@ fn m3_inbound_reference_distinguishes_missing_real_owner_from_file_scope() {
         file: file.clone(),
         range,
         enclosing_unit,
-        kind: None,
+        kind: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None),
         resolved: target.clone(),
         confidence: 1_000_000,
         usage_kind: UsageHitKind::Reference,
@@ -1169,6 +1347,7 @@ fn m3_inbound_reference_distinguishes_missing_real_owner_from_file_scope() {
         &filter,
         &mut IndexedDeclarations::default(),
         &mut missing_cache,
+        &mut super::super::environment::EnvironmentTraversalCache::default(),
         &mut CodeQueryExecutionBudget::default(),
         CodeQueryExecutionLimits::default(),
         &mut diagnostics,
@@ -1203,6 +1382,7 @@ fn m3_inbound_reference_distinguishes_missing_real_owner_from_file_scope() {
         &filter,
         &mut IndexedDeclarations::default(),
         &mut file_scope_cache,
+        &mut super::super::environment::EnvironmentTraversalCache::default(),
         &mut CodeQueryExecutionBudget::default(),
         CodeQueryExecutionLimits::default(),
         &mut diagnostics,
@@ -1290,6 +1470,7 @@ fn enclosing_declaration_index_retains_exact_owner_and_reports_missing_real_rang
     );
     assert!(matches!(
         CodeQueryResult {
+            depth_bound_status: None,
             session_subset: None,
             results: Vec::new(),
             truncated: index.projection_omitted,

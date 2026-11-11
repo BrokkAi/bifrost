@@ -390,6 +390,8 @@ mod jvm_extraction_tests {
 
         {
             let conn = store.conn.lock().unwrap();
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
             assert_eq!(
                 conn.execute(
                     "UPDATE blob_meta
@@ -477,6 +479,8 @@ mod jvm_extraction_tests {
 
         {
             let conn = store.conn.lock().unwrap();
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
             let top_level_count: usize = conn
                 .query_row(
                     "SELECT COUNT(*) FROM code_units
@@ -641,6 +645,8 @@ mod jvm_extraction_tests {
 
         {
             let conn = store.conn.lock().unwrap();
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
             assert_eq!(
                 conn.execute(
                     "UPDATE code_units
@@ -1723,7 +1729,13 @@ mod jvm_extraction_tests {
             let (_temp, store) = store_with_repeated_short_name(1);
             {
                 let conn = store.conn.lock().expect("store mutex");
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+                conn.execute_batch("UPDATE blob_meta SET is_complete = 0")
+                    .unwrap();
                 conn.execute_batch(mutation).unwrap();
+                conn.execute_batch("UPDATE blob_meta SET is_complete = 1")
+                    .unwrap();
             }
             let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
             store
@@ -1857,16 +1869,27 @@ mod jvm_extraction_tests {
             .iter()
             .find_map(|(package, oid)| (*package == "loser").then_some(*oid))
             .unwrap();
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE blob_meta SET is_complete = 0
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
+                [loser_oid.to_string()],
+            )
+            .unwrap();
+            conn.execute(
                 "DELETE FROM code_unit_fq_segments
                  WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [loser_oid.to_string()],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE blob_meta SET is_complete = 1
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
+                [loser_oid.to_string()],
+            )
+            .unwrap();
+        }
 
         let hydrated = store
             .hydrate_definition_order_candidate_rows(wanted, &generations, None)

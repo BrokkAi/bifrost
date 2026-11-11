@@ -40,7 +40,6 @@
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::rust_facts::{RustIncludeBindingKind, RustIncludeEdgeFact};
@@ -48,9 +47,9 @@ use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::hash::HashSet;
 
 use crate::graph_support::{RustCargoRouteError, RustFactSource};
-use crate::imports::rust_crate_root_package;
-use crate::lexical_scope::lexical_package_at;
-use crate::usage_walks::RustUsageWalks;
+use crate::imports::rust_crate_root_package_with;
+use crate::lexical_scope::lexical_package_at_with;
+use crate::usage_walks::{RustUsageWalks, WalkFill, Walked};
 
 /// The lexical owner route for a physical file consumed by `include!(...)`.
 ///
@@ -101,9 +100,11 @@ impl<'a> RustIncludeRoutes<'a> {
         analyzer: &'a dyn RustFactSource,
         token: QueryToken<'a>,
     ) -> Result<Self, RustCargoRouteError> {
-        Ok(Self {
-            analyzer,
-            walks: RustUsageWalks::new(analyzer, token)?,
+        crate::graph_support::with_usage_read_frame(analyzer, || {
+            Ok(Self {
+                analyzer,
+                walks: RustUsageWalks::new(analyzer, token)?,
+            })
         })
     }
 
@@ -112,9 +113,11 @@ impl<'a> RustIncludeRoutes<'a> {
         token: QueryToken<'a>,
         keep_going: &'a (impl Fn() -> bool + Sync),
     ) -> Result<Self, RustCargoRouteError> {
-        Ok(Self {
-            analyzer,
-            walks: RustUsageWalks::new_while(analyzer, token, keep_going)?,
+        crate::graph_support::with_usage_read_frame(analyzer, || {
+            Ok(Self {
+                analyzer,
+                walks: RustUsageWalks::new_while(analyzer, token, keep_going)?,
+            })
         })
     }
 
@@ -125,19 +128,17 @@ impl<'a> RustIncludeRoutes<'a> {
     pub fn include_routes_for(
         &self,
         file: &ProjectFile,
-    ) -> Result<Arc<Vec<RustIncludeRoute>>, RustCargoRouteError> {
-        if self.walks.cancelled() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        if let Some(cached) = self.analyzer.walk_caches().include_routes.get(file) {
-            return Ok(cached);
-        }
-        let routes = Arc::new(self.compose_include_routes(file)?);
-        self.analyzer
-            .walk_caches()
-            .include_routes
-            .insert(file.clone(), Arc::clone(&routes));
-        Ok(routes)
+    ) -> Result<Walked<Vec<RustIncludeRoute>>, RustCargoRouteError> {
+        crate::graph_support::with_usage_read_frame(self.analyzer, || {
+            if self.walks.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            self.walks.cached_walk(
+                |c| &c.include_routes,
+                file,
+                || Ok(WalkFill::settled(self.compose_include_routes(file)?)),
+            )
+        })
     }
 
     /// Every analyzed file that some other file splices in with `include!`.
@@ -149,36 +150,38 @@ impl<'a> RustIncludeRoutes<'a> {
     /// invocations in the workspace, and it materializes only the resolved
     /// target paths -- no route is composed here.
     pub fn all_included_files(&self) -> Result<Vec<ProjectFile>, RustCargoRouteError> {
-        let live = self.analyzer.live_blobs();
-        let mut included = Vec::new();
-        for oid in self.analyzer.rust_include_host_blobs()? {
-            if self.walks.cancelled() {
-                return Err(RustCargoRouteError::Cancelled);
-            }
-            for host in live.paths_for_oid(oid) {
+        crate::graph_support::with_usage_read_frame(self.analyzer, || {
+            let live = self.analyzer.live_blobs();
+            let mut included = Vec::new();
+            for oid in self.analyzer.rust_include_host_blobs()? {
                 if self.walks.cancelled() {
                     return Err(RustCargoRouteError::Cancelled);
                 }
-                let facts = self.analyzer.rust_usage_facts_of_blob(oid)?;
-                for edge in &facts.include_edges {
+                for host in live.paths_for_oid(oid) {
                     if self.walks.cancelled() {
                         return Err(RustCargoRouteError::Cancelled);
                     }
-                    if let Some(target) = resolve_include_target(&host, &edge.relative_path) {
-                        included.push(target);
+                    let facts = self.analyzer.rust_usage_facts_of_blob(oid)?;
+                    for edge in &facts.include_edges {
+                        if self.walks.cancelled() {
+                            return Err(RustCargoRouteError::Cancelled);
+                        }
+                        if let Some(target) = resolve_include_target(&host, &edge.relative_path) {
+                            included.push(target);
+                        }
                     }
                 }
             }
-        }
-        if self.walks.cancelled() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        included.sort();
-        included.dedup();
-        if self.walks.cancelled() {
-            return Err(RustCargoRouteError::Cancelled);
-        }
-        Ok(included)
+            if self.walks.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            included.sort();
+            included.dedup();
+            if self.walks.cancelled() {
+                return Err(RustCargoRouteError::Cancelled);
+            }
+            Ok(included)
+        })
     }
 
     /// The backward walk itself.
@@ -254,8 +257,12 @@ impl<'a> RustIncludeRoutes<'a> {
             .analyzer
             .prepared_syntax(self.walks.token(), host)
             .ok_or(RustCargoRouteError::Unavailable)?;
-        let module_package =
-            lexical_package_at(&route.module_package, prepared.source(), edge.include_start);
+        let module_package = lexical_package_at_with(
+            self.analyzer.lexical_caches(),
+            &route.module_package,
+            prepared.source(),
+            edge.include_start,
+        );
         let mut host_bindings = route.host_bindings;
         for binding in &edge.host_bindings {
             // A named or namespace binding shadows an earlier binding of the
@@ -300,20 +307,26 @@ impl<'a> RustIncludeRoutes<'a> {
             roots.insert(host.clone());
         }
         roots.extend(self.walks.owner_roots_of(host)?.iter().cloned());
-        roots.extend(self.walks.cargo_routes().target_roots_for_file(host));
+        roots.extend(self.walks.target_roots_of(host));
         let mut roots: Vec<_> = roots.into_iter().collect();
         roots.sort();
         Ok(roots
             .into_iter()
             .map(|root| {
-                let crate_package = rust_crate_root_package(&root);
+                let crate_package =
+                    rust_crate_root_package_with(self.analyzer.crate_naming_caches(), &root);
                 let module_package = if root == *host {
                     crate_package.clone()
                 } else {
                     self.walks
                         .physical_root_of(host)
                         .map(|module| module.package())
-                        .unwrap_or_else(|| crate::declarations::rust_package_name(host))
+                        .unwrap_or_else(|| {
+                            crate::declarations::rust_package_name_with(
+                                self.analyzer.crate_naming_caches(),
+                                host,
+                            )
+                        })
                 };
                 RustIncludeRoute {
                     root_file: root,

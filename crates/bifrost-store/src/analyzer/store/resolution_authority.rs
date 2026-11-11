@@ -63,6 +63,22 @@ impl AuthorityValidations {
     }
 }
 
+type SemanticSiteRows = Vec<(SemanticId, BindingNodeId, ResolutionNamespace)>;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SemanticSiteQueryKind {
+    SourceSite,
+    ReferenceRange,
+    DeclarationRange,
+}
+type SemanticSiteReadMemo = super::selected_read_memo::ExactReadMemo<
+    (i64, u32, SemanticSiteQueryKind, i64, i64, i64),
+    SemanticSiteRows,
+>;
+type ReferenceSpellingReadMemo = super::selected_read_memo::ExactReadMemo<
+    (i64, u32, Vec<u32>, String),
+    HashMap<SemanticId, String>,
+>;
+
 /// Published answers read by one selected operation, bounded by its touched keys.
 #[derive(Default)]
 #[doc(hidden)]
@@ -78,6 +94,24 @@ pub struct AuthorityRequestMemo {
     /// Decode with the current mount ordinal at use; never retain mounted IDs.
     #[doc(hidden)]
     pub rust_reason_owners: HashMap<(i64, i64), Option<i64>>,
+    /// Published site rows selected by one immutable blob and structured
+    /// locator. The caller still runs the authority check on every hit.
+    semantic_sites: SemanticSiteReadMemo,
+    /// Exact persisted spelling batches; staged spellings are merged afresh
+    /// by the lexical source after every hit.
+    reference_lookup_spellings: ReferenceSpellingReadMemo,
+}
+
+impl AuthorityRequestMemo {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn semantic_site_memo_counts_for_test(&self) -> (usize, usize) {
+        self.semantic_sites.bounded_counts()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn reference_spelling_memo_counts_for_test(&self) -> (usize, usize) {
+        self.reference_lookup_spellings.bounded_counts()
+    }
 }
 
 #[doc(hidden)]
@@ -344,11 +378,17 @@ impl<'project> SelectedResolutionAuthority<'project> {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<Vec<(SemanticId, BindingNodeId, ResolutionNamespace)>>> {
         use super::resolution_prepare::resolution_rows::{namespace_from_code, semantic_role_code};
-        self.read_authority(mount, cancellation, |conn| {
-            let (sql, first, second) = if let Some(site) = locator.source_site() {
-                (authority_rows::SEMANTIC_SITES_SQL, i64::from(site.get()), 0)
+        let result = self.read_authority(mount, cancellation, |conn| {
+            let (kind, sql, first, second) = if let Some(site) = locator.source_site() {
+                (
+                    SemanticSiteQueryKind::SourceSite,
+                    authority_rows::SEMANTIC_SITES_SQL,
+                    i64::from(site.get()),
+                    0,
+                )
             } else if let Some((start, end)) = locator.reference_range() {
                 (
+                    SemanticSiteQueryKind::ReferenceRange,
                     authority_rows::SEMANTIC_SITES_2_SQL,
                     start as i64,
                     end as i64,
@@ -358,12 +398,26 @@ impl<'project> SelectedResolutionAuthority<'project> {
                     .declaration_range()
                     .expect("structured locator address");
                 (
+                    SemanticSiteQueryKind::DeclarationRange,
                     authority_rows::SEMANTIC_SITES_3_SQL,
                     start as i64,
                     end as i64,
                 )
             };
-            Ok(conn
+            // Equal numeric arguments can name different predicates: site 0
+            // is not the same question as the reference range 0..0.
+            let key = (
+                mount.blob_id(),
+                mount.ordinal().get(),
+                kind,
+                first,
+                second,
+                semantic_role_code(locator.role()),
+            );
+            if let Some(rows) = self.request_memo.borrow().semantic_sites.get(&key) {
+                return Ok((key, rows.clone(), true));
+            }
+            let rows = conn
                 .prepare_cached(sql)?
                 .query_map(
                     rusqlite::params![
@@ -381,8 +435,19 @@ impl<'project> SelectedResolutionAuthority<'project> {
                         ))
                     },
                 )?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((key, rows, false))
+        })?;
+        let Some((key, rows, hit)) = result else {
+            return Ok(None);
+        };
+        if !hit && !cancellation.is_cancelled() {
+            self.request_memo
+                .borrow_mut()
+                .semantic_sites
+                .insert_bounded_weighed(key, rows.clone(), rows.len().saturating_mul(48));
+        }
+        Ok(Some(rows))
     }
 
     /// Only returned catalog rows carry authority; absence differs from a
@@ -543,14 +608,28 @@ impl<'project> SelectedResolutionAuthority<'project> {
     ) -> StoreResult<Option<HashMap<SemanticId, String>>> {
         let namespaces =
             serde_json::to_string(namespaces).expect("reference lookup namespaces serialize");
-        self.read_authority(mount, cancellation, |conn| {
+        let memo_key = (
+            mount.blob_id(),
+            mount.ordinal().get(),
+            keys.to_vec(),
+            namespaces.clone(),
+        );
+        let result = self.read_authority(mount, cancellation, |conn| {
+            if let Some(rows) = self
+                .request_memo
+                .borrow()
+                .reference_lookup_spellings
+                .get(&memo_key)
+            {
+                return Ok((rows.clone(), true));
+            }
             let mut statement =
                 conn.prepare_cached(authority_rows::REFERENCE_LOOKUP_SPELLING_SQL)?;
             let rows = statement.query_map(
                 rusqlite::params![
                     mount.blob_id(),
                     serde_json::to_string(keys).expect("scalar local key array"),
-                    namespaces
+                    &namespaces
                 ],
                 |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
             )?;
@@ -565,8 +644,29 @@ impl<'project> SelectedResolutionAuthority<'project> {
                     );
                 }
             }
-            Ok(spellings)
-        })
+            Ok((spellings, false))
+        })?;
+        let Some((spellings, hit)) = result else {
+            return Ok(None);
+        };
+        if !hit && !cancellation.is_cancelled() {
+            let bytes = memo_key
+                .2
+                .len()
+                .saturating_mul(4)
+                .saturating_add(memo_key.3.len())
+                .saturating_add(
+                    spellings
+                        .values()
+                        .map(|spelling| spelling.len().saturating_add(64))
+                        .sum::<usize>(),
+                );
+            self.request_memo
+                .borrow_mut()
+                .reference_lookup_spellings
+                .insert_bounded_weighed(memo_key, spellings.clone(), bytes);
+        }
+        Ok(Some(spellings))
     }
 
     pub(crate) fn definition_source_site(

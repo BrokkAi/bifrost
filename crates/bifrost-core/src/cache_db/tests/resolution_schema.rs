@@ -7,6 +7,73 @@ use rusqlite::params;
 #[path = "native_fk_probes.rs"]
 mod native_fk_probes;
 
+#[test]
+fn directional_channel_component_migration_preserves_legacy_and_checks_new_codes() {
+    let conn = create_current_baseline_without_migration();
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version < 256)
+    {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    conn.execute(
+        "INSERT INTO resolution_type_components
+         (blob_id,container_slot,constructor,kind,component_slot) VALUES(1,1,2,0,2)",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(include_str!(
+        "../../../migrations/cache/0256-directional-channel-components.sql"
+    ))
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT constructor FROM resolution_type_components WHERE container_slot=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2,
+        "legacy direction-unknown rows survive the table rebuild"
+    );
+    for (slot, code) in [(3, 5), (4, 6), (5, 7)] {
+        conn.execute(
+            "INSERT INTO resolution_type_components
+             (blob_id,container_slot,constructor,kind,component_slot) VALUES(1,?1,?2,0,2)",
+            params![slot, code],
+        )
+        .unwrap();
+    }
+    for (code, kind) in [(8, 0), (5, 1), (6, 2), (7, 1)] {
+        assert!(
+            conn.execute(
+                "INSERT INTO resolution_type_components
+                 (blob_id,container_slot,constructor,kind,component_slot)
+                 VALUES(1,9,?1,?2,2)",
+                params![code, kind],
+            )
+            .is_err(),
+            "invalid constructor/kind combination {code}/{kind}"
+        );
+    }
+    conn.execute("DELETE FROM resolution_type_components", [])
+        .unwrap();
+    // Later migrations complete the chain before comparing with the current schema.
+    for migration in POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > 256)
+    {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    validate_foreign_keys(&conn).unwrap();
+    assert_eq!(
+        schema_object_definitions_sha256(&conn).unwrap(),
+        CURRENT_SCHEMA_OBJECTS_SHA256
+    );
+}
+
 fn seed_complete_blob_meta(conn: &Connection, blob_id: i64, lang: &str) {
     conn.execute(
         "INSERT INTO blob_meta(
@@ -175,6 +242,10 @@ fn assert_resolution_canonical_schema_names(conn: &Connection) {
             &["blob_id", "semantic_key", "identity_id"][..],
         ),
         (
+            "resolution_reference_package_contexts",
+            &["blob_id", "reference_site", "prefixes"][..],
+        ),
+        (
             "resolution_typed_fact_lookups",
             &["blob_id", "relation", "identity_id"][..],
         ),
@@ -315,6 +386,192 @@ fn definition_namespace_authority_requires_declared_hoisting() {
     assert!(
         error.to_string().contains("CHECK constraint failed"),
         "definition namespace authority accepted unknown hoisting: {error}"
+    );
+}
+
+#[test]
+fn member_type_coverage_count_checks_and_scope_fk_survive_migration() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    configure_connection(&mut conn).unwrap();
+    migrate(&mut conn).unwrap();
+    // Only the JVM producers publish claims, so another language's interior
+    // cannot declare any.
+    let rust =
+        insert_reference_enumeration_impact_interior(&conn, "coverage-rust", "rust", "rust", 0);
+    assert!(conn.execute(
+        "UPDATE resolution_fragment_interiors SET expected_member_type_coverage_count=1 WHERE blob_id=?1",
+        [rust],
+    ).is_err());
+
+    let java =
+        insert_reference_enumeration_impact_interior(&conn, "coverage-java", "java", "java", 0);
+    conn.execute_batch(&format!(
+        "INSERT INTO resolution_member_scope_properties(
+               blob_id, definition_semantic_key, scope_head_node_key, scope_kind
+             ) VALUES
+               ({java}, 1, 10, 'type_body'),
+               ({java}, 2, 20, 'type_body'),
+               ({java}, 3, 30, 'type_body');"
+    ))
+    .unwrap();
+    let insert = |definition: i64, head: i64, coverage: &str, reason: Option<&str>| {
+        conn.execute(
+            "INSERT INTO resolution_member_type_coverage(
+                   blob_id, definition_semantic_key, scope_head_node_key, coverage, open_reason
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![java, definition, head, coverage, reason],
+        )
+    };
+    insert(1, 10, "complete", None).unwrap();
+    insert(2, 20, "open", Some("export_clause")).unwrap();
+    // A reason belongs to an open claim only, every open claim names one, and
+    // the reason vocabulary is closed.
+    for (coverage, reason) in [
+        ("complete", Some("malformed")),
+        ("open", None),
+        ("open", Some("future_reason")),
+        ("unknown", None),
+    ] {
+        let error = insert(3, 30, coverage, reason).unwrap_err();
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{coverage:?} {reason:?}: {error}"
+        );
+    }
+    conn.execute(
+        "UPDATE resolution_fragment_interiors SET expected_member_type_coverage_count=2 WHERE blob_id=?1",
+        [java],
+    )
+    .unwrap();
+    // The claim names its own type-body row; a claim for a scope that was
+    // never published fails the key check when its statement commits.
+    let error = insert(4, 40, "complete", None).unwrap_err();
+    assert!(
+        error.to_string().contains("FOREIGN KEY constraint failed"),
+        "{error}"
+    );
+    let plan = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT coverage.coverage, coverage.open_reason
+             FROM resolution_member_scope_properties AS scope
+             LEFT JOIN resolution_member_type_coverage AS coverage
+               ON coverage.blob_id = scope.blob_id AND coverage.definition_semantic_key = scope.definition_semantic_key
+             WHERE scope.scope_kind='type_body' AND scope.blob_id = ?1 AND scope.definition_semantic_key = ?2",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![java, 1], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("coverage USING PRIMARY KEY")),
+        "{plan:?}"
+    );
+    // Deleting the scope row deletes its claim.
+    conn.execute(
+        "DELETE FROM resolution_member_scope_properties WHERE blob_id=?1 AND definition_semantic_key=1",
+        [java],
+    )
+    .unwrap();
+    let remaining: Vec<i64> = conn
+        .prepare("SELECT definition_semantic_key FROM resolution_member_type_coverage WHERE blob_id=?1 ORDER BY 1")
+        .unwrap()
+        .query_map([java], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(remaining, vec![2]);
+}
+
+#[test]
+fn reference_package_context_count_and_site_fk_survive_migration() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    configure_connection(&mut conn).unwrap();
+    migrate(&mut conn).unwrap();
+    let rust = insert_reference_enumeration_impact_interior(
+        &conn,
+        "reference-context-rust",
+        "rust",
+        "rust",
+        0,
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT expected_reference_package_context_count FROM resolution_fragment_interiors WHERE blob_id=?1",
+            [rust], |row| row.get::<_, i64>(0),
+        ).unwrap(),
+        0,
+    );
+    assert!(conn.execute(
+        "UPDATE resolution_fragment_interiors SET expected_reference_package_context_count=1 WHERE blob_id=?1",
+        [rust],
+    ).is_err());
+
+    let scala = insert_reference_enumeration_impact_interior(
+        &conn,
+        "reference-context-scala",
+        "scala",
+        "scala",
+        0,
+    );
+    conn.execute(
+        "INSERT INTO resolution_sites(blob_id,site,role,namespace,site_kind,start_byte,end_byte,unqualified)
+         VALUES(?1,7,0,0,0,10,15,1)",
+        [scala],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO resolution_reference_package_contexts(blob_id,reference_site,prefixes)
+         VALUES(?1,7,jsonb('[\"a.b\",\"a\"]'))",
+        [scala],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE resolution_fragment_interiors SET expected_reference_package_context_count=1 WHERE blob_id=?1",
+        [scala],
+    ).unwrap();
+    let stored: String = conn.query_row(
+        "SELECT json(prefixes) FROM resolution_reference_package_contexts WHERE blob_id=?1 AND reference_site=7",
+        [scala], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(stored, "[\"a.b\",\"a\"]");
+    let plan = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT json(context.prefixes)
+         FROM resolution_reference_package_contexts AS context
+         JOIN resolution_sites AS site
+           ON site.blob_id=context.blob_id AND site.site=context.reference_site
+         WHERE context.blob_id=?1 AND context.reference_site=?2 AND site.role=0",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![scala, 7], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("context USING PRIMARY KEY")),
+        "{plan:?}"
+    );
+    let foreign_keys: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(foreign_keys, 0);
+    conn.execute(
+        "DELETE FROM resolution_sites WHERE blob_id=?1 AND site=7",
+        [scala],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM resolution_reference_package_contexts WHERE blob_id=?1",
+            [scala],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0
     );
 }
 
@@ -2780,5 +3037,434 @@ fn python_member_operations_migration_enforces_rows_and_cascade() {
             );
         }
         validate_foreign_keys(&conn).unwrap();
+    }
+}
+
+/// Module-token provenance is independent of member and wildcard demand keys.
+#[test]
+fn python_import_module_operands_migrate_and_cascade() {
+    for migrated in [false, true] {
+        let conn = if migrated {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn
+        } else {
+            open_in_memory_cache()
+        };
+        let blob = insert_resolution_test_blob(&conn, "module-operands", "python");
+        for (reference, prefix) in [(10, 1), (11, 2), (12, 1)] {
+            conn.execute(
+                "INSERT INTO python_import_module_operands VALUES(?1,?2,20,?3)",
+                params![blob, reference, prefix],
+            )
+            .unwrap();
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO python_import_module_operands VALUES(?1,10,21,1)",
+                [blob]
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO python_import_module_operands VALUES(?1,13,20,0)",
+                [blob]
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO python_import_module_operands VALUES(?1+1000000,13,20,1)",
+                [blob]
+            )
+            .is_err()
+        );
+        assert_eq!(conn.query_row("SELECT import_site,prefix_len FROM python_import_module_operands WHERE blob_id=?1 AND reference_site=11", [blob], |row| Ok((row.get::<_,u32>(0)?,row.get::<_,u32>(1)?))).unwrap(), (20,2));
+        validate_foreign_keys(&conn).unwrap();
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_import_module_operands",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        validate_foreign_keys(&conn).unwrap();
+    }
+}
+
+/// Python module registry writes remain source-owned across upgrades.
+#[test]
+fn python_module_registry_writes_migrate_and_cascade() {
+    for migrated in [false, true] {
+        let conn = if migrated {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn
+        } else {
+            open_in_memory_cache()
+        };
+        let blob = insert_resolution_test_blob(&conn, "module-registry-writes", "python");
+        conn.execute("INSERT INTO python_binding_source VALUES(?1,7,0,0)", [blob])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,expected_semantic_site_count,logical_rows,payload_bytes,publication_state) VALUES(?1,'python','python','test',zeroblob(32),4,1,0,'building')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO resolution_sites(blob_id,site,role,namespace) VALUES(?1,3,0,0),(?1,4,0,0),(?1,5,0,0),(?1,6,0,0)",
+            [blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO python_module_registry_writes VALUES(?1,3,4,5,1)",
+            [blob],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO python_module_registry_writes VALUES(?1,3,4,5,0)",
+                [blob]
+            )
+            .is_err(),
+            "registry reference primary key accepted duplicate"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO python_module_registry_writes VALUES(?1,6,4,5,2)",
+                [blob]
+            )
+            .is_err(),
+            "top_level CHECK accepted an invalid value"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO python_module_registry_writes VALUES(?1,6,4,99,0)",
+                [blob]
+            )
+            .is_err(),
+            "registry write foreign key accepted missing site"
+        );
+        conn.execute(
+            "INSERT INTO python_module_registry_writes VALUES(?1,6,4,NULL,1)",
+            [blob],
+        )
+        .unwrap();
+        validate_foreign_keys(&conn).unwrap();
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_module_registry_writes",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0,
+            "blob deletion did not cascade into module registry writes"
+        );
+        validate_foreign_keys(&conn).unwrap();
+    }
+}
+
+/// Lookup aliases survive upgrades without acquiring a second module identity.
+#[test]
+fn python_source_root_spellings_migrate_and_cascade() {
+    for migrated in [false, true] {
+        let conn = if migrated {
+            let conn = create_current_baseline_without_migration();
+            for migration in POST_BASELINE_MIGRATIONS {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn
+        } else {
+            open_in_memory_cache()
+        };
+        let blob = insert_resolution_test_blob(&conn, "source-root", "python");
+        conn.execute(
+            "INSERT INTO python_package_path_extensions VALUES(?1,0,'nested')",
+            [blob],
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state) VALUES(1,'python','python_environment',zeroblob(32),zeroblob(32),'native',1,0,'building');
+            INSERT INTO python_unit_summary_roots VALUES(1,0,'','workspace',0,'runtime',zeroblob(32));
+            INSERT INTO resolution_unit_summary_containers VALUES(1,'',NULL);
+            INSERT INTO resolution_unit_summary_containers VALUES(1,'provider','');
+            INSERT INTO python_unit_summary_providers VALUES(1,'provider','outer.pkg.mod','outer.pkg',0,'module','selected','outer/pkg/mod.py',NULL,zeroblob(32));
+            INSERT INTO python_unit_summary_spellings VALUES(1,'pkg.mod','outer','provider',1);
+            INSERT INTO python_unit_summary_spellings VALUES(1,'mod','outer/pkg','provider',0);").unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO python_unit_summary_spellings VALUES(1,'bad','outer','provider',2)",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO python_unit_summary_spellings VALUES(1,'missing','outer','missing',1)",
+                []
+            )
+            .is_err()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_unit_summary_providers",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+        validate_foreign_keys(&conn).unwrap();
+        assert_eq!(
+            schema_object_definitions_sha256(&conn).unwrap(),
+            CURRENT_SCHEMA_OBJECTS_SHA256
+        );
+        conn.execute(
+            "DELETE FROM python_unit_summary_providers WHERE summary_id=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_unit_summary_spellings",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute("DELETE FROM blobs WHERE id=?1", [blob])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM python_package_path_extensions",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            0
+        );
+        validate_foreign_keys(&conn).unwrap();
+    }
+}
+
+#[test]
+fn recipe_generation_tracks_only_first_fill_and_guards_immutable_recipes() {
+    let conn = create_current_baseline_without_migration();
+    for migration in POST_BASELINE_MIGRATIONS {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    let generation = || -> i64 {
+        conn.query_row(
+            "SELECT generation FROM resolution_identity_recipe_generation WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(generation(), 0);
+    let digest = vec![1_u8; 32];
+    conn.execute(
+        "INSERT INTO resolution_identities(identity_digest) VALUES(?1)",
+        [&digest],
+    )
+    .unwrap();
+    assert_eq!(generation(), 1);
+    conn.execute("UPDATE resolution_identities SET semantic_language=1, namespace=1, spelling='x' WHERE identity_digest=?1", [&digest]).unwrap();
+    assert_eq!(generation(), 2);
+    conn.execute("UPDATE resolution_identities SET semantic_language=1, namespace=1, spelling='x' WHERE identity_digest=?1", [&digest]).unwrap();
+    assert_eq!(generation(), 2);
+    conn.execute(
+        "INSERT INTO resolution_identities(identity_digest, semantic_language, namespace, spelling)
+         VALUES(?1,1,1,'x') ON CONFLICT(identity_digest) DO UPDATE SET
+         semantic_language=excluded.semantic_language, namespace=excluded.namespace,
+         spelling=excluded.spelling WHERE resolution_identities.semantic_language IS NULL",
+        [&digest],
+    )
+    .unwrap();
+    assert_eq!(generation(), 2);
+    assert!(
+        conn.execute(
+            "UPDATE resolution_identities SET spelling='y' WHERE identity_digest=?1",
+            [&digest]
+        )
+        .is_err()
+    );
+    assert!(conn.execute("UPDATE resolution_identities SET identity_digest=zeroblob(32) WHERE identity_digest=?1", [&digest]).is_err());
+    assert!(
+        conn.execute(
+            "UPDATE resolution_identities SET id=99 WHERE identity_digest=?1",
+            [&digest]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "DELETE FROM resolution_identities WHERE identity_digest=?1",
+            [&digest]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT OR REPLACE INTO resolution_identities(identity_digest) VALUES(?1)",
+            [&digest]
+        )
+        .is_err()
+    );
+    assert_eq!(generation(), 2);
+    let other = vec![2_u8; 32];
+    conn.execute("INSERT INTO resolution_identities(identity_digest, semantic_language, namespace, spelling) VALUES(?1,1,1,'z')", [&other]).unwrap();
+    assert_eq!(generation(), 3);
+    conn.execute(
+        "UPDATE resolution_identity_recipe_generation SET generation=9223372036854775807",
+        [],
+    )
+    .unwrap();
+    let third = vec![3_u8; 32];
+    assert!(conn.execute("INSERT INTO resolution_identities(identity_digest, semantic_language, namespace, spelling) VALUES(?1,1,1,'q')", [&third]).is_err());
+    assert_eq!(generation(), i64::MAX);
+}
+
+#[test]
+fn recipe_generation_counts_replace_without_recursive_triggers() {
+    let conn = create_current_baseline_without_migration();
+    for migration in POST_BASELINE_MIGRATIONS {
+        conn.execute_batch(migration.sql).unwrap();
+    }
+    conn.pragma_update(None, "recursive_triggers", "OFF")
+        .unwrap();
+    let digest = vec![4_u8; 32];
+    conn.execute("INSERT INTO resolution_identities(identity_digest, semantic_language, namespace, spelling) VALUES(?1,1,1,'x')", [&digest]).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT generation FROM resolution_identity_recipe_generation WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    conn.execute(
+        "INSERT OR REPLACE INTO resolution_identities(identity_digest) VALUES(?1)",
+        [&digest],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT generation FROM resolution_identity_recipe_generation WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn rust_route_question_lookup_migration_backfills_and_seeks() {
+    let mut conn = create_current_baseline_without_migration();
+    let previous = POST_BASELINE_MIGRATIONS
+        .iter()
+        .filter(|m| m.version < 281)
+        .inspect(|migration| conn.execute_batch(migration.sql).unwrap())
+        .map(|migration| migration.version)
+        .max()
+        .expect("a migration precedes 281");
+    conn.pragma_update(None, "user_version", previous).unwrap();
+    let blob = insert_visibility_blob_fixture(&conn, "rust-route-question", None, 1);
+    conn.execute("INSERT INTO resolution_unit_summaries(summary_id,lang,unit_kind,unit_key,summary_digest,producer_epoch,derivation_version,complete,publication_state) VALUES(1,'rust','rust_crate',zeroblob(32),zeroblob(32),'route-test',1,0,'building')", []).unwrap();
+    for (ordinal, path, components) in [
+        (0, "src/lib.rs", r#"["one","two"]"#),
+        (1, "src/shared.rs", r#"["one.two"]"#),
+        (2, "src/empty.rs", "[]"),
+    ] {
+        conn.execute("INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role) VALUES(1,?1,?2,?3,'source')", params![ordinal, blob, path]).unwrap();
+        conn.execute("INSERT INTO rust_resolution_unit_summary_file_naming(summary_id,member_ordinal,package_components,root_components) VALUES(1,?1,jsonb(?2),jsonb('[]'))", params![ordinal, components]).unwrap();
+    }
+    conn.execute("INSERT INTO resolution_unit_summary_dependency_names(summary_id,role,name) VALUES(1,'workspace','alias')", []).unwrap();
+    conn.execute("INSERT INTO rust_crate_topologies(topology_id,topology_digest,crate_key,producer_epoch,target_kind,crate_name,edition,prelude,cfg_atoms,inventory_complete,export_surface_digest,publication_state) VALUES(1,zeroblob(32),zeroblob(32),'route-test','lib','demo','2021','std',jsonb('[]'),1,zeroblob(32),'complete')", []).unwrap();
+    migrate(&mut conn).unwrap();
+    assert!(current_schema_is_valid(&conn).unwrap());
+    validate_foreign_keys(&conn).unwrap();
+    let mismatches: i64 = conn.query_row("SELECT count(*) FROM rust_resolution_unit_summary_file_naming AS naming WHERE package_path <> COALESCE((SELECT group_concat(value, '.') FROM (SELECT value FROM json_each(naming.package_components) ORDER BY CAST(key AS INTEGER))), '')", [], |r| r.get(0)).unwrap();
+    assert_eq!(mismatches, 0);
+    let mut stmt = conn.prepare("SELECT member_ordinal, package_path FROM rust_resolution_unit_summary_file_naming ORDER BY member_ordinal").unwrap();
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (0, "one.two".to_owned()),
+            (1, "one.two".to_owned()),
+            (2, String::new())
+        ]
+    );
+    drop(stmt);
+    conn.execute("INSERT INTO resolution_unit_summary_members(summary_id,member_ordinal,blob_id,rel_path,source_role) VALUES(1,3,?1,'src/new.rs','source')", [blob]).unwrap();
+    conn.execute("INSERT INTO rust_resolution_unit_summary_file_naming(summary_id,member_ordinal,package_components,package_path,root_components) VALUES(1,3,jsonb('[\"new\",\"pkg\"]'),'new.pkg',jsonb('[]'))", []).unwrap();
+    assert_eq!(conn.query_row("SELECT package_path FROM rust_resolution_unit_summary_file_naming WHERE summary_id=1 AND member_ordinal=3", [], |r| r.get::<_, String>(0)).unwrap(), "new.pkg");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("route-cache.db");
+    conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let reopened = Connection::open(&path).unwrap();
+    assert!(current_schema_is_valid(&reopened).unwrap());
+    validate_foreign_keys(&reopened).unwrap();
+    for (sql, params, index) in [
+        (
+            "SELECT summary_id FROM resolution_unit_summary_members WHERE rel_path=?1",
+            "src/shared.rs",
+            "resolution_unit_summary_members_path",
+        ),
+        (
+            "SELECT summary_id FROM rust_resolution_unit_summary_file_naming WHERE package_path=?1",
+            "one.two",
+            "rust_resolution_unit_summary_file_naming_package",
+        ),
+        (
+            "SELECT topology_id FROM rust_crate_topologies WHERE crate_name=?1 AND target_kind='lib'",
+            "demo",
+            "rust_crate_topologies_name_kind",
+        ),
+        (
+            "SELECT summary_id FROM resolution_unit_summary_dependency_names WHERE name=?1",
+            "alias",
+            "resolution_unit_summary_dependency_names_name",
+        ),
+    ] {
+        let detail: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([params], |r| r.get(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(
+            detail.iter().any(|line| line.contains(index)),
+            "{sql}: {detail:?}"
+        );
     }
 }

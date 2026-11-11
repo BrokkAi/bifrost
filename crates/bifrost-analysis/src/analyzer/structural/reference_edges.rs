@@ -28,11 +28,10 @@ use super::edges::SiteClass;
 
 use super::facts::FileFacts;
 use super::facts::Span;
+use brokk_bifrost_core::analyzer::structural::facts::ArgumentMode;
 
 use super::kinds::NormalizedKind;
 use super::kinds::Role;
-
-use super::lexical_environment::environment_for_file;
 
 use super::occurrence_rows::OccurrenceCompleteness;
 use super::occurrence_rows::OccurrenceFileResult;
@@ -46,8 +45,6 @@ use super::occurrence_rows::occurrences_for_file_at_lines;
 use super::occurrences::ALL_OCCURRENCE_ROLES;
 use super::occurrences::OccurrenceClass;
 use super::occurrences::OccurrenceRole;
-
-use super::resolution::EnvironmentAxis;
 
 use crate::analyzer::canonical_hash::CanonicalHasher;
 
@@ -63,6 +60,7 @@ use crate::analyzer::usages::ReferenceHit;
 use crate::analyzer::usages::ReferenceKind;
 use crate::analyzer::usages::UsageHit;
 use crate::analyzer::usages::UsageHitKind;
+use brokk_bifrost_core::analyzer::usages::model::{FacetProof, ReferenceFacets};
 
 use crate::analyzer::usages::UsageProof;
 use crate::analyzer::usages::UsageQueryCompletion;
@@ -71,6 +69,7 @@ use crate::analyzer::CodeUnit;
 
 use crate::analyzer::FqName;
 use crate::analyzer::IAnalyzer;
+use crate::analyzer::Language;
 
 use crate::analyzer::ProjectFile;
 use crate::analyzer::Range;
@@ -126,15 +125,20 @@ pub fn reference_hit_for_target(
     target: CodeUnit,
     proof: UsageProof,
 ) -> ReferenceHit {
-    let kind = hit.reference_kind.or_else(|| {
-        classify_reference_kind(
-            analyzer,
-            &hit.file,
-            hit.start_offset,
-            hit.end_offset,
-            &target,
-        )
-    });
+    let mut kind = classify_reference_facets(
+        analyzer,
+        &hit.file,
+        hit.start_offset,
+        hit.end_offset,
+        &target,
+    );
+    // A legacy hit's label is usable only where it agrees with the new facet
+    // meaning. In particular old field and static labels were heuristic.
+    for facet in hit.reference_kind.known().iter() {
+        if matches!(facet, ReferenceKind::SelfTypeAlias) {
+            kind = kind.with_present(facet);
+        }
+    }
     ReferenceHit {
         file: hit.file,
         range: Range {
@@ -378,6 +382,13 @@ struct NearestDeclaration {
     name: Option<Span>,
 }
 
+#[derive(Clone, Copy)]
+struct RoleOwner {
+    parent: u32,
+    role: Role,
+    mode: ArgumentMode,
+}
+
 /// Reusable per-file index for source-level reference classification.
 ///
 /// Construction reads one immutable structural-facts snapshot and performs one
@@ -390,6 +401,12 @@ pub struct ReferenceSiteClassifier<'analyzer> {
     #[doc(hidden)]
     pub facts: Arc<FileFacts>,
     named_accesses: ContainingSpanIndex<u32>,
+    exact_calls: HashMap<(usize, usize), u32>,
+    // None marks an ambiguous exact owner; ambiguity cannot certify a position.
+    role_owners: HashMap<(usize, usize), Option<RoleOwner>>,
+    language: Language,
+    // A whole role target is positive evidence that the selected name is bare.
+    bare_role_targets: HashSet<(usize, usize)>,
     containing_nodes: ContainingSpanIndex<u32>,
     nearest_declarations: Box<[Option<NearestDeclaration>]>,
     nearest_assignments: Box<[Option<u32>]>,
@@ -411,7 +428,6 @@ pub struct SelectedReferenceFileState<'analyzer> {
 }
 
 impl<'analyzer> SelectedReferenceFileState<'analyzer> {
-    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn range(&self, start_byte: usize, end_byte: usize) -> Range {
         assert!(
@@ -438,17 +454,14 @@ impl<'analyzer> SelectedReferenceFileState<'analyzer> {
 
 /// One request-local caller projection. Admission and facts belong to the same
 /// analyzer; the source is retained for usage snippets as well as line ranges.
-#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub struct SelectedReferenceFileProjection<'a> {
-    pub(crate) file: ProjectFile,
     #[doc(hidden)]
     pub source: String,
     #[doc(hidden)]
     pub state: SelectedReferenceFileState<'a>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl<'a> SelectedReferenceFileProjection<'a> {
     #[doc(hidden)]
     pub fn new(
@@ -473,15 +486,337 @@ impl<'a> SelectedReferenceFileProjection<'a> {
             // see the whole selected workspace for cross-language static uses.
             classifier.analyzer = context_analyzer;
         }
-        Ok(Self {
-            state,
-            source,
-            file: file.clone(),
-        })
+        Ok(Self { state, source })
+    }
+}
+
+/// Resolver receipt for the qualifier of this exact occurrence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifierBindingEvidence {
+    OwningType,
+    Value,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccessDisposition {
+    Read,
+    Write,
+    ReadWrite,
+    WriteReadUndecided,
+    Neither,
+    Transparent,
+    Undecided,
+}
+
+fn access_disposition(
+    language: Language,
+    kind: NormalizedKind,
+    role: Role,
+    mode: ArgumentMode,
+    operator: Option<&str>,
+) -> AccessDisposition {
+    use AccessDisposition::*;
+    let shared = common_access_disposition(kind, role);
+    match language {
+        Language::CSharp => match (kind, role) {
+            (NormalizedKind::Assignment, Role::Left) => match operator {
+                Some("=") => Write,
+                Some("+=") | Some("-=") | Some("*=") | Some("/=") | Some("%=") | Some("&=")
+                | Some("|=") | Some("^=") | Some("<<=") | Some(">>=") | Some("??=") => ReadWrite,
+                _ => Undecided,
+            },
+            (NormalizedKind::Call, Role::Arg | Role::Kwarg) => match mode {
+                ArgumentMode::Plain | ArgumentMode::In => Read,
+                ArgumentMode::Ref => ReadWrite,
+                ArgumentMode::Out => Write,
+                ArgumentMode::Spread => Undecided,
+            },
+            (NormalizedKind::UnaryExpression, Role::Operand) => match operator {
+                Some("++") | Some("--") => ReadWrite,
+                Some("&") | None => Undecided,
+                _ => Read,
+            },
+            _ => shared,
+        },
+        Language::Java => match (kind, role) {
+            (NormalizedKind::Assignment, Role::Left) => match operator {
+                Some("=") => Write,
+                Some("+=") | Some("-=") | Some("*=") | Some("/=") | Some("%=") | Some("&=")
+                | Some("|=") | Some("^=") | Some("<<=") | Some(">>=") | Some(">>>=") => ReadWrite,
+                // A missing or unfamiliar operator still proves the write, but not the read.
+                _ => WriteReadUndecided,
+            },
+            (NormalizedKind::Call, Role::Arg) => Read,
+            (NormalizedKind::UnaryExpression, Role::Operand) => match operator {
+                Some("++") | Some("--") => ReadWrite,
+                Some("&") | None => Undecided,
+                _ => Read,
+            },
+            _ => shared,
+        },
+        Language::Go => match (kind, role) {
+            // Go assignment facts do not publish the operator. The write is
+            // certain, while a compound-assignment read remains undecided.
+            (NormalizedKind::Assignment, Role::Left) => WriteReadUndecided,
+            (NormalizedKind::Call | NormalizedKind::ConcurrentSpawn, Role::Arg) => Read,
+            _ => shared,
+        },
+        _ => Undecided,
+    }
+}
+
+fn common_access_disposition(kind: NormalizedKind, role: Role) -> AccessDisposition {
+    use AccessDisposition::*;
+    match (kind, role) {
+        (NormalizedKind::FieldAccess, Role::Field) => Transparent,
+        (NormalizedKind::Assignment, Role::Right)
+        | (NormalizedKind::FieldAccess, Role::Object)
+        | (NormalizedKind::Return | NormalizedKind::Subscript, Role::Value)
+        | (NormalizedKind::Subscript, Role::Object | Role::Indices)
+        | (
+            NormalizedKind::BinaryExpression
+            | NormalizedKind::Comparison
+            | NormalizedKind::ComparisonChain,
+            Role::Left | Role::Right,
+        )
+        | (
+            NormalizedKind::If
+            | NormalizedKind::Switch
+            | NormalizedKind::Case
+            | NormalizedKind::Assertion,
+            Role::Test,
+        )
+        | (
+            NormalizedKind::CollectionLiteral
+            | NormalizedKind::TupleLiteral
+            | NormalizedKind::ListLiteral,
+            Role::Element,
+        )
+        | (NormalizedKind::StringLiteral, Role::Part) => Read,
+        _ => Undecided,
     }
 }
 
 impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
+    /// Independent proofs for the exact bound name. A missing qualifier binding
+    /// receipt leaves a qualified static access open.
+    #[doc(hidden)]
+    pub fn classify_reference_facets(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+        target: &CodeUnit,
+    ) -> ReferenceFacets {
+        self.classify_reference_facets_with_binding(start_byte, end_byte, target, None)
+    }
+
+    #[doc(hidden)]
+    pub fn classify_reference_facets_with_binding(
+        &self,
+        start_byte: usize,
+        end_byte: usize,
+        target: &CodeUnit,
+        qualifier_binding: Option<QualifierBindingEvidence>,
+    ) -> ReferenceFacets {
+        let mut proofs = [FacetProof::Undecided; 9];
+        let mut set = |kind: ReferenceKind, proof| {
+            proofs[kind as usize] = proof;
+        };
+        let exact = |span: Span| span.start_byte == start_byte && span.end_byte == end_byte;
+        let call = self
+            .exact_calls
+            .get(&(start_byte, end_byte))
+            .copied()
+            .or_else(|| {
+                self.named_accesses
+                    .best_containing_by_key(start_byte, end_byte, |id| {
+                        let node = self.facts.node(id);
+                        (
+                            usize::from(!node.kind.satisfies(NormalizedKind::Call)),
+                            node.range.end_byte - node.range.start_byte,
+                            id,
+                        )
+                    })
+            })
+            .filter(|&id| {
+                let node = self.facts.node(id);
+                node.kind.satisfies(NormalizedKind::Call)
+                    && (node.name.is_some_and(exact)
+                        || (node.range.start_byte == start_byte && node.range.end_byte == end_byte))
+            });
+        let constructor = target.is_class() || target.kind().display_lowercase() == "constructor";
+        set(
+            ReferenceKind::MethodCall,
+            if call.is_some() && !constructor {
+                FacetProof::Present
+            } else {
+                FacetProof::Absent
+            },
+        );
+        set(
+            ReferenceKind::ConstructorCall,
+            if call.is_some() && constructor {
+                FacetProof::Present
+            } else {
+                FacetProof::Absent
+            },
+        );
+        let super_call = call.is_some_and(|id| {
+            self.facts
+                .role_targets(id, Role::Receiver)
+                .any(|role| matches!(role.span.text(self.facts.source()).trim(), "super" | "base"))
+        });
+        set(
+            ReferenceKind::SuperCall,
+            if super_call {
+                FacetProof::Present
+            } else {
+                FacetProof::Absent
+            },
+        );
+
+        let access = self
+            .named_accesses
+            .best_containing_by_key(start_byte, end_byte, |id| {
+                let node = self.facts.node(id);
+                (node.range.end_byte - node.range.start_byte, id)
+            })
+            .filter(|&id| self.facts.node(id).name.is_some_and(exact));
+        let qualified = access.is_some_and(|id| {
+            let node = self.facts.node(id);
+            let role = if node.kind == NormalizedKind::FieldAccess {
+                Role::Object
+            } else {
+                Role::Receiver
+            };
+            self.facts.role_targets(id, role).next().is_some()
+        });
+        set(
+            ReferenceKind::StaticReference,
+            if qualifier_binding == Some(QualifierBindingEvidence::Value)
+                || (!qualified && self.bare_role_targets.contains(&(start_byte, end_byte)))
+            {
+                FacetProof::Absent
+            } else if qualifier_binding == Some(QualifierBindingEvidence::OwningType) {
+                FacetProof::Present
+            } else {
+                FacetProof::Undecided
+            },
+        );
+
+        if target.is_field() {
+            let access_span = access.map(|id| self.facts.node(id).span()).unwrap_or(Span {
+                start_byte,
+                end_byte,
+            });
+            let mut span = access_span;
+            let mut disposition = AccessDisposition::Undecided;
+            for _ in 0..self.facts.nodes().len() {
+                let Some(Some(RoleOwner { parent, role, mode })) = self
+                    .role_owners
+                    .get(&(span.start_byte, span.end_byte))
+                    .copied()
+                else {
+                    break;
+                };
+                disposition = access_disposition(
+                    self.language,
+                    self.facts.node(parent).kind,
+                    role,
+                    mode,
+                    self.facts
+                        .role_targets(parent, Role::Operator)
+                        .next()
+                        .map(|operator| operator.span.text(self.facts.source())),
+                );
+                if disposition != AccessDisposition::Transparent {
+                    break;
+                }
+                let parent_span = self.facts.node(parent).span();
+                if parent_span == span {
+                    disposition = AccessDisposition::Undecided;
+                    break;
+                }
+                span = parent_span;
+            }
+            // A language without an access table proves only the write of an
+            // exact assignment target; a compound assignment's read stays open.
+            if !matches!(
+                self.language,
+                Language::CSharp | Language::Java | Language::Go
+            ) {
+                let site = access.or_else(|| {
+                    self.site_identities
+                        .by_range
+                        .get(&(start_byte, end_byte))
+                        .copied()
+                });
+                if site
+                    .and_then(|id| self.nearest_assignments[id as usize])
+                    .is_some_and(|assignment| {
+                        self.facts
+                            .role_targets(assignment, Role::Left)
+                            .any(|left| left.span == access_span)
+                    })
+                {
+                    disposition = AccessDisposition::WriteReadUndecided;
+                }
+            }
+            let (read, write) = match disposition {
+                AccessDisposition::Read => (FacetProof::Present, FacetProof::Absent),
+                AccessDisposition::Write => (FacetProof::Absent, FacetProof::Present),
+                AccessDisposition::ReadWrite => (FacetProof::Present, FacetProof::Present),
+                AccessDisposition::WriteReadUndecided => {
+                    (FacetProof::Undecided, FacetProof::Present)
+                }
+                AccessDisposition::Neither => (FacetProof::Absent, FacetProof::Absent),
+                AccessDisposition::Transparent | AccessDisposition::Undecided => {
+                    (FacetProof::Undecided, FacetProof::Undecided)
+                }
+            };
+            set(ReferenceKind::FieldRead, read);
+            set(ReferenceKind::FieldWrite, write);
+        } else {
+            set(ReferenceKind::FieldRead, FacetProof::Absent);
+            set(ReferenceKind::FieldWrite, FacetProof::Absent);
+        }
+        if target.is_class() {
+            let inheritance = access.is_none()
+                && self
+                    .containing_nodes
+                    .best_containing_by_key(start_byte, end_byte, |id| {
+                        let node = self.facts.node(id);
+                        (node.range.end_byte - node.range.start_byte, id)
+                    })
+                    .and_then(|id| self.nearest_declarations[id as usize])
+                    .is_some_and(|decl| {
+                        decl.kind == NormalizedKind::Class
+                            && decl.name.is_none_or(|name| !exact(name))
+                    });
+            set(
+                ReferenceKind::Inheritance,
+                if inheritance {
+                    FacetProof::Present
+                } else {
+                    FacetProof::Absent
+                },
+            );
+            set(
+                ReferenceKind::TypeReference,
+                if inheritance || access.is_some() {
+                    FacetProof::Absent
+                } else {
+                    FacetProof::Present
+                },
+            );
+        } else {
+            set(ReferenceKind::Inheritance, FacetProof::Absent);
+            set(ReferenceKind::TypeReference, FacetProof::Absent);
+            set(ReferenceKind::SelfTypeAlias, FacetProof::Absent);
+        }
+        ReferenceFacets::from_proofs(proofs)
+    }
     /// Build the classifier from the analyzer's one facts snapshot for `file`.
     /// Returns `None` when the file has no structural adapter or facts.
     #[doc(hidden)]
@@ -494,6 +829,9 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             .structural_facts(file)?;
 
         let mut named_accesses = Vec::new();
+        let mut exact_calls = HashMap::default();
+        let mut role_owners = HashMap::default();
+        let mut bare_role_targets = HashSet::default();
         let mut containing_nodes = Vec::with_capacity(facts.nodes().len());
         let mut site_identity_nodes = HashMap::default();
         let mut nearest_declarations: Vec<Option<NearestDeclaration>> =
@@ -502,6 +840,24 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
         for (index, node) in facts.nodes().iter().enumerate() {
             let id = u32::try_from(index).expect("structural fact id must fit u32");
             containing_nodes.push((node.span(), id));
+            for target in facts.roles(id) {
+                let span = target.span;
+                // An edge whose target spans the owner itself (for example the
+                // Field token of an initializer label, which is the whole
+                // label) is not a parent relation; indexing it would make
+                // the real parent edge look ambiguous.
+                if span != node.span() {
+                    role_owners
+                        .entry((span.start_byte, span.end_byte))
+                        .and_modify(|owner: &mut Option<RoleOwner>| *owner = None)
+                        .or_insert(Some(RoleOwner {
+                            parent: id,
+                            role: target.role,
+                            mode: target.mode,
+                        }));
+                }
+                bare_role_targets.insert((target.span.start_byte, target.span.end_byte));
+            }
             if node.kind == NormalizedKind::Identifier {
                 site_identity_nodes
                     .entry((node.range.start_byte, node.range.end_byte))
@@ -512,6 +868,9 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
                 && let Some(name) = node.name
             {
                 named_accesses.push((name, id));
+            }
+            if node.kind.satisfies(NormalizedKind::Call) {
+                exact_calls.insert((node.range.start_byte, node.range.end_byte), id);
             }
 
             let parent_declaration = node.parent.and_then(|parent| {
@@ -552,6 +911,10 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
             analyzer,
             facts,
             named_accesses: ContainingSpanIndex::new(named_accesses),
+            exact_calls,
+            role_owners,
+            language,
+            bare_role_targets,
             containing_nodes: ContainingSpanIndex::new(containing_nodes),
             nearest_declarations: nearest_declarations.into_boxed_slice(),
             nearest_assignments: nearest_assignments.into_boxed_slice(),
@@ -602,14 +965,19 @@ impl<'analyzer> ReferenceSiteClassifier<'analyzer> {
     ) -> Option<ReferenceKind> {
         let covers = |span: Span| span.start_byte <= start_byte && end_byte <= span.end_byte;
         let candidate = self
-            .named_accesses
-            .best_containing_by_key(start_byte, end_byte, |id| {
-                let node = self.facts.node(id);
-                (
-                    usize::from(!node.kind.satisfies(NormalizedKind::Call)),
-                    node.range.end_byte - node.range.start_byte,
-                    id,
-                )
+            .exact_calls
+            .get(&(start_byte, end_byte))
+            .copied()
+            .or_else(|| {
+                self.named_accesses
+                    .best_containing_by_key(start_byte, end_byte, |id| {
+                        let node = self.facts.node(id);
+                        (
+                            usize::from(!node.kind.satisfies(NormalizedKind::Call)),
+                            node.range.end_byte - node.range.start_byte,
+                            id,
+                        )
+                    })
             });
         if let Some(id) = candidate {
             let node = self.facts.node(id);
@@ -720,6 +1088,20 @@ pub fn classify_reference_kind(
 ) -> Option<ReferenceKind> {
     ReferenceSiteClassifier::new(analyzer, file)?
         .classify_reference_kind(start_byte, end_byte, target)
+}
+
+pub fn classify_reference_facets(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start_byte: usize,
+    end_byte: usize,
+    target: &CodeUnit,
+) -> ReferenceFacets {
+    ReferenceSiteClassifier::new(analyzer, file)
+        .map(|classifier| classifier.classify_reference_facets(start_byte, end_byte, target))
+        .unwrap_or_else(|| {
+            brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None)
+        })
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1133,6 +1515,7 @@ impl EdgeDerivationResult {
                     | EdgeIncompleteReason::ForwardMetadataIncomplete => true,
                     EdgeIncompleteReason::InverseIndexReferenceEnumerationIncomplete
                     | EdgeIncompleteReason::InverseIndexResolutionIncomplete
+                    | EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding
                     | EdgeIncompleteReason::InverseIndexAdmissionIncomplete
                     | EdgeIncompleteReason::InverseIndexMetadataIncomplete
                     | EdgeIncompleteReason::InverseIndexTargetUncovered
@@ -1294,45 +1677,76 @@ impl OwnerRelationMemo {
         target: &CodeUnit,
     ) -> OwnerRelation {
         let ancestors = &mut self.ancestors;
-        classify_owner_relation_by(
-            analyzer,
-            site_enclosing,
-            target,
-            |hierarchy, site, target| {
-                ancestors
-                    .read(&memo_attribution(analyzer), |cache, capture| {
-                        if let Some(entry) = cache
-                            .lock()
-                            .expect("owner relation memo poisoned")
-                            .get(site)
-                            .cloned()
-                        {
-                            return Ok::<_, ()>(entry);
-                        }
-                        let mut complete = false;
-                        let entry = Arc::new(capture.build(|| {
-                            let answer = hierarchy.get_ancestors(site);
-                            complete = answer.is_complete();
-                            answer.edges
-                        }));
-                        if !complete {
-                            analyzer.record_query_incomplete(
-                                crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
-                                    "incomplete owner hierarchy".into(),
-                                ),
-                            );
-                            return Err(());
-                        }
-                        cache
-                            .lock()
-                            .expect("owner relation memo poisoned")
-                            .insert(site.clone(), Arc::clone(&entry));
-                        Ok(entry)
-                    })
-                    .ok()
-                    .map(|entry| entry.contains(target))
-            },
-        )
+        match crate::analyzer::i_analyzer::complete_independent_answer(analyzer, || {
+            classify_owner_relation_by(
+                analyzer,
+                site_enclosing,
+                target,
+                |hierarchy, site, target| {
+                    ancestors
+                        .read(&memo_attribution(analyzer), |cache, capture| {
+                            if let Some(entry) = cache
+                                .lock()
+                                .expect("owner relation memo poisoned")
+                                .get(site)
+                                .cloned()
+                            {
+                                return Ok::<_, ()>(entry);
+                            }
+                            // A hierarchy can report itself complete while a
+                            // read under it recorded a content gap (an unready
+                            // Rust inventory). Capture those reasons here: an
+                            // entry built from them must not be cached, since a
+                            // replay carries read keys but not completion, and
+                            // the reasons still reach the enclosing answer.
+                            let mut complete = false;
+                            let mut reasons = Vec::new();
+                            let entry = Arc::new(capture.build(|| {
+                                match crate::analyzer::i_analyzer::complete_independent_answer(
+                                    analyzer,
+                                    || hierarchy.get_ancestors(site),
+                                ) {
+                                    Ok(Ok(answer)) => {
+                                        complete = answer.is_complete();
+                                        answer.edges
+                                    }
+                                    Ok(Err(incomplete)) => {
+                                        reasons = incomplete;
+                                        Vec::new()
+                                    }
+                                    // The store error already reached the
+                                    // enclosing scopes.
+                                    Err(_) => Vec::new(),
+                                }
+                            }));
+                            if !complete {
+                                if reasons.is_empty() {
+                                    reasons.push(
+                                        crate::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                                            "incomplete owner hierarchy".into(),
+                                        ),
+                                    );
+                                }
+                                for reason in reasons {
+                                    analyzer.record_query_incomplete(reason);
+                                }
+                                return Err(());
+                            }
+                            cache
+                                .lock()
+                                .expect("owner relation memo poisoned")
+                                .insert(site.clone(), Arc::clone(&entry));
+                            Ok(entry)
+                        })
+                        .ok()
+                        .map(|entry| entry.contains(target))
+                },
+            )
+        }) {
+            Ok(Ok(relation)) => relation,
+            Ok(Err(_reasons)) => OwnerRelation::Unknown,
+            Err(_error) => OwnerRelation::Unknown,
+        }
     }
 }
 
@@ -1381,10 +1795,10 @@ fn classify_owner_relation_by(
 /// Classify a forward edge from the structured occurrence role and the owner
 /// relation already computed for the row.
 ///
-/// An `ImportTarget` row is an import binding only when its exact facts node
-/// belongs to a lexical-environment import binder. A re-export has the same
-/// occurrence role but no import-binder fact, so it deliberately makes no
-/// `Reexport` claim. A `SelfReference` owner relation proves recursion for
+/// Import target, alias and path rows are static when their exact facts node
+/// belongs to import syntax. A re-export has a different normalized kind,
+/// so it deliberately makes no `Reexport` claim. A `SelfReference` owner
+/// relation proves recursion for
 /// member, receiver, and value occurrences. `SameOwner` is intentionally not
 /// enough: `other.helper()` and `this.helper()` share that relation, while
 /// only the latter is a self receiver. Type/path/pattern occurrences remain
@@ -1395,25 +1809,16 @@ fn classify_forward_usage_kind(
     owner_relation: OwnerRelation,
 ) -> UsageHitKind {
     let import_binder_selected =
-        row.role == OccurrenceRole::ImportTarget && import_target_nodes.contains(&row.node);
+        is_import_binding_role(row.role) && import_target_nodes.contains(&row.node);
     classify_forward_usage_kind_from_evidence(row.role, import_binder_selected, owner_relation)
 }
 
-/// Return the exact occurrence nodes whose enclosing import fact has a
-/// structured lexical-environment import binder. Export/re-export facts are
-/// not import facts, so an `ImportTarget` row outside this set retains the
-/// ordinary `Reference` fallback.
+/// Return the exact reference occurrence nodes in structured import syntax.
+/// Export/re-export facts are not imports and retain the ordinary fallback.
 fn import_binding_nodes_for_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> Option<HashSet<u32>> {
-    let environment = environment_for_file(analyzer, file);
-    if !environment
-        .completeness
-        .covers(EnvironmentAxis::ImportBinders)
-    {
-        return None;
-    }
     let facts = analyzer
         .structural_fact_providers()
         .into_iter()
@@ -1421,28 +1826,15 @@ fn import_binding_nodes_for_file(
             provider.structural_language() == crate::analyzer::common::language_for_file(file)
         })
         .and_then(|provider| provider.structural_facts(file))?;
-    // A binder names the local token, but an aliased import also contains
-    // the imported target token. Both are import occurrences. Select the
-    // enclosing import declarations from proven binders, then visit each
-    // declaration once; this also preserves the re-export distinction.
-    let mut declarations = HashSet::default();
-    for binding in environment
-        .bindings
-        .iter()
-        .filter(|binding| binding.import.is_some())
-    {
-        let mut ancestor = binding.node;
-        while let Some(node) = ancestor {
-            if facts.node(node).kind == NormalizedKind::Import {
-                declarations.insert(node);
-                break;
-            }
-            ancestor = facts.node(node).parent;
-        }
-    }
+    // Import syntax is static even when it has no local binder (a wildcard).
+    // Re-exports have a different normalized kind. Enumerate import subtrees
+    // once, including path prefixes as well as target and alias tokens.
+    let declarations =
+        facts.nodes().iter().enumerate().filter_map(|(node, fact)| {
+            (fact.kind == NormalizedKind::Import).then_some(node as u32)
+        });
     Some(
         declarations
-            .into_iter()
             .flat_map(|declaration| declaration..facts.subtree_end(declaration))
             .filter(|&node| {
                 facts
@@ -1458,7 +1850,7 @@ fn import_binding_nodes_for_file(
 fn is_import_binding_role(role: OccurrenceRole) -> bool {
     matches!(
         role,
-        OccurrenceRole::ImportTarget | OccurrenceRole::ImportAlias
+        OccurrenceRole::ImportTarget | OccurrenceRole::ImportAlias | OccurrenceRole::PathSegment
     )
 }
 
@@ -1467,7 +1859,7 @@ fn classify_forward_usage_kind_from_evidence(
     import_binder_selected: bool,
     owner_relation: OwnerRelation,
 ) -> UsageHitKind {
-    if role == OccurrenceRole::ImportTarget && import_binder_selected {
+    if is_import_binding_role(role) && import_binder_selected {
         return UsageHitKind::Import;
     }
     if matches!(
@@ -1590,6 +1982,7 @@ pub(crate) fn edge_rows_from_reference_hits(
                 .or_insert_with(|| SiteIdentityIndex::build(analyzer, &hit.file))
                 .ast_id(&range);
             ReferenceEdgeRow {
+                dispatch_extensibility: None,
                 site: EdgeSite {
                     file: hit.file,
                     range,
@@ -1940,6 +2333,13 @@ pub(crate) fn inverse_edge_answer_digest(result: &EdgeDerivationResult) -> Stabl
     StableDigest::from_array(hasher.finish())
 }
 
+/// Digest seam for cross-surface read-verification regression checks.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn inverse_edge_answer_digest_for_test_support(result: &EdgeDerivationResult) -> StableDigest {
+    inverse_edge_answer_digest(result)
+}
+
 /// Every forward edge of one file: each reference-class occurrence that the
 /// resolver resolved to declared targets, in the canonical row shape.
 ///
@@ -2033,11 +2433,17 @@ pub fn forward_edges_from_occurrences(
             UsageProof::Unproven
         };
         for unit in units {
-            let kind = reference_sites.as_ref().and_then(|sites| {
-                sites.classify_reference_kind(row.range.start_byte, row.range.end_byte, unit)
-            });
+            let kind = reference_sites
+                .as_ref()
+                .map(|sites| {
+                    sites.classify_reference_facets(row.range.start_byte, row.range.end_byte, unit)
+                })
+                .unwrap_or_else(|| {
+                    brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None)
+                });
             let owner_relation = classify_owner_relation(analyzer, row.enclosing.as_ref(), unit);
             edges.push(ReferenceEdgeRow {
+                dispatch_extensibility: None,
                 site: EdgeSite {
                     file: file.clone(),
                     range: row.range,
@@ -2192,7 +2598,10 @@ class Child extends Base {
         );
         for confidence in [-2.0, 0.0, 0.1234567, 0.5, 1.0, 4.0] {
             let mut hit = UsageHit::new(file.clone(), 1, 0, 1, unit.clone(), confidence, "");
-            hit.reference_kind = Some(ReferenceKind::StaticReference);
+            hit.reference_kind =
+                brokk_bifrost_core::analyzer::usages::model::facets_from_classified(Some(
+                    ReferenceKind::StaticReference,
+                )); // slice B: recompute static proof from binding evidence.
             let reference =
                 reference_hit_for_target(&analyzer, hit, unit.clone(), UsageProof::Proven);
             assert!((reference.confidence_f64() - confidence.clamp(0.0, 1.0)).abs() <= 0.000001);
@@ -2202,6 +2611,7 @@ class Child extends Base {
     #[cfg(test)]
     fn site_edge(file: ProjectFile, start: usize) -> ReferenceEdgeRow {
         ReferenceEdgeRow {
+            dispatch_extensibility: None,
             target: CodeUnit::new(
                 file.clone(),
                 crate::analyzer::CodeUnitType::Function,
@@ -2219,7 +2629,9 @@ class Child extends Base {
                 ast_id: None,
                 enclosing: None,
             },
-            reference_kind: None,
+            reference_kind: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(
+                None,
+            ),
             proof: UsageProof::Proven,
             ambiguous_candidate: false,
             usage_kind: UsageHitKind::Reference,
@@ -2250,7 +2662,10 @@ class Child extends Base {
             alternate.edges.reverse();
             let mut duplicate = alternate.edges[0].clone();
             duplicate.proof = UsageProof::Unproven;
-            duplicate.reference_kind = Some(ReferenceKind::StaticReference);
+            duplicate.reference_kind =
+                brokk_bifrost_core::analyzer::usages::model::facets_from_classified(Some(
+                    ReferenceKind::StaticReference,
+                )); // slice B: recompute static proof from binding evidence.
             alternate.edges.push(duplicate);
             assert_eq!(inverse_edge_answer_digest(&alternate), digest);
         }

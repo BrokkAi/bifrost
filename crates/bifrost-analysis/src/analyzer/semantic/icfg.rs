@@ -168,6 +168,10 @@ pub struct IcfgProviderBehaviorIdentity {
     #[doc(hidden)]
     pub digest: StableDigest,
     read: StableDigest,
+    /// The active semantic model set, as `ReadKey::Models` names it. Already
+    /// folded into both halves above; kept apart so a consumer that is
+    /// otherwise independent of the workspace can still key on the model set.
+    models: StableDigest,
 }
 
 impl IcfgProviderBehaviorIdentity {
@@ -181,6 +185,7 @@ impl IcfgProviderBehaviorIdentity {
         Self {
             digest,
             read: digest,
+            models: no_active_model_set_digest(),
         }
     }
 
@@ -201,6 +206,12 @@ impl IcfgProviderBehaviorIdentity {
         self.read.as_bytes()
     }
 
+    /// The active semantic model set this provider dispatches under: the
+    /// digest `ReadKey::Models` records, or a fixed marker for no model set.
+    pub const fn models_digest(self) -> StableDigest {
+        self.models
+    }
+
     fn workspace(
         workspace: &WorkspaceAnalyzer,
         hierarchy_expansion: DispatchHierarchyExpansion,
@@ -209,13 +220,74 @@ impl IcfgProviderBehaviorIdentity {
         python_saved_default_safety: Option<StableDigest>,
         limits: OracleLimits,
     ) -> Self {
-        let mut digest = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN);
-        let mut read = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN);
+        Self::workspace_with_domains(
+            workspace,
+            hierarchy_expansion,
+            snapshot,
+            dispatch_hints,
+            python_saved_default_safety,
+            limits,
+            (
+                WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN,
+                WORKSPACE_ICFG_PROVIDER_READ_BEHAVIOR_DOMAIN,
+            ),
+        )
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn for_test_workspace_with_domains(
+        provider: &WorkspaceIcfgProvider<'_>,
+        domains: (&[u8], &[u8]),
+    ) -> Self {
+        let oracle = provider.oracle();
+        Self::workspace_with_domains(
+            oracle.workspace(),
+            oracle.hierarchy_expansion(),
+            oracle.active_semantic_model_snapshot().as_deref(),
+            oracle.dispatch_hints().digest(),
+            oracle
+                .python_saved_default_safety()
+                .map(|safety| safety.fingerprint()),
+            *oracle.limits(),
+            domains,
+        )
+    }
+
+    fn workspace_with_domains(
+        workspace: &WorkspaceAnalyzer,
+        hierarchy_expansion: DispatchHierarchyExpansion,
+        snapshot: Option<&ActiveSemanticModelSnapshot>,
+        dispatch_hints: StableDigest,
+        python_saved_default_safety: Option<StableDigest>,
+        limits: OracleLimits,
+        domains: (&[u8], &[u8]),
+    ) -> Self {
+        let mut digest = LengthDelimitedDigest::new(domains.0);
+        let mut read = LengthDelimitedDigest::new(domains.1);
+        let dependency_evidence: Vec<_> = Language::ALL
+            .into_iter()
+            .filter_map(|language| {
+                workspace
+                    .analyzer()
+                    .dependency_discovery_evidence(language)
+                    .map(|evidence| (language, evidence))
+            })
+            .collect();
+        let dependency_output =
+            crate::analyzer::semantic_model::dependency_discovery_output_digest(|language| {
+                dependency_evidence
+                    .iter()
+                    .find(|(candidate, _)| *candidate == language)
+                    .map(|(_, evidence)| evidence.as_ref())
+            });
         // Every engine input except the workspace's own content identity, into
         // both halves: each of these is something a reader of a recorded read
         // states for itself, and none of them moves because an unrelated file
         // was edited.
         let push_engine_inputs = |digest: &mut LengthDelimitedDigest| {
+            digest.push(b"dependency-discovery-output");
+            digest.push(dependency_output.as_bytes());
             match snapshot {
                 Some(snapshot) => {
                     digest.push(b"active-semantic-model-set");
@@ -262,9 +334,10 @@ impl IcfgProviderBehaviorIdentity {
             // Saved defaults depend on callable-scoped metadata mutation
             // evidence, not only on the callee file. Include its complete
             // bounded-scan fingerprint in both replay identity halves.
-            if language_support_for_hook(Language::Python, "forward_query_provider")
-                .and_then(|support| support.forward_query_provider(workspace.analyzer()))
-                .is_some()
+            if workspace.analyzer().languages().contains(&Language::Python)
+                && language_support_for_hook(Language::Python, "forward_query_provider")
+                    .and_then(|support| support.forward_query_provider(workspace.analyzer()))
+                    .is_some()
             {
                 digest.push(b"python-saved-default-safety");
                 match python_saved_default_safety {
@@ -308,9 +381,16 @@ impl IcfgProviderBehaviorIdentity {
         Self {
             digest: digest.finish(),
             read: read.finish(),
+            models: snapshot.map_or_else(no_active_model_set_digest, |snapshot| {
+                crate::analyzer::i_analyzer::active_model_digest(
+                    snapshot.active_models().active_model_set_hash(),
+                )
+            }),
         }
     }
 }
+
+use crate::analyzer::i_analyzer::no_active_model_set_digest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallBoundary {
@@ -321,12 +401,20 @@ pub struct CallBoundary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallTransferSet {
+    /// Caller-side argument evaluation is independent of any callee model.
+    pub caller_conversion_may_run_user_code: bool,
     pub transfers: Box<[CallTransfer]>,
     pub boundaries: Box<[CallBoundary]>,
     pub coverage: CandidateCoverage,
 }
 
 pub trait IcfgProvider: DispatchOracle {
+    fn memo_dependency_reacquirer(
+        &self,
+    ) -> Option<&dyn crate::analyzer::semantic::MemoDependencyReacquirer> {
+        None
+    }
+
     /// Query-owned attribution, including helpers without a carried thread frame.
     fn memo_attribution(&self) -> crate::analyzer::workspace_authority::OwnedMemoCapability;
 
@@ -394,10 +482,12 @@ pub struct CachedCallTransferOutcome {
     reads: Arc<crate::analyzer::usages::common::QueryMemoReads>,
     outcome: SemanticOutcome<CallTransferSet>,
     dispatch_read: DispatchReadAttribution,
+    admission: crate::analyzer::semantic::SemanticMemoAdmission,
 }
 
 #[derive(Clone)]
 pub struct CachedExitProfileOutcome {
+    admission: crate::analyzer::semantic::SemanticMemoAdmission,
     outcome: SemanticOutcome<IcfgExitProfile>,
     reads: Arc<crate::analyzer::usages::common::QueryMemoReads>,
 }
@@ -445,42 +535,56 @@ impl<'a> QueryLocalIcfgOutcomeCache<'a> {
     fn call_transfer(
         &self,
         analyzer: &dyn crate::analyzer::IAnalyzer,
+        budget: &mut crate::analyzer::semantic::SemanticBudget,
         key: &CallTransferCacheKey,
     ) -> Option<CachedCallTransferOutcome> {
-        let local = self
+        let mut entries = self
             .call_transfers
             .lock()
-            .expect("query-local ICFG call-transfer cache mutex is not poisoned")
-            .get(key)
-            .cloned();
+            .expect("query-local ICFG call-transfer cache mutex is not poisoned");
+        if let Some(cached) = entries.get(key)
+            && budget.admit_memo_hit(&cached.admission).is_err()
+        {
+            entries.remove(key);
+            return None;
+        }
+        let local = entries.get(key).cloned();
+        drop(entries);
         if let Some(cached) = local.as_ref() {
             crate::analyzer::usages::common::replay_memo_reads(&cached.reads, analyzer);
         }
         local.or_else(|| {
             self.parent
                 .as_deref()
-                .and_then(|parent| parent.call_transfer(analyzer, key))
+                .and_then(|parent| parent.call_transfer(analyzer, budget, key))
         })
     }
 
     fn exit_profile(
         &self,
         analyzer: &dyn crate::analyzer::IAnalyzer,
+        budget: &mut crate::analyzer::semantic::SemanticBudget,
         key: &ExitProfileCacheKey,
     ) -> Option<SemanticOutcome<IcfgExitProfile>> {
-        let local = self
+        let mut entries = self
             .exit_profiles
             .lock()
-            .expect("query-local ICFG exit-profile cache mutex is not poisoned")
-            .get(key)
-            .cloned();
+            .expect("query-local ICFG exit-profile cache mutex is not poisoned");
+        if let Some(cached) = entries.get(key)
+            && budget.admit_memo_hit(&cached.admission).is_err()
+        {
+            entries.remove(key);
+            return None;
+        }
+        let local = entries.get(key).cloned();
+        drop(entries);
         if let Some(cached) = local.as_ref() {
             crate::analyzer::usages::common::replay_memo_reads(&cached.reads, analyzer);
         }
         local.map(|cached| cached.outcome).or_else(|| {
             self.parent
                 .as_deref()
-                .and_then(|parent| parent.exit_profile(analyzer, key))
+                .and_then(|parent| parent.exit_profile(analyzer, budget, key))
         })
     }
 
@@ -1114,6 +1218,12 @@ impl HeapOracle for WorkspaceIcfgProvider<'_> {
 }
 
 impl IcfgProvider for WorkspaceIcfgProvider<'_> {
+    fn memo_dependency_reacquirer(
+        &self,
+    ) -> Option<&dyn crate::analyzer::semantic::MemoDependencyReacquirer> {
+        Some(&self.oracle)
+    }
+
     fn memo_attribution(&self) -> crate::analyzer::workspace_authority::OwnedMemoCapability {
         crate::analyzer::workspace_authority::workspace_memo_attribution(self.oracle.workspace())
     }
@@ -1139,7 +1249,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             self.workspace().analyzer(),
             || self.exit_profile_with_memo(callee_entry, callee_exit, request, &mut publication),
         );
-        if let Some((key, cached)) = publication {
+        if let Some((key, cached, admission)) = publication {
             self.outcome_cache
                 .exit_profiles
                 .lock()
@@ -1147,6 +1257,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                 .insert(
                     key,
                     CachedExitProfileOutcome {
+                        admission,
                         outcome: cached,
                         reads: Arc::new(reads),
                     },
@@ -1192,7 +1303,11 @@ impl WorkspaceIcfgProvider<'_> {
         callee_entry: &ProgramPointHandle,
         callee_exit: &ProgramPointHandle,
         request: &mut SemanticRequest<'_>,
-        publication: &mut Option<(ExitProfileCacheKey, SemanticOutcome<IcfgExitProfile>)>,
+        publication: &mut Option<(
+            ExitProfileCacheKey,
+            SemanticOutcome<IcfgExitProfile>,
+            crate::analyzer::semantic::SemanticMemoAdmission,
+        )>,
     ) -> Result<SemanticOutcome<IcfgExitProfile>, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
@@ -1206,11 +1321,12 @@ impl WorkspaceIcfgProvider<'_> {
         let key = (callee_entry.clone(), callee_exit.clone());
         let cached = cacheable_request.then(|| {
             self.outcome_cache
-                .exit_profile(self.workspace().analyzer(), &key)
+                .exit_profile(self.workspace().analyzer(), request.budget, &key)
         });
         if let Some(outcome) = cached.flatten() {
             return Ok(outcome);
         }
+        let before = request.budget.replay_snapshot();
         let refinements = self
             .oracle
             .runtime_refinements_for_procedure(callee_entry.procedure(), request)?;
@@ -1276,7 +1392,11 @@ impl WorkspaceIcfgProvider<'_> {
         };
         *work = work.conservative_add(refinements.work());
         if cacheable_request && let Some(cached) = outcome.completed_replay() {
-            *publication = Some((key, cached));
+            *publication = Some((
+                key,
+                cached,
+                request.budget.memo_admission_since(&before, &Arc::new(())),
+            ));
         }
         Ok(outcome)
     }
@@ -1293,7 +1413,7 @@ impl WorkspaceIcfgProvider<'_> {
             self.workspace().analyzer(),
             || self.call_transfers_with_memo(caller, call, context, request, &mut publication),
         );
-        if let Some((key, cached, dispatch_read)) = publication {
+        if let Some((key, cached, dispatch_read, admission)) = publication {
             self.outcome_cache
                 .call_transfers
                 .lock()
@@ -1301,6 +1421,7 @@ impl WorkspaceIcfgProvider<'_> {
                 .insert(
                     key,
                     CachedCallTransferOutcome {
+                        admission,
                         outcome: cached,
                         dispatch_read,
                         reads: Arc::new(reads),
@@ -1320,6 +1441,7 @@ impl WorkspaceIcfgProvider<'_> {
             CallTransferCacheKey,
             SemanticOutcome<CallTransferSet>,
             DispatchReadAttribution,
+            crate::analyzer::semantic::SemanticMemoAdmission,
         )>,
     ) -> Result<SemanticOutcome<CallTransferSet>, SemanticProviderError> {
         if request.cancellation.is_cancelled() {
@@ -1336,13 +1458,17 @@ impl WorkspaceIcfgProvider<'_> {
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
         let cache_key = (caller.clone(), call, context.clone());
         let cached = cacheable_request.then(|| {
-            self.outcome_cache
-                .call_transfer(self.workspace().analyzer(), &cache_key)
+            self.outcome_cache.call_transfer(
+                self.workspace().analyzer(),
+                request.budget,
+                &cache_key,
+            )
         });
         if let Some(cached) = cached.flatten() {
             record_dispatch_read_attribution(self.workspace(), &cached.dispatch_read);
             return Ok(cached.outcome);
         }
+        let before = request.budget.replay_snapshot();
         let semantic_call = caller
             .semantics()
             .call_site(call)
@@ -1445,6 +1571,27 @@ impl WorkspaceIcfgProvider<'_> {
             )
         };
         record_dispatch_read_attribution(self.workspace(), &dispatch_read);
+        let conversion_effect = self.oracle.call_conversion_may_run_user_code(
+            &origin,
+            &dispatch_outcome,
+            &mut request.staged(&mut staged_budget),
+        )?;
+        let inspect_conversions = conversion_effect.available_value().copied().unwrap_or(true);
+        let conversion_work = conversion_effect.work();
+        let conversion_interruption = match conversion_effect {
+            SemanticOutcome::Cancelled { work, .. } => Some(SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            }),
+            SemanticOutcome::ExceededBudget { exceeded, work, .. } => {
+                Some(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                })
+            }
+            _ => None,
+        };
         let mapped = dispatch_outcome.try_map(|dispatch| {
             let mut transfers = Vec::new();
             let mut additional_work = SemanticWork::default();
@@ -1537,6 +1684,7 @@ impl WorkspaceIcfgProvider<'_> {
                             unmaterialized_external_target: None,
                             proof: candidate.proof,
                             completeness,
+                            partial_cause: None,
                             provenance,
                         },
                         // Starting the task returns normally to the registering
@@ -1579,6 +1727,7 @@ impl WorkspaceIcfgProvider<'_> {
                             unmaterialized_external_target: None,
                             proof: candidate.proof,
                             completeness,
+                            partial_cause: None,
                             provenance,
                         },
                         // Creating the suspended object normally returns to the
@@ -1604,11 +1753,22 @@ impl WorkspaceIcfgProvider<'_> {
                 else {
                     continue;
                 };
+                let conversion_incomplete = inspect_conversions;
                 let (mut completeness, mut added_reason_bytes) = call_binding_completeness(
                     &semantic_call,
                     candidate.target.semantics().values(),
                     candidate.completeness,
                 );
+                // A transfer already partial keeps its first reason.
+                if conversion_incomplete && matches!(completeness, EvidenceCompleteness::Complete) {
+                    let previous = completeness_reason_bytes(&completeness);
+                    completeness = EvidenceCompleteness::Partial(
+                        "an argument conversion or receiver deref without a selected complete Identity summary may run user code".into(),
+                    );
+                    added_reason_bytes = added_reason_bytes.saturating_add(
+                        completeness_reason_bytes(&completeness).saturating_sub(previous),
+                    );
+                }
                 if argument_callable
                     .as_ref()
                     .is_some_and(|proof| !proof.captures().is_empty())
@@ -1644,7 +1804,20 @@ impl WorkspaceIcfgProvider<'_> {
                     completeness,
                 });
             }
+            if inspect_conversions {
+                for boundary in &mut boundaries {
+                    if matches!(boundary.dispatch.completeness, EvidenceCompleteness::Complete) {
+                        boundary.dispatch.completeness = EvidenceCompleteness::Partial(
+                            "an argument conversion or receiver deref without a selected complete Identity summary may run user code".into());
+                        additional_work = additional_work.conservative_add(SemanticWork {
+                            owned_text_bytes: completeness_reason_bytes(&boundary.dispatch.completeness),
+                            ..SemanticWork::default()
+                        });
+                    }
+                }
+            }
             let mut transfer_set = CallTransferSet {
+                caller_conversion_may_run_user_code: inspect_conversions,
                 transfers: transfers.into_boxed_slice(),
                 boundaries: boundaries.into_boxed_slice(),
                 coverage,
@@ -1671,11 +1844,20 @@ impl WorkspaceIcfgProvider<'_> {
                 return Err(error);
             }
         };
+        if let Some(outcome) = conversion_interruption {
+            if !retained_source_before {
+                dispatch_session.discard_exact_source();
+            }
+            request.budget.retain_performed_work(&staged_budget);
+            return Ok(outcome);
+        }
         let additional_work = mapped
             .available_value()
             .map_or(SemanticWork::default(), |(_, work)| *work);
         let original_work = mapped.work();
-        let total_work = original_work.conservative_add(additional_work);
+        let total_work = original_work
+            .conservative_add(conversion_work)
+            .conservative_add(additional_work);
         if let Some(outcome) = charge_call_transfer_projection(
             &mapped,
             &mut staged_budget,
@@ -1726,7 +1908,12 @@ impl WorkspaceIcfgProvider<'_> {
             self.outcome_cache.publish_snapshot(&dispatch_cache);
         }
         if cacheable_request && let Some(cached) = outcome.completed_replay() {
-            *publication = Some((cache_key, cached, dispatch_read));
+            *publication = Some((
+                cache_key,
+                cached,
+                dispatch_read,
+                request.budget.memo_admission_since(&before, &Arc::new(())),
+            ));
         }
         Ok(outcome)
     }
@@ -2448,13 +2635,31 @@ pub(crate) fn add_local_edge(
         point,
         frames: key.frames.clone(),
     };
+    let evidence = key
+        .point
+        .procedure()
+        .semantics()
+        .evidence_row(edge.evidence)
+        .expect("validated local edge has evidence");
+    let proven = crate::analyzer::semantic::statement_entries::control_edge_proves_route(
+        key.point.procedure().semantics(),
+        edge.evidence,
+    );
     builder.link(
         source,
         target_key,
         IcfgEdgeKind::Intraprocedural(edge.kind),
         None,
-        ProofStatus::Proven,
-        EvidenceCompleteness::Complete,
+        if proven {
+            ProofStatus::Proven
+        } else {
+            evidence.proof.clone()
+        },
+        if proven {
+            EvidenceCompleteness::Complete
+        } else {
+            evidence.completeness.clone()
+        },
         None,
         request,
     )?;
@@ -2559,7 +2764,6 @@ pub mod python_test_support;
 
 #[cfg(test)]
 mod tests {
-
     use brokk_bifrost_analysis::analyzer::semantic::ir::model::CallInvocationMode;
 
     use brokk_bifrost_analysis::analyzer::semantic::icfg::CallToReturnModel;
@@ -2593,6 +2797,84 @@ mod tests {
     use crate::analyzer::semantic::SemanticBudget;
 
     use crate::cancellation::CancellationToken;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10893: ICFG memo hits skipped their fill's transient admission"
+    )]
+    fn call_transfer_memo_admits_cold_peak_before_replaying() {
+        use super::*;
+        use crate::analyzer::semantic::ir::go_extraction_support_26::{
+            capabilities, key, minimal_procedure,
+        };
+        let fixture = crate::test_support::AnalyzerFixture::new(&[]);
+        let key = key();
+        let artifact = Arc::new(
+            crate::analyzer::semantic::SemanticArtifact::try_new(
+                key.clone(),
+                capabilities(&[]),
+                vec![minimal_procedure(
+                    &key,
+                    crate::analyzer::semantic::ProcedureId::new(0),
+                    "test",
+                    1,
+                )],
+            )
+            .unwrap(),
+        );
+        let procedure = artifact
+            .procedure_handle(crate::analyzer::semantic::ProcedureId::new(0))
+            .unwrap();
+        let cache_key = (procedure, CallSiteId::new(0), OracleCallContext::empty());
+        let scratch = SemanticWork {
+            evidence: 80,
+            ..SemanticWork::default()
+        };
+        let mut fill = SemanticBudget::uniform(100).unwrap();
+        let before = fill.replay_snapshot();
+        fill.admit(scratch).unwrap();
+        fill.release_admission(scratch);
+        let admission = fill.memo_admission_since(&before, &Arc::new(()));
+        for limit in [79, 80] {
+            let cache = QueryLocalIcfgOutcomeCache::default();
+            cache.call_transfers.lock().unwrap().insert(
+                cache_key.clone(),
+                CachedCallTransferOutcome {
+                    reads: Arc::new(
+                        crate::analyzer::usages::common::capture_memo_reads(
+                            fixture.analyzer().analyzer(),
+                            || (),
+                        )
+                        .1,
+                    ),
+                    outcome: SemanticOutcome::Complete {
+                        value: CallTransferSet::default(),
+                        work: SemanticWork::default(),
+                    },
+                    dispatch_read: DispatchReadAttribution::Unattributed(
+                        DispatchReadUnattributedReason::SourceRangeUnavailable,
+                    ),
+                    admission: admission.clone(),
+                },
+            );
+            let mut warm = SemanticBudget::uniform(limit).unwrap();
+            let accepted = cache
+                .call_transfer(fixture.analyzer().analyzer(), &mut warm, &cache_key)
+                .is_some();
+            assert_eq!(accepted, limit == 80);
+            assert_eq!(warm.refusal_count(), 0);
+            assert_eq!(
+                cache
+                    .call_transfers
+                    .lock()
+                    .unwrap()
+                    .contains_key(&cache_key),
+                accepted
+            );
+            let mut cold = SemanticBudget::uniform(limit).unwrap();
+            assert_eq!(cold.admit(scratch).is_ok(), accepted);
+        }
+    }
 
     #[cfg(test)]
     #[test]

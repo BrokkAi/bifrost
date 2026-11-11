@@ -659,7 +659,12 @@ fn cross_file_call_nested_rendering_cannot_retry_an_exhausted_source() {
         value.caller.node_range.is_none(),
         "nested caller rendering must use the negative cache rather than retrying"
     );
-    assert!(value.callee.node_range.is_some());
+    assert!(
+        value
+            .callee
+            .as_ref()
+            .is_some_and(|callee| callee.node_range.is_some())
+    );
     assert!(partial.result.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
     }));
@@ -668,26 +673,53 @@ fn cross_file_call_nested_rendering_cannot_retry_an_exhausted_source() {
 #[test]
 fn receiver_budget_projects_one_remaining_fact_cap_across_all_work() {
     let base = ReceiverAnalysisBudget::default();
+    let fact_axes = |budget: ReceiverAnalysisBudget| {
+        budget
+            .max_scope_nodes
+            .checked_add(budget.max_summary_expansions)
+            .and_then(|sum| sum.checked_add(budget.max_hierarchy_order_work))
+            .expect("fact axes do not overflow")
+    };
+    // Scope and summary are allocated first; hierarchy-order work gets the rest.
+    let full_axes =
+        base.max_scope_nodes + base.max_summary_expansions + base.max_hierarchy_order_work;
+    for facts in [0, 1, 100, full_axes - 1, full_axes] {
+        assert!(fact_axes(receiver_budget_for_remaining_work(base, facts, usize::MAX)) <= facts);
+    }
+
     let bounded = receiver_budget_for_remaining_work(base, 100, usize::MAX);
     assert_eq!(bounded.max_scope_nodes, 75);
     assert_eq!(bounded.max_summary_expansions, 25);
+    assert_eq!(bounded.max_hierarchy_order_work, 0);
+
+    let short = receiver_budget_for_remaining_work(base, full_axes - 1, usize::MAX);
+    assert_eq!(short.max_scope_nodes, base.max_scope_nodes);
+    assert_eq!(short.max_summary_expansions, base.max_summary_expansions);
     assert_eq!(
-        bounded
-            .max_scope_nodes
-            .saturating_add(bounded.max_summary_expansions),
-        100
+        short.max_hierarchy_order_work,
+        base.max_hierarchy_order_work - 1
     );
+    let full = receiver_budget_for_remaining_work(base, full_axes, usize::MAX);
+    assert_eq!(full, base);
 
     let tiny = receiver_budget_for_remaining_work(base, 1, 1);
-    assert!(
-        tiny.max_scope_nodes
-            .saturating_add(tiny.max_summary_expansions)
-            <= 1
-    );
     assert_eq!(tiny.max_targets, 1);
+    let empty = receiver_budget_for_remaining_work(base, 0, 0);
+    assert_eq!(fact_axes(empty), 0);
 
     let ample = receiver_budget_for_remaining_work(base, usize::MAX, usize::MAX);
     assert_eq!(ample, base);
+
+    // A custom base whose scope and summary overflow when added takes the
+    // partition branch instead of panicking, and still fits the budget.
+    let overflowing = ReceiverAnalysisBudget {
+        max_scope_nodes: usize::MAX,
+        max_summary_expansions: 1,
+        ..base
+    };
+    let bounded = receiver_budget_for_remaining_work(overflowing, usize::MAX, usize::MAX);
+    assert_eq!(fact_axes(bounded), usize::MAX);
+    assert_eq!(bounded.max_hierarchy_order_work, 0);
 }
 
 #[test]
@@ -1912,10 +1944,22 @@ fn every_enum_row_field_publishes_a_usable_value_domain() {
     for domain in ALL_DETAILED_CODE_QUERY_DOMAINS {
         for field in domain.row_fields() {
             let where_ = format!("{}.{}", domain.label(), field.name);
+            if let Some(CodeQueryEnumDomain::Undecided { labels, members }) = field.value_domain {
+                assert!(!members.is_empty(), "{where_} has no undecided members");
+                for member in members {
+                    assert!(
+                        labels.contains(member),
+                        "{where_} has undeclared sentinel {member}"
+                    );
+                }
+            }
             match (field.scalar_type, field.value_domain) {
                 (
                     CodeQueryRowScalarType::ConstrainedEnum,
-                    Some(CodeQueryEnumDomain::Labels(labels)),
+                    Some(
+                        CodeQueryEnumDomain::Labels(labels)
+                        | CodeQueryEnumDomain::Undecided { labels, .. },
+                    ),
                 ) => {
                     assert!(
                         !labels.is_empty(),
@@ -2350,4 +2394,59 @@ fn a_probe_refused_by_the_render_seal_leaves_that_file_its_own_coordinates() {
             "{path} row at byte {start_byte} rendered the fallback column"
         );
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10985: split prefetch lost receipts on partial refusal and subsequent ordinary cache hits"
+)]
+fn split_call_binding_refusal_leaves_earlier_files_uncached() {
+    use brokk_bifrost_analysis::analyzer::usages::call_relations::CallBindingCache;
+    let project = InlineTestProject::new()
+        .file("A.java", "class A { void f() { f(); } }")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("A.java");
+    let absent = project.file("Z.cpp");
+    let range = Range {
+        start_byte: 21,
+        end_byte: 22,
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut cache = CallBindingCache::default();
+    assert!(
+        cache
+            .prefetch_selected_call_targets_with_receipts(
+                &workspace,
+                [(file.clone(), range), (absent, range)],
+                None,
+            )
+            .is_none()
+    );
+    // The first file was resolved before the later file refused. It must be
+    // resolvable again, with both receipts returned to this caller.
+    let (setup, union) = cache
+        .prefetch_selected_call_targets_with_receipts(&workspace, [(file.clone(), range)], None)
+        .expect("retry returns split receipts");
+    use brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt;
+    let (_, expected) = QueryReadReceipt::capture(workspace.analyzer(), || {
+        setup.replay(workspace.analyzer());
+        union.replay(workspace.analyzer());
+    });
+    let (cached, actual) = QueryReadReceipt::capture(workspace.analyzer(), || {
+        cache.resolved_call_target(workspace.analyzer(), &file, range, None)
+    });
+    assert!(cached.is_some());
+    assert_eq!(
+        actual.digest(),
+        expected.digest(),
+        "cache hit must replay resolver dependencies"
+    );
+    assert_eq!(actual.incomplete_reasons(), expected.incomplete_reasons());
+    assert!(
+        cache
+            .prefetch_selected_call_targets_with_receipts(&workspace, [(file, range)], None,)
+            .is_none()
+    );
 }

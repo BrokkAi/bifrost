@@ -65,7 +65,7 @@ pub(in crate::analyzer::js_ts::semantic) fn lower_procedure<'tree, 'targets>(
         array_element_fields: HashMap::default(),
         namespace_import_locations: HashMap::default(),
     };
-    context.emit_procedure_inputs(&mut builder, spec)?;
+    context.emit_procedure_inputs(&mut builder, entry, spec)?;
     context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, entry, spec.body)?;
     context.emit_nested_rebind_gaps(&mut builder, entry, spec.body)?;
@@ -1733,12 +1733,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     entry
                 };
-                self.add_gap(
+                // Normal resumption retains the original continuation kind;
+                // abrupt and absent resumption remain open through gaps.
+                self.session.add_partial_generator_normal_continuation(
                     builder,
                     terminal,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::GeneratorSuspension,
-                    SemanticGapKind::Unsupported,
+                    next,
                     "yield suspension and resumption are not yet lowered",
                 )?;
                 // An abrupt resumption throws or returns at the yield. With
@@ -1759,10 +1759,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     discharge,
                     "abrupt generator resumption (throw or return) at a yield is not lowered",
                 )?;
-                // A normal resumption continues after the yield. The gap keeps
-                // abrupt resumption (`throw` and `return`) and non-resumption
-                // open.
-                self.edge(builder, terminal, next)?;
                 let argument = node
                     .child_by_field_name("argument")
                     .or_else(|| first_named_child(node));
@@ -3231,14 +3227,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
         self.edge(builder, normal, next)?;
-        self.abrupt(
-            builder,
-            exceptional,
-            scope,
-            CompletionKind::Throw,
-            None,
-            stack,
-        )?;
+        // The call's thrown value binds a catch parameter that handles it,
+        // like a local `throw`, so a value the callee throws reaches the
+        // catch body (#7960).
+        self.abrupt_throw(builder, exceptional, scope, thrown, stack)?;
         // A program-level callee name with competing direct imports or a
         // program-scope reassignment has more than one plausible target, so
         // the dispatch gap is ambiguous and stays undischargeable.

@@ -162,6 +162,16 @@ pub struct WrapperPayloadProjection {
 }
 
 pub trait StoreLanguageSupport: Send + Sync {
+    /// Select the persisted site that owns an expression result slot.
+    fn uses_point_expression_value_slot(&self) -> bool {
+        false
+    }
+
+    /// A call result shares its persisted reference site with the callee.
+    fn call_result_requires_query_marker(&self) -> bool {
+        false
+    }
+
     /// Install a language-owned provider on native point operations.
     fn demand_installer(&self) -> Option<super::resolution_operation::NativeDemandInstaller> {
         None
@@ -199,6 +209,11 @@ pub trait StoreLanguageSupport: Send + Sync {
     /// Whether the shared native type projector should publish direct
     /// constructor shapes for this language's selected type components.
     fn supports_direct_type_shapes(&self) -> bool {
+        false
+    }
+
+    /// Java preserves a written exact type across selected value links.
+    fn supports_exact_type_argument_links(&self) -> bool {
         false
     }
 
@@ -325,25 +340,33 @@ pub trait StoreLanguageSupport: Send + Sync {
 
     /// Bounded language-owned inputs for an implicit hierarchy edge.
     /// The default performs no reads.
+    #[allow(clippy::too_many_arguments)]
     fn selected_implicit_base_inputs(
         &self,
         _selection: &crate::analyzer::store::resolution_selection::SelectedResolutionMountInventory<
             '_,
         >,
+        _identities: &crate::analyzer::resolution::SelectedContextIdentities,
         _environment: i64,
         _declared_version: Option<(u16, u16)>,
         _owner: crate::analyzer::resolution::SemanticId,
         _cancellation: &crate::CancellationToken,
+        _mutations: &crate::analyzer::store::resolution_operation::PythonMutationQuery<'_, '_>,
     ) -> crate::analyzer::store::Result<Option<crate::analyzer::resolution::ImplicitBaseInputs>>
     {
         Ok(None)
     }
 
     /// Prepare bounded static dependency evidence from already selected snapshots.
+    /// The third field records configuration presence (None is an unvalidated legacy row).
     fn selected_dependency_file_evidence(
         &self,
         _root: &std::path::Path,
-        _selected: &[(ProjectFile, crate::analyzer::ProjectSourceSnapshot)],
+        _selected: &[(
+            ProjectFile,
+            crate::analyzer::ProjectSourceSnapshot,
+            Option<bool>,
+        )],
         _limits: &crate::analyzer::semantic_model::DependencyFileEvidenceLimits,
     ) -> crate::analyzer::semantic_model::DependencyFileEvidence {
         crate::analyzer::semantic_model::DependencyFileEvidence::default()
@@ -449,10 +472,21 @@ pub trait StoreLanguageSupport: Send + Sync {
                     Constructor::Array
                     | Constructor::Slice
                     | Constructor::Sequence
-                    | Constructor::Channel,
+                    | Constructor::Channel
+                    | Constructor::ChannelBoth
+                    | Constructor::ChannelSend
+                    | Constructor::ChannelReceive,
                 ),
             )
-            | (Transfer::ComponentKey, Some(Constructor::Channel)) => Component::Element,
+            | (
+                Transfer::ComponentKey,
+                Some(
+                    Constructor::Channel
+                    | Constructor::ChannelBoth
+                    | Constructor::ChannelSend
+                    | Constructor::ChannelReceive,
+                ),
+            ) => Component::Element,
             (Transfer::ComponentElement | Transfer::ComponentKey | Transfer::ComponentValue, _) => {
                 transfer.component_kind().expect("component transfer")
             }
@@ -599,6 +633,79 @@ pub mod neutral_fixture {
     }
 
     #[cfg(test)]
+    struct KotlinImplicitFixtureAdapter;
+    #[cfg(test)]
+    impl crate::analyzer::resolution::CallApplicabilityAdapter for KotlinImplicitFixtureAdapter {
+        fn map_arguments(
+            &self,
+            call: &crate::analyzer::resolution::typed_fact_lowering::LoweredCallApplicabilityObligation,
+            signature: &crate::analyzer::resolution::typed_fact_lowering::LoweredCallableSignatureProperty,
+        ) -> crate::analyzer::resolution::fact_resolution::call_applicability::MappingAssessment
+        {
+            crate::analyzer::resolution::CallApplicabilityAdapter::map_arguments(
+                &NeutralFakeCallApplicabilityAdapter,
+                call,
+                signature,
+            )
+        }
+
+        fn implicit_receiver_lookup(
+            &self,
+        ) -> Option<crate::analyzer::resolution::fact_resolution::call_applicability::ImplicitReceiverLookup>{
+            use crate::analyzer::resolution::fact_resolution::call_applicability::ImplicitReceiverLookup;
+            Some(ImplicitReceiverLookup::FirstApplicable)
+        }
+
+        fn implicit_receiver_value_lookup(&self) -> bool {
+            true
+        }
+
+        fn implicit_receiver_scope_kind(
+            &self,
+            kind: brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind,
+        ) -> Option<crate::analyzer::resolution::fact_resolution::call_applicability::ImplicitReceiverScopeKind>{
+            use crate::analyzer::resolution::fact_resolution::call_applicability::ImplicitReceiverScopeKind;
+            match kind {
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind::TypeBody => {
+                    Some(ImplicitReceiverScopeKind::Dispatch)
+                }
+                brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeKind::Executable => {
+                    Some(ImplicitReceiverScopeKind::Extension)
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    struct KotlinImplicitFixtureSupport;
+    #[cfg(test)]
+    impl StoreLanguageSupport for KotlinImplicitFixtureSupport {
+        fn precedence_rules(
+            &self,
+        ) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
+            crate::analyzer::resolution::precedence::KOTLIN_PRECEDENCE_RULES
+        }
+
+        fn call_applicability_adapter(
+            &self,
+        ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+            Some(&KotlinImplicitFixtureAdapter)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kotlin_implicit_rules_fixture() -> NeutralRulesFixture {
+        let fixture = neutral_rules_fixture(&[Language::Kotlin]);
+        static SUPPORT: KotlinImplicitFixtureSupport = KotlinImplicitFixtureSupport;
+        OVERLAYS.with(|overlays| {
+            overlays.borrow_mut().last_mut().unwrap()[language_index(Language::Kotlin).unwrap()] =
+                Some(&SUPPORT);
+        });
+        fixture
+    }
+
+    #[cfg(test)]
     struct DischargingCallApplicabilityAdapter;
     #[cfg(test)]
     impl crate::analyzer::resolution::CallApplicabilityAdapter for DischargingCallApplicabilityAdapter {
@@ -641,6 +748,43 @@ pub mod neutral_fixture {
     pub(crate) fn discharging_java_rules_fixture() -> NeutralRulesFixture {
         let fixture = neutral_rules_fixture(&[Language::Java]);
         static SUPPORT: DischargingJavaFixtureSupport = DischargingJavaFixtureSupport;
+        OVERLAYS.with(|overlays| {
+            overlays.borrow_mut().last_mut().unwrap()[language_index(Language::Java).unwrap()] =
+                Some(&SUPPORT);
+        });
+        fixture
+    }
+
+    #[cfg(test)]
+    struct ExactTypeLinksJavaFixtureSupport;
+    #[cfg(test)]
+    impl StoreLanguageSupport for ExactTypeLinksJavaFixtureSupport {
+        fn precedence_rules(
+            &self,
+        ) -> &'static dyn crate::analyzer::resolution::precedence::PrecedenceRules {
+            crate::analyzer::resolution::precedence::JAVA_PRECEDENCE_RULES
+        }
+
+        fn call_applicability_adapter(
+            &self,
+        ) -> Option<&'static dyn crate::analyzer::resolution::CallApplicabilityAdapter> {
+            Some(&NeutralFakeCallApplicabilityAdapter)
+        }
+
+        fn supports_direct_type_shapes(&self) -> bool {
+            true
+        }
+
+        fn supports_exact_type_argument_links(&self) -> bool {
+            true
+        }
+    }
+
+    /// Java rules plus the two hooks the Java analyzer enables for projected shapes.
+    #[cfg(test)]
+    pub(crate) fn exact_type_links_java_rules_fixture() -> NeutralRulesFixture {
+        let fixture = neutral_rules_fixture(&[Language::Java]);
+        static SUPPORT: ExactTypeLinksJavaFixtureSupport = ExactTypeLinksJavaFixtureSupport;
         OVERLAYS.with(|overlays| {
             overlays.borrow_mut().last_mut().unwrap()[language_index(Language::Java).unwrap()] =
                 Some(&SUPPORT);
@@ -725,3 +869,6 @@ pub mod neutral_fixture {
         })
     }
 }
+
+/// Shared bound for explicit receiver adjustment selection, including models.
+pub const MAX_EXPLICIT_RECEIVER_STEPS: usize = 8;

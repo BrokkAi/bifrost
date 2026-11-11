@@ -18,10 +18,11 @@ use super::budget::PolicyBudget;
 use super::definition::{PolicyAnalysisType, PolicyId, PolicyReportOptions};
 use super::finding::{
     BoundedWitness, FindingCertainty, FindingCompleteness, FindingIncompleteReason,
-    PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
-    PolicyFailureReason, PolicyIncompleteReason, PolicyLocationRelationship, PolicyRunCompletion,
-    PolicySourceLocation, PolicyWorkReport, ProofMetadata, ProofState, RelatedPolicyLocation,
-    insert_policy_diagnostic_bounded, normalize_policy_diagnostics_bounded,
+    MAX_MODEL_ATTRIBUTION_CONTRIBUTORS, ModelAttribution, PolicyDiagnostic, PolicyDiagnosticCode,
+    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
+    PolicyLocationRelationship, PolicyRunCompletion, PolicySourceLocation, PolicyWorkReport,
+    ProofMetadata, ProofState, RelatedPolicyLocation, insert_policy_diagnostic_bounded,
+    normalize_policy_diagnostics_bounded,
 };
 use super::finding_identity::{
     AnalysisEventRef, AnalysisFindingId, AnalysisSubjectRef, EvidenceRef, FindingIdentityStability,
@@ -263,6 +264,7 @@ impl<'a> TypestateProjectionAuthority<'a> {
             diagnostics,
             diagnostics_truncated,
             work,
+            subjects,
         } = payload;
         TypestateProjectionBatch {
             seal: self.seal.clone(),
@@ -271,6 +273,7 @@ impl<'a> TypestateProjectionAuthority<'a> {
             diagnostics,
             diagnostics_truncated,
             work,
+            subjects,
         }
     }
 }
@@ -355,6 +358,7 @@ pub(crate) struct TaintPairProjection {
     pub(crate) origins_truncated: bool,
     pub(crate) witness_refs: Vec<WitnessId>,
     pub(crate) witness_refs_truncated: bool,
+    pub(crate) model_attribution: Option<ModelAttribution>,
     pub(crate) report: ProjectedFindingReport,
 }
 
@@ -381,6 +385,8 @@ pub(crate) struct TypestateProjectedFinding {
     pub(crate) subject: AnalysisSubjectRef,
     pub(crate) witness_refs: Vec<WitnessId>,
     pub(crate) witness_refs_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_attribution: Option<ModelAttribution>,
     pub(crate) report: ProjectedFindingReport,
 }
 
@@ -481,6 +487,7 @@ const TYPESTATE_PROJECTION_FIELDS: &[&str] = &[
     "subject",
     "witness_refs",
     "witness_refs_truncated",
+    "model_attribution",
     "report",
 ];
 
@@ -529,6 +536,7 @@ impl<'de> de::Visitor<'de> for TypestateProjectedFindingVisitor<'_> {
         let mut subject: Option<AnalysisSubjectRef> = None;
         let mut witness_refs: Option<Vec<WitnessId>> = None;
         let mut witness_refs_truncated: Option<bool> = None;
+        let mut model_attribution: Option<Option<ModelAttribution>> = None;
         let mut report: Option<ProjectedFindingReport> = None;
         while let Some(field) = map.next_key::<String>()? {
             let duplicate = match field.as_str() {
@@ -542,6 +550,7 @@ impl<'de> de::Visitor<'de> for TypestateProjectedFindingVisitor<'_> {
                 "witness_refs_truncated" => {
                     witness_refs_truncated.replace(map.next_value()?).is_some()
                 }
+                "model_attribution" => model_attribution.replace(map.next_value()?).is_some(),
                 "report" => report.replace(map.next_value()?).is_some(),
                 other => {
                     return Err(de::Error::unknown_field(other, TYPESTATE_PROJECTION_FIELDS));
@@ -564,6 +573,15 @@ impl<'de> de::Visitor<'de> for TypestateProjectedFindingVisitor<'_> {
             witness_refs: witness_refs.ok_or_else(|| de::Error::missing_field("witness_refs"))?,
             witness_refs_truncated: witness_refs_truncated
                 .ok_or_else(|| de::Error::missing_field("witness_refs_truncated"))?,
+            model_attribution: model_attribution
+                .unwrap_or_default()
+                .map(|attribution| {
+                    attribution
+                        .validate()
+                        .map_err(de::Error::custom)
+                        .map(|_| attribution)
+                })
+                .transpose()?,
             report: report.ok_or_else(|| de::Error::missing_field("report"))?,
         })
     }
@@ -593,6 +611,10 @@ pub(crate) struct TypestateProjectionPayload {
     pub(crate) diagnostics: Vec<PolicyDiagnostic>,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
+    /// Per-site subject verdicts, present only when the compile succeeded.
+    /// Their finding references are final ids; the evaluator drops those it
+    /// does not retain.
+    pub(crate) subjects: Option<crate::finding::PolicySubjectVerdicts>,
 }
 
 /// Raw adapter output for one taint evaluation.
@@ -620,6 +642,7 @@ pub(crate) struct TypestateProjectionBatch {
     diagnostics: Vec<PolicyDiagnostic>,
     diagnostics_truncated: bool,
     work: PolicyWorkReport,
+    subjects: Option<crate::finding::PolicySubjectVerdicts>,
 }
 
 pub(crate) struct ValidatedTaintProjectionBatch {
@@ -637,6 +660,7 @@ pub(crate) struct ValidatedTypestateProjectionBatch {
     pub(crate) diagnostics: Vec<PolicyDiagnostic>,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
+    pub(crate) subjects: Option<crate::finding::PolicySubjectVerdicts>,
 }
 
 #[derive(Debug)]
@@ -649,6 +673,7 @@ pub(crate) struct ValidatedTaintPairProjection {
     pub(crate) origins_truncated: bool,
     pub(crate) witness_refs: Vec<WitnessId>,
     pub(crate) witness_refs_truncated: bool,
+    pub(crate) model_attribution: Option<ModelAttribution>,
     pub(crate) report: ProjectedFindingReport,
 }
 
@@ -660,6 +685,7 @@ pub(crate) struct ValidatedTypestateProjection {
     pub(crate) subject: AnalysisSubjectRef,
     pub(crate) witness_refs: Vec<WitnessId>,
     pub(crate) witness_refs_truncated: bool,
+    pub(crate) model_attribution: Option<ModelAttribution>,
     pub(crate) report: ProjectedFindingReport,
 }
 
@@ -927,6 +953,7 @@ pub(crate) fn validate_typestate_batch(
         diagnostics,
         diagnostics_truncated,
         work,
+        subjects: batch.subjects,
     })
 }
 
@@ -1020,7 +1047,7 @@ fn reject_duplicate_typestate_envelopes(
     let mut retained = Vec::with_capacity(projections.len());
     let mut conflicts = Vec::new();
     let mut projections = projections.into_iter().peekable();
-    while let Some(projection) = projections.next() {
+    while let Some(mut projection) = projections.next() {
         let key = typestate_envelope_sort_key(authority, &projection);
         let mut has_conflicting_payload = false;
         while projections
@@ -1032,6 +1059,17 @@ fn reject_duplicate_typestate_envelopes(
                 .expect("peeked typestate duplicate projection exists");
             has_conflicting_payload |=
                 typestate_envelopes_have_conflicting_semantics(&projection, &duplicate);
+            projection.model_attribution = match (
+                projection.model_attribution.take(),
+                duplicate.model_attribution,
+            ) {
+                (Some(left), Some(right)) => {
+                    Some(left.merge(&right, MAX_MODEL_ATTRIBUTION_CONTRIBUTORS))
+                }
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            };
         }
         if has_conflicting_payload {
             conflicts
@@ -1369,6 +1407,15 @@ fn validate_taint_pair(
         &pair.report,
         report_limits,
     )?;
+    if pair
+        .model_attribution
+        .as_ref()
+        .is_some_and(|attribution| attribution.validate().is_err())
+    {
+        return Err(ProjectionAuthorityError::FindingEnvelopeMismatch {
+            field: "model_attribution",
+        });
+    }
     let mut required_reasons = Vec::new();
     if pair.anchor.stability() == FindingIdentityStability::Weak {
         required_reasons.push(FindingIncompleteReason::StableAnchorWeak);
@@ -1389,6 +1436,7 @@ fn validate_taint_pair(
         origins_truncated: pair.origins_truncated,
         witness_refs: pair.witness_refs,
         witness_refs_truncated: pair.witness_refs_truncated,
+        model_attribution: pair.model_attribution,
         report: pair.report,
     })
 }
@@ -1439,6 +1487,15 @@ fn validate_typestate_projection(
         &projection.report,
         report_limits,
     )?;
+    if projection
+        .model_attribution
+        .as_ref()
+        .is_some_and(|attribution| attribution.validate().is_err())
+    {
+        return Err(ProjectionAuthorityError::FindingEnvelopeMismatch {
+            field: "model_attribution",
+        });
+    }
     let mut required_reasons = Vec::new();
     if projection.anchor.stability() == FindingIdentityStability::Weak {
         required_reasons.push(FindingIncompleteReason::StableAnchorWeak);
@@ -1455,6 +1512,7 @@ fn validate_typestate_projection(
         subject: projection.subject,
         witness_refs: projection.witness_refs,
         witness_refs_truncated: projection.witness_refs_truncated,
+        model_attribution: projection.model_attribution,
         report: projection.report,
     })
 }
@@ -2340,7 +2398,12 @@ mod tests {
         let sink_identity = StableSemanticIdentity::analyzer_declaration_id(
             "test",
             WorkspaceRelativePath::new("src/test.rs").unwrap(),
-            format!("decl:v1:{:x}", sha2::Sha256::digest(sink_key.as_bytes())),
+            format!(
+                "decl:v1:{}",
+                brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                    &sha2::Sha256::digest(sink_key.as_bytes()).into()
+                )
+            ),
         )
         .unwrap();
         let anchor = TaintFindingAnchor::strong(
@@ -2378,6 +2441,7 @@ mod tests {
             origins_truncated: false,
             witness_refs: Vec::new(),
             witness_refs_truncated: false,
+            model_attribution: None,
             report: crate::test_support::projected_finding_report(
                 crate::test_support::policy_test_location("src/test.rs", 0, 1, 1),
                 ProofReason::DataflowWitness,
@@ -2854,6 +2918,7 @@ mod tests {
             subject: AnalysisSubjectRef::try_new("test", "resource-instance").unwrap(),
             witness_refs: Vec::new(),
             witness_refs_truncated: false,
+            model_attribution: None,
             report: crate::test_support::projected_finding_report(
                 crate::test_support::policy_test_location("src/test.rs", 0, 1, 1),
                 ProofReason::DataflowWitness,
@@ -2900,6 +2965,31 @@ mod tests {
         assert_eq!(serde_json::to_string(&read).unwrap(), stored);
         assert_eq!(read.anchor, projection.anchor);
         assert_eq!(read.facts, projection.facts);
+
+        let mut attributed = projection.clone();
+        attributed.model_attribution = Some(crate::finding::ModelAttribution::from_full(
+            vec![crate::finding::ModelAttributionContributor {
+                role: crate::finding::ModelAttributionRole::Declaration,
+                pack_digest: "a".repeat(64),
+                record_id: "rust:decl:one".to_owned(),
+                built_from: "0.8.1".to_owned(),
+                resolved: "0.8.2".to_owned(),
+                direction: "older_artifact".to_owned(),
+                mismatch_kinds: vec!["version_nearby".to_owned()],
+                selection_rule_id: "cargo-compatible-nearest".to_owned(),
+                selection_rule_version: 1,
+            }],
+            8,
+        ));
+        let attributed_bytes = serde_json::to_string(&attributed).unwrap();
+        let mut attributed_decoder = serde_json::Deserializer::from_str(&attributed_bytes);
+        let replayed = serde::de::DeserializeSeed::deserialize(
+            TypestateProjectedFindingSeed::new(&budget),
+            &mut attributed_decoder,
+        )
+        .expect("a root unit replays attribution");
+        assert_eq!(replayed.model_attribution, attributed.model_attribution);
+        assert_eq!(serde_json::to_string(&replayed).unwrap(), attributed_bytes);
 
         // The scenario-set hash is derived from the scenario ids, so a stored
         // pair that disagrees is a load error rather than a fact set that
@@ -3019,6 +3109,7 @@ mod tests {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
+            subjects: None,
         });
 
         let validated =
@@ -3028,6 +3119,62 @@ mod tests {
         assert_eq!(validated.work.omitted_findings_lower_bound(), 0);
         assert_eq!(validated.completion, PolicyRunCompletion::Complete);
         assert!(validated.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn duplicate_typestate_envelopes_union_approximate_contributors() {
+        let registry = registry(&[(
+            "test:typestate",
+            crate::test_support::typestate_policy_source(
+                "test.typestate-authority",
+                "Typestate authority",
+            ),
+        )]);
+        let policy = registry.policies().next().unwrap();
+        let authority = TypestateProjectionAuthority::from_loaded_compilation(
+            policy,
+            TypestateProtocolHash::from_canonical_bytes(b"protocol"),
+            TypestateBindingPlanHash::from_canonical_bytes(b"bindings"),
+        )
+        .unwrap();
+        let make = |record_id: &str| {
+            let mut projection = typestate_projected_finding(&authority);
+            projection.model_attribution = Some(crate::finding::ModelAttribution::from_full(
+                vec![crate::finding::ModelAttributionContributor {
+                    role: crate::finding::ModelAttributionRole::Declaration,
+                    pack_digest: "a".repeat(64),
+                    record_id: record_id.to_owned(),
+                    built_from: "0.8.1".to_owned(),
+                    resolved: "0.8.2".to_owned(),
+                    direction: "older_artifact".to_owned(),
+                    mismatch_kinds: vec!["version_nearby".to_owned()],
+                    selection_rule_id: "cargo-compatible-nearest".to_owned(),
+                    selection_rule_version: 1,
+                }],
+                MAX_MODEL_ATTRIBUTION_CONTRIBUTORS,
+            ));
+            projection
+        };
+        let batch = authority.seal_batch(TypestateProjectionPayload {
+            projections: vec![make("second"), make("first")],
+            completion: PolicyRunCompletion::Complete,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
+            work: PolicyWorkReport::default(),
+            subjects: None,
+        });
+        let validated = validate_typestate_batch(&authority, batch, &PolicyBudget::default())
+            .expect("attribution does not conflict with finding identity");
+        assert_eq!(validated.projections.len(), 1);
+        let ids = validated.projections[0]
+            .model_attribution
+            .as_ref()
+            .unwrap()
+            .contributors
+            .iter()
+            .map(|contributor| contributor.record_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["first", "second"]);
     }
 
     #[test]
@@ -3056,6 +3203,7 @@ mod tests {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
+            subjects: None,
         });
 
         let validated =

@@ -185,6 +185,7 @@ impl TypestateQueryState {
                     &[],
                     &provider,
                     &provider,
+                    Some(workspace),
                     ProductionTypestateExecutionContext::Workspace,
                     &protocol,
                     &bindings,

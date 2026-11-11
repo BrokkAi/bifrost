@@ -23,7 +23,13 @@ pub(crate) fn occurrence_text<'source>(
 
 #[cfg(test)]
 pub(crate) fn parse_rust(source: &str) -> Tree {
-    crate::lexical_scope::parse_rust_tree(source).expect("Rust tree")
+    crate::lexical_scope::parse_rust_tree_with(
+        &crate::lexical_scope::RustLexicalCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+        ),
+        source,
+    )
+    .expect("Rust tree")
 }
 
 #[cfg(test)]
@@ -38,7 +44,14 @@ pub(crate) fn parse_rust_fixture(
     let temp = tempfile::tempdir().expect("temporary workspace");
     let root = temp.path().canonicalize().expect("canonical root");
     let file = brokk_bifrost_core::analyzer::ProjectFile::new(root, "src/lib.rs");
-    crate::declarations::parse_rust_file(&file, source, &tree)
+    crate::declarations::parse_rust_file_with(
+        &crate::crate_naming::RustCrateNamingCaches::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+        ),
+        &file,
+        source,
+        &tree,
+    )
 }
 
 // Shared grammar-boundary fixture. Escapes keep this file ASCII; all table

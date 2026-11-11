@@ -6,7 +6,7 @@ use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::semantic::statement_entries::ProcedureSyntax;
 use crate::analyzer::semantic::{
     ProcedureHandle, ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticEffect,
-    SemanticValueKind, SourceMappingKind, ValueId,
+    SemanticValueKind, SourceMappingId, SourceMappingKind, ValueId,
 };
 use crate::analyzer::{Language, Range, WorkspaceAnalyzer};
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -71,6 +71,187 @@ pub struct OverwrittenLocalCandidate {
 pub enum OverwrittenLocalSourceKind {
     DeclarationInitializer,
     PlainAssignment,
+}
+
+/// Exact macro invocation sources and the subset that cannot read each
+/// binding through opaque tokens or a definition-site expansion. Syntax,
+/// source mappings, and macro definitions are examined once per procedure.
+pub fn rust_dead_write_macro_sources_by_binding(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    bindings: &[ValueId],
+    cancellation: Option<&CancellationToken>,
+) -> HashMap<ValueId, (Vec<SourceMappingId>, Vec<SourceMappingId>)> {
+    let mut result = HashMap::new();
+    let Ok(prepared) = ProcedureSyntax::prepare(workspace, procedure, cancellation) else {
+        return result;
+    };
+    let Ok(procedure_node) = prepared.procedure_node(procedure) else {
+        return result;
+    };
+    let semantics = procedure.semantics();
+    let source = prepared.syntax.source();
+    let root = prepared.syntax.tree().root_node();
+    let binding_names = bindings
+        .iter()
+        .filter_map(|&binding| {
+            let mapping = semantics
+                .value(binding)
+                .and_then(|value| semantics.source_mapping(value.source))?;
+            let span = mapping.locator.anchor().span();
+            let node = root.named_descendant_for_byte_range(
+                span.start_byte() as usize,
+                span.end_byte() as usize,
+            )?;
+            if node.kind() != "identifier" {
+                return None;
+            }
+            let name = node.utf8_text(source.as_bytes()).ok()?;
+            Some((binding, name.strip_prefix("r#").unwrap_or(name).to_owned()))
+        })
+        .collect::<HashMap<_, _>>();
+    if binding_names.is_empty() {
+        return result;
+    }
+    let mut mappings_by_span: HashMap<(usize, usize), Vec<SourceMappingId>> = HashMap::new();
+    for mapping in semantics.source_mappings() {
+        let span = mapping.locator.anchor().span();
+        mappings_by_span
+            .entry((span.start_byte() as usize, span.end_byte() as usize))
+            .or_default()
+            .push(mapping.id);
+    }
+    let (empty_definition_by_name, definition_candidates) =
+        rust_empty_macro_definitions(root, source);
+    let exported_definitions =
+        brokk_bifrost_rust::macro_matcher::ExportedMacroDefinitions::from_candidates(
+            definition_candidates,
+            source,
+        );
+    let mut stack = vec![procedure_node];
+    while let Some(node) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return HashMap::new();
+        }
+        if node.id() != procedure_node.id() && (prepared.roles.nested_procedure)(node) {
+            continue;
+        }
+        if node.kind() == "macro_invocation" {
+            let sources = mappings_by_span
+                .get(&(node.start_byte(), node.end_byte()))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !sources.is_empty() {
+                // The resolver reuses the indexed exported definitions. It
+                // still scans sibling items in each enclosing lexical scope
+                // once per invocation to preserve textual shadowing order.
+                let resolved = matches!(
+                    brokk_bifrost_rust::macro_matcher::match_local_macro_invocation_with_definitions(
+                        node, source, &exported_definitions, node,
+                    ),
+                    Some(Ok(_))
+                );
+                let tokens =
+                    brokk_bifrost_rust::declarations::rust_macro_invocation_arguments(node);
+                let mentioned = tokens.map(|tokens| rust_token_tree_identifiers(tokens, source));
+                let empty_definition = resolved
+                    && mentioned.is_some()
+                    && brokk_bifrost_rust::declarations::rust_unqualified_macro_invocation_name(
+                        node, source,
+                    )
+                    .and_then(|name| empty_definition_by_name.get(name))
+                    .copied()
+                    .unwrap_or(false);
+                for (&binding, name) in &binding_names {
+                    let entry = result
+                        .entry(binding)
+                        .or_insert_with(|| (Vec::new(), Vec::new()));
+                    entry.0.extend_from_slice(sources);
+                    if empty_definition
+                        && mentioned
+                            .as_ref()
+                            .is_some_and(|tokens| !tokens.contains(name))
+                    {
+                        entry.1.extend_from_slice(sources);
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    for (all_sources, safe_sources) in result.values_mut() {
+        all_sources.sort_unstable();
+        all_sources.dedup();
+        safe_sources.sort_unstable();
+        safe_sources.dedup();
+    }
+    result
+}
+
+/// Compatibility wrapper for a single binding.
+pub fn rust_dead_write_macro_sources_without_read(
+    workspace: &WorkspaceAnalyzer,
+    procedure: &ProcedureHandle,
+    binding: ValueId,
+    cancellation: Option<&CancellationToken>,
+) -> (Vec<SourceMappingId>, Vec<SourceMappingId>) {
+    rust_dead_write_macro_sources_by_binding(workspace, procedure, &[binding], cancellation)
+        .remove(&binding)
+        .unwrap_or_default()
+}
+
+fn rust_empty_macro_definitions<'tree>(
+    root: Node<'tree>,
+    source: &str,
+) -> (HashMap<String, bool>, Vec<Node<'tree>>) {
+    let mut empty_by_name = HashMap::new();
+    let mut definitions = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "macro_definition" {
+            definitions.push(node);
+        }
+        if node.kind() == "macro_definition"
+            && let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name_node| name_node.utf8_text(source.as_bytes()).ok())
+        {
+            let mut cursor = node.walk();
+            let mut rules = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "macro_rule")
+                .peekable();
+            let empty = rules.peek().is_some()
+                && rules.all(|rule| {
+                    rule.child_by_field_name("right")
+                        .and_then(brokk_bifrost_rust::declarations::rust_macro_token_tree_interior)
+                        .is_some_and(|interior| interior.start_byte == interior.end_byte)
+                });
+            empty_by_name
+                .entry(name.to_owned())
+                .and_modify(|all_empty| *all_empty &= empty)
+                .or_insert(empty);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    (empty_by_name, definitions)
+}
+
+fn rust_token_tree_identifiers(tokens: Node<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut stack = vec![tokens];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && let Ok(token) = node.utf8_text(source.as_bytes())
+        {
+            names.insert(token.strip_prefix("r#").unwrap_or(token).to_owned());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    names
 }
 
 #[derive(Debug, Clone)]

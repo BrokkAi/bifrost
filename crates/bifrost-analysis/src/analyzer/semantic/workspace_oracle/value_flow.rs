@@ -2,7 +2,8 @@
 //!
 //! The implementation projects validated semantic IR rows into neutral oracle
 //! relations. Java argument conversions delegate to the shared resolver-owned
-//! producer through `conversions.rs`; no type interpretation lives here.
+//! producer through `conversions.rs`. Go conversions use retained IR classes
+//! through the language hook; call-result classes come from recorded dispatch.
 //! The remaining projection never reparses source or matches declarations by text,
 //! except for one narrow, explicitly named discharge predicate
 //! ([`super::external_constant_field_read_discharges_gap`], #2538) composed
@@ -51,6 +52,7 @@ use crate::analyzer::semantic::CallerReceiverBinding;
 use crate::analyzer::semantic::CandidateCoverage;
 use crate::analyzer::semantic::CaptureSource;
 use crate::analyzer::semantic::DispatchCandidate;
+use crate::analyzer::semantic::DispatchOracle;
 use crate::analyzer::semantic::EvidenceCompleteness;
 use crate::analyzer::semantic::FormalMultiplicity;
 use crate::analyzer::semantic::HeapOracle;
@@ -115,7 +117,8 @@ impl WorkspaceSemanticOracle<'_> {
     /// That association is what lets a consumer keep the escaped environment
     /// connected to the callee's writes without re-deriving the callable's
     /// provenance from syntax.
-    pub(crate) fn returned_callable_target(
+    #[doc(hidden)]
+    pub fn returned_callable_target(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
         candidate: &DispatchCandidate,
@@ -299,7 +302,8 @@ impl WorkspaceSemanticOracle<'_> {
 
     /// Resolve one local callable from a value through unique local
     /// definitions, then validate its exact capture association.
-    pub(crate) fn local_callable_target(
+    #[doc(hidden)]
+    pub fn local_callable_target(
         &self,
         procedure: &ProcedureHandle,
         value: ValueId,
@@ -341,6 +345,7 @@ impl WorkspaceSemanticOracle<'_> {
             let mut definition: Option<ValueId> = None;
             let mut created: Option<ProcedureHandle> = None;
             let mut created_value: Option<ValueId> = None;
+            let mut created_event: Option<(ProgramPointId, usize)> = None;
             for point in semantics.points() {
                 if request.cancellation.is_cancelled() {
                     return Ok(returned_callable_interruption(
@@ -354,7 +359,7 @@ impl WorkspaceSemanticOracle<'_> {
                     nested_entries: point.events.len(),
                     ..SemanticWork::default()
                 });
-                for event in point.events.iter() {
+                for (event_index, event) in point.events.iter().enumerate() {
                     match &event.effect {
                         SemanticEffect::Assignment {
                             target,
@@ -403,6 +408,7 @@ impl WorkspaceSemanticOracle<'_> {
                             }
                             created = Some(closure_procedure);
                             created_value = Some(*creation);
+                            created_event = Some((point.id, event_index));
                         }
                         SemanticEffect::Assignment {
                             target,
@@ -534,12 +540,16 @@ impl WorkspaceSemanticOracle<'_> {
                 }
                 let creation = value_handle(procedure, creation)?;
                 captures.sort_unstable();
-                capture_bindings.sort_unstable_by_key(|row| row.destination);
+                capture_bindings.sort_unstable_by_key(|row| (row.destination, row.id));
+                let (creation_point, creation_event_index) =
+                    created_event.expect("a retained callable records its creation event");
                 *request.budget = staged.budget;
                 return Ok(SemanticOutcome::Complete {
                     value: Some(LocalCallableTarget {
                         closure: closure_procedure,
                         creation,
+                        creation_point,
+                        creation_event_index,
                         captures: captures.into_boxed_slice(),
                         capture_bindings: capture_bindings.into_boxed_slice(),
                     }),
@@ -555,6 +565,11 @@ impl WorkspaceSemanticOracle<'_> {
 }
 
 impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
+    fn may_have_complete_collection_flow_contracts(&self) -> bool {
+        self.semantic_model_overlay()
+            .is_some_and(|overlay| overlay.may_have_complete_collection_flow_contracts())
+    }
+
     fn member_receiver_flow(
         &self,
         call: &crate::analyzer::semantic::CallSiteHandle,
@@ -653,7 +668,8 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
                     }
                 }
             }
-            Some(MemberReceiverPreparation::CopyValue) | None => {}
+            Some(MemberReceiverPreparation::CopyValue | MemberReceiverPreparation::ByValue)
+            | None => {}
         }
         let mut value = MemberReceiverFlow::new(call.clone(), preparation, storage, limits)
             .map_err(|error| internal_contract("invalid receiver flow", error))?;
@@ -1005,7 +1021,7 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         gap: &crate::analyzer::semantic::SemanticGap,
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, SemanticProviderError> {
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
         crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
             gap,
             procedure,
@@ -1020,7 +1036,7 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
         inert: &mut Option<bool>,
-    ) -> Result<bool, SemanticProviderError> {
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
         crate::analyzer::semantic::workspace_oracle::inert_drop_glue_discharges_gap(
             gap,
             procedure,
@@ -1030,12 +1046,28 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         )
     }
 
+    fn resolved_member_identity_discharged(
+        &self,
+        gap: &crate::analyzer::semantic::SemanticGap,
+        procedure: &ProcedureHandle,
+        request: &mut SemanticRequest<'_>,
+        proven: &mut Option<Vec<crate::analyzer::semantic::SemanticGapId>>,
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
+        crate::analyzer::semantic::workspace_oracle::dispatch::resolved_member_identity_discharges_gap(
+            gap,
+            procedure,
+            self.workspace,
+            request,
+            proven,
+        )
+    }
+
     fn residual_conversion_discharged(
         &self,
         gap: &crate::analyzer::semantic::SemanticGap,
         procedure: &ProcedureHandle,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<bool, SemanticProviderError> {
+    ) -> Result<GapDischargeVerdict, SemanticProviderError> {
         crate::analyzer::semantic::workspace_oracle::residual_conversion_discharges_gap(
             gap,
             procedure,
@@ -1066,6 +1098,78 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
     /// Only a `Complete` outcome licenses the flag. A partial verdict from an
     /// exhausted budget or an open trace is exactly the case where the store
     /// may not have overwritten what a client would otherwise kill.
+    fn constructed_class(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<Box<str>>, SemanticProviderError> {
+        let Some(target) = self
+            .proven_external_targets(call, request)?
+            .and_then(|targets| match targets.as_slice() {
+                [target] if target.member() == "<init>" && !target.has_receiver() => {
+                    Some(target.clone())
+                }
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        Ok(Some(target.owner_fqn().into()))
+    }
+
+    fn collection_flow_contract(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        receiver_class: &str,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        Option<Arc<crate::analyzer::semantic_model::CollectionFlowContract>>,
+        SemanticProviderError,
+    > {
+        use crate::analyzer::semantic_model::{
+            SemanticModelCallApplication, SemanticModelCallableDisposition,
+            SemanticModelCallableKey, selected_model_callable,
+        };
+        let Some(overlay) = self.semantic_model_overlay() else {
+            return Ok(None);
+        };
+        let Some(targets) = self.proven_external_targets(call, request)? else {
+            return Ok(None);
+        };
+        // The receiver's exact class is proven, so only the member that class
+        // owns can run; the residual override boundary names nothing else.
+        let [target] = targets.as_slice() else {
+            return Ok(None);
+        };
+        if target.owner_fqn() != receiver_class || !target.has_receiver() {
+            return Ok(None);
+        }
+        let language = call.procedure().artifact().key().language().language();
+        let key = SemanticModelCallableKey::new(
+            language.config_label(),
+            target.owner_fqn(),
+            target.member(),
+            target.has_receiver(),
+            target.arity(),
+        );
+        let Some(matched) = selected_model_callable(
+            self.workspace.analyzer(),
+            &overlay,
+            key,
+            target.selected_external_descriptor.as_ref(),
+            &SemanticModelCallApplication::positional(target.arity()),
+        ) else {
+            return Ok(None);
+        };
+        if matched.disposition != SemanticModelCallableDisposition::Unique {
+            return Ok(None);
+        }
+        let Some(callable) = matched.unique() else {
+            return Ok(None);
+        };
+        Ok(overlay.unique_complete_collection_flow(&callable.id))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn store_holds_strong_update(
         &self,
@@ -1080,6 +1184,11 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         staged: &mut WorkStager,
         cancellation: &crate::cancellation::CancellationToken,
     ) -> Result<bool, StrongUpdateStop> {
+        // The caller supplies a formal's object, so no local certificate can
+        // name it; the procedure's own IR proves the overwrite instead.
+        if bases.holds_formal_member_overwrite(procedure, point.id(), location) {
+            return Ok(true);
+        }
         let row = procedure
             .semantics()
             .memory_location(location)
@@ -1221,11 +1330,14 @@ impl RelationProjectionHost for WorkspaceSemanticOracle<'_> {
         else {
             return Ok(false);
         };
-        let outcome = {
-            let mut request = staged.request(cancellation);
-            self.update_eligibility(&store, &mut request)
-                .map_err(StrongUpdateStop::Provider)?
-        };
+        // The answer is reduced to a flag below, so the census its publication
+        // admitted has no holder once this returns. Leaving it on the ledger made
+        // every later Output unit of the batch pay for it (#10530).
+        let outcome = staged
+            .with_scratch_admissions(cancellation, |request| {
+                self.update_eligibility(&store, request)
+            })
+            .map_err(StrongUpdateStop::Provider)?;
         staged.work = staged.work.conservative_add(outcome.work());
         match outcome {
             SemanticOutcome::Complete {
@@ -1348,6 +1460,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             .ok_or_else(|| SemanticProviderError::internal("call-site handle is stale"))?
             .clone();
         let callee = candidate.target();
+        self.workspace()
+            .analyzer()
+            .record_read(crate::analyzer::ReadKey::semantic_artifact(
+                callee.artifact().key(),
+            ));
         let construction =
             constructor_call_result(call.procedure().semantics(), &call_row, callee.semantics());
         let construction_evidence = construction.and_then(|result| {
@@ -1401,7 +1518,8 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         let mut build =
             BindingBuild::new(unresolved_call_boundary || native_incomplete_source_candidate);
         let caller_abort_user_code = abort_paths_run_user_code(call.procedure().semantics());
-        for gap in call.procedure().semantics().gaps() {
+        let caller_gaps = call.procedure().semantics().call_gap_candidates(&call_row);
+        for gap in caller_gaps {
             if interrupted.is_some() {
                 break;
             }
@@ -1413,30 +1531,8 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 gaps: 1,
                 ..SemanticWork::default()
             });
-            let scoped_to_call = match gap.subject {
-                SemanticGapSubject::Procedure => true,
-                SemanticGapSubject::Point => gap.point == call_row.point,
-                SemanticGapSubject::Value(value) => {
-                    call_row.callee == value
-                        || call_row.receiver == Some(value)
-                        || call_row
-                            .arguments
-                            .iter()
-                            .any(|argument| argument.value == value)
-                        || call_row
-                            .normal_result_values()
-                            .any(|result| result == value)
-                        || call_row.thrown == Some(value)
-                }
-                SemanticGapSubject::CallSite(call_site) => call_site == call.id(),
-                SemanticGapSubject::CallContinuation { call_site, .. } => call_site == call.id(),
-                SemanticGapSubject::MemoryLocation(_)
-                | SemanticGapSubject::Capture(_)
-                | SemanticGapSubject::AsyncContinuation { .. } => false,
-            };
-            let relevant = scoped_to_call
-                && (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                    || gap.impacts.contains(SemanticGapImpact::ValueFlow))
+            let relevant = (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+                || gap.impacts.contains(SemanticGapImpact::ValueFlow))
                 && call_target_refinement_call(call.procedure().semantics(), gap).is_none()
                 && !implicit_abort_gap_is_discharged(gap, caller_abort_user_code);
             build.open |= relevant;
@@ -1481,18 +1577,18 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     let before = staged.budget.used();
                     let relevant = {
                         let mut nested = staged.request(request.cancellation);
-                        !crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
+                        crate::analyzer::semantic::workspace_oracle::external_constant_field_read_discharges_gap(
                             gap,
                             callee,
                             self.workspace,
                             &mut nested,
-                        )? && !crate::analyzer::semantic::workspace_oracle::inert_drop_glue_discharges_gap(
+                        )? != GapDischargeVerdict::Discharged && crate::analyzer::semantic::workspace_oracle::inert_drop_glue_discharges_gap(
                             gap,
                             callee,
                             self.workspace,
                             &mut nested,
                             &mut callee_inert_drops,
-                        )?
+                        )? != GapDischargeVerdict::Discharged
                     };
                     staged.work = staged
                         .work
@@ -1678,11 +1774,8 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 == crate::analyzer::semantic::SemanticLanguage::Standard(
                     crate::analyzer::Language::Java,
                 ) {
-            let outcome = self.java_call_conversions(
-                call,
-                candidate,
-                &mut staged.request(request.cancellation),
-            )?;
+            let outcome =
+                self.call_conversions(call, candidate, &mut staged.request(request.cancellation))?;
             staged.work = staged.work.conservative_add(outcome.work());
             match outcome {
                 SemanticOutcome::ExceededBudget { exceeded, .. } => {
@@ -1941,6 +2034,114 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     }
                     mapping = mapping.with_conversion(conversion);
                 }
+                // A language that publishes static classes converts an argument
+                // at an interface-typed parameter (Go boxing). Receivers are never
+                // boxed, so only parameter formals take the hook; languages that
+                // publish no classes return None from the default.
+                if let Some(ordinal) = ordinal
+                    && let Some(support) = language_support_for_hook(
+                        call.procedure().artifact().key().language().language(),
+                        "static_class_argument_conversion",
+                    )
+                {
+                    let formal_class = callee
+                        .semantics()
+                        .values()
+                        .iter()
+                        .find_map(|value| {
+                            matches!(value.kind, SemanticValueKind::Parameter { ordinal: parameter, .. } if parameter == ordinal)
+                                .then_some(value.static_type_class)
+                        })
+                        .unwrap_or(crate::analyzer::semantic::StaticTypeClass::Unknown);
+                    let value = call
+                        .procedure()
+                        .semantics()
+                        .value(actual.id())
+                        .expect("live actual");
+                    let mut actual_class = value.static_type_class;
+                    // Resolving a call-result origin costs a dispatch; only pay it when
+                    // the language's conversion for this formal depends on the actual.
+                    if support.static_class_conversion_needs_actual(formal_class)
+                        && let Some(crate::analyzer::semantic::StaticTypeOrigin::CallResult {
+                            call: origin,
+                            ordinal: result_ordinal,
+                        }) = &value.static_type_origin
+                    {
+                        let origin = call
+                            .procedure()
+                            .call_site_handle(*origin)
+                            .expect("live origin call");
+                        let dispatch =
+                            self.resolve_call(&origin, &mut staged.request(request.cancellation))?;
+                        staged.work = staged.work.conservative_add(dispatch.work());
+                        // A stopped origin dispatch interrupts the bindings, as a stopped
+                        // Java conversion does; it is not an Unknown class to continue from.
+                        match &dispatch {
+                            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                                return interrupted_call_bindings(
+                                    call,
+                                    candidate,
+                                    context,
+                                    build,
+                                    Interruption::Budget(*exceeded),
+                                    staged.work,
+                                    *self.limits(),
+                                );
+                            }
+                            SemanticOutcome::Cancelled { .. } => {
+                                return interrupted_call_bindings(
+                                    call,
+                                    candidate,
+                                    context,
+                                    build,
+                                    Interruption::Cancelled,
+                                    staged.work,
+                                    *self.limits(),
+                                );
+                            }
+                            _ => {}
+                        }
+                        actual_class = crate::analyzer::semantic::StaticTypeClass::Unknown;
+                        if let SemanticOutcome::Complete { value: result, .. } = dispatch {
+                            // Go interface satisfaction and function assignability require
+                            // identical signatures, so all targets share static result types.
+                            let mut common = None;
+                            let mut agrees = !result.candidates().is_empty();
+                            for target in result.candidates() {
+                                self.workspace().analyzer().record_read(
+                                    crate::analyzer::ReadKey::semantic_artifact(
+                                        target.target().artifact().key(),
+                                    ),
+                                );
+                                let class = target
+                                    .target()
+                                    .semantics()
+                                    .declared_result_classes()
+                                    .and_then(|classes| classes.get(*result_ordinal as usize))
+                                    .copied()
+                                    .unwrap_or(crate::analyzer::semantic::StaticTypeClass::Unknown);
+                                agrees &= class
+                                    != crate::analyzer::semantic::StaticTypeClass::Unknown
+                                    && common.is_none_or(|previous| previous == class);
+                                common = Some(class);
+                            }
+                            if agrees {
+                                actual_class = common.expect("nonempty targets");
+                            }
+                        }
+                    }
+                    if let Some(conversion) =
+                        support.static_class_argument_conversion(formal_class, actual_class)
+                    {
+                        if let Err(reason) = conversion {
+                            completeness = EvidenceCompleteness::Partial(
+                                format!("argument conversion unknown: {reason:?}").into(),
+                            );
+                            build.open = true;
+                        }
+                        mapping = mapping.with_conversion(conversion);
+                    }
+                }
                 Some((mapping_evidence, mapping, proof, completeness))
             } else {
                 build.open = true;
@@ -2118,6 +2319,12 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     continue;
                 }
                 let Some(result_id) = result_id else {
+                    // #8804: an exceptional arm with no `thrown` value has no
+                    // carrier for the callee's exception, so a binding set
+                    // without it is not the complete answer.
+                    if exceptional && call_row.exceptional_continuation.target().is_some() {
+                        build.open = true;
+                    }
                     continue;
                 };
                 if request.cancellation.is_cancelled() {
@@ -2248,6 +2455,51 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
     }
 }
 
+impl WorkspaceSemanticOracle<'_> {
+    /// The proven external targets of `call` when that is all dispatch leaves
+    /// open: each external boundary is proven with only the callee body
+    /// missing, and any other boundary is the unresolved-override residual,
+    /// which a caller that proves the receiver's exact class may discharge
+    /// (#10989). `None` when any other outcome or boundary remains.
+    fn proven_external_targets(
+        &self,
+        call: &crate::analyzer::semantic::CallSiteHandle,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<
+        Option<Vec<crate::analyzer::semantic::UnmaterializedExternalTarget>>,
+        SemanticProviderError,
+    > {
+        use crate::analyzer::semantic::{
+            DispatchBoundaryKind, DispatchBoundaryPartialCause, EvidenceCompleteness, ProofStatus,
+        };
+        let dispatch = self.resolve_call(call, request)?;
+        let value = match &dispatch {
+            SemanticOutcome::Complete { value, .. }
+            | SemanticOutcome::Unproven { partial: value, .. } => value,
+            _ => return Ok(None),
+        };
+        if !value.candidates().is_empty() {
+            return Ok(None);
+        }
+        let mut targets = Vec::new();
+        for boundary in value.boundaries() {
+            match (&boundary.kind, boundary.unmaterialized_external_target()) {
+                (DispatchBoundaryKind::External(_), Some(target))
+                    if matches!(boundary.proof, ProofStatus::Proven)
+                        && (matches!(boundary.completeness, EvidenceCompleteness::Complete)
+                            || boundary.partial_cause
+                                == Some(DispatchBoundaryPartialCause::ExternalBodyUnavailable)) =>
+                {
+                    targets.push(target.clone());
+                }
+                (DispatchBoundaryKind::Unresolved, None) => {}
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(targets))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::value_flow::AccessPathResolution;
@@ -2348,7 +2600,7 @@ mod tests {
             first_location,
             ValueOriginFacts {
                 load_origins: &load_origins,
-                copied_reference_members: &HashMap::default(),
+                prefix_stores: &PrefixStores::default(),
                 binding_origins: None,
             },
             8,
@@ -2384,7 +2636,7 @@ mod tests {
             MemoryLocationId::new(0),
             ValueOriginFacts {
                 load_origins: &load_origins,
-                copied_reference_members: &HashMap::default(),
+                prefix_stores: &PrefixStores::default(),
                 binding_origins: None,
             },
             8,
@@ -2434,7 +2686,7 @@ mod tests {
             first_location,
             ValueOriginFacts {
                 load_origins: &load_origins,
-                copied_reference_members: &HashMap::default(),
+                prefix_stores: &PrefixStores::default(),
                 binding_origins: None,
             },
             8,

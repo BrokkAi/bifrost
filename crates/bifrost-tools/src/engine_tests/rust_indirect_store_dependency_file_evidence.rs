@@ -47,10 +47,10 @@ mod rust_indirect_table_tests {
         let second = publish(lock("1.1.0"));
         let read = |snapshot| {
             store
-                .dependency_file_evidence(&WorkspaceSnapshots::from_iter([(
-                    "rust".into(),
-                    snapshot,
-                )]))
+                .dependency_file_evidence(
+                    &WorkspaceSnapshots::from_iter([("rust".into(), snapshot)]),
+                    brokk_bifrost_core::analyzer::Language::Rust,
+                )
                 .unwrap()
         };
         let first_selection = WorkspaceSnapshots::from_iter([("rust".into(), first.clone())]);

@@ -7,8 +7,8 @@
 # threshold, turning a silent multi-hour hang into a named failure in minutes.
 #
 # period x terminate-after = the kill threshold (60s x 10 = 10 minutes). The
-# heaviest legitimate single tests in this workspace finish in a couple of
-# minutes even on a loaded box; nothing real should survive to 10.
+# ordinary tests finish in a couple of minutes even on a loaded box. Scoped
+# nightly stress exceptions below keep their own measured hang thresholds.
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 10 }
@@ -26,6 +26,14 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 # evidence attached.
 [profile.default.junit]
 path = "junit.xml"
+
+# #9737: the 96-case Rust warm/cold edit-and-process-restart proof passed in
+# 2788 seconds (46m28s) at nice 10 on a4ceb1347997. Allow 70 minutes, about
+# 50 percent above that full-run duration, for this one ignored nightly test.
+# All other tests retain the profile's ten-minute hang detector.
+[[profile.default.overrides]]
+filter = 'test(rust_derivation_properties::update_state_machine::rust_derivation_properties)'
+slow-timeout = { period = "60s", terminate-after = 70 }
 
 # #7362 activates a whole real JDK in the existing scheduled JDK step.
 # Its scoped rayon pool uses every CPU handed to this reservation.
@@ -52,9 +60,11 @@ filter = 'test(temp_storage_scripts)'
 threads-required = "num-cpus"
 
 # This process-isolated watchdog builds a large JS/TS usage graph inside a
-# four-thread rayon pool and enforces its own 60-second deadlock timeout. It
-# completes well within that boundary alone, but whole-suite CPU saturation can
-# starve the worker thread long enough to mimic the deadlock it detects.
+# four-thread rayon pool and has its own wall-clock deadlock watchdog. It
+# completes in about 20-35 seconds alone, but whole-suite CPU saturation inside
+# this invocation, or concurrent nextest invocations this reservation cannot
+# coordinate with, can starve the worker thread long enough to mimic the
+# deadlock it detects (#2777).
 [[profile.default.overrides]]
 filter = 'test(jsts_usage_graph_receiver_analysis_does_not_deadlock_on_pool)'
 threads-required = "num-cpus"
@@ -66,7 +76,11 @@ threads-required = "num-cpus"
 # assertion cannot fail merely because the box is busy. On 2026-08-29 that
 # incidental coupling failed five tests 3/3 in one 13,692-test run and a
 # disjoint six in the next, out of 156 server-spawning tests -- a set that moved
-# between runs, so naming the casualties could never converge.
+# between runs, so naming the casualties could never converge. A server whose
+# assertions all ride on `run_policy` may instead keep that tool's larger
+# production fallback (DEFAULT_POLICY_REQUEST_BUDGET, 240s): the declared-storage
+# policy test spent 55s of the 60-second budget in cold policy preparation on a
+# loaded merge host, against 13s alone (#9953).
 #
 # The runtime workspace-switch test is the one other server without a configured
 # budget. It first warms through `search_symbols`, which is exempt from the cold
@@ -153,10 +167,53 @@ filter = 'test(semantic_ir_rows_round_trip_every_workspace_crate_source)'
 threads-required = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 40 }
 
+# rust_call_targets_are_independent_of_file_batch (#9755) resolves every Rust
+# call site in every golden fixture twice, once in its file's batch and once
+# alone, on every available CPU. It takes about 950 CPU seconds: 170 s and 267 s
+# of wall time on a 96-CPU host at load 130 to 150 (2026-11-05), so about two
+# minutes on the 16-CPU push runner and up to six minutes on a 4-CPU gate
+# runner. 15 minutes keeps it a hang detector on the small runners.
+[[profile.default.overrides]]
+filter = 'test(rust_call_targets_are_independent_of_file_batch)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# output_budget_stop::transient_residency_boundary_scan (#11704) evaluates one
+# cold and two warm policy runs for each of 66 row limits at the #10893
+# admission edge. Serial, it took 470-520 s on the push and merge hosts and
+# 512 s alone on a 32-CPU container, against the profile-wide 600 s kill, and
+# timed out under full policy-integration load. The rows are independent, so
+# the test spreads them over the CPUs this reservation hands it: measured 59 s
+# on 32 CPUs and 268 s with two CPUs. Fifteen minutes keeps this a hang
+# detector on the smallest runner.
+[[profile.default.overrides]]
+filter = 'test(transient_residency_boundary_scan)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 [[profile.default.overrides]]
 filter = 'test(native_java_kotlin_csharp_all_fixture_rows_and_partial_flows_round_trip)'
 threads-required = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 30 }
+
+# workspace_authority_memos_are_classified (#10951) is a syn census of the
+# workspace: check_capability_ownership parses every crate twice, and the
+# recorder and field censuses walk the 25 in-scope crates again, about 390 MiB
+# of source in total. Serial, it took 190 s on the 16-CPU push runner, 272 s
+# alone on the 2-CPU merge host, and 461 s on a loaded 32-CPU host (load 60 to
+# 202) against the profile-wide 600 s kill; in a broad 4462-test push-tests run
+# a second copy ran beside it and starved it past 600 s.
+#
+# The test now spreads each per-crate walk over every CPU: measured 101 s on 32
+# CPUs, 174 s on 2 CPUs, and 290 s for each of two concurrent copies sharing 2
+# CPUs. Reserve the machine so the rest of the suite cannot compete with those
+# workers inside one nextest process. A reservation cannot coordinate separate
+# nextest processes; 15 minutes keeps this a hang detector when merge runs
+# overlap.
+[[profile.default.overrides]]
+filter = 'test(workspace_authority_memos_are_classified)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 # The partial-flow differentials walk a corpus file by file and, per procedure,
 # project the workspace relations, build an ICFG and solve value flow. The

@@ -1,5 +1,4 @@
-//! Report-only interpretation of selected-environment absence. Ordinary usage
-//! queries keep their query obligations. All inventories here die with the report.
+//! Selected-environment absence reporting. All inventories die with the report.
 use super::{
     PythonAnalyzer,
     native_request::{PythonNativeOpen, open_python_native_request},
@@ -18,7 +17,7 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 
 pub(super) fn reason_is_scope(reason: &EdgeIncompleteReason) -> bool {
     matches!(reason, EdgeIncompleteReason::UsageAnalysisFailed { reason_kind, .. }
-        if matches!(reason_kind.as_str(), "python_environment_open" | "python_unknown_placement" | "python_dynamic_receiver_mutation_open"))
+        if super::query_reason_is_scope(reason_kind))
 }
 
 pub(super) fn usage_result(result: FuzzyResult) -> FuzzyResult {
@@ -33,14 +32,7 @@ pub(super) fn usage_result(result: FuzzyResult) -> FuzzyResult {
     };
     // Writes do not constitute reads. Scope obligations remain stated once in
     // the report. All reference-attributable losses and limits stay untouched.
-    diagnostics.retain(|diagnostic| {
-        !matches!(
-            diagnostic.reason_kind.as_str(),
-            "python_environment_open"
-                | "python_unknown_placement"
-                | "python_dynamic_receiver_mutation_open"
-        )
-    });
+    diagnostics.retain(|diagnostic| !super::query_reason_is_scope(&diagnostic.reason_kind));
     if diagnostics.is_empty() {
         FuzzyResult::Success {
             hits_by_overload,
@@ -145,6 +137,8 @@ pub(super) fn coverage(
         // may have a subtype combining otherwise unrelated owners by multiple
         // inheritance. Unknown receivers exclude neither classes nor modules.
         let owners = types
+            .filter(|(_, gap)| gap.is_none())
+            .map(|(answer, _)| answer)
             .filter(|answer| answer.status == TypeLookupStatus::Resolved && answer.types.len() == 1)
             .and_then(|answer| {
                 let definitions = &answer.types[0].definitions;

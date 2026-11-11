@@ -18,7 +18,6 @@ use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
 use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use std::mem::size_of;
-use std::sync::Arc;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,23 +111,7 @@ pub fn loop_candidates(
     workspace
         .analyzer()
         .loop_candidates_for(workspace, procedure, cancellation)
-        .map(|candidates| (*candidates).clone())
-}
-
-pub(crate) fn weight_loop_candidates(
-    _key: &(
-        crate::analyzer::semantic::SemanticArtifactMaterializationId,
-        crate::analyzer::semantic::ProcedureId,
-    ),
-    value: &Arc<LoopCandidates>,
-) -> u32 {
-    let size = size_of::<LoopCandidates>().saturating_add(
-        value
-            .rows
-            .capacity()
-            .saturating_mul(size_of::<LoopCandidate>()),
-    );
-    size.clamp(1, u32::MAX as usize) as u32
+        .map(|candidates| (**candidates).clone())
 }
 
 pub(crate) fn build_loop_candidates(
@@ -650,6 +633,12 @@ fn node_coordinates(node: Node<'_>, source: &str, line_starts: &[usize]) -> Loop
     }
 }
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for LoopCandidates {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>() + self.rows.capacity() * size_of::<LoopCandidate>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,6 +687,9 @@ mod tests {
                     content_identity,
                     node: None,
                     range: node_range(binder),
+                    logical_anchor: None,
+                    logical_index: bindings.len(),
+                    syntax: None,
                     name: binder.utf8_text(source.as_bytes()).unwrap().to_owned(),
                     kind: BindingKind::Local,
                     hoisting: HoistingClass::SourceOrder,

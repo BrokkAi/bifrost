@@ -59,6 +59,7 @@ fn evaluated_report(policy_id: &str, source: &str) -> PolicyReportDocument {
                 cvss_overlays: &[],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )

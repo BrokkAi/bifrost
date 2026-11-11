@@ -2,6 +2,8 @@ use super::*;
 use crate::structural::search::units::{
     CodeQueryExecutionScope, UnitExecutionResult, execute_code_query_unit,
 };
+use brokk_bifrost_analysis::CodeUnitIndex;
+use brokk_bifrost_test_macros::hardwon;
 
 // Explain validates execution limits without needing semantic registrations.
 fn explain_admission(step: serde_json::Value, limits: CodeQueryExecutionLimits) -> bool {
@@ -14,6 +16,99 @@ fn explain_admission(step: serde_json::Value, limits: CodeQueryExecutionLimits) 
         execute_request_with_limits(&analyzer, &query, limits),
         CodeQueryResponse::Explain(_)
     )
+}
+
+#[test]
+#[hardwon("#9179: unused RQL preflight listings left a Rust Scope read on store Output units")]
+fn query_without_file_inventory_consumer_records_no_scope() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub fn value() {}\n")
+        .file("config.json", "{\"port\": 8080}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "configuration_facts": {"formats": ["json"], "keys": ["port"]},
+        "limit": 10
+    }))
+    .expect("configuration query");
+    let (result, ledger) = crate::analyzer::capture_query_reads(workspace.analyzer(), || {
+        execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    });
+    assert_eq!(result.results.len(), 1, "{result:#?}");
+    assert!(
+        !ledger
+            .keys()
+            .iter()
+            .any(|key| matches!(key, crate::analyzer::ReadKey::Scope { .. })),
+        "{:?}",
+        ledger.keys()
+    );
+}
+
+#[test]
+#[hardwon("#9179: a reused query-local file list could omit Scope from a later ledger")]
+fn reused_file_inventory_replays_scope_to_each_consumer() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("main.py", "def run(): pass\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["python"],
+        "match": {"kind": "function"},
+        "steps": [{"op": "procedure_of"}, {"op": "nilness_operations"}]
+    }))
+    .expect("relation query");
+    assert!(relation_capabilities::needs_file_inventory(&query.plan));
+    let inventory = QueryFileInventory::default();
+    let (_, first) = crate::analyzer::capture_query_reads(&analyzer, || {
+        let mut diagnostics = Vec::new();
+        relation_capabilities::preflight(
+            &query.plan,
+            inventory.files(&analyzer, || analyzer.analyzed_files()),
+            None,
+            &mut diagnostics,
+        );
+        diagnostics
+    });
+    let (languages, second) = crate::analyzer::capture_query_reads(&analyzer, || {
+        inventory
+            .files(&analyzer, || panic!("cached inventory was listed again"))
+            .iter()
+            .map(crate::analyzer::common::language_for_file)
+            .collect::<std::collections::HashSet<_>>()
+    });
+    assert!(languages.contains(&Language::Python));
+    for ledger in [&first, &second] {
+        assert!(
+            ledger.keys().iter().any(|key| matches!(key, crate::analyzer::ReadKey::Scope { languages, .. } if languages.as_ref() == [Language::Python])),
+            "{:?}",
+            ledger.keys()
+        );
+    }
+}
+
+#[test]
+#[hardwon("#9179: a stopped cached listing could be replayed as a complete empty inventory")]
+fn stopped_file_inventory_refuses_each_consumer() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("main.py", "def run(): pass\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let _query = crate::analyzer::AnalyzerQueryScope::with_cancellation(&analyzer, &cancellation);
+    let inventory = QueryFileInventory::default();
+    let (_, first) =
+        crate::analyzer::capture_query_reads(&analyzer, || inventory.files(&analyzer, Vec::new));
+    let (_, second) = crate::analyzer::capture_query_reads(&analyzer, || {
+        inventory.files(&analyzer, || panic!("stopped inventory relisted"))
+    });
+    assert!(first.execution_dependences() > 0);
+    assert!(second.execution_dependences() > 0);
 }
 
 #[test]

@@ -206,6 +206,7 @@ fn hierarchy_definition_key(
 pub enum KotlinExternalRootHierarchyIncompleteReason {
     HierarchyFactsUnavailable,
     AmbiguousSupertype,
+    UnresolvedSupertype,
 }
 
 /// Completion status of a workspace hierarchy walk rooted at one exact
@@ -246,15 +247,17 @@ struct KotlinHierarchyTypeBucket {
 ///
 /// This is the external-root counterpart to
 /// [`build_kotlin_direct_descendant_index`]. It consumes the same persisted,
-/// AST-derived hierarchy facts, but retains an edge when Kotlin's type-name
-/// ladder resolves a raw supertype to `external_root_fqn`. The root itself is
-/// not represented by a fabricated [`CodeUnit`]. Instead, direct external edges
-/// seed an iterative walk over the ordinary workspace-to-workspace edges.
+/// AST-derived hierarchy facts. Kotlin's type-name ladder resolves workspace
+/// edges; the external hook follows unmatched names through the shared bounded
+/// closure. Missing external facts keep the answer incomplete. The root itself
+/// is not represented by a fabricated [`CodeUnit`]. Reached external edges seed
+/// an iterative walk over the ordinary workspace-to-workspace edges.
 ///
 /// `external_root_fqn` is the resolver-owned canonical identity at the
 /// dispatch boundary. Scanning every admitted declaration is required even for
 /// a complete-empty answer, so `max_visits` is checked before the candidate
 /// index is built.
+#[allow(clippy::too_many_arguments)]
 pub fn build_kotlin_external_root_hierarchy<Fact>(
     mut candidates: Vec<Fact>,
     mut hydrate: impl FnMut(&mut [Fact]) -> bool,
@@ -263,6 +266,15 @@ pub fn build_kotlin_external_root_hierarchy<Fact>(
     external_root_fqn: &str,
     max_visits: usize,
     cancellation: Option<&CancellationToken>,
+    mut external_reaches_root: impl FnMut(
+        &CodeUnit,
+        &KotlinNameScope<'_>,
+        &str,
+        &mut usize,
+    ) -> Result<
+        crate::ExternalSupertypeClosureAnswer,
+        crate::ExternalSupertypeClosureStop,
+    >,
 ) -> KotlinExternalRootHierarchyAnswer
 where
     Fact: KotlinHierarchyFact,
@@ -279,7 +291,7 @@ where
             0,
         );
     }
-    let visited = candidates.len();
+    let mut visited = candidates.len();
     candidates.sort_by(|left, right| left.declaration().cmp(right.declaration()));
     let mut types_by_fq_name: HashMap<String, KotlinHierarchyTypeBucket> = HashMap::default();
     for (index, facts) in candidates.iter().enumerate() {
@@ -317,6 +329,9 @@ where
 
     let mut workspace_edges = vec![Vec::new(); candidates.len()];
     let mut external_descendants = Vec::new();
+    // The first external closure that could not be completed; the walk keeps
+    // the descendants it proves around it.
+    let mut incomplete = None;
     for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return KotlinExternalRootHierarchyAnswer::stopped(
@@ -370,7 +385,32 @@ where
                         );
                         workspace_edges[ancestor].push(descendant_index);
                     }
-                    KotlinTypeName::Unresolved => {}
+                    KotlinTypeName::Unresolved => {
+                        match external_reaches_root(descendant, &scope, raw, &mut visited) {
+                            Ok(answer) => {
+                                if answer.reaches_root {
+                                    external_descendants.push(descendant_index);
+                                }
+                                if answer.unresolved_supertype.is_some() {
+                                    incomplete.get_or_insert(KotlinExternalRootHierarchyStatus::Incomplete(
+                                        KotlinExternalRootHierarchyIncompleteReason::UnresolvedSupertype,
+                                    ));
+                                }
+                            }
+                            Err(crate::ExternalSupertypeClosureStop::Cancelled) => {
+                                return KotlinExternalRootHierarchyAnswer::stopped(
+                                    KotlinExternalRootHierarchyStatus::Cancelled,
+                                    visited,
+                                );
+                            }
+                            Err(crate::ExternalSupertypeClosureStop::BudgetExhausted) => {
+                                return KotlinExternalRootHierarchyAnswer::stopped(
+                                    KotlinExternalRootHierarchyStatus::BudgetExhausted,
+                                    visited,
+                                );
+                            }
+                        }
+                    }
                     KotlinTypeName::Ambiguous => {
                         return KotlinExternalRootHierarchyAnswer::stopped(
                             KotlinExternalRootHierarchyStatus::Incomplete(
@@ -397,7 +437,7 @@ where
         );
     };
     KotlinExternalRootHierarchyAnswer {
-        status: KotlinExternalRootHierarchyStatus::Complete,
+        status: incomplete.unwrap_or(KotlinExternalRootHierarchyStatus::Complete),
         descendants,
         visited,
     }

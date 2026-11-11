@@ -10,6 +10,8 @@
 //! Unsupported or ambiguous shapes are recorded gaps that leave membership
 //! unproven, never a complete absence.
 
+#[path = "compilation_sdk_properties.rs"]
+mod sdk_properties;
 #[path = "compilation_symbols.rs"]
 mod symbols;
 pub(super) use symbols::{
@@ -36,12 +38,13 @@ use quick_xml::events::{BytesStart, Event};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use crate::analyzer::csharp::CSharpAnalyzer;
 use brokk_bifrost_analysis::analyzer::store::csharp_compilation::{
     self, CSharpCompilationFact, CSharpCompilationFacts, CSharpCompilationGap,
     CSharpCompilationMetadata, CSharpCompileItem, CSharpCompileItemKind, CSharpConfigurationInput,
-    CSharpGlobalUsing, SelectedCSharpCompilations,
+    CSharpConfigurationSource, CSharpGlobalUsing, SelectedCSharpCompilations,
 };
 use brokk_bifrost_analysis::analyzer::store::workspace_inputs::NativeConfigurationOverlayAuthority;
 use brokk_bifrost_core::analyzer::model::Language;
@@ -49,7 +52,7 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::path_utils::rel_path_string;
 use brokk_bifrost_csharp::graph_support::CSharpCompilationVisibility;
 
-const CONFIG_IDENTITY_DOMAIN: &[u8] = b"bifrost-csharp-compilation-config:v1";
+const CONFIG_IDENTITY_DOMAIN: &[u8] = b"bifrost-csharp-compilation-config:v2";
 const MAX_PROJECT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROJECT_FILES: usize = 4 * 1024;
 const MAX_CONFIG_FILES: usize = 16 * 1024;
@@ -58,7 +61,7 @@ const MAX_XML_NODES: usize = 64 * 1024;
 
 /// Identity of one workspace listing's MSBuild configuration inputs, present
 /// only when every input below the cap was read.
-fn read_config_digest(project: &dyn Project) -> Option<StableDigest> {
+fn read_config_digest(project: &dyn Project) -> Option<(StableDigest, StableDigest)> {
     let inputs = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::workspace_configuration_inputs(
         project, &super::adapter::CSharpAdapter, None,
     ).ok()?;
@@ -66,6 +69,16 @@ fn read_config_digest(project: &dyn Project) -> Option<StableDigest> {
         return None;
     }
     let mut hasher = CanonicalHasher::new(CONFIG_IDENTITY_DOMAIN);
+    let identity_items = inputs
+        .iter()
+        .map(|input| {
+            (
+                input.relative_path().to_owned(),
+                input.content_oid().to_string(),
+                input.file_present,
+            )
+        })
+        .collect::<Vec<_>>();
     for input in inputs {
         if input.source_bytes().len() > MAX_PROJECT_BYTES {
             return None;
@@ -73,6 +86,7 @@ fn read_config_digest(project: &dyn Project) -> Option<StableDigest> {
         hasher.value(input.relative_path().as_bytes());
         let file = ProjectFile::new(project.root(), PathBuf::from(input.relative_path()));
         if project.has_overlay(&file) {
+            hasher.value(&[1]);
             // Query authority includes unsaved project changes. Persisted sets
             // still use disk capture and reject mismatched configuration overlays.
             let source = brokk_bifrost_analysis::analyzer::common::read_bounded_source(
@@ -82,10 +96,19 @@ fn read_config_digest(project: &dyn Project) -> Option<StableDigest> {
             )?;
             hasher.value(source.as_bytes());
         } else {
+            hasher.value(&[u8::from(input.file_present)]);
             hasher.value(input.source_bytes());
         }
     }
-    Some(StableDigest::from_array(hasher.finish()))
+    let identity = csharp_compilation::compilation_input_digest(
+        identity_items
+            .iter()
+            .map(|(path, oid, present)| (path.as_str(), oid.as_str(), *present)),
+    );
+    Some((
+        StableDigest::from_array(hasher.finish()),
+        StableDigest::from_array(identity),
+    ))
 }
 
 /// Imported-file nesting a project's evaluation chain may follow.
@@ -101,6 +124,7 @@ const MAX_IMPORT_DEPTH: usize = 8;
 /// across the chain and items apply in chain order, relative to the project
 /// directory. A file in the chain this parser cannot follow is a gap.
 pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCompilationFacts {
+    let by_path = configuration_by_path(inputs);
     let mut facts = CSharpCompilationFacts {
         membership_complete: true,
         ..CSharpCompilationFacts::default()
@@ -124,21 +148,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
     let mut parsed = HashMap::<&str, Option<ParsedProject>>::default();
     let mut projects = Vec::new();
     for input in inputs {
-        // Empty retained ancestor inputs can represent either a missing probe
-        // or a present 0-byte file. Neither can establish a loadable import.
-        if input.source.as_deref().is_some_and(<[u8]>::is_empty)
-            && Path::new(&input.rel_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    matches!(
-                        name,
-                        "Directory.Build.props"
-                            | "Directory.Build.targets"
-                            | "Directory.Packages.props"
-                    )
-                })
-        {
+        if matches!(input.source, CSharpConfigurationSource::Absent) {
             continue;
         }
         if input.source.is_none() {
@@ -194,7 +204,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 ..Default::default()
             },
         });
-        finish_compilation_facts(&mut facts, inputs);
+        finish_compilation_facts(&mut facts);
         return facts;
     }
 
@@ -245,7 +255,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 })
                 .collect();
             facts.compilations.push(CSharpCompilationFact {
-                symbols: Default::default(),
+                symbols: symbols::derive_indexed(&by_path, Some(project_path), None),
                 project_path: Some(project_path.to_owned()),
                 items,
                 inventory_gap_indices: indices,
@@ -267,16 +277,29 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         // Microsoft.Common imports.
         let mut chain = Vec::<(&str, &ParsedProject)>::new();
         let mut chain_gaps = Vec::<(&str, String, Option<String>)>::new();
-        let implicit_imports = |names: &[&'static str]| {
-            names
-                .iter()
-                .filter(|_| !project.sdks.is_empty())
-                .filter_map(|name| nearest_input(&parsed, directory, name))
-                .collect::<Vec<_>>()
+        let implicit_imports = |names: &[&'static str], chain: &mut Vec<_>, gaps: &mut Vec<_>| {
+            if project.sdks.is_empty() {
+                return;
+            }
+            for name in names {
+                match nearest_configuration(&by_path, directory, name) {
+                    NearestConfiguration::Found(path) => {
+                        expand_chain(&parsed, &by_path, path, 0, chain, gaps)
+                    }
+                    NearestConfiguration::Unknown(candidate) => gaps.push((
+                        project_path,
+                        format!("candidate {candidate:?} has unknown presence"),
+                        Some((*name).to_owned()),
+                    )),
+                    NearestConfiguration::Absent => {}
+                }
+            }
         };
-        for path in implicit_imports(&["Directory.Build.props", "Directory.Packages.props"]) {
-            expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
-        }
+        implicit_imports(&["Directory.Build.props"], &mut chain, &mut chain_gaps);
+        // The membership property pass assumes "empty until assigned" only for
+        // this closure: later SDK, package and project props may set anything.
+        let props_end = chain.len();
+        implicit_imports(&["Directory.Packages.props"], &mut chain, &mut chain_gaps);
         let intermediate = project
             .properties
             .base_intermediate_output_path
@@ -304,26 +327,31 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         if let Some((path, _)) = restore_paths[0]
             .as_deref()
             .and_then(|path| parsed.get_key_value(path))
-            && inputs
-                .iter()
-                .any(|input| input.rel_path == *path && configuration_input_is_acquired(input))
+            && by_path
+                .get(*path)
+                .is_some_and(|input| configuration_input_is_acquired(input))
         {
-            expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
+            expand_chain(&parsed, &by_path, path, 0, &mut chain, &mut chain_gaps);
         }
         let body_start = chain.len();
-        expand_chain(&parsed, project_path, 0, &mut chain, &mut chain_gaps);
+        expand_chain(
+            &parsed,
+            &by_path,
+            project_path,
+            0,
+            &mut chain,
+            &mut chain_gaps,
+        );
         let targets_start = chain.len();
-        for path in implicit_imports(&["Directory.Build.targets"]) {
-            expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
-        }
+        implicit_imports(&["Directory.Build.targets"], &mut chain, &mut chain_gaps);
         if let Some((path, _)) = restore_paths[1]
             .as_deref()
             .and_then(|path| parsed.get_key_value(path))
-            && inputs
-                .iter()
-                .any(|input| input.rel_path == *path && configuration_input_is_acquired(input))
+            && by_path
+                .get(*path)
+                .is_some_and(|input| configuration_input_is_acquired(input))
         {
-            expand_chain(&parsed, path, 0, &mut chain, &mut chain_gaps);
+            expand_chain(&parsed, &by_path, path, 0, &mut chain, &mut chain_gaps);
         }
         let metadata_chain_complete = chain_gaps.is_empty();
         let mut pending_regions = Vec::<(String, MembershipRegion, usize)>::new();
@@ -362,8 +390,27 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
         let mut parsed_references_complete = true;
         let mut references_mutated = false;
         let mut operations = Vec::new();
+        let mut deferred_items = Vec::new();
         let mut raw_references = Vec::new();
+        let chain_source = |path: &str| {
+            by_path
+                .get(path)
+                .and_then(|input| input.source.as_deref())
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        };
+        // AD3d: property groups and their conditions in import order.
+        let mut ordered = symbols::OrderedProperties::new(
+            chain.iter().filter_map(|(path, _)| chain_source(path)),
+            &Path::new(project_path)
+                .file_stem()
+                .expect("project")
+                .to_string_lossy(),
+            &[],
+        );
         for (index, (path, fragment)) in chain.iter().enumerate() {
+            if index == props_end {
+                ordered.leave_props_phase();
+            }
             if index == body_start {
                 default_position = Some(operations.len());
             }
@@ -396,7 +443,24 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 );
                 pending_regions.push(((*path).to_owned(), MembershipRegion::Root, index));
             }
-            for (kind, conditioned, value) in &fragment.default_assignments {
+            let fragment_source = chain_source(path);
+            for assignment in &fragment.default_assignments {
+                let (kind, value) = (&assignment.kind, &assignment.value);
+                // An assignment whose guard is definitely false never executes,
+                // so it neither opens nor narrows the default trees.
+                let decision = match (&assignment.conditions, fragment_source) {
+                    (Some(conditions), Some(source)) => {
+                        ordered.decide_at_fragment_start(conditions, source)
+                    }
+                    _ => None,
+                };
+                if decision == Some(false) {
+                    continue;
+                }
+                // A definitely true guard is still conditioned here: the
+                // effective default-item properties come from the parse, which
+                // could not decide it, so only a definite false changes anything.
+                let conditioned = &assignment.conditioned;
                 let late = output_roots.is_some()
                     && matches!(
                         kind,
@@ -521,6 +585,10 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                     ));
                 }
             }
+            match fragment_source {
+                Some(source) => ordered.apply(source),
+                None => ordered.poison(),
+            }
             properties.overlay(&fragment.properties);
             transitive_flow &= fragment.transitive_flow;
             if !fragment.references_complete {
@@ -541,21 +609,85 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                     "a ProjectReference Remove, Update or item definition can change any reference",
                 );
             }
+            for item in &fragment.deferred_items {
+                deferred_items.push((
+                    *path,
+                    operations.len() + item.position,
+                    index < body_start,
+                    item,
+                ));
+            }
             operations.extend(fragment.operations.iter().cloned());
             raw_references.extend(fragment.references.iter().map(|raw| (*path, raw)));
         }
+        // MSBuild evaluates items only after all imported property groups.
+        let mut resolved_items = Vec::new();
+        for (path, position, before_defaults, item) in deferred_items {
+            match ordered.decide_final(&item.conditions) {
+                Some(false) => continue,
+                Some(true) => {
+                    let expanded = item
+                        .attributes
+                        .iter()
+                        .map(|(name, value)| {
+                            let value = if matches!(name.as_str(), "Include" | "Remove" | "Exclude")
+                            {
+                                ordered.expand_final(value)?
+                            } else {
+                                value.clone()
+                            };
+                            Ok((name.clone(), value))
+                        })
+                        .collect::<Result<Vec<_>, &'static str>>();
+                    if let Ok(attributes) = expanded {
+                        let mut resolved = Vec::new();
+                        let mut complete = true;
+                        collect_compile_operation(&attributes, false, &mut resolved, &mut complete);
+                        if complete {
+                            if before_defaults
+                                && let Some(default_position) = default_position.as_mut()
+                            {
+                                *default_position += resolved.len();
+                            }
+                            resolved_items.push((position, resolved));
+                            continue;
+                        }
+                    }
+                }
+                None => {}
+            }
+            for issue in &item.issues {
+                let index = gap(
+                    &mut facts,
+                    "unsupported_project_items",
+                    path,
+                    &issue.evidence,
+                );
+                pending_regions.push((path.to_owned(), issue.region.clone(), index));
+            }
+        }
+        // Reverse insertion preserves positions, including adjacent deferred items.
+        for (position, resolved) in resolved_items.into_iter().rev() {
+            operations.splice(position..position, resolved);
+        }
+        // Enumeration is independent of SDK path handling. Use the acquired
+        // ordered import chain for both SDK paths and symbol instances.
+        let sources = chain
+            .iter()
+            .filter_map(|(path, _)| by_path.get(*path).copied())
+            .filter_map(|input| input.source.as_deref())
+            .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+            .collect::<Vec<_>>();
+        let sdk_properties = symbols::membership_properties(sources.iter().copied());
+        let declared = symbols::declared_frameworks(&sdk_properties);
+        let instances = symbols::framework_instances(&by_path, project_path);
         if project
             .sdks
             .iter()
             .any(|sdk| sdk_path_properties(sdk).is_some())
         {
-            let sources = chain
-                .iter()
-                .filter_map(|(path, _)| inputs.iter().find(|input| input.rel_path == *path))
-                .filter_map(|input| input.source.as_deref())
-                .filter_map(|bytes| std::str::from_utf8(bytes).ok())
-                .collect::<Vec<_>>();
-            let sdk_properties = symbols::membership_properties(sources.iter().copied());
+            // SDK paths retain their project-level evaluation in this slice.
+            // A single TargetFramework already enters that evaluation as authored.
             let frameworks = sdk_properties.as_ref().ok().and_then(|properties| {
                 if properties.contains_key("targetframework") {
                     return None;
@@ -564,19 +696,71 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                     .get("targetframeworks")?
                     .as_ref()
                     .ok()
-                    .map(|value| {
-                        value
-                            .split(';')
-                            .map(str::trim)
-                            .filter(|entry| !entry.is_empty())
-                            .collect::<Vec<_>>()
-                    })
+                    .map(|_| &declared)
             });
             for sdk in &project.sdks {
+                if inherited_razor_defaults(sdk) {
+                    // Generated sources can collide with checked-in files under the
+                    // intermediate directory. Keep those paths open independently
+                    // of the generated declaration inventory.
+                    let evaluations = frameworks.as_ref().map_or_else(
+                        || vec![sdk_properties.clone()],
+                        |entries| {
+                            entries
+                                .iter()
+                                .map(|entry| {
+                                    symbols::membership_properties_with_globals(
+                                        sources.iter().copied(),
+                                        &[("TargetFramework", entry)],
+                                    )
+                                })
+                                .collect()
+                        },
+                    );
+                    let evaluations = if evaluations.is_empty() {
+                        vec![Err("empty_target_frameworks")]
+                    } else {
+                        evaluations
+                    };
+                    for properties in evaluations {
+                        let intermediate = properties
+                            .as_ref()
+                            .ok()
+                            .and_then(|properties| properties.get("intermediateoutputpath"));
+                        let reason = properties.as_ref().err().copied().or_else(|| {
+                            intermediate.and_then(|value| value.as_ref().err().copied())
+                        });
+                        let evidence = format!(
+                            "Razor generator and embedded validation declarations are unacquired{}",
+                            reason
+                                .map(|reason| format!(
+                                    "; SDK property evaluation unknown: {reason}"
+                                ))
+                                .unwrap_or_default()
+                        );
+                        let index = gap(
+                            &mut facts,
+                            "unsupported_project_items",
+                            project_path,
+                            &evidence,
+                        );
+                        inventory_gap_indices.push(index);
+                        pending_regions.push((
+                            project_path.to_owned(),
+                            intermediate
+                                .and_then(|value| value.as_ref().ok())
+                                .map_or(MembershipRegion::Root, |path| {
+                                    MembershipRegion::Pattern(format!("{path}/**"))
+                                }),
+                            index,
+                        ));
+                    }
+                    continue;
+                }
                 if let Some((names, declarations)) = sdk_path_properties(sdk) {
                     let mut evidence = Vec::new();
                     let mut open_root = false;
-                    let selected = frameworks.as_deref();
+                    let selected = frameworks.map(Vec::as_slice);
                     if selected.is_some_and(<[_]>::is_empty) {
                         open_root = true;
                         evidence.push("TargetFrameworks has no selected framework".to_owned());
@@ -602,7 +786,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                                 .map(|entry| {
                                     let valid = !entry.contains(['$', '@', '%', '/', '\\', ':']);
                                     (
-                                        Some(*entry),
+                                        Some(entry.as_str()),
                                         if valid {
                                             symbols::membership_properties_with_globals(
                                                 sources.iter().copied(),
@@ -1003,7 +1187,7 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 }
             }
         }
-        facts.compilations.push(CSharpCompilationFact {
+        let mut compilation = CSharpCompilationFact {
             symbols: Default::default(),
             project_path: Some(project_path.to_owned()),
             items,
@@ -1019,15 +1203,23 @@ pub(crate) fn compilation_facts(inputs: &[CSharpConfigurationInput]) -> CSharpCo
                 metadata_chain_complete,
                 &mut facts.gaps,
             ),
-        });
+        };
+        if instances.is_empty() {
+            compilation.symbols = symbols::derive_indexed(&by_path, Some(project_path), None);
+            facts.compilations.push(compilation);
+        } else {
+            for framework in instances {
+                let mut instance = compilation.clone();
+                instance.symbols =
+                    symbols::derive_indexed(&by_path, Some(project_path), Some(&framework));
+                facts.compilations.push(instance);
+            }
+        }
     }
-    finish_compilation_facts(&mut facts, inputs);
+    finish_compilation_facts(&mut facts);
     facts
 }
-fn finish_compilation_facts(
-    facts: &mut CSharpCompilationFacts,
-    inputs: &[CSharpConfigurationInput],
-) {
+fn finish_compilation_facts(facts: &mut CSharpCompilationFacts) {
     let global_gaps = facts
         .gaps
         .iter()
@@ -1046,7 +1238,33 @@ fn finish_compilation_facts(
         }
         compilation.inventory_gap_indices.sort_unstable();
         compilation.inventory_gap_indices.dedup();
-        compilation.symbols = symbols::derive(inputs, compilation.project_path.as_deref());
+    }
+    // Until nearest-framework selection is implemented, multiple target instances
+    // are an open reference edge. Do not choose the first or create a cross product.
+    let mut instance_counts = HashMap::<String, usize>::default();
+    for compilation in &facts.compilations {
+        if let Some(path) = &compilation.project_path {
+            *instance_counts.entry(path.clone()).or_default() += 1;
+        }
+    }
+    for compilation in &mut facts.compilations {
+        compilation.references.retain(|target| {
+            if instance_counts[target] == 1 {
+                return true;
+            }
+            compilation.references_complete = false;
+            facts.gaps.push(CSharpCompilationGap {
+                code: "ambiguous_project_reference_framework".into(),
+                path: compilation
+                    .project_path
+                    .clone()
+                    .expect("project reference owner"),
+                evidence: format!(
+                    "ProjectReference {target}: nearest target framework is not selected"
+                ),
+            });
+            false
+        });
     }
     facts.membership_complete = !facts.compilations.iter().any(|c| {
         c.items.iter().any(|i| {
@@ -1062,7 +1280,7 @@ fn finish_compilation_facts(
 // configuration input whose bytes were capped, so it stays an ordinary
 // acquired-but-unread import rather than an unacquired package obligation.
 fn configuration_input_is_acquired(input: &CSharpConfigurationInput) -> bool {
-    input.source.as_ref().is_none_or(|bytes| !bytes.is_empty())
+    !matches!(input.source, CSharpConfigurationSource::Absent)
 }
 
 /// A selected MSBuild item value, not C# syntax. Preserve parent components
@@ -1565,46 +1783,55 @@ fn derive_metadata(
     result
 }
 
-/// The configuration input named `name` in `directory` or its nearest
-/// ancestor within the workspace, as MSBuild finds a Directory.Build file.
-fn nearest_input<'a>(
-    parsed: &HashMap<&'a str, Option<ParsedProject>>,
-    directory: &Path,
-    name: &str,
-) -> Option<&'a str> {
-    directory.ancestors().find_map(|ancestor| {
-        let candidate = portable_rel_path(&ancestor.join(name));
-        parsed
-            .get_key_value(candidate.as_str())
-            .map(|(path, _)| *path)
-    })
-}
-
-enum AuthoritativeImport<'a> {
+/// Exact nearest-file search. A missing selected row or capped input cannot
+/// prove absence, so both stop the walk with an unknown candidate.
+#[derive(Debug)]
+pub(super) enum NearestConfiguration<'a> {
     Found(&'a str),
+    Absent,
     Unknown(String),
 }
 
-/// A property-function search cannot pass a directory without authoritative
-/// absence. Retained empty inputs conflate absent probes and present empty files,
-/// so the first candidate missing from `parsed` stops the walk.
-fn nearest_authoritative_input<'a>(
-    parsed: &HashMap<&'a str, Option<ParsedProject>>,
+pub(super) type ConfigurationByPath<'a> = HashMap<&'a str, &'a CSharpConfigurationInput>;
+
+pub(super) fn configuration_by_path(
+    inputs: &[CSharpConfigurationInput],
+) -> ConfigurationByPath<'_> {
+    let mut by_path = HashMap::default();
+    for input in inputs {
+        by_path.entry(input.rel_path.as_str()).or_insert(input);
+    }
+    by_path
+}
+
+pub(super) fn nearest_configuration<'a>(
+    inputs: &ConfigurationByPath<'a>,
     directory: &Path,
     name: &str,
-) -> AuthoritativeImport<'a> {
-    let candidate = portable_rel_path(&directory.join(name));
-    if let Some((path, _)) = parsed.get_key_value(candidate.as_str()) {
-        AuthoritativeImport::Found(path)
-    } else {
-        AuthoritativeImport::Unknown(candidate)
+) -> NearestConfiguration<'a> {
+    for ancestor in directory.ancestors() {
+        let candidate = portable_rel_path(&ancestor.join(name));
+        match inputs.get(candidate.as_str()).copied() {
+            Some(input) => match input.source {
+                CSharpConfigurationSource::Absent => continue,
+                CSharpConfigurationSource::Bytes(_) => {
+                    return NearestConfiguration::Found(&input.rel_path);
+                }
+                CSharpConfigurationSource::Capped => {
+                    return NearestConfiguration::Unknown(candidate);
+                }
+            },
+            None => return NearestConfiguration::Unknown(candidate),
+        }
     }
+    NearestConfiguration::Absent
 }
 
 /// Append `path` to `chain`, preceded by the files it imports. Imports that
 /// leave the inputs, cycle or nest too deeply are recorded in `gaps`.
 fn expand_chain<'a>(
     parsed: &'a HashMap<&'a str, Option<ParsedProject>>,
+    inputs: &ConfigurationByPath<'a>,
     path: &'a str,
     depth: usize,
     chain: &mut Vec<(&'a str, &'a ParsedProject)>,
@@ -1639,9 +1866,10 @@ fn expand_chain<'a>(
         let mut function_gap = None;
         let resolved = if let Some((name, start)) = function {
             match resolve_item_path(directory, start) {
-                Some(start) => match nearest_authoritative_input(parsed, &start, name) {
-                    AuthoritativeImport::Found(path) => Some(path),
-                    AuthoritativeImport::Unknown(candidate) => {
+                Some(start) => match nearest_configuration(inputs, &start, name) {
+                    NearestConfiguration::Found(path) => Some(path),
+                    NearestConfiguration::Absent => None,
+                    NearestConfiguration::Unknown(candidate) => {
                         function_gap = Some(format!(
                             "GetPathOfFileAbove({name:?}): candidate {candidate:?} has unknown presence; the file may exist there unselected"
                         ));
@@ -1661,7 +1889,7 @@ fn expand_chain<'a>(
                 .and_then(|resolved| parsed.get_key_value(resolved.as_str()).map(|(key, _)| *key))
         };
         match resolved {
-            Some(imported) => expand_chain(parsed, imported, depth + 1, chain, gaps),
+            Some(imported) => expand_chain(parsed, inputs, imported, depth + 1, chain, gaps),
             None => gaps.push((
                 path,
                 function_gap
@@ -1723,7 +1951,7 @@ impl CSharpAnalyzer {
         )
     }
 
-    fn record_membership_read<T>(
+    pub(super) fn record_membership_read<T>(
         &self,
         result: Result<T, brokk_bifrost_analysis::analyzer::store::StoreError>,
     ) -> Option<T> {
@@ -1935,7 +2163,7 @@ impl CSharpAnalyzer {
     /// the generation on its own. An unknown identity (incomplete source
     /// inventory, a failed listing, a capped or unreadable configuration
     /// file) publishes nothing, and the next lookup retries.
-    pub(crate) fn compilation_config_digest(&self) -> Option<StableDigest> {
+    fn compilation_config_identities(&self) -> Option<(StableDigest, StableDigest)> {
         self.memo_caches.compilation_config_digest.read(
             &memo_attribution(self),
             |cell| {
@@ -1957,12 +2185,32 @@ impl CSharpAnalyzer {
                 Some(answer) => AuthorityInputs::Fact {
                     language: Language::CSharp,
                     subject: brokk_bifrost_analysis::analyzer::read_ledger::FactSubject::Whole,
-                    answer: *answer,
+                    answer: answer.0,
                 },
                 None => AuthorityInputs::Unnamed,
             },
         )
     }
+
+    pub(crate) fn compilation_config_digest(&self) -> Option<StableDigest> {
+        self.compilation_config_identities()
+            .map(|(digest, _)| digest)
+    }
+
+    // The native read slice consumes this alongside the recorded configuration fact.
+    #[allow(dead_code)]
+    pub(crate) fn compilation_input_digest(&self) -> Option<StableDigest> {
+        self.compilation_config_identities()
+            .map(|(_, identity)| identity)
+    }
+}
+
+#[derive(Debug)]
+struct DeferredCompileItem {
+    position: usize,
+    attributes: Vec<(String, String)>,
+    conditions: Vec<Arc<str>>,
+    issues: Vec<MembershipIssue>,
 }
 
 #[derive(Debug)]
@@ -1976,8 +2224,9 @@ struct ParsedProject {
     /// A traversal or no-targets SDK project: no compilation at all.
     compiles_nothing: bool,
     operations: Vec<CompileOperation>,
+    deferred_items: Vec<DeferredCompileItem>,
     issues: Vec<MembershipIssue>,
-    default_assignments: Vec<(PropertyKind, bool, String)>,
+    default_assignments: Vec<DefaultAssignment>,
     package_references: Vec<(String, String)>,
     /// Whether the Compile items and default-item properties are all in
     /// supported static shapes.
@@ -2005,7 +2254,7 @@ struct MembershipIssue {
     region: MembershipRegion,
     evidence: String,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MembershipRegion {
     Root,
     Project,
@@ -2143,14 +2392,29 @@ enum CompileOperationKind {
 struct ElementFrame {
     name: String,
     conditioned: bool,
+    // The `Condition` texts guarding this element, outermost first, or `None`
+    // when a Target, Choose, When or Otherwise guards it: those are not
+    // decided by the membership property pass.
+    conditions: Option<Vec<Arc<str>>>,
 }
 
 #[derive(Debug)]
 struct PropertyCapture {
     depth: usize,
     conditioned: bool,
+    conditions: Option<Vec<Arc<str>>>,
     kind: PropertyKind,
     text: String,
+}
+
+/// One default-item property assignment, in document order. `conditions` is
+/// `None` when its guard is outside the decidable condition subset.
+#[derive(Debug)]
+struct DefaultAssignment {
+    kind: PropertyKind,
+    conditioned: bool,
+    conditions: Option<Vec<Arc<str>>>,
+    value: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2178,6 +2442,7 @@ fn parse_project(source: &str) -> ParsedProject {
     let mut reader = Reader::from_str(source);
     let mut stack = Vec::<ElementFrame>::new();
     let mut operations = Vec::new();
+    let mut deferred_items = Vec::new();
     let mut metadata_operations = Vec::new();
     let mut metadata_gaps = Vec::new();
     let mut metadata_imports_complete = true;
@@ -2301,11 +2566,12 @@ fn parse_project(source: &str) -> ParsedProject {
                             property.kind,
                             PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow
                         ) {
-                            default_assignments.push((
-                                property.kind,
-                                property.conditioned,
-                                property.text.clone(),
-                            ));
+                            default_assignments.push(DefaultAssignment {
+                                kind: property.kind,
+                                conditioned: property.conditioned,
+                                conditions: property.conditions.clone(),
+                                value: property.text.clone(),
+                            });
                         }
                         assign_property(
                             property.kind,
@@ -2377,6 +2643,7 @@ fn parse_project(source: &str) -> ParsedProject {
         if let Some(capture) = capture.as_mut() {
             // XML children in a scalar property are not a statically known value.
             capture.conditioned = true;
+            capture.conditions = None;
             complete = false;
             issues.push(MembershipIssue {
                 region: MembershipRegion::Root,
@@ -2386,6 +2653,17 @@ fn parse_project(source: &str) -> ParsedProject {
         let parent = stack.last().map(|frame| frame.name.as_str());
         let conditioned = stack.last().is_some_and(|frame| frame.conditioned)
             || is_conditioning_element(&name, &attributes);
+        let mut conditions = stack
+            .last()
+            .map_or_else(|| Some(Vec::new()), |frame| frame.conditions.clone());
+        if matches!(name.as_str(), "target" | "choose" | "when" | "otherwise") {
+            conditions = None;
+        }
+        if let (Some(list), Some(condition)) =
+            (conditions.as_mut(), attribute(&attributes, "Condition"))
+        {
+            list.push(Arc::from(condition));
+        }
         if parent == Some("projectreference") && !is_supported_reference_metadata(&name) {
             references_complete = false;
             if let Some(pending) = pending_reference.as_mut() {
@@ -2492,6 +2770,7 @@ fn parse_project(source: &str) -> ParsedProject {
                 );
                 if !item_complete {
                     complete = false;
+                    let mut item_issues = Vec::new();
                     let paths = [
                         attribute(&attributes, "Include"),
                         attribute(&attributes, "Remove"),
@@ -2500,17 +2779,48 @@ fn parse_project(source: &str) -> ParsedProject {
                     for path in paths.into_iter().flatten() {
                         for pattern in path.split(';').filter(|p| !p.trim().is_empty()) {
                             found = true;
-                            issues.push(MembershipIssue {
+                            item_issues.push(MembershipIssue {
                                 region: MembershipRegion::Pattern(pattern.to_owned()),
                                 evidence: format!("open Compile item: {attributes:?}"),
                             });
                         }
                     }
                     if !found {
-                        issues.push(MembershipIssue {
+                        item_issues.push(MembershipIssue {
                             region: MembershipRegion::Root,
                             evidence: format!("unsupported Compile item: {attributes:?}"),
                         });
+                    }
+                    let mut static_complete = true;
+                    collect_compile_operation(
+                        &attributes,
+                        false,
+                        &mut Vec::new(),
+                        &mut static_complete,
+                    );
+                    let has_property_path = attributes.iter().any(|(name, value)| {
+                        matches!(name.as_str(), "Include" | "Remove" | "Exclude")
+                            && value.contains("$(")
+                    });
+                    let eligible = (static_complete || has_property_path)
+                        && !(attribute(&attributes, "Include").is_some()
+                            && attribute(&attributes, "Remove").is_some())
+                        && conditions.is_some()
+                        && attributes.iter().all(|(name, value)| {
+                            !matches!(name.as_str(), "Include" | "Remove" | "Exclude")
+                                || (!value.contains("$([")
+                                    && !value.contains("@(")
+                                    && !value.contains("%("))
+                        });
+                    if eligible {
+                        deferred_items.push(DeferredCompileItem {
+                            position: operations.len(),
+                            attributes: attributes.clone(),
+                            conditions: conditions.clone().expect("checked conditions"),
+                            issues: item_issues,
+                        });
+                    } else {
+                        issues.extend(item_issues);
                     }
                 }
             }
@@ -2566,7 +2876,12 @@ fn parse_project(source: &str) -> ParsedProject {
                     kind,
                     PropertyKind::Metadata(_) | PropertyKind::ReferenceFlow
                 ) {
-                    default_assignments.push((kind, conditioned, String::new()));
+                    default_assignments.push(DefaultAssignment {
+                        kind,
+                        conditioned,
+                        conditions: conditions.clone(),
+                        value: String::new(),
+                    });
                 }
                 assign_property(
                     kind,
@@ -2581,7 +2896,11 @@ fn parse_project(source: &str) -> ParsedProject {
                 references.push(path);
             }
         } else {
-            stack.push(ElementFrame { name, conditioned });
+            stack.push(ElementFrame {
+                name,
+                conditioned,
+                conditions: conditions.clone(),
+            });
             if let Some(path) = reference {
                 // Child metadata can still disqualify the edge.
                 pending_reference = Some(PendingReference {
@@ -2594,6 +2913,7 @@ fn parse_project(source: &str) -> ParsedProject {
                 capture = Some(PropertyCapture {
                     depth: stack.len(),
                     conditioned,
+                    conditions,
                     kind,
                     text: String::new(),
                 });
@@ -2618,13 +2938,11 @@ fn parse_project(source: &str) -> ParsedProject {
                 MembershipRegion::Root | MembershipRegion::Import(_)
             )
         });
-    // Only Microsoft.NET.Sdk's default Compile item is modeled. A traversal
-    // or no-targets project compiles nothing; any other SDK (including the
-    // Microsoft.NET.Sdk.* family, whose props add their own excludes) is
-    // unmodeled.
+    // Razor inherits NET defaults. Web and Blazor still require their tooling
+    // removals; other SDKs retain their existing membership obligations.
     let sdk_project = sdks
         .iter()
-        .any(|sdk| sdk.eq_ignore_ascii_case("Microsoft.NET.Sdk"));
+        .any(|sdk| sdk.eq_ignore_ascii_case("Microsoft.NET.Sdk") || inherited_razor_defaults(sdk));
     let is_compiles_nothing_sdk = |sdk: &String| {
         sdk.eq_ignore_ascii_case("Microsoft.Build.Traversal")
             || sdk.eq_ignore_ascii_case("Microsoft.Build.NoTargets")
@@ -2651,6 +2969,7 @@ fn parse_project(source: &str) -> ParsedProject {
         sdk_project,
         compiles_nothing,
         operations,
+        deferred_items,
         issues,
         default_assignments,
         package_references,
@@ -2761,6 +3080,14 @@ fn is_conditioning_element(name: &str, attributes: &[(String, String)]) -> bool 
 }
 
 /// SDK effects bounded by the declared path properties below.
+// dotnet/sdk d037e5f857b3:
+// src/RazorSdk/Sdk/Sdk.props:13-23 imports Microsoft.NET.Sdk.
+// Web and Blazor retain their project obligations until the Web.ProjectSystem
+// tooling item-set exclusions are evaluated in the ordered props phase.
+fn inherited_razor_defaults(sdk: &str) -> bool {
+    sdk.eq_ignore_ascii_case("Microsoft.NET.Sdk.Razor")
+}
+
 fn sdk_path_properties(sdk: &str) -> Option<(&'static [&'static str], &'static str)> {
     const WEB: &[&str] = &["AppDesignerFolder"];
     const GENERATED: &[&str] = &[
@@ -3376,12 +3703,11 @@ mod tests {
                         .map(|region| (region.kind.as_str(), region.rel_path.as_str()))
                 })
                 .collect::<Vec<_>>();
-            assert!(!regions.is_empty(), "{project}: {membership:?}");
             if project == "Plain/Plain.csproj" || project == "Multi/Multi.csproj" {
-                assert!(
-                    regions.iter().all(|(_, path)| !path.is_empty()),
-                    "{project}: {regions:?}"
-                );
+                assert!(regions.is_empty(), "{project}: {membership:?}");
+                assert!(membership.proven.contains(&id));
+            } else {
+                assert!(!regions.is_empty(), "{project}: {membership:?}");
             }
             if project == "Dynamic/Dynamic.csproj" {
                 assert!(
@@ -3403,8 +3729,20 @@ mod tests {
             .join("tests/fixtures/golden/compilation-symbols/Append");
         let mut symbol_inputs = vec![CSharpConfigurationInput {
             rel_path: project.into(),
-            source: Some(br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DefineConstants>FOO</DefineConstants></PropertyGroup><Target><PropertyGroup><DefineConstants>BAR</DefineConstants></PropertyGroup></Target><PropertyGroup><DefineConstants>LATER</DefineConstants></PropertyGroup></Project>"#.to_vec()),
+            source: CSharpConfigurationSource::Bytes(br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DefineConstants>FOO</DefineConstants></PropertyGroup><Target><PropertyGroup><DefineConstants>BAR</DefineConstants></PropertyGroup></Target><PropertyGroup><DefineConstants>LATER</DefineConstants></PropertyGroup></Project>"#.to_vec().into_boxed_slice()),
         }];
+        for directory in ["", "Append/"] {
+            for name in [
+                "Directory.Build.props",
+                "Directory.Packages.props",
+                "Directory.Build.targets",
+            ] {
+                symbol_inputs.push(CSharpConfigurationInput {
+                    rel_path: format!("{directory}{name}"),
+                    source: CSharpConfigurationSource::Absent,
+                });
+            }
+        }
         for name in [
             "project.assets.json",
             "Append.csproj.nuget.g.props",
@@ -3412,10 +3750,14 @@ mod tests {
         ] {
             symbol_inputs.push(CSharpConfigurationInput {
                 rel_path: format!("Append/obj/{name}"),
-                source: Some(fs::read(fixture.join("obj").join(name)).unwrap()),
+                source: CSharpConfigurationSource::Bytes(
+                    fs::read(fixture.join("obj").join(name))
+                        .unwrap()
+                        .into_boxed_slice(),
+                ),
             });
         }
-        let symbols = symbols::derive(&symbol_inputs, Some(project));
+        let symbols = symbols::derive(&symbol_inputs, Some(project), "net10.0");
         assert!(symbols.symbols.is_empty());
         writeln!(
             rendered,
@@ -3423,8 +3765,8 @@ mod tests {
             symbols.open_reason
         )
         .unwrap();
-        symbol_inputs[0].source = Some(br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><Dest>DefineConstants</Dest></PropertyGroup><Target Name="Build"><CreateProperty Value="X"><Output TaskParameter="Value" PropertyName="$(Dest)" /></CreateProperty></Target></Project>"#.to_vec());
-        let dynamic_symbols = symbols::derive(&symbol_inputs, Some(project));
+        symbol_inputs[0].source = CSharpConfigurationSource::Bytes(br#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework><Dest>DefineConstants</Dest></PropertyGroup><Target Name="Build"><CreateProperty Value="X"><Output TaskParameter="Value" PropertyName="$(Dest)" /></CreateProperty></Target></Project>"#.to_vec().into_boxed_slice());
+        let dynamic_symbols = symbols::derive(&symbol_inputs, Some(project), "net10.0");
         assert!(dynamic_symbols.symbols.is_empty());
         writeln!(
             rendered,
@@ -3432,17 +3774,124 @@ mod tests {
             dynamic_symbols.open_reason
         )
         .unwrap();
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/target-property-scope/expected.txt");
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::write(&expected, &rendered).unwrap();
+        }
+        assert_eq!(rendered, fs::read_to_string(expected).unwrap());
+    }
+
+    #[test]
+    #[hardwon(
+        "#9973: unknown_configuration_presence violated the csharp_compilations open_reason CHECK"
+    )]
+    fn oversized_near_props_open_reason_is_persisted() {
+        let oversized = format!("<Project><!--{}--></Project>", "x".repeat(2 * 1024 * 1024));
+        let (_root, _project, _, analyzer) = analyzed(&[
+            ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"/>"),
+            ("App/Source.cs", "class Source {}"),
+            ("App/Directory.Build.props", &oversized),
+        ]);
+        analyzer.selected_compilations().unwrap().unwrap();
+        let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT open_reason FROM csharp_compilations WHERE project_path='App/App.csproj'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "unknown_configuration_presence");
+    }
+
+    #[test]
+    #[hardwon("#9973: target_assignment violated the csharp_compilations open_reason CHECK")]
+    fn target_assignment_open_reason_is_persisted() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/compilation-symbols/Append/obj");
+        let props = fs::read_to_string(assets.join("Append.csproj.nuget.g.props")).unwrap();
+        let targets = fs::read_to_string(assets.join("Append.csproj.nuget.g.targets")).unwrap();
+        let project_assets = fs::read_to_string(assets.join("project.assets.json")).unwrap();
+        let (_root, _project, _, analyzer) = analyzed(&[
+            (
+                "Append/Append.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><DefineConstants>FOO</DefineConstants></PropertyGroup><Target><PropertyGroup><DefineConstants>BAR</DefineConstants></PropertyGroup></Target></Project>",
+            ),
+            ("Append/Source.cs", "class Source {}"),
+            ("Append/obj/Append.csproj.nuget.g.props", &props),
+            ("Append/obj/Append.csproj.nuget.g.targets", &targets),
+            ("Append/obj/project.assets.json", &project_assets),
+        ]);
+        analyzer.selected_compilations().unwrap().unwrap();
+        let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+        let reason: String = conn.query_row(
+            "SELECT open_reason FROM csharp_compilations WHERE project_path='Append/Append.csproj'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(reason, "target_assignment");
+    }
+
+    #[test]
+    fn framework_instances_keep_one_selected_file_product() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/compilation-symbols/Frameworks");
+        let names = [
+            "Frameworks.csproj",
+            "Source.cs",
+            "obj/project.assets.json",
+            "obj/Frameworks.csproj.nuget.g.props",
+            "obj/Frameworks.csproj.nuget.g.targets",
+        ];
+        let mut counts = Vec::new();
+        for multi in [false, true] {
+            let owned = names
+                .iter()
+                .map(|name| {
+                    let mut source = fs::read_to_string(base.join(name)).unwrap();
+                    if !multi && *name == "Frameworks.csproj" {
+                        source = source.replace(
+                            "<TargetFrameworks>net6.0;net8.0;net8.0;net8.0-windows</TargetFrameworks>",
+                            "<TargetFramework>net8.0</TargetFramework>",
+                        );
+                    }
+                    (format!("Frameworks/{name}"), source)
+                })
+                .collect::<Vec<_>>();
+            let files = owned
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect::<Vec<_>>();
+            let (_root, _, _, analyzer) = analyzed(&files);
+            let declarations =
+                brokk_bifrost_analysis::CodeUnitIndex::all_declarations(&analyzer).count();
+            assert!(declarations > 0);
+            analyzer.selected_compilations().unwrap().unwrap();
+            let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM csharp_file_version_decisions d JOIN workspace_file_versions v USING(file_version_id) WHERE v.valid_until IS NULL AND v.rel_path = 'Frameworks/Source.cs'",
+                [], |row| row.get(0)).unwrap();
+            counts.push(count);
+        }
         assert_eq!(
-            rendered,
-            include_str!("../../../tests/fixtures/golden/target-property-scope/expected.txt")
+            counts,
+            vec![1, 1],
+            "single-framework and three-framework selected file products"
         );
     }
 
     /// Evaluated configuration crosses the producer/SQLite/selected-reader boundary.
     #[test]
     #[hardwon(
-        "#8147: ignored build inputs and SDK-qualified imports could close stale symbol sets"
+        "#8147+#8837: ignored inputs and a nearer empty props file could close stale membership and symbols"
     )]
+    #[hardwon(
+        "#7314: empty or repeated frameworks and failed enumeration discarded branches or crashed publication"
+    )]
+    #[hardwon("#7314: symbol PropertyGroup conditions were reevaluated after sibling assignments")]
+    #[hardwon("419d2f57df9a: early props saw a seeded TargetFramework in a single-target project")]
+    #[hardwon("541f8d3d8b24: framework enumeration ignored assignments at import positions")]
+    #[hardwon("9b78a10914df: locally treated framework globals produced closed symbol sets")]
     fn selected_compilation_symbols_match_the_compiler_golden() {
         use std::fmt::Write;
         let fixture_root =
@@ -3480,7 +3929,7 @@ mod tests {
             // Force publication before reading the selected rows.
             analyzer.selected_compilations().unwrap().unwrap();
             let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
-            let mut statement = conn.prepare("SELECT c.compilation_id, c.project_path, c.configuration, c.target_framework, c.symbols_closed, c.open_reason, lower(hex(c.symbol_set_digest)) FROM csharp_compilations c JOIN csharp_compilation_selections s ON s.set_id = c.set_id ORDER BY c.project_path").unwrap();
+            let mut statement = conn.prepare("SELECT c.compilation_id, c.project_path, c.configuration, c.target_framework, c.symbols_closed, c.open_reason, lower(hex(c.symbol_set_digest)), json(c.named_open_symbols) FROM csharp_compilations c JOIN csharp_compilation_selections s ON s.set_id = c.set_id ORDER BY c.project_path, c.target_framework").unwrap();
             let rows = statement
                 .query_map([], |row| {
                     Ok((
@@ -3491,13 +3940,16 @@ mod tests {
                         row.get::<_, bool>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 })
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             let mut output = String::new();
-            for (id, path, configuration, framework, closed, reason, digest) in rows {
+            for (id, path, configuration, framework, closed, reason, digest, named_open) in rows {
+                let named_open: BTreeSet<String> = serde_json::from_str(&named_open).unwrap();
+                writeln!(output, "named-open={named_open:?}").unwrap();
                 writeln!(output, "{path:?}: configuration={configuration} framework={framework:?} closed={closed} reason={reason:?} digest={digest}").unwrap();
                 let mut symbols = conn.prepare("SELECT symbol, source FROM csharp_compilation_symbols WHERE compilation_id = ?1 ORDER BY symbol").unwrap();
                 let symbols = symbols
@@ -3533,6 +3985,12 @@ mod tests {
                             "unprobed symbols: {actual:?}"
                         );
                         if closed {
+                            // The compiler oracle selected Debug; configuration symbols
+                            // are deliberately unknown in the analyzer environment.
+                            let expected = expected
+                                .difference(&named_open)
+                                .cloned()
+                                .collect::<BTreeSet<_>>();
                             assert_eq!(expected, actual, "{path}");
                         } else {
                             assert!(actual.is_subset(&expected), "{path}: {actual:?}");
@@ -3571,11 +4029,15 @@ mod tests {
         let after = capture();
         let digest =
             |inputs: &[brokk_bifrost_analysis::analyzer::store::WorkspaceConfigurationInput]| {
-                brokk_bifrost_analysis::analyzer::store::configuration_digest(
-                    inputs
-                        .iter()
-                        .map(|input| (input.relative_path(), input.content_oid())),
-                )
+                brokk_bifrost_analysis::analyzer::store::configuration_digest(inputs.iter().map(
+                    |input| {
+                        (
+                            input.relative_path(),
+                            input.content_oid(),
+                            Some(input.file_present),
+                        )
+                    },
+                ))
             };
         assert_ne!(digest(&before), digest(&after));
         let set_digest = |analyzer: &CSharpAnalyzer| {
@@ -3628,14 +4090,89 @@ mod tests {
             analyzer.inner.analyzer_store().read_conn().unwrap().prepare("SELECT symbol FROM csharp_compilation_symbols s JOIN csharp_compilations c USING(compilation_id) WHERE c.project_path = 'Console/Console.csproj' AND c.set_id = (SELECT max(set_id) FROM csharp_compilation_sets) ORDER BY symbol").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<Result<BTreeSet<_>, _>>().unwrap()
         };
         assert!(symbols(&edited).contains("ANCESTOR_EDIT"));
+        // The root props file proves Console's membership before a nearer file appears.
+        let console_membership = |analyzer: &CSharpAnalyzer| {
+            let selected = analyzer.selected_compilations().unwrap().unwrap();
+            let membership = selected
+                .compilations_of("Console/Source.cs")
+                .unwrap()
+                .unwrap();
+            let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+            let console_id: i64 = conn.query_row(
+                "SELECT compilation_id FROM csharp_compilations WHERE project_path = 'Console/Console.csproj' AND set_id = (SELECT max(set_id) FROM csharp_compilation_sets)",
+                [],
+                |row| row.get(0),
+            ).unwrap();
+            (console_id, membership)
+        };
+        let (console_id, root_membership) = console_membership(&edited);
+        assert!(root_membership.proven.contains(&console_id));
+        assert!(
+            !root_membership
+                .open
+                .iter()
+                .any(|item| item.compilation_id == console_id)
+        );
         writeln!(
             output,
             "ignored ancestor props edit changes set digest and defines ANCESTOR_EDIT: true"
         )
         .unwrap();
+        let probe_state = |analyzer: &CSharpAnalyzer| {
+            let conn = analyzer.inner.analyzer_store().read_conn().unwrap();
+            let revision: i64 = conn
+                .query_row(
+                    "SELECT max(revision) FROM workspace_revisions WHERE lang='csharp'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let rows = conn.prepare(
+                "SELECT rel_path, blob_oid, file_present FROM workspace_file_versions WHERE lang='csharp' AND input_kind='configuration' AND valid_until IS NULL ORDER BY rel_path"
+            ).unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<bool>>(2)?)))
+                .unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            let present = rows
+                .iter()
+                .find(|(path, _, _)| path == "Console/Directory.Build.props")
+                .expect("retained probe")
+                .2;
+            let digest = brokk_bifrost_analysis::analyzer::store::configuration_digest(
+                rows.iter().map(|(path, oid, present)| {
+                    (path.as_str(), git2::Oid::from_str(oid).unwrap(), *present)
+                }),
+            );
+            (present, revision, digest)
+        };
+        let before_probe = probe_state(&edited);
+        assert_eq!(before_probe.0, Some(false));
         let previous = set_digest(&edited);
+        fs::write(root.path().join("Console/Directory.Build.props"), "").unwrap();
+        let empty_nearer = edited.update_all();
+        assert_ne!(previous, set_digest(&empty_nearer));
+        let after_probe = probe_state(&empty_nearer);
+        assert_eq!(after_probe.0, Some(true));
+        assert!(after_probe.1 > before_probe.1);
+        assert_ne!(after_probe.2, before_probe.2);
+        let (new_console_id, placement) = console_membership(&empty_nearer);
+        assert!(!placement.proven.contains(&new_console_id));
+        let console_open = placement
+            .open
+            .iter()
+            .find(|item| item.compilation_id == new_console_id)
+            .expect("present empty nearer props opens Console membership");
+        assert!(
+            console_open
+                .regions
+                .iter()
+                .flat_map(|region| &region.gaps)
+                .any(|gap| gap.path == "Console/Directory.Build.props"
+                    && gap.code == "unsupported_project_items"
+                    && gap.evidence == "invalid XML or unsupported project shape")
+        );
+        writeln!(output, "present empty nearer props opens membership: true").unwrap();
+        let previous = set_digest(&empty_nearer);
         fs::write(root.path().join("Console/Directory.Build.props"), "<Project><PropertyGroup><DefineConstants>NEARER</DefineConstants></PropertyGroup></Project>").unwrap();
-        let nearer = edited.update_all();
+        let nearer = empty_nearer.update_all();
         assert_ne!(previous, set_digest(&nearer));
         assert!(symbols(&nearer).contains("NEARER"));
         assert!(!symbols(&nearer).contains("ANCESTOR_EDIT"));
@@ -3702,8 +4239,27 @@ mod tests {
             .expect("published compilation set");
         let mut rendered = String::new();
         for name in projects {
+            let membership = selection
+                .compilations_of(&format!("{name}/Source.cs"))
+                .unwrap()
+                .unwrap();
+            let project_path = format!("{name}/{name}.csproj");
+            let compilation_id = membership
+                .proven
+                .first()
+                .copied()
+                .or_else(|| {
+                    membership
+                        .open
+                        .iter()
+                        .find(|placement| {
+                            placement.project_path.as_deref() == Some(project_path.as_str())
+                        })
+                        .map(|placement| placement.compilation_id)
+                })
+                .expect("fixture project has a proven or open placement");
             let metadata = selection
-                .metadata(Some(&format!("{name}/{name}.csproj")))
+                .metadata(compilation_id)
                 .unwrap()
                 .expect("selected compilation");
             writeln!(rendered, "{name}: assembly={:?}", metadata.assembly_name).unwrap();
@@ -3797,6 +4353,82 @@ mod tests {
                 "membership must retain the source inventory containing Declared.cs: {keys:?}"
             );
         }
+    }
+
+    #[test]
+    #[hardwon(
+        "#8837: an absent-to-empty props transition replayed a retained proven membership answer"
+    )]
+    fn retained_membership_answer_opens_after_empty_nearer_props_appears() {
+        use brokk_bifrost_analysis::analyzer::{
+            FactSubject, LookupQuestion, ReadKey, WorkspaceFactFamily, capture_query_reads,
+        };
+        use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
+        use brokk_bifrost_csharp::graph::membership_scope::MembershipScopedSource;
+
+        let (root, project, _, analyzer) = analyzed(&[
+            ("Directory.Build.props", "<Project/>"),
+            ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />"),
+            ("App/Caller.cs", "class Caller {}"),
+            ("App/Declared.cs", "class Declared {}"),
+        ]);
+        let reference = file(&project, "App/Caller.cs");
+        let declaring = file(&project, "App/Declared.cs");
+        let unit = analyzer
+            .declarations(&declaring)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("declared class");
+
+        // Warm the retained membership route before the configuration changes.
+        let (_, reads) = capture_query_reads(&analyzer, || {
+            let membership = MembershipScopedSource::new(&analyzer, &reference);
+            assert!(membership.admit(&unit));
+            assert!(membership.admit(&unit));
+            assert_eq!(membership.doubt(), 0);
+        });
+        assert!(
+            reads.keys().iter().any(|key| matches!(
+                key,
+                ReadKey::Lookup {
+                    question: LookupQuestion::WorkspaceFact {
+                        family: WorkspaceFactFamily::CSharpCompilationConfiguration,
+                        language: Language::CSharp,
+                        subject: FactSubject::Whole,
+                    },
+                    ..
+                }
+            )),
+            "retained membership must depend on configuration: {:?}",
+            reads.keys()
+        );
+
+        fs::write(root.path().join("App/Directory.Build.props"), "").unwrap();
+        let updated = analyzer.update_all();
+        let (_, reads) = capture_query_reads(&updated, || {
+            let membership = MembershipScopedSource::new(&updated, &reference);
+            assert!(membership.admit(&unit));
+            assert!(membership.admit(&unit));
+            assert!(
+                membership.doubt() > 0,
+                "empty nearer props must open the retained membership answer"
+            );
+        });
+        assert!(
+            reads.keys().iter().any(|key| matches!(
+                key,
+                ReadKey::Lookup {
+                    question: LookupQuestion::WorkspaceFact {
+                        family: WorkspaceFactFamily::CSharpCompilationConfiguration,
+                        language: Language::CSharp,
+                        subject: FactSubject::Whole,
+                    },
+                    ..
+                }
+            )),
+            "updated membership must retain new configuration authority: {:?}",
+            reads.keys()
+        );
     }
 
     #[test]
@@ -4597,6 +5229,41 @@ mod tests {
     }
 
     #[test]
+    fn selected_compilation_input_identity_matches_capture_after_absent_probe_appears() {
+        let (root, project, _, analyzer) = analyzed(&[
+            (
+                "Directory.Build.props",
+                "<Project><PropertyGroup><DefineConstants>ROOT</DefineConstants></PropertyGroup></Project>",
+            ),
+            ("App/Directory.Build.props", ""),
+            ("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"/>"),
+            ("App/Program.cs", "class Program {}"),
+        ]);
+        let inputs = brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::workspace_configuration_inputs(
+            project.as_ref(), analyzer.inner.adapter(), None,
+        ).unwrap();
+        assert!(inputs.iter().any(
+            |input| input.relative_path() == "App/Directory.Build.targets" && !input.file_present
+        ));
+        let selected = |analyzer: &CSharpAnalyzer| {
+            let identity = analyzer
+                .compilation_input_digest()
+                .expect("complete configuration");
+            let selection = analyzer
+                .selected_compilations()
+                .expect("store read")
+                .expect("selected set");
+            assert_eq!(identity.as_bytes(), &selection.input_digest());
+            identity
+        };
+        let before = selected(&analyzer);
+        fs::write(root.path().join("App/Directory.Build.targets"), "").unwrap();
+        let updated = analyzer.update_all();
+        let after = selected(&updated);
+        assert_ne!(before, after);
+    }
+
+    #[test]
     fn disabled_default_items_do_not_claim_directory_sources() {
         let (_root, project, analyzed, analyzer) = analyzed(&[
             (
@@ -4711,17 +5378,37 @@ mod tests {
     }
 
     fn facts_of(files: &[(&str, &str)]) -> CSharpCompilationFacts {
-        let inputs = files
+        let mut inputs = files
             .iter()
             .map(|(path, source)| CSharpConfigurationInput {
                 rel_path: (*path).to_owned(),
-                source: Some(source.as_bytes().to_vec()),
+                source: CSharpConfigurationSource::Bytes(source.as_bytes().into()),
             })
             .collect::<Vec<_>>();
+        for (path, _) in files.iter().filter(|(path, _)| path.ends_with(".csproj")) {
+            let directory = Path::new(path).parent().expect("project parent");
+            for ancestor in directory.ancestors() {
+                for name in [
+                    "Directory.Build.props",
+                    "Directory.Build.targets",
+                    "Directory.Packages.props",
+                ] {
+                    let candidate = portable_rel_path(&ancestor.join(name));
+                    if !inputs.iter().any(|input| input.rel_path == candidate) {
+                        inputs.push(CSharpConfigurationInput {
+                            rel_path: candidate,
+                            source: CSharpConfigurationSource::Absent,
+                        });
+                    }
+                }
+            }
+        }
+        inputs.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
         compilation_facts(&inputs)
     }
 
     #[test]
+    #[hardwon("#8837: absent intermediate probes stopped GetPathOfFileAbove before a root file")]
     fn get_path_of_file_above_membership_golden() {
         use std::fmt::Write;
         let resolved_files = [
@@ -4817,8 +5504,29 @@ mod tests {
             ("src/App/Source.cs", "class Source {}"),
             ("src/App/Extra.cs", "class Extra {}"),
         ];
+        let absent_intermediate_files = [
+            (
+                "Directory.Build.props",
+                "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+            ),
+            (
+                "nested/one/two/Directory.Build.props",
+                "<Project><Import Project=\"$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))\" /></Project>",
+            ),
+            (
+                "nested/one/two/App.csproj",
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup><Compile Include=\"Source.cs\" /></ItemGroup></Project>",
+            ),
+            ("nested/one/two/Source.cs", "class Source {}"),
+            ("nested/one/two/Extra.cs", "class Extra {}"),
+        ];
         let mut output = String::new();
         for (label, files, paths) in [
+            (
+                "absent-intermediate",
+                absent_intermediate_files.as_slice(),
+                &["nested/one/two/Source.cs", "nested/one/two/Extra.cs"][..],
+            ),
             (
                 "resolved",
                 resolved_files.as_slice(),
@@ -4887,6 +5595,424 @@ mod tests {
         let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/golden/get-path-of-file-above/expected.txt");
         if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::write(&expected, &output).unwrap();
+        }
+        assert_eq!(fs::read_to_string(expected).unwrap(), output);
+    }
+
+    #[test]
+    #[hardwon("#10356: derived Razor and Web SDK projects left every hand-written source open")]
+    fn derived_sdk_membership_golden() {
+        use std::fmt::Write;
+        let mut output = String::new();
+        for sdk in ["Microsoft.NET.Sdk.Razor"] {
+            let project = format!(
+                r#"<Project Sdk="{sdk}"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>"#
+            );
+            let files = [
+                ("App/App.csproj", project.as_str()),
+                ("App/A.cs", "class A {}"),
+                ("App/obj/Debug/net10.0/Generated.cs", "class Generated {}"),
+            ];
+            let (_root, _, _, analyzer) = analyzed(&files);
+            writeln!(output, "{sdk}:").unwrap();
+            for path in ["App/A.cs", "App/obj/Debug/net10.0/Generated.cs"] {
+                writeln!(output, "{path}: {}", membership(&analyzer, path)).unwrap();
+            }
+            let facts = facts_of(&files);
+            assert!(!facts.compilations[0].inventory_gap_indices.is_empty());
+        }
+        for (label, properties, collision) in [
+            (
+                "no-framework-suffix",
+                "<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>",
+                "App/obj/Debug/EmbeddedAttribute.cs",
+            ),
+            (
+                "unknown-output",
+                "<IntermediateOutputPath>$(ExternalOutput)</IntermediateOutputPath>",
+                "Sibling/EmbeddedAttribute.cs",
+            ),
+        ] {
+            let project = format!(
+                r#"<Project Sdk="Microsoft.NET.Sdk.Razor"><PropertyGroup><TargetFramework>net10.0</TargetFramework>{properties}</PropertyGroup></Project>"#
+            );
+            let files = [
+                ("App/App.csproj", project.as_str()),
+                (collision, "class EmbeddedAttribute {}"),
+            ];
+            let (_root, _, _, analyzer) = analyzed(&files);
+            writeln!(
+                output,
+                "{label}: {collision}: {}",
+                membership(&analyzer, collision)
+            )
+            .unwrap();
+        }
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/derived-sdk-membership/expected.txt");
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::write(&expected, &output).unwrap();
+        }
+        assert_eq!(fs::read_to_string(expected).unwrap(), output);
+    }
+
+    #[test]
+    #[hardwon(
+        "#7314: a property the project defaults later left Newtonsoft's conditioned output roots open (AD3d)"
+    )]
+    #[hardwon(
+        "#7314: AD3d EC2 r5: an unknown operand in an and hid its false operand, leaving Newtonsoft's library open"
+    )]
+    fn ordered_property_evaluation_membership_golden() {
+        use std::fmt::Write;
+        // Newtonsoft.Json's shape: Directory.Build.props reads a property the
+        // project body defaults later. In MSBuild order it is still empty at the
+        // props, so the redirecting group never executes.
+        let props = r#"<Project><PropertyGroup Condition="'$(MSBuildProjectName)'=='App' and '$(LibFramework)'!=''"><BaseIntermediateOutputPath>obj\$(LibFramework)\</BaseIntermediateOutputPath><BaseOutputPath>bin\$(LibFramework)\</BaseOutputPath><DefaultItemExcludes>$(DefaultItemExcludes);obj\**;bin\**</DefaultItemExcludes></PropertyGroup></Project>"#;
+        let defaulted_later = [
+            ("Directory.Build.props", props),
+            (
+                "App/App.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><PropertyGroup Condition="'$(TargetFramework)'=='net8.0'"><LibFramework Condition="'$(LibFramework)'==''">$(TargetFramework)</LibFramework></PropertyGroup></Project>"#,
+            ),
+            ("App/A.cs", "class A {}"),
+        ];
+        // The twin: nothing in the tree assigns the property, so its value can
+        // only come from outside the declared workspace and the roots stay open.
+        let never_assigned = [
+            ("Directory.Build.props", props),
+            (
+                "App/App.csproj",
+                r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>"#,
+            ),
+            ("App/A.cs", "class A {}"),
+        ];
+        // Three-valued conditions over the never-assigned property: the known
+        // parts decide the first three (Newtonsoft.Json's library names another
+        // project), and the unknown operand truly decides the last.
+        let condition = "'$(MSBuildProjectName)'=='App' and '$(LibFramework)'!=''";
+        let variant = |replacement: &str| props.replace(condition, replacement);
+        let decided = [
+            (
+                "other-project-never-assigned",
+                variant("'$(MSBuildProjectName)'=='Tests' and '$(LibFramework)'!=''"),
+            ),
+            (
+                "nested-decided-by-known-parts",
+                variant("!('$(MSBuildProjectName)'=='App' or ('$(LibFramework)'=='a' and false))"),
+            ),
+            (
+                "function-and-false",
+                variant("Exists('$(LibFramework)') and '$(MSBuildProjectName)'=='Tests'"),
+            ),
+            (
+                "unknown-decides-or",
+                variant("'$(MSBuildProjectName)'=='Tests' or '$(LibFramework)'!=''"),
+            ),
+        ];
+        let decided = decided
+            .iter()
+            .map(|(label, props)| {
+                (
+                    *label,
+                    [
+                        ("Directory.Build.props", props.as_str()),
+                        never_assigned[1],
+                        never_assigned[2],
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut output = String::new();
+        for (label, files) in [
+            ("defaulted-later", defaulted_later.as_slice()),
+            ("never-assigned", never_assigned.as_slice()),
+        ]
+        .into_iter()
+        .chain(
+            decided
+                .iter()
+                .map(|(label, files)| (*label, files.as_slice())),
+        ) {
+            writeln!(output, "{label}:").unwrap();
+            let (_root, _, _, analyzer) = analyzed(files);
+            let facts = facts_of(files);
+            writeln!(output, "App/A.cs: {}", membership(&analyzer, "App/A.cs")).unwrap();
+            for gap in &facts.gaps {
+                writeln!(output, "gap={} {:?}: {}", gap.code, gap.path, gap.evidence).unwrap();
+            }
+        }
+        for (label, item, property, path) in [
+            (
+                "item-property-later",
+                r#"<Compile Include="$(Gen)\B.cs" />"#,
+                "<Gen>Generated</Gen>",
+                "App/Generated/B.cs",
+            ),
+            (
+                "item-property-unassigned",
+                r#"<Compile Include="$(Gen)\B.cs" />"#,
+                "",
+                "App/Generated/B.cs",
+            ),
+            (
+                "item-condition-on-later",
+                r#"<Compile Include="C.cs" Condition="'$(Flag)'=='on'" />"#,
+                "<Flag>on</Flag>",
+                "App/C.cs",
+            ),
+            (
+                "item-condition-off-later",
+                r#"<Compile Include="C.cs" Condition="'$(Flag)'=='on'" />"#,
+                "<Flag>off</Flag>",
+                "App/C.cs",
+            ),
+            // MSBuild compares numbers numerically: '01' equals '1', so this
+            // differing spelling stays undecided rather than a false guard.
+            (
+                "item-condition-numeric-spelling",
+                r#"<Compile Include="C.cs" Condition="'$(N)'=='1'" />"#,
+                "<N>01</N>",
+                "App/C.cs",
+            ),
+        ] {
+            let project = format!(
+                r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup>{item}</ItemGroup><PropertyGroup>{property}</PropertyGroup></Project>"#
+            );
+            let files = [("App/App.csproj", project.as_str()), (path, "class C {}")];
+            writeln!(output, "{label}:").unwrap();
+            let (_root, _, _, analyzer) = analyzed(&files);
+            writeln!(output, "{path}: {}", membership(&analyzer, path)).unwrap();
+            for gap in &facts_of(&files).gaps {
+                writeln!(output, "gap={} {:?}: {}", gap.code, gap.path, gap.evidence).unwrap();
+            }
+        }
+        // Review regressions. Each comment says what MSBuild does; the earlier
+        // pass decided each of the first three as a false "member".
+        let disable_when = |condition: &str| {
+            format!(
+                r#"<Project><PropertyGroup Condition="{condition}"><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>"#
+            )
+        };
+        let mode_is_x = disable_when("'$(Mode)'=='x'");
+        let sdk_is_set = disable_when("'$(UsingMicrosoftNETSdk)'=='true'");
+        let off_is_empty = disable_when("'$(Off)'==''");
+        let q_is_empty_project = r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup Condition="'$(Q)'==''"><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>"#;
+        for (label, files) in [
+            // The project assigns Mode before importing Mode.props, which then
+            // disables default items; the chain cannot order the two exactly.
+            (
+                "import-order",
+                vec![
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Mode>x</Mode></PropertyGroup><Import Project="Mode.props" /></Project>"#,
+                    ),
+                    ("App/Mode.props", mode_is_x.as_str()),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            // Sdk.props sets UsingMicrosoftNETSdk before Directory.Build.props.
+            (
+                "sdk-property",
+                vec![
+                    ("Directory.Build.props", sdk_is_set.as_str()),
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><UsingMicrosoftNETSdk>true</UsingMicrosoftNETSdk></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            // Off is empty at the props, so default items are disabled; a true
+            // guard is not applied to the parse's default-item properties.
+            (
+                "true-guard",
+                vec![
+                    ("Directory.Build.props", off_is_empty.as_str()),
+                    (
+                        "App/App.csproj",
+                        r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><Off>x</Off></PropertyGroup></Project>"#,
+                    ),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+            // The group's guard holds on entry, so Q is assigned even though P
+            // changes first; the project's guard on Q is then false.
+            (
+                "group-entry",
+                vec![
+                    (
+                        "Directory.Build.props",
+                        r#"<Project><PropertyGroup Condition="'$(P)'==''"><P>x</P><Q>y</Q></PropertyGroup></Project>"#,
+                    ),
+                    ("App/App.csproj", q_is_empty_project),
+                    ("App/A.cs", "class A {}"),
+                ],
+            ),
+        ] {
+            writeln!(output, "{label}:").unwrap();
+            let (_root, _, _, analyzer) = analyzed(&files);
+            writeln!(output, "App/A.cs: {}", membership(&analyzer, "App/A.cs")).unwrap();
+            for gap in &facts_of(&files).gaps {
+                writeln!(output, "gap={} {:?}: {}", gap.code, gap.path, gap.evidence).unwrap();
+            }
+        }
+        // Configuration is deliberately not an instance dimension. Exercise the
+        // persisted owner environment, including project-authored DEBUG.
+        // Configuration-conditioned DefineConstants keeps the whole environment
+        // open in this slice. The following ordered-evaluation step narrows that.
+        for (label, properties, frameworks, items) in [
+            ("configuration-open", "", vec!["net10.0"], ""),
+            (
+                "configuration-expansion",
+                "<DefineConstants>$(Configuration)</DefineConstants>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "configuration-alias",
+                "<Alias>$(Configuration)</Alias><DefineConstants>$(Alias)</DefineConstants>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "configuration-explicit",
+                "<DefineConstants>DEBUG;TRACE</DefineConstants>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "configuration-authored",
+                "<Configurations>Debug;Release;Staging;Test-Foo.Bar Baz</Configurations>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "configuration-disabled",
+                "<Configurations>Debug;Release;Staging</Configurations><DisableImplicitConfigurationDefines>true</DisableImplicitConfigurationDefines>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "configuration-condition",
+                "<DefineConstants Condition=\"'$(Configuration)'=='Staging'\">CUSTOM</DefineConstants>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "framework-multiple",
+                "",
+                vec!["net8.0", "netstandard2.0"],
+                "",
+            ),
+            ("framework-single", "", vec!["net8.0"], ""),
+            (
+                "framework-conditioned-constants",
+                r#"<DefineConstants Condition="'$(TargetFramework)'=='net8.0'">$(DefineConstants);MODERN</DefineConstants>"#,
+                vec!["net6.0", "net8.0", "net8.0-windows"],
+                "",
+            ),
+            (
+                "framework-defines-disabled",
+                "<DisableImplicitFrameworkDefines>true</DisableImplicitFrameworkDefines>",
+                vec!["net6.0", "net8.0", "net8.0-windows"],
+                "",
+            ),
+            (
+                "configuration-default",
+                "<Configuration Condition=\"'$(Configuration)'==''\">Staging</Configuration>",
+                vec!["net10.0"],
+                "",
+            ),
+            (
+                "configuration-composite",
+                "",
+                vec!["net10.0"],
+                "<ItemGroup Condition=\"'$(Configuration)|$(Platform)' == 'Staging|AnyCPU'\"><None Include=\"readme.txt\" /></ItemGroup>",
+            ),
+        ] {
+            use brokk_bifrost_csharp::preprocessor::{
+                OwnerEnvironments, SymbolEnvironment, scan_and_decide_preprocessor,
+            };
+            let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/golden/compilation-symbols/Append/obj");
+            let props = fs::read_to_string(assets.join("Append.csproj.nuget.g.props")).unwrap();
+            let targets = fs::read_to_string(assets.join("Append.csproj.nuget.g.targets")).unwrap();
+            let mut assets: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(assets.join("project.assets.json")).unwrap(),
+            )
+            .unwrap();
+            assets["project"]["restore"]["originalTargetFrameworks"] =
+                serde_json::json!(frameworks);
+            let assets = serde_json::to_string(&assets).unwrap();
+            let framework_property = if frameworks.len() == 1 {
+                format!("<TargetFramework>{}</TargetFramework>", frameworks[0])
+            } else {
+                format!(
+                    "<TargetFrameworks>{}</TargetFrameworks>",
+                    frameworks.join(";")
+                )
+            };
+            let project = format!(
+                "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>{framework_property}{properties}</PropertyGroup>{items}</Project>"
+            );
+            let (_root, _, _, analyzer) = analyzed(&[
+                ("Append/Append.csproj", &project),
+                ("Append/Source.cs", "class Source {}"),
+                ("Append/obj/Append.csproj.nuget.g.props", &props),
+                ("Append/obj/Append.csproj.nuget.g.targets", &targets),
+                ("Append/obj/project.assets.json", &assets),
+            ]);
+            let selected = analyzer.selected_compilations().unwrap().unwrap();
+            let configuration = selected.configurations().unwrap().remove(0);
+            let membership = selected
+                .compilations_of("Append/Source.cs")
+                .unwrap()
+                .unwrap();
+            let owners = membership
+                .proven
+                .iter()
+                .map(|&id| {
+                    let environment = analyzer
+                        .inner
+                        .analyzer_store()
+                        .csharp_owner_environment(id)
+                        .unwrap()
+                        .unwrap();
+                    SymbolEnvironment {
+                        compilation_key: environment.owner_key,
+                        defined: environment.symbols.into_iter().collect(),
+                        named_open: environment.named_open.into_iter().collect(),
+                        closed: environment.closed,
+                        open_reason: environment.open_reason,
+                    }
+                })
+                .collect::<Vec<_>>();
+            writeln!(output, "{label}: named-open={:?}", configuration.named_open).unwrap();
+            for symbol in [
+                "DEBUG",
+                "Debug",
+                "RELEASE",
+                "TRACE",
+                "STAGING",
+                "TEST_FOO_BAR_BAZ",
+                "UNRELATED",
+                "NET8_0_OR_GREATER",
+                "MODERN",
+            ] {
+                let source = format!(
+                    "#if {symbol}\nclass Enabled {{}}\n#else\nclass Disabled {{}}\n#endif\n"
+                );
+                let scan = scan_and_decide_preprocessor(&source, OwnerEnvironments::Known(&owners));
+                writeln!(output, "{symbol}: {:?}", scan.decisions.chains).unwrap();
+            }
+        }
+        let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/golden/ordered-property-evaluation/expected.txt");
+        if std::env::var_os("BIFROST_BLESS").is_some() {
+            fs::create_dir_all(expected.parent().unwrap()).unwrap();
             fs::write(&expected, &output).unwrap();
         }
         assert_eq!(fs::read_to_string(expected).unwrap(), output);

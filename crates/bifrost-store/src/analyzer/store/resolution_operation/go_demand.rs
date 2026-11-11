@@ -10,13 +10,143 @@ use super::go_named::{
 };
 use super::*;
 use crate::analyzer::resolution::DemandReferenceKey;
-#[cfg(any(test, feature = "test-support"))]
 use crate::analyzer::resolution::DemandRelationKey;
 use crate::analyzer::resolution::{
     DemandRootUnavailableReason, EndpointSignature, LoweringGapOrigin,
     SelectedResolutionMountContext,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+
+#[cfg(any(test, feature = "test-support"))]
+static GO_UNPROVIDED_MEMBER_PROBE: std::sync::Mutex<Option<Vec<(String, bool)>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn start_go_unprovided_member_probe_for_test() {
+    *GO_UNPROVIDED_MEMBER_PROBE.lock().unwrap() = Some(Vec::new());
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_go_unprovided_member_probe_for_test() -> Vec<(String, bool)> {
+    GO_UNPROVIDED_MEMBER_PROBE
+        .lock()
+        .unwrap()
+        .take()
+        .expect("Go unprovided-member probe started")
+}
+
+/// The demand that authorized one Go terminal's provider rows. A root frame
+/// with a selected source context reads that prepared context; every other
+/// root reads the operation's own caller demand. `GoRules::terminal_demand`
+/// is the only selector, so provider rows and closure policy agree on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GoTerminalDemand {
+    Prepared(super::go_named::GoPreparedContextKey),
+    Caller {
+        context_id: i64,
+        caller: SelectedResolutionMountOrdinal,
+        preparation: Option<super::go_named::GoPreparedContextKey>,
+    },
+}
+
+/// The current authority of one Go terminal's import binder: the selected
+/// demand, the binder's modeled import in that demand, the active model set,
+/// and the read authority. A recorded owner selection is usable only under an
+/// equal authority that the consumer obtained itself; the witness never
+/// supplies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GoTerminalAuthority {
+    pub demand: GoTerminalDemand,
+    pub binder_import: super::go_named::GoSelectedExternalImport,
+    pub active_model_set_hash: String,
+    pub seed_authority: crate::analyzer::resolution::SeedReadAuthority,
+}
+
+/// One selected Go type owner, recorded only when a Complete single-binder
+/// import selected a unique pack declaration and its typed slot projection was
+/// read exhaustively. Its validity is `authority`, kept apart from the owner's
+/// semantic identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GoExternalTypeWitness {
+    pub source_node: BindingNodeId,
+    pub owner_semantic: SemanticId,
+    pub owner_provider: crate::analyzer::semantic_model::overlay::ModelProvider,
+    pub qualified_name: String,
+    pub kind: crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind,
+    pub authority: GoTerminalAuthority,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GoSelectionReceipt {
+    relation: DemandRelationKey,
+    half: super::demand_closure::HalfId,
+    mount: SelectedResolutionMountOrdinal,
+    source_node: BindingNodeId,
+    targets: Box<[SemanticId]>,
+    completion: ResolutionCompletion,
+    epoch: u64,
+}
+
+/// Which selection produced each external-owner slot, for one operation.
+/// A close attempt retires its relation's earlier receipts, so an occurrence
+/// can certify only while the attempt that recorded it is current and
+/// finalized.
+#[derive(Default)]
+struct GoReceiptStore {
+    attempt_epochs: HashMap<DemandRelationKey, u64>,
+    receipts: HashMap<(SemanticId, SemanticId), Vec<GoSelectionReceipt>>,
+    /// The slots each relation's current attempt recorded, so a new attempt
+    /// retires its own receipts without scanning every other relation's.
+    recorded: HashMap<DemandRelationKey, Vec<(SemanticId, SemanticId)>>,
+}
+
+impl GoReceiptStore {
+    fn begin_attempt(&mut self, relation: &DemandRelationKey, epoch: u64) {
+        self.attempt_epochs.insert(relation.clone(), epoch);
+        for key in self.recorded.remove(relation).unwrap_or_default() {
+            let Some(occurrences) = self.receipts.get_mut(&key) else {
+                continue;
+            };
+            occurrences.retain(|receipt| receipt.relation != *relation);
+            if occurrences.is_empty() {
+                self.receipts.remove(&key);
+            }
+        }
+    }
+
+    fn attempt_epoch(&self, relation: &DemandRelationKey) -> u64 {
+        *self
+            .attempt_epochs
+            .get(relation)
+            .expect("Go terminal runs inside a close attempt")
+    }
+
+    fn record(&mut self, key: (SemanticId, SemanticId), receipt: GoSelectionReceipt) {
+        self.recorded
+            .entry(receipt.relation.clone())
+            .or_default()
+            .push(key);
+        self.receipts.entry(key).or_default().push(receipt);
+    }
+
+    /// The selection that currently produces this slot, when every current
+    /// occurrence agrees on it exactly.
+    fn current(
+        &self,
+        key: (SemanticId, SemanticId),
+        retained: &dyn super::demand::RetainedFrame,
+    ) -> Option<&GoSelectionReceipt> {
+        let mut current = self
+            .receipts
+            .get(&key)?
+            .iter()
+            .filter(|receipt| retained.attempt_is_current(&receipt.relation, receipt.epoch));
+        let receipt = current.next()?;
+        current.all(|other| other == receipt).then_some(receipt)
+    }
+}
 
 /// A provider owns registration independently of the name currently demanded.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -90,6 +220,7 @@ struct GoDemandState<'a, 'store, 'input> {
         HashMap<SelectedResolutionMountOrdinal, HashMap<SemanticId, Vec<SelectedRootPathHalf>>>,
     source_roles: HashMap<SelectedResolutionMountOrdinal, GoSourceRoleEntry>,
     base_context_mounts: HashSet<SelectedResolutionMountOrdinal>,
+    receipts: GoReceiptStore,
     #[cfg(any(test, feature = "test-support"))]
     prepared_root_source_halves:
         HashMap<EndpointSignature, Option<super::source_demand::SelectedRootSource>>,
@@ -368,6 +499,7 @@ impl<'store, 'input> GoDemandState<'_, 'store, 'input> {
             self.base,
             &persisted_lexical,
             &typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
             self.cancellation,
             self.session,
             |operation| {
@@ -612,6 +744,54 @@ struct GoRules<'a, 'request, 'store, 'input> {
 }
 
 impl GoRules<'_, '_, '_, '_> {
+    /// The only selector of the demand that a terminal's provider rows read:
+    /// the frame's prepared source context, or else the operation's own caller
+    /// demand.
+    fn terminal_demand(
+        &self,
+        frame: &super::demand_closure::RootFrame,
+    ) -> (GoTerminalDemand, &GoDemandContext) {
+        match frame.context.and_then(|key| self.prepared.get(&key)) {
+            Some(prepared) => (
+                GoTerminalDemand::Prepared(prepared.preparation.clone()),
+                &prepared.demand,
+            ),
+            None => (
+                GoTerminalDemand::Caller {
+                    context_id: self.language.demand.context_id,
+                    caller: self.language.caller,
+                    preparation: self.preparation.clone(),
+                },
+                &self.language.demand,
+            ),
+        }
+    }
+
+    /// The current authority of `binder` at `source_mount` for this frame's
+    /// terminal, built from the same selector as the provider rows. `None`
+    /// when that demand models no import for the binder or no model authority
+    /// is active, so nothing can validate.
+    pub(super) fn terminal_authority(
+        &self,
+        frame: &super::demand_closure::RootFrame,
+        source_mount: SelectedResolutionMountOrdinal,
+        binder: SemanticId,
+    ) -> Option<GoTerminalAuthority> {
+        let (demand, context) = self.terminal_demand(frame);
+        let binder_import = context
+            .modeled_imports
+            .get(&(source_mount, binder))?
+            .clone();
+        let ready = &self.language.operation.ready;
+        let models = ready.model_authority()?;
+        Some(GoTerminalAuthority {
+            demand,
+            binder_import,
+            active_model_set_hash: models.active_model_set_hash().to_owned(),
+            seed_authority: ready.inventory.seed_read_authority(),
+        })
+    }
+
     fn source(&self, frame: &super::demand_closure::RootFrame) -> Result<GoSourceDemand> {
         let qualified = frame.halves.first().cloned();
         let mount = if let Some(SelectedRootPathHalf::Reference { identity, .. }) = &qualified {
@@ -866,6 +1046,48 @@ impl super::demand_closure::PublicationCertificate for GoPublicationCertificate<
 impl<'request, 'store, 'input> super::demand_closure::DemandRules
     for GoRules<'_, 'request, 'store, 'input>
 {
+    fn certify_external_owner(
+        &self,
+        reference: SemanticId,
+        slot: SemanticId,
+        semantic: SemanticId,
+        kind: Option<crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind>,
+        retained: &dyn super::demand::RetainedFrame,
+    ) -> Option<crate::analyzer::resolution::selected_context::ValidatedOwner> {
+        let receipt = self
+            .language
+            .receipts
+            .current((reference, slot), retained)?;
+        let (frame, _, _) = retained.retained_frame_and_attempt(&receipt.relation)?;
+        let half = frame.halves.get(receipt.half.0)?;
+        let SelectedRootPathHalf::Reference {
+            source_reference, ..
+        } = half
+        else {
+            return None;
+        };
+        if *source_reference != receipt.source_node {
+            return None;
+        }
+        let [binder] = receipt.targets.as_ref() else {
+            return None;
+        };
+        if receipt.completion != ResolutionCompletion::Complete {
+            return None;
+        }
+        let current = self.terminal_authority(frame, receipt.mount, *binder)?;
+        let owner = self
+            .language
+            .operation
+            .ready
+            .context_identities
+            .validated_external_owner(&(reference, slot, *binder), &current)?;
+        (owner.semantic == semantic && kind.is_none_or(|kind| owner.declaration_kind == kind))
+            .then_some(owner)
+    }
+    fn begin_close_attempt(&mut self, relation: &DemandRelationKey, epoch: u64) {
+        self.language.receipts.begin_attempt(relation, epoch);
+    }
     type Placement = ();
     type Target = ();
     type Member = ();
@@ -903,15 +1125,7 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         for half in facts.halves {
             let answer = self.prefix_answer(frame, half.half, &facts.prefixes);
             let source = self.source(frame)?;
-            let demand = self
-                .prepared
-                .get(
-                    &frame
-                        .context
-                        .unwrap_or(super::demand_closure::ContextId(usize::MAX)),
-                )
-                .map(|prepared| &prepared.demand)
-                .unwrap_or(&self.language.demand);
+            let (_, demand) = self.terminal_demand(frame);
             let bindings: HashSet<_> = answer
                 .binding()
                 .targets()
@@ -1136,6 +1350,9 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
     ) -> Result<super::demand_closure::Read<super::demand_closure::ProviderRows>> {
         use super::demand_closure::{ProviderRows, Read};
         let prepared = frame.context.and_then(|key| self.prepared.get(&key));
+        // Provider rows and closure policy read the terminal's demand through
+        // the same selector, so a recorded owner's authority is the one used.
+        let (_, selected_demand) = self.terminal_demand(frame);
         let half = &frame.halves[half_id.0];
         let SelectedRootPathHalf::Reference {
             identity,
@@ -1160,9 +1377,7 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                 .namespace(),
             ResolutionNamespace::TypeOrValue
         );
-        let packages = prepared
-            .map(|prepared| &prepared.demand.import_packages)
-            .unwrap_or(&self.language.demand.import_packages);
+        let packages = &selected_demand.import_packages;
         let package_targets: Vec<_> = answer
             .binding()
             .targets()
@@ -1199,21 +1414,21 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         // native receiver walk used for a confirmed import.
         let mut endpoint_completion = None;
         let mut selected_owner = None;
+        let import_gap_only = matches!(&binding, ResolutionCompletion::Incomplete(reasons)
+            if reasons.iter().all(|reason| matches!(reason,
+                ResolutionIncompleteReason::UnsupportedSemantic(id)
+                    if self.language.operation.ready.context_identities.named_reason(*id)
+                        .is_some_and(|(name, _)| name == super::GO_IMPORT_INCOMPLETE))));
         if frame.halves.len() == 1
             && recipe.namespace() == ResolutionNamespace::Type
-            && matches!(&binding, ResolutionCompletion::Incomplete(reasons)
-                if reasons.iter().all(|reason| matches!(reason,
-                    ResolutionIncompleteReason::UnsupportedSemantic(id)
-                        if self.language.operation.ready.context_identities.named_reason(*id)
-                            .is_some_and(|(name, _)| name == super::GO_IMPORT_INCOMPLETE))))
+            && import_gap_only
             && answer.binding().targets().len() == 1
             // A source-backed import must keep its source owner, even when
             // its import inventory is incomplete. GoTool provenance is only
             // admitted by import authority for providers without source.
             && (package_targets.is_empty()
-                || prepared
-                    .map(|prepared| &prepared.demand.modeled_imports)
-                    .unwrap_or(&self.language.demand.modeled_imports)
+                || selected_demand
+                    .modeled_imports
                     .get(&(source_mount, answer.binding().targets()[0]))
                     .is_some_and(|provider| matches!(&provider.provenance,
                         super::go_named::GoExternalPackageProvenance::GoTool { .. })))
@@ -1236,10 +1451,16 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                     arguments: Vec::new(),
                     nullable: false,
                 };
+                if self.language.cancellation.is_cancelled() || !self.language.session.scope_step()
+                {
+                    // Keep the import's keyed incompleteness with the stop.
+                    return Ok(Read::Cancelled(binding.combine(&cancelled_completion())));
+                }
+                let selection = models.model_provider_selection();
                 let selected = authority.model_type_owner(
                     "go",
                     &nominal,
-                    &models.model_provider_selection(),
+                    &selection,
                     self.language.cancellation,
                 );
                 if self.language.cancellation.is_cancelled() {
@@ -1250,7 +1471,9 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                         StoreError::new(format!("Go incomplete-import model owner: {error:?}"))
                     })?
                 {
-                    selected_owner = Some((owner, declaration));
+                    assert!(declaration.kind.is_type_declaration());
+                    // An incomplete import keeps its gap and records no witness.
+                    selected_owner = Some((owner, declaration, false));
                 }
             }
         }
@@ -1260,9 +1483,8 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
         if recipe.namespace() == ResolutionNamespace::Type
             && answer.binding().completion() == &ResolutionCompletion::Complete
             && let [binder] = answer.binding().targets()
-            && let Some(provider) = prepared
-                .map(|prepared| &prepared.demand.modeled_imports)
-                .unwrap_or(&self.language.demand.modeled_imports)
+            && let Some(provider) = selected_demand
+                .modeled_imports
                 .get(&(source_mount, *binder))
             // GoTool package rows retain durable package IDs even without
             // indexed source. The import authority admits this tag only when
@@ -1318,6 +1540,10 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                     arguments: Vec::new(),
                     nullable: false,
                 };
+                if self.language.cancellation.is_cancelled() || !self.language.session.scope_step()
+                {
+                    return Ok(Read::Cancelled(cancelled_completion()));
+                }
                 let selected = authority.model_type_owner(
                     "go",
                     &nominal,
@@ -1330,17 +1556,43 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                 let selected = selected
                     .map_err(|error| StoreError::new(format!("Go model type owner: {error:?}")))?;
                 if let ModelTypeOwnerAnswer::Unique { owner, declaration } = selected {
-                    selected_owner = Some((owner, declaration));
+                    assert!(declaration.kind.is_type_declaration());
+                    // A Complete single-binder import may record a witness.
+                    selected_owner = Some((owner, declaration, true));
                 }
             }
         }
-        if let Some((owner, declaration)) = selected_owner
-            && let [binder] = answer.binding().targets()
+        // Witnesses wait for the provider's final completion: later export
+        // reads may stop, and the combined context completion may be open.
+        let mut pending_witnesses = Vec::new();
+        let mut pending_receipts = Vec::new();
+        let owner_selected = selected_owner.is_some();
+        // A source-less qualifier names an imported package that no indexed
+        // source declares: a GoTool-admitted import, or an import with no
+        // source package whose binders external authority admits or whose
+        // only gap is the unconfirmed import itself. A qualifier that names no
+        // import, or a local declaration that shadows one, is not one.
+        let targets = answer.binding().targets();
+        let modeled = |binder: &SemanticId| {
+            selected_demand
+                .modeled_imports
+                .get(&(source_mount, *binder))
+        };
+        let source_less = !targets.is_empty()
+            && (targets.iter().any(|binder| {
+                modeled(binder).is_some_and(|provider| {
+                    matches!(
+                        &provider.provenance,
+                        super::go_named::GoExternalPackageProvenance::GoTool { .. }
+                    )
+                })
+            }) || (package_targets.is_empty()
+                && (import_gap_only || targets.iter().all(|binder| modeled(binder).is_some()))));
+        let mut projection_evidence = ResolutionCompletion::Complete;
+        let type_projection = if recipe.namespace() == ResolutionNamespace::Type
+            && (owner_selected || source_less)
         {
-            use crate::analyzer::resolution::{
-                ExternalOwnerIdentity, ExternalOwnerLanguage, TypedFactPageVisitor,
-                TypedFactRequest,
-            };
+            use crate::analyzer::resolution::{TypedFactPageVisitor, TypedFactRequest};
             use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
             let lexical = self.language.operation.ready.lexical_source();
             let classifications = lexical
@@ -1382,33 +1634,81 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
             if read.is_cancelled() || self.language.cancellation.is_cancelled() {
                 return Ok(Read::Cancelled(read.evidence().clone()));
             }
-            if read.is_exhausted()
-                && read.evidence() == &ResolutionCompletion::Complete
-                && !slots.is_empty()
-            {
-                let identities = &self.language.operation.ready.context_identities;
-                let external = identities.external_owner_semantic_for_language(
+            // The visitor never stops early, so only cancellation ends the read
+            // before it is exhausted.
+            assert!(read.is_exhausted(), "{read:?}");
+            projection_evidence = read.evidence().clone();
+            Some((
+                reference,
+                slots,
+                projection_evidence == ResolutionCompletion::Complete,
+            ))
+        } else {
+            None
+        };
+        if let Some((owner, declaration, witnessable)) = selected_owner
+            && let [binder] = answer.binding().targets()
+            && let Some((reference, slots, true)) = &type_projection
+            && !slots.is_empty()
+        {
+            use crate::analyzer::resolution::{ExternalOwnerIdentity, ExternalOwnerLanguage};
+            let owner_provider = owner.provider.clone();
+            let qualified_name = declaration.qualified_name.clone();
+            let kind = declaration.kind;
+            let identities = &self.language.operation.ready.context_identities;
+            let external = identities.external_owner_semantic_for_language(
+                ExternalOwnerLanguage::Go,
+                &ExternalOwnerIdentity {
+                    provider_id: Arc::from(owner.provider.pack_digest),
+                    owner_fqn: Arc::from(declaration.qualified_name),
+                },
+                &self.language.operation.ready.shared_names(),
+            );
+            // Retaining the base must retain this import's keyed gap as
+            // well as its stable nominal identity. Complete imports do
+            // not add an endpoint receipt.
+            if binding != ResolutionCompletion::Complete {
+                endpoint_completion = Some(binding.clone());
+            }
+            for slot in slots {
+                identities.record_jvm_external_provider_type_identity(
                     ExternalOwnerLanguage::Go,
-                    &ExternalOwnerIdentity {
-                        provider_id: Arc::from(owner.provider.pack_digest),
-                        owner_fqn: Arc::from(declaration.qualified_name),
-                    },
-                    &self.language.operation.ready.shared_names(),
+                    *reference,
+                    *slot,
+                    external,
+                    *binder,
                 );
-                // Retaining the base must retain this import's keyed gap as
-                // well as its stable nominal identity. Complete imports do
-                // not add an endpoint receipt.
-                if binding != ResolutionCompletion::Complete {
-                    endpoint_completion = Some(binding.clone());
+                // Every external-owner identity for this slot originates here.
+                // The signature leaf only certifies these identities.
+                if binding == ResolutionCompletion::Complete {
+                    pending_receipts.push((
+                        (*reference, *slot),
+                        GoSelectionReceipt {
+                            relation: frame.relation.clone(),
+                            half: half_id,
+                            mount: source_mount,
+                            source_node: *source_reference,
+                            targets: answer.binding().targets().to_vec().into_boxed_slice(),
+                            completion: answer.binding().completion().clone(),
+                            epoch: self.language.receipts.attempt_epoch(&frame.relation),
+                        },
+                    ));
                 }
-                for slot in slots {
-                    identities.record_jvm_external_provider_type_identity(
-                        ExternalOwnerLanguage::Go,
-                        reference,
-                        slot,
-                        external,
-                        *binder,
-                    );
+                if witnessable
+                    && binding == ResolutionCompletion::Complete
+                    && let Some(authority) = self.terminal_authority(frame, source_mount, *binder)
+                {
+                    pending_witnesses.push((
+                        (*reference, *slot, *binder),
+                        GoExternalTypeWitness {
+                            source_node: *source_reference,
+                            owner_semantic: external,
+                            owner_provider: owner_provider.clone(),
+                            qualified_name: qualified_name.clone(),
+                            kind,
+                            authority,
+                        },
+                    ));
                 }
             }
         }
@@ -1467,11 +1767,95 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
                 exports.extend(rows);
             }
         }
-        let completion = if exports.is_empty() {
+        // A package without source declarations has no export rows, so an
+        // empty export set proves nothing; with no selected owner, no active
+        // declaration provider supplies a unique owner for the member (none
+        // declares it, or the candidates are ambiguous), and the answer stays
+        // open. Only written types take this path; value members are #10184.
+        // An owner lookup runs only for a complete or import-incomplete
+        // binding; any other binding gap keeps the answer open on its own.
+        let unprovided_candidate = source_less
+            && exports.is_empty()
+            && !owner_selected
+            && (binding == ResolutionCompletion::Complete || import_gap_only);
+        let unprovided_reason = (unprovided_candidate
+            && type_projection
+                .as_ref()
+                .is_some_and(|(_, slots, complete)| *complete && !slots.is_empty()))
+        .then(|| {
+            self.language
+                .operation
+                .ready
+                .context_identities
+                .named_semantic(
+                    CanonicalHasher::new(b"go-external-member-unprovided:v1").finish(),
+                    super::GO_EXTERNAL_MEMBER_UNPROVIDED,
+                    "no active declaration provider supplies a unique owner for this Go type",
+                )
+        });
+        let completion = if let Some(reason) = unprovided_reason {
+            let completion = binding.combine(&ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::UnsupportedSemantic(reason),
+            ]));
+            // With no exports the closure retains the base relation, and later
+            // candidate reads of a retained base see only keyed endpoint
+            // evidence, so the gap must be keyed here as well, as it is for
+            // a selected owner above.
+            assert!(endpoint_completion.is_none());
+            endpoint_completion = Some(completion.clone());
+            completion
+        } else if exports.is_empty() {
             binding.clone()
         } else {
             binding.combine(&context_completion)
         };
+        // For an unprovided candidate, an incomplete projection read cannot
+        // decide whether the reference is a written type, so its gap stays
+        // with the answer and with the keyed evidence later reads of a
+        // retained base see.
+        let completion =
+            if !unprovided_candidate || projection_evidence == ResolutionCompletion::Complete {
+                completion
+            } else {
+                let completion = completion.combine(&projection_evidence);
+                // An unprovided candidate has no selected owner, and the
+                // unprovided branch keys evidence only after a complete read.
+                assert!(endpoint_completion.is_none());
+                endpoint_completion = Some(completion.clone());
+                completion
+            };
+        #[cfg(any(test, feature = "test-support"))]
+        if unprovided_reason.is_some()
+            && let Some(records) = GO_UNPROVIDED_MEMBER_PROBE.lock().unwrap().as_mut()
+        {
+            let carries = |completion: &ResolutionCompletion| {
+                unprovided_reason.is_some_and(|reason| {
+                    matches!(completion, ResolutionCompletion::Incomplete(reasons)
+                        if reasons.contains(&ResolutionIncompleteReason::UnsupportedSemantic(reason)))
+                })
+            };
+            // A retained base answers later reads from its keyed endpoint
+            // evidence, so the reason must reach both carriers.
+            let has_reason =
+                carries(&completion) && endpoint_completion.as_ref().is_some_and(carries);
+            records.push((
+                format!(
+                    "{} {:?}: {completion:?}",
+                    recipe.spelling(),
+                    recipe.namespace()
+                ),
+                has_reason,
+            ));
+        }
+        if completion == ResolutionCompletion::Complete {
+            for (key, receipt) in pending_receipts {
+                self.language.receipts.record(key, receipt);
+            }
+            let identities = &self.language.operation.ready.context_identities;
+            for ((reference, slot, binder), witness) in pending_witnesses {
+                identities.record_go_external_type_witness(reference, slot, binder, witness);
+            }
+        }
         Ok(Read::ready(ProviderRows {
             endpoint_completion,
             language: Language::Go,
@@ -1579,14 +1963,13 @@ impl<'request, 'store, 'input> super::demand_closure::DemandRules
             let record = language.operation.mount_table().mount_by_ordinal(mount)?;
             if record.semantic_language() == Language::Go {
                 let local_key = endpoint.node().local_key().expect("mounted file scope key");
-                let imports: bool = language.operation.ready.inventory.connection().query_row(
-                    "SELECT EXISTS(
+                let imports: bool = language.operation.ready.inventory.connection().prepare_cached("SELECT EXISTS(
                        SELECT 1 FROM temp.selected_resolution_mounts mounted
                        JOIN main.resolution_go_package_imports imports ON imports.blob_id=mounted.blob_id
                        WHERE mounted.mount_ordinal=?1 AND imports.file_scope_key=?2 AND imports.kind='named'
                        UNION ALL
                        SELECT 1 FROM temp.selected_resolution_stage_go_package_imports
-                       WHERE host_ordinal=?1 AND file_scope_key=?3 AND kind='named')",
+                       WHERE host_ordinal=?1 AND file_scope_key=?3 AND kind='named')")?.query_row(
                     rusqlite::params![mount.get(), local_key, crate::analyzer::store::resolution_stage::codec::encode_node(endpoint.node())], |row| row.get(0),
                 )?;
                 if let Some(symbol) = endpoint.symbols().fixed().first().filter(|_| imports) {
@@ -1703,6 +2086,7 @@ impl SelectedResolutionOperation<'_, '_> {
             export_index: HashMap::default(),
             source_roles: HashMap::default(),
             base_context_mounts: HashSet::default(),
+            receipts: GoReceiptStore::default(),
             prepared_root_source_halves: HashMap::default(),
         };
         let mut shared = SharedDemand {
@@ -1865,6 +2249,7 @@ impl SelectedResolutionOperation<'_, '_> {
             export_index: HashMap::default(),
             source_roles: HashMap::default(),
             base_context_mounts,
+            receipts: GoReceiptStore::default(),
             #[cfg(any(test, feature = "test-support"))]
             prepared_root_source_halves: HashMap::default(),
         };
@@ -1881,6 +2266,7 @@ impl SelectedResolutionOperation<'_, '_> {
             context.blueprint,
             context.lexical,
             context.typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
             None,
             context.cancellation,
             context.session,
@@ -1912,3 +2298,300 @@ pub(crate) static GO_INTERVAL_DISCOVERY_SCOPE_0_SQL: std::sync::LazyLock<String>
             super::go_context::GO_SELECTED_SOURCE_FILE_BY_VERSION.as_str()
         )
     });
+
+#[cfg(test)]
+mod receipt_currency_tests {
+    use super::super::demand::{
+        DemandLanguage, DemandProvider, LanguageClosure, LanguageContextPreparation,
+        LanguagePrefixInputs, LanguageRootDiscovery,
+    };
+    use super::*;
+    use crate::analyzer::resolution::{
+        BindingNodeId, CloseContinuationId, CloseProgress, CloseResume, DemandMemberSelection,
+        DemandRootDiscovery, DemandRootProvider, HierarchyProvenanceView, RootClosure,
+        StackPattern,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Stands in for the Go terminal: each close attempt may record one
+    /// receipt into the real receipt store, as the terminal does once its
+    /// prefix binding and final completion are Complete.
+    struct ReceiptLanguage {
+        store: Rc<RefCell<GoReceiptStore>>,
+        switches: Rc<RefCell<Switches>>,
+        attempt: Option<DemandRelationKey>,
+        key: (SemanticId, SemanticId),
+    }
+
+    /// What the next close attempt does; shared with the test.
+    struct Switches {
+        /// The binder this attempt's terminal selects, or None when its
+        /// binding is not uniquely Complete and so it records nothing.
+        records: Option<SemanticId>,
+        yield_first: bool,
+        fail_finalize: bool,
+    }
+
+    impl ReceiptLanguage {
+        fn record_receipt(&mut self) {
+            let (Some(relation), Some(binder)) = (&self.attempt, self.switches.borrow().records)
+            else {
+                return;
+            };
+            let epoch = self.store.borrow().attempt_epoch(relation);
+            let receipt = GoSelectionReceipt {
+                relation: relation.clone(),
+                half: super::super::demand_closure::HalfId(0),
+                mount: SelectedResolutionMountOrdinal::new(1),
+                source_node: BindingNodeId::universal_root(),
+                targets: Box::new([binder]),
+                completion: ResolutionCompletion::Complete,
+                epoch,
+            };
+            self.store.borrow_mut().record(self.key, receipt);
+        }
+    }
+
+    impl DemandLanguage for ReceiptLanguage {
+        fn begin_close_attempt(&mut self, relation: &DemandRelationKey, epoch: u64) {
+            self.attempt = Some(relation.clone());
+            self.store.borrow_mut().begin_attempt(relation, epoch);
+        }
+        fn finalize_closure(
+            &mut self,
+            _endpoint: &EndpointSignature,
+            closure: LanguageClosure,
+        ) -> Result<LanguageClosure> {
+            if self.switches.borrow().fail_finalize {
+                return Err(StoreError::new("test finalization failure"));
+            }
+            Ok(closure)
+        }
+        fn root_has_receipt(&self, _: &EndpointSignature) -> bool {
+            true
+        }
+        // The provider's own yield path: this attempt records, then suspends.
+        #[allow(clippy::too_many_arguments)]
+        fn poll_close_root(
+            &mut self,
+            endpoint: &EndpointSignature,
+            question: &Self::RootQuestion,
+            context: Option<&Self::ContextData>,
+            inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+            _initial_members: Option<&DemandMemberSelection>,
+            _member_completion: &ResolutionCompletion,
+            provenance: HierarchyProvenanceView<'_>,
+            _resume: CloseResume<'_>,
+        ) -> Result<CloseProgress<LanguageClosure>> {
+            let yields = std::mem::take(&mut self.switches.borrow_mut().yield_first);
+            if yields {
+                self.record_receipt();
+                return Ok(CloseProgress::Reference {
+                    continuation: CloseContinuationId::issue(provenance),
+                    key: DemandReferenceKey::caller(self.key.0),
+                    completion: ResolutionCompletion::Complete,
+                });
+            }
+            Ok(CloseProgress::Ready(
+                self.close_root(endpoint, question, context, inputs)?,
+            ))
+        }
+        type RootQuestion = ();
+        type ContextKey = ();
+        type ContextData = ();
+        fn discover_root(
+            &mut self,
+            _endpoint: &EndpointSignature,
+        ) -> Result<LanguageRootDiscovery<Self::RootQuestion>> {
+            Ok(LanguageRootDiscovery::Ready {
+                question: (),
+                completion: ResolutionCompletion::Complete,
+            })
+        }
+        fn context_key(&self, _question: &Self::RootQuestion) -> Option<Self::ContextKey> {
+            None
+        }
+        fn prepare_context(
+            &mut self,
+            _key: &Self::ContextKey,
+            _question: &Self::RootQuestion,
+        ) -> Result<LanguageContextPreparation<Self::ContextData>> {
+            unreachable!("the fixture root needs no context")
+        }
+        fn prefix_inputs(
+            &mut self,
+            _question: &mut Self::RootQuestion,
+            _context: Option<&Self::ContextData>,
+        ) -> Result<LanguagePrefixInputs> {
+            Ok(LanguagePrefixInputs {
+                references: Vec::new(),
+                completion: ResolutionCompletion::Complete,
+            })
+        }
+        fn close_root(
+            &mut self,
+            _endpoint: &EndpointSignature,
+            _question: &Self::RootQuestion,
+            _context: Option<&Self::ContextData>,
+            _inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
+        ) -> Result<LanguageClosure> {
+            self.record_receipt();
+            Ok(LanguageClosure {
+                outcome: RootClosure::Published(ResolutionCompletion::Complete),
+                query_scope: None,
+                discharges: None,
+            })
+        }
+    }
+
+    fn relation(name: &str) -> DemandRelationKey {
+        DemandRelationKey::caller(EndpointSignature::new(
+            BindingNodeId::universal_root(),
+            StackPattern::closed([SemanticId::for_test(name)]),
+            StackPattern::closed(Vec::<BindingNodeId>::new()),
+        ))
+    }
+
+    /// The binder that currently certifies `key`, if any.
+    fn certified(
+        provider: &DemandProvider<ReceiptLanguage>,
+        store: &Rc<RefCell<GoReceiptStore>>,
+        key: (SemanticId, SemanticId),
+    ) -> Option<Box<[SemanticId]>> {
+        store
+            .borrow()
+            .current(key, provider)
+            .map(|receipt| receipt.targets.clone())
+    }
+
+    /// One receipt certifies only while the attempt that recorded it is the
+    /// relation's current, successfully finalized attempt, and only when every
+    /// current occurrence agrees.
+    #[test]
+    fn go_receipt_currency_follows_the_close_attempt_lifecycle() {
+        let key = (
+            SemanticId::for_test("reader-type-reference"),
+            SemanticId::for_test("reader-type-slot"),
+        );
+        let (first, second) = (
+            SemanticId::for_test("io-import"),
+            SemanticId::for_test("other-import"),
+        );
+        let store = Rc::new(RefCell::new(GoReceiptStore::default()));
+        let switches = Rc::new(RefCell::new(Switches {
+            records: Some(first),
+            yield_first: false,
+            fail_finalize: false,
+        }));
+        let (a, b) = (relation("currency-a"), relation("currency-b"));
+        let mut provider = DemandProvider::new(ReceiptLanguage {
+            store: Rc::clone(&store),
+            switches: Rc::clone(&switches),
+            attempt: None,
+            key,
+        });
+        let complete = ResolutionCompletion::Complete;
+        for relation in [&a, &b] {
+            assert!(matches!(
+                provider.discover(relation).unwrap(),
+                DemandRootDiscovery::Ready(_)
+            ));
+        }
+        // (g) No receipt certifies nothing.
+        assert_eq!(certified(&provider, &store, key), None);
+
+        // A finalized attempt certifies its receipt.
+        provider
+            .close_with_member_completion(&a, &[], &complete)
+            .unwrap();
+        assert_eq!(
+            certified(&provider, &store, key).as_deref(),
+            Some(&[first][..])
+        );
+
+        // (b) A repeat close with the same answer stays certifiable: the
+        // earlier occurrence is retired, not left to conflict.
+        provider
+            .close_with_member_completion(&a, &[], &complete)
+            .unwrap();
+        assert_eq!(
+            certified(&provider, &store, key).as_deref(),
+            Some(&[first][..])
+        );
+        assert_eq!(store.borrow().receipts[&key].len(), 1);
+
+        // (c) A changed Complete answer certifies only the new binder.
+        switches.borrow_mut().records = Some(second);
+        provider
+            .close_with_member_completion(&a, &[], &complete)
+            .unwrap();
+        assert_eq!(
+            certified(&provider, &store, key).as_deref(),
+            Some(&[second][..])
+        );
+
+        // (d) Complete turning into incomplete or no answer records nothing,
+        // and the earlier receipt no longer certifies.
+        switches.borrow_mut().records = None;
+        provider
+            .close_with_member_completion(&a, &[], &complete)
+            .unwrap();
+        assert_eq!(certified(&provider, &store, key), None);
+
+        // (e) A receipt from an attempt that yielded never certifies, even
+        // after a later attempt for the relation completes.
+        switches.borrow_mut().records = Some(first);
+        switches.borrow_mut().yield_first = true;
+        let yielded =
+            crate::analyzer::resolution::fact_resolution::with_empty_hierarchy_view_for_test(
+                |view| provider.poll_close(&a, &[], None, &complete, view, CloseResume::Start),
+            )
+            .unwrap();
+        assert!(matches!(yielded, CloseProgress::Reference { .. }));
+        assert_eq!(certified(&provider, &store, key), None);
+        switches.borrow_mut().records = None;
+        let resumed =
+            crate::analyzer::resolution::fact_resolution::with_empty_hierarchy_view_for_test(
+                |view| provider.poll_close(&a, &[], None, &complete, view, CloseResume::Start),
+            )
+            .unwrap();
+        assert!(matches!(resumed, CloseProgress::Ready(_)));
+        assert_eq!(certified(&provider, &store, key), None);
+
+        // (f) An error after the terminal recorded, but before finalization
+        // succeeded, leaves the attempt uncertifiable.
+        switches.borrow_mut().records = Some(first);
+        switches.borrow_mut().fail_finalize = true;
+        assert!(
+            provider
+                .close_with_member_completion(&a, &[], &complete)
+                .is_err()
+        );
+        assert_eq!(certified(&provider, &store, key), None);
+        switches.borrow_mut().fail_finalize = false;
+
+        // (f) Cancelling a suspended attempt after its receipt does the same.
+        switches.borrow_mut().yield_first = true;
+        crate::analyzer::resolution::fact_resolution::with_empty_hierarchy_view_for_test(|view| {
+            provider.poll_close(&a, &[], None, &complete, view, CloseResume::Start)
+        })
+        .unwrap();
+        provider.cancel_close(&a);
+        assert_eq!(certified(&provider, &store, key), None);
+
+        // (g) Two current occurrences from different relations conflict, even
+        // with the same binder.
+        provider
+            .close_with_member_completion(&a, &[], &complete)
+            .unwrap();
+        assert_eq!(
+            certified(&provider, &store, key).as_deref(),
+            Some(&[first][..])
+        );
+        provider
+            .close_with_member_completion(&b, &[], &complete)
+            .unwrap();
+        assert_eq!(certified(&provider, &store, key), None);
+    }
+}

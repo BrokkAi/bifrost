@@ -25,8 +25,8 @@
 //! `value.method` is absent needs a proven receiver type, which this pass does
 //! not have.
 
-use crate::graph_support::PythonSource;
 use crate::imports::resolve_imports_batched;
+use crate::source_support::PythonSource;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
     SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport, StructuredImportPathKind,

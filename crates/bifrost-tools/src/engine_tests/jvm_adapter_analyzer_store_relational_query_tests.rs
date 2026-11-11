@@ -124,7 +124,7 @@ mod jvm_extraction_tests {
                     panic!("the requested units index appears in the plan {state}: {plan:#?}")
                 });
             let anchored = view.contains("anchored");
-            let anchor_driven = anchored && index != "idx_code_units_lang_identifier_lookup";
+            let anchor_driven = anchored && index != "idx_code_units_lang_identifier";
             let versions_step = plan
                 .iter()
                 .position(|detail| {
@@ -222,8 +222,8 @@ mod jvm_extraction_tests {
                 "identifier",
                 RelationalDefinitionQuery::Identifier { file: None },
                 &[
-                    "idx_code_units_lang_identifier_lookup",
-                    "idx_code_units_lang_identifier_lookup",
+                    "idx_code_units_lang_identifier",
+                    "idx_code_units_lang_identifier",
                 ],
             ),
         ];
@@ -312,7 +312,7 @@ mod jvm_extraction_tests {
             assert_seeks_units_index(
                 "identifier prefix",
                 view,
-                "idx_code_units_lang_identifier_lookup",
+                "idx_code_units_lang_identifier",
                 &plan,
             );
         }
@@ -359,12 +359,7 @@ mod jvm_extraction_tests {
                     .chain(values.iter().map(String::as_str))
                     .collect();
                 let plan = explain(content_sql(view, predicate), &bindings);
-                assert_seeks_units_index(
-                    case_name,
-                    view,
-                    "idx_code_units_lang_identifier_lookup",
-                    &plan,
-                );
+                assert_seeks_units_index(case_name, view, "idx_code_units_lang_identifier", &plan);
             }
         }
 
@@ -459,7 +454,7 @@ mod jvm_extraction_tests {
                     explain_query_plan(&connection, "identifier definition", &sql, &bindings);
                 let identifier_step = plan
                     .iter()
-                    .position(|detail| detail.contains("idx_code_units_lang_identifier_lookup"))
+                    .position(|detail| detail.contains("idx_code_units_lang_identifier"))
                     .unwrap_or_else(|| panic!("identifier index missing {state}: {plan:#?}"));
                 let membership_step = plan
                     .iter()

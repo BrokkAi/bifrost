@@ -268,6 +268,7 @@ policy_records! {
     DeclarationSelectionFile { labels: ["declaration-selection-file"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(declaration-selection-file :path \"workspace-relative.rqlp\" :language LANGUAGE)", description: "Bind the declarations of one workspace-relative declaration-selection document; a missing or invalid document fails activation." }
     ProcedureEffectsOf { labels: ["procedure-effects-of"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(procedure-effects-of :binding NAME)", description: "Bind the procedure effects of the declarations an earlier row binding selects, so both bindings read one selection." }
     EndpointSetFile { labels: ["endpoint-set-file"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(endpoint-set-file :path \"workspace-relative.rqlp\" [:sha256 HEX])", description: "Reference one nested typed endpoint-set document by workspace-relative path." }
+    WithoutFlow { labels: ["without-flow"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(without-flow :sources (endpoint-set ...) [:sanitizers ...] [:barriers ...] [:transforms ...] [:external-models ...])", description: "Select a secondary flow whose sink demand is the primary composed taint sink." }
     Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion|flow ...)", description: "Select and configure exactly one policy analysis kind." }
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME :query SELECTOR)", description: "Bind one named typed row relation from a CodeQuery." }
     Join { labels: ["join"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(join :left NAME :right NAME [:kind inner|left|semi|anti] :on ((LEFT RIGHT)...))", description: "Join two named row relations by registered equal-typed fields." }
@@ -297,6 +298,7 @@ policy_records! {
     RqlFile { labels: ["rql-file"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(rql-file [:schema-version N] :path \"workspace/relative.rql\")", description: "Reference one workspace-relative RQL selector for deferred loading." }
     GeneratedMessage { labels: ["generated-message"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(generated-message :relation can-reach)", description: "Generate the fixed source-display can-reach sink-display message after proven flow." }
     CvssSeverity { labels: ["cvss-severity"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(cvss-severity :when-unscored unrated|note|warning|error)", description: "Derive severity from CVSS with an explicit unscored fallback." }
+    ProvenSubset { labels: ["proven-subset"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(proven-subset :reason \"text\")", description: "Declare that the policy reports proven findings but is not exhaustive." }
     Argument { labels: ["argument"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(argument :index N) | (argument :name \"NAME\")", description: "Bind a zero-based argument index or exact formal argument name." }
     ArgumentCondition { labels: ["argument-condition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(argument-condition :argument (argument :index N) :equals true|false)", description: "Require one direct call argument to have an exact Boolean value." }
     Result { labels: ["result"], layout: Mixed, owner: OwnerApplicability::BOTH, signature: "(result :index N) | (result true|false|nil|non-nil [:index N])", description: "Bind one zero-based normal call result, or name the accepting result of a conditional sanitizer." }
@@ -338,8 +340,10 @@ policy_records! {
     Subject { labels: ["subject"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject :id ID :selector SELECTOR :subject BINDING)", description: "Declare one policy-local typestate seed and its bound subject." }
     CallModeling { labels: ["call-modeling"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: "(call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback semantics for call arms without an executable body or applicable model." }
     OnUnknown { labels: ["on-unknown"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(on-unknown :verdict abstain|warn-unreliable|fail-closed|treat-may-as-finding)", description: "Declare what the run does when unknown or incomplete evidence blocked a verdict." }
+    InconclusiveOn { labels: ["inconclusive-on"], layout: Positional, owner: OwnerApplicability::POLICY_MATCH, signature: "(inconclusive-on [depth_bound_reached])", description: "Make a reached or undecidable call-depth bound run-incomplete while retaining findings." }
     Uncertainty { labels: ["uncertainty"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(uncertainty :escape inconclusive)", description: "Make escape capability gaps explicit." }
-    Automaton { labels: ["automaton"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(automaton :states [...] :initial STATE :accepting-states [...] :error-states [...] :events [...] :transitions [...] [:terminal-expectations [...]])", description: "Define the public typestate states, events, transitions, and terminal obligations." }
+    Automaton { labels: ["automaton"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(automaton :states [...] :initial STATE :accepting-states [...] :error-states [...] :events [...] :transitions [...] [:event-set (event-set ...)] [:terminal-expectations [...]])", description: "Define the public typestate states, events, transitions, and terminal obligations." }
+    EventSet { labels: ["event-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event-set :name \"NAMESPACE.NAME\" :version N :effects [\"NAMESPACE.EFFECT\"...])", description: "Declare the versioned semantic effect set covered by typestate events." }
     Event { labels: ["event"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event :id ID (:calls CALLS | :matches MATCH-SET | :on SEMANTIC-EVENT) ...)", description: "Define one direct-call, endpoint, or semantic typestate event." }
     Calls { labels: ["calls"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(calls :selector SELECTOR :subject BINDING :phase PHASE)", description: "Observe a direct call selector using one tracked receiver, return, or argument binding." }
     Transition { labels: ["transition"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(transition :from STATE :on EVENT :to STATE)", description: "Apply one deterministic typestate transition." }
@@ -639,6 +643,8 @@ macro_rules! value_shapes {
                     | Self::NonNegativeInteger
                     | Self::PositiveInteger
                     | Self::AnalysisRecord
+                    | Self::WithoutFlowSpec
+                    | Self::ProvenSubsetRecord
                     | Self::ReportOptions
                     | Self::WitnessOptions
                     | Self::Selector
@@ -695,8 +701,11 @@ macro_rules! value_shapes {
                     | Self::SubjectSet
                     | Self::CallModelingSpec
                     | Self::OnUnknownSpec
+                    | Self::CompletionSpec
+                    | Self::CompletionMarkers
                     | Self::UncertaintySpec
                     | Self::AutomatonSpec
+                    | Self::EventSetSpec
                     | Self::CallsTrigger
                     | Self::TypestateSubjects
                     | Self::TypestateEvents
@@ -729,6 +738,8 @@ macro_rules! value_shapes {
                     Self::SanitizerRequires => &[PolicyRecord::ReceiverRequirement, PolicyRecord::Argument],
                     Self::SanitizerResult | Self::SanitizerLiteral => &[],
                     Self::AnalysisRecord => &[PolicyRecord::Analysis],
+                    Self::WithoutFlowSpec => &[PolicyRecord::WithoutFlow],
+                    Self::ProvenSubsetRecord => &[PolicyRecord::ProvenSubset],
                     Self::ReportOptions => &[PolicyRecord::Report],
                     Self::WitnessOptions => &[PolicyRecord::Witness],
                     Self::Message => &[PolicyRecord::GeneratedMessage],
@@ -829,8 +840,10 @@ macro_rules! value_shapes {
                     Self::SubjectSet => &[PolicyRecord::SubjectSet],
                     Self::CallModelingSpec => &[PolicyRecord::CallModeling],
                     Self::OnUnknownSpec => &[PolicyRecord::OnUnknown],
+                    Self::CompletionSpec => &[PolicyRecord::InconclusiveOn],
                     Self::UncertaintySpec => &[PolicyRecord::Uncertainty],
                     Self::AutomatonSpec => &[PolicyRecord::Automaton],
+                    Self::EventSetSpec => &[PolicyRecord::EventSet],
                     Self::CallsTrigger => &[PolicyRecord::Calls],
                     Self::TypestateSubjects => &[PolicyRecord::Subject],
                     Self::TypestateEvents => &[PolicyRecord::Event],
@@ -918,6 +931,7 @@ macro_rules! value_shapes {
                     | Self::ThreatModels
                     | Self::UnmodeledCallBehavior
                     | Self::UnknownVerdict
+                    | Self::CompletionMarkers
                     | Self::TrustBoundary
                     | Self::SystemEntry
                     | Self::DirectoryScope
@@ -1010,6 +1024,8 @@ value_shapes! {
     RowAggregateOperand => "a stable-key COLUMN for set-equal/subset or a (POSITION-FIELD VALUE-FIELD) ordered sequence",
     Boolean => "true or false",
     AnalysisRecord => "an analysis record whose fields agree with its explicit type",
+    WithoutFlowSpec => "a without-flow record with no sink selector",
+    ProvenSubsetRecord => "a proven-subset record with a bounded reason",
     ReportOptions => "a report record",
     WitnessOptions => "a witness record",
     Selector => "an inline rql or deferred rql-file selector",
@@ -1098,8 +1114,11 @@ value_shapes! {
     SubjectSet => "a subject-set record",
     CallModelingSpec => "a call-modeling record",
     OnUnknownSpec => "an on-unknown record",
+    CompletionSpec => "an inconclusive-on record",
+    CompletionMarkers => "a vector of completion markers",
     UncertaintySpec => "an uncertainty record",
     AutomatonSpec => "an automaton record",
+    EventSetSpec => "a versioned semantic event-set record",
     CallsTrigger => "a calls record",
     TypestateSubjects => "subject records",
     TypestateEvents => "event records",
@@ -1246,6 +1265,8 @@ policy_fields! {
     PolicyDescription { record: Policy, labels: ["description"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Description, owner: OwnerApplicability::POLICY_ALL, signature: ":description \"text\"", description: "Add bounded descriptive text." }
     PolicyHelpUri { record: Policy, labels: ["help-uri"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: HelpUri, owner: OwnerApplicability::POLICY_ALL, signature: ":help-uri \"https://...\"", description: "Link to absolute HTTP(S) remediation help." }
     PolicyTags { record: Policy, labels: ["tags"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: PolicyTags, owner: OwnerApplicability::POLICY_ALL, signature: ":tags [TAG...]", description: "Attach a duplicate-free set of bounded policy tags." }
+    PolicyCoverage { record: Policy, labels: ["coverage"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: ProvenSubsetRecord, owner: OwnerApplicability::POLICY_ALL, signature: ":coverage (proven-subset :reason \"text\")", description: "Declare a proven subset and the reason the policy is not exhaustive." }
+    ProvenSubsetReason { record: ProvenSubset, labels: ["reason"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Description, owner: OwnerApplicability::POLICY_MATCH, signature: ":reason \"text\"", description: "Explain the missing coverage in bounded text." }
     PolicyAnalysis { record: Policy, labels: ["analysis"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisRecord, owner: OwnerApplicability::POLICY_ALL, signature: ":analysis (analysis ...)", description: "Provide the explicitly typed diagnostic-neutral analysis declaration." }
     PolicyClassification { record: Policy, labels: ["classification"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: ClassificationSpec, owner: OwnerApplicability::POLICY_ALL, signature: ":classification (classification ...)", description: "Add broad/refined taxonomy and optional CVSS policy." }
     PolicyReport { record: Policy, labels: ["report"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: ReportOptions, owner: OwnerApplicability::POLICY_ALL, signature: ":report (report ...)", description: "Override bounded report retention defaults." }
@@ -1287,6 +1308,8 @@ policy_fields! {
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
     AnalysisThreatModels { record: Analysis, labels: ["threat-models"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: NON_EMPTY_SET_6, shape: ThreatModels, owner: OwnerApplicability::POLICY_TAINT, signature: ":threat-models [remote|commandargs|environment|stdin|file|database...]", description: "Select the active threat models for source endpoints; omission defaults to [remote]." }
     AnalysisOnUnknown { record: Analysis, labels: ["on-unknown"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: OnUnknownSpec, owner: OwnerApplicability::POLICY_ALL, signature: ":on-unknown (on-unknown :verdict abstain|warn-unreliable|fail-closed|treat-may-as-finding)", description: "Choose what a verdict blocked by unknown evidence does; omission defaults to abstain." }
+    AnalysisCompletion { record: Analysis, labels: ["completion"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CompletionSpec, owner: OwnerApplicability::POLICY_MATCH, signature: ":completion (inconclusive-on [depth_bound_reached])", description: "Treat a reached or undecidable depth bound as run incompleteness." }
+    InconclusiveOnMarkers { record: InconclusiveOn, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: CompletionMarkers, owner: OwnerApplicability::POLICY_MATCH, signature: "[depth_bound_reached]", description: "Name the typed query marker that prevents a clean unbounded claim." }
     AnalysisLanguages { record: Analysis, labels: ["languages"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: SelectorLanguages, owner: OwnerApplicability::POLICY_ALL, signature: ":languages [LANGUAGE...]", description: "Conjoin one shared language scope with every inline RQL and referenced RQL selector in this analysis; `jvm` expands to [java, kotlin, scala] and `js-ts` expands to [javascript, typescript]." }
     AnalysisWhereGlobs { record: Analysis, labels: ["where"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: SelectorWhereGlobs, owner: OwnerApplicability::POLICY_ALL, signature: ":where [\"GLOB\"...]", description: "Conjoin one shared workspace-relative path-glob scope with every inline RQL and referenced RQL selector in this analysis." }
     AnalysisRqlSchemaVersion { record: Analysis, labels: ["rql-schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::POLICY_ALL, signature: ":rql-schema-version N", description: "Pin the RQL schema version for selectors that omit their own; explicit selector pins must agree. This is independent of the RQLP document schema version." }
@@ -1301,6 +1324,12 @@ policy_fields! {
     AnalysisOrigins { record: Analysis, labels: ["origins"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowOrigins, signature: ":origins (endpoint-set :entries [(origin ...)...])", description: "Compose the complete value-flow origin set." }
     AnalysisObservations { record: Analysis, labels: ["observations"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowObservations, signature: ":observations (endpoint-set :entries [(observation ...)...])", description: "Compose the complete value-flow observation set." }
     AnalysisKills { record: Analysis, labels: ["kills"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowKills, signature: ":kills (endpoint-set :entries [(kill ...)...])", description: "Compose optional value-flow kills; omission is empty." }
+    AnalysisWithoutFlow { record: Analysis, labels: ["without-flow"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: WithoutFlowSpec, owner: OwnerApplicability::POLICY_TAINT, signature: ":without-flow (without-flow :sources ...)", description: "Require absence of a second flow at each primary sink." }
+    WithoutFlowSources { record: WithoutFlow, labels: ["sources"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSources, signature: ":sources (endpoint-set ...)", description: "Select secondary flow sources." }
+    WithoutFlowSanitizers { record: WithoutFlow, labels: ["sanitizers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSanitizers, signature: ":sanitizers (endpoint-set ...)", description: "Select secondary flow sanitizers." }
+    WithoutFlowBarriers { record: WithoutFlow, labels: ["barriers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintBarriers, signature: ":barriers (endpoint-set ...)", description: "Select secondary flow value-type barriers." }
+    WithoutFlowTransforms { record: WithoutFlow, labels: ["transforms"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: Transforms, signature: ":transforms (endpoint-set ...)", description: "Select secondary flow transforms." }
+    WithoutFlowExternalModels { record: WithoutFlow, labels: ["external-models"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintExternalModels, signature: ":external-models (endpoint-set ...)", description: "Select secondary external transfers." }
     AnalysisFindingCombinations { record: Analysis, labels: ["finding-combinations"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: FindingCombinations, owner: OwnerApplicability::POLICY_TAINT, signature: ":finding-combinations [(finding-combination ...)...]", description: "Declare bounded explicit presentation/classification precedence rules." }
     AnalysisSubjects { record: Analysis, labels: ["subjects"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SubjectSet, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subjects (subject-set ...)", description: "Compose values newly tracked by typestate." }
     AnalysisUncertainty { record: Analysis, labels: ["uncertainty"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UncertaintySpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":uncertainty (uncertainty ...)", description: "Declare explicit handling for subjects that escape the analysis root." }
@@ -1502,9 +1531,14 @@ policy_fields! {
     AutomatonAccepting { record: Automaton, labels: ["accepting-states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":accepting-states [STATE...]", description: "Declare non-absorbing states that satisfy terminal expectations." }
     AutomatonErrors { record: Automaton, labels: ["error-states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":error-states [STATE...]", description: "Declare states whose transitions produce policy violations." }
     AutomatonEvents { record: Automaton, labels: ["events"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: TypestateEvents, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":events [(event ...)...]", description: "Declare the bounded typed event set." }
+    AutomatonEventSet { record: Automaton, labels: ["event-set"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EventSetSpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":event-set (event-set :name \"NAME\" :version N :effects [\"EFFECT\"...])", description: "Name the reviewed semantic effect vocabulary for this automaton." }
+    EventSetName { record: EventSet, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":name \"NAMESPACE.NAME\"", description: "Stable namespaced event-set identity." }
+    EventSetVersion { record: EventSet, labels: ["version"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PositiveInteger, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":version N", description: "Positive event-set version." }
+    EventSetEffects { record: EventSet, labels: ["effects"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: Strings, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":effects [\"NAMESPACE.EFFECT\"...]", description: "Complete vocabulary of namespaced semantic effects." }
     AutomatonTransitions { record: Automaton, labels: ["transitions"], placement: FieldPlacement::Keyword, required: Required, multiplicity: ValueMultiplicity::set(1, 4096), shape: TypestateTransitions, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":transitions [(transition ...)...]", description: "Declare deterministic state/event transitions." }
     AutomatonExpectations { record: Automaton, labels: ["terminal-expectations"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: TerminalExpectations, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":terminal-expectations [(terminal-expectation ...)...]", description: "Declare explicit or implicit terminal accepting-state obligations." }
     EventIdField { record: Event, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: EventId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":id EVENT", description: "Set the stable event identity." }
+    EventSemanticEffect { record: Event, labels: ["semantic-effect"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":semantic-effect \"NAMESPACE.EFFECT\"", description: "Map this policy event to one semantic effect in the event set." }
     EventCalls { record: Event, labels: ["calls"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallsTrigger, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":calls (calls ...)", description: "Trigger on a direct selector call; exclusive with matches and on." }
     EventMatches { record: Event, labels: ["matches"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: MatchEndpointSet, owner: OwnerApplicability::POLICY_TYPESTATE, child_context: TypestateTrigger, signature: ":matches MATCH-SET", description: "Trigger on selected endpoint observations; exclusive with calls and on." }
     EventOn { record: Event, labels: ["on"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SemanticEvent, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":on SEMANTIC-EVENT", description: "Trigger on an implicit semantic event; exclusive with calls and matches." }
@@ -1732,6 +1766,7 @@ pub enum AtomDomain {
     ThreatModel,
     UnmodeledCallBehavior,
     UnknownVerdict,
+    CompletionMarker,
     TrustBoundary,
     SystemEntry,
     DirectoryScope,
@@ -1886,6 +1921,7 @@ atom_values! {
     UnmodeledCallOptimistic { domain: UnmodeledCallBehavior, spellings: ["optimistic"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Preserve existing facts without adding flows through the unseen body." }
     UnmodeledCallRequireModel { domain: UnmodeledCallBehavior, spellings: ["require-model"], owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, description: "Abstain from input-dependent transfer when no exact or curated model applies." }
     UnknownVerdictAbstain { domain: UnknownVerdict, spellings: ["abstain"], owner: OwnerApplicability::POLICY_ALL, description: "Keep the findings, publish the inconclusive completion, and exit unreliable. The default." }
+    CompletionMarkerDepthBoundReached { domain: CompletionMarker, spellings: ["depth_bound_reached"], owner: OwnerApplicability::POLICY_MATCH, description: "The bounded call closure may grow beyond the declared depth." }
     UnknownVerdictWarnUnreliable { domain: UnknownVerdict, spellings: ["warn-unreliable"], owner: OwnerApplicability::POLICY_ALL, description: "Keep the findings and the inconclusive completion, mark them unreliable, and exit on the findings alone." }
     UnknownVerdictFailClosed { domain: UnknownVerdict, spellings: ["fail-closed"], owner: OwnerApplicability::POLICY_ALL, description: "Treat the blocked verdict as a gate failure at the policy severity, and name the unknown that caused it." }
     UnknownVerdictTreatMayAsFinding { domain: UnknownVerdict, spellings: ["treat-may-as-finding"], owner: OwnerApplicability::POLICY_ALL, description: "Publish explicit may evidence as possible findings with its reasons; unmet coverage obligations still make the run inconclusive. Flow and taint already retain possible findings under every verdict." }

@@ -588,10 +588,12 @@ fn export_facts_for_import(
                         state: "listed",
                         polluting: Some(false),
                     },
-                    CuratedExportSurface::Unreadable => ExportSurfaceFacts {
-                        state: "unreadable",
-                        polluting: None,
-                    },
+                    CuratedExportSurface::Unreadable | CuratedExportSurface::PartiallyListed(_) => {
+                        ExportSurfaceFacts {
+                            state: "unreadable",
+                            polluting: None,
+                        }
+                    }
                 }
             }
             StructuralSyntaxLimitedOutcome::Cancelled

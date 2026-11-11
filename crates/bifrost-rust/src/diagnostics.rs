@@ -73,6 +73,14 @@ pub enum RustCrateSurface {
     Uncertain { detail: String },
 }
 
+/// What selected declaration and re-export evidence proves about one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustPathPublication {
+    Published,
+    NotPublished,
+    Unknown { detail: String },
+}
+
 /// The external Rust evidence one diagnostic request may read.
 ///
 /// Every method answers from state the analyzer already retains. None of them
@@ -91,7 +99,7 @@ pub trait RustExternalEvidence {
 
     /// Whether the packs publish the item that `segments` names. `segments`
     /// includes the leading crate name.
-    fn publishes_path(&self, segments: &[String]) -> bool;
+    fn publishes_path(&self, segments: &[String]) -> RustPathPublication;
 
     /// Whether the packs publish `segments` as a *module* surface.
     ///
@@ -119,8 +127,8 @@ impl RustExternalEvidence for UnindexedRustDependencies {
         RustCrateSurface::Unpublished
     }
 
-    fn publishes_path(&self, _segments: &[String]) -> bool {
-        false
+    fn publishes_path(&self, _segments: &[String]) -> RustPathPublication {
+        RustPathPublication::NotPublished
     }
 
     fn is_module_surface(&self, _segments: &[String]) -> bool {
@@ -152,7 +160,8 @@ pub fn collect_rust_semantic_diagnostics(
         report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
         return report;
     }
-    let Some(tree) = crate::lexical_scope::parse_rust_tree(source) else {
+    let Some(tree) = crate::lexical_scope::parse_rust_tree_with(rust.lexical_caches(), source)
+    else {
         report.push_incomplete(
             None,
             vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
@@ -585,8 +594,12 @@ impl RustDiagnosticCollector<'_, '_> {
                 boundary: BoundaryStatus::ExternalUnknown,
             });
         };
-        if self.external.publishes_path(segments) {
-            return RustNameProof::ExternalIndexed;
+        match self.external.publishes_path(segments) {
+            RustPathPublication::Published => return RustNameProof::ExternalIndexed,
+            RustPathPublication::Unknown { detail } => {
+                return RustNameProof::Incomplete(RustProofGap::Unsupported { detail });
+            }
+            RustPathPublication::NotPublished => {}
         }
         match self.external.crate_surface(crate_name) {
             // The pack states a complete API surface for this exact crate and
@@ -675,31 +688,64 @@ impl RustDiagnosticCollector<'_, '_> {
     /// Read from the parser's recorded import path, never by splitting the
     /// import's source text.
     fn imported_path_segments(&self, reference_byte: usize, name: &str) -> Option<Vec<String>> {
-        let reference_mod =
-            crate::lexical_scope::enclosing_mod_item_range_at(self.root, reference_byte);
-        for visible_use in &self.visible_uses {
-            if !crate::lexical_scope::use_statement_visible_at(
-                reference_byte,
-                reference_mod,
-                visible_use.mod_range,
-                visible_use.scope_range,
-            ) {
+        imported_path_segments(self.root, &self.visible_uses, reference_byte, name)
+    }
+}
+
+fn imported_path_segments(
+    root: Node<'_>,
+    visible_uses: &[RustUseBinding],
+    reference_byte: usize,
+    name: &str,
+) -> Option<Vec<String>> {
+    let reference_mod = crate::lexical_scope::enclosing_mod_item_range_at(root, reference_byte);
+    for visible_use in visible_uses {
+        if !crate::lexical_scope::use_statement_visible_at(
+            reference_byte,
+            reference_mod,
+            visible_use.mod_range,
+            visible_use.scope_range,
+        ) {
+            continue;
+        }
+        for import in &visible_use.imports {
+            if !crate::imports::rust_import_binding_name(import)
+                .named()
+                .is_some_and(|binding| crate::imports::rust_binding_name_matches(binding, name))
+            {
                 continue;
             }
-            for import in &visible_use.imports {
-                if crate::imports::rust_import_binding_name(import).named() != Some(name) {
-                    continue;
-                }
-                if let Some(path) = import.path.as_ref()
-                    && !path.segments.is_empty()
-                {
-                    return Some(path.segments.clone());
-                }
+            if let Some(path) = import.path.as_ref()
+                && !path.segments.is_empty()
+            {
+                return Some(path.segments.clone());
             }
         }
-        None
     }
+    None
+}
 
+#[cfg(test)]
+mod raw_import_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10389: a raw import alias expands to its external crate"
+    )]
+    fn raw_alias_expands_external_type_path() {
+        let source = "use serde_json as r#type; fn f(v: r#type::Value) {}";
+        let tree = crate::lexical_scope::parse_rust_tree_uncached(source).unwrap();
+        let root = tree.root_node();
+        let imports = collect_rust_use_bindings(root, source);
+        let position = source.find("r#type::Value").unwrap();
+        let mut expanded = imported_path_segments(root, &imports, position, "r#type").unwrap();
+        expanded.push("Value".to_owned());
+        assert_eq!(expanded, ["serde_json", "Value"]);
+    }
+}
+
+impl RustDiagnosticCollector<'_, '_> {
     /// Place one proof in the report, minting the diagnostic only on the arm
     /// that can carry one.
     fn record(

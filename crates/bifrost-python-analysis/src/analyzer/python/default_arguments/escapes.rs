@@ -610,9 +610,9 @@ impl<'tree> EscapeGraph<'tree> {
                         }
                         StarExports::Explicit(exported)
                     }
-                    CuratedExportSurface::Absent | CuratedExportSurface::Unreadable => {
-                        StarExports::Incomplete
-                    }
+                    CuratedExportSurface::Absent
+                    | CuratedExportSurface::Unreadable
+                    | CuratedExportSurface::PartiallyListed(_) => StarExports::Incomplete,
                 };
         }
         Some(())

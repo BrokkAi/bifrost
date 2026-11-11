@@ -148,7 +148,7 @@ In JSON, a single-target role takes a pattern object, a list role takes an array
 
 Every ordered-list role reads the same way: each listed pattern must match a distinct edge of that role in source order, but the matches need not be contiguous and do not assert exact arity. So `"args": [a, b]` needs two different arguments with `a` before `b`, and `"decorators": [a, a]` needs two decorators rather than one matched twice. Use the `arity` field to fix the count: an exact number, or inclusive `min` and `max` bounds. There is no positional-index operator; to pin a position, narrow the surrounding source shape in a follow-up query.
 
-`kwargs` support is adapter-specific. Python, PHP, Scala, C#, Ruby, and Kotlin expose normalized named arguments; languages without that role return a capability diagnostic.
+`kwargs` support is adapter-specific. Python, PHP, Scala, C#, Ruby, and Kotlin expose normalized named arguments. Java and Rust expose them only for annotation and attribute arguments, so a Java or Rust `call` with `kwargs` matches nothing. Languages without that role return a capability diagnostic.
 
 ## Captures And Results
 
@@ -315,6 +315,15 @@ be confused with an arbitrary string:
   ]
 }
 ```
+
+Enum domains distinguish undecided source-property values from exact evidence
+categories. For example, `owner_relation=unknown` cannot decide `eq external` or
+`ne external`: the row is withheld with `row_predicate_undecided` and the answer
+is incomplete. An explicit comparison with the actual sentinel, or an `in` list
+containing it, uses normal label matching. A definite false predicate dominates
+other undecided predicates in the same filter. Presence tests remain about null;
+evidence categories such as `proof=unknown` retain exact comparisons. See the
+[row-predicate rules](/reference/code-query/#row-predicates-and-projections).
 
 Comparison `value` accepts exactly one of `string`, `integer`, `boolean`, or
 `enum`, or the object `{ "field": "OTHER_FIELD" }`. The public operators are
@@ -595,6 +604,7 @@ A **resolution candidate** is one thing the resolver considered for one referenc
 ```
 
 Each candidate row carries the `ast_id` of the *reference* it explains, an `ordinal` within that reference's trace, an optional `tier`, an `outcome` (`selected` or `rejected`) with an optional typed `rejection_reason`, a `boundary`, a `visibility`, a `trace_completeness`, and a `candidate` object whose `candidate_kind` is `unit`, `modeled`, `intrinsic`, `lexical`, `binding`, `import_binder`, or `external_route`. An `intrinsic` candidate names the canonical language type (for example, `java.lang.String`) and its binding tier without claiming a source declaration or location.
+A `modeled` candidate carries the pack-declared `symbol_id` and a mandatory `provider` object with `pack_id`, `pack_version`, and `pack_digest`. The provider and symbol ID together identify the declaration; `name` is presentation only.
 
 Three honesty rules govern candidate rows, and none of them can be read off an empty answer:
 
@@ -638,16 +648,17 @@ Bifrost derives "X uses Y" twice: the resolver derives it forward, from one clas
 }
 ```
 
-Each edge row carries `id`, an optional `ast_id`, `path`, `language`, `range`, `start_byte`, `end_byte`, a `target` declaration, an optional `enclosing_declaration`, an optional `reference_kind`, a `proof`, a `usage_kind`, a `site_class`, an `owner_relation`, an `edge_provenance`, and a `generation`. Both steps accept `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`.
+Each edge row carries `id`, an optional `ast_id`, `path`, `language`, `range`, `start_byte`, `end_byte`, a `target` declaration, an optional `enclosing_declaration`, `reference_facets`, a `proof`, a `usage_kind`, a `site_class`, an `owner_relation`, an `edge_provenance`, and a `generation`. Both steps accept `reference_kinds`, `proof`, `surface`, `usage`, `relation`, and `site_class`.
 
 `edge_provenance` is the field the whole domain exists for: `forward` for a resolver-derived row and `inverse` for a usage-index-derived one. It is spelled `edge_provenance` on the wire because every result item already owns `provenance` for its branch trace. It is data on every row rather than something read off which step produced the set, so a parity comparison is a comparison across a field. `generation` is the workspace generation the derivation ran in; two rows from two generations describe two workspaces and must not be related.
 
-Four absences here are answers rather than gaps:
+Three absences here are answers rather than gaps:
 
 - An **absent `ast_id`** means the producer could not address the site token as a facts-arena node, not that the edge is weaker. Where it is present, string equality with a capture's or an occurrence's `ast_id` is the correlation join.
-- An **absent `reference_kind`** means the producer classified no structured kind. It is not a kind of its own and must not be compared against one.
 - An `owner_relation` of `unknown` means the classifier could not relate the site's owner to the target's. It is never silently equal to `external`: an assertion over unknown relations is inconclusive, not clean.
 - A `site_class` of `declaration_site` is editor-visible navigation, not a runtime usage. The whole-workspace edge build drops such sites by design, so the classification is a field rather than a missing edge.
+
+- **`reference_facets`** states classification as two lists of reference kinds: `known` holds the kinds proven for this occurrence and `undecided` the kinds that may hold; every other kind is proven absent. A `reference_kinds` filter keeps a row when a known kind is requested, reports the answer incomplete with `reference_kind_undecided` when only an undecided kind could match, and drops a row only when every requested kind is proven absent. One occurrence can carry several kinds at once (a super call is both `method_call` and `super_call`). Empty lists, as on an import binding, mean no reference kind applies. The row `id` names the occurrence and does not change when its classification does.
 
 `surface` is optional and has **no default**, unlike `references_of`. The canonical edge answer includes editor-only rows, and silently defaulting to `external_usages` would narrow the compared ground set without the author saying so.
 
@@ -683,7 +694,7 @@ Call traversal is direct by default. `callers` and `callees` accept a positive f
 
 `call_sites_to` and `call_sites_from` expose the full call range, callee range, caller and callee declarations, call kind, proof tier, optional explicit receiver, and arguments. `call_input` requires exactly one of `{"receiver":true}`, `{"parameter_index":0}`, or `{"parameter_name":"payload"}`. Parameter indexes are zero-based formal slots and exclude receiver-bound parameters; keyword/named arguments bind by the callee's declared parameter name. A variadic slot may yield several expression rows. Spreads/splats are retained on the call-site result but are not guessed into a formal slot. An implicit receiver has no synthetic expression row.
 
-The three receiver-analysis steps return one row for every input, including unknown and unsupported cases. `receiver_targets` and `points_to` return `receiver_analysis` rows. Each includes `analysis_kind`, input path, language, range, text, and kind, `outcome`, and recursive `values`. `member_targets` returns `member_target_analysis` rows, which carry `outcome`, `coverage`, `target_count`, `site_id`, `site_ast_id`, and the exact member declarations under `member_targets` when they are resolved. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
+The three receiver-analysis steps return one row for every input, including unknown and unsupported cases. The exception is `member_targets` with `member_form` or `trivial_property`: it drops rows whose target provably does not match and withholds undecided rows with a `member_form_undecided` incomplete diagnostic (see [CodeQuery reference](/reference/code-query/)). `receiver_targets` and `points_to` return `receiver_analysis` rows. Each includes `analysis_kind`, input path, language, range, text, and kind, `outcome`, and recursive `values`. `member_targets` returns `member_target_analysis` rows, which carry `outcome`, `coverage`, `target_count`, `site_id`, `site_ast_id`, and the exact member declarations under `member_targets` when they are resolved. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
 
 The `member_selection` projection emits exactly one summary row per input occurrence, from the same resolver candidate trace `candidates_of` exposes: a stable domain-separated `id`, the exact `site_ast_id` join key, the decoded `member` spelling and `role`, an `outcome` of `selected`/`unresolved`/`untraced`, `selected_count` and `candidate_count`, `trace_completeness` (`full`, `selection_only`, or `absent`), and `coverage` (`exhaustive` only for a full trace, `open` for a selection-only trace, `unsupported` when the language records no trace). Selected `resolution_candidate` rows additionally carry `canonical_member_id`, a digest of the structured canonical identity (kind-tagged segments, namespace, language, recorded generic arity) -- same-spelling members of different owners always hash apart. Member-position occurrence support is per language: Rust records a full trace; TypeScript and Python record selection-only traces; Java summarizes its trace; Go, C#, C++, PHP, and Ruby do not classify member-position occurrences yet and state that as an `occurrence_role_unsupported` incomplete diagnostic, which makes policies over their rows unreliable rather than clean.
 
@@ -1011,3 +1022,12 @@ reports `unknown field in pattern object` at `match.calee`. The message does not
 ## RQL Interoperability
 
 The same semantic query can be written in [Rune Query Language](/rune-query-language/) while exploring interactively, then inspected with `:json`. JSON and RQL are peer frontends over `CodeQuery`; neither has separate matching semantics.
+
+The RQL call-shape projection is the only place that refines stored
+`callee_provenance` at query time. A stored `unknown` can project as `declared`
+for a Rust method call only when resolution is complete and ungapped and
+selects one declared method on a closed bound receiver. Refinement only fills
+`unknown`; it preserves every stored decided value. A receiver whose type is
+or contains an enclosing function type parameter remains `unknown`, unless
+the syntax-only producer already decided its provenance. Ambiguous, gapped,
+and unresolved targets remain `unknown`.

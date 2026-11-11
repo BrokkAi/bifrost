@@ -1601,6 +1601,18 @@ fn record_receiver_member_outcome<K: NodeKey>(
             }
             true
         }
+        ReceiverAnalysisOutcome::Incomplete { candidates } => {
+            edges.record_unproven_name_at_node(input, property_text, property);
+            for target in candidates {
+                edges.record_unproven(
+                    input,
+                    K::from_unit(&target),
+                    property.start_byte(),
+                    property.end_byte(),
+                );
+            }
+            true
+        }
         ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
             edges.record_unproven_name_at_node(input, property_text, property);

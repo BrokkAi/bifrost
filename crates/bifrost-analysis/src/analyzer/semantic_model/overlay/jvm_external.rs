@@ -3,6 +3,93 @@
 impl crate::analyzer::store::resolution_operation::SelectedModelAuthority
     for crate::analyzer::semantic_model::SemanticModelOverlay
 {
+    fn python_runtime_bases(
+        &self,
+        qualified_name: &str,
+        symbol_id: &str,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::store::resolution_operation::ModelRuntimeBases {
+        use crate::analyzer::semantic::type_flow::{ClassIdentity, ExternalClassCache};
+        use crate::analyzer::semantic_model::python_runtime_bases::{
+            MAX_PYTHON_HIERARCHY_VISITS, PythonRuntimeClaimBudget, runtime_bases,
+        };
+        use crate::analyzer::semantic_model::{ActiveSemanticModelShard, TypeFact};
+        use crate::analyzer::store::resolution_operation::ModelRuntimeBases;
+        use crate::analyzer::usages::python_class_hierarchy::{
+            PythonAncestryBasis, PythonHierarchyReason,
+        };
+        use crate::hash::HashSet;
+
+        struct Budget<'a> {
+            cancellation: &'a crate::CancellationToken,
+            visits: usize,
+            retained: HashSet<(*const ActiveSemanticModelShard, *const TypeFact)>,
+        }
+        impl PythonRuntimeClaimBudget for Budget<'_> {
+            fn charge(&mut self, visits: usize, work: usize) -> Result<(), PythonHierarchyReason> {
+                if self.cancellation.is_cancelled() {
+                    return Err(PythonHierarchyReason::Cancelled);
+                }
+                self.visits = self.visits.saturating_add(visits.max(work));
+                if self.visits > MAX_PYTHON_HIERARCHY_VISITS {
+                    return Err(PythonHierarchyReason::VisitLimit);
+                }
+                Ok(())
+            }
+            fn has_claim(&self, key: (*const ActiveSemanticModelShard, *const TypeFact)) -> bool {
+                self.retained.contains(&key)
+            }
+            fn mark_claim(&mut self, key: (*const ActiveSemanticModelShard, *const TypeFact)) {
+                self.retained.insert(key);
+            }
+        }
+        if cancellation.is_cancelled() {
+            return ModelRuntimeBases::Cancelled;
+        }
+        let Some(active) = self.active_models.as_ref() else {
+            return ModelRuntimeBases::Unproven;
+        };
+        let identity = ClassIdentity::External {
+            qualified_name: qualified_name.into(),
+            symbol_id: symbol_id.into(),
+        };
+        let mut budget = Budget {
+            cancellation,
+            visits: 0,
+            retained: HashSet::default(),
+        };
+        let result = runtime_bases(
+            active,
+            Some(self),
+            &identity,
+            &mut PythonAncestryBasis::default(),
+            &mut ExternalClassCache::default(),
+            &mut budget,
+        );
+        if cancellation.is_cancelled() {
+            return ModelRuntimeBases::Cancelled;
+        }
+        match result {
+            Ok(bases) => ModelRuntimeBases::Agreed(
+                bases
+                    .into_iter()
+                    .map(|base| {
+                        let ClassIdentity::External { symbol_id, .. } = base else {
+                            unreachable!("runtime claim base is external")
+                        };
+                        super::TypeRef::Declared {
+                            id: symbol_id.into(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        }
+                    })
+                    .collect(),
+            ),
+            Err(PythonHierarchyReason::Cancelled) => ModelRuntimeBases::Cancelled,
+            Err(_) => ModelRuntimeBases::Unproven,
+        }
+    }
+
     fn model_declared_types_named(
         &self,
         language: &str,
@@ -105,6 +192,7 @@ pub fn model_declares_external_type(
     fqn: &str,
 ) -> bool {
     qualified_model_symbols(overlay, fqn)
+        .records
         .iter()
         .any(|symbol| pack_type_kind(symbol.kind).is_some())
 }
@@ -119,7 +207,13 @@ pub fn model_declared_external_owner(
     // The unselected view folds same-id owners across providers; moving the JVM
     // onto the selected composition is #7605's change, with its own identity.
     let symbols = qualified_model_symbols(overlay, fqn);
-    match super::classify_model_type_owner(symbols.iter().map(|symbol| &**symbol), |kind| {
+    if matches!(
+        symbols.disposition,
+        super::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return None;
+    }
+    match super::classify_model_type_owner(symbols.records.iter().map(|symbol| &**symbol), |kind| {
         pack_type_kind(kind).is_some()
     }) {
         super::ModelTypeOwnerAnswer::Unique { declaration, .. } => {
@@ -138,15 +232,24 @@ pub fn model_declared_external_owner(
 pub fn qualified_model_symbols(
     overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     fqn: &str,
-) -> Vec<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>> {
-    overlay
-        .symbols_named(fqn)
-        .records
-        .into_iter()
-        .filter(|symbol| {
-            symbol.qualified_name == fqn || symbol.aliases.iter().any(|alias| alias == fqn)
-        })
-        .collect()
+) -> super::SemanticModelOverlayMatch<crate::analyzer::semantic_model::SemanticModelSymbol> {
+    let mut matched = overlay.symbols_named(fqn);
+    matched.records.retain(|symbol| {
+        symbol.qualified_name == fqn || symbol.aliases.iter().any(|alias| alias == fqn)
+    });
+    if !matches!(
+        matched.disposition,
+        super::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        matched.disposition = match matched.records.as_slice() {
+            [] => super::SemanticModelOverlayDisposition::Empty,
+            [symbol] if !symbol.provenance.ambiguous => {
+                super::SemanticModelOverlayDisposition::Unique
+            }
+            _ => super::SemanticModelOverlayDisposition::Conflict,
+        };
+    }
+    matched
 }
 
 /// The JVM type shape an overlay symbol kind denotes, or `None` when the

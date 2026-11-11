@@ -144,6 +144,7 @@ pub(crate) fn resolve_rust_type_prefixes(
         source,
         paths,
         typed,
+        &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
         cancellation,
         &session,
         |operation| {

@@ -19,6 +19,7 @@ pub struct RustCrateTarget {
     pub features: BTreeSet<String>,
     pub dependencies: Vec<RustCrateDependency>,
     pub inventory_complete: bool,
+    pub inventory_error: Option<String>,
 }
 
 /// Reuse Cargo's target discovery over an exact path inventory, without loading
@@ -154,16 +155,38 @@ pub fn rust_crate_targets(
             .filter(|dependency| {
                 dependency_available(dependency.kind, kind, kind != RustCallerTargetKind::Build)
             })
-            .map(|fact| RustCrateDependency {
-                extern_name: fact.exposed_name.clone(),
-                kind: fact.kind,
-                manifest_path: dependency_manifest(
+            .map(|fact| {
+                let manifest_path = dependency_manifest(
                     &profile.manifest_path,
                     fact,
                     &input.manifests,
                     &cargo_manifests,
                     configuration,
-                ),
+                );
+                let renamed = crate::cargo_routes::effective_cargo_dependency(
+                    Path::new(""),
+                    profile.manifest_path.parent().unwrap_or(Path::new("")),
+                    &manifest.document,
+                    &fact.manifest_name,
+                    fact.source_value(&manifest.document),
+                    &cargo_manifests,
+                )
+                .is_some_and(|(value, _)| value.contains_key("package"));
+                let extern_name = if renamed {
+                    None
+                } else {
+                    manifest_path
+                        .as_ref()
+                        .and_then(|path| input.manifests.get(path))
+                        .and_then(|manifest| manifest.facts.package.as_ref())
+                        .map(|package| package.library_name.clone())
+                }
+                .unwrap_or_else(|| fact.exposed_name.clone());
+                RustCrateDependency {
+                    extern_name,
+                    kind: fact.kind,
+                    manifest_path,
+                }
             })
             .collect();
         if same_package_library_root(&profile, package, &input.sources)?.is_some() {
@@ -176,14 +199,17 @@ pub fn rust_crate_targets(
         dependencies.sort_by(|left, right| {
             (&left.extern_name, left.kind).cmp(&(&right.extern_name, right.kind))
         });
-        if dependencies.windows(2).any(|pair| {
-            pair[0].extern_name == pair[1].extern_name
-                && pair[0].manifest_path != pair[1].manifest_path
-        }) {
-            return Err(format!(
-                "conflicting crate dependency routes: {dependencies:?}"
-            ));
-        }
+        let conflicts: BTreeSet<_> = dependencies
+            .windows(2)
+            .filter(|pair| {
+                pair[0].extern_name == pair[1].extern_name
+                    && pair[0].manifest_path != pair[1].manifest_path
+            })
+            .map(|pair| pair[0].extern_name.clone())
+            .collect();
+        dependencies.retain(|dependency| !conflicts.contains(&dependency.extern_name));
+        // Rows are keyed by extern name. Normal sorts before development and
+        // already grants every non-build target that can use the dev route.
         dependencies.dedup_by(|left, right| left.extern_name == right.extern_name);
         // Cargo reads its configuration from where the workspace build runs.
         let manifest_directory = profile.manifest_path.parent().unwrap_or(Path::new(""));
@@ -193,7 +219,7 @@ pub fn rust_crate_targets(
             &manifest.document,
             &cargo_manifests,
         )
-        .expect("a target's manifest declares a package");
+        .unwrap_or_else(|| manifest_directory.to_path_buf());
         let mut cfg_atoms = cfg_atoms_by_workspace
             .entry((
                 workspace,
@@ -224,7 +250,10 @@ pub fn rust_crate_targets(
             cfg_atoms,
             features: features[&profile.manifest_path].enabled.clone(),
             dependencies,
-            inventory_complete: inventory.target_inventory_complete
+            inventory_error: (!conflicts.is_empty())
+                .then(|| format!("conflicting target-specific destinations for {conflicts:?}")),
+            inventory_complete: conflicts.is_empty()
+                && inventory.target_inventory_complete
                 && features[&profile.manifest_path].complete,
         });
     }
@@ -272,14 +301,20 @@ fn fixed_build_features(
     let mut roots = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
     for (path, manifest) in manifests.iter().filter(|(_, m)| m.facts.package.is_some()) {
         let directory = path.parent().expect("manifest has a directory");
-        let workspace = cargo_workspace_manifest_directory(
+        let Some(workspace) = cargo_workspace_manifest_directory(
             Path::new(""),
             directory,
             &manifest.document,
             cargo_manifests,
-        )
-        .expect("package has a workspace directory");
-        let workspace_manifest = &manifests[&workspace.join("Cargo.toml")];
+        ) else {
+            // A broken package.workspace pointer has no feature-unification root.
+            // The result below retains the package with incomplete features.
+            continue;
+        };
+        let Some(workspace_manifest) = manifests.get(&workspace.join("Cargo.toml")) else {
+            // The selected listing can omit the workspace manifest.
+            continue;
+        };
         if !cargo_workspace_claims_package(&workspace, &workspace_manifest.facts, directory) {
             // Retaining an excluded manifest does not include its package in
             // this build. Its own explicit workspace would be a separate root.
@@ -329,13 +364,15 @@ fn fixed_build_features(
                         continue;
                     };
                     let target_directory = target.parent().expect("manifest has a directory");
-                    let target_workspace = cargo_workspace_manifest_directory(
+                    let Some(target_workspace) = cargo_workspace_manifest_directory(
                         Path::new(""),
                         target_directory,
                         &manifests[&target].document,
                         cargo_manifests,
-                    )
-                    .expect("dependency declares a package");
+                    ) else {
+                        // A retained dependency can have an unresolved workspace pointer.
+                        continue;
+                    };
                     if target_workspace == *workspace
                         && cargo_workspace_claims_package(
                             workspace,
@@ -641,20 +678,10 @@ fn dependency_manifest(
     cargo_manifests: &CargoHashMap<PathBuf, RustCargoManifestDocument>,
     configuration: &RustCargoConfiguration,
 ) -> Option<PathBuf> {
-    let manifest = manifests.get(path)?;
-    let table = match dependency.kind {
-        RustCargoDependencyKind::Normal => "dependencies",
-        RustCargoDependencyKind::Development => "dev-dependencies",
-        RustCargoDependencyKind::Build => "build-dependencies",
-    };
-    let raw_dependency = manifest
-        .document
-        .get(table)?
-        .get(&dependency.manifest_name)?;
     inventory_dependency_manifest(
         path,
         &dependency.manifest_name,
-        raw_dependency,
+        dependency.source_value(&manifests.get(path)?.document),
         manifests,
         cargo_manifests,
         configuration,

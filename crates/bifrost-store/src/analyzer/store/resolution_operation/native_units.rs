@@ -38,6 +38,115 @@ pub enum SelectedNativeDefinition {
         canonical_name: String,
         tier: Option<crate::analyzer::structural::PrecedenceTier>,
     },
+    ExternalOwner {
+        owner: crate::analyzer::resolution::ExternalOwnerIdentity,
+        authority: ExternalOwnerDefinitionAuthority,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ExternalOwnerDefinitionAuthority {
+    IndexedDeclaration,
+    ModelDeclared,
+    CanonicalLanguageRoot,
+    OtherIntrinsicOwner,
+}
+
+fn external_owner_definition_authority(
+    owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
+    reference_language: Option<Language>,
+    authority: crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority,
+) -> ExternalOwnerDefinitionAuthority {
+    use crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority;
+    match authority {
+        ExternalNominalAuthority::IndexedDeclaration => {
+            ExternalOwnerDefinitionAuthority::IndexedDeclaration
+        }
+        ExternalNominalAuthority::UnindexedModelDeclaration => {
+            ExternalOwnerDefinitionAuthority::ModelDeclared
+        }
+        ExternalNominalAuthority::LanguageRoot => {
+            if reference_language.is_some_and(|language| {
+                brokk_bifrost_jvm::intrinsics::intrinsic_root_owner(&owner.owner_fqn).is_some()
+                    && brokk_bifrost_jvm::intrinsics::language_root_member_inventory(
+                        language,
+                        &owner.owner_fqn,
+                    )
+                    .is_some()
+            }) {
+                ExternalOwnerDefinitionAuthority::CanonicalLanguageRoot
+            } else {
+                ExternalOwnerDefinitionAuthority::OtherIntrinsicOwner
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod external_owner_definition_authority_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8500: nonroot compiler owners shared the intrinsic provider with canonical roots"
+    )]
+    fn canonical_root_requires_selected_language_and_owner() {
+        let owner = |name: &str| crate::analyzer::resolution::ExternalOwnerIdentity {
+            provider_id: std::sync::Arc::from("jvm-intrinsic"),
+            owner_fqn: std::sync::Arc::from(name),
+        };
+        assert_eq!(
+            external_owner_definition_authority(
+                &owner("scala.AnyRef"),
+                Some(Language::Scala),
+                crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority::LanguageRoot
+            ),
+            ExternalOwnerDefinitionAuthority::CanonicalLanguageRoot
+        );
+        assert_eq!(
+            external_owner_definition_authority(
+                &owner("scala.AnyRef"),
+                Some(Language::Java),
+                crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority::LanguageRoot
+            ),
+            ExternalOwnerDefinitionAuthority::OtherIntrinsicOwner
+        );
+        assert_eq!(
+            external_owner_definition_authority(
+                &owner("scala.AnyRef"),
+                None,
+                crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority::LanguageRoot
+            ),
+            ExternalOwnerDefinitionAuthority::OtherIntrinsicOwner
+        );
+        for name in [
+            "java.lang.Enum",
+            "java.lang.Record",
+            "java.lang.annotation.Annotation",
+        ] {
+            assert_eq!(
+                external_owner_definition_authority(
+                    &owner(name),
+                    Some(Language::Java),
+                    crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority::LanguageRoot
+                ),
+                ExternalOwnerDefinitionAuthority::OtherIntrinsicOwner,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            external_owner_definition_authority(
+                &crate::analyzer::resolution::ExternalOwnerIdentity {
+                    provider_id: std::sync::Arc::from("pack"),
+                    owner_fqn: std::sync::Arc::from("java.nio.file.Path"),
+                },
+                Some(Language::Java),
+                crate::analyzer::resolution::fact_resolution::demand_scheduler::ExternalNominalAuthority::UnindexedModelDeclaration,
+            ),
+            ExternalOwnerDefinitionAuthority::ModelDeclared,
+        );
+    }
 }
 
 #[doc(hidden)]
@@ -46,6 +155,510 @@ pub enum SelectedNativeDefinitions {
     Ready(Vec<(SemanticId, SelectedNativeDefinition)>),
     Unavailable,
     Cancelled,
+}
+
+/// A Go definition crosswalk preserves authoritative absence and operational
+/// failure separately from a unique selected identity.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoHierarchyDefinitionMatch {
+    Missing,
+    Found(SemanticId),
+    Ambiguous(Vec<SemanticId>),
+    Stopped {
+        budget_limit:
+            Option<brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit>,
+    },
+    Unavailable,
+}
+
+pub(super) enum GoSelectedTargetMatch {
+    Matched(Vec<(SemanticId, String, i64)>),
+    Unavailable,
+    Stopped,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum GoTargetKeys {
+    Keys(Vec<i64>),
+    Unavailable,
+    Stopped,
+}
+
+static GO_TARGET_KEY_ACQUISITION_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "SELECT {columns}, units.identifier
+             {selected_view}
+             JOIN main.code_units AS units INDEXED BY idx_code_units_lang_identifier
+               ON units.blob_id=mount.blob_id
+             WHERE mount.mount_ordinal=?1 AND mount.storage_language='go'
+               AND units.lang=?2 AND units.identifier=?3
+               AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
+               AND units.in_declarations = 1 AND units.blob_id=mount.blob_id
+               AND {complete}",
+            columns = super::super::selected_definition::SELECTED_UNIT_COLUMNS,
+            selected_view = super::go_reverse_rows::GO_TARGET_SELECTED_VIEW_JOINS,
+            complete = super::super::PARSED_BLOB_COMPLETE_CONDITION,
+        )
+    });
+
+fn go_target_keys(
+    ready: &ReadySelectedResolution<'_, '_>,
+    ordinal: SelectedResolutionMountOrdinal,
+    target: &CodeUnit,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<GoTargetKeys> {
+    if !session.observe_cancellation() || cancellation.is_cancelled() {
+        return Ok(GoTargetKeys::Stopped);
+    }
+    let connection = ready.inventory.connection();
+    let candidates = {
+        let mut statement = connection.prepare_cached(GO_TARGET_KEY_ACQUISITION_SQL.as_str())?;
+        let mut rows = statement.query(rusqlite::params![
+            i64::from(ordinal.get()),
+            "go",
+            target.identifier()
+        ])?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next()? {
+            if !session.scope_step() || cancellation.is_cancelled() {
+                return Ok(GoTargetKeys::Stopped);
+            }
+            candidates.push((
+                super::super::candidate_row_from_row(row)?,
+                row.get::<_, String>(20)?,
+            ));
+        }
+        candidates
+    };
+    if !session.observe_cancellation() || cancellation.is_cancelled() {
+        return Ok(GoTargetKeys::Stopped);
+    }
+    let Some(rows) =
+        super::super::hydrate_candidate_rows(connection, candidates, Some(cancellation))?
+    else {
+        return Ok(GoTargetKeys::Stopped);
+    };
+    let mount = SelectedMountTable::new(&ready.inventory).mount_by_ordinal(ordinal)?;
+    let file = ProjectFile::new(ready.project.root(), mount.persisted_relative_path());
+    let mut keys = Vec::new();
+    for (row, identifier) in rows {
+        if !session.observe_cancellation() || cancellation.is_cancelled() {
+            return Ok(GoTargetKeys::Stopped);
+        }
+        // A row whose unit cannot be rebuilt or verified may still be the
+        // target, and so may a row whose stored identifier disagrees with its
+        // rebuilt unit. Corrupt rows are store errors, as in projection.
+        let Some(unit) = hydrate_fragment_unit(ready, ordinal, &file, &row)? else {
+            return Ok(GoTargetKeys::Unavailable);
+        };
+        if unit.identifier() != identifier {
+            return Ok(GoTargetKeys::Unavailable);
+        }
+        if unit == *target {
+            keys.push(row.unit_key);
+        }
+    }
+    Ok(GoTargetKeys::Keys(keys))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ReadySelectedResolution<'_, '_> {
+    #[doc(hidden)]
+    pub fn go_target_keys_for_test(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<GoTargetKeys> {
+        go_target_keys(self, ordinal, target, cancellation, session)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn go_target_key_acquisition_sql_for_test() -> &'static str {
+    GO_TARGET_KEY_ACQUISITION_SQL.as_str()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum GoUnresolvedRoute {
+    Clear,
+    Unavailable,
+    Stopped,
+}
+
+static GO_UNRESOLVED_ROUTE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        r#"SELECT direct.unit_key IS NOT NULL, bridge.declaration_id IS NOT NULL,
+       declaration.name_occurrence_id IS NULL,
+       CASE WHEN anonymous_type.kind IN (12,13) THEN 1 ELSE 0 END,
+       EXISTS(SELECT 1 FROM main.resolution_root_imports AS root_import
+              WHERE root_import.blob_id=semantic.blob_id
+                AND root_import.import_site=semantic.source_site),
+       link.unit_key IS NOT NULL
+{selected_view}
+JOIN main.resolution_semantic_sites AS semantic
+  ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
+LEFT JOIN main.resolution_definition_unit_crosswalks AS direct
+  ON direct.blob_id=semantic.blob_id AND direct.definition_semantic_key=semantic.semantic_key
+LEFT JOIN main.code_units AS direct_unit
+  ON direct_unit.blob_id=direct.blob_id AND direct_unit.unit_key=direct.unit_key
+LEFT JOIN main.source_native_declaration_bridges AS bridge
+  ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
+LEFT JOIN main.source_declarations AS declaration
+  ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
+LEFT JOIN main.source_declaration_units AS link
+  ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id
+LEFT JOIN main.code_units AS linked_unit
+  ON linked_unit.blob_id=link.blob_id AND linked_unit.unit_key=link.unit_key
+LEFT JOIN main.source_go_types AS anonymous_type
+  ON anonymous_type.blob_id=declaration.blob_id
+ AND anonymous_type.occurrence_id=declaration.occurrence_id
+WHERE mount.mount_ordinal=?1 AND {complete}
+  AND ((direct.unit_key IS NOT NULL
+        AND (direct_unit.unit_key IS NULL OR direct_unit.in_declarations=0))
+       OR (direct.unit_key IS NULL AND bridge.declaration_id IS NULL)
+       -- A lexical declaration projects to Lexical, never to a unit.
+       OR (bridge.declaration_id IS NOT NULL AND link.unit_key IS NULL
+           AND (direct.unit_key IS NOT NULL
+                OR declaration.lexical_kind IS NULL
+                OR declaration.lexical_identifier IS NULL
+                OR declaration.name_occurrence_id IS NULL))
+       OR (link.unit_key IS NOT NULL
+           AND (linked_unit.unit_key IS NULL OR linked_unit.in_declarations=0)))
+"#,
+        selected_view = super::go_reverse_rows::GO_TARGET_SELECTED_VIEW_JOINS,
+        complete = super::super::PARSED_BLOB_COMPLETE_CONDITION,
+    )
+});
+
+fn go_unresolved_route_exempt(
+    direct: bool,
+    bridge: bool,
+    has_links: bool,
+    nameless: bool,
+    anonymous_type: bool,
+    root_import: bool,
+    target: &CodeUnit,
+) -> bool {
+    (!direct
+        && !bridge
+        && root_import
+        && (target.is_class() || target.is_function() || target.is_field()))
+        || (!direct && bridge && !has_links && nameless && anonymous_type)
+}
+
+fn go_unresolved_route_check(
+    ready: &ReadySelectedResolution<'_, '_>,
+    ordinal: SelectedResolutionMountOrdinal,
+    target: &CodeUnit,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<GoUnresolvedRoute> {
+    if !session.observe_cancellation() || cancellation.is_cancelled() {
+        return Ok(GoUnresolvedRoute::Stopped);
+    }
+    let connection = ready.inventory.connection();
+    let mut statement = connection.prepare_cached(GO_UNRESOLVED_ROUTE_SQL.as_str())?;
+    let mut rows = statement.query([i64::from(ordinal.get())])?;
+    while let Some(row) = rows.next()? {
+        if !session.scope_step() || cancellation.is_cancelled() {
+            return Ok(GoUnresolvedRoute::Stopped);
+        }
+        let direct = row.get::<_, i64>(0)? != 0;
+        let bridge = row.get::<_, i64>(1)? != 0;
+        let nameless = row.get::<_, i64>(2)? != 0;
+        let anonymous_type = row.get::<_, i64>(3)? != 0;
+        let root_import = row.get::<_, i64>(4)? != 0;
+        // An unresolved bridge row has no link exactly when the joined link is NULL.
+        // The query's other branches can also return linked rows, so carry this
+        // bit in the query rather than infer it from the failure predicate.
+        let has_links = row.get::<_, i64>(5)? != 0;
+        if !go_unresolved_route_exempt(
+            direct,
+            bridge,
+            has_links,
+            nameless,
+            anonymous_type,
+            root_import,
+            target,
+        ) {
+            return Ok(GoUnresolvedRoute::Unavailable);
+        }
+    }
+    if !session.observe_cancellation() || cancellation.is_cancelled() {
+        return Ok(GoUnresolvedRoute::Stopped);
+    }
+    Ok(GoUnresolvedRoute::Clear)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ReadySelectedResolution<'_, '_> {
+    #[doc(hidden)]
+    pub fn go_unresolved_route_check_for_test(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<GoUnresolvedRoute> {
+        go_unresolved_route_check(self, ordinal, target, cancellation, session)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn go_unresolved_route_sql_for_test() -> &'static str {
+    GO_UNRESOLVED_ROUTE_SQL.as_str()
+}
+
+struct GoDefinitionCandidate {
+    id: SemanticId,
+    namespace: String,
+    source_site: i64,
+    direct_unit: Option<i64>,
+    declaration: Option<i64>,
+    links: Vec<i64>,
+    nameless: bool,
+    anonymous_type: bool,
+    direct_hydrates: bool,
+    root_import: bool,
+}
+
+static GO_TARGET_NOMINATED_SEMANTICS_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        let prefix = format!(
+            r#"WITH selected_blob AS MATERIALIZED (
+  SELECT mount.blob_id {selected_view}
+  WHERE mount.mount_ordinal=?1 AND {complete}
+), target_keys AS MATERIALIZED (
+  SELECT CAST(value AS INTEGER) AS unit_key FROM json_each(?2)
+), nominated AS MATERIALIZED (
+  SELECT direct.blob_id, direct.definition_semantic_key AS semantic_key
+  FROM selected_blob AS selected
+  CROSS JOIN target_keys AS target_key
+  CROSS JOIN main.resolution_definition_unit_crosswalks AS direct
+  WHERE direct.blob_id=selected.blob_id AND direct.unit_key=target_key.unit_key
+  UNION
+  SELECT semantic.blob_id, semantic.semantic_key
+  FROM selected_blob AS selected
+  CROSS JOIN target_keys AS target_key
+  CROSS JOIN main.source_declaration_units AS link
+  CROSS JOIN main.source_native_declaration_bridges AS bridge
+  CROSS JOIN main.resolution_semantic_sites AS semantic
+  WHERE link.blob_id=selected.blob_id AND link.unit_key=target_key.unit_key
+    AND bridge.blob_id=link.blob_id AND bridge.declaration_id=link.declaration_id
+    AND semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site
+    AND semantic.semantic_role='definition'
+)"#,
+            selected_view = super::go_reverse_rows::GO_TARGET_SELECTED_VIEW_JOINS,
+            complete = super::super::PARSED_BLOB_COMPLETE_CONDITION,
+        );
+        super::go_reverse_rows::go_target_definition_semantics_sql(
+            &prefix,
+            "CROSS JOIN nominated AS nominated",
+            "AND semantic.blob_id=nominated.blob_id AND semantic.semantic_key=nominated.semantic_key",
+        )
+    },
+);
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn go_target_nominated_semantics_sql_for_test() -> &'static str {
+    GO_TARGET_NOMINATED_SEMANTICS_SQL.as_str()
+}
+
+/// The same selected target proof serves hierarchy and reverse references.
+///
+/// It projects only the definitions nominated by the target's stored keys.
+/// Every other definition of the file may be ignored only because stored
+/// route and equality data proves it cannot denote the target: its routes
+/// end in stored unit keys, none of which has the target's identifier.
+/// Incomplete route data anywhere in the file keeps the match
+/// `Unavailable`; a reverse query returning no row is not that proof.
+pub(super) fn go_selected_target_match(
+    ready: &ReadySelectedResolution<'_, '_>,
+    ordinal: SelectedResolutionMountOrdinal,
+    target: &CodeUnit,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<GoSelectedTargetMatch> {
+    if !session.observe_cancellation() || cancellation.is_cancelled() {
+        return Ok(GoSelectedTargetMatch::Stopped);
+    }
+    let keys = match go_target_keys(ready, ordinal, target, cancellation, session)? {
+        GoTargetKeys::Keys(keys) => keys,
+        GoTargetKeys::Unavailable => return Ok(GoSelectedTargetMatch::Unavailable),
+        GoTargetKeys::Stopped => return Ok(GoSelectedTargetMatch::Stopped),
+    };
+    match go_unresolved_route_check(ready, ordinal, target, cancellation, session)? {
+        GoUnresolvedRoute::Clear => {}
+        GoUnresolvedRoute::Unavailable => return Ok(GoSelectedTargetMatch::Unavailable),
+        GoUnresolvedRoute::Stopped => return Ok(GoSelectedTargetMatch::Stopped),
+    }
+    if keys.is_empty() {
+        return Ok(GoSelectedTargetMatch::Matched(Vec::new()));
+    }
+    let connection = ready.inventory.connection();
+    let mut statement = connection.prepare_cached(GO_TARGET_NOMINATED_SEMANTICS_SQL.as_str())?;
+    let keys_json = serde_json::to_string(&keys).expect("i64 keys serialize as JSON");
+    let mut rows = statement.query(rusqlite::params![i64::from(ordinal.get()), keys_json])?;
+    let mut candidates: Vec<GoDefinitionCandidate> = Vec::new();
+    while let Some(row) = rows.next()? {
+        if !session.scope_step() || cancellation.is_cancelled() {
+            return Ok(GoSelectedTargetMatch::Stopped);
+        }
+        let key = u32::try_from(row.get::<_, i64>(0)?)
+            .map_err(|_| StoreError::corrupt("Go semantic key does not fit u32"))?;
+        let id = SemanticId::local(ordinal.get(), key);
+        let link: Option<i64> = row.get(5)?;
+        if candidates
+            .last()
+            .is_some_and(|candidate| candidate.id == id)
+        {
+            if let Some(link) = link {
+                candidates
+                    .last_mut()
+                    .expect("same candidate")
+                    .links
+                    .push(link);
+            }
+            continue;
+        }
+        let mut candidate = GoDefinitionCandidate {
+            id,
+            namespace: row.get(1)?,
+            source_site: row.get(2)?,
+            direct_unit: row.get(3)?,
+            declaration: row.get(4)?,
+            links: Vec::new(),
+            nameless: row.get::<_, Option<i64>>(6)?.is_none(),
+            anonymous_type: row.get::<_, i64>(7)? != 0,
+            direct_hydrates: row.get::<_, Option<i64>>(8)?.is_some(),
+            root_import: row.get::<_, i64>(9)? != 0,
+        };
+        if let Some(link) = link {
+            candidate.links.push(link);
+        }
+        candidates.push(candidate);
+    }
+    drop(rows);
+    drop(statement);
+    if !session.observe_cancellation() || cancellation.is_cancelled() {
+        return Ok(GoSelectedTargetMatch::Stopped);
+    }
+    let mut matched = Vec::new();
+    for candidate in candidates {
+        if !session.observe_cancellation() || cancellation.is_cancelled() {
+            return Ok(GoSelectedTargetMatch::Stopped);
+        }
+        // Conflicting authorities cannot be resolved by choosing one route.
+        if candidate.direct_unit.is_some_and(|direct| {
+            candidate.declaration.is_some()
+                && (candidate.links.is_empty()
+                    || candidate.links.iter().any(|link| *link != direct))
+        }) {
+            return Ok(GoSelectedTargetMatch::Unavailable);
+        }
+        if candidate.direct_unit.is_some() && !candidate.direct_hydrates {
+            return Ok(GoSelectedTargetMatch::Unavailable);
+        }
+        match project_native_definition_units(ready, &[candidate.id], cancellation, session)? {
+            SelectedNativeDefinitions::Ready(units) => {
+                if units.into_iter().any(|(_, definition)| matches!(definition, SelectedNativeDefinition::Unit(unit) if unit == *target)) {
+                    matched.push((candidate.id, candidate.namespace, candidate.source_site));
+                }
+            }
+            SelectedNativeDefinitions::Cancelled => return Ok(GoSelectedTargetMatch::Stopped),
+            SelectedNativeDefinitions::Unavailable => {
+                if go_unresolved_route_exempt(
+                    candidate.direct_unit.is_some(),
+                    candidate.declaration.is_some(),
+                    !candidate.links.is_empty(),
+                    candidate.nameless,
+                    candidate.anonymous_type,
+                    candidate.root_import,
+                    target,
+                ) {
+                    continue;
+                }
+                // Check every independently hydrated bridge unit. A missing or
+                // failed row is still a possible target, never negative proof.
+                if candidate.direct_unit.is_some() || candidate.links.is_empty() {
+                    return Ok(GoSelectedTargetMatch::Unavailable);
+                }
+                let coordinate = (ordinal, ResolutionLocalKey::new(i64::from(candidate.id.local_key().expect("local Go definition"))));
+                let Some(mut projection_rows) = read_fragment_definition_rows(ready, &[coordinate], cancellation)? else {
+                    return Ok(GoSelectedTargetMatch::Stopped);
+                };
+                let Some(unit_rows) = projection_rows.units.remove(&coordinate) else {
+                    return Ok(GoSelectedTargetMatch::Unavailable);
+                };
+                if unit_rows.len() != candidate.links.len() {
+                    return Ok(GoSelectedTargetMatch::Unavailable);
+                }
+                for row in unit_rows {
+                    if !session.scope_step() || cancellation.is_cancelled() {
+                        return Ok(GoSelectedTargetMatch::Stopped);
+                    }
+                    let mut one = FragmentDefinitionRows {
+                        units: BTreeMap::from([(coordinate, vec![row])]),
+                        lexical: BTreeMap::new(),
+                    };
+                    match project_fragment_definition(ready, coordinate, &mut one)? {
+                        Some(SelectedNativeDefinition::Unit(unit)) if unit != *target => {}
+                        _ => return Ok(GoSelectedTargetMatch::Unavailable),
+                    }
+                }
+            }
+        }
+    }
+    Ok(GoSelectedTargetMatch::Matched(matched))
+}
+
+/// Completed Go projections remain available if a later identity fails.
+pub enum GoHierarchyHydration {
+    Complete(Vec<(SemanticId, SelectedNativeDefinition)>),
+    Stopped(Vec<(SemanticId, SelectedNativeDefinition)>),
+    Unavailable(Vec<(SemanticId, SelectedNativeDefinition)>),
+}
+
+/// Classify a complete selected runtime binding before source-unit projection.
+pub(super) fn project_predeclared_symbol(
+    ready: &ReadySelectedResolution<'_, '_>,
+    storage_language: &str,
+    answer: &FactResolutionAnswer,
+    definitions: &mut SelectedNativeDefinitions,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    if !matches!(storage_language, "go" | "python") {
+        return Ok(false);
+    }
+    let mut predeclared_symbol = false;
+    if matches!(definitions, SelectedNativeDefinitions::Unavailable)
+        && answer.binding().targets().len() == 1
+        && answer.binding().completion() == &ResolutionCompletion::Complete
+    {
+        let source = ready.lexical_source();
+        match crate::analyzer::resolution::is_predeclared_universe_identity(
+            &source,
+            answer.binding().targets()[0],
+            cancellation,
+        )? {
+            Some(true) => predeclared_symbol = true,
+            Some(false) => {}
+            None => {
+                assert!(cancellation.is_cancelled());
+                *definitions = SelectedNativeDefinitions::Cancelled;
+            }
+        }
+    }
+    Ok(predeclared_symbol)
 }
 
 /// Ownership of one reason in the final native binding completion.
@@ -127,6 +740,13 @@ pub struct ProjectedNativeExternalMember {
     pub member_name: String,
     #[doc(hidden)]
     pub is_static: bool,
+    /// The parameter count of a method or constructor whose signature the
+    /// inventory records; `None` for fields and signature-less rows.
+    #[doc(hidden)]
+    pub callable_parameter_count: Option<u32>,
+    /// The language of the active pack that declares the member, when one does.
+    #[doc(hidden)]
+    pub declaring_language: Option<Language>,
     #[doc(hidden)]
     pub pack: Option<(String, String)>,
 }
@@ -307,7 +927,7 @@ pub struct SelectedNativeReferenceUnits {
     #[doc(hidden)]
     pub named_argument: Option<SelectedNativeNamedArgument>,
     #[doc(hidden)]
-    pub predeclared_go_symbol: bool,
+    pub predeclared_symbol: bool,
     #[doc(hidden)]
     pub callable_applicability_candidates: Vec<(SemanticId, CodeUnit)>,
     #[doc(hidden)]
@@ -325,6 +945,12 @@ pub struct SelectedNativeReferenceUnits {
     pub named_reasons: Vec<(&'static str, String)>,
     #[doc(hidden)]
     pub diagnostic_identities: Vec<(SemanticId, String)>,
+    /// The Java single-type import that wins this reference's simple type
+    /// name, when the answer has no target and the import's own proof found
+    /// no workspace source declaration.
+    #[doc(hidden)]
+    pub explicit_import_boundary:
+        Option<crate::analyzer::resolution::SelectedExplicitImportBoundary>,
 }
 
 /// Query-local projection reader that runs before the selected fact operation ends.
@@ -337,8 +963,9 @@ pub type SelectedNativeReferenceReader<'a> = dyn FnMut(
 #[doc(hidden)]
 #[cfg_attr(any(test, feature = "test-support"), derive(Debug))]
 pub enum SelectedNativeNamedArgument {
-    Resolved(SelectedNativeDefinition),
+    Resolved(SemanticId, SelectedNativeDefinition),
     Incomplete(String),
+    Absent(String),
 }
 
 #[derive(Debug)]
@@ -417,6 +1044,14 @@ type NativeReferenceUnitsOutcome =
 type NativeReferenceTypesOutcome =
     SelectedResolutionOperationOutcome<SelectedResolutionLocated<SelectedNativeReferenceTypes>>;
 
+type SelectedTypeSiteQuery = std::result::Result<
+    (
+        Option<(SelectedSemanticLocator, SemanticId)>,
+        Option<SemanticId>,
+    ),
+    BoundedResolution<NativeReferenceTypesOutcome>,
+>;
+
 enum SelectedTypeSite {
     Reference,
     Missing,
@@ -471,6 +1106,9 @@ fn finish_assignment_value_query<T>(
             value: value?,
             work,
         },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
     })
@@ -521,7 +1159,77 @@ pub type SelectedGoUnindexedImportOutcome = SelectedResolutionOperationOutcome<
     super::SelectedResolutionLocated<Option<std::sync::Arc<str>>>,
 >;
 
+fn go_hierarchy_stop(session: &ResolutionSession) -> GoHierarchyDefinitionMatch {
+    let budget_limit = match session.finish(()) {
+        BoundedResolution::Exceeded { limit, .. } => Some(limit),
+        BoundedResolution::Cancelled { .. }
+        | BoundedResolution::Unavailable { .. }
+        | BoundedResolution::Complete { .. } => None,
+    };
+    GoHierarchyDefinitionMatch::Stopped { budget_limit }
+}
+
 impl SelectedResolutionOperation<'_, '_> {
+    pub fn go_hierarchy_definition_units(
+        &self,
+        definitions: &[SemanticId],
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<GoHierarchyHydration> {
+        let mut completed = Vec::new();
+        for &definition in definitions {
+            if !session.observe_cancellation() || cancellation.is_cancelled() {
+                return Ok(GoHierarchyHydration::Stopped(completed));
+            }
+            match self.selected_hierarchy_definition_units(&[definition], cancellation, session)? {
+                SelectedNativeDefinitions::Ready(mut units) => completed.append(&mut units),
+                SelectedNativeDefinitions::Unavailable => {
+                    return Ok(GoHierarchyHydration::Unavailable(completed));
+                }
+                SelectedNativeDefinitions::Cancelled => {
+                    return Ok(GoHierarchyHydration::Stopped(completed));
+                }
+            }
+        }
+        Ok(GoHierarchyHydration::Complete(completed))
+    }
+
+    /// Match the whole source unit through Go's selected source-native route.
+    pub fn go_hierarchy_definition_match(
+        &self,
+        target: &CodeUnit,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<GoHierarchyDefinitionMatch> {
+        if !session.observe_cancellation() || cancellation.is_cancelled() {
+            return Ok(go_hierarchy_stop(session));
+        }
+        let path = crate::path_utils::rel_path_string(target.source());
+        let Some(mount) = self.mount_table().mount_for_path("go", &path)? else {
+            return Ok(GoHierarchyDefinitionMatch::Missing);
+        };
+        let found = match go_selected_target_match(
+            &self.ready,
+            mount.ordinal(),
+            target,
+            cancellation,
+            session,
+        )? {
+            GoSelectedTargetMatch::Matched(rows) => {
+                rows.into_iter().map(|(id, _, _)| id).collect::<Vec<_>>()
+            }
+            GoSelectedTargetMatch::Unavailable => {
+                return Ok(GoHierarchyDefinitionMatch::Unavailable);
+            }
+            GoSelectedTargetMatch::Stopped => return Ok(go_hierarchy_stop(session)),
+        };
+        Ok(match found.as_slice() {
+            [] => GoHierarchyDefinitionMatch::Missing,
+            [id] => GoHierarchyDefinitionMatch::Found(*id),
+            _ => GoHierarchyDefinitionMatch::Ambiguous(found),
+        })
+    }
+
     /// Project a unique unindexed Go import selected at this package reference.
     /// The binder, rather than source spelling, owns aliases and shadowing.
     #[doc(hidden)]
@@ -541,9 +1249,11 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics: &mut SelectedResolutionContextMetrics,
                 session: &session,
                 artifacts: None,
-                go_demand: Some(prepared.demand),
+                language_demand: super::NativeLanguageDemand::Go {
+                    demand: Box::new(prepared.demand),
+                    receiver_overlay: None,
+                },
                 selected_import_gap: None,
-                go_receiver_overlay: None,
                 query_result_slot: None,
                 point_metrics: None,
             },
@@ -617,9 +1327,8 @@ impl SelectedResolutionOperation<'_, '_> {
             context_metrics: &mut SelectedResolutionContextMetrics,
             session: &session,
             artifacts: None,
-            go_demand: None,
+            language_demand: super::NativeLanguageDemand::None,
             selected_import_gap: None,
-            go_receiver_overlay: None,
             query_result_slot: None,
             point_metrics: None,
         })
@@ -642,9 +1351,11 @@ impl SelectedResolutionOperation<'_, '_> {
             context_metrics: &mut SelectedResolutionContextMetrics,
             session: &session,
             artifacts: None,
-            go_demand: Some(prepared.demand),
+            language_demand: super::NativeLanguageDemand::Go {
+                demand: Box::new(prepared.demand),
+                receiver_overlay: None,
+            },
             selected_import_gap: None,
-            go_receiver_overlay: None,
             query_result_slot: None,
             point_metrics: None,
         })
@@ -834,9 +1545,8 @@ impl SelectedResolutionOperation<'_, '_> {
             context_metrics,
             session: &session,
             artifacts: None,
-            go_demand: None,
+            language_demand: super::NativeLanguageDemand::None,
             selected_import_gap: None,
-            go_receiver_overlay: None,
             query_result_slot,
             point_metrics: None,
         })
@@ -1049,14 +1759,23 @@ impl SelectedResolutionOperation<'_, '_> {
                     ordinal,
                     cancellation,
                 )?,
-                (Some((start, end)), None) if locator.storage_language() == "java" => self
-                    .point_expression_value_slot_at(
+                (Some((start, end)), None)
+                    if crate::analyzer::Language::from_config_label(locator.storage_language())
+                        .and_then(super::super::store_language_support)
+                        .is_some_and(|support| {
+                            support.uses_point_expression_value_slot()
+                                && (!support.call_result_requires_query_marker()
+                                    || locator.is_call_result_query())
+                        }) =>
+                {
+                    self.point_expression_value_slot_at(
                         locator.storage_language(),
                         locator.relative_path(),
                         start,
                         end,
                         cancellation,
-                    )?,
+                    )?
+                }
                 _ => None,
             },
         )
@@ -1094,9 +1813,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics,
                 session: &session,
                 artifacts: None,
-                go_demand: None,
+                language_demand: super::NativeLanguageDemand::None,
                 selected_import_gap: None,
-                go_receiver_overlay: None,
                 query_result_slot,
                 point_metrics: None,
             },
@@ -1146,22 +1864,94 @@ impl SelectedResolutionOperation<'_, '_> {
         point_metrics: &mut crate::analyzer::resolution::ResolutionBatchMetrics,
     ) -> Result<BoundedResolution<NativeReferenceTypesOutcome>> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
+        let selected = self.select_native_type_site(
+            locator,
+            definition,
+            query_result_slot,
+            cancellation,
+            &session,
+        )?;
+        let (declaration, query_result_slot) = match selected {
+            Ok(selected) => selected,
+            Err(outcome) => return Ok(outcome),
+        };
+        let locator = declaration.as_ref().map_or(locator, |(locator, _)| locator);
+        self.resolve_native_type_query_bounded(super::NativeReferenceQuery {
+            context: prepared.context,
+            locator,
+            cancellation,
+            context_metrics,
+            session: &session,
+            artifacts: Some(artifacts),
+            language_demand: super::NativeLanguageDemand::Go {
+                demand: Box::new(prepared.demand),
+                receiver_overlay: go_receiver_overlay,
+            },
+            selected_import_gap: None,
+            query_result_slot,
+            point_metrics: Some(point_metrics),
+        })
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_native_reference_types_bounded_for_python_request(
+        &mut self,
+        environment: &super::super::python_unit_summaries::PythonSelectedEnvironment,
+        locator: &SelectedSemanticLocator,
+        definition: Option<SemanticId>,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+        context_metrics: &mut SelectedResolutionContextMetrics,
+        artifacts: &mut crate::analyzer::resolution::ForwardCandidateArtifactCache,
+    ) -> Result<BoundedResolution<NativeReferenceTypesOutcome>> {
+        let session = ResolutionSession::bounded(budget, Some(cancellation));
+        let selected =
+            self.select_native_type_site(locator, definition, None, cancellation, &session)?;
+        let (declaration, query_result_slot) = match selected {
+            Ok(selected) => selected,
+            Err(outcome) => return Ok(outcome),
+        };
+        let locator = declaration.as_ref().map_or(locator, |(locator, _)| locator);
+        let context = self.empty_contexts(&ResolutionCompletion::Complete)?;
+        self.resolve_native_type_query_bounded(super::NativeReferenceQuery {
+            context,
+            locator,
+            cancellation,
+            context_metrics,
+            session: &session,
+            artifacts: Some(artifacts),
+            language_demand: super::NativeLanguageDemand::Python { environment },
+            selected_import_gap: None,
+            query_result_slot,
+            point_metrics: None,
+        })
+    }
+
+    fn select_native_type_site(
+        &mut self,
+        locator: &SelectedSemanticLocator,
+        definition: Option<SemanticId>,
+        query_result_slot: Option<SemanticId>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<SelectedTypeSiteQuery> {
         let selected = match definition {
             Some(definition) => self.selected_declaration_value_site_for_definition(
                 locator,
                 definition,
                 cancellation,
-                &session,
+                session,
             )?,
             None => {
-                self.declaration_value_site_for_missing_reference(locator, cancellation, &session)?
+                self.declaration_value_site_for_missing_reference(locator, cancellation, session)?
             }
         };
         let declaration = match selected {
             SelectedTypeSite::Reference => None,
             SelectedTypeSite::Missing => {
-                return Ok(session.finish(SelectedResolutionOperationOutcome::Native(
-                    SelectedResolutionLocated::Missing,
+                return Ok(Err(session.finish(
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
                 )));
             }
             SelectedTypeSite::Declaration(site) => Some(site),
@@ -1172,42 +1962,28 @@ impl SelectedResolutionOperation<'_, '_> {
                     &completion,
                     cancellation,
                 )?;
-                return Ok(session.finish(outcome));
+                return Ok(Err(session.finish(outcome)));
             }
             SelectedTypeSite::Cancelled => {
-                return Ok(
-                    session.finish(SelectedResolutionOperationOutcome::Cancelled(
-                        cancelled_completion(),
-                    )),
-                );
+                return Ok(Err(session.finish(
+                    SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
+                )));
             }
         };
-        let (locator, query_result_slot) = match &declaration {
+        let (selected_locator, query_result_slot) = match &declaration {
             Some((selected, slot)) => (selected, Some(*slot)),
             None => (locator, query_result_slot),
         };
         let query_result_slot = match query_result_slot {
             Some(slot) => Some(slot),
-            None => self.point_query_result_slot_at(locator, cancellation)?,
+            None => self.point_query_result_slot_at(selected_locator, cancellation)?,
         };
-        if locator.call_argument_ordinal().is_some() && query_result_slot.is_none() {
-            return Ok(session.finish(SelectedResolutionOperationOutcome::Native(
-                SelectedResolutionLocated::Missing,
+        if selected_locator.call_argument_ordinal().is_some() && query_result_slot.is_none() {
+            return Ok(Err(session.finish(
+                SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
             )));
         }
-        self.resolve_native_type_query_bounded(super::NativeReferenceQuery {
-            context: prepared.context,
-            locator,
-            cancellation,
-            context_metrics,
-            session: &session,
-            artifacts: Some(artifacts),
-            go_demand: Some(prepared.demand),
-            selected_import_gap: None,
-            go_receiver_overlay,
-            query_result_slot,
-            point_metrics: Some(point_metrics),
-        })
+        Ok(Ok((declaration, query_result_slot)))
     }
 
     fn resolve_native_type_query_bounded(
@@ -1263,9 +2039,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics,
                 session: &ResolutionSession::unbounded(),
                 artifacts: None,
-                go_demand: None,
+                language_demand: super::NativeLanguageDemand::None,
                 selected_import_gap: None,
-                go_receiver_overlay: None,
                 query_result_slot: None,
                 point_metrics: None,
             },
@@ -1311,9 +2086,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics,
                 session: &session,
                 artifacts: None,
-                go_demand: None,
+                language_demand: super::NativeLanguageDemand::None,
                 selected_import_gap,
-                go_receiver_overlay: None,
                 query_result_slot: None,
                 point_metrics: None,
             },
@@ -1371,142 +2145,17 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics,
                 session: &session,
                 artifacts: Some(artifacts),
-                go_demand: Some(prepared.demand),
+                language_demand: super::NativeLanguageDemand::Go {
+                    demand: Box::new(prepared.demand),
+                    receiver_overlay: go_receiver_overlay,
+                },
                 selected_import_gap: None,
-                go_receiver_overlay,
                 query_result_slot: None,
                 point_metrics: Some(point_metrics),
             },
             Some(selected_reader),
         )?;
         Ok(session.finish(outcome))
-    }
-
-    /// #7314 6b: full native query and post-query oracle evidence, deleted with the oracle.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn jvm_model_observation_for_test(
-        mut self,
-        language: Language,
-        path: &str,
-        start: usize,
-        end: usize,
-        subject: super::jvm_context::JvmOracleSourceSubject<'_>,
-        cancellation: &CancellationToken,
-    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
-        let super::JvmImportContext::Ready { context, .. } =
-            self.jvm_import_context(language, path, cancellation)?
-        else {
-            panic!("model oracle context unavailable")
-        };
-        let locator =
-            SelectedSemanticLocator::for_reference_range(language.config_label(), path, start, end);
-        let session = ResolutionSession::unbounded();
-        let outcome = self.resolve_native_reference_units_in_session(
-            super::NativeReferenceQuery {
-                context: (*context).clone(),
-                locator: &locator,
-                cancellation,
-                context_metrics: &mut SelectedResolutionContextMetrics,
-                session: &session,
-                artifacts: None,
-                go_demand: None,
-                selected_import_gap: None,
-                go_receiver_overlay: None,
-                query_result_slot: None,
-                point_metrics: None,
-            },
-            None,
-        )?;
-        let mut fields = std::collections::BTreeMap::new();
-        let lexical = self.ready.lexical_source();
-        let sites = match lexical.lookup_semantic_sites(&locator, cancellation, &session)? {
-            crate::analyzer::store::resolution_lexical::SelectedSemanticLookupOutcome::Found(
-                sites,
-            ) => sites,
-            _ => Vec::new(),
-        };
-        let mut associations = Vec::new();
-        for site in sites {
-            let reference = site.semantic();
-            associations.push(self.java_oracle_reference_observation_for_test(
-                language,
-                path,
-                reference,
-                subject,
-                cancellation,
-            )?);
-        }
-        fields.insert(
-            "reference_association".into(),
-            serde_json::json!(associations),
-        );
-        // #7314 6b: compact Debug keeps typed aliases recognizable by the shared
-        // canonical renderer. Validate native portable reason receipts against
-        // the operation's retained canonical demand identities.
-        let mut rendered = format!("{outcome:?}");
-        if let SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-            answer,
-        )) = &outcome
-        {
-            for (alias, digest) in &answer.argument_reason_digests {
-                if alias.shared_name_id().is_none() && alias.ordinal().is_none() {
-                    assert_eq!(
-                        self.ready
-                            .identity_content_digest((*alias).into(), cancellation)?,
-                        *digest,
-                        "native reason receipt must denote the same canonical content"
-                    );
-                }
-            }
-            // These are typed canonical digest fields, not arbitrary numeric arrays.
-            let digests = answer
-                .argument_reason_digests
-                .iter()
-                .map(|(_, digest)| digest)
-                .chain(answer.call_binding_reason_digests.iter())
-                .chain(
-                    answer
-                        .constructor_hierarchy_reason_digests
-                        .iter()
-                        .map(|(_, digest)| digest),
-                )
-                .chain(
-                    answer
-                        .static_type_qualifier_reason_digests
-                        .iter()
-                        .map(|(_, digest)| digest),
-                );
-            for digest in digests {
-                rendered = rendered.replace(
-                    &format!("{digest:?}"),
-                    &format!(
-                        "digest:{}",
-                        brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(digest)
-                    ),
-                );
-            }
-        }
-        fields.insert(
-            "answer".into(),
-            serde_json::json!(self.canonical_java_snapshot(rendered)),
-        );
-        // Canonicalize the complete event collection once, preserving every event.
-        let provenance = serde_json::to_string(
-            &self
-                .ready
-                .context_identities
-                .java_oracle_registration_trace(),
-        )
-        .unwrap();
-        fields.insert(
-            "registration_provenance".into(),
-            serde_json::from_str(&self.canonical_java_snapshot(provenance)).unwrap(),
-        );
-        fields.insert(
-            "route_visits".into(),
-            serde_json::json!(self.java_oracle_visits_for_test()),
-        );
-        Ok(fields)
     }
 
     fn resolve_native_reference_units_in_session(
@@ -1521,9 +2170,8 @@ impl SelectedResolutionOperation<'_, '_> {
             context_metrics,
             session,
             artifacts,
-            go_demand,
+            language_demand,
             selected_import_gap,
-            go_receiver_overlay,
             query_result_slot,
             point_metrics,
         } = query;
@@ -1535,9 +2183,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics,
                 session,
                 artifacts,
-                go_demand,
+                language_demand,
                 selected_import_gap,
-                go_receiver_overlay,
                 query_result_slot,
                 point_metrics,
             },
@@ -1572,18 +2219,25 @@ impl SelectedResolutionOperation<'_, '_> {
                     .map(|candidate| candidate.target())
                     .collect::<Vec<_>>();
                 let mut external_members = Vec::new();
+                let external_source = ready.typed_source();
                 for &target in answer.binding().targets() {
                     if let Some((owner, ordinal)) = ready.context_identities.external_member_identity(target) {
-                        let (member_name, is_static) = if let Some(members) = super::super::resolution_typed::external_owners::intrinsic_member_inventory_for_owner(ready.inventory.connection(), &owner)? {
-                            (members[ordinal as usize].name.to_owned(), false)
-                        } else { ready.inventory.connection().query_row(
-                            "SELECT member_name,is_static FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3",
+                        if !external_source.is_jvm_external_provider(&owner.provider_id) {
+                            continue;
+                        }
+                        let (member_name, is_static, callable_parameter_count) = if let Some(members) = super::super::resolution_typed::external_owners::intrinsic_member_inventory_for_owner(ready.inventory.connection(), &owner)? {
+                            (members[ordinal as usize].name.to_owned(), false, None)
+                        } else { ready.inventory.connection().prepare_cached("SELECT member_name,is_static,CASE WHEN signature_present=1 AND member_kind IN ('method','function','constructor') THEN json_array_length(parameters_jsonb) END FROM jvm_external_owner_members WHERE provider_id=?1 AND owner_fqn=?2 AND ordinal=?3")?.query_row(
                             rusqlite::params![owner.provider_id.as_ref(),owner.owner_fqn.as_ref(),ordinal],
-                            |row| Ok((row.get(0)?,row.get(1)?)))? };
+                            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))? };
                         external_members.push(ProjectedNativeExternalMember {
                             coordinate: crate::analyzer::resolution::ExternalMemberCoordinate::InventoryOrdinal(ordinal),
                             identity: crate::analyzer::resolution::ExternalMemberIdentity { owner: owner.clone(), ordinal },
-                            member_name, is_static,
+                            member_name, is_static, callable_parameter_count,
+                            declaring_language: ready.model_authority().and_then(|authority| authority.active_models()).and_then(|models| {
+                                models.shards().iter().find(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref())
+                                    .and_then(|shard| Language::from_config_label(&shard.manifest.language))
+                            }),
                             pack: ready.context_identities.is_jvm_package_member_target(target).then(|| {
                                 let shards = ready.model_authority().and_then(|authority| authority.active_models()).expect("selected package member has an active pack").shards();
                                 let shard = shards.iter().find(|shard| shard.manifest.semantic_sha256 == owner.provider_id.as_ref()).expect("member provider is active");
@@ -1595,31 +2249,18 @@ impl SelectedResolutionOperation<'_, '_> {
                 let model_targets = answer.model_member_selection().into_iter().flat_map(|selection| selection.candidates.iter().map(|member| member.target)).collect::<BTreeSet<_>>();
                 let model_member_selection = answer.model_member_selection().and_then(|selection| project_native_model_member_selection(selection, cancellation));
                 let source_targets = answer.binding().targets().iter().copied().filter(|target| !model_targets.contains(target)).collect::<Vec<_>>();
-                let mut definitions = project_native_definition_units(
+                let reference_language = ready
+                    .lexical_source()
+                    .semantic_language_of(reference, cancellation)?;
+                let mut definitions = project_native_definition_units_with_language(
                     ready,
                     &source_targets,
+                    reference_language,
                     cancellation,
                     session,
                 )?;
-                let mut predeclared_go_symbol = false;
-                if matches!(&definitions, SelectedNativeDefinitions::Unavailable)
-                    && answer.binding().targets().len() == 1
-                    && answer.binding().completion() == &ResolutionCompletion::Complete
-                {
-                    let source = ready.lexical_source();
-                    match crate::analyzer::resolution::is_go_universe_identity(
-                        &source,
-                        answer.binding().targets()[0],
-                        cancellation,
-                    )? {
-                        Some(true) => predeclared_go_symbol = true,
-                        Some(false) => {}
-                        None => {
-                            assert!(cancellation.is_cancelled());
-                            definitions = SelectedNativeDefinitions::Cancelled;
-                        }
-                    }
-                }
+                let predeclared_symbol =
+                    project_predeclared_symbol(ready, locator.storage_language(), &answer, &mut definitions, cancellation)?;
                 let selected_targets = answer
                     .binding()
                     .targets()
@@ -1642,7 +2283,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         .into_iter()
                         .filter_map(|(identity, definition)| match definition {
                             SelectedNativeDefinition::Unit(unit) => Some((identity, unit)),
-                            SelectedNativeDefinition::Lexical(_) | SelectedNativeDefinition::Intrinsic { .. } => None,
+                            SelectedNativeDefinition::Lexical(_) | SelectedNativeDefinition::Intrinsic { .. } | SelectedNativeDefinition::ExternalOwner { .. } => None,
                         })
                         .collect(),
                     SelectedNativeDefinitions::Unavailable
@@ -1698,6 +2339,13 @@ impl SelectedResolutionOperation<'_, '_> {
                     };
                     Ok((semantic, identity))
                 }).collect::<Result<Vec<_>>>()?;
+                // Only an answer with no target renders the import's boundary.
+                let explicit_import_boundary = answer
+                    .binding()
+                    .targets()
+                    .is_empty()
+                    .then(|| ready.context_identities.java_explicit_import_boundary(reference))
+                    .flatten();
                 let selected = SelectedNativeReferenceUnits {
                     query_obligations: answer.query_obligations.clone(),
                     answer,
@@ -1711,7 +2359,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     model_member_selection,
                     direct_target,
                     named_argument,
-                    predeclared_go_symbol,
+                    predeclared_symbol,
                     callable_applicability_candidates,
                     member_contexts,
                     trace_provenance,
@@ -1719,6 +2367,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     absent_member_owners,
                     named_reasons,
                     diagnostic_identities,
+                    explicit_import_boundary,
                 };
                 if let Some(reader) = selected_reader.as_mut() {
                     reader(operation, &selected)?;
@@ -1778,12 +2427,142 @@ fn selected_external_member_target(
     }))
 }
 
+/// Project binding identity from a unique source member selected by the shared
+/// access machinery. Only applicability obligations strictly after its owner in
+/// a complete C3 order can be irrelevant to that identity.
+pub(super) fn ordered_member_binding_completion(
+    ready: &ReadySelectedResolution<'_, '_>,
+    operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+    access: &super::member_access::MemberAccessResult,
+    order: Option<crate::analyzer::resolution::HierarchyOrderOutcomeId>,
+    root: SemanticId,
+    lookup: SemanticId,
+    cancellation: &CancellationToken,
+) -> Result<ResolutionCompletion> {
+    use crate::analyzer::resolution::{FactPageVisitor, SelectedTypedFactSource, TypedFactRequest};
+    let [target] = access.targets.as_slice() else {
+        return Ok(access.completion.clone());
+    };
+    let [(_, binding)] = access.evidence.bindings.as_slice() else {
+        return Ok(access.completion.clone());
+    };
+    if matches!(binding, super::member_access::MemberBinding::Unknown)
+        || target.target.completion != ResolutionCompletion::Complete
+    {
+        return Ok(access.completion.clone());
+    }
+    let Some(order) = order else {
+        return Ok(access.completion.clone());
+    };
+    let mut owners = Vec::new();
+    let read = ready
+        .typed_source()
+        .visit_member_owner_pages_for_definitions(
+            TypedFactRequest::new(&[target.target.token]),
+            cancellation,
+            &mut FactPageVisitor::new(&mut |page| {
+                for row in page {
+                    owners.push(row.row().owner_definition());
+                }
+                Ok(true)
+            }),
+        )?;
+    if !read.is_exhausted() || read.evidence() != &ResolutionCompletion::Complete {
+        return Ok(access.completion.clone());
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    let [owner] = owners.as_slice() else {
+        return Ok(access.completion.clone());
+    };
+    operation.ordered_member_binding_completion(order, root, *owner, lookup, &access.completion)
+}
+
+pub(super) enum NamedParameter {
+    Found(SemanticId),
+    Absent,
+    Open,
+}
+
+pub(super) trait NamedArgumentRules {
+    fn resolve_callee(
+        &mut self,
+        operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        reference: SemanticId,
+    ) -> Result<Option<FactResolutionAnswer>>;
+
+    fn callable_completion<'a>(
+        &self,
+        answer: &'a FactResolutionAnswer,
+    ) -> &'a ResolutionCompletion {
+        answer.completion()
+    }
+
+    fn dispatch_is_proven(
+        &self,
+        answer: &FactResolutionAnswer,
+        target: SemanticId,
+    ) -> Result<bool> {
+        let dispositions = answer.callable_receiver_dispositions();
+        Ok(dispositions.iter().all(|disposition| {
+            disposition.target() == target && disposition.disposition().gap().is_none()
+        }) && (answer.callable_receiver_origin().is_none() || !dispositions.is_empty()))
+    }
+
+    fn parameter(
+        &mut self,
+        operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        callable: SemanticId,
+        label: &str,
+    ) -> Result<NamedParameter>;
+}
+
+struct NativeNamedArgumentRules;
+impl NamedArgumentRules for NativeNamedArgumentRules {
+    fn resolve_callee(
+        &mut self,
+        operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        reference: SemanticId,
+    ) -> Result<Option<FactResolutionAnswer>> {
+        operation.resolve_reference(reference).map(Some)
+    }
+
+    fn parameter(
+        &mut self,
+        operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+        callable: SemanticId,
+        label: &str,
+    ) -> Result<NamedParameter> {
+        Ok(operation
+            .callable_parameter_for_label(callable, label)?
+            .map_or(NamedParameter::Open, NamedParameter::Found))
+    }
+}
+
 fn resolve_named_argument_parameter(
     ready: &ReadySelectedResolution<'_, '_>,
     operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
     reference: SemanticId,
     cancellation: &CancellationToken,
     session: &ResolutionSession,
+) -> Result<Option<SelectedNativeNamedArgument>> {
+    resolve_named_argument_parameter_with_rules(
+        ready,
+        operation,
+        reference,
+        cancellation,
+        session,
+        &mut NativeNamedArgumentRules,
+    )
+}
+
+pub(super) fn resolve_named_argument_parameter_with_rules(
+    ready: &ReadySelectedResolution<'_, '_>,
+    operation: &mut crate::analyzer::resolution::FactResolutionOperation<'_>,
+    reference: SemanticId,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+    rules: &mut impl NamedArgumentRules,
 ) -> Result<Option<SelectedNativeNamedArgument>> {
     let label = match operation.named_argument_label_for_reference(reference)? {
         NamedArgumentLabelRead::Found(label) => label,
@@ -1799,7 +2578,9 @@ fn resolve_named_argument_parameter(
     if cancellation.is_cancelled() || !session.scope_step() {
         return Ok(None);
     }
-    let call_answer = operation.resolve_reference(callee_reference)?;
+    let Some(call_answer) = rules.resolve_callee(operation, callee_reference)? else {
+        return Ok(None);
+    };
     if cancellation.is_cancelled() {
         return Ok(None);
     }
@@ -1827,7 +2608,7 @@ fn resolve_named_argument_parameter(
         ))));
     };
     if binding.completion() != &ResolutionCompletion::Complete
-        || call_answer.completion() != &ResolutionCompletion::Complete
+        || rules.callable_completion(&call_answer) != &ResolutionCompletion::Complete
     {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
             "named-argument call {} has a selected callable {} but its resolution is incomplete: binding={}, resolution={}",
@@ -1843,12 +2624,7 @@ fn resolve_named_argument_parameter(
         ))));
     }
     let receiver_dispositions = call_answer.callable_receiver_dispositions();
-    let dispatch_is_proven = receiver_dispositions.iter().all(|disposition| {
-        disposition.target() == *target && disposition.disposition().gap().is_none()
-    });
-    let dispatch_evidence_present =
-        call_answer.callable_receiver_origin().is_none() || !receiver_dispositions.is_empty();
-    if !dispatch_is_proven || !dispatch_evidence_present {
+    if !rules.dispatch_is_proven(&call_answer, *target)? {
         return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
             "named-argument call {} lacks complete dispatch evidence for callable {}: receiver_dispositions={:?}",
             selected_public_diagnostic_identity(ready, label.call, cancellation, session)?,
@@ -1859,12 +2635,20 @@ fn resolve_named_argument_parameter(
                 .collect::<Vec<_>>(),
         ))));
     }
-    let Some(parameter) = operation.callable_parameter_for_label(*target, &label.spelling)? else {
-        return Ok(Some(SelectedNativeNamedArgument::Incomplete(format!(
-            "selected callable {} has no unique parameter named {:?}",
-            selected_public_diagnostic_identity(ready, *target, cancellation, session)?,
-            label.spelling
-        ))));
+    let parameter = match rules.parameter(operation, *target, &label.spelling)? {
+        NamedParameter::Found(parameter) => parameter,
+        absence => {
+            let message = format!(
+                "selected callable {} has no unique parameter named {:?}",
+                selected_public_diagnostic_identity(ready, *target, cancellation, session)?,
+                label.spelling
+            );
+            return Ok(Some(match absence {
+                NamedParameter::Absent => SelectedNativeNamedArgument::Absent(message),
+                NamedParameter::Open => SelectedNativeNamedArgument::Incomplete(message),
+                NamedParameter::Found(_) => unreachable!(),
+            }));
+        }
     };
     if cancellation.is_cancelled() || !session.scope_step() {
         return Ok(None);
@@ -1885,7 +2669,9 @@ fn resolve_named_argument_parameter(
     };
     assert_eq!(projected_parameter, parameter);
     assert!(parameters.is_empty());
-    Ok(Some(SelectedNativeNamedArgument::Resolved(definition)))
+    Ok(Some(SelectedNativeNamedArgument::Resolved(
+        parameter, definition,
+    )))
 }
 
 fn project_native_reference_types(
@@ -2061,47 +2847,7 @@ fn project_fragment_definition(
     };
     let mut selected_unit = None;
     for row in unit_rows {
-        let persisted = row
-            .fq
-            .as_ref()
-            .ok_or_else(|| StoreError::corrupt("source declaration lacks structured identity"))?;
-        let prefix = match persisted.anchor {
-            None => None,
-            Some(PackageAnchor::OwnModule { pop: 0 }) => {
-                let Some(prefix) = ready.definition_module_anchor(coordinate.0, &file)? else {
-                    return Ok(None);
-                };
-                Some(prefix)
-            }
-            _ => {
-                return Err(StoreError::corrupt(
-                    "source declaration has an unsupported package anchor",
-                ));
-            }
-        };
-        let (fq, package_segments) = super::super::hydrate_unit_fq_with_anchor(
-            row.fq.as_ref(),
-            &row.content_qualifier,
-            &file,
-            |_, _, _| prefix,
-        )?;
-        let expected = CodeUnit::from_fq(
-            file.clone(),
-            row.kind,
-            fq,
-            package_segments,
-            row.signature.clone(),
-            row.flags.synthetic,
-        );
-        let unit = if let Some(analyzer) = ready.analyzer {
-            analyzer
-                .declarations_named(&file, expected.identifier())
-                .into_iter()
-                .find(|unit| unit == &expected)
-        } else {
-            Some(expected)
-        };
-        let Some(unit) = unit else {
+        let Some(unit) = hydrate_fragment_unit(ready, coordinate.0, &file, &row)? else {
             continue;
         };
         if selected_unit
@@ -2113,6 +2859,56 @@ fn project_fragment_definition(
         selected_unit = Some(unit);
     }
     Ok(selected_unit.map(SelectedNativeDefinition::Unit))
+}
+
+fn hydrate_fragment_unit(
+    ready: &ReadySelectedResolution<'_, '_>,
+    ordinal: SelectedResolutionMountOrdinal,
+    file: &ProjectFile,
+    row: &super::super::HydratedCandidateRow,
+) -> Result<Option<CodeUnit>> {
+    let persisted = row
+        .fq
+        .as_ref()
+        .ok_or_else(|| StoreError::corrupt("source declaration lacks structured identity"))?;
+    let prefix = match persisted.anchor {
+        None => None,
+        Some(PackageAnchor::OwnModule { pop: 0 }) => {
+            let Some(prefix) = ready.definition_module_anchor(ordinal, file)? else {
+                return Ok(None);
+            };
+            Some(prefix)
+        }
+        _ => {
+            return Err(StoreError::corrupt(
+                "source declaration has an unsupported package anchor",
+            ));
+        }
+    };
+    let (fq, package_segments) = super::super::hydrate_unit_fq_with_anchor(
+        row.fq.as_ref(),
+        &row.content_qualifier,
+        file,
+        |_, _, _| prefix,
+    )?;
+    let expected = CodeUnit::from_fq(
+        file.clone(),
+        row.kind,
+        fq,
+        package_segments,
+        row.signature.clone(),
+        row.flags.synthetic,
+    );
+    let unit = if let Some(analyzer) = ready.analyzer {
+        ready
+            .store
+            .lend_selected_reader(ready.inventory.connection(), || {
+                analyzer.verified_declaration(&expected)
+            })
+    } else {
+        Some(expected)
+    };
+    Ok(unit)
 }
 
 impl ReadySelectedResolution<'_, '_> {
@@ -2331,7 +3127,7 @@ mod argument_reason_digest_tests {
             .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(0))
             .unwrap()
             .blob_id();
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
             assert_eq!(
                 conn.execute(
                     "UPDATE resolution_fragment_interiors SET producer_epoch='stale' WHERE blob_id=?1",
@@ -2358,14 +3154,13 @@ pub fn python_definition_module_anchor(
 ) -> Result<Option<crate::analyzer::fq_name::FqName>> {
     let name: Option<String> = selection
         .connection()
-        .query_row(
+        .prepare_cached(
             "SELECT anchors.package_name FROM temp.selected_resolution_mounts mounts
          JOIN main.workspace_file_anchor_rows anchors USING(file_version_id)
          WHERE mounts.mount_ordinal=?1 AND anchors.anchor_kind='own_module'
            AND anchors.anchor_pop=0",
-            [ordinal.get()],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([ordinal.get()], |row| row.get(0))
         .optional()?;
     name.map(|name| {
         let components =
@@ -2398,7 +3193,8 @@ pub fn go_definition_module_anchor(
     };
     let package: Option<String> = selection
         .connection()
-        .query_row(GO_DEFINITION_PACKAGE_ANCHOR, [version], |row| row.get(0))
+        .prepare_cached(GO_DEFINITION_PACKAGE_ANCHOR)?
+        .query_row([version], |row| row.get(0))
         .optional()?;
     Ok(package.map(|package| brokk_bifrost_go::declarations::go_package_fq(&package)))
 }
@@ -2409,6 +3205,19 @@ fn project_intrinsic_definition(
     definition: SemanticId,
     cancellation: &CancellationToken,
 ) -> Result<Option<SelectedNativeDefinition>> {
+    // The JVM authority rule decides every JVM owner before this point, so a
+    // JVM owner reaches the intrinsic projection only from provider
+    // `jvm-intrinsic`. Other languages' owners keep their own projection.
+    if ready.context_identities.external_owner_language(definition)
+        == Some(crate::analyzer::resolution::ExternalOwnerLanguage::Jvm)
+        && let Some(owner) = ready.context_identities.external_owner_identity(definition)
+    {
+        assert_eq!(
+            owner.provider_id.as_ref(),
+            "jvm-intrinsic",
+            "external owner projected as intrinsic: {owner:?}"
+        );
+    }
     if let Some(entry) = crate::analyzer::resolution::universe_entry_for_identity(
         &ready.lexical_source(),
         definition,
@@ -2416,12 +3225,16 @@ fn project_intrinsic_definition(
     )? {
         // These are language rules in the fixed table: Go keeps predeclared
         // detection and Scala keeps its existing external-boundary projection.
-        return Ok(entry
-            .definition_tier
-            .map(|tier| SelectedNativeDefinition::Intrinsic {
+        return Ok(entry.definition_tier.map(|tier| {
+            assert!(
+                !entry.identity_spelling.is_empty(),
+                "intrinsic universe entry has no canonical name"
+            );
+            SelectedNativeDefinition::Intrinsic {
                 canonical_name: entry.identity_spelling.to_owned(),
                 tier: Some(tier),
-            }));
+            }
+        }));
     }
     use crate::analyzer::resolution::{
         SelectedTypedFactSource, TypedFactPageVisitor, TypedFactRequest,
@@ -2606,7 +3419,10 @@ pub fn public_reason_details(
     reason: &ResolutionIncompleteReason,
 ) -> (&'static str, Option<SemanticId>) {
     match *reason {
-        ResolutionIncompleteReason::UnsupportedSemantic(id) => ("UnsupportedSemantic", Some(id)),
+        ResolutionIncompleteReason::UnsupportedSemantic(id)
+        | ResolutionIncompleteReason::ReceiverSubclassObligation(id) => {
+            ("UnsupportedSemantic", Some(id))
+        }
         ResolutionIncompleteReason::OpenBoundary { semantic, .. } => {
             ("OpenBoundary", Some(semantic))
         }
@@ -2687,12 +3503,27 @@ pub(super) fn selected_public_diagnostic_site(
     let mount = ready
         .inventory
         .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
-    let site = ready.inventory.connection().prepare_cached(
+    let memo_key = (mount.blob_id(), key);
+    let cached = ready
+        .public_diagnostic_sites
+        .borrow()
+        .get(&memo_key)
+        .copied();
+    let site = if let Some(site) = cached {
+        site
+    } else {
+        let site = ready.inventory.connection().prepare_cached(
         "SELECT source_site AS site, 0 AS priority FROM resolution_semantic_sites WHERE blob_id=?1 AND semantic_key=?2
          UNION ALL SELECT site, 1 FROM resolution_gap_reasons WHERE blob_id=?1 AND reason=?2
          UNION ALL SELECT site, 2 FROM resolution_definition_property_gaps WHERE blob_id=?1 AND reason=?2
          ORDER BY priority, site LIMIT 1"
-    )?.query_row(rusqlite::params![mount.blob_id(), key], |row| row.get::<_, i64>(0)).optional()?;
+        )?.query_row(rusqlite::params![mount.blob_id(), key], |row| row.get::<_, i64>(0)).optional()?;
+        ready
+            .public_diagnostic_sites
+            .borrow_mut()
+            .insert_bounded(memo_key, site);
+        site
+    };
     match site {
         Some(site) => obligation_site_details(ready, ordinal, site),
         None => Ok(None),
@@ -2759,11 +3590,10 @@ pub(super) fn selected_public_diagnostic_identity(
             None if name.is_interned() => ready
                 .inventory
                 .connection()
-                .query_row(
+                .prepare_cached(
                     "SELECT identity_digest FROM main.resolution_identities WHERE id=?1",
-                    [i64::from(name.get())],
-                    |row| row.get::<_, [u8; 32]>(0),
-                )
+                )?
+                .query_row([i64::from(name.get())], |row| row.get::<_, [u8; 32]>(0))
                 .optional()?,
             None => None,
         }
@@ -2883,6 +3713,16 @@ pub fn project_native_definition_units(
     cancellation: &CancellationToken,
     session: &ResolutionSession,
 ) -> Result<SelectedNativeDefinitions> {
+    project_native_definition_units_with_language(ready, definitions, None, cancellation, session)
+}
+
+fn project_native_definition_units_with_language(
+    ready: &ReadySelectedResolution<'_, '_>,
+    definitions: &[SemanticId],
+    reference_language: Option<Language>,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<SelectedNativeDefinitions> {
     let lexical = ready.lexical_source();
     let mut coordinates = Vec::with_capacity(definitions.len());
     let mut source_definitions = Vec::with_capacity(definitions.len());
@@ -2897,6 +3737,30 @@ pub fn project_native_definition_units(
         }
         if cancellation.is_cancelled() || !session.scope_step() {
             return Ok(SelectedNativeDefinitions::Cancelled);
+        }
+        // Only JVM owners take the JVM authority rule; another language's owner
+        // keeps its existing projection below.
+        if ready.context_identities.external_owner_language(definition)
+            == Some(crate::analyzer::resolution::ExternalOwnerLanguage::Jvm)
+            && let Some(owner) = ready.context_identities.external_owner_identity(definition)
+        {
+            let indexed = owner.provider_id.as_ref() != "jvm-intrinsic"
+                && ready
+                    .typed_source()
+                    .external_owner_type_is_indexed(&owner)?;
+            let nominal = crate::analyzer::resolution::fact_resolution::demand_scheduler::jvm_external_nominal_authority(
+                &owner.provider_id,
+                indexed,
+            );
+            let authority =
+                external_owner_definition_authority(&owner, reference_language, nominal);
+            if authority != ExternalOwnerDefinitionAuthority::OtherIntrinsicOwner {
+                projected.push((
+                    definition,
+                    SelectedNativeDefinition::ExternalOwner { owner, authority },
+                ));
+                continue;
+            }
         }
         let Some(provenance) = lexical.semantic_provenance(definition, cancellation)? else {
             return Ok(SelectedNativeDefinitions::Cancelled);
@@ -3007,7 +3871,7 @@ fn project_source_definition_coordinates(
 
 /// The declarations of the owner types an absent-member fact names, or none
 /// when any owner has no parser-unit projection.
-fn project_absent_member_owners(
+pub(super) fn project_absent_member_owners(
     ready: &ReadySelectedResolution<'_, '_>,
     owners: &[SemanticId],
     cancellation: &CancellationToken,
@@ -3021,14 +3885,15 @@ fn project_absent_member_owners(
     else {
         return Ok(Vec::new());
     };
-    let mut units =
-        rows.into_iter()
-            .filter_map(|(_, definition)| match definition {
-                SelectedNativeDefinition::Unit(unit) => Some(unit),
-                SelectedNativeDefinition::Lexical(_)
-                | SelectedNativeDefinition::Intrinsic { .. } => None,
-            })
-            .collect::<Vec<_>>();
+    let mut units = rows
+        .into_iter()
+        .filter_map(|(_, definition)| match definition {
+            SelectedNativeDefinition::Unit(unit) => Some(unit),
+            SelectedNativeDefinition::Lexical(_)
+            | SelectedNativeDefinition::Intrinsic { .. }
+            | SelectedNativeDefinition::ExternalOwner { .. } => None,
+        })
+        .collect::<Vec<_>>();
     if units.len() != owners.len() {
         return Ok(Vec::new());
     }
@@ -3091,7 +3956,7 @@ pub(super) fn project_native_definition_units_each(
     }
 }
 
-fn project_native_member_contexts(
+pub(super) fn project_native_member_contexts(
     ready: &ReadySelectedResolution<'_, '_>,
     answer: &FactResolutionAnswer,
     cancellation: &CancellationToken,
@@ -3142,14 +4007,15 @@ fn project_native_member_contexts(
     else {
         return Ok(Vec::new());
     };
-    let units =
-        rows.into_iter()
-            .filter_map(|(identity, definition)| match definition {
-                SelectedNativeDefinition::Unit(unit) => Some((identity, unit)),
-                SelectedNativeDefinition::Lexical(_)
-                | SelectedNativeDefinition::Intrinsic { .. } => None,
-            })
-            .collect::<BTreeMap<_, _>>();
+    let units = rows
+        .into_iter()
+        .filter_map(|(identity, definition)| match definition {
+            SelectedNativeDefinition::Unit(unit) => Some((identity, unit)),
+            SelectedNativeDefinition::Lexical(_)
+            | SelectedNativeDefinition::Intrinsic { .. }
+            | SelectedNativeDefinition::ExternalOwner { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut contexts = Vec::with_capacity(member_owners.len() + member_rejections.len());
     for member in member_owners {
         let Some(target) = units.get(&member.target()).cloned() else {
@@ -3428,6 +4294,10 @@ fn project_native_trace_provenance(
                         covered = false;
                         continue;
                     }
+                    Some(SelectedNativeDefinition::ExternalOwner { .. }) => {
+                        covered = false;
+                        continue;
+                    }
                     None => {
                         covered = false;
                         continue;
@@ -3477,6 +4347,10 @@ fn project_native_trace_provenance(
                             TraceCandidateRef::Intrinsic {
                                 name: canonical_name.clone(),
                             }
+                        }
+                        Some(SelectedNativeDefinition::ExternalOwner { .. }) => {
+                            covered = false;
+                            continue;
                         }
                         None => {
                             covered = false;
@@ -3614,9 +4488,9 @@ fn project_native_trace_provenance(
         .into_iter()
         .filter_map(|(identity, definition)| match definition {
             SelectedNativeDefinition::Unit(unit) => Some((identity, unit.clone())),
-            SelectedNativeDefinition::Lexical(_) | SelectedNativeDefinition::Intrinsic { .. } => {
-                None
-            }
+            SelectedNativeDefinition::Lexical(_)
+            | SelectedNativeDefinition::Intrinsic { .. }
+            | SelectedNativeDefinition::ExternalOwner { .. } => None,
         })
         .collect();
     Ok(ProjectedNativeTraceProvenance {

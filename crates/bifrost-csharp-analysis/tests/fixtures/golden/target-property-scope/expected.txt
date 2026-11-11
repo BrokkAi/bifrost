@@ -1,8 +1,8 @@
-Plain/Plain.csproj: inventory_open=true regions=[("open_tree", "Plain")]
+Plain/Plain.csproj: inventory_open=true regions=[]
 Path/Path.csproj: inventory_open=true regions=[("open_tree", "")]
-Multi/Multi.csproj: inventory_open=true regions=[("open_tree", "Multi")]
+Multi/Multi.csproj: inventory_open=true regions=[]
 Unknown/Unknown.csproj: inventory_open=true regions=[("open_tree", "")]
-Local/Local.csproj: inventory_open=true regions=[("open_tree", "")]
+Local/Local.csproj: inventory_open=true regions=[("open_tree", ""), ("open_tree", "")]
 Dynamic/Dynamic.csproj: inventory_open=true regions=[("open_tree", "")]
 Append/Append.csproj: symbols_reason=Some("target_assignment")
 Append/Append.csproj dynamic Output: symbols_reason=Some("dynamic_target_property")

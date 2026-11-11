@@ -21,11 +21,13 @@ use crate::dataflow::{
 };
 use crate::value_flow::{ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowObservationPhase};
 
-use super::client::solve_taint_with_reusable_provider;
+use super::attributed::AttributedTaintFunction;
+use super::client::solve_taint_with_reusable_provider_with_model_receipts;
 use super::{
     SourceClassId, TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintFact, TaintSolveError,
     TaintSummaryResult, TaintUniverse, TaintUniverseHash,
 };
+use crate::model_attribution::{ModelReceipt, model_receipt_heap_bytes, model_receipt_valid};
 
 pub const TAINT_TRANSFER_SUMMARY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_TAINT_TRANSFER_SUMMARY_ROWS: usize = 65_536;
@@ -125,11 +127,15 @@ impl StableTaintClassSet {
     }
 }
 
+type StablePairReceipts = Box<[((SourceClassId, SourceClassId), ModelReceipt)]>;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StableTaintEdgeFunction {
     generated: StableTaintClassSet,
     default_identity: bool,
     overrides: Box<[(SourceClassId, StableTaintClassSet)]>,
+    pair_receipts: Option<StablePairReceipts>,
+    generated_receipts: Option<Box<[(SourceClassId, ModelReceipt)]>>,
 }
 
 impl StableTaintEdgeFunction {
@@ -138,16 +144,16 @@ impl StableTaintEdgeFunction {
     }
 
     fn from_live(
-        function: &TaintEdgeFunction,
+        function: &AttributedTaintFunction,
         universe: &TaintUniverse,
     ) -> Result<Self, TaintTransferSummaryError> {
-        if function.universe() != universe.hash()
-            || function.class_count() != universe.classes().len()
+        if function.base.universe() != universe.hash()
+            || function.base.class_count() != universe.classes().len()
         {
             return Err(TaintTransferSummaryError::UniverseMismatch);
         }
-        let mut overrides = Vec::with_capacity(function.overrides().len());
-        for (source, targets) in function.overrides() {
+        let mut overrides = Vec::with_capacity(function.base.overrides().len());
+        for (source, targets) in function.base.overrides() {
             let source = universe
                 .stable_id(*source)
                 .ok_or(TaintTransferSummaryError::UniverseMismatch)?
@@ -155,16 +161,58 @@ impl StableTaintEdgeFunction {
             overrides.push((source, StableTaintClassSet::from_live(targets, universe)?));
         }
         Ok(Self {
-            generated: StableTaintClassSet::from_live(function.generated(), universe)?,
-            default_identity: function.default_identity(),
+            generated: StableTaintClassSet::from_live(function.base.generated(), universe)?,
+            default_identity: function.base.default_identity(),
             overrides: overrides.into_boxed_slice(),
+            pair_receipts: (!function.pair_receipts().is_empty())
+                .then(|| {
+                    function
+                        .pair_receipts()
+                        .iter()
+                        .map(|((source, target), receipt)| {
+                            Ok((
+                                (
+                                    universe
+                                        .stable_id(*source)
+                                        .ok_or(TaintTransferSummaryError::UniverseMismatch)?
+                                        .clone(),
+                                    universe
+                                        .stable_id(*target)
+                                        .ok_or(TaintTransferSummaryError::UniverseMismatch)?
+                                        .clone(),
+                                ),
+                                receipt.clone(),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, TaintTransferSummaryError>>()
+                        .map(Vec::into_boxed_slice)
+                })
+                .transpose()?,
+            generated_receipts: (!function.generated_receipts().is_empty())
+                .then(|| {
+                    function
+                        .generated_receipts()
+                        .iter()
+                        .map(|(target, receipt)| {
+                            Ok((
+                                universe
+                                    .stable_id(*target)
+                                    .ok_or(TaintTransferSummaryError::UniverseMismatch)?
+                                    .clone(),
+                                receipt.clone(),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, TaintTransferSummaryError>>()
+                        .map(Vec::into_boxed_slice)
+                })
+                .transpose()?,
         })
     }
 
     fn to_live(
         &self,
         universe: &TaintUniverse,
-    ) -> Result<TaintEdgeFunction, TaintTransferSummaryError> {
+    ) -> Result<AttributedTaintFunction, TaintTransferSummaryError> {
         let mut overrides = Vec::with_capacity(self.overrides.len());
         for (source, targets) in &self.overrides {
             overrides.push((
@@ -174,13 +222,66 @@ impl StableTaintEdgeFunction {
                 targets.to_live(universe)?,
             ));
         }
-        TaintEdgeFunction::from_canonical_parts(
+        let base = TaintEdgeFunction::from_canonical_parts(
             universe,
             self.generated.to_live(universe)?,
             self.default_identity,
             overrides,
         )
-        .map_err(|_| TaintTransferSummaryError::InvalidEdgeFunction)
+        .map_err(|_| TaintTransferSummaryError::InvalidEdgeFunction)?;
+        let pairs = self
+            .pair_receipts
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|((source, target), receipt)| {
+                if !model_receipt_valid(receipt) || receipt.is_empty() {
+                    return Err(TaintTransferSummaryError::InvalidEdgeFunction);
+                }
+                Ok((
+                    (
+                        universe
+                            .class_id(source)
+                            .ok_or(TaintTransferSummaryError::UniverseMismatch)?,
+                        universe
+                            .class_id(target)
+                            .ok_or(TaintTransferSummaryError::UniverseMismatch)?,
+                    ),
+                    receipt.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let generated = self
+            .generated_receipts
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|(target, receipt)| {
+                if !model_receipt_valid(receipt) || receipt.is_empty() {
+                    return Err(TaintTransferSummaryError::InvalidEdgeFunction);
+                }
+                Ok((
+                    universe
+                        .class_id(target)
+                        .ok_or(TaintTransferSummaryError::UniverseMismatch)?,
+                    receipt.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !pairs.windows(2).all(|rows| rows[0].0 < rows[1].0)
+            || !generated.windows(2).all(|rows| rows[0].0 < rows[1].0)
+            || pairs
+                .iter()
+                .any(|((source, target), _)| !base.output_for(*source).contains_dense(*target))
+            || generated
+                .iter()
+                .any(|(target, _)| !base.generated().contains_dense(*target))
+        {
+            return Err(TaintTransferSummaryError::InvalidEdgeFunction);
+        }
+        Ok(AttributedTaintFunction::from_receipt_rows(
+            base, pairs, generated,
+        ))
     }
 
     fn retained_bytes(&self) -> usize {
@@ -192,6 +293,31 @@ impl StableTaintEdgeFunction {
                     .saturating_add(source.as_str().len())
                     .saturating_add(targets.retained_bytes())
             }))
+            .saturating_add(
+                self.pair_receipts
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|((source, target), receipt)| {
+                        source.as_str().len()
+                            + target.as_str().len()
+                            + model_receipt_heap_bytes(receipt)
+                            + std::mem::size_of::<((SourceClassId, SourceClassId), ModelReceipt)>()
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.generated_receipts
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|(target, receipt)| {
+                        target.as_str().len()
+                            + model_receipt_heap_bytes(receipt)
+                            + std::mem::size_of::<(SourceClassId, ModelReceipt)>()
+                    })
+                    .sum::<usize>(),
+            )
     }
 }
 
@@ -910,7 +1036,7 @@ impl TaintContractSet {
                         .ok_or(TaintTransferSummaryError::InvalidPlan)?
                         .clone(),
                     function: StableTaintEdgeFunction::from_live(
-                        binding.function(),
+                        &AttributedTaintFunction::exact(binding.function().clone()),
                         plan.universe(),
                     )?,
                 });
@@ -938,7 +1064,7 @@ impl TaintContractSet {
                             .clone(),
                     ),
                     function: StableTaintEdgeFunction::from_live(
-                        binding.function(),
+                        &AttributedTaintFunction::exact(binding.function().clone()),
                         plan.universe(),
                     )?,
                 });
@@ -1488,6 +1614,7 @@ struct TaintSummaryOracle<'query> {
     repository: &'query CompleteTaintTransferSummaryRepository,
     plan: &'query TaintAnalysisPlan,
     contracts: &'query TaintContractSet,
+    receipts: Option<&'query crate::model_attribution::TaintModelReceiptInputs>,
 }
 
 impl TaintSummaryOracle<'_> {
@@ -1549,15 +1676,17 @@ impl TaintSummaryOracle<'_> {
     }
 }
 
-impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOracle<'_> {
+impl ReusableIdeSummaryProvider<TaintFact, AttributedTaintFunction> for TaintSummaryOracle<'_> {
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
         root: &ProcedureHandle,
         entry_fact: TaintFact,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<ReusableIdeProcedureSummary<TaintFact, TaintEdgeFunction>>, SolverTermination>
-    {
+    ) -> Result<
+        Option<ReusableIdeProcedureSummary<TaintFact, AttributedTaintFunction>>,
+        SolverTermination,
+    > {
         if request.cancellation.is_cancelled() {
             return Err(SolverTermination::Cancelled);
         }
@@ -1623,8 +1752,11 @@ impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOr
             });
         }
         let mut reached = Vec::new();
-        let problem =
+        let mut problem =
             super::client::TaintFlowProblem::new(self.plan).with_cancellation(request.cancellation);
+        if let Some(receipts) = self.receipts {
+            problem = problem.with_model_receipts(receipts);
+        }
         for observation in &summary.observations[observation_range] {
             if request.cancellation.is_cancelled() {
                 return Err(SolverTermination::Cancelled);
@@ -1791,6 +1923,59 @@ pub fn solve_taint_with_reusable_summaries<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
+    solve_taint_with_reusable_summaries_inner(
+        root,
+        provider,
+        plan,
+        semantic_summaries,
+        repository,
+        None,
+        semantic_budget,
+        request,
+    )
+}
+
+/// Solve with selected-record receipts carried through reusable summary values.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_taint_with_reusable_summaries_with_model_receipts<Provider>(
+    root: &ProcedureHandle,
+    provider: &Provider,
+    plan: &TaintAnalysisPlan,
+    semantic_summaries: &TaintSemanticSummarySet<'_>,
+    repository: &mut CompleteTaintTransferSummaryRepository,
+    receipts: &crate::model_attribution::TaintModelReceiptInputs,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TaintTransferSummarySolveResult, TaintTransferSummarySolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+{
+    solve_taint_with_reusable_summaries_inner(
+        root,
+        provider,
+        plan,
+        semantic_summaries,
+        repository,
+        Some(receipts),
+        semantic_budget,
+        request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_taint_with_reusable_summaries_inner<Provider>(
+    root: &ProcedureHandle,
+    provider: &Provider,
+    plan: &TaintAnalysisPlan,
+    semantic_summaries: &TaintSemanticSummarySet<'_>,
+    repository: &mut CompleteTaintTransferSummaryRepository,
+    receipts: Option<&crate::model_attribution::TaintModelReceiptInputs>,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TaintTransferSummarySolveResult, TaintTransferSummarySolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+{
     if !plan.value_type_barriers().is_empty() {
         return Err(TaintSolveError::UnsupportedValueTypeBarriers {
             operation: "reusable taint summaries",
@@ -1822,12 +2007,14 @@ where
             repository,
             plan,
             contracts: &contracts,
+            receipts,
         };
-        solve_taint_with_reusable_provider(
+        solve_taint_with_reusable_provider_with_model_receipts(
             root,
             provider,
             &mut reusable,
             plan,
+            receipts,
             crate::dataflow::WitnessRetentionLimits::disabled(),
             semantic_budget,
             request,
@@ -1907,14 +2094,14 @@ struct FlattenedObservationKey {
 #[derive(Debug, Clone)]
 struct FlattenedObservationValue {
     evidence: PathQualityFrontier,
-    function: TaintEdgeFunction,
+    function: AttributedTaintFunction,
 }
 
 #[derive(Debug, Clone)]
 struct FlattenedEntryTransfer {
     source: SummaryEntry,
     evidence: PathQualityFrontier,
-    function: TaintEdgeFunction,
+    function: AttributedTaintFunction,
 }
 
 fn merge_flattened_observation(
@@ -2465,5 +2652,59 @@ impl From<TaintSolveError> for TaintTransferSummarySolveError {
 impl From<TaintTransferSummaryError> for TaintTransferSummarySolveError {
     fn from(error: TaintTransferSummaryError) -> Self {
         Self::Summary(error)
+    }
+}
+
+#[cfg(test)]
+mod receipt_transport_tests {
+    use super::*;
+    use crate::model_attribution::{
+        ModelContributor, ModelContributorRole, SUMMARY_RECEIPT_CAP, model_receipt_from_full,
+    };
+
+    #[test]
+    fn stable_edge_round_trip_keeps_pair_and_generated_receipts() {
+        let labels = ["source", "target"].map(|name| SourceClassId::new(name).unwrap());
+        let universe = TaintUniverse::new(labels.to_vec()).unwrap();
+        let source = universe.class_id(&labels[0]).unwrap();
+        let target = universe.class_id(&labels[1]).unwrap();
+        let generated = universe.class_set([&labels[1]]).unwrap();
+        let base = TaintEdgeFunction::from_canonical_parts(
+            &universe,
+            generated,
+            false,
+            vec![(source, universe.class_set([&labels[1]]).unwrap())],
+        )
+        .unwrap();
+        let receipt = model_receipt_from_full(
+            vec![ModelContributor {
+                role: ModelContributorRole::Summary,
+                pack_digest: "a".repeat(64),
+                record_id: "record".into(),
+                built_from: "0.4.23".into(),
+                resolved: "0.4.25".into(),
+                direction: "older_artifact".into(),
+                mismatch_kinds: vec!["version_nearby".into()],
+                selection_rule_id: "cargo-compatible-nearest".into(),
+                selection_rule_version: 1,
+            }],
+            SUMMARY_RECEIPT_CAP,
+        );
+        let attributed = AttributedTaintFunction::from_receipt_rows(
+            base.clone(),
+            vec![((source, target), receipt.clone())],
+            vec![(target, receipt.clone())],
+        );
+        let stable = StableTaintEdgeFunction::from_live(&attributed, &universe).unwrap();
+        assert_eq!(stable.to_live(&universe).unwrap(), attributed);
+        assert!(
+            stable.retained_bytes()
+                > StableTaintEdgeFunction::from_live(
+                    &AttributedTaintFunction::exact(base),
+                    &universe
+                )
+                .unwrap()
+                .retained_bytes()
+        );
     }
 }

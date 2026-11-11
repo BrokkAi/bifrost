@@ -143,6 +143,13 @@ trait RustAccessDecisionSource: Send + Sync {
         reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
         definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
     ) -> Result<DeclarationAccessDecision>;
+    fn visit_rust_access_pages(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        requests: TypedFactRequest<DeclarationAccessRequest>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
+    ) -> Result<TypedFactReadOutcome>;
 }
 
 /// Rust declaration-authority rows are keyed by a declaration in one source
@@ -191,7 +198,125 @@ fn site_cfg_context<'a>(
     selected.unwrap_or((RustSelectedActivation::Unknown, false, None))
 }
 
-impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
+type RustAccessEndpointRows = (
+    BTreeMap<SemanticId, SelectedTypedRow<LoweredRustReferenceContext>>,
+    BTreeMap<SemanticId, SelectedTypedRow<LoweredRustDeclarationAuthority>>,
+);
+
+fn read_rust_access_endpoints(
+    facts: &dyn SelectedTypedFactSource,
+    requests: &[DeclarationAccessRequest],
+    cancellation: &CancellationToken,
+    visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
+) -> Result<std::ops::ControlFlow<TypedFactReadOutcome, RustAccessEndpointRows>> {
+    let mut references = BTreeSet::new();
+    let mut definitions = BTreeSet::new();
+    for request in requests {
+        if cancellation.is_cancelled() {
+            return Ok(std::ops::ControlFlow::Break(
+                TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete),
+            ));
+        }
+        references.insert(request.reference);
+        definitions.insert(request.definition);
+    }
+    let references = references.into_iter().collect::<Vec<_>>();
+    let definitions = definitions
+        .into_iter()
+        .filter_map(local_rust_authority_definition)
+        .collect::<Vec<_>>();
+
+    let mut reference_rows = BTreeMap::new();
+    let mut collect_references = |rows: &[SelectedTypedRow<LoweredRustReferenceContext>]| {
+        for row in rows {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            let key = row.row().reference();
+            if reference_rows.insert(key, row.clone()).is_some() {
+                return Err(StoreError::corrupt(format!(
+                    "selected Rust reference context returned duplicate semantic: {key:?}"
+                )));
+            }
+        }
+        Ok(true)
+    };
+    let reference_outcome = if let Some(session) = visitor.resolution_session() {
+        let mut nested_visitor = FactPageVisitor::with_maximum_rows_in_session(
+            &mut collect_references,
+            MAX_SOURCE_ROWS_PER_BATCH,
+            session,
+        );
+        facts.visit_rust_reference_context_pages(
+            TypedFactRequest::new(&references),
+            cancellation,
+            &mut nested_visitor,
+        )?
+    } else {
+        let mut nested_visitor =
+            FactPageVisitor::with_maximum_rows(&mut collect_references, MAX_SOURCE_ROWS_PER_BATCH);
+        facts.visit_rust_reference_context_pages(
+            TypedFactRequest::new(&references),
+            cancellation,
+            &mut nested_visitor,
+        )?
+    };
+    if let Some(outcome) =
+        complete_access_source_read(reference_outcome, cancellation, "Rust reference context")?
+    {
+        return Ok(std::ops::ControlFlow::Break(outcome));
+    }
+
+    let mut definition_rows = BTreeMap::new();
+    let mut collect_definitions = |rows: &[SelectedTypedRow<LoweredRustDeclarationAuthority>]| {
+        for row in rows {
+            if cancellation.is_cancelled() {
+                return Ok(false);
+            }
+            let key = row.row().definition();
+            if definition_rows.insert(key, row.clone()).is_some() {
+                return Err(StoreError::corrupt(format!(
+                    "selected Rust declaration authority returned duplicate semantic: {key:?}"
+                )));
+            }
+        }
+        Ok(true)
+    };
+    let definition_outcome = if let Some(session) = visitor.resolution_session() {
+        let mut nested_visitor = FactPageVisitor::with_maximum_rows_in_session(
+            &mut collect_definitions,
+            MAX_SOURCE_ROWS_PER_BATCH,
+            session,
+        );
+        facts.visit_rust_declaration_authority_pages(
+            TypedFactRequest::new(&definitions),
+            cancellation,
+            &mut nested_visitor,
+        )?
+    } else {
+        let mut nested_visitor =
+            FactPageVisitor::with_maximum_rows(&mut collect_definitions, MAX_SOURCE_ROWS_PER_BATCH);
+        facts.visit_rust_declaration_authority_pages(
+            TypedFactRequest::new(&definitions),
+            cancellation,
+            &mut nested_visitor,
+        )?
+    };
+    if let Some(outcome) = complete_access_source_read(
+        definition_outcome,
+        cancellation,
+        "Rust declaration authority",
+    )? {
+        return Ok(std::ops::ControlFlow::Break(outcome));
+    }
+
+    Ok(std::ops::ControlFlow::Continue((
+        reference_rows,
+        definition_rows,
+    )))
+}
+
+impl<T: RustSelectedAccessPolicy> SelectedDeclarationAccessSource for T {
     fn qualify_selection_path(
         &self,
         facts: &dyn SelectedTypedFactSource,
@@ -199,7 +324,16 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         path: &mut PartialPath,
         cancellation: &CancellationToken,
     ) -> Result<Option<bool>> {
-        facts.qualify_selection_path(reference, path, cancellation)
+        super::declaration_access::SelectedDeclarationAccessRules::qualify_selection_path(
+            &RustPointSelectedRules {
+                policy: self,
+                source: facts,
+            },
+            facts,
+            reference,
+            path,
+            cancellation,
+        )
     }
 
     fn identity(&self) -> SemanticId {
@@ -213,43 +347,7 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         cancellation: &CancellationToken,
         session: Option<&ResolutionSession>,
     ) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
-        let Some(definition) = local_rust_authority_definition(definition) else {
-            return Ok(Some((DeclarationAccessDecision::Allowed, None)));
-        };
-        let mut authority = None;
-        let mut collect = |rows: &[SelectedTypedRow<LoweredRustDeclarationAuthority>]| {
-            for row in rows {
-                assert_eq!(row.row().definition(), definition);
-                assert!(
-                    authority.replace(row.clone()).is_none(),
-                    "one target owns one item authority"
-                );
-            }
-            Ok(!cancellation.is_cancelled())
-        };
-        let mut visitor = match session {
-            Some(session) => FactPageVisitor::with_maximum_rows_in_session(
-                &mut collect,
-                MAX_SOURCE_ROWS_PER_BATCH,
-                session,
-            ),
-            None => FactPageVisitor::new(&mut collect),
-        };
-        let outcome = facts.visit_rust_declaration_authority_pages(
-            TypedFactRequest::new(&[definition]),
-            cancellation,
-            &mut visitor,
-        )?;
-        if complete_access_source_read(outcome, cancellation, "Rust target activation")?.is_some() {
-            return Ok(None);
-        }
-        let Some(authority) = authority else {
-            return Ok(Some((DeclarationAccessDecision::Allowed, None)));
-        };
-        Ok(Some((
-            self.decide(facts, None, Some(&authority))?,
-            authority.row().activation_reason(),
-        )))
+        rust_declaration_activation(self, facts, definition, cancellation, session)
     }
 
     fn visit_access_pages(
@@ -259,177 +357,7 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         cancellation: &CancellationToken,
         visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
     ) -> Result<TypedFactReadOutcome> {
-        if cancellation.is_cancelled() {
-            return Ok(TypedFactReadOutcome::cancelled(
-                ResolutionCompletion::Complete,
-            ));
-        }
-        if requests.is_empty() {
-            return Ok(TypedFactReadOutcome::exhausted(
-                ResolutionCompletion::Complete,
-            ));
-        }
-
-        let mut references = BTreeSet::new();
-        let mut definitions = BTreeSet::new();
-        for request in requests.as_slice() {
-            if cancellation.is_cancelled() {
-                return Ok(TypedFactReadOutcome::cancelled(
-                    ResolutionCompletion::Complete,
-                ));
-            }
-            references.insert(request.reference);
-            definitions.insert(request.definition);
-        }
-        let references = references.into_iter().collect::<Vec<_>>();
-        let definitions = definitions
-            .into_iter()
-            .filter_map(local_rust_authority_definition)
-            .collect::<Vec<_>>();
-
-        let mut reference_rows = BTreeMap::new();
-        let mut collect_references = |rows: &[SelectedTypedRow<LoweredRustReferenceContext>]| {
-            for row in rows {
-                if cancellation.is_cancelled() {
-                    return Ok(false);
-                }
-                let key = row.row().reference();
-                if reference_rows.insert(key, row.clone()).is_some() {
-                    return Err(StoreError::corrupt(format!(
-                        "selected Rust reference context returned duplicate semantic: {key:?}"
-                    )));
-                }
-            }
-            Ok(true)
-        };
-        let reference_outcome = if let Some(session) = visitor.resolution_session() {
-            let mut nested_visitor = FactPageVisitor::with_maximum_rows_in_session(
-                &mut collect_references,
-                MAX_SOURCE_ROWS_PER_BATCH,
-                session,
-            );
-            facts.visit_rust_reference_context_pages(
-                TypedFactRequest::new(&references),
-                cancellation,
-                &mut nested_visitor,
-            )?
-        } else {
-            let mut nested_visitor = FactPageVisitor::with_maximum_rows(
-                &mut collect_references,
-                MAX_SOURCE_ROWS_PER_BATCH,
-            );
-            facts.visit_rust_reference_context_pages(
-                TypedFactRequest::new(&references),
-                cancellation,
-                &mut nested_visitor,
-            )?
-        };
-        if let Some(outcome) =
-            complete_access_source_read(reference_outcome, cancellation, "Rust reference context")?
-        {
-            return Ok(outcome);
-        }
-
-        let mut definition_rows = BTreeMap::new();
-        let mut collect_definitions = |rows: &[SelectedTypedRow<
-            LoweredRustDeclarationAuthority,
-        >]| {
-            for row in rows {
-                if cancellation.is_cancelled() {
-                    return Ok(false);
-                }
-                let key = row.row().definition();
-                if definition_rows.insert(key, row.clone()).is_some() {
-                    return Err(StoreError::corrupt(format!(
-                        "selected Rust declaration authority returned duplicate semantic: {key:?}"
-                    )));
-                }
-            }
-            Ok(true)
-        };
-        let definition_outcome = if let Some(session) = visitor.resolution_session() {
-            let mut nested_visitor = FactPageVisitor::with_maximum_rows_in_session(
-                &mut collect_definitions,
-                MAX_SOURCE_ROWS_PER_BATCH,
-                session,
-            );
-            facts.visit_rust_declaration_authority_pages(
-                TypedFactRequest::new(&definitions),
-                cancellation,
-                &mut nested_visitor,
-            )?
-        } else {
-            let mut nested_visitor = FactPageVisitor::with_maximum_rows(
-                &mut collect_definitions,
-                MAX_SOURCE_ROWS_PER_BATCH,
-            );
-            facts.visit_rust_declaration_authority_pages(
-                TypedFactRequest::new(&definitions),
-                cancellation,
-                &mut nested_visitor,
-            )?
-        };
-        if let Some(outcome) = complete_access_source_read(
-            definition_outcome,
-            cancellation,
-            "Rust declaration authority",
-        )? {
-            return Ok(outcome);
-        }
-
-        let mut page = Vec::with_capacity(MAX_SOURCE_ROWS_PER_BATCH);
-        for request in requests.as_slice() {
-            if cancellation.is_cancelled() {
-                return Ok(TypedFactReadOutcome::cancelled(
-                    ResolutionCompletion::Complete,
-                ));
-            }
-            let reference = reference_rows.get(&request.reference).ok_or_else(|| {
-                StoreError::corrupt(format!(
-                    "selected Rust access source omitted requested reference context: requests={:?}, received={:?}",
-                    requests.as_slice(),
-                    reference_rows.keys().collect::<Vec<_>>(),
-                ))
-            })?;
-            let definition = definition_rows.get(&request.definition);
-            let decision = self.decide(facts, Some(reference), definition)?;
-            page.push(DeclarationAccessRow {
-                request: *request,
-                decision,
-                activation_reason: definition
-                    .and_then(|definition| definition.row().activation_reason()),
-                visibility_applies: false,
-                subclass_access: None,
-            });
-            if page.len() == MAX_SOURCE_ROWS_PER_BATCH {
-                if !visitor.visit_page(&page)? {
-                    if cancellation.is_cancelled() {
-                        return Ok(TypedFactReadOutcome::cancelled(
-                            ResolutionCompletion::Complete,
-                        ));
-                    }
-                    return Ok(TypedFactReadOutcome::stopped(
-                        ResolutionCompletion::Complete,
-                    ));
-                }
-                page.clear();
-            }
-        }
-        if !page.is_empty() && !visitor.visit_page(&page)? {
-            if cancellation.is_cancelled() {
-                return Ok(TypedFactReadOutcome::cancelled(
-                    ResolutionCompletion::Complete,
-                ));
-            }
-            return Ok(TypedFactReadOutcome::stopped(
-                ResolutionCompletion::Complete,
-            ));
-        }
-        Ok(if cancellation.is_cancelled() {
-            TypedFactReadOutcome::cancelled(ResolutionCompletion::Complete)
-        } else {
-            TypedFactReadOutcome::exhausted(ResolutionCompletion::Complete)
-        })
+        self.visit_rust_access_pages(facts, requests, cancellation, visitor)
     }
 
     fn visit_reason_owners(
@@ -439,22 +367,16 @@ impl<T: RustAccessDecisionSource> SelectedDeclarationAccessSource for T {
         cancellation: &CancellationToken,
         visitor: &mut FactPageVisitor<'_, ReasonOwnerRow>,
     ) -> Result<TypedFactReadOutcome> {
-        let maximum_rows = visitor.maximum_rows().min(MAX_SOURCE_ROWS_PER_BATCH);
-        let session = visitor.resolution_session();
-        let mut adapt = |page: &[(SemanticId, SemanticId)]| {
-            let rows = page
-                .iter()
-                .map(|&(reason, definition)| ReasonOwnerRow { reason, definition })
-                .collect::<Vec<_>>();
-            visitor.visit_page(&rows)
-        };
-        let mut typed_visitor = match session {
-            Some(session) => {
-                FactPageVisitor::with_maximum_rows_in_session(&mut adapt, maximum_rows, session)
-            }
-            None => FactPageVisitor::with_maximum_rows(&mut adapt, maximum_rows),
-        };
-        facts.visit_rust_reason_owners(reasons, cancellation, &mut typed_visitor)
+        super::declaration_access::SelectedDeclarationAccessRules::visit_reason_owners(
+            &RustPointSelectedRules {
+                policy: self,
+                source: facts,
+            },
+            facts,
+            reasons,
+            cancellation,
+            visitor,
+        )
     }
 }
 
@@ -724,7 +646,7 @@ pub(crate) fn access(
             RustSelectedActivation::Active => (),
         }
     }
-    finish_access(
+    finish_placement_access(
         selection.connection(),
         reference,
         definition,
@@ -891,10 +813,392 @@ pub(crate) fn set_access(
             RustSelectedActivation::Active => (),
         }
     }
-    finish_access(conn, reference, definition, &references, &definitions)
+    finish_placement_access(conn, reference, definition, &references, &definitions)
 }
 
-fn finish_access(
+trait RustSelectedAccessPolicy: RustAccessDecisionSource {
+    fn crate_keys(&self) -> &[[u8; 32]];
+    fn base_blobs(&self) -> &[(BindingFragmentId, i64)];
+    fn policy_identity(&self) -> SemanticId;
+}
+
+/// Selected point requests keep crate contexts as targets. The shared iterator
+/// is lazy: Allowed in one crate must not execute reads for later crate keys.
+struct RustPointSelectedRules<'a> {
+    policy: &'a dyn RustSelectedAccessPolicy,
+    source: &'a dyn SelectedTypedFactSource,
+}
+
+struct RustPointEndpoint {
+    reference: Option<SelectedTypedRow<LoweredRustReferenceContext>>,
+    definition: Option<SelectedTypedRow<LoweredRustDeclarationAuthority>>,
+    crate_key: Option<[u8; 32]>,
+}
+
+#[derive(Default)]
+struct RustPointFacts {
+    requests: Vec<DeclarationAccessRequest>,
+    targets: HashMap<SemanticId, Vec<RustPointEndpoint>>,
+    activation_reasons: HashMap<SemanticId, SemanticId>,
+}
+
+fn rust_access_evidence(
+    decision: DeclarationAccessDecision,
+) -> super::declaration_access::AccessEvidence {
+    super::declaration_access::AccessEvidence {
+        decision,
+        activation_reason: None,
+        visibility_applies: false,
+        subclass_access: None,
+    }
+}
+
+impl super::declaration_access::DeclarationAccessRules for RustPointSelectedRules<'_> {
+    type Endpoint = RustPointEndpoint;
+    type Facts = RustPointFacts;
+    type TargetContext = ();
+
+    fn prepare_target(&self, _target: &Self::Endpoint) -> Result<()> {
+        Ok(())
+    }
+
+    fn declaration_relation(
+        &self,
+        caller: &Self::Endpoint,
+        target: &Self::Endpoint,
+        _facts: &Self::Facts,
+        _context: &(),
+    ) -> Result<Option<super::declaration_access::AccessEvidence>> {
+        Ok(self
+            .source
+            .rust_crate_access(
+                target
+                    .crate_key
+                    .expect("a point target names its crate context"),
+                self.policy.base_blobs(),
+                caller.reference.as_ref(),
+                target.definition.as_ref(),
+            )?
+            .map(|decision| {
+                let mut evidence = rust_access_evidence(decision);
+                evidence.activation_reason = target
+                    .definition
+                    .as_ref()
+                    .and_then(|row| row.row().activation_reason());
+                evidence
+            }))
+    }
+
+    fn combine_placements(
+        &self,
+        answers: impl Iterator<Item = Result<super::declaration_access::AccessEvidence>>,
+    ) -> Result<super::declaration_access::AccessEvidence> {
+        combine_rust_point_answers(
+            answers,
+            rust_access_evidence(DeclarationAccessDecision::Denied),
+        )
+    }
+
+    fn unknown_reason(&self) -> super::declaration_access::AccessEvidence {
+        rust_access_evidence(DeclarationAccessDecision::Unknown)
+    }
+}
+
+fn combine_rust_point_answers(
+    answers: impl Iterator<Item = Result<super::declaration_access::AccessEvidence>>,
+    empty: super::declaration_access::AccessEvidence,
+) -> Result<super::declaration_access::AccessEvidence> {
+    let mut selected = None;
+    for answer in answers {
+        let mut answer = answer?;
+        if answer.decision == DeclarationAccessDecision::Allowed {
+            return Ok(answer);
+        }
+        if selected
+            .as_ref()
+            .is_some_and(|previous: &super::declaration_access::AccessEvidence| {
+                previous.decision != answer.decision
+            })
+        {
+            answer.decision = DeclarationAccessDecision::Unknown;
+        }
+        selected = Some(answer);
+    }
+    Ok(selected.unwrap_or(empty))
+}
+
+/// Declaration self-activation has no caller placement. Its empty crate-context
+/// result depends on the declaration's cfg, rather than denying a reference.
+struct RustDeclarationActivationRules<'a> {
+    point: RustPointSelectedRules<'a>,
+    definition: Option<&'a SelectedTypedRow<LoweredRustDeclarationAuthority>>,
+}
+
+impl super::declaration_access::DeclarationAccessRules for RustDeclarationActivationRules<'_> {
+    type Endpoint = RustPointEndpoint;
+    type Facts = RustPointFacts;
+    type TargetContext = ();
+
+    fn prepare_target(&self, target: &Self::Endpoint) -> Result<()> {
+        self.point.prepare_target(target)
+    }
+
+    fn declaration_relation(
+        &self,
+        caller: &Self::Endpoint,
+        target: &Self::Endpoint,
+        facts: &Self::Facts,
+        context: &(),
+    ) -> Result<Option<super::declaration_access::AccessEvidence>> {
+        self.point
+            .declaration_relation(caller, target, facts, context)
+    }
+
+    fn combine_placements(
+        &self,
+        answers: impl Iterator<Item = Result<super::declaration_access::AccessEvidence>>,
+    ) -> Result<super::declaration_access::AccessEvidence> {
+        use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
+        let empty = if self
+            .definition
+            .is_some_and(|definition| definition.row().cfg_condition() == &RustCfgCondition::Always)
+        {
+            DeclarationAccessDecision::Allowed
+        } else {
+            DeclarationAccessDecision::Unknown
+        };
+        combine_rust_point_answers(answers, rust_access_evidence(empty))
+    }
+
+    fn unknown_reason(&self) -> super::declaration_access::AccessEvidence {
+        rust_access_evidence(DeclarationAccessDecision::Unknown)
+    }
+}
+
+impl super::declaration_access::SelectedDeclarationAccessRules for RustPointSelectedRules<'_> {
+    fn visit_reason_owners(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        reasons: TypedFactRequest<SemanticId>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, ReasonOwnerRow>,
+    ) -> Result<TypedFactReadOutcome> {
+        let maximum_rows = visitor.maximum_rows().min(MAX_SOURCE_ROWS_PER_BATCH);
+        let session = visitor.resolution_session();
+        let mut adapt = |page: &[(SemanticId, SemanticId)]| {
+            let rows = page
+                .iter()
+                .map(|&(reason, definition)| ReasonOwnerRow { reason, definition })
+                .collect::<Vec<_>>();
+            visitor.visit_page(&rows)
+        };
+        let mut typed_visitor = match session {
+            Some(session) => {
+                FactPageVisitor::with_maximum_rows_in_session(&mut adapt, maximum_rows, session)
+            }
+            None => FactPageVisitor::with_maximum_rows(&mut adapt, maximum_rows),
+        };
+        facts.visit_rust_reason_owners(reasons, cancellation, &mut typed_visitor)
+    }
+    fn qualify_selection_path(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        reference: SemanticId,
+        path: &mut PartialPath,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>> {
+        facts.qualify_selection_path(reference, path, cancellation)
+    }
+
+    fn identity(&self) -> SemanticId {
+        self.policy.policy_identity()
+    }
+
+    fn read_endpoints(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        requests: &[DeclarationAccessRequest],
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
+    ) -> Result<super::declaration_access::AccessEndpointRead<Self::Endpoint, Self::Facts>> {
+        let (references, definitions) =
+            match read_rust_access_endpoints(facts, requests, cancellation, visitor)? {
+                std::ops::ControlFlow::Continue(rows) => rows,
+                std::ops::ControlFlow::Break(outcome) => {
+                    return Ok(super::declaration_access::AccessEndpointRead::Terminal(
+                        outcome,
+                    ));
+                }
+            };
+        let endpoints = references
+            .into_iter()
+            .map(|(key, reference)| {
+                (
+                    key,
+                    vec![RustPointEndpoint {
+                        reference: Some(reference),
+                        definition: None,
+                        crate_key: None,
+                    }],
+                )
+            })
+            .collect();
+        let targets = requests
+            .iter()
+            .map(|request| request.definition)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|definition| {
+                let rows = self
+                    .policy
+                    .crate_keys()
+                    .iter()
+                    .map(|key| RustPointEndpoint {
+                        reference: None,
+                        definition: definitions.get(&definition).cloned(),
+                        crate_key: Some(*key),
+                    })
+                    .collect();
+                (definition, rows)
+            })
+            .collect();
+        Ok(super::declaration_access::AccessEndpointRead::Ready(
+            super::declaration_access::AccessEndpoints {
+                endpoints,
+                facts: RustPointFacts {
+                    requests: requests.to_vec(),
+                    targets,
+                    activation_reasons: definitions
+                        .iter()
+                        .filter_map(|(key, row)| {
+                            row.row().activation_reason().map(|reason| (*key, reason))
+                        })
+                        .collect(),
+                },
+            },
+        ))
+    }
+
+    fn request_endpoints<'a>(
+        &self,
+        request: &DeclarationAccessRequest,
+        selected: &'a super::declaration_access::AccessEndpoints<Self::Endpoint, Self::Facts>,
+    ) -> Result<super::declaration_access::AccessEndpointPair<'a, Self::Endpoint>> {
+        let callers = selected.endpoints.get(&request.reference).ok_or_else(|| {
+            let received = selected.endpoints.keys().copied().collect::<BTreeSet<_>>();
+            StoreError::corrupt(format!(
+                "selected Rust access source omitted requested reference context: requests={:?}, received={:?}",
+                selected.facts.requests, received.into_iter().collect::<Vec<_>>(),
+            ))
+        })?;
+        Ok((
+            callers,
+            selected
+                .facts
+                .targets
+                .get(&request.definition)
+                .expect("every requested definition has a crate-context list"),
+        ))
+    }
+
+    fn request_activation_reason(
+        &self,
+        request: &DeclarationAccessRequest,
+        selected: &super::declaration_access::AccessEndpoints<Self::Endpoint, Self::Facts>,
+    ) -> Option<SemanticId> {
+        selected
+            .facts
+            .activation_reasons
+            .get(&request.definition)
+            .copied()
+    }
+
+    fn declaration_activation(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+        session: Option<&ResolutionSession>,
+    ) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
+        rust_declaration_activation(self.policy, facts, definition, cancellation, session)
+    }
+}
+
+/// Module-placement visibility is a different reduction from the enclosing
+/// crate-context choice: mixed reachable and unreachable placements are unknown.
+struct RustPlacementRules<'a> {
+    conn: &'a rusqlite::Connection,
+    visibility: String,
+    reaches: RefCell<rusqlite::CachedStatement<'a>>,
+}
+
+impl super::declaration_access::DeclarationAccessRules for RustPlacementRules<'_> {
+    type Endpoint = CratePlacement;
+    type Facts = ();
+    type TargetContext = Option<String>;
+
+    fn prepare_target(&self, target: &Self::Endpoint) -> Result<Self::TargetContext> {
+        Ok(self
+            .conn
+            .prepare_cached(super::rust_crate_context::PARENT)?
+            .query_row(rusqlite::params![target.0, target.1], |row| row.get(0))
+            .optional()?)
+    }
+
+    fn declaration_relation(
+        &self,
+        caller: &Self::Endpoint,
+        target: &Self::Endpoint,
+        _facts: &(),
+        parent: &Self::TargetContext,
+    ) -> Result<Option<super::declaration_access::AccessEvidence>> {
+        let reaches: Option<bool> = self.reaches.borrow_mut().query_row(
+            rusqlite::params![
+                caller.0,
+                caller.1,
+                target.0,
+                target.1,
+                self.visibility,
+                parent
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(Some(rust_access_evidence(match reaches {
+            Some(true) => DeclarationAccessDecision::Allowed,
+            Some(false) => DeclarationAccessDecision::Denied,
+            None => DeclarationAccessDecision::Unknown,
+        })))
+    }
+
+    fn combine_placements(
+        &self,
+        answers: impl Iterator<Item = Result<super::declaration_access::AccessEvidence>>,
+    ) -> Result<super::declaration_access::AccessEvidence> {
+        let mut allowed = false;
+        let mut denied = false;
+        let mut unknown = false;
+        // Consume every relation even after uncertainty, preserving recorded reads.
+        for answer in answers {
+            match answer?.decision {
+                DeclarationAccessDecision::Allowed => allowed = true,
+                DeclarationAccessDecision::Denied => denied = true,
+                DeclarationAccessDecision::Unknown => unknown = true,
+                other => unreachable!("placement visibility cannot decide activation: {other:?}"),
+            }
+        }
+        Ok(rust_access_evidence(match (allowed, denied, unknown) {
+            (true, false, false) => DeclarationAccessDecision::Allowed,
+            (false, true, false) => DeclarationAccessDecision::Denied,
+            _ => DeclarationAccessDecision::Unknown,
+        }))
+    }
+
+    fn unknown_reason(&self) -> super::declaration_access::AccessEvidence {
+        rust_access_evidence(DeclarationAccessDecision::Unknown)
+    }
+}
+
+fn finish_placement_access(
     conn: &rusqlite::Connection,
     reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
     definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
@@ -908,40 +1212,47 @@ fn finish_access(
     let Some(visibility) = definition.row().visibility() else {
         return Ok(Some(DeclarationAccessDecision::Unknown));
     };
-    let visibility = encode_rust_visibility(visibility);
-    // Share all-placement reduction as SQL when a second language adopts shared placements (milestone 2b slices 5 and 7), not as callbacks.
-    let mut allowed = false;
-    let mut denied = false;
-    let mut unknown = false;
-    let mut reaches_statement = conn.prepare_cached(VISIBILITY)?;
-    for (target, path, _) in definitions {
-        let parent: Option<String> = conn
-            .prepare_cached(super::rust_crate_context::PARENT)?
-            .query_row(rusqlite::params![target, path], |row| row.get(0))
-            .optional()?;
-        for (requester, request_path, _) in references {
-            let reaches: Option<bool> = reaches_statement.query_row(
-                rusqlite::params![requester, request_path, target, path, visibility, parent],
-                |row| row.get(0),
-            )?;
-            match reaches {
-                Some(true) => allowed = true,
-                Some(false) => denied = true,
-                None => unknown = true,
-            }
-        }
-    }
-    if unknown {
-        return Ok(Some(DeclarationAccessDecision::Unknown));
-    }
-    Ok(Some(match (allowed, denied) {
-        (true, false) => DeclarationAccessDecision::Allowed,
-        (false, true) => DeclarationAccessDecision::Denied,
-        _ => DeclarationAccessDecision::Unknown,
-    }))
+    let rules = RustPlacementRules {
+        conn,
+        visibility: encode_rust_visibility(visibility),
+        reaches: RefCell::new(conn.prepare_cached(VISIBILITY)?),
+    };
+    Ok(Some(
+        super::declaration_access::evaluate_placements(&rules, references, definitions, &())?
+            .decision,
+    ))
 }
 
 impl RustAccessDecisionSource for RustCrateAccessPolicy {
+    fn visit_rust_access_pages(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        requests: TypedFactRequest<DeclarationAccessRequest>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
+    ) -> Result<TypedFactReadOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(TypedFactReadOutcome::cancelled(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(TypedFactReadOutcome::exhausted(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        super::declaration_access::visit_access_pages(
+            &RustPointSelectedRules {
+                policy: self,
+                source: facts,
+            },
+            facts,
+            requests,
+            cancellation,
+            visitor,
+        )
+    }
+
     fn identity(&self) -> SemanticId {
         self.identity
     }
@@ -952,105 +1263,123 @@ impl RustAccessDecisionSource for RustCrateAccessPolicy {
         reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
         definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
     ) -> Result<DeclarationAccessDecision> {
-        let mut decision = None;
-        for key in &self.crate_keys {
-            let Some(next) =
-                facts.rust_crate_access(*key, &self.base_blobs, reference, definition)?
-            else {
-                continue;
-            };
-            // One selected placement supplies positive authority for this exact
-            // reference/definition pair. A file compiled into more than one
-            // Cargo target has one placement per target, and a placement that
-            // cannot reach the definition does not revoke one that can --
-            // otherwise every reference in a lib/bin shared file is unprovable.
-            // `RustCrateSetAccessPolicy` below takes the same reading.
-            if next == DeclarationAccessDecision::Allowed {
-                return Ok(DeclarationAccessDecision::Allowed);
-            }
-            decision = Some(match decision {
-                Some(previous) if previous != next => DeclarationAccessDecision::Unknown,
-                _ => next,
-            });
+        let point = RustPointSelectedRules {
+            policy: self,
+            source: facts,
+        };
+        let callers = [RustPointEndpoint {
+            reference: reference.cloned(),
+            definition: None,
+            crate_key: None,
+        }];
+        let targets = self
+            .crate_keys
+            .iter()
+            .map(|key| RustPointEndpoint {
+                reference: None,
+                definition: definition.cloned(),
+                crate_key: Some(*key),
+            })
+            .collect::<Vec<_>>();
+        let endpoint_facts = RustPointFacts::default();
+        let evidence = if reference.is_none() {
+            super::declaration_access::evaluate_placements(
+                &RustDeclarationActivationRules { point, definition },
+                &callers,
+                &targets,
+                &endpoint_facts,
+            )?
+        } else {
+            super::declaration_access::evaluate_placements(
+                &point,
+                &callers,
+                &targets,
+                &endpoint_facts,
+            )?
+        };
+        Ok(evidence.decision)
+    }
+}
+
+impl RustAccessDecisionSource for RustCrateSetAccessPolicy {
+    fn visit_rust_access_pages(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        requests: TypedFactRequest<DeclarationAccessRequest>,
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
+    ) -> Result<TypedFactReadOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(TypedFactReadOutcome::cancelled(
+                ResolutionCompletion::Complete,
+            ));
         }
-        Ok(decision.unwrap_or_else(|| {
-            if reference.is_none() {
-                if definition.is_some_and(|definition| {
+        if requests.is_empty() {
+            return Ok(TypedFactReadOutcome::exhausted(
+                ResolutionCompletion::Complete,
+            ));
+        }
+        super::declaration_access::visit_access_pages(
+            &RustSetSelectedRules {
+                point: RustPointSelectedRules {
+                    policy: self,
+                    source: facts,
+                },
+                empty_decision: DeclarationAccessDecision::Denied,
+            },
+            facts,
+            requests,
+            cancellation,
+            visitor,
+        )
+    }
+    fn identity(&self) -> SemanticId {
+        self.identity
+    }
+
+    fn decide(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
+        definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
+    ) -> Result<DeclarationAccessDecision> {
+        let point = RustPointSelectedRules {
+            policy: self,
+            source: facts,
+        };
+        let callers = [RustPointEndpoint {
+            reference: reference.cloned(),
+            definition: None,
+            crate_key: None,
+        }];
+        let targets = self
+            .crate_keys
+            .iter()
+            .map(|key| RustPointEndpoint {
+                reference: None,
+                definition: definition.cloned(),
+                crate_key: Some(*key),
+            })
+            .collect::<Vec<_>>();
+        Ok(super::declaration_access::evaluate_placements(
+            &RustSetSelectedRules {
+                point,
+                empty_decision: if reference.is_some() {
+                    DeclarationAccessDecision::Denied
+                } else if definition.is_some_and(|definition| {
                     definition.row().cfg_condition()
                         == &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always
                 }) {
                     DeclarationAccessDecision::Allowed
                 } else {
-                    DeclarationAccessDecision::Unknown
-                }
-            } else {
-                // No crate this point request names places the reference's
-                // module, so the reference is outside the request's crate set.
-                // Rows say that exactly: a decoy of the same name in an
-                // unrelated Cargo target is denied here, not unknown. The
-                // crate-set policy below, which certifies absence, keeps the
-                // conservative reading instead.
-                DeclarationAccessDecision::Denied
-            }
-        }))
-    }
-}
-
-impl RustAccessDecisionSource for RustCrateSetAccessPolicy {
-    fn identity(&self) -> SemanticId {
-        self.identity
-    }
-
-    fn decide(
-        &self,
-        facts: &dyn SelectedTypedFactSource,
-        reference: Option<&SelectedTypedRow<LoweredRustReferenceContext>>,
-        definition: Option<&SelectedTypedRow<LoweredRustDeclarationAuthority>>,
-    ) -> Result<DeclarationAccessDecision> {
-        let mut decisions = Vec::new();
-        for key in &self.crate_keys {
-            if let Some(next) =
-                facts.rust_crate_set_access(*key, &self.base_blobs, reference, definition)?
-            {
-                decisions.push(next);
-            }
-        }
-        if decisions.contains(&DeclarationAccessDecision::UnknownActivation) {
-            return Ok(DeclarationAccessDecision::UnknownActivation);
-        }
-        if !decisions.is_empty()
-            && decisions
-                .iter()
-                .all(|decision| *decision == DeclarationAccessDecision::InactiveActivation)
-        {
-            return Ok(DeclarationAccessDecision::InactiveActivation);
-        }
-        decisions.retain(|decision| *decision != DeclarationAccessDecision::InactiveActivation);
-        if decisions.contains(&DeclarationAccessDecision::Allowed) {
-            return Ok(DeclarationAccessDecision::Allowed);
-        }
-        let Some(first) = decisions.first().copied() else {
-            if reference.is_none() {
-                return Ok(if definition.is_some_and(|definition| {
-                    definition.row().cfg_condition() == &brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition::Always
-                }) {
-                    DeclarationAccessDecision::Allowed
-                } else {
                     DeclarationAccessDecision::UnknownActivation
-                });
-            }
-            // No crate in this set places the reference's module, so the
-            // reference is outside the set. That is an exact exclusion from
-            // rows -- a decoy of the same name in an unrelated Cargo target --
-            // and it is not the undecided cfg atom that keeps absence
-            // uncertain, which arrives above as `UnknownActivation`.
-            return Ok(DeclarationAccessDecision::Denied);
-        };
-        Ok(if decisions.iter().all(|decision| *decision == first) {
-            first
-        } else {
-            DeclarationAccessDecision::Unknown
-        })
+                },
+            },
+            &callers,
+            &targets,
+            &RustPointFacts::default(),
+        )?
+        .decision)
     }
 }
 
@@ -1268,4 +1597,180 @@ pub(crate) fn qualify_import_path(
         }
     }
     Ok(Some(true))
+}
+
+impl RustSelectedAccessPolicy for RustCrateAccessPolicy {
+    fn crate_keys(&self) -> &[[u8; 32]] {
+        &self.crate_keys
+    }
+    fn base_blobs(&self) -> &[(BindingFragmentId, i64)] {
+        &self.base_blobs
+    }
+    fn policy_identity(&self) -> SemanticId {
+        self.identity
+    }
+}
+
+impl RustSelectedAccessPolicy for RustCrateSetAccessPolicy {
+    fn crate_keys(&self) -> &[[u8; 32]] {
+        &self.crate_keys
+    }
+    fn base_blobs(&self) -> &[(BindingFragmentId, i64)] {
+        &self.base_blobs
+    }
+    fn policy_identity(&self) -> SemanticId {
+        self.identity
+    }
+}
+
+fn rust_declaration_activation(
+    policy: &dyn RustAccessDecisionSource,
+    facts: &dyn SelectedTypedFactSource,
+    definition: SemanticId,
+    cancellation: &CancellationToken,
+    session: Option<&ResolutionSession>,
+) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
+    let Some(definition) = local_rust_authority_definition(definition) else {
+        return Ok(Some((DeclarationAccessDecision::Allowed, None)));
+    };
+    let mut authority = None;
+    let mut collect = |rows: &[SelectedTypedRow<LoweredRustDeclarationAuthority>]| {
+        for row in rows {
+            assert_eq!(row.row().definition(), definition);
+            assert!(
+                authority.replace(row.clone()).is_none(),
+                "one target owns one item authority"
+            );
+        }
+        Ok(!cancellation.is_cancelled())
+    };
+    let mut visitor = match session {
+        Some(session) => FactPageVisitor::with_maximum_rows_in_session(
+            &mut collect,
+            MAX_SOURCE_ROWS_PER_BATCH,
+            session,
+        ),
+        None => FactPageVisitor::new(&mut collect),
+    };
+    let outcome = facts.visit_rust_declaration_authority_pages(
+        TypedFactRequest::new(&[definition]),
+        cancellation,
+        &mut visitor,
+    )?;
+    if complete_access_source_read(outcome, cancellation, "Rust target activation")?.is_some() {
+        return Ok(None);
+    }
+    let Some(authority) = authority else {
+        return Ok(Some((DeclarationAccessDecision::Allowed, None)));
+    };
+    Ok(Some((
+        policy.decide(facts, None, Some(&authority))?,
+        authority.row().activation_reason(),
+    )))
+}
+
+struct RustSetSelectedRules<'a> {
+    point: RustPointSelectedRules<'a>,
+    // The already-computed empty answer, not a traversal or policy mode.
+    empty_decision: DeclarationAccessDecision,
+}
+impl super::declaration_access::DeclarationAccessRules for RustSetSelectedRules<'_> {
+    type Endpoint = RustPointEndpoint;
+    type Facts = RustPointFacts;
+    type TargetContext = ();
+    fn prepare_target(&self, _: &Self::Endpoint) -> Result<()> {
+        Ok(())
+    }
+    fn declaration_relation(
+        &self,
+        caller: &Self::Endpoint,
+        target: &Self::Endpoint,
+        _: &Self::Facts,
+        _: &(),
+    ) -> Result<Option<super::declaration_access::AccessEvidence>> {
+        Ok(self
+            .point
+            .source
+            .rust_crate_set_access(
+                target.crate_key.expect("set target names its crate"),
+                self.point.policy.base_blobs(),
+                caller.reference.as_ref(),
+                target.definition.as_ref(),
+            )?
+            .map(rust_access_evidence))
+    }
+    fn combine_placements(
+        &self,
+        answers: impl Iterator<Item = Result<super::declaration_access::AccessEvidence>>,
+    ) -> Result<super::declaration_access::AccessEvidence> {
+        let mut decisions = answers
+            .map(|answer| answer.map(|answer| answer.decision))
+            .collect::<Result<Vec<_>>>()?;
+        use DeclarationAccessDecision::*;
+        let decision = if decisions.contains(&UnknownActivation) {
+            UnknownActivation
+        } else if !decisions.is_empty()
+            && decisions
+                .iter()
+                .all(|decision| *decision == InactiveActivation)
+        {
+            InactiveActivation
+        } else {
+            decisions.retain(|decision| *decision != InactiveActivation);
+            if decisions.contains(&Allowed) {
+                Allowed
+            } else if let Some(first) = decisions.first().copied() {
+                if decisions.iter().all(|decision| *decision == first) {
+                    first
+                } else {
+                    Unknown
+                }
+            } else {
+                self.empty_decision
+            }
+        };
+        Ok(rust_access_evidence(decision))
+    }
+    fn unknown_reason(&self) -> super::declaration_access::AccessEvidence {
+        rust_access_evidence(DeclarationAccessDecision::Unknown)
+    }
+}
+impl super::declaration_access::SelectedDeclarationAccessRules for RustSetSelectedRules<'_> {
+    fn identity(&self) -> SemanticId {
+        self.point.policy.policy_identity()
+    }
+    fn read_endpoints(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        requests: &[DeclarationAccessRequest],
+        cancellation: &CancellationToken,
+        visitor: &mut FactPageVisitor<'_, DeclarationAccessRow>,
+    ) -> Result<super::declaration_access::AccessEndpointRead<Self::Endpoint, Self::Facts>> {
+        self.point
+            .read_endpoints(facts, requests, cancellation, visitor)
+    }
+    fn request_endpoints<'a>(
+        &self,
+        request: &DeclarationAccessRequest,
+        selected: &'a super::declaration_access::AccessEndpoints<Self::Endpoint, Self::Facts>,
+    ) -> Result<super::declaration_access::AccessEndpointPair<'a, Self::Endpoint>> {
+        self.point.request_endpoints(request, selected)
+    }
+    fn request_activation_reason(
+        &self,
+        request: &DeclarationAccessRequest,
+        selected: &super::declaration_access::AccessEndpoints<Self::Endpoint, Self::Facts>,
+    ) -> Option<SemanticId> {
+        self.point.request_activation_reason(request, selected)
+    }
+    fn declaration_activation(
+        &self,
+        facts: &dyn SelectedTypedFactSource,
+        definition: SemanticId,
+        cancellation: &CancellationToken,
+        session: Option<&ResolutionSession>,
+    ) -> Result<Option<(DeclarationAccessDecision, Option<SemanticId>)>> {
+        self.point
+            .declaration_activation(facts, definition, cancellation, session)
+    }
 }

@@ -35,20 +35,18 @@ pub fn python_extract_call_receiver(reference: &str) -> Option<String> {
         .map(|(receiver, _)| receiver.to_string())
 }
 
-/// Literal string data may occupy a long physical line, but replacement fields
-/// remain executable structure. Bytes and implicit concatenation use the same
-/// grammar nodes. The caller validates the finite source/tree envelope first.
-pub fn is_string_line_data(
-    node: tree_sitter::Node<'_>,
-    should_stop: &mut dyn FnMut() -> bool,
-) -> std::ops::ControlFlow<(), bool> {
-    brokk_bifrost_core::analyzer::tree_walk::is_uninterpolated_literal(
-        node,
-        &["string", "concatenated_string"],
-        &["interpolation"],
-        should_stop,
-    )
-}
+/// Python data literals. Bytes and implicit concatenation use the same grammar
+/// nodes; replacement fields remain executable structure.
+pub const PYTHON_LINE_DATA_KINDS: brokk_bifrost_core::analyzer::tree_walk::LineDataKinds =
+    brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        literals: &["string", "concatenated_string", "integer", "float"],
+        interpolations: &["interpolation"],
+        composites: &[
+            ("list", &["[", "]", ","]),
+            ("tuple", &["(", ")", ","]),
+            ("unary_operator", &["-", "+"]),
+        ],
+    };
 
 #[cfg(test)]
 mod tests {
@@ -86,13 +84,25 @@ mod tests {
                 stack.extend(node.named_children(&mut cursor));
             }
             assert_eq!(count, interpolations, "{}", value.to_sexp());
-            assert_eq!(
-                is_string_line_data(value, &mut || false),
-                ControlFlow::Continue(data)
-            );
+            let data_subtrees = |should_stop: &mut dyn FnMut() -> bool| {
+                match brokk_bifrost_core::analyzer::tree_walk::maximal_data_subtrees(
+                    value,
+                    &PYTHON_LINE_DATA_KINDS,
+                    |_| true,
+                    should_stop,
+                ) {
+                    ControlFlow::Continue(subtrees) => ControlFlow::Continue(
+                        subtrees
+                            .iter()
+                            .any(|subtree| subtree.range == value.byte_range()),
+                    ),
+                    ControlFlow::Break(()) => ControlFlow::Break(()),
+                }
+            };
+            assert_eq!(data_subtrees(&mut || false), ControlFlow::Continue(data));
             let mut stops = 0;
             assert_eq!(
-                is_string_line_data(value, &mut || {
+                data_subtrees(&mut || {
                     stops += 1;
                     true
                 }),

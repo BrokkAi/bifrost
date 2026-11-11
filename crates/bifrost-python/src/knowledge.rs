@@ -12,6 +12,12 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct PythonKnowledge;
 
 impl LanguageKnowledge for PythonKnowledge {
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Followable
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }
@@ -26,6 +32,42 @@ impl LanguageKnowledge for PythonKnowledge {
     // Native typing.overload selection is not modeled; decorated values retain
     // their existing unknown-value evidence instead of overload alternatives.
     fn callable_result_is_applicability_independent(&self) -> bool {
+        true
+    }
+
+    fn external_callee_expansion_requires_receiver_binding(&self) -> bool {
+        true
+    }
+
+    fn exact_external_call_keeps_import_boundary(&self) -> bool {
+        true
+    }
+
+    fn model_declarations_project_runtime_values(&self) -> bool {
+        true
+    }
+
+    fn model_declarations_supply_runtime_bases(&self) -> bool {
+        true
+    }
+
+    fn intrinsic_owners_use_source_member_rules(&self) -> bool {
+        true
+    }
+
+    fn qualified_type_lookups_use_value_namespace(&self) -> bool {
+        true
+    }
+
+    fn callable_expression_type_gap_is_value_only(&self) -> bool {
+        true
+    }
+
+    fn owned_members_are_not_lexically_scoped(&self) -> bool {
+        true
+    }
+
+    fn reassignments_are_one_declaration(&self) -> bool {
         true
     }
 

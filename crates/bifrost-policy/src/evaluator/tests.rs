@@ -23,6 +23,254 @@ use serde_json::json;
 mod activated_flow_assertion;
 mod visible_policy_run;
 
+fn projected_binding_rows() -> (Vec<UnitRowItem>, Vec<UnitRowEvidence>) {
+    use brokk_bifrost_rql::structural::search::{
+        UnitRowItemProvenance, UnitRowItemProvenanceStep, UnitRowItemRef, UnitRowItemRefValue,
+        UnitRowProvenanceRef, UnitRowProvenanceStep,
+    };
+    let range = CodeQueryRange {
+        start_line: 1,
+        start_column: 1,
+        end_line: 1,
+        end_column: 2,
+    };
+    let key = DetailedCodeQueryKey::Binding {
+        id: "binder-1".to_owned(),
+        ast_id: Some("binder-ast".to_owned()),
+        name: "x".to_owned(),
+    };
+    let rows = (0..2)
+        .map(|index| {
+            let item = UnitRowItem {
+                domain: DetailedCodeQueryDomain::Binding,
+                path: "main.rs".into(),
+                range: Some(range),
+                evidence: None,
+                coverage: None,
+                fields: Vec::new(), // reached_from_ast_id was projected away
+                projected_field_names: vec!["name".into()],
+                unknown_fields: Vec::new(),
+                terminal: Some(UnitRowItemTerminal::Binding {
+                    id: "binder-1".into(),
+                    ast_id: Some("binder-ast".into()),
+                    name: "x".into(),
+                    kind: "pattern_binder".into(),
+                }),
+                provenance: vec![UnitRowItemProvenance {
+                    branch: Vec::new(),
+                    seed: UnitRowItemRef {
+                        kind: "occurrence".into(),
+                        path: "main.rs".into(),
+                        value: UnitRowItemRefValue::Occurrence {
+                            id: format!("ref-{index}").into(),
+                            ast_id: format!("ref-ast-{index}").into(),
+                            class: "reference".into(),
+                            role: "value_reference".into(),
+                            namespace: "value".into(),
+                            range,
+                        },
+                    },
+                    steps: vec![UnitRowItemProvenanceStep {
+                        op: "binding-of".into(),
+                        result: UnitRowItemRef {
+                            kind: "binding".into(),
+                            path: "main.rs".into(),
+                            value: UnitRowItemRefValue::Binding {
+                                id: "binder-1".into(),
+                                ast_id: Some("binder-ast".into()),
+                                name: "x".into(),
+                                kind: "pattern_binder".into(),
+                                range,
+                            },
+                        },
+                        via: None,
+                    }],
+                }],
+                provenance_truncated: false,
+            };
+            let reference = UnitRowProvenanceRef {
+                domain: DetailedCodeQueryDomain::Occurrence,
+                key: DetailedCodeQueryKey::Occurrence {
+                    id: format!("ref-{index}"),
+                    ast_id: format!("ref-ast-{index}"),
+                    role: "value_reference".to_owned(),
+                },
+                rel_path: "main.rs".into(),
+                byte_span: Some(index..index + 1),
+                display_range: Some(range),
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: Some([1; 32]),
+            };
+            let binding = UnitRowProvenanceRef {
+                domain: DetailedCodeQueryDomain::Binding,
+                key: key.clone(),
+                rel_path: "main.rs".into(),
+                byte_span: Some(index..index + 1),
+                display_range: Some(range),
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: Some([1; 32]),
+            };
+            let evidence = UnitRowEvidence {
+                domain: DetailedCodeQueryDomain::Binding,
+                key: key.clone(),
+                rel_path: "main.rs".into(),
+                byte_span: Some(index..index + 1),
+                stable_owner_candidate: None,
+                identities: UnitRowIdentities::None,
+                source_slice_sha256: Some([1; 32]),
+                provenance: vec![UnitRowProvenance {
+                    branch: Vec::new(),
+                    seed: reference.clone(),
+                    steps: vec![UnitRowProvenanceStep {
+                        op: "binding-of".to_owned(),
+                        result: binding,
+                        via: None,
+                    }],
+                }],
+            };
+            (item, evidence)
+        })
+        .collect::<Vec<_>>();
+    rows.into_iter().unzip()
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10389: projected binding-of rows keep distinct reference findings"
+)]
+fn projected_binding_of_rows_are_not_deduplicated_as_direct_binders() {
+    let policy_id = PolicyId::new("test.binding-of-projection").unwrap();
+    let (items, evidence) = projected_binding_rows();
+    let adapted = adapt_match_candidates(
+        &policy_id,
+        BindingOutputClass::BindingOfOnly,
+        items,
+        evidence,
+        &[],
+    );
+    assert!(!adapted.conversion_failed, "{adapted:#?}");
+    assert_eq!(adapted.candidates.len(), 2, "{adapted:#?}");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10389: mixed selector with absent provenance preserves reference answers"
+)]
+fn mixed_binding_output_keeps_rows_without_provenance() {
+    let policy_id = PolicyId::new("test.binding-mixed").unwrap();
+    let (mut items, mut evidence) = projected_binding_rows();
+    for (item, detailed) in items.iter_mut().zip(&mut evidence) {
+        item.provenance.clear();
+        detailed.provenance.clear();
+    }
+    let adapted =
+        adapt_match_candidates(&policy_id, BindingOutputClass::Mixed, items, evidence, &[]);
+    assert!(!adapted.conversion_failed, "{adapted:#?}");
+    assert_eq!(adapted.candidates.len(), 2, "{adapted:#?}");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10389: duplicate binder rows are validated before deduplication"
+)]
+fn malformed_duplicate_binding_row_marks_match_incomplete() {
+    use brokk_bifrost_rql::structural::search::UnitRowItemRefValue;
+    let policy_id = PolicyId::new("test.binding-invalid-duplicate").unwrap();
+    let (mut items, evidence) = projected_binding_rows();
+    let UnitRowItemRefValue::Binding { range, .. } =
+        &mut items[1].provenance[0].steps[0].result.value
+    else {
+        unreachable!()
+    };
+    range.start_line += 1;
+    let adapted = adapt_match_candidates(
+        &policy_id,
+        BindingOutputClass::DirectOnly,
+        items,
+        evidence,
+        &[],
+    );
+    assert!(adapted.conversion_failed, "{adapted:#?}");
+    assert_eq!(adapted.candidates.len(), 1, "{adapted:#?}");
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10389: a duplicate or-pattern binder cannot shift a later binding's finding ordinal"
+)]
+fn duplicate_binding_does_not_advance_later_finding_ordinal() {
+    let policy_id = PolicyId::new("test.binding-ordinal").unwrap();
+    let (mut items, mut evidence) = projected_binding_rows();
+    for (item, detailed) in items.iter_mut().zip(&mut evidence) {
+        item.provenance.clear();
+        detailed.provenance.clear();
+    }
+    let mut later_item = items[0].clone();
+    let mut later_evidence = evidence[0].clone();
+    let Some(UnitRowItemTerminal::Binding { id, .. }) = later_item.terminal.as_mut() else {
+        unreachable!()
+    };
+    *id = "binder-2".into();
+    let DetailedCodeQueryKey::Binding { id, .. } = &mut later_evidence.key else {
+        unreachable!()
+    };
+    *id = "binder-2".to_owned();
+    later_evidence.byte_span = Some(2..3);
+    let without_duplicate = adapt_match_candidates(
+        &policy_id,
+        BindingOutputClass::DirectOnly,
+        vec![items[0].clone(), later_item.clone()],
+        vec![evidence[0].clone(), later_evidence.clone()],
+        &[],
+    );
+    let with_duplicate = adapt_match_candidates(
+        &policy_id,
+        BindingOutputClass::DirectOnly,
+        vec![items[0].clone(), items[1].clone(), later_item],
+        vec![evidence[0].clone(), evidence[1].clone(), later_evidence],
+        &[],
+    );
+    assert!(
+        !without_duplicate.conversion_failed,
+        "{without_duplicate:#?}"
+    );
+    assert!(!with_duplicate.conversion_failed, "{with_duplicate:#?}");
+    assert_eq!(with_duplicate.candidates.len(), 2, "{with_duplicate:#?}");
+    assert_eq!(
+        with_duplicate.candidates[1].id,
+        without_duplicate.candidates[1].id
+    );
+    assert_eq!(
+        with_duplicate.candidates[1].evidence.anchor(),
+        without_duplicate.candidates[1].evidence.anchor()
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10389: compiled selector output paths govern binder deduplication"
+)]
+fn binding_output_class_follows_only_row_producing_operands() {
+    let direct = CodeQuery::from_source(
+        "(except (bindings :name \"x\") (binding-of (occurrences :class reference)))",
+    )
+    .unwrap();
+    assert_eq!(
+        binding_output_class(&direct.plan),
+        BindingOutputClass::DirectOnly
+    );
+    let binding_of = CodeQuery::from_source("(binding-of (occurrences :class reference))").unwrap();
+    assert_eq!(
+        binding_output_class(&binding_of.plan),
+        BindingOutputClass::BindingOfOnly
+    );
+    let mixed = CodeQuery::from_source(
+        "(union (bindings :name \"x\") (binding-of (occurrences :class reference)))",
+    )
+    .unwrap();
+    assert_eq!(binding_output_class(&mixed.plan), BindingOutputClass::Mixed);
+}
+
 fn risk(rating: &str, refs: &[&str]) -> OrganizationalRiskAssessment {
     OrganizationalRiskAssessment::try_new(
         "test-risk".to_string(),
@@ -68,11 +316,289 @@ fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = budget;
     DefaultPolicyEvaluator::new()
         .evaluate(policy, &context, &mut budget)
         .unwrap()
+}
+
+#[test]
+fn approximate_family_backstop_marks_every_match_finding_without_changing_identity() {
+    let budget = PolicyBudget::default();
+    let exact = classified_match_run("alpha();\nalpha();\n", budget);
+    assert!(!exact.findings().is_empty());
+    assert!(
+        exact
+            .findings()
+            .iter()
+            .all(|finding| finding.model_attribution().is_none())
+    );
+    let exact_bytes = serde_json::to_vec(&exact).unwrap();
+    assert_eq!(
+        serde_json::to_vec(
+            &mark_approximate_family_run(exact.clone(), Vec::new(), &budget).unwrap()
+        )
+        .unwrap(),
+        exact_bytes,
+    );
+    let contributor = ModelAttributionContributor {
+        role: ModelAttributionRole::ReadDependency,
+        pack_digest: "a".repeat(64),
+        record_id: "active-pack".to_owned(),
+        built_from: "0.8.1".to_owned(),
+        resolved: "0.8.2".to_owned(),
+        direction: "older_artifact".to_owned(),
+        mismatch_kinds: vec!["version_nearby".to_owned()],
+        selection_rule_id: "cargo-compatible-nearest".to_owned(),
+        selection_rule_version: 1,
+    };
+    let marked = mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &budget)
+        .expect("the interim backstop fits its normal report budget");
+    assert_eq!(marked.completion(), exact.completion());
+    assert_eq!(marked.findings().len(), exact.findings().len());
+    for (marked, exact) in marked.findings().iter().zip(exact.findings()) {
+        assert_eq!(marked.id(), exact.id());
+        assert_eq!(
+            marked.model_attribution().unwrap().contributors,
+            vec![contributor.clone()]
+        );
+    }
+    let middle_budget = PolicyBudget::builder()
+        .with_max_retained_report_bytes(marked.retained_size().saturating_sub(1))
+        .unwrap()
+        .build()
+        .unwrap();
+    let detail_trimmed =
+        mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &middle_budget)
+            .expect("zero-detail attribution fits with every finding retained");
+    assert_eq!(detail_trimmed.findings().len(), exact.findings().len());
+    assert_eq!(detail_trimmed.completion(), exact.completion());
+    assert!(detail_trimmed.retained_size() <= middle_budget.max_retained_report_bytes());
+    for finding in detail_trimmed.findings() {
+        let attribution = finding.model_attribution().unwrap();
+        assert!(attribution.approximate);
+        assert!(attribution.contributors.is_empty());
+        assert!(!attribution.contributors_complete);
+        assert_eq!(attribution.omitted_at_least, 1);
+    }
+    // Cap-zero contributor detail must still be one byte too large, or the
+    // ordinary detail-trimming path can retain every finding and never test
+    // the incomplete-report fallback.
+    let mut zero_detail = exact.clone();
+    let zero_attribution = ModelAttribution::from_full(vec![contributor.clone()], 0);
+    let zero_findings = zero_detail
+        .take_findings()
+        .into_iter()
+        .map(|finding| {
+            finding
+                .with_model_attribution(Some(zero_attribution.clone()), &budget)
+                .unwrap()
+        })
+        .collect();
+    zero_detail.replace_findings(zero_findings);
+    let tight_budget = PolicyBudget::builder()
+        .with_max_retained_report_bytes(zero_detail.retained_size().saturating_sub(1))
+        .unwrap()
+        .build()
+        .unwrap();
+    let fitting =
+        mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &tight_budget)
+            .expect("retention keeps fitting marked findings");
+    assert!(!fitting.findings().is_empty());
+    assert!(fitting.findings().len() < exact.findings().len());
+    assert!(fitting.work().omitted_findings_lower_bound() > 0);
+    assert!(
+        fitting
+            .findings()
+            .iter()
+            .all(|finding| finding.model_attribution().is_some())
+    );
+    assert!(!fitting.completion().is_reliable());
+    assert!(fitting.retained_size() <= tight_budget.max_retained_report_bytes());
+    for finding in fitting.findings() {
+        let attribution = finding.model_attribution().unwrap();
+        assert!(attribution.approximate);
+        assert!(attribution.contributors.is_empty());
+        assert!(!attribution.contributors_complete);
+        assert_eq!(attribution.omitted_at_least, 1);
+    }
+    let marked_twice = mark_approximate_family_run(exact, vec![contributor], &budget).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&marked).unwrap(),
+        serde_json::to_vec(&marked_twice).unwrap()
+    );
+    let mut causal = marked_twice.findings()[0]
+        .model_attribution()
+        .unwrap()
+        .contributors[0]
+        .clone();
+    causal.role = ModelAttributionRole::Declaration;
+    causal.record_id = "selected-declaration".to_owned();
+    let existing =
+        mark_approximate_family_run(marked_twice, vec![causal.clone()], &budget).unwrap();
+    assert!(existing.findings().iter().all(|finding| {
+        let contributors = &finding.model_attribution().unwrap().contributors;
+        contributors
+            .iter()
+            .any(|item| item.role == ModelAttributionRole::ReadDependency)
+            && contributors.contains(&causal)
+    }));
+}
+
+fn read_dependency_contributor() -> ModelAttributionContributor {
+    ModelAttributionContributor {
+        role: ModelAttributionRole::ReadDependency,
+        pack_digest: "a".repeat(64),
+        record_id: "active-pack".to_owned(),
+        built_from: "0.8.1".to_owned(),
+        resolved: "0.8.2".to_owned(),
+        direction: "older_artifact".to_owned(),
+        mismatch_kinds: vec!["version_nearby".to_owned()],
+        selection_rule_id: "cargo-compatible-nearest".to_owned(),
+        selection_rule_version: 1,
+    }
+}
+
+/// The retention fallback as it was written before the prefix search: pop one
+/// finding at a time and revalidate the whole run.
+fn pop_until_the_marked_run_fits(
+    mut run: PolicyRun,
+    contributor: &ModelAttributionContributor,
+    budget: &PolicyBudget,
+) -> Result<PolicyRun, PolicyRunError> {
+    let attribution = ModelAttribution::from_full(vec![contributor.clone()], 0);
+    let mut retained = Vec::new();
+    let mut omitted = 0usize;
+    for finding in run.take_findings() {
+        match finding.with_model_attribution(Some(attribution.clone()), budget) {
+            Ok(marked) => retained.push(marked),
+            Err(_) => omitted += 1,
+        }
+    }
+    for _ in 0..omitted {
+        run.increment_omitted_findings();
+    }
+    loop {
+        run.replace_findings(retained.clone());
+        if omitted > 0 {
+            run.mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget);
+        }
+        if run.validate_against_budget(budget).is_ok() {
+            return Ok(run);
+        }
+        if retained.pop().is_none() {
+            return Err(PolicyRunError::RetainedReportBytesExceeded {
+                max: budget.max_retained_report_bytes(),
+            });
+        }
+        omitted += 1;
+        run.increment_omitted_findings();
+    }
+}
+
+#[test]
+fn retention_fallback_keeps_the_longest_fitting_prefix_of_many_findings() {
+    let source = "alpha();\n".repeat(120);
+    let budget = PolicyBudget::default();
+    let exact = classified_match_run(&source, budget);
+    assert_eq!(exact.findings().len(), 120);
+    let contributor = read_dependency_contributor();
+    let mut zero_detail = exact.clone();
+    let zero_attribution = ModelAttribution::from_full(vec![contributor.clone()], 0);
+    let marked = zero_detail
+        .take_findings()
+        .into_iter()
+        .map(|finding| {
+            finding
+                .with_model_attribution(Some(zero_attribution.clone()), &budget)
+                .unwrap()
+        })
+        .collect();
+    zero_detail.replace_findings(marked);
+    let full_size = zero_detail.retained_size();
+    // Budgets from "one byte short of every finding" down to "about a third
+    // of them" each need a different cut, and the cut must match the
+    // one-at-a-time reference exactly.
+    for shortfall in [1, 7, full_size / 20, full_size / 3, full_size * 2 / 3] {
+        let tight = PolicyBudget::builder()
+            .with_max_retained_report_bytes(full_size - shortfall)
+            .unwrap()
+            .build()
+            .unwrap();
+        let fitted = mark_approximate_family_run(exact.clone(), vec![contributor.clone()], &tight);
+        let reference = pop_until_the_marked_run_fits(exact.clone(), &contributor, &tight);
+        assert_eq!(fitted, reference, "shortfall {shortfall}");
+        let fitted = fitted.unwrap();
+        assert!(fitted.findings().len() < exact.findings().len());
+        assert_eq!(
+            fitted.work().omitted_findings_lower_bound(),
+            (exact.findings().len() - fitted.findings().len()) as u64,
+        );
+        assert!(
+            fitted
+                .findings()
+                .windows(2)
+                .all(|pair| pair[0].id() < pair[1].id())
+        );
+        assert!(fitted.retained_size() <= tight.max_retained_report_bytes());
+    }
+}
+
+#[test]
+fn invalid_model_attribution_propagates_instead_of_dropping_findings() {
+    let budget = PolicyBudget::default();
+    let exact = classified_match_run("alpha();\n", budget);
+    assert!(!exact.findings().is_empty());
+    let mut invalid = read_dependency_contributor();
+    invalid.selection_rule_id = "unknown-rule".to_owned();
+    let error = mark_approximate_family_run(exact, vec![invalid], &budget).unwrap_err();
+    assert!(
+        matches!(&error, PolicyRunError::ModelAttributionRejected(message)
+            if message.contains("InvalidModelAttribution")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn active_close_match_shard_marks_all_match_findings_and_keeps_completion() {
+    let budget = PolicyBudget::default();
+    let exact = classified_match_run("alpha();\nalpha();\n", budget);
+    let exact_pack = crate::test_support::exact_rust_dependency_snapshot();
+    let unchanged =
+        apply_approximate_family_backstop(exact.clone(), Some(exact_pack.as_ref()), &budget)
+            .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&unchanged).unwrap(),
+        serde_json::to_vec(&exact).unwrap(),
+        "loading an exact pack must not change finding bytes"
+    );
+    let snapshot = crate::test_support::close_match_snapshot();
+    let marked =
+        apply_approximate_family_backstop(exact.clone(), Some(snapshot.as_ref()), &budget).unwrap();
+    assert_eq!(marked.completion(), exact.completion());
+    assert_eq!(marked.findings().len(), exact.findings().len());
+    for (before, after) in exact.findings().iter().zip(marked.findings()) {
+        assert_eq!(before.id(), after.id());
+        let attribution = after
+            .model_attribution()
+            .expect("active shard marks finding");
+        assert_eq!(
+            attribution.contributors[0].role,
+            ModelAttributionRole::ReadDependency
+        );
+        assert_eq!(attribution.contributors[0].record_id, "active-pack");
+    }
+    let multi_y = crate::test_support::close_match_snapshot_with_versions(&["0.4.24", "0.4.25"]);
+    let marked_multi_y =
+        apply_approximate_family_backstop(exact, Some(multi_y.as_ref()), &budget).unwrap();
+    for finding in marked_multi_y.findings() {
+        let attribution = finding.model_attribution().unwrap();
+        assert_eq!(attribution.contributors.len(), 2);
+        assert_eq!(attribution.contributors[0].resolved, "0.4.24");
+        assert_eq!(attribution.contributors[1].resolved, "0.4.25");
+    }
 }
 
 fn policy_registry(identity: &str, source: &str) -> PolicyRegistry {
@@ -166,7 +692,12 @@ fn raw_taint_projection(
     let sink_identity = StableSemanticIdentity::analyzer_declaration_id(
         "typescript",
         WorkspaceRelativePath::new("app.ts").unwrap(),
-        format!("decl:v1:{:x}", sha2::Sha256::digest(sink_key.as_bytes())),
+        format!(
+            "decl:v1:{}",
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &sha2::Sha256::digest(sink_key.as_bytes()).into()
+            )
+        ),
     )
     .unwrap();
     let anchor = TaintFindingAnchor::strong(
@@ -204,6 +735,7 @@ fn raw_taint_projection(
         origins_truncated,
         witness_refs: Vec::new(),
         witness_refs_truncated: false,
+        model_attribution: None,
         report: crate::test_support::projected_finding_report(
             crate::test_support::policy_test_location("app.ts", 0, 1, 1),
             ProofReason::DataflowWitness,
@@ -220,6 +752,7 @@ struct FakeTaintAdapter {
     scenarios: Vec<SourceScenarioId>,
     origins_truncated: bool,
     completion: PolicyRunCompletion,
+    engine: Option<crate::taint_policy::TaintEngine>,
 }
 
 impl FakeTaintAdapter {
@@ -233,7 +766,13 @@ impl FakeTaintAdapter {
             scenarios,
             origins_truncated,
             completion: PolicyRunCompletion::Complete,
+            engine: None,
         }
+    }
+
+    fn with_engine(mut self, engine: crate::taint_policy::TaintEngine) -> Self {
+        self.engine = Some(engine);
+        self
     }
 }
 
@@ -249,7 +788,7 @@ impl TaintPolicyEvaluator for FakeTaintAdapter {
         _budget: &PolicyBudget,
     ) -> TaintProjectionPayload {
         TaintProjectionPayload {
-            engine: None,
+            engine: self.engine.clone(),
             scope: None,
             projections: vec![raw_taint_projection(
                 spec,
@@ -266,6 +805,162 @@ impl TaintPolicyEvaluator for FakeTaintAdapter {
     }
 }
 
+#[test]
+fn composed_taint_marks_all_findings_without_downgrading_complete_result() {
+    let (_temp, analyzer) = assembly_analyzer();
+    let registry = policy_registry("test:taint-compose-backstop", taint_policy_source());
+    let policy = registry.policies().next().unwrap();
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let context = PolicyEvaluationContext {
+        analyzer: &analyzer,
+        workspace: None,
+        flow_state: &flow_state,
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let scenarios = vec![SourceScenarioId::try_new("test", "composed").unwrap()];
+    let composed = FakeTaintAdapter::complete("sink-compose", scenarios.clone(), false)
+        .with_engine(crate::taint_policy::TaintEngine::Composition);
+    let exact = DefaultPolicyEvaluator::new()
+        .with_taint(&composed)
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert_eq!(exact.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(exact.findings().len(), 1);
+    let marked = DefaultPolicyEvaluator::new()
+        .with_taint(&composed)
+        .with_active_semantic_model_snapshot(Some(crate::test_support::close_match_snapshot()))
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert_eq!(marked.completion(), exact.completion());
+    assert_eq!(marked.findings()[0].id(), exact.findings()[0].id());
+    assert_eq!(
+        marked.findings()[0]
+            .model_attribution()
+            .unwrap()
+            .contributors[0]
+            .role,
+        ModelAttributionRole::ReadDependency,
+    );
+
+    // The IDE path is causal: loading an approximate pack without a selected
+    // approximate record does not mark this exact projected finding.
+    let icfg = FakeTaintAdapter::complete("sink-compose", scenarios, false).with_engine(
+        crate::taint_policy::TaintEngine::Icfg {
+            reason: "test fixture".into(),
+        },
+    );
+    let unmarked = DefaultPolicyEvaluator::new()
+        .with_taint(&icfg)
+        .with_active_semantic_model_snapshot(Some(crate::test_support::close_match_snapshot()))
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert_eq!(unmarked.completion(), exact.completion());
+    assert!(unmarked.findings()[0].model_attribution().is_none());
+}
+
+struct FailedBeforeProjectionTaintAdapter;
+
+impl crate::projection::sealed::TaintAdapter for FailedBeforeProjectionTaintAdapter {}
+
+impl TaintPolicyEvaluator for FailedBeforeProjectionTaintAdapter {
+    fn evaluate_taint(
+        &self,
+        _authority: &TaintProjectionAuthority,
+        _policy: &LoadedPolicy,
+        _spec: &ResolvedTaintPolicySpec,
+        _context: &PolicyEvaluationContext<'_>,
+        _budget: &PolicyBudget,
+    ) -> TaintProjectionPayload {
+        TaintProjectionPayload {
+            engine: None,
+            scope: None,
+            projections: Vec::new(),
+            completion: PolicyRunCompletion::Failed {
+                reasons: vec![PolicyFailureReason::InternalInvariant],
+            },
+            diagnostics: vec![internal_failure_diagnostic("taint evaluation stopped")],
+            diagnostics_truncated: false,
+            work: PolicyWorkReport::default(),
+            authored_arm_closures: Vec::new(),
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10047: a declared subset turned a failed policy run into an evaluator error"
+)]
+fn declared_subset_keeps_failed_match_and_taint_diagnostics() {
+    let match_registry = policy_registry(
+        "test:failed-declared-match",
+        r#"(policy :id "test.failed-declared-match" :name "Failed match"
+            :message "Match" :severity warning
+            :coverage (proven-subset :reason "Only direct calls")
+            :analysis (analysis :type match :selector
+                (rql (language typescript (call :callee (name "alpha"))))))"#,
+    );
+    let match_policy = match_registry.policies().next().unwrap();
+    let match_run = assemble_match_run(
+        match_policy,
+        failed_before_execution(
+            PolicyFailureReason::InternalInvariant,
+            "match query stopped before execution",
+            &PolicyBudget::default(),
+        ),
+        &[],
+        &[],
+        &PolicyBudget::default(),
+    )
+    .unwrap();
+    assert!(matches!(
+        match_run.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    assert_eq!(match_run.diagnostics().len(), 1);
+    assert_eq!(
+        match_run.diagnostics()[0].code(),
+        &PolicyDiagnosticCode::EvaluationFailure
+    );
+
+    let (_temp, analyzer) = assembly_analyzer();
+    let source = taint_policy_source().replace(
+        ":analysis (analysis",
+        ":coverage (proven-subset :reason \"Only modeled sources\")\n          :analysis (analysis",
+    );
+    let taint_registry = policy_registry("test:failed-declared-taint", &source);
+    let taint_policy = taint_registry.policies().next().unwrap();
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let context = PolicyEvaluationContext {
+        analyzer: &analyzer,
+        workspace: None,
+        flow_state: &flow_state,
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let taint_run = DefaultPolicyEvaluator::new()
+        .with_taint(&FailedBeforeProjectionTaintAdapter)
+        .evaluate(taint_policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert!(matches!(
+        taint_run.completion(),
+        PolicyRunCompletion::Failed { .. }
+    ));
+    assert_eq!(taint_run.diagnostics().len(), 1);
+    assert_eq!(
+        taint_run.diagnostics()[0].code(),
+        &PolicyDiagnosticCode::EvaluationFailure
+    );
+}
+
 struct IncompleteTypestateAdapter;
 
 impl crate::projection::sealed::TypestateAdapter for IncompleteTypestateAdapter {}
@@ -276,6 +971,7 @@ impl TypestatePolicyEvaluator for IncompleteTypestateAdapter {
         _policy: &LoadedPolicy,
         _spec: &ResolvedTypestatePolicySpec,
         _context: &PolicyEvaluationContext<'_>,
+        _subject_scope: brokk_bifrost_rql::structural::search::CodeQueryExecutionScope<'_>,
         _budget: &PolicyBudget,
     ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
         Err(TypestateCompilationFailure::incomplete_many_with_work(
@@ -325,6 +1021,7 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
                 cvss_overlays: &[],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )
@@ -348,6 +1045,50 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
         run.diagnostics()[0].impact(),
         PolicyDiagnosticImpact::RunIncomplete
     );
+}
+
+#[test]
+fn active_close_match_shard_preserves_typestate_completion_and_exact_only_bytes() {
+    let (_temp, analyzer) = assembly_analyzer();
+    let source = crate::test_support::typestate_policy_source(
+        "test.typestate-close-match",
+        "Typestate close match",
+    );
+    let registry = policy_registry("test:typestate-close-match", &source);
+    let policy = registry.policies().next().unwrap();
+    let adapter = IncompleteTypestateAdapter;
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let context = PolicyEvaluationContext {
+        analyzer: &analyzer,
+        workspace: None,
+        flow_state: &flow_state,
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let exact = DefaultPolicyEvaluator::new()
+        .with_typestate(&adapter)
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    let absent = DefaultPolicyEvaluator::new()
+        .with_typestate(&adapter)
+        .with_active_semantic_model_snapshot(None)
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&exact).unwrap(),
+        serde_json::to_vec(&absent).unwrap()
+    );
+
+    let marked = DefaultPolicyEvaluator::new()
+        .with_typestate(&adapter)
+        .with_active_semantic_model_snapshot(Some(crate::test_support::close_match_snapshot()))
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    assert_eq!(marked.completion(), exact.completion());
 }
 
 #[test]
@@ -396,6 +1137,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
             cvss_overlays: &[],
             organizational_risk: &[],
             incremental: None,
+            identifier_typos: None,
         },
         &PolicyBudget::default(),
     )
@@ -432,6 +1174,7 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let mut baseline_budget = PolicyBudget::default();
     let baseline = evaluator
@@ -473,6 +1216,109 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
             .iter()
             .all(|scenario| evidence.source_scenarios().contains(scenario))
     }));
+}
+
+#[test]
+fn taint_finding_that_fits_sheds_attribution_detail_instead_of_dropping() {
+    let (_temp, analyzer) = assembly_analyzer();
+    let registry = policy_registry("test:taint-assembly", taint_policy_source());
+    let policy = registry.policies().next().unwrap();
+    let authority = TaintProjectionAuthority::from_loaded(policy).unwrap();
+    let scenarios = vec![SourceScenarioId::try_new("test", "root").unwrap()];
+    let contributors = (0..3)
+        .map(|index| ModelAttributionContributor {
+            role: ModelAttributionRole::ReadDependency,
+            pack_digest: "a".repeat(64),
+            record_id: format!("active-pack-{index}-{}", "r".repeat(512)),
+            built_from: "0.8.1".to_owned(),
+            resolved: "0.8.2".to_owned(),
+            direction: "older_artifact".to_owned(),
+            mismatch_kinds: vec!["version_nearby".to_owned()],
+            selection_rule_id: "cargo-compatible-nearest".to_owned(),
+            selection_rule_version: 1,
+        })
+        .collect::<Vec<_>>();
+    let full = ModelAttribution::from_full(contributors, crate::MAX_MODEL_ATTRIBUTION_CONTRIBUTORS);
+    assert!(full.contributors_complete);
+    let zero_detail = full.without_detail();
+    assert!(zero_detail.approximate);
+    assert!(zero_detail.contributors.is_empty());
+    assert!(!zero_detail.contributors_complete);
+    assert_eq!(zero_detail.omitted_at_least, 3);
+    zero_detail.validate().unwrap();
+    let context = PolicyEvaluationContext {
+        analyzer: &analyzer,
+        workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let assemble = |attribution: Option<ModelAttribution>, budget: &PolicyBudget| {
+        let mut projection = raw_taint_projection(
+            policy.resolved_taint().unwrap(),
+            "sink-attribution",
+            scenarios.clone(),
+            false,
+        );
+        projection.pairs[0].model_attribution = attribution;
+        assemble_taint_projection_batch(
+            policy,
+            &authority,
+            authority.seal_batch(TaintProjectionPayload {
+                engine: None,
+                scope: None,
+                projections: vec![projection],
+                completion: PolicyRunCompletion::Complete,
+                diagnostics: Vec::new(),
+                diagnostics_truncated: false,
+                work: PolicyWorkReport::default(),
+                authored_arm_closures: Vec::new(),
+            }),
+            &context,
+            budget,
+        )
+        .unwrap()
+    };
+    let with_cap = |cap: usize| {
+        PolicyBudget::builder()
+            .with_max_evidence_bytes_per_finding(cap)
+            .unwrap()
+            .build()
+            .unwrap()
+    };
+    let unmarked = assemble(None, &PolicyBudget::default());
+    let base = &unmarked.findings()[0];
+    // Evidence selection depends on the cap, so find the smallest cap at which
+    // the unmarked finding survives instead of measuring it under another one.
+    let (mut low, mut high) = (0, 1 << 16);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if assemble(None, &with_cap(middle)).findings().is_empty() {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    // The finding fits with the zero-detail marker and not with the full list.
+    assert!(zero_detail.retained_size() < full.retained_size());
+    let budget = with_cap(low + zero_detail.retained_size());
+    assert_eq!(assemble(None, &budget).findings().len(), 1);
+    assert!(
+        base.clone()
+            .with_model_attribution(Some(full.clone()), &budget)
+            .unwrap_err()
+            .is_budget_limit_exceeded()
+    );
+    let run = assemble(Some(full), &budget);
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(run.work().omitted_findings_lower_bound(), 0);
+    assert_eq!(run.findings().len(), 1);
+    assert_eq!(run.findings()[0].id(), base.id());
+    assert_eq!(run.findings()[0].model_attribution(), Some(&zero_detail));
 }
 
 #[test]
@@ -520,6 +1366,7 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
             cvss_overlays: &[],
             organizational_risk: &overlays,
             incremental: None,
+            identifier_typos: None,
         },
         &budget,
     )
@@ -857,7 +1704,7 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
         withheld_rows_path: None,
     });
     assert!(certainty_reasons(std::slice::from_ref(&broad), &[]).is_empty());
-    assert!(incomplete_reasons(&CodeQueryCompletion::Complete, false).is_empty());
+    assert!(incomplete_reasons(&CodeQueryCompletion::Complete).is_empty());
     // A policy run drops the advisory entirely: it measures the execution that
     // raised it, and only a whole execution can raise it, so forwarding it
     // would make a sliced run and a full run differ in report bytes and at the
@@ -871,7 +1718,7 @@ fn broad_advisory_stays_complete_and_untruncated_capability_gap_is_inconclusive(
         codes: vec![CodeQueryDiagnosticCode::UnsupportedStructuralFeature],
     };
     assert_eq!(
-        incomplete_reasons(&completion, false),
+        incomplete_reasons(&completion),
         vec![PolicyIncompleteReason::CapabilityIncomplete]
     );
 }
@@ -1014,6 +1861,7 @@ fn rejected_detailed_row_does_not_hide_later_positive_candidates() {
 
     let adapted = adapt_match_candidates(
         &PolicyId::new("test.partial-row-conversion").expect("policy id"),
+        BindingOutputClass::DirectOnly,
         results.iter().map(UnitRowItem::project).collect(),
         evidence.iter().map(UnitRowEvidence::project).collect(),
         &query_diagnostics,
@@ -1055,6 +1903,7 @@ fn cancellation_after_query_rows_retains_partial_match_candidates() {
             let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
             let evaluated = evaluate_match_query_candidates(
                 &policy_id,
+                false,
                 &brokk_bifrost_flow::FlowWorkspaceState::default(),
                 &analyzer,
                 None,
@@ -1138,6 +1987,7 @@ export function invoke(service: Service) { service.run(); }
         let query = CodeQuery::from_json(&query).expect("query");
         let evaluated = evaluate_match_query_candidates(
             &policy_id,
+            false,
             &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &analyzer,
             None,
@@ -1177,6 +2027,7 @@ export function invoke(service: Service) { service.run(); }
     .expect("query");
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
+        false,
         &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &analyzer,
         None,
@@ -1197,6 +2048,12 @@ export function invoke(service: Service) { service.run(); }
 fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
     fn row(domain: DetailedCodeQueryDomain) -> (UnitRowItem, UnitRowEvidence) {
         let key = match domain {
+            DetailedCodeQueryDomain::DispatchTarget => DetailedCodeQueryKey::DispatchTarget {
+                id: "target-1".to_owned(),
+                site_id: "site-1".to_owned(),
+                root_id: "root-1".to_owned(),
+                ordinal: 0,
+            },
             DetailedCodeQueryDomain::CallShape => DetailedCodeQueryKey::CallShape {
                 id: "shape-1".to_owned(),
                 site_id: "site-1".to_owned(),
@@ -1248,13 +2105,23 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
     }
 
     let policy_id = PolicyId::new("test.source-backed-analysis-terminal").unwrap();
+    let dispatch_query = CodeQuery::from_sexp("(dispatch-targets (language rust (call)))")
+        .expect("source dispatch query");
+    assert!(executable_match_query(&dispatch_query, &PolicyBudget::default()).is_ok());
     for domain in [
+        DetailedCodeQueryDomain::DispatchTarget,
         DetailedCodeQueryDomain::CallShape,
         DetailedCodeQueryDomain::CallableSignature,
         DetailedCodeQueryDomain::SignatureParameter,
     ] {
         let (item, evidence) = row(domain);
-        let adapted = adapt_match_candidates(&policy_id, vec![item], vec![evidence], &[]);
+        let adapted = adapt_match_candidates(
+            &policy_id,
+            BindingOutputClass::DirectOnly,
+            vec![item],
+            vec![evidence],
+            &[],
+        );
         assert!(!adapted.conversion_failed, "{domain:?}");
         assert_eq!(adapted.candidates.len(), 1, "{domain:?}");
         assert!(adapted.incomplete_reasons.is_empty(), "{domain:?}");
@@ -1356,6 +2223,7 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 }],
             };
             let unit = UnitExecutionResult {
+                except_left_complete_empty: None,
                 rows: vec![UnitRow {
                     item,
                     evidence,
@@ -1364,6 +2232,8 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
                 work: Default::default(),
                 budgeted_work: Default::default(),
                 completion: CodeQueryCompletion::Complete,
+                depth_bound_status: None,
+                depth_answers: Vec::new(),
                 diagnostics: Vec::new(),
                 truncated: false,
             };
@@ -1488,6 +2358,24 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
         }
     }
 
+    let (item, evidence) = row(DetailedCodeQueryDomain::DispatchTarget);
+    let adapted = adapt_match_candidates(
+        &policy_id,
+        BindingOutputClass::DirectOnly,
+        vec![UnitRowItem {
+            range: None,
+            ..item
+        }],
+        vec![evidence],
+        &[],
+    );
+    assert!(adapted.candidates.is_empty());
+    assert!(
+        adapted
+            .incomplete_reasons
+            .contains(&PolicyIncompleteReason::CapabilityIncomplete)
+    );
+
     let (item, evidence) = row(DetailedCodeQueryDomain::CallableSignature);
     for (item, evidence) in [
         (
@@ -1512,7 +2400,13 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
             },
         ),
     ] {
-        let adapted = adapt_match_candidates(&policy_id, vec![item], vec![evidence], &[]);
+        let adapted = adapt_match_candidates(
+            &policy_id,
+            BindingOutputClass::DirectOnly,
+            vec![item],
+            vec![evidence],
+            &[],
+        );
         assert!(!adapted.conversion_failed);
         assert!(adapted.candidates.is_empty());
         assert!(
@@ -1527,7 +2421,13 @@ fn source_backed_analysis_terminals_require_exact_callable_row_evidence() {
         id: "parameter-1".to_owned(),
         signature_id: "signature-1".to_owned(),
     };
-    let adapted = adapt_match_candidates(&policy_id, vec![item], vec![evidence], &[]);
+    let adapted = adapt_match_candidates(
+        &policy_id,
+        BindingOutputClass::DirectOnly,
+        vec![item],
+        vec![evidence],
+        &[],
+    );
     assert!(adapted.conversion_failed);
     assert!(adapted.candidates.is_empty());
 }
@@ -1549,6 +2449,7 @@ fn generation_site_candidate_keeps_typed_identity_and_source_location() {
 
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
+        false,
         &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &analyzer,
         None,
@@ -1614,6 +2515,7 @@ const view = <div dangerouslySetInnerHTML={{ __html: value }} />;
 
     let evaluated = evaluate_match_query_candidates(
         &policy_id,
+        false,
         &brokk_bifrost_flow::FlowWorkspaceState::default(),
         &analyzer,
         None,
@@ -1682,7 +2584,13 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
                 range: call_range,
                 callee_range: call_range,
                 caller: declaration("<anonymous>", None),
-                callee: declaration("target", Some("function:target")),
+                callee: Some(declaration("target", Some("function:target"))),
+                target_id: None,
+                target_fq_name: None,
+                boundary_kind: None,
+                target_reason: None,
+                completeness: "complete",
+                coverage: "exhaustive",
                 // One of `call_site.call_kind`'s registered values: the row
                 // projection reads every field the domain declares, so a
                 // hand-built row must spell them as a real execution does.
@@ -1809,6 +2717,7 @@ fn cross_file_provenance_keeps_target_caller_and_callee_identities_distinct() {
         .expect("query");
         evaluate_match_query_candidates(
             &policy_id,
+            false,
             &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &analyzer,
             None,
@@ -2219,6 +3128,7 @@ fn configuration_fact_near_miss_axes_stay_clean_zeroes() {
         let query = CodeQuery::from_json(&filter).expect("near-miss query");
         let evaluated = evaluate_match_query_candidates(
             &policy_id,
+            false,
             &brokk_bifrost_flow::FlowWorkspaceState::default(),
             &analyzer,
             None,
@@ -2655,3 +3565,173 @@ fn modeled_python_ancestry_survives_unit_roundtrip_and_endpoint_free_projection(
 }
 
 use brokk_bifrost_cpp_analysis::analyzer::CppAnalyzer;
+#[test]
+fn declared_depth_completion_preserves_real_query_causes() {
+    let policy_id = PolicyId::new("test.depth-completion-precedence").unwrap();
+    let adapt = |status, query_completion| {
+        adapt_match_execution(
+            &policy_id,
+            BindingOutputClass::DirectOnly,
+            true,
+            Some(status),
+            Vec::new(),
+            Vec::new(),
+            &[],
+            query_completion,
+            CodeQueryExecutionWork::default(),
+            &PolicyBudget::default(),
+        )
+        .completion
+    };
+    for status in [DepthBoundStatus::Reached, DepthBoundStatus::Unknown] {
+        assert!(matches!(
+            adapt(status, CodeQueryCompletion::Complete),
+            PolicyRunCompletion::Inconclusive { reasons, .. }
+                if reasons.contains(&PolicyIncompleteReason::DepthBoundReached)
+        ));
+        assert!(matches!(
+            adapt(
+                status,
+                CodeQueryCompletion::Incomplete {
+                    codes: vec![CodeQueryDiagnosticCode::ResultLimitReached]
+                }
+            ),
+            PolicyRunCompletion::Inconclusive { reasons, .. }
+                if !reasons.contains(&PolicyIncompleteReason::DepthBoundReached)
+        ));
+        assert!(matches!(
+            adapt(status, CodeQueryCompletion::Invalid { codes: vec![] }),
+            PolicyRunCompletion::Failed { .. }
+        ));
+    }
+    assert_eq!(
+        adapt(DepthBoundStatus::NotReached, CodeQueryCompletion::Complete),
+        PolicyRunCompletion::Complete
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "dc6a9b891853: shared query products crossed policy depth-completion consumers"
+)]
+fn depth_consumer_keys_separate_shared_queries_in_both_orders() {
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::AnalyzerConfig;
+
+    let source = |id: &str, opted_in: bool| {
+        format!(
+            r#"(policy :schema-version 1 :id "{id}" :name "Depth consumer" :message "Caller" :severity warning
+        :analysis (analysis :type match {} :selector (rql :schema-version 1
+          (intersect
+            (callers :depth 1 :proof proven (enclosing-decl (language rust (function :name "target"))))
+            (enclosing-decl (language rust (function)))))))"#,
+            if opted_in {
+                ":completion (inconclusive-on [depth_bound_reached])"
+            } else {
+                ""
+            }
+        )
+    };
+    let off = crate::test_support::load_match_policy(&source("test.depth-consumer", false));
+    let on = crate::test_support::load_match_policy(&source("test.depth-consumer", true));
+    // Every persisted unit family, including prefix envelopes, owns the bit
+    // through this hash. Query text alone deliberately remains identical.
+    assert_ne!(off.semantic_hash(), on.semantic_hash());
+    assert_eq!(
+        match_policy_query(&off).unwrap().to_canonical_json(),
+        match_policy_query(&on).unwrap().to_canonical_json()
+    );
+    let off2 = crate::test_support::load_match_policy(&source("test.depth-consumer-off-2", false));
+    let on2 = crate::test_support::load_match_policy(&source("test.depth-consumer-on-2", true));
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub fn target() {} pub fn middle() { target(); } pub fn root() { middle(); }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let context = PolicyEvaluationContext {
+        analyzer: workspace.analyzer(),
+        workspace: Some(&workspace),
+        flow_state: &flow,
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let budget = PolicyBudget::default();
+    let query = executable_match_query(match_policy_query(&on).unwrap(), &budget).unwrap();
+    let solo = SubjectQueryBatch::new(workspace.analyzer(), [&on].into_iter(), &budget)
+        .execute(&query, &context, &budget, true);
+    assert_eq!(solo.depth_bound_status, Some(DepthBoundStatus::Reached));
+    for first in [false, true] {
+        let batch = SubjectQueryBatch::new(
+            workspace.analyzer(),
+            [&off, &on, &off2, &on2].into_iter(),
+            &budget,
+        );
+        let mut prior = [None, None];
+        for opted_in in [first, !first, first, !first] {
+            let rows = batch.execute(&query, &context, &budget, opted_in);
+            assert_eq!(
+                rows.depth_bound_status,
+                if opted_in {
+                    solo.depth_bound_status
+                } else {
+                    None
+                }
+            );
+            assert_eq!(rows.items.len(), solo.items.len());
+            assert_eq!(
+                rows.completion,
+                CodeQueryCompletion::Complete,
+                "{:?}",
+                rows.diagnostics
+            );
+            if let Some(previous) = &prior[usize::from(opted_in)] {
+                assert!(
+                    Arc::ptr_eq(previous, &rows),
+                    "same consumer reuses its product"
+                );
+            }
+            prior[usize::from(opted_in)] = Some(rows);
+        }
+        // The unit memo shares the same minimal (query, opt-in) owner.
+        let files = workspace.analyzer().analyzed_files();
+        for opted_in in [first, !first, first, !first] {
+            let shared = batch
+                .query_units(
+                    &query,
+                    workspace.analyzer(),
+                    Some(&workspace),
+                    budget.query_limits(),
+                    opted_in,
+                )
+                .unwrap();
+            let product = shared.execute(None, workspace.analyzer(), None, || {
+                execute_code_query_unit(
+                    workspace.analyzer(),
+                    &flow,
+                    Some(&workspace),
+                    &query,
+                    budget.query_limits(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(&files, &files)
+                        .with_depth_bound_status(opted_in),
+                )
+            });
+            assert_eq!(
+                product.depth_bound_status,
+                if opted_in {
+                    solo.depth_bound_status
+                } else {
+                    None
+                }
+            );
+            assert_eq!(product.depth_answers.is_empty(), !opted_in);
+        }
+    }
+}

@@ -8,11 +8,15 @@
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelProvenance,
     SemanticModelSymbol, SemanticModelSymbolKind, semantic_model_callable_family_id,
+    semantic_model_possible_callable_family_id,
 };
-use brokk_bifrost_analysis::analyzer::{CodeUnit, CodeUnitType, DescendantIndexScope, IAnalyzer};
+use brokk_bifrost_analysis::analyzer::{
+    CodeUnit, CodeUnitType, DescendantIndexScope, IAnalyzer, Language,
+};
+use brokk_bifrost_rql::query::plan_code_languages;
 use brokk_bifrost_rql::{
-    CallIdentity, CodeQuery, QueryStep, ResolvedCallIdentity, ResolvedCallIdentityKind,
-    ResolvedCallProof, ResolvedCallReceiverType,
+    CallIdentity, CodeQuery, CodeQueryPlanSource, InstantiatedType, QueryStep,
+    ResolvedCallIdentity, ResolvedCallIdentityKind, ResolvedCallProof, ResolvedCallReceiverType,
 };
 
 use super::definition::*;
@@ -146,6 +150,12 @@ enum ResolvedLocatorIdentity {
         identity: String,
         provenance: Box<SemanticModelProvenance>,
     },
+    /// The known members of a callable overload family that no active model
+    /// certifies complete (#10761).
+    PossibleSemanticModel {
+        identity: String,
+        provenance: Box<SemanticModelProvenance>,
+    },
 }
 
 impl ResolvedLocatorIdentity {
@@ -153,20 +163,37 @@ impl ResolvedLocatorIdentity {
         match self {
             Self::Workspace { .. } => ResolvedPolicyLocatorKind::WorkspaceDeclaration,
             Self::ActiveSemanticModel { .. } => ResolvedPolicyLocatorKind::ActiveSemanticModel,
+            Self::PossibleSemanticModel { .. } => ResolvedPolicyLocatorKind::PossibleSemanticModel,
         }
     }
 
     fn identity(&self) -> &str {
         match self {
-            Self::Workspace { identity, .. } => identity,
-            Self::ActiveSemanticModel { identity, .. } => identity,
+            Self::Workspace { identity, .. }
+            | Self::ActiveSemanticModel { identity, .. }
+            | Self::PossibleSemanticModel { identity, .. } => identity,
         }
     }
 
     fn provenance(&self) -> Option<SemanticModelProvenance> {
         match self {
             Self::Workspace { .. } => None,
-            Self::ActiveSemanticModel { provenance, .. } => Some((**provenance).clone()),
+            Self::ActiveSemanticModel { provenance, .. }
+            | Self::PossibleSemanticModel { provenance, .. } => Some((**provenance).clone()),
+        }
+    }
+}
+
+fn resolved_call_identity_kind(kind: ResolvedPolicyLocatorKind) -> ResolvedCallIdentityKind {
+    match kind {
+        ResolvedPolicyLocatorKind::WorkspaceDeclaration => {
+            ResolvedCallIdentityKind::WorkspaceDeclaration
+        }
+        ResolvedPolicyLocatorKind::ActiveSemanticModel => {
+            ResolvedCallIdentityKind::ActiveSemanticModel
+        }
+        ResolvedPolicyLocatorKind::PossibleSemanticModel => {
+            ResolvedCallIdentityKind::PossibleSemanticModel
         }
     }
 }
@@ -202,7 +229,24 @@ pub(super) fn resolve_policy_definition_locators(
             resolve_taint_set(&mut spec.transforms, locators)?;
             resolve_taint_set(&mut spec.external_models, locators)?;
             resolve_taint_entries(&mut spec.store_writes, locators)?;
-            resolve_taint_entries(&mut spec.store_reads, locators)
+            resolve_taint_entries(&mut spec.store_reads, locators)?;
+            if let Some(without) = &mut spec.without_flow {
+                resolve_taint_set(&mut without.sources, locators)?;
+                resolve_taint_set(&mut without.sanitizers, locators)?;
+                for entry in &mut without.sanitizers.entries {
+                    if let TaintSanitizerKind::Conditional { requires, .. } = &mut entry.kind {
+                        for item in requires {
+                            if let TaintSanitizerCondition::ResultOf(selector) = &mut item.condition
+                            {
+                                resolve_selector_locators(selector, locators)?;
+                            }
+                        }
+                    }
+                }
+                resolve_taint_set(&mut without.transforms, locators)?;
+                resolve_taint_set(&mut without.external_models, locators)?;
+            }
+            Ok(())
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &mut spec.subjects.entries {
@@ -435,9 +479,40 @@ pub(super) fn resolve_query_locators(
 ) -> Result<(), PolicySourceError> {
     let mut pending = vec![&mut query.plan];
     while let Some(plan) = pending.pop() {
+        // A step's rows come only from files in the languages its plan selects.
+        let languages = plan_code_languages(plan);
+        if let CodeQueryPlanSource::Seed(seed) = &mut plan.source {
+            for pattern in std::iter::once(&mut seed.root)
+                .chain(seed.inside.iter_mut())
+                .chain(seed.inside_decl.iter_mut())
+                .chain(seed.not_inside.iter_mut())
+            {
+                pattern.visit_qualifying_types_mut(&mut |ty| {
+                    resolve_query_type(ty, locators, &languages, resolved_locators)
+                })?;
+            }
+        }
         pending.extend(plan.source.child_plans_mut());
         for step in &mut plan.steps {
             match step {
+                QueryStep::ReferencesOf(filter)
+                | QueryStep::UsedBy(filter)
+                | QueryStep::Uses(filter) => {
+                    if let Some(enclosing) = &mut filter.enclosing {
+                        enclosing.pattern.visit_qualifying_types_mut(&mut |ty| {
+                            resolve_query_type(ty, locators, &languages, resolved_locators)
+                        })?;
+                        enclosing.canonical = enclosing.pattern.to_canonical_json();
+                    }
+                }
+                QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
+                    if let Some(enclosing) = &mut filter.enclosing {
+                        enclosing.pattern.visit_qualifying_types_mut(&mut |ty| {
+                            resolve_query_type(ty, locators, &languages, resolved_locators)
+                        })?;
+                        enclosing.canonical = enclosing.pattern.to_canonical_json();
+                    }
+                }
                 QueryStep::ResolvedCall(filter) => {
                     resolve_query_identity(
                         &mut filter.resolves_to,
@@ -445,6 +520,7 @@ pub(super) fn resolve_query_locators(
                         LocatorRole::Callable,
                         ReceiverTypeConstraintKind::Exact,
                         locators,
+                        &languages,
                         resolved_locators,
                     )?;
                     if let Some(receiver_type) = &mut filter.receiver_type {
@@ -455,6 +531,7 @@ pub(super) fn resolve_query_locators(
                                 LocatorRole::ReceiverType,
                                 ReceiverTypeConstraintKind::Exact,
                                 locators,
+                                &languages,
                                 resolved_locators,
                             )?,
                             ResolvedCallReceiverType::AssignableTo {
@@ -464,6 +541,7 @@ pub(super) fn resolve_query_locators(
                                 root,
                                 resolved_identities,
                                 locators,
+                                &languages,
                                 resolved_locators,
                             )?,
                         }
@@ -475,6 +553,7 @@ pub(super) fn resolve_query_locators(
                     LocatorRole::Value,
                     ReceiverTypeConstraintKind::Exact,
                     locators,
+                    &languages,
                     resolved_locators,
                 )?,
                 _ => {}
@@ -484,12 +563,145 @@ pub(super) fn resolve_query_locators(
     Ok(())
 }
 
+fn resolve_query_type(
+    ty: &mut InstantiatedType,
+    locators: LocatorResolution<'_>,
+    languages: &[Language],
+    resolved_locators: &mut Vec<ResolvedPolicyLocator>,
+) -> Result<(), PolicySourceError> {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        pending.extend(ty.arguments.iter_mut());
+        if let CallIdentity::Qualified {
+            resolved: Some(identity),
+            ..
+        } = &ty.identity
+        {
+            if ty.resolved_identities.is_empty() {
+                ty.resolved_identities.push(identity.clone());
+            }
+            continue;
+        }
+        let CallIdentity::Qualified {
+            value,
+            source_range,
+            ..
+        } = &ty.identity
+        else {
+            continue;
+        };
+        if !ty.resolved_identities.is_empty() || locators.is_deferred() {
+            continue;
+        }
+        let locator = PolicyLocator {
+            value: value.clone(),
+            range: source_range.clone().unwrap_or(0..0),
+        };
+        let resolved = match resolve_qualified_type_family(locators.analyzer(), &locator) {
+            Ok(resolved) => resolved,
+            Err(error) if locator_failure_is_inert(&error, locators, languages) => continue,
+            Err(error) => return Err(error),
+        };
+        for identity in resolved {
+            ty.resolved_identities.push(ResolvedCallIdentity {
+                kind: resolved_call_identity_kind(identity.kind()),
+                identity: identity.identity().to_owned(),
+            });
+            resolved_locators.push(ResolvedPolicyLocator {
+                role: LocatorRole::ReceiverType.public(),
+                kind: identity.kind(),
+                identity: identity.identity().to_owned(),
+                constraint: ReceiverTypeConstraintKind::Exact,
+                provenance: identity.provenance(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn resolve_qualified_type_family(
+    analyzer: Option<&dyn IAnalyzer>,
+    locator: &PolicyLocator,
+) -> Result<Vec<ResolvedLocatorIdentity>, PolicySourceError> {
+    let role = LocatorRole::ReceiverType;
+    let Some(analyzer) = analyzer else {
+        return Err(locator_error(
+            locator,
+            role,
+            LocatorFailure::Incomplete,
+            "no analyzer snapshot was supplied to the loaded-policy boundary",
+        ));
+    };
+    let QualifiedLocatorCandidates {
+        overlay: _,
+        source_matches,
+        source_identities,
+        model_records,
+    } = qualified_locator_candidates(analyzer, locator, role);
+    let (disposition, records) =
+        model_records.unwrap_or((SemanticModelOverlayDisposition::Empty, Vec::new()));
+    if source_identities.len() > 1
+        || (!source_identities.is_empty() && !records.is_empty())
+        || records.iter().any(|record| record.provenance.ambiguous)
+    {
+        return Err(locator_error(
+            locator,
+            role,
+            LocatorFailure::Ambiguous,
+            "qualifying type has conflicting source or model declarations",
+        ));
+    }
+    if matches!(disposition, SemanticModelOverlayDisposition::Open(_))
+        && (source_identities.is_empty() || !records.is_empty())
+    {
+        return Err(locator_error(
+            locator,
+            role,
+            LocatorFailure::Partial,
+            "active semantic-model inventory is incomplete",
+        ));
+    }
+    if records
+        .iter()
+        .any(|record| record.provenance.completeness != SemanticModelCompleteness::Complete)
+    {
+        return Err(locator_error(
+            locator,
+            role,
+            LocatorFailure::Partial,
+            "qualifying type declaration is partial",
+        ));
+    }
+    if !records.is_empty() {
+        return Ok(records
+            .into_iter()
+            .map(|record| ResolvedLocatorIdentity::ActiveSemanticModel {
+                identity: record.id.clone(),
+                provenance: Box::new(record.provenance.clone()),
+            })
+            .collect());
+    }
+    if let Some(root) = source_matches.into_iter().next() {
+        return Ok(vec![ResolvedLocatorIdentity::Workspace {
+            identity: root.declaration_id().to_string(),
+            root,
+        }]);
+    }
+    Err(locator_error(
+        locator,
+        role,
+        LocatorFailure::Zero,
+        "no canonical type declaration answered the locator",
+    ))
+}
+
 fn resolve_query_identity(
     locator: &mut CallIdentity,
     proof: ResolvedCallProof,
     role: LocatorRole,
     constraint: ReceiverTypeConstraintKind,
     locators: LocatorResolution<'_>,
+    languages: &[Language],
     resolved_locators: &mut Vec<ResolvedPolicyLocator>,
 ) -> Result<(), PolicySourceError> {
     let CallIdentity::Qualified {
@@ -516,12 +728,7 @@ fn resolve_query_identity(
     };
     let identity = match resolve_qualified_locator(locators.analyzer(), &policy_locator, role) {
         Ok(identity) => identity,
-        Err(error)
-            if matches!(locators, LocatorResolution::EndpointAnalyzer(_))
-                && is_qualified_locator_code(error.diagnostic.code) =>
-        {
-            return Ok(());
-        }
+        Err(error) if locator_failure_is_inert(&error, locators, languages) => return Ok(()),
         Err(error) => return Err(error),
     };
     if matches!(role, LocatorRole::Callable)
@@ -534,16 +741,8 @@ fn resolve_query_identity(
             "resolved-call :proof declared requires an active semantic-model callable, not a workspace declaration",
         ));
     }
-    let kind = match identity.kind() {
-        ResolvedPolicyLocatorKind::WorkspaceDeclaration => {
-            ResolvedCallIdentityKind::WorkspaceDeclaration
-        }
-        ResolvedPolicyLocatorKind::ActiveSemanticModel => {
-            ResolvedCallIdentityKind::ActiveSemanticModel
-        }
-    };
     *resolved = Some(ResolvedCallIdentity {
-        kind,
+        kind: resolved_call_identity_kind(identity.kind()),
         identity: identity.identity().to_owned(),
     });
     resolved_locators.push(ResolvedPolicyLocator {
@@ -560,6 +759,7 @@ fn resolve_query_receiver_family(
     root: &mut CallIdentity,
     resolved_identities: &mut Vec<String>,
     locators: LocatorResolution<'_>,
+    languages: &[Language],
     resolved_locators: &mut Vec<ResolvedPolicyLocator>,
 ) -> Result<(), PolicySourceError> {
     if matches!(
@@ -590,35 +790,17 @@ fn resolve_query_receiver_family(
     let identity =
         match resolve_qualified_locator(analyzer, &policy_locator, LocatorRole::ReceiverType) {
             Ok(identity) => identity,
-            Err(error)
-                if matches!(locators, LocatorResolution::EndpointAnalyzer(_))
-                    && is_qualified_locator_code(error.diagnostic.code) =>
-            {
-                return Ok(());
-            }
+            Err(error) if locator_failure_is_inert(&error, locators, languages) => return Ok(()),
             Err(error) => return Err(error),
         };
     *resolved_identities = match materialize_receiver_family(analyzer, &identity, &policy_locator) {
         Ok(identities) => identities,
-        Err(error)
-            if matches!(locators, LocatorResolution::EndpointAnalyzer(_))
-                && is_qualified_locator_code(error.diagnostic.code) =>
-        {
-            return Ok(());
-        }
+        Err(error) if locator_failure_is_inert(&error, locators, languages) => return Ok(()),
         Err(error) => return Err(error),
     };
     if let CallIdentity::Qualified { resolved, .. } = root {
-        let kind = match identity.kind() {
-            ResolvedPolicyLocatorKind::WorkspaceDeclaration => {
-                ResolvedCallIdentityKind::WorkspaceDeclaration
-            }
-            ResolvedPolicyLocatorKind::ActiveSemanticModel => {
-                ResolvedCallIdentityKind::ActiveSemanticModel
-            }
-        };
         *resolved = Some(ResolvedCallIdentity {
-            kind,
+            kind: resolved_call_identity_kind(identity.kind()),
             identity: identity.identity().to_owned(),
         });
     }
@@ -630,6 +812,33 @@ fn resolve_query_receiver_family(
         provenance: identity.provenance(),
     });
     Ok(())
+}
+
+/// Whether a qualified-locator failure leaves its query's answer unchanged, so
+/// the locator stays unresolved (it then matches nothing) instead of failing.
+///
+/// An endpoint lookup failure stays attached to its authored query. Otherwise
+/// a failure is inert only when the analyzer has no file in any language the
+/// locator's plan selects: that plan has no rows for the identity to filter,
+/// so the policy has no sites there and the missing identity cannot hide one.
+/// A run scoped to files of other languages usually also lacks the language's
+/// semantic models, so its locators resolve to nothing (#8854). The same
+/// failure where the analyzer holds a file of a selected language still fails.
+fn locator_failure_is_inert(
+    error: &PolicySourceError,
+    locators: LocatorResolution<'_>,
+    languages: &[Language],
+) -> bool {
+    if !is_qualified_locator_code(error.diagnostic.code) {
+        return false;
+    }
+    match locators {
+        LocatorResolution::EndpointAnalyzer(_) => true,
+        LocatorResolution::Analyzer(analyzer) => languages
+            .iter()
+            .all(|language| analyzer.analyzed_files_for_language(*language).is_empty()),
+        LocatorResolution::Required | LocatorResolution::Deferred => false,
+    }
 }
 
 fn materialize_receiver_family(
@@ -708,20 +917,23 @@ fn materialize_receiver_family(
     Ok(identities)
 }
 
-fn resolve_qualified_locator(
-    analyzer: Option<&dyn IAnalyzer>,
+struct QualifiedLocatorCandidates {
+    overlay: Option<
+        std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlay>,
+    >,
+    source_matches: Vec<CodeUnit>,
+    source_identities: Vec<String>,
+    model_records: Option<(
+        SemanticModelOverlayDisposition,
+        Vec<std::sync::Arc<SemanticModelSymbol>>,
+    )>,
+}
+
+fn qualified_locator_candidates(
+    analyzer: &dyn IAnalyzer,
     locator: &PolicyLocator,
     role: LocatorRole,
-) -> Result<ResolvedLocatorIdentity, PolicySourceError> {
-    let Some(analyzer) = analyzer else {
-        return Err(locator_error(
-            locator,
-            role,
-            LocatorFailure::Incomplete,
-            "no analyzer snapshot was supplied to the loaded-policy boundary",
-        ));
-    };
-
+) -> QualifiedLocatorCandidates {
     let source_matches = analyzer
         .get_definitions(&locator.value)
         .into_iter()
@@ -751,6 +963,35 @@ fn resolve_qualified_locator(
         (matched.disposition, records)
     });
 
+    QualifiedLocatorCandidates {
+        overlay,
+        source_matches,
+        source_identities,
+        model_records,
+    }
+}
+
+fn resolve_qualified_locator(
+    analyzer: Option<&dyn IAnalyzer>,
+    locator: &PolicyLocator,
+    role: LocatorRole,
+) -> Result<ResolvedLocatorIdentity, PolicySourceError> {
+    let Some(analyzer) = analyzer else {
+        return Err(locator_error(
+            locator,
+            role,
+            LocatorFailure::Incomplete,
+            "no analyzer snapshot was supplied to the loaded-policy boundary",
+        ));
+    };
+
+    let QualifiedLocatorCandidates {
+        overlay,
+        source_matches,
+        source_identities,
+        model_records,
+    } = qualified_locator_candidates(analyzer, locator, role);
+
     if source_identities.len() > 1 {
         return Err(locator_error(
             locator,
@@ -761,17 +1002,44 @@ fn resolve_qualified_locator(
     }
 
     if let Some((disposition, records)) = model_records {
+        // An open model can decide this locator only when no workspace
+        // declaration answers it or the part it read holds a candidate. One
+        // workspace identity with no answered candidate still resolves; the
+        // open lookup has already marked the query incomplete.
+        if matches!(disposition, SemanticModelOverlayDisposition::Open(_))
+            && (source_identities.is_empty() || !records.is_empty())
+        {
+            return Err(locator_error(
+                locator,
+                role,
+                LocatorFailure::Partial,
+                "active semantic-model inventory is incomplete".to_string(),
+            ));
+        }
         if matches!(role, LocatorRole::Callable)
             && records.len() > 1
             && source_identities.is_empty()
-            && let Some(identity) = semantic_model_callable_family_id(&records)
         {
-            let mut provenance = records[0].provenance.clone();
-            provenance.record_id = identity.clone();
-            return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
-                identity,
-                provenance: Box::new(provenance),
-            });
+            if let Some(identity) = semantic_model_callable_family_id(&records) {
+                let mut provenance = records[0].provenance.clone();
+                provenance.record_id = identity.clone();
+                return Ok(ResolvedLocatorIdentity::ActiveSemanticModel {
+                    identity,
+                    provenance: Box::new(provenance),
+                });
+            }
+            // One owner's overloads from one pack, none ambiguous, that no
+            // model certifies complete: the known members are a possible
+            // identity (#10761). Cross-pack, cross-owner and ambiguous
+            // records have none and stay ambiguous below.
+            if let Some(identity) = semantic_model_possible_callable_family_id(&records) {
+                let mut provenance = records[0].provenance.clone();
+                provenance.record_id = identity.clone();
+                return Ok(ResolvedLocatorIdentity::PossibleSemanticModel {
+                    identity,
+                    provenance: Box::new(provenance),
+                });
+            }
         }
         if records.iter().any(|record| record.provenance.ambiguous)
             || (disposition == SemanticModelOverlayDisposition::Conflict && records.len() > 1)
@@ -823,6 +1091,20 @@ fn resolve_qualified_locator(
                     .as_ref()
                     .and_then(|overlay| overlay.callable_family_id_for_symbol(record))
                 else {
+                    // A single known member of an uncertified family is a
+                    // possible identity, like several (#10761).
+                    if !record.provenance.ambiguous
+                        && let Some(identity) = overlay.as_ref().and_then(|overlay| {
+                            overlay.callable_possible_family_id_for_symbol(record)
+                        })
+                    {
+                        let mut provenance = record.provenance.clone();
+                        provenance.record_id = identity.clone();
+                        return Ok(ResolvedLocatorIdentity::PossibleSemanticModel {
+                            identity,
+                            provenance: Box::new(provenance),
+                        });
+                    }
                     return Err(locator_error(
                         locator,
                         role,

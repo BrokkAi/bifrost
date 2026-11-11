@@ -408,6 +408,8 @@ fn project_type<'tree>(
         }
     }
     types.push(TypeFact {
+        alias_target: None,
+        tuple_fields: None,
         implemented_traits_complete: false,
         generic_trait_impls_complete: false,
         jvm_inventory: None,

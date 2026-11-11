@@ -38,6 +38,8 @@ struct DeclaredCarrierSyntax {
 
 struct GoBarrierContext<'a> {
     analyzer: &'a dyn IAnalyzer,
+    snapshot:
+        Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
     state: brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo<
         GoBarrierState<'a>,
     >,
@@ -56,6 +58,7 @@ struct GoBarrierState<'a> {
 pub(crate) fn open(analyzer: &dyn IAnalyzer) -> Box<dyn ValueTypeBarrierContext + '_> {
     Box::new(GoBarrierContext {
         analyzer,
+        snapshot: super::selected_go_model_snapshot(analyzer),
         state: brokk_bifrost_analysis::analyzer::workspace_authority::CaptureScopedMemo::new(
             GoBarrierState {
                 analyzer,
@@ -77,6 +80,10 @@ impl ValueTypeBarrierContext for GoBarrierContext<'_> {
         observation: &BarrierObservation,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ObservedValueType, SemanticProviderError> {
+        let _model_scope = match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_compatible_selected_model_snapshot(self.analyzer, self.snapshot.clone()) {
+            Ok(scope) => scope,
+            Err(_) => return Ok(ObservedValueType::Undecided(IncompleteType)),
+        };
         self.state.read(
             &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self.analyzer),
             |state| state.observed_type(observation, request),
@@ -89,6 +96,10 @@ impl ValueTypeBarrierContext for GoBarrierContext<'_> {
         predicate: ValueTypePredicate,
         request: &mut SemanticRequest<'_>,
     ) -> Result<ValueTypeBarrierDecision, SemanticProviderError> {
+        let _model_scope = match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_compatible_selected_model_snapshot(self.analyzer, self.snapshot.clone()) {
+            Ok(scope) => scope,
+            Err(_) => return Ok(Undecided(IncompleteType)),
+        };
         self.state.read(
             &brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution(self.analyzer),
             |state| state.classify(observation, predicate, request),
@@ -423,13 +434,16 @@ impl GoBarrierState<'_> {
         let work = match &result {
             BoundedResolution::Cancelled { work }
             | BoundedResolution::Exceeded { work, .. }
+            | BoundedResolution::Unavailable { work, .. }
             | BoundedResolution::Complete { work, .. } => work,
         };
         request.budget.charge_work(SemanticWork {
-            events: work.scope_nodes,
+            events: work.scope_nodes.saturating_add(work.hierarchy_order_steps),
             ..Default::default()
         });
-        if !request.charge_execution_traversal(work.scope_nodes) {
+        if !request
+            .charge_execution_traversal(work.scope_nodes.saturating_add(work.hierarchy_order_steps))
+        {
             return Ok(Err(BudgetExceeded));
         }
         match result {
@@ -437,6 +451,7 @@ impl GoBarrierState<'_> {
             BoundedResolution::Exceeded { .. } => {
                 return Ok(Err(BudgetExceeded));
             }
+            BoundedResolution::Unavailable { .. } => return Ok(Err(IncompleteType)),
             BoundedResolution::Complete { value, .. } => {
                 // NoType is expected when following a selected declaration's type syntax.
                 if !matches!(

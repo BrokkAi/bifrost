@@ -16,6 +16,18 @@ pub type HashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
 #[cfg(feature = "randomized-hash")]
 pub type HashSet<T> = std::collections::HashSet<T>;
 
+/// Hash one value with the same fast hasher the maps above use, for a cache
+/// key that must not copy a large value. Stable within one process.
+pub fn hash_one<T: std::hash::Hash + ?Sized>(value: &T) -> u64 {
+    use std::hash::BuildHasher;
+    #[cfg(not(feature = "randomized-hash"))]
+    let hasher = rustc_hash::FxBuildHasher;
+    #[cfg(feature = "randomized-hash")]
+    let hasher =
+        std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+    hasher.hash_one(value)
+}
+
 pub fn map_with_capacity<K, V>(capacity: usize) -> HashMap<K, V> {
     HashMap::with_capacity_and_hasher(capacity, Default::default())
 }

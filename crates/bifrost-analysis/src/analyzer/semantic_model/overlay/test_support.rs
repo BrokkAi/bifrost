@@ -30,15 +30,25 @@ pub fn overlay(
 ) -> SemanticModelOverlay {
     super::composition::freeze_symbol_order(&mut symbols);
     super::composition::freeze_relation_order(relations.iter_mut());
+    let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_tests();
     let mut overlay = SemanticModelOverlay {
+        rust_reexport_roots: Default::default(),
+        rust_reexport_shards: Default::default(),
+        rust_reexport_published_roots: Default::default(),
         active_models: None,
+        rust_cargo_graph: None,
         row_source: None,
         selected_source: None,
         declared_type_names: Default::default(),
         active_model_set_hash: "test".to_string(),
-        model_member_cache: moka::sync::Cache::new(128),
-        model_result_cache: moka::sync::Cache::new(128),
+        model_member_cache: brokk_bifrost_core::budgeted_value_cache::BudgetedValueCache::new(
+            budget.region("analysis.model_member", Some(128)),
+        ),
+        model_result_cache: brokk_bifrost_core::budgeted_value_cache::BudgetedValueCache::new(
+            budget.region("analysis.model_result", Some(128)),
+        ),
         composition_diagnostics: Vec::new(),
+        charge: Default::default(),
         extraction_gaps: Vec::new(),
         extraction_gap_by_declaration: HashMap::default(),
         declaration_surface_languages: Vec::new(),
@@ -117,6 +127,7 @@ pub fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         pre_composition_qualified_name: None,
         semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
+        python_runtime_bases: None,
         non_overridable: None,
         ambient_use: None,
         id: format!("type.{qualified_name}"),
@@ -134,6 +145,10 @@ pub fn class(qualified_name: &str, language: &str) -> SemanticModelSymbol {
         declaration_is_abstract: false,
         declaration_is_sealed: false,
         callable_surface_complete: false,
+        source_completeness:
+            brokk_bifrost_semantic::analyzer::semantic_model::model::Completeness::Complete,
+        values_complete: false,
+        supertypes_complete: false,
         signature: None,
         structured_signature: None,
         has_explicit_type_terms: false,
@@ -182,6 +197,7 @@ pub fn method(
         pre_composition_qualified_name: None,
         semantic_contributors: Vec::new(),
         jvm_owner_family_enumerated: false,
+        python_runtime_bases: None,
         non_overridable: None,
         ambient_use: None,
         id: id.to_string(),
@@ -195,6 +211,10 @@ pub fn method(
         declaration_is_abstract: false,
         declaration_is_sealed: false,
         callable_surface_complete: false,
+        source_completeness:
+            brokk_bifrost_semantic::analyzer::semantic_model::model::Completeness::Complete,
+        values_complete: false,
+        supertypes_complete: false,
         signature: signature
             .as_ref()
             .map(|value| render_signature(name, value)),

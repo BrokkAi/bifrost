@@ -14,11 +14,15 @@ use crate::analyzer::java::*;
 
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 
+use crate::analyzer::java::unshadowed::{
+    EnclosingMemberType, UnshadowedScope, UseSite, enclosing_member_type,
+};
+use crate::analyzer::jvm::external::ExplicitImportHit;
 use crate::analyzer::jvm::external::JvmExternalDeclarations;
 
 use crate::analyzer::jvm::external::JvmExternalMember;
 
-use crate::analyzer::jvm::external::JvmExternalType;
+use crate::analyzer::jvm::external::QueryGapRecorder;
 
 use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
 
@@ -27,9 +31,9 @@ use brokk_bifrost_core::analyzer::structural::resolution::RejectionReason;
 use brokk_bifrost_analysis::analyzer::usages::get_definition::trace;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::java::graph_support::{
-    compute_java_relevant_imports, compute_java_same_package_reference_index,
+    JavaTypeName, compute_java_relevant_imports, compute_java_same_package_reference_index,
     java_could_import_file, java_could_import_file_without_source, java_same_package_fqn,
-    resolve_java_import_infos, resolve_java_type_name,
+    java_source_class_by_fqn, java_type_parameter_in_scope, resolve_java_import_infos,
 };
 use brokk_bifrost_jvm::java::imports::{non_static_import_path, static_import_path};
 use rayon::prelude::*;
@@ -38,7 +42,11 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JavaTypeResolution {
     Source(CodeUnit),
-    External(JvmExternalType),
+    /// An external type. Its witness, when it has one, proves that no missing
+    /// dependency jar can change what the name means (see
+    /// [`UnshadowedScope`]); member lookups on it then record only the gaps not
+    /// attributed to a dependency artifact.
+    External(ExplicitImportHit),
 }
 
 impl ImportAnalysisProvider for JavaAnalyzer {
@@ -54,14 +62,19 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        Arc::new(
-            self.resolve_imports(token, file)
-                .values()
-                .cloned()
-                .collect(),
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+            || -> HashSet<CodeUnit> {
+                let scope = AnalyzerQueryScope::new(self);
+                let token = scope.token();
+                self.resolve_imports(token, file)
+                    .values()
+                    .cloned()
+                    .collect()
+            },
         )
     }
 
@@ -619,7 +632,30 @@ impl JavaAnalyzer {
         file: &ProjectFile,
     ) -> HashMap<String, CodeUnit> {
         let imports = self.inner.import_info_of(token, file);
-        self.resolve_import_infos(token, &imports)
+        let resolved = self.resolve_import_infos(token, &imports);
+        // The memo above answers from workspace sources only. A single-type
+        // import that no workspace class satisfies is an entry a missing
+        // dependency jar could satisfy: it may hold the class, or a class
+        // whose member the path names, so the alternative package-prefix
+        // splits stay open. A `java.*` path is not such an entry, because no
+        // jar can supply or split a `java.*` package. The index's gaps are
+        // recorded here, in the fill, so a reader of this file's imports gets
+        // them from the memo's receipt and only a file that writes such an
+        // entry pays for them (#10470).
+        let open_entry = imports.iter().any(|import| {
+            !import.is_wildcard
+                && non_static_import_path(import).is_some_and(|path| {
+                    path.segments.first().is_some_and(|first| first != "java")
+                        && import
+                            .identifier
+                            .as_deref()
+                            .is_none_or(|identifier| !resolved.contains_key(identifier))
+                })
+        });
+        if open_entry {
+            QueryGapRecorder::new(self).all(&self.external_declaration_index());
+        }
+        resolved
     }
 
     pub(crate) fn resolve_import_infos(
@@ -661,69 +697,112 @@ impl JavaAnalyzer {
         raw_name: &str,
         selected_jdk_artifact_sha256: Option<&str>,
     ) -> Option<JavaTypeResolution> {
-        let normalized = raw_name.trim();
-        if normalized.is_empty() {
-            return None;
-        }
+        let name = JavaTypeName::from_normalized_spelling(raw_name)?;
+        self.resolve_type_name_at(
+            token,
+            packs,
+            file,
+            &name,
+            selected_jdk_artifact_sha256,
+            None,
+        )
+    }
 
-        if let Some(code_unit) = resolve_java_type_name(self, token, file, normalized) {
-            return Some(JavaTypeResolution::Source(code_unit));
-        }
-
-        let external = match selected_jdk_artifact_sha256 {
-            Some(digest) => self.external_declarations_for_source_jdk(packs, digest),
-            None => self.external_declarations(packs),
-        };
-        if external.is_empty() {
-            return None;
-        }
-
-        let access_package = self.package_name_of(file).unwrap_or_default();
-        if normalized.contains('.')
-            && let Some(external_type) =
-                external.resolve_qualified_name(normalized, &access_package)
-        {
-            return Some(JavaTypeResolution::External(external_type));
-        }
-
-        if let Some(external_type) =
-            self.resolve_external_imports(token, &external, file, normalized, &access_package)
-        {
-            return Some(JavaTypeResolution::External(external_type));
-        }
-
-        if let Some((first, rest)) = normalized.split_once('.')
-            && let Some(owner) = self.resolve_visible_external_simple_type(
-                token,
-                &external,
-                file,
-                first,
-                &access_package,
-            )
-        {
-            let nested_fqn = format!("{}.{}", owner.fqn(), rest);
-            if let Some(external_type) =
-                external.resolve_qualified_name(&nested_fqn, &access_package)
-            {
-                return Some(JavaTypeResolution::External(external_type));
+    /// Resolve a written type name through one ladder in Java's order (JLS 6.4.1
+    /// and 6.5.2).
+    ///
+    /// The first segment of the name is bound first, by: single-type imports
+    /// (a single-static-import of a member type counts as one), then types of
+    /// the same package, then one on-demand tier that holds every on-demand
+    /// import, every static-import-on-demand's member types and `java.lang`.
+    /// When the first segment names a type, the rest of the name is a chain of
+    /// member types of that type, and the package-qualified reading is not
+    /// attempted: Java does not consider it. When the first segment names no
+    /// type, the whole name is read as a package-qualified type.
+    ///
+    /// Three outcomes end the ladder with no resolution, because the code knows
+    /// that a lower tier's answer would be wrong or undecided: a single-type
+    /// import that binds the name but whose target nothing supplies (a bound
+    /// miss), two single-type imports or two on-demand candidates that bind
+    /// different types (an ambiguity, a compile error), and an inherited member
+    /// type that the ladder cannot resolve. Each records every gap the index
+    /// carries and an independent reason, because the index has nothing to say
+    /// when every dependency is present, and incompleteness and ambiguity must
+    /// be reported.
+    ///
+    /// This differs on purpose from a supertype the index cannot inspect (it
+    /// comes from a missing jar). That supertype only might declare a competing
+    /// binding, so the best structured target is still returned, with every gap
+    /// recorded. Turning "might shadow" into a stop, or "known to shadow" into
+    /// a best-effort target, would each lose information.
+    ///
+    /// Every external lookup in the ladder, `java.lang` included, records every
+    /// gap: a name found through the implicit import is hidden by a same-package
+    /// type, and a non-JDK package can be split across jars, so no missing jar
+    /// can be ruled out without a classpath model.
+    pub(crate) fn resolve_type_name_at(
+        &self,
+        token: QueryToken<'_>,
+        packs: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        file: &ProjectFile,
+        name: &JavaTypeName,
+        selected_jdk_artifact_sha256: Option<&str>,
+        site: Option<&UseSite<'_>>,
+    ) -> Option<JavaTypeResolution> {
+        match self.resolve_type_name_outcome_at(
+            token,
+            packs,
+            file,
+            name,
+            selected_jdk_artifact_sha256,
+            site,
+        ) {
+            TypeNameOutcome::Resolved(resolution) => Some(resolution),
+            TypeNameOutcome::BoundMiss | TypeNameOutcome::Stopped | TypeNameOutcome::Unbound => {
+                None
             }
         }
+    }
 
-        let same_package = java_same_package_fqn(self, file, normalized);
-        if let Some(external_type) = external.resolve_same_package(&access_package, normalized) {
-            return Some(JavaTypeResolution::External(external_type));
-        }
-
-        if same_package != normalized
-            && let Some(external_type) =
-                external.resolve_qualified_name(&same_package, &access_package)
-        {
-            return Some(JavaTypeResolution::External(external_type));
-        }
-
-        external
-            .resolve_java_lang(normalized)
-            .map(JavaTypeResolution::External)
+    /// [`Self::resolve_type_name_at`] with the reason a name did not resolve: the
+    /// ladder stopped on a bound miss, an ambiguity or an unresolved inherited
+    /// member type (and recorded why), or nothing binds the name.
+    pub(crate) fn resolve_type_name_outcome_at(
+        &self,
+        token: QueryToken<'_>,
+        packs: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        file: &ProjectFile,
+        name: &JavaTypeName,
+        selected_jdk_artifact_sha256: Option<&str>,
+        site: Option<&UseSite<'_>>,
+    ) -> TypeNameOutcome {
+        let external = match selected_jdk_artifact_sha256 {
+            Some(digest) => self.external_declarations_for_source_jdk(packs.clone(), digest),
+            None => self.external_declarations(packs.clone()),
+        };
+        let recorder = QueryGapRecorder::new(self);
+        // An empty surface exits only the external tiers: a source-only project
+        // still resolves its workspace names.
+        let surface_empty = external.empty_surface(&recorder);
+        let access_package = self.package_name_of(file).unwrap_or_default();
+        let ladder = TypeLadder {
+            java: self,
+            token,
+            packs,
+            selected_jdk_artifact_sha256,
+            file,
+            external: &external,
+            recorder: &recorder,
+            access_package: &access_package,
+            surface_empty,
+            imports: self.inner.import_info_of(token, file),
+            site,
+        };
+        ladder.resolve(name)
     }
 
     /// The FQN a file's explicit non-static single-type import binds to
@@ -750,6 +829,14 @@ impl JavaAnalyzer {
         for import in self.inner.import_info_of(token, file) {
             if import.is_wildcard {
                 continue;
+            }
+            // A single-static-import of the name may bind a member type instead
+            // of the single-type import (JLS 6.4.1), so the name has no single
+            // file-local owner.
+            if import.identifier.as_deref() == Some(simple_name)
+                && static_import_path(&import).is_some()
+            {
+                return None;
             }
             let Some(import_path) = non_static_import_path(&import) else {
                 continue;
@@ -807,6 +894,63 @@ impl JavaAnalyzer {
         raw_name: &str,
         selected_jdk_artifact_sha256: Option<&str>,
     ) -> Option<JvmExternalMember> {
+        self.resolve_member_name_at(
+            token,
+            packs,
+            file,
+            raw_name,
+            selected_jdk_artifact_sha256,
+            None,
+        )
+    }
+
+    /// The member `member_name` of an owner the type ladder already resolved. A
+    /// witness-backed owner records only the gaps not attributed to a dependency
+    /// artifact; any other owner records every gap.
+    pub(crate) fn resolve_member_of_hit(
+        &self,
+        packs: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        file: &ProjectFile,
+        owner: &ExplicitImportHit,
+        member_name: &str,
+        selected_jdk_artifact_sha256: Option<&str>,
+    ) -> Option<JvmExternalMember> {
+        let external = match selected_jdk_artifact_sha256 {
+            Some(digest) => self.external_declarations_for_source_jdk(packs, digest),
+            None => self.external_declarations(packs),
+        };
+        let recorder = QueryGapRecorder::new(self);
+        let access_package = self.package_name_of(file).unwrap_or_default();
+        match owner.witness() {
+            Some(witness) => external.resolve_member_of_unshadowed_owner(
+                &recorder,
+                witness,
+                member_name,
+                &access_package,
+            ),
+            None => {
+                external.resolve_member_of_owner(&recorder, owner, member_name, &access_package)
+            }
+        }
+    }
+
+    /// Resolve `Owner.member`. The owner is resolved through the type ladder at
+    /// `site`; when that gives a witness-backed owner, the member lookup records
+    /// only the gaps not attributed to a dependency artifact, and otherwise it
+    /// records every gap.
+    pub(crate) fn resolve_member_name_at(
+        &self,
+        token: QueryToken<'_>,
+        packs: Option<
+            Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+        >,
+        file: &ProjectFile,
+        raw_name: &str,
+        selected_jdk_artifact_sha256: Option<&str>,
+        site: Option<&UseSite<'_>>,
+    ) -> Option<JvmExternalMember> {
         let normalized = raw_name.trim();
         if normalized.is_empty() {
             return None;
@@ -815,90 +959,471 @@ impl JavaAnalyzer {
             Some(digest) => self.external_declarations_for_source_jdk(packs.clone(), digest),
             None => self.external_declarations(packs.clone()),
         };
-        if external.is_empty() {
+        let recorder = QueryGapRecorder::new(self);
+        if external.empty_surface(&recorder) {
             return None;
         }
         let access_package = self.package_name_of(file).unwrap_or_default();
-        external.resolve_member_spelling(normalized, &access_package, |owner_spelling| {
-            match self.resolve_type_name_with_selected_jdk(
-                token,
-                packs,
-                file,
-                owner_spelling,
-                selected_jdk_artifact_sha256,
-            ) {
-                Some(JavaTypeResolution::External(external_type)) => Some(external_type),
-                Some(JavaTypeResolution::Source(_)) | None => None,
+        // `Owner.member` is a canonical or already-normalized spelling: the
+        // member is its last segment and the owner is read as a type name.
+        let (owner_spelling, member_name) = normalized.rsplit_once('.')?;
+        if member_name.is_empty() {
+            return None;
+        }
+        let owner = JavaTypeName::from_normalized_spelling(owner_spelling)?;
+        let JavaTypeResolution::External(hit) = self.resolve_type_name_at(
+            token,
+            packs,
+            file,
+            &owner,
+            selected_jdk_artifact_sha256,
+            site,
+        )?
+        else {
+            return None;
+        };
+        match hit.witness() {
+            Some(witness) => external.resolve_member_of_unshadowed_owner(
+                &recorder,
+                witness,
+                member_name,
+                &access_package,
+            ),
+            None => external.resolve_member_of_owner(&recorder, &hit, member_name, &access_package),
+        }
+    }
+}
+
+/// What the type ladder made of a written name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypeNameOutcome {
+    Resolved(JavaTypeResolution),
+    /// A single-type import binds the name and nothing supplies its target. The
+    /// import still names the type structurally, so a caller may read the
+    /// import's canonical name; no lower tier may answer. The index's gaps and
+    /// the independent reason are already recorded.
+    BoundMiss,
+    /// The name is bound to something the ladder cannot name: an ambiguity, or
+    /// an inherited member type or type parameter that shadows every import. No
+    /// caller may name a type for it. The index's gaps and the independent
+    /// reason are already recorded.
+    Stopped,
+    /// Nothing binds the name as a type.
+    Unbound,
+}
+
+impl TypeNameOutcome {
+    fn from_option(resolution: Option<JavaTypeResolution>) -> Self {
+        resolution.map_or(Self::Unbound, Self::Resolved)
+    }
+}
+
+/// What binding one simple name found.
+enum NameBinding {
+    Hit(JavaTypeResolution),
+    BoundMiss,
+    /// The name is bound, but not to anything the ladder can name. The index's
+    /// gaps and the independent reason are already recorded.
+    Stopped,
+    /// No scope, import, package or on-demand tier binds the name as a type.
+    Unbound,
+}
+
+/// One type-name lookup's state: what the ladder reads at every tier.
+struct TypeLadder<'a, 'q> {
+    java: &'a JavaAnalyzer,
+    token: QueryToken<'q>,
+    packs: Option<
+        Arc<brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay>,
+    >,
+    selected_jdk_artifact_sha256: Option<&'a str>,
+    file: &'a ProjectFile,
+    external: &'a JvmExternalDeclarations<'a>,
+    recorder: &'a QueryGapRecorder<'a>,
+    access_package: &'a str,
+    surface_empty: bool,
+    imports: Vec<ImportInfo>,
+    /// Where the name is written, when the caller holds a node. Without it the
+    /// ladder cannot read lexical scope, so it never applies the reduced gap
+    /// rule and every external lookup records every gap.
+    site: Option<&'a UseSite<'q>>,
+}
+
+fn resolution_fqn(resolution: &JavaTypeResolution) -> String {
+    match resolution {
+        JavaTypeResolution::Source(unit) => unit.fq_name(),
+        JavaTypeResolution::External(external_type) => external_type.fqn().to_owned(),
+    }
+}
+
+impl TypeLadder<'_, '_> {
+    fn resolve(&self, name: &JavaTypeName) -> TypeNameOutcome {
+        let owner = match self.bind(name.first()) {
+            NameBinding::Hit(owner) => owner,
+            NameBinding::BoundMiss => return TypeNameOutcome::BoundMiss,
+            NameBinding::Stopped => return TypeNameOutcome::Stopped,
+            NameBinding::Unbound if name.is_dotted() => {
+                return TypeNameOutcome::from_option(self.package_qualified(name));
             }
-        })
+            NameBinding::Unbound => return TypeNameOutcome::Unbound,
+        };
+        TypeNameOutcome::from_option(
+            name.rest()
+                .iter()
+                .try_fold(owner, |owner, segment| self.member_type(&owner, segment)),
+        )
     }
 
-    fn resolve_visible_external_simple_type(
-        &self,
-        token: QueryToken<'_>,
-        external: &JvmExternalDeclarations<'_>,
-        file: &ProjectFile,
-        name: &str,
-        access_package: &str,
-    ) -> Option<JvmExternalType> {
-        if let Some(external_type) =
-            self.resolve_external_imports(token, external, file, name, access_package)
+    /// The whole name read as `package.Type` (or `package.Type.Member`), which
+    /// is the reading Java takes only when the first segment names no type.
+    fn package_qualified(&self, name: &JavaTypeName) -> Option<JavaTypeResolution> {
+        let fqn = name.render();
+        if let Some(unit) = java_source_class_by_fqn(self.java, self.token, &fqn) {
+            return Some(JavaTypeResolution::Source(unit));
+        }
+        if self.surface_empty {
+            return None;
+        }
+        self.external
+            .resolve_qualified_name(self.recorder, &fqn, self.access_package)
+            .map(|found| JavaTypeResolution::External(found.into()))
+    }
+
+    fn member_type(&self, owner: &JavaTypeResolution, name: &str) -> Option<JavaTypeResolution> {
+        let fqn = format!("{}.{name}", resolution_fqn(owner));
+        match owner {
+            JavaTypeResolution::Source(_) => java_source_class_by_fqn(self.java, self.token, &fqn)
+                .map(JavaTypeResolution::Source),
+            JavaTypeResolution::External(_) if self.surface_empty => None,
+            JavaTypeResolution::External(_) => self
+                .external
+                .resolve_qualified_name(self.recorder, &fqn, self.access_package)
+                .map(|found| JavaTypeResolution::External(found.into())),
+        }
+    }
+
+    fn bind(&self, name: &str) -> NameBinding {
+        // A class or method type parameter in scope is not a class, and it
+        // shadows every import (JLS 6.4.1).
+        if let Some(site) = self.site
+            && java_type_parameter_in_scope(site.node, site.source, name).is_some()
         {
-            return Some(external_type);
+            return NameBinding::Stopped;
         }
-
-        external
-            .resolve_same_package(access_package, name)
-            .or_else(|| external.resolve_java_lang(name))
+        // The workspace path checks local and declared enclosing types before
+        // reaching this fallback ladder. Read member evidence only here, after
+        // those scope answers, but before any import lookup records a stop or
+        // gaps. Declared and inherited member types shadow every import tier.
+        if let Some(site) = self.site {
+            match enclosing_member_type(
+                self.java,
+                self.packs.clone(),
+                self.selected_jdk_artifact_sha256,
+                self.external,
+                self.file,
+                site,
+                name,
+            ) {
+                EnclosingMemberType::None => {}
+                EnclosingMemberType::Declared(unit) => {
+                    return NameBinding::Hit(JavaTypeResolution::Source(unit));
+                }
+                EnclosingMemberType::Inherited { enclosing } => {
+                    self.external.record_all_gaps(self.recorder);
+                    self.report(format!(
+                        "jvm.member_type.inherited_unresolved: {name} in {enclosing}"
+                    ));
+                    return NameBinding::Stopped;
+                }
+            }
+        }
+        self.bind_single_type_imports(name)
+            .or_else(|| self.same_package(name).map(NameBinding::Hit))
+            .unwrap_or_else(|| self.bind_on_demand(name))
     }
 
-    fn resolve_external_imports(
-        &self,
-        token: QueryToken<'_>,
-        external: &JvmExternalDeclarations<'_>,
-        file: &ProjectFile,
-        name: &str,
-        access_package: &str,
-    ) -> Option<JvmExternalType> {
-        for import in self.inner.import_info_of(token, file) {
-            let Some(import_path) = non_static_import_path(&import) else {
-                continue;
-            };
+    /// The type a canonical name denotes: a workspace class, else an external
+    /// declaration.
+    fn canonical_type(&self, fqn: &str) -> Option<JavaTypeResolution> {
+        if let Some(unit) = java_source_class_by_fqn(self.java, self.token, fqn) {
+            return Some(JavaTypeResolution::Source(unit));
+        }
+        if self.surface_empty {
+            return None;
+        }
+        self.external
+            .resolve_explicit_import(self.recorder, fqn, self.access_package)
+            .map(|found| JavaTypeResolution::External(found.into()))
+    }
 
-            if !import.is_wildcard {
-                if import.identifier.as_deref() == Some(name)
-                    && let Some(external_type) = external
-                        .resolve_explicit_import(&import_path.render_segments("."), access_package)
-                {
-                    return Some(external_type);
+    /// The type a single-type import of `canonical` binds to `name`: a
+    /// workspace class, else an external declaration.
+    ///
+    /// When the use site is known and nothing in scope can shadow the name, the
+    /// external lookup records only the gaps not attributed to a dependency
+    /// artifact for a JDK type in an unshadowable package.
+    fn single_type_import_target(&self, name: &str, canonical: &str) -> Option<JavaTypeResolution> {
+        if let Some(unit) = java_source_class_by_fqn(self.java, self.token, canonical) {
+            return Some(JavaTypeResolution::Source(unit));
+        }
+        if self.surface_empty {
+            return None;
+        }
+        let scope = self.site.and_then(|site| {
+            UnshadowedScope::check(
+                self.java,
+                self.packs.clone(),
+                self.selected_jdk_artifact_sha256,
+                self.external,
+                self.file,
+                site,
+                name,
+            )
+        });
+        match scope {
+            Some(scope) => self.external.resolve_explicit_import_in_unshadowed_scope(
+                self.recorder,
+                canonical,
+                self.access_package,
+                scope,
+            ),
+            None => self
+                .external
+                .resolve_explicit_import(self.recorder, canonical, self.access_package)
+                .map(ExplicitImportHit::from),
+        }
+        .map(JavaTypeResolution::External)
+    }
+
+    /// The single-type import tier. `None` means no single-type import binds
+    /// the name, so lower tiers apply.
+    ///
+    /// Non-static imports are compared by canonical name from the source alone,
+    /// with no index lookup: JLS 7.5.1 makes two single-type imports of
+    /// different types with one simple name a compile error, whatever the class
+    /// path holds. A single-static-import of a member type is different. Two
+    /// spellings can name one inherited member type (`import static p.A.X;` and
+    /// `import static p.B.X;` when `B extends A` and `A` declares `X`), so each
+    /// is resolved to its declaring type and compared by declaration. A static
+    /// import whose declaring type cannot be resolved is a bound miss, not a
+    /// distinct type, and one whose declaring type has no member type of that
+    /// name names a method or a field and binds no type.
+    ///
+    /// Outcomes have a fixed precedence: an ambiguity, then a bound miss, then
+    /// a hit.
+    fn bind_single_type_imports(&self, name: &str) -> Option<NameBinding> {
+        let mut canonical_names = Vec::<String>::new();
+        let mut static_paths = Vec::new();
+        for import in &self.imports {
+            if import.is_wildcard || import.identifier.as_deref() != Some(name) {
+                continue;
+            }
+            if let Some(path) = non_static_import_path(import) {
+                let canonical = path.render_segments(".");
+                if !canonical_names.contains(&canonical) {
+                    canonical_names.push(canonical);
                 }
+            } else if let Some(path) = static_import_path(import) {
+                static_paths.push(path);
+            }
+        }
+        if canonical_names.is_empty() && static_paths.is_empty() {
+            return None;
+        }
+        canonical_names.sort_unstable();
+        if canonical_names.len() >= 2 {
+            let candidates = canonical_names
+                .iter()
+                .map(|canonical| self.canonical_type(canonical))
+                .collect::<Vec<_>>();
+            return Some(self.stop_ambiguous(&canonical_names, &candidates));
+        }
+
+        let mut resolved = Vec::<JavaTypeResolution>::new();
+        // Each unresolved candidate: its rendered path, and whether it is a
+        // `java.*` path.
+        let mut unresolved = Vec::<(String, bool)>::new();
+        let mut keep = |candidate: JavaTypeResolution| {
+            let fqn = resolution_fqn(&candidate);
+            if !resolved.iter().any(|known| resolution_fqn(known) == fqn) {
+                resolved.push(candidate);
+            }
+        };
+        for canonical in &canonical_names {
+            match self.single_type_import_target(name, canonical) {
+                Some(candidate) => keep(candidate),
+                None => unresolved.push((canonical.clone(), canonical.starts_with("java."))),
+            }
+        }
+        for path in static_paths {
+            let Some((member, declaring_segments)) = path.segments.split_last() else {
                 continue;
+            };
+            debug_assert_eq!(member, name);
+            match self.canonical_type(&declaring_segments.join(".")) {
+                None => unresolved.push((
+                    path.render_segments("."),
+                    declaring_segments
+                        .first()
+                        .is_some_and(|first| first == "java"),
+                )),
+                Some(declaring) => {
+                    if let Some(member_type) = self.member_type(&declaring, name) {
+                        keep(member_type);
+                    }
+                }
             }
         }
 
-        let mut wildcard_match: Option<JvmExternalType> = None;
-        for import in self.inner.import_info_of(token, file) {
-            let Some(import_path) = non_static_import_path(&import) else {
-                continue;
-            };
-            if !import.is_wildcard {
-                continue;
-            }
+        if resolved.len() >= 2 {
+            let mut names = resolved.iter().map(resolution_fqn).collect::<Vec<_>>();
+            names.sort_unstable();
+            let candidates = resolved.iter().cloned().map(Some).collect::<Vec<_>>();
+            return Some(self.stop_ambiguous(&names, &candidates));
+        }
+        if !unresolved.is_empty() {
+            return Some(self.stop_bound_miss(&unresolved));
+        }
+        resolved.pop().map(NameBinding::Hit)
+    }
 
-            let package_name = import_path.render_segments(".");
-            let Some(external_type) =
-                external.resolve_wildcard_import(&package_name, name, access_package)
-            else {
-                continue;
-            };
-            match wildcard_match.as_ref() {
-                Some(existing) if existing.fqn() != external_type.fqn() => return None,
-                Some(_) => {}
-                None => wildcard_match = Some(external_type),
+    /// Types of the same package: a workspace class, then an external one.
+    fn same_package(&self, name: &str) -> Option<JavaTypeResolution> {
+        let fqn = java_same_package_fqn(self.java, self.file, name);
+        if let Some(unit) = java_source_class_by_fqn(self.java, self.token, &fqn) {
+            return Some(JavaTypeResolution::Source(unit));
+        }
+        if self.surface_empty {
+            return None;
+        }
+        self.external
+            .resolve_same_package(self.recorder, self.access_package, name)
+            .map(|found| JavaTypeResolution::External(found.into()))
+    }
+
+    /// The on-demand tier. In JLS terms `java.lang.*` is an on-demand import at
+    /// the same level as the explicit ones, and a static-import-on-demand
+    /// contributes the member types of its type (JLS 7.5.4), so all of them
+    /// compete together. One distinct candidate binds the name. Several are an
+    /// ambiguity the compiler would reject, reported with no target instead of
+    /// being resolved by order.
+    fn bind_on_demand(&self, name: &str) -> NameBinding {
+        let mut found = Vec::<JavaTypeResolution>::new();
+        let mut keep = |candidate: JavaTypeResolution| {
+            let fqn = resolution_fqn(&candidate);
+            if !found.iter().any(|known| resolution_fqn(known) == fqn) {
+                found.push(candidate);
+            }
+        };
+        for import in self.imports.iter().filter(|import| import.is_wildcard) {
+            if let Some(path) = non_static_import_path(import) {
+                let package = path.render_segments(".");
+                if let Some(unit) =
+                    java_source_class_by_fqn(self.java, self.token, &format!("{package}.{name}"))
+                {
+                    keep(JavaTypeResolution::Source(unit));
+                }
+                if !self.surface_empty
+                    && let Some(external_type) = self.external.resolve_wildcard_import(
+                        self.recorder,
+                        &package,
+                        name,
+                        self.access_package,
+                    )
+                {
+                    keep(JavaTypeResolution::External(external_type.into()));
+                }
+            } else if let Some(path) = static_import_path(import) {
+                let fqn = format!("{}.{name}", path.render_segments("."));
+                if let Some(unit) = java_source_class_by_fqn(self.java, self.token, &fqn) {
+                    keep(JavaTypeResolution::Source(unit));
+                }
+                if !self.surface_empty
+                    && let Some(external_type) = self.external.resolve_qualified_name(
+                        self.recorder,
+                        &fqn,
+                        self.access_package,
+                    )
+                {
+                    keep(JavaTypeResolution::External(external_type.into()));
+                }
             }
         }
+        if !self.surface_empty
+            && let Some(external_type) = self.external.resolve_java_lang(self.recorder, name)
+        {
+            keep(JavaTypeResolution::External(external_type.into()));
+        }
+        match found.len() {
+            0 => NameBinding::Unbound,
+            1 => NameBinding::Hit(found.remove(0)),
+            _ => {
+                let mut names = found.iter().map(resolution_fqn).collect::<Vec<_>>();
+                names.sort_unstable();
+                let candidates = found.iter().cloned().map(Some).collect::<Vec<_>>();
+                self.stop_ambiguous(&names, &candidates)
+            }
+        }
+    }
 
-        wildcard_match
+    /// An import binds the name, but nothing supplies its target. Falling
+    /// through would return a definite wrong target (`java.lang.String` for
+    /// `import com.missing.String;`), so the ladder stops.
+    ///
+    /// A `java.*` import while no JDK declaration extraction is selected is the one exception: the
+    /// analyzer cannot tell which other packages belong to the JDK (`javax.*`
+    /// comes from third-party jars), but `java.*` is guaranteed to be the JDK's,
+    /// and an unacquired JDK stays a query obligation handled elsewhere. It
+    /// records the index's gaps and no new reason.
+    fn stop_bound_miss(&self, unresolved: &[(String, bool)]) -> NameBinding {
+        self.external.record_all_gaps(self.recorder);
+        let jdk_obligation = unresolved.iter().all(|(_, java_package)| *java_package)
+            && !self.java.active_semantic_models().is_some_and(|models| {
+                brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::jdk_declaration_extraction_selected(&models)
+            });
+        if !jdk_obligation {
+            let mut paths = unresolved
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            self.report(format!("jvm.import.unresolved: {}", paths.join(", ")));
+        }
+        NameBinding::BoundMiss
+    }
+
+    /// Two single-type imports, or two on-demand candidates, bind different
+    /// types. `candidates` is the resolution of each named type when it is
+    /// known, and `None` for a name nothing resolved.
+    ///
+    /// When every candidate is a workspace class, the ambiguity is a known fact
+    /// that the workspace resolver already reports with every peer on the trace
+    /// (#1602), so it ends the ladder silently: it adds no gap to a complete
+    /// answer. When an external surface took part, another surface could hold a
+    /// further peer, so the index's gaps and the independent ambiguity reason
+    /// are recorded.
+    fn stop_ambiguous(
+        &self,
+        names: &[String],
+        candidates: &[Option<JavaTypeResolution>],
+    ) -> NameBinding {
+        let all_workspace = candidates
+            .iter()
+            .all(|candidate| matches!(candidate, Some(JavaTypeResolution::Source(_))));
+        if !all_workspace {
+            self.external.record_all_gaps(self.recorder);
+            self.report(format!("jvm.import.ambiguous: {}", names.join(", ")));
+        }
+        NameBinding::Stopped
+    }
+
+    fn report(&self, detail: String) {
+        brokk_bifrost_analysis::analyzer::IAnalyzer::record_query_incomplete(
+            self.java,
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceGap(
+                detail.into_boxed_str(),
+            ),
+        );
     }
 }
 

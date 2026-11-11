@@ -53,10 +53,10 @@ where
                 if !reach.active {
                     return None;
                 }
-                let Root::Sink(sink) = reach.key.root else {
+                let Root::Sink(sink, _) = &reach.key.root else {
                     return None;
                 };
-                let accepted = &self.accepted[&sink];
+                let accepted = &self.accepted[sink];
                 let labels = self.functions.labels();
                 labels
                     .intersects(
@@ -291,7 +291,8 @@ where
                 .copied()
                 .filter(|&id| {
                     self.reaches[id].key.source == pair.source
-                        && self.reaches[id].key.root == Root::Sink(pair.sink)
+                        && self.reaches[id].key.root
+                            == Root::Sink(pair.sink, pair.certificate.clone())
                 })
                 .collect::<Vec<_>>();
             let chop = self.chop(&roots);
@@ -302,6 +303,7 @@ where
             let strict = self.current_pairs().into_iter().find(|candidate| {
                 candidate.source == pair.source
                     && candidate.sink == pair.sink
+                    && candidate.certificate == pair.certificate
                     && candidate.paths.iter().any(|(hops, _)| {
                         let labels = self.functions.labels();
                         labels.intersects(
@@ -401,7 +403,11 @@ where
                     InteriorTarget::Observation(0),
                 ),
                 Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
-                Endpoint::Source(_) | Endpoint::Execution(_) | Endpoint::Writeback { .. } => {
+                Endpoint::Source(_)
+                | Endpoint::Execution(_)
+                | Endpoint::Object(_)
+                | Endpoint::Writeback { .. }
+                | Endpoint::CallHandoff { .. } => {
                     unreachable!("a recorded output is not a source or execution")
                 }
             };
@@ -686,7 +692,11 @@ where
                         vec![InteriorObservation::Location(location.clone())]
                     }
                     Endpoint::Port(_) => Vec::new(),
-                    Endpoint::Source(_) | Endpoint::Execution(_) | Endpoint::Writeback { .. } => {
+                    Endpoint::Source(_)
+                    | Endpoint::Execution(_)
+                    | Endpoint::Object(_)
+                    | Endpoint::Writeback { .. }
+                    | Endpoint::CallHandoff { .. } => {
                         unreachable!("an interior output is not a source or execution")
                     }
                 };
@@ -705,8 +715,9 @@ where
                 });
                 let flows = flows.expect("a recorded hop's label partition is stable");
                 let incomplete = !matches!(flows.completeness, Completeness::Complete);
-                if let Completeness::Incomplete { reason } = flows.completeness {
+                if let Completeness::Incomplete { reason, cause } = flows.completeness {
                     self.note(Incompleteness::Interior {
+                        cause,
                         procedure: procedure.clone(),
                         reason,
                     });
@@ -727,6 +738,7 @@ where
                             from,
                             to,
                             crossed,
+                            function,
                             ..
                         } = &hop
                         else {

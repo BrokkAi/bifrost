@@ -13,6 +13,7 @@
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as covers;
 use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+use brokk_bifrost_core::analyzer::work_budget::NodeBudget;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -153,36 +154,6 @@ pub struct PythonRuntimeReadFacts {
     pub complete: bool,
 }
 
-/// Shared node budget for the bounded passes.
-#[derive(Debug)]
-struct PythonRuntimeBudget {
-    remaining: usize,
-    exhausted: bool,
-    visited_nodes: usize,
-}
-
-impl PythonRuntimeBudget {
-    /// The node bound keeps a large tree with few matching facts from making
-    /// extraction unbounded. The multiplier mirrors the JavaScript pass.
-    fn for_facts(max_facts: usize) -> Self {
-        Self {
-            remaining: max_facts.saturating_mul(64).max(4096),
-            exhausted: false,
-            visited_nodes: 0,
-        }
-    }
-
-    fn visit(&mut self) -> bool {
-        if self.remaining == 0 {
-            self.exhausted = true;
-            return false;
-        }
-        self.remaining -= 1;
-        self.visited_nodes += 1;
-        true
-    }
-}
-
 /// One import binding that covers a byte offset.
 struct ModuleBinding {
     local_name: String,
@@ -203,7 +174,9 @@ pub fn extract_python_runtime_reads(
     source: &str,
     max_facts: usize,
 ) -> PythonRuntimeReadFacts {
-    let mut budget = PythonRuntimeBudget::for_facts(max_facts);
+    // The node bound keeps a large tree with few matching facts from making
+    // extraction unbounded.
+    let mut budget = NodeBudget::new(max_facts.saturating_mul(64).max(4096));
     let bindings = module_bindings(root, source);
     let mut reads = Vec::new();
     let mut writes = Vec::new();
@@ -279,8 +252,8 @@ pub fn extract_python_runtime_reads(
     reads.sort_by_key(|read| read.range.start_byte);
     writes.sort_by_key(|write| write.range.start_byte);
     PythonRuntimeReadFacts {
-        complete: !budget.exhausted && reads.len() + writes.len() < max_facts,
-        visited_nodes: budget.visited_nodes,
+        complete: !budget.exhausted() && reads.len() + writes.len() < max_facts,
+        visited_nodes: budget.visited(),
         reads,
         writes,
     }
@@ -342,7 +315,7 @@ fn classify_container_occurrence<'tree>(
     path: &ReviewedPath<'tree>,
     source: &str,
     module_root: Node<'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
     reads: &mut Vec<PythonRuntimeRead>,
     writes: &mut Vec<PythonRuntimeWrite>,
 ) {
@@ -484,7 +457,7 @@ fn execution_context_accessor_coverage(
     attribute: Node<'_>,
     module_root: Node<'_>,
     read_range: Range,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonRuntimeAccessorCoverage {
     let scope = enclosing_execution_context(attribute)
         .and_then(|function| function.child_by_field_name("body"))
@@ -563,7 +536,7 @@ fn escaping_module_identifier(
     bindings: &[ModuleBinding],
     module_root: Node<'_>,
     source: &str,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> Option<String> {
     let name = node_text(node, source);
     let module = binding_root_module(node, name, bindings)?;
@@ -633,7 +606,7 @@ fn root_resolution(
     bindings: &[ModuleBinding],
     module_root: Node<'_>,
     source: &str,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonRuntimeRootResolution {
     let name = node_text(root, source);
     match python_name_resolution_at(name, root, source) {
@@ -673,7 +646,7 @@ fn module_scope_binds_name_through_imports(
     module_root: Node<'_>,
     name: &str,
     source: &str,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> Option<bool> {
     let mut imported = false;
     let mut stack = vec![module_root];
@@ -787,11 +760,7 @@ pub fn python_module_member_mutation(
     member: &str,
     max_nodes: usize,
 ) -> Option<PythonModuleMemberMutation> {
-    let mut budget = PythonRuntimeBudget {
-        remaining: max_nodes,
-        exhausted: false,
-        visited_nodes: 0,
-    };
+    let mut budget = NodeBudget::new(max_nodes);
     let bindings = python_import_bindings_from_tree(root, source);
     let Some(facts) =
         python_sys_modules_aliases(root, source, source_module, module, &bindings, &mut budget)
@@ -954,7 +923,7 @@ fn python_sys_modules_lookup<'tree>(
     module: &str,
     bindings: &[crate::imports::PythonImportBinding],
     facts: &PythonSysModulesFacts<'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonSysModulesLookup<'tree> {
     // The registry maps names to module objects; changing one entry does not
     // mutate the referenced module's globals. Only storing or producing this
@@ -1150,7 +1119,7 @@ fn python_mock_patch_dict_target<'tree>(call: Node<'tree>, source: &str) -> Opti
 fn python_mock_patch_dict_values<'tree>(
     call: Node<'tree>,
     proof: &PythonSysModulesProofContext<'_, 'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonSysModulesStoredValue {
     let source = proof.source;
     let Some(arguments) = call.child_by_field_name("arguments") else {
@@ -1189,7 +1158,7 @@ fn python_mock_patch_dict_values<'tree>(
 fn python_sys_modules_update_argument<'tree>(
     argument: Node<'tree>,
     proof: &PythonSysModulesProofContext<'_, 'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonSysModulesStoredValue {
     if argument.kind() == "keyword_argument" {
         argument
@@ -1307,7 +1276,7 @@ fn python_sys_modules_read_identity<'tree>(
     key: Option<Node<'tree>>,
     read: Node<'tree>,
     proof: &PythonSysModulesProofContext<'_, 'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonSysModulesLookup<'tree> {
     let Some(key) = key else {
         return PythonSysModulesLookup::Escape(node_source_range(read));
@@ -1345,7 +1314,7 @@ fn python_sys_modules_guard_excludes_module(
     key: Node<'_>,
     read: Node<'_>,
     proof: &PythonSysModulesProofContext<'_, '_>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> bool {
     if key.kind() != "identifier" {
         return false;
@@ -1398,7 +1367,7 @@ fn python_sys_modules_key_binding_unchanged(
     guard: Node<'_>,
     read: Node<'_>,
     proof: &PythonSysModulesProofContext<'_, '_>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> bool {
     let name = node_text(key, proof.source);
     let guard_reference = python_sys_modules_guard_key_reference(guard, name, proof.source, budget);
@@ -1461,7 +1430,7 @@ fn python_sys_modules_guard_key_reference<'tree>(
     condition: Node<'tree>,
     name: &str,
     source: &str,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> Option<Node<'tree>> {
     let mut stack = vec![condition];
     while let Some(node) = stack.pop() {
@@ -1501,7 +1470,7 @@ fn python_sys_modules_prior_continue_guard_excludes(
     read: Node<'_>,
     key_name: &str,
     proof: &PythonSysModulesProofContext<'_, '_>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> bool {
     let mut cursor = block.walk();
     for statement in block.named_children(&mut cursor) {
@@ -1558,7 +1527,7 @@ fn python_sys_modules_guard_truth(
     key_name: &str,
     module: &str,
     source: &str,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> PythonGuardTruth {
     let mut pending = vec![(condition, false)];
     let mut results = HashMap::<usize, PythonGuardTruth>::default();
@@ -1864,7 +1833,7 @@ fn python_sys_modules_value_scope<'tree>(node: Node<'tree>, source: &str) -> Nod
 fn python_sys_modules_stored_value<'tree>(
     value: Node<'tree>,
     context: &PythonSysModulesProofContext<'_, 'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
     seen: &mut HashSet<(usize, usize, String)>,
 ) -> PythonSysModulesStoredValue {
     let source = context.source;
@@ -1994,7 +1963,7 @@ fn python_sys_modules_stored_value<'tree>(
 fn python_sys_modules_update_values<'tree>(
     mapping: Node<'tree>,
     context: &PythonSysModulesProofContext<'_, 'tree>,
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
     seen: &mut HashSet<(usize, usize, String)>,
 ) -> PythonSysModulesStoredValue {
     let source = context.source;
@@ -2038,7 +2007,7 @@ fn python_sys_modules_aliases<'tree>(
     source_module: &str,
     module: &str,
     bindings: &[crate::imports::PythonImportBinding],
-    budget: &mut PythonRuntimeBudget,
+    budget: &mut NodeBudget,
 ) -> Option<PythonSysModulesFacts<'tree>> {
     let mut aliases_from = HashMap::<String, Vec<String>>::default();
     let mut assignments = HashMap::<(usize, usize, String), Vec<Node<'_>>>::default();
@@ -2338,11 +2307,7 @@ pub fn python_external_class_member_mutation(
     else {
         return Some(PythonModuleMemberMutation::Budget);
     };
-    let mut budget = PythonRuntimeBudget {
-        remaining: max_nodes,
-        exhausted: false,
-        visited_nodes: 0,
-    };
+    let mut budget = NodeBudget::new(max_nodes);
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if !budget.visit() {
@@ -2414,11 +2379,7 @@ fn python_external_class_aliases(
     class_identities: &[&str],
     max_nodes: usize,
 ) -> Option<Vec<PythonExternalClassAlias>> {
-    let mut budget = PythonRuntimeBudget {
-        remaining: max_nodes,
-        exhausted: false,
-        visited_nodes: 0,
-    };
+    let mut budget = NodeBudget::new(max_nodes);
     let mut assignments = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

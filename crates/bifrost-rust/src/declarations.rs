@@ -56,6 +56,26 @@ pub fn rust_file_package_fq(file: &ProjectFile) -> FqName {
     })
 }
 
+pub fn rust_file_package_fq_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> FqName {
+    let mut fq = FqName::new();
+    match crate::crate_naming::rust_crate_paths_with(caches, file) {
+        Some(paths) => {
+            for component in &paths.package {
+                fq.push(segment_interner().intern(component, SegmentKind::Package));
+            }
+        }
+        None => {
+            for component in crate::crate_naming::path_derived_package_components(file.rel_path()) {
+                fq.push(segment_interner().intern(&component, SegmentKind::Package));
+            }
+        }
+    }
+    fq
+}
+
 pub fn rust_semantic_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in package_name
@@ -977,6 +997,7 @@ fn source_import_from_nodes<'tree>(
 /// one place is what stops an alias from drifting back onto the `Member`
 /// segment a `const` of the same name in the same owner uses (#2911).
 fn rust_type_declaration_identity(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     parent: Option<&CodeUnit>,
     name: &str,
@@ -984,7 +1005,7 @@ fn rust_type_declaration_identity(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+    let fq = child_fq_base(parent, || rust_file_package_fq_with(naming, file))
         .with_pushed(segment_interner().intern(name, SegmentKind::Type));
     (short_name, fq)
 }
@@ -1282,6 +1303,7 @@ impl RustPrimaryMacroState {
 }
 
 struct RustPrimaryDeclarations<'source, 'parsed, 'tree> {
+    naming: &'source crate::crate_naming::RustCrateNamingCaches,
     file: &'source ProjectFile,
     source: &'source str,
     parsed: &'parsed mut ParsedFile,
@@ -1300,6 +1322,7 @@ struct RustPrimaryDeclarations<'source, 'parsed, 'tree> {
 
 impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
     fn new(
+        naming: &'source crate::crate_naming::RustCrateNamingCaches,
         file: &'source ProjectFile,
         source: &'source str,
         impl_import_binder: ImportBinder,
@@ -1324,6 +1347,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             in_test_region: false,
         };
         Self {
+            naming,
             file,
             source,
             parsed,
@@ -1409,6 +1433,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
         match node.kind() {
             "struct_item" | "enum_item" | "union_item" | "trait_item" => {
                 code_unit = register_rust_class_like(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1431,6 +1456,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             // no body, so it owns no member declarations.
             "trait_alias" => {
                 code_unit = register_rust_class_like(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1445,6 +1471,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             }
             "mod_item" => {
                 code_unit = register_rust_module(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1474,6 +1501,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                     || current.mode == RustPrimaryDeclarationMode::Impl =>
             {
                 code_unit = visit_rust_function(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1491,6 +1519,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                     || current.mode == RustPrimaryDeclarationMode::Foreign =>
             {
                 code_unit = visit_rust_function(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1514,6 +1543,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             }
             "field_declaration" | "enum_variant" | "const_item" | "static_item" => {
                 code_unit = register_rust_field(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1537,6 +1567,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
             }
             "macro_definition" | "decl_macro" => {
                 code_unit = visit_rust_macro(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1560,6 +1591,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                     || current.mode == RustPrimaryDeclarationMode::Impl =>
             {
                 code_unit = visit_rust_alias(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -1579,6 +1611,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryDeclarations<'source, 'parsed, 'tree> {
                 let owner = node.child_by_field_name("type").and_then(|type_node| {
                     let target = source_bridge.record_type(type_node, self.source);
                     rust_impl_owner(
+                        self.naming,
                         self.file,
                         target,
                         parent,
@@ -1730,6 +1763,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         reason = "the parse state is initialized from the coordinated parser products"
     )]
     fn new(
+        naming: &'source crate::crate_naming::RustCrateNamingCaches,
         file: &'source ProjectFile,
         source: &'source str,
         impl_import_binder: ImportBinder,
@@ -1752,6 +1786,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         module_sources.record_inner_attributes(root);
         Self {
             declarations: RustPrimaryDeclarations::new(
+                naming,
                 file,
                 source,
                 impl_import_binder,
@@ -1789,6 +1824,8 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
         native_active: bool,
     ) -> (bool, TreeWalkAction) {
         let (collector, properties) = self.native.source_collectors_mut();
+        self.item_sources
+            .record_primary_census_node(node, self.declarations.source);
         let source_macro_position = self.item_sources.enter(
             node,
             self.declarations.source,
@@ -1938,6 +1975,7 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
                 tree_id: root_tree_id,
             };
             visit_rust_macro_invocation_definitions(
+                self.declarations.naming,
                 self.declarations.file,
                 self.declarations.source,
                 node,
@@ -2323,7 +2361,36 @@ impl<'source, 'parsed, 'tree> RustPrimaryParseState<'source, 'parsed, 'tree> {
 }
 
 pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
-    let mut parsed = ParsedFile::new(rust_package_name(file));
+    // The legacy entry point has no analyzer owner; retain nothing across calls.
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    parse_rust_file_with(&caches, file, source, tree)
+}
+
+pub fn parse_rust_file_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+) -> ParsedFile {
+    parse_rust_file_with_package(
+        caches,
+        file,
+        source,
+        tree,
+        rust_package_name_with(caches, file),
+    )
+}
+
+fn parse_rust_file_with_package(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    package: String,
+) -> ParsedFile {
+    let mut parsed = ParsedFile::new(package);
     let root = tree.root_node();
 
     // This binder stays top-level-only for its own reason: it resolves the
@@ -2365,6 +2432,7 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
         )
         .expect("unbounded canonical syntax preparation cannot be cancelled");
     let mut traversal = RustPrimaryParseState::new(
+        naming,
         file,
         source,
         impl_import_binder,
@@ -2392,6 +2460,16 @@ pub fn rust_package_name(file: &ProjectFile) -> String {
     with_rust_package_components(file, |components| components.join("."))
 }
 
+pub fn rust_package_name_with(
+    caches: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> String {
+    match crate::crate_naming::rust_crate_paths_with(caches, file) {
+        Some(paths) => paths.package.join("."),
+        None => crate::crate_naming::path_derived_package_components(file.rel_path()).join("."),
+    }
+}
+
 /// Hands `read` the crate-anchored package components when a `Cargo.toml`
 /// governs `file`, otherwise the legacy path-derived scheme.
 ///
@@ -2400,7 +2478,10 @@ pub fn rust_package_name(file: &ProjectFile) -> String {
 /// questions a scan asks, so handing out an owned `Vec` would reinstate the
 /// per-call allocation the memo removes.
 fn with_rust_package_components<T>(file: &ProjectFile, read: impl FnOnce(&[String]) -> T) -> T {
-    match crate::crate_naming::rust_crate_paths(file) {
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    match crate::crate_naming::rust_crate_paths_with(&caches, file) {
         Some(paths) => read(&paths.package),
         None => read(&crate::crate_naming::path_derived_package_components(
             file.rel_path(),
@@ -2485,6 +2566,7 @@ fn record_rust_code_unit(
 
 #[allow(clippy::too_many_arguments)]
 fn register_rust_class_like(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2497,7 +2579,7 @@ fn register_rust_class_like(
     let name = rust_named_item_name(node, source)?;
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
-    let (short_name, fq) = rust_type_declaration_identity(file, parent, name);
+    let (short_name, fq) = rust_type_declaration_identity(naming, file, parent, name);
     let code_unit = CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Class,
@@ -2528,6 +2610,7 @@ fn register_rust_class_like(
 
 #[allow(clippy::too_many_arguments)]
 fn register_rust_module(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2543,7 +2626,7 @@ fn register_rust_module(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+    let fq = child_fq_base(parent, || rust_file_package_fq_with(naming, file))
         .with_pushed(segment_interner().intern(name, SegmentKind::Package));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
@@ -2599,6 +2682,7 @@ fn rust_direct_impl_import_binder<'tree>(
 
 #[allow(clippy::too_many_arguments)]
 fn visit_rust_function(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2618,6 +2702,7 @@ fn visit_rust_function(
         || item_has_path_attribute(node, source, "proc_macro_attribute")
     {
         return register_rust_macro(
+            naming,
             file,
             name,
             package_name,
@@ -2636,7 +2721,7 @@ fn visit_rust_function(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+    let fq = child_fq_base(parent, || rust_file_package_fq_with(naming, file))
         .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = rust_inherit_package_anchor(
         CodeUnit::with_signature_and_fq(
@@ -2672,6 +2757,7 @@ fn visit_rust_function(
 
 #[allow(clippy::too_many_arguments)]
 fn visit_rust_macro(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -2685,6 +2771,7 @@ fn visit_rust_macro(
 
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
     register_rust_macro(
+        naming,
         file,
         name,
         package_name,
@@ -2699,6 +2786,7 @@ fn visit_rust_macro(
 
 #[allow(clippy::too_many_arguments)]
 fn register_rust_macro(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     name: &str,
     package_name: &str,
@@ -2712,7 +2800,7 @@ fn register_rust_macro(
     let short_name = parent
         .map(|parent| format!("{}.{}", parent.short_name(), name))
         .unwrap_or_else(|| name.to_string());
-    let fq = child_fq_base(parent, || rust_file_package_fq(file))
+    let fq = child_fq_base(parent, || rust_file_package_fq_with(naming, file))
         .with_pushed(segment_interner().intern(name, SegmentKind::Member));
     let code_unit = CodeUnit::new_fq(
         file.clone(),
@@ -2750,6 +2838,7 @@ fn register_rust_macro(
 /// slice the correct source text.
 #[allow(clippy::too_many_arguments)]
 fn visit_rust_macro_invocation_definitions<'source>(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &'source str,
     node: Node<'_>,
@@ -2778,6 +2867,7 @@ fn visit_rust_macro_invocation_definitions<'source>(
         return;
     };
     let mut replay = RustEmbeddedReplayDriver::new(
+        naming,
         trees,
         file,
         source,
@@ -2905,6 +2995,7 @@ impl<'graph> RustEmbeddedReplayFrame<'graph> {
 }
 
 struct RustEmbeddedReplayDriver<'graph, 'source, 'external, 'collector> {
+    naming: &'external crate::crate_naming::RustCrateNamingCaches,
     trees: &'graph [RustEmbeddedReplayTree],
     file: &'external ProjectFile,
     source: &'source str,
@@ -2936,6 +3027,7 @@ impl<'graph, 'source, 'external, 'collector>
     RustEmbeddedReplayDriver<'graph, 'source, 'external, 'collector>
 {
     fn new(
+        naming: &'external crate::crate_naming::RustCrateNamingCaches,
         trees: &'graph [RustEmbeddedReplayTree],
         file: &'external ProjectFile,
         source: &'source str,
@@ -2947,6 +3039,7 @@ impl<'graph, 'source, 'external, 'collector>
         embedded_import_ids: &'external mut Vec<SourceImportId>,
     ) -> Self {
         Self {
+            naming,
             trees,
             file,
             source,
@@ -3126,6 +3219,7 @@ impl<'graph, 'source, 'external, 'collector>
                     let parent_in_test_region = self.contexts[context].in_test_region;
                     if node.kind() == "function_signature_item" {
                         visit_rust_function(
+                            self.naming,
                             self.file,
                             self.source,
                             node,
@@ -3137,6 +3231,7 @@ impl<'graph, 'source, 'external, 'collector>
                         );
                     } else {
                         register_rust_field(
+                            self.naming,
                             self.file,
                             self.source,
                             node,
@@ -3156,6 +3251,7 @@ impl<'graph, 'source, 'external, 'collector>
                     let parent_in_test_region = self.contexts[context].in_test_region;
                     if node.kind() == "function_item" {
                         visit_rust_function(
+                            self.naming,
                             self.file,
                             self.source,
                             node,
@@ -3167,6 +3263,7 @@ impl<'graph, 'source, 'external, 'collector>
                         );
                     } else if node.kind() == "const_item" {
                         register_rust_field(
+                            self.naming,
                             self.file,
                             self.source,
                             node,
@@ -3178,6 +3275,7 @@ impl<'graph, 'source, 'external, 'collector>
                         );
                     } else {
                         visit_rust_alias(
+                            self.naming,
                             self.file,
                             self.source,
                             node,
@@ -3196,6 +3294,7 @@ impl<'graph, 'source, 'external, 'collector>
                     let package_name = self.contexts[context].package_name.as_str();
                     let parent_in_test_region = self.contexts[context].in_test_region;
                     register_rust_field(
+                        self.naming,
                         self.file,
                         self.source,
                         node,
@@ -3218,6 +3317,7 @@ impl<'graph, 'source, 'external, 'collector>
         match node.kind() {
             "struct_item" | "enum_item" | "union_item" | "trait_item" => {
                 let Some(code_unit) = register_rust_class_like(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3244,6 +3344,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "mod_item" => {
                 let Some(code_unit) = register_rust_module(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3270,6 +3371,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "function_item" => {
                 visit_rust_function(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3296,6 +3398,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "const_item" | "static_item" => {
                 register_rust_field(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3308,6 +3411,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "type_item" => {
                 visit_rust_alias(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3320,6 +3424,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "macro_definition" if replay_macro_definitions => {
                 visit_rust_macro(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3339,6 +3444,7 @@ impl<'graph, 'source, 'external, 'collector>
                 };
                 let target = self.source_bridge.record_type(type_node, self.source);
                 let Some(owner) = rust_impl_owner(
+                    self.naming,
                     self.file,
                     target,
                     parent,
@@ -3396,6 +3502,7 @@ impl<'graph, 'source, 'external, 'collector>
         match node.kind() {
             "field_declaration" | "enum_variant" | "const_item" => {
                 let Some(code_unit) = register_rust_field(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3428,6 +3535,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "function_item" | "function_signature_item" => {
                 visit_rust_function(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -3440,6 +3548,7 @@ impl<'graph, 'source, 'external, 'collector>
             }
             "associated_type" | "type_item" => {
                 visit_rust_alias(
+                    self.naming,
                     self.file,
                     self.source,
                     node,
@@ -4586,6 +4695,7 @@ fn rust_attribute_meta_pattern_is_safe(attribute: Node<'_>, source: &str) -> boo
 
 #[allow(clippy::too_many_arguments)]
 fn register_rust_field(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -4612,7 +4722,7 @@ fn register_rust_field(
     // scope; a member sits directly under its owner.
     let fq = match parent {
         Some(parent) => parent.fq().clone(),
-        None => rust_file_package_fq(file).with_pushed(
+        None => rust_file_package_fq_with(naming, file).with_pushed(
             segment_interner().intern(RUST_MODULE_SCOPE_SEGMENT, SegmentKind::Package),
         ),
     }
@@ -4708,6 +4818,7 @@ fn rust_enum_variant_owner_identity(
 /// u32 = 1; }` produced one CodeUnit instead of two and the `const` was
 /// unreachable (#2911).
 fn visit_rust_alias(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -4719,7 +4830,7 @@ fn visit_rust_alias(
 ) -> Option<CodeUnit> {
     let name = rust_named_item_name(node, source)?;
     let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
-    let (short_name, fq) = rust_type_declaration_identity(file, parent, name);
+    let (short_name, fq) = rust_type_declaration_identity(naming, file, parent, name);
     let code_unit = rust_inherit_package_anchor(
         CodeUnit::with_signature_and_fq(
             file.clone(),
@@ -4773,7 +4884,15 @@ fn rust_package_anchor(anchor: RustModuleAnchor) -> Option<PackageAnchor> {
     }
 }
 
+fn rust_crate_root_package_for_parse(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
+    file: &ProjectFile,
+) -> String {
+    crate::imports::rust_crate_root_package_with(naming, file)
+}
+
 fn rust_impl_owner(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     target: &RustTypeSourceFact,
     lexical_parent: Option<&CodeUnit>,
@@ -4811,7 +4930,7 @@ fn rust_impl_owner(
             let imported_name = binding.imported_name.as_ref()?;
             let resolved_package = crate::imports::resolve_rust_module_path_with_crate(
                 &lexical_package,
-                &crate::imports::rust_crate_root_package(file),
+                &rust_crate_root_package_for_parse(naming, file),
                 &binding.module_specifier,
             )?;
             let anchor = crate::imports::rust_anchor_for_resolved_package(
@@ -4832,6 +4951,7 @@ fn rust_impl_owner(
         }
     } else {
         rust_impl_owner_identity_from_path(
+            naming,
             file,
             &lexical_package,
             package_name,
@@ -4872,7 +4992,7 @@ fn rust_impl_owner(
         // every component as a type creates an equal-rendering orphan when an
         // `impl` precedes the corresponding module-scoped declaration.
         let mut fq = if owner_package == package_name {
-            rust_file_package_fq(file)
+            rust_file_package_fq_with(naming, file)
         } else {
             rust_semantic_package_fq(&owner_package)
         };
@@ -4950,6 +5070,7 @@ fn rust_import_binding_module_route(binding: &ImportBinding) -> Option<String> {
 }
 
 fn rust_impl_owner_identity_from_path(
+    naming: &crate::crate_naming::RustCrateNamingCaches,
     file: &ProjectFile,
     lexical_package: &str,
     file_package: &str,
@@ -4957,7 +5078,7 @@ fn rust_impl_owner_identity_from_path(
     import_binder: &ImportBinder,
 ) -> Option<RustImplOwnerIdentity> {
     let (name, module_path) = path.split_last()?;
-    let crate_package = crate::imports::rust_crate_root_package(file);
+    let crate_package = rust_crate_root_package_for_parse(naming, file);
     let (package_name, module_specifier) = if let Some((root, remainder)) =
         module_path.split_first()
         && let Some(binding) = import_binder.bindings.get(root)
@@ -5290,6 +5411,23 @@ pub fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibi
 }
 
 #[cfg(test)]
+fn parse_rust_file_for_test(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    // Standalone fixtures have no analyzer owner; retain nothing across calls.
+    let caches = crate::crate_naming::RustCrateNamingCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    parse_rust_file_with(&caches, file, source, tree)
+}
+
+#[cfg(test)]
+fn parse_rust_tree_for_test(source: &str) -> Option<Tree> {
+    let caches = crate::lexical_scope::RustLexicalCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    crate::lexical_scope::parse_rust_tree_with(&caches, source)
+}
+
+#[cfg(test)]
 mod structured_package_tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
@@ -5327,7 +5465,7 @@ impl View for Number {
         assert!(!tree.root_node().has_error());
         let temp = tempfile::tempdir().unwrap();
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "lib.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let owner = parsed
             .declarations()
             .iter()
@@ -5379,7 +5517,7 @@ pub fn plain() {}
         let tree = parser.parse(source, None).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "lib.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         for (name, kind) in [
             ("bang", CodeUnitType::Macro),
             ("decorate", CodeUnitType::Macro),
@@ -5412,7 +5550,7 @@ pub fn plain() {}
             ".github/workflows/generate-release-yml.rs",
         );
 
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let pattern = parsed
             .top_level_declarations
             .iter()
@@ -5455,7 +5593,7 @@ use crate::root::After;
             "src/lib.rs",
         );
 
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let imports = parsed
             .imports
             .iter()
@@ -5543,7 +5681,7 @@ use crate::root::After;
             "src/lib.rs",
         );
 
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let source_facts = parsed
             .source_facts
             .as_ref()
@@ -5562,7 +5700,7 @@ use crate::root::After;
         let tree = parser.parse(source, None).unwrap();
         let temp = tempfile::tempdir().unwrap();
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "src/lib.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let imports = &parsed.rust_usage_facts.import_targets;
         assert_eq!(imports.len(), 2);
         assert!(
@@ -5587,7 +5725,7 @@ use crate::root::After;
             "src/lib.rs",
         );
 
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let source_facts = parsed
             .source_facts
             .as_ref()
@@ -5625,8 +5763,8 @@ use crate::root::After;
             "src/lib.rs",
         );
 
-        let first = parse_rust_file(&first_file, source, &tree);
-        let second = parse_rust_file(&second_file, source, &second_tree);
+        let first = parse_rust_file_for_test(&first_file, source, &tree);
+        let second = parse_rust_file_for_test(&second_file, source, &second_tree);
         assert_eq!(
             first.rust_usage_facts.import_targets, second.rust_usage_facts.import_targets,
             "identical bytes keep source identity indexes mount-independent"
@@ -5937,7 +6075,7 @@ replay! {
             "src/lib.rs",
         );
 
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let imports = parsed
             .imports
             .iter()
@@ -6004,7 +6142,7 @@ replay! {
             "src/lib.rs",
         );
 
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let method = parsed
             .children
             .values()
@@ -6030,7 +6168,7 @@ replay! {
             temp.path().canonicalize().expect("canonical root"),
             "lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
 
         let metadata_for = |name: &str| {
             parsed
@@ -6163,7 +6301,7 @@ mod embedded_replay_tests {
             RustItemMacroExpansion, RustMacroParseFailure,
         };
         let source = "cfg_if::cfg_if!{ else {} }\nempty!{}\nouter!{expr_child!(value + 1); empty_child!{} inner!{mod nested;}}\nmacro_rules! splice { ($($t:tt)*) => { $($t)* }; }\nmacro_rules! args { ($($t:tt)*) => { consume($($t)*) }; }\nfn target() {}\nfn consume(_: usize, _: fn()) {}\nfn run() { splice!(crate::target()); args!(0, crate::target); }";
-        let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+        let tree = parse_rust_tree_for_test(source).unwrap();
         assert!(
             !tree.root_node().has_error(),
             "opaque arguments are valid token trees"
@@ -6304,7 +6442,7 @@ mod embedded_replay_tests {
         // bang and attribute entry points, but derive publishes its argument
         // rather than the implementation function's name.
         let source = "extern crate proc_macro; use proc_macro::TokenStream;\n#[proc_macro] pub fn bang(input: TokenStream) -> TokenStream { input }\n#[proc_macro_attribute] pub fn attribute(_: TokenStream, input: TokenStream) -> TokenStream { input }\n#[proc_macro_derive(Derived)] pub fn derive_impl(input: TokenStream) -> TokenStream { input }\npub fn ordinary() {}";
-        let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+        let tree = parse_rust_tree_for_test(source).unwrap();
         assert!(!tree.root_node().has_error());
         let parsed = parse_fixture(source);
         let facts = &parsed.resolution_facts;
@@ -6349,7 +6487,7 @@ mod embedded_replay_tests {
             ),
             ("emit!{}", "emit", Some("emit")),
         ] {
-            let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+            let tree = parse_rust_tree_for_test(source).unwrap();
             assert!(!tree.root_node().has_error());
             let invocation = tree.root_node().named_child(0).unwrap();
             assert_eq!(invocation.kind(), "macro_invocation");
@@ -6373,7 +6511,7 @@ mod embedded_replay_tests {
             ("cfg_attr(flag, doc = \"text\", inline)", false),
         ] {
             let source = format!("#[{attribute}] use crate::Item;");
-            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            let tree = parse_rust_tree_for_test(&source).unwrap();
             assert!(!tree.root_node().has_error());
             let wrapper = tree.root_node().named_child(0).unwrap();
             assert_eq!(wrapper.kind(), "declaration_with_attribute");
@@ -6453,7 +6591,7 @@ mod embedded_replay_tests {
             ),
         ] {
             let source = format!("macro_rules! check {{ {rules} }}");
-            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            let tree = parse_rust_tree_for_test(&source).unwrap();
             assert!(!tree.root_node().has_error(), "{source}");
             let definition = tree.root_node().named_child(0).unwrap();
             assert_eq!(definition.kind(), "macro_definition");
@@ -6614,7 +6752,7 @@ fn repeated<T: Marker<{ "(r#type: u8, other: u8)".len() }>>(r#type: u8, other: u
             temp.path().canonicalize().expect("canonical root"),
             "src/lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let metadata = parsed
             .signature_metadata
             .iter()
@@ -6673,7 +6811,7 @@ trait Api<const N: usize> { fn signature(value: [u8; { N }]) -> [u8; { N }] wher
             temp.path().canonicalize().expect("canonical root"),
             "src/lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let signature_for = |name: &str| {
             parsed
                 .signatures
@@ -6721,7 +6859,7 @@ trait Api<const N: usize> { fn signature(value: [u8; { N }]) -> [u8; { N }] wher
             temp.path().canonicalize().expect("canonical root"),
             "lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let names = parsed
             .resolution_facts
             .names
@@ -6767,7 +6905,7 @@ trait Api<const N: usize> { fn signature(value: [u8; { N }]) -> [u8; { N }] wher
             temp.path().canonicalize().expect("canonical root"),
             "lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let names = parsed
             .resolution_facts
             .names
@@ -6905,6 +7043,58 @@ wrap! { impl Item { fn embedded_b() {} } }
     }
 
     #[test]
+    fn primary_impl_census_covers_every_unproved_introducer() {
+        use brokk_bifrost_core::analyzer::rust_facts::RustImplCensusBoundaryKind as Kind;
+
+        let cases: &[(&str, &[Kind], usize)] = &[
+            ("fn f() { println!(\"x\"); }", &[Kind::Macro], 0),
+            ("#[derive(Debug)] struct S;", &[Kind::Derive], 0),
+            (
+                "#[cfg_attr(any(), derive(Clone, Copy))] struct S;",
+                &[Kind::Derive],
+                0,
+            ),
+            ("#[my_attribute] struct S;", &[Kind::ExpandingAttribute], 0),
+            (
+                "#![feature(lang_items)]\nstruct S;",
+                &[Kind::InternalAttribute],
+                0,
+            ),
+            (
+                "#[lang = \"copy\"] trait Copy {}",
+                &[Kind::InternalAttribute],
+                0,
+            ),
+            ("struct Broken {", &[Kind::SyntaxError], 0),
+            (
+                "#![no_std]\n#[doc = \"ok\"] #[allow(dead_code)] struct S; impl S {} impl S {}",
+                &[],
+                2,
+            ),
+        ];
+        for &(source, expected, impl_count) in cases {
+            let parsed = parse_fixture(source);
+            let items = &parsed
+                .source_facts
+                .as_ref()
+                .expect("source facts")
+                .rust_items;
+            let kinds = items
+                .impl_census_boundaries
+                .iter()
+                .map(|boundary| boundary.kind)
+                .collect::<Vec<_>>();
+            if source == "struct Broken {" {
+                assert!(kinds.iter().all(|kind| *kind == Kind::SyntaxError));
+                assert!(!kinds.is_empty());
+            } else {
+                assert_eq!(kinds, expected, "source={source}");
+            }
+            assert_eq!(items.impls.len(), impl_count, "source={source}");
+        }
+    }
+
+    #[test]
     fn primary_item_sources_retain_unprojected_owners_and_exact_member_contexts() {
         let source = r#"
 struct Item;
@@ -6918,6 +7108,7 @@ impl Trait for Missing {
     fn member(&self) {
         fn local() { impl Item { fn nested() {} } }
     }
+
     impl_members! {}
 }
 impl<T> Trait for T { fn generic(&self) {} }
@@ -7268,7 +7459,7 @@ fn associated_decoy() -> usize { evaluate!(Other::EXACT) }
 fn lexical_decoy() -> usize { let EXACT = 3; evaluate!(EXACT) }
 fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
 "#;
-        let tree = crate::lexical_scope::parse_rust_tree(source).unwrap();
+        let tree = parse_rust_tree_for_test(source).unwrap();
         let mut pending = vec![tree.root_node()];
         let mut error_roots = 0;
         let mut roots = Vec::new();
@@ -9226,7 +9417,7 @@ wrap! {
         let tree = parser.parse(source, None).expect("parse Rust fixture");
         let temp = tempfile::tempdir().expect("temporary workspace");
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "src/lib.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let facts = parsed.source_facts.as_ref().expect("source facts");
         let properties = &facts.rust_declaration_properties;
         assert_eq!(
@@ -9270,7 +9461,7 @@ wrap! {
         let tree = parser.parse(source, None).expect("parse Rust fixture");
         let temp = tempfile::tempdir().expect("temporary workspace");
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "src/lib.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let facts = parsed.source_facts.as_ref().expect("source facts");
         let item = facts
             .rust_declaration_properties
@@ -9330,7 +9521,7 @@ macro_rules! mixed { ($name:ident, $item:item) => { $item }; }
         let tree = parser.parse(source, None).expect("parse Rust fixture");
         let temp = tempfile::tempdir().expect("temporary workspace");
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "src/lib.rs");
-        let definitions = parse_rust_file(&file, source, &tree)
+        let definitions = parse_rust_file_for_test(&file, source, &tree)
             .rust_usage_facts
             .module_routes
             .item_macros
@@ -9386,7 +9577,7 @@ macro_rules! opaque { ($($item:item)*) => { unknown! { $($item)* } }; }
         let tree = parser.parse(source, None).expect("parse Rust fixture");
         let temp = tempfile::tempdir().expect("temporary workspace");
         let file = ProjectFile::new(temp.path().canonicalize().unwrap(), "src/lib.rs");
-        let definitions = parse_rust_file(&file, source, &tree)
+        let definitions = parse_rust_file_for_test(&file, source, &tree)
             .rust_usage_facts
             .module_routes
             .item_macros
@@ -9465,7 +9656,7 @@ macro_rules! opaque { ($($item:item)*) => { unknown! { $($item)* } }; }
         let tree = parser.parse(source, None).unwrap();
         assert!(!tree.root_node().has_error());
         let file = ProjectFile::new(std::env::current_dir().unwrap(), "half.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         assert!(
             parsed.children.iter().any(|(owner, members)| {
                 owner.identifier() == "f16"
@@ -9508,7 +9699,7 @@ fn local_module() {
             temp.path().canonicalize().expect("canonical root"),
             "src/lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         assert_eq!(
             parsed
                 .rust_usage_facts
@@ -9567,7 +9758,7 @@ mod test_region_taint_tests {
             temp.path().canonicalize().expect("canonical root"),
             "src/lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         parsed
             .test_region_units
             .iter()
@@ -9586,7 +9777,7 @@ mod test_region_taint_tests {
             temp.path().canonicalize().expect("canonical root"),
             "src/lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let mut recorded = parsed
             .signature_metadata
             .iter()
@@ -10460,7 +10651,7 @@ mod nested {
         let tree = crate::test_helpers::parse_rust(source);
         let temp = tempfile::tempdir().unwrap();
         let file = ProjectFile::new(temp.path(), "src/nested.rs");
-        let parsed = parse_rust_file(&file, source, &tree);
+        let parsed = parse_rust_file_for_test(&file, source, &tree);
         let units = parsed.declarations();
         for (name, last_kind) in [
             ("nested", SegmentKind::Package),

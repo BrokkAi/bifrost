@@ -500,6 +500,7 @@ pub(crate) fn runtime_boundary_for_node(
     if node.kind() == "call"
         && let Some(method) = node.child_by_field_name("method")
     {
+        let kernel = crate::syntax::ruby_call_selects_kernel_function(node, source);
         match node_text(method, source) {
             "const_get" => return Some(Boundary::ConstGet),
             "const_set" => return Some(Boundary::ConstSet),
@@ -507,15 +508,26 @@ pub(crate) fn runtime_boundary_for_node(
             "const_missing" => return Some(Boundary::ConstMissingCall),
             "class_eval" => return Some(Boundary::ClassEval),
             "module_eval" => return Some(Boundary::ModuleEval),
-            "eval" => return Some(Boundary::Eval),
+            // A receiver that is not a constant path can hold a `Binding`,
+            // whose public `eval` runs code as well.
+            "eval"
+                if kernel
+                    || node
+                        .child_by_field_name("receiver")
+                        .is_some_and(|receiver| {
+                            !matches!(receiver.kind(), "constant" | "scope_resolution")
+                        }) =>
+            {
+                return Some(Boundary::Eval);
+            }
             "autoload" => return Some(Boundary::Autoload),
-            "require" if load.is_none_or(|load| load.has_receiver) => {
+            "require" if kernel && load.is_none_or(|load| load.has_receiver) => {
                 return Some(Boundary::DynamicRequire);
             }
-            "require_relative" if load.is_none_or(|load| load.has_receiver) => {
+            "require_relative" if kernel && load.is_none_or(|load| load.has_receiver) => {
                 return Some(Boundary::DynamicRequireRelative);
             }
-            "load" if load.is_none_or(|load| load.has_receiver) => {
+            "load" if kernel && load.is_none_or(|load| load.has_receiver) => {
                 return Some(Boundary::DynamicLoad);
             }
             _ => {}

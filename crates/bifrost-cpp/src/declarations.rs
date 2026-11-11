@@ -4624,6 +4624,66 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
     dialects: &[LanguageDialect],
     object_macro_fields: HashMap<String, ObjectMacroReplacement>,
 ) -> Vec<ParsedFile> {
+    parse_cpp_readings_observed(
+        file,
+        source,
+        root,
+        ancestry,
+        dialects,
+        object_macro_fields,
+        &IgnoreCppCallableObservations,
+    )
+}
+
+/// A live callable observation has the exact physical declaration range already
+/// linked by the visitor. The observer may copy facts, but cannot retain nodes.
+pub(crate) trait CppCallableObserver {
+    fn observe(
+        &self,
+        unit: &CodeUnit,
+        declaration_start: usize,
+        metadata: &SignatureMetadata,
+        declarator: Node<'_>,
+        source: &str,
+        ancestry: &ParentIndex<'_>,
+    );
+
+    fn observe_duplicate(
+        &self,
+        _unit: &CodeUnit,
+        _declaration_start: usize,
+        _declarator: Node<'_>,
+        _source: &str,
+        _ancestry: &ParentIndex<'_>,
+        _metadata: &dyn Fn() -> SignatureMetadata,
+    ) {
+    }
+}
+
+struct IgnoreCppCallableObservations;
+
+impl CppCallableObserver for IgnoreCppCallableObservations {
+    fn observe(
+        &self,
+        _unit: &CodeUnit,
+        _declaration_start: usize,
+        _metadata: &SignatureMetadata,
+        _declarator: Node<'_>,
+        _source: &str,
+        _ancestry: &ParentIndex<'_>,
+    ) {
+    }
+}
+
+pub(crate) fn parse_cpp_readings_observed<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+    dialects: &[LanguageDialect],
+    object_macro_fields: HashMap<String, ObjectMacroReplacement>,
+    callable_observer: &dyn CppCallableObserver,
+) -> Vec<ParsedFile> {
     assert!(
         dialects.len() == 1
             || (dialects.len() == 2
@@ -4653,6 +4713,7 @@ pub(crate) fn parse_cpp_readings_with_object_macro_fields<'tree>(
             source_dependencies: &dependencies,
             primary_ancestry: ancestry,
             primary_root_id: root.id(),
+            callable_observer,
             source_links: HashMap::default(),
             source_declarations: HashSet::default(),
             preprocessor_context_cache: Default::default(),
@@ -4959,15 +5020,30 @@ fn advance_primary_declarations<'tree>(
     }
 }
 
+/// The preprocessor and scope context a recovered or partitioned region
+/// inherits from the position it was cut from.
+///
+/// The three conditional fields are independent projections of the chain of
+/// enclosing conditional families, not one state: an inner family without a
+/// terminal `#else` inside an outer exhaustive one has `family` = inner,
+/// `exhaustive_family` = outer and `callable_guard_completion_byte` = `None`.
 #[derive(Clone)]
 struct CppActiveSourceContext {
+    /// The guards every enclosing branch requires. `None` when the context
+    /// keeps the region out of every configuration (a false or unreadable
+    /// condition, or contradictory branches); an empty set is unguarded.
     guards: Option<HashSet<crate::graph::resolver::PreprocessorGuard>>,
     namespace: Option<String>,
     child_namespace: Option<String>,
     outer_lexical_scope: Vec<String>,
     child_lexical_scope: Vec<String>,
+    /// The innermost enclosing conditional family, exhaustive or not.
     family: Option<SourceOccurrenceId>,
+    /// The innermost enclosing family that ends in `#else`.
     exhaustive_family: Option<SourceOccurrenceId>,
+    /// `None` when any enclosing family lacks a terminal `#else`; otherwise
+    /// the end byte of the enclosing families, `Some(0)` outside all of them.
+    /// Merging takes the maximum and lets `None` absorb.
     callable_guard_completion_byte: Option<usize>,
 }
 
@@ -4996,6 +5072,7 @@ pub struct CppVisitor<'a, 'source> {
     source_dependencies: &'a RefCell<crate::source_dependencies::DeclarationDependencies>,
     pub primary_ancestry: &'a ParentIndex<'a>,
     pub primary_root_id: usize,
+    callable_observer: &'a dyn CppCallableObserver,
     source_links: HashMap<CodeUnit, Vec<SourceDeclarationId>>,
     source_declarations: HashSet<SourceDeclarationId>,
     preprocessor_context_cache: crate::graph::resolver::PreprocessorContextCache,
@@ -5474,6 +5551,31 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         };
         if !self.parsed.source_declaration_metadata.contains(&link) {
             self.parsed.source_declaration_metadata.push(link);
+        }
+    }
+
+    fn add_callable_signature_with_metadata(
+        &mut self,
+        unit: CodeUnit,
+        declaration_start: usize,
+        declarator: Node<'_>,
+        ancestry: &ParentIndex<'_>,
+        metadata: SignatureMetadata,
+    ) {
+        self.callable_observer.observe(
+            &unit,
+            declaration_start,
+            &metadata,
+            declarator,
+            self.source,
+            ancestry,
+        );
+        // A malformed default argument can leave no complete parameter type
+        // to prove the overload discriminator. Keep the physical observation
+        // above for partial evidence, but do not persist a signature row
+        // without that proof.
+        if metadata.overload_discriminator().is_some() {
+            self.add_signature_with_metadata(unit, metadata);
         }
     }
 
@@ -6145,8 +6247,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 brokk_bifrost_core::analyzer::cpp_facts::CppOccurrenceRole::Definition;
             fact.callable_is_constructor = true;
         }
-        self.add_signature_with_metadata(
+        self.add_callable_signature_with_metadata(
             code_unit.clone(),
+            function_declarator.start_byte(),
+            function_declarator,
+            &recovered_ancestry,
             cpp_signature_metadata(
                 normalize_cpp_whitespace(node_text(function_declarator, self.source)),
                 function_declarator,
@@ -6355,6 +6460,10 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         let Some(parameters_node) = declarator.child_by_field_name("parameters") else {
             return false;
         };
+        let Ok(callable_slots) = cpp_callable_parameter_slots(parameters_node, &synthetic) else {
+            return false;
+        };
+        let callable_arity = cpp_callable_arity_from_slots(&callable_slots);
         let signature = cpp_parameter_signature(parameters_node, &synthetic);
         let mut parameter_labels = Vec::new();
         let mut parameter_cursor = parameters_node.walk();
@@ -6369,7 +6478,6 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 parameter_labels.push(name);
             }
         }
-        let arity = parameter_labels.len();
         let function = FunctionInfo {
             package_name: scope.package_name.clone(),
             owner: Some(CppMemberOwner::Unit(parent.clone())),
@@ -6386,8 +6494,8 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             parameter_labels,
         )
         .with_declaration_only(true)
-        .with_callable_arity(CallableArity::exact(arity))
-        .with_overload_discriminator(Some(cpp_overload_discriminator(declarator, &synthetic)))
+        .with_callable_arity(callable_arity)
+        .with_overload_discriminator(cpp_overload_discriminator(declarator, &synthetic))
         .with_callable_linkage(cpp_callable_linkage(statement, self.source, ancestry))
         // The reparse proves class ownership, but carries no original
         // class access ladder. Preserve unknown access rather than
@@ -7582,8 +7690,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         // of the caller: a declarator that a `function_definition` gives a body
         // is a definition wherever the recovery found it.
         let declaration_only = definition.is_none();
-        self.add_signature_with_metadata(
+        self.add_callable_signature_with_metadata(
             code_unit.clone(),
+            declaration.range.start_byte,
+            declaration.declarator,
+            ancestry,
             cpp_signature_metadata(
                 signature,
                 declaration.declarator,
@@ -8990,8 +9101,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
                 ancestry,
             )
         };
-        self.add_signature_with_metadata(
+        self.add_callable_signature_with_metadata(
             code_unit.clone(),
+            node.start_byte(),
+            function_declarator,
+            ancestry,
             cpp_signature_metadata(
                 signature,
                 function_declarator,
@@ -10065,6 +10179,30 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
         // refuse that key on identity grounds alone.
         let code_unit = function.code_unit(self.file.clone());
         if self.link_existing_source_declaration(ancestry, &code_unit, declaration_node) {
+            self.callable_observer.observe_duplicate(
+                &code_unit,
+                declaration_node.start_byte(),
+                declarator,
+                self.source,
+                ancestry,
+                &|| {
+                    let signature = render_cpp_function_display_signature_from_node(
+                        declaration_node,
+                        self.source,
+                        scope.template_signature.as_deref(),
+                        false,
+                        ancestry,
+                    );
+                    cpp_signature_metadata(
+                        signature,
+                        declarator,
+                        cpp_callable_linkage(declaration_node, self.source, ancestry),
+                        self.source,
+                        ancestry,
+                    )
+                    .with_declaration_only(true)
+                },
+            );
             return;
         }
         self.add_declaration(ancestry, code_unit.clone(), declaration_node, None, None);
@@ -10075,8 +10213,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             false,
             ancestry,
         );
-        self.add_signature_with_metadata(
+        self.add_callable_signature_with_metadata(
             code_unit.clone(),
+            declaration_node.start_byte(),
+            declarator,
+            ancestry,
             cpp_signature_metadata(
                 signature,
                 declarator,
@@ -10253,8 +10394,11 @@ impl<'a, 'source> CppVisitor<'a, 'source> {
             Some(template_signature) => format!("template {template_signature} {head} {{...}}"),
             None => format!("{head} {{...}}"),
         };
-        self.add_signature_with_metadata(
+        self.add_callable_signature_with_metadata(
             code_unit.clone(),
+            declaration_node.start_byte(),
+            function_declarator,
+            ancestry,
             cpp_signature_metadata(
                 signature,
                 function_declarator,
@@ -15420,10 +15564,8 @@ fn cpp_signature_metadata<'tree>(
         },
     };
     let enrich = |mut metadata: SignatureMetadata| {
-        metadata = metadata.with_overload_discriminator(Some(cpp_overload_discriminator(
-            function_declarator,
-            source,
-        )));
+        metadata = metadata
+            .with_overload_discriminator(cpp_overload_discriminator(function_declarator, source));
         // #3507: a qualified definition repeats none of the class body's
         // dispatch facts, so this row publishes none either.
         if let Some(dispatch) = dispatch {
@@ -15447,21 +15589,31 @@ fn cpp_signature_metadata<'tree>(
                 .with_return_type_identity(return_type_identity),
         );
     };
-    let callable_arity = cpp_callable_arity(parameters_node, source);
-    let callable_parameter_types = cpp_callable_parameter_types(parameters_node, source);
+    let callable_slots = cpp_callable_parameter_slots(parameters_node, source).ok();
+    let callable_arity = callable_slots.as_deref().map(cpp_callable_arity_from_slots);
+    let callable_parameter_types = callable_slots
+        .as_deref()
+        .map(|slots| cpp_callable_parameter_types_from_slots(slots, source));
+    let with_parameter_facts = |mut metadata: SignatureMetadata| {
+        if let Some(arity) = callable_arity {
+            metadata = metadata.with_callable_arity(arity);
+        }
+        if let Some(types) = &callable_parameter_types {
+            metadata = metadata.with_callable_parameter_types(types.clone());
+        }
+        metadata
+    };
     let parameter_text = normalize_cpp_whitespace(node_text(parameters_node, source));
     let search_from = cpp_signature_search_start(&signature, function_declarator, source, ancestry);
     let Some(relative_start) = signature
         .get(search_from..)
         .and_then(|suffix| suffix.find(&parameter_text))
     else {
-        return enrich(
+        return enrich(with_parameter_facts(
             SignatureMetadata::new(signature, Vec::new())
-                .with_callable_arity(callable_arity)
-                .with_callable_parameter_types(callable_parameter_types)
                 .with_return_type_text(return_type_text)
                 .with_return_type_identity(return_type_identity),
-        );
+        ));
     };
     let parameters_start = search_from + relative_start;
     let parameters_end = parameters_start + parameter_text.len();
@@ -15481,13 +15633,11 @@ fn cpp_signature_metadata<'tree>(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    enrich(
+    enrich(with_parameter_facts(
         SignatureMetadata::new(signature, parameters)
-            .with_callable_arity(callable_arity)
-            .with_callable_parameter_types(callable_parameter_types)
             .with_return_type_text(return_type_text)
             .with_return_type_identity(return_type_identity),
-    )
+    ))
 }
 
 pub(crate) fn cpp_callable_is_structural_constructor<'tree>(
@@ -16283,111 +16433,393 @@ fn cpp_callable_return_type_text<'tree>(
     None
 }
 
-pub(crate) fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> CallableArity {
+fn cpp_callable_arity_from_slots(slots: &[CppParameterSlot<'_>]) -> CallableArity {
     let mut required = 0;
     let mut total = 0;
     let mut repeated = false;
-    for slot in cpp_callable_parameter_slots(parameters_node, source) {
+    for slot in slots {
         match slot {
             CppParameterSlot::Declared {
                 required: is_required,
+                variadic,
                 ..
             } => {
                 total += 1;
-                if is_required {
+                if *is_required && !*variadic {
                     required += 1;
                 }
+                repeated |= *variadic;
             }
-            CppParameterSlot::OptionalVoid => total += 1,
             CppParameterSlot::Ellipsis => repeated = true,
         }
     }
     CallableArity::new(required, total, repeated)
 }
 
-/// One entry of a callable's invocation parameter list, plus an optional
-/// unnamed `void` declaration retained for the legacy arity result.
-///
-/// The list excludes an explicit object parameter and a lone `void`. Every
-/// derivation of parameter arity or type starts from this same sequence, so
-/// those views cannot disagree about which parameters exist.
+/// The pinned grammar's recovery of a Clang Blocks formal `Ret (^name)(Args)`:
+/// the return type and the caret-less `(name)` read as a `macro_type_specifier`
+/// whose `^` is the only recovery node, and `(Args)` as the declarator.
+struct CppBlockPointerFormal<'tree> {
+    result: Node<'tree>,
+    name: Node<'tree>,
+}
+
+fn cpp_block_pointer_formal(parameter: Node<'_>) -> Option<CppBlockPointerFormal<'_>> {
+    if parameter.kind() != "parameter_declaration" {
+        return None;
+    }
+    let ty = parameter.child_by_field_name("type")?;
+    let declarator = parameter.child_by_field_name("declarator")?;
+    if ty.kind() != "macro_type_specifier" || declarator.kind() != "abstract_function_declarator" {
+        return None;
+    }
+    let mut cursor = ty.walk();
+    let children = ty.children(&mut cursor).collect::<Vec<_>>();
+    let [result, open, caret, descriptor, close] = children.as_slice() else {
+        return None;
+    };
+    let mut caret_cursor = caret.walk();
+    let caret_children = caret.children(&mut caret_cursor).collect::<Vec<_>>();
+    let name = descriptor.child_by_field_name("type")?;
+    (ty.child_by_field_name("name") == Some(*result)
+        && result.kind() == "identifier"
+        && open.kind() == "("
+        && caret.is_error()
+        && matches!(caret_children.as_slice(), [token] if token.kind() == "^")
+        && descriptor.kind() == "type_descriptor"
+        && ty.child_by_field_name("type") == Some(*descriptor)
+        && descriptor.named_child_count() == 1
+        && name.kind() == "type_identifier"
+        && !descriptor.has_error()
+        && close.kind() == ")"
+        && !declarator.has_error())
+    .then_some(CppBlockPointerFormal {
+        result: *result,
+        name,
+    })
+}
+
+/// Whether `recovery` is a recovery node the formal-role reader proves safe.
+/// Two exact shapes are admitted; every other ERROR or MISSING node leaves the
+/// formal layout unavailable:
+/// - the `^` of a Clang Blocks formal, see [`cpp_block_pointer_formal`];
+/// - the MISSING type of a braced default argument `T x = {}`, which the
+///   grammar reads as a `compound_literal_expression`. The default value is
+///   not part of a formal's type, name or optionality.
+fn cpp_recovery_is_proven_formal_shape(recovery: Node<'_>) -> bool {
+    let Some(parent) = recovery.parent() else {
+        return false;
+    };
+    if recovery.is_error() {
+        return parent.kind() == "macro_type_specifier"
+            && parent
+                .parent()
+                .is_some_and(|parameter| cpp_block_pointer_formal(parameter).is_some());
+    }
+    recovery.is_missing()
+        && recovery.kind() == "type_identifier"
+        && parent.kind() == "compound_literal_expression"
+        && parent.child_by_field_name("type") == Some(recovery)
+        && parent
+            .child_by_field_name("value")
+            .is_some_and(|value| value.kind() == "initializer_list" && !value.has_error())
+        && parent.parent().is_some_and(|optional| {
+            optional.kind() == "optional_parameter_declaration"
+                && optional.child_by_field_name("default_value") == Some(parent)
+        })
+}
+
+/// Whether a parameter list holds a recovery node that is not a proven shape.
+fn cpp_parameter_list_has_unproven_recovery(
+    list: Node<'_>,
+    scope_step: &mut impl FnMut() -> bool,
+) -> Result<bool, CppFormalRoleError> {
+    let mut pending = vec![list];
+    while let Some(node) = pending.pop() {
+        if !scope_step() {
+            return Err(CppFormalRoleError::Stopped);
+        }
+        if !node.has_error() {
+            continue;
+        }
+        if node.is_error() || node.is_missing() {
+            if !cpp_recovery_is_proven_formal_shape(node) {
+                return Ok(true);
+            }
+            continue;
+        }
+        pending.extend(node.children(&mut node.walk()));
+    }
+    Ok(false)
+}
+
+/// A grammar role for one direct child of a C or C++ parameter list.
+/// Invalid and stopped classifications are separate from a valid empty list.
+#[derive(Clone, Copy)]
+pub enum CppFormalRole<'tree> {
+    Declared {
+        parameter: Node<'tree>,
+        name: Option<Node<'tree>>,
+        receiver: bool,
+        required: bool,
+        variadic: bool,
+    },
+    Void,
+    Ellipsis,
+    Other,
+}
+
+#[derive(Clone, Copy)]
+pub enum CppFormalRoleError {
+    Invalid,
+    Stopped,
+}
+
+/// Classify a structurally selected list child. A bare `void` is valid only
+/// when it is the sole parameter; a typed pack keeps its declaration node.
+pub fn cpp_formal_role_with_step<'tree>(
+    child: Node<'tree>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Result<CppFormalRole<'tree>, CppFormalRoleError> {
+    if !scope_step() {
+        return Err(CppFormalRoleError::Stopped);
+    }
+    let Some(list) = child.parent() else {
+        return Err(CppFormalRoleError::Invalid);
+    };
+    if !matches!(list.kind(), "parameter_list" | "parameters")
+        || child.is_missing()
+        || cpp_parameter_list_has_unproven_recovery(list, &mut scope_step)?
+    {
+        return Err(CppFormalRoleError::Invalid);
+    }
+    let (parameter, receiver) = if child.kind() == "explicit_object_parameter_declaration" {
+        let mut selected = None;
+        for nested in child.named_children(&mut child.walk()) {
+            if !scope_step() {
+                return Err(CppFormalRoleError::Stopped);
+            }
+            if nested.kind() == "parameter_declaration" && selected.replace(nested).is_some() {
+                return Err(CppFormalRoleError::Invalid);
+            }
+        }
+        (selected.ok_or(CppFormalRoleError::Invalid)?, true)
+    } else {
+        (child, false)
+    };
+    if !scope_step() {
+        return Err(CppFormalRoleError::Stopped);
+    }
+    match parameter.kind() {
+        "parameter_declaration"
+        | "optional_parameter_declaration"
+        | "variadic_parameter_declaration" => {
+            // The list walk above already refused every recovery node that is
+            // not an exact proven shape, so only field presence remains.
+            let ty = parameter
+                .child_by_field_name("type")
+                .ok_or(CppFormalRoleError::Invalid)?;
+            if !scope_step() {
+                return Err(CppFormalRoleError::Stopped);
+            }
+            let declarator = parameter.child_by_field_name("declarator");
+            if !scope_step() {
+                return Err(CppFormalRoleError::Stopped);
+            }
+            if parameter.kind() == "variadic_parameter_declaration" && declarator.is_none() {
+                return Err(CppFormalRoleError::Invalid);
+            }
+            if parameter.kind() == "optional_parameter_declaration" {
+                if !scope_step() {
+                    return Err(CppFormalRoleError::Stopped);
+                }
+                if parameter.child_by_field_name("default_value").is_none() {
+                    return Err(CppFormalRoleError::Invalid);
+                }
+            }
+            if declarator.is_none()
+                && ty.kind() == "primitive_type"
+                && node_text(ty, source) == "void"
+            {
+                if parameter.kind() != "parameter_declaration" || receiver {
+                    return Err(CppFormalRoleError::Invalid);
+                }
+                let mut parameters = 0;
+                for sibling in list.children(&mut list.walk()) {
+                    if !scope_step() {
+                        return Err(CppFormalRoleError::Stopped);
+                    }
+                    if matches!(
+                        sibling.kind(),
+                        "parameter_declaration"
+                            | "optional_parameter_declaration"
+                            | "variadic_parameter_declaration"
+                            | "explicit_object_parameter_declaration"
+                            | "variadic_parameter"
+                            | "..."
+                    ) {
+                        parameters += 1;
+                    }
+                }
+                return if parameters == 1 {
+                    Ok(CppFormalRole::Void)
+                } else {
+                    Err(CppFormalRoleError::Invalid)
+                };
+            }
+            let name = if parameter.kind() == "variadic_parameter_declaration" {
+                let mut pending = declarator.into_iter().collect::<Vec<_>>();
+                let mut found = None;
+                while let Some(node) = pending.pop() {
+                    if !scope_step() {
+                        return Err(CppFormalRoleError::Stopped);
+                    }
+                    if node.kind() == "identifier" {
+                        found = Some(node);
+                        break;
+                    }
+                    let children = node.named_children(&mut node.walk()).collect::<Vec<_>>();
+                    for child in children.into_iter().rev() {
+                        if !scope_step() {
+                            return Err(CppFormalRoleError::Stopped);
+                        }
+                        pending.push(child);
+                    }
+                }
+                found
+            } else {
+                if let Some(declarator) = declarator {
+                    let mut pending = vec![declarator];
+                    while let Some(node) = pending.pop() {
+                        if !scope_step() {
+                            return Err(CppFormalRoleError::Stopped);
+                        }
+                        for child in node.named_children(&mut node.walk()) {
+                            if !scope_step() {
+                                return Err(CppFormalRoleError::Stopped);
+                            }
+                            pending.push(child);
+                        }
+                    }
+                }
+                match cpp_block_pointer_formal(parameter) {
+                    Some(block) => Some(block.name),
+                    None => declarator.and_then(crate::structural::declarator_name_node),
+                }
+            };
+            Ok(CppFormalRole::Declared {
+                parameter,
+                name,
+                receiver,
+                required: parameter.kind() != "optional_parameter_declaration",
+                variadic: parameter.kind() == "variadic_parameter_declaration",
+            })
+        }
+        "variadic_parameter" | "..." => Ok(CppFormalRole::Ellipsis),
+        "(" | ")" | "," | "comment" => Ok(CppFormalRole::Other),
+        _ => Err(CppFormalRoleError::Invalid),
+    }
+}
+
+/// One invocation parameter; explicit object and lone void are excluded.
 #[derive(Clone, Copy)]
 enum CppParameterSlot<'tree> {
     Declared {
         parameter: Node<'tree>,
+        name: Option<Node<'tree>>,
         required: bool,
+        variadic: bool,
     },
-    OptionalVoid,
     Ellipsis,
 }
 
 fn cpp_callable_parameter_slots<'tree>(
     parameters_node: Node<'tree>,
     source: &str,
-) -> Vec<CppParameterSlot<'tree>> {
+) -> Result<Vec<CppParameterSlot<'tree>>, CppFormalRoleError> {
+    if parameters_node.is_missing()
+        || cpp_parameter_list_has_unproven_recovery(parameters_node, &mut || true)?
+    {
+        return Err(CppFormalRoleError::Invalid);
+    }
     let mut slots = Vec::new();
     let mut cursor = parameters_node.walk();
-    for parameter in parameters_node.children(&mut cursor) {
-        match parameter.kind() {
-            "parameter_declaration" | "optional_parameter_declaration" => {
-                let is_unnamed_void = parameter.child_by_field_name("declarator").is_none()
-                    && parameter
-                        .child_by_field_name("type")
-                        .is_some_and(|type_node| node_text(type_node, source).trim() == "void");
-                if is_unnamed_void && parameter.kind() == "parameter_declaration" {
-                    continue;
-                }
-                if is_unnamed_void {
-                    slots.push(CppParameterSlot::OptionalVoid);
-                    continue;
-                }
+    for child in parameters_node.children(&mut cursor) {
+        match cpp_formal_role_with_step(child, source, || true) {
+            Ok(CppFormalRole::Declared {
+                parameter,
+                name,
+                receiver: false,
+                required,
+                variadic,
+            }) => {
                 slots.push(CppParameterSlot::Declared {
                     parameter,
-                    required: parameter.kind() == "parameter_declaration",
+                    name,
+                    required,
+                    variadic,
                 });
             }
-            "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
-                slots.push(CppParameterSlot::Ellipsis);
-            }
-            _ => {}
+            Ok(CppFormalRole::Ellipsis) => slots.push(CppParameterSlot::Ellipsis),
+            Ok(
+                CppFormalRole::Declared { receiver: true, .. }
+                | CppFormalRole::Void
+                | CppFormalRole::Other,
+            ) => {}
+            Err(error) => return Err(error),
         }
     }
-    slots
+    Ok(slots)
 }
 
-pub(crate) fn cpp_callable_parameter_types(parameters_node: Node<'_>, source: &str) -> Vec<String> {
-    cpp_callable_parameter_slots(parameters_node, source)
-        .into_iter()
-        .filter_map(|slot| match slot {
-            CppParameterSlot::Declared { parameter, .. } => {
-                Some(cpp_parameter_type(parameter, source))
-            }
-            CppParameterSlot::Ellipsis => Some("...".to_string()),
-            CppParameterSlot::OptionalVoid => None,
+fn cpp_callable_parameter_types_from_slots(
+    slots: &[CppParameterSlot<'_>],
+    source: &str,
+) -> Vec<String> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            CppParameterSlot::Declared { parameter, .. } => cpp_parameter_type(*parameter, source),
+            CppParameterSlot::Ellipsis => "...".to_string(),
         })
         .collect()
+}
+
+pub(crate) fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> Option<CallableArity> {
+    cpp_callable_parameter_slots(parameters_node, source)
+        .ok()
+        .map(|slots| cpp_callable_arity_from_slots(&slots))
+}
+
+pub(crate) fn cpp_callable_parameter_types(
+    parameters_node: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    cpp_callable_parameter_slots(parameters_node, source)
+        .ok()
+        .map(|slots| cpp_callable_parameter_types_from_slots(&slots, source))
 }
 
 /// Return the written name of each callable parameter in invocation order.
 /// C and C++ permit declarations without names; those slots deliberately stay
-/// `None` so consumers can distinguish an unnamed formal from a guessed one.
+/// `None` inside the returned vector. An unavailable list returns outer `None`.
 pub(crate) fn cpp_callable_parameter_names(
     parameters_node: Node<'_>,
     source: &str,
-) -> Vec<Option<String>> {
-    cpp_callable_parameter_slots(parameters_node, source)
-        .into_iter()
-        .filter_map(|slot| match slot {
-            CppParameterSlot::Declared { parameter, .. } => Some(
-                parameter
-                    .child_by_field_name("declarator")
-                    .and_then(crate::structural::declarator_name_node)
-                    .and_then(|name| direct_identifier_name(name, source)),
-            ),
-            CppParameterSlot::Ellipsis => Some(None),
-            CppParameterSlot::OptionalVoid => None,
-        })
-        .collect()
+) -> Option<Vec<Option<String>>> {
+    Some(
+        cpp_callable_parameter_slots(parameters_node, source)
+            .ok()?
+            .into_iter()
+            .map(|slot| match slot {
+                CppParameterSlot::Declared { name, .. } => {
+                    name.and_then(|name| direct_identifier_name(name, source))
+                }
+                CppParameterSlot::Ellipsis => None,
+            })
+            .collect(),
+    )
 }
 
 /// One callable parameter's parser-derived type.
@@ -16411,27 +16843,28 @@ pub enum CppParameterType {
 ///
 /// The result is index-parallel with the rendered
 /// [`SignatureMetadata::callable_parameter_types`] spellings of the same
-/// callable.
+/// callable. Outer `None` means the grammar did not prove a complete list;
+/// `Some(Vec::new())` proves a valid zero-parameter list.
 pub fn cpp_callable_parameter_type_identities<'tree>(
     function_declarator: Node<'tree>,
     source: &str,
     ancestry: &ParentIndex<'tree>,
-) -> Vec<CppParameterType> {
-    let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
-        return Vec::new();
-    };
+) -> Option<Vec<CppParameterType>> {
+    let parameters_node = function_declarator.child_by_field_name("parameters")?;
     let lexical_scope = cpp_callable_lexical_scope(function_declarator, source, ancestry);
-    cpp_callable_parameter_slots(parameters_node, source)
-        .into_iter()
-        .filter_map(|slot| match slot {
-            CppParameterSlot::Ellipsis => Some(CppParameterType::Ellipsis),
-            CppParameterSlot::Declared { parameter, .. } => Some(
-                cpp_parameter_type_identity(parameter, source, &lexical_scope)
-                    .map_or(CppParameterType::Unstructured, CppParameterType::Structured),
-            ),
-            CppParameterSlot::OptionalVoid => None,
-        })
-        .collect()
+    Some(
+        cpp_callable_parameter_slots(parameters_node, source)
+            .ok()?
+            .into_iter()
+            .map(|slot| match slot {
+                CppParameterSlot::Ellipsis => CppParameterType::Ellipsis,
+                CppParameterSlot::Declared { parameter, .. } => {
+                    cpp_parameter_type_identity(parameter, source, &lexical_scope)
+                        .map_or(CppParameterType::Unstructured, CppParameterType::Structured)
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The parser-derived type of one declared object or parameter.
@@ -16485,27 +16918,28 @@ fn cpp_declaration_type_identity_in_scope(
 /// The result is index-parallel with
 /// [`cpp_callable_parameter_type_identities`]; a parameter that admits no
 /// comparable shape is [`CppComparableSlot::Unstructured`], which a comparison
-/// must treat as evidence of nothing rather than as agreement.
+/// must treat as evidence of nothing rather than as agreement. Outer `None`
+/// means the grammar did not prove the parameter list.
 pub fn cpp_comparable_parameter_shapes<'tree>(
     function_declarator: Node<'tree>,
     source: &str,
     ancestry: &ParentIndex<'tree>,
-) -> Vec<CppComparableSlot> {
-    let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
-        return Vec::new();
-    };
+) -> Option<Vec<CppComparableSlot>> {
+    let parameters_node = function_declarator.child_by_field_name("parameters")?;
     let lexical_scope = cpp_callable_lexical_scope(function_declarator, source, ancestry);
-    cpp_callable_parameter_slots(parameters_node, source)
-        .into_iter()
-        .filter_map(|slot| match slot {
-            CppParameterSlot::Ellipsis => Some(CppComparableSlot::Ellipsis),
-            CppParameterSlot::Declared { parameter, .. } => Some(
-                cpp_comparable_parameter(parameter, source, &lexical_scope)
-                    .map_or(CppComparableSlot::Unstructured, CppComparableSlot::Shape),
-            ),
-            CppParameterSlot::OptionalVoid => None,
-        })
-        .collect()
+    Some(
+        cpp_callable_parameter_slots(parameters_node, source)
+            .ok()?
+            .into_iter()
+            .map(|slot| match slot {
+                CppParameterSlot::Ellipsis => CppComparableSlot::Ellipsis,
+                CppParameterSlot::Declared { parameter, .. } => {
+                    cpp_comparable_parameter(parameter, source, &lexical_scope)
+                        .map_or(CppComparableSlot::Unstructured, CppComparableSlot::Shape)
+                }
+            })
+            .collect(),
+    )
 }
 
 fn cpp_comparable_parameter(
@@ -22082,63 +22516,70 @@ fn cpp_is_indexable_item_kind(kind: &str) -> bool {
     )
 }
 
-fn cpp_overload_discriminator(declarator: Node<'_>, source: &str) -> [u8; 32] {
+fn cpp_overload_discriminator(declarator: Node<'_>, source: &str) -> Option<[u8; 32]> {
     use brokk_bifrost_core::analyzer::tree_walk::{
         canonical_type_tokens, overload_discriminator, overload_parameter_tokens,
     };
     let mut tokens = Vec::new();
-    if let Some(parameters) = declarator.child_by_field_name("parameters") {
-        for slot in cpp_callable_parameter_slots(parameters, source) {
-            match slot {
-                CppParameterSlot::Declared { parameter, .. } => {
-                    tokens.extend(overload_parameter_tokens(
+    let parameters = declarator.child_by_field_name("parameters")?;
+    for slot in cpp_callable_parameter_slots(parameters, source).ok()? {
+        match slot {
+            CppParameterSlot::Declared {
+                parameter, name, ..
+            } => {
+                // The `(^name)` of a Blocks formal sits inside the recovered
+                // type; the written name never distinguishes an overload.
+                match cpp_block_pointer_formal(parameter) {
+                    Some(block) => {
+                        tokens.extend(overload_parameter_tokens(Some(block.result), source));
+                        tokens.push("<block-pointer>".to_owned());
+                    }
+                    None => tokens.extend(overload_parameter_tokens(
                         parameter.child_by_field_name("type"),
                         source,
-                    ));
-                    let mut cursor = parameter.walk();
-                    for qualifier in parameter.named_children(&mut cursor) {
-                        if qualifier.kind() == "type_qualifier" {
-                            tokens.extend(canonical_type_tokens(qualifier, source));
-                        }
+                    )),
+                }
+                let mut cursor = parameter.walk();
+                for qualifier in parameter.named_children(&mut cursor) {
+                    if qualifier.kind() == "type_qualifier" {
+                        tokens.extend(canonical_type_tokens(qualifier, source));
                     }
-                    // Pointer/reference/array/function declarators carry type
-                    // structure outside the base type. Exclude only the name.
-                    if let Some(declarator) = parameter.child_by_field_name("declarator") {
-                        let name = crate::structural::declarator_name_node(declarator);
-                        let mut pending = vec![(declarator, name)];
-                        while let Some((node, excluded_name)) = pending.pop() {
-                            if Some(node) == excluded_name {
-                                continue;
-                            }
-                            if node.child_count() == 0 {
-                                tokens.extend(canonical_type_tokens(node, source));
+                }
+                // Pointer/reference/array/function declarators carry type
+                // structure outside the base type. Exclude only the name.
+                if let Some(declarator) = parameter.child_by_field_name("declarator") {
+                    let mut pending = vec![(declarator, name)];
+                    while let Some((node, excluded_name)) = pending.pop() {
+                        if Some(node) == excluded_name {
+                            continue;
+                        }
+                        if node.child_count() == 0 {
+                            tokens.extend(canonical_type_tokens(node, source));
+                        } else {
+                            let parameter = matches!(
+                                node.kind(),
+                                "parameter_declaration" | "optional_parameter_declaration"
+                            );
+                            let excluded_name = if parameter {
+                                node.child_by_field_name("declarator")
+                                    .and_then(crate::structural::declarator_name_node)
                             } else {
-                                let parameter = matches!(
-                                    node.kind(),
-                                    "parameter_declaration" | "optional_parameter_declaration"
-                                );
-                                let excluded_name = if parameter {
-                                    node.child_by_field_name("declarator")
-                                        .and_then(crate::structural::declarator_name_node)
-                                } else {
-                                    excluded_name
-                                };
-                                let default = parameter
-                                    .then(|| node.child_by_field_name("default_value"))
-                                    .flatten();
-                                for index in (0..node.child_count()).rev() {
-                                    let child = node.child(index).expect("child");
-                                    if Some(child) != default {
-                                        pending.push((child, excluded_name));
-                                    }
+                                excluded_name
+                            };
+                            let default = parameter
+                                .then(|| node.child_by_field_name("default_value"))
+                                .flatten();
+                            for index in (0..node.child_count()).rev() {
+                                let child = node.child(index).expect("child");
+                                if Some(child) != default {
+                                    pending.push((child, excluded_name));
                                 }
                             }
                         }
                     }
                 }
-                CppParameterSlot::Ellipsis => tokens.push("<ellipsis>".to_owned()),
-                CppParameterSlot::OptionalVoid => {}
             }
+            CppParameterSlot::Ellipsis => tokens.push("<ellipsis>".to_owned()),
         }
     }
     let mut cursor = declarator.walk();
@@ -22158,7 +22599,7 @@ fn cpp_overload_discriminator(declarator: Node<'_>, source: &str) -> [u8; 32] {
             tokens.extend(canonical_type_tokens(qualifier, source));
         }
     }
-    overload_discriminator(tokens)
+    Some(overload_discriminator(tokens))
 }
 
 fn cpp_synthetic_name(node: Node<'_>) -> brokk_bifrost_core::analyzer::tree_walk::SyntheticName {
@@ -22925,6 +23366,7 @@ namespace internal {
             source_dependencies: &dependencies,
             primary_ancestry: &ancestry,
             primary_root_id: tree.root_node().id(),
+            callable_observer: &IgnoreCppCallableObservations,
             source_links: HashMap::default(),
             source_declarations: HashSet::default(),
             preprocessor_context_cache: Default::default(),
@@ -23063,6 +23505,7 @@ namespace internal {
             source_dependencies: &dependencies,
             primary_ancestry: &ancestry,
             primary_root_id: tree.root_node().id(),
+            callable_observer: &IgnoreCppCallableObservations,
             source_links: HashMap::default(),
             source_declarations: HashSet::default(),
             preprocessor_context_cache: Default::default(),
@@ -27423,6 +27866,7 @@ void Widget::both_const(const int* p) {}
         let declarator =
             cpp_function_declarator_at(tree.root_node(), start).expect("function declarator");
         cpp_comparable_parameter_shapes(declarator, source, &ParentIndex::unindexed())
+            .expect("valid fixture parameter roles")
     }
 
     fn sole_comparable_shape(source: &str, callable_name: &str) -> CppComparableParameter {

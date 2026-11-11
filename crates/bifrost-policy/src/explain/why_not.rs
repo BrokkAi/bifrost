@@ -25,7 +25,8 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_rql::structural::search::{
-    execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
+    CodeQueryExecutionScope, execute_code_query_detailed_eager_index_in_scope,
+    execute_code_query_detailed_eager_index_workspace_in_scope,
 };
 use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryResultDetail, CodeQueryResultValue,
@@ -295,7 +296,18 @@ pub fn explain_match_candidate(
         PrefixExecution::AnalyzerOnly,
         budget.max_findings(),
     );
-    let root = candidate_root(candidate, query, stages);
+    let mut root = candidate_root(candidate, query, stages);
+    if let Some(reason) = policy.definition().metadata.proven_subset_reason.as_deref() {
+        root.push_child(
+            RawNode::new(
+                ExplanationNodeKind::CoverageObligation,
+                ExplanationOutcome::Unknown,
+                "declared_proven_subset",
+            )
+            .with_expected("the policy selects every matching shape")
+            .with_actual(reason),
+        );
+    }
     build_explanation(
         ExplanationQuestion::WhyNot,
         policy.definition().metadata.id.clone(),
@@ -415,20 +427,22 @@ pub(super) fn run_prefixes(
 
         match (execution, context.workspace) {
             (PrefixExecution::PreferWorkspace, Some(workspace)) => {
-                execute_code_query_detailed_eager_index_workspace(
+                execute_code_query_detailed_eager_index_workspace_in_scope(
                     workspace,
                     context.flow_resources(),
                     &query,
                     budget.query_limits(),
                     context.cancellation,
+                    CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
                 )
             }
-            _ => execute_code_query_detailed_eager_index(
+            _ => execute_code_query_detailed_eager_index_in_scope(
                 context.analyzer,
                 context.flow_resources(),
                 &query,
                 budget.query_limits(),
                 context.cancellation,
+                CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(false),
             ),
         }
     };
@@ -529,7 +543,7 @@ pub(super) fn run_prefixes(
         let completion = executed.result.completion();
         if !matches!(completion, CodeQueryCompletion::Complete) {
             suffix_exhaustive = false;
-            suffix_reasons.extend(absence_reasons(&completion, executed.result.truncated));
+            suffix_reasons.extend(absence_reasons(&completion));
         }
     }
     later_prefix_state.reverse();
@@ -589,7 +603,7 @@ pub(super) fn run_prefixes(
                     ExplanationOutcome::Unknown
                 };
                 let rows = executed.result.results.len();
-                let mut reasons = absence_reasons(&completion, executed.result.truncated);
+                let mut reasons = absence_reasons(&completion);
                 if prefixes_omitted {
                     reasons.push(PolicyIncompleteReason::ReportRetentionBudget);
                 }
@@ -962,17 +976,14 @@ fn provenance_is_prefix(
 /// diagnostic codes through the evaluator's existing code-to-reason mapping,
 /// so a `why-not` answer names incompleteness in the same vocabulary a run
 /// does.
-pub(crate) fn absence_reasons(
-    completion: &CodeQueryCompletion,
-    truncated: bool,
-) -> Vec<PolicyIncompleteReason> {
+pub(crate) fn absence_reasons(completion: &CodeQueryCompletion) -> Vec<PolicyIncompleteReason> {
     let mut reasons = match completion {
         CodeQueryCompletion::Complete => Vec::new(),
         CodeQueryCompletion::ProvenSubset { codes } | CodeQueryCompletion::Invalid { codes } => {
             codes.iter().map(incomplete_reason_for_code).collect()
         }
         CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::Cancelled => {
-            incomplete_reasons(completion, truncated)
+            incomplete_reasons(completion)
         }
     };
     if reasons.is_empty() && !matches!(completion, CodeQueryCompletion::Complete) {

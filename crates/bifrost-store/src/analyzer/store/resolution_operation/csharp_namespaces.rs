@@ -330,9 +330,13 @@ pub fn probe_namespace_members(
     let Some(mount) = operation.mount_table().mount_for_path("csharp", caller)? else {
         return Ok(None);
     };
+    let Some(certified) = operation.ready.certified_csharp_view()? else {
+        return Ok(None);
+    };
     let mut units = CSharpUnitReader::new(
         &operation.ready.inventory,
         snapshot,
+        &certified,
         &operation.ready.context_identities,
     )?;
     let Some(callers) = units.placements(caller)? else {

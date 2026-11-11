@@ -51,12 +51,13 @@ pub(crate) mod go_publication_tests {
             // A recovered region publishes its span; whether a callable contains it
             // is the store's answer when it reads the row back (#3777), so the parse
             // alone cannot state the expected region rows.
-            let (nodes, roles, occurrence_roles, recovered_regions) =
+            let (nodes, roles, occurrence_roles, coverage, recovered_regions) =
                 facts.structural.clone().into_parts();
             let mut expected_structural = FileFacts::from_source_and_rows(
                 state.source.clone(),
                 facts.occurrences.clone(),
-                StructuralFactRows::new(nodes, roles, occurrence_roles, Vec::new()),
+                StructuralFactRows::new(nodes, roles, occurrence_roles, Vec::new())
+                    .with_coverage(coverage),
             )
             .persisted_rows()
             .expect("canonical structural rows");

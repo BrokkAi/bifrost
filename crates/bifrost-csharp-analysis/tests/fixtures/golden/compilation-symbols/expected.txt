@@ -1,5 +1,5 @@
-Some("Append/Append.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=e1af4aa796e3834defad36844b27caf41f456b46fde07a72ad2c8986161858a0
-  DEBUG (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("Append/Append.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=338994a86303102b45ba62b28b68189f6788229e4494f55324cfeb17c76f41d5
   FOO (define_constants)
   NET (sdk)
   NET10_0 (sdk)
@@ -18,9 +18,10 @@ Some("Append/Append.csproj"): configuration=Debug framework=Some("net10.0") clos
   NETCOREAPP3_0_OR_GREATER (sdk)
   NETCOREAPP3_1_OR_GREATER (sdk)
   TRACE (sdk)
-Some("Conditional/Conditional.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("condition") digest=6c58994a77337ed84b4bb8a4c5a0397210228416d5a245b0b332edcb78bf9261
-Some("Console/Console.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=b2865ae696b2a9c6364d8dfddc4d1afa2cce5379fadcd6c15503ba9c22e46e98
-  DEBUG (sdk)
+named-open={}
+Some("Conditional/Conditional.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("condition") digest=1d82c8ffa4df246aac6e911105f6a7823f2d4642404c5514a27d1cc96cbb9012
+named-open={"DEBUG", "RELEASE"}
+Some("Console/Console.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=382557921cff927e58efc329199ed19714cf188afec3aafd04c5994583a9274b
   NET (sdk)
   NET10_0 (sdk)
   NET10_0_OR_GREATER (sdk)
@@ -38,11 +39,167 @@ Some("Console/Console.csproj"): configuration=Debug framework=Some("net10.0") cl
   NETCOREAPP3_0_OR_GREATER (sdk)
   NETCOREAPP3_1_OR_GREATER (sdk)
   TRACE (sdk)
-Some("Disabled/Disabled.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=4dd9b9842dbc44be4dabab2394fb9b7eb4ee1db928c412327e762b1093820e72
-  DEBUG (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("Disabled/Disabled.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=586ac4a6f19d15ddde9e73a1de7096eea156d896b23a2204f73b95c1f3bf6891
   TRACE (sdk)
-Some("Intermediate/Intermediate.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=b2865ae696b2a9c6364d8dfddc4d1afa2cce5379fadcd6c15503ba9c22e46e98
-  DEBUG (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworkBoth/FrameworkBoth.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=3517b5ed6fd000d8d792ee7755f431724b06a262c2b14f55b8dea63a08223a98
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0 (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={}
+Some("FrameworkEnumerationUnknown/FrameworkEnumerationUnknown.csproj"): configuration=Debug framework=None closed=false reason=Some("dynamic_property") digest=f4e35291410a6906c1b17a0ae33180845931da077826b8c54bec9d0184486394
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworkGroupEntry/FrameworkGroupEntry.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=98068375e86cf7151e6c7d26d609a5810db2b67d0d6491cf1a1af122595748d1
+  FEATURE (define_constants)
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0 (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworkImportOrder/FrameworkImportOrder.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=3517b5ed6fd000d8d792ee7755f431724b06a262c2b14f55b8dea63a08223a98
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0 (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworkImportOrder/FrameworkImportOrder.csproj"): configuration=Debug framework=Some("net9.0") closed=true reason=None digest=c6259b17614e9d5a23e1df2ee8e6a0de11a0100bf21f02b500199f61d01b81e4
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NET9_0 (sdk)
+  NET9_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={}
+Some("FrameworkLocalGlobal/FrameworkLocalGlobal.csproj"): configuration=Debug framework=Some("net8.0") closed=false reason=Some("treat_as_local_property") digest=ad84a30ba9ce09e022ec72b8ad75383d8cfa84abe097dd1488e03436a3b3c078
+named-open={}
+Some("FrameworkLocalGlobal/FrameworkLocalGlobal.csproj"): configuration=Debug framework=Some("net9.0") closed=false reason=Some("treat_as_local_property") digest=742b2991b5be30b846b62692fb583bb7e78f46b3d9bf24f0a8a75448fe15cb5a
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworkPluralOne/FrameworkPluralOne.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=b7ee81e71cecde5fb135c929b7637db8b1ac197b022b77e606954a401028a0e3
+  EARLY (define_constants)
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0 (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworkSingleOrder/FrameworkSingleOrder.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=3517b5ed6fd000d8d792ee7755f431724b06a262c2b14f55b8dea63a08223a98
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0 (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("Frameworks/Frameworks.csproj"): configuration=Debug framework=Some("net6.0") closed=true reason=None digest=e6a6b22bef41a3c60297005098ed00ae4212bd8ab7021266ba6ffecf49bdb78f
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0 (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("Frameworks/Frameworks.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=6d912a0126159e22291100496b5ab5929bb4e74def0e10d3a445411fefa1e000
+  MODERN (define_constants)
+  NET (sdk)
+  NET5_0_OR_GREATER (sdk)
+  NET6_0_OR_GREATER (sdk)
+  NET7_0_OR_GREATER (sdk)
+  NET8_0 (sdk)
+  NET8_0_OR_GREATER (sdk)
+  NETCOREAPP (sdk)
+  NETCOREAPP1_0_OR_GREATER (sdk)
+  NETCOREAPP1_1_OR_GREATER (sdk)
+  NETCOREAPP2_0_OR_GREATER (sdk)
+  NETCOREAPP2_1_OR_GREATER (sdk)
+  NETCOREAPP2_2_OR_GREATER (sdk)
+  NETCOREAPP3_0_OR_GREATER (sdk)
+  NETCOREAPP3_1_OR_GREATER (sdk)
+  TRACE (sdk)
+named-open={}
+Some("Frameworks/Frameworks.csproj"): configuration=Debug framework=Some("net8.0-windows") closed=false reason=Some("unsupported_framework") digest=5398c3d2d5357868d0eb7b33f83cb278328ae682b016a7d8b72056a49bd49c39
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworksDisabled/FrameworksDisabled.csproj"): configuration=Debug framework=Some("net6.0") closed=true reason=None digest=1d7ada6da5d4459fd0c97e4db57f3ab80bcc08b22bb0c70815ddd311f2d1d623
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworksDisabled/FrameworksDisabled.csproj"): configuration=Debug framework=Some("net8.0") closed=true reason=None digest=7fa1411a9f47268027d06c9c2d0f1e394f10fceba46c60425329183ba7e8f923
+  MODERN (define_constants)
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("FrameworksDisabled/FrameworksDisabled.csproj"): configuration=Debug framework=Some("net8.0-windows") closed=true reason=None digest=d423b91275fad41c1af2eabab8464f01fc0d722d05aa9789efc82d119dfc5811
+  TRACE (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("Intermediate/Intermediate.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=382557921cff927e58efc329199ed19714cf188afec3aafd04c5994583a9274b
   NET (sdk)
   NET10_0 (sdk)
   NET10_0_OR_GREATER (sdk)
@@ -60,8 +217,8 @@ Some("Intermediate/Intermediate.csproj"): configuration=Debug framework=Some("ne
   NETCOREAPP3_0_OR_GREATER (sdk)
   NETCOREAPP3_1_OR_GREATER (sdk)
   TRACE (sdk)
-Some("Multi/Multi.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=b2865ae696b2a9c6364d8dfddc4d1afa2cce5379fadcd6c15503ba9c22e46e98
-  DEBUG (sdk)
+named-open={"DEBUG", "RELEASE"}
+Some("Multi/Multi.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=382557921cff927e58efc329199ed19714cf188afec3aafd04c5994583a9274b
   NET (sdk)
   NET10_0 (sdk)
   NET10_0_OR_GREATER (sdk)
@@ -79,8 +236,10 @@ Some("Multi/Multi.csproj"): configuration=Debug framework=Some("net10.0") closed
   NETCOREAPP3_0_OR_GREATER (sdk)
   NETCOREAPP3_1_OR_GREATER (sdk)
   TRACE (sdk)
-Some("Props/Props.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=3dc3db00aa2e320753d25ba180dc0a9b7b393fc6497406ba54c53d53ff1f8a9f
-  DEBUG (sdk)
+named-open={}
+Some("Multi/Multi.csproj"): configuration=Debug framework=Some("net10.0-windows") closed=false reason=Some("unsupported_framework") digest=f1699b3af0f48b07aa8f09375ec208dde1a44a4decb7898124c25b93332e2077
+named-open={"DEBUG", "RELEASE"}
+Some("Props/Props.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=d3eb930100d795d94d09c0176ffafe7951316c261e11123faad40410bb4c88aa
   NET (sdk)
   NET10_0 (sdk)
   NET10_0_OR_GREATER (sdk)
@@ -99,14 +258,21 @@ Some("Props/Props.csproj"): configuration=Debug framework=Some("net10.0") closed
   NETCOREAPP3_1_OR_GREATER (sdk)
   PROP (define_constants)
   TRACE (sdk)
-Some("SdkImport/SdkImport.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("unevaluated_import") digest=3ee805a03cfd9bdb7a5fb74e1e16fc424a2ed593e4b865b6ab14a1bf444e931f
-Some("Unknown/Unknown.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("dynamic_property") digest=2702bf01fb81c9ec5d93f8e97118e5af0cd4a8c6f1878c5f875d862a91ea5c34
-Some("Unrestored/Unrestored.csproj"): configuration=Debug framework=None closed=false reason=Some("unrestored") digest=fa8663aa4c9a3484c45245ea29dc656d93070330f6768487524eb136d4add8f9
-Some("Unsupported/Unsupported.csproj"): configuration=Debug framework=Some("net10.0-windows") closed=false reason=Some("unsupported_framework") digest=e780f4686b41938801bd1d4fdc04a8b413c3c86b7b569c0a7a669cc1882fd0f9
-Some("UnusedDynamic/UnusedDynamic.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("dynamic_property") digest=2702bf01fb81c9ec5d93f8e97118e5af0cd4a8c6f1878c5f875d862a91ea5c34
-Some("WithBuild/WithBuild.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("package_build_import") digest=d2c2fd7b3af9c0b1d0eccff80ce9abbd1cd98a2990e0110a9c3ba4098cc8a62c
-Some("WithoutBuild/WithoutBuild.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=b2865ae696b2a9c6364d8dfddc4d1afa2cce5379fadcd6c15503ba9c22e46e98
-  DEBUG (sdk)
+named-open={}
+Some("SdkImport/SdkImport.csproj"): configuration=Debug framework=None closed=false reason=Some("unevaluated_import") digest=1db44601cddaf218e1d02d6721b91169f325ea4a2e8ecc10a237b78ff912a8e0
+named-open={}
+Some("Unknown/Unknown.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("dynamic_property") digest=004bb250d5b7c3d520867eaa1b7cb27428c928fbf07e5e9d7ad892ad21538be9
+named-open={}
+Some("Unrestored/Unrestored.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("unrestored") digest=625dc4c71fb8ce2feb718b9245da4f09543ff9e57b3eb01257498221f8403be8
+named-open={"DEBUG", "RELEASE"}
+Some("Unsupported/Unsupported.csproj"): configuration=Debug framework=Some("net10.0-windows") closed=true reason=None digest=6dbbd01f3c37ebe31e6ef002e6baf0ba210e707463d4af736571fbee8af37f6a
+  TRACE (sdk)
+named-open={}
+Some("UnusedDynamic/UnusedDynamic.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("dynamic_property") digest=004bb250d5b7c3d520867eaa1b7cb27428c928fbf07e5e9d7ad892ad21538be9
+named-open={}
+Some("WithBuild/WithBuild.csproj"): configuration=Debug framework=Some("net10.0") closed=false reason=Some("package_build_import") digest=26d35bd8caa997d969701702701b58cbf08c7d6d0fb755d453b2365d15d16819
+named-open={"DEBUG", "RELEASE"}
+Some("WithoutBuild/WithoutBuild.csproj"): configuration=Debug framework=Some("net10.0") closed=true reason=None digest=382557921cff927e58efc329199ed19714cf188afec3aafd04c5994583a9274b
   NET (sdk)
   NET10_0 (sdk)
   NET10_0_OR_GREATER (sdk)
@@ -124,8 +290,10 @@ Some("WithoutBuild/WithoutBuild.csproj"): configuration=Debug framework=Some("ne
   NETCOREAPP3_0_OR_GREATER (sdk)
   NETCOREAPP3_1_OR_GREATER (sdk)
   TRACE (sdk)
-None: configuration=Debug framework=None closed=false reason=Some("loose_files") digest=a57da769e37cd06104493028607887ba9d3ab14472c966bed84e2e46d64c4d8b
+named-open={}
+None: configuration=Debug framework=None closed=false reason=Some("loose_files") digest=9c0c8a66030bffe53a00d9763aa5de792bcb3ebe8e72ee5d51d65e0ca7e93e7b
 restore appearance changes configuration digest: true
 ignored ancestor props appearance changes set digest: true
 ignored ancestor props edit changes set digest and defines ANCESTOR_EDIT: true
+present empty nearer props opens membership: true
 ignored nearer props appearance changes set digest and shadows ancestor: true

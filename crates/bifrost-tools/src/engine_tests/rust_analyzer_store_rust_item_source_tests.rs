@@ -98,7 +98,7 @@ mod outer {
             .file("src/lib.rs", ITEM_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let mut state = parse_state(&RustAdapter, &file);
+        let mut state = parse_state(&RustAdapter::for_tests(), &file);
         let facts = state.source_facts.as_mut().unwrap();
         let alias = &facts.rust_items.aliases[0];
         let selected = facts.occurrences.declaration(alias.declaration).occurrence;
@@ -136,7 +136,7 @@ mod outer {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -213,7 +213,7 @@ mod outer {
             .file("src/lib.rs", ITEM_SOURCE)
             .file("other/lib.rs", ITEM_SOURCE)
             .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let source = state.source_facts.as_ref().expect("Rust source facts");
         let mut expected_items = source.rust_items.clone();
         let mut expected_types = source.rust_types.clone();
@@ -316,7 +316,7 @@ mod outer {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -333,7 +333,7 @@ mod outer {
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -361,7 +361,7 @@ mod outer {
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("other/lib.rs"),
                 &|| true,
             )
@@ -384,7 +384,7 @@ mod outer {
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| {
                     checks.set(checks.get() + 1);
@@ -401,7 +401,7 @@ mod outer {
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| {
                         checks.set(checks.get() + 1);
@@ -433,7 +433,7 @@ fn nested() { qualified::nested!(); }
 <unrequested!()>::invoke!{}
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let source_facts = state.source_facts.as_ref().expect("Rust source facts");
         let text = |occurrence| {
             let range = source_facts.occurrences.occurrence(occurrence).range;
@@ -493,7 +493,7 @@ fn nested() { qualified::nested!(); }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -507,7 +507,7 @@ fn nested() { qualified::nested!(); }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -529,7 +529,7 @@ fn use_macro() { evaluate!(answer, 42); }
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let expected = state
             .source_facts
             .as_ref()
@@ -565,7 +565,7 @@ fn use_macro() { evaluate!(answer, 42); }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -576,7 +576,9 @@ fn use_macro() { evaluate!(answer, 42); }
 
         let reopened = AnalyzerStore::open_persistent(&path).unwrap();
         let actual = reopened
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert_eq!(actual.items.macro_definitions, expected);
@@ -586,19 +588,21 @@ fn use_macro() { evaluate!(answer, 42); }
     fn rust_macro_source_marker_is_required_and_fresh_empty_family_is_readable() {
         let fixture = InlineTestProject::new().file("src/lib.rs", "").build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let oid = oid_for(b"");
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         let fresh = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert!(fresh.items.macro_definitions.is_empty());
@@ -614,19 +618,27 @@ fn use_macro() { evaluate!(answer, 42); }
         });
         assert!(
             store
-                .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_hierarchy_source_facts(
+                    oid,
+                    generation,
+                    &RustAdapter::for_tests(),
+                    &file,
+                    &|| true
+                )
                 .is_err()
         );
 
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let repaired = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert!(repaired.items.macro_definitions.is_empty());
@@ -647,13 +659,13 @@ fn invoke() { many!(value); }
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -662,7 +674,13 @@ fn invoke() { many!(value); }
         assert_rust_source_read_cancellation_retries(
             |cancellation| {
                 store
-                    .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, cancellation)
+                    .rust_hierarchy_source_facts(
+                        oid,
+                        generation,
+                        &RustAdapter::for_tests(),
+                        &file,
+                        cancellation,
+                    )
                     .unwrap()
             },
             20,
@@ -686,7 +704,7 @@ passthrough! { macro_rules! second { ($name:ident) => {}; } }
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let parsed = state.source_facts.as_ref().expect("Rust source facts");
         let definitions = &parsed.rust_items.macro_definitions;
         let embedded_definitions = definitions
@@ -743,7 +761,7 @@ passthrough! { macro_rules! second { ($name:ident) => {}; } }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -755,7 +773,9 @@ passthrough! { macro_rules! second { ($name:ident) => {}; } }
             AnalyzerStore::open_persistent(&fixture.root().join("embedded-macro-source.db"))
                 .unwrap();
         let actual = reopened
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert_eq!(actual.items.macro_definitions, expected_definitions);
@@ -776,19 +796,21 @@ passthrough! { macro_rules! second { ($name:ident) => {}; } }
             .file("src/lib.rs", ITEM_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let oid = oid_for(ITEM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let generation = store.current_generation("rust").unwrap();
         let before = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         for (table, column) in [
@@ -831,7 +853,13 @@ passthrough! { macro_rules! second { ($name:ident) => {}; } }
             });
             assert_eq!(
                 store
-                    .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+                    .rust_hierarchy_source_facts(
+                        oid,
+                        generation,
+                        &RustAdapter::for_tests(),
+                        &file,
+                        &|| true
+                    )
                     .unwrap()
                     .unwrap(),
                 before
@@ -848,13 +876,13 @@ empty!{}
 fn nested() { qualified::nested!(); }
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -863,7 +891,7 @@ fn nested() { qualified::nested!(); }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -936,7 +964,7 @@ fn nested() { qualified::nested!(); }
                     .rust_hierarchy_source_facts(
                         oid,
                         generation,
-                        &RustAdapter,
+                        &RustAdapter::for_tests(),
                         &fixture.file("src/lib.rs"),
                         &|| true,
                     )
@@ -951,13 +979,13 @@ fn nested() { qualified::nested!(); }
     #[test]
     fn empty_rust_item_inventory_is_complete_but_cancellation_and_stale_generation_are_not() {
         let fixture = InlineTestProject::new().file("src/lib.rs", "").build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let oid = oid_for(b"");
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -966,7 +994,7 @@ fn nested() { qualified::nested!(); }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -981,7 +1009,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| false
                 )
@@ -994,7 +1022,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| {
                         checks.set(checks.get() + 1);
@@ -1009,7 +1037,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true
                 )
@@ -1024,7 +1052,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true
                 )
@@ -1053,7 +1081,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true
                 )
@@ -1069,7 +1097,7 @@ fn nested() { qualified::nested!(); }
     fn empty_import_groups_publish_contexts_without_import_leaf_rows() {
         let source = "use crate::{}; helper::wrap! { use crate::{}; }";
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         assert!(state.source_facts.as_ref().unwrap().imports.is_empty());
         assert!(
             state
@@ -1084,7 +1112,7 @@ fn nested() { qualified::nested!(); }
             "use a::{};",
         ] {
             let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
-            let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+            let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
             assert!(state.source_facts.as_ref().unwrap().imports.is_empty());
             assert!(
                 state.resolution_facts.gaps.iter().all(|gap| !matches!(
@@ -1109,7 +1137,7 @@ fn nested() { qualified::nested!(); }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -1118,7 +1146,7 @@ fn nested() { qualified::nested!(); }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -1141,13 +1169,13 @@ fn nested() { qualified::nested!(); }
         let fixture = InlineTestProject::new()
             .file("src/lib.rs", ITEM_SOURCE)
             .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let oid = oid_for(ITEM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -1156,7 +1184,7 @@ fn nested() { qualified::nested!(); }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -1175,7 +1203,7 @@ fn nested() { qualified::nested!(); }
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &missing_syntax
                 )
                 .is_err()
@@ -1185,7 +1213,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true
                 )
@@ -1201,7 +1229,7 @@ fn nested() { qualified::nested!(); }
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &cycle
                 )
                 .is_err()
@@ -1211,7 +1239,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true
                 )
@@ -1228,7 +1256,7 @@ fn nested() { qualified::nested!(); }
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &wrong_owner
                 )
                 .is_err()
@@ -1238,7 +1266,7 @@ fn nested() { qualified::nested!(); }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true
                 )
@@ -1261,13 +1289,13 @@ fn lexical_decoy() -> usize { let EXACT = 3; evaluate!(EXACT) }
 fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let oid = oid_for(source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap_or_else(|error| {
@@ -1281,7 +1309,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -1298,13 +1326,16 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
         let fixture = InlineTestProject::new()
             .file("src/lib.rs", ITEM_SOURCE)
             .build();
-        let state = Arc::new(parse_state(&RustAdapter, &fixture.file("src/lib.rs")));
+        let state = Arc::new(parse_state(
+            &RustAdapter::for_tests(),
+            &fixture.file("src/lib.rs"),
+        ));
         let oid = oid_for(ITEM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -1313,7 +1344,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
             .rust_hierarchy_source_facts(
                 oid,
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &fixture.file("src/lib.rs"),
                 &|| true,
             )
@@ -1323,7 +1354,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
             let prepared = AnalyzerStore::prepare_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 Arc::clone(&state),
             )
             .unwrap();
@@ -1347,7 +1378,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
                     .rust_hierarchy_source_facts(
                         oid,
                         generation,
-                        &RustAdapter,
+                        &RustAdapter::for_tests(),
                         &fixture.file("src/lib.rs"),
                         &|| true
                     )
@@ -1364,13 +1395,13 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
             let fixture = InlineTestProject::new()
                 .file("src/lib.rs", ITEM_SOURCE)
                 .build();
-            let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+            let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
             let oid = oid_for(ITEM_SOURCE.as_bytes());
             let store = AnalyzerStore::open_ephemeral().unwrap();
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .unwrap();
@@ -1379,7 +1410,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
                 .rust_hierarchy_source_facts(
                     oid,
                     generation,
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &fixture.file("src/lib.rs"),
                     &|| true,
                 )
@@ -1401,7 +1432,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
                     .rust_hierarchy_source_facts(
                         oid,
                         generation,
-                        &RustAdapter,
+                        &RustAdapter::for_tests(),
                         &fixture.file("src/lib.rs"),
                         &|| true
                     )
@@ -1411,7 +1442,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &state,
                 )
                 .unwrap();
@@ -1420,7 +1451,7 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
                     .rust_hierarchy_source_facts(
                         oid,
                         generation,
-                        &RustAdapter,
+                        &RustAdapter::for_tests(),
                         &fixture.file("src/lib.rs"),
                         &|| true
                     )
@@ -1441,17 +1472,80 @@ fn local_item_decoy() -> usize { const EXACT: usize = 4; evaluate!(EXACT) }
     }
 
     #[test]
+    fn version_one_rust_blob_is_reprepared_with_same_oid_and_census() {
+        let fixture = InlineTestProject::new()
+            .file("src/lib.rs", "struct Resource; impl Resource {}")
+            .build();
+        let file = fixture.file("src/lib.rs");
+        let source = "struct Resource; impl Resource {}";
+        let state = parse_state(&RustAdapter::for_tests(), &file);
+        let oid = oid_for(source.as_bytes());
+        let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust");
+        let path = fixture.root().join("copy-absence-upgrade.db");
+        let store = AnalyzerStore::open_persistent(&path).unwrap();
+        store
+            .write_parsed_blob(&key, &RustAdapter::for_tests(), &state)
+            .unwrap();
+        store.conn.execute(move |conn| {
+            let trigger: String = conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='source_rust_item_manifests_no_update_after_seal'",
+                [], |row| row.get(0),
+            ).unwrap();
+            let census_trigger: String = conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='source_rust_impl_census_files_no_delete_after_seal'",
+                [], |row| row.get(0),
+            ).unwrap();
+            conn.execute_batch("DROP TRIGGER source_rust_item_manifests_no_update_after_seal").unwrap();
+            conn.execute_batch("DROP TRIGGER source_rust_impl_census_files_no_delete_after_seal").unwrap();
+            conn.execute("UPDATE source_rust_item_manifests SET facts_version=1 WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')", [oid.to_string()]).unwrap();
+            conn.execute("DELETE FROM source_rust_impl_census_files WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='rust')", [oid.to_string()]).unwrap();
+            conn.execute_batch(&trigger).unwrap();
+            conn.execute_batch(&census_trigger).unwrap();
+        });
+        drop(store);
+
+        let reopened = AnalyzerStore::open_persistent(&path).unwrap();
+        assert_eq!(
+            reopened
+                .missing_parsed_blob_keys(std::slice::from_ref(&key))
+                .unwrap()
+                .as_slice(),
+            std::slice::from_ref(&key)
+        );
+        reopened
+            .write_parsed_blob(&key, &RustAdapter::for_tests(), &state)
+            .unwrap();
+        assert!(
+            reopened
+                .missing_parsed_blob_keys(std::slice::from_ref(&key))
+                .unwrap()
+                .is_empty()
+        );
+        reopened.conn.execute(move |conn| {
+            let (version, census_version, impl_count, boundary_count): (i64, i64, i64, i64) = conn.query_row(
+                "SELECT item.facts_version,census.census_version,census.impl_count,census.boundary_count
+                   FROM blobs AS b JOIN source_rust_item_manifests AS item ON item.blob_id=b.id
+                   JOIN source_rust_impl_census_files AS census ON census.blob_id=b.id
+                  WHERE b.blob_oid=?1 AND b.lang='rust'",
+                [oid.to_string()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            ).unwrap();
+            assert_eq!((version, census_version, impl_count, boundary_count), (2, 1, 1, 0));
+        });
+    }
+
+    #[test]
     fn sealed_item_rows_are_immutable_and_sparse_child_ordinals_cannot_reseal() {
         let fixture = InlineTestProject::new()
             .file("src/lib.rs", ITEM_SOURCE)
             .build();
-        let state = parse_state(&RustAdapter, &fixture.file("src/lib.rs"));
+        let state = parse_state(&RustAdapter::for_tests(), &fixture.file("src/lib.rs"));
         let oid = oid_for(ITEM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();

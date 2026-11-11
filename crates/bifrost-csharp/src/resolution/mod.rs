@@ -15,6 +15,7 @@ use tree_sitter::{Node, Tree};
 
 mod imports;
 mod names;
+mod types;
 
 #[derive(Default)]
 pub struct SourceBridges {
@@ -37,6 +38,7 @@ struct Producer<'a, 's> {
     facts: FileResolutionFacts,
     names: HashMap<String, ResolutionNameId>,
     claimed: HashSet<usize>,
+    declared_types: HashMap<(usize, ResolutionScopeId), ResolutionTypeSlotId>,
     namespace_paths: HashMap<ResolutionScopeId, Vec<ResolutionNameId>>,
     imports: Vec<(ResolutionSiteId, bool, Option<ResolutionNameId>)>,
     excluded: Vec<(usize, usize)>,
@@ -72,6 +74,7 @@ pub fn produce<'s>(
         facts: FileResolutionFacts::default(),
         names: HashMap::default(),
         claimed: HashSet::default(),
+        declared_types: HashMap::default(),
         namespace_paths: HashMap::default(),
         imports: Vec::new(),
         excluded,
@@ -121,6 +124,62 @@ pub fn produce<'s>(
         owner: None,
         type_parameters: None,
     };
+    // #10342: recovery can attach a damaged directive to a following declaration.
+    let mut directive_nodes = named_children(tree.root_node());
+    directive_nodes.reverse();
+    let mut directive_end = source.len();
+    while let Some(node) = directive_nodes.pop() {
+        if matches!(node.kind(), "preproc_if" | "preproc_elif" | "preproc_else") {
+            directive_nodes.extend(named_children(node).into_iter().rev());
+        } else if (!matches!(
+            node.kind(),
+            "using_directive"
+                | "extern_alias_directive"
+                | "ERROR"
+                | "comment"
+                | "shebang_directive"
+        ) && !node.kind().starts_with("preproc_")
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "compilation_unit"))
+            || matches!(
+                node.kind(),
+                "namespace_declaration"
+                    | "file_scoped_namespace_declaration"
+                    | "class_declaration"
+                    | "struct_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "delegate_declaration"
+                    | "global_statement"
+                    | "global_attribute"
+            )
+        {
+            directive_end = node.start_byte();
+            break;
+        }
+    }
+    // Some handlers claim their whole subtree, so inspect recovery nodes before dispatch.
+    let mut error_sites = HashMap::default();
+    let mut pending = vec![tree.root_node()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "ERROR"
+            && !p.is_excluded(node)
+            && (node.start_byte() < directive_end
+                || node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "compilation_unit"))
+        {
+            let site = p.site(node, root, ResolutionSiteKind::UnsupportedRoute);
+            p.facts.add_reference_enumeration_gap(
+                site,
+                ResolutionGapKind::CompilationImportsUnenumerated,
+            );
+            error_sites.insert(node.id(), site);
+        }
+        pending.extend(named_children(node));
+    }
     let mut file_namespace: Option<(usize, Context)> = None;
     let mut stack = vec![(tree.root_node(), context)];
     while let Some((node, mut ctx)) = stack.pop() {
@@ -143,14 +202,16 @@ pub fn produce<'s>(
         if node.kind() == "generic_name"
             && first_named_child_of_kind(node, "identifier").is_some_and(|name| p.is_excluded(name))
         {
-            p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedTypeSyntax);
+            let site = p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedTypeSyntax);
+            p.compilation_omission(node, site);
             continue;
         }
         if node
             .child_by_field_name("name")
             .is_some_and(|name| p.is_excluded(name))
         {
-            p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedScopeOrBinder);
+            let site = p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedScopeOrBinder);
+            p.compilation_omission(node, site);
             continue;
         }
         if node.is_missing()
@@ -161,7 +222,8 @@ pub fn produce<'s>(
                 .child_by_field_name("name")
                 .is_some_and(|n| n.is_missing())
         {
-            p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+            let site = p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+            p.compilation_omission(node, site);
             continue;
         }
         if first_named_child_of_kind(node, "explicit_interface_specifier").is_some() {
@@ -346,6 +408,28 @@ pub fn produce<'s>(
                         );
                         ctx.type_parameters = Some(ctx.scope);
                     }
+                    // ECMA-334 7.7.1: method type parameters are in scope
+                    // in the return type as well as in the parameter list.
+                    if let Some(returns) = crate::declarations::csharp_declared_type_node(node)
+                        && !p.is_excluded(returns)
+                    {
+                        let input = p.declared_type(returns, ctx);
+                        let slot = p.attach_declared_type(
+                            site,
+                            input,
+                            returns,
+                            DeclarationTypeRole::Return,
+                        );
+                        p.facts
+                            .callable_signatures
+                            .last_mut()
+                            .expect("callable signature exists")
+                            .result_types
+                            .push(ResolutionCallableResultTypeFact {
+                                ordinal: 0,
+                                value_type: slot,
+                            });
+                    }
                     ctx.scope = p.facts.allocate_lexical_scope(
                         ctx.scope,
                         Some(site),
@@ -406,6 +490,16 @@ pub fn produce<'s>(
                                 || node.kind() == "enum_member_declaration",
                         );
                     }
+                }
+            }
+            "variable_declaration" => {
+                // Lower a shared head before the ordinary source-order walk
+                // reaches it. Each following declarator reuses this syntax slot.
+                if let Some(ty) = node.child_by_field_name("type")
+                    && ty.kind() != "implicit_type"
+                    && !p.is_excluded(ty)
+                {
+                    p.declared_type(ty, ctx);
                 }
             }
             "parameter"
@@ -526,8 +620,29 @@ pub fn produce<'s>(
                     );
                 }
             }
-            "extern_alias_directive"
-            | "attribute"
+            "shebang_directive"
+                if node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "compilation_unit") =>
+            {
+                let site = p.site(node, ctx.scope, ResolutionSiteKind::UnsupportedRoute);
+                p.facts
+                    .add_gap(site, ResolutionGapKind::FileProgramEvidence);
+            }
+            "extern_alias_directive" => {
+                let name = node
+                    .child_by_field_name("name")
+                    .expect("extern alias has a name");
+                let site = p.site(node, ctx.scope, ResolutionSiteKind::ImportDeclaration);
+                let name = p.name(name);
+                p.facts.extern_aliases.push(ResolutionExternAliasFact {
+                    site,
+                    scope: ctx.scope,
+                    name,
+                });
+                skip = true;
+            }
+            "attribute"
             | "indexer_declaration"
             | "operator_declaration"
             | "conversion_operator_declaration"
@@ -535,7 +650,6 @@ pub fn produce<'s>(
             | "query_expression"
             | "global_statement" => {
                 let kind = match node.kind() {
-                    "extern_alias_directive" => ResolutionGapKind::UnsupportedRoute,
                     "attribute" => ResolutionGapKind::UnsupportedTypeSyntax,
                     "query_expression" | "global_statement" => {
                         ResolutionGapKind::UnsupportedScopeOrBinder
@@ -543,15 +657,6 @@ pub fn produce<'s>(
                     _ => ResolutionGapKind::UnsupportedMemberScope,
                 };
                 p.omit(node, ctx.scope, kind);
-                skip = true;
-            }
-            "alias_qualified_name"
-                if node.child_by_field_name("alias").is_some_and(|n| {
-                    crate::syntax::csharp_lookup_identifier(csharp_identifier_text(n, source))
-                        != "global"
-                }) =>
-            {
-                p.omit(node, ctx.scope, ResolutionGapKind::UnsupportedRoute);
                 skip = true;
             }
             "qualified_name" | "alias_qualified_name" | "member_access_expression"
@@ -585,7 +690,13 @@ pub fn produce<'s>(
                 }
             }
             "ERROR" => {
-                p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+                if let Some(&site) = error_sites.get(&node.id()) {
+                    // Preserve the ordinary omission's lexical scope (including file namespaces).
+                    p.facts.sites[site.index()].scope = ctx.scope;
+                    p.omit_site(node, ctx.scope, ResolutionGapKind::MalformedSyntax, site);
+                } else {
+                    p.omit(node, ctx.scope, ResolutionGapKind::MalformedSyntax);
+                }
                 skip = true;
             }
             _ => {}
@@ -741,6 +852,20 @@ pub fn produce<'s>(
             );
             p.facts
                 .add_reference_enumeration_gap(site, ResolutionGapKind::UnsupportedRoute);
+            // A namespace at EOF can have exactly the compilation unit's range.
+            // Preserve the ordinary omission scope, but do not call that tie root-only.
+            if scope == root
+                && !p.facts.scopes.iter().any(|candidate| {
+                    candidate.id != root
+                        && candidate.start_byte <= chain_starts[&branch.chain]
+                        && branch.end_byte <= candidate.end_byte
+                })
+            {
+                p.facts.add_reference_enumeration_gap(
+                    site,
+                    ResolutionGapKind::CompilationImportsUnenumerated,
+                );
+            }
         }
     }
     p.finish_imports();
@@ -904,6 +1029,47 @@ impl Producer<'_, '_> {
             }
         }
         self.facts.binders.push(binder);
+        // ECMA-334 8.2, 15.5, 15.6 and 15.7: declared types belong to
+        // the declaration, independently of initializer/call inference.
+        let type_node = if node.kind() == "variable_declarator" {
+            node.parent()
+                .and_then(|parent| parent.child_by_field_name("type"))
+        } else {
+            node.child_by_field_name("type")
+                .or_else(|| node.child_by_field_name("returns"))
+        };
+        let role = match kind {
+            ResolutionBinderKind::Parameter => Some(DeclarationTypeRole::Parameter),
+            ResolutionBinderKind::Field | ResolutionBinderKind::Local => {
+                Some(DeclarationTypeRole::Value)
+            }
+            _ => None,
+        };
+        if let (Some(type_node), Some(role)) = (type_node, role)
+            && type_node.kind() != "implicit_type"
+            && !self.is_excluded(type_node)
+        {
+            let slot = self.declared_type(
+                type_node,
+                Context {
+                    scope,
+                    package: {
+                        let mut package = scope;
+                        while !self.namespace_paths.contains_key(&package) {
+                            package = self
+                                .facts
+                                .scope(package)
+                                .parent
+                                .expect("lexical scope reaches package");
+                        }
+                        package
+                    },
+                    owner: None,
+                    type_parameters: None,
+                },
+            );
+            self.attach_declared_type(site, slot, type_node, role);
+        }
         if (site_kind == ResolutionSiteKind::TypeDeclaration && node.kind() != "type_parameter")
             || site_kind == ResolutionSiteKind::ConstructorDeclaration
             || (site_kind == ResolutionSiteKind::CallableDeclaration
@@ -1010,8 +1176,36 @@ impl Producer<'_, '_> {
             stack.extend(named_children(n));
         }
     }
-    fn omit(&mut self, node: Node<'_>, scope: ResolutionScopeId, kind: ResolutionGapKind) {
+    fn compilation_omission(&mut self, node: Node<'_>, site: ResolutionSiteId) {
+        if node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "compilation_unit")
+            && !(node.kind() == "using_directive"
+                && !crate::syntax::csharp_using_directive_is_global(node))
+        {
+            self.facts.add_reference_enumeration_gap(
+                site,
+                ResolutionGapKind::CompilationImportsUnenumerated,
+            );
+        }
+    }
+    fn omit(
+        &mut self,
+        node: Node<'_>,
+        scope: ResolutionScopeId,
+        kind: ResolutionGapKind,
+    ) -> ResolutionSiteId {
         let site = self.site(node, scope, ResolutionSiteKind::UnsupportedRoute);
+        self.omit_site(node, scope, kind, site);
+        site
+    }
+    fn omit_site(
+        &mut self,
+        node: Node<'_>,
+        scope: ResolutionScopeId,
+        kind: ResolutionGapKind,
+        site: ResolutionSiteId,
+    ) {
         if kind == ResolutionGapKind::UnsupportedRoute {
             self.facts.add_route_gap(
                 site,
@@ -1026,6 +1220,14 @@ impl Producer<'_, '_> {
             self.facts.add_gap(site, kind);
         }
         self.facts.add_reference_enumeration_gap(site, kind);
+        if node.kind() == "global_statement"
+            && node
+                .parent()
+                .is_some_and(|p| p.kind() == "compilation_unit")
+        {
+            self.facts
+                .add_reference_enumeration_gap(site, ResolutionGapKind::FileProgramEvidence);
+        }
         self.claim_tree(node);
     }
 }

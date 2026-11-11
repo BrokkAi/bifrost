@@ -328,10 +328,15 @@ mod tests {
                     captured.keys()
                 );
             });
+            // The graph stages observe that no model set is active; that
+            // observation is a read too, attributed to the owner like the key.
             assert_eq!(
                 parent.keys(),
                 if with_parent {
-                    vec![key.clone()]
+                    vec![
+                        ReadKey::Models(crate::analyzer::i_analyzer::no_active_model_set_digest()),
+                        key.clone(),
+                    ]
                 } else {
                     Vec::new()
                 }

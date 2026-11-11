@@ -319,8 +319,11 @@ pub(crate) struct FileRankingKey {
     git_tier: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SymbolLocationsResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<crate::result_incomplete::ToolResultIncomplete>,
+
     pub locations: Vec<SymbolLocation>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_locations: Vec<
@@ -333,14 +336,17 @@ pub struct SymbolLocationsResult {
     pub ambiguous: Vec<AmbiguousSymbol>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SymbolAncestorsResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<crate::result_incomplete::ToolResultIncomplete>,
+
     pub ancestors: Vec<SymbolAncestors>,
     pub not_found: Vec<NotFoundInput>,
     pub ambiguous: Vec<AmbiguousSymbol>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SymbolAncestors {
     pub symbol: String,
     pub ancestors: Vec<String>,
@@ -352,7 +358,7 @@ pub struct SymbolAncestors {
     pub alternatives: Vec<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SymbolLocation {
     pub symbol: String,
     pub path: String,
@@ -388,13 +394,8 @@ pub struct DefinitionLookupResult {
     /// inconclusive state is an additive change, not a contract break, so this
     /// is not a closed enumeration.
     pub status: String,
-    #[serde(
-        default = "definition_lookup_complete_default",
-        skip_serializing_if = "definition_lookup_complete"
-    )]
-    pub complete: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_reason: Option<DefinitionLookupIncompleteReason>,
+    #[serde(flatten)]
+    pub completion: DefinitionLookupCompletion,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -408,13 +409,8 @@ pub struct DeclarationLookupResult {
     pub query: DefinitionReferenceQuery,
     pub operation: NavigationOperation,
     pub status: String,
-    #[serde(
-        default = "definition_lookup_complete_default",
-        skip_serializing_if = "definition_lookup_complete"
-    )]
-    pub complete: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_reason: Option<DefinitionLookupIncompleteReason>,
+    #[serde(flatten)]
+    pub completion: DefinitionLookupCompletion,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -478,6 +474,10 @@ pub(crate) fn search_symbols_with_cap(
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> SearchSymbolsResult {
     let _scope = profiling::scope("searchtools::search_symbols");
+    // Matched declarations and their FQNs come from file reads that may be
+    // incomplete (a C# `#if` branch that was never parsed can hold other
+    // declarations or choose another namespace); the scope collects that.
+    let analyzer_query = AnalyzerQueryScope::new(analyzer);
     let patterns: Vec<String> = strip_params(params.patterns)
         .into_iter()
         .filter(|pattern| !pattern.trim().is_empty())
@@ -632,6 +632,9 @@ pub(crate) fn search_symbols_with_cap(
         .map(|candidate| candidate.code_unit.fq_name())
         .collect();
     let semantic_model_overlay = analyzer.semantic_model_overlay();
+    // An incomplete model search without cancellation means a semantic-model
+    // read was open; it is reported as such, not as a cancelled search.
+    let mut model_inventory_open = false;
     let (model_symbols, total_model_symbols) = semantic_model_overlay
         .as_deref()
         .map(|overlay| {
@@ -641,7 +644,11 @@ pub(crate) fn search_symbols_with_cap(
                 cancellation,
                 |symbol| !authored_names.contains(&symbol.qualified_name),
             );
-            complete &= model_complete;
+            model_inventory_open = !model_complete
+                && !brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(
+                    cancellation,
+                );
+            complete &= model_complete || model_inventory_open;
             let rows = matched;
             (rows, total)
         })
@@ -762,7 +769,15 @@ pub(crate) fn search_symbols_with_cap(
     if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled) {
         complete = false;
     }
-    let truncated = !complete || limit_truncated;
+    let read_gap = match analyzer_query.read_completion() {
+        Ok(()) => None,
+        Err(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled) => {
+            complete = false;
+            None
+        }
+        Err(reason) => Some(reason),
+    };
+    let truncated = !complete || limit_truncated || model_inventory_open || read_gap.is_some();
     let mut note = search_symbols_note(
         !complete,
         limit_truncated,
@@ -784,6 +799,22 @@ pub(crate) fn search_symbols_with_cap(
             "No authored files matched; showing {} of {total_model_symbols} declarations from the active semantic-model overlay.",
             model_symbols.len()
         ));
+    }
+    if model_inventory_open {
+        let open_note = "The active semantic-model inventory was incomplete, so modeled declarations may be missing.";
+        note = Some(match note {
+            Some(note) => format!("{note} {open_note}"),
+            None => open_note.to_owned(),
+        });
+    }
+    if let Some(reason) = read_gap {
+        let gap_note = format!(
+            "A matched source was read incompletely, so declarations may be missing or carry other qualified names: {reason:?}"
+        );
+        note = Some(match note {
+            Some(note) => format!("{note} {gap_note}"),
+            None => gap_note,
+        });
     }
 
     SearchSymbolsResult {
@@ -960,22 +991,29 @@ pub fn get_symbol_locations_with_cancellation(
     if let Some(overlay) = analyzer.semantic_model_overlay() {
         not_found.retain(|missing| {
             let mut matched = if missing.input.starts_with("bifrost-model://") {
-                overlay.symbols_at_uri(&missing.input).records
+                overlay.symbols_at_uri(&missing.input)
             } else {
-                let mut records = overlay.symbols_with_id(&missing.input).records;
-                if records.is_empty() {
-                    records = overlay.symbols_named(&missing.input).records;
+                let mut records = overlay.symbols_with_id(&missing.input);
+                if records.records.is_empty() && !matches!(records.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                    records = overlay.symbols_named(&missing.input);
                 }
                 records
             };
-            if matched.is_empty() {
+            if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                model_ambiguous.push(AmbiguousSymbol {
+                    target: missing.input.clone(),
+                    matches: matched.records.iter().map(|record| record.location.identity().to_string()).collect(),
+                    note: Some("semantic-model location inventory is incomplete".to_string()),
+                });
+                false
+            } else if matched.records.is_empty() {
                 true
-            } else if matched.iter().any(|record| record.provenance.ambiguous)
-                || matched.len() > 1
+            } else if matched.records.iter().any(|record| record.provenance.ambiguous)
+                || matched.records.len() > 1
             {
                 model_ambiguous.push(AmbiguousSymbol {
                     target: missing.input.clone(),
-                    matches: matched
+                    matches: matched.records
                         .iter()
                         .map(|record| record.location.identity().to_string())
                         .collect(),
@@ -986,13 +1024,22 @@ pub fn get_symbol_locations_with_cancellation(
                 });
                 false
             } else {
-                model_locations.append(&mut matched);
+                model_locations.append(&mut matched.records);
                 false
             }
         });
     }
 
+    let mut incomplete = crate::result_incomplete::query_read_incomplete(&scope);
+    if cancellation.is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
+        && !incomplete.iter().any(|entry| {
+            entry.reason == crate::result_incomplete::ToolResultIncompleteReason::Cancelled
+        })
+    {
+        incomplete.push(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled.into());
+    }
     SymbolLocationsResult {
+        incomplete,
         locations,
         model_locations,
         not_found,
@@ -1015,15 +1062,14 @@ pub fn get_definitions_by_location_with_cancellation(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let _scope = profiling::scope("searchtools::get_definitions_by_location");
-    GetDefinitionResult {
-        results: get_navigation_by_location_with_cancellation(
-            analyzer,
-            token,
-            params,
-            NavigationOperation::Definition,
-            cancellation,
-        ),
-    }
+    let results = get_navigation_by_location_with_cancellation(
+        analyzer,
+        token,
+        params,
+        NavigationOperation::Definition,
+        cancellation,
+    );
+    GetDefinitionResult { results }
 }
 
 pub fn get_declarations_by_location(
@@ -1041,32 +1087,32 @@ pub fn get_declarations_by_location_with_cancellation(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let _scope = profiling::scope("searchtools::get_declarations_by_location");
+    let results = get_navigation_by_location_with_cancellation(
+        analyzer,
+        token,
+        params,
+        NavigationOperation::Declaration,
+        cancellation,
+    );
     GetDeclarationResult {
-        results: get_navigation_by_location_with_cancellation(
-            analyzer,
-            token,
-            params,
-            NavigationOperation::Declaration,
-            cancellation,
-        )
-        .into_iter()
-        .map(|result| DeclarationLookupResult {
-            query: result.query,
-            operation: result.operation,
-            status: result.status,
-            complete: result.complete,
-            incomplete_reason: result.incomplete_reason,
-            reference: result.reference,
-            declarations: result.definitions,
-            diagnostics: result.diagnostics,
-        })
-        .collect(),
+        results: results
+            .into_iter()
+            .map(|result| DeclarationLookupResult {
+                query: result.query,
+                operation: result.operation,
+                status: result.status,
+                completion: result.completion,
+                reference: result.reference,
+                declarations: result.definitions,
+                diagnostics: result.diagnostics,
+            })
+            .collect(),
     }
 }
 
 fn get_navigation_by_location_with_cancellation(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     params: GetDefinitionParams,
     operation: NavigationOperation,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
@@ -1085,8 +1131,7 @@ fn get_navigation_by_location_with_cancellation(
             },
             operation,
             status: "invalid_location".to_string(),
-            complete: true,
-            incomplete_reason: None,
+            completion: Completion::COMPLETE,
             reference: None,
             definitions: Vec::new(),
             diagnostics: vec![DefinitionDiagnostic {
@@ -1109,14 +1154,42 @@ fn get_navigation_by_location_with_cancellation(
         {
             break;
         }
+        let pre_scope = cancellation.map_or_else(
+            || AnalyzerQueryScope::new(analyzer),
+            |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        );
+        let token = pre_scope.token();
         if query.path.starts_with("bifrost-model://")
             && let Some(overlay) = analyzer.semantic_model_overlay()
         {
             let matched = overlay.symbols_at_uri(&query.path);
+            if matched.records.is_empty()
+                && matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_))
+            {
+                results[index] = Some(DefinitionLookupResult {
+                    query,
+                    operation,
+                    status: "incomplete".to_string(),
+                    completion: Completion::incomplete(open_model_inventory_reason(cancellation)),
+                    reference: None,
+                    definitions: Vec::new(),
+                    diagnostics: vec![DefinitionDiagnostic {
+                        claim: None,
+                        kind: "semantic_model_incomplete".to_string(),
+                        message: "the model URI has an incomplete declaration inventory".to_string(),
+                    }],
+                });
+                if let Some(reason) = pre_scope.read_completion().err() {
+                    let result = results[index].as_mut().unwrap();
+                    record_query_read_incomplete(&mut result.completion, &mut result.diagnostics, reason, cancellation);
+                }
+                continue;
+            }
             if !matched.records.is_empty() {
+                let open = matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_));
                 let conflict = matched.disposition
                     == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict;
-                let navigation = if conflict {
+                let navigation = if conflict || open {
                     Ok(None)
                 } else {
                     semantic_model_navigation_candidates(
@@ -1127,6 +1200,8 @@ fn get_navigation_by_location_with_cancellation(
                     )
                 };
                 let navigation_conflict = navigation.as_ref().is_err();
+                let navigation_open =
+                    matches!(&navigation, Err(ModelNavigationFailure::Incomplete(_)));
                 let (mut definitions, navigation_diagnostic) = match navigation {
                     Ok(Some(definitions)) => (definitions, None),
                     Ok(None) => (
@@ -1136,15 +1211,20 @@ fn get_navigation_by_location_with_cancellation(
                         )],
                         None,
                     ),
-                    Err(diagnostic) => (Vec::new(), Some(diagnostic)),
+                    Err(
+                        ModelNavigationFailure::Incomplete(diagnostic)
+                        | ModelNavigationFailure::Other(diagnostic),
+                    ) => (Vec::new(), Some(diagnostic)),
                 };
-                if conflict {
+                if conflict || open {
                     definitions.clear();
                 }
                 results[index] = Some(DefinitionLookupResult {
                     query: query.clone(),
                     operation,
-                    status: if conflict || navigation_conflict {
+                    status: if open || navigation_open {
+                        "incomplete"
+                    } else if conflict || navigation_conflict {
                         "ambiguous"
                     } else {
                         "resolved"
@@ -1154,20 +1234,41 @@ fn get_navigation_by_location_with_cancellation(
                         path: query.path.clone(),
                         target: matched.records[0].qualified_name.clone(),
                     }),
-                    complete: true,
-                    incomplete_reason: None,
+                    completion: if open || navigation_open {
+                        Completion::incomplete(open_model_inventory_reason(cancellation))
+                    } else {
+                        Completion::COMPLETE
+                    },
                     definitions,
-                    diagnostics: if conflict {
+                    diagnostics: if conflict || open {
                         vec![DefinitionDiagnostic {
                             claim: None,
-                            kind: "semantic_model_conflict".to_string(),
-                            message: "the model URI resolves to conflicting active declarations"
-                                .to_string(),
+                            kind: if open {
+                                "semantic_model_incomplete"
+                            } else {
+                                "semantic_model_conflict"
+                            }
+                            .to_string(),
+                            message: if open {
+                                "the model URI has an incomplete declaration inventory"
+                            } else {
+                                "the model URI resolves to conflicting active declarations"
+                            }
+                            .to_string(),
                         }]
                     } else {
                         navigation_diagnostic.into_iter().collect()
                     },
                 });
+                if let Some(reason) = pre_scope.read_completion().err() {
+                    let result = results[index].as_mut().unwrap();
+                    record_query_read_incomplete(
+                        &mut result.completion,
+                        &mut result.diagnostics,
+                        reason,
+                        cancellation,
+                    );
+                }
                 continue;
             }
         }
@@ -1175,6 +1276,7 @@ fn get_navigation_by_location_with_cancellation(
             ResolvedFileInput::File(file) => {
                 pending.push((
                     index,
+                    pre_scope.read_completion().err(),
                     query.clone(),
                     brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupRequest {
                         file,
@@ -1190,8 +1292,7 @@ fn get_navigation_by_location_with_cancellation(
                     query,
                     operation,
                     status: "not_found".to_string(),
-                    complete: true,
-                    incomplete_reason: None,
+                    completion: Completion::COMPLETE,
                     reference: None,
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
@@ -1210,8 +1311,7 @@ fn get_navigation_by_location_with_cancellation(
                     query,
                     operation,
                     status: "not_found".to_string(),
-                    complete: true,
-                    incomplete_reason: None,
+                    completion: Completion::COMPLETE,
                     reference: None,
                     definitions: Vec::new(),
                     diagnostics: vec![DefinitionDiagnostic {
@@ -1222,41 +1322,103 @@ fn get_navigation_by_location_with_cancellation(
                 });
             }
         }
+        if let (Some(result), Some(reason)) =
+            (results[index].as_mut(), pre_scope.read_completion().err())
+        {
+            record_query_read_incomplete(
+                &mut result.completion,
+                &mut result.diagnostics,
+                reason,
+                cancellation,
+            );
+        }
     }
 
-    let mut render_cache = DefinitionCandidateRenderCache::default();
     for chunk in pending.chunks(8) {
         if cancellation
             .is_some_and(brokk_bifrost_core::cancellation::CancellationToken::is_cancelled)
         {
             break;
         }
+        // The chunk scope keeps request memos local to these eight lookups.
+        // Completion stays per lookup: a gap one reference observed (for
+        // example a JS property-reaching gap) says nothing about a sibling
+        // request that never read that fact (#10917).
+        let chunk_scope = AnalyzerQueryScope::new(analyzer);
+        // The render cache is per chunk: a hit carried into a later chunk
+        // would skip the reads that chunk's lookups must see.
+        let mut render_cache = DefinitionCandidateRenderCache::default();
         let requests = chunk
             .iter()
-            .map(|(_, _, request)| request.clone())
+            .map(|(_, _, _, request)| request.clone())
             .collect();
         let outcomes =
             brokk_bifrost_analysis::analyzer::usages::get_definition::resolve_navigation_batch(
                 analyzer,
-                token,
+                chunk_scope.token(),
                 requests,
                 operation,
                 cancellation,
             );
-        for ((index, query, request), outcome) in chunk.iter().zip(outcomes) {
-            results[*index] = Some(render_definition_lookup(
+        for ((index, pre_gap, query, request), (outcome, resolution_read_gap)) in
+            chunk.iter().zip(outcomes)
+        {
+            // Rendering reads the target's declaration data and source. Its
+            // gap belongs to this lookup, together with any gap this lookup's
+            // own resolution recorded.
+            let render_scope = cancellation.map_or_else(
+                || AnalyzerQueryScope::new(analyzer),
+                |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+            );
+            let mut result = render_definition_lookup(
                 analyzer,
-                token,
+                render_scope.token(),
                 query.clone(),
                 &request.file,
                 outcome,
                 operation,
                 &mut render_cache,
-            ));
+            );
+            if let Some(reason) =
+                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::merge_optional(
+                    brokk_bifrost_analysis::analyzer::QueryReadIncomplete::merge_optional(
+                        pre_gap.clone(),
+                        resolution_read_gap,
+                    ),
+                    render_scope.read_completion().err(),
+                )
+            {
+                record_query_read_incomplete(
+                    &mut result.completion,
+                    &mut result.diagnostics,
+                    reason,
+                    cancellation,
+                );
+            }
+            results[*index] = Some(result);
         }
     }
 
     results.into_iter().flatten().collect()
+}
+
+/// Why a lookup against an open semantic-model inventory is incomplete. A
+/// read stopped by cancellation reports the cancellation; otherwise the
+/// inventory is open, the same `structure_unavailable` the location path
+/// reports when the overlay is open.
+fn open_model_inventory_reason(
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+) -> DefinitionLookupIncompleteReason {
+    if brokk_bifrost_analysis::analyzer::semantic_model::overlay::search_cancelled(cancellation) {
+        DefinitionLookupIncompleteReason::Cancelled
+    } else {
+        DefinitionLookupIncompleteReason::StructureUnavailable
+    }
+}
+
+enum ModelNavigationFailure {
+    Incomplete(DefinitionDiagnostic),
+    Other(DefinitionDiagnostic),
 }
 
 fn semantic_model_navigation_candidates(
@@ -1264,9 +1426,22 @@ fn semantic_model_navigation_candidates(
     token: QueryToken<'_>,
     overlay: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay,
     symbol: &brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelSymbol,
-) -> Result<Option<Vec<DefinitionCandidate>>, DefinitionDiagnostic> {
-    let relations = overlay
-        .relations_from(&symbol.id)
+) -> Result<Option<Vec<DefinitionCandidate>>, ModelNavigationFailure> {
+    let matched = overlay.relations_from_for(&symbol.id, &symbol.language);
+    if matches!(
+        matched.disposition,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return Err(ModelNavigationFailure::Incomplete(DefinitionDiagnostic {
+            claim: None,
+            kind: "semantic_model_incomplete".to_string(),
+            message: format!(
+                "`{}` has incomplete modeled navigation relations",
+                symbol.qualified_name
+            ),
+        }));
+    }
+    let relations = matched
         .records
         .into_iter()
         .filter(|relation| relation.kind == "navigates_to")
@@ -1275,19 +1450,26 @@ fn semantic_model_navigation_candidates(
         return Ok(None);
     }
     if relations.len() != 1 || relations[0].provenance.ambiguous {
-        return Err(DefinitionDiagnostic {
+        return Err(ModelNavigationFailure::Other(DefinitionDiagnostic {
             claim: None,
             kind: "semantic_model_conflict".to_string(),
             message: format!(
                 "`{}` has conflicting active semantic-model navigation targets; no definition was selected",
                 symbol.qualified_name
             ),
-        });
+        }));
     }
     let relation = &relations[0];
-    let mut modeled_target = overlay.symbols_with_id(&relation.to);
-    if modeled_target.records.is_empty() {
-        modeled_target = overlay.symbols_named(&relation.to);
+    let mut modeled_target = overlay.symbols_with_id_in_family(&relation.to, &symbol.language);
+    if modeled_target.records.is_empty()
+        && !matches!(
+            modeled_target.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        )
+    {
+        modeled_target = overlay.symbols_named_in_family(&relation.to, &symbol.language);
     }
     match modeled_target.disposition {
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique => {
@@ -1297,16 +1479,23 @@ fn semantic_model_navigation_candidates(
             )]));
         }
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Conflict => {
-            return Err(DefinitionDiagnostic {
+            return Err(ModelNavigationFailure::Other(DefinitionDiagnostic {
                 claim: None,
                 kind: "semantic_model_conflict".to_string(),
                 message: format!(
                     "the navigation target `{}` resolves to conflicting active semantic-model declarations",
                     relation.to
                 ),
-            });
+            }));
         }
         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => {}
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_) => {
+            return Err(ModelNavigationFailure::Incomplete(DefinitionDiagnostic {
+                claim: None,
+                kind: "semantic_model_incomplete".to_string(),
+                message: format!("the navigation target `{}` has an incomplete semantic-model inventory", relation.to),
+            }));
+        }
     }
 
     match exact_codeunit_resolution(analyzer, &relation.to) {
@@ -1316,22 +1505,26 @@ fn semantic_model_navigation_candidates(
                 definition.semantic_model = Some(relation.provenance.clone());
             }
             if definitions.is_empty() {
-                Err(unresolved_semantic_model_navigation(symbol, &relation.to))
+                Err(ModelNavigationFailure::Other(
+                    unresolved_semantic_model_navigation(symbol, &relation.to),
+                ))
             } else {
                 Ok(Some(definitions))
             }
         }
-        CodeUnitResolution::Ambiguous(_) => Err(DefinitionDiagnostic {
-            claim: None,
-            kind: "semantic_model_conflict".to_string(),
-            message: format!(
-                "the navigation target `{}` is ambiguous in authored source; no definition was selected",
-                relation.to
-            ),
-        }),
-        CodeUnitResolution::NotFound => {
-            Err(unresolved_semantic_model_navigation(symbol, &relation.to))
+        CodeUnitResolution::Ambiguous(_) => {
+            Err(ModelNavigationFailure::Other(DefinitionDiagnostic {
+                claim: None,
+                kind: "semantic_model_conflict".to_string(),
+                message: format!(
+                    "the navigation target `{}` is ambiguous in authored source; no definition was selected",
+                    relation.to
+                ),
+            }))
         }
+        CodeUnitResolution::NotFound => Err(ModelNavigationFailure::Other(
+            unresolved_semantic_model_navigation(symbol, &relation.to),
+        )),
     }
 }
 
@@ -1350,8 +1543,8 @@ fn unresolved_semantic_model_navigation(
 }
 
 pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> GetTypeResult {
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let token = scope.token();
+    let _scope = AnalyzerQueryScope::new(analyzer);
+
     let _scope = profiling::scope("searchtools::get_type_by_location");
 
     if params.references.len() > TYPE_LOOKUP_MAX_REFERENCES {
@@ -1381,10 +1574,12 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
     let mut results: Vec<Option<TypeLookupResult>> = vec![None; params.references.len()];
 
     for (index, query) in params.references.into_iter().enumerate() {
+        let pre_scope = AnalyzerQueryScope::new(analyzer);
         match resolver.resolve_literal(&query.path) {
             ResolvedFileInput::File(file) => {
                 pending.push((
                     index,
+                    pre_scope.read_completion().err(),
                     query.clone(),
                     brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupRequest {
                         file,
@@ -1427,30 +1622,62 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
                 });
             }
         }
+        if let (Some(result), Some(reason)) =
+            (results[index].as_mut(), pre_scope.read_completion().err())
+        {
+            mark_type_read_incomplete(result, reason);
+        }
     }
 
     let requests: Vec<_> = pending
         .iter()
-        .map(|(_, _, request)| request.clone())
+        .map(|(_, _, _, request)| request.clone())
         .collect();
     let outcomes =
         brokk_bifrost_analysis::analyzer::usages::get_type::resolve_type_batch(analyzer, requests);
 
     let mut render_cache = DefinitionCandidateRenderCache::default();
-    for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
-        results[index] = Some(render_type_lookup(
+    for ((index, pre_gap, query, request), (outcome, resolution_gap)) in
+        pending.into_iter().zip(outcomes)
+    {
+        let render_scope = AnalyzerQueryScope::new(analyzer);
+        let mut result = render_type_lookup(
             analyzer,
-            token,
+            render_scope.token(),
             query,
             &request.file,
             outcome,
             &mut render_cache,
-        ));
+        );
+        if let Some(reason) = brokk_bifrost_analysis::analyzer::QueryReadIncomplete::merge_optional(
+            pre_gap,
+            brokk_bifrost_analysis::analyzer::QueryReadIncomplete::merge_optional(
+                resolution_gap,
+                render_scope.read_completion().err(),
+            ),
+        ) {
+            mark_type_read_incomplete(&mut result, reason);
+        }
+        results[index] = Some(result);
     }
 
     GetTypeResult {
         results: results.into_iter().flatten().collect(),
     }
+}
+
+fn mark_type_read_incomplete(
+    result: &mut TypeLookupResult,
+    reason: brokk_bifrost_analysis::analyzer::QueryReadIncomplete,
+) {
+    if matches!(result.status.as_str(), "resolved" | "no_type" | "ambiguous") {
+        result.status = "incomplete".to_owned();
+    }
+    result.diagnostics.push(DefinitionDiagnostic {
+        claim: None,
+        kind: "analysis_incomplete".to_owned(),
+        message: format!("structured evidence incomplete: {reason:?}"),
+    });
 }
 
 pub fn rename_symbol(analyzer: &dyn IAnalyzer, params: RenameSymbolParams) -> RenameSymbolResult {
@@ -1587,6 +1814,16 @@ pub(crate) fn render_rename_symbol_result(
         });
     }
 
+    let diagnostics = if language_for_target(&result.target) == Language::Python {
+        vec![DefinitionDiagnostic {
+            kind: "selected_environment_scope".into(),
+            message: super::scan_usages::PYTHON_USAGE_SCOPE_NOTE.into(),
+            claim: None,
+        }]
+    } else {
+        Vec::new()
+    };
+
     RenameSymbolResult {
         query,
         status: "ok".to_string(),
@@ -1597,7 +1834,7 @@ pub(crate) fn render_rename_symbol_result(
         }),
         old_name: Some(result.old_name),
         edits: file_edits,
-        diagnostics: Vec::new(),
+        diagnostics,
     }
 }
 
@@ -1606,17 +1843,27 @@ pub(crate) fn rename_symbol_failure(
     kind: &'static str,
     message: String,
 ) -> RenameSymbolResult {
+    let mut diagnostics = vec![DefinitionDiagnostic {
+        claim: None,
+        kind: kind.to_string(),
+        message,
+    }];
+    if kind == "incomplete_analysis"
+        && Language::from_path(std::path::Path::new(&query.path)) == Language::Python
+    {
+        diagnostics.push(DefinitionDiagnostic {
+            kind: "selected_environment_scope".into(),
+            message: super::scan_usages::PYTHON_USAGE_SCOPE_NOTE.into(),
+            claim: None,
+        });
+    }
     RenameSymbolResult {
         query,
         status: kind.to_string(),
         target: None,
         old_name: None,
         edits: Vec::new(),
-        diagnostics: vec![DefinitionDiagnostic {
-            claim: None,
-            kind: kind.to_string(),
-            message,
-        }],
+        diagnostics,
     }
 }
 
@@ -1723,6 +1970,9 @@ pub(crate) fn render_definition_lookup(
     operation: NavigationOperation,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
+    let model_language =
+        brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(file.language())
+            .semantic_pack_label();
     let _scope = profiling::scope("searchtools::render_definition_lookup");
     let terminal_incomplete = matches!(
         outcome.status,
@@ -1818,7 +2068,7 @@ pub(crate) fn render_definition_lookup(
                 // avoiding irrelevant work for names absent from every active
                 // model (#2324).
                 let receiver_owner = overlay
-                    .symbols_named(member_name)
+                    .symbols_named_in_family(member_name, model_language)
                     .records
                     .iter()
                     .any(|record| record.owner_id.is_some())
@@ -1831,13 +2081,13 @@ pub(crate) fn render_definition_lookup(
                 let mut matched = receiver_owner
                     .as_deref()
                     .map(|owner| overlay.members_named(owner, member_name))
-                    .filter(|matched| !matched.records.is_empty())
+                    .filter(|matched| !matched.records.is_empty() || matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)))
                     .or_else(|| {
                         imported_model_target
                             .as_deref()
-                            .map(|target| overlay.symbols_named(target))
+                            .map(|target| overlay.symbols_named_in_family(target, model_language))
                     })
-                    .unwrap_or_else(|| overlay.symbols_with_id(target));
+                    .unwrap_or_else(|| overlay.symbols_with_id_in_family(target, model_language));
                 // A visible explicit import names the binding. Its absence
                 // from the overlay must not select an unrelated declaration
                 // that merely shares the imported name (#3500).
@@ -1845,7 +2095,7 @@ pub(crate) fn render_definition_lookup(
                     language_for_file(file),
                     Language::Java | Language::Kotlin | Language::Scala
                 );
-                if matched.records.is_empty() && imported_model_target.is_none() {
+                if matched.records.is_empty() && !matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) && imported_model_target.is_none() {
                     if jvm_reference {
                         // The JVM name index is discovery, not import evidence.
                         // Let the language's boundary ladder name the external
@@ -1855,10 +2105,10 @@ pub(crate) fn render_definition_lookup(
                                 analyzer, file, target,
                             )
                         {
-                            matched = overlay.symbols_named(&external_target);
+                            matched = overlay.symbols_named_in_family(&external_target, model_language);
                         }
                     } else {
-                        matched = overlay.symbols_named(target);
+                        matched = overlay.symbols_named_in_family(target, model_language);
                     }
                 }
                 if !jvm_reference && matched.records.is_empty() && target.contains("::") {
@@ -1872,11 +2122,12 @@ pub(crate) fn render_definition_lookup(
                     } else {
                         // Ruby constant navigation shares this rendering arm,
                         // but Cargo crate-root visibility is Rust-specific.
-                        matched = overlay.symbols_named(&dotted_target);
+                        matched = overlay.symbols_named_in_family(&dotted_target, model_language);
                     }
                 }
                 if !jvm_reference && matched.records.is_empty() && target.contains('#') {
-                    matched = overlay.symbols_named(&target.replace('#', "."));
+                    matched =
+                        overlay.symbols_named_in_family(&target.replace('#', "."), model_language);
                 }
                 if language_for_file(file) == Language::Rust {
                     matched
@@ -1899,7 +2150,9 @@ pub(crate) fn render_definition_lookup(
                             }
                         }
                     }
-                    matched.disposition = if matched.records.is_empty() {
+                    matched.disposition = if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                        matched.disposition
+                    } else if matched.records.is_empty() {
                         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
                     } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
                     {
@@ -1924,7 +2177,9 @@ pub(crate) fn render_definition_lookup(
                                     | brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
                             )
                     });
-                    matched.disposition = if matched.records.is_empty() {
+                    matched.disposition = if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                        matched.disposition
+                    } else if matched.records.is_empty() {
                         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
                     } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
                     {
@@ -1957,7 +2212,9 @@ pub(crate) fn render_definition_lookup(
                                         && (has_variadic || arity <= signature.parameters.len())
                                 })
                     });
-                    matched.disposition = if matched.records.is_empty() {
+                    matched.disposition = if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                        matched.disposition
+                    } else if matched.records.is_empty() {
                         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
                     } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
                     {
@@ -1975,7 +2232,9 @@ pub(crate) fn render_definition_lookup(
                     matched
                         .records
                         .retain(|record| record.is_static == static_reference);
-                    matched.disposition = if matched.records.is_empty() {
+                    matched.disposition = if matches!(matched.disposition, brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)) {
+                        matched.disposition
+                    } else if matched.records.is_empty() {
                         brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty
                     } else if matched.records.len() == 1 && !matched.records[0].provenance.ambiguous
                     {
@@ -2024,12 +2283,15 @@ pub(crate) fn render_definition_lookup(
                         }
                     }
                     brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Empty => {}
+                    brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_) => {
+                        status = "incomplete".to_string();
+                    }
                 }
             }
         } else {
             for candidate in &mut definitions {
                 let target = candidate.fqn.as_deref().unwrap_or(&candidate.name);
-                let matched = overlay.symbols_named(target);
+                let matched = overlay.symbols_named_in_family(target, model_language);
                 if matched.disposition
                     == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
                     && matches!(
@@ -2075,16 +2337,22 @@ pub(crate) fn render_definition_lookup(
         );
     }
     diagnostics.extend(unclosed_construct_diagnostic(&definitions));
-    let (mut complete, incomplete_reason) = definition_result_completion(&status, &diagnostics);
-    if terminal_incomplete {
-        complete = false;
-    }
+    // A terminal outcome (incomplete, cancelled, exceeded_budget) is never
+    // complete, even when a reviewed model answered a generated item surface
+    // and `status` now says `resolved`; its own status names the reason.
+    let completion = definition_result_completion(
+        if terminal_incomplete {
+            outcome.status.as_str()
+        } else {
+            &status
+        },
+        &diagnostics,
+    );
     DefinitionLookupResult {
         query,
         operation,
         status,
-        complete,
-        incomplete_reason,
+        completion,
         reference: outcome.reference.map(|site| DefinitionReferenceSite {
             path: site.path,
             target: site.text,
@@ -2425,11 +2693,15 @@ pub fn get_symbol_ancestors(
                 ));
             }
         }
-        return SymbolAncestorsResult {
-            ancestors,
-            not_found,
-            ambiguous: Vec::new(),
-        };
+        return finish_symbol_ancestors(
+            &scope,
+            SymbolAncestorsResult {
+                incomplete: Vec::new(),
+                ancestors,
+                not_found,
+                ambiguous: Vec::new(),
+            },
+        );
     };
 
     let mut ancestors = Vec::new();
@@ -2456,16 +2728,22 @@ pub fn get_symbol_ancestors(
                         .iter()
                         .map(|ancestor| display_symbol_for_target(analyzer, ancestor))
                         .collect::<Vec<_>>();
-                    append_active_universal_root(analyzer, &code_unit, &mut ancestor_names);
+                    let mut incomplete_reasons = answer
+                        .open
+                        .iter()
+                        .map(|reason| reason.description())
+                        .collect::<Vec<_>>();
+                    append_active_universal_root(
+                        analyzer,
+                        &code_unit,
+                        &mut ancestor_names,
+                        &mut incomplete_reasons,
+                    );
                     resolved.push(SymbolAncestors {
                         symbol: display_symbol_for_target(analyzer, &code_unit),
                         ancestors: ancestor_names,
-                        complete: answer.is_complete(),
-                        incomplete_reasons: answer
-                            .open
-                            .iter()
-                            .map(|reason| reason.description())
-                            .collect(),
+                        complete: answer.is_complete() && incomplete_reasons.is_empty(),
+                        incomplete_reasons,
                         alternatives: answer
                             .ambiguous
                             .iter()
@@ -2522,17 +2800,39 @@ pub fn get_symbol_ancestors(
         }
     }
 
-    SymbolAncestorsResult {
-        ancestors,
-        not_found,
-        ambiguous,
+    finish_symbol_ancestors(
+        &scope,
+        SymbolAncestorsResult {
+            incomplete: Vec::new(),
+            ancestors,
+            not_found,
+            ambiguous,
+        },
+    )
+}
+
+fn finish_symbol_ancestors(
+    scope: &AnalyzerQueryScope<'_>,
+    mut result: SymbolAncestorsResult,
+) -> SymbolAncestorsResult {
+    result.incomplete = crate::result_incomplete::query_read_incomplete(scope);
+    if !result.incomplete.is_empty() {
+        for ancestor in &mut result.ancestors {
+            ancestor.complete = false;
+            ancestor.incomplete_reasons.push(format!(
+                "structured evidence incomplete: {:?}",
+                result.incomplete
+            ));
+        }
     }
+    result
 }
 
 fn append_active_universal_root(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     ancestors: &mut Vec<String>,
+    incomplete_reasons: &mut Vec<String>,
 ) {
     let Some(language) = code_unit
         .source()
@@ -2559,6 +2859,16 @@ fn append_active_universal_root(
         return;
     };
     let root = overlay.universal_root_for_language(language);
+    if let brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+        open,
+    ) = root.disposition
+    {
+        incomplete_reasons.push(if open.is_cancellation() {
+            "cancelled".to_owned()
+        } else {
+            format!("hierarchy_open: {}", open.reason)
+        });
+    }
     if root.disposition
         != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
     {
@@ -2573,6 +2883,12 @@ fn append_active_universal_root(
 fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<SymbolAncestors> {
     let overlay = analyzer.semantic_model_overlay()?;
     let matched = overlay.symbols_named(target);
+    let open = match matched.disposition {
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+            open,
+        ) => Some(open),
+        _ => None,
+    };
     let model_targets = matched
         .records
         .iter()
@@ -2612,6 +2928,14 @@ fn model_symbol_ancestors(analyzer: &dyn IAnalyzer, target: &str) -> Option<Symb
     }
     if !found {
         return None;
+    }
+    // Possible targets of an open lookup cannot certify a complete hierarchy.
+    if let Some(open) = open {
+        incomplete_reasons.push(if open.is_cancellation() {
+            "cancelled".to_owned()
+        } else {
+            format!("hierarchy_open: {}", open.reason)
+        });
     }
     names.sort();
     names.dedup();
@@ -3146,7 +3470,8 @@ pub(crate) fn collect_ranked_names_by(
         .zip(display_lines)
         .flat_map(|(candidate, line)| {
             let semantic_model = semantic_model_overlay.and_then(|overlay| {
-                let matched = overlay.symbols_named(&candidate.code_unit.fq_name());
+                let matched = overlay.symbols_named_in_family(&candidate.code_unit.fq_name(),
+                    brokk_bifrost_core::analyzer::model::LanguageDialect::Standard(language_for_file(candidate.code_unit.source())).semantic_pack_label());
                 (matched.disposition
                     == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
                     .then(|| matched.records[0].provenance.clone())

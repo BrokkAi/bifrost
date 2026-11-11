@@ -33,10 +33,11 @@ use super::engine::{
 use super::fact_source::{DeclarationAccessDecision, SelectedTypedRow};
 use super::local_identity::{ResolutionSemanticIdentity, SelectedResolutionMountOrdinal};
 use super::model::{
-    BindingFragmentId, BindingNodeId, DerivationKey, EndpointSignature, PartialPath, PartialPathId,
-    ResolutionAnswer, ResolutionCompletion, ResolutionIncompleteReason, SemanticId, SharedNameId,
-    StackPattern, TypeTransferRule, TypedFrontierState, clone_completion_with_poll,
-    combine_completion_with_poll, completion_values_equal_with_poll,
+    BindingFragmentId, BindingNodeId, DerivationKey, EndpointSignature, ExactCompletionAccumulator,
+    ExactCompletionState, PartialPath, PartialPathId, ResolutionAnswer, ResolutionCompletion,
+    ResolutionIncompleteReason, SemanticId, SharedNameId, StackPattern, TypeTransferRule,
+    TypedFrontierState, clone_completion_with_poll, combine_completion_with_poll,
+    completion_values_equal_with_poll,
 };
 use super::saturation::{CycleCompletenessCertifier, SaturationBranch, SaturationDecision};
 use super::selected_context::SelectedContextOverlay;
@@ -290,6 +291,7 @@ impl FactReferenceSiteMetadata {
 pub struct ReferenceLocalPathEvidence {
     metadata: FactReferenceSiteMetadata,
     local_definitions: Box<[SemanticId]>,
+    definition_endpoints: Box<[(SemanticId, BindingNodeId)]>,
     /// Prefix bindings whose declaration ended before the candidate site.
     prefix_local_definitions: Box<[SemanticId]>,
     prefix_scope_spellings: Box<[(u32, String)]>,
@@ -314,6 +316,7 @@ impl ReferenceLocalPathEvidence {
         Self {
             metadata,
             local_definitions: local_definitions.into_boxed_slice(),
+            definition_endpoints: Box::new([]),
             prefix_local_definitions: prefix_local_definitions.into_boxed_slice(),
             prefix_scope_spellings: prefix_scope_spellings.into_boxed_slice(),
             scope_endpoints: scope_endpoints.into_boxed_slice(),
@@ -328,6 +331,18 @@ impl ReferenceLocalPathEvidence {
     pub(crate) fn with_local_bindings_certified(mut self, certified: bool) -> Self {
         self.local_bindings_certified = certified;
         self
+    }
+
+    pub(crate) fn with_definition_endpoints(
+        mut self,
+        endpoints: Vec<(SemanticId, BindingNodeId)>,
+    ) -> Self {
+        self.definition_endpoints = endpoints.into_boxed_slice();
+        self
+    }
+
+    pub(crate) fn definition_endpoints(&self) -> &[(SemanticId, BindingNodeId)] {
+        &self.definition_endpoints
     }
 
     pub(crate) fn with_lexical_scopes(mut self, scopes: Vec<(BindingNodeId, u32)>) -> Self {
@@ -433,6 +448,7 @@ pub struct ReferenceSeed {
     query: ResolutionQuery,
     node: BindingNodeId,
     site_metadata: Option<FactReferenceSiteMetadata>,
+    prefix_reference: Option<Option<SemanticId>>,
     completion: ResolutionCompletion,
 }
 
@@ -589,6 +605,7 @@ impl ReferenceSeed {
             query,
             node,
             site_metadata,
+            prefix_reference: None,
             completion,
         }
     }
@@ -621,6 +638,18 @@ impl ReferenceSeed {
 
     pub const fn site_metadata(&self) -> Option<FactReferenceSiteMetadata> {
         self.site_metadata
+    }
+
+    pub const fn prefix_reference(&self) -> Option<Option<SemanticId>> {
+        self.prefix_reference
+    }
+
+    pub const fn with_prefix_reference(
+        mut self,
+        prefix_reference: Option<Option<SemanticId>>,
+    ) -> Self {
+        self.prefix_reference = prefix_reference;
+        self
     }
 
     /// The source declaration containing this reference occurrence.
@@ -662,6 +691,7 @@ impl ReferenceSeed {
             query: self.query,
             node: self.node,
             site_metadata: self.site_metadata,
+            prefix_reference: self.prefix_reference,
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
         })
     }
@@ -1203,6 +1233,21 @@ impl CandidatePathStore {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WithheldLexicalTargets {
+    pub(crate) targets: Box<[SemanticId]>,
+    pub(crate) reason: ResolutionIncompleteReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DemandedReferenceEntry {
+    pub(super) answer: super::fact_resolution::SharedAnswer,
+    pub(super) scope: Option<super::ClosedQueryScope>,
+    pub(super) withheld: Option<WithheldLexicalTargets>,
+    pub(super) consumed_walk: bool,
+    pub(super) labelled_incomplete: bool,
+}
+
 /// Exhausted immutable endpoint artifacts and demanded answers retained by
 /// their existing optional operation/request owner. Candidate bodies live in
 /// the separate, mandatory CandidatePathStore, so uncached callers do not
@@ -1225,11 +1270,11 @@ pub struct ForwardCandidateArtifactCache {
     /// are published here: see `retain_demanded_reference_answer`.
     demanded_reference_answers: HashMap<
         DemandedReferenceKey,
-        super::query_obligations::ClosedQueryValue<(
-            super::fact_resolution::SharedAnswer,
-            Option<super::ClosedQueryScope>,
-        )>,
+        super::query_obligations::ClosedQueryValue<DemandedReferenceEntry>,
     >,
+    /// Finalizer payload from the current fill, including reads whose answer
+    /// could not be retained by the demanded-reference memo.
+    finalized_withheld: HashMap<DemandedReferenceKey, WithheldLexicalTargets>,
     /// Budget accounting shared by the type and member stages of one receiver
     /// query. The selected authority keeps unrelated frontiers distinct.
     expanded_owner_frontiers: HashSet<DemandedReferenceKey>,
@@ -1238,6 +1283,24 @@ pub struct ForwardCandidateArtifactCache {
 }
 
 impl ForwardCandidateArtifactCache {
+    pub(super) fn record_finalized_withheld(
+        &mut self,
+        key: DemandedReferenceKey,
+        withheld: Option<&WithheldLexicalTargets>,
+    ) {
+        if let Some(withheld) = withheld {
+            self.finalized_withheld.insert(key, withheld.clone());
+        } else {
+            self.finalized_withheld.remove(&key);
+        }
+    }
+
+    pub(super) fn finalized_withheld(
+        &self,
+        key: &DemandedReferenceKey,
+    ) -> Option<&WithheldLexicalTargets> {
+        self.finalized_withheld.get(key)
+    }
     #[doc(hidden)]
     pub fn reset_owner_expansions(&mut self) {
         self.expanded_owner_frontiers.clear();
@@ -1266,10 +1329,7 @@ impl ForwardCandidateArtifactCache {
         &self,
         key: &DemandedReferenceKey,
         consumer: &mut super::QueryObligations,
-    ) -> Option<&(
-        super::fact_resolution::SharedAnswer,
-        Option<super::ClosedQueryScope>,
-    )> {
+    ) -> Option<&DemandedReferenceEntry> {
         Some(self.demanded_reference_answers.get(key)?.read(consumer))
     }
     pub(super) fn has_demanded_reference_answer(&self, key: &DemandedReferenceKey) -> bool {
@@ -1278,35 +1338,50 @@ impl ForwardCandidateArtifactCache {
 
     /// Publish one demanded reference's exhausted answer.
     ///
-    /// The caller has already established that the answer is complete and that
+    /// The caller has already established that the answer is complete or
+    /// finalizer-labelled incomplete and that
     /// its evaluation is live; this only refuses to overwrite, because one key
     /// has one answer and a second one would mean the key is not the whole
     /// identity of the question.
     pub(super) fn retain_demanded_reference_answer(
         &mut self,
         key: DemandedReferenceKey,
-        answer: super::fact_resolution::SharedAnswer,
+        finalized: super::fact_resolution::FinalizedLexicalAnswer,
         query_scope: Option<super::ClosedQueryScope>,
         obligations: super::QueryObligations,
     ) {
         // Ordinary route-discharge receipts are evaluator-local. This memo
         // carries only the immutable lexical value and its query scope/pending
         // assumptions, not whichever unrelated receipts its consumer held.
-        let mut query_scope = query_scope;
+        let mut entry = DemandedReferenceEntry {
+            answer: finalized.answer,
+            scope: query_scope,
+            withheld: finalized.withheld,
+            consumed_walk: finalized.consumed_walk,
+            labelled_incomplete: finalized.labelled_incomplete,
+        };
         let mut scope = obligations;
         if let Some(existing) = self.demanded_reference_answers.get(&key) {
-            let (binding, prior) = existing.read(&mut scope);
+            let prior = existing.read(&mut scope);
+            if let Some(prior_scope) = &prior.scope {
+                entry
+                    .scope
+                    .get_or_insert_with(Default::default)
+                    .merge(prior_scope.clone());
+            }
+            let mut comparable = prior.clone();
+            if let Some(new_scope) = &entry.scope {
+                comparable
+                    .scope
+                    .get_or_insert_with(Default::default)
+                    .merge(new_scope.clone());
+            }
             assert_eq!(
-                binding, &answer,
+                comparable, entry,
                 "one demanded reference key has one exhausted binding: {key:?}"
             );
-            if let Some(prior) = prior {
-                query_scope
-                    .get_or_insert_with(Default::default)
-                    .merge(prior.clone());
-            }
         }
-        let value = super::query_obligations::ClosedQueryValue::new((answer, query_scope), scope);
+        let value = super::query_obligations::ClosedQueryValue::new(entry, scope);
         self.demanded_reference_answers.insert(key, value);
     }
 
@@ -1324,7 +1399,7 @@ impl ForwardCandidateArtifactCache {
             // Instrumentation does not consume a binding, but uses the same
             // recording accessor with a local accounting scope.
             let mut scope = super::QueryObligations::empty();
-            bytes += size_of_val(key) + answer.read(&mut scope).0.structural_bytes();
+            bytes += size_of_val(key) + answer.read(&mut scope).answer.structural_bytes();
         }
         (self.demanded_reference_answers.len(), bytes)
     }
@@ -2805,6 +2880,17 @@ pub trait BatchResolutionFragmentSource {
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<ReferenceSeed>>;
 
+    /// Recognize the generated token at [4][1] of an unqualified root path.
+    /// A token is not a lexical prefix reference.
+    fn root_reference_token(
+        &self,
+        _reference: SemanticId,
+        _candidate: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     /// Read one reference's local declaration endpoints and root reachability
     /// from its selected `resolution_paths` key. This language-neutral read is
     /// useful to request-local algorithms that can answer package/root names
@@ -2881,6 +2967,14 @@ pub trait BatchResolutionFragmentSource {
     /// The producer publishes complete component rows for direct structured
     /// type expressions (without requiring a generic substitution first).
     fn supports_direct_type_shapes(
+        &self,
+        _reference: SemanticId,
+        _cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        Ok(false)
+    }
+
+    fn supports_exact_type_argument_links(
         &self,
         _reference: SemanticId,
         _cancellation: &CancellationToken,
@@ -3416,6 +3510,16 @@ impl<'a> SelectedContextPathFragmentSource<'a> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
+    fn root_reference_token(
+        &self,
+        reference: SemanticId,
+        candidate: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.base
+            .root_reference_token(reference, candidate, cancellation)
+    }
+
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -3463,6 +3567,15 @@ impl BatchResolutionFragmentSource for SelectedContextPathFragmentSource<'_> {
     ) -> StoreResult<bool> {
         self.base
             .supports_direct_type_shapes(reference, cancellation)
+    }
+
+    fn supports_exact_type_argument_links(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.base
+            .supports_exact_type_argument_links(reference, cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -5196,6 +5309,16 @@ impl SelectedContextOverlayFragmentSource<'_> {
 }
 
 impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> {
+    fn root_reference_token(
+        &self,
+        reference: SemanticId,
+        candidate: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.base
+            .root_reference_token(reference, candidate, cancellation)
+    }
+
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -5285,6 +5408,15 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
     ) -> StoreResult<bool> {
         self.base
             .supports_direct_type_shapes(reference, cancellation)
+    }
+
+    fn supports_exact_type_argument_links(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        self.base
+            .supports_exact_type_argument_links(reference, cancellation)
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -5569,7 +5701,7 @@ impl BatchResolutionFragmentSource for SelectedContextOverlayFragmentSource<'_> 
                         candidate,
                         HydratedCandidatePath {
                             path: cloned,
-                            origin: CandidatePathOrigin::default()
+                            origin: CandidatePathOrigin::default(),
                         }
                     )
                     .is_none(),
@@ -6011,6 +6143,58 @@ pub(super) enum DemandForwardBatchPoll {
 }
 
 impl DemandForwardBatchFrame {
+    #[cfg(test)]
+    pub(super) fn pending_relation_for_test(
+        reference: SemanticId,
+        endpoint: EndpointSignature,
+    ) -> Self {
+        let path = PartialPath::new(
+            endpoint.clone(),
+            endpoint.clone(),
+            [],
+            [],
+            ResolutionCompletion::Complete,
+        );
+        Self {
+            initialized: InitializedSeededBatch {
+                metrics: ResolutionBatchMetrics::default(),
+                completion_work: 0,
+                frontier: Vec::new(),
+                seeds: vec![SeedState {
+                    language: crate::analyzer::Language::None,
+                    reference,
+                    go_spelling_namespace: None,
+                    go_package_qualifier: false,
+                    universe_namespace: None,
+                    completed: Vec::new(),
+                    terminals: Vec::new(),
+                    incomplete_scope_search: false,
+                    completion: BatchCompletionLedger::default(),
+                    observed_completion: CancellationEvidenceLedger::default(),
+                    certifier: CycleCompletenessCertifier::new(&path),
+                }],
+                endpoint_definitions: HashMap::default(),
+                cancelled: false,
+            },
+            admitted: HashSet::default(),
+            accounted_hydrated_completions: HashSet::default(),
+            candidate_completion: OperationCandidateCompletionLedger::new(1),
+            round: Some(DemandForwardRound {
+                expandable: vec![BatchWorkPath {
+                    seed: 0,
+                    path,
+                    saturation: SaturationBranch::default(),
+                }],
+                expandable_seed_indices: vec![0],
+                terminalized: HashSet::default(),
+                matches: Vec::new(),
+                request_base: 0,
+                request_page: vec![BatchCandidateRequest::new(0, endpoint)],
+            }),
+            terminal: false,
+            allowed_targets: None,
+        }
+    }
     /// Restrict this query's eventual lexical selection without reconstructing
     /// source precedence. Only the implicit-receiver overlay uses this filter;
     /// its contextual declaration access still runs in the typed refinement.
@@ -8156,22 +8340,15 @@ fn candidate_completion_reason_sets_equal(
 /// their shared base and poll only the handle and sparse deltas; cancellation
 /// can suppress unpublished rows, but it cannot truncate semantic evidence
 /// already returned for the target.
+///
+/// The reasons follow `ExactCompletionAccumulator`'s union, polled
+/// observationally so it never aborts. `cancellation_observed` is separate
+/// from the reasons on purpose: the token can be seen cancelled while only
+/// complete operands were included, and `finish` then adds `Cancelled`.
 #[derive(Debug, Default)]
 pub(super) struct BatchCompletionLedger {
-    state: BatchCompletionState,
+    reasons: ExactCompletionAccumulator,
     cancellation_observed: bool,
-}
-
-#[derive(Debug, Default)]
-enum BatchCompletionState {
-    #[default]
-    Complete,
-    Single(Vec<ResolutionIncompleteReason>),
-    Multiple {
-        first: Vec<ResolutionIncompleteReason>,
-        additional: Vec<ResolutionIncompleteReason>,
-    },
-    Shared(CompletionReasonUnion),
 }
 
 fn raw_completion(reasons: Vec<ResolutionIncompleteReason>) -> ResolutionCompletion {
@@ -8216,127 +8393,39 @@ impl BatchCompletionLedger {
     ) -> bool {
         let mut cancellation_observed = cancellation.is_cancelled();
         cancellation_observed |= poll_reverse_completion(cancellation, work);
-        let ResolutionCompletion::Incomplete(incoming) = completion else {
-            self.cancellation_observed |= cancellation_observed;
-            return self.cancellation_observed | cancellation.is_cancelled();
-        };
-
-        if incoming.is_shared() || matches!(&self.state, BatchCompletionState::Shared(_)) {
-            let state = std::mem::take(&mut self.state);
+        if let ResolutionCompletion::Incomplete(incoming) = completion {
             let mut poll = || {
                 cancellation_observed |= poll_reverse_completion(cancellation, work);
                 false
             };
-            let reasons = match state {
-                BatchCompletionState::Shared(mut reasons) => {
-                    // A reverse target can accumulate thousands of sparse
-                    // path gaps. Mutate only the incoming operand; rebuilding
-                    // the accumulated additions on every path is quadratic.
-                    reasons
-                        .include_with_poll(incoming, &mut poll)
-                        .expect("observational completion polling cannot abort evidence retention");
-                    reasons
-                }
-                raw => {
-                    let mut reasons = CompletionReasonUnion::from_shared_with_poll(
-                        incoming, &mut poll,
-                    )
-                    .expect("observational completion polling cannot abort evidence retention");
-                    let (first, additional) = match raw {
-                        BatchCompletionState::Complete => (Vec::new(), Vec::new()),
-                        BatchCompletionState::Single(first) => (first, Vec::new()),
-                        BatchCompletionState::Multiple { first, additional } => (first, additional),
-                        BatchCompletionState::Shared(_) => unreachable!("shared state was handled"),
-                    };
-                    for reason in first.into_iter().chain(additional) {
-                        reasons.include_reason_with_poll(reason, &mut poll).expect(
-                            "observational completion polling cannot abort evidence retention",
-                        );
-                    }
-                    reasons
-                }
+            self.reasons
+                .include(completion, &mut poll)
+                .expect("observational completion polling cannot abort evidence retention");
+            let cancelled_reason = match &self.reasons.state {
+                ExactCompletionState::Shared(reasons) => reasons
+                    .contains_with_poll(&ResolutionIncompleteReason::Cancelled, &mut poll)
+                    .expect("observational membership polling cannot abort evidence retention"),
+                ExactCompletionState::Complete
+                | ExactCompletionState::Single(_)
+                | ExactCompletionState::Union(_) => incoming
+                    .iter()
+                    .any(|reason| *reason == ResolutionIncompleteReason::Cancelled),
             };
-            cancellation_observed |= reasons
-                .contains_with_poll(&ResolutionIncompleteReason::Cancelled, &mut || {
-                    cancellation_observed |= poll_reverse_completion(cancellation, work);
-                    false
-                })
-                .expect("observational membership polling cannot abort evidence retention");
-            self.state = BatchCompletionState::Shared(reasons);
-            self.cancellation_observed |= cancellation_observed | cancellation.is_cancelled();
-            return self.cancellation_observed;
+            cancellation_observed |= cancelled_reason;
         }
-
-        let state = std::mem::take(&mut self.state);
-        self.state = match state {
-            BatchCompletionState::Complete => {
-                let mut reasons = Vec::with_capacity(incoming.len());
-                for &reason in incoming.iter() {
-                    cancellation_observed |= poll_reverse_completion(cancellation, work);
-                    cancellation_observed |= reason == ResolutionIncompleteReason::Cancelled;
-                    reasons.push(reason);
-                }
-                BatchCompletionState::Single(reasons)
-            }
-            BatchCompletionState::Single(first) => {
-                assert!(
-                    !first.is_empty() || !incoming.is_empty(),
-                    "incomplete resolution requires a reason"
-                );
-                let mut additional = Vec::with_capacity(incoming.len());
-                for &reason in incoming.iter() {
-                    cancellation_observed |= poll_reverse_completion(cancellation, work);
-                    cancellation_observed |= reason == ResolutionIncompleteReason::Cancelled;
-                    additional.push(reason);
-                }
-                BatchCompletionState::Multiple { first, additional }
-            }
-            BatchCompletionState::Multiple {
-                first,
-                mut additional,
-            } => {
-                for &reason in incoming.iter() {
-                    cancellation_observed |= poll_reverse_completion(cancellation, work);
-                    cancellation_observed |= reason == ResolutionIncompleteReason::Cancelled;
-                    additional.push(reason);
-                }
-                BatchCompletionState::Multiple { first, additional }
-            }
-            BatchCompletionState::Shared(_) => {
-                unreachable!("shared completion operands use the factored union")
-            }
-        };
         self.cancellation_observed |= cancellation_observed | cancellation.is_cancelled();
         self.cancellation_observed
     }
 
     pub(super) fn include_reason(&mut self, reason: ResolutionIncompleteReason) {
-        let state = std::mem::take(&mut self.state);
-        self.state = match state {
-            BatchCompletionState::Complete => BatchCompletionState::Single(vec![reason]),
-            BatchCompletionState::Single(first) => BatchCompletionState::Multiple {
-                first,
-                additional: vec![reason],
-            },
-            BatchCompletionState::Multiple {
-                first,
-                mut additional,
-            } => {
-                additional.push(reason);
-                BatchCompletionState::Multiple { first, additional }
-            }
-            BatchCompletionState::Shared(mut existing) => {
-                existing
-                    .include_reason_with_poll(reason, &mut || false)
-                    .expect("non-cancellable completion union cannot abort");
-                BatchCompletionState::Shared(existing)
-            }
-        };
+        self.reasons
+            .include_reason(reason, &mut || false)
+            .expect("non-cancellable completion union cannot abort");
         self.cancellation_observed |= reason == ResolutionIncompleteReason::Cancelled;
     }
 
     pub(super) fn is_complete(&self) -> bool {
-        matches!(self.state, BatchCompletionState::Complete) && !self.cancellation_observed
+        matches!(self.reasons.state, ExactCompletionState::Complete) && !self.cancellation_observed
     }
 
     pub(super) fn finish_semantic(
@@ -8345,54 +8434,17 @@ impl BatchCompletionLedger {
         work: &mut usize,
     ) -> (ResolutionCompletion, bool) {
         let mut cancellation_observed = self.cancellation_observed | cancellation.is_cancelled();
-        let has_incomplete_operand = !matches!(&self.state, BatchCompletionState::Complete);
-        let reasons = match self.state {
-            BatchCompletionState::Complete => Vec::new(),
-            BatchCompletionState::Single(single) => {
-                let mut reasons = Vec::with_capacity(single.len());
-                for reason in single {
-                    cancellation_observed |= poll_reverse_completion(cancellation, work);
-                    reasons.push(reason);
-                }
-                reasons
-            }
-            BatchCompletionState::Multiple { first, additional } => {
-                let mut poll = || {
-                    cancellation_observed |= poll_reverse_completion(cancellation, work);
-                    false
-                };
-                let reasons = canonical_reasons_with_seed_and_poll(
-                    BTreeSet::new(),
-                    first.into_iter().chain(additional),
-                    &mut poll,
-                )
-                .expect("observational completion polling cannot abort evidence retention");
-                assert!(
-                    !reasons.is_empty(),
-                    "incomplete resolution requires a reason"
-                );
-                reasons.into_vec()
-            }
-            BatchCompletionState::Shared(reasons) => {
-                let reasons = reasons
-                    .finish_with_poll(&mut || {
-                        cancellation_observed |= poll_reverse_completion(cancellation, work);
-                        false
-                    })
-                    .expect("observational completion polling cannot abort evidence retention");
-                return (
-                    ResolutionCompletion::Incomplete(reasons),
-                    cancellation_observed | cancellation.is_cancelled(),
-                );
-            }
-        };
-        cancellation_observed |= cancellation.is_cancelled();
-        let completion = if has_incomplete_operand {
-            ResolutionCompletion::Incomplete(reasons.into_boxed_slice().into())
-        } else {
-            ResolutionCompletion::Complete
-        };
-        (completion, cancellation_observed)
+        let completion = self
+            .reasons
+            .finish(&mut || {
+                cancellation_observed |= poll_reverse_completion(cancellation, work);
+                false
+            })
+            .expect("observational completion polling cannot abort evidence retention");
+        (
+            completion,
+            cancellation_observed | cancellation.is_cancelled(),
+        )
     }
 
     pub(super) fn finish(
@@ -12831,6 +12883,8 @@ impl<'a, S: BatchResolutionFragmentSource + ?Sized> BatchResolutionEngine<'a, S>
     /// started until the callback returns, so broad traversal retains neither
     /// every reference seed, a workspace graph, nor a whole-workspace answer
     /// list.
+    /// This batch engine does not apply JVM prefix coverage. Product surfaces
+    /// use the fact evaluator for that protection.
     pub fn stream_all_reference_batches(
         &self,
         maximum_batch_size: usize,
@@ -13139,7 +13193,10 @@ fn mark_batch_cancelled(
         let (completion, _) = cancelled_completion.finish(cancellation, work);
         answers.push(BatchedReferenceAnswer {
             reference: entry.reference,
-            answer: ResolutionAnswer::new(targets, witnesses, completion),
+            answer: ResolutionAnswer::new(targets, witnesses, completion)
+                .with_lexical_choice_coverage(super::model::LexicalChoiceCoverage::Unknown(
+                    Box::new([ResolutionIncompleteReason::Cancelled]),
+                )),
         });
     }
     let mut cancelled_completion = BatchCompletionLedger::default();
@@ -13269,7 +13326,7 @@ mod tests {
     use crate::analyzer::resolution::test_support::{fragment, node, semantic};
     use std::cell::{Cell, RefCell};
 
-    use super::super::engine::{PreloadedFragment, PreloadedFragmentSource, ResolutionEngine};
+    use super::super::engine::{PreloadedFragment, PreloadedFragmentSource};
     use super::super::model::{
         BindingNodeId, BindingNodeKind, PrecedenceStep, ResolutionSlotValue, ResolutionTypeRef,
         StackPattern, StackVariableId, TypeTransferValueTransform, WitnessStep,
@@ -13619,6 +13676,103 @@ mod tests {
             .reference_seed(query, &CancellationToken::new())
             .expect("preloaded seed lookup is infallible")
             .expect("fixture reference has a seed")
+    }
+
+    #[test]
+    #[hardwon("#9002: the bulk seed path dropped language and prefix")]
+    fn bulk_jvm_seeds_match_point_lookup_and_keep_continuation_target() {
+        use crate::analyzer::Language;
+
+        let owner = fragment("bulk-jvm-prefix-fragment");
+        let head = semantic("bulk-jvm-head");
+        let continuation = semantic("bulk-jvm-continuation");
+        let unpublished = semantic("bulk-jvm-unpublished");
+        let missing = semantic("bulk-jvm-missing");
+        let target = semantic("bulk-jvm-target");
+        let head_node = node("bulk-jvm-head-node");
+        let continuation_node = node("bulk-jvm-continuation-node");
+        let unpublished_node = node("bulk-jvm-unpublished-node");
+        let target_node = node("bulk-jvm-target-node");
+        let source = PreloadedFragmentSource::from_fragments([PreloadedFragment::new(
+            owner,
+            [
+                (head_node, BindingNodeKind::Reference(head)),
+                (continuation_node, BindingNodeKind::Reference(continuation)),
+                (unpublished_node, BindingNodeKind::Reference(unpublished)),
+                (target_node, BindingNodeKind::Definition(target)),
+            ],
+            [(
+                path_id("bulk-jvm-continuation-path"),
+                path(
+                    continuation_node,
+                    target_node,
+                    ResolutionCompletion::Complete,
+                ),
+            )],
+        )
+        .with_reference_seed_data(vec![
+            (head, Language::Java, Some(None)),
+            (continuation, Language::Java, Some(Some(head))),
+            (unpublished, Language::Java, None),
+        ])]);
+
+        let cancellation = CancellationToken::new();
+        let mut bulk_seeds = Vec::new();
+        source
+            .visit_reference_seed_batches(2, &cancellation, &mut |batch| {
+                bulk_seeds.extend_from_slice(batch.seeds());
+                Ok(true)
+            })
+            .expect("preloaded bulk seed read is infallible");
+        assert_eq!(bulk_seeds.len(), 3);
+        for seed in &bulk_seeds {
+            assert_eq!(
+                seed,
+                &reference_seed(&source, ResolutionQuery::new(seed.reference())),
+                "bulk and point seeds must agree on source metadata and completion"
+            );
+            assert_eq!(seed.language(), Language::Java);
+        }
+        assert_eq!(
+            bulk_seeds
+                .iter()
+                .find(|seed| seed.reference() == head)
+                .unwrap()
+                .prefix_reference(),
+            Some(None),
+        );
+        assert_eq!(
+            bulk_seeds
+                .iter()
+                .find(|seed| seed.reference() == continuation)
+                .unwrap()
+                .prefix_reference(),
+            Some(Some(head)),
+        );
+        assert_eq!(
+            bulk_seeds
+                .iter()
+                .find(|seed| seed.reference() == unpublished)
+                .unwrap()
+                .prefix_reference(),
+            None,
+        );
+        assert!(
+            source
+                .reference_seed(ResolutionQuery::new(missing), &cancellation)
+                .unwrap()
+                .is_none()
+        );
+        let (answers, _) = collect_reference_batches(&source, 2);
+        assert_eq!(
+            answers
+                .iter()
+                .find(|item| item.reference() == continuation)
+                .unwrap()
+                .answer()
+                .targets(),
+            &[target],
+        );
     }
 
     #[cfg(test)]
@@ -14850,35 +15004,6 @@ mod tests {
             .is_err(),
             "the plural preload source must enforce the public 256-query bound"
         );
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn reverse_batch_equals_compatibility_and_is_row_order_invariant() {
-        let ordered = shared_fixture(false);
-        let reversed = shared_fixture(true);
-        let cancellation = CancellationToken::new();
-
-        let compatibility = ResolutionEngine::new(&ordered.source)
-            .references_to(ordered.target, &cancellation)
-            .expect("preloaded compatibility source is infallible");
-        let batched = BatchResolutionEngine::new(&ordered.source)
-            .references_to(ordered.target, &cancellation)
-            .expect("preloaded batch source is infallible");
-        let reversed_rows = BatchResolutionEngine::new(&reversed.source)
-            .references_to(reversed.target, &cancellation)
-            .expect("reordered preloaded batch source is infallible");
-
-        assert_eq!(batched, compatibility);
-        assert_eq!(reversed_rows, compatibility);
-        let mut expected = vec![
-            ordered.first_reference,
-            ordered.second_reference,
-            ordered.third_reference,
-        ];
-        expected.sort_unstable();
-        assert_eq!(batched.references(), expected);
-        assert_eq!(batched.completion(), &ResolutionCompletion::Complete);
     }
 
     #[cfg(test)]
@@ -17458,6 +17583,7 @@ mod tests {
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(unconditional.clone()),
             demanded_reference_answers: HashMap::default(),
+            finalized_withheld: HashMap::default(),
             expanded_owner_frontiers: HashSet::default(),
             cache_hits: std::cell::Cell::new(0),
         };
@@ -17579,6 +17705,7 @@ mod tests {
                     summary_expansions: 0,
                     scope_nodes: 0,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 },
             }
         ));
@@ -17613,6 +17740,7 @@ mod tests {
                     summary_expansions: 0,
                     scope_nodes: 3,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 },
                 ..
             }
@@ -17647,6 +17775,7 @@ mod tests {
                     summary_expansions: 0,
                     scope_nodes: 2,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 },
                 ..
             }
@@ -17672,6 +17801,7 @@ mod tests {
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(completion.clone()),
             demanded_reference_answers: HashMap::default(),
+            finalized_withheld: HashMap::default(),
             expanded_owner_frontiers: HashSet::default(),
             cache_hits: std::cell::Cell::new(0),
         };
@@ -17712,6 +17842,7 @@ mod tests {
                     summary_expansions: 0,
                     scope_nodes: 2,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 },
             }
         ));
@@ -17747,6 +17878,7 @@ mod tests {
                     summary_expansions: 0,
                     scope_nodes: 4,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 },
                 ..
             }
@@ -17782,6 +17914,7 @@ mod tests {
             endpoint_classifications: HashMap::default(),
             unconditional_completion: Some(unconditional.clone()),
             demanded_reference_answers: HashMap::default(),
+            finalized_withheld: HashMap::default(),
             expanded_owner_frontiers: HashSet::default(),
             cache_hits: std::cell::Cell::new(0),
         };
@@ -17990,7 +18123,7 @@ mod tests {
 
     #[cfg(test)]
     #[test]
-    fn typed_transfer_matches_preloaded_compatibility_and_propagates_coverage() {
+    fn typed_transfer_propagates_coverage() {
         let source_slot = semantic("batch-type-source");
         let first_slot = semantic("batch-type-first");
         let second_slot = semantic("batch-type-second");
@@ -18032,14 +18165,10 @@ mod tests {
         );
         let cancellation = CancellationToken::new();
 
-        let compatibility = ResolutionEngine::new(&source)
-            .transfer_types(&state, &cancellation)
-            .expect("preloaded compatibility transfer is infallible");
         let batched = BatchResolutionEngine::new(&source)
             .transfer_types(&state, &cancellation)
             .expect("preloaded batch transfer is infallible");
 
-        assert_eq!(batched, compatibility);
         assert!(batched.0.iter().all(|alternative| matches!(
             alternative.completion(),
             ResolutionCompletion::Incomplete(reasons)
@@ -18387,7 +18516,7 @@ mod tests {
     #[cfg(test)]
     #[test]
     #[hardwon("34a9dc50d012: batch and point APIs disagreed on a losing terminal gap")]
-    fn batch_and_compatibility_discharge_the_same_losing_terminal_path() {
+    fn batch_discharges_a_losing_terminal_gap() {
         let owner = fragment("terminal-parity-fragment");
         let reference = semantic("terminal-parity-reference");
         let target = semantic("terminal-parity-target");
@@ -18427,14 +18556,10 @@ mod tests {
         )]);
         let cancellation = CancellationToken::new();
 
-        let compatibility = ResolutionEngine::new(&source)
-            .resolve_reference(ResolutionQuery::new(reference), &cancellation)
-            .expect("preloaded compatibility source is infallible");
         let batch = BatchResolutionEngine::new(&source)
             .resolve_reference(ResolutionQuery::new(reference), &cancellation)
             .expect("preloaded batch source is infallible");
 
-        assert_eq!(batch, compatibility);
         assert_eq!(batch.targets(), &[target]);
         assert_eq!(batch.completion(), &ResolutionCompletion::Complete);
     }

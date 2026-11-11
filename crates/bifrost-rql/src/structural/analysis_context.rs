@@ -15,11 +15,16 @@ use crate::cancellation::CancellationToken;
 use brokk_bifrost_analysis::analyzer::read_attribution_records_reads as read_ledger_attached;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_flow::taint::ProductionTaintAnalysisResult;
+use brokk_bifrost_flow::taint::TaintProjectionLimits;
+use brokk_bifrost_flow::taint::output_product::{
+    OutputEventRow, OutputLocatorRow, OutputReportRow,
+};
 use brokk_bifrost_flow::typestate::{
     CompiledProtocol, ProductionTypestateSummaryRepository, TypestateBindingPlan,
     TypestateBindingPlanHash, TypestateProtocolHash,
 };
 use brokk_bifrost_flow::value_flow::ValueFlowPlan;
+use sha2::{Digest, Sha256};
 
 pub use brokk_bifrost_rql::refs::{
     MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
@@ -49,6 +54,86 @@ pub const MAX_TAINT_RESULTS_PER_REGISTRATION: usize = 256;
 pub const MAX_RETAINED_TAINT_PLAN_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_TAINT_REPORT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_TAINT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The budget or limit that left the output of one Output anchor incomplete.
+///
+/// The lanes are appended in order and registered as their discriminant, so a
+/// new lane goes last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TaintBudgetStopLane {
+    /// The semantic budget shared by the anchors of a run.
+    Semantic,
+    /// The composition's own cap on the procedures one search reads.
+    CompositionProcedures,
+    /// The composition's own cap on the hops one search expands.
+    CompositionHops,
+    /// The composition's own cap on the callers enumerated for one procedure.
+    CompositionCallersPerProcedure,
+    /// The run's allowance of findings: the anchor's row omitted findings.
+    FindingLimit,
+    /// The witness and attribution allowances: a finding's origins, a witness or
+    /// the run's attribution were truncated.
+    WitnessLimit,
+    /// The barrier allowance or the semantic budget: a barrier check was
+    /// omitted or left undecided.
+    BarrierUndecided,
+    /// A search of the unit failed for a reason that is not a budget: a provider
+    /// error that left a verdict unknown. The stop carries the failure text.
+    ProviderFailed,
+}
+
+impl TaintBudgetStopLane {
+    /// The limit a user raises, as a query diagnostic names it.
+    pub const fn limit_name(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic budget",
+            Self::CompositionProcedures => "taint composition procedure limit",
+            Self::CompositionHops => "taint composition hop limit",
+            Self::CompositionCallersPerProcedure => "taint composition callers-per-procedure limit",
+            Self::FindingLimit => "taint finding limit",
+            Self::WitnessLimit => "taint witness and attribution limit",
+            Self::BarrierUndecided => "taint barrier check limit",
+            Self::ProviderFailed => "semantic provider",
+        }
+    }
+}
+
+/// One Output anchor whose composition a budget stopped, and which budget.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaintBudgetStop {
+    pub anchor: OutputLocatorRow,
+    pub lane: TaintBudgetStopLane,
+    /// What the stop says beyond its lane: the failure text of a
+    /// `ProviderFailed` stop, bounded by the producer. Empty for every budget.
+    pub detail: String,
+}
+
+/// Stable composed taint evidence for one compiled procedure root. Every
+/// anchor is represented by a decoded Output row, including clean anchors.
+#[derive(Debug, Clone)]
+pub struct TaintOutputRows {
+    pub root: OutputLocatorRow,
+    pub projection_scope: String,
+    pub projection_limits: TaintProjectionLimits,
+    /// Bound endpoint inventory exposed by policy outcomes. Registrations
+    /// validate and fingerprint it, then discard it before retaining rows.
+    pub bound_sources: Vec<OutputEventRow>,
+    pub bound_sinks: Vec<OutputEventRow>,
+    pub rows: Vec<OutputReportRow>,
+    /// Anchors whose composition a budget stopped, with the budget. Such an
+    /// anchor's row is empty or partial, and a row alone does not say so, so a
+    /// query over this result is incomplete and names the limit (#10403).
+    /// Sorted and unique.
+    pub budget_stops: Vec<TaintBudgetStop>,
+    /// Matched frontier bindings retained by Output units, for contract tests.
+    #[cfg(feature = "test-support")]
+    pub frontier_sources: Vec<OutputEventRow>,
+}
+
+pub enum RegisteredTaintResult<'a> {
+    Live(&'a ProductionTaintAnalysisResult),
+    Output(&'a TaintOutputRows),
+}
 
 const fn capped_limit(requested: usize, maximum: usize) -> usize {
     if requested < maximum {
@@ -827,6 +912,7 @@ impl std::error::Error for ValueFlowPlanRegistrationSetError {}
 pub struct TaintResultRegistration {
     workspace_generation: u64,
     results: Box<[Arc<ProductionTaintAnalysisResult>]>,
+    output_results: Box<[TaintOutputRows]>,
     identity: TaintResultRegistrationIdentity,
     artifact_keys: Box<[SemanticArtifactKey]>,
     retained_plan_bytes: usize,
@@ -837,12 +923,20 @@ pub struct TaintResultRegistration {
 impl TaintResultRegistration {
     pub fn new(
         workspace_generation: u64,
-        mut results: Vec<Arc<ProductionTaintAnalysisResult>>,
+        results: Vec<Arc<ProductionTaintAnalysisResult>>,
     ) -> Result<Self, TaintResultRegistrationError> {
-        if results.is_empty() {
+        Self::new_with_output(workspace_generation, results, Vec::new())
+    }
+
+    pub fn new_with_output(
+        workspace_generation: u64,
+        mut results: Vec<Arc<ProductionTaintAnalysisResult>>,
+        mut output_results: Vec<TaintOutputRows>,
+    ) -> Result<Self, TaintResultRegistrationError> {
+        if results.is_empty() && output_results.is_empty() {
             return Err(TaintResultRegistrationError::Empty);
         }
-        if results.len() > MAX_TAINT_RESULTS_PER_REGISTRATION {
+        if results.len() + output_results.len() > MAX_TAINT_RESULTS_PER_REGISTRATION {
             return Err(TaintResultRegistrationError::TooManyResults {
                 maximum: MAX_TAINT_RESULTS_PER_REGISTRATION,
             });
@@ -859,6 +953,57 @@ impl TaintResultRegistration {
         {
             return Err(TaintResultRegistrationError::DuplicateRoot);
         }
+        for output in &mut output_results {
+            output
+                .root
+                .clone()
+                .decode()
+                .map_err(|_| TaintResultRegistrationError::InvalidOutput)?;
+            if output.rows.iter().any(|row| row.validate().is_err())
+                || output
+                    .bound_sources
+                    .iter()
+                    .any(|source| source.kind != "source" || source.decode_key().is_err())
+                || output
+                    .bound_sinks
+                    .iter()
+                    .any(|sink| sink.kind != "sink" || sink.decode_key().is_err())
+            {
+                return Err(TaintResultRegistrationError::InvalidOutput);
+            }
+            if output
+                .budget_stops
+                .iter()
+                .any(|stop| stop.anchor.clone().decode().is_err())
+            {
+                return Err(TaintResultRegistrationError::InvalidOutput);
+            }
+            output.budget_stops.sort_unstable();
+            output.budget_stops.dedup();
+            output.bound_sources.sort_unstable();
+            output.bound_sinks.sort_unstable();
+            if output
+                .bound_sources
+                .windows(2)
+                .any(|pair| pair[0] == pair[1])
+                || output.bound_sinks.windows(2).any(|pair| pair[0] == pair[1])
+            {
+                return Err(TaintResultRegistrationError::InvalidOutput);
+            }
+        }
+        output_results.sort_unstable_by(|left, right| left.root.cmp(&right.root));
+        if output_results
+            .windows(2)
+            .any(|pair| pair[0].root == pair[1].root)
+            || output_results.iter().any(|output| {
+                results.iter().any(|result| {
+                    output.root
+                        == OutputLocatorRow::encode(result.expected_root().semantics().locator())
+                })
+            })
+        {
+            return Err(TaintResultRegistrationError::DuplicateRoot);
+        }
 
         let mut artifact_keys = results
             .iter()
@@ -868,8 +1013,50 @@ impl TaintResultRegistration {
         artifact_keys.dedup();
         let retained_plan_bytes =
             checked_sum(results.iter().map(|result| result.retained_plan_bytes()))?;
-        let retained_report_bytes =
-            checked_sum(results.iter().map(|result| result.retained_report_bytes()))?;
+        let output_content = output_results
+            .iter()
+            .map(|output| {
+                let limits = [
+                    output.projection_limits.max_origins_per_finding,
+                    output.projection_limits.max_witnesses_per_finding,
+                    output.projection_limits.max_steps_per_witness,
+                    output.projection_limits.max_witness_bytes,
+                ];
+                let retained = serde_json::to_vec(&(
+                    &output.root,
+                    &output.projection_scope,
+                    limits,
+                    &output.rows,
+                    output
+                        .budget_stops
+                        .iter()
+                        .map(|stop| (&stop.anchor, stop.lane as u8, &stop.detail))
+                        .collect::<Vec<_>>(),
+                ))
+                .map_err(|_| TaintResultRegistrationError::InvalidOutput)?;
+                let inventory = serde_json::to_vec(&(&output.bound_sources, &output.bound_sinks))
+                    .map_err(|_| TaintResultRegistrationError::InvalidOutput)?;
+                let mut digest = Sha256::new();
+                digest.update(&retained);
+                digest.update(Sha256::digest(inventory));
+                Ok((
+                    retained.len(),
+                    format!(
+                        "output:{}",
+                        brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                            &digest.finalize().into()
+                        )
+                    )
+                    .into_boxed_str(),
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let retained_report_bytes = checked_sum(
+            results
+                .iter()
+                .map(|result| result.retained_report_bytes())
+                .chain(output_content.iter().map(|(bytes, _)| *bytes)),
+        )?;
         let retained_artifact_bytes = checked_sum(
             results
                 .iter()
@@ -880,12 +1067,18 @@ impl TaintResultRegistration {
             results: results
                 .iter()
                 .map(|result| result.registration_digest().to_owned().into_boxed_str())
+                .chain(output_content.into_iter().map(|(_, digest)| digest))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
+        for output in &mut output_results {
+            output.bound_sources = Vec::new();
+            output.bound_sinks = Vec::new();
+        }
         Ok(Self {
             workspace_generation,
             results: results.into_boxed_slice(),
+            output_results: output_results.into_boxed_slice(),
             identity,
             artifact_keys: artifact_keys.into_boxed_slice(),
             retained_plan_bytes,
@@ -900,6 +1093,10 @@ impl TaintResultRegistration {
 
     pub fn results(&self) -> &[Arc<ProductionTaintAnalysisResult>] {
         &self.results
+    }
+
+    pub fn output_results(&self) -> &[TaintOutputRows] {
+        &self.output_results
     }
 
     pub fn artifact_keys(&self) -> &[SemanticArtifactKey] {
@@ -930,6 +1127,13 @@ impl TaintResultRegistration {
             .iter()
             .find(|result| same_procedure_identity(result.expected_root(), expected_root))
             .map(Arc::as_ref)
+    }
+
+    fn output_for_root(&self, expected_root: &ProcedureHandle) -> Option<&TaintOutputRows> {
+        let locator = OutputLocatorRow::encode(expected_root.semantics().locator());
+        self.output_results
+            .iter()
+            .find(|result| result.root == locator)
     }
 }
 
@@ -963,6 +1167,7 @@ pub enum TaintResultRegistrationError {
     DuplicateRoot,
     PlanReportMismatch,
     RetainedBytesOverflow,
+    InvalidOutput,
 }
 
 impl fmt::Display for TaintResultRegistrationError {
@@ -981,6 +1186,7 @@ impl fmt::Display for TaintResultRegistrationError {
             Self::RetainedBytesOverflow => {
                 formatter.write_str("taint result retained-byte accounting overflowed")
             }
+            Self::InvalidOutput => formatter.write_str("taint Output rows are invalid"),
         }
     }
 }
@@ -1687,7 +1893,7 @@ impl QueryAnalysisContext {
         workspace_generation: u64,
         expected_root: &ProcedureHandle,
         handle: TaintResultHandle,
-    ) -> Result<&ProductionTaintAnalysisResult, QueryAnalysisContextError> {
+    ) -> Result<RegisteredTaintResult<'_>, QueryAnalysisContextError> {
         if handle.context_generation != self.generation {
             return Err(QueryAnalysisContextError::StaleTaintResultHandle);
         }
@@ -1701,13 +1907,16 @@ impl QueryAnalysisContext {
             .taint_registrations
             .get(handle.slot as usize)
             .ok_or(QueryAnalysisContextError::StaleTaintResultHandle)?;
-        let result = registration
-            .result_for_root(expected_root)
-            .ok_or(QueryAnalysisContextError::TaintResultRootMismatch)?;
-        if !result.plan_report_match() {
-            return Err(QueryAnalysisContextError::TaintPlanReportMismatch);
+        if let Some(result) = registration.result_for_root(expected_root) {
+            if !result.plan_report_match() {
+                return Err(QueryAnalysisContextError::TaintPlanReportMismatch);
+            }
+            return Ok(RegisteredTaintResult::Live(result));
         }
-        Ok(result)
+        registration
+            .output_for_root(expected_root)
+            .map(RegisteredTaintResult::Output)
+            .ok_or(QueryAnalysisContextError::TaintResultRootMismatch)
     }
 }
 

@@ -81,6 +81,12 @@ dense_ids! {
 )]
 pub struct StableDigest([u8; 32]);
 
+impl brokk_bifrost_core::retention_budget::RetainedBytes for StableDigest {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 impl StableDigest {
     pub const fn from_array(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -278,7 +284,8 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 /// that anything else changed. A checked-in golden expectation that embeds one
 /// of those ids must be re-blessed with `BIFROST_BLESS=1` in the same change;
 /// the code-query tutorial pages elide them (#5016).
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 46;
+// #10582: static value classes and declared result classes.
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 47;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that

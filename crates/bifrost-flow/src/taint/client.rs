@@ -21,6 +21,7 @@ use crate::value_flow::{
     ValueFlowSourceId,
 };
 
+use super::attributed::{AttributedTaintFunction, AttributedTaintValue};
 use super::model::TaintClassId;
 use super::{SourceClassId, TaintAnalysisPlan, TaintClassSet, TaintUniverse};
 
@@ -257,7 +258,7 @@ impl TaintEdgeFunction {
         output
     }
 
-    fn output_for(&self, class: TaintClassId) -> TaintClassSet {
+    pub(crate) fn output_for(&self, class: TaintClassId) -> TaintClassSet {
         self.overrides
             .binary_search_by_key(&class, |(source, _)| *source)
             .ok()
@@ -452,7 +453,7 @@ struct ActiveTaint<Evidence = ()> {
     evidence: Evidence,
     carrier: ValueFlowCarrierId,
     uncertain: bool,
-    function: TaintEdgeFunction,
+    function: AttributedTaintFunction,
 }
 
 impl<Evidence> ActiveTaint<Evidence> {
@@ -548,17 +549,17 @@ impl ProcedureValueLiveness {
 struct LiveTaintOutput<'a, Hook> {
     problem: &'a TaintFlowProblem<'a, Hook>,
     target: &'a crate::analyzer::semantic::ProgramPointHandle,
-    output: &'a mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+    output: &'a mut dyn DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>,
 }
 
-impl<Hook: TaintObservationHook> DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>
+impl<Hook: TaintObservationHook> DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>
     for LiveTaintOutput<'_, Hook>
 {
     fn should_continue(&self) -> bool {
         self.output.should_continue()
     }
 
-    fn emit(&mut self, transition: IdeTransition<TaintFact, TaintEdgeFunction>) -> bool {
+    fn emit(&mut self, transition: IdeTransition<TaintFact, AttributedTaintFunction>) -> bool {
         if self
             .problem
             .keeps_live_fact(self.target, *transition.fact())
@@ -572,6 +573,9 @@ impl<Hook: TaintObservationHook> DataflowOutput<IdeTransition<TaintFact, TaintEd
 
 pub struct TaintFlowProblem<'plan, Hook = NoTaintObservations> {
     plan: &'plan TaintAnalysisPlan,
+    caller_conversions:
+        Option<&'plan crate::hash::HashSet<crate::analyzer::semantic::CallSiteHandle>>,
+    model_receipts: Option<&'plan crate::model_attribution::TaintModelReceiptInputs>,
     observations: Hook,
     cancellation: brokk_bifrost_core::cancellation::CancellationToken,
     liveness: RefCell<HashMap<ProcedureHandle, Option<ProcedureValueLiveness>>>,
@@ -581,6 +585,8 @@ impl<'plan> TaintFlowProblem<'plan> {
     pub fn new(plan: &'plan TaintAnalysisPlan) -> Self {
         Self {
             plan,
+            caller_conversions: None,
+            model_receipts: None,
             observations: NoTaintObservations,
             cancellation: Default::default(),
             liveness: RefCell::new(HashMap::new()),
@@ -593,10 +599,20 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
     pub(crate) fn with_observations(plan: &'plan TaintAnalysisPlan, observations: Hook) -> Self {
         Self {
             plan,
+            caller_conversions: None,
+            model_receipts: None,
             observations,
             cancellation: Default::default(),
             liveness: RefCell::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn with_caller_conversions(
+        mut self,
+        calls: &'plan crate::hash::HashSet<crate::analyzer::semantic::CallSiteHandle>,
+    ) -> Self {
+        self.caller_conversions = Some(calls);
+        self
     }
 
     pub(crate) fn with_cancellation(
@@ -605,6 +621,30 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
     ) -> Self {
         self.cancellation = cancellation.clone();
         self
+    }
+
+    pub(crate) fn with_model_receipts(
+        mut self,
+        receipts: &'plan crate::model_attribution::TaintModelReceiptInputs,
+    ) -> Self {
+        self.model_receipts = Some(receipts);
+        self
+    }
+
+    fn source_function(
+        &self,
+        source: ValueFlowSourceId,
+        classes: &TaintClassSet,
+    ) -> AttributedTaintFunction {
+        let function = AttributedTaintFunction::exact(TaintEdgeFunction::generate(classes));
+        if let Some(receipt) = self
+            .model_receipts
+            .and_then(|inputs| inputs.sources.get(&source))
+        {
+            function.with_generated_receipt(receipt)
+        } else {
+            function
+        }
     }
 
     fn keeps_live_fact(
@@ -780,7 +820,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 point,
                 phase,
                 flow.carrier,
-                &flow.function,
+                &flow.function.base,
                 &mut flow.evidence,
             )
         });
@@ -794,9 +834,9 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
     /// error.
     fn sanitized_transfer_function(
         &self,
-        base: &TaintEdgeFunction,
+        base: &AttributedTaintFunction,
         removed_labels: &[Box<str>],
-    ) -> TaintEdgeFunction {
+    ) -> AttributedTaintFunction {
         if removed_labels.is_empty() {
             return base.clone();
         }
@@ -809,19 +849,23 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 removed.insert_dense(id);
             }
         }
-        base.compose(&TaintEdgeFunction::kill(&removed))
+        base.compose(&AttributedTaintFunction::exact(TaintEdgeFunction::kill(
+            &removed,
+        )))
     }
 
     fn apply_sanitizers<'a>(
         &self,
-        base: &TaintEdgeFunction,
+        base: &AttributedTaintFunction,
         sanitizers: impl Iterator<Item = &'a super::TaintSanitizerBinding>,
-    ) -> (TaintEdgeFunction, bool) {
+    ) -> (AttributedTaintFunction, bool) {
         let mut function = base.clone();
         let mut complete = true;
         for sanitizer in sanitizers {
             if sanitizer.is_proven() {
-                function = function.compose(&TaintEdgeFunction::kill(sanitizer.removed()));
+                function = function.compose(&AttributedTaintFunction::exact(
+                    TaintEdgeFunction::kill(sanitizer.removed()),
+                ));
             }
             if !sanitizer.is_resolved() {
                 complete = false;
@@ -849,7 +893,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                     carrier,
                     uncertain: !matches!(spec.proof(), ProofStatus::Proven)
                         || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
-                    function: TaintEdgeFunction::generate(
+                    function: self.source_function(
+                        source,
                         self.observations.source_classes(source, binding.classes()),
                     ),
                 })
@@ -861,7 +906,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         &self,
         edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
-        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>,
     ) {
         let mut output = Vec::new();
         let active = self.apply_point(
@@ -884,8 +929,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         &self,
         point: &crate::analyzer::semantic::ProgramPointHandle,
         carrier: ValueFlowCarrierId,
-        base: &TaintEdgeFunction,
-    ) -> (TaintEdgeFunction, bool) {
+        base: &AttributedTaintFunction,
+    ) -> (AttributedTaintFunction, bool) {
         self.apply_sanitizers(
             base,
             self.plan
@@ -903,8 +948,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         point: &crate::analyzer::semantic::ProgramPointHandle,
         input: ValueFlowCarrierId,
         output: ValueFlowCarrierId,
-        base: &TaintEdgeFunction,
-    ) -> (TaintEdgeFunction, bool) {
+        base: &AttributedTaintFunction,
+    ) -> (AttributedTaintFunction, bool) {
         self.apply_sanitizers(
             base,
             self.plan.sanitizers().iter().filter(|sanitizer| {
@@ -928,7 +973,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 evidence: Default::default(),
                 carrier,
                 uncertain,
-                function: self.plan.identity().clone(),
+                function: AttributedTaintFunction::exact(self.plan.identity().clone()),
             }],
             TaintFactKind::Meeting { .. } => Vec::new(),
         }
@@ -942,7 +987,9 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
     ) {
         for flow in active.iter_mut() {
             let (transfer, complete) = self.plan.transfer_function(point, phase, flow.carrier);
-            flow.function = flow.function.compose(transfer);
+            flow.function = flow
+                .function
+                .compose(&AttributedTaintFunction::exact(transfer.clone()));
             flow.uncertain |= !complete;
         }
         active.retain_mut(|flow| {
@@ -950,7 +997,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 point,
                 phase,
                 flow.carrier,
-                &flow.function,
+                &flow.function.base,
                 &mut flow.evidence,
             )
         });
@@ -982,7 +1029,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                     point,
                     ValueFlowObservationPhase::BeforeEffects,
                     flow.carrier,
-                    &flow.function,
+                    &flow.function.base,
                     &mut flow.evidence,
                 )
         });
@@ -991,6 +1038,19 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 .local_transform_function(point, rule.source, rule.target)
                 .unwrap_or_else(|| self.plan.identity())
         });
+        // Looked up only when some transform was selected through an
+        // approximate record, so an exact-only run pays nothing.
+        let local_transform_receipt = if rule.policy_local {
+            self.model_receipts
+                .filter(|inputs| !inputs.local_transforms.is_empty())
+                .and_then(|inputs| {
+                    inputs
+                        .local_transforms
+                        .get(&(point.clone(), rule.source, rule.target))
+                })
+        } else {
+            None
+        };
         let mut generated = active
             .iter()
             .filter(|flow| flow.carrier == rule.source)
@@ -999,7 +1059,11 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
             .map(|flow| {
                 let mut flow = flow.through_semantics(rule.complete);
                 if let Some(function) = local_transform {
-                    flow.function = flow.function.compose(function);
+                    let mut transform = AttributedTaintFunction::exact(function.clone());
+                    if let Some(receipt) = local_transform_receipt {
+                        transform = transform.with_model_receipt(receipt);
+                    }
+                    flow.function = flow.function.compose(&transform);
                 }
                 ActiveTaint {
                     carrier: rule.target,
@@ -1068,7 +1132,9 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 }
             }
             if !killed.is_empty() {
-                flow.function = flow.function.compose(&TaintEdgeFunction::kill(&killed));
+                flow.function = flow.function.compose(&AttributedTaintFunction::exact(
+                    TaintEdgeFunction::kill(&killed),
+                ));
             }
         }
     }
@@ -1079,7 +1145,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         phase: ValueFlowObservationPhase,
         active: &[ActiveTaint<Hook::Evidence>],
         entry: Option<TaintFact>,
-        output: &mut Vec<(TaintFact, TaintEdgeFunction, Hook::Evidence)>,
+        output: &mut Vec<(TaintFact, AttributedTaintFunction, Hook::Evidence)>,
     ) {
         for (sink, carrier) in self.plan.value_flow().sink_bindings_at(point, phase) {
             if self.plan.sink(sink).is_none() {
@@ -1107,7 +1173,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         point: &crate::analyzer::semantic::ProgramPointHandle,
         fact: TaintFact,
         entry: Option<TaintFact>,
-        output: &mut Vec<(TaintFact, TaintEdgeFunction, Hook::Evidence)>,
+        output: &mut Vec<(TaintFact, AttributedTaintFunction, Hook::Evidence)>,
     ) -> Vec<ActiveTaint<Hook::Evidence>> {
         let active = self.initial_active(point, fact);
         let mut after = Vec::new();
@@ -1121,7 +1187,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         entry: Option<TaintFact>,
         mut active: Vec<ActiveTaint<Hook::Evidence>>,
         after: Vec<ActiveTaint<Hook::Evidence>>,
-        output: &mut Vec<(TaintFact, TaintEdgeFunction, Hook::Evidence)>,
+        output: &mut Vec<(TaintFact, AttributedTaintFunction, Hook::Evidence)>,
     ) -> Vec<ActiveTaint<Hook::Evidence>> {
         self.apply_phase(point, ValueFlowObservationPhase::BeforeEffects, &mut active);
         self.append_meetings(
@@ -1153,7 +1219,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         phase: ValueFlowObservationPhase,
         max_candidates: usize,
         request: &mut DataflowRequest<'_>,
-    ) -> Result<Option<Vec<(TaintFact, TaintEdgeFunction)>>, SolverTermination> {
+    ) -> Result<Option<Vec<(TaintFact, AttributedTaintFunction)>>, SolverTermination> {
         if request.cancellation.is_cancelled() {
             return Err(SolverTermination::Cancelled);
         }
@@ -1191,7 +1257,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                         carrier,
                         uncertain: !matches!(spec.proof(), ProofStatus::Proven)
                             || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
-                        function: TaintEdgeFunction::generate(
+                        function: self.source_function(
+                            source,
                             self.observations.source_classes(source, binding.classes()),
                         ),
                     });
@@ -1202,7 +1269,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 evidence: Default::default(),
                 carrier,
                 uncertain,
-                function: self.plan.identity().clone(),
+                function: AttributedTaintFunction::exact(self.plan.identity().clone()),
             }],
             TaintFactKind::Meeting { .. } => Vec::new(),
         };
@@ -1255,7 +1322,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                             carrier,
                             uncertain: !matches!(spec.proof(), ProofStatus::Proven)
                                 || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
-                            function: TaintEdgeFunction::generate(
+                            function: self.source_function(
+                                source,
                                 self.observations.source_classes(source, binding.classes()),
                             ),
                         })
@@ -1332,7 +1400,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
             carrier,
             uncertain: !matches!(spec.proof(), ProofStatus::Proven)
                 || !matches!(spec.completeness(), EvidenceCompleteness::Complete),
-            function: TaintEdgeFunction::generate(
+            function: self.source_function(
+                source_id,
                 self.observations
                     .source_classes(source_id, binding.classes()),
             ),
@@ -1371,7 +1440,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 evidence: Default::default(),
                 carrier,
                 uncertain,
-                function: self.plan.identity().clone(),
+                function: AttributedTaintFunction::exact(self.plan.identity().clone()),
             }],
             TaintFactKind::Zero | TaintFactKind::Meeting { .. } => Vec::new(),
         };
@@ -1449,7 +1518,9 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                                 }
                             }
                         }
-                        flow.function = flow.function.compose(&TaintEdgeFunction::kill(&killed));
+                        flow.function = flow.function.compose(&AttributedTaintFunction::exact(
+                            TaintEdgeFunction::kill(&killed),
+                        ));
                     }
                 }
                 active
@@ -1464,12 +1535,12 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         output
             .into_iter()
             .filter_map(|(fact, function, evidence)| {
-                self.observations.emitted(fact, &function, &evidence);
+                self.observations.emitted(fact, &function.base, &evidence);
                 (fact == output_fact
                     && step
                         .target()
                         .is_none_or(|target| self.keeps_live_fact(target, fact)))
-                .then_some(function)
+                .then_some(function.base)
             })
             .collect()
     }
@@ -1477,8 +1548,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
     fn emit(
         &self,
         active: Vec<ActiveTaint<Hook::Evidence>>,
-        mut output: Vec<(TaintFact, TaintEdgeFunction, Hook::Evidence)>,
-        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+        mut output: Vec<(TaintFact, AttributedTaintFunction, Hook::Evidence)>,
+        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>,
     ) {
         output.extend(
             active
@@ -1488,7 +1559,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         output.sort_unstable();
         output.dedup();
         for (fact, function, evidence) in output {
-            self.observations.emitted(fact, &function, &evidence);
+            self.observations.emitted(fact, &function.base, &evidence);
             if !out.emit(IdeTransition::new(fact, function)) {
                 break;
             }
@@ -1499,7 +1570,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         &self,
         edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
-        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>,
     ) {
         let mut output = Vec::new();
         let active = self.apply_point(
@@ -1548,7 +1619,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                         point,
                         ValueFlowObservationPhase::BeforeEffects,
                         flow.carrier,
-                        &flow.function,
+                        &flow.function.base,
                         &mut flow.evidence,
                     );
                 let (mapped_function, mapped_complete) =
@@ -1582,7 +1653,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         &self,
         edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
-        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>,
     ) {
         let mut output = Vec::new();
         let active = self.apply_point(
@@ -1635,7 +1706,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                         point,
                         ValueFlowObservationPhase::BeforeEffects,
                         flow.carrier,
-                        &flow.function,
+                        &flow.function.base,
                         &mut flow.evidence,
                     )
                 {
@@ -1670,7 +1741,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         &self,
         edge: DataflowEdge<'_, TaintFact>,
         fact: TaintFact,
-        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>>,
+        out: &mut dyn DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>>,
     ) {
         let mut output = Vec::new();
         let active = self.apply_point(
@@ -1686,7 +1757,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         output.sort_unstable();
         output.dedup();
         for (fact, function, evidence) in output {
-            self.observations.emitted(fact, &function, &evidence);
+            self.observations.emitted(fact, &function.base, &evidence);
             if !out.emit(IdeTransition::new(fact, function)) {
                 return;
             }
@@ -1696,10 +1767,11 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
             edge.origin(),
             edge.boundary(),
             edge.kind(),
+            edge.caller_conversion_may_run_user_code(),
             active,
             |flow| {
                 self.observations
-                    .emitted(flow.fact(), &flow.function, &flow.evidence);
+                    .emitted(flow.fact(), &flow.function.base, &flow.evidence);
                 out.emit(IdeTransition::new(flow.fact(), flow.function))
             },
         );
@@ -1714,19 +1786,25 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
         active: Vec<ActiveTaint<Hook::Evidence>>,
     ) -> Vec<ActiveTaint<Hook::Evidence>> {
         let mut mapped = Vec::new();
-        self.visit_boundary(point, call, boundary, kind, active, |flow| {
+        let conversion = call.is_some_and(|call| {
+            self.caller_conversions
+                .is_some_and(|calls| calls.contains(call))
+        });
+        self.visit_boundary(point, call, boundary, kind, conversion, active, |flow| {
             mapped.push(flow);
             true
         });
         mapped
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_boundary(
         &self,
         point: &crate::analyzer::semantic::ProgramPointHandle,
         call: Option<&crate::analyzer::semantic::CallSiteHandle>,
         boundary: Option<&crate::analyzer::semantic::DispatchBoundaryKind>,
         kind: IcfgEdgeKind,
+        caller_conversion_may_run_user_code: bool,
         mut active: Vec<ActiveTaint<Hook::Evidence>>,
         mut emit: impl FnMut(ActiveTaint<Hook::Evidence>) -> bool,
     ) {
@@ -1743,7 +1821,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 point,
                 call,
                 flow.carrier,
-                &flow.function,
+                &flow.function.base,
                 &mut flow.evidence,
             )
         });
@@ -1754,6 +1832,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                 call,
                 boundary,
                 kind,
+                caller_conversion_may_run_user_code,
                 flow.carrier,
                 |transfer| {
                     if input_rejected
@@ -1761,7 +1840,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                             point,
                             call,
                             flow.carrier,
-                            &flow.function,
+                            &flow.function.base,
                             &mut flow.evidence,
                         )
                     {
@@ -1774,6 +1853,15 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                         transfer.target,
                         &flow.function,
                     );
+                    let receipt = transfer.model_fingerprint.and_then(|fingerprint| {
+                        self.model_receipts
+                            .and_then(|inputs| inputs.summaries.get(&fingerprint))
+                    });
+                    let function = if let Some(receipt) = receipt {
+                        function.with_model_receipt(receipt)
+                    } else {
+                        function
+                    };
                     let mut transferred = ActiveTaint {
                         evidence: flow.evidence.clone(),
                         carrier: transfer.target,
@@ -1787,7 +1875,7 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
                         point,
                         ValueFlowObservationPhase::AfterEffects,
                         transferred.carrier,
-                        &transferred.function,
+                        &transferred.function.base,
                         &mut transferred.evidence,
                     ) {
                         emitting = emit(transferred);
@@ -1813,8 +1901,8 @@ impl<'plan, Hook: TaintObservationHook> TaintFlowProblem<'plan, Hook> {
 #[allow(private_bounds)]
 impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hook> {
     type Fact = TaintFact;
-    type Value = TaintClassSet;
-    type EdgeFunction = TaintEdgeFunction;
+    type Value = AttributedTaintValue;
+    type EdgeFunction = AttributedTaintFunction;
 
     fn zero_fact(&self) -> Self::Fact {
         TaintFact::ZERO
@@ -1841,11 +1929,11 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
     }
 
     fn zero_value(&self) -> Self::Value {
-        self.plan.universe().empty_set()
+        AttributedTaintValue::exact(self.plan.universe().empty_set())
     }
 
     fn identity_edge_function(&self) -> Self::EdgeFunction {
-        self.plan.identity().clone()
+        AttributedTaintFunction::exact(self.plan.identity().clone())
     }
 
     fn is_flow_observation(&self, fact: &Self::Fact) -> bool {
@@ -1856,7 +1944,7 @@ impl<Hook: TaintObservationHook> IdeDataflowProblem for TaintFlowProblem<'_, Hoo
     }
 
     fn meet_values(&self, left: &Self::Value, right: &Self::Value) -> Self::Value {
-        left.union(right)
+        left.meet(right)
     }
 
     fn compose_edge_functions(
@@ -2576,6 +2664,7 @@ impl<'plan> TaintBackwardFlowProblem<'plan> {
                         call,
                         edge.boundary(),
                         edge.kind(),
+                        edge.caller_conversion_may_run_user_code(),
                         source,
                         |transfer| {
                             transfers.push(transfer);
@@ -2935,7 +3024,8 @@ pub(crate) fn solve_taint_batch_backward_on_input(
     Ok(TaintBackwardResult::from_result(result))
 }
 
-type RawTaintSummaryResult = IdeSummaryDataflowResult<TaintFact, TaintClassSet, TaintEdgeFunction>;
+type RawTaintSummaryResult =
+    IdeSummaryDataflowResult<TaintFact, AttributedTaintValue, AttributedTaintFunction>;
 
 /// One IDE result branded to the exact taint plan that defined its dense domains.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3013,6 +3103,7 @@ impl TaintSummaryResult {
             SummaryMetrics, WitnessArena, WitnessRetentionLimits,
         };
         let fact_result = SummaryDataflowResult::from_parts(
+            None,
             facts,
             Vec::new(),
             Vec::new(),
@@ -3069,7 +3160,17 @@ impl TaintSummaryResult {
     }
 
     pub fn value(&self, id: crate::dataflow::IdeValueId) -> Option<&TaintClassSet> {
-        self.result.value(id)
+        self.result.value(id).map(|value| &value.classes)
+    }
+
+    pub fn model_receipt(
+        &self,
+        id: crate::dataflow::IdeValueId,
+        classes: &TaintClassSet,
+    ) -> Option<crate::model_attribution::ModelReceipt> {
+        self.result
+            .value(id)
+            .map(|value| value.receipt_for_classes(classes))
     }
 
     pub const fn coverage(&self) -> &crate::dataflow::SummaryCoverage {
@@ -3112,8 +3213,8 @@ impl TaintSummaryResult {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.result.retained_bytes_with(
-            TaintClassSet::retained_heap_bytes,
-            TaintEdgeFunction::retained_heap_bytes,
+            AttributedTaintValue::retained_heap_bytes,
+            AttributedTaintFunction::retained_heap_bytes,
         ))
     }
 }
@@ -3153,6 +3254,30 @@ where
         root,
         provider,
         plan,
+        None,
+        witness_retention,
+        semantic_budget,
+        request,
+    )
+}
+
+pub fn solve_taint_batch_with_model_receipts<Provider>(
+    root: &ProcedureHandle,
+    provider: &Provider,
+    plan: &TaintAnalysisPlan,
+    receipts: &crate::model_attribution::TaintModelReceiptInputs,
+    witness_retention: WitnessRetentionLimits,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TaintSummaryResult, TaintSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+{
+    solve_taint_batch_with_witnesses_from_provider(
+        root,
+        provider,
+        plan,
+        Some(receipts),
         witness_retention,
         semantic_budget,
         request,
@@ -3176,6 +3301,7 @@ where
         root,
         &replay,
         plan,
+        None,
         witness_retention,
         semantic_budget,
         request,
@@ -3186,6 +3312,7 @@ fn solve_taint_batch_with_witnesses_from_provider<Provider>(
     root: &ProcedureHandle,
     provider: &Provider,
     plan: &TaintAnalysisPlan,
+    receipts: Option<&crate::model_attribution::TaintModelReceiptInputs>,
     witness_retention: WitnessRetentionLimits,
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
@@ -3202,7 +3329,10 @@ where
         return Err(TaintSolveError::RootMismatch);
     }
     let input = IdeSummarySolveInput::new(root, &[]).with_witness_retention(witness_retention);
-    let problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
+    let mut problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
+    if let Some(receipts) = receipts {
+        problem = problem.with_model_receipts(receipts);
+    }
     let result = if plan.value_flow().has_contextual_bindings() {
         solve_ide_with_summaries_with_call_context(
             input,
@@ -3219,18 +3349,19 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn solve_taint_with_reusable_provider<Provider, Reusable>(
+pub(crate) fn solve_taint_with_reusable_provider_with_model_receipts<Provider, Reusable>(
     root: &ProcedureHandle,
     provider: &Provider,
     reusable: &mut Reusable,
     plan: &TaintAnalysisPlan,
+    receipts: Option<&crate::model_attribution::TaintModelReceiptInputs>,
     witness_retention: WitnessRetentionLimits,
     semantic_budget: &mut SemanticBudget,
     request: &mut DataflowRequest<'_>,
 ) -> Result<TaintSummaryResult, TaintSolveError>
 where
     Provider: IcfgProvider + ?Sized,
-    Reusable: ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction>,
+    Reusable: ReusableIdeSummaryProvider<TaintFact, AttributedTaintFunction>,
 {
     if !plan.value_type_barriers().is_empty() {
         return Err(TaintSolveError::UnsupportedValueTypeBarriers {
@@ -3241,7 +3372,10 @@ where
         return Err(TaintSolveError::RootMismatch);
     }
     let input = IdeSummarySolveInput::new(root, &[]).with_witness_retention(witness_retention);
-    let problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
+    let mut problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
+    if let Some(receipts) = receipts {
+        problem = problem.with_model_receipts(receipts);
+    }
     let result = if plan.value_flow().has_contextual_bindings() {
         solve_ide_with_reusable_summaries_with_call_context(
             input,

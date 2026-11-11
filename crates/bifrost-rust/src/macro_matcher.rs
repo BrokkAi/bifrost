@@ -6,12 +6,28 @@
 //! feed that definition's syntax tree and the invocation argument `token_tree`.
 
 use crate::declarations::rust_node_text;
-use crate::lexical_scope::parse_rust_tree;
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::contains_node as node_within;
 use brokk_bifrost_core::analyzer::tree_walk::find_ancestor;
 use brokk_bifrost_core::hash::HashMap;
 use tree_sitter::Node;
+
+fn parse_rust_tree_for_fragment(source: &str) -> Option<tree_sitter::Tree> {
+    // Generated macro fragments have no analyzer owner and are uncached.
+    crate::lexical_scope::parse_rust_tree_uncached(source)
+}
+
+fn advance_point(mut point: tree_sitter::Point, text: &str) -> tree_sitter::Point {
+    for byte in text.bytes() {
+        if byte == b'\n' {
+            point.row += 1;
+            point.column = 0;
+        } else {
+            point.column += 1;
+        }
+    }
+    point
+}
 
 #[path = "macro_canonical_matcher.rs"]
 mod canonical;
@@ -309,7 +325,9 @@ pub fn macro_invocation_is_locally_bound<'tree>(
                         !import.module_self
                             && crate::imports::rust_import_binding_name(&import.info)
                                 .named()
-                                .is_some_and(|bound| strip_raw_identifier_prefix(bound) == name)
+                                .is_some_and(|bound| {
+                                    crate::imports::rust_binding_name_matches(bound, name)
+                                })
                     })
         })
     })
@@ -470,7 +488,7 @@ pub fn classify_fragment_interior(
     rel_end: usize,
 ) -> Option<MacroNamespaceEvidence> {
     let (wrapped, prefix_len) = wrap_fragment(fragment, fragment_source);
-    let tree = parse_rust_tree(&wrapped)?;
+    let tree = parse_rust_tree_for_fragment(&wrapped)?;
     let target_start = prefix_len + rel_start;
     let target_end = prefix_len + rel_end;
     let node = tree
@@ -596,7 +614,7 @@ pub(crate) fn captured_ident_role(role: MacroIdentRole, token: &str) -> MacroIde
         _ => return role,
     };
     let (wrapped, prefix_len) = wrap_fragment(fragment, token);
-    let parsed = parse_rust_tree(&wrapped)
+    let parsed = parse_rust_tree_for_fragment(&wrapped)
         .and_then(|tree| parsed_prefix_len(fragment, tree.root_node(), &wrapped, prefix_len));
     if parsed == Some(token.len()) {
         role
@@ -694,7 +712,7 @@ fn consume_parsed_fragment(
         return None;
     }
     let (wrapped, prefix_len) = wrap_fragment(fragment, rest);
-    let tree = parse_rust_tree(&wrapped)?;
+    let tree = parse_rust_tree_for_fragment(&wrapped)?;
     let expected_start = prefix_len + leading_ws_len(&wrapped[prefix_len..]);
     let macro_invocation_len = if fragment == MacroFragmentKind::Expr {
         canonical::macro_invocation_prefix_len(
@@ -775,6 +793,10 @@ pub fn parse_macro_operands(invocation: Node<'_>, source: &str) -> Option<Vec<Pa
     if matches_macro && spans.len() != 2 {
         return None;
     }
+    // Recomputing each operand's point from the file start is quadratic for a
+    // large file with many macro invocations; advance from the invocation.
+    let mut point = invocation.start_position();
+    let mut point_byte = invocation.start_byte();
     spans
         .into_iter()
         .enumerate()
@@ -791,7 +813,14 @@ pub fn parse_macro_operands(invocation: Node<'_>, source: &str) -> Option<Vec<Pa
                 repetition_path: Vec::new(),
                 ident_role: None,
             };
-            let tree = parse_bound_fragment(&binding, source)?;
+            point = advance_point(
+                point,
+                source
+                    .get(point_byte..start_byte)
+                    .expect("macro operand starts after the invocation"),
+            );
+            point_byte = start_byte;
+            let tree = parse_bound_fragment_at(&binding, source, point)?;
             let node = tree
                 .root_node()
                 .descendant_for_byte_range(start_byte, end_byte)?;
@@ -811,6 +840,19 @@ pub fn parse_macro_operands(invocation: Node<'_>, source: &str) -> Option<Vec<Pa
 /// The edit changes only the synthetic wrapper before the fragment; every
 /// fragment node can therefore be lowered against the original source bytes.
 pub fn parse_bound_fragment(binding: &MacroBinding, source: &str) -> Option<tree_sitter::Tree> {
+    let before = &source[..binding.start_byte];
+    let row = before.matches('\n').count();
+    let column = before
+        .rfind('\n')
+        .map_or(before.len(), |last| before.len() - last - 1);
+    parse_bound_fragment_at(binding, source, tree_sitter::Point::new(row, column))
+}
+
+fn parse_bound_fragment_at(
+    binding: &MacroBinding,
+    source: &str,
+    start_position: tree_sitter::Point,
+) -> Option<tree_sitter::Tree> {
     let (wrapped, prefix) = wrap_fragment(
         binding.fragment,
         &source[binding.start_byte..binding.end_byte],
@@ -819,21 +861,14 @@ pub fn parse_bound_fragment(binding: &MacroBinding, source: &str) -> Option<tree
     // subtree IDs, even after edits shift their coordinates. Each invocation
     // therefore needs fresh nodes before rebasing, or a repeated closure's
     // parameter can inherit the previous invocation's declaration occurrence.
-    let mut tree = crate::lexical_scope::parse_rust_tree_uncached(&wrapped)?;
-    let before = &source[..binding.start_byte];
-    let row = before.bytes().filter(|&byte| byte == b'\n').count();
-    let column = before
-        .as_bytes()
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(before.len(), |last| before.len() - last - 1);
+    let mut tree = parse_rust_tree_for_fragment(&wrapped)?;
     tree.edit(&tree_sitter::InputEdit {
         start_byte: 0,
         old_end_byte: prefix,
         new_end_byte: binding.start_byte,
         start_position: tree_sitter::Point::new(0, 0),
         old_end_position: tree_sitter::Point::new(0, prefix),
-        new_end_position: tree_sitter::Point::new(row, column),
+        new_end_position: start_position,
     });
     Some(tree)
 }
@@ -948,7 +983,7 @@ fn parsed_prefix_len(
             let node = largest_clean_node_starting_at(root, expected_start)?;
             let fragment_source = wrapped.get(expected_start..node.end_byte())?;
             let (fragment_wrapper, fragment_prefix) = wrap_fragment(fragment, fragment_source);
-            let fragment_tree = parse_rust_tree(&fragment_wrapper)?;
+            let fragment_tree = parse_rust_tree_for_fragment(&fragment_wrapper)?;
             let wrapper = fragment_tree.root_node().named_child(0)?;
             if wrapper.kind() != "type_item" {
                 return None;
@@ -1269,7 +1304,7 @@ impl MacroTranscriber {
         expanded.push_str(prefix);
         expanded.push_str(&output);
         expanded.push_str(suffix);
-        let Some(tree) = parse_rust_tree(&expanded) else {
+        let Some(tree) = parse_rust_tree_for_fragment(&expanded) else {
             return MacroTranscribedOutput::default();
         };
         if tree.root_node().has_error() {
@@ -2178,11 +2213,11 @@ fn ident_role_from_reparsed_transcriber(
     let wrapped = format!(
         "impl __BifrostMacroExpansion {{ fn __bifrost_macro_expansion() {{ {rewritten} }} }}"
     );
-    let (parsed_source, tree) = parse_rust_tree(&rewritten)
+    let (parsed_source, tree) = parse_rust_tree_for_fragment(&rewritten)
         .filter(|tree| !tree.root_node().has_error())
         .map(|tree| (rewritten.as_str(), tree))
         .or_else(|| {
-            parse_rust_tree(&wrapped)
+            parse_rust_tree_for_fragment(&wrapped)
                 .filter(|tree| !tree.root_node().has_error())
                 .map(|tree| (wrapped.as_str(), tree))
         })?;
@@ -2484,14 +2519,13 @@ fn collapse_ident_roles(roles: &[MacroIdentRole]) -> MacroIdentRole {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexical_scope::parse_rust_tree;
     use brokk_bifrost_core::analyzer::resolution_facts::{
         ResolutionIdentifierRole, ResolutionNamespace,
     };
     use brokk_bifrost_test_macros::hardwon;
 
     fn parse(source: &str) -> tree_sitter::Tree {
-        parse_rust_tree(source).expect("parse rust fixture")
+        parse_rust_tree_for_fragment(source).expect("parse rust fixture")
     }
 
     fn definition_and_invocation<'a>(
@@ -2829,6 +2863,23 @@ mod tests {
                 );
                 assert!(occurrences.iter().all(|row| row.provenance == brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceProvenance::Embedded), "{occurrences:?}");
             }
+        }
+    }
+
+    #[test]
+    fn parsed_macro_operands_keep_multiline_source_points() {
+        let source = "fn f() {\n    take!(\n        first,\n        second,\n    );\n}";
+        let tree = parse(source);
+        let invocation = named_descendant(tree.root_node(), "macro_invocation").unwrap();
+        let operands = parse_macro_operands(invocation, source).unwrap();
+        assert_eq!(operands.len(), 2);
+        for (operand, (spelling, point)) in operands.iter().zip([
+            ("first", tree_sitter::Point::new(2, 8)),
+            ("second", tree_sitter::Point::new(3, 8)),
+        ]) {
+            let node = operand.node();
+            assert_eq!(&source[node.start_byte()..node.end_byte()], spelling);
+            assert_eq!(node.start_position(), point);
         }
     }
 
@@ -3601,7 +3652,7 @@ cut_error!(format!("bad"),);
     #[test]
     fn captured_type_and_expression_fragments_retain_original_reference_ranges() {
         let source = "macro_rules! take { ($t:ty, $e:expr) => {}; }\nfn run() { take!(crate::Row, value + 1); }";
-        let tree = parse_rust_tree(source).expect("fixture syntax");
+        let tree = parse_rust_tree_for_fragment(source).expect("fixture syntax");
         let mut pending = vec![tree.root_node()];
         let mut invocation = None;
         while let Some(node) = pending.pop() {
@@ -3789,7 +3840,8 @@ pub fn lower_selected_macro_input_with_sources(
 ) -> SelectedMacroInputLowering {
     let mut source = " ".repeat(input.start_byte);
     source.push_str(&input.source);
-    let tree = parse_rust_tree(&source).expect("Rust parser accepts an invocation capsule");
+    let tree =
+        parse_rust_tree_for_fragment(&source).expect("Rust parser accepts an invocation capsule");
     let mut builder = crate::resolution::RustResolutionBuilder::new_for_macro_input(
         tree.root_node(),
         &source,

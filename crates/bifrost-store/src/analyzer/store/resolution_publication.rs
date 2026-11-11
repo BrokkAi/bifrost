@@ -497,6 +497,15 @@ impl AnalyzerStore {
                         )?;
                     }
                     root_content_tx(&tx, &owner, blob_id)?;
+                    // The writer-2 contract: the blob's source facts were just
+                    // published, so a projection that waited for them is
+                    // promoted in this transaction.
+                    brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
+                        &tx,
+                        &oid.to_string(),
+                        &owner.lang,
+                        owner.generation.0,
+                    )?;
                     let receipt = publication_receipt_tx(
                         &tx,
                         &owner,
@@ -553,6 +562,32 @@ impl AnalyzerStore {
         expected_input: &ResolutionContentInput,
         cancellation: &CancellationToken,
     ) -> Result<ResolutionContentPublicationOutcome> {
+        let epoch = match expected_input {
+            ResolutionContentInput::Parsed {
+                semantic_language, ..
+            } => super::resolution::resolution_bundle_epoch(*semantic_language),
+            ResolutionContentInput::Capsule { key, .. } => &key.producer_epoch,
+        };
+        self.admit_cached_selected_content_for_epoch(
+            owner,
+            persisted_relative_path,
+            key,
+            expected_input,
+            epoch,
+            cancellation,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn admit_cached_selected_content_for_epoch(
+        &self,
+        owner: &WorkspaceSnapshotId,
+        persisted_relative_path: &str,
+        key: &super::BlobKey,
+        expected_input: &ResolutionContentInput,
+        expected_epoch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ResolutionContentPublicationOutcome> {
         assert_eq!(
             key.lang, owner.lang,
             "cached parse key must match its owner storage language"
@@ -562,15 +597,16 @@ impl AnalyzerStore {
         let content_oid = key.oid;
         let path = persisted_relative_path.to_owned();
         let input = expected_input.clone();
+        let expected_epoch = expected_epoch.to_owned();
         let cancellation = cancellation.clone();
         self.conn.execute(move |conn| {
             let result = super::resolution::with_resolution_progress_handler(conn, &cancellation, |conn| {
             if cancellation.is_cancelled() { return Ok(ResolutionContentPublicationOutcome::Cancelled); }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let expected_epoch = match &input {
-                ResolutionContentInput::Parsed { key: expected, semantic_language } => {
+                ResolutionContentInput::Parsed { key: expected, .. } => {
                     assert_eq!(expected, &key, "cached parsed input has its parse identity");
-                    super::resolution::resolution_bundle_epoch(*semantic_language)
+                    expected_epoch.as_str()
                 }
                 ResolutionContentInput::Capsule { key, .. } => {
                     assert_eq!(key.content_oid()?, content_oid, "cached capsule has its derivation OID");
@@ -1317,10 +1353,30 @@ pub(super) fn publish_resolution_capsule_on(
         &tx,
         &super::BlobKey::unvaried(oid, &owner.lang),
     )?;
-    tx.execute(
-        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
-        params![oid_text, owner.lang, super::ParseVariant::Empty],
-    )?;
+    {
+        let _cascade = super::sealed_families::CascadeDelete::new(&tx);
+        let removed = tx
+            .prepare_cached(
+                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
+                 RETURNING generation",
+            )?
+            .query_map(
+                params![oid_text, owner.lang, super::ParseVariant::Empty],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // The delete cascaded away the name rows of every file version that
+        // mounts the old row; the repair does not restore them.
+        for removed_generation in removed {
+            brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(
+                &tx,
+                &oid_text,
+                &owner.lang,
+                removed_generation,
+                super::ParseVariant::Empty,
+            )?;
+        }
+    }
     tx.execute(
         "INSERT INTO blobs(blob_oid,lang,generation) VALUES(?1,?2,?3)",
         params![oid_text, owner.lang, owner.generation.0],
@@ -1342,6 +1398,15 @@ pub(super) fn publish_resolution_capsule_on(
         root_content_tx(&tx, previous, blob_id)?;
     }
     root_content_tx(&tx, &owner, blob_id)?;
+    // The repair replaced the blob row: file versions that mounted the old row
+    // are names_withdrawn above. A projection published ahead of its blob is
+    // blob_pending and is promoted here once the new row is proven ready.
+    brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
+        &tx,
+        &oid_text,
+        &owner.lang,
+        owner.generation.0,
+    )?;
     let receipt = publication_receipt_tx(
         &tx,
         &owner,

@@ -380,7 +380,7 @@ impl AnalyzerStore {
         validate_generation_key(&key.generation)?;
         ensure_not_cancelled(cancellation)?;
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tx = conn.transaction()?;
         let loaded = match load_result(
             &tx,
             key,
@@ -409,7 +409,7 @@ impl AnalyzerStore {
         &self,
     ) -> Result<ClassSetRootResultStoreSnapshot> {
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tx = conn.transaction()?;
         let generations = {
             let mut statement = tx.prepare(
                 "SELECT lang,workspace_content_digest,provider_behavior_digest,
@@ -2056,6 +2056,7 @@ mod tests {
                 .unwrap();
         }
         let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM class_set_root_result_generations",
@@ -2065,21 +2066,22 @@ mod tests {
             .unwrap(),
             8
         );
+        drop(_fixture);
         drop(conn);
         assert_eq!(
             load(&store, &first.key).unwrap(),
             ClassSetRootResultLookup::Miss
         );
 
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "DELETE FROM blobs WHERE blob_oid=?1 AND lang='python'",
-                params![BLOB],
-            )
-            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+        conn.execute(
+            "DELETE FROM blobs WHERE blob_oid=?1 AND lang='python'",
+            params![BLOB],
+        )
+        .unwrap();
+        drop(_fixture);
+        drop(conn);
         assert_eq!(
             load(&store, &result(9).key).unwrap(),
             ClassSetRootResultLookup::Miss

@@ -878,6 +878,16 @@ pub struct ValueFlowEventKey {
 }
 
 impl ValueFlowEventKey {
+    /// Rebuild a validated event identity from a durable output product. The
+    /// site is already the semantic source mapping selected at bind time.
+    pub fn from_stable_site(site: SemanticLocator, ordinal: u32, kind: ValueFlowEventKind) -> Self {
+        Self {
+            site,
+            ordinal,
+            kind,
+        }
+    }
+
     pub fn at_point(
         point: &ProgramPointHandle,
         ordinal: u32,

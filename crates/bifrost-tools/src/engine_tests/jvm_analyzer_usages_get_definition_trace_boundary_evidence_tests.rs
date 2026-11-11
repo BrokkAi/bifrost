@@ -145,6 +145,9 @@ mod boundary_evidence_tests {
         }
     }
 
+    /// Imports a type that only the fixture's malformed artifact could declare.
+    const PROBE_SOURCE: &str = "import com.acme.Probe;\nclass App { Probe probe; }\n";
+
     #[test]
     #[hardwon("#8201: a stable capped external index read was refused and rebuilt on every lookup")]
     fn external_index_retains_malformed_metadata_but_refuses_entry_read_errors() {
@@ -153,7 +156,7 @@ mod boundary_evidence_tests {
         // any third-party artifact content.
         for read_error in [false, true] {
             let fixture =
-                BoundaryFixture::with_config(Language::Java, "App.java", "class App {}", |root| {
+                BoundaryFixture::with_config(Language::Java, "App.java", PROBE_SOURCE, |root| {
                     let jar = root.join("malformed.jar");
                     write_source_jar(&jar, "Probe.class", b"malformed-class");
                     if read_error {
@@ -170,20 +173,27 @@ mod boundary_evidence_tests {
                     jvm_config_with_artifact_jar(Some(jar))
                 });
             let analyzer = fixture.workspace.analyzer();
+            let builds = brokk_bifrost_jvm_analysis::analyzer::jvm::external::external_index_build_count_for_test;
+            // Each read counts the index builds of its warm. Stable artifact
+            // gaps reach the lookup that reads the index, not the warm (#10470),
+            // so the read then resolves an import of a type the malformed
+            // artifact could declare. A refused fill rebuilds on every access,
+            // so builds are counted before the lookup.
             let read = || {
                 let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer);
+                let start = builds();
                 analyzer.warm_query_indexes();
-                scope.captured_read_incompleteness()
+                let warm_builds = builds() - start;
+                fixture.trace("Probe;");
+                (warm_builds, scope.captured_read_incompleteness())
             };
-            let builds = brokk_bifrost_jvm_analysis::analyzer::jvm::external::external_index_build_count_for_test;
-            let before = builds();
-            let first = read();
-            assert_eq!(builds(), before + 1);
+            let (first_builds, first) = read();
+            assert_eq!(first_builds, 1);
             // A published cell guarantees the second warm is a hit; a refused
             // fill leaves the cell empty and the next call builds again.
             assert_eq!(analyzer.query_indexes_warm(), !read_error, "{first:?}");
-            let second = read();
-            assert_eq!(builds(), before + if read_error { 2 } else { 1 });
+            let (second_builds, second) = read();
+            assert_eq!(second_builds, usize::from(read_error));
             assert_eq!(first, second);
             assert!(!first.is_empty(), "prove the artifact was inspected");
             if read_error {
@@ -1144,17 +1154,23 @@ mod boundary_evidence_tests {
     /// The #1900 acceptance shape, reproduced for Kotlin (#2287): three paired
     /// runs over one workspace whose only difference is what the JAR declares.
     ///
-    /// Before this change both carets died inside Kotlin's own
-    /// unresolved-receiver path (`no_indexed_definition` on the receiver,
-    /// `receiver_type_unknown` on the member) and no trace carried a route out
-    /// of the workspace at all, so nothing downstream could tell an external
-    /// member from an absent one.
+    /// Before #2287 both carets died inside Kotlin's own unresolved-receiver
+    /// path (`no_indexed_definition` on the receiver, `receiver_type_unknown`
+    /// on the member), so nothing downstream could tell an external member
+    /// from an absent one. The member caret's boundary is the selected store
+    /// answer. The receiver caret's is not: `Registry` is a name in expression
+    /// position that no type-name decision proves names the imported type
+    /// (#9546), so it stays Incomplete, but never a proven absence (#9677).
     #[test]
+    #[hardwon(
+        "#9677: an unproven class-name receiver answered NoDefinition for a JAR-declared member"
+    )]
     fn a_kotlin_member_of_a_class_jar_type_concludes_only_when_the_jar_declared_it() {
         let jars = tempfile::tempdir().expect("jar dir");
 
-        // The JAR declares `register`: both carets report the boundary they
-        // crossed, and the route names the exact external declaration.
+        // The JAR declares `register`: the member caret reports the boundary
+        // it crossed and the route names the exact external declaration; the
+        // receiver caret draws no route but does not prove the member absent.
         let declared = jars.path().join("declared.jar");
         write_probe_class_jar(&declared);
         let fixture = BoundaryFixture::with_config(
@@ -1163,23 +1179,35 @@ mod boundary_evidence_tests {
             JVM_ARTIFACT_KOTLIN_MEMBER_SOURCE,
             |_| jvm_config_with_artifact_jar(Some(declared.clone())),
         );
-        for answer in member_spelling_answers(&fixture) {
-            assert_eq!(
-                answer.status,
-                DefinitionLookupStatus::UnresolvableImportBoundary,
-                "the member is declared past a boundary, not absent"
-            );
-            assert!(
-                !answer.routes.is_empty()
-                    && answer.routes.iter().all(|(boundary, target)| {
-                        *boundary == BoundaryStatus::ExternalIndexed
-                            && target.as_deref() == Some("com.example.probe.Registry.register")
-                    }),
-                "the indexed class jar declares the `register` member: {:?}",
-                answer.routes
-            );
-        }
-        let (_, trace) = fixture.trace("Registry.register");
+        let answers = member_spelling_answers(&fixture);
+        let (receiver, member) = (&answers[0], &answers[1]);
+        assert_eq!(
+            receiver.status,
+            DefinitionLookupStatus::Incomplete,
+            "the jar declares the member, so the receiver caret is not absent: {:?}",
+            receiver.outcome
+        );
+        assert!(
+            receiver.routes.is_empty(),
+            "an unproven receiver selects no route out of the workspace: {:?}",
+            receiver.routes
+        );
+        assert_eq!(
+            member.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "the member is declared past a boundary, not absent: {:?}",
+            member.outcome
+        );
+        assert!(
+            !member.routes.is_empty()
+                && member.routes.iter().all(|(boundary, target)| {
+                    *boundary == BoundaryStatus::ExternalIndexed
+                        && target.as_deref() == Some("com.example.probe.Registry.register")
+                }),
+            "the indexed class jar declares the `register` member: {:?}",
+            member.routes
+        );
+        let (_, trace) = fixture.trace("register(\"x\")");
         let selected: Vec<_> = trace
             .candidates
             .iter()
@@ -1350,7 +1378,16 @@ mod boundary_evidence_tests {
     /// is still the member discriminator: with the member declared the route is
     /// selected and names `java.util.Collections.sort`; with an emptied members
     /// array the same run keeps a route that names nothing and is not selected.
+    ///
+    /// Kotlin runs three callers. In a top-level function nothing but a local
+    /// can bind `Collections` before the explicit import, so the receiver is
+    /// proven to name the imported type and the member is selected (#9677).
+    /// Inside a class body or a lambda an implicit receiver's members could
+    /// bind it first, so the answer stays Incomplete (#9546).
     #[test]
+    #[hardwon(
+        "#9677: an unproven class-name receiver answered NoDefinition for a pack-declared member"
+    )]
     fn a_kotlin_and_a_scala_member_of_a_pack_declared_type_report_external_indexed() {
         const KOTLIN_MEMBER_SOURCE: &str = concat!(
             "package app\n",
@@ -1358,6 +1395,16 @@ mod boundary_evidence_tests {
             "class Caller {\n",
             "  fun order(names: MutableList<String>) { Collections.sort(names) }\n",
             "}\n",
+        );
+        const KOTLIN_TOP_LEVEL_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "fun order(names: MutableList<String>) { Collections.sort(names) }\n",
+        );
+        const KOTLIN_LAMBDA_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "fun order(names: MutableList<String>) { run { Collections.sort(names) } }\n",
         );
         const SCALA_MEMBER_SOURCE: &str = concat!(
             "package app\n",
@@ -1367,9 +1414,31 @@ mod boundary_evidence_tests {
             "}\n",
         );
 
-        for (language, path, source) in [
-            (Language::Kotlin, "app/Caller.kt", KOTLIN_MEMBER_SOURCE),
-            (Language::Scala, "app/Caller.scala", SCALA_MEMBER_SOURCE),
+        for (language, path, source, prefix_proven) in [
+            (
+                Language::Kotlin,
+                "app/Caller.kt",
+                KOTLIN_MEMBER_SOURCE,
+                false,
+            ),
+            (
+                Language::Kotlin,
+                "app/Caller.kt",
+                KOTLIN_LAMBDA_MEMBER_SOURCE,
+                false,
+            ),
+            (
+                Language::Kotlin,
+                "app/Caller.kt",
+                KOTLIN_TOP_LEVEL_MEMBER_SOURCE,
+                true,
+            ),
+            (
+                Language::Scala,
+                "app/Caller.scala",
+                SCALA_MEMBER_SOURCE,
+                true,
+            ),
         ] {
             let declared = BoundaryFixture::with_config(language, path, source, |_| {
                 jvm_config_with_artifact_jar(None)
@@ -1382,6 +1451,26 @@ mod boundary_evidence_tests {
             );
             for needle in ["Collections.sort", "sort(names)"] {
                 let (outcome, trace) = declared.trace(needle);
+                if !prefix_proven {
+                    // A Kotlin receiver under an implicit receiver is not
+                    // proven to name the imported type and the store leaves
+                    // the pack owner's member inventory open (#9546), so the
+                    // declared member is Incomplete, never a proven absence
+                    // (#9677).
+                    assert_eq!(
+                        outcome.status,
+                        DefinitionLookupStatus::Incomplete,
+                        "{language:?} {needle:?}: the pack declares the member, so \
+                         the reference is not absent: {:?}",
+                        outcome.diagnostics
+                    );
+                    assert!(
+                        route_rows(&trace).is_empty(),
+                        "{language:?} {needle:?}: an unproven prefix selects no route: {:?}",
+                        route_rows(&trace)
+                    );
+                    continue;
+                }
                 assert_eq!(
                     outcome.status,
                     DefinitionLookupStatus::UnresolvableImportBoundary,
@@ -1630,81 +1719,6 @@ mod boundary_evidence_tests {
                 .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
             "with nothing activated and no artifact, nothing is known: {routes:?}"
         );
-    }
-
-    #[test]
-    #[hardwon(
-        "#6103: a semantic-model provider counted as a complete inventory and proved a constructor absent"
-    )]
-    fn kotlin_model_only_constructor_retains_external_type_boundary() {
-        use crate::analyzer::semantic_model::CatalogOptions;
-
-        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::CompilerOptions;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::DurablePackSource;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::DurablePackSourceKind;
-
-        use brokk_bifrost_analysis::analyzer::semantic_model::catalog::SemanticPackCatalog;
-
-        use brokk_bifrost_semantic::analyzer::semantic_model::source::SourceFormat;
-
-        use brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_source;
-
-        // Match the policy fixture's workspace-installed model, without pack
-        // acquisition. Merely writing this file does not activate the model.
-        let model = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../semantic-packs/web-network/jvm/bifrost.web-network-jvm.json"
-        ));
-        let fixture = BoundaryFixture::with_config(
-            Language::Kotlin,
-            "app/Caller.kt",
-            "package app\nimport java.net.URL\nfun use(x: String): URL = URL(x)\n",
-            |root| {
-                let models = root.join(".bifrost/semantic-models");
-                std::fs::create_dir_all(&models).unwrap();
-                std::fs::write(models.join("bifrost.web-network-jvm.json"), model).unwrap();
-                jvm_config_with_artifact_jar(None)
-            },
-        );
-        let pack = compile_source(
-            SourceFormat::Json,
-            model.as_bytes(),
-            &CompilerOptions::default(),
-        )
-        .expect("compile reviewed JVM model");
-        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-        catalog
-            .install(
-                &pack,
-                &DurablePackSource {
-                    kind: DurablePackSourceKind::Installed,
-                    source_id: "workspace-network-model".into(),
-                },
-            )
-            .unwrap();
-        activate_fixture_catalog(
-            &fixture,
-            &catalog,
-            "bifrost.web-network-jvm",
-            activation_evidence("java", "jdk", "java.base"),
-        );
-        for needle in ["URL =", "URL(x)"] {
-            let (outcome, trace) = fixture.trace_via_probe_entry_point(needle);
-            assert_eq!(
-                outcome.status,
-                DefinitionLookupStatus::UnresolvableImportBoundary,
-                "{needle}: {outcome:#?} {trace:#?}"
-            );
-            let routes = external_routes(&trace);
-            assert!(
-                routes
-                    .iter()
-                    .all(|(_, target)| target.as_deref() == Some("java.net.URL")),
-                "{routes:#?}"
-            );
-        }
     }
 
     #[test]

@@ -72,9 +72,14 @@ fn dump_prepared_resolution_rows() -> std::result::Result<(), Box<dyn std::error
             .unwrap();
         let tree = parser.parse(&source, None).expect("uncancelled parse");
         let parsed = match language {
-            Language::Rust => {
-                brokk_bifrost_rust::declarations::parse_rust_file(&file, &source, &tree)
-            }
+            Language::Rust => brokk_bifrost_rust::declarations::parse_rust_file_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                &file,
+                &source,
+                &tree,
+            ),
             Language::Go => brokk_bifrost_go::declarations::parse_go_file(&file, &source, &tree),
             Language::Java => {
                 brokk_bifrost_jvm::java::declarations::parse_java_file(&file, &source, &tree)
@@ -93,14 +98,12 @@ fn dump_prepared_resolution_rows() -> std::result::Result<(), Box<dyn std::error
                     csharp_scan.as_ref().unwrap(),
                 )
             }
-            Language::Python => {
-                brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
-                    &brokk_bifrost_core::analyzer::project::TestProject::new(&root, language),
-                    &file,
-                    &source,
-                    &tree,
-                )
-            }
+            Language::Python => brokk_bifrost_python::declarations::parse_python_file(
+                &brokk_bifrost_core::analyzer::project::TestProject::new(&root, language),
+                &file,
+                &source,
+                &tree,
+            ),
             _ => unreachable!("language selected above"),
         };
         let relative = relative.to_string_lossy().replace('\\', "/");

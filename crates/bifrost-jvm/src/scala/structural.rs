@@ -82,6 +82,9 @@ pub const SCALA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("call_expression", NormalizedKind::Call),
     ("infix_expression", NormalizedKind::Call),
     ("postfix_expression", NormalizedKind::Call),
+    // `new T(args)` applies T's constructor, as Java's
+    // `object_creation_expression` does (#1478, #9324).
+    ("instance_expression", NormalizedKind::Call),
     ("field_expression", NormalizedKind::FieldAccess),
     ("function_definition", NormalizedKind::Function),
     ("function_declaration", NormalizedKind::Function),
@@ -187,10 +190,64 @@ pub fn scala_call_function_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "infix_expression" => node.child_by_field_name("operator"),
         "postfix_expression" => postfix_operator_node(node),
+        "instance_expression" => constructed_type_node(node),
         _ => node
             .child_by_field_name("function")
             .map(expression_target_node),
     }
+}
+
+/// The member leaf of a selection that Scala applies exactly when the member
+/// resolves to a method (`entry.getName`, `"a+".r`, `Process(cmd).!`).
+///
+/// Uniform access means a selection written without arguments calls a
+/// parameterless method and reads a `val` or a Java field, so this names only
+/// the syntactic candidate: a `field_expression` that no enclosing call,
+/// generic application or assignment already consumes as its callee or
+/// target. Whether it is a call is the resolved declaration's answer.
+pub fn scala_selection_application_member(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "field_expression" {
+        return None;
+    }
+    let member = node.child_by_field_name("field")?;
+    if !matches!(member.kind(), "identifier" | "operator_identifier") {
+        return None;
+    }
+    let mut written = node;
+    while let Some(parent) = written.parent()
+        && parent.kind() == "parenthesized_expression"
+    {
+        written = parent;
+    }
+    let consumed_by = |parent: Node<'_>, field: &str| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|child| child.id() == written.id())
+    };
+    let consumed = written.parent().is_some_and(|parent| match parent.kind() {
+        "call_expression" | "generic_function" => consumed_by(parent, "function"),
+        "assignment_expression" => consumed_by(parent, "left"),
+        _ => false,
+    });
+    (!consumed).then_some(member)
+}
+
+/// The constructed type of `new T(args)`: its one type child, read through
+/// its type arguments (`new Box[Int](1)` constructs `Box`). An anonymous
+/// `new T { ... }` has its template body beside it.
+fn constructed_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let written = node.named_children(&mut cursor).find(|child| {
+        !matches!(
+            child.kind(),
+            "arguments" | "template_body" | "early_defs" | "end_marker"
+        )
+    })?;
+    Some(if written.kind() == "generic_type" {
+        written.child_by_field_name("type")?
+    } else {
+        written
+    })
 }
 
 fn callable_target_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -248,6 +305,9 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
                 |argument| {
                     if !sink.should_continue() {
                         return false;
+                    }
+                    if argument.is_extra() {
+                        return true;
                     }
                     let argument = expression_target_node(argument);
                     if let Some((keyword, value)) = named_argument_parts(argument) {
@@ -643,10 +703,12 @@ pub fn scala_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
 ///
 /// Scala has four shapes and they differ only in that interval:
 ///
-/// - A parameter -- method, class, or lambda -- is in effect over its whole
-///   callable, which is exactly the declaring scope, so it is `ScopeWide`.
-///   That is what makes a parameter reachable from inside a body whose byte
-///   range does not contain the parameter list.
+/// - A parameter -- method, class, given or lambda -- is in effect over all
+///   subsequent parameter clauses, the return type and the body, but not its
+///   own clause or type (SLS 2.13 4.6, 5.3). It is therefore `SourceOrder`
+///   from the end of its own clause to the end of the callable. Starting after
+///   the clause is what keeps `def f(other: other.Utility.type)` reading the
+///   `other` package rather than the parameter being declared.
 /// - A `val`/`var` local is in effect from the end of its definition to the
 ///   end of its scope (`SourceOrder`), which is why a read above it reaches
 ///   nothing. A `val`/`var` written directly in a template body, an enum body,
@@ -686,13 +748,47 @@ fn scala_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAct
         // A named context bound (`[T: Ord as ord]`) is a given parameter of
         // the callable that declares the type parameter, so it binds the way
         // a value parameter does.
-        "parameter" | "class_parameter" | "binding" | "context_bound" | "lambda_expression" => {
+        "context_bound" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::ScopeWide,
+            activation: scope,
+        }),
+        // A value parameter's own clause is the `parameters`, `class_parameters`
+        // or `bindings` node that directly contains it. Curried definitions
+        // have one such node per clause, so the end of this one is exactly the
+        // point where the parameter enters scope.
+        "parameter" | "class_parameter" | "binding" => {
+            // Parser recovery can place a binder under an ERROR node instead
+            // of its clause. Leave the activation unknown so callers report an
+            // incomplete lexical environment rather than panicking.
+            let clause = form.parent().filter(|clause| {
+                matches!(
+                    clause.kind(),
+                    "parameters" | "class_parameters" | "bindings" | "given_conditional"
+                )
+            })?;
             Some(BindingActivation {
                 kind: BindingKind::Parameter,
-                hoisting: HoistingClass::ScopeWide,
-                activation: scope,
+                hoisting: HoistingClass::SourceOrder,
+                activation: Range {
+                    start_byte: clause.end_byte(),
+                    end_byte: scope.end_byte,
+                    start_line: clause.end_position().row + 1,
+                    end_line: scope.end_line,
+                },
             })
         }
+        // An unparenthesized single lambda parameter is itself the clause.
+        "lambda_expression" => Some(BindingActivation {
+            kind: BindingKind::Parameter,
+            hoisting: HoistingClass::SourceOrder,
+            activation: Range {
+                start_byte: binder.end_byte(),
+                end_byte: scope.end_byte,
+                start_line: binder.end_position().row + 1,
+                end_line: scope.end_line,
+            },
+        }),
         "case_clause" | "catch_clause" => {
             let pattern = form.child_by_field_name("pattern")?;
             Some(BindingActivation {
@@ -823,6 +919,11 @@ impl StructuralSpec for ScalaStructuralSpec {
         true
     }
 
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::Method]
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         SCALA_KIND_TABLE
     }
@@ -871,10 +972,8 @@ impl StructuralSpec for ScalaStructuralSpec {
     /// operator makes it a symbolic operator application), and a
     /// `call_expression` whose own function is another `call_expression` is
     /// one more argument list of a curried application, not a call of the
-    /// inner call's result. `new Foo(1)` is deliberately absent: the grammar
-    /// spells it `instance_expression`, which this adapter's kind table does
-    /// not admit as a call at all, so there is no Scala constructor call site
-    /// to classify yet (#1478).
+    /// inner call's result. `new Foo(1)`, an `instance_expression`, is a
+    /// constructor application.
     fn call_site_facts(
         &self,
         node: Node<'_>,
@@ -892,6 +991,7 @@ impl StructuralSpec for ScalaStructuralSpec {
                     },
                 ))
             }
+            "instance_expression" => Some(CallSiteFacts::of_kind(CallKind::Constructor)),
             "call_expression" => {
                 let function = callable_target_node(
                     node.child_by_field_name("function")
@@ -1099,6 +1199,10 @@ impl StructuralSpec for ScalaStructuralSpec {
                 if let Some(name) = annotation_name(node) {
                     attach_terminal_callee(sink, name, expression_name_node(name).or(Some(name)));
                 }
+                let mut cursor = node.walk();
+                for arguments in node.children_by_field_name("arguments", &mut cursor) {
+                    attach_argument_roles(sink, arguments);
+                }
             }
             NormalizedKind::Identifier => match expression_name_node(node) {
                 Some(name) => sink.set_name(name),
@@ -1179,6 +1283,46 @@ mod tests {
         found
     }
 
+    #[test]
+    #[hardwon("f50adbd457f2: malformed Scala parameter recovery panicked binding activation")]
+    fn malformed_parameter_recovery_leaves_activation_unknown() {
+        let source = "object O { def f(x: Int, y:";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .expect("load Bifrost Scala grammar");
+        let tree = parser.parse(source, None).expect("parse truncated Scala");
+        assert!(
+            tree.root_node().has_error(),
+            "fixture must exercise recovery"
+        );
+
+        let mut binders = 0;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+            if scala_occurrence_role(node) != Some(OccurrenceRole::Binder) {
+                continue;
+            }
+            let Some(form) = nearest_ancestor(node, |kind| {
+                matches!(kind, "parameter" | "class_parameter" | "binding")
+            }) else {
+                continue;
+            };
+            binders += 1;
+            assert_eq!(
+                SCALA_STRUCTURAL_SPEC.binding_activation(node, node_range(tree.root_node())),
+                None,
+                "recovered {form:?} must leave its activation unknown"
+            );
+        }
+        assert_eq!(binders, 1, "{:?}", tree.root_node().to_sexp());
+    }
+
     /// The four binder shapes Scala has, and the interval each is in effect
     /// over. The shapes differ only in that interval, so the interval is what
     /// the assertions are about.
@@ -1203,8 +1347,8 @@ mod tests {
                 .map(|(token, kind, hoisting, _)| (*token, *kind, *hoisting))
                 .collect::<Vec<_>>(),
             vec![
-                ("rows", BindingKind::Parameter, HoistingClass::ScopeWide),
-                ("seed", BindingKind::Parameter, HoistingClass::ScopeWide),
+                ("rows", BindingKind::Parameter, HoistingClass::SourceOrder),
+                ("seed", BindingKind::Parameter, HoistingClass::SourceOrder),
                 ("total", BindingKind::Local, HoistingClass::SourceOrder),
                 ("sizes", BindingKind::Local, HoistingClass::SourceOrder),
                 (
@@ -1217,7 +1361,7 @@ mod tests {
                     BindingKind::PatternBinder,
                     HoistingClass::DeclaredHead
                 ),
-                ("item", BindingKind::Parameter, HoistingClass::ScopeWide),
+                ("item", BindingKind::Parameter, HoistingClass::SourceOrder),
             ],
             "{found:#?}"
         );
@@ -1230,14 +1374,14 @@ mod tests {
                 .3
         };
 
-        // A parameter is in effect over its whole callable, which is what
-        // makes it reachable from a body whose byte range excludes the
-        // parameter list.
+        // A parameter begins after its own clause, so the return type and body
+        // can read it while a type in the clause cannot.
         assert!(
-            activation("rows").starts_with("def run("),
+            activation("rows").starts_with(": Int = {"),
             "{:?}",
             activation("rows")
         );
+        assert_eq!(activation("seed"), activation("rows"));
         // A local is in effect only below its own definition, which is why a
         // read above it reaches nothing.
         assert!(
@@ -1250,8 +1394,8 @@ mod tests {
         assert_eq!(activation("row"), " if row.nonEmpty) yield row.length");
         // A pattern binder covers the guard and the body of its own case.
         assert_eq!(activation("entry"), " => entry");
-        // A lambda parameter is scope-wide over the lambda itself.
-        assert_eq!(activation("item"), "item => item.length");
+        // A lambda parameter begins after the parameter itself.
+        assert_eq!(activation("item"), " => item.length");
     }
 
     /// Scala 3's braceless `catch` inlines its case pattern into the
@@ -1281,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn given_and_extension_parameters_are_scope_wide_over_their_own_definition() {
+    fn given_and_extension_parameters_begin_after_their_own_clause() {
         let source = concat!(
             "object Host {\n",
             "  given ordering(using base: Int): Ord[Int] = build(base)\n",
@@ -1298,9 +1442,9 @@ mod tests {
                 .map(|(token, kind, hoisting, _)| (*token, *kind, *hoisting))
                 .collect::<Vec<_>>(),
             vec![
-                ("base", BindingKind::Parameter, HoistingClass::ScopeWide),
-                ("value", BindingKind::Parameter, HoistingClass::ScopeWide),
-                ("sep", BindingKind::Parameter, HoistingClass::ScopeWide),
+                ("base", BindingKind::Parameter, HoistingClass::SourceOrder),
+                ("value", BindingKind::Parameter, HoistingClass::SourceOrder),
+                ("sep", BindingKind::Parameter, HoistingClass::SourceOrder),
             ],
             "{found:#?}"
         );
@@ -1312,19 +1456,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("no binder named {name} in {found:#?}"))
                 .3
         };
+        assert_eq!(activation("base"), ": Ord[Int] = build(base)");
         assert_eq!(
-            activation("base"),
-            "given ordering(using base: Int): Ord[Int] = build(base)"
+            activation("value"),
+            " {\n    def twice(sep: String): String = value + sep + value\n  }"
         );
-        assert!(
-            activation("value").starts_with("extension (value: String)"),
-            "{:?}",
-            activation("value")
-        );
-        assert_eq!(
-            activation("sep"),
-            "def twice(sep: String): String = value + sep + value"
-        );
+        assert_eq!(activation("sep"), ": String = value + sep + value");
     }
 
     #[test]

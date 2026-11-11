@@ -17,14 +17,17 @@ use crate::dataflow::{
     solve_backward_demands_on_snapshot, solve_with_reusable_end_summaries,
 };
 
+pub(super) mod compose_labels;
+
 use super::{
     BoundTypestateEvent, BoundTypestateInitialSeed, BoundTypestateTerminal, CompiledProtocol,
-    DirectScalarSource, ProtocolEventId, ProtocolEventOccurrence, ProtocolObservationPhase,
-    ProtocolStateId, ProtocolStateKey, ProtocolTerminalObservationSpec, ProtocolUncertaintyCause,
-    ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior, TypestateBindingPlan,
+    CoverageCandidatePhase, CoverageDecisionKind, DirectScalarSource, ProtocolEventId,
+    ProtocolEventOccurrence, ProtocolObservationPhase, ProtocolStateId, ProtocolStateKey,
+    ProtocolTerminalObservationSpec, ProtocolUncertaintyCause, ProtocolUncertaintyResolution,
+    ProtocolUnmatchedEventBehavior, TypestateBindingContext, TypestateBindingPlan,
     TypestateBindingPlanHash, TypestateBindingQuality, TypestateEventBindingId,
-    TypestateEventCondition, TypestateProtocolHash, TypestateSubjectId, TypestateSubjectKey,
-    TypestateTerminalBindingId, direct_scalar_source,
+    TypestateEventCondition, TypestateObservationSite, TypestateProtocolHash, TypestateSubjectId,
+    TypestateSubjectKey, TypestateTerminalBindingId, direct_scalar_source,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,6 +39,7 @@ pub enum TypestateUncertainty {
     Escape = 3,
     IncompleteAnalysis = 4,
     UnmatchedEvent = 5,
+    ConditionalAlias = 6,
 }
 
 pub const MAX_TYPESTATE_CALLBACK_FACTS: usize = 8_192;
@@ -237,7 +241,7 @@ impl TypestateFact {
         }
     }
 
-    pub(super) const fn state_observation(
+    pub(crate) const fn state_observation(
         self,
     ) -> Option<(
         TypestateSubjectId,
@@ -651,6 +655,16 @@ impl TypestateSummaryResult {
         self.bindings_summary_complete
     }
 
+    /// Whether every solved fact is free of uncertainty and abstention.
+    pub const fn execution_complete(&self) -> bool {
+        self.execution_complete
+    }
+
+    /// Whether the solver covered its result, or reviewed bindings closed it.
+    pub const fn result_complete(&self) -> bool {
+        self.result_complete
+    }
+
     pub const fn result(&self) -> &SummaryDataflowResult<TypestateFact> {
         &self.result
     }
@@ -675,6 +689,7 @@ impl TypestateSummaryResult {
     /// do not.
     pub fn is_summary_publication_complete(&self) -> bool {
         self.bindings_summary_complete
+            && self.result.caller_conversions().is_empty()
             && self.result_complete
             && self.result.facts().iter().all(|fact| {
                 !fact.abstained()
@@ -1008,21 +1023,11 @@ impl<'plan> TypestateFlowProblem<'plan> {
                             continue;
                         }
                     }
-                    if let Some(activation) = seed.activation_edge() {
-                        let row = activation
-                            .procedure()
-                            .semantics()
-                            .control_edge(activation.id())
-                            .expect("validated control-edge activation resolves");
-                        let target = activation
-                            .procedure()
-                            .point_handle(row.target_point)
-                            .expect("validated control-edge activation retains its target");
-                        if edge.target() != &target
-                            || edge.kind() != IcfgEdgeKind::Intraprocedural(row.kind)
-                        {
-                            continue;
-                        }
+                    if seed.activation_successor().is_some_and(|(target, kind)| {
+                        edge.target() != &target
+                            || edge.kind() != IcfgEdgeKind::Intraprocedural(kind)
+                    }) {
+                        continue;
                     }
                     let fact =
                         TypestateFact::state(self.bindings.hash(), seed.subject(), seed.state());
@@ -1091,6 +1096,13 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 for binding in self.bindings.event_bindings_at_call_site_all_contexts(call) {
                     if subject == Some(binding.subject())
                         && binding.modeled_external_effect().is_some()
+                        && !coverage_refuses_at_arm(
+                            self.bindings,
+                            binding.subject(),
+                            Some(call),
+                            None,
+                            true,
+                        )
                     {
                         modeled_external_effect_applied = true;
                         if stages.is_empty() && edge.boundary().is_some_and(deferred_boundary) {
@@ -1109,6 +1121,15 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     }
                     let modeled_boundary = subject == Some(binding.subject())
                         && binding.modeled_external_effect().is_some()
+                        && !coverage_phase(*stage).is_some_and(|arm| {
+                            coverage_refuses_at_arm(
+                                self.bindings,
+                                binding.subject(),
+                                Some(call),
+                                Some(arm),
+                                true,
+                            )
+                        })
                         && edge.boundary().is_some_and(modeled_external_boundary);
                     modeled_external_effect_applied |= modeled_boundary;
                     if call_occurrence(self.protocol, binding.event(), *stage) {
@@ -1602,86 +1623,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
         fact: TypestateFact,
         binding: &BoundTypestateEvent,
     ) -> Vec<TypestateFact> {
-        let TypestateFactKind::State {
-            plan,
-            subject,
-            state,
-            uncertainty,
-            abstained,
-        } = fact.0
-        else {
-            return Vec::new();
-        };
-        let cardinality = self
-            .bindings
-            .subject(subject)
-            .expect("binding-plan facts retain valid subject IDs")
-            .cardinality();
-        if let Some(transition) = self
-            .protocol
-            .transition_for(state, binding.event(), cardinality)
-        {
-            let target = TypestateFact(TypestateFactKind::State {
-                plan,
-                subject,
-                state: transition.to(),
-                uncertainty,
-                abstained,
-            });
-            if self.protocol.is_error(transition.to()) {
-                return vec![
-                    target,
-                    TypestateFact(TypestateFactKind::Violation {
-                        plan,
-                        subject,
-                        violation: TypestateViolation {
-                            event_binding: binding.id(),
-                            from: state,
-                            to: transition.to(),
-                        },
-                        uncertainty,
-                        abstained,
-                    }),
-                ];
-            }
-            return vec![
-                target,
-                TypestateFact(TypestateFactKind::NonViolation {
-                    plan,
-                    subject,
-                    event_binding: binding.id(),
-                    uncertainty,
-                    abstained,
-                }),
-            ];
-        }
-        let non_violation = |uncertainty| {
-            TypestateFact(TypestateFactKind::NonViolation {
-                plan,
-                subject,
-                event_binding: binding.id(),
-                uncertainty,
-                abstained,
-            })
-        };
-        match self.protocol.semantics().unmatched_event {
-            ProtocolUnmatchedEventBehavior::PreserveState => {
-                vec![fact, non_violation(uncertainty)]
-            }
-            ProtocolUnmatchedEventBehavior::MarkInconclusive => {
-                let uncertainty = uncertainty.with(TypestateUncertainty::UnmatchedEvent);
-                vec![
-                    TypestateFact(TypestateFactKind::State {
-                        plan,
-                        subject,
-                        state,
-                        uncertainty,
-                        abstained,
-                    }),
-                    non_violation(uncertainty),
-                ]
-            }
-        }
+        compose_labels::apply_bound_event(self.protocol, self.bindings, fact, binding)
     }
 
     fn apply_uncertainty(
@@ -1893,21 +1835,94 @@ where
     Provider: IcfgProvider + ?Sized,
     Reusable: ReusableSummaryProvider<TypestateFact> + ?Sized,
 {
-    let problem = TypestateFlowProblem::try_new_for_analysis_root(protocol, bindings, root)?;
-    problem.validate_analysis_root(root)?;
-    problem.validate_entry_facts(entry_facts)?;
     let witness_retention = WitnessRetentionLimits::best_effort(
         1,
         MAX_TYPESTATE_RETAINED_WITNESS_RELATIONS,
         MAX_TYPESTATE_RETAINED_WITNESS_BYTES,
     )
     .expect("typestate best-effort witness limits are valid");
+    solve_typestate_with_reusable_provider_with_retention(
+        root,
+        entry_facts,
+        provider,
+        reusable,
+        protocol,
+        bindings,
+        witness_retention,
+        None,
+        semantic_budget,
+        request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn solve_typestate_with_reusable_provider_with_receipts<Provider, Reusable>(
+    root: &ProcedureHandle,
+    entry_facts: &[TypestateFact],
+    provider: &Provider,
+    reusable: &mut Reusable,
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TypestateSummaryResult, TypestateSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<TypestateFact> + ?Sized,
+{
+    // The shared solver admits complete fragments while this existing cap
+    // keeps large solves from retaining unbounded witness relations.
+    let witness_retention = WitnessRetentionLimits::bounded_complete(
+        1,
+        MAX_TYPESTATE_RETAINED_WITNESS_RELATIONS,
+        MAX_TYPESTATE_RETAINED_WITNESS_BYTES,
+    )
+    .expect("typestate bounded witness limits are valid");
+    solve_typestate_with_reusable_provider_with_retention(
+        root,
+        entry_facts,
+        provider,
+        reusable,
+        protocol,
+        bindings,
+        witness_retention,
+        Some(analyzer),
+        semantic_budget,
+        request,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn solve_typestate_with_reusable_provider_with_retention<Provider, Reusable>(
+    root: &ProcedureHandle,
+    entry_facts: &[TypestateFact],
+    provider: &Provider,
+    reusable: &mut Reusable,
+    protocol: &CompiledProtocol,
+    bindings: &TypestateBindingPlan,
+    witness_retention: WitnessRetentionLimits,
+    member_read_analyzer: Option<&dyn crate::analyzer::IAnalyzer>,
+    semantic_budget: &mut SemanticBudget,
+    request: &mut DataflowRequest<'_>,
+) -> Result<TypestateSummaryResult, TypestateSolveError>
+where
+    Provider: IcfgProvider + ?Sized,
+    Reusable: ReusableSummaryProvider<TypestateFact> + ?Sized,
+{
+    let problem = TypestateFlowProblem::try_new_for_analysis_root(protocol, bindings, root)?;
+    problem.validate_analysis_root(root)?;
+    problem.validate_entry_facts(entry_facts)?;
     let point_seeds = problem.summary_point_seeds(root);
     let analysis_subjects = problem.analysis_subjects(root, entry_facts);
+    let mut input = SummarySolveInput::new(root, entry_facts)
+        .with_point_seeds(&point_seeds)
+        .with_witness_retention(witness_retention);
+    if let Some(analyzer) = member_read_analyzer {
+        input = input.with_member_read_receipts(analyzer);
+    }
     let result = solve_with_reusable_end_summaries(
-        SummarySolveInput::new(root, entry_facts)
-            .with_point_seeds(&point_seeds)
-            .with_witness_retention(witness_retention),
+        input,
         provider,
         &problem,
         reusable,
@@ -1960,6 +1975,8 @@ fn reviewed_bindings_close_result_coverage(
                         subjects,
                         edge.origin(),
                         edge.source(),
+                        coverage_arm(edge.kind()),
+                        true,
                     )
                 })
             })
@@ -1979,6 +1996,8 @@ fn reviewed_bindings_close_result_coverage(
                         subjects,
                         boundary.origin(),
                         boundary.at(),
+                        None,
+                        true,
                     )
                 }
                 SummaryBoundaryKind::Limit(_) | SummaryBoundaryKind::Continuation { .. } => false,
@@ -2028,7 +2047,17 @@ fn reviewed_bindings_close_backward_result_coverage(
             return false;
         };
         closed_relevant_gap = true;
-        if !call_boundary_closed_for_subjects(bindings, subjects, edge.origin.as_ref(), point) {
+        let context_root = snapshot
+            .node(edge.source)
+            .is_some_and(|node| node.call_context.is_empty());
+        if !call_boundary_closed_for_subjects(
+            bindings,
+            subjects,
+            edge.origin.as_ref(),
+            point,
+            coverage_arm(edge.kind),
+            context_root,
+        ) {
             return false;
         }
     }
@@ -2059,6 +2088,10 @@ fn reviewed_bindings_close_backward_result_coverage(
                     &subjects,
                     boundary.origin.as_ref(),
                     point,
+                    None,
+                    snapshot
+                        .node(boundary.at)
+                        .is_some_and(|node| node.call_context.is_empty()),
                 ) {
                     return false;
                 }
@@ -2090,11 +2123,64 @@ fn call_boundary_closed_for_subjects(
     subjects: &HashSet<TypestateSubjectId>,
     origin: Option<&crate::analyzer::semantic::CallSiteHandle>,
     point: &crate::analyzer::semantic::ProgramPointHandle,
+    arm: Option<CoverageCandidatePhase>,
+    context_root: bool,
 ) -> bool {
     subjects.iter().copied().all(|subject| {
-        modeled_effect_binding_at(bindings, subject, origin, point)
+        (!coverage_refuses_at_arm(bindings, subject, origin, arm, context_root)
+            && modeled_effect_binding_at(bindings, subject, origin, point))
             || bindings.call_is_proven_noninterfering(subject, origin, point)
     })
+}
+
+fn coverage_arm(kind: IcfgEdgeKind) -> Option<CoverageCandidatePhase> {
+    match kind {
+        IcfgEdgeKind::NormalReturn | IcfgEdgeKind::CallToNormalContinuation => {
+            Some(CoverageCandidatePhase::AfterNormalReturn)
+        }
+        IcfgEdgeKind::ExceptionalReturn | IcfgEdgeKind::CallToExceptionalContinuation => {
+            Some(CoverageCandidatePhase::AfterExceptionalReturn)
+        }
+        IcfgEdgeKind::Call | IcfgEdgeKind::Intraprocedural(_) => None,
+    }
+}
+
+fn coverage_phase(stage: CallStage) -> Option<CoverageCandidatePhase> {
+    match stage {
+        CallStage::AfterNormalReturn => Some(CoverageCandidatePhase::AfterNormalReturn),
+        CallStage::AfterExceptionalReturn => Some(CoverageCandidatePhase::AfterExceptionalReturn),
+        CallStage::BeforeCall | CallStage::ActualToFormal | CallStage::ReturnFlow => None,
+    }
+}
+
+fn coverage_refuses_at_arm(
+    bindings: &TypestateBindingPlan,
+    subject: TypestateSubjectId,
+    origin: Option<&crate::analyzer::semantic::CallSiteHandle>,
+    arm: Option<CoverageCandidatePhase>,
+    context_root: bool,
+) -> bool {
+    let Some(call) = origin else { return false };
+    let site = TypestateObservationSite::call_site(call.clone(), TypestateBindingContext::root());
+    let refuses = |phase| {
+        matches!(
+            bindings
+                .coverage_decision(subject, &site, phase)
+                .map(|decision| decision.kind()),
+            Some(CoverageDecisionKind::Refused { .. })
+        )
+    };
+    if !context_root {
+        return refuses(CoverageCandidatePhase::AfterNormalReturn)
+            || refuses(CoverageCandidatePhase::AfterExceptionalReturn);
+    }
+    match arm {
+        Some(phase) => refuses(phase),
+        None => {
+            refuses(CoverageCandidatePhase::AfterNormalReturn)
+                || refuses(CoverageCandidatePhase::AfterExceptionalReturn)
+        }
+    }
 }
 
 fn modeled_effect_binding_at(

@@ -1,5 +1,8 @@
 //! C# structural spec for `query_code`.
 
+use crate::declarations::{
+    csharp_parameter_label_nodes, csharp_parameter_list_has_params, csharp_parameter_list_node,
+};
 use crate::syntax::{
     csharp_conditional_member_access, csharp_is_irrefutable_pattern, csharp_member_name,
 };
@@ -15,7 +18,9 @@ use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
 use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
-use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::kinds::{
+    NormalizedKind, Role, RoleCoverageGap, RoleCoverageGaps,
+};
 use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
@@ -32,9 +37,11 @@ use brokk_bifrost_core::analyzer::structural::result_use::{
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
-use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::analyzer::structural::spec::{
+    CoveredChildDisposition, RoleSink, StructuralSpec,
+};
 use brokk_bifrost_core::analyzer::tree_walk::{
-    named_children_iter, node_range, unwrap_parenthesized_expression,
+    ParentIndex, named_children_iter, node_range, unwrap_parenthesized_expression,
 };
 use brokk_bifrost_core::analyzer::{Language, Range};
 use tree_sitter::Node;
@@ -43,6 +50,127 @@ use tree_sitter::Node;
 pub struct CSharpStructuralSpec;
 
 pub static CSHARP_STRUCTURAL_SPEC: CSharpStructuralSpec = CSharpStructuralSpec;
+
+fn extract_csharp_parameters(node: Node<'_>, sink: &mut RoleSink<'_>) {
+    let list = csharp_parameter_list_node(node).filter(|list| list.kind() == "parameter_list");
+    let mut gaps = Vec::new();
+    if list.is_some_and(|list| {
+        list.has_error()
+            || named_children_iter(node)
+                .take_while(|child| child.id() != list.id())
+                .any(|child| child.has_error())
+    }) {
+        gaps.push(RoleCoverageGap::Recovery);
+    }
+    let flattened_params = list.is_some_and(csharp_parameter_list_has_params);
+    if flattened_params {
+        // The grammar flattens this parameter into the list's type and name.
+        if csharp_parameter_label_nodes(node).is_empty() {
+            gaps.push(RoleCoverageGap::Recovery);
+        }
+        gaps.push(RoleCoverageGap::UnrepresentedChild);
+    }
+    let container = list.ok_or_else(|| {
+        RoleCoverageGaps::new(
+            if node.kind() == "anonymous_method_expression" && !node.has_error() {
+                RoleCoverageGap::NoWrittenList
+            } else if node.kind() == "lambda_expression"
+                && node
+                    .child_by_field_name("parameters")
+                    .is_some_and(|child| child.kind() == "implicit_parameter")
+            {
+                RoleCoverageGap::UnrepresentedChild
+            } else {
+                RoleCoverageGap::Recovery
+            },
+        )
+    });
+    sink.covered_list(Role::Parameters, container, &gaps, |child| {
+        match child.kind() {
+            "parameter" => CoveredChildDisposition::Include(child),
+            "preproc_if" | "preproc_elif" | "preproc_else" | "preproc_endif" => {
+                CoveredChildDisposition::Gap(RoleCoverageGap::ConditionalRegion)
+            }
+            "identifier" | "predefined_type" | "array_type" | "generic_name" | "qualified_name"
+            | "nullable_type" | "pointer_type"
+                if flattened_params =>
+            {
+                CoveredChildDisposition::Exclude("flattened params type or name")
+            }
+            _ => CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild),
+        }
+    });
+}
+
+fn extract_csharp_members(node: Node<'_>, sink: &mut RoleSink<'_>) {
+    let body = node.child_by_field_name("body");
+    let mut gaps = Vec::new();
+    if brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(
+        node,
+        sink.source(),
+    )
+    .iter()
+    .any(|word| word == "partial")
+    {
+        gaps.push(RoleCoverageGap::PartialDeclaration);
+    }
+    if node.has_error() || body.is_some_and(|body| body.has_error()) {
+        gaps.push(RoleCoverageGap::Recovery);
+    }
+    let container = body
+        .or_else(|| {
+            (!node.has_error()
+                && node
+                    .children(&mut node.walk())
+                    .any(|child| child.kind() == ";"))
+            .then_some(node)
+        })
+        .ok_or_else(|| RoleCoverageGaps::new(RoleCoverageGap::Recovery));
+    sink.covered_list(Role::Members, container, &gaps, |child| {
+        match child.kind() {
+            _ if body.is_none() => CoveredChildDisposition::Exclude("type header without body"),
+            "method_declaration"
+            | "constructor_declaration"
+            | "destructor_declaration"
+            | "operator_declaration"
+            | "conversion_operator_declaration"
+            | "property_declaration"
+            | "event_declaration"
+            | "indexer_declaration"
+            | "delegate_declaration"
+            | "class_declaration"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration" => CoveredChildDisposition::Include(child),
+            "field_declaration" | "event_field_declaration" => {
+                let targets: Vec<_> = named_children_iter(child)
+                    .filter(|part| part.kind() == "variable_declaration")
+                    .flat_map(named_children_iter)
+                    .filter(|part| part.kind() == "variable_declarator")
+                    .collect();
+                if targets.is_empty() {
+                    CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild)
+                } else {
+                    CoveredChildDisposition::IncludeMany(targets)
+                }
+            }
+            "enum_member_declaration" | "record_struct_declaration" => {
+                CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild)
+            }
+            kind if kind.starts_with("preproc_") => {
+                CoveredChildDisposition::Gap(RoleCoverageGap::ConditionalRegion)
+            }
+            // A semicolon-only record has no body and no written members.
+            "identifier"
+            | "parameter_list"
+            | "type_parameter_list"
+            | "attribute_list"
+            | "modifiers" => CoveredChildDisposition::Exclude("type header"),
+            _ => CoveredChildDisposition::Gap(RoleCoverageGap::UnrepresentedChild),
+        }
+    });
+}
 
 /// Classify the syntax around one exact C# invocation expression.
 ///
@@ -223,12 +351,14 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("comment", NormalizedKind::Comment),
     ("invocation_expression", NormalizedKind::Call),
     ("object_creation_expression", NormalizedKind::Call),
+    ("implicit_object_creation_expression", NormalizedKind::Call),
     ("member_access_expression", NormalizedKind::FieldAccess),
     ("conditional_access_expression", NormalizedKind::FieldAccess),
     ("element_access_expression", NormalizedKind::FieldAccess),
     ("await_expression", NormalizedKind::Await),
     ("method_declaration", NormalizedKind::Method),
     ("operator_declaration", NormalizedKind::Method),
+    ("destructor_declaration", NormalizedKind::Method),
     ("conversion_operator_declaration", NormalizedKind::Method),
     ("constructor_declaration", NormalizedKind::Constructor),
     ("local_function_statement", NormalizedKind::Function),
@@ -243,6 +373,9 @@ pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("namespace_declaration", NormalizedKind::Module),
     ("file_scoped_namespace_declaration", NormalizedKind::Module),
     ("property_declaration", NormalizedKind::Declaration),
+    ("event_declaration", NormalizedKind::Declaration),
+    ("indexer_declaration", NormalizedKind::Declaration),
+    ("delegate_declaration", NormalizedKind::Declaration),
     ("variable_declarator", NormalizedKind::Assignment),
     ("assignment_expression", NormalizedKind::Assignment),
     ("using_directive", NormalizedKind::Import),
@@ -671,21 +804,107 @@ fn csharp_initializer_member_label(parent: Node<'_>, node: Node<'_>) -> bool {
     if parent.kind() == "with_initializer" {
         return parent.named_child(0) == Some(node);
     }
+    csharp_object_initializer_owner(parent, node, &ParentIndex::unindexed()).is_some()
+}
+
+/// The node that owns the object initializer whose assignment `node` labels:
+/// the creation expression for `new T { Name = value }` and
+/// `new() { Name = value }`, or the enclosing member assignment for a nested
+/// `Inner = { Name = value }`.
+fn csharp_object_initializer_owner<'tree>(
+    parent: Node<'tree>,
+    node: Node<'_>,
+    parents: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
     if parent.kind() != "assignment_expression" || parent.child_by_field_name("left") != Some(node)
     {
-        return false;
+        return None;
     }
-    parent
-        .parent()
+    parents
+        .parent(parent)
         .filter(|initializer| initializer.kind() == "initializer_expression")
-        .and_then(|initializer| initializer.parent())
-        .is_some_and(|owner| {
+        .and_then(|initializer| parents.parent(initializer))
+        .filter(|owner| {
             matches!(
                 owner.kind(),
                 "object_creation_expression"
                     | "implicit_object_creation_expression"
                     | "assignment_expression"
             )
+        })
+}
+
+/// CodeQL's MemberInitializer is an assignment directly owned by an
+/// ObjectInitializer (Creation.qll:31-75,94-95). Follow nested member
+/// initializers to the creating call; ordinary assignments inside a lambda
+/// or block never have the required immediate initializer parent.
+///
+/// Each member assignment climbs its own chain, so the walk is bounded: a chain
+/// deeper than [`MAX_INITIALIZER_NESTING`] answers `Err` and the caller stops
+/// the file's extraction as exceeded, so the file fails closed instead of
+/// losing the role, and total work stays linear in the file.
+fn csharp_member_initializer_creation<'tree>(
+    node: Node<'tree>,
+    parents: &ParentIndex<'tree>,
+) -> Result<Option<Node<'tree>>, InitializerNestingExceeded> {
+    if node.kind() != "assignment_expression" {
+        return Ok(None);
+    }
+    let owner_of = |assignment: Node<'tree>| {
+        csharp_object_initializer_owner(
+            assignment,
+            assignment.child_by_field_name("left")?,
+            parents,
+        )
+    };
+    let Some(mut owner) = owner_of(node) else {
+        return Ok(None);
+    };
+    let mut depth = 0;
+    while owner.kind() == "assignment_expression" {
+        depth += 1;
+        if depth > MAX_INITIALIZER_NESTING {
+            return Err(InitializerNestingExceeded);
+        }
+        let Some(next) = owner_of(owner) else {
+            return Ok(None);
+        };
+        owner = next;
+    }
+    Ok(matches!(
+        owner.kind(),
+        "object_creation_expression" | "implicit_object_creation_expression"
+    )
+    .then_some(owner))
+}
+
+/// The deepest chain of nested member initializers followed to its creating
+/// call.
+const MAX_INITIALIZER_NESTING: usize = 256;
+
+struct InitializerNestingExceeded;
+
+/// The receiver of an object-initializer member write is the object under
+/// construction, so the label `Name` in `new T { Name = value }` is a member
+/// access whose object is the creation expression. A nested initializer
+/// (`Inner = { Name = value }`) writes through the value of `Inner`, which no
+/// source expression denotes; its label has no object, so receiver analysis
+/// reports the site as unsupported instead of guessing a receiver.
+fn csharp_object_initializer_receiver<'tree>(label: Node<'tree>) -> Option<Node<'tree>> {
+    csharp_object_initializer_owner(label.parent()?, label, &ParentIndex::unindexed()).filter(
+        |owner| {
+            matches!(
+                owner.kind(),
+                "object_creation_expression" | "implicit_object_creation_expression"
+            )
+        },
+    )
+}
+
+fn is_csharp_object_initializer_label(node: Node<'_>) -> bool {
+    node.kind() == "identifier"
+        && node.parent().is_some_and(|parent| {
+            csharp_object_initializer_owner(parent, node, &ParentIndex::unindexed()).is_some()
         })
 }
 
@@ -887,7 +1106,7 @@ fn csharp_binding_activation(binder: Node<'_>, scope: Range) -> Option<BindingAc
 }
 
 pub fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
-    if argument.kind() != "argument" {
+    if !matches!(argument.kind(), "argument" | "attribute_argument") {
         return Some(argument);
     }
     let keyword = argument.child_by_field_name("name");
@@ -895,8 +1114,9 @@ pub fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
         .child_by_field_name("value")
         .or_else(|| argument.child_by_field_name("expression"))
         .or_else(|| {
-            brokk_bifrost_core::analyzer::tree_walk::named_children_iter(argument)
-                .find(|child| keyword.is_none_or(|keyword| child.id() != keyword.id()))
+            brokk_bifrost_core::analyzer::tree_walk::named_children_iter(argument).find(|child| {
+                !child.is_extra() && keyword.is_none_or(|keyword| child.id() != keyword.id())
+            })
         })
 }
 
@@ -908,15 +1128,32 @@ fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
         let Some(argument) = arguments.named_child(index) else {
             continue;
         };
-        if argument.kind() != "argument" {
+        if !matches!(argument.kind(), "argument" | "attribute_argument") {
             continue;
         }
         let keyword = argument.child_by_field_name("name");
+        let mode = if argument.kind() == "argument" {
+            (0..argument.child_count())
+                .filter_map(|index| argument.child(index))
+                .find_map(|child| match child.kind() {
+                    "ref" => {
+                        Some(brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Ref)
+                    }
+                    "out" => {
+                        Some(brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Out)
+                    }
+                    "in" => Some(brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::In),
+                    _ => None,
+                })
+                .unwrap_or(brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain)
+        } else {
+            brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain
+        };
         if let Some(value) = first_argument_value(argument).map(expression_target_node) {
             if let Some(keyword) = keyword {
-                sink.kwarg(keyword, value);
+                sink.kwarg_with_mode(keyword, value, mode);
             } else {
-                attach_role_with_derived_name(sink, Role::Arg, value, expression_name_node);
+                sink.argument_with_mode(value, expression_name_node(value), mode);
             }
         }
     }
@@ -930,6 +1167,26 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
         &["attribute"],
         expression_name_node,
     );
+}
+
+fn attach_declarator_decorators(sink: &mut RoleSink<'_>, declarator: Node<'_>) {
+    let mut parent = declarator.parent();
+    while let Some(owner) = parent {
+        if matches!(
+            owner.kind(),
+            "field_declaration" | "event_field_declaration"
+        ) {
+            attach_decorators(sink, owner);
+            break;
+        }
+        if !matches!(
+            owner.kind(),
+            "variable_declaration" | "variable_declarators"
+        ) {
+            break;
+        }
+        parent = owner.parent();
+    }
 }
 
 fn variable_declarator_value(node: Node<'_>) -> Option<Node<'_>> {
@@ -1020,26 +1277,145 @@ impl StructuralSpec for CSharpStructuralSpec {
         node: Node<'_>,
         source: &str,
     ) -> Option<brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes> {
+        let owner = if node.kind() == "variable_declarator" {
+            let mut current = node.parent();
+            loop {
+                match current {
+                    Some(parent)
+                        if matches!(
+                            parent.kind(),
+                            "field_declaration"
+                                | "event_field_declaration"
+                                | "local_declaration_statement"
+                        ) =>
+                    {
+                        break parent;
+                    }
+                    Some(parent)
+                        if matches!(
+                            parent.kind(),
+                            "variable_declaration" | "variable_declarators"
+                        ) =>
+                    {
+                        current = parent.parent()
+                    }
+                    _ => return None,
+                }
+            }
+        } else {
+            node
+        };
+        let type_kind = match node.kind() {
+            "class_declaration" => Some("class"),
+            "struct_declaration" => Some("struct"),
+            "interface_declaration" => Some("interface"),
+            "enum_declaration" => Some("enum"),
+            "record_declaration" => Some("record"),
+            _ => None,
+        };
         if !matches!(
             node.kind(),
-            "method_declaration"
+            "variable_declarator"
+                | "method_declaration"
                 | "constructor_declaration"
+                | "operator_declaration"
+                | "conversion_operator_declaration"
+                | "destructor_declaration"
+                | "local_function_statement"
+                | "lambda_expression"
+                | "anonymous_method_expression"
+                | "parameter"
                 | "class_declaration"
                 | "struct_declaration"
                 | "interface_declaration"
                 | "enum_declaration"
                 | "record_declaration"
+                | "property_declaration"
+                | "event_declaration"
+                | "indexer_declaration"
+                | "delegate_declaration"
+                | "using_directive"
+                | "namespace_declaration"
+                | "file_scoped_namespace_declaration"
         ) {
             return None;
         }
         Some(brokk_bifrost_core::analyzer::structural::facts::DeclarationAttributes {
-            modifiers: brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(node, source),
-            type_kind: None,
+            modifiers: brokk_bifrost_core::analyzer::structural::adapter_helpers::declaration_modifier_words(owner, source),
+            type_kind: type_kind.map(str::to_owned),
         })
+    }
+
+    fn extra_emitted_kinds(&self) -> &'static [NormalizedKind] {
+        // Refinement and embedded-leaf outputs beyond the grammar kind table.
+        &[NormalizedKind::Comparison]
+    }
+
+    fn authoritative_modifier_kinds(&self) -> &'static [NormalizedKind] {
+        // Calls, identifiers, literals, comments, and recovery nodes cannot own declaration attributes.
+        // Declaration kinds below are audited against all grammar producers of their exact kind.
+        &[
+            NormalizedKind::Method,
+            NormalizedKind::Constructor,
+            NormalizedKind::Function,
+            NormalizedKind::Lambda,
+            NormalizedKind::Parameter,
+            NormalizedKind::Class,
+            NormalizedKind::Declaration,
+            NormalizedKind::Assignment,
+            NormalizedKind::Import,
+            NormalizedKind::Module,
+            NormalizedKind::Comparison,
+            NormalizedKind::Call,
+            NormalizedKind::Identifier,
+            NormalizedKind::StringLiteral,
+            NormalizedKind::NumericLiteral,
+            NormalizedKind::BooleanLiteral,
+            NormalizedKind::NullLiteral,
+            NormalizedKind::Comment,
+            NormalizedKind::SyntaxError,
+        ]
+    }
+
+    fn authoritative_type_kind_kinds(&self) -> &'static [NormalizedKind] {
+        // Calls, identifiers, literals, comments, and recovery nodes cannot own declaration attributes.
+        // Declaration kinds below are audited against all grammar producers of their exact kind.
+        &[
+            NormalizedKind::Class,
+            NormalizedKind::Comparison,
+            NormalizedKind::Call,
+            NormalizedKind::Identifier,
+            NormalizedKind::StringLiteral,
+            NormalizedKind::NumericLiteral,
+            NormalizedKind::BooleanLiteral,
+            NormalizedKind::NullLiteral,
+            NormalizedKind::Comment,
+            NormalizedKind::SyntaxError,
+        ]
     }
 
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         CSHARP_KIND_TABLE
+    }
+
+    // Every C# member-initializer assignment, target-typed `new() { ... }`
+    // included, carries an `initializer_of` edge to its creating call, so a
+    // missing edge proves the assignment is not a member initializer.
+    fn certified_roles(&self) -> &'static [Role] {
+        &[Role::InitializerOf]
+    }
+
+    fn certified_role_kinds(&self, role: Role) -> &'static [NormalizedKind] {
+        match role {
+            Role::Parameters => &[
+                NormalizedKind::Method,
+                NormalizedKind::Constructor,
+                NormalizedKind::Function,
+                NormalizedKind::Lambda,
+            ],
+            Role::Members => &[NormalizedKind::Class],
+            _ => &[],
+        }
     }
 
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
@@ -1063,6 +1439,9 @@ impl StructuralSpec for CSharpStructuralSpec {
         }
         if kind == NormalizedKind::UnaryExpression && is_signed_numeric_prefix(node) {
             return NormalizedKind::NumericLiteral;
+        }
+        if kind == NormalizedKind::Identifier && is_csharp_object_initializer_label(node) {
+            return NormalizedKind::FieldAccess;
         }
         if kind == NormalizedKind::BinaryExpression
             && node
@@ -1111,8 +1490,11 @@ impl StructuralSpec for CSharpStructuralSpec {
         _source: &str,
         _context: &CallSiteContext,
     ) -> Option<CallSiteFacts> {
-        (node.kind() == "object_creation_expression")
-            .then(|| CallSiteFacts::of_kind(CallKind::Constructor))
+        matches!(
+            node.kind(),
+            "object_creation_expression" | "implicit_object_creation_expression"
+        )
+        .then(|| CallSiteFacts::of_kind(CallKind::Constructor))
     }
 
     fn supports_role(&self, role: Role) -> bool {
@@ -1155,6 +1537,23 @@ impl StructuralSpec for CSharpStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if matches!(
+            kind,
+            NormalizedKind::Method
+                | NormalizedKind::Constructor
+                | NormalizedKind::Function
+                | NormalizedKind::Lambda
+        ) {
+            extract_csharp_parameters(node, sink);
+        } else if kind == NormalizedKind::Class {
+            extract_csharp_members(node, sink);
+        } else if matches!(node.kind(), "delegate_declaration" | "indexer_declaration")
+            && let Some(list) = node.child_by_field_name("parameters")
+        {
+            for child in named_children_iter(list).filter(|child| child.kind() == "parameter") {
+                sink.role(Role::Parameters, child);
+            }
+        }
         if let Some(role) = csharp_member_position(node) {
             sink.occurrence_role(node, role);
         } else if csharp_is_binder(node) {
@@ -1379,7 +1778,14 @@ impl StructuralSpec for CSharpStructuralSpec {
                         );
                     }
                 }
-                if let Some(arguments) = node.child_by_field_name("arguments") {
+                let arguments = node.child_by_field_name("arguments").or_else(|| {
+                    (node.kind() == "implicit_object_creation_expression")
+                        .then(|| {
+                            named_children_iter(node).find(|child| child.kind() == "argument_list")
+                        })
+                        .flatten()
+                });
+                if let Some(arguments) = arguments {
                     attach_argument_roles(sink, arguments);
                 }
             }
@@ -1397,6 +1803,15 @@ impl StructuralSpec for CSharpStructuralSpec {
                     // analysis resolver supplies the CLR property name `Item`
                     // after it has selected this structured AST node.
                     sink.role(Role::Field, node);
+                    return;
+                }
+                if node.kind() == "identifier" {
+                    // An object-initializer label is its own member token.
+                    sink.role_named(Role::Field, node, node);
+                    sink.set_name(node);
+                    if let Some(object) = csharp_object_initializer_receiver(node) {
+                        sink.role(Role::Object, object);
+                    }
                     return;
                 }
                 let field = if node.kind() == "conditional_access_expression" {
@@ -1438,8 +1853,29 @@ impl StructuralSpec for CSharpStructuralSpec {
                 // `expression_name_node` returns unchanged.
                 if let Some(name) = node.child_by_field_name("name") {
                     sink.set_name(expression_name_node(name).unwrap_or(name));
+                } else if node.kind() == "indexer_declaration" {
+                    if let Some(name) = node
+                        .children(&mut node.walk())
+                        .find(|child| child.kind() == "this")
+                    {
+                        sink.set_name(name);
+                    }
+                } else if node.kind() == "operator_declaration" {
+                    if let Some(name) = node.child_by_field_name("operator") {
+                        sink.set_name(name);
+                    }
+                } else if node.kind() == "conversion_operator_declaration"
+                    && let Some(name) = node
+                        .children(&mut node.walk())
+                        .find(|child| matches!(child.kind(), "implicit" | "explicit"))
+                {
+                    sink.set_name(name);
                 }
-                attach_decorators(sink, node);
+                if node.kind() == "variable_declarator" {
+                    attach_declarator_decorators(sink, node);
+                } else {
+                    attach_decorators(sink, node);
+                }
             }
             // A parameter's attributes sit in its own attribute lists, which
             // is how `[FromQuery]` and other binding attributes reach the
@@ -1452,6 +1888,7 @@ impl StructuralSpec for CSharpStructuralSpec {
             }
             NormalizedKind::Assignment => match node.kind() {
                 "variable_declarator" => {
+                    attach_declarator_decorators(sink, node);
                     if let Some(name) = node.child_by_field_name("name") {
                         sink.role_named(Role::Left, name, name);
                         sink.set_name(name);
@@ -1485,12 +1922,22 @@ impl StructuralSpec for CSharpStructuralSpec {
                     if let Some(operator) = node.child_by_field_name("operator") {
                         sink.role_named(Role::Operator, operator, operator);
                     }
+                    match csharp_member_initializer_creation(node, sink.parents()) {
+                        Ok(Some(creation)) => sink.role(Role::InitializerOf, creation),
+                        Ok(None) => {}
+                        Err(InitializerNestingExceeded) => sink.stop_exceeded(),
+                    }
                 }
             },
             NormalizedKind::Import => attach_import_modules(sink, node),
             NormalizedKind::Decorator => {
                 if let Some(name) = node.child_by_field_name("name") {
                     attach_terminal_callee(sink, name, expression_name_node(name).or(Some(name)));
+                }
+                if let Some(arguments) = named_children_iter(node)
+                    .find(|child| child.kind() == "attribute_argument_list")
+                {
+                    attach_argument_roles(sink, arguments);
                 }
             }
             NormalizedKind::Identifier => match expression_name_node(node) {

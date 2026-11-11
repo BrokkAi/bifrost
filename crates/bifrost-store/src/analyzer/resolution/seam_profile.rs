@@ -218,6 +218,89 @@ use super::typed_fact_lowering::LoweredUnderlyingType;
 /// Names the JSON-lines output file. Unset means no instrument at all.
 pub const PROFILE_PATH_ENV: &str = "BIFROST_SEAM_PROFILE";
 
+/// Bounded Milestone 4 work counts. Each value is an event or occurrence,
+/// never an identity retained beyond the query.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum ResolutionWork {
+    DemandedReference,
+    PrefixDemand,
+    EvaluationRound,
+    DemandEpochExpansion,
+    UnreadyPrefixDeferral,
+    QueryMemoHit,
+    QueryMemoMiss,
+    CompletedRootMemoHit,
+    CompletedRootMemoMiss,
+    JavaRerunMemoHit,
+    JavaRerunMemoMiss,
+    WaitCycleBypass,
+    CycleGapFinish,
+    ProtectedRecordOccurrence,
+}
+
+impl ResolutionWork {
+    const ALL: [Self; 14] = [
+        Self::DemandedReference,
+        Self::PrefixDemand,
+        Self::EvaluationRound,
+        Self::DemandEpochExpansion,
+        Self::UnreadyPrefixDeferral,
+        Self::QueryMemoHit,
+        Self::QueryMemoMiss,
+        Self::CompletedRootMemoHit,
+        Self::CompletedRootMemoMiss,
+        Self::JavaRerunMemoHit,
+        Self::JavaRerunMemoMiss,
+        Self::WaitCycleBypass,
+        Self::CycleGapFinish,
+        Self::ProtectedRecordOccurrence,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DemandedReference => "demanded_references",
+            Self::PrefixDemand => "prefix_demands",
+            Self::EvaluationRound => "evaluation_rounds",
+            Self::DemandEpochExpansion => "demand_epoch_expansions",
+            Self::UnreadyPrefixDeferral => "unready_prefix_deferrals",
+            Self::QueryMemoHit => "query_memo_hits",
+            Self::QueryMemoMiss => "query_memo_misses",
+            Self::CompletedRootMemoHit => "completed_root_memo_hits",
+            Self::CompletedRootMemoMiss => "completed_root_memo_misses",
+            Self::JavaRerunMemoHit => "java_rerun_memo_hits",
+            Self::JavaRerunMemoMiss => "java_rerun_memo_misses",
+            Self::WaitCycleBypass => "wait_cycle_bypasses",
+            Self::CycleGapFinish => "cycle_gap_finishes",
+            Self::ProtectedRecordOccurrence => "protected_record_occurrences",
+        }
+    }
+}
+
+thread_local! {
+    static RESOLUTION_WORK_FLUSH: ResolutionWorkFlush = const { ResolutionWorkFlush };
+}
+
+struct ResolutionWorkFlush;
+
+impl Drop for ResolutionWorkFlush {
+    fn drop(&mut self) {
+        write_totals();
+    }
+}
+
+/// Record an event only when the seam profile is enabled. A test's worker
+/// thread writes its final totals on exit, including tests shorter than the
+/// normal five-second periodic profile interval.
+pub(crate) fn record_resolution_work(kind: ResolutionWork, count: usize) {
+    let Some(profile) = profile() else {
+        return;
+    };
+    RESOLUTION_WORK_FLUSH.with(|_| {});
+    profile.resolution_work[kind as usize].fetch_add(count as u64, Ordering::Relaxed);
+    profile.dirty.store(true, Ordering::Relaxed);
+}
+
 /// How often the background writer appends a `totals` line.
 ///
 /// A one-shot corpus run is killed by `timeout` and never returns from `main`,
@@ -256,6 +339,7 @@ macro_rules! seam_methods {
 }
 
 seam_methods! {
+    RootReferenceToken => "root_reference_token", "BatchResolutionFragmentSource";
     JvmSelectedRootPresence => "jvm_selected_root_presence", "BatchResolutionFragmentSource";
     CandidateAdmissionSession => "candidate_admission_session", "BatchResolutionFragmentSource";
     IdentityContentDigest => "identity_content_digest", "BatchResolutionFragmentSource";
@@ -263,9 +347,15 @@ seam_methods! {
     AdmitsReverseReference => "admits_reverse_reference", "BatchResolutionFragmentSource";
     ScopeReverseInventoryCompletion => "scope_reverse_inventory_completion", "BatchResolutionFragmentSource";
     ImplicitBaseInputs => "implicit_base_inputs", "SelectedTypedFactSource";
+    JvmExternalOwnerIsIndexed => "jvm_external_owner_is_indexed", "SelectedTypedFactSource";
+    SelectedBlobGapReasonProvenance => "selected_blob_gap_reason_provenance", "SelectedTypedFactSource";
+    SelectedBlobForFragment => "selected_blob_for_fragment", "SelectedTypedFactSource";
+    SelectedModelLanguage => "selected_model_language", "SelectedTypedFactSource";
+    SelectedModelProjection => "selected_model_projection", "SelectedTypedFactSource";
     SupportsConditionalTypeSeeds => "supports_conditional_type_seeds", "SelectedTypedFactSource";
     ConditionalTypeSeeds => "conditional_type_seeds", "SelectedTypedFactSource";
     JvmIntrinsicOwnerIsUnshadowed => "jvm_intrinsic_owner_is_unshadowed", "SelectedTypedFactSource";
+    SelectedJvmDeclarationOwner => "selected_jvm_declaration_owner", "SelectedTypedFactSource";
     GeneratedItemsCannotShadowBindings => "generated_items_cannot_shadow_bindings", "SelectedTypedFactSource";
     UniverseEntry => "universe_entry", "BatchResolutionFragmentSource";
     NamespaceDefinitionLanguages => "namespace_definition_languages", "BatchResolutionFragmentSource";
@@ -273,6 +363,7 @@ seam_methods! {
     InternSharedNameDigest => "intern_shared_name_digest", "BatchResolutionFragmentSource";
     SharedNameDigestForIdentity => "shared_name_digest_for_identity", "BatchResolutionFragmentSource";
     SupportsDirectTypeShapes => "supports_direct_type_shapes", "BatchResolutionFragmentSource";
+    SupportsExactTypeArgumentLinks => "supports_exact_type_argument_links", "BatchResolutionFragmentSource";
     SupportsGoUniverse => "supports_go_universe", "BatchResolutionFragmentSource";
     GoPackageInventoryComplete => "go_package_inventory_complete", "BatchResolutionFragmentSource";
     GoPackageInventoryCompleteForFragment => "go_package_inventory_complete_for_fragment", "BatchResolutionFragmentSource";
@@ -582,6 +673,7 @@ struct Profile {
     methods: [MethodCounters; METHOD_COUNT],
     go_reverse: GoReverseCounters,
     rename_phases: [RenamePhaseCounters; 4],
+    resolution_work: [AtomicU64; ResolutionWork::ALL.len()],
     output: Mutex<std::fs::File>,
     root_source_bounded: AtomicU64,
     root_source_universal: AtomicU64,
@@ -604,6 +696,7 @@ impl Profile {
                 methods: std::array::from_fn(|_| MethodCounters::default()),
                 go_reverse: GoReverseCounters::default(),
                 rename_phases: std::array::from_fn(|_| RenamePhaseCounters::default()),
+                resolution_work: std::array::from_fn(|_| AtomicU64::new(0)),
                 output: Mutex::new(output),
                 requests: AtomicU64::new(0),
                 in_flight: AtomicUsize::new(0),
@@ -648,6 +741,19 @@ impl Profile {
                 counters.sql_nanos.load(Ordering::Relaxed),
             ]
         })
+    }
+
+    fn resolution_work_snapshot(&self) -> serde_json::Value {
+        ResolutionWork::ALL
+            .iter()
+            .map(|kind| {
+                (
+                    kind.label().to_owned(),
+                    serde_json::json!(self.resolution_work[*kind as usize].load(Ordering::Relaxed)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into()
     }
 
     fn write_line(&self, line: &str) {
@@ -780,6 +886,7 @@ pub fn write_totals() {
         "uptime_ms": profile.started.elapsed().as_millis(),
         "requests": profile.requests.load(Ordering::Relaxed),
         "methods": method_object(&counters, None),
+        "resolution_work": profile.resolution_work_snapshot(),
     })
     .to_string();
     profile.write_line(&line);
@@ -1213,6 +1320,17 @@ impl<T: ?Sized> BatchResolutionFragmentSource for SeamProfiled<'_, T>
 where
     T: BatchResolutionFragmentSource,
 {
+    fn root_reference_token(
+        &self,
+        reference: SemanticId,
+        candidate: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::RootReferenceToken, 1);
+        self.inner
+            .root_reference_token(reference, candidate, cancellation)
+    }
+
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -1360,6 +1478,19 @@ where
             .inner
             .supports_direct_type_shapes(reference, cancellation)?;
         record_rows(SeamMethod::SupportsDirectTypeShapes, 1);
+        Ok(supported)
+    }
+
+    fn supports_exact_type_argument_links(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::SupportsExactTypeArgumentLinks, 1);
+        let supported = self
+            .inner
+            .supports_exact_type_argument_links(reference, cancellation)?;
+        record_rows(SeamMethod::SupportsExactTypeArgumentLinks, 1);
         Ok(supported)
     }
 
@@ -1695,6 +1826,47 @@ impl<T: ?Sized> SelectedTypedFactSource for SeamProfiled<'_, T>
 where
     T: SelectedTypedFactSource,
 {
+    fn selected_blob_for_fragment(
+        &self,
+        fragment: BindingFragmentId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<i64>>> {
+        record_call(SeamMethod::SelectedBlobForFragment, 1);
+        let result = self
+            .inner
+            .selected_blob_for_fragment(fragment, cancellation);
+        if let Ok(Some(Some(_))) = &result {
+            record_rows(SeamMethod::SelectedBlobForFragment, 1);
+        }
+        result
+    }
+    fn selected_blob_gap_reason_provenance(
+        &self,
+        blob: i64,
+        fragment: BindingFragmentId,
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SelectedGapReasonProvenance>>> {
+        record_call(SeamMethod::SelectedBlobGapReasonProvenance, reasons.len());
+        let result =
+            self.inner
+                .selected_blob_gap_reason_provenance(blob, fragment, reasons, cancellation);
+        if let Ok(Some(rows)) = &result {
+            record_rows(SeamMethod::SelectedBlobGapReasonProvenance, rows.len());
+        }
+        result
+    }
+    fn jvm_external_owner_is_indexed(
+        &self,
+        owner: &super::ExternalOwnerIdentity,
+    ) -> StoreResult<bool> {
+        record_call(SeamMethod::JvmExternalOwnerIsIndexed, 1);
+        let result = self.inner.jvm_external_owner_is_indexed(owner);
+        if result.is_ok() {
+            record_rows(SeamMethod::JvmExternalOwnerIsIndexed, 1);
+        }
+        result
+    }
     fn supports_conditional_type_seeds(&self) -> bool {
         let supported = self.inner.supports_conditional_type_seeds();
         // Keep default-language lifecycle counters byte-identical.
@@ -1717,6 +1889,34 @@ where
         result
     }
 
+    fn selected_model_language(
+        &self,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<brokk_bifrost_core::analyzer::Language>> {
+        let result = self.inner.selected_model_language(token, cancellation);
+        if matches!(&result, Ok(Some(_))) {
+            record_call(SeamMethod::SelectedModelLanguage, 1);
+            record_rows(SeamMethod::SelectedModelLanguage, 1);
+        }
+        result
+    }
+    fn selected_model_projection(
+        &self,
+        token: SemanticId,
+        kind: brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind,
+        receivers: &[crate::analyzer::resolution::ResolutionSlotValue],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<(Vec<super::ResolutionSlotValue>, super::ResolutionCompletion)>> {
+        let result = self
+            .inner
+            .selected_model_projection(token, kind, receivers, cancellation);
+        if let Ok(Some((values, _))) = &result {
+            record_call(SeamMethod::SelectedModelProjection, 1);
+            record_rows(SeamMethod::SelectedModelProjection, values.len());
+        }
+        result
+    }
     fn qualified_member_registrations(
         &self,
     ) -> &'static [super::fact_source::QualifiedMemberRegistration] {
@@ -1756,6 +1956,16 @@ where
         record_call(SeamMethod::JvmIntrinsicOwnerIsUnshadowed, 1);
         self.inner
             .jvm_intrinsic_owner_is_unshadowed(owner_fqn, cancellation)
+    }
+
+    fn selected_jvm_declaration_owner(
+        &self,
+        owner_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<super::ExternalOwnerIdentity>>> {
+        record_call(SeamMethod::SelectedJvmDeclarationOwner, 1);
+        self.inner
+            .selected_jvm_declaration_owner(owner_fqn, cancellation)
     }
 
     fn generated_items_cannot_shadow_bindings(
@@ -2702,8 +2912,10 @@ mod tests {
         );
         // #8834: jvm_selected_root_presence is forwarded and counted too.
         // #5671: the root-inventory admission session is forwarded and counted too.
-        assert_eq!(batch.len(), 39, "BatchResolutionFragmentSource: {batch:?}");
-        assert_eq!(typed.len(), 98, "SelectedTypedFactSource: {typed:?}");
+        // #7708: supports_exact_type_argument_links is forwarded and counted too.
+        assert_eq!(batch.len(), 41, "BatchResolutionFragmentSource: {batch:?}");
+        // #7654, #5658, #9002 add readers.
+        assert_eq!(typed.len(), 104, "SelectedTypedFactSource: {typed:?}");
 
         let forwarded = SeamMethod::ALL
             .iter()
@@ -2733,7 +2945,9 @@ mod tests {
         );
         // #8834: the selected-root presence read has its own profile method.
         // #7619 adds two readers; #5671 profiles the root-inventory session accessor.
-        assert_eq!(METHOD_COUNT, 135);
+        // #7654, #5658, #9002 add profiled readers.
+        // #7708 profiles supports_exact_type_argument_links.
+        assert_eq!(METHOD_COUNT, 143);
     }
 
     #[cfg(test)]

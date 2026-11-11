@@ -275,9 +275,8 @@ pub struct ContextBlueprintMemo {
 
 impl ReadySelectedResolution<'_, '_> {
     fn profile_context_read(&self, kind: &'static str, key: impl std::fmt::Debug) {
-        if let Some(profile) = self.jvm_context_profile.borrow_mut().as_mut() {
-            *profile.calls.entry((kind, format!("{key:?}"))).or_default() += 1;
-        }
+        self.rust_forward_build_view()
+            .profile_context_read(kind, key)
     }
 
     #[doc(hidden)]
@@ -288,6 +287,47 @@ impl ReadySelectedResolution<'_, '_> {
         session: &ResolutionSession,
     ) -> Result<crate::analyzer::resolution::SelectedContextPathPublicationOutcome> {
         self.publish_context_paths_with_projection_memo(context, None, cancellation, session)
+    }
+
+    pub(super) fn publish_context_paths_with_projection_memo(
+        &self,
+        context: SelectedResolutionContextInputs,
+        memo: Option<&ContextBlueprintMemo>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<crate::analyzer::resolution::SelectedContextPathPublicationOutcome> {
+        self.rust_forward_build_view()
+            .publish_context_paths_with_projection_memo(context, memo, cancellation, session)
+    }
+
+    /// Publish only at the consumer's scheduling boundary. Registration rules
+    /// retain provider-ledger deltas and Rust's independent receiver charges.
+    #[doc(hidden)]
+    pub fn publish_prepared_context(
+        &self,
+        context: SelectedResolutionContextInputs,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+        memo: Option<&ContextBlueprintMemo>,
+        register: impl FnOnce(&SelectedFactOperationBlueprint) -> Result<ContextRegistrationOutcome>,
+    ) -> Result<Option<SelectedFactOperationBlueprint>> {
+        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) =
+            self.collect_blueprint_with_projection_memo(context, memo, cancellation, session)?
+        else {
+            return Ok(None);
+        };
+        Ok(match register(&blueprint)? {
+            ContextRegistrationOutcome::Ready => Some(blueprint),
+            ContextRegistrationOutcome::Cancelled => None,
+        })
+    }
+}
+
+impl super::RustForwardBuildView<'_, '_> {
+    fn profile_context_read(&self, kind: &'static str, key: impl std::fmt::Debug) {
+        if let Some(profile) = self.jvm_context_profile.borrow_mut().as_mut() {
+            *profile.calls.entry((kind, format!("{key:?}"))).or_default() += 1;
+        }
     }
 
     pub(super) fn publish_context_paths_with_projection_memo(
@@ -370,27 +410,5 @@ impl ReadySelectedResolution<'_, '_> {
             memo.packages.publish(package_keys, publication.token);
         }
         Ok(publication)
-    }
-
-    /// Publish only at the consumer's scheduling boundary. Registration rules
-    /// retain provider-ledger deltas and Rust's independent receiver charges.
-    #[doc(hidden)]
-    pub fn publish_prepared_context(
-        &self,
-        context: SelectedResolutionContextInputs,
-        cancellation: &CancellationToken,
-        session: &ResolutionSession,
-        memo: Option<&ContextBlueprintMemo>,
-        register: impl FnOnce(&SelectedFactOperationBlueprint) -> Result<ContextRegistrationOutcome>,
-    ) -> Result<Option<SelectedFactOperationBlueprint>> {
-        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) =
-            self.collect_blueprint_with_projection_memo(context, memo, cancellation, session)?
-        else {
-            return Ok(None);
-        };
-        Ok(match register(&blueprint)? {
-            ContextRegistrationOutcome::Ready => Some(blueprint),
-            ContextRegistrationOutcome::Cancelled => None,
-        })
     }
 }

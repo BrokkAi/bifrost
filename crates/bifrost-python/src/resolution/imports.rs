@@ -11,6 +11,7 @@ pub(super) fn produce(
     if leaves.is_empty() || node.has_error() {
         p.omitted_reference(node, scope);
     }
+    let mut seen = HashSet::default();
     for leaf in leaves {
         let site = p.site(leaf.leaf, scope, ResolutionSiteKind::ImportDeclaration);
         // All import routes are source syntax only until environment and
@@ -149,52 +150,86 @@ pub(super) fn produce(
                         == ResolutionScopeKind::CompilationUnit,
                 },
             );
-        } else {
-            let reference = p.identifier(
-                route[bound_index],
-                scope,
-                ResolutionSiteKind::ModuleReference,
-                ResolutionIdentifierRole::Reference,
-                ResolutionNamespace::Value,
-            );
-            p.facts
-                .add_gap(reference, ResolutionGapKind::UnprovenActivation);
-            p.facts.root_references.push(ResolutionRootReferenceFact {
-                reference,
-                root_scope: ResolutionScopeId::new(0),
-                anchor,
-                prefix_reference: None,
-                owner_continued: false,
-            });
-            for (position, &name) in prefix.iter().enumerate() {
-                p.facts
-                    .root_reference_segments
-                    .push(ResolutionRootReferenceSegmentFact {
-                        reference,
-                        position: dense_ordinal(position, "Python target route"),
-                        name,
-                    });
-            }
-            p.facts
-                .root_import_demands
-                .push(ResolutionRootImportDemandFact {
-                    import_site: site,
-                    namespace: ResolutionNamespace::Value,
-                    name: names[bound_index],
-                });
-            p.facts
-                .root_import_demand_targets
-                .push(ResolutionRootImportDemandTargetFact {
-                    import_site: site,
-                    namespace: ResolutionNamespace::Value,
-                    name: names[bound_index],
-                    target: ResolutionRootImportDemandTarget::NamedReference(reference),
-                });
         }
+        emit_positioned_root_prefixes(
+            p,
+            &route,
+            &names,
+            ResolutionScopeId::new(0),
+            anchor,
+            |p, &token, ordinal| {
+                if (ordinal >= module.len() && (star || ordinal != bound_index))
+                    || !seen.insert(token.id())
+                {
+                    return None;
+                }
+                // Unaliased imports already positioned their binding-event
+                // reference at this token. Give that site the provider route.
+                let reference = if binding.is_some_and(|binding| binding.id() == token.id()) {
+                    p.facts.binding_events[event.expect("named import event") as usize].target
+                } else {
+                    p.identifier(
+                        token,
+                        scope,
+                        ResolutionSiteKind::ModuleReference,
+                        ResolutionIdentifierRole::Reference,
+                        ResolutionNamespace::Value,
+                    )
+                };
+                if ordinal < module.len() {
+                    p.facts
+                        .python_import_module_operands
+                        .push(PythonImportModuleOperandFact {
+                            reference_site: reference,
+                            import_site: site,
+                            prefix_len: dense_ordinal(ordinal + 1, "Python module operand prefix"),
+                        });
+                }
+                if !star && ordinal == bound_index {
+                    p.facts
+                        .add_gap(reference, ResolutionGapKind::UnprovenActivation);
+                    p.facts
+                        .root_import_demands
+                        .push(ResolutionRootImportDemandFact {
+                            import_site: site,
+                            namespace: ResolutionNamespace::Value,
+                            name: names[ordinal],
+                        });
+                    p.facts
+                        .root_import_demand_targets
+                        .push(ResolutionRootImportDemandTargetFact {
+                            import_site: site,
+                            namespace: ResolutionNamespace::Value,
+                            name: names[ordinal],
+                            target: ResolutionRootImportDemandTarget::NamedReference(reference),
+                        });
+                }
+                Some(reference)
+            },
+            |p| &mut p.facts,
+        );
     }
 }
 
 pub(super) fn finish(p: &mut Producer<'_, '_>) {
+    // Static module operands do not ask wildcard imports for lexical names.
+    // Reused binding references keep the same demands they had before.
+    let bound_references = p
+        .facts
+        .root_import_demand_targets
+        .iter()
+        .filter_map(|target| match target.target {
+            ResolutionRootImportDemandTarget::NamedReference(reference) => Some(reference),
+            ResolutionRootImportDemandTarget::SameNameGlob => None,
+        })
+        .collect::<HashSet<_>>();
+    let module_operands = p
+        .facts
+        .python_import_module_operands
+        .iter()
+        .map(|operand| operand.reference_site)
+        .filter(|reference| !bound_references.contains(reference))
+        .collect::<HashSet<_>>();
     let mut seen = HashSet::default();
     let demands = p
         .facts
@@ -202,6 +237,7 @@ pub(super) fn finish(p: &mut Producer<'_, '_>) {
         .iter()
         .filter(|id| {
             id.role == ResolutionIdentifierRole::Reference
+                && !module_operands.contains(&id.site)
                 && id.qualifier.is_none()
                 && id.namespace == ResolutionNamespace::Value
         })

@@ -44,6 +44,48 @@ pub(super) fn policy_location(
     )
 }
 
+/// Report locations of structural sites known only by their file and byte
+/// range (an undecided selector candidate has no semantic locator). Each
+/// file's source and line starts are read once per index, which lives for one
+/// verdict assembly.
+#[derive(Default)]
+pub(super) struct FileSpanLocations {
+    files: std::collections::HashMap<ProjectFile, (String, Vec<usize>)>,
+}
+
+impl FileSpanLocations {
+    pub(super) fn location(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        span: &std::ops::Range<usize>,
+    ) -> Result<PolicySourceLocation, String> {
+        let rel_path = brokk_bifrost_analysis::path_utils::rel_path_string(file);
+        let (source, starts) = match self.files.entry(file.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let source = workspace.analyzer().indexed_source(file).ok_or_else(|| {
+                    format!("{rel_path} has no indexed source for its subject location")
+                })?;
+                let starts = compute_line_starts(&source);
+                entry.insert((source, starts))
+            }
+        };
+        let (start_line, start_column) = line_column_for_offset(source, starts, span.start);
+        let (end_line, end_column) = line_column_for_offset(source, starts, span.end);
+        PolicySourceLocation::span_from_coordinates(
+            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new(&rel_path)
+                .map_err(|error| error.to_string())?,
+            span.start as u64,
+            span.end as u64,
+            start_line as u64,
+            start_column as u64,
+            end_line as u64,
+            end_column as u64,
+        )
+    }
+}
+
 pub(super) fn program_point_locator(point: &ProgramPointHandle) -> &SemanticLocator {
     let _row = point
         .procedure()

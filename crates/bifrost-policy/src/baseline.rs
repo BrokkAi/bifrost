@@ -147,7 +147,7 @@ impl PolicyBaselineDocument {
                     weak_excluded = weak_excluded.saturating_add(1);
                     continue;
                 }
-                if finding.suppression().is_some() || finding.scope().is_some() {
+                if finding.is_explicitly_accepted() {
                     continue;
                 }
                 finding_ids.push(finding.id());

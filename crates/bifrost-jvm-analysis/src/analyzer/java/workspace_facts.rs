@@ -44,10 +44,13 @@ impl JavaAnalyzer {
                     self,
                     cell,
                     || {
-                        // This source-only inventory is incomplete while externals
-                        // are unavailable. Reading the index makes that dependency
-                        // part of the retained fill's own receipt.
-                        self.external_declaration_index();
+                        // The digest covers workspace classes only, so it does not read
+                        // the external index: a missing jar changes no byte of it. A
+                        // single-type import whose package-prefix split a missing jar
+                        // could satisfy is an entry of the file that writes it, and
+                        // `JavaAnalyzer::resolve_imports` records the index's gaps for
+                        // that entry. Reading the index here made every Java query
+                        // partial while any jar was missing (#10470).
                         // Complete enumeration precedes the digest. Retain only the
                         // scalar, not another workspace-sized declaration inventory.
                         let classes = self
@@ -458,15 +461,30 @@ mod tests {
         assert_eq!(outer_memo.load(Ordering::Relaxed), 19);
     }
 
+    /// #10470 re-blessed this test. It used to assert that the inventory fill read
+    /// the whole external index, so that a missing artifact's gap rode in the
+    /// fill's receipt and was replayed on every hit: every Java query was partial
+    /// while any jar was missing. The inventory digest covers workspace classes
+    /// only, so it no longer reads the index. The gap now belongs to the one case a
+    /// missing jar can change: a single-type import that no workspace class
+    /// satisfies, recorded in the fill of the memo that resolves that file's
+    /// imports (and so replayed to its readers). The #8108 properties stay: the
+    /// inventory fill is retained, the second read rescans nothing, and both reads
+    /// carry their input keys.
     #[test]
     #[hardwon(
         "#8108: a missing dependency artifact made the Java import inventory refuse every fill and rescan all declarations per call"
     )]
-    fn import_inventory_replays_missing_artifact_on_hits() {
+    fn import_inventory_is_retained_and_a_missing_artifact_is_recorded_for_an_open_import_entry() {
         use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, QueryReadIncomplete};
 
         let project = InlineTestProject::with_language(Language::Java)
             .file("App.java", "class App {}")
+            .file(
+                "Open.java",
+                "import example.bifrost.issue8108.Thing;\nclass Open {}\n",
+            )
+            .file("Closed.java", "import java.util.List;\nclass Closed {}\n")
             .file(
                 "pom.xml",
                 r#"<project><modelVersion>4.0.0</modelVersion>
@@ -482,17 +500,19 @@ mod tests {
             vec![project.root().join("empty-repository")];
         let base = project.workspace_analyzer(config);
         let java = resolve_analyzer::<JavaAnalyzer>(base.analyzer()).unwrap();
+        let missing_artifact = |reasons: &[QueryReadIncomplete]| {
+            reasons.iter().any(|reason| {
+                matches!(reason,
+                QueryReadIncomplete::ArtifactUnavailable(message)
+                    if message.contains("jvm.dependency_unresolved"))
+            })
+        };
         let read = || {
             let scope = AnalyzerQueryScope::capturing_read_incompleteness(java);
             let answer = java.import_inventory_answer();
             (answer, scope.captured_read_incompleteness())
         };
-        let ((first, first_reasons), reads) = capture_query_reads(java, || {
-            let scope = AnalyzerQueryScope::capturing_read_incompleteness(java);
-            java.external_declaration_index();
-            let answer = java.import_inventory_answer();
-            (answer, scope.captured_read_incompleteness())
-        });
+        let ((first, first_reasons), reads) = capture_query_reads(java, read);
         let scans = java.inner.full_declaration_scan_count_for_test();
         let ((second, second_reasons), second_reads) = capture_query_reads(java, read);
         assert_eq!(first, second);
@@ -501,13 +521,30 @@ mod tests {
         assert!(!second_reads.keys().is_empty());
         assert!(scans > 0, "the cold inventory must scan declarations");
         assert_eq!(java.inner.full_declaration_scan_count_for_test(), scans);
-        for reasons in [first_reasons, second_reasons] {
+        for reasons in [&first_reasons, &second_reasons] {
             assert!(
-                reasons.iter().any(|reason| matches!(reason,
-                QueryReadIncomplete::ArtifactUnavailable(message)
-                    if message.contains("jvm.dependency_unresolved"))),
-                "{reasons:?}"
+                !missing_artifact(reasons),
+                "the workspace-class digest does not depend on a jar: {reasons:?}"
             );
+        }
+
+        let imports_of = |name: &str| {
+            let file = project.file(name);
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(java);
+            java.resolve_imports(scope.token(), &file);
+            scope.captured_read_incompleteness()
+        };
+        for read in 0..2 {
+            assert!(
+                missing_artifact(&imports_of("Open.java")),
+                "read {read}: an import no workspace class satisfies is an entry a missing jar \
+                 could satisfy, and the memo's receipt replays that"
+            );
+            assert!(
+                !missing_artifact(&imports_of("Closed.java")),
+                "read {read}: no jar can supply a java.* type"
+            );
+            assert!(!missing_artifact(&imports_of("App.java")));
         }
     }
 
@@ -921,14 +958,13 @@ mod external_receipt_budget_tests {
             .file("pom.xml", "<project/>")
             .build();
         let config = brokk_bifrost_analysis::analyzer::AnalyzerConfig {
-            memo_cache_budget_bytes: Some(8),
+            retention_budget_bytes: Some(4 * (8)),
             ..Default::default()
         };
         let analyzer = JavaAnalyzer::new_with_config(project.project_arc(), config);
         crate::analyzer::jvm::authority::assert_receipt_loss_refuses_live_index(
             &analyzer,
             &analyzer.external_index,
-            &analyzer.external_inputs,
             || {
                 analyzer.external_declaration_index();
             },

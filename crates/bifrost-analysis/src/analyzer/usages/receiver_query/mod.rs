@@ -223,10 +223,48 @@ pub struct ReceiverQueryReport {
     pub work: ReceiverAnalysisWork,
     pub candidates_truncated: bool,
     pub semantic_unsupported: Option<SemanticCapability>,
+    /// Original structured definition diagnostics, retained even when a later
+    /// neutral gate suppresses presentation of possible candidates.
+    pub definition_diagnostics:
+        Vec<crate::analyzer::usages::get_definition::DefinitionLookupDiagnostic>,
+    pub possible_candidates_suppressed: bool,
     /// Candidate-aligned semantic points-to answers for the RQL
     /// `points_to_candidate` expansion. The display-oriented receiver values
     /// can merge candidates and therefore cannot carry this identity.
     pub points_to: Option<SourcePointsToResult>,
+}
+
+impl ReceiverQueryReport {
+    fn note_possible_candidates_suppressed(&mut self) {
+        self.possible_candidates_suppressed |= match &self.analysis {
+            ReceiverQueryAnalysis::Values(outcome) => outcome.possible_candidates().is_some(),
+            ReceiverQueryAnalysis::MemberTargets(outcome) => {
+                outcome.possible_candidates().is_some()
+            }
+        };
+    }
+
+    pub fn cap_possible_candidates(&mut self, limit: usize) {
+        let truncated = match &mut self.analysis {
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Incomplete { candidates }) => {
+                let truncated = candidates.len() > limit;
+                candidates.truncate(limit);
+                truncated
+            }
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Incomplete {
+                candidates,
+            }) => {
+                let truncated = candidates.len() > limit;
+                candidates.truncate(limit);
+                truncated
+            }
+            _ => false,
+        };
+        if truncated {
+            self.candidates_truncated = true;
+            brokk_bifrost_core::analyzer::carried_context::mark_execution_dependent();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,21 +480,11 @@ impl ReceiverWorkLedger {
 
     #[doc(hidden)]
     pub fn remaining_budget(&self) -> ReceiverAnalysisBudget {
-        ReceiverAnalysisBudget {
-            max_scope_nodes: self
-                .budget
-                .max_scope_nodes
-                .saturating_sub(self.work.setup_nodes.saturating_add(self.work.scope_nodes)),
-            max_summary_expansions: self
-                .budget
-                .max_summary_expansions
-                .saturating_sub(self.work.summary_expansions),
-            max_resolution_rounds: self
-                .budget
-                .max_resolution_rounds
-                .saturating_sub(self.work.resolution_rounds),
-            ..self.budget
-        }
+        let mut remaining = self.budget.remaining_after(&self.work);
+        remaining.max_scope_nodes = remaining
+            .max_scope_nodes
+            .saturating_sub(self.work.setup_nodes);
+        remaining
     }
 
     #[doc(hidden)]
@@ -493,6 +521,7 @@ impl ReceiverWorkLedger {
                 remaining.max_resolution_rounds,
             )
             .allows(0);
+        let hierarchy_exceeded = work.hierarchy_order_steps > remaining.max_hierarchy_order_work;
         self.work.scope_nodes = self
             .work
             .scope_nodes
@@ -505,12 +534,18 @@ impl ReceiverWorkLedger {
             .work
             .resolution_rounds
             .saturating_add(work.resolution_rounds.min(remaining.max_resolution_rounds));
+        self.work.hierarchy_order_steps = self.work.hierarchy_order_steps.saturating_add(
+            work.hierarchy_order_steps
+                .min(remaining.max_hierarchy_order_work),
+        );
         if scope_exceeded {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else if summaries_exceeded {
             Err(ReceiverBudgetLimit::SummaryExpansions)
         } else if rounds_exceeded {
             Err(ReceiverBudgetLimit::ResolutionRounds)
+        } else if hierarchy_exceeded {
+            Err(ReceiverBudgetLimit::HierarchyOrderSteps)
         } else {
             Ok(())
         }
@@ -533,6 +568,7 @@ fn combined_receiver_work(
 pub enum CompatibilityOutcome<T> {
     Complete(T),
     Exceeded(ReceiverBudgetLimit),
+    Unavailable(&'static str),
 }
 
 #[doc(hidden)]
@@ -549,6 +585,9 @@ pub fn charge_bounded_resolution<T>(
         BoundedResolution::Exceeded { limit, .. } => Ok(CompatibilityOutcome::Exceeded(
             aggregate_limit.unwrap_or(limit),
         )),
+        BoundedResolution::Unavailable { reason, .. } => {
+            Ok(CompatibilityOutcome::Unavailable(reason))
+        }
         BoundedResolution::Cancelled { .. } => Err(ReceiverQueryError::Cancelled),
     }
 }
@@ -626,9 +665,13 @@ impl<'a> ReceiverQueryService<'a> {
         }
         self.ensure_receiver_request(language, query.cancellation);
         {
-            let mut request = self.receiver_request.borrow_mut();
-            if let Some(request) = request.as_mut() {
-                return request.resolve_type(query);
+            let mut retained = self.receiver_request.borrow_mut();
+            if let Some(request) = retained.as_mut() {
+                let result = request.resolve_type(query);
+                if request.reader_excludes_store_access() {
+                    *retained = None;
+                }
+                return result;
             }
         }
         resolver.resolve_type_bounded(query)
@@ -645,9 +688,13 @@ impl<'a> ReceiverQueryService<'a> {
         }
         self.ensure_receiver_request(language, query.cancellation);
         {
-            let mut request = self.receiver_request.borrow_mut();
-            if let Some(request) = request.as_mut() {
-                return request.resolve_definition(query);
+            let mut retained = self.receiver_request.borrow_mut();
+            if let Some(request) = retained.as_mut() {
+                let result = request.resolve_definition(query);
+                if request.reader_excludes_store_access() {
+                    *retained = None;
+                }
+                return result;
             }
         }
         resolver.resolve_definition_bounded(query)
@@ -1004,6 +1051,14 @@ impl<'a> ReceiverQueryService<'a> {
                         CompatibilityOutcome::Exceeded(limit) => {
                             return Ok(budget_report(operation, report.site, ledger.work(), limit));
                         }
+                        CompatibilityOutcome::Unavailable(reason) => {
+                            return Ok(unavailable_report(
+                                operation,
+                                report.site,
+                                ledger.work(),
+                                reason,
+                            ));
+                        }
                     };
                     if let Some(type_outcome) = modeled_call_result {
                         let model_values = projected_type_definitions(&type_outcome)
@@ -1039,6 +1094,14 @@ impl<'a> ReceiverQueryService<'a> {
                         CompatibilityOutcome::Exceeded(limit) => {
                             return Ok(budget_report(operation, report.site, ledger.work(), limit));
                         }
+                        CompatibilityOutcome::Unavailable(reason) => {
+                            return Ok(unavailable_report(
+                                operation,
+                                report.site,
+                                ledger.work(),
+                                reason,
+                            ));
+                        }
                     };
                     if let Some(type_outcome) = type_outcome {
                         let model_values = projected_type_definitions(&type_outcome)
@@ -1069,6 +1132,14 @@ impl<'a> ReceiverQueryService<'a> {
                             )?;
                             let projection = match projection {
                                 CompatibilityOutcome::Complete(projection) => projection,
+                                CompatibilityOutcome::Unavailable(reason) => {
+                                    return Ok(unavailable_report(
+                                        operation,
+                                        report.site,
+                                        ledger.work(),
+                                        reason,
+                                    ));
+                                }
                                 CompatibilityOutcome::Exceeded(limit) => {
                                     return Ok(budget_report(
                                         operation,
@@ -1196,6 +1267,14 @@ impl<'a> ReceiverQueryService<'a> {
                     CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(operation, gate_site, ledger.work(), limit));
                     }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            gate_site,
+                            ledger.work(),
+                            reason,
+                        ));
+                    }
                 };
                 let modeled_receiver_proof = legacy_exact_modeled_receiver_proof(
                     self.analyzer,
@@ -1245,6 +1324,8 @@ impl<'a> ReceiverQueryService<'a> {
                         ),
                         candidates_truncated: member_report.analysis.candidates_truncated,
                         semantic_unsupported: None,
+                        definition_diagnostics: Vec::new(),
+                        possible_candidates_suppressed: false,
                         points_to: None,
                     },
                     gate,
@@ -1751,6 +1832,14 @@ impl<'a> ReceiverQueryService<'a> {
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(operation, report_site, ledger.work(), limit));
             }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    report_site,
+                    ledger.work(),
+                    reason,
+                ));
+            }
         };
         if let Some(reason) = structural_receiver_unsupported_reason(language, &type_outcome) {
             let mut report = unknown_report(operation, report_site, ledger.work(), false);
@@ -1770,6 +1859,14 @@ impl<'a> ReceiverQueryService<'a> {
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(operation, report_site, ledger.work(), limit));
                 }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        report_site,
+                        ledger.work(),
+                        reason,
+                    ));
+                }
             };
             let mut analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
                 type_outcome.status,
@@ -1778,7 +1875,7 @@ impl<'a> ReceiverQueryService<'a> {
             if projection.truncated {
                 neutral_incomplete(&mut analysis);
             }
-            return Ok(ReceiverQueryReport {
+            let mut report = ReceiverQueryReport {
                 operation,
                 site: report_site,
                 analysis,
@@ -1786,8 +1883,12 @@ impl<'a> ReceiverQueryService<'a> {
                 work: ledger.work(),
                 candidates_truncated: projection.truncated,
                 semantic_unsupported: None,
+                definition_diagnostics: Vec::new(),
+                possible_candidates_suppressed: false,
                 points_to: None,
-            });
+            };
+            report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+            return Ok(report);
         }
 
         let semantic = (!static_type_reference)
@@ -1848,7 +1949,16 @@ impl<'a> ReceiverQueryService<'a> {
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(operation, report_site, ledger.work(), limit));
                 }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        report_site,
+                        ledger.work(),
+                        reason,
+                    ));
+                }
             };
+            let definition_diagnostics = outcome.diagnostics.clone();
             let (workspace_outcome, resolution_truncated) =
                 definition_outcome(outcome, ledger.remaining_budget().max_targets);
             let receiver_proof = if static_type_reference {
@@ -1891,6 +2001,14 @@ impl<'a> ReceiverQueryService<'a> {
                     CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(operation, report_site, ledger.work(), limit));
                     }
+                    CompatibilityOutcome::Unavailable(reason) => {
+                        return Ok(unavailable_report(
+                            operation,
+                            report_site,
+                            ledger.work(),
+                            reason,
+                        ));
+                    }
                 };
             }
             if !evidence_supports_precision
@@ -1900,7 +2018,7 @@ impl<'a> ReceiverQueryService<'a> {
             {
                 neutral_incomplete(&mut analysis);
             }
-            return Ok(ReceiverQueryReport {
+            let mut report = ReceiverQueryReport {
                 operation,
                 site: report_site,
                 analysis,
@@ -1908,8 +2026,12 @@ impl<'a> ReceiverQueryService<'a> {
                 work: ledger.work(),
                 candidates_truncated: evidence.is_truncated() || resolution_truncated,
                 semantic_unsupported: evidence.unsupported_capability(),
+                definition_diagnostics,
+                possible_candidates_suppressed: false,
                 points_to: None,
-            });
+            };
+            report.cap_possible_candidates(ledger.remaining_budget().max_targets);
+            return Ok(report);
         }
 
         let points_to = points_to
@@ -1924,6 +2046,14 @@ impl<'a> ReceiverQueryService<'a> {
             CompatibilityOutcome::Complete(node) => node,
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(operation, report_site, ledger.work(), limit));
+            }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    report_site,
+                    ledger.work(),
+                    reason,
+                ));
             }
         };
         let factories = if points_to_contains_call_result(&points_to, Some(cancellation))?
@@ -1963,6 +2093,14 @@ impl<'a> ReceiverQueryService<'a> {
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(operation, report_site, ledger.work(), limit));
                 }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(unavailable_report(
+                        operation,
+                        report_site,
+                        ledger.work(),
+                        reason,
+                    ));
+                }
             }
         } else {
             Vec::new()
@@ -1980,6 +2118,14 @@ impl<'a> ReceiverQueryService<'a> {
             CompatibilityOutcome::Complete(projection) => projection,
             CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(operation, report_site, ledger.work(), limit));
+            }
+            CompatibilityOutcome::Unavailable(reason) => {
+                return Ok(unavailable_report(
+                    operation,
+                    report_site,
+                    ledger.work(),
+                    reason,
+                ));
             }
         };
         let mut analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
@@ -1999,6 +2145,8 @@ impl<'a> ReceiverQueryService<'a> {
             work: ledger.work(),
             candidates_truncated: evidence.is_truncated() || projection.truncated,
             semantic_unsupported: evidence.unsupported_capability(),
+            definition_diagnostics: Vec::new(),
+            possible_candidates_suppressed: false,
             points_to: if operation == ReceiverQueryOperation::PointsTo {
                 Some(points_to.clone())
             } else {
@@ -2117,6 +2265,9 @@ pub fn structural_member_dispatch_supports_precise(
         CompatibilityOutcome::Exceeded(limit) => {
             return Ok(CompatibilityOutcome::Exceeded(limit));
         }
+        CompatibilityOutcome::Unavailable(reason) => {
+            return Ok(CompatibilityOutcome::Unavailable(reason));
+        }
     };
     if metadata.is_empty() {
         return Ok(CompatibilityOutcome::Complete(false));
@@ -2158,8 +2309,11 @@ fn finalize_legacy_report(
     ledger: &mut ReceiverWorkLedger,
 ) -> ReceiverQueryReport {
     let compatibility_limit = ledger.charge_analysis(report.work).err();
+    let mut report = report;
+    report.cap_possible_candidates(ledger.remaining_budget().max_targets);
     let mut report = apply_semantic_gate(analyzer, report, gate);
     if let Some(limit) = compatibility_limit {
+        report.note_possible_candidates_suppressed();
         neutral_exceeded(&mut report.analysis, limit);
     }
     report.work = ledger.work();
@@ -2176,6 +2330,7 @@ fn finalize_exact_modeled_report(
     ledger: &mut ReceiverWorkLedger,
 ) -> ReceiverQueryReport {
     if let Err(limit) = ledger.charge_analysis(report.work) {
+        report.note_possible_candidates_suppressed();
         neutral_exceeded(&mut report.analysis, limit);
     }
     report.work = ledger.work();
@@ -2233,12 +2388,25 @@ fn apply_semantic_gate(
                 // even when neutral value-flow has no external-value row.
                 // Member/type claims still require a declaration or model.
             } else if let Some(capability) = unsupported {
+                report.note_possible_candidates_suppressed();
                 neutral_unsupported(&mut report.analysis, capability.label());
             } else {
+                report.note_possible_candidates_suppressed();
+                if report.possible_candidates_suppressed {
+                    match &mut report.analysis {
+                        ReceiverQueryAnalysis::Values(outcome) => {
+                            *outcome = ReceiverAnalysisOutcome::Unknown
+                        }
+                        ReceiverQueryAnalysis::MemberTargets(outcome) => {
+                            *outcome = ReceiverAnalysisOutcome::Unknown
+                        }
+                    }
+                }
                 neutral_unknown(&mut report.analysis);
             }
         }
         SemanticReceiverGate::Exceeded { limit, .. } => {
+            report.note_possible_candidates_suppressed();
             neutral_exceeded(&mut report.analysis, limit);
         }
     }
@@ -2326,6 +2494,9 @@ fn legacy_exact_modeled_receiver_proof(
     let model_id = ty.semantic_model_id.as_deref()?;
     let overlay = analyzer.semantic_model_overlay()?;
     let owners = overlay.symbols_with_id(model_id);
+    if matches!(owners.disposition, SemanticModelOverlayDisposition::Open(_)) {
+        return None;
+    }
     let [owner] = owners.records.as_slice() else {
         return None;
     };
@@ -2519,6 +2690,7 @@ fn replace_with_neutral_unknown<T>(outcome: &mut ReceiverAnalysisOutcome<T>) {
     if !matches!(
         outcome,
         ReceiverAnalysisOutcome::Unsupported { .. }
+            | ReceiverAnalysisOutcome::Incomplete { .. }
             | ReceiverAnalysisOutcome::ExceededBudget { .. }
     ) {
         *outcome = ReceiverAnalysisOutcome::Unknown;
@@ -2656,6 +2828,7 @@ impl ReceiverSemanticBridge {
         ReceiverAnalysisWork {
             setup_nodes: 0,
             resolution_rounds: 0,
+            hierarchy_order_steps: 0,
             summary_expansions: work
                 .call_sites
                 .saturating_add(work.memory_locations)
@@ -2851,6 +3024,9 @@ pub fn project_receiver_values(
                 CompatibilityOutcome::Complete(ranges) => ranges,
                 CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(CompatibilityOutcome::Exceeded(limit));
+                }
+                CompatibilityOutcome::Unavailable(reason) => {
+                    return Ok(CompatibilityOutcome::Unavailable(reason));
                 }
             };
             factory_ranges.push((factory, ranges));
@@ -3189,7 +3365,11 @@ pub fn definition_outcome(
     }
     let truncated = definitions.len() > limit;
     definitions.truncate(limit);
-    let outcome = if outcome.status == DefinitionLookupStatus::Unavailable {
+    let outcome = if outcome.status == DefinitionLookupStatus::Incomplete {
+        ReceiverAnalysisOutcome::Incomplete {
+            candidates: definitions,
+        }
+    } else if outcome.status == DefinitionLookupStatus::Unavailable {
         ReceiverAnalysisOutcome::Unsupported {
             reason: "canonical_facts_unavailable",
         }
@@ -3232,6 +3412,45 @@ fn resolved_member_targets(
         .collect::<Vec<_>>();
     model_type_ids.sort();
     model_type_ids.dedup();
+    if !model_type_ids.is_empty()
+        && type_outcome
+            .types
+            .iter()
+            .any(|ty| ty.semantic_model_id.is_none())
+    {
+        let mut modeled = type_outcome.clone();
+        modeled.types.retain(|ty| ty.semantic_model_id.is_some());
+        let mut workspace = type_outcome.clone();
+        workspace.types.retain(|ty| ty.semantic_model_id.is_none());
+        let modeled = resolved_member_targets(
+            analyzer,
+            &modeled,
+            member_name,
+            workspace_outcome.clone(),
+            receiver_proof.clone(),
+            budget,
+        );
+        let workspace = resolved_member_targets(
+            analyzer,
+            &workspace,
+            member_name,
+            workspace_outcome,
+            receiver_proof,
+            budget,
+        );
+        // Neither partition proves exhaustive selection across both sources.
+        let possible = |outcome| match outcome {
+            ReceiverAnalysisOutcome::Precise(candidates)
+            | ReceiverAnalysisOutcome::Ambiguous(candidates) => {
+                ReceiverAnalysisOutcome::Incomplete { candidates }
+            }
+            other => other,
+        };
+        return ReceiverAnalysisOutcome::merge_branch_outcomes(
+            [possible(modeled), possible(workspace)],
+            budget,
+        );
+    }
     if !model_type_ids.is_empty() {
         let Some(receiver_proof) = receiver_proof else {
             return ReceiverAnalysisOutcome::Unknown;
@@ -3247,6 +3466,11 @@ fn resolved_member_targets(
         let mut exhaustive_absence = true;
         for owner_id in model_type_ids {
             let owners = overlay.symbols_with_id(&owner_id);
+            if matches!(owners.disposition, SemanticModelOverlayDisposition::Open(_)) {
+                exact = false;
+                exhaustive_absence = false;
+                continue;
+            }
             let [owner] = owners.records.as_slice() else {
                 exact = false;
                 exhaustive_absence = false;
@@ -3331,6 +3555,21 @@ fn resolved_member_targets(
         && receivers.len() == 1;
     let member_precise = workspace_outcome.is_precise();
     match workspace_outcome {
+        ReceiverAnalysisOutcome::Incomplete { candidates } => {
+            let mut targets = Vec::new();
+            for receiver in &receivers {
+                for member in &candidates {
+                    targets.push(ReceiverMemberTarget::Workspace {
+                        receiver: Some(receiver.clone()),
+                        member: member.clone(),
+                    });
+                }
+            }
+            targets.truncate(budget.max_targets.saturating_add(1));
+            ReceiverAnalysisOutcome::Incomplete {
+                candidates: targets,
+            }
+        }
         ReceiverAnalysisOutcome::Precise(members) | ReceiverAnalysisOutcome::Ambiguous(members) => {
             let mut targets = Vec::new();
             for receiver in &receivers {
@@ -3364,6 +3603,44 @@ fn legacy_member_targets(
     member_outcome: ReceiverAnalysisOutcome<CodeUnit>,
     budget: ReceiverAnalysisBudget,
 ) -> ReceiverAnalysisOutcome<ReceiverMemberTarget> {
+    if let ReceiverAnalysisOutcome::Unsupported { reason } = &receiver_outcome {
+        return ReceiverAnalysisOutcome::Unsupported { reason };
+    }
+    if let ReceiverAnalysisOutcome::Unsupported { reason } = &member_outcome {
+        return ReceiverAnalysisOutcome::Unsupported { reason };
+    }
+    if let ReceiverAnalysisOutcome::ExceededBudget { limit } = &receiver_outcome {
+        return ReceiverAnalysisOutcome::ExceededBudget { limit };
+    }
+    if let ReceiverAnalysisOutcome::ExceededBudget { limit } = &member_outcome {
+        return ReceiverAnalysisOutcome::ExceededBudget { limit };
+    }
+    if matches!(receiver_outcome, ReceiverAnalysisOutcome::Incomplete { .. })
+        || matches!(member_outcome, ReceiverAnalysisOutcome::Incomplete { .. })
+    {
+        let receivers = receiver_outcome
+            .values()
+            .or_else(|| receiver_outcome.possible_candidates());
+        let members = member_outcome
+            .values()
+            .or_else(|| member_outcome.possible_candidates());
+        let mut candidates = Vec::new();
+        if let (Some(receivers), Some(members)) = (receivers, members) {
+            for receiver in receivers {
+                for member in members {
+                    let candidate = ReceiverMemberTarget::Workspace {
+                        receiver: Some(receiver.owner().clone()),
+                        member: member.clone(),
+                    };
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+        candidates.truncate(budget.max_targets.saturating_add(1));
+        return ReceiverAnalysisOutcome::Incomplete { candidates };
+    }
     let receiver_precise = receiver_outcome.is_precise();
     let member_precise = member_outcome.is_precise();
     let Some(receiver_values) = receiver_outcome.values() else {
@@ -3375,7 +3652,9 @@ fn legacy_member_targets(
             ReceiverAnalysisOutcome::ExceededBudget { limit } => {
                 ReceiverAnalysisOutcome::ExceededBudget { limit }
             }
-            ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Ambiguous(_) => {
+            ReceiverAnalysisOutcome::Precise(_)
+            | ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Incomplete { .. } => {
                 unreachable!("value-carrying receiver outcome was handled above")
             }
         };
@@ -3389,7 +3668,9 @@ fn legacy_member_targets(
             ReceiverAnalysisOutcome::ExceededBudget { limit } => {
                 ReceiverAnalysisOutcome::ExceededBudget { limit }
             }
-            ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Ambiguous(_) => {
+            ReceiverAnalysisOutcome::Precise(_)
+            | ReceiverAnalysisOutcome::Ambiguous(_)
+            | ReceiverAnalysisOutcome::Incomplete { .. } => {
                 unreachable!("value-carrying member outcome was handled above")
             }
         };
@@ -3435,6 +3716,15 @@ pub fn unowned_workspace_member_targets(
                 })
                 .collect(),
         ),
+        ReceiverAnalysisOutcome::Incomplete { candidates } => ReceiverAnalysisOutcome::Incomplete {
+            candidates: candidates
+                .into_iter()
+                .map(|member| ReceiverMemberTarget::Workspace {
+                    receiver: None,
+                    member,
+                })
+                .collect(),
+        },
         ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
         ReceiverAnalysisOutcome::Unsupported { reason } => {
             ReceiverAnalysisOutcome::Unsupported { reason }
@@ -3526,6 +3816,37 @@ pub fn budget_report(
         work,
         candidates_truncated: false,
         semantic_unsupported: None,
+        definition_diagnostics: Vec::new(),
+        possible_candidates_suppressed: false,
+        points_to: None,
+    }
+}
+
+#[doc(hidden)]
+pub fn unavailable_report(
+    operation: ReceiverQueryOperation,
+    site: ReceiverQuerySite,
+    work: ReceiverAnalysisWork,
+    reason: &'static str,
+) -> ReceiverQueryReport {
+    let analysis = match operation {
+        ReceiverQueryOperation::MemberTargets => {
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unsupported { reason })
+        }
+        ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unsupported { reason })
+        }
+    };
+    ReceiverQueryReport {
+        operation,
+        site,
+        analysis,
+        member_range: None,
+        work,
+        candidates_truncated: false,
+        semantic_unsupported: None,
+        definition_diagnostics: Vec::new(),
+        possible_candidates_suppressed: false,
         points_to: None,
     }
 }
@@ -3553,6 +3874,8 @@ pub fn unknown_report(
         work,
         candidates_truncated,
         semantic_unsupported: None,
+        definition_diagnostics: Vec::new(),
+        possible_candidates_suppressed: false,
         points_to: None,
     }
 }
@@ -3610,6 +3933,8 @@ fn values_report(
         work: analysis.work,
         candidates_truncated: analysis.candidates_truncated,
         semantic_unsupported: None,
+        definition_diagnostics: Vec::new(),
+        possible_candidates_suppressed: false,
         points_to: None,
     }
 }
@@ -3649,6 +3974,8 @@ pub fn unsupported_report(
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
         semantic_unsupported: None,
+        definition_diagnostics: Vec::new(),
+        possible_candidates_suppressed: false,
         points_to: None,
     }
 }

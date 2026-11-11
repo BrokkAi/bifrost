@@ -591,7 +591,7 @@ impl AnalyzerStore {
         let limit = i64::try_from(max_rows.saturating_add(1))
             .map_err(|_| StoreError::new("class-set procedure surface family limit exceeds i64"))?;
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tx = conn.transaction()?;
         let raws = {
             let mut statement =
                 tx.prepare_cached(CLASS_SET_PROCEDURE_SURFACE_FAMILY_SQL.as_str())?;
@@ -627,7 +627,7 @@ impl AnalyzerStore {
         digest: ClassSetSummaryDigest,
     ) -> Result<Option<ClassSetProcedureSurfaceRow>> {
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let tx = conn.transaction()?;
         let row = load_surface_for_digest(&tx, digest)?;
         tx.commit()?;
         Ok(row)
@@ -1365,7 +1365,7 @@ fn insert_surface(
     }
     for (ordinal, read) in surface.reads.iter().enumerate() {
         ensure_not_cancelled(cancellation)?;
-        let columns = ReadKeyColumns::of(read);
+        let columns = ReadKeyColumns::of(read)?;
         conn.execute(
             "INSERT INTO class_set_procedure_surface_reads(
                surface_id,read_ordinal,key_digest,kind,family,languages,rel_path,name,
@@ -1616,6 +1616,33 @@ mod tests {
                 .class_set_procedure_surface_for_digest(*expected.surface_digest())
                 .unwrap(),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn the_surface_ledger_refuses_an_external_selection_read_explicitly() {
+        // The surface read table admits only procedure-dispatch lookups, so the
+        // external-selection key is refused when the row is built instead of
+        // being dropped by a column projection.
+        let original = surface(16);
+        let mut reads = original.reads.clone();
+        reads.push(ReadKey::lookup(
+            LookupKind::ExternalSelection,
+            LookupQuestion::ExternalSelection {
+                question_digest: [7; 32],
+            },
+            StableDigest::from_array([8; 32]),
+        ));
+        let error = ClassSetProcedureSurfaceRow::try_new(
+            original.header,
+            original.calls,
+            original.lexical_children,
+            reads,
+        )
+        .expect_err("the surface ledger cannot hold an external-selection read");
+        assert!(
+            error.to_string().contains("non-procedure-dispatch read"),
+            "{error}"
         );
     }
 
@@ -2062,6 +2089,7 @@ mod tests {
             .publish_class_set_procedure_surface(surface(16), &CancellationToken::new())
             .unwrap();
         let conn = store.conn.lock().unwrap();
+        let _fixture = super::super::sealed_families::Fixture::new(&conn);
         conn.execute(
             "DELETE FROM blobs WHERE blob_oid=?1 AND lang='python'",
             params![BLOB_A],

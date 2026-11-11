@@ -58,11 +58,37 @@ fn membership_capped(conn: &Connection, set_id: i64) -> Result<bool> {
 // #8632: parent-relative open items resolve before workspace portability.
 // #8831: Target property assignments change membership; 10 because #8832/#8839 also landed 9 on master.
 // #8845: per-framework Razor path evaluation changes membership; 11 because #8831 landed 10 on master.
-pub const DERIVATION_VERSION: i64 = 11;
+// #7314: coverage reasons now include source-enumeration gaps; 13 fences coverage rows written before the reason existed.
+// #7314 AD3d: ordered MSBuild property evaluation changes membership; 14 above master's 13.
+// #10356: derived Razor SDK default Compile membership changes; 15 above master's 14.
+// #7314 AD3d EC2 r5: three-valued MSBuild conditions change membership; 16.
+// #7314 M10a0: framework instances change compilation identity; 17.
+// #7314 M10a0 part 2: named-open configuration symbols change membership; 19 above master 17.
+// #7314 AD3d EC2 r5: three-valued MSBuild conditions decide more groups, changing membership; 16 above master's 14 and #10356's 15.
+// #7314 M10a0: framework instances change compilation identity; 17 above master's 16.
+// #10342: count only compilation import enumeration evidence; derivation 18 remains above master.
+// #7314 M10a0 part 2 final merge: derivation 19 above master 18.
+pub const DERIVATION_VERSION: i64 = 20;
 /// Rotate this table identity and DERIVATION_VERSION together when SDK rules change.
-pub const IMPLICIT_SYMBOL_TABLE_VERSION: &[u8] = b"sdk-10.0.403-v1";
+pub const IMPLICIT_SYMBOL_TABLE_VERSION: &[u8] = b"sdk-10.0.403-named-open-v2";
 /// The storage language whose revisions publish compilation membership.
 pub const STORAGE_LANGUAGE: &str = "csharp";
+/// Hash selected configuration identities in unique, strictly increasing
+/// SQLite BINARY rel_path order. blob_oid is lowercase hexadecimal OID text.
+pub fn compilation_input_digest<'a>(
+    items: impl IntoIterator<Item = (&'a str, &'a str, bool)>,
+) -> [u8; 32] {
+    let mut hasher = CanonicalHasher::new(b"bifrost-csharp-compilation-inputs:v2");
+    hasher.field("implicit_symbol_table", IMPLICIT_SYMBOL_TABLE_VERSION);
+    let mut previous: Option<&str> = None;
+    for (rel_path, blob_oid, present) in items {
+        debug_assert!(previous.is_none_or(|previous| previous < rel_path));
+        previous = Some(rel_path);
+        hasher.field(rel_path, blob_oid.as_bytes());
+        hasher.field("presence", &[u8::from(present)]);
+    }
+    hasher.finish()
+}
 const MAX_CONFIGURATION_FILES: usize = 16 * 1024;
 const MAX_CONFIGURATION_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CONFIGURATION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -72,7 +98,32 @@ const MAX_CONFIGURATION_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub struct CSharpConfigurationInput {
     pub rel_path: String,
     /// `None` when the input exceeded a byte cap and was not read.
-    pub source: Option<Vec<u8>>,
+    pub source: CSharpConfigurationSource,
+}
+
+#[derive(Debug, Clone)]
+pub enum CSharpConfigurationSource {
+    Absent,
+    Bytes(Box<[u8]>),
+    Capped,
+}
+
+impl CSharpConfigurationSource {
+    pub fn as_deref(&self) -> Option<&[u8]> {
+        match self {
+            Self::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+    pub fn is_some(&self) -> bool {
+        matches!(self, Self::Bytes(_))
+    }
+    pub fn is_none(&self) -> bool {
+        !self.is_some()
+    }
+    pub fn as_ref(&self) -> Option<&[u8]> {
+        self.as_deref()
+    }
 }
 
 /// The membership rules one configuration derives.
@@ -86,7 +137,7 @@ pub struct CSharpCompilationFacts {
     pub gaps: Vec<CSharpCompilationGap>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CSharpCompilationFact {
     /// Workspace-relative project path, `None` for the implicit compilation,
     /// which holds every selected source.
@@ -108,12 +159,13 @@ pub struct CSharpCompilationFact {
 }
 
 /// One selected compilation environment. Open environments deliberately list no symbols.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CSharpSymbolEnvironment {
     pub configuration: String,
     pub target_framework: Option<String>,
     pub open_reason: Option<String>,
     pub symbols: Vec<(String, String)>,
+    pub named_open: Vec<String>,
 }
 
 impl Default for CSharpSymbolEnvironment {
@@ -123,6 +175,7 @@ impl Default for CSharpSymbolEnvironment {
             target_framework: None,
             open_reason: Some("loose_files".into()),
             symbols: Vec::new(),
+            named_open: Vec::new(),
         }
     }
 }
@@ -130,8 +183,9 @@ impl Default for CSharpSymbolEnvironment {
 impl CSharpSymbolEnvironment {
     pub fn digest(&self) -> [u8; 32] {
         debug_assert!(self.open_reason.is_none() || self.symbols.is_empty());
-        let mut hash =
-            CanonicalHasher::new(b"csharp-symbol-environment:derivation-v1:sdk-10.0.403-v1");
+        let mut hash = CanonicalHasher::new(
+            b"csharp-symbol-environment:derivation-v2:sdk-10.0.403-named-open-v2",
+        );
         hash.field("configuration", self.configuration.as_bytes());
         hash.field(
             "framework",
@@ -144,12 +198,15 @@ impl CSharpSymbolEnvironment {
         for (symbol, source) in &self.symbols {
             hash.field(source, symbol.as_bytes());
         }
+        for symbol in &self.named_open {
+            hash.field("named_open", symbol.as_bytes());
+        }
         hash.finish()
     }
 }
 
 /// Configuration facts read whole for one compilation, never retained as a workspace index.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct CSharpCompilationMetadata {
     /// None when configuration cannot establish an assembly name (including a loose compilation).
     pub assembly_name: Option<String>,
@@ -163,7 +220,7 @@ pub struct CSharpCompilationMetadata {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CSharpGlobalUsing(pub String, pub Vec<String>, pub Option<String>, pub String);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CSharpCompileItem {
     pub kind: CSharpCompileItemKind,
     /// A file, or for a tree the directory.
@@ -211,13 +268,14 @@ pub struct CSharpCompilationGap {
 pub(super) const COMPILATION_METADATA_SQL: &str =
     "SELECT assembly_name, global_usings_complete, internals_visible_to_complete,
                     json(global_usings), json(internals_visible_to)
-             FROM csharp_compilations WHERE set_id = ?1 AND project_path IS ?2";
+             FROM csharp_compilations WHERE set_id = ?1 AND compilation_id = ?2";
 
 /// Inputs to the preprocessor evaluator for one owning compilation.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CSharpOwnerEnvironment {
     pub owner_key: String,
     pub symbols: Vec<String>,
+    pub named_open: Vec<String>,
     pub closed: bool,
     pub open_reason: Option<String>,
 }
@@ -295,18 +353,18 @@ pub(super) fn decode_file_decision(
 }
 
 pub(super) const OWNER_ENVIRONMENT_SQL: &str =
-    "SELECT c.project_path, c.symbols_closed, c.open_reason, s.symbol
+    "SELECT c.project_path, c.symbols_closed, c.open_reason, s.symbol, json(c.named_open_symbols), c.target_framework
      FROM csharp_compilations AS c
      LEFT JOIN csharp_compilation_symbols AS s ON s.compilation_id = c.compilation_id
      WHERE c.compilation_id = ?1 ORDER BY s.symbol";
 
 pub(super) const SELECTED_CONFIGURATIONS_SQL: &str =
     "SELECT c.project_path, c.configuration, c.target_framework,
-            c.symbols_closed, c.open_reason, s.symbol
+            c.symbols_closed, c.open_reason, s.symbol, c.compilation_id, json(c.named_open_symbols)
      FROM csharp_compilations c
      LEFT JOIN csharp_compilation_symbols s USING(compilation_id)
      WHERE c.set_id = ?1
-     ORDER BY c.project_path";
+     ORDER BY c.compilation_id, s.symbol";
 
 pub(super) const MISSING_DECISIONS_SQL: &str = "SELECT COUNT(*)
      FROM workspace_file_versions AS files
@@ -351,6 +409,19 @@ pub(super) const UNSEEN_BRANCH_FILES_SQL: &str = "SELECT files.rel_path, blobs.p
    AND decisions.decision_digest = blobs.parse_variant
  WHERE chains.omitted_nonblank = 1";
 
+pub(super) const UNCERTIFIED_SELECTED_CSHARP_SQL: &str = "SELECT files.rel_path
+  FROM workspace_file_versions AS files INDEXED BY idx_workspace_file_versions_snapshot_kind
+  LEFT JOIN analysis_epochs AS epochs ON epochs.lang = 'csharp' AND epochs.generation = files.generation
+  LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
+  LEFT JOIN blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = 'csharp'
+    AND blobs.parse_variant = decisions.decision_digest AND blobs.generation = ?2
+  LEFT JOIN blob_meta ON blob_meta.blob_id = blobs.id AND blob_meta.is_complete = 1
+ WHERE files.workspace_id = ?1 AND files.lang = 'csharp' AND files.generation = ?2
+   AND files.input_kind = 'source'
+   AND files.valid_from <= ?3 AND (files.valid_until IS NULL OR ?3 < files.valid_until)
+   AND NOT EXISTS (SELECT 1 FROM json_each(?4) AS overlays WHERE overlays.value = files.rel_path)
+   AND (epochs.lang IS NULL OR decisions.file_version_id IS NULL OR blob_meta.blob_id IS NULL)";
+
 pub(super) const REFERENCED_SYMBOLS_SQL: &str = "SELECT symbols.symbol FROM blobs AS keys
      JOIN csharp_source_condition_symbols AS symbols ON symbols.blob_id = keys.id
      WHERE keys.blob_oid = ?1 AND keys.lang = ?2 AND keys.parse_variant = ?3
@@ -371,7 +442,7 @@ pub(super) const SELECTED_SET_SQL: &str =
      WHERE selections.workspace_id = ?1 AND selections.lang = ?2
        AND selections.generation = ?3 AND selections.revision = ?4";
 
-const CONFIGURATION_IDENTITIES_SQL: &str = "SELECT rel_path, blob_oid
+const CONFIGURATION_IDENTITIES_SQL: &str = "SELECT rel_path, blob_oid, file_present
      FROM workspace_file_versions
      WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
        AND input_kind = 'configuration'
@@ -379,7 +450,7 @@ const CONFIGURATION_IDENTITIES_SQL: &str = "SELECT rel_path, blob_oid
      ORDER BY rel_path";
 
 const CONFIGURATION_BYTES_SQL: &str = "SELECT versions.rel_path, length(retained.source_bytes),
-            CASE WHEN length(retained.source_bytes) <= ?5 THEN retained.source_bytes END
+            CASE WHEN length(retained.source_bytes) <= ?5 THEN retained.source_bytes END, versions.file_present
      FROM workspace_file_versions AS versions
      LEFT JOIN workspace_input_sources AS retained ON retained.content_oid = versions.blob_oid
      WHERE versions.workspace_id = ?1 AND versions.lang = ?2 AND versions.generation = ?3
@@ -502,24 +573,38 @@ pub(super) fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> R
     let Some(_support) = super::store_language_support(crate::analyzer::Language::CSharp) else {
         return Ok(());
     };
+    // Legacy empty probes have unknown presence. Refuse before consulting any
+    // retained selection or set identity, even when a file cap omits the row.
+    let unvalidated: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_file_versions WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND input_kind='configuration' AND file_present IS NULL AND valid_from<=?4 AND (valid_until IS NULL OR ?4<valid_until))",
+        snapshot_params(snapshot), |row| row.get(0),
+    )?;
+    if unvalidated {
+        return Ok(());
+    }
     let selected = selected_set_record(tx, snapshot)?.map(|(_, version)| version);
     if selected == Some(DERIVATION_VERSION) {
         return Ok(());
     }
 
-    let mut hasher = CanonicalHasher::new(b"bifrost-csharp-compilation-inputs:v1");
-    hasher.field("implicit_symbol_table", IMPLICIT_SYMBOL_TABLE_VERSION);
+    let mut identities = Vec::new();
     {
-        let mut identities = tx.prepare_cached(CONFIGURATION_IDENTITIES_SQL)?;
-        let mut rows = identities.query(snapshot_params(snapshot))?;
+        let mut statement = tx.prepare_cached(CONFIGURATION_IDENTITIES_SQL)?;
+        let mut rows = statement.query(snapshot_params(snapshot))?;
         while let Some(row) = rows.next()? {
-            hasher.field(
-                &row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?.as_bytes(),
-            );
+            identities.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<bool>>(2)?
+                    .expect("selected inputs validated presence"),
+            ));
         }
     }
-    let input_digest = hasher.finish();
+    let input_digest = compilation_input_digest(
+        identities
+            .iter()
+            .map(|(path, oid, present)| (path.as_str(), oid.as_str(), *present)),
+    );
     let set_id = if let Some(set_id) = existing_set(
         tx,
         &snapshot.workspace_id,
@@ -659,6 +744,7 @@ fn selected_inputs(
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<usize>>(1)?,
                 row.get::<_, Option<Vec<u8>>>(2)?,
+                row.get::<_, Option<bool>>(3)?,
             ))
         },
     )?;
@@ -666,13 +752,16 @@ fn selected_inputs(
 }
 
 fn bounded_configuration_inputs(
-    rows: impl IntoIterator<Item = Result<(String, Option<usize>, Option<Vec<u8>>)>>,
+    rows: impl IntoIterator<Item = Result<(String, Option<usize>, Option<Vec<u8>>, Option<bool>)>>,
 ) -> Result<Option<(Vec<CSharpConfigurationInput>, Vec<CSharpCompilationGap>)>> {
     let mut inputs = Vec::new();
     let mut gaps = Vec::new();
     let mut total = 0_usize;
     for row in rows {
-        let (rel_path, length, source) = row?;
+        let (rel_path, length, source, present) = row?;
+        let Some(present) = present else {
+            return Ok(None);
+        };
         if inputs.len() == MAX_CONFIGURATION_FILES {
             gaps.push(CSharpCompilationGap {
                 code: CONFIGURATION_FILE_CAP.into(),
@@ -700,6 +789,13 @@ fn bounded_configuration_inputs(
                 None
             }
             None => None,
+        };
+        let source = if !present {
+            CSharpConfigurationSource::Absent
+        } else {
+            source
+                .map(|bytes| CSharpConfigurationSource::Bytes(bytes.into_boxed_slice()))
+                .unwrap_or(CSharpConfigurationSource::Capped)
         };
         inputs.push(CSharpConfigurationInput { rel_path, source });
     }
@@ -805,8 +901,8 @@ fn insert_set(
                set_id, project_path, references_complete, transitive_flow,
                assembly_name, global_usings_complete, internals_visible_to_complete,
                global_usings, internals_visible_to, configuration, target_framework,
-               symbols_closed, open_reason, symbol_set_digest, inventory_open, inventory_gap_indices
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), ?10, ?11, ?12, ?13, ?14, ?15, jsonb(?16))",
+               symbols_closed, open_reason, symbol_set_digest, inventory_open, inventory_gap_indices, named_open_symbols
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), ?10, ?11, ?12, ?13, ?14, ?15, jsonb(?16), jsonb(?17))",
         )?;
         let mut items = tx.prepare_cached(
             "INSERT INTO csharp_compilation_items(
@@ -847,7 +943,8 @@ fn insert_set(
                 compilation.symbols.digest().as_slice(),
                 !compilation.inventory_gap_indices.is_empty(),
                 serde_json::to_string(&compilation.inventory_gap_indices)
-                    .expect("indices serialize")
+                    .expect("indices serialize"),
+                serde_json::to_string(&compilation.symbols.named_open).expect("symbols serialize")
             ])?;
             let compilation_id = tx.last_insert_rowid();
             for (symbol, source) in &compilation.symbols.symbols {
@@ -858,8 +955,12 @@ fn insert_set(
             }
             if let Some(path) = compilation.project_path.as_deref() {
                 assert!(
-                    ids.insert(path, compilation_id).is_none(),
-                    "one compilation per project path: {path}"
+                    ids.insert(
+                        (path, compilation.symbols.target_framework.as_deref()),
+                        compilation_id
+                    )
+                    .is_none(),
+                    "one compilation per project and framework: {path}"
                 );
             }
             for (ordinal, item) in compilation.items.iter().enumerate() {
@@ -895,10 +996,23 @@ fn insert_set(
             continue;
         };
         for reference in &compilation.references {
-            let target = ids.get(reference.as_str()).unwrap_or_else(|| {
+            // Multi-target references must have been retained as typed open
+            // edges by evaluation until nearest-framework selection is available.
+            let mut targets = ids.iter().filter(|((project, _), _)| *project == reference);
+            let (_, target) = targets.next().unwrap_or_else(|| {
                 panic!("{path} references {reference}, which is not a compilation in its set")
             });
-            edges.execute(params![ids[path], target])?;
+            if targets.next().is_some() {
+                assert!(
+                    !compilation.references_complete,
+                    "an ambiguous framework reference cannot be complete"
+                );
+                continue;
+            }
+            edges.execute(params![
+                ids[&(path, compilation.symbols.target_framework.as_deref())],
+                target
+            ])?;
         }
     }
     Ok(CSharpCompilationSetRef {
@@ -912,6 +1026,7 @@ pub struct SelectedCSharpCompilations<'a> {
     conn: ReaderGuard<'a>,
     snapshot: WorkspaceSnapshotId,
     set_id: i64,
+    input_digest: [u8; 32],
     // Derived predicate of this immutable selected set; never declaration authority.
     membership_capped: bool,
 }
@@ -922,6 +1037,7 @@ pub struct SelectedCSharpCompilationConfiguration {
     pub configuration: String,
     pub target_framework: Option<String>,
     pub symbols: Vec<String>,
+    pub named_open: Vec<String>,
     pub closed: bool,
     pub open_reason: Option<String>,
 }
@@ -954,9 +1070,16 @@ impl AnalyzerStore {
         let owner_key = row
             .get::<_, Option<String>>(0)?
             .unwrap_or_else(|| "\0loose".into());
+        let owner_key = match row.get::<_, Option<String>>(5)? {
+            Some(framework) => format!("{owner_key} [TargetFramework={framework}]"),
+            None => owner_key,
+        };
         let mut environment = CSharpOwnerEnvironment {
             owner_key,
             symbols: Vec::new(),
+            named_open: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|e| {
+                super::StoreError::corrupt(format!("invalid C# named open symbols: {e}"))
+            })?,
             closed: row.get(1)?,
             open_reason: row.get(2)?,
         };
@@ -1066,77 +1189,134 @@ impl AnalyzerStore {
     ) -> Result<Vec<UnseenBranchFile>> {
         assert_eq!(snapshot.lang, "csharp");
         let conn = self.checkout_read_conn()?;
-        let mut stmt = conn.prepare_cached(UNSEEN_BRANCH_FILES_SQL)?;
-        let rows = stmt.query_map(
-            params![
-                snapshot.workspace_id.as_str(),
-                snapshot.generation.0,
-                snapshot.revision
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    UndecidedChainRow {
-                        chain: row.get(2)?,
-                        directive_start: row.get(3)?,
-                        directive_end: row.get(4)?,
-                        omitted_nonblank: row.get(5)?,
-                        invalid_condition: row.get(6)?,
-                        unknown_symbols: serde_json::from_str(&row.get::<_, String>(7)?).map_err(
-                            |e| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    7,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(e),
-                                )
-                            },
-                        )?,
-                        open_reasons: serde_json::from_str(&row.get::<_, String>(8)?).map_err(
-                            |e| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    8,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(e),
-                                )
-                            },
-                        )?,
-                        disagreeing_owners: serde_json::from_str(&row.get::<_, String>(9)?)
-                            .map_err(|e| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    9,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(e),
-                                )
-                            })?,
-                    },
-                ))
-            },
-        )?;
-        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.chain.cmp(&b.2.chain)));
-        let mut files: Vec<UnseenBranchFile> = Vec::new();
-        for row in rows {
-            let (rel_path, variant, chain) = row;
-            let variant: [u8; 32] = variant
-                .try_into()
-                .map_err(|_| super::StoreError::corrupt("invalid C# variant digest"))?;
-            if files.last().is_none_or(|file| file.rel_path != rel_path) {
-                files.push(UnseenBranchFile {
-                    rel_path,
-                    variant,
-                    chains: Vec::new(),
-                });
-            }
-            files
-                .last_mut()
-                .expect("one file pushed")
-                .chains
-                .push(chain);
-        }
-        Ok(files)
+        read_unseen_branch_files(&conn, snapshot)
     }
 
+    /// Inventory-first certificate and the published nonempty chains from one read transaction.
+    pub fn csharp_selected_unseen_branch_census(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        captured_generation: GenerationId,
+        overlay_paths: &[String],
+    ) -> Result<SelectedUnseenBranchCensus> {
+        assert_eq!(snapshot.lang, "csharp");
+        assert_eq!(captured_generation, snapshot.generation);
+        let mut conn = self.checkout_read_conn()?;
+        let tx = conn.transaction()?;
+        super::require_current_generation(&tx, "csharp", captured_generation)?;
+        let overlays = serde_json::to_string(overlay_paths).expect("overlay paths serialize");
+        let mut stmt = tx.prepare_cached(UNCERTIFIED_SELECTED_CSHARP_SQL)?;
+        let mut paths = stmt.query(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.0,
+            snapshot.revision,
+            overlays
+        ])?;
+        let mut uncertified_count = 0u64;
+        let mut sample = Vec::new();
+        while let Some(row) = paths.next()? {
+            uncertified_count += 1;
+            if sample.len() < 5 {
+                sample.push(row.get(0)?);
+            }
+        }
+        drop(paths);
+        drop(stmt);
+        let mut rows = read_unseen_branch_files(&tx, snapshot)?;
+        let overlay_set: crate::hash::HashSet<&str> =
+            overlay_paths.iter().map(String::as_str).collect();
+        rows.retain(|row| !overlay_set.contains(row.rel_path.as_str()));
+        tx.commit()?;
+        Ok(SelectedUnseenBranchCensus {
+            uncertified_count,
+            sample,
+            rows,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct SelectedUnseenBranchCensus {
+    pub uncertified_count: u64,
+    pub sample: Vec<String>,
+    pub rows: Vec<UnseenBranchFile>,
+}
+
+fn read_unseen_branch_files(
+    conn: &rusqlite::Connection,
+    snapshot: &WorkspaceSnapshotId,
+) -> Result<Vec<UnseenBranchFile>> {
+    let mut stmt = conn.prepare_cached(UNSEEN_BRANCH_FILES_SQL)?;
+    let rows = stmt.query_map(
+        params![
+            snapshot.workspace_id.as_str(),
+            snapshot.generation.0,
+            snapshot.revision
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                UndecidedChainRow {
+                    chain: row.get(2)?,
+                    directive_start: row.get(3)?,
+                    directive_end: row.get(4)?,
+                    omitted_nonblank: row.get(5)?,
+                    invalid_condition: row.get(6)?,
+                    unknown_symbols: serde_json::from_str(&row.get::<_, String>(7)?).map_err(
+                        |e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        },
+                    )?,
+                    open_reasons: serde_json::from_str(&row.get::<_, String>(8)?).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                    disagreeing_owners: serde_json::from_str(&row.get::<_, String>(9)?).map_err(
+                        |e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                9,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        },
+                    )?,
+                },
+            ))
+        },
+    )?;
+    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.chain.cmp(&b.2.chain)));
+    let mut files: Vec<UnseenBranchFile> = Vec::new();
+    for row in rows {
+        let (rel_path, variant, chain) = row;
+        let variant: [u8; 32] = variant
+            .try_into()
+            .map_err(|_| super::StoreError::corrupt("invalid C# variant digest"))?;
+        if files.last().is_none_or(|file| file.rel_path != rel_path) {
+            files.push(UnseenBranchFile {
+                rel_path,
+                variant,
+                chains: Vec::new(),
+            });
+        }
+        files
+            .last_mut()
+            .expect("one file pushed")
+            .chains
+            .push(chain);
+    }
+    Ok(files)
+}
+
+impl AnalyzerStore {
     /// Referenced symbols of the exact immutable variant, in symbol order.
     #[doc(hidden)]
     pub fn csharp_referenced_symbols(&self, key: &crate::gitblob::BlobKey) -> Result<Vec<String>> {
@@ -1159,7 +1339,7 @@ impl AnalyzerStore {
         generation: super::GenerationId,
         captured: &[super::workspace_inputs::WorkspaceConfigurationInput],
     ) -> Result<Option<CSharpCompilationSetRef>> {
-        let mut hasher = CanonicalHasher::new(b"bifrost-csharp-compilation-inputs:v1");
+        let mut hasher = CanonicalHasher::new(b"bifrost-csharp-compilation-inputs:v2");
         hasher.field("implicit_symbol_table", IMPLICIT_SYMBOL_TABLE_VERSION);
         let mut previous: Option<&str> = None;
         for input in captured {
@@ -1172,6 +1352,7 @@ impl AnalyzerStore {
                 &input.relative_path,
                 input.content_oid().to_string().as_bytes(),
             );
+            hasher.field("presence", &[u8::from(input.file_present)]);
         }
         let input_digest = hasher.finish();
         let (inputs, gaps) = bounded_configuration_inputs(captured.iter().map(|input| {
@@ -1180,6 +1361,7 @@ impl AnalyzerStore {
                 input.relative_path.clone(),
                 Some(bytes.len()),
                 (bytes.len() <= MAX_CONFIGURATION_FILE_BYTES).then(|| bytes.to_vec()),
+                Some(input.file_present),
             ))
         }))?
         .expect("captured configuration inputs retain their bytes");
@@ -1231,13 +1413,23 @@ impl AnalyzerStore {
             return Ok(None);
         };
         let membership_capped = membership_capped(&conn, set_id.id)?;
+        let input_digest = selected_input_digest(&conn, set_id.id)?;
         Ok(Some(SelectedCSharpCompilations {
             conn,
             snapshot: snapshot.clone(),
             set_id: set_id.id,
+            input_digest,
             membership_capped,
         }))
     }
+}
+
+fn selected_input_digest(conn: &Connection, set_id: i64) -> Result<[u8; 32]> {
+    Ok(conn.query_row(
+        "SELECT input_digest FROM csharp_compilation_sets WHERE set_id=?1",
+        [set_id],
+        |row| row.get(0),
+    )?)
 }
 
 fn selected_set_record(
@@ -1270,28 +1462,56 @@ fn selected_set(
 
 /// A borrowed view of one revision's compilation rules, with no retained rows.
 /// The shared selection's connection is the one an operation already holds;
-/// a second checkout would deadlock a single-connection store. The production
+/// a second checkout would deadlock a test-only single-connection store. The production
 /// owner keeps its ReaderGuard and delegates each read through this view.
 pub(super) struct CSharpCompilationView<'a> {
     conn: &'a Connection,
     snapshot: &'a WorkspaceSnapshotId,
     set_id: i64,
+    #[allow(dead_code)] // Consumed when the native read slice adds certification.
+    input_digest: [u8; 32],
     // Derived predicate of this immutable selected set; never declaration authority.
     membership_capped: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CSharpSelectedHandle {
+    pub snapshot: WorkspaceSnapshotId,
+    pub set_id: i64,
+    pub input_digest: [u8; 32],
+    pub membership_capped: bool,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+pub struct CertifiedCSharpHandle(pub(super) CSharpSelectedHandle);
+
+#[cfg(any(test, feature = "test-support"))]
+impl CertifiedCSharpHandle {
+    /// Direct reader fixtures only; production obtains this through certification.
+    pub fn unchecked_for_test(
+        conn: &Connection,
+        snapshot: &WorkspaceSnapshotId,
+    ) -> Result<Option<Self>> {
+        Ok(CSharpCompilationView::selected(conn, snapshot)?.map(|view| Self(view.handle())))
+    }
+}
+
 impl SelectedCSharpCompilations<'_> {
+    pub fn input_digest(&self) -> [u8; 32] {
+        self.input_digest
+    }
     /// Configuration rows for rendering one selected set in one request.
     pub fn configurations(&self) -> Result<Vec<SelectedCSharpCompilationConfiguration>> {
         let mut statement = self.conn.prepare_cached(SELECTED_CONFIGURATIONS_SQL)?;
         let mut rows = statement.query([self.set_id])?;
         let mut configurations: Vec<SelectedCSharpCompilationConfiguration> = Vec::new();
+        let mut last_compilation_id = None;
         while let Some(row) = rows.next()? {
             let project_path: Option<String> = row.get(0)?;
-            if configurations
-                .last()
-                .is_none_or(|last| last.project_path != project_path)
-            {
+            let compilation_id: i64 = row.get(6)?;
+            if last_compilation_id != Some(compilation_id) {
+                last_compilation_id = Some(compilation_id);
                 configurations.push(SelectedCSharpCompilationConfiguration {
                     project_path,
                     configuration: row.get(1)?,
@@ -1299,6 +1519,9 @@ impl SelectedCSharpCompilations<'_> {
                     closed: row.get(3)?,
                     open_reason: row.get(4)?,
                     symbols: Vec::new(),
+                    named_open: serde_json::from_str(&row.get::<_, String>(7)?).map_err(|e| {
+                        super::StoreError::corrupt(format!("invalid C# named open symbols: {e}"))
+                    })?,
                 });
             }
             if let Some(symbol) = row.get(5)? {
@@ -1323,16 +1546,14 @@ impl SelectedCSharpCompilations<'_> {
             conn: &self.conn,
             snapshot: &self.snapshot,
             set_id: self.set_id,
+            input_digest: self.input_digest,
             membership_capped: self.membership_capped,
         }
     }
 
     /// Assembly and compilation-wide imports for one selected compilation.
-    pub fn metadata(
-        &self,
-        project_path: Option<&str>,
-    ) -> Result<Option<CSharpCompilationMetadata>> {
-        self.view().metadata(project_path)
+    pub fn metadata(&self, compilation_id: i64) -> Result<Option<CSharpCompilationMetadata>> {
+        self.view().metadata(compilation_id)
     }
 
     /// Whether the rules state all source membership.
@@ -1386,6 +1607,17 @@ pub struct CSharpOpenInventory {
     pub gaps: Vec<CSharpCompilationGap>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static SOURCE_ENUMERATION_RECOMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn source_enumeration_recomputes_for_test() -> usize {
+    SOURCE_ENUMERATION_RECOMPUTES.with(std::cell::Cell::get)
+}
+
 /// One file's placements. Open compilations never erase independent proven ones.
 #[derive(Debug, Default)]
 pub struct CSharpMembership {
@@ -1434,7 +1666,37 @@ pub(super) enum SelectedCSharpMembership {
 }
 
 impl<'a> CSharpCompilationView<'a> {
-    pub(super) fn selected(
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn handle(&self) -> CSharpSelectedHandle {
+        CSharpSelectedHandle {
+            snapshot: self.snapshot.clone(),
+            set_id: self.set_id,
+            input_digest: self.input_digest,
+            membership_capped: self.membership_capped,
+        }
+    }
+
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    pub(super) fn certified(
+        conn: &'a Connection,
+        snapshot: &'a WorkspaceSnapshotId,
+        certified: &CertifiedCSharpHandle,
+    ) -> Self {
+        assert_eq!(snapshot, &certified.0.snapshot);
+        Self {
+            conn,
+            snapshot,
+            set_id: certified.0.set_id,
+            input_digest: certified.0.input_digest,
+            membership_capped: certified.0.membership_capped,
+        }
+    }
+    // The native read slice consumes this captured identity.
+    #[allow(dead_code)]
+    pub(super) fn input_digest(&self) -> [u8; 32] {
+        self.input_digest
+    }
+    pub(in crate::analyzer::store::csharp_compilation) fn selected(
         conn: &'a Connection,
         snapshot: &'a WorkspaceSnapshotId,
     ) -> Result<Option<Self>> {
@@ -1446,6 +1708,7 @@ impl<'a> CSharpCompilationView<'a> {
             conn,
             snapshot,
             set_id: set_id.id,
+            input_digest: selected_input_digest(conn, set_id.id)?,
             membership_capped,
         }))
     }
@@ -1453,13 +1716,13 @@ impl<'a> CSharpCompilationView<'a> {
     /// Assembly and compilation-wide imports for one member of this selection.
     pub(super) fn metadata(
         &self,
-        project_path: Option<&str>,
+        compilation_id: i64,
     ) -> Result<Option<CSharpCompilationMetadata>> {
         let row = self
             .conn
             .query_row(
                 COMPILATION_METADATA_SQL,
-                params![self.set_id, project_path],
+                params![self.set_id, compilation_id],
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
@@ -1600,7 +1863,12 @@ impl<'a> CSharpCompilationView<'a> {
         if changed {
             return self.unproven_selected_membership(rel_path, "configuration_replaced");
         }
-        self.evaluate_membership(rel_path)
+        let membership = if self.membership_capped {
+            capped_membership(self.conn, self.set_id, rel_path)?
+        } else {
+            compilations_of_set(self.conn, self.set_id, rel_path)?
+        };
+        self.with_file_program_evidence(membership, mount.blob_id(), rel_path)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1626,10 +1894,69 @@ impl<'a> CSharpCompilationView<'a> {
     /// of how the caller proved that the source belongs to its selection.
     pub(super) fn evaluate_membership(&self, rel_path: &str) -> Result<SelectedCSharpMembership> {
         if self.membership_capped {
-            capped_membership(self.conn, self.set_id, rel_path)
-        } else {
-            compilations_of_set(self.conn, self.set_id, rel_path)
+            return capped_membership(self.conn, self.set_id, rel_path);
         }
+        let membership = compilations_of_set(self.conn, self.set_id, rel_path)?;
+        // The file-program obligation applies only to a source no compilation
+        // claims. The selected-blob lookup it needs is one statement per
+        // membership evaluation, so ordinary members must not pay for it.
+        if !matches!(
+            &membership,
+            SelectedCSharpMembership::Proven(members)
+                if members.proven.is_empty() && members.open.is_empty()
+        ) {
+            return Ok(membership);
+        }
+        let blob = self.conn.query_row(
+            "SELECT blobs.id FROM workspace_file_versions files
+             JOIN csharp_file_version_decisions decisions USING(file_version_id)
+             JOIN blobs ON blobs.blob_oid=files.blob_oid AND blobs.lang=files.lang
+               AND blobs.generation=files.generation AND blobs.parse_variant=decisions.decision_digest
+             WHERE files.workspace_id=?1 AND files.lang='csharp' AND files.generation=?2
+               AND files.rel_path=?3 AND files.input_kind='source'
+               AND files.valid_from<=?4 AND (files.valid_until IS NULL OR ?4<files.valid_until)",
+            params![self.snapshot.workspace_id.as_str(), self.snapshot.generation.0,
+                rel_path, self.snapshot.revision], |row| row.get::<_, i64>(0),
+        ).optional()?;
+        match blob {
+            Some(blob) => self.with_file_program_evidence(membership, blob, rel_path),
+            None => Ok(membership),
+        }
+    }
+
+    fn with_file_program_evidence(
+        &self,
+        membership: SelectedCSharpMembership,
+        blob: i64,
+        _rel_path: &str,
+    ) -> Result<SelectedCSharpMembership> {
+        if let SelectedCSharpMembership::Proven(ref members) = membership
+            && members.proven.is_empty()
+            && members.open.is_empty()
+        {
+            let evidence: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM resolution_gap_reasons WHERE blob_id=?1 AND origin=?2)",
+                params![blob, super::resolution_prepare::resolution_rows::gap_origin_code(
+                    crate::analyzer::resolution::LoweringGapOrigin::Extracted(
+                        brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::FileProgramEvidence))],
+                |row| row.get(0),
+            )?;
+            if evidence {
+                return Ok(SelectedCSharpMembership::Unproven {
+                    #[cfg(any(test, feature = "test-support"))]
+                    code: "file_program_unevaluated",
+                    #[cfg(any(test, feature = "test-support"))]
+                    evidence: format!("file_program_unevaluated: {_rel_path}"),
+                    #[cfg(any(test, feature = "test-support"))]
+                    gaps: vec![CSharpCompilationGap {
+                        code: "file_program_unevaluated".into(),
+                        path: _rel_path.into(),
+                        evidence: "file program membership has not been evaluated".into(),
+                    }],
+                });
+            }
+        }
+        Ok(membership)
     }
 
     /// Every compilation `root` reaches over any ProjectReference edge,
@@ -1708,6 +2035,21 @@ impl<'a> CSharpCompilationView<'a> {
             })
             .collect())
     }
+}
+
+pub(super) fn selected_csharp_handle(
+    conn: &Connection,
+    snapshot: &WorkspaceSnapshotId,
+) -> Result<Option<CSharpSelectedHandle>> {
+    let Some(set_id) = selected_set(conn, snapshot)? else {
+        return Ok(None);
+    };
+    Ok(Some(CSharpSelectedHandle {
+        snapshot: snapshot.clone(),
+        set_id: set_id.id,
+        input_digest: selected_input_digest(conn, set_id.id)?,
+        membership_capped: membership_capped(conn, set_id.id)?,
+    }))
 }
 
 fn capped_membership(
@@ -1872,7 +2214,7 @@ pub fn verify_using_counts_for_test(conn: &Connection) {
         extent::content_available(&tx, "csharp", blob).unwrap();
         extent::content_available(&tx, "csharp", blob).unwrap();
     }
-    let mut statement=tx.prepare("SELECT workspace_id,generation,compilation_id,valid_from,publications_expected,publications_installed FROM csharp_compilation_using_coverage").unwrap();
+    let mut statement=tx.prepare("SELECT workspace_id,generation,compilation_id,valid_from,publications_expected,publications_installed,membership_complete,metadata_complete,json(reasons) FROM csharp_compilation_using_coverage").unwrap();
     let mut rows = statement.query([]).unwrap();
     while let Some(row) = rows.next().unwrap() {
         let workspace: String = row.get(0).unwrap();
@@ -1888,15 +2230,33 @@ pub fn verify_using_counts_for_test(conn: &Connection) {
                     generation,
                     compilation,
                     revision,
-                    crate::analyzer::store::resolution::resolution_bundle_epoch(
-                        crate::analyzer::Language::CSharp
-                    ),
+                    tx.query_row(
+                        "SELECT producer_epoch FROM resolution_producer_epochs WHERE lang='csharp'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .unwrap(),
                     0
                 ],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(actual, expected, "{workspace}/{compilation}@{revision}");
+        let source_enumeration =
+            extent::source_enumeration_paths(&tx, &workspace, generation, compilation, revision)
+                .unwrap();
+        assert_eq!(
+            row.get::<_, String>(8).unwrap(),
+            extent::coverage_reasons(
+                row.get(6).unwrap(),
+                row.get(7).unwrap(),
+                expected.0,
+                expected.1,
+                &source_enumeration
+            ),
+            "{workspace}/{compilation}@{revision}: reasons follow the evidence"
+        );
     }
 }
 
@@ -1965,8 +2325,50 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10342: local covering gaps poisoned global using certificates"
+    )]
+    fn csharp_compilation_enumeration_predicates_follow_error_edits() {
+        use super::super::resolution_prepare::resolution_rows::gap_origin_code;
+        use crate::analyzer::resolution::LoweringGapOrigin;
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind;
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let _fixture = super::super::sealed_families::Fixture::new(&conn);
+        conn.execute_batch("INSERT INTO blobs(id,blob_oid,lang,generation) VALUES(1,'1111111111111111111111111111111111111111','csharp',1);
+            INSERT INTO resolution_fragment_interiors(blob_id,lang,semantic_language,producer_epoch,interior_digest,logical_rows,payload_bytes,publication_state,expected_semantic_site_count) VALUES(1,'csharp','csharp','test',zeroblob(32),1,0,'complete',0);
+            INSERT INTO resolution_gap_reasons VALUES(1,0,0,0);
+            INSERT INTO resolution_gaps VALUES(1,1,0,0,0,0);
+            CREATE TEMP TABLE selected_csharp_compilation_members(compilation_id INTEGER,rel_path TEXT,blob_id INTEGER);
+            INSERT INTO selected_csharp_compilation_members VALUES(1,'Peer.cs',1);").unwrap();
+        for (kind, incomplete) in [
+            (ResolutionGapKind::UnsupportedRoute, false),
+            (ResolutionGapKind::CompilationImportsUnenumerated, true),
+            (ResolutionGapKind::UnsupportedRoute, false),
+        ] {
+            conn.execute(
+                "UPDATE resolution_gap_reasons SET origin=?1",
+                [gap_origin_code(LoweringGapOrigin::Extracted(kind))],
+            )
+            .unwrap();
+            let delta: bool = conn
+                .query_row(extent::BLOB_COVERING_GAP_SQL, [1], |row| row.get(0))
+                .unwrap();
+            let overlay: String = conn
+                .query_row(extent::OVERLAY_COUNTS_SQL, [1], |row| row.get(2))
+                .unwrap();
+            assert_eq!(delta, incomplete);
+            assert_eq!(overlay, if incomplete { "[\"Peer.cs\"]" } else { "[]" });
+        }
+    }
+
+    #[test]
     fn csharp_compilation_readers_plan_on_membership_indexes() {
-        let store = AnalyzerStore::open_ephemeral_temp_file(&Default::default()).unwrap();
+        let store = AnalyzerStore::open_ephemeral_temp_file(
+            &Default::default(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
+        )
+        .unwrap();
         let conn = store.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
@@ -2016,8 +2418,8 @@ mod tests {
                 .prepare(
                     "INSERT INTO workspace_file_versions(
                        workspace_id, lang, generation, rel_path, blob_oid, input_kind,
-                       projection_digest, valid_from
-                     ) VALUES(?1, 'csharp', ?2, ?3, ?4, 'configuration', NULL, ?5)",
+                       projection_digest, valid_from, file_present
+                     ) VALUES(?1, 'csharp', ?2, ?3, ?4, 'configuration', NULL, ?5, 1)",
                 )
                 .unwrap();
             for (index, rel_path) in [
@@ -2231,10 +2633,10 @@ mod tests {
             );
             tx.commit().unwrap();
         }
-        let cases: [(&str, Vec<Vec<&str>>); 23] = [
+        let cases: [(&str, Vec<Vec<&str>>); 31] = [
             (
                 "csharp_compilation_metadata",
-                vec![vec!["sqlite_autoindex_csharp_compilations"]],
+                vec![vec!["USING INTEGER PRIMARY KEY"]],
             ),
             (
                 "csharp_owner_environment",
@@ -2243,7 +2645,7 @@ mod tests {
             (
                 "csharp_selected_configurations",
                 vec![
-                    vec!["sqlite_autoindex_csharp_compilations"],
+                    vec!["idx_csharp_compilations_set_instance"],
                     vec!["USING COVERING INDEX", "USING PRIMARY KEY"],
                 ],
             ),
@@ -2343,6 +2745,40 @@ mod tests {
                 vec![vec!["sqlite_autoindex_csharp_compilations"]],
             ),
             (
+                "csharp_uncertified_selected",
+                vec![
+                    vec!["idx_workspace_file_versions_snapshot_kind"],
+                    vec!["SEARCH decisions USING INTEGER PRIMARY KEY"],
+                    vec![
+                        "SEARCH blobs USING COVERING INDEX",
+                        "SEARCH blobs USING INDEX",
+                    ],
+                    vec!["SEARCH blob_meta USING PRIMARY KEY"],
+                ],
+            ),
+            (
+                "csharp_extent_source_enumeration",
+                vec![vec!["idx_csharp_members_snapshot"]],
+            ),
+            (
+                "csharp_extent_path_source_enumeration",
+                vec![vec!["idx_csharp_members_path"]],
+            ),
+            ("csharp_extent_overlay_counts", vec![]),
+            (
+                "csharp_extent_blob_covering_gap",
+                vec![
+                    vec!["SEARCH g USING PRIMARY KEY"],
+                    vec!["SEARCH r USING PRIMARY KEY"],
+                ],
+            ),
+            (
+                "csharp_extent_stored_source_enumeration",
+                vec![vec!["USING PRIMARY KEY", "USING COVERING INDEX"]],
+            ),
+            ("csharp_selected_global_using_coverage", vec![]),
+            ("csharp_selected_global_using_sites", vec![]),
+            (
                 "csharp_unseen_branch_files",
                 vec![
                     vec!["SCAN chains USING INDEX idx_csharp_undecided_chains_nonblank"],
@@ -2375,6 +2811,29 @@ mod tests {
             for (name, required) in &cases {
                 let query = pinned(name);
                 let plan = explain_pin(&conn, &query);
+                if name.contains("source_enumeration")
+                    || name.contains("covering_gap")
+                    || name.contains("global_using")
+                    || *name == "csharp_extent_overlay_counts"
+                {
+                    // Only one-row constants, JSON of one value, the one-row
+                    // extent state and a compilation's staged members may be
+                    // scanned; every persisted table is reached by an index.
+                    for detail in &plan {
+                        assert!(
+                            !detail.starts_with("SCAN ")
+                                || [
+                                    "SCAN CONSTANT ROW",
+                                    "SCAN j VIRTUAL TABLE",
+                                    "SCAN m",
+                                    "SCAN temp.selected_csharp_extent_state"
+                                ]
+                                .iter()
+                                .any(|allowed| detail.starts_with(allowed)),
+                            "{state} {name}: scanned a table: {plan:#?}"
+                        );
+                    }
+                }
                 if *name == "csharp_unseen_branch_files" {
                     assert!(
                         plan.first().is_some_and(|line| line.contains(
@@ -2555,6 +3014,133 @@ mod tests {
     }
 
     #[test]
+    fn selected_source_census_counts_missing_and_incomplete_publications() {
+        use super::super::{BlobKey, ParseVariant, WorkspaceFileRow, WorkspaceId};
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("csharp", "census-fixture")
+            .unwrap();
+        let workspace = WorkspaceId("a".repeat(64));
+        let names = [
+            "Flagged.cs",
+            "Empty.cs",
+            "Incomplete.cs",
+            "MissingBlob.cs",
+            "MissingDecision.cs",
+        ];
+        let oids = (1..=5)
+            .map(|n| git2::Oid::from_str(&format!("{n:040x}")).unwrap())
+            .collect::<Vec<_>>();
+        let files = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| WorkspaceFileRow {
+                rel_path: (*name).into(),
+                blob_oid: oids[i],
+                decision: (i != 4).then_some(FileVersionDecision {
+                    decision_digest: [i as u8 + 1; 32],
+                    assignment_digest: [i as u8 + 1; 32],
+                }),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = store
+            .sync_workspace_inputs_for_workspace(
+                &workspace,
+                "csharp",
+                generation,
+                &files,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let keys = (0..3)
+            .map(|i| BlobKey {
+                oid: oids[i],
+                lang: "csharp".into(),
+                variant: ParseVariant::Digest([i as u8 + 1; 32]),
+            })
+            .collect::<Vec<_>>();
+        store.register_blobs(&keys, generation).unwrap();
+        let insert_meta = |oid: git2::Oid, digest: u8, complete: bool| {
+            store.conn.lock().unwrap().execute(
+                "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,stored_unit_count,range_count,signature_count,signature_metadata_count,supertype_count,child_count,import_statement_count,type_identifier_count,is_complete) SELECT id,'csharp',0,'',0,0,0,0,0,0,0,0,?3 FROM blobs WHERE blob_oid=?1 AND parse_variant=?2",
+                params![oid.to_string(), [digest;32].as_slice(), complete],
+            ).unwrap();
+        };
+        insert_meta(oids[0], 1, true);
+        insert_meta(oids[1], 2, true); // A complete zero-chain result is certified.
+        insert_meta(oids[2], 3, false);
+        store.conn.lock().unwrap().execute(
+            "INSERT INTO csharp_undecided_chains(blob_id,chain,directive_start,directive_end,omitted_nonblank,invalid_condition,unknown_symbols,open_reasons,disagreeing_owners) VALUES((SELECT id FROM blobs WHERE blob_oid=?1 AND parse_variant=?2),0,0,1,1,0,jsonb('[]'),jsonb('[]'),jsonb('[]'))",
+            params![oids[0].to_string(), [1u8;32].as_slice()],
+        ).unwrap();
+        let census = store
+            .csharp_selected_unseen_branch_census(&snapshot, generation, &[])
+            .unwrap();
+        assert_eq!(census.uncertified_count, 3);
+        assert_eq!(census.rows.len(), 1);
+        assert_eq!(census.rows[0].rel_path, "Flagged.cs");
+        assert_eq!(census.sample.len(), 3);
+        let masked = store
+            .csharp_selected_unseen_branch_census(
+                &snapshot,
+                generation,
+                &["MissingDecision.cs".into(), "Flagged.cs".into()],
+            )
+            .unwrap();
+        assert_eq!(masked.uncertified_count, 2);
+        assert!(masked.rows.is_empty());
+        let zero_chain_only = store
+            .csharp_selected_unseen_branch_census(
+                &snapshot,
+                generation,
+                &[
+                    "Flagged.cs".into(),
+                    "Incomplete.cs".into(),
+                    "MissingBlob.cs".into(),
+                    "MissingDecision.cs".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(zero_chain_only.uncertified_count, 0);
+        assert!(zero_chain_only.rows.is_empty());
+        store.conn.lock().unwrap().execute(
+            "UPDATE blob_meta SET is_complete=1 WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND parse_variant=?2)",
+            params![oids[2].to_string(), [3u8;32].as_slice()],
+        ).unwrap();
+        let census = store
+            .csharp_selected_unseen_branch_census(&snapshot, generation, &[])
+            .unwrap();
+        assert_eq!(census.uncertified_count, 2);
+        let key = BlobKey {
+            oid: oids[3],
+            lang: "csharp".into(),
+            variant: ParseVariant::Digest([4; 32]),
+        };
+        store.register_blobs(&[key], generation).unwrap();
+        insert_meta(oids[3], 4, true);
+        let census = store
+            .csharp_selected_unseen_branch_census(&snapshot, generation, &[])
+            .unwrap();
+        assert_eq!(census.uncertified_count, 1);
+        assert_eq!(census.sample, ["MissingDecision.cs"]);
+        store
+            .ensure_language_epoch_value("csharp", "next-census-epoch")
+            .unwrap();
+        let stale = store.csharp_selected_unseen_branch_census(&snapshot, generation, &[]);
+        assert!(
+            stale.is_err(),
+            "old generation cannot certify after an epoch advance"
+        );
+    }
+
+    #[test]
     fn decision_replacement_keeps_earlier_revisions_for_unchanged_content() {
         use super::super::{WorkspaceFileRow, WorkspaceId, WorkspaceSnapshots};
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -2668,6 +3254,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -2722,6 +3309,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                None,
                 None,
             )
             .unwrap();

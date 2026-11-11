@@ -52,7 +52,13 @@ pub(super) fn timing(
         });
 }
 
-pub(super) fn finish(p: &mut Producer<'_, '_>, scopes: &[Scope<'_>]) {
+pub(super) fn finish(
+    p: &mut Producer<'_, '_>,
+    scopes: &[Scope<'_>],
+    future_annotations: bool,
+    generic_annotation_scopes: &HashMap<ResolutionScopeId, ResolutionScopeId>,
+    generic_runtime_scopes: &HashSet<ResolutionScopeId>,
+) {
     let write_points = p
         .facts
         .binding_event_timings
@@ -70,22 +76,165 @@ pub(super) fn finish(p: &mut Producer<'_, '_>, scopes: &[Scope<'_>]) {
             .then_some((event.target, timing.commit_byte))
         })
         .collect::<HashMap<_, _>>();
+    let module_end = scopes[0].node.end_byte();
+    let module_scope = p
+        .facts
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == ResolutionScopeKind::CompilationUnit && scope.parent.is_none())
+        .expect("Python source module scope")
+        .id;
+    // PEP 563 function annotations use globals plus visible PEP 695 type
+    // parameters. A nested generic's runtime formal Block can also reach
+    // enclosing function locals. Until a separate annotation scope tree can
+    // represent just the type parameters, withhold that route.
+    let mut function_annotations = if future_annotations {
+        p.facts
+            .python_annotations
+            .iter()
+            .filter(|annotation| annotation.mode != PythonNativeAnnotationMode::Eager)
+            .filter_map(|annotation| {
+                let slot = p.facts.type_slots[annotation.type_slot.index()];
+                let site = p.facts.sites[slot.site.index()];
+                let node = scopes[0]
+                    .node
+                    .descendant_for_byte_range(site.start_byte, site.end_byte)?;
+                let function = find_ancestor(node, |parent| {
+                    parent.kind() == "function_definition"
+                        && parent
+                            .child_by_field_name("body")
+                            .is_some_and(|body| site.end_byte <= body.start_byte())
+                })?;
+                // A type slot for a dotted annotation names its terminal token.
+                // Route the entire annotation expression, including qualifiers.
+                let mut annotation_node = node;
+                while let Some(parent) = annotation_node.parent() {
+                    if parent == function {
+                        break;
+                    }
+                    if parent.child_by_field_name("type") == Some(annotation_node)
+                        || parent.child_by_field_name("return_type") == Some(annotation_node)
+                    {
+                        break;
+                    }
+                    annotation_node = parent;
+                }
+                let mut current = Some(site.scope);
+                let mut route = module_scope;
+                let mut crosses_executable = false;
+                while let Some(scope) = current {
+                    if route == module_scope {
+                        if let Some(&runtime) = generic_annotation_scopes.get(&scope) {
+                            route = runtime;
+                        } else if generic_runtime_scopes.contains(&scope) {
+                            route = scope;
+                        }
+                    }
+                    let row = p.facts.scopes[scope.index()];
+                    if row.kind == ResolutionScopeKind::Executable {
+                        crosses_executable = true;
+                    }
+                    current = row.parent;
+                }
+                let unsupported = route != module_scope && crosses_executable;
+                Some((
+                    annotation_node.start_byte(),
+                    annotation_node.end_byte(),
+                    if unsupported { module_scope } else { route },
+                    unsupported,
+                ))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    function_annotations.sort_unstable();
+    let mut function_ranges: Vec<(usize, usize, ResolutionScopeId, bool)> = Vec::new();
+    for (start, end, route, unsupported) in function_annotations {
+        if let Some(previous) = function_ranges.last_mut().filter(|previous| {
+            start <= previous.1 && route == previous.2 && unsupported == previous.3
+        }) {
+            previous.1 = previous.1.max(end);
+        } else {
+            function_ranges.push((start, end, route, unsupported));
+        }
+    }
+    let mut postponed = p
+        .facts
+        .python_annotations
+        .iter()
+        .filter(|annotation| annotation.mode != PythonNativeAnnotationMode::Eager)
+        .map(|annotation| {
+            // The syntax site can name only a generic head for member lookup.
+            // Timing covers every reference in the complete annotation value.
+            let slot = p.facts.type_slots[annotation.type_slot.index()];
+            let site = p.facts.sites[slot.site.index()];
+            (site.start_byte, site.end_byte)
+        })
+        .collect::<Vec<_>>();
+    postponed.sort_unstable();
+    // Merge containing/overlapping annotation ranges so membership is a binary
+    // search rather than a scan of all annotations for every source reference.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in postponed {
+        if let Some(previous) = ranges.last_mut().filter(|previous| start <= previous.1) {
+            previous.1 = previous.1.max(end);
+        } else {
+            ranges.push((start, end));
+        }
+    }
+    let function_route = |site: ResolutionSiteFact| {
+        function_ranges
+            .partition_point(|range| range.0 <= site.start_byte)
+            .checked_sub(1)
+            .and_then(|index| {
+                (site.end_byte <= function_ranges[index].1)
+                    .then_some((function_ranges[index].2, function_ranges[index].3))
+            })
+    };
+    // A lexical root and its qualified terminal form one route. The prefix
+    // selects that route; intermediate qualified prefixes follow the same one.
+    let mut chain_routes = HashMap::default();
+    for root in &p.facts.root_references {
+        if let Some(prefix) = root.prefix_reference
+            && let Some(route) = function_route(p.facts.sites[prefix.index()])
+        {
+            chain_routes.insert(root.reference, route);
+        }
+    }
+    let mut unsupported_annotations = Vec::new();
     for identifier in &p.facts.identifiers {
         if identifier.role != ResolutionIdentifierRole::Reference {
             continue;
         }
-        let site = p.facts.sites[identifier.site.index()];
-        let deferred = find_scope_in_chain(
-            Some(site.scope),
-            |id| p.facts.scopes[id.index()].parent,
-            |id| {
-                matches!(
-                    scopes[id.index()].node.kind(),
-                    "function_definition" | "lambda" | "generator_expression"
-                )
-            },
-        )
-        .is_some();
+        let site = &mut p.facts.sites[identifier.site.index()];
+        let function_annotation = chain_routes
+            .get(&identifier.site)
+            .copied()
+            .or_else(|| function_route(*site));
+        if let Some((route, _)) = function_annotation {
+            site.scope = route;
+        }
+        let site = *site;
+        if function_annotation.is_some_and(|(_, unsupported)| unsupported) {
+            unsupported_annotations.push(identifier.site);
+        }
+        let annotation = ranges
+            .partition_point(|range| range.0 <= site.start_byte)
+            .checked_sub(1)
+            .is_some_and(|index| site.end_byte <= ranges[index].1);
+        let deferred = annotation
+            || find_scope_in_chain(
+                Some(site.scope),
+                |id| p.facts.scopes[id.index()].parent,
+                |id| {
+                    matches!(
+                        scopes[id.index()].node.kind(),
+                        "function_definition" | "lambda" | "generator_expression"
+                    )
+                },
+            )
+            .is_some();
         p.facts
             .binding_observations
             .push(ResolutionBindingObservationFact {
@@ -93,16 +242,26 @@ pub(super) fn finish(p: &mut Producer<'_, '_>, scopes: &[Scope<'_>]) {
                 execution_scope: site.scope,
                 // A write token denotes the binding it establishes, rather
                 // than a read of the binding visible before its RHS executes.
-                point_byte: write_points
-                    .get(&identifier.site)
-                    .copied()
-                    .unwrap_or(site.start_byte),
+                point_byte: if annotation {
+                    // Postponed type syntax observes the completed module,
+                    // independently of the source occurrence's coordinates.
+                    module_end
+                } else {
+                    write_points
+                        .get(&identifier.site)
+                        .copied()
+                        .unwrap_or(site.start_byte)
+                },
                 kind: if deferred {
                     ResolutionBindingObservationKind::Deferred
                 } else {
                     ResolutionBindingObservationKind::Immediate
                 },
             });
+    }
+    for site in unsupported_annotations {
+        p.facts
+            .add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
     }
     // Observed lexical reads are source-owned demands. Existing root-reference
     // lowering suppresses their canonical checkpoint path, so a slot cannot

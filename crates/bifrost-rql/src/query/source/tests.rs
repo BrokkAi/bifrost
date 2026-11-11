@@ -58,6 +58,36 @@ fn accepted_rql_shorthands_have_no_live_diagnostics() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#10229: argument-mode source validation panicked on vector form and rejected multiple S-expression modes"
+)]
+fn argument_mode_parser_and_source_validator_agree() {
+    for source in [
+        "(identifier :argument-mode [ref out])",
+        "(identifier (argument-mode ref out))",
+    ] {
+        assert!(CodeQuery::from_source(source).is_ok(), "{source}");
+        assert!(
+            validate_query_source(source).is_empty(),
+            "{source}: {:?}",
+            validate_query_source(source)
+        );
+    }
+    for source in [
+        "(identifier :argument-mode [ref unknown])",
+        "(identifier (argument-mode ref unknown))",
+    ] {
+        assert!(CodeQuery::from_source(source).is_err(), "{source}");
+        assert!(
+            validate_query_source(source)
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unknown argument mode")),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn cpp_fact_help_and_validation_are_schema_driven() {
     let source = "(cpp-facts :kind assignment-does-not-return-this (method :name \"operator=\"))";
     assert!(validate_query_source(source).is_empty(), "{source}");
@@ -1283,7 +1313,12 @@ fn unsafe_context_call_property_has_help_and_diagnostic_ranges() {
 fn declaration_attributes_and_expression_roles_have_editor_support() {
     for source in [
         r#"(class :type-kind "interface" :modifier "sealed")"#,
+        r#"(class :type-kind "struct")"#,
         r#"(class :and [(type-kind "record") (modifier "public")])"#,
+        r#"(class :modifier "readonly")"#,
+        r#"(assignment :modifier "const")"#,
+        r#"(method :modifier "extern")"#,
+        r#"(parameter :modifier "ref")"#,
         r#"(cast :type (identifier) :value (identifier))"#,
         r#"(instance_of :operand (identifier) :type (identifier) :binding (identifier))"#,
         r#"(subscript :object (identifier) :indices ((numeric_literal)))"#,
@@ -1346,4 +1381,57 @@ fn call_traversal_completeness_has_source_validation_and_help() {
         assert_eq!(help.signature, ":completeness exhaustive|proven-subset");
         assert_eq!(help.description, QueryStepField::Completeness.description());
     }
+}
+
+#[test]
+fn member_targets_options_validate_the_way_the_parser_decodes_them() {
+    let valid = "(member-targets :member-form [field property] :trivial-property false (call))";
+    assert!(validate_query_source(valid).is_empty(), "{valid}");
+    for invalid in [
+        "(member-targets :member-form [constructor] (call))",
+        "(member-targets :member-form [] (call))",
+        "(member-targets :trivial-property maybe (call))",
+        "(member-targets :trivial-property true :trivial-property false (call))",
+        "(receiver-targets :member-form [field] (call))",
+        "(points-to :trivial-property true (call))",
+    ] {
+        assert!(
+            !validate_query_source(invalid).is_empty(),
+            "the validator must reject {invalid}"
+        );
+        assert!(
+            CodeQuery::from_sexp(invalid).is_err(),
+            "the parser must reject {invalid}"
+        );
+    }
+}
+
+#[test]
+fn qualifying_type_source_help_and_validation_follow_registry() {
+    let source = r#"(call :qualifying-type (instantiated-type :identity (qualified "cbc.Encryptor") :arguments [(instantiated-type :identity (qualified "des.Des"))]))"#;
+    assert!(
+        validate_query_source(source).is_empty(),
+        "{:?}",
+        validate_query_source(source)
+    );
+    for keyword in [
+        ":qualifying-type",
+        "instantiated-type",
+        ":identity",
+        "qualified",
+        ":arguments",
+    ] {
+        let help = query_source_help_at(source, source.find(keyword).unwrap())
+            .expect("new vocabulary has hover help");
+        assert_eq!(&source[help.range], keyword);
+        assert!(!help.description.is_empty());
+    }
+    let invalid = source.replace("des.Des", "");
+    let diagnostics = validate_query_source(&invalid);
+    assert!(!diagnostics.is_empty());
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.range.start >= invalid.find("arguments").unwrap())
+    );
 }

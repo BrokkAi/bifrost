@@ -48,11 +48,12 @@ use brokk_bifrost_core::analyzer::model::ProjectFile;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 
+use brokk_bifrost_core::analyzer::usages::accumulator::{UsageAccumulator, UsageFlow};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_jvm::java::graph::JavaGraphSource;
 use brokk_bifrost_jvm::java::graph::extractor::{
     self, JavaFileEvidenceBuildOutcome, JavaFileEvidenceOmission, JavaFileUsageEvidence,
-    OwnedReturnTypeCaches, ScanState,
+    OwnedReturnTypeCaches,
 };
 use brokk_bifrost_jvm::java::graph::inverted::{
     JavaEdgeScanCaches, scan_file as scan_inverted_file,
@@ -126,13 +127,15 @@ pub(crate) fn build_java_file_usage_evidence(
     }
 }
 
-pub(crate) fn merge_java_file_evidence(evidence: JavaFileUsageEvidence, state: &mut ScanState<'_>) {
-    merge_java_evidence_into_state(
+pub(crate) fn merge_java_file_evidence(
+    evidence: JavaFileUsageEvidence,
+    usages: &mut UsageAccumulator,
+) -> UsageFlow {
+    usages.merge(
         evidence.hits,
         evidence.unproven_hits,
         evidence.raw_match_count,
-        state,
-    );
+    )
 }
 
 /// Adapt the JVM-owned producer result to the snapshot cache's owned value.
@@ -195,9 +198,6 @@ pub(crate) fn build_java_file_cache_evidence(
                     JavaFileEvidenceOmission::UnavailableCapability => {
                         brokk_bifrost_analysis::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::UnavailableCapability
                     }
-                    JavaFileEvidenceOmission::InternalSafetyCap => {
-                        brokk_bifrost_analysis::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::InternalSafetyCap
-                    }
                 },
             )
         }
@@ -209,28 +209,13 @@ pub(crate) fn build_java_file_cache_evidence(
 
 pub(crate) fn merge_java_cached_file_evidence(
     evidence: &brokk_bifrost_analysis::analyzer::usages::java_usage_evidence_cache::JavaFileUsageEvidence,
-    state: &mut ScanState<'_>,
-) {
-    merge_java_evidence_into_state(
+    usages: &mut UsageAccumulator,
+) -> UsageFlow {
+    usages.merge(
         evidence.hits.iter().cloned(),
         evidence.unproven_hits.iter().cloned(),
         evidence.raw_match_count,
-        state,
-    );
-}
-
-fn merge_java_evidence_into_state(
-    hits: impl IntoIterator<Item = brokk_bifrost_core::analyzer::usages::model::UsageHit>,
-    unproven_hits: impl IntoIterator<Item = brokk_bifrost_core::analyzer::usages::model::UsageHit>,
-    raw_match_count: usize,
-    state: &mut ScanState<'_>,
-) {
-    state.hits.extend(hits);
-    state.unproven_hits.extend(unproven_hits);
-    *state.raw_match_count += raw_match_count;
-    *state.limit_exceeded =
-        brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(state.hits)
-            > state.max_usages;
+    )
 }
 
 pub(crate) fn build_java_usage_edges<F>(
@@ -291,42 +276,46 @@ fn with_java_edge_resolver<'a, T>(
 /// Type targets only, for the same reason as the Kotlin direction: a member
 /// reference binds by the *target* language's member-lookup rules, and answering
 /// one language's member question with another's would be guessing.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_jvm_files_for_foreign_type(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
-    max_usages: usize,
-    hits: &mut std::collections::BTreeSet<brokk_bifrost_core::analyzer::usages::model::UsageHit>,
-    unproven_hits: &mut std::collections::BTreeSet<
-        brokk_bifrost_core::analyzer::usages::model::UsageHit,
-    >,
-    raw_match_count: &mut usize,
-    limit_exceeded: &mut bool,
+    usages: &mut UsageAccumulator,
 ) {
-    if *limit_exceeded || !target.is_class() {
-        return;
-    }
-    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+    let Some(spec) =
+        scan_java_files_for_foreign_type(analyzer, token, candidate_files, target, usages)
+    else {
         return;
     };
+    scan_scala_files_for_java_target(analyzer, candidate_files, &spec, usages, None);
+}
+
+/// Collect hits on a Kotlin or Scala *type* target from Java source only. A
+/// Scala target's own query scans Scala files itself.
+///
+/// Returns the Java target spec when the Java half finished and other files may
+/// still be scanned against it, and `None` when the scan stopped: the budget was
+/// reached, a file's evidence was omitted or the scan was cancelled, or the
+/// target is not a type Java can name.
+pub(crate) fn scan_java_files_for_foreign_type(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    candidate_files: &HashSet<ProjectFile>,
+    target: &CodeUnit,
+    usages: &mut UsageAccumulator,
+) -> Option<TargetSpec> {
+    if usages.limit_reached() || !target.is_class() {
+        return None;
+    }
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
     let cancellation = brokk_bifrost_core::cancellation::CancellationToken::new();
     let relational_session =
         brokk_bifrost_analysis::analyzer::relational_frontier::RelationalFrontierSession::new(
             analyzer,
             &cancellation,
         );
-    let Some(spec) = TargetSpec::from_targets(java, std::slice::from_ref(target)) else {
-        return;
-    };
-    let mut state = ScanState {
-        max_usages,
-        hits,
-        unproven_hits,
-        raw_match_count,
-        limit_exceeded,
-    };
+    let spec = TargetSpec::from_targets(java, std::slice::from_ref(target))?;
     let mut java_files: Vec<ProjectFile> = candidate_files
         .iter()
         .filter(|file| {
@@ -348,21 +337,20 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
             &cancellation,
         ) {
             JavaFileEvidenceBuildOutcome::Complete(evidence) => {
-                merge_java_file_evidence(evidence, &mut state);
+                if merge_java_file_evidence(evidence, usages) == UsageFlow::LimitReached {
+                    return None;
+                }
             }
             JavaFileEvidenceBuildOutcome::Omitted(reason) => {
                 brokk_bifrost_core::profiling::note_with(|| {
                     format!("Java file evidence omitted for {:?}: {reason:?}", file)
                 });
-                return;
+                return None;
             }
-            JavaFileEvidenceBuildOutcome::Cancelled => return,
-        }
-        if *state.limit_exceeded {
-            return;
+            JavaFileEvidenceBuildOutcome::Cancelled => return None,
         }
     }
-    scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
+    Some(spec)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,9 +441,14 @@ pub(crate) fn scan_scala_files_for_java_target(
     analyzer: &dyn IAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
-    state: &mut brokk_bifrost_jvm::java::graph::extractor::ScanState<'_>,
+    usages: &mut UsageAccumulator,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> bool {
+    // A reached budget already decides the answer; scanning more files would
+    // only grow a total nobody reads past the cap.
+    if usages.limit_reached() {
+        return true;
+    }
     let Some(scala) = resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer) else {
         return true;
     };
@@ -468,7 +461,7 @@ pub(crate) fn scan_scala_files_for_java_target(
         java,
         candidate_files,
         spec,
-        state,
+        usages,
         cancellation,
     )
 }
@@ -485,7 +478,7 @@ fn scan_scala_files_for_foreign_target(
     java: &JavaAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     spec: &TargetSpec,
-    state: &mut brokk_bifrost_jvm::java::graph::extractor::ScanState<'_>,
+    usages: &mut UsageAccumulator,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> bool {
     use brokk_bifrost_analysis::analyzer::relational_frontier::RelationalItemFrontierOutcome;
@@ -559,7 +552,7 @@ fn scan_scala_files_for_foreign_target(
         &prepared,
         &catalog,
         1,
-        state.max_usages,
+        usages.empty_like(),
         Some(&realm_languages),
         true,
     ) {
@@ -579,10 +572,9 @@ fn scan_scala_files_for_foreign_target(
     };
     for file_scan in results.into_iter().flatten() {
         for target_hits in file_scan.hits {
-            state.hits.extend(target_hits);
+            usages.merge(target_hits, [], 0);
         }
-        state.unproven_hits.extend(file_scan.unproven_hits);
-        *state.limit_exceeded |= file_scan.limit_exceeded;
+        usages.merge([], file_scan.unproven_hits, 0);
     }
     true
 }

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::analyzer::structural::facts::FileFacts;
-use crate::analyzer::structural::reference_edges::ReferenceEdgeRow;
+use crate::analyzer::structural::reference_edges::{EdgeDerivationResult, ReferenceEdgeRow};
 use crate::analyzer::usages::call_relations::{
     CallRelationDiagnostic, CallRelationLimits, CallRelationResult, CallRelationWork, CallSite,
     CallerInventoryCoverage, is_call_relation_unit, raw_call_site,
@@ -80,6 +80,15 @@ pub trait IncomingCallProjection {
         budget: &mut IncomingFileBudget<'_>,
         diagnostics: &mut Vec<CallRelationDiagnostic>,
     ) -> Result<IncomingFile, Self::Error>;
+
+    /// Check source inventory gaps even when no forward edge reaches a target.
+    fn file_inventory_diagnostic(
+        &mut self,
+        _file: &ProjectFile,
+        _target: &CodeUnit,
+    ) -> Option<CallRelationDiagnostic> {
+        None
+    }
 
     /// Language grammar may exclude references before charging a candidate.
     /// The shared projection marks the inventory Incomplete for every
@@ -194,7 +203,7 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
                     | UsageHitKind::Definition
                     | UsageHitKind::OverrideDeclaration
             ) || matches!(
-                edge.reference_kind,
+                edge.reference_kind.known().iter().next(),
                 Some(
                     ReferenceKind::TypeReference
                         | ReferenceKind::SelfTypeAlias
@@ -240,6 +249,54 @@ pub fn project_selected_incoming<'e, M, P: IncomingCallProjection>(
         return Ok(None);
     }
     Ok(Some(IncomingSites(sites)))
+}
+
+/// Incoming calls to one target from the one file whose forward edges are
+/// `forward`, projected through the same language rules as the whole-workspace
+/// reverse relation.
+///
+/// Every call site of the file was resolved by the forward producer, so the
+/// answer needs no candidate admission: a site belongs to the target exactly
+/// when its resolution contains it. The file's forward completeness is the
+/// answer's completeness, because an unresolved or ambiguous reference in the
+/// file might call the target. `diagnostics` is the language's rendering of
+/// that completeness. The union of these answers over every file equals the
+/// reverse relation's sites for the target.
+pub fn project_in_file_incoming<P: IncomingCallProjection>(
+    projection: &mut P,
+    file: &ProjectFile,
+    target: &CodeUnit,
+    forward: &EdgeDerivationResult,
+    diagnostics: Vec<CallRelationDiagnostic>,
+    limits: CallRelationLimits,
+    cancellation: &CancellationToken,
+) -> Result<CallRelationResult, P::Error> {
+    let mut result = CallRelationResult {
+        caller_inventory: if forward.completeness.is_complete() {
+            CallerInventoryCoverage::Complete
+        } else {
+            CallerInventoryCoverage::Incomplete
+        },
+        diagnostics,
+        ..CallRelationResult::default()
+    };
+    if let Some(diagnostic) = projection.file_inventory_diagnostic(file, target) {
+        result.caller_inventory = CallerInventoryCoverage::Incomplete;
+        if !result.diagnostics.contains(&diagnostic) {
+            result.diagnostics.push(diagnostic);
+        }
+    }
+    let rows = forward
+        .edges
+        .iter()
+        .filter(|edge| edge.target == *target)
+        .map(|edge| (edge, ()));
+    if let Some(sites) =
+        project_selected_incoming(projection, target, rows, limits, cancellation, &mut result)?
+    {
+        finish_incoming_sites(sites, &mut result);
+    }
+    Ok(result)
 }
 
 /// Finalize calls for the one target asserted by project_selected_incoming.

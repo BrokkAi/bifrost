@@ -128,14 +128,39 @@ impl Span {
     }
 }
 
+/// How an argument supplies its value to a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ArgumentMode {
+    Plain = 0,
+    Spread = 1,
+    Ref = 2,
+    Out = 3,
+    In = 4,
+}
+
+impl ArgumentMode {
+    pub const fn is_spread(self) -> bool {
+        matches!(self, Self::Spread)
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Plain),
+            1 => Some(Self::Spread),
+            2 => Some(Self::Ref),
+            3 => Some(Self::Out),
+            4 => Some(Self::In),
+            _ => None,
+        }
+    }
+}
+
 /// One role edge from a fact to a sub-node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleTarget {
     pub role: Role,
-    /// Whether this argument role was produced by a language spread/unpack
-    /// form (`*args`, `...args`, and equivalents). False for non-argument
-    /// roles and ordinary arguments.
-    pub spread: bool,
+    pub mode: ArgumentMode,
     /// For [`Role::Kwarg`]: the span of the keyword name (`shell` in
     /// `run(cmd, shell=True)`). `None` for every other role.
     pub keyword: Option<SourceOccurrenceId>,
@@ -256,6 +281,7 @@ pub struct StructuralFactRows {
     nodes: Vec<NormalizedNode>,
     roles: CompactRows<RoleTarget>,
     occurrence_roles: CompactRows<OccurrenceRole>,
+    coverage: Vec<(u32, Role, super::kinds::RoleCoverage)>,
     /// The regions tree-sitter error recovery produced, in source order: each
     /// outermost `ERROR` node and each `MISSING` token, which is zero-width
     /// (#3777). A node of any kind inside an `ERROR` region may have produced
@@ -263,6 +289,14 @@ pub struct StructuralFactRows {
     /// region could hold a node it selects.
     recovered_regions: Vec<Span>,
 }
+
+pub type StructuralFactRowsParts = (
+    Vec<NormalizedNode>,
+    CompactRows<RoleTarget>,
+    CompactRows<OccurrenceRole>,
+    Vec<(u32, Role, super::kinds::RoleCoverage)>,
+    Vec<Span>,
+);
 
 impl StructuralFactRows {
     pub fn new(
@@ -348,8 +382,23 @@ impl StructuralFactRows {
             nodes,
             roles,
             occurrence_roles,
+            coverage: Vec::new(),
             recovered_regions,
         }
+    }
+
+    pub fn with_coverage(mut self, coverage: Vec<(u32, Role, super::kinds::RoleCoverage)>) -> Self {
+        debug_assert!(
+            coverage
+                .windows(2)
+                .all(|pair| (pair[0].0, pair[0].1) < (pair[1].0, pair[1].1))
+        );
+        self.coverage = coverage;
+        self
+    }
+
+    pub fn coverage(&self) -> &[(u32, Role, super::kinds::RoleCoverage)] {
+        &self.coverage
     }
 
     pub fn nodes(&self) -> &[NormalizedNode] {
@@ -410,18 +459,12 @@ impl StructuralFactRows {
             )
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<NormalizedNode>,
-        CompactRows<RoleTarget>,
-        CompactRows<OccurrenceRole>,
-        Vec<Span>,
-    ) {
+    pub fn into_parts(self) -> StructuralFactRowsParts {
         (
             self.nodes,
             self.roles,
             self.occurrence_roles,
+            self.coverage,
             self.recovered_regions,
         )
     }

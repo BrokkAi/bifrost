@@ -13,6 +13,7 @@
 //! are counted as skipped rows, never dropped in silence.
 
 pub mod jdk;
+pub mod rust;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -127,15 +128,20 @@ fn yaml_options() -> serde_saphyr::Options {
     }
 }
 
+/// Shared strict YAML decoder; language adapters validate their own row schema.
+pub(super) fn parse_codeql_yaml<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    serde_saphyr::from_slice_with_options(bytes, yaml_options()).map_err(|error| error.to_string())
+}
+
 fn for_each_codeql_row(
     files: &[(String, Vec<u8>)],
     mut visit: impl FnMut(&str, &str, u32, &[MadCell]),
 ) -> Result<(), CodeqlParseError> {
     for (file, bytes) in files {
-        let document: MadDocument = serde_saphyr::from_slice_with_options(bytes, yaml_options())
-            .map_err(|error| CodeqlParseError {
+        let document: MadDocument =
+            parse_codeql_yaml(bytes).map_err(|message| CodeqlParseError {
                 file: file.clone(),
-                message: error.to_string(),
+                message,
             })?;
         for extension in &document.extensions {
             let kind = extension.adds_to.extensible.as_str();
@@ -734,7 +740,7 @@ fn parse_argument_set(argument: &str, text: &str) -> Result<Vec<MadArgumentItem>
 }
 
 fn parse_argument_item(argument: &str, text: &str) -> Result<MadArgumentItem, String> {
-    if argument == "this" {
+    if matches!(argument, "this" | "self") {
         return Ok(MadArgumentItem::This);
     }
     if let Some((low, high)) = argument.split_once("..") {

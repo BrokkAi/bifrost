@@ -6,6 +6,42 @@
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binding_seed_entry_keeps_route_question_in_one_frame() {
+        use brokk_bifrost_analysis::analyzer::derivation_host::read_frame;
+        use brokk_bifrost_rust::graph_support::RustSource;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"frame_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )
+            .file("src/lib.rs", "pub fn probe() {}\n")
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let calls = AtomicUsize::new(0);
+        let keep_going = || {
+            if read_frame::read_frame_depth_for_test() == 1
+                && calls.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                <RustAnalyzer as RustSource>::file_routes(&analyzer, &file, None)
+                    .expect("route question inside usage entry");
+            }
+            true
+        };
+        brokk_bifrost_rust::usage::usage_binding_seeds_while(
+            &analyzer,
+            scope.token(),
+            &BTreeSet::new(),
+            &keep_going,
+        )
+        .expect("usage entry succeeds");
+        assert!(calls.load(Ordering::Relaxed) > 0);
+        assert_eq!(read_frame::read_frame_depth_for_test(), 0);
+    }
 
     use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -21,7 +57,6 @@ mod tests {
 
     use brokk_bifrost_core::analyzer::model::ProjectFile;
 
-    use crate::test_support::rust_analyzer;
     use brokk_bifrost_rust::usage::RustReferenceResolution;
     use brokk_bifrost_rust::usage::{Domain, ModuleKey, RustSymbolIdentity, RustSymbolNamespace};
     use brokk_bifrost_rust::usage_queries::RustUsageQueries;
@@ -53,7 +88,13 @@ mod tests {
             .expect("an uncancelled walk answers");
         let resolution = RustReferenceResolution::Exact(RustSymbolIdentity {
             file: source,
-            module: ModuleKey::new(target.source(), target.package_name()),
+            module: ModuleKey::new_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                target.source(),
+                target.package_name(),
+            ),
             name: target.identifier().to_string(),
             namespace: RustSymbolNamespace::Value,
         });
@@ -104,7 +145,10 @@ mod tests {
                  }\n",
             )
             .expect("write util.rs");
-        let analyzer = rust_analyzer(&root);
+        // A certified listing makes the route answers complete, so src/util.rs
+        // is known to be lib.rs's module crate::util, not a possible crate root
+        // whose private items would be visible in its own crate.
+        let (_workspace, analyzer) = crate::analyzer::rust::test_support::certified_analyzer(&root);
         let queries = RustUsageQueries::new(&analyzer);
 
         let mut rendered: Vec<String> = ["Shared", "helper", "worker", "util", "inner"]

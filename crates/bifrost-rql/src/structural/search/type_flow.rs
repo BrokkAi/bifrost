@@ -10,6 +10,7 @@
 //! as "no classes" or "no finding".
 
 use super::{DerivationExecutionCause, Incompleteness};
+use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -238,8 +239,7 @@ struct TypeFlowRootProduct {
     solver_work: SolverWork,
     semantic_work: SemanticWork,
     reads: Vec<ReadKey>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: ReadChannels,
 }
 
 impl TypeFlowRootProduct {
@@ -254,7 +254,7 @@ impl TypeFlowRootProduct {
             published_summaries: result.published_summaries as u64,
             summary_profile: result.summary_profile,
             solver_attempts: result.solver_attempts.len() as u64,
-            incomplete_roots: u64::from(!result.complete),
+            incomplete_roots: u64::from(!result.complete()),
             ..Default::default()
         }
     }
@@ -267,6 +267,9 @@ impl TypeFlowRootProduct {
         semantic_work: SemanticWork,
     ) -> Self {
         let work = Self::work_for(&result);
+        let complete = result.complete();
+        let semantic_budget_exhausted = result.semantic_budget_exhausted();
+        let persistence_status = result.persistence_status();
         let solver_work = result
             .solver_attempts
             .iter()
@@ -314,16 +317,15 @@ impl TypeFlowRootProduct {
             projected_rows,
             class_sets,
             findings,
-            complete: result.complete,
-            semantic_budget_exhausted: result.semantic_budget_exhausted,
+            complete,
+            semantic_budget_exhausted,
+            persistence_status,
             incomplete_evidence: result.incomplete_evidence,
-            persistence_status: result.persistence_status,
             work,
             solver_work,
             semantic_work,
             reads: Vec::new(),
-            unattributed_reads: 0,
-            execution_dependences: 0,
+            channels: ReadChannels::default(),
         }
     }
 }
@@ -725,8 +727,7 @@ type QueryFieldSlotInputs = (
 #[derive(Clone)]
 struct QueryFieldSlots {
     index: Arc<FieldSlotIndex>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: ReadChannels,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1482,8 +1483,7 @@ impl TypeFlowQueryState {
                 crate::analyzer::replay_query_read_receipt(
                     workspace.analyzer(),
                     result.product.reads.iter().cloned(),
-                    result.product.unattributed_reads,
-                    result.product.execution_dependences,
+                    result.product.channels,
                 );
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return None;
@@ -1498,8 +1498,7 @@ impl TypeFlowQueryState {
                     crate::analyzer::replay_query_read_receipt(
                         workspace.analyzer(),
                         owned.product.reads.iter().cloned(),
-                        owned.product.unattributed_reads,
-                        owned.product.execution_dependences,
+                        owned.product.channels,
                     );
                 }
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
@@ -1634,8 +1633,7 @@ impl TypeFlowQueryState {
                 crate::analyzer::replay_query_read_receipt(
                     workspace.analyzer(),
                     result.product.reads.iter().cloned(),
-                    result.product.unattributed_reads,
-                    result.product.execution_dependences,
+                    result.product.channels,
                 );
                 self.work.cache_hits = self.work.cache_hits.saturating_add(1);
                 return result
@@ -1762,8 +1760,7 @@ impl TypeFlowQueryState {
                     crate::analyzer::replay_query_read_receipt(
                         workspace.analyzer(),
                         std::iter::empty(),
-                        index.unattributed_reads,
-                        index.execution_dependences,
+                        index.channels,
                     );
                     index
                 }
@@ -1875,8 +1872,7 @@ impl TypeFlowQueryState {
                             }
                             let cached = QueryFieldSlots {
                                 index,
-                                unattributed_reads: receipt.unattributed_reads,
-                                execution_dependences: receipt.execution_dependences,
+                                channels: receipt.channels,
                             };
                             self.field_slots
                                 .insert(field_slot_key.clone(), Some(cached.clone()));
@@ -1958,7 +1954,7 @@ impl TypeFlowQueryState {
                 Ok(result) => {
                     let projected_rows = project_class_sets(&result);
                     if !persistent_store_failed
-                    && result.persistence_status == TypeFlowRootPersistenceStatus::Eligible
+                    && result.persistence_status() == TypeFlowRootPersistenceStatus::Eligible
                     && result.findings.is_empty()
                     // Constructor-origin evidence is request-local:
                     // the durable class-set projection does not carry
@@ -2047,8 +2043,7 @@ impl TypeFlowQueryState {
                         solver_work: solver_budget.used(),
                         semantic_work,
                         reads: Vec::new(),
-                        unattributed_reads: 0,
-                        execution_dependences: 0,
+                        channels: ReadChannels::default(),
                     };
                     Some(product)
                 }
@@ -2056,13 +2051,13 @@ impl TypeFlowQueryState {
         });
         let mut product = product?;
         product.reads = reads.keys();
-        product.unattributed_reads = reads.unattributed_reads();
-        product.execution_dependences = reads.execution_dependences();
+        product.channels = reads.channels();
         let product = Arc::new(product);
         // No memo reentry from the flow engine. A cancelled leader leaves its
         // permit unpublished so a live follower can retry as leader.
         if let Some(permit) = memo_permit
             && !cancellation.is_cancelled()
+            && !product.channels.reuse_refused
             && product
                 .failure
                 .as_ref()
@@ -2107,8 +2102,7 @@ impl TypeFlowQueryState {
                 crate::analyzer::replay_query_read_receipt(
                     workspace.analyzer(),
                     product.reads.iter().cloned(),
-                    product.unattributed_reads,
-                    product.execution_dependences,
+                    product.channels,
                 );
                 self.work.root_memo_hits = self.work.root_memo_hits.saturating_add(1);
                 self.work.root_memo_solver_work = self
@@ -2233,7 +2227,7 @@ impl TypeFlowQueryState {
         limits: CodeQueryValueFlowLimits,
         cancellation: &CancellationToken,
     ) -> RootResultPublicationOutcome {
-        if result.persistence_status != TypeFlowRootPersistenceStatus::Eligible
+        if result.persistence_status() != TypeFlowRootPersistenceStatus::Eligible
             || !result.findings.is_empty()
         {
             return RootResultPublicationOutcome::Continued;
@@ -2484,7 +2478,9 @@ fn root_result_semantics_digest(
     digest.finish()
 }
 
-const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v17";
+// v18 (#10539): one event's alternatives join instead of killing each other,
+// so a root result could have lost a returned join arm's classes.
+const ROOT_RESULT_ALGORITHM_ID: &[u8] = b"type-flow-root-algorithm-v18";
 
 fn push_usize(digest: &mut LengthDelimitedDigest, value: usize) {
     digest.push(
@@ -3181,6 +3177,24 @@ mod tests {
         }
     }
 
+    /// #9751: a completed Python mutation scan certifies the root by the whole
+    /// Python scope instead of refusing reuse, so any Python edit invalidates
+    /// it. #10008 replaces this coarse receipt with a cohort fact.
+    fn assert_python_scope_receipt(
+        workspace: &WorkspaceAnalyzer,
+        product: &super::TypeFlowRootProduct,
+    ) {
+        assert!(!product.channels.reuse_refused, "{:?}", product.channels);
+        let scope = workspace
+            .analyzer()
+            .workspace_scope_read_key(&[Language::Python]);
+        assert!(
+            product.reads.contains(&scope),
+            "missing Python scope receipt: {:?}",
+            product.reads
+        );
+    }
+
     fn assert_diagnostic(state: &mut TypeFlowQueryState, code: CodeQueryDiagnosticCode) {
         assert!(
             state
@@ -3234,7 +3248,7 @@ mod tests {
                 );
             };
             assert_eq!(
-                result.product.unattributed_reads, 0,
+                result.product.channels.unattributed_reads, 0,
                 "every differential capture must name its inputs"
             );
             result.product
@@ -3381,7 +3395,14 @@ mod tests {
             assert_eq!(changed.changed_path_count(), 1);
             // Root capture has no policy wrapper. These fixed inputs must never
             // accidentally reject a product for an unrelated policy/config key.
-            let inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+            // The fixture activates no models, so a root that consulted the
+            // model set recorded the absence marker, which the head matches.
+            let no_models =
+                brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(None);
+            let inputs = brokk_bifrost_analysis::analyzer::HeadInputs {
+                models: no_models,
+                ..brokk_bifrost_analysis::test_support::read_ledger_test_inputs()
+            };
             let head_root = named_root(&head, &project, "app.py", "independent");
             let answers = head_field_answers(&head, &head_root);
             let mut memo = LookupMemo::new();
@@ -3391,6 +3412,10 @@ mod tests {
             let mut accepted = 0;
             let mut gaps = Vec::new();
             let mut rejected_roots = Vec::new();
+            let mut scope_rejected_roots = Vec::new();
+            let python_scope = base
+                .analyzer()
+                .workspace_scope_read_key(&[Language::Python]);
             let mut empty_captures = 0;
             for (reference, product) in &products {
                 let root_name = format!(
@@ -3408,8 +3433,11 @@ mod tests {
                 assert!(
                     !product.reads.iter().any(|key| matches!(
                         key,
-                        brokk_bifrost_analysis::analyzer::ReadKey::Models(_)
-                            | brokk_bifrost_analysis::analyzer::ReadKey::Policy { .. }
+                        brokk_bifrost_analysis::analyzer::ReadKey::Models(models)
+                            if *models != no_models
+                    ) || matches!(
+                        key,
+                        brokk_bifrost_analysis::analyzer::ReadKey::Policy { .. }
                             | brokk_bifrost_analysis::analyzer::ReadKey::Configuration(_)
                             | brokk_bifrost_analysis::analyzer::ReadKey::Epoch(_)
                     )),
@@ -3450,9 +3478,16 @@ mod tests {
                 );
                 if verdict != ReadVerdict::Unchanged {
                     rejected += 1;
+                    if product.reads.contains(&python_scope) {
+                        scope_rejected_roots.push(root_name.clone());
+                    }
                     rejected_roots.push(root_name);
                     continue;
                 }
+                assert!(
+                    !product.reads.contains(&python_scope),
+                    "a Python edit must reject a Python-scope receipt: case={case} root={root_name}"
+                );
                 accepted += 1;
                 let head_reference = head_context
                     .procedure_references(&reference.file)
@@ -3491,23 +3526,27 @@ mod tests {
             );
             assert!(accepted > 0, "verification must actually accept products");
             if case == "unrelated" {
+                // base_dispatch also had a known false rejection (#7758); it now
+                // carries the Python scope receipt, so it is filtered below.
                 let expected = [
-                    // Known false rejection, not a dependency on the edit: this
-                    // product records receiver-hinted and unhinted ProcedureDispatch
-                    // answers under one question, so it is always rejected.
-                    // #7758 will remove this root from the expected set.
-                    "app.py::[\"app.py\", \"base_dispatch\"]",
                     // The edit changes this root's own body.
                     "unrelated.py::[\"unrelated.py\", \"unrelated\"]",
                 ];
+                // #9751: roots certified by the whole Python scope reject on
+                // any Python edit; #10008 restores their precise receipts.
                 let mut actual = rejected_roots
                     .iter()
+                    .filter(|name| !scope_rejected_roots.contains(name))
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 actual.sort_unstable();
                 assert_eq!(
                     actual, expected,
                     "unexpected unrelated-edit rejections: {rejected_roots:?}"
+                );
+                assert!(
+                    !scope_rejected_roots.is_empty(),
+                    "fixture must exercise Python-scope receipts"
                 );
             }
             if case == "add_override" {
@@ -3592,7 +3631,17 @@ mod tests {
                     | LookupQuestion::CallSite { rel_path, .. } => rel_path.as_ref() == path,
                     LookupQuestion::Name { .. }
                     | LookupQuestion::Summary { .. }
-                    | LookupQuestion::WorkspaceFact { .. } => false,
+                    | LookupQuestion::WorkspaceFact { .. }
+                    | LookupQuestion::StructuralName { .. }
+                    | LookupQuestion::StructuralRoleName { .. }
+                    | LookupQuestion::StructuralRecovered { .. }
+                    // #9737 M3: derivation questions have no persisted replay yet.
+                    | LookupQuestion::Derivation(_)
+                    | LookupQuestion::RustCopyAbsence { .. }
+                    | LookupQuestion::RustPlacedDeclaration { .. }
+                    | LookupQuestion::CertifiedDefinition { .. }
+                    | LookupQuestion::ExternalSelection { .. }
+                    | LookupQuestion::StoredSemanticIrPublication(..) => false,
                 },
                 _ => false,
             }
@@ -3992,7 +4041,10 @@ mod tests {
         }
 
         #[test]
-        fn read_set_mutation_warm_mro_change() {
+        #[brokk_bifrost_test_macros::hardwon(
+            "#9575: unreceipted Python dispatch must refuse warm MRO reuse"
+        )]
+        fn read_set_mutation_unreceipted_mro_change() {
             let project = InlineTestProject::with_language(Language::Python).with_git()
                 .file("base.py", "class Item:\n    pass\n\nclass Other:\n    pass\n\nclass A:\n    def pick(self):\n        return Item()\n\nclass A2:\n    def pick(self):\n        return Other()\n")
                 .file("mid.py", "from base import A, A2\n\nclass B(A):\n    pass\n")
@@ -4002,20 +4054,8 @@ mod tests {
             let root = named_root(&base, &project, "r.py", "R");
             let mut state = TypeFlowQueryState::default();
             let _cold = solve(&base, &mut state, &root);
-            let before = state.value_flow_cache.stats();
             let product = solve(&base, &mut state, &root);
-            eprintln!(
-                "T7 warm_stats={:?}",
-                state.value_flow_cache.stats().saturating_sub(before)
-            );
-            assert!(
-                state
-                    .value_flow_cache
-                    .stats()
-                    .saturating_sub(before)
-                    .dispatch_hits
-                    > 0
-            );
+            assert_python_scope_receipt(&base, &product);
             project
                 .file("mid.py")
                 .write("from base import A, A2\n\nclass B(A2):\n    pass\n")
@@ -4061,7 +4101,7 @@ mod tests {
                 product.complete, product.persistence_status
             );
             assert_eq!(
-                product.unattributed_reads, 0,
+                product.channels.unattributed_reads, 0,
                 "the missing metadata dependency must not already be reported as unattributed"
             );
             assert!(
@@ -4113,7 +4153,7 @@ mod tests {
             state.summary_state = None;
             state.summary_partitions = Default::default();
             let product = solve(&base, &mut state, &root);
-            assert_eq!(product.unattributed_reads, 0);
+            assert_eq!(product.channels.unattributed_reads, 0);
             assert_eq!(state.work().cache_hits, 0);
             assert_eq!(state.work().root_memo_hits, 0);
             assert!(
@@ -4159,7 +4199,7 @@ mod tests {
             state.summary_state = None;
             state.summary_partitions = Default::default();
             let product = solve(&base, &mut state, &root);
-            assert_eq!(product.unattributed_reads, 0);
+            assert_eq!(product.channels.unattributed_reads, 0);
             assert_eq!(state.work().cache_hits, 0);
             assert_eq!(state.work().root_memo_hits, 0);
             assert!(
@@ -4223,7 +4263,7 @@ mod tests {
             state.summary_state = None;
             state.summary_partitions = Default::default();
             let product = solve(&base, &mut state, &root);
-            assert_eq!(product.unattributed_reads, 0);
+            assert_eq!(product.channels.unattributed_reads, 0);
             assert_eq!(state.work().cache_hits, 0);
             assert_eq!(state.work().root_memo_hits, 0);
             assert!(
@@ -4253,7 +4293,10 @@ mod tests {
         }
 
         #[test]
-        fn read_set_mutation_runtime_summary_transitive_callee() {
+        #[brokk_bifrost_test_macros::hardwon(
+            "#9575: an unreceipted callee closure must recompute without publishing runtime summaries"
+        )]
+        fn read_set_mutation_unreceipted_runtime_summary_transitive_callee() {
             let project = InlineTestProject::with_language(Language::Python).with_git()
                 .file("c.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
                 .file("leaf.py", "from c import Other\n\ndef leaf(value):\n    return value\n")
@@ -4265,15 +4308,12 @@ mod tests {
             let a = named_root(&base, &project, "r.py", "A");
             let b = named_root(&base, &project, "r.py", "B");
             let a = solve(&base, &mut state, &a);
-            assert!(
-                a.work.published_summaries > 0,
-                "A must publish runtime class-set summaries"
-            );
+            assert_python_scope_receipt(&base, &a);
             let product = solve(&base, &mut state, &b);
-            eprintln!("T9 B_work={:?}", product.work);
+            assert_python_scope_receipt(&base, &product);
             assert!(
                 product.work.summary_cache_hits > product.work.root_summary_cache_hits,
-                "B must use runtime summaries"
+                "a receipted root reuses the earlier root's runtime summary"
             );
             for path in ["f.py", "leaf.py"] {
                 let artifact = product.reads.iter().any(|key| matches!(key,
@@ -4323,7 +4363,10 @@ mod tests {
         }
 
         #[test]
-        fn read_set_mutation_warm_subclass_reparenting() {
+        #[brokk_bifrost_test_macros::hardwon(
+            "#9575: unreceipted dispatch must observe fresh subclass reparenting"
+        )]
+        fn read_set_mutation_unreceipted_subclass_reparenting() {
             let project = InlineTestProject::with_language(Language::Python).with_git()
                 .file("base.py", "class Item:\n    pass\n\nclass Other:\n    pass\n\nclass A:\n    def method(self):\n        return Item()\n\nclass A2:\n    pass\n")
                 .file("b.py", "from base import A, A2, Other\n\nclass B(A2):\n    def method(self):\n        return Other()\n")
@@ -4333,20 +4376,8 @@ mod tests {
             let root = named_root(&base, &project, "r.py", "R");
             let mut state = TypeFlowQueryState::default();
             let _cold = solve(&base, &mut state, &root);
-            let before = state.value_flow_cache.stats();
             let product = solve(&base, &mut state, &root);
-            eprintln!(
-                "T12 warm_stats={:?}",
-                state.value_flow_cache.stats().saturating_sub(before)
-            );
-            assert!(
-                state
-                    .value_flow_cache
-                    .stats()
-                    .saturating_sub(before)
-                    .dispatch_hits
-                    > 0
-            );
+            assert_python_scope_receipt(&base, &product);
             eprintln!(
                 "T12 names_b={}",
                 product.reads.iter().any(|key| names_path(key, "b.py"))
@@ -4509,8 +4540,10 @@ mod tests {
         }
 
         #[test]
-        #[hardwon("#2445: later roots lost warm snapshot, binding and guard-refinement inputs")]
-        fn shared_snapshots_bindings_and_refinements_replay_changed_callee_inputs() {
+        #[hardwon(
+            "#2445: later roots must keep callee inputs when #9575 refuses unreceipted reuse"
+        )]
+        fn unreceipted_shared_derivations_recompute_changed_callee_inputs() {
             for (callee, edited) in [
                 (
                     "from classes import Item, Other\n\ndef make():\n    return Item()\n",
@@ -4538,9 +4571,10 @@ mod tests {
                 let before = state.value_flow_cache.stats();
                 let second = solve(&base, &mut state, &b);
                 let hits = state.value_flow_cache.stats().saturating_sub(before);
+                assert_python_scope_receipt(&base, &second);
                 assert!(
-                    hits.snapshot_hits > 0 && hits.binding_hits > 0,
-                    "must consume shared derivations: {hits:?}"
+                    hits.snapshot_hits > 0,
+                    "snapshot reuse remains admissible: {hits:?}"
                 );
                 let callee_inputs: Vec<_> = first.reads.iter().filter(|key| matches!(key,
                 ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "callee.py"
@@ -4592,7 +4626,10 @@ mod tests {
         }
 
         #[test]
-        fn runtime_summary_replays_the_publishing_roots_inputs() {
+        #[brokk_bifrost_test_macros::hardwon(
+            "#9575: rejected runtime summary publication must preserve transitive input invalidation"
+        )]
+        fn unreceipted_runtime_summary_keeps_transitive_inputs() {
             let project = InlineTestProject::with_language(Language::Python).with_git()
                 .file("classes.py", "class Item:\n    pass\n\nclass Other:\n    pass\n")
                 .file("leaf.py", "from classes import Other\n\ndef leaf(value):\n    return value\n")
@@ -4621,18 +4658,13 @@ mod tests {
             let b = root(&base, &project, "second");
             let mut state = TypeFlowQueryState::default();
             let first = solve(&base, &mut state, &a);
-            assert!(
-                first.work.published_summaries > 0,
-                "A must publish runtime rows: {:?}",
-                first.work
-            );
+            assert_python_scope_receipt(&base, &first);
             let second = solve(&base, &mut state, &b);
+            assert_python_scope_receipt(&base, &second);
             assert!(
                 second.work.summary_cache_hits > second.work.root_summary_cache_hits,
-                "B must reuse runtime callee rows: {:?}",
-                second.work
+                "a receipted root reuses the earlier root's runtime summary"
             );
-            assert!(second.reads.iter().any(|key| matches!(key, ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "warm.py")), "B must inherit A's own artifact as part of the publication superset: {:?}", second.reads);
             let leaf_input = first.reads.iter().find(|key| matches!(key, ReadKey::Artifact { rel_path: Some(path), .. } if path.as_ref() == "leaf.py")).expect("A reads the transitive leaf artifact");
             assert!(
                 second.reads.contains(leaf_input),
@@ -4931,21 +4963,26 @@ mod tests {
     }
 
     #[test]
-    fn type_flow_root_memo_products_are_independent_of_root_order() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9575: root memo reuse requires receipt authority and preserves root-order results"
+    )]
+    fn type_flow_root_memo_reuse_follows_receipt_authority() {
         use super::super::semantic::SemanticQueryContext;
         use super::{CachedTypeFlowAnalysis, TypeFlowRootMemo, TypeFlowRootProduct};
         use std::sync::Arc;
 
-        // Several entry roots share normalize and its precise constructor input,
-        // exercising both summary and refinement history without a budget boundary.
+        let filename = "app.py";
+        let source = "class Item:\n    pass\n\ndef normalize(x):\n    return x.missing\n\ndef first():\n    return normalize(Item())\n\ndef second():\n    return normalize(Item())\n\ndef third():\n    return first()\n";
+        // Several roots share normalize and its constructor input. Their receipts
+        // decide independently whether a later root memo consumer may reuse the product.
         let project = InlineTestProject::with_language(Language::Python)
             .with_git()
-            .file("app.py", "class Item:\n    pass\n\ndef normalize(x):\n    return x.missing\n\ndef first():\n    return normalize(Item())\n\ndef second():\n    return normalize(Item())\n\ndef third():\n    return first()\n")
+            .file(filename, source)
             .build();
         let workspace = project.workspace_analyzer(AnalyzerConfig::default());
         assert!(workspace.analyzer().workspace_content_identity().is_some());
         let mut context = SemanticQueryContext::new(&workspace, None, Default::default());
-        let references = context.procedure_references(&project.file("app.py"));
+        let references = context.procedure_references(&project.file(filename));
         let mut roots = references
             .iter()
             .map(|reference| {
@@ -5034,6 +5071,16 @@ mod tests {
                 );
                 products[index] = Some(product);
             }
+            // #9751: completed Python mutation scans now carry a Python scope
+            // receipt, so this fixture produces no refused root; the replay
+            // checks below still cover both branches whenever one appears.
+            assert!(
+                products
+                    .iter()
+                    .flatten()
+                    .any(|product| !product.channels.reuse_refused),
+                "fixture must produce an admitted root: {products:?}"
+            );
             assert_eq!(state.work.root_memo_hits, 0);
             assert_eq!(state.work.solves, roots.len() as u64);
             for (index, root) in roots.iter().enumerate() {
@@ -5050,22 +5097,35 @@ mod tests {
                     "a later capture must inherit the fill's keys: {:?}",
                     replay_reads.keys()
                 );
-                assert!(replay_reads.unattributed_reads() >= produced.unattributed_reads);
-                assert!(
-                    Arc::ptr_eq(&replay, produced),
-                    "consumer must read the memo product"
+                assert!(replay_reads.unattributed_reads() >= produced.channels.unattributed_reads);
+                assert_eq!(
+                    replay.channels.reuse_refused,
+                    produced.channels.reuse_refused
                 );
+                if produced.channels.reuse_refused {
+                    assert!(replay.channels.reuse_refused);
+                    assert!(!Arc::ptr_eq(&replay, produced));
+                    assert_eq!(consumer.work.solves, 1);
+                    assert_eq!(consumer.work.root_memo_hits, 0);
+                    assert_eq!(consumer.work.root_memo_solver_work, Default::default());
+                    assert_eq!(consumer.work.root_memo_semantic_work, Default::default());
+                } else {
+                    assert!(
+                        Arc::ptr_eq(&replay, produced),
+                        "consumer must read the memo product"
+                    );
+                    assert_eq!(consumer.work.solves, 0);
+                    assert_eq!(consumer.work.root_memo_hits, 1);
+                    assert_eq!(consumer.work.root_memo_solver_work, produced.solver_work);
+                    assert_eq!(
+                        consumer.work.root_memo_semantic_work,
+                        produced.semantic_work
+                    );
+                }
                 assert_eq!(
                     observations(&replay),
                     fresh[index],
                     "memo root index={index}"
-                );
-                assert_eq!(consumer.work.solves, 0);
-                assert_eq!(consumer.work.root_memo_hits, 1);
-                assert_eq!(consumer.work.root_memo_solver_work, produced.solver_work);
-                assert_eq!(
-                    consumer.work.root_memo_semantic_work,
-                    produced.semantic_work
                 );
                 assert_eq!(
                     consumer.work.incomplete_roots,
@@ -5158,8 +5218,7 @@ mod tests {
             solver_work: Default::default(),
             semantic_work: Default::default(),
             reads: Vec::new(),
-            unattributed_reads: 0,
-            execution_dependences: 0,
+            channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels::default(),
         });
         let census = product.census();
         assert_eq!(census.owned_text_bytes, product.retained_bytes());
@@ -5203,8 +5262,8 @@ mod tests {
     #[test]
     fn root_result_semantics_rotates_with_solver_projection_and_semantic_limits() {
         assert_eq!(
-            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v17",
-            "a root cached as finding-free before the conditional absent-member tier may now carry a conditional finding"
+            ROOT_RESULT_ALGORITHM_ID, b"type-flow-root-algorithm-v18",
+            "a root cached before the same-event join (#10539) may have lost a returned join arm's classes"
         );
         let adapter = type_flow_adapter(Language::Python).expect("Python supports type flow");
         let limits = CodeQueryValueFlowLimits::default();

@@ -28,6 +28,7 @@ use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::project_reads::ReadCapability;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
@@ -50,14 +51,6 @@ pub struct MethodCallReturnCacheKey {
     pub arity: usize,
 }
 
-pub struct ScanState<'a> {
-    pub max_usages: usize,
-    pub hits: &'a mut BTreeSet<UsageHit>,
-    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub raw_match_count: &'a mut usize,
-    pub limit_exceeded: &'a mut bool,
-}
-
 /// The exact reason a per-file evidence build cannot be published.
 ///
 /// A complete zero-hit scan is represented by [`JavaFileUsageEvidence`] with
@@ -73,7 +66,6 @@ pub enum JavaFileEvidenceOmission {
     ClassRange,
     RelationalFrontier,
     UnavailableCapability,
-    InternalSafetyCap,
 }
 
 /// Immutable, uncapped semantic evidence for one Java file and one target
@@ -162,11 +154,7 @@ pub struct ScanCtx<'a> {
     pub line_starts: &'a [usize],
     pub spec: &'a TargetSpec,
     pub bindings: &'a mut LocalInferenceEngine<String>,
-    pub hits: &'a mut BTreeSet<UsageHit>,
-    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
-    pub raw_match_count: &'a mut usize,
-    pub max_usages: usize,
-    pub limit_exceeded: &'a mut bool,
+    pub usages: &'a mut UsageAccumulator,
     pub class_ranges: ClassRangeIndex,
     pub method_call_return_cache: CaptureScopedMemo<
         RefCell<HashMap<MethodCallReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
@@ -206,8 +194,7 @@ impl ScanCtx<'_> {
 ///
 /// This is the adapter seam used by analysis-side cache acquisition. The
 /// scan deliberately uses the existing graph resolver and frontier-backed
-/// questions, but it never receives a request hit limit. A limit trip is
-/// therefore an internal safety failure and cannot become a cacheable value.
+/// questions, but it never receives a request hit limit.
 pub fn scan_file_evidence(
     java: &dyn JavaSource,
     _token: QueryToken<'_>,
@@ -248,19 +235,9 @@ pub fn scan_file_evidence(
         return JavaFileEvidenceBuildOutcome::Cancelled;
     }
 
-    let mut hits = BTreeSet::new();
-    let mut unproven_hits = BTreeSet::new();
-    let mut raw_match_count = 0usize;
-    let mut limit_exceeded = false;
-    let mut state = ScanState {
-        // Evidence must include every hit. Keeping this at usize::MAX means
-        // the request-level maximum cannot truncate or poison publication.
-        max_usages: usize::MAX,
-        hits: &mut hits,
-        unproven_hits: &mut unproven_hits,
-        raw_match_count: &mut raw_match_count,
-        limit_exceeded: &mut limit_exceeded,
-    };
+    // Evidence must include every hit, so the request-level maximum cannot
+    // truncate or poison publication; the analysis layer applies it on merge.
+    let mut usages = UsageAccumulator::unbounded();
     scan_prepared_file(
         java,
         graph,
@@ -268,14 +245,12 @@ pub fn scan_file_evidence(
         spec,
         return_caches,
         &prepared,
-        &mut state,
+        &mut usages,
     );
     if cancellation.is_cancelled() {
         return JavaFileEvidenceBuildOutcome::Cancelled;
     }
-    if limit_exceeded {
-        return JavaFileEvidenceBuildOutcome::Omitted(JavaFileEvidenceOmission::InternalSafetyCap);
-    }
+    let (hits, unproven_hits, raw_match_count) = usages.into_unbounded_parts();
     JavaFileEvidenceBuildOutcome::Complete(JavaFileUsageEvidence {
         hits,
         unproven_hits,
@@ -339,7 +314,7 @@ fn scan_prepared_file(
     spec: &TargetSpec,
     return_caches: &ReturnTypeCaches<'_>,
     prepared: &PreparedJavaFile,
-    state: &mut ScanState<'_>,
+    usages: &mut UsageAccumulator,
 ) {
     if !prepared.target_present {
         return;
@@ -357,11 +332,7 @@ fn scan_prepared_file(
         line_starts: &prepared.line_starts,
         spec,
         bindings: &mut bindings,
-        hits: state.hits,
-        unproven_hits: state.unproven_hits,
-        raw_match_count: state.raw_match_count,
-        max_usages: state.max_usages,
-        limit_exceeded: state.limit_exceeded,
+        usages,
         class_ranges: prepared.class_ranges.clone(),
         method_call_return_cache: CaptureScopedMemo::default(),
         receiver_target_match_cache: CaptureScopedMemo::default(),
@@ -414,7 +385,6 @@ fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let mut work = vec![Work::Visit(node)];
     while let Some(item) = work.pop() {
         let node = match item {
-            // Unwind scopes even after a hit limit stops further visits.
             Work::ExitScope => {
                 ctx.bindings.exit_scope();
                 continue;
@@ -424,16 +394,11 @@ fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
                 continue;
             }
             Work::SeedResource(resource) => {
-                if !*ctx.limit_exceeded {
-                    seed_typed_binding(resource, token, ctx);
-                }
+                seed_typed_binding(resource, token, ctx);
                 continue;
             }
             Work::Visit(node) => node,
         };
-        if *ctx.limit_exceeded {
-            continue;
-        }
         if node.kind() == "try_with_resources_statement" {
             ctx.bindings.enter_scope();
             let resources = node.child_by_field_name("resources");

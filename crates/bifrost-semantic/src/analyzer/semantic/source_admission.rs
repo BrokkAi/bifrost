@@ -2,9 +2,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionDimension {
     SourceBytes,
-    Nodes,
-    Depth,
-    SpanBytes,
     ExcludedNodes,
 }
 

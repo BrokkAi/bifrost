@@ -13,6 +13,12 @@ type Payload = Arc<dyn Any + Send + Sync>;
 /// The narrow operation core can perform on an opaque attribution frame.
 pub trait ExecutionAttribution: Any + Send + Sync {
     fn mark_execution_dependent(&self);
+
+    /// An execution dependence caused by a refused budget charge. A recipient
+    /// that does not tell the causes apart records an ordinary dependence.
+    fn mark_budget_refusal(&self) {
+        self.mark_execution_dependent();
+    }
 }
 
 #[derive(Clone)]
@@ -23,12 +29,47 @@ struct Frame {
 
 /// Mark the observing thread's current capture, including transported work.
 /// An absent or explicitly empty frame has no recipient.
+#[track_caller]
 pub fn mark_execution_dependent() {
+    mark(std::panic::Location::caller(), "ambient", |attribution| {
+        attribution.mark_execution_dependent();
+    });
+}
+
+/// Mark the observing thread's current capture with an execution dependence
+/// caused by a refused budget charge, so the capture can tell it from a
+/// provider failure or a cancellation.
+#[track_caller]
+pub fn mark_budget_refusal() {
+    mark(
+        std::panic::Location::caller(),
+        "ambient_budget",
+        |attribution| {
+            attribution.mark_budget_refusal();
+        },
+    );
+}
+
+/// [`mark_execution_dependent`] for a core observer (a cancellation token or
+/// a limited counter), so the census can tell observations from hand marks.
+#[track_caller]
+pub(crate) fn mark_observed(route: &'static str) {
+    mark(std::panic::Location::caller(), route, |attribution| {
+        attribution.mark_execution_dependent();
+    });
+}
+
+fn mark(
+    origin: &'static std::panic::Location<'static>,
+    route: &'static str,
+    deliver: impl FnOnce(&dyn ExecutionAttribution),
+) {
+    let _census = super::execution_census::mark_scope(origin, route);
     CONTEXT.with(|stack| {
         if let Some(Some(frame)) = stack.borrow().last()
             && let Some(attribution) = &frame.execution
         {
-            attribution.mark_execution_dependent();
+            deliver(attribution.as_ref());
         }
     });
 }

@@ -1,5 +1,6 @@
 use super::*;
 use brokk_bifrost_jvm_analysis::JavaAnalyzer;
+use brokk_bifrost_test_macros::hardwon;
 
 fn typestate_policy() -> PolicyRegistry {
     let source = crate::test_support::typestate_policy_source(
@@ -24,6 +25,7 @@ fn unsupported_typestate_reports_its_type_and_one_diagnostic() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::builder()
         .with_max_diagnostics(1)
@@ -63,6 +65,7 @@ fn explicit_scope_refuses_typestate_with_scope_capability() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::default();
     let run = DefaultPolicyEvaluator::new()
@@ -96,6 +99,7 @@ fn incomplete_typestate_compile_keeps_caller_budget_and_diagnostic() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::builder()
         .with_max_diagnostics(1)
@@ -130,6 +134,7 @@ impl TypestatePolicyEvaluator for FailedTypestateAdapter {
         _policy: &LoadedPolicy,
         _spec: &ResolvedTypestatePolicySpec,
         _context: &PolicyEvaluationContext<'_>,
+        _subject_scope: brokk_bifrost_rql::structural::search::CodeQueryExecutionScope<'_>,
         _budget: &PolicyBudget,
     ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
         Err(TypestateCompilationFailure::failed(
@@ -165,6 +170,7 @@ fn failed_typestate_compile_retains_one_failure_diagnostic() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::builder()
         .with_max_diagnostics(1)
@@ -218,6 +224,7 @@ fn match_finding_keeps_organizational_risk_overlay() {
         cvss_overlays: &[],
         organizational_risk: &overlays,
         incremental: None,
+        identifier_typos: None,
     };
     let run = DefaultPolicyEvaluator::new()
         .evaluate(policy, &context, &mut PolicyBudget::default())
@@ -254,6 +261,7 @@ fn explicit_scope_refuses_relational_binding_outside_scope() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let run = DefaultPolicyEvaluator::new()
         .evaluate_in_scope(
@@ -308,6 +316,7 @@ fn proven_subset_and_overlay_cap_report_distinct_reasons() {
         cvss_overlays: &[],
         organizational_risk: &overlays,
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::builder()
         .with_max_evidence_refs_per_finding(1)
@@ -336,6 +345,59 @@ fn proven_subset_and_overlay_cap_report_distinct_reasons() {
                 .contains(&FindingIncompleteReason::EvidenceTruncated)
         );
     }
+}
+
+#[test]
+#[hardwon("#10047: a zero diagnostic cap turned declared subset runs into failed runs")]
+fn declared_subset_survives_zero_diagnostic_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    ProjectFile::new(root.clone(), "Smells.java")
+        .write("class Smells { void run() { System.exit(1); } }\n")
+        .unwrap();
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+    let registry = policy_registry(
+        "test:declared-subset-zero-budget",
+        r#"(policy :id "test.declared-subset-zero-budget" :name "Subset"
+            :message "Exit" :severity warning
+            :coverage (proven-subset :reason "Only direct calls")
+            :analysis (analysis :type match :selector
+              (rql (language java (call :callee (name "exit"))))) )"#,
+    );
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let context = PolicyEvaluationContext {
+        analyzer: &analyzer,
+        workspace: None,
+        flow_state: &flow_state,
+        root_memo: None,
+        cancellation: None,
+        cvss_overlays: &[],
+        organizational_risk: &[],
+        incremental: None,
+        identifier_typos: None,
+    };
+    let mut budget = PolicyBudget::builder()
+        .with_max_diagnostics(0)
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = DefaultPolicyEvaluator::new()
+        .evaluate(registry.policies().next().unwrap(), &context, &mut budget)
+        .unwrap();
+    assert!(matches!(
+        run.completion(),
+        PolicyRunCompletion::Inconclusive { reasons, .. }
+            if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
+    ));
+    assert_eq!(run.findings().len(), 1);
+    assert!(
+        run.findings()[0]
+            .completeness()
+            .reasons()
+            .contains(&FindingIncompleteReason::DeclaredNonExhaustive)
+    );
+    assert!(run.diagnostics().is_empty());
+    assert!(run.diagnostics_truncated());
 }
 
 #[test]
@@ -403,6 +465,7 @@ fn two_match_run_with_budget(
         cvss_overlays: &[],
         organizational_risk: overlays,
         incremental: None,
+        identifier_typos: None,
     };
     DefaultPolicyEvaluator::new().evaluate(policy, &context, &mut budget)
 }
@@ -539,6 +602,7 @@ fn distinct_overlay_evidence_omissions_are_counted_once_each() {
         cvss_overlays: &cvss_overlays,
         organizational_risk: &organizational_risk,
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::builder()
         .with_max_evidence_refs_per_finding(0)
@@ -634,6 +698,7 @@ fn risk_overlay_preserves_proof_and_origin_reference_priority() {
         cvss_overlays: &[],
         organizational_risk: &overlays,
         incremental: None,
+        identifier_typos: None,
     };
     let mut budget = PolicyBudget::builder()
         .with_max_evidence_refs_per_finding(5)

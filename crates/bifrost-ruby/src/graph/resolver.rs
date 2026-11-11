@@ -1102,8 +1102,13 @@ mod tests {
         }
     }
     impl ImportAnalysisProvider for Fixture {
-        fn imported_code_units_of(&self, _: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            unimplemented!()
+        fn imported_code_units_of(
+            &self,
+            _: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> { unimplemented!() },
+            )
         }
         fn referencing_files_of(&self, _: &ProjectFile) -> HashSet<ProjectFile> {
             unimplemented!()
@@ -1248,9 +1253,10 @@ mod tests {
             (
                 build(),
                 brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads {
+                    runtime_cache_touched: false,
                     keys: Arc::from([]),
-                    unattributed_reads: 0,
-                    execution_dependences: 0,
+                    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels::default(
+                    ),
                     first_refusal: None,
                     first_execution_refusal: None,
                 },

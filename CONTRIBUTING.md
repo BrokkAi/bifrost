@@ -65,7 +65,13 @@ it with `cargo install --locked cargo-machete --version 0.9.2`. If it flags a
 dependency that is genuinely used (macro-only, feature-gated, or build-script
 use it cannot see), add the dependency to that crate's
 `[package.metadata.cargo-machete] ignored` list with a comment explaining why
-it is real; otherwise remove the dependency.
+it is real; otherwise remove the dependency. A manifest that is golden or
+policy fixture input rather than a compiled crate is not covered by either
+option. Hide it from the scan with a `.ignore` file beside the fixture root,
+listing the manifest path relative to that file's directory (for example
+`/workspace/Cargo.toml`) and a comment naming the golden that consumes it.
+Do not edit a fixture manifest to satisfy machete when a golden records its
+bytes.
 
 Bifrost's default feature set is empty. Include the `python` feature when
 running the Python-facing Rust test suite. Run Rust tests that
@@ -192,8 +198,8 @@ demand through `workflow_dispatch`. It runs the whole workspace with
 cadenced Python, extension and plugin legs, the
 licenses-and-crates assurance job (which also packages the exact crate
 archives), the open-core `classification` check, and the `release preflight`
-job, which rehearses the release harness on Linux/x86 against a locally built
-release binary: the pinned cargo-about, cargo-zigbuild and Zig install paths,
+jobs, which rehearse the release harness on Linux/x86 against locally built
+release binaries, one job per release build: the pinned cargo-about, cargo-zigbuild and Zig install paths,
 the glibc-2.28 binary and semantic-pack tool builds, the ELF and MCP
 compatibility contracts, the Python client and uv CLI wheels, the sdist, the
 agent-plugin, DSH, Pi and npm packaging, and the prepublish Codex and Claude
@@ -462,9 +468,9 @@ published crate archives. Hosts own external rule acquisition and activation.
 Core qualification records the empty catalog and an explicit not-evaluated
 scan separately from requested external-content acceptance. Parser assets and
 separate semantic/type/declaration packs retain their existing boundaries.
-Legacy authored and embedded semantic content still present in the checkout
-is transition debt, not a second authoring stream; its source removal is a
-separate post-release migration.
+The engine registers no built-in semantic packs (#4438). Legacy authored
+content still present in the checkout is retained test input, not a second
+authoring stream.
 
 After the **Release** workflow succeeds, `publish-npm.yml` packages each native
 archive as a platform package. It publishes the platform packages first. It
@@ -488,7 +494,8 @@ extracts it, and creates a fresh launcher cache. It then prepares the preferred
 binary with path lookup disabled (therefore exercising the published archive
 and checksum sidecar), runs `doctor` in exact-version mode, and makes an actual
 MCP `list_policies` call through both the published Codex and Claude adapter
-configs. It also checks the exact release tag's Codex and Claude marketplace
+configs; core ships no product rules, so each call must return an empty pack
+catalog. It also checks the exact release tag's Codex and Claude marketplace
 entries, so a missing public marketplace cannot hide behind a valid package
 archive. It does not modify Codex or Claude configuration, start a model
 session, or require host API credentials. The smoke runs for the current

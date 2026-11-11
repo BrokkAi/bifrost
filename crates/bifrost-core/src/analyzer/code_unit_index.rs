@@ -332,7 +332,7 @@ pub trait CodeUnitIndex: Send + Sync {
     /// bare-name ambiguity silently drops it) whose persisted terminal
     /// identifier (the leaf display name, e.g. `bar` for `pkg.Foo.bar`)
     /// equals `identifier`. Backed by the partial
-    /// `idx_code_units_lang_identifier_lookup` index. Implementations that
+    /// `idx_code_units_lang_identifier` index. Implementations that
     /// cannot answer cheaply return an empty set; callers retain their
     /// broader lookup path.
     fn lookup_candidates_by_identifier(&self, _identifier: &str) -> BTreeSet<CodeUnit> {

@@ -62,42 +62,53 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         Some(facts)
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        self.memo_caches.imported_code_units.read(
-            &memo_attribution(self),
-            |imported_code_units_memo| {
-                let scope = AnalyzerQueryScope::new(self);
-                let token = scope.token();
-                if let Some(cached) = imported_code_units_memo.get(file) {
-                    return cached;
-                }
-                let cache_fill =
-                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-                let namespaces = self.using_namespaces_of(token, file);
-                let aliases = self.using_aliases_of(token, file);
-                if namespaces.is_empty() && aliases.is_empty() {
-                    return Arc::new(HashSet::default());
-                }
-                let mut imported: HashSet<CodeUnit> = HashSet::default();
-                for namespace in &namespaces {
-                    imported.extend(
-                        self.inner
-                            .class_declarations_in_package(namespace)
-                            .iter()
-                            .cloned(),
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            self.memo_caches.imported_code_units.read(
+                &memo_attribution(self),
+                |imported_code_units_memo| {
+                    let scope = AnalyzerQueryScope::new(self);
+                    let token = scope.token();
+                    if let Some(cached) = imported_code_units_memo.get(file) {
+                        return cached;
+                    }
+                    let cache_fill =
+                        brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                    let namespaces = self.using_namespaces_of(token, file);
+                    let aliases = self.using_aliases_of(token, file);
+                    if namespaces.is_empty() && aliases.is_empty() {
+                        return Arc::new(
+                            brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                                HashSet::default(),
+                            ),
+                        );
+                    }
+                    let mut imported: HashSet<CodeUnit> = HashSet::default();
+                    for namespace in &namespaces {
+                        imported.extend(
+                            self.inner
+                                .class_declarations_in_package(namespace)
+                                .iter()
+                                .cloned(),
+                        );
+                    }
+                    for target in aliases.values() {
+                        imported.extend(visible_type_candidates(self, token, file, target));
+                    }
+                    let imported = Arc::new(
+                        brokk_bifrost_core::retention_budget::Accounted::uncharged(imported),
                     );
-                }
-                for target in aliases.values() {
-                    imported.extend(visible_type_candidates(self, token, file, target));
-                }
-                let imported = Arc::new(imported);
-                if cache_fill.is_complete() {
-                    imported_code_units_memo.insert(file.clone(), Arc::clone(&imported));
-                }
-                imported
-            },
-            |_| self.compilation_authority_inputs(),
-        )
+                    if cache_fill.is_complete() {
+                        imported_code_units_memo.insert(file.clone(), Arc::clone(&imported));
+                    }
+                    imported
+                },
+                |_| self.compilation_authority_inputs(),
+            )
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFrameworks></TargetFrameworks><UseArtifactsOutput>true</UseArtifactsOutput><BaseIntermediateOutputPath>obj/</BaseIntermediateOutputPath></PropertyGroup></Project>

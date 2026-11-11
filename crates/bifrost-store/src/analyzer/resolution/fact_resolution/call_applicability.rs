@@ -60,6 +60,17 @@ pub enum PartialOrder {
     Unknown,
 }
 
+/// A language's answer for one reference conversion between exact argument
+/// and formal types. `Refuted` makes the candidate inapplicable, so a
+/// language returns it only when no conversion of that language can apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ReferenceConversion {
+    Proven,
+    Refuted,
+    Unproven,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum ConversionKind {
@@ -205,6 +216,12 @@ pub enum ImplicitReceiverScopeKind {
 
 #[doc(hidden)]
 pub trait CallApplicabilityAdapter: Sync {
+    /// A bare term with no expected type may select its most specific member
+    /// before any application or value conversion is considered.
+    fn bare_nonapplication_specificity(&self) -> bool {
+        false
+    }
+
     /// Whether exact external call evidence may discharge a known-head
     /// receiver argument reason for this language.
     fn discharges_known_head_external_arguments(&self) -> bool {
@@ -397,6 +414,16 @@ pub trait CallApplicabilityAdapter: Sync {
 
     fn result_application_member_names(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// Whether this intrinsic type is closed and has no application member,
+    /// so a value of it can never consume an argument list.
+    fn intrinsic_type_rejects_application(
+        &self,
+        _kind: IntrinsicTypeKind,
+        _spelling: &str,
+    ) -> bool {
+        false
     }
 
     /// Declared members whose eligibility is proved by the selected facts.
@@ -607,17 +634,17 @@ pub trait CallApplicabilityAdapter: Sync {
         Ok(Some((answer, None)))
     }
 
-    /// Prove a language's reference conversion without admitting boxing or
-    /// replacing the existing primitive invocation phases.
-    fn proves_reference_conversion(
+    /// Prove or refute a language's reference conversion without admitting
+    /// boxing or replacing the existing primitive invocation phases.
+    fn reference_conversion(
         &self,
         _evaluation: &mut FactEvaluation<'_, '_>,
         _operand_slots: [SemanticId; 2],
         _source: ResolutionTypeRef,
         _target: ResolutionTypeRef,
         _states: &StateMap,
-    ) -> StoreResult<Option<bool>> {
-        Ok(Some(false))
+    ) -> StoreResult<Option<ReferenceConversion>> {
+        Ok(Some(ReferenceConversion::Unproven))
     }
 
     fn classify_primitive_pairs(
@@ -1799,6 +1826,31 @@ impl FactEvaluation<'_, '_> {
                 let member_names = adapter.declared_result_application_member_names();
                 if member_names.is_empty() {
                     return Ok(Some(ResultApplicationAssessment::Unknown));
+                }
+                let owners = result_types
+                    .iter()
+                    .map(|result_type| result_type.identity())
+                    .collect::<Vec<_>>();
+                // A closed intrinsic such as Scala `Unit` publishes no member
+                // scope, so the member search below would leave it open. The
+                // language proves it has no application member instead.
+                let Some(intrinsics) = self.session.intrinsic_call_type_descriptors(&owners)?
+                else {
+                    return Ok(None);
+                };
+                result_types.retain(|result_type| {
+                    !intrinsics.iter().any(|intrinsic| {
+                        intrinsic.identity() == result_type.identity()
+                            && adapter.intrinsic_type_rejects_application(
+                                intrinsic.kind(),
+                                intrinsic.spelling(),
+                            )
+                    })
+                });
+                if result_types.is_empty() {
+                    return Ok(Some(ResultApplicationAssessment::Inapplicable(
+                        CallableRejectionReason::ListShapeMismatch,
+                    )));
                 }
                 let owners = result_types
                     .iter()

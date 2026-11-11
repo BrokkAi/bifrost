@@ -809,10 +809,21 @@ pub enum WorkspaceSemanticModelRegistrationError {
 
 impl WorkspaceSemanticModelRegistrationError {
     /// The workspace-relative source path this failure is about, when it is
-    /// about one file rather than the directory as a whole.
+    /// about one file rather than the directory as a whole. Discovery that
+    /// failed only because one file was rejected is about that file (#10002).
     pub fn path(&self) -> Option<&str> {
         match self {
-            Self::DiscoveryIncomplete { .. } => None,
+            Self::DiscoveryIncomplete { report } => {
+                let mut invalid = report.files.iter().filter(|file| !file.valid);
+                match (
+                    report.diagnostics.is_empty(),
+                    invalid.next(),
+                    invalid.next(),
+                ) {
+                    (true, Some(file), None) => Some(&file.path),
+                    _ => None,
+                }
+            }
             Self::UnsupportedSourceFormat { path, .. }
             | Self::ReadFailed { path, .. }
             | Self::CompileFailed { path, .. }
@@ -1081,6 +1092,9 @@ pub fn activation_status_name(status: SemanticModelActivationStatus) -> &'static
         SemanticModelActivationStatus::Active => "active",
         SemanticModelActivationStatus::Disabled => "disabled",
         SemanticModelActivationStatus::Incompatible => "incompatible",
+        SemanticModelActivationStatus::ApproximateDistributedBlocked => {
+            "approximate_distributed_blocked"
+        }
         SemanticModelActivationStatus::ReviewRequired => "review_required",
         SemanticModelActivationStatus::Shadowed => "shadowed",
         SemanticModelActivationStatus::Conflict => "conflict",

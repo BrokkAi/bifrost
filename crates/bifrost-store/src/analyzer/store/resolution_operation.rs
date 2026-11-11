@@ -8,13 +8,18 @@
 
 mod services;
 pub(in crate::analyzer::store) use services::selected_jvm_declaration_owner;
-pub use services::{SelectedAnalyzerServices, SelectedModelAuthority};
+pub(in crate::analyzer::store) mod python_models;
+pub use services::{
+    ConfigurationCertificate, ModelRuntimeBases, SelectedAnalyzerServices,
+    SelectedExternalBindingRead, SelectedExternalBindingRequest, SelectedMacroFrontierReads,
+    SelectedModelAuthority,
+};
 
 #[doc(hidden)]
 pub mod go_context;
 #[doc(hidden)]
 pub mod go_hierarchy;
-pub use go_context::GO_IMPORT_INCOMPLETE;
+pub use go_context::{GO_EXTERNAL_MEMBER_UNPROVIDED, GO_IMPORT_INCOMPLETE};
 #[doc(hidden)]
 pub mod go_named;
 pub(crate) use go_named::GoPreparedImportContext;
@@ -26,6 +31,7 @@ pub use go_named::GoPreparedImportContextOutcome;
 pub mod go_demand;
 use go_demand::GoForwardOperationContext;
 
+pub(crate) mod declaration_access;
 #[doc(hidden)]
 pub mod go_method_family;
 #[doc(hidden)]
@@ -39,6 +45,13 @@ mod java_access;
 pub(crate) use java_access::JvmAccessPolicy;
 #[doc(hidden)]
 pub mod jvm_context;
+// Integration slice S-I connects this walk to selected JVM operations.
+#[expect(dead_code)]
+mod inherited_member_walk;
+
+fn missing_read_reuse_authority(context: &str) -> StoreError {
+    StoreError::new(format!("{context} read reuse authority is unavailable"))
+}
 #[doc(hidden)]
 pub mod jvm_demand;
 #[doc(hidden)]
@@ -47,18 +60,23 @@ mod jvm_hierarchy_order;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod jvm_reverse_rows;
-pub(in crate::analyzer) mod nominal_rules;
 #[cfg(any(test, feature = "test-support"))]
-pub(in crate::analyzer::store) mod python_demand;
+pub mod nominal_reverse;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use python_demand::PythonSelectedImportBoundary;
-#[cfg(any(test, feature = "test-support"))]
+pub mod nominal_reverse_rows;
+pub(in crate::analyzer) mod nominal_rules;
+pub(in crate::analyzer::store) mod python_demand;
+#[doc(hidden)]
+pub use python_demand::{
+    PythonDefinitionAnswer, PythonExternalSelectionState, PythonSelectedExternalImport,
+    PythonSelectedImportBoundary,
+};
 #[path = "resolution_operation/python_demand/lexical.rs"]
 pub(crate) mod python_lexical;
-#[cfg(any(test, feature = "test-support"))]
 mod python_members;
-#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use python_members::operations::PythonMutationQuery;
 #[doc(hidden)]
 pub mod python_reverse;
 #[doc(hidden)]
@@ -76,6 +94,8 @@ pub mod native_units;
 pub use native_units::SelectedNativeAssignmentValue;
 
 #[doc(hidden)]
+pub use native_units::ExternalOwnerDefinitionAuthority;
+#[doc(hidden)]
 pub use native_units::NativeExternalMemberTarget;
 #[doc(hidden)]
 pub use native_units::ProjectedNativeMemberContext;
@@ -92,6 +112,17 @@ pub use native_units::SelectedNativeReferenceUnits;
 #[doc(hidden)]
 pub use native_units::SelectedNativeTypes;
 
+enum NativeLanguageDemand<'a> {
+    None,
+    Go {
+        demand: Box<go_named::GoDemandContext>,
+        receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
+    },
+    Python {
+        environment: &'a super::python_unit_summaries::PythonSelectedEnvironment,
+    },
+}
+
 pub(super) struct NativeReferenceQuery<'a> {
     context: SelectedResolutionContextSet,
     locator: &'a SelectedSemanticLocator,
@@ -99,9 +130,8 @@ pub(super) struct NativeReferenceQuery<'a> {
     context_metrics: &'a mut SelectedResolutionContextMetrics,
     session: &'a ResolutionSession,
     artifacts: Option<&'a mut crate::analyzer::resolution::ForwardCandidateArtifactCache>,
-    go_demand: Option<go_named::GoDemandContext>,
+    language_demand: NativeLanguageDemand<'a>,
     selected_import_gap: Option<(SemanticId, SemanticId)>,
-    go_receiver_overlay: Option<crate::analyzer::resolution::GoReceiverSlotTypeOverlay>,
     query_result_slot: Option<SemanticId>,
     point_metrics: Option<&'a mut ResolutionBatchMetrics>,
 }
@@ -119,7 +149,7 @@ mod root_bridges;
 #[doc(hidden)]
 pub mod rust_crate_context;
 pub(super) mod rust_derive_helpers;
-use super::resolution_stage::SelectedResolutionStageOutcome;
+pub use super::resolution_stage::SelectedResolutionStageOutcome;
 
 use crate::analyzer::resolution::SeamProfiled;
 
@@ -213,6 +243,7 @@ pub(crate) use rust_reverse::SelectedRustReverseBatchOutcome;
 pub(crate) use rust_reverse::SelectedRustReverseQueries;
 pub(crate) use rust_reverse::SelectedRustTargetReferences;
 
+use std::cell::Cell;
 use std::cell::OnceCell;
 use std::cell::RefCell;
 
@@ -222,6 +253,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::Language;
@@ -365,6 +397,7 @@ use super::selected_definition::SelectedDefinitionUnitReadOutcome;
 use super::selected_definition::SelectedLexicalDefinitionReadOutcome;
 
 use super::selected_read_memo::ExactReadMemo;
+use brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal;
 
 use super::AnalyzerStore;
 use super::Result;
@@ -799,26 +832,31 @@ pub(crate) fn rust_declaration_context_sources(
 pub struct SelectedResolutionOperationInput<'project, 'selection> {
     project: &'project dyn Project,
     analyzer: Option<&'project dyn SelectedAnalyzerServices>,
+    read_reuse: Option<&'project dyn ReadReuseRefusal>,
     analysis_generation: u64,
     workspace_id: &'selection WorkspaceId,
     snapshots: &'selection WorkspaceSnapshots,
     languages: &'selection [SelectedResolutionLanguage],
     overlay_masks: &'selection [SelectedResolutionOverlayMask],
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
+    explicit_model_authority: Option<Option<Arc<dyn SelectedModelAuthority + Send + Sync>>>,
 }
 
 /// A worker recreates exactly the enclosing query's authority inputs.
 /// Owned selection descriptors die with that query; project/analyzer remain borrowed.
 #[doc(hidden)]
+#[derive(Clone)]
 pub struct CapturedSelectedResolutionInput<'project> {
     project: &'project dyn Project,
     analyzer: Option<&'project dyn SelectedAnalyzerServices>,
+    read_reuse: Option<&'project dyn ReadReuseRefusal>,
     analysis_generation: u64,
     workspace_id: WorkspaceId,
     snapshots: WorkspaceSnapshots,
     languages: Vec<SelectedResolutionLanguage>,
     overlay_masks: Vec<SelectedResolutionOverlayMask>,
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
+    explicit_model_authority: Option<Option<Arc<dyn SelectedModelAuthority + Send + Sync>>>,
 }
 
 impl<'project> CapturedSelectedResolutionInput<'project> {
@@ -827,12 +865,14 @@ impl<'project> CapturedSelectedResolutionInput<'project> {
         Self {
             project: input.project,
             analyzer: input.analyzer,
+            read_reuse: input.read_reuse,
             analysis_generation: input.analysis_generation,
             workspace_id: input.workspace_id.clone(),
             snapshots: input.snapshots.clone(),
             languages: input.languages.to_vec(),
             overlay_masks: input.overlay_masks.to_vec(),
             content_mounts: input.content_mounts.clone(),
+            explicit_model_authority: input.explicit_model_authority.clone(),
         }
     }
 
@@ -841,12 +881,14 @@ impl<'project> CapturedSelectedResolutionInput<'project> {
         SelectedResolutionOperationInput {
             project: self.project,
             analyzer: self.analyzer,
+            read_reuse: self.read_reuse,
             analysis_generation: self.analysis_generation,
             workspace_id: &self.workspace_id,
             snapshots: &self.snapshots,
             languages: &self.languages,
             overlay_masks: &self.overlay_masks,
             content_mounts: self.content_mounts.clone(),
+            explicit_model_authority: self.explicit_model_authority.clone(),
         }
     }
 }
@@ -863,12 +905,14 @@ impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection
         Self {
             project,
             analyzer: None,
+            read_reuse: None,
             analysis_generation: project.analysis_generation(),
             workspace_id,
             snapshots,
             languages,
             overlay_masks,
             content_mounts: Vec::new(),
+            explicit_model_authority: None,
         }
     }
 
@@ -884,6 +928,27 @@ impl<'project, 'selection> SelectedResolutionOperationInput<'project, 'selection
     #[doc(hidden)]
     pub fn with_analyzer(mut self, analyzer: &'project dyn SelectedAnalyzerServices) -> Self {
         self.analyzer = Some(analyzer);
+        self.read_reuse = Some(analyzer);
+        self
+    }
+
+    /// Supply only negative reuse attribution, without declaration/model authority.
+    #[doc(hidden)]
+    pub fn with_read_reuse(mut self, read_reuse: &'project dyn ReadReuseRefusal) -> Self {
+        self.read_reuse = Some(read_reuse);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_model_authority(
+        mut self,
+        authority: Option<Arc<dyn SelectedModelAuthority + Send + Sync>>,
+    ) -> Self {
+        assert!(
+            self.explicit_model_authority.is_none(),
+            "model authority is set once"
+        );
+        self.explicit_model_authority = Some(authority);
         self
     }
 }
@@ -992,13 +1057,257 @@ pub trait SelectedResolutionBroadStager {
 }
 
 /// Generated macro-reference facts staged for this crate operation.
-#[derive(Default)]
+#[derive(Clone, Default)]
 #[doc(hidden)]
 pub struct MacroOverlaySlot {
     /// Caller files already covered. Reverse confirmation adds callers in
     /// batches, so a crate-wide prepared bit can hide later files' facts.
     #[doc(hidden)]
     pub prepared_files: HashSet<String>,
+}
+
+/// One bounded macro frontier snapshot on a pooled SQLite reader.
+/// Its bounded shadow rows live in the reader's TEMP database.
+pub(in crate::analyzer::store) struct RetainedMacroFrontier {
+    stage_tables: Vec<String>,
+    requested_files: Vec<PathBuf>,
+    checked_files: HashSet<PathBuf>,
+    overlay: MacroOverlaySlot,
+    prepared_files: HashSet<PathBuf>,
+    receipt: Box<dyn std::any::Any + Send + Sync>,
+    selection_fingerprint: [u8; 32],
+    routing_digest: [u8; 32],
+    scope_identity: [u8; 32],
+    analysis_generation: u64,
+    main_data_version: i64,
+}
+
+#[cfg(test)]
+impl RetainedMacroFrontier {
+    pub(super) fn empty_for_test() -> Self {
+        Self {
+            stage_tables: Vec::new(),
+            requested_files: Vec::new(),
+            checked_files: HashSet::default(),
+            overlay: MacroOverlaySlot {
+                prepared_files: HashSet::default(),
+            },
+            prepared_files: HashSet::default(),
+            receipt: Box::new(()),
+            selection_fingerprint: [0; 32],
+            routing_digest: [0; 32],
+            scope_identity: [0; 32],
+            analysis_generation: 0,
+            main_data_version: 0,
+        }
+    }
+}
+
+// A retained reader may hold one snapshot of one small request set. The row
+// and page caps bound both the live TEMP stage and its shadow copy.
+const MAX_RETAINED_MACRO_FILES: usize = 8;
+const MAX_RETAINED_MACRO_PATH_BYTES: usize = 4096;
+const MAX_RETAINED_MACRO_RECEIPT_BYTES: usize = 16 * 1024;
+const MAX_RETAINED_MACRO_STAGE_ROWS: i64 = 20_000;
+const MAX_RETAINED_MACRO_STAGE_BYTES: i64 = 16 * 1024 * 1024;
+const RETAINED_MACRO_PREFIX: &str = "retained_macro_";
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FORCE_MACRO_POST_COPY_CAP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MACRO_READER_DISCARDS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_macro_post_copy_cap_failure_for_test(force: bool) {
+    FORCE_MACRO_POST_COPY_CAP_FOR_TEST.with(|cell| cell.set(force));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_macro_reader_discards_for_test() -> usize {
+    MACRO_READER_DISCARDS_FOR_TEST.with(|cell| cell.replace(0))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(in crate::analyzer::store) fn note_macro_reader_discard_for_test() {
+    MACRO_READER_DISCARDS_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
+}
+
+fn macro_frontier_cache_note(reads: &dyn SelectedMacroFrontierReads, hit: bool, reason: &str) {
+    #[cfg(any(test, feature = "test-support"))]
+    if hit && reason == "exact_set" {
+        MACRO_FRONTIER_CACHE_HITS.with(|cell| cell.set(cell.get() + 1));
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    if !hit && reason == "data_version" {
+        MACRO_FRONTIER_DATA_VERSION_MISSES.with(|cell| cell.set(cell.get() + 1));
+    }
+    crate::profiling::note_with(|| {
+        format!(
+            "rust_caller::macro_frontier_cache hit={hit} reason={reason} policy_unit={}",
+            reads
+                .policy_unit_label()
+                .unwrap_or_else(|| "none".to_owned())
+        )
+    });
+}
+
+// These test counters follow synchronous selected-operation reads on the caller thread.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static MACRO_FRONTIER_CACHE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MACRO_FRONTIER_PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MACRO_FRONTIER_DATA_VERSION_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_macro_frontier_cache_counts_for_test() -> (usize, usize) {
+    (
+        MACRO_FRONTIER_CACHE_HITS.with(|cell| cell.replace(0)),
+        MACRO_FRONTIER_PREPARATIONS.with(|cell| cell.replace(0)),
+    )
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_macro_frontier_data_version_misses_for_test() -> usize {
+    MACRO_FRONTIER_DATA_VERSION_MISSES.with(|cell| cell.replace(0))
+}
+
+fn macro_stage_tables(connection: &rusqlite::Connection) -> Result<Vec<String>> {
+    let sql = "SELECT name FROM temp.sqlite_schema WHERE type='table' AND \
+         (name LIKE 'selected_resolution_stage_%' OR name LIKE 'selected_resolution_admission%' \
+          OR name IN ('selected_resolution_contexts','selected_resolution_context_paths'))";
+    let mut tables = connection
+        .prepare(sql)?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for table in &tables {
+        assert!(
+            table
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+            "stage table names are trusted schema identifiers"
+        );
+    }
+    tables.sort_by_key(|table| match table.as_str() {
+        "selected_resolution_admissions" => 0,
+        "selected_resolution_stage_producers" => 1,
+        "selected_resolution_stage_nodes" => 2,
+        "selected_resolution_contexts" => 3,
+        "selected_resolution_stage_allocation_counters" => 4,
+        _ => 5,
+    });
+    Ok(tables)
+}
+
+pub(super) fn discard_macro_stage_snapshot(connection: &rusqlite::Connection) -> Result<()> {
+    for table in macro_stage_tables(connection)? {
+        let shadow = format!("{RETAINED_MACRO_PREFIX}{table}");
+        if shadow_table_exists(connection, &shadow)? {
+            connection.execute_batch(&format!("DELETE FROM temp.{shadow}"))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn macro_temp_within_cap(connection: &rusqlite::Connection) -> Result<bool> {
+    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA temp.page_size", [], |row| row.get(0))?;
+    Ok(pages.saturating_mul(page_size) <= MAX_RETAINED_MACRO_STAGE_BYTES)
+}
+
+fn shadow_table_exists(connection: &rusqlite::Connection, name: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+fn with_accounted_macro_snapshot_write<T>(
+    inventory: &super::resolution_selection::SelectedResolutionMountInventory<'_>,
+    write: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+) -> Result<T> {
+    let connection = inventory.connection();
+    let before_changes = connection.total_changes();
+    let before_schema: i64 =
+        connection.query_row("PRAGMA temp.schema_version", [], |row| row.get(0))?;
+    let result = write(connection);
+    inventory.account_committed_request_changes(connection.total_changes() - before_changes);
+    let after_schema: i64 =
+        connection.query_row("PRAGMA temp.schema_version", [], |row| row.get(0))?;
+    inventory.account_committed_schema_changes(after_schema - before_schema);
+    result
+}
+
+fn snapshot_macro_stage(connection: &rusqlite::Connection) -> Result<Option<Vec<String>>> {
+    if !connection.is_autocommit() {
+        return Ok(None);
+    }
+    let tables = macro_stage_tables(connection)?;
+    let mut rows = 0i64;
+    for table in &tables {
+        rows += connection.query_row(&format!("SELECT COUNT(*) FROM temp.{table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        if rows > MAX_RETAINED_MACRO_STAGE_ROWS {
+            return Ok(None);
+        }
+    }
+    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA temp.page_size", [], |row| row.get(0))?;
+    if pages.saturating_mul(page_size) > MAX_RETAINED_MACRO_STAGE_BYTES / 2 {
+        return Ok(None);
+    }
+    discard_macro_stage_snapshot(connection)?;
+    for table in &tables {
+        let shadow = format!("{RETAINED_MACRO_PREFIX}{table}");
+        if shadow_table_exists(connection, &shadow)? {
+            connection.execute_batch(&format!(
+                "INSERT INTO temp.{shadow} SELECT * FROM temp.{table}"
+            ))?;
+        } else {
+            connection.execute_batch(&format!(
+                "CREATE TEMP TABLE {shadow} AS SELECT * FROM temp.{table}"
+            ))?;
+        }
+    }
+    let pages: i64 = connection.query_row("PRAGMA temp.page_count", [], |row| row.get(0))?;
+    let within_cap = pages.saturating_mul(page_size) <= MAX_RETAINED_MACRO_STAGE_BYTES && {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            !FORCE_MACRO_POST_COPY_CAP_FOR_TEST.with(|cell| cell.get())
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            true
+        }
+    };
+    if !within_cap {
+        discard_macro_stage_snapshot(connection)?;
+    }
+    Ok(within_cap.then_some(tables))
+}
+
+fn restore_macro_stage_snapshot(
+    inventory: &super::resolution_selection::SelectedResolutionMountInventory<'_>,
+    tables: &[String],
+) -> Result<()> {
+    inventory.with_owned_temp_transaction(|connection| {
+        for table in tables {
+            let shadow = format!("{RETAINED_MACRO_PREFIX}{table}");
+            connection.execute_batch(&format!(
+                "INSERT INTO temp.{table} SELECT * FROM temp.{shadow}"
+            ))?;
+        }
+        Ok(super::resolution_selection::SelectedResolutionTempTransaction::Commit(()))
+    })?;
+    inventory.note_restored_macro_stage();
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1066,6 +1375,10 @@ type NativeDemandCallback<'a> = dyn FnMut(
     + 'a;
 
 pub(crate) trait DemandInstall: Send + Sync {
+    fn pre_admit(&self, _ready: &ReadySelectedResolution<'_, '_>) -> Result<bool> {
+        Ok(true)
+    }
+
     fn selected_target_completion(
         &self,
         _preparation: &dyn std::any::Any,
@@ -1143,6 +1456,20 @@ struct RetainedNativeCallerDemand {
     prepared: NativeDemandPreparationOutcome,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl SelectedResolutionOperation<'_, '_> {
+    #[doc(hidden)]
+    #[doc(hidden)]
+    pub fn pooled_reader_serial_for_test(&self) -> Option<u64> {
+        self.ready.inventory.conn.pooled_reader_serial_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn idle_reader_serials_for_test(&self) -> Vec<u64> {
+        self.ready.inventory.conn.idle_reader_serials_for_test()
+    }
+}
+
 impl SelectedResolutionOperation<'_, '_> {
     fn native_demand_preparation(
         &self,
@@ -1154,6 +1481,9 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> Result<NativeDemandPreparationOutcome> {
         if cancellation.is_cancelled() {
             return Ok(NativeDemandPreparationOutcome::Cancelled);
+        }
+        if !installer.0.pre_admit(&self.ready)? {
+            return Ok(NativeDemandPreparationOutcome::Unavailable);
         }
         if let Some(retained) = self
             .ready
@@ -1191,6 +1521,8 @@ pub struct QueryResolutionPreparation {
     /// Caller and macro-host files already checked for frontiers, including
     /// files with no macro input rows. These facts belong to this operation.
     checked_macro_frontier_files: RefCell<HashSet<PathBuf>>,
+    first_macro_frontier_request_seen: Cell<bool>,
+    macro_retention: Cell<MacroRetention>,
     /// Context registrations already validated for this operation and caller.
     registered_rust_caller_contexts:
         RefCell<HashMap<RustCallerRegistrationKey, Vec<RustCallerRegistrationFacts>>>,
@@ -1199,6 +1531,18 @@ pub struct QueryResolutionPreparation {
     native_caller_demand: RefCell<Option<RetainedNativeCallerDemand>>,
     /// Endpoint cells are immutable once closed under this retained selection.
     rust_workspace_relations: RefCell<ClosedRelations>,
+}
+
+/// Whether the operation's consumers allow its macro frontier snapshot to stay
+/// with the reader. One incomplete site invalidates the whole operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacroRetention {
+    /// No consumer has reported yet.
+    Pending,
+    /// Every consumer that reported was complete.
+    Completed,
+    /// A consumer failed, was cancelled or exceeded its budget.
+    Invalidated,
 }
 
 /// One caller's context reused only within the active operation.
@@ -1301,6 +1645,32 @@ pub(crate) struct RustCallerDemand {
     demand: RustDemandPreparation,
 }
 
+/// Why a Rust caller window stops before its forward stage is built.
+#[derive(Debug)]
+enum RustCallerWindowRefusal {
+    UnsupportedCaller,
+    Cancelled,
+    Stale(SelectedResolutionStale),
+    Unavailable(SelectedResolutionUnavailable),
+}
+
+impl RustCallerWindowRefusal {
+    fn outcome(&self) -> SelectedRustCallerReferenceOutcome {
+        match self {
+            Self::UnsupportedCaller => SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile,
+            Self::Cancelled => SelectedRustCallerReferenceOutcome::Operation(
+                SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
+            ),
+            Self::Stale(reason) => SelectedRustCallerReferenceOutcome::Operation(
+                SelectedResolutionOperationOutcome::Stale(reason.clone()),
+            ),
+            Self::Unavailable(reason) => SelectedRustCallerReferenceOutcome::Operation(
+                SelectedResolutionOperationOutcome::Unavailable(reason.clone()),
+            ),
+        }
+    }
+}
+
 struct RustReversePrepared {
     demand: Arc<RustCallerDemand>,
     contexts: SelectedResolutionContextSet,
@@ -1321,6 +1691,7 @@ fn confirm_reverse_session_bounded<A, L>(
     let sites = site_count.max(1);
     budget.max_summary_expansions = budget.max_summary_expansions.saturating_mul(sites);
     budget.max_scope_nodes = budget.max_scope_nodes.saturating_mul(sites);
+    budget.max_hierarchy_order_work = budget.max_hierarchy_order_work.saturating_mul(sites);
     let session = ResolutionSession::bounded(budget, Some(cancellation));
     let outcome = run(&session, session.cancellation().unwrap_or(cancellation))?;
     Ok(session.finish(outcome))
@@ -1646,6 +2017,7 @@ where
             &source,
             &persisted_lexical,
             &observed_typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
             cancellation,
             session,
             |operation| {
@@ -1738,6 +2110,16 @@ enum SelectedContentValidationOutcome {
 
 #[doc(hidden)]
 type ImportReferenceReadMemo = ExactReadMemo<(i64, git2::Oid, Vec<u8>), Vec<u32>>;
+type PersistedGapFrontierMemo = ExactReadMemo<(u32, u32), Option<(i64, bool)>>;
+type UnexpandedItemMacroGapMemo = ExactReadMemo<(i64, u32), Option<(String, usize, usize)>>;
+type ObligationSiteRangeMemo = ExactReadMemo<(i64, i64), Option<(Option<usize>, Option<usize>)>>;
+#[cfg(any(test, feature = "test-support"))]
+type StablePointReadProbe = (
+    Option<(i64, bool)>,
+    String,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+);
 
 /// Pure persisted reads shared only within a selected point batch.
 /// Blob ids are valid keys only while selection is fixed: the batch refuses
@@ -1790,16 +2172,509 @@ impl SelectedPointReadMemos {
     }
 }
 
+/// The selected inventory and request memos required by the Rust forward builder.
+/// It excludes the store, project, analyzer, read reuse, model authority, and
+/// connection factories so certification cannot read a second snapshot.
+struct RustForwardBuildView<'a, 'store> {
+    inventory: &'a SelectedResolutionMountInventory<'store>,
+    crate_rows: &'a RefCell<Option<rust_crate_rows::CrateRowMemo>>,
+    operation_demand_state: &'a Arc<crate::analyzer::resolution::SelectedDemandState>,
+    registered_rust_caller_contexts:
+        &'a RefCell<HashMap<RustCallerRegistrationKey, Vec<RustCallerRegistrationFacts>>>,
+    go_package_inventory_complete: &'a RefCell<Option<bool>>,
+    go_package_inventory_fragments: &'a RefCell<HashMap<BindingFragmentId, bool>>,
+    graph_stage_candidate_cache: &'a RefCell<Option<std::rc::Rc<UnconditionalCandidateCache>>>,
+    operation_candidate_cache: &'a std::rc::Rc<UnconditionalCandidateCache>,
+    boundary_candidate_read_memo: &'a BoundaryCandidateReadMemo,
+    jvm_root_presence_memo:
+        &'a std::rc::Rc<RefCell<super::resolution_lexical::JvmRootPresenceReadMemo>>,
+    point_read_memos: &'a std::rc::Rc<SelectedPointReadMemos>,
+    jvm_context_profile: &'a RefCell<Option<jvm_context::JvmContextReadProfile>>,
+}
+
+impl<'a, 'store> RustForwardBuildView<'a, 'store> {
+    pub fn shared_names(&self) -> super::resolution::StoreSharedNames<'a> {
+        self.inventory.shared_names()
+    }
+
+    pub fn lexical_source(&self) -> SelectedResolutionLexicalSource<'a, 'store> {
+        if let Some(cache) = self.graph_stage_candidate_cache.borrow().as_ref() {
+            return SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
+                self.inventory,
+                std::rc::Rc::clone(cache),
+            )
+            .with_boundary_read_memo(std::rc::Rc::clone(self.boundary_candidate_read_memo))
+            .with_jvm_root_presence_memo(std::rc::Rc::clone(self.jvm_root_presence_memo))
+            .with_candidate_path_read_memo(std::rc::Rc::clone(
+                &self.point_read_memos.candidate_paths,
+            ))
+            .with_reference_read_memo(std::rc::Rc::clone(
+                &self.point_read_memos.reference_evidence,
+            ));
+        }
+        SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
+            self.inventory,
+            std::rc::Rc::clone(self.operation_candidate_cache),
+        )
+        .with_boundary_read_memo(std::rc::Rc::clone(self.boundary_candidate_read_memo))
+        .with_jvm_root_presence_memo(std::rc::Rc::clone(self.jvm_root_presence_memo))
+        .with_candidate_path_read_memo(std::rc::Rc::clone(&self.point_read_memos.candidate_paths))
+        .with_reference_read_memo(std::rc::Rc::clone(
+            &self.point_read_memos.reference_evidence,
+        ))
+    }
+
+    fn publish_context_paths_with_compilers<R, P>(
+        &self,
+        context: SelectedResolutionContextInputs,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+        mut root_compiler: impl FnMut(
+            &SelectedContextIdentities,
+            &crate::analyzer::resolution::SelectedRootBridgeDescriptor,
+        ) -> Result<Option<SelectedContextCellProjection<R>>>,
+        mut package_compiler: impl FnMut(
+            &SelectedContextIdentities,
+            &crate::analyzer::resolution::SelectedPackageBridgeDescriptor,
+        ) -> Result<Option<SelectedContextCellProjection<P>>>,
+    ) -> Result<crate::analyzer::resolution::SelectedContextPathPublicationOutcome>
+    where
+        R: std::borrow::Borrow<crate::analyzer::resolution::SelectedRootBridgeProjection>,
+        P: std::borrow::Borrow<(
+                CandidatePathIdentity,
+                crate::analyzer::resolution::PartialPath,
+            )>,
+    {
+        use crate::analyzer::resolution::{
+            SelectedContextPathPublication, SelectedContextPathPublicationOutcome,
+        };
+
+        #[cfg(any(test, feature = "test-support"))]
+        let work_before = selected_sql_trace::context_publication_work(session);
+        let (
+            bridges,
+            completion,
+            declaration_access_source,
+            context_owned_gap_identities,
+            identities,
+            package_bridges,
+            go_import_bindings,
+            callable_import_boundaries,
+        ) = context.into_parts();
+        // Resolve descriptor content before SQL publication installs its parent
+        // cancellation handler. These immutable keys then remain available to
+        // construction and rollback without confusing cancellation with missing
+        // authority. The query-owned authority memo retains only demanded keys.
+        let source = self.lexical_source();
+        for bridge in &bridges {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion: completion,
+                });
+            }
+            bridge.validate_content_authority(&identities, &source, cancellation)?;
+        }
+        for bridge in &package_bridges {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion: completion,
+                });
+            }
+            bridge.validate_content_authority(&identities, &source, cancellation)?;
+        }
+        for bridge in &go_import_bindings {
+            if cancellation.is_cancelled() {
+                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion: completion,
+                });
+            }
+            bridge.validate_content_authority(&identities, &source, cancellation)?;
+        }
+        let go_package_inventory_complete = *self.go_package_inventory_complete.borrow();
+        let go_package_inventory_fragments = self.go_package_inventory_fragments.borrow().clone();
+        if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
+            return Err(StoreError::new(
+                "selected root inventory completion contains operation cancellation",
+            ));
+        }
+        // Tokens are freshly allocated for every publication. Hash the full
+        // structured path cells instead, including completion, so two equal
+        // overlays share demand answers without conflating distinct overlays.
+        // This buffer is the result of this one publication and dies here.
+        struct ContextSignature(Vec<u8>);
+        impl std::hash::Hasher for ContextSignature {
+            fn finish(&self) -> u64 {
+                let digest = brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(&self.0);
+                u64::from_le_bytes(
+                    digest[..8]
+                        .try_into()
+                        .expect("a SHA-256 digest has eight bytes"),
+                )
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0
+                    .extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                self.0.extend_from_slice(bytes);
+            }
+        }
+        use std::hash::Hash as _;
+        let mut signature = ContextSignature(Vec::new());
+        completion.hash(&mut signature);
+        context_owned_gap_identities.hash(&mut signature);
+        let mut shared = BTreeSet::new();
+        let mut local = BTreeSet::new();
+        let mut callable_boundaries = callable_import_boundaries;
+        if !callable_boundaries.is_empty() {
+            let mut content = callable_boundaries
+                .iter()
+                .map(|node| {
+                    crate::analyzer::resolution::selected_identity_content_digest(
+                        &identities,
+                        &source,
+                        (*node).into(),
+                        cancellation,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            content.sort_unstable();
+            content.hash(&mut signature);
+        }
+        // Only descriptor references live until this one publication ends.
+        // Compare full derivations, including completion, before SQL dedup.
+        let mut derivations = HashMap::default();
+        let names = self.shared_names();
+        let token = super::resolution_stage::SelectedResolutionStage::new(self.inventory)
+            .publish_context_paths(cancellation, |writer| {
+                for bridge in bridges.iter() {
+                    let Some(projection) = root_compiler(&identities, bridge)? else { return Ok(false); };
+                    let projected: &crate::analyzer::resolution::SelectedRootBridgeProjection = std::borrow::Borrow::borrow(&projection.value);
+                    let paths = projected.lexical.paths();
+                    assert_eq!(paths.len(), 1, "one context descriptor produces one path");
+                    let (path_id, path) = &paths[0];
+                    let candidate = CandidatePathIdentity::new(projected.lexical.fragment(), *path_id);
+                    if let Some(previous) = derivations.insert(candidate, bridge)
+                        && previous != bridge {
+                            return Err(StoreError::new(format!(
+                                "selected context has conflicting derivations for candidate path {candidate:?}: previous={previous:?}, current={bridge:?}"
+                            )));
+                        }
+                    local.insert(projected.local_anchor);
+                    callable_boundaries.extend(projected.callable_import_boundary);
+                    for (_, recipe) in &projected.recipes {
+                        shared.insert(recipe.identity(&names));
+                    }
+                    (candidate, path).hash(&mut signature);
+                    let offered = match projection.published {
+                        Some(source) => writer.reuse(source, candidate)?,
+                        None => writer.insert(candidate, path)?,
+                    };
+                    if !offered { return Ok(false); }
+                }
+                let mut package_derivations = HashMap::default();
+                for bridge in &package_bridges {
+                    let Some(projection) = package_compiler(&identities, bridge)? else { return Ok(false); };
+                    let (candidate, path): &(CandidatePathIdentity, crate::analyzer::resolution::PartialPath) = std::borrow::Borrow::borrow(&projection.value);
+                    let candidate = *candidate;
+                    if let Some(previous) = package_derivations.insert(candidate, bridge)
+                        && previous != bridge {
+                            return Err(StoreError::new(format!(
+                                "selected package context has conflicting derivations for {candidate:?}: previous={previous:?}, current={bridge:?}"
+                            )));
+                        }
+                    shared.extend(bridge.shared_identities());
+                    (candidate, &path).hash(&mut signature);
+                    let offered = match projection.published {
+                        Some(source) => writer.reuse(source, candidate)?,
+                        None => writer.insert(candidate, path)?,
+                    };
+                    if !offered { return Ok(false); }
+                }
+                let mut go_import_derivations = HashMap::default();
+                for bridge in &go_import_bindings {
+                    let Some((candidate, path)) = bridge.compile(&identities, &self.lexical_source(), cancellation, session)? else {
+                        return Ok(false);
+                    };
+                    if let Some(previous) = go_import_derivations.insert(candidate, bridge)
+                        && previous != bridge {
+                            return Err(StoreError::new(format!(
+                                "selected Go import context has conflicting derivations for {candidate:?}: previous={previous:?}, current={bridge:?}"
+                            )));
+                        }
+                    shared.extend(bridge.shared_identities());
+                    (candidate, &path).hash(&mut signature);
+                    if !writer.insert(candidate, &path)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+        let Some(token) = token else {
+            return Ok(SelectedContextPathPublicationOutcome::Cancelled {
+                contextual_reverse_inventory_completion: completion,
+            });
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(work_before) = work_before {
+            let incomplete_evidence = match &completion {
+                ResolutionCompletion::Complete => 0,
+                ResolutionCompletion::Incomplete(reasons) => reasons.iter().count(),
+            };
+            eprintln!(
+                "context publication work: derivations={}, paths={}, shared={}, incomplete_evidence={}, completion={completion:?}, before={work_before:?}, after={:?}",
+                bridges.len(),
+                derivations.len(),
+                shared.len(),
+                incomplete_evidence,
+                selected_sql_trace::context_publication_work(session)
+                    .expect("scoped context observation remains enabled"),
+            );
+        }
+        Ok(SelectedContextPathPublicationOutcome::Ready(
+            SelectedContextPathPublication {
+                token,
+                context_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
+                    &signature.0,
+                ),
+                contextual_reverse_inventory_completion: completion,
+                callable_static_import_boundaries: callable_boundaries.into_iter().collect(),
+                go_package_inventory_complete,
+                go_package_inventory_fragments,
+                declaration_access_source,
+                context_owned_gap_identities,
+                identities: identities.clone(),
+                shared_semantic_identities: shared.into_iter().collect(),
+                fragment_local_semantic_identities: local.into_iter().collect(),
+            },
+        ))
+    }
+
+    pub fn collect_blueprint_in_session(
+        &self,
+        context: SelectedResolutionContextInputs,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<SelectedFactOperationBlueprintConstruction> {
+        self.collect_blueprint_with_projection_memo(context, None, cancellation, session)
+    }
+
+    pub fn collect_blueprint_with_projection_memo(
+        &self,
+        context: SelectedResolutionContextInputs,
+        memo: Option<&file_context::ContextBlueprintMemo>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<SelectedFactOperationBlueprintConstruction> {
+        use crate::analyzer::resolution::SelectedContextPathPublicationOutcome;
+        Ok(
+            match self.publish_context_paths_with_projection_memo(
+                context,
+                memo,
+                cancellation,
+                session,
+            )? {
+                SelectedContextPathPublicationOutcome::Ready(publication) => {
+                    SelectedFactOperationBlueprintConstruction::Ready(
+                        SelectedFactOperationBlueprint::from_publication(publication)
+                            .with_selected_demand_state(self.operation_demand_state),
+                    )
+                }
+                SelectedContextPathPublicationOutcome::Cancelled {
+                    contextual_reverse_inventory_completion,
+                } => SelectedFactOperationBlueprintConstruction::Cancelled {
+                    cancellation_completion: ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::Cancelled,
+                    ]),
+                    contextual_reverse_inventory_completion,
+                },
+            },
+        )
+    }
+
+    fn validate_context_local_semantic_anchors(
+        &self,
+        persisted: &SelectedResolutionLexicalSource<'_, '_>,
+        blueprint: &SelectedFactOperationBlueprint,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<()>> {
+        let anchors = blueprint.fragment_local_semantic_identities();
+        let Some(runtimes) = persisted.local_semantics_for_identities(anchors, cancellation)?
+        else {
+            return Ok(None);
+        };
+        for (&(fragment, identity), runtime) in anchors.iter().zip(runtimes) {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let Some(runtime) = runtime else {
+                return Err(StoreError::new(format!(
+                    "selected context anchor identity is not in its blob's catalog: \
+                     fragment={fragment}, identity={identity:?}"
+                )));
+            };
+            let registered = self
+                .inventory
+                .mount_rebaser()
+                .borrow()
+                .registered_semantic_provenance(runtime);
+            match registered {
+                Some(SelectedSemanticProvenance::FragmentLocal(provenance)) => {
+                    if provenance.mount().fragment() != fragment
+                        || provenance.identity() != identity
+                    {
+                        return Err(StoreError::new(format!(
+                            "selected context anchor {runtime} has conflicting provenance"
+                        )));
+                    }
+                    continue;
+                }
+                Some(SelectedSemanticProvenance::Stage(provenance)) => {
+                    if provenance.mount().fragment() != fragment
+                        || provenance.identity() != identity
+                    {
+                        return Err(StoreError::new(format!(
+                            "selected context anchor {runtime} has conflicting stage provenance"
+                        )));
+                    }
+                    continue;
+                }
+                Some(SelectedSemanticProvenance::Shared(_)) => {
+                    return Err(StoreError::new(format!(
+                        "selected context anchor {runtime} was registered as Shared"
+                    )));
+                }
+                None => {}
+            }
+            if self
+                .inventory
+                .mount_rebaser()
+                .borrow()
+                .mount_for_fragment(fragment)
+                .is_none()
+            {
+                return Err(StoreError::new(format!(
+                    "selected context anchor {runtime} names an unknown selected mount"
+                )));
+            }
+            let Some(provenance) = persisted.semantic_provenance(runtime, cancellation)? else {
+                return Ok(None);
+            };
+            // A persisted anchor decodes to its blob's catalog. An anchor a
+            // staged mount minted (an `include!`-spliced file's lookups are
+            // lowered in its host's stage) decodes to that mount's stage
+            // catalog, as the registered arm above accepts.
+            let (mount, decoded) = match provenance {
+                SelectedSemanticProvenance::FragmentLocal(provenance) => {
+                    (provenance.mount(), provenance.identity())
+                }
+                SelectedSemanticProvenance::Stage(provenance) => {
+                    (provenance.mount(), provenance.identity())
+                }
+                SelectedSemanticProvenance::Shared(_) => {
+                    return Err(StoreError::new(format!(
+                        "selected context anchor {identity:?} for fragment {fragment} decodes to a shared identity"
+                    )));
+                }
+            };
+            if mount.fragment() != fragment || decoded != identity {
+                return Err(StoreError::new(format!(
+                    "selected context anchor {identity:?} for fragment {fragment} decodes to {decoded:?} in {mount:?}"
+                )));
+            }
+        }
+        Ok(Some(()))
+    }
+
+    fn register_context_in_session(
+        &self,
+        blueprint: &SelectedFactOperationBlueprint,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<ContextRegistrationOutcome> {
+        self.register_context_cells_in_session(
+            blueprint,
+            SelectedContextRegistrationCells {
+                shared: blueprint.shared_semantic_identities(),
+                boundaries: blueprint.boundary_nodes(),
+                gaps: blueprint.context_owned_gap_identities(),
+            },
+            cancellation,
+            session,
+        )
+    }
+
+    fn register_context_cells_in_session(
+        &self,
+        blueprint: &SelectedFactOperationBlueprint,
+        cells: SelectedContextRegistrationCells<'_>,
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<ContextRegistrationOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(ContextRegistrationOutcome::Cancelled);
+        }
+        // The selected inventory has already registered every identity read
+        // while collecting the context. Cloning that complete, mount-sized
+        // rebaser just to add the small contextual overlay made point
+        // resolution budget depend on unrelated selected mounts. Contextual
+        // anchors already present in that inventory are free; only persisted
+        // anchor keys that still need hydration consume bounded work.
+        let persisted = self.lexical_source();
+        if self
+            .validate_context_local_semantic_anchors(&persisted, blueprint, cancellation)?
+            .is_none()
+        {
+            return Ok(ContextRegistrationOutcome::Cancelled);
+        }
+        // Only the registrations this phase still performs are charged: the
+        // persisted anchors need no key translation and no registration now
+        // that their runtime IDs name their own mounts.
+        let registration_work = cells
+            .shared
+            .len()
+            .checked_add(cells.boundaries.len())
+            .and_then(|count| count.checked_add(cells.gaps.len()))
+            .expect("selected context registration work must fit usize");
+        if !(0..registration_work).all(|_| session.scope_step()) {
+            return Ok(ContextRegistrationOutcome::Cancelled);
+        }
+        if cancellation.is_cancelled() || !session.observe_cancellation() {
+            return Ok(ContextRegistrationOutcome::Cancelled);
+        }
+        if cancellation.is_cancelled() || !session.observe_cancellation() {
+            return Ok(ContextRegistrationOutcome::Cancelled);
+        }
+        let mut rebaser = self.inventory.mount_rebaser().borrow_mut();
+        for &identity in cells.shared {
+            rebaser.register_shared_semantic(identity);
+        }
+        let names = self.inventory.shared_names();
+        let mut gaps = cells
+            .gaps
+            .iter()
+            .map(|&reason| Ok((blueprint.context_owned_semantic_digest(reason)?, reason)))
+            .collect::<Result<Vec<_>>>()?;
+        gaps.sort_unstable_by_key(|(digest, _)| *digest);
+        for (digest, reason) in gaps {
+            rebaser.register_context_owned_semantic(reason, digest, &names);
+        }
+        for &node in cells.boundaries {
+            rebaser.register_context_boundary(node);
+        }
+        Ok(ContextRegistrationOutcome::Ready)
+    }
+}
+
 pub struct ReadySelectedResolution<'store, 'input> {
     store: &'store AnalyzerStore,
     #[doc(hidden)]
-    pub inventory: Box<SelectedResolutionMountInventory<'store>>,
+    pub inventory: Rc<SelectedResolutionMountInventory<'store>>,
     query_preparation: Option<Box<QueryResolutionPreparation>>,
     content_mounts: Vec<SelectedResolutionContentMountRequest>,
     project: &'input dyn Project,
     analyzer: Option<&'input dyn SelectedAnalyzerServices>,
+    read_reuse: Option<&'input dyn ReadReuseRefusal>,
     /// Captured request authority, including an explicit captured absence.
-    attached_model_authority: Option<Option<Arc<dyn SelectedModelAuthority + Send + Sync>>>,
+    model_authority: Option<Arc<dyn SelectedModelAuthority + Send + Sync>>,
     analysis_generation: u64,
     /// What this request has already asked the crate rows about textual macro
     /// visibility. Built empty when the request opens and dropped when it
@@ -1830,6 +2705,7 @@ pub struct ReadySelectedResolution<'store, 'input> {
     /// operation's read-only connection. Revalidation still runs per answer.
     go_publication_rechecks: RefCell<ExactReadMemo<(super::GoContextIdentity, i64), ()>>,
     snapshots: WorkspaceSnapshots,
+    csharp_view: std::cell::OnceCell<Option<super::csharp_compilation::CSharpSelectedHandle>>,
     go_base_profile: std::cell::Cell<Option<[u8; 32]>>,
     // One forward request selects one caller package variant, restored on exit.
     go_active_package: std::cell::Cell<Option<(i64, i64, Option<&'static str>)>>,
@@ -1849,6 +2725,15 @@ pub struct ReadySelectedResolution<'store, 'input> {
     jvm_root_presence_memo:
         std::rc::Rc<RefCell<super::resolution_lexical::JvmRootPresenceReadMemo>>,
     pub(crate) point_read_memos: std::rc::Rc<SelectedPointReadMemos>,
+    /// Immutable persisted gap kind and macro-input presence for the selected
+    /// mount. This owner is dropped with one resolution operation.
+    persisted_gap_frontiers: RefCell<PersistedGapFrontierMemo>,
+    /// Item-macro invocation metadata read from the selected immutable blob.
+    unexpanded_item_macro_gaps: RefCell<UnexpandedItemMacroGapMemo>,
+    /// Source-site and range rows are immutable for the selected blob. The
+    /// project source read still runs on every rendered diagnostic.
+    public_diagnostic_sites: RefCell<ExactReadMemo<(i64, u32), Option<i64>>>,
+    obligation_site_ranges: RefCell<ObligationSiteRangeMemo>,
     #[doc(hidden)]
     pub jvm_context_profile: RefCell<Option<jvm_context::JvmContextReadProfile>>,
     package_reference_read_memo: std::rc::Rc<RefCell<ExactReadMemo<PackageReferenceReadKey, bool>>>,
@@ -1856,6 +2741,25 @@ pub struct ReadySelectedResolution<'store, 'input> {
     // In particular, an unpublished overlay computes its anchor only once.
     definition_module_anchors:
         RefCell<HashMap<SelectedResolutionMountOrdinal, Option<crate::analyzer::fq_name::FqName>>>,
+}
+
+impl<'store> ReadySelectedResolution<'store, '_> {
+    fn rust_forward_build_view(&self) -> RustForwardBuildView<'_, 'store> {
+        RustForwardBuildView {
+            inventory: &self.inventory,
+            crate_rows: &self.crate_rows,
+            operation_demand_state: &self.operation_demand_state,
+            registered_rust_caller_contexts: &self.registered_rust_caller_contexts,
+            go_package_inventory_complete: &self.go_package_inventory_complete,
+            go_package_inventory_fragments: &self.go_package_inventory_fragments,
+            graph_stage_candidate_cache: &self.graph_stage_candidate_cache,
+            operation_candidate_cache: &self.operation_candidate_cache,
+            boundary_candidate_read_memo: &self.boundary_candidate_read_memo,
+            jvm_root_presence_memo: &self.jvm_root_presence_memo,
+            point_read_memos: &self.point_read_memos,
+            jvm_context_profile: &self.jvm_context_profile,
+        }
+    }
 }
 
 /// One request's answers to the textual-macro module walk.
@@ -1926,41 +2830,88 @@ impl std::ops::DerefMut for ReadySelectedResolution<'_, '_> {
 }
 
 impl<'store> ReadySelectedResolution<'store, '_> {
+    pub(super) fn certified_csharp_view(
+        &self,
+    ) -> Result<Option<super::csharp_compilation::CertifiedCSharpHandle>> {
+        let snapshot = self.snapshot("csharp");
+        if self.csharp_view.get().is_none() {
+            let handle = match snapshot {
+                Some(snapshot) => super::csharp_compilation::selected_csharp_handle(
+                    self.inventory.connection(),
+                    snapshot,
+                )?,
+                None => None,
+            };
+            self.csharp_view
+                .set(handle)
+                .expect("C# view initialized once");
+        }
+        let handle = self.csharp_view.get().expect("C# view initialized");
+        let (Some(snapshot), Some(handle), Some(analyzer)) = (snapshot, handle, self.analyzer)
+        else {
+            return Ok(None);
+        };
+        assert_eq!(&handle.snapshot, snapshot);
+        // Nested reads use immutable (workspace, generation, revision) rows, so
+        // their answers do not depend on which connection snapshot sees them.
+        Ok((self
+            .store
+            .lend_selected_reader(self.inventory.connection(), || {
+                analyzer.certify_selected_configuration(
+                    Language::CSharp,
+                    snapshot,
+                    &handle.input_digest,
+                    self.inventory.connection(),
+                )
+            })
+            == ConfigurationCertificate::Certified)
+            .then_some(super::csharp_compilation::CertifiedCSharpHandle(
+                handle.clone(),
+            )))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stable_point_read_probe_for_test(
+        &self,
+        ordinal: u32,
+        key: u32,
+        site: i64,
+    ) -> Result<StablePointReadProbe> {
+        let semantic = SemanticId::local(ordinal, key);
+        let completion =
+            ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                semantic,
+            )]);
+        Ok((
+            persisted_gap_frontier(self, ordinal, key)?,
+            format!("{:?}", unexpanded_item_macro_gaps(self, &completion)?),
+            native_units::selected_public_diagnostic_site(self, semantic)?,
+            obligation_site_details(self, ordinal, site)?,
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stable_point_read_fill_counts_for_test(&self) -> [usize; 4] {
+        [
+            self.persisted_gap_frontiers.borrow().bounded_counts().0,
+            self.unexpanded_item_macro_gaps.borrow().bounded_counts().0,
+            self.public_diagnostic_sites.borrow().bounded_counts().0,
+            self.obligation_site_ranges.borrow().bounded_counts().0,
+        ]
+    }
+
     /// The input snapshot that authorizes reads for this storage language.
     pub fn snapshot(&self, storage_key: &str) -> Option<&super::WorkspaceSnapshotId> {
         self.snapshots.get(storage_key)
     }
 
     pub(super) fn model_authority(&self) -> Option<Arc<dyn SelectedModelAuthority + Send + Sync>> {
-        let services = self
-            .analyzer
-            .and_then(|analyzer| analyzer.model_authority());
-        if let Some(attached) = &self.attached_model_authority {
-            if let Some(attached) = attached {
-                if let Some(services) = &services {
-                    assert_eq!(
-                        attached.active_model_set_hash(),
-                        services.active_model_set_hash(),
-                        "one selected operation has one model authority set"
-                    );
-                }
-                if let Some(analyzer) = self.analyzer {
-                    assert_eq!(
-                        attached
-                            .active_models()
-                            .as_ref()
-                            .map(|models| models.active_model_set_hash()),
-                        analyzer
-                            .active_models()
-                            .as_ref()
-                            .map(|models| models.active_model_set_hash()),
-                        "attached authority and analyzer services have the same active model set"
-                    );
-                }
-            }
-            return attached.clone();
+        if let (Some(analyzer), Some(authority)) = (self.analyzer, &self.model_authority) {
+            analyzer.record_model_authority_read(authority.active_model_set_hash());
         }
-        services
+        self.model_authority.clone()
     }
 
     #[doc(hidden)]
@@ -2003,35 +2954,12 @@ impl<'store> ReadySelectedResolution<'store, '_> {
     /// and dropped with it.
     #[doc(hidden)]
     pub fn shared_names(&self) -> super::resolution::StoreSharedNames<'_> {
-        self.inventory.shared_names()
+        self.rust_forward_build_view().shared_names()
     }
 
     #[doc(hidden)]
     pub fn lexical_source(&self) -> SelectedResolutionLexicalSource<'_, 'store> {
-        if let Some(cache) = self.graph_stage_candidate_cache.borrow().as_ref() {
-            return SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
-                &self.inventory,
-                std::rc::Rc::clone(cache),
-            )
-            .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
-            .with_jvm_root_presence_memo(std::rc::Rc::clone(&self.jvm_root_presence_memo))
-            .with_candidate_path_read_memo(std::rc::Rc::clone(
-                &self.point_read_memos.candidate_paths,
-            ))
-            .with_reference_read_memo(std::rc::Rc::clone(
-                &self.point_read_memos.reference_evidence,
-            ));
-        }
-        SelectedResolutionLexicalSource::new_on_demand_with_unconditional_cache(
-            &self.inventory,
-            std::rc::Rc::clone(&self.operation_candidate_cache),
-        )
-        .with_boundary_read_memo(std::rc::Rc::clone(&self.boundary_candidate_read_memo))
-        .with_jvm_root_presence_memo(std::rc::Rc::clone(&self.jvm_root_presence_memo))
-        .with_candidate_path_read_memo(std::rc::Rc::clone(&self.point_read_memos.candidate_paths))
-        .with_reference_read_memo(std::rc::Rc::clone(
-            &self.point_read_memos.reference_evidence,
-        ))
+        self.rust_forward_build_view().lexical_source()
     }
 
     fn bind_go_context_publication(&self, publication: super::GoContextIdentity) {
@@ -2047,20 +2975,51 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         }
     }
 
-    fn selected_jvm_external_providers(&self) -> Vec<String> {
-        let mut providers = nominal_rules::jvm_external_owner_relations().providers(self.analyzer);
+    fn selected_external_provider_families(
+        &self,
+    ) -> std::collections::HashMap<String, super::resolution_typed::ExternalProviderFamily> {
+        use super::resolution_typed::{ExternalProviderFamily, insert_external_provider_family};
+        let mut families = std::collections::HashMap::new();
+        insert_external_provider_family(
+            &mut families,
+            "jvm-intrinsic".to_owned(),
+            ExternalProviderFamily::Jvm,
+        );
+        for provider in nominal_rules::jvm_external_owner_relations().providers(self.analyzer) {
+            insert_external_provider_family(&mut families, provider, ExternalProviderFamily::Jvm);
+        }
         let authority = self.model_authority();
         if let Some(models) = authority
             .as_ref()
             .and_then(|authority| authority.active_models())
         {
-            providers.extend(
-                models
-                    .shards()
-                    .iter()
-                    .map(|shard| shard.manifest.semantic_sha256.clone()),
-            );
+            for shard in models.shards() {
+                let family = Language::from_config_label(&shard.manifest.language)
+                    .map(ExternalProviderFamily::from_language)
+                    .unwrap_or(ExternalProviderFamily::Unknown);
+                insert_external_provider_family(
+                    &mut families,
+                    shard.manifest.semantic_sha256.clone(),
+                    family,
+                );
+            }
         }
+        families
+            .into_iter()
+            .filter_map(|(id, family)| family.map(|family| (id, family)))
+            .collect()
+    }
+
+    fn selected_jvm_external_providers(&self) -> Vec<String> {
+        let mut providers = self
+            .selected_external_provider_families()
+            .into_iter()
+            .filter_map(|(id, family)| {
+                (family == super::resolution_typed::ExternalProviderFamily::Jvm
+                    && id != "jvm-intrinsic")
+                    .then_some(id)
+            })
+            .collect::<Vec<_>>();
         providers.sort_unstable();
         providers.dedup();
         providers
@@ -2068,7 +3027,16 @@ impl<'store> ReadySelectedResolution<'store, '_> {
 
     #[doc(hidden)]
     pub fn typed_source(&self) -> SelectedResolutionTypedSource<'_, 'store> {
-        let providers = self.selected_jvm_external_providers();
+        let families = self.selected_external_provider_families();
+        let mut providers = families
+            .iter()
+            .filter_map(|(id, family)| {
+                (*family == super::resolution_typed::ExternalProviderFamily::Jvm
+                    && id != "jvm-intrinsic")
+                    .then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        providers.sort_unstable();
         let authority = self.model_authority();
         let external_models = authority
             .as_ref()
@@ -2077,6 +3045,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
             .with_go_context_binder(self)
             .with_context_identities(self.context_identities.clone())
             .with_external_providers(providers)
+            .with_external_provider_families(families)
             .with_external_models(external_models)
             .with_model_authority(authority)
     }
@@ -2120,6 +3089,25 @@ pub fn take_rebaser_identities_at_handback_for_test() -> [usize; 4] {
 
 impl Drop for ReadySelectedResolution<'_, '_> {
     fn drop(&mut self) {
+        debug_assert_eq!(
+            Rc::strong_count(&self.inventory),
+            1,
+            "operation read frame outlived its operation"
+        );
+        if self.first_macro_frontier_request_seen.get()
+            && self.macro_retention.get() != MacroRetention::Completed
+            && self
+                .inventory
+                .retained_macro_frontier
+                .borrow_mut()
+                .take()
+                .is_some()
+        {
+            // A failed site cannot publish a reusable stage or read receipt.
+            // Close the pooled connection with its TEMP shadow snapshot.
+            self.inventory
+                .raise_macro_reader_checkin(super::resolution_selection::MacroReaderCheckin::Clear);
+        }
         let preparation = self
             .query_preparation
             .take()
@@ -2446,6 +3434,19 @@ impl<'a, 'store> SelectedMountTable<'a, 'store> {
             .map(|mount| mount.blob_id()))
     }
 
+    /// Content identity for one file in this operation's selected inventory.
+    #[doc(hidden)]
+    pub fn blob_oid_for_path(
+        &self,
+        storage_language: &str,
+        persisted_relative_path: &str,
+    ) -> Result<Option<git2::Oid>> {
+        Ok(self
+            .inventory
+            .mount_record_for_path(storage_language, persisted_relative_path)?
+            .map(|mount| mount.blob_oid()))
+    }
+
     #[doc(hidden)]
     pub fn mount_for_path(
         &self,
@@ -2587,7 +3588,9 @@ impl<'store, 'input> SelectedResolutionOperationOpenOutcome<'store, 'input> {
 /// batch may use it for several bounded point requests.
 #[doc(hidden)]
 pub struct SelectedResolutionOperation<'store, 'input> {
+    _rust_nesting_guard: RustSelectedNestingGuard,
     captured_input: CapturedSelectedResolutionInput<'input>,
+    macro_frontier_reads: Option<Box<dyn SelectedMacroFrontierReads + 'input>>,
     #[doc(hidden)]
     pub ready: ReadySelectedResolution<'store, 'input>,
     enumerated_mounts: OnceCell<Vec<SelectedResolutionOperationMount>>,
@@ -2606,17 +3609,21 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     /// Declared receiver types demanded by this selected query. Keys include
     /// the exact anchor and staged selection; member names do not affect it.
     go_receiver_anchor_types_memo: RefCell<go_receiver_anchor::GoReceiverAnchorTypesMemo>,
+    go_point_receiver_anchor_memo: RefCell<go_receiver_anchor::GoPointReceiverAnchorMemo>,
+    go_point_receiver_anchor_stats: RefCell<Option<go_receiver_anchor::GoPointReceiverAnchorStats>>,
     /// The selected source role for one mounted Go file at one stage epoch.
     go_source_roles: RefCell<ExactReadMemo<go_named::GoSourceRoleReadKey, Option<String>>>,
     /// Completed file contexts for distinct inputs over this query's selection.
-    // #7314 6b: temporary oracle selection, confined to this operation.
-    #[cfg(any(test, feature = "test-support"))]
-    java_oracle_selection: Option<jvm_context::JavaOracleSelection>,
-    #[cfg(any(test, feature = "test-support"))]
-    java_oracle_visits: RefCell<Vec<String>>,
     jvm_file_contexts: RefCell<jvm_context::JvmFileContextMemo>,
     jvm_access_policies: RefCell<java_access::JvmAccessPolicyMemo>,
     jvm_context_preparations: jvm_context::JvmContextPreparationMemo,
+    /// The inherited member-type knowledge this operation's JVM simple-type-
+    /// name decisions read (#9546). Every decision memo lives in this
+    /// operation, so it is bound to exactly this knowledge. None keeps the
+    /// decision without inherited tiers.
+    jvm_inherited_tier_knowledge: Option<inherited_member_walk::JvmInheritedKnowledge<'input>>,
+    /// A JVM decision in this operation consumed inherited walk evidence.
+    jvm_decision_consumed_walk: Cell<bool>,
     #[doc(hidden)]
     pub jvm_context_blueprints: file_context::ContextBlueprintMemo,
     /// Provider registrations shared by named contexts in this query only.
@@ -2661,7 +3668,84 @@ pub struct SelectedResolutionOperation<'store, 'input> {
     jvm_member_import_memo: RefCell<jvm_context::JvmMemberImportMemo>,
 }
 
+thread_local! {
+    static OPEN_RUST_SELECTED_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread currently owns a Rust selected operation. A route
+/// question must borrow that selection rather than opening another one.
+pub fn rust_selected_operation_active() -> bool {
+    OPEN_RUST_SELECTED_OPERATIONS.with(|open| open.get() != 0)
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static NESTED_RUST_SELECTED_OPERATION_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read and reset nested Rust selected-operation openings on this thread.
+#[cfg(all(debug_assertions, any(test, feature = "test-support")))]
+pub fn take_nested_rust_selected_operation_opens_for_test() -> usize {
+    NESTED_RUST_SELECTED_OPERATION_OPENS.with(|count| count.replace(0))
+}
+
+struct RustSelectedNestingGuard(bool);
+
+impl RustSelectedNestingGuard {
+    fn new(rust: bool) -> Self {
+        if rust {
+            OPEN_RUST_SELECTED_OPERATIONS.with(|open| {
+                let depth = open.get();
+                // #9213: restore the global assertion after the remaining shared
+                // resolution routes are threaded through their selected operation.
+                #[cfg(debug_assertions)]
+                if depth > 0 {
+                    NESTED_RUST_SELECTED_OPERATION_OPENS.with(|count| count.set(count.get() + 1));
+                }
+                open.set(depth + 1);
+            });
+        }
+        Self(rust)
+    }
+}
+
+impl Drop for RustSelectedNestingGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            OPEN_RUST_SELECTED_OPERATIONS.with(|open| open.set(open.get() - 1));
+        }
+    }
+}
+
 impl<'store, 'input> SelectedResolutionOperation<'store, 'input> {
+    /// Install the engine's read attribution for reusable Rust frontier work.
+    pub fn with_macro_frontier_reads(
+        mut self,
+        reads: Box<dyn SelectedMacroFrontierReads + 'input>,
+    ) -> Self {
+        self.macro_frontier_reads = Some(reads);
+        self
+    }
+
+    /// Only a completed consumer may hand its frontier snapshot to the reader.
+    /// Any failed, cancelled or exceeded site rejects the entire operation.
+    pub fn observe_macro_retention_result(&self, complete: bool) {
+        let retention = &self.ready.macro_retention;
+        retention.set(match (retention.get(), complete) {
+            (MacroRetention::Invalidated, _) | (_, false) => MacroRetention::Invalidated,
+            (MacroRetention::Pending | MacroRetention::Completed, true) => {
+                MacroRetention::Completed
+            }
+        });
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn derive_helper_decisions_enabled_for_test(&self) -> bool {
+        self.ready
+            .inventory
+            .derive_helper_decisions_enabled_for_test()
+    }
     /// Attach the batch's pure persisted reads before doing point work.
     pub fn with_point_read_memos(mut self, memos: std::rc::Rc<SelectedPointReadMemos>) -> Self {
         self.ready.point_read_memos = memos;
@@ -2802,7 +3886,7 @@ pub enum SelectedRustCallerReferenceOutcome<T = ()> {
 }
 
 /// One located answer set per requested site, in request order.
-pub(crate) type LocatedRustReferenceAnswers<T> =
+pub type LocatedRustReferenceAnswers<T> =
     Vec<SelectedResolutionLocated<Vec<SelectedRustReferenceAnswer<T>>>>;
 
 /// The same answer for several sites of one caller, in request order.
@@ -2856,6 +3940,9 @@ fn repeat_bounded_resolution<T>(
             .collect(),
         BoundedResolution::Exceeded { limit, work } => (0..count)
             .map(|_| BoundedResolution::Exceeded { limit, work })
+            .collect(),
+        BoundedResolution::Unavailable { reason, work } => (0..count)
+            .map(|_| BoundedResolution::Unavailable { reason, work })
             .collect(),
         BoundedResolution::Cancelled { work } => (0..count)
             .map(|_| BoundedResolution::Cancelled { work })
@@ -2970,6 +4057,13 @@ pub struct SelectedRustMemberAttribution {
     pub owner: CodeUnit,
     #[doc(hidden)]
     pub reach: SelectedRustMemberReach,
+    #[doc(hidden)]
+    pub receiver_form:
+        Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionCallableReceiverForm>,
+    #[doc(hidden)]
+    pub receiver_user_deref_steps: Option<u8>,
+    #[doc(hidden)]
+    pub written_reference_depth: Option<u8>,
 }
 
 /// The typed producer frontier for one gap retained by this Rust lookup.
@@ -3086,11 +4180,13 @@ pub fn rust_block_local_binding_is_decided(
 ) -> bool {
     definitions.is_empty()
         && matches!(lexical, [definition]
-            if definition.kind == brokk_bifrost_core::analyzer::model::DeclarationKind::BlockLocalItem)
+            if matches!(definition.kind,
+                brokk_bifrost_core::analyzer::model::DeclarationKind::BlockLocalItem
+                    | brokk_bifrost_core::analyzer::model::DeclarationKind::BlockLocalType))
         && matches!(completion, ResolutionCompletion::Incomplete(reasons)
         if reasons.iter().all(|reason| matches!(
             reason,
-            crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(_)
+            crate::analyzer::resolution::ResolutionIncompleteReason::UnsupportedSemantic(_) | crate::analyzer::resolution::ResolutionIncompleteReason::ReceiverSubclassObligation(_)
         )))
 }
 
@@ -5111,28 +6207,21 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         overlay_cache_key.field("macro-input-set", &input_identity);
         let overlay_cache_key = overlay_cache_key.finish();
         let cache = &self.ready.store.cache_budget;
-        let (include_overlay, cache_miss) =
-            match cache.rust_macro_include_overlay(&overlay_cache_key) {
-                Some(overlay) => (overlay, false),
-                None => {
-                    let Some(overlay) = self.build_selected_macro_include_overlay_plan(
-                        files,
-                        connection,
-                        cancellation,
-                    )?
-                    else {
-                        return Ok(SelectedResolutionStageOutcome::Cancelled);
-                    };
-                    (Arc::new(overlay), true)
-                }
-            };
-        if !self.apply_selected_macro_include_overlay_plan(&include_overlay, cancellation)? {
+        if let Some(overlay) = cache.rust_macro_include_overlay(&overlay_cache_key) {
+            if !self.apply_selected_macro_include_overlay_plan(&overlay, cancellation)? {
+                return Ok(SelectedResolutionStageOutcome::Cancelled);
+            }
+            return Ok(SelectedResolutionStageOutcome::Ready);
+        }
+        let Some(overlay) =
+            self.build_selected_macro_include_overlay_plan(files, connection, cancellation)?
+        else {
+            return Ok(SelectedResolutionStageOutcome::Cancelled);
+        };
+        if !self.apply_selected_macro_include_overlay_plan(&overlay, cancellation)? {
             return Ok(SelectedResolutionStageOutcome::Cancelled);
         }
-        if cache_miss {
-            cache
-                .insert_rust_macro_include_overlay(overlay_cache_key, Arc::clone(&include_overlay));
-        }
+        cache.insert_rust_macro_include_overlay(overlay_cache_key, overlay);
         Ok(SelectedResolutionStageOutcome::Ready)
     }
 
@@ -5542,6 +6631,243 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
         if cancellation.is_cancelled() {
             return Ok(SelectedResolutionStageOutcome::Cancelled);
         }
+        let Some(reads) = self.macro_frontier_reads.as_deref() else {
+            return self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+        };
+        let mut requested_files = files
+            .iter()
+            .map(|file| file.to_path_buf())
+            .collect::<Vec<_>>();
+        requested_files.sort_unstable();
+        requested_files.dedup();
+        let first = !self.ready.first_macro_frontier_request_seen.replace(true);
+        let retained = self
+            .ready
+            .inventory
+            .retained_macro_frontier
+            .borrow_mut()
+            .take();
+        // A replaced frontier leaves the reader to be cleaned unless a new
+        // snapshot is admitted below; this is the disposition to restore then.
+        let mut restore_after_snapshot = None;
+        if let Some(retained) = retained {
+            let discard_was_already_required = self.ready.inventory.macro_reader_checkin.get();
+            // Ownership of the shadow has left the reader. Any failed validation,
+            // restore, or discard must close it rather than pool orphaned TEMP pages.
+            self.ready
+                .inventory
+                .raise_macro_reader_checkin(super::resolution_selection::MacroReaderCheckin::Close);
+            if retained.requested_files == requested_files {
+                if first {
+                    let current_generation = self.ready.project.analysis_generation();
+                    if cancellation.is_cancelled() {
+                        self.ready.inventory.raise_macro_reader_checkin(
+                            super::resolution_selection::MacroReaderCheckin::Close,
+                        );
+                        return Ok(SelectedResolutionStageOutcome::Cancelled);
+                    }
+                    if current_generation != self.ready.analysis_generation {
+                        self.ready.inventory.raise_macro_reader_checkin(
+                            super::resolution_selection::MacroReaderCheckin::Close,
+                        );
+                        return Ok(SelectedResolutionStageOutcome::Stale(
+                            SelectedResolutionStale::TransientAnalysisGeneration {
+                                expected: self.ready.analysis_generation,
+                                actual: current_generation,
+                            },
+                        ));
+                    }
+                    let miss = if retained.analysis_generation != self.ready.analysis_generation {
+                        Some("generation")
+                    } else if self.ready.inventory.publication_data_version()?
+                        != Some(retained.main_data_version)
+                    {
+                        Some("data_version")
+                    } else if retained.selection_fingerprint != self.ready.inventory.fingerprint()
+                        || retained.routing_digest != self.ready.inventory.routing_digest()
+                        || retained.scope_identity != self.ready.inventory.scope_identity()
+                    {
+                        Some("authority")
+                    } else if !self.ready.inventory.macro_stage_is_pristine() {
+                        Some("stage")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = miss {
+                        with_accounted_macro_snapshot_write(
+                            &self.ready.inventory,
+                            discard_macro_stage_snapshot,
+                        )?;
+                        macro_frontier_cache_note(reads, false, reason);
+                    } else {
+                        restore_macro_stage_snapshot(
+                            &self.ready.inventory,
+                            &retained.stage_tables,
+                        )?;
+                        *self.ready.checked_macro_frontier_files.borrow_mut() =
+                            retained.checked_files.clone();
+                        *self.ready.macro_overlay.borrow_mut() = retained.overlay.clone();
+                        *self.ready.prepared_macro_files.borrow_mut() =
+                            retained.prepared_files.clone();
+                        self.ready.inventory.enable_derive_helper_decisions();
+                        reads.replay(retained.receipt.as_ref());
+                        self.ready
+                            .inventory
+                            .retained_macro_frontier
+                            .replace(Some(retained));
+                        self.ready
+                            .inventory
+                            .macro_reader_checkin
+                            .set(discard_was_already_required);
+                        macro_frontier_cache_note(reads, true, "exact_set");
+                        return Ok(SelectedResolutionStageOutcome::Ready);
+                    }
+                } else {
+                    self.ready
+                        .inventory
+                        .retained_macro_frontier
+                        .replace(Some(retained));
+                    self.ready.inventory.enable_derive_helper_decisions();
+                    self.ready
+                        .inventory
+                        .macro_reader_checkin
+                        .set(discard_was_already_required);
+                    macro_frontier_cache_note(reads, true, "same_operation");
+                    return Ok(SelectedResolutionStageOutcome::Ready);
+                }
+            } else {
+                if first {
+                    with_accounted_macro_snapshot_write(
+                        &self.ready.inventory,
+                        discard_macro_stage_snapshot,
+                    )?;
+                } else {
+                    self.ready
+                        .inventory
+                        .retained_macro_frontier
+                        .replace(Some(retained));
+                    self.ready
+                        .inventory
+                        .macro_reader_checkin
+                        .set(discard_was_already_required);
+                    return self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+                }
+                // The old shadow's rows are gone. If no new snapshot is admitted
+                // below, the reader still holds whatever this request staged, so it
+                // is cleaned and size-checked at check-in rather than closed. An
+                // admitted snapshot restores the prior disposition: the snapshot
+                // cap already bounded its pages.
+                self.ready.inventory.macro_reader_checkin.set(
+                    discard_was_already_required
+                        .max(super::resolution_selection::MacroReaderCheckin::Clear),
+                );
+                restore_after_snapshot = Some(discard_was_already_required);
+                macro_frontier_cache_note(reads, false, "set");
+            }
+        } else if first {
+            macro_frontier_cache_note(reads, false, "empty");
+        }
+        if !first {
+            return self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+        }
+        let pristine = self.ready.inventory.macro_stage_is_pristine();
+        let mut prepare = || self.prepare_selected_macro_frontiers_uncached(files, cancellation);
+        let (outcome, receipt) = reads.capture(&mut prepare);
+        if matches!(&outcome, Ok(SelectedResolutionStageOutcome::Ready))
+            && pristine
+            && self.ready.inventory.conn.is_pooled()
+            && requested_files.len() <= MAX_RETAINED_MACRO_FILES
+            && requested_files
+                .iter()
+                .map(|file| file.as_os_str().len())
+                .sum::<usize>()
+                <= MAX_RETAINED_MACRO_PATH_BYTES
+            && reads.receipt_bytes(receipt.as_ref()) <= MAX_RETAINED_MACRO_RECEIPT_BYTES
+            && self.ready.checked_macro_frontier_files.borrow().len()
+                <= MAX_RETAINED_MACRO_FILES * 8
+            && self.ready.macro_overlay.borrow().prepared_files.len()
+                <= MAX_RETAINED_MACRO_FILES * 8
+            && self.ready.prepared_macro_files.borrow().len() <= MAX_RETAINED_MACRO_FILES * 8
+            && self
+                .ready
+                .checked_macro_frontier_files
+                .borrow()
+                .iter()
+                .map(|path| path.as_os_str().len())
+                .sum::<usize>()
+                + self
+                    .ready
+                    .macro_overlay
+                    .borrow()
+                    .prepared_files
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+                + self
+                    .ready
+                    .prepared_macro_files
+                    .borrow()
+                    .iter()
+                    .map(|path| path.as_os_str().len())
+                    .sum::<usize>()
+                <= MAX_RETAINED_MACRO_PATH_BYTES
+            && let Some(data_version) = self.ready.inventory.publication_data_version()?
+        {
+            let snapshot =
+                with_accounted_macro_snapshot_write(&self.ready.inventory, snapshot_macro_stage);
+            match snapshot {
+                Ok(Some(stage_tables)) => {
+                    self.ready
+                        .inventory
+                        .retained_macro_frontier
+                        .replace(Some(Box::new(RetainedMacroFrontier {
+                            stage_tables,
+                            requested_files,
+                            checked_files: self.ready.checked_macro_frontier_files.borrow().clone(),
+                            overlay: self.ready.macro_overlay.borrow().clone(),
+                            prepared_files: self.ready.prepared_macro_files.borrow().clone(),
+                            receipt,
+                            selection_fingerprint: self.ready.inventory.fingerprint(),
+                            routing_digest: self.ready.inventory.routing_digest(),
+                            scope_identity: self.ready.inventory.scope_identity(),
+                            analysis_generation: self.ready.analysis_generation,
+                            main_data_version: data_version,
+                        })));
+                    if let Some(prior) = restore_after_snapshot
+                        && self.ready.inventory.macro_reader_checkin.get()
+                            == super::resolution_selection::MacroReaderCheckin::Clear
+                    {
+                        self.ready.inventory.macro_reader_checkin.set(prior);
+                    }
+                }
+                Ok(None) => {
+                    self.ready.inventory.raise_macro_reader_checkin(
+                        super::resolution_selection::MacroReaderCheckin::Close,
+                    );
+                    macro_frontier_cache_note(reads, false, "stage_cap");
+                }
+                Err(error) => {
+                    eprintln!("macro frontier cache snapshot skipped: {error}");
+                    self.ready.inventory.raise_macro_reader_checkin(
+                        super::resolution_selection::MacroReaderCheckin::Close,
+                    );
+                    macro_frontier_cache_note(reads, false, "snapshot_error");
+                }
+            }
+        } else {
+            macro_frontier_cache_note(reads, false, "cap_or_unavailable");
+        }
+        outcome
+    }
+
+    fn prepare_selected_macro_frontiers_uncached(
+        &self,
+        files: &[&Path],
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedResolutionStageOutcome> {
+        if cancellation.is_cancelled() {
+            return Ok(SelectedResolutionStageOutcome::Cancelled);
+        }
         self.ready.inventory.enable_derive_helper_decisions();
         let needs_frontier_check = {
             let checked = self.ready.checked_macro_frontier_files.borrow();
@@ -5551,6 +6877,8 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
             return Ok(SelectedResolutionStageOutcome::Ready);
         }
         let _macro_timing = crate::profiling::scope("rust_caller::macro_frontiers");
+        #[cfg(any(test, feature = "test-support"))]
+        MACRO_FRONTIER_PREPARATIONS.with(|cell| cell.set(cell.get() + 1));
         let pending_callers = {
             let checked = self.ready.checked_macro_frontier_files.borrow();
             files
@@ -6075,7 +7403,9 @@ impl<'store> SelectedResolutionOperation<'store, '_> {
                 {
                     return Ok(None);
                 }
-                if let ResolutionIncompleteReason::UnsupportedSemantic(reason) = reason {
+                if let ResolutionIncompleteReason::UnsupportedSemantic(reason)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(reason) = reason
+                {
                     candidates.push(reason);
                 }
             }
@@ -6313,6 +7643,7 @@ fn unexpanded_item_macro_gaps(
     for reason in reasons.iter() {
         let semantic = match reason {
             ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+            | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)
             | ResolutionIncompleteReason::OpenBoundary {
                 semantic,
                 status: crate::analyzer::structural::BoundaryStatus::WorkspaceLocal,
@@ -6327,7 +7658,11 @@ fn unexpanded_item_macro_gaps(
             }
             continue;
         }
-        if !matches!(reason, ResolutionIncompleteReason::UnsupportedSemantic(_)) {
+        if !matches!(
+            reason,
+            ResolutionIncompleteReason::UnsupportedSemantic(_)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(_)
+        ) {
             continue;
         }
         let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
@@ -6339,8 +7674,17 @@ fn unexpanded_item_macro_gaps(
         else {
             continue;
         };
-        let name = connection
-            .prepare_cached(
+        let memo_key = (mount.blob_id(), key);
+        let cached = ready
+            .unexpanded_item_macro_gaps
+            .borrow()
+            .get(&memo_key)
+            .cloned();
+        let name = if let Some(name) = cached {
+            name
+        } else {
+            let name = connection
+                .prepare_cached(
                 "SELECT head.macro_name, head.start_byte, head.end_byte FROM resolution_gap_reasons AS gap
                  JOIN source_rust_macro_inputs AS input
                    ON input.blob_id = gap.blob_id AND input.native_gap_site = gap.site
@@ -6353,7 +7697,18 @@ fn unexpanded_item_macro_gaps(
                 rusqlite::params![mount.blob_id(), key, item_origin, impl_origin],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?, row.get::<_, usize>(2)?)),
             )
-            .optional()?;
+                .optional()?;
+            ready
+                .unexpanded_item_macro_gaps
+                .borrow_mut()
+                .insert_bounded_weighed(
+                    memo_key,
+                    name.clone(),
+                    name.as_ref()
+                        .map_or(0, |(macro_name, _, _)| macro_name.len()),
+                );
+            name
+        };
         if let Some((macro_name, start_byte, end_byte)) = name {
             names.push(SelectedRustMacroExpansionGap {
                 semantic: *semantic,
@@ -6383,10 +7738,11 @@ fn generated_item_surface_gaps(
             brokk_bifrost_core::analyzer::resolution_facts::ResolutionGapKind::GeneratedItemSurface,
         ),
     );
-    let conn = ready.inventory.connection();
     let mut gaps = Vec::new();
     for reason in reasons.iter() {
-        let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason else {
+        let (ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+        | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)) = reason
+        else {
             continue;
         };
         let context_reason = ready.context_identities.named_reason(*semantic);
@@ -6400,12 +7756,7 @@ fn generated_item_surface_gaps(
         let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
             continue;
         };
-        if conn
-            .prepare_cached(rust_crate_context::REASON_GAP_ORIGIN)?
-            .query_row(rusqlite::params![ordinal, key], |row| row.get::<_, i64>(0))
-            .optional()?
-            == Some(origin)
-        {
+        if persisted_gap_frontier(ready, ordinal, key)?.map(|(origin, _)| origin) == Some(origin) {
             gaps.push(*semantic);
         }
     }
@@ -6465,40 +7816,54 @@ fn item_macro_invocation_name(
 /// The native macro-input join is the same producer fact used by Rust reverse
 /// candidate discovery: it separates an explicit invocation that can invent
 /// arbitrary items from an attribute-generated surface.
+fn persisted_gap_frontier(
+    ready: &ReadySelectedResolution<'_, '_>,
+    ordinal: u32,
+    key: u32,
+) -> Result<Option<(i64, bool)>> {
+    if let Some(value) = ready.persisted_gap_frontiers.borrow().get(&(ordinal, key)) {
+        return Ok(*value);
+    }
+    let value = ready
+        .inventory
+        .connection()
+        .prepare_cached(
+            "SELECT reason.origin,
+           EXISTS (SELECT 1 FROM main.source_rust_macro_inputs AS input
+             WHERE input.blob_id=reason.blob_id AND input.native_gap_site=reason.site)
+         FROM temp.selected_resolution_mounts AS mount
+         JOIN main.resolution_gap_reasons AS reason ON reason.blob_id=mount.blob_id
+         WHERE mount.mount_ordinal=?1 AND reason.reason=?2",
+        )?
+        .query_row(rusqlite::params![ordinal, key], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+        })
+        .optional()?;
+    ready
+        .persisted_gap_frontiers
+        .borrow_mut()
+        .insert_bounded((ordinal, key), value);
+    Ok(value)
+}
+
 fn retained_gap_frontiers(
     ready: &ReadySelectedResolution<'_, '_>,
     completion: &ResolutionCompletion,
 ) -> Result<Vec<SelectedRustGapFrontier>> {
-    const GAP_FRONTIER_SQL: &str = "SELECT reason.origin,
-        EXISTS (
-          SELECT 1 FROM main.source_rust_macro_inputs AS input
-          WHERE input.blob_id=reason.blob_id
-            AND input.native_gap_site=reason.site
-        )
-        FROM temp.selected_resolution_mounts AS mount
-        JOIN main.resolution_gap_reasons AS reason
-          ON reason.blob_id=mount.blob_id
-        WHERE mount.mount_ordinal=?1 AND reason.reason=?2";
     let ResolutionCompletion::Incomplete(reasons) = completion else {
         return Ok(Vec::new());
     };
-    let conn = ready.inventory.connection();
-    let mut statement = conn.prepare_cached(GAP_FRONTIER_SQL)?;
     let mut frontiers = Vec::new();
     for reason in reasons.iter() {
-        let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason else {
+        let (ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+        | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)) = reason
+        else {
             continue;
         };
         let persisted = semantic
             .ordinal()
             .zip(semantic.local_key())
-            .map(|(ordinal, key)| {
-                statement
-                    .query_row(rusqlite::params![ordinal, key], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
-                    })
-                    .optional()
-            })
+            .map(|(ordinal, key)| persisted_gap_frontier(ready, ordinal, key))
             .transpose()?
             .flatten();
         let kind = if persisted.is_some_and(|(_, macro_input)| macro_input) {
@@ -6586,7 +7951,6 @@ fn match_selected_definition(
     Ok(completed.map_continue(|()| found))
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn match_selected_definitions(
     mount: &SelectedResolutionOperationMount,
     target: &CodeUnit,
@@ -7302,7 +8666,16 @@ fn obligation_site_details(
     let mount = ready
         .inventory
         .mount_record_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))?;
-    let range = ready.inventory.connection().prepare_cached(
+    let memo_key = (mount.blob_id(), site);
+    let cached = ready
+        .obligation_site_ranges
+        .borrow()
+        .get(&memo_key)
+        .copied();
+    let range = if let Some(range) = cached {
+        range
+    } else {
+        let range = ready.inventory.connection().prepare_cached(
         "SELECT COALESCE(site.start_byte, declaration.name_start_byte, declaration.start_byte),
                 COALESCE(site.end_byte, declaration.name_end_byte, declaration.end_byte)
          FROM resolution_sites AS site
@@ -7313,7 +8686,13 @@ fn obligation_site_details(
          WHERE site.blob_id=?1 AND site.site=?2"
     )?.query_row(rusqlite::params![mount.blob_id(), site], |row| {
         Ok((row.get::<_, Option<usize>>(0)?, row.get::<_, Option<usize>>(1)?))
-    }).optional()?;
+        }).optional()?;
+        ready
+            .obligation_site_ranges
+            .borrow_mut()
+            .insert_bounded(memo_key, range);
+        range
+    };
     let Some((Some(start), Some(end))) = range else {
         return Ok(None);
     };
@@ -7415,21 +8794,22 @@ fn named_reason_details(
     let mut named = Vec::new();
     for reason in reasons.iter() {
         let semantic = match reason {
-            ResolutionIncompleteReason::UnsupportedSemantic(semantic) => semantic,
+            ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+            | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => semantic,
             // A context also names an open boundary it can explain, such as
             // the implicit prelude item an unqualified Rust name falls through
             // to. Publishing that evidence lets a caller tell the prelude
             // item from any other unindexed boundary (#3757).
             ResolutionIncompleteReason::OpenBoundary { semantic, .. } => {
                 if let Some((name, evidence)) = ready.context_identities.named_reason(*semantic) {
-                    named.push((name, evidence.to_string()));
+                    named.push((name, public_rust_evidence(ready, &evidence)?));
                 }
                 continue;
             }
             _ => continue,
         };
         if let Some((name, evidence)) = ready.context_identities.named_reason(*semantic) {
-            named.push((name, evidence.to_string()));
+            named.push((name, public_rust_evidence(ready, &evidence)?));
             continue;
         }
         if let Some(detail) = persisted_obligation_details(ready, *semantic)? {
@@ -7488,6 +8868,74 @@ fn named_reason_details(
     named.sort_unstable();
     named.dedup();
     Ok(named)
+}
+
+/// Replace store blob keys only when evidence crosses into a public answer.
+/// The original JSON still supplies the persisted reason's identity and joins.
+fn public_rust_evidence(ready: &ReadySelectedResolution<'_, '_>, evidence: &str) -> Result<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(evidence) else {
+        return Ok(evidence.to_owned());
+    };
+    fn rewrite(value: &mut serde_json::Value, connection: &rusqlite::Connection) -> Result<()> {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    rewrite(item, connection)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                // Producers that know the member's path record it as `rel_path`.
+                // Persisted crate gap evidence records only the member's blob,
+                // which files with identical content share, so a blob with more
+                // than one selected path reports that its path is unavailable.
+                if let Some(blob) = fields.remove("member_blob") {
+                    let blob = blob
+                        .as_i64()
+                        .expect("persisted blob evidence is an integer");
+                    let (path, count): (Option<String>, i64) = connection.query_row(
+                        "SELECT min(persisted_relative_path), \
+                                count(DISTINCT persisted_relative_path) \
+                         FROM selected_resolution_mounts \
+                         WHERE storage_language='rust' AND blob_id=?1",
+                        [blob],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let selected_path = path
+                        .as_deref()
+                        .filter(|path| count == 1 && !std::path::Path::new(path).is_absolute());
+                    fields.insert(
+                        "member_path".to_owned(),
+                        selected_path.map_or(serde_json::Value::Null, |path| {
+                            serde_json::json!(
+                                brokk_bifrost_core::path_utils::workspace_relative_slash_path(
+                                    std::path::Path::new(path)
+                                )
+                            )
+                        }),
+                    );
+                    if selected_path.is_none() {
+                        fields.insert(
+                            "member_path_unavailable".to_owned(),
+                            serde_json::json!(if count == 0 {
+                                "blob is not mounted in the selected resolution"
+                            } else if count == 1 {
+                                "selected file path is not workspace-relative"
+                            } else {
+                                "blob has multiple paths in the selected workspace"
+                            }),
+                        );
+                    }
+                }
+                for field in fields.values_mut() {
+                    rewrite(field, connection)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    rewrite(&mut value, ready.inventory.connection())?;
+    Ok(value.to_string())
 }
 
 /// Render reason evidence with sorted object keys when it is JSON.
@@ -7706,16 +9154,15 @@ fn assemble_rust_reference_answer<T>(
     if let ResolutionCompletion::Incomplete(reasons) = resolution.binding().completion() {
         for detail in ready
             .inventory
-            .connection()
-            .prepare_cached(rust_crate_context::GAP_DETAILS)?
-            .query_map([locator.relative_path()], |row| row.get::<_, String>(0))?
+            .rust_point_gap_details(locator.relative_path(), cancellation)?
         {
-            let detail = detail?;
             let reason = ResolutionIncompleteReason::UnsupportedSemantic(
                 rust_crate_context::inventory_reason(&ready.context_identities, &detail),
             );
             if reasons.iter().any(|candidate| *candidate == reason) {
-                let ResolutionIncompleteReason::UnsupportedSemantic(semantic) = reason else {
+                let (ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)) = reason
+                else {
                     unreachable!("inventory reasons are unsupported semantic identities")
                 };
                 // Named completion evidence already publishes this identity.
@@ -7723,7 +9170,7 @@ fn assemble_rust_reference_answer<T>(
                 // inventory again through a differently ordered JSON object.
                 if ready.context_identities.named_reason(semantic).is_none() {
                     macro_expansion_gaps.extend(inventory_macro_gaps(ready, &detail, semantic)?);
-                    inventory_details.push(detail);
+                    inventory_details.push(public_rust_evidence(ready, &detail)?);
                 }
             }
         }
@@ -7915,6 +9362,13 @@ fn project_rust_member_attributions(
         .inventory
         .connection()
         .prepare_cached(RUST_RECEIVER_KIND_SQL)?;
+    let mut receiver_forms = ready.inventory.connection().prepare_cached(
+        "SELECT json_extract(signature.body, '$[4]')
+         FROM temp.selected_resolution_mounts AS mount
+         JOIN main.resolution_callable_signatures AS signature
+           ON signature.blob_id = mount.blob_id AND signature.definition = ?2
+         WHERE mount.mount_ordinal = ?1",
+    )?;
     let mut attributions = Vec::with_capacity(rows.len());
     for row in rows {
         if !session.scope_step() {
@@ -7975,6 +9429,21 @@ fn project_rust_member_attributions(
                 .transpose()?,
             SelectedSemanticProvenance::Stage(_) | SelectedSemanticProvenance::Shared(_) => None,
         };
+        let receiver_form = match lexical.semantic_provenance(row.target(), cancellation)? {
+            Some(SelectedSemanticProvenance::FragmentLocal(provenance)) => receiver_forms
+                .query_row(
+                    rusqlite::params![provenance.mount().ordinal().get(), provenance.local_key().get()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .map(|code| super::resolution_prepare::resolution_rows::from_code(
+                    brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_CALLABLE_RECEIVER_FORMS,
+                    code,
+                    "Rust selected receiver form",
+                )),
+            _ => None,
+        };
         attributions.push(SelectedRustMemberAttribution {
             target: row.target(),
             receiver: row.receiver(),
@@ -7982,6 +9451,9 @@ fn project_rust_member_attributions(
             receiver_is_intrinsic: intrinsic_owners.contains(&row.receiver()),
             owner: owner.clone(),
             reach,
+            receiver_form,
+            receiver_user_deref_steps: row.rust_receiver_deref_steps(),
+            written_reference_depth: row.rust_receiver_reference_depth(),
         });
     }
     Ok(Some(attributions))
@@ -8401,7 +9873,6 @@ fn rust_type_parameter_member_reason(
         })
         .map(|projection| projection.output_slot())
         .collect::<HashSet<_>>();
-    let conn = ready.inventory.connection();
     let mut bounds = BTreeSet::new();
     let mut unbounded = false;
     let mut unresolved_bounds = false;
@@ -8420,15 +9891,11 @@ fn rust_type_parameter_member_reason(
         };
         for reason in reasons.iter() {
             let inferred = match reason {
-                ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+                | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => {
                     match (semantic.ordinal(), semantic.local_key()) {
-                        (Some(ordinal), Some(key)) => conn
-                            .prepare_cached(rust_crate_context::REASON_GAP_ORIGIN)?
-                            .query_row(rusqlite::params![ordinal, key], |row| {
-                                row.get::<_, i64>(0)
-                            })
-                            .optional()?
-                            .is_some_and(|origin| {
+                        (Some(ordinal), Some(key)) => persisted_gap_frontier(ready, ordinal, key)?
+                            .is_some_and(|(origin, _)| {
                                 super::resolution_prepare::resolution_rows::gap_origin_from_code(
                                     origin,
                                 ) == crate::analyzer::resolution::LoweringGapOrigin::Extracted(
@@ -8863,6 +10330,26 @@ fn register_selected_rust_caller_context_in_session(
     cancellation: &CancellationToken,
     session: &ResolutionSession,
 ) -> Result<ContextRegistrationOutcome> {
+    register_selected_rust_caller_context_on_view(
+        &ready.rust_forward_build_view(),
+        caller,
+        crate_keys,
+        access,
+        blueprint,
+        cancellation,
+        session,
+    )
+}
+
+fn register_selected_rust_caller_context_on_view(
+    ready: &RustForwardBuildView<'_, '_>,
+    caller: &Path,
+    crate_keys: &[[u8; 32]],
+    access: RustDeclarationAccessKind,
+    blueprint: &SelectedFactOperationBlueprint,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<ContextRegistrationOutcome> {
     if cancellation.is_cancelled() {
         return Ok(ContextRegistrationOutcome::Cancelled);
     }
@@ -8902,6 +10389,59 @@ fn register_selected_rust_caller_context_in_session(
         }
     }
     Ok(outcome)
+}
+
+/// Keep the crate scope and its query-lived memos alive through the forward
+/// resolution. Dropping this value restores the complete selected scope.
+struct RustForwardStage<'a, 'store> {
+    blueprint: Option<SelectedFactOperationBlueprint>,
+    _scope: Option<rust_crate_context::ForwardCrateScope<'a, 'store>>,
+    _memos: rust_crate_rows::CrateStageMemos<'a>,
+}
+
+/// Narrow the scope, collect the blueprint and register the caller context
+/// for one Rust forward window.
+fn build_rust_forward_stage<'a, 'store>(
+    ready: &RustForwardBuildView<'a, 'store>,
+    caller: &Path,
+    crate_keys: &[[u8; 32]],
+    context: SelectedResolutionContextInputs,
+    cancellation: &CancellationToken,
+    session: &ResolutionSession,
+) -> Result<std::result::Result<RustForwardStage<'a, 'store>, ResolutionCompletion>> {
+    let memos = ready.crate_stage_memos()?;
+    let scope = ready.narrow_forward_scope_to_crates(crate_keys, cancellation)?;
+    let blueprint_timing = crate::profiling::scope("rust_caller::collect_blueprint");
+    let blueprint = match ready.collect_blueprint_in_session(context, cancellation, session)? {
+        SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
+        SelectedFactOperationBlueprintConstruction::Cancelled {
+            cancellation_completion,
+            ..
+        } => return Ok(Err(cancellation_completion)),
+    };
+    drop(blueprint_timing);
+    note_rust_point_work("search_collect_blueprint", session);
+    let _resolve_timing = crate::profiling::scope("rust_caller::register_and_resolve");
+    if matches!(
+        register_selected_rust_caller_context_on_view(
+            ready,
+            caller,
+            crate_keys,
+            RustDeclarationAccessKind::Caller,
+            &blueprint,
+            cancellation,
+            session,
+        )?,
+        ContextRegistrationOutcome::Cancelled
+    ) {
+        return Ok(Err(cancelled_completion()));
+    }
+    note_rust_point_work("search_register_context", session);
+    Ok(Ok(RustForwardStage {
+        blueprint: Some(blueprint),
+        _scope: scope,
+        _memos: memos,
+    }))
 }
 
 /// Operation-local work used to validate and compile selected context.
@@ -8974,6 +10514,92 @@ impl AnalyzerStore {
         &'store self,
         input: SelectedResolutionOperationInput<'project, 'selection>,
         cancellation: &CancellationToken,
+    ) -> Result<SelectedResolutionOperationOpenOutcome<'store, 'project>>
+    where
+        'store: 'project,
+    {
+        self.open_selected_resolution_operation_uninstalled(input, cancellation)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn open_selected_resolution_operation_with_inherited_walk_for_test<
+        'store,
+        'project,
+        'selection,
+    >(
+        &'store self,
+        input: SelectedResolutionOperationInput<'project, 'selection>,
+        cancellation: &CancellationToken,
+    ) -> Result<SelectedResolutionOperationOpenOutcome<'store, 'project>>
+    where
+        'store: 'project,
+    {
+        let outcome = self.open_selected_resolution_operation_uninstalled(input, cancellation)?;
+        Ok(match outcome {
+            SelectedResolutionOperationOpenOutcome::Ready(mut operation) => {
+                let knowledge = if operation.ready.read_reuse.is_some() {
+                    inherited_member_walk::JvmInheritedKnowledge::Walk(Box::new(
+                        inherited_member_walk::WitnessFunction::new(
+                            operation.worker_store(),
+                            operation.worker_input().clone(),
+                            cancellation.clone(),
+                        ),
+                    ))
+                } else {
+                    inherited_member_walk::JvmInheritedKnowledge::Unavailable
+                };
+                operation.install_jvm_inherited_knowledge(knowledge);
+                SelectedResolutionOperationOpenOutcome::Ready(operation)
+            }
+            outcome => outcome,
+        })
+    }
+
+    pub(crate) fn open_selected_resolution_level_operation<'store, 'project, 'selection>(
+        &'store self,
+        input: SelectedResolutionOperationInput<'project, 'selection>,
+        cancellation: &CancellationToken,
+        knowledge: Option<inherited_member_walk::JvmInheritedKnowledge<'project>>,
+    ) -> Result<SelectedResolutionOperationOpenOutcome<'store, 'project>> {
+        let outcome = self.open_selected_resolution_operation_uninstalled(input, cancellation)?;
+        Ok(match outcome {
+            SelectedResolutionOperationOpenOutcome::Ready(mut operation) => {
+                if let Some(knowledge) = knowledge {
+                    operation.install_jvm_inherited_knowledge(knowledge);
+                }
+                SelectedResolutionOperationOpenOutcome::Ready(operation)
+            }
+            outcome => outcome,
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn open_selected_resolution_operation_with_inherited_tier_knowledge_for_test<
+        'store,
+        'project,
+        'selection,
+    >(
+        &'store self,
+        input: SelectedResolutionOperationInput<'project, 'selection>,
+        cancellation: &CancellationToken,
+        knowledge: Arc<crate::analyzer::resolution::tier_evaluator::InheritedTierKnowledge>,
+    ) -> Result<SelectedResolutionOperationOpenOutcome<'store, 'project>> {
+        let outcome = self.open_selected_resolution_operation_uninstalled(input, cancellation)?;
+        Ok(match outcome {
+            SelectedResolutionOperationOpenOutcome::Ready(mut operation) => {
+                operation.install_jvm_inherited_tier_knowledge(knowledge);
+                SelectedResolutionOperationOpenOutcome::Ready(operation)
+            }
+            outcome => outcome,
+        })
+    }
+
+    fn open_selected_resolution_operation_uninstalled<'store, 'project, 'selection>(
+        &'store self,
+        input: SelectedResolutionOperationInput<'project, 'selection>,
+        cancellation: &CancellationToken,
     ) -> Result<SelectedResolutionOperationOpenOutcome<'store, 'project>> {
         let captured_input = CapturedSelectedResolutionInput::capture(&input);
         Ok(
@@ -8984,7 +10610,14 @@ impl AnalyzerStore {
                     }
                     SelectedResolutionOperationOpenOutcome::Ready(Box::new(
                         SelectedResolutionOperation {
+                            _rust_nesting_guard: RustSelectedNestingGuard::new(
+                                captured_input
+                                    .languages
+                                    .iter()
+                                    .any(|language| language.storage_language() == "rust"),
+                            ),
                             captured_input,
+                            macro_frontier_reads: None,
                             ready: *ready,
                             enumerated_mounts: OnceCell::new(),
                             go_context_selections: RefCell::default(),
@@ -8992,14 +10625,17 @@ impl AnalyzerStore {
                             go_prepared_contexts: go_named::GoPreparedContextMemo::default(),
                             go_context_registrations: RefCell::default(),
                             go_receiver_anchor_types_memo: RefCell::default(),
+                            go_point_receiver_anchor_memo: RefCell::default(),
+                            go_point_receiver_anchor_stats: RefCell::new(
+                                crate::profiling::enabled()
+                                    .then(go_receiver_anchor::GoPointReceiverAnchorStats::new),
+                            ),
                             go_source_roles: RefCell::default(),
-                            #[cfg(any(test, feature = "test-support"))]
-                            java_oracle_selection: None,
-                            #[cfg(any(test, feature = "test-support"))]
-                            java_oracle_visits: RefCell::default(),
                             jvm_file_contexts: RefCell::default(),
                             jvm_access_policies: RefCell::default(),
                             jvm_context_preparations: Default::default(),
+                            jvm_inherited_tier_knowledge: None,
+                            jvm_decision_consumed_walk: Cell::new(false),
                             jvm_context_blueprints: Default::default(),
                             jvm_context_registrations: RefCell::default(),
                             jvm_source_access_memo: RefCell::default(),
@@ -9138,6 +10774,8 @@ impl AnalyzerStore {
             macro_overlay: RefCell::default(),
             prepared_macro_files: RefCell::default(),
             checked_macro_frontier_files: RefCell::default(),
+            first_macro_frontier_request_seen: Cell::new(false),
+            macro_retention: Cell::new(MacroRetention::Pending),
             registered_rust_caller_contexts: RefCell::default(),
             rust_caller_context: RefCell::new(None),
             rust_caller_demand: RefCell::new(None),
@@ -9166,15 +10804,21 @@ impl AnalyzerStore {
                 inventory.staged_read_epoch(),
             ),
         ));
+        let model_authority = input.explicit_model_authority.clone().unwrap_or_else(|| {
+            input
+                .analyzer
+                .and_then(SelectedAnalyzerServices::model_authority)
+        });
         Ok(PreparedSelectedResolution::Ready(Box::new(
             ReadySelectedResolution {
                 store: self,
-                inventory,
+                inventory: Rc::from(inventory),
                 query_preparation: Some(query_preparation),
                 content_mounts: input.content_mounts,
                 project: input.project,
                 analyzer: input.analyzer,
-                attached_model_authority: None,
+                read_reuse: input.read_reuse,
+                model_authority,
                 analysis_generation: input.analysis_generation,
                 macro_walk: RefCell::default(),
                 crate_rows: RefCell::default(),
@@ -9183,6 +10827,7 @@ impl AnalyzerStore {
                 go_publications: RefCell::default(),
                 go_publication_rechecks: RefCell::default(),
                 snapshots: input.snapshots.clone(),
+                csharp_view: std::cell::OnceCell::new(),
                 go_base_profile: std::cell::Cell::new(None),
                 go_active_package: std::cell::Cell::new(None),
                 go_definition_contexts: RefCell::default(),
@@ -9195,6 +10840,10 @@ impl AnalyzerStore {
                 boundary_candidate_read_memo: std::rc::Rc::new(RefCell::default()),
                 jvm_root_presence_memo: root_presence_memo,
                 point_read_memos: std::rc::Rc::default(),
+                persisted_gap_frontiers: RefCell::default(),
+                unexpanded_item_macro_gaps: RefCell::default(),
+                public_diagnostic_sites: RefCell::default(),
+                obligation_site_ranges: RefCell::default(),
                 jvm_context_profile: RefCell::new(
                     crate::analyzer::resolution::seam_profile::enabled()
                         .then(jvm_context::JvmContextReadProfile::default),
@@ -9425,9 +11074,8 @@ impl SelectedResolutionOperation<'_, '_> {
                 context_metrics,
                 session: &ResolutionSession::unbounded(),
                 artifacts: None,
-                go_demand: None,
+                language_demand: NativeLanguageDemand::None,
                 selected_import_gap: None,
-                go_receiver_overlay: None,
                 query_result_slot: None,
                 point_metrics: None,
             },
@@ -9469,9 +11117,8 @@ impl SelectedResolutionOperation<'_, '_> {
             context_metrics,
             session,
             mut artifacts,
-            mut go_demand,
+            mut language_demand,
             selected_import_gap,
-            go_receiver_overlay,
             query_result_slot,
             point_metrics,
         } = query;
@@ -9489,6 +11136,12 @@ impl SelectedResolutionOperation<'_, '_> {
             }
         };
         let family = nominal_rules::nominal_package_rules_for_storage(locator.storage_language());
+        let go_receiver_overlay = match &mut language_demand {
+            NativeLanguageDemand::Go {
+                receiver_overlay, ..
+            } => receiver_overlay.take(),
+            _ => None,
+        };
         let ready = &self.ready;
         let mut resolution_metrics = ResolutionBatchMetrics::default();
         let (projected, completion) = {
@@ -9524,6 +11177,11 @@ impl SelectedResolutionOperation<'_, '_> {
             }
             let located = if locator.storage_language() == "java" {
                 ready.lookup_java_definition_locator(&persisted_lexical, locator, cancellation)?
+            } else if locator.storage_language() == "python" {
+                // Python publishes a synthetic callee-value read at a call's
+                // callee range beside the user-addressable reference; select
+                // the reference the way the Python definition lookup does.
+                self.python_definition_reference(locator, cancellation, session)?
             } else {
                 ready.lookup_locator(&persisted_lexical, locator, cancellation)?
             };
@@ -9602,12 +11260,17 @@ impl SelectedResolutionOperation<'_, '_> {
                                 resolve_with_provider(operation, None, None).map(resolve_plain)
                             },
                         )?
-                    } else if let Some(demand) = go_demand.take() {
+                    } else if matches!(language_demand, NativeLanguageDemand::Go { .. }) {
+                        let NativeLanguageDemand::Go { demand, .. } =
+                            std::mem::replace(&mut language_demand, NativeLanguageDemand::None)
+                        else {
+                            unreachable!("checked Go demand")
+                        };
                         assert_eq!(locator.storage_language(), "go");
                         self.with_go_forward_operation(
                             GoForwardOperationContext {
                                 blueprint: &blueprint,
-                                demand,
+                                demand: *demand,
                                 caller_path: locator.relative_path(),
                                 lexical: &observed_lexical,
                                 typed: &observed_typed,
@@ -9619,6 +11282,43 @@ impl SelectedResolutionOperation<'_, '_> {
                                 resolve_with_provider(operation, None, None).map(resolve_plain)
                             },
                         )?
+                    } else if let NativeLanguageDemand::Python { environment } = language_demand {
+                        assert_eq!(locator.storage_language(), "python");
+                        let result = match artifacts.take() {
+                            Some(artifacts) => self.with_python_forward_operation_using_artifacts(
+                                environment.summary,
+                                environment.python_version,
+                                &blueprint,
+                                session,
+                                cancellation,
+                                artifacts,
+                                |operation, provider, _, _, _, external_imports, _, _| {
+                                    external_imports.borrow_mut().requested_reference =
+                                        Some(reference);
+                                    resolve_with_provider(operation, Some(provider), None)
+                                },
+                            ),
+                            None => self.with_python_forward_operation(
+                                environment.summary,
+                                environment.python_version,
+                                &blueprint,
+                                session,
+                                cancellation,
+                                |operation, provider, _, _, _, external_imports, _, _| {
+                                    external_imports.borrow_mut().requested_reference =
+                                        Some(reference);
+                                    resolve_with_provider(operation, Some(provider), None)
+                                },
+                            ),
+                        }?;
+                        match result {
+                            std::ops::ControlFlow::Continue(answer) => answer,
+                            std::ops::ControlFlow::Break(completion) => {
+                                return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                    completion,
+                                ));
+                            }
+                        }
                     } else if let Some((language, installer)) =
                         match native_demand_installer_for_reference(locator, reference) {
                             Ok(installer) => installer,
@@ -9681,6 +11381,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             &observed_lexical,
                             &persisted_lexical,
                             &observed_typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
                             ForwardOperationArtifactContext {
                                 cancellation,
                                 session,
@@ -9695,6 +11396,7 @@ impl SelectedResolutionOperation<'_, '_> {
                             &observed_lexical,
                             &persisted_lexical,
                             &observed_typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
                             cancellation,
                             session,
                             |operation| {
@@ -9945,6 +11647,62 @@ impl SelectedResolutionOperation<'_, '_> {
         ) -> Result<P>,
         cancelled: P,
     ) -> Result<Option<BoundedResolution<SelectedResolutionOperationOutcome<P>>>> {
+        let Some((projection, session)) = self.declaration_at_range_projection_in_session(
+            locator,
+            budget,
+            cancellation,
+            project,
+            cancelled,
+        )?
+        else {
+            return Ok(None);
+        };
+        let outcome =
+            self.ready
+                .finish(projection, &ResolutionCompletion::Complete, cancellation)?;
+        Ok(Some(session.finish(outcome)))
+    }
+
+    /// Read a declaration projection without request final authority. The
+    /// caller must check final authority after releasing a lent Rust window.
+    #[doc(hidden)]
+    pub fn declaration_at_range_projection_bounded<P>(
+        &self,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+        project: impl FnOnce(
+            &ReadySelectedResolution<'_, '_>,
+            &[SemanticId],
+            &CancellationToken,
+            &ResolutionSession,
+        ) -> Result<P>,
+        cancelled: P,
+    ) -> Result<Option<BoundedResolution<P>>> {
+        Ok(self
+            .declaration_at_range_projection_in_session(
+                locator,
+                budget,
+                cancellation,
+                project,
+                cancelled,
+            )?
+            .map(|(projection, session)| session.finish(projection)))
+    }
+
+    fn declaration_at_range_projection_in_session<P>(
+        &self,
+        locator: &SelectedSemanticLocator,
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+        project: impl FnOnce(
+            &ReadySelectedResolution<'_, '_>,
+            &[SemanticId],
+            &CancellationToken,
+            &ResolutionSession,
+        ) -> Result<P>,
+        cancelled: P,
+    ) -> Result<Option<(P, ResolutionSession)>> {
         let session = ResolutionSession::bounded(budget, Some(cancellation));
         let persisted = self.ready.lexical_source();
         let (start_byte, end_byte) = locator
@@ -9978,10 +11736,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 }
             }
         };
-        let outcome =
-            self.ready
-                .finish(projection, &ResolutionCompletion::Complete, cancellation)?;
-        Ok(Some(session.finish(outcome)))
+        Ok(Some((projection, session)))
     }
 
     /// A reverse confirmation certifies absence, so it answers under the
@@ -10084,17 +11839,6 @@ impl SelectedResolutionOperation<'_, '_> {
             return Ok(Vec::new());
         }
         let session = ResolutionSession::bounded(budget, Some(cancellation));
-        if self
-            .mount_table()
-            .mount_for_path("rust", &selected_path_key(caller))?
-            .is_none()
-        {
-            return Ok(repeat_bounded_resolution(
-                locators.len(),
-                session.finish(()),
-                || SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile,
-            ));
-        }
         let operation_cancellation = session.cancellation().unwrap_or(cancellation);
         let mut macro_callers = vec![caller];
         for path in locators
@@ -10105,78 +11849,24 @@ impl SelectedResolutionOperation<'_, '_> {
                 macro_callers.push(path);
             }
         }
-        match self
-            .prepare_selected_macro_frontiers_for_files(&macro_callers, operation_cancellation)?
-        {
-            SelectedResolutionStageOutcome::Ready => {}
-            SelectedResolutionStageOutcome::Cancelled => {
-                return Ok(repeat_bounded_resolution(
-                    locators.len(),
-                    session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                        )
-                    },
-                ));
-            }
-            SelectedResolutionStageOutcome::Stale(reason) => {
-                return Ok(repeat_bounded_resolution(
-                    locators.len(),
-                    session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Stale(reason.clone()),
-                        )
-                    },
-                ));
-            }
-            SelectedResolutionStageOutcome::Unavailable(reason) => {
-                return Ok(repeat_bounded_resolution(
-                    locators.len(),
-                    session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Unavailable(reason.clone()),
-                        )
-                    },
-                ));
-            }
-        }
-        // Rust point requests use this entry and call the installer directly, not the generic arm.
-        // Routing them through the generic arm changes statement counts (see the Rust point pins).
-        let prepared_handle = match rust_demand::RUST_DEMAND_INSTALLER.0.prepare_caller(
-            self,
+        let (prepared_handle, contexts) = match self.prepare_rust_caller_window(
             caller,
+            &macro_callers,
             operation_cancellation,
-            Some(&session),
+            &session,
         )? {
-            NativeDemandPreparationOutcome::Ready(prepared) => prepared,
-            NativeDemandPreparationOutcome::Unavailable => {
+            Ok(window) => window,
+            Err(refusal) => {
                 return Ok(repeat_bounded_resolution(
                     locators.len(),
                     session.finish(()),
-                    || SelectedRustCallerReferenceOutcome::UnsupportedCallerProfile,
-                ));
-            }
-            NativeDemandPreparationOutcome::Cancelled => {
-                return Ok(repeat_bounded_resolution(
-                    locators.len(),
-                    session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                        )
-                    },
+                    || refusal.outcome(),
                 ));
             }
         };
         let prepared = prepared_handle
             .downcast_ref::<RustCallerDemand>()
             .expect("Rust installer owns the caller preparation");
-        let contexts = prepared.contexts.clone().with_declaration_access_source(
-            RustDeclarationAccessKind::Caller.source(self, prepared.crate_keys.clone())?,
-        );
         let mut context_metrics = SelectedResolutionContextMetrics;
         self.resolve_rust_reference_demand_projection_per_locator(
             caller,
@@ -10188,6 +11878,66 @@ impl SelectedResolutionOperation<'_, '_> {
             &mut context_metrics,
             &session,
         )
+    }
+
+    /// Prepare one Rust caller window: the macro frontiers of the caller and of
+    /// the files its locators name, then the caller's demand and contexts.
+    /// Every main publication of the window finishes here, before any forward
+    /// stage is built.
+    fn prepare_rust_caller_window(
+        &self,
+        caller: &Path,
+        macro_callers: &[&Path],
+        cancellation: &CancellationToken,
+        session: &ResolutionSession,
+    ) -> Result<
+        std::result::Result<
+            (NativeDemandPreparation, SelectedResolutionContextSet),
+            RustCallerWindowRefusal,
+        >,
+    > {
+        if self
+            .mount_table()
+            .mount_for_path("rust", &selected_path_key(caller))?
+            .is_none()
+        {
+            return Ok(Err(RustCallerWindowRefusal::UnsupportedCaller));
+        }
+        match self.prepare_selected_macro_frontiers_for_files(macro_callers, cancellation)? {
+            SelectedResolutionStageOutcome::Ready => {}
+            SelectedResolutionStageOutcome::Cancelled => {
+                return Ok(Err(RustCallerWindowRefusal::Cancelled));
+            }
+            SelectedResolutionStageOutcome::Stale(reason) => {
+                return Ok(Err(RustCallerWindowRefusal::Stale(reason)));
+            }
+            SelectedResolutionStageOutcome::Unavailable(reason) => {
+                return Ok(Err(RustCallerWindowRefusal::Unavailable(reason)));
+            }
+        }
+        // Rust point requests use this entry and call the installer directly, not the generic arm.
+        // Routing them through the generic arm changes statement counts (see the Rust point pins).
+        let prepared = match rust_demand::RUST_DEMAND_INSTALLER.0.prepare_caller(
+            self,
+            caller,
+            cancellation,
+            Some(session),
+        )? {
+            NativeDemandPreparationOutcome::Ready(prepared) => prepared,
+            NativeDemandPreparationOutcome::Unavailable => {
+                return Ok(Err(RustCallerWindowRefusal::UnsupportedCaller));
+            }
+            NativeDemandPreparationOutcome::Cancelled => {
+                return Ok(Err(RustCallerWindowRefusal::Cancelled));
+            }
+        };
+        let demand = prepared
+            .downcast_ref::<RustCallerDemand>()
+            .expect("Rust installer owns the caller preparation");
+        let contexts = demand.contexts.clone().with_declaration_access_source(
+            RustDeclarationAccessKind::Caller.source(self, demand.crate_keys.clone())?,
+        );
+        Ok(Ok((prepared, contexts)))
     }
 
     #[doc(hidden)]
@@ -10800,6 +12550,45 @@ impl SelectedResolutionOperation<'_, '_> {
         ready.finish(attempt, &completion, cancellation)
     }
 
+    /// Check selected Rust inputs, validate contexts and build the forward stage.
+    #[allow(clippy::too_many_arguments)]
+    fn setup_rust_forward_window(
+        &self,
+        caller: &Path,
+        crate_keys: &[[u8; 32]],
+        contexts: SelectedResolutionContextSet,
+        cancellation: &CancellationToken,
+        context_metrics: &SelectedResolutionContextMetrics,
+        session: &ResolutionSession,
+    ) -> Result<std::result::Result<RustForwardStage<'_, '_>, ResolutionCompletion>> {
+        if !self.ensure_selected_rust_inputs_in_session(cancellation, session)? {
+            return Ok(Err(cancelled_completion()));
+        }
+        note_rust_point_work("search_entry_inputs", session);
+        let context_timing = crate::profiling::scope("rust_caller::prepare_context");
+        let context = match self.prepare_context_in_session(
+            contexts,
+            cancellation,
+            context_metrics,
+            session,
+        )? {
+            SelectedResolutionContextValidationOutcome::Ready(context) => context,
+            SelectedResolutionContextValidationOutcome::Cancelled => {
+                return Ok(Err(cancelled_completion()));
+            }
+        };
+        drop(context_timing);
+        note_rust_point_work("search_validate_mounts", session);
+        build_rust_forward_stage(
+            &self.ready.rust_forward_build_view(),
+            caller,
+            crate_keys,
+            context,
+            cancellation,
+            session,
+        )
+    }
+
     /// Resolve and project one Rust reference through the demand provider.
     ///
     /// The difference from the eager twin above is exactly three things: the
@@ -10828,60 +12617,17 @@ impl SelectedResolutionOperation<'_, '_> {
     ) -> Result<Vec<BoundedResolution<SelectedRustCallerReferenceOutcome>>> {
         let count = locators.len();
         let operation_cancellation = setup_session.cancellation().unwrap_or(cancellation);
-        if !self.ensure_selected_rust_inputs_in_session(operation_cancellation, setup_session)? {
-            return Ok(repeat_bounded_resolution(
-                count,
-                setup_session.finish(()),
-                || {
-                    SelectedRustCallerReferenceOutcome::Operation(
-                        SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                    )
-                },
-            ));
-        }
-        note_rust_point_work("search_entry_inputs", setup_session);
-        let context_timing = crate::profiling::scope("rust_caller::prepare_context");
-        let context = match self.prepare_context_in_session(
-            contexts,
-            operation_cancellation,
-            context_metrics,
-            setup_session,
-        )? {
-            SelectedResolutionContextValidationOutcome::Ready(context) => context,
-            SelectedResolutionContextValidationOutcome::Cancelled => {
-                return Ok(repeat_bounded_resolution(
-                    count,
-                    setup_session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                        )
-                    },
-                ));
-            }
-        };
-        drop(context_timing);
-        note_rust_point_work("search_validate_mounts", setup_session);
-        let ready = &mut self.ready;
-        let (mut results, attempts, completion) = {
-            let _crate_memos = ready.crate_stage_memos()?;
-            let _scope = ready
-                .narrow_forward_scope_to_crates(&prepared.crate_keys, operation_cancellation)?;
-            let persisted_lexical = ready.lexical_source();
-            let persisted_typed = ready.typed_source();
-            let observed_lexical = SeamProfiled::observing(&persisted_lexical);
-            let observed_typed = SeamProfiled::observing(&persisted_typed);
-            let blueprint_timing = crate::profiling::scope("rust_caller::collect_blueprint");
-            let blueprint = match ready.collect_blueprint_in_session(
-                context,
+        let resolved = {
+            let stage = match self.setup_rust_forward_window(
+                caller,
+                &prepared.crate_keys,
+                contexts,
                 operation_cancellation,
+                context_metrics,
                 setup_session,
             )? {
-                SelectedFactOperationBlueprintConstruction::Ready(blueprint) => blueprint,
-                SelectedFactOperationBlueprintConstruction::Cancelled {
-                    cancellation_completion,
-                    ..
-                } => {
+                Ok(stage) => stage,
+                Err(cancellation_completion) => {
                     return Ok(repeat_bounded_resolution(
                         count,
                         setup_session.finish(()),
@@ -10895,235 +12641,57 @@ impl SelectedResolutionOperation<'_, '_> {
                     ));
                 }
             };
-            drop(blueprint_timing);
-            note_rust_point_work("search_collect_blueprint", setup_session);
-            let _resolve_timing = crate::profiling::scope("rust_caller::register_and_resolve");
-            if matches!(
-                register_selected_rust_caller_context_in_session(
-                    ready,
-                    caller,
-                    &prepared.crate_keys,
-                    RustDeclarationAccessKind::Caller,
-                    &blueprint,
-                    operation_cancellation,
-                    setup_session,
-                )?,
-                ContextRegistrationOutcome::Cancelled
-            ) {
-                return Ok(repeat_bounded_resolution(
-                    count,
-                    setup_session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                        )
-                    },
-                ));
-            }
-            note_rust_point_work("search_register_context", setup_session);
-            note_rust_point_work("search_final_authority", setup_session);
-            if !setup_session.scope_step() {
-                return Ok(repeat_bounded_resolution(
-                    count,
-                    setup_session.finish(()),
-                    || {
-                        SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                        )
-                    },
-                ));
-            }
-            let shared_work = match setup_session.finish(()) {
-                BoundedResolution::Complete { work, .. } => work,
-                BoundedResolution::Exceeded { limit, work } => {
-                    return Ok((0..count)
-                        .map(|_| BoundedResolution::Exceeded { limit, work })
-                        .collect());
-                }
-                BoundedResolution::Cancelled { work } => {
-                    return Ok((0..count)
-                        .map(|_| BoundedResolution::Cancelled { work })
-                        .collect());
-                }
-            };
-            let mut results = Vec::with_capacity(count);
-            let mut attempts = Vec::with_capacity(count);
-            let mut completion = ResolutionCompletion::Complete;
-            for locator in locators {
-                let point_session = ResolutionSession::bounded_after_shared_work(
-                    budget,
-                    Some(cancellation),
-                    shared_work,
-                );
-                let point_cancellation = point_session.cancellation().unwrap_or(cancellation);
-                let located = ready.lookup_locators_in_session(
-                    &persisted_lexical,
-                    locator,
-                    point_cancellation,
-                    &point_session,
-                )?;
-                let point_outcome = match located {
-                    LocatedSemantics::Missing => Ok(SelectedResolutionOperationOutcome::Native(
-                        SelectedResolutionLocated::Missing,
-                    )),
-                    LocatedSemantics::Cancelled => Ok(
-                        SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
-                    ),
-                    LocatedSemantics::Found(references) => rust_demand::RUST_DEMAND_INSTALLER
-                        .run_point(
-                            prepared,
-                            NativeDemandPointRequest {
-                                ready,
-                                blueprint: &blueprint,
-                                lexical: &observed_lexical,
-                                paths: &persisted_lexical,
-                                typed: &observed_typed,
-                                cancellation: point_cancellation,
-                                session: &point_session,
-                                artifacts: None,
-                            },
-                            |operation, provider| {
-                                let mut answers = Vec::with_capacity(references.len());
-                                for reference in references {
-                                    if !point_session.scope_step()
-                                        || point_cancellation.is_cancelled()
-                                    {
-                                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                            cancelled_completion(),
-                                        ));
-                                    }
-                                    let resolution = match operation
-                                        .resolve_reference_by_demand(reference, provider)?
-                                    {
-                                        FactDemandResolution::Ready(resolution) => *resolution,
-                                        FactDemandResolution::Cancelled(completion) => {
-                                            return Ok(
-                                                SelectedResolutionOperationOutcome::Cancelled(
-                                                    completion,
-                                                ),
-                                            );
-                                        }
-                                    };
-                                    if !point_session.observe_cancellation()
-                                        || point_cancellation.is_cancelled()
-                                    {
-                                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
-                                            cancelled_completion(),
-                                        ));
-                                    }
-                                    match assemble_rust_reference_answer(
-                                        &RustReferenceAnswerContext {
-                                            ready,
-                                            mounts: SelectedMountTable::new(&ready.inventory),
-                                            reference,
-                                            locator,
-                                            session: &point_session,
-                                            cancellation: point_cancellation,
-                                        },
-                                        operation,
-                                        resolution,
-                                        &mut |operation, reference| {
-                                            operation
-                                                .resolve_reference_by_demand(reference, provider)
-                                        },
-                                        &mut project_rust_reference_unit,
-                                    )? {
-                                        SelectedResolutionOperationOutcome::Native(answer) => {
-                                            answers.push(answer)
-                                        }
-                                        SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                                            return Ok(
-                                                SelectedResolutionOperationOutcome::Unavailable(
-                                                    reason,
-                                                ),
-                                            );
-                                        }
-                                        SelectedResolutionOperationOutcome::Stale(reason) => {
-                                            return Ok(SelectedResolutionOperationOutcome::Stale(
-                                                reason,
-                                            ));
-                                        }
-                                        SelectedResolutionOperationOutcome::Cancelled(
-                                            completion,
-                                        ) => {
-                                            return Ok(
-                                                SelectedResolutionOperationOutcome::Cancelled(
-                                                    completion,
-                                                ),
-                                            );
-                                        }
-                                    }
-                                }
-                                Ok(SelectedResolutionOperationOutcome::Native(
-                                    SelectedResolutionLocated::Found(answers),
-                                ))
-                            },
-                        ),
-                };
-                let bounded = point_session.finish(point_outcome?);
-                match bounded {
-                    BoundedResolution::Complete {
-                        value: SelectedResolutionOperationOutcome::Native(attempt),
-                        work,
-                    } => {
-                        if let SelectedResolutionLocated::Found(answers) = &attempt {
-                            completion = ResolutionCompletion::combine_all_with_poll(
-                                std::iter::once(&completion).chain(
-                                    answers.iter().map(|answer| answer.resolution.completion()),
-                                ),
-                                &mut || cancellation.is_cancelled(),
-                            )
-                            .unwrap_or_else(cancelled_completion);
-                        }
-                        attempts.push(attempt);
-                        results.push(BoundedResolution::Complete {
-                            value: SelectedRustCallerReferenceOutcome::Operation(
-                                SelectedResolutionOperationOutcome::Native(
-                                    SelectedResolutionLocated::Missing,
-                                ),
-                            ),
-                            work,
-                        });
-                    }
-                    BoundedResolution::Complete { value, work } => {
-                        attempts.push(SelectedResolutionLocated::Missing);
-                        results.push(BoundedResolution::Complete {
-                            value: SelectedRustCallerReferenceOutcome::Operation(value),
-                            work,
-                        });
-                    }
-                    BoundedResolution::Exceeded { limit, work } => {
-                        attempts.push(SelectedResolutionLocated::Missing);
-                        results.push(BoundedResolution::Exceeded { limit, work });
-                    }
-                    BoundedResolution::Cancelled { work } => {
-                        attempts.push(SelectedResolutionLocated::Missing);
-                        results.push(BoundedResolution::Cancelled { work });
-                    }
-                }
-            }
-            note_rust_point_work("search_answers", setup_session);
-            (results, attempts, completion)
+            self.resolve_rust_locators_on_forward_stage(
+                stage.blueprint.as_ref().expect("stage owns blueprint"),
+                prepared,
+                locators,
+                budget,
+                cancellation,
+                setup_session,
+            )?
         };
-        let authoritative = ready.finish(attempts, &completion, cancellation)?;
+        let (mut results, attempts, completion) = match resolved {
+            Ok(resolved) => resolved,
+            Err(stopped) => return Ok(stopped),
+        };
+        let authoritative = self.ready.finish(attempts, &completion, cancellation)?;
         match authoritative {
             SelectedResolutionOperationOutcome::Native(attempts) => {
-                for (result, attempt) in results.iter_mut().zip(attempts) {
-                    if let BoundedResolution::Complete { value, .. } = result
-                        && let SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Native(
-                                SelectedResolutionLocated::Missing,
-                            ),
-                        ) = value
-                    {
-                        *value = SelectedRustCallerReferenceOutcome::Operation(
-                            SelectedResolutionOperationOutcome::Native(attempt),
-                        );
-                    }
-                }
+                Self::reveal_rust_attempts(&mut results, attempts);
             }
+            verdict => Self::apply_rust_window_verdict(&mut results, verdict),
+        }
+        Ok(results)
+    }
+
+    fn reveal_rust_attempts(
+        results: &mut [BoundedResolution<SelectedRustCallerReferenceOutcome>],
+        attempts: LocatedRustReferenceAnswers<()>,
+    ) {
+        for (result, attempt) in results.iter_mut().zip(attempts) {
+            if let BoundedResolution::Complete { value, .. } = result
+                && let SelectedRustCallerReferenceOutcome::Operation(
+                    SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Missing),
+                ) = value
+            {
+                *value = SelectedRustCallerReferenceOutcome::Operation(
+                    SelectedResolutionOperationOutcome::Native(attempt),
+                );
+            }
+        }
+    }
+
+    /// Apply a request-level authority refusal to results computed on a
+    /// Rust forward stage. A Native verdict leaves their revealed attempts intact.
+    #[doc(hidden)]
+    pub fn apply_rust_window_verdict<T>(
+        results: &mut [BoundedResolution<SelectedRustCallerReferenceOutcome>],
+        verdict: SelectedResolutionOperationOutcome<T>,
+    ) {
+        match verdict {
+            SelectedResolutionOperationOutcome::Native(_) => {}
             SelectedResolutionOperationOutcome::Unavailable(reason) => {
-                for result in &mut results {
+                for result in results {
                     if let BoundedResolution::Complete { value, .. } = result {
                         *value = SelectedRustCallerReferenceOutcome::Operation(
                             SelectedResolutionOperationOutcome::Unavailable(reason.clone()),
@@ -11132,7 +12700,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 }
             }
             SelectedResolutionOperationOutcome::Stale(reason) => {
-                for result in &mut results {
+                for result in results {
                     if let BoundedResolution::Complete { value, .. } = result {
                         *value = SelectedRustCallerReferenceOutcome::Operation(
                             SelectedResolutionOperationOutcome::Stale(reason.clone()),
@@ -11141,13 +12709,221 @@ impl SelectedResolutionOperation<'_, '_> {
                 }
             }
             SelectedResolutionOperationOutcome::Cancelled(_) => {
-                for result in &mut results {
+                for result in results {
                     let work = result.work();
                     *result = BoundedResolution::Cancelled { work };
                 }
             }
         }
-        Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn resolve_rust_locators_on_forward_stage(
+        &self,
+        blueprint: &SelectedFactOperationBlueprint,
+        prepared: &RustCallerDemand,
+        locators: &[&SelectedSemanticLocator],
+        budget: ReceiverAnalysisBudget,
+        cancellation: &CancellationToken,
+        setup_session: &ResolutionSession,
+    ) -> Result<
+        std::result::Result<
+            (
+                Vec<BoundedResolution<SelectedRustCallerReferenceOutcome>>,
+                LocatedRustReferenceAnswers<()>,
+                ResolutionCompletion,
+            ),
+            Vec<BoundedResolution<SelectedRustCallerReferenceOutcome>>,
+        >,
+    > {
+        let count = locators.len();
+        let ready = &self.ready;
+        let persisted_lexical = ready.lexical_source();
+        let persisted_typed = ready.typed_source();
+        let observed_lexical = SeamProfiled::observing(&persisted_lexical);
+        let observed_typed = SeamProfiled::observing(&persisted_typed);
+        let _resolve_timing = crate::profiling::scope("rust_caller::register_and_resolve");
+        note_rust_point_work("search_final_authority", setup_session);
+        if !setup_session.scope_step() {
+            return Ok(Err(repeat_bounded_resolution(
+                count,
+                setup_session.finish(()),
+                || {
+                    SelectedRustCallerReferenceOutcome::Operation(
+                        SelectedResolutionOperationOutcome::Cancelled(cancelled_completion()),
+                    )
+                },
+            )));
+        }
+        let shared_work = match setup_session.finish(()) {
+            BoundedResolution::Complete { work, .. } => work,
+            BoundedResolution::Exceeded { limit, work } => {
+                return Ok(Err((0..count)
+                    .map(|_| BoundedResolution::Exceeded { limit, work })
+                    .collect()));
+            }
+            BoundedResolution::Unavailable { reason, work } => {
+                return Ok(Err((0..count)
+                    .map(|_| BoundedResolution::Unavailable { reason, work })
+                    .collect()));
+            }
+            BoundedResolution::Cancelled { work } => {
+                return Ok(Err((0..count)
+                    .map(|_| BoundedResolution::Cancelled { work })
+                    .collect()));
+            }
+        };
+        let mut results = Vec::with_capacity(count);
+        let mut attempts = Vec::with_capacity(count);
+        let mut completion = ResolutionCompletion::Complete;
+        for locator in locators {
+            let point_session = ResolutionSession::bounded_after_shared_work(
+                budget,
+                Some(cancellation),
+                shared_work,
+            );
+            let point_cancellation = point_session.cancellation().unwrap_or(cancellation);
+            let located = ready.lookup_locators_in_session(
+                &persisted_lexical,
+                locator,
+                point_cancellation,
+                &point_session,
+            )?;
+            let point_outcome = match located {
+                LocatedSemantics::Missing => Ok(SelectedResolutionOperationOutcome::Native(
+                    SelectedResolutionLocated::Missing,
+                )),
+                LocatedSemantics::Cancelled => Ok(SelectedResolutionOperationOutcome::Cancelled(
+                    cancelled_completion(),
+                )),
+                LocatedSemantics::Found(references) => rust_demand::RUST_DEMAND_INSTALLER
+                    .run_point(
+                        prepared,
+                        NativeDemandPointRequest {
+                            ready,
+                            blueprint,
+                            lexical: &observed_lexical,
+                            paths: &persisted_lexical,
+                            typed: &observed_typed,
+                            cancellation: point_cancellation,
+                            session: &point_session,
+                            artifacts: None,
+                        },
+                        |operation, provider| {
+                            let mut answers = Vec::with_capacity(references.len());
+                            for reference in references {
+                                if !point_session.scope_step() || point_cancellation.is_cancelled()
+                                {
+                                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                        cancelled_completion(),
+                                    ));
+                                }
+                                let resolution = match operation
+                                    .resolve_reference_by_demand(reference, provider)?
+                                {
+                                    FactDemandResolution::Ready(resolution) => *resolution,
+                                    FactDemandResolution::Cancelled(completion) => {
+                                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                            completion,
+                                        ));
+                                    }
+                                };
+                                if !point_session.observe_cancellation()
+                                    || point_cancellation.is_cancelled()
+                                {
+                                    return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                        cancelled_completion(),
+                                    ));
+                                }
+                                match assemble_rust_reference_answer(
+                                    &RustReferenceAnswerContext {
+                                        ready,
+                                        mounts: SelectedMountTable::new(&ready.inventory),
+                                        reference,
+                                        locator,
+                                        session: &point_session,
+                                        cancellation: point_cancellation,
+                                    },
+                                    operation,
+                                    resolution,
+                                    &mut |operation, reference| {
+                                        operation.resolve_reference_by_demand(reference, provider)
+                                    },
+                                    &mut project_rust_reference_unit,
+                                )? {
+                                    SelectedResolutionOperationOutcome::Native(answer) => {
+                                        answers.push(answer)
+                                    }
+                                    SelectedResolutionOperationOutcome::Unavailable(reason) => {
+                                        return Ok(
+                                            SelectedResolutionOperationOutcome::Unavailable(reason),
+                                        );
+                                    }
+                                    SelectedResolutionOperationOutcome::Stale(reason) => {
+                                        return Ok(SelectedResolutionOperationOutcome::Stale(
+                                            reason,
+                                        ));
+                                    }
+                                    SelectedResolutionOperationOutcome::Cancelled(completion) => {
+                                        return Ok(SelectedResolutionOperationOutcome::Cancelled(
+                                            completion,
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(SelectedResolutionOperationOutcome::Native(
+                                SelectedResolutionLocated::Found(answers),
+                            ))
+                        },
+                    ),
+            };
+            let bounded = point_session.finish(point_outcome?);
+            match bounded {
+                BoundedResolution::Complete {
+                    value: SelectedResolutionOperationOutcome::Native(attempt),
+                    work,
+                } => {
+                    if let SelectedResolutionLocated::Found(answers) = &attempt {
+                        completion = ResolutionCompletion::combine_all_with_poll(
+                            std::iter::once(&completion)
+                                .chain(answers.iter().map(|answer| answer.resolution.completion())),
+                            &mut || cancellation.is_cancelled(),
+                        )
+                        .unwrap_or_else(cancelled_completion);
+                    }
+                    attempts.push(attempt);
+                    results.push(BoundedResolution::Complete {
+                        value: SelectedRustCallerReferenceOutcome::Operation(
+                            SelectedResolutionOperationOutcome::Native(
+                                SelectedResolutionLocated::Missing,
+                            ),
+                        ),
+                        work,
+                    });
+                }
+                BoundedResolution::Complete { value, work } => {
+                    attempts.push(SelectedResolutionLocated::Missing);
+                    results.push(BoundedResolution::Complete {
+                        value: SelectedRustCallerReferenceOutcome::Operation(value),
+                        work,
+                    });
+                }
+                BoundedResolution::Exceeded { limit, work } => {
+                    attempts.push(SelectedResolutionLocated::Missing);
+                    results.push(BoundedResolution::Exceeded { limit, work });
+                }
+                BoundedResolution::Unavailable { reason, work } => {
+                    attempts.push(SelectedResolutionLocated::Missing);
+                    results.push(BoundedResolution::Unavailable { reason, work });
+                }
+                BoundedResolution::Cancelled { work } => {
+                    attempts.push(SelectedResolutionLocated::Missing);
+                    results.push(BoundedResolution::Cancelled { work });
+                }
+            }
+        }
+        note_rust_point_work("search_answers", setup_session);
+        Ok(Ok((results, attempts, completion)))
     }
 
     #[doc(hidden)]
@@ -11584,11 +13360,11 @@ impl ReadySelectedResolution<'_, '_> {
         context: SelectedResolutionContextInputs,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
-        mut root_compiler: impl FnMut(
+        root_compiler: impl FnMut(
             &SelectedContextIdentities,
             &crate::analyzer::resolution::SelectedRootBridgeDescriptor,
         ) -> Result<Option<SelectedContextCellProjection<R>>>,
-        mut package_compiler: impl FnMut(
+        package_compiler: impl FnMut(
             &SelectedContextIdentities,
             &crate::analyzer::resolution::SelectedPackageBridgeDescriptor,
         ) -> Result<Option<SelectedContextCellProjection<P>>>,
@@ -11600,207 +13376,14 @@ impl ReadySelectedResolution<'_, '_> {
                 crate::analyzer::resolution::PartialPath,
             )>,
     {
-        use crate::analyzer::resolution::{
-            SelectedContextPathPublication, SelectedContextPathPublicationOutcome,
-        };
-
-        #[cfg(any(test, feature = "test-support"))]
-        let work_before = selected_sql_trace::context_publication_work(session);
-        let (
-            bridges,
-            completion,
-            declaration_access_source,
-            context_owned_gap_identities,
-            identities,
-            package_bridges,
-            go_import_bindings,
-            callable_import_boundaries,
-        ) = context.into_parts();
-        // Resolve descriptor content before SQL publication installs its parent
-        // cancellation handler. These immutable keys then remain available to
-        // construction and rollback without confusing cancellation with missing
-        // authority. The query-owned authority memo retains only demanded keys.
-        let source = self.lexical_source();
-        for bridge in &bridges {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
-                    contextual_reverse_inventory_completion: completion,
-                });
-            }
-            bridge.validate_content_authority(&identities, &source, cancellation)?;
-        }
-        for bridge in &package_bridges {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
-                    contextual_reverse_inventory_completion: completion,
-                });
-            }
-            bridge.validate_content_authority(&identities, &source, cancellation)?;
-        }
-        for bridge in &go_import_bindings {
-            if cancellation.is_cancelled() {
-                return Ok(SelectedContextPathPublicationOutcome::Cancelled {
-                    contextual_reverse_inventory_completion: completion,
-                });
-            }
-            bridge.validate_content_authority(&identities, &source, cancellation)?;
-        }
-        let go_package_inventory_complete = *self.go_package_inventory_complete.borrow();
-        let go_package_inventory_fragments = self.go_package_inventory_fragments.borrow().clone();
-        if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
-            return Err(StoreError::new(
-                "selected root inventory completion contains operation cancellation",
-            ));
-        }
-        // Tokens are freshly allocated for every publication. Hash the full
-        // structured path cells instead, including completion, so two equal
-        // overlays share demand answers without conflating distinct overlays.
-        // This buffer is the result of this one publication and dies here.
-        struct ContextSignature(Vec<u8>);
-        impl std::hash::Hasher for ContextSignature {
-            fn finish(&self) -> u64 {
-                let digest = brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(&self.0);
-                u64::from_le_bytes(
-                    digest[..8]
-                        .try_into()
-                        .expect("a SHA-256 digest has eight bytes"),
-                )
-            }
-            fn write(&mut self, bytes: &[u8]) {
-                self.0
-                    .extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-                self.0.extend_from_slice(bytes);
-            }
-        }
-        use std::hash::Hash as _;
-        let mut signature = ContextSignature(Vec::new());
-        completion.hash(&mut signature);
-        context_owned_gap_identities.hash(&mut signature);
-        let mut shared = BTreeSet::new();
-        let mut local = BTreeSet::new();
-        let mut callable_boundaries = callable_import_boundaries;
-        if !callable_boundaries.is_empty() {
-            let mut content = callable_boundaries
-                .iter()
-                .map(|node| {
-                    crate::analyzer::resolution::selected_identity_content_digest(
-                        &identities,
-                        &source,
-                        (*node).into(),
-                        cancellation,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            content.sort_unstable();
-            content.hash(&mut signature);
-        }
-        // Only descriptor references live until this one publication ends.
-        // Compare full derivations, including completion, before SQL dedup.
-        let mut derivations = HashMap::default();
-        let names = self.shared_names();
-        let token = super::resolution_stage::SelectedResolutionStage::new(&self.inventory)
-            .publish_context_paths(cancellation, |writer| {
-                for bridge in bridges.iter() {
-                    let Some(projection) = root_compiler(&identities, bridge)? else { return Ok(false); };
-                    let projected: &crate::analyzer::resolution::SelectedRootBridgeProjection = std::borrow::Borrow::borrow(&projection.value);
-                    let paths = projected.lexical.paths();
-                    assert_eq!(paths.len(), 1, "one context descriptor produces one path");
-                    let (path_id, path) = &paths[0];
-                    let candidate = CandidatePathIdentity::new(projected.lexical.fragment(), *path_id);
-                    if let Some(previous) = derivations.insert(candidate, bridge)
-                        && previous != bridge {
-                            return Err(StoreError::new(format!(
-                                "selected context has conflicting derivations for candidate path {candidate:?}: previous={previous:?}, current={bridge:?}"
-                            )));
-                        }
-                    local.insert(projected.local_anchor);
-                    callable_boundaries.extend(projected.callable_import_boundary);
-                    for (_, recipe) in &projected.recipes {
-                        shared.insert(recipe.identity(&names));
-                    }
-                    (candidate, path).hash(&mut signature);
-                    let offered = match projection.published {
-                        Some(source) => writer.reuse(source, candidate)?,
-                        None => writer.insert(candidate, path)?,
-                    };
-                    if !offered { return Ok(false); }
-                }
-                let mut package_derivations = HashMap::default();
-                for bridge in &package_bridges {
-                    let Some(projection) = package_compiler(&identities, bridge)? else { return Ok(false); };
-                    let (candidate, path): &(CandidatePathIdentity, crate::analyzer::resolution::PartialPath) = std::borrow::Borrow::borrow(&projection.value);
-                    let candidate = *candidate;
-                    if let Some(previous) = package_derivations.insert(candidate, bridge)
-                        && previous != bridge {
-                            return Err(StoreError::new(format!(
-                                "selected package context has conflicting derivations for {candidate:?}: previous={previous:?}, current={bridge:?}"
-                            )));
-                        }
-                    shared.extend(bridge.shared_identities());
-                    (candidate, &path).hash(&mut signature);
-                    let offered = match projection.published {
-                        Some(source) => writer.reuse(source, candidate)?,
-                        None => writer.insert(candidate, path)?,
-                    };
-                    if !offered { return Ok(false); }
-                }
-                let mut go_import_derivations = HashMap::default();
-                for bridge in &go_import_bindings {
-                    let Some((candidate, path)) = bridge.compile(&identities, &self.lexical_source(), cancellation, session)? else {
-                        return Ok(false);
-                    };
-                    if let Some(previous) = go_import_derivations.insert(candidate, bridge)
-                        && previous != bridge {
-                            return Err(StoreError::new(format!(
-                                "selected Go import context has conflicting derivations for {candidate:?}: previous={previous:?}, current={bridge:?}"
-                            )));
-                        }
-                    shared.extend(bridge.shared_identities());
-                    (candidate, &path).hash(&mut signature);
-                    if !writer.insert(candidate, &path)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            })?;
-        let Some(token) = token else {
-            return Ok(SelectedContextPathPublicationOutcome::Cancelled {
-                contextual_reverse_inventory_completion: completion,
-            });
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(work_before) = work_before {
-            let incomplete_evidence = match &completion {
-                ResolutionCompletion::Complete => 0,
-                ResolutionCompletion::Incomplete(reasons) => reasons.iter().count(),
-            };
-            eprintln!(
-                "context publication work: derivations={}, paths={}, shared={}, incomplete_evidence={}, completion={completion:?}, before={work_before:?}, after={:?}",
-                bridges.len(),
-                derivations.len(),
-                shared.len(),
-                incomplete_evidence,
-                selected_sql_trace::context_publication_work(session)
-                    .expect("scoped context observation remains enabled"),
-            );
-        }
-        Ok(SelectedContextPathPublicationOutcome::Ready(
-            SelectedContextPathPublication {
-                token,
-                context_digest: brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(
-                    &signature.0,
-                ),
-                contextual_reverse_inventory_completion: completion,
-                callable_static_import_boundaries: callable_boundaries.into_iter().collect(),
-                go_package_inventory_complete,
-                go_package_inventory_fragments,
-                declaration_access_source,
-                context_owned_gap_identities,
-                identities: identities.clone(),
-                shared_semantic_identities: shared.into_iter().collect(),
-                fragment_local_semantic_identities: local.into_iter().collect(),
-            },
-        ))
+        self.rust_forward_build_view()
+            .publish_context_paths_with_compilers(
+                context,
+                cancellation,
+                session,
+                root_compiler,
+                package_compiler,
+            )
     }
 
     #[doc(hidden)]
@@ -11841,7 +13424,8 @@ impl ReadySelectedResolution<'_, '_> {
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<SelectedFactOperationBlueprintConstruction> {
-        self.collect_blueprint_with_projection_memo(context, None, cancellation, session)
+        self.rust_forward_build_view()
+            .collect_blueprint_in_session(context, cancellation, session)
     }
 
     #[doc(hidden)]
@@ -11852,30 +13436,8 @@ impl ReadySelectedResolution<'_, '_> {
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<SelectedFactOperationBlueprintConstruction> {
-        use crate::analyzer::resolution::SelectedContextPathPublicationOutcome;
-        Ok(
-            match self.publish_context_paths_with_projection_memo(
-                context,
-                memo,
-                cancellation,
-                session,
-            )? {
-                SelectedContextPathPublicationOutcome::Ready(publication) => {
-                    SelectedFactOperationBlueprintConstruction::Ready(
-                        SelectedFactOperationBlueprint::from_publication(publication)
-                            .with_selected_demand_state(&self.operation_demand_state),
-                    )
-                }
-                SelectedContextPathPublicationOutcome::Cancelled {
-                    contextual_reverse_inventory_completion,
-                } => SelectedFactOperationBlueprintConstruction::Cancelled {
-                    cancellation_completion: ResolutionCompletion::incomplete([
-                        ResolutionIncompleteReason::Cancelled,
-                    ]),
-                    contextual_reverse_inventory_completion,
-                },
-            },
-        )
+        self.rust_forward_build_view()
+            .collect_blueprint_with_projection_memo(context, memo, cancellation, session)
     }
 
     /// Check every context anchor against the selection and against the blob
@@ -11895,92 +13457,8 @@ impl ReadySelectedResolution<'_, '_> {
         blueprint: &SelectedFactOperationBlueprint,
         cancellation: &CancellationToken,
     ) -> Result<Option<()>> {
-        let anchors = blueprint.fragment_local_semantic_identities();
-        let Some(runtimes) = persisted.local_semantics_for_identities(anchors, cancellation)?
-        else {
-            return Ok(None);
-        };
-        for (&(fragment, identity), runtime) in anchors.iter().zip(runtimes) {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let Some(runtime) = runtime else {
-                return Err(StoreError::new(format!(
-                    "selected context anchor identity is not in its blob's catalog: \
-                     fragment={fragment}, identity={identity:?}"
-                )));
-            };
-            let registered = self
-                .inventory
-                .mount_rebaser()
-                .borrow()
-                .registered_semantic_provenance(runtime);
-            match registered {
-                Some(SelectedSemanticProvenance::FragmentLocal(provenance)) => {
-                    if provenance.mount().fragment() != fragment
-                        || provenance.identity() != identity
-                    {
-                        return Err(StoreError::new(format!(
-                            "selected context anchor {runtime} has conflicting provenance"
-                        )));
-                    }
-                    continue;
-                }
-                Some(SelectedSemanticProvenance::Stage(provenance)) => {
-                    if provenance.mount().fragment() != fragment
-                        || provenance.identity() != identity
-                    {
-                        return Err(StoreError::new(format!(
-                            "selected context anchor {runtime} has conflicting stage provenance"
-                        )));
-                    }
-                    continue;
-                }
-                Some(SelectedSemanticProvenance::Shared(_)) => {
-                    return Err(StoreError::new(format!(
-                        "selected context anchor {runtime} was registered as Shared"
-                    )));
-                }
-                None => {}
-            }
-            if self
-                .inventory
-                .mount_rebaser()
-                .borrow()
-                .mount_for_fragment(fragment)
-                .is_none()
-            {
-                return Err(StoreError::new(format!(
-                    "selected context anchor {runtime} names an unknown selected mount"
-                )));
-            }
-            let Some(provenance) = persisted.semantic_provenance(runtime, cancellation)? else {
-                return Ok(None);
-            };
-            // A persisted anchor decodes to its blob's catalog. An anchor a
-            // staged mount minted (an `include!`-spliced file's lookups are
-            // lowered in its host's stage) decodes to that mount's stage
-            // catalog, as the registered arm above accepts.
-            let (mount, decoded) = match provenance {
-                SelectedSemanticProvenance::FragmentLocal(provenance) => {
-                    (provenance.mount(), provenance.identity())
-                }
-                SelectedSemanticProvenance::Stage(provenance) => {
-                    (provenance.mount(), provenance.identity())
-                }
-                SelectedSemanticProvenance::Shared(_) => {
-                    return Err(StoreError::new(format!(
-                        "selected context anchor {identity:?} for fragment {fragment} decodes to a shared identity"
-                    )));
-                }
-            };
-            if mount.fragment() != fragment || decoded != identity {
-                return Err(StoreError::new(format!(
-                    "selected context anchor {identity:?} for fragment {fragment} decodes to {decoded:?} in {mount:?}"
-                )));
-            }
-        }
-        Ok(Some(()))
+        self.rust_forward_build_view()
+            .validate_context_local_semantic_anchors(persisted, blueprint, cancellation)
     }
 
     #[doc(hidden)]
@@ -12012,15 +13490,20 @@ impl ReadySelectedResolution<'_, '_> {
             }
             staged.register_shared_semantic(identity);
         }
-        for &reason in blueprint.context_owned_gap_identities() {
+        // Context-local numbers follow encounter order. Register gaps in their
+        // canonical content order so a restored context cannot change the
+        // shared-name interner's order or the resulting publication.
+        let mut gaps = blueprint
+            .context_owned_gap_identities()
+            .iter()
+            .map(|&reason| Ok((blueprint.context_owned_semantic_digest(reason)?, reason)))
+            .collect::<Result<Vec<_>>>()?;
+        gaps.sort_unstable_by_key(|(digest, _)| *digest);
+        for (digest, reason) in gaps {
             if cancellation.is_cancelled() {
                 return Ok(ContextRegistrationOutcome::Cancelled);
             }
-            staged.register_context_owned_semantic(
-                reason,
-                blueprint.context_owned_semantic_digest(reason)?,
-                &self.inventory.shared_names(),
-            );
+            staged.register_context_owned_semantic(reason, digest, &self.inventory.shared_names());
         }
         for &node in blueprint.boundary_nodes() {
             if cancellation.is_cancelled() {
@@ -12062,7 +13545,6 @@ impl ReadySelectedResolution<'_, '_> {
         Ok(ContextRegistrationOutcome::Ready)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     fn reverse_register_in_session<L>(
         &self,
         blueprint: &SelectedFactOperationBlueprint,
@@ -12086,16 +13568,8 @@ impl ReadySelectedResolution<'_, '_> {
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<ContextRegistrationOutcome> {
-        self.register_context_cells_in_session(
-            blueprint,
-            SelectedContextRegistrationCells {
-                shared: blueprint.shared_semantic_identities(),
-                boundaries: blueprint.boundary_nodes(),
-                gaps: blueprint.context_owned_gap_identities(),
-            },
-            cancellation,
-            session,
-        )
+        self.rust_forward_build_view()
+            .register_context_in_session(blueprint, cancellation, session)
     }
 
     fn register_context_cells_in_session(
@@ -12105,56 +13579,8 @@ impl ReadySelectedResolution<'_, '_> {
         cancellation: &CancellationToken,
         session: &ResolutionSession,
     ) -> Result<ContextRegistrationOutcome> {
-        if cancellation.is_cancelled() {
-            return Ok(ContextRegistrationOutcome::Cancelled);
-        }
-        // The selected inventory has already registered every identity read
-        // while collecting the context. Cloning that complete, mount-sized
-        // rebaser just to add the small contextual overlay made point
-        // resolution budget depend on unrelated selected mounts. Contextual
-        // anchors already present in that inventory are free; only persisted
-        // anchor keys that still need hydration consume bounded work.
-        let persisted = self.lexical_source();
-        if self
-            .validate_context_local_semantic_anchors(&persisted, blueprint, cancellation)?
-            .is_none()
-        {
-            return Ok(ContextRegistrationOutcome::Cancelled);
-        }
-        // Only the registrations this phase still performs are charged: the
-        // persisted anchors need no key translation and no registration now
-        // that their runtime IDs name their own mounts.
-        let registration_work = cells
-            .shared
-            .len()
-            .checked_add(cells.boundaries.len())
-            .and_then(|count| count.checked_add(cells.gaps.len()))
-            .expect("selected context registration work must fit usize");
-        if !(0..registration_work).all(|_| session.scope_step()) {
-            return Ok(ContextRegistrationOutcome::Cancelled);
-        }
-        if cancellation.is_cancelled() || !session.observe_cancellation() {
-            return Ok(ContextRegistrationOutcome::Cancelled);
-        }
-        if cancellation.is_cancelled() || !session.observe_cancellation() {
-            return Ok(ContextRegistrationOutcome::Cancelled);
-        }
-        let mut rebaser = self.inventory.mount_rebaser().borrow_mut();
-        for &identity in cells.shared {
-            rebaser.register_shared_semantic(identity);
-        }
-        let names = self.inventory.shared_names();
-        for &reason in cells.gaps {
-            rebaser.register_context_owned_semantic(
-                reason,
-                blueprint.context_owned_semantic_digest(reason)?,
-                &names,
-            );
-        }
-        for &node in cells.boundaries {
-            rebaser.register_context_boundary(node);
-        }
-        Ok(ContextRegistrationOutcome::Ready)
+        self.rust_forward_build_view()
+            .register_context_cells_in_session(blueprint, cells, cancellation, session)
     }
 
     #[doc(hidden)]
@@ -12318,15 +13744,10 @@ impl ReadySelectedResolution<'_, '_> {
                 publication,
                 publication_data_version,
                 || {
-                    if self.store.uses_single_connection_reads() {
-                        super::go_package_context::go_context_status_on(
-                            self.inventory.connection(),
-                            publication,
-                            cancellation,
-                        )
-                    } else {
-                        self.store.go_context_head_status(publication, cancellation)
-                    }
+                    self.store
+                        .lend_selected_reader(self.inventory.connection(), || {
+                            self.store.go_context_head_status(publication, cancellation)
+                        })
                 },
             )?;
             match status {
@@ -12371,8 +13792,9 @@ impl ReadySelectedResolution<'_, '_> {
             for publication in self.go_publications.borrow().values() {
                 match self
                     .store
-                    .go_context_head_status(publication, cancellation)?
-                {
+                    .lend_selected_reader(self.inventory.connection(), || {
+                        self.store.go_context_head_status(publication, cancellation)
+                    })? {
                     super::GoContextHeadStatus::Current => {}
                     super::GoContextHeadStatus::Withdrawn => {
                         return Ok(SelectedResolutionOperationOutcome::Stale(
@@ -12709,6 +14131,7 @@ impl ReadySelectedResolution<'_, '_> {
             &paths,
             lexical,
             typed,
+            &crate::analyzer::resolution::fact_resolution::NOOP_LEXICAL_ANSWER_FINALIZER,
             provider,
             cancellation,
             session,
@@ -12973,10 +14396,16 @@ mod cache_budget_tests {
     #[test]
     fn store_cache_consumers_evict_each_other_within_one_byte_budget() {
         let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig {
-            store_cache_budget_bytes: Some(256 * 1024),
+            retention_budget_bytes: Some(4 * (256 * 1024)),
             ..Default::default()
         };
-        let store = AnalyzerStore::open_in_memory_single_connection_with_config(&config).unwrap();
+        let store = AnalyzerStore::open_in_memory_single_connection_with_config(
+            &config,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(
+                config.retention_budget_bytes(),
+            ),
+        )
+        .unwrap();
         let cache = &store.cache_budget;
         let scopes =
             vec![
@@ -12988,17 +14417,17 @@ mod cache_budget_tests {
                 200 * 1024
                     / std::mem::size_of::<(BindingFragmentId, ResolutionScopeId, BindingNodeId)>()
             ];
-        let overlay = Arc::new(PreparedMacroIncludeOverlay {
+        let overlay = PreparedMacroIncludeOverlay {
             components: vec![PreparedMacroIncludeComponent {
                 scopes,
                 origins: Vec::new(),
             }],
             path_count: 0,
             binding_pair_count: 0,
-        });
+        };
         assert!(overlay.retained_bytes() < 256 * 1024);
         let key = [255; 32];
-        cache.insert_rust_macro_include_overlay(key, Arc::clone(&overlay));
+        cache.insert_rust_macro_include_overlay(key, overlay);
         assert!(cache.weighted_bytes() > 200 * 1024);
         assert!(
             cache.rust_macro_include_overlay(&key).is_some(),
@@ -13020,15 +14449,15 @@ mod cache_budget_tests {
                     cache.weighted_bytes() - overlay_weight
                 );
             }
-            // Give the arriving consumer real demand, so TinyLFU can compare
-            // its entries against the colder overlay.
+            // Give the arriving consumer real demand, so the overlay is the
+            // least recently used entry when the budget evicts.
             for _ in 0..3 {
                 if cache.shared_name(digest).is_none() {
                     break;
                 }
             }
         }
-        assert!(cache.weighted_bytes() <= config.store_cache_budget_bytes());
+        assert!(cache.weighted_bytes() <= config.retention_budget_bytes());
         let retained_names = digests
             .iter()
             .filter(|&&digest| cache.shared_name(digest).is_some())

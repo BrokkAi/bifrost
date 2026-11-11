@@ -47,7 +47,7 @@ fn csharp_demand_searches_only_reached_namespace_levels() {
     let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
     let workspace_id = context.workspace_id.clone();
     let store = std::sync::Arc::clone(&context.store);
-    let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
         fixture.project_dyn(),
         AnalyzerConfig::default(),
         context,
@@ -56,9 +56,20 @@ fn csharp_demand_searches_only_reached_namespace_levels() {
     let snapshots = store
         .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".to_owned()])
         .unwrap();
-    let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
     let cancellation = CancellationToken::new();
     let project = fixture.project_dyn();
+    let services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+            >(workspace.analyzer())
+            .expect("C# analyzer"),
+        );
     for (name, marker, expected) in [
         ("Peer", "Peer p", ("App/Multi.cs", "A.B.Peer")),
         ("X", "X x", ("App/Inner.cs", "A.B.X")),
@@ -84,7 +95,8 @@ fn csharp_demand_searches_only_reached_namespace_levels() {
                     &snapshots,
                     &languages,
                     &[],
-                ),
+                )
+                .with_analyzer(&services),
                 &cancellation,
             )
             .unwrap()
@@ -212,7 +224,7 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
             single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
         let workspace_id = context.workspace_id.clone();
         let store = std::sync::Arc::clone(&context.store);
-        let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
             fixture.project_dyn(),
             AnalyzerConfig::default(),
             context,
@@ -221,9 +233,20 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
         let snapshots = store
             .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".to_owned()])
             .unwrap();
-        let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+        let languages = [SelectedResolutionLanguage::with_epoch(
+            "csharp",
+            Language::CSharp,
+            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+        )];
         let cancellation = CancellationToken::new();
         let project = fixture.project_dyn();
+        let services =
+            brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+                brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                    brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+                >(workspace.analyzer())
+                .expect("C# analyzer"),
+            );
         let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
             .open_selected_resolution_operation(
                 SelectedResolutionOperationInput::new(
@@ -232,7 +255,8 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
                     &snapshots,
                     &languages,
                     &[],
-                ),
+                )
+                .with_analyzer(&services),
                 &cancellation,
             )
             .unwrap()
@@ -352,4 +376,385 @@ fn csharp_demand_unmodeled_using_stops_outer_namespace_lookup() {
             result.targets, result.visited
         );
     }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7314: C# certification deadlocked on a single-connection store inside a selected operation"
+)]
+fn csharp_configuration_overlay_refuses_single_connection_demand() {
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine_tests::csharp_demand::csharp_configuration_overlay_refuses_single_connection_demand",
+                "--nocapture",
+            ])
+            .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    use brokk_bifrost_core::analyzer::project::OverlayProject;
+    let source = "class Caller { Peer value; } class Peer {}";
+    let fixture = InlineTestProject::with_language(Language::CSharp)
+        .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        .file("App/Caller.cs", source)
+        .build();
+    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let workspace_id = context.workspace_id.clone();
+    let store = std::sync::Arc::clone(&context.store);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        fixture.project_dyn(),
+        AnalyzerConfig::default(),
+        context,
+    )
+    .unwrap();
+    let snapshots = store
+        .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".into()])
+        .unwrap();
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
+    let services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+            >(workspace.analyzer())
+            .unwrap(),
+        );
+    let cancellation = CancellationToken::new();
+    let project = fixture.project_dyn();
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                project.as_ref(),
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&services),
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("selected C# operation");
+    };
+    assert!(brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_demand::probe_configuration_admission(&operation).unwrap());
+    drop(operation);
+    let source_overlay = OverlayProject::new(std::sync::Arc::clone(&project));
+    assert!(source_overlay.set(
+        fixture.file("App/Caller.cs").abs_path(),
+        "class Caller { Peer other; } class Peer {}".into(),
+    ));
+    let source_analyzer =
+        workspace.clone_with_project(std::sync::Arc::new(source_overlay.snapshot()));
+    let source_services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+            >(source_analyzer.analyzer())
+            .unwrap(),
+        );
+    // The selected inventory retains the disk project; the request analyzer has
+    // unrelated source overlay content. Certification uses the retained reader.
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                project.as_ref(),
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&source_services),
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("source overlay selected operation");
+    };
+    assert!(brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_demand::probe_configuration_admission(&operation).unwrap());
+    drop(operation);
+
+    let config_overlay = OverlayProject::new(std::sync::Arc::clone(&project));
+    assert!(config_overlay.set(
+        fixture.file("App/App.csproj").abs_path(),
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup /></Project>".into(),
+    ));
+    let config_analyzer =
+        workspace.clone_with_project(std::sync::Arc::new(config_overlay.snapshot()));
+    let config_services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+            >(config_analyzer.analyzer())
+            .unwrap(),
+        );
+    // A request analyzer can see a changed editor configuration after the
+    // disk selection opens. Admission must refuse on its held connection.
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                project.as_ref(),
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&config_services),
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("configuration request selected operation");
+    };
+    assert!(!brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_demand::probe_configuration_admission(&operation).unwrap());
+    drop(operation);
+
+    let outcome = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                &config_overlay,
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&services),
+            &cancellation,
+        )
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        SelectedResolutionOperationOpenOutcome::Unavailable(
+            brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionUnavailable::MissingTransientOverlayInput {
+                storage_language,
+                persisted_relative_path,
+            }
+        ) if storage_language == "csharp" && persisted_relative_path == "App/App.csproj"
+    ));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#7314: a live configuration overlay could change between two admissions of one C# operation"
+)]
+fn csharp_live_configuration_overlay_refuses_the_next_admission() {
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine_tests::csharp_demand::csharp_live_configuration_overlay_refuses_the_next_admission",
+                "--nocapture",
+            ])
+            .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        return;
+    }
+    use brokk_bifrost_analysis::analyzer::read_ledger::{
+        FactSubject, ReadKey, WorkspaceFactFamily,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic::read_ledger::LookupQuestion;
+    use brokk_bifrost_core::analyzer::project::OverlayProject;
+    let fixture = InlineTestProject::with_language(Language::CSharp)
+        .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+        .file(
+            "App/Caller.cs",
+            "class Caller { Peer value; } class Peer {}",
+        )
+        .build();
+    let context = single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
+    let workspace_id = context.workspace_id.clone();
+    let store = std::sync::Arc::clone(&context.store);
+    let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        fixture.project_dyn(),
+        AnalyzerConfig::default(),
+        context,
+    )
+    .unwrap();
+    // The request analyzer reads this live overlay itself, not a snapshot of
+    // it, so a later edit reaches the operation that is already open.
+    let disk = fixture.project_dyn();
+    let live = std::sync::Arc::new(OverlayProject::new(std::sync::Arc::clone(&disk)));
+    let request = workspace.clone_with_project(live.clone());
+    let csharp = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+        brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+    >(request.analyzer())
+    .unwrap();
+    let services =
+        brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+            csharp,
+        );
+    let snapshots = store
+        .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".into()])
+        .unwrap();
+    let languages = [SelectedResolutionLanguage::with_epoch(
+        "csharp",
+        Language::CSharp,
+        brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+    )];
+    let cancellation = CancellationToken::new();
+    // Begin the query before retaining the selected operation's only reader.
+    brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || ());
+    let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+        .open_selected_resolution_operation(
+            SelectedResolutionOperationInput::new(
+                disk.as_ref(),
+                &workspace_id,
+                &snapshots,
+                &languages,
+                &[],
+            )
+            .with_analyzer(&services),
+            &cancellation,
+        )
+        .unwrap()
+    else {
+        panic!("selected C# operation");
+    };
+    let admit = || {
+        brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_demand::probe_configuration_admission(&operation).unwrap()
+        })
+    };
+    let (admitted, reads) = admit();
+    assert!(admitted, "an unchanged configuration certifies");
+    assert!(!reads.reuse_refused());
+    let keys = reads.keys();
+    assert!(
+        keys.iter().any(|key| matches!(
+            key,
+            ReadKey::Lookup {
+                question: LookupQuestion::WorkspaceFact {
+                    family: WorkspaceFactFamily::CSharpCompilationConfiguration,
+                    language: Language::CSharp,
+                    subject: FactSubject::Whole,
+                },
+                ..
+            }
+        )),
+        "admission must record the configuration fact: {keys:?}"
+    );
+    assert!(live.set(
+        fixture.file("App/App.csproj").abs_path(),
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup /></Project>".into(),
+    ));
+    // Same operation, same captured handle: the next admission re-certifies
+    // against the live overlay and refuses before any retained caller hit.
+    let (admitted, reads) = admit();
+    assert!(
+        !admitted,
+        "a changed live configuration overlay must refuse"
+    );
+    assert!(
+        reads.reuse_refused(),
+        "a refused admission must refuse reuse"
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#9962: nested C# store reads inside a selected operation deadlocked a single-connection store"
+)]
+fn csharp_nested_selected_reads_agree_across_connection_modes() {
+    if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine_tests::csharp_demand::csharp_nested_selected_reads_agree_across_connection_modes",
+                "--nocapture",
+            ])
+            .env("BIFROST_TRIAL_NATIVE_CSHARP", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    use brokk_bifrost_core::analyzer::project::OverlayProject;
+    let mut answers = Vec::new();
+    for single_connection in [true, false] {
+        let source = "class Caller { Peer value; } class Peer {}";
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("App/App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\" />")
+            .file("App/Caller.cs", source)
+            .build();
+        let disk = fixture.project_dyn();
+        let context = if single_connection {
+            single_connection_store_context_for_test(disk.as_ref()).unwrap()
+        } else {
+            brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::ephemeral_store_context(
+                disk.as_ref(),
+            )
+            .unwrap()
+        };
+        let workspace_id = context.workspace_id.clone();
+        let store = std::sync::Arc::clone(&context.store);
+        let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+            std::sync::Arc::clone(&disk),
+            AnalyzerConfig::default(),
+            context,
+        )
+        .unwrap();
+        let overlay = OverlayProject::new(std::sync::Arc::clone(&disk));
+        assert!(overlay.set(fixture.file("App/Caller.cs").abs_path(), source.into(),));
+        let request = workspace.clone_with_project(std::sync::Arc::new(overlay.snapshot()));
+        let csharp = brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+            brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+        >(request.analyzer())
+        .unwrap();
+        let services =
+            brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+                csharp,
+            );
+        let snapshots = store
+            .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".into()])
+            .unwrap();
+        let languages = [SelectedResolutionLanguage::with_epoch(
+            "csharp",
+            Language::CSharp,
+            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+        )];
+        let cancellation = CancellationToken::new();
+        // Begin the query before retaining the selected operation's only reader.
+        brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || ());
+        let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
+            .open_selected_resolution_operation(
+                SelectedResolutionOperationInput::new(
+                    disk.as_ref(),
+                    &workspace_id,
+                    &snapshots,
+                    &languages,
+                    &[],
+                )
+                .with_analyzer(&services),
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("selected C# operation");
+        };
+        let locator =
+            SelectedSemanticLocator::for_reference_range("csharp", "App/Caller.cs", 15, 19);
+        // Both nested reads use immutable (workspace, generation, revision) rows;
+        // their answers do not depend on the connection's snapshot.
+        let (result, reads) = brokk_bifrost_analysis::analyzer::capture_query_reads(csharp, || {
+            probe_type(&operation, &snapshots["csharp"], &locator, &cancellation)
+        });
+        assert!(
+            !reads.keys().is_empty(),
+            "selected demand must record reads"
+        );
+        let result = result.unwrap().unwrap();
+        answers.push((result.targets, result.visited));
+    }
+    assert_eq!(answers[0], answers[1]);
 }

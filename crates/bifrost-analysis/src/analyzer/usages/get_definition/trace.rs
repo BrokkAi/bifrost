@@ -232,11 +232,18 @@ pub fn debug_assert_selection_agrees(rows: &[TraceCandidate], outcome: &Definiti
                         .any(|diagnostic| diagnostic.kind == "intrinsic_type_reference"),
                 "intrinsic selection must preserve its source-free identity: {outcome:?}",
             ),
-            TraceCandidateRef::Modeled { symbol_id, .. } => debug_assert!(
+            TraceCandidateRef::Modeled {
+                provider,
+                symbol_id,
+                ..
+            } => debug_assert!(
                 outcome
                     .modeled_definitions
                     .iter()
-                    .any(|symbol| symbol.id == *symbol_id),
+                    .any(|symbol| symbol.id == *symbol_id
+                        && crate::analyzer::semantic_model::ModelProvider::from(
+                            &symbol.provenance
+                        ) == *provider),
                 "trace selected modeled {symbol_id:?} which the outcome does not report: {:?}",
                 outcome.modeled_definitions
             ),
@@ -774,6 +781,9 @@ pub fn record_selected_modeled(outcome: &DefinitionLookupOutcome) {
         .map(|symbol| {
             TraceCandidate::selected(
                 TraceCandidateRef::Modeled {
+                    provider: crate::analyzer::semantic_model::ModelProvider::from(
+                        &symbol.provenance,
+                    ),
                     symbol_id: symbol.id.clone(),
                     name: symbol.qualified_name.clone(),
                 },
@@ -910,7 +920,7 @@ pub fn resolve_definition_batch_with_trace(
 
     resolutions
         .into_iter()
-        .map(|resolution| resolution.outcome)
+        .map(|(resolution, _)| resolution.outcome)
         .zip(
             per_request
                 .into_iter()
@@ -1177,7 +1187,15 @@ fn boundary_evidence_for(
                 language,
                 "definition_boundary_evidence",
             )
-            .and_then(|support| support.definition_boundary_evidence(analyzer, token, file, name));
+            .and_then(|support| match usage {
+                BoundaryEvidenceUse::Reference => {
+                    support.definition_boundary_evidence(analyzer, token, file, name)
+                }
+                // A call target is the canonical name an earlier lookup
+                // resolved, not a spelling written at a reference site.
+                BoundaryEvidenceUse::CallTarget => support
+                    .definition_boundary_evidence_for_resolved_callee(analyzer, token, file, name),
+            });
             match evidence {
                 Some((BoundaryStatus::ExternalUnknown, target)) => {
                     let discovery = analyzer.dependency_discovery_evidence(language);
@@ -1206,7 +1224,7 @@ fn boundary_evidence_for(
         language @ (Language::Python | Language::JavaScript | Language::TypeScript) => {
             let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
                 overlay
-                    .symbols_named(name)
+                    .symbols_named_for(name, language.config_label())
                     .records
                     .first()
                     .map(|symbol| symbol.id.clone())
@@ -1243,7 +1261,7 @@ fn boundary_evidence_for(
             // not a type a reference can name.
             let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
                 overlay
-                    .symbols_named(name)
+                    .symbols_named_for(name, "php")
                     .records
                     .iter()
                     .find(|symbol| {

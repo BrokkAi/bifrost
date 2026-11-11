@@ -10,6 +10,10 @@ use brokk_bifrost_core::analyzer::weighted_cache::weight_bytes;
 
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 
+use crate::analyzer::jvm::hierarchy::JvmHierarchyFact;
+use brokk_bifrost_analysis::analyzer::common::{
+    ReplayableQueryCache, build_replayable_query_cache,
+};
 use brokk_bifrost_analysis::analyzer::estimate_collection_bytes;
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -40,6 +44,10 @@ pub(crate) struct JavaMemoCaches {
     /// variant (#1748). Cold builds do not wait behind another query's deadline.
     pub(crate) direct_descendant_index:
         brokk_bifrost_analysis::analyzer::common::ReplayableDescendantMemo,
+    /// The snapshot's one hydrated external-root hierarchy index (#10428),
+    /// byte-weighted with its read receipt.
+    pub(crate) external_root_hierarchy_index:
+        ReplayableQueryCache<(), ExternalRootHierarchyIndexOutcome>,
     pub(crate) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(crate) same_package_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -63,6 +71,9 @@ impl JavaMemoCaches {
             direct_ancestors: crate::analyzer::jvm::hierarchy::ancestor_memo(budget_bytes / 8),
             direct_descendant_index:
                 brokk_bifrost_analysis::analyzer::common::new_replayable_descendant_memo(),
+            external_root_hierarchy_index: build_replayable_query_cache(
+                weight_external_root_hierarchy_index,
+            ),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
         }
@@ -71,6 +82,44 @@ impl JavaMemoCaches {
     pub(crate) fn budget_bytes(&self) -> u64 {
         self.budget_bytes
     }
+}
+
+pub(crate) type ExternalRootHierarchyIndexOutcome = Result<
+    Arc<brokk_bifrost_jvm::java::hierarchy::JavaExternalRootHierarchyIndex<JvmHierarchyFact>>,
+    brokk_bifrost_jvm::java::hierarchy::JavaExternalRootHierarchyStatus,
+>;
+
+/// Imports and supertypes are shared per file; counting them per declaration
+/// over-weighs files that declare several classes, which errs toward eviction.
+fn weight_external_root_hierarchy_index(outcome: &ExternalRootHierarchyIndexOutcome) -> usize {
+    let Ok(index) = outcome else {
+        return 0;
+    };
+    index
+        .candidates()
+        .iter()
+        .map(|fact| {
+            let facts = &fact.0;
+            let imports = facts
+                .imports
+                .iter()
+                .map(|import| size_of::<ImportInfo>() + import.raw_snippet.len())
+                .sum::<usize>();
+            let supertypes = facts
+                .raw_supertypes
+                .iter()
+                .map(|name| size_of::<String>() + name.len())
+                .sum::<usize>();
+            // One `types_by_fq_name` entry per declaration at most.
+            let fq_entry =
+                size_of::<String>() + 2 * size_of::<usize>() + facts.declaration.fq_name().len();
+            size_of::<JvmHierarchyFact>()
+                + usize::try_from(estimate_code_unit(&facts.declaration)).unwrap_or(usize::MAX)
+                + imports
+                + supertypes
+                + fq_entry
+        })
+        .sum()
 }
 
 pub(super) fn weight_import_map(key: &ProjectFile, value: &Arc<HashMap<String, CodeUnit>>) -> u32 {

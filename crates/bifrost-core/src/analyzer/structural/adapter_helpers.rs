@@ -519,11 +519,24 @@ pub fn declaration_modifier_words(node: Node<'_>, source: &str) -> Vec<String> {
     for child in children_iter(container.unwrap_or(node)) {
         let word = match child.kind() {
             "modifier" | "accessibility_modifier" => source.get(child.byte_range()),
+            "parameter_modifier" => {
+                for token in children_iter(child) {
+                    if matches!(
+                        token.kind(),
+                        "ref" | "out" | "in" | "params" | "this" | "scoped" | "readonly"
+                    ) {
+                        words.push(token.kind().to_owned());
+                    }
+                }
+                None
+            }
             "static get" => Some("static"),
-            "static" | "abstract" | "final" | "volatile" | "synchronized" | "transient"
-            | "native" | "strictfp" | "default" | "sealed" | "non-sealed" | "public"
-            | "protected" | "private" | "readonly" | "override" | "virtual" | "async"
-            | "partial" | "unsafe" | "extern" | "new" | "required" => Some(child.kind()),
+            "override_modifier" => Some("override"),
+            "global" | "static" | "abstract" | "final" | "volatile" | "synchronized"
+            | "transient" | "native" | "strictfp" | "default" | "sealed" | "non-sealed"
+            | "public" | "protected" | "private" | "readonly" | "override" | "virtual"
+            | "async" | "partial" | "unsafe" | "extern" | "new" | "required" | "const" | "ref"
+            | "out" | "in" | "params" | "this" | "scoped" => Some(child.kind()),
             _ => None,
         };
         if let Some(word) = word {

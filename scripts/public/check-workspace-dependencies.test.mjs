@@ -142,6 +142,7 @@ function metadata(overrides = {}) {
     ],
     "brokk-bifrost-policy": [
       dependency("brokk-bifrost-cpp-analysis", "dev"),
+      dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-rql"),
@@ -153,6 +154,7 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-mcp": [
+      dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-policy"),
@@ -389,6 +391,7 @@ test("accepts RQL grammar hooks below analysis but rejects policy", () => {
             dependency("brokk-bifrost-analysis"),
             dependency("brokk-bifrost-flow"),
             dependency("brokk-bifrost-cpp"),
+            dependency("brokk-bifrost-csharp"),
             dependency("brokk-bifrost-python"),
             dependency("brokk-bifrost-jvm"),
             dependency("brokk-bifrost-js-ts"),

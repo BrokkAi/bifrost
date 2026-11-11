@@ -272,7 +272,8 @@ fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
                     && candidate["outcome"] == "selected"
                     && candidate["external_target"] == "java.util.Collections.sort"
             }),
-        "the bound MCP workspace must expose the exact selected boundary: {compatible_candidates:#}"
+        "the bound MCP workspace must expose the exact selected boundary; readiness was \
+         {compatible_readiness:#}: {compatible_candidates:#}"
     );
 
     let no_pack = pack_activation_project(r#"["jvm"]"#, false);
@@ -1391,6 +1392,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
         &[PathBuf::from("policies/dynamic-eval.rqlp")],
         &PolicyEvaluationOptions::new(evaluation_date.parse().expect("fixed evaluation date"))
             .with_fail_on(PolicyFailOn::Warning),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("direct policy evaluation");
     assert_eq!(expected.exit_status(), 1);
@@ -1479,7 +1481,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
     assert_eq!(structured["report"], expected_report, "{baseline}");
-    assert_eq!(structured["report"]["schema_version"], 6);
+    assert_eq!(structured["report"]["schema_version"], 7);
     assert_eq!(
         structured["report"]["execution"]["stage_timings"],
         json!([])
@@ -1522,15 +1524,23 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     let attributed = &attributed["result"]["structuredContent"];
     // Requested timings ride beside the report as `stage_timings`, plus
     // per-policy splits inside each run's work: `evaluation.elapsed_ms`
-    // (#2893) and, for a policy that ran unit by unit, its four disjoint
-    // `units.*_ms` phases. With those metrics removed the report is the
-    // unattributed run's.
+    // (#2893), the four disjoint `units.*_ms` phases for a policy that ran
+    // unit by unit, and one `cpu.<phase>.available` count per #9947 phase
+    // (0 when the phase was not sampled). With those metrics removed the
+    // report is the unattributed run's.
     const POLICY_TIMING_METRICS: [&str; 5] = [
         "evaluation.elapsed_ms",
         "units.lookup_replay_ms",
         "units.prefetch_ms",
         "units.recompute_ms",
         "units.verify_ms",
+    ];
+    const POLICY_CPU_AVAILABILITY_METRICS: [&str; 5] = [
+        "cpu.compilation.available",
+        "cpu.compilation_exclusive.available",
+        "cpu.output_recompute.available",
+        "cpu.refusal_fallback.available",
+        "cpu.selector_binding.available",
     ];
     let mut report_without_timings = attributed["report"].clone();
     let mut removed_timings = Vec::new();
@@ -1546,6 +1556,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
                 .extract_if(.., |metric| {
                     POLICY_TIMING_METRICS
                         .iter()
+                        .chain(POLICY_CPU_AVAILABILITY_METRICS.iter())
                         .any(|name| metric["name"] == *name)
                 })
                 .map(|metric| (metric["name"].clone(), metric["unit"].clone())),
@@ -1567,9 +1578,14 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     }
     assert_eq!(
         removed_timings,
-        POLICY_TIMING_METRICS
+        POLICY_CPU_AVAILABILITY_METRICS
             .iter()
-            .map(|name| (json!(name), json!("milliseconds")))
+            .map(|name| (json!(name), json!("count")))
+            .chain(
+                POLICY_TIMING_METRICS
+                    .iter()
+                    .map(|name| (json!(name), json!("milliseconds"))),
+            )
             .collect::<Vec<_>>(),
         "{attributed}"
     );
@@ -4422,7 +4438,11 @@ fn legacy_clients_never_see_a_result_type() {
 
 /// The tools whose `structuredContent` shapes are published as contracts.
 /// published tool answers with a shape that is not yet a declared contract.
-const OUTPUT_SCHEMA_TOOLS: [&str; 10] = [
+const OUTPUT_SCHEMA_TOOLS: [&str; 14] = [
+    "analyze_diff",
+    "get_symbol_locations",
+    "get_symbol_ancestors",
+    "score_diff",
     "list_function_sources",
     "blast_radius",
     "cyclomatic_complexity",
@@ -5783,7 +5803,7 @@ fn assert_compact_malformed_run_policy_reply(response: &Value, task_capable: boo
             .expect("early run_policy correlation"),
     );
     let report = &structured["report"];
-    assert_eq!(report["schema_version"], 6, "{response}");
+    assert_eq!(report["schema_version"], 7, "{response}");
     assert_eq!(report["rules"], json!([]), "{response}");
     assert_eq!(report["runs"], json!([]), "{response}");
     assert_eq!(report["diagnostics"].as_array().map(Vec::len), Some(1));
@@ -5905,6 +5925,7 @@ fn mcp_tasks_run_policy_completes_through_a_task_handle() {
         &[PathBuf::from("policies/dynamic-eval.rqlp")],
         &PolicyEvaluationOptions::new("2026-07-27".parse().expect("fixed evaluation date"))
             .with_fail_on(PolicyFailOn::Warning),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("direct policy evaluation");
     let expected_report = serde_json::to_value(expected.report()).expect("serialize report");
@@ -6680,11 +6701,46 @@ fn light_lookup_overtakes_long_usage_scan() {
         );
     }
     let workspace = project.build();
-    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    // This test asserts request ordering, not cold-start latency. Spawn at the
+    // production budget ladder instead of this file's 60-second benchmark
+    // budget: `get_active_workspace` below is a serial tool with no fallback
+    // timer, so it waits out the 301-file cold build however long a loaded
+    // merge host takes. The measured calls keep their production interactive
+    // budgets. Under concurrent suites the benchmark budget expired during
+    // the warm-up (#10711).
+    let mut child = common::mcp_server::spawn_mcp_server_at_production_budget(
+        common::mcp_server::mcp_server_binary(),
+        workspace.root(),
+        "searchtools",
+    )
+    .expect("spawn bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
     let mut stderr = DrainedStderr::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // Wait for the cold build through a tool outside the fallback budget
+    // ladder. `get_active_workspace` is serial, so the host gives it no
+    // deadline and its handler joins the deferred workspace build. The warm
+    // lookup itself is a bounded read: on a loaded host its cold fallback (or
+    // the benchmark budget this file normally passes) expires before the
+    // build finishes and answers with the retryable not-ready error instead
+    // of a result.
+    let ready = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 59,
+            "method": "tools/call",
+            "params": {
+                "name": "get_active_workspace",
+                "arguments": {}
+            }
+        }),
+    );
+    assert_eq!(ready["result"]["isError"], false, "{ready}");
 
     // Warm the lookup once so the measured run is dispatch plus a cache hit,
     // not cold workspace readiness or first-touch hydration.

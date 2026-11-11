@@ -4,12 +4,12 @@
 //! production and external-boundary evidence. It emits neutral records so this
 //! crate stays below `brokk-bifrost-analysis` in the dependency graph.
 
-use crate::adapter::parse_cpp_file;
+use crate::adapter::parse_cpp_file_with_callable_observer;
 use crate::declarations::{
-    CppComparableNode, CppComparableSlot, CppParameterType, cpp_active_template_type_parameter,
-    cpp_callable_parameter_names, cpp_callable_parameter_type_identities,
-    cpp_callable_return_type_identity, cpp_comparable_parameter_shapes, cpp_function_declarator_at,
-    cpp_macro_swallowed_access_label, node_text,
+    CppCallableObserver, CppComparableNode, CppComparableSlot, CppParameterType,
+    cpp_active_template_type_parameter, cpp_callable_parameter_names,
+    cpp_callable_parameter_type_identities, cpp_callable_return_type_identity,
+    cpp_comparable_parameter_shapes, cpp_macro_swallowed_access_label, node_text,
 };
 use crate::graph::resolver::cpp_name_for;
 use crate::structural::is_cpp_preprocessor_conditional;
@@ -20,6 +20,7 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, collect_parse_errors};
 use brokk_bifrost_core::hash::HashMap;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 
@@ -145,6 +146,92 @@ pub struct CppExternalMember {
     pub source_path: PathBuf,
 }
 
+/// Owned facts from the exact physical callable occurrence visited by the C++
+/// declaration walk. This is local to one external header request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedCallable {
+    metadata: SignatureMetadata,
+    parameter_types: Option<Vec<CppParameterType>>,
+    parameter_names: Option<Vec<Option<String>>>,
+    parameter_shapes: Option<Vec<CppComparableSlot>>,
+    explicitness: Option<CppCallableExplicitness>,
+    return_type: Option<StructuredTypeIdentity>,
+    returns_forwarding_reference: bool,
+}
+
+#[derive(Default)]
+struct ExternalCallableCollector {
+    // None is a sticky same-key conflict, never an arbitrary winner.
+    by_occurrence: RefCell<HashMap<(CodeUnit, usize), Option<ObservedCallable>>>,
+}
+
+impl CppCallableObserver for ExternalCallableCollector {
+    fn observe(
+        &self,
+        unit: &CodeUnit,
+        declaration_start: usize,
+        metadata: &SignatureMetadata,
+        declarator: Node<'_>,
+        source: &str,
+        ancestry: &ParentIndex<'_>,
+    ) {
+        let parameter_types = cpp_callable_parameter_type_identities(declarator, source, ancestry);
+        let parameter_names = declarator
+            .child_by_field_name("parameters")
+            .and_then(|parameters| cpp_callable_parameter_names(parameters, source));
+        let parameter_shapes = cpp_comparable_parameter_shapes(declarator, source, ancestry);
+        let return_type = metadata
+            .return_type_identity()
+            .cloned()
+            .or_else(|| cpp_callable_return_type_identity(declarator, source, ancestry));
+        let returns_forwarding_reference = cpp_returns_forwarding_reference(
+            declarator,
+            source,
+            ancestry,
+            parameter_types.as_deref(),
+            parameter_shapes.as_deref(),
+            return_type.as_ref(),
+        );
+        let observed = ObservedCallable {
+            metadata: metadata.clone(),
+            parameter_types,
+            parameter_names,
+            parameter_shapes,
+            explicitness: cpp_callable_explicitness(declarator),
+            return_type,
+            returns_forwarding_reference,
+        };
+        let mut by_occurrence = self.by_occurrence.borrow_mut();
+        let key = (unit.clone(), declaration_start);
+        if let Some(existing) = by_occurrence.get_mut(&key) {
+            if existing.as_ref() != Some(&observed) {
+                *existing = None;
+            }
+        } else {
+            by_occurrence.insert(key, Some(observed));
+        }
+    }
+
+    fn observe_duplicate(
+        &self,
+        unit: &CodeUnit,
+        declaration_start: usize,
+        declarator: Node<'_>,
+        source: &str,
+        ancestry: &ParentIndex<'_>,
+        metadata: &dyn Fn() -> SignatureMetadata,
+    ) {
+        self.observe(
+            unit,
+            declaration_start,
+            &metadata(),
+            declarator,
+            source,
+            ancestry,
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CppCallableExplicitness {
     Implicit,
@@ -163,9 +250,9 @@ pub struct CppExternalDeclarationSet {
     pub types: Vec<CppExternalType>,
     pub members: Vec<CppExternalMember>,
     pub completeness: CppExternalDeclarationCompleteness,
-    /// Whether every declaration the header's own syntax states was extracted:
-    /// the parse needed no error recovery and no record was dropped by the
-    /// limit.
+    /// Whether every declaration and callable formal the header's own syntax
+    /// states was extracted: the parse needed no error recovery, every formal
+    /// role was classified, and no record was dropped by the limit.
     ///
     /// This is narrower than `completeness`, which also turns partial for any
     /// preprocessing. Conditional compilation does not hide a written
@@ -303,7 +390,8 @@ pub fn extract_external_declarations(
 
     let mut syntax_complete = parse_errors.is_empty();
 
-    let parsed = parse_cpp_file(&file, source, &tree);
+    let callable_collector = ExternalCallableCollector::default();
+    let parsed = parse_cpp_file_with_callable_observer(&file, source, &tree, &callable_collector);
     let mut parent_by_child = HashMap::default();
     for (parent, children) in &parsed.children {
         for child in children {
@@ -330,9 +418,6 @@ pub fn extract_external_declarations(
         )
     });
 
-    // One index for the file's tree rather than one ancestor walk per
-    // declaration: a large generated header has tens of thousands of them.
-    let ancestry = ParentIndex::new(tree.root_node());
     let mut types = Vec::new();
     let mut members = Vec::new();
     for declaration in declarations {
@@ -388,49 +473,68 @@ pub fn extract_external_declarations(
                     .unwrap_or_default(),
             }),
             CodeUnitType::Function | CodeUnitType::Field | CodeUnitType::Macro => {
-                let metadata = parsed
-                    .signature_metadata
-                    .get(&declaration)
-                    .and_then(|records| records.first());
                 let declaration_start = parsed
                     .ranges
                     .get(&declaration)
                     .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min());
-                let function_declarator = (declaration.kind() == CodeUnitType::Function)
+                let observed = (declaration.kind() == CodeUnitType::Function)
                     .then(|| {
-                        declaration_start
-                            .and_then(|start| cpp_function_declarator_at(tree.root_node(), start))
+                        declaration_start.and_then(|start| {
+                            callable_collector
+                                .by_occurrence
+                                .borrow()
+                                .get(&(declaration.clone(), start))
+                                .cloned()
+                                .flatten()
+                        })
                     })
                     .flatten();
-                let parameter_types = function_declarator.map(|declarator| {
-                    cpp_callable_parameter_type_identities(declarator, source, &ancestry)
-                });
-                let parameter_names = function_declarator.and_then(|declarator| {
-                    declarator
-                        .child_by_field_name("parameters")
-                        .map(|parameters| cpp_callable_parameter_names(parameters, source))
-                });
-                let parameter_shapes = function_declarator.map(|declarator| {
-                    cpp_comparable_parameter_shapes(declarator, source, &ancestry)
-                });
+                // Never join one physical occurrence's formals with another
+                // occurrence's preferred or first metadata row.
+                let metadata = if declaration.kind() == CodeUnitType::Function {
+                    observed.as_ref().map(|record| &record.metadata)
+                } else {
+                    parsed
+                        .signature_metadata
+                        .get(&declaration)
+                        .and_then(|records| records.first())
+                };
+                let parameter_types = observed
+                    .as_ref()
+                    .and_then(|record| record.parameter_types.clone());
+                let parameter_names = observed
+                    .as_ref()
+                    .and_then(|record| record.parameter_names.clone());
+                let parameter_shapes = observed
+                    .as_ref()
+                    .and_then(|record| record.parameter_shapes.clone());
+                if declaration.kind() == CodeUnitType::Function
+                    && (parameter_types.is_none()
+                        || parameter_names.is_none()
+                        || parameter_shapes.is_none())
+                {
+                    completeness = CppExternalDeclarationCompleteness::Partial;
+                    syntax_complete = false;
+                    diagnostics.push(CppExternalDeclarationDiagnostic {
+                        code: "cpp.external.formal_roles_unavailable",
+                        message: format!(
+                            "external header `{}` has unavailable formal roles for `{}`",
+                            source_path.display(),
+                            declaration.fq_name()
+                        ),
+                    });
+                }
                 let return_type = metadata
                     .and_then(|metadata| metadata.return_type_identity())
                     .cloned()
                     .or_else(|| {
-                        function_declarator.and_then(|declarator| {
-                            cpp_callable_return_type_identity(declarator, source, &ancestry)
-                        })
+                        observed
+                            .as_ref()
+                            .and_then(|record| record.return_type.clone())
                     });
-                let returns_forwarding_reference = function_declarator.is_some_and(|declarator| {
-                    cpp_returns_forwarding_reference(
-                        declarator,
-                        source,
-                        &ancestry,
-                        parameter_types.as_deref(),
-                        parameter_shapes.as_deref(),
-                        return_type.as_ref(),
-                    )
-                });
+                let returns_forwarding_reference = observed
+                    .as_ref()
+                    .is_some_and(|record| record.returns_forwarding_reference);
                 members.push(CppExternalMember {
                     owner: nearest_declaration_owner(&declaration, &parent_by_child),
                     name: declaration.terminal_name().to_owned(),
@@ -451,7 +555,7 @@ pub fn extract_external_declarations(
                     parameter_shapes,
                     callable_arity: metadata.and_then(SignatureMetadata::callable_arity),
                     parameter_names,
-                    explicitness: function_declarator.and_then(cpp_callable_explicitness),
+                    explicitness: observed.as_ref().and_then(|record| record.explicitness),
                     return_type,
                     returns_forwarding_reference,
                     source_path: source_path.to_path_buf(),

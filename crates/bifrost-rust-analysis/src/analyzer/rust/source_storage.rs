@@ -14,15 +14,15 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::rust_facts::{
     MacroFragmentKind, MacroIdentRole, RustAliasSourceFact, RustCallableParameterSourceFact,
     RustCallableSourceFact, RustDeclarationGenericsSourceFact, RustGenericArgumentsSourceFact,
-    RustGenericParameterSourceFact, RustImplSourceFact, RustItemBodyChildSourceFact,
-    RustItemImportContextFact, RustItemMacroExpansion, RustItemMacroSourceFact,
-    RustItemMacroSourcePosition, RustItemSourceFacts, RustItemSyntaxFact, RustMacroArmSourceFact,
-    RustMacroDefinitionSourceFact, RustMacroDelimiter, RustMacroIdentRoleSourceFact,
-    RustMacroParseFailure, RustMacroPatternSourceFact, RustMacroPatternSourceKind,
-    RustMacroRepetitionOperator, RustSourceContextFact, RustSourceContextKind, RustSourceNameFact,
-    RustTraitSourceFact, RustTypeCompoundSourceKind, RustTypePathSegmentSourceFact,
-    RustTypeSourceFact, RustTypeSourceShape, RustTypeWrapperSourceFact, RustTypeWrapperSourceKind,
-    RustValueSourceFact,
+    RustGenericParameterSourceFact, RustImplCensusBoundary, RustImplCensusBoundaryKind,
+    RustImplSourceFact, RustItemBodyChildSourceFact, RustItemImportContextFact,
+    RustItemMacroExpansion, RustItemMacroSourceFact, RustItemMacroSourcePosition,
+    RustItemSourceFacts, RustItemSyntaxFact, RustMacroArmSourceFact, RustMacroDefinitionSourceFact,
+    RustMacroDelimiter, RustMacroIdentRoleSourceFact, RustMacroParseFailure,
+    RustMacroPatternSourceFact, RustMacroPatternSourceKind, RustMacroRepetitionOperator,
+    RustSourceContextFact, RustSourceContextKind, RustSourceNameFact, RustTraitSourceFact,
+    RustTypeCompoundSourceKind, RustTypePathSegmentSourceFact, RustTypeSourceFact,
+    RustTypeSourceShape, RustTypeWrapperSourceFact, RustTypeWrapperSourceKind, RustValueSourceFact,
 };
 use brokk_bifrost_core::analyzer::source_facts::{
     SourceDeclaration, SourceDeclarationId, SourceOccurrenceId,
@@ -1505,7 +1505,34 @@ impl RustSourceStorage for AnalyzerStore {
                 }
             }
 
+            let mut impl_census_boundaries = Vec::new();
+            let mut statement = tx.prepare_cached(
+                "SELECT ordinal, kind, start_byte FROM source_rust_impl_census_boundaries
+                  WHERE blob_id = ?1 ORDER BY ordinal",
+            )?;
+            let mut rows = statement.query([blob_id])?;
+            while let Some(row) = rows.next()? {
+                if !keep_going() {
+                    return Ok(None);
+                }
+                require_dense_ordinal(row.get(0)?, impl_census_boundaries.len(), "impl census boundary")?;
+                let kind = match row.get::<_, i64>(1)? {
+                    0 => RustImplCensusBoundaryKind::Macro,
+                    1 => RustImplCensusBoundaryKind::Derive,
+                    2 => RustImplCensusBoundaryKind::ExpandingAttribute,
+                    3 => RustImplCensusBoundaryKind::InternalAttribute,
+                    4 => RustImplCensusBoundaryKind::SyntaxError,
+                    value => return Err(StoreError::new(format!("invalid Rust impl census boundary kind {value}"))),
+                };
+                impl_census_boundaries.push(RustImplCensusBoundary {
+                    kind,
+                    start_byte: nonnegative_usize(row.get(2)?, "impl census boundary start")?,
+                });
+            }
+            drop(rows);
+            drop(statement);
             let item_facts = RustItemSourceFacts {
+                impl_census_boundaries,
                 contexts,
                 syntax,
                 impls,

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod js_ts_extraction_tests {
-    use brokk_bifrost_analysis::analyzer::semantic::DependencyFingerprint;
+    use brokk_bifrost_analysis::analyzer::semantic::{DependencyFingerprint, StableDigest};
 
     use brokk_bifrost_analysis::IAnalyzer;
     use brokk_bifrost_analysis::analyzer::semantic::ConfigurationFingerprint;
@@ -13,16 +13,17 @@ mod js_ts_extraction_tests {
     use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticProviderError;
     use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticRequest;
     use brokk_bifrost_analysis::analyzer::semantic::provider::SemanticWork;
+    use brokk_bifrost_analysis::analyzer::semantic::service::CachedSemanticArtifact;
     use brokk_bifrost_analysis::analyzer::semantic::service::CompleteSemanticArtifactCache;
     use brokk_bifrost_analysis::analyzer::semantic::service::ProgramSemanticsLowerer;
     use brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity;
-    use brokk_bifrost_analysis::analyzer::semantic::service::SemanticCacheRevivalCensus;
     use brokk_bifrost_analysis::analyzer::semantic::service::current_artifact_source_with_lowerer;
     use brokk_bifrost_analysis::analyzer::semantic::service::materialize_with_lowerer;
     use brokk_bifrost_analysis::analyzer::semantic::service::retained_artifact_base_bytes;
     use brokk_bifrost_analysis::analyzer::semantic::service::retained_artifact_bytes;
     use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer;
     use brokk_bifrost_core::analyzer::model::ProjectFile;
+    use brokk_bifrost_core::retention_budget::{ENTRY_OVERHEAD_BYTES, RetainedBytes, SelfCharged};
     use std::sync::Arc;
 
     use brokk_bifrost_analysis::analyzer::semantic::ProcedureSemanticsParts;
@@ -318,6 +319,13 @@ mod js_ts_extraction_tests {
         })
         .expect("every limit is positive")
     }
+    fn test_provenanced_key(artifact: SemanticArtifactKey) -> ProvenancedArtifactKey {
+        ProvenancedArtifactKey {
+            artifact,
+            built_from: StableDigest::from_array([0; 32]),
+        }
+    }
+
     #[test]
     fn current_artifact_key_tracks_source_adapter_and_configuration_without_lowering() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -509,150 +517,6 @@ mod js_ts_extraction_tests {
         assert_eq!(lowerer.calls(), 1);
         assert_eq!(cache.len(), 1);
     }
-    #[test]
-    fn semantic_cache_invalidation_witnesses_are_distinct_clone_shared_and_one_shot() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("root");
-        let file = write_file(&root, "src/main.ts", "export function main() {}\n");
-        let analyzer = analyzer(&root);
-        let cache = CompleteSemanticArtifactCache::default();
-        let lowerer = FakeLowerer::new(FakeMode::Complete);
-        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
-
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: held, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &cancellation,
-        ) else {
-            panic!("initial complete artifact")
-        };
-
-        let cloned_cache = cache.clone();
-        cloned_cache.arm_selector_continuation_invalidation_for_test();
-        cache.invalidate_evaluation_root_continuation_if_armed_for_test();
-        assert_eq!(cache.len(), 1, "the evaluation witness is not armed");
-        cache.invalidate_selector_continuation_if_armed_for_test();
-        assert_eq!(
-            cache.selector_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus::default()
-        );
-        assert_eq!(
-            cache.evaluation_root_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus::default()
-        );
-        assert_eq!(cache.len(), 0);
-
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: revived, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &cancellation,
-        ) else {
-            panic!("revived complete artifact")
-        };
-        assert!(Arc::ptr_eq(&held, &revived));
-        assert_eq!(
-            cache.selector_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 1,
-                distinct_artifacts: 1,
-            }
-        );
-        assert_eq!(
-            cache.evaluation_root_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus::default()
-        );
-
-        cache.inner.invalidate_all_for_test();
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: revived, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &cancellation,
-        ) else {
-            panic!("same artifact revived a second time")
-        };
-        assert!(Arc::ptr_eq(&held, &revived));
-        assert_eq!(
-            cache.selector_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 2,
-                distinct_artifacts: 1,
-            }
-        );
-
-        cloned_cache.arm_evaluation_root_continuation_invalidation_for_test();
-        cache.invalidate_selector_continuation_if_armed_for_test();
-        assert_eq!(cache.len(), 1, "the selector witness is no longer armed");
-        cache.invalidate_evaluation_root_continuation_if_armed_for_test();
-        assert_eq!(
-            cache.selector_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 2,
-                distinct_artifacts: 1,
-            }
-        );
-        assert_eq!(
-            cache.evaluation_root_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus::default()
-        );
-        assert_eq!(cache.len(), 0);
-
-        let mut budget = SemanticBudget::default();
-        let SemanticOutcome::Complete { value: revived, .. } = materialize(
-            &analyzer,
-            &cache,
-            &lowerer,
-            &file,
-            &mut budget,
-            &cancellation,
-        ) else {
-            panic!("second revived complete artifact")
-        };
-        assert!(Arc::ptr_eq(&held, &revived));
-        assert_eq!(
-            cache.selector_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 2,
-                distinct_artifacts: 1,
-            }
-        );
-        assert_eq!(
-            cache.evaluation_root_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 1,
-                distinct_artifacts: 1,
-            }
-        );
-
-        cache.invalidate_evaluation_root_continuation_if_armed_for_test();
-        assert_eq!(
-            cache.selector_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 2,
-                distinct_artifacts: 1,
-            }
-        );
-        assert_eq!(
-            cache.evaluation_root_continuation_revival_census_for_test(),
-            SemanticCacheRevivalCensus {
-                operations: 1,
-                distinct_artifacts: 1,
-            }
-        );
-        assert_eq!(cache.len(), 1);
-        assert_eq!(lowerer.calls(), 1);
-    }
     /// #2295: one budget pays one artifact's retained census once, however many
     /// complete-artifact cache hits it serves.
     ///
@@ -833,7 +697,6 @@ mod js_ts_extraction_tests {
         let census = artifact.work();
         assert_eq!(budget.resident().nested_entries, census.nested_entries);
         assert_eq!(budget.resident().owned_text_bytes, census.owned_text_bytes);
-        let key = artifact.key().clone();
         let prepared_pin = CachedSemanticArtifact::new(&artifact);
         drop(artifact);
         assert_eq!(cache.len(), 1, "the artifact remains in the ready cache");
@@ -843,9 +706,20 @@ mod js_ts_extraction_tests {
             "complete-cache and prepared-pool pins alone consume no root allowance"
         );
         let mut continuation = SemanticBudget::new_child(budget.limits(), &budget.scope_snapshot());
-        let artifact = cache
-            .get_ready(&key, &cancellation)
-            .expect("cached artifact");
+        let mut warm_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: artifact, ..
+        } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut warm_budget,
+            &cancellation,
+        )
+        else {
+            panic!("cached artifact")
+        };
         continuation
             .charge_complete_artifact(&artifact)
             .expect("new consumer admission");
@@ -860,7 +734,7 @@ mod js_ts_extraction_tests {
             "a live root handle restores its exact census"
         );
         drop(prepared_pin);
-        cache.inner.invalidate_all_for_test();
+        cache.invalidate_all();
         assert_eq!(
             cache.len(),
             0,
@@ -1011,11 +885,32 @@ mod js_ts_extraction_tests {
         let second_weight = retained_artifact_bytes(second.key(), &second);
         assert_eq!(first_weight, second_weight, "equal-sized fixtures");
         assert!(first_weight > 1);
-        let cache = CompleteSemanticArtifactCache::new(first_weight);
-        cache.insert(first.key().clone(), Arc::clone(&first));
-        cache.insert(second.key().clone(), Arc::clone(&second));
+        drop(staging_cache);
+        let first_key = test_provenanced_key(first.key().clone());
+        let first_cached = CachedSemanticArtifact::new(&first);
+        let first_entry_bytes = first_key.retained_bytes() as u64
+            + first_cached.eviction_bytes() as u64
+            + ENTRY_OVERHEAD_BYTES as u64;
+        drop(first_cached);
+        let cache = CompleteSemanticArtifactCache::new(first_entry_bytes + 32);
+        cache.insert(
+            test_provenanced_key(first.key().clone()),
+            Arc::clone(&first),
+        );
+        assert_eq!(cache.len(), 1, "one entry fits its measured weight");
+        cache.insert(
+            test_provenanced_key(second.key().clone()),
+            Arc::clone(&second),
+        );
 
-        assert_eq!(cache.len(), 1, "two byte-weighted entries exceed capacity");
+        // The second admission may evict the first and then refuse because
+        // the caller still pins that first allocation outside this region.
+        assert!(cache.len() < 2, "two byte-weighted entries exceed capacity");
+        let stats = cache.inner.region().stats();
+        assert!(
+            stats.evictions > 0 || stats.refused_admissions > 0,
+            "{stats:?}"
+        );
     }
     #[test]
     fn analyzer_update_preserves_unchanged_content_keyed_artifacts() {
@@ -1632,6 +1527,11 @@ mod js_ts_extraction_tests {
             .iter()
             .map(ProcedureSemantics::value_identity_index_retained_bytes)
             .sum::<u64>();
+        let callable_selection_dominance_bytes = artifact
+            .procedures()
+            .iter()
+            .map(ProcedureSemantics::callable_selection_dominance_reserved_bytes)
+            .sum::<u64>();
         let lexical_children_index_bytes = artifact.lexical_children_index_retained_bytes();
         let call_source_extent_bytes = artifact.call_source_extents_retained_bytes();
         assert!(
@@ -1644,23 +1544,25 @@ mod js_ts_extraction_tests {
             retained_bytes,
             base_bytes
                 .saturating_add(call_index_bytes)
+                .saturating_add(callable_selection_dominance_bytes)
+                .saturating_add(
+                    artifact
+                        .procedures()
+                        .iter()
+                        .map(ProcedureSemantics::call_gap_index_reserved_bytes)
+                        .sum::<u64>()
+                )
                 .saturating_add(value_identity_index_bytes)
                 .saturating_add(lexical_children_index_bytes)
                 .saturating_add(call_source_extent_bytes),
             "cache weight must include every derived semantic-index allocation"
         );
 
-        let undersized = CompleteSemanticArtifactCache::new(base_bytes);
-        undersized.insert(artifact.key().clone(), Arc::clone(&artifact));
         assert_eq!(
-            undersized.len(),
-            0,
-            "the former row-only capacity must not retain the indexed artifact"
+            artifact.allocation_charge().bytes(),
+            retained_bytes,
+            "the self-charged artifact includes its derived indexes"
         );
-
-        let exact = CompleteSemanticArtifactCache::new(retained_bytes);
-        exact.insert(artifact.key().clone(), artifact);
-        assert_eq!(exact.len(), 1, "the corrected exact capacity retains it");
     }
     #[test]
     fn dialect_and_source_origin_are_part_of_snapshot_identity() {

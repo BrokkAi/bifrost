@@ -1181,18 +1181,42 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     pub(in crate::analyzer::js_ts::semantic) fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         spec: &ProcedureSpec<'tree>,
     ) -> Result<(), TsLoweringError> {
         let callable = spec.callable;
-        let parameter_slots = if spec.kind == ProcedureKind::Initializer {
-            Vec::new()
+        if self.session.cancellation().is_cancelled() {
+            return Err(TsLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = if spec.kind == ProcedureKind::Initializer {
+            Some(Vec::new())
         } else {
             formal_parameter_slots_for_owner_with_nodes(
                 self.prepared.dialect().language(),
                 callable,
                 self.prepared.source(),
             )
-            .unwrap_or_default()
+        };
+        if self.session.cancellation().is_cancelled() {
+            return Err(TsLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let parameter_slots = match slots {
+            Some(slots) => slots,
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "JavaScript/TypeScript callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
         };
         let mut ordinal = 0_u32;
         for (slot, node) in parameter_slots {
@@ -1208,7 +1232,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let receiver = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: true },
+                    SemanticValueKind::Receiver {
+                        dispatch: true,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(receiver);
             } else {
@@ -1236,7 +1263,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?);
         }
         Ok(())

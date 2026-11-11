@@ -19,7 +19,8 @@
 //! over it can never be silently clean.
 
 use super::occurrences::labelled_enum;
-use crate::hash::HashSet;
+use super::spec::BindingCandidateVerdict;
+use crate::hash::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -446,6 +447,10 @@ impl CallSiteFacts {
 pub struct CallSiteContext {
     macro_derived_callees: HashSet<String>,
     identifier_call_starts: HashSet<usize>,
+    binding_candidate_verdicts: HashMap<usize, BindingCandidateVerdict>,
+    binding_candidates_open: bool,
+    test_attribute_scopes: HashMap<usize, bool>,
+    test_attributes_open: bool,
 }
 
 impl CallSiteContext {
@@ -472,6 +477,53 @@ impl CallSiteContext {
     /// Whether the identifier node starting at `start_byte` is a call site.
     pub fn is_identifier_call_at(&self, start_byte: usize) -> bool {
         self.identifier_call_starts.contains(&start_byte)
+    }
+
+    /// File-local binder classification shared by structural extraction.
+    /// Other adapters leave this empty and keep their existing per-node path.
+    pub fn with_binding_candidate_verdicts(
+        verdicts: HashMap<usize, BindingCandidateVerdict>,
+    ) -> Self {
+        Self {
+            binding_candidate_verdicts: verdicts,
+            ..Self::default()
+        }
+    }
+
+    /// A Rust preparation work limit was reached. Preserve syntax facts but
+    /// make every unresolved binder classification explicitly Open.
+    pub fn with_open_binding_candidates() -> Self {
+        Self {
+            binding_candidates_open: true,
+            test_attributes_open: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_test_attribute_scopes(mut self, scopes: HashMap<usize, bool>) -> Self {
+        self.test_attribute_scopes = scopes;
+        self
+    }
+
+    pub fn test_attribute_scope_unshadowed(&self, node_id: usize) -> bool {
+        !self.test_attributes_open
+            && self.test_attribute_scopes.get(&node_id).copied() == Some(true)
+    }
+
+    pub fn test_attribute_scope_scans(&self) -> usize {
+        self.test_attribute_scopes.len()
+    }
+
+    pub fn binding_candidate_verdict_at(
+        &self,
+        syntax_id: usize,
+    ) -> Option<BindingCandidateVerdict> {
+        self.binding_candidate_verdicts
+            .get(&syntax_id)
+            .copied()
+            .or(self
+                .binding_candidates_open
+                .then_some(BindingCandidateVerdict::Open))
     }
 }
 

@@ -11,7 +11,7 @@
 //! avoid repeating source spans or spellings without creating a Rust-side
 //! arena whose lifetime escapes the parse operation.
 
-use super::model::CodeUnit;
+use super::model::{CodeUnit, ProcedureKind};
 use super::structural::occurrences::labelled_enum;
 use super::structural::resolution::{DeclaredVisibility, HoistingClass};
 use crate::analyzer::dense_id::define_dense_id;
@@ -294,6 +294,13 @@ pub enum ResolutionIdentifierRole {
     Alias,
 }
 
+impl ResolutionIdentifierRole {
+    /// Whether this identifier publishes a semantic reference site.
+    pub const fn publishes_semantic_reference(self) -> bool {
+        matches!(self, Self::Reference)
+    }
+}
+
 labelled_enum! {
     ResolutionNamespace, ALL_RESOLUTION_NAMESPACES {
         Type => "type",
@@ -455,6 +462,9 @@ labelled_enum! {
         // Unordered observed runtime values of a local or pattern binder.
         // Appended to preserve every existing persisted role index.
         ObservedValue => "observed_value",
+        // A bare reference to a callable that the language evaluates as a value.
+        // Appended to preserve every existing persisted role index.
+        EvaluatedValue => "evaluated_value",
     }
 }
 
@@ -520,10 +530,26 @@ labelled_enum! {
         // type or an inferred functional-interface type. No CallFact is needed.
         // Append only: the persisted codec is this vocabulary's index.
         NonInvokingMemberReference => "non_invoking_member_reference",
+        // A Scala term written without an argument list. This records the
+        // source selection shape only: binding, evaluation, implicit
+        // application, and eta conversion remain separate obligations.
+        // Append only: the persisted codec is this vocabulary's index.
+        BareTermBinding => "bare_term_binding",
+        // The same binding shape where the Scala AST proves that the use has
+        // no expected type. Only this narrower marker permits non-application
+        // specificity; its position is source evidence, not a type guess.
+        BareTermBindingNoExpectedType => "bare_term_binding_no_expected_type",
     }
 }
 
 impl BindingProjectionKind {
+    pub const fn is_bare_term_binding(self) -> bool {
+        matches!(
+            self,
+            Self::BareTermBinding | Self::BareTermBindingNoExpectedType
+        )
+    }
+
     /// A projection from a callable reference to one of its call results. The
     /// first and the later results share this shape; only the first result's
     /// declared type is published as a first-result declaration.
@@ -738,6 +764,9 @@ labelled_enum! {
         Channel => "channel",
         Slice => "slice",
         Array => "array",
+        ChannelBoth => "channel_both",
+        ChannelSend => "channel_send",
+        ChannelReceive => "channel_receive",
     }
 }
 
@@ -1156,6 +1185,78 @@ pub struct ResolutionMemberOwnerFact {
     pub qualifier_compatibility: ResolutionMemberQualifierCompatibility,
 }
 
+labelled_enum! {
+    /// Why a producer could not certify a source owner's member-type inventory.
+    MemberTypesOpenReason, ALL_MEMBER_TYPES_OPEN_REASONS {
+        /// An ERROR or MISSING node, or a declaration with a parse error, lies
+        /// in the owner's type body.
+        Malformed => "malformed",
+        /// A type declaration without a spelled name emitted no member row.
+        UnnamedTypeDeclaration => "unnamed_type_declaration",
+        /// A named type declaration in the owner's type body published no
+        /// member-type row for this owner.
+        MemberRowMissing => "member_row_missing",
+        /// A node kind the producer's census does not classify lies in the
+        /// owner's type body.
+        UnrecognizedForm => "unrecognized_form",
+        /// A Kotlin `typealias` nested in a type body, which the lowerer binds
+        /// without a member-owner row.
+        NestedTypeAliasWithoutMemberRow => "nested_type_alias_without_member_row",
+        /// A type declaration inside a Kotlin enum-entry body, which the
+        /// lowerer keeps in the enum's own scope.
+        EnumEntryBodyDeclaration => "enum_entry_body_declaration",
+        /// A Scala `export` clause, which can forward type members that are
+        /// not member-owner rows of this owner.
+        ExportClause => "export_clause",
+    }
+}
+
+/// A producer's claim about one source type owner's declared member types.
+///
+/// `Complete` says that every type the language makes a member of this owner
+/// through its own type body is published as a `NestedType` or associated-type
+/// member-owner row for this owner. `Open` names the first reason the producer
+/// cannot say so. An owner with no claim is Unknown, and no reader may treat it
+/// as complete (#9546).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MemberTypesCoverage {
+    Complete,
+    Open(MemberTypesOpenReason),
+}
+
+impl MemberTypesCoverage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Open(_) => "open",
+        }
+    }
+
+    pub const fn open_reason(self) -> Option<MemberTypesOpenReason> {
+        match self {
+            Self::Complete => None,
+            Self::Open(reason) => Some(reason),
+        }
+    }
+
+    /// Decode the persisted pair of columns. `None` means the pair is not a
+    /// value this type can encode, which a reader reports as a corrupt row.
+    pub fn from_columns(coverage: &str, open_reason: Option<&str>) -> Option<Self> {
+        match (coverage, open_reason) {
+            ("complete", None) => Some(Self::Complete),
+            ("open", Some(reason)) => MemberTypesOpenReason::from_label(reason).map(Self::Open),
+            _ => None,
+        }
+    }
+}
+
+/// The member-type coverage claim for one type declaration with a type body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionMemberTypeCoverageFact {
+    pub owner: ResolutionSiteId,
+    pub coverage: MemberTypesCoverage,
+}
+
 /// Producer authority for a definition to bind one lookup namespace with the
 /// declared hoisting behavior.
 ///
@@ -1300,6 +1401,33 @@ pub struct ResolutionReferenceOwnerFact {
     pub owner: Option<ResolutionSiteId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolutionReferenceExecutionDisposition {
+    Callable,
+    NonExecutable,
+    Unknown,
+}
+
+impl ResolutionReferenceExecutionDisposition {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Callable => "callable",
+            Self::NonExecutable => "non_executable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Execution frame at one ordinary positioned reference site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionReferenceExecutionContextFact {
+    pub reference: ResolutionSiteId,
+    pub disposition: ResolutionReferenceExecutionDisposition,
+    pub procedure_kind: Option<ProcedureKind>,
+    pub initializer_is_static: Option<bool>,
+    pub callable_site: Option<ResolutionSiteId>,
+}
+
 labelled_enum! {
     ResolutionSupertypeKind, ALL_RESOLUTION_SUPERTYPE_KINDS {
         Superclass => "superclass",
@@ -1435,6 +1563,8 @@ pub enum ResolutionRootImportAnchor {
     /// Resolve a syntactically absolute route using the selected source unit's
     /// language-version rules.
     Absolute,
+    /// Resolve the first structured segment in the C# alias declaration space.
+    AliasQualified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1451,8 +1581,15 @@ pub struct ResolutionRootImportFact {
     pub position: Option<usize>,
 }
 
-/// A source import visible in every file of the caller's own compilations.
-/// Presence is the marker; ordinary lexical imports have no row.
+/// A source-owned extern alias declaration, separate from ordinary binders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResolutionExternAliasFact {
+    pub site: ResolutionSiteId,
+    pub scope: ResolutionScopeId,
+    pub name: ResolutionNameId,
+}
+
+/// A source import visible throughout the caller's own compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionCompilationImportFact {
     pub import_site: ResolutionSiteId,
@@ -1495,6 +1632,46 @@ pub struct ResolutionRootReferenceSegmentFact {
     pub reference: ResolutionSiteId,
     pub position: u32,
     pub name: ResolutionNameId,
+}
+
+/// Emit each positioned path token with the root route preceding it. Languages
+/// select tokens, namespaces and anchors; shared code owns prefix enumeration.
+/// Returning `None` reuses an already emitted token (for shared import leaves).
+pub fn emit_positioned_root_prefixes<State, Token>(
+    state: &mut State,
+    tokens: &[Token],
+    names: &[ResolutionNameId],
+    root_scope: ResolutionScopeId,
+    anchor: ResolutionRootImportAnchor,
+    mut reference: impl FnMut(&mut State, &Token, usize) -> Option<ResolutionSiteId>,
+    facts: impl Fn(&mut State) -> &mut FileResolutionFacts,
+) {
+    assert_eq!(tokens.len(), names.len(), "one name per positioned token");
+    for (ordinal, token) in tokens.iter().enumerate() {
+        let Some(reference) = reference(state, token, ordinal) else {
+            continue;
+        };
+        let facts = facts(state);
+        facts.root_references.push(ResolutionRootReferenceFact {
+            reference,
+            root_scope,
+            anchor,
+            prefix_reference: None,
+            owner_continued: false,
+        });
+        facts
+            .root_reference_segments
+            .extend(
+                names[..ordinal]
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &name)| ResolutionRootReferenceSegmentFact {
+                        reference,
+                        position: dense_ordinal(position, "positioned root prefix"),
+                        name,
+                    }),
+            );
+    }
 }
 
 /// One exact name and effective namespace that a root import may expose.
@@ -1649,6 +1826,14 @@ pub struct ResolutionPackageReferenceFact {
     pub root_scope: ResolutionScopeId,
 }
 
+/// Exact lexical package visibility at a positioned reference occurrence.
+/// An empty list is affirmative; absence of this fact is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionLexicalPackageContextFact {
+    pub reference: ResolutionSiteId,
+    pub prefixes: Vec<String>,
+}
+
 /// One member that a Scala package object re-exports at its package route.
 /// Both declarations retain their source identities; this row only states the
 /// selected package route through which the member is also visible.
@@ -1773,6 +1958,9 @@ labelled_enum! {
     /// The expression was fully traversed, but its resulting type or value is not modeled.
     /// References and binders below this site are retained, so this is not an enumeration gap.
         UnsupportedExpressionType => "unsupported_expression_type",
+    /// Structured C# compilation-unit evidence of an unevaluated file program.
+        FileProgramEvidence => "file_program_evidence",
+        CompilationImportsUnenumerated => "compilation_imports_unenumerated",
     }
 }
 
@@ -1935,6 +2123,13 @@ pub enum PythonNativeImportForm {
     Star,
 }
 
+/// Surviving statically evaluated package search directory, relative to its initializer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PythonPackagePathExtensionFact {
+    pub ordinal: u32,
+    pub directory: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PythonNativeImportFact {
     pub import_site: ResolutionSiteId,
@@ -1942,6 +2137,23 @@ pub struct PythonNativeImportFact {
     pub relative_level: u32,
     pub module_segment_count: u32,
     pub binding_event: Option<u32>,
+}
+
+/// One positioned Python import module token, independent of binding demands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonImportModuleOperandFact {
+    pub reference_site: ResolutionSiteId,
+    pub import_site: ResolutionSiteId,
+    pub prefix_len: u32,
+}
+
+/// One source-observed write to a module registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PythonModuleRegistryWriteFact {
+    pub registry_reference: ResolutionSiteId,
+    pub key_reference: ResolutionSiteId,
+    pub value_reference: Option<ResolutionSiteId>,
+    pub top_level: bool,
 }
 
 /// Python syntax only. Shared temporal selection must read guards through a
@@ -2237,6 +2449,9 @@ pub struct FileResolutionFacts {
     pub binding_observations: Vec<ResolutionBindingObservationFact>,
     pub python_predicates: Vec<PythonNativePredicateFact>,
     pub python_imports: Vec<PythonNativeImportFact>,
+    pub python_import_module_operands: Vec<PythonImportModuleOperandFact>,
+    pub python_module_registry_writes: Vec<PythonModuleRegistryWriteFact>,
+    pub python_package_path_extensions: Vec<PythonPackagePathExtensionFact>,
     pub python_guards: Vec<PythonNativeGuardFact>,
     pub python_site_guards: Vec<PythonNativeSiteGuardFact>,
     pub python_export_operations: Vec<PythonNativeExportOperationFact>,
@@ -2248,6 +2463,7 @@ pub struct FileResolutionFacts {
     pub import_routes: Vec<ResolutionImportRouteFact>,
     pub import_route_segments: Vec<ResolutionImportRouteSegmentFact>,
     pub root_imports: Vec<ResolutionRootImportFact>,
+    pub extern_aliases: Vec<ResolutionExternAliasFact>,
     pub compilation_imports: Vec<ResolutionCompilationImportFact>,
     pub root_import_segments: Vec<ResolutionRootImportSegmentFact>,
     pub root_import_demands: Vec<ResolutionRootImportDemandFact>,
@@ -2255,11 +2471,16 @@ pub struct FileResolutionFacts {
     pub root_import_demand_targets: Vec<ResolutionRootImportDemandTargetFact>,
     pub import_selectors: Vec<ResolutionImportSelectorFact>,
     pub root_references: Vec<ResolutionRootReferenceFact>,
+    /// Qualified references whose own prefix is proved absent by the producer:
+    /// their qualifier has independent reference authority and feeds the
+    /// selected typed route, possibly through a non-owning name chain.
+    pub typed_receiver_prefix_absences: Vec<ResolutionSiteId>,
     pub root_reference_segments: Vec<ResolutionRootReferenceSegmentFact>,
     pub root_exports: Vec<ResolutionRootExportFact>,
     pub package_members: Vec<ResolutionPackageMemberFact>,
     pub go_package_imports: Vec<ResolutionGoPackageImportFact>,
     pub package_references: Vec<ResolutionPackageReferenceFact>,
+    pub lexical_package_contexts: Vec<ResolutionLexicalPackageContextFact>,
     pub package_object_exports: Vec<ResolutionPackageObjectExportFact>,
     pub invocation_roles: Vec<ResolutionInvocationRoleFact>,
     pub singleton_relations: Vec<ResolutionSingletonRelationFact>,
@@ -2316,6 +2537,10 @@ pub struct FileResolutionFacts {
     pub callable_receivers: Vec<ResolutionCallableReceiverFact>,
     pub member_owners: Vec<ResolutionMemberOwnerFact>,
     pub deferred_member_owners: Vec<ResolutionDeferredMemberOwnerFact>,
+    /// Member-type coverage claims, one per certified source type owner.
+    /// Only the Java, Kotlin and Scala producers write them; an owner with a
+    /// type body and no claim is Unknown.
+    pub member_type_coverage: Vec<ResolutionMemberTypeCoverageFact>,
     pub name_lookups: Vec<ResolutionNameLookupFact>,
     /// Module declarations reached through environment routes rather than a
     /// lexical binder. Python file modules use selected import providers.
@@ -2337,6 +2562,7 @@ pub struct FileResolutionFacts {
     pub relation_members: Vec<ResolutionRelationMemberFact>,
     pub engine_rule_eligibilities: Vec<ResolutionEngineRuleEligibilityFact>,
     pub reference_owners: Vec<ResolutionReferenceOwnerFact>,
+    pub reference_execution_contexts: Vec<ResolutionReferenceExecutionContextFact>,
     pub visibility_eligibilities: Vec<ResolutionVisibilityEligibilityFact>,
     pub declaration_visibilities: Vec<ResolutionDeclarationVisibilityFact>,
     pub declaration_access_boundaries: Vec<ResolutionDeclarationAccessBoundaryFact>,
@@ -2668,6 +2894,9 @@ impl FileResolutionFacts {
             && self.binding_observations.is_empty()
             && self.python_predicates.is_empty()
             && self.python_imports.is_empty()
+            && self.python_import_module_operands.is_empty()
+            && self.python_module_registry_writes.is_empty()
+            && self.python_package_path_extensions.is_empty()
             && self.python_guards.is_empty()
             && self.python_site_guards.is_empty()
             && self.python_export_operations.is_empty()
@@ -2679,6 +2908,7 @@ impl FileResolutionFacts {
             && self.import_routes.is_empty()
             && self.import_route_segments.is_empty()
             && self.root_imports.is_empty()
+            && self.extern_aliases.is_empty()
             && self.compilation_imports.is_empty()
             && self.root_import_segments.is_empty()
             && self.root_import_demands.is_empty()
@@ -2686,11 +2916,13 @@ impl FileResolutionFacts {
             && self.root_import_demand_targets.is_empty()
             && self.import_selectors.is_empty()
             && self.root_references.is_empty()
+            && self.typed_receiver_prefix_absences.is_empty()
             && self.root_reference_segments.is_empty()
             && self.root_exports.is_empty()
             && self.package_members.is_empty()
             && self.go_package_imports.is_empty()
             && self.package_references.is_empty()
+            && self.lexical_package_contexts.is_empty()
             && self.package_object_exports.is_empty()
             && self.invocation_roles.is_empty()
             && self.singleton_relations.is_empty()
@@ -2734,6 +2966,7 @@ impl FileResolutionFacts {
             && self.callable_receivers.is_empty()
             && self.member_owners.is_empty()
             && self.deferred_member_owners.is_empty()
+            && self.member_type_coverage.is_empty()
             && self.name_lookups.is_empty()
             && self.route_owned_module_declarations.is_empty()
             && self.keyword_references.is_empty()
@@ -2741,6 +2974,7 @@ impl FileResolutionFacts {
             && self.relation_members.is_empty()
             && self.engine_rule_eligibilities.is_empty()
             && self.reference_owners.is_empty()
+            && self.reference_execution_contexts.is_empty()
             && self.visibility_eligibilities.is_empty()
             && self.declaration_visibilities.is_empty()
             && self.declaration_access_boundaries.is_empty()
@@ -2766,6 +3000,20 @@ impl FileResolutionFacts {
             .filter(|identifier| identifier.role == ResolutionIdentifierRole::Declaration)
             .map(|identifier| (identifier.site, identifier.namespace))
             .collect::<HashSet<_>>();
+        let mut context_sites = HashSet::new();
+        for fact in &self.lexical_package_contexts {
+            assert!(
+                context_sites.insert(fact.reference),
+                "duplicate reference package context"
+            );
+            assert_eq!(
+                identifiers[&fact.reference].role,
+                ResolutionIdentifierRole::Reference
+            );
+            assert!(fact.prefixes.iter().all(|prefix| {
+                !prefix.is_empty() && prefix.split('.').all(|part| !part.is_empty())
+            }));
+        }
         definitions.extend(
             self.additional_definition_namespaces
                 .iter()
@@ -2933,6 +3181,15 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.binding_observations))
             .saturating_add(rows(&self.python_predicates))
             .saturating_add(rows(&self.python_imports))
+            .saturating_add(rows(&self.python_import_module_operands))
+            .saturating_add(rows(&self.python_module_registry_writes))
+            .saturating_add(rows(&self.python_package_path_extensions))
+            .saturating_add(
+                self.python_package_path_extensions
+                    .iter()
+                    .map(|fact| fact.directory.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
             .saturating_add(rows(&self.python_guards))
             .saturating_add(rows(&self.python_site_guards))
             .saturating_add(rows(&self.python_export_operations))
@@ -2944,6 +3201,7 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.import_routes))
             .saturating_add(rows(&self.import_route_segments))
             .saturating_add(rows(&self.root_imports))
+            .saturating_add(rows(&self.extern_aliases))
             .saturating_add(rows(&self.compilation_imports))
             .saturating_add(rows(&self.root_import_segments))
             .saturating_add(rows(&self.root_import_demands))
@@ -2951,11 +3209,23 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.root_import_demand_targets))
             .saturating_add(rows(&self.import_selectors))
             .saturating_add(rows(&self.root_references))
+            .saturating_add(rows(&self.typed_receiver_prefix_absences))
             .saturating_add(rows(&self.root_reference_segments))
             .saturating_add(rows(&self.root_exports))
             .saturating_add(rows(&self.package_members))
             .saturating_add(rows(&self.go_package_imports))
             .saturating_add(rows(&self.package_references))
+            .saturating_add(
+                self.lexical_package_contexts
+                    .iter()
+                    .fold(0usize, |total, fact| {
+                        total
+                            .saturating_add(
+                                std::mem::size_of::<ResolutionLexicalPackageContextFact>(),
+                            )
+                            .saturating_add(fact.prefixes.iter().map(String::len).sum::<usize>())
+                    }),
+            )
             .saturating_add(rows(&self.package_object_exports))
             .saturating_add(rows(&self.invocation_roles))
             .saturating_add(rows(&self.singleton_relations))
@@ -3027,11 +3297,13 @@ impl FileResolutionFacts {
             .saturating_add(rows(&self.callable_receivers))
             .saturating_add(rows(&self.member_owners))
             .saturating_add(rows(&self.deferred_member_owners))
+            .saturating_add(rows(&self.member_type_coverage))
             .saturating_add(rows(&self.name_lookups))
             .saturating_add(rows(&self.declared_type_relations))
             .saturating_add(rows(&self.relation_members))
             .saturating_add(rows(&self.engine_rule_eligibilities))
             .saturating_add(rows(&self.reference_owners))
+            .saturating_add(rows(&self.reference_execution_contexts))
             .saturating_add(rows(&self.visibility_eligibilities))
             .saturating_add(rows(&self.declaration_visibilities))
             .saturating_add(rows(&self.declaration_access_boundaries))

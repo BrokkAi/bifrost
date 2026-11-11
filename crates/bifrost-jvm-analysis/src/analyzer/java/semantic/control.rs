@@ -7,6 +7,9 @@ use crate::analyzer::java::semantic::numeric::JavaNumericLiteral;
 use crate::analyzer::java::semantic::numeric::integral_domain_contains;
 
 use crate::analyzer::java::semantic::numeric::java_numeric_literal;
+use crate::analyzer::java::semantic::numeric::{
+    java_integral_binary, java_integral_comparison, java_integral_negate,
+};
 
 use crate::analyzer::java::semantic::syntax::*;
 
@@ -151,6 +154,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         prepared,
         structural_node_index,
         session,
+        return_type: spec.callable.child_by_field_name("type"),
         expression_values: HashMap::default(),
         constant_index_values: HashMap::default(),
         field_declaration_anchors: declaration_inventory.field_anchors,
@@ -158,6 +162,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         type_name_roots: declaration_inventory.type_roots,
         local_types: HashMap::default(),
         local_type_nodes: HashMap::default(),
+        constant_locals: HashMap::default(),
         array_values: HashSet::default(),
         non_null_values: HashSet::default(),
         catch_binders: HashMap::default(),
@@ -171,10 +176,177 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         procedure_targets,
         cleanups: Vec::new(),
     };
-    context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.emit_procedure_inputs(
+        &mut builder,
+        entry,
+        spec.callable,
+        spec.kind,
+        spec.properties,
+    )?;
     context.emit_captured_receiver(&mut builder, entry, spec)?;
     context.emit_lexical_capture_inputs(&mut builder, entry, spec)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
+    // Annotations, type parameters, constructors, lambdas and anonymous
+    // classes remain refused. Synchronized methods have no monitor lowering;
+    // native/abstract methods have no executable body and get no footprint.
+    // Annotations cannot be swallowed with keyword modifiers. The implicit
+    // receiver is emitted as an input.
+    let footprint_method = spec.callable.kind() == "method_declaration"
+        && spec
+            .callable
+            .parent()
+            .and_then(|body| body.parent())
+            .is_none_or(|owner| {
+                !matches!(owner.kind(), "object_creation_expression" | "enum_constant")
+            });
+    if footprint_method {
+        context
+            .session
+            .footprint_register(spec.callable, BoundaryDisposition::Lowered);
+        let mut signature_complete = true;
+        let mut cursor = spec.callable.walk();
+        for child in spec.callable.named_children(&mut cursor) {
+            match child.kind() {
+                "modifiers"
+                    if named_children(child).is_empty()
+                        && brokk_bifrost_jvm::java::declarations::java_modifier_keywords(
+                            spec.callable,
+                        )
+                        .all(|keyword| {
+                            matches!(
+                                keyword,
+                                "public"
+                                    | "protected"
+                                    | "private"
+                                    | "static"
+                                    | "final"
+                                    | "strictfp"
+                            )
+                        }) =>
+                {
+                    context
+                        .session
+                        .footprint_consume_subtree(child, BranchClass::Type)
+                }
+                _ if java_footprint_type(child) => context
+                    .session
+                    .footprint_consume_subtree(child, BranchClass::Type),
+                "identifier" => context
+                    .session
+                    .footprint_consume_subtree(child, BranchClass::Identifier),
+                "formal_parameters" => {
+                    context
+                        .session
+                        .footprint_register(child, BoundaryDisposition::Lowered);
+                    for parameter in named_children(child) {
+                        let ty = parameter.child_by_field_name("type");
+                        let name = parameter.child_by_field_name("name");
+                        if parameter.kind() == "formal_parameter"
+                            && ty.is_some_and(java_footprint_type)
+                            && name.is_some_and(|name| name.kind() == "identifier")
+                            && named_children(parameter).iter().all(|node| {
+                                Some(node.id()) == ty.map(|n| n.id())
+                                    || Some(node.id()) == name.map(|n| n.id())
+                                    || node.kind() == "modifiers"
+                                        && named_children(*node).is_empty()
+                            })
+                        {
+                            context
+                                .session
+                                .footprint_register(parameter, BoundaryDisposition::Lowered);
+                            for node in named_children(parameter) {
+                                context.session.footprint_consume_subtree(
+                                    node,
+                                    if node.kind() == "identifier" {
+                                        BranchClass::Identifier
+                                    } else {
+                                        BranchClass::Type
+                                    },
+                                );
+                            }
+                        } else {
+                            signature_complete = false;
+                            context.session.footprint_register(
+                                parameter,
+                                BoundaryDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
+                            );
+                        }
+                    }
+                }
+                "throws" if named_children(child).into_iter().all(java_footprint_type) => {
+                    // Declared exception types constrain callers; every throwing
+                    // operation already routes its exceptional continuation.
+                    context
+                        .session
+                        .footprint_consume_subtree(child, BranchClass::Type);
+                }
+                "block" => {}
+                _ => signature_complete = false,
+            }
+        }
+        context.session.footprint_class(
+            FootprintClass::SignatureAttributesTransforms,
+            if signature_complete {
+                FootprintDisposition::Represented
+            } else {
+                FootprintDisposition::Refused(FootprintRefusal::UnclassifiedBranch)
+            },
+        );
+        let mut pending = vec![spec.body];
+        let mut has_call = false;
+        while let Some(node) = pending.pop() {
+            has_call |= node.kind() == "method_invocation";
+            if !matches!(node.kind(), "lambda_expression" | "class_declaration") {
+                pending.extend(named_children(node));
+            }
+        }
+        for class in [
+            FootprintClass::PublicationEscape,
+            FootprintClass::NormalExit,
+            FootprintClass::ExceptionalExit,
+        ] {
+            context
+                .session
+                .footprint_class(class, FootprintDisposition::Represented);
+        }
+        for class in [
+            FootprintClass::Capture,
+            FootprintClass::DeferredExecution,
+            FootprintClass::NestedCallableOwnership,
+        ] {
+            context.session.footprint_class(
+                class,
+                FootprintDisposition::Excluded(FootprintExclusion::NoInstance),
+            );
+        }
+        context.session.footprint_class(
+            FootprintClass::CleanupDropUnwind,
+            FootprintDisposition::Represented,
+        );
+        context.session.footprint_class(
+            FootprintClass::NestedCall,
+            if has_call {
+                FootprintDisposition::Represented
+            } else {
+                FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
+            },
+        );
+        // The current producer does not tie the broad DynamicDispatch gap to
+        // its target-resolution gap, and may omit class initialization.
+        for class in [
+            FootprintClass::CallTarget,
+            FootprintClass::ConversionInitialization,
+        ] {
+            context.session.footprint_class(
+                class,
+                if has_call {
+                    FootprintDisposition::Refused(FootprintRefusal::RelevantGap)
+                } else {
+                    FootprintDisposition::Excluded(FootprintExclusion::NoInstance)
+                },
+            );
+        }
+    }
 
     // #2553: "source-order composition across initializer fragments" is the
     // gap's own documented reason (JLS 12.4.2/12.5 compose every static-or-
@@ -276,7 +448,7 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         )?;
     }
 
-    drive_and_finish_procedure(
+    let (mut parts, work) = drive_and_finish_procedure(
         builder,
         pending,
         entry,
@@ -284,7 +456,21 @@ pub(in crate::analyzer::java::semantic) fn lower_procedure<'tree, 'targets>(
         exceptional_exit,
         cancellation,
         |builder, work, stack| context.step(builder, work, stack),
-    )
+    )?;
+    if footprint_method {
+        context.session.footprint_classes_from_rows(
+            &parts,
+            &[
+                FootprintClass::MemoryWrite,
+                FootprintClass::MemoryRead,
+                FootprintClass::StaticGlobal,
+            ],
+        );
+    }
+    context
+        .session
+        .assemble_footprint(&mut parts, spec.callable, java_call_control_branch);
+    Ok((parts, work))
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
@@ -297,6 +483,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
+        self.session
+            .footprint_register(node, BoundaryDisposition::Lowered);
+        for child in named_children(node) {
+            if java_footprint_type(child)
+                || child.kind() == "modifiers" && named_children(child).is_empty()
+            {
+                self.session
+                    .footprint_consume_subtree(child, BranchClass::Type);
+            }
+        }
         let initializers = children_by_field_name(node, "declarator")
             .into_iter()
             .filter_map(|declarator| {
@@ -318,7 +514,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|(declarator, _, _)| self.point(builder, *declarator, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
         self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
-        for (index, (_, name, initializer)) in initializers.iter().enumerate().rev() {
+        for (index, (declarator, name, initializer)) in initializers.iter().enumerate().rev() {
             let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
                 JavaLoweringError::Invalid("local declaration has invalid name range".into())
             })?;
@@ -327,6 +523,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .ok_or_else(|| {
                     JavaLoweringError::Invalid("local declaration was not preindexed".into())
                 })?;
+            if self
+                .local_type_nodes
+                .get(&target)
+                .is_some_and(|ty| self.footprint_conversion_is_identity(*ty, *initializer))
+            {
+                self.session
+                    .footprint_register(*declarator, BoundaryDisposition::Lowered);
+            }
+            self.session
+                .footprint_consume_subtree(*name, BranchClass::Identifier);
             if self.expression_is_non_null(*initializer) {
                 self.non_null_values.insert(target);
             }
@@ -379,6 +585,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         );
         let right = required_field(node, "right")?;
         let lexical_target = self.lexical_reference_binding(left);
+        if left.kind() == "identifier"
+            && lexical_target
+                .and_then(|(target, _)| self.local_type_nodes.get(&target))
+                .is_some_and(|ty| self.footprint_conversion_is_identity(*ty, right))
+        {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            self.session
+                .footprint_consume_subtree(left, BranchClass::Identifier);
+        }
         let terminal = self.point(builder, node, Vec::new())?;
         // putstatic initializes after the RHS and writes only on success.
         let evaluation_terminal = if self.static_field_may_initialize(left) {
@@ -1116,10 +1332,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
             _ => {
+                // A comparison over literals and constant locals is decided
+                // here, like a literal: only the arm it selects gets an edge.
+                // The condition is still lowered so its reads stay recorded.
+                let (when_true, when_false) = match self.constant_truth(node) {
+                    Some(true) => (Some(when_true), None),
+                    Some(false) => (None, Some(when_false)),
+                    None => (Some(when_true), Some(when_false)),
+                };
                 let decision = self.point(builder, node, Vec::new())?;
-                self.edge(builder, decision, when_true)?;
-                self.edge(builder, decision, when_false)?;
-                self.record_guard(builder, decision, node, Some(when_true), Some(when_false))?;
+                for target in [when_true, when_false].into_iter().flatten() {
+                    self.edge(builder, decision, target)?;
+                }
+                self.record_guard(builder, decision, node, when_true, when_false)?;
                 if !self.is_primitive_boolean_expression(node) {
                     // Boolean conversion happens after expression side effects,
                     // including inside a short-circuit operand.
@@ -1295,6 +1520,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "binary_expression" => {}
             _ => return Ok(None),
+        }
+
+        // A comparison over integral constants is decided like a literal;
+        // `condition` keeps only the arm it selects, and the published
+        // predicate says why the other arm is missing.
+        if let Some(value) = self.constant_truth(cursor) {
+            return Ok(Some(NormalizedConditionGuard::folded(
+                GuardPredicate::ConstantBoolean {
+                    value: value != negated,
+                },
+                None,
+            )));
         }
 
         let Some(operator) = cursor.child_by_field_name("operator") else {
@@ -1554,6 +1791,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// its value (JLS 5.2) publishes its typed constant: an integer literal
     /// keeps its integer value even for a floating target, whose conversion
     /// the scalar solver applies from the target's declared type.
+    // Claims do not invent assignment/return conversions. In particular,
+    // unboxing can throw and boxing allocates; neither operation is emitted
+    // by these paths. Other non-identity primitive conversions and unknown
+    // inferred types also remain unclaimed until their lowering is audited.
+    fn footprint_conversion_is_identity(&self, target: Node<'tree>, source: Node<'tree>) -> bool {
+        let target_scalar = JavaScalarType::from_type(target);
+        match self.compound_value_type(source) {
+            JavaCompoundType::Primitive(scalar) => target_scalar == Some(scalar),
+            JavaCompoundType::Boxed(_) | JavaCompoundType::String | JavaCompoundType::Null => {
+                target_scalar.is_none() && node_text(self.prepared.source(), target) != Some("var")
+            }
+            JavaCompoundType::Unknown => {
+                target_scalar.is_none()
+                    && node_text(self.prepared.source(), target) != Some("var")
+                    && (source.kind() == "this" && self.receiver.is_some()
+                        || self
+                            .lexical_reference_binding(source)
+                            .is_some_and(|(value, _)| self.array_values.contains(&value))
+                        || self.compound_declared_type(source).is_some_and(|ty| {
+                            java_footprint_type(ty)
+                                && JavaScalarType::from_type(ty).is_none()
+                                && node_text(self.prepared.source(), ty) != Some("var")
+                        }))
+            }
+        }
+    }
+
     fn assignment_literal_kind(
         &self,
         target: ValueId,
@@ -1767,6 +2031,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
         match node.kind() {
             "block" | "constructor_body" | "program" => {
+                if node.kind() == "block" {
+                    self.session
+                        .footprint_register(node, BoundaryDisposition::Lowered);
+                }
                 let children = named_children(node)
                     .into_iter()
                     .filter(|child| child.kind() != "comment")
@@ -1774,6 +2042,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.schedule_statements(builder, entry, &children, next, scope, stack)
             }
             "expression_statement" => {
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 if let Some(expression) = first_named_child(node) {
                     stack.push(Work::Expression {
                         node: expression,
@@ -1787,6 +2057,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
             }
             "return_statement" => {
+                if first_named_child(node).is_none_or(|operand| {
+                    self.return_type
+                        .is_some_and(|ty| self.footprint_conversion_is_identity(ty, operand))
+                }) {
+                    self.session
+                        .footprint_register(node, BoundaryDisposition::Lowered);
+                }
                 let terminal = if let Some(value_node) = first_named_child(node) {
                     let point = self.point(builder, node, Vec::new())?;
                     let source = self.expression_value(
@@ -2101,8 +2378,107 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "constructor_declaration"
             | "compact_constructor_declaration"
             | "static_initializer" => self.edge(builder, entry, next),
-            _ => self.unhandled_control_syntax(builder, node, entry),
+            _ => {
+                self.session.footprint_register(
+                    node,
+                    BoundaryDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
+                );
+                self.unhandled_control_syntax(builder, node, entry)
+            }
         }
+    }
+
+    /// The value of a numerical comparison whose operands are integral
+    /// constants (see [`Self::integral_constant`]), or `None` when either
+    /// operand is not one. Evaluating such a condition has no side effects
+    /// and cannot throw, so dropping the arm it never selects is exact.
+    fn constant_truth(&self, node: Node<'tree>) -> Option<bool> {
+        if node.kind() != "binary_expression" {
+            return None;
+        }
+        let operator = node.child_by_field_name("operator")?.kind();
+        if !matches!(operator, "==" | "!=" | "<" | "<=" | ">" | ">=") {
+            return None;
+        }
+        let left = self.integral_constant(node.child_by_field_name("left")?)?;
+        let right = self.integral_constant(node.child_by_field_name("right")?)?;
+        java_integral_comparison(operator, left, right)
+    }
+
+    /// The `int` or `long` value of an expression built from integer
+    /// literals, effectively final constant locals (`constant_locals`),
+    /// parentheses, unary `+`/`-` and binary `+ - * / %`. Anything else,
+    /// including a division by zero, has no value. The walk is iterative
+    /// because generated conditions can nest deeply.
+    fn integral_constant(&self, root: Node<'tree>) -> Option<JavaNumericLiteral> {
+        enum Step<'tree> {
+            Visit(Node<'tree>),
+            Apply(Node<'tree>),
+        }
+        let source = self.prepared.source();
+        let mut work = vec![Step::Visit(root)];
+        let mut values = Vec::new();
+        while let Some(step) = work.pop() {
+            match step {
+                Step::Visit(node) => {
+                    if let Some(literal) = java_numeric_literal(source, node) {
+                        literal.integer()?;
+                        values.push(literal);
+                        continue;
+                    }
+                    match node.kind() {
+                        "parenthesized_expression" => {
+                            work.push(Step::Visit(first_named_child(node)?));
+                        }
+                        "identifier" => {
+                            let (binding, kind) = self.lexical_reference_binding(node)?;
+                            if kind != ValueFlowKind::Local {
+                                return None;
+                            }
+                            values.push(*self.constant_locals.get(&binding)?);
+                        }
+                        "unary_expression" => {
+                            let operator = node.child_by_field_name("operator")?.kind();
+                            if !matches!(operator, "+" | "-") {
+                                return None;
+                            }
+                            work.push(Step::Apply(node));
+                            work.push(Step::Visit(node.child_by_field_name("operand")?));
+                        }
+                        "binary_expression"
+                            if node
+                                .child_by_field_name("operator")
+                                .is_some_and(|operator| {
+                                    matches!(operator.kind(), "+" | "-" | "*" | "/" | "%")
+                                }) =>
+                        {
+                            work.push(Step::Apply(node));
+                            work.push(Step::Visit(node.child_by_field_name("right")?));
+                            work.push(Step::Visit(node.child_by_field_name("left")?));
+                        }
+                        _ => return None,
+                    }
+                }
+                Step::Apply(node) if node.kind() == "unary_expression" => {
+                    let operand = values.pop().expect("a visited unary operand has a value");
+                    let negate = node.child_by_field_name("operator")?.kind() == "-";
+                    values.push(if negate {
+                        java_integral_negate(operand)?
+                    } else {
+                        operand
+                    });
+                }
+                Step::Apply(node) => {
+                    let right = values.pop().expect("a visited right operand has a value");
+                    let left = values.pop().expect("a visited left operand has a value");
+                    let operator = node.child_by_field_name("operator")?.kind();
+                    values.push(java_integral_binary(operator, left, right)?);
+                }
+            }
+        }
+        let value = values.pop();
+        debug_assert!(values.is_empty(), "every operand was consumed: {values:?}");
+        value
     }
 
     fn is_primitive_boolean_expression(&self, node: Node<'tree>) -> bool {
@@ -2241,6 +2617,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        if matches!(
+            node.kind(),
+            "decimal_integer_literal"
+                | "hex_integer_literal"
+                | "octal_integer_literal"
+                | "binary_integer_literal"
+                | "decimal_floating_point_literal"
+                | "hex_floating_point_literal"
+                | "character_literal"
+                | "true"
+                | "false"
+                | "null_literal"
+        ) {
+            self.session
+                .footprint_consume_subtree(node, BranchClass::Literal);
+        }
         if matches!(node.kind(), "identifier" | "this") {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
@@ -2579,6 +2971,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     named_children(node)
                 };
                 if embedded.is_empty() {
+                    if node.kind() == "string_literal" {
+                        self.session
+                            .footprint_consume_subtree(node, BranchClass::Literal);
+                    }
                     return self.edge(builder, entry, next);
                 }
                 self.derive_result_from_operands(
@@ -3545,6 +3941,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
         let body = required_field(node, "body")?;
+        if node.kind() == "try_statement" {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            for child in named_children(node) {
+                if child.kind() == "finally_clause" {
+                    self.session
+                        .footprint_register(child, BoundaryDisposition::Lowered);
+                }
+            }
+        }
         let children = named_children(node);
         let catches = children
             .iter()
@@ -3919,6 +4325,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .child_by_field_name("arguments")
             .map(named_children)
             .unwrap_or_default();
+        if node.kind() == "method_invocation" {
+            // Claim only call syntax here. Receiver and arguments must earn
+            // their own claims when their evaluation is actually lowered.
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            if let Some(name) = node.child_by_field_name("name") {
+                self.session
+                    .footprint_consume_subtree(name, BranchClass::Identifier);
+            }
+            if let Some(arguments) = node.child_by_field_name("arguments") {
+                self.session
+                    .footprint_register(arguments, BoundaryDisposition::Lowered);
+            }
+        }
         let mut argument_values =
             Vec::with_capacity(arguments.len() + usize::from(enclosing_instance.is_some()));
         argument_values.extend(
@@ -4712,6 +5132,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let mut continuations = Vec::with_capacity(values.len());
         for (index, value_node) in values.into_iter().enumerate() {
             let invoke = invokes[index];
+            // The cleanup point remains anchored to the try statement for
+            // ResourceRelease selectors. Dispatch needs the individual resource.
+            let resource = value_node
+                .parent()
+                .filter(|parent| {
+                    parent.kind() == "resource" && parent.child_by_field_name("type").is_some()
+                })
+                .unwrap_or(value_node);
+            assert!(
+                !matches!(
+                    resource.kind(),
+                    "method_invocation" | "object_creation_expression"
+                ),
+                "an implicit close anchor must not alias its initializer call"
+            );
+            let call_metadata = self.session.add_value_mapping(builder, resource)?;
             let normal = self.point(builder, node, Vec::new())?;
             let exceptional = self.point(builder, node, Vec::new())?;
             let receiver =
@@ -4733,13 +5169,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 },
             )?;
-            let call_site = self.session.add_call_site(
+            let call_site = self.session.add_call_site_at_mapping(
                 builder,
                 CallSiteScaffold {
                     point: invoke,
                     callee,
                     receiver: Some(receiver),
-                    member_selection: None,
+                    member_selection: Some(Box::new(DeferredMemberSelection {
+                        member: "close".into(),
+                        receiver_place: None,
+                        receiver_pointer_depth: None,
+                    })),
                     arguments: Box::new([]),
                     normal_results: Box::new([]),
                     result: None,
@@ -4748,6 +5188,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     normal_continuation: normal,
                     exceptional_continuation: exceptional,
                 },
+                call_metadata,
             )?;
             self.resolution_gaps(
                 builder,
@@ -4933,4 +5374,119 @@ fn ends_in_yield_or_throw(statement: Option<Node<'_>>) -> bool {
         }
     }
     true
+}
+use brokk_bifrost_semantic::analyzer::semantic::{CallControlDisposition, CallControlKind};
+use brokk_bifrost_semantic::analyzer::semantic::{FootprintExclusion, FootprintRefusal};
+
+// Generic and annotated types remain refused until their transforms are audited.
+fn java_footprint_type(node: Node<'_>) -> bool {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if !matches!(
+            node.kind(),
+            "void_type"
+                | "integral_type"
+                | "floating_point_type"
+                | "boolean_type"
+                | "type_identifier"
+                | "scoped_type_identifier"
+                | "array_type"
+                | "dimensions"
+        ) {
+            return false;
+        }
+        pending.extend(named_children(node));
+    }
+    true
+}
+
+fn java_call_control_branch(node: Node<'_>) -> (CallControlKind, CallControlDisposition) {
+    use CallControlDisposition as D;
+    use FootprintExclusion as E;
+    use FootprintRefusal as R;
+    match node.kind() {
+        "method_invocation" | "object_creation_expression" => {
+            (CallControlKind::ExplicitCall, D::Represented)
+        }
+        "return_statement" | "if_statement" | "try_statement" | "catch_clause"
+        | "finally_clause" => (CallControlKind::Control, D::Represented),
+        "method_declaration" | "constructor_declaration" | "lambda_expression" => (
+            CallControlKind::NestedCallable,
+            D::Refused(R::UnclassifiedBranch),
+        ),
+        "method_reference" => (CallControlKind::Callback, D::Refused(R::UnclassifiedBranch)),
+        "field_access" | "array_access" => (
+            CallControlKind::ImplicitAccess,
+            D::Refused(R::UnclassifiedBranch),
+        ),
+        "static_initializer" | "object_creation_expression_with_body" => (
+            CallControlKind::InitializationConversion,
+            D::Refused(R::UnclassifiedBranch),
+        ),
+        "integral_type"
+        | "floating_point_type"
+        | "boolean_type"
+        | "array_type"
+        | "dimensions"
+        | "scoped_type_identifier"
+        | "throws"
+        | "local_variable_declaration"
+        | "variable_declarator"
+        | "assignment_expression"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal"
+        | "decimal_floating_point_literal"
+        | "hex_floating_point_literal"
+        | "character_literal"
+        | "true"
+        | "false"
+        | "null_literal"
+        | "string_fragment"
+        | "escape_sequence"
+        | "this"
+        | "identifier"
+        | "type_identifier"
+        | "modifiers"
+        | "formal_parameter"
+        | "argument_list"
+        | "formal_parameters"
+        | "void_type"
+        | "block"
+        | "expression_statement"
+        | "decimal_integer_literal"
+        | "string_literal" => (
+            CallControlKind::Syntax,
+            D::AffirmativelyExcluded(E::NoInstance),
+        ),
+        _ => (CallControlKind::Syntax, D::Refused(R::UnclassifiedBranch)),
+    }
+}
+
+#[cfg(test)]
+mod java_call_control_tests {
+    use super::*;
+
+    #[test]
+    fn implicit_call_construct_cannot_be_silently_excluded() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse("class A { static { f(); } }", None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut found = false;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "static_initializer" {
+                found = true;
+                assert!(!matches!(
+                    java_call_control_branch(node).1,
+                    CallControlDisposition::AffirmativelyExcluded(_)
+                ));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(found, "grammar construct was not found");
+    }
 }

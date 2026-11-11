@@ -98,11 +98,6 @@ impl RustCargoManifestDocument {
         }
     }
 
-    /// The normalized library target name when the manifest declares one.
-    pub(crate) fn normalized_library_name(&self) -> Option<String> {
-        self.library_name().map(normalize_crate_name)
-    }
-
     /// Digest of everything in this manifest that crate topology, crate
     /// naming or dependency routes can read.
     ///
@@ -200,7 +195,7 @@ pub(crate) fn canonical_toml_digest(
     hasher.finish()
 }
 
-pub(crate) fn normalize_crate_name(name: &str) -> String {
+pub fn normalize_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
@@ -219,10 +214,6 @@ mod tests {
         assert_eq!(document.source_bytes(), source.as_ref());
         assert_eq!(document.package_name(), Some("dashed-package"));
         assert_eq!(document.library_name(), Some("dashed_lib"));
-        assert_eq!(
-            document.normalized_library_name(),
-            Some("dashed_lib".to_string())
-        );
         assert_eq!(
             document.content_oid(),
             Oid::hash_object(ObjectType::Blob, &source).unwrap()

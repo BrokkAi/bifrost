@@ -313,6 +313,8 @@ mod jvm_extraction_tests {
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::shared_blob(2);
         let writer = fixture.store.conn.lock().unwrap();
         let connection = &*writer;
+        let _fixture =
+            brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(connection);
         prepare_pin_context(connection);
         // Populate both ordinary authorities and stage namespaces with the same
         // digests. Shared requests must never pick the matching ordinary local ID.

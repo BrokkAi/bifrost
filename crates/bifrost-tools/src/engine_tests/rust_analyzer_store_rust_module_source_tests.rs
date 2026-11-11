@@ -49,7 +49,7 @@ other! { }
             .file("src/lib.rs", MODULE_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let source_facts = state
             .source_facts
             .as_ref()
@@ -79,7 +79,7 @@ other! { }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("canonical module fixture publishes");
@@ -489,7 +489,7 @@ other! { }
             store
                 .write_parsed_blob(
                     &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                    &RustAdapter,
+                    &RustAdapter::for_tests(),
                     &invalid
                 )
                 .is_err(),
@@ -529,7 +529,7 @@ broken! { mod malformed_module; let = ; }
 "#;
         let fixture = InlineTestProject::new().file("src/lib.rs", source).build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let source_facts = state
             .source_facts
             .as_ref()
@@ -628,7 +628,7 @@ broken! { mod malformed_module; let = ; }
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .expect("raw module source facts publish");

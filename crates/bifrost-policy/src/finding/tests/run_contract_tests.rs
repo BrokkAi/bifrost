@@ -5,6 +5,7 @@ use crate::finding_identity::{AnalysisEventRef, AnalysisFindingId, OpaqueFinding
 use crate::future_evidence::{
     FlowFindingEvidence, TaintFindingAnchor, TaintFindingEvidence, TaintProjectionFactsHash,
 };
+use brokk_bifrost_test_macros::hardwon;
 
 #[test]
 fn empty_run_admits_exact_finding_limit() {
@@ -33,6 +34,57 @@ fn detached_findings_are_no_longer_retained_by_run() {
     let detached = run.take_findings();
     assert_eq!(detached.len(), 1);
     assert_eq!(run.work().retained_findings(), 0);
+}
+
+#[test]
+#[hardwon("#10985: attribution retention truncation reconciles subject finding joins")]
+fn replaced_findings_are_reconciled_with_subject_verdicts() {
+    let loaded = loaded_match_policy();
+    let finding = finding_with(
+        &loaded,
+        match_evidence(),
+        Vec::new(),
+        None,
+        &PolicyBudget::default(),
+    )
+    .unwrap();
+    let finding_id = finding.id();
+    let mut run = run_at(PolicyRunCompletion::Complete);
+    run.replace_findings(vec![finding]);
+    let subjects = PolicySubjectVerdicts::new(
+        vec![SubjectSelectorEnumeration {
+            selector: "src".to_owned(),
+            enumeration: SubjectEnumeration::Certified,
+        }],
+        vec![PolicySubjectVerdict {
+            selector: "src".to_owned(),
+            location: crate::test_support::policy_test_location("src/app.rs", 1, 2, 1),
+            verdict: SubjectVerdict::Selected {
+                bindings: 1,
+                findings: vec![finding_id],
+                further_findings_absent: FurtherFindingsAbsent::Complete,
+                finding_location_bound: None,
+            },
+        }],
+    );
+    run = run
+        .with_subjects(subjects, &PolicyBudget::default())
+        .unwrap();
+
+    run.replace_findings(Vec::new());
+    run.reconcile_subject_findings(&PolicyBudget::default())
+        .unwrap();
+
+    assert_eq!(run.validate_subjects(), Ok(()));
+    assert!(matches!(
+        &run.subjects().unwrap().entries[0].verdict,
+        SubjectVerdict::Selected {
+            findings,
+            further_findings_absent: FurtherFindingsAbsent::Partial { reasons },
+            finding_location_bound: Some(FindingLocationBound::Unbounded),
+            ..
+        } if findings.is_empty() && reasons == &["findings_truncated"]
+    ));
 }
 
 #[test]

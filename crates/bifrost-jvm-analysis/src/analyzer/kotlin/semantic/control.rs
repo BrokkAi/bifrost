@@ -68,7 +68,13 @@ pub(in crate::analyzer::kotlin::semantic) fn lower_procedure<'tree, 'targets>(
         procedure_targets,
         cleanups: Vec::new(),
     };
-    context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.emit_procedure_inputs(
+        &mut builder,
+        entry,
+        spec.callable,
+        spec.kind,
+        spec.properties,
+    )?;
     context.bind_receiver_carrier(spec.callable);
     context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body.scan_root())?;
@@ -2345,6 +2351,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(member) = navigation_member(node) else {
             return self.opaque_operation(builder, node, entry, next, scope, stack);
         };
+        // A property read applies a Java getter when its member resolves to
+        // one (`zis.nextEntry` calls `getNextEntry()`), which only dispatch
+        // can decide. It lowers as a bound-method call site whose dispatch
+        // resolves the member. A Kotlin property or Java field it resolves to
+        // instead stays as open there as the occurrence-anchored, identity-gapped
+        // field load this replaces. Reading a value class's underlying
+        // property is a projection the file proves, not a member read.
+        if brokk_bifrost_jvm::kotlin::syntax::kotlin_property_read_member(node).is_some()
+            && self.underlying_projection(receiver, member).is_none()
+        {
+            return if is_safe_navigation(node) {
+                self.safe_call(builder, node, node, entry, next, scope, stack)
+            } else {
+                self.call(builder, node, entry, next, scope, false, stack)
+            };
+        }
         if is_safe_navigation(node) {
             let gate = self.null_gate(builder, node, next)?;
             let access = self.property_load(
@@ -2502,7 +2524,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
-        let callee_node = kotlin_callee(node);
+        // A property-read call (see `navigation`) is its own callee.
+        let callee_node = if node.kind() == "navigation_expression" {
+            Some(node)
+        } else {
+            kotlin_callee(node)
+        };
         let receiver_node = callee_node
             .filter(|callee| callee.kind() == "navigation_expression")
             .and_then(kotlin_navigation_receiver);
@@ -2575,7 +2602,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         );
         // Bind the value-class construction facts before the call site takes
         // ownership of the argument list.
-        let construction = self.construction_proof(node);
+        let construction = if node.kind() == "navigation_expression" {
+            KotlinConstructionProof::Unrelated
+        } else {
+            self.construction_proof(node)
+        };
         let underlying = match construction {
             KotlinConstructionProof::Proven { index, .. } => {
                 argument_values.get(index).map(|argument| argument.value)

@@ -440,9 +440,17 @@ fn find_direct_importers_with_cancellation(
                 ImportReachability::DoesNotReach => return Ok(()),
                 ImportReachability::Unknown => {}
             }
-            let imported = import_provider
-                .imported_code_units_from_infos(candidate, &imports)
-                .unwrap_or_else(|| import_provider.imported_code_units_of(candidate));
+            let imported_from_infos =
+                import_provider.imported_code_units_from_infos(candidate, &imports);
+            let imported_from_provider = if imported_from_infos.is_none() {
+                Some(import_provider.imported_code_units_of(candidate))
+            } else {
+                None
+            };
+            let imported: &HashSet<CodeUnit> = imported_from_infos
+                .as_deref()
+                .or_else(|| imported_from_provider.as_deref().map(|units| &**units))
+                .expect("one import source is present");
             if cancellation.is_cancelled() {
                 return Err(());
             }
@@ -977,8 +985,13 @@ pub mod tests {
 
     #[cfg(test)]
     impl ImportAnalysisProvider for FileEdgeProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            Arc::new(HashSet::default())
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> { HashSet::default() },
+            )
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -997,8 +1010,15 @@ pub mod tests {
 
     #[cfg(test)]
     impl ImportAnalysisProvider for BatchedImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            panic!("batched importer discovery must not hydrate individual import states");
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> {
+                    panic!("batched importer discovery must not hydrate individual import states");
+                },
+            )
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -1034,10 +1054,17 @@ pub mod tests {
 
     #[cfg(test)]
     impl ImportAnalysisProvider for CancellingImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            self.cancellation.cancel();
-            Arc::new([self.imported.clone()].into_iter().collect())
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> {
+                    self.calls.fetch_add(1, Ordering::AcqRel);
+                    self.cancellation.cancel();
+                    [self.imported.clone()].into_iter().collect()
+                },
+            )
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -1109,8 +1136,13 @@ pub mod tests {
 
     #[cfg(test)]
     impl ImportAnalysisProvider for PrefetchingImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            Arc::new(HashSet::default())
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> { HashSet::default() },
+            )
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {

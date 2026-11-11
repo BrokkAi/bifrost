@@ -62,7 +62,7 @@ impl CompositionReads for SelectedDecodedReads<'_> {
             .collect())
     }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(resolve_records(self.all_types_named(name)?).records)
+        Ok(resolve_records(FamilyRows::complete(self.all_types_named(name)?)).records)
     }
     fn all_member_records_with_id(
         &self,

@@ -91,7 +91,8 @@ pub(crate) fn compose_taint_policy(
                 value_type: entry.value_type,
                 origins: vec![EndpointOrigin::PolicyLocal {
                     path: PolicyDependencyPath::new(format!(
-                        "/analysis/barriers/entries/{}",
+                        "/analysis/{}/entries/{}",
+                        segments.barriers,
                         json_pointer_segment(entry.id.as_str())
                     ))
                     .map_err(|error| CompositionError::LoadedModel(error.to_string()))?,
@@ -1093,6 +1094,7 @@ mod tests {
             store_reads: vec![],
             store_include_files: vec![],
             finding_combinations: vec![],
+            without_flow: None,
         };
         let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());
         let composed = compose_taint_policy(
@@ -1193,6 +1195,7 @@ mod tests {
             store_reads: vec![],
             store_include_files: vec![],
             finding_combinations: vec![],
+            without_flow: None,
         };
 
         let composed = compose_taint_policy(
@@ -1266,6 +1269,7 @@ mod tests {
             store_reads: vec![],
             store_include_files: vec![],
             finding_combinations: combinations,
+            without_flow: None,
         };
         let catalogs = TaintCatalogRegistry::new_without_workspace(Default::default());
 

@@ -1,29 +1,19 @@
 use crate::analyzer::python::*;
+use brokk_bifrost_analysis::analyzer::semantic_model::python_runtime_bases::{
+    MAX_PYTHON_HIERARCHY_VISITS, PythonRuntimeClaimBudget, retain_open_claims,
+    runtime_base_claim_declared, runtime_bases,
+};
 use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 
 use brokk_bifrost_semantic::analyzer::semantic::type_flow::ClassIdentity;
 
 use brokk_bifrost_semantic::analyzer::semantic::type_flow::ExternalClassCache;
 
-use brokk_bifrost_analysis::analyzer::semantic::type_flow::external_class_identity_with_visits;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActivatedSemanticModelRecord;
-
 use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelShard;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ActiveSemanticModelSnapshot;
 
-use brokk_bifrost_analysis::analyzer::semantic_model::runtime::ResolvedActiveSemanticModels;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
-
 use brokk_bifrost_analysis::analyzer::semantic_model::TypeFact;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::TypeKind;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::TypeRef;
-
-use brokk_bifrost_analysis::analyzer::semantic_model::overlay::activated_type_provenance;
 
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 
@@ -49,8 +39,6 @@ use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonHier
 
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonHierarchyReason;
 
-use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonModeledClassIdentity;
-
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonMroMember;
 
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonMroMembersAnswer;
@@ -58,8 +46,6 @@ use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonMroM
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonOverrideAnswer;
 
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonOverrideOutcome;
-
-use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonRuntimeBaseClaim;
 
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET;
 
@@ -81,7 +67,6 @@ use brokk_bifrost_python::graph_support::resolve_base_class;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-const MAX_PYTHON_HIERARCHY_VISITS: usize = 4096;
 const MAX_PYTHON_C3_WORK: usize = 65_536;
 const MAX_PYTHON_MEMBER_VISITS: usize = 32_768;
 const PYTHON_OBJECT_ROOT: &str = "builtins.object";
@@ -111,6 +96,18 @@ struct HierarchyBudget<'a> {
     retained_claims: HashSet<(*const ActiveSemanticModelShard, *const TypeFact)>,
 }
 
+impl PythonRuntimeClaimBudget for HierarchyBudget<'_> {
+    fn charge(&mut self, visits: usize, work: usize) -> Result<(), PythonHierarchyReason> {
+        HierarchyBudget::charge(self, visits, work)
+    }
+    fn has_claim(&self, key: (*const ActiveSemanticModelShard, *const TypeFact)) -> bool {
+        self.retained_claims.contains(&key)
+    }
+    fn mark_claim(&mut self, key: (*const ActiveSemanticModelShard, *const TypeFact)) {
+        self.retained_claims.insert(key);
+    }
+}
+
 impl HierarchyBudget<'_> {
     fn charge(&mut self, visits: usize, work: usize) -> Result<(), PythonHierarchyReason> {
         if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
@@ -133,338 +130,9 @@ fn session_reason(session: &ResolutionSession) -> PythonHierarchyReason {
     match session.finish(()) {
         BoundedResolution::Cancelled { .. } => PythonHierarchyReason::Cancelled,
         BoundedResolution::Exceeded { .. } => PythonHierarchyReason::VisitLimit,
+        BoundedResolution::Unavailable { .. } => PythonHierarchyReason::UnknownMemberSurface,
         BoundedResolution::Complete { .. } => unreachable!("failed charge has a sticky stop"),
     }
-}
-
-fn modeled_identity(identity: &ClassIdentity) -> PythonModeledClassIdentity {
-    let ClassIdentity::External {
-        qualified_name,
-        symbol_id,
-    } = identity
-    else {
-        unreachable!("runtime model claims refer to external class identities")
-    };
-    PythonModeledClassIdentity {
-        qualified_name: qualified_name.to_string(),
-        symbol_id: symbol_id.to_string(),
-    }
-}
-
-fn retain_claim(
-    active: &ResolvedActiveSemanticModels,
-    activated: &ActivatedSemanticModelRecord<TypeFact>,
-    overlay: Option<&SemanticModelOverlay>,
-    basis: &mut PythonAncestryBasis,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<Option<usize>, PythonHierarchyReason> {
-    let Some(declared) = &activated.record.runtime_bases else {
-        return Ok(None);
-    };
-    // Addresses are only query-local deduplication keys, never public identity.
-    let key = (
-        std::sync::Arc::as_ptr(&activated.shard),
-        std::sync::Arc::as_ptr(&activated.record),
-    );
-    if budget.retained_claims.contains(&key) {
-        return Ok(None);
-    }
-    budget.charge(declared.len(), declared.len().saturating_add(1))?;
-    let mut ambiguous = false;
-    if let Some(overlay) = overlay {
-        for symbol in overlay.symbol_candidates_with_id(&activated.record.id) {
-            budget.charge(1, 1)?;
-            ambiguous |= symbol.provenance.ambiguous;
-        }
-    }
-    let provenance = activated_type_provenance(
-        active,
-        &activated.shard,
-        &activated.record,
-        ambiguous,
-        &mut || budget.charge(1, 1),
-    )?;
-    budget.retained_claims.insert(key);
-    let index = basis.claims.len();
-    basis.claims.push(PythonRuntimeBaseClaim {
-        declared_class: PythonModeledClassIdentity {
-            qualified_name: activated.record.name.clone(),
-            symbol_id: activated.record.id.clone(),
-        },
-        class: None,
-        declared_bases: declared.clone(),
-        bases: vec![None; declared.len()],
-        provenance,
-    });
-    Ok(Some(index))
-}
-
-type RetainedRuntimeClaim = (ActivatedSemanticModelRecord<TypeFact>, usize);
-
-struct CollectedRuntimeClaims {
-    records: Vec<RetainedRuntimeClaim>,
-    // A previously retained posting still declares a claim. Dedupe is not absence.
-    declared: bool,
-}
-
-/// Collect raw records for selected IDs, retaining lower-ranked same-ID owner
-/// conflicts. Presence is independent of whether a posting was already retained.
-fn collect_claim_ids(
-    active: &ResolvedActiveSemanticModels,
-    ids: &[String],
-    overlay: Option<&SemanticModelOverlay>,
-    basis: &mut PythonAncestryBasis,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<CollectedRuntimeClaims, PythonHierarchyReason> {
-    let mut records = Vec::new();
-    let mut declared = false;
-    for id in ids {
-        for activated in active.all_type_records_with_id(id) {
-            budget.charge(1, 1)?;
-            if activated.shard.manifest.language == "python" {
-                declared |= activated.record.runtime_bases.is_some();
-                if let Some(index) = retain_claim(active, &activated, overlay, basis, budget)? {
-                    records.push((activated, index));
-                }
-            }
-        }
-    }
-    Ok(CollectedRuntimeClaims { records, declared })
-}
-
-fn runtime_claim_owner_ids(
-    active: &ResolvedActiveSemanticModels,
-    qualified_name: &str,
-    symbol_id: &str,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<Vec<String>, PythonHierarchyReason> {
-    budget.charge(1, 1)?;
-    let mut ids = vec![symbol_id.to_owned()];
-    let mut seen_ids = HashSet::default();
-    seen_ids.insert(symbol_id.to_owned());
-    for activated in active.all_type_records_named(qualified_name) {
-        budget.charge(1, 1)?;
-        if activated.shard.manifest.language == "python"
-            && activated.record.name == qualified_name
-            && seen_ids.insert(activated.record.id.clone())
-        {
-            ids.push(activated.record.id.clone());
-        }
-    }
-    Ok(ids)
-}
-
-fn collect_runtime_claims<'a>(
-    active: &'a ResolvedActiveSemanticModels,
-    owner: &'a ClassIdentity,
-    overlay: Option<&SemanticModelOverlay>,
-    basis: &mut PythonAncestryBasis,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<CollectedRuntimeClaims, PythonHierarchyReason> {
-    let ClassIdentity::External {
-        qualified_name,
-        symbol_id,
-    } = owner
-    else {
-        unreachable!("only external classes have runtime model claims")
-    };
-    let ids = runtime_claim_owner_ids(active, qualified_name, symbol_id, budget)?;
-    collect_claim_ids(active, &ids, overlay, basis, budget)
-}
-
-/// Unresolved names have no established canonical owner. Preserve their
-/// possible claim evidence conservatively, separately from admitted owners.
-fn retain_open_claims(
-    active: &ResolvedActiveSemanticModels,
-    name: &str,
-    overlay: Option<&SemanticModelOverlay>,
-    basis: &mut PythonAncestryBasis,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<bool, PythonHierarchyReason> {
-    let mut ids = Vec::new();
-    let mut seen_ids = HashSet::default();
-    for activated in active.all_type_records_named(name) {
-        budget.charge(1, 1)?;
-        if activated.shard.manifest.language == "python"
-            && seen_ids.insert(activated.record.id.clone())
-        {
-            ids.push(activated.record.id.clone());
-        }
-    }
-    Ok(collect_claim_ids(active, &ids, overlay, basis, budget)?.declared)
-}
-
-fn runtime_claim_target(
-    overlay: Option<&SemanticModelOverlay>,
-    reference: &TypeRef,
-    cache: &mut ExternalClassCache,
-    budget: &mut HierarchyBudget<'_>,
-    unresolved: &mut Vec<TypeRef>,
-) -> Result<ClassIdentity, PythonHierarchyReason> {
-    let target = match reference {
-        TypeRef::Named {
-            name,
-            arguments,
-            nullable: false,
-        } if arguments.is_empty() => {
-            let target = crate::analyzer::python::type_flow::exact_external_class_name_with_visits(
-                overlay,
-                name,
-                cache,
-                &mut || budget.charge(1, 1),
-            )?;
-            if target.is_none() {
-                budget.charge(1, 1)?;
-                unresolved.push(reference.clone());
-            }
-            target
-        }
-        TypeRef::Declared {
-            id,
-            arguments,
-            nullable: false,
-        } if arguments.is_empty() => {
-            // ID resolution uses the same canonical class selection and rank
-            // boundary as name resolution, not a preferred raw claim.
-            let target = external_class_identity_with_visits(
-                overlay,
-                Language::Python,
-                "",
-                Some(id),
-                cache,
-                &mut || budget.charge(1, 1),
-            )?;
-            if target.is_none() {
-                budget.charge(1, 1)?;
-                unresolved.push(reference.clone());
-            }
-            target
-        }
-        _ => return Err(PythonHierarchyReason::UnsupportedBaseExpression),
-    };
-    target.ok_or(PythonHierarchyReason::UnresolvedBase)
-}
-
-fn runtime_bases(
-    active: &ResolvedActiveSemanticModels,
-    overlay: Option<&SemanticModelOverlay>,
-    identity: &ClassIdentity,
-    basis: &mut PythonAncestryBasis,
-    cache: &mut ExternalClassCache,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<Vec<ClassIdentity>, PythonHierarchyReason> {
-    // None abstains; every explicit raw contributor, including lower-ranked
-    // owners that cannot bind, is collected before admission checks.
-    let records = collect_runtime_claims(active, identity, overlay, basis, budget)?.records;
-    if records.is_empty() {
-        return Err(PythonHierarchyReason::MissingRuntimeBases);
-    }
-    let mut failure = None;
-    // Retain all contributors before checking their declaration admission.
-    for (activated, index) in &records {
-        let admitted =
-            active.type_declaration_admitted(&activated.record, &mut || budget.charge(1, 1))?;
-        let canonical = external_class_identity_with_visits(
-            overlay,
-            Language::Python,
-            &activated.record.name,
-            Some(&activated.record.id),
-            cache,
-            &mut || budget.charge(1, 1),
-        )?;
-        if activated.record.type_kind != TypeKind::Class
-            || !admitted
-            || canonical.as_ref() != Some(identity)
-        {
-            failure.get_or_insert(PythonHierarchyReason::AmbiguousRuntimeBase);
-        } else {
-            basis.claims[*index].class = canonical.as_ref().map(modeled_identity);
-        }
-    }
-    let mut agreed = None;
-    let mut unresolved = Vec::new();
-    for (_, index) in records {
-        let claim = &mut basis.claims[index];
-        let mut resolved = Vec::new();
-        let mut seen = HashSet::default();
-        for (slot, reference) in claim.declared_bases.iter().enumerate() {
-            budget.charge(0, 1)?;
-            match runtime_claim_target(overlay, reference, cache, budget, &mut unresolved) {
-                Ok(target) => {
-                    claim.bases[slot] = Some(modeled_identity(&target));
-                    if !seen.insert(target.clone()) {
-                        failure.get_or_insert(PythonHierarchyReason::DuplicateBase);
-                    }
-                    resolved.push(target);
-                }
-                Err(
-                    reason @ (PythonHierarchyReason::Cancelled | PythonHierarchyReason::VisitLimit),
-                ) => return Err(reason),
-                Err(reason) => {
-                    failure.get_or_insert(reason);
-                }
-            }
-        }
-        if resolved.len() == claim.declared_bases.len() {
-            match &agreed {
-                Some(previous) if *previous != resolved => {
-                    failure.get_or_insert(PythonHierarchyReason::ConflictingRuntimeBases);
-                }
-                None => agreed = Some(resolved),
-                _ => {}
-            }
-        }
-    }
-    for reference in unresolved {
-        match reference {
-            TypeRef::Named { name, .. } => {
-                retain_open_claims(active, &name, overlay, basis, budget)?;
-            }
-            TypeRef::Declared { id, .. } => {
-                for activated in active.all_type_records_with_id(&id) {
-                    budget.charge(1, 1)?;
-                    if activated.shard.manifest.language == "python" {
-                        let _retained_index =
-                            retain_claim(active, &activated, overlay, basis, budget)?;
-                    }
-                }
-            }
-            _ => unreachable!("only supported unresolved class references are queued"),
-        }
-    }
-    match failure {
-        Some(reason) => Err(reason),
-        None => Ok(agreed.expect("all claims resolved, including empty roots")),
-    }
-}
-
-/// Whether the active model claims runtime bases for this external identity.
-///
-/// An implicit object root may use the language-intrinsic endpoint only in
-/// the absence of claims. Presence does not establish admission or agreement;
-/// runtime_bases still adjudicates every contributor to the selected owner IDs.
-fn runtime_base_claim_declared(
-    active: &ResolvedActiveSemanticModels,
-    identity: &ClassIdentity,
-    budget: &mut HierarchyBudget<'_>,
-) -> Result<bool, PythonHierarchyReason> {
-    let ClassIdentity::External {
-        qualified_name,
-        symbol_id,
-    } = identity
-    else {
-        return Ok(false);
-    };
-    let ids = runtime_claim_owner_ids(active, qualified_name, symbol_id, budget)?;
-    let mut declared = false;
-    for id in ids {
-        for activated in active.all_type_records_with_id(&id) {
-            budget.charge(1, 1)?;
-            declared |= activated.shard.manifest.language == "python"
-                && activated.record.runtime_bases.is_some();
-        }
-    }
-    Ok(declared)
 }
 
 impl PythonClassHierarchyProvider for PythonAnalyzer {
@@ -580,6 +248,9 @@ impl PythonClassHierarchyProvider for PythonAnalyzer {
         let result = match session.finish(result) {
             BoundedResolution::Complete { value, .. } => value,
             BoundedResolution::Exceeded { .. } => Err(PythonHierarchyReason::VisitLimit),
+            BoundedResolution::Unavailable { .. } => {
+                Err(PythonHierarchyReason::UnknownMemberSurface)
+            }
             BoundedResolution::Cancelled { .. } => Err(PythonHierarchyReason::Cancelled),
         };
         match result {
@@ -918,20 +589,45 @@ impl PythonAnalyzer {
                         }
                     }
                 };
+                // An imported class from a module outside the workspace that
+                // no active model covers is an unknown external endpoint, not
+                // a base we failed to infer (#10433).
+                let (resolution, failure) = if target.is_some() {
+                    (
+                        PythonBaseResolution::Resolved,
+                        PythonHierarchyReason::UnresolvedBase,
+                    )
+                } else if crate::analyzer::usages::get_definition::python::python_base_imported_from_external_module_bounded(
+                    support,
+                    scope.token(),
+                    owner.source(),
+                    prepared.source(),
+                    prepared.tree().root_node(),
+                    expression,
+                )
+                // A stopped walk proves nothing; the failed answer stands.
+                .unwrap_or(false)
+                {
+                    (
+                        PythonBaseResolution::External,
+                        PythonHierarchyReason::ExternalBase,
+                    )
+                } else {
+                    (
+                        PythonBaseResolution::Unresolved,
+                        PythonHierarchyReason::UnresolvedBase,
+                    )
+                };
                 if let Some(facts) = &mut root_facts {
                     facts.push(PythonBaseFact {
                         origin: PythonBaseOrigin::Source,
                         ordinal,
                         spelling: raw,
-                        resolution: if target.is_some() {
-                            PythonBaseResolution::Resolved
-                        } else {
-                            PythonBaseResolution::Unresolved
-                        },
+                        resolution,
                         target: target.clone(),
                     });
                 }
-                bases.push(target.ok_or(PythonHierarchyReason::UnresolvedBase)?);
+                bases.push(target.ok_or(failure)?);
             }
         }
         if !self.indexed_source_matches(owner.source(), prepared.source()) {

@@ -85,7 +85,7 @@ impl TypeFlowReport {
     /// witness from an earlier root.
     pub fn merge_root(&mut self, result: TypeFlowRootResult) {
         self.roots_analyzed += 1;
-        if !result.complete {
+        if !result.complete() {
             self.roots_incomplete += 1;
         }
         self.solver_budget_exhaustions

@@ -3,7 +3,7 @@ title: C#
 description: Query C# null-conditional calls, named arguments, attributes, and using aliases with query_code.
 ---
 
-> Last verified end to end: 2026-10-27 (`query_code` schema version 1).
+> Last verified end to end: 2026-11-06 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
@@ -40,6 +40,74 @@ class AppEntry {
         service?.Run("optional");
     }
 }
+```
+
+<!-- code-query-fixture:csharp/Initializer.cs -->
+```csharp
+class HttpCookie { public bool Secure; }
+class CookieBuilder {
+    HttpCookie Build() => new HttpCookie { Secure = true };
+}
+```
+
+## Object initializer assignments
+
+An object member initializer remains an `assignment` fact. Its `initializer_of`
+role selects the creating `call`, so an existing assignment pattern still sees
+`Secure = true` and can opt into initializer provenance.
+
+<!-- code-query-case:member-initializer:rql -->
+```lisp
+(language csharp
+  (assignment :text/regex "^Secure = true$" :initializer_of (call)))
+```
+
+<!-- code-query-case:member-initializer:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"assignment","text":{"regex":"^Secure = true$"},"initializer_of":{"kind":"call"}}}
+```
+
+<!-- code-query-case:member-initializer:expected -->
+```json
+{"results":[{"enclosing_symbol":"CookieBuilder.Build","end_line":3,"kind":"assignment","language":"csharp","path":"csharp/Initializer.cs","result_type":"structural_match","start_line":3,"text":"Secure = true"}],"truncated":false}
+```
+
+## Direct parameters and members
+
+`:parameters` selects written formal parameters directly owned by a callable. A
+list that Bifrost cannot fully represent makes absence-dependent answers incomplete.
+
+<!-- code-query-case:method-parameter:rql -->
+```lisp
+(language csharp (method :name "Run" :parameters [(parameter :name "code")]))
+```
+
+<!-- code-query-case:method-parameter:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"method","name":"Run","parameters":[{"kind":"parameter","name":"code"}]}}
+```
+
+<!-- code-query-case:method-parameter:expected -->
+```json
+{"results":[{"enclosing_symbol":"App.Service.Run","end_line":15,"kind":"method","language":"csharp","path":"csharp/App.cs","result_type":"structural_match","start_line":12,"text":"public string Run(string code) {…"}],"truncated":false}
+```
+
+`:members` selects source-declared direct members of a type, excluding inherited
+members. An incomplete member list makes absence-dependent answers incomplete.
+
+<!-- code-query-case:direct-member:rql -->
+```lisp
+(language csharp (class :name "Service" :members [(method :name "Run")]))
+```
+
+<!-- code-query-case:direct-member:json -->
+```json
+{"languages":["csharp"],"match":{"kind":"class","name":"Service","members":[{"kind":"method","name":"Run"}]}}
+```
+
+<!-- code-query-case:direct-member:expected -->
+```json
+{"results":[{"enclosing_symbol":"App.Service","end_line":18,"kind":"class","language":"csharp","path":"csharp/App.cs","result_type":"structural_match","start_line":7,"text":"[Route(\"/run\")]…"}],"truncated":false}
 ```
 
 ## Null-conditional and named calls
@@ -476,6 +544,7 @@ case-insensitive decoded values with numeric bounds on one XML attribute.
   "results": [
     {
       "completeness": "complete",
+      "directory": "csharp",
       "end_byte": 64,
       "fact_id": "<public-id>",
       "fact_provenance": "authored",
@@ -672,6 +741,8 @@ call-site row carries its receiver and argument binding identities.
         }
       ],
       "call_kind": "function",
+      "completeness": "complete",
+      "coverage": "exhaustive",
       "callee": {
         "end_line": 23,
         "fq_name": "Parity.Consume",

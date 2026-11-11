@@ -540,7 +540,12 @@ pub fn verify_extension_bundle(
                 }
             }
         }
-        let actual = StableDigest::parse(format!("{:x}", hasher.finalize())).expect("sha256");
+        let actual = StableDigest::parse(
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &hasher.finalize().into(),
+            ),
+        )
+        .expect("sha256");
         if len != c.byte_length || actual != c.content_sha256 {
             errors.push(ManifestError::new(
                 c.path.as_str(),

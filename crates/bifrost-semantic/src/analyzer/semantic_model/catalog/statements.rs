@@ -24,13 +24,14 @@ SELECT m.* FROM ids CROSS JOIN active_catalog_declaration_members m ON m.record_
 pub const SEARCH_OWNER_QUALIFICATIONS: &str = r#"WITH ids AS MATERIALIZED (
  SELECT DISTINCT CAST(value AS TEXT) AS id FROM json_each(:ids)
 ), selected AS MATERIALIZED (
- SELECT t.record_id,
+ SELECT t.source_db,t.shard_key,t.record_key,t.record_id,n.language,
         COALESCE(json_type(t.record_json,'$.guard') <> 'null',0) AS guarded,
         json_extract(t.record_json,'$.name') AS owner_name
  FROM ids CROSS JOIN active_catalog_declaration_types t ON t.record_id=ids.id
+ JOIN active_catalog_declaration_names n USING(source_db,shard_key,record_key)
+ WHERE n.identity_name=1
 )
-SELECT record_id AS owner_id,COUNT(*) AS record_count,MAX(guarded) AS guarded,
-       MIN(owner_name) AS owner_name FROM selected GROUP BY record_id;"#;
+SELECT * FROM selected;"#;
 
 pub const TYPES_BY_IDENTITY_NAME: &str = r#"SELECT t.* FROM active_catalog_declaration_names AS n
 JOIN active_catalog_declaration_types AS t
@@ -267,6 +268,12 @@ pub const SEARCH_TYPES: &str = r#"SELECT n.source_db,n.shard_key,n.record_key,n.
 FROM active_catalog_declaration_names AS n
 JOIN active_catalog_declaration_types AS t USING(source_db,shard_key,record_key);"#;
 
+/// Search composition reads only scalar type identity, not the JSON payload.
+pub const SEARCH_TYPE_IDENTITIES: &str = r#"SELECT n.source_db,n.shard_key,n.record_key,n.manifest_digest,
+       n.name AS spelling,n.language,n.namespace,n.identity_name,t.record_id
+FROM active_catalog_declaration_names AS n
+JOIN active_catalog_declaration_types AS t USING(source_db,shard_key,record_key);"#;
+
 pub const SEARCH_MEMBERS: &str = r#"SELECT m.source_db,m.shard_key,m.record_key,m.manifest_digest,m.shard_id,
        m.name AS spelling,m.record_id,m.record_json
 FROM active_catalog_declaration_members AS m;"#;
@@ -298,8 +305,7 @@ FROM active_catalog_declaration_names AS n
 JOIN active_catalog_declaration_types AS t USING(source_db,shard_key,record_key)
 WHERE n.name LIKE :prefilter ESCAPE '\';"#;
 
-pub const RELATION_ORIGINS: &str =
-    "SELECT DISTINCT r.from_id FROM active_catalog_declaration_relations r ORDER BY r.from_id";
+pub const RELATION_ORIGINS: &str = "SELECT r.from_id FROM active_catalog_declaration_relations r";
 
 pub const ALL_RELATIONS: &str = r#"SELECT r.* FROM active_catalog_declaration_relations AS r;"#;
 
@@ -343,13 +349,13 @@ WITH owner_names AS MATERIALIZED (
  JOIN active_catalog_declaration_members m
    ON m.source_db=a.source_db AND m.shard_key=a.shard_key AND m.record_key=a.member_key
 ), candidates AS (
- SELECT t.source_db,t.shard_key,t.record_key,t.record_id,NULL AS owner_id,n.language AS language,
+ SELECT t.source_db,t.shard_key,t.record_key,'type' AS row_kind,t.record_id,NULL AS owner_id,n.language AS language,
         json_extract(t.record_json,'$.name') AS qualified_name,
         n.name AS spelling,json_extract(t.record_json,'$.name') AS record_name
  FROM active_catalog_declaration_types t JOIN active_catalog_declaration_names n
  USING(source_db,shard_key,record_key)
  UNION ALL
- SELECT m.source_db,m.shard_key,m.record_key,m.record_id,m.owner_id,m.language,
+ SELECT m.source_db,m.shard_key,m.record_key,'member' AS row_kind,m.record_id,m.owner_id,m.language,
         COALESCE(o.name,m.owner_id)||'.'||m.name,
         m.spelling,m.name AS record_name
  FROM member_names m LEFT JOIN owner_names o
@@ -359,7 +365,7 @@ SELECT c.*,json_extract(s.value,'$.digest') AS pack_digest
 FROM candidates c JOIN json_each(:shards) s
   ON json_extract(s.value,'$.source_db')=c.source_db
  AND json_extract(s.value,'$.shard_key')=c.shard_key
-ORDER BY c.qualified_name,c.record_id,pack_digest;
+;
 "#;
 
 pub const ALL_TYPES: &str = "SELECT r.* FROM active_catalog_declaration_types r";
@@ -523,7 +529,7 @@ CROSS JOIN temp.active_shards active
 CROSS JOIN main.catalog_assembly_identities i
   ON i.manifest_digest=f.manifest_digest AND i.shard_id=f.shard_id
 WHERE f.namespace >= :ns AND f.namespace < :ns_upper AND s.index_version=4
-UNION
+UNION ALL
 SELECT i.name,f.target_name
 FROM session.catalog_type_forwards f INDEXED BY catalog_type_forwards_namespace
 CROSS JOIN session.catalog_semantic_rows_indexed_shards s
@@ -533,17 +539,9 @@ CROSS JOIN temp.active_shards active
 CROSS JOIN session.catalog_assembly_identities i
   ON i.manifest_digest=f.manifest_digest AND i.shard_id=f.shard_id
 WHERE f.namespace >= :ns AND f.namespace < :ns_upper AND s.index_version=4
-ORDER BY 1,2;"#;
+;"#;
 
 /// A complete miss needs the same forwarding assemblies as the retained index,
 /// not merely an activated reader that happens to contain other providers.
-pub const TYPE_FORWARD_SOURCES_COMPLETE: &str = r#"SELECT NOT EXISTS (
-  SELECT 1 FROM json_each(:identities) p
-  WHERE NOT EXISTS (
-    SELECT 1 FROM active_catalog_assembly_identities a
-    WHERE a.name=json_extract(p.value,'$.name')
-      AND a.version=json_extract(p.value,'$.version')
-      AND a.culture IS json_extract(p.value,'$.culture')
-      AND a.public_key_token IS json_extract(p.value,'$.public_key_token')
-  )
-);"#;
+pub const TYPE_FORWARD_SOURCES_COMPLETE: &str = r#"SELECT a.name,a.version,a.culture,a.public_key_token
+FROM active_catalog_assembly_identities a;"#;

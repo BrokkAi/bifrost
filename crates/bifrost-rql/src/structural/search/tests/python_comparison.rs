@@ -739,3 +739,55 @@ fn identical_expression_filter_reports_unresolved_binding_identity() {
     );
     assert!(result.result.results.is_empty());
 }
+
+#[test]
+#[hardwon(
+    "#10229: round 7 found anchored rows amplified rendered captures without a response bound"
+)]
+fn anchored_rendered_captures_obey_response_budget() {
+    let source = format!("def f():\n{}", "    x = 1\n".repeat(768));
+    let (_temp, analyzer) = python_analyzer(&source);
+    let query: CodeQuery = CodeQuery::from_json(&serde_json::json!({
+        "languages": ["python"], "match": {
+            "kind": "function", "each": {"kind": "identifier", "name": "x", "capture": "x"}
+        },
+        "steps": [{"op": "anchor", "capture": "x"}], "limit": 1000
+    }))
+    .expect("valid capture query");
+    let result = execute_code_query_with_access_mode(
+        analyzer.as_ref(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        StructuralAccessMode::ScanOnly,
+        true,
+    )
+    .expect("query executes");
+    assert_eq!(result.result.results.len(), 768);
+    let bytes: usize = result
+        .result
+        .results
+        .iter()
+        .map(|row| {
+            let CodeQueryResultValue::StructuralMatch { value } = &row.value else {
+                panic!("expected structural row")
+            };
+            value
+                .captures
+                .iter()
+                .map(|capture| capture.text.len() + 64)
+                .sum::<usize>()
+        })
+        .sum();
+    assert!(bytes <= super::super::super::matcher::MAX_RENDERED_CAPTURE_BYTES_PER_RESPONSE);
+    assert_eq!(
+        result
+            .result
+            .diagnostics
+            .iter()
+            .filter(
+                |diagnostic| diagnostic.code == CodeQueryDiagnosticCode::RenderedCapturesTruncated
+            )
+            .count(),
+        1
+    );
+}

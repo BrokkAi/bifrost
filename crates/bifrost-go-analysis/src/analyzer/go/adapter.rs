@@ -3,7 +3,6 @@
 //! Every answer below comes from [`brokk_bifrost_go`]; this file exists only
 //! because `LanguageAdapter` is an analysis-owned trait the Go crate cannot name.
 
-use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::cognitive_complexity;
 
 use brokk_bifrost_core::analyzer::model::Language;
@@ -29,13 +28,31 @@ pub struct GoAdapter;
 static GO_SEMANTIC_LOWERER: super::semantic::GoSemanticLowerer = super::semantic::GoSemanticLowerer;
 
 impl LanguageAdapter for GoAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[
+                "interpreted_string_literal",
+                "raw_string_literal",
+                "int_literal",
+                "float_literal",
+                "imaginary_literal",
+                "rune_literal",
+            ],
+            interpolations: &[],
+            composites: &[
+                ("literal_value", &["{", "}", ","]),
+                ("literal_element", &[]),
+                ("unary_expression", &["-", "+"]),
+            ],
+        }
+    }
+
     fn record_file_identity_inputs(
         &self,
         analyzer: &brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer<Self>,
         file: &ProjectFile,
     ) {
-        use brokk_bifrost_analysis::analyzer::ReadKey;
-        use brokk_bifrost_go::packages::{GoModuleInput, nearest_go_module_inputs};
+        use brokk_bifrost_go::packages::nearest_go_module_inputs;
         if file
             .rel_path()
             .extension()
@@ -48,39 +65,11 @@ impl LanguageAdapter for GoAdapter {
         if !attribution.is_capturing() {
             return;
         }
-        for input in nearest_go_module_inputs(file).iter() {
-            match input {
-                GoModuleInput::File {
-                    rel_path,
-                    blob,
-                    content_digest,
-                } => {
-                    let input = ProjectFile::new(analyzer.project().root(), rel_path);
-                    if analyzer.workspace_package_identity_input_content_digest(&input)
-                        != Some(*content_digest)
-                    {
-                        analyzer.record_unattributed_read();
-                    }
-                    analyzer.record_read(ReadKey::file(
-                        Language::Go,
-                        rel_path.as_str(),
-                        git2::Oid::from_bytes(blob).expect("Go module blob width"),
-                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
-                    ));
-                }
-                GoModuleInput::PathAbsent { rel_path } => {
-                    let input = ProjectFile::new(analyzer.project().root(), rel_path);
-                    if analyzer
-                        .workspace_package_identity_input_content_digest(&input)
-                        .is_some()
-                    {
-                        analyzer.record_unattributed_read();
-                    }
-                    analyzer.record_read(ReadKey::path_absent(Language::Go, rel_path.as_str()));
-                }
-                GoModuleInput::Unavailable => analyzer.record_unattributed_read(),
-            }
-        }
+        brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::record_identity_walk_inputs(
+            analyzer,
+            Language::Go,
+            nearest_go_module_inputs(file).iter(),
+        );
     }
 
     /// Relative to `brokk-bifrost-go`'s crate root: the `.scm` assets moved with
@@ -129,11 +118,8 @@ impl LanguageAdapter for GoAdapter {
         true
     }
 
-    fn workspace_package_identity_input(&self, file: &ProjectFile) -> bool {
-        file.rel_path()
-            .file_name()
-            .is_some_and(|name| name == "go.mod")
-            || go_vendor_root(file.rel_path()).is_some()
+    fn workspace_package_identity_input_path(&self, path: &std::path::Path) -> bool {
+        path.file_name().is_some_and(|name| name == "go.mod") || go_vendor_root(path).is_some()
     }
 
     /// Only the `module` directive qualifies declarations: package identity

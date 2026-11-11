@@ -241,6 +241,7 @@ mod tests {
             cvss_overlays: &[],
             organizational_risk: &[],
             incremental: None,
+            identifier_typos: None,
         };
         let mut budget = budget;
         let run = DefaultPolicyEvaluator::new()

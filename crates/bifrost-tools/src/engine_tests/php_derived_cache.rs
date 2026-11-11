@@ -36,7 +36,11 @@ mod php_extraction_tests {
     }
 
     impl IAnalyzer for AnalyzerWithUnclaimedFile {
-        fn update(&self, _changed_files: &std::collections::BTreeSet<ProjectFile>) -> Self
+        fn update_with_listing(
+            &self,
+            _changed_files: &std::collections::BTreeSet<ProjectFile>,
+            _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self
         where
             Self: Sized,
         {

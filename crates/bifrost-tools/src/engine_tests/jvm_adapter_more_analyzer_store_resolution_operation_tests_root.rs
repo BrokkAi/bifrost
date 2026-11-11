@@ -510,7 +510,7 @@ mod jvm_extraction_tests {
             _ => panic!("matching cached content authority must open Ready"),
         };
         let mut ready = operation.ready;
-        fixture.store.conn.execute(|conn| {
+        fixture.store.conn.execute_fixture(|conn| {
             conn.execute(
                 "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
                 [persisted_oid().to_string()],
@@ -890,7 +890,7 @@ mod jvm_extraction_tests {
                 Some(())
             );
             let blob = mount.blob_id();
-            let republished = fixture.store.conn.execute(move |conn| {
+            let republished = fixture.store.conn.execute_fixture(move |conn| {
                 conn.execute(
                     "UPDATE resolution_fragment_interiors SET publication_state = 'building' \
                  WHERE blob_id = ?1",
@@ -981,6 +981,10 @@ mod jvm_extraction_tests {
                     BindingNodeId::local(mount.ordinal().get(), u32::MAX),
                 ),
             ];
+            // Site rows are memoized only during a stage read: outside one, a
+            // cached absence could cross another connection's lazy publication.
+            let stage_read = inventory.derivation_read().unwrap();
+            assert!(stage_read.is_some());
             let sites_first = lexical
                 .definition_source_sites(&requests, &cancellation)
                 .unwrap()
@@ -989,6 +993,7 @@ mod jvm_extraction_tests {
                 .definition_source_sites(&requests, &cancellation)
                 .unwrap()
                 .unwrap();
+            drop(stage_read);
             assert_eq!(sites_first[0], Some(ResolutionSiteId::new(site_key)));
             assert_eq!(sites_first[1], None);
             assert_eq!(sites_first, sites_second);

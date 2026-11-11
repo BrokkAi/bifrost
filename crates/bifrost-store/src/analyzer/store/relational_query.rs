@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use brokk_bifrost_core::CancellationToken;
 use brokk_bifrost_core::analyzer::{
@@ -8,12 +8,12 @@ use brokk_bifrost_core::analyzer::{
     RelationalDefinitionRequest, RelationalDefinitionValue, RelationalName,
 };
 
+use super::candidate_fq_memo::CandidateFqBatch;
 use super::{
-    AnalyzerStore, CandidateRow, CandidateRowContainer, FqIdentityHeader, GenerationId,
-    HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
+    AnalyzerStore, CandidateFqMemo, CandidateRow, CandidateRowContainer, FqIdentityHeader,
+    GenerationId, HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
     candidate_row_from_row, candidate_row_from_row_at, candidate_rows_for_languages_with,
-    hydrate_candidate_rows, hydrate_mounted_candidate_conn, require_generation_map,
-    signature_metadata_projection_from_row,
+    hydrate_mounted_candidate_conn, require_generation_map, signature_metadata_projection_from_row,
 };
 use crate::analyzer::store::StoreLanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile, sort_units};
@@ -49,12 +49,13 @@ pub const CALLABLE_CANDIDATE_AVAILABILITY_SQL: &str = "SELECT EXISTS(
 #[doc(hidden)]
 pub fn content_sql(view: &str, predicate: &str) -> String {
     format!(
-        "SELECT {CANDIDATE_COLUMNS}, names.rel_path
+        "SELECT {CANDIDATE_COLUMNS}, names.rel_path, publication.publication_witness
          FROM {view} AS names
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
          JOIN blobs AS keys ON keys.id = units.blob_id
+         JOIN blob_meta AS publication ON publication.blob_id = keys.id
          WHERE names.lang = ?1 AND names.source_kind <> 'path' AND {predicate}
          ORDER BY names.rel_path, names.blob_oid, units.unit_key"
     )
@@ -134,20 +135,23 @@ fn decorated_identifier_prefix_successor(prefix: &str) -> String {
 }
 
 fn query_content_candidates(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     sql: &str,
     lang: &str,
     values: &[&dyn rusqlite::ToSql],
 ) -> Result<Vec<(HydratedCandidateRow, String)>> {
     let rows = candidate_rows_for_languages_with(tx, std::iter::once(lang), sql, values, |row| {
-        Ok((candidate_row_from_row(row)?, row.get::<_, String>(20)?))
+        Ok((
+            (candidate_row_from_row(row)?, row.get::<_, String>(20)?),
+            row.get::<_, Option<i64>>(21)?,
+        ))
     })?;
-    Ok(hydrate_candidate_rows(tx, rows, None)?
-        .expect("uncancelled relational candidate hydration completes"))
+    fq.hydrate(tx, rows)
 }
 
 fn hydrate_candidates<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     adapter: &A,
     project_root: &Path,
     rows: Vec<(HydratedCandidateRow, String)>,
@@ -180,7 +184,8 @@ pub fn batched_content_sql(
 ) -> String {
     format!(
         "WITH requests(request_index, {request_columns}) AS MATERIALIZED ({})
-         SELECT requests.request_index, {CANDIDATE_COLUMNS}, names.rel_path
+         SELECT requests.request_index, {CANDIDATE_COLUMNS}, names.rel_path,
+                publication.publication_witness
          FROM requests
          CROSS JOIN {view} AS names ON names.lang = ?2
           AND names.source_kind <> 'path'
@@ -188,7 +193,8 @@ pub fn batched_content_sql(
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
-         JOIN blobs AS keys ON keys.id = units.blob_id",
+         JOIN blobs AS keys ON keys.id = units.blob_id
+         JOIN blob_meta AS publication ON publication.blob_id = keys.id",
         batched_request_rows_sql(request_values)
     )
 }
@@ -200,13 +206,15 @@ pub fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) 
              SELECT CAST(key AS INTEGER), json_array({request_values})
              FROM json_each(?1)
          )
-         SELECT requests.request_index, {CANDIDATE_COLUMNS}, names.rel_path
+         SELECT requests.request_index, {CANDIDATE_COLUMNS}, names.rel_path,
+                publication.publication_witness
          FROM {view} AS names
          CROSS JOIN requests ON requests.lookup_key = json_array({name_values})
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
          JOIN blobs AS keys ON keys.id = units.blob_id
+         JOIN blob_meta AS publication ON publication.blob_id = keys.id
          WHERE names.lang = ?2 AND names.source_kind <> 'path'"
     )
 }
@@ -224,7 +232,8 @@ pub fn batched_definition_order_sql(view: &str) -> String {
                 (SELECT MIN(ranges.start_byte)
                  FROM unit_ranges AS ranges
                  WHERE ranges.blob_id = units.blob_id
-                   AND ranges.unit_key = units.unit_key) AS first_start_byte
+                   AND ranges.unit_key = units.unit_key) AS first_start_byte,
+                publication.publication_witness
          FROM requests
          CROSS JOIN {view} AS names ON names.lang = ?2
           AND names.source_kind <> 'path'
@@ -234,7 +243,8 @@ pub fn batched_definition_order_sql(view: &str) -> String {
          JOIN code_units AS units
            ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
-         JOIN blobs AS keys ON keys.id = units.blob_id"
+         JOIN blobs AS keys ON keys.id = units.blob_id
+         JOIN blob_meta AS publication ON publication.blob_id = keys.id"
     )
 }
 
@@ -288,7 +298,8 @@ pub struct DefinitionOrderRow {
 }
 
 fn query_batched_content_candidates(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     queries: &[BatchedContentQuery],
     request_json: &str,
     storage_languages: &[String],
@@ -309,14 +320,16 @@ fn query_batched_content_candidates(
             let mut statement = tx.prepare_cached(sql)?;
             let rows = statement.query_map(params![request_json, lang], |row| {
                 Ok((
-                    candidate_row_from_row_at(row, 1)?,
-                    (row.get::<_, usize>(0)?, row.get::<_, String>(21)?),
+                    (
+                        candidate_row_from_row_at(row, 1)?,
+                        (row.get::<_, usize>(0)?, row.get::<_, String>(21)?),
+                    ),
+                    row.get::<_, Option<i64>>(22)?,
                 ))
             })?;
             let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
             drop(statement);
-            let rows = hydrate_candidate_rows(tx, rows, None)?
-                .expect("uncancelled relational batch hydration completes");
+            let rows = fq.hydrate(tx, rows)?;
             for (candidate, (request_index, rel_path)) in rows {
                 assert!(request_index < candidates.len());
                 candidates[request_index].push((candidate, rel_path));
@@ -327,7 +340,8 @@ fn query_batched_content_candidates(
 }
 
 fn query_batched_definition_order_candidates(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     request_json: &str,
     storage_languages: &[String],
     request_count: usize,
@@ -342,12 +356,15 @@ fn query_batched_definition_order_candidates(
         for lang in storage_languages {
             let rows = statement.query_map(params![request_json, lang], |row| {
                 Ok((
-                    row.get::<_, usize>(0)?,
-                    StoredDefinitionOrderCandidate {
-                        candidate: candidate_row_from_row_at(row, 1)?,
-                        rel_path: row.get::<_, String>(21)?,
-                        first_start_byte: row.get::<_, Option<usize>>(22)?,
-                    },
+                    (
+                        row.get::<_, usize>(0)?,
+                        StoredDefinitionOrderCandidate {
+                            candidate: candidate_row_from_row_at(row, 1)?,
+                            rel_path: row.get::<_, String>(21)?,
+                            first_start_byte: row.get::<_, Option<usize>>(22)?,
+                        },
+                    ),
+                    row.get::<_, Option<i64>>(23)?,
                 ))
             })?;
             for row in rows {
@@ -355,8 +372,7 @@ fn query_batched_definition_order_candidates(
             }
         }
     }
-    let flat = hydrate_candidate_rows(tx, flat, None)?
-        .expect("uncancelled definition-order hydration completes");
+    let flat = fq.hydrate(tx, flat)?;
     let mut candidates = std::iter::repeat_with(Vec::new)
         .take(request_count)
         .collect::<Vec<_>>();
@@ -431,7 +447,7 @@ pub const STRUCTURAL_MEMBER_PATH_REQUEST: BatchedPathRequest = BatchedPathReques
 
 #[allow(clippy::too_many_arguments)]
 fn query_batched_path_units<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -466,7 +482,7 @@ fn query_batched_path_units<A: StoreLanguageAdapter>(
 }
 
 fn live_unit_counts(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     storage_languages: &[String],
 ) -> Result<HashMap<String, usize>> {
     let mut statement = tx.prepare_cached(
@@ -510,7 +526,7 @@ fn serialize_set_requests<T: serde::Serialize>(requests: &[T]) -> Result<String>
 }
 
 fn hydrate_batched_definition_units<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     adapter: &A,
     project_root: &Path,
     rows: Vec<(HydratedCandidateRow, String)>,
@@ -523,7 +539,8 @@ fn hydrate_batched_definition_units<A: StoreLanguageAdapter>(
 
 #[allow(clippy::too_many_arguments)]
 fn set_exact_definition_values<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -572,6 +589,7 @@ fn set_exact_definition_values<A: StoreLanguageAdapter>(
     });
     let candidates = query_batched_content_candidates(
         tx,
+        fq,
         &queries,
         &request_json,
         storage_languages,
@@ -609,7 +627,8 @@ fn set_exact_definition_values<A: StoreLanguageAdapter>(
 
 #[allow(clippy::too_many_arguments)]
 fn set_normalized_definition_values<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -680,6 +699,7 @@ fn set_normalized_definition_values<A: StoreLanguageAdapter>(
     let queries = changed.into_iter().chain(unchanged).collect::<Vec<_>>();
     let candidates = query_batched_content_candidates(
         tx,
+        fq,
         &queries,
         &request_json,
         storage_languages,
@@ -717,7 +737,8 @@ fn set_normalized_definition_values<A: StoreLanguageAdapter>(
 
 #[allow(clippy::too_many_arguments)]
 fn set_structural_member_values<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -773,6 +794,7 @@ fn set_structural_member_values<A: StoreLanguageAdapter>(
     });
     let candidates = query_batched_content_candidates(
         tx,
+        fq,
         &queries,
         &request_json,
         storage_languages,
@@ -917,7 +939,7 @@ pub fn path_view_sql(predicate: &str) -> String {
 }
 
 fn path_units<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     adapter: &A,
     project_root: &Path,
     lang: &str,
@@ -955,8 +977,10 @@ fn path_units<A: StoreLanguageAdapter>(
 /// Content-derived candidates for one (view, predicate, values) point query,
 /// hydrated into `CodeUnit`s. Shared by the split-view fast path and the
 /// single wide-view fallback in [`definition_values`].
+#[allow(clippy::too_many_arguments)]
 fn query_view_candidates<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -971,7 +995,7 @@ fn query_view_candidates<A: StoreLanguageAdapter>(
         .collect::<Vec<_>>();
     let mut units = Vec::new();
     for lang in storage_languages {
-        let rows = query_content_candidates(tx, &sql, lang, &values)?;
+        let rows = query_content_candidates(tx, fq, &sql, lang, &values)?;
         units.extend(hydrate_candidates(tx, adapter, project_root, rows)?);
     }
     Ok(units)
@@ -1027,7 +1051,7 @@ fn query_view_candidates<A: StoreLanguageAdapter>(
 /// contributed any candidate rows to this call site in the first place.
 ///
 /// `Identifier`/`IdentifierPrefix` (issue #2588 residual cost) get the same
-/// treatment for a different reason: `idx_code_units_lang_identifier_lookup`
+/// treatment for a different reason: `idx_code_units_lang_identifier`
 /// (from `0018-current-baseline.sql`) is keyed on `(lang, identifier)` with
 /// no `fq_anchor_kind` prefix, so both the wide view's stable and anchored
 /// arms already seek it directly with no correlated-anchor-scan defect. But
@@ -1200,7 +1224,8 @@ pub fn split_view_sources<A: StoreLanguageAdapter>(
 }
 
 fn definition_values<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -1288,6 +1313,7 @@ fn definition_values<A: StoreLanguageAdapter>(
             for (source_view, source_predicate, source_values) in &sources {
                 units.extend(query_view_candidates(
                     tx,
+                    fq,
                     adapter,
                     project_root,
                     storage_languages,
@@ -1300,6 +1326,7 @@ fn definition_values<A: StoreLanguageAdapter>(
         None => {
             units.extend(query_view_candidates(
                 tx,
+                fq,
                 adapter,
                 project_root,
                 storage_languages,
@@ -1358,7 +1385,7 @@ fn definition_values<A: StoreLanguageAdapter>(
 }
 
 fn package_relation_value<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -1426,11 +1453,7 @@ fn package_relation_value<A: StoreLanguageAdapter>(
     }
 }
 
-fn package_exists(
-    tx: &Transaction<'_>,
-    storage_languages: &[String],
-    package: &str,
-) -> Result<bool> {
+fn package_exists(tx: &Connection, storage_languages: &[String], package: &str) -> Result<bool> {
     let mut statement = tx.prepare_cached(PACKAGE_EXISTS_SQL)?;
     for lang in storage_languages {
         if statement
@@ -1469,7 +1492,8 @@ fn callable_metadata(
 }
 
 fn callable_values<A: StoreLanguageAdapter>(
-    tx: &Transaction<'_>,
+    tx: &Connection,
+    fq: &mut CandidateFqBatch<'_>,
     adapter: &A,
     project_root: &Path,
     storage_languages: &[String],
@@ -1502,8 +1526,13 @@ fn callable_values<A: StoreLanguageAdapter>(
                 "canonical declaration visibility is unavailable for callable candidates in {lang}"
             )));
         }
-        let candidates =
-            query_content_candidates(tx, &candidate_sql, lang, &[&prefix, &parent, &identifier])?;
+        let candidates = query_content_candidates(
+            tx,
+            fq,
+            &candidate_sql,
+            lang,
+            &[&prefix, &parent, &identifier],
+        )?;
         for (candidate, rel_path) in candidates {
             let locator = (
                 super::BlobKey {
@@ -1589,6 +1618,7 @@ impl AnalyzerStore {
         workspace_snapshots: &WorkspaceSnapshots,
         requests: &[RelationalDefinitionRequest],
         cancellation: &CancellationToken,
+        candidate_fq: &CandidateFqMemo,
         merge_overlay: F,
     ) -> Result<RelationalStoreOutcome>
     where
@@ -1614,6 +1644,7 @@ impl AnalyzerStore {
             generations,
             storage_languages.iter().map(String::as_str),
         )?;
+        let mut fq = CandidateFqBatch::begin(&tx, candidate_fq, generations)?;
         let mut values = requests
             .iter()
             .map(|request| RelationalDefinitionValue::empty_for(&request.query))
@@ -1629,6 +1660,7 @@ impl AnalyzerStore {
         };
         set_exact_definition_values(
             &tx,
+            &mut fq,
             adapter,
             project_root,
             storage_languages,
@@ -1642,6 +1674,7 @@ impl AnalyzerStore {
         }
         set_normalized_definition_values(
             &tx,
+            &mut fq,
             adapter,
             project_root,
             storage_languages,
@@ -1655,6 +1688,7 @@ impl AnalyzerStore {
         }
         set_structural_member_values(
             &tx,
+            &mut fq,
             adapter,
             project_root,
             storage_languages,
@@ -1687,6 +1721,7 @@ impl AnalyzerStore {
                 RelationalDefinitionQuery::CallableFacts => {
                     RelationalDefinitionValue::CallableFacts(callable_values(
                         &tx,
+                        &mut fq,
                         adapter,
                         project_root,
                         storage_languages,
@@ -1695,6 +1730,7 @@ impl AnalyzerStore {
                 }
                 _ => RelationalDefinitionValue::Definitions(definition_values(
                     &tx,
+                    &mut fq,
                     adapter,
                     project_root,
                     storage_languages,
@@ -1708,6 +1744,7 @@ impl AnalyzerStore {
             return Ok(RelationalStoreOutcome::Cancelled);
         }
         tx.commit()?;
+        fq.finish();
         Ok(RelationalStoreOutcome::Complete(values))
     }
 
@@ -1754,6 +1791,7 @@ impl AnalyzerStore {
         workspace_snapshots: &WorkspaceSnapshots,
         names: &[RelationalName],
         cancellation: &CancellationToken,
+        candidate_fq: &CandidateFqMemo,
     ) -> Result<Option<Vec<Vec<DefinitionOrderRow>>>> {
         if names.is_empty() {
             return Ok(Some(Vec::new()));
@@ -1777,8 +1815,10 @@ impl AnalyzerStore {
             })
             .collect::<Vec<_>>();
         let request_json = serialize_set_requests(&keys)?;
+        let mut fq = CandidateFqBatch::begin(&tx, candidate_fq, generations)?;
         let candidates = query_batched_definition_order_candidates(
             &tx,
+            &mut fq,
             &request_json,
             storage_languages,
             names.len(),
@@ -1827,6 +1867,7 @@ impl AnalyzerStore {
             );
         }
         tx.commit()?;
+        fq.finish();
         Ok(Some(values))
     }
 
@@ -2321,6 +2362,8 @@ pub mod tests {
 mod batched_query_tests {
     use std::path::PathBuf;
 
+    use brokk_bifrost_test_macros::hardwon;
+
     use brokk_bifrost_core::CancellationToken;
     use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use brokk_bifrost_core::analyzer::{
@@ -2331,7 +2374,10 @@ mod batched_query_tests {
     use git2::Oid;
     use rusqlite::params;
 
-    use super::{AnalyzerStore, RelationalStoreOutcome, SET_QUERY_MIN_REQUESTS, live_unit_counts};
+    use super::{
+        AnalyzerStore, CandidateFqMemo, RelationalStoreOutcome, SET_QUERY_MIN_REQUESTS,
+        live_unit_counts,
+    };
     use crate::analyzer::store::{
         GenerationId, PathSymbolRow, StoreLanguageAdapter, WorkspaceAnchorRow, WorkspaceFileRow,
         WorkspacePackageEdgeRow, WorkspacePackageFileRow, WorkspaceSnapshots,
@@ -2482,22 +2528,28 @@ mod batched_query_tests {
     }
 
     fn insert_blob(conn: &rusqlite::Connection, adapter: &FixtureAdapter, blob: &Blob) {
+        insert_blob_as(conn, adapter, blob, None, &str::to_string);
+    }
+
+    /// `insert_blob` with an explicit blob ID (`None` lets SQLite choose) and a
+    /// rewrite of each FQ segment's text. The `code_units` header is still the
+    /// one `prepare_unit_fq` derives, so a rewritten segment of the same
+    /// length makes a stale identity visible in an answer.
+    fn insert_blob_as(
+        conn: &rusqlite::Connection,
+        adapter: &FixtureAdapter,
+        blob: &Blob,
+        blob_id: Option<i64>,
+        segment_text: &dyn Fn(&str) -> String,
+    ) {
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(conn);
         conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 0)",
-            params![blob.oid.to_string(), blob.lang],
+            "INSERT INTO blobs(id, blob_oid, lang, generation) VALUES(?1, ?2, ?3, 0)",
+            params![blob_id, blob.oid.to_string(), blob.lang],
         )
         .unwrap();
         let blob_id = conn.last_insert_rowid();
         let range_count = blob.rows.iter().map(|row| row.starts.len()).sum::<usize>();
-        conn.execute(
-            "INSERT INTO blob_meta(
-               blob_id, lang, contains_tests, content_package, stored_unit_count,
-               range_count, signature_count, signature_metadata_count, supertype_count,
-               child_count, import_statement_count, type_identifier_count, is_complete
-             ) VALUES(?1, ?2, 0, '', ?3, ?4, 0, 0, 0, 0, 0, 0, 1)",
-            params![blob_id, blob.lang, blob.rows.len(), range_count],
-        )
-        .unwrap();
         for (unit_key, row) in blob.rows.iter().enumerate() {
             let unit = &row.unit;
             let qualifier = adapter.storage_content_qualifier(unit, "");
@@ -2546,7 +2598,14 @@ mod batched_query_tests {
                     "INSERT INTO code_unit_fq_segments(
                        blob_id, lang, unit_key, seg_ordinal, seg_kind, segment
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![blob_id, blob.lang, unit_key, ordinal, kind, text],
+                    params![
+                        blob_id,
+                        blob.lang,
+                        unit_key,
+                        ordinal,
+                        kind,
+                        segment_text(text)
+                    ],
                 )
                 .unwrap();
             }
@@ -2561,6 +2620,15 @@ mod batched_query_tests {
                 .unwrap();
             }
         }
+        conn.execute(
+            "INSERT INTO blob_meta(
+               blob_id, lang, contains_tests, content_package, stored_unit_count,
+               range_count, signature_count, signature_metadata_count, supertype_count,
+               child_count, import_statement_count, type_identifier_count, is_complete
+             ) VALUES(?1, ?2, 0, '', ?3, ?4, 0, 0, 0, 0, 0, 0, 1)",
+            params![blob_id, blob.lang, blob.rows.len(), range_count],
+        )
+        .unwrap();
     }
 
     /// The fixture, by file:
@@ -2834,6 +2902,16 @@ mod batched_query_tests {
             &self,
             requests: &[RelationalDefinitionRequest],
         ) -> Vec<RelationalDefinitionValue> {
+            self.values_with(requests, &CandidateFqMemo::default())
+        }
+
+        /// `values` under a caller-owned candidate FQ memo, as an outer query
+        /// shares one across its batches.
+        fn values_with(
+            &self,
+            requests: &[RelationalDefinitionRequest],
+            candidate_fq: &CandidateFqMemo,
+        ) -> Vec<RelationalDefinitionValue> {
             let outcome = self
                 .store
                 .relational_definition_values(
@@ -2844,6 +2922,7 @@ mod batched_query_tests {
                     &self.snapshots,
                     requests,
                     &CancellationToken::new(),
+                    candidate_fq,
                     |_| {},
                 )
                 .unwrap();
@@ -3296,6 +3375,7 @@ mod batched_query_tests {
                     &fixture.snapshots,
                     names,
                     &CancellationToken::new(),
+                    &CandidateFqMemo::default(),
                 )
                 .unwrap()
                 .expect("an uncancelled batch completes")
@@ -3435,6 +3515,375 @@ mod batched_query_tests {
                 assert_eq!(direct, *expected, "direct existence of {rendered:?}");
             }
         }
+    }
+    // Candidate FQ memo (#8826): one outer query shares one `CandidateFqMemo`
+    // across its relational batches. A hit needs the persisted publication
+    // witness, the lineage nonce, the generation and the whole FQ header of the
+    // row the current batch selected to equal the memo entry's.
+
+    fn run_request() -> [RelationalDefinitionRequest; 1] {
+        [request(
+            0,
+            &stable(&[("demo", P), ("Widget", T), ("run", M)]),
+            &RelationalDefinitionQuery::ExactName,
+        )]
+    }
+
+    fn definitions(values: &[RelationalDefinitionValue]) -> Vec<CodeUnit> {
+        let [RelationalDefinitionValue::Definitions(units)] = values else {
+            panic!("one definition request gives one definition list: {values:?}");
+        };
+        units.clone()
+    }
+
+    fn widget_blob_id(fixture: &Fixture) -> i64 {
+        let widget = fixture
+            .blobs
+            .iter()
+            .find(|blob| blob.rel_path == "src/demo/Widget.java")
+            .unwrap();
+        let conn = fixture.store.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+            [widget.oid.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Replace `src/demo/Widget.java`'s stored blob in the same generation and
+    /// under the same blob ID, as a Rust repair that keeps its ID does.
+    fn republish_widget(fixture: &Fixture, rows: Vec<Row>, segment_text: &dyn Fn(&str) -> String) {
+        let widget = fixture
+            .blobs
+            .iter()
+            .find(|blob| blob.rel_path == "src/demo/Widget.java")
+            .unwrap();
+        let blob_id = widget_blob_id(fixture);
+        let blob = Blob {
+            lang: widget.lang,
+            rel_path: widget.rel_path,
+            oid: widget.oid,
+            rows,
+            in_workspace: widget.in_workspace,
+            parsed: true,
+        };
+        let conn = fixture.store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+        conn.execute("DELETE FROM blobs WHERE id = ?1", [blob_id])
+            .unwrap();
+        insert_blob_as(&conn, &fixture.adapter, &blob, Some(blob_id), segment_text);
+    }
+
+    fn widget_rows(units: &Units) -> Vec<Row> {
+        vec![
+            row(&units.widget, &[0]),
+            row(&units.run_a, &[40]),
+            row(&units.run_a, &[12]),
+            row(&units.inner, &[20]),
+            row(&units.size, &[]),
+        ]
+    }
+
+    #[hardwon("#8826: one request re-hydrated the same candidate FQ rows thousands of times")]
+    #[test]
+    fn one_outer_query_reads_each_candidate_identity_once() {
+        let fixture = fixture();
+        let u = &fixture.units;
+
+        // Point SQL: one request per batch, the shape of most analyzer traffic.
+        let point = run_request();
+        let memo = CandidateFqMemo::default();
+        let first = fixture.values_with(&point, &memo);
+        let cold = memo.counts_for_test();
+        let second = fixture.values_with(&point, &memo);
+        let warm = memo.counts_for_test();
+        assert_eq!(
+            first,
+            fixture.values(&point),
+            "the memo changed a point answer"
+        );
+        assert_eq!(second, first, "a memo hit changed a point answer");
+        assert!(cold.hydrated_keys > 0, "{cold:?}");
+        assert_eq!(warm.hydrated_keys, cold.hydrated_keys, "{warm:?}");
+        assert!(warm.hits > cold.hits, "{warm:?}");
+
+        // Set SQL: a batch large enough for the set-oriented statements, then
+        // the same candidates again in a second batch of the same query.
+        let set = u
+            .pads
+            .iter()
+            .take(SET_QUERY_MIN_REQUESTS)
+            .enumerate()
+            .map(|(ordinal, pad)| {
+                request(
+                    ordinal,
+                    &RelationalName::stable(pad.fq().clone()),
+                    &RelationalDefinitionQuery::ExactName,
+                )
+            })
+            .collect::<Vec<_>>();
+        let memo = CandidateFqMemo::default();
+        let first = fixture.values_with(&set, &memo);
+        let cold = memo.counts_for_test();
+        let second = fixture.values_with(&set, &memo);
+        let warm = memo.counts_for_test();
+        assert_eq!(first, fixture.values(&set), "the memo changed a set answer");
+        assert_eq!(second, first, "a memo hit changed a set answer");
+        assert_eq!(cold.hydrated_keys, SET_QUERY_MIN_REQUESTS, "{cold:?}");
+        assert_eq!(warm.hydrated_keys, cold.hydrated_keys, "{warm:?}");
+        assert!(warm.hits >= cold.hits + SET_QUERY_MIN_REQUESTS, "{warm:?}");
+    }
+
+    /// The coordinator's counterexample: a complete blob with unit U, then the
+    /// same blob without U, then with U again under different FQ rows, all in
+    /// one generation, under one blob ID, within one outer query.
+    #[test]
+    fn republished_unit_never_hits_an_earlier_publication() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let memo = CandidateFqMemo::default();
+        assert!(definitions(&fixture.values_with(&run_request(), &memo)).contains(&u.run_a));
+
+        let without_run = widget_rows(u)
+            .into_iter()
+            .filter(|row| row.unit != u.run_a)
+            .collect();
+        republish_widget(&fixture, without_run, &str::to_string);
+        assert!(!definitions(&fixture.values_with(&run_request(), &memo)).contains(&u.run_a));
+
+        // The re-added unit keeps its header but its stored identity is now
+        // demo.Widget.rux, so the exact-name filter must drop it. An entry
+        // admitted from the first publication would still say `run`.
+        republish_widget(&fixture, widget_rows(u), &|text: &str| {
+            if text == "run" {
+                "rux".to_string()
+            } else {
+                text.to_string()
+            }
+        });
+        let third = definitions(&fixture.values_with(&run_request(), &memo));
+        assert!(!third.contains(&u.run_a), "stale memo identity: {third:?}");
+        assert_eq!(third, definitions(&fixture.values(&run_request())));
+    }
+
+    #[test]
+    fn completing_a_blob_again_mints_a_new_witness() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let memo = CandidateFqMemo::default();
+        assert!(definitions(&fixture.values_with(&run_request(), &memo)).contains(&u.run_a));
+        let blob_id = widget_blob_id(&fixture);
+        let witness = |fixture: &Fixture| -> Option<i64> {
+            let conn = fixture.store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT publication_witness FROM blob_meta WHERE blob_id = ?1",
+                [blob_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = witness(&fixture);
+        {
+            let conn = fixture.store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE blob_meta SET is_complete = 0 WHERE blob_id = ?1",
+                [blob_id],
+            )
+            .unwrap();
+            // The seal allows FQ edits only while the blob is incomplete.
+            conn.execute(
+                "UPDATE code_unit_fq_segments SET segment = 'rux'
+                 WHERE blob_id = ?1 AND segment = 'run'",
+                [blob_id],
+            )
+            .unwrap();
+        }
+        assert!(!definitions(&fixture.values_with(&run_request(), &memo)).contains(&u.run_a));
+        {
+            let conn = fixture.store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE blob_meta SET is_complete = 1 WHERE blob_id = ?1",
+                [blob_id],
+            )
+            .unwrap();
+        }
+        let after = witness(&fixture);
+        assert!(
+            after.is_some() && after != before,
+            "{before:?} -> {after:?}"
+        );
+        let answer = definitions(&fixture.values_with(&run_request(), &memo));
+        assert!(
+            !answer.contains(&u.run_a),
+            "stale memo identity: {answer:?}"
+        );
+    }
+
+    #[test]
+    fn changed_header_or_lineage_rereads_the_identity() {
+        let fixture = fixture();
+        let memo = CandidateFqMemo::default();
+        let expected = fixture.values_with(&run_request(), &memo);
+        let cold = memo.counts_for_test();
+
+        // Headers live on code_units; the blob-row seal admits this edit only
+        // as a fixture write.
+        let blob_id = widget_blob_id(&fixture);
+        {
+            let conn = fixture.store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            conn.execute(
+                "UPDATE code_units
+                 SET normalized_fqn_tail = COALESCE(normalized_fqn_tail, exact_fqn_tail) || ' changed'
+                 WHERE blob_id = ?1 AND unit_key IN (1, 2)",
+                [blob_id],
+            )
+            .unwrap();
+        }
+        assert_eq!(fixture.values_with(&run_request(), &memo), expected);
+        let header = memo.counts_for_test();
+        assert!(header.hydrated_keys > cold.hydrated_keys, "{header:?}");
+
+        // A different lineage nonce: no entry from the earlier one can hit.
+        {
+            let conn = fixture.store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE blob_publication_witness_sequence SET store_nonce = randomblob(16)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(fixture.values_with(&run_request(), &memo), expected);
+        let lineage = memo.counts_for_test();
+        assert!(lineage.hydrated_keys > header.hydrated_keys, "{lineage:?}");
+    }
+
+    #[test]
+    fn a_larger_replacement_identity_is_charged_against_the_byte_cap() {
+        let fixture = fixture();
+        let u = &fixture.units;
+        let probe = CandidateFqMemo::default();
+        fixture.values_with(&run_request(), &probe);
+        let small = probe.counts_for_test().weighed_bytes;
+        let cap = small + 16;
+        let memo = CandidateFqMemo::with_caps_for_test(usize::MAX, cap);
+        fixture.values_with(&run_request(), &memo);
+        let before = memo.counts_for_test();
+        assert_eq!(before.weighed_bytes, small, "{before:?}");
+
+        // The same unit keys now hold a longer identity, so the batch replaces
+        // held keys with larger entries.
+        let longer = unit(
+            "src/demo/Widget.java",
+            CodeUnitType::Function,
+            &[
+                ("demo", P),
+                ("Widget", T),
+                ("run_with_a_much_longer_member_name", M),
+            ],
+            1,
+        );
+        let rows = vec![
+            row(&u.widget, &[0]),
+            row(&longer, &[40]),
+            row(&longer, &[12]),
+            row(&u.inner, &[20]),
+            row(&u.size, &[]),
+        ];
+        republish_widget(&fixture, rows, &str::to_string);
+        let request = [request(
+            0,
+            &RelationalName::stable(longer.fq().clone()),
+            &RelationalDefinitionQuery::ExactName,
+        )];
+        assert_eq!(
+            fixture.values_with(&request, &memo),
+            fixture.values(&request)
+        );
+        let after = memo.counts_for_test();
+        assert_eq!(after.held_bytes, after.weighed_bytes, "{after:?}");
+        assert!(after.weighed_bytes <= cap, "{after:?}");
+        assert!(
+            after.refused_admissions > before.refused_admissions,
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_or_capped_batches_never_change_answers() {
+        let fixture = fixture();
+        let memo = CandidateFqMemo::default();
+        let cancellation = CancellationToken::new();
+        let outcome = fixture
+            .store
+            .relational_definition_values(
+                &fixture.adapter,
+                &fixture.root,
+                &fixture.generations,
+                &fixture.languages,
+                &fixture.snapshots,
+                &run_request(),
+                &cancellation,
+                &memo,
+                |_| cancellation.cancel(),
+            )
+            .unwrap();
+        assert!(matches!(outcome, RelationalStoreOutcome::Cancelled));
+        let counts = memo.counts_for_test();
+        assert!(
+            counts.hydrated_keys > 0,
+            "the batch hydrated before cancelling: {counts:?}"
+        );
+        assert_eq!(
+            counts.entries, 0,
+            "a cancelled batch admitted entries: {counts:?}"
+        );
+
+        let expected = fixture.values(&run_request());
+        let capped = CandidateFqMemo::with_caps_for_test(1, usize::MAX);
+        assert_eq!(fixture.values_with(&run_request(), &capped), expected);
+        assert_eq!(fixture.values_with(&run_request(), &capped), expected);
+        let counts = capped.counts_for_test();
+        assert_eq!(counts.entries, 1, "{counts:?}");
+        assert!(counts.refused_admissions > 0, "{counts:?}");
+        let tiny = CandidateFqMemo::with_caps_for_test(usize::MAX, 1);
+        assert_eq!(fixture.values_with(&run_request(), &tiny), expected);
+        assert_eq!(tiny.counts_for_test().entries, 0);
+    }
+
+    /// One `relational_definition_values` call runs every statement of its
+    /// request in one batch, so staging must stay inside the memo's caps while
+    /// the batch runs, not only when it admits at the end.
+    #[test]
+    #[hardwon(
+        "#8826: a batch staged every identity it hydrated, past the memo's entry and byte caps"
+    )]
+    fn one_batch_stages_no_more_than_the_memo_caps() {
+        let fixture = fixture();
+        let expected = fixture.values(&run_request());
+        let uncapped = CandidateFqMemo::default();
+        assert_eq!(fixture.values_with(&run_request(), &uncapped), expected);
+        let full = uncapped.counts_for_test();
+        assert!(
+            full.peak_staged_entries > 1,
+            "the request stages more than one identity in one batch: {full:?}"
+        );
+
+        let entry_capped = CandidateFqMemo::with_caps_for_test(1, usize::MAX);
+        assert_eq!(fixture.values_with(&run_request(), &entry_capped), expected);
+        let counts = entry_capped.counts_for_test();
+        assert_eq!(counts.peak_staged_entries, 1, "{counts:?}");
+
+        let byte_cap = full.peak_staged_bytes / 2;
+        let byte_capped = CandidateFqMemo::with_caps_for_test(usize::MAX, byte_cap);
+        assert_eq!(fixture.values_with(&run_request(), &byte_capped), expected);
+        let counts = byte_capped.counts_for_test();
+        assert!(
+            counts.peak_staged_bytes <= byte_cap,
+            "staged {} bytes past a {byte_cap}-byte cap: {counts:?}",
+            counts.peak_staged_bytes
+        );
     }
 }
 

@@ -2,6 +2,7 @@ pub mod analysis_context;
 mod capabilities;
 mod execution;
 pub mod identifier_dictionary;
+pub mod identifier_typos;
 mod matcher;
 mod planner;
 pub mod rune_ir;

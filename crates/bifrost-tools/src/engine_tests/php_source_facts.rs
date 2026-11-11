@@ -262,7 +262,7 @@ function make(?PackageAlias $value): Child { return new Child(); }
         );
         store
             .conn
-            .execute(|conn| {
+            .execute_fixture(|conn| {
                 let writes: i64 =
                     conn.query_row("SELECT COUNT(*) FROM source_php_writes", [], |row| {
                         row.get(0)

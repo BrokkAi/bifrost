@@ -1,7 +1,55 @@
+/// Record all positive and negative inputs to a language's identity walk.
+pub fn record_identity_walk_inputs<'a, A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    language: Language,
+    inputs: impl IntoIterator<Item = &'a brokk_bifrost_core::analyzer::project::IdentityWalkInput>,
+) {
+    use crate::analyzer::{IAnalyzer, ReadKey};
+    use brokk_bifrost_core::analyzer::project::IdentityWalkInput;
+    for input in inputs {
+        match input {
+            IdentityWalkInput::File {
+                rel_path,
+                blob,
+                content_digest,
+            } => {
+                let input = ProjectFile::new(analyzer.project().root(), rel_path);
+                if analyzer.workspace_package_identity_input_content_digest(&input)
+                    != Some(*content_digest)
+                {
+                    analyzer.record_unattributed_read();
+                }
+                analyzer.record_read(ReadKey::file(
+                    language,
+                    rel_path.as_str(),
+                    git2::Oid::from_bytes(blob).expect("identity input blob width"),
+                    brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                ));
+            }
+            IdentityWalkInput::PathAbsent { rel_path } => {
+                let input = ProjectFile::new(analyzer.project().root(), rel_path);
+                if analyzer
+                    .workspace_package_identity_input_content_digest(&input)
+                    .is_some()
+                {
+                    analyzer.record_unattributed_read();
+                }
+                analyzer.record_read(ReadKey::path_absent(language, rel_path.as_str()));
+            }
+            IdentityWalkInput::Unavailable => analyzer.record_unattributed_read(),
+        }
+    }
+}
+
 use super::source_admission::{AdmissionStop, SourceAdmissionPolicy, SourceAdmissionRefusal};
 use crate::analyzer::read_ledger::reason as derivation_reason;
 use crate::analyzer::store_bridge::AnalyzerStoreEngineExt;
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
 use brokk_bifrost_core::gitblob::BlobKey;
+use brokk_bifrost_core::retention_budget::{
+    Accounted, BudgetRegion, RetainedBytes, SharedAllocation,
+};
+use brokk_bifrost_rust::cargo_routes::is_rust_listing_path;
 // The traversal primitives and the two byte-range readers below them are pure
 // tree-sitter node arithmetic, so they live in `brokk-bifrost-core` and are
 // re-exported here at the paths every caller already uses. The budgeted walk
@@ -39,7 +87,9 @@ use crate::analyzer::without_project_reads;
 
 use crate::analyzer::fq_name::absent_segment_separators;
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, install_on_dedicated_build_pool};
-use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
+use crate::analyzer::project::{
+    OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot, SharedWorkspaceFileListing,
+};
 use crate::analyzer::read_ledger::{
     IndexFamily, LookupKind, LookupQuestion, ReadKey, declaration_facts_digest,
     signature_metadata_digest,
@@ -61,16 +111,17 @@ use crate::analyzer::store::resolution_selection::{
 };
 
 use crate::analyzer::store::{
-    ActiveSearchBlob, AnalyzerStore, CompleteAnalysisBlobRequest, FileVersionDecision,
-    GenerationId, HierarchyStorageKey, HydratedCandidateRow, HydratedDefinitionOrderCandidateRow,
+    ActiveSearchBlob, AnalyzerStore, CandidateFqMemo, CompleteAnalysisBlobRequest,
+    DefinitionInventoryState, DefinitionNameRow, FileVersionDecision, GenerationId,
+    HierarchyStorageKey, HydratedCandidateRow, HydratedDefinitionOrderCandidateRow,
     HydratedMountedCandidatePrimaryRangeRow as MountedCandidatePrimaryRangeRow,
     HydratedMountedCandidateRow as MountedCandidateRow, LimitedQueryRows,
     MissingCompleteAnalysisBlob, PathSymbolRow, PersistBatchStats, PersistBatchTargets,
     PreparedParsedBlob, PreparedParsedBlobPreparation, RelationalStoreOutcome,
     RenderedDefinitionCandidateOutcome, RenderedDefinitionRequest, StoreError, WorkspaceAnchorRow,
-    WorkspaceContentPackageFact, WorkspaceFileRow, WorkspacePackageEdgeRow,
-    WorkspacePackageFileRow, WorkspaceSnapshots, WorkspaceSourceRefusalRow,
-    require_complete_file_state,
+    WorkspaceContentPackageFact, WorkspaceContentUnitTails, WorkspaceFileDefinitionInventory,
+    WorkspaceFileRow, WorkspacePackageEdgeRow, WorkspacePackageFileRow, WorkspaceSnapshots,
+    WorkspaceSourceRefusalRow, require_complete_file_state,
 };
 
 use crate::analyzer::structural::materialization::MaterializationRecord;
@@ -146,13 +197,13 @@ macro_rules! delegate_inner_procedure_fact_methods {
                 workspace: &$crate::analyzer::WorkspaceAnalyzer,
                 procedure: &$crate::analyzer::semantic::ProcedureHandle,
                 cancellation: Option<&$crate::CancellationToken>,
-            ) -> Result<std::sync::Arc<$crate::analyzer::LoopCandidates>, $crate::analyzer::QueryReadIncomplete>;
+            ) -> Result<std::sync::Arc<brokk_bifrost_core::retention_budget::Accounted<$crate::analyzer::LoopCandidates>>, $crate::analyzer::QueryReadIncomplete>;
             fn statement_assessments_for(
                 &self,
                 workspace: &$crate::analyzer::WorkspaceAnalyzer,
                 procedure: &$crate::analyzer::semantic::ProcedureHandle,
                 cancellation: Option<&$crate::CancellationToken>,
-            ) -> std::sync::Arc<$crate::analyzer::semantic::StatementAssessments>;
+            ) -> std::sync::Arc<brokk_bifrost_core::retention_budget::Accounted<$crate::analyzer::semantic::statement_entries::AccountedStatementAssessments>>;
         }
     };
 }
@@ -184,10 +235,67 @@ macro_rules! delegate_inner_test_hook_methods {
 pub use crate::delegate_inner_test_hook_methods;
 
 type DeclarationPrimaryRanges = Vec<(CodeUnit, Option<Range>)>;
-type ProcedureFactCacheKey = (
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProcedureFactCacheKey(
     crate::analyzer::semantic::SemanticArtifactMaterializationId,
     crate::analyzer::semantic::ProcedureId,
 );
+
+impl RetainedBytes for ProcedureFactCacheKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Publish only assessments whose captured inputs can be verified on reuse.
+fn publish_statement_assessments<K>(
+    analyzer: &dyn IAnalyzer,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    permit: Option<
+        brokk_bifrost_core::budgeted_value_cache::BudgetedValuePermit<
+            K,
+            SharedAllocation<
+                Accounted<
+                    crate::analyzer::semantic::statement_entries::AccountedStatementAssessments,
+                >,
+            >,
+        >,
+    >,
+    value: crate::analyzer::semantic::StatementAssessments,
+    execution_dependent: bool,
+    reads: &crate::analyzer::ReadLedger,
+) -> Arc<Accounted<crate::analyzer::semantic::statement_entries::AccountedStatementAssessments>>
+where
+    K: Eq + std::hash::Hash + Clone + Send + Sync + RetainedBytes + 'static,
+{
+    if execution_dependent || reads.reuse_refused() || reads.unattributed_reads() > 0 {
+        crate::analyzer::i_analyzer::replay_query_read_receipt(
+            analyzer,
+            [],
+            brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+                unattributed_reads: reads.unattributed_reads(),
+                execution_dependences: usize::from(execution_dependent),
+                reuse_refused: reads.reuse_refused(),
+                ..Default::default()
+            },
+        );
+        let value = Arc::new(Accounted::uncharged(
+            crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(value),
+        ));
+        if let Some(permit) = permit {
+            permit.publish_rejected();
+        }
+        return value;
+    }
+    let value = Arc::new(Accounted::charged(
+        budget,
+        crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(value),
+    ));
+    if let Some(permit) = permit {
+        permit.publish_complete(SharedAllocation::new(Arc::clone(&value)));
+    }
+    value
+}
 
 // `FileState` holds the full parsed source (`source: String`) plus every
 // declaration-shaped collection derived from it (imports, signatures,
@@ -418,7 +526,7 @@ pub fn prepare_exact_syntax_tree<A: LanguageAdapter + ?Sized>(
         variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
         assignment_digest: None,
         condition_symbols: Vec::new(),
-        undecided_chains: Vec::new(),
+        undecided_scan: None,
         preprocessor: adapter.preprocess(file, source.source()),
     };
     prepare_exact_syntax_tree_with_parse(
@@ -860,6 +968,13 @@ pub enum BulkFileStateSource {
     Omit,
 }
 
+/// Keyed states from one bulk read, plus the dirty states whose incompleteness
+/// the caller records after deciding whether the bulk build itself completed.
+struct BulkFileStateEntries {
+    states: HashMap<ProjectFile, (FileStateCacheKey, FileState)>,
+    dirty_states: Vec<Arc<FileState>>,
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct AnalyzerStoreContext {
@@ -939,9 +1054,81 @@ pub struct AnalyzerStoreContext {
 #[doc(hidden)]
 pub struct WorkspaceBuildSnapshot {
     files: Arc<BTreeSet<ProjectFile>>,
+    omissions: Arc<Vec<brokk_bifrost_core::analyzer::project::WorkspaceFileOmission>>,
     live_entries: Arc<HashMap<ProjectFile, LivePathEntry>>,
     disk_stats: Arc<HashMap<ProjectFile, FileStatStamp>>,
     analysis_generation: u64,
+}
+
+// Rust listing failure rows. The unavailable row marks a revision whose listing
+// could not be read, so its failure set is not a complete account and is never
+// carried forward. Omission rows are recomputed from the cached omissions on
+// every update.
+const RUST_LISTING_UNAVAILABLE_PATH: &str = "";
+const RUST_LISTING_UNAVAILABLE_REASON: &str = "listing unavailable";
+const RUST_LISTING_OMISSION_PREFIX: &str = "omission: ";
+
+/// Whether an omission can hide a workspace source for any language. A walk
+/// error, an undecodable Git path, or a project that cannot say why
+/// (`Unknown`, which is also the default listing's single row) may drop a
+/// source this analyzer should have indexed. So may a symbolic link to a
+/// directory, which the listing does not descend into, or an unreadable
+/// symbolic link. Ignore rules, configured excludes and other non-regular
+/// entries are outside the analyzer's universe.
+fn omission_may_hide_source(
+    reason: brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason,
+) -> bool {
+    use brokk_bifrost_core::analyzer::project::WorkspaceFileOmissionReason;
+    matches!(
+        reason,
+        WorkspaceFileOmissionReason::WalkError
+            | WorkspaceFileOmissionReason::NonUtf8GitPath
+            | WorkspaceFileOmissionReason::Unknown
+            | WorkspaceFileOmissionReason::SymlinkToDirectory
+            | WorkspaceFileOmissionReason::UnreadableSymlink
+    )
+}
+
+/// A complete listing proof was granted under an empty set of omissions that
+/// can hide source. Compare that set with the new observation without walking
+/// files. Missing evidence also cannot preserve a proof.
+pub(crate) fn listing_may_withdraw_proof(
+    project: &dyn Project,
+    listing: Option<&SharedWorkspaceFileListing>,
+) -> Result<bool, StoreError> {
+    Ok(
+        current_listing_omissions(project, listing)?.is_none_or(|omissions| {
+            omissions
+                .iter()
+                .any(|omission| omission_may_hide_source(omission.reason))
+        }),
+    )
+}
+
+/// The current listing's omissions: the project's cached listing when it has
+/// one, else the listing the enclosing update already read. The withdrawal
+/// decision and the update's observed-listing fact both read this, so they
+/// cannot see two different listings.
+fn current_listing_omissions(
+    project: &dyn Project,
+    listing: Option<&SharedWorkspaceFileListing>,
+) -> Result<
+    Option<Arc<Vec<brokk_bifrost_core::analyzer::project::WorkspaceFileOmission>>>,
+    StoreError,
+> {
+    Ok(match project.cached_omissions_if_available()? {
+        Some(omissions) => Some(omissions),
+        None => listing.map(|(_, omissions)| Arc::clone(omissions)),
+    })
+}
+
+/// Whether a path the listing omitted keeps the Rust listing from proving a
+/// module or manifest absent: every omission that can hide a source, and any
+/// other omission of a `.rs` or `Cargo.toml` path.
+fn omission_fails_rust_listing(
+    omission: &brokk_bifrost_core::analyzer::project::WorkspaceFileOmission,
+) -> bool {
+    omission_may_hide_source(omission.reason) || is_rust_listing_path(&omission.path)
 }
 
 impl WorkspaceBuildSnapshot {
@@ -951,9 +1138,9 @@ impl WorkspaceBuildSnapshot {
         liveness: Option<&Liveness>,
         selected_languages: &[Language],
     ) -> Option<Arc<Self>> {
-        let files = {
+        let (files, omissions) = {
             let _scope = profiling::scope("WorkspaceBuildSnapshot::list_files");
-            project.all_files_shared().ok()?
+            project.all_files_with_omissions().ok()?
         };
         let mut live_entries = map_with_capacity(files.len());
         let mut disk_stats = map_with_capacity(files.len());
@@ -999,6 +1186,7 @@ impl WorkspaceBuildSnapshot {
         }
         Some(Arc::new(Self {
             files,
+            omissions,
             live_entries: Arc::new(live_entries),
             disk_stats: Arc::new(disk_stats),
             analysis_generation,
@@ -1149,6 +1337,12 @@ pub struct StructuralSnapshotKey {
     generation: GenerationId,
 }
 
+impl RetainedBytes for StructuralSnapshotKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.blob.lang.capacity()
+    }
+}
+
 impl StructuralSnapshotKey {
     /// A key for a cache test that has no analyzer to derive one from.
     #[cfg(any(test, feature = "test-support"))]
@@ -1164,7 +1358,8 @@ impl StructuralSnapshotKey {
     }
 }
 
-/// Exercise the writable fallback without depending on temporary-file failure.
+/// Exercise the test-only single-connection store without depending on a
+/// temporary-file failure.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn single_connection_store_context_for_test(
@@ -1175,6 +1370,7 @@ pub fn single_connection_store_context_for_test(
     Ok(store_context_from_store(project, store, false))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn ephemeral_store_context(
     project: &dyn Project,
@@ -1182,15 +1378,27 @@ pub fn ephemeral_store_context(
     ephemeral_store_context_with_config(project, &Default::default())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn ephemeral_store_context_with_config(
     project: &dyn Project,
     config: &AnalyzerConfig,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = AnalyzerStore::open_ephemeral_with_config(config)
+    let budget =
+        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    ephemeral_store_context_with_budget(project, config, &budget)
+}
+
+pub(crate) fn ephemeral_store_context_with_budget(
+    project: &dyn Project,
+    config: &AnalyzerConfig,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let store = AnalyzerStore::open_ephemeral_with_config(config, budget)
         .map_err(|error| error.context("opening the ephemeral analyzer store"))?;
     Ok(store_context_from_store(project, store, true))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn persistent_store_context_without_automatic_gc(
     project: &dyn Project,
@@ -1198,13 +1406,25 @@ pub fn persistent_store_context_without_automatic_gc(
     persistent_store_context_with_config(project, &Default::default(), false)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn persistent_store_context_with_config(
     project: &dyn Project,
     config: &AnalyzerConfig,
     automatic_gc: bool,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let budget =
+        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    persistent_store_context_with_budget(project, config, automatic_gc, &budget)
+}
+
+pub(crate) fn persistent_store_context_with_budget(
+    project: &dyn Project,
+    config: &AnalyzerConfig,
+    automatic_gc: bool,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
     let store = match project.persistence_root() {
-        Some(root) => open_persistent_store_with_config(root, config)?,
+        Some(root) => open_persistent_store_with_budget(root, config, budget)?,
         None => {
             return Err(StoreError::new(rootless_persistence_message(
                 project.root(),
@@ -1214,12 +1434,13 @@ pub(crate) fn persistent_store_context_with_config(
     Ok(store_context_from_store(project, store, automatic_gc))
 }
 
-fn open_persistent_store_with_config(
+fn open_persistent_store_with_budget(
     root: &std::path::Path,
     config: &AnalyzerConfig,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> std::result::Result<AnalyzerStore, StoreError> {
     let db_path = crate::analyzer::store::analyzer_db_path(root);
-    AnalyzerStore::open_persistent_with_config(&db_path, config).map_err(|error| {
+    AnalyzerStore::open_persistent_with_config(&db_path, config, budget).map_err(|error| {
         error.context(format!(
             "opening the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
             db_path.display(),
@@ -1228,6 +1449,7 @@ fn open_persistent_store_with_config(
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn scoped_store_context(
     project: &dyn Project,
@@ -1235,11 +1457,12 @@ pub fn scoped_store_context(
     scoped_store_context_with_config(project, &Default::default())
 }
 
-pub(crate) fn scoped_store_context_with_config(
+pub(crate) fn scoped_store_context_with_budget(
     project: &dyn Project,
     config: &AnalyzerConfig,
+    budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> std::result::Result<AnalyzerStoreContext, StoreError> {
-    let store = open_persistent_store_with_config(project.root(), config)?;
+    let store = open_persistent_store_with_budget(project.root(), config, budget)?;
     // The root selects reusable content, not the identity of this partial
     // listing. Do not use the subset to schedule repository-wide collection.
     let mut context = store_context_from_store(project, store, false);
@@ -1249,6 +1472,16 @@ pub(crate) fn scoped_store_context_with_config(
         context.workspace_id.clone(),
     )));
     Ok(context)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn scoped_store_context_with_config(
+    project: &dyn Project,
+    config: &AnalyzerConfig,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let budget =
+        brokk_bifrost_core::retention_budget::RetentionBudget::new(config.retention_budget_bytes());
+    scoped_store_context_with_budget(project, config, &budget)
 }
 
 /// Report a persisted build over a project with no persistence identity, with
@@ -1388,12 +1621,21 @@ pub struct PathParse {
     pub variant: brokk_bifrost_core::gitblob::ParseVariant,
     pub assignment_digest: Option<[u8; 32]>,
     pub condition_symbols: Vec<String>,
-    pub undecided_chains: Vec<crate::analyzer::store::UndecidedChainRow>,
+    pub undecided_scan: Option<crate::analyzer::store::CSharpUndecidedScan>,
     pub preprocessor:
         Option<Arc<dyn brokk_bifrost_core::analyzer::prepared_syntax::SourcePreprocessor>>,
 }
 
-type OverlayVariantMemo = moka::sync::Cache<(ProjectFile, Oid, Option<[u8; 32]>), OverlayVariant>;
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct OverlayVariantKey(ProjectFile, Oid, Option<[u8; 32]>);
+
+impl RetainedBytes for OverlayVariantKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.0.retained_bytes()
+    }
+}
+
+type OverlayVariantMemo = BudgetRegion<OverlayVariantKey, OverlayVariant>;
 
 #[derive(Clone)]
 struct OverlayVariant {
@@ -1401,9 +1643,44 @@ struct OverlayVariant {
     undecided_chains: Vec<crate::analyzer::store::UndecidedChainRow>,
 }
 
+impl RetainedBytes for OverlayVariant {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.undecided_chains.capacity()
+                * std::mem::size_of::<crate::analyzer::store::UndecidedChainRow>()
+            + self
+                .undecided_chains
+                .iter()
+                .map(|chain| {
+                    [
+                        &chain.unknown_symbols,
+                        &chain.open_reasons,
+                        &chain.disagreeing_owners,
+                    ]
+                    .into_iter()
+                    .map(|strings| {
+                        strings.capacity() * std::mem::size_of::<String>()
+                            + strings.iter().map(String::capacity).sum::<usize>()
+                    })
+                    .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
 pub trait LanguageAdapter:
     crate::analyzer::store::StoreLanguageAdapter + Send + Sync + 'static
 {
+    /// Apply obligations carried by a consumed read key. The default language
+    /// has no key-specific obligation.
+    fn record_read_obligation(
+        &self,
+        _analyzer: &TreeSitterAnalyzer<Self>,
+        _key: &crate::analyzer::ReadKey,
+    ) where
+        Self: Sized,
+    {
+    }
     fn derive_parse_configuration(
         &self,
         _store: &AnalyzerStore,
@@ -1433,7 +1710,7 @@ pub trait LanguageAdapter:
             variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
             assignment_digest: None,
             condition_symbols: Vec::new(),
-            undecided_chains: Vec::new(),
+            undecided_scan: None,
             preprocessor: self.preprocess(file, source),
         })
     }
@@ -1503,19 +1780,10 @@ pub trait LanguageAdapter:
         &[]
     }
 
-    /// Opt into bounded AST-proven data exclusion from default line accounting.
-    fn supports_structural_line_data(&self) -> bool {
-        false
-    }
-
-    /// Language grammar rule only; shared code owns traversal and accounting.
-    fn is_structural_line_data(
-        &self,
-        _node: tree_sitter::Node<'_>,
-        _should_stop: &mut dyn FnMut() -> bool,
-    ) -> std::ops::ControlFlow<(), bool> {
-        std::ops::ControlFlow::Continue(false)
-    }
+    /// The grammar tables of this language's data nodes. Shared source
+    /// admission excludes maximal data subtrees from default line accounting,
+    /// so every language declares them; there is no default.
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds;
 
     fn query_directory(&self) -> &'static str;
     fn parser_language(&self) -> TsLanguage {
@@ -1735,7 +2003,11 @@ pub trait LanguageAdapter:
     /// workspace package identity. An unsaved overlay of such an input cannot
     /// be represented by package rows built from the disk workspace, so exact
     /// package misses cease to be authoritative for that request snapshot.
-    fn workspace_package_identity_input(&self, _file: &ProjectFile) -> bool {
+    fn workspace_package_identity_input(&self, file: &ProjectFile) -> bool {
+        self.workspace_package_identity_input_path(file.rel_path())
+    }
+    /// Path-only classification also covers committed inputs absent from the listing.
+    fn workspace_package_identity_input_path(&self, _path: &std::path::Path) -> bool {
         false
     }
     /// The digest of what the package-identity input `file`, whose bytes are
@@ -1839,6 +2111,13 @@ pub trait LanguageAdapter:
     /// [`crate::analyzer::structural::StructuralFactProvider`].
     fn structural_spec(&self) -> Option<&'static dyn crate::analyzer::structural::StructuralSpec> {
         crate::analyzer::structural_spec_for(self.language())
+    }
+
+    fn for_config(self, _config: &AnalyzerConfig) -> Self
+    where
+        Self: Sized,
+    {
+        self
     }
 
     /// Bind path-derived placement to the same project view as source reads.
@@ -1961,7 +2240,7 @@ pub enum PreparedSyntaxLimitedOutcome {
 #[doc(hidden)]
 pub struct AnalyzedSource {
     condition_symbols: Vec<String>,
-    undecided_chains: Vec<crate::analyzer::store::UndecidedChainRow>,
+    undecided_scan: Option<crate::analyzer::store::CSharpUndecidedScan>,
     #[doc(hidden)]
     pub state: FileState,
     /// `None` only for a bounded parse timeout, which keeps a file-scope-only
@@ -2138,6 +2417,61 @@ impl PackageIdentityInputDigest {
             identity: adapter.workspace_package_identity_digest(file, source),
         }
     }
+
+    /// A listed input whose bytes could not be read. The all-zero content
+    /// equals no SHA-256 of real bytes, so every consumer fails closed: an
+    /// overlay is not authoritative against it, a content key that folds it
+    /// misses, and a reread can never confirm it.
+    fn unreadable() -> Self {
+        Self {
+            content: [0; 32],
+            identity: None,
+        }
+    }
+}
+
+/// The selected configuration a generation was built against: the digest of
+/// its inputs and the blob of each present input.
+///
+/// The digest keys content identity but cannot say which files it covers, so
+/// the blobs travel with it. A comparison against a committed tree needs them
+/// (`WorkspaceFactIndex::selected_configuration_input_blobs`). Holding both in
+/// one value keeps them from disagreeing at any write site.
+#[derive(Debug, Clone)]
+struct SelectedConfiguration {
+    digest: StableDigest,
+    /// Workspace-relative path to blob, for inputs that were present.
+    /// A retained absence has no blob.
+    present_blobs: HashMap<Box<str>, Oid>,
+}
+
+impl SelectedConfiguration {
+    fn from_inputs(inputs: &[WorkspaceConfigurationInput]) -> Self {
+        let mut ordered = inputs.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|input| input.relative_path());
+        Self {
+            digest: crate::analyzer::store::configuration_digest(ordered.iter().map(|input| {
+                (
+                    input.relative_path(),
+                    input.content_oid(),
+                    Some(input.file_present),
+                )
+            })),
+            present_blobs: inputs
+                .iter()
+                .filter(|input| input.file_present)
+                .map(|input| (Box::from(input.relative_path()), input.content_oid()))
+                .collect(),
+        }
+    }
+
+    /// The selection after one present input was republished in place.
+    /// `digest` is the store's digest of the resulting revision.
+    fn with_replaced_input(mut self, path: &str, blob: Oid, digest: StableDigest) -> Self {
+        self.present_blobs.insert(Box::from(path), blob);
+        self.digest = digest;
+        self
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2145,25 +2479,39 @@ impl PackageIdentityInputDigest {
 pub struct AnalyzerRuntimeState {
     fresh_parse_errors: HashMap<ProjectFile, Vec<crate::analyzer::ParseError>>,
     #[doc(hidden)]
-    pub dirty_file_states: Mutex<HashMap<FileStateCacheKey, DirtyFileState>>,
+    dirty_file_states: Mutex<HashMap<FileStateCacheKey, DirtyFileState>>,
     #[doc(hidden)]
     pub dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
     /// Whether this generation accounts for every workspace package file.
     /// Positive package rows remain usable when incomplete; only absence loses
     /// authority. Incremental generations may clear but never restore it.
     workspace_inventory: WorkspaceInventoryCompleteness,
+    /// The snapshots this generation's own syncs published, by storage
+    /// language. `workspace_inventory.listed` describes what those syncs
+    /// observed, not whatever revision the store holds later, so a listing
+    /// proof covers a selected snapshot only if it is one of these.
+    listed_snapshots: arc_swap::ArcSwap<WorkspaceSnapshots>,
+    /// The storage languages whose listing proof a content-reading sync
+    /// withdrew because it could not validate every file. The withdrawal
+    /// persists: a later update observes the files it changed, not the file
+    /// that could not be validated, so it must not grant the proof again. Only
+    /// a sync that validates every file of the language clears its entry.
+    listing_withdrawn: arc_swap::ArcSwap<HashSet<String>>,
     /// Digests of the non-source inputs that qualified this generation's
     /// workspace declarations.
     #[doc(hidden)]
     pub workspace_package_identity_input_digests: HashMap<ProjectFile, PackageIdentityInputDigest>,
-    /// Canonical disk configuration identity; exact historical bytes live in SQL.
-    workspace_configuration_digest: Option<StableDigest>,
+    /// Canonical disk configuration identity and the blobs it covers; exact
+    /// historical bytes live in SQL.
+    selected_configuration: Option<SelectedConfiguration>,
     /// A build can finish with useful source/package rows while failing to
     /// capture the configuration bytes that qualify those rows. Keep that
     /// failure with the generation: construction happens before a query
     /// context exists, so `begin_query` delivers it at the normal query
     /// failure boundary instead of dropping it.
     workspace_package_inventory_error: Option<StoreError>,
+    /// A failed update attempt; retired when pending paths reconcile.
+    update_resolution_error: Option<StoreError>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     #[doc(hidden)]
     pub persistence_stats: PersistBatchStats,
@@ -2202,19 +2550,55 @@ struct WorkspaceInventoryCompleteness {
     /// selected revision records with its reason. Graph construction can name
     /// those exclusions instead of refusing the whole inventory.
     accounted: bool,
+    /// The source enumeration reached every workspace source: the listing was
+    /// complete, every listed file resolved to a content identity, and the
+    /// workspace-input sync ran. A source left out here has no file version, so
+    /// no database arm can see the hole. A blob that failed to persist does not
+    /// clear it: that file has a version and its state is unknown in the store.
+    listed: bool,
 }
 
 impl WorkspaceInventoryCompleteness {
     const COMPLETE: Self = Self {
         indexed: true,
         accounted: true,
+        listed: true,
     };
 
     fn mark_incomplete(&mut self) {
         *self = Self {
             indexed: false,
             accounted: false,
+            listed: self.listed,
         };
+    }
+
+    /// An enumeration or identity-resolution failure: a source may be missing
+    /// from the published inventory without any trace in it.
+    fn require_listed(&mut self, condition: bool) {
+        if !condition {
+            self.listed = false;
+            self.mark_incomplete();
+        }
+    }
+
+    /// The omissions of the listing this sync observed, or None when it
+    /// observed no listing. Without a listing there is no evidence that no
+    /// source was dropped, and an omission that can hide a source is evidence
+    /// that one was. Only the listing fact moves: the sources that were listed
+    /// are all indexed, so package and graph readiness are unchanged.
+    fn require_observed_listing(
+        &mut self,
+        omissions: Option<&[brokk_bifrost_core::analyzer::project::WorkspaceFileOmission]>,
+    ) {
+        let hidden = omissions.is_none_or(|omissions| {
+            omissions
+                .iter()
+                .any(|omission| omission_may_hide_source(omission.reason))
+        });
+        if hidden {
+            self.listed = false;
+        }
     }
 
     fn require(&mut self, condition: bool) {
@@ -2248,9 +2632,23 @@ impl WorkspaceInventoryCompleteness {
         }
     }
 
+    /// The sync's accounting for a live source whose blob has no published
+    /// facts. Admitted sources are selected with their facts missing, refusals
+    /// are recorded rows, and an unfinished admission is neither: the source
+    /// has no file version and no refusal row, so no database arm can see the
+    /// hole and the listing itself is incomplete.
+    fn record_unpublished(&mut self, outcome: &UnpublishedSource) {
+        match outcome {
+            UnpublishedSource::Admitted => self.mark_incomplete(),
+            UnpublishedSource::Refused(reason) => self.record_refusal(reason),
+            UnpublishedSource::Unavailable => self.require_listed(false),
+        }
+    }
+
     fn meet(&mut self, other: Self) {
         self.indexed &= other.indexed;
         self.accounted &= other.accounted;
+        self.listed &= other.listed;
     }
 }
 
@@ -2290,9 +2688,12 @@ impl AnalyzerRuntimeState {
             dirty_file_states: Mutex::new(dirty_file_states),
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
             workspace_inventory,
+            listed_snapshots: arc_swap::ArcSwap::from_pointee(WorkspaceSnapshots::default()),
+            listing_withdrawn: arc_swap::ArcSwap::from_pointee(HashSet::default()),
             workspace_package_identity_input_digests: HashMap::default(),
-            workspace_configuration_digest: None,
+            selected_configuration: None,
             workspace_package_inventory_error: None,
+            update_resolution_error: None,
             seeded_file_states,
             persistence_stats: PersistBatchStats::default(),
             claim_edges: HashMap::default(),
@@ -2310,15 +2711,22 @@ impl AnalyzerRuntimeState {
             dirty_file_states,
             dirty_path_symbol_rows,
             workspace_inventory,
+            listed_snapshots: _,
+            listing_withdrawn: _,
             workspace_package_identity_input_digests,
-            workspace_configuration_digest: _,
+            selected_configuration: _,
             workspace_package_inventory_error,
+            update_resolution_error,
             seeded_file_states,
             persistence_stats,
             claim_edges,
             tier_demand,
             claim_import_reads,
         } = other;
+        self.update_resolution_error = self
+            .update_resolution_error
+            .take()
+            .or(update_resolution_error);
         self.fresh_parse_errors.extend(fresh_parse_errors);
         // The second pass was handed this pass's dirty maps as input and
         // returns the merged result, so it replaces rather than extends.
@@ -2355,7 +2763,7 @@ impl AnalyzerRuntimeState {
     }
 
     fn record_workspace_package_inventory_error(&mut self, error: StoreError) {
-        self.mark_workspace_package_inventory_incomplete();
+        self.workspace_inventory.require_listed(false);
         if self.workspace_package_inventory_error.is_none() {
             self.workspace_package_inventory_error = Some(error);
         }
@@ -2379,6 +2787,24 @@ impl AnalyzerRuntimeState {
             .clone()
     }
 
+    #[doc(hidden)]
+    pub fn insert_dirty_file_state_for_test(&self, key: FileStateCacheKey, dirty: DirtyFileState) {
+        self.dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .insert(key, dirty);
+    }
+
+    #[doc(hidden)]
+    pub fn force_dirty_retry_for_test(&self, key: &FileStateCacheKey) {
+        self.dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .get_mut(key)
+            .expect("failed preparation must remain dirty")
+            .next_retry_at = Instant::now();
+    }
+
     fn has_dirty_file_states(&self) -> bool {
         !self
             .dirty_file_states
@@ -2392,14 +2818,6 @@ impl AnalyzerRuntimeState {
             .lock()
             .expect("dirty path-symbol mutex poisoned")
             .clone()
-    }
-
-    fn dirty_content_qualifier(&self, key: &FileStateCacheKey) -> Option<String> {
-        self.dirty_file_states
-            .lock()
-            .expect("dirty file-state mutex poisoned")
-            .get(key)
-            .map(|dirty| dirty.state.content_qualifier.clone())
     }
 
     fn dirty_imports(&self, key: &FileStateCacheKey) -> Option<Vec<ImportInfo>> {
@@ -2515,6 +2933,20 @@ impl FileStateCacheKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SourceParseabilityCacheKey {
     file_state: FileStateCacheKey,
+}
+
+impl RetainedBytes for SourceParseabilityCacheKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.file_state.rel_path.as_os_str().len()
+    }
+}
+
+struct ParseabilityDecision(Result<(), SourceAdmissionRefusal>);
+
+impl RetainedBytes for ParseabilityDecision {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }
 
 fn source_bytes_for_oid(project: &dyn Project, file: &ProjectFile, oid: Oid) -> Option<Vec<u8>> {
@@ -2983,6 +3415,12 @@ pub struct SourceBlobIdentity {
     oid: Oid,
 }
 
+impl RetainedBytes for SourceBlobIdentity {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 /// Per-file memo of "the blob oid of this exact decoded source text" (#2917).
 ///
 /// Every query path that persists or looks up facts under a file's content key
@@ -2996,7 +3434,7 @@ pub struct SourceBlobIdentity {
 #[doc(hidden)]
 pub struct SourceBlobOidMemo {
     #[doc(hidden)]
-    pub entries: moka::sync::Cache<ProjectFile, SourceBlobIdentity>,
+    pub entries: BudgetRegion<ProjectFile, SourceBlobIdentity>,
     /// SHA-1 computations performed, for the #2917 cost pin.
     #[cfg(any(test, feature = "test-support"))]
     hashes: AtomicUsize,
@@ -3006,17 +3444,25 @@ pub struct SourceBlobOidMemo {
     pub text_hashes: AtomicUsize,
 }
 
-impl Default for SourceBlobOidMemo {
-    fn default() -> Self {
+impl SourceBlobOidMemo {
+    fn new(budget: &brokk_bifrost_core::retention_budget::RetentionBudget) -> Self {
         Self {
-            entries: moka::sync::Cache::builder()
-                .max_capacity(SOURCE_BLOB_OID_MEMO_ENTRIES)
-                .build(),
+            entries: budget.region(
+                "analysis.source_blob_oid",
+                Some(SOURCE_BLOB_OID_MEMO_ENTRIES as usize),
+            ),
             #[cfg(any(test, feature = "test-support"))]
             hashes: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             text_hashes: AtomicUsize::new(0),
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for SourceBlobOidMemo {
+    fn default() -> Self {
+        Self::new(&brokk_bifrost_core::retention_budget::RetentionBudget::for_tests())
     }
 }
 
@@ -3514,15 +3960,28 @@ struct UnseenBranchFilesMemo {
             Arc<Vec<crate::analyzer::store::UnseenBranchFile>>,
         )>,
     >,
-    overlays: Mutex<Option<CachedOverlayUnseenBranches>>,
+    certification: OnceLock<ScopeCertification>,
     produced: Mutex<ProducedUnseenBranches>,
 }
 
-struct CachedOverlayUnseenBranches {
-    snapshot: crate::analyzer::store::WorkspaceSnapshotId,
-    digest: [u8; 32],
+struct OverlayUnseenBranchCensus {
+    certified: bool,
     rows: Arc<Vec<crate::analyzer::store::UnseenBranchFile>>,
 }
+
+#[derive(Clone)]
+enum ScopeCertification {
+    Certified {
+        snapshot: crate::analyzer::store::WorkspaceSnapshotId,
+        overlay_digest: Option<[u8; 32]>,
+        rows: Arc<Vec<crate::analyzer::store::UnseenBranchFile>>,
+    },
+    Uncertified,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+static CSHARP_CERTIFICATE_CENSUSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 type ProducedUnseenBranches =
     HashMap<(String, [u8; 32]), Vec<crate::analyzer::store::UndecidedChainRow>>;
@@ -3617,6 +4076,10 @@ pub struct QueryReadCache {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub identifier_candidate_query_executions: Arc<AtomicUsize>,
+    /// `analyzed_live_files` calls answered from the request memo.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub analyzed_live_file_hits: Arc<AtomicUsize>,
     /// The workspace's path-synthetic module units, walked at most once per
     /// request (#1774). Complete eligibility is memoized before caller filtering.
     path_synthetic_modules: Arc<RwLock<Option<Arc<PathSyntheticModules>>>>,
@@ -3782,6 +4245,8 @@ impl QueryReadCache {
             identifier_candidate_units: Arc::new(KeyedPoolSafeMemo::new()),
             #[cfg(any(test, feature = "test-support"))]
             identifier_candidate_query_executions: Arc::new(AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            analyzed_live_file_hits: Arc::new(AtomicUsize::new(0)),
             path_synthetic_modules: Arc::new(RwLock::new(None)),
             class_ranges: Arc::new(RwLock::new(HashMap::default())),
             definition_lookup: Arc::default(),
@@ -3882,6 +4347,7 @@ impl QueryReadCache {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.identifier_candidate_query_executions = Arc::new(AtomicUsize::new(0));
+            self.analyzed_live_file_hits = Arc::new(AtomicUsize::new(0));
         }
         self.path_synthetic_modules = Arc::new(RwLock::new(None));
         self.class_ranges = Arc::new(RwLock::new(HashMap::default()));
@@ -4154,6 +4620,7 @@ pub struct TreeSitterAnalyzer<A> {
     #[doc(hidden)]
     pub adapter: Arc<A>,
     config: AnalyzerConfig,
+    pending_updates: BTreeSet<ProjectFile>,
     #[doc(hidden)]
     pub state: Arc<AnalyzerRuntimeState>,
     /// Structural-search facts cache (issue #328). Shared across clones and
@@ -4174,11 +4641,15 @@ pub struct TreeSitterAnalyzer<A> {
     /// content identity, derived once. See `build_content_identity_base`.
     content_identity_base: StableDigest,
     semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
-    loop_candidates_by_procedure:
-        moka::sync::Cache<ProcedureFactCacheKey, Arc<crate::analyzer::LoopCandidates>>,
-    statement_assessments_by_procedure: moka::sync::Cache<
+    loop_candidates_by_procedure: BudgetedValueCache<
         ProcedureFactCacheKey,
-        Arc<crate::analyzer::semantic::StatementAssessments>,
+        SharedAllocation<Accounted<crate::analyzer::LoopCandidates>>,
+    >,
+    statement_assessments_by_procedure: BudgetedValueCache<
+        ProcedureFactCacheKey,
+        SharedAllocation<
+            Accounted<crate::analyzer::semantic::statement_entries::AccountedStatementAssessments>,
+        >,
     >,
     /// Content digests already derived for a blob, so a repeat semantic
     /// materialization of an unchanged file does not re-hash it. Keyed by the
@@ -4196,8 +4667,7 @@ pub struct TreeSitterAnalyzer<A> {
     /// Parse-safety verdicts for source blobs whose required fact publication
     /// is absent. The explicit entry cap bounds this across requests.
     /// Shared with clones that share persistent products; rebuilds start clean.
-    source_parseability:
-        moka::sync::Cache<SourceParseabilityCacheKey, Result<(), SourceAdmissionRefusal>>,
+    source_parseability: BudgetRegion<SourceParseabilityCacheKey, ParseabilityDecision>,
     #[doc(hidden)]
     pub store_context: AnalyzerStoreContext,
     /// Immutable path-to-blob identities for the source generation that built
@@ -4330,6 +4800,7 @@ impl<A: LanguageAdapter> Clone for TreeSitterAnalyzer<A> {
             project: Arc::clone(&self.project),
             adapter: Arc::clone(&self.adapter),
             config: self.config.clone(),
+            pending_updates: self.pending_updates.clone(),
             state: Arc::clone(&self.state),
             structural_cache: Arc::clone(&self.structural_cache),
             structural_index_cache: Arc::clone(&self.structural_index_cache),
@@ -4394,6 +4865,11 @@ impl<A: LanguageAdapter> Clone for TreeSitterAnalyzer<A> {
 }
 
 impl<A> TreeSitterAnalyzer<A> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_pending_update_paths(&self) -> &BTreeSet<ProjectFile> {
+        &self.pending_updates
+    }
+
     /// An object-safe core source can retain this exact generation's
     /// recording capability without cloning an analyzer into a fresh registry.
     pub fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability
@@ -4445,11 +4921,14 @@ impl<A> TreeSitterAnalyzer<A> {
         snapshot.structural_index_cache = Arc::new(
             crate::analyzer::structural::provider::StructuralFactSnapshotCache::new(
                 self.config.memo_cache_budget_bytes(),
+                self.analyzer_store().retention_budget(),
             ),
         );
-        snapshot.snapshot_caches = Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
-            self.config.memo_cache_budget_bytes() / 8,
-        ));
+        snapshot.snapshot_caches =
+            Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new_with_budget(
+                self.config.memo_cache_budget_bytes() / 8,
+                self.analyzer_store().retention_budget(),
+            ));
         snapshot.adapter = Self::bind_selected_adapter(
             &snapshot.project,
             Arc::clone(&snapshot.adapter),
@@ -4496,10 +4975,13 @@ where
     ) -> crate::analyzer::store::Result<
         Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
     > {
-        if !matches!(
-            language,
-            Language::JavaScript | Language::TypeScript | Language::CSharp | Language::Go
-        ) {
+        // The tree-sitter analyzer has never captured a Rust overlay set;
+        // `publish_overlay` itself still serves Rust.
+        if language == Language::Rust
+            || !crate::analyzer::store::dependency_file_evidence::publishes_dependency_evidence(
+                language,
+            )
+        {
             return Ok(None);
         }
         crate::analyzer::store::dependency_file_evidence::publish_overlay(
@@ -4539,6 +5021,7 @@ where
         descendants.extend(keyed.into_iter().map(|(_, child)| child));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>, adapter: A) -> Self {
         Self::new_with_config(project, adapter, AnalyzerConfig::default())
     }
@@ -4548,8 +5031,11 @@ where
         &self.config
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config(project: Arc<dyn Project>, adapter: A, config: AnalyzerConfig) -> Self {
-        Self::new_internal(project, adapter, config, None, None)
+        let store_context = ephemeral_store_context_with_config(project.as_ref(), &config)
+            .expect("failed to initialize in-memory analyzer store");
+        Self::new_internal(project, adapter, config, None, store_context)
             .expect("failed to initialize in-memory analyzer store")
     }
 
@@ -4561,7 +5047,7 @@ where
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
     ) -> std::result::Result<Self, StoreError> {
-        Self::new_internal(project, adapter, config, progress, Some(store_context))
+        Self::new_internal(project, adapter, config, progress, store_context)
     }
 
     #[doc(hidden)]
@@ -4617,7 +5103,7 @@ where
             );
             store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
             let mut state = Self::build_state(
-                self.project.as_ref(),
+                Arc::clone(&self.project),
                 adapter.as_ref(),
                 &self.config,
                 progress,
@@ -4631,10 +5117,17 @@ where
             }
             if let Some(snapshot) = relational_workspace_snapshots.get("rust")
                 && self.adapter.language() == Language::Rust
-                && let Err(error) = store_context.store.reconcile_rust_crates(snapshot)
             {
-                state.mark_workspace_package_inventory_incomplete();
-                eprintln!("Rust crate reconciliation failed after full update: {error}");
+                match store_context.store.reconcile_rust_crates(snapshot) {
+                    Ok(report) => self
+                        .snapshot_caches
+                        .derivations()
+                        .forget_rust_units(&report),
+                    Err(error) => {
+                        state.mark_workspace_package_inventory_incomplete();
+                        eprintln!("Rust crate reconciliation failed after full update: {error}");
+                    }
+                }
             }
             if let Err(error) = store_context
                 .store
@@ -4660,6 +5153,7 @@ where
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_progress<F>(project: Arc<dyn Project>, adapter: A, progress: F) -> Self
     where
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
@@ -4667,6 +5161,7 @@ where
         Self::new_with_config_and_progress(project, adapter, AnalyzerConfig::default(), progress)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config_and_progress<F>(
         project: Arc<dyn Project>,
         adapter: A,
@@ -4676,8 +5171,16 @@ where
     where
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
-        Self::new_internal(project, adapter, config, Some(Arc::new(progress)), None)
-            .expect("failed to initialize in-memory analyzer store")
+        let store_context = ephemeral_store_context_with_config(project.as_ref(), &config)
+            .expect("failed to initialize in-memory analyzer store");
+        Self::new_internal(
+            project,
+            adapter,
+            config,
+            Some(Arc::new(progress)),
+            store_context,
+        )
+        .expect("failed to initialize in-memory analyzer store")
     }
 
     fn new_internal(
@@ -4685,7 +5188,7 @@ where
         adapter: A,
         config: AnalyzerConfig,
         progress: Option<BuildProgress>,
-        store_context: Option<AnalyzerStoreContext>,
+        store_context: AnalyzerStoreContext,
     ) -> std::result::Result<Self, StoreError> {
         let project = super::project_read_facade::with_project_read_slot(project);
         let attached_read_ledgers = Arc::new(AtomicUsize::new(0));
@@ -4694,25 +5197,28 @@ where
             QueryReadCache::default(),
             &attached_read_ledgers,
         );
+        let adapter = adapter.for_config(&config);
         let adapter = Arc::new(adapter.for_project(Arc::clone(&project)).unwrap_or(adapter));
         // A supplied store can still belong to a directly constructed analyzer.
         // Only a workspace build snapshot delegates crate publication to the
         // WorkspaceAnalyzer boundary after its language workers finish.
-        let standalone = store_context
-            .as_ref()
-            .is_none_or(|context| context.workspace_snapshot.is_none());
-        let mut store_context = match store_context {
-            Some(store_context) => store_context,
-            None => ephemeral_store_context_with_config(project.as_ref(), &config)?,
-        };
+        let standalone = store_context.workspace_snapshot.is_none();
+        let mut store_context = store_context;
+        if standalone {
+            store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
+                project.as_ref(),
+                store_context.liveness.as_deref(),
+                &[adapter.language()],
+            );
+            store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
+        }
         let epochs = adapter
             .storage_language_keys()
             .into_iter()
             .map(|(storage_key, parser_language)| {
                 (
                     storage_key,
-                    crate::analyzer::store::epoch::epoch_for(adapter.language(), &parser_language)
-                        .into_owned(),
+                    crate::analyzer::store::epoch::epoch_for(adapter.language(), &parser_language),
                 )
             })
             .collect::<Vec<_>>();
@@ -4723,7 +5229,11 @@ where
         for (storage_language, _) in &epochs {
             store_context
                 .store
-                .ensure_resolution_producer_epoch(storage_language, adapter.language())
+                .ensure_resolution_producer_epoch_value(
+                    storage_language,
+                    adapter.language(),
+                    adapter.resolution_producer_epoch(),
+                )
                 .map_err(|error| error.context("publishing resolution producer epochs"))?;
         }
         store_context.generations = Arc::new(generations);
@@ -4733,7 +5243,7 @@ where
                 adapter.language()
             ));
             Arc::new(Self::build_state(
-                project.as_ref(),
+                Arc::clone(&project),
                 adapter.as_ref(),
                 &config,
                 progress,
@@ -4749,11 +5259,19 @@ where
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config, &store_context));
-        let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
-        let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
+        let structural_index_cache = Arc::new(Self::build_structural_index_cache(
+            &config,
+            store_context.store.retention_budget(),
+        ));
+        let snapshot_caches = Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new_with_budget(
+            config.memo_cache_budget_bytes() / 8,
+            store_context.store.retention_budget(),
+        ));
         let content_identity_base = Self::build_content_identity_base(&config, adapter.as_ref());
         let semantic_cache =
-            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::default();
+            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new_with_budget(
+                store_context.store.retention_budget(),
+            );
         let active_persisted_payload_bytes = store_context
             .store
             .active_file_state_payload_bytes(&store_context.generations)
@@ -4762,7 +5280,6 @@ where
             file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
         let query_file_state_cache_budget =
             query_file_state_cache_budget_bytes(file_state_cache_budget);
-        let procedure_fact_cache_budget = config.memo_cache_budget_bytes() / 16;
         let storage_languages = adapter
             .storage_language_keys()
             .into_iter()
@@ -4823,14 +5340,12 @@ where
             source_snapshot_file_states,
             file_state_cache_budget,
             query_file_state_cache_budget,
-            procedure_fact_cache_budget,
             indexed_live_snapshot,
             dependency_evidence_overlay,
         ))
     }
 
-    /// The structural facts cache takes a slice of the shared memo budget --
-    /// one slice for the workspace, not one per language delegate.
+    /// The structural facts cache shares the owner's retention budget.
     ///
     /// The delegates of one build share the entries and the budget through
     /// their shared store context, and each keeps its own extraction and
@@ -4838,14 +5353,14 @@ where
     /// [`AnalyzerStoreContext::structural_facts`].
     #[doc(hidden)]
     pub fn build_structural_cache(
-        config: &AnalyzerConfig,
+        _config: &AnalyzerConfig,
         store_context: &AnalyzerStoreContext,
     ) -> crate::analyzer::structural::provider::StructuralFactsCache {
         store_context
             .structural_facts
             .get_or_init(|| {
                 crate::analyzer::structural::provider::StructuralFactsCache::new(
-                    config.memo_cache_budget_bytes() / 8,
+                    store_context.store.retention_budget(),
                 )
             })
             .sharing_entries()
@@ -4859,9 +5374,11 @@ where
     #[doc(hidden)]
     pub fn build_structural_index_cache(
         config: &AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> crate::analyzer::structural::provider::StructuralFactSnapshotCache {
         crate::analyzer::structural::provider::StructuralFactSnapshotCache::new(
             config.memo_cache_budget_bytes(),
+            budget,
         )
     }
 
@@ -4871,6 +5388,7 @@ where
         &self.structural_index_cache
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn build_snapshot_caches(
         config: &AnalyzerConfig,
@@ -4923,6 +5441,25 @@ where
     /// reusable.
     #[doc(hidden)]
     pub fn language_content_identity(&self) -> StableDigest {
+        self.content_identity_with_file_set(|overlays| {
+            self.indexed_live_snapshot.content_digest(overlays)
+        })
+    }
+
+    /// Everything [`Self::language_content_identity`] folds except the
+    /// analyzed file set, as one digest: the epoch, the analyzer
+    /// configuration, the selected configuration, the package-identity
+    /// inputs and the overlays.
+    fn identity_inputs_digest(&self) -> StableDigest {
+        self.content_identity_with_file_set(|_| StableDigest::sha256(b"no-file-set"))
+    }
+
+    fn content_identity_with_file_set(
+        &self,
+        file_set: impl FnOnce(
+            Option<&brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent>,
+        ) -> StableDigest,
+    ) -> StableDigest {
         let overlays = self.project.overlay_content();
         let language = self.adapter.language();
         let mut overlay_paths = self
@@ -4941,25 +5478,46 @@ where
                 }
             }
         }
-        let base = self.state.workspace_configuration_digest.map_or(
+        let base = self.state.selected_configuration.as_ref().map_or(
             self.content_identity_base,
-            |digest| {
+            |configuration| {
                 let mut base = crate::analyzer::canonical_hash::CanonicalHasher::new(
                     b"bifrost-workspace-content:selected-configuration:v1",
                 );
                 base.field("language", self.content_identity_base.as_bytes());
-                base.field("configuration", digest.as_bytes());
+                base.field("configuration", configuration.digest.as_bytes());
                 StableDigest::from_array(base.finish())
             },
         );
         crate::analyzer::content_identity::language_content_identity(
             base,
-            self.indexed_live_snapshot
-                .content_digest(overlays.as_deref()),
+            file_set(overlays.as_deref()),
             overlay_paths
                 .iter()
                 .map(|(path, digest)| (path.as_str(), digest)),
         )
+    }
+
+    /// Language, adapter and selected configuration authority without the
+    /// file-set content folded into `language_content_identity`.
+    pub fn structural_selection_authority(&self) -> StableDigest {
+        let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-structural-selection-authority:v1",
+        );
+        hasher.field(
+            "language",
+            self.adapter.language().config_label().as_bytes(),
+        );
+        hasher.field("base", self.content_identity_base.as_bytes());
+        SourceAdmissionPolicy::current().hash_identity(&mut hasher);
+        hasher.field(
+            "overlay_authority",
+            &[u8::from(self.project.overlay_content().is_some())],
+        );
+        if let Some(configuration) = self.state.selected_configuration.as_ref() {
+            hasher.field("selected_configuration", configuration.digest.as_bytes());
+        }
+        StableDigest::from_array(hasher.finish())
     }
 
     #[doc(hidden)]
@@ -5051,6 +5609,19 @@ where
         crate::analyzer::semantic::SemanticProviderError,
     > {
         crate::analyzer::semantic::service::stored_partial_flows(self, file, key, procedure)
+    }
+
+    #[doc(hidden)]
+    pub fn stored_semantic_ir_procedure(
+        &self,
+        file: &ProjectFile,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+        procedure: crate::analyzer::semantic::ProcedureId,
+    ) -> Result<
+        Option<crate::analyzer::semantic::ProcedureSemanticsParts>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        crate::analyzer::semantic::service::stored_semantic_ir_procedure(self, file, key, procedure)
     }
 
     #[doc(hidden)]
@@ -5182,8 +5753,7 @@ where
         let oid = self.content_oid_of(file, source)?;
         let key = self.variant_cache_key(oid, file)?;
         let state = self
-            .state
-            .dirty_file_state(&key)
+            .dirty_file_state_for_query(&key)
             .or_else(|| self.source_snapshot_file_states.get(&key).cloned())
             .or_else(|| self.query_file_state_snapshot(&key));
         let state = state.or_else(|| {
@@ -5412,6 +5982,48 @@ where
         })
     }
 
+    /// Whether the workspace-input sync saw every source of this language, and
+    /// no overlay replaces persisted content. This is the fact the definition
+    /// inventory enumerator needs besides the stored file states: a source the
+    /// enumeration missed or admission refused has no file version, so the
+    /// store cannot tell that it is absent from its own selection. It is not
+    /// persisted; each analyzer holds its own build's fact.
+    #[doc(hidden)]
+    pub fn workspace_listing_complete(&self) -> bool {
+        self.state.workspace_inventory.listed
+            && self.project.overlay_content().is_none_or(|overlays| {
+                // Ownership, not the extension: a header the analyzer adopted
+                // through include inference has no language of its own.
+                let live = self.live_snapshot();
+                overlays
+                    .entries()
+                    .iter()
+                    .all(|(file, _)| !self.adapter_owns_file(file, &live))
+            })
+    }
+
+    /// The snapshots whose listing this analyzer observed complete: the
+    /// selected snapshot of each storage language that this analyzer's own sync
+    /// published, while [`Self::workspace_listing_complete`] holds. The store
+    /// reads at exactly these snapshots, so the fact cannot be paired with an
+    /// earlier snapshot, or with one another writer published after the sync.
+    #[doc(hidden)]
+    pub fn workspace_listing_proof(&self) -> crate::analyzer::store::ListedSnapshots {
+        let mut proven = WorkspaceSnapshots::default();
+        if self.workspace_listing_complete() {
+            let listed = self.state.listed_snapshots.load();
+            // A withdrawn language has no proof even when the listed fact
+            // survived, for example when two reads of the omissions raced.
+            let withdrawn = self.state.listing_withdrawn.load();
+            for (lang, snapshot) in self.selected_workspace_snapshots().iter() {
+                if listed.get(lang) == Some(snapshot) && !withdrawn.contains(lang) {
+                    proven.insert(lang.clone(), snapshot.clone());
+                }
+            }
+        }
+        crate::analyzer::store::ListedSnapshots::new(proven)
+    }
+
     /// Whether every source overlay belongs to the parsed inventory. Unlike
     /// package-absence proof, graph construction may consume an indexed overlay,
     /// and a source that admission refused is an explained exclusion the
@@ -5579,7 +6191,6 @@ where
             file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
         let query_file_state_cache_budget =
             query_file_state_cache_budget_bytes(file_state_cache_budget);
-        let procedure_fact_cache_budget = config.memo_cache_budget_bytes() / 16;
         let indexed_live_snapshot = store_context.live_paths.snapshot();
         let dependency_evidence_overlay = Self::capture_dependency_overlay(
             project.as_ref(),
@@ -5611,7 +6222,6 @@ where
             source_snapshot_file_states,
             file_state_cache_budget,
             query_file_state_cache_budget,
-            procedure_fact_cache_budget,
             indexed_live_snapshot,
             dependency_evidence_overlay,
         )
@@ -5640,7 +6250,6 @@ where
         source_snapshot_file_states: SourceSnapshotFileStateIndex,
         file_state_cache_budget: usize,
         query_file_state_cache_budget: usize,
-        procedure_fact_cache_budget: u64,
         indexed_live_snapshot: Arc<LiveSnapshot>,
         dependency_evidence_overlay: crate::analyzer::store::Result<
             Option<Arc<crate::analyzer::store::dependency_file_evidence::ScopedDependencyEvidence>>,
@@ -5650,28 +6259,40 @@ where
             project,
             adapter,
             config,
+            pending_updates: BTreeSet::new(),
             state,
             structural_cache,
             structural_index_cache,
             snapshot_caches,
             content_identity_base,
             semantic_cache,
-            loop_candidates_by_procedure: crate::analyzer::weighted_cache::build_weighted_cache(
-                procedure_fact_cache_budget,
-                crate::analyzer::weight_loop_candidates,
+            loop_candidates_by_procedure: BudgetedValueCache::new(
+                store_context
+                    .store
+                    .retention_budget()
+                    .region("analysis.loop_candidates_by_procedure", None),
             ),
-            statement_assessments_by_procedure:
-                crate::analyzer::weighted_cache::build_weighted_cache(
-                    procedure_fact_cache_budget,
-                    crate::analyzer::semantic::statement_entries::weight_statement_assessments,
-                ),
+            statement_assessments_by_procedure: BudgetedValueCache::new(
+                store_context
+                    .store
+                    .retention_budget()
+                    .region("analysis.statement_assessments_by_procedure", None),
+            ),
             semantic_source_digests:
-                crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
-            overlay_variants: moka::sync::Cache::builder().max_capacity(4096).build(),
-            blob_oids: Arc::new(SourceBlobOidMemo::default()),
-            source_parseability: moka::sync::Cache::builder()
-                .max_capacity(SOURCE_PARSEABILITY_MEMO_ENTRIES)
-                .build(),
+                crate::analyzer::semantic::service::SourceContentIdentityMemo::new(
+                    store_context.store.retention_budget(),
+                ),
+            overlay_variants: store_context
+                .store
+                .retention_budget()
+                .region("analysis.overlay_variants", Some(4096)),
+            blob_oids: Arc::new(SourceBlobOidMemo::new(
+                store_context.store.retention_budget(),
+            )),
+            source_parseability: store_context.store.retention_budget().region(
+                "analysis.source_parseability",
+                Some(SOURCE_PARSEABILITY_MEMO_ENTRIES as usize),
+            ),
             store_context,
             indexed_live_snapshot,
             dependency_evidence_overlay,
@@ -5795,7 +6416,7 @@ where
             variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
             assignment_digest: None,
             condition_symbols: Vec::new(),
-            undecided_chains: Vec::new(),
+            undecided_scan: None,
             preprocessor: adapter.preprocess(file, &source),
         };
         Self::analyze_source_with_parse(parser, adapter, file, source, budget, parse)
@@ -5835,7 +6456,7 @@ where
                 parsed.add_file_scope(file, &source);
                 return Some(AnalyzedSource {
                     condition_symbols: parse.condition_symbols,
-                    undecided_chains: parse.undecided_chains,
+                    undecided_scan: parse.undecided_scan,
                     state: Self::file_state_from_parsed(
                         source,
                         parsed,
@@ -5958,7 +6579,7 @@ where
         state.additional_projections = additional_projections;
         Some(AnalyzedSource {
             condition_symbols: parse.condition_symbols,
-            undecided_chains: parse.undecided_chains,
+            undecided_scan: parse.undecided_scan,
             state,
             syntax: Some(syntax),
         })
@@ -6314,7 +6935,7 @@ where
                                 let result = match analyzed {
                                     Some(AnalyzedSource {
                                         condition_symbols: _,
-                                        undecided_chains: _,
+                                        undecided_scan: _,
                                         state: timed_out_state,
                                         syntax: None,
                                     }) => {
@@ -6331,7 +6952,7 @@ where
                                     }
                                     Some(AnalyzedSource {
                                         condition_symbols,
-                                        undecided_chains,
+                                        undecided_scan,
                                         state,
                                         syntax: Some(syntax),
                                     }) => {
@@ -6365,8 +6986,8 @@ where
                                                     if !condition_symbols.is_empty() {
                                                         *prepared = prepared.with_condition_symbols(condition_symbols);
                                                     }
-                                                    if !undecided_chains.is_empty() {
-                                                        *prepared = prepared.with_undecided_chains(undecided_chains);
+                                                    if let Some(scan) = undecided_scan {
+                                                        *prepared = prepared.with_undecided_scan(scan);
                                                     }
                                                     Self::inject_prepared_failure_for_test(
                                                         &file,
@@ -7102,7 +7723,7 @@ where
         );
         state
             .workspace_inventory
-            .require(file_oids.len() == files.len());
+            .require_listed(file_oids.len() == files.len());
         let (mut state, decisions) = Self::reconcile_configured_paths(
             project,
             adapter,
@@ -7122,6 +7743,7 @@ where
             captured,
             store_context,
             &decisions,
+            store_context.workspace_listing_complete,
         )?;
         state
             .dirty_path_symbol_rows
@@ -7129,6 +7751,7 @@ where
             .expect("dirty path-symbol mutex poisoned")
             .extend(dirty);
         state.workspace_inventory.meet(inventory);
+        state.listed_snapshots.store(Arc::new(snapshots.clone()));
         Ok((state, snapshots))
     }
 
@@ -7292,7 +7915,7 @@ where
     }
 
     fn build_state(
-        project: &dyn Project,
+        build_project: Arc<dyn Project>,
         adapter: &A,
         config: &AnalyzerConfig,
         progress: Option<BuildProgress>,
@@ -7302,6 +7925,7 @@ where
             "TreeSitterAnalyzer::{:?}::build_state",
             adapter.language()
         ));
+        let project = build_project.as_ref();
         let workspace_snapshot = store_context.workspace_snapshot.as_deref();
 
         let (analyzable_files, enumeration_complete): (Vec<_>, bool) = {
@@ -7348,6 +7972,22 @@ where
                     return state;
                 }
             };
+        // The build and published adapters use the same captured configuration.
+        // Only this build-scoped project owns bytes; publication binds a SQL reader.
+        let configuration = Arc::new(configuration);
+        let captured_adapter = (adapter.language() == Language::Rust)
+            .then(|| {
+                adapter.for_project(Arc::new(
+                    crate::analyzer::workspace::SelectedConfigurationProject::captured(
+                        Arc::clone(&build_project),
+                        adapter.language(),
+                        Arc::clone(&configuration),
+                        &analyzable_files,
+                    ),
+                ))
+            })
+            .flatten();
+        let adapter = captured_adapter.as_ref().unwrap_or(adapter);
         match adapter.derive_parse_configuration(
             &store_context.store,
             &store_context.workspace_id,
@@ -7378,13 +8018,11 @@ where
                         state
                     }
                 };
-                state.workspace_inventory.require(enumeration_complete);
-                state.workspace_configuration_digest =
-                    Some(crate::analyzer::store::configuration_digest(
-                        configuration
-                            .iter()
-                            .map(|input| (input.relative_path(), input.content_oid())),
-                    ));
+                state
+                    .workspace_inventory
+                    .require_listed(enumeration_complete);
+                state.selected_configuration =
+                    Some(SelectedConfiguration::from_inputs(&configuration));
                 state.workspace_package_identity_input_digests =
                     Self::workspace_package_identity_input_digests(
                         project,
@@ -7424,9 +8062,9 @@ where
                 },
             )
         };
-        if !enumeration_complete {
-            state.mark_workspace_package_inventory_incomplete();
-        }
+        state
+            .workspace_inventory
+            .require_listed(enumeration_complete);
         // Another language already panicked: every phase below is work whose
         // only effect is to postpone that panic reaching the caller (#2359).
         if store_context.build_abort.is_aborted() {
@@ -7456,13 +8094,14 @@ where
                 "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
                 adapter.language()
             ));
-            let (dirty, inventory, _snapshots) = match Self::sync_path_symbol_units(
+            let (dirty, inventory, snapshots) = match Self::sync_path_symbol_units(
                 project,
                 adapter,
                 &indexed_files,
                 &configuration,
                 store_context,
                 &HashMap::default(),
+                enumeration_complete,
             ) {
                 Ok(publication) => publication,
                 Err(error) => {
@@ -7476,6 +8115,7 @@ where
                 .expect("dirty path-symbol mutex poisoned")
                 .extend(dirty);
             state.workspace_inventory.meet(inventory);
+            state.listed_snapshots.store(Arc::new(snapshots));
         }
 
         if let Some(progress) = progress.as_ref() {
@@ -7489,14 +8129,7 @@ where
             ));
         }
         if Self::captures_workspace_configuration(adapter.language()) {
-            let mut ordered = configuration.iter().collect::<Vec<_>>();
-            ordered.sort_by_key(|input| input.relative_path());
-            state.workspace_configuration_digest =
-                Some(crate::analyzer::store::configuration_digest(
-                    ordered
-                        .into_iter()
-                        .map(|input| (input.relative_path(), input.content_oid())),
-                ));
+            state.selected_configuration = Some(SelectedConfiguration::from_inputs(&configuration));
         }
         state.workspace_package_identity_input_digests = if adapter.language() == Language::Rust {
             configuration
@@ -7536,16 +8169,18 @@ where
                 Err(_) => return HashMap::default(),
             },
         };
+        // An input that cannot be read is recorded as unreadable rather than
+        // dropped: a dropped input would be absent on both sides of a later
+        // comparison and could not show that it moved.
         files
             .iter()
             .filter(|file| adapter.workspace_package_identity_input(file))
-            .filter_map(|file| {
-                std::fs::read(file.abs_path()).ok().map(|source| {
-                    (
-                        file.clone(),
-                        PackageIdentityInputDigest::new(adapter, file, &source),
-                    )
-                })
+            .map(|file| {
+                let digest = match std::fs::read(file.abs_path()) {
+                    Ok(source) => PackageIdentityInputDigest::new(adapter, file, &source),
+                    Err(_) => PackageIdentityInputDigest::unreadable(),
+                };
+                (file.clone(), digest)
             })
             .collect()
     }
@@ -7565,6 +8200,8 @@ where
                 | Language::Scala
                 | Language::JavaScript
                 | Language::TypeScript
+                | Language::Ruby
+                | Language::Php
         )
     }
 
@@ -7621,18 +8258,16 @@ where
                     crate::path_utils::rel_path_string(file),
                     bytes.into_boxed_slice(),
                 ))),
-                // Languages can retain an absent input as empty bytes.
-                // Its later appearance changes the OID and configuration
-                // input digest.
+                // Retained absence has its own presence bit; a later empty
+                // file changes the configuration digest without changing its OID.
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound
                         && support.is_some_and(|support| {
                             support.retains_absent_configuration_input(file.rel_path())
                         }) =>
                 {
-                    Ok(Some(WorkspaceConfigurationInput::new(
+                    Ok(Some(WorkspaceConfigurationInput::absent(
                         crate::path_utils::rel_path_string(file),
-                        Box::new([]),
                     )))
                 }
                 Err(error)
@@ -7683,14 +8318,11 @@ where
         ) else {
             return true;
         };
-        let mut ordered = inputs.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|input| input.relative_path());
-        let digest = crate::analyzer::store::configuration_digest(
-            ordered
-                .into_iter()
-                .map(|input| (input.relative_path(), input.content_oid())),
-        );
-        self.state.workspace_configuration_digest != Some(digest)
+        self.state
+            .selected_configuration
+            .as_ref()
+            .map(|configuration| configuration.digest)
+            != Some(SelectedConfiguration::from_inputs(&inputs).digest)
     }
 
     /// Every workspace file whose extension no language claims: the universe
@@ -8114,6 +8746,80 @@ where
         Ok((packages, package_files, edges, anchors))
     }
 
+    /// Definition-inventory evidence for each file projection: the final name of
+    /// every stored unit whose `code_units` name columns do not carry it,
+    /// assembled as the file's anchor prefix plus the stored tail. The
+    /// normalized name is `normalize_full_name` of the assembled name, the call
+    /// the inventory side makes, so the enumerator and the visitor agree by
+    /// construction. A file is never complete by default: package facts must
+    /// cover it, its blob must be ready, and every anchor must resolve.
+    fn workspace_definition_inventories(
+        adapter: &A,
+        entries: &[(ProjectFile, WorkspaceFileRow, Option<PathSymbolRow>)],
+        package_facts_complete: bool,
+        tails: &WorkspaceContentUnitTails,
+    ) -> Vec<WorkspaceFileDefinitionInventory> {
+        let interner = crate::analyzer::fq_name::segment_interner();
+        let mut tails_by_blob: HashMap<Oid, Vec<_>> = HashMap::default();
+        for unit in &tails.units {
+            tails_by_blob.entry(unit.blob_oid).or_default().push(unit);
+        }
+        entries
+            .iter()
+            .map(|(project_file, file, _)| {
+                let unknown = |state| WorkspaceFileDefinitionInventory {
+                    rel_path: file.rel_path.clone(),
+                    state,
+                    names: Vec::new(),
+                };
+                if !package_facts_complete {
+                    return unknown(DefinitionInventoryState::PackageFactsIncomplete);
+                }
+                if !tails.ready_blobs.contains(&file.blob_oid) {
+                    return unknown(DefinitionInventoryState::Unknown);
+                }
+                let language = project_file.declaration_language();
+                let mut prefixes: HashMap<(PackageAnchor, &str), Option<FqName>> =
+                    HashMap::default();
+                let mut names = Vec::new();
+                for unit in tails_by_blob.get(&file.blob_oid).into_iter().flatten() {
+                    let full = match unit.anchor {
+                        None => unit.tail.clone(),
+                        Some(anchor) => {
+                            let Some(prefix) = prefixes
+                                .entry((anchor, unit.content_qualifier.as_str()))
+                                .or_insert_with(|| {
+                                    adapter.resolve_package_anchor(
+                                        anchor,
+                                        &unit.content_qualifier,
+                                        project_file,
+                                    )
+                                })
+                            else {
+                                return unknown(DefinitionInventoryState::UnresolvedAnchor);
+                            };
+                            let mut full = prefix.clone();
+                            full.extend_from(&unit.tail);
+                            full
+                        }
+                    };
+                    let exact_fqn = full.display_native(language, interner);
+                    names.push(DefinitionNameRow {
+                        blob_id: unit.blob_id,
+                        unit_key: unit.unit_key,
+                        normalized_fqn: adapter.normalize_full_name(&exact_fqn),
+                        exact_fqn,
+                    });
+                }
+                WorkspaceFileDefinitionInventory {
+                    rel_path: file.rel_path.clone(),
+                    state: DefinitionInventoryState::ProjectionComplete,
+                    names,
+                }
+            })
+            .collect()
+    }
+
     #[allow(clippy::type_complexity)]
     fn sync_path_symbol_units(
         project: &dyn Project,
@@ -8122,6 +8828,7 @@ where
         configuration: &[WorkspaceConfigurationInput],
         store_context: &AnalyzerStoreContext,
         decisions: &HashMap<ProjectFile, crate::analyzer::store::FileVersionDecision>,
+        enumeration_complete: bool,
     ) -> Result<
         (
             HashMap<ProjectFile, (String, PathSymbolRow)>,
@@ -8146,8 +8853,51 @@ where
                 .collect();
         let mut publication_keys = Vec::new();
         let mut live_files = Vec::new();
+        // Ignore rules, configured excludes, ignored untracked files and
+        // uninitialized submodule gitlinks are outside the analyzer's universe.
+        // See `omission_fails_rust_listing` for which omissions fail the proof.
+        let mut rust_listing_failures = BTreeMap::<String, String>::new();
+        if !enumeration_complete || store_context.workspace_snapshot.is_none() {
+            rust_listing_failures.insert(
+                RUST_LISTING_UNAVAILABLE_PATH.to_string(),
+                RUST_LISTING_UNAVAILABLE_REASON.to_string(),
+            );
+        }
+        if let Some(listing) = &store_context.workspace_snapshot {
+            for omission in listing.omissions.iter() {
+                if omission_fails_rust_listing(omission) {
+                    rust_listing_failures.insert(
+                        brokk_bifrost_core::path_utils::workspace_relative_slash_path(
+                            &omission.path,
+                        ),
+                        format!("{RUST_LISTING_OMISSION_PREFIX}{:?}", omission.reason),
+                    );
+                }
+            }
+        }
+        let mut inventory = WorkspaceInventoryCompleteness::COMPLETE;
+        // An omission the listing reports can be a source with no file version
+        // and no refusal row; no database arm can see it.
+        inventory.require_observed_listing(
+            store_context
+                .workspace_snapshot
+                .as_ref()
+                .map(|listing| listing.omissions.as_slice()),
+        );
         for file in files {
             let Some(blob_oid) = snapshot.validated_oid_for_path(file) else {
+                // Size, encoding and binary refusals, unavailable reads, and
+                // failures to produce a validated OID are drops within the
+                // listing universe. Rust sources and manifests clear proof.
+                // The file has no version and no refusal row, so the listing
+                // is incomplete for every language.
+                inventory.require_listed(false);
+                if is_rust_listing_path(file.rel_path()) {
+                    rust_listing_failures.insert(
+                        crate::path_utils::rel_path_string(file),
+                        "missing validated OID".to_string(),
+                    );
+                }
                 continue;
             };
             let storage_language = adapter.storage_language_key_for_file(file).to_string();
@@ -8163,7 +8913,6 @@ where
             });
             live_files.push((file, blob_oid, storage_language));
         }
-        let mut inventory = WorkspaceInventoryCompleteness::COMPLETE;
         let published = store_context
             .store
             .parsed_blob_keys_at_generations(&publication_keys, &store_context.generations)?;
@@ -8178,10 +8927,24 @@ where
                     },
                 ),
             }) {
-                match classify_unpublished_source(project, adapter, file, blob_oid) {
-                    UnpublishedSource::Admitted => inventory.mark_incomplete(),
+                let unpublished = classify_unpublished_source(project, adapter, file, blob_oid);
+                inventory.record_unpublished(&unpublished);
+                match unpublished {
+                    UnpublishedSource::Admitted => {
+                        if storage_language == "rust" {
+                            rust_listing_failures.insert(
+                                crate::path_utils::rel_path_string(file),
+                                "unpublished admitted".to_string(),
+                            );
+                        }
+                    }
                     UnpublishedSource::Refused(reason) => {
-                        inventory.record_refusal(&reason);
+                        if storage_language == "rust" {
+                            rust_listing_failures.insert(
+                                crate::path_utils::rel_path_string(file),
+                                "unpublished refused".to_string(),
+                            );
+                        }
                         refusals_by_language
                             .entry(storage_language)
                             .or_default()
@@ -8193,7 +8956,12 @@ where
                         continue;
                     }
                     UnpublishedSource::Unavailable => {
-                        inventory.mark_incomplete();
+                        if storage_language == "rust" {
+                            rust_listing_failures.insert(
+                                crate::path_utils::rel_path_string(file),
+                                "unpublished unavailable".to_string(),
+                            );
+                        }
                         continue;
                     }
                 }
@@ -8259,17 +9027,19 @@ where
                     by_variant.entry(variant).or_default().push(entry.clone());
                 }
                 let mut combined = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut batches = Vec::new();
                 for (variant, entries) in by_variant {
                     let oids = entries
                         .iter()
                         .map(|(_, row, _)| row.blob_oid)
                         .collect::<Vec<_>>();
+                    let blob_key = BlobKey {
+                        oid: Oid::zero(),
+                        lang: lang.clone(),
+                        variant,
+                    };
                     let facts = store_context.store.workspace_content_package_facts(
-                        &BlobKey {
-                            oid: Oid::zero(),
-                            lang: lang.clone(),
-                            variant,
-                        },
+                        &blob_key,
                         store_context.generations[&lang],
                         &oids,
                         adapter.workspace_file_package_anchor(),
@@ -8281,24 +9051,83 @@ where
                     combined.1.extend(package_files);
                     combined.2.extend(edges);
                     combined.3.extend(anchors);
+                    batches.push((blob_key, entries, facts.complete));
                 }
-                Ok::<_, StoreError>(combined)
+                // The store publishes an inventory only for a new file version
+                // or a refillable one. Names are derived, and unit tails read,
+                // for those files alone: an unchanged reopen derives nothing.
+                let needed = store_context.store.workspace_inventories_needed(
+                    &store_context.workspace_id,
+                    &lang,
+                    store_context.generations[&lang],
+                    &files,
+                    &path_symbols,
+                    &combined.1,
+                    &combined.2,
+                    &combined.3,
+                    &foreign_source_paths[&lang],
+                )?;
+                let mut inventories = Vec::new();
+                for (blob_key, entries, package_facts_complete) in batches {
+                    let entries = entries
+                        .into_iter()
+                        .filter(|(_, row, _)| needed.contains(&row.rel_path))
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    // An incomplete batch stores no names, so it reads no tails.
+                    let tails = if package_facts_complete {
+                        let oids = entries
+                            .iter()
+                            .map(|(_, row, _)| row.blob_oid)
+                            .collect::<Vec<_>>();
+                        store_context.store.workspace_content_unit_tails(
+                            &blob_key,
+                            store_context.generations[&lang],
+                            &oids,
+                        )?
+                    } else {
+                        WorkspaceContentUnitTails {
+                            units: Vec::new(),
+                            ready_blobs: Default::default(),
+                        }
+                    };
+                    inventories.extend(Self::workspace_definition_inventories(
+                        adapter,
+                        &entries,
+                        package_facts_complete,
+                        &tails,
+                    ));
+                }
+                Ok::<_, StoreError>((combined, inventories))
             })();
-            let (packages, package_files, package_edges, anchors) = relations?;
-            let published_snapshot = store_context.store.sync_workspace_inputs_for_workspace(
-                &store_context.workspace_id,
-                &lang,
-                store_context.generations[&lang],
-                &files,
-                &path_symbols,
-                &packages,
-                &package_files,
-                &package_edges,
-                &anchors,
-                configuration,
-                &foreign_source_paths[&lang],
-                &refusals_by_language[&lang],
-            )?;
+            let ((packages, package_files, package_edges, anchors), inventories) = relations?;
+            let published_snapshot = store_context
+                .store
+                .sync_workspace_inputs_with_rust_listing(
+                    &store_context.workspace_id,
+                    &lang,
+                    store_context.generations[&lang],
+                    &files,
+                    &path_symbols,
+                    &packages,
+                    &package_files,
+                    &package_edges,
+                    &anchors,
+                    configuration,
+                    &foreign_source_paths[&lang],
+                    &refusals_by_language[&lang],
+                    &inventories,
+                    (lang == "rust").then(|| {
+                        (
+                            crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                            std::mem::take(&mut rust_listing_failures)
+                                .into_iter()
+                                .collect(),
+                        )
+                    }),
+                )?;
             snapshots.insert(lang.clone(), published_snapshot);
             // A path projection may publish before its source blob does. Keep
             // the producer's row beside the retained dirty source until both
@@ -8374,7 +9203,7 @@ where
             .filter(|file| natural(file) && snapshot.validated_oid_for_path(file).is_some())
             .map(crate::path_utils::rel_path_string)
             .collect::<Vec<_>>();
-        let rows = readings
+        let reading_rows = readings
             .iter()
             .filter_map(|file| {
                 snapshot
@@ -8384,15 +9213,106 @@ where
                         blob_oid,
                         decision: None,
                     })
+                    .map(|row| (*file, row))
             })
             .collect::<Vec<_>>();
+        let rows = reading_rows
+            .iter()
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        // A natural file or a reading whose stat no longer validates gets no
+        // version and no refusal row here, so the snapshot this sync publishes
+        // can lack it without the store knowing. The full sync and the update
+        // path treat that as an incomplete listing, and so does this one.
+        //
+        // `files` came from the analyzed set, which already dropped every
+        // source whose identity did not validate or whose blob is not parsed.
+        // Such a source may be a header some C translation unit compiles, but
+        // nothing here says so, so it is absent from `readings` and the checks
+        // above cannot see it. The sync would then remove its `cpp:c` version
+        // while certifying the snapshot complete. Every source this analyzer
+        // owns must therefore be in the analyzed set.
+        let every_file_validated = reading_rows.len() == readings.len()
+            && self
+                .store_context
+                .live_paths
+                .files()
+                .iter()
+                .filter(|file| natural(file))
+                .all(|file| snapshot.validated_oid_for_path(file).is_some())
+            && {
+                let analyzed = self
+                    .analyzed_live_files()
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                self.owned_live_files(&self.live_snapshot())
+                    .iter()
+                    .all(|file| analyzed.contains(file))
+            };
+
+        // The same inventory rules as the ordinary sync: names are derived for
+        // the readings the store will publish or refill, from the reading's own
+        // blob. Without them each reading stays unknown, and the ordinary sync
+        // treats it as foreign and never refills it.
+        let inventories = (|| {
+            let store = &self.store_context.store;
+            let workspace_id = &self.store_context.workspace_id;
+            let needed = store.workspace_inventories_needed(
+                workspace_id,
+                storage_lang,
+                generation,
+                &rows,
+                &[],
+                &[],
+                &[],
+                &[],
+                &natural_paths,
+            )?;
+            let entries = reading_rows
+                .iter()
+                .filter(|(_, row)| needed.contains(&row.rel_path))
+                .map(|(file, row)| ((*file).clone(), row.clone(), None))
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                return Ok(Vec::new());
+            }
+            let oids = entries
+                .iter()
+                .map(|(_, row, _)| row.blob_oid)
+                .collect::<Vec<_>>();
+            let blob_key = BlobKey {
+                oid: Oid::zero(),
+                lang: storage_lang.to_owned(),
+                variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
+            };
+            let facts = store.workspace_content_package_facts(
+                &blob_key,
+                generation,
+                &oids,
+                self.adapter.workspace_file_package_anchor(),
+            )?;
+            let tails = if facts.complete {
+                store.workspace_content_unit_tails(&blob_key, generation, &oids)?
+            } else {
+                WorkspaceContentUnitTails {
+                    units: Vec::new(),
+                    ready_blobs: Default::default(),
+                }
+            };
+            Ok::<_, StoreError>(Self::workspace_definition_inventories(
+                self.adapter.as_ref(),
+                &entries,
+                facts.complete,
+                &tails,
+            ))
+        })()?;
 
         let mut last_error = None;
         for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
             match self
                 .store_context
                 .store
-                .sync_workspace_inputs_for_workspace(
+                .sync_workspace_inputs_with_rust_listing(
                     &self.store_context.workspace_id,
                     storage_lang,
                     generation,
@@ -8405,12 +9325,30 @@ where
                     &[],
                     &natural_paths,
                     &[],
+                    &inventories,
+                    None,
                 ) {
                 Ok(snapshot) => {
                     let mut snapshots = self.selected_workspace_snapshots().as_ref().clone();
-                    snapshots.insert(storage_lang.to_string(), snapshot);
+                    snapshots.insert(storage_lang.to_string(), snapshot.clone());
                     self.relational_workspace_snapshots
                         .store(Arc::new(snapshots));
+                    // This sync observed the listing the analyzer's own sync
+                    // did; the published snapshot is proven only if that
+                    // listing was complete and every file it covers validated.
+                    // Otherwise the language has no proof, and a later update
+                    // does not grant it again.
+                    let mut listed = self.state.listed_snapshots.load().as_ref().clone();
+                    let mut withdrawn = self.state.listing_withdrawn.load().as_ref().clone();
+                    if self.state.workspace_inventory.listed && every_file_validated {
+                        listed.insert(storage_lang.to_string(), snapshot);
+                        withdrawn.remove(storage_lang);
+                    } else {
+                        listed.remove(storage_lang);
+                        withdrawn.insert(storage_lang.to_string());
+                    }
+                    self.state.listed_snapshots.store(Arc::new(listed));
+                    self.state.listing_withdrawn.store(Arc::new(withdrawn));
                     self.store_context.live_paths.replace_additional_mounts(
                         storage_lang,
                         readings.iter().map(|file| (*file).clone()),
@@ -8426,6 +9364,10 @@ where
         Err(last_error.expect("at least one workspace snapshot write was attempted"))
     }
 
+    /// Publish each file in its own transaction. `last_certificate` goes to the
+    /// last file's publication only, never to an earlier one: the earlier
+    /// revisions lack the later files, so a certificate of the whole update
+    /// would claim a complete listing at a revision that omits them.
     #[allow(clippy::too_many_arguments)]
     fn refresh_path_symbol_units(
         project: &dyn Project,
@@ -8436,6 +9378,7 @@ where
         dirty: &mut HashMap<ProjectFile, (String, PathSymbolRow)>,
         inventory: &mut WorkspaceInventoryCompleteness,
         decisions: &HashMap<ProjectFile, FileVersionDecision>,
+        last_certificate: Option<&(i64, Vec<(String, String)>)>,
     ) -> Result<(), StoreError> {
         let storage_languages = adapter
             .storage_language_keys()
@@ -8467,7 +9410,7 @@ where
         let published = store_context
             .store
             .parsed_blob_keys_at_generations(&publication_keys, &store_context.generations)?;
-        for file in files {
+        for (index, file) in files.iter().enumerate() {
             dirty.remove(file);
             let rel_path = crate::path_utils::rel_path_string(file);
             let storage_language = adapter.storage_language_key_for_file(file);
@@ -8475,7 +9418,14 @@ where
             // The same classification as the full workspace sync: a refused
             // source is recorded, never selected, and the omission of a source
             // whose admission did not finish leaves the inventory incomplete.
-            let live_oid = snapshot.validated_oid_for_path(file).filter(|&oid| {
+            let validated_oid = snapshot.validated_oid_for_path(file);
+            // A live entry whose stat no longer matches is a source this
+            // update leaves without a version or a refusal row. An absent
+            // entry is a deleted file, which is not a source.
+            if validated_oid.is_none() && snapshot.oid_for_path(file).is_some() {
+                inventory.require_listed(false);
+            }
+            let live_oid = validated_oid.filter(|&oid| {
                 if published.contains(&BlobKey {
                     oid,
                     lang: storage_language.to_string(),
@@ -8490,13 +9440,11 @@ where
                 }) {
                     return true;
                 }
-                match classify_unpublished_source(project, adapter, file, oid) {
-                    UnpublishedSource::Admitted => {
-                        inventory.mark_incomplete();
-                        true
-                    }
+                let unpublished = classify_unpublished_source(project, adapter, file, oid);
+                inventory.record_unpublished(&unpublished);
+                match unpublished {
+                    UnpublishedSource::Admitted => true,
                     UnpublishedSource::Refused(reason) => {
-                        inventory.record_refusal(&reason);
                         refusal = Some(WorkspaceSourceRefusalRow {
                             rel_path: rel_path.clone(),
                             blob_oid: oid,
@@ -8504,10 +9452,7 @@ where
                         });
                         false
                     }
-                    UnpublishedSource::Unavailable => {
-                        inventory.mark_incomplete();
-                        false
-                    }
+                    UnpublishedSource::Unavailable => false,
                 }
             });
             let file_replacement =
@@ -8552,26 +9497,82 @@ where
                     )
                     .and_then(|facts| {
                         inventory.require(facts.complete);
-                        Self::workspace_snapshot_relations(adapter, &[entry], &facts.facts)
+                        let relations = Self::workspace_snapshot_relations(
+                            adapter,
+                            std::slice::from_ref(&entry),
+                            &facts.facts,
+                        )?;
+                        // The store stores an inventory only for a new file
+                        // version or a refillable one. A no-op update derives
+                        // no names; an incomplete batch stores none, so it
+                        // reads no tails either.
+                        let (_, package_files, package_edges, anchors) = &relations;
+                        let needed = store_context.store.path_symbol_unit_needs_inventory(
+                            &store_context.workspace_id,
+                            &generations,
+                            &rel_path,
+                            file_replacement,
+                            replacement_ref,
+                            package_files,
+                            package_edges,
+                            anchors,
+                        )?;
+                        if !needed {
+                            return Ok((relations, None));
+                        }
+                        let tails = if facts.complete {
+                            store_context.store.workspace_content_unit_tails(
+                                &BlobKey {
+                                    oid: Oid::zero(),
+                                    lang: lang.to_owned(),
+                                    variant: decision.as_ref().map_or(
+                                        brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                                        |decision| {
+                                            brokk_bifrost_core::gitblob::ParseVariant::Digest(
+                                                decision.decision_digest,
+                                            )
+                                        },
+                                    ),
+                                },
+                                generations[lang],
+                                &[blob_oid],
+                            )?
+                        } else {
+                            WorkspaceContentUnitTails {
+                                units: Vec::new(),
+                                ready_blobs: Default::default(),
+                            }
+                        };
+                        let inventories = Self::workspace_definition_inventories(
+                            adapter,
+                            std::slice::from_ref(&entry),
+                            facts.complete,
+                            &tails,
+                        );
+                        Ok((relations, inventories.into_iter().next()))
                     })
             } else {
-                Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
+                Ok(((Vec::new(), Vec::new(), Vec::new(), Vec::new()), None))
             };
-            let (packages, package_files, package_edges, anchors) = relations?;
-            let next = store_context.store.replace_path_symbol_unit(
-                &store_context.workspace_id,
-                workspace_snapshots,
-                &storage_languages,
-                &generations,
-                &rel_path,
-                file_replacement,
-                replacement_ref,
-                &packages,
-                &package_files,
-                &package_edges,
-                &anchors,
-                refusal.as_ref().map(|row| (storage_language, row)),
-            )?;
+            let ((packages, package_files, package_edges, anchors), file_inventory) = relations?;
+            let next = store_context
+                .store
+                .replace_path_symbol_unit_with_inventory(
+                    &store_context.workspace_id,
+                    workspace_snapshots,
+                    &storage_languages,
+                    &generations,
+                    &rel_path,
+                    file_replacement,
+                    replacement_ref,
+                    &packages,
+                    &package_files,
+                    &package_edges,
+                    &anchors,
+                    file_inventory.as_ref(),
+                    refusal.as_ref().map(|row| (storage_language, row)),
+                    last_certificate.filter(|_| index + 1 == files.len()),
+                )?;
             workspace_snapshots.extend(next);
             if let Some((lang, row)) = replacement
                 && !published.contains(&BlobKey {
@@ -8591,6 +9592,126 @@ where
             }
         }
         Ok(())
+    }
+
+    /// The omissions of the listing an incremental update can see without
+    /// walking: the project's cached listing, else the one listing read the
+    /// enclosing update took. None means this update has no listing evidence.
+    /// Recheck only changed paths and previously failing paths. A stale version
+    /// performs one full pass over the build's cached listing.
+    ///
+    /// A project without a listing cache certifies from `listing`, the one
+    /// listing read the enclosing update already took. This function never
+    /// reads the workspace listing itself: with neither a cache nor `listing`
+    /// the listing is unavailable and the certificate stays unavailable.
+    fn incremental_rust_listing_failures(
+        project: &dyn Project,
+        adapter: &A,
+        store_context: &AnalyzerStoreContext,
+        previous: Option<&crate::analyzer::store::WorkspaceSnapshotId>,
+        changed: &BTreeSet<ProjectFile>,
+        listing: Option<&SharedWorkspaceFileListing>,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let omissions = current_listing_omissions(project, listing)?;
+        let Some(omissions) = omissions else {
+            return Ok(vec![(
+                RUST_LISTING_UNAVAILABLE_PATH.to_string(),
+                RUST_LISTING_UNAVAILABLE_REASON.to_string(),
+            )]);
+        };
+        let version = crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let prior = previous
+            .map(|snapshot| {
+                store_context
+                    .store
+                    .rust_source_listing_failures(snapshot, version)
+            })
+            .transpose()?
+            .flatten();
+        let prior = prior.filter(|rows| {
+            !rows
+                .iter()
+                .any(|(path, _)| path == RUST_LISTING_UNAVAILABLE_PATH)
+        });
+        let mut failures = prior
+            .as_ref()
+            .map_or_else(BTreeMap::new, |rows| rows.iter().cloned().collect());
+        let candidates: Vec<ProjectFile> = if prior.is_some() {
+            for file in changed {
+                failures.remove(&crate::path_utils::rel_path_string(file));
+            }
+            changed.iter().cloned().collect()
+        } else {
+            failures.clear();
+            let cached = project.cached_listing_if_available()?;
+            let Some((files, _)) = cached.as_ref().or(listing) else {
+                return Ok(vec![(
+                    RUST_LISTING_UNAVAILABLE_PATH.to_string(),
+                    RUST_LISTING_UNAVAILABLE_REASON.to_string(),
+                )]);
+            };
+            files
+                .iter()
+                .cloned()
+                .chain(changed.iter().cloned())
+                .collect()
+        };
+        // Unknown listing state and omission rows are recomputed from the
+        // current cache; neither is a persistent path failure.
+        failures.remove(RUST_LISTING_UNAVAILABLE_PATH);
+        failures.retain(|_, reason| !reason.starts_with(RUST_LISTING_OMISSION_PREFIX));
+        failures.extend(Self::rust_omission_rows(&omissions));
+        let candidate_set = candidates.iter().cloned().collect();
+        // The non-caching filter only selects among the supplied paths and
+        // applies the ignore rules; it does not enumerate the workspace.
+        let relevant = match project.cached_analyzable_files_from(&candidate_set, Language::Rust)? {
+            Some(relevant) => Some(relevant),
+            None if listing.is_some() => {
+                Some(project.analyzable_files_from(&candidate_set, Language::Rust)?)
+            }
+            None => None,
+        };
+        let Some(relevant) = relevant else {
+            return Ok(vec![(
+                RUST_LISTING_UNAVAILABLE_PATH.to_string(),
+                RUST_LISTING_UNAVAILABLE_REASON.to_string(),
+            )]);
+        };
+        let live = store_context.live_paths.snapshot();
+        let mut keys = Vec::new();
+        for file in candidates {
+            if !is_rust_listing_path(file.rel_path())
+                || !relevant.contains(&file)
+                || (!file.exists() && !project.has_overlay(&file))
+            {
+                continue;
+            }
+            let path = crate::path_utils::rel_path_string(&file);
+            let Some(oid) = live.validated_oid_for_path(&file) else {
+                failures.insert(path, "missing validated OID".to_string());
+                continue;
+            };
+            if adapter.storage_language_key_for_file(&file) == "rust" {
+                keys.push((
+                    path,
+                    BlobKey {
+                        oid,
+                        lang: "rust".to_string(),
+                        variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
+                    },
+                ));
+            }
+        }
+        let published = store_context.store.parsed_blob_keys_at_generations(
+            &keys.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>(),
+            &store_context.generations,
+        )?;
+        for (path, key) in keys {
+            if !published.contains(&key) {
+                failures.insert(path, "unpublished".to_string());
+            }
+        }
+        Ok(failures.into_iter().collect())
     }
 
     fn reconcile_file_states(
@@ -8652,7 +9773,7 @@ where
         };
         match oid_plan {
             Ok(file_oids) => {
-                workspace_inventory.require(file_oids.len() == files.len());
+                workspace_inventory.require_listed(file_oids.len() == files.len());
                 let mut candidate_order = Vec::new();
                 let mut candidates_by_blob_key = HashMap::default();
                 for file in &files {
@@ -8745,10 +9866,11 @@ where
                 });
                 let missing_result = store_context
                     .store
-                    .missing_published_complete_analysis_blob_keys_at_generations(
+                    .missing_published_complete_analysis_blob_keys_at_generations_for_epoch(
                         &analysis_requests,
                         store_context.generations.as_ref(),
                         adapter.language(),
+                        adapter.resolution_producer_epoch(),
                         semantic_ir_epoch.as_deref(),
                     );
                 let missing = match missing_result {
@@ -8991,7 +10113,7 @@ where
                 }
             }
             Err(error) => {
-                workspace_inventory.mark_incomplete();
+                workspace_inventory.require_listed(false);
                 profiling::note(format!(
                     "resolve_live_oids failed; reconciling {:?} without live identities: {error}",
                     adapter.language()
@@ -9360,7 +10482,8 @@ where
                 let source = project
                     .read_source_snapshot(file)
                     .map_err(StoreError::from)?;
-                let key = (file.clone(), source.oid(), configuration.output_digest);
+                let key =
+                    OverlayVariantKey(file.clone(), source.oid(), configuration.output_digest);
                 // The complete key certifies a hit across requests and GC row reuse.
                 if let Some(variant) = memo.get(&key) {
                     debug_assert_eq!(key.0, *file);
@@ -9372,7 +10495,10 @@ where
                     key,
                     OverlayVariant {
                         variant: parse.variant,
-                        undecided_chains: parse.undecided_chains,
+                        undecided_chains: parse
+                            .undecided_scan
+                            .expect("overlay C# parse scanned chains")
+                            .chains,
                     },
                 );
                 Ok(Some(parse.variant))
@@ -9418,6 +10544,32 @@ where
         }
     }
 
+    fn dirty_parse_incomplete_detail() -> Box<str> {
+        "dirty parse-incomplete file state".into()
+    }
+
+    fn observe_dirty_file_state(&self, state: &Arc<FileState>, detail: impl FnOnce() -> Box<str>) {
+        if !state.parse_complete {
+            self.record_query_incomplete(
+                QueryReadIncomplete::SemanticEvidenceUnavailable(detail()),
+            );
+        }
+    }
+
+    fn dirty_file_state_for_query(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.dirty_file_state_for_query_with_detail(key, Self::dirty_parse_incomplete_detail)
+    }
+
+    fn dirty_file_state_for_query_with_detail(
+        &self,
+        key: &FileStateCacheKey,
+        detail: impl FnOnce() -> Box<str>,
+    ) -> Option<Arc<FileState>> {
+        let state = self.state.dirty_file_state(key)?;
+        self.observe_dirty_file_state(&state, detail);
+        Some(state)
+    }
+
     #[doc(hidden)]
     pub fn query_file_state_snapshot(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
         self.record_file_read(
@@ -9454,10 +10606,25 @@ where
         file: &ProjectFile,
         key: &FileStateCacheKey,
     ) -> Option<Arc<FileState>> {
+        self.retained_file_state_with_incomplete_detail(
+            file,
+            key,
+            Self::dirty_parse_incomplete_detail,
+        )
+    }
+
+    /// Reuse already-owned projections, recording `detail` when the retained
+    /// state came from a dirty parse-incomplete read.
+    #[doc(hidden)]
+    pub fn retained_file_state_with_incomplete_detail(
+        &self,
+        file: &ProjectFile,
+        key: &FileStateCacheKey,
+        detail: impl FnOnce() -> Box<str>,
+    ) -> Option<Arc<FileState>> {
         self.record_file_read(file, key.oid);
         if let Some(state) = self
-            .state
-            .dirty_file_state(key)
+            .dirty_file_state_for_query_with_detail(key, detail)
             .or_else(|| self.source_snapshot_file_states.get(key).cloned())
         {
             return Some(state);
@@ -9538,7 +10705,7 @@ where
         state: &FileState,
         syntax: Option<&PreparedSyntaxTree>,
         condition_symbols: &[String],
-        undecided_chains: &[crate::analyzer::store::UndecidedChainRow],
+        undecided_scan: Option<&crate::analyzer::store::CSharpUndecidedScan>,
     ) -> std::result::Result<usize, StoreError> {
         assert_eq!(
             store_context.generations[storage_key], generation,
@@ -9571,10 +10738,9 @@ where
                     } else {
                         prepared.with_condition_symbols(condition_symbols.to_vec())
                     };
-                    let prepared = if undecided_chains.is_empty() {
-                        prepared
-                    } else {
-                        prepared.with_undecided_chains(undecided_chains.to_vec())
+                    let prepared = match undecided_scan {
+                        Some(scan) => prepared.with_undecided_scan(scan.clone()),
+                        None => prepared,
                     };
                     let (mut outcomes, _) = store_context
                         .store
@@ -9640,7 +10806,7 @@ where
             state,
             analyzed.syntax.as_deref(),
             &analyzed.condition_symbols,
-            &analyzed.undecided_chains,
+            analyzed.undecided_scan.as_ref(),
         ) {
             Ok(_) => {
                 dirty_file_states.remove(&key);
@@ -9672,6 +10838,16 @@ where
 
     #[doc(hidden)]
     pub fn retry_dirty_file_state(
+        &self,
+        key: &FileStateCacheKey,
+        storage_key: &str,
+    ) -> Option<Arc<FileState>> {
+        let state = self.retry_dirty_file_state_inner(key, storage_key)?;
+        self.observe_dirty_file_state(&state, Self::dirty_parse_incomplete_detail);
+        Some(state)
+    }
+
+    fn retry_dirty_file_state_inner(
         &self,
         key: &FileStateCacheKey,
         storage_key: &str,
@@ -9713,7 +10889,7 @@ where
             }
         };
         let symbols = parse.condition_symbols.clone();
-        let undecided_chains = parse.undecided_chains.clone();
+        let undecided_scan = parse.undecided_scan.clone();
         self.record_file_tier_access(InformationTier::Syntax, &file);
         let syntax = match prepare_exact_syntax_tree_with_parse(
             self.adapter.as_ref(),
@@ -9779,10 +10955,9 @@ where
                 } else {
                     (*prepared).with_condition_symbols(symbols)
                 };
-                let prepared = if undecided_chains.is_empty() {
-                    prepared
-                } else {
-                    prepared.with_undecided_chains(undecided_chains)
+                let prepared = match undecided_scan {
+                    Some(scan) => prepared.with_undecided_scan(scan),
+                    None => prepared,
                 };
                 self.store_context.store.repair_prepared_blob(prepared)
             }
@@ -10622,7 +11797,9 @@ where
             self.state.dirty_path_symbol_snapshot(),
             Vec::new(),
         );
-        state.record_workspace_package_inventory_error(error);
+        state.workspace_package_inventory_error =
+            self.state.workspace_package_inventory_error.clone();
+        state.update_resolution_error = Some(error);
         let snapshots = self.selected_workspace_snapshots();
         let mut context = self.store_context.clone();
         context.live_paths = Arc::new(
@@ -10687,11 +11864,7 @@ where
             &captured,
             Some((&snapshots, &self.indexed_live_snapshot)),
         )?;
-        state.workspace_configuration_digest = Some(crate::analyzer::store::configuration_digest(
-            captured
-                .iter()
-                .map(|input| (input.relative_path(), input.content_oid())),
-        ));
+        state.selected_configuration = Some(SelectedConfiguration::from_inputs(&captured));
         state.workspace_package_identity_input_digests =
             Self::workspace_package_identity_input_digests(
                 self.project.as_ref(),
@@ -10762,7 +11935,7 @@ where
                 variant: brokk_bifrost_core::gitblob::ParseVariant::Empty,
                 assignment_digest: None,
                 condition_symbols: Vec::new(),
-                undecided_chains: Vec::new(),
+                undecided_scan: None,
                 preprocessor: self.adapter.preprocess(file, source),
             }),
         }?;
@@ -10794,7 +11967,10 @@ where
             && let Some(memo) = self.active_query_request_memo::<UnseenBranchFilesMemo>()
         {
             let chains = parse
-                .undecided_chains
+                .undecided_scan
+                .as_ref()
+                .expect("C# selected parse scanned chains")
+                .chains
                 .iter()
                 .filter(|chain| chain.omitted_nonblank)
                 .cloned()
@@ -10815,8 +11991,29 @@ where
         overlay_revision: Option<OverlayRevision>,
         cancellation: Option<&CancellationToken>,
     ) -> PreparedSyntaxPreparation {
+        self.prepare_syntax_from_source_with_scan(
+            file,
+            source,
+            origin,
+            overlay_revision,
+            cancellation,
+        )
+        .0
+    }
+
+    fn prepare_syntax_from_source_with_scan(
+        &self,
+        file: &ProjectFile,
+        source: PreparedSyntaxSource,
+        origin: PreparedSourceOrigin,
+        overlay_revision: Option<OverlayRevision>,
+        cancellation: Option<&CancellationToken>,
+    ) -> (
+        PreparedSyntaxPreparation,
+        Option<crate::analyzer::store::CSharpUndecidedScan>,
+    ) {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return PreparedSyntaxPreparation::Cancelled;
+            return (PreparedSyntaxPreparation::Cancelled, None);
         }
         // Accounted before parser setup, not after it as before the
         // extraction. The two differ only when the grammar refuses the file's
@@ -10827,9 +12024,10 @@ where
             Ok(parse) => parse,
             Err(error) => {
                 self.record_store_error(error);
-                return PreparedSyntaxPreparation::Complete(None);
+                return (PreparedSyntaxPreparation::Complete(None), None);
             }
         };
+        let scan = parse.undecided_scan.clone();
         let outcome = prepare_exact_syntax_tree_with_parse(
             self.adapter.as_ref(),
             file,
@@ -10851,7 +12049,7 @@ where
             }
             _ => {}
         }
-        outcome
+        (outcome, scan)
     }
 
     /// One crossing of `tier`'s storage funnel, attributed to `file`.
@@ -10930,7 +12128,10 @@ where
             }
         }
         if sink.csharp_enumeration && self.adapter.language() == Language::CSharp {
-            if !self.state.workspace_inventory.indexed {
+            // A source-admission refusal is a recorded exclusion, not missing
+            // evidence (`record_refusal`): it leaves `indexed` false but keeps
+            // `accounted`, so it must not make an enumeration incomplete.
+            if !self.state.workspace_inventory.accounted {
                 self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
                     "selected C# source inventory has unpublished or incomplete facts".into(),
                 ));
@@ -11090,36 +12291,71 @@ where
     fn csharp_overlay_unseen_branch_files(
         &self,
     ) -> Option<Arc<Vec<crate::analyzer::store::UnseenBranchFile>>> {
+        self.csharp_overlay_unseen_branch_census()
+            .map(|census| census.rows)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn csharp_overlay_unseen_branch_census_for_test(&self) -> Option<(bool, usize)> {
+        self.csharp_overlay_unseen_branch_census()
+            .map(|census| (census.certified, census.rows.len()))
+    }
+
+    /// Replace the query-local file-state byte budget. A test of the bulk
+    /// file cap lifts the budget so that only the cap can bind.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_query_file_state_cache_budget_for_test(&self, max_bytes: usize) {
+        *self
+            .query_read_cache
+            .write()
+            .expect("query read cache poisoned") = QueryReadCache::new(max_bytes);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_overlay_variant_cache_capacity_for_test(&mut self, capacity: u64) {
+        self.overlay_variants = self
+            .store_context
+            .store
+            .retention_budget()
+            .region("analysis.overlay_variants", Some(capacity as usize));
+    }
+
+    fn csharp_overlay_unseen_branch_census(&self) -> Option<OverlayUnseenBranchCensus> {
         let snapshots = self.selected_workspace_snapshots();
         let snapshot = snapshots.get("csharp")?;
         let Some(overlays) = self.project.overlay_content() else {
-            return Some(Arc::new(Vec::new()));
+            return Some(OverlayUnseenBranchCensus {
+                certified: true,
+                rows: Arc::new(Vec::new()),
+            });
         };
-        let memo = self.active_query_request_memo::<UnseenBranchFilesMemo>();
-        if let Some(memo) = &memo {
-            let guard = memo.overlays.lock().expect("unseen overlay memo poisoned");
-            if let Some(cached) = guard.as_ref()
-                && &cached.snapshot == snapshot
-                && cached.digest == overlays.digest()
-            {
-                return Some(Arc::clone(&cached.rows));
-            }
-        }
         if overlays.entries().is_empty() {
-            return Some(Arc::new(Vec::new()));
+            return Some(OverlayUnseenBranchCensus {
+                certified: true,
+                rows: Arc::new(Vec::new()),
+            });
         }
         let configuration = match self
             .adapter
             .snapshot_parse_configuration(&self.store_context.store, snapshot)
         {
             Ok(Some(configuration)) => configuration,
-            Ok(None) => return Some(Arc::new(Vec::new())),
+            Ok(None) => {
+                return Some(OverlayUnseenBranchCensus {
+                    certified: false,
+                    rows: Arc::new(Vec::new()),
+                });
+            }
             Err(error) => {
                 self.record_store_error(error);
                 return None;
             }
         };
         let mut rows = Vec::new();
+        let mut certified = true;
         for (file, _) in overlays.entries() {
             if file.language() != Language::CSharp {
                 continue;
@@ -11131,6 +12367,7 @@ where
                         file.language().uses_configured_parse_variants(),
                         "unindexed C# overlay has no configured parse variants: {file:?}"
                     );
+                    certified = false;
                     continue;
                 }
                 Err(error) => {
@@ -11145,17 +12382,24 @@ where
                     return None;
                 }
             };
-            let key = (file.clone(), source.oid(), configuration.output_digest);
+            let key = OverlayVariantKey(file.clone(), source.oid(), configuration.output_digest);
             let Some(overlay) = self.overlay_variants.get(&key) else {
+                certified = false;
                 continue;
             };
+            if overlay.variant != variant {
+                certified = false;
+                continue;
+            }
             let brokk_bifrost_core::gitblob::ParseVariant::Digest(digest) = variant else {
+                certified = false;
                 continue;
             };
             let chains = overlay
                 .undecided_chains
-                .into_iter()
+                .iter()
                 .filter(|chain| chain.omitted_nonblank)
+                .cloned()
                 .collect::<Vec<_>>();
             if !chains.is_empty() {
                 rows.push(crate::analyzer::store::UnseenBranchFile {
@@ -11166,21 +12410,82 @@ where
             }
         }
         let rows = Arc::new(rows);
-        if let Some(memo) = memo {
-            *memo.overlays.lock().expect("unseen overlay memo poisoned") =
-                Some(CachedOverlayUnseenBranches {
-                    snapshot: snapshot.clone(),
-                    digest: overlays.digest(),
-                    rows: Arc::clone(&rows),
-                });
-        }
-        Some(rows)
+        Some(OverlayUnseenBranchCensus { certified, rows })
     }
 
-    fn record_csharp_unseen_branch_obligation(
+    fn csharp_scope_certification(&self) -> ScopeCertification {
+        let Some(overlay) = self.csharp_overlay_unseen_branch_census() else {
+            return ScopeCertification::Uncertified;
+        };
+        if !overlay.certified {
+            return ScopeCertification::Uncertified;
+        }
+        let snapshots = self.selected_workspace_snapshots();
+        let Some(snapshot) = snapshots.get("csharp") else {
+            return ScopeCertification::Uncertified;
+        };
+        let Some(generation) = self.language_generation("csharp") else {
+            return ScopeCertification::Uncertified;
+        };
+        let overlay_paths = self
+            .project
+            .overlay_content()
+            .map(|overlays| {
+                overlays
+                    .entries()
+                    .iter()
+                    .filter(|(file, _)| file.language() == Language::CSharp)
+                    .map(|(file, _)| crate::path_utils::rel_path_string(file))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        #[cfg(any(test, feature = "test-support"))]
+        CSHARP_CERTIFICATE_CENSUSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let census = match self
+            .store_context
+            .store
+            .csharp_selected_unseen_branch_census(snapshot, generation, &overlay_paths)
+        {
+            Ok(census) => census,
+            Err(error) => {
+                self.record_store_error(error);
+                return ScopeCertification::Uncertified;
+            }
+        };
+        if census.uncertified_count != 0 {
+            return ScopeCertification::Uncertified;
+        }
+        let mut rows = census.rows;
+        rows.extend(overlay.rows.iter().cloned());
+        ScopeCertification::Certified {
+            snapshot: snapshot.clone(),
+            overlay_digest: self
+                .project
+                .overlay_content()
+                .map(|overlay| overlay.digest()),
+            rows: Arc::new(rows),
+        }
+    }
+
+    fn refuse_uncertified_csharp_gap_fill(&self) {
+        // Publication state is not part of a retained answer's named input set.
+        // Keep the caller's best-effort reason while refusing this fill.
+        self.mark_execution_dependent();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn csharp_certificate_census_count_for_test(&self) -> usize {
+        CSHARP_CERTIFICATE_CENSUSES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn record_csharp_unseen_branch_obligation(
         &self,
         file: Option<(&str, brokk_bifrost_core::gitblob::ParseVariant)>,
     ) {
+        if crate::analyzer::i_analyzer::current_query_context_value(|_| Some(())).is_none() {
+            return;
+        }
         let Some(rows) = self.csharp_unseen_branch_files() else {
             return;
         };
@@ -11210,7 +12515,7 @@ where
                 .cmp(&right.rel_path)
                 .then(left.variant.cmp(&right.variant))
         });
-        let chosen = match file {
+        let best_effort = match file {
             Some((file, variant)) => overlays
                 .iter()
                 .chain(produced.iter())
@@ -11240,6 +12545,54 @@ where
                         .has_overlay(&ProjectFile::new(self.project.root(), &row.rel_path))
                 })
             }),
+        };
+        let Some(best_effort) = best_effort else {
+            return;
+        };
+        let certification = if let Some(fill) =
+            crate::analyzer::i_analyzer::active_retained_fill_memo::<OnceLock<ScopeCertification>>()
+        {
+            fill.get_or_init(|| self.csharp_scope_certification())
+                .clone()
+        } else if let Some(memo) = self.active_query_request_memo::<UnseenBranchFilesMemo>() {
+            memo.certification
+                .get_or_init(|| self.csharp_scope_certification())
+                .clone()
+        } else {
+            self.csharp_scope_certification()
+        };
+        let snapshots = self.selected_workspace_snapshots();
+        let current_snapshot = snapshots.get("csharp");
+        let current_overlay_digest = self
+            .project
+            .overlay_content()
+            .map(|overlay| overlay.digest());
+        let chosen = match &certification {
+            ScopeCertification::Certified {
+                snapshot,
+                overlay_digest,
+                rows,
+            } if current_snapshot == Some(snapshot)
+                && *overlay_digest == current_overlay_digest =>
+            {
+                match file {
+                    Some((path, variant)) => rows.iter().find(|row| {
+                        row.rel_path == path
+                            && variant
+                                == brokk_bifrost_core::gitblob::ParseVariant::Digest(row.variant)
+                    }),
+                    None => rows.iter().min_by(|left, right| {
+                        left.rel_path
+                            .cmp(&right.rel_path)
+                            .then(left.variant.cmp(&right.variant))
+                            .then(left.chains[0].chain.cmp(&right.chains[0].chain))
+                    }),
+                }
+            }
+            ScopeCertification::Certified { .. } | ScopeCertification::Uncertified => {
+                self.refuse_uncertified_csharp_gap_fill();
+                Some(best_effort)
+            }
         };
         let Some(chosen) = chosen else { return };
         let clauses = chosen
@@ -11389,22 +12742,31 @@ where
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
         source_mode: BulkFileStateSource,
-    ) -> HashMap<ProjectFile, (FileStateCacheKey, FileState)> {
+    ) -> BulkFileStateEntries {
         let _scope = crate::analyzer::AnalyzerQueryScope::new(self);
         let live = self.live_snapshot();
         let entries = self.bulk_live_file_entries(files, &live);
         if entries.is_empty() {
-            return HashMap::default();
+            return BulkFileStateEntries {
+                states: HashMap::default(),
+                dirty_states: Vec::new(),
+            };
         }
 
         let mut out = HashMap::default();
+        let mut dirty_states = Vec::new();
         let mut clean_entries = Vec::new();
         for (file, oid, storage_key) in entries {
             let Some(key) = self.variant_cache_key(oid, &file) else {
                 continue;
             };
-            if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+            // The bulk caller decides whether a dirty parse-incomplete state
+            // is a failed build before this signal is recorded. The caller
+            // observes every returned dirty state so the request still
+            // carries the #8474 read incompleteness.
+            if let Some(state) = self.retry_dirty_file_state_inner(&key, &storage_key) {
                 out.insert(file, (key, state.as_ref().clone()));
+                dirty_states.push(state);
             } else if live.is_overlay_path(&file)
                 && let Some(state) = self
                     .transient_file_states
@@ -11426,7 +12788,10 @@ where
         }
         let entries = clean_entries;
         if entries.is_empty() {
-            return out;
+            return BulkFileStateEntries {
+                states: out,
+                dirty_states,
+            };
         }
 
         let mut source_by_file = HashMap::default();
@@ -11468,7 +12833,10 @@ where
                 out.insert(file, (key, state));
             }
         }
-        out
+        BulkFileStateEntries {
+            states: out,
+            dirty_states,
+        }
     }
 
     #[doc(hidden)]
@@ -11477,7 +12845,12 @@ where
         files: impl IntoIterator<Item = ProjectFile>,
         source_mode: BulkFileStateSource,
     ) -> HashMap<ProjectFile, FileState> {
-        self.bulk_file_state_entries(files, source_mode)
+        let entries = self.bulk_file_state_entries(files, source_mode);
+        for state in &entries.dirty_states {
+            self.observe_dirty_file_state(state, Self::dirty_parse_incomplete_detail);
+        }
+        entries
+            .states
             .into_iter()
             .map(|(file, (_, state))| (file, state))
             .collect()
@@ -11502,14 +12875,24 @@ where
             files.into_iter().take(BULK_FILE_STATE_QUERY_LIMIT),
             source_mode,
         );
-        if !scope.captured_read_incompleteness().is_empty() {
+        let build_complete = scope.captured_read_incompleteness().is_empty();
+        drop(scope);
+        // A dirty parse-incomplete state is a value for its own key, not a
+        // failed build. Observing it after the admission decision keeps the
+        // retained-fill refusal (#8474) while still publishing the complete
+        // siblings an ordinary request reads (#8191). Real build failures
+        // recorded by the hydration above still suppress publication (#7876).
+        for state in &entries.dirty_states {
+            self.observe_dirty_file_state(state, Self::dirty_parse_incomplete_detail);
+        }
+        if !build_complete {
             return;
         }
-        let mut snapshot = map_with_capacity(entries.len());
+        let mut snapshot = map_with_capacity(entries.states.len());
         let mut file_states = query_file_states
             .write()
             .expect("query file-state cache write lock poisoned");
-        for (_, (key, state)) in entries {
+        for (_, (key, state)) in entries.states {
             let state = Arc::new(state);
             if file_states.retain(key.clone(), Arc::clone(&state)) {
                 snapshot.insert(key, state);
@@ -11820,11 +13203,14 @@ where
         // entries are rare; inspect just that bounded dirty map so the SQL
         // optimization cannot turn a transient write error into a false
         // negative.
-        for (key, dirty) in self.state.dirty_snapshot() {
+        for (key, _) in self.state.dirty_snapshot() {
             if cancellation.is_cancelled() {
                 return HashSet::default();
             }
-            if !dirty.state.type_identifiers.is_disjoint(identifiers) {
+            let Some(state) = self.dirty_file_state_for_query(&key) else {
+                continue;
+            };
+            if !state.type_identifiers.is_disjoint(identifiers) {
                 result.insert(ProjectFile::new(root, key.rel_path));
             }
         }
@@ -12146,7 +13532,7 @@ where
         };
         let key = SourceParseabilityCacheKey { file_state };
         let decision = match self.source_parseability.get(&key) {
-            Some(decision) => decision,
+            Some(decision) => decision.0.clone(),
             None => {
                 let cancellation = self.active_query_cancellation();
                 let Some(outcome) = source_admission_for_oid(
@@ -12175,7 +13561,8 @@ where
                         return true;
                     }
                 };
-                self.source_parseability.insert(key, decision.clone());
+                self.source_parseability
+                    .insert(key, ParseabilityDecision(decision.clone()));
                 decision
             }
         };
@@ -12229,7 +13616,7 @@ where
             state,
             analyzed.syntax.as_deref(),
             &analyzed.condition_symbols,
-            &analyzed.undecided_chains,
+            analyzed.undecided_scan.as_ref(),
         ) {
             Ok(_) => {
                 self.state
@@ -12433,15 +13820,21 @@ where
                     // runs no other reconcile, and the Rust route readers answer only
                     // from live summary rows, so derive those units again here.
                     let (snapshots, _) = self.capture_relational_workspace_snapshots();
-                    if let Some(snapshot) = snapshots.get("rust")
-                        && let Err(error) = self
+                    if let Some(snapshot) = snapshots.get("rust") {
+                        match self
                             .store_context
                             .store
                             .reconcile_rust_crates_unless_current(snapshot)
-                    {
-                        self.record_store_error(
-                            error.context("re-deriving Rust summaries after a live blob repair"),
-                        );
+                        {
+                            Ok(report) => self
+                                .snapshot_caches
+                                .derivations()
+                                .forget_rust_units(&report),
+                            Err(error) => self
+                                .record_store_error(error.context(
+                                    "re-deriving Rust summaries after a live blob repair",
+                                )),
+                        }
                     }
                 }
             });
@@ -12469,6 +13862,40 @@ where
     #[doc(hidden)]
     pub fn language_generation(&self, lang: &str) -> Option<GenerationId> {
         self.store_context.generations.get(lang).copied()
+    }
+
+    /// Fence a cold memo build against store generations captured at analyzer
+    /// construction. Call this inside the build's read-completion capture, after
+    /// its own computation has finished and before it offers a value to a cell.
+    #[doc(hidden)]
+    pub fn record_cold_compute_generation_fence(&self) {
+        use crate::analyzer::i_analyzer::IAnalyzer;
+
+        if IAnalyzer::active_query_cancellation(self).is_some_and(|token| token.is_cancelled())
+            || IAnalyzer::current_query_read_completion(self)
+                .err()
+                .is_some_and(|reason| reason.is_execution_dependent())
+        {
+            return;
+        }
+        for (language, _) in self.adapter.storage_language_keys() {
+            let captured = *self
+                .store_context
+                .generations
+                .get(&language)
+                .expect("analyzer captured every storage language generation");
+            if let Err(error) = self
+                .store_context
+                .store
+                .require_current_generation(&language, captured)
+            {
+                IAnalyzer::record_query_incomplete(
+                    self,
+                    crate::analyzer::QueryReadIncomplete::StoreFailure(error),
+                );
+                break;
+            }
+        }
     }
 
     /// The current file-to-blob mapping, in both directions.
@@ -12508,6 +13935,15 @@ where
             mounts.push((rebased, oid));
         }
         Some(mounts)
+    }
+
+    /// Every live path this adapter analyzes, before the validation and parsed-blob
+    /// filters that [`Self::analyzed_live_files`] applies.
+    pub(crate) fn owned_live_files(&self, live: &LiveSnapshot) -> Vec<ProjectFile> {
+        live.all_paths()
+            .filter_map(|file| self.rebase_live_file_to_project_root(file))
+            .filter(|file| self.adapter_owns_file(file, live))
+            .collect()
     }
 
     /// Whether this adapter analyzes `file`.
@@ -12627,15 +14063,15 @@ where
                     .clone()
             })
         {
+            #[cfg(any(test, feature = "test-support"))]
+            self.query_read_cache_lock()
+                .analyzed_live_file_hits
+                .fetch_add(1, Ordering::Relaxed);
             return files;
         }
         let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
         let snapshot = self.live_snapshot();
-        let requested_paths = snapshot
-            .all_paths()
-            .filter_map(|file| self.rebase_live_file_to_project_root(file))
-            .filter(|file| self.adapter_owns_file(file, &snapshot))
-            .collect::<Vec<_>>();
+        let requested_paths = self.owned_live_files(&snapshot);
         if let Err(error) = self.selected_variants_for_paths(&requested_paths) {
             self.record_store_error(error);
             return Vec::new();
@@ -13315,7 +14751,7 @@ where
                 return Ok(None);
             }
             let modules = Arc::new(PathSyntheticModules {
-                answer: (reads.execution_dependences == 0).then(|| {
+                answer: (reads.channels.execution_dependences == 0).then(|| {
                     crate::analyzer::read_ledger::path_synthetic_modules_digest(
                         self.adapter.language(),
                         &result.rows,
@@ -13330,8 +14766,9 @@ where
                 self.mark_execution_dependent();
                 return Ok(None);
             }
-            if reads.unattributed_reads == 0
-                && reads.execution_dependences == 0
+            if reads.channels.unattributed_reads == 0
+                && reads.channels.execution_dependences == 0
+                && !reads.channels.reuse_refused
                 && scope.captured_read_incompleteness().is_empty()
                 && let Some(memo) = &memo
             {
@@ -13709,11 +15146,7 @@ where
             return (LimitedQueryRows::complete(Vec::new(), 0), paths);
         }
         let snapshot = self.live_snapshot();
-        let dirty = self
-            .state
-            .dirty_file_states
-            .lock()
-            .expect("dirty file-state mutex poisoned");
+        let dirty = self.state.dirty_snapshot();
         let mut rows = Vec::new();
         let mut inspected = 0usize;
         let mut visit_units =
@@ -13737,7 +15170,7 @@ where
                 }
                 true
             };
-        for (key, dirty) in dirty.iter() {
+        for key in dirty.keys() {
             // Scanning a dirty-state entry is real provider work even when the
             // entry belongs to another language or no longer matches the live
             // OID. Charge it so a small caller limit cannot hide an unbounded
@@ -13753,7 +15186,10 @@ where
                 continue;
             }
             paths.insert(file);
-            if !visit_units(&dirty.state, &mut rows, &mut inspected, &mut continue_query) {
+            let Some(state) = self.dirty_file_state_for_query(key) else {
+                continue;
+            };
+            if !visit_units(&state, &mut rows, &mut inspected, &mut continue_query) {
                 return (LimitedQueryRows::incomplete(rows, inspected), paths);
             }
         }
@@ -14223,7 +15659,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(state.children.get(owner).map(Vec::as_slice), limit);
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
@@ -14490,6 +15926,78 @@ where
         Ok(())
     }
 
+    fn rust_omission_rows(
+        omissions: &[brokk_bifrost_core::analyzer::project::WorkspaceFileOmission],
+    ) -> BTreeMap<String, String> {
+        omissions
+            .iter()
+            .filter(|omission| omission_fails_rust_listing(omission))
+            .map(|omission| {
+                (
+                    brokk_bifrost_core::path_utils::workspace_relative_slash_path(&omission.path),
+                    format!("{RUST_LISTING_OMISSION_PREFIX}{:?}", omission.reason),
+                )
+            })
+            .collect()
+    }
+
+    /// Compare the current omission proof with the prior selected certificate.
+    /// A read failure is returned for the caller to treat as a change.
+    pub fn rust_listing_changed(
+        &self,
+        listing: Option<&SharedWorkspaceFileListing>,
+    ) -> Result<bool, StoreError> {
+        let cached;
+        let omissions = if let Some((_, omissions)) = listing {
+            omissions
+        } else {
+            cached = self.project().cached_omissions_if_available()?;
+            let Some(omissions) = cached.as_ref() else {
+                return Ok(false);
+            };
+            omissions
+        };
+        let current = Self::rust_omission_rows(omissions);
+        let Some(snapshot) = self.selected_workspace_snapshots().get("rust").cloned() else {
+            return Ok(false);
+        };
+        let prior = self.store_context.store.rust_source_listing_failures(
+            &snapshot,
+            crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+        )?;
+        Ok(prior.is_some_and(|rows| {
+            // A certificate written while no listing was readable holds the
+            // unavailable row. A listing is readable now, so recompute it.
+            if rows
+                .iter()
+                .any(|(path, _)| path == RUST_LISTING_UNAVAILABLE_PATH)
+            {
+                return true;
+            }
+            let prior = rows
+                .into_iter()
+                .filter(|(_, reason)| reason.starts_with(RUST_LISTING_OMISSION_PREFIX))
+                .collect::<BTreeMap<_, _>>();
+            current != prior
+        }))
+    }
+
+    /// The failure that kept this build's workspace inputs from publishing.
+    /// A failed sync publishes no dependency evidence: the selection is absent
+    /// or an earlier revision's, so selected rows do not describe these inputs
+    /// and a dependency read must report the failure instead (#8357).
+    #[doc(hidden)]
+    pub fn workspace_input_publication_error(&self) -> Option<StoreError> {
+        self.state
+            .workspace_package_inventory_error
+            .as_ref()
+            .map(|error| {
+                error
+                    .clone()
+                    .context("this build's workspace inputs did not publish")
+            })
+    }
+
     #[doc(hidden)]
     pub fn selected_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
         self.relational_workspace_snapshots.load_full()
@@ -14619,16 +16127,20 @@ where
                 lang: self.adapter.storage_language_key_for_file(&file).to_owned(),
                 variant,
             };
-            let cached = self.store_context.store.admit_cached_selected_content(
-                owner,
-                &path,
-                &key,
-                &ResolutionContentInput::Parsed {
-                    key: key.clone(),
-                    semantic_language: language,
-                },
-                cancellation,
-            )?;
+            let cached = self
+                .store_context
+                .store
+                .admit_cached_selected_content_for_epoch(
+                    owner,
+                    &path,
+                    &key,
+                    &ResolutionContentInput::Parsed {
+                        key: key.clone(),
+                        semantic_language: language,
+                    },
+                    self.adapter.resolution_producer_epoch(),
+                    cancellation,
+                )?;
             let outcome = match cached {
                 ResolutionContentPublicationOutcome::Unavailable(
                     SelectedResolutionUnavailable::MissingBlob { .. }
@@ -14725,13 +16237,14 @@ where
         let generations = HashMap::from_iter([(owner.lang.clone(), owner.generation)]);
         // The walk's tree was dropped with its parse, so this path parses the
         // retained source again.
-        let syntax = match self.prepare_syntax_from_source_cancellable(
+        let (syntax_outcome, scan) = self.prepare_syntax_from_source_with_scan(
             file,
             PreparedSyntaxSource::Exact(Arc::from(state.source.as_str())),
             PreparedSourceOrigin::Disk,
             None,
             Some(cancellation),
-        ) {
+        );
+        let syntax = match syntax_outcome {
             PreparedSyntaxPreparation::Complete(Some(syntax)) => syntax,
             PreparedSyntaxPreparation::Refused(reason) => {
                 self.record_admission_refusal(file, reason);
@@ -14772,6 +16285,10 @@ where
             PreparedParsedBlobPreparation::Cancelled => {
                 return Ok(ResolutionContentPublicationOutcome::Cancelled);
             }
+        };
+        let prepared = match scan {
+            Some(scan) => prepared.with_undecided_scan(scan),
+            None => prepared,
         };
         self.store_context.store.publish_selected_parsed_content(
             owner,
@@ -15209,6 +16726,9 @@ where
 
         let cancellation = self.active_query_cancellation().unwrap_or_default();
         let storage_languages = self.storage_language_keys_for_queries();
+        let candidate_fq = self
+            .active_query_request_memo::<CandidateFqMemo>()
+            .unwrap_or_default();
         let ordered = self
             .store_query_or_record(
                 |sink| {
@@ -15230,6 +16750,7 @@ where
                         self.selected_workspace_snapshots().as_ref(),
                         &names,
                         &cancellation,
+                        &candidate_fq,
                     ),
                 "reading relational definition ordering",
             )
@@ -16130,9 +17651,6 @@ where
         fqn: &str,
         normalized: bool,
     ) -> Option<BTreeSet<CodeUnit>> {
-        if !self.workspace_declaration_identities_authoritative() {
-            return Some(BTreeSet::new());
-        }
         use crate::analyzer::store::PersistedLookupKey;
         let (key, lookup, family) = self.persisted_fqn_lookup(
             fqn,
@@ -16142,25 +17660,52 @@ where
                 PersistedLookupKey::ExactFqn
             },
         );
+        self.try_lookup_declarations_by_persisted_key(key, &lookup, family)
+    }
+
+    /// Direct replay for a normalized-tail question. `normalized_key` is the
+    /// persisted key itself, so applying the language normalizer again would
+    /// change the question and make a certificate unsound.
+    #[doc(hidden)]
+    pub fn try_lookup_declarations_by_normalized_key(
+        &self,
+        normalized_key: &str,
+    ) -> Option<BTreeSet<CodeUnit>> {
+        self.try_lookup_declarations_by_persisted_key(
+            crate::analyzer::store::PersistedLookupKey::NormalizedFqn,
+            normalized_key,
+            IndexFamily::DefinitionNormalizedTail,
+        )
+    }
+
+    fn try_lookup_declarations_by_persisted_key(
+        &self,
+        key: crate::analyzer::store::PersistedLookupKey,
+        lookup: &str,
+        family: IndexFamily,
+    ) -> Option<BTreeSet<CodeUnit>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Some(BTreeSet::new());
+        }
         let rows = self.store_query_or_record(
-            |sink| sink.push(ReadKey::index(family, &lookup)),
+            |sink| sink.push(ReadKey::index(family, lookup)),
             self.store_context
                 .store
                 .declaration_candidate_rows_by_lookup_key_for_langs(
                     &self.storage_language_keys_for_queries(),
                     self.store_context.generations.as_ref(),
                     key,
-                    &lookup,
+                    lookup,
                 ),
             format!("querying declarations by persisted name `{lookup}`"),
         )?;
         let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
         matches.extend(self.dirty_units_matching(false, |unit| {
-            self.persisted_fqn_candidate_matches(unit, key, &lookup)
+            self.persisted_fqn_candidate_matches(unit, key, lookup)
         }));
         matches.extend(
             self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                self.persisted_fqn_candidate_matches(unit, key, &lookup)
+                self.persisted_fqn_candidate_matches(unit, key, lookup)
             })?,
         );
         Some(matches)
@@ -16449,8 +17994,8 @@ where
     /// contract (see `IAnalyzer`) is that every fully-qualified name `pattern`
     /// can match ends at the query path's tail, and that
     /// `terminal_identifiers` holds every way one persisted `identifier` can
-    /// spell that tail. `idx_code_units_lang_identifier_lookup` indexes
-    /// `(lang, identifier)`, so the candidate set is one seek per spelling
+    /// spell that tail. `idx_code_units_lang_identifier` indexes
+    /// `(lang, identifier, blob_id)`, so the candidate set is one seek per spelling
     /// rather than the whole-table walk
     /// `declaration_candidate_rows_by_pattern_for_langs` performs (#1688). On
     /// the CodeScale shared cache that walk reads 8.3 M `cpp` rows, each with a
@@ -16999,8 +18544,8 @@ where
     pub fn content_qualifier_of(&self, file: &ProjectFile) -> Option<String> {
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = self.variant_cache_key(oid, file)?;
-        if let Some(content_qualifier) = self.state.dirty_content_qualifier(&key) {
-            return Some(content_qualifier);
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
+            return Some(state.content_qualifier.clone());
         }
         // See `storage_key_and_generation`: a foreign file has no persisted
         // qualifier here, and the snapshot fallbacks below refuse it too.
@@ -17066,7 +18611,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return from_state(&state, limit);
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
@@ -17156,7 +18701,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(
                 projection_value_for_unit(&state.ruby_method_dispatch_modes, code_unit)
                     .map(std::slice::from_ref),
@@ -17210,8 +18755,8 @@ where
         };
         // The dirty overlay holds a parse the store has not accepted yet, and
         // is authoritative over anything retained.
-        if let Some(imports) = self.state.dirty_imports(&key) {
-            return imports;
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
+            return state.imports.clone();
         }
         if let Some(retained) = self.import_info_store_get(&key) {
             return retained.to_vec();
@@ -17283,7 +18828,7 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         self.record_file_read(file, oid);
         let key = self.variant_cache_key(oid, file)?;
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return state.source_facts.as_ref().map(|_| state.imports.clone());
         }
         if let Some(retained) = self.import_info_store_get_checked(&key) {
@@ -17455,7 +19000,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(Some(&state.imports), limit);
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
@@ -17580,7 +19125,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.raw_supertypes, code_unit),
                 limit,
@@ -17632,7 +19177,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.supertype_lookup_paths, code_unit),
                 limit,
@@ -17958,7 +19503,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return false;
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return state.type_aliases.contains(code_unit);
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
@@ -18030,7 +19575,7 @@ where
         key: &FileStateCacheKey,
         file: &ProjectFile,
     ) -> Option<Arc<EnclosingCodeUnitIndex>> {
-        if let Some(state) = self.state.dirty_file_state(key) {
+        if let Some(state) = self.dirty_file_state_for_query(key) {
             return Some(self.enclosing_code_unit_index_from_state(key, &state));
         }
         if let Some(state) = self.source_snapshot_file_state(file) {
@@ -18162,7 +19707,7 @@ where
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.signatures, code_unit),
                 limit,
@@ -18315,10 +19860,33 @@ where
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
+        self.ranges_for_source_oid_limited(code_unit, oid, limit)
+    }
+
+    /// Range rows for one exact source identity already selected by a caller.
+    /// Every cache and store branch uses the same variant key; none reselects
+    /// the live file between source capture and declaration-range lookup.
+    #[doc(hidden)]
+    pub fn ranges_for_source_oid_limited(
+        &self,
+        code_unit: &CodeUnit,
+        oid: Oid,
+        limit: usize,
+    ) -> LimitedQueryRows<Range> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
         let Some(key) = self.variant_cache_key(oid, file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        if let Some(state) = self.state.dirty_file_state(&key) {
+        // Range rows, including dirty or retained rows, belong to this exact
+        // selected blob. Consumers that read the source later can verify it.
+        self.record_file_read(file, oid);
+        if let Some(state) = self.dirty_file_state_for_query(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.ranges, code_unit),
                 limit,
@@ -18330,7 +19898,7 @@ where
                 limit,
             );
         }
-        if let Some(state) = self.source_snapshot_file_state(file) {
+        if let Some(state) = self.source_snapshot_file_states.get(&key) {
             return limited_projection_rows(
                 projection_rows_for_unit(&state.ranges, code_unit),
                 limit,
@@ -18803,6 +20371,11 @@ where
         } else {
             self.relational_definition_batch_call_count
                 .fetch_add(1, Ordering::Relaxed);
+            // Candidate FQ identities live for the outer query; outside one,
+            // this call's own memo behaves as an unmemoized read.
+            let candidate_fq = self
+                .active_query_request_memo::<CandidateFqMemo>()
+                .unwrap_or_default();
             let current = self.store_context.store.relational_definition_values(
                 self.adapter.as_ref(),
                 self.project.root(),
@@ -18811,6 +20384,7 @@ where
                 self.selected_workspace_snapshots().as_ref(),
                 &unique,
                 cancellation,
+                &candidate_fq,
                 |values| {
                     assert_eq!(values.len(), unique.len());
                     for (request, value) in unique.iter().zip(values) {
@@ -19591,6 +21165,31 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn declaration_candidates_for_question(
+        &self,
+        file: &ProjectFile,
+        question: &LookupQuestion,
+    ) -> Option<Vec<CodeUnit>> {
+        if !self.workspace_declaration_identities_authoritative() || !self.is_analyzed(file) {
+            return None;
+        }
+        self.fetch_file_state(file)
+            .or_else(|| self.fetch_file_state_from_current_source(file))
+            .map(|state| {
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| {
+                        !unit.is_file_scope()
+                            && crate::analyzer::read_ledger::declaration_question_matches(
+                                question, unit,
+                            )
+                    })
+                    .cloned()
+                    .collect()
+            })
+    }
+
     fn prefetch_parse_variants(&self, files: &[ProjectFile]) {
         if let Err(error) = self.selected_variants_for_paths(files) {
             self.record_store_error(error);
@@ -19622,54 +21221,66 @@ where
         workspace: &crate::analyzer::WorkspaceAnalyzer,
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&crate::CancellationToken>,
-    ) -> Result<Arc<crate::analyzer::LoopCandidates>, crate::analyzer::QueryReadIncomplete> {
+    ) -> Result<Arc<Accounted<crate::analyzer::LoopCandidates>>, crate::analyzer::QueryReadIncomplete>
+    {
         self.record_procedure_memo_read(procedure);
-        enum FailedFill {
-            Read(crate::analyzer::QueryReadIncomplete),
-            Execution(Arc<crate::analyzer::LoopCandidates>),
-        }
         let generation_before = self.project().analysis_generation();
-        let key = (procedure.artifact().materialization_id(), procedure.id());
-        match self
+        let key = ProcedureFactCacheKey(procedure.artifact().materialization_id(), procedure.id());
+        let no_cancellation = crate::CancellationToken::new();
+        let (acquisition, _) = self
             .loop_candidates_by_procedure
-            .try_get_with_by_ref(&key, || {
-                let ((value, completion), reads) =
-                    crate::analyzer::i_analyzer::capture_query_reads(self, || {
-                        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-                        let value = crate::analyzer::build_loop_candidates(
-                            workspace,
-                            procedure,
-                            cancellation,
-                        );
-                        (value, scope.read_completion())
-                    });
-                completion.map_err(FailedFill::Read)?;
-                let execution_reason = value.reason.is_some_and(|reason| {
-                    crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason)
-                        .is_some()
-                });
-                if execution_reason
-                    || self.project().analysis_generation() != generation_before
-                    || reads.execution_dependences() > 0
-                    || cancellation.is_some_and(crate::CancellationToken::is_cancelled)
-                {
-                    self.mark_execution_dependent();
-                    return Err(FailedFill::Execution(Arc::new(value)));
-                }
-                Ok::<_, FailedFill>(Arc::new(value))
-            }) {
-            Ok(value) => Ok(value),
-            Err(attempt) => match attempt.as_ref() {
-                FailedFill::Read(reason) => {
-                    self.record_query_incomplete(reason.clone());
-                    Err(reason.clone())
-                }
-                FailedFill::Execution(value) => {
-                    self.mark_execution_dependent();
-                    Ok(Arc::clone(value))
-                }
-            },
+            .acquire(&key, cancellation.unwrap_or(&no_cancellation));
+        let permit = match acquisition {
+            BudgetedValueAcquisition::Cached { value } => return Ok(Arc::clone(value.arc())),
+            BudgetedValueAcquisition::Leader { permit } => Some(permit),
+            BudgetedValueAcquisition::Rejected | BudgetedValueAcquisition::Cancelled => None,
+        };
+        let ((value, completion), reads) =
+            crate::analyzer::i_analyzer::capture_query_reads(self, || {
+                let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+                (
+                    crate::analyzer::build_loop_candidates(workspace, procedure, cancellation),
+                    scope.read_completion(),
+                )
+            });
+        if let Err(reason) = completion {
+            if let Some(permit) = permit {
+                permit.publish_rejected();
+            }
+            self.record_query_incomplete(reason.clone());
+            return Err(reason);
         }
+        let execution_reason = value.reason.is_some_and(|reason| {
+            crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some()
+        });
+        let execution_dependent = execution_reason
+            || self.project().analysis_generation() != generation_before
+            || reads.execution_dependences() > 0
+            || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        if execution_dependent || reads.reuse_refused() {
+            crate::analyzer::i_analyzer::replay_query_read_receipt(
+                self,
+                [],
+                brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+                    execution_dependences: usize::from(execution_dependent),
+                    reuse_refused: reads.reuse_refused(),
+                    ..Default::default()
+                },
+            );
+            let value = Arc::new(Accounted::uncharged(value));
+            if let Some(permit) = permit {
+                permit.publish_rejected();
+            }
+            return Ok(value);
+        }
+        let value = Arc::new(Accounted::charged(
+            self.store_context.store.retention_budget(),
+            value,
+        ));
+        if let Some(permit) = permit {
+            permit.publish_complete(SharedAllocation::new(Arc::clone(&value)));
+        }
+        Ok(value)
     }
 
     fn statement_assessments_for(
@@ -19677,60 +21288,73 @@ where
         workspace: &crate::analyzer::WorkspaceAnalyzer,
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&crate::CancellationToken>,
-    ) -> Arc<crate::analyzer::semantic::StatementAssessments> {
+    ) -> Arc<Accounted<crate::analyzer::semantic::statement_entries::AccountedStatementAssessments>>
+    {
         self.record_procedure_memo_read(procedure);
         let generation_before = self.project().analysis_generation();
-        let key = (procedure.artifact().materialization_id(), procedure.id());
-        match self
+        let key = ProcedureFactCacheKey(procedure.artifact().materialization_id(), procedure.id());
+        let no_cancellation = crate::CancellationToken::new();
+        let (acquisition, _) = self
             .statement_assessments_by_procedure
-            .try_get_with_by_ref(&key, || {
-                let ((value, completion), reads) = crate::analyzer::i_analyzer::capture_query_reads(self, || {
-                    let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-                    let value = crate::analyzer::semantic::statement_entries::build_statement_assessments(
-                        workspace, procedure, cancellation);
-                    (Arc::new(value), scope.read_completion())
-                });
-                let execution_reason = value.reason.into_iter().chain(value.rows.iter().filter_map(|row| {
-                    match row.verdict {
-                        crate::analyzer::semantic::StatementVerdict::Open(reason) => Some(reason),
-                        _ => None,
-                    }
-                })).any(|reason| crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason).is_some());
-                if let Err(reason) = completion {
-                    if reason.is_execution_dependent() {
-                        self.mark_execution_dependent();
-                    }
-                    return Err(Err(reason));
-                }
-                if execution_reason || self.project().analysis_generation() != generation_before || reads.execution_dependences() > 0
-                    || cancellation.is_some_and(crate::CancellationToken::is_cancelled)
-                {
-                    self.mark_execution_dependent();
-                    return Err(Ok(value));
-                }
-                Ok::<_, Result<Arc<crate::analyzer::semantic::StatementAssessments>, crate::analyzer::QueryReadIncomplete>>(value)
-            }) {
-            Ok(value) => value,
-            Err(attempt) => {
-                match attempt.as_ref() {
-                    Ok(value) => {
-                        self.mark_execution_dependent();
-                        Arc::clone(value)
-                    }
-                    Err(reason) => {
-                        if reason.is_execution_dependent() {
-                            self.mark_execution_dependent();
-                        }
-                        self.record_query_incomplete(reason.clone());
-                        Arc::new(crate::analyzer::semantic::StatementAssessments {
-                            rows: Vec::new(),
-                            complete: false,
-                            reason: Some(derivation_reason::QUERY_INCOMPLETE),
-                        })
-                    }
-                }
+            .acquire(&key, cancellation.unwrap_or(&no_cancellation));
+        let permit = match acquisition {
+            BudgetedValueAcquisition::Cached { value } => return Arc::clone(value.arc()),
+            BudgetedValueAcquisition::Leader { permit } => Some(permit),
+            BudgetedValueAcquisition::Rejected | BudgetedValueAcquisition::Cancelled => None,
+        };
+        let ((value, completion), reads) =
+            crate::analyzer::i_analyzer::capture_query_reads(self, || {
+                let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+                (
+                    crate::analyzer::semantic::statement_entries::build_statement_assessments(
+                        workspace,
+                        procedure,
+                        cancellation,
+                    ),
+                    scope.read_completion(),
+                )
+            });
+        let execution_reason = value
+            .reason
+            .into_iter()
+            .chain(value.rows.iter().filter_map(|row| match row.verdict {
+                crate::analyzer::semantic::StatementVerdict::Open(reason) => Some(reason),
+                _ => None,
+            }))
+            .any(|reason| {
+                crate::analyzer::read_ledger::DerivationExecutionCause::from_reason(reason)
+                    .is_some()
+            });
+        if let Err(reason) = completion {
+            if let Some(permit) = permit {
+                permit.publish_rejected();
             }
+            if reason.is_execution_dependent() {
+                self.mark_execution_dependent();
+            }
+            self.record_query_incomplete(reason.clone());
+            return Arc::new(Accounted::uncharged(
+                crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(
+                    crate::analyzer::semantic::StatementAssessments {
+                        rows: Vec::new(),
+                        complete: false,
+                        reason: Some(derivation_reason::QUERY_INCOMPLETE),
+                    },
+                ),
+            ));
         }
+        let execution_dependent = execution_reason
+            || self.project().analysis_generation() != generation_before
+            || reads.execution_dependences() > 0
+            || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        publish_statement_assessments(
+            self,
+            self.store_context.store.retention_budget(),
+            permit,
+            value,
+            execution_dependent,
+            &reads,
+        )
     }
 
     fn dependency_file_locations(
@@ -19754,23 +21378,22 @@ where
         &self,
     ) -> crate::analyzer::store::Result<crate::analyzer::semantic_model::DependencyFileEvidence>
     {
-        if !matches!(
+        if !crate::analyzer::store::dependency_file_evidence::publishes_dependency_evidence(
             self.adapter.language(),
-            Language::Rust
-                | Language::JavaScript
-                | Language::TypeScript
-                | Language::CSharp
-                | Language::Go
         ) {
             return Err(crate::analyzer::store::StoreError::new(
                 "static dependency publication is unavailable for this language adapter",
             ));
         }
+        if let Some(error) = self.workspace_input_publication_error() {
+            return Err(error);
+        }
         match &self.dependency_evidence_overlay {
             Ok(Some(publication)) => publication.read(),
-            Ok(None) => self
-                .analyzer_store()
-                .dependency_file_evidence(&self.selected_workspace_snapshots()),
+            Ok(None) => self.analyzer_store().dependency_file_evidence(
+                &self.selected_workspace_snapshots(),
+                self.adapter.language(),
+            ),
             Err(error) => Err(error.clone()),
         }
     }
@@ -19926,6 +21549,9 @@ where
         if let Some(error) = self.state.workspace_package_inventory_error.clone() {
             context.record_store_error(error);
         }
+        if let Some(error) = self.state.update_resolution_error.clone() {
+            context.record_store_error(error);
+        }
         let mut cache = self
             .query_read_cache
             .write()
@@ -19964,6 +21590,10 @@ where
         TreeSitterAnalyzer::record_read_key(self, key);
     }
 
+    fn record_read_obligation(&self, key: &crate::analyzer::ReadKey) {
+        self.adapter.record_read_obligation(self, key);
+    }
+
     fn record_read_receipt(&self, keys: &Arc<[crate::analyzer::ReadKey]>) {
         let contexts = if crate::analyzer::i_analyzer::has_read_attribution_ledgers() {
             Vec::new()
@@ -19999,6 +21629,19 @@ where
     }
 
     #[track_caller]
+    fn refuse_read_reuse(&self) {
+        crate::analyzer::i_analyzer::record_reuse_refusal(
+            || IAnalyzer::read_ledger_attached(self),
+            || {
+                self.query_read_cache
+                    .read()
+                    .expect("query read cache poisoned")
+                    .contexts
+                    .clone()
+            },
+        );
+    }
+
     fn mark_execution_dependent_reads(&self, count: usize) {
         crate::analyzer::i_analyzer::record_execution_dependence(
             count,
@@ -20013,8 +21656,28 @@ where
         );
     }
 
+    fn record_budget_dependences(&self, count: usize) {
+        crate::analyzer::i_analyzer::record_budget_dependence(
+            count,
+            || IAnalyzer::read_ledger_attached(self),
+            || {
+                self.query_read_cache
+                    .read()
+                    .expect("query read cache poisoned")
+                    .contexts
+                    .clone()
+            },
+        );
+    }
+
     fn records_query_reads(&self) -> bool {
         true
+    }
+
+    fn selected_workspace_snapshots_for_reads(
+        &self,
+    ) -> Option<Arc<crate::analyzer::store::WorkspaceSnapshots>> {
+        Some(self.selected_workspace_snapshots())
     }
 
     fn read_ledger_attached(&self) -> bool {
@@ -20107,9 +21770,76 @@ where
         }
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        without_project_reads(|| {
-            if changed_files.is_empty() {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&SharedWorkspaceFileListing>,
+    ) -> Self {
+        let pending = super::pending_update_paths(changed_files, &self.pending_updates);
+        let changed_files = &pending;
+        let mut updated = without_project_reads(|| {
+            // A failed read cannot show the listing unchanged, so it routes as
+            // a change and the error is recorded once the update's state exists.
+            let mut listing_read_error = None;
+            // Without a maintained listing cache, a point update has no proof
+            // that membership or omissions stayed unchanged. Capture one
+            // build-scoped enumeration, shared by all certificate consumers.
+            let captured_listing = if listing.is_none() {
+                match self.project.cached_listing_if_available() {
+                    Ok(Some(_)) => None,
+                    Ok(None) => match self.project.all_files_with_omissions() {
+                        Ok(listing) => Some(listing),
+                        Err(error) => {
+                            listing_read_error = Some(error.into());
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        listing_read_error = Some(error.into());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let listing = listing.or(captured_listing.as_ref());
+            let mut refreshed_listing = match listing {
+                Some(listing) => listing.clone(),
+                None => match self.project.all_files_with_omissions() {
+                    Ok(listing) => listing,
+                    Err(error) => return self.failed_configured_update(error.into()),
+                },
+            };
+            let resolved_files =
+                match brokk_bifrost_core::analyzer::project::resolve_update_paths_with_refresh(
+                    self.project.as_ref(),
+                    changed_files,
+                    &mut refreshed_listing,
+                    &|file| Self::workspace_configuration_input(self.adapter.as_ref(), file),
+                ) {
+                    Ok(files) => files,
+                    Err(error) => return self.failed_configured_update(error.into()),
+                };
+            let listing = Some(&refreshed_listing);
+            let changed_files = &resolved_files;
+            let rust_listing_changed = self.adapter.language() == Language::Rust
+                && self.rust_listing_changed(listing).unwrap_or_else(|error| {
+                    listing_read_error = Some(error);
+                    true
+                });
+            let listing_withdrawn = listing_may_withdraw_proof(self.project.as_ref(), listing)
+                .unwrap_or_else(|error| {
+                    listing_read_error = Some(error);
+                    true
+                });
+            // Once every proof is withdrawn, a persisting omission has nothing
+            // left to withdraw, so an update with no changed file stays a no-op.
+            if changed_files.is_empty()
+                && self.state.update_resolution_error.is_none()
+                && !rust_listing_changed
+                && !(listing_withdrawn
+                    && crate::analyzer::read_verification::WorkspaceFactIndex::holds_workspace_listing_proof(self))
+            {
                 return self.clone();
             }
             let snapshots = self.selected_workspace_snapshots();
@@ -20124,6 +21854,79 @@ where
                 Ok(configuration) => configuration.flatten(),
                 Err(error) => return self.failed_configured_update(error),
             };
+            // Only additions can introduce an uncaptured ancestor manifest.
+            // Existing source edits keep the generation's captured configuration.
+            let mut added_rust_manifest = false;
+            // A directory-target main changes package ownership only when it
+            // appears or disappears; an edit to an existing one keeps the layout.
+            let mut target_layout_changed = false;
+            // Without a captured configuration, naming reads manifests directly
+            // and there is no capture to fall behind.
+            if let (Language::Rust, Some(configuration)) = (
+                self.adapter.language(),
+                self.state.selected_configuration.as_ref(),
+            ) {
+                for file in changed_files.iter().filter(|file| {
+                    brokk_bifrost_core::analyzer::project::is_rust_target_layout_main(
+                        file.rel_path(),
+                    )
+                }) {
+                    let captured = configuration
+                        .present_blobs
+                        .contains_key(crate::path_utils::rel_path_string(file).as_str());
+                    match file.abs_path().try_exists() {
+                        Ok(present) if present == captured => {}
+                        Ok(_) => {
+                            target_layout_changed = true;
+                            break;
+                        }
+                        Err(error) => {
+                            return self.failed_configured_update(StoreError::from(error));
+                        }
+                    }
+                }
+                let mut added_sources = changed_files
+                    .iter()
+                    .filter(|file| {
+                        file.rel_path()
+                            .extension()
+                            .is_some_and(|extension| extension == "rs")
+                            && self.indexed_live_snapshot.oid_for_path(file).is_none()
+                    })
+                    .peekable();
+                if added_sources.peek().is_some() {
+                    for directory in
+                        crate::analyzer::store::workspace_inputs::metadata_ancestor_directories(
+                            added_sources,
+                        )
+                    {
+                        let manifest = directory.join("Cargo.toml");
+                        let relative = crate::path_utils::rel_path_string(&ProjectFile::new(
+                            self.project.root(),
+                            &manifest,
+                        ));
+                        if configuration.present_blobs.contains_key(relative.as_str()) {
+                            continue;
+                        }
+                        match self.project.root().join(&manifest).try_exists() {
+                            Ok(true) => {
+                                added_rust_manifest = true;
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                return self.failed_configured_update(StoreError::from(error));
+                            }
+                        }
+                    }
+                }
+            }
+            // A newly governing manifest or an added or removed directory-target
+            // main changes package ownership. Rebuild with a fresh configuration
+            // capture, just like a created package-identity input below.
+            if added_rust_manifest || target_layout_changed {
+                return self.update_all();
+            }
             if parse_configuration.is_some()
                 && changed_files
                     .iter()
@@ -20169,7 +21972,7 @@ where
                 if configuration {
                     // A generation that failed to capture configuration has no
                     // baseline row to replace.
-                    if self.state.workspace_configuration_digest.is_none() {
+                    if self.state.selected_configuration.is_none() {
                         return self.update_all();
                     }
                     configuration_inputs.push(WorkspaceConfigurationInput::new(
@@ -20292,11 +22095,27 @@ where
             state
                 .workspace_inventory
                 .meet(self.state.workspace_inventory);
-            state.workspace_package_inventory_error =
-                self.state.workspace_package_inventory_error.clone();
+            // The current listing's omissions, from the same source the Rust
+            // listing certificate reads. An update with neither a cached
+            // listing nor the enclosing update's listing cannot know whether
+            // a new omission appeared, so the fact is cleared, as the Rust
+            // certificate reports it unavailable.
+            match current_listing_omissions(self.project.as_ref(), listing) {
+                Ok(omissions) => state.workspace_inventory.require_observed_listing(
+                    omissions.as_ref().map(|omissions| omissions.as_slice()),
+                ),
+                Err(error) => state.record_workspace_package_inventory_error(error),
+            }
+            state.update_resolution_error = listing_read_error;
+            // An error this update recorded stays; the previous one carries
+            // forward only when this update has none.
+            if state.workspace_package_inventory_error.is_none() {
+                state.workspace_package_inventory_error =
+                    self.state.workspace_package_inventory_error.clone();
+            }
             state.workspace_package_identity_input_digests =
                 self.state.workspace_package_identity_input_digests.clone();
-            state.workspace_configuration_digest = self.state.workspace_configuration_digest;
+            state.selected_configuration = self.state.selected_configuration.clone();
             state
                 .workspace_package_identity_input_digests
                 .extend(identity_inputs);
@@ -20328,6 +22147,43 @@ where
             workspace_paths_to_refresh.extend(claim_delta.added);
             workspace_paths_to_refresh.extend(claim_delta.dropped);
             dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
+            let previous = self.selected_workspace_snapshots();
+            // A revision's certificate never changes, and only the transaction
+            // that opens a revision writes it. So the certificate is computed
+            // before the publications, from what the reconciles above already
+            // published (parse blobs, live OIDs) and from the paths this update
+            // names. Only the update's last publication carries it: each file
+            // is published at a revision of its own, and the revisions before
+            // the last lack the later files, so a certificate written there
+            // would call the listing complete without them. Those revisions
+            // stay uncertified (incomplete) and the final revision, which
+            // holds every change, is never observable without its certificate.
+            let rust_listing = if self.adapter.language() == Language::Rust {
+                match Self::incremental_rust_listing_failures(
+                    self.project.as_ref(),
+                    self.adapter.as_ref(),
+                    &store_context,
+                    previous.get("rust"),
+                    &workspace_paths_to_refresh,
+                    listing,
+                ) {
+                    Ok(failures) => Some((
+                        crate::analyzer::store::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                        failures,
+                    )),
+                    Err(error) => {
+                        state.record_workspace_package_inventory_error(error);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let configuration_inputs_empty = configuration_inputs.is_empty();
+            let publishes = !workspace_paths_to_refresh.is_empty() || !configuration_inputs_empty;
+            // A failed publication leaves a revision that lacks later changes,
+            // so no later publication certifies.
+            let mut certifiable = true;
             if let Err(error) = Self::refresh_path_symbol_units(
                 self.project.as_ref(),
                 self.adapter.as_ref(),
@@ -20337,14 +22193,17 @@ where
                 &mut dirty_path_symbol_rows,
                 &mut state.workspace_inventory,
                 &path_decisions,
+                rust_listing.as_ref().filter(|_| configuration_inputs_empty),
             ) {
+                certifiable = false;
                 state.record_workspace_package_inventory_error(error);
             }
             *state
                 .dirty_path_symbol_rows
                 .lock()
                 .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
-            for input in configuration_inputs {
+            let configuration_input_count = configuration_inputs.len();
+            for (index, input) in configuration_inputs.into_iter().enumerate() {
                 let storage_languages = self
                     .adapter
                     .storage_language_keys()
@@ -20356,18 +22215,29 @@ where
                     .map(|lang| (lang.clone(), store_context.generations[lang]))
                     .collect::<HashMap<_, _>>();
                 let path = input.relative_path().to_owned();
+                assert!(input.file_present, "only present inputs are republished");
+                let blob = input.content_oid();
                 match store_context.store.replace_configuration_input(
                     &store_context.workspace_id,
                     &relational_workspace_snapshots,
                     &storage_languages,
                     &generations,
                     input,
+                    rust_listing
+                        .as_ref()
+                        .filter(|_| certifiable && index + 1 == configuration_input_count),
                 ) {
                     Ok((snapshots, digest)) => {
                         relational_workspace_snapshots.extend(snapshots);
-                        state.workspace_configuration_digest = Some(digest);
+                        // The update above refused to run without a baseline.
+                        let previous = state.selected_configuration.take().expect(
+                            "a configuration input is republished onto a captured baseline",
+                        );
+                        state.selected_configuration =
+                            Some(previous.with_replaced_input(&path, blob, digest));
                     }
                     Err(error) => {
+                        certifiable = false;
                         state.record_workspace_package_inventory_error(
                             error.context(format!("configuration input {path:?} after update")),
                         );
@@ -20382,9 +22252,37 @@ where
             // their surface-changed dependents instead of every crate in the
             // workspace. The full pass still runs when the change can move crate
             // membership itself.
-            if let Some(snapshot) = relational_workspace_snapshots.get("rust")
+            if let Some(mut snapshot) = relational_workspace_snapshots.get("rust").cloned()
                 && self.adapter.language() == Language::Rust
             {
+                // An update that published nothing opened no revision, so a
+                // changed omission set alone is certified here, at a revision
+                // of its own. Every other update's certificate went with its
+                // last publication.
+                if !publishes && let Some((version, failures)) = rust_listing {
+                    match store_context
+                        .store
+                        .publish_rust_source_listing(&snapshot, version, failures)
+                    {
+                        Ok(certified) => {
+                            relational_workspace_snapshots.insert("rust".into(), certified.clone());
+                            snapshot = certified;
+                        }
+                        Err(error) => state.record_workspace_package_inventory_error(error),
+                    }
+                }
+                // The listing moved only when the certificate differs from the
+                // one the previous snapshot carries.
+                let listing_moved = match previous.get("rust") {
+                    Some(previous) => store_context
+                        .store
+                        .rust_listing_certificates_differ(previous, &snapshot)
+                        .unwrap_or_else(|error| {
+                            state.record_workspace_package_inventory_error(error);
+                            true
+                        }),
+                    None => true,
+                };
                 // A manifest whose meaning did not change places no crate
                 // differently, so it does not send the reconcile to every crate.
                 let changed_paths = workspace_paths_to_refresh
@@ -20393,18 +22291,38 @@ where
                     .map(crate::path_utils::rel_path_string)
                     .collect::<Vec<_>>();
                 let previous = self.selected_workspace_snapshots();
-                let reconciled = match previous.get("rust") {
+                // A listing omission can hide paths in any crate, and every
+                // crate's broad completeness includes the workspace-wide
+                // certificate. So a change to the omission set reconciles every
+                // crate, even when no indexed source changed. It is rare: a
+                // symlink, walk error or path encoding must change. #10382
+                // scopes certificate failures by path so that only the crates
+                // under the changed path reconcile.
+                let reconciled = match previous
+                    .get("rust")
+                    .filter(|_| !rust_listing_changed && !listing_moved)
+                {
                     Some(previous) => store_context.store.reconcile_rust_crates_after_changes(
                         previous,
-                        snapshot,
+                        &snapshot,
                         &changed_paths,
                     ),
                     // No crate rows were reconciled for this workspace before.
-                    None => store_context.store.reconcile_rust_crates(snapshot),
+                    None => store_context.store.reconcile_rust_crates(&snapshot),
                 };
-                if let Err(error) = reconciled {
-                    state.mark_workspace_package_inventory_incomplete();
-                    eprintln!("Rust crate reconciliation failed after update: {error}");
+                match reconciled {
+                    Ok(report) => {
+                        profiling::note_with(|| {
+                            format!("rust_unit_summaries.reconcile after update: {report:?}")
+                        });
+                        self.snapshot_caches
+                            .derivations()
+                            .forget_rust_units(&report);
+                    }
+                    Err(error) => {
+                        state.mark_workspace_package_inventory_incomplete();
+                        eprintln!("Rust crate reconciliation failed after update: {error}");
+                    }
                 }
             }
             if let Err(error) = store_context
@@ -20415,6 +22333,24 @@ where
                     error.context("JVM context reconciliation after update"),
                 );
             }
+            // A snapshot this update published carries this update's listing
+            // observation; one it left alone keeps the previous proof. The
+            // observation covers the files the update changed, so a language
+            // whose proof a sync withdrew stays without one: the file that
+            // could not be validated is still unvalidated.
+            let mut withdrawn = self.state.listing_withdrawn.load().as_ref().clone();
+            if listing_withdrawn {
+                withdrawn.extend(snapshots.keys().cloned());
+                withdrawn.extend(relational_workspace_snapshots.keys().cloned());
+            }
+            let mut listed_snapshots = self.state.listed_snapshots.load().as_ref().clone();
+            for (lang, snapshot) in &relational_workspace_snapshots {
+                if snapshots.get(lang) != Some(snapshot) && !withdrawn.contains(lang) {
+                    listed_snapshots.insert(lang.clone(), snapshot.clone());
+                }
+            }
+            state.listed_snapshots.store(Arc::new(listed_snapshots));
+            state.listing_withdrawn.store(Arc::new(withdrawn));
             let relational_workspace_snapshots = Arc::new(relational_workspace_snapshots);
             Self::from_state(
                 Arc::clone(&self.project),
@@ -20429,7 +22365,13 @@ where
                 store_context,
                 relational_workspace_snapshots,
             )
-        })
+        });
+        if updated.state.workspace_package_inventory_error.is_some()
+            || updated.state.update_resolution_error.is_some()
+        {
+            updated.pending_updates = pending;
+        }
+        updated
     }
 
     fn update_all(&self) -> Self {
@@ -20868,6 +22810,10 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
         self.adapter.language()
     }
 
+    fn holds_workspace_listing_proof(&self) -> bool {
+        !self.workspace_listing_proof().snapshots().is_empty()
+    }
+
     fn declaration_facts_digest(&self, declaration: &CodeUnit) -> StableDigest {
         let parent = self.structural_parent_of(declaration);
         declaration_facts_digest(declaration, parent.as_ref())
@@ -20879,6 +22825,14 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
 
     fn definition_answer_digest(&self, name: &str) -> StableDigest {
         crate::analyzer::read_ledger::declaration_set_digest(&self.get_definitions(name))
+    }
+
+    fn normalized_tail_candidates(&self, key: &str) -> Option<Vec<CodeUnit>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
+        self.try_lookup_declarations_by_normalized_key(key)
+            .map(|units| units.into_iter().collect())
     }
 
     fn identifier_candidate_answer_digest(&self, name: &str) -> StableDigest {
@@ -20914,14 +22868,92 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
         .and_then(|modules| modules.answer)
     }
 
-    fn analyzed_blobs(&self) -> Vec<(ProjectFile, Oid)> {
-        self.analyzed_live_files()
+    fn identity_inputs_digest(&self) -> Option<StableDigest> {
+        Some(TreeSitterAnalyzer::identity_inputs_digest(self))
+    }
+
+    fn analyzed_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+        // A store failure while listing returns a partial (often empty) list
+        // after recording the failure on every capturing scope; observe it
+        // here so a caller never reads the missing files as absent.
+        let scope = crate::analyzer::AnalyzerQueryScope::capturing_read_incompleteness(self);
+        let blobs = self
+            .analyzed_live_files()
             .into_iter()
             .filter_map(|file| {
                 let oid = self.resolve_live_oid_for_file(&file)?;
                 Some((file, oid))
             })
+            .collect();
+        // Only a store failure or a cancelled read can leave the listing
+        // itself partial. A semantic gap or a source-admission refusal is a
+        // property of one listed file's parse: its path and blob are still
+        // known, and the gap is reported on the evaluation's own scope.
+        let listing_incomplete = scope.captured_read_incompleteness().iter().any(|reason| {
+            matches!(
+                reason,
+                crate::analyzer::QueryReadIncomplete::StoreFailure(_)
+                    | crate::analyzer::QueryReadIncomplete::Cancelled
+            )
+        });
+        (!listing_incomplete).then_some(blobs)
+    }
+
+    fn has_workspace_package_identity_inputs(&self) -> bool {
+        self.adapter.has_workspace_package_identity_inputs()
+    }
+
+    fn is_package_identity_input(&self, path: &std::path::Path) -> bool {
+        self.adapter.workspace_package_identity_input_path(path)
+    }
+
+    fn package_identity_input_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+        // The generation recorded the digest of the bytes it read, so bytes
+        // that differ now are not what the head read.
+        self.state
+            .workspace_package_identity_input_digests
+            .iter()
+            .filter(|(file, _)| self.adapter.workspace_package_identity_input(file))
+            .map(|(file, retained)| {
+                let bytes = std::fs::read(file.abs_path()).ok()?;
+                if crate::analyzer::canonical_hash::sha256_bytes(&bytes) != retained.content {
+                    return None;
+                }
+                Some((
+                    file.clone(),
+                    Oid::hash_object(ObjectType::Blob, &bytes).ok()?,
+                ))
+            })
             .collect()
+    }
+
+    fn is_selected_configuration_input(&self, path: &std::path::Path) -> bool {
+        Self::captures_workspace_configuration(self.adapter.language())
+            && !self.adapter.workspace_package_identity_input_path(path)
+            && WorkspaceConfigurationInput::is_native_input(self.adapter.language(), path)
+    }
+
+    fn selected_configuration_input_blobs(&self) -> Option<Vec<(ProjectFile, Oid)>> {
+        if !Self::captures_workspace_configuration(self.adapter.language()) {
+            return Some(Vec::new());
+        }
+        // A capturing language whose build recorded no selection failed to
+        // capture it, which the generation reports at its next query.
+        let configuration = self.state.selected_configuration.as_ref()?;
+        Some(
+            configuration
+                .present_blobs
+                .iter()
+                .map(|(rel_path, blob)| {
+                    let file = ProjectFile::new(
+                        self.project.root().to_path_buf(),
+                        std::path::PathBuf::from(rel_path.as_ref()),
+                    );
+                    (file, *blob)
+                })
+                .filter(|(file, _)| !self.adapter.workspace_package_identity_input(file))
+                .collect(),
+        )
     }
 
     fn refused_source_blobs(&self) -> Result<Vec<(ProjectFile, Oid)>, StoreError> {
@@ -20934,8 +22966,30 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
         file: &ProjectFile,
         blob: Oid,
     ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
-        let state = self.fetch_file_state(file)?;
-        self.index_keys_of_state(file, blob, state)
+        self.blob_index_keys_outcome(file, blob).ok()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn blob_index_keys_failure(&self, file: &ProjectFile, blob: Oid) -> Option<String> {
+        let reason = self.blob_index_keys_outcome(file, blob).err()?;
+        let mut detail = reason.to_string();
+        if matches!(reason, IndexKeysUnavailable::NoFileState) {
+            let resolved = self.resolve_live_oid_for_file(file);
+            let key = resolved.and_then(|oid| self.variant_cache_key(oid, file));
+            let source = key
+                .as_ref()
+                .and_then(|key| self.source_for_oid(file, key.oid));
+            let snapshot = self.project.read_source_snapshot(file);
+            detail.push_str(&format!(
+                "; resolved live oid {resolved:?}, cache key {key:?}, listed blob {blob}, \
+                 file root {:?}, project root {:?}, source bytes {:?}, source snapshot {:?}",
+                file.root(),
+                self.project.root(),
+                source.as_ref().map(String::len),
+                snapshot.as_ref().map(|snapshot| snapshot.oid()),
+            ));
+        }
+        Some(detail)
     }
 
     fn stored_blob_index_keys(
@@ -20957,7 +23011,77 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
                 source,
             )
             .ok()??;
-        self.index_keys_of_state(file, blob, Arc::new(state))
+        self.index_keys_of_state(file, blob, Arc::new(state)).ok()
+    }
+
+    fn definition_inventory_owner(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.store_context.store) as usize)
+    }
+
+    fn definition_inventory_snapshots(&self) -> Option<crate::analyzer::store::ListedSnapshots> {
+        let proof = self.workspace_listing_proof();
+        let languages = self.storage_language_keys_for_queries();
+        (!languages.is_empty()
+            && languages
+                .iter()
+                .all(|language| proof.snapshots().contains_key(language)))
+        .then_some(proof)
+    }
+
+    fn definition_inventory_entries(
+        &self,
+        family: crate::analyzer::read_ledger::IndexFamily,
+        key: &[u8],
+    ) -> Option<Vec<(String, String, crate::analyzer::semantic::ids::StableDigest)>> {
+        use crate::analyzer::read_ledger::IndexFamily;
+        if !matches!(
+            family,
+            IndexFamily::DefinitionExact
+                | IndexFamily::DefinitionNormalizedTail
+                | IndexFamily::DefinitionIdentifier
+        ) {
+            return None;
+        }
+        if self
+            .active_query_cancellation()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return None;
+        }
+        let listed = self.definition_inventory_snapshots()?;
+        let mut entries = Vec::new();
+        for language in listed.snapshots().keys() {
+            let candidates = self
+                .store_context
+                .store
+                .index_blob_candidates_for_key_at(&listed, language, family, key)
+                .ok()??;
+            if candidates.len() > 65_536 {
+                return None;
+            }
+            for candidate in candidates {
+                if self.store_context.build_abort.cancellation().is_cancelled() {
+                    return None;
+                }
+                let file =
+                    ProjectFile::new(self.project.root().to_path_buf(), candidate.mounted_path);
+                let keys = self.blob_index_keys(&file, candidate.blob.oid)?;
+                for (entry_family, entry_key, digest) in keys {
+                    if entry_family == family && entry_key.as_ref() == key {
+                        entries.push((
+                            crate::path_utils::rel_path_string(&file),
+                            candidate.blob.lang.clone(),
+                            digest,
+                        ));
+                    }
+                }
+            }
+        }
+        if self.workspace_listing_proof() != listed {
+            return None;
+        }
+        Some(entries)
     }
 
     fn callable_metrics_for_file(
@@ -20981,42 +23105,121 @@ impl<A: LanguageAdapter> crate::analyzer::read_verification::WorkspaceFactIndex
     }
 }
 
+/// Why one blob's index keys could not be enumerated.
+///
+/// [`WorkspaceFactIndex::blob_index_keys`] answers `None` for every variant,
+/// because a warm base must treat an unenumerable blob as unverified. The
+/// detail exists so a caller that requires enumeration can name the refusing
+/// branch and the store error the production answer discards.
+#[derive(Debug)]
+enum IndexKeysUnavailable {
+    BuildCancelled,
+    IncompleteFileState,
+    IncompleteProjection(String),
+    NoFileState,
+    NoParseVariant,
+    NoStorageGeneration(String),
+    PackageFacts(crate::analyzer::store::StoreError),
+    IncompletePackageFacts,
+    SnapshotRelations(crate::analyzer::store::StoreError),
+    IndexDigests {
+        language: String,
+        error: crate::analyzer::store::StoreError,
+    },
+    IndexRowsMissing {
+        language: String,
+    },
+}
+
+impl std::fmt::Display for IndexKeysUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BuildCancelled => write!(f, "the build was cancelled"),
+            Self::IncompleteFileState => write!(f, "the primary file state is incomplete"),
+            Self::IncompleteProjection(language) => {
+                write!(f, "the {language} projection is incomplete")
+            }
+            Self::NoFileState => write!(f, "the analyzer has no file state"),
+            Self::NoParseVariant => write!(f, "the file has no selected parse variant"),
+            Self::NoStorageGeneration(language) => {
+                write!(f, "the store has no {language} generation")
+            }
+            Self::PackageFacts(error) => write!(f, "reading package facts failed: {error}"),
+            Self::IncompletePackageFacts => write!(f, "the persisted package facts are incomplete"),
+            Self::SnapshotRelations(error) => {
+                write!(f, "deriving workspace package relations failed: {error}")
+            }
+            Self::IndexDigests { language, error } => {
+                write!(f, "reading {language} index rows failed: {error}")
+            }
+            Self::IndexRowsMissing { language } => {
+                write!(f, "the store holds no {language} index rows for the blob")
+            }
+        }
+    }
+}
+
 /// The producer half of [`WorkspaceFactIndex`], shared by the mounted and the
 /// store-fed enumerations so that one blob has one key set however it was
 /// reached.
 impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
+    fn blob_index_keys_outcome(
+        &self,
+        file: &ProjectFile,
+        blob: Oid,
+    ) -> Result<Vec<crate::analyzer::store::IndexEntryDigest>, IndexKeysUnavailable> {
+        let state = self
+            .fetch_file_state(file)
+            .ok_or(IndexKeysUnavailable::NoFileState)?;
+        self.index_keys_of_state(file, blob, state)
+    }
+
     fn index_keys_of_state(
         &self,
         file: &ProjectFile,
         blob: Oid,
         state: Arc<FileState>,
-    ) -> Option<Vec<crate::analyzer::store::IndexEntryDigest>> {
+    ) -> Result<Vec<crate::analyzer::store::IndexEntryDigest>, IndexKeysUnavailable> {
         use crate::analyzer::read_ledger::IndexFamily;
 
-        if self.store_context.build_abort.cancellation().is_cancelled()
-            || !state.parse_complete
-            || state
-                .additional_projections
-                .iter()
-                .any(|(_, projection)| !projection.parse_complete)
+        if self.store_context.build_abort.cancellation().is_cancelled() {
+            return Err(IndexKeysUnavailable::BuildCancelled);
+        }
+        if !state.parse_complete {
+            return Err(IndexKeysUnavailable::IncompleteFileState);
+        }
+        if let Some((language, _)) = state
+            .additional_projections
+            .iter()
+            .find(|(_, projection)| !projection.parse_complete)
         {
-            return None;
+            return Err(IndexKeysUnavailable::IncompleteProjection(
+                (*language).to_owned(),
+            ));
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations.get(storage_key).copied()?;
+        let generation = self
+            .store_context
+            .generations
+            .get(storage_key)
+            .copied()
+            .ok_or_else(|| IndexKeysUnavailable::NoStorageGeneration(storage_key.to_owned()))?;
         let path_symbol = Self::path_symbol_row(&self.adapter, file, blob);
+        let package_fact_key = self
+            .path_blob_key(Oid::zero(), storage_key, file)
+            .ok_or(IndexKeysUnavailable::NoParseVariant)?;
         let facts = self
             .store_context
             .store
             .workspace_content_package_facts(
-                &self.path_blob_key(Oid::zero(), storage_key, file)?,
+                &package_fact_key,
                 generation,
                 &[blob],
                 self.adapter.workspace_file_package_anchor(),
             )
-            .ok()?;
+            .map_err(IndexKeysUnavailable::PackageFacts)?;
         if !facts.complete {
-            return None;
+            return Err(IndexKeysUnavailable::IncompletePackageFacts);
         }
         let entry = (
             file.clone(),
@@ -21028,7 +23231,8 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
             path_symbol.clone(),
         );
         let (packages, package_files, package_edges, _) =
-            Self::workspace_snapshot_relations(&self.adapter, &[entry], &facts.facts).ok()?;
+            Self::workspace_snapshot_relations(&self.adapter, &[entry], &facts.facts)
+                .map_err(IndexKeysUnavailable::SnapshotRelations)?;
         let mut combined: crate::hash::HashMap<
             (IndexFamily, Box<[u8]>),
             crate::analyzer::canonical_hash::CanonicalHasher,
@@ -21039,20 +23243,32 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
                 .iter()
                 .map(|(lang, projection)| (*lang, projection.as_ref())),
         ) {
-            let generation = self.store_context.generations.get(lang).copied()?;
+            let generation = self
+                .store_context
+                .generations
+                .get(lang)
+                .copied()
+                .ok_or_else(|| IndexKeysUnavailable::NoStorageGeneration(lang.to_owned()))?;
             let entries = self
                 .store_context
                 .store
                 .file_state_index_digests(
                     self.adapter.as_ref(),
                     projection,
-                    blob,
-                    lang,
+                    &self
+                        .path_blob_key(blob, lang, file)
+                        .ok_or(IndexKeysUnavailable::NoParseVariant)?,
                     generation,
                     path_symbol.as_ref(),
                     &packages,
                 )
-                .ok()??;
+                .map_err(|error| IndexKeysUnavailable::IndexDigests {
+                    language: lang.to_owned(),
+                    error,
+                })?
+                .ok_or_else(|| IndexKeysUnavailable::IndexRowsMissing {
+                    language: lang.to_owned(),
+                })?;
             for (family, key, digest) in entries {
                 let hash = combined.entry((family, key.clone())).or_insert_with(|| {
                     crate::analyzer::canonical_hash::CanonicalHasher::new(
@@ -21096,7 +23312,7 @@ impl<A: LanguageAdapter> TreeSitterAnalyzer<A> {
             .map(|((family, key), hash)| (family, key, StableDigest::from_array(hash.finish())))
             .collect::<Vec<_>>();
         entries.sort();
-        Some(entries)
+        Ok(entries)
     }
 }
 
@@ -21107,7 +23323,7 @@ pub mod resolution_producer_tests;
 
 #[cfg(test)]
 mod inventory_completeness_tests {
-    use super::WorkspaceInventoryCompleteness;
+    use super::{UnpublishedSource, WorkspaceInventoryCompleteness};
     use crate::analyzer::semantic::source_admission::{AdmissionDimension, SourceAdmissionRefusal};
 
     /// Every refusal kind is deterministic in the source bytes, the adapter and
@@ -21127,7 +23343,7 @@ mod inventory_completeness_tests {
                 observed: 20_000,
             },
             SourceAdmissionRefusal::Budget {
-                dimension: AdmissionDimension::Nodes,
+                dimension: AdmissionDimension::ExcludedNodes,
                 limit: 1,
                 observed: 2,
             },
@@ -21140,6 +23356,29 @@ mod inventory_completeness_tests {
         let mut transient = WorkspaceInventoryCompleteness::COMPLETE;
         transient.mark_incomplete();
         assert!(!transient.indexed && !transient.accounted);
+    }
+
+    /// Source admission that times out or is cancelled leaves the source with
+    /// no file version and no refusal row. The production budget is a fixed ten
+    /// seconds with no cancellation token on this path, so no test can drive
+    /// that outcome through a sync; this pins the accounting both syncs apply
+    /// to it through `record_unpublished`.
+    #[brokk_bifrost_test_macros::hardwon("#10325: an unavailable source kept the listing complete")]
+    #[test]
+    fn an_unavailable_source_clears_the_listing_fact() {
+        let mut unavailable = WorkspaceInventoryCompleteness::COMPLETE;
+        unavailable.record_unpublished(&UnpublishedSource::Unavailable);
+        assert!(!unavailable.listed, "no version and no refusal row");
+        assert!(!unavailable.indexed && !unavailable.accounted);
+
+        // An admitted or refused source has a version or a refusal row, so the
+        // listing stays complete and the store's own arms see it.
+        let mut admitted = WorkspaceInventoryCompleteness::COMPLETE;
+        admitted.record_unpublished(&UnpublishedSource::Admitted);
+        assert!(admitted.listed && !admitted.indexed);
+        let mut refused = WorkspaceInventoryCompleteness::COMPLETE;
+        refused.record_unpublished(&UnpublishedSource::Refused(SourceAdmissionRefusal::Binary));
+        assert!(refused.listed && refused.accounted);
     }
 }
 
@@ -21202,6 +23441,51 @@ pub use crate::analyzer::store::file_state::{FileState, PreparedSyntaxPreparatio
 mod memo_input_tests {
     use super::*;
     use crate::analyzer::{MultiAnalyzer, capture_query_reads};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10952: statement_assessments_for dropped unattributed reads on a hit")]
+    fn statement_assessments_unattributed_fill_is_not_reused() {
+        let analyzer = MultiAnalyzer::default();
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::for_tests();
+        let cache = BudgetedValueCache::new(budget.region("test.statement_assessments", None));
+        let cancellation = crate::CancellationToken::new();
+        for (key, count, expected_fills) in [(0u32, 0, 1), (1u32, 3, 2)] {
+            let mut fills = 0;
+            for request in 0..2 {
+                let (_, consumer) = capture_query_reads(&analyzer, || {
+                    let permit = match cache.acquire(&key, &cancellation).0 {
+                        BudgetedValueAcquisition::Cached { .. } => return,
+                        BudgetedValueAcquisition::Leader { permit } => permit,
+                        _ => panic!("test cache must admit a fill"),
+                    };
+                    let (value, reads) = capture_query_reads(&analyzer, || {
+                        fills += 1;
+                        analyzer.record_unattributed_reads(count);
+                        crate::analyzer::semantic::StatementAssessments {
+                            rows: Vec::new(),
+                            complete: true,
+                            reason: None,
+                        }
+                    });
+                    publish_statement_assessments(
+                        &analyzer,
+                        &budget,
+                        Some(permit),
+                        value,
+                        false,
+                        &reads,
+                    );
+                });
+                assert!(
+                    consumer.unattributed_reads() >= count,
+                    "request {request} lost {count} unattributed reads: {}",
+                    consumer.unattributed_reads()
+                );
+            }
+            assert_eq!(fills, expected_fills, "key {key}");
+        }
+    }
 
     #[test]
     fn blob_memo_hits_only_project_selected_text() {
@@ -21325,14 +23609,12 @@ impl brokk_bifrost_core::analyzer::project_reads::ErasedReadAttribution for Proj
     fn replay(
         &self,
         receipts: &[brokk_bifrost_core::analyzer::project_reads::OpaqueReadReceipt],
-        unattributed_reads: usize,
-        execution_dependences: usize,
+        channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
     ) {
         crate::analyzer::workspace_authority::replay_erased_reads(
             &self.contexts(),
             receipts,
-            unattributed_reads,
-            execution_dependences,
+            channels,
         );
     }
     fn record(
@@ -21396,6 +23678,21 @@ fn install_project_read_recorder_with_variant(
     attached: &Arc<AtomicUsize>,
     variant_for_file: Option<ProjectVariantReader>,
 ) -> Arc<RwLock<QueryReadCache>> {
+    try_install_project_read_recorder_with_variant(
+        project.as_ref(),
+        cache,
+        attached,
+        variant_for_file,
+    )
+    .expect("analysis projects must carry a read capability")
+}
+
+fn try_install_project_read_recorder_with_variant(
+    project: &dyn Project,
+    cache: QueryReadCache,
+    attached: &Arc<AtomicUsize>,
+    variant_for_file: Option<ProjectVariantReader>,
+) -> Option<Arc<RwLock<QueryReadCache>>> {
     let queries = Arc::new(RwLock::new(cache));
     let capability =
         brokk_bifrost_core::analyzer::project_reads::ReadCapability::new(ProjectReadAttribution {
@@ -21404,11 +23701,7 @@ fn install_project_read_recorder_with_variant(
             queries: Arc::downgrade(&queries),
             attached: Arc::downgrade(attached),
         });
-    assert!(
-        project.install_read_recorder(capability),
-        "analysis projects must carry a read capability"
-    );
-    queries
+    project.install_read_recorder(capability).then_some(queries)
 }
 
 impl ProjectReadAttribution {
@@ -21476,7 +23769,7 @@ impl Drop for ProjectReadRegistration {
 /// The same weak Project recorder can serve an empty-language workspace.
 /// Its registry supplies capture/broadcast ownership, with no semantic query API.
 #[derive(Clone)]
-pub(super) struct ProjectReadRegistry {
+pub(crate) struct ProjectReadRegistry {
     queries: Arc<RwLock<QueryReadCache>>,
     attached: Arc<AtomicUsize>,
 }
@@ -21485,6 +23778,45 @@ impl ProjectReadRegistry {
         let attached = Arc::new(AtomicUsize::new(0));
         let queries = install_project_read_recorder(project, QueryReadCache::default(), &attached);
         Self { queries, attached }
+    }
+    /// Arbitrary borrowed Projects need not support installing a recorder.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn try_new(project: &dyn Project) -> Option<Self> {
+        let attached = Arc::new(AtomicUsize::new(0));
+        let queries = try_install_project_read_recorder_with_variant(
+            project,
+            QueryReadCache::default(),
+            &attached,
+            None,
+        )?;
+        Some(Self { queries, attached })
+    }
+
+    /// Use the same capture and forwarding machinery as analyzer queries.
+    /// The borrowed registry stays alive through both the action and forwarding,
+    /// including when the action returns an error.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn capture<T>(
+        &self,
+        query: impl FnOnce() -> T,
+    ) -> (T, Arc<crate::analyzer::ReadLedger>) {
+        let enclosing = crate::analyzer::i_analyzer::current_thread_read_ledger();
+        let (result, reads) = crate::analyzer::i_analyzer::capture_with_read_registration(
+            enclosing.as_ref(),
+            |context| {
+                self.begin_query(&context);
+                ProjectReadRegistration {
+                    queries: Some(Arc::clone(&self.queries)),
+                    attached: Some(Arc::clone(&self.attached)),
+                    context,
+                }
+            },
+            query,
+        );
+        if let Some(enclosing) = enclosing {
+            crate::analyzer::i_analyzer::forward_captured_query_reads(&enclosing, &reads);
+        }
+        (result, reads)
     }
     pub(super) fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if self
@@ -21532,6 +23864,16 @@ impl ProjectReadRegistry {
     pub(super) fn record_unattributed_reads(&self, count: usize) {
         crate::analyzer::i_analyzer::record_unattributed_reads(
             count,
+            || self.read_ledger_attached(),
+            || self.contexts(),
+        );
+    }
+}
+
+impl brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal for ProjectReadRegistry {
+    fn refuse_read_reuse(&self) {
+        // Resolve the consumer on every use, never the capture at construction.
+        crate::analyzer::i_analyzer::record_reuse_refusal(
             || self.read_ledger_attached(),
             || self.contexts(),
         );

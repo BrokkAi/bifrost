@@ -13,20 +13,20 @@ use super::super::{
     EndpointDefinitionSchemaResolution, EndpointObservationPhase, EndpointOrigin, EndpointRole,
     EndpointTaintSemantics, EvidenceRef, FindingCertainty, FindingClassification,
     FindingCompleteness, FindingDiffDisposition, FindingIdentityStability, FindingSeverity,
-    MatchFindingAnchor, MatchResultDomain, OrganizationalRiskAssessment, PolicyAnalysisType,
-    PolicyCapability, PolicyDependencyPackActivationMode, PolicyDiagnosticImpact,
-    PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason, PolicyFinding,
-    PolicyFindingEvidence, PolicyIncompleteReason, PolicyLocationRelationship, PolicyMessageSpec,
-    PolicyObligation, PolicyOverlayScope, PolicyPackActivationReview, PolicyPackDecisionStatus,
-    PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySelectionProvenance,
-    PolicySeveritySpec, PolicySourceLocation, PolicySuppressionDecision,
+    FurtherFindingsAbsent, MatchFindingAnchor, MatchResultDomain, OrganizationalRiskAssessment,
+    PolicyAnalysisType, PolicyCapability, PolicyDependencyPackActivationMode,
+    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason,
+    PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLocationRelationship,
+    PolicyMessageSpec, PolicyObligation, PolicyOverlayScope, PolicyPackActivationReview,
+    PolicyPackDecisionStatus, PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef,
+    PolicyReportDocument, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
+    PolicySelectionProvenance, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionDecision,
     PolicySuppressionMatchState, PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
     PolicySuppressionReview, PolicySuppressionTemporalState, ProofMetadata, ProofReason,
     ResolvedEndpointDependency, ResolvedEndpointIdentity, ResolvedEndpointManifestEntry,
     ResolvedEndpointSelectorSchemas, ResolvedEndpointSetDependency, ResolvedMatchDirectoryManifest,
     ResolvedPrecedenceEdge, ResolvedTypestateTerminal, SchemaVersionOrigin,
-    SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
+    SchemaVersionResolution, StableSemanticIdentity, SubjectVerdict, TaintSourceEvidence,
     TypestateViolationEvidence,
 };
 
@@ -165,6 +165,7 @@ pub fn write_policy_human<W: Write>(
         }
         write_run_diagnostics(&mut output, run)?;
         write_run_obligations(&mut output, run, options.detail())?;
+        write_subject_verdicts(&mut output, run)?;
         if !run.completion().is_exhaustive() || run.diagnostics_truncated() {
             let rule = report
                 .rules()
@@ -205,6 +206,7 @@ pub fn write_policy_human<W: Write>(
     }) {
         write_scope_review(&mut output, review)?;
     }
+    write_inline_suppressions(&mut output, report)?;
     if let Some(review) = report.baseline() {
         write_baseline_review(&mut output, review)?;
     }
@@ -225,11 +227,7 @@ fn write_report_header<W: Write>(
         .runs()
         .iter()
         .flat_map(PolicyRun::findings)
-        .filter(|finding| {
-            finding.suppression().is_none()
-                && finding.scope().is_none()
-                && finding.baseline().is_none()
-        })
+        .filter(|finding| !finding.is_accepted())
         .count();
     writeln!(
         output,
@@ -395,6 +393,7 @@ fn write_concise_report<W: Write>(
         )
         .map_err(map_io_error)?;
     }
+    write_inline_suppressions(output, report)?;
     if let Some(baseline) = report.baseline() {
         writeln!(
             output,
@@ -554,6 +553,7 @@ fn write_concise_report<W: Write>(
             warning_count = warning_count.saturating_add(1);
         }
         write_run_obligations(output, run, HumanRenderDetail::Concise)?;
+        write_subject_verdicts(output, run)?;
     }
     if summarized_selector_gaps {
         writeln!(
@@ -627,9 +627,7 @@ fn write_concise_report<W: Write>(
 }
 
 fn is_active_finding(report: &PolicyReportDocument, finding: &PolicyFinding) -> bool {
-    finding.suppression().is_none()
-        && finding.scope().is_none()
-        && finding.baseline().is_none()
+    !finding.is_accepted()
         && !report.diff().is_some_and(|review| {
             review.policy_is_qualified(finding.policy_id())
                 && finding
@@ -669,6 +667,21 @@ fn write_concise_finding<W: Write>(
         escape_terminal_text(finding.message()),
     )
     .map_err(map_io_error)?;
+    if let Some(attribution) = finding.model_attribution() {
+        writeln!(
+            output,
+            "    May depend on approximate model evidence (active pack)."
+        )
+        .map_err(map_io_error)?;
+        if attribution.omitted_at_least > 0 {
+            writeln!(
+                output,
+                "    +at least {} more contributors",
+                attribution.omitted_at_least
+            )
+            .map_err(map_io_error)?;
+        }
+    }
     write!(output, "    Location: ").map_err(map_io_error)?;
     write_location(output, finding.primary()).map_err(map_io_error)?;
     if let Some(symbol) = concise_terminal_symbol(finding) {
@@ -906,6 +919,7 @@ fn concise_terminal_symbol(finding: &PolicyFinding) -> Option<&str> {
     match evidence.terminal() {
         PolicyQueryResultRef::Declaration { fq_name, .. } => Some(fq_name),
         PolicyQueryResultRef::ReferenceSite { target_fq_name, .. } => Some(target_fq_name),
+        PolicyQueryResultRef::ReferenceEdge { target_fq_name, .. } => Some(target_fq_name),
         PolicyQueryResultRef::CallSite { callee_fq_name, .. } => Some(callee_fq_name),
         _ => None,
     }
@@ -925,6 +939,60 @@ fn write_value_type_barrier_notes<W: Write>(
             finding.value_type_barrier_notes().omitted_lower_bound()
         )
         .map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+/// How a witness source reached its field, as the report states it.
+struct AdmittedPatternRoute<'a> {
+    constructor: &'a str,
+    /// `[written, (the import the file wrote,) route, declaration]`.
+    import_chain: &'a [String],
+    import_chain_truncated: bool,
+    import_route_complete: bool,
+    position: u32,
+}
+
+/// Name how a witness source reached its field: the path as written, the
+/// import the file wrote when that differs from the route, the resolved route
+/// (the entry before the declaration) when it differs from the declaration, and
+/// whether the route was shortened or is not fully shown.
+fn write_admitted_pattern_note<W: Write>(
+    output: &mut W,
+    note: &AdmittedPatternRoute<'_>,
+) -> Result<(), PolicyRenderError> {
+    let chain = note.import_chain;
+    let constructor = note.constructor;
+    let written = chain.first().map(String::as_str).unwrap_or(constructor);
+    let route = chain
+        .len()
+        .checked_sub(2)
+        .and_then(|index| chain.get(index))
+        .map(String::as_str)
+        .unwrap_or(constructor);
+    // A fourth entry is the import the file wrote, between the written
+    // spelling and the resolved route.
+    let hop = (chain.len() >= 4).then(|| chain[1].as_str());
+    write!(output, " (admitted via {}", escape_terminal_text(written)).map_err(map_io_error)?;
+    if let Some(hop) = hop {
+        write!(output, " imported as {}", escape_terminal_text(hop)).map_err(map_io_error)?;
+    }
+    write!(
+        output,
+        " field {} ({}",
+        note.position,
+        escape_terminal_text(constructor)
+    )
+    .map_err(map_io_error)?;
+    if route != constructor {
+        write!(output, ", re-exported as {}", escape_terminal_text(route)).map_err(map_io_error)?;
+    }
+    write!(output, "))").map_err(map_io_error)?;
+    if note.import_chain_truncated {
+        write!(output, " [import route shortened]").map_err(map_io_error)?;
+    }
+    if !note.import_route_complete {
+        write!(output, " [import route incomplete]").map_err(map_io_error)?;
     }
     Ok(())
 }
@@ -958,6 +1026,18 @@ fn write_finding<W: Write>(
             suppression.decision(),
             suppression.policy_hash_state(),
         )?;
+    }
+    if let Some(inline) = finding.inline_suppression() {
+        writeln!(
+            output,
+            "  inline: accepted by the directive on line {}",
+            inline.line()
+        )
+        .map_err(map_io_error)?;
+        if let Some(reason) = inline.reason() {
+            writeln!(output, "  inline reason: {}", escape_terminal_text(reason))
+                .map_err(map_io_error)?;
+        }
     }
     if let Some(scope) = finding.scope() {
         writeln!(
@@ -1025,6 +1105,46 @@ fn write_finding<W: Write>(
         writeln!(output).map_err(map_io_error)?;
     }
     write_evidence_summary(output, finding)?;
+    if let Some(attribution) = finding.model_attribution() {
+        // The marker is conservative: a union across source groups or taint
+        // classes can mark a finding the approximate model did not cause.
+        writeln!(
+            output,
+            "  may depend on approximate model evidence (active pack)"
+        )
+        .map_err(map_io_error)?;
+        for contributor in &attribution.contributors {
+            writeln!(
+                output,
+                "    {:?}: {} / {} (built from {}, resolved {}, {}; kinds {}; rule {}@{})",
+                contributor.role,
+                escape_terminal_text(&contributor.pack_digest),
+                escape_terminal_text(&contributor.record_id),
+                escape_terminal_text(&contributor.built_from),
+                escape_terminal_text(&contributor.resolved),
+                escape_terminal_text(&contributor.direction),
+                contributor
+                    .mismatch_kinds
+                    .iter()
+                    .map(|kind| escape_terminal_text(kind).to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                escape_terminal_text(&contributor.selection_rule_id),
+                contributor.selection_rule_version,
+            )
+            .map_err(map_io_error)?;
+        }
+        if attribution.omitted_at_least > 0 {
+            writeln!(
+                output,
+                "    and at least {} more contributors",
+                attribution.omitted_at_least
+            )
+            .map_err(map_io_error)?;
+        } else if !attribution.contributors_complete {
+            writeln!(output, "    contributor list may be incomplete").map_err(map_io_error)?;
+        }
+    }
     write_evidence_detail(output, finding.evidence())?;
     write_certainty_detail(output, finding.certainty())?;
     write_proof_detail(output, finding.proof())?;
@@ -1090,6 +1210,26 @@ fn write_finding<W: Write>(
                 write_location(output, location).map_err(map_io_error)?;
             }
             write_evidence_refs_suffix(output, step.evidence_refs())?;
+            if let Some(crate::finding::WitnessStepProvenance::AdmittedPatternProjection {
+                constructor,
+                import_chain,
+                import_chain_truncated,
+                import_route_complete,
+                position,
+                ..
+            }) = step.provenance()
+            {
+                write_admitted_pattern_note(
+                    output,
+                    &AdmittedPatternRoute {
+                        constructor,
+                        import_chain,
+                        import_chain_truncated: *import_chain_truncated,
+                        import_route_complete: *import_route_complete,
+                        position: *position,
+                    },
+                )?;
+            }
             writeln!(output).map_err(map_io_error)?;
         }
         if witness.truncated() {
@@ -1217,6 +1357,67 @@ fn write_suppression_review<W: Write>(
         writeln!(output).map_err(map_io_error)?;
     }
     write_suppression_decision(output, review.decision())
+}
+
+/// The inline-accepted finding count, then every directive that accepted
+/// nothing, with what to do about it.
+fn write_inline_suppressions<W: Write>(
+    output: &mut BoundedWriter<W>,
+    report: &PolicyReportDocument,
+) -> Result<(), PolicyRenderError> {
+    let Some(review) = report.inline_suppressions() else {
+        return Ok(());
+    };
+    let accepted = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| finding.inline_suppression().is_some())
+        .count();
+    if accepted > 0 {
+        writeln!(
+            output,
+            "  Accepted inline: {accepted} finding{}.",
+            plural_suffix(accepted)
+        )
+        .map_err(map_io_error)?;
+    }
+    for entry in review
+        .entries()
+        .iter()
+        .filter(|entry| entry.state() != crate::PolicyInlineSuppressionState::Applied)
+    {
+        let what = match entry.state() {
+            crate::PolicyInlineSuppressionState::Applied => unreachable!("filtered above"),
+            crate::PolicyInlineSuppressionState::Unused => {
+                "matches no finding; remove it or move it above the finding's line"
+            }
+            crate::PolicyInlineSuppressionState::MissingReason => {
+                "accepts nothing: a blanket directive needs a reason after `--`"
+            }
+            crate::PolicyInlineSuppressionState::Malformed => "accepts nothing: malformed",
+        };
+        writeln!(
+            output,
+            "  {}:{}: `{}: ignore` directive {what}",
+            escape_terminal_text(entry.path()),
+            entry.line(),
+            escape_terminal_text(review.prefix().as_str()),
+        )
+        .map_err(map_io_error)?;
+        if let Some(detail) = entry.detail() {
+            writeln!(output, "    {}", escape_terminal_text(detail)).map_err(map_io_error)?;
+        }
+    }
+    if review.omitted_entries() > 0 {
+        writeln!(
+            output,
+            "  {} more inline directives were not listed.",
+            review.omitted_entries()
+        )
+        .map_err(map_io_error)?;
+    }
+    Ok(())
 }
 
 fn write_scope_review<W: Write>(
@@ -3094,6 +3295,7 @@ fn write_query_result_detail<W: Write>(
             target_fq_name,
             target_identity,
             usage_kind,
+            reference_facets,
             proof,
             ..
         } => {
@@ -3110,7 +3312,32 @@ fn write_query_result_detail<W: Write>(
             } else {
                 write!(output, "unspecified").map_err(map_io_error)?;
             }
-            write!(output, "; proof {}", query_proof(*proof)).map_err(map_io_error)?;
+            write!(
+                output,
+                "; facets known={:?}, undecided={:?}; proof {}",
+                reference_facets.known,
+                reference_facets.undecided,
+                query_proof(*proof)
+            )
+            .map_err(map_io_error)?;
+        }
+        PolicyQueryResultRef::ReferenceEdge {
+            id,
+            target_fq_name,
+            reference_facets,
+            proof,
+            ..
+        } => {
+            write!(
+                output,
+                " edge {}; target {}; facets known={:?}, undecided={:?}; proof {}",
+                escape_terminal_text(id),
+                escape_terminal_text(target_fq_name),
+                reference_facets.known,
+                reference_facets.undecided,
+                query_proof(*proof)
+            )
+            .map_err(map_io_error)?;
         }
         PolicyQueryResultRef::CallSite {
             caller_fq_name,
@@ -3426,6 +3653,80 @@ fn write_run_diagnostics<W: Write>(
 /// a blocked claim addressable. The scan view states the count only, the same
 /// way it states a completion rather than every reason behind it: a reader who
 /// wants the list runs `--verbose`.
+fn write_subject_verdicts<W: Write>(
+    output: &mut BoundedWriter<W>,
+    run: &PolicyRun,
+) -> Result<(), PolicyRenderError> {
+    let Some(subjects) = run.subjects() else {
+        return Ok(());
+    };
+    let selected = subjects
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.verdict, SubjectVerdict::Selected { .. }))
+        .count();
+    let complete = subjects
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.verdict,
+                SubjectVerdict::Selected {
+                    further_findings_absent: FurtherFindingsAbsent::Complete,
+                    ..
+                }
+            )
+        })
+        .count();
+    let undecided = subjects
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.verdict, SubjectVerdict::Undecided { .. }))
+        .count();
+    write!(
+        output,
+        "subjects: {selected} selected ({complete} with complete absence), {undecided} undecided"
+    )
+    .map_err(map_io_error)?;
+    if subjects.omitted.selected > 0 || subjects.omitted.undecided > 0 {
+        write!(
+            output,
+            "; omitted {} selected, {} undecided",
+            subjects.omitted.selected, subjects.omitted.undecided
+        )
+        .map_err(map_io_error)?;
+    }
+    writeln!(output).map_err(map_io_error)?;
+    for selector in &subjects.selectors {
+        writeln!(
+            output,
+            "  selector {}: {}",
+            escape_terminal_text(&selector.selector),
+            selector.enumeration.as_str(),
+        )
+        .map_err(map_io_error)?;
+    }
+    for entry in &subjects.entries {
+        if let SubjectVerdict::Undecided { reasons, .. } = &entry.verdict {
+            let span = entry
+                .location
+                .byte_span()
+                .expect("subject verdict locations have spans");
+            writeln!(
+                output,
+                "  undecided {}:{}-{} selector {}: {}",
+                escape_terminal_text(entry.location.path()),
+                span.start(),
+                span.end(),
+                escape_terminal_text(&entry.selector),
+                escape_terminal_text(&reasons.join(", "))
+            )
+            .map_err(map_io_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_run_obligations<W: Write>(
     output: &mut BoundedWriter<W>,
     run: &PolicyRun,
@@ -4266,6 +4567,7 @@ const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
         PolicyQueryResultRef::Declaration { .. } => "declaration",
         PolicyQueryResultRef::File { .. } => "file",
         PolicyQueryResultRef::ReferenceSite { .. } => "reference_site",
+        PolicyQueryResultRef::ReferenceEdge { .. } => "reference_edge",
         PolicyQueryResultRef::CallSite { .. } => "call_site",
         PolicyQueryResultRef::ExpressionSite { .. } => "expression_site",
         PolicyQueryResultRef::JsxAttributeValue { .. } => "jsx_attribute_value",
@@ -4421,6 +4723,7 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::WorkspaceModelLoadFailed => "workspace-model-load-failed",
         Code::WorkspaceModelInert => "workspace-model-inert",
         Code::ApproximateStandardLibrary => "approximate-standard-library",
+        Code::ApproximateDependencyArtifact => "approximate-dependency-artifact",
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",
@@ -4595,6 +4898,74 @@ mod tests {
                 max_serialized_bytes: 20
             })
         ));
+    }
+
+    #[test]
+    fn admitted_pattern_note_names_the_import_the_route_and_what_is_missing() {
+        let note = |chain: &[&str], truncated: bool, complete: bool| {
+            let chain = chain
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>();
+            let mut rendered = Vec::new();
+            write_admitted_pattern_note(
+                &mut rendered,
+                &AdmittedPatternRoute {
+                    constructor: "poem.web.query.Query",
+                    import_chain: &chain,
+                    import_chain_truncated: truncated,
+                    import_route_complete: complete,
+                    position: 0,
+                },
+            )
+            .unwrap();
+            String::from_utf8(rendered).unwrap()
+        };
+        // The route is the declaration itself: no re-export is claimed.
+        assert_eq!(
+            note(
+                &["poem.web.query.Query", "poem.web.query.Query"],
+                false,
+                true
+            ),
+            " (admitted via poem.web.query.Query field 0 (poem.web.query.Query))"
+        );
+        assert_eq!(
+            note(
+                &["Query", "poem.web.Query", "poem.web.query.Query"],
+                false,
+                true
+            ),
+            " (admitted via Query field 0 (poem.web.query.Query, re-exported as poem.web.Query))"
+        );
+        // The import the file wrote and the resolved route are shown apart: the
+        // local hop is not the re-export.
+        assert_eq!(
+            note(
+                &[
+                    "PoemQuery",
+                    "crate::web::PoemQuery",
+                    "poem.web.Query",
+                    "poem.web.query.Query"
+                ],
+                false,
+                false
+            ),
+            " (admitted via PoemQuery imported as crate::web::PoemQuery field 0 \
+             (poem.web.query.Query, re-exported as poem.web.Query)) [import route incomplete]"
+        );
+        // Shortened and incomplete are separate facts.
+        let shortened = note(&["Q", "poem.web.query.Query"], true, true);
+        assert!(
+            shortened.ends_with(" [import route shortened]"),
+            "{shortened}"
+        );
+        let incomplete = note(&["Q", "poem.web.query.Query"], false, false);
+        assert!(
+            incomplete.ends_with(" [import route incomplete]"),
+            "{incomplete}"
+        );
+        assert!(!incomplete.contains("shortened"));
     }
 
     #[test]

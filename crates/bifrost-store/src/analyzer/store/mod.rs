@@ -1,5 +1,7 @@
 #[doc(hidden)]
 pub mod cache_budget;
+mod candidate_fq_memo;
+mod connection_authorizer;
 #[doc(hidden)]
 pub mod semantic_composition;
 
@@ -211,6 +213,11 @@ pub use import_graph::WorkspaceImportGraphSource;
 #[doc(hidden)]
 pub use relational_query::RelationalStoreOutcome;
 
+pub use candidate_fq_memo::CandidateFqMemo;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use candidate_fq_memo::CandidateFqMemoCounts;
+
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::ToSql;
@@ -240,7 +247,6 @@ use std::sync::atomic::AtomicBool;
 
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::Ordering;
 
 use std::sync::Arc;
@@ -294,10 +300,12 @@ pub mod relational_query;
 #[doc(hidden)]
 pub mod rust_macro_source_sql;
 
+pub mod rust_copy_absence;
 #[doc(hidden)]
 pub mod rust_crates;
 #[doc(hidden)]
 pub mod rust_impl_children;
+pub mod rust_inventory;
 
 #[doc(hidden)]
 pub mod selected_definition;
@@ -320,11 +328,12 @@ pub mod go_unit_summaries;
 pub mod import_graph;
 #[doc(hidden)]
 pub mod jvm_external_inventory;
+pub mod jvm_external_publication;
+mod publication;
 #[doc(hidden)]
 pub mod python_binding_rows;
 #[doc(hidden)]
 pub mod python_member_rows;
-#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod python_unit_summaries;
 #[doc(hidden)]
@@ -335,6 +344,7 @@ pub mod unit_schedule;
 pub mod unit_summaries;
 mod versioned_relation;
 
+pub mod reader_binding;
 #[allow(dead_code)]
 #[doc(hidden)]
 pub mod resolution;
@@ -361,6 +371,7 @@ pub mod resolution_stage;
 #[doc(hidden)]
 pub mod resolution_typed;
 pub(crate) mod row_batch;
+mod schema_lease;
 pub(crate) mod selected_read_memo;
 #[doc(hidden)]
 pub mod semantic_ir;
@@ -370,7 +381,10 @@ pub mod test_adapters;
 #[doc(hidden)]
 pub mod workspace_inputs;
 
+#[cfg(any(test, feature = "test-support"))]
+mod nested_lend;
 #[doc(hidden)]
+pub mod sealed_families;
 pub mod writer;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -427,12 +441,15 @@ pub(super) fn valid_workspace_relative_path(path: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreErrorKind {
     Generic,
+    NotWritable,
     StaleGeneration,
     StaleResolution,
     SqliteInterrupted,
     Cancelled,
     ResourceBound,
     Corrupt,
+    #[cfg(any(test, feature = "test-support"))]
+    SelectedLendSnapshotMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,8 +585,7 @@ impl From<std::io::Error> for StoreError {
 
 impl From<rusqlite::Error> for StoreError {
     fn from(err: rusqlite::Error) -> Self {
-        let sqlite_interrupted =
-            err.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted);
+        let code = err.sqlite_error_code();
         let message = if let Some(sqlite) = err.sqlite_error() {
             format!(
                 "analyzer store SQLite error: {err} (code: {:?}, extended code: {})",
@@ -580,8 +596,13 @@ impl From<rusqlite::Error> for StoreError {
         };
         Self {
             message,
-            kind: if sqlite_interrupted {
+            kind: if code == Some(rusqlite::ErrorCode::OperationInterrupted) {
                 StoreErrorKind::SqliteInterrupted
+            } else if matches!(
+                code,
+                Some(rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::DiskFull)
+            ) {
+                StoreErrorKind::NotWritable
             } else {
                 StoreErrorKind::Generic
             },
@@ -644,8 +665,34 @@ pub struct WorkspaceSnapshotId {
     pub revision: i64,
 }
 
+/// Defined beside the listing-name predicate in `bifrost-rust`, so that the
+/// two change together.
+pub use brokk_bifrost_rust::cargo_routes::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+
 #[doc(hidden)]
 pub type WorkspaceSnapshots = HashMap<String, WorkspaceSnapshotId>;
+
+/// Workspace snapshots whose source enumeration the producing analyzer
+/// observed complete. The definition-inventory enumerator reads at exactly
+/// these snapshots, so a completeness fact cannot be paired with another
+/// snapshot. A storage language absent from the map has no proven snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ListedSnapshots(WorkspaceSnapshots);
+
+impl ListedSnapshots {
+    /// Only an analyzer that published each snapshot in its own sync and saw
+    /// that sync's listing complete may name it here.
+    #[doc(hidden)]
+    pub fn new(snapshots: WorkspaceSnapshots) -> Self {
+        Self(snapshots)
+    }
+
+    #[doc(hidden)]
+    pub fn snapshots(&self) -> &WorkspaceSnapshots {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SemanticPackActivationSourceKind {
@@ -752,11 +799,110 @@ pub fn rust_selected_units_fill_sql() -> &'static str {
     RUST_SELECTED_UNITS_FILL_SQL.as_str()
 }
 
+#[doc(hidden)]
+pub fn rust_selected_units_insert_marker() -> &'static str {
+    "INSERT INTO temp.selected_rust_unit_summaries\n"
+}
+
+/// The one owner of writes to selected Rust summary rows. The writer has no
+/// operation memo before selection fill or after checkout cleanup. During an
+/// operation, even a failed write changes the memo generation first.
+#[derive(Clone, Copy)]
+pub(crate) enum SelectedSummaryWrite {
+    Fill,
+    ClearSelection,
+    ClearRows,
+    #[cfg(test)]
+    InsertGapFixture,
+}
+
+pub(crate) enum SelectedSummaryWriteTarget<'a, 'store> {
+    Now(&'a Connection),
+    OnCheckin(&'a mut ReaderGuard<'store>),
+}
+
+#[doc(hidden)]
+pub const CLEAR_SELECTED_RESOLUTION_TEMP_SQL: &str = r#"
+DROP TRIGGER IF EXISTS temp.selected_resolution_mounts_no_insert;
+DROP TRIGGER IF EXISTS temp.selected_resolution_mounts_no_update;
+DROP TRIGGER IF EXISTS temp.selected_resolution_mounts_no_delete;
+DELETE FROM temp.selected_resolution_stage_producers;
+DELETE FROM temp.selected_resolution_stage_nodes;
+DELETE FROM temp.selected_resolution_admissions;
+DELETE FROM temp.selected_resolution_scope_mounts;
+DELETE FROM temp.selected_rust_transient_placement_attributes;
+DELETE FROM temp.selected_resolution_transient_placements;
+DELETE FROM temp.selected_resolution_mounts;
+DELETE FROM temp.selected_resolution_overlay_masks;
+DELETE FROM temp.selected_resolution_content_mounts;
+DELETE FROM temp.selected_resolution_languages;
+DELETE FROM temp.selected_resolution_context;
+DELETE FROM temp.selected_rust_unit_closure;
+DELETE FROM temp.selected_rust_unit_summaries;
+DELETE FROM temp.selected_workspace_revisions;
+"#;
+
+pub(crate) fn selected_summary_write(
+    target: SelectedSummaryWriteTarget<'_, '_>,
+    write: SelectedSummaryWrite,
+    generation: Option<&std::sync::atomic::AtomicU64>,
+    operation_memo_active: bool,
+) -> Result<()> {
+    debug_assert!(
+        generation.is_some() || !operation_memo_active,
+        "selected summary writes with an active operation must advance its generation"
+    );
+    if let Some(generation) = generation {
+        generation.fetch_add(1, Ordering::Relaxed);
+    }
+    let sql = match write {
+        SelectedSummaryWrite::Fill => rust_selected_units_fill_sql(),
+        SelectedSummaryWrite::ClearSelection => CLEAR_SELECTED_RESOLUTION_TEMP_SQL,
+        SelectedSummaryWrite::ClearRows => "DELETE FROM temp.selected_rust_unit_summaries;",
+        #[cfg(test)]
+        SelectedSummaryWrite::InsertGapFixture => {
+            "INSERT INTO temp.selected_rust_unit_summaries VALUES('fixture','rust',1,1,zeroblob(32),1,999999,NULL,1)"
+        }
+    };
+    match target {
+        SelectedSummaryWriteTarget::Now(conn) => conn.execute_batch(sql)?,
+        SelectedSummaryWriteTarget::OnCheckin(reader) => {
+            assert!(matches!(write, SelectedSummaryWrite::ClearSelection));
+            reader.cleanup_before_checkin(sql);
+        }
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn clear_selected_rust_units_for_test(conn: &Connection) -> Result<()> {
+    selected_summary_write(
+        SelectedSummaryWriteTarget::Now(conn),
+        SelectedSummaryWrite::ClearRows,
+        None,
+        false,
+    )
+}
+
+#[doc(hidden)]
+pub fn clear_selected_resolution_temp_for_test(conn: &Connection) -> Result<()> {
+    selected_summary_write(
+        SelectedSummaryWriteTarget::Now(conn),
+        SelectedSummaryWrite::ClearSelection,
+        None,
+        false,
+    )
+}
+
 /// Rebuild selection-owned Rust rows for either reader pool after its input write.
 #[doc(hidden)]
 pub fn fill_selected_rust_units(conn: &Connection) -> Result<()> {
-    conn.execute_batch(rust_selected_units_fill_sql())?;
-    Ok(())
+    selected_summary_write(
+        SelectedSummaryWriteTarget::Now(conn),
+        SelectedSummaryWrite::Fill,
+        None,
+        false,
+    )
 }
 
 /// Structural publication verification, before source/native families seal:
@@ -958,18 +1104,26 @@ pub struct AnalyzerStore {
     pub active_readers: ReaderPool,
     streaming_readers: ReaderPool,
     /// The workspace selection held by the writer connection's temp schema, for
-    /// the in-memory fallback that reads through it. Only the holder of the
-    /// writer connection's guard ever reads or writes this, and it takes both
-    /// guards together (see [`ReaderConn::Writer`]).
+    /// the test-only single-connection store that reads through it. Only the
+    /// holder of the writer connection's guard ever reads or writes this, and
+    /// it takes both guards together (see [`ReaderConn::Writer`]).
     #[doc(hidden)]
     pub writer_selection: Arc<Mutex<Option<AppliedWorkspaceSelection>>>,
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub crate_statement_counter: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
+    /// Blob oids `workspace_content_unit_tails` was asked to read, summed over
+    /// calls. Derivation of names for a file the sync leaves alone shows up
+    /// here, so a test can pin that an unchanged reopen reads none.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub unit_tail_blob_reads: std::sync::atomic::AtomicUsize,
     writer_resolution_selection: Mutex<Option<resolution_selection::RetainedResolutionSelection>>,
     /// All cross-request relation caches share this weighted capacity.
     #[doc(hidden)]
     pub cache_budget: cache_budget::StoreCacheBudget,
+    retention_budget: brokk_bifrost_core::retention_budget::RetentionBudget,
+    content_digests: brokk_bifrost_core::content_digest::ContentDigestCache,
     #[cfg(any(test, feature = "test-support"))]
     workspace_selection_counters: WorkspaceSelectionCounters,
     #[doc(hidden)]
@@ -984,6 +1138,8 @@ pub struct AnalyzerStore {
     parsed_blob_transaction_starts: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     parsed_blob_point_contains_queries: AtomicUsize,
+    #[cfg(any(test, feature = "test-support"))]
+    parsed_blob_membership_keys: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     replacement_cost_lookup_queries: Arc<AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1034,8 +1190,8 @@ pub struct AnalyzerStore {
 /// checkout is always returned on the thread that took it.
 ///
 /// When `source` is `None` the store has no separate readable file (the
-/// in-memory single-connection fallback); reads then route back through the
-/// writer connection so correctness is preserved at the cost of read
+/// test-only in-memory single-connection store); reads then route back through
+/// the writer connection so correctness is preserved at the cost of read
 /// parallelism. That path takes no permit: it is already serialized by the
 /// writer mutex.
 #[doc(hidden)]
@@ -1092,16 +1248,20 @@ struct WorkspaceSelectionStamp {
     temp_schema_version: i64,
 }
 
+pub(crate) const MAIN_DATA_VERSION_SQL: &str = "PRAGMA main.data_version";
+pub(crate) const MAIN_SCHEMA_VERSION_SQL: &str = "PRAGMA main.schema_version";
+pub(crate) const TEMP_SCHEMA_VERSION_SQL: &str = "PRAGMA temp.schema_version";
+
 fn workspace_selection_stamp(conn: &Connection) -> Result<WorkspaceSelectionStamp> {
     Ok(WorkspaceSelectionStamp {
         main_data_version: conn
-            .prepare_cached("PRAGMA main.data_version")?
+            .prepare_cached(MAIN_DATA_VERSION_SQL)?
             .query_row([], |row| row.get(0))?,
         main_schema_version: conn
-            .prepare_cached("PRAGMA main.schema_version")?
+            .prepare_cached(MAIN_SCHEMA_VERSION_SQL)?
             .query_row([], |row| row.get(0))?,
         temp_schema_version: conn
-            .prepare_cached("PRAGMA temp.schema_version")?
+            .prepare_cached(TEMP_SCHEMA_VERSION_SQL)?
             .query_row([], |row| row.get(0))?,
     })
 }
@@ -1130,6 +1290,14 @@ pub struct AppliedWorkspaceSelection {
 #[doc(hidden)]
 pub struct SelectedReader {
     conn: Connection,
+    /// The pooled connection's identity for the end-to-end reuse assertions.
+    #[cfg(any(test, feature = "test-support"))]
+    serial: u64,
+    /// Set once this connection is pooled after a `Clear` check-in, and kept
+    /// until it closes: SQLite keeps the freed in-memory TEMP pages for the
+    /// connection's whole life, so it stays charged to the retained-reader limit.
+    pooled_after_clear: bool,
+    macro_frontier: Option<Box<resolution_operation::RetainedMacroFrontier>>,
     /// `None` until the revisioned views have been created on this connection;
     /// afterwards, the selection materialized in
     /// `temp.selected_workspace_revisions`.
@@ -1171,6 +1339,9 @@ thread_local! {
 // Target/base comparisons retain two complete connection-local selections.
 // Larger histories must not accumulate workspace-sized operation arenas.
 const MAX_RETAINED_RESOLUTION_READERS: usize = 2;
+#[cfg(any(test, feature = "test-support"))]
+static NEXT_POOLED_READER_SERIAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 impl ReaderPool {
     /// `capacity` is the host's parallelism, at least 4, with no upper bound,
@@ -1327,14 +1498,26 @@ impl ReaderPool {
                 } else if state
                     .idle
                     .iter()
-                    .filter(|reader| reader.resolution_selection.is_some())
+                    .filter(|reader| {
+                        reader.resolution_selection.is_some() || reader.pooled_after_clear
+                    })
                     .count()
                     > MAX_RETAINED_RESOLUTION_READERS
                 {
+                    // Cleared readers hold at most MAX_RETAINED_RESOLUTION_READERS times the snapshot cap of idle TEMP.
+                    // A cleared reader without a selection goes first, so a warm selection
+                    // outlives the readers that would have closed before #10225.
                     let index = state
                         .idle
                         .iter()
-                        .position(|reader| reader.resolution_selection.is_some())
+                        .position(|reader| {
+                            reader.pooled_after_clear && reader.resolution_selection.is_none()
+                        })
+                        .or_else(|| {
+                            state.idle.iter().position(|reader| {
+                                reader.resolution_selection.is_some() || reader.pooled_after_clear
+                            })
+                        })
                         .expect("the retained reader count is nonzero");
                     Some(state.idle.remove(index))
                 } else {
@@ -1397,17 +1580,83 @@ impl ReaderPool {
     }
 }
 
-/// RAII handle to a checked-out reader (or the writer, in the fallback path).
+/// RAII handle to a checked-out reader (or the writer, in the test-only
+/// single-connection path).
 /// Derefs to `Connection` so existing read methods — `conn.transaction()`,
 /// helper calls taking `&Connection` — work unchanged. On drop, a pooled reader
 /// is returned to its pool.
 #[doc(hidden)]
 pub struct ReaderGuard<'a> {
     inner: ReaderConn<'a>,
-    checkin_cleanup: Option<&'static str>,
+    /// The owning store's budget, which holds the classifier's cached schema
+    /// scans and read sets.
+    cache_budget: &'a cache_budget::StoreCacheBudget,
+    /// What check-in does with this connection's TEMP state and whether it may
+    /// serve another checkout. Advanced only by the installer methods below.
+    checkin: CheckinPlan,
+    /// Scoped connection settings to put back at check-in. They are restored
+    /// whatever the plan decides, so they are not part of it.
     query_planner_stability_on_checkin: Option<bool>,
     restore_reader_mmap_on_checkin: bool,
-    reusable: bool,
+}
+
+/// The check-in protocol of one reader checkout.
+enum CheckinPlan {
+    /// Nothing is pending; the reader may return to its pool as it is.
+    Reusable,
+    /// Run connection-local cleanup, then pool the reader. A failed cleanup
+    /// closes it instead.
+    Cleanup { sql: &'static str },
+    /// Run cleanup, then pool the reader only after its TEMP state is shown to
+    /// be at the selection's cleared baseline. Only a pooled reader proves this.
+    CleanupThenProveClear {
+        sql: &'static str,
+        selection: resolution_selection::RetainedResolutionSelection,
+    },
+    /// Close the connection instead of pooling it. `abandoned_cleanup` is the
+    /// cleanup that was pending when the reader was discarded: closing makes
+    /// it unnecessary, but a discarded reader with abandoned cleanup must not be
+    /// re-enabled.
+    Discard {
+        abandoned_cleanup: Option<&'static str>,
+    },
+}
+
+/// What check-in decided after running the plan.
+enum CheckinOutcome {
+    Pool,
+    PoolCleared { proved_clear: bool },
+    Close,
+}
+
+/// A read transaction that reuses an already selected transaction when the
+/// connection is lent to a nested store read.
+pub enum ReadTransaction<'a> {
+    Owned(rusqlite::Transaction<'a>),
+    #[cfg(any(test, feature = "test-support"))]
+    Nested(&'a Connection),
+}
+
+impl std::ops::Deref for ReadTransaction<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Owned(tx) => tx,
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Nested(conn) => conn,
+        }
+    }
+}
+
+impl ReadTransaction<'_> {
+    pub fn commit(self) -> rusqlite::Result<()> {
+        match self {
+            Self::Owned(tx) => tx.commit(),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Nested(_) => Ok(()),
+        }
+    }
 }
 
 // Keep the common pooled checkout inline instead of allocating for every read.
@@ -1417,10 +1666,11 @@ enum ReaderConn<'a> {
         pool: &'a ReaderPool,
         reader: Option<SelectedReader>,
     },
-    /// The in-memory single-connection fallback reads through the writer, whose
-    /// temp schema is shared with every other user of that connection. Its
-    /// selection therefore lives beside the connection mutex rather than in a
-    /// pool entry, and is held for as long as the connection guard is.
+    /// The test-only in-memory single-connection store reads through the
+    /// writer, whose temp schema is shared with every other user of that
+    /// connection. Its selection therefore lives beside the connection mutex
+    /// rather than in a pool entry, and is held for as long as the connection
+    /// guard is.
     Writer {
         store: &'a AnalyzerStore,
         conn: std::sync::MutexGuard<'a, Connection>,
@@ -1429,6 +1679,14 @@ enum ReaderConn<'a> {
             std::sync::MutexGuard<'a, Option<resolution_selection::RetainedResolutionSelection>>,
         // Another writer checkout on this thread would wait for this one.
         _exclusive: writer::RetainedExclusiveReader,
+    },
+    /// A read-only borrow of the selected operation's connection. Its scope
+    /// counts every guard and asserts that all guards return before it exits.
+    #[cfg(any(test, feature = "test-support"))]
+    NestedReader {
+        connection: *const Connection,
+        writer: usize,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     },
     /// A writer-backed reader whose owner lent the connection to other store
     /// users ([`ReaderGuard::lend_writer`]). It holds no lock, so nothing may
@@ -1501,6 +1759,43 @@ pub fn reader_eviction_bytes_for_test() -> i64 {
 }
 
 impl<'a> ReaderGuard<'a> {
+    pub(in crate::analyzer::store) fn take_macro_frontier(
+        &mut self,
+    ) -> Option<Box<resolution_operation::RetainedMacroFrontier>> {
+        match &mut self.inner {
+            ReaderConn::Pooled { reader, .. } => reader
+                .as_mut()
+                .expect("reader guard already returned")
+                .macro_frontier
+                .take(),
+            ReaderConn::Writer { .. } | ReaderConn::LentWriter { .. } => None,
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => None,
+        }
+    }
+
+    pub(in crate::analyzer::store) fn put_macro_frontier(
+        &mut self,
+        frontier: Box<resolution_operation::RetainedMacroFrontier>,
+    ) {
+        let ReaderConn::Pooled { reader, .. } = &mut self.inner else {
+            panic!("macro frontier retention requires a pooled reader");
+        };
+        assert!(
+            reader
+                .as_mut()
+                .expect("reader guard already returned")
+                .macro_frontier
+                .replace(frontier)
+                .is_none(),
+            "one macro frontier per pooled reader"
+        );
+    }
+
+    pub(in crate::analyzer::store) fn is_pooled(&self) -> bool {
+        matches!(self.inner, ReaderConn::Pooled { .. })
+    }
+
     /// Whether another store checkout on this thread would reacquire our mutex.
     #[doc(hidden)]
     pub fn excludes_store_access(&self) -> bool {
@@ -1606,6 +1901,8 @@ impl<'a> ReaderGuard<'a> {
                 conn, selection, ..
             } => (conn, selection),
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 }
@@ -1620,6 +1917,10 @@ impl std::ops::Deref for ReaderGuard<'_> {
             }
             ReaderConn::Writer { conn, .. } => conn,
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            // The scope holds the original connection and asserts that every
+            // nested guard has returned before that connection can be released.
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { connection, .. } => unsafe { &**connection },
         }
     }
 }
@@ -1632,11 +1933,65 @@ impl std::ops::DerefMut for ReaderGuard<'_> {
             }
             ReaderConn::Writer { conn, .. } => conn,
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => panic!(
+                "nested transactional read under a selected-operation lend: mutable connection access"
+            ),
         }
     }
 }
 
 impl ReaderGuard<'_> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pooled_reader_serial_for_test(&self) -> Option<u64> {
+        match &self.inner {
+            ReaderConn::Pooled { reader, .. } => Some(
+                reader
+                    .as_ref()
+                    .expect("reader guard already returned")
+                    .serial,
+            ),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn idle_reader_serials_for_test(&self) -> Vec<u64> {
+        match &self.inner {
+            ReaderConn::Pooled { pool, .. } => pool
+                .state
+                .lock()
+                .expect("reader pool poisoned")
+                .idle
+                .iter()
+                .map(|reader| reader.serial)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn transaction(&mut self) -> rusqlite::Result<ReadTransaction<'_>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if matches!(&self.inner, ReaderConn::NestedReader { .. }) {
+            return Ok(ReadTransaction::Nested(&*self));
+        }
+        Ok(ReadTransaction::Owned(
+            std::ops::DerefMut::deref_mut(self).transaction()?,
+        ))
+    }
+
+    fn with_read_transaction<T>(
+        &mut self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.transaction()?;
+        let result = read(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     #[doc(hidden)]
     pub fn take_retained_resolution_selection(
         &mut self,
@@ -1652,6 +2007,8 @@ impl ReaderGuard<'_> {
                 ..
             } => resolution_selection.take(),
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 
@@ -1672,6 +2029,8 @@ impl ReaderGuard<'_> {
                 ..
             } => &mut **resolution_selection,
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
         };
         assert!(
             slot.replace(retained).is_none(),
@@ -1680,12 +2039,19 @@ impl ReaderGuard<'_> {
     }
 
     pub(in crate::analyzer::store) fn retain_before_checkin(&mut self) {
-        assert!(!self.reusable, "only a discarded reader needs re-enabling");
-        assert!(
-            self.checkin_cleanup.is_none(),
-            "a retained selection must not bypass pending TEMP cleanup"
-        );
-        self.reusable = true;
+        match self.checkin {
+            CheckinPlan::Discard {
+                abandoned_cleanup: None,
+            } => self.checkin = CheckinPlan::Reusable,
+            CheckinPlan::Discard {
+                abandoned_cleanup: Some(_),
+            } => panic!("a retained selection must not bypass pending TEMP cleanup"),
+            CheckinPlan::Reusable
+            | CheckinPlan::Cleanup { .. }
+            | CheckinPlan::CleanupThenProveClear { .. } => {
+                panic!("only a discarded reader needs re-enabling")
+            }
+        }
     }
 
     /// Keep parameter changes from recompiling the selected reader's indexed
@@ -1728,6 +2094,8 @@ impl ReaderGuard<'_> {
             }
             ReaderConn::Writer { .. } => self.stabilize_query_plans(),
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 
@@ -1742,6 +2110,8 @@ impl ReaderGuard<'_> {
                 .take(),
             ReaderConn::Writer { .. } => None,
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
         };
         if let Some(previous) = previous {
             match self.set_db_config(SQLITE_DBCONFIG_ENABLE_QPSG, previous) {
@@ -1750,7 +2120,7 @@ impl ReaderGuard<'_> {
                     "general reader checkout restores its original planner policy"
                 ),
                 Err(error) => {
-                    self.reusable = false;
+                    self.discard_before_checkin();
                     return Err(error.into());
                 }
             }
@@ -1763,11 +2133,22 @@ impl ReaderGuard<'_> {
     /// after committing a known-empty baseline and installing cleanup.
     #[doc(hidden)]
     pub fn discard_before_checkin(&mut self) {
-        self.reusable = false;
+        self.checkin = match std::mem::replace(&mut self.checkin, CheckinPlan::Reusable) {
+            CheckinPlan::Reusable => CheckinPlan::Discard {
+                abandoned_cleanup: None,
+            },
+            CheckinPlan::Cleanup { sql } | CheckinPlan::CleanupThenProveClear { sql, .. } => {
+                CheckinPlan::Discard {
+                    abandoned_cleanup: Some(sql),
+                }
+            }
+            discarded @ CheckinPlan::Discard { .. } => discarded,
+        };
     }
 
     /// Borrow the larger build-only map without changing the pool's policy.
-    /// The single-connection fallback is in-memory and has no file to map.
+    /// The test-only single-connection store is in-memory and has no file to
+    /// map.
     pub(crate) fn use_derivation_mmap(&mut self) -> Result<()> {
         if matches!(&self.inner, ReaderConn::Pooled { .. }) {
             assert!(
@@ -1790,38 +2171,120 @@ impl ReaderGuard<'_> {
     /// A failed cleanup discards a pooled connection instead of making its
     /// TEMP state observable by the next checkout.
     pub(crate) fn cleanup_before_checkin(&mut self, sql: &'static str) {
-        assert!(
-            self.checkin_cleanup.replace(sql).is_none(),
-            "reader checkin cleanup may be installed only once"
-        );
-        self.reusable = true;
+        match self.checkin {
+            CheckinPlan::Reusable
+            | CheckinPlan::Discard {
+                abandoned_cleanup: None,
+            } => self.checkin = CheckinPlan::Cleanup { sql },
+            CheckinPlan::Cleanup { .. }
+            | CheckinPlan::CleanupThenProveClear { .. }
+            | CheckinPlan::Discard {
+                abandoned_cleanup: Some(_),
+            } => panic!("reader checkin cleanup may be installed only once"),
+        }
     }
+
+    /// Check a cleared reader's TEMP baseline before it goes back to the pool.
+    /// Only a pooled reader serves another request afterwards; a writer-backed
+    /// reader stays with its store, so there is no pooling decision to make.
+    pub(crate) fn verify_selection_clear_on_checkin(
+        &mut self,
+        selection: resolution_selection::RetainedResolutionSelection,
+    ) {
+        let CheckinPlan::Cleanup { sql } = self.checkin else {
+            panic!("only a reader with pending cleanup proves its cleared baseline once");
+        };
+        if matches!(self.inner, ReaderConn::Pooled { .. }) {
+            self.checkin = CheckinPlan::CleanupThenProveClear { sql, selection };
+        }
+    }
+
+    fn run_checkin_cleanup(&mut self, sql: &'static str) -> rusqlite::Result<()> {
+        match &mut self.inner {
+            ReaderConn::Pooled { reader, .. } => reader
+                .as_mut()
+                .expect("reader guard already returned")
+                .conn
+                .execute_batch(sql),
+            ReaderConn::Writer { conn, .. } => conn.execute_batch(sql),
+            ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static POOLED_READER_CLOSES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn note_pooled_reader_close_for_test() {
+    POOLED_READER_CLOSES_FOR_TEST.with(|cell| cell.set(cell.get() + 1));
+}
+
+/// Pooled readers closed at check-in on this thread since the last call.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_pooled_reader_closes_for_test() -> usize {
+    POOLED_READER_CLOSES_FOR_TEST.with(|cell| cell.replace(0))
 }
 
 impl Drop for ReaderGuard<'_> {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        if let ReaderConn::NestedReader { writer, .. } = &self.inner {
+            nested_lend::release(*writer);
+            return;
+        }
         // The owner reclaims a lent connection first: its cleanup, the
         // planner restoration and the checks below need the connection held.
         assert!(
             !self.is_lent_writer(),
             "a lent writer-backed reader must be reclaimed before it is dropped"
         );
-        let had_cleanup = self.checkin_cleanup.is_some();
+        // Checkin maintenance does not read the derivation's inputs.
+        let _cleanup = brokk_bifrost_core::attribution::capture_frame_active()
+            .then(brokk_bifrost_core::attribution::classifier_statements);
         let mut cleanup_errors = Vec::new();
-        if let Some(sql) = self.checkin_cleanup.take() {
-            let result = match &mut self.inner {
-                ReaderConn::Pooled { reader, .. } => reader
-                    .as_mut()
-                    .expect("reader guard already returned")
-                    .conn
-                    .execute_batch(sql),
-                ReaderConn::Writer { conn, .. } => conn.execute_batch(sql),
-                ReaderConn::LentWriter { .. } => lent_writer_used(),
-            };
-            if let Err(error) = result {
-                cleanup_errors.push(("TEMP cleanup", error));
+        let outcome = match std::mem::replace(&mut self.checkin, CheckinPlan::Reusable) {
+            CheckinPlan::Reusable => CheckinOutcome::Pool,
+            CheckinPlan::Cleanup { sql } => match self.run_checkin_cleanup(sql) {
+                Ok(()) => CheckinOutcome::PoolCleared {
+                    proved_clear: false,
+                },
+                Err(error) => {
+                    cleanup_errors.push(("TEMP cleanup", error));
+                    CheckinOutcome::Close
+                }
+            },
+            CheckinPlan::CleanupThenProveClear { sql, selection } => {
+                let conn: &Connection = &*self;
+                let schema =
+                    conn.query_row("PRAGMA temp.schema_version", [], |row| row.get::<_, i64>(0));
+                let changes = conn.total_changes();
+                if let Err(error) = self.run_checkin_cleanup(sql) {
+                    cleanup_errors.push(("TEMP cleanup", error));
+                    CheckinOutcome::Close
+                } else if let Err(error) = resolution_operation::discard_macro_stage_snapshot(self)
+                {
+                    eprintln!(
+                        "analyzer store discarded pooled reader after macro shadow cleanup failed: {error}"
+                    );
+                    CheckinOutcome::Close
+                } else if schema.is_ok_and(|schema| {
+                    selection
+                        .cleared_reader_is_at_baseline(self, changes, schema)
+                        .unwrap_or(false)
+                }) {
+                    CheckinOutcome::PoolCleared { proved_clear: true }
+                } else {
+                    CheckinOutcome::Close
+                }
             }
-        }
+            CheckinPlan::Discard { .. } => CheckinOutcome::Close,
+        };
         if self.restore_reader_mmap_on_checkin
             && let Err(error) =
                 self.pragma_update(None, "mmap_size", crate::cache_db::READER_MMAP_SIZE_BYTES)
@@ -1846,27 +2309,45 @@ impl Drop for ReaderGuard<'_> {
                     eprintln!(
                         "analyzer store discarded pooled reader after cleanup failed: {cleanup_errors:?}"
                     );
+                    #[cfg(any(test, feature = "test-support"))]
+                    note_pooled_reader_close_for_test();
                     drop(reader);
                     pool.abandon_checkout();
-                } else if !self.reusable {
-                    drop(reader);
-                    pool.abandon_checkout();
-                } else {
-                    if had_cleanup {
-                        if let Some(selection) = &mut reader.selection {
-                            selection.snapshots.clear();
-                        }
-                        reader.resolution_selection = None;
-                    }
-                    pool.checkin(reader);
+                    return;
                 }
+                let pool_reader = match outcome {
+                    CheckinOutcome::Close => false,
+                    // A cleared reader does not keep the frontier whose TEMP
+                    // shadow its cleanup removed.
+                    CheckinOutcome::PoolCleared { .. } => reader.macro_frontier.is_none(),
+                    CheckinOutcome::Pool => {
+                        reader.macro_frontier.is_none()
+                            || resolution_operation::macro_temp_within_cap(&reader.conn)
+                                .unwrap_or(false)
+                    }
+                };
+                if !pool_reader {
+                    #[cfg(any(test, feature = "test-support"))]
+                    note_pooled_reader_close_for_test();
+                    drop(reader);
+                    pool.abandon_checkout();
+                    return;
+                }
+                if let CheckinOutcome::PoolCleared { proved_clear } = outcome {
+                    if let Some(selection) = &mut reader.selection {
+                        selection.snapshots.clear();
+                    }
+                    reader.resolution_selection = None;
+                    reader.pooled_after_clear |= proved_clear;
+                }
+                pool.checkin(reader);
             }
             ReaderConn::Writer {
                 selection,
                 resolution_selection,
                 ..
             } => {
-                if had_cleanup {
+                if matches!(outcome, CheckinOutcome::PoolCleared { .. }) {
                     if let Some(selection) = selection.as_mut() {
                         selection.snapshots.clear();
                     }
@@ -1874,14 +2355,16 @@ impl Drop for ReaderGuard<'_> {
                 }
                 assert!(
                     cleanup_errors.is_empty(),
-                    "analyzer store cleanup failed on the writer fallback: {cleanup_errors:?}"
+                    "analyzer store cleanup failed on the writer-backed reader: {cleanup_errors:?}"
                 );
                 assert!(
-                    self.reusable,
-                    "analyzer store writer fallback left TEMP state unverified"
+                    !matches!(outcome, CheckinOutcome::Close),
+                    "analyzer store writer-backed reader left TEMP state unverified"
                 );
             }
             ReaderConn::LentWriter { .. } => lent_writer_used(),
+            #[cfg(any(test, feature = "test-support"))]
+            ReaderConn::NestedReader { .. } => lent_writer_used(),
         }
     }
 }
@@ -1954,7 +2437,7 @@ fn semantic_pack_active_set_digest(members: &[SemanticPackActiveReference]) -> R
         hash_length_prefixed(&mut hasher, member.source_id.as_bytes());
         hasher.update([u8::from(member.workspace_produced)]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&hasher.finalize().into()))
 }
 
 fn update_sha256_with_length_prefix(hasher: &mut Sha256, value: &[u8]) {
@@ -2055,7 +2538,7 @@ fn reader_source_path(conn: &Connection) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn unique_temp_db_path() -> PathBuf {
+fn unique_temp_db_path() -> Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2064,13 +2547,29 @@ fn unique_temp_db_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
+    // A temp root that is itself a symlink is a valid TMPDIR, and sandboxes
+    // commonly spell it that way. Resolve it before cache_db's symlink guard
+    // so the ephemeral store keeps its pooled readers.
+    let temp_dir = std::env::temp_dir();
+    let temp_dir = temp_dir.canonicalize().map_err(|error| {
+        StoreError::new(format!(
+            "ephemeral analyzer cache temp directory {} is unusable: {error}",
+            temp_dir.display()
+        ))
+    })?;
     // Deliberately not named `bifrost_cache.db`, so the writer's legacy-cache
     // cleanup treats it as unrelated and never touches sibling temp files.
-    std::env::temp_dir().join(format!("bifrost-analyzer-{pid}-{nanos}-{counter}.db"))
+    Ok(temp_dir.join(format!("bifrost-analyzer-{pid}-{nanos}-{counter}.db")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GenerationId(#[doc(hidden)] pub i64);
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for GenerationId {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
 
 impl GenerationId {
     /// Rehydrate an epoch identity from a schema-checked generation column.
@@ -2383,11 +2882,27 @@ pub struct PathSymbolRow {
     pub requires_imports: bool,
 }
 
-pub(super) const OPEN_FILE_VERSION_DECISION_SQL: &str = "SELECT files.file_version_id, files.projection_digest, decisions.decision_digest, decisions.assignment_digest
+pub(super) const OPEN_FILE_VERSION_DECISION_SQL: &str = "SELECT files.file_version_id, files.projection_digest, decisions.decision_digest, decisions.assignment_digest, files.definition_inventory_state
                          FROM workspace_file_versions AS files
                          LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
                          WHERE files.workspace_id = ?1 AND files.lang = ?2 AND files.generation = ?3
                            AND files.rel_path = ?4 AND files.input_kind = 'source' AND files.valid_until IS NULL";
+
+/// An open file version read by `OPEN_FILE_VERSION_DECISION_SQL`: its id,
+/// projection digest, C# decision and recorded inventory state.
+type OpenFileVersion = (i64, String, Option<FileVersionDecision>, Option<String>);
+
+/// Whether the incoming projection replaces the open file version. The single
+/// predicate of the per-file publication and of the question of whether that
+/// publication will store an inventory.
+fn open_file_version_changed(
+    old: Option<&OpenFileVersion>,
+    new_digest: Option<&str>,
+    decision: Option<FileVersionDecision>,
+) -> bool {
+    old.map(|(_, digest, _, _)| digest.as_str()) != new_digest
+        || old.and_then(|(_, _, decision, _)| *decision) != decision
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
@@ -2467,6 +2982,48 @@ pub struct WorkspaceContentPackageFacts {
     pub complete: bool,
 }
 
+/// One stored unit whose final name the `code_units` name columns do not
+/// carry: its stored tail, with the anchor and content qualifier that place it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct WorkspaceContentUnitTail {
+    pub blob_oid: Oid,
+    pub blob_id: i64,
+    pub unit_key: i64,
+    pub anchor: Option<PackageAnchor>,
+    pub content_qualifier: String,
+    pub tail: FqName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct WorkspaceContentUnitTails {
+    pub units: Vec<WorkspaceContentUnitTail>,
+    /// The requested blobs whose stored facts are complete and ready. A blob
+    /// outside this set has no enumerable units, which is not the same as none.
+    pub ready_blobs: HashSet<Oid>,
+}
+
+fn workspace_content_unit_tails_sql(oid_count: usize) -> String {
+    assert!(oid_count > 0, "unit-tail query needs at least one blob");
+    let placeholders = std::iter::repeat_n("?", oid_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT live.blob_oid, units.blob_id, units.unit_key, units.fq_anchor_kind,
+                units.fq_anchor_pop, units.content_qualifier, units.fq_segment_count,
+                segments.seg_ordinal, segments.seg_kind, segments.segment
+         FROM live_parsed_blobs AS live
+         JOIN code_units AS units ON units.blob_id = live.blob_id
+         JOIN code_unit_fq_segments AS segments
+           ON segments.blob_id = units.blob_id AND segments.unit_key = units.unit_key
+         WHERE live.lang = ? AND live.parse_variant = ?
+           AND live.blob_oid IN ({placeholders})
+           AND units.exact_fqn IS NULL
+         ORDER BY live.blob_oid, units.blob_id, units.unit_key, segments.seg_ordinal"
+    )
+}
+
 type PathSymbolRowsResult = Result<Vec<(String, PathSymbolRow)>>;
 
 fn decode_path_symbol_row(
@@ -2504,7 +3061,7 @@ fn decode_path_symbol_row(
 /// Shared row-fetch body of `path_symbol_rows_by_fqn_for_langs` and its batched sibling: runs entirely
 /// within a caller-supplied transaction so the batch path can resolve many FQN pairs per transaction.
 fn path_symbol_rows_by_fqn_in_tx(
-    tx: &Transaction,
+    tx: &Connection,
     langs: &[String],
     exact_fqn: &str,
     normalized_fqn: &str,
@@ -2749,6 +3306,9 @@ fn workspace_snapshots_conn(
 
 #[doc(hidden)]
 pub fn ensure_revisioned_workspace_views(conn: &Connection) -> Result<()> {
+    // All connection paths, including import and planner fixtures, must have
+    // this function before a selected-summary trigger can execute.
+    let _generation = register_selected_summary_generation(conn)?;
     let configured = conn
         .query_row(
             "SELECT 1 FROM temp.sqlite_schema
@@ -2762,6 +3322,24 @@ pub fn ensure_revisioned_workspace_views(conn: &Connection) -> Result<()> {
         conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)?;
     }
     Ok(())
+}
+
+pub(crate) fn register_selected_summary_generation(
+    conn: &Connection,
+) -> rusqlite::Result<Arc<std::sync::atomic::AtomicU64>> {
+    use rusqlite::functions::FunctionFlags;
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let trigger_generation = Arc::clone(&generation);
+    conn.create_scalar_function(
+        "bifrost_selected_summary_bump",
+        0,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
+        move |_| {
+            trigger_generation.fetch_add(1, Ordering::Relaxed);
+            Ok(0i64)
+        },
+    )?;
+    Ok(generation)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -2801,11 +3379,223 @@ fn current_test_workspace_snapshots(conn: &Connection) -> Result<WorkspaceSnapsh
     Ok(snapshots)
 }
 
+/// Projection-side evidence supplied by the analysis publication producer.
+/// The producer cannot say "known": the store derives that from the blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionInventoryState {
+    Unknown,
+    /// Package facts cover the file and every anchor resolved. The file
+    /// version becomes known once its blob is complete and ready.
+    ProjectionComplete,
+    PackageFactsIncomplete,
+    UnresolvedAnchor,
+}
+
+/// The blob deletes that `withdraw_definition_inventory_for_deleted_blob_tx`
+/// follows in the same transaction. RETURNING names the generation each removed row
+/// belonged to, which keys the hook.
+const STALE_BLOB_DELETE_SQL: &str = "DELETE FROM blobs
+ WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?4 AND generation <> ?3
+ RETURNING generation";
+const UNROOTED_BLOB_GC_DELETE_SQL: &str = "DELETE FROM blobs
+ WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
+   AND generation = COALESCE(
+     (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
+   )
+   AND NOT EXISTS (
+     SELECT 1 FROM workspace_resolution_content_roots AS roots
+     WHERE roots.blob_id = blobs.id
+   )
+ RETURNING generation";
+
+/// Writer 1: the owner publication promotes the one file version it just
+/// published when its blob is already ready.
+const DEFINITION_INVENTORY_PROMOTE_FILE_SQL: &str = concat!(
+    "UPDATE main.workspace_file_versions AS fv
+ SET definition_inventory_state = 'known'
+ WHERE fv.file_version_id = ?1 AND fv.definition_inventory_state = 'blob_pending' AND ",
+    brokk_bifrost_core::definition_inventory_blob_ready!()
+);
+
+/// Final anchored spelling, normalized after assembling prefix and tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionNameRow {
+    pub blob_id: i64,
+    pub unit_key: i64,
+    pub exact_fqn: String,
+    pub normalized_fqn: String,
+}
+
+/// One file projection's definition-inventory evidence, produced beside its
+/// package and anchor rows and written by
+/// `replace_workspace_file_definition_inventory` with the projection. A file
+/// with no entry is published unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct WorkspaceFileDefinitionInventory {
+    pub rel_path: String,
+    pub state: DefinitionInventoryState,
+    pub names: Vec<DefinitionNameRow>,
+}
+
+/// The sole writer of projection definition names, and the first authorized
+/// writer of `definition_inventory_state` (see
+/// `bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx`
+/// for the second). Call within
+/// publication's transaction; replacing a projection must replace its evidence
+/// atomically. A projection-complete file version is known only if its blob is
+/// already complete and ready; otherwise it stays `blob_pending` for the blob
+/// publication to promote. Incomplete and legacy projections are never known.
+pub fn replace_workspace_file_definition_inventory(
+    tx: &Transaction<'_>,
+    file_version_id: i64,
+    rows: &[DefinitionNameRow],
+    state: DefinitionInventoryState,
+) -> Result<()> {
+    // The names' blob ids come from a read made before this transaction. If
+    // another analyzer republished the file's blob since, an id may be gone,
+    // may name another blob, or may name another parse variant of the same
+    // content. Writing it would abort the publication on the foreign key or
+    // attach names to other units, so a file whose ids no longer name the
+    // variant it selects is published unknown, which the next sync refills in
+    // place.
+    let mut ids = rows.iter().map(|row| row.blob_id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut current = tx.prepare_cached(concat!(
+        "SELECT EXISTS(SELECT 1 FROM main.workspace_file_versions AS fv
+           JOIN main.blobs AS blobs ON blobs.blob_oid = fv.blob_oid AND blobs.lang = fv.lang
+             AND blobs.generation = fv.generation
+          WHERE fv.file_version_id = ?1 AND blobs.id = ?2 AND ",
+        brokk_bifrost_core::definition_inventory_selected_variant!(),
+        ")"
+    ))?;
+    let mut stale = false;
+    for id in ids {
+        stale |= !current.query_row(params![file_version_id, id], |row| row.get::<_, bool>(0))?;
+    }
+    let (rows, state) = if stale {
+        (&[][..], DefinitionInventoryState::Unknown)
+    } else {
+        (rows, state)
+    };
+    tx.execute(
+        "DELETE FROM workspace_file_definition_name_rows WHERE file_version_id = ?1",
+        [file_version_id],
+    )?;
+    for chunk in rows.chunks(64) {
+        let bindings: Vec<_> = chunk
+            .iter()
+            .map(|row| {
+                (
+                    file_version_id,
+                    row.blob_id,
+                    row.unit_key,
+                    row.exact_fqn.as_str(),
+                    row.normalized_fqn.as_str(),
+                )
+            })
+            .collect();
+        assert!(row_batch::insert_typed_rows(
+            tx,
+            "INSERT INTO workspace_file_definition_name_rows(file_version_id, blob_id, unit_key, exact_fqn, normalized_fqn) VALUES",
+            "(?, ?, ?, ?, ?)",
+            &bindings,
+            &CancellationToken::new(),
+        )?);
+    }
+    let label = match state {
+        DefinitionInventoryState::Unknown => None,
+        DefinitionInventoryState::ProjectionComplete => Some("blob_pending"),
+        DefinitionInventoryState::PackageFactsIncomplete => Some("package_facts_incomplete"),
+        DefinitionInventoryState::UnresolvedAnchor => Some("unresolved_anchor"),
+    };
+    let changed = tx.execute(
+        "UPDATE workspace_file_versions SET definition_inventory_state = ?2 WHERE file_version_id = ?1",
+        params![file_version_id, label],
+    )?;
+    assert_eq!(
+        changed, 1,
+        "inventory must belong to a published file version"
+    );
+    if state == DefinitionInventoryState::ProjectionComplete {
+        tx.prepare_cached(DEFINITION_INVENTORY_PROMOTE_FILE_SQL)?
+            .execute([file_version_id])?;
+    }
+    Ok(())
+}
+
+/// The open source versions of one language whose inventory a digest-equal sync
+/// may rewrite in place: NULL (a version from before migration 0292),
+/// `names_withdrawn` (a blob delete cascaded the name rows away),
+/// `package_facts_incomplete` (the batch's package facts were incomplete when
+/// the projection was published) and `unresolved_anchor` (an anchor had no
+/// package name then; a repaired go.mod or other configuration can resolve it
+/// while the file's own content is unchanged). The first conjunct states the
+/// partial index predicate, so the seek stays on that index. The validity
+/// equality bounds the seek to open versions, excluding retained history.
+const DEFINITION_INVENTORY_REFILLABLE_SQL: &str = "SELECT files.file_version_id, files.rel_path
+ FROM workspace_file_versions AS files INDEXED BY idx_workspace_file_definition_inventory_unknown
+ WHERE files.lang = ?2 AND files.workspace_id = ?1 AND files.generation = ?3
+ AND files.definition_inventory_state IS NOT 'known'
+ AND files.input_kind = 'source' AND files.valid_until IS NULL
+ AND (files.definition_inventory_state IS NULL
+      OR files.definition_inventory_state IN
+         ('names_withdrawn', 'package_facts_incomplete', 'unresolved_anchor'))";
+
+/// Whether a digest-equal open version's recorded state is refillable (the
+/// state column of `DEFINITION_INVENTORY_REFILLABLE_SQL`).
+fn definition_inventory_refillable(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        None | Some("names_withdrawn")
+            | Some("package_facts_incomplete")
+            | Some("unresolved_anchor")
+    )
+}
+
+/// Rewrites the name rows and state of an open file version that the sync found
+/// digest-equal, without replacing it: the file version id and its revision
+/// stay, so nothing keyed by revision is re-keyed. Only complete evidence
+/// refills; an incomplete inventory leaves the stored state as it is. The
+/// version becomes known only through the owner's own promotion, so a blob that
+/// is not ready yet leaves it `blob_pending` for the readiness hook.
+fn refill_definition_inventory_in_place(
+    tx: &Transaction<'_>,
+    file_version_id: i64,
+    inventory: &WorkspaceFileDefinitionInventory,
+) -> Result<()> {
+    if inventory.state == DefinitionInventoryState::ProjectionComplete {
+        replace_workspace_file_definition_inventory(
+            tx,
+            file_version_id,
+            &inventory.names,
+            inventory.state,
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_workspace_file_projection_rows(
     tx: &Transaction<'_>,
     file_version_id: i64,
     projection: &WorkspaceFileProjection<'_>,
+    inventory: Option<&WorkspaceFileDefinitionInventory>,
 ) -> Result<()> {
+    match inventory {
+        Some(inventory) => replace_workspace_file_definition_inventory(
+            tx,
+            file_version_id,
+            &inventory.names,
+            inventory.state,
+        )?,
+        None => replace_workspace_file_definition_inventory(
+            tx,
+            file_version_id,
+            &[],
+            DefinitionInventoryState::Unknown,
+        )?,
+    }
     {
         let mut insert = tx.prepare_cached(
             "INSERT INTO workspace_file_package_rows(file_version_id, package_name)
@@ -3209,6 +3999,181 @@ impl AnalyzerStore {
         Ok(WorkspaceContentPackageFacts { facts, complete })
     }
 
+    /// The stored tails of every unit of the requested blobs whose final name
+    /// is not a `code_units` name column. The publication producer assembles
+    /// each with its file's anchor prefix into a `DefinitionNameRow`.
+    #[doc(hidden)]
+    pub fn workspace_content_unit_tails(
+        &self,
+        key: &BlobKey,
+        generation: GenerationId,
+        blob_oids: &[Oid],
+    ) -> Result<WorkspaceContentUnitTails> {
+        let lang = key.lang.as_str();
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        const OIDS_PER_QUERY: usize = 900;
+        let mut requested = blob_oids.iter().map(Oid::to_string).collect::<Vec<_>>();
+        requested.sort_unstable();
+        requested.dedup();
+        #[cfg(any(test, feature = "test-support"))]
+        self.unit_tail_blob_reads
+            .fetch_add(requested.len(), std::sync::atomic::Ordering::Relaxed);
+        let interner = segment_interner();
+        let mut units: Vec<WorkspaceContentUnitTail> = Vec::new();
+        let mut ready_blobs = HashSet::default();
+        for chunk in requested.chunks(OIDS_PER_QUERY) {
+            let parameters = || {
+                std::iter::once(rusqlite::types::Value::Text(lang.to_owned()))
+                    .chain(std::iter::once(key.variant.as_bytes().to_vec().into()))
+                    .chain(chunk.iter().cloned().map(rusqlite::types::Value::Text))
+            };
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut ready = tx.prepare_cached(&format!(
+                "SELECT live.blob_oid FROM live_parsed_blobs AS live
+                 WHERE live.lang = ? AND live.parse_variant = ?
+                   AND live.blob_oid IN ({placeholders})"
+            ))?;
+            for oid in ready.query_map(params_from_iter(parameters()), |row| {
+                row.get::<_, String>(0)
+            })? {
+                ready_blobs.insert(Oid::from_str(&oid?)?);
+            }
+            let mut statement =
+                tx.prepare_cached(&workspace_content_unit_tails_sql(chunk.len()))?;
+            let mut rows = statement.query(params_from_iter(parameters()))?;
+            while let Some(row) = rows.next()? {
+                let blob_oid = Oid::from_str(&row.get::<_, String>(0)?)?;
+                let blob_id: i64 = row.get(1)?;
+                let unit_key: i64 = row.get(2)?;
+                let ordinal: usize = row.get(7)?;
+                let kind = segment_kind_from_sql(&row.get::<_, String>(8)?)?;
+                let segment: String = row.get(9)?;
+                if ordinal == 0 {
+                    let anchor = match (
+                        row.get::<_, Option<String>>(3)?.as_deref(),
+                        row.get::<_, Option<i64>>(4)?,
+                    ) {
+                        (None, None) => None,
+                        (Some("own_module"), Some(pop)) => Some(PackageAnchor::OwnModule {
+                            pop: u8::try_from(pop).map_err(|_| {
+                                StoreError::new(format!("invalid own-module anchor pop {pop}"))
+                            })?,
+                        }),
+                        (Some("crate_root"), Some(0)) => Some(PackageAnchor::CrateRoot),
+                        pair => {
+                            return Err(StoreError::new(format!(
+                                "invalid relational package anchor pair {pair:?}"
+                            )));
+                        }
+                    };
+                    units.push(WorkspaceContentUnitTail {
+                        blob_oid,
+                        blob_id,
+                        unit_key,
+                        anchor,
+                        content_qualifier: row.get(5)?,
+                        tail: FqName::new(),
+                    });
+                }
+                let unit = units
+                    .last_mut()
+                    .expect("a unit's first segment row precedes its later segments");
+                assert_eq!(
+                    (unit.blob_id, unit.unit_key, unit.tail.len()),
+                    (blob_id, unit_key, ordinal),
+                    "relational unit segments are contiguous"
+                );
+                unit.tail.push(interner.intern(&segment, kind));
+            }
+        }
+        tx.commit()?;
+        Ok(WorkspaceContentUnitTails { units, ready_blobs })
+    }
+
+    /// The source files whose definition inventory the matching
+    /// [`Self::sync_workspace_inputs_with_rust_listing`] would store: those it
+    /// publishes as a new file version, and the digest-equal open versions
+    /// whose stored inventory is refillable. Every other file keeps the
+    /// inventory it has, so a producer derives names only for the answer. The
+    /// publication compares with the same predicate (`OpenInput::matches`).
+    /// The answer is read outside the publication transaction. A concurrent
+    /// writer can only make it stale in one direction that matters: a file
+    /// published without an inventory is stored unknown, which fails closed.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn workspace_inventories_needed(
+        &self,
+        workspace_id: &WorkspaceId,
+        lang: &str,
+        generation: GenerationId,
+        files: &[WorkspaceFileRow],
+        path_symbols: &[PathSymbolRow],
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
+        foreign_source_paths: &[String],
+    ) -> Result<HashSet<String>> {
+        let foreign = foreign_source_paths
+            .iter()
+            .cloned()
+            .collect::<crate::hash::HashSet<_>>();
+        let projections =
+            workspace_file_projections(files, path_symbols, package_files, package_edges, anchors);
+        let digests = files
+            .iter()
+            .map(|file| workspace_file_projection_digest(file, &projections[&*file.rel_path]))
+            .collect::<Vec<_>>();
+        let inputs = files
+            .iter()
+            .zip(&digests)
+            .map(|(file, digest)| workspace_inputs::WorkspaceInputRow {
+                relative_path: &file.rel_path,
+                content_oid: file.blob_oid,
+                projection_digest: Some(digest),
+                csharp_decision: file.decision,
+                file_present: None,
+            })
+            .collect::<Vec<_>>();
+        let incoming = inputs
+            .iter()
+            .map(|row| (row.relative_path, row))
+            .collect::<HashMap<_, _>>();
+        let conn = self.read_conn()?;
+        let mut needed = files
+            .iter()
+            .map(|file| file.rel_path.clone())
+            .collect::<HashSet<_>>();
+        for open in workspace_inputs::open_inputs(
+            &conn,
+            workspace_id,
+            lang,
+            generation,
+            workspace_inputs::WorkspaceInputKind::Source,
+        )? {
+            if !foreign.contains(&open.path)
+                && open.matches(incoming.get(open.path.as_str()).copied())
+            {
+                needed.remove(&open.path);
+            }
+        }
+        let refillable = conn
+            .prepare_cached(DEFINITION_INVENTORY_REFILLABLE_SQL)?
+            .query_map(params![workspace_id.as_str(), lang, generation.0], |row| {
+                row.get::<_, String>(1)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        needed.extend(
+            refillable
+                .into_iter()
+                .filter(|path| incoming.contains_key(path.as_str())),
+        );
+        Ok(needed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
     pub fn sync_workspace_inputs_for_workspace(
@@ -3226,6 +4191,46 @@ impl AnalyzerStore {
         foreign_source_paths: &[String],
         refusals: &[WorkspaceSourceRefusalRow],
     ) -> Result<WorkspaceSnapshotId> {
+        self.sync_workspace_inputs_with_rust_listing(
+            workspace_id,
+            lang,
+            generation,
+            files,
+            path_symbols,
+            _packages,
+            package_files,
+            package_edges,
+            anchors,
+            configuration,
+            foreign_source_paths,
+            refusals,
+            &[],
+            None,
+        )
+    }
+
+    /// The version belongs to the producer's listing rules. Other callers
+    /// cannot manufacture a positive Rust listing certificate.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn sync_workspace_inputs_with_rust_listing(
+        &self,
+        workspace_id: &WorkspaceId,
+        lang: &str,
+        generation: GenerationId,
+        files: &[WorkspaceFileRow],
+        path_symbols: &[PathSymbolRow],
+        _packages: &[String],
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
+        configuration: &[WorkspaceConfigurationInput],
+        foreign_source_paths: &[String],
+        refusals: &[WorkspaceSourceRefusalRow],
+        inventories: &[WorkspaceFileDefinitionInventory],
+        rust_listing: Option<(i64, Vec<(String, String)>)>,
+    ) -> Result<WorkspaceSnapshotId> {
+        assert!(rust_listing.is_none() || lang == "rust");
         assert!(
             lang == "csharp" || files.iter().all(|file| file.decision.is_none()),
             "only C# rows carry decisions"
@@ -3243,6 +4248,10 @@ impl AnalyzerStore {
         let package_files = package_files.to_vec();
         let package_edges = package_edges.to_vec();
         let anchors = anchors.to_vec();
+        let inventories = inventories
+            .iter()
+            .map(|inventory| (inventory.rel_path.clone(), inventory.clone()))
+            .collect::<HashMap<_, _>>();
         self.execute_selection_publication(move |conn| {
             let lang = lang.as_str();
             let files = files.as_slice();
@@ -3270,6 +4279,7 @@ impl AnalyzerStore {
                     content_oid: file.blob_oid,
                     projection_digest: Some(digest),
                     csharp_decision: file.decision,
+                    file_present: None,
                 })
                 .collect::<Vec<_>>();
             for input in &configuration {
@@ -3289,6 +4299,14 @@ impl AnalyzerStore {
                 &refusals,
                 &foreign_source_paths,
             )?;
+            let head_before = tx
+                .query_row(
+                    "SELECT revision FROM workspace_heads
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+                    params![workspace_id.as_str(), lang, generation.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
             let (snapshot, inserted) = workspace_inputs::replace_workspace_input_partitions(
                 &tx,
                 &workspace_id,
@@ -3308,14 +4326,195 @@ impl AnalyzerStore {
                 ],
                 &refusal_changes,
             )?;
+            let mut published_ids = crate::hash::HashSet::default();
             for ((kind, path), id) in inserted {
                 if kind == workspace_inputs::WorkspaceInputKind::Source {
-                    insert_workspace_file_projection_rows(&tx, id, &projections[path.as_str()])?;
+                    published_ids.insert(id);
+                    insert_workspace_file_projection_rows(
+                        &tx,
+                        id,
+                        &projections[path.as_str()],
+                        inventories.get(&path),
+                    )?;
                 }
             }
+            // A digest-equal open version kept its row, so it carries the
+            // inventory of the sync that published it. Refill the ones whose
+            // stored evidence is gone or was incomplete.
+            let refillable = tx
+                .prepare_cached(DEFINITION_INVENTORY_REFILLABLE_SQL)?
+                .query_map(params![workspace_id.as_str(), lang, generation.0], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (id, path) in refillable {
+                if !published_ids.contains(&id)
+                    && let Some(inventory) = inventories.get(&path)
+                {
+                    refill_definition_inventory_in_place(&tx, id, inventory)?;
+                }
+            }
+            // The certificate belongs to a revision for good, and only the
+            // transaction that opened a revision writes one. A call that found
+            // the head unchanged left a revision readers can already select,
+            // so a listing that differs from the one stored there, as when a
+            // symlink appeared while the process was down, opens a new revision.
+            let snapshot = match &rust_listing {
+                Some(listing) => {
+                    publish_rust_listing_certificate(&tx, snapshot, head_before, listing)?
+                }
+                None => snapshot,
+            };
             tx.commit()?;
             Ok(snapshot)
         })
+    }
+
+    /// Missing or stale derivations fail closed.
+    pub fn rust_source_listing_complete(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        derivation_version: i64,
+    ) -> Result<bool> {
+        let conn = self.read_conn()?;
+        Self::rust_source_listing_complete_on_connection(&conn, snapshot, derivation_version)
+    }
+
+    /// The same answer on a caller's bound connection.
+    pub fn rust_source_listing_complete_on_connection(
+        conn: &rusqlite::Connection,
+        snapshot: &WorkspaceSnapshotId,
+        derivation_version: i64,
+    ) -> Result<bool> {
+        assert_eq!(snapshot.lang, "rust");
+        conn.query_row(
+            "SELECT complete FROM rust_source_listing_certificates
+                 WHERE workspace_id=?1 AND lang=?2 AND generation=?3
+                   AND revision=?4 AND derivation_version=?5",
+            rusqlite::params![
+                snapshot.workspace_id.0,
+                snapshot.lang,
+                snapshot.generation.0,
+                snapshot.revision,
+                derivation_version
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(Into::into)
+    }
+
+    /// The version gate makes stale failure sets unavailable to incremental updates.
+    pub fn rust_source_listing_failures(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        derivation_version: i64,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        Self::rust_source_listing_failures_on(&tx, snapshot, derivation_version)
+    }
+
+    fn rust_source_listing_failures_on(
+        conn: &rusqlite::Connection,
+        snapshot: &WorkspaceSnapshotId,
+        derivation_version: i64,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM rust_source_listing_certificates
+                 WHERE workspace_id=?1 AND lang=?2 AND generation=?3
+                   AND revision=?4 AND derivation_version=?5
+             )",
+            rusqlite::params![
+                snapshot.workspace_id.0,
+                snapshot.lang,
+                snapshot.generation.0,
+                snapshot.revision,
+                derivation_version
+            ],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, reason FROM rust_source_listing_failures
+             WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    snapshot.workspace_id.0,
+                    snapshot.lang,
+                    snapshot.generation.0,
+                    snapshot.revision
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some(rows))
+    }
+
+    /// Certify the listing of an update that publishes no file or
+    /// configuration input, and return the snapshot that carries it. An update
+    /// that does publish passes its certificate to its last publication
+    /// (`replace_path_symbol_unit` or `replace_configuration_input`), which
+    /// writes it in the transaction that opens the revision. The earlier
+    /// publications of that update carry none: their revisions lack the later
+    /// changes, so the update's certificate does not describe them.
+    ///
+    /// A revision's certificate is written once, by the transaction that opens
+    /// the revision, and never changes: a snapshot taken at it reads the same
+    /// certificate for as long as it lives, and answers retained against its
+    /// binding stay true. `snapshot` is already the head that readers can
+    /// select, so a certificate that is not identical to the one stored there
+    /// (none stored included) opens a new revision, which changes no file
+    /// version, and the returned snapshot names it. The caller installs that
+    /// snapshot.
+    pub fn publish_rust_source_listing(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+        derivation_version: i64,
+        failures: Vec<(String, String)>,
+    ) -> Result<WorkspaceSnapshotId> {
+        assert_eq!(snapshot.lang, "rust");
+        let snapshot = snapshot.clone();
+        self.execute_selection_publication(move |conn| {
+            let tx = conn.transaction()?;
+            let head: i64 = tx.query_row(
+                "SELECT revision FROM workspace_heads
+                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+                params![
+                    snapshot.workspace_id.as_str(),
+                    snapshot.lang,
+                    snapshot.generation.0
+                ],
+                |row| row.get(0),
+            )?;
+            if head != snapshot.revision {
+                return Err(StoreError::new(format!(
+                    "workspace revision conflict for rust: analyzer has {}, head is {head}",
+                    snapshot.revision
+                )));
+            }
+            let certified = certify_rust_listing(&tx, &snapshot, derivation_version, &failures)?;
+            tx.commit()?;
+            Ok(certified)
+        })
+    }
+
+    /// Whether two snapshots of one workspace carry different listing
+    /// certificates. A revision opened only to carry a certificate differs from
+    /// its predecessor in revision number but not necessarily in certificate.
+    pub fn rust_listing_certificates_differ(
+        &self,
+        left: &WorkspaceSnapshotId,
+        right: &WorkspaceSnapshotId,
+    ) -> Result<bool> {
+        let conn = self.read_conn()?;
+        Ok(rust_listing_certificate_at(&conn, left)? != rust_listing_certificate_at(&conn, right)?)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3534,41 +4733,41 @@ impl AnalyzerStore {
             return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
         }
         let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let mut rows = Vec::new();
-        for lang in langs {
-            for (sql, name) in std::iter::once((EXACT_PATH_SYMBOL_FQN_SQL, exact_fqn)).chain(
-                (normalized_fqn != exact_fqn)
-                    .then_some((NORMALIZED_PATH_SYMBOL_FQN_SQL, normalized_fqn)),
-            ) {
-                let remaining = limit - rows.len();
-                if remaining == 0 {
-                    return Ok(LimitedQueryRows::incomplete(rows, limit));
-                }
-                let sql = format!("{sql} LIMIT ?3");
-                let mut statement = tx.prepare_cached(&sql)?;
-                let mut source = statement.query(params![
-                    lang,
-                    name,
-                    i64::try_from(remaining).unwrap_or(i64::MAX)
-                ])?;
-                loop {
-                    if !continue_query() {
-                        let inspected = rows.len();
-                        return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        conn.with_read_transaction(|tx| {
+            require_generation_map(tx, generations, langs.iter().map(String::as_str))?;
+            let mut rows = Vec::new();
+            for lang in langs {
+                for (sql, name) in std::iter::once((EXACT_PATH_SYMBOL_FQN_SQL, exact_fqn)).chain(
+                    (normalized_fqn != exact_fqn)
+                        .then_some((NORMALIZED_PATH_SYMBOL_FQN_SQL, normalized_fqn)),
+                ) {
+                    let remaining = limit - rows.len();
+                    if remaining == 0 {
+                        return Ok(LimitedQueryRows::incomplete(rows, limit));
                     }
-                    let Some(row) = source.next()? else { break };
-                    rows.push((row.get::<_, String>(0)?, decode_path_symbol_row(row, 1)?));
+                    let sql = format!("{sql} LIMIT ?3");
+                    let mut statement = tx.prepare_cached(&sql)?;
+                    let mut source = statement.query(params![
+                        lang,
+                        name,
+                        i64::try_from(remaining).unwrap_or(i64::MAX)
+                    ])?;
+                    loop {
+                        if !continue_query() {
+                            let inspected = rows.len();
+                            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+                        }
+                        let Some(row) = source.next()? else { break };
+                        rows.push((row.get::<_, String>(0)?, decode_path_symbol_row(row, 1)?));
+                    }
                 }
             }
-        }
-        tx.commit()?;
-        let inspected = rows.len();
-        Ok(if inspected == limit {
-            LimitedQueryRows::incomplete(rows, inspected)
-        } else {
-            LimitedQueryRows::complete(rows, inspected)
+            let inspected = rows.len();
+            Ok(if inspected == limit {
+                LimitedQueryRows::incomplete(rows, inspected)
+            } else {
+                LimitedQueryRows::complete(rows, inspected)
+            })
         })
     }
 
@@ -3621,9 +4820,47 @@ impl AnalyzerStore {
         Ok(results)
     }
 
+    /// The replacement of one path with no definition-inventory evidence: its
+    /// projection is published unknown.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)]
     pub fn replace_path_symbol_unit(
+        &self,
+        workspace_id: &WorkspaceId,
+        base_snapshots: &WorkspaceSnapshots,
+        storage_langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        rel_path: &str,
+        file_replacement: Option<(&str, Oid, Option<FileVersionDecision>)>,
+        path_symbol_replacement: Option<(&str, &PathSymbolRow)>,
+        packages: &[String],
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
+        refusal: Option<(&str, &WorkspaceSourceRefusalRow)>,
+        rust_listing: Option<&(i64, Vec<(String, String)>)>,
+    ) -> Result<WorkspaceSnapshots> {
+        self.replace_path_symbol_unit_with_inventory(
+            workspace_id,
+            base_snapshots,
+            storage_langs,
+            generations,
+            rel_path,
+            file_replacement,
+            path_symbol_replacement,
+            packages,
+            package_files,
+            package_edges,
+            anchors,
+            None,
+            refusal,
+            rust_listing,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn replace_path_symbol_unit_with_inventory(
         &self,
         workspace_id: &WorkspaceId,
         base_snapshots: &WorkspaceSnapshots,
@@ -3636,8 +4873,14 @@ impl AnalyzerStore {
         package_files: &[WorkspacePackageFileRow],
         package_edges: &[WorkspacePackageEdgeRow],
         anchors: &[WorkspaceAnchorRow],
+        inventory: Option<&WorkspaceFileDefinitionInventory>,
         refusal: Option<(&str, &WorkspaceSourceRefusalRow)>,
+        rust_listing: Option<&(i64, Vec<(String, String)>)>,
     ) -> Result<WorkspaceSnapshots> {
+        assert!(
+            rust_listing.is_none() || storage_langs == ["rust"],
+            "only a Rust analyzer publishes a listing certificate: {storage_langs:?}"
+        );
         assert!(
             file_replacement
                 .is_none_or(|(lang, _, decision)| decision.is_none() || lang == "csharp"),
@@ -3660,6 +4903,8 @@ impl AnalyzerStore {
         let package_files = package_files.to_vec();
         let package_edges = package_edges.to_vec();
         let anchors = anchors.to_vec();
+        let inventory = inventory.cloned();
+        let rust_listing = rust_listing.cloned();
         self.execute_selection_publication(move |conn| {
             let storage_langs = storage_langs.as_slice();
             let workspace_id_text = workspace_id.as_str();
@@ -3710,6 +4955,7 @@ impl AnalyzerStore {
                                 row.get::<_, i64>(0)?,
                                 row.get::<_, String>(1)?,
                                 csharp_compilation::decode_file_decision(row, 2)?,
+                                row.get::<_, Option<String>>(4)?,
                             ))
                         },
                     )
@@ -3736,16 +4982,20 @@ impl AnalyzerStore {
                     .as_ref()
                     .map(|file| workspace_file_projection_digest(file, &replacement_projection));
                 let decision = replacement_file.as_ref().and_then(|file| file.decision);
-                let changed = old.as_ref().map(|(_, digest, _)| digest.as_str())
-                    != new_digest.as_deref()
-                    || old.as_ref().and_then(|(_, _, decision)| *decision) != decision;
-                let closed = old.as_ref().filter(|_| changed).map(|(id, _, _)| *id);
+                let inventory = inventory.as_ref().filter(|_| {
+                    file_replacement
+                        .is_some_and(|(replacement_lang, _, _)| replacement_lang == lang)
+                });
+                let changed =
+                    open_file_version_changed(old.as_ref(), new_digest.as_deref(), decision);
+                let closed = old.as_ref().filter(|_| changed).map(|(id, _, _, _)| *id);
                 let replacement = replacement_file.as_ref().filter(|_| changed).map(|file| {
                     workspace_inputs::WorkspaceInputRow {
                         relative_path: rel_path,
                         content_oid: file.blob_oid,
                         projection_digest: new_digest.as_deref(),
                         csharp_decision: decision,
+                        file_present: None,
                     }
                 });
                 let replacements = replacement
@@ -3772,13 +5022,95 @@ impl AnalyzerStore {
                     &refusal_changes,
                 )?;
                 for id in inserted.into_values() {
-                    insert_workspace_file_projection_rows(&tx, id, &replacement_projection)?;
+                    insert_workspace_file_projection_rows(
+                        &tx,
+                        id,
+                        &replacement_projection,
+                        inventory,
+                    )?;
                 }
+                if !changed
+                    && let Some((id, _, _, state)) = old.as_ref()
+                    && definition_inventory_refillable(state.as_deref())
+                    && let Some(inventory) = inventory
+                {
+                    refill_definition_inventory_in_place(&tx, *id, inventory)?;
+                }
+                let snapshot = match &rust_listing {
+                    Some(listing) => publish_rust_listing_certificate(
+                        &tx,
+                        snapshot,
+                        Some(head_revision),
+                        listing,
+                    )?,
+                    None => snapshot,
+                };
                 snapshots.insert(lang.clone(), snapshot);
             }
             tx.commit()?;
             Ok(snapshots)
         })
+    }
+
+    /// Whether [`Self::replace_path_symbol_unit_with_inventory`] with the same
+    /// replacement would store an inventory: it publishes a new file version,
+    /// or the open one is digest-equal with a refillable state. A no-op update
+    /// needs none, so the producer derives no names for it. Read outside the
+    /// publication transaction; a stale answer can only leave a version stored
+    /// unknown, which fails closed.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub fn path_symbol_unit_needs_inventory(
+        &self,
+        workspace_id: &WorkspaceId,
+        generations: &HashMap<String, GenerationId>,
+        rel_path: &str,
+        file_replacement: Option<(&str, Oid, Option<FileVersionDecision>)>,
+        path_symbol_replacement: Option<(&str, &PathSymbolRow)>,
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
+    ) -> Result<bool> {
+        let Some((lang, blob_oid, decision)) = file_replacement else {
+            return Ok(false);
+        };
+        let generation = generations
+            .get(lang)
+            .copied()
+            .ok_or_else(|| StoreError::new(format!("missing captured generation for {lang}")))?;
+        let conn = self.read_conn()?;
+        let old = conn
+            .query_row(
+                OPEN_FILE_VERSION_DECISION_SQL,
+                params![workspace_id.as_str(), lang, generation.0, rel_path],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        csharp_compilation::decode_file_decision(row, 2)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let file = WorkspaceFileRow {
+            decision,
+            rel_path: rel_path.to_string(),
+            blob_oid,
+        };
+        let symbols = path_symbol_replacement
+            .filter(|(replacement_lang, _)| *replacement_lang == lang)
+            .map(|(_, row)| std::slice::from_ref(row))
+            .unwrap_or_default();
+        let projection =
+            workspace_file_projection(rel_path, symbols, package_files, package_edges, anchors);
+        let digest = workspace_file_projection_digest(&file, &projection);
+        Ok(
+            open_file_version_changed(old.as_ref(), Some(&digest), decision)
+                || old.as_ref().is_some_and(|(_, _, _, state)| {
+                    definition_inventory_refillable(state.as_deref())
+                }),
+        )
     }
 
     /// Publish one changed configuration input at the next revision of every
@@ -3794,10 +5126,16 @@ impl AnalyzerStore {
         storage_langs: &[String],
         generations: &HashMap<String, GenerationId>,
         input: WorkspaceConfigurationInput,
+        rust_listing: Option<&(i64, Vec<(String, String)>)>,
     ) -> Result<(
         WorkspaceSnapshots,
         crate::analyzer::semantic::ids::StableDigest,
     )> {
+        assert!(
+            rust_listing.is_none() || storage_langs == ["rust"],
+            "only a Rust analyzer publishes a listing certificate: {storage_langs:?}"
+        );
+        let rust_listing = rust_listing.cloned();
         let workspace_id = workspace_id.clone();
         let base_snapshots = base_snapshots.clone();
         let storage_langs = storage_langs.to_vec();
@@ -3852,32 +5190,46 @@ impl AnalyzerStore {
                 )?;
                 let rows = tx
                     .prepare_cached(
-                        "SELECT rel_path, blob_oid FROM workspace_file_versions
+                        "SELECT rel_path, blob_oid, file_present FROM workspace_file_versions
                          WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
                            AND input_kind = 'configuration' AND valid_until IS NULL
                          ORDER BY rel_path",
                     )?
                     .query_map(params![workspace_id.as_str(), lang, generation.0], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<bool>>(2)?,
+                        ))
                     })?
                     .map(|row| {
-                        let (path, oid) = row?;
+                        let (path, oid, present) = row?;
                         let oid = Oid::from_str(&oid).map_err(|error| {
                             StoreError::new(format!(
                                 "invalid configuration oid {oid:?} at {path:?}: {error}"
                             ))
                         })?;
-                        Ok((path, oid))
+                        Ok((path, oid, present))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let lang_digest = workspace_inputs::configuration_digest(
-                    rows.iter().map(|(path, oid)| (path.as_str(), *oid)),
+                    rows.iter()
+                        .map(|(path, oid, present)| (path.as_str(), *oid, *present)),
                 );
                 assert!(
                     digest.is_none_or(|digest| digest == lang_digest),
                     "storage languages of one analyzer share its configuration: {rows:?}"
                 );
                 digest = Some(lang_digest);
+                let snapshot = match &rust_listing {
+                    Some(listing) => publish_rust_listing_certificate(
+                        &tx,
+                        snapshot,
+                        Some(head_revision),
+                        listing,
+                    )?,
+                    None => snapshot,
+                };
                 snapshots.insert(lang.clone(), snapshot);
             }
             tx.commit()?;
@@ -3886,11 +5238,27 @@ impl AnalyzerStore {
         })
     }
 
-    pub fn open_for_workspace(workspace_root: &Path) -> Result<Self> {
+    /// Share the store-owned, budget-charged artifact digest region.
+    pub fn content_digests(&self) -> brokk_bifrost_core::content_digest::ContentDigestCache {
+        self.content_digests.clone()
+    }
+
+    pub fn retention_budget(&self) -> &brokk_bifrost_core::retention_budget::RetentionBudget {
+        &self.retention_budget
+    }
+
+    pub fn open_for_workspace(
+        workspace_root: &Path,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Result<Self> {
         if gitblob::discover(workspace_root).is_some() {
-            Self::open_persistent(&analyzer_db_path(workspace_root))
+            Self::open_persistent_with_config(
+                &analyzer_db_path(workspace_root),
+                &Default::default(),
+                budget,
+            )
         } else {
-            Self::open_ephemeral()
+            Self::open_ephemeral_with_config(&Default::default(), budget)
         }
     }
 
@@ -3899,7 +5267,8 @@ impl AnalyzerStore {
         reader_source: Option<PathBuf>,
         db_path: Option<PathBuf>,
         ephemeral: Option<EphemeralDb>,
-        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        _config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Self {
         resolution_lexical::register_resolution_identity_functions(&conn)
             .expect("configure resolution identity SQL functions");
@@ -3916,8 +5285,12 @@ impl AnalyzerStore {
             writer_selection: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            unit_tail_blob_reads: std::sync::atomic::AtomicUsize::new(0),
             writer_resolution_selection: Mutex::new(None),
-            cache_budget: cache_budget::StoreCacheBudget::new(config.store_cache_budget_bytes()),
+            cache_budget: cache_budget::StoreCacheBudget::new(budget),
+            retention_budget: budget.clone(),
+            content_digests: brokk_bifrost_core::content_digest::ContentDigestCache::new(budget),
             #[cfg(any(test, feature = "test-support"))]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path,
@@ -3931,6 +5304,8 @@ impl AnalyzerStore {
             parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             parsed_blob_point_contains_queries: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            parsed_blob_membership_keys: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             replacement_cost_lookup_queries: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -3948,13 +5323,23 @@ impl AnalyzerStore {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    /// Test convenience. Production owners pass their shared budget to
+    /// `open_persistent_with_config`.
     pub fn open_persistent(db_path: &Path) -> Result<Self> {
-        Self::open_persistent_with_config(db_path, &Default::default())
+        {
+            let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+                config.retention_budget_bytes(),
+            );
+            Self::open_persistent_with_config(db_path, &config, &budget)
+        }
     }
 
     pub fn open_persistent_with_config(
         db_path: &Path,
-        config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        _config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<Self> {
         let (conn, reader_source) = StoreWriter::persistent(db_path)?;
         Ok(Self {
@@ -3965,8 +5350,12 @@ impl AnalyzerStore {
             writer_selection: Arc::new(Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             crate_statement_counter: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            unit_tail_blob_reads: std::sync::atomic::AtomicUsize::new(0),
             writer_resolution_selection: Mutex::new(None),
-            cache_budget: cache_budget::StoreCacheBudget::new(config.store_cache_budget_bytes()),
+            cache_budget: cache_budget::StoreCacheBudget::new(budget),
+            retention_budget: budget.clone(),
+            content_digests: brokk_bifrost_core::content_digest::ContentDigestCache::new(budget),
             #[cfg(any(test, feature = "test-support"))]
             workspace_selection_counters: WorkspaceSelectionCounters::default(),
             db_path: Some(db_path.to_path_buf()),
@@ -3980,6 +5369,8 @@ impl AnalyzerStore {
             parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             parsed_blob_point_contains_queries: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            parsed_blob_membership_keys: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             replacement_cost_lookup_queries: Arc::new(AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
@@ -3997,6 +5388,7 @@ impl AnalyzerStore {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     /// Ephemeral (non-git) workspace store.
     ///
     /// Backed by a delete-on-drop temp *file* rather than `:memory:` so the
@@ -4007,20 +5399,30 @@ impl AnalyzerStore {
     /// workspace identity", which is exactly what an ephemeral store is,
     /// independent of the on-disk backing.
     ///
-    /// Documented fallback: if the temp-file backing cannot be established on
-    /// this platform, fall back to a single in-memory connection whose reads
-    /// route through the writer (no read parallelism, but correct).
+    /// A temp-file failure is returned. There is no single-connection memory
+    /// fallback: reads on that connection re-enter the writer mutex while the
+    /// caller still holds it, which hangs instead of reporting the failure.
+    /// Test convenience. Production owners pass their shared budget to
+    /// `open_ephemeral_with_config`.
     pub fn open_ephemeral() -> Result<Self> {
-        Self::open_ephemeral_with_config(&Default::default())
+        {
+            let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+                config.retention_budget_bytes(),
+            );
+            Self::open_ephemeral_with_config(&config, &budget)
+        }
     }
 
+    /// The store requires a delete-on-drop temp file so its reader pool can
+    /// open independent read-only connections. A failure to establish that
+    /// file is returned to the caller; it is never replaced by the test-only
+    /// single-connection store, whose nested reads deadlock.
     pub fn open_ephemeral_with_config(
         config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<Self> {
-        match Self::open_ephemeral_temp_file(config) {
-            Ok(store) => Ok(store),
-            Err(_) => Self::open_in_memory_single_connection_with_config(config),
-        }
+        Self::open_ephemeral_temp_file(config, budget)
     }
 
     #[doc(hidden)]
@@ -4119,8 +5521,9 @@ impl AnalyzerStore {
 
     fn open_ephemeral_temp_file(
         config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<Self> {
-        let path = unique_temp_db_path();
+        let path = unique_temp_db_path()?;
         let conn = crate::cache_db::open_unified_connection(&path).map_err(StoreError::new)?;
         let Some(resolved) = reader_source_path(&conn) else {
             return Err(StoreError::new(
@@ -4133,22 +5536,37 @@ impl AnalyzerStore {
             None,
             Some(EphemeralDb { path: resolved }),
             config,
+            budget,
         ))
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
+    /// Test-only single-connection store. Production ephemeral stores use
+    /// `open_ephemeral_with_config`, whose reader pool needs a temp file.
+    /// Test convenience. Production owners pass their shared budget to
+    /// `open_in_memory_single_connection_with_config`.
     pub fn open_in_memory_single_connection() -> Result<Self> {
-        Self::open_in_memory_single_connection_with_config(&Default::default())
+        {
+            let config = brokk_bifrost_core::analyzer::config::AnalyzerConfig::default();
+            let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+                config.retention_budget_bytes(),
+            );
+            Self::open_in_memory_single_connection_with_config(&config, &budget)
+        }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
     pub fn open_in_memory_single_connection_with_config(
         config: &brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
     ) -> Result<Self> {
         let mut conn = crate::cache_db::open_in_memory_store_connection()?;
         crate::cache_db::configure_connection(&mut conn).map_err(StoreError::new)?;
         crate::cache_db::migrate(&mut conn).map_err(StoreError::new)?;
         // `reader_source = None` routes reads back through the writer connection.
-        Ok(Self::from_parts(conn, None, None, None, config))
+        Ok(Self::from_parts(conn, None, None, None, config, budget))
     }
 
     /// Decode language-owned source rows in one generation-checked snapshot.
@@ -4158,7 +5576,7 @@ impl AnalyzerStore {
         &self,
         lang: &str,
         generation: GenerationId,
-        decode: impl FnOnce(&Transaction<'_>) -> Result<T>,
+        decode: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
@@ -4170,10 +5588,16 @@ impl AnalyzerStore {
 
     /// Check out a read-only connection for a pure-SELECT method. Pooled readers
     /// run concurrently against WAL snapshots; the writer connection is never
-    /// taken by these paths (except in the in-memory single-connection
-    /// fallback, where `source` is `None`).
+    /// taken by these paths (except in the test-only in-memory
+    /// single-connection store, where `source` is `None`).
     #[doc(hidden)]
     pub fn read_conn(&self) -> Result<ReaderGuard<'_>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if nested_lend::active(self.conn.reader_exclusion_identity()) {
+            // This checkout has no requested snapshot. The lent connection
+            // already carries the selected operation's workspace selection.
+            return self.checkout_read_conn();
+        }
         let conn = self.checkout_read_conn()?;
         #[cfg(any(test, feature = "test-support"))]
         let conn = {
@@ -4207,12 +5631,101 @@ impl AnalyzerStore {
         &self,
         snapshots: &WorkspaceSnapshots,
     ) -> Result<ReaderGuard<'_>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if nested_lend::active(self.conn.reader_exclusion_identity()) {
+            let conn = self.checkout_read_conn()?;
+            let installed: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_temp_master WHERE type='table' AND name='selected_workspace_revisions')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !installed {
+                return Err(Self::lend_snapshot_error());
+            }
+            let installed_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM temp.selected_workspace_revisions",
+                [],
+                |row| row.get(0),
+            )?;
+            if installed_count != snapshots.len() as i64 {
+                return Err(Self::lend_snapshot_error());
+            }
+            let mut statement = conn.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM temp.selected_workspace_revisions WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4)",
+            )?;
+            for snapshot in snapshots.values() {
+                let matches: bool = statement.query_row(
+                    params![
+                        snapshot.workspace_id.as_str(),
+                        snapshot.lang,
+                        snapshot.generation.0,
+                        snapshot.revision
+                    ],
+                    |row| row.get(0),
+                )?;
+                if !matches {
+                    return Err(Self::lend_snapshot_error());
+                }
+            }
+            drop(statement);
+            return Ok(conn);
+        }
         let mut conn = self.checkout_read_conn()?;
         self.select_workspace_snapshots(&mut conn, snapshots)?;
         Ok(conn)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    fn lend_snapshot_error() -> StoreError {
+        StoreError {
+            message: "different snapshot under selected-operation lend".into(),
+            kind: StoreErrorKind::SelectedLendSnapshotMismatch,
+            missing_required_source_facts: false,
+        }
+    }
+
+    /// In test-support single-connection stores, run callbacks with the selected reader.
+    /// Production stores use pooled readers, so callbacks run directly.
+    /// Nested workspace reads are admitted only for exactly the operation's installed
+    /// selection; a subset request fails closed. A nested guard must be dropped before
+    /// the callback returns; scope exit
+    /// aborts if one escapes because it borrows the selected connection.
+    #[doc(hidden)]
+    pub fn lend_selected_reader<T>(&self, connection: &Connection, f: impl FnOnce() -> T) -> T {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if self.uses_single_connection_reads() {
+                let _scope =
+                    nested_lend::Scope::new(self.conn.reader_exclusion_identity(), connection);
+                return f();
+            }
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = connection;
+        f()
+    }
+
     fn checkout_read_conn(&self) -> Result<ReaderGuard<'_>> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.uses_single_connection_reads() {
+            let writer = self.conn.reader_exclusion_identity();
+            // Selected callbacks stay on this thread. Graph/reverse stages avoid
+            // workers on single-connection stores, and worker transports reject
+            // them. Independent threads have no local lend and wait on the writer.
+            if let Some(connection) = nested_lend::borrow(writer) {
+                return Ok(ReaderGuard {
+                    cache_budget: &self.cache_budget,
+                    inner: ReaderConn::NestedReader {
+                        connection,
+                        writer,
+                        _thread: std::marker::PhantomData,
+                    },
+                    checkin: CheckinPlan::Reusable,
+                    query_planner_stability_on_checkin: None,
+                    restore_reader_mmap_on_checkin: false,
+                });
+            }
+        }
         let conn = if self.streaming_read_active() {
             self.read_conn_from_pool(
                 &self.streaming_readers,
@@ -4228,8 +5741,9 @@ impl AnalyzerStore {
     }
 
     /// A publication job may commit before returning an error. Invalidate the
-    /// writer fallback while its connection is still held, even in that case:
-    /// SQLite data_version excludes commits made by the connection itself.
+    /// test-only writer-backed reader selection while its connection is still
+    /// held, even in that case: SQLite data_version excludes commits made by
+    /// the connection itself.
     #[doc(hidden)]
     pub fn execute_selection_publication<T, F>(&self, job: F) -> T
     where
@@ -4268,7 +5782,7 @@ impl AnalyzerStore {
     ///
     /// Reads normally take a pooled reader; this is for the ephemeral store's
     /// own writer-connection queries, which hold that connection already. The
-    /// selection it leaves behind is the one the writer-backed reader fallback
+    /// selection it leaves behind is the one the test-only writer-backed reader
     /// then sees.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
@@ -4310,7 +5824,13 @@ impl AnalyzerStore {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let changes_before = conn.total_changes();
         let tx = conn.unchecked_transaction()?;
-        tx.execute_batch("DELETE FROM temp.selected_rust_unit_closure; DELETE FROM temp.selected_rust_unit_summaries;")?;
+        tx.execute_batch("DELETE FROM temp.selected_rust_unit_closure;")?;
+        selected_summary_write(
+            SelectedSummaryWriteTarget::Now(&tx),
+            SelectedSummaryWrite::ClearRows,
+            None,
+            false,
+        )?;
         tx.prepare_cached("DELETE FROM temp.selected_workspace_revisions")?
             .execute([])?;
         {
@@ -4343,6 +5863,19 @@ impl AnalyzerStore {
             application_changes,
         });
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn idle_resolution_reader_serials_for_test(&self) -> Vec<u64> {
+        self.active_readers
+            .state
+            .lock()
+            .expect("reader pool poisoned")
+            .idle
+            .iter()
+            .map(|reader| reader.serial)
+            .collect()
     }
 
     /// Runs of the revisioned view script, and rewrites of the selection rows.
@@ -4391,9 +5924,9 @@ impl AnalyzerStore {
     }
 
     /// [`Self::active_read_conn_for_resolution`] for a selection opener. The
-    /// in-memory fallback's only connection can be held by another request
-    /// for as long as that request runs, so the wait for it observes
-    /// `cancellation`; `None` means it stopped the wait.
+    /// test-only single-connection store's only connection can be held by
+    /// another request for as long as that request runs, so the wait for it
+    /// observes `cancellation`; `None` means it stopped the wait.
     fn cancellable_read_conn_for_resolution(
         &self,
         key: &resolution_selection::RetainedResolutionSelectionKey,
@@ -4431,6 +5964,11 @@ impl AnalyzerStore {
                     }) {
                         Ok(conn) => SelectedReader {
                             conn,
+                            #[cfg(any(test, feature = "test-support"))]
+                            serial: NEXT_POOLED_READER_SERIAL
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                            pooled_after_clear: false,
+                            macro_frontier: None,
                             selection: None,
                             resolution_selection: None,
                             statistics_epoch,
@@ -4443,14 +5981,14 @@ impl AnalyzerStore {
                     },
                 };
                 Ok(ReaderGuard {
+                    cache_budget: &self.cache_budget,
                     inner: ReaderConn::Pooled {
                         pool,
                         reader: Some(reader),
                     },
-                    checkin_cleanup: None,
+                    checkin: CheckinPlan::Reusable,
                     query_planner_stability_on_checkin: None,
                     restore_reader_mmap_on_checkin: false,
-                    reusable: true,
                 })
             }
             None => {
@@ -4460,17 +5998,18 @@ impl AnalyzerStore {
         }
     }
 
-    /// The in-memory fallback's reader around a held writer connection.
+    /// The test-only single-connection store's reader around a held writer
+    /// connection.
     fn writer_reader_guard<'a>(
         &'a self,
         conn: std::sync::MutexGuard<'a, Connection>,
     ) -> ReaderGuard<'a> {
         ReaderGuard {
+            cache_budget: &self.cache_budget,
             inner: self.writer_reader_conn(conn),
-            checkin_cleanup: None,
+            checkin: CheckinPlan::Reusable,
             query_planner_stability_on_checkin: None,
             restore_reader_mmap_on_checkin: false,
-            reusable: true,
         }
     }
 
@@ -4529,6 +6068,19 @@ impl AnalyzerStore {
         self.db_path.as_deref()
     }
 
+    /// Commit on the writer so a pooled reader observes a new main.data_version.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn advance_data_version_for_test(&self) {
+        self.conn.execute(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS macro_frontier_data_version_probe(value INTEGER); \
+                 INSERT INTO macro_frontier_data_version_probe(value) VALUES(1)",
+            )
+            .expect("test writer must advance main.data_version");
+        });
+    }
+
     pub fn is_ephemeral(&self) -> bool {
         self.db_path.is_none()
     }
@@ -4538,9 +6090,8 @@ impl AnalyzerStore {
         self.conn.execute(move |conn| {
             let tx = conn.transaction()?;
             {
-                let mut remove_stale = tx.prepare(
-                    "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?4 AND generation <> ?3",
-                )?;
+                let _cascade = sealed_families::CascadeDelete::new(&tx);
+                let mut remove_stale = tx.prepare(STALE_BLOB_DELETE_SQL)?;
                 let mut insert = tx.prepare(
                     "INSERT OR IGNORE INTO blobs(blob_oid, lang, generation, parse_variant) VALUES(?1, ?2, ?3, ?4)",
                 )?;
@@ -4567,7 +6118,12 @@ impl AnalyzerStore {
                                 params![key.oid.to_string(), key.lang, generation.0, key.variant],
                             )?;
                         }
-                        remove_stale.execute(params![key.oid.to_string(), key.lang, generation.0, key.variant])?;
+                        let removed = remove_stale
+                            .query_map(params![key.oid.to_string(), key.lang, generation.0, key.variant], |row| row.get::<_, i64>(0))?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        for removed_generation in removed {
+                            brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(&tx, &key.oid.to_string(), &key.lang, removed_generation, key.variant)?;
+                        }
                         insert.execute(params![key.oid.to_string(), key.lang, generation.0, key.variant])?;
                     }
                 }
@@ -4635,7 +6191,7 @@ impl AnalyzerStore {
     }
 
     fn current_blob_key_statement<'conn>(
-        tx: &'conn Transaction<'_>,
+        tx: &'conn Connection,
     ) -> Result<rusqlite::Statement<'conn>> {
         Ok(tx.prepare(
             "SELECT 1 FROM blobs
@@ -4704,6 +6260,24 @@ impl AnalyzerStore {
         semantic_language: Language,
         semantic_ir_epoch: Option<&str>,
     ) -> Result<Vec<MissingCompleteAnalysisBlob>> {
+        self.missing_published_complete_analysis_blob_keys_at_generations_for_epoch(
+            requests,
+            generations,
+            semantic_language,
+            resolution::resolution_bundle_epoch(semantic_language),
+            semantic_ir_epoch,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn missing_published_complete_analysis_blob_keys_at_generations_for_epoch(
+        &self,
+        requests: &[CompleteAnalysisBlobRequest],
+        generations: &HashMap<String, GenerationId>,
+        semantic_language: Language,
+        resolution_epoch: &'static str,
+        semantic_ir_epoch: Option<&str>,
+    ) -> Result<Vec<MissingCompleteAnalysisBlob>> {
         assert_ne!(semantic_language, Language::None);
         let mut storage_languages = HashSet::default();
         for request in requests {
@@ -4716,7 +6290,11 @@ impl AnalyzerStore {
             );
         }
         for storage_language in &storage_languages {
-            self.ensure_resolution_producer_epoch(storage_language, semantic_language)?;
+            self.ensure_resolution_producer_epoch_value(
+                storage_language,
+                semantic_language,
+                resolution_epoch,
+            )?;
             if let Some(epoch) = semantic_ir_epoch {
                 self.ensure_semantic_ir_producer_epoch(storage_language, epoch)?;
             }
@@ -4740,9 +6318,12 @@ impl AnalyzerStore {
                     )
                 }),
             )?;
-            let expected_epoch = resolution::resolution_bundle_epoch(semantic_language);
             for storage_language in storage_languages {
-                resolution::require_active_resolution_epoch(&tx, storage_language, expected_epoch)?;
+                resolution::require_active_resolution_epoch(
+                    &tx,
+                    storage_language,
+                    resolution_epoch,
+                )?;
             }
         }
         let missing =
@@ -4771,6 +6352,9 @@ impl AnalyzerStore {
         entries: &[BlobKey],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<HashSet<BlobKey>> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.parsed_blob_membership_keys
+            .fetch_add(entries.len(), Ordering::SeqCst);
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(
@@ -4781,6 +6365,11 @@ impl AnalyzerStore {
         let present = parsed_blob_keys_conn(&tx, entries)?;
         tx.commit()?;
         Ok(present)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn take_parsed_blob_membership_keys_for_test(&self) -> usize {
+        self.parsed_blob_membership_keys.swap(0, Ordering::SeqCst)
     }
 
     pub fn contains_blob(&self, key: &BlobKey) -> Result<bool> {
@@ -4823,11 +6412,10 @@ impl AnalyzerStore {
         self.parsed_blob_point_contains_queries
             .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, &key.lang, generation)?;
-        let exists = contains_parsed_blob_conn(&tx, key, read_path_parsed_blob_condition())?;
-        tx.commit()?;
-        Ok(exists)
+        conn.with_read_transaction(|conn| {
+            require_current_generation(conn, &key.lang, generation)?;
+            contains_parsed_blob_conn(conn, key, read_path_parsed_blob_condition())
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4908,19 +6496,21 @@ impl AnalyzerStore {
                         minimum_work_items: work_items,
                     });
                 }
-                let (nodes_json, roles_json, occurrence_roles_json) = tx.query_row(
-                    "SELECT nodes, roles, occurrence_roles
+                let (nodes_json, roles_json, occurrence_roles_json, role_coverage_json) = tx
+                    .query_row(
+                        "SELECT nodes, roles, occurrence_roles, role_coverage
                      FROM structural_source_facts
                      WHERE blob_id = ?1",
-                    [blob_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                )?;
+                        [blob_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )?;
                 let recovered_regions = tx
                     .prepare_cached(STRUCTURAL_RECOVERED_REGIONS_SQL)?
                     .query_map(params![blob_id, callable_kind_codes_json()], |row| {
@@ -4935,7 +6525,7 @@ impl AnalyzerStore {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 tx.commit()?;
                 let decode_error = |family: &str, err: serde_json::Error| {
-                    StoreError::new(format!("invalid persisted structural {family}: {err}"))
+                    StoreError::corrupt(format!("invalid persisted structural {family}: {err}"))
                 };
                 let nodes = decode_structural_nodes(&nodes_json)
                     .map_err(|err| decode_error("nodes", err))?;
@@ -4943,17 +6533,83 @@ impl AnalyzerStore {
                     .map_err(|err| decode_error("roles", err))?;
                 let occurrence_roles = decode_structural_occurrence_roles(&occurrence_roles_json)
                     .map_err(|err| decode_error("occurrence roles", err))?;
+                let role_coverage: Vec<(u32, u8, u8, Option<Vec<u8>>)> =
+                    serde_json::from_str(&role_coverage_json).map_err(|err| {
+                        StoreError::corrupt(format!(
+                            "invalid persisted structural role coverage: {err}"
+                        ))
+                    })?;
+                use brokk_bifrost_core::analyzer::structural::code::VocabularyCode;
+                use brokk_bifrost_core::analyzer::structural::kinds::{
+                    NormalizedKind, Role, RoleCoverageGap,
+                };
+                let span_only_edges = roles
+                    .iter()
+                    .filter(|edge| edge.node.is_none())
+                    .map(|edge| (edge.source_node_id, edge.role))
+                    .collect::<HashSet<_>>();
+                let mut previous = None;
+                for &(owner, role_code, state, ref reasons) in &role_coverage {
+                    let role = Role::from_code(role_code)
+                        .ok_or_else(|| StoreError::corrupt("unknown role coverage role"))?;
+                    let pair = (owner, role);
+                    if previous.is_some_and(|prior| prior >= pair) {
+                        return Err(StoreError::corrupt(
+                            "duplicate or unordered role coverage pair",
+                        ));
+                    }
+                    previous = Some(pair);
+                    let kind = nodes
+                        .get(owner as usize)
+                        .and_then(|node| NormalizedKind::from_code(node.kind))
+                        .ok_or_else(|| StoreError::corrupt("invalid role coverage owner"))?;
+                    if !role.has_coverage() || !role.valid_for(kind) {
+                        return Err(StoreError::corrupt(
+                            "role coverage role invalid for owner kind",
+                        ));
+                    }
+                    match (state, reasons) {
+                        (0, None) => {
+                            if span_only_edges.contains(&(owner, role_code)) {
+                                return Err(StoreError::corrupt(
+                                    "complete role coverage has span-only edge",
+                                ));
+                            }
+                        }
+                        (1, Some(codes)) if !codes.is_empty() => {
+                            let mut previous_code = None;
+                            for &code in codes {
+                                if previous_code.is_some_and(|prior| prior >= code)
+                                    || RoleCoverageGap::from_code(code).is_none()
+                                {
+                                    return Err(StoreError::corrupt(
+                                        "invalid role coverage reason",
+                                    ));
+                                }
+                                previous_code = Some(code);
+                            }
+                        }
+                        _ => {
+                            return Err(StoreError::corrupt(
+                                "invalid role coverage state or reasons",
+                            ));
+                        }
+                    }
+                }
                 if nodes.len() != node_count
                     || roles.len() != role_count
                     || occurrence_roles.len() != occurrence_role_count
                 {
-                    return Ok(StructuralFactRowsRead::Unavailable);
+                    return Err(StoreError::corrupt(
+                        "persisted structural row counts disagree with manifest",
+                    ));
                 }
                 Ok(StructuralFactRowsRead::Ready(PersistedStructuralFacts {
                     source_bytes,
                     nodes,
                     roles,
                     occurrence_roles,
+                    role_coverage,
                     recovered_regions,
                 }))
             });
@@ -4984,11 +6640,23 @@ impl AnalyzerStore {
         let lang = key.lang.clone();
         let variant = key.variant;
         self.conn.execute(move |conn| {
-            conn.execute(
+            let tx = conn.transaction().expect("mark parsed blob incomplete");
+            let oid = key.oid.to_string();
+            tx.execute(
                 "UPDATE blob_meta SET is_complete = 0 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3)",
-                params![key.oid.to_string(), lang, variant],
+                params![oid, lang, variant],
             )
-            .expect("mark parsed blob incomplete")
+            .expect("mark parsed blob incomplete");
+            let generation: i64 = tx
+                .query_row(
+                    "SELECT generation FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
+                    params![oid, lang, variant],
+                    |row| row.get(0),
+                )
+                .expect("the blob row exists");
+            brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(&tx, &oid, &lang, generation)
+                .expect("withdraw the definition inventory of the incomplete blob");
+            tx.commit().expect("mark parsed blob incomplete");
         });
     }
 
@@ -5010,6 +6678,13 @@ impl AnalyzerStore {
     pub fn current_generation(&self, lang: &str) -> Result<GenerationId> {
         let conn = self.read_conn()?;
         current_generation_conn(&conn, lang)
+    }
+
+    /// Check a captured analyzer generation at the end of a cold computation.
+    #[doc(hidden)]
+    pub fn require_current_generation(&self, lang: &str, generation: GenerationId) -> Result<()> {
+        let conn = self.read_conn()?;
+        require_current_generation(&conn, lang, generation)
     }
 
     #[doc(hidden)]
@@ -5070,11 +6745,12 @@ impl AnalyzerStore {
             root.append_fragments(&mut fragments);
             for fragment in fragments {
                 let semantic_language = fragment.resolution.semantic_language();
-                if let Some(existing) = languages.insert(fragment.lang(), semantic_language)
-                    && existing != semantic_language
+                let producer = (semantic_language, fragment.resolution.producer_epoch());
+                if let Some(existing) = languages.insert(fragment.lang(), producer)
+                    && existing != producer
                 {
                     return Err(StoreError::new(format!(
-                        "conflicting semantic languages for prepared storage language {}",
+                        "conflicting resolution producers for prepared storage language {}: {existing:?} and {producer:?}",
                         fragment.lang()
                     )));
                 }
@@ -5087,8 +6763,12 @@ impl AnalyzerStore {
                 }
             }
         }
-        for (storage_language, semantic_language) in languages {
-            self.ensure_resolution_producer_epoch(storage_language, semantic_language)?;
+        for (storage_language, (semantic_language, producer_epoch)) in languages {
+            self.ensure_resolution_producer_epoch_value(
+                storage_language,
+                semantic_language,
+                producer_epoch,
+            )?;
         }
         for (storage_language, producer_epoch) in semantic_ir_epochs {
             self.ensure_semantic_ir_producer_epoch(storage_language, producer_epoch)?;
@@ -5201,11 +6881,10 @@ impl AnalyzerStore {
     ) -> Result<Option<FileState>> {
         let lang = key.lang.as_str();
         let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        let result = hydrate_file_state_conn(&tx, key, adapter, file, source)?;
-        tx.commit()?;
-        Ok(result)
+        conn.with_read_transaction(|conn| {
+            require_current_generation(conn, lang, generation)?;
+            hydrate_file_state_conn(conn, key, adapter, file, source)
+        })
     }
 
     /// Read only the persisted rows required to render a file summary. This
@@ -5322,7 +7001,7 @@ impl AnalyzerStore {
         &self,
         lang: &str,
         generation: GenerationId,
-        read: impl FnOnce(&Transaction<'_>) -> Result<T>,
+        read: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
@@ -7439,17 +9118,8 @@ impl AnalyzerStore {
                 dead
             };
             {
-                let mut del = tx.prepare(
-                    "DELETE FROM blobs
-                 WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
-                   AND generation = COALESCE(
-                     (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
-                   )
-                   AND NOT EXISTS (
-                     SELECT 1 FROM workspace_resolution_content_roots AS roots
-                     WHERE roots.blob_id = blobs.id
-                   )",
-                )?;
+                let _cascade = sealed_families::CascadeDelete::new(&tx);
+                let mut del = tx.prepare(UNROOTED_BLOB_GC_DELETE_SQL)?;
                 for key in &dead {
                     csharp_compilation::extent::before_blob_delete(&tx, key)?;
                     if key.lang == "csharp" {
@@ -7466,7 +9136,12 @@ impl AnalyzerStore {
                             params![key.oid.to_string(), key.lang, key.variant],
                         )?;
                     }
-                    del.execute(params![key.oid.to_string(), key.lang, key.variant])?;
+                    let removed = del
+                        .query_map(params![key.oid.to_string(), key.lang, key.variant], |row| row.get::<_, i64>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    for removed_generation in removed {
+                        brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(&tx, &key.oid.to_string(), &key.lang, removed_generation, key.variant)?;
+                    }
                 }
             }
             tx.commit()?;
@@ -7511,6 +9186,7 @@ impl AnalyzerStore {
                 "DELETE FROM workspace_heads WHERE workspace_id = ?1",
                 params![workspace_id],
             )?;
+            let _cascade = sealed_families::CascadeDelete::new(&tx);
             tx.execute(
                 "DELETE FROM rust_crate_versions WHERE workspace_id = ?1",
                 params![workspace_id],
@@ -7532,6 +9208,8 @@ impl AnalyzerStore {
                 "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
                 params![workspace_id],
             )?;
+            #[cfg(any(test, debug_assertions, feature = "test-support"))]
+            drop(_cascade);
             tx.commit()?;
             Ok(revisions)
         })
@@ -8256,16 +9934,32 @@ impl AnalyzerStore {
         if !keep_going() {
             return Ok(None);
         }
-        let unique = unique_rust_fact_oid_strings(oids);
+        // The scope, route, gate and macro queries must see one snapshot, or
+        // a concurrent republication could mix rows from two blob versions.
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
+        Self::rust_module_route_facts_on_connection(&tx, key, generation, oids, keep_going)
+    }
+
+    #[doc(hidden)]
+    pub fn rust_module_route_facts_on_connection(
+        conn: &Connection,
+        key: &BlobKey,
+        generation: GenerationId,
+        oids: &[Oid],
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<Option<HashMap<Oid, RustModuleRouteFacts>>> {
+        if !keep_going() {
+            return Ok(None);
+        }
+        let unique = unique_rust_fact_oid_strings(oids);
         let mut by_oid: HashMap<Oid, RustModuleRouteFacts> = HashMap::default();
         for chunk in unique.chunks(RUST_FACT_OIDS_PER_QUERY) {
             if !keep_going() {
                 return Ok(None);
             }
             let (placeholders, parameters) = rust_fact_oid_query_parameters(key, generation, chunk);
-            let mut stmt = tx.prepare_cached(&format!(
+            let mut stmt = conn.prepare_cached(&format!(
                 "SELECT keys.blob_oid, source_scope.declaration_id,
                         facts.parent_ordinal, facts.module_name,
                         facts.path_attribute, facts.visibility, facts.imports_macros,
@@ -8298,7 +9992,7 @@ impl AnalyzerStore {
                     .push(scope?);
             }
             drop(stmt);
-            let mut stmt = tx.prepare_cached(&format!(
+            let mut stmt = conn.prepare_cached(&format!(
                 "SELECT keys.blob_oid, source_route.declaration_id,
                         facts.scope_ordinal, facts.module_name,
                         facts.path_attribute, facts.visibility, facts.imports_macros,
@@ -8332,7 +10026,7 @@ impl AnalyzerStore {
                     .push(route?);
             }
             drop(stmt);
-            let mut stmt = tx.prepare_cached(&format!(
+            let mut stmt = conn.prepare_cached(&format!(
                 "SELECT keys.blob_oid, facts.route_ordinal, facts.macro_name,
                         facts.invocation_start
                  FROM rust_published_fact_blobs AS keys
@@ -8358,7 +10052,7 @@ impl AnalyzerStore {
                 attach_rust_module_route_gate(&mut facts.routes, route_ordinal, gate)?;
             }
             drop(stmt);
-            let mut stmt = tx.prepare_cached(&format!(
+            let mut stmt = conn.prepare_cached(&format!(
                 "SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
                         facts.scope_start, facts.scope_end, facts.passthrough,
                         facts.exported, facts.declaration_id, facts.arguments_only,
@@ -8389,7 +10083,6 @@ impl AnalyzerStore {
             }
             drop(stmt);
         }
-        tx.commit()?;
         Ok(keep_going().then_some(by_oid))
     }
 
@@ -8466,7 +10159,7 @@ fn live_rust_summary_joins(
            ON {prefix}_summaries.summary_id={prefix}_versions.summary_id \
           AND {prefix}_summaries.lang='rust' \
           AND {prefix}_summaries.unit_kind='rust_crate' \
-          AND {prefix}_summaries.publication_state='complete' \
+          AND {prefix}_summaries.{is_complete} \
           AND {prefix}_summaries.derivation_version={version_param} \
          CROSS JOIN main.resolution_producer_epochs AS {prefix}_epochs \
            ON {prefix}_epochs.lang={prefix}_versions.lang \
@@ -8477,7 +10170,8 @@ fn live_rust_summary_joins(
           AND {prefix}_rust_versions.generation={prefix}_versions.generation \
           AND {prefix}_rust_versions.unit_key={prefix}_versions.unit_key \
           AND {prefix}_rust_versions.valid_from={prefix}_versions.valid_from \
-          AND {prefix}_rust_versions.summary_id={prefix}_versions.summary_id"
+          AND {prefix}_rust_versions.summary_id={prefix}_versions.summary_id",
+        is_complete = publication::IS_COMPLETE,
     )
 }
 
@@ -11245,12 +12939,19 @@ pub enum StructuralFactRowsRead {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CSharpUndecidedScan {
+    pub oid: Oid,
+    pub variant: ParseVariant,
+    pub chains: Vec<UndecidedChainRow>,
+}
+
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct PreparedParsedBlob {
     /// Referenced preprocessor symbols supplied by the C# producer for this variant.
     pub csharp_condition_symbols: Vec<String>,
-    pub csharp_undecided_chains: Vec<UndecidedChainRow>,
+    pub csharp_undecided_scan: Option<CSharpUndecidedScan>,
     #[doc(hidden)]
     pub key: BlobKey,
     #[doc(hidden)]
@@ -11369,12 +13070,15 @@ impl PreparedParsedBlob {
         self
     }
 
-    pub fn with_undecided_chains(mut self, mut rows: Vec<UndecidedChainRow>) -> Self {
+    pub fn with_undecided_scan(mut self, mut scan: CSharpUndecidedScan) -> Self {
         assert_eq!(self.key.lang, "csharp");
-        assert!(self.csharp_undecided_chains.is_empty());
+        assert!(self.csharp_undecided_scan.is_none());
+        assert_eq!(scan.oid, self.key.oid);
+        assert_eq!(scan.variant, self.key.variant);
+        let rows = &mut scan.chains;
         rows.sort_unstable_by_key(|row| row.chain);
         assert!(rows.windows(2).all(|w| w[0].chain != w[1].chain));
-        for row in &mut rows {
+        for row in rows.iter_mut() {
             row.unknown_symbols.sort_unstable();
             row.open_reasons.sort_unstable();
             row.disagreeing_owners.sort_unstable();
@@ -11403,7 +13107,7 @@ impl PreparedParsedBlob {
                 })
                 .sum::<usize>(),
         );
-        self.csharp_undecided_chains = rows;
+        self.csharp_undecided_scan = Some(scan);
         self
     }
 
@@ -11469,7 +13173,7 @@ impl PreparedParsedBlob {
     fn has_same_persisted_fragment(&self, other: &Self) -> bool {
         self.key == other.key
             && self.csharp_condition_symbols == other.csharp_condition_symbols
-            && self.csharp_undecided_chains == other.csharp_undecided_chains
+            && self.csharp_undecided_scan == other.csharp_undecided_scan
             && self.generation == other.generation
             && self.units == other.units
             && self.ranges == other.ranges
@@ -12309,6 +14013,12 @@ fn try_persist_prepared_chunk_tx(
             )?;
         }
         csharp_compilation::extent::content_available(&tx, &blob.key.lang, blob_id)?;
+        brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
+            &tx,
+            &blob.key.oid.to_string(),
+            &blob.key.lang,
+            blob.generation.0,
+        )?;
     }
     if cancellation.is_cancelled() {
         tx.rollback()?;
@@ -12811,8 +14521,11 @@ fn write_prepared_blob_rows_tx(
     }
     // The delete below cascades away the old row's unit summary members, exports
     // and imports, so the summaries that listed it stop being live first.
-    tx.prepare_cached(unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL)?
-        .execute(params![oid, lang, blob.key.variant])?;
+    {
+        let _cascade = sealed_families::CascadeDelete::new(tx);
+        tx.prepare_cached(unit_summaries::WITHDRAW_VERSIONS_OF_REPLACED_BLOB_SQL)?
+            .execute(params![oid, lang, blob.key.variant])?;
+    }
     csharp_compilation::extent::before_blob_delete(tx, &blob.key)?;
     // Only C# blobs carry condition symbols (asserted at the insert below), so
     // other languages issue no statement here.
@@ -12828,10 +14541,29 @@ fn write_prepared_blob_rows_tx(
             params![oid, lang, blob.key.variant],
         )?;
     }
-    tx.prepare_cached(
-        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
-    )?
-    .execute(params![oid, lang, blob.key.variant])?;
+    {
+        let _cascade = sealed_families::CascadeDelete::new(tx);
+        let removed = tx
+            .prepare_cached(
+                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
+                 RETURNING generation",
+            )?
+            .query_map(params![oid, lang, blob.key.variant], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // The delete cascaded away the name rows of every file version that
+        // mounts the old row, whether or not this publication restores the blob.
+        for removed_generation in removed {
+            brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(
+                tx,
+                oid,
+                lang,
+                removed_generation,
+                blob.key.variant,
+            )?;
+        }
+    }
     tx.prepare_cached(rust_crates::REINSERT_BLOB_SQL)?
         .execute(params![
             previous_blob,
@@ -12853,9 +14585,21 @@ fn write_prepared_blob_rows_tx(
             insert.execute(params![blob_id, symbol])?;
         }
     }
-    assert!(lang == "csharp" || blob.csharp_undecided_chains.is_empty());
+    assert!(lang == "csharp" || blob.csharp_undecided_scan.is_none());
+    if lang == "csharp" && matches!(blob.key.variant, ParseVariant::Digest(_)) {
+        let scan = blob
+            .csharp_undecided_scan
+            .as_ref()
+            .expect("complete C# Digest publication requires a real undecided-chain scan");
+        assert_eq!(scan.oid, blob.key.oid);
+        assert_eq!(scan.variant, blob.key.variant);
+    }
     let mut insert = tx.prepare_cached(csharp_compilation::INSERT_UNDECIDED_CHAIN_SQL)?;
-    for row in &blob.csharp_undecided_chains {
+    for row in blob
+        .csharp_undecided_scan
+        .iter()
+        .flat_map(|scan| &scan.chains)
+    {
         insert.execute(params![
             blob_id,
             row.chain,
@@ -12870,6 +14614,9 @@ fn write_prepared_blob_rows_tx(
     }
 
     {
+        // The only production writer of code_units. The scope ends before the
+        // resolution bundle below, which opens its own owner scope.
+        let _owner = sealed_families::Scope::new(tx, sealed_families::Owner::BlobRows);
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO code_units(
                blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
@@ -13356,8 +15103,209 @@ fn visit_file_state_index_entries<A: StoreLanguageAdapter>(
 #[doc(hidden)]
 pub type IndexEntryDigest = (IndexFamily, Box<[u8]>, StableDigest);
 
-const INDEX_DIGEST_BLOB_SQL: &str = "SELECT keys.id FROM blobs AS keys JOIN blob_meta AS meta ON meta.blob_id = keys.id
-             WHERE keys.blob_oid = ?1 AND keys.lang = ?2 AND keys.generation = ?3 AND meta.is_complete = 1";
+/// A conservative candidate mounted in the selected workspace snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionIndexCandidate {
+    pub mounted_path: PathBuf,
+    pub blob: BlobKey,
+}
+
+const DEFINITION_INVENTORY_CANDIDATE_ARMS: [&str; 9] = [
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.code_units AS rows INDEXED BY idx_code_units_lang_exact_fqn
+JOIN selected_workspace_file_versions AS files ON files.lang = rows.lang
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.exact_fqn = ?2 AND rows.lang = ?1 AND rows.blob_id = blobs.id",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.code_units AS rows INDEXED BY idx_code_units_lang_normalized_fqn
+JOIN selected_workspace_file_versions AS files ON files.lang = rows.lang
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.normalized_fqn = ?2 AND rows.lang = ?1 AND rows.blob_id = blobs.id",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.code_units AS rows INDEXED BY idx_code_units_lang_identifier
+JOIN selected_workspace_file_versions AS files ON files.lang = rows.lang
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.identifier = ?2 AND rows.lang = ?1 AND rows.blob_id = blobs.id",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.code_units AS rows INDEXED BY idx_code_units_lang_short_name
+JOIN selected_workspace_file_versions AS files ON files.lang = rows.lang
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.short_name = ?2 AND rows.lang = ?1 AND rows.blob_id = blobs.id",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.workspace_file_definition_name_rows AS rows INDEXED BY idx_workspace_file_definition_names_exact
+JOIN selected_workspace_file_versions AS files ON rows.file_version_id = files.file_version_id
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.exact_fqn = ?2",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.workspace_file_definition_name_rows AS rows INDEXED BY idx_workspace_file_definition_names_normalized
+JOIN selected_workspace_file_versions AS files ON rows.file_version_id = files.file_version_id
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.normalized_fqn = ?2",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.workspace_file_path_symbol_rows AS rows INDEXED BY idx_workspace_file_path_symbol_rows_exact
+JOIN selected_workspace_file_versions AS files ON rows.file_version_id = files.file_version_id
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.exact_fqn = ?2",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.workspace_file_path_symbol_rows AS rows INDEXED BY idx_workspace_file_path_symbol_rows_normalized
+JOIN selected_workspace_file_versions AS files ON rows.file_version_id = files.file_version_id
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.normalized_fqn = ?2",
+    r"SELECT files.rel_path, files.blob_oid, files.parse_variant
+FROM main.workspace_file_path_symbol_rows AS rows INDEXED BY idx_workspace_file_path_symbol_rows_short
+JOIN selected_workspace_file_versions AS files ON rows.file_version_id = files.file_version_id
+JOIN main.blobs AS blobs ON blobs.blob_oid = files.blob_oid AND blobs.lang = files.lang
+ AND blobs.parse_variant = files.parse_variant AND blobs.generation = files.generation
+WHERE files.lang = ?1 AND rows.short_name = ?2",
+];
+const DEFINITION_INVENTORY_UNKNOWN_ARMS: [&str; 4] = [
+    // Both file arms seek the selected language, workspace and generation.
+    // The open arm seeks valid_until = NULL; the historical arm seeks
+    // valid_until > revision, excluding history closed at or before selection.
+    // valid_from remains a residual predicate to exclude future versions.
+    //
+    // This arm also covers a blob that is incomplete or partial: a file is
+    // known only while its blob (the selected variant, in the file's own
+    // generation) is complete, and nothing in production changes
+    // `blob_meta.is_complete` or `parse_completeness` after the row is
+    // inserted. A blob_meta row is inserted only together with a new blobs
+    // row, and every delete of a blobs row runs
+    // `withdraw_definition_inventory_for_deleted_blob_tx` in its transaction,
+    // which moves each file that mounted it off known. The test-only mutators
+    // call `reconcile_definition_inventory_for_blob_tx`, which demotes.
+    r"SELECT EXISTS(SELECT 1 FROM selected_workspace_revisions AS selected
+ CROSS JOIN main.workspace_file_versions AS unknown
+   INDEXED BY idx_workspace_file_definition_inventory_unknown
+   ON unknown.lang = selected.lang AND unknown.workspace_id = selected.workspace_id
+  AND unknown.generation = selected.generation
+ WHERE selected.lang = ?1 AND unknown.definition_inventory_state IS NOT 'known'
+ AND unknown.input_kind = 'source' AND unknown.valid_from <= selected.revision
+ AND unknown.valid_until IS NULL)",
+    r"SELECT EXISTS(SELECT 1 FROM selected_workspace_revisions AS selected
+ CROSS JOIN main.workspace_file_versions AS unknown
+   INDEXED BY idx_workspace_file_definition_inventory_unknown
+   ON unknown.lang = selected.lang AND unknown.workspace_id = selected.workspace_id
+  AND unknown.generation = selected.generation
+ WHERE selected.lang = ?1 AND unknown.definition_inventory_state IS NOT 'known'
+ AND unknown.input_kind = 'source' AND unknown.valid_from <= selected.revision
+ AND unknown.valid_until > selected.revision)",
+    // No selected revision for the language is not an empty inventory.
+    r"SELECT NOT EXISTS(SELECT 1 FROM selected_workspace_revisions AS selected WHERE selected.lang = ?1)",
+    // A source that admission refused has no selected file version, so it
+    // would pass every arm above while it may define the name. The refusal is
+    // recorded per revision with its validity interval; the seek leads with
+    // the workspace, language and generation of the selected revision.
+    r"SELECT EXISTS(SELECT 1 FROM selected_workspace_revisions AS selected
+ CROSS JOIN main.workspace_source_refusals AS refusals
+   ON refusals.workspace_id = selected.workspace_id
+  AND refusals.lang = selected.lang
+  AND refusals.generation = selected.generation
+ WHERE selected.lang = ?1 AND refusals.valid_from <= selected.revision
+   AND (refusals.valid_until IS NULL OR selected.revision < refusals.valid_until))",
+];
+
+impl AnalyzerStore {
+    /// Returns None unless every selected file has complete inventory evidence
+    /// and the source enumeration behind the selected revision is complete.
+    /// A source that admission refused or that a failed read left out of the
+    /// enumeration has no file version, so the file arms alone cannot see it.
+    /// `listed` names the snapshots the producing analyzer observed complete
+    /// (`TreeSitterAnalyzer::workspace_listing_proof`); the store does not
+    /// persist that fact, and it reads at exactly those snapshots. A language
+    /// with no proven snapshot is unknown.
+    /// The caller must filter this superset with the canonical blob index keys.
+    pub fn index_blob_candidates_for_key_at(
+        &self,
+        listed: &ListedSnapshots,
+        lang: &str,
+        family: IndexFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<DefinitionIndexCandidate>>> {
+        if !listed.snapshots().contains_key(lang) {
+            return Ok(None);
+        }
+        self.index_blob_candidates(
+            self.read_conn_for_workspace(listed.snapshots())?,
+            lang,
+            family,
+            key,
+        )
+    }
+
+    /// The same enumeration at the connection's current selection, for the
+    /// store's own tests, which publish synthetic rows without an analyzer.
+    #[cfg(test)]
+    pub fn index_blob_candidates_for_key(
+        &self,
+        lang: &str,
+        family: IndexFamily,
+        key: &[u8],
+        workspace_listing_complete: bool,
+    ) -> Result<Option<Vec<DefinitionIndexCandidate>>> {
+        if !workspace_listing_complete {
+            return Ok(None);
+        }
+        self.index_blob_candidates(self.read_conn()?, lang, family, key)
+    }
+
+    fn index_blob_candidates(
+        &self,
+        mut conn: ReaderGuard<'_>,
+        lang: &str,
+        family: IndexFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<DefinitionIndexCandidate>>> {
+        let arms: &[usize] = match family {
+            IndexFamily::DefinitionExact => &[0, 4, 6],
+            IndexFamily::DefinitionNormalizedTail => &[1, 5, 7],
+            IndexFamily::DefinitionIdentifier => &[2, 3, 8],
+            IndexFamily::PathSymbol => &[6, 7],
+            _ => panic!("definition inventory requires a definition or path-symbol family"),
+        };
+        let key = std::str::from_utf8(key).map_err(|error| StoreError::new(error.to_string()))?;
+        let tx = conn.transaction()?;
+        for sql in DEFINITION_INVENTORY_UNKNOWN_ARMS {
+            if tx.query_row(sql, [lang], |row| row.get::<_, bool>(0))? {
+                return Ok(None);
+            }
+        }
+        let sql = arms
+            .iter()
+            .map(|&arm| DEFINITION_INVENTORY_CANDIDATE_ARMS[arm])
+            .collect::<Vec<_>>()
+            .join(" UNION ");
+        let mut stmt = tx.prepare_cached(&sql)?;
+        let mut rows = stmt.query(params![lang, key])?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next()? {
+            candidates.push(DefinitionIndexCandidate {
+                mounted_path: PathBuf::from(row.get::<_, String>(0)?),
+                blob: BlobKey {
+                    oid: Oid::from_str(&row.get::<_, String>(1)?)?,
+                    lang: lang.to_owned(),
+                    variant: row.get(2)?,
+                },
+            });
+        }
+        Ok(Some(candidates))
+    }
+}
+
+// The parse variant selects among blobs of one source: a configured C# file
+// can store several variants of the same bytes, and only the selected one
+// matches the file state being hashed.
+const INDEX_DIGEST_BLOB_SQL: &str =
+    "SELECT keys.id FROM blobs AS keys JOIN blob_meta AS meta ON meta.blob_id = keys.id
+             WHERE keys.blob_oid = ?1 AND keys.lang = ?2 AND keys.parse_variant = ?3
+               AND keys.generation = ?4 AND meta.is_complete = 1";
 const INDEX_DIGEST_UNITS_SQL: &str =
     "SELECT * FROM code_units WHERE blob_id = ?1 ORDER BY unit_key";
 const INDEX_DIGEST_SEGMENTS_SQL: &str = "SELECT unit_key, seg_ordinal, seg_kind, segment FROM code_unit_fq_segments WHERE blob_id = ?1 ORDER BY unit_key, seg_ordinal";
@@ -13398,8 +15346,7 @@ impl AnalyzerStore {
         &self,
         adapter: &A,
         state: &FileState,
-        blob: Oid,
-        lang: &str,
+        blob: &BlobKey,
         generation: GenerationId,
         path_symbol: Option<&PathSymbolRow>,
         packages: &[String],
@@ -13410,7 +15357,7 @@ impl AnalyzerStore {
         let blob_id = tx
             .query_row(
                 INDEX_DIGEST_BLOB_SQL,
-                params![blob.to_string(), lang, generation.0],
+                params![blob.oid.to_string(), blob.lang, blob.variant, generation.0],
                 |row| row.get::<_, i64>(0),
             )
             .optional()?;
@@ -15810,7 +17757,7 @@ fn count_vec_entries<T>(map: &HashMap<CodeUnit, Vec<T>>) -> usize {
     map.values().map(Vec::len).sum()
 }
 
-fn candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateRow> {
+pub(super) fn candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateRow> {
     candidate_row_from_row_at(row, 0)
 }
 
@@ -17908,6 +19855,7 @@ fn ensure_language_epochs_tx(
             generations.insert(lang.clone(), generation);
             continue;
         }
+        let _cascade = sealed_families::CascadeDelete::new(&tx);
         if lang == "rust" {
             tx.execute("DELETE FROM rust_crate_versions WHERE lang = ?1", [lang])?;
             tx.execute("DELETE FROM rust_crate_reconciliations", [])?;
@@ -17968,6 +19916,140 @@ fn matching_language_epochs_conn(
 
 /// Return the head revision of one storage language after checking that it is
 /// still the revision the analyzer based its change on.
+/// The certificate stored at a revision: its derivation version and failures.
+pub(super) type RustListingCertificate = (i64, std::collections::BTreeSet<(String, String)>);
+
+pub(super) fn rust_listing_certificate_at(
+    conn: &Connection,
+    snapshot: &WorkspaceSnapshotId,
+) -> Result<Option<RustListingCertificate>> {
+    let key = params![
+        snapshot.workspace_id.as_str(),
+        snapshot.lang,
+        snapshot.generation.0,
+        snapshot.revision
+    ];
+    let Some(version) = conn
+        .query_row(
+            "SELECT derivation_version FROM rust_source_listing_certificates
+             WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4",
+            key,
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let failures = conn
+        .prepare_cached(
+            "SELECT rel_path, reason FROM rust_source_listing_failures
+             WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4",
+        )?
+        .query_map(key, |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(Some((version, failures)))
+}
+
+/// Write the certificate of a revision that the same transaction opened. A
+/// revision's certificate is written once, before any reader can select the
+/// revision: a reader that found none would retain an incomplete answer, and
+/// a certificate appearing later would change the revision's answer under the
+/// same binding. A revision that is already observable goes through
+/// `certify_rust_listing`.
+fn write_rust_listing_certificate(
+    tx: &Transaction<'_>,
+    snapshot: &WorkspaceSnapshotId,
+    derivation_version: i64,
+    failures: &[(String, String)],
+) -> Result<()> {
+    assert!(
+        rust_listing_certificate_at(tx, snapshot)?.is_none(),
+        "the Rust listing certificate of {snapshot:?} is written once"
+    );
+    tx.execute(
+        "INSERT INTO rust_source_listing_certificates
+         (workspace_id,lang,generation,revision,derivation_version,complete)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            snapshot.workspace_id.as_str(),
+            snapshot.lang,
+            snapshot.generation.0,
+            snapshot.revision,
+            derivation_version,
+            failures.is_empty()
+        ],
+    )?;
+    for (path, reason) in failures {
+        tx.execute(
+            "INSERT INTO rust_source_listing_failures
+             (workspace_id,lang,generation,revision,rel_path,reason)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang,
+                snapshot.generation.0,
+                snapshot.revision,
+                path,
+                reason
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Publish the certificate of the publication that produced `snapshot`, in the
+/// transaction that produced it. `head_before` is the head that transaction
+/// found. A different revision means the transaction opened `snapshot`, so
+/// the certificate is written there with the file versions and no reader has
+/// seen the revision without it. The same revision means nothing opened one,
+/// so it is already observable and `certify_rust_listing` decides.
+fn publish_rust_listing_certificate(
+    tx: &Transaction<'_>,
+    snapshot: WorkspaceSnapshotId,
+    head_before: Option<i64>,
+    (version, failures): &(i64, Vec<(String, String)>),
+) -> Result<WorkspaceSnapshotId> {
+    assert_eq!(snapshot.lang, "rust");
+    if head_before == Some(snapshot.revision) {
+        certify_rust_listing(tx, &snapshot, *version, failures)
+    } else {
+        write_rust_listing_certificate(tx, &snapshot, *version, failures)?;
+        Ok(snapshot)
+    }
+}
+
+/// Certify the listing for the head revision `snapshot`, which readers can
+/// already select. An identical stored certificate needs nothing. Otherwise,
+/// no certificate included, the certificate is written at a new head, which
+/// changes no file version, so every version still open stays valid across it.
+/// The revision's other per-revision selection (dependency evidence) is
+/// published with it.
+fn certify_rust_listing(
+    tx: &Transaction<'_>,
+    snapshot: &WorkspaceSnapshotId,
+    derivation_version: i64,
+    failures: &[(String, String)],
+) -> Result<WorkspaceSnapshotId> {
+    let wanted = (derivation_version, failures.iter().cloned().collect());
+    if rust_listing_certificate_at(tx, snapshot)? == Some(wanted) {
+        return Ok(snapshot.clone());
+    }
+    let revision = workspace_inputs::open_workspace_revision(
+        tx,
+        &snapshot.workspace_id,
+        &snapshot.lang,
+        snapshot.generation,
+        Some(snapshot.revision),
+    )?;
+    let opened = WorkspaceSnapshotId {
+        revision,
+        ..snapshot.clone()
+    };
+    dependency_file_evidence::publish(tx, &opened)?;
+    write_rust_listing_certificate(tx, &opened, derivation_version, failures)?;
+    Ok(opened)
+}
+
 fn require_base_workspace_revision(
     tx: &rusqlite::Transaction<'_>,
     workspace_id: &WorkspaceId,
@@ -19070,12 +21152,14 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
     };
     let (stale_blobs, mut reclaimed) = stale_blobs;
     {
+        let _cascade = sealed_families::CascadeDelete::new(&tx);
         let mut delete = tx.prepare(
             "DELETE FROM blobs
              WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3
                AND generation <> COALESCE(
                  (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
-               )",
+               )
+             RETURNING generation",
         )?;
         for key in stale_blobs {
             csharp_compilation::extent::before_blob_delete(&tx, &key)?;
@@ -19092,10 +21176,24 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
                     params![key.oid.to_string(), key.lang, key.variant],
                 )?;
             }
-            delete.execute(params![key.oid.to_string(), key.lang, key.variant])?;
+            let removed = delete
+                .query_map(params![key.oid.to_string(), key.lang, key.variant], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for removed_generation in removed {
+                brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(
+                    &tx,
+                    &key.oid.to_string(),
+                    &key.lang,
+                    removed_generation,
+                    key.variant,
+                )?;
+            }
         }
     }
 
+    let _cascade = sealed_families::CascadeDelete::new(&tx);
     let remaining = max_logical_rows.saturating_sub(reclaimed);
     if remaining > 0 {
         tx.execute(unit_summaries::DELETE_STALE_GENERATION_VERSIONS_SQL, [])?;
@@ -19137,6 +21235,8 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
     // or stale blobs exhausted this pass's logical-row budget.
     tx.execute(unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
     tx.execute(rust_crates::DELETE_UNBOUND_TOPOLOGIES_SQL, [])?;
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    drop(_cascade);
     tx.commit()?;
     Ok(reclaimed)
 }
@@ -20434,7 +22534,12 @@ fn decode_structural_roles(
                 source_node_id,
                 ordinal,
                 role,
-                spread: spread != 0,
+                mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::from_code(
+                    spread,
+                )
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("invalid structural argument mode {spread}"))
+                })?,
                 keyword: persisted_json_span(keyword_start, keyword_end)?,
                 node,
                 span: PersistedSpan { start, end },
@@ -20691,7 +22796,7 @@ pub mod tests {
             let payload_bytes = resolution.payload_bytes + ir.payload_bytes();
             PreparedParsedBlob {
                 csharp_condition_symbols: Vec::new(),
-                csharp_undecided_chains: Vec::new(),
+                csharp_undecided_scan: None,
                 key: BlobKey::unvaried(oid, "python"),
                 generation: GenerationId::BOOTSTRAP,
                 state: Arc::clone(&state),
@@ -21453,6 +23558,16 @@ pub mod tests {
         )
         .context("publishing rows");
         assert_eq!(constraint.kind(), StoreErrorKind::Generic);
+        let readonly = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY_DBMOVED),
+            None,
+        ));
+        assert_eq!(readonly.kind(), StoreErrorKind::NotWritable);
+        let full = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ));
+        assert_eq!(full.kind(), StoreErrorKind::NotWritable);
         // 1555 is SQLITE_CONSTRAINT_PRIMARYKEY; diagnostics keep the extended code.
         assert!(
             constraint.to_string().contains("extended code: 1555"),
@@ -21533,7 +23648,7 @@ pub mod tests {
         let payload_bytes = resolution.payload_bytes + lang.len();
         PreparedParsedBlob {
             csharp_condition_symbols: Vec::new(),
-            csharp_undecided_chains: Vec::new(),
+            csharp_undecided_scan: None,
             key: BlobKey::unvaried(oid, lang),
             generation: GenerationId::BOOTSTRAP,
             state,
@@ -21580,6 +23695,47 @@ pub mod tests {
     }
 
     #[test]
+    fn complete_csharp_digest_requires_scan_receipt() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let oid = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let mut blob = empty_publication(oid, "csharp");
+        blob.key.variant = ParseVariant::Digest([1; 32]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.persist_prepared_blobs(vec![blob], PersistBatchTargets::PRODUCTION)
+        }));
+        assert!(
+            result.is_err(),
+            "complete C# Digest cannot omit its scan receipt"
+        );
+    }
+
+    #[test]
+    fn csharp_scan_receipt_binds_source_and_variant() {
+        let oid = Oid::from_str("1111111111111111111111111111111111111111").unwrap();
+        let other = Oid::from_str("2222222222222222222222222222222222222222").unwrap();
+        let mut blob = empty_publication(oid, "csharp");
+        blob.key.variant = ParseVariant::Digest([1; 32]);
+        for (scan_oid, variant) in [
+            (other, blob.key.variant),
+            (oid, ParseVariant::Digest([2; 32])),
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                {
+                    let mut candidate = empty_publication(oid, "csharp");
+                    candidate.key.variant = ParseVariant::Digest([1; 32]);
+                    candidate
+                }
+                .with_undecided_scan(CSharpUndecidedScan {
+                    oid: scan_oid,
+                    variant,
+                    chains: vec![],
+                })
+            }));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
     fn prepared_csharp_variants_persist_their_own_referenced_symbols() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
@@ -21614,16 +23770,20 @@ pub mod tests {
             keys.push(blob.key.clone());
             prepared.push(
                 blob.with_condition_symbols(vec![symbol.into(), symbol.into()])
-                    .with_undecided_chains(vec![UndecidedChainRow {
-                        chain: 0,
-                        directive_start: 0,
-                        directive_end: 1,
-                        omitted_nonblank: digest == 1,
-                        invalid_condition: false,
-                        unknown_symbols: vec![symbol.into()],
-                        open_reasons: Vec::new(),
-                        disagreeing_owners: Vec::new(),
-                    }]),
+                    .with_undecided_scan(CSharpUndecidedScan {
+                        oid,
+                        variant: ParseVariant::Digest([digest; 32]),
+                        chains: vec![UndecidedChainRow {
+                            chain: 0,
+                            directive_start: 0,
+                            directive_end: 1,
+                            omitted_nonblank: digest == 1,
+                            invalid_condition: false,
+                            unknown_symbols: vec![symbol.into()],
+                            open_reasons: Vec::new(),
+                            disagreeing_owners: Vec::new(),
+                        }],
+                    }),
             );
         }
         let (outcomes, _) = store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
@@ -21687,6 +23847,7 @@ pub mod tests {
                 .unwrap()
         );
         let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM blobs WHERE blob_oid=?1",
@@ -21696,6 +23857,7 @@ pub mod tests {
             .unwrap(),
             2
         );
+        drop(_fixture);
         drop(conn);
 
         let conflicting_oid = oid_for(b"conflicting test flags");
@@ -21708,15 +23870,15 @@ pub mod tests {
             assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
             assert_eq!(store.conn.lock().unwrap().query_row("SELECT contains_tests FROM blob_meta JOIN blobs ON blobs.id=blob_meta.blob_id WHERE blob_oid=?1", [conflicting_oid.to_string()], |row| row.get::<_, i64>(0)).unwrap(), flag);
         }
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute(
-                "DELETE FROM blobs WHERE blob_oid=?1",
-                [conflicting_oid.to_string()],
-            )
-            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let _fixture = sealed_families::Fixture::new(&conn);
+        conn.execute(
+            "DELETE FROM blobs WHERE blob_oid=?1",
+            [conflicting_oid.to_string()],
+        )
+        .unwrap();
+        drop(_fixture);
+        drop(conn);
         let left = empty_publication(conflicting_oid, "java");
         let mut right = empty_publication(conflicting_oid, "java");
         right.contains_tests = 1;
@@ -21736,6 +23898,147 @@ pub mod tests {
 
     #[cfg(test)]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6556: an unusable ephemeral temp directory fell back to a single connection instead of returning its error"
+    )]
+    fn ephemeral_store_reports_an_unusable_temp_directory() {
+        const CHILD_ENV: &str = "BIFROST_ISSUE_6556_UNUSABLE_TMPDIR_CHILD";
+        let test_name =
+            "analyzer::store::tests::ephemeral_store_reports_an_unusable_temp_directory";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let blocker = temp.path().join("not-a-directory");
+            std::fs::write(&blocker, b"blocker").unwrap();
+            let bad_tmp = blocker.join("child");
+            let cache_root = temp.path().join("cache-root");
+            std::fs::create_dir(&cache_root).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TMPDIR", &bad_tmp)
+                .env("TMP", &bad_tmp)
+                .env("TEMP", &bad_tmp)
+                .env("BIFROST_CACHE_ROOT", &cache_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let error = match AnalyzerStore::open_ephemeral() {
+            Ok(_) => panic!("an unusable temp directory must not fall back to an in-memory store"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("ephemeral analyzer cache temp directory"),
+            "{error}"
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6556: a symlinked temp root silently selected the deadlocking single-connection store"
+    )]
+    fn ephemeral_store_keeps_pooled_readers_through_a_symlinked_temp_root() {
+        const CHILD_ENV: &str = "BIFROST_ISSUE_6556_SYMLINKED_TMPDIR_CHILD";
+        let test_name = "analyzer::store::tests::ephemeral_store_keeps_pooled_readers_through_a_symlinked_temp_root";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let real_tmp = temp.path().join("real-tmp");
+            std::fs::create_dir(&real_tmp).unwrap();
+            let linked_tmp = temp.path().join("linked-tmp");
+            std::os::unix::fs::symlink(&real_tmp, &linked_tmp).unwrap();
+            let cache_root = temp.path().join("cache-root");
+            std::fs::create_dir(&cache_root).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TMPDIR", &linked_tmp)
+                .env("BIFROST_CACHE_ROOT", &cache_root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let store =
+            AnalyzerStore::open_ephemeral().expect("a symlinked TMPDIR is a supported temp root");
+        assert!(
+            !store.uses_single_connection_reads(),
+            "a symlinked TMPDIR must keep the pooled-reader store"
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#6556: an unwritable machine cache template publication forced the deadlocking fallback"
+    )]
+    fn ephemeral_store_opens_when_the_machine_cache_cannot_publish_a_template() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ENV: &str = "BIFROST_ISSUE_6556_TEMPLATE_PUBLICATION_CHILD";
+        let test_name = "analyzer::store::tests::ephemeral_store_opens_when_the_machine_cache_cannot_publish_a_template";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let cache_root = temp.path().join("cache-root");
+            let template_dir = cache_root.join("store-templates");
+            std::fs::create_dir_all(&template_dir).unwrap();
+            std::fs::set_permissions(&template_dir, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let writable = tempfile::NamedTempFile::new_in(&template_dir).is_ok();
+            std::fs::set_permissions(&template_dir, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            if writable {
+                eprintln!(
+                    "skipping {test_name}: this process bypasses the read-only template directory"
+                );
+                return;
+            }
+            std::fs::set_permissions(&template_dir, std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            let tmp = temp.path().join("tmp");
+            std::fs::create_dir(&tmp).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TMPDIR", &tmp)
+                .env("TMP", &tmp)
+                .env("TEMP", &tmp)
+                .env("BIFROST_CACHE_ROOT", &cache_root)
+                .output()
+                .unwrap();
+            std::fs::set_permissions(&template_dir, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let store = AnalyzerStore::open_ephemeral()
+            .expect("an unwritable template cache must not fail an ephemeral store");
+        assert!(
+            !store.uses_single_connection_reads(),
+            "an unwritable template cache must not select the single-connection store"
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
     fn requested_projection_repairs_do_not_leak_between_queries() {
         let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
         let oid = oid_for(b"stale projection");
@@ -21749,6 +24052,7 @@ pub mod tests {
             store.persist_prepared_blobs(vec![root], PersistBatchTargets::PRODUCTION);
         assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
         let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
         let request = CompleteAnalysisBlobRequest::new(
             brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
             ["java:projection".into()],
@@ -21804,6 +24108,213 @@ pub mod tests {
                 brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java:projection")
             )]
         );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn stale_go_resolution_interior_with_same_oid_requires_republication() {
+        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        let oid = oid_for(b"directional channel epoch");
+        let prepared = || {
+            let mut blob = empty_publication(oid, "go");
+            let resolution = PreparedResolutionBundle::new(
+                Language::Go,
+                Default::default(),
+                Default::default(),
+                Vec::new(),
+                Default::default(),
+                Vec::new(),
+                Default::default(),
+                Vec::new(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            blob.logical_rows =
+                blob.logical_rows - blob.resolution.logical_rows + resolution.logical_rows;
+            blob.payload_bytes =
+                blob.payload_bytes - blob.resolution.payload_bytes + resolution.payload_bytes;
+            blob.mutation_logical_rows = blob.logical_rows;
+            blob.mutation_payload_bytes = blob.payload_bytes;
+            blob.resolution = resolution;
+            blob
+        };
+        let blob = prepared();
+        store
+            .ensure_prepared_resolution_epochs(std::slice::from_ref(&blob))
+            .unwrap();
+        let (outcomes, _) =
+            store.persist_prepared_blobs(vec![blob], PersistBatchTargets::PRODUCTION);
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+        let request = CompleteAnalysisBlobRequest::new(BlobKey::unvaried(oid, "go"), []);
+        {
+            let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            assert!(
+                missing_published_complete_analysis_blob_keys_conn(
+                    &conn,
+                    std::slice::from_ref(&request),
+                    Language::Go
+                )
+                .unwrap()
+                .is_empty()
+            );
+            conn.execute("UPDATE resolution_fragment_interiors SET producer_epoch='resolution-bundle-go-v75-before-direction' WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang='go')", [oid.to_string()]).unwrap();
+            assert_eq!(
+                missing_published_complete_analysis_blob_keys_conn(
+                    &conn,
+                    std::slice::from_ref(&request),
+                    Language::Go
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+        let (outcomes, _) =
+            store.persist_prepared_blobs(vec![prepared()], PersistBatchTargets::PRODUCTION);
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+        let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+        assert!(
+            missing_published_complete_analysis_blob_keys_conn(&conn, &[request], Language::Go)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_jvm_member_type_coverage_with_same_oid_requires_republication() {
+        use crate::analyzer::resolution::{
+            BindingFragmentId, lower_resolution_facts_for_selection,
+        };
+        use crate::analyzer::store::resolution_prepare::{
+            ResolutionInteriorPreparation, prepare_resolution_bundle_with_unit_keys,
+        };
+        use brokk_bifrost_core::analyzer::ProjectFile;
+        use tree_sitter::Parser;
+
+        let store = AnalyzerStore::open_in_memory_single_connection().unwrap();
+        for (language, storage_language, source) in [
+            (
+                Language::Java,
+                "java",
+                "class Outer { class Inner {} } class Broken { void f( { }",
+            ),
+            (
+                Language::Kotlin,
+                "kotlin",
+                "class Outer { class Inner } class AliasOwner { typealias Alias = String }",
+            ),
+        ] {
+            let mut facts = match language {
+                Language::Java => {
+                    brokk_bifrost_jvm::java::declarations::java_source_facts_for_test(source)
+                }
+                Language::Kotlin => {
+                    let mut parser = Parser::new();
+                    parser
+                        .set_language(&brokk_bifrost_jvm::kotlin::language::LANGUAGE.into())
+                        .unwrap();
+                    let tree = parser.parse(source, None).unwrap();
+                    let file = ProjectFile::new(std::env::current_dir().unwrap(), "src/Fixture.kt");
+                    brokk_bifrost_jvm::kotlin::declarations::parse_kotlin_file(&file, source, &tree)
+                        .resolution_facts
+                }
+                _ => unreachable!(),
+            };
+            assert!(!facts.member_type_coverage.is_empty(), "{language:?}");
+            assert!(facts.member_type_coverage.iter().any(|claim| matches!(
+                claim.coverage,
+                brokk_bifrost_core::analyzer::resolution_facts::MemberTypesCoverage::Complete
+            )));
+            assert!(facts.member_type_coverage.iter().any(|claim| matches!(
+                claim.coverage,
+                brokk_bifrost_core::analyzer::resolution_facts::MemberTypesCoverage::Open(_)
+            )));
+            // This SQL-envelope fixture has no code-unit table; the producer's
+            // member-scope and coverage facts remain intact.
+            facts.definition_units.clear();
+            let oid = oid_for(source.as_bytes());
+            let lowered = lower_resolution_facts_for_selection(
+                BindingFragmentId::for_test([language as u8]),
+                crate::analyzer::resolution::test_shared_names(),
+                language,
+                &facts,
+            );
+            let expected = lowered
+                .typed()
+                .member_scopes()
+                .iter()
+                .filter(|scope| scope.is_type_body())
+                .map(|scope| {
+                    (
+                        i64::from(scope.definition().local_key().unwrap()),
+                        scope.member_types(),
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let prepared = || {
+                let mut blob = empty_publication(oid, storage_language);
+                let ResolutionInteriorPreparation::Prepared(resolution) =
+                    prepare_resolution_bundle_with_unit_keys(
+                        &lowered,
+                        None,
+                        &CancellationToken::new(),
+                    )
+                else {
+                    panic!("live preparation");
+                };
+                blob.logical_rows =
+                    blob.logical_rows - blob.resolution.logical_rows + resolution.logical_rows;
+                blob.payload_bytes =
+                    blob.payload_bytes - blob.resolution.payload_bytes + resolution.payload_bytes;
+                blob.mutation_logical_rows = blob.logical_rows;
+                blob.mutation_payload_bytes = blob.payload_bytes;
+                blob.resolution = *resolution;
+                blob
+            };
+            let blob = prepared();
+            store
+                .ensure_prepared_resolution_epochs(std::slice::from_ref(&blob))
+                .unwrap();
+            let (outcomes, _) =
+                store.persist_prepared_blobs(vec![blob], PersistBatchTargets::PRODUCTION);
+            assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+            let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            let count = || {
+                conn.query_row("SELECT count(*) FROM resolution_member_type_coverage WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang=?2)", params![oid.to_string(), storage_language], |row| row.get::<_, i64>(0)).unwrap()
+            };
+            assert_eq!(count() as usize, facts.member_type_coverage.len());
+            conn.execute("DELETE FROM resolution_member_type_coverage WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang=?2)", params![oid.to_string(), storage_language]).unwrap();
+            conn.execute("UPDATE resolution_fragment_interiors SET producer_epoch='old-jvm-member-types' WHERE blob_id=(SELECT id FROM blobs WHERE blob_oid=?1 AND lang=?2)", params![oid.to_string(), storage_language]).unwrap();
+            assert_eq!(count(), 0);
+            drop(_fixture);
+            drop(conn);
+            let (outcomes, _) =
+                store.persist_prepared_blobs(vec![prepared()], PersistBatchTargets::PRODUCTION);
+            assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
+            let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
+            let blob_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM blobs WHERE blob_oid=?1 AND lang=?2",
+                    params![oid.to_string(), storage_language],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let requested =
+                serde_json::to_string(&expected.keys().copied().collect::<Vec<_>>()).unwrap();
+            let mut statement = conn.prepare(crate::analyzer::store::resolution_prepare::typed_rows::MEMBER_SCOPES_BY_DEFINITION_SQL).unwrap();
+            let actual = statement.query_map(params![blob_id, requested], |row| {
+                let key: i64 = row.get(0)?;
+                let coverage = crate::analyzer::store::resolution_prepare::typed_rows::decode_member_types(
+                    crate::analyzer::store::resolution_stage::codec::decode_semantic(key), row.get(2)?, row.get(3)?
+                ).unwrap();
+                Ok((key, coverage))
+            }).unwrap().collect::<rusqlite::Result<std::collections::HashMap<_, _>>>().unwrap();
+            assert_eq!(actual, expected, "{language:?}");
+        }
     }
 
     #[cfg(test)]
@@ -22017,6 +24528,7 @@ pub mod tests {
         assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0].error);
         {
             let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
             assert_eq!(
                 conn.query_row("SELECT detail FROM semantic_ir_publications", [], |row| row
                     .get::<_, String>(0))
@@ -22231,6 +24743,137 @@ pub mod tests {
 
     #[cfg(test)]
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8837: recapture must replace legacy empty configuration probes and preserve historical uncertainty"
+    )]
+    fn legacy_configuration_presence_recapture_uses_one_revision() {
+        let mut conn = brokk_bifrost_core::cache_db::test_connection_through_262();
+        let workspace_id = WorkspaceId("e".repeat(64));
+        let empty = WorkspaceConfigurationInput::new("Directory.Build.props".into(), Box::new([]));
+        let nonempty = WorkspaceConfigurationInput::new(
+            "sub/Directory.Build.props".into(),
+            b"<Project/>".to_vec().into_boxed_slice(),
+        );
+        conn.execute("INSERT INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,'csharp',1,1)", [&workspace_id.0]).unwrap();
+        conn.execute("INSERT INTO workspace_heads(workspace_id, lang, generation, revision) VALUES(?1, 'csharp', 1, 1)", [&workspace_id.0]).unwrap();
+        for input in [&empty, &nonempty] {
+            conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,input_kind,rel_path,blob_oid,valid_from) VALUES(?1,'csharp',1,'configuration',?2,?3,1)",
+                params![workspace_id.as_str(), input.relative_path, input.content_oid().to_string()]).unwrap();
+        }
+        for input in [&empty, &nonempty] {
+            conn.execute(
+                "INSERT INTO workspace_input_sources(content_oid,source_bytes) VALUES(?1,?2)",
+                params![input.content_oid().to_string(), input.source_bytes.as_ref()],
+            )
+            .unwrap();
+        }
+        brokk_bifrost_core::cache_db::migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('csharp', 'test', 1)",
+            [],
+        )
+        .unwrap();
+        let store = AnalyzerStore::from_parts(
+            conn,
+            None,
+            None,
+            None,
+            &Default::default(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
+        );
+        let generation = GenerationId(1);
+        let old = WorkspaceSnapshotId {
+            workspace_id: workspace_id.clone(),
+            lang: "csharp".into(),
+            generation,
+            revision: 1,
+        };
+        let capture = |configuration: &[WorkspaceConfigurationInput]| {
+            store
+                .sync_workspace_inputs_for_workspace(
+                    &workspace_id,
+                    "csharp",
+                    generation,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    configuration,
+                    &[],
+                    &[],
+                )
+                .unwrap()
+        };
+        let old_ids = store.conn.execute(|conn| {
+            conn.prepare("SELECT file_version_id FROM workspace_file_versions WHERE input_kind='configuration' ORDER BY rel_path")?
+                .query_map([], |row| row.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()
+        }).unwrap();
+        store.conn.execute(|conn| {
+            let rows = conn.prepare("SELECT file_present FROM workspace_file_versions WHERE input_kind='configuration' ORDER BY rel_path")?
+                .query_map([], |row| row.get::<_, Option<bool>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(rows, vec![None, Some(true)]);
+            Ok::<(), StoreError>(())
+        }).unwrap();
+        let unknown = configuration_digest([
+            ("Directory.Build.props", empty.content_oid(), None),
+            (
+                "sub/Directory.Build.props",
+                nonempty.content_oid(),
+                Some(true),
+            ),
+        ]);
+        let absent = configuration_digest([
+            ("Directory.Build.props", empty.content_oid(), Some(false)),
+            (
+                "sub/Directory.Build.props",
+                nonempty.content_oid(),
+                Some(true),
+            ),
+        ]);
+        let present = configuration_digest([
+            ("Directory.Build.props", empty.content_oid(), Some(true)),
+            (
+                "sub/Directory.Build.props",
+                nonempty.content_oid(),
+                Some(true),
+            ),
+        ]);
+        assert_ne!(unknown, absent);
+        assert_ne!(unknown, present);
+        let legacy = old.clone();
+        store
+            .conn
+            .execute(move |conn| {
+                let tx = conn.transaction()?;
+                csharp_compilation::publish(&tx, &legacy)?;
+                tx.commit()?;
+                Ok::<(), StoreError>(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .csharp_selected_compilation_set(&old)
+                .unwrap()
+                .is_none()
+        );
+        let recaptured = capture(&[
+            WorkspaceConfigurationInput::absent("Directory.Build.props".into()),
+            nonempty,
+        ]);
+        assert_eq!(recaptured.revision, old.revision + 1);
+        store.conn.execute(move |conn| {
+            let rows = conn.prepare("SELECT file_version_id,file_present,valid_until FROM workspace_file_versions WHERE input_kind='configuration' ORDER BY file_version_id")?
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, Option<bool>>(1)?,row.get::<_, Option<i64>>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(rows, vec![(old_ids[0],None,Some(recaptured.revision)), (old_ids[1],Some(true),None), (rows[2].0,Some(false),None)]);
+            Ok::<(), StoreError>(())
+        }).unwrap();
+    }
+
+    #[cfg(test)]
+    #[test]
     fn selected_file_projection_digest_matches_published_workspace_digest() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let workspace_id = WorkspaceId("c".repeat(64));
@@ -22409,6 +25052,7 @@ pub mod tests {
                 &langs,
                 &generations,
                 input("gradle.properties", "version=2\n"),
+                None,
             )
             .unwrap();
         let (added, digest) = store
@@ -22418,6 +25062,7 @@ pub mod tests {
                 &langs,
                 &generations,
                 input("build.gradle", "plugins {}\n"),
+                None,
             )
             .unwrap();
 
@@ -22429,10 +25074,11 @@ pub mod tests {
         ];
         assert_eq!(
             digest,
-            configuration_digest(
-                full.iter()
-                    .map(|input| (input.relative_path(), input.content_oid()))
-            )
+            configuration_digest(full.iter().map(|input| (
+                input.relative_path(),
+                input.content_oid(),
+                Some(input.file_present)
+            )))
         );
         for lang in &langs {
             assert_eq!(added[lang].revision, base[lang].revision + 2, "{lang}");
@@ -22453,6 +25099,7 @@ pub mod tests {
                 &langs,
                 &generations,
                 input("gradle.properties", "version=3\n"),
+                None,
             )
             .unwrap_err();
         assert!(
@@ -22643,7 +25290,10 @@ pub mod tests {
             return;
         }
 
-        let opened = AnalyzerStore::open_for_workspace(&workspace_root);
+        let opened = AnalyzerStore::open_for_workspace(
+            &workspace_root,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
+        );
         let error = match opened {
             Ok(_) => panic!("an unwritable workspace root must not open a persisted store"),
             Err(error) => error,
@@ -22665,7 +25315,11 @@ pub mod tests {
     #[test]
     fn non_git_root_uses_in_memory_store_and_roundtrips_registry() {
         let temp = tempfile::TempDir::new().unwrap();
-        let store = AnalyzerStore::open_for_workspace(temp.path()).unwrap();
+        let store = AnalyzerStore::open_for_workspace(
+            temp.path(),
+            &brokk_bifrost_core::retention_budget::RetentionBudget::new(1024 * 1024 * 1024),
+        )
+        .unwrap();
         assert!(store.is_ephemeral());
         assert!(store.db_path().is_none());
 
@@ -22786,8 +25440,9 @@ pub mod tests {
                     } else {
                         store.checkout_read_conn().unwrap()
                     };
-                    // Include the route in the text so writer fallback's three
-                    // routes each start with their own prepared statement.
+                    // Include the route in the text so the writer-backed
+                    // reader's three routes each start with their own prepared
+                    // statement.
                     let sql = format!(
                         "SELECT 17, length(resolution_node_identity('reference', 7, 11)) /* {route} */"
                     );
@@ -22925,6 +25580,83 @@ pub mod tests {
     }
 
     #[cfg(test)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#10225: cleared readers evaded the retained TEMP bound")]
+    fn cleared_readers_obey_retained_limit() {
+        let pool = ReaderPool::new(None);
+        let mut readers = Vec::new();
+        for serial in 1..=MAX_RETAINED_RESOLUTION_READERS as u64 + 1 {
+            let (epoch, acquired) = pool.acquire();
+            assert!(acquired.is_none());
+            readers.push(SelectedReader {
+                conn: Connection::open_in_memory().unwrap(),
+                serial,
+                pooled_after_clear: true,
+                macro_frontier: None,
+                selection: None,
+                resolution_selection: None,
+                statistics_epoch: epoch,
+                query_planner_stability_before_resolution: None,
+            });
+        }
+        for reader in readers {
+            pool.checkin(reader);
+        }
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.idle.len(), MAX_RETAINED_RESOLUTION_READERS);
+        assert_eq!(
+            state
+                .idle
+                .iter()
+                .map(|reader| reader.serial)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10225: a retained macro frontier could grow TEMP past the snapshot cap before checkin"
+    )]
+    fn oversized_macro_frontier_closes_at_checkin() {
+        let pool = ReaderPool::new(None);
+        let (epoch, acquired) = pool.acquire();
+        assert!(acquired.is_none());
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TEMP TABLE oversized (payload BLOB); INSERT INTO oversized VALUES (zeroblob(17000000));").unwrap();
+        assert!(!resolution_operation::macro_temp_within_cap(&conn).unwrap());
+        let budget = cache_budget::StoreCacheBudget::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        );
+        let guard = ReaderGuard {
+            cache_budget: &budget,
+            inner: ReaderConn::Pooled {
+                pool: &pool,
+                reader: Some(SelectedReader {
+                    conn,
+                    serial: 1,
+                    pooled_after_clear: false,
+                    macro_frontier: Some(Box::new(
+                        resolution_operation::RetainedMacroFrontier::empty_for_test(),
+                    )),
+                    selection: None,
+                    resolution_selection: None,
+                    statistics_epoch: epoch,
+                    query_planner_stability_before_resolution: None,
+                }),
+            },
+            checkin: CheckinPlan::Reusable,
+            query_planner_stability_on_checkin: None,
+            restore_reader_mmap_on_checkin: false,
+        };
+        let _ = take_pooled_reader_closes_for_test();
+        drop(guard);
+        assert_eq!(take_pooled_reader_closes_for_test(), 1);
+        assert!(pool.state.lock().unwrap().idle.is_empty());
+    }
+
+    #[cfg(test)]
     /// #3798: every checkout is out, and each holder asks for a nested one, as
     /// a Rust reverse operation does when it confirms a candidate blob. Before
     /// nested checkouts skipped the gate, every thread waited for another's
@@ -22935,7 +25667,10 @@ pub mod tests {
         let mut pool = ReaderPool::new(None);
         pool.capacity = 2;
         let open = |statistics_epoch| SelectedReader {
+            serial: 0,
+            pooled_after_clear: false,
             conn: Connection::open_in_memory().unwrap(),
+            macro_frontier: None,
             selection: None,
             resolution_selection: None,
             statistics_epoch,
@@ -23074,7 +25809,8 @@ pub mod tests {
         drop(reader);
 
         let mut reader = store.read_conn_for_workspace(&selection(2)).unwrap();
-        reader.cleanup_before_checkin("DELETE FROM temp.selected_rust_unit_closure; DELETE FROM temp.selected_rust_unit_summaries; DELETE FROM temp.selected_workspace_revisions;");
+        clear_selected_rust_units_for_test(&reader).unwrap();
+        reader.cleanup_before_checkin("DELETE FROM temp.selected_rust_unit_closure; DELETE FROM temp.selected_workspace_revisions;");
         drop(reader);
         let reader = store.read_conn_for_workspace(&selection(2)).unwrap();
         assert_eq!(
@@ -23171,9 +25907,8 @@ pub mod tests {
                     "{state}: {plan:#?}"
                 );
                 assert!(
-                    plan.iter().any(|row| row.contains(
-                        "SEARCH owner USING INDEX idx_code_units_lang_identifier_lookup"
-                    )),
+                    plan.iter().any(|row| row
+                        .contains("SEARCH owner USING INDEX idx_code_units_lang_identifier")),
                     "{state}: {plan:#?}"
                 );
                 assert!(
@@ -23237,7 +25972,7 @@ pub mod tests {
         );
         assert!(
             plan.iter()
-                .all(|detail| !detail.contains("idx_code_units_lang_identifier_lookup")),
+                .all(|detail| !detail.contains("idx_code_units_lang_identifier")),
             "the by-key query must not fall back to the language-wide index {state}: {plan:#?}"
         );
         assert!(
@@ -23667,6 +26402,7 @@ pub mod tests {
                     &[],
                     &[],
                     &[],
+                    None,
                     None,
                 )
                 .unwrap();
@@ -24743,8 +27479,9 @@ pub mod tests {
         let plan = explain_pin(&conn, &pinned(query_name));
 
         assert!(
-            plan.iter().any(|detail| detail
-                .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
+            plan.iter()
+                .any(|detail| detail
+                    .contains("SEARCH units USING INDEX idx_code_units_lang_identifier")),
             "the {lookup_description} must seek the identifier index {state}: {plan:#?}"
         );
         assert!(
@@ -24861,6 +27598,7 @@ pub mod tests {
     fn rejects_forbidden_persisted_code_unit_kinds() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().unwrap();
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
             [TEST_OID],
@@ -25082,6 +27820,7 @@ pub mod tests {
 
     #[cfg(test)]
     fn roundtrip_unit(conn: &Connection, blob_id: i64, key: i64) {
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(conn);
         conn.execute(
             "INSERT INTO code_units(blob_id, lang, unit_key, kind, short_name, identifier,
             content_qualifier, synthetic, is_type_alias, in_declarations, in_definition_lookup)
@@ -25101,6 +27840,7 @@ pub mod tests {
         ];
         {
             let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
             for (index, oid) in oids.iter().enumerate() {
                 conn.execute(
                     "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'fixture')",
@@ -25108,9 +27848,6 @@ pub mod tests {
                 )
                 .unwrap();
                 let blob_id = conn.last_insert_rowid();
-                if index < 2 {
-                    roundtrip_blob_meta(&conn, blob_id, "file-package");
-                }
                 if index == 0 {
                     roundtrip_unit(&conn, blob_id, 0);
                     conn.execute(
@@ -25123,6 +27860,9 @@ pub mod tests {
                         conn.execute("INSERT INTO code_unit_fq_segments(blob_id, lang, unit_key, seg_ordinal, seg_kind, segment)
                             VALUES(?1, 'fixture', 0, ?2, 'package', ?3)", params![blob_id, ordinal as i64, segment]).unwrap();
                     }
+                }
+                if index < 2 {
+                    roundtrip_blob_meta(&conn, blob_id, "file-package");
                 }
             }
             conn.execute_batch("PRAGMA reverse_unordered_selects=ON")
@@ -25320,6 +28060,7 @@ pub mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         write_import_fixture(&store, "rust", &imports);
         let conn = store.conn.lock().expect("store mutex");
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
         conn.execute("DELETE FROM blobs WHERE blob_oid = ?1", [TEST_OID])
             .unwrap();
         let remaining: i64 = conn
@@ -25376,6 +28117,7 @@ pub mod tests {
 
     #[cfg(test)]
     fn insert_test_blob_and_unit(conn: &Connection) {
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(conn);
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
             [TEST_OID],
@@ -25584,10 +28326,16 @@ mod roundtrip_unit_properties {
         lang: &str,
         adapter: &A,
         state: &FileState,
+        variant: Option<[u8; 32]>,
     ) {
+        let _fixture = crate::analyzer::store::sealed_families::Fixture::new(conn);
         conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 0)",
-            params![oid.to_string(), lang],
+            "INSERT INTO blobs(blob_oid, lang, parse_variant, generation) VALUES(?1, ?2, ?3, 0)",
+            params![
+                oid.to_string(),
+                lang,
+                variant.as_ref().map_or_else(Vec::new, |v| v.to_vec())
+            ],
         )
         .unwrap();
         let blob_id = conn.last_insert_rowid();
@@ -25691,6 +28439,65 @@ mod roundtrip_unit_properties {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "#10325: the index digest hashed another parse variant's rows for the same source"
+    )]
+    fn file_state_index_digests_selects_parse_variant() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = ProjectFile::new(temp.path().to_path_buf(), "Variant.java");
+        let oid = test_blob_oid(b"same source");
+        let plain = BlobKey::unvaried(oid, "java");
+        let variant = BlobKey {
+            oid,
+            lang: "java".into(),
+            variant: ParseVariant::Digest([7; 32]),
+        };
+        let mut plain_state = empty_state();
+        plain_state.declarations.insert(unit(&file, "Plain"));
+        let mut variant_state = empty_state();
+        variant_state.declarations.insert(unit(&file, "Configured"));
+        let publish_into = |store: &AnalyzerStore, state: &FileState, key: &BlobKey| {
+            let input = state.clone();
+            let key = key.clone();
+            store.conn.execute(move |conn| {
+                publish(
+                    conn,
+                    key.oid,
+                    &key.lang,
+                    &Adapter,
+                    &input,
+                    match key.variant {
+                        ParseVariant::Digest(value) => Some(value),
+                        ParseVariant::Empty => None,
+                    },
+                )
+            });
+        };
+        let digests = |store: &AnalyzerStore, state: &FileState, key: &BlobKey| {
+            store
+                .file_state_index_digests(&Adapter, state, key, GenerationId(0), None, &[])
+                .unwrap()
+                .unwrap()
+        };
+        // Both variants of the same source in one store, the plain one first,
+        // so an unfiltered lookup would find the plain rows for either key.
+        let both = AnalyzerStore::open_ephemeral().unwrap();
+        publish_into(&both, &plain_state, &plain);
+        publish_into(&both, &variant_state, &variant);
+        for (state, key) in [(&plain_state, &plain), (&variant_state, &variant)] {
+            // The expected digests come from a store that holds only this
+            // variant, so they hash exactly this variant's rows.
+            let alone = AnalyzerStore::open_ephemeral().unwrap();
+            publish_into(&alone, state, key);
+            assert_eq!(
+                digests(&both, state, key),
+                digests(&alone, state, key),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#8180: unchanged file index entries invalidated every probing unit"
     )]
     fn index_digest_inventory_and_published_row_changes() {
@@ -25751,13 +28558,12 @@ mod roundtrip_unit_properties {
             let input = state.clone();
             store
                 .conn
-                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input));
+                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input, None));
             store
                 .file_state_index_digests(
                     &Adapter,
                     state,
-                    oid,
-                    "java",
+                    &BlobKey::unvaried(oid, "java"),
                     GenerationId(0),
                     Some(&symbol),
                     &packages,
@@ -25978,7 +28784,7 @@ mod roundtrip_unit_properties {
             let input = state.clone();
             store
                 .conn
-                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input));
+                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input, None));
         }
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let single = store
@@ -26136,7 +28942,7 @@ mod roundtrip_unit_properties {
             let input = state.clone();
             store
                 .conn
-                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input));
+                .execute(move |conn| publish(conn, oid, "java", &Adapter, &input, None));
         }
         let store = AnalyzerStore::open_persistent(&path).unwrap();
         let single = store
@@ -26190,7 +28996,7 @@ mod roundtrip_unit_properties {
         let oid = test_blob_oid(b"candidates");
         {
             let conn = store.conn.lock().unwrap();
-            publish(&conn, oid, "java", &Adapter, &state);
+            publish(&conn, oid, "java", &Adapter, &state, None);
             let mut other = empty_state();
             other.declarations.insert(unit(&file, "Foo"));
             publish(
@@ -26199,6 +29005,7 @@ mod roundtrip_unit_properties {
                 "kotlin",
                 &Adapter,
                 &other,
+                None,
             );
         }
         let langs = vec!["java".to_owned()];
@@ -26350,7 +29157,7 @@ mod roundtrip_unit_properties {
         ]);
         let oid = test_blob_oid(b"anchored identities");
         let conn = store.conn.lock().unwrap();
-        publish(&conn, oid, "java", &AnchoredAdapter, &state);
+        publish(&conn, oid, "java", &AnchoredAdapter, &state, None);
         let actual = hydrate_file_state_conn(
             &conn,
             &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "java"),
@@ -26396,7 +29203,7 @@ mod roundtrip_unit_properties {
             make(&file, &["root"], SegmentKind::Type).with_package_anchor(PackageAnchor::CrateRoot),
         );
         let last_oid = test_blob_oid(b"last hydration cancellation");
-        publish(&conn, last_oid, "java", &AnchoredAdapter, &last);
+        publish(&conn, last_oid, "java", &AnchoredAdapter, &last, None);
         assert_eq!(
             read_unit_rows(
                 &conn,
@@ -26458,7 +29265,7 @@ mod generation_liveness_properties {
         let key = key.clone();
         let oid = key.oid.to_string();
         let lang = key.lang.clone();
-        store.conn.execute(move |conn| -> Result<i64> {
+        store.conn.execute_fixture(move |conn| -> Result<i64> {
         let tx = conn.transaction().unwrap();
         let id: i64 = tx
             .query_row(
@@ -26467,14 +29274,6 @@ mod generation_liveness_properties {
                 |r| r.get(0),
             )
             .unwrap();
-        tx.execute(
-            "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,
-            stored_unit_count,range_count,signature_count,signature_metadata_count,
-            supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
-            VALUES(?1,?2,0,'',2,0,0,0,0,1,2,0,1)",
-            params![id, lang],
-        )
-        .unwrap();
         for (key, name) in [(0, "Parent"), (1, "Child")] {
             tx.execute(
                 "INSERT INTO code_units(blob_id,lang,unit_key,kind,short_name,identifier,
@@ -26503,9 +29302,1154 @@ mod generation_liveness_properties {
             params![id, lang],
         )
         .unwrap();
+        tx.execute(
+            "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,
+            stored_unit_count,range_count,signature_count,signature_metadata_count,
+            supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
+            VALUES(?1,?2,0,'',2,0,0,0,0,1,2,0,1)",
+            params![id, lang],
+        )
+        .unwrap();
         tx.commit().unwrap();
         Ok(id)
         }).unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10325: a stale blob id from the tail read attached a file's names to another blob"
+    )]
+    fn definition_inventory_owner_refuses_names_whose_blob_id_is_not_the_files_blob() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = BlobKey::unvaried(oid(b"inventory"), "java");
+        publish(&store, &key, GenerationId::BOOTSTRAP);
+        // Each id stands in for one the file's republished blob gave up and
+        // another row took: an unrelated blob with the same unit keys, and
+        // another parse variant of the file's own content, which the file
+        // does not select.
+        let other = publish(
+            &store,
+            &BlobKey::unvaried(oid(b"other"), "java"),
+            GenerationId::BOOTSTRAP,
+        );
+        let sibling = publish(
+            &store,
+            &BlobKey {
+                oid: key.oid,
+                lang: "java".into(),
+                variant: ParseVariant::Digest([7; 32]),
+            },
+            GenerationId::BOOTSTRAP,
+        );
+        let file = WorkspaceFileRow {
+            decision: None,
+            rel_path: "mounted/A.java".into(),
+            blob_oid: key.oid,
+        };
+        store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                std::slice::from_ref(&file),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        for (label, stale) in [("another blob", other), ("another variant", sibling)] {
+            let (names, state): (i64, Option<String>) = store
+                .conn
+                .execute(move |conn| -> Result<(i64, Option<String>)> {
+                    let tx = conn.transaction()?;
+                    let version: i64 = tx.query_row(
+                        "SELECT file_version_id FROM workspace_file_versions WHERE valid_until IS NULL",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    replace_workspace_file_definition_inventory(
+                        &tx,
+                        version,
+                        &[DefinitionNameRow {
+                            blob_id: stale,
+                            unit_key: 0,
+                            exact_fqn: "final.Parent".into(),
+                            normalized_fqn: "final.Parent".into(),
+                        }],
+                        DefinitionInventoryState::ProjectionComplete,
+                    )?;
+                    let names = tx.query_row(
+                        "SELECT COUNT(*) FROM workspace_file_definition_name_rows WHERE file_version_id = ?1",
+                        [version],
+                        |r| r.get(0),
+                    )?;
+                    let state = tx.query_row(
+                        "SELECT definition_inventory_state FROM workspace_file_versions WHERE file_version_id = ?1",
+                        [version],
+                        |r| r.get(0),
+                    )?;
+                    tx.commit()?;
+                    Ok((names, state))
+                })
+                .unwrap();
+            assert_eq!(
+                (names, state),
+                (0, None),
+                "{label}: the file is published unknown"
+            );
+            assert_eq!(
+                store
+                    .index_blob_candidates_for_key(
+                        "java",
+                        IndexFamily::DefinitionExact,
+                        b"final.Parent",
+                        true,
+                    )
+                    .unwrap(),
+                None,
+                "{label}: an unknown file proves no absence and lends no candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn definition_inventory_owner_replaces_names_and_fences_unknown_inputs() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = BlobKey::unvaried(oid(b"inventory"), "java");
+        let id = publish(&store, &key, GenerationId::BOOTSTRAP);
+        let file = WorkspaceFileRow {
+            decision: None,
+            rel_path: "mounted/A.java".into(),
+            blob_oid: key.oid,
+        };
+        store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                std::slice::from_ref(&file),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let query = || {
+            store
+                .index_blob_candidates_for_key(
+                    "java",
+                    IndexFamily::DefinitionExact,
+                    b"final.Parent",
+                    true,
+                )
+                .unwrap()
+        };
+        let reconcile = || {
+            let blob_oid = key.oid.to_string();
+            store
+                .conn
+                .execute(move |conn| -> Result<()> {
+                    let tx = conn.transaction()?;
+                    brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
+                        &tx,
+                        &blob_oid,
+                        "java",
+                        GenerationId::BOOTSTRAP.0,
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        assert!(query().is_none(), "legacy NULL must remain unknown");
+        for state in [
+            DefinitionInventoryState::PackageFactsIncomplete,
+            DefinitionInventoryState::UnresolvedAnchor,
+            DefinitionInventoryState::ProjectionComplete,
+        ] {
+            store.conn.execute(move |conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                let version = tx.query_row("SELECT file_version_id FROM workspace_file_versions WHERE valid_until IS NULL", [], |r| r.get(0))?;
+                for name in ["old.Parent", "final.Parent"] {
+                    replace_workspace_file_definition_inventory(&tx, version, &[DefinitionNameRow { blob_id: id, unit_key: 0, exact_fqn: name.into(), normalized_fqn: name.into() }], state)?;
+                }
+                let count: i64 = tx.query_row("SELECT COUNT(*) FROM workspace_file_definition_name_rows WHERE file_version_id=?1", [version], |r| r.get(0))?;
+                assert_eq!(count, 1);
+                tx.commit()?;
+                Ok(())
+            }).unwrap();
+            let result = query();
+            if state == DefinitionInventoryState::ProjectionComplete {
+                let rows = result.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].mounted_path, PathBuf::from("mounted/A.java"));
+                assert_eq!(rows[0].blob, key);
+            } else {
+                assert!(result.is_none());
+            }
+        }
+        assert_eq!(
+            store
+                .index_blob_candidates_for_key(
+                    "java",
+                    IndexFamily::DefinitionExact,
+                    b"absent",
+                    true
+                )
+                .unwrap(),
+            Some(vec![])
+        );
+        for sql in [
+            "UPDATE blob_meta SET is_complete=0",
+            "UPDATE blob_meta SET parse_completeness='partial'",
+            "UPDATE blobs SET generation=generation+1",
+        ] {
+            store
+                .conn
+                .execute(move |conn| -> Result<()> {
+                    conn.execute_batch(sql)?;
+                    Ok(())
+                })
+                .unwrap();
+            // The raw mutation stands in for a republish; the publication
+            // hook is what withdraws known from a blob that is no longer ready.
+            reconcile();
+            assert!(query().is_none(), "{sql}");
+            store.conn.execute(|conn| -> Result<()> { conn.execute_batch("UPDATE blob_meta SET is_complete=1,parse_completeness='complete'; UPDATE blobs SET generation=0;")?; Ok(()) }).unwrap();
+            // The same hook promotes the pending file version once ready again.
+            assert!(query().is_none(), "pending until the hook runs: {sql}");
+            reconcile();
+            assert_eq!(query().unwrap().len(), 1, "{sql}");
+        }
+        // A context-only projection change must not inherit the old certificate.
+        let old_version: i64 = store
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT file_version_id FROM workspace_file_versions WHERE valid_until IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let symbol = PathSymbolRow {
+            rel_path: file.rel_path.clone(),
+            blob_oid: file.blob_oid,
+            kind: CodeUnitType::Module,
+            package_name: "context".into(),
+            short_name: "A".into(),
+            exact_fqn: "context.A".into(),
+            normalized_fqn: "context.A".into(),
+            requires_imports: false,
+        };
+        store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                std::slice::from_ref(&file),
+                &[symbol],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            query().is_none(),
+            "replacement projection must stay unknown"
+        );
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                let version: i64 = tx.query_row(
+                    "SELECT file_version_id FROM workspace_file_versions WHERE valid_until IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_ne!(version, old_version);
+                replace_workspace_file_definition_inventory(
+                    &tx,
+                    version,
+                    &[DefinitionNameRow {
+                        blob_id: id,
+                        unit_key: 0,
+                        exact_fqn: "final.Parent".into(),
+                        normalized_fqn: "final.Parent".into(),
+                    }],
+                    DefinitionInventoryState::ProjectionComplete,
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(query().unwrap().len(), 1);
+        store
+            .conn
+            .execute(|conn| -> Result<()> {
+                conn.execute("DELETE FROM workspace_file_versions", [])?;
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM workspace_file_definition_name_rows",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(count, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The state of every current file version, by id.
+    fn inventory_states(store: &AnalyzerStore) -> Vec<Option<String>> {
+        store
+            .read_conn()
+            .unwrap()
+            .prepare(
+                "SELECT definition_inventory_state FROM workspace_file_versions
+                 WHERE valid_until IS NULL ORDER BY file_version_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// Runs the second writer in its own transaction, as every publisher does.
+    fn reconcile_inventory(store: &AnalyzerStore, key: &BlobKey, generation: GenerationId) {
+        let oid = key.oid.to_string();
+        let lang = key.lang.clone();
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                brokk_bifrost_core::definition_inventory::reconcile_definition_inventory_for_blob_tx(
+                    &tx,
+                    &oid,
+                    &lang,
+                    generation.0,
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The owner publication for the only current file version.
+    fn owner_publish_inventory(
+        store: &AnalyzerStore,
+        blob_id: i64,
+        names: &[&str],
+        state: DefinitionInventoryState,
+    ) {
+        let names: Vec<DefinitionNameRow> = names
+            .iter()
+            .map(|name| DefinitionNameRow {
+                blob_id,
+                unit_key: 0,
+                exact_fqn: (*name).into(),
+                normalized_fqn: (*name).into(),
+            })
+            .collect();
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                let version = tx.query_row(
+                    "SELECT file_version_id FROM workspace_file_versions WHERE valid_until IS NULL",
+                    [],
+                    |row| row.get(0),
+                )?;
+                replace_workspace_file_definition_inventory(&tx, version, &names, state)?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn sync_single_file(
+        store: &AnalyzerStore,
+        key: &BlobKey,
+        generation: GenerationId,
+        path: &str,
+    ) {
+        let file = WorkspaceFileRow {
+            decision: None,
+            rel_path: path.into(),
+            blob_oid: key.oid,
+        };
+        store
+            .sync_workspace_snapshot(
+                &key.lang,
+                generation,
+                std::slice::from_ref(&file),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+    }
+
+    fn exact_candidates(
+        store: &AnalyzerStore,
+        name: &str,
+    ) -> Option<Vec<DefinitionIndexCandidate>> {
+        store
+            .index_blob_candidates_for_key(
+                "java",
+                IndexFamily::DefinitionExact,
+                name.as_bytes(),
+                true,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn definition_inventory_state_follows_its_blob_through_readiness_and_deletion() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = BlobKey::unvaried(oid(b"lifecycle"), "java");
+        let generation = GenerationId::BOOTSTRAP;
+        let id = publish(&store, &key, generation);
+        let set_complete = |complete: bool| {
+            store
+                .conn
+                .execute(move |conn| -> Result<()> {
+                    conn.execute(
+                        "UPDATE blob_meta SET is_complete = ?1",
+                        [i64::from(complete)],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        set_complete(false);
+        sync_single_file(&store, &key, generation, "mounted/A.java");
+
+        // The projection is published while the blob is not ready: pending.
+        owner_publish_inventory(
+            &store,
+            id,
+            &["final.Parent"],
+            DefinitionInventoryState::ProjectionComplete,
+        );
+        assert_eq!(inventory_states(&store), vec![Some("blob_pending".into())]);
+        assert!(exact_candidates(&store, "final.Parent").is_none());
+
+        // Late readiness: the blob's publication promotes the pending row, and
+        // stamps the generation it proved.
+        set_complete(true);
+        assert_eq!(
+            inventory_states(&store),
+            vec![Some("blob_pending".into())],
+            "nothing promotes without a writer"
+        );
+        reconcile_inventory(&store, &key, generation);
+        assert_eq!(inventory_states(&store), vec![Some("known".into())]);
+        assert_eq!(exact_candidates(&store, "final.Parent").unwrap().len(), 1);
+
+        // Any path that removes the blob row withdraws the names in its own
+        // transaction: the delete cascades the name rows away. The raw delete
+        // stands in for the GC and repair deletes, whose own predicates never
+        // reach a mounted blob; the hook is the backstop. Readiness cannot
+        // bring the state back, because the rows are gone.
+        let oid = key.oid.to_string();
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                {
+                    let _cascade = sealed_families::CascadeDelete::new(&tx);
+                    tx.execute("DELETE FROM blobs", [])?;
+                }
+                brokk_bifrost_core::definition_inventory::withdraw_definition_inventory_for_deleted_blob_tx(
+                    &tx,
+                    &oid,
+                    "java",
+                    GenerationId::BOOTSTRAP.0,
+                    ParseVariant::Empty,
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        reconcile_inventory(&store, &key, generation);
+        assert_eq!(
+            inventory_states(&store),
+            vec![Some("names_withdrawn".into())]
+        );
+        assert!(exact_candidates(&store, "final.Parent").is_none());
+    }
+
+    #[test]
+    fn definition_inventory_known_file_reads_unknown_once_its_blob_is_incomplete() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = BlobKey::unvaried(oid(b"incomplete-after-known"), "java");
+        let id = publish(&store, &key, GenerationId::BOOTSTRAP);
+        sync_single_file(&store, &key, GenerationId::BOOTSTRAP, "mounted/A.java");
+        owner_publish_inventory(
+            &store,
+            id,
+            &["final.Parent"],
+            DefinitionInventoryState::ProjectionComplete,
+        );
+        assert_eq!(exact_candidates(&store, "final.Parent").unwrap().len(), 1);
+        // The unknown arms no longer inspect `blob_meta`, so the file's own
+        // state is the only thing that can make this read unknown.
+        store.mark_parsed_blob_incomplete_for_test(&key);
+        assert_eq!(inventory_states(&store), vec![Some("blob_pending".into())]);
+        assert!(exact_candidates(&store, "final.Parent").is_none());
+    }
+
+    #[test]
+    fn definition_inventory_state_is_withdrawn_when_a_new_generation_replaces_the_blob() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let key = BlobKey::unvaried(oid(b"rotation"), "java");
+        let id = publish(&store, &key, GenerationId::BOOTSTRAP);
+        sync_single_file(&store, &key, GenerationId::BOOTSTRAP, "mounted/A.java");
+        owner_publish_inventory(
+            &store,
+            id,
+            &["final.Parent"],
+            DefinitionInventoryState::ProjectionComplete,
+        );
+        assert_eq!(inventory_states(&store), vec![Some("known".into())]);
+        let next = store.ensure_language_epoch_value("java", "next").unwrap();
+        // register_blobs removes the generation-0 row and inserts a bare one.
+        store
+            .register_blobs(std::slice::from_ref(&key), next)
+            .unwrap();
+        assert_eq!(
+            inventory_states(&store),
+            vec![Some("names_withdrawn".into())]
+        );
+    }
+
+    /// One code unit shaped like a candidate class, in its own complete blob.
+    #[derive(Clone, Copy)]
+    struct InventoryUnit {
+        short_name: &'static str,
+        identifier: &'static str,
+        exact_fqn: Option<&'static str>,
+        normalized_fqn: Option<&'static str>,
+        in_declarations: bool,
+        in_definition_lookup: bool,
+        /// The unit is reachable only as the child of a second unit.
+        child_only: bool,
+    }
+
+    fn publish_inventory_unit(
+        store: &AnalyzerStore,
+        key: &BlobKey,
+        generation: GenerationId,
+        unit: InventoryUnit,
+    ) -> i64 {
+        store
+            .register_blobs(std::slice::from_ref(key), generation)
+            .unwrap();
+        let key = key.clone();
+        store
+            .conn
+            .execute(move |conn| -> Result<i64> {
+                // Fixture rows: the test writes the blob's unit rows directly,
+                // without the production blob-row owner.
+                crate::analyzer::store::sealed_families::fixture_rows(conn, |conn| {
+                    let tx = conn.transaction()?;
+                    let lang = key.lang.clone();
+                    let id: i64 = tx.query_row(
+                        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2 AND parse_variant = ?3",
+                        params![key.oid.to_string(), lang, key.variant],
+                        |row| row.get(0),
+                    )?;
+                    let owner = InventoryUnit {
+                        short_name: "Owner",
+                        identifier: "Owner",
+                        exact_fqn: None,
+                        normalized_fqn: None,
+                        in_declarations: true,
+                        in_definition_lookup: true,
+                        child_only: false,
+                    };
+                    let units = [unit, owner];
+                    let published = if unit.child_only { 2 } else { 1 };
+                    for (unit_key, row) in units[..published].iter().enumerate() {
+                        tx.execute(
+                            "INSERT INTO code_units(blob_id,lang,unit_key,kind,short_name,identifier,
+                             content_qualifier,exact_fqn,normalized_fqn,synthetic,is_type_alias,
+                             in_declarations,in_definition_lookup)
+                             VALUES(?1,?2,?3,0,?4,?5,'',?6,?7,0,0,?8,?9)",
+                            params![
+                                id,
+                                lang,
+                                unit_key,
+                                row.short_name,
+                                row.identifier,
+                                row.exact_fqn,
+                                row.normalized_fqn,
+                                row.in_declarations,
+                                row.in_definition_lookup
+                            ],
+                        )?;
+                    }
+                    if unit.child_only {
+                        // The candidate unit is declared only as a child edge of the owner.
+                        tx.execute(
+                            "INSERT INTO unit_children(blob_id,lang,parent_key,ordinal,child_key)
+                             VALUES(?1,?2,1,0,0)",
+                            params![id, lang],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT INTO blob_reference_fact_manifests(blob_id,lang,epoch,identifier_count)
+                         VALUES(?1,?2,1,0)",
+                        params![id, lang],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO blob_meta(blob_id,lang,contains_tests,content_package,
+                         stored_unit_count,range_count,signature_count,signature_metadata_count,
+                         supertype_count,child_count,import_statement_count,type_identifier_count,is_complete)
+                         VALUES(?1,?2,0,'',?3,0,0,0,0,?4,0,0,1)",
+                        params![id, lang, published, i64::from(unit.child_only)],
+                    )?;
+                    tx.commit()?;
+                    Ok(id)
+                })
+            })
+            .unwrap()
+    }
+
+    /// Every candidate class the arms must keep reachable, each in its own
+    /// mounted file, reached through its own key and only through it.
+    #[test]
+    fn definition_inventory_candidates_find_every_class_of_unit_row() {
+        struct Case {
+            label: &'static str,
+            path: &'static str,
+            unit: InventoryUnit,
+            /// Anchored name rows from the owner input, if any.
+            anchored: Option<(&'static str, &'static str)>,
+            family: IndexFamily,
+            key: &'static str,
+        }
+        let unit = |short: &'static str, identifier: &'static str| InventoryUnit {
+            short_name: short,
+            identifier,
+            exact_fqn: None,
+            normalized_fqn: None,
+            in_declarations: true,
+            in_definition_lookup: true,
+            child_only: false,
+        };
+        let cases = [
+            Case {
+                label: "declaration-only",
+                path: "m/Declared.java",
+                unit: InventoryUnit {
+                    exact_fqn: Some("decl.Only"),
+                    in_definition_lookup: false,
+                    ..unit("Only", "Only")
+                },
+                anchored: None,
+                family: IndexFamily::DefinitionExact,
+                key: "decl.Only",
+            },
+            Case {
+                label: "lookup-only",
+                path: "m/Lookup.java",
+                unit: InventoryUnit {
+                    exact_fqn: Some("look.Only"),
+                    in_declarations: false,
+                    ..unit("Only", "Only")
+                },
+                anchored: None,
+                family: IndexFamily::DefinitionExact,
+                key: "look.Only",
+            },
+            Case {
+                label: "metadata-only (in neither projection)",
+                path: "m/Metadata.java",
+                unit: InventoryUnit {
+                    exact_fqn: Some("meta.Only"),
+                    in_declarations: false,
+                    in_definition_lookup: false,
+                    ..unit("Only", "Only")
+                },
+                anchored: None,
+                family: IndexFamily::DefinitionExact,
+                key: "meta.Only",
+            },
+            Case {
+                label: "child-only",
+                path: "m/Child.java",
+                unit: InventoryUnit {
+                    exact_fqn: Some("child.Only"),
+                    in_declarations: false,
+                    in_definition_lookup: false,
+                    child_only: true,
+                    ..unit("Only", "Only")
+                },
+                anchored: None,
+                family: IndexFamily::DefinitionExact,
+                key: "child.Only",
+            },
+            Case {
+                label: "identifier differs from short_name",
+                path: "m/Identifier.java",
+                unit: unit("Widget", "widget_ident"),
+                anchored: None,
+                family: IndexFamily::DefinitionIdentifier,
+                key: "widget_ident",
+            },
+            Case {
+                label: "short_name when the identifier differs",
+                path: "m/Short.java",
+                unit: unit("Gadget", "gadget_ident"),
+                anchored: None,
+                family: IndexFamily::DefinitionIdentifier,
+                key: "Gadget",
+            },
+            Case {
+                label: "normalized spelling",
+                path: "m/Normalized.java",
+                unit: InventoryUnit {
+                    exact_fqn: Some("raw.Spelling"),
+                    normalized_fqn: Some("norm.Spelling"),
+                    ..unit("Spelling", "Spelling")
+                },
+                anchored: None,
+                family: IndexFamily::DefinitionNormalizedTail,
+                key: "norm.Spelling",
+            },
+            Case {
+                label: "anchored name row",
+                path: "m/Anchored.java",
+                unit: unit("Anchor", "Anchor"),
+                anchored: Some(("anchored.Name", "anchored.Name")),
+                family: IndexFamily::DefinitionExact,
+                key: "anchored.Name",
+            },
+            Case {
+                label: "anchored normalized name row",
+                path: "m/AnchoredNormalized.java",
+                unit: unit("Anchored2", "Anchored2"),
+                anchored: Some(("anchored.Raw", "anchored.Norm")),
+                family: IndexFamily::DefinitionNormalizedTail,
+                key: "anchored.Norm",
+            },
+        ];
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = GenerationId::BOOTSTRAP;
+        let mut files = Vec::new();
+        let mut blobs = Vec::new();
+        for (index, case) in cases.iter().enumerate() {
+            let key = BlobKey::unvaried(oid(case.label.as_bytes()), "java");
+            let id = publish_inventory_unit(&store, &key, generation, case.unit);
+            files.push(WorkspaceFileRow {
+                decision: None,
+                rel_path: case.path.into(),
+                blob_oid: key.oid,
+            });
+            blobs.push((index, key, id));
+        }
+        // A path-derived synthetic row: no unit in its blob, no imports.
+        let synthetic_key = BlobKey::unvaried(oid(b"path-derived"), "java");
+        publish_inventory_unit(&store, &synthetic_key, generation, unit("Path", "Path"));
+        files.push(WorkspaceFileRow {
+            decision: None,
+            rel_path: "m/Synthetic.java".into(),
+            blob_oid: synthetic_key.oid,
+        });
+        let path_symbol = PathSymbolRow {
+            rel_path: "m/Synthetic.java".into(),
+            blob_oid: synthetic_key.oid,
+            kind: CodeUnitType::Module,
+            package_name: "syn".into(),
+            short_name: "Synthetic".into(),
+            exact_fqn: "syn.Synthetic".into(),
+            normalized_fqn: "syn.Synthetic".into(),
+            requires_imports: false,
+        };
+        store
+            .sync_workspace_snapshot(
+                "java",
+                generation,
+                &files,
+                std::slice::from_ref(&path_symbol),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        // The owner input: every file's projection is complete; the anchored
+        // cases carry their final name rows.
+        let by_path: HashMap<String, i64> = store
+            .read_conn()
+            .unwrap()
+            .prepare("SELECT rel_path, file_version_id FROM workspace_file_versions WHERE valid_until IS NULL")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut owner_rows = Vec::new();
+        for (index, _, id) in &blobs {
+            let case = &cases[*index];
+            let names = case
+                .anchored
+                .iter()
+                .map(|(exact, normalized)| DefinitionNameRow {
+                    blob_id: *id,
+                    unit_key: 0,
+                    exact_fqn: (*exact).into(),
+                    normalized_fqn: (*normalized).into(),
+                })
+                .collect::<Vec<_>>();
+            owner_rows.push((by_path[case.path], names));
+        }
+        owner_rows.push((by_path["m/Synthetic.java"], Vec::new()));
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                let tx = conn.transaction()?;
+                for (version, names) in &owner_rows {
+                    replace_workspace_file_definition_inventory(
+                        &tx,
+                        *version,
+                        names,
+                        DefinitionInventoryState::ProjectionComplete,
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            inventory_states(&store)
+                .iter()
+                .all(|state| *state == Some("known".into()))
+        );
+        for (index, key, _) in &blobs {
+            let case = &cases[*index];
+            let found = store
+                .index_blob_candidates_for_key("java", case.family, case.key.as_bytes(), true)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{}: inventory unexpectedly unknown", case.label));
+            assert_eq!(
+                found,
+                vec![DefinitionIndexCandidate {
+                    mounted_path: PathBuf::from(case.path),
+                    blob: key.clone(),
+                }],
+                "{}",
+                case.label
+            );
+        }
+        let found = store
+            .index_blob_candidates_for_key("java", IndexFamily::PathSymbol, b"syn.Synthetic", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![DefinitionIndexCandidate {
+                mounted_path: PathBuf::from("m/Synthetic.java"),
+                blob: synthetic_key.clone(),
+            }],
+            "path-derived synthetic row without imports"
+        );
+    }
+
+    /// A remount is a new file version: it is unknown until its owner
+    /// publication, and then the new path is the only candidate.
+    #[test]
+    fn definition_inventory_remounted_file_is_a_candidate_only_at_its_new_path() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = GenerationId::BOOTSTRAP;
+        let key = BlobKey::unvaried(oid(b"remount"), "java");
+        let id = publish(&store, &key, generation);
+        for (path, expected_path) in [
+            ("mounted/A.java", "mounted/A.java"),
+            ("moved/B.java", "moved/B.java"),
+        ] {
+            sync_single_file(&store, &key, generation, path);
+            if path == "moved/B.java" {
+                assert!(
+                    exact_candidates(&store, "final.Parent").is_none(),
+                    "the remounted file version is unknown until its owner publication"
+                );
+            }
+            owner_publish_inventory(
+                &store,
+                id,
+                &["final.Parent"],
+                DefinitionInventoryState::ProjectionComplete,
+            );
+            assert_eq!(
+                exact_candidates(&store, "final.Parent").unwrap(),
+                vec![DefinitionIndexCandidate {
+                    mounted_path: PathBuf::from(expected_path),
+                    blob: key.clone(),
+                }]
+            );
+        }
+    }
+
+    /// A configured parse variant: the candidate is the variant blob that the
+    /// file version's decision selects, not the unvaried blob of the same oid.
+    #[test]
+    fn definition_inventory_configured_variant_finds_the_selected_blob() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = GenerationId::BOOTSTRAP;
+        let variant = BlobKey {
+            oid: oid(b"variant"),
+            lang: "csharp".into(),
+            variant: ParseVariant::Digest([7; 32]),
+        };
+        let plain = BlobKey::unvaried(variant.oid, "csharp");
+        let unit = InventoryUnit {
+            short_name: "Variant",
+            identifier: "Variant",
+            exact_fqn: Some("variant.Only"),
+            normalized_fqn: None,
+            in_declarations: true,
+            in_definition_lookup: true,
+            child_only: false,
+        };
+        let id = publish_inventory_unit(&store, &variant, generation, unit);
+        publish_inventory_unit(&store, &plain, generation, unit);
+        let file = WorkspaceFileRow {
+            decision: Some(FileVersionDecision {
+                decision_digest: [7; 32],
+                assignment_digest: [8; 32],
+            }),
+            rel_path: "m/Variant.cs".into(),
+            blob_oid: variant.oid,
+        };
+        store
+            .sync_workspace_snapshot(
+                "csharp",
+                generation,
+                std::slice::from_ref(&file),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        owner_publish_inventory(
+            &store,
+            id,
+            &[],
+            DefinitionInventoryState::ProjectionComplete,
+        );
+        assert_eq!(
+            store
+                .index_blob_candidates_for_key(
+                    "csharp",
+                    IndexFamily::DefinitionExact,
+                    b"variant.Only",
+                    true
+                )
+                .unwrap()
+                .unwrap(),
+            vec![DefinitionIndexCandidate {
+                mounted_path: PathBuf::from("m/Variant.cs"),
+                blob: variant.clone(),
+            }]
+        );
+        // The decision's variant is the blob half of known: an incomplete
+        // variant blob withdraws it even though the unvaried blob is ready.
+        store
+            .conn
+            .execute(|conn| -> Result<()> {
+                conn.execute(
+                    "UPDATE blob_meta SET is_complete = 0
+                     WHERE blob_id = (SELECT id FROM blobs WHERE parse_variant <> x'')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        reconcile_inventory(&store, &variant, generation);
+        assert_eq!(inventory_states(&store), vec![Some("blob_pending".into())]);
+    }
+
+    /// Two C# parse variants of one oid share a generation. Collecting the
+    /// unmounted one deletes only its own blob row, so a file version that
+    /// selects the other variant keeps its blob and its name rows.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10325: collecting an unmounted C# parse variant withdrew the names of the mounted one"
+    )]
+    fn collecting_an_unmounted_variant_leaves_the_mounted_variant_known() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = GenerationId::BOOTSTRAP;
+        let mounted = BlobKey {
+            oid: oid(b"sibling-variants"),
+            lang: "csharp".into(),
+            variant: ParseVariant::Digest([7; 32]),
+        };
+        let unmounted = BlobKey::unvaried(mounted.oid, "csharp");
+        let unit = InventoryUnit {
+            short_name: "Variant",
+            identifier: "Variant",
+            exact_fqn: Some("variant.Only"),
+            normalized_fqn: None,
+            in_declarations: true,
+            in_definition_lookup: true,
+            child_only: false,
+        };
+        let id = publish_inventory_unit(&store, &mounted, generation, unit);
+        publish_inventory_unit(&store, &unmounted, generation, unit);
+        let file = WorkspaceFileRow {
+            decision: Some(FileVersionDecision {
+                decision_digest: [7; 32],
+                assignment_digest: [8; 32],
+            }),
+            rel_path: "m/Variant.cs".into(),
+            blob_oid: mounted.oid,
+        };
+        store
+            .sync_workspace_snapshot(
+                "csharp",
+                generation,
+                std::slice::from_ref(&file),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        owner_publish_inventory(
+            &store,
+            id,
+            &[],
+            DefinitionInventoryState::ProjectionComplete,
+        );
+        let known = vec![Some("known".into())];
+        assert_eq!(inventory_states(&store), known);
+
+        assert_eq!(
+            store.gc_with(|_| false).unwrap(),
+            1,
+            "only the unmounted row"
+        );
+        assert_eq!(
+            store.missing_blobs(std::slice::from_ref(&mounted)).unwrap(),
+            vec![]
+        );
+        assert_eq!(store.missing_blobs(&[unmounted]).unwrap().len(), 1);
+        assert_eq!(
+            inventory_states(&store),
+            known,
+            "the mounted variant's rows and blob were not touched"
+        );
+        assert_eq!(
+            store
+                .index_blob_candidates_for_key(
+                    "csharp",
+                    IndexFamily::DefinitionExact,
+                    b"variant.Only",
+                    true
+                )
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// Every Rust source under `crates/` and `tests/`, with its workspace-relative path.
+    fn workspace_rust_sources() -> Vec<(String, String)> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut pending = vec![root.join("crates"), root.join("tests")];
+        let mut sources = Vec::new();
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                sources.push((relative, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+        sources.sort();
+        sources
+    }
+
+    /// The name rows have one writer, and `definition_inventory_state` has
+    /// exactly three writer functions: the
+    /// owner publication in this file, and the blob-keyed reconcile and
+    /// delete-withdrawal hooks in core. The scan is over source text, so the needles are spelled in
+    /// pieces and this test never matches itself.
+    #[test]
+    fn definition_inventory_has_one_name_writer_and_three_state_writers() {
+        let name_insert = ["INSERT INTO ", "workspace_file_definition_name_rows"].concat();
+        let state_set = ["SET definition_inventory_", "state"].concat();
+        let versions_insert = ["INTO ", "workspace_file_versions"].concat();
+        let versions_insert_main = ["INTO main.", "workspace_file_versions"].concat();
+        let scratch_table = ["CREATE TABLE ", "workspace_file_versions("].concat();
+        let mut name_writers = Vec::new();
+        let mut state_writers = Vec::new();
+        for (path, source) in workspace_rust_sources() {
+            for _ in source.match_indices(&name_insert) {
+                name_writers.push(path.clone());
+            }
+            for _ in source.match_indices(&state_set) {
+                state_writers.push(path.clone());
+            }
+            // An INSERT into the file versions names its columns, and the
+            // inventory column is not among them.
+            for needle in [&versions_insert, &versions_insert_main] {
+                for (at, _) in source.match_indices(needle.as_str()) {
+                    let rest = source[at + needle.len()..].trim_start();
+                    let Some(columns) = rest.strip_prefix('(') else {
+                        // A positional INSERT is allowed only into a scratch
+                        // table that the same source file creates itself.
+                        assert!(
+                            source.contains(&scratch_table),
+                            "{path}: INSERT without a column list"
+                        );
+                        continue;
+                    };
+                    let columns = columns.split(')').next().unwrap();
+                    assert!(
+                        !columns.contains("definition_inventory_state"),
+                        "{path}: INSERT writes an inventory column"
+                    );
+                }
+            }
+        }
+        assert_eq!(name_writers.len(), 1, "{name_writers:?}");
+        // Owner: the file-version promotion and the state UPDATE. Hooks: the
+        // blob-keyed promotion and demotion, and the delete-time withdrawal.
+        let expected = [
+            "crates/bifrost-core/src/definition_inventory.rs",
+            "crates/bifrost-core/src/definition_inventory.rs",
+            "crates/bifrost-core/src/definition_inventory.rs",
+            "crates/bifrost-store/src/analyzer/store/mod.rs",
+            "crates/bifrost-store/src/analyzer/store/mod.rs",
+        ];
+        // The one test exception writes NULL to fake a row from before
+        // migration 0292.
+        let legacy_fixture = "crates/bifrost-tools/src/engine_tests/definition_index_inventory.rs";
+        let expected_states = [expected.as_slice(), &[legacy_fixture]].concat();
+        assert_eq!(state_writers, expected_states, "state writers");
     }
 
     #[test]
@@ -26913,5 +30857,119 @@ mod generation_liveness_properties {
             error.sqlite_error_code(),
             Some(rusqlite::ErrorCode::ConstraintViolation)
         );
+    }
+}
+
+#[cfg(test)]
+mod selected_summary_write_owner_tests {
+    use super::*;
+
+    #[test]
+    fn selected_summary_triggers_advance_across_replace_delete_and_rollback() {
+        let conn = Connection::open_in_memory().unwrap();
+        let generation = register_selected_summary_generation(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE selected_rust_unit_summaries(id INTEGER PRIMARY KEY, value TEXT);\
+             CREATE TEMP TRIGGER selected_insert AFTER INSERT ON selected_rust_unit_summaries BEGIN SELECT bifrost_selected_summary_bump(); END;\
+             CREATE TEMP TRIGGER selected_update AFTER UPDATE ON selected_rust_unit_summaries BEGIN SELECT bifrost_selected_summary_bump(); END;\
+             CREATE TEMP TRIGGER selected_delete AFTER DELETE ON selected_rust_unit_summaries BEGIN SELECT bifrost_selected_summary_bump(); END;",
+        ).unwrap();
+        let load = || generation.load(Ordering::Relaxed);
+        conn.execute_batch("INSERT INTO temp.selected_rust_unit_summaries VALUES(1,'a')")
+            .unwrap();
+        let after_insert = load();
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO temp.selected_rust_unit_summaries VALUES(1,'b')",
+        )
+        .unwrap();
+        assert!(load() > after_insert);
+        let after_replace = load();
+        conn.execute_batch("DELETE FROM temp.selected_rust_unit_summaries")
+            .unwrap();
+        assert!(load() > after_replace);
+        conn.execute_batch(
+            "SAVEPOINT selected_test; INSERT INTO temp.selected_rust_unit_summaries VALUES(1,'c')",
+        )
+        .unwrap();
+        let within_savepoint = load();
+        conn.execute_batch("ROLLBACK TO selected_test; RELEASE selected_test")
+            .unwrap();
+        assert_eq!(
+            load(),
+            within_savepoint,
+            "rollback must not restore an old key"
+        );
+        conn.execute_batch("INSERT INTO temp.selected_rust_unit_summaries VALUES(1,'d')")
+            .unwrap();
+        assert!(
+            load() > within_savepoint,
+            "different rewrite must miss the old generation"
+        );
+    }
+
+    #[test]
+    fn sql_writes_to_selected_summary_rows_stay_in_owner_module() {
+        fn visit(path: &std::path::Path, offenders: &mut Vec<String>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, offenders);
+                    continue;
+                }
+                if !matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("rs" | "sql")
+                ) {
+                    continue;
+                }
+                if path
+                    == std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("src/analyzer/store/mod.rs")
+                    || path.file_name().and_then(|name| name.to_str())
+                        == Some("rust_selected_units_fill.sql")
+                {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let normalized = text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                let table = ["selected_rust", "unit_summaries"].join("_");
+                for verb in ["insert into", "update", "delete from"] {
+                    for qualifier in ["", "temp."] {
+                        if normalized.contains(&format!("{verb} {qualifier}{table}")) {
+                            offenders
+                                .push(format!("{}: {verb} {qualifier}{table}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut offenders = Vec::new();
+        visit(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap(),
+            &mut offenders,
+        );
+        assert!(
+            offenders.is_empty(),
+            "selected summary writes bypass owner: {offenders:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "active operation must advance")]
+    fn selected_summary_owner_requires_generation_for_active_operation() {
+        let connection = Connection::open_in_memory().unwrap();
+        selected_summary_write(
+            SelectedSummaryWriteTarget::Now(&connection),
+            SelectedSummaryWrite::ClearRows,
+            None,
+            true,
+        )
+        .unwrap();
     }
 }

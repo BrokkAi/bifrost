@@ -91,6 +91,8 @@ pub fn resolve_php_semantic_pack_dependencies(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
+    // Composer autoload targets may recursively walk installed package trees.
+    brokk_bifrost_analysis::analyzer::dependency_support::refuse_external_discovery_reads();
     let mut dependencies = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
     let mut metadata_inputs_considered = 0_usize;
@@ -835,7 +837,7 @@ const COMPOSER_MANIFEST_FILE_NAME: &str = "composer.json";
 const PHP_TOOLCHAIN_NAME: &str = "php";
 
 /// The builtin declaration pack a declared `php` version selects
-/// (`semantic-packs/php/phpstorm-stubs-*.json`).
+/// (authored in `BrokkAi/bifrost-packs`).
 const PHP_BUILTIN_PACK_ID: &str = "bifrost.php-builtin";
 
 /// The ecosystem term a PHP *runtime* dependency publishes. The runtime is not

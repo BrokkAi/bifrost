@@ -1,6 +1,6 @@
 //! Stack-safe, request-bounded algorithms over immutable dense control-flow graphs.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use brokk_bifrost_core::cancellation::CancellationToken;
 
@@ -80,6 +80,129 @@ pub trait DenseBidirectionalGraph {
         node: Self::Node,
     ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_;
     fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)>;
+}
+
+/// A procedure-local view that excludes proven infeasible control edges.
+/// Other graph consumers continue to see the retained topology until they
+/// explicitly adopt this view.
+pub struct FeasibleSuccessors<'a, G: DenseBidirectionalGraph> {
+    graph: &'a G,
+    excluded: BTreeSet<G::Edge>,
+    outgoing: Vec<usize>,
+    incoming: Vec<usize>,
+}
+
+impl<'a, G: DenseBidirectionalGraph> FeasibleSuccessors<'a, G> {
+    pub fn new(graph: &'a G, excluded: impl IntoIterator<Item = G::Edge>) -> Self {
+        let mut view = Self {
+            graph,
+            excluded: BTreeSet::new(),
+            outgoing: vec![0; graph.node_count()],
+            incoming: vec![0; graph.node_count()],
+        };
+        for edge in excluded {
+            if let Some((source, target)) = graph.edge_endpoints(edge)
+                && view.excluded.insert(edge)
+            {
+                view.outgoing[graph.node_index(source).expect("valid control source")] += 1;
+                view.incoming[graph.node_index(target).expect("valid control target")] += 1;
+            }
+        }
+        view
+    }
+}
+
+struct FeasibleEdges<'a, I, E> {
+    inner: I,
+    excluded: &'a BTreeSet<E>,
+    remaining: usize,
+}
+
+impl<I, E, N> Iterator for FeasibleEdges<'_, I, E>
+where
+    I: Iterator<Item = (E, N)>,
+    E: Ord,
+{
+    type Item = (E, N);
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.find(|(edge, _)| !self.excluded.contains(edge));
+        if item.is_some() {
+            self.remaining -= 1;
+        }
+        item
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<I, E, N> DoubleEndedIterator for FeasibleEdges<'_, I, E>
+where
+    I: DoubleEndedIterator<Item = (E, N)>,
+    E: Ord,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let item = self.inner.rfind(|(edge, _)| !self.excluded.contains(edge));
+        if item.is_some() {
+            self.remaining -= 1;
+        }
+        item
+    }
+}
+
+impl<I, E, N> ExactSizeIterator for FeasibleEdges<'_, I, E>
+where
+    I: ExactSizeIterator<Item = (E, N)>,
+    E: Ord,
+{
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+impl<G: DenseBidirectionalGraph> DenseBidirectionalGraph for FeasibleSuccessors<'_, G> {
+    type Node = G::Node;
+    type Edge = G::Edge;
+    fn node_count(&self) -> usize {
+        self.graph.node_count()
+    }
+    fn node_at(&self, index: usize) -> Option<Self::Node> {
+        self.graph.node_at(index)
+    }
+    fn node_index(&self, node: Self::Node) -> Option<usize> {
+        self.graph.node_index(node)
+    }
+    fn successors(
+        &self,
+        node: Self::Node,
+    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
+        let inner = self.graph.successors(node);
+        let remaining =
+            inner.len() - self.outgoing[self.graph.node_index(node).expect("valid control node")];
+        FeasibleEdges {
+            inner,
+            excluded: &self.excluded,
+            remaining,
+        }
+    }
+    fn predecessors(
+        &self,
+        node: Self::Node,
+    ) -> impl DoubleEndedIterator<Item = (Self::Edge, Self::Node)> + ExactSizeIterator + '_ {
+        let inner = self.graph.predecessors(node);
+        let remaining =
+            inner.len() - self.incoming[self.graph.node_index(node).expect("valid control node")];
+        FeasibleEdges {
+            inner,
+            excluded: &self.excluded,
+            remaining,
+        }
+    }
+    fn edge_endpoints(&self, edge: Self::Edge) -> Option<(Self::Node, Self::Node)> {
+        (!self.excluded.contains(&edge))
+            .then(|| self.graph.edge_endpoints(edge))
+            .flatten()
+    }
 }
 
 /// A dense graph over `usize` nodes built from its edge list, for the callers
@@ -292,6 +415,7 @@ impl<'request> CfgAlgorithmRequest<'request> {
         }
     }
 
+    // Statement assessment in bifrost-analysis charges potential CFG edges to this shared budget.
     #[doc(hidden)]
     pub fn visit_node<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
         self.checkpoint()?;
@@ -314,7 +438,8 @@ impl<'request> CfgAlgorithmRequest<'request> {
         self.visit_node()
     }
 
-    pub(crate) fn visit_edge<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
+    #[doc(hidden)]
+    pub fn visit_edge<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
         self.checkpoint()?;
         self.budget
             .charge(CfgAlgorithmWork {
@@ -379,7 +504,65 @@ pub fn forward_reachability<G>(
 where
     G: DenseBidirectionalGraph,
 {
-    reachability(graph, start, Direction::Forward, &|_| false, request)
+    reachability(
+        graph,
+        start,
+        Direction::Forward,
+        &|_| false,
+        &|_| true,
+        &|_| true,
+        &|_| (&[], &[]),
+        request,
+    )
+}
+
+/// Forward closure over retained edges and caller-supplied potential successors.
+/// `continue_from` can stop a path at an uncertain completion. Every potential
+/// successor is charged to the same request as a retained edge.
+pub fn forward_reachability_with_successors<'a, G>(
+    graph: &G,
+    start: G::Node,
+    continue_from: impl Fn(G::Node) -> bool,
+    added_successors: impl Fn(G::Node) -> (&'a [G::Node], &'a [G::Node]),
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<Reachability<G::Node>, CfgAlgorithmError<G::Node>>
+where
+    G: DenseBidirectionalGraph,
+    G::Node: 'a,
+{
+    forward_reachability_with_filtered_successors(
+        graph,
+        start,
+        continue_from,
+        |_| true,
+        added_successors,
+        request,
+    )
+}
+
+/// Forward closure with a proof filter for retained control edges.
+pub fn forward_reachability_with_filtered_successors<'a, G>(
+    graph: &G,
+    start: G::Node,
+    continue_from: impl Fn(G::Node) -> bool,
+    edge_allowed: impl Fn(G::Edge) -> bool,
+    added_successors: impl Fn(G::Node) -> (&'a [G::Node], &'a [G::Node]),
+    request: &mut CfgAlgorithmRequest<'_>,
+) -> Result<Reachability<G::Node>, CfgAlgorithmError<G::Node>>
+where
+    G: DenseBidirectionalGraph,
+    G::Node: 'a,
+{
+    reachability(
+        graph,
+        start,
+        Direction::Forward,
+        &|_| false,
+        &continue_from,
+        &edge_allowed,
+        &added_successors,
+        request,
+    )
 }
 
 pub fn reverse_reachability<G>(
@@ -390,7 +573,16 @@ pub fn reverse_reachability<G>(
 where
     G: DenseBidirectionalGraph,
 {
-    reachability(graph, start, Direction::Reverse, &|_| false, request)
+    reachability(
+        graph,
+        start,
+        Direction::Reverse,
+        &|_| false,
+        &|_| true,
+        &|_| true,
+        &|_| (&[], &[]),
+        request,
+    )
 }
 
 /// Reachability in the forward direction where an `avoid`ed node is a barrier.
@@ -410,18 +602,33 @@ pub fn forward_reachability_avoiding<G>(
 where
     G: DenseBidirectionalGraph,
 {
-    reachability(graph, start, Direction::Forward, &avoid, request)
+    reachability(
+        graph,
+        start,
+        Direction::Forward,
+        &avoid,
+        &|_| true,
+        &|_| true,
+        &|_| (&[], &[]),
+        request,
+    )
 }
 
-fn reachability<G>(
+// Keep all traversals in this one budgeted walker, including proven-edge closure.
+#[allow(clippy::too_many_arguments)]
+fn reachability<'a, G>(
     graph: &G,
     start: G::Node,
     direction: Direction,
     avoid: &impl Fn(G::Node) -> bool,
+    continue_from: &impl Fn(G::Node) -> bool,
+    edge_allowed: &impl Fn(G::Edge) -> bool,
+    added_successors: &impl Fn(G::Node) -> (&'a [G::Node], &'a [G::Node]),
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<Reachability<G::Node>, CfgAlgorithmError<G::Node>>
 where
     G: DenseBidirectionalGraph,
+    G::Node: 'a,
 {
     request.checkpoint()?;
     let started = request.budget.used();
@@ -442,6 +649,9 @@ where
 
     while let Some(node) = stack.pop() {
         request.checkpoint()?;
+        if !continue_from(node) {
+            continue;
+        }
         match direction {
             Direction::Forward => discover_adjacent(
                 graph,
@@ -449,6 +659,7 @@ where
                 &mut membership,
                 &mut stack,
                 avoid,
+                edge_allowed,
                 request,
             )?,
             Direction::Reverse => discover_adjacent(
@@ -457,8 +668,26 @@ where
                 &mut membership,
                 &mut stack,
                 avoid,
+                edge_allowed,
                 request,
             )?,
+        }
+        if matches!(direction, Direction::Forward) {
+            let (explicit, dense_suffix) = added_successors(node);
+            for &adjacent_node in explicit.iter().chain(dense_suffix) {
+                request.visit_edge()?;
+                if avoid(adjacent_node) {
+                    continue;
+                }
+                let index = graph
+                    .node_index(adjacent_node)
+                    .ok_or(CfgAlgorithmError::InvalidNode(adjacent_node))?;
+                if !membership[index] {
+                    membership[index] = true;
+                    request.visit_node()?;
+                    stack.push(adjacent_node);
+                }
+            }
         }
     }
 
@@ -475,14 +704,15 @@ fn discover_adjacent<G>(
     membership: &mut [bool],
     stack: &mut Vec<G::Node>,
     avoid: &impl Fn(G::Node) -> bool,
+    edge_allowed: &impl Fn(G::Edge) -> bool,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<(), CfgAlgorithmError<G::Node>>
 where
     G: DenseBidirectionalGraph,
 {
-    for (_, adjacent_node) in adjacent {
+    for (edge, adjacent_node) in adjacent {
         request.visit_edge()?;
-        if avoid(adjacent_node) {
+        if !edge_allowed(edge) || avoid(adjacent_node) {
             continue;
         }
         let index = graph
@@ -917,29 +1147,81 @@ impl<Node: Copy> Dominators<Node> {
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
-        let (Some(a_index), Some(b_index)) = (graph.node_index(a), graph.node_index(b)) else {
-            return false;
-        };
-        if self.immediate.get(a_index).copied().flatten().is_none() {
-            return false;
-        }
-        let mut cursor = b_index;
-        loop {
-            let Some(parent) = self.immediate.get(cursor).copied().flatten() else {
-                return false;
-            };
-            if cursor == a_index {
-                return true;
-            }
-            if parent == cursor {
-                return false;
-            }
-            cursor = parent;
+        dominates_with_parent(graph, a, b, |index| {
+            self.immediate.get(index).copied().flatten()
+        })
+    }
+
+    pub(crate) fn into_compact(self) -> CompactDominators {
+        CompactDominators {
+            immediate: self
+                .immediate
+                .into_iter()
+                .map(|parent| {
+                    parent.map_or(u32::MAX, |index| {
+                        assert!(
+                            index < u32::MAX as usize,
+                            "compact dominance requires u32 point counts"
+                        );
+                        index as u32
+                    })
+                })
+                .collect(),
         }
     }
 
     pub const fn work(&self) -> CfgAlgorithmWork {
         self.work
+    }
+}
+
+/// Compact immutable dominance retained by a validated procedure.
+#[derive(Debug)]
+pub(crate) struct CompactDominators {
+    immediate: Box<[u32]>,
+}
+
+impl CompactDominators {
+    pub(crate) fn dominates<G: DenseBidirectionalGraph>(
+        &self,
+        graph: &G,
+        a: G::Node,
+        b: G::Node,
+    ) -> bool {
+        dominates_with_parent(graph, a, b, |index| {
+            self.immediate
+                .get(index)
+                .copied()
+                .filter(|parent| *parent != u32::MAX)
+                .map(|parent| parent as usize)
+        })
+    }
+}
+
+fn dominates_with_parent<G: DenseBidirectionalGraph>(
+    graph: &G,
+    a: G::Node,
+    b: G::Node,
+    parent: impl Fn(usize) -> Option<usize>,
+) -> bool {
+    let (Some(a_index), Some(b_index)) = (graph.node_index(a), graph.node_index(b)) else {
+        return false;
+    };
+    if parent(a_index).is_none() {
+        return false;
+    }
+    let mut cursor = b_index;
+    loop {
+        let Some(next) = parent(cursor) else {
+            return false;
+        };
+        if cursor == a_index {
+            return true;
+        }
+        if next == cursor {
+            return false;
+        }
+        cursor = next;
     }
 }
 

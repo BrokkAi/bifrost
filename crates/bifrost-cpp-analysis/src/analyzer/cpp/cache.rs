@@ -101,7 +101,7 @@ pub(crate) fn weight_cpp_overwritten_candidates(
 
 pub(crate) fn weight_code_unit_set_by_file(
     _key: &ProjectFile,
-    value: &Arc<HashSet<CodeUnit>>,
+    value: &Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
 ) -> u32 {
     let size = value.iter().fold(0usize, |acc, item| {
         acc + size_of::<CodeUnit>()

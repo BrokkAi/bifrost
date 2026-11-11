@@ -5,12 +5,10 @@ use super::{AnalyzerStore, WorkspaceSnapshotId};
 use super::{Result, StoreError};
 use crate::CancellationToken;
 use brokk_bifrost_core::analyzer::resolution_facts::*;
-#[cfg(any(test, feature = "test-support"))]
 use rusqlite::OptionalExtension;
 use rusqlite::{Connection, Transaction, params};
 
 /// Construct the Python-owned, operation-local module declaration classifier.
-#[cfg(any(test, feature = "test-support"))]
 pub fn namespace_definition_provider()
 -> Box<dyn super::language_support::NamespaceDefinitionClassifier> {
     super::resolution_operation::python_demand::namespace_definition_provider()
@@ -22,21 +20,16 @@ pub fn namespace_definition_provider()
 // Format 6 also requires member role/base inputs and compiler proxy contexts.
 // Format 7 fixes authored parameter/field type owners and positional receiver roles.
 // Format 7 also publishes direct assignment Value properties for typed reads.
-// Production builds do not admit Python to selected overlays. Test-support builds
-// admit it for the native trial; their test-support stores are rejected by the
-// flip's format bump. The production flip ends this freeze and sets the format
-// once with its rejection test (#6108).
-pub(crate) const NATIVE_SOURCE_FORMAT: i64 = 7;
+// The format-7 trial freeze ended with the production switch (#5658).
+pub(crate) const NATIVE_SOURCE_FORMAT: i64 = 8;
 // Dormant inputs also retain dynamic operations and exact/prefix/Any names.
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub(crate) struct BindingScope {
     pub(crate) scope: u32,
     pub(crate) parent: Option<u32>,
     pub(crate) class_body: bool,
 }
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub(crate) struct BindingSlot {
     pub(crate) slot: u32,
@@ -44,7 +37,6 @@ pub(crate) struct BindingSlot {
     pub(crate) name: String,
     pub(crate) whole_scope: bool,
 }
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub(crate) struct BindingEvent {
     pub(crate) event: u32,
@@ -57,14 +49,15 @@ pub(crate) struct BindingEvent {
     pub(crate) entry_byte: usize,
     pub(crate) commit_byte: usize,
     pub(crate) phase: u32,
+    /// The source site of `<reference>` in a direct single-target assignment
+    /// `name = <reference>`; none for every other writer.
+    pub(crate) source_reference: Option<u32>,
 }
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub(crate) struct BindingDirective {
     pub(crate) fact: ResolutionBindingDirectiveFact,
     pub(crate) name: String,
 }
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub(crate) struct PythonBindingRows {
     pub(crate) scopes: Vec<BindingScope>,
@@ -80,7 +73,6 @@ pub(crate) struct PythonBindingRows {
     pub(crate) loop_regions: Vec<(u32, std::ops::Range<usize>)>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl super::cache_budget::RetainedBytes for PythonBindingRows {
     fn retained_bytes(&self) -> usize {
         let mut heap = super::cache_budget::RetainedHeap::default();
@@ -227,46 +219,58 @@ pub fn publish(
             code(&WILDCARD_POLICIES, &surface.wildcard_policy)
         ],
     )?;
-    for scope in &facts.scopes {
-        let parent = facts
-            .scope_continuations
-            .iter()
-            .find(|row| row.scope == scope.id)
-            .map_or(scope.parent, |row| row.parent);
-        insert(
-            tx,
-            "INSERT INTO resolution_binding_scopes VALUES(?1,?2,?3)",
-            params![blob, scope.id.get(), parent.map(|scope| scope.get())],
-        )?;
+    let scopes = facts
+        .scopes
+        .iter()
+        .map(|scope| {
+            let parent = facts
+                .scope_continuations
+                .iter()
+                .find(|row| row.scope == scope.id)
+                .map_or(scope.parent, |row| row.parent);
+            (blob, scope.id.get(), parent.map(|scope| scope.get()))
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binding_scopes VALUES",
+        "(?,?,?)",
+        &scopes,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
-    for slot in &facts.binding_slots {
-        let site = facts.sites[slot.declaration.index()];
-        let identifier = identifiers[&slot.declaration];
-        insert(
-            tx,
-            "INSERT INTO resolution_binding_slots VALUES(?1,?2,?3,?4,?5)",
-            params![
+    let slots = facts
+        .binding_slots
+        .iter()
+        .map(|slot| {
+            let site = facts.sites[slot.declaration.index()];
+            let identifier = identifiers[&slot.declaration];
+            (
                 blob,
                 slot.declaration.get(),
                 site.scope.get(),
-                facts.names[identifier.name.index()].spelling,
-                slot.lookup == ResolutionBindingLookup::WholeScope
-            ],
-        )?;
+                facts.names[identifier.name.index()].spelling.as_str(),
+                slot.lookup == ResolutionBindingLookup::WholeScope,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binding_slots VALUES",
+        "(?,?,?,?,?)",
+        &slots,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
-    for (event, timing) in facts
+    let events = facts
         .binding_events
         .iter()
         .zip(&facts.binding_event_timings)
-    {
-        if cancellation.is_cancelled() {
-            return Err(StoreError::cancelled("temporal publication cancelled"));
-        }
-        assert_eq!(event.ordinal, timing.event);
-        insert(
-            tx,
-            "INSERT INTO resolution_binding_events VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![
+        .map(|(event, timing)| {
+            assert_eq!(event.ordinal, timing.event);
+            (
                 blob,
                 event.ordinal,
                 event.slot.get(),
@@ -278,42 +282,69 @@ pub fn publish(
                 timing.entry_byte as i64,
                 timing.commit_byte as i64,
                 timing.commit_phase,
-                event.source_reference.map(|site| site.get())
-            ],
-        )?;
+                event.source_reference.map(|site| site.get()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binding_events VALUES",
+        "(?,?,?,?,?,?,?,?,?,?,?,?)",
+        &events,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("temporal publication cancelled"));
     }
-    for observation in &facts.binding_observations {
-        insert(
-            tx,
-            "INSERT INTO resolution_binding_observations VALUES(?1,?2,?3,?4,?5)",
-            params![
+    let observations = facts
+        .binding_observations
+        .iter()
+        .map(|observation| {
+            (
                 blob,
                 observation.reference.get(),
                 observation.execution_scope.get(),
                 observation.point_byte as i64,
-                observation.kind == ResolutionBindingObservationKind::Deferred
-            ],
-        )?;
+                observation.kind == ResolutionBindingObservationKind::Deferred,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binding_observations VALUES",
+        "(?,?,?,?,?)",
+        &observations,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("temporal publication cancelled"));
     }
-    for directive in &facts.binding_directives {
-        let identifier = identifiers[&directive.reference];
-        insert(
-            tx,
-            "INSERT INTO resolution_binding_directives VALUES(?1,?2,?3,?4,?5)",
-            params![
+    let directives = facts
+        .binding_directives
+        .iter()
+        .map(|directive| {
+            let identifier = identifiers[&directive.reference];
+            (
                 blob,
                 directive.reference.get(),
                 i64::from(directive.kind == ResolutionBindingDirectiveKind::Nonlocal),
-                facts.names[identifier.name.index()].spelling,
-                directive.target.map(|site| site.get())
-            ],
-        )?;
+                facts.names[identifier.name.index()].spelling.as_str(),
+                directive.target.map(|site| site.get()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binding_directives VALUES",
+        "(?,?,?,?,?)",
+        &directives,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
-    for guard in &facts.python_guards {
-        insert(
-            tx,
-            "INSERT INTO python_binding_guards VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
+    let batch = facts
+        .python_guards
+        .iter()
+        .map(|guard| {
+            (
                 blob,
                 guard.id,
                 guard.parent,
@@ -321,29 +352,55 @@ pub fn publish(
                 guard.execution_scope.get(),
                 code(&GUARD_KINDS, &guard.kind),
                 guard.arm_ordinal,
-                guard.predicate.map(|site| site.get())
-            ],
-        )?;
+                guard.predicate.map(|site| site.get()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_binding_guards VALUES",
+        "(?,?,?,?,?,?,?,?)",
+        &batch,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
-    for guard in &facts.python_site_guards {
-        insert(
-            tx,
-            "INSERT INTO python_binding_site_guards VALUES(?1,?2,?3)",
-            params![blob, guard.site.get(), guard.guard],
-        )?;
+    let batch = facts
+        .python_site_guards
+        .iter()
+        .map(|guard| (blob, guard.site.get(), guard.guard))
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_binding_site_guards VALUES",
+        "(?,?,?)",
+        &batch,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
-    for predicate in &facts.python_predicates {
-        insert(
-            tx,
-            "INSERT INTO python_binding_predicates VALUES(?1,?2,?3,?4)",
-            params![
+    let batch = facts
+        .python_predicates
+        .iter()
+        .map(|predicate| {
+            (
                 blob,
                 predicate.predicate.get(),
                 code(&PREDICATE_KINDS, &predicate.kind),
-                predicate.operand.map(|site| site.get())
-            ],
-        )?;
+                predicate.operand.map(|site| site.get()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_binding_predicates VALUES",
+        "(?,?,?,?)",
+        &batch,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
+    let mut imports = Vec::new();
     for import in &facts.python_imports {
         if cancellation.is_cancelled() {
             return Err(StoreError::cancelled("Python source publication cancelled"));
@@ -384,21 +441,48 @@ pub fn publish(
                 routes[0].bound_name.expect("named import local name")
             );
         }
-        insert(
-            tx,
-            "INSERT INTO python_binding_imports(blob_id,import_site,form,relative_level,module_segments,binding_event,route) VALUES(?1,?2,?3,?4,?5,?6,jsonb(?7))",
-            params![
-                blob,
-                import.import_site.get(),
-                code(&IMPORT_FORMS, &import.form),
-                import.relative_level,
-                import.module_segment_count,
-                import.binding_event,
-                serde_json::to_string(&route).expect("string array serializes")
-            ],
-        )?;
+        imports.push((
+            blob,
+            import.import_site.get(),
+            code(&IMPORT_FORMS, &import.form),
+            import.relative_level,
+            import.module_segment_count,
+            import.binding_event,
+            serde_json::to_string(&route).expect("string array serializes"),
+        ));
+    }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_binding_imports(blob_id,import_site,form,relative_level,module_segments,binding_event,route) VALUES",
+        "(?,?,?,?,?,?,jsonb(?))",
+        &imports,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
     let mut member_count = 0;
+    let mut extensions = Vec::new();
+    for (ordinal, extension) in facts.python_package_path_extensions.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return Err(super::StoreError::cancelled(
+                "Python package extension publication cancelled",
+            ));
+        }
+        assert_eq!(extension.ordinal as usize, ordinal);
+        extensions.push((blob, ordinal as i64, extension.directory.as_str()));
+    }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_package_path_extensions(blob_id,ordinal,directory) VALUES",
+        "(?,?,?)",
+        &extensions,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled(
+            "Python package extension publication cancelled",
+        ));
+    }
+    let mut export_operations = Vec::new();
     for (ordinal, operation) in facts.python_export_operations.iter().enumerate() {
         if cancellation.is_cancelled() {
             return Err(StoreError::cancelled("Python source publication cancelled"));
@@ -423,23 +507,107 @@ pub fn publish(
             .iter()
             .map(|member| facts.names[member.name.index()].spelling.as_str())
             .collect::<Vec<_>>();
-        insert(
-            tx,
-            "INSERT INTO python_binding_export_operations(blob_id,ordinal,kind,readable,members) VALUES(?1,?2,?3,?4,jsonb(?5))",
-            params![
-                blob,
-                operation.ordinal,
-                code(&EXPORT_OPERATION_KINDS, &operation.kind),
-                operation.readable,
-                serde_json::to_string(&names).expect("string array serializes")
-            ],
-        )?;
+        export_operations.push((
+            blob,
+            operation.ordinal,
+            code(&EXPORT_OPERATION_KINDS, &operation.kind),
+            operation.readable,
+            serde_json::to_string(&names).expect("string array serializes"),
+        ));
+    }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_binding_export_operations(blob_id,ordinal,kind,readable,members) VALUES",
+        "(?,?,?,?,jsonb(?))",
+        &export_operations,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled("Python source publication cancelled"));
     }
     assert_eq!(
         member_count,
         facts.python_export_members.len(),
         "export members have an operation"
     );
+    Ok(())
+}
+
+/// A module operand is addressed by its exact per-blob positioned reference.
+pub(crate) const IMPORT_MODULE_OPERAND_SQL: &str =
+    "SELECT operand.import_site, operand.prefix_len, imports.module_segments
+ FROM main.python_import_module_operands operand
+ JOIN main.python_binding_imports imports
+   ON imports.blob_id=operand.blob_id AND imports.import_site=operand.import_site
+ WHERE operand.blob_id=?1 AND operand.reference_site=?2";
+
+#[doc(hidden)]
+pub fn publish_import_module_operands(
+    tx: &Transaction<'_>,
+    blob: i64,
+    facts: &FileResolutionFacts,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let operands = facts
+        .python_import_module_operands
+        .iter()
+        .map(|operand| {
+            assert!(
+                operand.prefix_len >= 1,
+                "module operand prefixes are nonempty"
+            );
+            (
+                blob,
+                operand.reference_site.get(),
+                operand.import_site.get(),
+                operand.prefix_len,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_import_module_operands(blob_id,reference_site,import_site,prefix_len) VALUES",
+        "(?,?,?,?)",
+        &operands,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled(
+            "Python module operand publication cancelled",
+        ));
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn publish_module_registry_writes(
+    tx: &Transaction<'_>,
+    blob: i64,
+    facts: &FileResolutionFacts,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let writes = facts
+        .python_module_registry_writes
+        .iter()
+        .map(|write| {
+            (
+                blob,
+                write.registry_reference.get(),
+                write.key_reference.get(),
+                write.value_reference.map(ResolutionSiteId::get),
+                write.top_level,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO python_module_registry_writes(blob_id,registry_reference,key_reference,value_reference,top_level) VALUES",
+        "(?,?,?,?,?)",
+        &writes,
+        cancellation,
+    )? {
+        return Err(StoreError::cancelled(
+            "Python module registry write publication cancelled",
+        ));
+    }
     Ok(())
 }
 
@@ -635,7 +803,6 @@ impl AnalyzerStore {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl PythonBindingRows {
     pub(crate) fn load(
         conn: &Connection,
@@ -643,7 +810,7 @@ impl PythonBindingRows {
         blob: i64,
         known_oid: Option<git2::Oid>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<std::sync::Arc<Self>>> {
+    ) -> Result<Option<brokk_bifrost_core::retention_budget::BudgetedValue<Self>>> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
@@ -651,16 +818,12 @@ impl PythonBindingRows {
         // Row ids can be reused after deletion. The content and producer, not
         // the row id, determine the validity of these unit-local facts.
         let identity = if let Some(oid) = known_oid {
-            conn.query_row(
-                "SELECT format FROM python_binding_source WHERE blob_id=?1",
-                [blob],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|format| (oid, format))
+            conn.prepare_cached("SELECT format FROM python_binding_source WHERE blob_id=?1")?
+                .query_row([blob], |row| row.get::<_, i64>(0))
+                .optional()?
+                .map(|format| (oid, format))
         } else {
-            let selected = conn.query_row(
-                "SELECT blobs.blob_oid,source.format FROM blobs JOIN python_binding_source source ON source.blob_id=blobs.id WHERE blobs.id=?1 AND blobs.lang='python'",
+            let selected = conn.prepare_cached("SELECT blobs.blob_oid,source.format FROM blobs JOIN python_binding_source source ON source.blob_id=blobs.id WHERE blobs.id=?1 AND blobs.lang='python'")?.query_row(
                 [blob], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             ).optional()?;
             match selected {
@@ -679,8 +842,23 @@ impl PythonBindingRows {
             .first_chunk::<20>()
             .expect("SHA-1 content identity");
         if let Some(rows) = cache.python_binding_rows(blob_oid, format) {
-            return Ok((!cancellation.is_cancelled()).then_some(rows));
+            return Ok((!cancellation.is_cancelled())
+                .then_some(brokk_bifrost_core::retention_budget::BudgetedValue::Retained(rows)));
         }
+        let Some(result) = Self::read(conn, blob, cancellation)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            cache.insert_python_binding_rows(blob_oid, format, result),
+        ))
+    }
+
+    /// A single blob's query-local binding inputs, without installing a cache.
+    pub(crate) fn read(
+        conn: &Connection,
+        blob: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Self>> {
         let mut result = Self::default();
         macro_rules! read {
             ($sql:expr,$field:ident,$convert:expr) => {{
@@ -720,7 +898,7 @@ impl PythonBindingRows {
             })
         );
         read!(
-            "SELECT event,slot,target,kind,authored,value_slot,execution_scope,entry_byte,commit_byte,phase FROM resolution_binding_events WHERE blob_id=?1 ORDER BY commit_byte DESC,phase DESC,event DESC",
+            "SELECT event,slot,target,kind,authored,value_slot,execution_scope,entry_byte,commit_byte,phase,source_reference FROM resolution_binding_events WHERE blob_id=?1 ORDER BY commit_byte DESC,phase DESC,event DESC",
             events,
             |r| Ok(BindingEvent {
                 event: r.get(0)?,
@@ -732,7 +910,8 @@ impl PythonBindingRows {
                 execution_scope: r.get(6)?,
                 entry_byte: r.get(7)?,
                 commit_byte: r.get(8)?,
-                phase: r.get(9)?
+                phase: r.get(9)?,
+                source_reference: r.get(10)?
             })
         );
         read!(
@@ -858,8 +1037,6 @@ impl PythonBindingRows {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let result = std::sync::Arc::new(result);
-        cache.insert_python_binding_rows(blob_oid, format, std::sync::Arc::clone(&result));
         Ok(Some(result))
     }
 }
@@ -870,11 +1047,8 @@ impl AnalyzerStore {
     pub fn python_binding_source_is_current(&self, blob: i64) -> Result<bool> {
         self.conn.execute(move |conn| {
             Ok(conn
-                .query_row(
-                    "SELECT format FROM python_binding_source WHERE blob_id=?1",
-                    [blob],
-                    |row| row.get::<_, i64>(0),
-                )
+                .prepare_cached("SELECT format FROM python_binding_source WHERE blob_id=?1")?
+                .query_row([blob], |row| row.get::<_, i64>(0))
                 .optional()?
                 == Some(NATIVE_SOURCE_FORMAT))
         })
@@ -964,7 +1138,7 @@ impl super::python_unit_summaries::PythonEnvironmentPublication {
         self.store.conn.execute(move |conn| {
             let summary = crate::analyzer::store::python_unit_summaries::selected_binding_summary(conn,&snapshot,&profile)?
                 .expect("reconciled selected Python environment");
-            let blob = conn.query_row("SELECT blob_id FROM resolution_unit_summary_members WHERE summary_id=?1 AND rel_path=?2",
+            let blob = conn.prepare_cached("SELECT blob_id FROM resolution_unit_summary_members WHERE summary_id=?1 AND rel_path=?2")?.query_row(
                 rusqlite::params![summary,path],|row|row.get(0))?;
             let cancellation = CancellationToken::default();
             let rows = crate::analyzer::store::python_binding_rows::PythonBindingRows::load(
@@ -994,7 +1168,121 @@ impl super::python_unit_summaries::PythonEnvironmentPublication {
 mod cache_tests {
     use super::super::cache_budget::{RetainedBytes, StoreCacheBudget};
     use super::*;
-    use std::sync::Arc;
+
+    #[test]
+    fn format_seven_source_rows_are_missing_and_rederived_on_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("format.db");
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        let cache = store.cache_budget.clone();
+        store.conn.execute(move |conn| -> Result<()> {
+            conn.execute("INSERT INTO blobs(blob_oid,lang) VALUES(?1,'python')", ["a".repeat(40)])?;
+            let blob = conn.last_insert_rowid();
+            conn.execute("INSERT INTO python_binding_source VALUES(?1,?2,0,0)", params![blob, NATIVE_SOURCE_FORMAT])?;
+            conn.execute("INSERT INTO resolution_binding_scopes VALUES(?1,0,NULL)", [blob])?;
+            let snapshot = WorkspaceSnapshotId {
+                workspace_id: super::super::WorkspaceId("e".repeat(64)),
+                lang: "python".to_owned(), generation: super::super::GenerationId(0), revision: 1,
+            };
+            conn.execute("INSERT INTO workspace_revisions VALUES(?1,'python',0,1)", [snapshot.workspace_id.as_str()])?;
+            conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,projection_digest,valid_from,valid_until) VALUES(?1,'python',0,'a.py',?2,?3,1,2)", params![snapshot.workspace_id.as_str(), "a".repeat(40), "0".repeat(64)])?;
+            let cancellation = CancellationToken::default();
+            assert!(PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.is_some());
+            let mut read = false;
+            read_environment_source_rows(conn, &snapshot, &cancellation, |_, _| { read = true; Ok(()) })?;
+            assert!(read, "current source facts are read before the format downgrade");
+            conn.execute("UPDATE python_binding_source SET format=7 WHERE blob_id=?1", [blob])?;
+            assert!(PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.is_none());
+            let error = read_environment_source_rows(conn, &snapshot, &cancellation, |_, _| panic!("format-7 source rows must not be read")).unwrap_err();
+            assert!(error.is_missing_required_source_facts());
+            assert!(error.to_string().contains("a.py"));
+            Ok(())
+        }).unwrap();
+        drop(store);
+        let store = AnalyzerStore::open_persistent(&database).unwrap();
+        let cache = store.cache_budget.clone();
+        let project = brokk_bifrost_core::analyzer::project::TestProject::new(
+            directory.path(),
+            brokk_bifrost_core::analyzer::Language::Python,
+        );
+        let file = brokk_bifrost_core::analyzer::ProjectFile::new(directory.path(), "a.py");
+        let source = "import external\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let parsed =
+            brokk_bifrost_python::declarations::parse_python_file(&project, &file, source, &tree);
+        store
+            .conn
+            .execute(move |conn| -> Result<()> {
+                let blob = conn.query_row(
+                    "SELECT id FROM blobs WHERE blob_oid=?1",
+                    ["a".repeat(40)],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                let cancellation = CancellationToken::default();
+                assert!(
+                    PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.is_none()
+                );
+                let tx = conn.transaction()?;
+                // Replace the stale publication with facts re-derived by the production parser.
+                tx.execute(
+                    "DELETE FROM resolution_binding_scopes WHERE blob_id=?1",
+                    [blob],
+                )?;
+                tx.execute("DELETE FROM python_binding_source WHERE blob_id=?1", [blob])?;
+                let names = crate::analyzer::resolution::PerRequestSharedNames::new();
+                let lowered = crate::analyzer::resolution::lower_resolution_facts_for_selection(
+                    crate::analyzer::resolution::BindingFragmentId::at_ordinal(0),
+                    &names,
+                    brokk_bifrost_core::analyzer::Language::Python,
+                    &parsed.resolution_facts,
+                );
+                let super::super::resolution_prepare::ResolutionInteriorPreparation::Prepared(
+                    bundle,
+                ) = super::super::resolution_prepare::prepare_resolution_bundle_with_unit_keys(
+                    &lowered,
+                    None,
+                    &cancellation,
+                )
+                else {
+                    panic!("uncancelled re-derivation must prepare")
+                };
+                assert!(super::super::resolution::insert_prepared_bundle_tx(
+                    &tx,
+                    blob,
+                    "python",
+                    &bundle,
+                    &cancellation
+                )?);
+                publish(&tx, blob, &parsed.resolution_facts, &cancellation)?;
+                tx.commit()?;
+                let rows = PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?
+                    .expect("re-derived format-8 answers");
+                assert!(
+                    rows.events
+                        .iter()
+                        .any(|event| event.kind == ResolutionBindingEventKind::Import),
+                    "the import binding must survive re-derivation"
+                );
+                let snapshot = WorkspaceSnapshotId {
+                    workspace_id: super::super::WorkspaceId("e".repeat(64)),
+                    lang: "python".to_owned(),
+                    generation: super::super::GenerationId(0),
+                    revision: 1,
+                };
+                let mut read = false;
+                read_environment_source_rows(conn, &snapshot, &cancellation, |_, _| {
+                    read = true;
+                    Ok(())
+                })?;
+                assert!(read, "reopened source summary reads the new publication");
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn binding_cache_reads_current_identity_and_only_retains_complete_loads() {
@@ -1002,7 +1290,7 @@ mod cache_tests {
         let cache = store.cache_budget.clone();
         store
             .conn
-            .execute(move |conn| -> Result<()> {
+            .execute_fixture(move |conn| -> Result<()> {
                 conn.execute(
                     "INSERT INTO blobs(blob_oid,lang) VALUES(?1,'python')",
                     ["a".repeat(40)],
@@ -1087,7 +1375,7 @@ mod cache_tests {
                 assert!(cache.weighted_bytes() > first.retained_bytes() as u64);
                 let again =
                     PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.unwrap();
-                assert!(Arc::ptr_eq(&first, &again));
+                assert!(std::ptr::eq(&*first, &*again));
                 let hit_cancel = CancellationToken::cancel_after_checks_for_test(2);
                 assert!(PythonBindingRows::load(conn, &cache, blob, None, &hit_cancel)?.is_none());
                 assert!(hit_cancel.is_cancelled());
@@ -1125,14 +1413,14 @@ mod cache_tests {
                 let replacement =
                     PythonBindingRows::load(conn, &cache, blob, None, &cancellation)?.unwrap();
                 assert_eq!(replacement.scopes[0].scope, 7);
-                assert!(!Arc::ptr_eq(&first, &replacement));
-                let tiny = StoreCacheBudget::new(1);
+                assert!(!std::ptr::eq(&*first, &*replacement));
+                let tiny = StoreCacheBudget::new(&brokk_bifrost_core::retention_budget::RetentionBudget::new(1));
                 let uncached =
                     PythonBindingRows::load(conn, &tiny, blob, None, &cancellation)?.unwrap();
                 let reread =
                     PythonBindingRows::load(conn, &tiny, blob, None, &cancellation)?.unwrap();
                 assert_eq!(uncached.scopes[0].scope, reread.scopes[0].scope);
-                assert!(!Arc::ptr_eq(&uncached, &reread));
+                assert!(!std::ptr::eq(&*uncached, &*reread));
                 assert_eq!(tiny.weighted_bytes(), 0);
                 Ok(())
             })

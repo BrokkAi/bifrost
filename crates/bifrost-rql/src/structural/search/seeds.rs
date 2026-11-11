@@ -1,7 +1,6 @@
 use super::super::facts::RecoveredRegion;
 use super::*;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
-use crate::analyzer::structural::resolution::EnvironmentAxis;
 use crate::query::{LanguageRule, QueryPathScope};
 #[cfg(debug_assertions)]
 use brokk_bifrost_analysis::analyzer::i_analyzer::read_key_recorded_on_active_ledgers;
@@ -27,15 +26,6 @@ pub(super) fn desired_seed_rows(
         None
     } else {
         Some(desired_rows)
-    }
-}
-
-pub(super) fn empty_truncated_seed_execution() -> PlanExecution {
-    PlanExecution {
-        rows: Vec::new(),
-        truncated: true,
-        cancelled: false,
-        pipeline_halted: false,
     }
 }
 
@@ -258,6 +248,21 @@ pub(super) fn ready_seed_index(
     cache.get_ready(content_identity, cancellation)
 }
 
+fn certified_name_term(
+    plan: &QueryPlan,
+) -> Option<&brokk_bifrost_analysis::analyzer::structural::index_query::StructuralPostingTerm> {
+    use brokk_bifrost_analysis::analyzer::structural::index_query::StructuralPostingTerm;
+    let terms = plan.structural_access().terms();
+    terms
+        .iter()
+        .find(|term| matches!(term, StructuralPostingTerm::ExactName(_)))
+        .or_else(|| {
+            terms
+                .iter()
+                .find(|term| matches!(term, StructuralPostingTerm::RoleName { .. }))
+        })
+}
+
 pub(super) fn prepare_seed_access(
     provider: &dyn StructuralFactProvider,
     provider_file_count: usize,
@@ -296,10 +301,18 @@ pub(super) fn prepare_seed_access(
     };
     let ready_index = ready_index.or_else(|| cache.get_ready(content_identity, cancellation));
     let cache_ready_before_lookup = ready_index.is_some();
-    let auto_build_is_viable = files.is_some_and(|files| {
-        files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
-            && files.len().saturating_mul(4) >= provider_file_count
-    });
+    let auto_build_is_viable = files.map_or_else(
+        || {
+            provider_file_count == 0
+                && certified_name_term(plan).is_some()
+                && provider.structural_inventory_complete()
+                && provider.structural_selection_authority().is_some()
+        },
+        |files| {
+            files.len() >= MIN_AUTO_STRUCTURAL_INDEX_FILES
+                && files.len().saturating_mul(4) >= provider_file_count
+        },
+    );
     if state.access_mode.uses_auto_index_admission() && ready_index.is_none() {
         if !auto_build_is_viable {
             return scan_access(state, scoped_file_count, None);
@@ -403,43 +416,6 @@ pub(super) fn prepare_seed_access(
                         access.retained_bytes.saturating_add(index.retained_bytes());
                 }
             }
-            if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
-                state.analyzer.read_ledger_attached()
-            }) {
-                if let Some(seed_files) = state.scope.seed_files() {
-                    // Negative postings can skip hydration entirely. Name all
-                    // selected files before asking the warmed index, too.
-                    for file in files.unwrap_or(seed_files) {
-                        if let Some(key) = provider.structural_file_read_key(file) {
-                            state.analyzer.record_read(key.clone());
-                            #[cfg(debug_assertions)]
-                            debug_assert!(
-                                read_key_recorded_on_active_ledgers(state.analyzer, &key),
-                                "narrowed posting hits record selected files"
-                            );
-                        } else {
-                            state.analyzer.record_unattributed_read();
-                        }
-                    }
-                } else {
-                    // This is the value-consumption point. Merely reading the
-                    // provider's scalar content identity names no dependency.
-                    #[cfg(debug_assertions)]
-                    let key = state
-                        .analyzer
-                        .workspace_scope_read_key(&[provider.structural_language()]);
-                    brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read(
-                        state.analyzer,
-                        brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily::StructuralPostingIndex,
-                        brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(&[provider.structural_language()]),
-                    );
-                    #[cfg(debug_assertions)]
-                    debug_assert!(
-                        read_key_recorded_on_active_ledgers(state.analyzer, &key),
-                        "whole posting hits record their language scope"
-                    );
-                }
-            }
             let selection = index.select(
                 plan.structural_access(),
                 files,
@@ -473,6 +449,22 @@ pub(super) fn prepare_seed_access(
                             Some("structural analyzed content changed after index selection"),
                         );
                     }
+                    // Observe C# branch obligations at selection, including when
+                    // this request has no read ledger. Read dependencies remain
+                    // owned by record_index_selection_reads below.
+                    if let Some(seed_files) = state.scope.seed_files() {
+                        for file in files.unwrap_or(seed_files) {
+                            if let Some(key) = provider.structural_file_read_key(file) {
+                                state.analyzer.record_read_obligation(&key);
+                            }
+                        }
+                    } else {
+                        let key = state
+                            .analyzer
+                            .workspace_scope_read_key(&[provider.structural_language()]);
+                        state.analyzer.record_read_obligation(&key);
+                    }
+                    record_index_selection_reads(state, provider, &index, files, plan);
                     state
                         .structural_index_session
                         .record_selection(workspace_content);
@@ -518,8 +510,16 @@ pub(super) fn prepare_seed_access(
                         workspace_content,
                     }
                 }
-                Ok(None) => scan_access(state, scoped_file_count, None),
+                Ok(None) => {
+                    if state.scope.seed_files().is_none() {
+                        record_whole_index_scope(state, provider);
+                    }
+                    scan_access(state, scoped_file_count, None)
+                }
                 Err(reason) => {
+                    if state.scope.seed_files().is_none() {
+                        record_whole_index_scope(state, provider);
+                    }
                     if reason.contains("cancelled")
                         && let Some(profile) = &mut state.profile
                     {
@@ -563,6 +563,132 @@ pub(super) fn prepare_seed_access(
                 Some("structural index acquisition cancelled"),
             )
         }
+    }
+}
+
+fn record_whole_index_scope(
+    state: &QueryExecutionState<'_>,
+    provider: &dyn StructuralFactProvider,
+) {
+    if brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        state.analyzer.read_ledger_attached()
+    }) {
+        brokk_bifrost_analysis::analyzer::workspace_authority::record_workspace_authority_read(
+            state.analyzer,
+            brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily::StructuralPostingIndex,
+            brokk_bifrost_analysis::analyzer::workspace_authority::AuthorityInputs::SourceOf(
+                &[provider.structural_language()],
+            ),
+        );
+    }
+}
+
+fn record_index_selection_reads(
+    state: &QueryExecutionState<'_>,
+    provider: &dyn StructuralFactProvider,
+    index: &SnapshotStructuralIndex,
+    files: Option<&[ProjectFile]>,
+    plan: &QueryPlan,
+) {
+    use brokk_bifrost_analysis::analyzer::read_ledger::{LookupKind, LookupQuestion, ReadKey};
+    if !brokk_bifrost_analysis::analyzer::read_attribution_records_reads(|| {
+        state.analyzer.read_ledger_attached()
+    }) {
+        return;
+    }
+    let Some(workspace_before) = state.analyzer.workspace_content_identity() else {
+        state.analyzer.record_unattributed_read();
+        return;
+    };
+    let mut reads = Vec::new();
+    if let Some(seed_files) = state.scope.seed_files() {
+        for file in files.unwrap_or(seed_files) {
+            let Some(key) = provider.structural_file_read_key(file) else {
+                state.analyzer.record_unattributed_read();
+                return;
+            };
+            reads.push(key);
+        }
+    } else {
+        use brokk_bifrost_analysis::analyzer::structural::index_query::StructuralPostingTerm;
+        let term = certified_name_term(plan);
+        let Some((term, authority)) = term
+            .zip(provider.structural_selection_authority())
+            .filter(|_| provider.structural_inventory_complete())
+        else {
+            record_whole_index_scope(state, provider);
+            return;
+        };
+        let (names, role) = match term {
+            StructuralPostingTerm::ExactName(names) => (names, None),
+            StructuralPostingTerm::RoleName { role, names } => (names, Some(*role)),
+            _ => unreachable!("selected term is a name posting"),
+        };
+        for name in names {
+            let (digest, paths, kind, question) = if let Some(role) = role {
+                let keyword = false;
+                let (digest, paths) = index.role_name_inventory(role, name, keyword);
+                (
+                    digest,
+                    paths,
+                    LookupKind::StructuralRoleNameInventory,
+                    LookupQuestion::StructuralRoleName {
+                        language: provider.structural_language(),
+                        role,
+                        name: name.as_str().into(),
+                        keyword,
+                        authority,
+                    },
+                )
+            } else {
+                let (digest, paths) = index.exact_name_inventory(name);
+                (
+                    digest,
+                    paths,
+                    LookupKind::StructuralNameInventory,
+                    LookupQuestion::StructuralName {
+                        language: provider.structural_language(),
+                        name: name.as_str().into(),
+                        authority,
+                    },
+                )
+            };
+            reads.push(ReadKey::lookup(kind, question, digest));
+            for file in paths {
+                let Some(key) = provider.structural_file_read_key(&file) else {
+                    state.analyzer.record_unattributed_read();
+                    return;
+                };
+                reads.push(key);
+            }
+        }
+        let (digest, paths) = index.recovered_inventory();
+        reads.push(ReadKey::lookup(
+            LookupKind::StructuralRecoveredInventory,
+            LookupQuestion::StructuralRecovered {
+                language: provider.structural_language(),
+                authority,
+            },
+            digest,
+        ));
+        for file in paths {
+            let Some(key) = provider.structural_file_read_key(&file) else {
+                state.analyzer.record_unattributed_read();
+                return;
+            };
+            reads.push(key);
+        }
+    }
+    if Some(index.content_identity()) != provider.structural_content_identity()
+        || !state.analyzer.workspace_content_matches(workspace_before)
+    {
+        state.analyzer.record_unattributed_read();
+        return;
+    }
+    for key in reads {
+        state.analyzer.record_read(key.clone());
+        #[cfg(debug_assertions)]
+        debug_assert!(read_key_recorded_on_active_ledgers(state.analyzer, &key));
     }
 }
 
@@ -680,7 +806,7 @@ pub(super) fn execute_occurrence_seed(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
     let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
-        return empty_truncated_seed_execution();
+        return PlanExecution::truncated(Vec::new());
     };
 
     let files = seed_scan_files(state, &seed.languages, &seed.where_globs);
@@ -696,7 +822,7 @@ pub(super) fn execute_occurrence_seed(
                 truncated = true;
                 break;
             }
-            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            SeedFileScanStatus::Cancelled => return PlanExecution::cancelled(Vec::new()),
         }
 
         let Some(result) = state.occurrence_cache.rows_for_file(
@@ -705,7 +831,7 @@ pub(super) fn execute_occurrence_seed(
             &seed.filter,
             state.cancellation,
         ) else {
-            return cancelled_plan_execution();
+            return PlanExecution::cancelled(Vec::new());
         };
         state
             .occurrence_cache
@@ -746,12 +872,7 @@ pub(super) fn execute_occurrence_seed(
         }
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 
 /// Which lexical-environment row family a seed scan produces.
@@ -776,7 +897,7 @@ pub(super) fn execute_environment_seed(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
     let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
-        return empty_truncated_seed_execution();
+        return PlanExecution::truncated(Vec::new());
     };
 
     let files = seed_scan_files(state, languages, where_globs);
@@ -796,7 +917,7 @@ pub(super) fn execute_environment_seed(
                 truncated = true;
                 break;
             }
-            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            SeedFileScanStatus::Cancelled => return PlanExecution::cancelled(Vec::new()),
         }
 
         let result = state
@@ -868,12 +989,7 @@ pub(super) fn execute_environment_seed(
         }
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 
 pub(super) enum MaterializationSeedKind<'a> {
@@ -896,7 +1012,7 @@ pub(super) fn execute_materialization_seed(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
     let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
-        return empty_truncated_seed_execution();
+        return PlanExecution::truncated(Vec::new());
     };
 
     let files = seed_scan_files(state, languages, where_globs);
@@ -916,7 +1032,7 @@ pub(super) fn execute_materialization_seed(
                 truncated = true;
                 break;
             }
-            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            SeedFileScanStatus::Cancelled => return PlanExecution::cancelled(Vec::new()),
         }
 
         let result = state
@@ -981,12 +1097,7 @@ pub(super) fn execute_materialization_seed(
         }
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 
 pub(super) fn execute_path_seed(
@@ -999,7 +1110,7 @@ pub(super) fn execute_path_seed(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
     let Some(desired_rows) = desired_seed_rows(terminal_cap, state, limits, diagnostics) else {
-        return empty_truncated_seed_execution();
+        return PlanExecution::truncated(Vec::new());
     };
 
     let files = seed_scan_files(state, languages, where_globs);
@@ -1015,7 +1126,7 @@ pub(super) fn execute_path_seed(
                 truncated = true;
                 break;
             }
-            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            SeedFileScanStatus::Cancelled => return PlanExecution::cancelled(Vec::new()),
         }
 
         let Some(result) =
@@ -1023,7 +1134,7 @@ pub(super) fn execute_path_seed(
                 .path_cache
                 .paths_for(state.analyzer, &file, false, state.cancellation)
         else {
-            return cancelled_plan_execution();
+            return PlanExecution::cancelled(Vec::new());
         };
         state.path_cache.report_completeness(
             state.analyzer,
@@ -1081,12 +1192,7 @@ pub(super) fn execute_path_seed(
         }
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 /// Report a file whose recovered syntax could hide a node `seed` selects
 /// (#3777). The file is still searched: a row found in it is real, but no row
@@ -1476,24 +1582,14 @@ pub(super) fn execute_seed(
         if locally_capped {
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
         }
-        return PlanExecution {
-            rows,
-            truncated,
-            cancelled: false,
-            pipeline_halted: false,
-        };
+        return PlanExecution::new(rows, truncated);
     }
     if let Some(profile) = &mut state.cache_profile {
         profile.seed_result.record_miss();
     }
     if desired_rows == 0 {
         push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: false,
-            pipeline_halted: false,
-        };
+        return PlanExecution::truncated(Vec::new());
     }
 
     let diagnostic_start = diagnostics.len();
@@ -1534,12 +1630,7 @@ pub(super) fn execute_seed(
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return PlanExecution {
-                rows: Vec::new(),
-                truncated: true,
-                cancelled: true,
-                pipeline_halted: false,
-            };
+            return PlanExecution::cancelled(Vec::new());
         }
         let language = crate::analyzer::common::language_for_file(file);
         let requested = seed.languages.is_empty() || seed.languages.contains(&language);
@@ -1554,6 +1645,11 @@ pub(super) fn execute_seed(
         let language = provider.structural_language();
         supported.insert(language);
         let explicitly_requested = seed.languages.contains(&language);
+        let certified_selection = state.scope.seed_files().is_none()
+            && seed.where_globs.is_empty()
+            && provider.structural_inventory_complete()
+            && provider.structural_selection_authority().is_some()
+            && certified_name_term(&plan).is_some();
         let unsupported_features = || {
             plan.features()
                 .unsupported_by(|feature| provider_supports_feature(provider, feature))
@@ -1575,6 +1671,7 @@ pub(super) fn execute_seed(
                 })
         };
         if unrestricted_explicit_scope
+            && !certified_selection
             && !plan.structural_access().terms().is_empty()
             && let Some(index) = ready_seed_index(provider, state)
         {
@@ -1615,6 +1712,41 @@ pub(super) fn execute_seed(
             files.dedup();
             provider_scopes.push((language, provider, files, access));
             continue;
+        }
+        // Select from a complete posting before enumerating the provider's whole
+        // scope; enumeration itself records a Scope read for a scan. A language
+        // that cannot express part of the query stays on the scan path unless it
+        // was requested explicitly: whether it reports the unsupported feature
+        // depends on whether it has scoped files, which only the scan can tell,
+        // and the posting cannot hold matches its adapter cannot represent.
+        if certified_selection && (explicitly_requested || unsupported_features().next().is_none())
+        {
+            let access = prepare_seed_access(
+                provider,
+                0,
+                None,
+                &plan,
+                !super::relations::declaration_owner_may_be_non_lexical(language),
+                state,
+                None,
+            );
+            if let SeedStructuralAccess::Indexed {
+                index, candidates, ..
+            } = &access
+            {
+                if explicitly_requested {
+                    diagnostics.extend(unsupported_features());
+                }
+                let mut files: Vec<ProjectFile> = candidates
+                    .files()
+                    .chain(index.files_with_recovered_regions())
+                    .cloned()
+                    .collect();
+                files.sort();
+                files.dedup();
+                provider_scopes.push((language, provider, files, access));
+                continue;
+            }
         }
         let (mut files, provider_file_count) =
             provider_scope_files(state, provider, language, workspace_files);
@@ -1688,16 +1820,14 @@ pub(super) fn execute_seed(
     let mut cache_complete = state.cache_profile.as_ref().map(|_| true);
     let signature_incomplete = super::super::matcher::CallableSignatureIncomplete::default();
     'candidates: for (_path, language, provider, file, access) in candidates {
+        signature_incomplete
+            .certified_roles
+            .set(provider.structural_certified_roles());
         if state
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return PlanExecution {
-                rows: Vec::new(),
-                truncated: true,
-                cancelled: true,
-                pipeline_halted: false,
-            };
+            return PlanExecution::cancelled(Vec::new());
         }
         // A Rust impl member or an out-of-line C++ member can be owned by a
         // type declaration in another file, so the owner's `inside_decl` name
@@ -1778,7 +1908,7 @@ pub(super) fn execute_seed(
                     break;
                 }
                 FairSeedBudgetSharedAdmission::Cancelled => {
-                    return cancelled_plan_execution();
+                    return PlanExecution::cancelled(Vec::new());
                 }
             }
         } else if !state.seed_scan_ledger.scanned.contains(&ledger_key) {
@@ -1919,7 +2049,7 @@ pub(super) fn execute_seed(
                         break;
                     }
                     FairSeedBudgetAdmission::Cancelled => {
-                        return cancelled_plan_execution();
+                        return PlanExecution::cancelled(Vec::new());
                     }
                 }
             } else {
@@ -1936,7 +2066,7 @@ pub(super) fn execute_seed(
                         break;
                     }
                     FairSeedBudgetSharedAdmission::Cancelled => {
-                        return cancelled_plan_execution();
+                        return PlanExecution::cancelled(Vec::new());
                     }
                 }
             }
@@ -2029,7 +2159,7 @@ pub(super) fn execute_seed(
             limits,
         ) {
             SeedFileScanStatus::Scanned => {}
-            SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            SeedFileScanStatus::Cancelled => return PlanExecution::cancelled(Vec::new()),
             SeedFileScanStatus::BudgetExhausted => {
                 truncated = true;
                 cache_complete = cache_complete.map(|_| false);
@@ -2078,6 +2208,17 @@ pub(super) fn execute_seed(
                                 relation_source,
                                 rule,
                                 state.scope.identifier_dictionary(),
+                                state.scope.identifier_typos(),
+                            )
+                        }
+                        (Language::Rust, LanguageRule::Rust(rule)) => {
+                            rust_language_rules::matches_for_file(
+                                analyzer,
+                                state.semantic.as_mut(),
+                                state.cancellation,
+                                &file,
+                                relation_source,
+                                rule,
                             )
                         }
                         _ => super::language_rules::LanguageRuleMatches::default(),
@@ -2119,42 +2260,107 @@ pub(super) fn execute_seed(
             .as_ref()
             .map(|oracle| oracle as &dyn super::super::matcher::DeclarationOwnerOracle);
         let local_value_oracle = if seed.constrains_local_value() && language == Language::Python {
-            let environment = state
-                .environment_cache
-                .environment_for(state.analyzer, &file);
-            state.environment_cache.report_completeness(
+            super::python_variables::file_local_value_oracle(
+                state.analyzer,
+                &mut state.environment_cache,
                 &file,
-                &environment,
-                &[EnvironmentAxis::Scopes, EnvironmentAxis::BindingIntervals],
+                &facts,
                 diagnostics,
-            );
-            let dynamic_scope_calls = state
-                .environment_cache
-                .python_dynamic_scope_calls(state.analyzer, &file);
-            state
-                .environment_cache
-                .python_variable_index_for(
-                    state.analyzer,
-                    &file,
-                    facts.source_identity(),
-                    facts.source(),
-                    &environment,
-                )
-                .map(|index| {
-                    super::python_variables::local_value_oracle(
-                        &index,
-                        &facts,
-                        &dynamic_scope_calls,
-                    )
-                })
+            )
         } else {
             None
         };
         let local_value_oracle = local_value_oracle
             .as_ref()
             .map(|oracle| oracle as &dyn super::super::matcher::LocalValueOracle);
-        let matches = if indexed_file.is_some() {
-            let mut examined = 0u64;
+        // A selection whose call-ness resolution decides (#9479) is a
+        // `field_access` fact, so `call` postings never select it: add the
+        // file's candidates to the verified set and let the matcher decide.
+        let owned_calls = state.scope.owned_call_anchors().cloned();
+        #[cfg(any(test, feature = "test-support"))]
+        let candidate_probe = state.scope.binding_candidate_probe();
+        let selection_applications = matcher_seed
+            .mentions_kind(NormalizedKind::Call)
+            .then(|| {
+                let analyzer = state.analyzer;
+                let cancellation = state.cancellation;
+                state
+                    .call_cache
+                    .bindings
+                    .read_mut(&memo_attribution(analyzer), |bindings| {
+                        super::relations::selection_applications_for_file(
+                            analyzer,
+                            &file,
+                            &facts,
+                            bindings,
+                            owned_calls.as_deref(),
+                            #[cfg(any(test, feature = "test-support"))]
+                            candidate_probe.as_ref(),
+                            cancellation,
+                        )
+                    })
+            })
+            .filter(|applications| !applications.is_empty());
+        let selected_facts = match &selection_applications {
+            Some(applications) => {
+                let mut selected = selected_facts
+                    .iter()
+                    .copied()
+                    .chain(applications.keys().copied())
+                    .collect::<Vec<_>>();
+                selected.sort_unstable();
+                selected.dedup();
+                std::borrow::Cow::Owned(selected)
+            }
+            None => std::borrow::Cow::Borrowed(selected_facts),
+        };
+        // File-level recovery/provider diagnostics have already been emitted.
+        // Prune roots before matcher and pipeline row caps, not after binding
+        // prefetch has resolved every same-named call in the file.
+        let scoped_candidates = state.scope.owned_call_anchors().map(|owned| {
+            if indexed_file.is_some() {
+                selected_facts
+                    .iter()
+                    .copied()
+                    .filter(|&node| owned.contains(&file, facts.node(node).range))
+                    .collect::<Vec<_>>()
+            } else {
+                (0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"))
+                    .filter(|&node| owned.contains(&file, facts.node(node).range))
+                    .collect::<Vec<_>>()
+            }
+        });
+        let selected_facts = scoped_candidates
+            .as_deref()
+            .unwrap_or(selected_facts.as_ref());
+        // Charge the verifier walk beyond the facts already charged: the
+        // selected candidates on the indexed path, the file's whole fact
+        // count on the scan path. One execution charges a file's full walk
+        // once across compatible seed scans, serially and in parallel alike
+        // (`parallel_seed_union_matches_serial_shared_scan_charges`), so a
+        // replayed scan pays only its work beyond that walk. The admission
+        // overshoot is bounded by one file's matcher work.
+        let already_charged = if indexed_file.is_some() {
+            charged_fact_nodes
+        } else {
+            fact_nodes
+        };
+        // Walks under `each` and `argument-mode` stop where the walk beyond
+        // `already_charged` would spend more than the query's remaining fact
+        // budget, not only after this file is charged.
+        let max_examined_facts = u64::try_from(
+            already_charged.saturating_add(
+                limits.max_fact_nodes.saturating_sub(
+                    state
+                        .budget
+                        .fact_nodes
+                        .saturating_add(state.budget.examined_references),
+                ),
+            ),
+        )
+        .unwrap_or(u64::MAX);
+        let mut examined = 0u64;
+        let matches = if indexed_file.is_some() || scoped_candidates.is_some() {
             let matches = super::super::matcher::match_query_candidates(
                 &matcher_seed,
                 &facts,
@@ -2162,52 +2368,19 @@ pub(super) fn execute_seed(
                 remaining,
                 &mut examined,
                 oracle,
+                selection_applications.as_ref(),
                 local_value_oracle,
                 owner_oracle,
                 &signature_incomplete,
+                provider.structural_recorded_argument_modes(),
+                state.cancellation,
+                max_examined_facts,
             );
             if let Some(profile) = &mut state.profile {
                 profile.access_path.examined_fact_nodes = profile
                     .access_path
                     .examined_fact_nodes
                     .saturating_add(examined);
-            }
-            // Charge the verifier walk beyond the already-charged candidates.
-            // The admission overshoot is bounded by one file's matcher work.
-            let extra = usize::try_from(
-                examined.saturating_sub(u64::try_from(charged_fact_nodes).unwrap_or(u64::MAX)),
-            )
-            .unwrap_or(usize::MAX);
-            if extra > 0 {
-                projected = state.budget;
-                projected.fact_nodes = projected.fact_nodes.saturating_add(extra);
-                if let Some(lease) = &parallel_budget {
-                    match lease.admit(projected) {
-                        FairSeedBudgetAdmission::Admitted => {}
-                        FairSeedBudgetAdmission::Rejected(global_projected) => {
-                            push_budget_diagnostic(diagnostics, &global_projected);
-                            truncated = true;
-                            cache_complete = cache_complete.map(|_| false);
-                            break;
-                        }
-                        FairSeedBudgetAdmission::Cancelled => {
-                            return cancelled_plan_execution();
-                        }
-                    }
-                } else if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
-                    projected
-                        .fact_nodes
-                        .saturating_add(projected.examined_references),
-                    limits.max_fact_nodes,
-                )
-                .allows(0)
-                {
-                    push_budget_diagnostic(diagnostics, &projected);
-                    truncated = true;
-                    cache_complete = cache_complete.map(|_| false);
-                    break;
-                }
-                state.budget.fact_nodes = projected.fact_nodes;
             }
             matches
         } else {
@@ -2217,7 +2390,6 @@ pub(super) fn execute_seed(
                     .examined_fact_nodes
                     .saturating_add(u64::try_from(facts.nodes().len()).unwrap_or(u64::MAX));
             }
-            let mut examined = 0u64;
             super::super::matcher::match_query_candidates(
                 &matcher_seed,
                 &facts,
@@ -2225,16 +2397,156 @@ pub(super) fn execute_seed(
                 remaining,
                 &mut examined,
                 oracle,
+                selection_applications.as_ref(),
                 local_value_oracle,
                 owner_oracle,
                 &signature_incomplete,
+                provider.structural_recorded_argument_modes(),
+                state.cancellation,
+                max_examined_facts,
             )
         };
+        if signature_incomplete.cancelled.get() {
+            return PlanExecution::cancelled(Vec::new());
+        }
+        let extra = usize::try_from(
+            examined.saturating_sub(u64::try_from(already_charged).unwrap_or(u64::MAX)),
+        )
+        .unwrap_or(usize::MAX);
+        if extra > 0 {
+            projected = state.budget;
+            projected.fact_nodes = projected.fact_nodes.saturating_add(extra);
+            if let Some(lease) = &parallel_budget {
+                match lease.admit(projected) {
+                    FairSeedBudgetAdmission::Admitted => {}
+                    FairSeedBudgetAdmission::Rejected(global_projected) => {
+                        push_budget_diagnostic(diagnostics, &global_projected);
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break;
+                    }
+                    FairSeedBudgetAdmission::Cancelled => {
+                        return PlanExecution::cancelled(Vec::new());
+                    }
+                }
+            } else if !brokk_bifrost_core::analyzer::work_budget::LimitedCounter::from_usage(
+                projected
+                    .fact_nodes
+                    .saturating_add(projected.examined_references),
+                limits.max_fact_nodes,
+            )
+            .allows(0)
+            {
+                push_budget_diagnostic(diagnostics, &projected);
+                truncated = true;
+                cache_complete = cache_complete.map(|_| false);
+                break;
+            }
+            state.budget.fact_nodes = projected.fact_nodes;
+        }
         let matches = if let Some(ranges) = &custom_ranges {
             language_rule_matches(&facts, matches, ranges)
         } else {
             matches
         };
+        let unknown_sites = signature_incomplete
+            .qualifying_type_sites
+            .borrow_mut()
+            .drain(..)
+            .collect();
+        let unknown_sites = if let Some(ranges) = &custom_ranges {
+            language_rule_matches(&facts, unknown_sites, ranges)
+        } else {
+            unknown_sites
+        };
+        for site in unknown_sites {
+            let owner = site
+                .reported_range
+                .unwrap_or_else(|| facts.node(site.node).range);
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: Some(CodeQuerySourceSpan {
+                    path: crate::path_utils::workspace_relative_slash_path(file.rel_path()),
+                    range: super::render::public_range(&facts, owner),
+                    start_byte: owner.start_byte, end_byte: owner.end_byte,
+                }),
+                code: CodeQueryDiagnosticCode::QualifyingTypeUnresolved,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(), language: language.config_label(),
+                message: "qualifying-type could not prove this site's associated qualifier and every deciding type component".to_owned(),
+                exhausted_roots: Vec::new(), withheld_rows_path: (site.reported_range.is_none() && seed.positive_capture_names().is_empty()).then(|| crate::path_utils::workspace_relative_slash_path(file.rel_path())),
+            }));
+        }
+        for (owner, role, coverage) in signature_incomplete
+            .role_coverage_gaps
+            .borrow_mut()
+            .drain(..)
+        {
+            let gap = match coverage {
+                Some(
+                    brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage::Incomplete(gaps),
+                ) => format!("{:?}", gaps.iter().collect::<Vec<_>>()),
+                _ => "unknown".to_string(),
+            };
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::StructuralRoleCoverageIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: format!(
+                    "{}:{} (bytes {}..{}): {} role coverage is {gap}; ordered role matching is incomplete",
+                    crate::path_utils::workspace_relative_slash_path(file.rel_path()),
+                    owner.start_line,
+                    owner.start_byte,
+                    owner.end_byte,
+                    role.label(),
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            }));
+        }
+        for count_gap in signature_incomplete.count_gaps.borrow_mut().drain(..) {
+            let super::super::matcher::CountGap {
+                owner,
+                role,
+                lower,
+                upper,
+                min,
+                max,
+                coverage,
+            } = count_gap;
+            let gap = match coverage {
+                Some(
+                    brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage::Incomplete(gaps),
+                ) => format!("{:?}", gaps.iter().collect::<Vec<_>>()),
+                _ => "unknown".to_string(),
+            };
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+                incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                related: Vec::new(),
+                source: None,
+                code: CodeQueryDiagnosticCode::StructuralRoleCoverageIncomplete,
+                impact: CodeQueryDiagnosticImpact::Incomplete,
+                branch: Vec::new(),
+                language: "workspace",
+                message: format!(
+                    "{}:{} (bytes {}..{}): {} count interval [{lower}, {}] versus [{min}, {}] is incomplete; coverage gaps: {gap}",
+                    crate::path_utils::workspace_relative_slash_path(file.rel_path()),
+                    owner.start_line,
+                    owner.start_byte,
+                    owner.end_byte,
+                    role.label(),
+                    upper.map_or_else(|| "unbounded".to_string(), |upper| upper.to_string()),
+                    max.map_or_else(|| "unbounded".to_string(), |max| max.to_string()),
+                ),
+                exhausted_roots: Vec::new(),
+                withheld_rows_path: None,
+            }));
+        }
         if let Some(lease) = &parallel_budget {
             for fact_match in matches {
                 let mut projected = state.budget;
@@ -2251,7 +2563,7 @@ pub(super) fn execute_seed(
                         break 'candidates;
                     }
                     FairSeedBudgetAdmission::Cancelled => {
-                        return cancelled_plan_execution();
+                        return PlanExecution::cancelled(Vec::new());
                     }
                 }
             }
@@ -2329,6 +2641,20 @@ pub(super) fn execute_seed(
             withheld_rows_path: None,
         }));
     }
+    if signature_incomplete.selection_application_undecided.get() {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "call matching is incomplete because resolution did not decide whether at least one member selection applies a parameterless method or reads a field".to_string(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
+    }
     if signature_incomplete.role_target_unrecorded.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
@@ -2342,6 +2668,62 @@ pub(super) fn execute_seed(
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
         }));
+    }
+    if signature_incomplete.role_absence_uncertified.get() {
+        let roles = signature_incomplete
+            .uncertified_role_absences
+            .borrow()
+            .iter()
+            .map(|role| role.label())
+            .collect::<Vec<_>>();
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: format!(
+                "structural role absence is incomplete because the language adapter does not certify that it records every {roles:?} edge, so a fact without the edge may still have it"
+            ),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
+    }
+    if signature_incomplete.each_incomplete.get() {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "each pattern is incomplete because its subtree contains recovered syntax"
+                .to_string(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
+    }
+    if signature_incomplete.argument_mode_unrecorded.get() {
+        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+            incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+            related: Vec::new(),
+            source: None,
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message:
+                "argument-mode is incomplete because the adapter does not record a requested mode"
+                    .to_string(),
+            exhausted_roots: Vec::new(),
+            withheld_rows_path: None,
+        }));
+    }
+    if signature_incomplete.fact_budget_exhausted.get() {
+        push_budget_diagnostic(diagnostics, &state.budget);
     }
     if signature_incomplete.local_value_unresolved.get() {
         diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
@@ -2437,12 +2819,7 @@ pub(super) fn execute_seed(
     if let Some(profile) = &mut state.cache_profile {
         profile.seed_result.record_build(cache_complete);
     }
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }
 
 /// Retain the normalized roots selected by a language relation and carry its

@@ -73,6 +73,8 @@ use brokk_bifrost_php::aliases::resolve_php_type_node_arms;
 
 use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
 
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbol;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind;
 use brokk_bifrost_analysis::analyzer::semantic_model::overlay::SemanticModelOverlay;
 
 use brokk_bifrost_core::analyzer::usages::local_inference::SymbolResolution;
@@ -406,11 +408,13 @@ fn php_expression_type_fqn(
 pub(crate) struct PhpDefinitionResolution {
     pub(crate) outcome: DefinitionLookupOutcome,
     pub(crate) external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+    pub(crate) exact_external_call: Option<ExactExternalCallProof>,
 }
 
 #[derive(Default)]
 struct PhpCallEvidence {
     external_callee_identity: Option<ResolverOwnedExternalCalleeIdentity>,
+    exact_external_call: Option<ExactExternalCallProof>,
 }
 
 impl PhpCallEvidence {
@@ -464,6 +468,7 @@ pub(crate) fn resolve_php(
     PhpDefinitionResolution {
         outcome,
         external_callee_identity: call_evidence.external_callee_identity,
+        exact_external_call: call_evidence.exact_external_call,
     }
 }
 
@@ -635,7 +640,28 @@ fn resolve_php_with_session(
             } else {
                 resolve_php_type(&raw, &ctx)
             };
-            php_fqn_outcome(support, overlay, owner, &raw)
+            let outcome = php_fqn_outcome(support, overlay, owner.clone(), &raw);
+            // `new Owner(...)` of a class only a pack publishes calls the
+            // constructor that pack declares. A relative scope (`new static`)
+            // names the class only at run time.
+            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+                && !relative_class_keyword
+                && type_node.kind() != "relative_scope"
+                && let Some(call_evidence) = call_evidence
+                && let Some(owner) = owner.as_deref()
+                && let Some(proof) = php_object_creation_arity(type_node)
+                    .and_then(|arity| php_overlay_constructor_call_proof(overlay, owner, arity))
+            {
+                call_evidence.record_external_member(owner, PHP_CONSTRUCTOR);
+                let canonical = proof.canonical_callee().to_owned();
+                call_evidence.exact_external_call = Some(proof);
+                return external_member_boundary_outcome(
+                    canonical.clone(),
+                    format!("`{canonical}` is declared by an activated PHP semantic pack"),
+                    None,
+                );
+            }
+            outcome
         }
         Some(PhpReferenceNode::Function(name_node)) => {
             let raw = php_qualified_candidate_text_with_session(name_node, source, session);
@@ -671,6 +697,11 @@ fn resolve_php_with_session(
             };
             let owner =
                 php_static_scope_fqn(php, support, scope, source, &ctx, &enclosing, session);
+            // `self::`, `static::` and `parent::` select through the enclosing
+            // hierarchy, so only a named scope proves its call shape.
+            let call_arity = (access == PhpMemberAccess::StaticScope)
+                .then(|| php_member_call_arity(name, "scoped_call_expression"))
+                .flatten();
             php_member_outcome(
                 php,
                 support,
@@ -680,6 +711,7 @@ fn resolve_php_with_session(
                     member,
                     access,
                     kind,
+                    call_arity,
                 },
                 session,
                 call_evidence,
@@ -716,6 +748,8 @@ fn resolve_php_with_session(
                     member,
                     access: PhpMemberAccess::Instance,
                     kind,
+                    call_arity: php_member_call_arity(name, "member_call_expression")
+                        .or_else(|| php_member_call_arity(name, "nullsafe_member_call_expression")),
                 },
                 session,
                 call_evidence,
@@ -1382,6 +1416,97 @@ struct PhpMemberResolution<'a> {
     member: &'a str,
     access: PhpMemberAccess,
     kind: PhpMemberKind,
+    /// The positional argument count when `member` names the callee of a
+    /// call of the matching access form, see [`php_member_call_arity`].
+    call_arity: Option<u32>,
+}
+
+/// The positional arity of the call whose `call_kind` node names `name` as
+/// its callee.
+fn php_member_call_arity(name: Node<'_>, call_kind: &str) -> Option<u32> {
+    let call = name.parent().filter(|call| call.kind() == call_kind)?;
+    call.child_by_field_name("name")
+        .is_some_and(|callee| callee.id() == name.id())
+        .then(|| crate::analyzer::php::semantic::php_positional_call_arity(call))
+        .flatten()
+}
+
+/// The name PHP gives every constructor.
+const PHP_CONSTRUCTOR: &str = "__construct";
+
+/// The positional arity of the `new` expression whose class `type_node` names.
+fn php_object_creation_arity(type_node: Node<'_>) -> Option<u32> {
+    let creation = type_node
+        .parent()
+        .filter(|parent| parent.kind() == "object_creation_expression")?;
+    php_object_creation_type(creation)
+        .is_some_and(|class| class.id() == type_node.id())
+        .then(|| crate::analyzer::php::semantic::php_positional_call_arity(creation))
+        .flatten()
+}
+
+/// The one declaration an activated pack publishes for `member` on `owner`
+/// itself.
+///
+/// A call proof names the receiver's own class, so an inherited declaration,
+/// which has another owner, does not qualify.
+fn php_overlay_own_member(
+    overlay: Option<&SemanticModelOverlay>,
+    owner: &str,
+    member: &str,
+) -> Option<Arc<SemanticModelSymbol>> {
+    let PhpOverlayMember::Indexed(id) = php_overlay_member(overlay, owner, member) else {
+        return None;
+    };
+    let overlay = overlay?;
+    let symbols = overlay.symbols_with_id_in_family(&id, "php");
+    let [symbol] = symbols.records.as_slice() else {
+        return None;
+    };
+    let owners = overlay.symbols_with_id_in_family(symbol.owner_id.as_deref()?, "php");
+    matches!(owners.records.as_slice(), [declaring] if declaring.qualified_name == owner)
+        .then(|| symbol.clone())
+}
+
+/// The exact call proof for `new owner(...)` when an activated pack declares
+/// the class's constructor.
+fn php_overlay_constructor_call_proof(
+    overlay: Option<&SemanticModelOverlay>,
+    owner: &str,
+    arity: u32,
+) -> Option<ExactExternalCallProof> {
+    let symbol = php_overlay_own_member(overlay, owner, PHP_CONSTRUCTOR)?;
+    (symbol.kind == SemanticModelSymbolKind::Constructor)
+        .then(|| ExactExternalCallProof::php_external_constructor(owner, PHP_CONSTRUCTOR, arity))
+}
+
+/// The exact call proof for one member call that an activated pack answers.
+///
+/// A named static scope proves a static member; an instance access proves
+/// whichever member PHP binds, since `$value->staticMember()` calls the static
+/// method without `$this`.
+fn php_overlay_member_call_proof(
+    overlay: Option<&SemanticModelOverlay>,
+    owner: &str,
+    member: &str,
+    access: PhpMemberAccess,
+    arity: u32,
+) -> Option<ExactExternalCallProof> {
+    let symbol = php_overlay_own_member(overlay, owner, member)?;
+    match (access, symbol.kind) {
+        (PhpMemberAccess::Instance, SemanticModelSymbolKind::Method) if symbol.has_receiver() => {
+            Some(ExactExternalCallProof::php_bound_external_member(
+                owner, member, arity,
+            ))
+        }
+        (
+            PhpMemberAccess::Instance | PhpMemberAccess::StaticScope,
+            SemanticModelSymbolKind::Method | SemanticModelSymbolKind::Function,
+        ) if !symbol.has_receiver() => Some(ExactExternalCallProof::php_static_external_member(
+            owner, member, arity,
+        )),
+        _ => None,
+    }
 }
 
 /// The definition outcome for one PHP member reference, given what its receiver
@@ -1405,6 +1530,7 @@ fn php_member_outcome(
         member,
         access,
         kind,
+        call_arity,
     } = resolution;
     let owners = match owners {
         PhpReceiverOwners::Unknown => {
@@ -1451,6 +1577,9 @@ fn php_member_outcome(
                 && let Some(call_evidence) = call_evidence
             {
                 call_evidence.record_external_member(owner, member);
+                call_evidence.exact_external_call = call_arity.and_then(|arity| {
+                    php_overlay_member_call_proof(overlay, owner, member, access, arity)
+                });
             }
             outcome
         }
@@ -3541,7 +3670,23 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             context.exact_token_focus,
         );
         evidence.external_callee_identity = resolution.external_callee_identity;
-        resolution.outcome
+        let mut outcome = resolution.outcome;
+        if let Some(proof) = resolution.exact_external_call {
+            // The call boundary keys the external callee by the reference
+            // text, which must be the proof's canonical owner and member
+            // rather than the member name the site spells.
+            debug_assert!(outcome.reference.is_none());
+            outcome.reference = Some(
+                brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite {
+                    text: proof.canonical_callee().to_owned(),
+                    ..site.clone()
+                },
+            );
+            evidence.call_application = proof.call_application();
+            evidence.dispatch_extensibility = proof.dispatch_extensibility();
+            evidence.exact_external_call = Some(proof);
+        }
+        outcome
     };
     std::ops::ControlFlow::Continue(DefinitionResolution {
         outcome,

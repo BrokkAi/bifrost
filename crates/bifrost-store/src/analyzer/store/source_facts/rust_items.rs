@@ -7,10 +7,10 @@
 use crate::CancellationToken;
 use brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts;
 use brokk_bifrost_core::analyzer::rust_facts::{
-    MacroFragmentKind, MacroIdentRole, RustItemMacroExpansion, RustItemMacroSourcePosition,
-    RustItemSourceFacts, RustMacroDelimiter, RustMacroPatternSourceKind,
-    RustMacroRepetitionOperator, RustSourceContextKind, RustTypeCompoundSourceKind,
-    RustTypeSourceFact, RustTypeSourceShape, RustTypeWrapperSourceKind,
+    MacroFragmentKind, MacroIdentRole, RustImplCensusBoundaryKind, RustItemMacroExpansion,
+    RustItemMacroSourcePosition, RustItemSourceFacts, RustMacroDelimiter,
+    RustMacroPatternSourceKind, RustMacroRepetitionOperator, RustSourceContextKind,
+    RustTypeCompoundSourceKind, RustTypeSourceFact, RustTypeSourceShape, RustTypeWrapperSourceKind,
 };
 use brokk_bifrost_core::analyzer::source_facts::SourceOccurrenceId;
 use rusqlite::{Transaction, params};
@@ -19,7 +19,7 @@ use super::super::{Result, usize_to_i64};
 use super::check_cancelled;
 
 #[doc(hidden)]
-pub const RUST_ITEM_SOURCE_FACTS_VERSION: i64 = 1;
+pub const RUST_ITEM_SOURCE_FACTS_VERSION: i64 = 2;
 #[doc(hidden)]
 pub const RUST_MACRO_FACTS_VERSION: i64 = 1;
 #[doc(hidden)]
@@ -133,7 +133,8 @@ pub fn rust_item_source_cost(
     items: &RustItemSourceFacts,
     types: &[RustTypeSourceFact],
 ) -> (usize, usize) {
-    let mut rows = 1usize
+    let mut rows = 2usize
+        .saturating_add(items.impl_census_boundaries.len())
         .saturating_add(items.syntax.len())
         .saturating_add(items.contexts.len())
         .saturating_add(items.impls.len())
@@ -377,6 +378,46 @@ pub fn insert_rust_item_source_facts_tx(
          ) VALUES",
         "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &impls,
+        cancellation,
+    )?;
+
+    let written_impls: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM source_rust_impl_items WHERE blob_id = ?1",
+        [blob_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        written_impls,
+        usize_to_i64(item_facts.impls.len())?,
+        "Rust impl census covers every written source impl"
+    );
+    let mut boundaries = Vec::with_capacity(item_facts.impl_census_boundaries.len());
+    for (ordinal, boundary) in item_facts.impl_census_boundaries.iter().enumerate() {
+        check_cancelled(cancellation)?;
+        let kind = match boundary.kind {
+            RustImplCensusBoundaryKind::Macro => 0,
+            RustImplCensusBoundaryKind::Derive => 1,
+            RustImplCensusBoundaryKind::ExpandingAttribute => 2,
+            RustImplCensusBoundaryKind::InternalAttribute => 3,
+            RustImplCensusBoundaryKind::SyntaxError => 4,
+        };
+        boundaries.push((
+            blob_id,
+            usize_to_i64(ordinal)?,
+            kind,
+            usize_to_i64(boundary.start_byte)?,
+        ));
+    }
+    tx.execute(
+        "INSERT INTO source_rust_impl_census_files(blob_id, census_version, impl_count, boundary_count)
+         VALUES(?1, 1, ?2, ?3)",
+        params![blob_id, written_impls, usize_to_i64(boundaries.len())?],
+    )?;
+    super::insert_rows(
+        tx,
+        "INSERT INTO source_rust_impl_census_boundaries(blob_id, ordinal, kind, start_byte) VALUES",
+        "(?, ?, ?, ?)",
+        &boundaries,
         cancellation,
     )?;
 

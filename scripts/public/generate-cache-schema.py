@@ -229,7 +229,15 @@ def seed_inserts(connection: sqlite3.Connection) -> list[str]:
         columns = table_columns(connection, table)
         quoted_columns = ", ".join(quote_identifier(column) for column in columns)
         for row in table_rows(connection, table, columns):
-            values = ", ".join(sql_literal(value) for value in row)
+            rendered = [sql_literal(value) for value in row]
+            if table == "blob_publication_witness_sequence":
+                nonce = row[columns.index("store_nonce")]
+                if not isinstance(nonce, bytes) or len(nonce) != 16:
+                    raise RuntimeError("publication witness store nonce must be 16 bytes")
+                # Each fresh store mints its own lineage. A literal copied from
+                # the migration database would give every fresh store one nonce.
+                rendered[columns.index("store_nonce")] = "randomblob(16)"
+            values = ", ".join(rendered)
             inserts.append(
                 f"INSERT INTO {quote_identifier(table)} ({quoted_columns}) "
                 f"VALUES ({values});"

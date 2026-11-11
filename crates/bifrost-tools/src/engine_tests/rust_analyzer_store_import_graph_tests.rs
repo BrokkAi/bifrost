@@ -382,11 +382,7 @@ mod rust_departing_tests_tests {
     fn rust_incremental_import_graph_work_matches_fresh_rebuild_for_reexport_and_leaf_edits() {
         use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
-        use brokk_bifrost_core::analyzer::model::Language;
-
         use brokk_bifrost_rust_analysis::RustAnalyzer;
-
-        use brokk_bifrost_core::analyzer::project::TestProject;
 
         let temp = tempfile::tempdir().expect("Rust import graph fixture");
         let root = temp.path().canonicalize().expect("canonical fixture root");
@@ -411,7 +407,16 @@ mod rust_departing_tests_tests {
         ] {
             std::fs::write(root.join(path), contents).expect("write Rust fixture file");
         }
-        let analyzer = RustAnalyzer::from_project(TestProject::new(root.clone(), Language::Rust));
+        let workspace = brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
+            crate::inline_project::certified_project_at(&root),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+        )
+        .expect("certified fixture workspace builds");
+        let analyzer = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            RustAnalyzer,
+        >(workspace.analyzer())
+        .expect("workspace contains the Rust analyzer")
+        .clone();
         let files = brokk_bifrost_core::analyzer::CodeUnitIndex::analyzed_files(&analyzer);
         let sources = rust_graph_sources(&analyzer, &files);
         let initial_graph = rust_graph_facts(&analyzer, &files, None);
@@ -472,11 +477,7 @@ mod rust_departing_tests_tests {
     fn rust_name_surface_cutoff_matches_fresh_after_body_item_and_glob_edits() {
         use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
 
-        use brokk_bifrost_core::analyzer::model::Language;
-
         use brokk_bifrost_rust_analysis::RustAnalyzer;
-
-        use brokk_bifrost_core::analyzer::project::TestProject;
 
         let temp = tempfile::tempdir().expect("Rust binding surface fixture");
         let root = temp.path().canonicalize().expect("canonical fixture root");
@@ -504,7 +505,16 @@ mod rust_departing_tests_tests {
         ] {
             std::fs::write(root.join(path), contents).expect("write Rust fixture file");
         }
-        let analyzer = RustAnalyzer::from_project(TestProject::new(root.clone(), Language::Rust));
+        let workspace = brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
+            crate::inline_project::certified_project_at(&root),
+            brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+        )
+        .expect("certified fixture workspace builds");
+        let analyzer = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            RustAnalyzer,
+        >(workspace.analyzer())
+        .expect("workspace contains the Rust analyzer")
+        .clone();
         let files = brokk_bifrost_core::analyzer::CodeUnitIndex::analyzed_files(&analyzer);
         let sources = rust_graph_sources(&analyzer, &files);
         let initial_graph = rust_graph_facts(&analyzer, &files, None);

@@ -1,4 +1,23 @@
 //! Found-defect pins that require this binary's registered language rules.
+#[test]
+fn published_rust_evidence_changes_both_provider_identity_domains() {
+    use brokk_bifrost_analysis::analyzer::semantic::icfg::{IcfgProvider, WorkspaceIcfgProvider};
+    use brokk_bifrost_analysis::analyzer::semantic_model::DependencyDiscoveryOutcome;
+    use brokk_bifrost_analysis::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::Language;
+
+    let fixture =
+        AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", "pub fn example() {}")]);
+    let workspace = fixture.analyzer();
+    let absent = WorkspaceIcfgProvider::new(workspace).behavior_identity();
+    workspace.retain_dependency_discovery_evidence(
+        &[Language::Rust],
+        &DependencyDiscoveryOutcome::complete(Vec::new()),
+    );
+    let present = WorkspaceIcfgProvider::new(workspace).behavior_identity();
+    assert_ne!(absent.digest(), present.digest());
+    assert_ne!(absent.read_digest(), present.read_digest());
+}
 mod fact_resolution {
     mod tests {
 

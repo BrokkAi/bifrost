@@ -54,9 +54,10 @@ use brokk_bifrost_analysis::path_utils::rel_path_string;
 use brokk_bifrost_flow::type_flow::{FieldSlotIndex, FieldSlotIndexCache};
 use brokk_bifrost_flow::value_flow::ValueFlowCache;
 use brokk_bifrost_rql::structural::search::{
-    CodeQueryExecutionScope, IntersectPrefixProduct, MergedUnitRows, UnitExecutionResult,
-    continue_intersect_prefix, execute_code_query_unit, execute_intersect_prefix, merge_unit_rows,
-    plan_seed_files, push_skipped_unit_diagnostic, remaining_unit_limits,
+    CodeQueryExecutionScope, CompleteEmptyFromOperandZero, IntersectPrefixProduct, MergedUnitRows,
+    UnitExecutionResult, continue_empty_operand_zero, continue_intersect_prefix,
+    execute_code_query_unit, execute_intersect_prefix, merge_unit_rows_in_scope, plan_seed_files,
+    push_skipped_unit_diagnostic, push_unit_budget_diagnostic, remaining_unit_limits,
 };
 use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryExecutionLimits, QueryValueKind};
 use brokk_bifrost_rql::{PlanPartitioning, PlanWidenDetail};
@@ -66,8 +67,9 @@ use super::definition::PolicyId;
 use super::evaluator::SubjectQueryBatch;
 use super::resolved::LoadedPolicy;
 use super::units::{
-    IncrementalMode, PolicyIncrementalContext, PolicyIncrementalRun, PolicyUnit, PolicyUnitKey,
-    PolicyUnitProduct, UnitPartition, UnitPhaseMetrics, WidenReason,
+    IncrementalMode, OutputRefusalCause, PolicyIncrementalContext, PolicyIncrementalRun,
+    PolicyUnit, PolicyUnitKey, PolicyUnitProduct, StagedUnits, UnitPartition, UnitPhaseMetrics,
+    WidenReason,
 };
 
 /// What one policy's sliced attempt did, whether or not it widened.
@@ -83,7 +85,14 @@ pub(crate) struct UnitAttempt {
     recomputed: u64,
     unbounded: u64,
     all_recomputed_published: bool,
+    execution_stable: bool,
+    /// Seed-order positions of fresh refused units whose product cannot stand
+    /// in for a recomputation: execution was unstable or a cause is not
+    /// answer content, judged for that unit alone (#9947). A published unit's
+    /// execution is always stable.
+    unkept_positions: Vec<usize>,
     widen_detail: Option<PlanWidenDetail>,
+    output_refusals: std::collections::BTreeMap<OutputRefusalCause, u64>,
 }
 
 impl Default for UnitAttempt {
@@ -94,14 +103,82 @@ impl Default for UnitAttempt {
             recomputed: 0,
             unbounded: 0,
             all_recomputed_published: true,
+            execution_stable: true,
+            unkept_positions: Vec::new(),
             widen_detail: None,
+            output_refusals: Default::default(),
         }
     }
+}
+
+/// A refusal cause that follows from the unit's answer, not from how this
+/// execution ran.
+fn is_answer_content_refusal(cause: &OutputRefusalCause) -> bool {
+    matches!(
+        cause,
+        OutputRefusalCause::DiagnosticsOpen
+            | OutputRefusalCause::NotCompleteOrAuthoredProven
+            | OutputRefusalCause::AttributionRunExhausted
+            | OutputRefusalCause::OmittedFindings
+            | OutputRefusalCause::OmittedBarriers
+            | OutputRefusalCause::UndecidedBarrierChecks
+            | OutputRefusalCause::IncompleteOrTruncatedFinding
+            | OutputRefusalCause::IncompleteOrTruncatedWitness
+            // This receipt also covers composition budget stops.
+            // execution_stable separately excludes environmental failures.
+            | OutputRefusalCause::ExecutionDependentReceipt
+    )
 }
 
 impl UnitAttempt {
     pub(crate) fn all_recomputed_published(&self) -> bool {
         self.all_recomputed_published
+    }
+
+    /// Whether no unit of this attempt came from a stored product.
+    pub(crate) fn replayed_nothing(&self) -> bool {
+        self.reused == 0
+    }
+
+    /// Fresh products can replace the cold loop only when execution was stable
+    /// and every refusal follows from answer content. New causes fail closed.
+    pub(crate) fn refused_only_for_answer_content(&self) -> bool {
+        self.execution_stable
+            && !self.output_refusals.is_empty()
+            && self.output_refusals.keys().all(is_answer_content_refusal)
+    }
+
+    /// Seed-order positions of fresh refused units that must be computed
+    /// again, because the same judgement `refused_only_for_answer_content`
+    /// makes for the whole attempt fails for that unit.
+    pub(crate) fn unkept_positions(&self) -> &[usize] {
+        &self.unkept_positions
+    }
+
+    /// Record why one fresh Output unit at `position` was not published.
+    pub(crate) fn record_unit_refusal(
+        &mut self,
+        position: usize,
+        execution_stable: bool,
+        unit: String,
+        causes: Vec<OutputRefusalCause>,
+    ) {
+        if !(execution_stable && !causes.is_empty() && causes.iter().all(is_answer_content_refusal))
+        {
+            self.unkept_positions.push(position);
+        }
+        self.record_output_refusal(unit, causes);
+    }
+
+    pub(crate) fn record_output_refusal(&mut self, unit: String, causes: Vec<OutputRefusalCause>) {
+        if !causes.is_empty() {
+            brokk_bifrost_analysis::profiling::note_with(|| {
+                format!("policy.output.refusal unit={unit} causes={causes:?}")
+            });
+            for cause in causes {
+                *self.output_refusals.entry(cause).or_default() += 1;
+            }
+        }
     }
 
     pub(crate) fn set_widen_detail(&mut self, detail: Option<PlanWidenDetail>) {
@@ -150,6 +227,9 @@ impl UnitAttempt {
             units_recomputed: self.recomputed,
             units_unbounded: self.unbounded,
             lookups_replayed: 0,
+            output_refusals: self.output_refusals,
+            composition_searches: Default::default(),
+            discarded_source_inventory: None,
             widen_reason,
             base_units_reused: 0,
             base_units_recomputed: 0,
@@ -298,6 +378,9 @@ pub(crate) struct UnitReuse<'a> {
     /// Where this attempt's time went, handed to the incremental context once
     /// when the attempt ends so the per-unit loop never takes its lock.
     phase: Cell<UnitPhaseMetrics>,
+    /// The units this attempt recomputed, provisional until the caller
+    /// commits them through `take_staged`. Dropping the reuse discards them.
+    staged: RefCell<StagedUnits>,
 }
 
 impl Drop for UnitReuse<'_> {
@@ -323,6 +406,18 @@ impl<'a> UnitReuse<'a> {
         budget: &'a PolicyBudget,
         flow: &brokk_bifrost_flow::FlowWorkspaceState,
     ) -> Self {
+        Self::continuing(policy, incremental, budget, flow, StagedUnits::default())
+    }
+
+    /// Continue an attempt whose earlier phase already staged units, so this
+    /// phase reads them and commits them with its own.
+    pub(crate) fn continuing(
+        policy: &'a LoadedPolicy,
+        incremental: &'a PolicyIncrementalContext<'a>,
+        budget: &'a PolicyBudget,
+        flow: &brokk_bifrost_flow::FlowWorkspaceState,
+        staged: StagedUnits,
+    ) -> Self {
         let limits = budget.query_limits();
         Self {
             incremental,
@@ -334,7 +429,14 @@ impl<'a> UnitReuse<'a> {
             memo: LookupMemo::new(),
             answers: HeadFieldSlotAnswers::new(incremental.workspace(), flow, &limits),
             phase: Cell::default(),
+            staged: RefCell::new(staged),
         }
+    }
+
+    /// Hand over the units this attempt staged, to commit or to pass to the
+    /// attempt's next phase.
+    pub(crate) fn take_staged(&self) -> StagedUnits {
+        self.staged.take()
     }
 
     /// The incremental context this reuse decides against.
@@ -417,13 +519,18 @@ impl<'a> UnitReuse<'a> {
         // A repeated consumer must see this attempt's writes. Use the same
         // verification and accounting path as a committed product; publication
         // remains atomic with recording the complete policy unit set.
-        let staged = self.incremental.staged_unit(self.policy_id, key);
+        let staged = self.staged.borrow().get(key).cloned();
         let mut store = self
             .incremental
             .store()
             .lock()
             .expect("policy-unit store mutex poisoned");
         let Some(unit) = staged.as_ref().or_else(|| store.lookup(key)) else {
+            if matches!(key.partition, UnitPartition::Output { .. }) {
+                brokk_bifrost_analysis::profiling::note_with(|| {
+                    format!("policy.units output_key_miss key={:?}", key)
+                });
+            }
             return Ok(None);
         };
         if unit.budget_mode() != BudgetMode::Exhaustive {
@@ -541,10 +648,11 @@ impl<'a> UnitReuse<'a> {
 
     /// Stage one recomputed unit under the reads that produced it.
     ///
-    /// The incremental context commits staged products only when the caller
-    /// records the complete unit-key set for a successful sliced policy. A
-    /// later widening therefore drops this product instead of exposing a
-    /// partial unit set through the shared store.
+    /// The caller takes the staged products (`take_staged`) and commits them
+    /// with the complete unit-key set of a successful sliced policy
+    /// (`commit_units`), or on their own when the attempt staged them as
+    /// publishable by themselves (`commit_publishable_units`, #9947). A refused
+    /// sibling never decides whether one is committed.
     pub(crate) fn publish(
         &self,
         key: PolicyUnitKey,
@@ -572,17 +680,14 @@ impl<'a> UnitReuse<'a> {
             UnitPartition::Whole => None,
         };
         let snapshots = self.incremental.publication_snapshots(&reads);
-        self.incremental.stage_unit(
-            self.policy_id.clone(),
-            PolicyUnit::new(
-                key,
-                seed_parse_variant,
-                product,
-                reads,
-                BudgetMode::Exhaustive,
-                snapshots,
-            ),
-        );
+        self.staged.borrow_mut().stage(PolicyUnit::new(
+            key,
+            seed_parse_variant,
+            product,
+            reads,
+            BudgetMode::Exhaustive,
+            snapshots,
+        ));
     }
 }
 
@@ -600,19 +705,55 @@ pub(crate) fn recompute_unit<T>(
     unit_label: impl FnOnce() -> String,
     run: impl FnOnce() -> T,
 ) -> (T, Option<Vec<ReadKey>>, Duration) {
+    let (product, reads, elapsed, _) =
+        recompute_unit_observed(analyzer, cancellation, unit_label, run);
+    (product, reads, elapsed)
+}
+
+/// What made a unit's receipt unbounded: the ledger's channels at the end of the
+/// execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReceiptDependences {
+    /// The execution dependences of the receipt that no refused budget charge
+    /// caused: a cancellation, a change of the analysis generation, a store
+    /// failure, a provider failure that marked the execution, and so on. A rerun
+    /// may not repeat any of them. The ledger records the cause of each
+    /// dependence as it is marked, and nested captures forward the cause with
+    /// the count, so this is exact however many times a refusal was forwarded.
+    pub(crate) non_budget_dependences: usize,
+    pub(crate) unattributed_reads: usize,
+    pub(crate) reuse_refused: bool,
+    pub(crate) persistence_refusals: usize,
+}
+
+/// [`recompute_unit`] that also reports why the receipt is unbounded: the
+/// ledger's channels at the end of the execution. A caller that can tell which
+/// execution dependences it explains uses them to judge whether a rerun repeats.
+pub(crate) fn recompute_unit_observed<T>(
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+    unit_label: impl FnOnce() -> String,
+    run: impl FnOnce() -> T,
+) -> (T, Option<Vec<ReadKey>>, Duration, ReceiptDependences) {
+    let unit_label = unit_label();
     let ledger = Arc::new(ReadLedger::new());
     let generation_before = analyzer.project().analysis_generation();
+    let unit_boundary;
     let product = {
         let started = Instant::now();
-        let _reads = AnalyzerQueryScope::with_read_ledger(analyzer, Arc::clone(&ledger));
+        let _reads = AnalyzerQueryScope::with_policy_unit_read_ledger(
+            analyzer,
+            Arc::clone(&ledger),
+            unit_label.clone(),
+        );
         let product = run();
-        if cancellation.is_some_and(CancellationToken::is_cancelled)
+        unit_boundary = cancellation.is_some_and(CancellationToken::is_cancelled)
             || analyzer
                 .active_query_cancellation()
                 .is_some_and(|token| token.is_cancelled())
             || analyzer.project().analysis_generation() != generation_before
-            || _reads.store_error().is_some()
-        {
+            || _reads.store_error().is_some();
+        if unit_boundary {
             brokk_bifrost_analysis::profiling::note_with(|| {
                 format!(
                     "policy.units unbounded origin={}:{} cause=unit_boundary cancelled={} snapshot={} store={}",
@@ -648,11 +789,104 @@ pub(crate) fn recompute_unit<T>(
         (product, started.elapsed())
     };
     let (product, elapsed) = product;
-    if !ledger.is_bounded() {
-        note_refused_unit(&ledger, unit_label);
+    let reads = ledger.publishable_keys().map(policy_unit_reads);
+    if reads.is_none() {
+        note_refused_unit(&ledger, || unit_label);
     }
-    let reads = ledger.is_bounded().then(|| ledger.keys());
-    (product, reads, elapsed)
+    let channels = ledger.channels();
+    (
+        product,
+        reads,
+        elapsed,
+        ReceiptDependences {
+            non_budget_dependences: channels
+                .execution_dependences
+                .saturating_sub(channels.budget_dependences),
+            unattributed_reads: channels.unattributed_reads,
+            reuse_refused: channels.reuse_refused,
+            persistence_refusals: channels.persistence_refusals,
+        },
+    )
+}
+
+/// Whether a unit that stopped on the shared budget repeats on a rerun, so the
+/// refusals its receipt records are the one execution dependence that does not
+/// make the rerun differ.
+///
+/// The keep-fresh arm requires a stable execution only because a provider
+/// failure or a cancellation may not repeat. A semantic budget stop in an
+/// attempt that replayed nothing repeats from the same state. A receipt is
+/// unbounded after a ledger refusal, so the unit is stable only when every
+/// execution dependence in its receipt was caused by a refused budget charge:
+/// the ledger records the cause of each dependence when it is marked and nested
+/// captures forward the cause with the count (`non_budget_dependences` is what
+/// is left). A provider failure that marked the execution before the unit met
+/// its refusal therefore keeps the unit unstable, whether or not the stopped
+/// product kept the provider record of the partial result it replaced. The unit
+/// must also have been refused itself (`own_refusals` is its refusal delta on
+/// the shared ledger, so a refusal that began before the unit is not counted)
+/// and have left no read unattributed, refused for reuse or kept from
+/// persistence. The product's own stability (provider and cancellation records,
+/// read incompleteness) is judged by `refusal_stable`. The receipt itself stays
+/// unusable: the caller never uses it to stage the unit.
+fn unit_execution_stable(
+    receipt_usable: bool,
+    stop_repeats: bool,
+    channels: &ReceiptDependences,
+    own_refusals: usize,
+    refusal_stable: bool,
+) -> bool {
+    (receipt_usable || (stop_repeats && stopped_by_own_refusals(channels, own_refusals)))
+        && refusal_stable
+}
+
+fn stopped_by_own_refusals(channels: &ReceiptDependences, own_refusals: usize) -> bool {
+    own_refusals > 0
+        && channels.non_budget_dependences == 0
+        && channels.unattributed_reads == 0
+        && !channels.reuse_refused
+        && channels.persistence_refusals == 0
+}
+
+fn policy_unit_reads(reads: Vec<ReadKey>) -> Vec<ReadKey> {
+    debug_assert!(
+        !reads.iter().any(|key| matches!(
+            key,
+            ReadKey::Lookup {
+                kind: brokk_bifrost_analysis::analyzer::LookupKind::CertifiedDefinitionAnswer,
+                ..
+            }
+        )),
+        "policy unit received a protocol certificate: {reads:?}"
+    );
+    reads
+}
+
+#[cfg(all(test, debug_assertions))]
+mod certified_read_projection_tests {
+    #[cfg(debug_assertions)]
+    use super::*;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "policy unit received a protocol certificate")]
+    fn policy_unit_rejects_protocol_certificates() {
+        use brokk_bifrost_analysis::analyzer::semantic::read_ledger::CertifiedDefinitionKind;
+        let raw = ReadKey::index(
+            brokk_bifrost_analysis::analyzer::IndexFamily::DefinitionExact,
+            "target",
+        );
+        let certificate = ReadKey::lookup(
+            brokk_bifrost_analysis::analyzer::LookupKind::CertifiedDefinitionAnswer,
+            brokk_bifrost_analysis::analyzer::LookupQuestion::certified_definition(
+                CertifiedDefinitionKind::Exact,
+                "target",
+                [brokk_bifrost_analysis::analyzer::Language::Rust],
+            ),
+            brokk_bifrost_analysis::analyzer::semantic::ids::StableDigest::sha256([]),
+        );
+        policy_unit_reads(vec![raw, certificate]);
+    }
 }
 
 /// Report one refused unit, after its reads have finished recording.
@@ -692,6 +926,7 @@ fn lookup_replay_limits(limits: &CodeQueryExecutionLimits) -> LookupReplayLimits
         },
         max_usage_files: limits.max_scanned_files,
         max_usages: limits.max_pipeline_rows,
+        stored_semantic_ir_source_bytes: limits.max_scanned_source_bytes,
         semantic: SemanticWork::default_limits(),
     }
 }
@@ -711,6 +946,7 @@ pub(crate) struct UnitQueryExecution<'a> {
     pub(crate) workspace: Option<&'a WorkspaceAnalyzer>,
     pub(crate) cancellation: Option<&'a CancellationToken>,
     pub(crate) limits: CodeQueryExecutionLimits,
+    pub(crate) depth_opt_in: bool,
     pub(crate) workspace_files: &'a [ProjectFile],
     /// The policy batch whose other consumers of the same query a unit's
     /// execution is shared with. A unit it serves replays the reads of the
@@ -723,15 +959,28 @@ pub(crate) struct SeedPartition {
     pub(crate) language: Language,
     pub(crate) rel_path: String,
     pub(crate) blob: Oid,
+    /// The root set-operator cut digest and the digest of its operands, when
+    /// the query takes the prefix slice. A unit then stores this seed's
+    /// operand rows, not its answer, so it is keyed by the cut it serves.
+    pub(crate) prefix: Option<(StableDigest, StableDigest)>,
 }
 
 impl SeedPartition {
     /// One unit per seed file, which is what a policy's own query uses.
     pub(crate) fn seed(self) -> UnitPartition {
-        UnitPartition::Seed {
-            language: self.language,
-            rel_path: self.rel_path.into_boxed_str(),
-            blob: self.blob,
+        match self.prefix {
+            Some((cut, input)) => UnitPartition::Prefix {
+                language: self.language,
+                rel_path: self.rel_path.into_boxed_str(),
+                blob: self.blob,
+                cut,
+                input,
+            },
+            None => UnitPartition::Seed {
+                language: self.language,
+                rel_path: self.rel_path.into_boxed_str(),
+                blob: self.blob,
+            },
         }
     }
 
@@ -739,11 +988,26 @@ impl SeedPartition {
     /// relational policy uses: it runs one query per binding over the same
     /// seeds, and two of them must not share a key.
     pub(crate) fn binding(self, binding: &str) -> UnitPartition {
-        UnitPartition::Binding {
-            binding: Box::from(binding),
-            language: self.language,
-            rel_path: self.rel_path.into_boxed_str(),
-            blob: self.blob,
+        match self.prefix {
+            // Two bindings over the same set operands would otherwise spell
+            // the same prefix key, and a policy's unit-key set lists each unit
+            // once (#9583), so the binding is part of the prefix's input.
+            Some((cut, input)) => UnitPartition::Prefix {
+                language: self.language,
+                rel_path: self.rel_path.into_boxed_str(),
+                blob: self.blob,
+                cut,
+                input: StableDigest::sha256(
+                    serde_json::to_string(&[input.to_string().as_str(), binding])
+                        .expect("a prefix input and binding name are JSON"),
+                ),
+            },
+            None => UnitPartition::Binding {
+                binding: Box::from(binding),
+                language: self.language,
+                rel_path: self.rel_path.into_boxed_str(),
+                blob: self.blob,
+            },
         }
     }
 }
@@ -803,6 +1067,9 @@ pub(crate) trait UnitSlice {
         true
     }
     fn capture<'a>(&self, _analyzer: &'a dyn IAnalyzer) -> Self::Capture<'a>;
+    /// Add reads made while preparing a shared input to this unit's receipt.
+    /// Called inside the recompute capture, before the unit executes.
+    fn replay_preparation_reads(&self, _analyzer: &dyn IAnalyzer, _seed: &Self::Seed) {}
     fn after_recompute(
         &self,
         _prefix: &mut Self::Prefix,
@@ -815,6 +1082,32 @@ pub(crate) trait UnitSlice {
     }
     fn publishable(&self, _prefix: &Self::Prefix) -> bool {
         true
+    }
+    fn publication_refusal_causes(&self, _prefix: &Self::Prefix) -> Vec<OutputRefusalCause> {
+        Vec::new()
+    }
+    fn refusal_execution_stable(&self, _prefix: &Self::Prefix) -> bool {
+        false
+    }
+    /// Execute a unit and return its own refusal evidence with the result.
+    /// Most slices cannot refuse a semantic ledger. Output overrides this to
+    /// return the count from its independent ledger, including error exits.
+    fn prefix_with_refusals(
+        &self,
+        seed: &Self::Seed,
+        allowance: Self::Allowance,
+    ) -> (Result<Self::Prefix, Self::Error>, usize) {
+        (self.prefix(seed, allowance), 0)
+    }
+    /// Whether `prefix` stopped on the shared budget in a way that repeats when
+    /// the same attempt runs again from the same state. Such a unit's own
+    /// refusals are then the one execution dependence that does not make a rerun
+    /// differ (see [`discounted_refusals`]).
+    fn budget_stop_repeats(&self, _prefix: &Self::Prefix) -> bool {
+        false
+    }
+    fn observes_output_refusals(&self) -> bool {
+        false
     }
     /// Whether a recomputed product depended on execution state its reads
     /// cannot reproduce, such as a refused or exhausted budget, so its reads
@@ -845,11 +1138,31 @@ pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
 ) -> Result<S::Output, WidenReason> {
-    let mut state = S::BudgetState::default();
+    evaluate_reusable_slice_with_state(
+        slice,
+        seeds,
+        &mut S::BudgetState::default(),
+        reuse,
+        attempt,
+        analyzer,
+        cancellation,
+    )
+}
+
+/// Shares the charged budget with a subsequent slice of the same query.
+pub(crate) fn evaluate_reusable_slice_with_state<'a, S: UnitSlice>(
+    slice: &S,
+    seeds: impl IntoIterator<Item = (S::Seed, &'a PolicyUnitKey)>,
+    state: &mut S::BudgetState,
+    reuse: &mut UnitReuse<'_>,
+    attempt: &mut UnitAttempt,
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+) -> Result<S::Output, WidenReason> {
     let mut skipped = 0;
     let mut products = Vec::new();
     for (seed, key) in seeds {
-        slice.before_lookup(&mut state, &seed)?;
+        slice.before_lookup(state, &seed)?;
         let decoded = match reuse.published_with_reads(key)? {
             Some((product, reads)) => match slice.decode(&seed, product, &reads) {
                 Ok(prefix) => Some(prefix),
@@ -863,26 +1176,35 @@ pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
             // cumulative execution allowance. Recompute it under that grant.
             slice.validate(prefix).is_ok()
                 && !cancellation.is_some_and(CancellationToken::is_cancelled)
-                && slice.fits(&state, prefix)
+                && slice.fits(state, prefix)
         }) {
             Some(prefix) => {
                 attempt.reused();
-                slice.charge(&mut state, &prefix);
+                slice.charge(state, &prefix);
                 prefix
             }
             None => {
-                let Some(allowance) = slice.remaining(&state) else {
+                let Some(allowance) = slice.remaining(state) else {
                     skipped += 1;
                     continue;
                 };
                 attempt.recomputed();
                 let capture = slice.capture(analyzer);
-                let (mut result, reads, elapsed) = recompute_unit(
-                    analyzer,
-                    cancellation,
-                    || format!("policy={} partition={:?}", reuse.policy_id, key.partition),
-                    || slice.prefix(&seed, allowance),
-                );
+                let recompute_cpu =
+                    matches!(key.partition, UnitPartition::Output { .. }).then(|| {
+                        crate::phase_cpu::Scope::new(crate::phase_cpu::Phase::OutputRecompute)
+                    });
+                let ((mut result, own_refusals), reads, elapsed, channels) =
+                    recompute_unit_observed(
+                        analyzer,
+                        cancellation,
+                        || format!("policy={} partition={:?}", reuse.policy_id, key.partition),
+                        || {
+                            slice.replay_preparation_reads(analyzer, &seed);
+                            slice.prefix_with_refusals(&seed, allowance)
+                        },
+                    );
+                drop(recompute_cpu);
                 if let Ok(prefix) = &mut result {
                     slice.after_recompute(prefix, &capture, cancellation);
                 }
@@ -891,20 +1213,69 @@ pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
                     Ok(prefix) => prefix,
                     Err(error) => return Ok(slice.failure(error, products)),
                 };
-                slice.charge(&mut state, &prefix);
-                let reads = reads.filter(|_| !slice.execution_dependent(&prefix));
+                slice.charge(state, &prefix);
+                // The receipt is unbounded after a ledger refusal, which does not
+                // make a rerun differ when the unit's stop repeats; every other
+                // dependence keeps the unit unstable. The receipt itself stays
+                // unusable: `reads` is not touched, so the unit is never staged.
+                let unit_stable = unit_execution_stable(
+                    reads.is_some(),
+                    slice.budget_stop_repeats(&prefix),
+                    &channels,
+                    own_refusals,
+                    slice.refusal_execution_stable(&prefix),
+                );
+                attempt.execution_stable &= unit_stable;
+                let execution_dependent = slice.execution_dependent(&prefix);
+                let reads = reads.filter(|_| !execution_dependent);
                 match reads {
                     Some(reads) => {
                         slice.set_reads(&mut prefix, &reads);
                         slice.validate(&prefix)?;
                         if slice.publishable(&prefix) {
+                            // An unstable Output execution is not publishable, so
+                            // the cold loop may keep every published product.
+                            debug_assert!(
+                                unit_stable || !slice.observes_output_refusals(),
+                                "a published Output unit's execution was stable"
+                            );
                             reuse.publish(key.clone(), slice.encode(&prefix), reads);
                         } else {
                             attempt.all_recomputed_published = false;
+                            let causes = slice.publication_refusal_causes(&prefix);
+                            if slice.observes_output_refusals() {
+                                attempt.record_unit_refusal(
+                                    products.len(),
+                                    unit_stable,
+                                    format!("{:?}", key.partition),
+                                    if causes.is_empty() {
+                                        vec![OutputRefusalCause::PublishableFalse]
+                                    } else {
+                                        causes
+                                    },
+                                );
+                            }
                         }
                     }
                     None => {
                         attempt.all_recomputed_published = false;
+                        let causes = slice.publication_refusal_causes(&prefix);
+                        if slice.observes_output_refusals() {
+                            attempt.record_unit_refusal(
+                                products.len(),
+                                unit_stable,
+                                format!("{:?}", key.partition),
+                                [
+                                    vec![if execution_dependent {
+                                        OutputRefusalCause::ExecutionDependentReceipt
+                                    } else {
+                                        OutputRefusalCause::UnusableReceipt
+                                    }],
+                                    causes,
+                                ]
+                                .concat(),
+                            );
+                        }
                         slice.missing_reads(attempt, &mut prefix)?;
                     }
                 }
@@ -915,6 +1286,23 @@ pub(crate) fn evaluate_reusable_slice<'a, S: UnitSlice>(
         products.push(prefix);
     }
     Ok(slice.suffix(slice.merge(products), skipped))
+}
+
+/// A run budget has one set of shared counters across slices, but physical
+/// step slots belong to each slice's own plan and cannot be added across a
+/// probe and its fallback.
+fn charge_shared_slice_budget(
+    state: &mut (
+        brokk_bifrost_rql::structural::search::CodeQueryExecutionWork,
+        brokk_bifrost_rql::structural::CodeQueryBudgetedWork,
+    ),
+    work: brokk_bifrost_rql::structural::search::CodeQueryExecutionWork,
+    budgeted: &brokk_bifrost_rql::structural::CodeQueryBudgetedWork,
+) {
+    state.0 = state.0.saturating_add(work);
+    let mut shared = budgeted.clone();
+    shared.step_outputs.clear();
+    state.1 = state.1.saturating_add(&shared);
 }
 
 struct FileQuerySlice<'a, F> {
@@ -965,14 +1353,7 @@ where
     }
 
     fn charge(&self, state: &mut Self::BudgetState, rows: &Self::Prefix) {
-        state.0 = state.0.saturating_add(rows.work);
-        if state.1.step_outputs.is_empty() {
-            state
-                .1
-                .step_outputs
-                .resize(rows.budgeted_work.step_outputs.len(), 0);
-        }
-        state.1 = state.1.saturating_add(&rows.budgeted_work);
+        charge_shared_slice_budget(state, rows.work, &rows.budgeted_work);
     }
 
     fn fits(&self, state: &Self::BudgetState, rows: &Self::Prefix) -> bool {
@@ -1041,16 +1422,207 @@ where
     }
 
     fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged {
-        merge_unit_rows(self.query, products)
+        merge_unit_rows_in_scope(
+            self.query,
+            products,
+            CodeQueryExecutionScope::whole_workspace()
+                .with_depth_bound_status(self.execution.depth_opt_in),
+        )
     }
 
     fn suffix(&self, mut merged: Self::Merged, skipped: usize) -> Self::Output {
         merged.apply_result_limit(self.query.limit);
         if skipped > 0 {
-            merged.truncated = true;
+            merged.mark_truncated();
             push_skipped_unit_diagnostic(&mut merged.diagnostics, skipped);
         }
         merged
+    }
+}
+
+struct OperandProbe {
+    rows: UnitExecutionResult,
+    reads: Vec<ReadKey>,
+    reads_closed: bool,
+}
+
+struct OperandProbeSlice<'a> {
+    query: &'a CodeQuery,
+    execution: &'a UnitQueryExecution<'a>,
+}
+
+impl UnitSlice for OperandProbeSlice<'_> {
+    type Capture<'a> = AnalyzerQueryScope<'a>;
+    type Seed = ProjectFile;
+    type Prefix = OperandProbe;
+    type Error = std::convert::Infallible;
+    type BudgetState = (
+        brokk_bifrost_rql::structural::search::CodeQueryExecutionWork,
+        brokk_bifrost_rql::structural::CodeQueryBudgetedWork,
+    );
+    type Allowance = CodeQueryExecutionLimits;
+    type Merged = Vec<OperandProbe>;
+    type Output = (Vec<OperandProbe>, usize);
+
+    fn remaining(&self, state: &Self::BudgetState) -> Option<Self::Allowance> {
+        remaining_unit_limits(self.execution.limits, &state.0, &state.1)
+    }
+    fn prefix(
+        &self,
+        file: &Self::Seed,
+        allowance: Self::Allowance,
+    ) -> Result<Self::Prefix, Self::Error> {
+        #[cfg(any(test, feature = "test-support"))]
+        let probe_action = self
+            .execution
+            .analyzer
+            .test_hooks()
+            .take_operand_probe_action_for_test();
+        #[cfg(any(test, feature = "test-support"))]
+        if probe_action == Some(brokk_bifrost_analysis::analyzer::OperandProbeTestAction::Cancel) {
+            self.execution
+                .cancellation
+                .expect("probe cancellation test requires a run token")
+                .cancel();
+        }
+        // The continuation checks seed-list membership. Pin this seed's
+        // content even when the operand emits no other reads.
+        let seed_read = self
+            .execution
+            .analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == file.language())
+            .and_then(|provider| provider.structural_file_read_key(file))
+            .expect("probe seed must have a structural file read key");
+        self.execution.analyzer.record_read(seed_read);
+        let rows = execute_code_query_unit(
+            self.execution.analyzer,
+            self.execution.flow_state.clone(),
+            self.execution.workspace,
+            self.query,
+            allowance,
+            self.execution.cancellation,
+            CodeQueryExecutionScope::for_seed_files(
+                std::slice::from_ref(file),
+                self.execution.workspace_files,
+            )
+            .with_depth_bound_status(self.execution.depth_opt_in),
+        );
+        #[cfg(any(test, feature = "test-support"))]
+        let mut rows = rows;
+        #[cfg(any(test, feature = "test-support"))]
+        if probe_action
+            == Some(brokk_bifrost_analysis::analyzer::OperandProbeTestAction::IncompleteEmpty)
+        {
+            // An injected incomplete probe names its cause like a real one:
+            // a truncated result without one is refused.
+            rows.rows.clear();
+            rows.truncated = true;
+            rows.diagnostics
+                .push(brokk_bifrost_rql::CodeQueryDiagnostic::new(
+                    brokk_bifrost_rql::CodeQueryDiagnostic {
+                        incompleteness: brokk_bifrost_rql::Incompleteness::Content,
+                        related: Vec::new(),
+                        source: None,
+                        code: brokk_bifrost_rql::CodeQueryDiagnosticCode::SemanticResultsOmitted,
+                        impact: brokk_bifrost_rql::CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "workspace",
+                        message: "test-injected incomplete operand probe".to_string(),
+                        exhausted_roots: Vec::new(),
+                        withheld_rows_path: None,
+                    },
+                ));
+            rows.completion =
+                brokk_bifrost_rql::structural::code_query_completion(true, &rows.diagnostics);
+        }
+        Ok(OperandProbe {
+            rows,
+            reads: Vec::new(),
+            reads_closed: true,
+        })
+    }
+    fn decode(
+        &self,
+        _seed: &Self::Seed,
+        product: PolicyUnitProduct,
+        reads: &[ReadKey],
+    ) -> Result<Self::Prefix, UnitDecodeError> {
+        let PolicyUnitProduct::Prefix(json) = product else {
+            return Err(UnitDecodeError::Corrupt);
+        };
+        let rows: UnitExecutionResult =
+            serde_json::from_str(&json).map_err(|_| UnitDecodeError::Corrupt)?;
+        if !rows.has_valid_step_outputs(self.query) {
+            return Err(UnitDecodeError::Corrupt);
+        }
+        Ok(OperandProbe {
+            rows,
+            reads: reads.to_vec(),
+            reads_closed: true,
+        })
+    }
+    fn encode(&self, probe: &Self::Prefix) -> PolicyUnitProduct {
+        PolicyUnitProduct::Prefix(serde_json::to_string(&probe.rows).expect("probe rows serialize"))
+    }
+    fn charge(&self, state: &mut Self::BudgetState, probe: &Self::Prefix) {
+        charge_shared_slice_budget(state, probe.rows.work, &probe.rows.budgeted_work);
+    }
+    fn fits(&self, state: &Self::BudgetState, probe: &Self::Prefix) -> bool {
+        let Some(allowance) = self.remaining(state) else {
+            return false;
+        };
+        probe
+            .rows
+            .reached_limit(
+                self.query,
+                &allowance,
+                self.execution.limits.max_pipeline_rows,
+                self.query.limit,
+            )
+            .is_none()
+    }
+    fn capture<'a>(&self, analyzer: &'a dyn IAnalyzer) -> Self::Capture<'a> {
+        AnalyzerQueryScope::capturing_read_incompleteness(analyzer)
+    }
+    fn after_recompute(
+        &self,
+        probe: &mut Self::Prefix,
+        scope: &Self::Capture<'_>,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        let active = self.execution.analyzer.active_query_cancellation();
+        probe.reads_closed = scope.captured_read_incompleteness().is_empty()
+            && !cancellation
+                .or(active.as_ref())
+                .is_some_and(CancellationToken::is_cancelled);
+        fold_unit_execution_state(&mut probe.rows, scope, cancellation.or(active.as_ref()));
+    }
+    fn missing_reads(
+        &self,
+        attempt: &mut UnitAttempt,
+        probe: &mut Self::Prefix,
+    ) -> Result<(), WidenReason> {
+        attempt.unbounded();
+        probe.reads_closed = false;
+        probe.reads.clear();
+        Ok(())
+    }
+    fn set_reads(&self, probe: &mut Self::Prefix, reads: &[ReadKey]) {
+        probe.reads = reads.to_vec();
+    }
+    fn publishable(&self, probe: &Self::Prefix) -> bool {
+        probe.reads_closed && check_exhaustive_rows(&probe.rows).is_ok()
+    }
+    fn failure(&self, error: Self::Error, _products: Vec<Self::Prefix>) -> Self::Output {
+        match error {}
+    }
+    fn merge(&self, products: impl IntoIterator<Item = Self::Prefix>) -> Self::Merged {
+        products.into_iter().collect()
+    }
+    fn suffix(&self, products: Self::Merged, skipped: usize) -> Self::Output {
+        (products, skipped)
     }
 }
 
@@ -1092,7 +1664,8 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
             CodeQueryExecutionScope::for_seed_files(
                 std::slice::from_ref(file),
                 self.execution.workspace_files,
-            ),
+            )
+            .with_depth_bound_status(self.execution.depth_opt_in),
         ))
     }
 
@@ -1128,14 +1701,7 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
     }
 
     fn charge(&self, state: &mut Self::BudgetState, prefix: &Self::Prefix) {
-        state.0 = state.0.saturating_add(prefix.work);
-        if state.1.step_outputs.is_empty() {
-            state
-                .1
-                .step_outputs
-                .resize(prefix.budgeted_work.step_outputs.len(), 0);
-        }
-        state.1 = state.1.saturating_add(&prefix.budgeted_work);
+        charge_shared_slice_budget(state, prefix.work, &prefix.budgeted_work);
     }
 
     fn fits(&self, state: &Self::BudgetState, prefix: &Self::Prefix) -> bool {
@@ -1220,6 +1786,8 @@ impl UnitSlice for IntersectPrefixSlice<'_> {
             self.execution.cancellation,
             self.seeds,
             products,
+            CodeQueryExecutionScope::whole_workspace()
+                .with_depth_bound_status(self.execution.depth_opt_in),
         )
         .into_merged_rows(self.query)
     }
@@ -1250,16 +1818,60 @@ pub(crate) fn query_slicing_widen_reason(query: &CodeQuery) -> Option<QuerySlici
 
 fn policy_partitioning(query: &CodeQuery) -> PlanPartitioning {
     let partitioning = PlanPartitioning::classify_for_prefix(&query.plan);
-    if matches!(partitioning, PlanPartitioning::Prefix { .. })
-        && !matches!(
-            query.validate_row_kinds().as_deref(),
-            Ok([QueryValueKind::Declaration | QueryValueKind::Occurrence])
-        )
-    {
-        PlanPartitioning::classify(&query.plan)
-    } else {
-        partitioning
+    if let PlanPartitioning::Prefix { cut } = partitioning {
+        // Every operand must produce the SAME single Declaration or Occurrence
+        // kind, so the set operator compares rows of one identity space. The
+        // whole query must also have one terminal kind; with an authored
+        // suffix that kind can differ from the operands' (for example
+        // CallSite), so it is checked separately.
+        let operand_kinds = cut
+            .operands(&query.plan)
+            .iter()
+            .map(|operand| {
+                let operand_query = CodeQuery {
+                    plan: operand.clone(),
+                    ..query.clone()
+                };
+                match operand_query.validate_row_kinds().as_deref() {
+                    Ok([kind @ (QueryValueKind::Declaration | QueryValueKind::Occurrence)]) => {
+                        Some(*kind)
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let shared_kind = match operand_kinds.split_first() {
+            Some((Some(first), rest)) if rest.iter().all(|kind| kind == &Some(*first)) => {
+                Some(*first)
+            }
+            _ => None,
+        };
+        if shared_kind.is_none() || !matches!(query.validate_row_kinds().as_deref(), Ok([_])) {
+            return PlanPartitioning::classify(&query.plan);
+        }
+        return PlanPartitioning::Prefix { cut };
     }
+    partitioning
+}
+
+#[cfg(test)]
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "#8389: mixed Declaration and Occurrence root union entered Prefix"
+)]
+fn mixed_row_kind_root_union_stays_whole() {
+    let query = CodeQuery::from_sexp(
+        "(union (enclosing-decl (language rust (function))) (occurrences-in (language rust (scopes))))",
+    )
+    .expect("mixed row union parses");
+    assert_eq!(
+        query.validate_row_kinds().expect("valid row kinds"),
+        [QueryValueKind::Declaration, QueryValueKind::Occurrence]
+    );
+    assert!(matches!(
+        policy_partitioning(&query),
+        PlanPartitioning::Whole(_)
+    ));
 }
 
 /// Why the taint composition's frontier cannot evaluate `query` on one blob,
@@ -1268,9 +1880,9 @@ fn policy_partitioning(query: &CodeQuery) -> PlanPartitioning {
 /// The frontier reads one blob's rows and merges nothing, so it accepts what
 /// [`query_slicing_widen_reason`] accepts plus an `except` over rows whose
 /// identity names their file ([`PlanPartitioning::restricts_to_seed_file`]).
-/// Unit reuse keeps the stricter rule: a unit's rows must merge into the whole
-/// execution's rows in its order, so it also needs the except's minuend to
-/// order its rows by seed ([`PlanPartitioning::classify`]). The
+/// Unit reuse keeps the stricter rule: its per-file products must preserve
+/// every key's representative, evidence and dependency reads while merging
+/// deterministically across files ([`PlanPartitioning::classify`]). The
 /// workspace field-index prepass would be repeated per blob either way. A plan
 /// with a step that can move its rows out of the seed's file (a reverse or
 /// forward relation, see `QueryStepOp::rows_may_leave_seed_file`) has rows
@@ -1324,7 +1936,7 @@ pub(crate) fn sliced_query_units(
 
     let prefix_digests = match policy_partitioning(query) {
         PlanPartitioning::Prefix { cut } => {
-            let cut_digest = StableDigest::sha256("bifrost.rql.root_intersect.cut.v1");
+            let cut_digest = StableDigest::sha256("bifrost.rql.root_set.cut.v2");
             let operand_inputs: Vec<_> = cut
                 .operands(&query.plan)
                 .iter()
@@ -1354,20 +1966,12 @@ pub(crate) fn sliced_query_units(
             // than evidence of sameness.
             return Err(WidenReason::ReverseDependencyEvidenceMissing);
         };
-        let partition = match prefix_digests {
-            Some((cut, input)) => UnitPartition::Prefix {
-                language,
-                rel_path: rel_path.into_boxed_str(),
-                blob,
-                cut,
-                input,
-            },
-            None => partition(SeedPartition {
-                language,
-                rel_path,
-                blob,
-            }),
-        };
+        let partition = partition(SeedPartition {
+            language,
+            rel_path,
+            blob,
+            prefix: prefix_digests,
+        });
         keys.push(inputs.unit_key(policy, partition));
     }
     reuse.prefetch(
@@ -1375,15 +1979,192 @@ pub(crate) fn sliced_query_units(
         Some(brokk_bifrost_rql::structural::unit_plan_node_count(query)),
     )?;
 
+    if let PlanPartitioning::Prefix { cut } = policy_partitioning(query)
+        && matches!(
+            cut.operator(&query.plan),
+            brokk_bifrost_rql::query::SetOperator::Intersect
+                | brokk_bifrost_rql::query::SetOperator::Except
+        )
+    {
+        let operand = cut.operands(&query.plan)[0].clone();
+        let authored = CodeQuery {
+            plan: operand.clone(),
+            ..query.clone()
+        };
+        let probe_digest = StableDigest::sha256(
+            serde_json::to_string(&authored.to_canonical_query_plan_json())
+                .expect("canonical probe input is JSON"),
+        );
+        let probe_cut = StableDigest::sha256("bifrost.rql.root_set.probe.v1");
+        let probe_query = CodeQuery {
+            plan: operand,
+            limit: usize::MAX,
+            ..query.clone()
+        };
+        let mut probe_keys = Vec::with_capacity(seed_files.len());
+        for file in &seed_files {
+            let language = language_for_file(file);
+            let rel_path = rel_path_string(file);
+            let Some(blob) = incremental.changed().head_blob(language, &rel_path) else {
+                return Err(WidenReason::ReverseDependencyEvidenceMissing);
+            };
+            probe_keys.push(inputs.unit_key(
+                policy,
+                partition(SeedPartition {
+                    language,
+                    rel_path,
+                    blob,
+                    prefix: Some((probe_cut, probe_digest)),
+                }),
+            ));
+        }
+        reuse.prefetch(
+            &probe_keys,
+            Some(brokk_bifrost_rql::structural::unit_plan_node_count(
+                &probe_query,
+            )),
+        )?;
+        let probe_slice = OperandProbeSlice {
+            query: &probe_query,
+            execution,
+        };
+        let mut budget_state = Default::default();
+        let (probes, skipped) = evaluate_reusable_slice_with_state(
+            &probe_slice,
+            seed_files.iter().cloned().zip(probe_keys.iter()),
+            &mut budget_state,
+            reuse,
+            attempt,
+            execution.analyzer,
+            execution.cancellation,
+        )?;
+        let probe_complete = skipped == 0
+            && !execution
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            && probes.len() == seed_files.len()
+            && probes.iter().all(|probe| {
+                probe.reads_closed
+                    && !probe.reads.is_empty()
+                    && check_exhaustive_rows(&probe.rows).is_ok()
+                    && probe.rows.completion == brokk_bifrost_rql::CodeQueryCompletion::Complete
+            });
+        let all_empty = probe_complete && probes.iter().all(|probe| probe.rows.rows.is_empty());
+        let cancelled = execution
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled);
+        let budget_exhausted =
+            remaining_unit_limits(execution.limits, &budget_state.0, &budget_state.1).is_none();
+        let terminal = cancelled || skipped > 0 || budget_exhausted;
+        let probe_products: Vec<_> = probes
+            .into_iter()
+            .map(|probe| (probe.rows, probe.reads))
+            .collect();
+        if all_empty && !terminal {
+            #[cfg(any(test, feature = "test-support"))]
+            execution
+                .analyzer
+                .test_hooks()
+                .record_empty_operand_probe_shortcut_for_test();
+            let merged = continue_empty_operand_zero(
+                execution.analyzer,
+                execution.flow_state.clone(),
+                execution.workspace,
+                query,
+                execution.limits,
+                execution.cancellation,
+                &seed_files,
+                CompleteEmptyFromOperandZero {
+                    probes: probe_products,
+                },
+                CodeQueryExecutionScope::whole_workspace()
+                    .with_depth_bound_status(execution.depth_opt_in),
+            )
+            .into_merged_rows(query);
+            return Ok(SlicedQuery {
+                merged,
+                keys: probe_keys,
+            });
+        }
+        let probe_rows: Vec<_> = probe_products.into_iter().map(|(rows, _)| rows).collect();
+        if terminal {
+            let mut merged = merge_unit_rows_in_scope(
+                &probe_query,
+                probe_rows,
+                CodeQueryExecutionScope::whole_workspace()
+                    .with_depth_bound_status(execution.depth_opt_in),
+            );
+            // Probe rows are operand rows, never root set answers.
+            merged.items.clear();
+            merged.evidence.clear();
+            merged.mark_truncated();
+            // Every terminal cause is named, so the truncation is explained:
+            // probes that used up the physical limits exactly skip no unit,
+            // yet leave no room for the continuation.
+            if skipped > 0 {
+                push_skipped_unit_diagnostic(&mut merged.diagnostics, skipped);
+            } else if budget_exhausted {
+                push_unit_budget_diagnostic(&mut merged.diagnostics);
+            }
+            if cancelled {
+                brokk_bifrost_rql::fold_query_read_incompleteness(
+                    &mut merged.diagnostics,
+                    [brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled],
+                );
+            }
+            return Ok(SlicedQuery {
+                merged,
+                keys: probe_keys,
+            });
+        }
+        let slice = IntersectPrefixSlice {
+            query,
+            execution,
+            seeds: &seed_files,
+        };
+        let mut merged = evaluate_reusable_slice_with_state(
+            &slice,
+            seed_files.iter().cloned().zip(keys.iter()),
+            &mut budget_state,
+            reuse,
+            attempt,
+            execution.analyzer,
+            execution.cancellation,
+        )?;
+        for probe in probe_rows {
+            merged.work = merged.work.saturating_add(probe.work);
+            merged.budgeted_work.provenance_steps = merged
+                .budgeted_work
+                .provenance_steps
+                .saturating_add(probe.budgeted_work.provenance_steps);
+            merged.budgeted_work.import_files_resolved = merged
+                .budgeted_work
+                .import_files_resolved
+                .saturating_add(probe.budgeted_work.import_files_resolved);
+            merged.budgeted_work.import_edges_resolved = merged
+                .budgeted_work
+                .import_edges_resolved
+                .saturating_add(probe.budgeted_work.import_edges_resolved);
+            merged.diagnostics.extend(probe.diagnostics);
+            if probe.truncated {
+                merged.mark_truncated();
+            }
+        }
+        keys.extend(probe_keys);
+        return Ok(SlicedQuery { merged, keys });
+    }
+
     if prefix_digests.is_some() {
         let slice = IntersectPrefixSlice {
             query,
             execution,
             seeds: &seed_files,
         };
-        let merged = evaluate_reusable_slice(
+        let mut budget_state = Default::default();
+        let merged = evaluate_reusable_slice_with_state(
             &slice,
             seed_files.iter().cloned().zip(keys.iter()),
+            &mut budget_state,
             reuse,
             attempt,
             execution.analyzer,
@@ -1404,7 +2185,13 @@ pub(crate) fn sliced_query_units(
         execution,
         execute: |(file, remaining)| {
             let shared = execution.subject_batch.and_then(|batch| {
-                batch.query_units(query, execution.analyzer, execution.workspace, remaining)
+                batch.query_units(
+                    query,
+                    execution.analyzer,
+                    execution.workspace,
+                    remaining,
+                    execution.depth_opt_in,
+                )
             });
             let execute = || {
                 let _timing = brokk_bifrost_analysis::profiling::scope_with(|| {
@@ -1420,7 +2207,8 @@ pub(crate) fn sliced_query_units(
                     CodeQueryExecutionScope::for_seed_files(
                         std::slice::from_ref(file),
                         execution.workspace_files,
-                    ),
+                    )
+                    .with_depth_bound_status(execution.depth_opt_in),
                 )
             };
             match &shared {
@@ -1459,48 +2247,11 @@ fn fold_unit_execution_state(
     scope: &AnalyzerQueryScope<'_>,
     cancellation: Option<&CancellationToken>,
 ) {
-    use brokk_bifrost_analysis::analyzer::QueryReadIncomplete;
-    use brokk_bifrost_rql::{
-        CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
-        DiagnosticExecutionCause, Incompleteness,
-    };
     let mut reasons = scope.captured_read_incompleteness();
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        reasons.push(QueryReadIncomplete::Cancelled);
+        reasons.push(brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled);
     }
-    for reason in reasons {
-        let (code, cause, message) = match reason {
-            QueryReadIncomplete::StoreFailure(error) => (
-                CodeQueryDiagnosticCode::SemanticProviderFailed,
-                DiagnosticExecutionCause::Provider,
-                error.to_string(),
-            ),
-            QueryReadIncomplete::Cancelled => (
-                CodeQueryDiagnosticCode::Cancelled,
-                DiagnosticExecutionCause::Cancelled,
-                "query_code cancelled; any already-produced results are partial".to_owned(),
-            ),
-            _ => continue,
-        };
-        if !rows.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == code
-                && (code == CodeQueryDiagnosticCode::Cancelled || diagnostic.message == message)
-        }) {
-            rows.diagnostics
-                .push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
-                    code,
-                    incompleteness: Incompleteness::Operational(cause),
-                    impact: CodeQueryDiagnosticImpact::Incomplete,
-                    branch: Vec::new(),
-                    language: "workspace",
-                    message,
-                    exhausted_roots: Vec::new(),
-                    related: Vec::new(),
-                    source: None,
-                    withheld_rows_path: None,
-                }));
-        }
-    }
+    brokk_bifrost_rql::fold_query_read_incompleteness(&mut rows.diagnostics, reasons);
     rows.completion =
         brokk_bifrost_rql::structural::code_query_completion(rows.truncated, &rows.diagnostics);
 }
@@ -1528,7 +2279,71 @@ mod cache_fill_tests {
     use brokk_bifrost_analysis::analyzer::common::{QueryCacheCell, complete_query_cache_cell};
     use brokk_bifrost_analysis::analyzer::store::StoreError;
     use brokk_bifrost_cpp_analysis::CppAnalyzer;
+    use brokk_bifrost_rql::merge_unit_rows;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn merged_union_rows_reach_the_root_result_cap_across_seed_files() {
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_rql::structural::search::MergedLimit;
+        use brokk_bifrost_rust_analysis::RustAnalyzer;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("a.rs", "pub fn first() {}")
+            .file("b.rs", "pub fn second() {}")
+            .build();
+        let analyzer = RustAnalyzer::from_project(fixture.project().clone());
+        let branch = serde_json::json!({"languages": ["rust"], "match": {"kind": "function"}});
+        let query = CodeQuery::from_json(&serde_json::json!({
+            "union": [branch.clone(), branch],
+            "limit": 2,
+        }))
+        .expect("structural union query");
+        let files = analyzer.analyzed_files();
+        assert_eq!(files.len(), 2);
+        let products = files
+            .iter()
+            .map(|file| {
+                let rows = execute_code_query_unit(
+                    &analyzer,
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    None,
+                    &query,
+                    Default::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                );
+                assert_eq!(
+                    rows.rows.len(),
+                    2,
+                    "both branch rows remain until the shared merge"
+                );
+                assert!(check_exhaustive_rows(&rows).is_ok());
+                rows
+            })
+            .collect::<Vec<_>>();
+        let merged = brokk_bifrost_rql::structural::search::merge_unit_rows(&query, products);
+        assert_eq!(merged.items.len(), 2);
+        for (item, evidence) in merged.items.iter().zip(&merged.evidence) {
+            let item_branches = item
+                .provenance
+                .iter()
+                .map(|trace| trace.branch.as_slice())
+                .collect::<Vec<_>>();
+            let evidence_branches = evidence
+                .provenance
+                .iter()
+                .map(|trace| trace.branch.as_slice())
+                .collect::<Vec<_>>();
+            assert_eq!(item_branches, vec![&[0][..], &[1][..]]);
+            assert_eq!(evidence_branches, item_branches);
+        }
+        assert_eq!(
+            merged.reached_limit(&Default::default(), query.limit),
+            Some(MergedLimit::ResultLimit),
+            "the two complete units together reach the root cap"
+        );
+    }
 
     #[test]
     #[hardwon("#8314: retained unbounded unit rows lost late store failure or cancellation")]
@@ -1579,7 +2394,7 @@ mod cache_fill_tests {
             );
             assert!(reads.is_none());
             fold_unit_execution_state(&mut rows, &scope, Some(&cancellation));
-            let merged = merge_unit_rows(&query, [rows]);
+            let merged = brokk_bifrost_rql::structural::search::merge_unit_rows(&query, [rows]);
             assert_eq!(merged.items.len(), 1, "retain the answer already computed");
             assert_ne!(
                 merged.completion(),
@@ -1596,6 +2411,104 @@ mod cache_fill_tests {
                     })
             );
         }
+    }
+
+    /// A crate with an unknown Cargo target key answers its route questions as
+    /// partial. The
+    /// policy unit that asked must not report that crate as clean: the unknown
+    /// reaches the merged answer as an incompleteness diagnostic that names the
+    /// route evidence.
+    #[test]
+    #[hardwon("#9737: the whole route index answered fail-open negatives for partial crates")]
+    fn partial_crate_route_unknown_reaches_the_policy_unit_as_incomplete() {
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_rust_analysis::RustAnalyzer;
+
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nmystery = true\n",
+            )
+            .file("src/lib.rs", "pub fn value() -> i32 { 1 }\n")
+            .build();
+        let analyzer = RustAnalyzer::from_project(fixture.project().clone());
+        let query = CodeQuery::from_json(&serde_json::json!({
+            "languages": ["rust"], "match": {"kind": "function"}, "limit": 10,
+        }))
+        .unwrap();
+        let files = analyzer.analyzed_files();
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let (mut rows, _, _) = recompute_unit(
+            &analyzer,
+            None,
+            || "policy=test.route_evidence partition=whole".to_owned(),
+            || {
+                let rows = execute_code_query_unit(
+                    &analyzer,
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    None,
+                    &query,
+                    Default::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(&files, &files),
+                );
+                // A unit that filters test code asks whether each file is
+                // reachable only from test builds. The answer is `false` for
+                // this partial crate, which is not a proof of "production".
+                for file in &files {
+                    use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+                    assert!(!analyzer.file_is_test_only(file));
+                }
+                rows
+            },
+        );
+        fold_unit_execution_state(&mut rows, &scope, None);
+        let merged = merge_unit_rows(&query, [rows]);
+        assert_eq!(merged.items.len(), 1, "the function is still reported");
+        assert_ne!(
+            merged.completion(),
+            brokk_bifrost_rql::CodeQueryCompletion::Complete,
+            "an unknown route answer is not a clean unit: {:?}",
+            merged.diagnostics
+        );
+        assert!(
+            merged.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .starts_with("Rust route evidence is incomplete for units")),
+            "the diagnostic names the route evidence: {:?}",
+            merged.diagnostics
+        );
+    }
+
+    #[test]
+    #[hardwon("#9737: a replayed persistence refusal must block policy unit publication")]
+    fn persistence_refusal_blocks_policy_unit_publication() {
+        let fixture = InlineTestProject::with_language(Language::Cpp)
+            .file("app.cpp", "int value = 1;")
+            .build();
+        let analyzer = CppAnalyzer::from_project(fixture.project().clone());
+        let (_, reads, _) = recompute_unit(
+            &analyzer,
+            None,
+            || "policy=test.persistence partition=whole".to_owned(),
+            || {
+                let receipt = ReadLedger::new();
+                receipt.refuse_persistence();
+                brokk_bifrost_analysis::analyzer::i_analyzer::replay_query_reads(
+                    &analyzer, &receipt,
+                );
+            },
+        );
+        assert!(reads.is_none());
+        let (_, replayed_reads, _) = recompute_unit(
+            &analyzer,
+            None,
+            || "policy=test.persistence partition=replayed".to_owned(),
+            || {
+                brokk_bifrost_analysis::analyzer::replay_query_read_keys(&analyzer, [], 0, 1);
+            },
+        );
+        assert!(replayed_reads.is_none());
     }
 
     #[test]
@@ -1792,6 +2705,237 @@ mod field_slot_verification_tests {
 
     #[test]
     #[hardwon(
+        "#8837: pre-presence policy receipts without configuration reads reused across revisions"
+    )]
+    fn old_epoch_receipt_cannot_reuse_on_unchanged_base_to_head() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .with_git()
+            .file("app.cs", "class App {}\n")
+            .file("other.cs", "class Other {}\n")
+            .build();
+        let build = || {
+            WorkspaceAnalyzer::build_persisted(
+                Arc::new(FilesystemProject::new(fixture.root()).expect("project")),
+                AnalyzerConfig::default(),
+            )
+            .expect("workspace")
+        };
+        let base = build();
+        let base_snapshot = workspace_snapshot(&base).expect("base snapshot");
+        let registry = crate::test_support::registry_with_policy(
+            "test:8837-epoch",
+            r#"(policy :id "test.8837-epoch" :name "Epoch" :message "Epoch"
+                :severity warning :analysis (analysis :type match
+                  :selector (rql (language csharp (class)))))"#,
+            "epoch receipt",
+        );
+        let policy = registry.policies().next().expect("policy");
+        let old_inputs =
+            WorkspaceUnitInputs::of(&base, None, None).with_epoch_before_8837(&base, None);
+        let partition = UnitPartition::AssertFile {
+            language: Language::CSharp,
+            rel_path: "app.cs".into(),
+            blob: ChangedFacts::between(&base, &base)
+                .head_blob(Language::CSharp, "app.cs")
+                .expect("unchanged blob"),
+            subjects: StableDigest::sha256(b"App"),
+        };
+        let old_key = old_inputs.unit_key(policy, partition.clone());
+        let mut persisted = PersistedPolicyUnitStore::new(Arc::clone(base.store().expect("store")));
+        persisted.publish(PolicyUnit::new(
+            old_key.clone(),
+            Some(brokk_bifrost_analysis::gitblob::ParseVariant::Empty),
+            PolicyUnitProduct::AssertFile(AssertFileProduct {
+                findings: Vec::new(),
+                unconcluded: Vec::new(),
+                row_completions: Vec::new(),
+                diagnostics: Vec::new(),
+                work: Default::default(),
+            }),
+            Vec::new(), // Legacy receipt has no name-index or C# configuration read.
+            BudgetMode::Exhaustive,
+            vec![StableDigest::sha256(b"foreign old snapshot")],
+        ));
+        assert_eq!(persisted.flush().expect("persist receipt"), 1);
+        drop(persisted);
+
+        std::fs::write(fixture.root().join("other.cs"), "class Other { int X; }\n")
+            .expect("unrelated edit");
+        fixture.commit("unrelated edit");
+        let head = build();
+        let changed = ChangedFacts::between(&base, &head);
+        assert_eq!(
+            changed.head_blob(Language::CSharp, "app.cs"),
+            Some(match &partition {
+                UnitPartition::AssertFile { blob, .. } => *blob,
+                _ => unreachable!(),
+            }),
+        );
+        let inputs = WorkspaceUnitInputs::of(&head, None, None);
+        assert_eq!(old_inputs.configuration(), inputs.configuration());
+        assert_eq!(old_inputs.models(), inputs.models());
+        let current_key = inputs.unit_key(policy, partition);
+        let store = Mutex::new(PersistedPolicyUnitStore::new(Arc::clone(
+            head.store().expect("store"),
+        )));
+        let context = PolicyIncrementalContext::new(
+            &store,
+            &head,
+            &changed,
+            inputs,
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots {
+                base: base_snapshot,
+                head: workspace_snapshot(&head).expect("head snapshot"),
+            },
+        );
+        let budget = PolicyBudget::default();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let mut reuse = UnitReuse::new(policy, &context, &budget, &flow);
+        reuse
+            .prefetch(std::slice::from_ref(&old_key), None)
+            .expect("fetch old receipt");
+        assert!(
+            reuse
+                .published(&old_key)
+                .expect("verify foreign receipt")
+                .is_some(),
+            "without the epoch boundary, a foreign receipt with no reads verifies"
+        );
+        reuse
+            .prefetch(std::slice::from_ref(&current_key), None)
+            .expect("fetch current receipt");
+        assert!(
+            reuse
+                .published(&current_key)
+                .expect("current lookup")
+                .is_none(),
+            "the current epoch must exclude the old receipt before verification"
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "2fd06a51df9c: budget-skipped seed units incorrectly certified a negative depth frontier"
+    )]
+    fn depth_units_stop_after_a_complete_seed_without_certifying_absence() {
+        let fixture = InlineTestProject::with_language(Language::TypeScript)
+            .with_git()
+            .file("a.ts", "export function a() {}\nexport function aa() {}\n")
+            .file("b.ts", "export function b() {}\n")
+            .file("c.ts", "export function c() {}\n")
+            .build();
+        let workspace = WorkspaceAnalyzer::build_persisted(
+            Arc::new(FilesystemProject::new(fixture.root()).unwrap()),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let registry = crate::test_support::registry_with_policy(
+            "test:budget-units",
+            r#"(policy
+            :id "test.budget-units" :name "Budget units" :message "Matched" :severity warning
+            :analysis (analysis :type match :completion (inconclusive-on [depth_bound_reached]) :selector (rql (callers :depth 1 (enclosing-decl (language typescript (function :name "missing")))))))"#,
+            "policy",
+        );
+        let policy = registry.policies().next().unwrap();
+        let changed = ChangedFacts::between(&workspace, &workspace);
+        assert!(changed.is_complete());
+        let snapshot = workspace_snapshot(&workspace).unwrap();
+        let store = Mutex::new(crate::units::InMemoryPolicyUnitStore::new());
+        let context = PolicyIncrementalContext::new(
+            &store,
+            &workspace,
+            &changed,
+            WorkspaceUnitInputs::of(&workspace, None, None),
+            IncrementalBaseState::Evaluated,
+            UnitSnapshots {
+                base: snapshot,
+                head: snapshot,
+            },
+        );
+        let limits = CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..Default::default()
+        };
+        let budget = PolicyBudget::builder()
+            .with_query_limits(limits)
+            .unwrap()
+            .build()
+            .unwrap();
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let query = CodeQuery::from_sexp(
+            r#"(callers :depth 1 (enclosing-decl (language typescript (function :name "missing"))))"#,
+        )
+        .unwrap();
+        let files = workspace.analyzer().analyzed_files();
+        let first = execute_code_query_unit(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            limits,
+            None,
+            CodeQueryExecutionScope::for_seed_files(&files[..1], &files)
+                .with_depth_bound_status(true),
+        );
+        assert!(!first.truncated);
+        assert_eq!(
+            first.depth_bound_status,
+            Some(brokk_bifrost_rql::DepthBoundStatus::NotReached)
+        );
+        let execution = UnitQueryExecution {
+            analyzer: workspace.analyzer(),
+            flow_state: (&flow).into(),
+            workspace: Some(&workspace),
+            cancellation: None,
+            limits,
+            depth_opt_in: true,
+            workspace_files: &files,
+            subject_batch: None,
+        };
+        let mut reuse = UnitReuse::new(policy, &context, &budget, &flow);
+        let mut attempt = UnitAttempt::default();
+        let sliced = sliced_query_units(
+            policy,
+            &query,
+            &mut reuse,
+            &execution,
+            SeedPartition::seed,
+            &mut attempt,
+        )
+        .expect("budget exhaustion must not widen");
+        assert_eq!(attempt.recomputed, 1);
+        assert_eq!(attempt.total, 3);
+        assert_eq!(
+            sliced.merged.depth_bound_status,
+            Some(brokk_bifrost_rql::DepthBoundStatus::Unknown)
+        );
+        assert!(sliced.merged.truncated);
+        assert_ne!(
+            sliced.merged.completion(),
+            brokk_bifrost_rql::CodeQueryCompletion::Complete
+        );
+        assert!(
+            sliced
+                .merged
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == brokk_bifrost_rql::CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                    && diagnostic.message.contains("skipped 2 units"))
+        );
+        let staged = reuse.take_staged();
+        for (index, key) in sliced.keys.into_iter().enumerate() {
+            assert_eq!(
+                staged.get(&key).is_some(),
+                index == 0,
+                "only the completed first unit may be published"
+            );
+        }
+    }
+
+    #[test]
+    #[hardwon(
         "#8287: physical budget walls widened sliced policies instead of reporting partial rows"
     )]
     fn sliced_units_stop_at_the_request_budget_without_publishing_partial_units() {
@@ -1822,7 +2966,7 @@ mod field_slot_verification_tests {
             &store,
             &workspace,
             &changed,
-            WorkspaceUnitInputs::of(&workspace, None),
+            WorkspaceUnitInputs::of(&workspace, None, None),
             IncrementalBaseState::Evaluated,
             UnitSnapshots {
                 base: snapshot,
@@ -1850,6 +2994,7 @@ mod field_slot_verification_tests {
             workspace: Some(&workspace),
             cancellation: None,
             limits,
+            depth_opt_in: false,
             workspace_files: &files,
             subject_batch: None,
         };
@@ -1881,11 +3026,10 @@ mod field_slot_verification_tests {
                     == brokk_bifrost_rql::CodeQueryDiagnosticCode::ExecutionBudgetExhausted
                     && diagnostic.message.contains("skipped 2 units"))
         );
+        let staged = reuse.take_staged();
         for key in sliced.keys {
             assert!(
-                context
-                    .staged_unit(&policy.definition().metadata.id, &key)
-                    .is_none(),
+                staged.get(&key).is_none(),
                 "truncated and skipped units must not be published"
             );
         }
@@ -2004,7 +3148,7 @@ mod field_slot_verification_tests {
             "both FieldSlots reads must really be recorded: {reads:?}"
         );
         let unchanged = ChangedFacts::between(&base, &base);
-        let key = WorkspaceUnitInputs::of(&base, None).unit_key(
+        let key = WorkspaceUnitInputs::of(&base, None, None).unit_key(
             &policy,
             UnitPartition::AssertFile {
                 language: Language::Python,
@@ -2043,7 +3187,7 @@ mod field_slot_verification_tests {
             &store,
             &head,
             &changed,
-            WorkspaceUnitInputs::of(&head, None),
+            WorkspaceUnitInputs::of(&head, None, None),
             IncrementalBaseState::Evaluated,
             UnitSnapshots {
                 base: base_snapshot,
@@ -2143,7 +3287,7 @@ mod field_slot_verification_tests {
             &store,
             &edited,
             &changed,
-            WorkspaceUnitInputs::of(&edited, None),
+            WorkspaceUnitInputs::of(&edited, None, None),
             IncrementalBaseState::Evaluated,
             UnitSnapshots {
                 base: workspace_snapshot(&head).expect("previous snapshot"),
@@ -2177,3 +3321,244 @@ mod field_slot_verification_tests {
 #[cfg(test)]
 #[path = "unit_execution/field_slot_shareability_tests.rs"]
 mod field_slot_shareability_tests;
+
+#[cfg(test)]
+mod budget_stop_stability_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10403: a unit's own budget stop made the keep-fresh arm recompute everything")]
+    fn a_stop_whose_only_dependences_are_budget_refusals_is_stable() {
+        let none = ReceiptDependences::default();
+        // A usable receipt is stable whatever else holds.
+        assert!(unit_execution_stable(true, false, &none, 0, true));
+        // Unbounded only by the unit's own budget refusals, however often nested
+        // captures forwarded them, and the stop repeats.
+        assert!(unit_execution_stable(false, true, &none, 1, true));
+        assert!(unit_execution_stable(false, true, &none, 2, true));
+        // The discount never applies to a unit whose stop does not repeat.
+        assert!(!unit_execution_stable(false, false, &none, 1, true));
+        // The product's own stability judgement still decides.
+        assert!(!unit_execution_stable(false, true, &none, 1, false));
+    }
+
+    #[test]
+    fn any_other_dependence_keeps_the_unit_unstable() {
+        let none = ReceiptDependences::default();
+        // A refusal that began before the unit is not in its delta, and a unit
+        // with no refusal of its own has nothing to discount.
+        assert!(!unit_execution_stable(false, true, &none, 0, true));
+        for other in [
+            // A provider failure, a cancellation, a generation change or a store
+            // failure marked the execution.
+            ReceiptDependences {
+                non_budget_dependences: 1,
+                ..none
+            },
+            ReceiptDependences {
+                unattributed_reads: 1,
+                ..none
+            },
+            ReceiptDependences {
+                reuse_refused: true,
+                ..none
+            },
+            ReceiptDependences {
+                persistence_refusals: 1,
+                ..none
+            },
+        ] {
+            assert!(
+                !unit_execution_stable(false, true, &other, 1, true),
+                "{other:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod budget_cause_channel_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::semantic::{SemanticBudget, SemanticWork};
+    use brokk_bifrost_analysis::analyzer::{IAnalyzer, Language};
+    use brokk_bifrost_rust_analysis::RustAnalyzer;
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// One unit that meets a semantic budget refusal, with or without an earlier
+    /// provider failure that marked its execution, and with the refusal inside a
+    /// nested capture or not. A nested capture forwards what it recorded to the
+    /// unit once per level, so only the recorded cause can tell the two kinds of
+    /// dependence apart.
+    #[test]
+    #[hardwon("#10403: a provider failure before a budget refusal in one unit was judged stable")]
+    fn the_cause_of_each_execution_dependence_reaches_the_unit_receipt() {
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file("app.rs", "pub fn value() -> i32 { 1 }")
+            .build();
+        let analyzer = RustAnalyzer::from_project(fixture.project().clone());
+        let over = SemanticWork {
+            program_points: 2,
+            ..SemanticWork::default()
+        };
+        for provider_failure in [false, true] {
+            for nested in [false, true] {
+                let mut budget = SemanticBudget::uniform(1).unwrap();
+                let refusals_before = budget.refusal_count();
+                let (_, reads, _, dependences) = recompute_unit_observed(
+                    &analyzer,
+                    None,
+                    || "policy=test.cause partition=seed:app.rs".to_owned(),
+                    || {
+                        let mut unit = || {
+                            if provider_failure {
+                                // A transient provider failure marks the execution
+                                // and leaves no record in a stopped product.
+                                analyzer.mark_execution_dependent();
+                            }
+                            assert!(budget.admit(over).is_err());
+                        };
+                        if nested {
+                            capture_query_reads(&analyzer, unit);
+                        } else {
+                            unit();
+                        }
+                    },
+                );
+                let own_refusals = budget.refusal_count() - refusals_before;
+                assert!(reads.is_none(), "the receipt is unbounded after a refusal");
+                assert!(own_refusals > 0);
+                assert_eq!(
+                    dependences.non_budget_dependences > 0,
+                    provider_failure,
+                    "provider_failure={provider_failure} nested={nested}: {dependences:?}"
+                );
+                assert_eq!(
+                    unit_execution_stable(false, true, &dependences, own_refusals, true),
+                    !provider_failure,
+                    "provider_failure={provider_failure} nested={nested}: {dependences:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod materialization_cause_tests {
+    use super::*;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_analysis::CancellationToken;
+    use brokk_bifrost_analysis::analyzer::capture_query_reads;
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        SemanticBudget, SemanticOutcome, SemanticRequest,
+    };
+    use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, Language};
+    use brokk_bifrost_test_macros::hardwon;
+
+    /// A materialization that ends in a cancellation is an execution dependence
+    /// no budget refusal caused, and one that ends in a budget outcome is a
+    /// budget dependence only; an earlier version counted both as one kind.
+    #[test]
+    #[hardwon("#10403: a cancelled materialization was counted as a budget dependence")]
+    fn a_materialization_outcome_marks_the_dependence_of_its_cause() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("app.rs", "pub fn value() -> i32 { 1 }")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let file = project.file("app.rs");
+        for cancelled in [true, false] {
+            let cancellation = CancellationToken::default();
+            if cancelled {
+                cancellation.cancel();
+            }
+            let mut budget = if cancelled {
+                SemanticBudget::default()
+            } else {
+                SemanticBudget::uniform(1).unwrap()
+            };
+            let refusals_before = budget.refusal_count();
+            let ((outcome, counts), reads, _, dependences) = recompute_unit_observed(
+                analyzer,
+                None,
+                || "policy=test.materialization partition=seed:app.rs".to_owned(),
+                || {
+                    let (outcome, captured) = capture_query_reads(analyzer, || {
+                        workspace
+                            .materialize_program_semantics(
+                                &file,
+                                &mut SemanticRequest::new(&mut budget, &cancellation),
+                            )
+                            .expect("materialization")
+                    });
+                    (
+                        outcome,
+                        (
+                            captured.execution_dependences(),
+                            captured.budget_dependences(),
+                        ),
+                    )
+                },
+            );
+            let (executions, budgets) = counts;
+            let own_refusals = budget.refusal_count() - refusals_before;
+            assert!(
+                reads.is_none(),
+                "cancelled={cancelled}: receipt is unbounded"
+            );
+            assert!(executions > 0, "cancelled={cancelled}");
+            if cancelled {
+                assert!(
+                    matches!(outcome, SemanticOutcome::Cancelled { .. }),
+                    "{outcome:?}"
+                );
+                assert_eq!(own_refusals, 0);
+                // No budget refusal caused any of the dependences.
+                assert_eq!(budgets, 0, "executions={executions}");
+                assert_eq!(dependences.non_budget_dependences, executions);
+            } else {
+                assert!(
+                    matches!(outcome, SemanticOutcome::ExceededBudget { .. }),
+                    "{outcome:?}"
+                );
+                assert!(own_refusals > 0);
+                // Every dependence follows a refusal, the ledger's or the
+                // workspace's own mark of the refused outcome.
+                assert_eq!(budgets, executions);
+                assert_eq!(dependences.non_budget_dependences, 0, "{dependences:?}");
+                assert!(unit_execution_stable(
+                    false,
+                    true,
+                    &dependences,
+                    own_refusals,
+                    true
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fresh_refusal_tests {
+    use super::*;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#9947: fresh refused products must not survive unstable execution")]
+    fn fresh_refusals_require_stable_execution_and_known_causes() {
+        let mut attempt = UnitAttempt::default();
+        assert!(!attempt.refused_only_for_answer_content());
+        attempt.record_output_refusal(
+            "output".into(),
+            vec![OutputRefusalCause::ExecutionDependentReceipt],
+        );
+        assert!(attempt.refused_only_for_answer_content());
+        attempt.execution_stable = false;
+        assert!(!attempt.refused_only_for_answer_content());
+        attempt.execution_stable = true;
+        attempt.record_output_refusal("output".into(), vec![OutputRefusalCause::UnusableReceipt]);
+        assert!(!attempt.refused_only_for_answer_content());
+    }
+}

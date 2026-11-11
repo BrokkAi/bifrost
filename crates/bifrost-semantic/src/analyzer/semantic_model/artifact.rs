@@ -9,6 +9,7 @@ use crate::analyzer::semantic_model::validate::ValidationCensus;
 use crate::analyzer::semantic_model::validate::ValidationLimits;
 
 use crate::analyzer::semantic_model::validate::is_canonical_relative_path;
+use crate::analyzer::semantic_model::validate::rust_reexport_target_segment_valid;
 
 use crate::analyzer::semantic_model::validate::validate_pack_locally_with_census;
 
@@ -99,6 +100,18 @@ pub struct CompiledPackManifest {
     /// Exact Python cross-artifact correspondence retained at pack scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_correspondence: Option<PythonCorrespondenceEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_external_reexports: Vec<crate::analyzer::semantic_model::RustExternalReexport>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::analyzer::semantic_model::model::rust_reexports_not_truncated"
+    )]
+    pub rust_external_reexports_truncated: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::analyzer::semantic_model::model::rust_reexports_not_truncated"
+    )]
+    pub rust_external_reexports_glob_incomplete: bool,
     pub semantic_sha256: String,
     pub content_sha256: String,
     pub shards: Vec<CompiledShardDescriptor>,
@@ -346,6 +359,10 @@ pub struct CompiledProcedureSummary {
     /// field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_effects: Vec<CompiledDeclaredEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_effects: Vec<CompiledSubjectEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_coverage: Vec<CompiledLifecycleCoverage>,
     /// Compiled mirror of the procedure-level operation-precondition review
     /// state. `None` and `Some([])` are intentionally distinct claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +383,16 @@ pub struct CompiledProcedureSummary {
     pub class_decorator_identity: Option<CompiledClassDecoratorIdentity>,
 }
 
+impl CompiledProcedureSummary {
+    pub fn subject_effects(&self) -> &[CompiledSubjectEffect] {
+        &self.subject_effects
+    }
+
+    pub fn lifecycle_coverage(&self) -> &[CompiledLifecycleCoverage] {
+        &self.lifecycle_coverage
+    }
+}
+
 /// Whether two compiled summaries make the same flow-observable claims.
 pub fn compiled_flow_claims_agree(
     left: &CompiledProcedureSummary,
@@ -380,6 +407,8 @@ pub fn compiled_flow_claims_agree(
         && left.effects == right.effects
         && left.concurrency_effects == right.concurrency_effects
         && left.returned_callables == right.returned_callables
+        && left.subject_effects == right.subject_effects
+        && left.lifecycle_coverage == right.lifecycle_coverage
 }
 
 pub use crate::analyzer::semantic_model::model::{
@@ -390,8 +419,11 @@ pub use crate::analyzer::semantic_model::model::{
     AuthoredCondWaiters as CompiledCondWaiters,
     AuthoredConditionalIndirectWrite as CompiledConditionalIndirectWrite,
     AuthoredConditionalResultRefinement as CompiledConditionalResultRefinement,
-    AuthoredDeclaredEffect as CompiledDeclaredEffect,
+    AuthoredCoverageCondition as CompiledCoverageCondition,
+    AuthoredCoverageSubject as CompiledCoverageSubject,
+    AuthoredDeclaredEffect as CompiledDeclaredEffect, AuthoredEventSet as CompiledEventSet,
     AuthoredIndirectWriteTarget as CompiledIndirectWriteTarget,
+    AuthoredLifecycleCoverage as CompiledLifecycleCoverage,
     AuthoredLockCondition as CompiledLockCondition, AuthoredLockMode as CompiledLockMode,
     AuthoredNormalReturnRefinement as CompiledNormalReturnRefinement,
     AuthoredNormalReturnTypeRefinement as CompiledNormalReturnTypeRefinement,
@@ -402,7 +434,7 @@ pub use crate::analyzer::semantic_model::model::{
     AuthoredResultPredicate as CompiledResultPredicate,
     AuthoredResultUseObligation as CompiledResultUseObligation,
     AuthoredReturnedCallable as CompiledReturnedCallable,
-    AuthoredSummaryEffect as CompiledSummaryEffect,
+    AuthoredSubjectEffect as CompiledSubjectEffect, AuthoredSummaryEffect as CompiledSummaryEffect,
     AuthoredSummaryExitKind as CompiledSummaryExitKind,
     AuthoredSummaryInput as CompiledSummaryInput,
     AuthoredSummaryLocation as CompiledSummaryLocation,
@@ -578,6 +610,11 @@ pub struct CompiledSemanticModelPack {
     pub shards: Vec<CompiledShardArtifact>,
 }
 
+/// The default bound on one text value in a pack (a qualified name, for example).
+/// The pack compiler and validator use it unless a caller sets another; a report
+/// that quotes a pack's qualified name must accept every one the format allows.
+pub const DEFAULT_MAX_TEXT_BYTES: usize = 16 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
     pub max_manifest_bytes: usize,
@@ -601,7 +638,7 @@ impl Default for DecodeLimits {
             max_shards: 4_096,
             max_records_per_shard: 250_000,
             max_total_records: 2_000_000,
-            max_text_bytes: 16 * 1024,
+            max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
             max_depth: 64,
         }
     }
@@ -612,6 +649,7 @@ pub enum ArtifactError {
     LimitExceeded(&'static str),
     InvalidJson(String),
     UnsupportedVersion(u32),
+    ContractV1LifecycleClaims,
     NonCanonical,
     InvalidDescriptor(String),
     SizeMismatch { expected: u64, actual: u64 },
@@ -633,6 +671,8 @@ impl fmt::Display for ArtifactError {
                     "unsupported semantic-model schema version {version}"
                 )
             }
+            Self::ContractV1LifecycleClaims => formatter
+                .write_str("procedure summary contract v1 cannot carry lifecycle coverage claims"),
             Self::NonCanonical => formatter.write_str("artifact bytes are not canonical JSON"),
             Self::InvalidDescriptor(message) => {
                 write!(formatter, "invalid shard descriptor: {message}")
@@ -678,6 +718,15 @@ pub fn decode_manifest_with_census(
     let manifest: CompiledPackManifest = serde_json::from_slice(bytes)
         .map_err(|error| ArtifactError::InvalidJson(error.to_string()))?;
     require_version(manifest.schema_version)?;
+    require_rust_approximation_schema(manifest.schema_version, &manifest.provenance)?;
+    require_rust_reexport_schema(
+        manifest.schema_version,
+        &manifest.rust_external_reexports,
+        manifest.rust_external_reexports_truncated
+            || manifest.rust_external_reexports_glob_incomplete,
+    )?;
+    let reexport_records =
+        validate_rust_reexport_carrier(&manifest.rust_external_reexports, limits, &mut census)?;
     if let Some(extraction) = &manifest.extraction
         && (manifest.schema_version < 19 || !is_lower_sha256(extraction.digest()))
     {
@@ -832,7 +881,7 @@ pub fn decode_manifest_with_census(
             "shard descriptors must have unique ascending ids".to_owned(),
         ));
     }
-    let mut total_records = 0u64;
+    let mut total_records = reexport_records;
     let total_raw = manifest.shards.iter().try_fold(0u64, |total, shard| {
         validate_descriptor(shard, limits)?;
         total_records = total_records
@@ -994,6 +1043,7 @@ pub fn read_shard_wire(
             .map_err(|error| ArtifactError::InvalidJson(error.to_string()))?
     };
     require_version(wire.schema_version)?;
+    require_rust_approximation_schema(wire.schema_version, &wire.provenance)?;
     Ok((wire, raw))
 }
 
@@ -1035,10 +1085,15 @@ fn validate_compiled_procedure_metadata(
         ));
     }
     for (compiled, authored) in summaries.iter().zip(authored_summaries) {
-        if compiled.contract_version != PROCEDURE_SUMMARY_CONTRACT_VERSION {
+        if !PROCEDURE_SUMMARY_SUPPORTED_CONTRACT_VERSIONS.contains(&compiled.contract_version) {
             return Err(ArtifactError::InvalidDescriptor(
                 "procedure summary contract version is unsupported".to_owned(),
             ));
+        }
+        if compiled.contract_version == 1
+            && (!compiled.subject_effects.is_empty() || !compiled.lifecycle_coverage.is_empty())
+        {
+            return Err(ArtifactError::ContractV1LifecycleClaims);
         }
         if compiled.model_id != format!("{}#{}", shard.pack_id, compiled.id) {
             return Err(ArtifactError::InvalidDescriptor(
@@ -1347,6 +1402,16 @@ pub fn manifest_semantic_digest(manifest: &CompiledPackManifest) -> Result<Strin
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "Option::is_none")]
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        rust_external_reexports: &'a Vec<crate::analyzer::semantic_model::RustExternalReexport>,
+        #[serde(
+            skip_serializing_if = "crate::analyzer::semantic_model::model::rust_reexports_not_truncated"
+        )]
+        rust_external_reexports_truncated: &'a bool,
+        #[serde(
+            skip_serializing_if = "crate::analyzer::semantic_model::model::rust_reexports_not_truncated"
+        )]
+        rust_external_reexports_glob_incomplete: &'a bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         extraction: &'a Option<ArtifactExtraction>,
         shards: Vec<(&'a str, &'a str)>,
@@ -1362,6 +1427,9 @@ pub fn manifest_semantic_digest(manifest: &CompiledPackManifest) -> Result<Strin
         safety: &manifest.safety,
         cpp_portability: &manifest.cpp_portability,
         python_correspondence: &manifest.python_correspondence,
+        rust_external_reexports: &manifest.rust_external_reexports,
+        rust_external_reexports_truncated: &manifest.rust_external_reexports_truncated,
+        rust_external_reexports_glob_incomplete: &manifest.rust_external_reexports_glob_incomplete,
         extraction: &manifest.extraction,
         shards: manifest
             .shards
@@ -1391,6 +1459,16 @@ pub fn manifest_content_digest(manifest: &CompiledPackManifest) -> Result<String
         cpp_portability: &'a Option<CppPortabilityEvidence>,
         #[serde(skip_serializing_if = "Option::is_none")]
         python_correspondence: &'a Option<PythonCorrespondenceEvidence>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        rust_external_reexports: &'a Vec<crate::analyzer::semantic_model::RustExternalReexport>,
+        #[serde(
+            skip_serializing_if = "crate::analyzer::semantic_model::model::rust_reexports_not_truncated"
+        )]
+        rust_external_reexports_truncated: &'a bool,
+        #[serde(
+            skip_serializing_if = "crate::analyzer::semantic_model::model::rust_reexports_not_truncated"
+        )]
+        rust_external_reexports_glob_incomplete: &'a bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         extraction: &'a Option<ArtifactExtraction>,
         #[serde(skip_serializing_if = "<[String]>::is_empty")]
@@ -1414,6 +1492,9 @@ pub fn manifest_content_digest(manifest: &CompiledPackManifest) -> Result<String
         safety: &manifest.safety,
         cpp_portability: &manifest.cpp_portability,
         python_correspondence: &manifest.python_correspondence,
+        rust_external_reexports: &manifest.rust_external_reexports,
+        rust_external_reexports_truncated: &manifest.rust_external_reexports_truncated,
+        rust_external_reexports_glob_incomplete: &manifest.rust_external_reexports_glob_incomplete,
         extraction: &manifest.extraction,
         carried_sources: &manifest.carried_sources,
         source_inputs: &manifest.source_inputs,
@@ -1579,6 +1660,20 @@ pub fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>
         } => {
             for fact in types {
                 defined.insert(fact.id.clone());
+                if let Some(target) = &fact.alias_target {
+                    collect_declared_type_refs(target, &mut referenced);
+                }
+                if let Some(layout) = &fact.tuple_fields {
+                    for slot in &layout.fields {
+                        if let TupleFieldSlot::Public { id, r#type, .. } = slot {
+                            // The co-located field MemberFact defines this ID.
+                            // The slot only references it; defining it here
+                            // would give a cross-shard member two owners.
+                            referenced.insert(id.clone());
+                            collect_declared_type_refs(r#type, &mut referenced);
+                        }
+                    }
+                }
                 for hierarchy in &fact.hierarchy {
                     collect_declared_type_refs(&hierarchy.target, &mut referenced);
                 }
@@ -1612,6 +1707,15 @@ pub fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<String>
                 if let Some(underlying) = &fact.underlying_type {
                     for type_ref in &underlying.referenced_types {
                         collect_declared_type_refs(type_ref, &mut referenced);
+                    }
+                }
+                if let Some(effects) = fact
+                    .value_semantics
+                    .as_ref()
+                    .and_then(|value| value.drop_effects.as_ref())
+                {
+                    for ty in effects.payloads.iter().chain(&effects.field_types) {
+                        collect_declared_type_refs(ty, &mut referenced);
                     }
                 }
                 if let Some(TypeValueSemantics {
@@ -1755,7 +1859,7 @@ fn collect_self_pattern_refs(
     }
 }
 
-fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
+pub(crate) fn collect_declared_type_refs(root: &TypeRef, ids: &mut HashSet<String>) {
     crate::analyzer::semantic::common::visit_declared_type_refs(std::iter::once(root), |id| {
         ids.insert(id.to_owned());
     });
@@ -1778,6 +1882,9 @@ fn authored_pack_from_compiled_shard(shard: &CompiledShard) -> AuthoredSemanticM
         carried_sources: Vec::new(),
         cpp_portability: shard.cpp_portability.clone(),
         python_correspondence: shard.python_correspondence.clone(),
+        rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
         shards: vec![authored_shard_from_compiled(shard)],
     }
 }
@@ -1803,6 +1910,9 @@ pub fn authored_pack_from_decoded_shards<'a>(
         carried_sources: manifest.carried_sources.clone(),
         cpp_portability: manifest.cpp_portability.clone(),
         python_correspondence: manifest.python_correspondence.clone(),
+        rust_external_reexports: manifest.rust_external_reexports.clone(),
+        rust_external_reexports_truncated: manifest.rust_external_reexports_truncated,
+        rust_external_reexports_glob_incomplete: manifest.rust_external_reexports_glob_incomplete,
         shards: shards
             .into_iter()
             .map(authored_shard_from_compiled)
@@ -1884,6 +1994,8 @@ pub fn authored_procedure_summary_from_compiled(
         concurrency_effects: summary.concurrency_effects.clone(),
         returned_callables: summary.returned_callables.clone(),
         declared_effects: summary.declared_effects.clone(),
+        subject_effects: summary.subject_effects.clone(),
+        lifecycle_coverage: summary.lifecycle_coverage.clone(),
         preconditions: summary.preconditions.clone(),
         result_contracts: summary.result_contracts.clone(),
         result_use_obligations: summary.result_use_obligations.clone(),
@@ -1955,6 +2067,103 @@ fn validate_text(
     Ok(())
 }
 
+fn validate_rust_reexport_carrier(
+    routes: &[crate::analyzer::semantic_model::RustExternalReexport],
+    limits: &DecodeLimits,
+    census: &mut ValidationCensus,
+) -> Result<u64, ArtifactError> {
+    use crate::analyzer::semantic_model::RustExternalReexport;
+    let mut count = u64::try_from(routes.len())
+        .map_err(|_| ArtifactError::LimitExceeded("total record limit"))?;
+    for route in routes {
+        let (facade, target) = match route {
+            RustExternalReexport::ExplicitUse {
+                facade_path,
+                target,
+                ..
+            } => (facade_path, target),
+            RustExternalReexport::GlobUse {
+                facade_module_path,
+                target_module,
+                ..
+            } => (facade_module_path, target_module),
+            RustExternalReexport::InlinedItem {
+                facade_path,
+                original,
+                ..
+            } => (facade_path, original),
+        };
+        validate_text(facade, limits, census, "Rust reexport facade path")?;
+        let segments = facade.split('.').collect::<Vec<_>>();
+        if segments.len() > 64 {
+            return Err(ArtifactError::LimitExceeded(
+                "Rust reexport path segment limit",
+            ));
+        }
+        for segment in segments {
+            validate_text(segment, limits, census, "Rust reexport path segment")?;
+        }
+        let mut targets = vec![target];
+        if let RustExternalReexport::GlobUse {
+            explicit_competitors,
+            glob_competitors,
+            ..
+        } = route
+        {
+            let competitors = explicit_competitors
+                .len()
+                .checked_add(glob_competitors.len())
+                .ok_or(ArtifactError::LimitExceeded("total record limit"))?;
+            count = count
+                .checked_add(
+                    u64::try_from(competitors)
+                        .map_err(|_| ArtifactError::LimitExceeded("total record limit"))?,
+                )
+                .ok_or(ArtifactError::LimitExceeded("total record limit"))?;
+            for name in explicit_competitors {
+                validate_text(name, limits, census, "Rust reexport competitor")?;
+                if name.contains('.') {
+                    return Err(ArtifactError::InvalidDescriptor(
+                        "invalid Rust reexport competitor".into(),
+                    ));
+                }
+            }
+            targets.extend(glob_competitors);
+        }
+        for target in targets {
+            validate_text(
+                &target.path.join("."),
+                limits,
+                census,
+                "Rust reexport target path",
+            )?;
+            validate_text(
+                &target.external_crate_name,
+                limits,
+                census,
+                "Rust reexport crate",
+            )?;
+            if target.path.is_empty()
+                || target.path.len() > 64
+                || target.path.first() != Some(&target.external_crate_name)
+            {
+                return Err(ArtifactError::InvalidDescriptor(
+                    "invalid Rust reexport target path".into(),
+                ));
+            }
+            for segment in &target.path {
+                validate_text(segment, limits, census, "Rust reexport target segment")?;
+                if !rust_reexport_target_segment_valid(segment) {
+                    return Err(ArtifactError::InvalidDescriptor(
+                        "invalid Rust reexport target path segment".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Decoding accepts every supported schema version, not only the one this
 /// build mints: an installed artifact keeps loading across a version bump and
 /// is regenerated on its producer's normal cadence.
@@ -1963,6 +2172,38 @@ fn require_version(version: u32) -> Result<(), ArtifactError> {
         Ok(())
     } else {
         Err(ArtifactError::UnsupportedVersion(version))
+    }
+}
+
+fn require_rust_approximation_schema(
+    schema_version: u32,
+    provenance: &Provenance,
+) -> Result<(), ArtifactError> {
+    if provenance.rust_artifact_approximation.is_some()
+        && schema_version < RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION
+    {
+        Err(ArtifactError::InvalidDescriptor(
+            "Rust artifact approximation provenance requires schema 28".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_rust_reexport_schema(
+    schema_version: u32,
+    reexports: &[crate::analyzer::semantic_model::RustExternalReexport],
+    truncated: bool,
+) -> Result<(), ArtifactError> {
+    if (!reexports.is_empty() || truncated)
+        && schema_version
+            < crate::analyzer::semantic_model::model::RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION
+    {
+        Err(ArtifactError::InvalidDescriptor(
+            "Rust external reexports require schema 29".to_owned(),
+        ))
+    } else {
+        Ok(())
     }
 }
 

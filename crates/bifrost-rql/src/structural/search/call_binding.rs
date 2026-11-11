@@ -27,12 +27,13 @@
 //! `__init__`'s), what fills the receiver position, and which published
 //! signature entry the call selects.
 
-use super::dispatch::DispatchBoundaryClass;
+use super::dispatch::{DispatchBoundaryClass, DispatchCompleteness, DispatchProof, DispatchStatus};
 use super::*;
 use crate::analyzer::store::resolution_operation::native_units::{
     NativeInvocationOutcome, ProjectedNativeModelMemberSelection,
 };
 
+use crate::analyzer::languages::SourceCallableApplication;
 use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, FormalParameterPassingMode, FormalParameterSlot, FormalVariadicKind,
     receiver_is_declared_parameter,
@@ -52,7 +53,7 @@ use crate::analyzer::usages::call_binding::{
 };
 use crate::analyzer::usages::call_conversion::ConversionUnknown;
 use crate::analyzer::usages::call_relations::{
-    formal_owner_for_callee, python_first_formal_is_bound,
+    SourceCallableResult, formal_owner_for_callee, python_first_formal_is_bound,
 };
 use crate::analyzer::usages::callable_signature::{
     SelectedSignature, callable_signature_reports, signature_choice,
@@ -66,6 +67,181 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 };
 
 use super::dispatch::DispatchSiteAnswer;
+
+/// Query-local proof tying this exact source call and lexical binder to one
+/// selected executable procedure. Layout reuse never retains this certificate.
+pub(super) struct SourceCallableBindingEvidence {
+    binding: crate::analyzer::resolution::lexical_definition::LexicalDefinition,
+    call_key: brokk_bifrost_flow::value_flow::DurableCallSiteKey,
+    call_context: usize,
+    call: crate::analyzer::semantic::CallSiteHandle,
+    target_key: brokk_bifrost_flow::value_flow::DurableProcedureKey,
+    target: super::semantic::SemanticProcedureValue,
+    layout: crate::analyzer::usages::call_relations::SourceCallableLayout,
+}
+
+impl SourceCallableBindingEvidence {
+    pub(super) fn is_direct_go_application(&self) -> bool {
+        self.layout.application == SourceCallableApplication::NoReceiver
+    }
+
+    pub(super) fn source(&self) -> &str {
+        self.target.source_text()
+    }
+    pub(super) fn binding(
+        &self,
+    ) -> &crate::analyzer::resolution::lexical_definition::LexicalDefinition {
+        &self.binding
+    }
+    pub(super) fn callable_range(&self) -> crate::analyzer::Range {
+        source_callable_range(super::semantic::procedure_callable_span(
+            &self.target.handle,
+        ))
+    }
+}
+
+fn source_callable_range(span: crate::analyzer::semantic::SourceSpan) -> crate::analyzer::Range {
+    crate::analyzer::Range {
+        start_byte: span.start_byte() as usize,
+        end_byte: span.end_byte() as usize,
+        start_line: span.start().line() as usize + 1,
+        end_line: span.end().line() as usize + 1,
+    }
+}
+
+fn source_callable_evidence(
+    analyzer: &dyn IAnalyzer,
+    bindings: &mut CallBindingCache,
+    semantic: &mut SemanticQueryContext<'_>,
+    shape: &CallShapeValue,
+    answer: &DispatchSiteAnswer,
+    binding: crate::analyzer::resolution::lexical_definition::LexicalDefinition,
+) -> Option<SourceCallableBindingEvidence> {
+    let file = &shape.report.outcome.file;
+    let source_identity = shape.facts.as_ref()?.source_identity();
+    if shape
+        .seed
+        .as_ref()
+        .is_some_and(|seed| &seed.file != file || seed.facts.source_identity() != source_identity)
+    {
+        semantic.push_source_generation_changed(file);
+        return None;
+    }
+    if answer.status != DispatchStatus::Resolved
+        || !answer.coverage.is_exhaustive()
+        || !answer.unnamed_boundaries.is_empty()
+        || answer.call_site_count != 1
+    {
+        return None;
+    }
+    let [arm] = answer.arms.as_slice() else {
+        return None;
+    };
+    if arm.proof != DispatchProof::Proven
+        || arm.completeness != DispatchCompleteness::Complete
+        || arm.boundary.is_some()
+        || arm.boundary_kind.is_some()
+        || arm.target_unit.is_some()
+    {
+        return None;
+    }
+    let call =
+        semantic.exact_call_site_at_source(file, shape.report.outcome.range, source_identity)?;
+    let context = answer.call_contexts.get(arm.call_context)?;
+    let call_key = (call.procedure().durable_key(), call.id());
+    if context.call.as_ref() != Some(&call_key)
+        || context.proven_non_callable
+        || !context.residuals.is_empty()
+        || !context.unnamed_boundaries.is_empty()
+    {
+        return None;
+    }
+    let target_key = arm.target_procedure.as_ref()?;
+    let locator = arm.target_locator.as_ref()?;
+    if &target_key.0 != call.procedure().artifact().key() {
+        semantic.push_source_generation_changed(file);
+        return None;
+    }
+    let target = semantic.selected_source_procedure(target_key, locator)?;
+    if target.handle.durable_key() != *target_key || target.file() != file {
+        return None;
+    }
+    if !semantic.source_callable_inputs_available(file, &target.handle) {
+        return None;
+    }
+    let callable_range =
+        source_callable_range(super::semantic::procedure_callable_span(&target.handle));
+    let source = target.source_text();
+    let mut step = || semantic.source_callable_scope_step(file);
+    if !matches!(
+        bindings.source_callable_matches_binding(
+            analyzer,
+            file,
+            source,
+            &binding,
+            callable_range,
+            &mut step,
+        ),
+        SourceCallableResult::Found(())
+    ) {
+        return None;
+    }
+    let SourceCallableResult::Found(layout) = bindings.source_callable_layout(
+        analyzer,
+        file,
+        &target_key.0,
+        target_key.1,
+        callable_range,
+        source,
+        &mut step,
+    ) else {
+        return None;
+    };
+    Some(SourceCallableBindingEvidence {
+        binding,
+        call_key,
+        call_context: arm.call_context,
+        call,
+        target_key: target_key.clone(),
+        target,
+        layout,
+    })
+}
+
+/// Reacquire the exact resolver selection for a result-obligation reader.
+/// Incomplete, truncated and external selections never certify a source arm.
+pub(super) fn selected_source_callable_evidence(
+    analyzer: &dyn IAnalyzer,
+    bindings: &mut CallBindingCache,
+    semantic: &mut SemanticQueryContext<'_>,
+    shape: &CallShapeValue,
+    answer: &DispatchSiteAnswer,
+) -> Option<SourceCallableBindingEvidence> {
+    let outcome = &shape.report.outcome;
+    let lookup = bindings.resolved_call_target(
+        analyzer,
+        &outcome.file,
+        outcome.callee_range?,
+        Some(semantic.cancellation()),
+    )?;
+    if lookup.outcome.status != DefinitionLookupStatus::Resolved
+        || !lookup.outcome.definitions.is_empty()
+        || lookup.structure_unavailable
+        || lookup.unproven_link_unit
+        || lookup.truncated
+        || lookup.exact_external_call.is_some()
+    {
+        return None;
+    }
+    source_callable_evidence(
+        analyzer,
+        bindings,
+        semantic,
+        shape,
+        answer,
+        lookup.outcome.lexical_definition?,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CallBindingIdentityRequest {
@@ -201,10 +377,10 @@ impl CallBindingSelectorProof {
 #[derive(Debug, Clone)]
 pub(super) struct CallBindingDispatch {
     pub(super) target_id: Option<String>,
-    pub(super) proof: Option<&'static str>,
-    pub(super) completeness: Option<&'static str>,
-    pub(super) outcome: &'static str,
-    pub(super) coverage: &'static str,
+    pub(super) proof: Option<DispatchProof>,
+    pub(super) completeness: Option<DispatchCompleteness>,
+    pub(super) status: DispatchStatus,
+    pub(super) coverage_status: crate::analyzer::semantic::CandidateCoverage,
     pub(super) target_count: usize,
     pub(super) targets_truncated: bool,
 }
@@ -215,18 +391,18 @@ impl CallBindingDispatch {
             target_id: None,
             proof: None,
             completeness: None,
-            outcome: "unknown",
-            coverage: "open",
+            status: DispatchStatus::Unknown,
+            coverage_status: crate::analyzer::semantic::CandidateCoverage::Open,
             target_count: 0,
             targets_truncated: false,
         }
     }
 
     fn is_exact(&self) -> bool {
-        self.outcome == "resolved"
-            && self.coverage == "exhaustive"
-            && self.proof == Some("proven")
-            && self.completeness == Some("complete")
+        self.status == DispatchStatus::Resolved
+            && self.coverage_status.is_exhaustive()
+            && self.proof == Some(DispatchProof::Proven)
+            && self.completeness == Some(DispatchCompleteness::Complete)
             && self.target_count > 0
     }
 
@@ -234,11 +410,19 @@ impl CallBindingDispatch {
         answer: &DispatchSiteAnswer,
         source_target: Option<&CodeUnit>,
         model_target_id: Option<&str>,
+        source_procedure: Option<(
+            &brokk_bifrost_flow::value_flow::DurableProcedureKey,
+            &crate::analyzer::semantic::SemanticLocator,
+        )>,
     ) -> Self {
         let compatible = |arm: &&super::dispatch::DispatchArm| {
             (arm.target_unit.as_ref() == source_target && source_target.is_some())
                 || (arm.target_unit.is_none()
                     && model_target_id.is_some_and(|id| id == arm.target_id))
+                || source_procedure.is_some_and(|(key, locator)| {
+                    arm.target_procedure.as_ref() == Some(key)
+                        && arm.target_locator.as_ref() == Some(locator)
+                })
         };
         // An exact external declaration identifies the selected endpoint even
         // when dispatch retains an unnamed override boundary. Keep that open
@@ -263,8 +447,8 @@ impl CallBindingDispatch {
             target_id: singular.map(|arm| arm.target_id.clone()),
             proof: singular.map(|arm| arm.proof),
             completeness: singular.map(|arm| arm.completeness),
-            outcome: answer.outcome,
-            coverage: answer.coverage.label(),
+            status: answer.status,
+            coverage_status: answer.coverage,
             target_count: answer.arms.len(),
             targets_truncated: answer.coverage.is_truncated(),
         }
@@ -277,10 +461,10 @@ impl CallBindingDispatch {
         );
         Self {
             target_id: (target_ids.len() == 1).then(|| target_ids[0].clone()),
-            proof: Some("proven"),
-            completeness: Some("complete"),
-            outcome: "resolved",
-            coverage: "exhaustive",
+            proof: Some(DispatchProof::Proven),
+            completeness: Some(DispatchCompleteness::Complete),
+            status: DispatchStatus::Resolved,
+            coverage_status: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
             target_count: target_ids.len(),
             targets_truncated: false,
         }
@@ -289,21 +473,21 @@ impl CallBindingDispatch {
     fn from_resolver_owned_external(target_id: &str) -> Self {
         Self {
             target_id: Some(target_id.to_owned()),
-            proof: Some("proven"),
-            completeness: Some("complete"),
-            outcome: "resolved",
-            coverage: "exhaustive",
+            proof: Some(DispatchProof::Proven),
+            completeness: Some(DispatchCompleteness::Complete),
+            status: DispatchStatus::Resolved,
+            coverage_status: crate::analyzer::semantic::CandidateCoverage::Exhaustive,
             target_count: 1,
             targets_truncated: false,
         }
     }
 
     fn keep_open_for_receiver_evidence(&mut self) {
-        self.outcome = "unproven";
-        self.coverage = "open";
+        self.status = DispatchStatus::Unproven;
+        self.coverage_status = crate::analyzer::semantic::CandidateCoverage::Open;
         if self.target_id.is_some() {
-            self.proof = Some("unproven");
-            self.completeness = Some("partial");
+            self.proof = Some(DispatchProof::Unproven);
+            self.completeness = Some(DispatchCompleteness::Partial);
         }
     }
 }
@@ -314,11 +498,17 @@ fn receiver_proof_can_close_dispatch(
 ) -> bool {
     let named_targets = !proof.targets.is_empty()
         && !answer.arms.is_empty()
-        && answer.arms.iter().all(|arm| arm.proof == "proven")
-        && matches!(answer.outcome, "resolved" | "unproven");
+        && answer
+            .arms
+            .iter()
+            .all(|arm| arm.proof == DispatchProof::Proven)
+        && matches!(
+            answer.status,
+            DispatchStatus::Resolved | DispatchStatus::Unproven
+        );
     let unresolved_targets = !proof.targets.is_empty()
         && answer.arms.is_empty()
-        && answer.outcome == "unknown"
+        && answer.status == DispatchStatus::Unknown
         && answer.unnamed_boundaries.as_slice() == [DispatchBoundaryClass::Unresolved];
     answer.call_site_count == 1
         && (named_targets || unresolved_targets)
@@ -423,7 +613,7 @@ fn receiver_proven_arm_for_target(
             let mut declaring_owners = Vec::new();
             let mut declared_member_ids = Vec::new();
             for symbol_id in declaration.symbol_ids() {
-                let matched = overlay.symbols_with_id(symbol_id);
+                let matched = overlay.symbols_with_id_for(symbol_id, "python");
                 let [symbol] = matched.records.as_slice() else {
                     return false;
                 };
@@ -440,7 +630,7 @@ fn receiver_proven_arm_for_target(
                 let Some(owner_id) = symbol.owner_id.as_deref() else {
                     return false;
                 };
-                let owner = overlay.symbols_with_id(owner_id);
+                let owner = overlay.symbols_with_id_for(owner_id, "python");
                 let [owner] = owner.records.as_slice() else {
                     return false;
                 };
@@ -496,6 +686,10 @@ enum ModelCallBinding {
         signature: Box<crate::analyzer::semantic_model::Signature>,
         semantic_model_provenance: Arc<SemanticModelProvenance>,
         model_aliases: Vec<String>,
+        /// `model_callable_id` names the known members of an overload family
+        /// that no model certifies complete, so the binding is only possible
+        /// (#10761).
+        possible_family: bool,
     },
     CompatibleLayout {
         layout: FormalParameterLayout,
@@ -505,6 +699,7 @@ enum ModelCallBinding {
         formal_layout_id: String,
         pack_id: String,
         receiver_type_id: Option<String>,
+        possible_family: bool,
     },
     Conflict,
     Incomplete {
@@ -521,6 +716,26 @@ enum ModelCallBinding {
         semantic_model_provenance: Option<Arc<SemanticModelProvenance>>,
     },
     Unavailable,
+}
+
+/// The site diagnostic for a call bound through a possible overload family
+/// (#10761): the model may omit the overload the code calls, so the binding
+/// and anything it selects stay incomplete.
+fn possible_family_binding_diagnostic(file: &ProjectFile) -> CodeQueryDiagnostic {
+    CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        incompleteness: Incompleteness::Content,
+        related: Vec::new(),
+        source: None,
+        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+        impact: CodeQueryDiagnosticImpact::Incomplete,
+        branch: Vec::new(),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        message: "call_bindings semantic model callable family is not certified complete; \
+                  the call binds its known members as a possible identity"
+            .to_owned(),
+        exhausted_roots: Vec::new(),
+        withheld_rows_path: None,
+    })
 }
 
 fn model_formal_layout(
@@ -564,12 +779,43 @@ fn model_formal_layout(
     }
 }
 
+/// The declared formals the written actuals apply to: all of them, or for a
+/// reduced-form extension call those after the receiver's `this` formal.
+/// `None` when an extension signature declares no receiver formal.
+fn written_formals(
+    signature: &crate::analyzer::semantic_model::Signature,
+    receiver_is_first_argument: bool,
+) -> Option<std::borrow::Cow<'_, crate::analyzer::semantic_model::Signature>> {
+    if !receiver_is_first_argument {
+        return Some(std::borrow::Cow::Borrowed(signature));
+    }
+    let mut written = signature.clone();
+    if written.parameters.is_empty() {
+        return None;
+    }
+    written.parameters.remove(0);
+    Some(std::borrow::Cow::Owned(written))
+}
+
 fn model_receiver_binding(
     has_receiver: bool,
+    receiver_is_first_argument: bool,
     implicit_constructor: bool,
     shape: &CallShapeValue,
 ) -> CallReceiverBinding {
-    if has_receiver {
+    if receiver_is_first_argument {
+        // The resolver proved the reduced extension form, so the receiver
+        // expression is written and fills the declared `this` formal.
+        let range = shape
+            .report
+            .outcome
+            .receiver_range
+            .expect("a reduced-form extension call writes its receiver");
+        CallReceiverBinding::Actual {
+            range,
+            declared_first_ordinary: true,
+        }
+    } else if has_receiver {
         if implicit_constructor && shape.report.outcome.receiver_range.is_none() {
             CallReceiverBinding::Implicit {
                 declared_first_ordinary: false,
@@ -671,7 +917,7 @@ fn model_call_binding_for_receiver_target(
     let [member_id] = declaration.symbol_ids() else {
         return ModelCallBinding::Unavailable;
     };
-    let matched_member = overlay.symbols_with_id(member_id);
+    let matched_member = overlay.symbols_with_id_for(member_id, "python");
     let [member] = matched_member.records.as_slice() else {
         return ModelCallBinding::Unavailable;
     };
@@ -689,7 +935,7 @@ fn model_call_binding_for_receiver_target(
     let Some(declaring_owner_id) = member.owner_id.as_deref() else {
         return ModelCallBinding::Unavailable;
     };
-    let declaring_owner_match = overlay.symbols_with_id(declaring_owner_id);
+    let declaring_owner_match = overlay.symbols_with_id_for(declaring_owner_id, "python");
     let [declaring_owner] = declaring_owner_match.records.as_slice() else {
         return ModelCallBinding::Unavailable;
     };
@@ -738,7 +984,7 @@ fn model_call_binding_for_receiver_target(
     ModelCallBinding::Unique {
         python_constructor: false,
         layout: model_formal_layout(signature, shape),
-        receiver: model_receiver_binding(true, false, shape),
+        receiver: model_receiver_binding(true, false, false, shape),
         key: Box::new(modeled_key),
         model_id: member.id.clone(),
         model_callable_id,
@@ -748,6 +994,7 @@ fn model_call_binding_for_receiver_target(
         signature: Box::new(signature.clone()),
         semantic_model_provenance: Arc::new(member.provenance.clone()),
         model_aliases: member.aliases.clone(),
+        possible_family: false,
     }
 }
 
@@ -819,11 +1066,15 @@ fn model_call_binding(
         has_receiver,
         parameter_count: arity,
     };
+    let receiver_is_first_argument =
+        unmaterialized.is_some_and(|target| target.receiver_is_first_argument);
     model_call_binding_for_external_shape(
         analyzer,
         modeled_key,
+        receiver_is_first_argument,
         arm.exact_external_target.as_ref(),
         unmaterialized.and_then(|target| target.selected_external_descriptor.as_ref()),
+        unmaterialized.and_then(|target| target.type_argument_bindings.as_deref()),
         shape,
         bindings,
     )
@@ -846,18 +1097,26 @@ fn model_call_binding_for_external_dispatch(
     model_call_binding_for_external_shape(
         analyzer,
         modeled_key,
+        target.receiver_is_first_argument(),
         None,
         target.selected_external_descriptor.as_ref(),
+        target.type_argument_bindings.as_deref(),
         shape,
         bindings,
     )
 }
 
+/// `receiver_is_first_argument` marks a reduced-form extension call,
+/// `v.M(args...)` to a static `M(this T v, ...)`: the receiver binds the first
+/// declared formal, and the written actuals apply to the formals after it.
+#[allow(clippy::too_many_arguments)]
 fn model_call_binding_for_external_shape(
     analyzer: &dyn IAnalyzer,
     modeled_key: ModeledProcedureKey,
+    receiver_is_first_argument: bool,
     exact_external_target: Option<&crate::analyzer::semantic::ExactExternalProcedureTarget>,
     selected_descriptor: Option<&crate::analyzer::resolution::ExternalMemberIdentity>,
+    type_argument_bindings: Option<&[(Box<str>, crate::analyzer::semantic_model::TypeRef)]>,
     shape: &CallShapeValue,
     bindings: &mut CallBindingCache,
 ) -> ModelCallBinding {
@@ -875,23 +1134,123 @@ fn model_call_binding_for_external_shape(
         modeled_key.has_receiver,
         modeled_key.parameter_count,
     );
-    let model_callable_id = overlay.callable_family_id_for_target(key);
-    let application = structured_model_application(shape);
-    let Some(matched) =
+    let mut model_callable_id = overlay.callable_family_id_for_target(key);
+    let mut application = structured_model_application(shape);
+    // The receiver of a reduced-form extension call is the first positional
+    // actual of the declared signature.
+    if receiver_is_first_argument
+        && let SemanticModelCallApplication::Written {
+            positional_count, ..
+        } = &mut application
+    {
+        *positional_count = positional_count
+            .checked_add(1)
+            .expect("a written positional count leaves room for the receiver");
+    }
+    let Some(mut matched) =
         selected_model_callable(analyzer, &overlay, key, selected_descriptor, &application)
     else {
         return ModelCallBinding::Unavailable;
     };
+    // An overload family that no model certifies complete still answers the
+    // call from its known members. Bind that answer under the possible
+    // family identity, which never equals a proven one, and let the site
+    // report the binding incomplete (#10761). A family whose known members
+    // span packs or owners has no possible identity and stays incomplete.
+    let mut possible_family = false;
+    if matched.disposition
+        == SemanticModelCallableDisposition::Incomplete(
+            SemanticModelCallableIncompleteReason::PartialModel,
+        )
+        && let Some(possible) = matched.possible
+        && let Some(possible_id) = overlay.callable_possible_family_id_for_target(key)
+    {
+        matched.disposition = possible;
+        model_callable_id = Some(possible_id);
+        possible_family = true;
+    }
     let exact_target_matches = |symbol: &crate::analyzer::semantic_model::SemanticModelSymbol| {
         exact_external_target.is_none_or(|target| {
             symbol.has_exact_artifact_locator(target.procedure().path().as_str(), target.symbol())
         })
     };
+    let language = crate::analyzer::common::language_for_file(&shape.report.outcome.file);
+    let selects_by_argument_types = matches!(language, Language::Java | Language::CSharp);
+    // Overloads of one owner whose binding layouts differ, such as
+    // PrintWriter.format(String, Object...) and format(Locale, String,
+    // Object...) for three actuals, are told apart only by the actuals'
+    // types (#10812). As for a unique layout match (#9981), only a proven
+    // rejection removes an overload: one survivor is the overload the code
+    // calls, and several survivors go to positive selection below, which
+    // reports the binding incomplete when it cannot decide. Conflicting
+    // owners stay a conflict.
+    //
+    // A conflict can retain one exact candidate when another owner's
+    // same-named member mismatched this application. One record is not a
+    // same-owner overload family, so never narrow that conflict.
+    let same_owner_overloads = matched.disposition == SemanticModelCallableDisposition::Conflict
+        && selects_by_argument_types
+        && matched.records.len() > 1
+        && matched
+            .records
+            .windows(2)
+            .all(|pair| pair[0].owner_id == pair[1].owner_id);
+    if same_owner_overloads {
+        let mut survivors = Vec::new();
+        for candidate in &matched.records {
+            let Some(signature) = candidate.structured_signature() else {
+                return ModelCallBinding::Unavailable;
+            };
+            let Some(written) = written_formals(signature, receiver_is_first_argument) else {
+                return ModelCallBinding::Unavailable;
+            };
+            match bindings.model_signature_rejects_call(
+                analyzer,
+                &shape.report,
+                shape
+                    .source()
+                    .map(|source| (&shape.report.outcome.file, source)),
+                &written,
+            ) {
+                Ok(true) => {}
+                Ok(false) => survivors.push(Arc::clone(candidate)),
+                Err(reason) => {
+                    return ModelCallBinding::ConversionUnavailable {
+                        model_id: None,
+                        pack_id: Some(candidate.provenance.pack_id.clone()),
+                        reason,
+                        semantic_model_provenance: Some(Arc::new(candidate.provenance.clone())),
+                    };
+                }
+            }
+        }
+        if survivors.is_empty() {
+            let first = &matched.records[0];
+            return ModelCallBinding::ConversionUnavailable {
+                model_id: None,
+                pack_id: Some(first.provenance.pack_id.clone()),
+                reason: ConversionUnknown::SignatureApplicability,
+                semantic_model_provenance: Some(Arc::new(first.provenance.clone())),
+            };
+        }
+        matched.disposition = if survivors.len() == 1 {
+            SemanticModelCallableDisposition::Unique
+        } else {
+            SemanticModelCallableDisposition::Conflict
+        };
+        matched.records = survivors;
+    }
     let provenance = matched
         .records
         .first()
         .map(|symbol| Arc::new(symbol.provenance.clone()));
-    let model_id = matched.records.first().map(|symbol| symbol.id.clone());
+    // An unresolved constructor overload family has no selected constructor
+    // identity. Its first record is merely storage order. Other callable
+    // families retain their existing model-record attribution.
+    let model_id = (shape.report.outcome.call_kind != CallKind::Constructor
+        || matched.records.len() == 1)
+        .then(|| matched.records.first().map(|symbol| symbol.id.clone()))
+        .flatten();
     match matched.disposition {
         SemanticModelCallableDisposition::Unique => {
             let Some(symbol) = matched.unique() else {
@@ -908,15 +1267,45 @@ fn model_call_binding_for_external_shape(
                     semantic_model_provenance: provenance,
                 };
             };
-            let layout = model_formal_layout(signature, shape);
-            let receiver =
-                model_receiver_binding(modeled_key.has_receiver, implicit_constructor, shape);
             let Some(model_provenance) = provenance else {
                 return ModelCallBinding::Unavailable;
             };
+            let Some(written) = written_formals(signature, receiver_is_first_argument) else {
+                return ModelCallBinding::Unavailable;
+            };
+            // A unique layout match is not an applicable overload: the code may
+            // call a same-arity member the model never declared (#9981).
+            let rejection = match bindings.model_signature_rejects_call(
+                analyzer,
+                &shape.report,
+                shape
+                    .source()
+                    .map(|source| (&shape.report.outcome.file, source)),
+                &written,
+            ) {
+                Ok(false) => None,
+                Ok(true) => Some(ConversionUnknown::SignatureApplicability),
+                Err(reason) => Some(reason),
+            };
+            if let Some(reason) = rejection {
+                return ModelCallBinding::ConversionUnavailable {
+                    model_id,
+                    pack_id: Some(model_provenance.pack_id.clone()),
+                    reason,
+                    semantic_model_provenance: Some(model_provenance),
+                };
+            }
+            let layout = model_formal_layout(signature, shape);
+            let receiver = model_receiver_binding(
+                modeled_key.has_receiver,
+                receiver_is_first_argument,
+                implicit_constructor,
+                shape,
+            );
             let model_id = symbol.id.clone();
             let pack_id = model_provenance.pack_id.clone();
             let signature_id = model_signature_id(&model_id, signature);
+            let signature = bound_model_signature(&written, type_argument_bindings);
             let Some(model_callable_id) = model_callable_id else {
                 return ModelCallBinding::Conflict;
             };
@@ -934,12 +1323,21 @@ fn model_call_binding_for_external_shape(
                 pack_id,
                 receiver_type_id,
                 signature_id,
-                signature: Box::new(signature.clone()),
+                signature: Box::new(signature),
                 semantic_model_provenance: model_provenance,
                 model_aliases: symbol.aliases.clone(),
+                possible_family,
             }
         }
-        SemanticModelCallableDisposition::CompatibleLayout => {
+        SemanticModelCallableDisposition::CompatibleLayout
+        | SemanticModelCallableDisposition::Conflict => {
+            // Only the same-owner overloads narrowed above reach selection as
+            // a conflict.
+            if matched.disposition == SemanticModelCallableDisposition::Conflict
+                && !same_owner_overloads
+            {
+                return ModelCallBinding::Conflict;
+            }
             let Some(symbol) = matched.records.first().cloned() else {
                 return ModelCallBinding::Unavailable;
             };
@@ -959,8 +1357,7 @@ fn model_call_binding_for_external_shape(
             else {
                 return ModelCallBinding::Conflict;
             };
-            let language = crate::analyzer::common::language_for_file(&shape.report.outcome.file);
-            if !matches!(language, Language::Java | Language::CSharp) {
+            if !selects_by_argument_types {
                 let receiver_type_id = modeled_key
                     .has_receiver
                     .then(|| symbol.owner_id.clone())
@@ -969,6 +1366,7 @@ fn model_call_binding_for_external_shape(
                     layout: model_formal_layout(signature, shape),
                     receiver: model_receiver_binding(
                         modeled_key.has_receiver,
+                        receiver_is_first_argument,
                         implicit_constructor,
                         shape,
                     ),
@@ -977,6 +1375,7 @@ fn model_call_binding_for_external_shape(
                     formal_layout_id: model_signature_id(&model_callable_id, signature),
                     pack_id,
                     receiver_type_id,
+                    possible_family,
                 };
             }
             let candidates = matched
@@ -985,7 +1384,11 @@ fn model_call_binding_for_external_shape(
                 .filter(|candidate| exact_target_matches(candidate))
                 .filter_map(|candidate| {
                     let signature = candidate.structured_signature()?;
-                    Some((candidate.id.clone(), signature.clone()))
+                    let written = written_formals(signature, receiver_is_first_argument)?;
+                    Some((
+                        candidate.id.clone(),
+                        bound_model_signature(&written, type_argument_bindings),
+                    ))
                 })
                 .collect::<Vec<_>>();
             if exact_external_target.is_some() && candidates.is_empty() {
@@ -1012,13 +1415,26 @@ fn model_call_binding_for_external_shape(
                     } else {
                         None
                     };
-                    let signature_id = model_signature_id(&selected_model_id, &selected_signature);
-                    let layout = model_formal_layout(&selected_signature, shape);
+                    // The id names the declared signature so summaries and
+                    // ports keyed by it do not move with the call's bindings.
+                    let Some(declared_signature) = selected_symbol.structured_signature() else {
+                        return ModelCallBinding::Unavailable;
+                    };
+                    let signature_id = model_signature_id(&selected_model_id, declared_signature);
+                    let layout = if receiver_is_first_argument {
+                        model_formal_layout(
+                            &bound_model_signature(declared_signature, type_argument_bindings),
+                            shape,
+                        )
+                    } else {
+                        model_formal_layout(&selected_signature, shape)
+                    };
                     ModelCallBinding::Unique {
                         python_constructor: false,
                         layout,
                         receiver: model_receiver_binding(
                             modeled_key.has_receiver,
+                            receiver_is_first_argument,
                             implicit_constructor,
                             shape,
                         ),
@@ -1031,6 +1447,7 @@ fn model_call_binding_for_external_shape(
                         signature: Box::new(selected_signature),
                         semantic_model_provenance: Arc::new(selected_symbol.provenance.clone()),
                         model_aliases: selected_symbol.aliases.clone(),
+                        possible_family,
                     }
                 }
                 Ok(None) => ModelCallBinding::ConversionUnavailable {
@@ -1047,7 +1464,6 @@ fn model_call_binding_for_external_shape(
                 },
             }
         }
-        SemanticModelCallableDisposition::Conflict => ModelCallBinding::Conflict,
         SemanticModelCallableDisposition::Incomplete(reason) => ModelCallBinding::Incomplete {
             model_id,
             pack_id: provenance.as_ref().map(|value| value.pack_id.clone()),
@@ -1056,6 +1472,41 @@ fn model_call_binding_for_external_shape(
         },
         SemanticModelCallableDisposition::Empty => ModelCallBinding::Empty,
     }
+}
+
+/// Substitute the type arguments that exact call selection bound into the
+/// declared formals, once, so overload selection and the per-actual
+/// conversion proof see the same types. A formal that cannot be substituted
+/// keeps its declared type. Bindings that carry a wildcard or an unknown type
+/// are not exact, so every declared formal is kept. No bindings means the
+/// declared signature.
+fn bound_model_signature(
+    signature: &crate::analyzer::semantic_model::Signature,
+    type_argument_bindings: Option<&[(Box<str>, crate::analyzer::semantic_model::TypeRef)]>,
+) -> crate::analyzer::semantic_model::Signature {
+    use crate::analyzer::semantic_model::TypeRef;
+    let Some(type_argument_bindings) = type_argument_bindings else {
+        return signature.clone();
+    };
+    let mut inexact = false;
+    crate::analyzer::semantic::common::visit_type_refs(
+        type_argument_bindings.iter().map(|(_, term)| term),
+        |term| inexact |= matches!(term, TypeRef::Wildcard { .. } | TypeRef::Unknown),
+    );
+    if inexact {
+        return signature.clone();
+    }
+    let bindings = type_argument_bindings
+        .iter()
+        .map(|(name, term)| (name.to_string(), term.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut bound = signature.clone();
+    for parameter in &mut bound.parameters {
+        if let Some(term) = parameter.r#type.substitute(&bindings, 64) {
+            parameter.r#type = term;
+        }
+    }
+    bound
 }
 
 /// Bind a direct active-model class call through that class's declared
@@ -1085,7 +1536,7 @@ fn model_python_constructor_binding(
     let overlay = analyzer.semantic_model_overlay()?;
     let canonical = format!("{owner_fqn}.{member}");
     let classes = overlay
-        .symbols_named(&canonical)
+        .symbols_named_for(&canonical, "python")
         .records
         .into_iter()
         .filter(|symbol| {
@@ -1126,7 +1577,7 @@ fn model_python_constructor_binding(
     Some(ModelCallBinding::Unique {
         python_constructor: true,
         layout: model_formal_layout(signature, shape),
-        receiver: model_receiver_binding(true, true, shape),
+        receiver: model_receiver_binding(true, false, true, shape),
         key: Box::new(modeled_key),
         model_id: initializer.id.clone(),
         model_callable_id,
@@ -1136,6 +1587,7 @@ fn model_python_constructor_binding(
         signature: Box::new(signature.clone()),
         semantic_model_provenance: Arc::new(initializer.provenance.clone()),
         model_aliases: initializer.aliases.clone(),
+        possible_family: false,
     })
 }
 
@@ -1153,8 +1605,14 @@ fn python_constructor_initializer(
     std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
     std::sync::Arc<crate::analyzer::semantic_model::SemanticModelSymbol>,
 )> {
-    let mut direct_initializers = overlay
-        .members_of(&class.id)
+    let direct_members = overlay.members_of_for(&class.id, "python");
+    if matches!(
+        direct_members.disposition,
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return None;
+    }
+    let mut direct_initializers = direct_members
         .records
         .into_iter()
         .filter(|symbol| {
@@ -1188,12 +1646,18 @@ fn python_constructor_initializer(
     }
     let mro = python_constructor_class_mro(overlay, &class.id)?;
     for class_id in mro.into_iter().skip(1) {
-        let declaring_class_match = overlay.symbols_with_id(&class_id);
+        let declaring_class_match = overlay.symbols_with_id_for(&class_id, "python");
         let [declaring_class] = declaring_class_match.records.as_slice() else {
             return None;
         };
-        let mut initializers = overlay
-            .members_of(&class_id)
+        let members = overlay.members_of_for(&class_id, "python");
+        if matches!(
+            members.disposition,
+            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+        ) {
+            return None;
+        }
+        let mut initializers = members
             .records
             .into_iter()
             .filter(|symbol| {
@@ -1247,7 +1711,7 @@ fn python_constructor_class_mro(
         let top = stack.len() - 1;
         if stack[top].bases.is_none() {
             let class_id = stack[top].class_id.clone();
-            let class_match = overlay.symbols_with_id(&class_id);
+            let class_match = overlay.symbols_with_id_for(&class_id, "python");
             let [class] = class_match.records.as_slice() else {
                 return None;
             };
@@ -1324,8 +1788,14 @@ fn python_constructor_direct_bases(
     if class.qualified_name == "builtins.object" {
         return Some(Vec::new());
     }
-    let relations = overlay
-        .relations_from(&class.id)
+    let relations = overlay.relations_from_for(&class.id, "python");
+    if matches!(
+        relations.disposition,
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return None;
+    }
+    let relations = relations
         .records
         .into_iter()
         .filter(|relation| relation.kind == "extends")
@@ -1354,11 +1824,23 @@ fn python_constructor_direct_bases(
     }
     let mut bases = Vec::with_capacity(ordered.len());
     for relation in ordered {
-        let base_match = overlay.symbols_with_id(&relation.to);
+        let base_match = overlay.symbols_with_id_for(&relation.to, "python");
+        if matches!(
+            base_match.disposition,
+            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+        ) {
+            return None;
+        }
         let no_id_match = base_match.records.is_empty();
         let records = if no_id_match {
-            overlay
-                .symbols_named(&relation.to)
+            let named = overlay.symbols_named_for(&relation.to, "python");
+            if matches!(
+                named.disposition,
+                crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+            ) {
+                return None;
+            }
+            named
                 .records
                 .into_iter()
                 .filter(|symbol| {
@@ -1511,8 +1993,10 @@ fn model_provenance_for_source_target(
 /// can discharge. The named `unresolved` boundary distinguishes that contract
 /// residual from real target-limit or workspace-hierarchy truncation.
 fn authored_residual_arm(answer: &DispatchSiteAnswer) -> Option<&super::dispatch::DispatchArm> {
-    (matches!(answer.outcome, "unknown" | "unproven")
-        && answer.call_site_count == 1
+    (matches!(
+        answer.status,
+        DispatchStatus::Unknown | DispatchStatus::Unproven
+    ) && answer.call_site_count == 1
         && answer.arms.len() == 1
         && is_authored_override_residual(&answer.unnamed_boundaries))
     .then(|| &answer.arms[0])
@@ -1552,7 +2036,7 @@ fn closed_model_selector_proof_for_external_target(
     answer: &DispatchSiteAnswer,
     key: &ModeledProcedureKey,
 ) -> Option<CallBindingSelectorProof> {
-    if answer.outcome != "resolved"
+    if answer.status != DispatchStatus::Resolved
         || !answer.coverage.is_exhaustive()
         || answer.call_site_count != 1
         || !answer.unnamed_boundaries.is_empty()
@@ -1562,7 +2046,7 @@ fn closed_model_selector_proof_for_external_target(
     let [arm] = answer.arms.as_slice() else {
         return None;
     };
-    if arm.proof != "proven" || arm.completeness != "complete" {
+    if arm.proof != DispatchProof::Proven || arm.completeness != DispatchCompleteness::Complete {
         return None;
     }
     let target = arm.unmaterialized_target.as_ref()?;
@@ -1624,13 +2108,13 @@ fn is_authored_override_residual(boundaries: &[DispatchBoundaryClass]) -> bool {
 }
 
 fn resolver_proven_static_model_selector(answer: &DispatchSiteAnswer) -> bool {
-    answer.outcome == "resolved"
+    answer.status == DispatchStatus::Resolved
         && answer.coverage.is_exhaustive()
         && answer.unnamed_boundaries.is_empty()
         && matches!(
             answer.arms.as_slice(),
             [arm]
-                if arm.proof == "proven"
+                if arm.proof == DispatchProof::Proven
                     && arm
                         .unmaterialized_target
                         .as_ref()
@@ -1642,7 +2126,7 @@ fn resolver_proven_static_model_selector(answer: &DispatchSiteAnswer) -> bool {
 /// alone: resolved, exhaustive, one proven and complete arm, and nothing the
 /// oracle could not name.
 fn answer_closed_on_arm(answer: &DispatchSiteAnswer, arm: &super::dispatch::DispatchArm) -> bool {
-    answer.outcome == "resolved"
+    answer.status == DispatchStatus::Resolved
         && answer.coverage.is_exhaustive()
         && answer.call_site_count == 1
         && answer.call_contexts.len() == 1
@@ -1650,8 +2134,8 @@ fn answer_closed_on_arm(answer: &DispatchSiteAnswer, arm: &super::dispatch::Disp
         && answer.exceeded_limit.is_none()
         && answer.unnamed_boundaries.is_empty()
         && matches!(answer.arms.as_slice(), [only] if only.target_id == arm.target_id)
-        && arm.proof == "proven"
-        && arm.completeness == "complete"
+        && arm.proof == DispatchProof::Proven
+        && arm.completeness == DispatchCompleteness::Complete
 }
 
 /// A modeled external call whose dispatch answer is already closed on the one
@@ -1710,8 +2194,8 @@ fn resolver_proven_python_constructor_selector(
 #[cfg(test)]
 mod authored_override_residual_tests {
     use super::{
-        DispatchBoundaryClass, DispatchSiteAnswer, authored_residual_arm,
-        is_authored_override_residual,
+        DispatchBoundaryClass, DispatchCompleteness, DispatchProof, DispatchSiteAnswer,
+        DispatchStatus, authored_residual_arm, is_authored_override_residual,
     };
     use brokk_bifrost_test_macros::hardwon;
 
@@ -1742,9 +2226,10 @@ mod authored_override_residual_tests {
 
     #[test]
     fn only_unknown_or_unproven_answers_can_carry_the_contract_residual() {
-        let answer = |outcome| DispatchSiteAnswer {
+        let answer = |status: DispatchStatus| DispatchSiteAnswer {
             coverage_reasons: Vec::new(),
-            outcome,
+            outcome: status.label(),
+            status,
             coverage: crate::analyzer::semantic::CandidateCoverage::Open,
             call_site_count: 1,
             semantic_unsupported: None,
@@ -1762,11 +2247,12 @@ mod authored_override_residual_tests {
             }],
             unnamed_boundaries: vec![DispatchBoundaryClass::Unresolved],
         };
-        for outcome in ["unknown", "unproven"] {
-            let mut answer = answer(outcome);
+        for status in [DispatchStatus::Unknown, DispatchStatus::Unproven] {
+            let mut answer = answer(status);
             answer.arms.push(super::super::dispatch::DispatchArm {
                 call_context: 0,
                 target_procedure: None,
+                target_locator: None,
                 boundary: None,
                 execution_timing: crate::analyzer::semantic::ExecutionTiming::Unknown,
                 target_id: "target".to_owned(),
@@ -1775,20 +2261,21 @@ mod authored_override_residual_tests {
                 external_callee_identity: None,
                 exact_external_target: None,
                 unmaterialized_target: None,
-                proof: "proven",
-                completeness: "partial",
+                proof: DispatchProof::Proven,
+                completeness: DispatchCompleteness::Partial,
                 boundary_kind: Some(DispatchBoundaryClass::External),
+                boundary_reason: None,
             });
             assert!(authored_residual_arm(&answer).is_some());
         }
-        for outcome in [
-            "resolved",
-            "ambiguous",
-            "unsupported",
-            "exceeded_budget",
-            "cancelled",
+        for status in [
+            DispatchStatus::Resolved,
+            DispatchStatus::Ambiguous,
+            DispatchStatus::Unsupported,
+            DispatchStatus::ExceededBudget,
+            DispatchStatus::Cancelled,
         ] {
-            assert!(authored_residual_arm(&answer(outcome)).is_none());
+            assert!(authored_residual_arm(&answer(status)).is_none());
         }
     }
 }
@@ -1876,7 +2363,14 @@ pub(super) fn call_binding_expansions(
     let mut native_selected = false;
     let mut diagnostic_family = None;
     let mut diagnostic_terminal_decided = false;
+    let mut lexical_candidate = None;
     let (mut target, mut declaration, mut signature_id, mut source_target) = match resolved {
+        // The lexical binder is retained for the selected source-procedure
+        // certificate below. Without that certificate it has no formal layout.
+        ResolvedCallTarget::Lexical(definition) => {
+            lexical_candidate = Some(definition);
+            (CallBindingTarget::Unresolved, None, None, None)
+        }
         ResolvedCallTarget::Unit(candidate) => {
             let native_incomplete = candidate.incomplete_native_diagnostics.is_some();
             native_resolution_gap = candidate.incomplete_native_diagnostics;
@@ -2046,7 +2540,7 @@ pub(super) fn call_binding_expansions(
                 // still safe for candidate-local dispatch evidence. Its
                 // original navigation gap remains attached to this row and
                 // keeps the result incomplete.
-                CallBindingDispatch::from_answer(answer, source_target.as_ref(), None)
+                CallBindingDispatch::from_answer(answer, source_target.as_ref(), None, None)
             });
     if incomplete_callee_diagnostics.is_some() {
         dispatch.keep_open_for_receiver_evidence();
@@ -2084,6 +2578,7 @@ pub(super) fn call_binding_expansions(
     let mut model_static_selector_proven = false;
     let mut python_constructor_selector_proven = false;
     let mut model_layout_compatible = false;
+    let mut source_procedure_layout_proven = false;
     let mut model_conversion_context: Option<(
         String,
         String,
@@ -2151,8 +2646,10 @@ pub(super) fn call_binding_expansions(
                     .external_callee_identity
                     .as_ref()
                     .is_some_and(|identity| {
-                        crate::analyzer::common::language_for_file(&file) == identity.language()
-                        && (arm.exact_external_target.is_some()
+                        crate::analyzer::languages::calls_external_declarations_of(
+                            crate::analyzer::common::language_for_file(&file),
+                            identity.language(),
+                        ) && (arm.exact_external_target.is_some()
                             || arm.unmaterialized_target.as_ref().is_some_and(|target| {
                                 let exact_callee = target.owner_fqn() == identity.owner_fqn()
                                     && target.member() == identity.member();
@@ -2190,6 +2687,18 @@ pub(super) fn call_binding_expansions(
     let receiver_proof_model_bindings = receiver_proof
         .filter(|_| receiver_proof_model)
         .and_then(|proof| model_call_bindings_for_receiver_proof(analyzer, proof, shape));
+    // Navigation may leave a multi-target callee incomplete even though exact
+    // receiver evidence identifies every runtime member. Use those formals only
+    // after reconciling every dispatch arm with the receiver declarations and
+    // checking the model signatures. The lookup diagnostics remain attached.
+    let incomplete_lookup_withholds_binding = incomplete_lookup_withholds_binding
+        && !(receiver_proof_model_bindings.is_some()
+            && receiver_proof.is_some_and(|proof| {
+                dispatch_answer.as_ref().is_some_and(|answer| {
+                    receiver_proven_arms(analyzer, answer, proof, source_target.as_ref(), None)
+                        .is_some()
+                })
+            }));
     let receiver_proof_target_id = external_model_arm
         .map(|arm| arm.target_id.as_str())
         .or_else(|| {
@@ -2250,7 +2759,11 @@ pub(super) fn call_binding_expansions(
                 signature: resolved_signature,
                 semantic_model_provenance: resolved_provenance,
                 model_aliases: resolved_model_aliases,
+                possible_family,
             } => {
+                if possible_family {
+                    diagnostics.push(possible_family_binding_diagnostic(&file));
+                }
                 model_static_selector_proven = resolver_owned_external_dispatch.is_some()
                     || dispatch_answer
                         .as_ref()
@@ -2268,6 +2781,7 @@ pub(super) fn call_binding_expansions(
                         answer,
                         source_target.as_ref(),
                         Some(&arm.target_id),
+                        None,
                     );
                     python_constructor_selector_proven = true;
                 }
@@ -2286,7 +2800,8 @@ pub(super) fn call_binding_expansions(
                     && closed_model_selector_proof_for_external_target(analyzer, answer, &key)
                         .is_none()
                 {
-                    dispatch = CallBindingDispatch::from_answer(answer, None, Some(&arm.target_id));
+                    dispatch =
+                        CallBindingDispatch::from_answer(answer, None, Some(&arm.target_id), None);
                 }
                 target = CallBindingTarget::ResolvedExternal { layout, receiver };
                 model_callable_id = Some(resolved_model_callable_id);
@@ -2344,7 +2859,11 @@ pub(super) fn call_binding_expansions(
                 formal_layout_id: resolved_formal_layout_id,
                 pack_id: resolved_pack_id,
                 receiver_type_id: resolved_receiver_type_id,
+                possible_family,
             } => {
+                if possible_family {
+                    diagnostics.push(possible_family_binding_diagnostic(&file));
+                }
                 model_static_selector_proven = dispatch_answer
                     .as_ref()
                     .is_some_and(resolver_proven_static_model_selector);
@@ -2451,7 +2970,7 @@ pub(super) fn call_binding_expansions(
                 let id = model_signature_id(&symbol.id, signature);
                 target = CallBindingTarget::ResolvedExternal {
                     layout: model_formal_layout(signature, shape),
-                    receiver: model_receiver_binding(!symbol.is_static, false, shape),
+                    receiver: model_receiver_binding(!symbol.is_static, false, false, shape),
                 };
                 signature_id = Some(id.clone());
                 formal_layout_id = Some(id.clone());
@@ -2528,6 +3047,80 @@ pub(super) fn call_binding_expansions(
             }));
         }
     }
+    if let (Some(binding), Some(answer), Some(semantic)) =
+        (lexical_candidate, dispatch_answer.as_ref(), semantic)
+        && !incomplete_lookup_withholds_binding
+        && resolver_owned_external_dispatch.is_none()
+        && let Some(evidence) =
+            source_callable_evidence(analyzer, bindings, semantic, shape, answer, binding)
+    {
+        let layout = evidence.layout.clone();
+        {
+            let language = crate::analyzer::common::language_for_file(&file);
+            let application_proven = match layout.application {
+                SourceCallableApplication::NoReceiver => {
+                    matches!(language, Language::Rust | Language::Go)
+                        && shape.report.outcome.receiver_range.is_none()
+                }
+                SourceCallableApplication::JsArrow
+                | SourceCallableApplication::JsOrdinaryFunction
+                    if matches!(language, Language::JavaScript | Language::TypeScript) =>
+                {
+                    shape.report.outcome.receiver_range.is_none()
+                                // A complete selected procedure with no
+                                // captured environment has no lexical-this or
+                                // other capture application to transport.
+                                && evidence.target.handle.semantics().captures().is_empty()
+                                && shape
+                                    .report
+                                    .arguments
+                                    .iter()
+                                    .all(|arg| arg.name.is_none() && !arg.spread)
+                                && matches!(
+                                    semantic.selected_source_callable_argument_ordinals(
+                                        &file,
+                                        shape.report.outcome.range,
+                                        &evidence.call,
+                                        &evidence.target_key,
+                                        evidence.target.handle.semantics().locator(),
+                                        shape.report.arguments.len(),
+                                    ),
+                                    SourceCallableResult::Found(ordinals)
+                                        if ordinals.iter().enumerate().all(|(index, ordinal)| {
+                                            *ordinal == index
+                                                && layout.layout.slots.get(*ordinal).is_some()
+                                        })
+                                )
+                }
+                // Other language/application pairings have no
+                // selected source-callable contract in this reader.
+                SourceCallableApplication::JsOrdinaryFunction
+                | SourceCallableApplication::JsArrow => false,
+            };
+            if application_proven {
+                debug_assert_eq!(
+                    answer.call_contexts[evidence.call_context].call.as_ref(),
+                    Some(&evidence.call_key),
+                );
+                target = CallBindingTarget::ResolvedSourceProcedure {
+                    layout: layout.layout,
+                    receiver: CallReceiverBinding::Absent,
+                };
+                dispatch = CallBindingDispatch::from_answer(
+                    answer,
+                    None,
+                    None,
+                    Some((
+                        &evidence.target_key,
+                        evidence.target.handle.semantics().locator(),
+                    )),
+                );
+                semantic_target_id = dispatch.target_id.clone();
+                target_origin = Some("source");
+                source_procedure_layout_proven = true;
+            }
+        }
+    }
     if formal_layout_id.is_none() {
         formal_layout_id = signature_id.clone();
     }
@@ -2600,6 +3193,9 @@ pub(super) fn call_binding_expansions(
                 receiver: CallReceiverBinding::Absent,
                 ..
             } | CallBindingTarget::ResolvedIncomplete {
+                receiver: CallReceiverBinding::Absent,
+                ..
+            } | CallBindingTarget::ResolvedSourceProcedure {
                 receiver: CallReceiverBinding::Absent,
                 ..
             }
@@ -2751,7 +3347,7 @@ pub(super) fn call_binding_expansions(
         receiver_type_id = None;
     }
     let binding_is_complete = actual_binding_classification_is_complete(&report)
-        && (signature_id.is_some() || model_layout_compatible);
+        && (signature_id.is_some() || model_layout_compatible || source_procedure_layout_proven);
     // A direct Python name whose production resolver selected one workspace
     // declaration has an exact binding selector even when the semantic oracle
     // has no runtime dispatch target (unknown/open/0). This proves the
@@ -2761,8 +3357,8 @@ pub(super) fn call_binding_expansions(
         && crate::analyzer::common::language_for_file(&file) == Language::Python
         && shape.report.outcome.receiver_range.is_none()
         && native_resolution_gap.is_none()
-        && dispatch.outcome == "unknown"
-        && dispatch.coverage == "open"
+        && dispatch.status == DispatchStatus::Unknown
+        && dispatch.coverage_status == crate::analyzer::semantic::CandidateCoverage::Open
         && dispatch.target_count == 0
         && signature_id.is_some()
         && formal_layout_id.is_some();
@@ -2809,14 +3405,14 @@ pub(super) fn call_binding_expansions(
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: format!(
                 "call_bindings did not establish complete actual-to-formal coverage (dispatch outcome={}, coverage={}, target_count={}, binding coverage={})",
-                dispatch.outcome,
-                dispatch.coverage,
+                dispatch.status.label(),
+                dispatch.coverage_status.label(),
                 dispatch.target_count,
                 report.coverage.label(),
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }), match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
+        }), binding_incompleteness.execution_cause()));
     } else if has_semantic && !selector.exact && !diagnostic_terminal_decided {
         diagnostics.push(super::QueryExecutionState::diagnostic(analyzer, CodeQueryDiagnostic::new(CodeQueryDiagnostic {
             incompleteness: binding_incompleteness,
@@ -2828,11 +3424,11 @@ pub(super) fn call_binding_expansions(
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: format!(
                 "call_bindings established an exact declared target and actual-to-formal mapping, but exact selector proof remains unavailable (dispatch outcome={}, coverage={}, target_count={})",
-                dispatch.outcome, dispatch.coverage, dispatch.target_count,
+                dispatch.status.label(), dispatch.coverage_status.label(), dispatch.target_count,
             ),
         exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }), match dispatch.outcome { "cancelled" => Some(DerivationExecutionCause::Cancelled), "exceeded_budget" => Some(DerivationExecutionCause::Budget), _ if dispatch.coverage == "truncated" => Some(DerivationExecutionCause::Budget), _ => None }));
+        }), binding_incompleteness.execution_cause()));
     }
     let site = CallBindingSiteValue {
         report,
@@ -2946,6 +3542,9 @@ pub(super) fn structured_model_application(shape: &CallShapeValue) -> SemanticMo
 enum ResolvedCallTarget {
     DiagnosticModelCandidates(Box<ProjectedNativeModelMemberSelection>),
     Unit(ResolvedCallTargetUnit),
+    /// A successful production lookup of a source binder with no indexed
+    /// callable unit. The binder does not itself identify an initializer.
+    Lexical(crate::analyzer::resolution::lexical_definition::LexicalDefinition),
     Incomplete {
         unit: Option<CodeUnit>,
         diagnostics: Vec<DefinitionLookupDiagnostic>,
@@ -3014,10 +3613,23 @@ fn resolve_call_target(
     {
         return ResolvedCallTarget::DiagnosticModelCandidates(selection.clone());
     }
+    let lexical_definition = lookup.outcome.lexical_definition;
+    let lexical_source_available = !lookup.structure_unavailable
+        && !lookup.unproven_link_unit
+        && !lookup.truncated
+        && lookup.exact_external_call.is_none()
+        && incomplete_native_diagnostics.is_none();
     let mut definitions = lookup.outcome.definitions;
     definitions.sort();
     definitions.dedup();
     match definitions.len() {
+        0 if status == DefinitionLookupStatus::Resolved && lexical_source_available => {
+            match lexical_definition {
+                Some(definition) => ResolvedCallTarget::Lexical(definition),
+                None if native_selected => ResolvedCallTarget::UnresolvedNative,
+                None => ResolvedCallTarget::Unresolved,
+            }
+        }
         0 if native_selected => ResolvedCallTarget::UnresolvedNative,
         0 if status == DefinitionLookupStatus::Incomplete => ResolvedCallTarget::Incomplete {
             unit: None,

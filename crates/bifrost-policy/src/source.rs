@@ -918,6 +918,7 @@ struct Decoder {
 struct DecodedAnalysis {
     analysis: PolicyAnalysis,
     on_unknown: OnUnknownSpec,
+    completion_on_depth_bound_reached: bool,
 }
 
 impl Decoder {
@@ -1053,10 +1054,42 @@ impl Decoder {
         let DecodedAnalysis {
             analysis,
             on_unknown,
+            completion_on_depth_bound_reached,
         } = self.decode_analysis(fields.required("analysis"), "/analysis")?;
         let analysis_kind = analysis.analysis_type();
         let message = self.decode_message(fields.required("message"), analysis_kind)?;
         let severity = self.decode_severity(fields.required("severity"))?;
+        let proven_subset_reason = fields
+            .get("coverage")
+            .map(|value| {
+                if !matches!(
+                    analysis,
+                    PolicyAnalysis::Match { .. } | PolicyAnalysis::Taint { .. }
+                ) {
+                    return Err(source_error(
+                        "unsupported-policy-coverage",
+                        value.range.clone(),
+                        "proven-subset coverage is supported only for match and taint analyses",
+                    ));
+                }
+                let coverage = RecordCursor::parse(
+                    value,
+                    PolicyRecord::ProvenSubset,
+                    DecodeContext::policy(PolicyAnalysisKind::Match),
+                )?;
+                let reason = coverage.required("reason");
+                let text = expect_string(reason, "proven-subset reason", MAX_DISPLAY_TEXT_BYTES)?;
+                if text.trim().is_empty() {
+                    return Err(source_error(
+                        "empty-proven-subset-reason",
+                        reason.range.clone(),
+                        "proven-subset reason must not be empty",
+                    ));
+                }
+                self.map("/coverage/reason", reason);
+                Ok(text)
+            })
+            .transpose()?;
         let metadata = PolicyMetadata {
             id: parse_identifier(fields.required("id"), "policy ID")?,
             name: expect_string(fields.required("name"), "policy name", MAX_HUMAN_NAME_BYTES)?,
@@ -1067,6 +1100,7 @@ impl Decoder {
                 .map(|value| expect_string(value, "policy description", MAX_DISPLAY_TEXT_BYTES))
                 .transpose()?,
             help_uri: fields.get("help-uri").map(decode_help_uri).transpose()?,
+            proven_subset_reason,
             tags: fields
                 .get("tags")
                 .map(|value| decode_string_set(value, "policy tags", 0, MAX_STRING_VECTOR_ENTRIES))
@@ -1130,6 +1164,7 @@ impl Decoder {
             metadata,
             analysis,
             on_unknown,
+            completion_on_depth_bound_reached,
             classification,
             report,
         })
@@ -1725,6 +1760,11 @@ impl Decoder {
             .map(|value| self.decode_on_unknown(value, kind))
             .transpose()?
             .unwrap_or_default();
+        let completion_on_depth_bound_reached = fields
+            .get("completion")
+            .map(|value| self.decode_completion(value, kind))
+            .transpose()?
+            .unwrap_or(false);
         let analysis = match kind {
             PolicyAnalysisKind::Match => PolicyAnalysis::Match {
                 spec: MatchPolicySpec {
@@ -1751,6 +1791,7 @@ impl Decoder {
         Ok(DecodedAnalysis {
             analysis,
             on_unknown,
+            completion_on_depth_bound_reached,
         })
     }
 
@@ -1981,6 +2022,7 @@ impl Decoder {
             store_reads: Vec::new(),
             store_include_files: Vec::new(),
             finding_combinations: Vec::new(),
+            without_flow: None,
         })
     }
 
@@ -2248,6 +2290,11 @@ impl Decoder {
             .map(|value| self.decode_store_set(value, &format!("{path}/stores")))
             .transpose()?
             .unwrap_or_default();
+        let without_flow = fields
+            .get("without-flow")
+            .map(|value| self.decode_without_flow(value, &format!("{path}/without_flow")))
+            .transpose()?
+            .map(Box::new);
         let finding_combinations = fields
             .get("finding-combinations")
             .map(|value| {
@@ -2283,7 +2330,67 @@ impl Decoder {
             store_reads: stores.reads,
             store_include_files: stores.include_files,
             finding_combinations,
+            without_flow,
         })
+    }
+
+    fn decode_without_flow(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintWithoutFlowSpec, PolicySourceError> {
+        let fields = RecordCursor::parse(
+            expr,
+            PolicyRecord::WithoutFlow,
+            DecodeContext::policy(PolicyAnalysisKind::Taint),
+        )?;
+        let clause = TaintWithoutFlowSpec {
+            sources: self
+                .decode_source_set(fields.required("sources"), &format!("{path}/sources"))?,
+            sanitizers: fields
+                .get("sanitizers")
+                .map(|value| self.decode_sanitizer_set(value, &format!("{path}/sanitizers")))
+                .transpose()?
+                .unwrap_or_default(),
+            barriers: fields
+                .get("barriers")
+                .map(|value| self.decode_barrier_set(value, &format!("{path}/barriers")))
+                .transpose()?
+                .unwrap_or_default(),
+            transforms: fields
+                .get("transforms")
+                .map(|value| self.decode_transform_set(value, &format!("{path}/transforms")))
+                .transpose()?
+                .unwrap_or_default(),
+            external_models: fields
+                .get("external-models")
+                .map(|value| {
+                    self.decode_external_model_set(value, &format!("{path}/external_models"))
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        reject_without_flow_imports(&clause.sources, fields.required("sources"))?;
+        if clause.sources.entries.is_empty() {
+            return Err(source_error(
+                "without-flow-empty-sources",
+                fields.required("sources").range.clone(),
+                "`without-flow` requires at least one local source entry",
+            ));
+        }
+        if let Some(value) = fields.get("sanitizers") {
+            reject_without_flow_imports(&clause.sanitizers, value)?;
+        }
+        if let Some(value) = fields.get("barriers") {
+            reject_without_flow_imports(&clause.barriers, value)?;
+        }
+        if let Some(value) = fields.get("transforms") {
+            reject_without_flow_imports(&clause.transforms, value)?;
+        }
+        if let Some(value) = fields.get("external-models") {
+            reject_without_flow_imports(&clause.external_models, value)?;
+        }
+        Ok(clause)
     }
 
     fn decode_source_set(
@@ -3594,6 +3701,33 @@ impl Decoder {
         Ok(OnUnknownSpec { verdict })
     }
 
+    fn decode_completion(
+        &mut self,
+        expr: &Expr,
+        analysis: PolicyAnalysisKind,
+    ) -> Result<bool, PolicySourceError> {
+        let fields = RecordCursor::parse(
+            expr,
+            PolicyRecord::InconclusiveOn,
+            DecodeContext::policy(analysis),
+        )?;
+        let markers = expect_vector(
+            fields.positional(0).expect("required completion markers"),
+            "completion markers",
+            1,
+            1,
+        )?;
+        let marker = expect_atom(
+            &markers[0],
+            AtomDomain::CompletionMarker,
+            "completion marker",
+        )?;
+        Ok(matches!(
+            marker,
+            PolicyAtomValue::CompletionMarkerDepthBoundReached
+        ))
+    }
+
     fn decode_automaton(
         &mut self,
         expr: &Expr,
@@ -3678,6 +3812,57 @@ impl Decoder {
             event_graph.push(graph_node);
         }
         validate_named_graph(&event_graph, "typestate event")?;
+        let event_set = fields
+            .get("event-set")
+            .map(|value| {
+                let set = RecordCursor::parse(value, PolicyRecord::EventSet, context)?;
+                let name = namespaced_effect_id(set.required("name"), "event-set name")?;
+                let version = expect_u32(set.required("version"), "event-set version", false)?;
+                let effects =
+                    decode_string_set(set.required("effects"), "event-set effects", 1, 256)?;
+                for effect in &effects {
+                    validate_namespaced_effect_id(
+                        effect,
+                        set.required("effects"),
+                        "event-set effect",
+                    )?;
+                }
+                Ok::<_, PolicySourceError>(TypestateEventSetSpec {
+                    name,
+                    version,
+                    effects,
+                })
+            })
+            .transpose()?;
+        if let Some(set) = &event_set {
+            if !events.iter().any(|event| event.semantic_effect.is_some()) {
+                return Err(source_error(
+                    "event-set-without-mapped-event",
+                    fields.required("event-set").range.clone(),
+                    "event set has no mapped event",
+                ));
+            }
+            for event in &events {
+                if let Some(effect) = &event.semantic_effect
+                    && !set.effects.contains(effect)
+                {
+                    return Err(source_error(
+                        "semantic-effect-outside-event-set",
+                        fields.required("event-set").range.clone(),
+                        format!(
+                            "event `{}` maps effect `{effect}` outside the event set",
+                            event.id
+                        ),
+                    ));
+                }
+            }
+        } else if events.iter().any(|event| event.semantic_effect.is_some()) {
+            return Err(source_error(
+                "missing-event-set",
+                expr.range.clone(),
+                "mapped typestate events require an event set",
+            ));
+        }
 
         let transition_values = expect_vector(
             fields.required("transitions"),
@@ -3766,6 +3951,7 @@ impl Decoder {
         });
         terminal_expectations.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
         Ok(TypestateAutomatonSpec {
+            event_set,
             states,
             initial,
             accepting_states,
@@ -3832,6 +4018,25 @@ impl Decoder {
                 ));
             }
         };
+        let semantic_effect = fields
+            .get("semantic-effect")
+            .map(|value| namespaced_effect_id(value, "semantic effect"))
+            .transpose()?;
+        if semantic_effect.is_some()
+            && matches!(
+                &trigger,
+                TypestateEventTrigger::Calls {
+                    argument_condition: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(source_error(
+                "conditional-semantic-effect",
+                fields.required("semantic-effect").range.clone(),
+                "a mapped semantic effect cannot have a call-argument condition",
+            ));
+        }
         let supersedes = fields
             .get("supersedes")
             .map(|value| {
@@ -3852,6 +4057,7 @@ impl Decoder {
         Ok((
             TypestateEventSpec {
                 id,
+                semantic_effect,
                 trigger,
                 applies_to_subjects: fields
                     .get("applies-to-subjects")
@@ -5283,6 +5489,23 @@ struct DecodedStoreEntryFields {
     instance: Option<PolicyPort>,
 }
 
+fn reject_without_flow_imports<T>(
+    set: &TaintEndpointSet<T>,
+    expr: &Expr,
+) -> Result<(), PolicySourceError> {
+    if !set.include_files.is_empty()
+        || !set.include_sets.is_empty()
+        || !set.include_matches.is_empty()
+    {
+        return Err(source_error(
+            "without-flow-imports-unsupported",
+            expr.range.clone(),
+            "`without-flow` accepts local :entries only; include-files, include-sets and include-matches are not supported there yet",
+        ));
+    }
+    Ok(())
+}
+
 struct DecodedMatchEndpointSet {
     set: MatchEndpointSetRef,
     role: Option<EndpointRole>,
@@ -5305,6 +5528,7 @@ fn empty_taint_policy_spec() -> TaintPolicySpec {
         store_reads: Vec::new(),
         store_include_files: Vec::new(),
         finding_combinations: Vec::new(),
+        without_flow: None,
     }
 }
 
@@ -5721,6 +5945,27 @@ fn select_record(
                 ),
             )
         })
+}
+
+fn validate_namespaced_effect_id(
+    value: &str,
+    expr: &Expr,
+    what: &str,
+) -> Result<(), PolicySourceError> {
+    if value.len() > 256 || !value.contains('.') || !is_valid_namespaced_identifier(value) {
+        return Err(source_error(
+            "invalid-semantic-effect-id",
+            expr.range.clone(),
+            format!("{what} must be a namespaced stable identifier"),
+        ));
+    }
+    Ok(())
+}
+
+fn namespaced_effect_id(expr: &Expr, what: &str) -> Result<String, PolicySourceError> {
+    let value = expect_string(expr, what, 256)?;
+    validate_namespaced_effect_id(&value, expr, what)?;
+    Ok(value)
 }
 
 fn expect_string(expr: &Expr, what: &str, max_bytes: usize) -> Result<String, PolicySourceError> {
@@ -8294,7 +8539,9 @@ mod tests {
         use sha2::{Digest, Sha256};
         assert_eq!(bytes.len(), 3556);
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(&bytes).into()
+            ),
             "852d262aadaf40cfbb3a6b0d7848ea2f6456bf51b34c56d3982da2431d6de40c"
         );
         assert_eq!(
@@ -8317,7 +8564,9 @@ mod tests {
         use sha2::{Digest, Sha256};
         assert_eq!(bytes.len(), 1003);
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(&bytes).into()
+            ),
             "0420a24cd71ca9110162d7977d879c5d59e9f56af72d8c8983abe60721afdd21"
         );
     }
@@ -8882,6 +9131,60 @@ mod tests {
     }
 
     #[test]
+    fn decodes_without_flow_clause_and_rejects_a_sink_inside_it() {
+        let policy = r#"(policy :schema-version 1 :id "test.negative" :name "Negative"
+          :message "negative" :severity warning
+          :analysis (analysis :type taint :mode may
+            :sources (endpoint-set :entries [(source :id a :display-name "A"
+              :categories [input.user-controlled]
+              :selector (rql :schema-version 1 (language rust (call)))
+              :bind return-value :labels [attacker-controlled])])
+            :sinks (endpoint-set :entries [(sink :id s :display-name "S"
+              :categories [sink]
+              :selector (rql :schema-version 1 (language rust (call)))
+              :dangerous-operand (argument :index 0)
+              :accepts [attacker-controlled])])
+            :without-flow (without-flow
+              :sources (endpoint-set :entries [(source :id b :display-name "B"
+                :categories [input.user-controlled]
+                :selector (rql :schema-version 1 (language rust (call)))
+                :bind return-value :labels [partitioned])]))))"#;
+        let parsed = parse(policy).expect("secondary clause parses");
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("policy document expected")
+        };
+        let PolicyAnalysis::Taint { spec } = definition.analysis else {
+            panic!("taint analysis expected")
+        };
+        assert_eq!(spec.without_flow.as_ref().unwrap().sources.entries.len(), 1);
+        let invalid = policy.replace(
+            ":without-flow (without-flow",
+            ":without-flow (without-flow :sinks (endpoint-set :entries [])",
+        );
+        assert!(parse(&invalid).is_err(), "B must not declare sinks");
+        let prefix = policy.split(":without-flow").next().unwrap();
+        let empty =
+            format!("{prefix}:without-flow (without-flow :sources (endpoint-set :entries []))))");
+        assert!(
+            parse(&empty)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one local source"),
+            "B must name a local source"
+        );
+        let imported = format!(
+            "{prefix}:without-flow (without-flow :sources (endpoint-set :include-files [(endpoint-set-file :path \"sources.rqlp\")]))))"
+        );
+        assert!(
+            parse(&imported)
+                .unwrap_err()
+                .to_string()
+                .contains("local :entries only"),
+            "B imports have a clause-specific diagnostic"
+        );
+    }
+
+    #[test]
     fn decodes_set_oriented_taint_policy_and_specific_combination() {
         let parsed = parse(
             r#"(policy
@@ -8988,6 +9291,69 @@ mod tests {
         assert_eq!(spec.automaton.events.len(), 1);
         assert_eq!(spec.automaton.transitions.len(), 1);
         assert_eq!(spec.automaton.terminal_expectations.len(), 1);
+    }
+
+    #[test]
+    fn typestate_semantic_effect_set_validates_mapping_and_condition() {
+        let source = r#"(policy :id "test.coverage" :name "Coverage" :message "M" :severity warning
+          :analysis (analysis :type typestate :mode may
+            :subjects (subject-set :entries [])
+            :uncertainty (uncertainty :escape inconclusive)
+            :automaton (automaton :states [open closed error] :initial open
+              :accepting-states [closed] :error-states [error]
+              :event-set (event-set :name "test.resource" :version 1 :effects ["test.release"])
+              :events [(event :id close :semantic-effect "test.release"
+                :calls (calls :selector (rql (call :callee (name "Close")))
+                  :subject receiver :phase after-normal-return))]
+              :transitions [(transition :from open :on close :to closed)])))"#;
+        let parsed = parse(source).expect("mapped effect and event set parse");
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("policy")
+        };
+        let PolicyAnalysis::Typestate { spec } = definition.analysis else {
+            panic!("typestate")
+        };
+        assert_eq!(
+            spec.automaton.event_set.as_ref().unwrap().name,
+            "test.resource"
+        );
+        assert_eq!(
+            spec.automaton.events[0].semantic_effect.as_deref(),
+            Some("test.release")
+        );
+        for (replacement, expected) in [
+            (
+                ":effects [\"test.other\"]",
+                "semantic-effect-outside-event-set",
+            ),
+            (
+                ":semantic-effect \"test.release\"",
+                "event-set-without-mapped-event",
+            ),
+        ] {
+            let invalid = if expected == "event-set-without-mapped-event" {
+                source.replace(replacement, "")
+            } else {
+                source.replace(":effects [\"test.release\"]", replacement)
+            };
+            assert_eq!(parse(&invalid).unwrap_err().diagnostic.code, expected);
+        }
+        let conditional = source.replace(":subject receiver :phase after-normal-return",
+            ":subject receiver :phase after-normal-return :condition (argument-condition :argument (argument :index 0) :equals true)");
+        assert_eq!(
+            parse(&conditional).unwrap_err().diagnostic.code,
+            "conditional-semantic-effect"
+        );
+        let invalid_name = source.replace("test.resource", "resource");
+        assert_eq!(
+            parse(&invalid_name).unwrap_err().diagnostic.code,
+            "invalid-semantic-effect-id"
+        );
+        let invalid_effect = source.replace("test.release", "release");
+        assert_eq!(
+            parse(&invalid_effect).unwrap_err().diagnostic.code,
+            "invalid-semantic-effect-id"
+        );
     }
 
     #[test]

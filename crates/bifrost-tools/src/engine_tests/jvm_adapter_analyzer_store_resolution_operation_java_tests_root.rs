@@ -76,9 +76,9 @@ pub(crate) mod jvm_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::store::WorkspacePackageFileRow;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseCandidateOutcome;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::nominal_reverse::NominalReverseCandidateOutcome;
 
-    use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseConfirmed;
+    use brokk_bifrost_analysis::analyzer::store::resolution_operation::nominal_reverse::NominalReverseConfirmed;
 
     #[test]
     fn selected_java_import_token_provenance_survives_remount() {
@@ -303,14 +303,14 @@ pub(crate) mod jvm_extraction_tests {
             .site;
         let before_nomination = operation.ready.inventory.read_change_stamp().unwrap();
         let candidates = operation
-            .jvm_reverse_candidate_sites(&target, &cancellation)
+            .nominal_reverse_candidate_sites(&target, &cancellation)
             .unwrap();
         assert_eq!(
             operation.ready.inventory.read_change_stamp().unwrap(),
             before_nomination,
             "private reverse request keys must not invalidate selected authority",
         );
-        let JvmReverseCandidateOutcome::Ready(candidates) = candidates else {
+        let NominalReverseCandidateOutcome::Ready(candidates) = candidates else {
             panic!("selected JVM candidate inventory must be ready");
         };
         assert!(
@@ -322,7 +322,7 @@ pub(crate) mod jvm_extraction_tests {
             "the Scala usage reference must enter the shared JVM candidate set: {candidates:#?}"
         );
         let confirmed = operation
-            .confirm_jvm_reverse_candidates(
+            .confirm_nominal_reverse_candidates(
                 candidates,
                 &cancellation,
                 &mut SelectedResolutionContextMetrics,
@@ -507,7 +507,7 @@ pub(crate) mod jvm_extraction_tests {
             |_| {},
             |store, oid| {
                 let oid = oid.to_owned();
-                store.conn.execute(move |connection| {
+                store.conn.execute_fixture(move |connection| {
                 connection.execute(
                     "UPDATE resolution_sites SET owner=-1 WHERE role=0 AND blob_id IN (SELECT id FROM blobs WHERE blob_oid=?1)",
                     [oid],
@@ -553,14 +553,14 @@ pub(crate) mod jvm_extraction_tests {
         let query = |cancellation: &CancellationToken| {
             let admission = CancellationToken::new();
             let operation = fixture.open_ready(&admission);
-            let JvmReverseCandidateOutcome::Ready(candidates) = operation
-                .jvm_reverse_candidate_sites(target, &admission)
+            let NominalReverseCandidateOutcome::Ready(candidates) = operation
+                .nominal_reverse_candidate_sites(target, &admission)
                 .unwrap()
             else {
                 panic!("the candidate inventory is available before cancellation")
             };
             operation
-                .confirm_jvm_reverse_candidates(
+                .confirm_nominal_reverse_candidates(
                     candidates,
                     cancellation,
                     &mut SelectedResolutionContextMetrics,
@@ -568,7 +568,7 @@ pub(crate) mod jvm_extraction_tests {
                 .unwrap()
                 .0
         };
-        let render = |confirmed: &JvmReverseConfirmed| {
+        let render = |confirmed: &NominalReverseConfirmed| {
             let mut rows = confirmed
             .references
             .iter()
@@ -643,7 +643,7 @@ pub(crate) mod jvm_extraction_tests {
         adapter: &A,
         prepare_peer: impl FnOnce(&mut FileState),
         before_confirm: impl FnOnce(&AnalyzerStore, &str),
-    ) -> (JvmReverseConfirmed, ResolutionSiteId) {
+    ) -> (NominalReverseConfirmed, ResolutionSiteId) {
         let project_root = tempfile::tempdir().unwrap();
         let store = AnalyzerStore::open_persistent(&project_root.path().join("store.db")).unwrap();
         let project = MutableGenerationProject::new(project_root.path(), Language::Java);
@@ -787,9 +787,9 @@ pub(crate) mod jvm_extraction_tests {
             .cloned()
             .expect("Java target declaration");
         let candidates = operation
-            .jvm_reverse_candidate_sites(&target, &cancellation)
+            .nominal_reverse_candidate_sites(&target, &cancellation)
             .unwrap();
-        let JvmReverseCandidateOutcome::Ready(candidates) = candidates else {
+        let NominalReverseCandidateOutcome::Ready(candidates) = candidates else {
             panic!("selected JVM candidate inventory must be ready");
         };
 
@@ -852,7 +852,7 @@ pub(crate) mod jvm_extraction_tests {
         );
         before_confirm(&store, &peer_oid.to_string());
         let confirmed = operation
-            .confirm_jvm_reverse_candidates(
+            .confirm_nominal_reverse_candidates(
                 candidates,
                 &cancellation,
                 &mut SelectedResolutionContextMetrics,

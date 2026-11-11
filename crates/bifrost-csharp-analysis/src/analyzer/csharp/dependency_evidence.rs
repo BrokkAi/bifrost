@@ -16,21 +16,16 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use brokk_bifrost_analysis::analyzer::configuration::{
-    ConfigurationIngestionOutcome, ingest_configuration_document,
-};
+use brokk_bifrost_analysis::analyzer::configuration::{DocumentSpans, decode_json_document};
 use brokk_bifrost_analysis::analyzer::semantic::topology::DependencyScope;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     DependencyCondition, DependencyEvidence, DependencyEvidenceGap, DependencyEvidenceGapKind,
     DependencyEvidenceKind, DependencyFileEvidence, DependencyFileEvidenceLimits,
-    VersionComparator, parse_version_comparators, version_bounds_admit,
+    VersionComparator, parse_version_comparators, parse_version_interval, version_bounds_admit,
 };
 use brokk_bifrost_analysis::analyzer::topology::{
     TopologyCompleteness, TopologyEntity, TopologyEntityKind, TopologyProvenance,
     TopologyProvenanceKind,
-};
-use brokk_bifrost_core::analyzer::configuration::{
-    ConfigurationNodeKind, ConfigurationRouteSelector,
 };
 use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot;
@@ -38,7 +33,13 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use serde_json::Value;
 
+use super::compilation::{
+    ConfigurationByPath, NearestConfiguration, configuration_by_path, nearest_configuration,
+};
 use super::compilation::{attribute, element_attributes};
+use brokk_bifrost_analysis::analyzer::store::csharp_compilation::{
+    CSharpConfigurationInput, CSharpConfigurationSource,
+};
 
 const ECOSYSTEM: &str = "nuget";
 const FRAMEWORK_SOURCE: &str = "framework";
@@ -116,13 +117,35 @@ struct Input<'a> {
 /// selected C# revision.
 pub(crate) fn csharp_selected_dependency_file_evidence(
     selected: &[(ProjectFile, ProjectSourceSnapshot)],
+    presence: &[Option<bool>],
     limits: &DependencyFileEvidenceLimits,
 ) -> DependencyFileEvidence {
+    assert_eq!(selected.len(), presence.len());
+    let configuration = selected
+        .iter()
+        .zip(presence)
+        .map(|((file, source), presence)| {
+            let source = match presence {
+                Some(false) => CSharpConfigurationSource::Absent,
+                Some(true) => CSharpConfigurationSource::Bytes(source.source().as_bytes().into()),
+                None => CSharpConfigurationSource::Capped,
+            };
+            CSharpConfigurationInput {
+                rel_path: portable(file.rel_path()),
+                source,
+            }
+        })
+        .collect::<Vec<_>>();
+    let configuration_by_path = configuration_by_path(&configuration);
     let mut evidence = DependencyFileEvidence::default();
     let mut inputs = Vec::new();
-    for (file, source) in selected
-        .iter()
-        .filter(|(file, _)| is_nuget_evidence_input(file.rel_path()))
+    for ((file, source), _present) in
+        selected
+            .iter()
+            .zip(presence)
+            .filter(|((file, _), present)| {
+                is_nuget_evidence_input(file.rel_path()) && **present != Some(false)
+            })
     {
         let digest = source.oid().to_string();
         if blob_oid(source.source()) != digest {
@@ -185,7 +208,7 @@ pub(crate) fn csharp_selected_dependency_file_evidence(
     }
     for input in &inputs {
         let result = if has_extension(input.path, "csproj") {
-            project_rows(input, &central, &mut evidence)
+            project_rows(input, &central, &configuration_by_path, &mut evidence)
         } else if is_named(input.path, "packages.lock.json") {
             lock_rows(input, &projects, &mut evidence)
         } else if is_named(input.path, "project.assets.json") {
@@ -235,15 +258,26 @@ struct CentralVersions {
     versions: BTreeMap<String, Option<String>>,
 }
 
-/// The nearest ancestor `Directory.Packages.props`, as MSBuild imports it.
+/// The first proven-present ancestor is authoritative even when its bytes
+/// are empty or malformed. Unknown presence cannot justify a farther file.
 fn central_for<'a>(
     project: &Path,
     central: &'a BTreeMap<PathBuf, CentralVersions>,
-) -> Option<&'a CentralVersions> {
-    project
-        .parent()?
-        .ancestors()
-        .find_map(|directory| central.get(directory))
+    configuration: &ConfigurationByPath<'_>,
+) -> Result<Option<&'a CentralVersions>, String> {
+    let directory = project.parent().expect("project parent");
+    match nearest_configuration(configuration, directory, "Directory.Packages.props") {
+        NearestConfiguration::Absent => Ok(None),
+        NearestConfiguration::Unknown(candidate) => Err(format!(
+            "Directory.Packages.props candidate {candidate:?} has unknown presence"
+        )),
+        NearestConfiguration::Found(path) => central
+            .get(&parent(Path::new(path)))
+            .map(Some)
+            .ok_or_else(|| {
+                format!("Directory.Packages.props {path:?} is not a readable configuration input")
+            }),
+    }
 }
 
 /// One NuGet item read from MSBuild XML, with its exact element span.
@@ -392,6 +426,7 @@ fn parse_msbuild(source: &str) -> Result<MsbuildDocument, String> {
 fn project_rows(
     input: &Input<'_>,
     central: &BTreeMap<PathBuf, CentralVersions>,
+    configuration: &ConfigurationByPath<'_>,
     evidence: &mut DependencyFileEvidence,
 ) -> Result<(), String> {
     let document = parse_msbuild(input.text)
@@ -410,16 +445,28 @@ fn project_rows(
                     Some(owner.clone()),
                     conditions,
                 );
-                if row.version_requirement.is_none()
-                    && let Some(central) = central_for(input.path, central)
-                    && let Some(version) = central.versions.get(&item.include.to_ascii_lowercase())
-                {
-                    row.complete = version.as_deref().is_some_and(is_static_value);
-                    row.version_requirement = version.clone();
-                    row.conditions.push(condition(
-                        "nuget.central_version_file",
-                        portable(&central.path),
-                    ));
+                if row.version_requirement.is_none() {
+                    match central_for(input.path, central, configuration) {
+                        Ok(Some(central)) => {
+                            if let Some(version) =
+                                central.versions.get(&item.include.to_ascii_lowercase())
+                            {
+                                row.complete = version.as_deref().is_some_and(is_static_value);
+                                row.version_requirement = version.clone();
+                                row.conditions.push(condition(
+                                    "nuget.central_version_file",
+                                    portable(&central.path),
+                                ));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(reason) => evidence.gaps.push(gap(
+                            DependencyEvidenceGapKind::Unresolved,
+                            input.path,
+                            item.range.clone(),
+                            reason,
+                        )),
+                    }
                 }
                 if row.version_requirement.is_none() {
                     evidence.gaps.push(gap(
@@ -485,50 +532,14 @@ fn owning_project(
     }
 }
 
-/// Exact member spans keyed by the member's key route.
-type JsonSpans = BTreeMap<Vec<String>, std::ops::Range<usize>>;
-
-/// Parse JSON once for values and once through the configuration ingester for
-/// exact member spans.
-fn json_document(input: &Input<'_>) -> Result<(Value, JsonSpans), String> {
-    let facts = match ingest_configuration_document(input.path, input.text.as_bytes()) {
-        ConfigurationIngestionOutcome::Facts(facts) if facts.completeness().is_complete() => facts,
-        outcome => {
-            return Err(format!(
-                "JSON parser did not establish clean input: {outcome:?}"
-            ));
-        }
-    };
-    let mut spans = BTreeMap::new();
-    for fact in facts.facts() {
-        if !matches!(fact.kind(), ConfigurationNodeKind::Member { .. }) {
-            continue;
-        }
-        let mut route = Vec::new();
-        for segment in fact.route().segments() {
-            match segment.selector() {
-                ConfigurationRouteSelector::Key { occurrence, .. } if *occurrence > 1 => {
-                    return Err("duplicate JSON member".into());
-                }
-                ConfigurationRouteSelector::Key { name, .. } => route.push(name.clone()),
-                ConfigurationRouteSelector::Index(_) => break,
-            }
-        }
-        let range = fact.evidence();
-        spans.insert(route, range.start_byte()..range.end_byte());
-    }
-    let value = serde_json::from_str(input.text).map_err(|error| error.to_string())?;
-    Ok((value, spans))
+fn json_document(input: &Input<'_>) -> Result<(Value, DocumentSpans), String> {
+    decode_json_document(input.path, input.text)
 }
 
-fn span(spans: &JsonSpans, route: &[&str]) -> Result<std::ops::Range<usize>, String> {
-    let key = route
-        .iter()
-        .map(|part| (*part).to_owned())
-        .collect::<Vec<_>>();
+fn span(spans: &DocumentSpans, route: &[&str]) -> Result<std::ops::Range<usize>, String> {
     spans
-        .get(&key)
-        .cloned()
+        .member(route)
+        .map(|range| range.start_byte()..range.end_byte())
         .ok_or_else(|| format!("JSON member {route:?} has no source span"))
 }
 
@@ -895,7 +906,7 @@ impl NugetVersionRange {
                     ));
                 }
                 let bounds = if alternative.starts_with(['[', '(']) {
-                    interval(alternative)?
+                    parse_version_interval(alternative, NugetVersion::parse)?
                 } else {
                     comparators(alternative)?
                 };
@@ -911,53 +922,6 @@ impl NugetVersionRange {
     pub fn matches(&self, version: &NugetVersion) -> bool {
         version_bounds_admit(&self.alternatives, version)
     }
-}
-
-fn interval(text: &str) -> Result<Vec<(VersionComparator, NugetVersion)>, String> {
-    let invalid = || format!("{text:?} is not NuGet interval notation");
-    let inclusive_lower = text.starts_with('[');
-    let inclusive_upper = text.ends_with(']');
-    if !text.ends_with([']', ')']) || text.len() < 2 {
-        return Err(invalid());
-    }
-    let inner = &text[1..text.len() - 1];
-    let Some((lower, upper)) = inner.split_once(',') else {
-        // Only `[1.0]` is an exact interval; `(1.0)` is empty.
-        if !(inclusive_lower && inclusive_upper) {
-            return Err(invalid());
-        }
-        return Ok(vec![(
-            VersionComparator::Equal,
-            NugetVersion::parse(inner)?,
-        )]);
-    };
-    let (lower, upper) = (lower.trim(), upper.trim());
-    if (lower.is_empty() && upper.is_empty()) || upper.contains(',') {
-        return Err(invalid());
-    }
-    let mut bounds = Vec::new();
-    if !lower.is_empty() {
-        let comparator = if inclusive_lower {
-            VersionComparator::GreaterOrEqual
-        } else {
-            VersionComparator::Greater
-        };
-        bounds.push((comparator, NugetVersion::parse(lower)?));
-    }
-    if !upper.is_empty() {
-        let comparator = if inclusive_upper {
-            VersionComparator::LessOrEqual
-        } else {
-            VersionComparator::Less
-        };
-        bounds.push((comparator, NugetVersion::parse(upper)?));
-    }
-    if let [(_, lower), (_, upper)] = bounds.as_slice()
-        && lower > upper
-    {
-        return Err(format!("{text:?} has a lower bound above its upper bound"));
-    }
-    Ok(bounds)
 }
 
 fn comparators(text: &str) -> Result<Vec<(VersionComparator, NugetVersion)>, String> {
@@ -997,6 +961,60 @@ pub fn nuget_dependency_version_matches(
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#8837: an empty nearer central package file was skipped for a farther version")]
+    fn nearest_central_package_file_respects_proven_presence() {
+        let root = std::env::current_dir().unwrap();
+        let files = [
+            (
+                "Directory.Packages.props",
+                "<Project><ItemGroup><PackageVersion Include=\"Pkg\" Version=\"1.2.3\" /></ItemGroup></Project>",
+            ),
+            ("nested/Directory.Packages.props", ""),
+            (
+                "nested/App.csproj",
+                "<Project><ItemGroup><PackageReference Include=\"Pkg\" /></ItemGroup></Project>",
+            ),
+        ];
+        let selected = files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    ProjectFile::new(&root, PathBuf::from(path)),
+                    ProjectSourceSnapshot::disk_bytes(bytes.as_bytes().to_vec()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let limits = DependencyFileEvidenceLimits::default();
+        let present =
+            csharp_selected_dependency_file_evidence(&selected, &[Some(true); 3], &limits);
+        let declared = |evidence: &DependencyFileEvidence| {
+            evidence
+                .rows
+                .iter()
+                .find(|row| {
+                    row.package.eq_ignore_ascii_case("Pkg")
+                        && row.kind == DependencyEvidenceKind::Declared
+                })
+                .and_then(|row| row.version_requirement.clone())
+        };
+        assert_eq!(declared(&present), None);
+        assert!(
+            present
+                .gaps
+                .iter()
+                .any(|gap| gap.message.contains("not a readable configuration input"))
+        );
+
+        let absent = csharp_selected_dependency_file_evidence(
+            &selected,
+            &[Some(true), Some(false), Some(true)],
+            &limits,
+        );
+        assert_eq!(declared(&absent), Some("1.2.3".into()));
+    }
     use super::*;
 
     #[test]

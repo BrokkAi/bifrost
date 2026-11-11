@@ -149,7 +149,7 @@ fn location_scan_recovery_names_the_location_tool() {
     );
     let entry = &result.results[0];
     assert_eq!(
-        entry.incomplete_reason,
+        entry.completion.incomplete_reason(),
         Some(ScanUsagesIncompleteReason::UnmatchedPaths)
     );
     let recovery = entry.message.as_deref().unwrap_or_default();

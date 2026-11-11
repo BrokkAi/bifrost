@@ -41,7 +41,8 @@ type WorkspacePathSnapshot = (Arc<GoWorkspacePathIndex>, StableDigest);
 #[derive(Clone)]
 pub(crate) struct GoMemoCaches {
     budget_bytes: u64,
-    pub(crate) imported_code_units: GoFileMemo<Arc<HashSet<CodeUnit>>>,
+    pub(crate) imported_code_units:
+        GoFileMemo<Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>>,
     pub(crate) source_facts: GoSourceMemo,
     pub(crate) referencing_files: GoFileMemo<Arc<HashSet<ProjectFile>>>,
     pub(crate) reverse_import_index: WorkspaceAuthorityMemo<Arc<PoolSafeMemo<GoReverseImports>>>,
@@ -70,7 +71,12 @@ impl GoMemoCaches {
             budget_bytes,
             imported_code_units: ReplayingMemo::new(build_weighted_cache(
                 budget_bytes / 4,
-                |_, entry: &Arc<GoMemoEntry<Arc<HashSet<CodeUnit>>>>| memo_weight(entry),
+                |_,
+                 entry: &Arc<
+                    GoMemoEntry<
+                        Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
+                    >,
+                >| memo_weight(entry),
             )),
             source_facts: ReplayingMemo::new(build_weighted_cache(
                 budget_bytes / 8,

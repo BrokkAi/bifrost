@@ -1,6 +1,6 @@
 ---
 title: Semantic Pack Reference
-description: Every field of the semantic-model pack format, the .bifrost/packs.json document, the shipped packs, and the pack commands.
+description: Every field of the semantic-model pack format, the .bifrost/packs.json document, and the pack commands.
 ---
 
 This page lists every part of the semantic-model pack format and the tools that
@@ -8,7 +8,7 @@ work with it. For an explanation of how packs are authored, activated, and used,
 read [Semantic-Model Packs](/semantic-model-packs/).
 
 The sources of truth are the Rust types that the JSON schema is generated from,
-the pack validator, the embedded pack registry, and the command-line parsers.
+the pack validator, and the command-line parsers.
 You can print some of these lists from a binary:
 
 | Command | Prints |
@@ -20,9 +20,9 @@ You can print some of these lists from a binary:
 ## Schema versions
 
 Every authored pack declares `schema_version`. This build reads versions `2`
-through `22`, inclusive. Its newest version is `22`. Version `1` and
-any other value fail with `schema.unsupported_version`. The field is
-required; there is no default.
+through `22`, inclusive, and versions `26` through `32`. Its newest version is
+`32`. Version `1`, versions `23` through `25`, and any other value fail with
+`schema.unsupported_version`. The field is required; there is no default.
 
 `bifrost-semantic-pack generate` writes each pack produced from a pinned
 artifact at the lowest version its content needs: the highest version gate in
@@ -34,7 +34,9 @@ schema-19 extraction authority, so their output requires at least version 19.
 C# assembly packs also carry assembly identities, requiring version 20. JVM
 packs that record enclosing type parameters on owner inventories require
 version 21. Rust packs that state `drop_glue` in value semantics require
-version 22.
+version 22. Packs whose procedure summaries carry lifecycle subject effects or
+coverage claims require version 26. Packs without those claims are still
+written at version 22 or lower.
 
 A field is accepted only in a pack whose `schema_version` is at least the
 version that introduced it. A pack that declares an earlier version and uses
@@ -63,6 +65,10 @@ of an older version parse every pack that it accepts by number.
 | 20 | `assembly_identity` and non-empty `type_forwards` on declaration payloads. | `schema.assembly_identity_version`, `schema.type_forwards_version` |
 | 21 | Non-empty `enclosing_type_parameters` on JVM owner inventories. | `jvm_inventory.schema_version` |
 | 22 | `drop_glue` in `value_semantics` on Rust type facts. | `declaration.drop_glue_schema_version` |
+| 26 | Non-empty `subject_effects` and `lifecycle_coverage` on procedure summaries: reviewed receiver lifecycle effects and exhaustive event-set coverage claims. Versions 23 through 25 are not defined. | `summary.lifecycle_schema_version` |
+| 30 | `tuple_fields` on Rust struct facts: every ordinal is public with a reference to a same-shard, public field member named by decimal position and a structured type, or opaque with its visibility reason. Absence means unknown; completeness is derived only when every slot is public and the owner is neither hidden nor non-exhaustive. Schema 29 carries the SQLx facade re-export carrier. | `declaration.tuple_fields_schema_version` |
+| 31 | Reviewed Rust destruction: `drop_effects` and the required `drop_review` scope on Rust struct and enum facts. | `declaration.drop_effects_schema_version` |
+| 32 | Optional `alias_target` on type aliases, expressed over their own parameters. | `declaration.alias_target_schema_version` |
 
 A declaration payload can record its provider's `assembly_identity` and a
 `type_forwards` vector. Forward names retain CLR spelling, including generic
@@ -80,16 +86,18 @@ forward rows.
 ### JSON schema files
 
 The generated JSON schema is
-[`schemas/semantic-model-pack-v22.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v22.schema.json).
+[`schemas/semantic-model-pack-v32.schema.json`](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-pack-v32.schema.json).
 `cargo run --profile measure --example generate_semantic_model_schema` writes it from the Rust
 type `AuthoredSemanticModelPack`, and a repository test requires the
 checked-in file to match the generated schema exactly. The file describes
 every field of every supported version, and it accepts `schema_version` from
-`2` through `22`. It requires `compatibility.bifrost` for versions `2` through
-`7` and forbids it for versions `8` and newer. It does not express the other
-per-field version gates in the table above; the validator enforces them.
+`2` through `22` and `26` through `32`, and rejects `23` through `25`. It
+requires `compatibility.bifrost` for versions `2` through `7` and forbids it
+for versions `8` and newer. It does not express the other per-field version
+gates in the table above; the validator enforces them.
 
-The schema files for earlier versions remain checked in; there is no v7 file.
+The schema files for earlier versions remain checked in; there is no v7 file
+and no file for versions 23 through 25.
 The v8 file accepts versions `2` through `8`, requires `compatibility.bifrost`
 through version `7`, and forbids it for version `8`.
 
@@ -100,7 +108,7 @@ fields. Every variant is tagged by a `kind` (or `op`) field.
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `schema_version` | integer, 2 to 22 | yes | The pack format version. See [Schema versions](#schema-versions). |
+| `schema_version` | integer, 2 to 22, 26 to 30 | yes | The pack format version. See [Schema versions](#schema-versions). |
 | `pack_id` | stable ID | yes | The pack identity. |
 | `version` | SemVer version | yes | The pack version. |
 | `producer` | `{name, version}` | yes | The tool that produced the pack. `name` is non-empty text; `version` is a SemVer version. |
@@ -122,7 +130,7 @@ Compiled schema-19 manifests and shard envelopes may contain `extraction`:
 paths supply this claim in memory; authored documents reject the field. Every
 shard must agree with its manifest. Both semantic digests include the claim,
 and older or curated packs without it have no extraction authority. The
-[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v22.schema.json)
+[compiled-manifest schema](https://github.com/BrokkAi/bifrost/blob/master/schemas/semantic-model-compiled-manifest-v32.schema.json)
 describes this envelope separately from the authoring format.
 
 A **stable ID** is 1 to 256 bytes of lowercase ASCII letters, digits, `.`,
@@ -1189,7 +1197,7 @@ None of these resolvers downloads anything.
 | `generated` | Durable catalog | Packs generated locally from exact dependency artifacts. |
 | `installed` | Durable catalog | Packs installed from a release bundle. |
 | `pre_shipped` | Durable catalog | Packs that a host image installs in advance. |
-| `embedded` | Session memory | The packs compiled into the engine. See [Shipped packs](#shipped-packs). |
+| `embedded` | Session memory | Packs a host or embedding application registers in memory for one session. The engine itself registers none. |
 
 ### Selection order
 
@@ -1211,72 +1219,35 @@ None of these resolvers downloads anything.
 5. Equal-rank candidates with different facts stay a conflict.
 
 Activation statuses are `active`, `disabled`, `incompatible`,
-`review_required`, `shadowed`, `conflict`, and `unavailable`.
+`approximate_distributed_blocked`, `review_required`, `shadowed`, `conflict`,
+and `unavailable`. `approximate_distributed_blocked` is the temporary
+close-match hold for `installed`, `pre_shipped`, and `embedded` sources. The
+`incompatible` status also covers a close-match Rust artifact whose claim
+excludes a resolved Cargo version; its activation explanation says
+`close-match claim excludes this resolved version`. A graph with both covered
+and excluded versions of one crate refuses the whole shard because Rust model
+lookups use crate spelling rather than Cargo package ID.
+
+The release criteria include per-lookup Match and Assertion attribution (#10189),
+causal Typestate attribution (#10198),
+and causal composed-taint attribution (#10212).
+An explicitly supplied local bundle classified as `installed` is held too.
+The unpinned-toolchain stdlib approximation route is separate and remains
+available.
 
 Authored workspace source and exact navigable artifact declarations outrank
 model-only facts after activation.
 
-## Shipped packs
+## Pack content
 
-The engine embeds these packs. Hosts register them when they bootstrap the
-catalog. When `BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` is set, the bundle replaces
-this whole set; the two are not merged.
-
-"Review" means the pack sets `safety.review_required`, so it also needs an
-`enable` entry. "Ver." is the pack `schema_version`.
-
-| Pack ID | Version | Language / ecosystem | Ver. | Payload | Completeness | Review | Models | Activation requires |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `bifrost.scala.case-class` | 1.0.0 | scala / maven | 2 | generator rules | partial | no | Generated `copy` and parameter accessors of case classes. | Scala present. |
-| `bifrost.java.lombok` | 1.0.0 | java / maven | 2 | generator rules | partial | no | Accessors and constructors generated by Lombok 1.18.42 `@Data`, `@Getter`, `@Setter`, `@Value`, `@NoArgsConstructor`, `@RequiredArgsConstructor`. | Package `org.projectlombok:lombok` `=1.18.42`. |
-| `bifrost.rust.getset` | 1.0.0 | rust / cargo | 2 | generator rules | partial | no | Getters generated by getset 0.1.7 `#[get = "pub"]`. | Package `getset` `=0.1.7`. |
-| `bifrost.jdk21.result-use-obligations` | 1.0.0 | java / jdk | 5 | summaries | complete | no | `String.trim()` as a pure value; `Files.deleteIfExists(Path)` as a status result. | Toolchain `jdk` `>=21.0.0, <22.0.0`, target `jvm`. |
-| `bifrost.node-runtime-values-javascript` | 0.1.0 | javascript / npm | 4 | `runtime_values` companion | partial | yes | `process.env` and `process.argv` keyed reads. | The Node runtime row for 22.11.0. |
-| `bifrost.node-runtime-values-typescript` | 0.1.0 | typescript / npm | 4 | `runtime_values` companion | partial | yes | The same, for TypeScript. | The Node runtime row for 22.11.0. |
-| `bifrost.node-child-process-javascript-declarations` | 0.2.0 | javascript / npm | 2 | declarations | partial | yes | The `child_process` module and `execSync`. | JavaScript present. |
-| `bifrost.node-child-process-typescript-declarations` | 0.2.0 | typescript / npm | 2 | declarations | partial | yes | The same, for TypeScript. | TypeScript present. |
-| `bifrost.node-child-process-javascript-summaries` | 0.1.0 | javascript / npm | 4 | summaries | complete | yes | `child_process.execSync`. | JavaScript present. |
-| `bifrost.node-child-process-typescript-summaries` | 0.1.0 | typescript / npm | 4 | summaries | complete | yes | The same, for TypeScript. | TypeScript present. |
-| `bifrost.node-buffer-javascript-declarations` | 0.1.0 | javascript / npm | 2 | declarations | partial | yes | The `Buffer` type and four members. | JavaScript present. |
-| `bifrost.node-buffer-typescript-declarations` | 0.1.0 | typescript / npm | 2 | declarations | partial | yes | The same, for TypeScript. | TypeScript present. |
-| `bifrost.python-process-inputs` | 0.1.0 | python / pypi | 4 | `runtime_values` companion | partial | no | `os.environ` and `sys.argv` keyed reads. | The Python process-input row. |
-| `bifrost.python-os-command-declarations` | 0.2.0 | python / pypi | 2 | declarations | partial | no | The `os` module and `os.system/chmod/open/mkdir/makedirs`. | Python present. |
-| `bifrost.python-os-command-summaries` | 0.1.0 | python / pypi | 4 | summaries | complete | no | `os.system(command)`. | Python present. |
-| `bifrost.python-security-sink-declarations` | 0.1.0 | python / python | 2 | declarations | partial | no | `socket.socket.bind` and three XML parser entry points. | CPython `3.13.5`. |
-| `bifrost.python-security-sink-summaries` | 0.2.0 | python / python | 14 | summaries | complete | no | Socket bind, XML parser, and regex execution input flows. | CPython `3.13.5`. |
-| `bifrost.python-stdlib-api-declarations` | 0.2.0 | python / python | 2 | declarations | partial | no | `hmac.new`, `hashlib.md5/sha1/sha256`, `re` execution APIs and `Pattern.search`, `textwrap.shorten`, `pathlib.Path.chmod`, and legacy `ssl.wrap_socket`. | CPython `>=3.10, <3.15`; SSL shard `>=3.10, <3.12`. |
-| `bifrost.go.stdlib.os` | 1.0.0 | go / go | 2 | summaries | complete | no | Result contracts for `os.Open`, `os.Create`, `os.CreateTemp`, `os.OpenFile`, `os.Stat`, `os.Lstat`, `os.File.Stat`, `os.IsNotExist`, `os.Exit`, and `os/exec.ExitError.ExitCode`. | Go present. |
-| `bifrost.go.stdlib.os-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | Declarations for the `os` summaries. | Go present. |
-| `bifrost.go.stdlib.errors` | 1.1.0 | go / go | 7 | summaries | complete | no | `errors.Is`, `errors.As`, `errors.New`. | Go present. |
-| `bifrost.go.stdlib.errors-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | Declarations for `errors`. | Go present. |
-| `bifrost.go.stdlib.log` | 1.0.0 | go / go | 2 | summaries | partial | no | No normal return for `log.Fatal*`, `log.Panic*`, and the `log.Logger` methods of the same names. | Go present. |
-| `bifrost.go.stdlib.log-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | Declarations for `log`. | Go present. |
-| `bifrost.go.stdlib.net` | 1.1.0 | go / go | 2 | summaries | complete | no | Result contracts for `net.Dial`, `net.DialTimeout`, `net.Listen`. | Go present. |
-| `bifrost.go.stdlib.net-declarations` | 1.1.0 | go / go | 2 | declarations | partial | no | `net`, `net.Conn`, `net.Listener`, `net.Addr`. | Go present. |
-| `bifrost.go.stdlib.net-url` | 1.0.0 | go / go | 2 | summaries | complete | no | Result contracts for `url.Parse` and `url.ParseRequestURI`. | Go present. |
-| `bifrost.go.stdlib.net-url-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | `net/url` and `url.URL`. | Go present. |
-| `bifrost.go.stdlib.net-http` | 1.2.0 | go / go | 2 | summaries | complete | no | Handler registration and serving: `http.Handle`, `HandleFunc`, `Serve`, `ListenAndServe`, `NewServeMux`, `ServeMux.Handle`, `ServeMux.HandleFunc`, and `http.Get`. | Go present. |
-| `bifrost.go.stdlib.net-http-declarations` | 1.2.0 | go / go | 2 | declarations | partial | no | `net/http`, `Handler`, `HandlerFunc`, `ServeMux`. | Go present. |
-| `bifrost.go.stdlib.bytes-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | The `bytes` package and one member. | Go present. |
-| `bifrost.go.stdlib.encoding-pem` | 1.0.0 | go / go | 2 | summaries | complete | no | Result contract for `pem.Decode`. | Go present. |
-| `bifrost.go.stdlib.encoding-pem-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | `encoding/pem` and `pem.Block`. | Go present. |
-| `bifrost.go.stdlib.crypto-x509` | 1.0.0 | go / go | 2 | summaries | complete | no | Parameter preconditions for `x509.IsEncryptedPEMBlock`. | Go present. |
-| `bifrost.go.stdlib.crypto-x509-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | `crypto/x509` and one member. | Go present. |
-| `bifrost.go.stdlib.path-filepath` | 1.0.0 | go / go | 2 | declarations | partial | no | The `path/filepath` module and the variadic `Join(...string) string`. | Go present. |
-| `bifrost.go.stdlib.testing` | 1.1.0 | go / go | 2 | declarations, summaries | partial | no | `testing.T`, `testing.B`, `testing.F` receivers, and no normal return for their `FailNow`, `Fatal*`, and `Skip*` methods. | Go present. |
-| `bifrost.go.stdlib.sync-atomic` | 1.0.0 | go / go | 2 | summaries | complete | no | Concurrency effects of the `sync/atomic` functions and typed atomics. | Go present. |
-| `bifrost.go.stdlib.sync-atomic-declarations` | 1.0.0 | go / go | 2 | declarations | partial | no | Declarations for `sync/atomic`. | Go present. |
-| `bifrost.go.concurrency` | 1.6.0 | go / go | 12 | summaries | complete | no | Concurrency effects for `sync` (mutexes, `Once`, `WaitGroup`, `Cond`, `Map`), `context.Context.Done` and cancellation, `time` timers and tickers, `testing.T.Run`, `Parallel`, `Cleanup`, and `errgroup`. | Go present. The `errgroup` shard also requires module `golang.org/x/sync` `>=0.1.0, <1.0.0` in ecosystem `go`. |
-| `bifrost.go.concurrency-declarations` | 1.2.0 | go / go | 2 | declarations | partial | no | Declarations for the concurrency summaries. | Go present. The `errgroup` shard has the same module requirement. |
-| `bifrost.go.testify.require` | 1.0.0 | go / go-module | 2 | summaries | complete | no | Normal-return refinement for `require.NoError`. | Module `github.com/stretchr/testify` `=1.11.1`. |
-| `bifrost.go.testify.require-declarations` | 1.0.0 | go / go-module | 2 | declarations | partial | no | `require` and `require.TestingT`. | The same module. |
-| `bifrost.go.testify.assert` | 1.0.0 | go / go-module | 2 | summaries | complete | no | Conditional result refinement for `assert.NoError`. | The same module. |
-| `bifrost.go.testify.assert-declarations` | 1.0.0 | go / go-module | 2 | declarations | partial | no | `assert` and `assert.TestingT`. | The same module. |
-
-"Present" means that the workspace contains files of that language, which
-mints the intrinsic language row. The source files for open packs and their
-release recipes are published in
-[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs).
+The engine ships no semantic packs (#4438). Open packs and their release
+recipes are authored and released in
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs); each release's
+bundle index lists its packs, what they model, and what activates them. The
+binary installs the selected release bundle at bootstrap, and
+`BIFROST_OPEN_SEMANTIC_PACK_BUNDLE` or `bifrost install-semantic-packs` installs
+an extracted release offline. Without either, the catalog holds only workspace
+models.
 
 ## bifrost-semantic-pack
 
@@ -1512,3 +1483,68 @@ These variables change pack behavior. The
 | `BIFROST_SEMANTIC_PACK_CATALOG`, `BIFROST_SEMANTIC_PACK_EVIDENCE` | Legacy. Read by every `SearchToolsService` session. Set both or neither. The catalog is opened read-only. The evidence is a non-empty JSON array of rows with `language`, `ecosystem`, and optional `package`, `module`, `toolchain` (`{name, version?}`), `target`, `configuration`, and `artifactSha256`. This route supplies no `enable` controls, and it fails when `.bifrost/packs.json` exists. |
 
 Go universe type references remain open when another active provider declares the same simple type name in the owning package.
+
+Rust schema-29 dependency packs may carry unresolved public re-export routes.
+Each route retains its rustdoc target item ID and a namespace only when the
+structured rustdoc item kind proves it. Named imports use exact defining-pack
+namespace evidence. A glob binds only when one external glob supplies the name
+and no local glob, explicit item, or other named route competes. Other glob
+compositions, unknown target kinds, and incomplete re-export surfaces make
+facade lookup incomplete; they do not change the completeness of declarations
+that the pack did retain. `rust_external_reexports_glob_incomplete` records
+unsupported glob composition without blocking a proven named route; the
+truncation marker still blocks all routes. Source-set packs with public uses
+mark their route surface unsupported. Packs without re-export evidence omit
+the carrier.
+
+### Reviewed Rust destruction (schema 31)
+
+`value_semantics.drop_glue: inert` retains its strict meaning: the type has no
+`Drop` implementation, and its recursively instantiated fields execute no user
+code on destruction. Library-owned memory is a different contract.
+
+Schema 31 adds `value_semantics.drop_effects` with the single kind
+`memory_or_refcount_release`. Its required `payloads` and `field_types` are
+structured TypeRefs: every type parameter is an explicit recursive payload
+obligation, and cross-crate fields need their own selected facts.
+`internal_field_coverage: reviewed_transitive` covers reviewed same-crate
+internals. `allocator_assumption` is `none` or `global_memory_release_only`.
+Neither callbacks nor zeroization are covered. This field conflicts with
+`drop_glue`; unions are not supported by the new contract.
+
+Both schema-31 destruction claims require a sibling `drop_review`, containing
+`scope` and `review`. Cargo scope binds exact package identity, version, source
+SHA-256, expanded enabled features, target and cfgs. Rust standard-library scope
+binds the exact toolchain, source revision, target and cfgs. Review provenance
+contains `source`, immutable `revision`, nonempty SHA-256 `source_digests`, and
+`cfg_not_features_reviewed`. The single scope-admission policy prefers an exact
+review of the locked version and features, then that version with an attested
+feature superset, then the nearest caret-compatible reviewed version. Distance
+uses absolute major/minor/patch deltas in that order; equal distances prefer the
+lower version. Different features require the review to cover a superset and
+attest that negative feature cfgs were checked. Exact feature sets need no such
+attestation. Approximate decisions carry both versions and feature sets for the
+consumer's completion diagnostics. Missing selection evidence stays unknown.
+Pre-31 fields remain readable without inventing a review scope.
+
+These are transport and validation contracts. Their presence does not by itself
+establish a cleanup exemption. The `global_memory_release_only` assumption refers to the engine's single
+`GLOBAL_ALLOCATOR_RELEASE_ASSUMPTION` constant. A later consumer-relative proof
+may rely on it only when memory/refcount release is unobservable, recording it
+in provenance. A complete allocator census will tighten this path and the
+existing standard owned-memory admission together (#10969).
+Authored standard-library destruction facts belong in a reviewed companion pack;
+generated rustdoc declarations make no such claim.
+
+### Alias targets (schema 32)
+
+A `type_alias` declaration may carry `alias_target`, a structured `TypeRef`
+over the alias's own `type_parameters`. Missing targets make no claim.
+Targets must use known type declaration IDs and parameters in scope; member IDs
+cannot identify target types. Cycles through
+alias declaration IDs, including nested target references, are rejected.
+Older schema versions cannot carry this field. Rust selected-type readers expand
+complete targets through the shared resolver and its operation limits. Missing
+targets, unsupported target forms, ambiguous targets and cyclic expansion remain
+Partial. A target uses the alias's own parameters and defaults, without capturing
+names from the caller's source scope.

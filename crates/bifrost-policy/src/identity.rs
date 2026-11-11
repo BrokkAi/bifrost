@@ -206,6 +206,7 @@ impl PolicySemanticHash {
         match_manifests: &[ResolvedMatchDirectoryManifest],
         endpoint_set_dependencies: &[super::resolved::ResolvedEndpointSetDependency],
         precedence: &PolicyPrecedenceManifest,
+        without_flow: Option<&ResolvedTaintPolicySpec>,
     ) -> Result<Self, LoadedModelError> {
         let value = canonical_loaded::resolved_policy_to_json(
             definition,
@@ -216,6 +217,7 @@ impl PolicySemanticHash {
             match_manifests,
             endpoint_set_dependencies,
             precedence,
+            without_flow,
         )?;
         Ok(Self(hash_canonical_value(POLICY_SEMANTIC_DOMAIN, &value)))
     }
@@ -420,6 +422,7 @@ mod tests {
             &[],
             &[],
             &PolicyPrecedenceManifest::default(),
+            None,
         )
         .unwrap();
         let hash_b = PolicySemanticHash::from_resolved_policy(
@@ -431,6 +434,7 @@ mod tests {
             &[],
             &[],
             &PolicyPrecedenceManifest::default(),
+            None,
         )
         .unwrap();
 
@@ -475,6 +479,7 @@ mod tests {
             std::slice::from_ref(&first),
             &[],
             &PolicyPrecedenceManifest::default(),
+            None,
         )
         .unwrap();
         let overlapping = PolicySemanticHash::from_resolved_policy(
@@ -486,6 +491,7 @@ mod tests {
             &[first, second],
             &[],
             &PolicyPrecedenceManifest::default(),
+            None,
         )
         .unwrap();
 

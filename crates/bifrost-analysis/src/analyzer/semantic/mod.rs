@@ -2,6 +2,9 @@
 #![allow(hidden_glob_reexports)]
 // Boundary-visible child modules keep their qualified paths when short names collide.
 #![allow(ambiguous_glob_reexports)]
+// ProcedureHandle keys hash immutable identity; the artifact charge is only
+// mutable accounting state and is excluded from equality and hashing.
+#![allow(clippy::mutable_key_type)]
 
 //! Language-neutral executable semantics and adapter contracts.
 
@@ -16,6 +19,11 @@ pub use brokk_bifrost_semantic::analyzer::semantic::*;
 macro_rules! impl_program_semantics_provider {
     ($analyzer:ty, |$context:ident| $lowerer:expr) => {
         impl $crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            fn lowering_identity(&self) -> Option<$crate::analyzer::semantic::service::SemanticAdapterIdentity> {
+                let $context = self;
+                let lowerer = $lowerer;
+                Some($crate::analyzer::semantic::service::ProgramSemanticsLowerer::identity(&lowerer))
+            }
             #[cfg(any(test, feature = "test-support"))]
             fn lower_with_budget_for_test(
                 &self,
@@ -119,6 +127,41 @@ macro_rules! impl_program_semantics_provider {
                     .materialize_semantics_with_lowerer(&lowerer, file, request)
             }
 
+            fn stored_semantic_ir_publication_read(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                subject: [u8; 32],
+                source_byte_cap: Option<usize>,
+                cancellation: &$crate::analyzer::semantic::CancellationToken,
+            ) -> Result<$crate::analyzer::semantic::StoredSemanticIrRead, $crate::analyzer::semantic::SemanticProviderError> {
+                $crate::analyzer::semantic::service::stored_semantic_ir_publication_read(
+                    &self.inner, file,
+                    |store, key| store.semantic_ir_head_observation(key).map(|head| (head, None::<()>)),
+                    source_byte_cap, cancellation,
+                ).map(|(read, _)| read)
+            }
+
+            fn stored_footprint_coverage(
+                &self,
+                procedure: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::FootprintAdmission,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_footprint_coverage(procedure, request)
+            }
+            fn stored_call_control_coverage(
+                &self,
+                procedure: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::FootprintAdmission,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_call_control_coverage(procedure, request)
+            }
+
             fn stored_partial_flows(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -137,6 +180,18 @@ macro_rules! impl_program_semantics_provider {
                 key: &$crate::analyzer::semantic::SemanticArtifactKey,
             ) -> Result<bool, $crate::analyzer::semantic::SemanticProviderError> {
                 self.inner.has_complete_semantic_ir_rows(file, key)
+            }
+
+            fn stored_semantic_ir_procedure(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+                procedure: $crate::analyzer::semantic::ProcedureId,
+            ) -> Result<
+                Option<$crate::analyzer::semantic::ProcedureSemanticsParts>,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_semantic_ir_procedure(file, key, procedure)
             }
         }
     };
@@ -213,6 +268,41 @@ macro_rules! impl_program_semantics_provider {
                     .materialize_semantics_with_lowerer(&lowerer, file, request)
             }
 
+            fn stored_semantic_ir_publication_read(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                subject: [u8; 32],
+                source_byte_cap: Option<usize>,
+                cancellation: &$crate::analyzer::semantic::CancellationToken,
+            ) -> Result<$crate::analyzer::semantic::StoredSemanticIrRead, $crate::analyzer::semantic::SemanticProviderError> {
+                $crate::analyzer::semantic::service::stored_semantic_ir_publication_read(
+                    &self.inner, file,
+                    |store, key| store.semantic_ir_head_observation(key).map(|head| (head, None::<()>)),
+                    source_byte_cap, cancellation,
+                ).map(|(read, _)| read)
+            }
+
+            fn stored_footprint_coverage(
+                &self,
+                procedure: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::FootprintAdmission,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_footprint_coverage(procedure, request)
+            }
+            fn stored_call_control_coverage(
+                &self,
+                procedure: &$crate::analyzer::semantic::ProcedureHandle,
+                request: &mut $crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                $crate::analyzer::semantic::FootprintAdmission,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_call_control_coverage(procedure, request)
+            }
+
             fn stored_partial_flows(
                 &self,
                 file: &$crate::analyzer::ProjectFile,
@@ -231,6 +321,18 @@ macro_rules! impl_program_semantics_provider {
                 key: &$crate::analyzer::semantic::SemanticArtifactKey,
             ) -> Result<bool, $crate::analyzer::semantic::SemanticProviderError> {
                 self.inner.has_complete_semantic_ir_rows(file, key)
+            }
+
+            fn stored_semantic_ir_procedure(
+                &self,
+                file: &$crate::analyzer::ProjectFile,
+                key: &$crate::analyzer::semantic::SemanticArtifactKey,
+                procedure: $crate::analyzer::semantic::ProcedureId,
+            ) -> Result<
+                Option<$crate::analyzer::semantic::ProcedureSemanticsParts>,
+                $crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.stored_semantic_ir_procedure(file, key, procedure)
             }
         }
     };
@@ -261,6 +363,7 @@ pub use icfg::*;
 
 pub use oracle::*;
 pub use service::semantic_artifact_retained_bytes;
+pub use service::{FootprintAdmission, FootprintAdmissionRefusal};
 #[cfg(any(test, feature = "test-support"))]
 pub use service::{SemanticCacheRevivalCensus, SemanticMaterializationCensus};
 pub use statement_entries::*;

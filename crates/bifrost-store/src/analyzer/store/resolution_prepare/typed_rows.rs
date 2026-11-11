@@ -38,8 +38,9 @@ use brokk_bifrost_core::analyzer::resolution_facts::{
     ALL_RESOLUTION_MEMBER_KINDS, ALL_RESOLUTION_MEMBER_QUALIFIER_COMPATIBILITIES,
     ALL_RESOLUTION_SUPERTYPE_KINDS, ALL_RESOLUTION_TYPE_COMPONENT_KINDS,
     ALL_RESOLUTION_TYPE_CONSTRUCTOR_KINDS, ALL_RESOLUTION_TYPE_SLOT_ROLES,
-    ALL_RESOLUTION_TYPE_TRANSFER_KINDS, ResolutionEngineRuleKind, ResolutionMemberAccess,
-    ResolutionMemberKind, ResolutionMemberQualifierCompatibility, ResolutionSiteId,
+    ALL_RESOLUTION_TYPE_TRANSFER_KINDS, MemberTypesCoverage, ResolutionEngineRuleKind,
+    ResolutionMemberAccess, ResolutionMemberKind, ResolutionMemberQualifierCompatibility,
+    ResolutionSiteId,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     ALL_BOUNDARY_STATUSES, ALL_RESOLUTION_COMPLETION_REASON_KINDS,
@@ -233,13 +234,21 @@ pub(crate) const DECLARATION_VISIBILITIES_BY_DEFINITION_SQL: &str = "WITH reques
 /// Questions 46 and 47 keep the tier 1 table they already have, for the same
 /// reason as question 45: it holds the fact under the key the reader holds,
 /// and a second copy of it would be the one thing the schema rules forbid.
-pub(crate) const MEMBER_SCOPES_BY_DEFINITION_SQL: &str = "SELECT definition_semantic_key, scope_head_node_key \
-     FROM resolution_member_scope_properties \
-     WHERE scope_kind='type_body' AND blob_id = ?1 AND definition_semantic_key IN (SELECT value FROM json_each(?2))";
+/// The member-type claim rides on each type-body row; a missing claim row is
+/// Unknown (#9546).
+pub(crate) const MEMBER_SCOPES_BY_DEFINITION_SQL: &str = "SELECT scope.definition_semantic_key, scope.scope_head_node_key, \
+     coverage.coverage, coverage.open_reason \
+     FROM resolution_member_scope_properties AS scope \
+     LEFT JOIN resolution_member_type_coverage AS coverage \
+       ON coverage.blob_id = scope.blob_id AND coverage.definition_semantic_key = scope.definition_semantic_key \
+     WHERE scope.scope_kind='type_body' AND scope.blob_id = ?1 AND scope.definition_semantic_key IN (SELECT value FROM json_each(?2))";
 
-pub(crate) const MEMBER_SCOPES_BY_HEAD_SQL: &str = "SELECT definition_semantic_key, scope_head_node_key \
-     FROM resolution_member_scope_properties \
-     WHERE scope_kind='type_body' AND blob_id = ?1 AND scope_head_node_key IN (SELECT value FROM json_each(?2))";
+pub(crate) const MEMBER_SCOPES_BY_HEAD_SQL: &str = "SELECT scope.definition_semantic_key, scope.scope_head_node_key, \
+     coverage.coverage, coverage.open_reason \
+     FROM resolution_member_scope_properties AS scope \
+     LEFT JOIN resolution_member_type_coverage AS coverage \
+       ON coverage.blob_id = scope.blob_id AND coverage.definition_semantic_key = scope.definition_semantic_key \
+     WHERE scope.scope_kind='type_body' AND scope.blob_id = ?1 AND scope.scope_head_node_key IN (SELECT value FROM json_each(?2))";
 
 /// Companion declarations are persisted by source-site identity. Join both
 /// sites through the semantic-site index so callers can continue with the
@@ -1852,6 +1861,31 @@ pub(crate) fn decode_deferred_member_owner(
         SemanticId::shared_name(context.names.from_persisted(SharedNameId::interned(lookup))),
         body,
     )
+}
+
+/// Decode a persisted member-type claim. A type body with no claim row is
+/// Unknown; a pair the claim type cannot encode is a corrupt store, never an
+/// assertion.
+pub(crate) fn decode_member_types(
+    definition: SemanticId,
+    coverage: Option<String>,
+    open_reason: Option<String>,
+) -> super::super::Result<Option<MemberTypesCoverage>> {
+    match (coverage, open_reason) {
+        (None, None) => Ok(None),
+        (Some(coverage), open_reason) => {
+            MemberTypesCoverage::from_columns(&coverage, open_reason.as_deref())
+                .map(Some)
+                .ok_or_else(|| {
+                    super::super::StoreError::corrupt(format!(
+                        "member-type claim for {definition:?} is malformed: coverage={coverage:?}, open_reason={open_reason:?}"
+                    ))
+                })
+        }
+        (None, Some(open_reason)) => Err(super::super::StoreError::corrupt(format!(
+            "member-type claim for {definition:?} has an open reason {open_reason:?} without a coverage"
+        ))),
+    }
 }
 
 pub(crate) fn decode_member_owner_fields(

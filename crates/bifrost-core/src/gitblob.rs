@@ -823,6 +823,19 @@ pub fn working_tree_paths_under(repo: &Repository, subtree: &str) -> Result<Hash
     working_tree_paths(repo, Some(subtree))
 }
 
+/// Whether the gitlink at `rel` has no child Git metadata in the working-tree
+/// directory `checkout`. Workspace listings never initialize or fetch a
+/// submodule, so an uninitialized gitlink contributes no source.
+pub fn gitlink_is_uninitialized(checkout: &Path, rel: &str) -> Result<bool> {
+    match checkout.join(Path::new(rel)).join(".git").try_exists() {
+        Ok(exists) => Ok(!exists),
+        // A historical gitlink whose path, or an ancestor of it, is now a
+        // file has no child Git metadata.
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => Ok(true),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Open only an already materialized gitlink; never initialize or fetch it.
 fn materialized_submodule(repo: &Repository, rel: &str) -> Result<Option<Repository>> {
     let relative = Path::new(rel);
@@ -832,19 +845,15 @@ fn materialized_submodule(repo: &Repository, rel: &str) -> Result<Option<Reposit
     {
         return Err(format!("invalid submodule path: {rel}"));
     }
+    // Opening an uninitialized gitlink through repository discovery would
+    // incorrectly treat the parent as its child.
+    if gitlink_is_uninitialized(workdir(repo)?, rel)? {
+        return Ok(None);
+    }
     let parent = workdir(repo)?
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let path = parent.join(relative);
-    // An uninitialized gitlink has no child Git metadata. Opening the parent
-    // through repository discovery would incorrectly treat it as a child.
-    if !path
-        .join(".git")
-        .try_exists()
-        .map_err(|error| error.to_string())?
-    {
-        return Ok(None);
-    }
     let canonical = path.canonicalize().map_err(|error| error.to_string())?;
     if canonical != path || !canonical.starts_with(&parent) || canonical == parent {
         return Err(format!(
@@ -868,7 +877,18 @@ fn materialized_submodule(repo: &Repository, rel: &str) -> Result<Option<Reposit
 
 fn contained_child_file(workdir: &Path, rel: &Path) -> Result<bool> {
     let path = workdir.join(rel);
-    if !path.is_file() {
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        // Removed since Git reported it: not listed, as before.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.is_symlink() && !path.is_file() {
+        // The listing classifies these links as omissions without reading a
+        // target. Regular source targets still require containment below.
+        return Ok(true);
+    }
+    if !metadata.is_file() && !metadata.is_symlink() {
         return Ok(false);
     }
     let canonical = path.canonicalize().map_err(|error| error.to_string())?;
@@ -882,7 +902,15 @@ fn contained_child_file(workdir: &Path, rel: &Path) -> Result<bool> {
 }
 
 fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
+    working_tree_paths_with_non_utf8(repo, subtree).map(|(paths, _)| paths)
+}
+
+pub fn working_tree_paths_with_non_utf8(
+    repo: &Repository,
+    subtree: Option<&str>,
+) -> Result<(HashSet<String>, Vec<std::path::PathBuf>)> {
     let mut paths = HashSet::new();
+    let mut non_utf8 = Vec::new();
     // Strict descendant workdirs make traversal acyclic. The stack and full
     // listing belong to this query only, not to a retained workspace index.
     let mut pending = vec![(
@@ -897,7 +925,12 @@ fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSe
             .map_err(|error| error.to_string())?;
         let mut index = current.index().map_err(|error| error.to_string())?;
         index.read(true).map_err(|error| error.to_string())?;
-        let dirty = dirty_worktree_paths(&current, scope.as_deref())?;
+        let (dirty, invalid) = dirty_worktree_paths_with_non_utf8(&current, scope.as_deref())?;
+        non_utf8.extend(
+            invalid
+                .into_iter()
+                .map(|path| std::path::PathBuf::from(&prefix).join(path)),
+        );
         let mut visited_gitlinks = HashSet::new();
         for entry in index.iter() {
             let rel = index_path_to_string(&entry)?;
@@ -929,7 +962,7 @@ fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSe
             {
                 continue;
             }
-            if (!dirty.contains(&rel) || workdir.join(&rel).is_file())
+            if (!dirty.contains(&rel) || listed_working_tree_kind(&workdir.join(&rel)))
                 && (prefix.is_empty() || contained_child_file(&workdir, Path::new(&rel))?)
             {
                 paths.insert(format!("{prefix}{rel}"));
@@ -937,22 +970,28 @@ fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSe
         }
         for rel in dirty {
             if index.get_path(Path::new(&rel), 0).is_none()
-                && workdir.join(&rel).is_file()
+                && listed_working_tree_kind(&workdir.join(&rel))
                 && (prefix.is_empty() || contained_child_file(&workdir, Path::new(&rel))?)
             {
                 paths.insert(format!("{prefix}{rel}"));
             }
         }
     }
-    Ok(paths)
+    Ok((paths, non_utf8))
+}
+
+fn listed_working_tree_kind(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_file() || metadata.is_symlink())
 }
 
 /// Whether one working-directory path belongs to the listing
 /// [`all_working_tree_paths`] builds, decided for that path alone.
 ///
 /// The listing holds tracked paths whose file exists and untracked files Git
-/// does not ignore, so a path is listed when it is a file and either the index
-/// tracks it or no ignore rule matches it. A file watcher uses this to update
+/// does not ignore, including symlinks regardless of their target kind. A path
+/// is listed when it is a file or symlink and either the index tracks it or no
+/// ignore rule matches it. A file watcher uses this to update
 /// a cached listing for one created, removed or renamed path without walking
 /// the worktree.
 pub fn working_tree_path_is_listed(repo: &Repository, rel_path: &Path) -> Result<bool> {
@@ -962,66 +1001,101 @@ pub fn working_tree_path_is_listed(repo: &Repository, rel_path: &Path) -> Result
     {
         return Ok(false);
     }
-    let mut current = Repository::open(repo.path()).map_err(|error| error.to_string())?;
-    let mut relative = rel_path.to_path_buf();
-    let mut in_child = false;
-    loop {
-        let workdir = workdir(&current)?
+    WorkingTreeMembership::new(repo)?.contains(rel_path)
+}
+
+/// One index snapshot shared by a batch of point-membership probes.
+pub(crate) struct WorkingTreeMembership {
+    repo: Repository,
+    index: git2::Index,
+    workdir: PathBuf,
+    normalized_workdir: PathBuf,
+}
+
+impl WorkingTreeMembership {
+    pub(crate) fn new(repo: &Repository) -> Result<Self> {
+        let repo = Repository::open(repo.path()).map_err(|error| error.to_string())?;
+        let workdir = workdir(&repo)?
             .canonicalize()
             .map_err(|error| error.to_string())?;
         let normalized_workdir = workdir.to_path_buf().normalize();
-        let mut index = current.index().map_err(|error| error.to_string())?;
+        let mut index = repo.index().map_err(|error| error.to_string())?;
         index.read(true).map_err(|error| error.to_string())?;
-        // A gitlink can only be an ancestor of this path. Point membership
-        // probes those index entries instead of scanning the whole index.
-        let gitlink = relative
-            .ancestors()
-            .filter(|path| !path.as_os_str().is_empty())
-            .find_map(|path| {
-                (0..=3)
-                    .filter_map(|stage| index.get_path(path, stage))
-                    .find(|entry| entry.mode == 0o160000)
-            })
-            .map(|entry| index_path_to_string(&entry))
-            .transpose()?;
-        if let Some(gitlink) = gitlink {
-            let Some(child) = materialized_submodule(&current, &gitlink)? else {
-                return Ok(false);
-            };
-            relative = relative
-                .strip_prefix(&gitlink)
-                .expect("gitlink prefix matched")
-                .to_path_buf();
-            current = child;
-            in_child = true;
-            continue;
-        }
-        if !workdir.join(&relative).is_file() {
-            return Ok(false);
-        }
-        if in_child && !contained_child_file(&workdir, &relative)? {
-            return Ok(false);
-        }
-        if index.get_path(&relative, 0).is_some() {
-            return Ok(true);
-        }
-        // Native Git does not enumerate the contents of an untracked nested
-        // repository. A point update must not admit them either.
-        if let Some(owner) = workdir.join(&relative).parent().and_then(discover) {
-            let owner_workdir = owner
-                .workdir()
-                .map(Path::canonicalize)
-                .transpose()
-                .map_err(|error| error.to_string())?
-                .map(NormalizePath::normalize);
-            if owner_workdir.as_deref() != Some(normalized_workdir.as_path()) {
+        Ok(Self {
+            repo,
+            index,
+            workdir,
+            normalized_workdir,
+        })
+    }
+
+    pub(crate) fn contains(&self, relative: &Path) -> Result<bool> {
+        self.contains_inner(relative, false)
+    }
+
+    fn contains_inner(&self, relative: &Path, in_child: bool) -> Result<bool> {
+        let mut relative = relative.to_path_buf();
+        let mut in_child = in_child;
+        let mut child_membership = None;
+        loop {
+            let membership = child_membership.as_ref().unwrap_or(self);
+            // A gitlink can only be an ancestor of this path. Point membership
+            // probes those index entries instead of scanning the whole index.
+            let gitlink = relative
+                .ancestors()
+                .filter(|path| !path.as_os_str().is_empty())
+                .find_map(|path| {
+                    (0..=3)
+                        .filter_map(|stage| membership.index.get_path(path, stage))
+                        .find(|entry| entry.mode == 0o160000)
+                })
+                .map(|entry| index_path_to_string(&entry))
+                .transpose()?;
+            if let Some(gitlink) = gitlink {
+                let Some(child) = materialized_submodule(&membership.repo, &gitlink)? else {
+                    return Ok(false);
+                };
+                relative = relative
+                    .strip_prefix(&gitlink)
+                    .expect("gitlink prefix matched")
+                    .to_path_buf();
+                child_membership = Some(WorkingTreeMembership::new(&child)?);
+                in_child = true;
+                continue;
+            }
+            if !listed_working_tree_kind(&membership.workdir.join(&relative)) {
                 return Ok(false);
             }
+            if in_child && !contained_child_file(&membership.workdir, &relative)? {
+                return Ok(false);
+            }
+            if membership.index.get_path(&relative, 0).is_some() {
+                return Ok(true);
+            }
+            // Native Git does not enumerate the contents of an untracked nested
+            // repository. A point update must not admit them either.
+            if let Some(owner) = membership
+                .workdir
+                .join(&relative)
+                .parent()
+                .and_then(discover)
+            {
+                let owner_workdir = owner
+                    .workdir()
+                    .map(Path::canonicalize)
+                    .transpose()
+                    .map_err(|error| error.to_string())?
+                    .map(NormalizePath::normalize);
+                if owner_workdir.as_deref() != Some(membership.normalized_workdir.as_path()) {
+                    return Ok(false);
+                }
+            }
+            return membership
+                .repo
+                .is_path_ignored(&relative)
+                .map(|ignored| !ignored)
+                .map_err(|error| error.to_string());
         }
-        return current
-            .is_path_ignored(&relative)
-            .map(|ignored| !ignored)
-            .map_err(|error| error.to_string());
     }
 }
 
@@ -1206,6 +1280,21 @@ pub fn existing_working_tree_oids(root: &Path) -> Result<HashSet<String>> {
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // A symlink whose target cannot be resolved (a loop, a link
+            // through a regular file, a directory that cannot be read) is only
+            // an omission in the listing, so no analyzer reads bytes through
+            // it. Skipping it may let GC drop cached analysis of a target that
+            // becomes readable again later; that analysis is re-derived on
+            // demand. Aborting instead would stop GC on every run for as long
+            // as the link exists. A path that is not a link and cannot be
+            // inspected still aborts collection.
+            Err(_)
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.is_symlink()) =>
+            {
+                continue;
+            }
             Err(error) => return Err(format!("inspecting GC file {}: {error}", path.display())),
         };
         if metadata.is_file() {
@@ -1250,6 +1339,13 @@ pub fn index_path_to_string(entry: &IndexEntry) -> Result<String> {
 }
 
 fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
+    dirty_worktree_paths_with_non_utf8(repo, subtree).map(|(paths, _)| paths)
+}
+
+fn dirty_worktree_paths_with_non_utf8(
+    repo: &Repository,
+    subtree: Option<&str>,
+) -> Result<(HashSet<String>, Vec<std::path::PathBuf>)> {
     let _scope = crate::profiling::scope("gitblob::dirty_worktree_paths");
     let workdir = workdir(repo)?;
     // libgit2's recursive index-to-worktree diff can rescan very large trees
@@ -1297,6 +1393,7 @@ fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<Hash
     }
 
     let mut dirty = HashSet::new();
+    let mut non_utf8 = Vec::new();
     let mut fields = output.stdout.split(|byte| *byte == 0);
     while let Some(field) = fields.next() {
         if field.is_empty() {
@@ -1312,15 +1409,33 @@ fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<Hash
         let status = &field[..2];
         let path = &field[3..];
         if status != b"  " && status != b"!!" {
+            if std::str::from_utf8(path).is_err() {
+                non_utf8.push(bytes_to_path(path));
+            }
             dirty.insert(String::from_utf8_lossy(path).into_owned());
             if (status.contains(&b'R') || status.contains(&b'C'))
                 && let Some(previous) = fields.next().filter(|previous| !previous.is_empty())
             {
+                if std::str::from_utf8(previous).is_err() {
+                    non_utf8.push(bytes_to_path(previous));
+                }
                 dirty.insert(String::from_utf8_lossy(previous).into_owned());
             }
         }
     }
-    Ok(dirty)
+    Ok((dirty, non_utf8))
+}
+
+fn bytes_to_path(bytes: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(bytes).into()
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 fn hash_working_file(workdir: &Path, rel: &str) -> Result<Oid> {
@@ -1792,6 +1907,13 @@ mod tests {
                 .contains("escapes")
         );
         std::fs::remove_file(child.workdir().unwrap().join("escape.py")).unwrap();
+        for (name, target) in [("directory-link", "."), ("dangling-link", "missing")] {
+            symlink(target, child.workdir().unwrap().join(name)).unwrap();
+            let relative = format!("child/{name}");
+            assert!(all_working_tree_paths(&parent).unwrap().contains(&relative));
+            assert!(working_tree_path_is_listed(&parent, Path::new(&relative)).unwrap());
+        }
+
         let external = init_repo(outside.path());
         commit_all(&external, "external");
         register_gitlink(
@@ -1970,6 +2092,38 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!oids.contains(&deleted_oid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10321: an unresolvable untracked symlink aborted cache GC once Git listed every symlink"
+    )]
+    fn gc_oids_skip_unresolvable_symlinks_and_keep_file_links() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+        commit_all(&repo, "init");
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("target.txt"), "linked\n").unwrap();
+        std::os::unix::fs::symlink("loop", temp.path().join("loop")).unwrap();
+        // A loop in an intermediate component, and a link through a regular
+        // file, fail to resolve just as a direct loop does.
+        std::os::unix::fs::symlink("loop/file", temp.path().join("through-loop")).unwrap();
+        std::os::unix::fs::symlink("clean.txt/inner", temp.path().join("through-file")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("target.txt"),
+            temp.path().join("linked.txt"),
+        )
+        .unwrap();
+
+        let oids = existing_working_tree_oids(temp.path()).unwrap();
+        // A link to a regular file is analyzed through the link, so its bytes
+        // stay live.
+        let linked = Oid::hash_object(ObjectType::Blob, b"linked\n")
+            .unwrap()
+            .to_string();
+        assert!(oids.contains(&linked), "missing linked OID {linked}");
     }
 
     /// GC keeps an analyzer row while its blob is in `live_bloom`, which joins

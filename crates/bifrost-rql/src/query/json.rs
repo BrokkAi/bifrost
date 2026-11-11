@@ -15,6 +15,7 @@ use super::schema::{
     configuration_provenance_label, configuration_scalar_kind_label, reference_kind_label,
     usage_proof_label, usage_surface_label,
 };
+use brokk_bifrost_core::analyzer::structural::facts::ArgumentMode;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use serde_json::{Map, Value, json};
@@ -56,7 +57,7 @@ impl CodeQuery {
     }
 }
 
-fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
+pub(crate) fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
     let mut object = match &plan.source {
         CodeQueryPlanSource::Seed(seed) => seed_to_json(seed),
         CodeQueryPlanSource::Occurrences(seed) => occurrence_seed_to_json(seed),
@@ -476,6 +477,9 @@ pub(super) fn rewrite_path_filter_to_json(filter: &RewritePathFilter) -> Map<Str
 
 pub(super) fn edge_filter_to_json(filter: &EdgeFilter) -> Map<String, Value> {
     let mut object = Map::new();
+    if let Some(enclosing) = &filter.enclosing {
+        object.insert("enclosing".to_string(), enclosing.canonical.clone());
+    }
     if !filter.reference_kinds.is_empty() {
         object.insert(
             "reference_kinds".to_string(),
@@ -706,6 +710,9 @@ pub(super) fn configuration_facts_filter_to_json(
                     .collect(),
             ),
         );
+    }
+    if let Some(regex) = &filter.value_regex {
+        object.insert("value_regex".to_string(), json!(regex.0.as_str()));
     }
     for (field, value) in [
         ("value_lt", filter.value_lt.as_ref()),
@@ -987,6 +994,10 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         QueryStep::CaptureAnchor(capture) => {
             object.insert("capture".to_string(), json!(capture));
         }
+        QueryStep::IdenticalCaptures { left, right } => {
+            object.insert("left".to_string(), json!(left));
+            object.insert("right".to_string(), json!(right));
+        }
         QueryStep::ProgramPointById { id } => {
             object.insert(
                 QueryStepField::ProgramPointId.label().to_string(),
@@ -995,6 +1006,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         }
         QueryStep::ConfigurationAbsence(filter) => {
             object.extend(configuration_facts_filter_to_json(filter));
+            if filter.absence_scope == super::ir::ConfigurationAbsenceScope::Subtree {
+                object.insert("scope".to_string(), json!("subtree"));
+            }
         }
         QueryStep::StatementFacts(kind) => {
             object.insert(
@@ -1229,6 +1243,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
             }
         }
         QueryStep::ReferencesOf(filter) | QueryStep::UsedBy(filter) | QueryStep::Uses(filter) => {
+            if let Some(enclosing) = &filter.enclosing {
+                object.insert("enclosing".to_string(), enclosing.canonical.clone());
+            }
             if !filter.reference_kinds.is_empty() {
                 object.insert(
                     "reference_kinds".to_string(),
@@ -1344,6 +1361,12 @@ fn query_step_to_json(step: &QueryStep) -> Value {
             if let Some(capture) = &filter.capture {
                 object.insert("capture".to_string(), json!(capture));
             }
+            if !filter.member_form.is_empty() {
+                object.insert("member_form".to_string(), json!(filter.member_form));
+            }
+            if let Some(trivial_property) = filter.trivial_property {
+                object.insert("trivial_property".to_string(), json!(trivial_property));
+            }
         }
         QueryStep::FieldWriteValue(filter) => {
             if let Some(receiver_identity_id) = &filter.receiver_identity_id {
@@ -1425,6 +1448,45 @@ fn row_predicate_to_json(predicate: &super::ir::QueryRowPredicate) -> Value {
     Value::Object(object)
 }
 
+fn instantiated_type_to_json(value: &super::ir::InstantiatedType) -> Value {
+    let mut object = Map::new();
+    object.insert(
+        "identity".to_owned(),
+        call_identity_to_json(&value.identity),
+    );
+    if !value.arguments.is_empty() {
+        object.insert(
+            "arguments".to_owned(),
+            Value::Array(
+                value
+                    .arguments
+                    .iter()
+                    .map(instantiated_type_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !value.resolved_identities.is_empty() {
+        object.insert(
+            "resolved_identities".to_owned(),
+            Value::Array(
+                value
+                    .resolved_identities
+                    .iter()
+                    .map(|identity| {
+                        call_identity_to_json(&CallIdentity::Qualified {
+                            value: String::new(),
+                            source_range: None,
+                            resolved: Some(identity.clone()),
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(object)
+}
+
 fn call_identity_to_json(identity: &CallIdentity) -> Value {
     match identity {
         CallIdentity::Stable(identity) => json!({ "stable": identity }),
@@ -1442,6 +1504,9 @@ fn call_identity_to_json(identity: &CallIdentity) -> Value {
             }
             super::ir::ResolvedCallIdentityKind::ActiveSemanticModel => {
                 json!({ "active_semantic_model": resolved.identity })
+            }
+            super::ir::ResolvedCallIdentityKind::PossibleSemanticModel => {
+                json!({ "possible_semantic_model": resolved.identity })
             }
         },
     }
@@ -1474,7 +1539,7 @@ fn visibility_list_to_json(visibilities: &[DeclaredVisibility]) -> Value {
     }
 }
 
-fn pattern_to_json(pattern: &Pattern) -> Value {
+pub(super) fn pattern_to_json(pattern: &Pattern) -> Value {
     let mut object = Map::new();
     if !pattern.kinds.is_empty() {
         object.insert("kind".to_string(), kind_list_to_json(&pattern.kinds));
@@ -1578,6 +1643,18 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     if let Some(arity) = &pattern.arity {
         object.insert("arity".to_string(), arity_to_json(arity));
     }
+    if let Some(count) = &pattern.count {
+        let mut spec = Map::new();
+        spec.insert("role".to_string(), json!(count.role.label()));
+        spec.insert("pattern".to_string(), pattern_to_json(&count.pattern));
+        if count.min != 0 || count.max.is_none() {
+            spec.insert("min".to_string(), json!(count.min));
+        }
+        if let Some(max) = count.max {
+            spec.insert("max".to_string(), json!(max));
+        }
+        object.insert("count".to_string(), Value::Object(spec));
+    }
     if !pattern.visibility.is_empty() {
         object.insert(
             "visibility".to_string(),
@@ -1595,6 +1672,35 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     }
     if let Some(sub) = &pattern.has {
         object.insert("has".to_string(), pattern_to_json(sub));
+    }
+    if let Some(sub) = &pattern.each {
+        object.insert("each".to_string(), pattern_to_json(sub));
+    }
+    if !pattern.argument_modes.is_empty() {
+        object.insert(
+            "argument_mode".to_string(),
+            Value::Array(
+                pattern
+                    .argument_modes
+                    .iter()
+                    .map(|mode| {
+                        json!(match mode {
+                            ArgumentMode::Plain => "plain",
+                            ArgumentMode::Spread => "spread",
+                            ArgumentMode::Ref => "ref",
+                            ArgumentMode::Out => "out",
+                            ArgumentMode::In => "in",
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(constraint) = &pattern.qualifying_type {
+        object.insert(
+            "qualifying_type".to_owned(),
+            instantiated_type_to_json(constraint),
+        );
     }
     if let Some(sub) = &pattern.local_value {
         object.insert("local_value".to_string(), pattern_to_json(sub));

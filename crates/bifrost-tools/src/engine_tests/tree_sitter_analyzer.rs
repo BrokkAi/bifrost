@@ -1393,8 +1393,10 @@ mod tests {
             source_before_probe,
             source_after_probe,
         ));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let provider = analyzer
             .structural_fact_providers()
             .into_iter()
@@ -2122,14 +2124,7 @@ mod tests {
             ["cpp:c".to_owned()],
         )];
         let dirty_key = dirty_key.clone();
-        analyzer
-            .state
-            .dirty_file_states
-            .lock()
-            .expect("dirty file-state mutex poisoned")
-            .get_mut(&dirty_key)
-            .expect("failed preparation must remain dirty")
-            .next_retry_at = Instant::now();
+        analyzer.state.force_dirty_retry_for_test(&dirty_key);
         let starts = store.parsed_blob_transaction_starts_for_test();
 
         let retried = analyzer
@@ -2407,8 +2402,10 @@ mod tests {
             .collect::<Vec<_>>();
         let base: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let overlay = Arc::new(OverlayProject::new(base));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&overlay) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&overlay) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         for file in &files {
             analyzer.fetch_file_state(file).expect("warm file state");
         }
@@ -2538,6 +2535,9 @@ mod tests {
             }
         }
         impl LanguageAdapter for RangeAdapter {
+            fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+                CppAdapter.line_data_kinds()
+            }
             fn query_directory(&self) -> &'static str {
                 CppAdapter.query_directory()
             }
@@ -2617,7 +2617,7 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
-            RustAdapter,
+            RustAdapter::for_tests(),
             AnalyzerConfig::default(),
             store_context_from_store(project.as_ref(), store, false),
             None,
@@ -2630,7 +2630,8 @@ mod tests {
         "#6650: a source refused by admission cleared graph readiness for the whole inventory"
     )]
     fn refused_source_is_recorded_without_clearing_graph_readiness() {
-        let blob = format!("pub const DATA: &str = \"{}\";\n", "A".repeat(20_000));
+        // A long identifier is code; a long string line is admitted (#10694).
+        let blob = format!("pub struct DATA{};\n", "A".repeat(20_000));
         let fixture = crate::inline_project::InlineTestProject::with_language(Language::Rust)
             .file("src/lib.rs", "pub fn ok() {}\n")
             .file("src/blob.rs", blob.as_str())
@@ -3133,7 +3134,7 @@ mod tests {
     #[test]
     fn issue_1748_double_colon_spellings_do_not_seek_for_rust() {
         let (_temp, project) = rust_scoped_lookup_project();
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
 
         analyzer.reset_definition_candidate_row_read_count_for_test();
         analyzer.reset_structural_miss_spelling_count_for_test();
@@ -3221,7 +3222,7 @@ mod tests {
     #[test]
     fn issue_1748_dotted_rust_spellings_are_all_still_sought() {
         let (_temp, project) = rust_scoped_lookup_project();
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
 
         analyzer.reset_definition_candidate_row_read_count_for_test();
         analyzer.reset_structural_miss_spelling_count_for_test();
@@ -3256,7 +3257,7 @@ mod tests {
         )
             .expect("write Rust fixture");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
 
         let target = analyzer
             .declarations(&file)
@@ -3642,7 +3643,7 @@ mod tests {
             .store
             .ensure_language_epoch_value("python", "cutover-after-failure")
             .unwrap();
-        analyzer.state.dirty_file_states.lock().unwrap().insert(
+        analyzer.state.insert_dirty_file_state_for_test(
             key.clone(),
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
                 Arc::new(parsed),
@@ -3675,14 +3676,7 @@ mod tests {
             "terminal stale state must not schedule another obsolete write"
         );
         assert!(
-            analyzer
-                .state
-                .dirty_file_states
-                .lock()
-                .unwrap()
-                .get(&key)
-                .unwrap()
-                .status
+            analyzer.state.dirty_snapshot().get(&key).unwrap().status
                 == DirtyFileStateStatus::TerminalStale
         );
     }
@@ -3766,7 +3760,7 @@ mod tests {
                 &config,
                 &store_context,
             )),
-            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
+            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config, &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests())),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
                 &config,
             )),
@@ -3972,7 +3966,7 @@ mod tests {
                 &config,
                 &store_context,
             )),
-            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config)),
+            Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_index_cache(&config, &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests())),
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_snapshot_caches(
                 &config,
             )),
@@ -4077,7 +4071,7 @@ mod tests {
         );
 
         let rust_file = temp_file(&root, "src/net/mod.rs");
-        let rust = RustAdapter;
+        let rust = RustAdapter::for_tests();
         let rust_unit = CodeUnit::new(rust_file.clone(), CodeUnitType::Class, "net", "Client");
         assert_eq!(rust.storage_content_qualifier(&rust_unit, ""), "");
         assert_eq!(
@@ -4344,7 +4338,7 @@ mod tests {
             .collect();
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
         analyzer.get_all_declarations();
         let outside = files
             .iter()
@@ -4618,8 +4612,10 @@ mod tests {
                 "pub struct Target;\npub fn use_target() { let _ = Target; }\n",
             )
             .build();
-        let analyzer =
-            TreeSitterAnalyzer::new(fixture.project_dyn() as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            fixture.project_dyn() as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let scope = AnalyzerQueryScope::for_identifier_candidate_memo(&analyzer);
         let run_lookup = |identifier, limit| {
             let _site_scope = AnalyzerQueryScope::new(&analyzer);
@@ -4871,7 +4867,7 @@ mod tests {
         let store_context = store_context_from_store(project.as_ref(), store, false);
         let mut analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project) as Arc<dyn Project>,
-            RustAdapter,
+            RustAdapter::for_tests(),
             AnalyzerConfig::default(),
             store_context,
             None,
@@ -5074,8 +5070,10 @@ mod tests {
             .build();
         let file = fixture.file("src/main.rs");
         let project = Arc::new(CountingOverlayProject::new(fixture.root(), initial));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         project.set_source(changed);
         let updated = analyzer.update(&BTreeSet::from([file.clone()]));
         let scope = AnalyzerQueryScope::new(&updated);
@@ -5839,8 +5837,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let project = Arc::new(CountingOverlayProject::new(&root, "fn target() {}\n"));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let file = ProjectFile::new(&root, "src/main.rs");
 
         let first =
@@ -5952,7 +5952,7 @@ mod tests {
         file.write("fn target() {}\nfn consumer() { target(); }\n")
             .expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
 
         let first = {
             let scope =
@@ -5986,7 +5986,7 @@ mod tests {
         file.write("fn target() {}\nfn consumer() { target(); }\n")
             .expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
 
         let exact = |label: &str| {
             let scope =
@@ -6023,7 +6023,7 @@ mod tests {
                 .file("src/main.rs", source)
                 .build();
             let file = project.file("src/main.rs");
-            let analyzer = TreeSitterAnalyzer::new(project.project_dyn(), RustAdapter);
+            let analyzer = TreeSitterAnalyzer::new(project.project_dyn(), RustAdapter::for_tests());
             let target = analyzer
                 .lookup_candidates_by_identifier("target")
                 .into_iter()
@@ -6078,7 +6078,7 @@ mod tests {
         let file = temp_file(&root, "src/main.rs");
         file.write("fn target() {}\n").expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
 
         let first = {
             let scope =
@@ -6133,7 +6133,7 @@ mod tests {
         let file = temp_file(&root, "src/main.rs");
         file.write("fn target() {}\n").expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
         let scope =
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
         let prepared = analyzer
@@ -6189,7 +6189,7 @@ mod tests {
         let file = temp_file(&root, "src/main.rs");
         file.write("fn target() {}\n").expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
         let scope =
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
         let prepared = analyzer
@@ -6420,7 +6420,7 @@ mod tests {
         file.write("fn target() {}\nfn consumer() { target(); }\n")
             .expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
         let _scope =
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
         let barrier = Arc::new(Barrier::new(8));
@@ -6473,7 +6473,7 @@ mod tests {
         let project = fixture.project_dyn();
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
-            RustAdapter,
+            RustAdapter::for_tests(),
             AnalyzerConfig::default(),
             store_context_from_store(project.as_ref(), store, false),
             None,
@@ -6624,9 +6624,17 @@ mod tests {
             let store = AnalyzerStore::open_persistent(&db).expect("persistent store");
             let mut context = store_context_from_store(project.as_ref(), store, false);
             context.build_tier_access = Arc::new(AnalyzerBuildTierAccess::new_active());
+            // A workspace open lists the project once (workspace.rs), so its
+            // listing certificate describes that listing, as the update's does.
+            context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
+                project.as_ref(),
+                context.liveness.as_deref(),
+                &[Language::Rust],
+            );
+            context.workspace_listing_complete = context.workspace_snapshot.is_some();
             TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
                 Arc::clone(&project),
-                RustAdapter,
+                RustAdapter::for_tests(),
                 AnalyzerConfig::default(),
                 context,
                 None,
@@ -6913,7 +6921,7 @@ mod tests {
         let store = AnalyzerStore::open_persistent(&db).expect("workspace store");
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project_dyn),
-            RustAdapter,
+            RustAdapter::for_tests(),
             AnalyzerConfig::default(),
             store_context_from_store(project_dyn.as_ref(), store, false),
             None,
@@ -7216,6 +7224,9 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11231: an ignored JVM toolchain config edit was dropped as a listing non-member"
+    )]
     fn jvm_toolchain_native_configuration_lifecycle() {
         native_configuration_lifecycle(
             JavaAdapter,
@@ -7254,7 +7265,7 @@ mod tests {
             .expect("workspace snapshot");
         let captured = TreeSitterAnalyzer::<RustAdapter>::workspace_configuration_inputs(
             overlay.as_ref(),
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             Some(snapshot.as_ref()),
         )
         .expect("disk configuration capture");
@@ -7271,7 +7282,7 @@ mod tests {
             .expect("workspace snapshot with overlay-only path");
         let captured = TreeSitterAnalyzer::<RustAdapter>::workspace_configuration_inputs(
             overlay.as_ref(),
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             Some(snapshot.as_ref()),
         )
         .expect("overlay-only configuration is transient");
@@ -7289,8 +7300,10 @@ mod tests {
             .expect("source directory");
         file.write("fn disk() {}\n").expect("rust source");
         let project = Arc::new(CountingOverlayProject::new(&root, "fn first() {}\n"));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
 
         let first = {
             let scope =
@@ -7330,8 +7343,10 @@ mod tests {
         file.write("fn disk() {}\n").expect("rust source");
         let base: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let overlay = Arc::new(OverlayProject::new(base));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&overlay) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&overlay) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let source = (0..20_000)
             .map(|index| format!("fn target_{index}() {{}}\n"))
             .collect::<String>();
@@ -7411,8 +7426,10 @@ mod tests {
         file.write("fn disk() {}\n").expect("rust source");
         let base: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let overlay = Arc::new(OverlayProject::new(base));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&overlay) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&overlay) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let repeated_source = "fn repeated() {}\n";
 
         assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
@@ -7468,8 +7485,10 @@ mod tests {
         let source = "pub struct Example;\nimpl Example { pub fn value(&self) -> usize { 1 } }\n";
         file.write(source).expect("rust source");
         let project = Arc::new(CountingOverlayProject::new(root, source));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         project.reset_reads();
 
         let outer_scope =
@@ -7650,8 +7669,10 @@ mod tests {
         file.write(old_source).expect("Rust source");
 
         let project = Arc::new(CountingOverlayProject::new(&root, old_source));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let store = Arc::clone(&analyzer.store_context.store);
         let old_oid =
             Oid::hash_object(ObjectType::Blob, old_source.as_bytes()).expect("old source OID");
@@ -7713,8 +7734,10 @@ mod tests {
         indexed_file.write(source).expect("indexed Rust source");
 
         let project = Arc::new(CountingOverlayProject::new(&root, source));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         let store = Arc::clone(&analyzer.store_context.store);
         let generation = analyzer.store_context.generations["rust"];
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("source OID");
@@ -7896,7 +7919,7 @@ mod tests {
             .collect::<String>();
         file.write(&source).expect("source");
         let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter::for_tests());
         let units = analyzer.location_declarations(&file);
         assert_eq!(units.len(), 20, "{units:?}");
 
@@ -7919,7 +7942,7 @@ mod tests {
         let disk_source = "fn disk() {}\n";
         file.write(disk_source).expect("disk source");
         let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter::for_tests());
         let expected =
             |source: &str| Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("blob oid");
 
@@ -7991,8 +8014,10 @@ mod tests {
         file.write("fn disk() {}\n").expect("rust source");
 
         let live_project = Arc::new(CountingOverlayProject::new(&root, "fn live() {}\n"));
-        let analyzer =
-            TreeSitterAnalyzer::new(Arc::clone(&live_project) as Arc<dyn Project>, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(
+            Arc::clone(&live_project) as Arc<dyn Project>,
+            RustAdapter::for_tests(),
+        );
         live_project.reset_reads();
         let _live_scope =
             brokk_bifrost_analysis::analyzer::i_analyzer::AnalyzerQueryScope::new(&analyzer);
@@ -8035,7 +8060,7 @@ mod tests {
         let overlay_source = "fn unsaved() { disk(); }\n";
         file.write(disk_source).expect("disk source");
         let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let disk = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
+        let disk = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter::for_tests());
         let sibling = disk.clone_with_project(Arc::clone(&base));
         let disk_oid = Oid::hash_object(ObjectType::Blob, disk_source.as_bytes()).unwrap();
         let overlay_oid = Oid::hash_object(ObjectType::Blob, overlay_source.as_bytes()).unwrap();
@@ -8215,7 +8240,7 @@ mod tests {
         .expect("rust source");
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter::for_tests());
         let cancellation = CancellationToken::cancel_after_checks_for_test(6);
         let patterns =
             SearchSymbolPatternBatch::compile(vec!["diagnostic_.*".to_string()], false, None);

@@ -23,8 +23,8 @@ use super::fact_lowering::{
 };
 use super::local_identity::{ResolutionIdentityTranslation, ResolutionMountTranslation};
 use super::model::{
-    BindingFragmentId, BindingNodeId, BindingNodeKind, EndpointSignature, PartialPath,
-    PartialPathId, PartialScopedSymbol, PrecedenceStep, ResolutionCompletion,
+    BindingFragmentId, BindingNodeId, BindingNodeKind, EndpointSignature, LexicalChoiceRecord,
+    PartialPath, PartialPathId, PartialScopedSymbol, PrecedenceStep, ResolutionCompletion,
     ResolutionIncompleteReason, ResolutionSlotValue, ResolutionTypeRef, ScopeStackPattern,
     SemanticId, StackPattern, StackVariableId, SymbolStackPattern, TypeTransferRule,
     TypedFrontierState, WitnessStep,
@@ -217,6 +217,10 @@ fn remount_lexical(
                 site.site_metadata()
                     .map(|metadata| remount_site_metadata(metadata, translation)),
             )
+            .with_prefix_reference(
+                site.prefix_reference()
+                    .map(|prefix| prefix.map(|prefix| translation.semantic(prefix))),
+            )
             .with_go_definition_namespaces(site.go_definition_namespaces()),
         );
     }
@@ -314,6 +318,38 @@ pub(super) fn remount_path(
         });
     }
     let completion = remount_completion(path.completion(), translation, cancellation)?;
+    let mut lexical_choices = Vec::with_capacity(path.lexical_choices().len());
+    for record in path.lexical_choices() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let reason = remount_completion(
+            &ResolutionCompletion::incomplete([record.reason]),
+            translation,
+            cancellation,
+        )?;
+        let ResolutionCompletion::Incomplete(reasons) = reason else {
+            unreachable!("a remounted lexical reason stays incomplete")
+        };
+        let mut steps = Vec::with_capacity(record.precedence.len());
+        for step in record.precedence.iter() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            steps.push(PrecedenceStep {
+                semantic: translation.semantic(step.semantic),
+                ..*step
+            });
+        }
+        lexical_choices.push(LexicalChoiceRecord {
+            source_fragment: translation.fragment(record.source_fragment),
+            source_path: translation.path(record.source_path),
+            reason: reasons.iter().next().copied().expect("one lexical reason"),
+            owner: translation.node(record.owner),
+            precedence: steps.into_boxed_slice(),
+            segment_position: record.segment_position,
+        });
+    }
     let remounted = PartialPath::new_with_poll(
         start,
         end,
@@ -322,6 +358,11 @@ pub(super) fn remount_path(
         completion,
         &mut || cancellation.is_cancelled(),
     )?
+    .with_lexical_metadata(
+        lexical_choices.into_boxed_slice(),
+        path.addressed_lexical_choice(),
+        path.segment_count(),
+    )
     .with_root_import_activation(path.root_import_activation())
     .with_native_import(path.native_import().map(|(token, route)| {
         Box::new((
@@ -447,6 +488,11 @@ pub(super) fn remount_completion(
             }
             ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
                 ResolutionIncompleteReason::UnsupportedSemantic(translation.semantic(*semantic))
+            }
+            ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => {
+                ResolutionIncompleteReason::ReceiverSubclassObligation(
+                    translation.semantic(*semantic),
+                )
             }
         });
     }
@@ -909,6 +955,8 @@ fn remount_common(
         declared_root_routes,
         root_import_provenance,
         package_references,
+        reference_execution_contexts,
+        lexical_package_contexts,
         package_members,
         package_routes,
         go_package_imports,
@@ -1136,6 +1184,7 @@ fn remount_common(
     }
     let shared_language = LoweredSharedLanguageFacts {
         aliases: shared_language.aliases,
+        extern_aliases: shared_language.extern_aliases,
         compilation_imports: shared_language.compilation_imports,
         call_argument_lists: shared_language.call_argument_lists,
         call_arguments: remounted_call_arguments,
@@ -1162,6 +1211,8 @@ fn remount_common(
         remounted_routes,
         remounted_import_provenance,
         remounted_package_references,
+        reference_execution_contexts,
+        lexical_package_contexts,
         remounted_package_members,
         remounted_package_routes,
         remounted_go_package_imports,
@@ -1250,6 +1301,7 @@ pub(super) fn remount_member_scope(
         translation.node(property.scope_head()),
         property.scope_kind(),
     )
+    .with_member_types(property.member_types())
 }
 
 pub(super) fn remount_member_owner(

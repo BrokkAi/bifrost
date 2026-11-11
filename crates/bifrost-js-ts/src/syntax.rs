@@ -13,6 +13,7 @@ use brokk_bifrost_core::analyzer::source_facts::{
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
+use brokk_bifrost_core::analyzer::work_budget::NodeBudget;
 use brokk_bifrost_core::analyzer::{Language, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Tree};
@@ -813,33 +814,32 @@ pub struct JsTsRuntimeReadFacts {
 /// few matching facts from making extraction unbounded.
 #[derive(Debug)]
 struct JsTsRuntimeTraversalBudget {
-    remaining: usize,
-    exhausted: bool,
-    visited_nodes: usize,
+    nodes: NodeBudget,
     facts_truncated: bool,
 }
 
 impl JsTsRuntimeTraversalBudget {
     fn for_facts(max_facts: usize) -> Self {
         Self {
-            remaining: max_facts
-                .saturating_add(1)
-                .saturating_mul(1024)
-                .min(1_000_000),
-            exhausted: false,
-            visited_nodes: 0,
+            nodes: NodeBudget::new(
+                max_facts
+                    .saturating_add(1)
+                    .saturating_mul(1024)
+                    .min(1_000_000),
+            ),
+            facts_truncated: false,
+        }
+    }
+
+    fn unbounded() -> Self {
+        Self {
+            nodes: NodeBudget::new(usize::MAX),
             facts_truncated: false,
         }
     }
 
     fn visit(&mut self) -> bool {
-        if self.remaining == 0 {
-            self.exhausted = true;
-            return false;
-        }
-        self.remaining -= 1;
-        self.visited_nodes = self.visited_nodes.saturating_add(1);
-        true
+        self.nodes.visit()
     }
 }
 
@@ -859,12 +859,7 @@ pub struct JsTsStaticMemberReceiver<'tree> {
 
 impl JsTsLexicalBindingIndex {
     pub fn build(root: Node<'_>, source: &str) -> Self {
-        let mut budget = JsTsRuntimeTraversalBudget {
-            remaining: usize::MAX,
-            exhausted: false,
-            visited_nodes: 0,
-            facts_truncated: false,
-        };
+        let mut budget = JsTsRuntimeTraversalBudget::unbounded();
         Self::build_bounded(root, source, &mut budget).0
     }
 
@@ -1131,7 +1126,7 @@ impl JsTsLexicalBindingIndex {
                     .push((scope, node_source_range(binder), target.to_string()));
             }
         }
-        let complete = !budget.exhausted && !index.incomplete_parameter_patterns;
+        let complete = !budget.nodes.exhausted() && !index.incomplete_parameter_patterns;
         (index, complete)
     }
 
@@ -2354,7 +2349,7 @@ fn collect_runtime_global_writes_with_budget(
             stack.push(child);
         }
     }
-    (writes, !budget.exhausted)
+    (writes, !budget.nodes.exhausted())
 }
 
 fn append_runtime_write_facts(
@@ -2766,12 +2761,7 @@ fn module_member_writes(
         };
         written_member(access)
     };
-    let mut write_budget = JsTsRuntimeTraversalBudget {
-        remaining: usize::MAX,
-        exhausted: false,
-        visited_nodes: 0,
-        facts_truncated: false,
-    };
+    let mut write_budget = JsTsRuntimeTraversalBudget::unbounded();
     let mut writes = JsTsModuleMemberWrites::default();
     // The earliest refusal in the file is the one reported, so a caller naming
     // the site names the first thing a reader would find.
@@ -2977,19 +2967,19 @@ pub fn extract_js_ts_runtime_reads(
         writes,
         effect_coverage,
         accessor_coverage,
-        visited_nodes: budget.visited_nodes,
+        visited_nodes: budget.nodes.visited(),
         traversal_complete: bindings_complete
             && writes_complete
             && effects_complete
             && accessors_complete
             && scopes_complete
-            && !budget.exhausted,
+            && !budget.nodes.exhausted(),
         complete: bindings_complete
             && writes_complete
             && effects_complete
             && accessors_complete
             && scopes_complete
-            && !budget.exhausted
+            && !budget.nodes.exhausted()
             && !budget.facts_truncated,
     }
 }
@@ -3018,12 +3008,7 @@ fn runtime_effect_coverage_with_bindings(
         bindings,
         root,
         source,
-        &mut JsTsRuntimeTraversalBudget {
-            remaining: usize::MAX,
-            exhausted: false,
-            visited_nodes: 0,
-            facts_truncated: false,
-        },
+        &mut JsTsRuntimeTraversalBudget::unbounded(),
     )
     .0
 }
@@ -3121,15 +3106,24 @@ fn runtime_effect_coverage_with_bindings_bounded(
             break;
         }
         if runtime_effect_hazard_kind(node.kind()) {
-            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
+            return (
+                JsTsRuntimeEffectCoverage::Unknown,
+                !budget.nodes.exhausted(),
+            );
         }
         if runtime_linkage_boundary(node) {
-            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
+            return (
+                JsTsRuntimeEffectCoverage::Unknown,
+                !budget.nodes.exhausted(),
+            );
         }
         if node.kind() == "call_expression"
             && !runtime_call_is_local(bindings, &local_functions, node, source)
         {
-            return (JsTsRuntimeEffectCoverage::Unknown, !budget.exhausted);
+            return (
+                JsTsRuntimeEffectCoverage::Unknown,
+                !budget.nodes.exhausted(),
+            );
         }
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -3138,7 +3132,7 @@ fn runtime_effect_coverage_with_bindings_bounded(
     }
     (
         JsTsRuntimeEffectCoverage::ClosedLocalCalls,
-        !budget.exhausted,
+        !budget.nodes.exhausted(),
     )
 }
 
@@ -3238,7 +3232,7 @@ fn runtime_accessor_coverage_bounded(
         {
             return (
                 JsTsRuntimeAccessorCoverage::UnknownAccessorEffects,
-                !budget.exhausted,
+                !budget.nodes.exhausted(),
             );
         }
         let mut cursor = node.walk();
@@ -3248,7 +3242,7 @@ fn runtime_accessor_coverage_bounded(
     }
     (
         JsTsRuntimeAccessorCoverage::NoKnownAccessorEffects,
-        !budget.exhausted,
+        !budget.nodes.exhausted(),
     )
 }
 
@@ -3319,7 +3313,7 @@ fn runtime_scope_hazards(
         }
         push_scope_children(&mut stack, node, scope_root);
     }
-    (hazards, !budget.exhausted)
+    (hazards, !budget.nodes.exhausted())
 }
 
 /// The outermost iteration construct between `node` and `scope_root`. Any
@@ -3398,7 +3392,7 @@ fn local_function_bindings_bounded(
             stack.push(child);
         }
     }
-    (functions, !budget.exhausted)
+    (functions, !budget.nodes.exhausted())
 }
 
 /// Resolve a property/member-name node whose name is statically determined by
@@ -6104,12 +6098,7 @@ relay();
         let recovered = "function f(X = missing +) { var X; }";
         let tree = parse_javascript(recovered);
         assert!(tree.root_node().has_error());
-        let mut budget = JsTsRuntimeTraversalBudget {
-            remaining: usize::MAX,
-            exhausted: false,
-            visited_nodes: 0,
-            facts_truncated: false,
-        };
+        let mut budget = JsTsRuntimeTraversalBudget::unbounded();
         let (bindings, complete) =
             JsTsLexicalBindingIndex::build_bounded(tree.root_node(), recovered, &mut budget);
         assert!(
@@ -6118,9 +6107,7 @@ relay();
         );
         assert!(bindings.incomplete_parameter_patterns);
         let mut budget = JsTsRuntimeTraversalBudget {
-            remaining: 1,
-            exhausted: false,
-            visited_nodes: 0,
+            nodes: NodeBudget::new(1),
             facts_truncated: false,
         };
         let tree = parse_javascript("function f(X = 1) {}");
@@ -6129,7 +6116,7 @@ relay();
             function_parameter_contains_expression(function, &mut budget),
             None
         );
-        assert!(budget.exhausted);
+        assert!(budget.nodes.exhausted());
     }
 
     #[test]

@@ -185,7 +185,20 @@ fn extract_file_facts_limited_with_tree(
     // One per-file scan, before any call site is classified: a language whose
     // call shapes depend on file-wide facts (C/C++ function-like macros) reads
     // the whole tree once here instead of once per call.
-    let call_site_context = spec.call_site_context(tree.root_node(), source);
+    let call_site_context = match spec.call_site_context_limited(
+        tree.root_node(),
+        source,
+        max_fact_nodes,
+        cancellation,
+    ) {
+        Ok(context) => context,
+        Err(StructuralFactCollectorStop::Cancelled) => return LimitedFileFacts::Cancelled,
+        Err(StructuralFactCollectorStop::Exceeded) => {
+            return LimitedFileFacts::Exceeded {
+                minimum_fact_nodes: max_fact_nodes.saturating_add(1),
+            };
+        }
+    };
     let mut source_facts = PrimarySourceFactCollector::new(source);
 
     // The parser and the iterative walk remain language-owned. The collector
@@ -236,6 +249,47 @@ mod tests {
     use super::super::occurrences::OccurrenceRole;
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10389: raw Rust syntax depth cannot reject admitted cold facts")]
+    fn rust_raw_syntax_budget_matches_hydrated_warm_facts() {
+        let spec = &brokk_bifrost_rust::structural::RUST_STRUCTURAL_SPEC;
+        let grammar = tree_sitter_rust::LANGUAGE.into();
+        let source = format!(
+            "fn f() {{ let x: i32; let _ = {}1{}; }}",
+            "(".repeat(256),
+            ")".repeat(256)
+        );
+        let full = extract_file_facts(spec, &grammar, &source).unwrap();
+        let limit = full.work_item_count();
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let mut raw_count = 0usize;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            raw_count += 1;
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(raw_count > limit, "raw={raw_count}, normalized={limit}");
+        let LimitedFileFacts::Complete(cold) =
+            extract_file_facts_limited(spec, &grammar, &source, limit, None)
+        else {
+            panic!("cold extraction must admit the normalized fact budget");
+        };
+        let warm =
+            FileFacts::from_persisted_rows(source.clone(), cold.persisted_rows().unwrap()).unwrap();
+        let shape = |facts: &FileFacts| {
+            facts
+                .nodes()
+                .iter()
+                .map(|node| (node.kind, node.range, node.construct.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&cold), shape(&warm));
+        assert_eq!(cold.work_item_count(), warm.work_item_count());
+    }
 
     /// #1459: an empty file is a legitimate workspace member with zero facts
     /// (empty `__init__.py`, placeholder `.ts` fixtures). It must extract as

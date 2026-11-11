@@ -174,7 +174,7 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
                 site: u32,
             },
             Unstaged {
-                blob: i64,
+                path: String,
                 declaration: i64,
                 module: bool,
             },
@@ -215,7 +215,7 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
                             end,
                         },
                         MissingDeclaration::Unstaged {
-                            blob: export.blob,
+                            path: mount.persisted_relative_path().to_owned(),
                             declaration,
                             module,
                         },
@@ -239,12 +239,12 @@ impl<'a, 'store> EndpointRows<'a, 'store, '_> {
                         )
                     }
                     MissingDeclaration::Unstaged {
-                        blob,
+                        path,
                         declaration,
                         module,
                     } => sql::unstaged_macro_item(
                         &self.ready.context_identities,
-                        blob,
+                        &path,
                         declaration,
                         module,
                     ),

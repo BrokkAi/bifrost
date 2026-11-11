@@ -14,7 +14,194 @@ use crate::analyzer::semantic::SemanticBudgetDimension;
 use crate::query::PlanPartitioning;
 use crate::structural::execution::plan::StepOutputCap;
 use crate::structural::identifier_dictionary::IdentifierDictionary;
+use crate::structural::identifier_typos::IdentifierTypoTable;
 use std::path::Path;
+
+// An exactly empty set prefix makes every later operand irrelevant to the answer.
+pub(super) const EXACT_SHORT_CIRCUIT_DEPTH_STATUS: DepthBoundStatus = DepthBoundStatus::NotReached;
+
+/// Whether a certified empty operand ends this set in authored order.
+pub(super) fn empty_operand_ends_set(operator: SetOperator, operand: usize) -> bool {
+    match operator {
+        SetOperator::Intersect => true,
+        SetOperator::Except => operand == 0,
+        SetOperator::Union => false,
+    }
+}
+
+fn skipped_depth_answers_at(plan: &CodeQueryPlan, path: &[usize]) -> Vec<BoundedCallAnswer> {
+    let mut answers = unknown_depth_answers_at(plan, path);
+    for answer in &mut answers {
+        answer.membership_unknown = EXACT_SHORT_CIRCUIT_DEPTH_STATUS == DepthBoundStatus::Unknown;
+    }
+    answers
+}
+
+fn replace_skipped_depth_answers(
+    answers: &mut Vec<BoundedCallAnswer>,
+    plan: &CodeQueryPlan,
+    operands: &[CodeQueryPlan],
+) {
+    for operand in operands {
+        let skipped = skipped_depth_answers_at(operand, &authored_subplan_path(plan, operand));
+        let keys = skipped
+            .iter()
+            .map(|answer| answer.traversal.as_str())
+            .collect::<HashSet<_>>();
+        answers.retain(|answer| !keys.contains(answer.traversal.as_str()));
+        answers.extend(skipped);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BoundedMemberRow {
+    pub(crate) identity: UnitRowKey,
+    pub(crate) depth: usize,
+}
+
+/// The bounded traversal's own member rows, retained before suffix projection.
+/// Only stable declaration identities are retained, not duplicate rendered rows,
+/// provenance or evidence. Depth-zero seeds are member rows too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundedCallAnswer {
+    pub(crate) traversal: String,
+    pub(crate) members: Vec<BoundedMemberRow>,
+    pub(crate) bound: usize,
+    pub(crate) frontier: Vec<(UnitRowKey, UnitRowKey)>,
+    pub(crate) undecided_frontier: Vec<UnitRowKey>,
+    pub(crate) membership_unknown: bool,
+    #[serde(default)]
+    pub(crate) budget_stopped: bool,
+}
+
+impl BoundedCallAnswer {
+    pub(crate) fn status(&self) -> DepthBoundStatus {
+        if self.membership_unknown {
+            DepthBoundStatus::Unknown
+        } else if !self.frontier.is_empty() {
+            DepthBoundStatus::Reached
+        } else if !self.undecided_frontier.is_empty() || self.budget_stopped {
+            DepthBoundStatus::Unknown
+        } else {
+            DepthBoundStatus::NotReached
+        }
+    }
+}
+
+pub(super) fn bounded_member_row(unit: &CodeUnit) -> UnitRowKey {
+    // Traversal membership is declaration identity, not a rendered source range.
+    key("bounded_declaration").declaration(unit).finish()
+}
+
+pub(super) fn authored_plan_nodes(plan: &CodeQueryPlan) -> Vec<(&CodeQueryPlan, Vec<usize>)> {
+    let mut pending = vec![(plan, Vec::new())];
+    let mut nodes = Vec::new();
+    while let Some((node, path)) = pending.pop() {
+        for (index, child) in node.source.child_plans().into_iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            pending.push((child, child_path));
+        }
+        nodes.push((node, path));
+    }
+    nodes
+}
+
+fn authored_subplan_path(root: &CodeQueryPlan, subplan: &CodeQueryPlan) -> Vec<usize> {
+    authored_plan_nodes(root)
+        .into_iter()
+        .find(|(node, _)| std::ptr::eq(*node, subplan))
+        .expect("the cut operand is an authored subtree")
+        .1
+}
+
+fn unknown_depth_answers_at(plan: &CodeQueryPlan, base_path: &[usize]) -> Vec<BoundedCallAnswer> {
+    let mut answers = Vec::new();
+    for (node, path) in authored_plan_nodes(plan) {
+        let mut absolute = base_path.to_vec();
+        absolute.extend(path);
+        for (position, step) in node.steps.iter().enumerate() {
+            if let QueryStep::Callers(filter) | QueryStep::Callees(filter) = step {
+                answers.push(BoundedCallAnswer {
+                    traversal: traversal_key(node, position, &absolute),
+                    members: Vec::new(),
+                    frontier: Vec::new(),
+                    bound: filter.depth.get(),
+                    undecided_frontier: Vec::new(),
+                    membership_unknown: true,
+                    budget_stopped: false,
+                });
+            }
+        }
+    }
+    answers
+}
+
+fn unknown_depth_answers(plan: &CodeQueryPlan) -> Vec<BoundedCallAnswer> {
+    unknown_depth_answers_at(plan, &[])
+}
+
+fn rebased_traversal_keys(plan: &CodeQueryPlan, base_path: &[usize]) -> HashMap<String, String> {
+    let mut rewrites = HashMap::default();
+    for (node, path) in authored_plan_nodes(plan) {
+        let mut absolute = base_path.to_vec();
+        absolute.extend_from_slice(&path);
+        for (position, step) in node.steps.iter().enumerate() {
+            if matches!(step, QueryStep::Callers(_) | QueryStep::Callees(_)) {
+                rewrites.insert(
+                    traversal_key(node, position, &path),
+                    traversal_key(node, position, &absolute),
+                );
+            }
+        }
+    }
+    rewrites
+}
+
+/// Reconcile each authored traversal independently. A locally depth-N witness
+/// survives exactly when its target is outside the union of the bounded answers.
+/// If another seed reaches the source earlier, it must already include that
+/// target within N, so no second merged-depth test is necessary.
+fn reconciled_depth_status(answers: &[BoundedCallAnswer]) -> Option<DepthBoundStatus> {
+    let mut groups: HashMap<&str, Vec<&BoundedCallAnswer>> = HashMap::default();
+    for answer in answers {
+        groups.entry(&answer.traversal).or_default().push(answer);
+    }
+    let mut status = None;
+    for group in groups.values() {
+        let mut members: HashMap<&UnitRowKey, usize> = HashMap::default();
+        for member in group.iter().flat_map(|answer| &answer.members) {
+            members
+                .entry(&member.identity)
+                .and_modify(|depth| *depth = (*depth).min(member.depth))
+                .or_insert(member.depth);
+        }
+        let observed = if group.iter().any(|answer| answer.membership_unknown) {
+            DepthBoundStatus::Unknown
+        } else if group
+            .iter()
+            .flat_map(|answer| &answer.frontier)
+            .any(|(_, target)| !members.contains_key(target))
+        {
+            DepthBoundStatus::Reached
+        // Uncertainty needs a frontier at the merged depth. Witnesses above
+        // deliberately use only target membership, never a source-depth test.
+        } else if group.iter().any(|answer| {
+            answer.budget_stopped
+                || answer.undecided_frontier.iter().any(|source| {
+                    members
+                        .get(source)
+                        .is_none_or(|depth| *depth >= answer.bound)
+                })
+        }) {
+            DepthBoundStatus::Unknown
+        } else {
+            DepthBoundStatus::NotReached
+        };
+        join_depth_bound_status(&mut status, Some(observed));
+    }
+    status
+}
 
 /// Native operand rows from one seed at a root intersect cut. The rows remain
 /// typed until the physical set operator and its suffix consume them.
@@ -26,6 +213,8 @@ pub struct IntersectPrefixProduct {
     pub work: CodeQueryExecutionWork,
     pub budgeted_work: CodeQueryBudgetedWork,
     pub completion: CodeQueryCompletion,
+    pub depth_bound_status: Option<DepthBoundStatus>,
+    pub depth_answers: Vec<BoundedCallAnswer>,
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub reads: Vec<crate::analyzer::read_ledger::ReadKey>,
     pub reads_closed: bool,
@@ -223,7 +412,7 @@ impl IntersectPrefixProduct {
                     facts,
                     fact_match: FactMatch {
                         node,
-                        captures: Vec::new(),
+                        captures: Arc::from([]),
                         reported_range: None,
                         heuristic: None,
                     },
@@ -281,6 +470,7 @@ impl IntersectPrefixProduct {
             IntersectTraceValueIdentity::DispatchTarget {
                 rel_path,
                 site_id,
+                root_id,
                 start_byte,
                 end_byte,
                 ordinal,
@@ -347,6 +537,7 @@ impl IntersectPrefixProduct {
                             site_ast_id,
                             answer,
                         },
+                        root_id,
                         ordinal,
                     },
                 )))
@@ -406,7 +597,7 @@ impl IntersectPrefixProduct {
         if value.2 != site_id {
             return Err(CorruptIntersectProduct);
         }
-        Ok(PipelineVia::CallSite(value))
+        Ok(PipelineVia::CallSite(Box::new(value)))
     }
 
     /// Number of native rows in each authored operand.
@@ -431,11 +622,14 @@ impl IntersectPrefixProduct {
         }
         let envelope = IntersectPrefixEnvelope {
             seed: rel_path_string(&self.seed),
+            operator: cut.operator(plan).label().to_string(),
             operands: self.encode_rows_json(plan)?,
             operand_step_outputs: self.operand_step_outputs.clone(),
             work: self.work,
             budgeted_work: self.budgeted_work.clone(),
             completion: self.completion.clone(),
+            depth_bound_status: self.depth_bound_status,
+            depth_answers: self.depth_answers.clone(),
             diagnostics: self.diagnostics.clone(),
             diagnostic_causes: self
                 .diagnostics
@@ -499,7 +693,8 @@ impl IntersectPrefixProduct {
         else {
             return Err(CorruptIntersectProduct);
         };
-        if envelope.seed != rel_path_string(&seed)
+        if envelope.operator != cut.operator(plan).label()
+            || envelope.seed != rel_path_string(&seed)
             || !envelope.reads_closed
             || reads.is_empty()
             || envelope.read_set_digest
@@ -550,6 +745,8 @@ impl IntersectPrefixProduct {
             work: envelope.work,
             budgeted_work: envelope.budgeted_work,
             completion: envelope.completion,
+            depth_bound_status: envelope.depth_bound_status,
+            depth_answers: envelope.depth_answers,
             diagnostics,
             reads,
             reads_closed: true,
@@ -794,7 +991,7 @@ impl IntersectPrefixProduct {
                             facts: Arc::clone(&facts),
                             fact_match: FactMatch {
                                 node: node_id,
-                                captures: Vec::new(),
+                                captures: Arc::from([]),
                                 reported_range: None,
                                 heuristic: None,
                             },
@@ -892,7 +1089,7 @@ impl IntersectPrefixProduct {
                                     facts: Arc::clone(&facts),
                                     fact_match: FactMatch {
                                         node: trace.seed_node,
-                                        captures: Vec::new(),
+                                        captures: Arc::from([]),
                                         reported_range: None,
                                         heuristic: None,
                                     },
@@ -929,11 +1126,16 @@ pub struct CorruptIntersectProduct;
 #[serde(deny_unknown_fields)]
 struct IntersectPrefixEnvelope {
     seed: String,
+    operator: String,
     operands: serde_json::Value,
     operand_step_outputs: Vec<Vec<u64>>,
     work: CodeQueryExecutionWork,
     budgeted_work: CodeQueryBudgetedWork,
     completion: CodeQueryCompletion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    depth_bound_status: Option<DepthBoundStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    depth_answers: Vec<BoundedCallAnswer>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     diagnostic_causes: Vec<IntersectDiagnosticCause>,
     reads_closed: bool,
@@ -1054,6 +1256,7 @@ enum IntersectTraceValueIdentity {
     DispatchTarget {
         rel_path: String,
         site_id: String,
+        root_id: String,
         start_byte: usize,
         end_byte: usize,
         ordinal: usize,
@@ -1154,6 +1357,7 @@ fn encode_trace_value(
         PipelineTraceValue::DispatchTarget(value) => IntersectTraceValueIdentity::DispatchTarget {
             rel_path: rel_path_string(value.file()),
             site_id: value.site.site_id.clone(),
+            root_id: value.root_id.clone(),
             start_byte: value.site.range.start_byte,
             end_byte: value.site.range.end_byte,
             ordinal: value.ordinal,
@@ -1299,7 +1503,10 @@ fn resolve_intersect_step_slot<'a>(
 pub struct IntersectContinuationResult {
     pub detailed: Option<DetailedCodeQueryResult>,
     pub completion: CodeQueryCompletion,
+    pub depth_bound_status: Option<DepthBoundStatus>,
     pub diagnostics: Vec<CodeQueryDiagnostic>,
+    pub work: CodeQueryExecutionWork,
+    pub budgeted_work: CodeQueryBudgetedWork,
 }
 
 impl IntersectContinuationResult {
@@ -1323,21 +1530,137 @@ impl IntersectContinuationResult {
                 budgeted_work: detailed.budgeted_work,
                 diagnostics: detailed.result.diagnostics,
                 truncated: detailed.result.truncated,
+                depth_bound_status: detailed.result.depth_bound_status,
                 fair_share_divisor: 1,
                 step_output_caps: unit_step_output_caps(query),
             },
             None => MergedUnitRows {
                 items: Vec::new(),
                 evidence: Vec::new(),
-                work: CodeQueryExecutionWork::default(),
-                budgeted_work: CodeQueryBudgetedWork::default(),
+                work: self.work,
+                budgeted_work: self.budgeted_work,
                 diagnostics: self.diagnostics,
                 truncated: true,
+                depth_bound_status: self.depth_bound_status,
                 fair_share_divisor: 1,
                 step_output_caps: unit_step_output_caps(query),
             },
         }
     }
+}
+
+/// A caller-certified complete, empty operand-zero result for every seed.
+/// Its rows have no set members; only physical work and diagnostics survive.
+#[derive(Debug)]
+pub struct CompleteEmptyFromOperandZero {
+    pub probes: Vec<(
+        UnitExecutionResult,
+        Vec<crate::analyzer::read_ledger::ReadKey>,
+    )>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continue_empty_operand_zero(
+    analyzer: &dyn IAnalyzer,
+    flow_state: impl Into<SemanticFlowResources> + Clone,
+    workspace: Option<&WorkspaceAnalyzer>,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    seeds: &[ProjectFile],
+    empty: CompleteEmptyFromOperandZero,
+    scope: CodeQueryExecutionScope<'_>,
+) -> IntersectContinuationResult {
+    let PlanPartitioning::Prefix { cut } = PlanPartitioning::classify_for_prefix(&query.plan)
+    else {
+        panic!("empty operand continuation requires a prefix cut");
+    };
+    assert!(matches!(
+        cut.operator(&query.plan),
+        SetOperator::Intersect | SetOperator::Except
+    ));
+    assert_eq!(empty.probes.len(), seeds.len());
+    let operands = cut.operands(&query.plan);
+    let prefixes = seeds
+        .iter()
+        .cloned()
+        .zip(empty.probes)
+        .map(|(seed, (probe, reads))| {
+            assert!(probe.rows.is_empty() && !probe.truncated);
+            assert_eq!(probe.completion, CodeQueryCompletion::Complete);
+            let mut slots = operands
+                .iter()
+                .map(|operand| {
+                    let branch_query = CodeQuery {
+                        plan: operand.clone(),
+                        limit: usize::MAX,
+                        ..query.clone()
+                    };
+                    let branch_plan = select_physical_plan(
+                        &branch_query,
+                        UnionExecutionStrategy::Sequential,
+                        1,
+                        0,
+                    )
+                    .expect("eligible operand has a physical plan");
+                    vec![0; branch_plan.step_output_caps().len()]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(slots[0].len(), probe.budgeted_work.step_outputs.len());
+            slots[0] = probe.budgeted_work.step_outputs.clone();
+            let mut status = probe.depth_bound_status;
+            let mut depth_answers = probe.depth_answers;
+            let rewrites = rebased_traversal_keys(
+                &operands[0],
+                &authored_subplan_path(&query.plan, &operands[0]),
+            );
+            for answer in &mut depth_answers {
+                if let Some(key) = rewrites.get(&answer.traversal) {
+                    answer.traversal = key.clone();
+                }
+            }
+            for operand in operands[1..]
+                .iter()
+                .filter(|_| scope.computes_depth_bound_status())
+            {
+                depth_answers.extend(skipped_depth_answers_at(
+                    operand,
+                    &authored_subplan_path(&query.plan, operand),
+                ));
+            }
+            if scope.computes_depth_bound_status()
+                && operands[1..]
+                    .iter()
+                    .any(super::query_plan_has_bounded_call_step)
+            {
+                join_depth_bound_status(&mut status, Some(EXACT_SHORT_CIRCUIT_DEPTH_STATUS));
+            }
+            IntersectPrefixProduct {
+                seed,
+                operands: vec![Vec::new(); operands.len()],
+                operand_step_outputs: slots,
+                work: probe.work,
+                budgeted_work: probe.budgeted_work,
+                completion: probe.completion,
+                depth_bound_status: status,
+                depth_answers,
+                diagnostics: probe.diagnostics,
+                reads,
+                reads_closed: true,
+            }
+        })
+        .collect();
+    continue_intersect_prefix(
+        analyzer,
+        flow_state,
+        workspace,
+        query,
+        limits,
+        cancellation,
+        seeds,
+        prefixes,
+        scope,
+    )
 }
 
 /// Merge every seed's native operands in whole-run order, evaluate the
@@ -1352,13 +1675,45 @@ pub fn continue_intersect_prefix(
     cancellation: Option<&CancellationToken>,
     seeds: &[ProjectFile],
     prefixes: Vec<IntersectPrefixProduct>,
+    scope: CodeQueryExecutionScope<'_>,
 ) -> IntersectContinuationResult {
     let crate::query::PlanPartitioning::Prefix { cut } =
         PlanPartitioning::classify_for_prefix(&query.plan)
     else {
         panic!("intersect continuation requires an eligible cut");
     };
+    // Structural seeds use relative-path string order, which differs from
+    // ProjectFile's component order for paths such as stats.rs/stats/client.rs.
+    assert_eq!(seeds, plan_seed_files(&query.plan, seeds));
+    assert!(seeds.windows(2).all(|pair| pair[0] != pair[1]));
     let mut diagnostics = Vec::new();
+    let mut charged_work = CodeQueryExecutionWork::default();
+    let mut charged_budgeted = CodeQueryBudgetedWork::default();
+    let mut depth_bound_status = if seeds.is_empty() && scope.computes_depth_bound_status() {
+        empty_partition_depth_status(&query.plan)
+    } else {
+        None
+    };
+    let mut depth_answers = prefixes
+        .iter()
+        .flat_map(|prefix| prefix.depth_answers.iter().cloned())
+        .collect::<Vec<_>>();
+    for prefix in &prefixes {
+        if prefix.depth_answers.is_empty() {
+            join_depth_bound_status(&mut depth_bound_status, prefix.depth_bound_status);
+        }
+        charged_work = charged_work.saturating_add(prefix.work);
+        if charged_budgeted.step_outputs.is_empty() {
+            charged_budgeted
+                .step_outputs
+                .resize(prefix.budgeted_work.step_outputs.len(), 0);
+        }
+        charged_budgeted = charged_budgeted.saturating_add(&prefix.budgeted_work);
+    }
+    join_depth_bound_status(
+        &mut depth_bound_status,
+        reconciled_depth_status(&depth_answers),
+    );
     let complete = prefixes.len() == seeds.len()
         && prefixes.iter().zip(seeds).all(|(prefix, seed)| {
             prefix.seed == *seed
@@ -1367,10 +1722,30 @@ pub fn continue_intersect_prefix(
                 && !prefix.reads.is_empty()
         });
     if !complete || cancellation.is_some_and(CancellationToken::is_cancelled) {
+        // Withholding the continuation does not create a second cause when a
+        // prefix already reported why its rows could not be enumerated. A
+        // missing seed or read proof is a separate discovery failure.
+        let missing_proof = prefixes.len() != seeds.len()
+            || prefixes.iter().zip(seeds).any(|(prefix, seed)| {
+                prefix.seed != *seed || !prefix.reads_closed || prefix.reads.is_empty()
+            });
+        let unreported_prefix = prefixes.iter().any(|prefix| {
+            prefix.completion != CodeQueryCompletion::Complete
+                && !prefix.diagnostics.iter().any(|diagnostic| {
+                    matches!(
+                        diagnostic.impact,
+                        CodeQueryDiagnosticImpact::Incomplete | CodeQueryDiagnosticImpact::Invalid
+                    )
+                })
+        });
         for prefix in prefixes {
             diagnostics.extend(prefix.diagnostics);
         }
-        diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
+        if missing_proof
+            || unreported_prefix
+            || cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
+            diagnostics.push(CodeQueryDiagnostic::new(CodeQueryDiagnostic {
             incompleteness: brokk_bifrost_rql::Incompleteness::Content,
             code: CodeQueryDiagnosticCode::SemanticResultsOmitted,
             impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -1383,22 +1758,44 @@ pub fn continue_intersect_prefix(
             related: Vec::new(),
             exhausted_roots: Vec::new(),
             withheld_rows_path: None,
-        }));
+            }));
+        }
+        // Unseen seed members can cancel an available local witness. A
+        // withheld global traversal has no complete membership proof.
+        if scope.computes_depth_bound_status()
+            && super::query_plan_has_bounded_call_step(&query.plan)
+        {
+            depth_bound_status = Some(DepthBoundStatus::Unknown);
+        }
         return IntersectContinuationResult {
             detailed: None,
             completion: code_query_completion(true, &diagnostics),
+            depth_bound_status,
             diagnostics,
+            work: charged_work,
+            budgeted_work: charged_budgeted,
         };
     }
     let mut merged_operands = Vec::new();
     for (branch, plan) in cut.operands(&query.plan).iter().enumerate() {
         let mut rows = Vec::new();
-        for prefix in &prefixes {
-            rows.extend(prefix.operands[branch].iter().cloned());
-        }
         if PlanPartitioning::classify(plan).is_seed_union() {
-            // Physical union rows carry their authored branch in every trace.
-            // A stable sort restores branch-major order across seed products.
+            let mut traces_by_key: HashMap<PipelineKey, Vec<(usize, usize, PipelineTrace)>> =
+                HashMap::default();
+            for (seed_index, prefix) in prefixes.iter().enumerate() {
+                for (row_index, row) in prefix.operands[branch].iter().enumerate() {
+                    traces_by_key.entry(row.value.key()).or_default().extend(
+                        row.traces
+                            .iter()
+                            .cloned()
+                            .map(|trace| (seed_index, row_index, trace)),
+                    );
+                    rows.push(row.clone());
+                }
+            }
+            // Whole visits outer operand, nested branch, ProjectFile-sorted seed,
+            // then scan row. Prefixes can already cap a row's traces at 16, so
+            // a capped trace subset may differ even though rows and answers agree.
             rows.sort_by(|left, right| {
                 left.traces
                     .first()
@@ -1406,8 +1803,47 @@ pub fn continue_intersect_prefix(
                     .cmp(&right.traces.first().map(|trace| &trace.branch[1..]))
             });
             rows = combine_set_rows(SetOperator::Union, vec![rows], false).0;
+            for row in &mut rows {
+                let mut traces = traces_by_key
+                    .remove(&row.value.key())
+                    .expect("merged union row has input traces");
+                traces.sort_by(|left, right| {
+                    left.2.branch[1..]
+                        .cmp(&right.2.branch[1..])
+                        .then_with(|| left.0.cmp(&right.0))
+                        .then_with(|| left.1.cmp(&right.1))
+                });
+                row.provenance_truncated |= traces.len() > MAX_PROVENANCE_TRACES;
+                row.traces = traces
+                    .into_iter()
+                    .take(MAX_PROVENANCE_TRACES)
+                    .map(|(_, _, trace)| trace)
+                    .collect();
+            }
+        } else {
+            for prefix in &prefixes {
+                rows.extend(prefix.operands[branch].iter().cloned());
+            }
         }
         merged_operands.push(rows);
+    }
+    if scope.computes_depth_bound_status()
+        && let Some(empty) = merged_operands.iter().position(Vec::is_empty)
+        && empty_operand_ends_set(cut.operator(&query.plan), empty)
+    {
+        // Capture evaluates all operands. Only their merged, certified prefix
+        // can reproduce the whole executor's exact short-circuit.
+        replace_skipped_depth_answers(
+            &mut depth_answers,
+            &query.plan,
+            &cut.operands(&query.plan)[empty + 1..],
+        );
+        depth_bound_status = reconciled_depth_status(&depth_answers);
+        for prefix in &prefixes {
+            if prefix.depth_answers.is_empty() {
+                join_depth_bound_status(&mut depth_bound_status, prefix.depth_bound_status);
+            }
+        }
     }
     let mut row_keys = Vec::new();
     let mut prefix_work = CodeQueryExecutionWork::default();
@@ -1426,10 +1862,19 @@ pub fn continue_intersect_prefix(
     }
     let Some(suffix_limits) = remaining_unit_limits(limits, &prefix_work, &prefix_budgeted) else {
         push_budget_diagnostic(&mut diagnostics, &CodeQueryExecutionBudget::default());
+        if scope.computes_depth_bound_status()
+            && super::query_plan_has_bounded_call_step(&query.plan)
+            && depth_bound_status != Some(DepthBoundStatus::Reached)
+        {
+            depth_bound_status = Some(DepthBoundStatus::Unknown);
+        }
         return IntersectContinuationResult {
             detailed: None,
             completion: code_query_completion(true, &diagnostics),
+            depth_bound_status,
             diagnostics,
+            work: charged_work,
+            budgeted_work: charged_budgeted,
         };
     };
     let mut detailed = execute_detailed_unit(
@@ -1439,7 +1884,7 @@ pub fn continue_intersect_prefix(
         query,
         suffix_limits,
         cancellation,
-        CodeQueryExecutionScope::whole_workspace().with_intersect_operands(merged_operands),
+        scope.with_intersect_operands(merged_operands),
         &mut row_keys,
         None,
     );
@@ -1454,7 +1899,11 @@ pub fn continue_intersect_prefix(
     }
     assert_eq!(
         whole_plan.node(cut_node).operator(),
-        PhysicalQueryOperator::SequentialIntersection
+        match cut.operator(&query.plan) {
+            SetOperator::Union => PhysicalQueryOperator::SequentialUnion,
+            SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
+            SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
+        }
     );
     // The injected cut output is charged while rendering the continuation so
     // its retained rows have budget evidence. The ordinary set operator does
@@ -1520,13 +1969,47 @@ pub fn continue_intersect_prefix(
             );
         }
     }
+    for prefix in &prefixes {
+        diagnostics.extend(
+            prefix
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.branch.is_empty())
+                .cloned(),
+        );
+    }
     diagnostics.extend(detailed.result.diagnostics.iter().cloned());
     detailed.result.diagnostics = diagnostics.clone();
+    let suffix_depth_status = if detailed.depth_answers.is_empty() {
+        detailed.result.depth_bound_status
+    } else {
+        None
+    };
+    detailed.depth_answers.extend(depth_answers);
+    join_depth_bound_status(&mut depth_bound_status, suffix_depth_status);
+    join_depth_bound_status(
+        &mut depth_bound_status,
+        reconciled_depth_status(&detailed.depth_answers),
+    );
+    detailed.result.depth_bound_status = depth_bound_status;
     let completion = detailed.result.completion();
+    if detailed.result.depth_bound_status == Some(DepthBoundStatus::NotReached)
+        && !matches!(
+            completion,
+            CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
+        )
+    {
+        // Reconciliation must preserve the whole executor's uncertainty when
+        // a later suffix stops before completion.
+        detailed.result.depth_bound_status = Some(DepthBoundStatus::Unknown);
+    }
     IntersectContinuationResult {
+        depth_bound_status: detailed.result.depth_bound_status,
         detailed: Some(detailed),
         completion,
         diagnostics,
+        work: charged_work,
+        budgeted_work: charged_budgeted,
     }
 }
 
@@ -1558,9 +2041,16 @@ pub fn execute_intersect_prefix(
         analyzer,
         std::sync::Arc::clone(&ledger),
     );
-    // Intersect membership includes absence: a newly published seed may add
-    // a match to another operand without changing this seed's blob.
-    analyzer.record_read(analyzer.workspace_scope_read_key(&Language::ALL));
+    // Continuation checks the current seed list and merges every seed's operand
+    // rows on each run. Membership therefore needs no per-prefix read key.
+    // Pin this seed's content even when its operands produce no other reads.
+    let seed_read = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == seed_file.language())
+        .and_then(|provider| provider.structural_file_read_key(&seed_file))
+        .expect("prefix seed must have a structural file read key");
+    analyzer.record_read(seed_read);
     let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
     let mut prefix_query = query.clone();
     prefix_query.plan.steps.clear();
@@ -1587,7 +2077,11 @@ pub fn execute_intersect_prefix(
     let cut_node = physical.node(physical.root()).dependencies()[0];
     assert_eq!(
         physical.node(cut_node).operator(),
-        PhysicalQueryOperator::SequentialIntersection
+        match cut.operator(&query.plan) {
+            SetOperator::Union => PhysicalQueryOperator::SequentialUnion,
+            SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
+            SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
+        }
     );
     let mut operand_step_outputs = Vec::with_capacity(cut.operands(&query.plan).len());
     for (branch, operand) in cut.operands(&query.plan).iter().enumerate() {
@@ -1634,6 +2128,8 @@ pub fn execute_intersect_prefix(
                 codes: vec![CodeQueryDiagnosticCode::SemanticResultsOmitted],
             }
         },
+        depth_bound_status: detailed.result.depth_bound_status,
+        depth_answers: detailed.depth_answers,
         diagnostics: detailed.result.diagnostics,
         reads: ledger.keys(),
         reads_closed,
@@ -1654,38 +2150,247 @@ pub fn execute_intersect_prefix(
 /// file count instead of quadratic.
 type IntersectPrefixCapture = std::sync::Arc<std::sync::Mutex<Option<Vec<Vec<PipelineRow>>>>>;
 
+/// Test-only count of call-shape candidates presented to binding prefetch.
+/// The owning query scope carries this probe across execution workers.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default)]
+pub struct CallBindingCandidateProbe(Arc<std::sync::atomic::AtomicU64>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl CallBindingCandidateProbe {
+    pub fn count(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn record(&self, count: usize) {
+        self.0.fetch_add(
+            u64::try_from(count).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Request-local split receipts from the call-bindings step. An absent value
+/// means the route could not supply independently captured setup evidence.
+type SplitCallBindingReceipt = (
+    brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt,
+    brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt,
+);
+
+#[derive(Clone, Default)]
+pub struct CallBindingReadReceipts {
+    split: Arc<std::sync::Mutex<Option<SplitCallBindingReceipt>>>,
+    isolated: Arc<
+        std::sync::Mutex<Option<brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt>>,
+    >,
+    rejected: Arc<std::sync::Mutex<Vec<(ProjectFile, Range)>>>,
+}
+
+impl std::fmt::Debug for CallBindingReadReceipts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallBindingReadReceipts")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallBindingReadReceipts {
+    /// Consume the pair once execution has finished. None is a refusal, not
+    /// evidence of complete setup or an empty request union.
+    pub fn take(&self) -> Option<SplitCallBindingReceipt> {
+        self.split
+            .lock()
+            .expect("call binding receipt sink poisoned")
+            .take()
+    }
+
+    /// Full isolated binding-step receipt, captured after call-shape.
+    pub fn take_isolated(
+        &self,
+    ) -> Option<brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt> {
+        self.isolated
+            .lock()
+            .expect("candidate receipt poisoned")
+            .take()
+    }
+
+    pub fn take_rejected(&self) -> Vec<(ProjectFile, Range)> {
+        std::mem::take(&mut *self.rejected.lock().expect("candidate proofs poisoned"))
+    }
+
+    pub(super) fn reject(&self, file: ProjectFile, range: Range) {
+        self.rejected
+            .lock()
+            .expect("candidate proofs poisoned")
+            .push((file, range));
+    }
+
+    pub(super) fn store_isolated(
+        &self,
+        receipt: brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt,
+    ) {
+        *self.isolated.lock().expect("candidate receipt poisoned") = Some(receipt);
+    }
+
+    pub(super) fn store(&self, receipts: Option<SplitCallBindingReceipt>) {
+        *self
+            .split
+            .lock()
+            .expect("call binding receipt sink poisoned") = receipts;
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CodeQueryExecutionScope<'a> {
+    isolated_call_binding_receipts: Option<CallBindingReadReceipts>,
+    call_binding_receipts: Option<CallBindingReadReceipts>,
+    owned_call_anchors: Option<Arc<OwnedCallAnchors>>,
+    #[cfg(any(test, feature = "test-support"))]
+    binding_candidate_probe: Option<CallBindingCandidateProbe>,
     seed_files: Option<&'a [ProjectFile]>,
+    depth_bound_status: bool,
     workspace_files: Option<&'a [ProjectFile]>,
     branch_path: &'a [usize],
     /// Ancestor union suffix steps appended to a flattened leaf. They run on
     /// rows normally but cannot narrow diagnostics across the original set.
     inherited_suffix_steps: usize,
+    depth_key_rewrites: Option<Arc<HashMap<String, String>>>,
     /// Optional compilation-local call-target outcomes shared by selector
     /// scans. The analyzer and model authority are rechecked at query entry.
     shared_call_target_outcomes:
         Option<crate::analyzer::usages::call_relations::CallTargetOutcomeCache>,
     intersect_operands: Option<std::sync::Arc<Vec<Vec<PipelineRow>>>>,
     intersect_prefix_capture: Option<IntersectPrefixCapture>,
+    except_left_capture: Option<Arc<std::sync::Mutex<Option<bool>>>>,
     /// Words the host accepts as spelled correctly, for relations that guess
     /// at misspellings. A result that consulted it is valid only for this
     /// dictionary, so a host that caches results keys them by its digest.
     identifier_dictionary: Option<&'a IdentifierDictionary>,
+    /// The run's known identifier misspellings, which a rules pack supplies.
+    /// Without one, relations that report misspellings report nothing and
+    /// say so; a host that caches results keys them by its digest.
+    identifier_typos: Option<&'a IdentifierTypoTable>,
+    /// The file whose call sites a reverse-in-file plan answers. Seeds then
+    /// range over the workspace: the operand denotes the targets everywhere.
+    reverse_entered_file: Option<&'a ProjectFile>,
+}
+
+impl Default for CodeQueryExecutionScope<'_> {
+    fn default() -> Self {
+        Self::whole_workspace()
+    }
 }
 
 impl<'a> CodeQueryExecutionScope<'a> {
+    /// Opt in only after proving a complete structural call inventory. The
+    /// sink belongs to this execution; default queries do not capture it.
+    #[doc(hidden)]
+    pub fn with_call_binding_receipts(mut self, receipts: CallBindingReadReceipts) -> Self {
+        self.call_binding_receipts = Some(receipts);
+        self
+    }
+
+    /// Run only the binding step inside a candidate boundary. The caller
+    /// must restrict this execution to exactly one certified syntax candidate.
+    #[doc(hidden)]
+    pub fn with_isolated_call_binding_receipts(
+        mut self,
+        receipts: CallBindingReadReceipts,
+    ) -> Self {
+        self.isolated_call_binding_receipts = Some(receipts.clone());
+        self.call_binding_receipts = Some(receipts);
+        self
+    }
+
+    pub(super) fn isolated_call_binding_receipts(&self) -> Option<CallBindingReadReceipts> {
+        self.isolated_call_binding_receipts.clone()
+    }
+
+    pub(super) fn call_binding_receipts(&self) -> Option<CallBindingReadReceipts> {
+        self.call_binding_receipts.clone()
+    }
+
+    /// Restrict only structurally proven site-local call selectors. Lookup
+    /// authority and file-wide uncertainty remain the whole workspace/file.
+    #[doc(hidden)]
+    pub fn with_owned_call_anchors(mut self, anchors: Arc<OwnedCallAnchors>) -> Self {
+        self.owned_call_anchors = Some(anchors);
+        self
+    }
+
+    pub(super) fn owned_call_anchors(&self) -> Option<&Arc<OwnedCallAnchors>> {
+        self.owned_call_anchors.as_ref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_binding_candidate_probe(mut self, probe: CallBindingCandidateProbe) -> Self {
+        self.binding_candidate_probe = Some(probe);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn binding_candidate_probe(&self) -> Option<CallBindingCandidateProbe> {
+        self.binding_candidate_probe.clone()
+    }
+
+    /// Answer a reverse-in-file plan for the call sites in `file`. Only a
+    /// caller that partitions such a plan by caller file creates this scope;
+    /// a one-file seed restriction keeps its ordinary meaning.
+    pub const fn for_reverse_entered_file(
+        file: &'a ProjectFile,
+        workspace_files: &'a [ProjectFile],
+    ) -> Self {
+        let mut scope = Self::whole_workspace();
+        scope.workspace_files = Some(workspace_files);
+        scope.reverse_entered_file = Some(file);
+        scope
+    }
+
+    pub(super) const fn reverse_entered_file(&self) -> Option<&'a ProjectFile> {
+        self.reverse_entered_file
+    }
+
+    /// Compute traversal completion evidence for a consumer that requests it.
+    /// Direct RQL defaults to enabled; policy hosts use their completion declaration.
+    #[doc(hidden)]
+    pub const fn with_depth_bound_status(mut self, enabled: bool) -> Self {
+        self.depth_bound_status = enabled;
+        self
+    }
+
+    pub(super) const fn computes_depth_bound_status(&self) -> bool {
+        self.depth_bound_status
+    }
+
+    pub(super) fn depth_bound_key(&self, key: &str) -> String {
+        self.depth_key_rewrites
+            .as_ref()
+            .and_then(|rewrites| rewrites.get(key))
+            .cloned()
+            .unwrap_or_else(|| key.to_owned())
+    }
+
     /// Enumerate seeds over the analyzer's whole analyzed file set.
     pub const fn whole_workspace() -> Self {
         Self {
+            #[cfg(any(test, feature = "test-support"))]
+            binding_candidate_probe: None,
+            isolated_call_binding_receipts: None,
+            call_binding_receipts: None,
+            owned_call_anchors: None,
             seed_files: None,
+            depth_bound_status: true,
             workspace_files: None,
             branch_path: &[],
             inherited_suffix_steps: 0,
+            depth_key_rewrites: None,
             shared_call_target_outcomes: None,
             intersect_operands: None,
             intersect_prefix_capture: None,
+            except_left_capture: None,
             identifier_dictionary: None,
+            identifier_typos: None,
+            reverse_entered_file: None,
         }
     }
 
@@ -1698,6 +2403,26 @@ impl<'a> CodeQueryExecutionScope<'a> {
         Self::for_seed_files_with_branch_path(seed_files, workspace_files, &[])
     }
 
+    /// Narrow starting files while retaining the original workspace view for
+    /// diagnostics and dependency resolution, and all other execution options.
+    #[doc(hidden)]
+    pub fn restrict_seed_files<'b>(
+        self,
+        seed_files: &'b [ProjectFile],
+    ) -> CodeQueryExecutionScope<'b>
+    where
+        'a: 'b,
+    {
+        let mut scope: CodeQueryExecutionScope<'b> = self;
+        assert!(
+            scope
+                .seed_files
+                .is_none_or(|original| { seed_files.iter().all(|file| original.contains(file)) })
+        );
+        scope.seed_files = Some(seed_files);
+        scope
+    }
+
     /// Enumerate one seed file while retaining the authored union branch path.
     pub(super) const fn for_seed_files_with_branch_path(
         seed_files: &'a [ProjectFile],
@@ -1705,14 +2430,24 @@ impl<'a> CodeQueryExecutionScope<'a> {
         branch_path: &'a [usize],
     ) -> Self {
         Self {
+            #[cfg(any(test, feature = "test-support"))]
+            binding_candidate_probe: None,
+            isolated_call_binding_receipts: None,
+            call_binding_receipts: None,
+            owned_call_anchors: None,
             seed_files: Some(seed_files),
+            depth_bound_status: true,
             workspace_files: Some(workspace_files),
             branch_path,
             inherited_suffix_steps: 0,
+            depth_key_rewrites: None,
             shared_call_target_outcomes: None,
             intersect_operands: None,
             intersect_prefix_capture: None,
+            except_left_capture: None,
             identifier_dictionary: None,
+            identifier_typos: None,
+            reverse_entered_file: None,
         }
     }
 
@@ -1729,6 +2464,9 @@ impl<'a> CodeQueryExecutionScope<'a> {
 
     pub(super) fn with_shared_call_target_outcomes_from(mut self, source: &Self) -> Self {
         self.shared_call_target_outcomes = source.shared_call_target_outcomes.clone();
+        self.owned_call_anchors = source.owned_call_anchors.clone();
+        self.call_binding_receipts = source.call_binding_receipts.clone();
+        self.isolated_call_binding_receipts = source.isolated_call_binding_receipts.clone();
         self
     }
 
@@ -1741,9 +2479,23 @@ impl<'a> CodeQueryExecutionScope<'a> {
         self
     }
 
-    pub(super) fn with_identifier_dictionary_from(mut self, source: &Self) -> Self {
-        self.identifier_dictionary = source.identifier_dictionary;
+    /// Report the misspellings `typos` lists in relations that look for them.
+    pub const fn with_identifier_typos(mut self, typos: &'a IdentifierTypoTable) -> Self {
+        self.identifier_typos = Some(typos);
         self
+    }
+
+    /// Carry the host's spelling inputs, the dictionary and the typo table,
+    /// into a scope derived from `source`.
+    pub(super) fn with_spelling_inputs_from(mut self, source: &Self) -> Self {
+        self.identifier_dictionary = source.identifier_dictionary;
+        self.identifier_typos = source.identifier_typos;
+        self
+    }
+
+    /// The known misspellings, absent when the host activated no table.
+    pub(super) const fn identifier_typos(&self) -> Option<&'a IdentifierTypoTable> {
+        self.identifier_typos
     }
 
     /// The accepted identifier words, empty when the host supplied none.
@@ -1774,7 +2526,42 @@ impl<'a> CodeQueryExecutionScope<'a> {
     pub(super) fn shared_call_target_outcomes(
         &self,
     ) -> Option<&crate::analyzer::usages::call_relations::CallTargetOutcomeCache> {
-        self.shared_call_target_outcomes.as_ref()
+        // This cache replays one accumulated read set for the whole file.
+        // A procedure-owned query must neither import foreign call-resolution
+        // reads nor make its accounting depend on earlier procedure visits.
+        // Keep its call-target cache query-local instead; ordinary file queries
+        // retain the existing compilation-wide sharing.
+        if self.owned_call_anchors.is_some() {
+            None
+        } else {
+            self.shared_call_target_outcomes.as_ref()
+        }
+    }
+
+    fn capture_except_left(
+        &mut self,
+        query: &CodeQuery,
+    ) -> Option<Arc<std::sync::Mutex<Option<bool>>>> {
+        if !self.computes_depth_bound_status()
+            || !matches!(
+                query.plan.source,
+                CodeQueryPlanSource::Set {
+                    op: SetOperator::Except,
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        let capture = Arc::new(std::sync::Mutex::new(None));
+        self.except_left_capture = Some(capture.clone());
+        Some(capture)
+    }
+
+    pub(super) fn record_except_left(&self, complete_empty: bool) {
+        if let Some(capture) = &self.except_left_capture {
+            *capture.lock().expect("except capture lock is not poisoned") = Some(complete_empty);
+        }
     }
 
     pub(super) fn with_intersect_operands(mut self, rows: Vec<Vec<PipelineRow>>) -> Self {
@@ -1818,7 +2605,7 @@ pub fn execute_code_query_unit(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
-    scope: CodeQueryExecutionScope<'_>,
+    mut scope: CodeQueryExecutionScope<'_>,
 ) -> UnitExecutionResult {
     if PlanPartitioning::classify(&query.plan).is_seed_union()
         && let Some(seed_files) = scope.seed_files()
@@ -1840,8 +2627,9 @@ pub fn execute_code_query_unit(
             );
         }
     }
-    let unit_query = if PlanPartitioning::classify(&query.plan).is_seed_union()
-        && PlanPartitioning::union_has_post_merge_suffix(&query.plan)
+    let unit_query = if PlanPartitioning::classify(&query.plan) == PlanPartitioning::BySeedSetUnion
+        || (PlanPartitioning::classify(&query.plan).is_seed_union()
+            && PlanPartitioning::union_has_post_merge_suffix(&query.plan))
     {
         Some(CodeQuery {
             limit: usize::MAX,
@@ -1850,6 +2638,7 @@ pub fn execute_code_query_unit(
     } else {
         None
     };
+    let except_left = scope.capture_except_left(query);
     let mut row_keys = Vec::new();
     let detailed = execute_detailed_unit(
         analyzer,
@@ -1862,7 +2651,10 @@ pub fn execute_code_query_unit(
         &mut row_keys,
         None,
     );
-    project_unit_result(&detailed, row_keys)
+    let mut unit = project_unit_result(&detailed, row_keys);
+    unit.except_left_complete_empty = except_left
+        .and_then(|capture| *capture.lock().expect("except capture lock is not poisoned"));
+    unit
 }
 
 /// Remaining physical allowance for sequential units or union leaves.
@@ -1903,9 +2695,15 @@ pub fn remaining_unit_limits(
         .then_some(remaining)
 }
 
+/// Name an exhausted unit budget as the cause of a truncated merge whose
+/// remaining physical limits left no room for further units.
+pub fn push_unit_budget_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>) {
+    push_budget_diagnostic(diagnostics, &CodeQueryExecutionBudget::default());
+}
+
 /// Report units or leaves omitted after a physical allowance ran out.
 pub fn push_skipped_unit_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>, skipped: usize) {
-    push_budget_diagnostic(diagnostics, &CodeQueryExecutionBudget::default());
+    push_unit_budget_diagnostic(diagnostics);
     let diagnostic = diagnostics
         .iter_mut()
         .find(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted)
@@ -1913,6 +2711,38 @@ pub fn push_skipped_unit_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnostic>, 
     diagnostic
         .message
         .push_str(&format!("; skipped {skipped} units"));
+}
+
+fn traversal_key(plan: &CodeQueryPlan, position: usize, path: &[usize]) -> String {
+    crate::structural::execution::plan::depth_bound_traversal_key(plan, position, path)
+}
+
+fn leaf_traversal_rewrites(
+    original: &CodeQueryPlan,
+    leaf: &CodeQueryPlan,
+    path: &[usize],
+) -> HashMap<String, String> {
+    let mut current = original;
+    let mut current_path = Vec::new();
+    let mut inherited = Vec::new();
+    for &branch in path {
+        let mut suffix = (0..current.steps.len())
+            .map(|position| traversal_key(current, position, &current_path))
+            .collect::<Vec<_>>();
+        suffix.extend(inherited);
+        inherited = suffix;
+        let CodeQueryPlanSource::Set { branches, .. } = &current.source else {
+            unreachable!("union branch path addresses a set")
+        };
+        current = &branches[branch];
+        current_path.push(branch);
+    }
+    let mut rewrites = rebased_traversal_keys(leaf, path);
+    let local_count = leaf.steps.len() - inherited.len();
+    for (offset, global) in inherited.into_iter().enumerate() {
+        rewrites.insert(traversal_key(leaf, local_count + offset, &[]), global);
+    }
+    rewrites
 }
 
 /// Execute one eligible union unit leaf by leaf, preserving branch rows until
@@ -1935,11 +2765,17 @@ fn execute_seed_union_unit(
     let mut diagnostics = Vec::new();
     let mut truncated = false;
 
+    let mut depth_answers = Vec::new();
+    let mut depth_bound_status = None;
+
     let leaf_count = leaves.len();
     for (index, (leaf, branch_path, inherited_suffix_steps)) in leaves.into_iter().enumerate() {
         let Some(remaining) = remaining_unit_limits(limits, &work, &budgeted_work) else {
             push_skipped_unit_diagnostic(&mut diagnostics, leaf_count - index);
             truncated = true;
+            if scope.computes_depth_bound_status() {
+                depth_answers.extend(unknown_depth_answers(&query.plan));
+            }
             break;
         };
         let leaf_query = CodeQuery {
@@ -1961,9 +2797,15 @@ fn execute_seed_union_unit(
                 .expect("a seed-union unit requires whole-workspace files"),
             &branch_path,
         )
+        .with_depth_bound_status(scope.computes_depth_bound_status())
         .with_shared_call_target_outcomes_from(&scope)
-        .with_identifier_dictionary_from(&scope);
+        .with_spelling_inputs_from(&scope);
         leaf_scope.inherited_suffix_steps = inherited_suffix_steps;
+        leaf_scope.depth_key_rewrites = Some(Arc::new(leaf_traversal_rewrites(
+            &query.plan,
+            &leaf_query.plan,
+            &branch_path,
+        )));
         let detailed = execute_detailed_unit(
             analyzer,
             flow_state.clone(),
@@ -1976,6 +2818,10 @@ fn execute_seed_union_unit(
             None,
         );
         let mut leaf_result = project_unit_result(&detailed, row_keys);
+        if leaf_result.depth_answers.is_empty() {
+            join_depth_bound_status(&mut depth_bound_status, leaf_result.depth_bound_status);
+        }
+        depth_answers.append(&mut leaf_result.depth_answers);
         work = work.saturating_add(leaf_result.work);
         budgeted_work.provenance_steps = budgeted_work
             .provenance_steps
@@ -1994,15 +2840,28 @@ fn execute_seed_union_unit(
         rows.append(&mut leaf_result.rows);
     }
 
+    super::execution::discharge_decided_qualifying_sites(
+        unit_qualifying_sites(&rows, &diagnostics),
+        &mut diagnostics,
+        0,
+    );
+
     // Skipped suffix leaves still occupy their physical-plan counter slots.
     budgeted_work
         .step_outputs
         .resize(unit_step_output_caps(query).len(), 0);
+    join_depth_bound_status(
+        &mut depth_bound_status,
+        reconciled_depth_status(&depth_answers),
+    );
     UnitExecutionResult {
+        except_left_complete_empty: None,
         rows,
         work,
         budgeted_work,
         completion: code_query_completion(truncated, &diagnostics),
+        depth_bound_status,
+        depth_answers,
         diagnostics,
         truncated,
     }
@@ -2042,8 +2901,9 @@ pub fn execute_code_query_selector_unit(
     parent_semantic: &SemanticBudget,
     parent_execution: &SemanticExecutionBudget,
     artifact_leases: SemanticArtifactLeaseSnapshot,
-    scope: CodeQueryExecutionScope<'_>,
+    mut scope: CodeQueryExecutionScope<'_>,
 ) -> SelectorUnitExecution {
+    let except_left = scope.capture_except_left(query);
     let mut row_keys = Vec::new();
     let detailed = execute_detailed_selector_unit(
         workspace,
@@ -2058,7 +2918,9 @@ pub fn execute_code_query_selector_unit(
         scope,
         &mut row_keys,
     );
-    let unit = project_unit_result(&detailed, row_keys);
+    let mut unit = project_unit_result(&detailed, row_keys);
+    unit.except_left_complete_empty = except_left
+        .and_then(|capture| *capture.lock().expect("except capture lock is not poisoned"));
     SelectorUnitExecution { unit, detailed }
 }
 
@@ -2091,10 +2953,13 @@ fn project_unit_result(
         })
         .collect();
     UnitExecutionResult {
+        except_left_complete_empty: None,
         rows,
         work: detailed.work,
         budgeted_work: detailed.budgeted_work.clone(),
         completion,
+        depth_bound_status: detailed.result.depth_bound_status,
+        depth_answers: detailed.depth_answers.clone(),
         diagnostics: detailed.result.diagnostics.clone(),
         truncated: detailed.result.truncated,
     }
@@ -2129,6 +2994,7 @@ fn execute_detailed_selector_unit(
     execute_internal_with_analysis_strategy(
         workspace.analyzer(),
         token,
+        None,
         Some(workspace),
         Some(flow_state.into()),
         None,
@@ -2176,6 +3042,7 @@ fn execute_detailed_unit(
     execute_internal_with_analysis_strategy(
         analyzer,
         token,
+        None,
         workspace,
         Some(flow_state.into()),
         None,
@@ -2310,12 +3177,14 @@ impl UnitRowKeyBuilder {
     }
 
     fn call_site_value(self, value: &CallSiteValue) -> Self {
-        let CallSiteValue(site, binding, site_id, _, _, _) = value;
+        let CallSiteValue(site, binding, site_id, _, _, _, target) = value;
         // A call site is identified by the exact call expression it covers and
         // the two declarations it connects. The argument rows the pipeline key
-        // also holds are derived from that same expression, so they cannot
-        // separate two rows this rendering equates.
-        self.path(&site.file)
+        // also holds are derived from that same expression. Source-backed
+        // dispatch can publish several external arms at one expression with
+        // the same placeholder callee, so retain the per-arm target evidence.
+        let key = self
+            .path(&site.file)
             .range(site.range)
             .range(site.callee_range)
             .text(site_id)
@@ -2330,7 +3199,19 @@ impl UnitRowKeyBuilder {
                 )
             }))
             .number(site.arguments.len())
-            .variant(binding)
+            .variant(binding);
+        match target {
+            None => key,
+            Some(target) => key
+                .text("target")
+                .optional(target.target_id.as_deref())
+                .optional(target.target_fq_name.as_deref())
+                .optional(target.boundary_kind)
+                .text(target.proof)
+                .text(target.completeness)
+                .text(target.coverage)
+                .optional(target.reason.as_deref()),
+        }
     }
 
     fn finish(self) -> UnitRowKey {
@@ -2410,7 +3291,6 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             )
             .text(site.usage_kind.wire_label())
             .text(usage_proof_label(site.proof))
-            .optional(site.reference_kind.map(reference_kind_label))
             .finish(),
         PipelineKey::CallSite(value) => key("call_site").call_site_value(value).finish(),
         PipelineKey::ExpressionSite(value) => key("expression_site")
@@ -2467,7 +3347,9 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
         PipelineKey::OverloadSelection(id) => key("overload_selection").text(id).finish(),
         PipelineKey::MemberSelection(id) => key("member_selection").text(id).finish(),
         PipelineKey::DispatchOutcome(id) => key("dispatch_outcome").text(id).finish(),
-        PipelineKey::DispatchTarget(id) => key("dispatch_target").text(id).finish(),
+        PipelineKey::DispatchTarget(id, root_id) => {
+            key("dispatch_target").text(id).text(root_id).finish()
+        }
         PipelineKey::MemberFamily(id) => key("member_family").text(id).finish(),
         PipelineKey::MemberFamilyEdge(id) => key("member_family_edge").text(id).finish(),
         PipelineKey::PythonHierarchyFact(id) => key("python_hierarchy_fact").text(id).finish(),
@@ -2516,11 +3398,11 @@ pub(super) fn unit_row_key(key_value: &PipelineKey) -> UnitRowKey {
             .number(edge.start_byte)
             .number(edge.end_byte)
             .declaration(&edge.target)
-            .optional(edge.reference_kind.map(|kind| kind.to_string()))
-            .text(usage_proof_label(edge.proof))
-            .text(edge.usage_kind.wire_label())
-            .text(edge.site_class.label())
-            .text(edge.owner_relation.label())
+            .optional(
+                edge.source
+                    .as_ref()
+                    .map(|source| source.declaration_id().as_str().to_string()),
+            )
             .text(edge.provenance.label())
             .finish(),
         PipelineKey::StateEvent(event) => key("state_event")
@@ -3231,6 +4113,17 @@ pub enum UnitRowItemTerminal {
         proof: Box<str>,
         target_fq_name: Box<str>,
         usage_kind: Box<str>,
+        reference_facets: UnitRowReferenceFacets,
+    },
+    ReferenceEdge {
+        id: Box<str>,
+        reference_facets: UnitRowReferenceFacets,
+        proof: Box<str>,
+        usage_kind: Box<str>,
+        site_class: Box<str>,
+        owner_relation: Box<str>,
+        edge_provenance: Box<str>,
+        generation: u64,
     },
     CallSite {
         proof: Box<str>,
@@ -3400,11 +4293,25 @@ impl UnitRowItemTerminal {
                 proof: boxed(value.proof),
                 target_fq_name: boxed(&value.target.fq_name),
                 usage_kind: boxed(value.usage_kind),
+                reference_facets: (&value.reference_facets).into(),
+            },
+            CodeQueryResultValue::ReferenceEdge { value } => UnitRowItemTerminal::ReferenceEdge {
+                id: boxed(&value.id),
+                reference_facets: (&value.reference_facets).into(),
+                proof: boxed(value.proof),
+                usage_kind: boxed(value.usage_kind),
+                site_class: boxed(value.site_class),
+                owner_relation: boxed(value.owner_relation),
+                edge_provenance: boxed(value.provenance),
+                generation: value.generation,
             },
             CodeQueryResultValue::CallSite { value } => UnitRowItemTerminal::CallSite {
                 proof: boxed(value.proof),
                 caller_fq_name: boxed(&value.caller.fq_name),
-                callee_fq_name: boxed(&value.callee.fq_name),
+                callee_fq_name: boxed(value.callee.as_ref().map_or(
+                    value.target_fq_name.as_deref().unwrap_or("<unresolved>"),
+                    |callee| callee.fq_name.as_str(),
+                )),
             },
             CodeQueryResultValue::ExpressionSite { value } => UnitRowItemTerminal::ExpressionSite {
                 input_kind: boxed(value.input_kind),
@@ -3495,7 +4402,6 @@ impl UnitRowItemTerminal {
             | CodeQueryResultValue::RustMarkerImpl { .. }
             | CodeQueryResultValue::RustPointerFinding { .. }
             | CodeQueryResultValue::Guard { .. }
-            | CodeQueryResultValue::ReferenceEdge { .. }
             | CodeQueryResultValue::QualifiedPath { .. }
             | CodeQueryResultValue::Export { .. }
             | CodeQueryResultValue::DeclarationState { .. }
@@ -3726,6 +4632,22 @@ pub struct UnitRowItemRef {
     pub value: UnitRowItemRefValue,
 }
 
+/// Owned reference facets retained in unit rows and policy findings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRowReferenceFacets {
+    pub known: Vec<Box<str>>,
+    pub undecided: Vec<Box<str>>,
+}
+
+impl From<&CodeQueryReferenceFacets> for UnitRowReferenceFacets {
+    fn from(facets: &CodeQueryReferenceFacets) -> Self {
+        Self {
+            known: facets.known.iter().map(|label| boxed(label)).collect(),
+            undecided: facets.undecided.iter().map(|label| boxed(label)).collect(),
+        }
+    }
+}
+
 /// The per-family fields of one projected provenance reference.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "ref", rename_all = "snake_case")]
@@ -3787,6 +4709,13 @@ pub enum UnitRowItemRefValue {
         target_fq_name: Box<str>,
         usage_kind: Option<Box<str>>,
         proof: Box<str>,
+        reference_facets: UnitRowReferenceFacets,
+    },
+    ReferenceEdge {
+        id: Box<str>,
+        range: CodeQueryRange,
+        proof: Box<str>,
+        reference_facets: UnitRowReferenceFacets,
     },
     CallSite {
         range: CodeQueryRange,
@@ -3980,12 +4909,26 @@ impl UnitRowItemRef {
                 target_fq_name,
                 usage_kind,
                 proof,
+                reference_facets,
                 ..
             } => UnitRowItemRefValue::ReferenceSite {
                 range: *range,
                 target_fq_name: boxed(target_fq_name),
                 usage_kind: usage_kind.map(boxed),
                 proof: boxed(proof),
+                reference_facets: reference_facets.into(),
+            },
+            CodeQueryResultRef::ReferenceEdge {
+                id,
+                range,
+                proof,
+                reference_facets,
+                ..
+            } => UnitRowItemRefValue::ReferenceEdge {
+                id: boxed(id),
+                range: *range,
+                proof: boxed(proof),
+                reference_facets: reference_facets.into(),
             },
             CodeQueryResultRef::CallSite {
                 range,
@@ -4172,12 +5115,40 @@ pub struct UnitRow {
 /// where this is the whole of the row's product column.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitExecutionResult {
+    /// Exact operand-zero emptiness, before exclusion and suffix projection.
+    /// A merge requires this proof from every seed before skipping the rights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub except_left_complete_empty: Option<bool>,
     pub rows: Vec<UnitRow>,
     pub work: CodeQueryExecutionWork,
     pub budgeted_work: CodeQueryBudgetedWork,
     pub completion: CodeQueryCompletion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_bound_status: Option<DepthBoundStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depth_answers: Vec<BoundedCallAnswer>,
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub truncated: bool,
+}
+
+impl UnitExecutionResult {
+    /// Member identities and frontier endpoints count toward batch retention,
+    /// even when the final selector projects an empty answer.
+    #[doc(hidden)]
+    pub fn depth_answer_row_count(&self) -> usize {
+        self.depth_answers.iter().fold(0_usize, |count, answer| {
+            count
+                .saturating_add(1)
+                .saturating_add(answer.members.len())
+                .saturating_add(answer.frontier.len().saturating_mul(2))
+                .saturating_add(answer.undecided_frontier.len())
+        })
+    }
+
+    /// Persisted unit products must retain one work slot per physical step.
+    pub fn has_valid_step_outputs(&self, query: &CodeQuery) -> bool {
+        self.budgeted_work.step_outputs.len() == unit_step_output_caps(query).len()
+    }
 }
 
 /// The rows several units produced, merged into the vector one whole execution
@@ -4190,8 +5161,18 @@ pub struct MergedUnitRows {
     pub budgeted_work: CodeQueryBudgetedWork,
     pub diagnostics: Vec<CodeQueryDiagnostic>,
     pub truncated: bool,
+    pub depth_bound_status: Option<DepthBoundStatus>,
     fair_share_divisor: usize,
     step_output_caps: Vec<Option<StepOutputCap>>,
+}
+
+pub(super) fn join_depth_bound_status(
+    target: &mut Option<DepthBoundStatus>,
+    observed: Option<DepthBoundStatus>,
+) {
+    if let Some(observed) = observed {
+        *target = Some(target.map_or(observed, |prior| prior.join(observed)));
+    }
 }
 
 impl MergedUnitRows {
@@ -4199,6 +5180,14 @@ impl MergedUnitRows {
     /// `CodeQueryResult::completion` derives one.
     pub fn completion(&self) -> CodeQueryCompletion {
         code_query_completion(self.truncated, &self.diagnostics)
+    }
+
+    /// Stop a merged product without certifying an absent frontier.
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
+        if self.depth_bound_status == Some(DepthBoundStatus::NotReached) {
+            self.depth_bound_status = Some(DepthBoundStatus::Unknown);
+        }
     }
 
     /// Apply the root result limit after merging all seed partitions.
@@ -4215,7 +5204,7 @@ impl MergedUnitRows {
         if self.items.len() > limit {
             self.items.truncate(limit);
             self.evidence.truncate(limit);
-            self.truncated = true;
+            self.mark_truncated();
             if !has_result_limit {
                 push_truncation_diagnostic(
                     &mut self.diagnostics,
@@ -4237,8 +5226,10 @@ impl MergedUnitRows {
 }
 
 fn unit_step_output_caps(query: &CodeQuery) -> Vec<Option<StepOutputCap>> {
-    let union = PlanPartitioning::classify(&query.plan).is_seed_union();
-    let flattened_union = union && !PlanPartitioning::union_has_post_merge_suffix(&query.plan);
+    let partitioning = PlanPartitioning::classify(&query.plan);
+    let union = partitioning.is_seed_union() || partitioning == PlanPartitioning::BySeedSetUnion;
+    let flattened_union =
+        partitioning.is_seed_union() && !PlanPartitioning::union_has_post_merge_suffix(&query.plan);
     let mut caps = Vec::new();
     let plans = if flattened_union {
         PlanPartitioning::union_leaf_plans(&query.plan)
@@ -4289,23 +5280,50 @@ pub fn unit_plan_node_count(query: &CodeQuery) -> usize {
     unit_step_output_caps(query).len()
 }
 
-/// Merge the rows of several unit executions of one query into the vector one
-/// whole execution would have produced.
+// With no seed files, executed traversals have empty bounded sets. Later
+// intersect/except operands can still be skipped rather than executed.
+fn empty_partition_depth_status(plan: &CodeQueryPlan) -> Option<DepthBoundStatus> {
+    if !super::query_plan_has_bounded_call_step(plan) {
+        return None;
+    }
+    // With zero units, both executed empty traversals and exact skips are NotReached.
+    Some(DepthBoundStatus::NotReached)
+}
+
+/// Merge the rows of several unit executions into one deterministic answer.
+///
+/// `units` must cover the complete `plan_seed_files` inventory. In particular,
+/// complete-empty except proofs cannot establish absence for omitted seeds.
+/// Callers report any omitted units as incomplete rather than publishing a
+/// complete merged answer.
 ///
 /// `units` must arrive in seed order -- the order the family's own comparator
 /// puts their seed files in, which [`seed_file_order`] and
-/// [`structural_seed_file_order`] expose. A non-union whole execution's row
-/// vector is the concatenation of its per-seed-file row vectors in exactly
-/// that order. An eligible union unit contains leaf rows in seed-major order,
+/// [`structural_seed_file_order`] expose. A leaf plan's whole row vector is
+/// the concatenation of its per-seed-file row vectors in that order. A set
+/// minuend in an except preserves authored branch order within each file;
+/// its cross-file result order need not equal the whole executor's order.
+/// An eligible union unit contains leaf rows in seed-major order,
 /// so this function stably sorts those raw rows by their full branch path
 /// before applying the same first-writer deduplication as the executor.
 ///
 /// Every counter lane is summed and diagnostics are concatenated in order. The
-/// equality this reproduces is claimed only while no cumulative cap was
-/// reached, which is what the summed lanes let a caller check.
+/// per-key equivalence this reproduces is claimed only while no cumulative
+/// cap was reached, which is what the summed lanes let a caller check.
 pub fn merge_unit_rows(
     query: &CodeQuery,
     units: impl IntoIterator<Item = UnitExecutionResult>,
+) -> MergedUnitRows {
+    merge_unit_rows_in_scope(query, units, CodeQueryExecutionScope::whole_workspace())
+}
+
+/// Merge with the consumer's depth-completion setting, including when there
+/// are no seed products from which that setting could be inferred.
+#[doc(hidden)]
+pub fn merge_unit_rows_in_scope(
+    query: &CodeQuery,
+    units: impl IntoIterator<Item = UnitExecutionResult>,
+    scope: CodeQueryExecutionScope<'_>,
 ) -> MergedUnitRows {
     let mut items: Vec<UnitRowItem> = Vec::new();
     let mut evidence: Vec<UnitRowEvidence> = Vec::new();
@@ -4314,21 +5332,31 @@ pub fn merge_unit_rows(
     let mut budgeted_work: Option<CodeQueryBudgetedWork> = None;
     let mut diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut truncated = false;
+    let mut depth_bound_status = None;
+    let mut any_units = false;
+    let mut except_left_complete_empty = true;
+    let mut depth_answers = Vec::new();
     let partitioning = PlanPartitioning::classify(&query.plan);
-    let union = partitioning.is_seed_union();
+    let union = partitioning.is_seed_union() || partitioning == PlanPartitioning::BySeedSetUnion;
     let fair_share_divisor = match partitioning {
-        PlanPartitioning::BySeedUnion | PlanPartitioning::BySeedExcept => {
-            PlanPartitioning::fair_share_divisor(&query.plan)
-                .expect("a seed-partitioned set has a checked fair-share divisor")
-        }
+        PlanPartitioning::BySeedUnion
+        | PlanPartitioning::BySeedSetUnion
+        | PlanPartitioning::BySeedExcept => PlanPartitioning::fair_share_divisor(&query.plan)
+            .expect("a seed-partitioned set has a checked fair-share divisor"),
         PlanPartitioning::BySeed | PlanPartitioning::Prefix { .. } | PlanPartitioning::Whole(_) => {
             1
         }
     };
-    let step_output_caps = unit_step_output_caps(query);
+    let mut step_output_caps = unit_step_output_caps(query);
     let mut raw_rows = Vec::new();
 
     for unit in units {
+        any_units = true;
+        except_left_complete_empty &= unit.except_left_complete_empty == Some(true);
+        if unit.depth_answers.is_empty() {
+            join_depth_bound_status(&mut depth_bound_status, unit.depth_bound_status);
+        }
+        depth_answers.extend(unit.depth_answers);
         work = work.saturating_add(unit.work);
         budgeted_work = Some(match budgeted_work {
             Some(summed) => summed.saturating_add(&unit.budgeted_work),
@@ -4339,11 +5367,61 @@ pub fn merge_unit_rows(
         raw_rows.extend(unit.rows);
     }
 
-    if union {
-        if !PlanPartitioning::union_has_post_merge_suffix(&query.plan) {
-            for row in &raw_rows {
-                row_branch(row);
+    if any_units
+        && except_left_complete_empty
+        && scope.computes_depth_bound_status()
+        && let CodeQueryPlanSource::Set {
+            op: SetOperator::Except,
+            branches,
+        } = &query.plan.source
+    {
+        replace_skipped_depth_answers(&mut depth_answers, &query.plan, &branches[1..]);
+        depth_bound_status = reconciled_depth_status(&depth_answers);
+    }
+    if !any_units && scope.computes_depth_bound_status() {
+        depth_bound_status = empty_partition_depth_status(&query.plan);
+    }
+    join_depth_bound_status(
+        &mut depth_bound_status,
+        reconciled_depth_status(&depth_answers),
+    );
+    // Selector units execute the union as one scoped physical plan, whereas
+    // ordinary row units execute its leaves separately. Both retain the same
+    // typed rows. Select the counter layout actually carried by the products;
+    // if layouts have equal length, use the stricter cap in each slot so an
+    // ambiguous layout can only widen early.
+    if union
+        && !budgeted_work
+            .as_ref()
+            .is_none_or(|work| work.step_outputs.is_empty())
+    {
+        let whole = select_physical_plan(query, UnionExecutionStrategy::Sequential, 1, 0)
+            .expect("an eligible union has a physical plan")
+            .step_output_caps();
+        let count = budgeted_work.as_ref().unwrap().step_outputs.len();
+        if count == whole.len() && count == step_output_caps.len() {
+            for (cap, whole_cap) in step_output_caps.iter_mut().zip(whole) {
+                *cap = match (*cap, whole_cap) {
+                    (Some(left), Some(right)) => {
+                        Some(if left.resolve(usize::MAX) <= right.resolve(usize::MAX) {
+                            left
+                        } else {
+                            right
+                        })
+                    }
+                    (Some(left), None) => Some(left),
+                    (None, Some(right)) => Some(right),
+                    (None, None) => None,
+                };
             }
+        } else if count == whole.len() {
+            step_output_caps = whole;
+        }
+    }
+
+    if union {
+        for row in &raw_rows {
+            row_representative_branch(row);
         }
         // A post-merge unit can carry traces from several branches. Its first
         // trace names the retained representative chosen by the shared set
@@ -4353,6 +5431,13 @@ pub fn merge_unit_rows(
                 .branch
                 .cmp(&right.item.provenance[0].branch)
         });
+    }
+    if union {
+        super::execution::discharge_decided_qualifying_sites(
+            unit_qualifying_sites(&raw_rows, &diagnostics),
+            &mut diagnostics,
+            0,
+        );
     }
     for row in raw_rows {
         match indexes.get(&row.key) {
@@ -4365,6 +5450,14 @@ pub fn merge_unit_rows(
         }
     }
 
+    if depth_bound_status == Some(DepthBoundStatus::NotReached)
+        && !matches!(
+            code_query_completion(truncated, &diagnostics),
+            CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. }
+        )
+    {
+        depth_bound_status = Some(DepthBoundStatus::Unknown);
+    }
     MergedUnitRows {
         items,
         evidence,
@@ -4372,14 +5465,57 @@ pub fn merge_unit_rows(
         budgeted_work: budgeted_work.unwrap_or_default(),
         diagnostics,
         truncated,
+        depth_bound_status,
         fair_share_divisor,
         step_output_caps,
     }
 }
 
-/// The branch path on a raw union row, after validating that both projected
-/// provenance surfaces agree and that every trace came from one leaf.
-fn row_branch(row: &UnitRow) -> &[usize] {
+/// Visit only the first row for each key, exactly as the subsequent union
+/// merge does. A later capture-free row cannot decide an earlier captured
+/// representative. The existing structural key records custom projections.
+fn unit_qualifying_sites<'rows>(
+    rows: &'rows [UnitRow],
+    diagnostics: &[CodeQueryDiagnostic],
+) -> impl Iterator<Item = super::execution::QualifyingDischargeSite> + use<'rows> {
+    // Rendering can erase every capture in a row once its response budget is
+    // exhausted. Existing unit diagnostics preserve that loss across replay;
+    // without complete rendering, an empty list is no capture-absence proof.
+    let captures_complete = !diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::RenderedCapturesTruncated);
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .filter(move |row| seen.insert(&row.key))
+        .filter_map(move |row| {
+            if row.key.arm.as_ref() != "structural_match"
+                || row.key.parts.len() != 3
+                || !row.key.parts[2].is_empty()
+            {
+                return None;
+            }
+            let Some(UnitRowItemTerminal::StructuralMatch { captures, .. }) = &row.item.terminal
+            else {
+                return None;
+            };
+            let span = row.evidence.byte_span.as_ref()?;
+            Some(super::execution::QualifyingDischargeSite {
+                path: row.evidence.rel_path.to_string(),
+                start_byte: span.start,
+                end_byte: span.end,
+                empty_captures: captures_complete && captures.is_empty(),
+                first_branch: row
+                    .item
+                    .provenance
+                    .iter()
+                    .map(|trace| &trace.branch)
+                    .min()
+                    .cloned(),
+            })
+        })
+}
+
+fn row_representative_branch(row: &UnitRow) -> &[usize] {
     assert!(
         !row.item.provenance.is_empty(),
         "union rows require provenance"
@@ -4395,10 +5531,6 @@ fn row_branch(row: &UnitRow) -> &[usize] {
         assert_eq!(
             item_trace.branch, evidence_trace.branch,
             "item and evidence traces must carry the same branch"
-        );
-        assert_eq!(
-            &item_trace.branch, branch,
-            "all traces for one raw row must carry one leaf branch"
         );
     }
     branch
@@ -4499,9 +5631,20 @@ pub fn plan_seed_files(plan: &CodeQueryPlan, files: &[ProjectFile]) -> Vec<Proje
             .1;
             (leaves, structural)
         }
-        PlanPartitioning::BySeedExcept => {
-            let minuend = PlanPartitioning::except_minuend_leaf(plan)
-                .expect("an eligible except has a minuend");
+        PlanPartitioning::BySeedExcept | PlanPartitioning::BySeedSetUnion => {
+            let mut minuend =
+                if PlanPartitioning::classify(plan) == PlanPartitioning::BySeedSetUnion {
+                    plan
+                } else {
+                    PlanPartitioning::except_minuend_leaf(plan)
+                        .expect("an eligible except has a minuend")
+                };
+            // The classifier proved that every leaf uses this comparator.
+            // An admitted union minuend has no comparator of its own; select its first
+            // authored leaf without changing the tree executed in each unit.
+            while let CodeQueryPlanSource::Set { branches, .. } = &minuend.source {
+                minuend = branches.first().expect("a set has branches");
+            }
             let structural = seed_languages(minuend).1;
             let mut leaves = Vec::new();
             let mut pending = vec![plan];
@@ -4682,10 +5825,10 @@ impl UnitExecutionResult {
     ) -> Option<MergedLimit> {
         let partitioning = PlanPartitioning::classify(&query.plan);
         let fair_share_divisor = match partitioning {
-            PlanPartitioning::BySeedUnion | PlanPartitioning::BySeedExcept => {
-                PlanPartitioning::fair_share_divisor(&query.plan)
-                    .expect("a seed-partitioned set has a checked fair-share divisor")
-            }
+            PlanPartitioning::BySeedUnion
+            | PlanPartitioning::BySeedSetUnion
+            | PlanPartitioning::BySeedExcept => PlanPartitioning::fair_share_divisor(&query.plan)
+                .expect("a seed-partitioned set has a checked fair-share divisor"),
             PlanPartitioning::BySeed
             | PlanPartitioning::Prefix { .. }
             | PlanPartitioning::Whole(_) => 1,

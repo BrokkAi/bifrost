@@ -4,7 +4,7 @@ use crate::graph::resolver::{
     type_reference_hit_node, visible_owner_from_member_name,
 };
 use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
-use brokk_bifrost_core::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
+use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
 use brokk_bifrost_core::analyzer::{CodeUnit, Range};
 use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
@@ -77,7 +77,7 @@ pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// results. The structured same-symbol check below prevents unrelated
 /// enclosing units from being classified as recursive references.
 pub fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     let start = node.start_byte();
@@ -103,7 +103,7 @@ pub fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// analyzer reconciles both occurrences into one logical CodeUnit, so the
 /// ordinary own-declaration suppression does not apply.
 pub fn push_declaration_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
@@ -121,7 +121,7 @@ pub fn push_declaration_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// self-receiver hit merely because the declaration belongs to the queried
 /// target.
 pub fn push_declared_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
@@ -139,7 +139,7 @@ pub fn push_declared_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// declaration, but this recovery path needs the exact source range to bridge
 /// the inverse edge without exposing it as a runtime reference.
 pub fn push_recovered_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
@@ -203,7 +203,7 @@ fn push_unproven_hit_range(
             unreachable!("unsupported unproven C++ hit emission kind: {kind:?}")
         }
     };
-    ctx.unproven_hits.insert(hit.into_unproven());
+    ctx.usages.insert_unproven_hit(hit);
 }
 
 fn push_hit_with_options(
@@ -234,7 +234,7 @@ fn push_hit_range_with_options(
     kind: UsageHitKind,
     allow_inside_target_declaration: bool,
 ) {
-    if *ctx.limit_exceeded {
+    if ctx.usages.limit_reached() {
         return;
     }
     if is_member_field_own_declarator(anchor, ctx) {
@@ -325,12 +325,7 @@ fn insert_hit_range(
         }
         UsageHitKind::DeclaredReference => hit.into_declared_reference(),
     };
-    if ctx.hits.insert(hit) && kind.included_in(UsageHitSurface::ExternalUsages) {
-        ctx.external_hit_count += 1;
-        if ctx.external_hit_count > ctx.max_usages {
-            *ctx.limit_exceeded = true;
-        }
-    }
+    ctx.usages.insert_hit(hit);
 }
 
 pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {

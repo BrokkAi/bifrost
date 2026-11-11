@@ -1,4 +1,4 @@
-use crate::declarations::parse_rust_file;
+use crate::declarations::parse_rust_file_with;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use std::sync::{
     Mutex,
@@ -40,7 +40,7 @@ fn rust_producer_corpus_smoke() {
                                 let tree = parser.parse(&source, None).expect("parse Rust smoke source");
                                 // The coordinated walk owns RustResolutionBuilder
                                 // and calls finish before returning ParsedFile.
-                                parse_rust_file(&file, &source, &tree);
+                                parse_rust_file_with(&crate::crate_naming::RustCrateNamingCaches::new(&brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing()), &file, &source, &tree);
                             }));
                             match outcome {
                                 Ok(()) => { count.fetch_add(1, Ordering::Relaxed); }

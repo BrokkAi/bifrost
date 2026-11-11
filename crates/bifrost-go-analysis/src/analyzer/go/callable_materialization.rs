@@ -593,7 +593,7 @@ impl GoCallableMaterialization for WorkspaceSemanticOracle<'_> {
             return Ok(None);
         };
         let active = snapshot.active_models();
-        let Some(reader) = active.source_reader() else {
+        let Some(reader) = active.activation_reader() else {
             return Ok(None);
         };
         let packages = GoOverlayPackages::new(Some(overlay));
@@ -636,7 +636,12 @@ impl GoCallableMaterialization for WorkspaceSemanticOracle<'_> {
             return Ok(None);
         }
 
-        let matched = active.members_with_id(&factory.provenance.record_id);
+        let mut matched = active.members_with_id(&factory.provenance.record_id);
+        matched.records.retain(|record| {
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                &record.shard.manifest.language,
+            ) == "go"
+        });
         let lookup_work = SemanticWork {
             nested_entries: matched
                 .candidates_examined

@@ -11,6 +11,22 @@ use crate::analyzer::source_facts::{SourceDeclarationId, SourceFactRows, SourceO
 
 pub const GO_SOURCE_FACTS_VERSION: i64 = 1;
 
+/// Scalar admission for a current, fully published Go source blob. Consumers
+/// must additionally check recorded structural recovery before proving a
+/// complete declaration inventory.
+pub const GO_SOURCE_HEADER_SQL: &str = "SELECT blob.id, marker.logical_rows, marker.payload_bytes,
+            source.occurrence_count, source.declaration_count, source.declaration_unit_count,
+            marker.membership_digest, marker.has_build_constraints,
+            marker.build_selection_facts_version
+     FROM blobs AS blob
+     JOIN source_go_manifests AS marker ON marker.blob_id = blob.id
+     JOIN source_fact_manifests AS source ON source.blob_id = blob.id
+     JOIN blob_meta AS meta ON meta.blob_id = blob.id
+     JOIN source_fact_readiness AS ready ON ready.blob_id = blob.id
+     WHERE blob.blob_oid = ?1 AND blob.lang = 'go' AND blob.parse_variant = x'' AND blob.generation = ?2
+       AND marker.facts_version = ?3 AND source.facts_version = ?4
+       AND source.publication_state = 'complete' AND meta.is_complete = 1 AND ready.available = 1";
+
 /// Version of the supplemental Go build-selection fact stored with the source
 /// manifest. Older cache rows remain explicitly unknown until republished.
 pub const GO_BUILD_SELECTION_FACTS_VERSION: i64 = 1;

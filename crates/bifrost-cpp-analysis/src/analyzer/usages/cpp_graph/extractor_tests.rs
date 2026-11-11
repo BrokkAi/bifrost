@@ -82,17 +82,8 @@ mod effective_using_scale_tests {
             .prepared_syntax(query_token, &consumer)
             .expect("prepared consumer");
         let target_group = HashSet::from_iter([target]);
-        let mut hits = std::collections::BTreeSet::new();
-        let mut unproven_hits = std::collections::BTreeSet::new();
-        let mut raw_match_count = 0;
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages: usize::MAX,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
+        let mut usages =
+            brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator::unbounded();
 
         reset_type_reference_candidate_scan_count_for_test();
         scan_prepared_file(
@@ -104,8 +95,9 @@ mod effective_using_scale_tests {
             None,
             &spec,
             &target_group,
-            &mut state,
+            &mut usages,
         );
+        let hits = usages.hits();
 
         let hit_text = hits
             .iter()

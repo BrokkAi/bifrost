@@ -71,11 +71,54 @@ fn evaluated_report(source: &str) -> PolicyReportDocument {
                 cvss_overlays: &[],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )
         .unwrap();
     PolicyReportDocument::try_new(vec![descriptor], vec![run], Vec::new(), false, 0, None).unwrap()
+}
+
+#[test]
+fn human_views_keep_the_close_match_marker_when_contributor_details_are_cut() {
+    let report = evaluated_report("export function target() {}\n");
+    let budget = PolicyBudget::default();
+    let snapshot = crate::test_support::close_match_snapshot();
+    let mut run = crate::evaluator::apply_approximate_family_backstop(
+        report.runs()[0].clone(),
+        Some(snapshot.as_ref()),
+        &budget,
+    )
+    .unwrap();
+    let contributor = run.findings()[0].model_attribution().unwrap().contributors[0].clone();
+    let finding = run.findings()[0].clone();
+    run.findings_mut()[0] = finding
+        .with_model_attribution(
+            Some(crate::ModelAttribution::from_full(vec![contributor], 0)),
+            &budget,
+        )
+        .unwrap();
+    let marked = PolicyReportDocument::try_new(
+        report.rules().to_vec(),
+        vec![run],
+        Vec::new(),
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    let json = serde_json::to_string(&marked).unwrap();
+    assert!(json.contains("\"model_attribution\""), "{json}");
+    assert!(json.contains("\"omitted_at_least\":1"), "{json}");
+    for detail in [HumanRenderDetail::Verbose, HumanRenderDetail::Concise] {
+        let text = render(&marked, detail);
+        assert!(
+            text.to_lowercase()
+                .contains("may depend on approximate model evidence (active pack)"),
+            "{text}"
+        );
+        assert!(text.contains("at least 1 more contributor"), "{text}");
+    }
 }
 
 #[test]

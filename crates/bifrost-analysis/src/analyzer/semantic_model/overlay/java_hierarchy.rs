@@ -5,6 +5,31 @@ use super::*;
 #[allow(unused_imports)]
 pub use brokk_bifrost_semantic::analyzer::semantic_model::overlay::java_hierarchy::*;
 impl SemanticModelOverlay {
+    /// Direct nominal parents and whether their inventory is exhaustive.
+    /// Missing inventories retain authored edges without closing a family.
+    pub fn java_direct_hierarchy(
+        &self,
+        source: &SemanticModelSymbol,
+    ) -> Result<(Vec<HierarchyFact>, bool), JavaHierarchyIncomplete> {
+        if source.provenance.ambiguous {
+            return Err(JavaHierarchyIncomplete::Ambiguous);
+        }
+        let active = self
+            .active_models
+            .as_ref()
+            .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
+        let owner =
+            owner_declaration(active, source).ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
+        let (parents, complete) = match &owner.jvm_inventory {
+            Some(inventory) => (inventory.supertypes.clone(), inventory.supertypes_complete),
+            None => (owner.hierarchy.clone(), false),
+        };
+        Ok((
+            parents,
+            complete && source.provenance.completeness == SemanticModelCompleteness::Complete,
+        ))
+    }
+
     #[doc(hidden)]
     pub fn java_reference_widening(
         &self,
@@ -29,6 +54,7 @@ impl SemanticModelOverlay {
                 Ok((
                     edges.clone(),
                     current.provenance.completeness == SemanticModelCompleteness::Complete,
+                    None,
                 ))
             },
             |ty| match ty {
@@ -59,11 +85,14 @@ impl SemanticModelOverlay {
             cancellation,
             |current| {
                 let owner = owner_declaration(active, current);
-                if let Some(inventory) = owner
-                    .as_ref()
-                    .and_then(|owner| owner.jvm_inventory.as_ref())
+                if let Some(owner) = owner.as_ref()
+                    && let Some(inventory) = owner.jvm_inventory.as_ref()
                 {
-                    return Ok((inventory.supertypes.clone(), inventory.supertypes_complete));
+                    return Ok((
+                        inventory.supertypes.clone(),
+                        inventory.supertypes_complete,
+                        Some(owner.type_parameters.clone()),
+                    ));
                 }
                 // Authored edges establish positive paths without certifying
                 // an exhaustive supertype inventory. A missing witness must
@@ -72,7 +101,7 @@ impl SemanticModelOverlay {
                     .java_hierarchy
                     .get(&current.id)
                     .ok_or(JavaHierarchyIncomplete::MissingHierarchy)?;
-                Ok((edges.clone(), false))
+                Ok((edges.clone(), false, None))
             },
             |ty| match ty {
                 TypeRef::Named { name, .. } => Some(name),
@@ -90,7 +119,10 @@ impl SemanticModelOverlay {
         cancellation: Option<&crate::CancellationToken>,
         hierarchy: impl Fn(
             &SemanticModelSymbol,
-        ) -> Result<(Vec<HierarchyFact>, bool), JavaHierarchyIncomplete>,
+        ) -> Result<
+            (Vec<HierarchyFact>, bool, Option<Vec<String>>),
+            JavaHierarchyIncomplete,
+        >,
         edge_name: impl Fn(&TypeRef) -> Option<&str>,
     ) -> JavaHierarchyAnswer {
         let mut answer = JavaHierarchyAnswer {
@@ -101,11 +133,12 @@ impl SemanticModelOverlay {
             Arc::clone(source),
             vec![source.provenance.clone()],
             Vec::new(),
+            Vec::new(),
         )]);
         let mut seen = HashSet::default();
         let mut visited = 0;
         let mut edge_visits = 0;
-        while let Some((current, path, path_edges)) = pending.pop_front() {
+        while let Some((current, path, path_edges, path_parameters)) = pending.pop_front() {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 answer.incomplete.push(JavaHierarchyIncomplete::Cancelled);
                 break;
@@ -140,16 +173,19 @@ impl SemanticModelOverlay {
                     .push(JavaHierarchyIncomplete::MissingHierarchy);
                 continue;
             }
-            let (edges, complete) = match hierarchy(&current) {
+            let (edges, complete, parameters) = match hierarchy(&current) {
                 Ok(evidence) => evidence,
                 Err(reason) => {
                     answer.incomplete.push(reason);
                     continue;
                 }
             };
+            let mut path_parameters = path_parameters;
+            path_parameters.push(parameters);
             if current.id == target.id {
                 answer.witness.get_or_insert(JavaHierarchyWitness {
                     declarations: path,
+                    type_parameters: path_parameters,
                     edges: path_edges,
                 });
                 continue;
@@ -203,7 +239,12 @@ impl SemanticModelOverlay {
                 next_path.push(next.provenance.clone());
                 let mut next_edges = path_edges.clone();
                 next_edges.push(edge.clone());
-                pending.push_back((Arc::clone(next), next_path, next_edges));
+                pending.push_back((
+                    Arc::clone(next),
+                    next_path,
+                    next_edges,
+                    path_parameters.clone(),
+                ));
             }
         }
         let mut unique = Vec::new();

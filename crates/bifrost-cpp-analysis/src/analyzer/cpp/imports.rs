@@ -100,38 +100,47 @@ impl ImportAnalysisProvider for CppAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        if let Some(cached) = self.imported_code_units.read(
-            &memo_attribution(self),
-            |memo| memo.get(file),
-            |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
-        ) {
-            return cached;
-        }
-        let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-
-        let mut resolved = HashSet::default();
-        let include_targets = self.include_target_index();
-        let Some(paths) = CppSource::canonical_include_paths(self, token, file) else {
-            return Arc::new(resolved);
-        };
-        for path in paths {
-            for target in resolve_include_targets_with_index(file, &path, &include_targets) {
-                resolved.extend(self.inner.top_level_declarations(&target));
-            }
-        }
-
-        let resolved = Arc::new(resolved);
-        if cache_fill.is_complete() {
-            self.imported_code_units.read(
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let scope = AnalyzerQueryScope::new(self);
+            let token = scope.token();
+            if let Some(cached) = self.imported_code_units.read(
                 &memo_attribution(self),
-                |memo| memo.insert(file.clone(), Arc::clone(&resolved)),
+                |memo| memo.get(file),
                 |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
-            );
+            ) {
+                return cached;
+            }
+            let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+
+            let mut resolved = HashSet::default();
+            let include_targets = self.include_target_index();
+            let Some(paths) = CppSource::canonical_include_paths(self, token, file) else {
+                return Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                    resolved,
+                ));
+            };
+            for path in paths {
+                for target in resolve_include_targets_with_index(file, &path, &include_targets) {
+                    resolved.extend(self.inner.top_level_declarations(&target));
+                }
+            }
+
+            let resolved = Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                resolved,
+            ));
+            if cache_fill.is_complete() {
+                self.imported_code_units.read(
+                    &memo_attribution(self),
+                    |memo| memo.insert(file.clone(), Arc::clone(&resolved)),
+                    |_| AuthorityInputs::SourceOf(&[Language::Cpp]),
+                );
+            }
+            resolved
         }
-        resolved
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

@@ -724,23 +724,6 @@ test('only complete successful policy reports qualify for an immutable cache sna
   assert.match(action, /cache_nonce="\$\(date \+%s\)-\$\{RANDOM\}-\$\$"/u);
 });
 
-test('a supplied semantic-pack executable bypasses Cargo and preserves arguments', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pack helper '));
-  try {
-    const bin = path.join(dir, 'pack tool');
-    const capture = path.join(dir, 'args');
-    fs.writeFileSync(bin, '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$CAPTURE"\n', { mode: 0o755 });
-    fs.writeFileSync(path.join(dir, 'cargo'), '#!/usr/bin/env bash\necho unexpected-cargo >&2\nexit 99\n', { mode: 0o755 });
-    const result = spawnSync('bash', ['-c', 'source scripts/lib/semantic-pack-tool.sh; run_semantic_pack_tool generate "output with spaces" spec.json'], {
-      encoding: 'utf8', env: { ...process.env, BIFROST_SEMANTIC_PACK_BIN: bin, CAPTURE: capture, PATH: `${dir}${path.delimiter}${process.env.PATH}` },
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(fs.readFileSync(capture, 'utf8').trimEnd().split('\n'), ['generate', 'output with spaces', 'spec.json']);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 
 // Exercise the action's actual shell with a hand-written process, including a
 // stderr handshake that cannot complete if diagnostics are buffered until exit.

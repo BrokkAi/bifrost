@@ -1,7 +1,10 @@
-# This counter tracks cache pins, never semantic identity. Procedure handles
-# compare and hash only their artifact allocation pointer and immutable row ID.
-# Keep mutable-key checks active for every other field and type.
+# These types track cache pins and retention-budget charges, never semantic
+# identity. Procedure handles compare and hash only their artifact allocation
+# pointer and immutable row ID, and an allocation charge takes no part in
+# equality or hashing. Keep mutable-key checks active for every other field and
+# type.
 ignore-interior-mutability = [
     "..",
+    "brokk_bifrost_core::retention_budget::AllocationCharge",
     "brokk_bifrost_semantic::analyzer::semantic::ir::artifact::ArtifactCachePins",
 ]

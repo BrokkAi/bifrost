@@ -12,7 +12,7 @@
 //! `TreeSitterAnalyzer`, or `PythonAnalyzer`.
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here
-//! take [`graph_support::PythonSource`] (or
+//! take [`source_support::PythonSource`] (or
 //! [`graph_support::PythonUsageSource`] once the usage index exists) -- a core
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized per-file
 //! products Python resolves through. `analyzer/python/` in
@@ -33,14 +33,15 @@ pub mod graph;
 pub mod graph_support;
 pub mod imports;
 pub mod intrinsics;
+pub mod package_paths;
 pub mod queries;
 mod regex;
 pub use regex::{decode_python_fstring_literal_segments, decode_python_string_value};
-#[cfg(any(test, feature = "test-support"))]
 mod resolution;
 pub mod runtime_values;
 pub mod source_facts;
 mod source_properties;
+pub mod source_support;
 pub mod structural;
 pub mod syntax;
 pub mod test_detection;

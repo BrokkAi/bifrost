@@ -127,7 +127,7 @@ impl SemanticModelCompleteness {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticModelSymbolKind {
     Class,
@@ -176,7 +176,7 @@ impl SemanticModelSymbolKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelRange {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -195,20 +195,20 @@ impl From<Range> for SemanticModelRange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelAuthoredAnchor {
     pub path: String,
     pub symbol: String,
     pub range: SemanticModelRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelVirtualLocation {
     pub uri: String,
     pub range: SemanticModelRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticModelLocation {
     Authored(SemanticModelAuthoredAnchor),
@@ -300,7 +300,9 @@ pub struct GeneratedFunctionScope {
 }
 
 /// The defining provider; curated contributors remain on the composed symbol.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, schemars::JsonSchema,
+)]
 pub struct ModelProvider {
     pub pack_id: String,
     pub pack_version: String,
@@ -429,7 +431,8 @@ pub fn classify_model_type_owner<'a>(
 }
 
 /// Selected composition answer semantics. Bump when G1 composition changes.
-pub const MODEL_COMPOSITION_VERSION: u32 = 1;
+/// #10045: authored Rust family certification now survives generated std composition.
+pub const MODEL_COMPOSITION_VERSION: u32 = 3;
 
 /// The caller compilation's providers, canonicalized before hashing.
 #[derive(Debug, Clone)]
@@ -557,7 +560,7 @@ pub struct PromotedFrom {
     pub depth: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SemanticModelSymbol {
     /// Go promotion provenance reconstructed from the authored declaring site.
     #[serde(skip)]
@@ -578,6 +581,11 @@ pub struct SemanticModelSymbol {
     #[serde(skip)]
     #[doc(hidden)]
     pub jvm_owner_family_enumerated: bool,
+    /// Authored Python runtime base classes in declaration order. None means
+    /// unknown bases; Some(empty) means a proven root. Other
+    /// languages take base types from their own declaration facts.
+    #[serde(skip)]
+    pub python_runtime_bases: Option<Vec<TypeRef>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub rust_generated_scope: Option<Box<GeneratedFunctionScope>>,
@@ -604,6 +612,18 @@ pub struct SemanticModelSymbol {
     #[serde(skip)]
     #[doc(hidden)]
     pub callable_surface_complete: bool,
+    /// The source pack state before Fenced is projected as partial provenance.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub source_completeness: Completeness,
+    /// The serialized value inventory fence of a declaration owner.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub values_complete: bool,
+    /// The serialized supertype fence of a declaration owner.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub supertypes_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     #[serde(skip)]
@@ -760,6 +780,9 @@ impl SemanticModelCallApplication {
 pub enum SemanticModelCallableIncompleteReason {
     /// The owner or member came from a partial active model.
     PartialModel,
+    /// The active models could not be read in full for this owner or member:
+    /// their JVM-family part was open.
+    InputUnavailable,
     /// The active model explicitly marked this record as ambiguous.
     AmbiguousModel,
     /// The model did not publish a structured signature.
@@ -791,6 +814,11 @@ pub enum SemanticModelCallableDisposition {
 pub struct SemanticModelCallableMatch {
     pub records: Vec<Arc<SemanticModelSymbol>>,
     pub disposition: SemanticModelCallableDisposition,
+    /// When `disposition` is `Incomplete(PartialModel)` only because no model
+    /// certifies the one owner's overload family complete, the `Unique`,
+    /// `CompatibleLayout` or `Conflict` answer the known members give. A
+    /// consumer may bind through it only as a possible identity (#10761).
+    pub possible: Option<SemanticModelCallableDisposition>,
 }
 
 impl SemanticModelCallableMatch {
@@ -854,12 +882,56 @@ pub fn semantic_model_callable_family_id<T: std::borrow::Borrow<SemanticModelSym
                 || first.callable_family_complete))
             .then(|| first.id.clone());
     }
+    let certified = records.iter().all(|record| {
+        let record = record.borrow();
+        record.provenance.completeness == SemanticModelCompleteness::Complete
+            || record.callable_family_complete
+    });
+    if !certified {
+        return None;
+    }
+    let record_ids = uniform_callable_family_record_ids(records)?;
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.semantic_model.callable_family.v1");
+    for record_id in record_ids {
+        digest.push(record_id.as_bytes());
+    }
+    Some(digest.finish().to_string())
+}
+
+/// Derive the identity of the known members of an overload family that no
+/// model certifies complete (#10761).
+///
+/// The records must pass every check of [`semantic_model_callable_family_id`]
+/// except certification: one structured owner/name/call shape, one activation
+/// provenance, and no ambiguous record. The model may omit overloads, so a
+/// call bound through this identity is a possible binding, never an exact
+/// one. The digest domain differs from the proven family's, so a possible
+/// identity never equals a proven one, even for one record.
+pub fn semantic_model_possible_callable_family_id<T: std::borrow::Borrow<SemanticModelSymbol>>(
+    records: &[T],
+) -> Option<String> {
+    let record_ids = uniform_callable_family_record_ids(records)?;
+    let mut digest =
+        LengthDelimitedDigest::new(b"bifrost.semantic_model.possible_callable_family.v1");
+    for record_id in record_ids {
+        digest.push(record_id.as_bytes());
+    }
+    Some(digest.finish().to_string())
+}
+
+/// The sorted record IDs of callable records that share one unambiguous
+/// owner/name/call shape and one activation provenance, or `None`.
+fn uniform_callable_family_record_ids<T: std::borrow::Borrow<SemanticModelSymbol>>(
+    records: &[T],
+) -> Option<Vec<&str>> {
+    let first = records.first()?.borrow();
+    if !member_is_callable(first) {
+        return None;
+    }
     let first_provenance = &first.provenance;
     let same_family = records.iter().all(|record| {
         let record = record.borrow();
         !record.provenance.ambiguous
-            && (record.provenance.completeness == SemanticModelCompleteness::Complete
-                || record.callable_family_complete)
             && record.owner_id == first.owner_id
             && record.name == first.name
             && record.language == first.language
@@ -884,14 +956,7 @@ pub fn semantic_model_callable_family_id<T: std::borrow::Borrow<SemanticModelSym
         .collect::<Vec<_>>();
     record_ids.sort_unstable();
     record_ids.dedup();
-    if record_ids.len() != records.len() {
-        return None;
-    }
-    let mut digest = LengthDelimitedDigest::new(b"bifrost.semantic_model.callable_family.v1");
-    for record_id in record_ids {
-        digest.push(record_id.as_bytes());
-    }
-    Some(digest.finish().to_string())
+    (record_ids.len() == records.len()).then_some(record_ids)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -934,14 +999,28 @@ pub enum SemanticModelOverlayDisposition {
     Empty,
     Unique,
     Conflict,
+    /// Rows of these languages are not certified complete: a JVM reader failed
+    /// or a C# pack fence is open. Present records are possible candidates.
+    Open(super::runtime::FamilyOpen),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum SemanticModelOverlayBuildError {
     Cancelled,
+    Open(super::runtime::FamilyOpen),
     RetainedBytesExceeded(super::runtime::SemanticModelOverlayBudgetExceeded),
     GoSurfaceTraversalExceeded,
+}
+
+impl From<super::runtime::FamilyOpen> for SemanticModelOverlayBuildError {
+    fn from(open: super::runtime::FamilyOpen) -> Self {
+        if open.is_cancellation() {
+            Self::Cancelled
+        } else {
+            Self::Open(open)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -956,6 +1035,76 @@ impl<T> SemanticModelOverlayMatch<T> {
         (self.disposition == SemanticModelOverlayDisposition::Unique)
             .then(|| self.records.first().cloned())
             .flatten()
+    }
+}
+
+impl SemanticModelOverlayMatch<SemanticModelSymbol> {
+    /// Keeps one language family's records and recomputes their disposition.
+    pub fn for_family(mut self, language: &str) -> Self {
+        use brokk_bifrost_core::analyzer::model::semantic_pack_realm;
+        self.records.retain(|record| {
+            semantic_pack_realm(&record.language) == semantic_pack_realm(language)
+        });
+        let stays_open = matches!(
+            &self.disposition,
+            SemanticModelOverlayDisposition::Open(open) if open.covers(language)
+        );
+        if !stays_open {
+            self.disposition = disposition(&self.records, |record| record.provenance.ambiguous);
+        }
+        self
+    }
+
+    /// Keeps one language's records and recomputes the disposition over them.
+    /// Content gaps stay scoped to their languages. Read failures and
+    /// cancellations stay Open for every language because merged rows were lost.
+    pub fn for_language(mut self, language: &str) -> Self {
+        self.records.retain(|record| record.language == language);
+        let stays_open = matches!(
+            &self.disposition,
+            SemanticModelOverlayDisposition::Open(open) if open.covers(language)
+        );
+        if !stays_open {
+            self.disposition = disposition(&self.records, |record| record.provenance.ambiguous);
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod overlay_open_tests {
+    use super::*;
+
+    #[test]
+    fn open_is_language_scoped() {
+        let open = super::super::runtime::FamilyOpen::jvm("test");
+        let empty = || SemanticModelOverlayMatch::<SemanticModelSymbol> {
+            records: Vec::new(),
+            disposition: SemanticModelOverlayDisposition::Open(open),
+        };
+        assert_eq!(
+            empty().for_language("python").disposition,
+            SemanticModelOverlayDisposition::Open(open)
+        );
+        assert_eq!(
+            empty().for_language("java").disposition,
+            SemanticModelOverlayDisposition::Open(open)
+        );
+        assert!(super::super::runtime::FamilyOpen::jvm_cancelled().covers("python"));
+        // Content gaps cover exactly their listed languages.
+        let csharp = super::super::runtime::FamilyOpen::content("test", &["csharp"]);
+        let csharp_open = || SemanticModelOverlayMatch::<SemanticModelSymbol> {
+            records: Vec::new(),
+            disposition: SemanticModelOverlayDisposition::Open(csharp),
+        };
+        assert_eq!(
+            csharp_open().for_language("csharp").disposition,
+            SemanticModelOverlayDisposition::Open(csharp)
+        );
+        assert_eq!(
+            csharp_open().for_language("java").disposition,
+            SemanticModelOverlayDisposition::Empty
+        );
     }
 }
 
@@ -1004,6 +1153,12 @@ pub enum SemanticModelEdgeDefect {
     NameResolved,
     /// More than one published declaration answers the target.
     Ambiguous,
+    /// The target lookup's JVM-family part was open, so declarations that
+    /// answer it may be missing.
+    Open,
+    /// The read of the type's own hierarchy relations was open, so edges it
+    /// declares may be missing. The edge's `to` is empty: no target is known.
+    RelationsOpen,
 }
 
 /// One hierarchy edge an ancestor walk could not cross cleanly.
@@ -1032,6 +1187,14 @@ impl std::fmt::Display for SemanticModelUnresolvedEdge {
             SemanticModelEdgeDefect::Ambiguous => write!(
                 formatter,
                 "`{from}` inherits `{to}`, which more than one active semantic pack declares"
+            ),
+            SemanticModelEdgeDefect::Open => write!(
+                formatter,
+                "`{from}` inherits `{to}`, whose declarations could not be read in full"
+            ),
+            SemanticModelEdgeDefect::RelationsOpen => write!(
+                formatter,
+                "the hierarchy relations of `{from}` could not be read in full"
             ),
         }
     }
@@ -1069,6 +1232,10 @@ pub struct ResolvedEdgeTarget {
     pub records: Vec<Arc<SemanticModelSymbol>>,
     #[doc(hidden)]
     pub defect: Option<SemanticModelEdgeDefect>,
+    /// The open part of the lookup when `defect` is `Open`: the records are
+    /// then candidates, never a resolution.
+    #[doc(hidden)]
+    pub open: Option<super::runtime::FamilyOpen>,
 }
 
 /// What declaration kinds a hierarchy edge may name.
@@ -1469,9 +1636,18 @@ pub fn member_is_callable(symbol: &SemanticModelSymbol) -> bool {
     symbol_kind_is_callable(symbol.kind)
 }
 
+/// Whether a call of this callable member binds a receiver, which is the
+/// receiver half of a resolver-owned callable key.
+///
+/// This is [`SemanticModelSymbol::has_receiver`] except for Ruby, which has
+/// no receiverless method: a singleton method (`is_static`) runs with its
+/// owner's class or module object as `self`, and the resolver binds
+/// `Marshal.load(x)` with the written constant as that receiver (#9336).
+/// The instance-member question keeps asking `has_receiver`.
 #[doc(hidden)]
 pub fn member_has_receiver(symbol: &SemanticModelSymbol) -> bool {
     symbol.has_receiver()
+        || (symbol.language == "ruby" && matches!(symbol.kind, SemanticModelSymbolKind::Method))
 }
 
 /// The qualified name every declaration of `language` implicitly inherits,
@@ -1614,9 +1790,16 @@ pub fn type_declarations_equivalent(left: &TypeFact, right: &TypeFact) -> bool {
 
 #[doc(hidden)]
 pub fn mark_symbol_identity_conflicts(symbols: &mut [SemanticModelSymbol]) {
-    let mut identities: HashMap<String, Vec<usize>> = HashMap::default();
+    let mut identities: HashMap<(String, String), Vec<usize>> = HashMap::default();
     for (index, symbol) in symbols.iter().enumerate() {
-        identities.entry(symbol.id.clone()).or_default().push(index);
+        identities
+            .entry((
+                brokk_bifrost_core::analyzer::model::semantic_pack_realm(&symbol.language)
+                    .to_owned(),
+                symbol.id.clone(),
+            ))
+            .or_default()
+            .push(index);
     }
     for posting in identities.values().filter(|posting| posting.len() > 1) {
         let mut artifacts = HashSet::default();

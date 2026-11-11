@@ -572,9 +572,46 @@ impl fmt::Display for SemanticArtifactMaterializationId {
     }
 }
 
+// A clone receives fresh derived state, even if a future owner changes its IR.
+#[derive(Debug, Default)]
+struct CallableSelectionDominance(
+    std::sync::OnceLock<Option<crate::analyzer::semantic::cfg_algorithms::CompactDominators>>,
+);
+
+impl Clone for CallableSelectionDominance {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+// These cells live only as long as this immutable ProcedureSemantics value.
+// There is no cross-request registry; clones start with empty derived state.
+#[derive(Debug, Default)]
+struct CallGapDerived {
+    scopes: std::sync::OnceLock<CallGapScopes>,
+    abort_user_code: std::sync::OnceLock<bool>,
+}
+
+impl Clone for CallGapDerived {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug)]
+struct CallGapScopes {
+    procedure: Box<[usize]>,
+    points: Box<[(ProgramPointId, usize)]>,
+    values: Box<[(ValueId, usize)]>,
+    calls: Box<[(CallSiteId, usize)]>,
+}
+
 /// One validated executable body.
 #[derive(Debug, Clone)]
 pub struct ProcedureSemantics {
+    callable_selection_dominance: CallableSelectionDominance,
+    call_gap_derived: CallGapDerived,
+    declared_result_classes: Option<Box<[StaticTypeClass]>>,
     id: ProcedureId,
     materialization_id: ProcedureMaterializationId,
     locator: SemanticLocator,
@@ -607,6 +644,7 @@ pub struct ProcedureSemantics {
     pointer_invalidations: Box<[PointerInvalidation]>,
     incomplete_facts: Box<[SemanticIncompleteFact]>,
     receiver_type_facts: Box<[CallReceiverTypeFact]>,
+    guarded_pattern_projections: Box<[GuardedPatternProjection]>,
     evidence_rows: Box<[Evidence]>,
     gaps: Box<[SemanticGap]>,
     blocks: Box<[BasicBlock]>,
@@ -634,9 +672,12 @@ impl ProcedureSemantics {
         let value_identity_ordinals =
             duplicate_value_ordinals(&parts.values, &parts.source_mappings);
         let mut semantics = Self {
+            callable_selection_dominance: CallableSelectionDominance::default(),
+            call_gap_derived: CallGapDerived::default(),
             id: parts.id,
             materialization_id: ProcedureMaterializationId(StableDigest::from_array([0; 32])),
             locator: parts.locator,
+            declared_result_classes: parts.declared_result_classes,
             source_range_holes: parts.source_range_holes.into_boxed_slice(),
             lexical_parent: parts.lexical_parent,
             kind: parts.kind,
@@ -663,6 +704,7 @@ impl ProcedureSemantics {
             pointer_invalidations: parts.pointer_invalidations.into_boxed_slice(),
             incomplete_facts: parts.incomplete_facts.into_boxed_slice(),
             receiver_type_facts: parts.receiver_type_facts.into_boxed_slice(),
+            guarded_pattern_projections: parts.guarded_pattern_projections.into_boxed_slice(),
             evidence_rows: parts.evidence_rows.into_boxed_slice(),
             gaps: parts.gaps.into_boxed_slice(),
             blocks: parts.blocks.into_boxed_slice(),
@@ -710,7 +752,12 @@ impl ProcedureSemantics {
         self.pointer_accesses.hash(&mut digest);
         self.pointer_invalidations.hash(&mut digest);
         self.incomplete_facts.hash(&mut digest);
+        self.declared_result_classes.hash(&mut digest);
         self.receiver_type_facts.hash(&mut digest);
+        if !self.guarded_pattern_projections.is_empty() {
+            b"guarded-pattern-projections-v1".hash(&mut digest);
+            self.guarded_pattern_projections.hash(&mut digest);
+        }
         self.evidence_rows.hash(&mut digest);
         self.gaps.hash(&mut digest);
         self.blocks.hash(&mut digest);
@@ -891,8 +938,16 @@ impl ProcedureSemantics {
 
     /// Written receiver types of this procedure's method calls, in increasing
     /// call-site order, one fact per call site at most.
+    pub fn declared_result_classes(&self) -> Option<&[StaticTypeClass]> {
+        self.declared_result_classes.as_deref()
+    }
+
     pub fn receiver_type_facts(&self) -> &[CallReceiverTypeFact] {
         &self.receiver_type_facts
+    }
+
+    pub fn guarded_pattern_projections(&self) -> &[GuardedPatternProjection] {
+        &self.guarded_pattern_projections
     }
 
     /// The written receiver type fact for one call site, if the file proved one.
@@ -1115,7 +1170,6 @@ impl ProcedureSemantics {
         });
         self.points()
             .iter()
-            .filter(|point| dominance.dominates(self, point.id, call.point))
             .flat_map(|point| {
                 point
                     .events
@@ -1132,7 +1186,7 @@ impl ProcedureSemantics {
                     | SemanticEffect::CallableCreation { result, .. } => result,
                     _ => return false,
                 };
-                if result != call.callee {
+                if result != call.callee || !dominance.dominates(self, *point, call.point) {
                     return false;
                 }
                 let Some(source) = self.source_mapping(event.source) else {
@@ -1214,19 +1268,115 @@ impl ProcedureSemantics {
 
     fn callable_selection_dominance(
         &self,
-    ) -> Option<crate::analyzer::semantic::cfg_algorithms::Dominators<ProgramPointId>> {
-        use crate::analyzer::semantic::cfg_algorithms::{
-            CfgAlgorithmBudget, CfgAlgorithmRequest, dominators,
-        };
-        let mut budget = CfgAlgorithmBudget::default();
-        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
-        // A failed bounded proof leaves receiver binding unknown.
-        dominators(
-            self,
-            self.entry_point(),
-            &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+    ) -> Option<&crate::analyzer::semantic::cfg_algorithms::CompactDominators> {
+        self.callable_selection_dominance
+            .0
+            .get_or_init(|| {
+                use crate::analyzer::semantic::cfg_algorithms::{
+                    CfgAlgorithmBudget, CfgAlgorithmRequest, dominators,
+                };
+                // Fixed limits and a private uncancelled token make this outcome
+                // a pure function of this immutable procedure. Never share this
+                // result with callers whose CFG limits differ.
+                let mut budget = CfgAlgorithmBudget::default();
+                let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+                dominators(
+                    self,
+                    self.entry_point(),
+                    &mut CfgAlgorithmRequest::new(&mut budget, &cancellation),
+                )
+                .ok()
+                .map(|dominance| dominance.into_compact())
+            })
+            .as_ref()
+    }
+
+    /// Gaps whose subjects can affect this call, in original gap-id order.
+    pub fn call_gap_candidates(&self, call: &SemanticCallSite) -> Vec<&SemanticGap> {
+        // A derived index of immutable IR is not charged: a fill charge lands on
+        // whichever request fills it first, making persisted and rendered work
+        // counters depend on request order.
+        let scopes = self.call_gap_derived.scopes.get_or_init(|| {
+            let mut procedure = Vec::new();
+            let mut points = Vec::new();
+            let mut values = Vec::new();
+            let mut calls = Vec::new();
+            for (index, gap) in self.gaps.iter().enumerate() {
+                match gap.subject {
+                    SemanticGapSubject::Procedure => procedure.push(index),
+                    SemanticGapSubject::Point => points.push((gap.point, index)),
+                    SemanticGapSubject::Value(value) => values.push((value, index)),
+                    SemanticGapSubject::CallSite(call)
+                    | SemanticGapSubject::CallContinuation {
+                        call_site: call, ..
+                    } => calls.push((call, index)),
+                    SemanticGapSubject::MemoryLocation(_)
+                    | SemanticGapSubject::Capture(_)
+                    | SemanticGapSubject::AsyncContinuation { .. } => {}
+                }
+            }
+            points.sort_unstable();
+            values.sort_unstable();
+            calls.sort_unstable();
+            CallGapScopes {
+                procedure: procedure.into_boxed_slice(),
+                points: points.into_boxed_slice(),
+                values: values.into_boxed_slice(),
+                calls: calls.into_boxed_slice(),
+            }
+        });
+        fn append<K: Ord>(rows: &[(K, usize)], key: K, candidates: &mut Vec<usize>) {
+            let start = rows.partition_point(|(row, _)| row < &key);
+            candidates.extend(
+                rows[start..]
+                    .iter()
+                    .take_while(|(row, _)| row == &key)
+                    .map(|(_, index)| *index),
+            );
+        }
+        let mut candidates = scopes.procedure.to_vec();
+        append(&scopes.points, call.point, &mut candidates);
+        append(&scopes.calls, call.id, &mut candidates);
+        let mut values = vec![call.callee];
+        values.extend(call.receiver);
+        values.extend(call.arguments.iter().map(|argument| argument.value));
+        values.extend(call.normal_result_values());
+        values.extend(call.thrown);
+        values.sort_unstable();
+        values.dedup();
+        for value in values {
+            append(&scopes.values, value, &mut candidates);
+        }
+        candidates.sort_unstable_by_key(|index| self.gaps[*index].id);
+        candidates
+            .into_iter()
+            .map(|index| &self.gaps[index])
+            .collect()
+    }
+
+    /// Complete abort-path answer, derived without request reads or limits.
+    pub(crate) fn memoized_abort_paths_run_user_code(
+        &self,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        *self.call_gap_derived.abort_user_code.get_or_init(compute)
+    }
+
+    /// Reserve all possible lazy gap-index rows before artifact admission.
+    pub fn call_gap_index_reserved_bytes(&self) -> u64 {
+        (self.gaps.len() as u64).saturating_mul(
+            size_of::<(ProgramPointId, usize)>()
+                .max(size_of::<(ValueId, usize)>())
+                .max(size_of::<(CallSiteId, usize)>()) as u64,
         )
-        .ok()
+    }
+
+    /// Reserve the largest lazy dominance payload before artifact admission.
+    /// The inline cell is already included in size_of::<ProcedureSemantics>.
+    pub fn callable_selection_dominance_reserved_bytes(&self) -> u64 {
+        (self.points.len() as u64)
+            .saturating_mul(size_of::<u32>() as u64)
+            .saturating_add((size_of::<usize>() * 2) as u64)
     }
 
     /// Values introduced at a callable-selection boundary to prepare its
@@ -1651,6 +1801,8 @@ mod value_identity_tests {
 
     fn value(id: u32, source: u32, kind: SemanticValueKind) -> SemanticValue {
         SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(id),
             kind,
             source: SourceMappingId::new(source),
@@ -1746,6 +1898,7 @@ fn boxed_slice_index_retained_bytes<K, V>(index: &HashMap<K, Box<[V]>>) -> u64 {
 /// One immutable interpretation of one mounted source snapshot.
 #[derive(Debug)]
 pub struct SemanticArtifact {
+    pub(crate) charge: brokk_bifrost_core::retention_budget::AllocationCharge,
     pub(crate) cache_pins: Arc<ArtifactCachePins>,
     #[doc(hidden)]
     pub query_source: Option<Arc<str>>,
@@ -1815,7 +1968,7 @@ impl SemanticArtifact {
         let work =
             measure_artifact_work(&key, &procedure_parts, &go_predeclared_builtin_assumptions);
         let mut charged_budget = budget.clone();
-        charged_budget.admit(work)?;
+        charged_budget.admit_artifact_rows(work)?;
         validate_artifact(&key, &capabilities, &procedure_parts)?;
 
         let mut procedures_by_locator = HashMap::default();
@@ -1850,6 +2003,7 @@ impl SemanticArtifact {
             &go_predeclared_builtin_assumptions,
         );
         let artifact = Self {
+            charge: Default::default(),
             cache_pins: Arc::new(ArtifactCachePins::default()),
             query_source: None,
             key,
@@ -2042,6 +2196,12 @@ fn compute_artifact_materialization_id(
 pub struct ProcedureHandle {
     artifact: Arc<SemanticArtifact>,
     id: ProcedureId,
+}
+
+impl brokk_bifrost_core::retention_budget::RetainedBytes for ProcedureHandle {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }
 
 impl ProcedureHandle {
@@ -2406,6 +2566,16 @@ impl ProcedureLocalLocator<ControlEdgeId> {
 mod tests {
 
     use crate::analyzer::semantic::ir::artifact::*;
+
+    #[test]
+    fn cloned_procedure_dominance_starts_uninitialized() {
+        let cell = CallableSelectionDominance::default();
+        cell.0
+            .set(None)
+            .expect("fresh cell accepts the deterministic outcome");
+        assert!(cell.0.get().is_some());
+        assert!(cell.clone().0.get().is_none());
+    }
 
     fn call_with_shared_result(id: u32) -> SemanticCallSite {
         SemanticCallSite {

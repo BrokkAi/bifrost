@@ -526,7 +526,9 @@ impl<'source> GoSourcePropertyCollector<'source> {
                 },
             },
             "channel_type" => {
-                let direction = channel_direction(node);
+                let Some(direction) = channel_direction(node) else {
+                    return self.opaque();
+                };
                 match children.first().copied() {
                     Some(element) => GoSourceTypeShape::Channel { direction, element },
                     None => self.opaque(),
@@ -751,21 +753,43 @@ fn shape_children(shape: &GoSourceTypeShape) -> Vec<GoSourceTypeId> {
     }
 }
 
-fn channel_direction(node: Node<'_>) -> GoChannelDirection {
+pub(crate) fn channel_direction(node: Node<'_>) -> Option<GoChannelDirection> {
+    if node.kind() != "channel_type" || node.is_missing() || node.has_error() {
+        return None;
+    }
+    let value = node.child_by_field_name("value")?;
     let mut cursor = node.walk();
     let mut chan_start = None;
     let mut arrow_start = None;
+    let mut values = 0;
     for child in node.children(&mut cursor) {
+        if child.is_extra() {
+            continue;
+        }
+        if child.is_missing() {
+            return None;
+        }
+        if child.id() == value.id() {
+            values += 1;
+            continue;
+        }
         match child.kind() {
-            "chan" => chan_start = Some(child.start_byte()),
-            "<-" => arrow_start = Some(child.start_byte()),
-            _ => {}
+            "chan" if chan_start.replace(child.start_byte()).is_none() => {}
+            "<-" if arrow_start.replace(child.start_byte()).is_none() => {}
+            _ => return None,
         }
     }
+    if values != 1
+        || chan_start? >= value.start_byte()
+        || arrow_start.is_some_and(|arrow| arrow >= value.start_byte())
+    {
+        return None;
+    }
     match (arrow_start, chan_start) {
-        (Some(arrow), Some(chan)) if arrow < chan => GoChannelDirection::Receive,
-        (Some(_), Some(_)) => GoChannelDirection::Send,
-        _ => GoChannelDirection::Both,
+        (Some(arrow), Some(chan)) if arrow < chan => Some(GoChannelDirection::Receive),
+        (Some(_), Some(_)) => Some(GoChannelDirection::Send),
+        (None, Some(_)) => Some(GoChannelDirection::Both),
+        _ => None,
     }
 }
 
@@ -847,6 +871,55 @@ fn parameter_facts(
 mod grammar_boundary_tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn channel_direction_uses_each_nodes_immediate_tokens_and_refuses_malformed_syntax() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let valid = parser
+            .parse("package p\nvar x chan<- <-chan *int\n", None)
+            .unwrap();
+        assert!(!valid.root_node().has_error());
+        let mut channels = Vec::new();
+        let mut pending = vec![valid.root_node()];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "channel_type" {
+                channels.push((
+                    node.child_by_field_name("value").unwrap().kind().to_owned(),
+                    channel_direction(node),
+                ));
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+        assert_eq!(
+            channels,
+            [
+                ("channel_type".to_owned(), Some(GoChannelDirection::Send)),
+                ("pointer_type".to_owned(), Some(GoChannelDirection::Receive)),
+            ]
+        );
+
+        let malformed = parser.parse("package p\nvar x <-chan\n", None).unwrap();
+        assert!(malformed.root_node().has_error());
+        assert_eq!(channel_direction(malformed.root_node()), None);
+        let mut pending = vec![malformed.root_node()];
+        let mut found = false;
+        while let Some(node) = pending.pop() {
+            if node.kind() == "channel_type" {
+                found = true;
+                assert_eq!(channel_direction(node), None);
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+        assert!(
+            !found,
+            "the parser must not publish this malformed channel as channel_type"
+        );
+    }
 
     #[test]
     #[hardwon(

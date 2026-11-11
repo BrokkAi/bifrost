@@ -330,11 +330,9 @@ mod rust_departing_tests_tests {
         );
         assert!(
             result.edges.iter().any(|edge| {
-                edge.reference_kind
-                    == Some(
-                        brokk_bifrost_core::analyzer::usages::model::ReferenceKind::SelfTypeAlias,
-                    )
-                    && edge.proof == brokk_bifrost_core::analyzer::usages::model::UsageProof::Proven
+                edge.reference_kind.known().contains(
+                    brokk_bifrost_core::analyzer::usages::model::ReferenceKind::SelfTypeAlias,
+                ) && edge.proof == brokk_bifrost_core::analyzer::usages::model::UsageProof::Proven
                     && edge
                         .site
                         .enclosing
@@ -866,11 +864,14 @@ mod rust_departing_tests_tests {
             "every root route names a reference site of its own blob: {unsited:?}"
         );
         conn.execute_batch("SAVEPOINT root_routes").unwrap();
+        let _fixture =
+            brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
         conn.execute(
             "DELETE FROM resolution_fragment_interiors WHERE blob_id=?1",
             [blob],
         )
         .unwrap();
+        drop(_fixture);
         for table in [
             "resolution_root_route_segments",
             "resolution_reference_lookup_identities",

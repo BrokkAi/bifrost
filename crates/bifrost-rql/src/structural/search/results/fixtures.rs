@@ -147,7 +147,17 @@ pub fn code_query_result_fixtures_json() -> Value {
             value: Default::default(),
         },
         CodeQueryResultValue::FlowWitness {
-            value: Default::default(),
+            value: Box::new(CodeQueryFlowWitness {
+                steps: [Some("fixture-selected-summary".to_owned()), None]
+                    .into_iter()
+                    .map(|summary_fingerprint| CodeQueryFlowWitnessStep {
+                        kind: CodeQueryFlowWitnessStepKind::Edge { edge_kind: "model" },
+                        summary_fingerprint,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
         },
         CodeQueryResultValue::ClassSetRow {
             value: Default::default(),
@@ -452,6 +462,7 @@ pub fn code_query_result_fixtures_json() -> Value {
             })
             .collect(),
         truncated: false,
+        depth_bound_status: Some(DepthBoundStatus::Unknown),
         session_subset: None,
         diagnostics: vec![CodeQueryDiagnostic::new(CodeQueryDiagnostic {
             incompleteness: brokk_bifrost_rql::Incompleteness::Operational(
@@ -537,4 +548,14 @@ pub fn code_query_result_fixtures_json() -> Value {
     assert!(properties.contains_key("annotation_type"));
     assert!(properties.contains_key("annotation_status"));
     serialized
+}
+
+#[cfg(test)]
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "73e64410abdd: canonical fixture omitted the depth status and failed its feature build"
+)]
+fn canonical_fixture_serializes_depth_status() {
+    let fixture = code_query_result_fixtures_json();
+    assert_eq!(fixture["depth_bound_status"], "unknown");
 }

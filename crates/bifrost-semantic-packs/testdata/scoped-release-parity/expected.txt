@@ -1,0 +1,2 @@
+active packs: bifrost.jdk@21.0.8, widget-npm-fixture@1.2.3
+widget.Widget types: 1

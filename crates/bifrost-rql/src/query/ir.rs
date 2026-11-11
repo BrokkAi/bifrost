@@ -19,7 +19,7 @@ use brokk_bifrost_core::analyzer::structural::control_relation::{
     ControlExitPartition, ControlRelationKind,
 };
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
-use brokk_bifrost_core::analyzer::structural::facts::AssignmentSequenceKind;
+use brokk_bifrost_core::analyzer::structural::facts::{ArgumentMode, AssignmentSequenceKind};
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
     StateEventReadCause,
@@ -306,15 +306,30 @@ impl CppRule {
 pub enum CSharpRule {
     StaticArray,
     UseNumberConstant,
+    MissingXmldocParameter,
+    UnknownXmldocParameter,
+    MissingXmldocTypeParameter,
+    UnknownXmldocTypeParameter,
 }
 
 impl CSharpRule {
-    pub const ALL: [Self; 2] = [Self::StaticArray, Self::UseNumberConstant];
+    pub const ALL: [Self; 6] = [
+        Self::StaticArray,
+        Self::UseNumberConstant,
+        Self::MissingXmldocParameter,
+        Self::UnknownXmldocParameter,
+        Self::MissingXmldocTypeParameter,
+        Self::UnknownXmldocTypeParameter,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::StaticArray => "cs/static-array",
             Self::UseNumberConstant => "cs/use-number-constant",
+            Self::MissingXmldocParameter => "csharp/missing-xmldoc-parameter",
+            Self::UnknownXmldocParameter => "csharp/unknown-xmldoc-parameter",
+            Self::MissingXmldocTypeParameter => "csharp/missing-xmldoc-type-parameter",
+            Self::UnknownXmldocTypeParameter => "csharp/unknown-xmldoc-type-parameter",
         }
     }
 
@@ -458,6 +473,7 @@ pub enum LanguageRule {
     CSharp(CSharpRule),
     Java(JavaRule),
     Js(JsRule),
+    Rust(RustRule),
 }
 
 impl LanguageRule {
@@ -467,6 +483,7 @@ impl LanguageRule {
             .or_else(|| CSharpRule::from_label(label).map(Self::CSharp))
             .or_else(|| JavaRule::from_label(label).map(Self::Java))
             .or_else(|| JsRule::from_label(label).map(Self::Js))
+            .or_else(|| RustRule::from_label(label).map(Self::Rust))
     }
 
     pub const fn label(self) -> &'static str {
@@ -475,6 +492,7 @@ impl LanguageRule {
             Self::CSharp(rule) => rule.label(),
             Self::Java(rule) => rule.label(),
             Self::Js(rule) => rule.label(),
+            Self::Rust(rule) => rule.label(),
         }
     }
 
@@ -485,7 +503,28 @@ impl LanguageRule {
             .chain(CSharpRule::ALL.iter().map(|rule| rule.label()))
             .chain(JavaRule::ALL.iter().map(|rule| rule.label()))
             .chain(JsRule::ALL.iter().map(|rule| rule.label()))
+            .chain(RustRule::ALL.iter().map(|rule| rule.label()))
             .collect()
+    }
+}
+
+/// Canonical Rust framework source shapes selected with declaration authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RustRule {
+    PoemHandlerParam,
+}
+
+impl RustRule {
+    pub const ALL: [Self; 1] = [Self::PoemHandlerParam];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PoemHandlerParam => "rust/poem-handler-param",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|rule| rule.label() == label)
     }
 }
 
@@ -941,12 +980,21 @@ pub enum ConfigurationRouteSegmentFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigurationRouteFilter(pub Vec<ConfigurationRouteSegmentFilter>);
 
+/// Region searched by a configuration absence step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigurationAbsenceScope {
+    #[default]
+    Document,
+    Subtree,
+}
+
 /// Constrained-value filter over authored configuration-document facts.
 ///
 /// Every axis is an author's enumeration: an empty axis means every value,
 /// never no value. Route alternatives are exact-length and order-sensitive.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConfigurationFactsFilter {
+    pub absence_scope: ConfigurationAbsenceScope,
     pub formats: Vec<ConfigurationFormat>,
     pub node_kinds: Vec<ConfigurationNodeKindFilter>,
     pub roles: Vec<ConfigurationMemberRole>,
@@ -954,6 +1002,7 @@ pub struct ConfigurationFactsFilter {
     pub keys: Vec<String>,
     pub values: Vec<String>,
     pub values_ignore_case: Vec<String>,
+    pub value_regex: Option<ConfigurationValueRegex>,
     pub value_lt: Option<String>,
     pub value_le: Option<String>,
     pub value_gt: Option<String>,
@@ -1005,6 +1054,17 @@ pub struct ConfigurationFactsFilter {
     pub provenances: Vec<ConfigurationValueProvenance>,
     pub completenesses: Vec<ConfigurationCompletenessFilter>,
 }
+
+#[derive(Debug, Clone)]
+pub struct ConfigurationValueRegex(pub Regex);
+
+impl PartialEq for ConfigurationValueRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
+}
+
+impl Eq for ConfigurationValueRegex {}
 
 /// A non-structural seed producing authored configuration facts directly from
 /// workspace documents.
@@ -1155,9 +1215,26 @@ pub struct CrossDomainRequirement {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReferenceTraversalFilter {
     pub reference_kinds: Vec<ReferenceKind>,
+    pub enclosing: Option<Box<EnclosingPattern>>,
     pub proof: Option<UsageProof>,
     pub surface: UsageHitSurface,
 }
+
+/// A validated structural pattern with its canonical representation for
+/// query-step equality. Regex-backed patterns cannot derive `Eq` directly.
+#[derive(Debug, Clone)]
+pub struct EnclosingPattern {
+    pub pattern: Pattern,
+    pub canonical: serde_json::Value,
+}
+
+impl PartialEq for EnclosingPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+    }
+}
+
+impl Eq for EnclosingPattern {}
 
 /// Constrained-value filter over canonical reference-edge rows.
 ///
@@ -1169,6 +1246,7 @@ pub struct ReferenceTraversalFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EdgeFilter {
     pub reference_kinds: Vec<ReferenceKind>,
+    pub enclosing: Option<Box<EnclosingPattern>>,
     pub proof: Option<UsageProof>,
     pub surface: Option<UsageHitSurface>,
     pub usage_kinds: Vec<UsageHitKind>,
@@ -1292,6 +1370,7 @@ pub enum AssignmentRelationKind {
     SelfInitializer,
     FailedSwap,
     OverwrittenUnread,
+    DeadWrite,
 }
 
 impl AssignmentRelationKind {
@@ -1301,6 +1380,7 @@ impl AssignmentRelationKind {
             Self::SelfInitializer => "self_initializer",
             Self::FailedSwap => "failed_swap",
             Self::OverwrittenUnread => "overwritten_unread",
+            Self::DeadWrite => "dead_write",
         }
     }
 
@@ -1310,6 +1390,7 @@ impl AssignmentRelationKind {
             "self_initializer" => Some(Self::SelfInitializer),
             "failed_swap" => Some(Self::FailedSwap),
             "overwritten_unread" => Some(Self::OverwrittenUnread),
+            "dead_write" => Some(Self::DeadWrite),
             _ => None,
         }
     }
@@ -1454,6 +1535,20 @@ pub struct CallSiteTraversalFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReceiverTraversalFilter {
     pub capture: Option<String>,
+    /// For `member-targets` only (#10229): keep a row whose single exact
+    /// target has one of these declaration forms. Labels come from
+    /// `MEMBER_FORM_LABELS`; empty means the step does not filter on form.
+    pub member_form: Vec<&'static str>,
+    /// For `member-targets` only (#10229): keep a row whose single exact
+    /// target is, or is not, a trivial property.
+    pub trivial_property: Option<bool>,
+}
+
+impl ReceiverTraversalFilter {
+    /// Whether the step decides rows by the target's declaration (#10229).
+    pub fn filters_members(&self) -> bool {
+        !self.member_form.is_empty() || self.trivial_property.is_some()
+    }
 }
 
 /// Exact identity constraints for a field-write terminal. These compare only
@@ -1641,12 +1736,29 @@ impl CallIdentity {
             }
         )
     }
+
+    pub fn is_resolved_possible_semantic_model(&self) -> bool {
+        matches!(
+            self,
+            Self::Qualified {
+                resolved: Some(ResolvedCallIdentity {
+                    kind: ResolvedCallIdentityKind::PossibleSemanticModel,
+                    ..
+                }),
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolvedCallIdentityKind {
     WorkspaceDeclaration,
     ActiveSemanticModel,
+    /// The known members of an active-model overload family that no model
+    /// certifies complete (#10761). Every call it selects is a possible
+    /// match, reported incomplete.
+    PossibleSemanticModel,
 }
 
 /// Resolution result retained on a qualified RQL locator.
@@ -1824,6 +1936,7 @@ pub enum QueryStep {
     Filter(Vec<QueryRowPredicate>),
     Project(Vec<QueryRowProjectionColumn>),
     CaptureAnchor(String),
+    IdenticalCaptures { left: String, right: String },
     ConfigurationAbsence(Box<ConfigurationFactsFilter>),
     StatementFacts(StatementFactKind),
     CppFacts(CppClassFactKind),
@@ -2414,6 +2527,7 @@ impl QueryStep {
             Self::Filter(_) => QueryStepOp::Filter,
             Self::Project(_) => QueryStepOp::Project,
             Self::CaptureAnchor(_) => QueryStepOp::CaptureAnchor,
+            Self::IdenticalCaptures { .. } => QueryStepOp::IdenticalCaptures,
             Self::ConfigurationAbsence(_) => QueryStepOp::ConfigurationAbsence,
             Self::StatementFacts(_) => QueryStepOp::StatementFacts,
             Self::CppFacts(_) => QueryStepOp::CppFacts,
@@ -2601,6 +2715,10 @@ impl QueryStep {
         match QueryStepOp::from_label(label)? {
             QueryStepOp::Filter | QueryStepOp::Project => None,
             QueryStepOp::CaptureAnchor => Some(Self::CaptureAnchor(String::new())),
+            QueryStepOp::IdenticalCaptures => Some(Self::IdenticalCaptures {
+                left: String::new(),
+                right: String::new(),
+            }),
             QueryStepOp::ConfigurationAbsence => Some(Self::ConfigurationAbsence(Box::default())),
             QueryStepOp::StatementFacts => {
                 Some(Self::StatementFacts(StatementFactKind::AllocaInLoop))
@@ -2826,6 +2944,9 @@ impl QueryStep {
         match (self, input) {
             (Self::Filter(_) | Self::Project(_), input) => Some(input),
             (Self::CaptureAnchor(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::StructuralMatch)
+            }
+            (Self::IdenticalCaptures { .. }, QueryValueKind::StructuralMatch) => {
                 Some(QueryValueKind::StructuralMatch)
             }
             (Self::ConfigurationAbsence(_), QueryValueKind::ConfigurationFact) => {
@@ -3291,6 +3412,130 @@ impl QueryStep {
 
 type ProjectedRowFields = Vec<(String, CodeQueryRowField)>;
 
+/// A capture label bound inside an `each` belongs to that `each` alone. The
+/// decoders and [`CodeQuery::validate_steps`] both check it, because
+/// embedders can build the public IR directly.
+pub(super) fn validate_each_capture_scopes<'a>(
+    roots: impl IntoIterator<Item = &'a Pattern>,
+    path: &str,
+) -> Result<(), QueryError> {
+    let mut labels = std::collections::HashMap::<&str, usize>::new();
+    let mut next_scope = 0;
+    let mut stack = roots
+        .into_iter()
+        .map(|pattern| (pattern, 0))
+        .collect::<Vec<_>>();
+    while let Some((pattern, scope)) = stack.pop() {
+        if let Some(root) = &pattern.qualifying_type {
+            if pattern.kinds.is_empty()
+                || pattern
+                    .kinds
+                    .iter()
+                    .any(|kind| !kind.satisfies(NormalizedKind::Call))
+            {
+                return Err(QueryError::new(
+                    child_query_path(path, "qualifying_type"),
+                    "qualifying_type requires kind call",
+                ));
+            }
+            let mut pending = vec![(root, 0)];
+            let mut count = 0;
+            while let Some((ty, depth)) = pending.pop() {
+                count += 1;
+                if depth > MAX_PATTERN_DEPTH || count > MAX_PATTERN_NODES {
+                    return Err(QueryError::new(
+                        child_query_path(path, "qualifying_type"),
+                        "instantiated-type nesting or node budget exceeded",
+                    ));
+                }
+                let valid = match &ty.identity {
+                    CallIdentity::Stable(value) => {
+                        !value.is_empty() && value.len() <= MAX_STRING_PREDICATE_LENGTH
+                    }
+                    CallIdentity::Qualified {
+                        value,
+                        resolved: None,
+                        ..
+                    } => !value.is_empty() && value.len() <= MAX_STRING_PREDICATE_LENGTH,
+                    CallIdentity::Qualified {
+                        resolved: Some(resolved),
+                        ..
+                    } => {
+                        resolved.kind != ResolvedCallIdentityKind::PossibleSemanticModel
+                            && !resolved.identity.is_empty()
+                    }
+                };
+                if !valid
+                    || ty.resolved_identities.len() > MAX_PATTERN_NODES
+                    || ty.resolved_identities.iter().any(|identity| {
+                        identity.kind == ResolvedCallIdentityKind::PossibleSemanticModel
+                            || identity.identity.is_empty()
+                            || identity.identity.len() > MAX_STRING_PREDICATE_LENGTH
+                    })
+                {
+                    return Err(QueryError::new(
+                        child_query_path(path, "qualifying_type.identity"),
+                        "expected bounded canonical type identities",
+                    ));
+                }
+                pending.extend(ty.arguments.iter().map(|argument| (argument, depth + 1)));
+            }
+        }
+
+        if let Some(label) = pattern.capture.as_deref()
+            && let Some(previous) = labels.insert(label, scope)
+            && previous != scope
+        {
+            return Err(QueryError::new(
+                path,
+                format!(
+                    "capture label '{label}' is bound both inside and outside an each, or in different each predicates"
+                ),
+            ));
+        }
+        for child in pattern.nested_patterns() {
+            let child_scope = if pattern
+                .each
+                .as_deref()
+                .is_some_and(|each| std::ptr::eq(each, child))
+            {
+                next_scope += 1;
+                next_scope
+            } else {
+                scope
+            };
+            stack.push((child, child_scope));
+        }
+    }
+    Ok(())
+}
+
+/// Embedders can build a filter directly, so execution checks what the
+/// decoders check: every numeric bound is a decimal that the configuration
+/// number grammar reads.
+fn validate_configuration_bounds(
+    filter: &ConfigurationFactsFilter,
+    path: &str,
+) -> Result<(), QueryError> {
+    for (field, bound) in [
+        ("value_lt", &filter.value_lt),
+        ("value_le", &filter.value_le),
+        ("value_gt", &filter.value_gt),
+        ("value_ge", &filter.value_ge),
+    ] {
+        if let Some(bound) = bound
+            && brokk_bifrost_analysis::analyzer::configuration::ConfigurationNumber::parse(bound)
+                .is_none()
+        {
+            return Err(QueryError::new(
+                child_path(path, field),
+                "expected a decimal numeric bound string whose exponent fits a 64-bit integer",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_query_steps(
     steps: &[QueryStep],
     input: QueryValueKind,
@@ -3308,6 +3553,24 @@ fn validate_query_steps(
     let mut projected_fields = input_projected_fields.map(<[_]>::to_vec);
     for (index, step) in steps.iter().enumerate() {
         let step_path = format!("{path}[{index}]");
+        let enclosing = match step {
+            QueryStep::ReferencesOf(filter)
+            | QueryStep::UsedBy(filter)
+            | QueryStep::Uses(filter) => filter.enclosing.as_deref(),
+            QueryStep::EdgesOf(filter) | QueryStep::EdgesFrom(filter) => {
+                filter.enclosing.as_deref()
+            }
+            _ => None,
+        };
+        if let Some(enclosing) = enclosing {
+            validate_each_capture_scopes(
+                [&enclosing.pattern],
+                &child_path(&step_path, "enclosing"),
+            )?;
+        }
+        if let QueryStep::ConfigurationAbsence(filter) = step {
+            validate_configuration_bounds(filter, &step_path)?;
+        }
         match step {
             QueryStep::Filter(predicates) => validate_row_predicates(
                 predicates,
@@ -3350,6 +3613,7 @@ fn validate_query_steps(
         let expected_input = match step {
             QueryStep::Filter(_) | QueryStep::Project(_) => "a typed row",
             QueryStep::CaptureAnchor(_) => "structural_match",
+            QueryStep::IdenticalCaptures { .. } => "structural_match",
             QueryStep::ConfigurationAbsence(_) => "configuration_fact",
             QueryStep::StatementFacts(_) => "structural_match",
             QueryStep::CppFacts(_) => "structural_match",
@@ -3932,6 +4196,16 @@ impl CodeQuerySeed {
                 .is_some_and(Pattern::constrains_local_value)
     }
 
+    /// Whether any pattern in this seed names `kind` as a required or excluded
+    /// kind.
+    pub fn mentions_kind(&self, kind: NormalizedKind) -> bool {
+        self.root.mentions_kind(kind)
+            || [&self.inside, &self.inside_decl, &self.not_inside]
+                .into_iter()
+                .flatten()
+                .any(|pattern| pattern.mentions_kind(kind))
+    }
+
     /// Whether any pattern in this seed filters on an exact normalized
     /// boolean-literal value.
     pub fn constrains_boolean_value(&self) -> bool {
@@ -4086,6 +4360,7 @@ pub struct DependencyEvidenceFilter {
     pub declared_by: Vec<String>,
     pub scopes: Vec<String>,
     pub features: Vec<String>,
+    pub lock_associations: Vec<String>,
 }
 #[derive(Debug, Clone)]
 pub struct DependencyEvidenceSeed {
@@ -4252,8 +4527,10 @@ impl CodeQuery {
                             return true;
                         }
                         patterns.extend(pattern.has.as_deref());
+                        patterns.extend(pattern.each.as_deref());
                         patterns.extend(pattern.local_value.as_deref());
                         patterns.extend(pattern.not_has.as_deref());
+                        patterns.extend(pattern.count.iter().map(|count| count.pattern.as_ref()));
                     }
                 }
                 CodeQueryPlanSource::DependencyEvidence(_) => {}
@@ -4344,12 +4621,22 @@ fn validate_plan(
     }
 
     let mut domain = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => ValidatedDomain {
-            kind: QueryValueKind::StructuralMatch,
-            captures: Some(seed.positive_capture_names()),
-            projected_fields: None,
-            row_kinds: vec![QueryValueKind::StructuralMatch],
-        },
+        CodeQueryPlanSource::Seed(seed) => {
+            validate_each_capture_scopes(
+                [&seed.root]
+                    .into_iter()
+                    .chain(seed.inside.iter())
+                    .chain(seed.inside_decl.iter())
+                    .chain(seed.not_inside.iter()),
+                path,
+            )?;
+            ValidatedDomain {
+                kind: QueryValueKind::StructuralMatch,
+                captures: Some(seed.positive_capture_names()),
+                projected_fields: None,
+                row_kinds: vec![QueryValueKind::StructuralMatch],
+            }
+        }
         CodeQueryPlanSource::Occurrences(_) => ValidatedDomain {
             kind: QueryValueKind::Occurrence,
             captures: None,
@@ -4398,12 +4685,15 @@ fn validate_plan(
                 row_kinds: vec![QueryValueKind::DependencyEvidence],
             }
         }
-        CodeQueryPlanSource::ConfigurationFacts(_) => ValidatedDomain {
-            kind: QueryValueKind::ConfigurationFact,
-            captures: None,
-            projected_fields: None,
-            row_kinds: vec![QueryValueKind::ConfigurationFact],
-        },
+        CodeQueryPlanSource::ConfigurationFacts(seed) => {
+            validate_configuration_bounds(&seed.filter, &child_path(path, "configuration_facts"))?;
+            ValidatedDomain {
+                kind: QueryValueKind::ConfigurationFact,
+                captures: None,
+                projected_fields: None,
+                row_kinds: vec![QueryValueKind::ConfigurationFact],
+            }
+        }
         CodeQueryPlanSource::Correlate(correlation) => {
             let op_path = child_path(path, "correlate");
             let (code, _) = validate_cross_domain_inputs(
@@ -4579,15 +4869,19 @@ fn validate_plan(
     )?;
     let mut input = domain.kind;
     for (index, step) in plan.steps.iter().enumerate() {
-        let capture = match step {
-            QueryStep::CaptureAnchor(capture) => Some(capture.as_str()),
+        let captures: Vec<(&str, &str)> = match step {
+            QueryStep::CaptureAnchor(capture) => vec![("capture", capture)],
+            QueryStep::IdenticalCaptures { left, right } => vec![("left", left), ("right", right)],
             QueryStep::ReceiverTargets(filter)
             | QueryStep::PointsTo(filter)
-            | QueryStep::MemberTargets(filter) => filter.capture.as_deref(),
-            _ => None,
+            | QueryStep::MemberTargets(filter) => filter
+                .capture
+                .as_deref()
+                .map_or_else(Vec::new, |capture| vec![("capture", capture)]),
+            _ => Vec::new(),
         };
-        if let Some(capture) = capture {
-            let capture_path = format!("{steps_path}[{index}].capture");
+        for (field, capture) in captures {
+            let capture_path = format!("{steps_path}[{index}].{field}");
             if input != QueryValueKind::StructuralMatch {
                 return Err(QueryError::new(
                     capture_path,
@@ -4750,7 +5044,7 @@ fn validate_set_branch_domain(
 
 /// The programming languages a code plan can select. An unconstrained seed
 /// selects every analyzable language.
-fn plan_code_languages(plan: &CodeQueryPlan) -> Vec<Language> {
+pub fn plan_code_languages(plan: &CodeQueryPlan) -> Vec<Language> {
     let mut languages = Vec::new();
     let mut pending = vec![plan];
     while let Some(plan) = pending.pop() {
@@ -5122,6 +5416,9 @@ fn child_query_path(path: &str, field: &str) -> String {
 }
 
 impl CodeQuerySeed {
+    /// Every label the seed can bind: the union over all alternatives. An
+    /// `each` contributes only the labels its child guarantees, because those
+    /// are the only labels it exports to the enclosing pattern.
     pub(crate) fn positive_capture_names(&self) -> std::collections::HashSet<String> {
         let mut captures = std::collections::HashSet::new();
         let mut stack = vec![&self.root];
@@ -5138,6 +5435,9 @@ impl CodeQuerySeed {
             if let Some(has) = pattern.has.as_deref() {
                 stack.push(has);
             }
+            if let Some(each) = pattern.each.as_deref() {
+                captures.extend(each.guaranteed_capture_names());
+            }
             stack.extend(pattern.all.iter());
             stack.extend(pattern.any.iter());
             for role in Role::single_target_roles() {
@@ -5151,6 +5451,64 @@ impl CodeQuerySeed {
             stack.extend(pattern.kwargs.iter().map(|(_, pattern)| pattern));
         }
         captures
+    }
+}
+
+impl Pattern {
+    /// The labels every match of this pattern binds: `any` contributes the
+    /// intersection of its alternatives, every other child its own guaranteed
+    /// labels. This is the set an `each` exports to its enclosing pattern.
+    pub fn guaranteed_capture_names(&self) -> std::collections::HashSet<String> {
+        let mut stack = vec![(self, false)];
+        let mut guaranteed =
+            std::collections::HashMap::<*const Pattern, std::collections::HashSet<String>>::new();
+        while let Some((pattern, visited)) = stack.pop() {
+            let mut children = Vec::new();
+            children.extend(pattern.has.iter().map(Box::as_ref));
+            children.extend(pattern.each.iter().map(Box::as_ref));
+            children.extend(pattern.all.iter());
+            children.extend(pattern.any.iter());
+            for role in Role::single_target_roles() {
+                if let Some(child) = pattern.single_role_pattern(*role) {
+                    children.push(child);
+                }
+            }
+            for role in Role::list_target_roles() {
+                children.extend(pattern.list_role_patterns(*role));
+            }
+            children.extend(pattern.kwargs.iter().map(|(_, child)| child));
+            if !visited {
+                stack.push((pattern, true));
+                stack.extend(children.into_iter().map(|child| (child, false)));
+                continue;
+            }
+            let mut bound = std::collections::HashSet::new();
+            if let Some(capture) = pattern.capture.as_deref() {
+                bound.insert(capture.to_string());
+            }
+            for child in children {
+                if pattern
+                    .any
+                    .iter()
+                    .any(|alternative| std::ptr::eq(child, alternative))
+                {
+                    continue;
+                }
+                bound.extend(guaranteed[&(child as *const Pattern)].iter().cloned());
+            }
+            if let Some(first) = pattern.any.first() {
+                let mut common = guaranteed[&(first as *const Pattern)].clone();
+                for alternative in pattern.any.iter().skip(1) {
+                    common
+                        .retain(|name| guaranteed[&(alternative as *const Pattern)].contains(name));
+                }
+                bound.extend(common);
+            }
+            guaranteed.insert(pattern as *const Pattern, bound);
+        }
+        guaranteed
+            .remove(&(self as *const Pattern))
+            .unwrap_or_default()
     }
 }
 
@@ -5286,6 +5644,38 @@ impl ArityConstraint {
 /// every node in the workspace), while nested patterns may be capture-only
 /// or empty in role fields (an empty `args` entry means "some argument exists").
 /// Entries in `all` and `any`, and boxed containment patterns, must not be empty.
+#[derive(Debug, Clone)]
+pub struct CountPredicate {
+    pub role: Role,
+    pub pattern: Box<Pattern>,
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+impl CountPredicate {
+    pub fn new(role: Role, pattern: Pattern, min: u32, max: Option<u32>) -> Self {
+        assert!(Role::list_target_roles().contains(&role));
+        assert!(max.is_none_or(|max| min <= max));
+        Self {
+            role,
+            pattern: Box::new(pattern),
+            min,
+            max,
+        }
+    }
+}
+
+/// A canonical nominal identity and constraints on its declared type slots.
+/// Trailing slots are unconstrained; lifetimes are not slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstantiatedType {
+    pub identity: CallIdentity,
+    pub arguments: Vec<Self>,
+    /// Canonical candidates selected at the loaded-policy boundary. Several
+    /// active crate versions can expose the same authored locator.
+    pub resolved_identities: Vec<ResolvedCallIdentity>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Pattern {
     /// JSON `kind`: a union of kinds, each subtype-aware (`literal` matches
@@ -5357,6 +5747,7 @@ pub struct Pattern {
     /// edges) and `collection_literal` facts (`elements` role edges, #2647);
     /// a fact with neither edge family has arity 0.
     pub arity: Option<ArityConstraint>,
+    pub count: Option<CountPredicate>,
     /// Recorded modifier visibility of a callable declaration. Empty means
     /// unconstrained. A fact matches when its adapter-recorded visibility is
     /// one of these labels. `unknown` is a real recorded value, never equal
@@ -5368,6 +5759,8 @@ pub struct Pattern {
     pub parameter_type: Option<StringPredicate>,
     pub capture: Option<String>,
     pub has: Option<Box<Pattern>>,
+    pub each: Option<Box<Pattern>>,
+    pub argument_modes: Vec<ArgumentMode>,
     /// Match the exact RHS of a unique direct function-local assignment
     /// guaranteed before this read by unconditional or earlier same-suite
     /// execution. Captures in the nested value pattern
@@ -5390,8 +5783,11 @@ pub struct Pattern {
     pub body: Option<Box<Pattern>>,
     pub label: Option<Box<Pattern>>,
     pub binding: Option<Box<Pattern>>,
+    pub initializer_of: Option<Box<Pattern>>,
     pub indices: Vec<Pattern>,
     pub dimensions: Vec<Pattern>,
+    pub parameters: Vec<Pattern>,
+    pub members: Vec<Pattern>,
     pub callee: Option<Box<Pattern>>,
     pub receiver: Option<Box<Pattern>>,
     /// Each listed pattern must match some positional argument; matches must
@@ -5431,6 +5827,8 @@ pub struct Pattern {
     /// Each listed pattern constrains a written generic type argument on a
     /// call callee, in source order.
     pub type_arguments: Vec<Pattern>,
+    /// Canonical alias-expanded static type qualifying an associated call.
+    pub qualifying_type: Option<InstantiatedType>,
 }
 
 /// A declaration modifier that can be selected without naming a framework or
@@ -5452,10 +5850,30 @@ pub enum DeclarationModifier {
     Public,
     Protected,
     Private,
+    Readonly,
+    Const,
+    Extern,
+    Ref,
+    Async,
+    File,
+    Fixed,
+    Internal,
+    New,
+    Override,
+    Partial,
+    Required,
+    Unsafe,
+    Virtual,
+    In,
+    Out,
+    Params,
+    This,
+    Scoped,
+    Global,
 }
 
 impl DeclarationModifier {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 34] = [
         Self::Static,
         Self::Abstract,
         Self::Final,
@@ -5470,6 +5888,26 @@ impl DeclarationModifier {
         Self::Public,
         Self::Protected,
         Self::Private,
+        Self::Readonly,
+        Self::Const,
+        Self::Extern,
+        Self::Ref,
+        Self::Async,
+        Self::File,
+        Self::Fixed,
+        Self::Internal,
+        Self::New,
+        Self::Override,
+        Self::Partial,
+        Self::Required,
+        Self::Unsafe,
+        Self::Virtual,
+        Self::In,
+        Self::Out,
+        Self::Params,
+        Self::This,
+        Self::Scoped,
+        Self::Global,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -5488,6 +5926,26 @@ impl DeclarationModifier {
             Self::Public => "public",
             Self::Protected => "protected",
             Self::Private => "private",
+            Self::Readonly => "readonly",
+            Self::Const => "const",
+            Self::Extern => "extern",
+            Self::Ref => "ref",
+            Self::Async => "async",
+            Self::File => "file",
+            Self::Fixed => "fixed",
+            Self::Internal => "internal",
+            Self::New => "new",
+            Self::Override => "override",
+            Self::Partial => "partial",
+            Self::Required => "required",
+            Self::Unsafe => "unsafe",
+            Self::Virtual => "virtual",
+            Self::In => "in",
+            Self::Out => "out",
+            Self::Params => "params",
+            Self::This => "this",
+            Self::Scoped => "scoped",
+            Self::Global => "global",
         }
     }
 
@@ -5527,10 +5985,14 @@ impl Pattern {
             && self.assignment_unstarred_count_mismatch.is_none()
             && self.index.is_none()
             && self.arity.is_none()
+            && self.count.is_none()
             && self.visibility.is_empty()
             && self.parameter_type.is_none()
             && self.capture.is_none()
             && self.has.is_none()
+            && self.each.is_none()
+            && self.argument_modes.is_empty()
+            && self.qualifying_type.is_none()
             && self.local_value.is_none()
             && self.not_has.is_none()
             && self.not.is_none()
@@ -5571,6 +6033,7 @@ impl Pattern {
             Role::Body => self.body.as_deref(),
             Role::Label => self.label.as_deref(),
             Role::Binding => self.binding.as_deref(),
+            Role::InitializerOf => self.initializer_of.as_deref(),
 
             Role::Arg
             | Role::Kwarg
@@ -5581,6 +6044,8 @@ impl Pattern {
             | Role::Part
             | Role::Indices
             | Role::Dimensions
+            | Role::Parameters
+            | Role::Members
             | Role::TypeArguments => None,
         }
     }
@@ -5596,6 +6061,8 @@ impl Pattern {
             Role::Part => &self.parts,
             Role::Indices => &self.indices,
             Role::Dimensions => &self.dimensions,
+            Role::Parameters => &self.parameters,
+            Role::Members => &self.members,
 
             Role::Callee
             | Role::Receiver
@@ -5617,7 +6084,86 @@ impl Pattern {
             | Role::Alternative
             | Role::Body
             | Role::Label
-            | Role::Binding => &[],
+            | Role::Binding
+            | Role::InitializerOf => &[],
+        }
+    }
+
+    pub fn single_role_pattern_mut(&mut self, role: Role) -> Option<&mut Pattern> {
+        match role {
+            Role::Callee => self.callee.as_deref_mut(),
+            Role::Receiver => self.receiver.as_deref_mut(),
+            Role::Left => self.left.as_deref_mut(),
+            Role::Right => self.right.as_deref_mut(),
+            Role::Operator => self.operator.as_deref_mut(),
+            Role::Module => self.module.as_deref_mut(),
+            Role::Object => self.object.as_deref_mut(),
+            Role::Field => self.field.as_deref_mut(),
+            Role::Iterable => self.iterable.as_deref_mut(),
+            Role::Tag => self.tag.as_deref_mut(),
+            Role::Value => self.value.as_deref_mut(),
+            Role::Key => self.key.as_deref_mut(),
+            Role::Test => self.test.as_deref_mut(),
+            Role::Type => self.type_operand.as_deref_mut(),
+            Role::Operand => self.operand.as_deref_mut(),
+            Role::Consequence => self.consequence.as_deref_mut(),
+            Role::Alternative => self.alternative.as_deref_mut(),
+            Role::Body => self.body.as_deref_mut(),
+            Role::Label => self.label.as_deref_mut(),
+            Role::Binding => self.binding.as_deref_mut(),
+            Role::InitializerOf => self.initializer_of.as_deref_mut(),
+
+            Role::Arg
+            | Role::Kwarg
+            | Role::Decorator
+            | Role::Element
+            | Role::Attributes
+            | Role::Children
+            | Role::Part
+            | Role::Indices
+            | Role::Dimensions
+            | Role::Parameters
+            | Role::Members
+            | Role::TypeArguments => None,
+        }
+    }
+
+    pub fn list_role_patterns_mut(&mut self, role: Role) -> &mut [Pattern] {
+        match role {
+            Role::Arg => &mut self.args,
+            Role::Decorator => &mut self.decorators,
+            Role::Element => &mut self.elements,
+            Role::Attributes => &mut self.attributes,
+            Role::Children => &mut self.children,
+            Role::TypeArguments => &mut self.type_arguments,
+            Role::Part => &mut self.parts,
+            Role::Indices => &mut self.indices,
+            Role::Dimensions => &mut self.dimensions,
+            Role::Parameters => &mut self.parameters,
+            Role::Members => &mut self.members,
+
+            Role::Callee
+            | Role::Receiver
+            | Role::Kwarg
+            | Role::Left
+            | Role::Right
+            | Role::Operator
+            | Role::Module
+            | Role::Object
+            | Role::Field
+            | Role::Iterable
+            | Role::Tag
+            | Role::Value
+            | Role::Key
+            | Role::Test
+            | Role::Type
+            | Role::Operand
+            | Role::Consequence
+            | Role::Alternative
+            | Role::Body
+            | Role::Label
+            | Role::Binding
+            | Role::InitializerOf => &mut [],
         }
     }
 
@@ -5628,7 +6174,10 @@ impl Pattern {
     /// Whether this pattern or any nested sub-pattern filters on recorded
     /// callable visibility or parameter-type spellings.
     pub fn constrains_callable_signature(&self) -> bool {
-        if !self.visibility.is_empty() || self.parameter_type.is_some() {
+        if !self.visibility.is_empty()
+            || self.parameter_type.is_some()
+            || self.qualifying_type.is_some()
+        {
             return true;
         }
         if self
@@ -5637,6 +6186,10 @@ impl Pattern {
             .is_some_and(Self::constrains_callable_signature)
             || self
                 .not_has
+                .as_deref()
+                .is_some_and(Self::constrains_callable_signature)
+            || self
+                .each
                 .as_deref()
                 .is_some_and(Self::constrains_callable_signature)
             || self
@@ -5649,6 +6202,10 @@ impl Pattern {
                 .is_some_and(Self::constrains_callable_signature)
             || self.all.iter().any(Self::constrains_callable_signature)
             || self.any.iter().any(Self::constrains_callable_signature)
+            || self
+                .count
+                .as_ref()
+                .is_some_and(|count| count.pattern.constrains_callable_signature())
         {
             return true;
         }
@@ -5689,6 +6246,10 @@ impl Pattern {
                 .as_deref()
                 .is_some_and(Self::constrains_boolean_value)
             || self
+                .each
+                .as_deref()
+                .is_some_and(Self::constrains_boolean_value)
+            || self
                 .local_value
                 .as_deref()
                 .is_some_and(Self::constrains_boolean_value)
@@ -5698,6 +6259,10 @@ impl Pattern {
                 .is_some_and(Self::constrains_boolean_value)
             || self.all.iter().any(Self::constrains_boolean_value)
             || self.any.iter().any(Self::constrains_boolean_value)
+            || self
+                .count
+                .as_ref()
+                .is_some_and(|count| count.pattern.constrains_boolean_value())
         {
             return true;
         }
@@ -5726,10 +6291,95 @@ impl Pattern {
     /// Immediate compiled-pattern children, including Boolean and negative
     /// positions. Callers analyzing necessary conditions must retain their
     /// context; enumeration alone does not make a child a positive demand.
+    /// Visit every qualifying-type constraint at the loaded-policy boundary.
+    pub fn visit_qualifying_types_mut<E>(
+        &mut self,
+        visit: &mut impl FnMut(&mut InstantiatedType) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.visit_qualifying_types_mut_with_path("", &mut |ty, _| visit(ty))
+    }
+
+    /// The same traversal with canonical JSON paths for source-range attribution.
+    pub fn visit_qualifying_types_mut_with_path<E>(
+        &mut self,
+        path: &str,
+        visit: &mut impl FnMut(&mut InstantiatedType, &str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        use super::schema::PatternField;
+        if let Some(ty) = &mut self.qualifying_type {
+            visit(
+                ty,
+                &child_query_path(path, PatternField::QualifyingType.label()),
+            )?;
+        }
+        for (child, field) in [
+            (&mut self.has, PatternField::Has),
+            (&mut self.each, PatternField::Each),
+            (&mut self.not_has, PatternField::NotHas),
+            (&mut self.local_value, PatternField::LocalValue),
+            (&mut self.not, PatternField::Not),
+        ] {
+            if let Some(child) = child {
+                child.visit_qualifying_types_mut_with_path(
+                    &child_query_path(path, field.label()),
+                    visit,
+                )?;
+            }
+        }
+        for (children, field) in [
+            (&mut self.all, PatternField::All),
+            (&mut self.any, PatternField::Any),
+        ] {
+            for (index, child) in children.iter_mut().enumerate() {
+                child.visit_qualifying_types_mut_with_path(
+                    &format!("{}[{index}]", child_query_path(path, field.label())),
+                    visit,
+                )?;
+            }
+        }
+        for role in Role::single_target_roles() {
+            if let Some(child) = self.single_role_pattern_mut(*role) {
+                child.visit_qualifying_types_mut_with_path(
+                    &child_query_path(path, role.label()),
+                    visit,
+                )?;
+            }
+        }
+        for role in Role::list_target_roles() {
+            for (index, child) in self.list_role_patterns_mut(*role).iter_mut().enumerate() {
+                child.visit_qualifying_types_mut_with_path(
+                    &format!("{}[{index}]", child_query_path(path, role.label())),
+                    visit,
+                )?;
+            }
+        }
+        for (name, child) in &mut self.kwargs {
+            child.visit_qualifying_types_mut_with_path(
+                &child_query_path(&child_query_path(path, Role::Kwarg.label()), name),
+                visit,
+            )?;
+        }
+        if let Some(count) = &mut self.count {
+            count.pattern.visit_qualifying_types_mut_with_path(
+                &child_query_path(
+                    &child_query_path(path, PatternField::Count.label()),
+                    "pattern",
+                ),
+                visit,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn to_canonical_json(&self) -> serde_json::Value {
+        super::json::pattern_to_json(self)
+    }
+
     pub(crate) fn nested_patterns(&self) -> impl Iterator<Item = &Pattern> {
         self.has
             .iter()
             .map(Box::as_ref)
+            .chain(self.each.iter().map(Box::as_ref))
             .chain(self.not_has.iter().map(Box::as_ref))
             .chain(self.local_value.iter().map(Box::as_ref))
             .chain(self.not.iter().map(Box::as_ref))
@@ -5746,6 +6396,10 @@ impl Pattern {
                     .flat_map(move |role| self.list_role_patterns(*role)),
             )
             .chain(self.kwargs.iter().map(|(_, pattern)| pattern))
+            // A counted child is evaluated like any nested pattern, so its own
+            // dependencies (comment blocks, local values, oracles) must be
+            // prepared; it is never a positive demand.
+            .chain(self.count.iter().map(|count| count.pattern.as_ref()))
     }
 
     fn any_nested_pattern(&self, predicate: impl FnMut(&Pattern) -> bool) -> bool {
@@ -5762,6 +6416,14 @@ impl Pattern {
                 .text
                 .as_ref()
                 .is_none_or(|predicate| predicate.matches(text))
+    }
+
+    /// Whether this pattern or a nested pattern names `kind` as a required or
+    /// excluded kind.
+    pub fn mentions_kind(&self, kind: NormalizedKind) -> bool {
+        self.kinds.contains(&kind)
+            || self.not_kinds.contains(&kind)
+            || self.any_nested_pattern(|pattern| pattern.mentions_kind(kind))
     }
 
     /// Whether this pattern or a nested pattern constrains call unsafe context.
@@ -5816,6 +6478,10 @@ impl Pattern {
 
     /// Whether this pattern or any nested pattern traverses a local assignment
     /// value.
+    pub fn constrains_qualifying_type(&self) -> bool {
+        self.qualifying_type.is_some() || self.any_nested_pattern(Self::constrains_qualifying_type)
+    }
+
     pub fn constrains_local_value(&self) -> bool {
         self.local_value.is_some() || self.any_nested_pattern(Self::constrains_local_value)
     }

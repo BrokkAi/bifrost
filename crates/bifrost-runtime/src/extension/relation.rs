@@ -447,6 +447,7 @@ pub struct ValueOccurrence {
 #[serde(rename_all = "snake_case")]
 pub enum ValueDependenceSubtype {
     Assignment,
+    OwnershipUnknown,
     Parameter,
     Receiver,
     NormalReturn,
@@ -920,7 +921,12 @@ pub(crate) fn value_carrier_digest(projection: &str) -> Result<StableDigest, Rel
     let mut hasher = Sha256::new();
     hasher.update(b"brokk-bifrost-extension-value-carrier-v1\0");
     hasher.update(projection.as_bytes());
-    StableDigest::parse(format!("{:x}", hasher.finalize())).map_err(RelationCodecError::new)
+    StableDigest::parse(
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        ),
+    )
+    .map_err(RelationCodecError::new)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -220,6 +220,11 @@ impl RenderText for SymbolLocationsResult {
                     .join("; ")
             ));
         }
+        lines.extend(
+            self.incomplete
+                .iter()
+                .map(|item| format!("Incomplete: {item}")),
+        );
         if lines.is_empty() {
             "No matching symbols found.".to_string()
         } else {
@@ -241,6 +246,11 @@ impl RenderText for SymbolAncestorsResult {
         if !self.ambiguous.is_empty() {
             blocks.push(render_ambiguous_symbols_table(&self.ambiguous));
         }
+        blocks.extend(
+            self.incomplete
+                .iter()
+                .map(|item| format!("Incomplete: {item}")),
+        );
         if blocks.is_empty() {
             "No matching ancestors found.".to_string()
         } else {
@@ -314,6 +324,9 @@ fn render_symbol_sources_incomplete(items: &[SymbolSourcesIncomplete]) -> String
         .map(|item| {
             let reason = match item.reason {
                 SymbolSourcesIncompleteReason::Cancelled => "cancelled",
+                SymbolSourcesIncompleteReason::ReadIncomplete => {
+                    item.detail.as_deref().unwrap_or("read incomplete")
+                }
                 SymbolSourcesIncompleteReason::InsideUnclosedConstruct => {
                     "inside a construct its file's parse never closed"
                 }
@@ -580,6 +593,14 @@ impl RenderText for UsageGraphResult {
                 self.incomplete_reasons
                     .iter()
                     .map(|reason| format!("- {}: {}", reason.code, reason.message)),
+            );
+        }
+        if !self.scope_obligations.is_empty() {
+            lines.push("Graph scope assumptions:".into());
+            lines.extend(
+                self.scope_obligations
+                    .iter()
+                    .map(|obligation| format!("- {}: {}", obligation.code, obligation.message)),
             );
         }
         if !self.truncated_symbols.is_empty() {
@@ -1330,6 +1351,7 @@ mod tests {
             incomplete: vec![SymbolSourcesIncomplete {
                 target: "Slow".to_string(),
                 reason: SymbolSourcesIncompleteReason::Cancelled,
+                detail: None,
             }],
         };
 

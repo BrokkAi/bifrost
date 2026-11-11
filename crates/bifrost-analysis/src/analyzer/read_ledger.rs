@@ -71,6 +71,8 @@ pub use crate::analyzer::semantic::read_ledger::ReadKey;
 
 /// Domain for the digest of an answer that is a set of declarations.
 const DECLARATION_SET_DOMAIN: &[u8] = b"bifrost-read-ledger:declaration-set:v1";
+/// Domain for all full declaration identities matching one rendered question.
+const DECLARATION_CANDIDATES_DOMAIN: &[u8] = b"bifrost-read-ledger:declaration-candidates:v1";
 /// Domain for the exact declaration facts consumed by a language resolver.
 const DECLARATION_FACTS_DOMAIN: &[u8] = b"bifrost-read-ledger:declaration-facts:v1";
 /// Domain for a declaration-facts question whose declaration is absent.
@@ -109,6 +111,47 @@ pub fn declaration_set_digest<'a>(units: impl IntoIterator<Item = &'a CodeUnit>)
         hasher.field(&path, fq_name.as_bytes());
     }
     StableDigest::from_array(hasher.finish())
+}
+
+/// Exact parser candidate set for a declaration-shaped question, including an
+/// empty set. `DeclarationId` contains every field used by `CodeUnit` equality
+/// while spelling the source as a workspace-relative path. A persisted expected
+/// unit can test membership in this set without making those fields question
+/// fields; its own fragment reads separately certify that expected unit.
+pub fn declaration_candidate_set_digest<'a>(
+    question: &LookupQuestion,
+    units: impl IntoIterator<Item = &'a CodeUnit>,
+) -> StableDigest {
+    assert!(matches!(question, LookupQuestion::Declaration { .. }));
+    let mut identities = units
+        .into_iter()
+        .filter(|unit| declaration_question_matches(question, unit))
+        .map(|unit| unit.declaration_id().to_string())
+        .collect::<Vec<_>>();
+    identities.sort_unstable();
+    identities.dedup();
+    let mut hasher = CanonicalHasher::new(DECLARATION_CANDIDATES_DOMAIN);
+    hasher.sequence("candidates", &identities, |digest, identity| {
+        digest.value(identity.as_bytes());
+    });
+    StableDigest::from_array(hasher.finish())
+}
+
+/// The declaration-shape predicate shared by candidate inventory and digest.
+pub fn declaration_question_matches(question: &LookupQuestion, unit: &CodeUnit) -> bool {
+    let LookupQuestion::Declaration {
+        rel_path,
+        fq_name,
+        kind,
+        signature,
+    } = question
+    else {
+        unreachable!("declaration candidate sets require a declaration question")
+    };
+    rel_path_string(unit.source()) == **rel_path
+        && unit.fq_name() == **fq_name
+        && unit.kind() == *kind
+        && unit.signature() == signature.as_deref()
 }
 
 pub(crate) fn declaration_candidates_lookup_key<'a>(
@@ -297,6 +340,25 @@ pub mod reason {
         };
     }
     reasons! {
+        JAVA_CALLER_PUBLIC_IDENTITY_MISSING = "java_caller_public_identity_missing" => Some(DerivationExecutionCause::Provider),
+        JAVA_REFERENCE_EXECUTION_CONTEXT_UNKNOWN = "java_reference_execution_context_unknown" => None,
+        JAVA_REFERENCE_EXECUTION_CONTEXT_CAPABILITY_ABSENT = "java_reference_execution_context_capability_absent" => Some(DerivationExecutionCause::Provider),
+        JAVA_REFERENCE_EXECUTION_CONTEXT_ROW_ABSENT = "java_reference_execution_context_row_absent" => Some(DerivationExecutionCause::Snapshot),
+        JAVA_REFERENCE_EXECUTION_CONTEXT_CORRUPT = "java_reference_execution_context_corrupt" => Some(DerivationExecutionCause::Provider),
+        RUST_COPY_CENSUS_MISSING = "rust_copy.census_missing" => None,
+        RUST_COPY_CENSUS_CORRUPT = "rust_copy.census_corrupt" => None,
+        RUST_COPY_BOUNDARY_MACRO = "rust_copy.boundary_macro" => None,
+        RUST_COPY_BOUNDARY_DERIVE = "rust_copy.boundary_derive" => None,
+        RUST_COPY_BOUNDARY_EXPANDING_ATTRIBUTE = "rust_copy.boundary_expanding_attribute" => None,
+        RUST_COPY_BOUNDARY_INTERNAL_ATTRIBUTE = "rust_copy.boundary_internal_attribute" => None,
+        RUST_COPY_BOUNDARY_SYNTAX_ERROR = "rust_copy.boundary_syntax_error" => None,
+        RUST_COPY_MODULE_UNIVERSE_OPEN = "rust_copy.module_universe_open" => None,
+        RUST_COPY_UNRESOLVED_SUBJECT = "rust_copy.unresolved_subject" => None,
+        RUST_COPY_ALIAS_SUBJECT = "rust_copy.alias_subject" => None,
+        RUST_COPY_UNPAIRED_IMPL = "rust_copy.unpaired_impl" => None,
+        RUST_COPY_MATCHING_TRAIT_IMPL = "rust_copy.matching_trait_impl" => None,
+        RUST_COPY_PUBLICATION_INCOMPLETE = "rust_copy.publication_incomplete" => None,
+        RUST_COPY_TARGET_UNAVAILABLE = "rust_copy.target_unavailable" => Some(DerivationExecutionCause::Provider),
         JVM_INDEX_CAPPED_ENTRIES = "jvm.index.capped_entries" => None,
         ARTIFACT_MEMBERS_LIMIT = "limit.artifact_members" => None,
         KOTLIN_CLASSIFICATION_CAPPED = "kotlin.classification_capped" => None,
@@ -346,12 +408,30 @@ pub mod reason {
         // A Go import is incomplete when its package rows are missing or
         // unconfirmed, which also depends on the selected external inventory.
         GO_IMPORT_INCOMPLETE = "go-import-incomplete" => Some(DerivationExecutionCause::Provider),
+        GO_EXTERNAL_MEMBER_UNPROVIDED = "go-external-member-unprovided" => Some(DerivationExecutionCause::Provider),
         OWNER_INVENTORY_OPEN = "OwnerInventoryOpen" => Some(DerivationExecutionCause::Provider),
+        // A missing nominal member can depend on a selected provider surface.
+        // Retain the operational barrier until its absence has a ledgered input.
+        // #7979: workspace class decorators retain candidates without member-preservation proof.
+        PYTHON_MODEL_ALLOCATOR_RESULT_UNKNOWN = "python_model_allocator_result_unknown" => Some(DerivationExecutionCause::Provider),
+        PYTHON_MODEL_MEMBER_INVENTORY_OPEN = "python_model_member_inventory_open" => Some(DerivationExecutionCause::Provider),
+        PYTHON_MODEL_DESCRIPTOR_ROLE_UNKNOWN = "python_model_descriptor_role_unknown" => Some(DerivationExecutionCause::Provider),
+        PYTHON_SOURCE_IMPLICIT_PROTOCOL_OPEN = "python_source_implicit_protocol_open" => Some(DerivationExecutionCause::Provider),
+        PYTHON_CLASS_DECORATOR_UNPROVEN = "python_class_decorator_unproven" => Some(DerivationExecutionCause::Provider),
+        PYTHON_RECEIVER_SUBCLASS_MEMBER_MISSING = "python_receiver_subclass_member_missing" => Some(DerivationExecutionCause::Provider),
+        UNACQUIRED_OBJECT_MEMBER = "UnacquiredObjectMember" => Some(DerivationExecutionCause::Provider),
         HIERARCHY_INCOMPLETE = "hierarchy_incomplete" => None,
         HIERARCHY_AMBIGUOUS = "hierarchy_ambiguous" => None,
+        COVERAGE_INCOMPLETE = "coverage_incomplete" => None,
+        PROVIDER_UNAVAILABLE = "provider_unavailable" => Some(DerivationExecutionCause::Provider),
+        FORWARD_SATISFACTION_INCOMPLETE = "forward_satisfaction_incomplete" => None,
+        GO_ALIAS_TERMINAL_INCOMPLETE = "alias target has no complete selected terminal" => None,
         // These explicit registrations preserve the prior unknown-label fallback.
         JVM_IMPORT_SELECTOR_OPEN = "jvm-import-selector-open" => Some(DerivationExecutionCause::Provider),
         JVM_IMPORT_OWNER_OPEN = "jvm-import-owner-open" => Some(DerivationExecutionCause::Provider),
+        SCALA_PACKAGE_CLAUSE_BOUNDARY_OPEN = "scala-package-clause-boundary-open" => Some(DerivationExecutionCause::Provider),
+        JVM_SOURCE_DOMAIN_OPEN = "jvm-source-domain-open" => Some(DerivationExecutionCause::Provider),
+        JVM_PACKAGE_ALIAS_ROUTE_OPEN = "jvm-package-alias-route-open" => Some(DerivationExecutionCause::Provider),
         JVM_PACK_PACKAGE_MEMBER = "jvm-pack-package-member" => Some(DerivationExecutionCause::Provider),
         JVM_PACK_PACKAGE_MEMBER_OPEN = "JvmPackPackageMemberOpen" => Some(DerivationExecutionCause::Provider),
         AMBIGUOUS_MEMBER = "ambiguous_member" => None,
@@ -394,6 +474,8 @@ pub mod reason {
         PROCEDURE_SYNTAX_INEXACT = "procedure_syntax_inexact" => None,
         PROCEDURE_SYNTAX_MISSING = "procedure_syntax_missing" => None,
         PROCEDURE_SYNTAX_RECOVERY = "procedure_syntax_recovery" => None,
+        METHOD_OVERRIDE_LIMIT = "method_override_limit" => Some(DerivationExecutionCause::Budget),
+        METHOD_OVERRIDE_INCOMPLETE = "method_override_incomplete" => Some(DerivationExecutionCause::Provider),
         QUERY_INCOMPLETE = "query_incomplete" => Some(DerivationExecutionCause::Provider),
         SNAPSHOT_MISMATCH = "snapshot_mismatch" => Some(DerivationExecutionCause::Snapshot),
         SOURCE_BUDGET_EXHAUSTED = "source_budget_exhausted" => Some(DerivationExecutionCause::Budget),
@@ -404,6 +486,8 @@ pub mod reason {
         SYNTAX_UNAVAILABLE = "syntax_unavailable" => Some(DerivationExecutionCause::Provider),
         TARGET_RECEIVER_READ_UNAVAILABLE = "target_receiver_read_unavailable" => Some(DerivationExecutionCause::Provider),
         UNKNOWN = "unknown" => Some(DerivationExecutionCause::Provider),
+        TYPESTATE_UNPROVEN_HANDOFF = "typestate-unproven-handoff" => None,
+        TYPESTATE_UNPROVEN_GUARD = "typestate-unproven-guard" => None,
         UNPROVEN_ACTIVATION = "unproven_activation" => None,
         UNSUPPORTED_CALLABLE_KIND = "unsupported_callable_kind" => None,
         UNSUPPORTED_CASE_FACT = "unsupported_case_fact" => None,
@@ -608,14 +692,22 @@ struct RecordedKeys {
 /// their enclosing ledger visible.
 #[derive(Debug)]
 pub struct ReadLedger {
+    runtime_cache_touched: std::sync::atomic::AtomicBool,
     identity: brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity,
     keys: Mutex<RecordedKeys>,
     unattributed_reads: AtomicUsize,
     execution_dependences: AtomicUsize,
+    // The part of `execution_dependences` caused by a refused budget charge.
+    budget_dependences: AtomicUsize,
+    reuse_refused: std::sync::atomic::AtomicBool,
+    persistence_refusals: AtomicUsize,
     first_refusal: OnceLock<brokk_bifrost_core::profiling::ReadRefusal>,
     // Nested resolver funnels subsume unattributed inputs, but still forward
     // execution dependence. Retain its origin independently for that channel.
     first_execution_refusal: OnceLock<brokk_bifrost_core::profiling::ReadRefusal>,
+    // Profiling only: the token stop count when this capture opened, for the
+    // execution census. Zero when profiling is off.
+    opened_at_stops: u64,
 }
 
 impl Default for ReadLedger {
@@ -624,17 +716,43 @@ impl Default for ReadLedger {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         assert!(id != 0, "read-ledger capture identity exhausted");
         Self {
+            runtime_cache_touched: Default::default(),
             identity: brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity(id),
             keys: Mutex::default(),
             unattributed_reads: AtomicUsize::default(),
             execution_dependences: AtomicUsize::default(),
+            budget_dependences: AtomicUsize::default(),
+            reuse_refused: std::sync::atomic::AtomicBool::default(),
+            persistence_refusals: AtomicUsize::default(),
             first_refusal: OnceLock::new(),
             first_execution_refusal: OnceLock::new(),
+            opened_at_stops: brokk_bifrost_core::analyzer::execution_census::stop_observations(),
+        }
+    }
+}
+
+impl Drop for ReadLedger {
+    fn drop(&mut self) {
+        if brokk_bifrost_core::profiling::enabled() {
+            brokk_bifrost_core::analyzer::execution_census::record_capture_closed(
+                self.opened_at_stops,
+                self.is_bounded(),
+                self.execution_dependences() > 0,
+            );
         }
     }
 }
 
 impl ReadLedger {
+    /// Runtime cache access affects scoped retry eligibility only.
+    pub fn mark_runtime_cache_touched(&self) {
+        self.runtime_cache_touched.store(true, Ordering::Relaxed);
+    }
+
+    pub fn runtime_cache_touched(&self) -> bool {
+        self.runtime_cache_touched.load(Ordering::Relaxed)
+    }
+
     pub const fn capture_identity(
         &self,
     ) -> brokk_bifrost_core::analyzer::memo_attribution::CaptureIdentity {
@@ -800,6 +918,16 @@ impl ReadLedger {
         self.unattributed_reads.fetch_add(count, Ordering::Relaxed);
     }
 
+    #[track_caller]
+    pub fn refuse_read_reuse(&self) {
+        if brokk_bifrost_core::profiling::enabled() && self.first_refusal.get().is_none() {
+            let refusal = brokk_bifrost_core::profiling::current_read_refusal("reuse_refused")
+                .expect("timing is enabled");
+            self.first_refusal.get_or_init(|| refusal);
+        }
+        self.reuse_refused.store(true, Ordering::Relaxed);
+    }
+
     /// Execution depended on state that named content reads cannot reproduce.
     /// Use the same admission rule as an unattributable read.
     #[track_caller]
@@ -809,6 +937,11 @@ impl ReadLedger {
 
     #[track_caller]
     pub fn mark_execution_dependent_reads(&self, count: usize) {
+        if count > 0 && brokk_bifrost_core::profiling::enabled() {
+            brokk_bifrost_core::analyzer::execution_census::record_ledger_mark(
+                std::panic::Location::caller(),
+            );
+        }
         if count > 0
             && brokk_bifrost_core::profiling::enabled()
             && self.first_execution_refusal.get().is_none()
@@ -823,6 +956,20 @@ impl ReadLedger {
         }
         self.execution_dependences
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// An execution dependence caused by a refused budget charge.
+    #[track_caller]
+    pub fn mark_budget_dependent(&self) {
+        self.mark_execution_dependent_reads(1);
+        self.record_budget_dependences(1);
+    }
+
+    /// Attribute `count` of the execution dependences already recorded to a
+    /// refused budget charge. Used when a receipt's dependences are forwarded
+    /// or replayed, so the cause travels with the count.
+    pub fn record_budget_dependences(&self, count: usize) {
+        self.budget_dependences.fetch_add(count, Ordering::Relaxed);
     }
 
     pub(crate) fn first_execution_refusal(
@@ -840,9 +987,53 @@ impl ReadLedger {
         self.execution_dependences.load(Ordering::Relaxed)
     }
 
+    /// The execution dependences caused by a refused budget charge.
+    pub fn budget_dependences(&self) -> usize {
+        self.budget_dependences.load(Ordering::Relaxed)
+    }
+
+    pub fn reuse_refused(&self) -> bool {
+        self.reuse_refused.load(Ordering::Relaxed)
+    }
+
+    pub fn refuse_persistence(&self) {
+        self.record_persistence_refusals(1);
+    }
+
+    pub fn record_persistence_refusals(&self, count: usize) {
+        self.persistence_refusals
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn persistence_refusals(&self) -> usize {
+        self.persistence_refusals.load(Ordering::Relaxed)
+    }
+
+    pub fn channels(&self) -> brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+        brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+            unattributed_reads: self.unattributed_reads(),
+            execution_dependences: self.execution_dependences(),
+            budget_dependences: self.budget_dependences(),
+            reuse_refused: self.reuse_refused(),
+            persistence_refusals: self.persistence_refusals(),
+        }
+    }
+
     /// Whether every read this ledger observed was named.
     pub fn is_bounded(&self) -> bool {
-        self.unattributed_reads() == 0 && self.execution_dependences() == 0
+        self.unattributed_reads() == 0 && self.execution_dependences() == 0 && !self.reuse_refused()
+    }
+
+    /// The keys to publish to disk, or `None` when this ledger must not be
+    /// published: it is unbounded, a read refused persistence, or it holds a
+    /// key that [`ReadKey::is_persistable`] refuses. Every publisher of a
+    /// ledger's reads applies this one check.
+    pub fn publishable_keys(&self) -> Option<Vec<ReadKey>> {
+        if !self.is_bounded() || self.persistence_refusals() > 0 {
+            return None;
+        }
+        let keys = self.keys();
+        keys.iter().all(ReadKey::is_persistable).then_some(keys)
     }
 
     /// How many funnel crossings could not be attributed to a key.
@@ -1176,6 +1367,9 @@ mod tests {
             LookupQuestion::Summary {
                 identity: StableDigest::sha256("artifact"),
             },
+            LookupQuestion::ExternalSelection {
+                question_digest: *StableDigest::sha256("artifact").as_bytes(),
+            },
         ]
         .map(|question| {
             ReadKey::lookup(
@@ -1259,6 +1453,22 @@ mod tests {
     #[test]
     fn a_lookup_question_round_trips_through_serde() {
         let questions = [
+            LookupQuestion::StructuralRoleName {
+                language: Language::Rust,
+                role: brokk_bifrost_core::analyzer::structural::kinds::Role::Callee,
+                name: "put".into(),
+                keyword: false,
+                authority: StableDigest::sha256("selection"),
+            },
+            LookupQuestion::StructuralName {
+                language: Language::Rust,
+                name: "put".into(),
+                authority: StableDigest::sha256("selection"),
+            },
+            LookupQuestion::StructuralRecovered {
+                language: Language::Rust,
+                authority: StableDigest::sha256("selection"),
+            },
             LookupQuestion::Name {
                 language: Some(Language::Rust),
                 name: Box::from("crate::a::f"),
@@ -1293,6 +1503,9 @@ mod tests {
             },
             LookupQuestion::Summary {
                 identity: StableDigest::sha256("summary"),
+            },
+            LookupQuestion::ExternalSelection {
+                question_digest: [9; 32],
             },
         ];
         for question in questions {

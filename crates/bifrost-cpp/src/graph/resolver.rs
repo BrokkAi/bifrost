@@ -11258,7 +11258,7 @@ pub fn collect_include_closure(
 
 fn parse_macro_parameter_list<T>(
     replacement: &str,
-    read: impl FnOnce(Node<'_>, &str) -> T,
+    read: impl FnOnce(Node<'_>, &str) -> Option<T>,
 ) -> Option<T> {
     let parsed = parse_sentinel(
         "void __bifrost_macro_parameters(",
@@ -11273,7 +11273,7 @@ fn parse_macro_parameter_list<T>(
     let declaration = single_named_child_matching(root, |child| !child.is_extra())?;
     let declarator = declaration.child_by_field_name("declarator")?;
     let parameters = declarator.child_by_field_name("parameters")?;
-    Some(read(parameters, &source))
+    read(parameters, &source)
 }
 
 fn parse_macro_parameter_list_arity(replacement: &str) -> Option<CallableArity> {

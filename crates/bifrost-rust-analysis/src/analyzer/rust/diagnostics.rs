@@ -41,7 +41,9 @@ use brokk_bifrost_core::analyzer::model::SemanticDiagnosticIncompleteReason;
 use brokk_bifrost_core::analyzer::model::SemanticDiagnosticReport;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
-use brokk_bifrost_rust::diagnostics::{RustCrateSurface, RustExternalEvidence};
+use brokk_bifrost_rust::diagnostics::{
+    RustCrateSurface, RustExternalEvidence, RustPathPublication,
+};
 
 pub(crate) fn collect_rust_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
@@ -99,7 +101,7 @@ impl RustExternalEvidence for RetainedRustDependencies {
         self.crates().crate_surface(crate_name)
     }
 
-    fn publishes_path(&self, segments: &[String]) -> bool {
+    fn publishes_path(&self, segments: &[String]) -> RustPathPublication {
         self.crates().publishes_path(segments)
     }
 

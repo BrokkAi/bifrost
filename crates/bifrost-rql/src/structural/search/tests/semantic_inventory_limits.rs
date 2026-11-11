@@ -2,6 +2,46 @@
 use super::*;
 
 #[test]
+fn call_effects_releases_each_files_semantic_artifact() {
+    let source = format!(
+        "def sink():\n    pass\ndef run():\n{}",
+        "    sink()\n".repeat(20)
+    );
+    let query = CodeQuery::from_json(&json!({
+        "execution_mode": "profile",
+        "match": { "kind": "call", "name": "sink" },
+        "steps": [{ "op": "call_shape" }, { "op": "call_effects" }]
+    }))
+    .expect("call effects query");
+    let run = |files: usize| {
+        let mut project =
+            InlineTestProject::with_language(Language::Python).file("a.py", source.clone());
+        if files == 2 {
+            project = project.file("b.py", format!("# distinct file\n{source}"));
+        }
+        let project = project.build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let CodeQueryResponse::Profile(profile) = execute_workspace_request(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        ) else {
+            panic!("profile expected")
+        };
+        assert_eq!(profile.result.results.len(), files * 20);
+        assert!(!profile.work.semantic.budget_exhausted);
+        profile.work.semantic.resident_retained_bytes_peak
+    };
+    let one_file_peak = run(1);
+    let two_file_peak = run(2);
+    assert!(one_file_peak > 0);
+    assert!(
+        two_file_peak < one_file_peak * 3 / 2,
+        "one={one_file_peak}, two={two_file_peak}"
+    );
+}
+
+#[test]
 fn procedure_inventory_reports_source_budget_exhaustion_without_rows() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("main.py", "def run():\n    marker()\n")

@@ -4,7 +4,12 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
+use brokk_bifrost_semantic::analyzer::semantic::ir::model::{
+    FootprintClass, FootprintDisposition, FootprintExclusion, FootprintRefusal, StaticTypeClass,
+    StaticTypeOrigin,
+};
 use brokk_bifrost_semantic::analyzer::semantic::lowering::ShortCircuitKind;
+use brokk_bifrost_semantic::analyzer::semantic::lowering::{BoundaryDisposition, BranchClass};
 
 use brokk_bifrost_semantic::analyzer::semantic::lowering::completion_label;
 
@@ -19,11 +24,12 @@ use brokk_bifrost_semantic::analyzer::semantic::lowering::schedule_short_circuit
 use tree_sitter::Node;
 
 use brokk_bifrost_go::declarations::{
-    GoCallableResultSyntax, go_callable_result_syntax, is_predeclared_go_type,
+    GoCallableResultSyntax, go_callable_result_syntax, is_predeclared_go_basic_type,
+    is_predeclared_go_type,
 };
 use brokk_bifrost_go::syntax::{clause_statement_list, is_clause};
 
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use brokk_bifrost_analysis::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
@@ -84,7 +90,24 @@ pub use crate::analyzer::go::semantic::callable_materialization::materialize_go_
 // change; the code-query tutorial pages elide such ids (#5016).
 // The lowerer reaches declaration and import helpers (decoded import names).
 // #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v98";
+// #9447: structured formal roles, refusal, and stable local var function-literal
+// targets/captures change semantic payloads under the existing Go99 identity.
+// #9183: the Go footprint account changes parse-time semantic rows.
+// #9879: scoped call/control claims for receivers, results, value formals,
+// assignments, supported defers and method callees change coverage rows.
+// #9954: package-qualified callees and binary conditions change coverage rows.
+// #9794: defer capture distinguishes unresolved by-value copies (v104; #9954 has v103).
+// #10095: identifier-receiver method calls claim their selector coverage (v105).
+// #10145: fully bound var declarations claim scoped source coverage (v106).
+// #10162: direct calls and blank assignments claim full footprint coverage (v107).
+// #10162: short var, typed var and defer claims; deferred, cleanup and initialization classes from the lowered IR (v108).
+// #10267: a typed multi-name var with a multi-result call publishes every result (v109).
+// #10490: methods and unnamed-result functions claim receiver and result signature syntax and set footprint classes from the lowered rows (v110).
+// #10554: slice and map composite literals store their elements, and elided-type element literals allocate (v112).
+// #10490: returns, ifs, assignments, resolved identifier reads, value-only expressions and identifier-argument calls claim full footprint coverage, except where they convert to an interface or compare interfaces (v113).
+// #10490: `&x`, `&T{}`, empty composite literals and same-file struct literals with non-interface fields claim full footprint coverage (v114).
+// #10582: publish static underlying-type classes and declared result classes (v115).
+const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v115";
 
 impl_program_semantics_provider!(GoAnalyzer, GoSemanticLowerer);
 
@@ -146,6 +169,12 @@ impl ProgramSemanticsLowerer for GoSemanticLowerer {
             }
             ProcedureEnumeration::Cancelled { work } => {
                 return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+            ProcedureEnumeration::Unknown { work } => {
+                return Ok(SemanticOutcome::Unknown {
                     partial: None,
                     work,
                 });
@@ -545,6 +574,8 @@ struct ProcedureSpec<'tree> {
     kind: ProcedureKind,
     properties: ProcedureProperties,
     result_shadowing: PredeclaredShadowing,
+    /// Exact syntax availability from this callable's lexical prepass.
+    formal_layout_available: bool,
     captures: Box<[GoCaptureSpec<'tree>]>,
     shared_bindings: Box<[GoSharedBindingSpec]>,
     omitted_capture_names: Box<[Box<str>]>,
@@ -663,6 +694,33 @@ struct GoInterfacePayloadProof<'tree> {
     boxing_initializer: Node<'tree>,
 }
 
+fn declared_callable_result_types(declaration: Node<'_>) -> Option<Vec<Node<'_>>> {
+    if declaration.child_by_field_name("type_parameters").is_some() {
+        return None;
+    }
+    go_callable_result_types(declaration)
+}
+
+fn assertion_package_functions<'tree>(
+    specs: &[ProcedureSpec<'tree>],
+    source: &str,
+) -> HashMap<String, Option<Node<'tree>>> {
+    let mut functions = HashMap::default();
+    for spec in specs {
+        if spec.lexical_parent.is_none()
+            && spec.callable.kind() == "function_declaration"
+            && let Some(name) = spec.callable.child_by_field_name("name")
+            && let Some(name) = nonempty_node_text(source, name)
+        {
+            functions
+                .entry(name.to_owned())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(spec.callable));
+        }
+    }
+    functions
+}
+
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<GoProcedureInventory<'tree>>;
 
 /// Positive dynamic-type evidence for an assertion. Static type information
@@ -675,6 +733,7 @@ struct GoAssertionProofContext<'a, 'tree, 'file> {
     source: &'a str,
     named_types: &'a GoNamedTypeDefinitions<'tree>,
     package_shadowing: PredeclaredShadowing,
+    package_functions: HashMap<String, Option<Node<'tree>>>,
     inventory: &'a mut ProcedureInventoryBuilder<'file>,
     cancellation: &'a CancellationToken,
 }
@@ -914,6 +973,58 @@ impl<'tree> GoAssertionProofContext<'_, 'tree, '_> {
                 return Ok(None);
             }
             let (_, initializer) = self.binding_type_source(binding);
+            if initializer.is_none() {
+                let identity = match binding {
+                    GoResolvedBinding::Local(identity) | GoResolvedBinding::Formal(identity) => {
+                        identity
+                    }
+                };
+                let callable = self.specs[identity.procedure.index()].callable;
+                let name = callable
+                    .named_descendant_for_byte_range(
+                        identity.declaration_start,
+                        identity.declaration_start + 1,
+                    )
+                    .expect("binding belongs to callable");
+                let mut declaration = name.parent().expect("binding has declaration");
+                if declaration.kind() == "expression_list" {
+                    declaration = declaration.parent().expect("list has declaration");
+                }
+                if declaration.kind() == "var_spec" {
+                    let names = children_by_field_name(declaration, "name");
+                    let values = declaration
+                        .child_by_field_name("value")
+                        .map(expression_sequence)
+                        .unwrap_or_default();
+                    if names.len() > 1
+                        && let Some(call) = go_single_value_expression(&values)
+                        && call.kind() == "call_expression"
+                        && let Some(function) = call.child_by_field_name("function")
+                        && let function = transparent_parenthesized_expression(function)
+                        && self
+                            .binding(identity.procedure.index(), function)?
+                            .is_none()
+                        && function.kind() == "identifier"
+                        && let Some(function_name) = nonempty_node_text(self.source, function)
+                        && let Some(declaration) =
+                            self.package_functions.get(function_name).copied().flatten()
+                        && let Some(types) = declared_callable_result_types(declaration)
+                        && types.len() == names.len()
+                        && let Some(index) = names
+                            .iter()
+                            .position(|candidate| candidate.id() == name.id())
+                    {
+                        return Ok(Some(GoInterfacePayloadProof {
+                            r#type: GoAssertionType {
+                                node: types[index],
+                                pointer_depth: 0,
+                            },
+                            boxing_procedure: identity.procedure,
+                            boxing_initializer: call,
+                        }));
+                    }
+                }
+            }
             let Some(initializer) = initializer else {
                 return Ok(None);
             };
@@ -1195,6 +1306,12 @@ pub fn reference_assertion_payload_type_is_exact(
                 work,
             });
         }
+        ProcedureEnumeration::Unknown { work } => {
+            return Ok(SemanticOutcome::Unknown {
+                partial: None,
+                work,
+            });
+        }
     };
     let root = prepared.tree().root_node();
     let mut inventory = ProcedureInventoryBuilder::new(
@@ -1262,6 +1379,7 @@ pub fn reference_assertion_payload_type_is_exact(
             source: prepared.source(),
             named_types: &facts.named_type_definitions,
             package_shadowing: facts.package_shadowing,
+            package_functions: assertion_package_functions(&facts.specs, prepared.source()),
             inventory: &mut inventory,
             cancellation,
         };
@@ -1451,6 +1569,7 @@ fn enumerate_procedures<'tree>(
                 kind,
                 properties,
                 result_shadowing: PredeclaredShadowing::default(),
+                formal_layout_available: false,
                 captures: Box::new([]),
                 shared_bindings: Box::new([]),
                 omitted_capture_names: Box::new([]),
@@ -1723,9 +1842,10 @@ fn callable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
     )
 }
 
-/// Resolve every lexical capture to its exact declaring binding. Stable
-/// short-declared locals may remain value snapshots; all other captures relay
-/// one shared cell through every intervening closure.
+/// Resolve every lexical capture to its exact declaring binding. Stable short
+/// declarations and local var function literals may remain value snapshots
+/// only after the shared whole-lifetime mutation and escape proof; other
+/// captures relay one shared cell through every intervening closure.
 #[allow(clippy::too_many_arguments)]
 fn populate_capture_specs<'tree>(
     specs: &mut [ProcedureSpec<'tree>],
@@ -1750,6 +1870,14 @@ fn populate_capture_specs<'tree>(
             cancellation,
         )?);
     }
+    for (index, (spec, bindings)) in specs.iter_mut().zip(&lexical_bindings).enumerate() {
+        assert_eq!(
+            spec.id.index(),
+            index,
+            "Go prepass facts follow procedure IDs"
+        );
+        spec.formal_layout_available = bindings.formal_layout_available;
+    }
     let GoCallExposures {
         call_exposure_origins,
         capture_mutable_bindings,
@@ -1771,6 +1899,7 @@ fn populate_capture_specs<'tree>(
         source,
         named_types: named_type_definitions,
         package_shadowing,
+        package_functions: assertion_package_functions(specs, source),
         inventory,
         cancellation,
     };
@@ -1839,7 +1968,7 @@ fn populate_capture_specs<'tree>(
         spec.reference_boxing_initializers = boxing_initializers;
     }
     let mut captures = vec![Vec::<GoCaptureSpec<'tree>>::new(); specs.len()];
-    let omitted_capture_names = vec![Vec::<Box<str>>::new(); specs.len()];
+    let mut omitted_capture_names = vec![Vec::<Box<str>>::new(); specs.len()];
     for child in specs.iter() {
         charge_go_inventory_prepass(inventory, cancellation)?;
         let Some(parent_id) = child.lexical_parent else {
@@ -1877,6 +2006,10 @@ fn populate_capture_specs<'tree>(
         })?;
         let mut captured = Vec::new();
         for (name, reference) in references {
+            if !child_bindings.formal_layout_available {
+                omitted_capture_names[child.id.index()].push(name);
+                continue;
+            }
             if let Some(binding) = resolve_go_binding(
                 specs,
                 &lexical_bindings,
@@ -1940,24 +2073,38 @@ fn populate_capture_specs<'tree>(
         for capture in direct {
             let owner = resolved_binding_procedure(capture.binding);
             let mut relay = specs[child_index].lexical_parent;
+            let mut relay_chain = Vec::new();
+            let mut unavailable = false;
             while let Some(relay_id) = relay {
                 if relay_id == owner {
                     break;
                 }
                 charge_go_inventory_prepass(inventory, cancellation)?;
-                if !captures[relay_id.index()]
-                    .iter()
-                    .any(|existing| existing.binding == capture.binding)
-                {
-                    captures[relay_id.index()].push(capture.clone());
+                if !lexical_bindings[relay_id.index()].formal_layout_available {
+                    omitted_capture_names[child_index].push(capture.name.clone());
+                    unavailable = true;
+                    break;
                 }
+                relay_chain.push(relay_id);
                 relay = specs[relay_id.index()].lexical_parent;
+            }
+            if unavailable {
+                captures[child_index].retain(|existing| existing.binding != capture.binding);
+                continue;
             }
             debug_assert_eq!(
                 relay,
                 Some(owner),
                 "a resolved capture binding must be in the lexical ancestor chain"
             );
+            for relay_id in relay_chain {
+                if !captures[relay_id.index()]
+                    .iter()
+                    .any(|existing| existing.binding == capture.binding)
+                {
+                    captures[relay_id.index()].push(capture.clone());
+                }
+            }
         }
     }
 
@@ -2027,6 +2174,10 @@ fn populate_capture_specs<'tree>(
             )
         });
         bindings.dedup_by_key(|binding| binding.binding);
+    }
+    for omitted in &mut omitted_capture_names {
+        omitted.sort_unstable();
+        omitted.dedup();
     }
     for ((((spec, captured), shared), omitted), exposures) in specs
         .iter_mut()
@@ -2413,6 +2564,8 @@ struct GoScopedLocalBinding {
 /// name set would therefore erase an earlier outer reference. These transient
 /// inventories share their scope selectors with lowering-time `LocalBinding`.
 struct GoCallableLexicalBindings {
+    /// True only when this callable's parameter syntax produced a layout.
+    formal_layout_available: bool,
     formals: HashMap<Box<str>, GoBindingIdentity>,
     locals: HashMap<Box<str>, Vec<GoScopedLocalBinding>>,
     receiver_types: HashMap<GoBindingIdentity, GoTypeIdentity>,
@@ -2804,6 +2957,39 @@ fn go_file_underlying_type<'tree>(
             }
             _ => return Some(kind),
         }
+    }
+    None
+}
+
+/// The type a chain of same-file aliases (`type X = Y`) denotes. An alias is
+/// another spelling of its target, unlike a defined type (`type X Y`), so the
+/// chain stops at the first node that is not a use of an alias. `None` when the
+/// chain is longer than the number of declarations, which only a cycle causes.
+fn go_resolve_type_aliases<'tree>(
+    mut kind: Node<'tree>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'tree>,
+) -> Option<Node<'tree>> {
+    let definition_count = named_types.values().map(Vec::len).sum::<usize>();
+    for _ in 0..=definition_count {
+        if kind.kind() != "type_identifier" {
+            return Some(kind);
+        }
+        let name = node_text(source, kind)?;
+        if go_type_parameter_constraint(kind, name, source, named_types).is_some() {
+            return Some(kind);
+        }
+        let Some(definition) = visible_go_named_type(named_types, name, kind.start_byte()) else {
+            return Some(kind);
+        };
+        if definition
+            .underlying
+            .parent()
+            .is_none_or(|parent| parent.kind() != "type_alias")
+        {
+            return Some(kind);
+        }
+        kind = definition.underlying;
     }
     None
 }
@@ -3238,6 +3424,46 @@ fn go_assertion_types_match<'tree>(
     Ok(true)
 }
 
+fn go_static_type_class(
+    kind: Node<'_>,
+    source: &str,
+    named_types: &GoNamedTypeDefinitions<'_>,
+    use_byte: usize,
+) -> StaticTypeClass {
+    use StaticTypeClass as Class;
+    if kind.kind() == "type_identifier"
+        && node_text(source, kind).is_some_and(|name| {
+            go_type_parameter_constraint(kind, name, source, named_types).is_some()
+        })
+    {
+        return Class::Unknown;
+    }
+    if go_type_is_interface(kind, source, named_types, use_byte) {
+        return Class::Interface;
+    }
+    let Some(underlying) = go_file_underlying_type(kind, source, named_types, use_byte) else {
+        return Class::Unknown;
+    };
+    match underlying.kind() {
+        "pointer_type" => Class::Pointer,
+        "function_type" => Class::Reference,
+        _ => match go_storage_kind_of_underlying(underlying) {
+            Some(GoStorageKind::Array | GoStorageKind::Struct) => Class::Value,
+            Some(GoStorageKind::Slice | GoStorageKind::Map | GoStorageKind::Channel) => {
+                Class::Reference
+            }
+            None if underlying.kind() == "type_identifier"
+                && node_text(source, underlying).is_some_and(|name| {
+                    is_predeclared_go_type(name) && !matches!(name, "any" | "error" | "comparable")
+                }) =>
+            {
+                Class::Value
+            }
+            _ => Class::Unknown,
+        },
+    }
+}
+
 fn go_storage_kind_from_type(
     kind: Node<'_>,
     source: &str,
@@ -3321,16 +3547,6 @@ fn go_type_is_interface(
     use_byte: usize,
 ) -> bool {
     go_type_interface_node(kind, source, named_types, use_byte).is_some()
-}
-
-fn go_type_is_empty_interface(
-    kind: Node<'_>,
-    source: &str,
-    named_types: &GoNamedTypeDefinitions<'_>,
-    use_byte: usize,
-) -> bool {
-    go_type_interface_node(kind, source, named_types, use_byte)
-        .is_some_and(|node| node.kind() != "interface_type" || named_children(node).is_empty())
 }
 
 fn go_channel_payload_copy_from_type(
@@ -3726,6 +3942,7 @@ fn go_callable_lexical_bindings(
 ) -> Result<GoCallableLexicalBindings, GoInventoryPrepassStop> {
     charge_go_inventory_prepass(inventory, cancellation)?;
     let mut bindings = GoCallableLexicalBindings {
+        formal_layout_available: false,
         formals: HashMap::default(),
         locals: HashMap::default(),
         receiver_types: HashMap::default(),
@@ -3738,16 +3955,12 @@ fn go_callable_lexical_bindings(
         callable_literals: HashMap::default(),
         callable_methods: HashMap::default(),
     };
-    if let Some(layout) = formal_parameter_slots_for_owner(Language::Go, spec.callable, source) {
-        for slot in layout.slots {
+    if let Some(slots) =
+        formal_parameter_slots_for_owner_with_nodes(Language::Go, spec.callable, source)
+    {
+        bindings.formal_layout_available = true;
+        for (slot, declaration) in slots {
             charge_go_inventory_prepass(inventory, cancellation)?;
-            let declaration = spec
-                .callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(spec.callable);
             let storage = declaration.child_by_field_name("type").and_then(|kind| {
                 go_storage_kind_from_type(
                     kind,
@@ -3974,6 +4187,11 @@ fn go_callable_lexical_bindings(
         let name_count = name_nodes.len();
         for (index, name_node) in name_nodes.into_iter().enumerate() {
             let declared_value = go_declaration_value_for_index(name_count, &value_nodes, index);
+            let exact_value_candidate = exact_value_candidate
+                || (node.kind() == "var_spec"
+                    && declared_value
+                        .map(transparent_parenthesized_expression)
+                        .is_some_and(|value| value.kind() == "func_literal"));
             if !is_go_binding_reference_kind(name_node.kind()) {
                 continue;
             }
@@ -4291,10 +4509,11 @@ fn immutable_captured_binding(
 /// all rather than a narrower one.
 ///
 /// The claim is made only for a binding this prepass already proved stable:
-/// one short or const declaration whose value is a function literal, with no
-/// later assignment, no address escape, and no implicit pointer-method
-/// address. That is the same predicate exact value captures use, so a
-/// reassigned binding stays unresolved instead of naming its first value.
+/// a short or const declaration, or a local var with a selected function
+/// literal, with no assignment anywhere in its lifetime, no address escape,
+/// and no implicit pointer-method address. The same whole-lifetime predicate
+/// selects exact value captures, so a reassigned binding stays unresolved
+/// instead of naming its first value.
 ///
 /// A binding exactly initialized with a method-value selection is stable in
 /// the same sense and denotes that method: `f := c.serve; go f()` reaches the
@@ -4642,6 +4861,17 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     call_exposed_bindings: HashSet<ValueId>,
     value_types: HashMap<ValueId, GoTypeIdentity>,
+    /// `(source, target)` pairs where a lowering site proved the target holds
+    /// a value of the source's static type: lexical reads, fresh declarations
+    /// and assignments between identical types. The static type class and
+    /// origin flow along these pairs only.
+    static_type_copies: Vec<(ValueId, ValueId)>,
+    /// Values whose static type is unproven: an assertion, load, receive or
+    /// computed expression. Invalidation also flows along
+    /// `static_type_copies`, so a variable declared from such a value has no
+    /// class either. Assignments never invalidate: a Go variable keeps the
+    /// static type of its declaration.
+    static_type_invalidated: HashSet<ValueId>,
     /// The structured declared type syntax for bindings whose identity is not
     /// represented by `GoTypeIdentity`, especially interface destinations.
     value_type_nodes: HashMap<ValueId, Node<'tree>>,
@@ -4670,7 +4900,20 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     /// Fresh aggregate or converted values whose first binding consumes the
     /// completed construction rather than copying an already-owned value.
     fresh_binding_values: HashSet<ValueId>,
+    /// Locals declared without a type whose initializer is provably not an
+    /// interface; the variable takes that initializer's type.
+    non_interface_locals: HashSet<ValueId>,
     addressed_places: Vec<GoAddressedPlace>,
+    /// The scoped call/control disposition of each lowered `nil` occurrence.
+    /// Builtin `nil` has no call or control instance; a shadowed `nil` is a
+    /// binding read, represented only when lowering found its source.
+    predeclared_dispositions: HashMap<usize, CallControlDisposition>,
+    /// The scoped call/control disposition of each node of a composite literal
+    /// that lowering models in full: the literal, its body, its elements and
+    /// their key and value wrappers. A literal node absent here is refused, so
+    /// a slice or map literal with elements, whose element stores carry a gap
+    /// or no claim, never reaches scoped admission.
+    literal_dispositions: HashMap<usize, CallControlDisposition>,
     /// Every `(struct type, field)` declaration this file states, shared by
     /// every procedure lowered from it.
     struct_field_anchors: &'tree HashMap<(usize, Box<str>), SourceAnchor>,
@@ -4704,7 +4947,8 @@ struct LoweringContext<'tree, 'facts, 'targets, 'imports, 'procedure> {
     deferred_captures: HashMap<usize, DeferredCapture>,
     cleanups: Vec<CleanupRegion<'tree>>,
     named_results: Vec<ValueId>,
-    declared_result_arity: Option<usize>,
+    /// The declared result type of each result slot, in order.
+    declared_result_types: Option<Vec<Node<'tree>>>,
     return_shape_supported: bool,
     omitted_capture_names: &'procedure [Box<str>],
     call_exposure_origins: &'procedure [GoCallExposureOrigin],
@@ -4988,6 +5232,8 @@ fn lower_procedure<'tree>(
         locals: HashMap::default(),
         call_exposed_bindings: HashSet::default(),
         value_types: HashMap::default(),
+        static_type_copies: Vec::new(),
+        static_type_invalidated: HashSet::default(),
         value_type_nodes: HashMap::default(),
         value_storage_kinds: HashMap::default(),
         index_value_copies: HashMap::default(),
@@ -4996,7 +5242,10 @@ fn lower_procedure<'tree>(
         channel_payload_types: HashMap::default(),
         exact_slice_shapes: HashMap::default(),
         fresh_binding_values: HashSet::default(),
+        non_interface_locals: HashSet::default(),
         addressed_places: Vec::new(),
+        predeclared_dispositions: HashMap::default(),
+        literal_dispositions: HashMap::default(),
         struct_field_anchors,
         field_locators: HashMap::default(),
         predeclared_builtin_assumptions: HashSet::default(),
@@ -5012,7 +5261,7 @@ fn lower_procedure<'tree>(
         deferred_captures: HashMap::default(),
         cleanups: Vec::new(),
         named_results: Vec::new(),
-        declared_result_arity: go_callable_result_types(spec.callable).map(|results| results.len()),
+        declared_result_types: go_callable_result_types(spec.callable),
         return_shape_supported: spec
             .callable
             .child_by_field_name("result")
@@ -5034,24 +5283,40 @@ fn lower_procedure<'tree>(
         // shadowed would discard valid builtin constants in every closure.
         predeclared_shadowed: package_shadowing.merged(spec.result_shadowing),
     };
-    context.emit_procedure_inputs(&mut builder, spec.callable)?;
+    let top_level_declaration = matches!(
+        spec.callable.kind(),
+        "function_declaration" | "method_declaration"
+    ) && spec.lexical_parent.is_none();
+    if top_level_declaration {
+        context.session.footprint_class(
+            FootprintClass::Capture,
+            FootprintDisposition::Excluded(FootprintExclusion::NoInstance),
+        );
+    }
+    context.emit_procedure_inputs(
+        &mut builder,
+        entry,
+        spec.callable,
+        spec.formal_layout_available,
+    )?;
     context.emit_capture_inputs(&mut builder, entry, spec)?;
     context.emit_named_result_bindings(&mut builder, spec.callable, spec.body)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
     context.emit_shared_binding_cells(&mut builder, entry, spec)?;
     context.collect_call_exposed_bindings(&builder)?;
 
-    if spec.lexical_parent.is_some()
-        && spec.captures.is_empty()
-        && !spec.omitted_capture_names.is_empty()
-    {
+    if spec.lexical_parent.is_some() && !spec.omitted_capture_names.is_empty() {
+        context.session.footprint_class(
+            FootprintClass::Capture,
+            FootprintDisposition::Refused(FootprintRefusal::RelevantGap),
+        );
         context.session.record_gap(
             &mut builder,
             entry,
             SemanticGapSubject::Procedure,
             SemanticCapability::Captures,
-            SemanticGapKind::Unsupported,
-            "required lexical captures are absent from the Go function literal's binding inventory",
+            SemanticGapKind::Unknown,
+            "Go lexical capture bindings are unavailable from source syntax",
         )?;
     }
     if spec
@@ -5094,6 +5359,194 @@ fn lower_procedure<'tree>(
         cancellation,
         |builder, work, stack| context.step(builder, work, stack),
     )?;
+    parts.declared_result_classes = go_callable_result_types(spec.callable).map(|types| {
+        types
+            .into_iter()
+            .map(|node| {
+                go_static_type_class(
+                    node,
+                    context.prepared.source(),
+                    context.named_type_definitions,
+                    node.start_byte(),
+                )
+            })
+            .collect()
+    });
+    for value in &mut parts.values {
+        if let Some(node) = context.value_type_nodes.get(&value.id) {
+            value.static_type_class = go_static_type_class(
+                *node,
+                context.prepared.source(),
+                context.named_type_definitions,
+                node.start_byte(),
+            );
+        }
+    }
+    for call in &parts.call_sites {
+        for ordinal in 0..call
+            .normal_results
+            .len()
+            .max(usize::from(call.result.is_some()))
+        {
+            if let Some(result) = call.normal_result(ordinal) {
+                let value = &mut parts.values[result.index()];
+                if value.static_type_class == StaticTypeClass::Unknown {
+                    value.static_type_origin = Some(StaticTypeOrigin::CallResult {
+                        call: call.id,
+                        ordinal: ordinal as u32,
+                    });
+                }
+            }
+        }
+    }
+    // These pairs were selected by type-preserving lowering sites, never by
+    // generic value-dependence edges. Iterate because CFG lowering schedules
+    // expressions after binding writes.
+    for _ in 0..parts.values.len() {
+        let mut changed = false;
+        for &(source, target) in &context.static_type_copies {
+            if context.static_type_invalidated.contains(&source) {
+                changed |= context.static_type_invalidated.insert(target);
+                continue;
+            }
+            if context.static_type_invalidated.contains(&target) {
+                continue;
+            }
+            let class = parts.values[source.index()].static_type_class;
+            let origin = parts.values[source.index()].static_type_origin.clone();
+            let target = &mut parts.values[target.index()];
+            if target.static_type_class == StaticTypeClass::Unknown
+                && target.static_type_origin.is_none()
+                && (class != StaticTypeClass::Unknown || origin.is_some())
+            {
+                target.static_type_class = class;
+                target.static_type_origin = origin;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for value in &mut parts.values {
+        if context.static_type_invalidated.contains(&value.id) {
+            value.static_type_class = StaticTypeClass::Unknown;
+            value.static_type_origin = None;
+        }
+    }
+    // Named results, type parameters and nested function literals keep every
+    // class Refused: bare returns, defers over named results and captures
+    // record gaps or stay unclaimed.
+    if top_level_declaration
+        && spec
+            .callable
+            .child_by_field_name("type_parameters")
+            .is_none()
+        && spec
+            .callable
+            .child_by_field_name("result")
+            .is_none_or(go_unnamed_result_syntax)
+    {
+        use FootprintClass as Class;
+        use FootprintDisposition as Disposition;
+        let absent = Disposition::Excluded(FootprintExclusion::NoInstance);
+        context
+            .session
+            .footprint_class(Class::NestedCallableOwnership, absent);
+        context.session.footprint_classes_from_rows(
+            &parts,
+            &[
+                Class::MemoryWrite,
+                Class::DeferredExecution,
+                Class::MemoryRead,
+                Class::StaticGlobal,
+            ],
+        );
+        // Every publication goes through a return statement, which the
+        // source-boundary account must claim. A multi-value return carries
+        // `ProcedureReturn { value: None }`, and a return statement can be
+        // unreachable or lowered without a row, so a callable with results is
+        // Represented whatever rows are present. The rows decide only for a
+        // callable without results.
+        if context
+            .declared_result_types
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
+            context
+                .session
+                .footprint_classes_from_rows(&parts, &[Class::PublicationEscape]);
+        } else {
+            context
+                .session
+                .footprint_class(Class::PublicationEscape, Disposition::Represented);
+        }
+        // A supported defer pushes one cleanup region that runs its deferred
+        // call on every return, fall-off and panic route; an unsupported defer
+        // pushes none and its syntax stays unclaimed.
+        let cleanup = if context.cleanups.is_empty() {
+            absent
+        } else {
+            Disposition::Represented
+        };
+        context
+            .session
+            .footprint_class(Class::CleanupDropUnwind, cleanup);
+        // This class covers conversions and initializations. Every Go
+        // initialization this lowering claims is lowered (short var, typed
+        // var, zero-value var); an unclaimed one refuses the boundary, so
+        // Represented holds. NoInstance would affirm that no initialization
+        // occurs.
+        context
+            .session
+            .footprint_class(Class::ConversionInitialization, Disposition::Represented);
+        context
+            .session
+            .footprint_class(Class::NormalExit, Disposition::Represented);
+        // The IR emits an exceptional-exit marker even without a call.
+        context
+            .session
+            .footprint_class(Class::ExceptionalExit, Disposition::Represented);
+        for class in [Class::NestedCall, Class::CallTarget] {
+            context.session.footprint_class(
+                class,
+                if parts.call_sites.is_empty() {
+                    absent
+                } else {
+                    Disposition::Represented
+                },
+            );
+        }
+    }
+    let predeclared_dispositions = &context.predeclared_dispositions;
+    let literal_dispositions = &context.literal_dispositions;
+    context
+        .session
+        .assemble_footprint(&mut parts, spec.callable, |node| {
+            if matches!(node.kind(), "nil" | "true" | "false") {
+                let disposition = predeclared_dispositions.get(&node.id()).copied().unwrap_or(
+                    CallControlDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
+                );
+                (CallControlKind::Syntax, disposition)
+            } else if matches!(
+                node.kind(),
+                "composite_literal" | "literal_value" | "literal_element" | "keyed_element"
+            ) {
+                // Only a literal that lowering models is classified; the
+                // default refuses, so no unconditional arm admits a literal.
+                let kind = if node.kind() == "composite_literal" {
+                    CallControlKind::InitializationConversion
+                } else {
+                    CallControlKind::Syntax
+                };
+                let disposition = literal_dispositions.get(&node.id()).copied().unwrap_or(
+                    CallControlDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
+                );
+                (kind, disposition)
+            } else {
+                go_call_control_branch(node)
+            }
+        });
     let pointer_rows = add_go_pointer_facts(&mut parts, context.addressed_places);
     work = work.conservative_add(SemanticWork {
         nested_entries: pointer_rows,
@@ -5390,24 +5843,144 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
+        prepass_formal_layout_available: bool,
     ) -> Result<(), GoLoweringError> {
-        let layout =
-            formal_parameter_slots_for_owner(Language::Go, callable, self.prepared.source())
-                .unwrap_or_default();
+        if self.session.cancellation().is_cancelled() {
+            return Err(GoLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = formal_parameter_slots_for_owner_with_nodes(
+            Language::Go,
+            callable,
+            self.prepared.source(),
+        );
+        if self.session.cancellation().is_cancelled() {
+            return Err(GoLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        if !prepass_formal_layout_available || slots.is_none() {
+            self.session
+                .footprint_formal_slots(Err(FootprintRefusal::FormalSlotsUnavailable));
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::ParameterFlow,
+                SemanticGapKind::Unknown,
+                "Go callable parameter layout is unavailable from source syntax",
+            )?;
+        }
+        let Some(slots) = slots else {
+            return Ok(());
+        };
+        if prepass_formal_layout_available {
+            self.session.footprint_formal_slots(Ok(slots.len()));
+        }
+        // Ordinary named value and pointer formals have the same source
+        // ownership: the loop below lowers each slot and its type syntax.
+        if matches!(
+            callable.kind(),
+            "function_declaration" | "method_declaration"
+        ) && callable.child_by_field_name("type_parameters").is_none()
+            && callable.child_by_field_name("result").is_none_or(|result| {
+                go_unnamed_result_syntax(result)
+                    && go_callable_result_types(callable).is_some_and(|types| {
+                        types
+                            .iter()
+                            .all(|ty| matches!(ty.kind(), "pointer_type" | "type_identifier"))
+                    })
+            })
+            && let Some(name) = callable.child_by_field_name("name")
+            && let Some(parameters) = callable.child_by_field_name("parameters")
+            && slots.iter().all(|(slot, declaration)| {
+                slot.variadic.is_none()
+                    && declaration
+                        .child_by_field_name("type")
+                        .is_some_and(|ty| matches!(ty.kind(), "pointer_type" | "type_identifier"))
+                    && named_children(*declaration).iter().all(|child| {
+                        matches!(
+                            child.kind(),
+                            "identifier" | "pointer_type" | "type_identifier"
+                        )
+                    })
+            })
+        {
+            self.session
+                .footprint_register(callable, BoundaryDisposition::Lowered);
+            self.session
+                .footprint_consume_subtree(name, BranchClass::Identifier);
+            self.session
+                .footprint_register(parameters, BoundaryDisposition::Lowered);
+            // The receiver declaration is one of the slots below.
+            if let Some(receiver) = callable.child_by_field_name("receiver") {
+                self.session
+                    .footprint_register(receiver, BoundaryDisposition::Lowered);
+            }
+            for (_, declaration) in &slots {
+                self.session
+                    .footprint_consume_subtree(*declaration, BranchClass::Type);
+            }
+            // Result types are inert type syntax. A return statement that
+            // publishes a result is claimed on its own.
+            if let Some(result) = callable.child_by_field_name("result") {
+                self.session
+                    .footprint_consume_subtree(result, BranchClass::Type);
+            }
+            self.session.footprint_class(
+                FootprintClass::SignatureAttributesTransforms,
+                FootprintDisposition::Represented,
+            );
+        } else if matches!(
+            callable.kind(),
+            "function_declaration" | "method_declaration"
+        ) && callable.child_by_field_name("type_parameters").is_none()
+            && callable.child_by_field_name("body").is_some()
+            && let Some(name) = callable.child_by_field_name("name")
+            && let Some(parameters) = callable.child_by_field_name("parameters")
+            && slots.iter().all(|(slot, declaration)| {
+                slot.variadic.is_none()
+                    && declaration
+                        .child_by_field_name("type")
+                        .is_some_and(|ty| matches!(ty.kind(), "pointer_type" | "type_identifier"))
+                    && named_children(*declaration).iter().all(|child| {
+                        matches!(
+                            child.kind(),
+                            "identifier" | "pointer_type" | "type_identifier"
+                        )
+                    })
+            })
+            && callable
+                .child_by_field_name("result")
+                .is_none_or(go_unnamed_result_syntax)
+        {
+            // The scoped call/control proof also admits result types the full
+            // claim above does not accept: the loop below lowers every slot,
+            // and result types are syntax with no call or control effect.
+            self.session.footprint_refuse_node_for_scoped(callable);
+            self.session.footprint_refuse_subtree_for_scoped(name);
+            self.session.footprint_refuse_node_for_scoped(parameters);
+            if let Some(receiver) = callable.child_by_field_name("receiver") {
+                self.session.footprint_refuse_node_for_scoped(receiver);
+            }
+            for (_, declaration) in &slots {
+                self.session
+                    .footprint_refuse_subtree_for_scoped(*declaration);
+            }
+            if let Some(result) = callable.child_by_field_name("result") {
+                self.session.footprint_refuse_subtree_for_scoped(result);
+            }
+        }
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
+        for (slot, declaration) in slots {
             if self.session.cancellation().is_cancelled() {
                 return Err(GoLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            let declaration = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
             let mapping_node = slot
                 .names
                 .first()
@@ -5424,7 +5997,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: true },
+                    SemanticValueKind::Receiver {
+                        dispatch: true,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(value);
                 value
@@ -6793,24 +7369,63 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         target: ValueId,
         kind: ValueFlowKind,
     ) -> Result<(), GoLoweringError> {
-        let interface_destination =
-            self.value_type_nodes
-                .get(&target)
-                .copied()
-                .is_some_and(|type_node| {
-                    self.type_is_empty_interface(type_node, type_node.start_byte())
-                });
+        let interface_destination = self
+            .value_type_nodes
+            .get(&target)
+            .copied()
+            .is_some_and(|type_node| self.type_is_interface(type_node, type_node.start_byte()));
         let exact_interface_reference = interface_destination
             || self
                 .reference_boxing_initializers
                 .contains(&source_node.id());
-        let converted =
-            if exact_interface_reference && self.expression_is_reference_value(source_node) {
-                self.reference_boxing_value(builder, point, source_node, source)?
-            } else {
-                self.assignment_conversion_value(builder, point, source_node, source)?
-            };
+        let converted = if exact_interface_reference
+            && self.binding_source_is_reference_value(source_node, source)
+        {
+            self.reference_boxing_value(builder, point, source_node, source)?
+        } else {
+            let converted =
+                self.assignment_conversion_value(builder, point, source_node, source)?;
+            if source_node.kind() == "call_expression"
+                && self
+                    .multi_result_values
+                    .get(&source_node.id())
+                    .is_some_and(|values| values.contains(&source))
+                && let Some(type_node) = self.value_type_nodes.get(&target).copied()
+            {
+                self.record_declared_type_value_facts(type_node, converted);
+            }
+            converted
+        };
         self.append_binding_assignment(builder, point, target, converted, kind)
+    }
+
+    fn binding_source_is_reference_value(&self, node: Node<'tree>, value: ValueId) -> bool {
+        if matches!(
+            node.kind(),
+            "index_expression" | "type_assertion_expression"
+        ) && self
+            .multi_result_values
+            .get(&node.id())
+            .is_some_and(|values| values.get(1) == Some(&value))
+        {
+            return false;
+        }
+        if node.kind() == "call_expression"
+            && self
+                .multi_result_values
+                .get(&node.id())
+                .is_some_and(|values| values.contains(&value))
+        {
+            return self.value_type_nodes.get(&value).is_some_and(|type_node| {
+                go_type_is_reference(
+                    *type_node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    type_node.start_byte(),
+                )
+            });
+        }
+        self.expression_is_reference_value(node)
     }
 
     fn expression_is_reference_value(&self, node: Node<'tree>) -> bool {
@@ -6947,11 +7562,26 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     /// them a later member read cannot resolve its declaration, which is how
     /// a comma-ok assertion result previously lost its field identities.
     fn record_expression_value_facts(&mut self, node: Node<'tree>, value: ValueId) {
+        if matches!(
+            node.kind(),
+            "type_assertion_expression"
+                | "selector_expression"
+                | "index_expression"
+                | "receive_expression"
+                | "binary_expression"
+                | "unary_expression"
+        ) {
+            self.static_type_invalidated.insert(value);
+        }
         if let Some(identity) = self.expression_type_identity(node, node.start_byte()) {
             self.value_types.insert(value, identity);
         }
         if let Some(type_node) = self.expression_type_node(node, node.start_byte()) {
-            self.value_type_nodes.insert(value, type_node);
+            if node.kind() == "call_expression" && self.call_result_type_node(node).is_some() {
+                self.record_declared_type_value_facts(type_node, value);
+            } else {
+                self.value_type_nodes.insert(value, type_node);
+            }
         }
         if let Some(storage) = self.expression_storage_kind(node, node.start_byte()) {
             self.value_storage_kinds.insert(value, storage);
@@ -6977,10 +7607,39 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
     }
 
-    /// A same-file, unshadowed, nongeneric function states its single result
-    /// type in the declaration. Keep that type on the call result so a later
-    /// member read uses the declaration's field identity.
-    fn call_result_type_node(&self, call: Node<'tree>) -> Option<Node<'tree>> {
+    fn record_declared_type_value_facts(&mut self, type_node: Node<'tree>, value: ValueId) {
+        let byte = type_node.start_byte();
+        self.value_type_nodes.insert(value, type_node);
+        if let Some(identity) = self.type_identity(type_node) {
+            self.value_types.insert(value, identity);
+        }
+        if let Some(storage) = self.type_storage_kind(type_node, byte) {
+            self.value_storage_kinds.insert(value, storage);
+        }
+        let copy = go_index_value_copy_from_type(
+            type_node,
+            self.prepared.source(),
+            self.named_type_definitions,
+            byte,
+        );
+        if copy != MemoryValueCopy::Unknown {
+            self.index_value_copies.insert(value, copy);
+        }
+        if let Some(identity) = self.index_value_type_from_type(type_node) {
+            self.index_value_types.insert(value, identity);
+        }
+        if let Some(copy) = self.channel_payload_copy_from_type(type_node, byte) {
+            self.channel_payload_copies.insert(value, copy);
+        }
+        if let Some(identity) = self.channel_payload_type_from_type(type_node, byte) {
+            self.channel_payload_types.insert(value, identity);
+        }
+    }
+
+    /// A same-file, unshadowed, nongeneric function states its result types in
+    /// the declaration. Keep them on the call results so a later member read
+    /// uses the declaration's field identity.
+    fn call_result_type_nodes(&self, call: Node<'tree>) -> Option<Vec<Node<'tree>>> {
         let function = transparent_parenthesized_expression(call.child_by_field_name("function")?);
         if function.kind() != "identifier" {
             return None;
@@ -6990,11 +7649,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return None;
         }
         let (_, declaration) = self.package_functions.get(name).copied().flatten()?;
-        if declaration.child_by_field_name("type_parameters").is_some() {
-            return None;
-        }
-        let results = go_callable_result_types(declaration)?;
-        match results.as_slice() {
+        declared_callable_result_types(declaration)
+    }
+
+    /// The declared result type of a call with exactly one result.
+    fn call_result_type_node(&self, call: Node<'tree>) -> Option<Node<'tree>> {
+        match self.call_result_type_nodes(call)?.as_slice() {
             [result] => Some(*result),
             _ => None,
         }
@@ -7135,6 +7795,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             assert_eq!(values.len(), count, "one Go call has one result arity");
             return Ok(values.clone());
         }
+        let result_types = (call.kind() == "call_expression")
+            .then(|| self.call_result_type_nodes(call))
+            .flatten();
         let mut values = Vec::with_capacity(count);
         for index in 0..count {
             // The comma-ok assertion is a two-result expression like a call:
@@ -7165,6 +7828,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 // member read through the narrowed value needs that type to
                 // resolve its field declaration.
                 self.record_expression_value_facts(call, value);
+            }
+            if let Some(type_node) = result_types.as_ref().and_then(|types| types.get(index)) {
+                self.record_declared_type_value_facts(*type_node, value);
             }
             values.push(value);
         }
@@ -7215,6 +7881,128 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             .flatten()
             .find(|definition| definition.declaration == declaration)
             .copied()
+    }
+
+    fn types_identical(&self, left: Node<'tree>, right: Node<'tree>) -> bool {
+        let mut pending = vec![(left, right)];
+        while let Some((left, right)) = pending.pop() {
+            let left = transparent_parenthesized_expression(left);
+            let right = transparent_parenthesized_expression(right);
+            if let Some(identity) = self.type_identity(left) {
+                if self.type_identity(right).as_ref() != Some(&identity) {
+                    return false;
+                }
+                continue;
+            }
+            if left.kind() != right.kind() || left.child_count() != right.child_count() {
+                return false;
+            }
+            if left.child_count() == 0
+                && node_text(self.prepared.source(), left)
+                    != node_text(self.prepared.source(), right)
+            {
+                return false;
+            }
+            for index in 0..left.child_count() {
+                pending.push((left.child(index).unwrap(), right.child(index).unwrap()));
+            }
+        }
+        true
+    }
+
+    // Go permits assignment between a defined type and an unnamed type
+    // with identical underlying structure, without changing storage identity.
+    /// Whether lowering a typed binding needs the source's declared type: an
+    /// interface target boxes a reference payload, and a container target
+    /// keeps its backing store. A pointer or another non-container type does
+    /// not; for those, the query-time typed-var identity proof reads the
+    /// callee's result types. A type this file cannot classify needs it.
+    fn binding_depends_on_source_type(&self, target: Node<'tree>) -> bool {
+        let mut target = target;
+        loop {
+            match target.kind() {
+                "pointer_type" => return false,
+                "parenthesized_type" => {
+                    let Some(inner) = first_named_child_matching(target, |child| !child.is_extra())
+                    else {
+                        return true;
+                    };
+                    target = inner;
+                }
+                "type_identifier" => {
+                    let Some(name) = node_text(self.prepared.source(), target) else {
+                        return true;
+                    };
+                    match self.file_underlying_type(target, target.start_byte()) {
+                        Some(underlying) if underlying != target => target = underlying,
+                        _ => {
+                            return !is_predeclared_go_type(name)
+                                || matches!(name, "any" | "error");
+                        }
+                    }
+                }
+                _ => return true,
+            }
+        }
+    }
+
+    /// Whether assigning a value of type `source` to `target` keeps the value's
+    /// identity: `Some(true)` for identical types, `Some(false)` for a known
+    /// conversion (boxing, or a defined type with literal underlying structure),
+    /// and `None` when this file cannot decide.
+    fn assignment_preserves_type_identity(
+        &self,
+        source: Node<'tree>,
+        target: Node<'tree>,
+    ) -> Option<bool> {
+        let source =
+            go_resolve_type_aliases(source, self.prepared.source(), self.named_type_definitions)?;
+        let target =
+            go_resolve_type_aliases(target, self.prepared.source(), self.named_type_definitions)?;
+        if self.types_identical(source, target) {
+            return Some(true);
+        }
+        if self.type_is_interface(target, target.start_byte()) {
+            // Assigning an interface to another copies the interface value,
+            // so its dynamic payload keeps its identity. A source known not
+            // to be an interface is boxed, and the binding holds the box. A
+            // source this file cannot classify stays unresolved: an imported
+            // or qualified type, a type parameter, and the predeclared `error`,
+            // which these helpers do not yet treat as an interface (#10436).
+            if self.type_is_interface(source, source.start_byte()) {
+                return Some(true);
+            }
+            let known_non_interface = match source.kind() {
+                "qualified_type" | "generic_type" => false,
+                "type_identifier" => match self.file_underlying_type(source, source.start_byte()) {
+                    Some(underlying) if underlying != source => true,
+                    _ => node_text(self.prepared.source(), source).is_some_and(|name| {
+                        is_predeclared_go_type(name) && !matches!(name, "error" | "any")
+                    }),
+                },
+                _ => true,
+            };
+            return known_non_interface.then_some(false);
+        }
+        // Otherwise Go assigns between non-identical types only when their
+        // underlying types are identical and one side is unnamed. Any other
+        // non-identity in compiling code means a type this file cannot
+        // resolve, such as an imported alias or an alias inside a type
+        // literal, so identity is unresolved, not converted.
+        let is_named = |node: Node<'tree>| {
+            matches!(
+                node.kind(),
+                "type_identifier" | "qualified_type" | "generic_type"
+            )
+        };
+        for (named, literal) in [(source, target), (target, source)] {
+            if is_named(named) && !is_named(literal) {
+                let underlying = self.file_underlying_type(named, named.start_byte())?;
+                return (underlying != named && self.types_identical(underlying, literal))
+                    .then_some(true);
+            }
+        }
+        None
     }
 
     fn type_identity(&self, node: Node<'tree>) -> Option<GoTypeIdentity> {
@@ -7288,13 +8076,283 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         )
     }
 
-    fn type_is_empty_interface(&self, node: Node<'tree>, byte: usize) -> bool {
-        go_type_is_empty_interface(
+    /// Whether a binding of this declared type boxes its value: a same-file
+    /// interface or `any`. The predeclared `error` is not recognized yet
+    /// (#10436), so an `error` destination stays unresolved.
+    fn type_is_interface(&self, node: Node<'tree>, byte: usize) -> bool {
+        go_type_is_interface(
             node,
             self.prepared.source(),
             self.named_type_definitions,
             byte,
         )
+    }
+
+    /// Whether a declared type is provably not an interface: a same-file or
+    /// predeclared type whose underlying type this file resolves to a
+    /// concrete shape. A qualified, type-parameter or unresolvable type, the
+    /// predeclared `error`, `any` and `comparable`, and a shadowed predeclared
+    /// name are all unknown, so they are not.
+    fn type_is_known_non_interface(&self, node: Node<'tree>) -> bool {
+        let Some(underlying) = self.file_underlying_type(node, node.start_byte()) else {
+            return false;
+        };
+        match underlying.kind() {
+            "pointer_type"
+            | "slice_type"
+            | "map_type"
+            | "channel_type"
+            | "array_type"
+            | "implicit_length_array_type"
+            | "struct_type"
+            | "function_type" => true,
+            "type_identifier" => self.type_is_predeclared_basic(underlying),
+            _ => false,
+        }
+    }
+
+    /// Whether an identifier is one of Go's unshadowed predeclared basic types.
+    fn type_is_predeclared_basic(&self, node: Node<'tree>) -> bool {
+        node.kind() == "type_identifier"
+            && node_text(self.prepared.source(), node).is_some_and(|name| {
+                is_predeclared_go_basic_type(name)
+                    && !self.package_shadowing.shadows(name)
+                    && self
+                        .visible_named_type_definition(name, node.start_byte())
+                        .is_none()
+            })
+    }
+
+    /// The declared type syntax of an expression's value, when this file
+    /// states one. A variadic formal binds a slice but records its element
+    /// type, so it states nothing here.
+    fn expression_declared_type(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let type_node = self.expression_type_node(node, node.start_byte())?;
+        type_node
+            .parent()
+            .is_none_or(|parent| parent.kind() != "variadic_parameter_declaration")
+            .then_some(type_node)
+    }
+
+    /// Whether an expression's static type is provably not an interface: a
+    /// basic literal, an unshadowed `true` or `false`, or a value whose
+    /// declared type is.
+    fn expression_is_known_non_interface(&self, node: Node<'tree>) -> bool {
+        let node = transparent_parenthesized_expression(node);
+        match node.kind() {
+            "true" | "false" => self.predeclared_constant_has_builtin_meaning(node),
+            kind if is_go_literal_value_kind(kind) => true,
+            _ => self
+                .expression_declared_type(node)
+                .is_some_and(|kind| self.type_is_known_non_interface(kind)),
+        }
+    }
+
+    /// Whether storing a value of `source` type in a place of `target` type
+    /// introduces no implicit conversion that lowering would have to represent
+    /// (G2 does not represent interface boxing): the target is provably not an
+    /// interface, or the two types are the same.
+    fn assignment_needs_no_conversion(
+        &self,
+        target: Option<Node<'tree>>,
+        source: Option<Node<'tree>>,
+    ) -> bool {
+        let Some(target) = target else {
+            return false;
+        };
+        self.type_is_known_non_interface(target)
+            || source.is_some_and(|source| {
+                self.assignment_preserves_type_identity(source, target) == Some(true)
+            })
+    }
+
+    /// [`Self::assignment_needs_no_conversion`] for a source expression. The
+    /// unshadowed `nil` converts to any pointer-shaped or interface target
+    /// without boxing anything.
+    fn expression_needs_no_conversion(
+        &self,
+        target: Option<Node<'tree>>,
+        source: Node<'tree>,
+    ) -> bool {
+        let source = transparent_parenthesized_expression(source);
+        (source.kind() == "nil" && self.predeclared_constant_has_builtin_meaning(source))
+            || self.assignment_needs_no_conversion(target, self.expression_declared_type(source))
+    }
+
+    /// Whether `left == right` or `left != right` can never panic. Comparing
+    /// two interface values (or aggregates holding them) panics when both hold
+    /// the same non-comparable dynamic type, so one operand must be `nil`, a
+    /// literal, or a value whose declared type is a predeclared scalar, a
+    /// pointer or a channel.
+    fn comparison_cannot_panic(&self, node: Node<'tree>) -> bool {
+        [
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|operand| {
+            let operand = transparent_parenthesized_expression(operand);
+            match operand.kind() {
+                "nil" | "true" | "false" => self.predeclared_constant_has_builtin_meaning(operand),
+                kind if is_go_literal_value_kind(kind) => true,
+                _ => self.expression_declared_type(operand).is_some_and(|kind| {
+                    self.file_underlying_type(kind, kind.start_byte())
+                        .is_some_and(|underlying| match underlying.kind() {
+                            "pointer_type" | "channel_type" => true,
+                            "type_identifier" => self.type_is_predeclared_basic(underlying),
+                            _ => false,
+                        })
+                }),
+            }
+        })
+    }
+
+    /// The declared parameter slots of a call to a same-file, unshadowed
+    /// package function. A generic function's type-parameter slots are not
+    /// known non-interface types, so an argument passed to one refuses.
+    fn direct_callee_parameters(
+        &self,
+        call: Node<'tree>,
+    ) -> Option<Vec<GoMethodParameterType<'tree>>> {
+        let function = transparent_parenthesized_expression(call.child_by_field_name("function")?);
+        if function.kind() != "identifier" {
+            return None;
+        }
+        let name = nonempty_node_text(self.prepared.source(), function)?;
+        if self.binding_value(name, function.start_byte()).is_some() {
+            return None;
+        }
+        let (_, declaration) = self.package_functions.get(name).copied().flatten()?;
+        go_method_parameter_types(declaration.child_by_field_name("parameters")?)
+    }
+
+    /// Whether passing these identifier arguments to the call's parameters
+    /// introduces no implicit conversion. A builtin that converts its operands
+    /// does.
+    fn direct_call_needs_no_conversion(
+        &self,
+        call: Node<'tree>,
+        arguments: &[Node<'tree>],
+    ) -> bool {
+        if arguments.is_empty() {
+            return true;
+        }
+        if let Some(builtin) = self.builtin_call_kind(call) {
+            return matches!(
+                builtin,
+                GoBuiltinCall::Cap
+                    | GoBuiltinCall::Clear
+                    | GoBuiltinCall::Close
+                    | GoBuiltinCall::Complex
+                    | GoBuiltinCall::Copy
+                    | GoBuiltinCall::Imag
+                    | GoBuiltinCall::Len
+                    | GoBuiltinCall::Max
+                    | GoBuiltinCall::Min
+                    | GoBuiltinCall::Real
+            );
+        }
+        // A callee this file does not state (another file of the package or a
+        // function value) keeps its call-target obligation, which carries the
+        // question of its parameter types to the query that resolves it.
+        let Some(parameters) = self.direct_callee_parameters(call) else {
+            return true;
+        };
+        arguments.iter().enumerate().all(|(index, argument)| {
+            parameters
+                .get(index)
+                .or_else(|| parameters.last().filter(|parameter| parameter.variadic))
+                .is_some_and(|parameter| {
+                    self.expression_needs_no_conversion(Some(parameter.node), *argument)
+                })
+        })
+    }
+
+    /// Whether a return statement's operands convert to the declared results
+    /// with nothing to represent: each operand pairs with its result type, or
+    /// a sole call supplies every result.
+    fn return_needs_no_conversion(&self, values: &[Node<'tree>]) -> bool {
+        if values.is_empty() {
+            return true;
+        }
+        let Some(results) = self.declared_result_types.as_deref() else {
+            return false;
+        };
+        if values.len() == results.len() {
+            return values
+                .iter()
+                .zip(results)
+                .all(|(value, result)| self.expression_needs_no_conversion(Some(*result), *value));
+        }
+        let [call] = values else {
+            return false;
+        };
+        let Some(sources) = (call.kind() == "call_expression")
+            .then(|| self.call_result_type_nodes(*call))
+            .flatten()
+            .filter(|sources| sources.len() == results.len())
+        else {
+            return false;
+        };
+        sources.iter().zip(results).all(|(source, result)| {
+            self.assignment_needs_no_conversion(Some(*result), Some(*source))
+        })
+    }
+
+    /// Whether a simple `=` or `:=` whose targets are all identifiers
+    /// converts nothing the boundary point would have to represent. A blank
+    /// target and a newly declared variable take the source's own type.
+    fn identifier_assignment_needs_no_conversion(
+        &self,
+        node: Node<'tree>,
+        targets: &[Node<'tree>],
+        sources: &[Node<'tree>],
+    ) -> bool {
+        let target_type = |target: Node<'tree>| -> Option<Option<Node<'tree>>> {
+            let name = node_text(self.prepared.source(), target)?;
+            if name == "_" {
+                return None;
+            }
+            if node.kind() == "short_var_declaration"
+                && self
+                    .local_declaration_value(name, target.start_byte())
+                    .is_some()
+            {
+                return None;
+            }
+            let value = self.binding_value(name, node.start_byte());
+            if value.is_some_and(|value| self.non_interface_locals.contains(&value)) {
+                return None;
+            }
+            Some(value.and_then(|value| self.value_type_nodes.get(&value).copied()))
+        };
+        if targets.len() == sources.len() {
+            return targets.iter().zip(sources).all(|(target, source)| {
+                target_type(*target)
+                    .is_none_or(|kind| self.expression_needs_no_conversion(kind, *source))
+            });
+        }
+        let [source] = sources else {
+            return false;
+        };
+        let source_types = match source.kind() {
+            "call_expression" => self.call_result_type_nodes(*source),
+            "type_assertion_expression" => source
+                .child_by_field_name("type")
+                .map(|asserted| vec![asserted]),
+            _ => None,
+        };
+        targets.iter().enumerate().all(|(index, target)| {
+            target_type(*target).is_none_or(|kind| {
+                self.assignment_needs_no_conversion(
+                    kind,
+                    source_types
+                        .as_ref()
+                        .and_then(|types| types.get(index).copied()),
+                )
+            })
+        })
     }
 
     fn expression_type_identity(&self, node: Node<'tree>, byte: usize) -> Option<GoTypeIdentity> {
@@ -7936,37 +8994,21 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 let index_node = required_field(place, "index")?;
                 let base =
                     self.expression_value(builder, operand, self.expression_value_kind(operand))?;
-                let constant_index = self.canonical_integer_index_value(builder, index_node)?;
-                let index = match constant_index {
-                    Some((value, _)) => value,
-                    None => self.expression_value(
-                        builder,
-                        index_node,
-                        self.expression_value_kind(index_node),
-                    )?,
-                };
                 let value_copy = self.expression_index_value_copy(operand, operand.start_byte());
-                let location = self.session.add_memory_location_with_value_copy(
-                    builder,
-                    point,
-                    MemoryLocationKind::Index {
-                        base,
-                        index: Some(index),
-                        constant_index: constant_index.map(|(_, magnitude)| magnitude),
-                        identity: if self.expression_storage_kind(operand, operand.start_byte())
-                            == Some(GoStorageKind::Map)
-                        {
-                            brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Aggregate
-                        } else {
-                            brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element
-                        },
-                    },
-                    value_copy,
+                let identity = if self.expression_storage_kind(operand, operand.start_byte())
+                    == Some(GoStorageKind::Map)
+                {
+                    IndexedLocationIdentity::Aggregate
+                } else {
+                    IndexedLocationIdentity::Element
+                };
+                let (location, index, exact) = self.index_memory_location(
+                    builder, point, base, index_node, identity, value_copy,
                 )?;
                 Ok(Some((
                     MemoryAccessKind::Index,
                     location,
-                    Some((index, constant_index.is_some())),
+                    Some((index, exact)),
                 )))
             }
             "unary_expression" if unary_operator_kind(place) == Some("*") => {
@@ -8010,6 +9052,40 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             )?;
         }
         Ok(Some((kind, location)))
+    }
+
+    /// The location of the element that `index_node` selects in `base`, shared
+    /// by an index expression and a map literal entry so both name the same
+    /// location. Returns the index value and whether the index is an exact
+    /// integer literal.
+    fn index_memory_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        base: ValueId,
+        index_node: Node<'tree>,
+        identity: IndexedLocationIdentity,
+        value_copy: MemoryValueCopy,
+    ) -> Result<(MemoryLocationId, ValueId, bool), GoLoweringError> {
+        let constant_index = self.canonical_integer_index_value(builder, index_node)?;
+        let index = match constant_index {
+            Some((value, _)) => value,
+            None => {
+                self.expression_value(builder, index_node, self.expression_value_kind(index_node))?
+            }
+        };
+        let location = self.session.add_memory_location_with_value_copy(
+            builder,
+            point,
+            MemoryLocationKind::Index {
+                base,
+                index: Some(index),
+                constant_index: constant_index.map(|(_, magnitude)| magnitude),
+                identity,
+            },
+            value_copy,
+        )?;
+        Ok((location, index, constant_index.is_some()))
     }
 
     /// Reuse one procedure-local value for each structured integer-literal
@@ -8587,31 +9663,34 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         self.schedule_expressions(builder, entry, &arguments, next, scope, stack)
     }
 
+    /// Returns whether the read has a lowered source: a binding or a package
+    /// static load.
     fn emit_lexical_input_flow(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
         point: ProgramPointId,
         target: ValueId,
-    ) -> Result<(), GoLoweringError> {
+    ) -> Result<bool, GoLoweringError> {
         let Some(name) = node_text(self.prepared.source(), node) else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(source) = self.binding_value(name, node.start_byte()) else {
-            if let Some(location) = self.package_static_location(builder, point, node, name)? {
-                let metadata = self.session.add_value_mapping(builder, node)?;
-                self.session.append_effect_with_metadata(
-                    builder,
-                    point,
-                    metadata,
-                    SemanticEffect::MemoryLoad {
-                        kind: MemoryAccessKind::Static,
-                        location,
-                        result: target,
-                    },
-                )?;
-            }
-            return Ok(());
+            let Some(location) = self.package_static_location(builder, point, node, name)? else {
+                return Ok(false);
+            };
+            let metadata = self.session.add_value_mapping(builder, node)?;
+            self.session.append_effect_with_metadata(
+                builder,
+                point,
+                metadata,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Static,
+                    location,
+                    result: target,
+                },
+            )?;
+            return Ok(true);
         };
         if let Some((location, kind)) = self.shared_binding_locations.get(&source).copied() {
             let metadata = self.session.add_value_mapping(builder, node)?;
@@ -8625,8 +9704,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     result: target,
                 },
             )?;
-            return Ok(());
+            return Ok(true);
         }
+        self.static_type_copies.push((source, target));
         let kind = if Some(source) == self.receiver {
             ValueFlowKind::Receiver
         } else if self.local_at(name, node.start_byte()) == Some(source)
@@ -8653,7 +9733,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 },
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn step(
@@ -8730,6 +9810,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         // A folded literal keeps exactly one arm. Recording the guard is what
         // keeps the fold legible: nothing else in the frozen artifact says the
         // branch was constant (#2443).
+        if node.kind() == "binary_expression" {
+            self.session.footprint_refuse_node_for_scoped(node);
+        }
         if let Some(value) = self.folded_boolean_constant(node) {
             let taken = if value { when_true } else { when_false };
             self.session.add_target_edge(builder, entry, taken)?;
@@ -8744,7 +9827,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
         let normalized_unary =
             if node.kind() == "unary_expression" && unary_operator_kind(node) == Some("!") {
-                let (operand, negated) = self.peel_condition_wrappers(node)?;
+                let mut wrappers = Vec::new();
+                let (operand, negated) =
+                    self.peel_condition_wrappers_visiting(node, |wrapper| wrappers.push(wrapper))?;
                 let normalized = self.normalize_peeled_condition(builder, operand, negated)?;
                 if normalized.is_none() {
                     // With no normalized outer predicate, negation changes the
@@ -8756,6 +9841,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     } else {
                         (when_true, when_false)
                     };
+                    // Each peeled negation or parenthesis only swaps or keeps
+                    // the arms; the terminal operand claims itself.
+                    for wrapper in wrappers {
+                        self.session
+                            .footprint_register(wrapper, BoundaryDisposition::Lowered);
+                    }
                     stack.push(Work::Condition {
                         node: operand,
                         entry,
@@ -8790,6 +9881,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
         match (node.kind(), go_boolean_operator_kind(node)) {
             ("binary_expression", Some(operator @ ("&&" | "||"))) => {
+                // Short-circuit control edges; the operands are conditions
+                // that claim themselves.
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
                 let right_entry = self.session.add_node_point(builder, right, Vec::new())?;
@@ -8817,6 +9912,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 Ok(())
             }
             ("parenthesized_expression", _) => {
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 let value =
                     first_runtime_named_child(node).ok_or_else(|| missing_field(node, "value"))?;
                 stack.push(Work::Condition {
@@ -9479,11 +10576,20 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         &self,
         condition: Node<'tree>,
     ) -> Result<(Node<'tree>, bool), GoLoweringError> {
+        self.peel_condition_wrappers_visiting(condition, |_| {})
+    }
+
+    /// [`Self::peel_condition_wrappers`] that reports each wrapper it passes.
+    fn peel_condition_wrappers_visiting(
+        &self,
+        condition: Node<'tree>,
+        visit_wrapper: impl FnMut(Node<'tree>),
+    ) -> Result<(Node<'tree>, bool), GoLoweringError> {
         use brokk_bifrost_core::analyzer::language_knowledge::LanguageKnowledge;
         let syntax = brokk_bifrost_go::GoKnowledge
             .guard_condition_syntax()
             .expect("Go supplies guard grammar shapes");
-        peel_guard_condition(condition, syntax)
+        peel_guard_condition_visiting(condition, syntax, visit_wrapper)
             .map_err(|missing| missing_field(missing.node, missing.field))
     }
 
@@ -9617,14 +10723,20 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     ) -> Result<(), GoLoweringError> {
         match node.kind() {
             "block" => {
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 let children = named_children(node);
                 self.schedule_statements(builder, entry, &children, next, scope, stack)
             }
             "statement_list" => {
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 let children = named_children(node);
                 self.schedule_statements(builder, entry, &children, next, scope, stack)
             }
             "expression_statement" => {
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 let next = self.materialize_statement_next(builder, next, scope, stack)?;
                 let expressions = named_children(node);
                 self.note_deterministic_evaluation_order(builder, entry, node, &expressions)?;
@@ -9732,6 +10844,27 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), GoLoweringError> {
         let values = runtime_expression_children(node);
+        // Every effect of a return is a row or a gap: the operand flows,
+        // `ProcedureReturn`, the unwinding of cleanups, and a gap for each
+        // conversion or named-result shape it does not relate. Its operands
+        // are scheduled and claim themselves.
+        // An operand converted to an interface result is boxed, which the
+        // return flow does not represent, so such a return stays unclaimed.
+        let claimed = self.return_needs_no_conversion(&values);
+        if claimed {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+        }
+        self.session.footprint_refuse_node_for_scoped(node);
+        for list in named_children(node) {
+            if list.kind() == "expression_list" {
+                if claimed {
+                    self.session
+                        .footprint_register(list, BoundaryDisposition::Lowered);
+                }
+                self.session.footprint_refuse_node_for_scoped(list);
+            }
+        }
         let terminal = if values.is_empty() {
             entry
         } else {
@@ -9739,7 +10872,11 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         };
         let direct_multi_results = if let [source_node] = values.as_slice()
             && source_node.kind() == "call_expression"
-            && let Some(result_arity) = self.declared_result_arity.filter(|arity| *arity > 1)
+            && let Some(result_arity) = self
+                .declared_result_types
+                .as_ref()
+                .map(Vec::len)
+                .filter(|arity| *arity > 1)
         {
             Some(self.multi_result_values(builder, *source_node, result_arity)?)
         } else {
@@ -10092,6 +11229,23 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let mut evaluations = self.assignment_evaluation_nodes(node);
         let mut order_evaluations = self.assignment_order_evaluation_nodes(node);
         let boundary = self.session.add_node_point(builder, node, Vec::new())?;
+        // Identifier targets are written at the boundary point. Other targets
+        // and every right-hand operand need their own lowering claim.
+        self.session.footprint_refuse_node_for_scoped(node);
+        for side in ["left", "right"] {
+            if let Some(list) = node.child_by_field_name(side) {
+                self.session.footprint_refuse_node_for_scoped(list);
+            }
+        }
+        for target in node
+            .child_by_field_name("left")
+            .map(expression_sequence)
+            .unwrap_or_default()
+        {
+            if target.kind() == "identifier" {
+                self.session.footprint_refuse_node_for_scoped(target);
+            }
+        }
         let operator_is_simple = node.kind() == "short_var_declaration"
             || node
                 .child_by_field_name("operator")
@@ -10104,6 +11258,32 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             && left_items.len() == 1
             && right_items.len() == 1
             && is_go_binding_reference_kind(left_items[0].kind());
+        // A simple `=` or `:=` whose targets are all identifiers writes each
+        // one at the boundary point (a binding write, a static store, or a
+        // gap) and never schedules the target, so a target has no effect of
+        // its own. The right-hand items are scheduled and claim themselves.
+        // The write converts the source to the target's type; an interface
+        // target boxes it, which is not represented, so that stays unclaimed.
+        if operator_is_simple
+            && !left_items.is_empty()
+            && left_items
+                .iter()
+                .all(|target| target.kind() == "identifier")
+            && self.identifier_assignment_needs_no_conversion(node, &left_items, &right_items)
+        {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            for side in [left, right].into_iter().flatten() {
+                self.session
+                    .footprint_register(side, BoundaryDisposition::Lowered);
+            }
+            for target in &left_items {
+                self.session.footprint_register(
+                    *target,
+                    BoundaryDisposition::ExcludedNoEffect(BranchClass::Identifier),
+                );
+            }
+        }
         let multi_result_rhs = go_single_value_expression(&right_items);
         let multi_result_values = multi_result_rhs
             .filter(|rhs| {
@@ -10209,6 +11389,18 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                                 .is_some_and(|source_type| source_type == *target_type)
                         });
                     let kind = self.binding_flow_kind(name, target, node.end_byte());
+                    // A Go variable's static type is fixed by its declaration;
+                    // a later assignment converts the value to that type. Only
+                    // the declaring `:=` gives the binding its class and origin.
+                    let declares = node.kind() == "short_var_declaration"
+                        && self.local_declaration_value(name, name_node.start_byte())
+                            == Some(target);
+                    if declares {
+                        self.static_type_copies.push((value, target));
+                    }
+                    if declares && self.expression_is_known_non_interface(source_node) {
+                        self.non_interface_locals.insert(target);
+                    }
                     if identity_preserving {
                         self.append_binding_assignment(builder, boundary, target, value, kind)?;
                     } else {
@@ -10282,6 +11474,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                                 == Some(target);
                         let kind = self.binding_flow_kind(name, target, node.end_byte());
                         if newly_declared {
+                            self.static_type_copies.push((value, target));
                             self.append_binding_assignment(builder, boundary, target, value, kind)?;
                         } else {
                             // The intrafile call row does not publish the type of
@@ -10787,6 +11980,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         for spec in specs.iter().copied().skip(1) {
             entries.push(self.session.add_node_point(builder, spec, Vec::new())?);
         }
+        let mut all_specs_bound = true;
         for (index, spec) in specs.iter().copied().enumerate() {
             let spec_entry = entries[index];
             let spec_next = entries
@@ -10804,6 +11998,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             let mut unsupported = false;
             let mut saw_nonblank_target = false;
             let mut unresolved_any = false;
+            let mut bound_names = 0;
+            let mut recorded_gap = false;
             if values.is_empty() {
                 for name_node in &names {
                     let Some(name) = node_text(self.prepared.source(), *name_node) else {
@@ -10824,6 +12020,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             "typed Go zero-value declaration has no lowered local binding",
                         )?;
                         unresolved_any = true;
+                        recorded_gap = true;
                         continue;
                     };
                     if !self.value_types.contains_key(&target)
@@ -10841,6 +12038,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             "Go zero value for an unresolved declared type is not lowered",
                         )?;
                         unresolved_any = true;
+                        recorded_gap = true;
                         continue;
                     }
                     let zero_kind = if self
@@ -10881,6 +12079,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         ValueFlowKind::Local,
                     )?;
                     lowered_any = true;
+                    bound_names += 1;
                 }
             } else {
                 saw_nonblank_target |= names.iter().any(|name_node| {
@@ -10892,11 +12091,51 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             value.kind(),
                             "call_expression" | "type_assertion_expression"
                         ) || names.len() == 2 && self.is_map_index(*value))
-                        && spec.child_by_field_name("type").is_none()
                 });
                 if let Some(value) = multi_result_rhs {
                     let results = self.multi_result_values(builder, value, names.len())?;
-                    for (name_node, value) in names.iter().zip(results.iter().copied()) {
+                    let declared_type = spec.child_by_field_name("type");
+                    let result_types = (value.kind() == "call_expression")
+                        .then(|| self.call_result_type_nodes(value))
+                        .flatten();
+                    let identities = (0..names.len())
+                        .map(|ordinal| {
+                            // A blank destination binds nothing, so its
+                            // result's identity cannot affect the flow.
+                            if node_text(self.prepared.source(), names[ordinal]) == Some("_") {
+                                return Some(true);
+                            }
+                            declared_type.map_or(Some(true), |target| {
+                                match result_types
+                                    .as_ref()
+                                    .and_then(|types| types.get(ordinal).copied())
+                                {
+                                    Some(result) => {
+                                        self.assignment_preserves_type_identity(result, target)
+                                    }
+                                    // A callee in another file: the query-time
+                                    // typed-var identity proof reads its result
+                                    // types, unless the IR itself needs them.
+                                    None => (!self.binding_depends_on_source_type(target))
+                                        .then_some(false),
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if identities.iter().any(Option::is_none) {
+                        self.session.record_gap(
+                            builder,
+                            boundary,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::Assignments,
+                            SemanticGapKind::Unsupported,
+                            "Go typed multi-result var initialization has unresolved declared result or underlying types",
+                        )?;
+                        recorded_gap = true;
+                    }
+                    for (ordinal, (name_node, result_value)) in
+                        names.iter().zip(results.iter().copied()).enumerate()
+                    {
                         let Some(name) = node_text(self.prepared.source(), *name_node) else {
                             continue;
                         };
@@ -10909,20 +12148,37 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             self.session.record_gap(
                                 builder,
                                 boundary,
-                                SemanticGapSubject::Value(value),
+                                SemanticGapSubject::Value(result_value),
                                 SemanticCapability::Assignments,
                                 SemanticGapKind::Unsupported,
                                 "Go multi-result var value has an identifier target without a lowered local binding",
                             )?;
+                            recorded_gap = true;
                             continue;
                         };
-                        self.append_binding_assignment(
-                            builder,
-                            boundary,
-                            target,
-                            value,
-                            ValueFlowKind::Local,
-                        )?;
+                        let identity_preserving = identities[ordinal] == Some(true);
+                        if declared_type.is_none() {
+                            self.static_type_copies.push((result_value, target));
+                        }
+                        if identity_preserving {
+                            self.append_binding_assignment(
+                                builder,
+                                boundary,
+                                target,
+                                result_value,
+                                ValueFlowKind::Local,
+                            )?;
+                        } else {
+                            self.append_reference_aware_binding_assignment(
+                                builder,
+                                boundary,
+                                value,
+                                result_value,
+                                target,
+                                ValueFlowKind::Local,
+                            )?;
+                        }
+                        bound_names += 1;
                     }
                     lowered_any = true;
                 } else if names.len() == 1 && values.len() == 1 {
@@ -10939,6 +12195,20 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             self.expression_value_kind(value_node),
                         )?;
                         let inferred = spec.child_by_field_name("type").is_none();
+                        if inferred
+                            || self
+                                .value_type_nodes
+                                .get(&target)
+                                .zip(self.expression_type_node(value_node, spec.start_byte()))
+                                .is_some_and(|(target, source)| {
+                                    self.types_identical(source, *target)
+                                })
+                        {
+                            self.static_type_copies.push((value, target));
+                        }
+                        if inferred && self.expression_is_known_non_interface(value_node) {
+                            self.non_interface_locals.insert(target);
+                        }
                         let identity_preserving = inferred
                             || self.value_types.get(&target).is_some_and(|target_type| {
                                 self.expression_type_identity(value_node, spec.start_byte())
@@ -10967,12 +12237,14 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                             )?;
                         }
                         lowered_any = true;
+                        bound_names += 1;
                     }
                 } else {
                     unsupported = true;
                 }
             }
             if unsupported {
+                recorded_gap = true;
                 self.session.record_gap(
                     builder,
                     boundary,
@@ -10983,6 +12255,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 )?;
             }
             if saw_nonblank_target && !lowered_any && !unsupported && !unresolved_any {
+                recorded_gap = true;
                 self.session.record_gap(
                     builder,
                     boundary,
@@ -10991,6 +12264,46 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     SemanticGapKind::Unknown,
                     "Go var initialization bound no analyzable local target",
                 )?;
+            }
+            let nonblank_names = names
+                .iter()
+                .filter(|name| {
+                    node_text(self.prepared.source(), **name).is_some_and(|text| text != "_")
+                })
+                .count();
+            let spec_bound = !recorded_gap && bound_names == nonblank_names;
+            all_specs_bound &= spec_bound;
+            if spec_bound {
+                self.session
+                    .footprint_register(spec, BoundaryDisposition::Lowered);
+                for name in &names {
+                    self.session.footprint_register(
+                        *name,
+                        BoundaryDisposition::ExcludedNoEffect(BranchClass::Identifier),
+                    );
+                }
+                if let Some(ty) = spec.child_by_field_name("type") {
+                    self.session
+                        .footprint_consume_subtree(ty, BranchClass::Type);
+                }
+                if let Some(values) = spec.child_by_field_name("value")
+                    && values.kind() == "expression_list"
+                {
+                    self.session
+                        .footprint_register(values, BoundaryDisposition::Lowered);
+                }
+                self.session.footprint_refuse_node_for_scoped(spec);
+                for name in names {
+                    self.session.footprint_refuse_node_for_scoped(name);
+                }
+                if let Some(ty) = spec.child_by_field_name("type") {
+                    self.session.footprint_refuse_subtree_for_scoped(ty);
+                }
+                if let Some(values) = spec.child_by_field_name("value")
+                    && values.kind() == "expression_list"
+                {
+                    self.session.footprint_refuse_node_for_scoped(values);
+                }
             }
             self.session.add_target_edge(builder, boundary, spec_next)?;
             self.note_deterministic_evaluation_order(builder, spec_entry, spec, &values)?;
@@ -11002,6 +12315,16 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 scope,
                 stack,
             )?;
+        }
+        if all_specs_bound {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            self.session.footprint_refuse_node_for_scoped(node);
+            for child in named_children(node) {
+                if child.kind() == "var_spec_list" {
+                    self.session.footprint_refuse_node_for_scoped(child);
+                }
+            }
         }
         Ok(())
     }
@@ -11290,6 +12613,13 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 "deferred invocation panic propagation is not lowered",
             )?;
         } else {
+            // A supported defer registers one stable call here and a cleanup
+            // scope runs it, in LIFO order, on every return, fall-off and
+            // panic route. The classifier still checks each inner node, and
+            // the inner call must match a lowered call site exactly.
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            self.session.footprint_refuse_subtree_for_scoped(node);
             let capture = self
                 .deferred_captures
                 .get(&operand.id())
@@ -11912,6 +13242,12 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         let condition = required_field(node, "condition")?;
         let consequence = required_field(node, "consequence")?;
         let alternative = node.child_by_field_name("alternative");
+        // The statement itself emits only control edges and guards; the
+        // initializer, condition and both branches are scheduled and claim
+        // themselves.
+        self.session
+            .footprint_register(node, BoundaryDisposition::Lowered);
+        self.session.footprint_refuse_node_for_scoped(node);
         let condition_entry = self
             .session
             .add_node_point(builder, condition, Vec::new())?;
@@ -12507,6 +13843,9 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         {
             self.note_predeclared_builtin_assumption(builtin);
         }
+        if node.kind() == "interpreted_string_literal" {
+            self.session.footprint_refuse_subtree_for_scoped(node);
+        }
         let result = self
             .multi_result_values
             .get(&node.id())
@@ -12515,10 +13854,43 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             .unwrap_or_else(|| {
                 self.expression_value(builder, node, self.expression_value_kind(node))
             })?;
-        if is_go_binding_reference_kind(node.kind()) && !self.is_go_constant_value(node) {
-            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        let binding_read =
+            if is_go_binding_reference_kind(node.kind()) && !self.is_go_constant_value(node) {
+                Some(self.emit_lexical_input_flow(builder, node, entry, result)?)
+            } else {
+                None
+            };
+        let predeclared_constant = matches!(node.kind(), "nil" | "true" | "false");
+        if predeclared_constant {
+            let disposition = match binding_read {
+                None => {
+                    CallControlDisposition::AffirmativelyExcluded(FootprintExclusion::NoInstance)
+                }
+                Some(true) => CallControlDisposition::Represented,
+                Some(false) => {
+                    CallControlDisposition::Refused(FootprintRefusal::UnclassifiedBranch)
+                }
+            };
+            self.predeclared_dispositions.insert(node.id(), disposition);
+        }
+        // A read is a full claim only when lowering emitted its row: a
+        // binding flow, a shared-cell load, or a package static load. An
+        // unresolved name emits no row and no gap, so it stays unclaimed and
+        // refuses the boundary. An unshadowed `nil`, `true` or `false` is a
+        // constant with no storage and no effect.
+        match binding_read {
+            Some(true) => self
+                .session
+                .footprint_consume_subtree(node, BranchClass::Identifier),
+            None if predeclared_constant => self
+                .session
+                .footprint_consume_subtree(node, BranchClass::Literal),
+            None | Some(false) => {}
         }
         if let Some(target) = self.package_function_target(node) {
+            // The reference is a `CallableReference` row.
+            self.session
+                .footprint_consume_subtree(node, BranchClass::Identifier);
             let metadata = self.metadata(entry)?;
             self.append_effect(
                 builder,
@@ -12539,6 +13911,17 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             && let Some(point) = self.selector_points.get(&node.id()).copied()
         {
             let operand = required_field(node, "operand")?;
+            if matches!(
+                self.selector_resolution(node),
+                GoSelectorResolution::Method { .. }
+            ) {
+                // The classifier admits this selector only as a call's
+                // callee, where the represented call covers it.
+                self.session.footprint_refuse_node_for_scoped(node);
+                if let Some(field) = node.child_by_field_name("field") {
+                    self.session.footprint_refuse_node_for_scoped(field);
+                }
+            }
             if matches!(
                 self.evaluated_selector_resolution(builder, node),
                 GoSelectorResolution::Method {
@@ -13056,6 +14439,11 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 Ok(())
             }
             "parenthesized_expression" => {
+                // The wrapper emits an assignment and a flow row, or nothing
+                // when it only spells a call receiver; its operand is
+                // scheduled and claims itself.
+                self.session
+                    .footprint_register(node, BoundaryDisposition::Lowered);
                 if let Some(value) = first_runtime_named_child(node) {
                     if parenthesized_call_receiver(node) {
                         // The call site and deferred-capture producer both
@@ -13200,12 +14588,30 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                         stack,
                     );
                 }
+                self.session.footprint_refuse_node_for_scoped(node);
                 let exact_binding = if is_go_binding_reference_kind(referenced.kind()) {
                     node_text(self.prepared.source(), referenced)
                         .and_then(|name| self.binding_value(name, referenced.start_byte()))
                 } else {
                     None
                 };
+                // `&x` of a lowered binding and `&T{}` are an assignment row
+                // plus, for a binding, the shared cell the prepass allocated
+                // (its loads and stores are rows). Neither can panic. A
+                // parenthesized operand, a selector, an index and anything
+                // else stay unclaimed. The conversion at an interface
+                // target belongs to the consumer of the pointer.
+                if operand.id() == referenced.id() {
+                    if exact_binding.is_some() && referenced.kind() == "identifier" {
+                        self.session
+                            .footprint_register(node, BoundaryDisposition::Lowered);
+                        self.session
+                            .footprint_consume_subtree(operand, BranchClass::Identifier);
+                    } else if referenced.kind() == "composite_literal" {
+                        self.session
+                            .footprint_register(node, BoundaryDisposition::Lowered);
+                    }
+                }
                 let source = if let Some(binding) = exact_binding {
                     binding
                 } else {
@@ -13707,6 +15113,25 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 )
             }
             "binary_expression" | "unary_expression" => {
+                // `&`, `*` and `<-` have their own arms above. Every effect of
+                // an operator is an operand flow row or a panic gap; its
+                // operands are scheduled and claim themselves.
+                debug_assert!(
+                    node.kind() == "binary_expression"
+                        || !matches!(unary_operator_kind(node), Some("&" | "*" | "<-"))
+                );
+                // Comparing interface operands can panic, and nothing records
+                // that, so such a comparison stays unclaimed. Division and
+                // shifts record their panic as a gap.
+                if !matches!(
+                    node.child_by_field_name("operator")
+                        .map(|operator| operator.kind()),
+                    Some("==" | "!=")
+                ) || self.comparison_cannot_panic(node)
+                {
+                    self.session
+                        .footprint_register(node, BoundaryDisposition::Lowered);
+                }
                 // The operator result derives from every operand. Without this
                 // flow an arithmetic step silently ended the value's history.
                 let children = runtime_expression_children(node);
@@ -13818,148 +15243,64 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 )
             }
             "composite_literal" => {
-                let kind = match node.child_by_field_name("type").map(|node| node.kind()) {
-                    Some("slice_type") => AllocationKind::Slice,
-                    Some("array_type" | "implicit_length_array_type" | "map_type") => {
-                        AllocationKind::Array
-                    }
-                    _ => AllocationKind::Object,
+                if let Some(ty) = node.child_by_field_name("type") {
+                    self.session.footprint_refuse_subtree_for_scoped(ty);
+                }
+                let literal = GoLiteralParts {
+                    node,
+                    type_node: node.child_by_field_name("type"),
+                    body: node.child_by_field_name("body"),
                 };
-                self.session.add_allocation(builder, entry, result, kind)?;
-                let children = runtime_expression_children(node);
-                self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
-                let index_stores =
-                    self.composite_literal_index_stores(builder, entry, node, result)?;
-                let field_stores = if index_stores.is_none() {
-                    self.composite_literal_field_stores(builder, entry, node, result)?
-                } else {
-                    None
-                };
-                let aggregate_initializers = if index_stores.is_none() && field_stores.is_none() {
-                    self.composite_literal_aggregate_initializers(builder, node)?
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                if index_stores.as_ref().is_none_or(Vec::is_empty)
-                    && field_stores.as_ref().is_none_or(Vec::is_empty)
-                    && aggregate_initializers.is_empty()
-                {
+                self.composite_literal_expression(
+                    builder, entry, next, literal, result, scope, stack,
+                )
+            }
+            // An element literal that omits its type takes the element type of
+            // the enclosing literal, so it allocates and stores like an
+            // explicit composite literal.
+            "literal_value" if !self.literal_value_is_composite_body(node) => {
+                let Some(type_node) = self.literal_value_expected_type(node) else {
+                    self.session.record_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Value(result),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unsupported,
+                        "Go composite literal with an elided type has no resolvable element type",
+                    )?;
+                    self.session.footprint_refuse_node_for_scoped(node);
+                    let children = runtime_expression_children(node);
+                    self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
                     return self
                         .schedule_expressions(builder, entry, &children, next, scope, stack);
-                }
-                let terminal = self.session.add_node_point(builder, node, Vec::new())?;
-                if let Some(stores) = index_stores {
-                    let value_copy = self.expression_index_value_copy(node, node.start_byte());
-                    for (constant_index, value) in stores {
-                        let index = self.value(
-                            builder,
-                            terminal,
-                            SemanticValueKind::UnsignedInteger(constant_index),
-                        )?;
-                        let location = self.session.add_memory_location_with_value_copy(
-                            builder,
-                            terminal,
-                            MemoryLocationKind::Index {
-                                base: result,
-                                index: Some(index),
-                                constant_index: Some(constant_index),
-                                identity: IndexedLocationIdentity::Element,
-                            },
-                            value_copy,
-                        )?;
-                        self.add_unprojected_index_gap(builder, terminal, location, true)?;
-                        self.append_effect(
-                            builder,
-                            terminal,
-                            SemanticEffect::MemoryStore {
-                                kind: MemoryAccessKind::Index,
-                                location,
-                                value,
-                            },
-                        )?;
-                    }
-                }
-                if let Some(stores) = field_stores {
-                    for store in stores {
-                        let value = if store.aggregate_copy {
-                            let copied = self.session.add_node_value(
-                                builder,
-                                store.source_node,
-                                SemanticValueKind::Temporary,
-                            )?;
-                            self.append_effect(
-                                builder,
-                                terminal,
-                                SemanticEffect::Assignment {
-                                    target: copied,
-                                    value: store.value,
-                                },
-                            )?;
-                            self.append_effect(
-                                builder,
-                                terminal,
-                                SemanticEffect::ValueFlow {
-                                    kind: ValueFlowKind::Transfer(ValueTransfer {
-                                        kind: TransferKind::AggregateCopy,
-                                        operation: TransferOperation::None,
-                                    }),
-                                    source: store.value,
-                                    target: copied,
-                                },
-                            )?;
-                            copied
-                        } else {
-                            store.value
-                        };
-                        let location = self.session.add_memory_location(
-                            builder,
-                            terminal,
-                            MemoryLocationKind::Field {
-                                base: result,
-                                member: store.member,
-                            },
-                        )?;
-                        self.append_effect(
-                            builder,
-                            terminal,
-                            SemanticEffect::MemoryStore {
-                                kind: MemoryAccessKind::Field,
-                                location,
-                                value,
-                            },
-                        )?;
-                    }
-                }
-                for initializer in aggregate_initializers {
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::AggregateInitializer {
-                            aggregate: result,
-                            selector: initializer.selector,
-                            value: initializer.value,
-                        },
-                    )?;
-                }
-                self.session.add_target_edge(builder, terminal, next)?;
-                self.schedule_expressions(
-                    builder,
-                    entry,
-                    &children,
-                    EdgeTarget::normal(terminal),
-                    scope,
-                    stack,
+                };
+                let literal = GoLiteralParts {
+                    node,
+                    type_node: Some(type_node),
+                    body: Some(node),
+                };
+                self.composite_literal_expression(
+                    builder, entry, next, literal, result, scope, stack,
                 )
             }
             "literal_value" | "literal_element" | "keyed_element" | "expression_list"
             | "argument_list" | "variadic_argument" => {
+                self.session.footprint_refuse_node_for_scoped(node);
                 let children = runtime_expression_children(node);
                 self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             "type_instantiation_expression" => self.session.add_target_edge(builder, entry, next),
-            kind if is_runtime_leaf(kind) => self.session.add_target_edge(builder, entry, next),
+            kind if is_runtime_leaf(kind) => {
+                // A literal has no effect of its own: the rows that use its
+                // value belong to its parent.
+                if is_go_literal_value_kind(kind) {
+                    self.session
+                        .footprint_consume_subtree(node, BranchClass::Literal);
+                }
+                self.session.footprint_refuse_node_for_scoped(node);
+                self.session.add_target_edge(builder, entry, next)
+            }
             _ => self.unhandled_control_syntax(builder, node, entry),
         }
     }
@@ -13975,6 +15316,28 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), GoLoweringError> {
         let invoke = self.emit_call_expression(builder, node, next, scope, false, stack)?;
+        self.session.footprint_refuse_node_for_scoped(node);
+        if let Some(function) = node.child_by_field_name("function")
+            && function.kind() == "selector_expression"
+        {
+            if self.selector_resolution(function) == GoSelectorResolution::Package {
+                // A package-qualified callee has no runtime receiver to schedule.
+                // The call row represents the selector; its qualifier is syntax.
+                self.session.footprint_refuse_subtree_for_scoped(function);
+            } else if let Some(operand) = function.child_by_field_name("operand")
+                && operand.kind() == "identifier"
+                && self.place_root_binding(operand).is_some()
+            {
+                // The call binds this identifier receiver; its selector is
+                // represented by the call row. Compound receiver expressions
+                // still need their own coverage and remain unclaimed.
+                self.session.footprint_refuse_subtree_for_scoped(function);
+            }
+        }
+        if let Some(arguments) = node.child_by_field_name("arguments") {
+            self.session.footprint_refuse_node_for_scoped(arguments);
+        }
+        self.claim_direct_identifier_call(node);
         let evaluations = self.call_operand_evaluations(node, false)?;
         self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;
         self.schedule_expressions(
@@ -13985,6 +15348,31 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             scope,
             stack,
         )
+    }
+
+    /// Claims a call to a named function whose arguments are all identifiers.
+    /// The call row represents the callee, so that identifier is consumed.
+    /// Each argument is scheduled as an expression and claims itself only
+    /// when its read emitted a row, so an unresolved argument still refuses.
+    fn claim_direct_identifier_call(&mut self, node: Node<'tree>) {
+        let arguments = call_arguments(node);
+        if let Some(function) = node
+            .child_by_field_name("function")
+            .filter(|function| function.kind() == "identifier")
+            && arguments
+                .iter()
+                .all(|argument| argument.kind() == "identifier")
+            && self.direct_call_needs_no_conversion(node, &arguments)
+        {
+            self.session
+                .footprint_register(node, BoundaryDisposition::Lowered);
+            self.session
+                .footprint_consume_subtree(function, BranchClass::Identifier);
+            if let Some(arguments) = node.child_by_field_name("arguments") {
+                self.session
+                    .footprint_register(arguments, BoundaryDisposition::Lowered);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14033,6 +15421,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             return self.session.add_target_edge(builder, boundary, next);
         }
         let invoke = self.emit_call_expression(builder, node, next, scope, true, stack)?;
+        self.claim_direct_identifier_call(node);
         self.session
             .add_target_edge(builder, entry, EdgeTarget::normal(invoke))
     }
@@ -14820,6 +16209,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), GoLoweringError> {
+        self.session.footprint_class(
+            FootprintClass::Capture,
+            FootprintDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
+        );
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
         let target = self.procedure_targets.get(&node.id()).cloned();
         let resolution = target
@@ -14896,6 +16289,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
         if let Some(target) = target.as_ref() {
             for name in &target.omitted_capture_names {
+                self.session.footprint_class(
+                    FootprintClass::Capture,
+                    FootprintDisposition::Refused(FootprintRefusal::RelevantGap),
+                );
                 let Some(source) = self.binding_value(name, node.start_byte()) else {
                     continue;
                 };
@@ -14904,8 +16301,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     entry,
                     SemanticGapSubject::Value(source),
                     SemanticCapability::Captures,
-                    SemanticGapKind::Unsupported,
-                    "Go closure captures this parent binding by reference, whose value identity is not modeled",
+                    SemanticGapKind::Unknown,
+                    "Go closure capture binding is unavailable from source syntax",
                 )?;
             }
         }
@@ -15324,38 +16721,303 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         }
     }
 
-    /// Lower exact array literal operands as stores into the new inline array.
-    /// Positional entries advance from the preceding entry, while an integer
-    /// key sets the position for itself and the following positional entry.
-    /// Unavailable keys, lengths, duplicates, and bounds retain a Values gap
-    /// instead of manufacturing an indexed definition.
+    /// Lower a composite literal, explicit or with an elided type, as an
+    /// allocation followed by one store per element. The stores sit at a
+    /// terminal point after every operand has evaluated, so a panic in an
+    /// operand cannot publish a partially constructed value.
+    #[allow(clippy::too_many_arguments)]
+    fn composite_literal_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        literal: GoLiteralParts<'tree>,
+        result: ValueId,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), GoLoweringError> {
+        let node = literal.node;
+        let kind = match literal.type_node.map(|node| node.kind()) {
+            Some("slice_type") => AllocationKind::Slice,
+            Some("array_type" | "implicit_length_array_type" | "map_type") => AllocationKind::Array,
+            _ => AllocationKind::Object,
+        };
+        self.session.add_allocation(builder, entry, result, kind)?;
+        self.session.footprint_refuse_node_for_scoped(node);
+        let children = runtime_expression_children(node);
+        self.note_deterministic_evaluation_order(builder, entry, node, &children)?;
+        let index_stores = self.composite_literal_index_stores(builder, entry, literal, result)?;
+        let map_stores = if index_stores.is_none() {
+            self.composite_literal_map_stores(builder, entry, literal, result)?
+        } else {
+            None
+        };
+        let field_stores = if index_stores.is_none() && map_stores.is_none() {
+            self.composite_literal_field_stores(builder, entry, literal, result)?
+        } else {
+            None
+        };
+        let aggregate_initializers =
+            if index_stores.is_none() && map_stores.is_none() && field_stores.is_none() {
+                self.composite_literal_aggregate_initializers(builder, literal)?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        if index_stores.as_ref().is_none_or(Vec::is_empty)
+            && map_stores.as_ref().is_none_or(Vec::is_empty)
+            && field_stores.as_ref().is_none_or(Vec::is_empty)
+            && aggregate_initializers.is_empty()
+        {
+            self.claim_composite_literal(literal, 0);
+            return self.schedule_expressions(builder, entry, &children, next, scope, stack);
+        }
+        if let Some(stores) = field_stores.as_deref().filter(|stores| {
+            stores
+                .iter()
+                .all(|store| store.field_is_known_non_interface)
+        }) {
+            self.claim_composite_literal(literal, stores.len());
+        }
+        let terminal = self.session.add_node_point(builder, node, Vec::new())?;
+        let element_copy = literal
+            .type_node
+            .map_or(MemoryValueCopy::Unknown, |type_node| {
+                go_index_value_copy_from_type(
+                    type_node,
+                    self.prepared.source(),
+                    self.named_type_definitions,
+                    node.start_byte(),
+                )
+            });
+        if let Some(stores) = index_stores {
+            for (constant_index, value) in stores {
+                let index = self.value(
+                    builder,
+                    terminal,
+                    SemanticValueKind::UnsignedInteger(constant_index),
+                )?;
+                let location = self.session.add_memory_location_with_value_copy(
+                    builder,
+                    terminal,
+                    MemoryLocationKind::Index {
+                        base: result,
+                        index: Some(index),
+                        constant_index: Some(constant_index),
+                        identity: IndexedLocationIdentity::Element,
+                    },
+                    element_copy,
+                )?;
+                self.add_unprojected_index_gap(builder, terminal, location, true)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+        }
+        if let Some(stores) = map_stores {
+            for (key, value) in stores {
+                let (location, _index, exact) = self.index_memory_location(
+                    builder,
+                    terminal,
+                    result,
+                    key,
+                    IndexedLocationIdentity::Aggregate,
+                    element_copy,
+                )?;
+                self.add_unprojected_index_gap(builder, terminal, location, exact)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+        }
+        if let Some(stores) = field_stores {
+            for store in stores {
+                let value = if store.aggregate_copy {
+                    let copied = self.session.add_node_value(
+                        builder,
+                        store.source_node,
+                        SemanticValueKind::Temporary,
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target: copied,
+                            value: store.value,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Transfer(ValueTransfer {
+                                kind: TransferKind::AggregateCopy,
+                                operation: TransferOperation::None,
+                            }),
+                            source: store.value,
+                            target: copied,
+                        },
+                    )?;
+                    copied
+                } else {
+                    store.value
+                };
+                let location = self.session.add_memory_location(
+                    builder,
+                    terminal,
+                    MemoryLocationKind::Field {
+                        base: result,
+                        member: store.member,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Field,
+                        location,
+                        value,
+                    },
+                )?;
+            }
+        }
+        for initializer in aggregate_initializers {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::AggregateInitializer {
+                    aggregate: result,
+                    selector: initializer.selector,
+                    value: initializer.value,
+                },
+            )?;
+        }
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    /// Claim an explicit composite literal whose effects are all rows: an
+    /// allocation, plus one field store per element when `element_count` is
+    /// non-zero. Callers pass a count only for a struct layout whose every
+    /// field initializer is stored without an implicit interface conversion;
+    /// the claim refuses unless that count is the whole body, so a body with a
+    /// comment, an element the stores skipped, or a parse error stays
+    /// unclaimed. Slice and map literals with elements are never claimed:
+    /// their stores are indexed and are not modeled for admission. The key
+    /// of a struct element is a field label, so it takes the identifier
+    /// disposition that an identifier read takes, whether or not a local
+    /// shadows it.
+    fn claim_composite_literal(&mut self, literal: GoLiteralParts<'tree>, element_count: usize) {
+        let (Some(type_node), Some(body)) = (literal.type_node, literal.body) else {
+            return;
+        };
+        if literal.node.kind() != "composite_literal"
+            || type_node.has_error()
+            || type_node.is_missing()
+            || body.has_error()
+            || body.is_missing()
+        {
+            return;
+        }
+        let elements = named_children(body);
+        if elements.len() != element_count {
+            return;
+        }
+        let excluded =
+            CallControlDisposition::AffirmativelyExcluded(FootprintExclusion::NoInstance);
+        self.session
+            .footprint_register(literal.node, BoundaryDisposition::Lowered);
+        self.literal_dispositions
+            .insert(literal.node.id(), CallControlDisposition::Represented);
+        self.session
+            .footprint_consume_subtree(type_node, BranchClass::Type);
+        self.session
+            .footprint_register(body, BoundaryDisposition::Lowered);
+        self.literal_dispositions.insert(body.id(), excluded);
+        for element in elements {
+            let mut wrappers = vec![element];
+            if element.kind() == "keyed_element" {
+                let key = element.child_by_field_name("key");
+                let label = key.map(|key| transparent_runtime_wrapper_child(key).unwrap_or(key));
+                if let Some(label) = label {
+                    self.session
+                        .footprint_consume_subtree(label, BranchClass::Identifier);
+                }
+                wrappers.extend(key.filter(|key| key.kind() == "literal_element"));
+                wrappers.extend(
+                    element
+                        .child_by_field_name("value")
+                        .filter(|value| value.kind() == "literal_element"),
+                );
+            }
+            for wrapper in wrappers {
+                self.session
+                    .footprint_register(wrapper, BoundaryDisposition::Lowered);
+                self.literal_dispositions.insert(wrapper.id(), excluded);
+            }
+        }
+    }
+
+    /// Whether a literal value is the body of an explicit composite literal,
+    /// rather than an element literal whose type is elided.
+    fn literal_value_is_composite_body(&self, node: Node<'tree>) -> bool {
+        node.parent().is_some_and(|parent| {
+            parent.kind() == "composite_literal" && field_matches(parent, "body", node)
+        })
+    }
+
+    /// Lower exact array and slice literal operands as stores into the new
+    /// aggregate. Positional entries advance from the preceding entry, while an
+    /// integer key sets the position for itself and the following positional
+    /// entry. Unavailable keys, lengths, duplicates, and bounds retain a Values
+    /// gap instead of manufacturing an indexed definition.
     fn composite_literal_index_stores(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
-        node: Node<'tree>,
+        literal: GoLiteralParts<'tree>,
         result: ValueId,
     ) -> Result<Option<Vec<(u128, ValueId)>>, GoLoweringError> {
-        let Some(type_node) = node.child_by_field_name("type") else {
+        let Some(type_node) = literal.type_node else {
             return Ok(None);
         };
-        let Some(array_type) = self.file_underlying_type(type_node, node.start_byte()) else {
+        let Some(array_type) = self.file_underlying_type(type_node, literal.node.start_byte())
+        else {
             return Ok(None);
         };
         if !matches!(
             array_type.kind(),
-            "array_type" | "implicit_length_array_type"
+            "array_type" | "implicit_length_array_type" | "slice_type"
         ) {
             return Ok(None);
         }
-        let Some(body) = node.child_by_field_name("body") else {
+        let Some(body) = literal.body else {
             self.session.record_gap(
                 builder,
                 entry,
                 SemanticGapSubject::Value(result),
                 SemanticCapability::Values,
                 SemanticGapKind::Unsupported,
-                "Go array literal body is unavailable",
+                "Go array or slice literal body is unavailable",
             )?;
             return Ok(Some(Vec::new()));
         };
@@ -15382,7 +17044,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     SemanticGapSubject::Value(result),
                     SemanticCapability::Values,
                     SemanticGapKind::Unsupported,
-                    "Go array literal length is not an exact integer literal",
+                    "Go array or slice literal length is not an exact integer literal",
                 )?;
                 return Ok(Some(Vec::new()));
             };
@@ -15398,35 +17060,38 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         for element in elements {
             let (constant_index, value_node) = if element.kind() == "keyed_element" {
                 let Some(key) = element.child_by_field_name("key") else {
-                    unsupported = Some("Go array literal keyed initializer has no index");
+                    unsupported = Some("Go array or slice literal keyed initializer has no index");
                     break;
                 };
                 let key = transparent_runtime_wrapper_child(key).unwrap_or(key);
                 let Some(index) = go_integer_literal_value(self.prepared.source(), key) else {
-                    unsupported = Some("Go array literal index is not an exact integer literal");
+                    unsupported =
+                        Some("Go array or slice literal index is not an exact integer literal");
                     break;
                 };
                 let Some(value) = element.child_by_field_name("value") else {
-                    unsupported = Some("Go array literal keyed initializer has no value");
+                    unsupported = Some("Go array or slice literal keyed initializer has no value");
                     break;
                 };
                 (index, value)
             } else if element.kind() == "literal_element" {
                 (next_index, element)
             } else {
-                unsupported = Some("Go array literal initializer shape is unavailable");
+                unsupported = Some("Go array or slice literal initializer shape is unavailable");
                 break;
             };
             if length.is_some_and(|length| constant_index >= length) {
-                unsupported = Some("Go array literal initializer is outside its exact bounds");
+                unsupported =
+                    Some("Go array or slice literal initializer is outside its exact bounds");
                 break;
             }
             if !used.insert(constant_index) {
-                unsupported = Some("Go array literal repeats an element initializer");
+                unsupported = Some("Go array or slice literal repeats an element initializer");
                 break;
             }
             let Some(following) = constant_index.checked_add(1) else {
-                unsupported = Some("Go array literal index exceeds the semantic identity range");
+                unsupported =
+                    Some("Go array or slice literal index exceeds the semantic identity range");
                 break;
             };
             next_index = following;
@@ -15449,6 +17114,68 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         Ok(Some(stores))
     }
 
+    /// Lower map literal entries as stores into the new map, keyed by the
+    /// evaluated key like an assignment to `m[key]`. Go gives no source-level
+    /// key identity beyond the key value, so an entry whose key is not an
+    /// integer literal stores at a dynamic index, and `add_unprojected_index_gap`
+    /// reports it like every other map access.
+    fn composite_literal_map_stores(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        literal: GoLiteralParts<'tree>,
+        result: ValueId,
+    ) -> Result<Option<Vec<(Node<'tree>, ValueId)>>, GoLoweringError> {
+        let Some(type_node) = literal.type_node else {
+            return Ok(None);
+        };
+        let Some(map_type) = self.file_underlying_type(type_node, literal.node.start_byte()) else {
+            return Ok(None);
+        };
+        if map_type.kind() != "map_type" {
+            return Ok(None);
+        }
+        let Some(body) = literal.body else {
+            self.session.record_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::Values,
+                SemanticGapKind::Unsupported,
+                "Go map literal body is unavailable",
+            )?;
+            return Ok(Some(Vec::new()));
+        };
+        let mut stores = Vec::new();
+        for element in named_children(body)
+            .into_iter()
+            .filter(|element| element.kind() != "comment")
+        {
+            let (Some(key), Some(value_node)) = (
+                element
+                    .child_by_field_name("key")
+                    .filter(|_| element.kind() == "keyed_element"),
+                element.child_by_field_name("value"),
+            ) else {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go map literal element has no key and value",
+                )?;
+                return Ok(Some(Vec::new()));
+            };
+            let key = transparent_runtime_wrapper_child(key).unwrap_or(key);
+            let value_node = transparent_runtime_wrapper_child(value_node).unwrap_or(value_node);
+            let value =
+                self.expression_value(builder, value_node, self.expression_value_kind(value_node))?;
+            stores.push((key, value));
+        }
+        Ok(Some(stores))
+    }
+
     /// Lower explicit initializers of a struct literal as stores into the
     /// newly allocated aggregate. The stores are emitted at the caller's
     /// terminal point, after every initializer has evaluated, so a panic in
@@ -15457,10 +17184,11 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
-        node: Node<'tree>,
+        literal: GoLiteralParts<'tree>,
         result: ValueId,
     ) -> Result<Option<Vec<GoCompositeLiteralStore<'tree>>>, GoLoweringError> {
-        let Some(type_node) = node.child_by_field_name("type") else {
+        let node = literal.node;
+        let Some(type_node) = literal.type_node else {
             return Ok(None);
         };
         if go_type_uses_generic(
@@ -15479,7 +17207,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             )?;
             return Ok(Some(Vec::new()));
         }
-        let body_is_well_formed_empty = node.child_by_field_name("body").is_some_and(|body| {
+        let body_is_well_formed_empty = literal.body.is_some_and(|body| {
             !type_node.has_error()
                 && !type_node.is_missing()
                 && !body.has_error()
@@ -15532,6 +17260,18 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                     SemanticGapDischarge::ExactFieldLayout,
                     "Go struct literal field layout is unavailable",
                 )?;
+            } else {
+                // Array, slice and map literals lowered their elements
+                // already; any other underlying type has no element layout
+                // this lowering knows, so its operands must not vanish.
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unsupported,
+                    "Go composite literal has an unrecognized aggregate layout",
+                )?;
             }
             return Ok(None);
         }
@@ -15546,7 +17286,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
             )?;
             return Ok(Some(Vec::new()));
         };
-        let Some(body) = node.child_by_field_name("body") else {
+        let Some(body) = literal.body else {
             return Ok(Some(Vec::new()));
         };
         let elements = named_children(body);
@@ -15681,11 +17421,16 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 storage_kind_unavailable = true;
                 false
             };
+            let field_is_known_non_interface = field.type_node.is_some_and(|type_node| {
+                self.composite_field_storage(type_node).is_some()
+                    && !self.type_is_interface(type_node, type_node.start_byte())
+            });
             stores.push(GoCompositeLiteralStore {
                 member,
                 source_node: value_node,
                 value,
                 aggregate_copy,
+                field_is_known_non_interface,
             });
         }
         if storage_kind_unavailable {
@@ -15715,9 +17460,10 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     fn composite_literal_aggregate_initializers(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        node: Node<'tree>,
+        literal: GoLiteralParts<'tree>,
     ) -> Result<Option<Vec<GoAggregateInitializer>>, GoLoweringError> {
-        let Some(type_node) = node.child_by_field_name("type") else {
+        let node = literal.node;
+        let Some(type_node) = literal.type_node else {
             return Ok(None);
         };
         if go_type_uses_generic(
@@ -15739,7 +17485,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
         if !unresolved_layout {
             return Ok(None);
         }
-        let Some(body) = node.child_by_field_name("body") else {
+        let Some(body) = literal.body else {
             return Ok(None);
         };
         let elements = named_children(body);
@@ -16099,8 +17845,7 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
     /// Go copies a deferred argument value into the cleanup record. Pointer
     /// values and channel descriptors retain the referenced object; slices and
     /// maps retain their backing store. Arrays, structs, scalar values, and
-    /// unresolved expressions remain language-defined so no copied outer value
-    /// is mistaken for the source's storage.
+    /// unresolved expressions defer their reference identity to query time.
     fn deferred_argument_flow_kind(&self, node: Node<'tree>) -> ValueFlowKind {
         if self
             .expression_type_identity(node, node.start_byte())
@@ -16113,9 +17858,8 @@ impl<'tree, 'facts, 'targets, 'imports, 'procedure>
                 offset: BackingStoreOffset::Zero,
             },
             Some(GoStorageKind::Channel) => ValueFlowKind::Local,
-            Some(GoStorageKind::Array | GoStorageKind::Struct) | None => {
-                ValueFlowKind::LanguageDefined
-            }
+            Some(GoStorageKind::Array | GoStorageKind::Struct) => ValueFlowKind::LanguageDefined,
+            None => ValueFlowKind::ByValueCapture,
         }
     }
 
@@ -16760,7 +18504,7 @@ fn go_operation_can_panic(node: Node<'_>) -> bool {
 /// `sink(int(x))` then lowered as zero-argument calls, so no taint binding
 /// could name their argument (#2662). Enumerating the kinds makes a future
 /// grammar addition a deliberate decision instead of an accident of spelling.
-fn is_go_type_syntax(kind: &str) -> bool {
+pub(crate) fn is_go_type_syntax(kind: &str) -> bool {
     matches!(
         kind,
         // Type expressions.
@@ -16814,6 +18558,19 @@ fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, 
         field,
         missing_field,
     )
+}
+
+/// A result list whose syntax names no result variable: one type, or a
+/// parenthesized list of unnamed result declarations.
+fn go_unnamed_result_syntax(result: Node<'_>) -> bool {
+    match result.kind() {
+        "pointer_type" | "type_identifier" => true,
+        "parameter_list" => named_children(result).iter().all(|declaration| {
+            declaration.kind() == "parameter_declaration"
+                && declaration.child_by_field_name("name").is_none()
+        }),
+        _ => false,
+    }
 }
 
 fn is_runtime_leaf(kind: &str) -> bool {
@@ -16939,11 +18696,24 @@ fn is_go_binding_reference_kind(kind: &str) -> bool {
     kind == "identifier" || is_go_predeclared_constant_kind(kind)
 }
 
+/// The operands of a composite literal: an explicit one, or an element literal
+/// whose elided type comes from the enclosing literal.
+#[derive(Clone, Copy)]
+struct GoLiteralParts<'tree> {
+    node: Node<'tree>,
+    type_node: Option<Node<'tree>>,
+    body: Option<Node<'tree>>,
+}
+
 struct GoCompositeLiteralStore<'tree> {
     member: SemanticLocator,
     source_node: Node<'tree>,
     value: ValueId,
     aggregate_copy: bool,
+    /// The field's declared type is known and is not an interface. The store
+    /// keeps the value itself with no boxing row, so an interface field
+    /// leaves the literal unclaimed.
+    field_is_known_non_interface: bool,
 }
 
 enum GoKeyedElementNameError {
@@ -17398,6 +19168,548 @@ mod tests {
             panic!("Go fixture lowering must complete");
         };
         value
+    }
+
+    #[test]
+    fn footprint_classes_cover_methods_and_unnamed_results() {
+        let source = "package p\ntype R struct{}\n\
+func Pair() (int, error) { return 0, nil }\n\
+func Helper(x int) {}\n\
+func (r *R) Method(x int) { Helper(x); _ = x }\n\
+func (R) Unnamed(x int) { Helper(x) }\n\
+func One(x int) int { return x }\n\
+func Two() (int, error) { return Pair() }\n\
+func Never(x int) int { for {} }\n\
+func Falls(x int) int { Helper(x) }\n\
+func Named(x int) (n int) { return x }\n\
+func Generic[T any](x T) T { return x }\n\
+const K = 1\n\
+func Chain(x int, ok bool) int { y := x; z := y; _ = z; if ok { return z }; return y }\n\
+func Guard(err error) error { if err != nil { return err }; return nil }\n\
+func Negated(ok bool) bool { if !ok { return (ok) }; return ok }\n\
+func Scalars(a int, b bool) (int, float64, string, rune, bool) { c := -a + 2; d := a < c && !b; return c, 1.5, \"s\", 'r', d }\n\
+func Reassign(x int) int { y := 0; y = x; return y }\n\
+func Boolean() bool { t := true; return t }\n\
+func Pointer(p *int) int { return *p }\n\
+func Receive(c chan int) int { return <-c }\n\
+func Address(x int) *int { return &x }\n\
+func Compound(x int) int { x += 1; return x }\n\
+func Tuple() int { a, b := 1, 2; return a + b }\n\
+func Undeclared() int { return undeclaredName }\n\
+func Constant() int { return K }\n\
+func ConstantArgument() { Helper(K) }\n\
+type T struct{}\n\
+var global any\n\
+func Sink(v any) {}\n\
+func SinkPtr(v *T) {}\n\
+func Equal(a, b any) bool { return a == b }\n\
+func EqualInts(a, b int) bool { return a == b }\n\
+func EqualToNil(a any) bool { return a == nil }\n\
+func EqualPointers(a, b *T) bool { return a != b }\n\
+func WrapPointer(p *T) any { return p }\n\
+func ReturnPointer(p *T) *T { return p }\n\
+func ReturnInterface(a any) any { return a }\n\
+func ReturnNilInterface() any { return nil }\n\
+func SavePointer(p *T) { global = p }\n\
+func StoreInterfaceLocal(p *T) { var x any; x = p; _ = x }\n\
+func StorePointerLocal(p *T) { var x *T; x = p; _ = x }\n\
+type E struct{}\n\
+func (e *E) Error() string { return \"\" }\n\
+func TypedInterfaceInit(p *T) { var x any = p; _ = x }\n\
+func TypedErrorInit(e *E) { var x error = e; _ = x }\n\
+func ZeroInterfaceLocal() { var x any; _ = x }\n\
+func PassToInterface(p *T) { Sink(p) }\n\
+func GenericSink[E any](y E, x any) {}\n\
+func GenericPassToInterface(p *T) { q := 1; GenericSink(q, p) }\n\
+func PassToPointer(p *T) { SinkPtr(p) }\n\
+func Divide(a, b int) int { return a / b }\n\
+func DivideByConstant(a int) int { return a / 2 }\n\
+func Shift(a, n int) int { return a << n }\n";
+        let procedures = lower_fixture(source);
+        let coverage = |name: &str| {
+            &procedures
+                .iter()
+                .find(|p| p.locator.declaration().last_segment_name() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is lowered"))
+                .footprint_coverage
+        };
+        let class =
+            |name: &str, class: FootprintClass| coverage(name).classes[(class.code() - 1) as usize];
+        let refused = |name: &str| {
+            coverage(name)
+                .classes
+                .iter()
+                .any(|class| matches!(class, FootprintDisposition::Refused(_)))
+        };
+
+        // A method with no result and a direct call has every class set and
+        // its boundary accounted: receiver and parameters are signature syntax.
+        for name in ["Method", "Unnamed"] {
+            assert_eq!(
+                coverage(name).boundary,
+                Ok(()),
+                "{name}: {:#?}",
+                coverage(name)
+            );
+            assert!(!refused(name), "{name}: {:#?}", coverage(name));
+        }
+        assert_eq!(
+            class("Method", FootprintClass::NestedCall),
+            FootprintDisposition::Represented
+        );
+
+        // A callable with results has its classes set, with a publication
+        // even where no row publishes. `Falls` is not valid Go (no return) but
+        // parses; it shows that the result type is claimed by itself.
+        assert_eq!(
+            coverage("Falls").boundary,
+            Ok(()),
+            "{:#?}",
+            coverage("Falls")
+        );
+        for name in ["One", "Two", "Never", "Falls"] {
+            assert!(!refused(name), "{name}: {:#?}", coverage(name));
+            assert_eq!(
+                class(name, FootprintClass::PublicationEscape),
+                FootprintDisposition::Represented,
+                "{name}"
+            );
+        }
+
+        // Returns, `if`, short variable declarations, plain assignments,
+        // identifier reads that lowered a row, literals, `nil`, `true`,
+        // parenthesized, binary and unary (other than `&`, `*` and `<-`)
+        // expressions are fully claimed. A name this file does not declare
+        // lowers to a static load row, so its read is claimed. Every other
+        // node and a read that lowers no row (a constant) refuses the boundary,
+        // and a tuple initialization refuses through its gap.
+        for name in [
+            "One",
+            "Two",
+            "Chain",
+            "Guard",
+            "Negated",
+            "Scalars",
+            "Reassign",
+            "Boolean",
+            "Undeclared",
+            "Address",
+        ] {
+            assert_eq!(
+                coverage(name).boundary,
+                Ok(()),
+                "{name}: {:#?}",
+                coverage(name)
+            );
+        }
+        for name in [
+            "Pointer",
+            "Receive",
+            "Compound",
+            "Constant",
+            "ConstantArgument",
+        ] {
+            assert_eq!(
+                coverage(name).boundary,
+                Err(FootprintRefusal::UnaccountedSourceNode),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            coverage("Tuple").boundary,
+            Err(FootprintRefusal::RelevantGap)
+        );
+
+        // A node with an effect that no row or gap represents stays
+        // unclaimed. Comparing two interface values panics when they hold the
+        // same non-comparable type, and storing a value in an interface boxes
+        // it at a return, an assignment or a call argument. The claim needs
+        // the target to be provably not an interface, or the same type.
+        // Division and shifts record their panic as a gap.
+        for name in [
+            "EqualInts",
+            "EqualToNil",
+            "EqualPointers",
+            "ReturnPointer",
+            "ReturnInterface",
+            "ReturnNilInterface",
+            "StorePointerLocal",
+            "TypedInterfaceInit",
+            "TypedErrorInit",
+            "ZeroInterfaceLocal",
+            "PassToPointer",
+            "DivideByConstant",
+        ] {
+            assert_eq!(
+                coverage(name).boundary,
+                Ok(()),
+                "{name}: {:#?}",
+                coverage(name)
+            );
+        }
+        for name in [
+            "Equal",
+            "WrapPointer",
+            "SavePointer",
+            "StoreInterfaceLocal",
+            "PassToInterface",
+            "GenericPassToInterface",
+        ] {
+            assert_eq!(
+                coverage(name).boundary,
+                Err(FootprintRefusal::UnaccountedSourceNode),
+                "{name}"
+            );
+        }
+        // A typed variable initializer converts through lowering's own
+        // assignment path, so the claim rests on the row it emits: reference
+        // boxing into `any`, and an opaque language-defined flow into `error`.
+        for (name, row) in [
+            ("TypedInterfaceInit", "go.reference_boxing"),
+            ("TypedErrorInit", "go.assignment_conversion"),
+        ] {
+            let lowered = procedures
+                .iter()
+                .find(|p| p.locator.declaration().last_segment_name() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is lowered"));
+            assert!(format!("{lowered:?}").contains(row), "{name}: {row}");
+        }
+        for name in ["Divide", "Shift"] {
+            assert_eq!(
+                coverage(name).boundary,
+                Err(FootprintRefusal::RelevantGap),
+                "{name}"
+            );
+        }
+
+        // Named results and type parameters keep every class refused.
+        for name in ["Named", "Generic"] {
+            assert_eq!(
+                class(name, FootprintClass::PublicationEscape),
+                FootprintDisposition::Refused(FootprintRefusal::UnclassifiedBranch),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn footprint_claims_address_of_and_composite_literals() {
+        let source = "package p\n\
+type Res struct{}\n\
+type Pair struct { A int; B *Res }\n\
+type Closer interface{ Close() }\n\
+type Holder struct { C Closer }\n\
+type Slot struct { R *Res }\n\
+func ReturnRes() *Res { return &Res{} }\n\
+func ShortRes() { r := &Res{}; _ = r }\n\
+func Keyed(y *Res) { x := Pair{A: 1, B: y}; _ = x }\n\
+func Positional(y *Res) { x := Pair{1, y}; _ = x }\n\
+func Nested() { x := Slot{R: &Res{}}; _ = x }\n\
+func Shadowed(y *Res) { A := 1; x := Pair{A: A, B: y}; _ = x }\n\
+func EmptyAnyMap() { m := map[any]int{}; _ = m }\n\
+func EmptySlice() { s := []*Res{}; _ = s }\n\
+func AddressOfLocal(x int) *int { return &x }\n\
+func InterfaceField() { h := Holder{C: &Res{}}; _ = h }\n\
+func ReturnCloser() Closer { return &Res{} }\n\
+func ReturnError() error { return &Res{} }\n\
+func ReturnAny() any { return &Res{} }\n\
+func AnyMapKey(k any) { m := map[any]int{k: 1}; _ = m }\n\
+func SliceElement() { s := []int{1}; _ = s }\n\
+func MapElement() { m := map[string]int{\"a\": 1}; _ = m }\n\
+func ParenthesizedAddress(x int) *int { return &(x) }\n\
+func FieldAddress(s *Pair) *int { return &s.A }\n\
+func UnknownField() { x := Pair{A: 1, Missing: 2}; _ = x }\n";
+        let procedures = lower_fixture(source);
+        let find = |name: &str| {
+            procedures
+                .iter()
+                .find(|p| p.locator.declaration().last_segment_name() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is lowered"))
+        };
+        // The full footprint and the scoped call/control proof agree on every
+        // literal this lowering models.
+        for name in [
+            "ReturnRes",
+            "ShortRes",
+            "Keyed",
+            "Positional",
+            "Nested",
+            "Shadowed",
+            "EmptyAnyMap",
+            "EmptySlice",
+            "AddressOfLocal",
+        ] {
+            let procedure = find(name);
+            assert_eq!(
+                procedure.footprint_coverage.boundary,
+                Ok(()),
+                "{name}: {:#?}",
+                procedure.footprint_coverage
+            );
+            // The scoped proof does not classify slice and map type syntax, so
+            // an empty slice or map literal is claimed by the full footprint
+            // only.
+            if !matches!(name, "EmptyAnyMap" | "EmptySlice") {
+                assert_eq!(
+                    procedure.call_control_coverage.admission,
+                    Ok(()),
+                    "{name}: {:#?}",
+                    procedure.call_control_coverage
+                );
+            }
+        }
+        // A struct field typed as an interface stores the value with no
+        // boxing row, a return into an interface boxes it, a field name the
+        // layout lacks records a gap and leaves the literal unclaimed, and a literal with
+        // elements in a slice or map (a map keyed by `any` can panic on an
+        // unhashable key) is not modeled.
+        for name in [
+            "InterfaceField",
+            "ReturnCloser",
+            "ReturnError",
+            "ReturnAny",
+            "AnyMapKey",
+            "UnknownField",
+            "SliceElement",
+            "MapElement",
+            "ParenthesizedAddress",
+            "FieldAddress",
+        ] {
+            assert_eq!(
+                find(name).footprint_coverage.boundary,
+                Err(FootprintRefusal::UnaccountedSourceNode),
+                "{name}"
+            );
+        }
+
+        // No literal with elements in a slice or map reaches scoped admission.
+        for name in ["InterfaceField", "SliceElement", "MapElement", "AnyMapKey"] {
+            assert!(
+                find(name).call_control_coverage.admission.is_err(),
+                "{name}: {:#?}",
+                find(name).call_control_coverage
+            );
+        }
+        // An address-taken local is a shared cell: its load and store rows
+        // set the classes, with no class code of its own.
+        let address = find("AddressOfLocal");
+        assert_eq!(
+            address.footprint_coverage.classes
+                [(FootprintClass::PublicationEscape.code() - 1) as usize],
+            FootprintDisposition::Represented
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10490: a package-level nil, true or false was treated as the builtin"
+    )]
+    fn footprint_claims_treat_package_level_predeclared_names_as_values() {
+        let boundary = |source: &str, name: &str| {
+            lower_fixture(source)
+                .iter()
+                .find(|p| p.locator.declaration().last_segment_name() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is lowered"))
+                .footprint_coverage
+                .boundary
+        };
+        let api = "package p\ntype T struct{}\n";
+        // Each pair is the same body with and without a package-level
+        // declaration of the predeclared name. The builtin forms are claimed;
+        // the shadowed forms read a variable of another type, so comparing it
+        // can panic and storing a pointer in it boxes the pointer.
+        let cases = [
+            (
+                "var nil any = []int{}\n",
+                "func F(x any) bool { return x == nil }",
+                false,
+            ),
+            ("", "func F(x any) bool { return x == nil }", true),
+            (
+                "var true any = &T{}\n",
+                "func F(p *T) { x := true; x = p; _ = x }",
+                false,
+            ),
+            (
+                "",
+                "func F(p *T) { x := true; x = false; _ = x; _ = p }",
+                true,
+            ),
+            (
+                "var false any = &T{}\n",
+                "func F(p *T) { x := false; x = p; _ = x }",
+                false,
+            ),
+            ("var nil *T\n", "func F() any { return nil }", false),
+            ("", "func F() any { return nil }", true),
+        ];
+        for (declaration, function, admitted) in cases {
+            let source = format!("{api}{declaration}{function}\n");
+            let boundary = boundary(&source, "F");
+            if admitted {
+                assert_eq!(boundary, Ok(()), "{source}");
+            } else {
+                assert_eq!(
+                    boundary,
+                    Err(FootprintRefusal::UnaccountedSourceNode),
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9946: review found a shadowed Go nil excluded from call/control coverage as the builtin"
+    )]
+    fn call_control_excludes_only_builtin_nil() {
+        use CallControlDisposition as D;
+        // The right-hand expression list spans exactly the `nil` it holds,
+        // so collect every branch at that span.
+        let coverage = |source: &str| {
+            let procedures = lower_fixture(source);
+            let f = procedures
+                .iter()
+                .find(|p| p.locator.declaration().last_segment_name() == Some("F"))
+                .expect("F is lowered");
+            let start = source.rfind("= nil").expect("nil read") + "= ".len();
+            let dispositions = f
+                .call_control_coverage
+                .branches
+                .iter()
+                .filter(|branch| branch.start == start && branch.end == start + "nil".len())
+                .map(|branch| branch.disposition)
+                .collect::<Vec<_>>();
+            (dispositions, f.call_control_coverage.admission)
+        };
+        let excluded = D::AffirmativelyExcluded(FootprintExclusion::NoInstance);
+        let api = "package p\ntype R struct{}\n";
+
+        let builtin = coverage(&format!("{api}func F(r *R) {{ r = nil }}\n"));
+        assert_eq!(builtin, (vec![excluded, excluded], Ok(())));
+
+        // A package-level `nil` is a static load, not the predeclared constant.
+        let package_shadow = coverage(&format!(
+            "{api}var nil = &R{{}}\nfunc F(r *R) {{ r = nil }}\n"
+        ));
+        assert_eq!(package_shadow, (vec![excluded, D::Represented], Ok(())));
+
+        // The local binding read is represented, but the `nil :=` target is
+        // not an identifier claim, so the procedure still refuses.
+        let local_shadow = coverage(&format!("{api}func F(r *R) {{ nil := r; r = nil }}\n"));
+        assert_eq!(
+            local_shadow,
+            (
+                vec![excluded, D::Represented],
+                Err(FootprintRefusal::UnaccountedSourceNode)
+            )
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9879: lowered Go assignments, defers, receivers and results refused call/control coverage"
+    )]
+    fn call_control_admits_lowered_statements_and_refuses_unclaimed_syntax() {
+        let source = "package p\ntype R struct{ f func() }\n\
+func Open() *R { return &R{} }\n\
+func (r *R) Close() {}\n\
+func Use(r *R) {}\n\
+func Admitted(flag bool) { r := Open(); if flag { return }; defer Use(r); r.Close(); _ = r }\n\
+func LoopDefer(values []*R) { r := Open(); for range values { defer Use(r) } }\n\
+func Spawn(r *R) { go Use(r) }\n\
+func FieldCallee(r *R) { r.f() }\n\
+func DeferredLiteral(r *R) { defer func() { Use(r) }() }\n";
+        let procedures = lower_fixture(source);
+        let admission = |name: &str| {
+            &procedures
+                .iter()
+                .find(|p| p.locator.declaration().last_segment_name() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is lowered"))
+                .call_control_coverage
+        };
+        for name in ["Open", "Close", "Use", "Admitted"] {
+            let coverage = admission(name);
+            assert_eq!(coverage.admission, Ok(()), "{name}: {coverage:#?}");
+        }
+        for name in ["LoopDefer", "Spawn", "FieldCallee", "DeferredLiteral"] {
+            let coverage = admission(name);
+            assert!(coverage.admission.is_err(), "{name}: {coverage:#?}");
+        }
+
+        // The admitted defer is one deferred call per exit route after its
+        // registration: falling off the end and the exceptional exit of
+        // `r.Close()`. The earlier return does not run it.
+        let admitted = procedures
+            .iter()
+            .find(|p| p.locator.declaration().last_segment_name() == Some("Admitted"))
+            .expect("Admitted is lowered");
+        let deferred_call = source.find("Use(r); r.Close").expect("deferred call");
+        let deferred_sites = admitted
+            .call_sites
+            .iter()
+            .filter(|call| {
+                let span = admitted.source_mappings[call.source.index()]
+                    .locator
+                    .anchor()
+                    .span();
+                span.start_byte() as usize == deferred_call
+                    && span.end_byte() as usize == deferred_call + "Use(r)".len()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deferred_sites.len(), 2, "{:#?}", admitted.call_sites);
+        assert!(
+            deferred_sites.iter().all(|call| {
+                call.invocation_mode == CallInvocationMode::Ordinary
+                    && call.execution_timing == ExecutionTiming::SameInvocation
+            }),
+            "{deferred_sites:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9550: real Go calls had no adapter admission regression case"
+    )]
+    fn call_control_real_direct_call_is_admitted() {
+        let procedures =
+            lower_fixture("package p\ntype R struct{}\nfunc f(x *R) { g(x) }\nfunc g(x *R) {}");
+        let f = procedures
+            .iter()
+            .find(|p| p.locator.declaration().last_segment_name() == Some("f"))
+            .unwrap();
+        assert_eq!(
+            f.call_control_coverage.admission,
+            Ok(()),
+            "{:#?}",
+            f.call_control_coverage.branches
+        );
+        assert!(
+            f.call_control_coverage
+                .branches
+                .iter()
+                .any(|b| b.kind == CallControlKind::ExplicitCall
+                    && b.disposition == CallControlDisposition::Represented)
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9954: package-qualified calls and lowered binary conditions refused scoped coverage"
+    )]
+    fn call_control_admits_package_call_and_binary_condition() {
+        let source = "package p\nimport \"os\"\nfunc Leaked(path string) { file, err := os.Open(path); if err != nil { return }; _ = file }";
+        let procedures = lower_fixture(source);
+        let leaked = procedures
+            .iter()
+            .find(|p| p.locator.declaration().last_segment_name() == Some("Leaked"))
+            .expect("Leaked is lowered");
+        assert_eq!(
+            leaked.call_control_coverage.admission,
+            Ok(()),
+            "{:#?}",
+            leaked.call_control_coverage.branches
+        );
     }
 
     fn assert_immutable_value_capture_relay<'a>(
@@ -18447,6 +20759,9 @@ func run() {
             panic!("run has one unresolved spawned interface call: {run:#?}");
         };
         assert_eq!(call.declared_targets, CallableTargetResolution::Unknown);
+        // The assignment still boxes the pointer into the interface, as any
+        // same-file interface destination does; only the dispatch proof, and
+        // so the receiver extraction, is refused.
         assert!(
             run.points
                 .iter()
@@ -18455,7 +20770,7 @@ func run() {
                     !matches!(
                         event.effect,
                         SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
+                            kind: ValueFlowKind::ReferenceUnboxing,
                             ..
                         }
                     )
@@ -20714,6 +23029,9 @@ func shadowed(copy func([]int, []int) int) {
         assert_eq!(
             effects,
             [
+                // The `[]int{1, 2}` literal stores its two elements first.
+                ("write", Some(0)),
+                ("write", Some(1)),
                 ("read", Some(0)),
                 ("read", Some(1)),
                 ("write", Some(0)),
@@ -21635,6 +23953,86 @@ func outer() {
         }));
     }
 
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9447: malformed Go literal formals leaked outer captures through an unproved scope"
+    )]
+    #[test]
+    fn malformed_literal_formals_refuse_outer_captures_but_keep_proven_local_captures() {
+        const SOURCE: &str = r#"package main
+func outer(value int) {
+    valid := func() { _ = value }
+    malformed := func(value int, other *) {
+        _ = value
+        known := 1
+        nested := func() {
+            _ = known
+            _ = value
+        }
+        nested()
+    }
+    _, _ = valid, malformed
+}
+"#;
+        let procedures = lower_fixture(SOURCE);
+        let outer = named_procedure(&procedures, "outer");
+        let mut children = procedures
+            .iter()
+            .filter(|procedure| procedure.lexical_parent == Some(outer.id))
+            .collect::<Vec<_>>();
+        children.sort_unstable_by_key(|procedure| procedure.locator.anchor().span().start_byte());
+        let [valid, malformed] = children.as_slice() else {
+            panic!("expected valid and malformed child literals: {children:#?}");
+        };
+        let nested_children = procedures
+            .iter()
+            .filter(|procedure| procedure.lexical_parent == Some(malformed.id))
+            .collect::<Vec<_>>();
+        let [nested] = nested_children.as_slice() else {
+            panic!("expected nested literal in malformed owner: {procedures:#?}");
+        };
+
+        assert_eq!(
+            outer.captures.len(),
+            1,
+            "only valid child captures outer value: {outer:#?}"
+        );
+        assert_eq!(outer.captures[0].target, valid.id);
+        assert!(
+            malformed
+                .captures
+                .iter()
+                .all(|capture| capture.target != nested.id
+                    || source_text(
+                        SOURCE,
+                        value_source_span(malformed, capture_source_value(malformed, capture))
+                    ) == "known"),
+            "unproved outer value must not be relayed through malformed owner: {malformed:#?}"
+        );
+        assert_eq!(
+            malformed.captures.len(),
+            1,
+            "known owner-local value still reaches nested: {malformed:#?}"
+        );
+        assert_eq!(malformed.captures[0].target, nested.id);
+        assert!(
+            malformed.gaps.iter().any(|gap| {
+                gap.capability == SemanticCapability::ParameterFlow
+                    && gap.kind == SemanticGapKind::Unknown
+            }),
+            "malformed formal layout remains open: {malformed:#?}"
+        );
+        for procedure in [*malformed, *nested] {
+            assert!(
+                procedure.gaps.iter().any(|gap| {
+                    gap.capability == SemanticCapability::Captures
+                        && gap.kind == SemanticGapKind::Unknown
+                        && matches!(gap.subject, SemanticGapSubject::Procedure)
+                }),
+                "unproved capture ancestry remains open: {procedure:#?}"
+            );
+        }
+    }
+
     #[test]
     fn binding_assigned_by_nested_func_literal_relays_the_shared_cell() {
         let procedures = lower_fixture(
@@ -21774,6 +24172,384 @@ func outer() {
                 )
             })
         }));
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10267: typed multi-result interface initialization lost pointer boxing"
+    )]
+    #[test]
+    fn typed_multi_result_reference_boxing() {
+        // `any` is the predeclared empty interface. `I` is a same-file
+        // non-empty interface: Go boxes a pointer into it exactly as into
+        // `any`, and the assertion recovers the payload either way.
+        for (interface, declaration) in [
+            ("any", ""),
+            ("I", "type I interface{ M() }\nfunc (*Resource) M() {}\n"),
+        ] {
+            let source = format!(
+                r#"package main
+type Resource struct{{}}
+{declaration}func pair() (*Resource, *Resource) {{ return nil, nil }}
+func initialize() {{
+    var a, b {interface} = pair()
+    pointer := a.(*Resource)
+    consume(pointer, b)
+}}
+"#
+            );
+            let procedures = lower_fixture(&source);
+            let procedure = named_procedure(&procedures, "initialize");
+            let effects = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .map(|event| &event.effect)
+                .collect::<Vec<_>>();
+            let boxes = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceBoxing,
+                        source,
+                        target,
+                    } => Some((*source, *target)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                boxes.len(),
+                2,
+                "{interface}: each pointer result must be boxed: {procedure:#?}"
+            );
+            for (ordinal, (source, _)) in boxes.iter().enumerate() {
+                assert!(matches!(&procedure.values[source.index()].kind,
+                    SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == format!("go.normal_result.{ordinal}")));
+            }
+            assert!(
+                effects.iter().any(|effect| matches!(
+                    effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceUnboxing,
+                        ..
+                    }
+                )),
+                "{interface}: assertion must recover the reference payload: {procedure:#?}"
+            );
+            // A same-file interface target is known: boxing it is complete.
+            assert!(
+                procedure
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.capability != SemanticCapability::Assignments),
+                "{interface}: a same-file interface target must not report an Assignments gap: {procedure:#?}"
+            );
+        }
+        // The predeclared `error` is not yet an interface to the boxing and
+        // payload helpers (#10436), so the binding records an assignment gap
+        // instead of claiming the pointers' identity.
+        let procedures = lower_fixture(
+            "package main\ntype Resource struct{}\nfunc (*Resource) Error() string { return \"\" }\nfunc pair() (*Resource, *Resource) { return nil, nil }\nfunc initialize() {\n    var a, b error = pair()\n    pointer := a.(*Resource)\n    consume(pointer, b)\n}\n",
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::Assignments),
+            "an error destination must stay unresolved: {procedure:#?}"
+        );
+        // An interface source keeps its payload: each result binds directly.
+        let procedures = lower_fixture(
+            "package main\ntype I interface{ M() }\nfunc pair() (I, I) { return nil, nil }\nfunc initialize() {\n    var a, b any = pair()\n    consume(a, b)\n}\n",
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        for ordinal in 0..2 {
+            let result = procedure.values.iter().position(|value| matches!(&value.kind,
+                SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == format!("go.normal_result.{ordinal}")
+            )).expect("call result");
+            assert!(
+                procedure
+                    .points
+                    .iter()
+                    .flat_map(|point| &point.events)
+                    .any(|event| matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow { source, kind: ValueFlowKind::Local, .. }
+                            if source.index() == result
+                    )),
+                "an interface result must bind without conversion: {procedure:#?}"
+            );
+        }
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Assignments),
+            "interface-to-interface assignment is known: {procedure:#?}"
+        );
+        // An `error` source is not yet an interface to these helpers
+        // (#10436), so its payload stays unresolved.
+        let procedures = lower_fixture(
+            "package main\nfunc pair() (error, error) { return nil, nil }\nfunc initialize() {\n    var a, b any = pair()\n    consume(a, b)\n}\n",
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::Assignments),
+            "an error source must stay unresolved: {procedure:#?}"
+        );
+        // An imported result type cannot be classified here, so it stays
+        // unresolved instead of being boxed or converted.
+        let procedures = lower_fixture(
+            "package main\nimport \"example.com/other\"\nfunc pair() (other.I, other.I) { return nil, nil }\nfunc initialize() {\n    var a, b any = pair()\n    consume(a, b)\n}\n",
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::Assignments),
+            "an imported source must stay unresolved: {procedure:#?}"
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10267: typed multi-result maps lost comma-ok storage metadata"
+    )]
+    #[test]
+    fn typed_multi_result_map_lookup() {
+        let procedures = lower_fixture(
+            r#"package main
+func pair() (map[string]int, map[string]int) { return nil, nil }
+func initialize(key string) {
+    var a, b map[string]int = pair()
+    v, ok := a[key]
+    consume(v, ok, b)
+}
+"#,
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        assert!(
+            !procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.kind == SemanticGapKind::Unsupported
+                    && gap.capability == SemanticCapability::Assignments),
+            "map lookup must be supported: {procedure:#?}"
+        );
+        assert!(
+            procedure.values.iter().any(|value| matches!(&value.kind,
+                SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == "go.map_presence"
+            )),
+            "map lookup must have a presence result: {procedure:#?}"
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10267: parenthesized local callee inherited package result proof"
+    )]
+    #[test]
+    fn typed_multi_result_shadowed_parenthesized_call() {
+        let procedures = lower_fixture(
+            r#"package main
+type Resource struct { value int }
+func pair() (*Resource, *Resource) { return nil, nil }
+func initialize(pair func() (any, any)) {
+    var a, b any = (pair)()
+    pointer := a.(*Resource)
+    consume(pointer, b)
+}
+"#,
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        assert!(
+            !procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .any(|event| matches!(
+                    event.effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::ReferenceUnboxing,
+                        ..
+                    }
+                )),
+            "shadowed call proves no payload: {procedure:#?}"
+        );
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10267: comma-ok presence Boolean was boxed as a reference"
+    )]
+    #[test]
+    fn typed_multi_result_presence_is_not_reference() {
+        for initializer in ["m[key]", "x.(*Resource)"] {
+            let source = format!(
+                r#"package main
+type Resource struct {{ value int }}
+func initialize(m map[string]*Resource, key string, x any) {{
+    var a, b any = {initializer}
+    consume(a, b)
+}}
+"#
+            );
+            let procedures = lower_fixture(&source);
+            let procedure = named_procedure(&procedures, "initialize");
+            let boxes = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .filter(|event| {
+                    matches!(
+                        event.effect,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::ReferenceBoxing,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(
+                boxes, 1,
+                "only the pointer result is a reference: {procedure:#?}"
+            );
+        }
+    }
+
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10267: typed unnamed map results lost backing-store identity"
+    )]
+    #[test]
+    fn typed_multi_result_map_preserves_identity() {
+        // Aliases denote the same type: `N` and `M` are both `map[string]int`,
+        // so neither initialization converts the map.
+        for prelude in [
+            "type M map[string]int\nfunc pair() (M, M) { return nil, nil }\n",
+            "type M = map[string]int\ntype N = map[string]int\nfunc pair() (M, M) { return nil, nil }\n",
+        ] {
+            let declared = if prelude.contains("type N") {
+                "N"
+            } else {
+                "map[string]int"
+            };
+            let source = format!(
+                r#"package main
+{prelude}func initialize() {{
+    var a, b {declared} = pair()
+    a["key"] = 1
+    consume(a["key"], b)
+}}
+"#
+            );
+            let procedures = lower_fixture(&source);
+            let procedure = named_procedure(&procedures, "initialize");
+            for ordinal in 0..2 {
+                let result = procedure.values.iter().position(|value| matches!(&value.kind,
+                    SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == format!("go.normal_result.{ordinal}")
+                )).expect("call result");
+                assert!(
+                    procedure.points.iter().flat_map(|point| &point.events).any(
+                        |event| matches!(event.effect, SemanticEffect::ValueFlow {
+                        source, kind: ValueFlowKind::BackingStore { .. }, ..
+                    } if source.index() == result)
+                    ),
+                    "{declared}: map result must flow without conversion: {procedure:#?}"
+                );
+            }
+            assert!(
+                procedure
+                    .gaps
+                    .iter()
+                    .all(|gap| gap.capability != SemanticCapability::Assignments),
+                "{declared}: aliases of one map type are known identical: {procedure:#?}"
+            );
+        }
+        // An alias inside a type literal: the map either keeps its identity or
+        // the initialization records an assignment gap, never a silent
+        // conversion.
+        let procedures = lower_fixture(
+            "package main\ntype E = int\nfunc pair() (map[string]E, map[string]E) { return nil, nil }\nfunc initialize() {\n    var a, b map[string]int = pair()\n    consume(a, b)\n}\n",
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        let preserved = (0..2).all(|ordinal| {
+            let result = procedure.values.iter().position(|value| matches!(&value.kind,
+                SemanticValueKind::LanguageDefined(kind) if kind.as_ref() == format!("go.normal_result.{ordinal}")
+            )).expect("call result");
+            procedure.points.iter().flat_map(|point| &point.events).any(|event| {
+                matches!(event.effect, SemanticEffect::ValueFlow {
+                    source, kind: ValueFlowKind::BackingStore { .. }, ..
+                } if source.index() == result)
+            })
+        });
+        let gapped = procedure
+            .gaps
+            .iter()
+            .any(|gap| gap.capability == SemanticCapability::Assignments);
+        assert!(
+            preserved || gapped,
+            "nested alias converted silently: {procedure:#?}"
+        );
+        // A blank destination's unresolvable result type records no gap.
+        let procedures = lower_fixture(
+            "package main\nimport \"example.com/other\"\nfunc pair() (other.MapAlias, map[string]int) { return nil, nil }\nfunc initialize() {\n    var _, m map[string]int = pair()\n    consume(m)\n}\n",
+        );
+        let procedure = named_procedure(&procedures, "initialize");
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .all(|gap| gap.capability != SemanticCapability::Assignments),
+            "a blank destination left an assignment gap: {procedure:#?}"
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10267: cross-file typed tuple results silently lost reference payload completeness"
+    )]
+    fn typed_multi_result_cross_file_records_assignment_gap() {
+        let source = "package main\nfunc initialize() { var a, b any = pair(); consume(a, b) }\n";
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Go)
+            .file("caller.go", source)
+            .file(
+                "callee.go",
+                "package main\ntype R struct{}\nfunc pair() (*R, *R) { return nil, nil }\n",
+            )
+            .build();
+        let prepared = prepared_fixture(source);
+        let SemanticOutcome::Complete {
+            value: procedures, ..
+        } = GoSemanticLowerer
+            .lower(
+                &project.file("caller.go"),
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("cross-file caller lowers")
+        else {
+            panic!("lowering must complete")
+        };
+        let procedure = named_procedure(&procedures, "initialize");
+        let call = procedure
+            .call_sites
+            .iter()
+            .find(|call| call.normal_results.len() == 2)
+            .expect("pair results remain selectable");
+        let second = call.normal_results[1];
+        assert!(procedure.points.iter().flat_map(|point| &point.events).any(|event|
+            matches!(event.effect, SemanticEffect::ValueFlow { source, .. } if source == second)
+        ), "{procedure:#?}");
+        assert!(
+            procedure
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::Assignments
+                    && gap.kind == SemanticGapKind::Unsupported),
+            "{procedure:#?}"
+        );
     }
 
     #[test]
@@ -22583,7 +25359,9 @@ func explicitlyTyped() {
                 Some((procedure, call))
             })
             .collect::<Vec<_>>();
-        assert_eq!(inferred.len(), 2, "{inferred:#?}");
+        // #10267: the explicitly typed spec lowers its results like the
+        // inferred forms instead of recording a conservative gap.
+        assert_eq!(inferred.len(), 3, "{inferred:#?}");
 
         let mut assignment_counts = Vec::new();
         for (procedure, call) in inferred {
@@ -22629,26 +25407,7 @@ func explicitlyTyped() {
             assignment_counts.push(assignment_sources.len());
         }
         assignment_counts.sort_unstable();
-        assert_eq!(assignment_counts, vec![1, 2]);
-
-        let explicitly_typed = procedures
-            .iter()
-            .find(|procedure| {
-                procedure.gaps.iter().any(|gap| {
-                    gap.subject == SemanticGapSubject::Point
-                        && gap.capability == SemanticCapability::Assignments
-                        && gap.detail.as_ref()
-                            == "Go multi-name, tuple, and multi-result var initialization flow is not yet lowered"
-                })
-            })
-            .expect("explicitly typed multi-result var stays conservative");
-        assert!(
-            explicitly_typed
-                .call_sites
-                .iter()
-                .all(|call| call.normal_results.is_empty()),
-            "{explicitly_typed:#?}"
-        );
+        assert_eq!(assignment_counts, vec![1, 2, 2]);
     }
     #[test]
     fn full_slice_capacity_controls_exact_append_replacement() {
@@ -22895,5 +25654,130 @@ func (receiver *cell) factory(seed int) func() int {
         assert!(
             !procedure.is_formal_cell_initialization(selected_store.0, &selected_store.1.effect)
         );
+    }
+}
+use brokk_bifrost_semantic::analyzer::semantic::{CallControlDisposition, CallControlKind};
+
+fn go_call_control_branch(node: Node<'_>) -> (CallControlKind, CallControlDisposition) {
+    use CallControlDisposition as D;
+    use FootprintExclusion as E;
+    use FootprintRefusal as R;
+    // A node reaches this classifier only when lowering claimed it, so each
+    // Represented kind is one that its lowering arm emits rows for.
+    match node.kind() {
+        "call_expression" => (CallControlKind::ExplicitCall, D::Represented),
+        "return_statement" | "if_statement" | "for_statement" | "select_statement" => {
+            (CallControlKind::Control, D::Represented)
+        }
+        // Lowering claims a defer only when it registers one stable call that
+        // a cleanup scope runs on every exit route.
+        "defer_statement" => (CallControlKind::Deferred, D::Represented),
+        "go_statement" => (CallControlKind::Deferred, D::Refused(R::UnclassifiedBranch)),
+        "func_literal" | "function_declaration" | "method_declaration" => (
+            CallControlKind::NestedCallable,
+            D::Refused(R::UnclassifiedBranch),
+        ),
+        // A method callee belongs to its represented call. A field or index
+        // access may fault, and Go lowers that fault only as a gap, not as an
+        // exceptional edge.
+        "selector_expression"
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "call_expression"
+                    && parent
+                        .child_by_field_name("function")
+                        .is_some_and(|function| function.id() == node.id())
+            }) =>
+        {
+            (CallControlKind::ImplicitAccess, D::Represented)
+        }
+        "selector_expression" | "index_expression" => (
+            CallControlKind::ImplicitAccess,
+            D::Refused(R::UnclassifiedBranch),
+        ),
+        "unary_expression" if unary_operator_kind(node) == Some("&") => {
+            (CallControlKind::Syntax, D::Represented)
+        }
+        // `*` is a dereference and `<-` a receive; neither has been proved.
+        "unary_expression" if matches!(unary_operator_kind(node), Some("*" | "<-")) => {
+            (CallControlKind::Syntax, D::Refused(R::UnclassifiedBranch))
+        }
+        // A claimed var spec has every nonblank name bound and no recorded
+        // gap. Its zero value, inferred initializer, or typed initializer
+        // follows the same binding branch as an assignment. The declaration
+        // wrappers are claimed only when all of their specs are bound.
+        "assignment_statement"
+        | "short_var_declaration"
+        | "var_declaration"
+        | "var_spec_list"
+        | "var_spec"
+        // Binary lowering emits operand value flows, short-circuit control
+        // edges where needed, and an exceptional gap for a faulting operator.
+        | "binary_expression"
+        // Unary operators other than `&`, `*` and `<-` emit operand flows and
+        // a gap for a faulting operator; a parenthesis emits a wrapper flow.
+        | "unary_expression"
+        | "parenthesized_expression" => {
+            (CallControlKind::Syntax, D::Represented)
+        }
+        "type_conversion_expression" => (
+            CallControlKind::InitializationConversion,
+            D::Refused(R::UnclassifiedBranch),
+        ),
+        "identifier"
+        // An import qualifier is resolved syntax, never a runtime receiver.
+        | "package_identifier"
+        | "field_identifier"
+        | "type_identifier"
+        | "parameter_declaration"
+        | "pointer_type"
+        | "argument_list"
+        | "expression_list"
+        | "statement_list"
+        | "parameter_list"
+        | "block"
+        | "expression_statement"
+        | "int_literal"
+        | "float_literal"
+        | "imaginary_literal"
+        | "rune_literal"
+        | "interpreted_string_literal"
+        | "interpreted_string_literal_content"
+        | "escape_sequence"
+        | "raw_string_literal"
+        | "raw_string_literal_content" => (
+            CallControlKind::Syntax,
+            D::AffirmativelyExcluded(E::NoInstance),
+        ),
+        _ => (CallControlKind::Syntax, D::Refused(R::UnclassifiedBranch)),
+    }
+}
+
+#[cfg(test)]
+mod go_call_control_tests {
+    use super::*;
+
+    #[test]
+    fn implicit_call_construct_cannot_be_silently_excluded() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
+        let tree = parser
+            .parse("package p\nfunc f() { defer g() }", None)
+            .unwrap();
+        let mut stack = vec![tree.root_node()];
+        let mut found = false;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "defer_statement" {
+                found = true;
+                assert!(!matches!(
+                    go_call_control_branch(node).1,
+                    CallControlDisposition::AffirmativelyExcluded(_)
+                ));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert!(found, "grammar construct was not found");
     }
 }

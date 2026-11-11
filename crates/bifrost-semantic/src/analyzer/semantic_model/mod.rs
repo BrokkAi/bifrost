@@ -142,7 +142,7 @@ pub use crate::analyzer::semantic_model::artifact::CompiledSyncMapOperation;
 
 pub use crate::analyzer::semantic_model::artifact::CompiledTaskSpawnCondition;
 
-pub use crate::analyzer::semantic_model::artifact::DecodeLimits;
+pub use crate::analyzer::semantic_model::artifact::{DEFAULT_MAX_TEXT_BYTES, DecodeLimits};
 
 pub use crate::analyzer::semantic_model::artifact::PayloadKind;
 
@@ -278,6 +278,13 @@ pub fn compiled_manifest_json_schema() -> String {
     // serde_json's preserve_order feature, so sort like the authoring schema.
     let mut schema = schemars::schema_for!(CompiledPackManifest);
     let schema_object = schema.ensure_object();
+    schema_object["properties"]["schema_version"]
+        .as_object_mut()
+        .expect("manifest schema version is an object")
+        .insert(
+            "enum".to_owned(),
+            serde_json::json!(SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS),
+        );
     schema_object.sort_keys();
     for value in schema_object.values_mut() {
         value.sort_all_objects();
@@ -289,6 +296,13 @@ pub fn compiled_manifest_json_schema() -> String {
 pub fn authoring_json_schema() -> String {
     let mut schema = schemars::schema_for!(AuthoredSemanticModelPack);
     let schema_object = schema.ensure_object();
+    schema_object["properties"]["schema_version"]
+        .as_object_mut()
+        .expect("authoring schema version is an object")
+        .insert(
+            "enum".to_owned(),
+            serde_json::json!(SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS),
+        );
     schema_object.insert(
         "allOf".to_owned(),
         serde_json::json!([
@@ -313,7 +327,7 @@ pub fn authoring_json_schema() -> String {
                     "properties": {
                         "schema_version": {
                             "minimum": VERSION_INDEPENDENT_COMPATIBILITY_SCHEMA_VERSION,
-                            "maximum": SEMANTIC_MODEL_SCHEMA_VERSION
+                            "maximum": SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION
                         }
                     },
                     "required": ["schema_version"]
@@ -340,7 +354,7 @@ pub fn authoring_json_schema() -> String {
 #[cfg(test)]
 mod tests {
 
-    use crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION;
+    use crate::analyzer::semantic_model::SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION;
 
     use crate::analyzer::semantic_model::authoring_json_schema;
     use serde_json::{Value, json};
@@ -358,7 +372,7 @@ mod tests {
         let schema: Value = serde_json::from_str(&authoring_json_schema()).unwrap();
         assert_eq!(
             schema["properties"]["schema_version"]["maximum"],
-            SEMANTIC_MODEL_SCHEMA_VERSION
+            SEMANTIC_MODEL_LATEST_SUPPORTED_SCHEMA_VERSION
         );
         assert_eq!(
             schema["$defs"]["Compatibility"]["properties"]["bifrost"]["type"],

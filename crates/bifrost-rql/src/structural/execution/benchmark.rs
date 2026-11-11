@@ -925,7 +925,7 @@ fn benchmark_workspace(project: Arc<dyn Project>) -> WorkspaceAnalyzer {
         project,
         AnalyzerConfig {
             parallelism: Some(1),
-            memo_cache_budget_bytes: Some(MEMO_CACHE_BUDGET_BYTES),
+            retention_budget_bytes: Some(4 * (MEMO_CACHE_BUDGET_BYTES)),
             ..AnalyzerConfig::default()
         },
     )
@@ -1362,7 +1362,7 @@ fn run_case(
         project,
         AnalyzerConfig {
             parallelism: Some(1),
-            memo_cache_budget_bytes: Some(MEMO_CACHE_BUDGET_BYTES),
+            retention_budget_bytes: Some(4 * (MEMO_CACHE_BUDGET_BYTES)),
             ..AnalyzerConfig::default()
         },
     )

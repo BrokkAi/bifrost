@@ -102,6 +102,16 @@ pub fn go_failure_handler_body_shapes(
     callable: Range,
     cancellation: &CancellationToken,
 ) -> Vec<NativeFailureBranch> {
+    let _model_scope =
+        match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            workspace.analyzer(),
+        ) {
+            Ok(scope) => scope,
+            Err(_) => {
+                workspace.analyzer().mark_execution_dependent();
+                return Vec::new();
+            }
+        };
     let mut evidence = HandlerEvidence {
         request: None,
         cancellation,
@@ -120,6 +130,16 @@ pub fn go_failure_handler_file_body_shapes(
     cancellation: &CancellationToken,
 ) -> HashMap<Range, Vec<NativeFailureBranch>> {
     use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_tree_preorder};
+    let _model_scope =
+        match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            workspace.analyzer(),
+        ) {
+            Ok(scope) => scope,
+            Err(_) => {
+                workspace.analyzer().mark_execution_dependent();
+                return HashMap::default();
+            }
+        };
     let mut evidence = HandlerEvidence {
         request: None,
         cancellation,
@@ -505,6 +525,9 @@ fn native_binding_static_type<'tree, 'go>(
         BoundedResolution::Exceeded { limit, work } => {
             return BoundedResolution::Exceeded { limit, work };
         }
+        BoundedResolution::Unavailable { reason, work } => {
+            return BoundedResolution::Unavailable { reason, work };
+        }
         BoundedResolution::Cancelled { work } => return BoundedResolution::Cancelled { work },
         BoundedResolution::Complete {
             value: SelectedResolutionOperationOutcome::Cancelled(_),
@@ -618,17 +641,7 @@ fn native_binding_static_type<'tree, 'go>(
     };
     let mut selected = BindingProof::Open;
     let remaining = BoundedReceiverQuery {
-        budget: ReceiverAnalysisBudget {
-            max_scope_nodes: query
-                .budget
-                .max_scope_nodes
-                .saturating_sub(work.scope_nodes),
-            max_summary_expansions: query
-                .budget
-                .max_summary_expansions
-                .saturating_sub(work.summary_expansions),
-            ..query.budget
-        },
+        budget: query.budget.remaining_after(&work),
         ..query
     };
     let mut receiver = None;
@@ -667,21 +680,7 @@ fn native_binding_static_type<'tree, 'go>(
                 && let Some(receiver) = receiver
             {
                 let member_query = BoundedReceiverQuery {
-                    budget: ReceiverAnalysisBudget {
-                        max_scope_nodes: query
-                            .budget
-                            .max_scope_nodes
-                            .saturating_sub(total_work.scope_nodes),
-                        max_summary_expansions: query
-                            .budget
-                            .max_summary_expansions
-                            .saturating_sub(total_work.summary_expansions),
-                        max_resolution_rounds: query
-                            .budget
-                            .max_resolution_rounds
-                            .saturating_sub(total_work.resolution_rounds),
-                        ..query.budget
-                    },
+                    budget: query.budget.remaining_after(&total_work),
                     ..query
                 };
                 match super::model_receiver::go_selected_static_type_member(
@@ -717,6 +716,18 @@ fn native_binding_static_type<'tree, 'go>(
                             ),
                         };
                     }
+                    Ok(BoundedResolution::Unavailable {
+                        reason,
+                        work: member_work,
+                    }) => {
+                        return BoundedResolution::Unavailable {
+                            reason,
+                            work: super::native_points::go_add_resolution_work(
+                                total_work,
+                                member_work,
+                            ),
+                        };
+                    }
                     Ok(BoundedResolution::Cancelled { work: member_work }) => {
                         return BoundedResolution::Cancelled {
                             work: super::native_points::go_add_resolution_work(
@@ -741,6 +752,13 @@ fn native_binding_static_type<'tree, 'go>(
             work: type_work,
         } => BoundedResolution::Exceeded {
             limit,
+            work: super::native_points::go_add_resolution_work(work, type_work),
+        },
+        BoundedResolution::Unavailable {
+            reason,
+            work: type_work,
+        } => BoundedResolution::Unavailable {
+            reason,
             work: super::native_points::go_add_resolution_work(work, type_work),
         },
         BoundedResolution::Cancelled { work: type_work } => BoundedResolution::Cancelled {

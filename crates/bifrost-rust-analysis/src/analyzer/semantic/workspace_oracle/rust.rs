@@ -49,3 +49,32 @@ pub fn rust_std_builtin_call(
         span.start_byte() as usize..span.end_byte() as usize,
     ))
 }
+
+/// A declared local/parameter String identity, without inferred call results.
+pub(crate) fn rust_std_direct_string_receiver(
+    workspace: &WorkspaceAnalyzer,
+    call: &CallSiteHandle,
+) -> Result<bool, SemanticProviderError> {
+    let procedure = call.procedure();
+    if procedure.artifact().key().language() != LanguageDialect::Standard(Language::Rust) {
+        return Ok(false);
+    }
+    let Some(row) = procedure.semantics().call_site(call.id()) else {
+        return Ok(false);
+    };
+    let Some(mapping) = procedure.semantics().source_mapping(row.source) else {
+        return Ok(false);
+    };
+    let Some((file, source)) = exact_source_for_procedure(workspace, procedure, usize::MAX)? else {
+        return Ok(false);
+    };
+    let span = mapping.locator.anchor().span();
+    Ok(
+        crate::analyzer::rust::std_types::rust_std_direct_string_receiver(
+            workspace.analyzer(),
+            &file,
+            &source,
+            span.start_byte() as usize..span.end_byte() as usize,
+        ),
+    )
+}

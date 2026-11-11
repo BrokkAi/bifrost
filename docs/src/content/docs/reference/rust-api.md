@@ -437,10 +437,13 @@ workspace's current generation.
 | `roots` | `Vec<PathBuf>` | `vec![root]`. API version 1 requires exactly one root. |
 | `analyzer_config` | `AnalyzerConfig` | `AnalyzerConfig::default()` |
 | `limits` | `ExtensionLimits` | `ExtensionLimits::default()` |
-| `persistence` | `ExtensionPersistenceMode` | `Ephemeral`: an in-memory store discarded when the workspace drops. `.persisted()` selects `Persisted`, the repository's persisted analyzer cache. |
+| `persistence` | `ExtensionPersistenceMode` | `Ephemeral`: a temp-file-backed store discarded when the workspace drops. `.persisted()` selects `Persisted`, the repository's persisted analyzer cache. |
 
-`ExtensionWorkspace::open(options)` reads every workspace file into memory and
-builds the analyzer. A file that is not valid UTF-8 is skipped and reported in
+`ExtensionWorkspace::open(options, &budget)` reads every workspace file into memory and
+builds the analyzer. `budget` is a `RetentionBudget`, re-exported from
+`brokk_bifrost::extension`, that caps the derived data the analyzer retains in
+memory between requests. Build one with `RetentionBudget::new(bytes)`, or with
+`RetentionBudget::retain_nothing()` to retain none. A file that is not valid UTF-8 is skipped and reported in
 `open_diagnostics()`. A file larger than `limits.source_bytes` fails the open.
 Errors are `ExtensionWorkspaceError::InvalidRoots`, `Project`, `Analyzer`, or
 `Store` (a persisted store could not be opened; there is no fallback to an
@@ -557,8 +560,8 @@ plan into a new destination directory.
 ```rust
 use brokk_bifrost::extension::{
     CodeQuery, ExtensionCancellation, ExtensionCapabilityId, ExtensionCompatibility,
-    ExtensionLimits, ExtensionWorkspace, ExtensionWorkspaceOptions, StructuralRequest,
-    negotiate_extension_api,
+    ExtensionLimits, ExtensionWorkspace, ExtensionWorkspaceOptions, RetentionBudget,
+    StructuralRequest, negotiate_extension_api,
 };
 use serde_json::json;
 
@@ -572,7 +575,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let negotiated = negotiate_extension_api(&compatibility)?;
     println!("api {}.{}", negotiated.version.major, negotiated.version.minor);
 
-    let workspace = ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(".").persisted())?;
+    let budget = RetentionBudget::new(256 * 1024 * 1024);
+    let workspace =
+        ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(".").persisted(), &budget)?;
     let query = CodeQuery::from_json(&json!({
         "match": { "kind": "function", "name": "run" }
     }))?;

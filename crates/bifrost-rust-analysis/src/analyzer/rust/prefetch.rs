@@ -210,7 +210,7 @@ pub(crate) fn prefetch_caller_files(
                             use crate::analyzer::rust::std_types::completed_proof;
                             let attempt = completed_proof(Some(cancellation), || {
                                 crate::analyzer::rust::expand_rust_imported_external_callee_attempt_with_operation(
-                                                    analyzer, file, text, Some(&external_site), Some(factory), Some(&mut *operation),
+                                                    analyzer, file, text, Some(&external_site), factory, &mut *operation,
                                                 ).into_value()
                             });
                             match attempt {

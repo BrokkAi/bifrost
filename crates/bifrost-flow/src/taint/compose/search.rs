@@ -25,14 +25,19 @@ mod refinement;
 
 use std::sync::Arc;
 
+use crate::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, reverse_reachability,
+};
 use crate::analyzer::semantic::icfg::invoked_call_at;
+use crate::analyzer::semantic::partial_flow::ports::heap_ports_overlap;
 use crate::analyzer::semantic::partial_flow::{
     CrossedCalls, HeapSelector, PartialFlowOutcome, PartialFlowPort, ProcedurePartialFlows,
     call_input_value, heap_selectors,
 };
 use crate::analyzer::semantic::{
-    AccessPathRoot, AccessPathTail, BindingOriginIndex, CallSiteId, EvidenceCompleteness,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticCallSite, SemanticRequest, ValueId,
+    AccessPathRoot, AccessPathTail, BindingOriginIndex, CallSiteId, CallStorageSharing,
+    ControlContinuation, EvidenceCompleteness, ProcedureHandle, ProgramPointHandle, ProgramPointId,
+    ProofStatus, SemanticCallSite, SemanticRequest, ValueId,
 };
 use crate::dataflow::{SemanticInputStatus, UnmodeledCallBehavior};
 use crate::hash::{HashMap, HashSet};
@@ -41,14 +46,15 @@ use crate::value_flow::{
     ValueFlowPlan, ValueFlowSinkId,
 };
 
-use super::graph::{ComposedSourceId, Endpoint, ExecutionTarget, Hop, HopQuality};
+use super::graph::{ComposedSourceId, Endpoint, ExecutionTarget, Hop, HopQuality, ObjectAnchor};
 use super::labels::{ComposeLabels, LabelFunctionId, LabelFunctions};
 use super::provider::bound_return_member_matches;
 use super::provider::{
     BlockedGap, BoundSanitizer, BoundSource, BoundTransform, CallModel, CallerLocation,
     Completeness, CompositionProvider, DispatchCandidate, EndpointEvidence, ExecutionArmContext,
-    ExecutionEndpointStatus, ExecutionSource, InteriorObservation, InteriorSeed, InteriorTarget,
-    Openness, StoreChannelLink, StoreWriteObservation,
+    ExecutionCertificate, ExecutionCertificateStep, ExecutionEndpointStatus, ExecutionSource,
+    InteriorObservation, InteriorSeed, InteriorTarget, Openness, StoreChannelLink,
+    StoreWriteObservation,
 };
 use super::{ComposeError, CompositionBudget};
 
@@ -59,62 +65,103 @@ use super::{ComposeError, CompositionBudget};
 pub struct SourceSinkPair {
     pub source: ComposedSourceId,
     pub sink: ValueFlowSinkId,
+    pub certificate: Option<ExecutionCertificate>,
     pub paths: Vec<(Vec<Hop>, HopQuality)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionReach {
     pub root: DurableProcedureKey,
-    pub source: usize,
+    pub target: ExecutionReachTarget,
     pub function: LabelFunctionId,
     pub quality: HopQuality,
     pub hops: Vec<Hop>,
     pub incoming: Option<ExecutionArmContext>,
+    pub certificate: ExecutionCertificate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ExecutionReachTarget {
+    Source(usize),
+    Procedure(Box<DurableProcedureKey>),
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecutionOutcome<L: ComposeLabels> {
     pub sources: Vec<ExecutionSource<L::Fact>>,
     pub reaches: Vec<ExecutionReach>,
+    pub procedure_reaches: Vec<ExecutionReach>,
     pub functions: LabelFunctions<L>,
     pub incomplete: Vec<Incompleteness>,
     pub stats: SearchStats,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectReach<Fact> {
+    pub root: ObjectAnchor,
+    pub source: ExecutionSource<Fact>,
+    pub function: LabelFunctionId,
+    pub quality: HopQuality,
+    pub hops: Vec<Hop>,
+}
+
 /// A budget lane of [`CompositionBudget`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BudgetLane {
     Procedures,
     Hops,
     CallersPerProcedure,
+    Semantic,
 }
 
 /// Why the composed result may miss a flow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Incompleteness {
+    ExecutionRoots {
+        reason: Box<str>,
+        cause: super::IncompleteCause,
+    },
     Execution {
         procedure: DurableProcedureKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
     },
     /// A dispatch on the frontier was open, unproven or exceeded.
     Dispatch {
         call: DurableCallSiteKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
+    },
+    /// A model's override closure covers a call, but an accepted path uses
+    /// receiver or argument storage whose concrete implementation is unknown.
+    ModelOutputStorage {
+        call: DurableCallSiteKey,
+        source_call: Option<DurableCallSiteKey>,
     },
     /// An incoming-call enumeration was truncated or incomplete.
     Callers {
         procedure: DurableProcedureKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
     },
     /// A model replaced a call but is not complete.
     Model {
         call: DurableCallSiteKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
+    },
+    /// A selected partial summary contributes its stated edges while all
+    /// unspecified effects of this exact call remain unknown.
+    UnknownSummaryEffects {
+        call: DurableCallSiteKey,
+        summary: Box<crate::dataflow::ProcedureSummaryKey>,
+        target: crate::analyzer::semantic::DispatchBoundaryKind,
     },
     /// An interior run was not complete.
     Interior {
         procedure: DurableProcedureKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
     },
     /// A procedure's partial flows were not projected completely.
     PartialFlows {
@@ -128,6 +175,8 @@ pub enum Incompleteness {
     Open {
         procedure: DurableProcedureKey,
         residual: Box<[DurableCallSiteKey]>,
+        residual_causes: Box<[super::IncompleteCause]>,
+        cause: super::IncompleteCause,
         blocked: Option<BlockedGap>,
         status: SemanticInputStatus,
         reason: Box<str>,
@@ -148,30 +197,83 @@ pub enum Incompleteness {
     Endpoints {
         procedure: DurableProcedureKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
     },
     /// The selected write inventory for a demanded store read was incomplete.
     StoreInventory {
         procedure: DurableProcedureKey,
         reason: Box<str>,
+        cause: super::IncompleteCause,
     },
     /// A source, of the plan or matched on the frontier, at `point` whose
     /// selector evidence is not proven and complete, as the ICFG engine's
     /// plan reports it.
-    SourceEvidence { point: ProgramPointHandle },
+    SourceEvidence {
+        point: ProgramPointHandle,
+        cause: super::IncompleteCause,
+    },
     /// A bound sink of the plan at `point` whose selector evidence is not
     /// proven and complete.
-    SinkEvidence { point: ProgramPointHandle },
+    SinkEvidence {
+        point: ProgramPointHandle,
+        cause: super::IncompleteCause,
+    },
     /// A budget lane was exhausted.
     Budget(BudgetLane),
     /// The request was cancelled.
     Cancelled,
+    Object {
+        anchor: Box<ObjectAnchor>,
+        reason: Box<str>,
+        cause: super::IncompleteCause,
+    },
+}
+
+impl Incompleteness {
+    pub fn cause(&self) -> super::IncompleteCause {
+        use super::{IncompleteCause as Cause, OperationalCause as Operational};
+        match self {
+            Self::Dispatch { cause, .. }
+            | Self::Open { cause, .. }
+            | Self::ExecutionRoots { cause, .. }
+            | Self::Execution { cause, .. }
+            | Self::Callers { cause, .. }
+            | Self::Model { cause, .. }
+            | Self::Interior { cause, .. }
+            | Self::Endpoints { cause, .. }
+            | Self::StoreInventory { cause, .. }
+            | Self::SourceEvidence { cause, .. }
+            | Self::SinkEvidence { cause, .. }
+            | Self::Object { cause, .. } => *cause,
+            Self::Budget(lane) => Cause::Operational(Operational::Budget(*lane)),
+            Self::Cancelled => Cause::Operational(Operational::Cancelled),
+            Self::PartialFlows { outcome, .. } => match outcome {
+                PartialFlowOutcome::ExceededBudget | PartialFlowOutcome::Truncated => {
+                    Cause::Operational(Operational::Budget(BudgetLane::Semantic))
+                }
+                PartialFlowOutcome::Error => Cause::Operational(Operational::Provider),
+                PartialFlowOutcome::Complete => {
+                    unreachable!("complete partial flows do not emit incompleteness")
+                }
+            },
+            // The selected summary's authored content leaves these effects
+            // unknown; no budget or provider stop produced them.
+            Self::ModelOutputStorage { .. }
+            | Self::UnknownSummaryEffects { .. }
+            | Self::MissingCaptureBinding { .. }
+            | Self::UnplacedTransfer { .. } => Cause::Content,
+        }
+    }
 }
 
 /// The result of stage 1.
 #[derive(Debug, Clone)]
 pub struct SearchOutcome<L: ComposeLabels> {
+    pub effective_budget: CompositionBudget,
+    pub object_reaches: Vec<ObjectReach<L::Fact>>,
     pub execution_sources: Vec<ExecutionSource<L::Fact>>,
     pub execution_reaches: Vec<ExecutionReach>,
+    pub execution_procedure_reaches: Vec<ExecutionReach>,
     pub pairs: Vec<SourceSinkPair>,
     pub strict_pairs: Vec<SourceSinkPair>,
     /// The source table the pairs index: the plan's sources, then those the
@@ -189,6 +291,9 @@ pub struct SearchOutcome<L: ComposeLabels> {
     pub abstained: Vec<DurableCallSiteKey>,
     pub stats: SearchStats,
     pub barrier_notes: Vec<super::ValueTypeBarrierFindingNotes>,
+    /// The model each dispatched call returned, for the report's reads of
+    /// the calls on reported paths.
+    pub call_models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<L::Function>>>>,
 }
 
 /// What stage 1 did, for the run's timing notes.
@@ -220,6 +325,8 @@ pub struct SearchStats {
 /// frontier.
 pub(super) struct ComposeQuery<'a, L: ComposeLabels> {
     pub(super) execution_roots: Vec<DurableProcedureKey>,
+    pub(super) object_roots: Vec<ObjectAnchor>,
+    pub(super) certified_procedure_reaches: Option<Vec<ExecutionReach>>,
     pub(super) value_flow: Option<&'a ValueFlowPlan>,
     pub(super) labels: L,
     pub(super) sinks: Vec<(ValueFlowSinkId, L::Fact)>,
@@ -230,17 +337,21 @@ pub(super) struct ComposeQuery<'a, L: ComposeLabels> {
 
 /// A transform applied in place on the paths through its call, as opposed to
 /// a matched [`BoundTransform`], which is a flow of its own.
-pub(super) struct InPlaceTransform<Function> {
-    pub(super) point: ProgramPointHandle,
-    pub(super) carrier: ValueFlowCarrier,
-    pub(super) function: Function,
+pub struct InPlaceTransform<Function> {
+    pub point: ProgramPointHandle,
+    pub carrier: ValueFlowCarrier,
+    pub function: Function,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Root {
     Execution(Box<DurableProcedureKey>),
-    Sink(ValueFlowSinkId),
-    Port(Box<(DurableProcedureKey, PartialFlowPort)>),
+    Object(Box<ObjectAnchor>),
+    Sink(ValueFlowSinkId, Option<ExecutionCertificate>),
+    Port(
+        Box<(DurableProcedureKey, PartialFlowPort)>,
+        Option<ExecutionCertificate>,
+    ),
     StoreWrite(usize),
 }
 
@@ -250,8 +361,9 @@ impl Root {
     fn unbalanced(&self) -> bool {
         match self {
             Self::Execution(_) => false,
-            Self::Sink(_) => true,
-            Self::Port(port) => matches!(port.1, PartialFlowPort::CaptureOut { .. }),
+            Self::Object(_) => false,
+            Self::Sink(..) => true,
+            Self::Port(port, _) => matches!(port.1, PartialFlowPort::CaptureOut { .. }),
             Self::StoreWrite(_) => true,
         }
     }
@@ -265,6 +377,7 @@ struct ItemKey {
     /// Label function of the path from `node` to `root`.
     function: LabelFunctionId,
     execution_arm: Option<ExecutionArmContext>,
+    certificate: Option<ExecutionCertificate>,
 }
 
 /// How an item was derived. Every index names an item or reach that existed
@@ -453,6 +566,9 @@ struct InteriorIndex {
 struct DispatchAnswer {
     candidates: Vec<Arc<DispatchCandidate>>,
     uncertain: bool,
+    incomplete_reason: Option<Box<str>>,
+    incomplete_cause: Option<super::IncompleteCause>,
+    external_body_unavailable: Option<super::provider::ExternalBodyUnavailableGap>,
     /// The best quality of the call's own continuation edges.
     continuation: HopQuality,
 }
@@ -486,6 +602,9 @@ where
     L: ComposeLabels<Fact = Provider::Fact, Function = Provider::Function>,
 {
     execution_roots: Vec<DurableProcedureKey>,
+    object_roots: Vec<ObjectAnchor>,
+    object_reaches: Vec<ObjectReach<L::Fact>>,
+    certified_procedure_reaches: Option<Vec<ExecutionReach>>,
     value_flow: Option<&'a ValueFlowPlan>,
     /// What each bound sink accepts.
     accepted: HashMap<ValueFlowSinkId, L::Fact>,
@@ -499,6 +618,8 @@ where
     execution_sources: Vec<ExecutionSource<L::Fact>>,
     execution_source_ids: HashMap<(ExecutionTarget, Box<str>, Option<ExecutionArmContext>), usize>,
     execution_reaches: Vec<ExecutionReach>,
+    execution_procedure_reaches: Vec<ExecutionReach>,
+    execution_procedure_reach_ids: HashMap<(ExecutionCertificate, DurableProcedureKey), usize>,
     execution_reach_ids: HashMap<
         (
             DurableProcedureKey,
@@ -523,6 +644,10 @@ where
     /// Live handles of procedures an interior run has served.
     handles: HashMap<DurableProcedureKey, ProcedureHandle>,
     dispatches: HashMap<DurableCallSiteKey, Arc<DispatchAnswer>>,
+    /// The model each dispatched call returned with its dispatch.
+    dispatched_models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<L::Function>>>>,
+    /// Models the search has used; a model's incompleteness is noted once,
+    /// at its first use.
     models: HashMap<DurableCallSiteKey, Option<Arc<CallModel<L::Function>>>>,
     callers: HashMap<DurableProcedureKey, Arc<[DurableCallSiteKey]>>,
     parents: HashMap<DurableProcedureKey, Option<DurableProcedureKey>>,
@@ -580,6 +705,16 @@ where
         .map(|(sink, _)| *sink)
         .collect::<Vec<_>>();
     let mut search = Search::new(query, provider, budget);
+    for anchor in search.object_roots.clone() {
+        search.add_item(
+            anchor.procedure.clone(),
+            Root::Object(Box::new(anchor.clone())),
+            Endpoint::Object(Box::new(anchor)),
+            LabelFunctionId::IDENTITY,
+            HopQuality::CERTAIN,
+            Derivation::Root,
+        );
+    }
     for procedure in search.execution_roots.clone() {
         search.add_item(
             procedure.clone(),
@@ -595,9 +730,14 @@ where
     // path reaches them. The plan's sources are noted as `Search::new` adds
     // them, and a source matched on the frontier as the search enters its
     // procedure.
-    for (_, spec) in value_flow.into_iter().flat_map(ValueFlowPlan::sinks) {
+    for sink in &sinks {
+        let spec = value_flow
+            .expect("a value sink has a value plan")
+            .sink(*sink)
+            .expect("a selected sink names a bound sink of the plan");
         if !evidence_quality(spec.proof(), spec.completeness()).is_certain() {
             search.note(Incompleteness::SinkEvidence {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
                 point: spec.point().clone(),
             });
         }
@@ -622,16 +762,127 @@ where
             None => HopQuality::CERTAIN,
         }
         .conjoin(evidence_quality(spec.proof(), spec.completeness()));
-        search.add_item(
-            procedure,
-            Root::Sink(sink),
-            Endpoint::Sink(sink),
-            LabelFunctionId::IDENTITY,
-            quality,
-            Derivation::Root,
-        );
+        if spec
+            .point()
+            .procedure()
+            .semantics()
+            .lexical_parent()
+            .is_some()
+            && let Some(reaches) = &search.certified_procedure_reaches
+        {
+            let matching = reaches
+                .iter()
+                .filter(|reach| {
+                    matches!(&reach.target, ExecutionReachTarget::Procedure(target) if target.as_ref() == &procedure)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                search.note(Incompleteness::Execution {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                    procedure: procedure.clone(),
+                    reason: "nested sink has no admitted invoked instance".into(),
+                });
+                search.add_item(
+                    procedure,
+                    Root::Sink(sink, None),
+                    Endpoint::Sink(sink),
+                    LabelFunctionId::IDENTITY,
+                    quality.conjoin(HopQuality::UNCERTAIN),
+                    Derivation::Root,
+                );
+            } else {
+                // One invoked returned instance does not certify other calls
+                // of the same factory. Keep an open seed for each unmatched
+                // creation prefix so its source path cannot disappear.
+                let unmatched_factory = matching.iter().any(|invoked| {
+                    let Some(instance) = invoked
+                        .certificate
+                        .prefix
+                        .last()
+                        .and_then(|step| step.instance.as_ref())
+                    else {
+                        return false;
+                    };
+                    reaches.iter().any(|producer| {
+                        producer.certificate.root == invoked.certificate.root
+                            && matches!(&producer.target, ExecutionReachTarget::Procedure(target) if target.as_ref() == &instance.producer)
+                            && producer.certificate.prefix.last().is_some_and(|step| {
+                                Some(&step.call) != instance.factory_call.as_ref()
+                            })
+                    })
+                });
+                if unmatched_factory {
+                    search.note(Incompleteness::Execution {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        procedure: procedure.clone(),
+                        reason: "factory has a creation prefix without this callable invocation"
+                            .into(),
+                    });
+                    search.add_item(
+                        procedure.clone(),
+                        Root::Sink(sink, None),
+                        Endpoint::Sink(sink),
+                        LabelFunctionId::IDENTITY,
+                        quality.conjoin(HopQuality::UNCERTAIN),
+                        Derivation::Root,
+                    );
+                }
+                for reach in matching {
+                    let certified = reach.certificate.prefix.last().is_some_and(|step| {
+                        step.target == ExecutionTarget::Procedure(Box::new(procedure.clone()))
+                            && step.instance.is_some()
+                    }) || (reach.certificate.root == procedure
+                        && reach.certificate.prefix.is_empty());
+                    if !certified {
+                        search.note(Incompleteness::Execution {
+                            cause: super::IncompleteCause::Operational(
+                                super::OperationalCause::Provider,
+                            ),
+                            procedure: procedure.clone(),
+                            reason: "nested sink instance has no exact creation certificate".into(),
+                        });
+                    }
+                    search.add_item(
+                        procedure.clone(),
+                        Root::Sink(sink, Some(reach.certificate)),
+                        Endpoint::Sink(sink),
+                        LabelFunctionId::IDENTITY,
+                        quality.conjoin(if certified {
+                            reach.quality
+                        } else {
+                            HopQuality::UNCERTAIN
+                        }),
+                        Derivation::Root,
+                    );
+                }
+            }
+        } else {
+            search.add_item(
+                procedure,
+                Root::Sink(sink, None),
+                Endpoint::Sink(sink),
+                LabelFunctionId::IDENTITY,
+                quality,
+                Derivation::Root,
+            );
+        }
     }
+    let trace_search = std::env::var_os("BIFROST_TIMING").is_some();
+    let mut traced_items = 0usize;
+    let search_start = std::time::Instant::now();
     while let Some(work) = search.work.pop() {
+        traced_items += 1;
+        if trace_search && (traced_items == 1 || traced_items.is_multiple_of(100)) {
+            eprintln!(
+                "[bifrost-timing] NOTE composition.search items={traced_items} queued={} retained={} elapsed={:?}",
+                search.work.len(),
+                search.items.len(),
+                search_start.elapsed()
+            );
+        }
         if search.stopped {
             break;
         }
@@ -639,34 +890,74 @@ where
             search.note(Incompleteness::Cancelled);
             break;
         }
+        if request.stop_observed() {
+            search.note(Incompleteness::Budget(BudgetLane::Semantic));
+            break;
+        }
         match work {
             Work::Item(item) => search.process_item(item, request)?,
             Work::Reach(reach) => search.process_reach(reach),
         }
+        if request.cancellation.is_cancelled() {
+            search.note(Incompleteness::Cancelled);
+            break;
+        }
+        if request.stop_observed() {
+            search.note(Incompleteness::Budget(BudgetLane::Semantic));
+            break;
+        }
+        if trace_search && traced_items == 1 {
+            eprintln!(
+                "[bifrost-timing] NOTE composition.search first_item_done elapsed={:?}",
+                search_start.elapsed()
+            );
+        }
     }
-    for procedure in search.visited.clone() {
-        if let Openness::Open {
-            residual,
-            blocked,
-            status,
-            reason,
-        } = provider
-            .openness(&procedure, request)
-            .map_err(provider_error)?
-        {
-            search.note(Incompleteness::Open {
-                procedure,
+    if trace_search {
+        eprintln!(
+            "[bifrost-timing] NOTE composition.search complete items={traced_items} limits={budget:?} elapsed={:?}",
+            search_start.elapsed()
+        );
+    }
+    if !request.stop_observed() {
+        for procedure in search.visited.clone() {
+            if let Openness::Open {
                 residual,
+                residual_causes,
+                cause,
                 blocked,
                 status,
                 reason,
-            });
+            } = provider
+                .openness(&procedure, request)
+                .map_err(provider_error)?
+            {
+                search.note(Incompleteness::Open {
+                    procedure,
+                    residual,
+                    residual_causes,
+                    cause,
+                    blocked,
+                    status,
+                    reason,
+                });
+            }
         }
     }
     // Refinement uses recorded derivations only. It cannot spend a fresh
     // topology budget or discover another source, edge or procedure.
-    if provider.has_value_type_barriers() {
+    if !request.stop_observed() && provider.has_value_type_barriers() {
         search.refine(request)?;
+    }
+    if trace_search {
+        eprintln!(
+            "[bifrost-timing] NOTE composition.search reasons={:?} limits={budget:?}",
+            search
+                .incomplete
+                .iter()
+                .map(|reason| (reason.cause(), reason))
+                .collect::<Vec<_>>()
+        );
     }
     let stats = SearchStats {
         recorded_supports: search.recorded_supports,
@@ -677,14 +968,21 @@ where
         baseline_candidate_pairs: search.baseline_candidate_pairs,
         strict_replays: search.strict_replays,
         procedures: search.visited.len() + search.execution_visited.len(),
-        hops: search.items.len() + search.reaches.len() + search.execution_reaches.len(),
+        hops: search.items.len()
+            + search.reaches.len()
+            + search.execution_reaches.len()
+            + search.object_reaches.len()
+            + search.execution_procedure_reaches.len(),
         dispatches: search.dispatches.len(),
         callers: search.callers.values().map(|calls| calls.len()).sum(),
     };
     let pairs = search.pairs();
     Ok(SearchOutcome {
+        effective_budget: budget,
+        object_reaches: search.object_reaches,
         execution_sources: search.execution_sources,
         execution_reaches: search.execution_reaches,
+        execution_procedure_reaches: search.execution_procedure_reaches,
         pairs,
         strict_pairs: search.strict_pairs,
         sources: search.sources,
@@ -694,6 +992,7 @@ where
         abstained: search.abstained,
         stats,
         barrier_notes: search.barrier_notes,
+        call_models: search.dispatched_models,
     })
 }
 
@@ -709,6 +1008,8 @@ where
     fn new(query: ComposeQuery<'a, L>, provider: &'a Provider, budget: CompositionBudget) -> Self {
         let ComposeQuery {
             execution_roots,
+            object_roots,
+            certified_procedure_reaches,
             value_flow,
             labels,
             sinks,
@@ -737,6 +1038,9 @@ where
         }
         let mut search = Self {
             execution_roots,
+            object_roots,
+            object_reaches: Vec::new(),
+            certified_procedure_reaches,
             value_flow,
             accepted: sinks.into_iter().collect(),
             provider,
@@ -746,6 +1050,8 @@ where
             execution_sources: Vec::new(),
             execution_source_ids: HashMap::default(),
             execution_reaches: Vec::new(),
+            execution_procedure_reaches: Vec::new(),
+            execution_procedure_reach_ids: HashMap::default(),
             execution_reach_ids: HashMap::default(),
             execution_visited: HashSet::default(),
             sources_in: HashMap::default(),
@@ -759,6 +1065,7 @@ where
             location_interiors: HashMap::default(),
             handles: HashMap::default(),
             dispatches: HashMap::default(),
+            dispatched_models: HashMap::default(),
             models: HashMap::default(),
             callers: HashMap::default(),
             parents: HashMap::default(),
@@ -811,6 +1118,7 @@ where
     fn add_source(&mut self, source: BoundSource<L::Fact>) {
         if matches!(source.evidence, EndpointEvidence::Known(quality) if !quality.is_certain()) {
             self.note(Incompleteness::SourceEvidence {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
                 point: source.point.clone(),
             });
         }
@@ -837,8 +1145,9 @@ where
             .provider
             .endpoints(procedure, request)
             .map_err(provider_error)?;
-        if let Completeness::Incomplete { reason } = endpoints.completeness {
+        if let Completeness::Incomplete { reason, cause } = endpoints.completeness {
             self.note(Incompleteness::Endpoints {
+                cause,
                 procedure: procedure.clone(),
                 reason,
             });
@@ -1044,6 +1353,17 @@ where
         quality: HopQuality,
         derivation: Derivation,
     ) {
+        let certificate = match &derivation {
+            Derivation::Root => match &root {
+                Root::Sink(_, certificate) | Root::Port(_, certificate) => certificate.clone(),
+                // Object roots, like execution and store roots, do not carry
+                // a value-root invocation certificate. They use typed
+                // handoffs and cannot enter the capture-hop path.
+                Root::Execution(_) | Root::Object(_) | Root::StoreWrite(_) => None,
+            },
+            Derivation::Step { next, .. } => self.items[*next].key.certificate.clone(),
+            Derivation::Summary(summary) => self.items[summary.next].key.certificate.clone(),
+        };
         self.add_item_with_arm(
             ItemKey {
                 procedure,
@@ -1051,6 +1371,7 @@ where
                 node,
                 function,
                 execution_arm: None,
+                certificate,
             },
             quality,
             derivation,
@@ -1074,7 +1395,10 @@ where
             }
             return;
         }
-        if self.items.len() + self.reaches.len() + self.execution_reaches.len()
+        if self.items.len()
+            + self.reaches.len()
+            + self.execution_reaches.len()
+            + self.execution_procedure_reaches.len()
             >= self.budget.max_hops
         {
             self.exhaust(BudgetLane::Hops);
@@ -1219,14 +1543,15 @@ where
             // snapshot may discharge fewer gaps than the stored one, so verify
             // that it did not lose a baseline discharge certificate.
             if !Arc::ptr_eq(&projection, &flows)
-                && (!projection.relations_complete
-                    || (projection.open && !flows.open)
+                && (!projection.relations_proven()
+                    || (projection.has_undischarged_gap() && !flows.has_undischarged_gap())
                     || flows
                         .discharged_gaps
                         .iter()
                         .any(|gap| !projection.discharged_gaps.contains(gap)))
             {
                 self.note(Incompleteness::Interior {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
                     procedure: procedure.clone(),
                     reason: "a label-group projection has open relations".into(),
                 });
@@ -1261,26 +1586,48 @@ where
         if let Some(answer) = self.dispatches.get(call) {
             return Ok(Arc::clone(answer));
         }
-        let dispatch = self
+        let (dispatch, model) = self
             .provider
             .dispatch(call, request)
             .map_err(provider_error)?;
-        let uncertain = match dispatch.completeness {
-            Completeness::Complete => false,
-            Completeness::Incomplete { reason } => {
-                self.note(Incompleteness::Dispatch {
-                    call: call.clone(),
-                    reason,
-                });
-                true
-            }
+        self.dispatched_models
+            .insert(call.clone(), model.map(Arc::new));
+        let (incomplete_cause, incomplete_reason) = match dispatch.completeness {
+            Completeness::Complete => (None, None),
+            Completeness::Incomplete { cause, reason } => (Some(cause), Some(reason)),
         };
+        let uncertain = incomplete_reason.is_some();
         let answer = Arc::new(DispatchAnswer {
             candidates: dispatch.candidates.into_iter().map(Arc::new).collect(),
             uncertain,
+            incomplete_reason,
+            incomplete_cause,
+            external_body_unavailable: dispatch.external_body_unavailable,
             continuation: dispatch.continuation,
         });
         self.dispatches.insert(call.clone(), Arc::clone(&answer));
+        Ok(answer)
+    }
+
+    fn note_dispatch_incomplete(&mut self, call: &DurableCallSiteKey, answer: &DispatchAnswer) {
+        if let Some(reason) = &answer.incomplete_reason {
+            self.note(Incompleteness::Dispatch {
+                call: call.clone(),
+                reason: reason.clone(),
+                cause: answer
+                    .incomplete_cause
+                    .expect("incomplete dispatch has a cause"),
+            });
+        }
+    }
+
+    fn dispatch_noted(
+        &mut self,
+        call: &DurableCallSiteKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Arc<DispatchAnswer>, ComposeError> {
+        let answer = self.dispatch(call, request)?;
+        self.note_dispatch_incomplete(call, &answer);
         Ok(answer)
     }
 
@@ -1311,7 +1658,7 @@ where
         for class in crossed {
             let mut quality = HopQuality::CERTAIN;
             for &call in class.iter() {
-                let dispatch = self.dispatch(&(procedure.clone(), call), request)?;
+                let dispatch = self.dispatch_noted(&(procedure.clone(), call), request)?;
                 quality = quality.conjoin(dispatch.continuation);
             }
             best = best.join(quality);
@@ -1328,21 +1675,51 @@ where
         Ok((quality, class.clone()))
     }
 
-    fn model(&mut self, call: &DurableCallSiteKey) -> Option<Arc<CallModel<L::Function>>> {
+    /// The model that replaces `call`, which returns with the call's dispatch.
+    /// A call this search has not dispatched yet is dispatched here.
+    fn model(
+        &mut self,
+        call: &DurableCallSiteKey,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<Arc<CallModel<L::Function>>>, ComposeError> {
         if let Some(model) = self.models.get(call) {
-            return model.clone();
+            return Ok(model.clone());
         }
-        let model = self.provider.model(call).map(Arc::new);
+        if !self.dispatched_models.contains_key(call) {
+            self.dispatch(call, request)?;
+        }
+        let model = self
+            .dispatched_models
+            .get(call)
+            .expect("dispatch records the call's model")
+            .clone();
         if let Some(model) = &model
-            && let Completeness::Incomplete { reason } = &model.completeness
+            && model.retains_dispatch
+        {
+            self.note(Incompleteness::UnknownSummaryEffects {
+                call: call.clone(),
+                summary: model
+                    .summary
+                    .clone()
+                    .map(Box::new)
+                    .expect("an open authored model names its summary"),
+                target: model
+                    .summary_target
+                    .clone()
+                    .expect("an open authored model names its target"),
+            });
+        }
+        if let Some(model) = &model
+            && let Completeness::Incomplete { reason, cause } = &model.completeness
         {
             self.note(Incompleteness::Model {
+                cause: *cause,
                 call: call.clone(),
                 reason: reason.clone(),
             });
         }
         self.models.insert(call.clone(), model.clone());
-        model
+        Ok(model)
     }
 
     fn callers(
@@ -1357,8 +1734,9 @@ where
             .provider
             .callers(procedure, request)
             .map_err(provider_error)?;
-        if let Completeness::Incomplete { reason } = answer.completeness {
+        if let Completeness::Incomplete { reason, cause } = answer.completeness {
             self.note(Incompleteness::Callers {
+                cause,
                 procedure: procedure.clone(),
                 reason,
             });
@@ -1406,6 +1784,7 @@ where
     fn writeback_seeds(
         &mut self,
         handle: &ProcedureHandle,
+        data: &ProcedureData,
         seeds: &mut Vec<InteriorSeed>,
         ends: &mut Vec<Endpoint>,
         request: &mut SemanticRequest<'_>,
@@ -1420,8 +1799,56 @@ where
                 continue;
             }
             let call_key = (caller.clone(), call.id);
-            let dispatch = self.dispatch(&call_key, request)?;
-            if self.model(&call_key).is_some() {
+            let dispatch = self.dispatch_noted(&call_key, request)?;
+            if let Some(model) = self.model(&call_key, request)? {
+                for binding in model.writeback.iter() {
+                    let whole_storage = PartialFlowPort::Heap {
+                        root: Box::new(binding.actual.clone()),
+                        selectors: Box::default(),
+                        tail: AccessPathTail::Exact,
+                    };
+                    for heap in std::iter::once(&whole_storage).chain(data.flows.ports.iter().filter(|port| {
+                        matches!(port, PartialFlowPort::Heap { root, .. } if root.as_ref() == &binding.actual)
+                    })) {
+                        let PartialFlowPort::Heap { selectors, tail, .. } = heap else { unreachable!() };
+                        match heap_sharing(binding, selectors, *tail) {
+                            crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
+                            crate::analyzer::semantic::CallStorageSharing::Unknown => {
+                                self.note(Incompleteness::Model {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                                    call: call_key.clone(),
+                                    reason: "a model writeback has unknown storage sharing".into(),
+                                });
+                                continue;
+                            }
+                            crate::analyzer::semantic::CallStorageSharing::Shares => {}
+                        }
+                        if !binding.complete {
+                            self.note(Incompleteness::Model {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                                call: call_key.clone(),
+                                reason: "a model writeback has incomplete caller storage".into(),
+                            });
+                        }
+                        if !binding.proven || !binding.conversion_preserves_identity || binding.storage.is_empty() {
+                            self.note(Incompleteness::Model {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                                call: call_key.clone(),
+                                reason: "a model writeback has unproven shared storage".into(),
+                            });
+                            continue;
+                        }
+                        for storage in &binding.storage {
+                            seeds.push(InteriorSeed::Writeback {
+                                call: call.id,
+                                storage: Box::new(storage.clone()),
+                                selectors: selectors.clone(),
+                                tail: *tail,
+                            });
+                            ends.push(Endpoint::Port(heap.clone()));
+                        }
+                    }
+                }
                 continue;
             }
             for candidate in &dispatch.candidates {
@@ -1437,6 +1864,15 @@ where
                     else {
                         continue;
                     };
+                    if candidate
+                        .written_heap_ports
+                        .as_ref()
+                        .is_some_and(|written| {
+                            !written.iter().any(|port| heap_ports_overlap(heap, port))
+                        })
+                    {
+                        continue;
+                    }
                     for binding in candidate
                         .writeback
                         .iter()
@@ -1446,6 +1882,7 @@ where
                             crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
                             crate::analyzer::semantic::CallStorageSharing::Unknown => {
                                 self.note(Incompleteness::Dispatch {
+                                    cause: super::IncompleteCause::Content,
                                     call: call_key.clone(),
                                     reason: "a call writeback has unknown storage sharing".into(),
                                 });
@@ -1458,6 +1895,7 @@ where
                             || !binding.conversion_preserves_identity
                         {
                             self.note(Incompleteness::Dispatch {
+                                cause: super::IncompleteCause::Content,
                                 call: call_key.clone(),
                                 reason: "a call writeback has unproven shared storage".into(),
                             });
@@ -1499,8 +1937,9 @@ where
             .map_err(provider_error)?;
         let mut answer = Vec::new();
         for (function, flows) in projections {
-            if let Completeness::Incomplete { reason } = flows.completeness {
+            if let Completeness::Incomplete { reason, cause } = flows.completeness {
                 self.note(Incompleteness::Interior {
+                    cause,
                     procedure: procedure.clone(),
                     reason,
                 });
@@ -1571,7 +2010,7 @@ where
             } else {
                 self.store_writes[writes[0]].owner.clone()
             };
-            self.writeback_seeds(&handle, &mut seeds, &mut seed_ends, request)?;
+            self.writeback_seeds(&handle, data, &mut seeds, &mut seed_ends, request)?;
         }
         let mut index = InteriorIndex::default();
         for (function, flow) in self.run_interior(procedure, &seeds, &observations, request)? {
@@ -1601,8 +2040,9 @@ where
     }
 
     /// What reaches one caller-side location of `procedure`: an interior run
-    /// seeded at its sources and input ports, observing that location. Run
-    /// once per location.
+    /// seeded at its sources, input ports, and earlier call writebacks,
+    /// observing that location. Run once per location. The writeback seeds
+    /// let local member copies carry a callee write to a later call's input.
     fn location_interior(
         &mut self,
         procedure: &DurableProcedureKey,
@@ -1614,7 +2054,12 @@ where
         if let Some(reaching) = self.location_interiors.get(&key) {
             return Ok(Arc::clone(reaching));
         }
-        let (seeds, seed_ends) = self.interior_seeds(procedure, data, true);
+        let (mut seeds, mut seed_ends) = self.interior_seeds(procedure, data, true);
+        if !self.handles.contains_key(procedure) {
+            self.run_interior(procedure, &[], &[], request)?;
+        }
+        let handle = self.handles[procedure].clone();
+        self.writeback_seeds(&handle, data, &mut seeds, &mut seed_ends, request)?;
         let observations = [InteriorObservation::Location(location.clone())];
         let reaching: Reaching = self
             .run_interior(procedure, &seeds, &observations, request)?
@@ -1642,6 +2087,13 @@ where
             unreachable!("execution items have execution roots");
         };
         let root = root.as_ref().clone();
+        let certificate = key
+            .certificate
+            .clone()
+            .unwrap_or_else(|| ExecutionCertificate {
+                root: root.clone(),
+                prefix: Box::new([]),
+            });
         let quality = self.items[id].quality;
         let endpoints = self
             .provider
@@ -1667,10 +2119,16 @@ where
                 || !matches!(endpoints.status, ExecutionEndpointStatus::Absent))
         {
             self.note(Incompleteness::Execution {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
                 procedure: key.procedure.clone(),
                 reason: format!(
-                    "execution endpoints at {target:?} are open: {:?}, incoming {:?}",
-                    endpoints.status, key.execution_arm
+                    "execution endpoints are open: {}",
+                    match endpoints.status {
+                        ExecutionEndpointStatus::Complete => "complete",
+                        ExecutionEndpointStatus::Partial(_) => "partial",
+                        ExecutionEndpointStatus::Conflict(_) => "conflict",
+                        ExecutionEndpointStatus::Absent => "absent",
+                    }
                 )
                 .into(),
             });
@@ -1708,7 +2166,10 @@ where
                 }
                 continue;
             }
-            if self.items.len() + self.reaches.len() + self.execution_reaches.len()
+            if self.items.len()
+                + self.reaches.len()
+                + self.execution_reaches.len()
+                + self.execution_procedure_reaches.len()
                 >= self.budget.max_hops
             {
                 self.exhaust(BudgetLane::Hops);
@@ -1719,17 +2180,52 @@ where
                 .insert(reach_key, self.execution_reaches.len());
             self.execution_reaches.push(ExecutionReach {
                 root: root.clone(),
-                source: source_id,
+                target: ExecutionReachTarget::Source(source_id),
                 function: key.function,
                 quality: reach_quality,
                 hops: self.execution_item_path(id, reach_quality),
                 incoming: key.execution_arm.clone(),
+                certificate: certificate.clone(),
             });
         }
         let ExecutionTarget::Procedure(procedure) = target else {
             return Ok(());
         };
         let procedure = *procedure;
+        let procedure_key = (certificate.clone(), procedure.clone());
+        if let Some(&reach_id) = self.execution_procedure_reach_ids.get(&procedure_key) {
+            if !self.execution_procedure_reaches[reach_id]
+                .quality
+                .dominates(quality)
+            {
+                let hops = self.execution_item_path(id, quality);
+                let reach = &mut self.execution_procedure_reaches[reach_id];
+                reach.quality = reach.quality.join(quality);
+                reach.hops = hops;
+            }
+        } else {
+            if self.items.len()
+                + self.reaches.len()
+                + self.execution_reaches.len()
+                + self.execution_procedure_reaches.len()
+                >= self.budget.max_hops
+            {
+                self.exhaust(BudgetLane::Hops);
+                self.stopped = true;
+                return Ok(());
+            }
+            self.execution_procedure_reach_ids
+                .insert(procedure_key, self.execution_procedure_reaches.len());
+            self.execution_procedure_reaches.push(ExecutionReach {
+                root: root.clone(),
+                target: ExecutionReachTarget::Procedure(Box::new(procedure.clone())),
+                function: key.function,
+                quality,
+                hops: self.execution_item_path(id, quality),
+                incoming: key.execution_arm.clone(),
+                certificate: certificate.clone(),
+            });
+        }
         if self.execution_visited.insert(procedure.clone())
             && self.execution_visited.len() > self.budget.max_procedures
         {
@@ -1741,8 +2237,9 @@ where
             .provider
             .invocations(&procedure, request)
             .map_err(provider_error)?;
-        if let Completeness::Incomplete { reason } = inventory.coverage {
+        if let Completeness::Incomplete { reason, cause } = inventory.coverage {
             self.note(Incompleteness::Execution {
+                cause,
                 procedure: procedure.clone(),
                 reason,
             });
@@ -1750,7 +2247,7 @@ where
         for site in inventory.sites {
             let dispatch = self
                 .provider
-                .execution_dispatch(&site.call, request)
+                .execution_dispatch(&site.call, key.execution_arm.as_ref(), request)
                 .map_err(provider_error)?;
             let residual_discharged = !dispatch.arms.is_empty()
                 && dispatch.coverage != crate::analyzer::semantic::CandidateCoverage::Truncated
@@ -1768,12 +2265,99 @@ where
                     || residual_discharged);
             if !dispatch_closed {
                 self.note(Incompleteness::Execution {
+                    cause: match &dispatch.outcome {
+                        super::provider::ExecutionDispatchOutcome::Budget(_) => {
+                            super::IncompleteCause::Operational(super::OperationalCause::Budget(
+                                BudgetLane::Semantic,
+                            ))
+                        }
+                        super::provider::ExecutionDispatchOutcome::Cancelled(_) => {
+                            super::IncompleteCause::Operational(super::OperationalCause::Cancelled)
+                        }
+                        // Candidates cut off at a finite bound are a budget
+                        // stop even when the dispatch itself completed.
+                        super::provider::ExecutionDispatchOutcome::Complete
+                        | super::provider::ExecutionDispatchOutcome::Unsupported(_)
+                            if dispatch.coverage
+                                == crate::analyzer::semantic::CandidateCoverage::Truncated =>
+                        {
+                            super::IncompleteCause::Operational(super::OperationalCause::Budget(
+                                BudgetLane::Semantic,
+                            ))
+                        }
+                        super::provider::ExecutionDispatchOutcome::Complete
+                        | super::provider::ExecutionDispatchOutcome::Unsupported(_) => {
+                            super::IncompleteCause::Content
+                        }
+                    },
                     procedure: procedure.clone(),
-                    reason: format!("execution dispatch {:?} is open: {:?}", site.call, dispatch)
-                        .into(),
+                    reason: {
+                        let mut residuals = dispatch
+                            .residuals
+                            .iter()
+                            .map(|residual| residual.label())
+                            .collect::<Vec<_>>();
+                        residuals.sort_unstable();
+                        format!(
+                            "execution dispatch {} is open: outcome={} coverage={:?} residuals={residuals:?}",
+                            call_site_text(&site.call),
+                            match dispatch.outcome {
+                                super::provider::ExecutionDispatchOutcome::Complete => "complete",
+                                super::provider::ExecutionDispatchOutcome::Unsupported(_) => "unsupported",
+                                super::provider::ExecutionDispatchOutcome::Cancelled(_) => "cancelled",
+                                super::provider::ExecutionDispatchOutcome::Budget(_) => "budget",
+                            },
+                            dispatch.coverage
+                        )
+                        .into()
+                    },
                 });
             }
             for (ordinal, arm) in dispatch.arms.into_iter().enumerate() {
+                let step = ExecutionCertificateStep {
+                    call: site.call.clone(),
+                    ordinal,
+                    target: arm.target.clone(),
+                    instance: arm.instance.clone(),
+                    context: arm.context.clone(),
+                };
+                // A named recursive call revisits the same procedure inventory;
+                // it does not create another callable instance to certify.
+                if step.instance.is_none()
+                    && certificate.prefix.iter().any(|old| {
+                        old.instance.is_none()
+                            && old.target == step.target
+                            && old.context == step.context
+                    })
+                {
+                    continue;
+                }
+                if certificate.prefix.iter().any(|old| {
+                    old.context == step.context
+                        && match (&old.instance, &step.instance) {
+                            (Some(old), Some(new)) => old == new,
+                            _ => false,
+                        }
+                }) {
+                    self.note(Incompleteness::Execution {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        procedure: procedure.clone(),
+                        reason: format!(
+                            "repeated instance and context on execution path at {}",
+                            call_site_text(&step.call)
+                        )
+                        .into(),
+                    });
+                    continue;
+                }
+                let mut prefix = certificate.prefix.to_vec();
+                prefix.push(step);
+                let next_certificate = ExecutionCertificate {
+                    root: root.clone(),
+                    prefix: prefix.into_boxed_slice(),
+                };
                 let function = self.functions.intern(arm.function);
                 let composed = self.functions.then(function, key.function);
                 let hop = Hop::Invocation {
@@ -1782,6 +2366,7 @@ where
                     target: Box::new(arm.target.clone()),
                     function,
                     quality: arm.quality,
+                    certificate: next_certificate.clone(),
                 };
                 let owner = match &arm.target {
                     ExecutionTarget::Procedure(procedure) => procedure.as_ref().clone(),
@@ -1797,7 +2382,9 @@ where
                             call: site.call.clone(),
                             ordinal,
                             quality: arm.quality,
+                            certificate: next_certificate.clone(),
                         }),
+                        certificate: Some(next_certificate),
                     },
                     quality.conjoin(arm.quality),
                     Derivation::Step {
@@ -1834,6 +2421,126 @@ where
         }
     }
 
+    fn call_boundary_label(
+        &mut self,
+        call: &DurableCallSiteKey,
+        callee: &DurableProcedureKey,
+        from: &Endpoint,
+        to: &Endpoint,
+    ) -> (LabelFunctionId, HopQuality) {
+        self.provider
+            .call_boundary_function(call, callee, from, to)
+            .map_or(
+                (LabelFunctionId::IDENTITY, HopQuality::CERTAIN),
+                |(function, quality)| (self.functions.intern(function), quality),
+            )
+    }
+
+    fn process_object_item(
+        &mut self,
+        id: usize,
+        root: &ObjectAnchor,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<bool, ComposeError> {
+        let key = self.items[id].key.clone();
+        let relation = self
+            .provider
+            .object_relation(&key.procedure, &key.node, request)
+            .map_err(provider_error)?;
+        if !relation.complete {
+            self.note(Incompleteness::Object {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                anchor: Box::new(root.clone()),
+                reason: format!("object relation at {:?} is incomplete", key.node).into(),
+            });
+        }
+        let quality = self.items[id]
+            .quality
+            .conjoin(HopQuality::from_uncertain(!relation.complete));
+        for source in relation.sources {
+            if self.items.len()
+                + self.reaches.len()
+                + self.execution_reaches.len()
+                + self.object_reaches.len()
+                >= self.budget.max_hops
+            {
+                self.exhaust(BudgetLane::Hops);
+                self.stopped = true;
+                return Ok(relation.cross_call);
+            }
+            self.object_reaches.push(ObjectReach {
+                root: root.clone(),
+                source,
+                function: key.function,
+                quality,
+                hops: self.execution_item_path(id, quality),
+            });
+        }
+        for predecessor in relation.predecessors {
+            let function = self.functions.intern(predecessor.function);
+            let hop = Hop::Interior {
+                procedure: key.procedure.clone(),
+                from: predecessor.from.clone(),
+                to: key.node.clone(),
+                quality: predecessor.quality,
+                function,
+                crossed: Box::new([]),
+            };
+            let next_function = self.functions.then(function, key.function);
+            self.add_item(
+                key.procedure.clone(),
+                key.root.clone(),
+                predecessor.from,
+                next_function,
+                quality.conjoin(predecessor.quality),
+                Derivation::Step {
+                    hops: vec![hop],
+                    next: id,
+                },
+            );
+        }
+        Ok(relation.cross_call)
+    }
+
+    fn process_call_handoff(&mut self, id: usize, key: &ItemKey, quality: HopQuality) {
+        let Endpoint::CallHandoff {
+            call,
+            candidate,
+            binding,
+            function,
+            quality: handoff_quality,
+        } = &key.node
+        else {
+            unreachable!("only a typed handoff enters this method")
+        };
+        let (actual, formal) = candidate
+            .arguments
+            .get(binding.argument_index)
+            .expect("a client handoff indexes its selected candidate");
+        let hop = Hop::CallHandoff {
+            call: (key.procedure.clone(), *call),
+            callee: candidate.procedure.clone(),
+            actual: actual.clone(),
+            formal: formal.clone(),
+            exit: binding.exit,
+            continuity: binding.continuity,
+            function: *function,
+            quality: *handoff_quality,
+        };
+        let function = self.functions.then(*function, key.function);
+        self.add_item(
+            key.procedure.clone(),
+            key.root.clone(),
+            Endpoint::Port(actual.clone()),
+            function,
+            quality.conjoin(*handoff_quality),
+            Derivation::Step {
+                hops: vec![hop],
+                next: id,
+            },
+        );
+    }
+
     fn process_item(
         &mut self,
         id: usize,
@@ -1841,6 +2548,26 @@ where
     ) -> Result<(), ComposeError> {
         let key = self.items[id].key.clone();
         let quality = self.items[id].quality;
+        if let Root::Object(root) = &key.root {
+            let cross_call = self.process_object_item(id, root, request)?;
+            match &key.node {
+                Endpoint::Port(
+                    PartialFlowPort::CallResult { call, .. } | PartialFlowPort::CallThrown { call },
+                ) => {
+                    return if cross_call {
+                        self.descend(id, *call, request)
+                    } else {
+                        Ok(())
+                    };
+                }
+                Endpoint::Object(_) | Endpoint::Port(_) => return Ok(()),
+                Endpoint::CallHandoff { .. } => {
+                    self.process_call_handoff(id, &key, quality);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         if let Endpoint::Execution(target) = &key.node {
             self.process_execution_item(id, target.as_ref().clone(), request)?;
             return Ok(());
@@ -1848,6 +2575,10 @@ where
         let Some(data) = self.procedure(&key.procedure, request)? else {
             return Ok(());
         };
+        if matches!(key.node, Endpoint::CallHandoff { .. }) {
+            self.process_call_handoff(id, &key, quality);
+            return Ok(());
+        }
         if let Endpoint::Port(port @ PartialFlowPort::CallResult { .. }) = &key.node {
             self.open_store_read(id, port);
         }
@@ -1855,11 +2586,26 @@ where
             for flow in data.into.get(port).cloned().unwrap_or_default() {
                 let (flow_quality, crossed) =
                     self.flow_quality(&key.procedure, flow.uncertain, &flow.crossed, request)?;
+                let local = self
+                    .provider
+                    .local_function(
+                        &key.procedure,
+                        &Endpoint::Port(flow.from.clone()),
+                        &Endpoint::Port(port.clone()),
+                        request,
+                    )
+                    .map_err(provider_error)?;
+                let (local, local_quality) = local.map_or(
+                    (LabelFunctionId::IDENTITY, HopQuality::CERTAIN),
+                    |(function, quality)| (self.functions.intern(function), quality),
+                );
+                let flow_quality = flow_quality.conjoin(local_quality);
+                let along = self.functions.then(flow.function, local);
                 let hop = Hop::Stored {
                     procedure: key.procedure.clone(),
                     from: flow.from.clone(),
                     to: port.clone(),
-                    function: flow.function,
+                    function: along,
                     quality: flow_quality,
                     crossed,
                 };
@@ -1896,11 +2642,21 @@ where
                 let (flow_quality, crossed) =
                     self.flow_quality(&key.procedure, flow.uncertain, &flow.crossed, request)?;
                 let seed = flow.from;
+                let local = self
+                    .provider
+                    .local_function(&key.procedure, &seed, &key.node, request)
+                    .map_err(provider_error)?;
+                let (local, local_quality) = local.map_or(
+                    (LabelFunctionId::IDENTITY, HopQuality::CERTAIN),
+                    |(function, quality)| (self.functions.intern(function), quality),
+                );
+                let flow_quality = flow_quality.conjoin(local_quality);
+                let along = self.functions.then(flow.function, local);
                 let mut hops = vec![Hop::Interior {
                     procedure: key.procedure.clone(),
                     from: seed.clone(),
                     to: key.node.clone(),
-                    function: flow.function,
+                    function: along,
                     quality: flow_quality,
                     crossed,
                 }];
@@ -1930,6 +2686,8 @@ where
                         Derivation::Step { hops, next: id },
                     ),
                     Endpoint::Sink(_)
+                    | Endpoint::Object(_)
+                    | Endpoint::CallHandoff { .. }
                     | Endpoint::StoreWrite(_)
                     | Endpoint::Location(_)
                     | Endpoint::Execution(_) => {
@@ -1975,6 +2733,40 @@ where
                 };
                 self.descend(id, *call, request)
             }
+            Endpoint::Port(
+                port @ (PartialFlowPort::CallReceiver { call }
+                | PartialFlowPort::CallArgument { call, .. }),
+            ) => {
+                let call_key = (key.procedure.clone(), *call);
+                if self.model(&call_key, request)?.is_some_and(|model| {
+                    model
+                        .receiver_reads
+                        .iter()
+                        .any(|binding| &binding.actual == port)
+                }) {
+                    if !self.handles.contains_key(&key.procedure) {
+                        self.run_interior(&key.procedure, &[], &[], request)?;
+                    }
+                    let handle = self.handles[&key.procedure].clone();
+                    let site = handle
+                        .semantics()
+                        .call_site(*call)
+                        .expect("a modeled call input belongs to its procedure");
+                    let value = call_input_value(site, port)
+                        .expect("a modeled call input has a live value");
+                    self.written_location(
+                        id,
+                        &handle,
+                        value,
+                        site.point,
+                        &[],
+                        AccessPathTail::Exact,
+                        Some(*call),
+                        request,
+                    )?;
+                }
+                Ok(())
+            }
             Endpoint::Port(port) if is_formal_or_heap_input(port) => self.formal(id, request),
             Endpoint::Location(location) => {
                 let handle = self.handles[&key.procedure].clone();
@@ -1988,6 +2780,7 @@ where
                     id,
                     &handle,
                     value,
+                    site.point,
                     &location.selectors,
                     location.tail,
                     Some(location.call),
@@ -2012,6 +2805,7 @@ where
                     id,
                     &handle,
                     value.id(),
+                    spec.point().id(),
                     &selectors,
                     location.path().tail(),
                     None,
@@ -2037,7 +2831,8 @@ where
         let call_key = (key.procedure.clone(), call);
         self.linked(id, &call_key);
         let dispatch = self.dispatch(&call_key, request)?;
-        if let Some(model) = self.model(&call_key) {
+        if let Some(model) = self.model(&call_key, request)? {
+            self.note_dispatch_incomplete(&call_key, &dispatch);
             // Scalar normal-return transfers do not describe the content of a
             // member read through the result. A modeled dispatch may have no
             // candidates, so dropping this demand would falsely complete it.
@@ -2045,36 +2840,162 @@ where
                 if matches!(root.as_ref(), PartialFlowPort::CallResult { .. }))
             {
                 self.note(Incompleteness::Model {
-                    call: call_key,
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                    call: call_key.clone(),
                     reason: "a call model does not describe a returned member".into(),
                 });
+                if !model.retains_dispatch {
+                    return Ok(());
+                }
+            } else {
+                let Endpoint::Port(output) = &key.node else {
+                    unreachable!()
+                };
+                self.apply_model(id, &call_key, &model, output);
+            }
+            if !model.retains_dispatch {
                 return Ok(());
             }
-            self.apply_model(id, &call_key, &model);
-            return Ok(());
         }
         let Endpoint::Port(result) = &key.node else {
             unreachable!("only call results descend");
         };
-        for candidate in &dispatch.candidates {
-            let rows = self
+        if matches!(key.root, Root::Object(_))
+            && matches!(result, PartialFlowPort::CallResult { .. })
+        {
+            for continuation in self
                 .provider
-                .partial_flows(&candidate.procedure, request)
-                .map_err(provider_error)?;
-            let callee_ports =
-                returned_member_callee_ports(candidate, result, &rows.ports, |declared| {
-                    self.provider.canonical_returned_field(
-                        &candidate.procedure,
-                        &call_key.0,
-                        declared,
-                        request,
-                    )
-                });
-            for callee_port in callee_ports {
-                self.open_callee_root(id, &call_key, candidate, callee_port, dispatch.uncertain);
+                .unproven_object_continuations(&call_key, request)
+                .map_err(provider_error)?
+            {
+                let function = self.functions.intern(continuation.function);
+                let function = self.functions.then(function, key.function);
+                self.add_item(
+                    key.procedure.clone(),
+                    key.root.clone(),
+                    continuation.from,
+                    function,
+                    self.items[id].quality.conjoin(continuation.quality),
+                    Derivation::Step {
+                        hops: Vec::new(),
+                        next: id,
+                    },
+                );
             }
         }
-        if dispatch.candidates.is_empty() || dispatch.uncertain {
+        let mut object_handoffs = 0_usize;
+        let mut absent_exits_complete = !dispatch.candidates.is_empty();
+        for candidate in &dispatch.candidates {
+            let exit = match result {
+                PartialFlowPort::CallResult { .. } => {
+                    Some(super::provider::CallHandoffExit::Normal)
+                }
+                PartialFlowPort::CallThrown { .. } => {
+                    Some(super::provider::CallHandoffExit::Exceptional)
+                }
+                // A returned-member heap port also descends here. Its value
+                // path uses returned_member_callee_ports below, not an object
+                // handoff at the call's scalar continuation.
+                PartialFlowPort::Heap { .. } => None,
+                _ => unreachable!("only call continuations or returned members descend"),
+            };
+            if let Some(exit) = exit {
+                let inventory = self
+                    .provider
+                    .call_handoffs(&call_key, candidate, exit, request)
+                    .map_err(provider_error)?;
+                absent_exits_complete &= inventory.complete;
+                for handoff in inventory.handoffs {
+                    assert_eq!(handoff.binding.exit, exit);
+                    assert!(
+                        handoff.binding.argument_index < candidate.arguments.len(),
+                        "a client handoff indexes its selected candidate"
+                    );
+                    if handoff.binding.continuity == super::provider::CallObjectContinuity::Copy {
+                        continue;
+                    }
+                    object_handoffs += 1;
+                    let handoff_quality =
+                        handoff.binding.quality.conjoin(HopQuality::from_uncertain(
+                            dispatch.uncertain
+                                || dispatch.candidates.len() != 1
+                                || !handoff.binding.continuity.is_exact(),
+                        ));
+                    let function = self.functions.intern(handoff.function);
+                    self.add_item(
+                        key.procedure.clone(),
+                        key.root.clone(),
+                        Endpoint::CallHandoff {
+                            call,
+                            candidate: Box::new((**candidate).clone()),
+                            binding: handoff.binding,
+                            function,
+                            quality: handoff_quality,
+                        },
+                        key.function,
+                        self.items[id].quality,
+                        Derivation::Step {
+                            hops: Vec::new(),
+                            next: id,
+                        },
+                    );
+                }
+            }
+            if !matches!(key.root, Root::Object(_)) {
+                let rows = self
+                    .provider
+                    .partial_flows(&candidate.procedure, request)
+                    .map_err(provider_error)?;
+                let callee_ports =
+                    returned_member_callee_ports(candidate, result, &rows.ports, |declared| {
+                        self.provider.canonical_returned_field(
+                            &candidate.procedure,
+                            &call_key.0,
+                            declared,
+                            request,
+                        )
+                    });
+                for callee_port in callee_ports {
+                    self.open_callee_root(
+                        id,
+                        &call_key,
+                        candidate,
+                        callee_port,
+                        dispatch.uncertain,
+                    );
+                }
+            }
+        }
+        if let Root::Object(root) = &key.root
+            && object_handoffs == 0
+            && let Some(gap) = &dispatch.external_body_unavailable
+            && self
+                .provider
+                .certified_object_origin(root, &call_key, result, gap, request)
+                .map_err(provider_error)?
+                .is_some()
+        {
+            return Ok(());
+        }
+        self.note_dispatch_incomplete(&call_key, &dispatch);
+        if matches!(key.root, Root::Object(_))
+            && ((object_handoffs == 0 && !absent_exits_complete) || dispatch.uncertain)
+        {
+            let Root::Object(root) = &key.root else {
+                unreachable!()
+            };
+            self.note(Incompleteness::Object {
+                cause: dispatch
+                    .incomplete_cause
+                    .unwrap_or(super::IncompleteCause::Content),
+                anchor: root.clone(),
+                reason: format!(
+                    "call {} has unresolved or ambiguous dispatch",
+                    call_site_text(&call_key)
+                )
+                .into(),
+            });
+        } else if dispatch.candidates.is_empty() || dispatch.uncertain {
             self.unmodeled(id, &call_key, request)?;
         }
         Ok(())
@@ -2104,9 +3025,57 @@ where
             _ => unreachable!("a caller heap port is rooted at a call input"),
         };
         let call_key = (key.procedure.clone(), call);
-        let dispatch = self.dispatch(&call_key, request)?;
-        if self.model(&call_key).is_some() {
-            return Ok(());
+        let dispatch = self.dispatch_noted(&call_key, request)?;
+        if let Some(model) = self.model(&call_key, request)? {
+            for binding in model
+                .writeback
+                .iter()
+                .filter(|binding| &binding.actual == root.as_ref())
+            {
+                match heap_sharing(binding, selectors, *tail) {
+                    crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
+                    crate::analyzer::semantic::CallStorageSharing::Unknown => {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Operational(
+                                super::OperationalCause::Provider,
+                            ),
+                            call: call_key.clone(),
+                            reason: "a modeled heap output has unknown storage sharing".into(),
+                        });
+                        continue;
+                    }
+                    crate::analyzer::semantic::CallStorageSharing::Shares => {}
+                }
+                if !binding.complete {
+                    self.note(Incompleteness::Model {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        call: call_key.clone(),
+                        reason: "a modeled heap output has incomplete caller storage".into(),
+                    });
+                }
+                if !binding.proven
+                    || !binding.conversion_preserves_identity
+                    || binding.storage.is_empty()
+                {
+                    self.note(Incompleteness::Model {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        call: call_key.clone(),
+                        reason: "a modeled heap output has unproven shared storage".into(),
+                    });
+                    continue;
+                }
+                let Endpoint::Port(output) = &key.node else {
+                    unreachable!()
+                };
+                self.apply_model(id, &call_key, &model, output);
+            }
+            if !model.retains_dispatch {
+                return Ok(());
+            }
         }
         for candidate in &dispatch.candidates {
             for binding in candidate
@@ -2119,6 +3088,7 @@ where
                     crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
                     crate::analyzer::semantic::CallStorageSharing::Unknown => {
                         self.note(Incompleteness::Dispatch {
+                            cause: super::IncompleteCause::Content,
                             call: call_key.clone(),
                             reason: "a stored call heap port has unknown storage sharing".into(),
                         });
@@ -2131,6 +3101,7 @@ where
                     || binding.storage.is_empty()
                 {
                     self.note(Incompleteness::Dispatch {
+                        cause: super::IncompleteCause::Content,
                         call: call_key.clone(),
                         reason: "a stored call heap port has unproven shared storage".into(),
                     });
@@ -2153,8 +3124,9 @@ where
                         dispatch.uncertain
                             || sharing == crate::analyzer::semantic::CallStorageSharing::Unknown,
                     );
-                } else if !data.flows.relations_complete {
+                } else if data.flows.may_omit_flows() {
                     self.note(Incompleteness::Dispatch {
+                        cause: super::IncompleteCause::Content,
                         call: call_key.clone(),
                         reason: "a callee heap output is not fully covered".into(),
                     });
@@ -2163,6 +3135,7 @@ where
         }
         if dispatch.candidates.is_empty() {
             self.note(Incompleteness::Dispatch {
+                cause: super::IncompleteCause::Content,
                 call: call_key.clone(),
                 reason: "a post-call heap demand has no proven callee binding".into(),
             });
@@ -2271,7 +3244,10 @@ where
         callee_port: PartialFlowPort,
         uncertain: bool,
     ) {
-        let root = Root::Port(Box::new((candidate.procedure.clone(), callee_port.clone())));
+        let root = Root::Port(
+            Box::new((candidate.procedure.clone(), callee_port.clone())),
+            self.items[id].key.certificate.clone(),
+        );
         let waiter = CallWaiter {
             item: id,
             call: call.clone(),
@@ -2317,6 +3293,7 @@ where
         id: usize,
         procedure: &ProcedureHandle,
         value: ValueId,
+        read_point: ProgramPointId,
         selectors: &[HeapSelector],
         tail: AccessPathTail,
         excluded: Option<CallSiteId>,
@@ -2330,102 +3307,212 @@ where
         };
         let wanted = origin(value);
         let caller = procedure.durable_key();
+        let before_read = {
+            let mut budget = CfgAlgorithmBudget::default();
+            let mut reach_request = CfgAlgorithmRequest::new(&mut budget, request.cancellation);
+            match reverse_reachability(procedure.semantics(), read_point, &mut reach_request) {
+                Ok(reachable) => reachable,
+                Err(error) => {
+                    self.note(Incompleteness::Interior {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        procedure: caller.clone(),
+                        reason: match error {
+                            CfgAlgorithmError::InvalidNode(_) => {
+                                "reader ordering cannot be proven: invalid node"
+                            }
+                            CfgAlgorithmError::Cancelled { .. } => {
+                                "reader ordering cannot be proven: cancelled"
+                            }
+                            CfgAlgorithmError::ExceededBudget(_) => {
+                                "reader ordering cannot be proven: budget exceeded"
+                            }
+                        }
+                        .into(),
+                    });
+                    return Ok(());
+                }
+            }
+        };
+        // Ordinary callee reads and writes are already represented by the
+        // stored partial-flow path. This extra search serves only a modeled
+        // receiver input whose model did not publish a local body.
+        let Some(read_call) = excluded else {
+            return Ok(());
+        };
+        let read_key = (caller.clone(), read_call);
+        let Some(read_model) = self.model(&read_key, request)? else {
+            return Ok(());
+        };
+        let read_site = procedure
+            .semantics()
+            .call_site(read_call)
+            .expect("a modeled receiver read names a live call");
+        let reader_storage = read_model
+            .receiver_reads
+            .iter()
+            .filter(|binding| call_input_value(read_site, &binding.actual) == Some(value))
+            .flat_map(|binding| binding.storage.iter().cloned())
+            .collect::<Vec<_>>();
+        if reader_storage.is_empty() {
+            self.note(Incompleteness::Model {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                call: read_key,
+                reason: "a modeled receiver read has no proven caller storage".into(),
+            });
+            return Ok(());
+        }
         for call in procedure.semantics().call_sites() {
             if Some(call.id) == excluded {
                 continue;
             }
-            let call_key = (caller.clone(), call.id);
-            let dispatch = self.dispatch(&call_key, request)?;
-            // A model replaces the body and writes no heap location.
-            if self.model(&call_key).is_some() {
+            if !self
+                .provider
+                .may_have_modeled_storage_output(procedure, call.id)
+            {
                 continue;
             }
-            for candidate in &dispatch.candidates {
-                for binding in &candidate.writeback {
-                    let may_reach_read = binding.storage.iter().any(|storage| {
+            let call_key = (caller.clone(), call.id);
+            let between = match call.normal_continuation {
+                ControlContinuation::Target(point) => {
+                    before_read.contains(procedure.semantics(), point)
+                }
+                ControlContinuation::Absent => false,
+                _ => true,
+            };
+            if !between {
+                continue;
+            }
+            let sharing = self
+                .provider
+                .call_input_storage_overlap(procedure, value, selectors, tail, call.id, request)
+                .map_err(provider_error)?;
+            if sharing == CallStorageSharing::Isolated {
+                continue;
+            }
+            // Selection may still reject a same-named summary. Only the
+            // selected model's concrete receiver/argument outputs qualify.
+            let (raw_dispatch, model) = self
+                .provider
+                .dispatch(&call_key, request)
+                .map_err(provider_error)?;
+            let Some(model) = model.map(Arc::new) else {
+                continue;
+            };
+            if model.writeback.is_empty() {
+                continue;
+            }
+            if sharing == CallStorageSharing::Unknown {
+                self.note(Incompleteness::Model {
+                    cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                    call: call_key.clone(),
+                    reason: "a modeled writer's storage overlap is unknown".into(),
+                });
+                continue;
+            }
+            if !matches!(call.normal_continuation, ControlContinuation::Target(_)) {
+                self.note(Incompleteness::Dispatch {
+                    cause: super::IncompleteCause::Content,
+                    call: call_key.clone(),
+                    reason: "a modeled writer has no proven normal-return point".into(),
+                });
+                continue;
+            }
+            if !raw_dispatch.completeness.is_complete() {
+                self.note(Incompleteness::Dispatch {
+                    cause: match &raw_dispatch.completeness {
+                        Completeness::Incomplete { cause, .. } => *cause,
+                        Completeness::Complete => unreachable!("checked incomplete dispatch"),
+                    },
+                    call: call_key.clone(),
+                    reason: "a modeled writer's dispatch is incomplete".into(),
+                });
+            }
+            for binding in model.writeback.iter() {
+                let may_reach_read = binding.storage.iter().any(|storage| {
                         matches!(storage.path().root(), AccessPathRoot::Value(root) if Some(root.id()) == wanted)
+                            || reader_storage.contains(storage)
                     });
-                    if !may_reach_read {
-                        if wanted.is_none()
-                            || (!binding.complete
-                                && heap_sharing(binding, selectors, tail)
-                                    != crate::analyzer::semantic::CallStorageSharing::Isolated)
-                        {
-                            self.note(Incompleteness::Dispatch {
-                                call: call_key.clone(),
-                                reason: "a possible call writer has unmapped storage".into(),
-                            });
-                        }
-                        continue;
-                    }
-                    let heap = PartialFlowPort::Heap {
-                        root: Box::new(binding.formal.clone()),
-                        selectors: selectors.into(),
-                        tail,
-                    };
-                    let Some(data) = self.procedure(&candidate.procedure, request)? else {
-                        continue;
-                    };
-                    if !data.into.contains_key(&heap) {
-                        if !data.flows.relations_complete {
-                            self.note(Incompleteness::Dispatch {
-                                call: call_key.clone(),
-                                reason: "a callee writeback output is not fully covered".into(),
-                            });
-                        }
-                        continue;
-                    }
-                    match heap_sharing(binding, selectors, tail) {
-                        crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
-                        crate::analyzer::semantic::CallStorageSharing::Unknown => {
-                            self.note(Incompleteness::Dispatch {
-                                call: call_key.clone(),
-                                reason: "a possible call writer has unknown storage sharing".into(),
-                            });
-                            continue;
-                        }
-                        crate::analyzer::semantic::CallStorageSharing::Shares => {}
-                    }
-                    if !binding.complete
-                        || !binding.proven
-                        || !binding.conversion_preserves_identity
-                    {
-                        self.note(Incompleteness::Dispatch {
+                if !may_reach_read {
+                    if wanted.is_none() || !binding.complete {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Operational(
+                                super::OperationalCause::Provider,
+                            ),
                             call: call_key.clone(),
-                            reason: "a call writeback has unproven shared storage".into(),
+                            reason: "a model output has unmapped caller storage".into(),
+                        });
+                    }
+                    continue;
+                }
+                match heap_sharing(binding, selectors, tail) {
+                    crate::analyzer::semantic::CallStorageSharing::Isolated => continue,
+                    crate::analyzer::semantic::CallStorageSharing::Unknown => {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Operational(
+                                super::OperationalCause::Provider,
+                            ),
+                            call: call_key.clone(),
+                            reason: "a model output has unknown storage sharing".into(),
                         });
                         continue;
                     }
-                    for storage in &binding.storage {
-                        let AccessPathRoot::Value(root) = storage.path().root() else {
-                            continue;
-                        };
-                        if Some(root.id()) != wanted {
-                            continue;
-                        }
-                        if !storage.path().selectors().is_empty() {
-                            self.note(Incompleteness::Dispatch {
-                                call: call_key.clone(),
-                                reason: "a projected writeback location cannot be substituted"
-                                    .into(),
-                            });
-                            continue;
-                        }
-                        self.open_callee_root(
-                            id,
-                            &call_key,
-                            candidate,
-                            heap.clone(),
-                            dispatch.uncertain,
-                        );
+                    crate::analyzer::semantic::CallStorageSharing::Shares => {}
+                }
+                if !binding.complete {
+                    self.note(Incompleteness::Model {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        call: call_key.clone(),
+                        reason: "a model output has incomplete caller storage".into(),
+                    });
+                }
+                if !binding.proven
+                    || !binding.conversion_preserves_identity
+                    || binding.storage.is_empty()
+                {
+                    self.note(Incompleteness::Model {
+                        cause: super::IncompleteCause::Operational(
+                            super::OperationalCause::Provider,
+                        ),
+                        call: call_key.clone(),
+                        reason: "a model output has unproven shared storage".into(),
+                    });
+                    continue;
+                }
+                for storage in &binding.storage {
+                    let value_origin_matches = matches!(storage.path().root(),
+                            AccessPathRoot::Value(root) if Some(root.id()) == wanted);
+                    if !value_origin_matches && !reader_storage.contains(storage) {
+                        continue;
                     }
+                    if !storage.path().selectors().is_empty() {
+                        self.note(Incompleteness::Model {
+                            cause: super::IncompleteCause::Operational(
+                                super::OperationalCause::Provider,
+                            ),
+                            call: call_key.clone(),
+                            reason: "a model output location cannot be substituted".into(),
+                        });
+                        continue;
+                    }
+                    let heap = PartialFlowPort::Heap {
+                        root: Box::new(binding.actual.clone()),
+                        selectors: selectors.into(),
+                        tail,
+                    };
+                    self.dispatch_noted(&call_key, request)?;
+                    self.model(&call_key, request)?;
+                    self.apply_model(id, &call_key, &model, &heap);
                 }
             }
         }
         Ok(())
     }
 
-    /// A model replaces the call: link the call's result to the caller-side
+    /// A model replaces the call: link its output to the caller-side
     /// inputs its transfers read. A model that covers the call is not a
     /// boundary, so its hops are uncertain only through the model itself.
     fn apply_model(
@@ -2433,24 +3520,30 @@ where
         id: usize,
         call: &DurableCallSiteKey,
         model: &CallModel<L::Function>,
+        output: &PartialFlowPort,
     ) {
         let key = self.items[id].key.clone();
         let item_quality = self.items[id].quality;
-        // Model transfers end at the normal return, which is the singular
-        // call result; no other result port and no heap location is modeled.
-        let Endpoint::Port(result @ PartialFlowPort::CallResult { ordinal: None, .. }) = &key.node
-        else {
-            return;
-        };
         for transfer in &model.transfers {
+            let matches_output = &transfer.output == output
+                || matches!(output, PartialFlowPort::Heap { root, .. } if root.as_ref() == &transfer.output);
+            if !matches_output {
+                continue;
+            }
             let actual = transfer.actual.clone();
             let model_function = transfer.function.clone();
             let hop = Hop::Model {
                 call: call.clone(),
                 actual: actual.clone(),
-                result: result.clone(),
+                result: output.clone(),
+                summary: model.summary.clone().map(Box::new),
+                retains_dispatch: model.retains_dispatch,
                 function: self.functions.intern(model_function),
-                quality: model.quality(),
+                quality: if model.retains_dispatch {
+                    HopQuality::new(transfer.proven, false)
+                } else {
+                    model.quality()
+                },
             };
             let mut hops = vec![hop];
             hops.extend(self.annotations_for(call, Some(&actual), &key.node));
@@ -2481,26 +3574,44 @@ where
         let next = self.items[waiter.item].key.clone();
         let next_quality = self.items[waiter.item].quality;
         for (actual, caller_node) in caller_side(&waiter.candidate, waiter.call.1, &formal) {
+            let (caller_function, caller_quality) = self.call_boundary_label(
+                &waiter.call,
+                &waiter.candidate.procedure,
+                &Endpoint::Port(actual.clone()),
+                &Endpoint::Port(formal.clone()),
+            );
+            let (callee_function, callee_quality) = self.call_boundary_label(
+                &waiter.call,
+                &waiter.candidate.procedure,
+                &Endpoint::Port(waiter.callee_port.clone()),
+                &next.node,
+            );
             let caller = Hop::Caller {
                 call: waiter.call.clone(),
                 callee: waiter.candidate.procedure.clone(),
                 actual: actual.clone(),
                 formal: formal.clone(),
-                uncertain: waiter.uncertain,
+                uncertain: waiter.uncertain || !caller_quality.is_certain(),
+                function: caller_function,
             };
             let callee = Hop::Callee {
                 call: waiter.call.clone(),
                 callee: waiter.candidate.procedure.clone(),
                 from: waiter.callee_port.clone(),
                 to: next.node.clone(),
-                uncertain: waiter.uncertain,
+                uncertain: waiter.uncertain || !callee_quality.is_certain(),
+                function: callee_function,
             };
             let annotations = self.annotations_for(&waiter.call, Some(&actual), &next.node);
             let along = self.functions.hops(&annotations);
+            let along = self.functions.then(callee_function, along);
             let along = self.functions.then(inner_function, along);
+            let along = self.functions.then(caller_function, along);
             let function = self.functions.then(along, next.function);
             let quality = HopQuality::from_uncertain(waiter.uncertain)
+                .conjoin(caller_quality)
                 .conjoin(inner_quality)
+                .conjoin(callee_quality)
                 .conjoin(Hop::path_quality(&annotations))
                 .conjoin(next_quality);
             self.add_item(
@@ -2529,12 +3640,19 @@ where
         let reach_quality = reached.quality;
         let next = self.items[waiter.item].key.clone();
         let next_quality = self.items[waiter.item].quality;
+        let (callee_function, callee_quality) = self.call_boundary_label(
+            &waiter.call,
+            &waiter.candidate.procedure,
+            &Endpoint::Port(waiter.callee_port.clone()),
+            &next.node,
+        );
         let callee = Hop::Callee {
             call: waiter.call.clone(),
             callee: waiter.candidate.procedure.clone(),
             from: waiter.callee_port.clone(),
             to: next.node.clone(),
-            uncertain: waiter.uncertain,
+            uncertain: waiter.uncertain || !callee_quality.is_certain(),
+            function: callee_function,
         };
         let mut hops = vec![callee];
         hops.extend(self.annotations_for(&waiter.call, None, &next.node));
@@ -2542,6 +3660,7 @@ where
         let along = self.functions.then(reach_function, along);
         let function = self.functions.then(along, next.function);
         let quality = reach_quality
+            .conjoin(callee_quality)
             .conjoin(Hop::path_quality(&hops))
             .conjoin(next_quality);
         self.add_reach(
@@ -2567,7 +3686,7 @@ where
         let Endpoint::Port(formal) = &key.node else {
             unreachable!("a formal item is at a port");
         };
-        if let Root::Port(port) = &key.root
+        if let Root::Port(port, _) = &key.root
             && port.0 == key.procedure
         {
             if self.summary_items.insert(id) {
@@ -2585,28 +3704,55 @@ where
         if !key.root.unbalanced() {
             return Ok(());
         }
-        let callers = self.callers(&key.procedure, request)?;
+        let anchored_caller = if self.certified_procedure_reaches.is_some() {
+            key.certificate.as_ref().map(|certificate| {
+                certificate.prefix.iter().rev().find_map(|step| {
+                    (step.target == ExecutionTarget::Procedure(Box::new(key.procedure.clone())))
+                        .then(|| step.call.clone())
+                })
+            })
+        } else {
+            None
+        };
+        let callers = match anchored_caller {
+            Some(Some(call)) => vec![call],
+            Some(None) => {
+                // An admitted root has no caller prefix to leave through.
+                return Ok(());
+            }
+            None => self.callers(&key.procedure, request)?.to_vec(),
+        };
         for call in callers.iter() {
-            let dispatch = self.dispatch(call, request)?;
+            let dispatch = self.dispatch_noted(call, request)?;
             for candidate in dispatch
                 .candidates
                 .iter()
                 .filter(|candidate| candidate.procedure == key.procedure)
             {
                 for (actual, caller_node) in caller_side(candidate, call.1, formal) {
+                    let (caller_function, caller_quality) = self.call_boundary_label(
+                        call,
+                        &key.procedure,
+                        &Endpoint::Port(actual.clone()),
+                        &Endpoint::Port(formal.clone()),
+                    );
                     let hop = Hop::Caller {
                         call: call.clone(),
                         callee: key.procedure.clone(),
                         actual,
                         formal: formal.clone(),
-                        uncertain: dispatch.uncertain,
+                        uncertain: dispatch.uncertain || !caller_quality.is_certain(),
+                        function: caller_function,
                     };
+                    let function = self.functions.then(caller_function, key.function);
                     self.add_item(
                         call.0.clone(),
                         key.root.clone(),
                         caller_node,
-                        key.function,
-                        HopQuality::from_uncertain(dispatch.uncertain).conjoin(quality),
+                        function,
+                        HopQuality::from_uncertain(dispatch.uncertain)
+                            .conjoin(caller_quality)
+                            .conjoin(quality),
                         Derivation::Step {
                             hops: vec![hop],
                             next: id,
@@ -2664,12 +3810,33 @@ where
             });
             return Ok(());
         }
+        let certified = self.certified_procedure_reaches.is_none()
+            || key.certificate.as_ref().is_some_and(|certificate| {
+                certificate.prefix.iter().rev().any(|step| {
+                    step.target == ExecutionTarget::Procedure(Box::new(key.procedure.clone()))
+                        && step.instance.as_ref().is_some_and(|instance| {
+                            instance.producer == parent
+                                && instance.capture_bindings.iter().any(|row| {
+                                    row.target == key.procedure.1 && row.destination == *destination
+                                })
+                        })
+                })
+            });
+        if !certified {
+            self.note(Incompleteness::Execution {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                procedure: key.procedure.clone(),
+                reason: "capture hop has no equal invoked instance and binding".into(),
+            });
+        }
+        let quality = quality.conjoin(HopQuality::from_uncertain(!certified));
         let hop = Hop::Closure {
             parent: parent.clone(),
             closure: key.procedure.clone(),
             binding: binding.clone(),
             slot: slot.clone(),
-            uncertain: false,
+            uncertain: !certified,
+            certificate: key.certificate.clone(),
         };
         if key.root.unbalanced() {
             self.add_item(
@@ -2687,7 +3854,10 @@ where
         }
         // A balanced root cannot leave through the parent's callers on its
         // own: open the parent's capture binding as a root of its own.
-        let root = Root::Port(Box::new((parent.clone(), binding.clone())));
+        let root = Root::Port(
+            Box::new((parent.clone(), binding.clone())),
+            key.certificate.clone(),
+        );
         if self.registered_capture_waiters.insert((id, root.clone())) {
             self.capture_waiters
                 .entry(root.clone())
@@ -2718,7 +3888,10 @@ where
         let function = self
             .functions
             .then(reached.key.function, self.items[waiter.item].key.function);
-        let quality = reached.quality.conjoin(self.items[waiter.item].quality);
+        let quality = reached
+            .quality
+            .conjoin(self.items[waiter.item].quality)
+            .conjoin(Hop::path_quality(std::slice::from_ref(&waiter.hop)));
         let root = self.items[waiter.item].key.root.clone();
         self.add_reach(
             root,
@@ -2735,7 +3908,7 @@ where
 
     fn process_reach(&mut self, id: usize) {
         let root = self.reaches[id].key.root.clone();
-        if matches!(root, Root::Sink(_)) {
+        if matches!(root, Root::Sink(..)) {
             return;
         }
         for waiter in self.call_waiters.get(&root).cloned().unwrap_or_default() {
@@ -2756,7 +3929,11 @@ where
         let procedure = self.items[item].key.procedure.clone();
         let links = self.provider.store_links(&procedure, output);
         if let Some(reason) = links.incomplete {
-            self.note(Incompleteness::StoreInventory { procedure, reason });
+            self.note(Incompleteness::StoreInventory {
+                cause: super::IncompleteCause::Operational(super::OperationalCause::Provider),
+                procedure,
+                reason,
+            });
         }
         for link in links.writes {
             assert!(
@@ -2794,6 +3971,8 @@ where
         let hop = Hop::Store {
             write_call: waiter.link.write_call.clone(),
             read_call: waiter.link.read_call.clone(),
+            write_site: Box::new(waiter.link.write_site.clone()),
+            read_site: Box::new(waiter.link.read_site.clone()),
             read_origin: waiter.link.read_origin.clone(),
             read_phase: waiter.link.read_phase,
             read_carrier: waiter.link.read_carrier.clone(),
@@ -2886,27 +4065,35 @@ where
     }
 
     fn current_pairs(&self) -> Vec<SourceSinkPair> {
-        let mut by_pair: HashMap<(ValueFlowSinkId, ComposedSourceId), Vec<usize>> =
-            HashMap::default();
+        let mut by_pair: HashMap<
+            (
+                ValueFlowSinkId,
+                ComposedSourceId,
+                Option<ExecutionCertificate>,
+            ),
+            Vec<usize>,
+        > = HashMap::default();
+        let mut keys = Vec::new();
         for (id, reach) in self.reaches.iter().enumerate() {
             if !reach.active {
                 continue;
             }
-            if let Root::Sink(sink) = reach.key.root {
-                by_pair
-                    .entry((sink, reach.key.source))
-                    .or_default()
-                    .push(id);
+            if let Root::Sink(sink, certificate) = &reach.key.root {
+                let key = (*sink, reach.key.source, certificate.clone());
+                if !by_pair.contains_key(&key) {
+                    keys.push(key.clone());
+                }
+                by_pair.entry(key).or_default().push(id);
             }
         }
-        let mut keys = by_pair.keys().copied().collect::<Vec<_>>();
-        keys.sort_unstable();
+        keys.sort_by_key(|(sink, source, _)| (*sink, *source));
         keys.into_iter()
-            .map(|(sink, source)| {
-                let reaches = &by_pair[&(sink, source)];
+            .map(|(sink, source, certificate)| {
+                let reaches = &by_pair[&(sink, source, certificate.clone())];
                 SourceSinkPair {
                     source,
                     sink,
+                    certificate,
                     paths: reaches
                         .iter()
                         .map(|&reach| (self.reach_path(reach), self.reaches[reach].quality))
@@ -2926,6 +4113,13 @@ pub(super) fn evidence_quality(
         matches!(proof, ProofStatus::Proven),
         matches!(completeness, EvidenceCompleteness::Complete),
     )
+}
+
+/// Names a call site by its file and its procedure-local ids. A durable call
+/// key also carries the workspace mount and artifact fingerprints, and replayed
+/// diagnostic text must not depend on the mount.
+fn call_site_text(((artifact, procedure), call): &DurableCallSiteKey) -> String {
+    format!("{} {procedure:?} {call:?}", artifact.path())
 }
 
 /// Whether a value enters the procedure's interior at this port.
@@ -3046,10 +4240,10 @@ fn caller_side(
         .collect()
 }
 
-/// Place an in-place matched-value transfer on every call use of its value;
-/// all other transfers stay on the call at the observation point. `input` and
-/// `output` are its carriers; an in-place binding sits on whichever one call
-/// port its carrier is.
+/// Place an in-place matched-value transfer on every call use of its value,
+/// and a two-carrier transfer on the one call whose ports carry both.
+/// `input` and `output` are its carriers; an in-place binding sits on
+/// whichever one call port its carrier is. `point` names the procedure.
 fn place_transfer(
     point: &ProgramPointHandle,
     input: &ValueFlowCarrier,
@@ -3062,15 +4256,14 @@ fn place_transfer(
         _ => None,
     };
     let semantics = point.procedure().semantics();
-    // The selected observation point still determines phase; every use of
-    // its matched value follows the definition, even at a different point.
-    let matched_value = input == output && matches!(input, ValueFlowCarrier::Value(_));
+    // Ports alone place a transfer; the selected observation point only
+    // determines phase. Every use of an in-place matched value follows its
+    // definition, even at a different point. A two-carrier transfer's output
+    // is a value that exactly one call defines, and its observation point is
+    // the output's: a result of a call with arguments is observed at the
+    // call's normal continuation, not at the call's own point (#9987).
     let mut placements = Vec::new();
-    for call in semantics
-        .call_sites()
-        .iter()
-        .filter(|call| matched_value || call.point == point.id())
-    {
+    for call in semantics.call_sites() {
         let input_port = value_of(input).and_then(|value| call_input_port(call, value));
         let output_port = value_of(output).and_then(|value| call_output_port(call, value));
         let placement = match (input == output, input_port, output_port) {
@@ -3089,6 +4282,10 @@ fn place_transfer(
             },
         ));
     }
+    debug_assert!(
+        input == output || placements.len() <= 1,
+        "a call output value has exactly one defining call"
+    );
     placements
 }
 

@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><Flag>yes</Flag></PropertyGroup><PropertyGroup Condition="'$(Flag)'=='yes'"><Flag>no</Flag><DefineConstants>$(DefineConstants);FEATURE</DefineConstants></PropertyGroup></Project>

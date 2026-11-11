@@ -41,7 +41,7 @@ use brokk_bifrost_analysis::analyzer::declared_scalar::DeclaredScalarType;
 
 use brokk_bifrost_analysis::analyzer::declared_scalar::binding_nodes;
 
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use brokk_bifrost_analysis::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
@@ -59,6 +59,8 @@ use brokk_bifrost_core::analyzer::tree_walk::WalkControl;
 
 use brokk_bifrost_core::analyzer::tree_walk::try_walk_named_tree_preorder;
 
+use brokk_bifrost_core::analyzer::tree_walk::walk_named_tree_preorder;
+
 use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
 
 use brokk_bifrost_core::analyzer::model::Language;
@@ -75,11 +77,13 @@ use brokk_bifrost_php::graph_support::php_is_constructor_name;
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
-const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v9";
+// #9447: structured formal roles and refusal change semantic payloads.
+// #9332: defaulted formals publish their saved DefaultArgument values.
+const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v14";
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 
-struct PhpSemanticLowerer;
+pub(crate) struct PhpSemanticLowerer;
 
 impl ProgramSemanticsLowerer for PhpSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
@@ -734,22 +738,42 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         procedure_kind: ProcedureKind,
         properties: ProcedureProperties,
     ) -> Result<(), PhpLoweringError> {
-        let layout =
-            formal_parameter_slots_for_owner(Language::Php, callable, self.prepared.source())
-                .unwrap_or_default();
+        if self.session.cancellation().is_cancelled() {
+            return Err(PhpLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let layout = formal_parameter_slots_for_owner_with_nodes(
+            Language::Php,
+            callable,
+            self.prepared.source(),
+        );
+        if self.session.cancellation().is_cancelled() {
+            return Err(PhpLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = match layout {
+            Some(slots) => slots,
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "PHP callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
+        };
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
+        for (slot, declaration) in slots {
             if self.session.cancellation().is_cancelled() {
                 return Err(PhpLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            let declaration = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
             let mapping_node = slot
                 .names
                 .first()
@@ -777,6 +801,34 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     passing_mode,
                 },
             )?;
+            if slot.default_range.is_some() && slot.variadic.is_none() {
+                let default = declaration
+                    .child_by_field_name("default_value")
+                    .expect("a PHP formal default range names its default_value field");
+                // PHP limits a default to a constant expression, so the value
+                // an omitted formal receives is the same on every call and the
+                // shared call binder can select it as a saved default. A `new`
+                // initializer (PHP 8.1) is the exception: it allocates a fresh
+                // object per call, which a saved definition-time value would
+                // alias, so that formal stays unbound and the call stays open.
+                let mut allocates = false;
+                walk_named_tree_preorder(default, true, |node| {
+                    if node.kind() == "object_creation_expression" {
+                        allocates = true;
+                        WalkControl::Break
+                    } else {
+                        WalkControl::Continue
+                    }
+                });
+                if !allocates {
+                    let metadata = self.session.add_value_mapping(builder, default)?;
+                    self.session.add_value_with_metadata(
+                        builder,
+                        metadata,
+                        SemanticValueKind::DefaultArgument { ordinal },
+                    )?;
+                }
+            }
             ordinal = ordinal
                 .checked_add(1)
                 .ok_or_else(|| PhpLoweringError::Invalid("too many PHP parameters".into()))?;
@@ -809,7 +861,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let receiver = self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?;
             self.receiver = Some(receiver);
             self.parameters.insert("this".into(), receiver);
@@ -980,10 +1035,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     terminal,
                     SemanticEffect::Assignment { target, value },
                 )?;
-                if matches!(
-                    right.kind(),
-                    "match_expression" | "conditional_expression" | "binary_expression"
-                ) {
+                // `??` lowers its join as flows from both operands, and any
+                // other non-boolean operator lowers as an ordinary expression
+                // with its own gaps; only the joins below are still opaque.
+                let opaque_join = match right.kind() {
+                    "match_expression" | "conditional_expression" => true,
+                    "binary_expression" => matches!(
+                        php_short_circuit_operator(right),
+                        Some("&&" | "and" | "||" | "or")
+                    ),
+                    _ => false,
+                };
+                if opaque_join {
                     let children = runtime_expression_children(node);
                     self.note_unspecified_evaluation_order(builder, terminal, node, &children)?;
                     self.add_magic_dispatch_gaps(
@@ -2580,6 +2643,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         let boundary = self.point(builder, node, Vec::new())?;
+        let children = runtime_expression_children(node);
+        if !self.is_closed_concatenation_assignment(node) {
+            self.note_unspecified_evaluation_order(builder, boundary, node, &children)?;
+            self.add_magic_dispatch_gaps(builder, boundary, "operator or assignment dispatch")?;
+        }
+        if node.kind() == "augmented_assignment_expression" {
+            // The new value is computed from the old target and the right
+            // operand, which both evaluate as children before the write, so
+            // the flows precede the assignment that publishes the result.
+            let result = self.expression_value(
+                builder,
+                node,
+                expression_value_kind(self.prepared.source(), node),
+            )?;
+            let operands = children
+                .iter()
+                .map(|child| {
+                    self.expression_value(
+                        builder,
+                        *child,
+                        expression_value_kind(self.prepared.source(), *child),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.session
+                .append_language_defined_value_flows(builder, boundary, operands, result)?;
+        }
         if let Some(target) = self.operator_write_target(node) {
             let value = self.expression_value(
                 builder,
@@ -2592,9 +2682,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 SemanticEffect::Assignment { target, value },
             )?;
         }
-        let children = runtime_expression_children(node);
-        self.note_unspecified_evaluation_order(builder, boundary, node, &children)?;
-        self.add_magic_dispatch_gaps(builder, boundary, "operator or assignment dispatch")?;
         self.session.add_target_edge(builder, boundary, next)?;
         self.schedule_expressions(
             builder,
@@ -2604,6 +2691,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
             stack,
         )
+    }
+
+    /// `$local .= operand` over operands that convert without user code is
+    /// the closed concatenation it abbreviates, written back to a local.
+    fn is_closed_concatenation_assignment(&self, node: Node<'tree>) -> bool {
+        if node.kind() != "augmented_assignment_expression"
+            || !node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == ".=")
+            || self.operator_write_target(node).is_none()
+        {
+            return false;
+        }
+        let operands = runtime_expression_children(node);
+        operands
+            .iter()
+            .all(|operand| self.converts_to_string_without_user_code(*operand))
+            && operands
+                .iter()
+                .filter(|operand| !self.is_effect_free_operand(**operand))
+                .count()
+                < 2
     }
 
     fn operator_write_target(&self, node: Node<'tree>) -> Option<ValueId> {
@@ -2728,13 +2837,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "cast_expression" => {
                 let boundary = self.point(builder, node, Vec::new())?;
                 let children = runtime_expression_children(node);
-                if !self.is_scalar_operator_syntax(node) {
+                if !self.is_scalar_operator_syntax(node) && !self.is_closed_concatenation(node) {
                     self.note_unspecified_evaluation_order(builder, boundary, node, &children)?;
                     self.add_magic_dispatch_gaps(
                         builder,
                         boundary,
                         "operator or assignment dispatch",
                     )?;
+                }
+                if node.kind() != "reference_assignment_expression" {
+                    // An operator's result depends on every operand it reads;
+                    // the default flow keeps that dependence without claiming
+                    // the scalar it computes.
+                    let result = self.expression_value(
+                        builder,
+                        node,
+                        expression_value_kind(self.prepared.source(), node),
+                    )?;
+                    let operands = children
+                        .iter()
+                        .map(|child| {
+                            self.expression_value(
+                                builder,
+                                *child,
+                                expression_value_kind(self.prepared.source(), *child),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.session
+                        .append_language_defined_value_flows(builder, boundary, operands, result)?;
                 }
                 self.session.add_target_edge(builder, boundary, next)?;
                 self.schedule_expressions(
@@ -2746,6 +2877,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
+            "array_creation_expression" if !is_php_assignment_target(node) => {
+                self.array_creation_expression(builder, node, entry, next, scope, stack)
+            }
             "array_creation_expression"
             | "list_literal"
             | "pair"
@@ -2754,16 +2888,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "argument"
             | "arguments"
             | "variadic_unpacking"
-            | "dynamic_variable_name"
-            | "encapsed_string"
-            | "heredoc"
-            | "nowdoc"
             | "string_value"
             | "print_intrinsic"
             | "error_suppression_expression" => {
                 let children = runtime_expression_children(node);
                 self.note_unspecified_evaluation_order(builder, entry, node, &children)?;
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "dynamic_variable_name" => {
+                // `$$name` reads whichever local the name's value spells at
+                // run time, and no stable local stands behind it.
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "PHP variable-variable reads a local named at run time",
+                )?;
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "encapsed_string" | "heredoc" | "nowdoc" => {
+                self.string_literal(builder, node, entry, next, scope, stack)
             }
             "parenthesized_expression" => {
                 let children = runtime_expression_children(node);
@@ -2820,6 +2967,125 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// Lower a quoted, heredoc or nowdoc string.
+    ///
+    /// An interpolated string is built from every part it interpolates, the
+    /// way `.` is built from its operands: a variable, an element or property
+    /// read, or a `{$expr}` expression, evaluated left to right. Converting a
+    /// part runs `__toString` unless the part is proven not to be an object.
+    /// A `${name}` part is a variable-variable read, whose own lowering
+    /// records the gap.
+    #[allow(clippy::too_many_arguments)]
+    fn string_literal(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PhpLoweringError> {
+        let parts = php_interpolated_parts(node);
+        if parts.is_empty() {
+            return self.leaf_expression(builder, node, entry, next);
+        }
+        let terminal = self.point(builder, node, Vec::new())?;
+        if !parts
+            .iter()
+            .all(|part| self.converts_to_string_without_user_code(*part))
+        {
+            self.add_magic_dispatch_gaps(builder, terminal, "string interpolation conversion")?;
+        }
+        let result = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
+        let operands = parts
+            .iter()
+            .map(|part| {
+                self.expression_value(
+                    builder,
+                    *part,
+                    expression_value_kind(self.prepared.source(), *part),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .append_language_defined_value_flows(builder, terminal, operands, result)?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &parts,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    /// A `.` whose operands are proven not to be objects converts them to
+    /// strings without `__toString`, and two operands that run no code of
+    /// their own leave nothing for the unspecified evaluation order to
+    /// reorder.
+    fn is_closed_concatenation(&self, node: Node<'tree>) -> bool {
+        if node.kind() != "binary_expression"
+            || !node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == ".")
+        {
+            return false;
+        }
+        let operands = runtime_expression_children(node);
+        operands
+            .iter()
+            .all(|operand| self.converts_to_string_without_user_code(*operand))
+            && operands
+                .iter()
+                .filter(|operand| !self.is_effect_free_operand(**operand))
+                .count()
+                < 2
+    }
+
+    fn converts_to_string_without_user_code(&self, node: Node<'tree>) -> bool {
+        self.local_type_of(node)
+            .is_some_and(|local| local.converts_to_string_without_user_code())
+    }
+
+    /// An operand whose evaluation runs no code and writes nothing: a
+    /// literal, a plain variable read, or an element read of a proven array
+    /// by such a key. An undefined name or key only warns.
+    fn is_effect_free_operand(&self, node: Node<'tree>) -> bool {
+        let node = peel_php_condition_parentheses(node);
+        match node.kind() {
+            "variable_name" => {
+                !php_variable_name(self.prepared.source(), node).eq_ignore_ascii_case("GLOBALS")
+            }
+            "string" | "integer" | "float" | "boolean" | "null" | "nowdoc" => true,
+            "encapsed_string" => runtime_expression_children(node)
+                .iter()
+                .all(|part| matches!(part.kind(), "string_content" | "escape_sequence")),
+            "subscript_expression" => {
+                let Some(
+                    place @ PhpPlace::Element {
+                        object,
+                        key: Some(key),
+                    },
+                ) = php_place(node)
+                else {
+                    return false;
+                };
+                object.kind() == "variable_name"
+                    && self.access_is_closed(&place)
+                    && matches!(
+                        peel_php_condition_parentheses(key).kind(),
+                        "variable_name" | "string" | "integer"
+                    )
+            }
+            _ => false,
+        }
+    }
+
     fn is_scalar_operator_operand(&self, source: &str, node: Node<'tree>) -> bool {
         let node = peel_php_condition_parentheses(node);
         self.php_condition_binding(node).is_some()
@@ -2845,6 +3111,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         let merge = self.point(builder, node, Vec::new())?;
+        if php_short_circuit_operator(node) == Some("??") {
+            // `$a ?? $b` is the left operand when it is set and the right one
+            // otherwise; the merge reads both alternatives.
+            let result = self.expression_value(
+                builder,
+                node,
+                expression_value_kind(self.prepared.source(), node),
+            )?;
+            let operands = [
+                required_field(node, "left")?,
+                required_field(node, "right")?,
+            ]
+            .into_iter()
+            .map(|operand| {
+                self.expression_value(
+                    builder,
+                    operand,
+                    expression_value_kind(self.prepared.source(), operand),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+            self.session
+                .append_language_defined_value_flows(builder, merge, operands, result)?;
+        }
         self.session.add_target_edge(builder, merge, next)?;
         stack.push(Work::Condition {
             node,
@@ -3560,7 +3850,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.value(
                 builder,
                 boundary,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )
         })
         .transpose()?;
@@ -3813,6 +4106,172 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
         self.constant_index_values.insert(key, value);
         Ok(Some(value))
+    }
+
+    /// The interned key value of an element whose key the source leaves
+    /// implicit. It is the value `$array[N]` uses, so a later constant read
+    /// meets the literal's store.
+    fn implicit_index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        key: i64,
+        element: Node<'tree>,
+    ) -> Result<ValueId, PhpLoweringError> {
+        let key: Box<str> = format!("i:{key}").into();
+        if let Some(value) = self.constant_index_values.get(&key) {
+            return Ok(*value);
+        }
+        let metadata = self.session.add_value_mapping(builder, element)?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Constant)?;
+        self.constant_index_values.insert(key, value);
+        Ok(value)
+    }
+
+    /// Lower an array literal as the element stores that build it.
+    ///
+    /// Each element is stored as if by `$array[key] = value`, at the canonical
+    /// key value a later `$array[key]` read uses. A PHP array is a value, not
+    /// an object, so the literal is no allocation: the stores build an
+    /// aggregate value, and the literal's own value is assigned from it once
+    /// every store is done. That assignment is the event that defines the
+    /// literal's value, which is where the shared container collapse lets a
+    /// whole-array use -- a call argument, an element of an enclosing literal,
+    /// a return -- carry the elements; an assignment to a local copies them
+    /// with it. An element without a key takes the next integer key, one past
+    /// the largest integer key so far (PHP manual, "Arrays"); once a computed,
+    /// negative or spread key leaves that unknown, later implicit keys are
+    /// stored at an unprojected index with its gap.
+    #[allow(clippy::too_many_arguments)]
+    fn array_creation_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PhpLoweringError> {
+        let result = self.expression_value(
+            builder,
+            node,
+            expression_value_kind(self.prepared.source(), node),
+        )?;
+        let children = runtime_expression_children(node);
+        // Every element is evaluated before the array exists, so the stores
+        // sit on the point after the last element.
+        let terminal = self.point(builder, node, Vec::new())?;
+        let metadata = self.session.add_value_mapping(builder, node)?;
+        let elements = self.session.add_value_with_metadata(
+            builder,
+            metadata,
+            SemanticValueKind::Temporary,
+        )?;
+        let mut next_key = Some(0_i64);
+        for element in &children {
+            let parts = named_children_without_comments(*element);
+            let (key, value) = match parts.as_slice() {
+                [value] => (None, *value),
+                [key, value] => (Some(*key), *value),
+                _ => {
+                    return Err(PhpLoweringError::Invalid(format!(
+                        "PHP array element initializer has {} operands",
+                        parts.len()
+                    )));
+                }
+            };
+            if matches!(value.kind(), "variadic_unpacking" | "by_ref") {
+                next_key = None;
+                self.session.add_partitioned_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(elements),
+                    SemanticCapability::IndexMemory,
+                    SemanticGapImpacts::single(SemanticGapImpact::HeapWrite),
+                    SemanticGapKind::Unsupported,
+                    "PHP spread and by-reference array literal elements are not stored",
+                )?;
+                continue;
+            }
+            let index = match key {
+                Some(key) => {
+                    let index = self.index_value(builder, key)?;
+                    let integer = php_constant_key(self.prepared.source(), key)
+                        .map(|key| php_canonical_integer_key(&key));
+                    next_key = match (next_key, integer) {
+                        // A string key leaves the integer sequence alone.
+                        (next, Some(None)) => next,
+                        (Some(next), Some(Some(key))) if key >= 0 => {
+                            key.checked_add(1).map(|after| after.max(next))
+                        }
+                        _ => None,
+                    };
+                    index
+                }
+                None => match next_key {
+                    Some(key) => {
+                        next_key = key.checked_add(1);
+                        Some(self.implicit_index_value(builder, key, *element)?)
+                    }
+                    None => None,
+                },
+            };
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base: elements,
+                    index,
+                    constant_index: None,
+                    identity:
+                        brokk_bifrost_analysis::analyzer::semantic::IndexedLocationIdentity::Element,
+                },
+            )?;
+            if index.is_none() {
+                self.add_dynamic_index_gap(
+                    builder,
+                    terminal,
+                    location,
+                    if key.is_some() {
+                        "PHP computed array literal key identity is not proven"
+                    } else {
+                        "PHP array literal element follows a key that leaves its implicit key unknown"
+                    },
+                )?;
+            }
+            let value = self.expression_value(
+                builder,
+                value,
+                expression_value_kind(self.prepared.source(), value),
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value,
+                },
+            )?;
+        }
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value: elements,
+            },
+        )?;
+        self.session.add_target_edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
     }
 
     fn add_field_identity_gap(
@@ -4655,6 +5114,23 @@ fn is_first_class_callable(node: Node<'_>) -> bool {
     })
 }
 
+/// The argument count of a call written with positional arguments only.
+///
+/// A named argument, a spread, a by-reference argument or the first-class
+/// callable form `f(...)` binds its actuals to formals by more than position,
+/// so it has no positional arity to name.
+pub(crate) fn php_positional_call_arity(call: Node<'_>) -> Option<u32> {
+    if is_first_class_callable(call) {
+        return None;
+    }
+    let arguments = call_arguments(call);
+    arguments
+        .iter()
+        .all(|argument| php_call_argument_shape(*argument) == PhpCallArgumentShape::Positional)
+        .then(|| u32::try_from(arguments.len()).ok())
+        .flatten()
+}
+
 fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
     call_arguments_node(node)
         .map(named_children)
@@ -5180,6 +5656,64 @@ fn php_declared_class(source: &str, type_node: Node<'_>) -> Option<Box<str>> {
     }
 }
 
+/// What a parameter's declared type proves its binding holds on entry.
+///
+/// A class names an instance of it. A bare `array` is an array; a nullable
+/// `?array` may be null, which is not an object either. A scalar type admits
+/// no object, because PHP converts a `Stringable` argument to the declared
+/// scalar before the body runs. Unions and intersections state no single
+/// answer and are left open.
+fn php_parameter_local_type(source: &str, type_node: Node<'_>) -> Option<PhpLocalType> {
+    let mut current = type_node;
+    let mut nullable = false;
+    loop {
+        match current.kind() {
+            "type" | "named_type" => current = first_named_child(current)?,
+            "optional_type" => {
+                nullable = true;
+                current = first_named_child(current)?;
+            }
+            "primitive_type" => {
+                let name = nonempty_node_text(source, current)?.to_ascii_lowercase();
+                return match name.as_str() {
+                    "array" if !nullable => Some(PhpLocalType::Array),
+                    "array" | "int" | "float" | "string" | "bool" | "false" | "true" | "null" => {
+                        Some(PhpLocalType::Plain)
+                    }
+                    _ => None,
+                };
+            }
+            _ => return php_declared_class(source, current).map(PhpLocalType::Class),
+        }
+    }
+}
+
+/// The parts a string literal interpolates, in source order. A nowdoc
+/// interpolates nothing, and a heredoc's parts sit in its body.
+fn php_interpolated_parts(node: Node<'_>) -> Vec<Node<'_>> {
+    let body = match node.kind() {
+        "encapsed_string" => Some(node),
+        "heredoc" => node.child_by_field_name("value"),
+        _ => None,
+    };
+    body.map(named_children)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|part| {
+            !matches!(part.kind(), "string_content" | "escape_sequence")
+                && !is_comment_kind(part.kind())
+        })
+        .collect()
+}
+
+/// The variable at the bottom of a `$name[a][b]` element chain.
+fn php_subscript_base_variable(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "subscript_expression" {
+        node = *runtime_expression_children(node).first()?;
+    }
+    (node.kind() == "variable_name").then_some(node)
+}
+
 /// Every class-like declaration this file states, keyed by its own name.
 ///
 /// A name two declarations share is poisoned rather than resolved: neither
@@ -5564,6 +6098,22 @@ fn php_constant_key(source: &str, node: Node<'_>) -> Option<Box<str>> {
             }
         }
         "null" => Some("s:".into()),
+        // Inside an interpolated string, `"$a[key]"` spells the string key
+        // `'key'` without quotes.
+        "name"
+            if node
+                .parent()
+                .and_then(|subscript| subscript.parent())
+                .is_some_and(|owner| {
+                    matches!(owner.kind(), "encapsed_string" | "heredoc_body")
+                }) =>
+        {
+            let content = nonempty_node_text(source, node)?;
+            Some(match php_integer_string_key(content) {
+                Some(value) => format!("i:{value}").into(),
+                None => format!("s:{content}").into(),
+            })
+        }
         "string" | "encapsed_string" => {
             let mut content = None;
             for child in named_children(node) {
@@ -5582,6 +6132,16 @@ fn php_constant_key(source: &str, node: Node<'_>) -> Option<Box<str>> {
         }
         _ => None,
     }
+}
+
+/// The integer a canonical key from [`php_constant_key`] names, or `None` for
+/// a string key. The input is that function's own `i:`/`s:` encoding, not
+/// source text.
+fn php_canonical_integer_key(key: &str) -> Option<i64> {
+    let integer = key.strip_prefix("i:")?;
+    let value = integer.parse().ok();
+    debug_assert!(value.is_some(), "canonical PHP integer key {key:?}");
+    value
 }
 
 fn php_place_detail(place: &PhpPlace<'_>) -> &'static str {
@@ -5679,7 +6239,32 @@ enum PhpLocalType {
     /// A PHP array. An array is not an object, so no `ArrayAccess` dispatch or
     /// magic accessor can run behind an element access on it.
     Array,
+    /// A value that is not an object: a scalar, or a value read out of a
+    /// request superglobal, which the SAPI fills with strings and arrays of
+    /// them. Converting it to a string runs no `__toString`, but an element
+    /// read on it may still be a string offset, so it is not an `Array`.
+    Plain,
 }
+
+impl PhpLocalType {
+    /// Whether string conversion of this value runs no user code. An array
+    /// converts to `"Array"` with a warning, like the missing-element read the
+    /// adapter already treats as a warning rather than an abort.
+    fn converts_to_string_without_user_code(&self) -> bool {
+        matches!(self, Self::Array | Self::Plain)
+    }
+}
+
+/// The superglobals PHP itself fills before any user code runs, each an array
+/// of strings and nested arrays. `$GLOBALS` and `$_SESSION` are absent: the
+/// first aliases the global symbol table, and the second holds whatever the
+/// program stored. A procedure that rebinds or writes into one loses the fact
+/// (`php_local_types`); a write from another procedure is outside what this
+/// file-local pass can see, and PHP code does not replace request input
+/// wholesale with objects.
+const PHP_REQUEST_SUPERGLOBALS: [&str; 7] = [
+    "_GET", "_POST", "_COOKIE", "_REQUEST", "_FILES", "_SERVER", "_ENV",
+];
 
 /// The class name of the type-like declaration this callable is written in.
 fn enclosing_class_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -5724,18 +6309,21 @@ fn php_local_types(
         ) {
             continue;
         }
-        let (Some(name), Some(class)) = (
+        let (Some(name), Some(declared)) = (
             parameter.child_by_field_name("name"),
             parameter
                 .child_by_field_name("type")
-                .and_then(|type_node| php_declared_class(source, type_node)),
+                .and_then(|type_node| php_parameter_local_type(source, type_node)),
         ) else {
             continue;
         };
         let name = php_variable_name(source, name);
         if !name.is_empty() {
-            types.insert(name.into(), PhpLocalType::Class(class));
+            types.insert(name.into(), declared);
         }
+    }
+    for name in PHP_REQUEST_SUPERGLOBALS {
+        types.insert(name.into(), PhpLocalType::Array);
     }
 
     let bind = |types: &mut HashMap<Box<str>, PhpLocalType>,
@@ -5776,6 +6364,18 @@ fn php_local_types(
                 ) else {
                     continue;
                 };
+                if left.kind() == "subscript_expression" {
+                    // An element write may store an object into a request
+                    // superglobal, so its elements are no longer plain.
+                    if let Some(base) = php_subscript_base_variable(left) {
+                        let name = php_variable_name(source, base);
+                        if PHP_REQUEST_SUPERGLOBALS.contains(&name) {
+                            types.remove(name);
+                            conflicting.push(name.into());
+                        }
+                    }
+                    continue;
+                }
                 if left.kind() != "variable_name" {
                     continue;
                 }
@@ -5787,6 +6387,24 @@ fn php_local_types(
                     php_variable_name(source, left),
                     inferred,
                 );
+            }
+            "augmented_assignment_expression" => {
+                // `.=` leaves a string behind whatever the target held; any
+                // other compound operator keeps what the sweep knew before.
+                let (Some(left), Some(operator)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("operator"),
+                ) else {
+                    continue;
+                };
+                if left.kind() == "variable_name" && operator.kind() == ".=" {
+                    bind(
+                        &mut types,
+                        &mut conflicting,
+                        php_variable_name(source, left),
+                        Some(PhpLocalType::Plain),
+                    );
+                }
             }
             "catch_clause" => {
                 let (Some(name), Some(class)) = (
@@ -5841,6 +6459,24 @@ fn php_expression_local_type(
     }
     match node.kind() {
         "array_creation_expression" => Some(PhpLocalType::Array),
+        "string" | "encapsed_string" | "heredoc" | "nowdoc" | "integer" | "float" | "boolean"
+        | "null" => Some(PhpLocalType::Plain),
+        "binary_expression"
+            if node
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == ".") =>
+        {
+            Some(PhpLocalType::Plain)
+        }
+        // An element of request input is a string or a nested array, as long
+        // as this procedure left the superglobal itself alone.
+        "subscript_expression" => {
+            let base = php_subscript_base_variable(node)?;
+            let name = php_variable_name(source, base);
+            (PHP_REQUEST_SUPERGLOBALS.contains(&name)
+                && types.get(name) == Some(&PhpLocalType::Array))
+            .then_some(PhpLocalType::Plain)
+        }
         "object_creation_expression" => named_children(node)
             .into_iter()
             .find(|child| {

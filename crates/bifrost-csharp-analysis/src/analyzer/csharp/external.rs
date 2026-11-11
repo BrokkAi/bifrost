@@ -86,6 +86,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelActivationEvi
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCallableKey;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCompleteness;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind;
 
@@ -132,6 +133,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
+
+const CSHARP_PACK_PRODUCER_VERSION: u32 = 1;
+
+fn csharp_pack_producer_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{}+csharp-pack-{CSHARP_PACK_PRODUCER_VERSION}",
+            env!("CARGO_PKG_VERSION")
+        )
+    })
+}
 
 use brokk_bifrost_core::cancellation::is_cancelled_at_checkpoint;
 
@@ -304,6 +317,7 @@ pub struct CSharpExternalMember {
     is_static: bool,
     is_abstract: bool,
     is_virtual: bool,
+    implements_slot: bool,
     generic_arity: usize,
     type_parameters: Vec<String>,
     return_type: Option<String>,
@@ -347,7 +361,7 @@ impl CSharpExternalMember {
         &self.source
     }
     fn externally_visible(&self) -> bool {
-        semantic_visibility(self.visibility).is_externally_visible()
+        semantic_visibility(self.visibility).is_externally_visible() || self.implements_slot
     }
 }
 
@@ -450,23 +464,32 @@ pub struct CSharpExternalDeclarationIndex {
     /// to find out whether a namespace the file has in scope could supply an
     /// extension method of that name, which makes the miss unprovable.
     static_methods_by_namespace: HashMap<String, HashSet<String>>,
-    /// Whether every dependency input this index was built from was both
-    /// discovered and decoded whole.
-    complete: bool,
-    /// Whether the project declared any dependency input at all: a configured
-    /// assembly path, or a `project.assets.json` under the project root.
-    ///
-    /// Zero inputs is not proof that the compilation references nothing. It is
-    /// the absence of evidence, which is why it is kept apart from
-    /// [`Self::complete`]: discovery over an empty input set completes
-    /// vacuously, and reading that as "the external surface is empty" would
-    /// turn every `using System;` in a loose `.cs` file into an error.
-    has_dependency_inputs: bool,
+    /// How much of the compilation's external surface this index read.
+    surface: ExternalSurface,
     production_diagnostics: Vec<ProducerDiagnostic>,
     /// Constant-time no-reader guard; forward names live only in catalog rows.
     has_type_forwards: bool,
     /// Pack-level provenance for the no-reader diagnostic, never a name index.
     forwarding_packs: Vec<brokk_bifrost_analysis::analyzer::semantic_model::AssemblyReference>,
+}
+
+/// How much of a compilation's external surface a
+/// [`CSharpExternalDeclarationIndex`] covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalSurface {
+    /// The project declared no dependency input: no configured assembly path
+    /// and no `project.assets.json` under the project root. Discovery over an
+    /// empty input set completes vacuously, but zero inputs is the absence of
+    /// evidence, not proof that the compilation references nothing. Reading
+    /// it as "the external surface is empty" would turn every `using System;`
+    /// in a loose `.cs` file into an error.
+    NoInputs,
+    /// Some input was not discovered or not decoded whole, so the index holds
+    /// an unknown remainder.
+    Partial,
+    /// Every declared input was discovered and decoded whole. Only this state
+    /// can prove that the external surface lacks a name.
+    Complete,
 }
 
 impl Default for CSharpExternalDeclarationIndex {
@@ -475,11 +498,7 @@ impl Default for CSharpExternalDeclarationIndex {
             types: HashMap::default(),
             namespaces: HashSet::default(),
             static_methods_by_namespace: HashMap::default(),
-            // An index that was handed no inputs read all of them. What stops
-            // an empty index proving anything external is
-            // `has_dependency_inputs`, not this.
-            complete: true,
-            has_dependency_inputs: false,
+            surface: ExternalSurface::NoInputs,
             production_diagnostics: Vec::new(),
             has_type_forwards: false,
             forwarding_packs: Vec::new(),
@@ -508,9 +527,16 @@ impl CSharpExternalDeclarationIndex {
         artifacts.dedup();
         let _timing =
             brokk_bifrost_core::profiling::scope("csharp_external_index.build_from_artifacts");
-        let mut index = Self::default();
-        index.complete &= discovery.complete;
-        index.has_dependency_inputs = discovery.profile.metadata_inputs_considered > 0;
+        let mut index = Self {
+            surface: if !discovery.complete {
+                ExternalSurface::Partial
+            } else if discovery.profile.metadata_inputs_considered > 0 {
+                ExternalSurface::Complete
+            } else {
+                ExternalSurface::NoInputs
+            },
+            ..Self::default()
+        };
         for (path, declared_assembly) in artifacts {
             index.index_assembly(&path, declared_assembly.as_deref());
         }
@@ -591,18 +617,19 @@ impl CSharpExternalDeclarationIndex {
                 .is_some_and(|names| names.contains(name))
         })
     }
-    /// Whether every dependency input was discovered and decoded whole.
+    /// Whether every declared dependency input was discovered and decoded
+    /// whole. An index with no inputs read all of them, vacuously.
     ///
     /// A partial index holds an unknown remainder, so a miss against it is
     /// never proof of absence.
     pub fn is_complete(&self) -> bool {
-        self.complete
+        self.surface != ExternalSurface::Partial
     }
-    /// Whether the project declared any dependency input for this index to
-    /// read. A miss against an index built from no inputs proves nothing about
-    /// the compilation's external surface.
-    pub fn has_dependency_inputs(&self) -> bool {
-        self.has_dependency_inputs
+    /// Whether a miss against this index proves that the compilation's
+    /// external surface lacks the name: every input was read whole, and there
+    /// was at least one.
+    pub fn proves_absence(&self) -> bool {
+        self.surface == ExternalSurface::Complete
     }
     pub(crate) fn forwarding_packs(
         &self,
@@ -639,6 +666,7 @@ impl CSharpExternalDeclarationIndex {
                 artifact_sha256: None,
             }],
             provenance: Provenance {
+                rust_artifact_approximation: None,
                 source: "local dependency artifact".to_owned(),
                 revision: None,
             },
@@ -672,7 +700,9 @@ impl CSharpExternalDeclarationIndex {
         };
         self.production_diagnostics
             .extend(production.diagnostics.iter().cloned());
-        self.complete &= production.completeness == Completeness::Complete;
+        if production.completeness != Completeness::Complete {
+            self.surface = ExternalSurface::Partial;
+        }
         let Some(pack) = production.pack.as_ref() else {
             return;
         };
@@ -862,12 +892,24 @@ impl<'a> CSharpExternalDeclarations<'a> {
         collapse_external_type_candidates(candidates)
     }
 
+    /// Whether an indexed assembly or an activated pack declares the exact
+    /// type identity `fqn`, including a nested type spelled with dots.
+    pub(crate) fn declares_type(&self, fqn: &str) -> bool {
+        !matches!(
+            self.resolve_type_in_file(fqn, "", &[], &HashMap::default()),
+            CSharpExternalTypeLookup::Absent
+        )
+    }
+
     fn pack_types_named(&self, fqn: &str) -> Vec<CSharpExternalTypeCandidate> {
         let Some(overlay) = self.packs.as_ref() else {
             return Vec::new();
         };
-        let mut declarations = overlay
-            .symbols_named(fqn)
+        let named = overlay.symbols_named_for(fqn, Language::CSharp.config_label());
+        if matches!(named.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return Vec::new();
+        }
+        let mut declarations = named
             .records
             .into_iter()
             .filter(|symbol| {
@@ -888,8 +930,15 @@ impl<'a> CSharpExternalDeclarations<'a> {
             .map(|symbol| {
                 let mut base_types = Vec::new();
                 let mut hierarchy_complete = true;
-                let mut extends = overlay
-                    .relations_from(&symbol.id)
+                let relations = overlay.relations_from_for(&symbol.id, "csharp");
+                // An open read may have hidden a base, so the hierarchy is not whole.
+                if matches!(
+                    relations.disposition,
+                    brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+                ) {
+                    hierarchy_complete = false;
+                }
+                let mut extends = relations
                     .records
                     .into_iter()
                     .filter(|relation| relation.kind == "extends")
@@ -902,7 +951,12 @@ impl<'a> CSharpExternalDeclarations<'a> {
                     {
                         hierarchy_complete = false;
                     }
-                    let target = overlay.symbols_with_id(&relation.to);
+                    let target = overlay.symbols_with_id_for(&relation.to, "csharp");
+                    // An open lookup proves neither the base's identity nor its
+                    // absence, so the hierarchy is not whole either way.
+                    if matches!(target.disposition, SemanticModelOverlayDisposition::Open(_)) {
+                        hierarchy_complete = false;
+                    }
                     match target.records.as_slice() {
                         [target]
                             if target.owner_id.is_none()
@@ -988,8 +1042,11 @@ impl<'a> CSharpExternalDeclarations<'a> {
         }
 
         let overlay = self.packs.as_ref()?;
-        let declarations = overlay
-            .symbols_named(&owner)
+        let named = overlay.symbols_named_for(&owner, Language::CSharp.config_label());
+        if matches!(named.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return None;
+        }
+        let declarations = named
             .records
             .into_iter()
             .filter(|symbol| {
@@ -1002,6 +1059,11 @@ impl<'a> CSharpExternalDeclarations<'a> {
         let [declared] = declarations.as_slice() else {
             return None;
         };
+        let family =
+            overlay.members_named_for(&declared.id, member, Language::CSharp.config_label());
+        if matches!(family.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return None;
+        }
         let matched = overlay.member_target_on_owner(&declared.id, member);
         if matched.records.is_empty()
             || !matches!(
@@ -1045,8 +1107,11 @@ impl<'a> CSharpExternalDeclarations<'a> {
         }
 
         let overlay = self.packs.as_ref()?;
-        let declarations = overlay
-            .symbols_named(&owner)
+        let named = overlay.symbols_named_for(&owner, Language::CSharp.config_label());
+        if matches!(named.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return None;
+        }
+        let declarations = named
             .records
             .into_iter()
             .filter(|symbol| {
@@ -1063,6 +1128,103 @@ impl<'a> CSharpExternalDeclarations<'a> {
             == brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelCompleteness::Complete
             && !declared.provenance.ambiguous)
             .then_some(declared.declaration_is_sealed())
+    }
+
+    /// The named type a value of the external member `owner.member` holds:
+    /// the declared type of a field or property when `arity` is `None`, or
+    /// the return type of the method of that arity otherwise (#8299).
+    ///
+    /// This is what lets a receiver chain (`Options.Standard.WithSecurity(..)`,
+    /// `mvc.Formatters.Add(..)`) cross a member that only an external surface
+    /// declares. Every matching declaration must name the same type; a type
+    /// parameter, an array, a disagreement, or an open pack read answers
+    /// nothing, so the receiver stays as unknown as it was.
+    pub(crate) fn member_value_type(
+        &self,
+        owner: &str,
+        member: &str,
+        arity: Option<usize>,
+    ) -> Option<String> {
+        let owner = metadata_type_identity(owner);
+        let artifact_types = self
+            .artifacts
+            .members_named(&owner, member)
+            .into_iter()
+            .filter(|candidate| match arity {
+                None => matches!(
+                    candidate.kind,
+                    CSharpExternalMemberKind::Field | CSharpExternalMemberKind::Property
+                ),
+                Some(arity) => {
+                    candidate.kind == CSharpExternalMemberKind::Method
+                        && candidate.parameter_types.len() == arity
+                }
+            })
+            .map(|candidate| match candidate.return_type_ref.as_ref() {
+                Some(DecodedType::Named { name, .. }) => Some(name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !artifact_types.is_empty() {
+            return unique_value_type(artifact_types);
+        }
+
+        let overlay = self.packs.as_ref()?;
+        let named = overlay.symbols_named_for(&owner, Language::CSharp.config_label());
+        if matches!(named.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return None;
+        }
+        let declarations = named
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == Language::CSharp.config_label()
+                    && csharp_pack_type_kind(symbol.kind)
+                    && (symbol.qualified_name == owner
+                        || symbol.aliases.iter().any(|alias| alias == &owner))
+            })
+            .collect::<Vec<_>>();
+        let [declared] = declarations.as_slice() else {
+            return None;
+        };
+        let matched = overlay.member_target_on_owner(&declared.id, member);
+        if !matches!(
+            matched.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Unique
+                | brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelMemberTargetDisposition::Conflict
+        ) {
+            return None;
+        }
+        use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
+        let pack_types = matched
+            .records
+            .iter()
+            .filter(|candidate| match arity {
+                None => matches!(
+                    candidate.kind,
+                    Kind::Field | Kind::Property | Kind::Constant
+                ),
+                Some(arity) => {
+                    candidate.kind == Kind::Method
+                        && candidate
+                            .structured_signature
+                            .as_ref()
+                            .is_some_and(|signature| signature.parameters.len() == arity)
+                }
+            })
+            .map(|candidate| {
+                match candidate
+                    .structured_signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.as_ref())
+                    .or(candidate.value_type.as_ref())
+                {
+                    Some(TypeRef::Named { name, .. }) => Some(name.clone()),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        unique_value_type(pack_types)
     }
 
     /// Whether an indexed assembly declares the owner type and an externally
@@ -1108,22 +1270,28 @@ impl<'a> CSharpExternalDeclarations<'a> {
     fn pack_constructor(&self, owner: &str, parameter_count: u32) -> Option<(String, String)> {
         let overlay = self.packs.as_ref()?;
         let parameter_count = usize::try_from(parameter_count).ok()?;
-        let mut declarations = overlay
-            .symbols_named(owner)
-            .records
-            .into_iter()
-            .filter(|symbol| {
-                symbol.language == Language::CSharp.config_label()
-                    && csharp_pack_type_kind(symbol.kind)
-                    && (symbol.qualified_name == owner
-                        || symbol.aliases.iter().any(|alias| alias == owner))
-            });
+        let named = overlay.symbols_named_for(owner, Language::CSharp.config_label());
+        if matches!(named.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return None;
+        }
+        let mut declarations = named.records.into_iter().filter(|symbol| {
+            symbol.language == Language::CSharp.config_label()
+                && csharp_pack_type_kind(symbol.kind)
+                && (symbol.qualified_name == owner
+                    || symbol.aliases.iter().any(|alias| alias == owner))
+        });
         let declared = declarations.next()?;
         if declarations.next().is_some() {
             return None;
         }
-        let matching = overlay
-            .members_of(&declared.id)
+        let members = overlay.constructors_for(&declared.id, Language::CSharp.config_label());
+        if matches!(
+            members.disposition,
+            SemanticModelOverlayDisposition::Open(_)
+        ) {
+            return None;
+        }
+        let matching = members
             .records
             .into_iter()
             .filter(|symbol| {
@@ -1175,16 +1343,16 @@ impl<'a> CSharpExternalDeclarations<'a> {
         let Some(overlay) = self.packs.as_ref() else {
             return false;
         };
-        let mut declarations = overlay
-            .symbols_named(owner)
-            .records
-            .into_iter()
-            .filter(|symbol| {
-                symbol.language == Language::CSharp.config_label()
-                    && csharp_pack_type_kind(symbol.kind)
-                    && (symbol.qualified_name == owner
-                        || symbol.aliases.iter().any(|alias| alias == owner))
-            });
+        let named = overlay.symbols_named_for(owner, Language::CSharp.config_label());
+        if matches!(named.disposition, SemanticModelOverlayDisposition::Open(_)) {
+            return false;
+        }
+        let mut declarations = named.records.into_iter().filter(|symbol| {
+            symbol.language == Language::CSharp.config_label()
+                && csharp_pack_type_kind(symbol.kind)
+                && (symbol.qualified_name == owner
+                    || symbol.aliases.iter().any(|alias| alias == owner))
+        });
         let Some(declared) = declarations.next() else {
             return false;
         };
@@ -1192,6 +1360,143 @@ impl<'a> CSharpExternalDeclarations<'a> {
             return false;
         }
         overlay.member_present_on_owner(&declared.id, member)
+    }
+}
+
+impl CSharpExternalDeclarations<'_> {
+    /// Whether this surface proves that no type in `receiver`'s hierarchy
+    /// declares a member named `member`. C# considers extension methods only
+    /// then, since an instance member of that name takes precedence. A type
+    /// or base that the surface does not declare completely proves nothing.
+    pub(crate) fn hierarchy_lacks_member(&self, receiver: &str, member: &str) -> bool {
+        let mut pending = vec![receiver.to_owned()];
+        let mut seen = HashSet::default();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let CSharpExternalTypeLookup::Unique(declared) =
+                self.resolve_type_in_file(&name, "", &[], &HashMap::default())
+            else {
+                return false;
+            };
+            if !declared.hierarchy_complete || self.declaring_owner(&declared.fqn, member).is_some()
+            {
+                return false;
+            }
+            pending.extend(declared.base_types);
+        }
+        true
+    }
+
+    /// The static extension methods named `member` that the active packs
+    /// declare (#8297). Assembly declarations carry no extension receiver,
+    /// so only packs answer. A same-named extension whose owner, receiver or
+    /// signature the packs leave undecided may be the applicable one, so it
+    /// leaves the lookup open rather than disappearing.
+    pub(crate) fn pack_extension_methods(
+        &self,
+        member: &str,
+    ) -> brokk_bifrost_csharp::graph::resolver::CSharpModelExtensionMethods {
+        use brokk_bifrost_csharp::graph::resolver::{
+            CSharpExtensionReceiver, CSharpModelExtensionMethod, CSharpModelExtensionMethods,
+        };
+        const UNDECIDED: &str =
+            "csharp model extension method has an undecided owner, receiver or signature";
+        let mut result = CSharpModelExtensionMethods::default();
+        let Some(overlay) = self.packs.as_ref() else {
+            return result;
+        };
+        let language = Language::CSharp.config_label();
+        let named = overlay.symbols_named_for(member, language);
+        if let SemanticModelOverlayDisposition::Open(open) = named.disposition {
+            result.open = Some(open.reason);
+            return result;
+        }
+        // The id of a declaration the packs name exactly once.
+        let unique_type_name = |id: &str| {
+            let declared = overlay.symbols_with_id_for(id, language);
+            if matches!(
+                declared.disposition,
+                SemanticModelOverlayDisposition::Open(_)
+            ) {
+                return None;
+            }
+            match declared.records.as_slice() {
+                [declared]
+                    if declared.owner_id.is_none() && csharp_pack_type_kind(declared.kind) =>
+                {
+                    Some(declared.qualified_name.clone())
+                }
+                _ => None,
+            }
+        };
+        for symbol in named.records {
+            let Some(receiver) = symbol.extension_receiver.as_ref() else {
+                continue;
+            };
+            if symbol.name != member
+                || symbol.language != language
+                || symbol.kind
+                    != brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelSymbolKind::Method
+                || !symbol.is_static
+                || !symbol.externally_visible()
+            {
+                continue;
+            }
+            let receiver = match receiver {
+                TypeRef::Named { name, .. } => Some(CSharpExtensionReceiver::Exact(name.clone())),
+                TypeRef::Declared { id, .. } => {
+                    unique_type_name(id).map(CSharpExtensionReceiver::Exact)
+                }
+                TypeRef::TypeParameter { .. }
+                    if symbol.extension_receiver_constraints.is_empty() =>
+                {
+                    Some(CSharpExtensionReceiver::Any)
+                }
+                _ => None,
+            };
+            let owner_fqn = symbol.owner_id.as_deref().and_then(unique_type_name);
+            let (Some(receiver), Some(owner_fqn), Some(signature)) =
+                (receiver, owner_fqn, symbol.structured_signature())
+            else {
+                result.open.get_or_insert(UNDECIDED);
+                continue;
+            };
+            // A partial pack still declares this member; partiality bounds
+            // what its absence proves, not whether it exists.
+            if symbol.provenance.ambiguous || signature.parameters.is_empty() {
+                result.open.get_or_insert(UNDECIDED);
+                continue;
+            }
+            let variadic = signature
+                .parameters
+                .last()
+                .is_some_and(|parameter| parameter.variadic);
+            result.methods.push(CSharpModelExtensionMethod {
+                owner_fqn,
+                receiver,
+                required_parameters: signature
+                    .parameters
+                    .iter()
+                    .filter(|parameter| !parameter.optional && !parameter.variadic)
+                    .count(),
+                max_parameters: (!variadic).then_some(signature.parameters.len()),
+                generic_arity: signature.type_parameters.len(),
+            });
+        }
+        result
+    }
+}
+
+/// The one named type every candidate declaration agrees on. An empty list,
+/// an unnamed candidate or a disagreement answers nothing.
+fn unique_value_type(mut candidates: Vec<Option<String>>) -> Option<String> {
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [Some(name)] => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -1306,6 +1611,7 @@ fn project_pack_types(path: &Path, pack: &AuthoredSemanticModelPack) -> Vec<CSha
                 is_static: fact.is_static,
                 is_abstract: fact.is_abstract,
                 is_virtual: fact.is_virtual,
+                implements_slot: false,
                 generic_arity: member_parameters.len(),
                 type_parameters: member_parameters.to_vec(),
                 return_type: return_type_ref.as_ref().map(DecodedType::legacy_name),
@@ -1401,6 +1707,45 @@ fn decoded_type_from_semantic(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CSharpAssemblyPackProducer;
 
+struct CSharpPackCompletenessEvidence<'a> {
+    diagnostics: &'a [ProducerDiagnostic],
+    suppressed: usize,
+    member_omitted: bool,
+    base_edge_omitted: bool,
+    record_limit_reported: bool,
+    export_omitted: bool,
+}
+
+impl CSharpPackCompletenessEvidence<'_> {
+    fn classify(&self) -> Completeness {
+        let fenced_diagnostics_only = self.diagnostics.iter().all(|diagnostic| {
+            matches!(
+                diagnostic.code.as_str(),
+                "csharp.signature.omitted"
+                    | "csharp.member.unsupported_parameter_type"
+                    | "csharp.member.unsupported_return_type"
+            )
+        });
+        if self.diagnostics.is_empty()
+            && self.suppressed == 0
+            && !self.member_omitted
+            && !self.base_edge_omitted
+        {
+            Completeness::Complete
+        } else if !self.record_limit_reported
+            && !self.export_omitted
+            && !self.base_edge_omitted
+            && self.suppressed == 0
+            && fenced_diagnostics_only
+            && self.member_omitted
+        {
+            Completeness::Fenced
+        } else {
+            Completeness::Partial
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CSharpDependencyPackAdapter;
 
@@ -1410,6 +1755,29 @@ pub fn resolve_csharp_semantic_pack_dependencies(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
+    use brokk_bifrost_analysis::analyzer::dependency_support::{
+        refuse_external_discovery_reads, report_external_discovery_read,
+    };
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ExternalDiscoveryRead, UnverifiableDiscoveryRead,
+    };
+    // The asset census walks the workspace and package resolution walks NuGet roots.
+    report_external_discovery_read(ExternalDiscoveryRead::Unverifiable(
+        UnverifiableDiscoveryRead::ExternalCacheWalk,
+    ));
+    refuse_external_discovery_reads();
+    for name in [
+        "NUGET_PACKAGES",
+        "HOME",
+        "DOTNET_ROOT",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+    ] {
+        report_external_discovery_read(ExternalDiscoveryRead::Environment {
+            name: name.into(),
+            value: std::env::var_os(name),
+        });
+    }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return csharp_cancelled_discovery();
     }
@@ -1520,8 +1888,19 @@ impl DependencyPackAdapter for CSharpDependencyPackAdapter {
         "bifrost-csharp-dependency"
     }
 
+    fn adapter_version(&self) -> &str {
+        csharp_pack_producer_version()
+    }
+
     fn producer(&self) -> Producer {
-        Producer::for_name("bifrost-csharp-assembly")
+        Producer {
+            name: "bifrost-csharp-assembly".to_owned(),
+            version: csharp_pack_producer_version().to_owned(),
+        }
+    }
+
+    fn production_schema_version(&self, _dependency: &ResolvedDependency) -> u32 {
+        brokk_bifrost_semantic::analyzer::semantic_model::FENCED_COMPLETENESS_MIN_SCHEMA_VERSION
     }
 
     fn produce(
@@ -1734,6 +2113,10 @@ impl CSharpAssemblyPackProducer {
         let mut types = Vec::new();
         let mut members = Vec::new();
         let mut record_limit_reported = false;
+        let mut member_omitted = external_types
+            .iter()
+            .any(|ty| ty.externally_visible() && !ty.omitted_members.is_empty());
+        let mut base_edge_omitted = false;
         for ty in external_types.iter().filter(|ty| ty.externally_visible()) {
             if types
                 .len()
@@ -1814,7 +2197,10 @@ impl CSharpAssemblyPackProducer {
                     }
                 }
             }
+            base_edge_omitted |= !supertypes_complete;
             types.push(TypeFact {
+                alias_target: None,
+                tuple_fields: None,
                 implemented_traits_complete: false,
                 generic_trait_impls_complete: false,
                 jvm_inventory: Some(
@@ -1909,6 +2295,7 @@ impl CSharpAssemblyPackProducer {
                             message,
                         );
                         omitted_members.push((member.name.clone(), member.kind, member.visibility));
+                        member_omitted = true;
                         continue;
                     }
                 };
@@ -1928,6 +2315,7 @@ impl CSharpAssemblyPackProducer {
                                     member.kind,
                                     member.visibility,
                                 ));
+                                member_omitted = true;
                                 continue;
                             }
                         }
@@ -2079,11 +2467,15 @@ impl CSharpAssemblyPackProducer {
             selector.artifact_sha256 = Some(artifact.sha256().to_owned());
         }
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
-        let completeness = if diagnostics.is_empty() && suppressed_diagnostics.total() == 0 {
-            Completeness::Complete
-        } else {
-            Completeness::Partial
-        };
+        let completeness = CSharpPackCompletenessEvidence {
+            diagnostics: &diagnostics,
+            suppressed: suppressed_diagnostics.total(),
+            member_omitted,
+            base_edge_omitted,
+            record_limit_reported,
+            export_omitted: exports.omitted != 0,
+        }
+        .classify();
         let pack = AuthoredSemanticModelPack {
             extraction: Some(
                 brokk_bifrost_semantic::analyzer::semantic_model::ArtifactExtraction::from_artifact(
@@ -2091,13 +2483,16 @@ impl CSharpAssemblyPackProducer {
                     artifact,
                 ),
             ),
-            schema_version:
-                brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+            schema_version: if completeness == Completeness::Fenced {
+                brokk_bifrost_semantic::analyzer::semantic_model::FENCED_COMPLETENESS_MIN_SCHEMA_VERSION
+            } else {
+                brokk_bifrost_analysis::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION
+            },
             pack_id: request.pack_id.clone(),
             version: request.pack_version.clone(),
             producer: Producer {
                 name: "bifrost-csharp-assembly".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: csharp_pack_producer_version().to_owned(),
             },
             language: "csharp".to_owned(),
             ecosystem: request.ecosystem.clone(),
@@ -2109,6 +2504,9 @@ impl CSharpAssemblyPackProducer {
             carried_sources: Vec::new(),
             cpp_portability: None,
             python_correspondence: None,
+            rust_external_reexports: Vec::new(),
+            rust_external_reexports_truncated: false,
+            rust_external_reexports_glob_incomplete: false,
             shards: vec![AuthoredShard {
                 id: "declarations.external".to_owned(),
                 activation,
@@ -2483,6 +2881,7 @@ fn csharp_dependency_production_request(
             artifact_sha256: None,
         }],
         provenance: Provenance {
+            rust_artifact_approximation: None,
             source: "exact local .NET dependency".to_owned(),
             revision: None,
         },
@@ -3169,6 +3568,44 @@ fn parse_assembly_bounded_rows(
     let methods = collect_metadata_rows(layout.rows(6), cancellation, |i| {
         read_method(&layout, i, strings, blobs, decode_budget)
     })?;
+    // MethodImpl identifies method bodies that implement interface slots even
+    // when their metadata accessibility is private.
+    let explicit_bodies = collect_metadata_rows(layout.rows(25), cancellation, |i| {
+        let row = layout.row(25, i)?;
+        let mut p = 0;
+        let owner = index(row, &mut p, index_size(layout.rows[2]))?;
+        let body = index(row, &mut p, coded_size(&layout.rows, &[6, 10], 1))?;
+        let _declaration = index(row, &mut p, coded_size(&layout.rows, &[6, 10], 1))?;
+        Some((owner, body))
+    })?;
+    if explicit_bodies.iter().any(|(owner, body)| {
+        if body & 1 != 0 || body >> 1 == 0 {
+            return true;
+        }
+        let method = body >> 1;
+        let Some(index) = owner.checked_sub(1).map(|index| index as usize) else {
+            return true;
+        };
+        let Some(ty) = types.get(index) else {
+            return true;
+        };
+        let end = types
+            .get(index + 1)
+            .map(|next| next.method_start)
+            .unwrap_or(methods.len() as u32 + 1);
+        method < ty.method_start || method >= end
+    }) {
+        // A MethodRef body cannot be assigned to a local owner member.
+        // Refuse the assembly rather than certify a surface we cannot inspect.
+        return None;
+    }
+    let explicit_bodies: HashSet<(u32, u32)> = explicit_bodies
+        .into_iter()
+        .map(|row| {
+            let (owner, body) = row;
+            (owner, body >> 1)
+        })
+        .collect();
     let properties = collect_metadata_rows(layout.rows(23), cancellation, |i| {
         read_property(&layout, i, strings, blobs, decode_budget)
     })?;
@@ -3180,6 +3617,18 @@ fn parse_assembly_bounded_rows(
     let property_accessors = property_accessors(&layout, &methods);
     let event_owners = event_owners(&layout, types.len() as u32, events.len() as u32);
     let event_accessors = association_accessors(&layout, &methods, 0);
+    let mut explicit_associations = HashSet::default();
+    let explicit_methods: HashSet<u32> = explicit_bodies.iter().map(|(_, body)| *body).collect();
+    for i in 1..=layout.rows(24) {
+        let row = layout.row(24, i)?;
+        let mut p = 0;
+        u16at(row, &mut p)?;
+        let method = index(row, &mut p, index_size(methods.len() as u32))?;
+        let association = index(row, &mut p, coded_size(&layout.rows, &[20, 23], 1))?;
+        if explicit_methods.contains(&method) {
+            explicit_associations.insert((association & 1, association >> 1));
+        }
+    }
     let generic = generic_parameters(&layout, strings, decode_budget);
     let (interfaces, incomplete_interfaces) =
         interfaces_for(&layout, &types, &type_refs, &type_specs);
@@ -3250,6 +3699,8 @@ fn parse_assembly_bounded_rows(
             } else {
                 CSharpExternalMemberKind::Method
             };
+            let implements_slot =
+                explicit_bodies.contains(&((idx + 1) as u32, method_index as u32 + 1));
             if let Some(member) = member(
                 path,
                 0x0600_0000 | (method_index as u32 + 1),
@@ -3269,10 +3720,21 @@ fn parse_assembly_bounded_rows(
                 &type_specs,
                 max_signature_depth,
             ) {
-                members.push(member);
+                members.push(CSharpExternalMember {
+                    implements_slot,
+                    ..member
+                });
             } else {
                 omitted_signatures = omitted_signatures.saturating_add(1);
-                omitted_members.push((m.name.clone(), kind, member_visibility(m.flags)));
+                omitted_members.push((
+                    m.name.clone(),
+                    kind,
+                    if implements_slot || m.flags & 0x40 != 0 {
+                        CSharpVisibility::Public
+                    } else {
+                        member_visibility(m.flags)
+                    },
+                ));
             }
         }
         for (pidx, p) in properties
@@ -3284,6 +3746,16 @@ fn parse_assembly_bounded_rows(
                 .get(&(pidx as u32 + 1))
                 .copied()
                 .unwrap_or(p.flags);
+            if explicit_associations.contains(&(1, pidx as u32 + 1))
+                && !semantic_visibility(member_visibility(flags)).is_externally_visible()
+            {
+                omitted_members.push((
+                    p.name.clone(),
+                    CSharpExternalMemberKind::Property,
+                    CSharpVisibility::Public,
+                ));
+                continue;
+            }
             if let Some(member) = member(
                 path,
                 0x1700_0000 | (pidx as u32 + 1),
@@ -3316,6 +3788,16 @@ fn parse_assembly_bounded_rows(
                 .get(&(event_index as u32 + 1))
                 .copied()
                 .unwrap_or(event.flags);
+            if explicit_associations.contains(&(0, event_index as u32 + 1))
+                && !semantic_visibility(member_visibility(flags)).is_externally_visible()
+            {
+                omitted_members.push((
+                    event.name.clone(),
+                    CSharpExternalMemberKind::Event,
+                    CSharpVisibility::Public,
+                ));
+                continue;
+            }
             let Some(event_type) = resolve_typedef_or_ref_type_at_depth(
                 event.event_type,
                 &types,
@@ -3340,6 +3822,7 @@ fn parse_assembly_bounded_rows(
                 is_static: flags & 0x10 != 0,
                 is_abstract: flags & 0x400 != 0,
                 is_virtual: flags & 0x40 != 0,
+                implements_slot: false,
                 generic_arity: 0,
                 type_parameters: Vec::new(),
                 return_type: Some(event_type.legacy_name()),
@@ -3517,6 +4000,7 @@ fn member(
         is_static: flags & 0x10 != 0,
         is_abstract: flags & 0x400 != 0,
         is_virtual: flags & 0x40 != 0,
+        implements_slot: false,
         generic_arity,
         type_parameters,
         return_type: return_type_ref.as_ref().map(DecodedType::legacy_name),

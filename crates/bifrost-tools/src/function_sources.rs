@@ -67,6 +67,9 @@ pub struct FunctionSourcesSummary {
 
 #[derive(Debug, Default, Serialize, JsonSchema)]
 pub struct ListFunctionSourcesResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<crate::result_incomplete::ToolResultIncomplete>,
+
     pub summary: FunctionSourcesSummary,
     pub records: Vec<FunctionSource>,
 }
@@ -77,7 +80,7 @@ pub fn list_function_sources(
     analyzer: &dyn IAnalyzer,
     params: ListFunctionSourcesParams,
 ) -> ListFunctionSourcesResult {
-    let _scope = AnalyzerQueryScope::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
     let paths = params
         .paths
         .map(|paths| paths.into_iter().collect::<HashSet<_>>());
@@ -185,6 +188,7 @@ pub fn list_function_sources(
                 &right.site_id,
             ))
     });
+    result.incomplete = crate::result_incomplete::query_read_incomplete(&scope);
     result.summary.record_count = result.records.len();
     result
 }

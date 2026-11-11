@@ -136,6 +136,8 @@ pub fn direct_formal_store_fields(
     // A local alias has a Local flow instead and cannot certify this proof.
     let mut direct_uses = HashSet::new();
     let mut other_origins = HashSet::new();
+    let mut copy_sources = Vec::new();
+    let mut value_sources: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
     for point in semantics.points() {
         for event in &point.events {
             match event.effect {
@@ -143,19 +145,44 @@ pub fn direct_formal_store_fields(
                     kind,
                     source,
                     target,
-                } if formal_values.contains(&source)
-                    && matches!(kind, ValueFlowKind::Parameter | ValueFlowKind::Receiver) =>
-                {
-                    direct_uses.insert(target);
+                } => {
+                    value_sources.entry(target).or_default().push(source);
+                    if matches!(kind, ValueFlowKind::Transfer(transfer) if transfer.kind == TransferKind::AggregateCopy)
+                    {
+                        copy_sources.push((target, source));
+                    }
+                    if formal_values.contains(&source)
+                        && matches!(kind, ValueFlowKind::Parameter | ValueFlowKind::Receiver)
+                    {
+                        direct_uses.insert(target);
+                    } else {
+                        other_origins.insert(target);
+                    }
                 }
-                SemanticEffect::ValueFlow { target, .. }
-                | SemanticEffect::Assignment { target, .. } => {
+                SemanticEffect::Assignment { target, value } => {
+                    value_sources.entry(target).or_default().push(value);
                     other_origins.insert(target);
                 }
                 _ => {}
             }
         }
     }
+    // An exact aggregate copy owns fresh direct member cells. A parallel
+    // Assignment from the same source records value dependence, not another
+    // storage identity. Stores to the copy therefore cannot disprove a store
+    // to the formal's own field.
+    let isolated_copies = copy_sources
+        .into_iter()
+        .filter_map(|(target, source)| {
+            let direct_source = formal_values.contains(&source)
+                || direct_uses.contains(&source) && !other_origins.contains(&source);
+            (direct_source
+                && value_sources[&target]
+                    .iter()
+                    .all(|origin| *origin == source))
+            .then_some(target)
+        })
+        .collect::<HashSet<_>>();
     let blocked_points = semantics
         .gaps()
         .iter()
@@ -190,6 +217,9 @@ pub fn direct_formal_store_fields(
             let MemoryLocationKind::Field { base, ref member } = location.kind else {
                 continue;
             };
+            if isolated_copies.contains(&base) {
+                continue;
+            }
             let direct = (formal_values.contains(&base)
                 || direct_uses.contains(&base) && !other_origins.contains(&base))
                 && !point_has_gap
@@ -817,6 +847,7 @@ impl CallArgumentGroup {
 pub enum MemberReceiverPreparation {
     Reference,
     AddressOfPlace,
+    ByValue,
     CopyValue,
     CopyPointee,
 }
@@ -1150,7 +1181,10 @@ impl CallBindings {
                                 && callee.semantics().properties().receiver_binding
                                     == ProcedureReceiverBinding::Class)
                                 || caller.semantics().value(actual.id()).is_some_and(|row| {
-                                    row.kind == SemanticValueKind::Receiver { dispatch: true }
+                                    matches!(
+                                        row.kind,
+                                        SemanticValueKind::Receiver { dispatch: true, .. }
+                                    )
                                 })
                                 || constructor_call_result(
                                     caller.semantics(),

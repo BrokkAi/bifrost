@@ -59,6 +59,7 @@ fn assessed_threat_and_truncated_scenario_render_in_report() {
                 cvss_overlays: &[],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )
@@ -94,6 +95,7 @@ fn assessed_threat_and_truncated_scenario_render_in_report() {
                 cvss_overlays: &[overlay],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )
@@ -305,6 +307,7 @@ fn catalog_schema_and_exact_match_origin_have_distinct_report_labels() {
                 cvss_overlays: &[],
                 organizational_risk: &[],
                 incremental: None,
+                identifier_typos: None,
             },
             &mut PolicyBudget::default(),
         )

@@ -43,7 +43,7 @@ mod jvm_extraction_tests {
         };
         let fixture = crate::selection_fixture_support::JvmSelectionFixture::new(2);
         let selection = fixture.open_ready(&[]);
-        fixture.store.conn.execute(|conn| {
+        fixture.store.conn.execute_fixture(|conn| {
             conn.execute("INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) SELECT blob_id,930001,0,2 FROM resolution_fragment_interiors", []).unwrap();
             conn.execute("INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) SELECT blob_id,0,0,0,930001,930001 FROM resolution_fragment_interiors", []).unwrap();
         });

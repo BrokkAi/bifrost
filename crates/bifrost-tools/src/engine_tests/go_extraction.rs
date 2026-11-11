@@ -4107,6 +4107,12 @@ func caller() { _, _ = os.Open("book.xlsx") }
                         && (detail.starts_with("SEARCH walk USING AUTOMATIC COVERING INDEX")
                             || detail
                                 .starts_with("SEARCH binding USING AUTOMATIC COVERING INDEX")
+                            // The lexical-walk seed reads the materialized site_paths
+                            // CTE, which holds only the keyed (blob_id, start_node)
+                            // rows. SQLite may build its automatic partial index
+                            // over those rows to apply the kind=1 seed filter.
+                            || detail.as_str()
+                                == "SEARCH site_paths USING AUTOMATIC PARTIAL COVERING INDEX (kind=?)"
                             || detail.starts_with(
                                 "SEARCH prefix_definition USING AUTOMATIC PARTIAL COVERING INDEX",
                             )
@@ -5026,7 +5032,7 @@ func main() { api.Public() }
                 };
                 assert_eq!(read(store, &snapshot, &other), Some(expected.clone()));
                 let report = reconcile(store, &snapshot, profile, &cancellation);
-                assert_eq!(report.rebound, 2, "{report:?}");
+                assert_eq!(report.rebound_count, 2, "{report:?}");
                 assert_eq!(
                     read(store, &snapshot, &inventory),
                     Some(inventory_first.clone())
@@ -6399,9 +6405,17 @@ type Item struct{ Decoy bool }
                 // #5671 root-prefix seeks stop returning the two context rows admission rejected: scope steps (Definition 459 -> 457, Type 462 -> 460) and decoded search rows (Definition cold 156 -> 154/warm 96 -> 94, Type cold 152 -> 150/warm 93 -> 91) fall together; search statement counts are unchanged.
                 // #7684: direct type-shape demand and projection add four
                 // definition steps and five value-type steps in this fixture.
+                // #9301: shared member lookup, term-family binding and slot
+                // preparation read binding projections for the structural
+                // bare-term marker in every language. The rows are already in the
+                // session cache, so SQL is unchanged, but each keyed read charges
+                // its requests and rows: +10 scope steps for both kinds.
+                // #9300: preserving the full pass's next-round self-answer
+                // dependency revisits a changed reference, adding 14 charged
+                // steps to the sparse pin; unchanged references still skip.
                 let expected_scope_nodes = match kind {
-                    ProductionGoPointKind::Definition => 415,
-                    ProductionGoPointKind::Type => 420,
+                    ProductionGoPointKind::Definition => 419,
+                    ProductionGoPointKind::Type => 424,
                 };
                 // These generic-free fixtures no longer open the optional formal-row
                 // table and its indexes during cold point setup. The cold open is
@@ -6486,11 +6500,20 @@ type Item struct{ Decoy bool }
                 // #7506: debug builds add three cold-open statements and rows, the
                 // debug_assert! COUNT checks of container placements (twice) and Rust
                 // summaries in resolution_selection.rs. Release-code builds (the
-                // measure profile) compile them out, so the production open is 270/238.
+                // measure profile) compile them out, so the production open was
+                // 270/238 before TEMP count packing.
+                // Packed TEMP admissions remove the count table's unique index:
+                // one fewer schema row at cold open, with identical point work.
+                // #9709 (migration 0274) adds the member_type_coverage stage
+                // family: its TEMP table and unique and seek indexes add three
+                // cold-open schema statements and rows in both profiles.
+                // #9948 installs three TEMP triggers on selected Rust summary
+                // rows: their DDL adds three statements and schema rows at
+                // cold open. This Go fixture does not mutate those rows.
                 let cold_open = if cfg!(debug_assertions) {
-                    (273, 241)
+                    (279, 246)
                 } else {
-                    (270, 238)
+                    (276, 243)
                 };
                 // #8166: the batch candidate-path memo serves repeated
                 // RESOLUTION_PATHS_BY_KEY_SQL hydration within one point
@@ -6501,9 +6524,27 @@ type Item struct{ Decoy bool }
                 // and rows), and the operation-local caller-role memo serves one
                 // repeated CALLER_SOURCE_ROLE read (-1/-1): cold and warm searches
                 // gain one statement and one row for both kinds.
+                // #9439: selection-owned point-read memos avoid repeated
+                // immutable reads within a point's search. The warm Type
+                // point also avoids one repeated read.
+                // #9755: the node-catalog, member-scope and site-row memo now
+                // answers only inside an active stage read, fenced by the
+                // binding's transaction epoch, so a cached absence cannot
+                // outlive the snapshot it was read on. This point search runs
+                // outside a stage read, so those reads run again: +8
+                // statements and +6 rows in each cold and warm search, for
+                // both kinds. With the fence removed the old values return.
+                // #9869: the per-caller source-inventory build-constraint read
+                // adds one indexed statement and one decoded row to each cold
+                // search. Warm searches reuse the prepared import context.
+                // #9559: family-scoped navigation lookups use a separate read
+                // context, adding one cold statement and row for both kinds.
+                // Warm lookup work and engine work remain unchanged.
+                // This integration merge keeps one additional cold statement
+                // and row above the pre-#9869 counts.
                 let (cold_search, warm_open, warm_search) = match kind {
-                    ProductionGoPointKind::Definition => ((156, 144), (5, 4), (123, 94)),
-                    ProductionGoPointKind::Type => ((174, 141), (5, 4), (142, 92)),
+                    ProductionGoPointKind::Definition => ((163, 147), (5, 4), (131, 100)),
+                    ProductionGoPointKind::Type => ((180, 143), (5, 4), (149, 97)),
                 };
                 let production_schema = cold
                     .open
@@ -7571,7 +7612,23 @@ type Item struct{ Decoy bool }
             }
         }
         #[test]
+        #[hardwon("#9163: a republish during a Go selected operation panicked in model_authority")]
         fn go_model_type_owner_mint_closes_only_selected_type_frontiers() {
+            struct LiveModels<'a>(&'a dyn brokk_bifrost_analysis::analyzer::IAnalyzer);
+            impl brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal for LiveModels<'_> {
+                fn refuse_read_reuse(&self) {
+                    brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal::refuse_read_reuse(
+                        &brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services(self.0),
+                    );
+                }
+            }
+            impl brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedAnalyzerServices for LiveModels<'_> {
+                fn verified_declaration(&self, expected: &brokk_bifrost_analysis::analyzer::CodeUnit) -> Option<brokk_bifrost_analysis::analyzer::CodeUnit> { self.0.declarations_named(expected.source(), expected.identifier()).into_iter().find(|unit| unit == expected) }
+                fn declarations_named(&self, file: &brokk_bifrost_analysis::analyzer::ProjectFile, name: &str) -> Vec<brokk_bifrost_analysis::analyzer::CodeUnit> { self.0.declarations_named(file, name) }
+                fn external_inventory_providers(&self) -> Vec<String> { Vec::new() }
+                fn active_models(&self) -> Option<std::sync::Arc<brokk_bifrost_analysis::analyzer::semantic_model::ResolvedActiveSemanticModels>> { self.0.active_semantic_models() }
+                fn model_authority(&self) -> Option<std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>> { self.0.semantic_model_overlay().map(|overlay| overlay as _) }
+            }
             use crate::inline_project::InlineTestProject;
             use brokk_bifrost_analysis::AnalyzerConfig;
             use brokk_bifrost_analysis::analyzer::resolution::fact_source::SelectedTypedFactSource;
@@ -7825,149 +7882,198 @@ type Item struct{ Decoy bool }
                     ),
                     SemanticModelRuntimeOutcome::Ready { .. }
                 ));
-                let mut operation = open_ready_operation(
-                    &fixture.store,
-                    selected_operation_input(
+                let selected_overlay = workspace.analyzer().semantic_model_overlay();
+                let run = |republish: bool| {
+                    let services = LiveModels(workspace.analyzer());
+                    let input = selected_operation_input(
                         &fixture.project,
                         &fixture.workspace_id,
                         &fixture.snapshots,
                         &fixture.languages,
                         &fixture.overlay_masks,
                         Vec::new(),
-                    ),
-                    &cancellation,
-                ).with_go_model_authority(workspace.analyzer().semantic_model_overlay().map(|overlay| overlay as std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>));
-                let GoPreparedImportContextOutcome::Ready(prepared) = operation
-                    .go_file_import_context(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
-                    .unwrap()
-                else {
-                    panic!("prepared modeled import")
-                };
-                assert_eq!(
-                    prepared.demand.modeled_imports.len(),
-                    usize::from(!competing_source),
-                    "modeled binder in {case}"
-                );
-                assert_eq!(
-                    prepared.demand.import_packages.len(),
-                    usize::from(competing_source),
-                    "source binder in {case}"
-                );
-                let at = source.rfind("Item").unwrap();
-                let locator = SelectedSemanticLocator::for_reference_range(
-                    "go",
-                    GO_ROOT_CONSUMER_PATH,
-                    at,
-                    at + 4,
-                );
-                let result = operation
-                    .resolve_native_reference_types_bounded_for_go_request(
-                        *prepared,
-                        None,
-                        None,
-                        &locator,
-                        None,
-                        ReceiverAnalysisBudget::default(),
-                        &cancellation,
-                        &mut SelectedResolutionContextMetrics,
-                        &mut Default::default(),
-                        &mut Default::default(),
-                    )
-                    .unwrap();
-                let BoundedResolution::Complete {
-                    value:
-                        SelectedResolutionOperationOutcome::Native(SelectedResolutionLocated::Found(
-                            answer,
-                        )),
-                    ..
-                } = result
-                else {
-                    panic!("{case}: native type result")
-                };
-                let frontiers = answer.answer.projected_frontiers();
-                assert_eq!(
-                    frontiers.iter().any(|frontier| frontier
-                        .possible_values()
-                        .iter()
-                        .any(|value| value.ty().identity().shared_name_id().is_some())),
-                    expected_owner,
-                    "{case}: {frontiers:#?}"
-                );
-                let mut minted_identity = None;
-                if expected_owner {
-                    let brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeTypes::Ready { external_owners, .. } = &answer.value_types else { panic!("external type projection") };
-                    let [(owner_identity, owner)] = external_owners.as_slice() else {
-                        panic!("one defining external owner")
+                    );
+                    let input = if case == "defined" {
+                        input.with_analyzer(&services)
+                    } else {
+                        input
                     };
-                    minted_identity = Some(*owner_identity);
+                    let input = input.with_model_authority(selected_overlay.clone().map(|overlay| overlay as std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>));
+                    let mut operation = open_ready_operation(&fixture.store, input, &cancellation);
+                    if republish {
+                        assert!(workspace.invalidate_dependency_pack_state(&[
+                            brokk_bifrost_analysis::DependencyPackEcosystem::Go,
+                        ]));
+                    }
+                    let GoPreparedImportContextOutcome::Ready(prepared) = operation
+                        .go_file_import_context(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
+                        .unwrap()
+                    else {
+                        panic!("prepared modeled import")
+                    };
                     assert_eq!(
-                        owner.provider_id.as_ref(),
-                        compiled.manifest.semantic_sha256
+                        prepared.demand.modeled_imports.len(),
+                        usize::from(!competing_source),
+                        "modeled binder in {case}"
                     );
                     assert_eq!(
-                        owner.owner_fqn.as_ref(),
-                        "example.test/root/provider.Item",
-                        "canonical import path, independent of the remote alias"
+                        prepared.demand.import_packages.len(),
+                        usize::from(competing_source),
+                        "source binder in {case}"
                     );
-                    let frontier = frontiers
-                        .iter()
-                        .find(|frontier| !frontier.possible_values().is_empty())
+                    let at = source.rfind("Item").unwrap();
+                    let locator = SelectedSemanticLocator::for_reference_range(
+                        "go",
+                        GO_ROOT_CONSUMER_PATH,
+                        at,
+                        at + 4,
+                    );
+                    let result = operation
+                        .resolve_native_reference_types_bounded_for_go_request(
+                            *prepared,
+                            None,
+                            None,
+                            &locator,
+                            None,
+                            ReceiverAnalysisBudget::default(),
+                            &cancellation,
+                            &mut SelectedResolutionContextMetrics,
+                            &mut Default::default(),
+                            &mut Default::default(),
+                        )
                         .unwrap();
+                    let BoundedResolution::Complete {
+                        value:
+                            SelectedResolutionOperationOutcome::Native(
+                                SelectedResolutionLocated::Found(answer),
+                            ),
+                        ..
+                    } = result
+                    else {
+                        panic!("{case}: native type result")
+                    };
+                    let frontiers = answer.answer.projected_frontiers();
                     assert_eq!(
-                        frontier.completion(),
-                        &ResolutionCompletion::Complete,
-                        "{frontier:?}"
+                        frontiers.iter().any(|frontier| frontier
+                            .possible_values()
+                            .iter()
+                            .any(|value| value.ty().identity().shared_name_id().is_some())),
+                        expected_owner,
+                        "{case}: {frontiers:#?}"
                     );
-                    assert!(matches!(frontier.possible_values(), [
+                    let mut minted_identity = None;
+                    if expected_owner {
+                        let brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedNativeTypes::Ready { external_owners, .. } = &answer.value_types else { panic!("external type projection") };
+                        let [(owner_identity, owner)] = external_owners.as_slice() else {
+                            panic!("one defining external owner")
+                        };
+                        minted_identity = Some(*owner_identity);
+                        assert_eq!(
+                            owner.provider_id.as_ref(),
+                            compiled.manifest.semantic_sha256
+                        );
+                        assert_eq!(
+                            owner.owner_fqn.as_ref(),
+                            "example.test/root/provider.Item",
+                            "canonical import path, independent of the remote alias"
+                        );
+                        let frontier = frontiers
+                            .iter()
+                            .find(|frontier| !frontier.possible_values().is_empty())
+                            .unwrap();
+                        assert_eq!(
+                            frontier.completion(),
+                            &ResolutionCompletion::Complete,
+                            "{frontier:?}"
+                        );
+                        assert!(matches!(frontier.possible_values(), [
                         brokk_bifrost_analysis::analyzer::resolution::ResolutionSlotValue::TypeObject(..)
                     ]));
-                    // With the provider record disabled, this rooted Type slot
-                    // is complete-empty and has no qualified-member frontier.
-                    // Minting adds its TypeObject and preserves that empty frontier.
-                    assert!(frontier.unindexed_external().is_empty(), "{frontier:?}");
-                    // This is the model-authority/typed-reader boundary: field
-                    // slots must carry types, never model field memory tokens.
-                    let typed = operation.ready.typed_source();
-                    let metadata = typed
-                        .go_model_owner_declarations(*owner_identity, owner, &cancellation)
-                        .unwrap()
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(
-                        metadata.members_state,
-                        if case == "promotion-uncertain" {
-                            ModelMembersState::MayIncludePromotionCopies
-                        } else {
-                            ModelMembersState::Exact
-                        }
-                    );
-                    if case == "embedding" {
-                        assert_eq!(metadata.embedded.len(), 1);
+                        // With the provider record disabled, this rooted Type slot
+                        // is complete-empty and has no qualified-member frontier.
+                        // Minting adds its TypeObject and preserves that empty frontier.
+                        assert!(frontier.unindexed_external().is_empty(), "{frontier:?}");
+                        // This is the model-authority/typed-reader boundary: field
+                        // slots must carry types, never model field memory tokens.
+                        let typed = operation.ready.typed_source();
+                        let metadata = typed
+                            .go_model_owner_declarations(*owner_identity, owner, &cancellation)
+                            .unwrap()
+                            .unwrap()
+                            .unwrap();
                         assert_eq!(
-                            metadata.embedded[0].indirection(),
-                            1,
-                            "pointer fact and structured pointer are one layer"
+                            metadata.members_state,
+                            if case == "promotion-uncertain" {
+                                ModelMembersState::MayIncludePromotionCopies
+                            } else {
+                                ModelMembersState::Exact
+                            }
                         );
-                        let GoMemberDeclarationKind::Struct { fields } = metadata.declaration.kind
-                        else {
-                            panic!("model struct")
-                        };
-                        assert_eq!(
-                            fields.len(),
-                            2,
-                            "ordinary field plus retained private embedding edge"
-                        );
-                        assert!(fields.iter().all(|field| field.field.is_none()));
-                        assert_eq!(
-                            fields.iter().filter(|field| field.embedded).count(),
-                            1,
-                            "same target type alone does not imply embedding"
-                        );
-                        for field in fields {
+                        if case == "embedding" {
+                            assert_eq!(metadata.embedded.len(), 1);
+                            assert_eq!(
+                                metadata.embedded[0].indirection(),
+                                1,
+                                "pointer fact and structured pointer are one layer"
+                            );
+                            let GoMemberDeclarationKind::Struct { fields } =
+                                metadata.declaration.kind
+                            else {
+                                panic!("model struct")
+                            };
+                            assert_eq!(
+                                fields.len(),
+                                2,
+                                "ordinary field plus retained private embedding edge"
+                            );
+                            assert!(fields.iter().all(|field| field.field.is_none()));
+                            assert_eq!(
+                                fields.iter().filter(|field| field.embedded).count(),
+                                1,
+                                "same target type alone does not imply embedding"
+                            );
+                            for field in fields {
+                                let mut seeds = Vec::new();
+                                let read = typed
+                                    .visit_intrinsic_seed_pages_for_slots(
+                                        TypedFactRequest::new(&[field.value_type.unwrap()]),
+                                        &cancellation,
+                                        &mut TypedFactPageVisitor::new(&mut |page| {
+                                            seeds.extend_from_slice(page);
+                                            Ok(true)
+                                        }),
+                                    )
+                                    .unwrap();
+                                assert!(read.is_exhausted());
+                                let [seed] = seeds.as_slice() else {
+                                    panic!("one field type seed")
+                                };
+                                let [value] = seed.row().frontier().possible_values() else {
+                                    panic!("one field type object")
+                                };
+                                assert_eq!(value.ty().identity(), metadata.embedded[0].identity());
+                                assert_eq!(value.ty().indirection(), u32::from(field.embedded));
+                            }
+                        } else if case == "field-shadow" {
+                            let GoMemberDeclarationKind::Struct { fields } =
+                                metadata.declaration.kind
+                            else {
+                                panic!("model struct")
+                            };
+                            assert_eq!(fields.len(), 2);
+                            assert!(
+                                fields
+                                    .iter()
+                                    .all(|field| field.field.is_none() && !field.embedded)
+                            );
+                            let slots = fields
+                                .iter()
+                                .map(|field| field.value_type.unwrap())
+                                .collect::<Vec<_>>();
                             let mut seeds = Vec::new();
                             let read = typed
                                 .visit_intrinsic_seed_pages_for_slots(
-                                    TypedFactRequest::new(&[field.value_type.unwrap()]),
+                                    TypedFactRequest::new(&slots),
                                     &cancellation,
                                     &mut TypedFactPageVisitor::new(&mut |page| {
                                         seeds.extend_from_slice(page);
@@ -7976,60 +8082,173 @@ type Item struct{ Decoy bool }
                                 )
                                 .unwrap();
                             assert!(read.is_exhausted());
-                            let [seed] = seeds.as_slice() else {
-                                panic!("one field type seed")
-                            };
-                            let [value] = seed.row().frontier().possible_values() else {
-                                panic!("one field type object")
-                            };
-                            assert_eq!(value.ty().identity(), metadata.embedded[0].identity());
-                            assert_eq!(value.ty().indirection(), u32::from(field.embedded));
+                            assert_eq!(seeds.len(), 2);
+                            assert!(seeds.iter().all(|seed| seed.row().frontier().completion()
+                                == &ResolutionCompletion::Complete));
+                            assert!(seeds.iter().any(|seed| {
+                                seed.row().frontier().possible_values().iter().any(|value| {
+                                    value.ty().identity() == *owner_identity
+                                        && value.ty().indirection() == 1
+                                        && value.ty().reference_indirection() == 0
+                                })
+                            }));
+                            assert!(seeds.iter().any(|seed| seed.row().spelling() == "int"));
                         }
-                    } else if case == "field-shadow" {
-                        let GoMemberDeclarationKind::Struct { fields } = metadata.declaration.kind
-                        else {
-                            panic!("model struct")
-                        };
-                        assert_eq!(fields.len(), 2);
-                        assert!(
-                            fields
-                                .iter()
-                                .all(|field| field.field.is_none() && !field.embedded)
-                        );
-                        let slots = fields
-                            .iter()
-                            .map(|field| field.value_type.unwrap())
-                            .collect::<Vec<_>>();
-                        let mut seeds = Vec::new();
-                        let read = typed
-                            .visit_intrinsic_seed_pages_for_slots(
-                                TypedFactRequest::new(&slots),
-                                &cancellation,
-                                &mut TypedFactPageVisitor::new(&mut |page| {
-                                    seeds.extend_from_slice(page);
-                                    Ok(true)
-                                }),
-                            )
-                            .unwrap();
-                        assert!(read.is_exhausted());
-                        assert_eq!(seeds.len(), 2);
-                        assert!(seeds.iter().all(|seed| seed.row().frontier().completion()
-                            == &ResolutionCompletion::Complete));
-                        assert!(seeds.iter().any(|seed| {
-                            seed.row().frontier().possible_values().iter().any(|value| {
-                                value.ty().identity() == *owner_identity
-                                    && value.ty().indirection() == 1
-                                    && value.ty().reference_indirection() == 0
-                            })
-                        }));
-                        assert!(seeds.iter().any(|seed| seed.row().spelling() == "int"));
                     }
-                }
-                if matches!(
-                    case,
-                    "source-interface" | "model-interface" | "interface-cycle" | "promoted-field"
-                ) {
-                    for (selector, found) in [("Missing", true), ("Own", true), ("Absent", false)] {
+                    if matches!(
+                        case,
+                        "source-interface"
+                            | "model-interface"
+                            | "interface-cycle"
+                            | "promoted-field"
+                    ) {
+                        for (selector, found) in
+                            [("Missing", true), ("Own", true), ("Absent", false)]
+                        {
+                            let GoPreparedImportContextOutcome::Ready(prepared) = operation
+                                .go_file_import_context(
+                                    context_id,
+                                    GO_ROOT_CONSUMER_PATH,
+                                    &cancellation,
+                                )
+                                .unwrap()
+                            else {
+                                panic!("prepared interface request")
+                            };
+                            let at = source.find(&format!(".{selector}(")).unwrap() + 1;
+                            let locator = SelectedSemanticLocator::for_reference_range(
+                                "go",
+                                GO_ROOT_CONSUMER_PATH,
+                                at,
+                                at + selector.len(),
+                            );
+                            let result = operation
+                                .resolve_native_reference_units_bounded_for_go_request(
+                                    *prepared,
+                                    None,
+                                    &locator,
+                                    ReceiverAnalysisBudget::default(),
+                                    &cancellation,
+                                    &mut SelectedResolutionContextMetrics,
+                                    &mut Default::default(),
+                                    &mut Default::default(),
+                                )
+                                .unwrap();
+                            let BoundedResolution::Complete {
+                                value:
+                                    SelectedResolutionOperationOutcome::Native(
+                                        SelectedResolutionLocated::Found(answer),
+                                    ),
+                                ..
+                            } = result
+                            else {
+                                panic!("{case}.{selector}: interface binding unavailable")
+                            };
+                            assert_eq!(
+                                answer.answer.binding().targets().len(),
+                                usize::from(found),
+                                "{case}.{selector}: {:?}",
+                                answer.answer
+                            );
+                            // Member lookup reads only the declared method set
+                            // (#9101). The open model implementation family stays
+                            // with interface satisfaction and method inventories, so
+                            // an exact model interface selects and proves absence
+                            // completely. A cyclic embedding is a gap in the
+                            // declared set and stays incomplete.
+                            if case != "promoted-field" {
+                                assert_eq!(
+                                    answer.answer.binding().completion()
+                                        == &ResolutionCompletion::Complete,
+                                    case != "interface-cycle",
+                                    "{case}.{selector}: {:?}",
+                                    answer.answer.binding().completion()
+                                );
+                            }
+                            if case == "promoted-field" && selector == "Missing" {
+                                let [candidate] = answer
+                                    .model_member_selection
+                                    .as_ref()
+                                    .expect("projected model selection")
+                                    .candidates
+                                    .as_slice()
+                                else {
+                                    panic!("one projected model method")
+                                };
+                                assert_eq!(
+                                    candidate.owner.owner_fqn.as_ref(),
+                                    "example.test/root/provider.Base"
+                                );
+                                assert!(
+                                    !candidate.receiver_route_proven,
+                                    "model embedding supplies no receiver storage proof"
+                                );
+                                assert!(candidate.route_exact && !candidate.interface);
+                                assert!(
+                                    matches!(&answer.definitions, brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(rows) if rows.is_empty()),
+                                    "model token must not become a source unit"
+                                );
+                            }
+                            if found {
+                                let [member] = answer.answer.member_owners() else {
+                                    panic!(
+                                        "{case}.{selector}: one declaring owner: {:?}",
+                                        answer.answer
+                                    )
+                                };
+                                if selector == "Missing" {
+                                    assert!(
+                                        member.owner().shared_name_id().is_some(),
+                                        "method comes from a real model owner"
+                                    );
+                                    if case == "source-interface" {
+                                        assert_eq!(Some(member.owner()), minted_identity);
+                                    } else {
+                                        assert_ne!(
+                                            Some(member.owner()),
+                                            minted_identity,
+                                            "embedding reaches Base's method"
+                                        );
+                                    }
+                                    assert_eq!(member.hierarchy_depth(), 1);
+                                } else if case == "source-interface" {
+                                    assert!(
+                                        member.owner().shared_name_id().is_none(),
+                                        "source direct method retained"
+                                    );
+                                    assert_eq!(member.hierarchy_depth(), 0);
+                                } else {
+                                    assert_eq!(Some(member.owner()), minted_identity);
+                                    assert_eq!(member.hierarchy_depth(), 0);
+                                }
+                                if case == "interface-cycle" {
+                                    assert!(
+                                        answer
+                                            .answer
+                                            .binding()
+                                            .witnesses()
+                                            .iter()
+                                            .all(|w| w.completion()
+                                                != &ResolutionCompletion::Complete),
+                                        "cyclic inventory never becomes a complete positive witness"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Observe actual model candidates in the receiver walk. The
+                    // unit projection remains checkpoint 4; inspect native binding.
+                    let mut defined_answer = None;
+                    if matches!(
+                        case,
+                        "receiver"
+                            | "embedding"
+                            | "pointer-near-miss"
+                            | "defined"
+                            | "defined-absent"
+                            | "promotion-uncertain"
+                            | "field-shadow"
+                    ) {
                         let GoPreparedImportContextOutcome::Ready(prepared) = operation
                             .go_file_import_context(
                                 context_id,
@@ -8038,14 +8257,14 @@ type Item struct{ Decoy bool }
                             )
                             .unwrap()
                         else {
-                            panic!("prepared interface request")
+                            panic!("prepared receiver request")
                         };
-                        let at = source.find(&format!(".{selector}(")).unwrap() + 1;
+                        let at = source.find(".Missing").unwrap() + 1;
                         let locator = SelectedSemanticLocator::for_reference_range(
                             "go",
                             GO_ROOT_CONSUMER_PATH,
                             at,
-                            at + selector.len(),
+                            at + 7,
                         );
                         let result = operation
                             .resolve_native_reference_units_bounded_for_go_request(
@@ -8067,198 +8286,73 @@ type Item struct{ Decoy bool }
                             ..
                         } = result
                         else {
-                            panic!("{case}.{selector}: interface binding unavailable")
+                            panic!("model receiver binding must remain available")
                         };
-                        assert_eq!(
-                            answer.answer.binding().targets().len(),
-                            usize::from(found),
-                            "{case}.{selector}: {:?}",
-                            answer.answer
-                        );
-                        // Member lookup reads only the declared method set
-                        // (#9101). The open model implementation family stays
-                        // with interface satisfaction and method inventories, so
-                        // an exact model interface selects and proves absence
-                        // completely. A cyclic embedding is a gap in the
-                        // declared set and stays incomplete.
-                        if case != "promoted-field" {
-                            assert_eq!(
-                                answer.answer.binding().completion()
-                                    == &ResolutionCompletion::Complete,
-                                case != "interface-cycle",
-                                "{case}.{selector}: {:?}",
-                                answer.answer.binding().completion()
-                            );
+                        if case == "defined" {
+                            defined_answer = Some(answer.answer.clone());
                         }
-                        if case == "promoted-field" && selector == "Missing" {
-                            let [candidate] = answer
-                                .model_member_selection
-                                .as_ref()
-                                .expect("projected model selection")
-                                .candidates
-                                .as_slice()
-                            else {
-                                panic!("one projected model method")
-                            };
+                        if matches!(
+                            case,
+                            "receiver" | "embedding" | "defined" | "promotion-uncertain"
+                        ) {
                             assert_eq!(
-                                candidate.owner.owner_fqn.as_ref(),
-                                "example.test/root/provider.Base"
+                                answer.answer.binding().targets().len(),
+                                1,
+                                "{:?}",
+                                answer.answer.binding()
                             );
                             assert!(
-                                !candidate.receiver_route_proven,
-                                "model embedding supplies no receiver storage proof"
+                                answer.answer.binding().targets()[0]
+                                    .shared_name_id()
+                                    .is_some()
                             );
-                            assert!(candidate.route_exact && !candidate.interface);
-                            assert!(
-                                matches!(&answer.definitions, brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::SelectedNativeDefinitions::Ready(rows) if rows.is_empty()),
-                                "model token must not become a source unit"
-                            );
-                        }
-                        if found {
-                            let [member] = answer.answer.member_owners() else {
-                                panic!(
-                                    "{case}.{selector}: one declaring owner: {:?}",
-                                    answer.answer
-                                )
-                            };
-                            if selector == "Missing" {
+                            if case == "promotion-uncertain" {
                                 assert!(
-                                    member.owner().shared_name_id().is_some(),
-                                    "method comes from a real model owner"
+                                    answer.answer.member_owners().is_empty(),
+                                    "an unmarked promotion copy has no exact declaring owner or depth"
                                 );
-                                if case == "source-interface" {
-                                    assert_eq!(Some(member.owner()), minted_identity);
-                                } else {
-                                    assert_ne!(
-                                        Some(member.owner()),
-                                        minted_identity,
-                                        "embedding reaches Base's method"
-                                    );
-                                }
-                                assert_eq!(member.hierarchy_depth(), 1);
-                            } else if case == "source-interface" {
-                                assert!(
-                                    member.owner().shared_name_id().is_none(),
-                                    "source direct method retained"
+                                assert_ne!(
+                                    answer.answer.binding().completion(),
+                                    &ResolutionCompletion::Complete,
+                                    "promotion copies cannot supply exact depth or declaring owner proof"
                                 );
-                                assert_eq!(member.hierarchy_depth(), 0);
-                            } else {
-                                assert_eq!(Some(member.owner()), minted_identity);
-                                assert_eq!(member.hierarchy_depth(), 0);
-                            }
-                            if case == "interface-cycle" {
                                 assert!(
                                     answer
                                         .answer
                                         .binding()
                                         .witnesses()
                                         .iter()
-                                        .all(|w| w.completion() != &ResolutionCompletion::Complete),
-                                    "cyclic inventory never becomes a complete positive witness"
+                                        .all(|witness| witness.completion()
+                                            != &ResolutionCompletion::Complete)
                                 );
+                            } else {
+                                let [member] = answer.answer.member_owners() else {
+                                    panic!("one model declaring owner")
+                                };
+                                assert_eq!(Some(member.owner()), minted_identity);
+                                assert_eq!(member.hierarchy_depth(), 0);
                             }
-                        }
-                    }
-                }
-                // Observe actual model candidates in the receiver walk. The
-                // unit projection remains checkpoint 4; inspect native binding.
-                if matches!(
-                    case,
-                    "receiver"
-                        | "embedding"
-                        | "pointer-near-miss"
-                        | "defined"
-                        | "defined-absent"
-                        | "promotion-uncertain"
-                        | "field-shadow"
-                ) {
-                    let GoPreparedImportContextOutcome::Ready(prepared) = operation
-                        .go_file_import_context(context_id, GO_ROOT_CONSUMER_PATH, &cancellation)
-                        .unwrap()
-                    else {
-                        panic!("prepared receiver request")
-                    };
-                    let at = source.find(".Missing").unwrap() + 1;
-                    let locator = SelectedSemanticLocator::for_reference_range(
-                        "go",
-                        GO_ROOT_CONSUMER_PATH,
-                        at,
-                        at + 7,
-                    );
-                    let result = operation
-                        .resolve_native_reference_units_bounded_for_go_request(
-                            *prepared,
-                            None,
-                            &locator,
-                            ReceiverAnalysisBudget::default(),
-                            &cancellation,
-                            &mut SelectedResolutionContextMetrics,
-                            &mut Default::default(),
-                            &mut Default::default(),
-                        )
-                        .unwrap();
-                    let BoundedResolution::Complete {
-                        value:
-                            SelectedResolutionOperationOutcome::Native(
-                                SelectedResolutionLocated::Found(answer),
-                            ),
-                        ..
-                    } = result
-                    else {
-                        panic!("model receiver binding must remain available")
-                    };
-                    if matches!(
-                        case,
-                        "receiver" | "embedding" | "defined" | "promotion-uncertain"
-                    ) {
-                        assert_eq!(
-                            answer.answer.binding().targets().len(),
-                            1,
-                            "{:?}",
-                            answer.answer.binding()
-                        );
-                        assert!(
-                            answer.answer.binding().targets()[0]
-                                .shared_name_id()
-                                .is_some()
-                        );
-                        if case == "promotion-uncertain" {
+                        } else {
                             assert!(
-                                answer.answer.member_owners().is_empty(),
-                                "an unmarked promotion copy has no exact declaring owner or depth"
+                                answer.answer.binding().targets().is_empty(),
+                                "{:?}",
+                                answer.answer.binding()
                             );
                             assert_ne!(
                                 answer.answer.binding().completion(),
-                                &ResolutionCompletion::Complete,
-                                "promotion copies cannot supply exact depth or declaring owner proof"
+                                &ResolutionCompletion::Complete
                             );
-                            assert!(
-                                answer
-                                    .answer
-                                    .binding()
-                                    .witnesses()
-                                    .iter()
-                                    .all(|witness| witness.completion()
-                                        != &ResolutionCompletion::Complete)
-                            );
-                        } else {
-                            let [member] = answer.answer.member_owners() else {
-                                panic!("one model declaring owner")
-                            };
-                            assert_eq!(Some(member.owner()), minted_identity);
-                            assert_eq!(member.hierarchy_depth(), 0);
                         }
-                    } else {
-                        assert!(
-                            answer.answer.binding().targets().is_empty(),
-                            "{:?}",
-                            answer.answer.binding()
-                        );
-                        assert_ne!(
-                            answer.answer.binding().completion(),
-                            &ResolutionCompletion::Complete
-                        );
                     }
+                    defined_answer
+                };
+                let baseline = run(false);
+                if case == "defined" {
+                    assert_eq!(
+                        run(true),
+                        baseline,
+                        "a publication clear after open cannot change the pinned Go answer"
+                    );
                 }
             }
         }
@@ -9041,6 +9135,7 @@ func use() { provider.Rewrites.ReadFile() }
                         &lexical,
                         &lexical,
                         &typed,
+                        &brokk_bifrost_analysis::analyzer::resolution::fact_resolution::NoopLexicalAnswerFinalizer,
                         &cancellation,
                         &ResolutionSession::unbounded(),
                         |resolver| {
@@ -9512,6 +9607,44 @@ func use() { provider.Rewrites.ReadFile() }
                 }
                 absent.push(BindingNodeId::local(mount.ordinal().get(), u32::MAX));
             }
+            // During one stage read, an exact catalog hit must mark an
+            // unscoped derivation frame just as the SQL miss does.
+            struct Frame(std::sync::Mutex<Vec<String>>);
+            impl brokk_bifrost_core::attribution::AttributionFrame for Frame {
+                fn mark_unattributed(
+                    &self,
+                    statement: &str,
+                    _: Option<&'static str>,
+                    _: brokk_bifrost_core::attribution::ConnectionTag,
+                ) {
+                    self.0.lock().unwrap().push(statement.to_owned());
+                }
+            }
+            let _stage_read = operation.ready.inventory.derivation_read().unwrap();
+            let frame = std::sync::Arc::new(Frame(std::sync::Mutex::new(Vec::new())));
+            let _frame = brokk_bifrost_core::attribution::enter_frame(frame.clone());
+            lexical.classify_endpoint_nodes(&nodes, &live).unwrap();
+            let misses = frame
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|sql| sql.contains("main.resolution_node_catalog node"))
+                .count();
+            assert!(misses > 0);
+            frame.0.lock().unwrap().clear();
+            lexical.classify_endpoint_nodes(&nodes, &live).unwrap();
+            let hits = frame
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|sql| sql.contains("main.resolution_node_catalog node"))
+                .count();
+            assert_eq!(hits, misses);
+            drop(_frame);
+            drop(_stage_read);
+
             let connection = operation.ready.inventory.connection();
             begin_production_selected_sql_trace_on_connection(connection);
             let first = lexical.classify_endpoint_nodes(&nodes, &live).unwrap();
@@ -9538,12 +9671,14 @@ func use() { provider.Rewrites.ReadFile() }
                     .to_string()
             );
             let repeated = finish_production_selected_sql_trace_on_connection(connection);
+            // This operation has no active stage read. Main-blob absence can
+            // change after another connection publishes lazy facts, so the
+            // node and owner reads must execute again.
             assert!(
-                !repeated
+                repeated
                     .statements
                     .iter()
-                    .any(|sql| sql.contains("main.resolution_node_catalog node")
-                        || sql.contains("main.resolution_member_scope_properties")),
+                    .any(|sql| sql.contains("main.resolution_node_catalog node")),
                 "{repeated:?}"
             );
         }
@@ -9968,7 +10103,8 @@ func use() { provider.Rewrites.ReadFile() }
         fn refused_source_is_a_recorded_input_and_a_named_package_gap() {
             // Shaped like ollama's embedded WAV test data: one line over the
             // default 16,000-byte structural line limit.
-            let refused = format!("package provider\n\nvar data = `{}`\n", "A".repeat(20_000));
+            // A long identifier is code; a long string line is admitted (#10694).
+            let refused = format!("package provider\n\nvar data{} int\n", "A".repeat(20_000));
             let fixture = Fixture::from_project(
                 InlineTestProject::with_language(Language::Go)
                     .file("go.mod", "module example.test/root\n\ngo 1.22\n")
@@ -10127,7 +10263,7 @@ func use() { provider.Rewrites.ReadFile() }
                 .project
                 .file("provider/data_test.go")
                 .write(format!(
-                    "package provider\n\nvar data = `{}`\n",
+                    "package provider\n\nvar data{} int\n",
                     "B".repeat(20_000)
                 ))
                 .unwrap();
@@ -10199,7 +10335,7 @@ func use() { provider.Rewrites.ReadFile() }
             };
             let item = fixture.project.file("provider/item.go");
             item.write(format!(
-                "package provider\ntype Item struct{{}}\nvar data = `{}`\n",
+                "package provider\ntype Item struct{{}}\nvar data{} int\n",
                 "A".repeat(20_000)
             ))
             .unwrap();
@@ -10974,7 +11110,7 @@ func use() { provider.Rewrites.ReadFile() }
             .enumerate()
             {
                 conn.execute("INSERT OR IGNORE INTO workspace_revisions(workspace_id,lang,generation,revision) VALUES(?1,?2,?3,?4)",rusqlite::params![workspace,lang,generation,from]).unwrap();
-                conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,projection_digest,valid_from,valid_until) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",rusqlite::params![workspace,lang,generation,format!("invalid{index}.go"),oid,kind,(kind=="source").then_some(&projection),from,until]).unwrap();
+                conn.execute("INSERT INTO workspace_file_versions(workspace_id,lang,generation,rel_path,blob_oid,input_kind,projection_digest,valid_from,valid_until,file_present) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",rusqlite::params![workspace,lang,generation,format!("invalid{index}.go"),oid,kind,(kind=="source").then_some(&projection),from,until,(kind=="configuration").then_some(1)]).unwrap();
                 conn.execute("INSERT INTO go_package_files(package_id,rel_path,source_role) SELECT ?1,rel_path,'go' FROM workspace_file_versions WHERE file_version_id=?2",rusqlite::params![package,conn.last_insert_rowid()]).unwrap();
             }
             let visible: i64 = conn
@@ -12385,9 +12521,14 @@ func use() { provider.Rewrites.ReadFile() }
                 .build();
             let workspace = project.workspace_analyzer(AnalyzerConfig::default());
             let active = std::sync::Arc::new(active);
-            let overlay =
-                SemanticModelOverlay::build(workspace.analyzer(), &active, &cancellation, 1 << 26)
-                    .unwrap();
+            let overlay = SemanticModelOverlay::build(
+                workspace.analyzer(),
+                &active,
+                &cancellation,
+                1 << 26,
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            )
+            .unwrap();
             let factory = overlay
                 .symbols()
                 .into_iter()
@@ -13797,6 +13938,8 @@ func use() { provider.Rewrites.ReadFile() }
             let key = key();
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.push(SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::Callable,
                 source: SourceMappingId::new(0),
@@ -14215,6 +14358,7 @@ func caller() { db.Open() }
                 SemanticLanguage::Standard(Language::Go),
                 semantic_call,
                 Some(&proof),
+                None,
                 None,
             )
             .expect("resolver-owned package proof");

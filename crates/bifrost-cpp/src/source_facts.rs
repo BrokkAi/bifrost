@@ -1020,7 +1020,7 @@ pub(crate) fn capture_declaration(
             while let Some(current) = chain {
                 if current.kind() == "function_declarator" {
                     fact.callable_comparable_shapes =
-                        Some(cpp_comparable_parameter_shapes(current, source, ancestry));
+                        cpp_comparable_parameter_shapes(current, source, ancestry);
                     fact.callable_identity_suffix = cpp_callable_identity_suffix(current, source);
                     fact.callable_is_constructor =
                         cpp_callable_is_structural_constructor(current, source, ancestry);
@@ -1149,13 +1149,19 @@ fn capture_member_fact(
     } else {
         CppMemberRole::Method
     };
+    let comparable = cpp_comparable_parameter_shapes(function_declarator, source, ancestry);
+    let parameter_shape = comparable
+        .as_deref()
+        .and_then(|shapes| callable_parameter_shape(function_declarator, owner_name, shapes));
+    // An unavailable list proves no special-member parameter shape. Keep the
+    // other source facts, but never infer a default constructor from it.
     let (copy_parameter, move_parameter, remaining_parameters_defaulted) =
-        callable_parameter_shape(function_declarator, source, ancestry, owner_name);
+        parameter_shape.unwrap_or((false, false, false));
     let special_member = match role {
         CppMemberRole::Destructor => CppSpecialMemberKind::Destructor,
         CppMemberRole::Constructor if copy_parameter => CppSpecialMemberKind::CopyConstructor,
         CppMemberRole::Constructor if move_parameter => CppSpecialMemberKind::MoveConstructor,
-        CppMemberRole::Constructor if function_parameter_count(function_declarator) == 0 => {
+        CppMemberRole::Constructor if comparable.as_ref().is_some_and(Vec::is_empty) => {
             CppSpecialMemberKind::DefaultConstructor
         }
         CppMemberRole::AssignmentOperator if copy_parameter => CppSpecialMemberKind::CopyAssignment,
@@ -1248,21 +1254,12 @@ fn capture_throw_fact(node: Node<'_>, source: &str) -> CppThrowFact {
     }
 }
 
-fn function_parameter_count(function: Node<'_>) -> usize {
-    function
-        .child_by_field_name("parameters")
-        .map_or(0, |parameters| parameters.named_child_count())
-}
-
 fn callable_parameter_shape(
     function: Node<'_>,
-    source: &str,
-    ancestry: &ParentIndex<'_>,
     owner_name: Option<&str>,
-) -> (bool, bool, bool) {
-    let Some(parameters) = function.child_by_field_name("parameters") else {
-        return (false, false, true);
-    };
+    comparable: &[CppComparableSlot],
+) -> Option<(bool, bool, bool)> {
+    let parameters = function.child_by_field_name("parameters")?;
     let parameter_nodes: Vec<_> = parameters.named_children(&mut parameters.walk()).collect();
     let remaining_parameters_defaulted = parameter_nodes.len() > 1
         && parameter_nodes
@@ -1270,38 +1267,37 @@ fn callable_parameter_shape(
             .skip(1)
             .all(|parameter| parameter.child_by_field_name("default_value").is_some());
     let Some(first) = parameter_nodes.first().copied() else {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     };
     let Some(_type_node) = first.child_by_field_name("type") else {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     };
     let Some(owner_name) = owner_name else {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     };
-    let comparable = cpp_comparable_parameter_shapes(function, source, ancestry);
     let Some(CppComparableSlot::Shape(parameter)) = comparable.first() else {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     };
     let reference = match parameter.node(parameter.root()) {
         CppComparableNode::Reference { inner } => Some(*inner),
         _ => None,
     };
     let Some(inner) = reference else {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     };
     let CppComparableNode::Named { name, .. } = parameter.node(inner) else {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     };
     let same_owner = name.path().last().is_some_and(|name| name == owner_name);
     if !same_owner {
-        return (false, false, remaining_parameters_defaulted);
+        return Some((false, false, remaining_parameters_defaulted));
     }
     let rvalue = first
         .child_by_field_name("declarator")
         .is_some_and(|declarator| declarator_contains_rvalue_reference(declarator));
     let copy = !rvalue;
     let move_parameter = rvalue;
-    (copy, move_parameter, remaining_parameters_defaulted)
+    Some((copy, move_parameter, remaining_parameters_defaulted))
 }
 
 fn declarator_contains_rvalue_reference(node: Node<'_>) -> bool {

@@ -525,6 +525,8 @@ impl FoundryEntry {
             concurrency_effects: Vec::new(),
             returned_callables: Vec::new(),
             declared_effects: Vec::new(),
+            subject_effects: Vec::new(),
+            lifecycle_coverage: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
             result_use_obligations: Vec::new(),

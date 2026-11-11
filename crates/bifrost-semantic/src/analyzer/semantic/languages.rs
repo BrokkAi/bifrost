@@ -20,3 +20,17 @@ pub fn language_knowledge(language: Language) -> Option<&'static dyn LanguageKno
         Language::Scala => Some(&brokk_bifrost_jvm::ScalaKnowledge),
     }
 }
+
+/// Whether a call written in `caller` may select an external callee that
+/// `declaring` declares. A resolver-owned callee identity names the callee's
+/// declaring language, which is the caller's own unless the caller calls
+/// another language's declarations directly.
+#[doc(hidden)]
+pub fn calls_external_declarations_of(caller: Language, declaring: Language) -> bool {
+    caller == declaring
+        || language_knowledge(caller).is_some_and(|knowledge| {
+            knowledge
+                .external_declaration_languages()
+                .contains(&declaring)
+        })
+}

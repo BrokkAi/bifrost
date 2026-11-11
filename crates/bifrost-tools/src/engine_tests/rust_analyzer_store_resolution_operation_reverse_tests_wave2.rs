@@ -30,6 +30,46 @@ mod rust_departing_wave2_root_tests {
 
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_selected_mount_table_visits_for_test;
     use brokk_bifrost_test_macros::hardwon;
+    #[test]
+    fn immutable_selected_point_reads_hit_without_changing_evidence() {
+        let fixture = RustRootResolutionOperationFixture::new_with_unrelated_crate_source_count(1);
+        let cancellation = CancellationToken::new();
+        let operation = fixture.open_ready(&cancellation);
+        let ready = &operation.ready;
+        let (ordinal, key, site) = ready
+            .inventory
+            .connection()
+            .query_row(
+                "SELECT mount.mount_ordinal, semantic.semantic_key, semantic.source_site
+             FROM temp.selected_resolution_mounts AS mount
+             JOIN main.resolution_semantic_sites AS semantic ON semantic.blob_id=mount.blob_id
+             WHERE semantic.source_site IS NOT NULL
+             ORDER BY mount.mount_ordinal, semantic.semantic_key LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("fixture has a persisted semantic site");
+        let first = ready
+            .stable_point_read_probe_for_test(ordinal, key, site)
+            .unwrap();
+        let fills = ready.stable_point_read_fill_counts_for_test();
+        assert!(
+            fills.iter().all(|count| *count > 0),
+            "each cold reader fills: {fills:?}"
+        );
+        let second = ready
+            .stable_point_read_probe_for_test(ordinal, key, site)
+            .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(ready.stable_point_read_fill_counts_for_test(), fills);
+    }
+
     /// The main hydration statement must seek a fixed requested declaration,
     /// even when the workspace or that declaration's own blob grows. VM steps
     /// measure SQLite work; the mount-visit regression below measures Rust work.
@@ -144,6 +184,34 @@ mod rust_departing_wave2_root_tests {
                     rows[0].2.fq.is_some(),
                     "parsed declaration identity is hydrated"
                 );
+                let SelectedDefinitionUnitReadOutcome::Ready(repeated) = inventory
+                    .selected_definition_units(&request, &cancellation)
+                    .expect("repeated caller projection")
+                else {
+                    panic!("repeated caller projection is ready")
+                };
+                assert_eq!(repeated, rows);
+                assert_eq!(take_selected_definition_unit_sql_work(), (0, 0));
+                use brokk_bifrost_analysis::analyzer::store::selected_definition::{
+                    SelectedLexicalDefinitionReadOutcome,
+                    take_selected_lexical_definition_sql_executions,
+                };
+                take_selected_lexical_definition_sql_executions();
+                let SelectedLexicalDefinitionReadOutcome::Ready(lexical) = inventory
+                    .selected_lexical_definitions(&request, &cancellation)
+                    .expect("caller lexical projection")
+                else {
+                    panic!("caller lexical projection is ready")
+                };
+                assert_eq!(take_selected_lexical_definition_sql_executions(), 1);
+                let SelectedLexicalDefinitionReadOutcome::Ready(repeated_lexical) = inventory
+                    .selected_lexical_definitions(&request, &cancellation)
+                    .expect("repeated caller lexical projection")
+                else {
+                    panic!("repeated caller lexical projection is ready")
+                };
+                assert_eq!(format!("{repeated_lexical:?}"), format!("{lexical:?}"));
+                assert_eq!(take_selected_lexical_definition_sql_executions(), 0);
 
                 // Run the pre-correction query for the same request. This is the
                 // causal control, not the oracle for the requested declaration's

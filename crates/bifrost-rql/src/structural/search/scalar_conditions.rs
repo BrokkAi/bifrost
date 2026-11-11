@@ -22,6 +22,9 @@ use crate::analyzer::resolve_analyzer;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, Dominators, dominators,
 };
+use crate::analyzer::semantic::statement_entries::{
+    CandidateControlRouteIndex, control_edge_proves_route, proven_control_reachable_points,
+};
 use crate::analyzer::semantic::type_flow::validate_prepared_syntax_source_for_procedure;
 use crate::analyzer::semantic::{
     ControlEdgeId, ControlEdgeKind, EvidenceCompleteness, EvidenceId, GuardFact, GuardPredicate,
@@ -801,6 +804,21 @@ fn derive_scalar_condition_outcomes(
         &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
     )
     .ok();
+    let candidate_routes = CandidateControlRouteIndex::build(
+        semantics,
+        &mut CfgAlgorithmRequest::new(&mut cfg_budget, cancellation),
+    )
+    .map_err(|error| match error {
+        crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError::Cancelled { .. } => {
+            ScalarConditionGap::Cancelled
+        }
+        crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError::ExceededBudget(_) => {
+            ScalarConditionGap::WorkLimit
+        }
+        crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError::InvalidNode(point) => {
+            panic!("validated CFG point {point:?}")
+        }
+    })?;
     if cfg_budget.refusal_count() > 0 {
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
@@ -816,6 +834,9 @@ fn derive_scalar_condition_outcomes(
         .gaps()
         .iter()
         .filter(|gap| {
+            if candidate_routes.has_candidate_edge(gap.evidence) {
+                return false;
+            }
             gap_is_relevant_to_scalar_guards(
                 semantics,
                 gap,
@@ -840,6 +861,7 @@ fn derive_scalar_condition_outcomes(
             semantics
                 .control_edges()
                 .iter()
+                .filter(|edge| !control_edge_proves_route(semantics, edge.evidence))
                 .map(|edge| (edge.source, edge.evidence)),
         )
         .chain(
@@ -854,9 +876,13 @@ fn derive_scalar_condition_outcomes(
                 .iter()
                 .map(|guard| (guard.source, guard.evidence)),
         )
-        .filter(|(_, evidence)| !complete_evidence(semantics, *evidence))
+        .filter(|(_, evidence)| {
+            !complete_evidence(semantics, *evidence)
+                && !candidate_routes.has_candidate_edge(*evidence)
+        })
         .collect::<Vec<_>>();
     let partial_producer = !partial_rows.is_empty();
+    let proven_control_points = proven_control_reachable_points(semantics);
     let partial_sources = partial_rows
         .iter()
         .flat_map(|(source, evidence)| {
@@ -892,7 +918,10 @@ fn derive_scalar_condition_outcomes(
             let span = mapping.locator.anchor().span();
             let verdict = if mapping.kind != SourceMappingKind::Exact {
                 ScalarConditionVerdict::Open(ScalarConditionGap::InexactSource)
-            } else if partial_procedure {
+            } else if partial_procedure
+                || (candidate_routes.any_at(guard.point)
+                    && !proven_control_points.contains(&guard.point))
+            {
                 ScalarConditionVerdict::Open(ScalarConditionGap::PartialProcedure)
             } else if partial_producer {
                 ScalarConditionVerdict::Open(ScalarConditionGap::PartialProducer)
@@ -1735,7 +1764,7 @@ fn exact_entry_reaches_guard(
         }
         let mut normal = None;
         for (_, edge) in semantics.successor_edges(current) {
-            if !complete_evidence(semantics, edge.evidence) {
+            if !control_edge_proves_route(semantics, edge.evidence) {
                 return false;
             }
             match edge.kind {
@@ -1930,22 +1959,36 @@ impl ComposedConditions<'_> {
         let mut false_terminals = Vec::<ControlEdgeId>::new();
         let mut true_target = None;
         let mut false_target = None;
+        let mut folded_arm = false;
         for (index, guard) in ordered_guards.iter().enumerate() {
-            let (Some(true_edge), Some(false_edge)) = (guard.true_edge, guard.false_edge) else {
-                return Err(ScalarConditionGap::MissingArm);
+            // A producer that decided an operand at lowering keeps only the
+            // arm it selects and says so with a constant predicate; the
+            // missing arm is then infeasible, not unknown.
+            let arms = match (guard.true_edge, guard.false_edge, guard.predicate) {
+                (Some(true_edge), Some(false_edge), _) => vec![true_edge, false_edge],
+                (Some(edge), None, GuardPredicate::ConstantBoolean { .. })
+                | (None, Some(edge), GuardPredicate::ConstantBoolean { .. }) => {
+                    folded_arm = true;
+                    vec![edge]
+                }
+                // The CFG's reachability seal drops an unreachable operand's
+                // edges into reachable code and clears those arms; such an
+                // operand cannot reach either terminal.
+                _ if !scalar.is_reachable(guard.point) => continue,
+                _ => return Err(ScalarConditionGap::MissingArm),
             };
-            let mut arms = 0_usize;
+            let mut successors = 0_usize;
             for (edge_id, edge) in semantics.successor_edges(guard.point) {
-                if edge_id == true_edge || edge_id == false_edge {
-                    arms += 1;
+                if arms.contains(&edge_id) {
+                    successors += 1;
                 } else if edge.kind != ControlEdgeKind::Exceptional {
                     return Err(incomplete);
                 }
             }
-            if arms != 2 {
+            if successors != arms.len() {
                 return Err(incomplete);
             }
-            for edge_id in [true_edge, false_edge] {
+            for edge_id in arms {
                 let edge = semantics
                     .control_edge(edge_id)
                     .expect("validated guard arm owns a control edge");
@@ -1957,7 +2000,7 @@ impl ComposedConditions<'_> {
                 {
                     return Err(incomplete);
                 }
-                if !complete_evidence(semantics, edge.evidence) {
+                if !control_edge_proves_route(semantics, edge.evidence) {
                     return Err(ScalarConditionGap::PartialProducer);
                 }
                 let point = semantics
@@ -2003,7 +2046,7 @@ impl ComposedConditions<'_> {
                 terminals.push(edge_id);
             }
         }
-        if true_terminals.is_empty() || false_terminals.is_empty() {
+        if (true_terminals.is_empty() || false_terminals.is_empty()) && !folded_arm {
             return Err(ScalarConditionGap::MissingArm);
         }
         let feasible = |edge_id: &ControlEdgeId| {

@@ -309,7 +309,7 @@ mod surface_tests {
         assert_eq!(result.results.len(), 1, "one reference query, one result");
         BoundedPointCall {
             status: result.results[0].status.clone(),
-            complete: result.results[0].complete,
+            complete: result.results[0].completion.is_complete(),
             // A site that does not resolve has to say why in the receipt. An
             // unexplained `exceeded_budget` is a latency number nobody can act on.
             diagnostics: result.results[0]

@@ -764,6 +764,7 @@ mod tests {
             &project,
             &package_clauses,
             &brokk_bifrost_core::hash::HashSet::default(),
+            Vec::new,
         );
         let all_files = project.all_files().unwrap();
         let consumer = ProjectFile::new(root.clone(), "consumer.go");

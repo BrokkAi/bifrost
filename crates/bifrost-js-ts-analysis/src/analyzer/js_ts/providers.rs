@@ -42,7 +42,7 @@ use super::cache::AttributedCache;
 use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::weighted_cache::{
-    weight_code_unit_set, weight_code_unit_vec_by_unit, weight_project_file_set,
+    weight_code_unit_vec_by_unit, weight_project_file_set,
 };
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_js_ts::graph::resolver::{
@@ -163,27 +163,31 @@ pub(crate) fn imported_code_units_of(
     host: &dyn JsTsMemoSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
-) -> Arc<HashSet<CodeUnit>> {
+) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
     memoized_value(
         host,
         &host.memo_caches().imported_code_units,
         file,
-        weight_code_unit_set,
-        || resolve_imported_code_units(host, file, host.import_info_of(token, file)),
+        |_, units| brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(units),
+        || {
+            brokk_bifrost_core::retention_budget::Accounted::uncharged(resolve_imported_code_units(
+                host,
+                file,
+                host.import_info_of(token, file),
+            ))
+        },
     )
 }
 
-/// `imports` is intentionally unused: `imported_code_units_of`'s cache is keyed by `file` alone and,
-/// unlike Python's binding-name-keyed cache, stores a plain `HashSet<CodeUnit>` with no collision risk
-/// -- so routing through it (rather than re-resolving from the passed-in `imports`) is both correct and
-/// gets the caching this hook exists to provide, shared with `could_import_file` below.
+/// The file-keyed provider memo already owns the complete import answer.
+/// Callers use that memo when this info-specific hook returns None.
 pub(crate) fn imported_code_units_from_infos(
-    host: &dyn JsTsMemoSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
+    _host: &dyn JsTsMemoSource,
+    _token: QueryToken<'_>,
+    _file: &ProjectFile,
     _imports: &[ImportInfo],
 ) -> Option<Arc<HashSet<CodeUnit>>> {
-    Some(imported_code_units_of(host, token, file))
+    None
 }
 
 pub(crate) fn referencing_files_of(
@@ -716,10 +720,12 @@ mod tests {
                 &analyzer,
                 &caches.imported_code_units,
                 &file,
-                weight_code_unit_set,
+                |_, units| {
+                    brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(units)
+                },
                 || {
                     analyzer.record_read(keys[0].clone());
-                    HashSet::default()
+                    brokk_bifrost_core::retention_budget::Accounted::uncharged(HashSet::default())
                 },
             );
             memoized_value(

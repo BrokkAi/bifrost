@@ -2,6 +2,7 @@
 //! back, and require the rebuilt artifact to be the lowered one.
 
 use brokk_bifrost_core::cache_gc::PlannerStatisticsState;
+use brokk_bifrost_test_macros::hardwon;
 
 use crate::analyzer::store::AnalyzerStore;
 use crate::analyzer::store::planner_statistics::pinned_plans::{explain_pin, pinned};
@@ -36,6 +37,230 @@ fn semantic_ir_publication_lookup_seeks_keys() {
     }
 }
 
+#[test]
+fn footprint_coverage_changes_sealed_row_digest() {
+    use super::SemanticIrHeadObservation;
+    use crate::analyzer::semantic::{FootprintClass, FootprintDisposition, FootprintRefusal};
+    use brokk_bifrost_core::gitblob::BlobKey;
+    use row_fixture::{LANG, fixture, insert, prepare};
+
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let mut fixture = fixture();
+    let original = prepare(&fixture);
+    let (oid_a, _) = insert(&store, "coverage original a", &original);
+    let (oid_b, _) = insert(&store, "coverage original b", &original);
+    let digest = |oid| match store
+        .semantic_ir_head_observation(&BlobKey::unvaried(oid, LANG))
+        .unwrap()
+    {
+        SemanticIrHeadObservation::Present { row_digest, .. } => row_digest,
+        other => panic!("expected present: {other:?}"),
+    };
+    assert_eq!(digest(oid_a), digest(oid_b));
+
+    fixture.parts[0].footprint_coverage.classes
+        [(FootprintClass::MemoryWrite.code() - 1) as usize] =
+        FootprintDisposition::Refused(FootprintRefusal::ContradictoryOwnership);
+    let changed = prepare(&fixture);
+    let (oid_c, _) = insert(&store, "coverage changed", &changed);
+    assert_ne!(digest(oid_a), digest(oid_c));
+}
+
+#[test]
+fn scoped_call_control_coverage_changes_sealed_row_digest() {
+    use super::SemanticIrHeadObservation;
+    use brokk_bifrost_core::gitblob::BlobKey;
+    use row_fixture::{LANG, fixture, insert, prepare};
+
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let mut fixture = fixture();
+    let original = prepare(&fixture);
+    let (oid_a, _) = insert(&store, "scoped original a", &original);
+    let (oid_b, _) = insert(&store, "scoped original b", &original);
+    let digest = |oid| match store
+        .semantic_ir_head_observation(&BlobKey::unvaried(oid, LANG))
+        .unwrap()
+    {
+        SemanticIrHeadObservation::Present { row_digest, .. } => row_digest,
+        other => panic!("expected present: {other:?}"),
+    };
+    assert_eq!(digest(oid_a), digest(oid_b));
+
+    fixture.parts[0].call_control_coverage.source_boundary = Ok(());
+    let changed = prepare(&fixture);
+    let (oid_c, _) = insert(&store, "scoped changed", &changed);
+    assert_ne!(digest(oid_a), digest(oid_c));
+}
+
+#[test]
+#[hardwon("#9784: stored semantic IR rows changed without invalidating policy units")]
+fn sealed_publication_digest_and_unfiltered_observation() {
+    use super::SemanticIrHeadObservation;
+    use brokk_bifrost_core::gitblob::BlobKey;
+    use row_fixture::{LANG, fixture, insert, prepare};
+
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let fixture = fixture();
+    let prepared = prepare(&fixture);
+    let (oid_a, id_a) = insert(&store, "digest a", &prepared);
+    let (oid_b, id_b) = insert(&store, "digest b", &prepared);
+    let key_a = BlobKey::unvaried(oid_a, LANG);
+    let key_b = BlobKey::unvaried(oid_b, LANG);
+    let digest_a = match store.semantic_ir_head_observation(&key_a).unwrap() {
+        SemanticIrHeadObservation::Present { row_digest, .. } => row_digest,
+        other => panic!("expected present: {other:?}"),
+    };
+    let digest_b = match store.semantic_ir_head_observation(&key_b).unwrap() {
+        SemanticIrHeadObservation::Present { row_digest, .. } => row_digest,
+        other => panic!("expected present: {other:?}"),
+    };
+    assert_eq!(digest_a, digest_b);
+    assert_eq!(digest_a.as_bytes().len(), 32);
+    assert_eq!(
+        store
+            .read_semantic_ir_with_observation(&key_a, &fixture.scope)
+            .unwrap()
+            .1
+            .unwrap()
+            .len(),
+        fixture.parts.len()
+    );
+    let mut conn = store.conn.lock().unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE semantic_ir_publications SET row_digest = zeroblob(31) WHERE blob_id = ?1",
+            [id_a]
+        )
+        .is_err()
+    );
+    conn.execute(
+        "UPDATE semantic_ir_publications SET row_digest = NULL WHERE blob_id = ?1",
+        [id_a],
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute(
+        "UPDATE semantic_ir_publications SET detail = 'changed' WHERE blob_id = ?1",
+        [id_b],
+    )
+    .unwrap();
+    assert_ne!(
+        super::sealed_publication_digest(&tx, id_b).unwrap(),
+        digest_b
+    );
+    tx.rollback().unwrap();
+    let tx = conn.transaction().unwrap();
+    assert!(
+        tx.execute(
+            "UPDATE semantic_ir_call_sites SET normal_results = jsonb('[999]') WHERE blob_id = ?1",
+            [id_b]
+        )
+        .unwrap()
+            > 0
+    );
+    assert_ne!(
+        super::sealed_publication_digest(&tx, id_b).unwrap(),
+        digest_b
+    );
+    tx.rollback().unwrap();
+    let tx = conn.transaction().unwrap();
+    assert!(
+        tx.execute(
+            "UPDATE semantic_ir_texts SET text = 'changed' WHERE blob_id = ?1",
+            [id_b]
+        )
+        .unwrap()
+            > 0
+    );
+    assert_ne!(
+        super::sealed_publication_digest(&tx, id_b).unwrap(),
+        digest_b
+    );
+    tx.rollback().unwrap();
+    for sql in [
+        "UPDATE semantic_ir_guarded_pattern_projections SET path_len = path_len + 1 WHERE blob_id = ?1",
+        "UPDATE semantic_ir_guarded_pattern_steps SET tuple_ordinal = 999 WHERE blob_id = ?1 AND kind = 0",
+    ] {
+        let tx = conn.transaction().unwrap();
+        assert!(tx.execute(sql, [id_b]).unwrap() > 0);
+        assert_ne!(
+            super::sealed_publication_digest(&tx, id_b).unwrap(),
+            digest_b
+        );
+        tx.rollback().unwrap();
+    }
+    drop(conn);
+    let conn = store.conn.lock().unwrap();
+    let legacy_digest: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT row_digest FROM semantic_ir_publications WHERE blob_id = ?1",
+            [id_a],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_digest, None);
+    drop(conn);
+    assert_eq!(
+        store.semantic_ir_head_observation(&key_a).unwrap(),
+        SemanticIrHeadObservation::LegacyNoDigest
+    );
+    assert!(matches!(
+        store.semantic_ir_head_observation(&key_b).unwrap(),
+        SemanticIrHeadObservation::Present { .. }
+    ));
+    let conn = store.conn.lock().unwrap();
+    conn.execute("UPDATE semantic_ir_publications SET publication_state = 'building', row_digest = NULL WHERE blob_id = ?1", [id_b]).unwrap();
+    drop(conn);
+    assert_eq!(
+        store.semantic_ir_head_observation(&key_b).unwrap(),
+        SemanticIrHeadObservation::NotComplete
+    );
+    store
+        .ensure_semantic_ir_producer_epoch(LANG, "new epoch")
+        .unwrap();
+    assert_eq!(
+        store.semantic_ir_head_observation(&key_a).unwrap(),
+        SemanticIrHeadObservation::StaleEpoch
+    );
+}
+
+#[test]
+#[hardwon("#9784: the funnel decoded rows under a non-Complete head")]
+fn incomplete_head_refuses_child_reads() {
+    use super::{PreparedSemanticIr, SemanticIrHeadObservation, SemanticIrLoweringOutcome};
+    use brokk_bifrost_core::gitblob::BlobKey;
+    use row_fixture::{EPOCH, LANG, SOURCE_BYTES, fixture, insert};
+
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let fixture = fixture();
+    let prepared = PreparedSemanticIr::prepare(
+        SemanticIrLoweringOutcome::Incomplete { label: "unknown" },
+        None,
+        EPOCH,
+        fixture.scope.content,
+        SOURCE_BYTES,
+    );
+    let (oid, _) = insert(&store, "incomplete head", &prepared);
+    let key = BlobKey::unvaried(oid, LANG);
+    let (observation, parts) = store
+        .read_semantic_ir_with_observation(&key, &fixture.scope)
+        .unwrap();
+    assert_eq!(observation, SemanticIrHeadObservation::NotComplete);
+    assert!(parts.is_none());
+    let (observation, parts) = store
+        .read_semantic_ir_with_observed_scope(
+            &key,
+            &super::SemanticIrMountFields {
+                mount: fixture.scope.mount,
+                path: fixture.scope.path.clone(),
+                language: fixture.scope.language,
+            },
+        )
+        .unwrap();
+    assert_eq!(observation, SemanticIrHeadObservation::NotComplete);
+    assert!(parts.is_none());
+}
+
 /// Every table and every row variant of the semantic IR rows: a fixture of
 /// five procedures that the encoder writes, the schema checks, and the decoder
 /// rebuilds. The parse-time lowerers that write these rows live in other
@@ -59,30 +284,32 @@ mod row_fixture {
         AccessPathTail, AllocationId, AllocationKind, AllocationSite, ArgumentDomain,
         ArtifactCallableTarget, AsyncResumeKind, BackingStoreOffset, BasicBlock, BlockId,
         CallArgumentExpansion, CallContinuationKind, CallInvocationMode, CallReceiverTypeFact,
-        CallSiteId, CallableReferenceKind, CallableTarget, CallableTargetResolution, CallableValue,
-        CaptureBinding, CaptureId, CaptureMode, CaptureSource, ConstructionReturn, ContentIdentity,
-        ControlContinuation, ControlEdge, ControlEdgeKind, DeclarationLocator, DeclarationSegment,
-        DeclarationSegmentKind, DeferredMemberSelection, DispatchExtensibility, DropBehavior,
-        DropFact, Evidence, EvidenceCompleteness, EvidenceId, ExecutionTiming, FormalMultiplicity,
-        FormalParameterPassingMode, GoPredeclaredBuiltin, GuardArm, GuardConditionDigest,
-        GuardFactParts, GuardId, GuardPredicate, IndexedLocationIdentity, IntegerComparison,
-        LifecycleIncompleteReason, LoopSite, MemoryAccessKind, MemoryLocation, MemoryLocationId,
-        MemoryLocationKind, MemoryValueCopy, MoveInvalidation, MoveOutFact, MoveOutState,
-        PointerAccess, PointerAccessKind, PointerAccessWidth, PointerAlias, PointerByteOffset,
-        PointerIncompleteReason, PointerInvalidation, PointerInvalidationCause,
+        CallSiteId, CallTargetObligation, CallableReferenceKind, CallableTarget,
+        CallableTargetResolution, CallableValue, CaptureBinding, CaptureId, CaptureMode,
+        CaptureSource, ConstructionReturn, ContentIdentity, ControlContinuation, ControlEdge,
+        ControlEdgeKind, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
+        DeferredMemberSelection, DispatchExtensibility, DropBehavior, DropFact, Evidence,
+        EvidenceCompleteness, EvidenceId, ExecutionTiming, FootprintClass, FootprintDisposition,
+        FormalMultiplicity, FormalParameterPassingMode, GoPredeclaredBuiltin, GuardArm,
+        GuardConditionDigest, GuardFactParts, GuardId, GuardPredicate, GuardedPatternProjection,
+        IndexedLocationIdentity, IntegerComparison, LifecycleIncompleteReason, LoopSite,
+        MemoryAccessKind, MemoryLocation, MemoryLocationId, MemoryLocationKind, MemoryValueCopy,
+        MoveInvalidation, MoveOutFact, MoveOutState, PatternProjectionStatus,
+        PatternProjectionStep, PointerAccess, PointerAccessKind, PointerAccessWidth, PointerAlias,
+        PointerByteOffset, PointerIncompleteReason, PointerInvalidation, PointerInvalidationCause,
         PointerInvalidationTarget, PointerOrigin, PointerOriginId, PointerOriginKind,
-        PointerRelationStrength, ProcedureCallBoundary, ProcedureId, ProcedureInvocationKind,
-        ProcedureKind, ProcedureProperties, ProcedureReceiverBinding, ProcedureSemanticsParts,
-        ProgramPoint, ProgramPointId, ProofStatus, ScopeEndAt, ScopeEndFact,
-        SemanticBudgetDimension, SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite,
-        SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapDischarge,
-        SemanticGapId, SemanticGapImpact, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
-        SemanticIncompleteFact, SemanticIncompleteReason, SemanticIncompleteSubject,
-        SemanticLocator, SemanticPlace, SemanticRole, SemanticValue, SemanticValueKind,
-        SignedIntegerMagnitude, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind,
-        SourcePosition, SourceSpan, StableDigest, StatementEntrySite, StructuralNodeIdentity,
-        SwitchCaseFactParts, SwitchEdgeParts, SwitchFactId, SwitchFactKind, SwitchFactParts,
-        SwitchSelectorDomain, SynchronizationOperation, SynchronizationPayload,
+        PointerRelationStrength, ProcedureCallBoundary, ProcedureFootprintCoverage, ProcedureId,
+        ProcedureInvocationKind, ProcedureKind, ProcedureProperties, ProcedureReceiverBinding,
+        ProcedureSemanticsParts, ProgramPoint, ProgramPointId, ProofStatus, ScopeEndAt,
+        ScopeEndFact, SemanticBudgetDimension, SemanticBudgetExceeded, SemanticCallArgument,
+        SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
+        SemanticGapDischarge, SemanticGapId, SemanticGapImpact, SemanticGapImpacts,
+        SemanticGapKind, SemanticGapSubject, SemanticIncompleteFact, SemanticIncompleteReason,
+        SemanticIncompleteSubject, SemanticLocator, SemanticPlace, SemanticRole, SemanticValue,
+        SemanticValueKind, SignedIntegerMagnitude, SourceAnchor, SourceMapping, SourceMappingId,
+        SourceMappingKind, SourcePosition, SourceSpan, StableDigest, StatementEntrySite,
+        StructuralNodeIdentity, SwitchCaseFactParts, SwitchEdgeParts, SwitchFactId, SwitchFactKind,
+        SwitchFactParts, SwitchSelectorDomain, SynchronizationOperation, SynchronizationPayload,
         SynchronizationPayloadCopy, TransferKind, TransferOperation, ValueFlowKind, ValueId,
         ValuePreservation, ValueTransfer, ValueUseKind, WorkspaceMountId, WorkspaceRelativePath,
     };
@@ -422,7 +649,10 @@ mod row_fixture {
                 passing_mode: FormalParameterPassingMode::NamedOnly,
             },
             SemanticValueKind::DefaultArgument { ordinal: 2 },
-            SemanticValueKind::Receiver { dispatch: true },
+            SemanticValueKind::Receiver {
+                dispatch: true,
+                mode: crate::analyzer::semantic::ReceiverMode::SharedBorrow,
+            },
             SemanticValueKind::Return,
             SemanticValueKind::Temporary,
             SemanticValueKind::Address,
@@ -447,7 +677,10 @@ mod row_fixture {
                 name: Some("kwargs".into()),
                 passing_mode: FormalParameterPassingMode::PositionalOrNamed,
             },
-            SemanticValueKind::Receiver { dispatch: false },
+            SemanticValueKind::Receiver {
+                dispatch: false,
+                mode: crate::analyzer::semantic::ReceiverMode::Owned,
+            },
             SemanticValueKind::ConstantString("  padded \t".into()),
             SemanticValueKind::ConstantString("   ".into()),
         ];
@@ -455,12 +688,15 @@ mod row_fixture {
             .into_iter()
             .enumerate()
             .map(|(index, kind)| SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: v(u32::try_from(index).unwrap()),
                 kind,
                 source: sm(u32::try_from(index).unwrap() % 3),
                 evidence: ev(2),
             })
             .collect();
+        p0.values[0].source = sm(3);
         p0.allocations = [
             AllocationKind::Object,
             AllocationKind::Array,
@@ -722,6 +958,18 @@ mod row_fixture {
                 kind: SourceMappingKind::Synthetic,
                 ast_identity: Some(StructuralNodeIdentity::new(content, u32::MAX)),
             },
+            SourceMapping {
+                id: sm(3),
+                locator: locator(&path, &outer, SemanticRole::ProgramPoint, anchor(20, 21, 0)),
+                kind: SourceMappingKind::Exact,
+                ast_identity: Some(StructuralNodeIdentity::new(content, 8)),
+            },
+            SourceMapping {
+                id: sm(4),
+                locator: locator(&path, &outer, SemanticRole::ProgramPoint, anchor(18, 22, 0)),
+                kind: SourceMappingKind::Exact,
+                ast_identity: Some(StructuralNodeIdentity::new(content, 9)),
+            },
         ];
         p0.statement_entries = vec![
             StatementEntrySite {
@@ -791,7 +1039,7 @@ mod row_fixture {
             ),
             gap(
                 2,
-                SemanticGapSubject::Value(v(1)),
+                SemanticGapSubject::Value(v(0)),
                 SemanticCapability::Values,
                 some_impacts,
                 SemanticGapKind::Unknown,
@@ -850,6 +1098,22 @@ mod row_fixture {
                 SemanticGapDischarge::None,
             ),
         ];
+        p0.footprint_coverage.classes[(FootprintClass::CallTarget.code() - 1) as usize] =
+            FootprintDisposition::Represented;
+        p0.footprint_coverage
+            .call_target_obligations
+            .push(CallTargetObligation {
+                call: call(1),
+                gap: SemanticGapId::new(5),
+                impacts: some_impacts,
+            });
+        p0.call_control_coverage
+            .call_target_obligations
+            .push(CallTargetObligation {
+                call: call(1),
+                gap: SemanticGapId::new(5),
+                impacts: some_impacts,
+            });
         p0.blocks = vec![
             BasicBlock {
                 id: BlockId::new(0),
@@ -1666,6 +1930,21 @@ mod row_fixture {
                 member: "len".into(),
             },
         ];
+        p0.guarded_pattern_projections = vec![GuardedPatternProjection {
+            ordinal: 0,
+            point: pt(2),
+            whole_value: v(1),
+            binder: v(0),
+            pattern_source: sm(4),
+            binder_source: sm(3),
+            declared_path_len: 2,
+            path: vec![
+                PatternProjectionStep::Tuple(0),
+                PatternProjectionStep::Named("payload".into()),
+            ]
+            .into_boxed_slice(),
+            status: PatternProjectionStatus::Unevaluated,
+        }];
         p0.go_predeclared_builtin_assumptions = vec![
             GoPredeclaredBuiltin::Len,
             GoPredeclaredBuiltin::Append,
@@ -1691,12 +1970,16 @@ mod row_fixture {
         };
         p1.values = vec![
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: v(0),
                 kind: SemanticValueKind::Local,
                 source: sm(0),
                 evidence: ev(0),
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: v(1),
                 kind: SemanticValueKind::Temporary,
                 source: sm(0),
@@ -1842,10 +2125,10 @@ mod row_fixture {
 
         let receiver = PartialFlowPort::Receiver;
         let parameter = PartialFlowPort::Parameter { ordinal: 0 };
-        let flows_0 = ProcedurePartialFlows {
-            outcome: PartialFlowOutcome::Complete,
-            detail: Some("unknown".to_owned()),
-            ports: vec![
+        let flows_0 = ProcedurePartialFlows::new(
+            PartialFlowOutcome::Complete,
+            Some("unknown".to_owned()),
+            vec![
                 receiver.clone(),
                 parameter.clone(),
                 PartialFlowPort::NormalReturn,
@@ -1898,7 +2181,7 @@ mod row_fixture {
                     destination: mem(0),
                 },
             ],
-            flows: vec![
+            vec![
                 PartialFlow {
                     from: PortId::new(0),
                     to: PortId::new(2),
@@ -1922,40 +2205,42 @@ mod row_fixture {
                     crossed: vec![vec![call(0)].into_boxed_slice()].into(),
                 },
             ],
-            open: true,
-            relations_complete: true,
-            discharged_gaps: vec![SemanticGapId::new(1), SemanticGapId::new(3)],
-        };
+            true,
+            true,
+            vec![SemanticGapId::new(1), SemanticGapId::new(3)],
+        );
         // A second procedure with ports, so a read of one procedure's ports
         // or flows that also took another's would be seen.
-        let flows_1 = ProcedurePartialFlows {
-            outcome: PartialFlowOutcome::Complete,
-            detail: None,
-            ports: vec![
+        let flows_1 = ProcedurePartialFlows::new(
+            PartialFlowOutcome::Complete,
+            None,
+            vec![
                 PartialFlowPort::Parameter { ordinal: 0 },
                 PartialFlowPort::CallArgument {
                     call: call(0),
                     ordinal: 0,
                 },
             ],
-            flows: vec![PartialFlow {
+            vec![PartialFlow {
                 from: PortId::new(0),
                 to: PortId::new(1),
                 uncertain: false,
                 crossed: vec![Box::<[CallSiteId]>::default()].into(),
             }],
-            open: false,
-            relations_complete: true,
-            discharged_gaps: Vec::new(),
-        };
-        let empty_flows = |outcome, detail: Option<&str>| ProcedurePartialFlows {
-            outcome,
-            detail: detail.map(str::to_owned),
-            ports: Vec::new(),
-            flows: Vec::new(),
-            open: false,
-            relations_complete: false,
-            discharged_gaps: Vec::new(),
+            false,
+            true,
+            Vec::new(),
+        );
+        let empty_flows = |outcome, detail: Option<&str>| {
+            ProcedurePartialFlows::new(
+                outcome,
+                detail.map(str::to_owned),
+                Vec::new(),
+                Vec::new(),
+                false,
+                false,
+                Vec::new(),
+            )
         };
         Fixture {
             scope,
@@ -1976,6 +2261,8 @@ mod row_fixture {
         let mut parts = fixture.parts.clone();
         for procedure in &mut parts {
             procedure.go_predeclared_builtin_assumptions.clear();
+            procedure.footprint_coverage = ProcedureFootprintCoverage::unclassified();
+            procedure.call_control_coverage = Default::default();
         }
         parts[0].go_predeclared_builtin_assumptions = vec![
             GoPredeclaredBuiltin::Append,
@@ -2041,7 +2328,65 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
     use crate::analyzer::semantic::ProcedureId;
     use row_fixture::{SOURCE_BYTES, expected_decoded_parts, fixture, insert, prepare};
 
-    let fixture = fixture();
+    let mut fixture = fixture();
+    use crate::analyzer::semantic::StaticTypeClass;
+    fixture.parts[0].declared_result_classes = Some(
+        vec![
+            StaticTypeClass::Interface,
+            StaticTypeClass::Unknown,
+            StaticTypeClass::Value,
+        ]
+        .into_boxed_slice(),
+    );
+    for (value, class) in fixture.parts[0].values.iter_mut().zip(
+        [
+            StaticTypeClass::Unknown,
+            StaticTypeClass::Interface,
+            StaticTypeClass::Pointer,
+            StaticTypeClass::Reference,
+            StaticTypeClass::Value,
+        ]
+        .into_iter()
+        .cycle(),
+    ) {
+        value.static_type_class = class;
+    }
+    if let Some(result) = fixture.parts[0].call_sites[0].normal_result(0) {
+        fixture.parts[0].values[result.index()].static_type_class = StaticTypeClass::Unknown;
+        fixture.parts[0].values[result.index()].static_type_origin =
+            Some(crate::analyzer::semantic::StaticTypeOrigin::CallResult {
+                call: fixture.parts[0].call_sites[0].id,
+                ordinal: 0,
+            });
+    }
+    // A target-bearing candidate must retain its separate evidence through rows.
+    fixture.parts[0]
+        .control_edges
+        .push(crate::analyzer::semantic::ControlEdge {
+            source_point: crate::analyzer::semantic::ProgramPointId::new(1),
+            target_point: crate::analyzer::semantic::ProgramPointId::new(4),
+            kind: crate::analyzer::semantic::ControlEdgeKind::Exceptional,
+            source: crate::analyzer::semantic::SourceMappingId::new(0),
+            evidence: crate::analyzer::semantic::EvidenceId::new(1),
+        });
+    fixture.parts[0]
+        .gaps
+        .push(crate::analyzer::semantic::SemanticGap {
+            id: crate::analyzer::semantic::SemanticGapId::new(8),
+            point: crate::analyzer::semantic::ProgramPointId::new(4),
+            subject: crate::analyzer::semantic::SemanticGapSubject::Point,
+            capability: crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow,
+            impacts: crate::analyzer::semantic::SemanticGapImpacts::for_gap(
+                crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow,
+                crate::analyzer::semantic::SemanticGapSubject::Point,
+            ),
+            kind: crate::analyzer::semantic::SemanticGapKind::Unproven,
+            budget: None,
+            discharge: crate::analyzer::semantic::SemanticGapDischarge::None,
+            detail: "unproven reason".into(),
+            source: crate::analyzer::semantic::SourceMappingId::new(0),
+            evidence: crate::analyzer::semantic::EvidenceId::new(1),
+        });
     let prepared = prepare(&fixture);
     let store = AnalyzerStore::open_ephemeral().unwrap();
     let (oid, blob_id) = insert(&store, "round trip", &prepared);
@@ -2115,6 +2460,18 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
         );
     }
 
+    for (index, whole) in decoded.iter().enumerate() {
+        let procedure = ProcedureId::new(u32::try_from(index).unwrap());
+        let narrow = store
+            .read_semantic_ir_procedure(blob_id, &fixture.scope, procedure)
+            .unwrap();
+        assert_eq!(
+            format!("{narrow:#?}"),
+            format!("{whole:#?}"),
+            "procedure {index}"
+        );
+    }
+
     for (index, flows) in fixture.flows.iter().enumerate() {
         let procedure = ProcedureId::new(u32::try_from(index).unwrap());
         assert_eq!(
@@ -2143,6 +2500,328 @@ fn semantic_ir_rows_round_trip_every_table_and_variant() {
         )),
         "{missing}"
     );
+}
+
+/// Admission reads one complete publication and requires every coverage row.
+#[test]
+#[hardwon("#9183: review found a relevant semantic gap could leave stored coverage admitted")]
+fn footprint_coverage_reader_refuses_missing_old_and_incomplete_rows() {
+    use super::{StoredFootprintCoverage, StoredFootprintRefusal};
+    use crate::analyzer::semantic::{
+        CallSiteId, CallTargetObligation, ProcedureId, SemanticGapId, SemanticGapImpact,
+        SemanticGapImpacts,
+    };
+    use row_fixture::{fixture, insert, prepare};
+
+    let fixture = fixture();
+    let prepared = prepare(&fixture);
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let (oid, blob_id) = insert(&store, "footprint reader", &prepared);
+    let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, row_fixture::LANG);
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_footprint_coverage
+             SET boundary_disposition = 1, boundary_reason = NULL
+             WHERE blob_id = ?1 AND procedure BETWEEN 0 AND 3",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_footprint_coverage_classes
+             SET disposition = 1, reason = NULL
+             WHERE blob_id = ?1 AND procedure BETWEEN 0 AND 3",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_footprint_coverage_classes
+             SET disposition = 2, reason = 2
+             WHERE blob_id = ?1 AND procedure = 0 AND class = 12",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM semantic_ir_footprint_coverage
+             WHERE blob_id = ?1 AND procedure = 1",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_footprint_coverage SET contract_version = 2
+             WHERE blob_id = ?1 AND procedure = 2",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM semantic_ir_footprint_coverage_classes
+             WHERE blob_id = ?1 AND procedure = 3 AND class = 15",
+            [blob_id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0,
+        );
+    }
+    let read = |procedure| {
+        store
+            .read_footprint_coverage(&key, fixture.scope.content, ProcedureId::new(procedure))
+            .unwrap()
+    };
+    assert_eq!(
+        read(0),
+        StoredFootprintCoverage::Admitted {
+            call_target_obligations: vec![CallTargetObligation {
+                call: CallSiteId::new(1),
+                gap: SemanticGapId::new(5),
+                impacts: SemanticGapImpacts::single(SemanticGapImpact::ValueFlow)
+                    .with(SemanticGapImpact::HeapWrite),
+            }]
+        }
+    );
+    assert_eq!(
+        read(1),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::CoverageUnavailable)
+    );
+    assert_eq!(
+        read(2),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::OldContract)
+    );
+    assert_eq!(
+        read(3),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::MissingClass)
+    );
+    // A malformed admitted boundary cannot override an excluded call target
+    // class when the publication still contains a target obligation.
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_footprint_coverage_classes
+             SET disposition = 2, reason = 1
+             WHERE blob_id = ?1 AND procedure = 0 AND class = 9",
+            [blob_id],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        read(0),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::RefusedCoverage)
+    );
+    // A producer that found an unaccounted gap persists a boundary refusal.
+    // It must never be admitted because its other coverage rows look complete.
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_footprint_coverage
+             SET boundary_disposition = 3, boundary_reason = 5
+             WHERE blob_id = ?1 AND procedure = 0",
+            [blob_id],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        read(0),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::RefusedCoverage)
+    );
+}
+
+#[test]
+fn footprint_writer_accepts_represented_class_without_instances() {
+    use super::StoredFootprintCoverage;
+    use crate::analyzer::semantic::{FootprintClass, FootprintDisposition, ProcedureId};
+    use row_fixture::{fixture, insert, prepare};
+
+    let mut fixture = fixture();
+    let procedure = &mut fixture.parts[1];
+    assert!(
+        procedure
+            .points
+            .iter()
+            .flat_map(|point| &point.events)
+            .all(|event| !matches!(
+                event.effect,
+                crate::analyzer::semantic::SemanticEffect::MemoryLoad { .. }
+            ))
+    );
+    procedure.footprint_coverage.boundary = Ok(());
+    procedure.footprint_coverage.classes = [FootprintDisposition::Represented; 15];
+    assert_eq!(
+        procedure.footprint_coverage.classes[(FootprintClass::MemoryRead.code() - 1) as usize],
+        FootprintDisposition::Represented,
+    );
+    let prepared = prepare(&fixture);
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let (oid, _) = insert(&store, "represented empty footprint", &prepared);
+    let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, row_fixture::LANG);
+    assert!(matches!(
+        store
+            .read_footprint_coverage(&key, fixture.scope.content, ProcedureId::new(1))
+            .unwrap(),
+        StoredFootprintCoverage::Admitted { .. }
+    ));
+}
+
+#[test]
+fn footprint_writer_refuses_excluded_memory_store() {
+    use super::{StoredFootprintCoverage, StoredFootprintRefusal};
+    use crate::analyzer::semantic::{
+        FootprintClass, FootprintDisposition, FootprintExclusion, FootprintRefusal, ProcedureId,
+    };
+    use row_fixture::{fixture, insert, prepare};
+
+    let mut fixture = fixture();
+    let coverage = &mut fixture.parts[0].footprint_coverage;
+    coverage.boundary = Ok(());
+    coverage.classes[(FootprintClass::MemoryWrite.code() - 1) as usize] =
+        FootprintDisposition::Excluded(FootprintExclusion::NoInstance);
+    assert!(
+        fixture.parts[0]
+            .points
+            .iter()
+            .any(|point| point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    crate::analyzer::semantic::SemanticEffect::MemoryStore { .. }
+                )
+            }))
+    );
+    let prepared = prepare(&fixture);
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let (oid, blob_id) = insert(&store, "contradictory footprint", &prepared);
+    let conn = store.conn.lock().unwrap();
+    let boundary: (i64, i64) = conn
+        .query_row(
+            "SELECT boundary_disposition, boundary_reason
+             FROM semantic_ir_footprint_coverage WHERE blob_id = ?1 AND procedure = 0",
+            [blob_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        boundary,
+        (3, FootprintRefusal::ContradictoryOwnership.code())
+    );
+    drop(conn);
+    let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, row_fixture::LANG);
+    assert_eq!(
+        store
+            .read_footprint_coverage(&key, fixture.scope.content, ProcedureId::new(0))
+            .unwrap(),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::RefusedCoverage),
+    );
+}
+
+/// A Go multi-value return publishes through indexed flows and carries no
+/// returned value, and a composite literal initializes through aggregate
+/// operands. Each must count as a publication, so a class that excludes the
+/// publication is contradictory and a class that represents it is not.
+#[test]
+fn footprint_writer_counts_return_flows_and_aggregate_operands() {
+    use crate::analyzer::semantic::{
+        FootprintClass, FootprintDisposition, FootprintExclusion, FootprintRefusal, SemanticEffect,
+        ValueFlowKind,
+    };
+    use row_fixture::{fixture, insert, prepare};
+
+    type Witness = (&'static str, fn(&SemanticEffect) -> bool, FootprintClass);
+    let witnesses: [Witness; 4] = [
+        (
+            "indexed return",
+            |effect| {
+                matches!(
+                    effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::IndexedReturn { .. },
+                        ..
+                    }
+                )
+            },
+            FootprintClass::PublicationEscape,
+        ),
+        (
+            "return flow",
+            |effect| {
+                matches!(
+                    effect,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Return,
+                        ..
+                    }
+                )
+            },
+            FootprintClass::PublicationEscape,
+        ),
+        (
+            "aggregate initializer",
+            |effect| matches!(effect, SemanticEffect::AggregateInitializer { .. }),
+            FootprintClass::MemoryWrite,
+        ),
+        (
+            "aggregate initializer",
+            |effect| matches!(effect, SemanticEffect::AggregateInitializer { .. }),
+            FootprintClass::PublicationEscape,
+        ),
+    ];
+    for (name, is_witness, class) in witnesses {
+        let boundary = |disposition| {
+            let mut fixture = fixture();
+            let procedure = fixture
+                .parts
+                .iter_mut()
+                .find(|procedure| {
+                    procedure
+                        .points
+                        .iter()
+                        .any(|point| point.events.iter().any(|event| is_witness(&event.effect)))
+                })
+                .unwrap_or_else(|| panic!("fixture has no {name}"));
+            // Keep only the witness: a capture or another event would also
+            // witness a publication.
+            let witness = procedure
+                .points
+                .iter()
+                .flat_map(|point| &point.events)
+                .find(|event| is_witness(&event.effect))
+                .unwrap()
+                .clone();
+            for point in &mut procedure.points {
+                point.events = Box::new([]);
+            }
+            procedure.points[0].events = Box::new([witness]);
+            procedure.captures.clear();
+            procedure.footprint_coverage.boundary = Ok(());
+            procedure.footprint_coverage.classes = [FootprintDisposition::Represented; 15];
+            procedure.footprint_coverage.classes[(class.code() - 1) as usize] = disposition;
+            let id = procedure.id.index();
+            let prepared = prepare(&fixture);
+            let store = AnalyzerStore::open_ephemeral().unwrap();
+            let (_, blob_id) = insert(&store, name, &prepared);
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT boundary_disposition, boundary_reason
+                 FROM semantic_ir_footprint_coverage WHERE blob_id = ?1 AND procedure = ?2",
+                rusqlite::params![blob_id, id as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            boundary(FootprintDisposition::Excluded(
+                FootprintExclusion::NoInstance
+            )),
+            (3, Some(FootprintRefusal::ContradictoryOwnership.code())),
+            "{name} against excluded {class:?}"
+        );
+        assert_eq!(
+            boundary(FootprintDisposition::Represented),
+            (1, None),
+            "{name} against represented {class:?}"
+        );
+    }
 }
 
 /// A head without child rows carries its outcome in its own columns: the
@@ -2215,6 +2894,21 @@ fn semantic_ir_decoder_rejects_corrupted_rows_by_naming_the_row() {
     use row_fixture::{fixture, insert, prepare};
 
     let cases: &[(&str, CorruptedRead, &str, &[&str])] = &[
+        (
+            "a guarded candidate with a mismatched path length",
+            CorruptedRead::Ir,
+            "UPDATE semantic_ir_guarded_pattern_projections SET path_len = 3 WHERE blob_id = {blob} AND procedure = 0 AND ordinal = 0",
+            &["semantic_ir_guarded_pattern_steps", "is incomplete"],
+        ),
+        (
+            "a guarded path with a non-dense step",
+            CorruptedRead::Ir,
+            "UPDATE semantic_ir_guarded_pattern_steps SET step = 2 WHERE blob_id = {blob} AND procedure = 0 AND candidate = 0 AND step = 1",
+            &[
+                "semantic_ir_guarded_pattern_steps",
+                "expected the dense id 1",
+            ],
+        ),
         (
             "a value id that skips one",
             CorruptedRead::Ir,
@@ -2464,5 +3158,102 @@ fn semantic_ir_decoder_rejects_corrupted_rows_by_naming_the_row() {
     assert!(
         accepted.is_empty(),
         "the decoder accepted corrupted rows: {accepted:?}"
+    );
+}
+
+/// A complete scoped claim is independent of the full-footprint claim; all
+/// eight child classes and the separate source boundary must be present.
+#[test]
+fn call_control_coverage_reader_requires_complete_scoped_publication() {
+    use super::{StoredFootprintCoverage, StoredFootprintRefusal};
+    use crate::analyzer::semantic::ProcedureId;
+    use row_fixture::{fixture, insert, prepare};
+
+    let mut fixture = fixture();
+    for procedure in &mut fixture.parts[..4] {
+        procedure.call_control_coverage.source_boundary = Ok(());
+        procedure.call_control_coverage.admission = Ok(());
+    }
+    let prepared = prepare(&fixture);
+    let store = AnalyzerStore::open_ephemeral().unwrap();
+    let (oid, blob_id) = insert(&store, "scoped call control", &prepared);
+    let key = brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, row_fixture::LANG);
+    {
+        let conn = store.conn.lock().unwrap();
+        assert!(conn.execute(
+            "INSERT INTO semantic_ir_call_control_classes(blob_id, procedure, class, disposition)
+             VALUES(?1, 999999, 1, 1)",
+            [blob_id],
+        ).is_err(), "orphan scoped class must violate its parent FK");
+        conn.execute(
+            "DELETE FROM semantic_ir_call_control_coverage
+                      WHERE blob_id = ?1 AND procedure = 1",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_call_control_coverage SET contract_version = 2
+                      WHERE blob_id = ?1 AND procedure = 2",
+            [blob_id],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM semantic_ir_call_control_classes
+                      WHERE blob_id = ?1 AND procedure = 3 AND class = 8",
+            [blob_id],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+    let read = |id| {
+        store
+            .read_call_control_coverage(&key, fixture.scope.content, ProcedureId::new(id))
+            .unwrap()
+    };
+    assert!(matches!(read(0), StoredFootprintCoverage::Admitted { .. }));
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM semantic_ir_call_control_obligations
+             WHERE blob_id = ?1 AND procedure = 0",
+            [blob_id],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        read(0),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::RefusedCoverage)
+    );
+    assert_eq!(
+        read(1),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::CoverageUnavailable)
+    );
+    assert_eq!(
+        read(2),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::OldContract)
+    );
+    assert_eq!(
+        read(3),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::MissingClass)
+    );
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE semantic_ir_call_control_coverage
+                      SET source_boundary = 3, source_reason = 5
+                      WHERE blob_id = ?1 AND procedure = 0",
+            [blob_id],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        read(0),
+        StoredFootprintCoverage::Refused(StoredFootprintRefusal::RefusedCoverage)
     );
 }

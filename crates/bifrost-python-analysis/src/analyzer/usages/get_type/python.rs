@@ -1,41 +1,53 @@
-use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
-
-use brokk_bifrost_analysis::analyzer::usages::get_type::candidates_outcome_with_target_kind;
-
-use brokk_bifrost_analysis::analyzer::usages::get_type::exact_semantic_model_type_outcome;
-
-use brokk_bifrost_analysis::analyzer::usages::get_type::no_type;
-
-use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
-
-use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
-
-use crate::analyzer::usages::get_definition::python::PythonDefinitionProvider;
-
-use crate::analyzer::usages::get_definition::python::PythonTypeLookupTarget;
-
-use crate::analyzer::usages::get_definition::python::python_type_lookup_resolution_bounded;
-
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-
-use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
-
-use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
-
-use brokk_bifrost_core::analyzer::model::Language;
-
-use brokk_bifrost_core::analyzer::model::ProjectFile;
-
 use crate::analyzer::PythonAnalyzer;
-
+use crate::analyzer::usages::get_definition::python::PythonDefinitionProvider;
+use crate::analyzer::usages::get_definition::python::PythonTypeLookupTarget;
+use crate::analyzer::usages::get_definition::python::python_type_lookup_resolution_bounded;
+use brokk_bifrost_analysis::analyzer::i_analyzer::IAnalyzer;
+use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
-
+use brokk_bifrost_analysis::analyzer::usages::get_type::TypeLookupOutcome;
+use brokk_bifrost_analysis::analyzer::usages::get_type::candidates_outcome_with_target_kind;
+use brokk_bifrost_analysis::analyzer::usages::get_type::exact_semantic_model_type_outcome;
+use brokk_bifrost_analysis::analyzer::usages::get_type::no_type;
+use brokk_bifrost_core::analyzer::model::Language;
+use brokk_bifrost_core::analyzer::model::ProjectFile;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
+use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
+use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
+use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 use brokk_bifrost_core::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_python_type_bounded(
+    analyzer: &dyn IAnalyzer,
+    _token: QueryToken<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    crate::analyzer::python::native_request::definition_lookup::resolve_type_bounded(
+        BoundedReceiverQuery {
+            analyzer,
+            file,
+            source,
+            tree,
+            site,
+            budget,
+            cancellation,
+        },
+    )
+}
+
+/// The legacy structural type lookup. The native request answers every site
+/// first; it keeps this answer only where the native answer is open for a
+/// typed provider or lexical-selection reason (#5658).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_python_type_legacy_bounded(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
@@ -168,7 +180,7 @@ def drive(car: Car):
             budget,
         );
         assert_eq!(outcomes.len(), 1);
-        outcomes.pop().unwrap()
+        outcomes.pop().unwrap().0
     }
 
     /// The caret sits on `engine` in `car.engine.start()`.
@@ -360,5 +372,76 @@ def drive(car: Car):
                 "-> {annotation}: {result:#?}",
             );
         }
+    }
+
+    /// The reported types drop `types.NoneType` beside another type, but an
+    /// answer whose only type is NoneType still reports it.
+    #[test]
+    fn a_none_only_answer_still_reports_none_type() {
+        let source = "def f():\n    value = None\n    return value\n";
+        let start = source.rfind("value").expect("use site");
+        let result = resolve(
+            &[("app.py", source)],
+            "app.py",
+            start,
+            "value".len(),
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        );
+        assert_eq!(
+            result
+                .types
+                .iter()
+                .map(|ty| ty.fqn.as_str())
+                .collect::<Vec<_>>(),
+            ["types.NoneType"],
+            "{result:#?}",
+        );
+    }
+
+    const CLS_SOURCE: &str = concat!(
+        "class Service:\n",
+        "    @classmethod\n",
+        "    def member(cls):\n",
+        "        return 1\n",
+        "\n",
+        "    @classmethod\n",
+        "    def build(cls):\n",
+        "        return cls.member()\n",
+        "\n",
+        "\n",
+        "class Sub(Service):\n",
+        "    @classmethod\n",
+        "    def member(cls):\n",
+        "        return 2\n",
+    );
+
+    /// `cls` in a classmethod is the class Service or a subclass. Its type is a
+    /// complete type reference to Service even though a subclass may override
+    /// the member the call reaches.
+    #[test]
+    fn cls_in_a_classmethod_reports_its_class_as_a_complete_type_reference() {
+        let start = CLS_SOURCE.find("cls.member").expect("cls receiver");
+        let result = resolve(
+            &[("app.py", CLS_SOURCE)],
+            "app.py",
+            start,
+            "cls".len(),
+            INTERACTIVE_TYPE_LOOKUP_BUDGET,
+        );
+        assert_eq!(result.status, TypeLookupStatus::Resolved, "{result:#?}");
+        assert_eq!(
+            result.target_kind,
+            brokk_bifrost_analysis::analyzer::usages::target_kind::TypeLookupTargetKind::TypeReference,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result
+                .types
+                .iter()
+                .map(|ty| ty.fqn.as_str())
+                .collect::<Vec<_>>(),
+            ["app.Service"],
+            "{result:#?}"
+        );
     }
 }

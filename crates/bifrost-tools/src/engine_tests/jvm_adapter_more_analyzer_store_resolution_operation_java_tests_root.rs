@@ -97,9 +97,926 @@ pub mod jvm_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::resolution::local_identity::ResolutionLookupSemanticRecipe;
 
+    use brokk_bifrost_analysis::analyzer::resolution::tier_evaluator::InheritedTierWitness;
+
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::resolution_operation_tests_go_support::operation_fixture_support::mount_lookup as mount_lookup;
 
     use brokk_bifrost_analysis::analyzer::store::resolution_operation::resolution_operation_tests_go_support::operation_fixture_support::assert_empty_context_metrics as assert_empty_context_metrics;
+
+    #[derive(Default)]
+    struct ReadReuseCounter(std::sync::atomic::AtomicUsize);
+
+    impl brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal for ReadReuseCounter {
+        fn refuse_read_reuse(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn inherited_witness_fixture(
+        source: &str,
+        owner_name: &str,
+    ) -> (JavaRootResolutionOperationFixture, ResolutionSiteId) {
+        let fixture = JavaRootResolutionOperationFixture::with_source_texts(
+            [
+                source,
+                "package unused; class Spare {}",
+                "package other; class Other {}",
+            ],
+            ["Types.java", "unused/Spare.java", "other/Other.java"],
+            &[],
+        );
+        let site = fixture
+            .consumer_facts
+            .identifiers_named(
+                owner_name,
+                ResolutionIdentifierRole::Declaration,
+                ResolutionNamespace::Type,
+            )
+            .first()
+            .expect("owner definition")
+            .site;
+        (fixture, site)
+    }
+
+    fn inherited_witness_for_owner(
+        operation: &SelectedResolutionOperation<'_, '_>,
+        site: ResolutionSiteId,
+        spelling: &str,
+        token: &CancellationToken,
+    ) -> Option<InheritedTierWitness> {
+        inherited_witness_for_owner_in(operation, "Types.java", site, spelling, token)
+    }
+
+    fn inherited_witness_for_owner_in(
+        operation: &SelectedResolutionOperation<'_, '_>,
+        path: &str,
+        site: ResolutionSiteId,
+        spelling: &str,
+        token: &CancellationToken,
+    ) -> Option<InheritedTierWitness> {
+        let lexical = operation.ready.lexical_source();
+        let locator_token = CancellationToken::new();
+        let brokk_bifrost_analysis::analyzer::store::resolution_operation::LocatedSemantic::Found(
+            owner,
+        ) = operation
+            .ready
+            .lookup_locator(
+                &lexical,
+                &SelectedSemanticLocator::new("java", path, site, LoweredSemanticRole::Definition),
+                &locator_token,
+            )
+            .unwrap()
+        else {
+            panic!("owner definition selected");
+        };
+        let lookup = ResolutionLookupSemanticRecipe::new(
+            Language::Java,
+            ResolutionNamespace::Type,
+            spelling,
+        )
+        .semantic(&operation.ready.shared_names());
+        operation
+            .jvm_inherited_witness_for_test(owner, lookup, spelling, token)
+            .unwrap()
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9546: an inherited walk decision leaked through the Java import-context snapshot"
+    )]
+    fn inherited_walk_snapshot_only_publishes_without_consumed_witness() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_context::{
+            JvmImportContext, JvmImportContextSnapshotRefusal,
+        };
+
+        let token = CancellationToken::new();
+        let (fixture, _) = inherited_witness_fixture(
+            "class B { static class T {} } class C extends B { T field; }",
+            "C",
+        );
+        let reuse = ReadReuseCounter::default();
+        // Opening with a read-reuse capability installs the walk-backed
+        // witness function, as production does.
+        let consuming = fixture.open_ready_with_read_reuse(&token, &reuse);
+        let (context, snapshot) = consuming
+            .jvm_import_context_with_snapshot(Language::Java, "Types.java", &token)
+            .unwrap();
+        assert!(matches!(context, JvmImportContext::Ready { .. }));
+        assert_eq!(
+            snapshot.err(),
+            Some(JvmImportContextSnapshotRefusal::InheritedTierKnowledge)
+        );
+        drop(consuming);
+
+        let publishing = fixture.open_ready_with_read_reuse(&token, &reuse);
+        let (context, snapshot) = publishing
+            .jvm_import_context_with_snapshot(Language::Java, "unused/Spare.java", &token)
+            .unwrap();
+        let JvmImportContext::Ready {
+            context: published, ..
+        } = context
+        else {
+            panic!("Java context must be Ready");
+        };
+        let snapshot = snapshot.expect("a context with no witness is publishable");
+        drop(publishing);
+
+        let restoring = fixture.open_ready_with_read_reuse(&token, &reuse);
+        let JvmImportContext::Ready {
+            context: restored, ..
+        } = restoring
+            .restore_jvm_import_context_snapshot(&snapshot)
+            .unwrap()
+            .expect("Walk operation can restore a no-witness context")
+        else {
+            panic!("restored context must be Ready");
+        };
+        assert_eq!(
+            format!("{:?}", published.mounts),
+            format!("{:?}", restored.mounts)
+        );
+    }
+
+    #[test]
+    fn inherited_witness_direct_parent_and_memo() {
+        let token = CancellationToken::new();
+        let (fixture, site) =
+            inherited_witness_fixture("class B { static class T {} } class C extends B {}", "C");
+        let reuse = ReadReuseCounter::default();
+        let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+        let t_site = fixture.consumer_facts.identifiers_named(
+            "T",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        )[0]
+        .site;
+        let brokk_bifrost_analysis::analyzer::store::resolution_operation::LocatedSemantic::Found(
+            t,
+        ) = operation
+            .ready
+            .lookup_locator(
+                &operation.ready.lexical_source(),
+                &SelectedSemanticLocator::new(
+                    "java",
+                    "Types.java",
+                    t_site,
+                    LoweredSemanticRole::Definition,
+                ),
+                &token,
+            )
+            .unwrap()
+        else {
+            panic!("nested T definition selected");
+        };
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            inherited_witness_for_owner(&operation, site, "T", &cancelled),
+            None
+        );
+        let first = inherited_witness_for_owner(&operation, site, "T", &token);
+        assert_eq!(first, Some(InheritedTierWitness::Proven(vec![t])));
+        assert_eq!(
+            inherited_witness_for_owner(&operation, site, "T", &token),
+            first
+        );
+
+        assert_eq!(
+            first,
+            inherited_witness_for_owner(&operation, site, "T", &token)
+        );
+    }
+
+    #[test]
+    fn inherited_witness_three_level_chain() {
+        let token = CancellationToken::new();
+        let (fixture, site) = inherited_witness_fixture(
+            "class A { static class T {} } class B extends A {} class C extends B {} class D extends C {}",
+            "D",
+        );
+        let reuse = ReadReuseCounter::default();
+        let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+        let result = inherited_witness_for_owner(&operation, site, "T", &token);
+        assert!(
+            matches!(result, Some(InheritedTierWitness::Proven(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_witness_four_level_chain_never_absent() {
+        let token = CancellationToken::new();
+        let (fixture, site) = inherited_witness_fixture(
+            "class A { static class T {} static class B extends A { static class C extends B { static class D extends C { static class E extends D {} } } } }",
+            "E",
+        );
+        let reuse = ReadReuseCounter::default();
+        let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+        let result = inherited_witness_for_owner(&operation, site, "T", &token);
+        assert!(
+            matches!(
+                result,
+                Some(InheritedTierWitness::Proven(_) | InheritedTierWitness::Open { .. })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_witness_cycle_and_unresolved_parent_stay_open() {
+        for (source, owner) in [
+            ("class A extends B {} class B extends A {}", "A"),
+            ("class C extends Missing {}", "C"),
+        ] {
+            let token = CancellationToken::new();
+            let (fixture, site) = inherited_witness_fixture(source, owner);
+            let reuse = ReadReuseCounter::default();
+            let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+            let result = inherited_witness_for_owner(&operation, site, "T", &token);
+            assert!(
+                matches!(result, Some(InheritedTierWitness::Open { .. })),
+                "{source}: {result:?}"
+            );
+        }
+    }
+
+    /// A member type crosses an inheritance edge only when the inheriting
+    /// class may access it (JLS 8.5): never a private one, and a
+    /// package-private one only within its package. The edge into the asking
+    /// class follows the same rule as the edges inside the walk.
+    #[test]
+    fn inherited_witness_follows_member_type_access() {
+        let token = CancellationToken::new();
+        let (fixture, site) = inherited_witness_fixture(
+            "class B { private static class T {} } class C extends B {}",
+            "C",
+        );
+        let reuse = ReadReuseCounter::default();
+        let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+        assert_eq!(
+            inherited_witness_for_owner(&operation, site, "T", &token),
+            Some(InheritedTierWitness::Absent),
+            "a private member type is not inherited"
+        );
+
+        for (asking_package, inherited) in [("q", false), ("p", true)] {
+            let asking = format!("package {asking_package}; class C extends p.A {{}}");
+            let asking_path = format!("{asking_package}/C.java");
+            let fixture = JavaRootResolutionOperationFixture::with_source_texts(
+                [
+                    asking.as_str(),
+                    "package p; public class A { static class T {} }",
+                    "package r; class Spare {}",
+                ],
+                [asking_path.as_str(), "p/A.java", "r/Spare.java"],
+                &[],
+            );
+            let site = fixture
+                .consumer_facts
+                .identifiers_named(
+                    "C",
+                    ResolutionIdentifierRole::Declaration,
+                    ResolutionNamespace::Type,
+                )
+                .first()
+                .expect("owner definition")
+                .site;
+            let reuse = ReadReuseCounter::default();
+            let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+            let result =
+                inherited_witness_for_owner_in(&operation, &asking_path, site, "T", &token);
+            assert_eq!(
+                matches!(result, Some(InheritedTierWitness::Proven(_))),
+                inherited,
+                "package {asking_package}: {result:?}"
+            );
+            if !inherited {
+                assert_eq!(result, Some(InheritedTierWitness::Absent));
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_witness_complete_coverage_proves_absent() {
+        let token = CancellationToken::new();
+        let (fixture, site) = inherited_witness_fixture("class B {} class C extends B {}", "C");
+        let reuse = ReadReuseCounter::default();
+        let operation = fixture.open_ready_with_read_reuse(&token, &reuse);
+
+        assert_eq!(
+            inherited_witness_for_owner(&operation, site, "T", &token),
+            Some(InheritedTierWitness::Absent)
+        );
+    }
+
+    #[test]
+    fn inherited_witness_without_read_reuse_is_unavailable() {
+        let token = CancellationToken::new();
+        let (fixture, _) = inherited_witness_fixture("class B {} class C extends B {}", "C");
+        let operation = fixture.open_without_read_reuse(&token);
+
+        let owner = brokk_bifrost_analysis::analyzer::resolution::SemanticId::for_test("C");
+        let lookup = brokk_bifrost_analysis::analyzer::resolution::SemanticId::for_test("T");
+        for _ in 0..2 {
+            let error = operation
+                .jvm_inherited_witness_for_test(owner, lookup, "T", &token)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("read reuse authority is unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn java_inherited_member_type_finalizer_preserves_lexical_evidence_in_the_operation() {
+        use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
+        use brokk_bifrost_analysis::analyzer::resolution::tier_evaluator::{
+            InheritedTierKnowledge, InheritedTierWitness, LexicalTypeLevel, place_lexical_type,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            LocatedSemantic, jvm_context::JvmImportContext, jvm_demand::JvmForwardOperationContext,
+        };
+
+        const CONSUMER: &str = "class Outer { static class T {} T z; class C extends B { T x; void m() { class T {} T y; } } class C2 extends D { T w; } }";
+        const PROVIDER: &str = "class B { static class T {} }";
+        let fixture = JavaRootResolutionOperationFixture::with_source_texts(
+            [CONSUMER, PROVIDER, "class D {}"],
+            ["Outer.java", "B.java", "D.java"],
+            &[],
+        );
+        let cancellation = CancellationToken::new();
+        for case in [
+            "none",
+            "absent",
+            "same",
+            "different",
+            "open",
+            "open-batch-first",
+            "walk",
+        ] {
+            let reuse = ReadReuseCounter::default();
+            let mut operation = fixture.open_ready_with_read_reuse(&cancellation, &reuse);
+            let consumer = operation
+                .mount_table()
+                .mount_for_path("java", "Outer.java")
+                .unwrap()
+                .unwrap();
+            let provider = operation
+                .mount_table()
+                .mount_for_path("java", "B.java")
+                .unwrap()
+                .unwrap();
+            let lowered_consumer =
+                brokk_bifrost_analysis::analyzer::resolution::lower_resolution_facts_for_selection(
+                    consumer.fragment(),
+                    &operation.ready.shared_names(),
+                    Language::Java,
+                    &fixture.consumer_facts,
+                );
+            let lowered_provider =
+                brokk_bifrost_analysis::analyzer::resolution::lower_resolution_facts_for_selection(
+                    provider.fragment(),
+                    &operation.ready.shared_names(),
+                    Language::Java,
+                    &fixture.provider_facts,
+                );
+            let semantic = |facts: &FileResolutionFacts, source: &str, needle: &str, role| {
+                let start = source.find(needle).unwrap();
+                facts
+                    .identifiers_named("T", role, ResolutionNamespace::Type)
+                    .into_iter()
+                    .find(|id| facts.sites[id.site.index()].start_byte == start)
+                    .unwrap()
+                    .site
+            };
+            let inherited_field_site = semantic(
+                &fixture.consumer_facts,
+                CONSUMER,
+                "T x",
+                ResolutionIdentifierRole::Reference,
+            );
+            let absent_field_site = semantic(
+                &fixture.consumer_facts,
+                CONSUMER,
+                "T w",
+                ResolutionIdentifierRole::Reference,
+            );
+            let field_site = if case == "absent" || case.starts_with("open") {
+                absent_field_site
+            } else {
+                inherited_field_site
+            };
+            let direct_site = semantic(
+                &fixture.consumer_facts,
+                CONSUMER,
+                "T z",
+                ResolutionIdentifierRole::Reference,
+            );
+            let local_site = semantic(
+                &fixture.consumer_facts,
+                CONSUMER,
+                "T y",
+                ResolutionIdentifierRole::Reference,
+            );
+            let outer_site = semantic(
+                &fixture.consumer_facts,
+                CONSUMER,
+                "T {}",
+                ResolutionIdentifierRole::Declaration,
+            );
+            let local_definition_site = semantic(
+                &fixture.consumer_facts,
+                CONSUMER,
+                "T {} T y",
+                ResolutionIdentifierRole::Declaration,
+            );
+            let provider_site = semantic(
+                &fixture.provider_facts,
+                PROVIDER,
+                "T {}",
+                ResolutionIdentifierRole::Declaration,
+            );
+            let outer = semantic_at(
+                &lowered_consumer,
+                outer_site,
+                LoweredSemanticRole::Definition,
+            );
+            let local = semantic_at(
+                &lowered_consumer,
+                local_definition_site,
+                LoweredSemanticRole::Definition,
+            );
+            let inherited = semantic_at(
+                &lowered_provider,
+                provider_site,
+                LoweredSemanticRole::Definition,
+            );
+            let lookup =
+                ResolutionLookupSemanticRecipe::new(Language::Java, ResolutionNamespace::Type, "T")
+                    .semantic(&operation.ready.shared_names());
+            let resolve_locator = |site| {
+                SelectedSemanticLocator::new(
+                    "java",
+                    "Outer.java",
+                    site,
+                    LoweredSemanticRole::Reference,
+                )
+            };
+            let LocatedSemantic::Found(field) = operation
+                .ready
+                .lookup_locator(
+                    &operation.ready.lexical_source(),
+                    &resolve_locator(field_site),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("field reference");
+            };
+            let LocatedSemantic::Found(direct) = operation
+                .ready
+                .lookup_locator(
+                    &operation.ready.lexical_source(),
+                    &resolve_locator(direct_site),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("direct body reference");
+            };
+            let LocatedSemantic::Found(local_reference) = operation
+                .ready
+                .lookup_locator(
+                    &operation.ready.lexical_source(),
+                    &resolve_locator(local_site),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("local reference");
+            };
+            let endpoints = operation
+                .ready
+                .typed_source()
+                .jvm_access_endpoints(&[field, local_reference, direct], &cancellation)
+                .unwrap()
+                .unwrap();
+            let direct_evidence = operation
+                .ready
+                .lexical_source()
+                .reference_local_path_evidence(direct, &cancellation)
+                .unwrap()
+                .unwrap();
+            let field_evidence = operation
+                .ready
+                .lexical_source()
+                .reference_local_path_evidence(field, &cancellation)
+                .unwrap()
+                .unwrap();
+            let field_endpoint = endpoints
+                .iter()
+                .find(|endpoint| endpoint.semantic == field)
+                .unwrap();
+            assert!(
+                place_lexical_type(outer, &field_evidence, field_endpoint).is_some(),
+                "case={case}, evidence={field_evidence:?}, endpoint={field_endpoint:?}"
+            );
+            let direct_endpoint = endpoints
+                .iter()
+                .find(|endpoint| endpoint.semantic == direct)
+                .unwrap();
+            assert_eq!(
+                place_lexical_type(outer, &direct_evidence, direct_endpoint).map(|p| p.level),
+                Some(LexicalTypeLevel::Declared(0))
+            );
+            let owner = endpoints
+                .iter()
+                .find(|endpoint| endpoint.semantic == field)
+                .unwrap()
+                .enclosing_templates[0];
+            let witness = match case {
+                "none" => None,
+                "absent" => Some(InheritedTierWitness::Absent),
+                "same" | "walk" => Some(InheritedTierWitness::Proven(vec![inherited])),
+                "different" => Some(InheritedTierWitness::Proven(vec![outer])),
+                "open" | "open-batch-first" => Some(InheritedTierWitness::Open {
+                    frontier: Vec::new(),
+                    reasons: vec!["test-open"],
+                }),
+                _ => unreachable!(),
+            };
+            let label = match case {
+                "different" => Some("jvm-inherited-member-type-competing"),
+                "open" | "open-batch-first" => Some("jvm-inherited-member-type-open"),
+                _ => None,
+            };
+            let entries = endpoints
+                .iter()
+                .flat_map(|endpoint| endpoint.enclosing_templates.iter().copied())
+                .map(|template| {
+                    (
+                        (template, lookup),
+                        if template == owner && case != "absent" {
+                            witness.clone().unwrap_or(InheritedTierWitness::Absent)
+                        } else {
+                            InheritedTierWitness::Absent
+                        },
+                    )
+                });
+            if case != "walk" {
+                let knowledge = Arc::new(InheritedTierKnowledge::from_entries(
+                    entries.collect::<std::collections::BTreeMap<_, _>>(),
+                ));
+                operation = fixture.open_ready_with_inherited_tier_knowledge(
+                    &cancellation,
+                    &reuse,
+                    knowledge,
+                );
+            }
+            reuse.0.store(0, std::sync::atomic::Ordering::Relaxed);
+            let lexical = operation.ready.lexical_source();
+            let typed = operation.ready.typed_source();
+            let JvmImportContext::Ready {
+                context,
+                scoped_gaps,
+                ..
+            } = operation
+                .jvm_import_context(Language::Java, "Outer.java", &cancellation)
+                .unwrap()
+            else {
+                panic!("Java context");
+            };
+            let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+                .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+                .unwrap()
+            else {
+                panic!("context validation");
+            };
+            let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+                .ready
+                .collect_blueprint(context, &cancellation)
+                .unwrap()
+            else {
+                panic!("blueprint");
+            };
+            operation
+                .ready
+                .register_context(&blueprint, &cancellation)
+                .unwrap();
+            operation
+                .with_jvm_finalized_forward_operation_for_test(
+                    JvmForwardOperationContext {
+                        storage_language: "java",
+                        blueprint: &blueprint,
+                        caller_path: "Outer.java",
+                        import_gaps: &scoped_gaps,
+                        lexical: &lexical,
+                        typed: &typed,
+                        cancellation: &cancellation,
+                        session: &ResolutionSession::unbounded(),
+                    },
+                    |forward| {
+                        let direct_answer = forward.resolve_reference_with_metrics(
+                            direct,
+                            &mut ResolutionBatchMetrics::default(),
+                        )?;
+                        assert_eq!(direct_answer.binding().targets(), &[outer]);
+                        assert_eq!(direct_answer.completion(), &ResolutionCompletion::Complete);
+                        let before_field = reuse.0.load(std::sync::atomic::Ordering::Relaxed);
+                        if witness.is_some() {
+                        let first_batch = if case == "open-batch-first" {
+                            Some(forward.resolve_references_by_demand_for_test(
+                                &[field],
+                                &mut ResolutionBatchMetrics::default(),
+                            )?)
+                        } else {
+                            None
+                        };
+                        // A batch-first fill consumes the inherited tier and
+                        // refuses once before the point read.
+                        let before_point = reuse.0.load(std::sync::atomic::Ordering::Relaxed);
+                        assert_eq!(before_point, before_field + usize::from(first_batch.is_some()), "case={case}");
+                        let point = forward.resolve_reference_with_metrics(
+                            field,
+                            &mut ResolutionBatchMetrics::default(),
+                        )?;
+                        assert_eq!(reuse.0.load(std::sync::atomic::Ordering::Relaxed), before_point + 1, "case={case}");
+                        let payload = forward.withheld_lexical_targets_for_test(field);
+                        let repeat = forward.resolve_reference_with_metrics(
+                            field,
+                            &mut ResolutionBatchMetrics::default(),
+                        )?;
+                        assert_eq!(reuse.0.load(std::sync::atomic::Ordering::Relaxed), before_point + 2, "case={case}");
+                        assert_eq!(point, repeat);
+                        assert_eq!(payload, forward.withheld_lexical_targets_for_test(field));
+                        let batch = forward.resolve_references_for_test(
+                            &[field],
+                            &mut ResolutionBatchMetrics::default(),
+                        )?;
+                        assert_eq!(batch[0].0, point.binding().targets());
+                        assert_eq!(&batch[0].1, point.completion());
+                        let expected_withheld = label
+                            .filter(|label| label.ends_with("open"))
+                            .map(|_| vec![outer]);
+                        assert_eq!(batch[0].2, expected_withheld, "case={case}, point={point:?}");
+                        if let Some(first_batch) = first_batch {
+                            assert_eq!(first_batch[0], batch[0], "case={case}");
+                        }
+                        if let Some(label) = label {
+                            assert!(point.binding().targets().is_empty(), "{point:?}");
+                            assert!(point.binding().witnesses().is_empty(), "{point:?}");
+                    let ResolutionCompletion::Incomplete(reasons) = point.completion() else {
+                        panic!("missing inherited-tier completion: {point:?}");
+                    };
+                    assert!(reasons.iter().any(|reason| matches!(reason,
+                        brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason::UnsupportedSemantic(id)
+                            if operation.ready.context_identities.named_reason(*id).is_some_and(|(name, _)| name == label)
+                    )), "expected {label}, observed {:?}: {point:?}", reasons.iter().map(|reason| match reason {
+                        brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason::UnsupportedSemantic(id) => operation.ready.context_identities.named_reason(*id),
+                        _ => None,
+                    }).collect::<Vec<_>>());
+                            if label.ends_with("open") {
+                                let (selected, withheld) = operation
+                                    .finalize_jvm_lexical_targets_for_test(
+                                        field,
+                                        vec![outer],
+                                        &cancellation,
+                                    )?;
+                                assert!(selected.is_empty());
+                                assert_eq!(
+                                    withheld.as_deref(),
+                                    Some([outer].as_slice()),
+                                    "case={case}, point={point:?}"
+                                );
+                            } else {
+                                assert!(payload.is_none());
+                            }
+                        } else {
+                            let expected = if case == "same" || case == "walk" { inherited } else { outer };
+                            assert_eq!(point.binding().targets(), &[expected]);
+                            assert_eq!(point.completion(), &ResolutionCompletion::Complete);
+                            assert!(payload.is_none());
+                        }
+                        }
+                        let local_answer = forward.resolve_reference_with_metrics(
+                            local_reference,
+                            &mut ResolutionBatchMetrics::default(),
+                        )?;
+                        assert_eq!(local_answer.binding().targets(), &[local]);
+                        assert_eq!(local_answer.completion(), &ResolutionCompletion::Complete);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "finds real gap: a class-header reference gets no JVM access endpoint with its enclosing classes; the query-time fix regressed Kotlin endpoints and is deferred to #9546 enablement"]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7006: a header reference selected an outer type despite an unresolved enclosing supertype"
+    )]
+    fn java_header_reference_has_outer_endpoint() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::LocatedSemantic;
+
+        const SOURCE: &str = "import java.lang.Exception; class App extends Missing { static class FlowException extends Exception {} }";
+        let fixture = JavaRootResolutionOperationFixture::with_source_texts(
+            [
+                SOURCE,
+                "package java.lang; public class Exception {}",
+                "class Third {}",
+            ],
+            ["App.java", "java/lang/Exception.java", "Third.java"],
+            &[],
+        );
+        let cancellation = CancellationToken::new();
+        let initial = fixture.open_ready(&cancellation);
+        let reference_site = fixture
+            .consumer_facts
+            .identifiers_named(
+                "Exception",
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Type,
+            )
+            .into_iter()
+            .find(|id| {
+                fixture.consumer_facts.sites[id.site.index()].start_byte
+                    == SOURCE.find("Exception {}").unwrap()
+            })
+            .unwrap()
+            .site;
+        let lexical = initial.ready.lexical_source();
+        let typed = initial.ready.typed_source();
+        let locate = |site, role| {
+            let LocatedSemantic::Found(semantic) = initial
+                .ready
+                .lookup_locator(
+                    &lexical,
+                    &SelectedSemanticLocator::new("java", "App.java", site, role),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("selected site");
+            };
+            semantic
+        };
+        let reference = locate(reference_site, LoweredSemanticRole::Reference);
+        let endpoints = typed
+            .jvm_access_endpoints(&[reference], &cancellation)
+            .unwrap()
+            .unwrap();
+        let app_site = fixture.consumer_facts.identifiers_named(
+            "App",
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        )[0]
+        .site;
+        let app = locate(app_site, LoweredSemanticRole::Definition);
+        assert_eq!(endpoints[0].enclosing_templates, vec![app]);
+    }
+
+    #[test]
+    #[ignore = "finds real gap: the explicit single-type import route bypasses the Open inherited tier; deferred to #9546 enablement"]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7006: a header reference selected an outer type despite an unresolved enclosing supertype"
+    )]
+    fn java_header_explicit_import_route_respects_open_tier() {
+        use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
+        use brokk_bifrost_analysis::analyzer::resolution::tier_evaluator::{
+            InheritedTierKnowledge, InheritedTierWitness,
+        };
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::{
+            LocatedSemantic, jvm_context::JvmImportContext, jvm_demand::JvmForwardOperationContext,
+        };
+
+        const SOURCE: &str = "import java.lang.Exception; class App extends Missing { static class FlowException extends Exception {} }";
+        let fixture = JavaRootResolutionOperationFixture::with_source_texts(
+            [
+                SOURCE,
+                "package java.lang; public class Exception {}",
+                "class Third {}",
+            ],
+            ["App.java", "java/lang/Exception.java", "Third.java"],
+            &[],
+        );
+        let cancellation = CancellationToken::new();
+        let initial = fixture.open_ready(&cancellation);
+        let reference_site = fixture
+            .consumer_facts
+            .identifiers_named(
+                "Exception",
+                ResolutionIdentifierRole::Reference,
+                ResolutionNamespace::Type,
+            )
+            .into_iter()
+            .find(|id| {
+                fixture.consumer_facts.sites[id.site.index()].start_byte
+                    == SOURCE.find("Exception {}").unwrap()
+            })
+            .unwrap()
+            .site;
+        let lexical = initial.ready.lexical_source();
+        let typed = initial.ready.typed_source();
+        let locate = |site, role| {
+            let LocatedSemantic::Found(semantic) = initial
+                .ready
+                .lookup_locator(
+                    &lexical,
+                    &SelectedSemanticLocator::new("java", "App.java", site, role),
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("selected site");
+            };
+            semantic
+        };
+        let reference = locate(reference_site, LoweredSemanticRole::Reference);
+        let endpoints = typed
+            .jvm_access_endpoints(&[reference], &cancellation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoints[0].enclosing_templates.len(), 1, "{endpoints:?}");
+        let lookup = ResolutionLookupSemanticRecipe::new(
+            Language::Java,
+            ResolutionNamespace::Type,
+            "Exception",
+        )
+        .semantic(&initial.ready.shared_names());
+        let knowledge = Arc::new(InheritedTierKnowledge::from_entries([(
+            (endpoints[0].enclosing_templates[0], lookup),
+            InheritedTierWitness::Open {
+                frontier: Vec::new(),
+                reasons: vec!["test-open"],
+            },
+        )]));
+        drop(typed);
+        drop(lexical);
+        drop(initial);
+        let reuse = ReadReuseCounter::default();
+        let operation =
+            fixture.open_ready_with_inherited_tier_knowledge(&cancellation, &reuse, knowledge);
+        let lexical = operation.ready.lexical_source();
+        let typed = operation.ready.typed_source();
+        let JvmImportContext::Ready {
+            context,
+            scoped_gaps,
+            ..
+        } = operation
+            .jvm_import_context(Language::Java, "App.java", &cancellation)
+            .unwrap()
+        else {
+            panic!("Java context");
+        };
+        let SelectedResolutionContextValidationOutcome::Ready(context) = operation
+            .prepare_context(*context, &cancellation, &SelectedResolutionContextMetrics)
+            .unwrap()
+        else {
+            panic!("context validates");
+        };
+        let SelectedFactOperationBlueprintConstruction::Ready(blueprint) = operation
+            .ready
+            .collect_blueprint(context, &cancellation)
+            .unwrap()
+        else {
+            panic!("blueprint");
+        };
+        operation
+            .ready
+            .register_context(&blueprint, &cancellation)
+            .unwrap();
+        operation.with_jvm_finalized_forward_operation_for_test(
+            JvmForwardOperationContext {
+                storage_language: "java", blueprint: &blueprint, caller_path: "App.java",
+                import_gaps: &scoped_gaps, lexical: &lexical, typed: &typed,
+                cancellation: &cancellation, session: &ResolutionSession::unbounded(),
+            },
+            |forward| {
+                let answer = forward.resolve_reference_with_metrics(
+                    reference, &mut ResolutionBatchMetrics::default(),
+                )?;
+                assert!(answer.binding().targets().is_empty(), "{answer:?}");
+                assert!(forward.withheld_lexical_targets_for_test(reference).is_some(), "{answer:?}");
+                let ResolutionCompletion::Incomplete(reasons) = answer.completion() else {
+                    panic!("header answer must be open: {answer:?}");
+                };
+                assert!(reasons.iter().any(|reason| matches!(reason,
+                    brokk_bifrost_analysis::analyzer::resolution::model::ResolutionIncompleteReason::UnsupportedSemantic(id)
+                        if operation.ready.context_identities.named_reason(*id).is_some_and(|(name, _)| name == "jvm-inherited-member-type-open")
+                )), "{answer:?}");
+                Ok(())
+            },
+        ).unwrap();
+    }
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#8290: a repeated read through one forward operation lost the closed root's closure discharges"
@@ -432,7 +1349,7 @@ pub mod jvm_extraction_tests {
         );
         // Give every host a distinct reverse inventory reason, including hosts
         // whose paths cannot carry this exact source anchor.
-        fixture.store.conn.execute(|connection| {
+        fixture.store.conn.execute_fixture(|connection| {
             connection.execute("INSERT INTO resolution_gap_reasons(blob_id,reason,site,origin) SELECT blob_id,930002,0,2 FROM resolution_fragment_interiors", []).unwrap();
             connection.execute("INSERT INTO resolution_gaps(blob_id,covers,subject,lookup,gap,reason) SELECT blob_id,3,0,0,930002,930002 FROM resolution_fragment_interiors", []).unwrap();
         });
@@ -2226,7 +3143,7 @@ pub mod jvm_extraction_tests {
         // `resolution_sites.owner` is -1 for a reference in no declaration. Scala
         // stores that for an import selector; no Java construct produces it, so
         // the stored row is set directly.
-        fixture.store.conn.execute(|connection| {
+        fixture.store.conn.execute_fixture(|connection| {
             connection
                 .execute("UPDATE resolution_sites SET owner=-1 WHERE role=0", [])
                 .unwrap()
@@ -2352,6 +3269,7 @@ pub mod jvm_extraction_tests {
     #[doc(hidden)]
     pub struct JavaRootResolutionOperationFixture {
         store: AnalyzerStore,
+        read_reuse: ReadReuseCounter,
         #[doc(hidden)]
         pub project_root: tempfile::TempDir,
         project: MutableGenerationProject,
@@ -2484,6 +3402,7 @@ pub mod jvm_extraction_tests {
                 facts.try_into().unwrap();
             Self {
                 store,
+                read_reuse: ReadReuseCounter::default(),
                 project_root,
                 project,
                 workspace_id,
@@ -2512,7 +3431,27 @@ pub mod jvm_extraction_tests {
             cancellation: &CancellationToken,
         ) -> SelectedResolutionOperationOpenOutcome<'_, '_> {
             self.store
-                .open_selected_resolution_operation(
+                .open_selected_resolution_operation_with_inherited_walk_for_test(
+                    SelectedResolutionOperationInput::new(
+                        &self.project,
+                        &self.workspace_id,
+                        &self.snapshots,
+                        &self.languages,
+                        &[],
+                    )
+                    .with_read_reuse(&self.read_reuse),
+                    cancellation,
+                )
+                .unwrap()
+        }
+
+        fn open_without_read_reuse(
+            &self,
+            cancellation: &CancellationToken,
+        ) -> SelectedResolutionOperation<'_, '_> {
+            match self
+                .store
+                .open_selected_resolution_operation_with_inherited_walk_for_test(
                     SelectedResolutionOperationInput::new(
                         &self.project,
                         &self.workspace_id,
@@ -2523,6 +3462,64 @@ pub mod jvm_extraction_tests {
                     cancellation,
                 )
                 .unwrap()
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+                _ => panic!("complete Java operation must open Ready"),
+            }
+        }
+
+        fn open_ready_with_read_reuse<'a>(
+            &'a self,
+            cancellation: &CancellationToken,
+            reuse: &'a dyn brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal,
+        ) -> SelectedResolutionOperation<'a, 'a> {
+            let input = SelectedResolutionOperationInput::new(
+                &self.project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                &[],
+            )
+            .with_read_reuse(reuse);
+            match self
+                .store
+                .open_selected_resolution_operation_with_inherited_walk_for_test(
+                    input,
+                    cancellation,
+                )
+                .unwrap()
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+                _ => panic!("complete Java operation must open Ready"),
+            }
+        }
+
+        fn open_ready_with_inherited_tier_knowledge<'a>(
+            &'a self,
+            cancellation: &CancellationToken,
+            reuse: &'a dyn brokk_bifrost_core::analyzer::memo_attribution::ReadReuseRefusal,
+            knowledge: Arc<brokk_bifrost_analysis::analyzer::resolution::tier_evaluator::InheritedTierKnowledge>,
+        ) -> SelectedResolutionOperation<'a, 'a> {
+            let input = SelectedResolutionOperationInput::new(
+                &self.project,
+                &self.workspace_id,
+                &self.snapshots,
+                &self.languages,
+                &[],
+            )
+            .with_read_reuse(reuse);
+            match self
+                .store
+                .open_selected_resolution_operation_with_inherited_tier_knowledge_for_test(
+                    input,
+                    cancellation,
+                    knowledge,
+                )
+                .unwrap()
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+                _ => panic!("complete Java operation must open Ready"),
+            }
         }
 
         #[doc(hidden)]

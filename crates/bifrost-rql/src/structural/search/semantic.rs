@@ -1,4 +1,4 @@
-use super::dispatch::DispatchBoundaryClass;
+use super::dispatch::{DispatchBoundaryClass, DispatchProof};
 use super::{DerivationExecutionCause, Incompleteness};
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use std::mem::{align_of, size_of};
@@ -315,6 +315,12 @@ struct ProcedureRangeLookupDiagnostics {
     cancellation_message: &'static str,
 }
 
+/// Why a file's semantic artifact could not be had under the query's budget.
+pub(super) enum ArtifactUnavailable {
+    BudgetExhausted,
+    Unavailable,
+}
+
 pub(super) struct SemanticQueryContext<'a> {
     workspace: &'a WorkspaceAnalyzer,
     cancellation: Option<&'a CancellationToken>,
@@ -511,6 +517,25 @@ impl<'a> SemanticQueryContext<'a> {
         bindings.prefetch_selected_call_targets(self.workspace, candidates, self.cancellation)
     }
 
+    pub(super) fn prefetch_call_bindings_with_receipts(
+        &self,
+        bindings: &mut crate::analyzer::usages::call_relations::CallBindingCache,
+        candidates: impl IntoIterator<Item = (ProjectFile, crate::analyzer::Range)>,
+    ) -> Option<(
+        brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt,
+        brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadReceipt,
+    )> {
+        let _models = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            self.workspace.analyzer(),
+            self.active_semantic_model_snapshot.clone(),
+        );
+        bindings.prefetch_selected_call_targets_with_receipts(
+            self.workspace,
+            candidates,
+            self.cancellation,
+        )
+    }
+
     /// Resolve one exact runtime keyed read through the workspace oracle while
     /// charging this query's shared semantic budget and cancellation token.
     pub(super) fn runtime_keyed_read_at_source(
@@ -531,12 +556,20 @@ impl<'a> SemanticQueryContext<'a> {
         if let Some(collector) = &artifact_collector {
             request = request.with_artifact_collector(collector);
         }
-        crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
+        let outcome = crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
             self.workspace,
             self.active_semantic_model_snapshot.clone(),
             DispatchHints::empty(),
         )
-        .runtime_keyed_read_at_source(file, range, filter, &mut request)
+        .runtime_keyed_read_at_source(file, range, filter, &mut request);
+        if let Ok(outcome) = &outcome {
+            if matches!(outcome, SemanticOutcome::Cancelled { .. }) {
+                self.report_cancelled_outcome(file, "semantic keyed-read analysis was cancelled");
+            } else {
+                self.report_incomplete_outcome(outcome, file, "keyed-read result");
+            }
+        }
+        outcome
     }
 
     #[cfg(test)]
@@ -624,7 +657,8 @@ impl<'a> SemanticQueryContext<'a> {
         execution_child: SemanticExecutionBudget,
         artifact_leases: SemanticArtifactLeaseSnapshot,
     ) -> Self {
-        let budget = SemanticBudget::new_child(child_semantic_limits, parent_scope);
+        // Every continuation is carved from what its parent has left.
+        let budget = SemanticBudget::new_carved_child(child_semantic_limits, parent_scope);
         Self::new_with_budget(
             workspace,
             cancellation,
@@ -1075,7 +1109,7 @@ impl<'a> SemanticQueryContext<'a> {
         file: &ProjectFile,
         range: crate::analyzer::Range,
     ) -> (super::dispatch::DispatchSiteAnswer, Incompleteness) {
-        use super::dispatch::{DispatchArm, DispatchSiteAnswer};
+        use super::dispatch::{DispatchArm, DispatchSiteAnswer, DispatchStatus};
 
         // Release before materializing the next file: materialization may publish.
         self.prepared_source_dispatch.read_mut(
@@ -1094,7 +1128,7 @@ impl<'a> SemanticQueryContext<'a> {
         {
             self.release_definition_operations();
             return (
-                DispatchSiteAnswer::interrupted("cancelled", None, None),
+                DispatchSiteAnswer::interrupted(DispatchStatus::Cancelled, None, None),
                 Incompleteness::Operational(DerivationExecutionCause::Cancelled),
             );
         }
@@ -1106,13 +1140,13 @@ impl<'a> SemanticQueryContext<'a> {
                     .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
                 {
                     return (
-                        DispatchSiteAnswer::interrupted("cancelled", None, None),
+                        DispatchSiteAnswer::interrupted(DispatchStatus::Cancelled, None, None),
                         Incompleteness::Operational(DerivationExecutionCause::Cancelled),
                     );
                 }
                 if !self.initial_artifact_leases_fit(file) {
                     return (
-                        DispatchSiteAnswer::interrupted("exceeded_budget", None, None),
+                        DispatchSiteAnswer::interrupted(DispatchStatus::ExceededBudget, None, None),
                         Incompleteness::Operational(DerivationExecutionCause::Budget),
                     );
                 }
@@ -1151,7 +1185,7 @@ impl<'a> SemanticQueryContext<'a> {
             Err(error) => {
                 if !artifact_window_fits {
                     return (
-                        DispatchSiteAnswer::interrupted("exceeded_budget", None, None),
+                        DispatchSiteAnswer::interrupted(DispatchStatus::ExceededBudget, None, None),
                         Incompleteness::Operational(DerivationExecutionCause::Budget),
                     );
                 }
@@ -1164,27 +1198,20 @@ impl<'a> SemanticQueryContext<'a> {
                     &reason,
                 );
                 return (
-                    DispatchSiteAnswer::interrupted("unknown", None, None),
+                    DispatchSiteAnswer::interrupted(DispatchStatus::Unknown, None, None),
                     Incompleteness::Operational(DerivationExecutionCause::Provider),
                 );
             }
         };
         if !artifact_window_fits {
             return (
-                DispatchSiteAnswer::interrupted("exceeded_budget", None, None),
+                DispatchSiteAnswer::interrupted(DispatchStatus::ExceededBudget, None, None),
                 Incompleteness::Operational(DerivationExecutionCause::Budget),
             );
         }
 
-        let label = match &outcome {
-            SemanticOutcome::Complete { .. } => "resolved",
-            SemanticOutcome::Ambiguous { .. } => "ambiguous",
-            SemanticOutcome::Unknown { .. } => "unknown",
-            SemanticOutcome::Unsupported { .. } => "unsupported",
-            SemanticOutcome::Unproven { .. } => "unproven",
-            SemanticOutcome::ExceededBudget { .. } => "exceeded_budget",
-            SemanticOutcome::Cancelled { .. } => "cancelled",
-        };
+        let status = DispatchStatus::from_outcome(&outcome);
+        let label = status.label();
         let semantic_unsupported = match &outcome {
             SemanticOutcome::Unsupported { capability, .. } => Some(capability.label()),
             _ => None,
@@ -1204,7 +1231,11 @@ impl<'a> SemanticQueryContext<'a> {
         }
         let Some(result) = outcome.available_value() else {
             return (
-                DispatchSiteAnswer::interrupted(label, semantic_unsupported, exceeded_limit),
+                DispatchSiteAnswer::interrupted(
+                    DispatchStatus::from_outcome(&outcome),
+                    semantic_unsupported,
+                    exceeded_limit,
+                ),
                 Self::partial_outcome_code(&outcome).1,
             );
         };
@@ -1250,8 +1281,8 @@ impl<'a> SemanticQueryContext<'a> {
                     .collect(),
             });
             for candidate in observation.dispatch().candidates() {
-                if candidate.proof().label() != "proven"
-                    || candidate.completeness().label() != "complete"
+                if !matches!(candidate.proof(), ProofStatus::Proven)
+                    || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
                 {
                     coverage_reasons.push(format!(
                         "candidate: proof={:?}, completeness={:?}",
@@ -1264,6 +1295,7 @@ impl<'a> SemanticQueryContext<'a> {
                 arms.push(DispatchArm {
                     call_context,
                     target_procedure: Some(target.durable_key()),
+                    target_locator: Some(locator.clone()),
                     boundary: None,
                     execution_timing: dispatch_arm_execution_timing(
                         semantic_call.execution_timing,
@@ -1282,9 +1314,10 @@ impl<'a> SemanticQueryContext<'a> {
                     // A dispatch candidate names a materialized procedure, so
                     // it never carries an unmaterialized identity.
                     unmaterialized_target: None,
-                    proof: candidate.proof().label(),
-                    completeness: candidate.completeness().label(),
+                    proof: candidate.proof().into(),
+                    completeness: candidate.completeness().into(),
                     boundary_kind: None,
+                    boundary_reason: None,
                 });
             }
             for boundary in observation.dispatch().boundaries() {
@@ -1309,6 +1342,7 @@ impl<'a> SemanticQueryContext<'a> {
                 arms.push(DispatchArm {
                     call_context,
                     target_procedure: None,
+                    target_locator: Some(locator.clone()),
                     boundary: Some(boundary.kind.clone()),
                     execution_timing: dispatch_arm_execution_timing(
                         semantic_call.execution_timing,
@@ -1327,9 +1361,10 @@ impl<'a> SemanticQueryContext<'a> {
                     // lookup for this arm, so it is retained rather than
                     // dropped with the rest of the boundary.
                     unmaterialized_target: boundary.unmaterialized_external_target().cloned(),
-                    proof: boundary.proof.label(),
-                    completeness: boundary.completeness.label(),
+                    proof: (&boundary.proof).into(),
+                    completeness: (&boundary.completeness).into(),
                     boundary_kind: Some(DispatchBoundaryClass::from_kind(&boundary.kind)),
+                    boundary_reason: boundary.partial_cause,
                 });
             }
         }
@@ -1342,6 +1377,7 @@ impl<'a> SemanticQueryContext<'a> {
         (
             DispatchSiteAnswer {
                 outcome: label,
+                status,
                 coverage,
                 coverage_reasons,
                 call_site_count: result.observations().len(),
@@ -1544,6 +1580,272 @@ impl<'a> SemanticQueryContext<'a> {
         ))
     }
 
+    /// One exact structural call in a complete semantic source snapshot.
+    pub(super) fn exact_call_site_at_source(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+        source_identity: ContentIdentity,
+    ) -> Option<CallSiteHandle> {
+        let (artifact, _, quality) = self.materialize(file)?;
+        if source_identity != artifact.key().revision().content() {
+            self.push_source_generation_changed(file);
+            return None;
+        }
+        if !quality.is_complete() {
+            return None;
+        }
+        let index = self.source_call_index(file, &artifact)?;
+        let exact_key = (range.start_byte, range.end_byte);
+        let start = index
+            .candidates
+            .partition_point(|candidate| (candidate.span.start, candidate.span.end) < exact_key);
+        let end = index
+            .candidates
+            .partition_point(|candidate| (candidate.span.start, candidate.span.end) <= exact_key);
+        (end.saturating_sub(start) == 1).then(|| index.candidates[start].call.clone())
+    }
+
+    /// Charge the query's shared traversal ledger for each inspected source
+    /// node. A receipt execution's narrower traversal cap is checked without
+    /// mutating its child: into_receipt applies the accumulated delta once.
+    pub(super) fn source_callable_scope_step(
+        &mut self,
+        file: &ProjectFile,
+    ) -> Result<(), crate::analyzer::usages::call_relations::SourceCallableStop> {
+        use crate::analyzer::usages::call_relations::SourceCallableStop;
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::Cancelled,
+                Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "source callable traversal was cancelled",
+            );
+            return Err(SourceCallableStop::Cancelled);
+        }
+        if let Some((_, execution)) = &self.receipt_execution {
+            let (_, probe) = execution.fork();
+            if !probe.charge_traversal(self.traversal_steps.saturating_add(1)) {
+                self.exhaust_traversal_budget(file, "source callable traversal");
+                return Err(SourceCallableStop::ExceededBudget);
+            }
+        }
+        if !self.charge_consumer_traversal(file, 1, "source callable traversal") {
+            return Err(
+                if self
+                    .cancellation
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    SourceCallableStop::Cancelled
+                } else {
+                    SourceCallableStop::ExceededBudget
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn source_callable_outcome<T>(
+        &mut self,
+        file: &ProjectFile,
+        outcome: Result<SemanticOutcome<T>, crate::analyzer::semantic::SemanticProviderError>,
+    ) -> crate::analyzer::usages::call_relations::SourceCallableResult<T> {
+        use crate::analyzer::usages::call_relations::{SourceCallableResult, SourceCallableStop};
+        match outcome {
+            Ok(SemanticOutcome::Complete { value, .. }) => SourceCallableResult::Found(value),
+            Ok(SemanticOutcome::Cancelled { .. }) => {
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::Cancelled,
+                    Incompleteness::Operational(DerivationExecutionCause::Cancelled),
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    "selected source callable application was cancelled",
+                );
+                SourceCallableResult::Stopped(SourceCallableStop::Cancelled)
+            }
+            Ok(SemanticOutcome::ExceededBudget { .. }) => {
+                self.budget_exhausted = true;
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    Incompleteness::Operational(DerivationExecutionCause::Budget),
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    "selected source callable application exceeded its semantic budget",
+                );
+                SourceCallableResult::Stopped(SourceCallableStop::ExceededBudget)
+            }
+            Ok(outcome) => {
+                self.push_diagnostic_with_cause(
+                    Self::partial_outcome_code(&outcome),
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    "selected source callable application did not complete",
+                );
+                SourceCallableResult::Unavailable
+            }
+            Err(error) => {
+                self.workspace.analyzer().record_unattributed_read();
+                self.push_diagnostic(
+                    CodeQueryDiagnosticCode::SemanticProviderFailed,
+                    Incompleteness::Operational(DerivationExecutionCause::Provider),
+                    CodeQueryDiagnosticImpact::Incomplete,
+                    file,
+                    &error.to_string(),
+                );
+                SourceCallableResult::Unavailable
+            }
+        }
+    }
+
+    /// The selected oracle's complete argument and receiver application for
+    /// one source-local JS callable. Complete/exhaustive CallBindings validates
+    /// that every declared receiver is bound; refusing receiver relations here
+    /// limits this reader to calls with no dynamic-this adaptation. This
+    /// certificate is candidate and call specific, never a layout memo.
+    pub(super) fn selected_source_callable_argument_ordinals(
+        &mut self,
+        file: &ProjectFile,
+        range: crate::analyzer::Range,
+        call: &CallSiteHandle,
+        target_key: &brokk_bifrost_flow::value_flow::DurableProcedureKey,
+        target_locator: &SemanticLocator,
+        actual_count: usize,
+    ) -> crate::analyzer::usages::call_relations::SourceCallableResult<Vec<usize>> {
+        use crate::analyzer::usages::call_relations::{SourceCallableResult, SourceCallableStop};
+        // Dispatch pipeline values retain only durable identities. Resolve the
+        // exact call again through the same bounded prepared source session;
+        // candidate/artifact handles live only for this application operation.
+        let outcome = match self.prepared_dispatch_at_source(file, range) {
+            Some(outcome) => outcome,
+            None => {
+                let Some(materialized) = self.materialized_outcome(file) else {
+                    return SourceCallableResult::Unavailable;
+                };
+                self.begin_prepared_dispatch_at_source(file, materialized, range)
+            }
+        };
+        let dispatch = match self.source_callable_outcome(file, outcome) {
+            SourceCallableResult::Found(value) => value,
+            SourceCallableResult::Unavailable => return SourceCallableResult::Unavailable,
+            SourceCallableResult::Stopped(reason) => return SourceCallableResult::Stopped(reason),
+        };
+        if !self.artifact_window_fits(file) {
+            self.budget_exhausted = true;
+            self.push_diagnostic(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                Incompleteness::Operational(DerivationExecutionCause::Budget),
+                CodeQueryDiagnosticImpact::Incomplete,
+                file,
+                "selected source callable application exceeded its artifact window",
+            );
+            return SourceCallableResult::Stopped(SourceCallableStop::ExceededBudget);
+        }
+        let [observation] = dispatch.observations() else {
+            return SourceCallableResult::Unavailable;
+        };
+        let fresh_call = observation.call();
+        if fresh_call.procedure().durable_key() != call.procedure().durable_key()
+            || fresh_call.id() != call.id()
+            || !dispatch.coverage().is_exhaustive()
+            || !observation.dispatch().coverage().is_exhaustive()
+            || !observation.dispatch().boundaries().is_empty()
+            || observation.dispatch().resolver_proved_no_callee()
+        {
+            return SourceCallableResult::Unavailable;
+        }
+        let [candidate] = observation.dispatch().candidates() else {
+            return SourceCallableResult::Unavailable;
+        };
+        let Some(call_row) = fresh_call
+            .procedure()
+            .semantics()
+            .call_site(fresh_call.id())
+        else {
+            return SourceCallableResult::Unavailable;
+        };
+        if candidate.target().durable_key() != *target_key
+            || candidate.target().semantics().locator() != target_locator
+            || candidate.proof().label() != "proven"
+            || candidate.completeness().label() != "complete"
+            || candidate.target().semantics().properties().call_boundary
+                != crate::analyzer::semantic::ProcedureCallBoundary::Direct
+            || call_row.arguments.len() != actual_count
+            || call_row.receiver.is_some()
+        {
+            return SourceCallableResult::Unavailable;
+        }
+        let oracle = crate::analyzer::semantic::WorkspaceSemanticOracle::with_dispatch_hints(
+            self.workspace,
+            self.active_semantic_model_snapshot.clone(),
+            DispatchHints::empty(),
+        );
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        let collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &collector {
+            request = request.with_artifact_collector(collector);
+        }
+        let outcome = oracle.call_bindings(
+            fresh_call,
+            candidate,
+            &OracleCallContext::empty(),
+            &mut request,
+        );
+        drop(request);
+        let bindings = match self.source_callable_outcome(file, outcome) {
+            SourceCallableResult::Found(value) => value,
+            SourceCallableResult::Unavailable => return SourceCallableResult::Unavailable,
+            SourceCallableResult::Stopped(reason) => return SourceCallableResult::Stopped(reason),
+        };
+        if !bindings.coverage().is_exhaustive() {
+            return SourceCallableResult::Unavailable;
+        }
+        let mut ordinals = vec![None; actual_count];
+        for binding in bindings.bindings() {
+            let CallBinding::ArgumentGroup(group) = binding else {
+                // A receiver relation means this application needs a dynamic
+                // receiver. The initial local reader admits only the oracle's
+                // complete no-receiver application contract.
+                if matches!(binding, CallBinding::Receiver { .. }) {
+                    return SourceCallableResult::Unavailable;
+                }
+                continue;
+            };
+            if !group.coverage().is_exhaustive() {
+                return SourceCallableResult::Unavailable;
+            }
+            for mapping in group.mappings() {
+                if !matches!(mapping.proof(), ProofStatus::Proven)
+                    || !matches!(mapping.completeness(), EvidenceCompleteness::Complete)
+                {
+                    return SourceCallableResult::Unavailable;
+                }
+                let ProcedurePortKind::Parameter { ordinal } = mapping.value().formal().kind()
+                else {
+                    return SourceCallableResult::Unavailable;
+                };
+                let position = mapping.value().source_index() as usize;
+                let Some(slot) = ordinals.get_mut(position) else {
+                    return SourceCallableResult::Unavailable;
+                };
+                if slot.replace(ordinal as usize).is_some() {
+                    return SourceCallableResult::Unavailable;
+                }
+            }
+        }
+        ordinals.into_iter().collect::<Option<Vec<_>>>().map_or(
+            SourceCallableResult::Unavailable,
+            SourceCallableResult::Found,
+        )
+    }
+
     /// The exact artifact outcome already retained for this file.
     ///
     /// Flow-state consumers that join back to the handles projected above
@@ -1566,6 +1868,54 @@ impl<'a> SemanticQueryContext<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Run `run` over the file's artifact, materialized at most once per query
+    /// and charged to the query's semantic budget, with a request that spends
+    /// that same budget under the query's cancellation. The workspace and the
+    /// query's activation snapshot are passed along for the language rules that
+    /// build their own oracle. An exhausted budget or an unavailable artifact is
+    /// an error, and the budget diagnostic has already been recorded.
+    pub(super) fn with_cached_artifact<R>(
+        &mut self,
+        file: &ProjectFile,
+        run: impl FnOnce(
+            &'a WorkspaceAnalyzer,
+            Option<Arc<ActiveSemanticModelSnapshot>>,
+            &Arc<SemanticArtifact>,
+            &mut SemanticRequest<'_>,
+        ) -> R,
+    ) -> Result<R, ArtifactUnavailable> {
+        let Some(outcome) = self.materialized_outcome(file) else {
+            return Err(if self.budget_exhausted {
+                ArtifactUnavailable::BudgetExhausted
+            } else {
+                ArtifactUnavailable::Unavailable
+            });
+        };
+        let Some(artifact) = outcome.available_value() else {
+            return Err(ArtifactUnavailable::Unavailable);
+        };
+        let workspace = self.workspace;
+        let snapshot = self.active_semantic_model_snapshot.clone();
+        let cancellation = self.cancellation.unwrap_or(&self.uncancelled);
+        // Artifacts the callback materializes join the query's lease window
+        // like every other read of this context.
+        let artifact_collector = self
+            .artifact_window
+            .as_ref()
+            .map(SemanticArtifactLeaseWindow::collector);
+        let mut request = SemanticRequest::new(&mut self.budget, cancellation);
+        if let Some(collector) = &artifact_collector {
+            request = request.with_artifact_collector(collector);
+        }
+        Ok(run(workspace, snapshot, artifact, &mut request))
+    }
+
+    /// How many files this query has materialized so far.
+    #[cfg(test)]
+    pub(super) fn materialization_attempts(&self) -> usize {
+        self.attempts
     }
 
     /// Build one source-call index per materialized file. Exact structural
@@ -1754,21 +2104,31 @@ impl<'a> SemanticQueryContext<'a> {
 
     /// The typed reason [`Self::materialize`] refused, so a mandatory row can
     /// state it instead of reporting a bare unknown.
-    fn materialization_gate(&self, file: &ProjectFile) -> (&'static str, Option<&'static str>) {
+    fn materialization_gate(
+        &self,
+        file: &ProjectFile,
+    ) -> (super::dispatch::DispatchStatus, Option<&'static str>) {
         match self.cache.get(file) {
             Some(CachedSemanticMaterialization::FileBudgetExhausted)
             | Some(CachedSemanticMaterialization::RetainedBudgetExhausted) => {
-                ("exceeded_budget", None)
+                (super::dispatch::DispatchStatus::ExceededBudget, None)
             }
             Some(CachedSemanticMaterialization::Outcome { outcome, .. }) => match outcome {
-                SemanticOutcome::Cancelled { .. } => ("cancelled", None),
-                SemanticOutcome::Unsupported { capability, .. } => {
-                    ("unsupported", Some(capability.label()))
+                SemanticOutcome::Cancelled { .. } => {
+                    (super::dispatch::DispatchStatus::Cancelled, None)
                 }
-                SemanticOutcome::ExceededBudget { .. } => ("exceeded_budget", None),
-                _ => ("unknown", None),
+                SemanticOutcome::Unsupported { capability, .. } => (
+                    super::dispatch::DispatchStatus::Unsupported,
+                    Some(capability.label()),
+                ),
+                SemanticOutcome::ExceededBudget { .. } => {
+                    (super::dispatch::DispatchStatus::ExceededBudget, None)
+                }
+                _ => (super::dispatch::DispatchStatus::Unknown, None),
             },
-            Some(CachedSemanticMaterialization::ProviderFailed(_)) | None => ("unknown", None),
+            Some(CachedSemanticMaterialization::ProviderFailed(_)) | None => {
+                (super::dispatch::DispatchStatus::Unknown, None)
+            }
         }
     }
 
@@ -2432,6 +2792,88 @@ impl<'a> SemanticQueryContext<'a> {
         })
     }
 
+    /// Source syntax can retain positions while the producer explicitly
+    /// withholds its formal or capture inventory. Preserve that refusal;
+    /// unrelated body and value-scoped gaps do not veto this certificate.
+    pub(super) fn source_callable_inputs_available(
+        &mut self,
+        file: &ProjectFile,
+        procedure: &ProcedureHandle,
+    ) -> bool {
+        use crate::analyzer::semantic::{SemanticGapKind, SemanticGapSubject};
+        let mut refusals = Vec::new();
+        let mut budget_refused = false;
+        for gap in procedure.semantics().gaps() {
+            if self.source_callable_scope_step(file).is_err() {
+                return false;
+            }
+            if gap.subject == SemanticGapSubject::Procedure
+                && matches!(
+                    gap.capability,
+                    SemanticCapability::ParameterFlow | SemanticCapability::Captures
+                )
+            {
+                budget_refused |= gap.kind == SemanticGapKind::ExceededBudget;
+                refusals.push(format!(
+                    "{} {}: {}",
+                    gap.capability.label(),
+                    gap.kind.label(),
+                    gap.detail,
+                ));
+            }
+        }
+        if refusals.is_empty() {
+            return true;
+        }
+        self.budget_exhausted |= budget_refused;
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+            if budget_refused {
+                Incompleteness::Operational(DerivationExecutionCause::Budget)
+            } else {
+                Incompleteness::Content
+            },
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
+            &format!("selected source callable input inventory is incomplete: {refusals:?}"),
+        );
+        false
+    }
+
+    /// Rehydrate a selected source procedure by its complete semantic key.
+    /// The locator is checked as part of the same selected-arm identity; a
+    /// procedure ordinal from another materialization cannot stand in for it.
+    pub(super) fn selected_source_procedure(
+        &mut self,
+        key: &brokk_bifrost_flow::value_flow::DurableProcedureKey,
+        locator: &SemanticLocator,
+    ) -> Option<SemanticProcedureValue> {
+        if locator.mount()
+            != WorkspaceMountId::from_root(self.workspace.analyzer().project().root())
+        {
+            return None;
+        }
+        let file = super::witness_projection::locator_file(self.workspace, locator);
+        let (artifact, source, quality) = self.materialize(&file)?;
+        if !quality.is_complete() {
+            return None;
+        }
+        if artifact.key() != &key.0 {
+            self.push_source_generation_changed(&file);
+            return None;
+        }
+        let handle = artifact.procedure_handle(key.1)?;
+        if handle.semantics().locator() != locator {
+            return None;
+        }
+        Some(SemanticProcedureValue {
+            handle,
+            file,
+            source,
+            quality,
+        })
+    }
+
     fn procedure_of_declaration(
         &mut self,
         declaration: &DeclarationValue,
@@ -2766,7 +3208,7 @@ impl<'a> SemanticQueryContext<'a> {
                 dispatch.unnamed_boundaries.is_empty(),
                 dispatch.arms.as_slice(),
             ) {
-                (true, true, [arm]) if arm.proof == "proven" => {
+                (true, true, [arm]) if arm.proof == DispatchProof::Proven => {
                     arm.external_callee_identity.as_ref().and_then(|identity| {
                         let call_shape = arm
                             .exact_external_target
@@ -4149,6 +4591,9 @@ impl<'a> SemanticQueryContext<'a> {
             self.can_start_artifact_windows(),
             "result-contract file windows are sequential and artifact-independent"
         );
+        if self.receipt_execution.is_none() && self.limits.rows_per_dimension.is_none() {
+            self.budget.start_artifact_window(&file);
+        }
         self.artifact_window_file = Some(file);
     }
 
@@ -4200,6 +4645,7 @@ impl<'a> SemanticQueryContext<'a> {
         self.cache.clear();
         self.budget
             .release_unleased_artifacts(&self.artifact_leases);
+        self.budget.release_artifact_window();
         self.indexed_source_identities = CaptureScopedMemo::default();
         self.source_call_indexes = CaptureScopedMemo::default();
         self.active_retained_bytes = 0;
@@ -4255,80 +4701,16 @@ impl<'a> SemanticQueryContext<'a> {
         match cached {
             CachedSemanticMaterialization::Outcome { outcome, source } => {
                 let value = outcome.available_value().cloned();
-                let quality = match &outcome {
-                    SemanticOutcome::Complete { .. } => SemanticQueryQuality::default(),
-                    SemanticOutcome::Ambiguous { .. } => {
-                        let reason = "semantic provider returned an ambiguous artifact";
-                        self.push_diagnostic(
-                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                            Incompleteness::Content,
-                            CodeQueryDiagnosticImpact::Incomplete,
-                            file,
-                            reason,
-                        );
-                        SemanticQueryQuality::unproven_partial(reason)
-                    }
-                    SemanticOutcome::Unknown { .. } => {
-                        let reason = "semantic provider returned an unknown partial artifact";
-                        self.push_diagnostic(
-                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                            Incompleteness::Content,
-                            CodeQueryDiagnosticImpact::Incomplete,
-                            file,
-                            reason,
-                        );
-                        SemanticQueryQuality::unproven_partial(reason)
-                    }
-                    SemanticOutcome::Unsupported { capability, .. } => {
-                        let reason = format!(
-                            "semantic capability `{}` is unsupported",
-                            capability.label()
-                        );
-                        self.push_diagnostic(
-                            CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
-                            Incompleteness::Content,
-                            CodeQueryDiagnosticImpact::Incomplete,
-                            file,
-                            &reason,
-                        );
-                        SemanticQueryQuality::unproven_partial(reason)
-                    }
-                    SemanticOutcome::Unproven { .. } => {
-                        let reason = "semantic provider returned an unproven partial artifact";
-                        self.push_diagnostic(
-                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                            Incompleteness::Content,
-                            CodeQueryDiagnosticImpact::Incomplete,
-                            file,
-                            reason,
-                        );
-                        SemanticQueryQuality::unproven_partial(reason)
-                    }
-                    SemanticOutcome::ExceededBudget { exceeded, .. } => {
-                        self.workspace.analyzer().mark_execution_dependent();
-                        self.budget_exhausted = true;
-                        let reason = exceeded.to_string();
-                        self.push_diagnostic(
-                            CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                            Incompleteness::Content,
-                            CodeQueryDiagnosticImpact::Incomplete,
-                            file,
-                            &reason,
-                        );
-                        SemanticQueryQuality::unproven_partial(reason)
-                    }
-                    SemanticOutcome::Cancelled { .. } => {
-                        self.workspace.analyzer().mark_execution_dependent();
-                        self.push_diagnostic(
-                            CodeQueryDiagnosticCode::Cancelled,
-                            Incompleteness::Content,
-                            CodeQueryDiagnosticImpact::Incomplete,
-                            file,
-                            "semantic materialization was cancelled",
-                        );
-                        return None;
-                    }
-                };
+                if matches!(outcome, SemanticOutcome::Cancelled { .. }) {
+                    self.report_cancelled_outcome(file, "semantic materialization was cancelled");
+                    return None;
+                }
+                let quality = self
+                    .report_incomplete_outcome(&outcome, file, "artifact")
+                    .map_or_else(
+                        SemanticQueryQuality::default,
+                        SemanticQueryQuality::unproven_partial,
+                    );
                 value
                     .zip(source)
                     .map(|(value, source)| (value, source, quality))
@@ -4532,6 +4914,73 @@ impl<'a> SemanticQueryContext<'a> {
             message,
             vec![entry],
             Incompleteness::Operational(DerivationExecutionCause::Budget),
+        );
+    }
+
+    /// Name why a semantic outcome is not complete, in the diagnostic
+    /// vocabulary every semantic step shares, and return that reason. `None`
+    /// for a complete outcome. `subject` names what the provider returned, for
+    /// the message.
+    ///
+    /// A step that turns such an outcome into truncated rows must report it
+    /// here: a truncation without an `Incomplete` diagnostic names no cause.
+    fn report_incomplete_outcome<T>(
+        &mut self,
+        outcome: &SemanticOutcome<T>,
+        file: &ProjectFile,
+        subject: &str,
+    ) -> Option<String> {
+        let (code, reason) = match outcome {
+            SemanticOutcome::Complete { .. } => return None,
+            SemanticOutcome::Ambiguous { .. } => (
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                format!("semantic provider returned an ambiguous {subject}"),
+            ),
+            SemanticOutcome::Unknown { .. } => (
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                format!("semantic provider returned an unknown partial {subject}"),
+            ),
+            SemanticOutcome::Unproven { .. } => (
+                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                format!("semantic provider returned an unproven partial {subject}"),
+            ),
+            SemanticOutcome::Unsupported { capability, .. } => (
+                CodeQueryDiagnosticCode::SemanticCapabilityUnsupported,
+                format!(
+                    "semantic capability `{}` is unsupported",
+                    capability.label()
+                ),
+            ),
+            SemanticOutcome::ExceededBudget { exceeded, .. } => {
+                self.workspace.analyzer().mark_execution_dependent();
+                self.budget_exhausted = true;
+                (
+                    CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                    exceeded.to_string(),
+                )
+            }
+            SemanticOutcome::Cancelled { .. } => {
+                unreachable!("a cancelled outcome is reported by report_cancelled_outcome")
+            }
+        };
+        self.push_diagnostic(
+            code,
+            Incompleteness::Content,
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
+            &reason,
+        );
+        Some(reason)
+    }
+
+    fn report_cancelled_outcome(&mut self, file: &ProjectFile, message: &str) {
+        self.workspace.analyzer().mark_execution_dependent();
+        self.push_diagnostic(
+            CodeQueryDiagnosticCode::Cancelled,
+            Incompleteness::Content,
+            CodeQueryDiagnosticImpact::Incomplete,
+            file,
+            message,
         );
     }
 
@@ -5642,7 +6091,9 @@ mod tests {
         SemanticLanguage, SemanticRole, SourceMappingId, SourceMappingKind, SourceRevision,
         WorkspaceMountId, WorkspaceRelativePath,
     };
+    use crate::structural::search::dispatch::DispatchCompleteness;
     use brokk_bifrost_analysis::test_support::source_anchor;
+    use brokk_bifrost_test_macros::hardwon;
 
     #[test]
     fn dispatch_file_operations_release_before_next_file_and_discard_stale() {
@@ -5856,6 +6307,135 @@ mod tests {
             ..AnalyzerConfig::default()
         });
         (project, workspace)
+    }
+
+    #[test]
+    #[hardwon("#8962: one 3,616-line file exceeded the default per-lane event grant")]
+    fn one_large_file_fits_its_own_artifact_window() {
+        let calls = (0..64).map(|_| "    sink()\n").collect::<String>();
+        let source = format!("package subject\nfunc sink() {{}}\nfunc subject() {{\n{calls}}}\n");
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("subject.go", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let file = project.file("subject.go");
+        let limits = CodeQuerySemanticLimits {
+            max_retained_bytes: 7 * 256 * 1024,
+            ..CodeQuerySemanticLimits::default()
+        };
+        let mut context = SemanticQueryContext::new(&workspace, None, limits);
+        let default_event_grant = context.budget.limits().events;
+        context.start_artifact_window(file.clone());
+        let (artifact, _, _) = context.materialize(&file).unwrap_or_else(|| {
+            panic!(
+                "one large file fits its own window: {:?}",
+                context.diagnostics
+            )
+        });
+        assert!(
+            artifact.work().events > default_event_grant,
+            "events={}, grant={default_event_grant}",
+            artifact.work().events
+        );
+        drop(artifact);
+        context.release_artifact_window();
+        assert_eq!(context.budget.limits().events, default_event_grant);
+        assert!(!context.budget_exhausted);
+    }
+
+    #[test]
+    fn artifact_window_expands_grants_for_target_artifacts() {
+        let calls = "    sink()\n".repeat(64);
+        let source = format!("package subject\nfunc sink() {{}}\nfunc subject() {{\n{calls}}}\n");
+        let target_calls = "    sink()\n".repeat(32);
+        let target_source =
+            format!("package subject\nfunc sink() {{}}\nfunc subject() {{\n{target_calls}}}\n");
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("window.go", source)
+            .file("target.go", target_source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        });
+        let window_file = project.file("window.go");
+        let target_file = project.file("target.go");
+        let limits = CodeQuerySemanticLimits {
+            max_retained_bytes: 7 * 256 * 1024,
+            ..CodeQuerySemanticLimits::default()
+        };
+        let mut context = SemanticQueryContext::new(&workspace, None, limits);
+        let default_grant = context.budget.limits().events;
+        context.start_artifact_window(window_file.clone());
+        let (artifact, _, _) = context
+            .materialize(&window_file)
+            .expect("window file fits its own expanded grant");
+        assert!(artifact.work().events > default_grant);
+        drop(artifact);
+        let remaining_before_target = context.budget.remaining();
+        let (target, _, _) = context.materialize(&target_file).unwrap_or_else(|| {
+            panic!(
+                "target artifact should fit the byte cap: {:?}",
+                context.diagnostics
+            )
+        });
+        assert!(
+            target.work().events > remaining_before_target.events
+                || target.work().source_mappings > remaining_before_target.source_mappings,
+            "target exceeds pre-admission headroom in at least one row lane"
+        );
+        drop(target);
+        assert!(!context.budget_exhausted);
+        let fitting_bytes = context.physical_retained_bytes();
+        context.release_artifact_window();
+        assert_eq!(context.budget.limits().events, default_grant);
+
+        let limits = CodeQuerySemanticLimits {
+            max_retained_bytes: fitting_bytes - 1,
+            ..CodeQuerySemanticLimits::default()
+        };
+        let mut refusing = SemanticQueryContext::new(&workspace, None, limits);
+        refusing.start_artifact_window(window_file.clone());
+        let source = refusing
+            .materialize(&window_file)
+            .expect("source fits byte cap");
+        drop(source);
+        let before_refusal = refusing.budget.remaining();
+        assert!(refusing.materialize(&target_file).is_none());
+        assert!(
+            refusing.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::SemanticBudgetExhausted
+                    && diagnostic.message.contains("retained_bytes")
+            }),
+            "{:?}",
+            refusing.diagnostics
+        );
+        let after_refusal = refusing.budget.remaining();
+        assert_eq!(after_refusal.events, before_refusal.events);
+        assert_eq!(
+            after_refusal.source_mappings,
+            before_refusal.source_mappings
+        );
+        refusing.release_artifact_window();
+    }
+
+    #[test]
+    fn artifact_window_keeps_explicit_row_grants() {
+        let (project, workspace) = receipt_workspace();
+        let file = project.file("subject.go");
+        let limits = CodeQuerySemanticLimits {
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|_| 1)),
+            ..Default::default()
+        };
+        let mut context = SemanticQueryContext::new(&workspace, None, limits);
+        context.start_artifact_window(file.clone());
+        assert!(context.materialize(&file).is_none());
+        assert_eq!(context.budget.limits().events, 1);
+        context.release_artifact_window();
+        assert_eq!(context.budget.limits().events, 1);
     }
 
     const PREPARED_DISPATCH_SOURCE: &str =
@@ -6248,7 +6828,8 @@ mod tests {
             fitting_answer
                 .arms
                 .iter()
-                .all(|arm| arm.proof == "proven" && arm.completeness == "complete"),
+                .all(|arm| arm.proof == DispatchProof::Proven
+                    && arm.completeness == DispatchCompleteness::Complete),
             "the optional-cache refusal leaves the complete target answer unchanged"
         );
         assert!(

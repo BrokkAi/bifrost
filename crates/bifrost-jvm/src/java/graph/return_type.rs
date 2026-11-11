@@ -568,6 +568,13 @@ pub fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Ve
                 components.push(component.to_string());
             }
             "array_type" => stack.push(node.child_by_field_name("element")?),
+            // An expression-qualified name (`java.nio.file.Files` before a
+            // method call) is a `field_access` chain. The field is the last
+            // segment and the object holds the rest.
+            "field_access" => {
+                stack.push(node.child_by_field_name("field")?);
+                stack.push(node.child_by_field_name("object")?);
+            }
             "annotated_type" | "generic_type" => {
                 let mut cursor = node.walk();
                 let nominal = node
@@ -1034,6 +1041,16 @@ pub fn merge_receiver_type_outcomes(
 fn merge_same_declaration_receiver_type_outcomes(
     outcomes: impl IntoIterator<Item = ReceiverAnalysisOutcome<String>>,
 ) -> ReceiverAnalysisOutcome<String> {
+    let outcomes = outcomes.into_iter().collect::<Vec<_>>();
+    if outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, ReceiverAnalysisOutcome::Incomplete { .. }))
+    {
+        return ReceiverAnalysisOutcome::merge_branch_outcomes(
+            outcomes,
+            ReceiverAnalysisBudget::default(),
+        );
+    }
     let mut outcomes = outcomes.into_iter();
     let Some(first) = outcomes.next() else {
         return ReceiverAnalysisOutcome::Unknown;

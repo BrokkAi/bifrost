@@ -1,0 +1,38 @@
+{
+  "schema_version": 26,
+  "pack_id": "fixture.lifecycle-coverage",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-test", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": { "toolchains": [] },
+  "provenance": { "source": "test-only #9431 lifecycle coverage carrier fixture" },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "lifecycle",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [{
+        "id": "close",
+        "target": { "path": "com/example/Resource.class", "symbol": "Resource.close", "has_receiver": true, "parameter_count": 0 },
+        "completeness": "complete",
+        "locations": [],
+        "transfers": [],
+        "effects": [],
+        "subject_effects": [{
+          "id": "release", "effect": "bifrost.resource.release",
+          "subject": "receiver", "exit": "normal", "condition": "always",
+          "timing": "immediate", "certainty": "definite"
+        }],
+        "lifecycle_coverage": [{
+          "id": "normal-lifecycle",
+          "event_set": { "name": "bifrost.resource-lifecycle", "version": 1, "effects": ["bifrost.resource.release"] },
+          "subject": "receiver", "exit": "normal", "witnesses": ["release"]
+        }]
+      }]
+    }
+  }]
+}

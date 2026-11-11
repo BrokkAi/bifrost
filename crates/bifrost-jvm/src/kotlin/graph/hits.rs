@@ -17,12 +17,9 @@
 //! either resolves to the target or does not, with no receiver to be unsure
 //! about. The other two exist for the callable and property arms.
 
-use crate::graph_hits::{HitRecorder, refresh_usage_limit};
+use crate::graph_hits::HitRecorder;
 use crate::kotlin::graph::extractor::ScanCtx;
-use brokk_bifrost_core::analyzer::usages::common::{
-    reclassify_import_hit_at, reclassify_override_declaration_hit_at,
-    reclassify_self_receiver_hit_at,
-};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::analyzer::{CodeUnit, Range};
 use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
@@ -34,17 +31,15 @@ pub struct EnclosingContext {
 }
 
 pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    *ctx.raw_match_count += 1;
-    if *ctx.limit_exceeded {
+    ctx.usages.note_raw_match();
+    if ctx.usages.limit_reached() {
         return;
     }
     let Some(enclosing) = enclosing_context(node, ctx).enclosing else {
         return;
     };
     HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_proven(
-        ctx.hits,
-        ctx.max_usages,
-        ctx.limit_exceeded,
+        ctx.usages,
         node,
         enclosing,
         &crate::KotlinKnowledge,
@@ -53,14 +48,23 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 pub fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_import,
+    );
 }
 
 /// Record a declaration that overrides the target as a reference to it.
 pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_override_declaration_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_override_declaration,
+    );
 }
 
 /// Record `node` as a same-owner receiver hit (#1014 facet B): a reference whose
@@ -74,8 +78,12 @@ pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// call names an ancestor's declaration from outside it.
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_self_receiver,
+    );
 }
 
 /// Record a reference that *might* name the target but could not be proven —
@@ -89,12 +97,8 @@ pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
     let end = node.end_byte();
     let enclosing = enclosing_context(node, ctx).enclosing;
-    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_unproven(
-        ctx.unproven_hits,
-        start,
-        end,
-        enclosing,
-    );
+    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target)
+        .record_unproven(ctx.usages, start, end, enclosing);
 }
 
 /// The declaration enclosing `node`.

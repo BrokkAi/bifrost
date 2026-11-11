@@ -22,14 +22,18 @@ use brokk_bifrost_core::analyzer::structural::callable::InvocationPhase;
 /// binder it introduced -- plus the parser-derived target path the route
 /// pointed at, where the adapter recorded one -- rather than by a resolution
 /// the resolver never performed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub enum TraceCandidateRef {
     /// An indexed workspace declaration.
     Unit(CodeUnit),
     /// A canonical language intrinsic identity with no source location.
     Intrinsic { name: String },
     /// An exact declaration published by an activated semantic model.
-    Modeled { symbol_id: String, name: String },
+    Modeled {
+        provider: crate::analyzer::semantic_model::ModelProvider,
+        symbol_id: String,
+        name: String,
+    },
     /// A binder in the referencing file itself, as the resolver reports it.
     Lexical(LexicalDefinition),
     /// A binding row of the file's lexical environment, addressed by the
@@ -58,6 +62,80 @@ pub enum TraceCandidateRef {
     /// reference spelling. It is a candidate in the sense that matters here:
     /// something is there, and this lookup could not see it.
     ExternalRoute { name: String },
+}
+
+impl PartialEq for TraceCandidateRef {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unit(a), Self::Unit(b)) => a == b,
+            (Self::Intrinsic { name: a }, Self::Intrinsic { name: b }) => a == b,
+            (
+                Self::Modeled {
+                    provider: ap,
+                    symbol_id: ai,
+                    ..
+                },
+                Self::Modeled {
+                    provider: bp,
+                    symbol_id: bi,
+                    ..
+                },
+            ) => ap == bp && ai == bi,
+            (Self::Lexical(a), Self::Lexical(b)) => a == b,
+            (
+                Self::Binding {
+                    file: af,
+                    node: an,
+                    name: am,
+                },
+                Self::Binding {
+                    file: bf,
+                    node: bn,
+                    name: bm,
+                },
+            ) => af == bf && an == bn && am == bm,
+            (
+                Self::ImportBinder {
+                    file: af,
+                    node: an,
+                    name: am,
+                    target_segments: at,
+                },
+                Self::ImportBinder {
+                    file: bf,
+                    node: bn,
+                    name: bm,
+                    target_segments: bt,
+                },
+            ) => af == bf && an == bn && am == bm && at == bt,
+            (Self::ExternalRoute { name: a }, Self::ExternalRoute { name: b }) => a == b,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod modeled_identity_tests {
+    use super::TraceCandidateRef;
+    use crate::analyzer::semantic_model::ModelProvider;
+
+    #[test]
+    fn identical_symbol_ids_from_distinct_providers_remain_distinct() {
+        let candidate = |pack_id: &str, name: &str| TraceCandidateRef::Modeled {
+            provider: ModelProvider {
+                pack_id: pack_id.into(),
+                pack_version: "1.0".into(),
+                pack_digest: "digest".into(),
+            },
+            symbol_id: "shared.declaration".into(),
+            name: name.into(),
+        };
+        assert_ne!(candidate("pack-a", "same"), candidate("pack-b", "same"));
+        assert_eq!(
+            candidate("pack-a", "old name"),
+            candidate("pack-a", "new name")
+        );
+    }
 }
 
 /// The wildcard marker used as the `name` of an on-demand import route. It
@@ -147,15 +225,25 @@ pub struct TraceCandidate {
     pub failing_argument: Option<FailingArgument>,
 }
 
+impl TraceCandidateRef {
+    /// Where a candidate sits before any boundary refinement: intrinsic and
+    /// modelled identities are external (known from the engine or a selected
+    /// pack); every other candidate names a workspace declaration.
+    fn default_boundary(&self) -> BoundaryStatus {
+        match self {
+            Self::Intrinsic { .. } | Self::Modeled { .. } => BoundaryStatus::ExternalIndexed,
+            _ => BoundaryStatus::WorkspaceLocal,
+        }
+    }
+}
+
 impl TraceCandidate {
     /// A selected candidate with nothing further claimed. Intrinsic external
-    /// identities are known without a workspace location or an external provider.
+    /// identities are known without a workspace location or an external provider,
+    /// and a modelled declaration always comes from its selected semantic pack,
+    /// never from workspace source, so both sit past the external boundary.
     pub fn selected(candidate: TraceCandidateRef, tier: Option<PrecedenceTier>) -> Self {
-        let boundary = if matches!(&candidate, TraceCandidateRef::Intrinsic { .. }) {
-            BoundaryStatus::ExternalIndexed
-        } else {
-            BoundaryStatus::WorkspaceLocal
-        };
+        let boundary = candidate.default_boundary();
         Self {
             candidate,
             tier,
@@ -176,11 +264,7 @@ impl TraceCandidate {
         tier: Option<PrecedenceTier>,
         reason: RejectionReason,
     ) -> Self {
-        let boundary = if matches!(&candidate, TraceCandidateRef::Intrinsic { .. }) {
-            BoundaryStatus::ExternalIndexed
-        } else {
-            BoundaryStatus::WorkspaceLocal
-        };
+        let boundary = candidate.default_boundary();
         Self {
             candidate,
             tier,

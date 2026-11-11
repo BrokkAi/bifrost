@@ -838,6 +838,70 @@ mod tests {
     }
 
     #[test]
+    #[hardwon("#9194: a type-specific local kind lost Rust point and reverse gap discharge")]
+    fn block_local_type_keeps_point_and_reverse_discharge() {
+        use brokk_bifrost_rust_analysis::analyzer::rust::selected_reverse::{
+            RustSelectedReverseOutcome, with_rust_selected_reverse_queries,
+        };
+
+        let source =
+            "pub struct Local;\npub fn outer() {\n    struct Local; let _: Local = todo!();\n}\n";
+        let fixture = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname='local_type_control'\nversion='0.1.0'\nedition='2024'\n",
+            )
+            .file("src/lib.rs", source)
+            .build();
+        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let file = fixture.file("src/lib.rs");
+        let site = rust_shadow_site(source, "Local");
+        let tree = rust_shadow_tree(source);
+        let query = BoundedReceiverQuery {
+            analyzer: &analyzer,
+            file: &file,
+            source,
+            tree: Some(&tree),
+            site: &site,
+            budget: Default::default(),
+            cancellation: None,
+        };
+        let BoundedResolution::Complete { value, .. } =
+            RustSupport.resolve_definition_bounded(query)
+        else {
+            panic!("local type point lookup must complete");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(value.definitions.is_empty(), "{value:#?}");
+        assert_eq!(
+            value
+                .lexical_definition
+                .as_ref()
+                .map(|definition| definition.kind),
+            Some(brokk_bifrost_core::analyzer::model::DeclarationKind::BlockLocalType)
+        );
+
+        let global = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.identifier() == "Local")
+            .expect("global Local");
+        let reverse =
+            with_rust_selected_reverse_queries(&analyzer, &CancellationToken::new(), |queries| {
+                queries.inverse_for(&[global])
+            });
+        let RustSelectedReverseOutcome::Ready(Some(rows)) = reverse else {
+            panic!("global type reverse lookup must be available: {reverse:?}");
+        };
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].edges.is_empty(),
+            "local type must not reference the global: {rows:?}"
+        );
+        assert_eq!(rows[0].completeness, EdgeCompleteness::Complete, "{rows:?}");
+    }
+
+    #[test]
     #[ignore = "finds real bug: function-local macro enumeration retains two UnsupportedSemantic reasons instead of Complete (#2767). Owner: selected_rust_workspace_binding_world"]
     fn partition_2767_local_macro_enumeration_is_complete() {
         let world = partition_binding_world(
@@ -1268,9 +1332,10 @@ impl SearchToolsService {
                     && edge.site.file == fixture.file("src/consumer.rs")
             })
             .expect("consumer import");
-        assert_eq!(
-            consumer.reference_kind,
-            Some(brokk_bifrost_core::analyzer::usages::model::ReferenceKind::TypeReference)
+        assert!(
+            consumer.reference_kind.known().contains(
+                brokk_bifrost_core::analyzer::usages::model::ReferenceKind::TypeReference
+            )
         );
         assert_eq!(consumer.proof, UsageProof::Proven);
         let imports = inverse

@@ -8,11 +8,16 @@ use super::imports::{
     import_bindings_for_lookup,
 };
 use super::jvm_context::{
-    JvmImportContext, JvmImportContextGap, jvm_prefix_defers_member_selection,
+    JvmImportContext, JvmImportContextGap, assert_compatible_scoped_gap_reasons,
+    jvm_prefix_defers_member_selection,
 };
 use super::package_context::SelectedPackageRows;
 use super::*;
 use crate::analyzer::resolution::DemandRelationKey;
+use crate::analyzer::resolution::fact_resolution::demand_scheduler::{
+    ExternalNominalAuthority, SelectedExternalOwner, SelectedExternalOwnerSelection,
+};
+use crate::analyzer::resolution::selected_context::SelectedJavaTypeNameWinner;
 use crate::analyzer::resolution::{
     BindingOrigin, DemandMemberSelection, DemandMemberSelectionRequest,
     DemandSelectedOverlayBlueprint, EndpointSignature, FactResolutionAnswer,
@@ -24,8 +29,23 @@ use crate::analyzer::resolution::{
     CanonicalIdentityDescriptor, CanonicalIdentityPart, DemandReferenceKey,
 };
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    BindingProjectionKind, ResolutionGapKind, ResolutionRootImportKind,
+    BindingProjectionKind, ResolutionGapKind, ResolutionRootImportKind, ResolutionSiteId,
 };
+
+fn register_scoped_gap_identities(
+    mut context: SelectedResolutionContextSet,
+    gaps: &[JvmImportContextGap],
+) -> SelectedResolutionContextSet {
+    let mut registered: HashMap<SemanticId, &JvmImportContextGap> = HashMap::default();
+    for gap in gaps {
+        if let Some(previous) = registered.insert(gap.reason, gap) {
+            assert_compatible_scoped_gap_reasons(previous, gap);
+        } else {
+            context = context.with_context_owned_gap_identity(gap.reason);
+        }
+    }
+    context
+}
 
 pub(in crate::analyzer) fn jvm_root_import_origin(
     language: Language,
@@ -485,6 +505,27 @@ struct JvmDemandState<'a, 'store, 'input> {
 }
 
 impl JvmDemandState<'_, '_, '_> {
+    fn selected_external_owner_authority(
+        &self,
+        owner: SemanticId,
+    ) -> Result<Option<ExternalNominalAuthority>> {
+        let Some(coordinates) = self
+            .operation
+            .ready
+            .context_identities
+            .external_owner_identity(owner)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::analyzer::resolution::fact_resolution::demand_scheduler::jvm_external_nominal_authority(
+                &coordinates.provider_id,
+                coordinates.provider_id.as_ref() != "jvm-intrinsic"
+                    && self.operation.jvm_external_type_is_indexed(&coordinates)?,
+            ),
+        ))
+    }
+
     fn jvm_import_bindings_for_lookup(
         &self,
         mount: SelectedResolutionMountOrdinal,
@@ -551,13 +592,16 @@ impl JvmDemandState<'_, '_, '_> {
         &self,
         source: &JvmSourceDemand,
         values: &[ResolutionSlotValue],
-    ) -> Result<Option<DemandMemberSelectionRequest>> {
+    ) -> Result<Option<(DemandMemberSelectionRequest, ResolutionLookupSemanticRecipe)>> {
         let (half, qualifiers) = source
             .import_qualifiers
             .as_ref()
             .expect("selected import qualifier");
         let SelectedRootPathHalf::Import {
-            identity, demand, ..
+            identity,
+            token,
+            demand,
+            ..
         } = half
         else {
             unreachable!("selected member import");
@@ -581,26 +625,41 @@ impl JvmDemandState<'_, '_, '_> {
         } else {
             recipe.namespace()
         };
-        let lookup = ResolutionLookupSemanticRecipe::new(
-            Language::Scala,
-            member_namespace,
-            recipe.spelling(),
-        )
-        .semantic(&self.operation.ready.shared_names());
-        Ok(Some(DemandMemberSelectionRequest {
-            policy: &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
-            order: Some(crate::analyzer::resolution::HierarchyOrderRequest {
-                policy: &super::jvm_hierarchy_order::JVM_DECLARED_ORDER,
-                start_after: None,
-            }),
-            reference: *qualifiers
-                .first()
-                .expect("a selected owner has positioned inputs"),
-            values: values.to_vec(),
-            lookup,
-            namespace: recipe.namespace(),
-            language: Language::Scala,
-        }))
+        let ordinal = SelectedResolutionMountOrdinal::new(identity.fragment().ordinal());
+        let record = self
+            .operation
+            .ready
+            .inventory
+            .mount_record_by_ordinal(ordinal)?;
+        let selector = super::imports::selected_import_selector(
+            self.operation.ready.inventory.connection(),
+            record.blob_id(),
+            *token,
+        )?;
+        let authored_name = selector
+            .as_ref()
+            .and_then(|selector| selector.source_name.as_deref())
+            .unwrap_or(recipe.spelling());
+        let lookup =
+            ResolutionLookupSemanticRecipe::new(Language::Scala, member_namespace, authored_name)
+                .semantic(&self.operation.ready.shared_names());
+        Ok(Some((
+            DemandMemberSelectionRequest {
+                policy: &crate::analyzer::resolution::DEFAULT_HIERARCHY_POLICY,
+                order: Some(crate::analyzer::resolution::HierarchyOrderRequest {
+                    policy: &super::jvm_hierarchy_order::JVM_DECLARED_ORDER,
+                    start_after: None,
+                }),
+                reference: *qualifiers
+                    .first()
+                    .expect("a selected owner has positioned inputs"),
+                values: values.to_vec(),
+                lookup,
+                namespace: recipe.namespace(),
+                language: Language::Scala,
+            },
+            ResolutionLookupSemanticRecipe::new(Language::Scala, recipe.namespace(), authored_name),
+        )))
     }
 
     fn source_demand(&self, endpoint: &EndpointSignature) -> Result<Option<JvmSourceDemand>> {
@@ -1770,6 +1829,7 @@ fn context_publishable_qualifier_completion(
         .filter(|reason| match reason {
             ResolutionIncompleteReason::OpenBoundary { semantic, .. }
             | ResolutionIncompleteReason::UnsupportedSemantic(semantic)
+            | ResolutionIncompleteReason::ReceiverSubclassObligation(semantic)
             | ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
                 !semantic.is_operation_local()
             }
@@ -1857,8 +1917,8 @@ impl JvmDemandState<'_, '_, '_> {
         &self,
         source: &JvmSourceDemand,
         inputs: &[(DemandReferenceKey, &FactResolutionAnswer)],
-    ) -> Result<Option<DemandMemberSelectionRequest>> {
-        (|| -> Result<Option<DemandMemberSelectionRequest>> {
+    ) -> Result<Option<(DemandMemberSelectionRequest, ResolutionLookupSemanticRecipe)>> {
+        (|| -> Result<Option<(DemandMemberSelectionRequest, ResolutionLookupSemanticRecipe)>> {
             let Some((_, qualifiers)) = &source.import_qualifiers else {
                 return Ok(None);
             };
@@ -1902,6 +1962,7 @@ impl JvmDemandState<'_, '_, '_> {
 
     fn caller_gap_authority(
         &self,
+        _frame: &super::demand_closure::RootFrame,
         source: &JvmSourceDemand,
     ) -> Result<Read<Option<DemandClosureDischarges>>> {
         let mut discharges = match source.caller_scoped_source {
@@ -1954,6 +2015,8 @@ impl JvmDemandState<'_, '_, '_> {
                 for gap in &positive {
                     targets.extend(gap.external_member_targets.iter().copied());
                 }
+                // #9783: caller discharges bypass route reduction, so they
+                // cannot certify an external owner.
                 (!targets.is_empty()).then(|| {
                     DemandClosureDischarges::with_operation_local_placeholders([])
                         .with_selected_targets(targets)
@@ -2042,9 +2105,7 @@ impl JvmDemandState<'_, '_, '_> {
             else {
                 return Ok(None);
             };
-            let file_context = scoped_gaps.iter().fold(file_context, |context, gap| {
-                context.with_context_owned_gap_identity(gap.reason)
-            });
+            let file_context = register_scoped_gap_identities(file_context, &scoped_gaps);
             self.pending_registration =
                 Some(JvmPendingRegistration::Provider(key, scoped_gaps.clone()));
             (JvmNamePublication::Prepared(file_context), scoped_gaps)
@@ -2644,6 +2705,58 @@ impl JvmDemandState<'_, '_, '_> {
             JvmPackagePrefix::Retained(completion.clone())
         }))
     }
+
+    // A selected package-prefix carrier and a complete terminal member read
+    // can settle the raw qualified-reference gap for that exact terminal site.
+    // Other lowering gaps still need their own producer certificates.
+    fn jvm_selected_package_terminal_reasons(
+        &self,
+        fragment: BindingFragmentId,
+        reference: SemanticId,
+        reasons: &[SemanticId],
+    ) -> Result<Option<Vec<SemanticId>>> {
+        let mut provenance = Vec::new();
+        for chunk in reasons.chunks(MAX_TYPED_FACT_REQUESTS_PER_BATCH) {
+            let outcome = self
+                .operation
+                .ready
+                .typed_source()
+                .visit_gap_reason_provenance_pages_for_reasons(
+                    TypedFactRequest::new(chunk),
+                    self.cancellation,
+                    &mut FactPageVisitor::new(&mut |page| {
+                        provenance.extend_from_slice(page);
+                        Ok(true)
+                    }),
+                )?;
+            if !outcome.is_exhausted() || self.cancellation.is_cancelled() {
+                return Ok(None);
+            }
+        }
+        let site = ResolutionSiteId::new(
+            reference
+                .local_key()
+                .expect("selected terminal has a local site"),
+        );
+        Ok(Some(
+            reasons
+                .iter()
+                .copied()
+                .filter(|reason| {
+                    matches!(
+                        provenance
+                            .iter()
+                            .filter(|row| row.reason() == *reason)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                        [row] if row.fragment() == fragment
+                            && row.source_site() == site
+                            && row.origin() == LoweringGapOrigin::QualifiedReference
+                    )
+                })
+                .collect(),
+        ))
+    }
 }
 
 /// Inputs for one caller file's shared JVM forward operation.
@@ -2660,6 +2773,16 @@ pub struct JvmForwardOperationContext<'a> {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_jvm_finalized_forward_operation_for_test<T>(
+        &self,
+        context: JvmForwardOperationContext<'_>,
+        run: impl FnOnce(&mut crate::analyzer::resolution::FactResolutionOperation<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_jvm_forward_operation_for_test(context, run)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn with_jvm_forward_operation_for_test<T>(
@@ -2756,6 +2879,7 @@ impl SelectedResolutionOperation<'_, '_> {
             selected_import_gap,
             pending_registration: None,
         };
+        let finalizer = super::jvm_context::JvmLexicalAnswerFinalizer { operation: self };
         self.with_shared_forward_operation(
             JvmRules::new(language),
             &arena,
@@ -2764,6 +2888,7 @@ impl SelectedResolutionOperation<'_, '_> {
             blueprint,
             lexical,
             typed,
+            &finalizer,
             Some(&self.jvm_context_blueprints),
             cancellation,
             session,
@@ -2905,6 +3030,8 @@ impl<'a, 'store, 'input> JvmRules<'a, 'store, 'input> {
             BTreeSet<SemanticId>,
         )>,
     > {
+        // These provider-frame references have no selected terminal target;
+        // their route evidence cannot certify a definition owner.
         use super::demand_closure::{
             PositionedRouteAlternative, PositionedRouteOutcome, PositiveRouteSupport,
             RouteAlternativeOwner, RouteAlternativePosition, RouteLocation, RouteOpenOutcome,
@@ -3428,7 +3555,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             let Some(import_head) = self
                 .state
                 .operation
-                .jvm_lexical_import_qualifier(*source_reference, self.state.cancellation)?
+                .jvm_lexical_route_head(*source_reference, self.state.cancellation)?
             else {
                 return Ok(Some(
                     super::demand_closure::ProviderPreparation::Unavailable(cancelled_completion()),
@@ -3441,12 +3568,13 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     .package_origin_rank = binding_origin_rank(language, origin);
             }
         }
-        let member_start = if let Some(request) =
+        let member_start = if let Some((request, lookup)) =
             self.state.selected_member_request(source, inputs)?
         {
             Some(JvmSourceStart::Members {
                 reference: request.reference,
                 values: request.values,
+                authored_lookup: Some(lookup),
             })
         } else if let Some((_, qualifiers)) = &source.import_qualifiers {
             if let Some(values) = self.state.scala_import_projected_values(qualifiers, inputs) {
@@ -3462,12 +3590,13 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                             && answer.binding().targets().iter().copied().collect::<BTreeSet<_>>()
                                 == owners
                 }) {
-                    self.state
-                        .scala_import_member_request(source, values)?
-                        .map(|request| JvmSourceStart::Members {
+                    self.state.scala_import_member_request(source, values)?.map(
+                        |(request, lookup)| JvmSourceStart::Members {
                             reference: request.reference,
                             values: request.values,
-                        })
+                            authored_lookup: Some(lookup),
+                        },
+                    )
                 } else {
                     None
                 }
@@ -3495,6 +3624,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                             .filter(|owners| !owners.is_empty())
                             .map(|_| JvmSourceStart::Members {
                                 reference: *prefix,
+                                authored_lookup: None,
                                 values: self
                                     .state
                                     .jvm_prefix_projected_values(*prefix, answer, language)
@@ -3509,6 +3639,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     .filter(|owners| !owners.is_empty())
                     .map(|_| JvmSourceStart::Members {
                         reference: *prefix,
+                        authored_lookup: None,
                         values: self
                             .state
                             .jvm_prefix_projected_values(*prefix, answer, language)
@@ -3555,7 +3686,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
         } else {
             None
         };
-        let terminal_reasons = terminal_evidence
+        let mut terminal_reasons = terminal_evidence
             .as_ref()
             .map(|(_, retired, _)| retired.clone())
             .unwrap_or_default();
@@ -3618,6 +3749,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 })
                 .unwrap_or_else(cancelled_completion);
             let mut discharges = DemandClosureDischarges::default();
+            let mut alias_provider_reasons = Vec::new();
             let start = if let Some(prefix) = prefix_reference {
                 let answer = inputs[0].1;
                 let expression_type = nominal_rules::nominal_language_rules(language)
@@ -3638,6 +3770,155 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     }
                     JvmSourceStart::Unresolved(Some(*prefix))
                 } else {
+                    // SLS 2.13 chapter 9 and section 3.1: a package is a
+                    // stable-identifier prefix in the term namespace. Only a
+                    // qualified path may continue through this container.
+                    let SelectedRootPathHalf::Reference {
+                        identity, route, ..
+                    } = source
+                        .qualified
+                        .as_ref()
+                        .expect("positioned prefix belongs to a qualified reference")
+                    else {
+                        unreachable!("positioned prefix is a reference")
+                    };
+                    let first = *route.first().expect("positioned prefix has a route");
+                    let Some(recipes) = self.state.operation.jvm_lookup_recipes(
+                        identity.fragment(),
+                        [first],
+                        self.state.cancellation,
+                    )?
+                    else {
+                        return Ok(Some(
+                            super::demand_closure::ProviderPreparation::Unavailable(
+                                cancelled_completion(),
+                            ),
+                        ));
+                    };
+                    let spelling = recipes[0].spelling();
+                    let Some(local) = authored_reference_local_path_evidence(
+                        &self.state.operation.ready,
+                        *prefix,
+                        self.state.cancellation,
+                    )?
+                    else {
+                        return Ok(Some(
+                            super::demand_closure::ProviderPreparation::Unavailable(
+                                cancelled_completion(),
+                            ),
+                        ));
+                    };
+                    let mut selected_alias = None;
+                    let mut ambiguous_import = !local.local_bindings_certified();
+                    let mut package_alias_binding_seen = false;
+                    let mut package_alias_route_open = false;
+                    if local.local_definitions().is_empty() && !ambiguous_import {
+                        let record = self
+                            .state
+                            .operation
+                            .ready
+                            .inventory
+                            .mount_record_by_ordinal(source.mount)?;
+                        let mut bindings: Vec<(Option<ResolutionSiteId>, JvmImportBinding)> =
+                            Vec::new();
+                        for namespace in [ResolutionNamespace::Type, ResolutionNamespace::Value] {
+                            let lookup =
+                                ResolutionLookupSemanticRecipe::new(language, namespace, spelling);
+                            let Some(rows) = self
+                                .state
+                                .jvm_import_bindings_for_lookup(source.mount, &lookup)?
+                            else {
+                                return Ok(Some(
+                                    super::demand_closure::ProviderPreparation::Unavailable(
+                                        cancelled_completion(),
+                                    ),
+                                ));
+                            };
+                            for row in rows.into_iter().filter(|row| row.reference == *prefix) {
+                                let Some(metadata) = self.state.operation.import_token_metadata(
+                                    record.blob_id(),
+                                    source.mount,
+                                    row.token,
+                                    self.state.cancellation,
+                                )?
+                                else {
+                                    return Ok(Some(
+                                        super::demand_closure::ProviderPreparation::Unavailable(
+                                            cancelled_completion(),
+                                        ),
+                                    ));
+                                };
+                                let site =
+                                    metadata.route.as_ref().and_then(|route| route.source_site);
+                                if let Some((_, prior)) =
+                                    bindings.iter().find(|(prior_site, prior)| {
+                                        site.is_some_and(|site| *prior_site == Some(site))
+                                            || prior.token == row.token
+                                    })
+                                {
+                                    ambiguous_import |= prior.precedence != row.precedence
+                                        || prior.coordinate != row.coordinate;
+                                } else {
+                                    bindings.push((site, row));
+                                }
+                            }
+                        }
+                        let winners = bindings
+                            .iter()
+                            .filter(|candidate| {
+                                !bindings.iter().any(|other| {
+                                    other.1.token != candidate.1.token
+                                        && jvm_import_binding_shadows(
+                                            language,
+                                            &other.1,
+                                            &candidate.1,
+                                        )
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        ambiguous_import |= winners.len() > 1;
+                        let package_lookup = ResolutionLookupSemanticRecipe::new(
+                            language,
+                            ResolutionNamespace::Package,
+                            spelling,
+                        )
+                        .semantic(&self.state.operation.ready.shared_names());
+                        for binding in &winners {
+                            let Some(site) = binding.0 else {
+                                continue;
+                            };
+                            match self.state.operation.jvm_selected_package_alias_for_site(
+                                source.mount,
+                                site,
+                                package_lookup,
+                                self.state.cancellation,
+                            )? {
+                                Read::Ready {
+                                    value,
+                                    completion: selected_completion,
+                                } => {
+                                    completion = completion.combine(&selected_completion);
+                                    package_alias_binding_seen |= value.is_some();
+                                    package_alias_route_open |=
+                                        selected_completion != ResolutionCompletion::Complete;
+                                    if winners.len() == 1 && !ambiguous_import {
+                                        selected_alias = value;
+                                    }
+                                }
+                                Read::Cancelled(selected_completion)
+                                | Read::Unavailable {
+                                    completion: selected_completion,
+                                    ..
+                                } => {
+                                    return Ok(Some(
+                                        super::demand_closure::ProviderPreparation::Unavailable(
+                                            selected_completion,
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     let evidence = self
                         .prefix_evidence
                         .borrow()
@@ -3655,8 +3936,169 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                     }
                     // #7869: this route walks the prefix positions itself.
                     // Their outcomes belong to this reference, not its qualifier.
-                    completion = ResolutionCompletion::Complete;
-                    JvmSourceStart::PositionedPackage(*prefix)
+                    if let Some(alias) = selected_alias {
+                        let mut unsupported = Vec::new();
+                        let mut provider_reasons = Vec::new();
+                        let mut retained = ResolutionCompletion::Complete;
+                        if let ResolutionCompletion::Incomplete(reasons) =
+                            answer.binding().completion()
+                        {
+                            for reason in reasons.iter() {
+                                match reason {
+                                    ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                                        unsupported.push(*semantic);
+                                    }
+                                    ResolutionIncompleteReason::OpenBoundary { semantic, status }
+                                        if *status == crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed => {
+                                        provider_reasons.push(*semantic);
+                                    }
+                                    other => retained = retained.combine(&ResolutionCompletion::incomplete([*other])),
+                                }
+                            }
+                        }
+                        let unsupported_completion = if unsupported.is_empty() {
+                            ResolutionCompletion::Complete
+                        } else {
+                            ResolutionCompletion::incomplete(
+                                unsupported
+                                    .iter()
+                                    .copied()
+                                    .map(ResolutionIncompleteReason::UnsupportedSemantic),
+                            )
+                        };
+                        match self.state.jvm_package_prefix_evidence(
+                            identity.fragment(),
+                            &unsupported_completion,
+                        )? {
+                            Some(JvmPackagePrefix::Witness(retired)) => {
+                                discharges.merge(
+                                    DemandClosureDischarges::with_operation_local_placeholders(
+                                        retired.clone(),
+                                    )
+                                    .for_prefix(*prefix, retired, true),
+                                );
+                            }
+                            Some(JvmPackagePrefix::Retained(incomplete)) => {
+                                retained = retained.combine(&incomplete);
+                            }
+                            None => {
+                                return Ok(Some(
+                                    super::demand_closure::ProviderPreparation::Unavailable(
+                                        cancelled_completion(),
+                                    ),
+                                ));
+                            }
+                        }
+                        alias_provider_reasons = provider_reasons.clone();
+                        let SelectedRootPathHalf::Reference {
+                            source_reference, ..
+                        } = source
+                            .qualified
+                            .as_ref()
+                            .expect("selected package prefix is a reference")
+                        else {
+                            unreachable!("selected package prefix is a reference")
+                        };
+                        let observed = source
+                            .qualified_completion
+                            .as_ref()
+                            .expect("qualified source keeps terminal evidence");
+                        let Some((terminal_reference, retired, normalized)) =
+                            self.state.jvm_root_reference_evidence(
+                                language,
+                                identity.fragment(),
+                                *source_reference,
+                                observed,
+                            )?
+                        else {
+                            return Ok(Some(
+                                super::demand_closure::ProviderPreparation::Unavailable(
+                                    cancelled_completion(),
+                                ),
+                            ));
+                        };
+                        terminal_reasons = retired;
+                        let normalized =
+                            completion_without_unsupported_semantics(&normalized, &unsupported);
+                        let terminal_unsupported = match &normalized {
+                            ResolutionCompletion::Complete => Vec::new(),
+                            ResolutionCompletion::Incomplete(reasons) => reasons
+                                .iter()
+                                .filter_map(|reason| match reason {
+                                    ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                                        Some(*semantic)
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        };
+                        let terminal_prefix_completion = ResolutionCompletion::incomplete(
+                            terminal_unsupported
+                                .iter()
+                                .copied()
+                                .map(ResolutionIncompleteReason::UnsupportedSemantic),
+                        );
+                        if let Some(JvmPackagePrefix::Witness(retired)) =
+                            self.state.jvm_package_prefix_evidence(
+                                identity.fragment(),
+                                &terminal_prefix_completion,
+                            )?
+                        {
+                            discharges.merge(
+                                DemandClosureDischarges::with_operation_local_placeholders(
+                                    retired.clone(),
+                                ),
+                            );
+                            terminal_reasons.extend(retired);
+                        }
+                        let Some(qualified_reasons) =
+                            self.state.jvm_selected_package_terminal_reasons(
+                                identity.fragment(),
+                                terminal_reference,
+                                &terminal_unsupported,
+                            )?
+                        else {
+                            return Ok(Some(
+                                super::demand_closure::ProviderPreparation::Unavailable(
+                                    cancelled_completion(),
+                                ),
+                            ));
+                        };
+                        discharges.merge(
+                            DemandClosureDischarges::with_operation_local_placeholders(
+                                qualified_reasons.clone(),
+                            ),
+                        );
+                        terminal_reasons.extend(qualified_reasons);
+                        let normalized = completion_without_unsupported_semantics(
+                            &normalized,
+                            &terminal_reasons,
+                        );
+                        if let ResolutionCompletion::Incomplete(reasons) = normalized {
+                            for reason in reasons.iter() {
+                                if !matches!(reason,
+                                    ResolutionIncompleteReason::OpenBoundary { semantic, status }
+                                        if provider_reasons.contains(semantic)
+                                            && *status == crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed
+                                ) {
+                                    retained = retained
+                                        .combine(&ResolutionCompletion::incomplete([*reason]));
+                                }
+                            }
+                        }
+                        completion = retained;
+                        JvmSourceStart::SelectedPackageAlias {
+                            reference: *prefix,
+                            container: alias.container,
+                        }
+                    } else if (ambiguous_import && package_alias_binding_seen)
+                        || package_alias_route_open
+                    {
+                        JvmSourceStart::Unresolved(Some(*prefix))
+                    } else {
+                        completion = ResolutionCompletion::Complete;
+                        JvmSourceStart::PositionedPackage(*prefix)
+                    }
                 }
             } else {
                 if *owner_continued && *anchor == ResolutionRootImportAnchor::Lexical {
@@ -3685,6 +4127,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 reader.expect("source reader prepared"),
                 terminal_reasons,
             );
+            state.alias_provider_reasons = alias_provider_reasons;
             if matches!(state.start, JvmSourceStart::Unresolved(_)) {
                 state.authority.get_mut().complete = false;
             }
@@ -3759,8 +4202,8 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                         discharges.merge(local);
                     }
                 }
+                context = register_scoped_gap_identities(context, &gaps);
                 for gap in gaps {
-                    context = context.with_context_owned_gap_identity(gap.reason);
                     if gap.lookup == lookup {
                         completion = completion.combine(&ResolutionCompletion::incomplete([gap
                             .boundary_status
@@ -3786,6 +4229,26 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 for bridge in &bindings {
                     completion = completion.combine(bridge.completion());
                 }
+                let package_alias =
+                    match self.state.operation.jvm_selected_package_alias_for_import(
+                        source.mount,
+                        *token,
+                        source.lookup,
+                        self.state.cancellation,
+                    )? {
+                        Read::Ready {
+                            value,
+                            completion: alias_completion,
+                        } => {
+                            completion = completion.combine(&alias_completion);
+                            value
+                        }
+                        Read::Cancelled(completion) | Read::Unavailable { completion, .. } => {
+                            return Ok(Some(
+                                super::demand_closure::ProviderPreparation::Unavailable(completion),
+                            ));
+                        }
+                    };
                 let mut state = JvmSourceState::new(
                     JvmSourceStart::NamedImport,
                     completion,
@@ -3796,6 +4259,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 state.named_import = Some(JvmNamedImport {
                     context: context.without_root_bridges(),
                     bindings,
+                    package_alias,
                 });
                 self.source_roots.insert(frame.endpoint.clone(), state);
                 return Ok(None);
@@ -3839,7 +4303,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
         if source.mount == self.state.caller && self.state.whole_file_import_gaps.is_some() {
             let Read::Ready {
                 value: discharges, ..
-            } = self.state.caller_gap_authority(source)?
+            } = self.state.caller_gap_authority(frame, source)?
             else {
                 return Ok(Some(
                     super::demand_closure::ProviderPreparation::Unavailable(cancelled_completion()),
@@ -3878,7 +4342,7 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
             };
             let Read::Ready {
                 value: discharges, ..
-            } = self.state.caller_gap_authority(source)?
+            } = self.state.caller_gap_authority(frame, source)?
             else {
                 return Ok(Some(
                     super::demand_closure::ProviderPreparation::Unavailable(cancelled_completion()),
@@ -4062,9 +4526,11 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 unreachable!("a JVM source root owns one half");
             };
             // An empty member inventory from another file cannot certify the
-            // qualified route's absence.
+            // qualified route's absence. A selected external member is a
+            // positive answer, not an empty one.
             let mut empty_authority = true;
             if half.selected_targets.is_empty()
+                && authority.external_nominal.is_none()
                 && let JvmSourceStart::Members { values, .. } = &state.start
             {
                 for value in values {
@@ -4129,6 +4595,26 @@ impl<'store, 'input> super::demand_closure::DemandRules for JvmRules<'_, 'store,
                 );
             }
             exact.merge(state.discharges.clone());
+            if complete {
+                for certificate in &half.selected_external_owners {
+                    if exact
+                        .selected_targets
+                        .as_ref()
+                        .is_some_and(|targets| targets.contains(&certificate.owner))
+                    {
+                        exact = exact.with_selected_external_owner(certificate.clone());
+                    }
+                }
+            }
+            if complete && matches!(state.start, JvmSourceStart::SelectedPackageAlias { .. }) {
+                for target in &half.selected_targets {
+                    exact
+                        .positive_binding_providers
+                        .entry(*target)
+                        .or_default()
+                        .extend(state.alias_provider_reasons.iter().copied());
+                }
+            }
             let preserve_discharges = complete || exact != DemandClosureDischarges::default();
             let mut policy = super::demand_closure::ClosurePolicy::new(
                 member_completion,
@@ -4503,12 +4989,14 @@ struct JvmSourceAuthority {
 struct JvmNamedImport {
     context: SelectedResolutionContextSet,
     bindings: Vec<crate::analyzer::resolution::SelectedRootBridgeDescriptor>,
+    package_alias: Option<super::jvm_context::JvmSelectedPackageAlias>,
 }
 
 #[derive(Clone)]
 enum JvmSourceTarget {
     Route(super::demand_closure::WalkCursor<super::demand_closure::ClosureTag>),
     Import(usize),
+    PackageAlias(super::jvm_context::JvmSelectedPackageAlias),
 }
 
 struct JvmSourceState {
@@ -4518,6 +5006,7 @@ struct JvmSourceState {
     completion: ResolutionCompletion,
     discharges: DemandClosureDischarges,
     terminal_reasons: Vec<SemanticId>,
+    alias_provider_reasons: Vec<SemanticId>,
     authority: RefCell<JvmSourceAuthority>,
     material: RefCell<
         HashMap<super::demand_closure::ExportAuthority, super::demand_closure::BridgeMaterial>,
@@ -4541,6 +5030,7 @@ impl JvmSourceState {
             completion,
             discharges,
             terminal_reasons,
+            alias_provider_reasons: Vec::new(),
             authority: RefCell::new(JvmSourceAuthority {
                 complete: true,
                 prefix,
@@ -4558,9 +5048,14 @@ enum JvmSourceStart {
     Absolute,
     NamedImport,
     PositionedPackage(SemanticId),
+    SelectedPackageAlias {
+        reference: SemanticId,
+        container: String,
+    },
     Members {
         reference: SemanticId,
         values: Vec<ResolutionSlotValue>,
+        authored_lookup: Option<ResolutionLookupSemanticRecipe>,
     },
     Unresolved(Option<SemanticId>),
 }
@@ -4569,9 +5064,9 @@ impl JvmSourceStart {
         match self {
             Self::Absolute | Self::NamedImport => None,
             Self::Unresolved(prefix) => *prefix,
-            Self::PositionedPackage(reference) | Self::Members { reference, .. } => {
-                Some(*reference)
-            }
+            Self::PositionedPackage(reference)
+            | Self::SelectedPackageAlias { reference, .. }
+            | Self::Members { reference, .. } => Some(*reference),
         }
     }
 }
@@ -4585,6 +5080,22 @@ struct JvmHalfRows<'a, 'store, 'input> {
 }
 
 impl JvmHalfRows<'_, '_, '_> {
+    fn member_lookup<'a>(
+        &'a self,
+        route: &'a super::demand_closure::MemberRouteContext<'_, ()>,
+    ) -> &'a ResolutionLookupSemanticRecipe {
+        if route.position == super::demand_closure::MemberRoutePosition::Terminal
+            && let JvmSourceStart::Members {
+                authored_lookup: Some(lookup),
+                ..
+            } = &self.state.start
+        {
+            lookup
+        } else {
+            route.lookup
+        }
+    }
+
     fn retain_package_outcome(
         &self,
         cursor: &super::demand_closure::WalkCursor<super::demand_closure::ClosureTag>,
@@ -4615,13 +5126,49 @@ impl JvmHalfRows<'_, '_, '_> {
             JvmPackageOutcome::ExternalOwner {
                 completion,
                 authority,
-                ..
+                owner,
             } => {
                 self.state.authority.borrow_mut().complete &=
                     *completion == ResolutionCompletion::Complete;
+                let certificate = if *completion == ResolutionCompletion::Complete
+                    && lookup.namespace() == ResolutionNamespace::Type
+                    && let Some(reference) = self
+                        .rules
+                        .state
+                        .jvm_source_reference_semantic(self.state.reader.source_reference)?
+                    && self
+                        .rules
+                        .state
+                        .operation
+                        .ready
+                        .context_identities
+                        .java_type_name_owner(reference)
+                        .is_none_or(|selected| {
+                            matches!(&selected.winner, SelectedJavaTypeNameWinner::OnDemand { fqn, .. }
+                                if selected.owner == *owner
+                                    && self.rules.state.operation.ready.context_identities
+                                        .external_owner_identity(*owner)
+                                        .is_some_and(|identity| fqn.as_ref() == identity.owner_fqn.as_ref()))
+                        })
+                    && let Some(owner_authority) =
+                        self.rules.state.selected_external_owner_authority(*owner)?
+                {
+                    Some(SelectedExternalOwner {
+                        reference,
+                        owner: *owner,
+                        authority: owner_authority,
+                        selection: SelectedExternalOwnerSelection::Jvm {
+                            route: super::demand_closure::RouteAlternativeOwner::Half(cursor.tag.0),
+                            import_token: None,
+                        },
+                    })
+                } else {
+                    None
+                };
                 PositionedRouteOutcome::Supported(PositiveRouteSupport::ExternalOwner {
                     complete: *completion == ResolutionCompletion::Complete,
                     authority: *authority,
+                    certificate,
                 })
             }
             JvmPackageOutcome::ProvenEmpty => PositionedRouteOutcome::Closed,
@@ -4949,13 +5496,21 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
     type Member = ();
     fn source_import_targets(&self, _: &()) -> Result<Read<Option<Vec<Self::Target>>>> {
         Ok(Read::ready(self.state.named_import.as_ref().map(|named| {
-            named
+            let mut targets = named
                 .bindings
                 .iter()
                 .enumerate()
                 .filter(|(_, bridge)| bridge.target_definition().is_some())
                 .map(|(index, _)| JvmSourceTarget::Import(index))
-                .collect()
+                .collect::<Vec<_>>();
+            targets.extend(
+                named
+                    .package_alias
+                    .iter()
+                    .cloned()
+                    .map(JvmSourceTarget::PackageAlias),
+            );
+            targets
         })))
     }
     fn proven_targets(
@@ -5028,6 +5583,7 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
         let Some(read) = self.rules.state.operation.jvm_source_member_rows(
             owner,
             route,
+            self.member_lookup(route),
             self.source.token,
             self.rules.state.cancellation,
         )?
@@ -5050,10 +5606,45 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
         route: &super::demand_closure::MemberRouteContext<'_, Self::Rank>,
         row: &Self::MemberRow,
     ) -> Result<Read<Option<super::demand_closure::SelectedMemberRouteTarget>>> {
+        // An external member has no source declaration to navigate to. At the
+        // terminal it is the route's positive nominal target, as an external
+        // owner is at a package route's terminal: typed member resolution
+        // keeps member, dispatch and absence authority. A language that defers
+        // terminal member selection to typed resolution (Java) never names
+        // the member on this route.
+        if row.definition().ordinal().is_none()
+            && route.position == super::demand_closure::MemberRoutePosition::Terminal
+            && !jvm_prefix_defers_member_selection(self.state.reader.language)
+        {
+            if !self.rules.state.operation.jvm_member_row_selected(
+                self.state.reader.language,
+                route,
+                self.member_lookup(route),
+                row,
+            )? {
+                return Ok(Read::ready(None));
+            }
+            let mut authority = self.state.authority.borrow_mut();
+            if authority
+                .external_nominal
+                .is_none_or(|selected| selected == row.definition())
+            {
+                authority.external_nominal = Some(row.definition());
+                return Ok(Read::Ready {
+                    value: None,
+                    completion: route.selection.completion.clone(),
+                });
+            }
+            // Several external members (overloads) leave the terminal to
+            // typed member resolution; the route cannot name one of them.
+            authority.complete = false;
+            return Ok(Read::ready(None));
+        }
         let target = self.rules.state.operation.jvm_source_member_target(
             self.source,
             &self.state.reader,
             route,
+            self.member_lookup(route),
             row,
             self.rules.state.cancellation,
         )?;
@@ -5089,7 +5680,12 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
         facts: &mut super::demand_closure::PlacementFacts<Self::Target>,
     ) -> Result<Vec<super::demand_closure::PlacementStart<(), Self::Rank>>> {
         use super::demand_closure::{PlacementStart, RouteLocation, WalkCursor};
-        if let JvmSourceStart::Members { reference, values } = &self.state.start {
+        if let JvmSourceStart::Members {
+            reference,
+            values,
+            authored_lookup,
+        } = &self.state.start
+        {
             // The selected lexical prefix consumes the first route segment;
             // any remaining segments still belong to the shared route driver.
             let consumed = if self.source.is_import {
@@ -5103,7 +5699,7 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
             } else {
                 (
                     super::demand_closure::MemberRoutePosition::Terminal,
-                    &self.source.demand,
+                    authored_lookup.as_ref().unwrap_or(&self.source.demand),
                 )
             };
             let lookup = if position == super::demand_closure::MemberRoutePosition::Segment {
@@ -5137,7 +5733,9 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
             return Ok(Vec::new());
         }
         let (package, consumed) =
-            if matches!(self.state.start, JvmSourceStart::PositionedPackage(_)) {
+            if let JvmSourceStart::SelectedPackageAlias { container, .. } = &self.state.start {
+                (container.as_str(), 1)
+            } else if matches!(self.state.start, JvmSourceStart::PositionedPackage(_)) {
                 // The positioned prefix was already classified as a package. Do
                 // not search root exports for an unrelated type of that spelling.
                 (
@@ -5201,6 +5799,12 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
     fn target_location(&self, target: &Self::Target) -> super::demand_closure::RouteLocation {
         match target {
             JvmSourceTarget::Route(cursor) => cursor.location.clone(),
+            JvmSourceTarget::PackageAlias(alias) => {
+                super::demand_closure::RouteLocation::Container {
+                    unit: 0,
+                    container: alias.container.clone(),
+                }
+            }
             JvmSourceTarget::Import(index) => {
                 let bridge = &self
                     .state
@@ -5227,6 +5831,15 @@ impl super::demand_closure::HalfRules for JvmHalfRows<'_, '_, '_> {
         target: Self::Target,
         completion: &ResolutionCompletion,
     ) -> Result<Option<super::demand_closure::ExportHydration>> {
+        if let JvmSourceTarget::PackageAlias(_) = target {
+            // A selected package is a route coordinate, not an exported CodeUnit.
+            return Ok(Some(super::demand_closure::ExportHydration {
+                exports: Vec::new(),
+                blockers: Vec::new(),
+                unstaged: ResolutionCompletion::Complete,
+                coverage: Default::default(),
+            }));
+        }
         if let JvmSourceTarget::Import(index) = target {
             let bridge = &self
                 .state

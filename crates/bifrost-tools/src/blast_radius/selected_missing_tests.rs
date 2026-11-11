@@ -226,7 +226,13 @@ where
 {
     *telemetry = SelectedMissingTestsTelemetry::default();
     let expected_generation = catalog.generation();
-    let mut work = prepare_missing_tests_at_root(root, params, options, cancellation)?;
+    let mut work = prepare_missing_tests_at_root(
+        root,
+        params,
+        options,
+        cancellation,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )?;
     if work.prepared.target != Snapshot::Worktree {
         return Err(
             "selected-Java missing_tests requires the live worktree as the target snapshot"
@@ -895,6 +901,7 @@ mod tests {
             .min_by_key(|range| (range.start_line, range.start_byte))
             .expect("an indexed Java declaration has a primary range");
         ReferenceEdgeRow {
+            dispatch_extensibility: None,
             site: EdgeSite {
                 file: site_unit.source().clone(),
                 range,
@@ -902,7 +909,9 @@ mod tests {
                 enclosing: enclosing.cloned(),
             },
             target: target.clone(),
-            reference_kind: None,
+            reference_kind: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(
+                None,
+            ),
             proof,
             ambiguous_candidate: false,
             usage_kind,

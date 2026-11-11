@@ -26,6 +26,14 @@ incomplete dispatch set. A complete candidate enumeration can contain an
 unproven alternative when the available semantics cannot select one runtime
 target.
 
+A selected partial procedure summary contributes only its declared transfers.
+Each transfer keeps its own proof evidence. The call's original dispatch,
+unmodeled residual, continuation, and obligations remain open. A barrier on a
+declared transfer cuts that transfer only; it cannot establish clean absence or
+close the call. Results that depend on the call retain a typed unknown-effects
+gap and incomplete coverage. A complete summary may close the call only when
+the normal closure guards also admit it.
+
 When paths differ in proof or completeness, the solver keeps the incomparable
 alternatives. It discards a path only when another path dominates its evidence.
 
@@ -99,6 +107,17 @@ model set prevents a match, assertion or typestate policy from starting. Its
 authored policy identity. That identity does not represent a resolved
 executable policy, and the run publishes no cached evaluation evidence.
 
+A qualified callable locator whose model records are one owner's overloads
+from one pack, none ambiguous, but whose family no model certifies complete,
+binds as a possible identity (`possible_semantic_model`) instead of failing.
+A call to that family binds the overload its known members select under the
+same possible identity, which never equals a proven family identity. Every
+site bound this way and every match through the possible identity carries an
+incomplete diagnostic, so its findings are reported as possible flows and the
+run is inconclusive; it never completes or closes by summary. Records from
+different owners or packs, ambiguous records, and a workspace declaration
+beside a model record still fail as ambiguous.
+
 Taint and flow policies bind each endpoint entry independently. An unavailable
 identity prevents only that entry from selecting sites; the remaining entries
 run. Completion is inconclusive with partial discovery, and an incomplete-run
@@ -118,6 +137,18 @@ dispatch outcome rows,
 `exceeded_limit` is optional: an unavailable lane does not turn budget exhaustion
 into a complete result. Lane projection preserves the typed outcome, candidate
 coverage, proof, and completeness.
+
+Steps that read one semantic artifact per input row, such as `call-effects` and
+the result-contract steps, process their input grouped by file. Each file opens
+a window, and the file's caches are released when the next file starts, so
+resident work scales with one file and its dispatch targets, not with the
+workspace. Inside an open window an artifact's own row charge is grant-neutral:
+admitting it raises the matching row-lane grants by exactly its census, because
+row grants are estimates while the retained-byte cap is the measured memory
+bound. Work that is not an artifact's own rows still spends the default
+headroom, and explicit row grants, policy child scopes and windowless contexts
+are unchanged. Output of a windowed step is therefore grouped by file; that
+order is not a contract.
 
 ## Scope is part of the claim
 

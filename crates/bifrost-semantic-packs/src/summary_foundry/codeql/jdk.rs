@@ -552,6 +552,7 @@ pub fn generate_jdk_summaries(
             }],
         },
         Provenance {
+            rust_artifact_approximation: None,
             source: "https://github.com/github/codeql (MIT license)".to_owned(),
             revision: Some(commit.to_owned()),
         },

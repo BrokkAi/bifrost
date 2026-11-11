@@ -1,4 +1,5 @@
 use crate::analyzer::semantic::ids::MemoryLocationId;
+use crate::analyzer::semantic::ids::{ProgramPointId, ValueId};
 
 use crate::analyzer::semantic::ids::SemanticArtifactKey;
 
@@ -68,6 +69,15 @@ use std::borrow::Cow;
 use std::path::Path;
 
 /// One materialized workspace target for an exact semantic call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ReceiverOwnerRelation {
+    Direct,
+    Promoted,
+    Unknown,
+    #[default]
+    NotApplicable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchCandidate {
     #[doc(hidden)]
@@ -78,6 +88,7 @@ pub struct DispatchCandidate {
     pub completeness: EvidenceCompleteness,
     pub(crate) native_incomplete_source_reason: Option<Box<str>>,
     member_receiver_preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+    receiver_owner_relation: ReceiverOwnerRelation,
     #[doc(hidden)]
     pub provenance: Box<[OracleRelationHandle]>,
     #[doc(hidden)]
@@ -104,6 +115,7 @@ impl DispatchCandidate {
             completeness,
             native_incomplete_source_reason: None,
             member_receiver_preparation: None,
+            receiver_owner_relation: ReceiverOwnerRelation::NotApplicable,
             provenance: collect_candidate_provenance(provenance, limits)?,
             excluded_targets: Box::new([]),
             sealed: false,
@@ -177,6 +189,18 @@ impl DispatchCandidate {
         self.member_receiver_preparation = Some(preparation);
     }
 
+    pub const fn receiver_owner_relation(&self) -> ReceiverOwnerRelation {
+        self.receiver_owner_relation
+    }
+
+    pub fn mark_receiver_owner_relation(&mut self, relation: ReceiverOwnerRelation) {
+        assert!(
+            !self.sealed,
+            "receiver owner relation is set before sealing"
+        );
+        self.receiver_owner_relation = relation;
+    }
+
     pub fn provenance(&self) -> &[OracleRelationHandle] {
         &self.provenance
     }
@@ -242,6 +266,9 @@ impl DispatchCandidate {
 /// reconstruct either fact from the locator or source text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExactExternalProcedureTarget {
+    pub receiver_adjustment_call: Option<crate::analyzer::semantic::StableDigest>,
+    pub unadmitted_receiver_deref: bool,
+    receiver_adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
     artifact: SemanticArtifactKey,
     procedure: SemanticLocator,
     symbol: Box<str>,
@@ -265,12 +292,27 @@ impl ExactExternalProcedureTarget {
             && artifact.language() == procedure.language()
             && !symbol.is_empty())
         .then_some(Self {
+            receiver_adjustment_call: None,
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             artifact,
             procedure,
             symbol,
             has_receiver,
             formal_contract,
         })
+    }
+
+    pub fn with_receiver_adjustments(
+        mut self,
+        steps: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
+    ) -> Self {
+        self.receiver_adjustments = steps;
+        self
+    }
+
+    pub fn receiver_adjustments(&self) -> &[crate::analyzer::semantic_model::ReceiverAdjustment] {
+        &self.receiver_adjustments
     }
 
     pub const fn artifact(&self) -> &SemanticArtifactKey {
@@ -560,6 +602,15 @@ pub fn split_owner_member(head: &str) -> Option<(&str, &str)> {
     (!owner.is_empty() && !member.is_empty()).then_some((owner.trim(), member.trim()))
 }
 
+/// Every possible owner/member boundary in a qualified name value.
+pub fn owner_member_splits(name: &str) -> impl Iterator<Item = (&str, &str)> {
+    name.match_indices('.').filter_map(move |(index, _)| {
+        let (owner, rest) = name.split_at(index);
+        let member = &rest[1..];
+        (!owner.is_empty() && !member.is_empty()).then_some((owner, member))
+    })
+}
+
 /// A callee symbol without its optional trailing parameter list. The parameter
 /// types never enter a canonical identity, so every reader of an authored or
 /// resolved symbol cuts them off the same way (#1978).
@@ -661,15 +712,24 @@ pub struct ReturnedCallableProvenance {
     producer_callee: ProcedureHandle,
     closure: ProcedureHandle,
     captures: Box<[MemoryLocationId]>,
+    creation_value: ValueId,
+    creation_point: ProgramPointId,
+    creation_event_index: usize,
+    capture_bindings: Box<[CaptureBinding]>,
 }
 
 impl ReturnedCallableProvenance {
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         producer: CallSiteHandle,
         producer_callee: ProcedureHandle,
         closure: ProcedureHandle,
         captures: Box<[MemoryLocationId]>,
+        creation_value: ValueId,
+        creation_point: ProgramPointId,
+        creation_event_index: usize,
+        capture_bindings: Box<[CaptureBinding]>,
     ) -> Self {
         assert_eq!(
             producer.procedure().artifact().key().mount(),
@@ -686,6 +746,10 @@ impl ReturnedCallableProvenance {
             producer_callee,
             closure,
             captures,
+            creation_value,
+            creation_point,
+            creation_event_index,
+            capture_bindings,
         }
     }
 
@@ -717,6 +781,24 @@ impl ReturnedCallableProvenance {
     /// The closure's environment slots, in the closure's own procedure.
     pub fn captures(&self) -> &[MemoryLocationId] {
         &self.captures
+    }
+
+    /// The exact creation in the producing callee's semantic artifact.
+    pub const fn creation_value(&self) -> ValueId {
+        self.creation_value
+    }
+
+    pub const fn creation_point(&self) -> ProgramPointId {
+        self.creation_point
+    }
+
+    pub const fn creation_event_index(&self) -> usize {
+        self.creation_event_index
+    }
+
+    /// Canonically ordered exact environment assignments for this creation.
+    pub fn capture_bindings(&self) -> &[CaptureBinding] {
+        &self.capture_bindings
     }
 }
 

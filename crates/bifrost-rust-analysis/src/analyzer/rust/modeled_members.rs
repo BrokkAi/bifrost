@@ -12,8 +12,6 @@ use brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome;
-
 use brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution;
 
 use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
@@ -38,7 +36,7 @@ use crate::analyzer::RustOverlayCrates;
 
 use brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer;
 use brokk_bifrost_rust::declarations::rust_node_text;
-use brokk_bifrost_rust::lexical_scope::rust_lexical_scope_index;
+use brokk_bifrost_rust::graph_support::RustSource;
 use brokk_bifrost_rust::prelude::{
     RustEdition, RustPreludeCrate, RustPreludeNamespace, rust_prelude_name,
 };
@@ -73,6 +71,8 @@ pub(crate) struct UfcsTrait<'tree> {
 /// Declaration identity and the implementation evidence proved at this probe.
 /// A trait declaration alone never closes its implementation set.
 pub(crate) struct SelectedMember {
+    unadmitted_receiver_deref: bool,
+    adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
     pub owner: String,
     extensibility: brokk_bifrost_core::analyzer::model::DispatchExtensibility,
 }
@@ -85,7 +85,7 @@ impl SelectedMember {
     ) -> brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof {
         use brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof;
         use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
-        match self.extensibility {
+        let mut proof = match self.extensibility {
             DispatchExtensibility::Closed => ExactExternalCallProof::rust_bound_external_member(
                 &self.owner,
                 member,
@@ -94,7 +94,10 @@ impl SelectedMember {
             DispatchExtensibility::Open => {
                 ExactExternalCallProof::rust_trait_declaration(&self.owner, member, parameter_count)
             }
-        }
+        };
+        proof.unadmitted_receiver_deref = self.unadmitted_receiver_deref;
+        proof.receiver_adjustments = self.adjustments.clone();
+        proof
     }
 }
 
@@ -109,12 +112,18 @@ pub(crate) fn select<'analyzer>(
     owner: &str,
     has_receiver: bool,
     parameter_count: u32,
-    factory: Option<&native_points::RustDefinitionOperationFactory<'analyzer>>,
-    mut operation: Option<&mut SelectedResolutionOperation<'analyzer, '_>>,
+    factory: &native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut SelectedResolutionOperation<'analyzer, '_>,
     named_trait: Option<&UfcsTrait<'_>>,
     receiver_application: Option<&TypeRef>,
+    cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<SelectedMember> {
     use brokk_bifrost_core::analyzer::model::DispatchExtensibility;
+    let uncancelled = analyzer.active_query_cancellation().unwrap_or_default();
+    let cancellation = cancellation.unwrap_or(&uncancelled);
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let overlay = analyzer.semantic_model_overlay()?;
     let active = analyzer.active_semantic_models()?;
     let owner = RustOverlayCrates::new(Some(&overlay)).referenceable_symbol(owner)?;
@@ -136,17 +145,6 @@ pub(crate) fn select<'analyzer>(
     let member = rust_node_text(terminal, source);
     let receiver_facts = super::semantic::RustReceiverTypeFacts::from_tree(source, tree);
     let expression = callee.child_by_field_name("value");
-    let lexical_traits = (owner.kind == SemanticModelSymbolKind::Trait)
-        .then(|| {
-            let model = super::trait_applicability::ModelApplicability::new(
-                analyzer, rust, &overlay, &active,
-            );
-            let ty = receiver_facts.declared_receiver_type(source, tree, expression?)?;
-            super::trait_applicability::lexical_receiver_traits(
-                analyzer, file, source, tree, ty, &model,
-            )
-        })
-        .flatten();
     let application = SemanticModelCallApplication::positional(parameter_count);
     let callable_on = |declaring: &SemanticModelSymbol| {
         overlay.callable_for_application(
@@ -164,6 +162,9 @@ pub(crate) fn select<'analyzer>(
     // by-value trait method can precede an inherent borrowed-self method.
     let mut selected_receiver_extensibility =
         receiver_dispatch_extensibility(owner.kind, Some(&owner.qualified_name));
+    let mut unadmitted_receiver_deref = false;
+    let mut receiver_steps = 0;
+    let mut adjustments = Vec::new();
     let candidates = if let Some(named) = named_trait {
         overlay
             .callable_owners_on_surface(&active, &owner, member)?
@@ -171,62 +172,18 @@ pub(crate) fn select<'analyzer>(
             .filter(|candidate| candidate.owner.qualified_name == named.owner)
             .collect::<Vec<_>>()
     } else {
-        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
-        let prelude = match operation.as_deref_mut() {
-            Some(operation) => operation.rust_prelude_for_caller(file.rel_path(), &cancellation),
-            None => {
-                let owned_factory;
-                let factory = match factory {
-                    Some(factory) => factory,
-                    None => {
-                        owned_factory = native_points::RustDefinitionOperationFactory::new(
-                            analyzer,
-                            &cancellation,
-                        )?;
-                        &owned_factory
-                    }
-                };
-                match factory.open(&cancellation) {
-                    Ok(SelectedResolutionOperationOpenOutcome::Ready(operation)) => {
-                        operation.rust_prelude_for_caller(file.rel_path(), &cancellation)
-                    }
-                    Ok(outcome) => {
-                        use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
-                        let cause = match outcome {
-                            SelectedResolutionOperationOpenOutcome::Cancelled => DerivationExecutionCause::Cancelled,
-                            SelectedResolutionOperationOpenOutcome::Unavailable(_) | SelectedResolutionOperationOpenOutcome::Stale(_) => DerivationExecutionCause::Provider,
-                            SelectedResolutionOperationOpenOutcome::Ready(_) => unreachable!(),
-                        };
-                        crate::analyzer::rust::std_types::operational_proof_stop(
-                            "selected_operation_unavailable", cause,
-                        );
-                        return None;
-                    }
-                    Err(error) => {
-                        eprintln!("opening selected Rust trait scope: {error}");
-                        crate::analyzer::rust::std_types::operational_proof_stop("store_error", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider);
-                        return None;
-                    }
-                }
-            }
-        }
+        let prelude = operation.rust_prelude_for_caller(file.rel_path(), cancellation)
         .unwrap_or_else(|error| {
             eprintln!("reading selected Rust trait prelude: {error}");
             crate::analyzer::rust::std_types::operational_proof_stop("store_error", brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause::Provider);
             None
         })?;
-        let imports = if let Some(selected) = operation.as_deref_mut() {
-            crate::analyzer::rust::std_types::selected_import_infos(
-                analyzer,
-                selected,
-                file,
-                &cancellation,
-            )?
-        } else {
-            analyzer
-                .import_analysis_provider_for_file(file)?
-                .import_info_of(scope.token(), file)
-        };
+        let imports = crate::analyzer::rust::std_types::selected_import_infos(
+            analyzer,
+            operation,
+            file,
+            cancellation,
+        )?;
         let visible_imports = imports
             .iter()
             .filter(|import| {
@@ -236,8 +193,12 @@ pub(crate) fn select<'analyzer>(
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut source_traits =
-            brokk_bifrost_rust::imports::rust_imported_code_units(rust, file, &visible_imports);
+        let mut source_traits = brokk_bifrost_rust::imports::rust_imported_code_units_with(
+            rust.crate_naming_caches(),
+            rust,
+            file,
+            &visible_imports,
+        );
         let mut external_imports = Vec::new();
         for import in &visible_imports {
             let Some((written, focused)) =
@@ -267,17 +228,9 @@ pub(crate) fn select<'analyzer>(
                 tree: Some(tree),
                 site: &import_site,
                 budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
-                cancellation: Some(&cancellation),
+                cancellation: Some(cancellation),
             };
-            let resolved = match operation.as_deref_mut() {
-                Some(operation) => {
-                    native_points::resolve_rust_definition_in_operation(query, operation)
-                }
-                None => match factory {
-                    Some(factory) => factory.resolve_bounded(query),
-                    None => native_points::resolve_rust_definition_bounded(query),
-                },
-            };
+            let resolved = factory.resolve(operation, query);
             crate::analyzer::rust::std_types::observe_proof_resolution(&resolved);
             let BoundedResolution::Complete { value, .. } = resolved else {
                 return None;
@@ -296,20 +249,16 @@ pub(crate) fn select<'analyzer>(
                 written.root,
                 None,
                 &imports,
-                |query| match operation.as_deref_mut() {
-                    Some(operation) => {
-                        native_points::resolve_rust_definition_in_operation(query, operation)
-                    }
-                    None => match factory {
-                        Some(factory) => factory.resolve_bounded(query),
-                        None => native_points::resolve_rust_definition_bounded(query),
-                    },
-                },
+                |query| factory.resolve(operation, query),
             ) {
                 external_imports.push(import);
             }
         }
-        let lexical = rust_lexical_scope_index(tree.root_node(), source);
+        let lexical = brokk_bifrost_rust::lexical_scope::rust_lexical_scope_index_with(
+            rust.inner.adapter().lexical_caches(),
+            tree.root_node(),
+            source,
+        );
         let visible = |candidate: &SemanticModelSymbol| {
             let imported = external_imports.iter().any(|import| {
                 let Some(path) = &import.path else {
@@ -372,9 +321,12 @@ pub(crate) fn select<'analyzer>(
             .filter(|import| import.is_wildcard)
             .cloned()
             .collect::<Vec<_>>();
-        for namespace in
-            brokk_bifrost_rust::imports::rust_imported_code_units(rust, file, &wildcard_imports)
-        {
+        for namespace in brokk_bifrost_rust::imports::rust_imported_code_units_with(
+            rust.crate_naming_caches(),
+            rust,
+            file,
+            &wildcard_imports,
+        ) {
             source_traits.extend(rust.get_direct_children(&namespace));
         }
         source_traits.extend(rust.declarations(file).into_iter().filter(|unit| {
@@ -415,8 +367,27 @@ pub(crate) fn select<'analyzer>(
                 source_rivals.push(candidate);
             }
         }
-        let mut applicability =
-            super::trait_applicability::ModelApplicability::new(analyzer, rust, &overlay, &active);
+        let resolver = super::std_types::model_proof_resolver(analyzer, factory, operation)?;
+        let mut applicability = super::trait_applicability::ModelApplicability::new(
+            analyzer,
+            rust,
+            &overlay,
+            &active,
+            resolver.as_ref(),
+        );
+        let lexical_traits = (owner.kind == SemanticModelSymbolKind::Trait)
+            .then(|| {
+                let ty = receiver_facts.declared_receiver_type(source, tree, expression?)?;
+                super::trait_applicability::lexical_receiver_traits(
+                    analyzer,
+                    file,
+                    source,
+                    tree,
+                    ty,
+                    &applicability,
+                )
+            })
+            .flatten();
         // Static and UFCS paths have no field receiver. Their explicit owner
         // still drives the existing typed trait route (for example From::from).
         let mut receiver_type = receiver_application
@@ -426,12 +397,9 @@ pub(crate) fn select<'analyzer>(
                     .and_then(|expression| {
                         receiver_facts.declared_receiver_type(source, tree, expression)
                     })
-                    .and_then(|ty| applicability.receiver_type(analyzer, file, source, ty))
+                    .and_then(|ty| applicability.receiver_type(file, source, ty))
             })
-            .or_else(|| {
-                super::std_types::RustTypeProof::new(analyzer)?
-                    .modeled_receiver_type(file, expression?)
-            })
+            .or_else(|| resolver.modeled_receiver_type(file, expression?))
             .unwrap_or_else(|| applicability.abstract_receiver(&owner));
         let borrowed = expression.and_then(|mut expression| {
             while expression.kind() == "parenthesized_expression" {
@@ -457,12 +425,15 @@ pub(crate) fn select<'analyzer>(
         let mut receiver = owner;
         let mut visited = std::collections::HashSet::new();
         let candidates = loop {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             selected_receiver_extensibility =
                 receiver_dispatch_extensibility(receiver.kind, Some(&receiver.qualified_name));
             if !visited.insert(receiver.id.clone()) {
                 return None;
             }
-            let direct = overlay.members_of(&receiver.id);
+            let direct = overlay.members_of_in_family(&receiver.id, "rust");
             let family = direct
                 .records
                 .iter()
@@ -561,6 +532,10 @@ pub(crate) fn select<'analyzer>(
                 if family.is_empty() && possible.len() == 1 {
                     let trait_ = in_scope[possible[0]].clone();
                     let matched = callable_on(&trait_);
+                    if receiver_steps > 0 && !adjustment_target_is_shared(&active, &matched) {
+                        unadmitted_receiver_deref = true;
+                        adjustments.clear();
+                    }
                     // Preserve the existing exact implementation route before
                     // falling back to declaration-only evidence. Its complete
                     // callable contract and positive hierarchy path are a
@@ -591,6 +566,8 @@ pub(crate) fn select<'analyzer>(
                         });
                         return (self_forms_known && callable_is_proven(&matched)).then(|| {
                             SelectedMember {
+                                unadmitted_receiver_deref,
+                                adjustments: adjustments.clone().into_boxed_slice(),
                                 owner: trait_.qualified_name.clone(),
                                 extensibility: DispatchExtensibility::Open,
                             }
@@ -604,9 +581,15 @@ pub(crate) fn select<'analyzer>(
                     return None;
                 }
                 let matched = callable_on(&receiver);
+                if receiver_steps > 0 && !adjustment_target_is_shared(&active, &matched) {
+                    unadmitted_receiver_deref = true;
+                    adjustments.clear();
+                }
                 let extensibility =
                     selected_receiver_extensibility.unwrap_or(DispatchExtensibility::Open);
                 return callable_is_proven(&matched).then(|| SelectedMember {
+                    unadmitted_receiver_deref,
+                    adjustments: adjustments.clone().into_boxed_slice(),
                     owner: receiver.qualified_name.clone(),
                     extensibility,
                 });
@@ -616,9 +599,18 @@ pub(crate) fn select<'analyzer>(
             {
                 dereferenced = element;
             }
+            if receiver_steps == brokk_bifrost_analysis::analyzer::store::language_support::MAX_EXPLICIT_RECEIVER_STEPS {
+                return None;
+            }
             let Some(target) = applicability.deref_target(&receiver, dereferenced) else {
                 break Vec::new();
             };
+            receiver_steps += 1;
+            if let Some(adjustment) = applicability.deref_adjustment(&receiver) {
+                adjustments.push(adjustment);
+            } else {
+                unadmitted_receiver_deref = true;
+            }
             receiver = applicability.owner(&target)?;
             receiver_type = target;
         };
@@ -643,6 +635,10 @@ pub(crate) fn select<'analyzer>(
             continue;
         }
         let matched = callable_on(&candidate.owner);
+        if receiver_steps > 0 && !adjustment_target_is_shared(&active, &matched) {
+            unadmitted_receiver_deref = true;
+            adjustments.clear();
+        }
         if !callable_is_proven(&matched) {
             return None;
         }
@@ -707,6 +703,8 @@ pub(crate) fn select<'analyzer>(
             Some(_) => return None, // More than one applicable typed impl remains ambiguous.
             None => {
                 selected = Some(SelectedMember {
+                    unadmitted_receiver_deref,
+                    adjustments: adjustments.clone().into_boxed_slice(),
                     owner: candidate.owner.qualified_name.clone(),
                     extensibility: if implementation_is_proven(&candidate.owner, &matched) {
                         selected_receiver_extensibility.unwrap_or(DispatchExtensibility::Open)
@@ -750,4 +748,30 @@ fn implementation_is_proven(
             && matched.records.iter().all(|record| {
                 record.provenance.completeness == SemanticModelCompleteness::Complete
             }))
+}
+
+/// A mutable target would require a separate DerefMut call. A shared Deref
+/// summary never authorizes that adjustment, even when the Target is identical.
+fn adjustment_target_is_shared(
+    active: &brokk_bifrost_analysis::analyzer::store::active_models::ResolvedActiveSemanticModels,
+    matched: &crate::analyzer::semantic_model::SemanticModelCallableMatch,
+) -> bool {
+    !matched.records.is_empty()
+        && matched.records.iter().all(|symbol| {
+            let records = active.all_member_records_with_id(&symbol.id);
+            if records.open_for_language("rust").is_some() {
+                return false;
+            }
+            records
+                .rows
+                .filter(|record| {
+                    record.shard.manifest.semantic_sha256 == symbol.provenance.pack_digest
+                })
+                .any(|record| {
+                    matches!(
+                        record.record.self_form,
+                        Some(crate::analyzer::semantic_model::RustSelfForm::Shared)
+                    )
+                })
+        })
 }

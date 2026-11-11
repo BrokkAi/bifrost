@@ -314,6 +314,15 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     other => other,
                 }
             }
+            ReceiverAnalysisOutcome::Incomplete { candidates } => {
+                ReceiverAnalysisOutcome::Incomplete {
+                    candidates: candidates
+                        .iter()
+                        .flat_map(|value| self.member_targets_for_value(value, member))
+                        .take(budget.max_targets.saturating_add(1))
+                        .collect(),
+                }
+            }
             ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
             ReceiverAnalysisOutcome::Unsupported { reason } => {
                 ReceiverAnalysisOutcome::Unsupported { reason }
@@ -1999,6 +2008,14 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                         .collect(),
                 ))
             }
+            ReceiverAnalysisOutcome::Incomplete { candidates } => {
+                Some(ReceiverAnalysisOutcome::Incomplete {
+                    candidates: candidates
+                        .into_iter()
+                        .map(|endpoint| ReceiverValue::ClassOrStaticObject(endpoint.declaration))
+                        .collect(),
+                })
+            }
             ReceiverAnalysisOutcome::Unknown => Some(ReceiverAnalysisOutcome::Unknown),
             ReceiverAnalysisOutcome::Unsupported { reason } => {
                 Some(ReceiverAnalysisOutcome::Unsupported { reason })
@@ -2625,6 +2642,13 @@ fn source_owner_receiver_outcome(
                 .map(ReceiverValue::InstanceType)
                 .collect(),
         ),
+        ReceiverAnalysisOutcome::Incomplete { candidates } => ReceiverAnalysisOutcome::Incomplete {
+            candidates: candidates
+                .into_iter()
+                .take(budget.max_targets.saturating_add(1))
+                .map(ReceiverValue::InstanceType)
+                .collect(),
+        },
         ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
         ReceiverAnalysisOutcome::Unsupported { reason } => {
             ReceiverAnalysisOutcome::Unsupported { reason }
@@ -3217,6 +3241,9 @@ fn wrap_factory_outcome(
         ReceiverAnalysisOutcome::Ambiguous(values) => {
             ReceiverAnalysisOutcome::Ambiguous(values.into_iter().map(wrap).collect())
         }
+        ReceiverAnalysisOutcome::Incomplete { candidates } => ReceiverAnalysisOutcome::Incomplete {
+            candidates: candidates.into_iter().map(wrap).collect(),
+        },
         ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
         ReceiverAnalysisOutcome::Unsupported { reason } => {
             ReceiverAnalysisOutcome::Unsupported { reason }
@@ -3524,8 +3551,16 @@ mod tests {
         fn imported_code_units_of(
             &self,
             _file: &ProjectFile,
-        ) -> Arc<brokk_bifrost_core::hash::HashSet<CodeUnit>> {
-            Arc::new(brokk_bifrost_core::hash::HashSet::default())
+        ) -> Arc<
+            brokk_bifrost_core::retention_budget::Accounted<
+                brokk_bifrost_core::hash::HashSet<CodeUnit>,
+            >,
+        > {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
+                    brokk_bifrost_core::hash::HashSet::default()
+                },
+            )
         }
 
         fn referencing_files_of(

@@ -1141,65 +1141,13 @@ pub fn unique_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
-/// Resolve a spelled type name through the analyzer's own memoized import map,
-/// the same-package tier and the default package.
+/// The workspace class declared under exactly `fqn`, if any.
 ///
-/// The [`resolve_java_type_name_with`] family walks the raw import list per
-/// call; this one answers from the resolved-import cache and is what the
-/// external-aware route above it consults first.
-pub fn resolve_java_type_name(
-    source: &dyn JavaSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    raw_name: &str,
-) -> Option<CodeUnit> {
-    let normalized = raw_name.trim();
-    if normalized.is_empty() {
-        return None;
-    }
-
-    if normalized.contains('.') {
-        if let Some(code_unit) = usage_source_type_by_fqn(source, token, normalized) {
-            return Some(code_unit);
-        }
-        if let Some(code_unit) = resolve_java_nested_type_name(source, token, file, normalized) {
-            return Some(code_unit);
-        }
-    }
-
-    resolve_java_visible_simple_type(source, token, file, normalized)
-}
-
-fn resolve_java_nested_type_name(
-    source: &dyn JavaSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    normalized: &str,
-) -> Option<CodeUnit> {
-    let (first, rest) = normalized.split_once('.')?;
-    let owner = resolve_java_visible_simple_type(source, token, file, first)?;
-    let nested_fqn = format!("{}.{}", owner.fq_name(), rest);
-    usage_source_type_by_fqn(source, token, &nested_fqn)
-}
-
-pub fn resolve_java_visible_simple_type(
-    source: &dyn JavaSource,
-    token: QueryToken<'_>,
-    file: &ProjectFile,
-    name: &str,
-) -> Option<CodeUnit> {
-    if let Some(code_unit) = source.resolved_imports(file).get(name) {
-        return Some(code_unit.clone());
-    }
-    let same_package_fqn = java_same_package_fqn(source, file, name);
-    usage_source_type_by_fqn(source, token, &same_package_fqn).or_else(|| {
-        java_file_is_in_default_package(source, file)
-            .then(|| usage_source_type_by_fqn(source, token, name))
-            .flatten()
-    })
-}
-
-fn usage_source_type_by_fqn(
+/// This is the source half of every Java type-name tier: the analysis-side
+/// ladder in `JavaAnalyzer::resolve_type_name_at` asks it once per candidate
+/// fully qualified name (a single-type import's target, a same-package name, an
+/// on-demand package's member, a nested type of a bound owner).
+pub fn java_source_class_by_fqn(
     source: &dyn JavaSource,
     token: QueryToken<'_>,
     fqn: &str,
@@ -1209,6 +1157,61 @@ fn usage_source_type_by_fqn(
         result = usage_source_type_by_fqn_in(definitions, fqn);
     });
     result
+}
+
+/// A Java type name as the resolution ladder reads it: its identifier segments
+/// in order. `Map.Entry` is `["Map", "Entry"]`.
+///
+/// Java binds the first segment of a dotted name first (JLS 6.5.2): the name is
+/// a member-type chain when the first segment names a type in scope, and a
+/// package-qualified name otherwise. The ladder therefore needs the segments,
+/// not the spelling, and takes them from here so no tier splits text itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavaTypeName {
+    segments: Vec<String>,
+}
+
+impl JavaTypeName {
+    /// The segments of a name already read from its AST, for example with
+    /// [`crate::java::graph::return_type::java_type_name_components`]. Type
+    /// arguments, annotations and array dimensions are not segments.
+    pub fn from_components(segments: Vec<String>) -> Option<Self> {
+        (!segments.is_empty() && segments.iter().all(|segment| !segment.is_empty()))
+            .then_some(Self { segments })
+    }
+
+    /// A name that is already a plain dot-joined identifier path: a canonical
+    /// fully qualified name an index produced, or the spelling a caller that
+    /// holds no node has already normalized with [`normalize_java_type_text`].
+    /// This is a value, not source syntax; a caller that holds the node uses
+    /// [`Self::from_node`].
+    pub fn from_normalized_spelling(spelling: &str) -> Option<Self> {
+        let segments = spelling
+            .trim()
+            .split('.')
+            .map(|segment| segment.trim().to_owned())
+            .collect::<Vec<_>>();
+        segments
+            .iter()
+            .all(|segment| !segment.is_empty())
+            .then_some(Self { segments })
+    }
+
+    pub fn first(&self) -> &str {
+        &self.segments[0]
+    }
+
+    pub fn rest(&self) -> &[String] {
+        &self.segments[1..]
+    }
+
+    pub fn is_dotted(&self) -> bool {
+        self.segments.len() > 1
+    }
+
+    pub fn render(&self) -> String {
+        self.segments.join(".")
+    }
 }
 
 fn usage_source_type_by_fqn_in(

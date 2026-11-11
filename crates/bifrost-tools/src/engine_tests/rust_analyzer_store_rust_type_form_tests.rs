@@ -108,7 +108,7 @@ passthrough! {
             .file("src/lib.rs", TYPE_FORM_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let parsed = state.source_facts.as_ref().expect("Rust source facts");
         let mut expected = parsed.rust_types.clone();
         expected.sort_by_key(|fact| fact.occurrence.get());
@@ -166,7 +166,7 @@ passthrough! {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -177,7 +177,9 @@ passthrough! {
 
         let reopened = AnalyzerStore::open_persistent(&path).unwrap();
         let actual = reopened
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert_eq!(actual.types, expected);
@@ -200,7 +202,7 @@ passthrough! {
             .file("src/lib.rs", TYPE_FORM_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let parsed = state.source_facts.as_ref().expect("Rust source facts");
         let mut expected = parsed.rust_types.clone();
         expected.sort_by_key(|fact| fact.occurrence.get());
@@ -210,7 +212,7 @@ passthrough! {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -227,7 +229,13 @@ passthrough! {
         });
         assert!(
             store
-                .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+                .rust_hierarchy_source_facts(
+                    oid,
+                    generation,
+                    &RustAdapter::for_tests(),
+                    &file,
+                    &|| true
+                )
                 .is_err(),
             "stale type-form publication must not hydrate"
         );
@@ -235,12 +243,14 @@ passthrough! {
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
         let repaired = store
-            .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, &|| true)
+            .rust_hierarchy_source_facts(oid, generation, &RustAdapter::for_tests(), &file, &|| {
+                true
+            })
             .unwrap()
             .unwrap();
         assert_eq!(repaired.types, expected);
@@ -252,13 +262,13 @@ passthrough! {
             .file("src/lib.rs", TYPE_FORM_SOURCE)
             .build();
         let file = fixture.file("src/lib.rs");
-        let state = parse_state(&RustAdapter, &file);
+        let state = parse_state(&RustAdapter::for_tests(), &file);
         let oid = oid_for(TYPE_FORM_SOURCE.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "rust"),
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
             .unwrap();
@@ -266,7 +276,13 @@ passthrough! {
         assert_rust_source_read_cancellation_retries(
             |cancellation| {
                 store
-                    .rust_hierarchy_source_facts(oid, generation, &RustAdapter, &file, cancellation)
+                    .rust_hierarchy_source_facts(
+                        oid,
+                        generation,
+                        &RustAdapter::for_tests(),
+                        &file,
+                        cancellation,
+                    )
                     .unwrap()
             },
             12,

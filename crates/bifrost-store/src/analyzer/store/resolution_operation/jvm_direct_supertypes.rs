@@ -5,7 +5,7 @@ use crate::analyzer::resolution::{
 };
 use brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason;
 use brokk_bifrost_core::analyzer::resolution_facts::{
-    BindingProjectionKind, ResolutionSupertypeKind,
+    BindingProjectionKind, DeclarationTypeRole, ResolutionSupertypeKind, ResolutionTypeTransferKind,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason;
 
@@ -177,6 +177,23 @@ struct ReferenceAnswer {
     completion: ResolutionCompletion,
 }
 
+#[derive(Clone)]
+struct AliasStep {
+    references: Vec<SemanticId>,
+    completion: ResolutionCompletion,
+}
+
+fn stopped_alias_walk(
+    cancellation: &CancellationToken,
+    semantic: SemanticId,
+) -> ResolutionCompletion {
+    ResolutionCompletion::incomplete([if cancellation.is_cancelled() {
+        ResolutionIncompleteReason::Cancelled
+    } else {
+        ResolutionIncompleteReason::ReceiverBudgetExhausted(semantic)
+    }])
+}
+
 /// Borrowed inside `with_jvm_hierarchy_query`; never retained across requests.
 pub struct JvmHierarchyQuery<'query, 'source, R: JvmHierarchyReadReceipts = ()> {
     forward: &'query mut FactResolutionOperation<'source>,
@@ -186,6 +203,8 @@ pub struct JvmHierarchyQuery<'query, 'source, R: JvmHierarchyReadReceipts = ()> 
     cancellation: &'query CancellationToken,
     receipts: &'query mut R,
     references: HashMap<SemanticId, (Result<ReferenceAnswer>, R::Receipt)>,
+    alias_steps: HashMap<SemanticId, (Result<Option<AliasStep>>, R::Receipt)>,
+    session: &'query ResolutionSession,
     #[cfg(any(test, feature = "test-support"))]
     resolved_references: std::cell::Cell<usize>,
     // Selected language/kind facts certify the intrinsic coordinate. This
@@ -202,6 +221,270 @@ pub struct JvmHierarchyQuery<'query, 'source, R: JvmHierarchyReadReceipts = ()> 
 }
 
 impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
+    /// Follow the selected alias declaration's own type graph. The binding
+    /// target identifies its mount; the RHS reference retains that mount's
+    /// lexical and import context when resolved by the forward operation.
+    fn alias_step(&mut self, alias: SemanticId) -> Result<Option<AliasStep>> {
+        // The immediate inventory lookup costs one step on either side of the
+        // request-local memo. The forward walk charges its own occurrences.
+        if !self.session.scope_step() {
+            return Ok(Some(AliasStep {
+                references: Vec::new(),
+                completion: stopped_alias_walk(self.cancellation, alias),
+            }));
+        }
+        if let Some((_, receipt)) = self.alias_steps.get(&alias) {
+            self.receipts.replay(receipt);
+        } else {
+            let typed = self.typed;
+            let cancellation = self.cancellation;
+            let (step, receipt) = self.receipts.capture(|| {
+                let mut completion = ResolutionCompletion::Complete;
+                let mut slots = Vec::new();
+                let outcome = typed.visit_declaration_type_pages_for_definitions(
+                    TypedFactRequest::new(&[alias]),
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        slots.extend(
+                            page.iter()
+                                .filter(|selected| {
+                                    selected.row().definition() == alias
+                                        && selected.row().role() == DeclarationTypeRole::Identity
+                                })
+                                .map(|selected| selected.row().slot()),
+                        );
+                        Ok(true)
+                    }),
+                )?;
+                completion = completion.combine(outcome.evidence());
+                if !outcome.is_exhausted() {
+                    return Ok(Some(AliasStep {
+                        references: Vec::new(),
+                        completion: completion.combine(&cancelled_completion()),
+                    }));
+                }
+                if slots.is_empty() {
+                    return Ok((completion != ResolutionCompletion::Complete).then_some(
+                        AliasStep {
+                            references: Vec::new(),
+                            completion,
+                        },
+                    ));
+                }
+                slots.sort_unstable();
+                slots.dedup();
+                if slots.len() != 1 {
+                    return Ok(Some(AliasStep {
+                        references: Vec::new(),
+                        completion: completion.combine(&ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(alias),
+                        ])),
+                    }));
+                }
+                let mut transfers = Vec::new();
+                let outcome = typed.visit_type_transfer_pages_to_targets(
+                    TypedFactRequest::new(&slots),
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        transfers.extend(
+                            page.iter()
+                                .filter(|selected| {
+                                    selected.row().kind() == ResolutionTypeTransferKind::TypeAlias
+                                        && selected.row().rule().target_slot() == slots[0]
+                                })
+                                .map(|selected| selected.row().clone()),
+                        );
+                        Ok(true)
+                    }),
+                )?;
+                completion = completion.combine(outcome.evidence());
+                if !outcome.is_exhausted() {
+                    return Ok(Some(AliasStep {
+                        references: Vec::new(),
+                        completion: completion.combine(&cancelled_completion()),
+                    }));
+                }
+                if transfers.is_empty() {
+                    return Ok((completion != ResolutionCompletion::Complete).then_some(
+                        AliasStep {
+                            references: Vec::new(),
+                            completion,
+                        },
+                    ));
+                }
+                // A parameterized or nested alias needs substitution through
+                // its use site. Until that payload is available, keep it open.
+                let mut parameters = Vec::new();
+                let outcome = typed.visit_generic_type_alias_parameter_pages_for_definitions(
+                    TypedFactRequest::new(&[alias]),
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        parameters.extend(page.iter().map(|selected| *selected.row()));
+                        Ok(true)
+                    }),
+                )?;
+                completion = completion.combine(outcome.evidence());
+                if !outcome.is_exhausted() {
+                    completion = completion.combine(&cancelled_completion());
+                }
+                let mut nested = false;
+                let outcome = typed.visit_member_owner_pages_for_definitions(
+                    TypedFactRequest::new(&[alias]),
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        nested |= page
+                            .iter()
+                            .any(|selected| selected.row().definition() == alias);
+                        Ok(true)
+                    }),
+                )?;
+                completion = completion.combine(outcome.evidence());
+                if !outcome.is_exhausted() {
+                    completion = completion.combine(&cancelled_completion());
+                }
+                if !parameters.is_empty()
+                    || transfers.len() != 1
+                    || nested
+                    || transfers.iter().any(|transfer| {
+                        transfer.rule().indirection_delta() != 0
+                            || transfer.rule().reference_indirection_delta() != 0
+                    })
+                {
+                    completion = completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(alias),
+                    ]));
+                }
+                let mut sources = Vec::new();
+                for transfer in &transfers {
+                    completion = completion.combine(transfer.rule().completion());
+                    sources.push(transfer.source_slot());
+                }
+                sources.sort_unstable();
+                sources.dedup();
+                let mut references = Vec::new();
+                let outcome = typed.visit_binding_projection_pages_for_outputs(
+                    TypedFactRequest::new(&sources),
+                    cancellation,
+                    &mut TypedFactPageVisitor::new(&mut |page| {
+                        references.extend(
+                            page.iter()
+                                .filter(|selected| {
+                                    sources.contains(&selected.row().output_slot())
+                                        && selected.row().kind()
+                                            == BindingProjectionKind::TargetTypeIdentity
+                                })
+                                .map(|selected| selected.row().reference()),
+                        );
+                        Ok(true)
+                    }),
+                )?;
+                completion = completion.combine(outcome.evidence());
+                if !outcome.is_exhausted() {
+                    completion = completion.combine(&cancelled_completion());
+                }
+                references.sort_unstable();
+                references.dedup();
+                if references.is_empty() {
+                    completion = completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(alias),
+                    ]));
+                }
+                Ok(Some(AliasStep {
+                    references,
+                    completion,
+                }))
+            });
+            self.alias_steps.insert(alias, (step, receipt));
+        }
+        let step = &self.alias_steps[&alias].0;
+        let copies = step
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(0, |step| step.references.len());
+        if !self.session.scope_steps(copies) {
+            return Ok(Some(AliasStep {
+                references: Vec::new(),
+                completion: stopped_alias_walk(self.cancellation, alias),
+            }));
+        }
+        self.alias_steps[&alias].0.clone()
+    }
+
+    fn expand_alias_parents(&mut self, binding: ReferenceAnswer) -> Result<ReferenceAnswer> {
+        let mut completion = binding.completion;
+        let mut targets = Vec::new();
+        if !self.session.scope_steps(binding.targets.len()) {
+            return Ok(ReferenceAnswer {
+                targets,
+                completion: completion
+                    .combine(&stopped_alias_walk(self.cancellation, binding.targets[0])),
+            });
+        }
+        // Exit events keep the current DFS ancestors separate from finished
+        // declarations. Reconverging aliases reuse the completed result.
+        let mut pending = binding
+            .targets
+            .into_iter()
+            .map(|target| (target, false))
+            .collect::<Vec<_>>();
+        let mut on_stack = HashSet::default();
+        let mut finished = HashSet::default();
+        'walk: while let Some((target, exiting)) = pending.pop() {
+            if !self.session.scope_step() {
+                completion = completion.combine(&stopped_alias_walk(self.cancellation, target));
+                break;
+            }
+            if exiting {
+                on_stack.remove(&target);
+                finished.insert(target);
+                continue;
+            }
+            if on_stack.contains(&target) {
+                completion = completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::UnsupportedSemantic(target),
+                ]));
+                continue;
+            }
+            if finished.contains(&target) {
+                continue;
+            }
+            match self.alias_step(target)? {
+                Some(step) => {
+                    completion = completion.combine(&step.completion);
+                    on_stack.insert(target);
+                    pending.push((target, true));
+                    for reference in step.references {
+                        if !self.session.scope_step() {
+                            completion =
+                                completion.combine(&stopped_alias_walk(self.cancellation, target));
+                            break 'walk;
+                        }
+                        let rhs = self.resolve_reference(reference, None, None)?;
+                        completion = completion.combine(&rhs.completion);
+                        for next in rhs.targets {
+                            if !self.session.scope_step() {
+                                completion = completion
+                                    .combine(&stopped_alias_walk(self.cancellation, target));
+                                break 'walk;
+                            }
+                            pending.push((next, false));
+                        }
+                    }
+                }
+                None => {
+                    targets.push(target);
+                    finished.insert(target);
+                }
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        Ok(ReferenceAnswer {
+            targets,
+            completion,
+        })
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub fn resolved_reference_count_for_test(&self) -> usize {
         self.resolved_references.get()
@@ -222,6 +505,13 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
         kind: Option<ResolutionSupertypeKind>,
         supertype_slot: Option<SemanticId>,
     ) -> Result<ReferenceAnswer> {
+        // Count this occurrence on both cold resolution and receipt replay.
+        if !self.session.scope_step() {
+            return Ok(ReferenceAnswer {
+                targets: Vec::new(),
+                completion: stopped_alias_walk(self.cancellation, reference),
+            });
+        }
         // Kind and slot are selected parent metadata, not a caller mode.
         // Synthetic implicit parents have their own reference sites; alias
         // RHSs have no parent kind or supertype slot. Neither can vary for
@@ -292,6 +582,14 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
                 })
             });
             self.references.insert(reference, (answer, receipt));
+        }
+        let answer = &self.references[&reference].0;
+        let copies = answer.as_ref().map_or(0, |answer| answer.targets.len());
+        if !self.session.scope_steps(copies) {
+            return Ok(ReferenceAnswer {
+                targets: Vec::new(),
+                completion: stopped_alias_walk(self.cancellation, reference),
+            });
         }
         self.references[&reference].0.clone()
     }
@@ -410,6 +708,7 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
                 break;
             }
             let binding = self.resolve_reference(reference, kind, Some(supertype_slot))?;
+            let binding = self.expand_alias_parents(binding)?;
             parents.push(JvmDirectSupertype {
                 kind,
                 parent_ordinal,
@@ -426,6 +725,24 @@ impl<R: JvmHierarchyReadReceipts> JvmHierarchyQuery<'_, '_, R> {
 }
 
 impl SelectedResolutionOperation<'_, '_> {
+    /// Only a selected provider reference with an actual external coordinate
+    /// certifies a canonical unread parent. Nominal fallbacks are excluded.
+    pub fn jvm_hierarchy_reference_owner(
+        &self,
+        reference: SemanticId,
+    ) -> Option<crate::analyzer::resolution::ExternalOwnerIdentity> {
+        let identity = self
+            .ready
+            .context_identities
+            .jvm_external_provider_type_identity_for_reference(
+                crate::analyzer::resolution::ExternalOwnerLanguage::Jvm,
+                reference,
+            )?;
+        self.ready
+            .context_identities
+            .external_owner_identity(identity)
+    }
+
     /// Open once around the entire hierarchy or member-family walk. Each call
     /// on the borrowed query reuses the operation and its demand provider.
     pub fn with_jvm_hierarchy_query<T>(
@@ -510,6 +827,8 @@ impl SelectedResolutionOperation<'_, '_> {
                     cancellation: context.cancellation,
                     receipts,
                     references: HashMap::default(),
+                    alias_steps: HashMap::default(),
+                    session: context.session,
                     #[cfg(any(test, feature = "test-support"))]
                     resolved_references: std::cell::Cell::new(0),
                     intrinsic_parent: &intrinsic_parent,

@@ -570,12 +570,16 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.extend([
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(0),
                     kind: SemanticValueKind::Temporary,
                     source,
                     evidence,
                 },
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(1),
                     kind: SemanticValueKind::Temporary,
                     source,
@@ -700,12 +704,16 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.extend([
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(0),
                     kind: SemanticValueKind::Temporary,
                     source,
                     evidence,
                 },
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(1),
                     kind: SemanticValueKind::Local,
                     source,
@@ -751,12 +759,16 @@ pub mod tests {
         });
         parts.values.extend([
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::Temporary,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(1),
                 kind: SemanticValueKind::Local,
                 source,
@@ -1014,12 +1026,16 @@ pub mod tests {
         });
         outer.values.extend([
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::Callable,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(1),
                 kind: SemanticValueKind::Local,
                 source,
@@ -1229,18 +1245,24 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.extend([
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(0),
                     kind: SemanticValueKind::Local,
                     source,
                     evidence,
                 },
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(1),
                     kind: SemanticValueKind::Constant,
                     source,
                     evidence,
                 },
                 SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(2),
                     kind: SemanticValueKind::Temporary,
                     source,
@@ -1378,6 +1400,8 @@ pub mod tests {
             let source = SourceMappingId::new(0);
             let evidence = EvidenceId::new(0);
             parts.values.push(SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::Callable,
                 source,
@@ -1436,6 +1460,8 @@ pub mod tests {
         let key = key();
         let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);
         outer.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Callable,
             source: SourceMappingId::new(0),
@@ -1572,6 +1598,8 @@ pub mod tests {
         let mut child = minimal_procedure(&key, ProcedureId::new(1), "lambda", 3);
         child.lexical_parent = Some(ProcedureId::new(0));
         parts.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Callable,
             source: SourceMappingId::new(0),
@@ -1634,6 +1662,8 @@ pub mod tests {
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             if matches!(subject, SemanticGapSubject::Value(_)) {
                 parts.values.push(SemanticValue {
+                    static_type_origin: None,
+                    static_type_class: Default::default(),
                     id: ValueId::new(0),
                     kind: SemanticValueKind::Temporary,
                     source: SourceMappingId::new(0),
@@ -1762,6 +1792,8 @@ pub mod tests {
             Some((source_locator.path(), source_locator.anchor()))
         );
         parts.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Temporary,
             source,
@@ -1824,6 +1856,8 @@ pub mod tests {
         let source = SourceMappingId::new(0);
         let evidence = EvidenceId::new(0);
         parts.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Callable,
             source,
@@ -1904,6 +1938,8 @@ pub mod tests {
         ]);
         let mut invalid_keyword = parts.clone();
         invalid_keyword.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(1),
             kind: SemanticValueKind::Local,
             source,
@@ -1955,6 +1991,8 @@ pub mod tests {
 
         let mut singular_result = valid_detached.clone();
         singular_result.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(1),
             kind: SemanticValueKind::Temporary,
             source,
@@ -1965,12 +2003,16 @@ pub mod tests {
         let mut indexed_results = valid_detached.clone();
         indexed_results.values.extend([
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(1),
                 kind: SemanticValueKind::Temporary,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(2),
                 kind: SemanticValueKind::Temporary,
                 source,
@@ -1981,6 +2023,8 @@ pub mod tests {
 
         let mut thrown = valid_detached.clone();
         thrown.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(1),
             kind: SemanticValueKind::Exception,
             source,
@@ -2219,13 +2263,25 @@ pub mod tests {
             "partial local evidence must not prove receiver absence"
         );
 
-        let artifact = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
+        // Persisted rows are produced from Parts, while lazy query indexes
+        // belong only to the validated artifact (#10742).
+        let persisted_parts = format!("{parts:#?}");
+        let artifact = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts.clone()])
             .expect("matched call continuations are valid");
+        let materialization = artifact.materialization_id();
+        let reserved_bytes =
+            crate::analyzer::semantic::service::semantic_artifact_retained_bytes(&artifact);
 
         assert_eq!(artifact.procedures()[0].call_sites().len(), 1);
         assert_eq!(
             artifact.procedures()[0].proven_caller_receiver_binding(CallSiteId::new(0)),
             Some(CallerReceiverBinding::Absent),
+        );
+        assert_eq!(artifact.materialization_id(), materialization);
+        assert_eq!(format!("{parts:#?}"), persisted_parts);
+        assert_eq!(
+            crate::analyzer::semantic::service::semantic_artifact_retained_bytes(&artifact),
+            reserved_bytes
         );
     }
 
@@ -2237,6 +2293,8 @@ pub mod tests {
         let source = SourceMappingId::new(0);
         let evidence = EvidenceId::new(0);
         parts.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Callable,
             source,
@@ -2484,6 +2542,8 @@ pub mod tests {
     #[cfg(test)]
     fn parameter_value(id: u32, ordinal: u32, multiplicity: FormalMultiplicity) -> SemanticValue {
         SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(id),
             kind: SemanticValueKind::Parameter {
                 ordinal,
@@ -2499,6 +2559,8 @@ pub mod tests {
     #[cfg(test)]
     fn default_argument_value(id: u32, ordinal: u32) -> SemanticValue {
         SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(id),
             kind: SemanticValueKind::DefaultArgument { ordinal },
             source: SourceMappingId::new(0),
@@ -2714,18 +2776,24 @@ pub mod tests {
         let evidence = EvidenceId::new(0);
         parts.values.extend([
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::Local,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(1),
                 kind: SemanticValueKind::Local,
                 source,
                 evidence,
             },
             SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(2),
                 kind: SemanticValueKind::Temporary,
                 source,
@@ -2862,6 +2930,8 @@ pub mod tests {
             let key = key();
             let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
             parts.values.push(SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id: ValueId::new(0),
                 kind: SemanticValueKind::Temporary,
                 source: SourceMappingId::new(0),
@@ -2928,6 +2998,8 @@ pub mod tests {
         let evidence = EvidenceId::new(0);
         for id in [ValueId::new(0), ValueId::new(1)] {
             parts.values.push(SemanticValue {
+                static_type_origin: None,
+                static_type_class: Default::default(),
                 id,
                 kind: SemanticValueKind::Temporary,
                 source,
@@ -3202,6 +3274,8 @@ pub mod tests {
         let omitted = procedure_locator(&key, "omitted", 7);
         let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
         parts.values.push(SemanticValue {
+            static_type_origin: None,
+            static_type_class: Default::default(),
             id: ValueId::new(0),
             kind: SemanticValueKind::Callable,
             source: SourceMappingId::new(0),

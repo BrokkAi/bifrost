@@ -50,6 +50,7 @@ impl TypestatePolicyEvaluator for SiblingTypestateAdapter {
         _policy: &LoadedPolicy,
         _spec: &ResolvedTypestatePolicySpec,
         _context: &PolicyEvaluationContext<'_>,
+        _subject_scope: brokk_bifrost_rql::structural::search::CodeQueryExecutionScope<'_>,
         _budget: &PolicyBudget,
     ) -> Result<TypestateCompilationHashes, TypestateCompilationFailure> {
         Ok(TypestateCompilationHashes::new(
@@ -72,6 +73,7 @@ impl TypestatePolicyEvaluator for SiblingTypestateAdapter {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
+            subjects: None,
         }
     }
 }

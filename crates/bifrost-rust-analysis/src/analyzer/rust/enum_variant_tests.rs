@@ -59,8 +59,21 @@ fn bind_fields(listener: TcpListener, mode: Mode) {
     // this query's input and may be absent from the canonical unit map.
     properties.remove(&io_owner);
     properties.remove(&ready_owner);
-    rust.declaration_source_properties
-        .insert((generation, oid, file), Arc::new(properties));
+    let key = (generation, oid, file);
+    let properties = Arc::new(properties);
+    let bytes = super::weight_declaration_source_properties(&key, &properties) as usize;
+    let properties = Arc::try_unwrap(properties).expect("test properties have no other holder");
+    let properties = Arc::new(
+        brokk_bifrost_core::retention_budget::Accounted::charged_with_bytes(
+            &rust._retention_budget,
+            properties,
+            bytes,
+        ),
+    );
+    drop(rust.declaration_source_properties.insert(
+        key,
+        brokk_bifrost_core::retention_budget::SharedAllocation::new(properties),
+    ));
 
     assert!(!rust_declaration_is_enum_variant(&rust, &io).expect("field property is available"));
     assert!(

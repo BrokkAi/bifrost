@@ -22,8 +22,8 @@ use semver::Version;
 use serde::Deserialize;
 
 use crate::analyzer::semantic_model::{
-    CatalogCoordinate, CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
-    PendingDependencyPackAcquisition, RegisteredWorkspaceSemanticModel,
+    ActivationInputs, CatalogCoordinate, CatalogError, CatalogOpenMode, CatalogOptions,
+    DependencyPackLimits, PendingDependencyPackAcquisition, RegisteredWorkspaceSemanticModel,
     SEMANTIC_PACK_CACHE_ROOT_ENV, SemanticModelActivationControl, SemanticModelActivationEvidence,
     SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
     SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticPackCatalog,
@@ -52,8 +52,135 @@ pub const MAX_WORKSPACE_PACKS_CATALOG_PATH_BYTES: usize = 1_024;
 const WORKSPACE_PACKS_SCHEMA_VERSION: u32 = 1;
 const MAX_JSON_ERROR_BYTES: usize = 512;
 
-/// Facade-owned registration hook for reviewed shipped semantic packs.
-pub type SemanticModelCatalogBootstrap = fn(&SemanticPackCatalog) -> Result<(), String>;
+/// Release entries a workspace activation can reach (#6397 Part B).
+/// Workspace-local and dependency-generated objects are outside this set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseCoverage {
+    WholeRelease,
+    Covered(CoveredRelease),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CoveredRelease {
+    pub languages: BTreeSet<String>,
+    pub pairs: BTreeSet<(String, String)>,
+    pub productions: BTreeSet<String>,
+}
+
+impl ReleaseCoverage {
+    pub fn covers_entry(&self, language: &str, ecosystem: &str) -> bool {
+        match self {
+            Self::WholeRelease => true,
+            Self::Covered(covered) => {
+                covered.languages.contains(language)
+                    || covered
+                        .pairs
+                        .contains(&(language.to_owned(), ecosystem.to_owned()))
+            }
+        }
+    }
+
+    pub fn covers_production(&self, digest: &str, language: &str, ecosystem: &str) -> bool {
+        match self {
+            Self::WholeRelease => true,
+            Self::Covered(covered) => {
+                covered.productions.contains(digest) || self.covers_entry(language, ecosystem)
+            }
+        }
+    }
+
+    pub fn identity(&self) -> [u8; 32] {
+        let mut hash = brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-6397-release-coverage:v1",
+        );
+        match self {
+            Self::WholeRelease => hash.field("kind", b"whole"),
+            Self::Covered(covered) => {
+                hash.field("kind", b"covered");
+                let languages = covered.languages.iter().collect::<Vec<_>>();
+                hash.sequence("languages", &languages, |hash, value| {
+                    hash.value(value.as_bytes())
+                });
+                let pairs = covered.pairs.iter().collect::<Vec<_>>();
+                hash.sequence("pairs", &pairs, |hash, (language, ecosystem)| {
+                    hash.field("language", language.as_bytes());
+                    hash.field("ecosystem", ecosystem.as_bytes());
+                });
+                let productions = covered.productions.iter().collect::<Vec<_>>();
+                hash.sequence("productions", &productions, |hash, value| {
+                    hash.value(value.as_bytes())
+                });
+            }
+        }
+        hash.finish()
+    }
+
+    /// Whether every release entry `other` reaches is reached here as well.
+    pub fn contains(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::WholeRelease, _) => true,
+            (Self::Covered(_), Self::WholeRelease) => false,
+            (Self::Covered(outer), Self::Covered(inner)) => {
+                inner.languages.is_subset(&outer.languages)
+                    && inner
+                        .pairs
+                        .iter()
+                        .all(|(language, ecosystem)| self.covers_entry(language, ecosystem))
+                    && inner.productions.is_subset(&outer.productions)
+            }
+        }
+    }
+
+    pub fn union(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Covered(left), Self::Covered(right)) => Self::Covered(CoveredRelease {
+                languages: left.languages.union(&right.languages).cloned().collect(),
+                pairs: left.pairs.union(&right.pairs).cloned().collect(),
+                productions: left
+                    .productions
+                    .union(&right.productions)
+                    .cloned()
+                    .collect(),
+            }),
+            _ => Self::WholeRelease,
+        }
+    }
+}
+
+/// Project the same kept ecosystems used by activation into release membership.
+pub fn release_coverage(
+    languages: &BTreeSet<Language>,
+    packs_config: Option<&WorkspacePacksConfig>,
+    evidence: &[SemanticModelActivationEvidence],
+) -> ReleaseCoverage {
+    let covered_languages = kept_pack_ecosystems(languages, packs_config)
+        .into_iter()
+        .flat_map(|ecosystem| {
+            ecosystem
+                .languages()
+                .iter()
+                .map(|language| language.config_label().to_owned())
+        })
+        .collect::<BTreeSet<_>>();
+    let pairs = evidence
+        .iter()
+        .filter(|item| !covered_languages.contains(&item.language))
+        .map(|item| (item.language.clone(), item.ecosystem.clone()))
+        .collect();
+    ReleaseCoverage::Covered(CoveredRelease {
+        languages: covered_languages,
+        pairs,
+        productions: BTreeSet::new(),
+    })
+}
+
+/// Facade-owned registration hook for reviewed shipped semantic packs. It
+/// returns the leases that keep its packs until activation returns.
+pub type SemanticModelCatalogBootstrap =
+    fn(
+        &SemanticPackCatalog,
+        &ReleaseCoverage,
+    ) -> Result<Vec<crate::analyzer::semantic_model::CatalogLeaseToken>, String>;
 
 static SEMANTIC_MODEL_CATALOG_BOOTSTRAP: OnceLock<SemanticModelCatalogBootstrap> = OnceLock::new();
 
@@ -66,13 +193,41 @@ pub fn install_semantic_model_catalog_bootstrap(
         .map_err(|_| "semantic-model catalog bootstrap is already configured")
 }
 
-/// Register reviewed shipped packs when the facade installed a provider.
-pub fn bootstrap_semantic_model_catalog(catalog: &SemanticPackCatalog) -> Result<bool, String> {
+/// Register reviewed shipped packs when the facade installed a provider;
+/// `None` means no provider is installed.
+pub fn bootstrap_semantic_model_catalog(
+    catalog: &SemanticPackCatalog,
+    coverage: &ReleaseCoverage,
+) -> Result<Option<Vec<crate::analyzer::semantic_model::CatalogLeaseToken>>, String> {
     let Some(bootstrap) = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied() else {
-        return Ok(false);
+        return Ok(None);
     };
-    bootstrap(catalog)?;
-    Ok(true)
+    bootstrap(catalog, coverage).map(Some)
+}
+
+/// Facade-owned probe that names the shipped-pack acquisition the bootstrap
+/// would wait for, or `None` once registration can run without the network.
+pub type ShippedSemanticPackPendingProbe = fn() -> Option<String>;
+
+static SHIPPED_SEMANTIC_PACK_PENDING_PROBE: OnceLock<ShippedSemanticPackPendingProbe> =
+    OnceLock::new();
+
+/// Configure the shipped-pack pending probe once for this process.
+pub fn install_shipped_semantic_pack_pending_probe(
+    probe: ShippedSemanticPackPendingProbe,
+) -> Result<(), &'static str> {
+    SHIPPED_SEMANTIC_PACK_PENDING_PROBE
+        .set(probe)
+        .map_err(|_| "shipped semantic-pack pending probe is already configured")
+}
+
+/// Why [`bootstrap_semantic_model_catalog`] would block on a host acquisition
+/// that is still running, for stages that must not wait on the network
+/// (#11030). `None` means registration is local work.
+pub fn shipped_semantic_packs_pending() -> Option<String> {
+    SHIPPED_SEMANTIC_PACK_PENDING_PROBE
+        .get()
+        .and_then(|probe| probe())
 }
 
 /// Intrinsic language evidence selects shipped language/runtime packs without
@@ -160,7 +315,8 @@ const MAX_NODE_RUNTIME_DECLARATION_BYTES: u64 = 1024 * 1024;
 /// other revision names no reviewed artifact and mints no evidence.
 const REVIEWED_NODE_RUNTIME_VERSION: &str = "22.11.0";
 /// SHA-256 of the reviewed Node distribution archive the shipped packs pin
-/// (`node-v22.11.0.tar.gz`, per `semantic-packs/node/runtime-values/README.md`).
+/// (`node-v22.11.0.tar.gz`, per the Node runtime-values pack's README in
+/// `BrokkAi/bifrost-packs`).
 const REVIEWED_NODE_RUNTIME_ARTIFACT_DIGEST: &str =
     "24e5130fa7bc1eaab218a0c9cb05e03168fa381bb9e3babddc6a11f655799222";
 /// SHA-256 of the RFC 8785 canonical JSON of the reviewed runtime profile the
@@ -796,8 +952,36 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     additional_evidence: &[SemanticModelActivationEvidence],
     cancellation: &crate::CancellationToken,
 ) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
-    let Some(prelude) =
-        workspace_activation_prelude(workspace, catalog, &sources, additional_evidence)?
+    activate_selected_workspace_semantic_sources_in_catalog(
+        workspace,
+        analyzer_config,
+        catalog,
+        sources,
+        additional_evidence,
+        cancellation,
+        &DependencyPackEcosystem::ALL,
+    )
+}
+
+/// Activate only the configured dependency ecosystems named by the host.
+/// The selection is data, so an empty selection performs no dependency discovery.
+pub fn activate_selected_workspace_semantic_sources_in_catalog(
+    workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    catalog: &SemanticPackCatalog,
+    sources: WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+    cancellation: &crate::CancellationToken,
+    selected_ecosystems: &[DependencyPackEcosystem],
+) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
+    let Some(prelude) = workspace_activation_prelude(
+        workspace,
+        catalog,
+        &sources,
+        additional_evidence,
+        &ReleaseCoverage::WholeRelease,
+        selected_ecosystems,
+    )?
     else {
         return Ok(None);
     };
@@ -806,27 +990,72 @@ pub fn activate_workspace_semantic_sources_in_catalog(
         workspace_models,
         evidence,
         controls,
+        leases,
     } = prelude;
-    let activation = semantic_model_activation_request(evidence, controls);
+    let activation = merge_carried_activation_request(
+        workspace,
+        semantic_model_activation_request(evidence, controls).into(),
+        selected_ecosystems,
+    );
     // An empty ecosystem list still resolves: the dependency loop simply has
     // nothing to discover, and the request's workspace evidence is what
     // selects. That keeps one code path for all routes.
-    let outcome = workspace.activate_dependency_packs(
+    let outcome = workspace.activate_dependency_packs_with_inputs(
         &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
         &ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
             persistence: None,
-            activation: &activation,
+            activation: &activation.request,
             limits: DependencyPackLimits::default(),
             cancellation,
         },
+        Some(&activation),
     );
+    catalog
+        .release_leases(&leases)
+        .map_err(WorkspaceActivationError::Catalog)?;
     Ok(Some(WorkspacePacksActivation {
         ecosystems,
         workspace_models,
         outcome,
     }))
+}
+
+/// Keep verified siblings in a scoped activation while taking global settings
+/// from the current configuration. The update already removed stale entries.
+fn merge_carried_activation_request(
+    workspace: &WorkspaceAnalyzer,
+    mut fresh: ActivationInputs,
+    selected: &[DependencyPackEcosystem],
+) -> ActivationInputs {
+    if selected.len() == DependencyPackEcosystem::ALL.len() {
+        return fresh;
+    }
+    if let Some(mut carried) = workspace.carried_activation_inputs() {
+        carried.request.evidence.retain(|entry| {
+            !selected
+                .iter()
+                .any(|ecosystem| entry.ecosystem == ecosystem.label())
+        });
+        carried
+            .request
+            .approximate_standard_libraries
+            .retain(|entry| {
+                !selected
+                    .iter()
+                    .any(|ecosystem| entry.ecosystem == ecosystem.label())
+            });
+        fresh.request.evidence.extend(carried.request.evidence);
+        fresh
+            .request
+            .approximate_standard_libraries
+            .extend(carried.request.approximate_standard_libraries);
+        if !selected.contains(&DependencyPackEcosystem::Cargo) {
+            fresh.rust_cargo_graph = carried.rust_cargo_graph;
+        }
+    }
+    fresh
 }
 
 /// The outcome of the installed-pack stage of one workspace activation
@@ -854,8 +1083,34 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
     additional_evidence: &[SemanticModelActivationEvidence],
     cancellation: &crate::CancellationToken,
 ) -> Result<Option<InstalledWorkspacePacksActivation>, WorkspaceActivationError> {
-    let Some(prelude) =
-        workspace_activation_prelude(workspace, catalog, &sources, additional_evidence)?
+    activate_selected_installed_workspace_semantic_sources_in_catalog(
+        workspace,
+        analyzer_config,
+        catalog,
+        sources,
+        additional_evidence,
+        cancellation,
+        &DependencyPackEcosystem::ALL,
+    )
+}
+
+pub fn activate_selected_installed_workspace_semantic_sources_in_catalog(
+    workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    catalog: &SemanticPackCatalog,
+    sources: WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+    cancellation: &crate::CancellationToken,
+    selected_ecosystems: &[DependencyPackEcosystem],
+) -> Result<Option<InstalledWorkspacePacksActivation>, WorkspaceActivationError> {
+    let Some(prelude) = workspace_activation_prelude(
+        workspace,
+        catalog,
+        &sources,
+        additional_evidence,
+        &ReleaseCoverage::WholeRelease,
+        selected_ecosystems,
+    )?
     else {
         return Ok(None);
     };
@@ -864,19 +1119,28 @@ pub fn activate_installed_workspace_semantic_sources_in_catalog(
         workspace_models,
         evidence,
         controls,
+        leases,
     } = prelude;
-    let activation = semantic_model_activation_request(evidence, controls);
-    let installed = workspace.activate_installed_dependency_packs(
+    let activation = merge_carried_activation_request(
+        workspace,
+        semantic_model_activation_request(evidence, controls).into(),
+        selected_ecosystems,
+    );
+    let installed = workspace.activate_installed_dependency_packs_with_inputs(
         &activation_config_with_source_toolchains(workspace, analyzer_config, sources.config),
         &ecosystems,
         DependencyPackWorkspaceContext {
             catalog,
             persistence: None,
-            activation: &activation,
+            activation: &activation.request,
             limits: DependencyPackLimits::default(),
             cancellation,
         },
+        Some(&activation),
     );
+    catalog
+        .release_leases(&leases)
+        .map_err(WorkspaceActivationError::Catalog)?;
     Ok(Some(InstalledWorkspacePacksActivation {
         activation: WorkspacePacksActivation {
             ecosystems,
@@ -896,6 +1160,7 @@ struct WorkspaceActivationPrelude {
     workspace_models: Vec<RegisteredWorkspaceSemanticModel>,
     evidence: Vec<SemanticModelActivationEvidence>,
     controls: Vec<SemanticModelActivationControl>,
+    leases: Vec<crate::analyzer::semantic_model::CatalogLeaseToken>,
 }
 
 fn semantic_model_activation_request(
@@ -917,8 +1182,11 @@ fn workspace_activation_prelude(
     catalog: &SemanticPackCatalog,
     sources: &WorkspaceActivationSources<'_>,
     additional_evidence: &[SemanticModelActivationEvidence],
+    coverage: &ReleaseCoverage,
+    selected_ecosystems: &[DependencyPackEcosystem],
 ) -> Result<Option<WorkspaceActivationPrelude>, WorkspaceActivationError> {
-    let ecosystems = workspace_pack_ecosystems(workspace, sources.config);
+    let mut ecosystems = workspace_pack_ecosystems(workspace, sources.config);
+    ecosystems.retain(|ecosystem| selected_ecosystems.contains(ecosystem));
     // Does this workspace opt into the reviewed route at all? Presence of the
     // directory is the whole opt-in, and asking costs one stat. Discovery
     // asks again and properly, rejecting a symlink or a non-directory; an
@@ -937,13 +1205,19 @@ fn workspace_activation_prelude(
     {
         return Ok(None);
     }
-    let shipped_models = {
+    let (shipped_models, leases) = {
         let _scope = crate::profiling::scope("semantic_pack.bootstrap_shipped_models");
         if sources.intrinsic_shipped_models {
-            bootstrap_semantic_model_catalog(catalog)
+            // The leases stay held until activation returns; the callers of
+            // this prelude release them on success and on error.
+            match bootstrap_semantic_model_catalog(catalog, coverage)
                 .map_err(WorkspaceActivationError::ShippedModels)?
+            {
+                Some(leases) => (true, leases),
+                None => (false, Vec::new()),
+            }
         } else {
-            false
+            (false, Vec::new())
         }
     };
     // The reviewed workspace-local models join the same catalog handle and the
@@ -956,15 +1230,26 @@ fn workspace_activation_prelude(
             model_root,
             catalog,
             WorkspaceSemanticModelOptions::default(),
-        )
-        .map_err(WorkspaceActivationError::WorkspaceModels)?,
-        None => WorkspaceSemanticModelRegistration::default(),
+        ),
+        None => Ok(WorkspaceSemanticModelRegistration::default()),
+    };
+    let registration = match registration {
+        Ok(registration) => registration,
+        Err(error) => {
+            catalog
+                .release_leases(&leases)
+                .map_err(WorkspaceActivationError::Catalog)?;
+            return Err(WorkspaceActivationError::WorkspaceModels(error));
+        }
     };
     if ecosystems.is_empty()
         && registration.models.is_empty()
         && additional_evidence.is_empty()
         && !shipped_models
     {
+        catalog
+            .release_leases(&leases)
+            .map_err(WorkspaceActivationError::Catalog)?;
         return Ok(None);
     }
     // A pack declaring `safety.review_required` needs an explicit compatible
@@ -1000,6 +1285,7 @@ fn workspace_activation_prelude(
         workspace_models: registration.models,
         evidence,
         controls,
+        leases,
     }))
 }
 
@@ -1011,7 +1297,13 @@ pub fn workspace_pack_ecosystems(
     workspace: &WorkspaceAnalyzer,
     config: Option<&WorkspacePacksConfig>,
 ) -> Vec<DependencyPackEcosystem> {
-    let languages = workspace.analyzer().languages();
+    kept_pack_ecosystems(&workspace.analyzer().languages(), config)
+}
+
+fn kept_pack_ecosystems(
+    languages: &BTreeSet<Language>,
+    config: Option<&WorkspacePacksConfig>,
+) -> Vec<DependencyPackEcosystem> {
     config
         .map(|config| config.ecosystems().to_vec())
         .unwrap_or_else(|| DependencyPackEcosystem::ALL.to_vec())
@@ -1163,6 +1455,8 @@ pub(crate) mod tests {
         pub(crate) language: Language,
         pub(crate) index:
             Option<std::sync::Arc<dyn crate::analyzer::read_verification::WorkspaceFactIndex>>,
+        pub(crate) definitions: Vec<crate::CodeUnit>,
+        pub(crate) complete_symbol_index: bool,
     }
     impl crate::analyzer::CodeUnitIndex for CatalogWorkspace {
         fn project(&self) -> &dyn crate::Project {
@@ -1172,7 +1466,26 @@ pub(crate) mod tests {
             BTreeSet::from([self.language])
         }
         fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::CodeUnit> + '_> {
-            Box::new(std::iter::empty())
+            Box::new(self.definitions.iter().cloned())
+        }
+        fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = crate::CodeUnit> + '_> {
+            let fq_name = fq_name.to_owned();
+            Box::new(
+                self.definitions
+                    .iter()
+                    .filter(move |unit| unit.fq_name() == fq_name)
+                    .cloned(),
+            )
+        }
+        fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<crate::CodeUnit> {
+            self.definitions
+                .iter()
+                .filter(|unit| unit.fq_name() == identifier)
+                .cloned()
+                .collect()
+        }
+        fn has_complete_symbol_lookup_index(&self) -> bool {
+            self.complete_symbol_index
         }
         fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<crate::CodeUnit> {
             unimplemented!()
@@ -1208,7 +1521,11 @@ pub(crate) mod tests {
         ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
             self.index.iter().map(|index| index.as_ref()).collect()
         }
-        fn update(&self, _: &BTreeSet<crate::ProjectFile>) -> Self {
+        fn update_with_listing(
+            &self,
+            _: &BTreeSet<crate::ProjectFile>,
+            _listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+        ) -> Self {
             unimplemented!()
         }
         fn update_all(&self) -> Self {
@@ -1287,6 +1604,7 @@ pub(crate) mod tests {
         fn update(
             &self,
             _: &BTreeSet<crate::ProjectFile>,
+            _: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
         ) -> Box<dyn crate::analyzer::multi_analyzer::LanguageAnalyzer> {
             unimplemented!()
         }
@@ -1320,6 +1638,8 @@ pub(crate) mod tests {
                         project: project.clone(),
                         language,
                         index: None,
+                        definitions: Vec::new(),
+                        complete_symbol_index: false,
                     }),
                 )
             })
@@ -1386,10 +1706,14 @@ pub(crate) mod tests {
     }
 
     // Synthetic engine-only catalog fixtures, not product pack content.
-    fn bootstrap_intrinsic_fixtures(catalog: &SemanticPackCatalog) -> Result<(), String> {
+    fn bootstrap_intrinsic_fixtures(
+        catalog: &SemanticPackCatalog,
+        _coverage: &ReleaseCoverage,
+    ) -> Result<Vec<crate::analyzer::semantic_model::CatalogLeaseToken>, String> {
         use crate::analyzer::semantic_model::dependency::test_support::{
             compiled_pack, install_fixture_pack,
         };
+        let mut leases = Vec::new();
         for (language, ecosystem) in [("rust", "cargo"), ("python", "pypi")] {
             let source = serde_json::json!({
                 "schema_version": 2,
@@ -1409,17 +1733,29 @@ pub(crate) mod tests {
                     }], "members": [], "relations": []
                 }}]
             });
-            install_fixture_pack(catalog, &compiled_pack(&source.to_string()))?;
+            let pack = compiled_pack(&source.to_string());
+            install_fixture_pack(catalog, &pack)?;
+            leases.push(
+                catalog
+                    .lease(
+                        &pack.manifest.content_sha256,
+                        "intrinsic-test",
+                        std::time::Duration::from_secs(60),
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_token(pack.manifest.content_sha256.clone()),
+            );
         }
-        Ok(())
+        Ok(leases)
     }
 
     #[test]
+    #[hardwon("#6397: intrinsic leases ended before workspace activation returned")]
     fn intrinsic_catalog_selection_is_multilingual_and_document_route_is_opt_in() {
         use crate::analyzer::semantic_model::{
             SemanticModelActivationStatus, SemanticModelRuntimeOutcome,
         };
-        install_semantic_model_catalog_bootstrap(bootstrap_intrinsic_fixtures).unwrap();
+        let _ = install_semantic_model_catalog_bootstrap(bootstrap_intrinsic_fixtures);
         let config =
             parse_workspace_packs_config(r#"{"schema_version":1,"ecosystems":[]}"#).unwrap();
         for files in [
@@ -1459,6 +1795,11 @@ pub(crate) mod tests {
             )
             .unwrap()
             .unwrap();
+            let connection = rusqlite::Connection::open(catalog.root().join("catalog.db")).unwrap();
+            let held: i64 = connection
+                .query_row("SELECT count(*) FROM catalog_leases", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(held, 0, "activation must release intrinsic leases");
             let Some(SemanticModelRuntimeOutcome::Ready { active, .. }) = result.outcome.runtime
             else {
                 panic!("{result:?}");
@@ -1475,6 +1816,69 @@ pub(crate) mod tests {
                 BTreeSet::from(["test.intrinsic-python", "test.intrinsic-rust"])
             );
         }
+    }
+
+    #[test]
+    #[hardwon("#6397: intrinsic leases ended in the activation prelude")]
+    fn intrinsic_leases_span_prelude_and_release_on_error() {
+        let _ = install_semantic_model_catalog_bootstrap(bootstrap_intrinsic_fixtures);
+        let config =
+            parse_workspace_packs_config(r#"{"schema_version":1,"ecosystems":[]}"#).unwrap();
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("app.rs"), "fn main() {}").unwrap();
+        let workspace = workspace_at(temp.path(), AnalyzerConfig::default());
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let sources = WorkspaceActivationSources {
+            catalog_root: temp.path(),
+            workspace_model_root: None,
+            config: Some(&config),
+            intrinsic_shipped_models: true,
+        };
+        let prelude = workspace_activation_prelude(
+            &workspace,
+            &catalog,
+            &sources,
+            &[],
+            &ReleaseCoverage::WholeRelease,
+            &DependencyPackEcosystem::ALL,
+        )
+        .unwrap()
+        .unwrap();
+        let connection = rusqlite::Connection::open(catalog.root().join("catalog.db")).unwrap();
+        let count = || -> i64 {
+            connection
+                .query_row("SELECT count(*) FROM catalog_leases", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(), 2, "prelude must retain intrinsic leases");
+        catalog.release_leases(&prelude.leases).unwrap();
+        assert_eq!(count(), 0);
+
+        fs::create_dir_all(temp.path().join(".bifrost")).unwrap();
+        fs::write(
+            temp.path().join(WORKSPACE_SEMANTIC_MODEL_DIRECTORY),
+            "not a directory",
+        )
+        .unwrap();
+        let sources = WorkspaceActivationSources {
+            workspace_model_root: Some(temp.path()),
+            ..sources
+        };
+        let error = workspace_activation_prelude(
+            &workspace,
+            &catalog,
+            &sources,
+            &[],
+            &ReleaseCoverage::WholeRelease,
+            &DependencyPackEcosystem::ALL,
+        )
+        .err()
+        .expect("invalid model root must fail");
+        assert!(
+            matches!(error, WorkspaceActivationError::WorkspaceModels(_)),
+            "{error}"
+        );
+        assert_eq!(count(), 0, "failed prelude must release intrinsic leases");
     }
 
     #[test]
@@ -1753,5 +2157,41 @@ mod bootstrap_capture_tests {
             );
         });
         assert!(reads.keys().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod release_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn release_coverage_identity_and_union() {
+        let mut left = CoveredRelease::default();
+        left.languages
+            .extend(["java".to_owned(), "rust".to_owned()]);
+        left.pairs.extend([
+            ("python".to_owned(), "pypi".to_owned()),
+            ("go".to_owned(), "go".to_owned()),
+        ]);
+        let mut reverse = CoveredRelease::default();
+        reverse
+            .languages
+            .extend(["rust".to_owned(), "java".to_owned()]);
+        reverse.pairs.extend([
+            ("go".to_owned(), "go".to_owned()),
+            ("python".to_owned(), "pypi".to_owned()),
+        ]);
+        assert_eq!(
+            ReleaseCoverage::Covered(left.clone()).identity(),
+            ReleaseCoverage::Covered(reverse).identity()
+        );
+        let original = ReleaseCoverage::Covered(left.clone()).identity();
+        left.productions.insert("a".to_owned());
+        assert_ne!(original, ReleaseCoverage::Covered(left.clone()).identity());
+        assert!(ReleaseCoverage::Covered(left.clone()).covers_production("a", "other", "other"));
+        assert_eq!(
+            ReleaseCoverage::Covered(left).union(&ReleaseCoverage::WholeRelease),
+            ReleaseCoverage::WholeRelease
+        );
     }
 }

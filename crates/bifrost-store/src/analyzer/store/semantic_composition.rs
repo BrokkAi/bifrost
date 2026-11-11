@@ -1,9 +1,114 @@
 //! Immutable composition values retained by the shared store cache.
 
+use super::active_models::ActiveSemanticModelShard;
 use super::cache_budget::{RetainedBytes, RetainedHeap};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_semantic::analyzer::semantic_model::overlay::*;
 use brokk_bifrost_semantic::analyzer::semantic_model::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceRecordIdentity {
+    pack_digest: String,
+    record_kind: String,
+    record_id: String,
+}
+
+impl SourceRecordIdentity {
+    pub fn new(shard: &ActiveSemanticModelShard, record_kind: &str, record_id: &str) -> Self {
+        Self {
+            pack_digest: shard.manifest.semantic_sha256.clone(),
+            record_kind: record_kind.to_owned(),
+            record_id: record_id.to_owned(),
+        }
+    }
+}
+
+/// Authored locations for Source locators, partitioned by row owner. The
+/// activation part is charged with overlay inputs; request anchors use the
+/// shared store cache budget.
+#[derive(Debug, Default, Clone)]
+pub struct SourceAnchors {
+    anchors: HashMap<SourceRecordIdentity, SemanticModelAuthoredAnchor>,
+}
+
+impl SourceAnchors {
+    pub fn retained_bytes_lower_bound(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.anchors.capacity().saturating_mul(std::mem::size_of::<(
+                SourceRecordIdentity,
+                SemanticModelAuthoredAnchor,
+            )>()))
+            .saturating_add(self.anchors.iter().fold(0usize, |bytes, (key, anchor)| {
+                bytes
+                    .saturating_add(key.pack_digest.capacity())
+                    .saturating_add(key.record_kind.capacity())
+                    .saturating_add(key.record_id.capacity())
+                    .saturating_add(anchor.path.capacity())
+                    .saturating_add(anchor.symbol.capacity())
+            }))
+    }
+
+    pub fn digest(&self) -> String {
+        let mut entries = self.anchors.iter().collect::<Vec<_>>();
+        entries.sort_unstable_by(|(a, _), (b, _)| {
+            (&a.pack_digest, &a.record_kind, &a.record_id).cmp(&(
+                &b.pack_digest,
+                &b.record_kind,
+                &b.record_id,
+            ))
+        });
+        let mut digest = brokk_bifrost_semantic::analyzer::semantic::LengthDelimitedDigest::new(
+            b"semantic-source-anchors-v1",
+        );
+        for (key, anchor) in entries {
+            digest.push(format!("{key:?}:{anchor:?}").as_bytes());
+        }
+        digest.finish().to_string()
+    }
+
+    pub fn get(
+        &self,
+        shard: &ActiveSemanticModelShard,
+        record_kind: &str,
+        record_id: &str,
+    ) -> Option<&SemanticModelAuthoredAnchor> {
+        self.anchors
+            .get(&SourceRecordIdentity::new(shard, record_kind, record_id))
+    }
+
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.anchors
+            .keys()
+            .any(|key| other.anchors.contains_key(key))
+    }
+
+    pub fn ids_at_path(&self, path: &str) -> Vec<String> {
+        self.anchors
+            .iter()
+            .filter(|(_, anchor)| anchor.path == path)
+            .map(|(key, _)| key.record_id.clone())
+            .collect()
+    }
+
+    pub fn insert_symbol(&mut self, record_kind: &'static str, symbol: SemanticModelSymbol) {
+        if let SemanticModelLocation::Authored(anchor) = symbol.location {
+            self.anchors.insert(
+                SourceRecordIdentity {
+                    pack_digest: symbol.provenance.pack_digest,
+                    record_kind: record_kind.to_owned(),
+                    record_id: symbol.id,
+                },
+                anchor,
+            );
+        }
+    }
+}
+
+impl RetainedBytes for SourceAnchors {
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes_lower_bound()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SemanticModelCompositionDiagnostic {
@@ -54,8 +159,36 @@ pub struct ComposedGroup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SemanticOverlayBuildIdentity(pub [u8; 32]);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RequestSourceAnchorsKey {
+    pub build: SemanticOverlayBuildIdentity,
+    pub binding: super::model_catalog::ReaderBinding,
+}
+
+impl RetainedBytes for RequestSourceAnchorsKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// The search-candidate stream of one build, and of the JVM reader binding it
+/// read through when a real request owner contributed rows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SearchCandidateKey {
+    pub realm: Option<String>,
+    pub build: SemanticOverlayBuildIdentity,
+    pub jvm_binding: Option<super::model_catalog::ReaderBinding>,
+}
+
+impl RetainedBytes for SearchCandidateKey {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.realm.as_ref().map_or(0, String::capacity)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComposedGroupCacheKey {
+    pub jvm_binding: Option<super::model_catalog::ReaderBinding>,
     pub build: SemanticOverlayBuildIdentity,
     pub selection_digest: Option<[u8; 32]>,
     pub group: CompositionGroupKey,
@@ -75,8 +208,12 @@ pub enum CompositionLookup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompositionDiscoveryCacheKey {
+    pub jvm_binding: Option<super::model_catalog::ReaderBinding>,
     pub build: SemanticOverlayBuildIdentity,
     pub selection_digest: Option<[u8; 32]>,
+    /// The language family a scoped lookup read, whose discovery is a subset
+    /// of the unscoped one; None for an unscoped lookup.
+    pub realm: Option<String>,
     pub lookup: CompositionLookup,
 }
 
@@ -88,6 +225,7 @@ impl RetainedBytes for ComposedGroupCacheKey {
 impl RetainedBytes for CompositionDiscoveryCacheKey {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of_val(self)
+            + self.realm.as_ref().map_or(0, String::capacity)
             + match &self.lookup {
                 CompositionLookup::SelectedId { language, id } => {
                     language.capacity() + id.capacity()
@@ -107,11 +245,9 @@ impl RetainedBytes for CompositionDiscoveryCacheKey {
 fn group_owned_bytes(key: &CompositionGroupKey) -> usize {
     key.language.capacity() + key.identity.capacity()
 }
-impl RetainedBytes for Vec<CompositionGroupKey> {
+impl RetainedBytes for CompositionGroupKey {
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of_val(self)
-            + self.capacity() * std::mem::size_of::<CompositionGroupKey>()
-            + self.iter().map(group_owned_bytes).sum::<usize>()
+        std::mem::size_of_val(self) + group_owned_bytes(self)
     }
 }
 impl RetainedBytes for ComposedGroup {
@@ -264,6 +400,12 @@ fn charge_symbol(s: &SemanticModelSymbol, heap: &mut RetainedHeap) {
         SemanticModelLocation::Authored(a) => heap.add(a.path.capacity() + a.symbol.capacity()),
         SemanticModelLocation::Model(m) => heap.add(m.uri.capacity()),
     }
+    charge_type_refs(types, heap);
+}
+
+/// Charge the heap that type trees own below the given roots. The roots'
+/// inline size belongs to their owner and is not charged here.
+pub(crate) fn charge_type_refs(mut types: Vec<&TypeRef>, heap: &mut RetainedHeap) {
     while let Some(t) = types.pop() {
         match t {
             TypeRef::Unknown => {}
@@ -354,6 +496,7 @@ pub type SearchCandidate = (
     String,
     String,
     String,
+    String,
 );
 
 #[derive(Debug)]
@@ -389,7 +532,7 @@ pub struct SearchCandidateStream {
     pub single_contributors: Vec<Option<String>>,
     /// Some(name) is the unique, unguarded raw owner. None requires the shared
     /// ranked/guarded qualification read, without composing its group.
-    pub owner_qualifications: HashMap<String, Option<String>>,
+    pub owner_qualifications: HashMap<(String, String), Option<String>>,
     pub orphans: Vec<((String, String), Vec<String>)>,
 }
 impl RetainedBytes for SemanticOverlayBuildIdentity {
@@ -430,8 +573,8 @@ impl RetainedBytes for SearchCandidateStream {
             heap.add(digest.capacity());
         }
         heap.map(&self.owner_qualifications);
-        for (id, name) in &self.owner_qualifications {
-            heap.add(id.capacity() + name.as_ref().map_or(0, String::capacity));
+        for ((realm, id), name) in &self.owner_qualifications {
+            heap.add(realm.capacity() + id.capacity() + name.as_ref().map_or(0, String::capacity));
         }
         heap.vec(&self.orphans);
         for ((language, owner), spellings) in &self.orphans {

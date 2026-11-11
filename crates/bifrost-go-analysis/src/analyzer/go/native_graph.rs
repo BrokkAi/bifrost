@@ -88,7 +88,7 @@ impl NativeWorkspaceGraphProvider for GoNativeWorkspaceGraphProvider {
         if request_files.is_empty() {
             return None;
         }
-        if !go.graph_inventory_complete() {
+        if !go.graph_inventory_complete_with_named_refusals() {
             return Some(LanguageEdgeFailure {
                 reason: "Go canonical package identities are unavailable",
                 files: request_files,

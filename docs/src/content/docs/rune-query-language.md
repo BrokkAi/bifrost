@@ -284,7 +284,55 @@ accepts finite `:depth N`, but not `:transitive`. `callers :proof proven :comple
 proven-subset` is the one explicit non-exhaustive contract: it returns only resolved proven caller
 edges and labels the result as a proven subset, never as all callers. It remains diagnostic-visible
 when a caller cannot be rendered as an indexed declaration, and is rejected without `:proof proven`
-or on `callees`. `call-input` requires exactly one receiver, parameter-index, or parameter-name
+or on `callees`. A bounded `callers` or `callees` result also reports
+`depth_bound_status`: `reached` means a proof-filtered edge from a declaration at
+minimal depth N reaches a declaration outside the bounded set (selected seeds
+plus depths 1 through N);
+`not_reached` means the complete frontier proves no such edge; `unknown` means
+bounded membership or the frontier could not be certified. This status describes
+the chosen query bound and does not itself make the bounded query incomplete. Traversal and
+frontier enumeration share the execution budget; a probe exhausting it is an
+ordinary budget stop for the step. This keeps whole-query execution and
+partition reconciliation equivalent when a limit cuts frontier enumeration
+short. The marker is retained before later filters or projections remove
+rows. An empty seed set is `not_reached`. An exact complete-empty intersect
+operand or except left operand short-circuits later operands; their skipped
+bounded traversals contribute `not_reached`, because they cannot affect the
+empty answer. The empty operand's own marker still contributes: a traversal
+that reached its bound before a filter erased its rows remains `reached`.
+Incomplete operands do not justify this short-circuit. Only answer-level depth
+status is rendered; skipped operands do not receive per-step depth markers.
+A policy approximating
+unbounded call reachability can declare that `reached` or `unknown` makes its
+run inconclusive.
+
+A Rust `call` pattern can constrain the canonical static type qualifying an
+associated call, including a source alias and its substituted defaults:
+
+```lisp
+(call :qualifying-type
+  (instantiated-type :identity (qualified "example.Cipher")
+    :arguments [(instantiated-type :identity (qualified "example.Des"))]))
+```
+
+`qualified` resolves at the loaded-policy boundary through the same canonical
+identity lookup as other qualified constraints. It accepts every selected model
+version exposing that locator; a local type with the same spelling is distinct.
+Listed `:arguments` constrain declared type parameters in order. Lifetimes do
+not occupy slots, and unlisted trailing slots are unconstrained. This differs
+from `:type-arguments`, which inspects written syntax, and `:receiver-type`,
+which constrains a resolved member's declaring owner. Unproved association,
+unknown queried components, const arguments in queried slots, and unsupported
+value receivers report incomplete capability. A proven different component
+can decide a nonmatch; an unqueried unknown component does not make the answer
+incomplete. Boolean composition is per site: a proven match decides an `or`
+branch, a proven nonmatch decides an `and` branch, and negating unknown stays
+unknown. An earlier unknown alternative or witness can still change the selected
+captures: a later match does not complete an `or`, union, existential relation,
+or ordered-role match unless those captures are proved unchanged. This uncertainty also applies to downstream
+capture-dependent steps such as `anchor`.
+
+`call-input` requires exactly one receiver, parameter-index, or parameter-name
 selector. `resolved-call` consumes `call_binding` rows and retains only rows for one stable callable
 identity with `exact` or `declared` proof. Its optional `:receiver-type` accepts either one exact
 receiver identity or `(assignable-to ROOT)`, which accepts the source-backed workspace root and
@@ -346,6 +394,16 @@ unambiguous second-field operand. Ordered comparison is defined only for
 integer fields. Comparison against an absent nullable field is false,
 including `ne`; use `is-null` to select absence. One filter accepts 1 through
 16 predicates, and an `in` set accepts 1 through 64 literals.
+
+An enum domain may declare an undecided source-property label. Thus an actual
+`owner_relation=unknown` makes `(owner_relation eq external)` and
+`(owner_relation ne external)` undecided: the filter withholds that row and
+reports `row_predicate_undecided` with an incomplete answer. Explicit
+`(owner_relation eq unknown)` and an `in` list containing the actual sentinel
+match it normally. A definitely false conjunct excludes the row without a new
+predicate diagnostic. Projected aliases preserve this behavior, and a field
+comparison checks both operands' domains. Null tests still inspect presence;
+evidence categories such as `proof=unknown` keep exact label comparisons.
 
 `(project :columns (...) QUERY)` publishes exactly the selected row fields to
 a relational binding, in order. A bare field keeps its name and `(FIELD
@@ -568,7 +626,7 @@ The direction is a field on every row, not something read off which wrapper prod
 
 `:surface` is optional and, unlike `references-of`, has **no default**. The complete edge answer includes editor-only rows, so silently defaulting to `external-usages` would narrow the compared ground set without the author having said so.
 
-Four absences are answers rather than gaps. An absent `ast_id` means the producer could not address the site token as an AST node, not that the edge is weaker. An absent `reference_kind` means no structured kind was classified, and is not a kind to compare against. An `owner_relation` of `unknown` is inconclusive and never silently equal to `external`. A `site_class` of `declaration_site` is editor-visible navigation rather than a runtime usage, which is why it is classified instead of dropped.
+Three absences are answers rather than gaps. An absent `ast_id` means the producer could not address the site token as an AST node, not that the edge is weaker. An `owner_relation` of `unknown` is inconclusive and never silently equal to `external`. A `site_class` of `declaration_site` is editor-visible navigation rather than a runtime usage, which is why it is classified instead of dropped. Classification is `reference_facets`: `known` kinds are proven, `undecided` kinds may hold, every other kind is proven absent; a `:reference-kinds` filter keeps known matches, answers incomplete (`reference_kind_undecided`) when only an undecided kind could match, and drops a row only on proven absence. The row `id` names the occurrence, not its classification.
 
 Only Java, Kotlin, Rust, Python, JavaScript, and TypeScript answer the forward projection. `(edges-from ...)` in any other language reports `edge_axis_unsupported` with `incomplete` impact -- never a clean empty answer -- and a derivation that was truncated, cancelled or failed reports `edge_derivation_incomplete`.
 
@@ -757,3 +815,12 @@ RQL is not yet a stable standalone external query API. It is intended to make in
 - `:quit` or `:exit` exits the REPL.
 
 Press `Ctrl+C` once to cancel reflexively; press it twice in a row to quit.
+
+The RQL call-shape projection is the only place that refines stored
+`callee_provenance` at query time. A stored `unknown` can project as `declared`
+for a Rust method call only when resolution is complete and ungapped and
+selects one declared method on a closed bound receiver. Refinement only fills
+`unknown`; it preserves every stored decided value. A receiver whose type is
+or contains an enclosing function type parameter remains `unknown`, unless
+the syntax-only producer already decided its provenance. Ambiguous, gapped,
+and unresolved targets remain `unknown`.

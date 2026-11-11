@@ -31,9 +31,12 @@ pub(crate) mod rust_departing_root_tests {
 
     use brokk_bifrost_rust_analysis::analyzer::rust::semantic::RustSemanticLowerer;
 
+    use brokk_bifrost_semantic::analyzer::semantic::partial_flow::fixpoint::PartialFlowOutcome;
     use brokk_bifrost_semantic::analyzer::semantic::partial_flow::fixpoint::ProcedurePartialFlows;
 
+    use brokk_bifrost_semantic::analyzer::semantic::oracle::limits::OracleLimits;
     use brokk_bifrost_semantic::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows;
+    use brokk_bifrost_semantic::analyzer::semantic::partial_flow::fixpoint::parse_time_partial_flows_with_limits;
 
     use crate::analyzer::semantic::ContentIdentity;
     use crate::analyzer::semantic::ProcedureId;
@@ -74,6 +77,66 @@ pub(crate) mod rust_departing_root_tests {
     use brokk_bifrost_core::analyzer::model::ProjectFile;
 
     use brokk_bifrost_core::text_utils::compute_line_starts;
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11069: declaration_facts hits dropped their fill's reads"
+    )]
+    fn declaration_facts_fill_and_hit_receipts_agree() {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "Cargo.toml",
+                "[package]\nname=\"owner-fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                "pub fn emit(value: u32) { sink(value); }\npub fn sink(value: u32) {}\n",
+            )
+            .build();
+        let filesystem =
+            brokk_bifrost_analysis::analyzer::FilesystemProject::new(project.root()).unwrap();
+        let workspace = brokk_bifrost_analysis::WorkspaceAnalyzer::build_ephemeral_footgun(
+            Arc::new(filesystem),
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+        let file = project.file("src/lib.rs");
+        let rust = brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<
+            brokk_bifrost_rust_analysis::analyzer::rust::RustAnalyzer,
+        >(workspace.analyzer())
+        .unwrap();
+        let queries = brokk_bifrost_rust::usage_queries::RustUsageQueries::new(rust);
+        let (cold, reads) = brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(
+            workspace.analyzer(),
+            || queries.declaration_facts_of(&file).unwrap(),
+        );
+        let (warm, warm_reads) = brokk_bifrost_analysis::analyzer::i_analyzer::capture_query_reads(
+            workspace.analyzer(),
+            || queries.declaration_facts_of(&file).unwrap(),
+        );
+        assert!(Arc::ptr_eq(&cold, &warm));
+        let keys = reads.unordered_keys();
+        let rendered = format!("{keys:?}");
+        for dependency in [
+            "Cargo.toml",
+            "src/lib.rs",
+            "src/Cargo.toml",
+            "PathAbsent",
+            "DeclarationFacts",
+            "WorkspaceOverlayMembership",
+        ] {
+            assert!(
+                rendered.contains(dependency),
+                "missing {dependency}: {keys:?}"
+            );
+        }
+
+        assert_eq!(
+            reads.digest(),
+            warm_reads.digest(),
+            "fill: {reads:?}; hit: {warm_reads:?}"
+        );
+    }
+
     /// Every file with `extension` under `root`, sorted, found without recursion.
     pub(crate) fn source_files(root: &Path, extension: &str) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -94,7 +157,7 @@ pub(crate) mod rust_departing_root_tests {
 
     /// Parse one file the way the Rust adapter prepares exact syntax.
     pub(crate) fn prepare(file: &ProjectFile, source: &Arc<str>) -> PreparedSyntaxTree {
-        let adapter = RustAdapter;
+        let adapter = RustAdapter::for_tests();
         assert!(
             adapter.parser_included_ranges(file, source).is_none(),
             "the Rust adapter parses whole files"
@@ -220,7 +283,6 @@ pub(crate) mod rust_departing_root_tests {
         adapter: &A,
     ) -> RoundTripReport {
         let root = root.to_path_buf();
-        let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let lowerer = adapter
             .parse_time_semantic_lowerer()
             .expect("native lowerer");
@@ -229,16 +291,27 @@ pub(crate) mod rust_departing_root_tests {
         let capabilities = lowerer.capabilities();
         let epoch = semantic_ir_producer_epoch(&identity);
         let storage_language = adapter.language().config_label();
-        assert!(
+        // Each file's check reads only that file's rows, so each file gets its
+        // own store, dropped before the next file. One store per worker for
+        // the whole walk held gigabytes on the `crates/` corpus and ran the
+        // Windows gate's disk out (#10813); emptying it per file with a
+        // cascading delete cost more CPU than the rest of the test together.
+        let open_store = || {
+            let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
+            assert!(
+                store
+                    .ensure_semantic_ir_producer_epoch(storage_language, &epoch)
+                    .unwrap()
+            );
             store
-                .ensure_semantic_ir_producer_epoch(storage_language, &epoch)
-                .unwrap()
-        );
+        };
+        let first = open_store();
         assert!(
-            !store
+            !first
                 .ensure_semantic_ir_producer_epoch(storage_language, &epoch)
                 .unwrap()
         );
+        drop(first);
         let mut seen = std::collections::HashSet::new();
         let mut report = RoundTripReport::default();
         for path in files {
@@ -394,6 +467,7 @@ pub(crate) mod rust_departing_root_tests {
                 None
             };
             let prepared_rows = produced.rows;
+            let store = open_store();
             let blob_id = {
                 let mut conn = store.conn.lock().unwrap();
                 conn.execute(
@@ -554,7 +628,7 @@ pub(crate) mod rust_departing_root_tests {
     pub(crate) fn semantic_ir_rows_round_trip_every_workspace_crate_source() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let workers = std::thread::available_parallelism().map_or(1, usize::from);
-        let report = round_trip_tree(&root, workers, &RustAdapter, "rs");
+        let report = round_trip_tree(&root, workers, &RustAdapter::for_tests(), "rs");
         print_report(&report);
         assert!(report.round_tripped > 0, "{report:?}");
     }
@@ -683,7 +757,7 @@ pub(crate) mod rust_departing_root_tests {
             .expect("the Rust file yields a complete artifact");
 
         let prepared = match prepare_exact_syntax_tree(
-            &RustAdapter,
+            &RustAdapter::for_tests(),
             &file,
             PreparedSyntaxSource::Exact(Arc::from(LIB)),
             PreparedSourceOrigin::Disk,
@@ -734,6 +808,32 @@ pub(crate) mod rust_departing_root_tests {
         Vec<ProcedureSemanticsParts>,
         Vec<ProcedurePartialFlows>,
     ) {
+        partial_flows_of_with_limits(source, OracleLimits::default())
+    }
+
+    /// [`partial_flows_of`] under explicit oracle limits.
+    fn partial_flows_of_with_limits(
+        source: &str,
+        limits: OracleLimits,
+    ) -> (
+        ProjectFile,
+        Vec<ProcedureSemanticsParts>,
+        Vec<ProcedurePartialFlows>,
+    ) {
+        let (file, parts, mut flows) = partial_flows_under_each(source, &[limits]);
+        (file, parts, flows.remove(0))
+    }
+
+    /// The partial flows of one source, projected once under each of `limits`
+    /// from the same artifact, so the runs are comparable procedure by procedure.
+    fn partial_flows_under_each(
+        source: &str,
+        limits: &[OracleLimits],
+    ) -> (
+        ProjectFile,
+        Vec<ProcedureSemanticsParts>,
+        Vec<Vec<ProcedurePartialFlows>>,
+    ) {
         let project = InlineTestProject::with_language(Language::Rust)
             .file("lib.rs", source)
             .build();
@@ -752,8 +852,13 @@ pub(crate) mod rust_departing_root_tests {
             .expect("Rust semantic artifact is available");
         let source: Arc<str> = Arc::from(source);
         let prepared = prepare(&file, &source);
-        let flows = parse_time_partial_flows(&artifact, &prepared, &cancellation)
-            .expect("the projection is not cancelled");
+        let flows = limits
+            .iter()
+            .map(|limits| {
+                parse_time_partial_flows_with_limits(&artifact, &prepared, &cancellation, *limits)
+                    .expect("the projection is not cancelled")
+            })
+            .collect::<Vec<_>>();
         let parts = match RustSemanticLowerer.lower(
             &file,
             &prepared,
@@ -763,7 +868,9 @@ pub(crate) mod rust_departing_root_tests {
             Ok(SemanticOutcome::Complete { value, .. }) => value,
             other => panic!("the fixture lowers completely: {other:?}"),
         };
-        assert_eq!(parts.len(), flows.len(), "one entry per procedure");
+        for flows in &flows {
+            assert_eq!(parts.len(), flows.len(), "one entry per procedure");
+        }
         (file, parts, flows)
     }
 
@@ -791,41 +898,14 @@ pub(crate) mod rust_departing_root_tests {
         }
     }
 
-    /// Partial flows survive the write and the read: each procedure's ports,
-    /// flows with their crossed calls, openness and discharged gaps read back
-    /// equal to the computed value.
-    #[test]
-    pub(crate) fn partial_flows_round_trip_through_rows() {
-        let source = "pub struct Holder {\n    field: u32,\n}\n\nimpl Holder {\n    pub fn store(&mut self, value: u32) {\n        self.field = value;\n    }\n}\n\npub fn identity(value: u32) -> u32 {\n    value\n}\n\npub fn forward(value: u32) {\n    sink(value);\n}\n\nfn sink(_value: u32) {}\n\npub fn capture(value: u32) -> impl Fn() -> u32 {\n    move || value\n}\n\npub fn around(value: u32) -> u32 {\n    sink(0);\n    value\n}\n\npub fn dynamic_index(values: &[u32], index: usize) -> u32 {\n    values[index]\n}\n\npub struct Pair { value: u32 }\npub fn mixed(flag: bool, value: u32, original: Pair) -> Pair {\n    if flag { return Pair { value }; }\n    original\n}\n";
-        let (file, parts, flows) = partial_flows_of(source);
-        let mixed = parts
-            .iter()
-            .position(|part| part.locator.declaration().last_segment_name() == Some("mixed"))
-            .expect("mixed return procedure");
-        assert!(
-            !flows[mixed].relations_complete && !flows[mixed].flows.is_empty(),
-            "a positive member relation in one return arm cannot close another: {:#?}",
-            flows[mixed]
-        );
-        assert!(
-            flows.iter().any(|procedure| !procedure.flows.is_empty()),
-            "the fixture has at least one partial flow to round-trip"
-        );
-        assert!(
-            flows
-                .iter()
-                .flat_map(|procedure| &procedure.flows)
-                .any(|flow| flow.crossed.iter().any(|class| !class.is_empty())),
-            "the fixture has a flow that crosses a call: {flows:#?}"
-        );
-        // Both values of the head's relation-proof fact are stored and read back:
-        // the dynamic element read names an index this procedure cannot prove
-        // constant, so its relation stays partial.
-        assert!(
-            flows.iter().any(|procedure| procedure.relations_complete)
-                && flows.iter().any(|procedure| !procedure.relations_complete),
-            "the fixture has procedures with and without an unproven relation: {flows:#?}"
-        );
+    /// Write the heads of one Rust source through the semantic-IR writer, as
+    /// the blob transaction does, and read each procedure's head back.
+    fn store_and_read_heads(
+        source: &str,
+        file: &ProjectFile,
+        parts: Vec<ProcedureSemanticsParts>,
+        flows: &[ProcedurePartialFlows],
+    ) -> Vec<ProcedurePartialFlows> {
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let identity = RustSemanticLowerer.identity();
         let epoch = semantic_ir_producer_epoch(&identity);
@@ -844,7 +924,7 @@ pub(crate) mod rust_departing_root_tests {
         );
         let prepared = PreparedSemanticIr::prepare(
             SemanticIrLoweringOutcome::Complete { parts },
-            Some(&flows),
+            Some(flows),
             &epoch,
             content,
             source.len(),
@@ -871,13 +951,230 @@ pub(crate) mod rust_departing_root_tests {
             tx.commit().unwrap();
             blob_id
         };
-        for (index, expected) in flows.iter().enumerate() {
-            let procedure = ProcedureId::new(u32::try_from(index).unwrap());
-            let decoded = store
-                .read_partial_flows(blob_id, procedure, &scope)
-                .unwrap()
-                .unwrap_or_else(|| panic!("procedure {index} has a head row"));
-            assert_eq!(&decoded, expected, "procedure {index}");
+        (0..flows.len())
+            .map(|index| {
+                let procedure = ProcedureId::new(u32::try_from(index).unwrap());
+                store
+                    .read_partial_flows(blob_id, procedure, &scope)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("procedure {index} has a head row"))
+            })
+            .collect()
+    }
+
+    /// Partial flows survive the write and the read: each procedure's ports,
+    /// flows with their crossed calls, openness and discharged gaps read back
+    /// equal to the computed value.
+    #[test]
+    pub(crate) fn partial_flows_round_trip_through_rows() {
+        let source = "pub struct Holder {\n    field: u32,\n}\n\nimpl Holder {\n    pub fn store(&mut self, value: u32) {\n        self.field = value;\n    }\n}\n\npub fn identity(value: u32) -> u32 {\n    value\n}\n\npub fn forward(value: u32) {\n    sink(value);\n}\n\nfn sink(_value: u32) {}\n\npub fn capture(value: u32) -> impl Fn() -> u32 {\n    move || value\n}\n\npub fn around(value: u32) -> u32 {\n    sink(0);\n    value\n}\n\npub fn dynamic_index(values: &[u32], index: usize) -> u32 {\n    values[index]\n}\n\npub struct Pair { value: u32 }\npub fn mixed(flag: bool, value: u32, original: Pair) -> Pair {\n    if flag { return Pair { value }; }\n    original\n}\n";
+        let (file, parts, flows) = partial_flows_of(source);
+        let mixed = parts
+            .iter()
+            .position(|part| part.locator.declaration().last_segment_name() == Some("mixed"))
+            .expect("mixed return procedure");
+        assert!(
+            !flows[mixed].relations_proven() && !flows[mixed].flows.is_empty(),
+            "a positive member relation in one return arm cannot close another: {:#?}",
+            flows[mixed]
+        );
+        assert!(
+            flows.iter().any(|procedure| !procedure.flows.is_empty()),
+            "the fixture has at least one partial flow to round-trip"
+        );
+        assert!(
+            flows
+                .iter()
+                .flat_map(|procedure| &procedure.flows)
+                .any(|flow| flow.crossed.iter().any(|class| !class.is_empty())),
+            "the fixture has a flow that crosses a call: {flows:#?}"
+        );
+        // Both values of the head's relation-proof fact are stored and read back:
+        // the dynamic element read names an index this procedure cannot prove
+        // constant, so its relation stays partial.
+        assert!(
+            flows.iter().any(|procedure| procedure.relations_proven())
+                && flows.iter().any(|procedure| !procedure.relations_proven()),
+            "the fixture has procedures with and without an unproven relation: {flows:#?}"
+        );
+        let decoded = store_and_read_heads(source, &file, parts, &flows);
+        for (index, (decoded, expected)) in decoded.iter().zip(&flows).enumerate() {
+            assert_eq!(decoded, expected, "procedure {index}");
         }
+    }
+
+    /// The repository's own `from_reasons` shape: a return that joins a root that
+    /// is not an exact allocation (a unit variant, a call result or a parameter)
+    /// with a struct variant that stores a field. The projection does not
+    /// transport the stored member (#9766).
+    const REJECTED_MEMBER_SOURCE: &str = "pub fn small(x: u32) -> u32 { x }\n\
+        pub enum Reasons { Complete, Incomplete { reasons: u32 } }\n\
+        pub fn joined(empty: bool, reasons: u32) -> Reasons {\n    \
+            if empty { Reasons::Complete } else { Reasons::Incomplete { reasons } }\n}\n\
+        pub fn make() -> Reasons { Reasons::Complete }\n\
+        pub fn from_call(empty: bool, reasons: u32) -> Reasons {\n    \
+            if empty { make() } else { Reasons::Incomplete { reasons } }\n}\n\
+        pub fn from_param(empty: bool, reasons: u32, base: Reasons) -> Reasons {\n    \
+            if empty { base } else { Reasons::Incomplete { reasons } }\n}\n\
+        pub struct Holder { pub text: Option<u32> }\n\
+        pub fn holder() -> Holder { Holder { text: None } }\n\
+        pub fn mutated(flag: bool, value: u32) -> Holder {\n    \
+            match flag { true => holder(), false => { let mut result = holder(); result.text = Some(value); result } }\n}\n\
+        pub enum Out { Text(String), Structured { structured: String, rendered: Option<String> } }\n\
+        pub struct Res { pub content: Vec<String>, pub structured: Option<String> }\n\
+        impl Res { pub fn success(content: Vec<String>) -> Res { Res { content, structured: None } } }\n\
+        pub fn assigned_after_construction(output: Out) -> Res {\n    match output {\n        \
+            Out::Text(text) => Res::success(vec![text]),\n        \
+            Out::Structured { structured, rendered } => {\n            \
+                let text = rendered.unwrap_or_else(|| structured.clone());\n            \
+                let mut result = Res::success(vec![text]);\n            \
+                result.structured = Some(structured);\n            result\n        }\n    }\n}\n\
+        pub struct Outcome { pub complete: bool, pub diagnostics: Vec<u32> }\n\
+        impl Outcome { pub fn complete(diagnostics: Vec<u32>) -> Outcome { Outcome { complete: true, diagnostics } } }\n\
+        pub fn assigned_in_both_arms(r: Result<Outcome, u32>) -> Outcome {\n    match r {\n        \
+            Ok(mut outcome) => { outcome.complete = true; outcome }\n        \
+            Err(error) => {\n            let mut outcome = Outcome::complete(Vec::new());\n            \
+                outcome.complete = false;\n            outcome.diagnostics.push(error);\n            outcome\n        }\n    }\n}\n";
+
+    fn procedure_named(parts: &[ProcedureSemanticsParts], name: &str) -> usize {
+        parts
+            .iter()
+            .position(|part| part.locator.declaration().last_segment_name() == Some(name))
+            .unwrap_or_else(|| panic!("{name} procedure"))
+    }
+
+    /// A real capacity cap that cuts the candidate set leaves an incomplete
+    /// projection that still yields flows, and the stored head must say
+    /// Truncated, never Complete. A small provenance cap reaches that on a small
+    /// fixture; the default cap needs more than 4,096 relations, which costs
+    /// minutes in a debug build. The small function stays under the cap.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10461: a truncated parse-time head was stored as complete"
+    )]
+    fn truncated_parse_time_head_round_trips_as_truncated() {
+        let mut values = OracleLimits::default().values();
+        values.provenance_records = 8;
+        let limits = OracleLimits::new(values).expect("eight provenance records is a valid limit");
+        let mut source =
+            String::from("pub fn small() {}\npub fn wide(x: u32) -> u32 {\n    let v0 = x;\n");
+        for index in 1..24 {
+            source.push_str(&format!("    let v{index} = v{};\n", index - 1));
+        }
+        source.push_str("    v23\n}\n");
+        let source = source.as_str();
+        let (file, parts, flows) = partial_flows_of_with_limits(source, limits);
+        let wide = procedure_named(&parts, "wide");
+        let small = procedure_named(&parts, "small");
+        assert_eq!(
+            flows[wide].outcome,
+            PartialFlowOutcome::Truncated,
+            "the provenance cap cuts the candidate set: {:?}",
+            flows[wide].detail
+        );
+        assert!(
+            flows[wide].has_undischarged_gap(),
+            "a truncated incomplete projection is open"
+        );
+        assert_eq!(flows[small].outcome, PartialFlowOutcome::Complete);
+        let decoded = store_and_read_heads(source, &file, parts, &flows);
+        assert_eq!(decoded[wide], flows[wide]);
+        assert_eq!(decoded[wide].outcome, PartialFlowOutcome::Truncated);
+        assert_eq!(decoded[small], flows[small]);
+    }
+
+    /// The #9766 guard records a content gap: the stored member is not
+    /// transported. That is not a capacity cut, so the stored head is Complete
+    /// with `open` and without `relations_complete`, never Truncated. It reads
+    /// back unchanged, and it is the same under a small but sufficient set of
+    /// limits and under the defaults.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10466: a rejected return member was typed as a budget truncation"
+    )]
+    fn rejected_return_member_head_is_open_content_not_truncated() {
+        let mut values = OracleLimits::default().values();
+        values.provenance_records = 64;
+        values.evidence_handles = 64;
+        values.access_path_length = 4;
+        let small = OracleLimits::new(values).expect("small limits are valid");
+        let (file, parts, mut flows) =
+            partial_flows_under_each(REJECTED_MEMBER_SOURCE, &[OracleLimits::default(), small]);
+        let limited = flows.remove(1);
+        let flows = flows.remove(0);
+        for name in [
+            "joined",
+            "from_call",
+            "from_param",
+            "mutated",
+            "assigned_after_construction",
+            "assigned_in_both_arms",
+        ] {
+            let head = &flows[procedure_named(&parts, name)];
+            assert_eq!(
+                head.outcome,
+                PartialFlowOutcome::Complete,
+                "{name}: {head:#?}"
+            );
+            assert!(head.has_undischarged_gap(), "{name}: {head:#?}");
+            assert!(
+                !head.relations_proven(),
+                "{name}: the rejected member is not covered: {head:#?}"
+            );
+        }
+        let small = procedure_named(&parts, "small");
+        assert_eq!(flows[small].outcome, PartialFlowOutcome::Complete);
+        assert!(flows[small].relations_proven());
+        // The guard reads only content: a small but sufficient set of limits
+        // gives every procedure the same head.
+        assert_eq!(limited, flows, "a sufficient limit must not change a head");
+
+        let decoded = store_and_read_heads(REJECTED_MEMBER_SOURCE, &file, parts, &flows);
+        assert_eq!(decoded, flows);
+    }
+
+    /// compute_partial_flows reports a cancellation as an ExceededBudget head.
+    /// A preparation cancelled at any check must return no heads, not heads
+    /// with a budget cause. The token trips after N checks; sweep N until the
+    /// preparation finishes without tripping it.
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#10461: a cancelled preparation held budget-stop heads")]
+    fn cancelled_parse_time_preparation_holds_no_heads() {
+        let source = "pub fn id(x: u32) -> u32 { x }\npub fn nothing() {}\n";
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("lib.rs", source)
+            .build();
+        let file = project.file("lib.rs");
+        let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+        let live = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &live),
+            )
+            .expect("Rust semantic materialization runs")
+            .available_value()
+            .cloned()
+            .expect("Rust semantic artifact is available");
+        let source: Arc<str> = Arc::from(source);
+        let prepared = prepare(&file, &source);
+        let mut checks = 1;
+        loop {
+            let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+            let flows = parse_time_partial_flows(&artifact, &prepared, &cancellation);
+            if cancellation.cancel_after_checks_tripped_for_test() {
+                assert!(
+                    flows.is_none(),
+                    "a preparation cancelled at check {checks} returned heads: {flows:#?}"
+                );
+            } else {
+                assert!(flows.is_some(), "an uncancelled preparation has heads");
+                break;
+            }
+            checks += 1;
+            assert!(checks < 100_000, "the preparation never finished");
+        }
+        assert!(checks > 1, "the sweep cancelled at least once");
     }
 }

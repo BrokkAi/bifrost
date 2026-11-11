@@ -1,5 +1,22 @@
 use super::*;
 
+fn subtree_has_bounded_call_step(plan: &PhysicalQueryPlan, root: PhysicalQueryNodeId) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if matches!(
+            plan.logical_node(node).operator(),
+            LogicalQueryOperator::Step {
+                step: QueryStep::Callers(_) | QueryStep::Callees(_),
+                ..
+            }
+        ) {
+            return true;
+        }
+        pending.extend(plan.node(node).dependencies());
+    }
+    false
+}
+
 /// Only a proof that every seed is scoped to absent languages can remove a
 /// branch's pipeline share. Unknown domains and unscoped seeds keep a share.
 /// Walk the plan iteratively, including nested set operands, without changing
@@ -104,16 +121,15 @@ pub(super) fn execute_plan(
 
     let profiling = state.profile.is_some();
     let mut execution = if let Some(operands) = state.scope.intersect_operands() {
-        assert_eq!(
-            plan.node(current_node_id).operator(),
-            PhysicalQueryOperator::SequentialIntersection,
-            "intersect continuation must replace its named physical cut"
-        );
+        let LogicalQueryOperator::Set { op, .. } = plan.logical_node(current_node_id).operator()
+        else {
+            panic!("prefix continuation requires a set cut");
+        };
         assert_eq!(
             operands.len(),
             plan.node(current_node_id).dependencies().len()
         );
-        let (mut rows, _) = combine_set_rows(SetOperator::Intersect, operands.to_vec(), profiling);
+        let (mut rows, _) = combine_set_rows(*op, operands.to_vec(), profiling);
         state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
         state.step_outputs[current_node_id.index()] = rows.len() as u64;
         let truncated = if let Some(cap) = current_terminal_cap
@@ -125,12 +141,7 @@ pub(super) fn execute_plan(
         } else {
             false
         };
-        PlanExecution {
-            rows,
-            truncated,
-            cancelled: false,
-            pipeline_halted: false,
-        }
+        PlanExecution::new(rows, truncated)
     } else {
         execute_plan_node(
             plan,
@@ -265,7 +276,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution =
                     execute_occurrence_seed(seed, terminal_cap, state, limits, diagnostics);
@@ -275,8 +286,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -292,7 +303,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_environment_seed(
                     EnvironmentSeedKind::Scopes(&seed.filter),
@@ -309,8 +320,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -326,7 +337,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_environment_seed(
                     EnvironmentSeedKind::Bindings(&seed.filter),
@@ -343,8 +354,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -363,7 +374,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_materialization_seed(
                     MaterializationSeedKind::GenerationSites(&seed.filter),
@@ -380,8 +391,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -397,7 +408,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_materialization_seed(
                     MaterializationSeedKind::Exports(&seed.filter),
@@ -414,8 +425,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -431,7 +442,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_path_seed(
                     &seed.filter,
@@ -448,8 +459,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -461,8 +472,8 @@ fn execute_plan_node(
         ) => {
             let execution =
                 execute_dependency_evidence_seed(seed, terminal_cap, state, limits, diagnostics);
-            self_truncated = execution.truncated;
-            if execution.cancelled {
+            self_truncated = execution.is_truncated();
+            if execution.is_cancelled() {
                 disposition = QueryOperatorDisposition::Cancelled;
             }
             execution
@@ -480,7 +491,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_configuration_facts_seed(
                     seed,
@@ -495,8 +506,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -512,7 +523,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 let execution = execute_seed(seed, terminal_cap, state, limits, diagnostics);
                 if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
@@ -521,8 +532,8 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = execution.truncated;
-                if execution.cancelled {
+                self_truncated = execution.is_truncated();
+                if execution.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 execution
@@ -545,25 +556,33 @@ fn execute_plan_node(
             work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
-            if child.cancelled {
+            if child.stop == PlanStop::Cancelled {
                 disposition = QueryOperatorDisposition::Skipped;
                 push_operator_termination(
                     &mut terminations,
                     QueryOperatorTermination::DependencyCancelled,
                 );
                 child
-            } else if child.pipeline_halted {
+            } else if child.stop == PlanStop::HaltedPipeline {
                 disposition = QueryOperatorDisposition::Skipped;
                 push_operator_termination(
                     &mut terminations,
                     QueryOperatorTermination::DependencyPipelineHalted,
                 );
+                // The halt ends at the last step of its authored suffix; the
+                // rows stay truncated past it.
                 PlanExecution {
-                    pipeline_halted: !final_in_authored_suffix,
+                    stop: if *final_in_authored_suffix {
+                        PlanStop::Truncated
+                    } else {
+                        PlanStop::HaltedPipeline
+                    },
                     ..child
                 }
             } else {
                 let mut instrumentation = profiling.then(QueryStepInstrumentation::default);
+                let depth_answer_start = state.depth_answers.len();
+                let child_truncated = child.is_truncated();
                 let mut stepped = apply_plan_step(
                     step,
                     token,
@@ -571,6 +590,7 @@ fn execute_plan_node(
                     physical_node.diagnostic_relation_predicates(),
                     *final_in_authored_suffix,
                     child.rows,
+                    child_truncated,
                     state,
                     limits,
                     plan.logical_node(node_id)
@@ -579,6 +599,12 @@ fn execute_plan_node(
                     diagnostics,
                     instrumentation.as_mut(),
                 );
+                if let Some(key) = plan.logical_node(node_id).depth_bound_key() {
+                    let key = state.scope.depth_bound_key(key);
+                    for answer in &mut state.depth_answers[depth_answer_start..] {
+                        answer.traversal = key.clone();
+                    }
+                }
                 if let Some(instrumentation) = instrumentation {
                     rows_visited = instrumentation.rows_visited;
                     relation_expansions = instrumentation.relation_expansions;
@@ -598,11 +624,13 @@ fn execute_plan_node(
                         QueryOperatorTermination::TerminalCap,
                     );
                 }
-                self_truncated = stepped.truncated;
-                if stepped.cancelled {
+                self_truncated = stepped.is_truncated();
+                if stepped.is_cancelled() {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
-                stepped.truncated |= child.truncated;
+                if child_truncated {
+                    stepped.mark_truncated();
+                }
                 stepped
             }
         }
@@ -638,7 +666,7 @@ fn execute_plan_node(
             work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
-            if parallel.execution.cancelled {
+            if parallel.execution.is_cancelled() {
                 disposition = QueryOperatorDisposition::Skipped;
                 push_operator_termination(
                     &mut terminations,
@@ -662,7 +690,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 debug_assert_eq!(
                     physical_operator,
@@ -718,6 +746,8 @@ fn execute_plan_node(
                         branch.push(index);
                     }
                     let dependency_started = profiling.then(Instant::now);
+                    let outer_depth_answers = std::mem::take(&mut state.depth_answers);
+                    let outer_depth_status = state.depth_bound_status.take();
                     let mut child = execute_plan(
                         plan,
                         token,
@@ -728,6 +758,10 @@ fn execute_plan_node(
                         &mut child_diagnostics,
                         profile_branch,
                     );
+                    let child_depth_answers =
+                        std::mem::replace(&mut state.depth_answers, outer_depth_answers);
+                    let child_depth_status = state.depth_bound_status.take();
+                    state.depth_bound_status = outer_depth_status;
                     debug_assert!(
                         state
                             .budget
@@ -757,14 +791,14 @@ fn execute_plan_node(
                     // stopped on a row cap, a relation limit, or missing
                     // analysis reports that instead, and re-running it would
                     // repeat the same work for the same result.
-                    let starved = child.truncated
+                    let starved = child.is_truncated()
                         && child_diagnostics.iter().any(|diagnostic| {
                             diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
                         });
                     // An empty operand proves the whole result empty only if
                     // every evaluated operand has complete coverage. Otherwise
                     // preserve the ordinary merge and starved-branch retry.
-                    complete_prefix &= !child.truncated
+                    complete_prefix &= !child.is_truncated()
                         && !child_diagnostics.iter().any(|diagnostic| {
                             diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
                         });
@@ -774,31 +808,77 @@ fn execute_plan_node(
                     // so the unit must, or its summed work and diagnostics
                     // would understate the whole run's.
                     let ends_operator = complete_prefix
-                        && !child.cancelled
+                        && !child.is_cancelled()
                         && child.rows.is_empty()
-                        && (*op == SetOperator::Intersect
-                            && state.scope.intersect_prefix_capture().is_none()
-                            || (*op == SetOperator::Except
-                                && index == 0
-                                && state.scope.seed_files().is_none()));
+                        && units::empty_operand_ends_set(*op, index)
+                        && match op {
+                            SetOperator::Intersect => {
+                                state.scope.intersect_prefix_capture().is_none()
+                            }
+                            SetOperator::Except => state.scope.seed_files().is_none(),
+                            SetOperator::Union => true,
+                        };
                     branch_diagnostics.push(child_diagnostics);
-                    if child.cancelled {
+                    if child.is_cancelled() {
                         push_operator_termination(
                             &mut terminations,
                             QueryOperatorTermination::DependencyCancelled,
                         );
+                        state.depth_answers.extend(child_depth_answers);
+                        join_depth_bound_status(&mut state.depth_bound_status, child_depth_status);
                         cancelled_child = Some(child);
                         break;
                     }
                     branch_attempts.push(BranchAttempt {
                         limits: branch_limits,
-                        truncated: child.truncated,
+                        truncated: child.is_truncated(),
                         starved,
+                        depth_bound_status: child_depth_status,
+                        depth_answers: child_depth_answers,
                     });
                     branch_rows.push(child.rows);
                     if ends_operator {
                         empty_operand = true;
                         if index + 1 < dependencies.len() {
+                            if state.scope.computes_depth_bound_status()
+                                && dependencies[index + 1..].iter().any(|dependency| {
+                                    subtree_has_bounded_call_step(plan, *dependency)
+                                })
+                            {
+                                let mut pending = dependencies[index + 1..].to_vec();
+                                while let Some(node) = pending.pop() {
+                                    if let Some(key) = plan.logical_node(node).depth_bound_key() {
+                                        let bound = match plan.logical_node(node).operator() {
+                                            LogicalQueryOperator::Step {
+                                                step:
+                                                    QueryStep::Callers(filter)
+                                                    | QueryStep::Callees(filter),
+                                                ..
+                                            } => filter.depth.get(),
+                                            _ => unreachable!(
+                                                "only bounded call steps carry traversal keys"
+                                            ),
+                                        };
+                                        state.depth_answers.push(units::BoundedCallAnswer {
+                                            traversal: state.scope.depth_bound_key(key),
+                                            members: Vec::new(),
+                                            frontier: Vec::new(),
+                                            bound,
+                                            undecided_frontier: Vec::new(),
+                                            membership_unknown:
+                                                units::EXACT_SHORT_CIRCUIT_DEPTH_STATUS
+                                                    == DepthBoundStatus::Unknown,
+                                            budget_stopped: false,
+                                        });
+                                    }
+                                    pending.extend_from_slice(plan.node(node).dependencies());
+                                }
+                                // An exact short-circuit makes the skipped frontier irrelevant.
+                                join_depth_bound_status(
+                                    &mut state.depth_bound_status,
+                                    Some(units::EXACT_SHORT_CIRCUIT_DEPTH_STATUS),
+                                );
+                            }
                             push_operator_termination(
                                 &mut terminations,
                                 QueryOperatorTermination::EmptyOperand,
@@ -854,6 +934,8 @@ fn execute_plan_node(
                             branch.push(index);
                         }
                         let dependency_started = profiling.then(Instant::now);
+                        let outer_depth_answers = std::mem::take(&mut state.depth_answers);
+                        let outer_depth_status = state.depth_bound_status.take();
                         let mut child = execute_plan(
                             plan,
                             token,
@@ -864,6 +946,10 @@ fn execute_plan_node(
                             &mut retry_diagnostics,
                             profile_branch,
                         );
+                        let child_depth_answers =
+                            std::mem::replace(&mut state.depth_answers, outer_depth_answers);
+                        let child_depth_status = state.depth_bound_status.take();
+                        state.depth_bound_status = outer_depth_status;
                         if let Some(started) = dependency_started {
                             dependency_execution_ns =
                                 dependency_execution_ns.saturating_add(elapsed_ns(started));
@@ -879,12 +965,14 @@ fn execute_plan_node(
                         if let Some(started) = prefix_started {
                             merge_ns = merge_ns.saturating_add(elapsed_ns(started));
                         }
-                        if child.cancelled {
+                        if child.is_cancelled() {
                             push_operator_termination(
                                 &mut terminations,
                                 QueryOperatorTermination::DependencyCancelled,
                             );
                             branch_diagnostics[index] = retry_diagnostics;
+                            branch_attempts[index].depth_bound_status = child_depth_status;
+                            branch_attempts[index].depth_answers = child_depth_answers;
                             cancelled_child = Some(child);
                             break;
                         }
@@ -894,17 +982,46 @@ fn execute_plan_node(
                         // so a retry against an already-spent row budget can
                         // return less than the first attempt did. Keep the
                         // attempt that saw more of the branch.
-                        if child.truncated && child.rows.len() <= branch_rows[index].len() {
+                        if child.is_truncated() && child.rows.len() <= branch_rows[index].len() {
                             continue;
                         }
                         input_rows = input_rows
                             .saturating_sub(branch_rows[index].len())
                             .saturating_add(child.rows.len());
+                        branch_attempts[index].truncated = child.is_truncated();
                         branch_rows[index] = child.rows;
                         branch_diagnostics[index] = retry_diagnostics;
-                        branch_attempts[index].truncated = child.truncated;
                         branch_attempts[index].starved = false;
+                        branch_attempts[index].depth_bound_status = child_depth_status;
+                        branch_attempts[index].depth_answers = child_depth_answers;
                     }
+                }
+                // Only the authored root except is partitioned as BySeedExcept.
+                // Retain operand zero's selected attempt before final exclusion.
+                let mut source = plan.node(plan.root()).dependencies()[0];
+                while matches!(
+                    plan.node(source).operator(),
+                    PhysicalQueryOperator::PipelineStep
+                ) {
+                    source = plan.node(source).dependencies()[0];
+                }
+                if *op == SetOperator::Except && node_id == source {
+                    let complete_empty = branch_rows.first().is_some_and(Vec::is_empty)
+                        && branch_attempts
+                            .first()
+                            .is_some_and(|attempt| !attempt.truncated)
+                        && branch_diagnostics.first().is_some_and(|diagnostics| {
+                            code_query_completion(false, diagnostics)
+                                == CodeQueryCompletion::Complete
+                        });
+                    state.scope.record_except_left(complete_empty);
+                }
+                for attempt in &mut branch_attempts {
+                    state.depth_answers.append(&mut attempt.depth_answers);
+                    join_depth_bound_status(
+                        &mut state.depth_bound_status,
+                        attempt.depth_bound_status,
+                    );
                 }
                 let truncated = branch_attempts.iter().any(|attempt| attempt.truncated);
                 // A scoped BindingUses query can withhold just the binders
@@ -952,6 +1069,7 @@ fn execute_plan_node(
                         Some(scope_diagnostics && left_bindings_are_covered)
                     }
                 };
+                let qualifying_diagnostic_start = diagnostics.len();
                 for mut branch in branch_diagnostics {
                     diagnostics.append(&mut branch);
                 }
@@ -961,22 +1079,23 @@ fn execute_plan_node(
                 if let Some(child) = cancelled_child {
                     disposition = QueryOperatorDisposition::Skipped;
                     child
-                } else if *op == SetOperator::Intersect
-                    && node_id == plan.node(plan.root()).dependencies()[0]
+                } else if node_id == plan.node(plan.root()).dependencies()[0]
                     && let Some(capture) = state.scope.intersect_prefix_capture()
                 {
                     *capture.lock().expect("prefix capture lock is not poisoned") =
                         Some(branch_rows);
-                    PlanExecution {
-                        rows: Vec::new(),
-                        truncated,
-                        cancelled: false,
-                        pipeline_halted: false,
-                    }
+                    PlanExecution::new(Vec::new(), truncated)
                 } else {
                     let merge_started = profiling.then(Instant::now);
                     let (mut rows, merge_measurement) =
                         combine_set_rows(*op, branch_rows, profiling);
+                    if *op == SetOperator::Union {
+                        discharge_decided_qualifying_sites(
+                            rows.iter().filter_map(qualifying_pipeline_site),
+                            diagnostics,
+                            qualifying_diagnostic_start,
+                        );
+                    }
                     let incomplete_rows_discarded = match incomplete_exclusion {
                         Some(true) => {
                             let before = rows.len();
@@ -1025,12 +1144,7 @@ fn execute_plan_node(
                         );
                         rows.truncate(cap);
                     }
-                    PlanExecution {
-                        rows,
-                        truncated,
-                        cancelled: false,
-                        pipeline_halted: false,
-                    }
+                    PlanExecution::new(rows, truncated)
                 }
             }
         }
@@ -1046,7 +1160,7 @@ fn execute_plan_node(
             work_started = profiling.then(|| state_execution_work_snapshot(state));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
-            let dependency_cancelled = child.cancelled;
+            let dependency_cancelled = child.is_cancelled();
             let token_cancelled = state
                 .cancellation
                 .is_some_and(CancellationToken::is_cancelled);
@@ -1064,8 +1178,7 @@ fn execute_plan_node(
                 } else if token_cancelled {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
-                child.cancelled = true;
-                child.truncated = true;
+                child.mark_cancelled();
                 push_cancelled_diagnostic(diagnostics);
             }
             if child.rows.len() > *count {
@@ -1074,7 +1187,7 @@ fn execute_plan_node(
                 push_operator_termination(&mut terminations, QueryOperatorTermination::ResultLimit);
                 push_truncation_diagnostic(diagnostics, &state.budget, *count);
                 child.rows.truncate(*count);
-                child.truncated = true;
+                child.mark_truncated();
             }
             child
         }
@@ -1092,7 +1205,7 @@ fn execute_plan_node(
                     &mut terminations,
                     QueryOperatorTermination::CancellationBeforeWork,
                 );
-                cancelled_plan_execution()
+                PlanExecution::cancelled(Vec::new())
             } else {
                 // The code input is branch 0 and the configuration input is
                 // branch 1, in both row provenance and diagnostics. Each runs
@@ -1136,7 +1249,7 @@ fn execute_plan_node(
                     prefix_branch_rows(&mut child.rows, index);
                     prefix_branch_diagnostics(&mut child_diagnostics, index);
                     diagnostics.append(&mut child_diagnostics);
-                    if child.cancelled {
+                    if child.is_cancelled() {
                         push_operator_termination(
                             &mut terminations,
                             QueryOperatorTermination::DependencyCancelled,
@@ -1212,8 +1325,8 @@ fn execute_plan_node(
                             QueryOperatorTermination::TerminalCap,
                         );
                     }
-                    self_truncated = execution.truncated;
-                    if execution.cancelled {
+                    self_truncated = execution.is_truncated();
+                    if execution.is_cancelled() {
                         disposition = QueryOperatorDisposition::Cancelled;
                     }
                     execution
@@ -1238,7 +1351,7 @@ fn execute_plan_node(
                 QueryOperatorTermination::AnalysisIncomplete,
             );
         }
-        if execution.cancelled && disposition == QueryOperatorDisposition::Cancelled {
+        if execution.is_cancelled() && disposition == QueryOperatorDisposition::Cancelled {
             push_operator_termination(
                 &mut terminations,
                 QueryOperatorTermination::CancellationDuringWork,
@@ -1279,8 +1392,8 @@ fn execute_plan_node(
             terminations: terminations.unwrap_or_default(),
             output_rows: execution.rows.len(),
             operator_truncated: self_truncated,
-            result_truncated: execution.truncated,
-            result_cancelled: execution.cancelled,
+            result_truncated: execution.is_truncated(),
+            result_cancelled: execution.is_cancelled(),
         });
     }
     execution
@@ -1296,6 +1409,8 @@ struct BranchAttempt {
     /// The branch truncated against its share of the metered scan budget,
     /// which is the only truncation a larger share can lift.
     starved: bool,
+    depth_bound_status: Option<DepthBoundStatus>,
+    depth_answers: Vec<units::BoundedCallAnswer>,
 }
 
 /// Whether re-running a truncated branch under `retry` can see more of it than
@@ -1379,6 +1494,9 @@ pub(super) fn execute_parallel_seed_union(
                     step_outputs: vec![0; plan.node_count()],
                     receiver_budget_override,
                     budget: base_budget,
+                    // Parallel union dependencies are seed scans only.
+                    depth_bound_status: None,
+                    depth_answers: Vec::new(),
                     seed_cache: CaptureScopedMemo::default(),
                     // Parallel branches dedupe shared per-file charges
                     // through the coordinator ledger, not this one.
@@ -1514,6 +1632,7 @@ pub(super) fn execute_parallel_seed_union(
     let mut truncated = false;
     let mut cancelled_child = None;
     let prefix_started = profiling.then(Instant::now);
+    let qualifying_diagnostic_start = diagnostics.len();
     for (branch, mut result) in scheduled.results.into_iter().enumerate() {
         input_rows = input_rows.saturating_add(result.execution.rows.len());
         let contributes_to_public_prefix = cancelled_child.is_none();
@@ -1521,7 +1640,7 @@ pub(super) fn execute_parallel_seed_union(
             prefix_branch_rows(&mut result.execution.rows, branch);
             prefix_branch_diagnostics(&mut result.diagnostics, branch);
             diagnostics.append(&mut result.diagnostics);
-            truncated |= result.execution.truncated;
+            truncated |= result.execution.is_truncated();
         }
 
         for (key, cached) in result.seed_cache {
@@ -1547,7 +1666,7 @@ pub(super) fn execute_parallel_seed_union(
             state.access_failure = result.access_failure;
         }
         if contributes_to_public_prefix {
-            if result.execution.cancelled {
+            if result.execution.is_cancelled() {
                 cancelled_child = Some(result.execution);
             } else {
                 branch_rows.push(result.execution.rows);
@@ -1574,6 +1693,11 @@ pub(super) fn execute_parallel_seed_union(
     let merge_started = profiling.then(Instant::now);
     let (mut rows, merge_measurement) =
         combine_set_rows(SetOperator::Union, branch_rows, profiling);
+    discharge_decided_qualifying_sites(
+        rows.iter().filter_map(qualifying_pipeline_site),
+        diagnostics,
+        qualifying_diagnostic_start,
+    );
     if let Some(started) = merge_started {
         merge_ns = merge_ns.saturating_add(elapsed_ns(started));
     }
@@ -1596,12 +1720,7 @@ pub(super) fn execute_parallel_seed_union(
         rows.truncate(cap);
     }
     ParallelUnionExecution {
-        execution: PlanExecution {
-            rows,
-            truncated,
-            cancelled: false,
-            pipeline_halted: false,
-        },
+        execution: PlanExecution::new(rows, truncated),
         input_rows,
         rows_visited: input_rows,
         rows_discarded,
@@ -1637,7 +1756,8 @@ pub(super) fn append_diagnostic_terminations(
             // below. A diagnostic can be emitted or replayed by a parent that
             // only observed a cancelled dependency, so prose provenance is
             // not sufficient to call it operator-local work.
-            CodeQueryDiagnosticCode::Cancelled => None,
+            CodeQueryDiagnosticCode::Cancelled
+            | CodeQueryDiagnosticCode::RenderedCapturesTruncated => None,
             CodeQueryDiagnosticCode::ExecutionBudgetExhausted => {
                 Some(QueryOperatorTermination::ExecutionBudget)
             }
@@ -1694,6 +1814,7 @@ pub(super) fn append_diagnostic_terminations(
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
             | CodeQueryDiagnosticCode::SemanticPackAcquisitionPending
+            | CodeQueryDiagnosticCode::SemanticPackActivationFailed
             | CodeQueryDiagnosticCode::CallBindingDispatchPartial
             | CodeQueryDiagnosticCode::CallBindingSelectorRejected
             | CodeQueryDiagnosticCode::SemanticProviderFailed
@@ -1722,6 +1843,8 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
             | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
             | CodeQueryDiagnosticCode::ReferenceAnalysisFailed
+            | CodeQueryDiagnosticCode::ReferenceKindUndecided
+            | CodeQueryDiagnosticCode::EnclosingPatternUndecided
             | CodeQueryDiagnosticCode::OccurrenceResolutionIncomplete
             | CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
             | CodeQueryDiagnosticCode::MaterializationDerivationIncomplete
@@ -1748,6 +1871,11 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete
             | CodeQueryDiagnosticCode::ResultObligationDerivationIncomplete
             | CodeQueryDiagnosticCode::CallShapeCoverageIncomplete
+            | CodeQueryDiagnosticCode::StructuralRoleCoverageIncomplete
+            | CodeQueryDiagnosticCode::QualifyingTypeUnresolved
+            | CodeQueryDiagnosticCode::IdenticalCapturesOpen
+            | CodeQueryDiagnosticCode::MemberFormUndecided
+            | CodeQueryDiagnosticCode::RowPredicateUndecided
             | CodeQueryDiagnosticCode::JsxProjectionIncomplete
             | CodeQueryDiagnosticCode::CrossDomainBindingUnproven
             | CodeQueryDiagnosticCode::CrossDomainKeyUnsupported
@@ -1762,6 +1890,7 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
             | CodeQueryDiagnosticCode::HierarchyIncomplete
             | CodeQueryDiagnosticCode::WorkspaceSemanticModelsNotLoaded
+            | CodeQueryDiagnosticCode::PolicyDeclaredProvenSubset
             | CodeQueryDiagnosticCode::BroadQuery => None,
         };
         if let Some(termination) = termination {
@@ -1770,11 +1899,74 @@ pub(super) fn append_diagnostic_terminations(
     }
 }
 
-pub(super) fn cancelled_plan_execution() -> PlanExecution {
-    PlanExecution {
-        rows: Vec::new(),
-        truncated: true,
-        cancelled: true,
-        pipeline_halted: false,
+/// A transient row-equivalence proof shared by whole and seed-unit unions.
+/// It never enters a memo or serialized unit product.
+pub(super) struct QualifyingDischargeSite {
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub empty_captures: bool,
+    pub first_branch: Option<Vec<usize>>,
+}
+
+fn qualifying_pipeline_site(row: &PipelineRow) -> Option<QualifyingDischargeSite> {
+    let PipelineValue::StructuralMatch(value) = &row.value else {
+        return None;
+    };
+    if value.fact_match.reported_range.is_some() {
+        return None;
     }
+    let span = value.fact_match.display_span(&value.facts);
+    Some(QualifyingDischargeSite {
+        path: crate::path_utils::workspace_relative_slash_path(value.file.rel_path()),
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        empty_captures: value.fact_match.captures.is_empty(),
+        first_branch: row.traces.iter().map(|trace| &trace.branch).min().cloned(),
+    })
+}
+
+/// A union is complete at a site if one of its branches proves a match there.
+/// Other sites and unrelated diagnostics retain their incompleteness.
+pub(super) fn discharge_decided_qualifying_sites(
+    sites: impl IntoIterator<Item = QualifyingDischargeSite>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    start: usize,
+) {
+    if !diagnostics[start..]
+        .iter()
+        .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::QualifyingTypeUnresolved)
+    {
+        return;
+    }
+    let mut decided = std::collections::HashMap::new();
+    for site in sites {
+        decided
+            .entry((site.path, site.start_byte, site.end_byte))
+            .or_insert_with(Vec::new)
+            .push((site.empty_captures, site.first_branch));
+    }
+    let mut index = 0;
+    diagnostics.retain(|diagnostic| {
+        let current = index;
+        index += 1;
+        current < start
+            || diagnostic.code != CodeQueryDiagnosticCode::QualifyingTypeUnresolved
+            || diagnostic.source.as_ref().is_none_or(|source| {
+                diagnostic.withheld_rows_path.as_deref() != Some(source.path.as_str())
+                    || !decided
+                        .get(&(source.path.clone(), source.start_byte, source.end_byte))
+                        .is_some_and(|proofs| {
+                            proofs.iter().any(|(empty_captures, first_branch)| {
+                                // A capture-free unknown cannot change a capture-free
+                                // winner. A captured winner is stable only if it is
+                                // already earlier than the unknown branch.
+                                *empty_captures
+                                    || first_branch
+                                        .as_ref()
+                                        .is_some_and(|branch| branch < &diagnostic.branch)
+                            })
+                        })
+            })
+    });
 }

@@ -14,37 +14,66 @@ use std::sync::Arc;
 
 // Seeds every evidence set's input digest, so a stored set is reused only for
 // the producer that wrote it. v4: Cargo owned lock rows cover each member's
-// transitive lock closure (#9055).
-const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v5";
+// transitive lock closure (#9055). v6: absent configuration candidates no
+// longer count toward the input file cap (#8780).
+const PRODUCER: &[u8] = b"bifrost.static-dependency-evidence.v6";
 pub(super) const READ_ROWS_SQL: &str = "SELECT ecosystem,package,kind,version_requirement,exact_version,source,locator,declared_by,scope,conditions,build_file,source_digest,start_byte,end_byte,complete FROM dependency_file_evidence WHERE set_id = ?1 ORDER BY id";
 
+/// Each language that publishes static dependency evidence, by the snapshot
+/// key its revisions are stored under. Java, Kotlin and Scala publish the
+/// same JVM rows, as JavaScript and TypeScript publish the same npm rows; the
+/// multi-language reader keeps one row per identity.
+const PUBLISHING_LANGUAGES: [(&str, crate::analyzer::Language); 10] = [
+    ("rust", crate::analyzer::Language::Rust),
+    ("javascript", crate::analyzer::Language::JavaScript),
+    ("typescript:ts", crate::analyzer::Language::TypeScript),
+    ("csharp", crate::analyzer::Language::CSharp),
+    ("go", crate::analyzer::Language::Go),
+    ("ruby", crate::analyzer::Language::Ruby),
+    ("php", crate::analyzer::Language::Php),
+    ("java", crate::analyzer::Language::Java),
+    ("kotlin", crate::analyzer::Language::Kotlin),
+    ("scala", crate::analyzer::Language::Scala),
+];
+
+/// Whether `language` publishes static dependency evidence.
+pub fn publishes_dependency_evidence(language: crate::analyzer::Language) -> bool {
+    PUBLISHING_LANGUAGES
+        .iter()
+        .any(|(_, publishing)| *publishing == language)
+}
+
 fn supports_language(language: &str) -> bool {
-    matches!(
-        language,
-        "rust" | "javascript" | "typescript:ts" | "csharp" | "go"
-    )
+    PUBLISHING_LANGUAGES.iter().any(|(key, _)| *key == language)
 }
 
 fn prepare_selected(
     language: &str,
     root: &std::path::Path,
     selected: &[(ProjectFile, ProjectSourceSnapshot)],
+    presence: &[Option<bool>],
     limits: &DependencyFileEvidenceLimits,
 ) -> DependencyFileEvidence {
-    let language = match language {
-        "rust" => crate::analyzer::Language::Rust,
-        "javascript" => crate::analyzer::Language::JavaScript,
-        "typescript:ts" => crate::analyzer::Language::TypeScript,
-        "csharp" => crate::analyzer::Language::CSharp,
-        "go" => crate::analyzer::Language::Go,
-        _ => unreachable!("unsupported dependency evidence language: {language}"),
-    };
+    assert_eq!(selected.len(), presence.len());
+    let language = PUBLISHING_LANGUAGES
+        .iter()
+        .find(|(key, _)| *key == language)
+        .unwrap_or_else(|| unreachable!("unsupported dependency evidence language: {language}"))
+        .1;
     crate::analyzer::store::store_language_support_for_hook(
         language,
         "selected_dependency_file_evidence",
     )
     .expect("selected dependency evidence language has a support")
-    .selected_dependency_file_evidence(root, selected, limits)
+    .selected_dependency_file_evidence(
+        root,
+        &selected
+            .iter()
+            .zip(presence)
+            .map(|((file, source), presence)| (file.clone(), source.clone(), *presence))
+            .collect::<Vec<_>>(),
+        limits,
+    )
 }
 
 #[doc(hidden)]
@@ -57,7 +86,7 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
     // The indexed, ordered metadata cursor has constant memory even when the
     // workspace exceeds the acquisition cap. Include omitted identities in the
     // digest so a relevant edit cannot reuse a stale limit result.
-    let mut metadata = tx.prepare_cached("SELECT rel_path,blob_oid FROM workspace_file_versions WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND input_kind='configuration' AND valid_from<=?4 AND (valid_until IS NULL OR valid_until>?4) ORDER BY rel_path")?;
+    let mut metadata = tx.prepare_cached("SELECT rel_path,blob_oid,file_present FROM workspace_file_versions WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND input_kind='configuration' AND valid_from<=?4 AND (valid_until IS NULL OR valid_until>?4) ORDER BY rel_path")?;
     let mut cursor = metadata.query(params![
         snapshot.workspace_id.as_str(),
         snapshot.lang,
@@ -67,6 +96,14 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
     while let Some(row) = cursor.next()? {
         hash.field("path", row.get::<_, String>(0)?.as_bytes());
         hash.field("oid", row.get::<_, String>(1)?.as_bytes());
+        hash.field(
+            "presence",
+            &[match row.get::<_, Option<bool>>(2)? {
+                Some(true) => 1,
+                Some(false) => 0,
+                None => 2,
+            }],
+        );
     }
     let digest = lower_hex_string(&hash.finish());
     let existing = tx.query_row("SELECT set_id FROM dependency_evidence_sets WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND input_digest=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,digest], |r| r.get::<_,i64>(0)).optional()?;
@@ -77,11 +114,11 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
         // All paths, source identities and ownership are workspace relative;
         // no file under this synthetic absolute root is opened.
         let root = std::env::temp_dir().join("bifrost-selected-dependency-inputs");
-        let (selected, gaps) =
+        let (selected, presence, gaps) =
             selected_inputs(tx, snapshot, &root, &limits, std::iter::empty(), |_, _| {
                 unreachable!("disk publication has no overlay inputs")
             })?;
-        let mut evidence = prepare_selected(&snapshot.lang, &root, &selected, &limits);
+        let mut evidence = prepare_selected(&snapshot.lang, &root, &selected, &presence, &limits);
         evidence.gaps.extend(gaps);
         insert_set(tx, snapshot, &digest, &evidence, &selected)?
     };
@@ -91,6 +128,7 @@ pub fn publish(tx: &Transaction<'_>, snapshot: &WorkspaceSnapshotId) -> Result<(
 
 type SelectedInputs = (
     Vec<(ProjectFile, ProjectSourceSnapshot)>,
+    Vec<Option<bool>>,
     Vec<DependencyEvidenceGap>,
 );
 
@@ -103,18 +141,24 @@ fn selected_inputs<'a>(
     mut read_overlay: impl FnMut(&ProjectFile, usize) -> Result<Option<ProjectSourceSnapshot>>,
 ) -> Result<SelectedInputs> {
     let mut selected = Vec::new();
+    let mut presence = Vec::new();
     let mut gaps = Vec::new();
     let mut bytes = 0_usize;
+    // Only inputs that may exist count toward `max_files`. C# records every
+    // candidate a project could import (`Directory.Build.props`,
+    // `obj/*.nuget.g.props`, ...) as an absent input; they carry no bytes and
+    // grow with the present project files, so counting them made a few dozen
+    // projects exhaust the cap (#8780).
+    let mut counted = 0_usize;
     // C# retains an absent input as an empty blob, and SQLite's substr of a
     // zero-length blob is NULL rather than an empty blob.
-    let mut statement = conn.prepare_cached("SELECT versions.rel_path, length(retained.source_bytes), ifnull(substr(retained.source_bytes,1,?5),x'') FROM workspace_file_versions AS versions JOIN workspace_input_sources AS retained ON retained.content_oid=versions.blob_oid WHERE versions.workspace_id=?1 AND versions.lang=?2 AND versions.generation=?3 AND versions.input_kind='configuration' AND versions.valid_from<=?4 AND (versions.valid_until IS NULL OR versions.valid_until>?4) ORDER BY versions.rel_path LIMIT ?6")?;
+    let mut statement = conn.prepare_cached("SELECT versions.rel_path, length(retained.source_bytes), ifnull(substr(retained.source_bytes,1,?5),x''), versions.file_present FROM workspace_file_versions AS versions JOIN workspace_input_sources AS retained ON retained.content_oid=versions.blob_oid WHERE versions.workspace_id=?1 AND versions.lang=?2 AND versions.generation=?3 AND versions.input_kind='configuration' AND versions.valid_from<=?4 AND (versions.valid_until IS NULL OR versions.valid_until>?4) ORDER BY versions.rel_path")?;
     let mut rows = statement.query(params![
         snapshot.workspace_id.as_str(),
         snapshot.lang,
         snapshot.generation.0,
         snapshot.revision,
-        limits.max_file_bytes,
-        limits.max_files.saturating_add(1)
+        limits.max_file_bytes
     ])?;
     // Merge the ordered overlay identities into the SQL cursor before applying
     // limits. Replaced disk bytes must neither exhaust the budget nor prevent
@@ -135,7 +179,14 @@ fn selected_inputs<'a>(
         } else {
             disk_path.unwrap()
         });
-        if selected.len() >= limits.max_files {
+        let input_presence = if take_overlay {
+            Some(true)
+        } else {
+            disk.expect("selected disk input")
+                .get::<_, Option<bool>>(3)?
+        };
+        let counts = input_presence != Some(false);
+        if counts && counted >= limits.max_files {
             gaps.push(DependencyEvidenceGap {
                 kind: DependencyEvidenceGapKind::Limit,
                 build_file: path,
@@ -208,7 +259,11 @@ fn selected_inputs<'a>(
                     message: "dependency overlay changed during admission".into(),
                 })
             }
-            Ok(source) => selected.push((ProjectFile::new(root, path), source)),
+            Ok(source) => {
+                counted += usize::from(counts);
+                presence.push(input_presence);
+                selected.push((ProjectFile::new(root, path), source));
+            }
             Err(error) => gaps.push(DependencyEvidenceGap {
                 kind: DependencyEvidenceGapKind::Malformed,
                 build_file: path,
@@ -220,7 +275,7 @@ fn selected_inputs<'a>(
             disk = rows.next()?;
         }
     }
-    Ok((selected, gaps))
+    Ok((selected, presence, gaps))
 }
 
 fn insert_set(
@@ -424,19 +479,17 @@ pub fn publish_overlay(
         }) {
             return Ok(None);
         }
-        let key = match language {
-            crate::analyzer::Language::Rust => "rust",
-            crate::analyzer::Language::JavaScript => "javascript",
-            crate::analyzer::Language::TypeScript => "typescript:ts",
-            crate::analyzer::Language::CSharp => "csharp",
-            crate::analyzer::Language::Go => "go",
-            _ => return Ok(None),
+        let Some(&(key, _)) = PUBLISHING_LANGUAGES
+            .iter()
+            .find(|(_, publishing)| *publishing == language)
+        else {
+            return Ok(None);
         };
         let snapshot = snapshots.get(key).ok_or_else(|| {
             super::StoreError::new("dependency overlay has no selected input revision")
         })?;
         let limits = DependencyFileEvidenceLimits::default();
-        let (selected, gaps) = {
+        let (selected, presence, gaps) = {
             let conn = store.read_conn_for_workspace(snapshots)?;
             selected_inputs(
                 &conn,
@@ -463,7 +516,13 @@ pub fn publish_overlay(
                 },
             )?
         };
-        let mut evidence = prepare_selected(&snapshot.lang, project.root(), &selected, &limits);
+        let mut evidence = prepare_selected(
+            &snapshot.lang,
+            project.root(),
+            &selected,
+            &presence,
+            &limits,
+        );
         evidence.gaps.extend(gaps);
         // A private set has one Arc lease. UUID ownership prevents a drop from
         // deleting an identical publication still owned by another analyzer.
@@ -528,29 +587,48 @@ impl AnalyzerStore {
         }
         Ok(result)
     }
+    /// Read `language`'s selected static dependency evidence.
+    ///
+    /// The selection is keyed by the language, not by the snapshots that
+    /// happen to be selected: a language whose workspace inputs never
+    /// published has no snapshot at all, and skipping it reported a complete
+    /// empty answer (#8357).
     #[doc(hidden)]
     pub fn dependency_file_evidence(
         &self,
         snapshots: &WorkspaceSnapshots,
+        language: crate::analyzer::Language,
     ) -> Result<DependencyFileEvidence> {
+        let (key, _) = PUBLISHING_LANGUAGES
+            .iter()
+            .find(|(_, publishing)| *publishing == language)
+            .ok_or_else(|| {
+                super::StoreError::new(format!(
+                    "{language:?} does not publish static dependency evidence"
+                ))
+            })?;
+        let missing = |message: String| DependencyFileEvidence {
+            gaps: vec![DependencyEvidenceGap {
+                kind: DependencyEvidenceGapKind::Missing,
+                build_file: PathBuf::new(),
+                byte_range: 0..0,
+                message,
+            }],
+            ..DependencyFileEvidence::default()
+        };
+        let Some(snapshot) = snapshots.get(*key) else {
+            return Ok(missing(format!(
+                "no {key} workspace input revision is selected"
+            )));
+        };
         let conn = self.read_conn_for_workspace(snapshots)?;
-        let mut result = DependencyFileEvidence::default();
-        for snapshot in snapshots.values().filter(|s| supports_language(&s.lang)) {
-            let set = conn.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,snapshot.revision], |r|r.get::<_,i64>(0)).optional()?;
-            let Some(set) = set else {
-                result.gaps.push(DependencyEvidenceGap {
-                    kind: DependencyEvidenceGapKind::Missing,
-                    build_file: PathBuf::new(),
-                    byte_range: 0..0,
-                    message: "selected revision has no static dependency publication".into(),
-                });
-                continue;
-            };
-            let evidence = read_set(&conn, set)?;
-            result.rows.extend(evidence.rows);
-            result.gaps.extend(evidence.gaps);
-        }
-        Ok(result)
+        let set = conn.query_row("SELECT set_id FROM dependency_evidence_selections WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4", params![snapshot.workspace_id.as_str(),snapshot.lang,snapshot.generation.0,snapshot.revision], |r|r.get::<_,i64>(0)).optional()?;
+        let Some(set) = set else {
+            return Ok(missing(
+                "selected revision has no static dependency publication".into(),
+            ));
+        };
+        read_set(&conn, set)
     }
 }
 fn invalid(label: &str) -> rusqlite::Error {
@@ -617,12 +695,12 @@ mod tests {
         fn selected_dependency_file_evidence(
             &self,
             _root: &std::path::Path,
-            selected: &[(ProjectFile, ProjectSourceSnapshot)],
+            selected: &[(ProjectFile, ProjectSourceSnapshot, Option<bool>)],
             _limits: &DependencyFileEvidenceLimits,
         ) -> DependencyFileEvidence {
             // This test concerns store acquisition, not language parsing. Prove
             // that the real publisher admitted the replacement buffer.
-            if let Some((file, source)) = selected.first() {
+            if let Some((file, source, _)) = selected.first() {
                 assert!(selected.len() <= 2);
                 assert_eq!(file.rel_path(), std::path::Path::new("Cargo.toml"));
                 assert_eq!(source.source(), OVERLAY);
@@ -630,7 +708,7 @@ mod tests {
                     source.origin(),
                     crate::analyzer::ProjectSourceOrigin::Overlay(_)
                 ));
-                if let Some((file, source)) = selected.get(1) {
+                if let Some((file, source, _)) = selected.get(1) {
                     assert_eq!(file.rel_path(), std::path::Path::new("member/Cargo.toml"));
                     assert_eq!(source.source(), OVERLAY);
                     assert_eq!(source.origin(), crate::analyzer::ProjectSourceOrigin::Disk);
@@ -689,7 +767,9 @@ mod tests {
                 )
                 .unwrap();
             let snapshots = WorkspaceSnapshots::from_iter([("rust".into(), snapshot)]);
-            let before = store.dependency_file_evidence(&snapshots).unwrap();
+            let before = store
+                .dependency_file_evidence(&snapshots, Language::Rust)
+                .unwrap();
             assert_eq!(before.gaps.len(), 1);
             assert_eq!(before.gaps[0].kind, DependencyEvidenceGapKind::Limit);
             assert_eq!(

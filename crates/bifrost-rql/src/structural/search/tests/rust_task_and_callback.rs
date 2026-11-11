@@ -424,6 +424,9 @@ pub fn process_control() {
 }
 
 #[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "73e64410abdd: authored procedure callees ignored depth and falsely reported not_reached"
+)]
 fn procedure_callees_follow_only_invoked_callback_formals() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -447,18 +450,13 @@ pub fn root(span: &Span) {
         )
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
-    let query = CodeQuery::from_json(&json!({
-        "languages": ["rust"],
-        "match": { "kind": "function", "name": "root" },
-        "steps": [
-            { "op": "procedure_of" },
-            { "op": "callees" }
-        ],
-        "result_detail": "full"
-    }))
-    .expect("procedure-scoped callback traversal query");
+    let query = CodeQuery::from_sexp(
+        "(callees :depth 3 (procedure-of (language rust (function :name \"root\"))))",
+    )
+    .expect("authored procedure-scoped callback traversal query");
 
     let result = execute_rust_query(&workspace, query);
+    assert_eq!(result.depth_bound_status, Some(DepthBoundStatus::Unknown));
     let closures = result
         .results
         .iter()

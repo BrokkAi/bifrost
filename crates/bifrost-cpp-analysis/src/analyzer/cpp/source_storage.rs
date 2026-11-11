@@ -719,7 +719,7 @@ impl CppSourceStorage for AnalyzerStore {
 type DeclarationTemplateArguments = HashMap<(u32, i64), Vec<CppTemplateExpression>>;
 
 fn read_template_arguments(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     blob_id: i64,
     keep_going: &dyn Fn() -> bool,
 ) -> Result<Option<DeclarationTemplateArguments>> {
@@ -965,7 +965,9 @@ impl<A: LanguageAdapter> CanonicalCppSourceFacts for TreeSitterAnalyzer<A> {
             file.clone(),
         );
         let is_primary_language = lang == self.adapter.storage_language_key_for_file(file);
-        let retained_primary = self.retained_file_state(file, &key);
+        let retained_primary = self.retained_file_state_with_incomplete_detail(file, &key, || {
+            format!("retained C++ parse for {file:?} ({oid}) is incomplete").into()
+        });
         // Ordinary store hydration deliberately omits canonical source families.
         // Only a retained primary parse owns an in-memory source inventory.
         if is_primary_language

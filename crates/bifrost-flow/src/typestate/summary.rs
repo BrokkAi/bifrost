@@ -2,24 +2,27 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
+use std::sync::Arc;
 
 use crate::analyzer::semantic::{
     DurableValueIdentity, IcfgProvider, ProcedureHandle, ReturnTransferKind, SemanticBudget,
     SemanticLocator,
 };
 use crate::dataflow::{
-    DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryKey, ReusableEndSummary,
-    ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider,
-    SemanticProcedureSummary, SemanticSummaryArtifactIndex, SemanticSummarySetValidationError,
-    SolverTermination, SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey,
-    SummaryExitKind, SummaryRecursiveGroupKey, canonical_semantic_summaries_by_artifact,
-    path_evidence_from_frontier, path_evidence_has_complete_path,
-    path_evidence_has_proven_complete_path, path_evidence_has_proven_path, path_evidence_qualities,
-    validate_recursive_summary_batch,
+    DataflowRequest, FactId, MemberReadReceipt, PathQuality, PathQualityFrontier,
+    ProcedureSummaryKey, QualityEvidence, ReusableEndSummary, ReusableProcedureSummary,
+    ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider, SemanticProcedureSummary,
+    SemanticSummaryArtifactIndex, SemanticSummarySetValidationError, SolverTermination,
+    SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey, SummaryDimension,
+    SummaryDimensionState, SummaryExitKind, SummaryRecursiveGroupKey, SummaryWitness,
+    SummaryWitnessStepKind, WitnessFragment, WitnessReconstructionLimits, WitnessStepRow,
+    canonical_protocol_summaries_by_artifact, path_evidence_from_frontier,
+    path_evidence_has_complete_path, path_evidence_has_proven_complete_path,
+    path_evidence_has_proven_path, path_evidence_qualities, validate_recursive_summary_batch,
 };
 
-use super::client::solve_typestate_with_reusable_provider;
+use super::client::solve_typestate_with_reusable_provider_with_receipts;
 use super::{
     CompiledProtocol, ProtocolEventKey, ProtocolExpectationKey, ProtocolStateKey,
     TypestateBindingPlan, TypestateBindingSummaryHash, TypestateContextKey, TypestateFact,
@@ -32,6 +35,138 @@ pub const MAX_PROTOCOL_SUMMARY_ROWS: usize = 65_536;
 pub const MAX_PROTOCOL_SUMMARY_EFFECTS: usize = 65_536;
 pub const DEFAULT_PROTOCOL_SUMMARY_REPOSITORY_ENTRIES: usize = 4_096;
 pub const DEFAULT_PROTOCOL_SUMMARY_REPOSITORY_BYTES: usize = 64 * 1024 * 1024;
+
+fn receipt_is_admissible(receipt: &MemberReadReceipt) -> bool {
+    receipt.channels.unattributed_reads == 0
+        && receipt.channels.execution_dependences == 0
+        && !receipt.channels.reuse_refused
+}
+
+/// A key in a protocol receipt. The representation is private so that only
+/// `new` (which refuses raw `ReadKey::Index`) and the certifying conversion in
+/// `from_member` can construct one: a protocol receipt can never hold a raw
+/// Index read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProtocolReadKey(ProtocolKey);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProtocolKey {
+    Read(crate::analyzer::ReadKey),
+    DefinitionIndexInventory(DefinitionIndexInventory),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DefinitionIndexInventory {
+    pub raw: crate::analyzer::ReadKey,
+    pub normalization_version: Option<u32>,
+    pub delegates: Vec<crate::analyzer::Language>,
+    pub digest: crate::analyzer::semantic::ids::StableDigest,
+}
+
+/// A solve-bound authority over definition buckets. Implementations must use
+/// the solve's exact selected snapshots and delegate set, return None when any
+/// inventory input is unknown, and never record into an enclosing capture.
+pub trait ProtocolInventorySource: fmt::Debug + Send + Sync {
+    fn certify(&self, key: &crate::analyzer::ReadKey) -> Option<DefinitionIndexInventory>;
+}
+
+impl ProtocolReadKey {
+    fn new(key: crate::analyzer::ReadKey) -> Option<Self> {
+        if matches!(key, crate::analyzer::ReadKey::Index { .. }) {
+            None
+        } else {
+            Some(Self(ProtocolKey::Read(key)))
+        }
+    }
+
+    pub fn as_read_key(&self) -> &crate::analyzer::ReadKey {
+        match &self.0 {
+            ProtocolKey::Read(key) => key,
+            ProtocolKey::DefinitionIndexInventory(certificate) => &certificate.raw,
+        }
+    }
+
+    /// The definition-index certificate this key carries, if it is one.
+    pub(super) fn certificate(&self) -> Option<&DefinitionIndexInventory> {
+        match &self.0 {
+            ProtocolKey::Read(_) => None,
+            ProtocolKey::DefinitionIndexInventory(certificate) => Some(certificate),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtocolMemberReceipt {
+    keys: HashSet<ProtocolReadKey>,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncoveredProtocolIndexReads(pub Vec<crate::analyzer::ReadKey>);
+
+impl ProtocolMemberReceipt {
+    /// The only path from a member receipt to a protocol receipt. A raw
+    /// `ReadKey::Index` read names an index bucket, not the answer the probe
+    /// consumed. The snapshot-bound inventory capability covers the three
+    /// definition families; every other raw Index read refuses publication.
+    pub(super) fn from_member(
+        member: &MemberReadReceipt,
+        inventory: Option<&dyn ProtocolInventorySource>,
+    ) -> Result<Self, UncoveredProtocolIndexReads> {
+        let _suppression = crate::analyzer::ReadAttribution::for_receipt_verification().install();
+        let mut uncovered = Vec::new();
+        let mut keys = HashSet::default();
+        for key in &member.keys {
+            match ProtocolReadKey::new(key.clone()) {
+                Some(key) => {
+                    keys.insert(key);
+                }
+                None => {
+                    let certificate = match key {
+                        crate::analyzer::ReadKey::Index {
+                            family:
+                                crate::analyzer::IndexFamily::DefinitionExact
+                                | crate::analyzer::IndexFamily::DefinitionNormalizedTail
+                                | crate::analyzer::IndexFamily::DefinitionIdentifier,
+                            ..
+                        } => inventory.and_then(|source| source.certify(key)),
+                        _ => None,
+                    };
+                    if let Some(certificate) = certificate {
+                        assert_eq!(&certificate.raw, key);
+                        keys.insert(ProtocolReadKey(ProtocolKey::DefinitionIndexInventory(
+                            certificate,
+                        )));
+                    } else {
+                        uncovered.push(key.clone());
+                    }
+                }
+            }
+        }
+        if !uncovered.is_empty() {
+            uncovered.sort();
+            return Err(UncoveredProtocolIndexReads(uncovered));
+        }
+        Ok(Self {
+            keys,
+            channels: member.channels,
+        })
+    }
+
+    pub(super) fn protocol_keys(&self) -> impl Iterator<Item = &ProtocolReadKey> {
+        self.keys.iter()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &crate::analyzer::ReadKey> {
+        self.keys.iter().map(ProtocolReadKey::as_read_key)
+    }
+
+    fn is_admissible(&self) -> bool {
+        self.channels.unattributed_reads == 0
+            && self.channels.execution_dependences == 0
+            && !self.channels.reuse_refused
+    }
+}
 
 #[derive(Default)]
 struct ProtocolBindingContracts {
@@ -73,7 +208,12 @@ impl ProtocolSummaryKey {
         bindings: TypestateBindingSummaryHash,
         entry_facts: Vec<ProtocolFactKey>,
     ) -> Result<Self, ProtocolSummaryError> {
-        if !semantic_summary.completeness().is_complete() {
+        if !matches!(
+            semantic_summary
+                .coverage()
+                .state(SummaryDimension::Protocol),
+            SummaryDimensionState::Complete
+        ) {
             return Err(ProtocolSummaryError::IncompleteSemanticSummary);
         }
         let mut entry_facts = entry_facts;
@@ -121,7 +261,7 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
     pub fn try_new(
         summaries: Vec<&'summary SemanticProcedureSummary>,
     ) -> Result<Self, ProtocolSummaryError> {
-        let (summaries, by_artifact) = canonical_semantic_summaries_by_artifact(summaries)
+        let (summaries, by_artifact) = canonical_protocol_summaries_by_artifact(summaries)
             .map_err(|error| match error {
                 SemanticSummarySetValidationError::Incomplete => {
                     ProtocolSummaryError::IncompleteSemanticSummary
@@ -145,8 +285,6 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
     }
 
     /// Diagnostic presence only: never serves rows and never records a read.
-    /// Any path serving rows to a solve must use compatible_repository, which
-    /// retains record_protocol_repository_read and its unattributed refusal.
     pub(super) fn has_compatible_rows_for_diagnostics(
         &self,
         repository: &CompleteProtocolSummaryStorage,
@@ -162,30 +300,21 @@ impl<'summary> ProtocolSemanticSummarySet<'summary> {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Production rejects row reuse; row-serving paths must retain attribution"
-        )
-    )]
+    /// The stored rows this solve may consult, copied from borrowed storage so
+    /// that only compatible rows are cloned, not the whole repository.
     pub(super) fn compatible_repository(
         &self,
-        repository: &CompleteProtocolSummaryRepository,
+        storage: &CompleteProtocolSummaryStorage,
+        attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
         protocol: &CompiledProtocol,
         bindings: &TypestateBindingPlan,
     ) -> CompleteProtocolSummaryRepository {
-        if !repository.storage.entries.is_empty() {
-            repository.record_read();
-        }
-        let mut compatible = CompleteProtocolSummaryRepository::with_limits(
-            repository.limits(),
-            repository.attribution.clone(),
-        );
+        let mut compatible =
+            CompleteProtocolSummaryRepository::with_limits(storage.limits(), attribution);
         let Some(contracts) = self.compute_binding_contracts(bindings, || false) else {
             return compatible;
         };
-        for summary in repository.storage.entries.values() {
+        for summary in storage.entries.values() {
             if summary.key().protocol() == protocol.hash()
                 && contracts.get(summary.key().procedure()) == Some(&summary.key().bindings())
             {
@@ -388,13 +517,14 @@ impl ProtocolUncertaintyKey {
     }
 
     fn from_live(live: TypestateUncertaintySet) -> Self {
-        const ALL: [TypestateUncertainty; 6] = [
+        const ALL: [TypestateUncertainty; 7] = [
             TypestateUncertainty::AmbiguousDispatch,
             TypestateUncertainty::UnknownCall,
             TypestateUncertainty::ExternalCall,
             TypestateUncertainty::Escape,
             TypestateUncertainty::IncompleteAnalysis,
             TypestateUncertainty::UnmatchedEvent,
+            TypestateUncertainty::ConditionalAlias,
         ];
         Self(
             ALL.into_iter()
@@ -675,6 +805,8 @@ impl ProtocolFactKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProtocolPathEvidence(u8);
 
+type ProtocolWitnessFragments = Box<[(PathQuality, Box<[WitnessStepRow<ProtocolFactKey>]>)]>;
+
 impl ProtocolPathEvidence {
     pub const fn has_proven_path(self) -> bool {
         path_evidence_has_proven_path(self.0)
@@ -697,12 +829,13 @@ impl ProtocolPathEvidence {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProtocolSummaryRow {
     input: ProtocolFactKey,
     exit_kind: SummaryExitKind,
     output: ProtocolFactKey,
     evidence: ProtocolPathEvidence,
+    fragments: ProtocolWitnessFragments,
 }
 
 impl ProtocolSummaryRow {
@@ -723,12 +856,13 @@ impl ProtocolSummaryRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProtocolObservedEffect {
     input: ProtocolFactKey,
     site: SemanticLocator,
     observation: ProtocolFactKey,
     evidence: ProtocolPathEvidence,
+    fragments: ProtocolWitnessFragments,
 }
 
 impl ProtocolObservedEffect {
@@ -755,6 +889,7 @@ pub struct ProtocolSummary {
     key: ProtocolSummaryKey,
     rows: Box<[ProtocolSummaryRow]>,
     effects: Box<[ProtocolObservedEffect]>,
+    receipt: ProtocolMemberReceipt,
 }
 
 impl ProtocolSummary {
@@ -778,7 +913,12 @@ impl ProtocolSummary {
             key,
             rows: rows.into_boxed_slice(),
             effects: effects.into_boxed_slice(),
+            receipt: ProtocolMemberReceipt::default(),
         })
+    }
+
+    pub fn receipt(&self) -> &ProtocolMemberReceipt {
+        &self.receipt
     }
 
     pub const fn key(&self) -> &ProtocolSummaryKey {
@@ -877,7 +1017,24 @@ impl ProtocolSummary {
     }
 
     pub fn retained_bytes(&self) -> usize {
+        let mut receipt_heap = crate::analyzer::store::cache_budget::RetainedHeap::default();
+        receipt_heap.add(
+            self.receipt
+                .keys
+                .capacity()
+                .saturating_mul(size_of::<ProtocolReadKey>()),
+        );
+        for key in self.receipt.keys() {
+            crate::analyzer::store::cache_budget::retained_read_key(&mut receipt_heap, key);
+        }
+        for key in self.receipt.protocol_keys() {
+            if let Some(certificate) = key.certificate() {
+                receipt_heap
+                    .add(certificate.delegates.capacity() * size_of::<crate::analyzer::Language>());
+            }
+        }
         size_of::<Self>()
+            .saturating_add(receipt_heap.total())
             .saturating_add(protocol_key_heap_bytes(&self.key))
             .saturating_add(size_of::<ProtocolSummaryKey>())
             .saturating_add(protocol_key_heap_bytes(&self.key))
@@ -886,6 +1043,7 @@ impl ProtocolSummary {
                 total
                     .saturating_add(protocol_fact_heap_bytes(&row.input))
                     .saturating_add(protocol_fact_heap_bytes(&row.output))
+                    .saturating_add(protocol_fragment_bytes(&row.fragments))
             }))
             .saturating_add(size_of_val(self.effects()))
             .saturating_add(self.effects.iter().fold(0_usize, |total, effect| {
@@ -893,6 +1051,7 @@ impl ProtocolSummary {
                     .saturating_add(protocol_fact_heap_bytes(&effect.input))
                     .saturating_add(crate::value_flow::semantic_locator_heap_bytes(&effect.site))
                     .saturating_add(protocol_fact_heap_bytes(&effect.observation))
+                    .saturating_add(protocol_fragment_bytes(&effect.fragments))
             }))
     }
 }
@@ -1008,10 +1167,23 @@ impl ProtocolSummaryLookupKey {
 }
 
 /// A query-bound view; shared owners retain only CompleteProtocolSummaryStorage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolReceiptVerdict {
+    Current,
+    Stale,
+    Unverifiable,
+}
+
+pub trait ProtocolReceiptVerifier: fmt::Debug + Send + Sync {
+    fn verify(&self, receipt: &ProtocolMemberReceipt) -> ProtocolReceiptVerdict;
+}
+
 #[derive(Debug, Clone)]
 pub struct CompleteProtocolSummaryRepository {
     storage: CompleteProtocolSummaryStorage,
     attribution: crate::analyzer::workspace_authority::OwnedMemoCapability,
+    receipt_verifier: Option<Arc<dyn ProtocolReceiptVerifier>>,
+    inventory_source: Option<Arc<dyn ProtocolInventorySource>>,
 }
 
 impl CompleteProtocolSummaryRepository {
@@ -1025,17 +1197,25 @@ impl CompleteProtocolSummaryRepository {
         Self {
             storage: CompleteProtocolSummaryStorage::with_limits(limits),
             attribution,
+            receipt_verifier: None,
+            inventory_source: None,
         }
     }
-    fn record_read(&self) {
-        record_protocol_repository_read(&self.attribution);
+
+    pub fn bind_inventory_source(&mut self, source: Arc<dyn ProtocolInventorySource>) {
+        self.inventory_source = Some(source);
+    }
+
+    /// Bind a verifier for this request's selected snapshot.
+    pub fn bind_receipt_verifier(&mut self, verifier: Arc<dyn ProtocolReceiptVerifier>) {
+        self.receipt_verifier = Some(verifier);
+    }
+
+    pub fn clear_receipt_verifier(&mut self) {
+        self.receipt_verifier = None;
     }
     pub fn get(&self, key: &ProtocolSummaryKey) -> Option<&ProtocolSummary> {
-        let answer = self.storage.get(key);
-        if answer.is_some() {
-            self.record_read();
-        }
-        answer
+        self.storage.get(key)
     }
     pub fn len(&self) -> usize {
         self.storage.len()
@@ -1081,34 +1261,11 @@ impl CompleteProtocolSummaryRepository {
         bindings: TypestateBindingSummaryHash,
         entry: &ProtocolFactKey,
     ) -> Option<&ProtocolSummary> {
-        let answer = self
-            .storage
-            .matching_summary_for_entry(procedure, protocol, bindings, entry);
-        if answer.is_some() {
-            self.record_read();
-        }
-        answer
+        self.storage
+            .matching_summary_for_entry(procedure, protocol, bindings, entry)
     }
     pub(super) fn into_publication_batches(self) -> ProtocolSummaryPublicationBatches {
         self.storage.into_publication_batches()
-    }
-}
-
-/// Source keys cover the complete index, including negative membership. Until
-/// non-source protocol inputs have a replay receipt, refuse unit reuse too.
-pub(super) fn record_protocol_repository_read(
-    attribution: &crate::analyzer::workspace_authority::OwnedMemoCapability,
-) {
-    let analyzer = attribution.analyzer();
-    crate::analyzer::workspace_authority::record_workspace_authority_read(
-        analyzer,
-        crate::analyzer::WorkspaceFactFamily::ProtocolSummaries,
-        crate::analyzer::workspace_authority::AuthorityInputs::SourceOf(
-            &crate::analyzer::Language::ALL,
-        ),
-    );
-    if attribution.capability().is_capturing() {
-        attribution.capability().record_unattributed();
     }
 }
 
@@ -1422,6 +1579,7 @@ fn entry_projections_match(
 
 struct ProtocolSummaryOracle<'query, 'semantic> {
     repository: &'query CompleteProtocolSummaryRepository,
+    receipt_verifier: Option<Arc<dyn ProtocolReceiptVerifier>>,
     protocol: &'query CompiledProtocol,
     bindings: &'query TypestateBindingPlan,
     semantic_summaries: &'query ProtocolSemanticSummarySet<'semantic>,
@@ -1429,7 +1587,7 @@ struct ProtocolSummaryOracle<'query, 'semantic> {
     remap: Option<ProtocolLiveRemap<'query>>,
     points: HashMap<
         ProcedureHandle,
-        HashMap<SemanticLocator, crate::analyzer::semantic::ProgramPointHandle>,
+        HashMap<SemanticLocator, Option<crate::analyzer::semantic::ProgramPointHandle>>,
     >,
 }
 
@@ -1473,6 +1631,15 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         ) else {
             return Ok(None);
         };
+        let Some(verifier) = &self.receipt_verifier else {
+            return Ok(None);
+        };
+        if summary.receipt.keys.is_empty()
+            || !summary.receipt.is_admissible()
+            || verifier.verify(&summary.receipt) != ProtocolReceiptVerdict::Current
+        {
+            return Ok(None);
+        }
         let row_range = summary.row_range(&entry);
         let effect_range = summary.effect_range(&entry);
         let exit_count = row_range.len();
@@ -1515,7 +1682,10 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
                 let Some(handle) = procedure.point_handle(point.id) else {
                     return Ok(None);
                 };
-                points.insert(super::binding::program_point_locator(&handle), handle);
+                points
+                    .entry(super::binding::program_point_locator(&handle))
+                    .and_modify(|existing| *existing = None)
+                    .or_insert(Some(handle));
             }
             self.points.insert(procedure.clone(), points);
         }
@@ -1548,6 +1718,17 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         }) {
             return Err(termination.into());
         }
+        let rebound_rows = summary.rows[row_range.clone()]
+            .iter()
+            .map(|row| rebind_protocol_fragments(&row.fragments, procedure, remap))
+            .collect::<Option<Vec<_>>>();
+        let rebound_effects = summary.effects[effect_range.clone()]
+            .iter()
+            .map(|effect| rebind_protocol_fragments(&effect.fragments, procedure, remap))
+            .collect::<Option<Vec<_>>>();
+        let evidence_complete = rebound_rows.is_some() && rebound_effects.is_some();
+        let mut row_evidence = rebound_rows.unwrap_or_default().into_iter();
+        let mut effect_evidence = rebound_effects.unwrap_or_default().into_iter();
         let mut exits = Vec::with_capacity(exit_count);
         for row in &summary.rows[row_range] {
             if request.cancellation.is_cancelled() {
@@ -1562,6 +1743,8 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
                     .fact(&row.output)
                     .expect("validated protocol summary output remaps"),
                 qualities: row.evidence.qualities(),
+                evidence: evidence_complete
+                    .then(|| row_evidence.next().expect("one row evidence per row")),
             });
         }
         let mut reached = Vec::with_capacity(effect_count);
@@ -1569,17 +1752,39 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
             if request.cancellation.is_cancelled() {
                 return Err(SolverTermination::Cancelled.into());
             }
-            reached.push(ReusableReachedFact {
-                point: points
+            let evidence = evidence_complete.then(|| {
+                effect_evidence
+                    .next()
+                    .expect("one effect evidence per effect")
+            });
+            let point = if let Some(evidence) = evidence.as_ref() {
+                let Some(point) = rebound_effect_point(evidence, &effect.site) else {
+                    return Ok(None);
+                };
+                point
+            } else {
+                let Some(point) = points
                     .and_then(|points| points.get(&effect.site))
-                    .expect("validated protocol summary effect site remaps")
-                    .clone(),
+                    .and_then(Option::as_ref)
+                else {
+                    return Ok(None);
+                };
+                point.clone()
+            };
+            reached.push(ReusableReachedFact {
+                point,
                 fact: remap
                     .fact(&effect.observation)
                     .expect("validated protocol summary observation remaps"),
+                evidence,
                 qualities: effect.evidence.qualities(),
             });
         }
+        crate::analyzer::i_analyzer::replay_query_read_receipt(
+            self.repository.attribution.analyzer(),
+            summary.receipt.keys().cloned(),
+            summary.receipt.channels,
+        );
         Ok(Some(ReusableProcedureSummary {
             exits: exits.into_boxed_slice(),
             reached: reached.into_boxed_slice(),
@@ -1782,6 +1987,8 @@ pub enum ProtocolSummaryCacheStatus {
     CapacityExceeded,
     Conflict,
     ProjectionSkipped,
+    FragmentUnavailable,
+    ReceiptUnavailable,
 }
 
 impl ProtocolSummarySolveResult {
@@ -1835,9 +2042,13 @@ where
     let binding_contracts = semantic_summaries
         .build_binding_contracts(bindings, request)
         .unwrap_or_default();
+    let inventory_source = repository.inventory_source.take();
+    let receipt_verifier = repository.receipt_verifier.take();
+    let attribution = provider.memo_attribution();
     let result = {
         let mut reusable = ProtocolSummaryOracle {
             repository,
+            receipt_verifier,
             protocol,
             bindings,
             semantic_summaries,
@@ -1845,13 +2056,14 @@ where
             remap: None,
             points: HashMap::new(),
         };
-        solve_typestate_with_reusable_provider(
+        solve_typestate_with_reusable_provider_with_receipts(
             root,
             entry_facts,
             provider,
             &mut reusable,
             protocol,
             bindings,
+            attribution.analyzer(),
             semantic_budget,
             request,
         )?
@@ -1891,6 +2103,7 @@ where
         bindings,
         &result,
         request,
+        inventory_source.as_deref(),
     )?;
     let root_entries = canonical_entry_facts(entry_facts, protocol, bindings)?;
     let application = projection
@@ -1913,6 +2126,8 @@ where
         projection.summaries,
         &binding_contracts,
         projection.skipped,
+        projection.fragment_refused,
+        projection.receipt_refused,
     )?;
     Ok(ProtocolSummarySolveResult {
         result: Box::new(result),
@@ -1944,13 +2159,152 @@ struct ProcedureProtocolProjection {
     rows: Vec<ProtocolSummaryRow>,
     effects: Vec<ProtocolObservedEffect>,
     oversized: bool,
+    fragment_refused: bool,
 }
 
 struct ProtocolProjectionBatch {
     summaries: Vec<ProtocolSummary>,
     skipped: bool,
+    fragment_refused: bool,
+    receipt_refused: bool,
 }
 
+fn encode_protocol_fragment(
+    witness: &SummaryWitness,
+    quality: PathQuality,
+    entry_point: &crate::analyzer::semantic::ProgramPointHandle,
+    entry_fact: FactId,
+    end_point: &crate::analyzer::semantic::ProgramPointHandle,
+    end_fact: FactId,
+    mut canonical_fact: impl FnMut(FactId) -> Option<ProtocolFactKey>,
+) -> Option<Box<[WitnessStepRow<ProtocolFactKey>]>> {
+    let steps = witness.steps();
+    let (seed, edges) = steps.split_first()?;
+    if witness.truncated()
+        || witness.omitted_steps_lower_bound() != 0
+        || witness.quality() != quality
+        || steps.len() > WitnessReconstructionLimits::default().max_steps()
+        || seed.kind() != SummaryWitnessStepKind::Seed
+        || seed.source() != entry_point
+        || seed.target().is_some()
+        || seed.origin().is_some()
+        || seed.boundary().is_some()
+        || seed.receiver_operand().is_some()
+        || !matches!(seed.proof(), crate::analyzer::semantic::ProofStatus::Proven)
+        || !matches!(
+            seed.completeness(),
+            crate::analyzer::semantic::EvidenceCompleteness::Complete
+        )
+        || seed.input_fact() != entry_fact
+        || seed.output_fact() != entry_fact
+    {
+        return None;
+    }
+    let mut folded = PathQuality::PROVEN_COMPLETE;
+    let mut previous = seed;
+    for step in edges {
+        if !matches!(step.kind(), SummaryWitnessStepKind::Edge(_))
+            || step.target().is_none()
+            || step.receiver_operand().is_some()
+            || step.source() != previous.target().unwrap_or(previous.source())
+            || step.input_fact() != previous.output_fact()
+        {
+            return None;
+        }
+        folded = folded.through_evidence(step.proof(), step.completeness());
+        previous = step;
+    }
+    if folded != quality
+        || previous.target().unwrap_or(previous.source()) != end_point
+        || previous.output_fact() != end_fact
+    {
+        return None;
+    }
+    steps
+        .iter()
+        .map(|step| WitnessStepRow::encode(step, &mut canonical_fact).ok())
+        .collect()
+}
+
+fn rebind_protocol_fragments(
+    fragments: &[(PathQuality, Box<[WitnessStepRow<ProtocolFactKey>]>)],
+    procedure: &ProcedureHandle,
+    remap: &ProtocolLiveRemap<'_>,
+) -> Option<Box<[QualityEvidence<TypestateFact>]>> {
+    fragments
+        .iter()
+        .map(|(quality, fragment)| {
+            let steps = fragment
+                .iter()
+                .map(|step| {
+                    step.rebind(
+                        |locator, ordinal| {
+                            // A callee-relative path may traverse a call edge
+                            // into another procedure in this artifact.
+                            procedure.artifact().procedures().iter().find_map(|owner| {
+                                owner
+                                    .points()
+                                    .get(ordinal)
+                                    .filter(|point| point.id.index() == ordinal)
+                                    .and_then(|point| {
+                                        procedure
+                                            .artifact()
+                                            .procedure_handle(owner.id())?
+                                            .point_handle(point.id)
+                                    })
+                                    .filter(|point| point.locator() == Some(locator))
+                            })
+                        },
+                        |locator| {
+                            procedure
+                                .artifact()
+                                .procedures()
+                                .iter()
+                                .flat_map(|owner| {
+                                    owner.call_sites().iter().filter_map(|call| {
+                                        procedure
+                                            .artifact()
+                                            .procedure_handle(owner.id())?
+                                            .call_site_handle(call.id)
+                                    })
+                                })
+                                .find(|call| call.locator() == Some(locator))
+                        },
+                        |fact| remap.fact(fact).ok(),
+                    )
+                    .ok()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(QualityEvidence {
+                quality: *quality,
+                fragment: WitnessFragment {
+                    steps: steps.into_boxed_slice(),
+                },
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn rebound_effect_point(
+    evidence: &[QualityEvidence<TypestateFact>],
+    site: &SemanticLocator,
+) -> Option<crate::analyzer::semantic::ProgramPointHandle> {
+    // Source locators can alias points. The fragment carries the exact point
+    // chosen by the body solve, including for an observed call effect.
+    let point = evidence.first()?.fragment.steps.last()?.output_point();
+    (point.locator() == Some(site)
+        && evidence.iter().all(|quality| {
+            quality
+                .fragment
+                .steps
+                .last()
+                .is_some_and(|step| step.output_point() == point)
+        }))
+    .then(|| point.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn project_complete_protocol_summaries(
     semantic_summaries: &ProtocolSemanticSummarySet<'_>,
     binding_contracts: &ProtocolBindingContracts,
@@ -1958,6 +2312,7 @@ fn project_complete_protocol_summaries(
     bindings: &TypestateBindingPlan,
     result: &TypestateSummaryResult,
     request: &DataflowRequest<'_>,
+    inventory: Option<&dyn ProtocolInventorySource>,
 ) -> Result<ProtocolProjectionBatch, ProtocolSummaryError> {
     if result.protocol_hash() != protocol.hash() {
         return Err(ProtocolSummaryError::ResultProtocolMismatch);
@@ -1978,6 +2333,8 @@ fn project_complete_protocol_summaries(
             return Ok(ProtocolProjectionBatch {
                 summaries: Vec::new(),
                 skipped: true,
+                fragment_refused: false,
+                receipt_refused: false,
             });
         }
         let procedure = summary.entry().procedure();
@@ -2014,11 +2371,44 @@ fn project_complete_protocol_summaries(
             .result()
             .fact(summary.exit_fact())
             .ok_or(ProtocolSummaryError::InvalidFact)?;
+        let mut fragments = Vec::new();
+        for quality in summary.path_qualities().iter() {
+            let Ok(witness) = result.result().witness_for_end_summary(
+                summary,
+                quality,
+                WitnessReconstructionLimits::default(),
+            ) else {
+                projection.fragment_refused = true;
+                break;
+            };
+            let Some(fragment) = encode_protocol_fragment(
+                &witness,
+                quality,
+                summary.entry().entry_point(),
+                summary.entry().entry_fact(),
+                summary.exit_point(),
+                summary.exit_fact(),
+                |id| {
+                    result
+                        .result()
+                        .fact(id)
+                        .and_then(|fact| ProtocolFactKey::from_live(*fact, protocol, bindings).ok())
+                },
+            ) else {
+                projection.fragment_refused = true;
+                break;
+            };
+            fragments.push((quality, fragment));
+        }
+        if projection.fragment_refused {
+            continue;
+        }
         projection.rows.push(ProtocolSummaryRow {
             input,
             exit_kind: exit_kind(summary.exit_kind()),
             output: ProtocolFactKey::from_live(*output, protocol, bindings)?,
             evidence: ProtocolPathEvidence::from_frontier(summary.path_qualities()),
+            fragments: fragments.into_boxed_slice(),
         });
     }
     for reached in result.result().reached() {
@@ -2026,6 +2416,8 @@ fn project_complete_protocol_summaries(
             return Ok(ProtocolProjectionBatch {
                 summaries: Vec::new(),
                 skipped: true,
+                fragment_refused: false,
+                receipt_refused: false,
             });
         }
         let procedure = reached.entry().procedure();
@@ -2072,27 +2464,102 @@ fn project_complete_protocol_summaries(
             projection.oversized = true;
             continue;
         }
+        let mut fragments = Vec::new();
+        for quality in reached.path_qualities().iter() {
+            let Ok(witness) = result.result().witness_for_reached(
+                reached,
+                quality,
+                WitnessReconstructionLimits::default(),
+            ) else {
+                projection.fragment_refused = true;
+                break;
+            };
+            let Some(fragment) = encode_protocol_fragment(
+                &witness,
+                quality,
+                reached.entry().entry_point(),
+                reached.entry().entry_fact(),
+                reached.point(),
+                reached.fact(),
+                |id| {
+                    result
+                        .result()
+                        .fact(id)
+                        .and_then(|fact| ProtocolFactKey::from_live(*fact, protocol, bindings).ok())
+                },
+            ) else {
+                projection.fragment_refused = true;
+                break;
+            };
+            fragments.push((quality, fragment));
+        }
+        if projection.fragment_refused {
+            continue;
+        }
         projection.effects.push(ProtocolObservedEffect {
             input,
             site: super::binding::program_point_locator(reached.point()),
             observation,
             evidence: ProtocolPathEvidence::from_frontier(reached.path_qualities()),
+            fragments: fragments.into_boxed_slice(),
         });
     }
 
     let mut skipped = !ineligible.is_empty();
+    let mut fragment_refused = false;
+    let mut receipt_refused = false;
     let mut summaries = Vec::with_capacity(projections.len());
     for (procedure, projection) in projections {
         let semantic = semantic_summaries
             .unique_summary_for(&procedure)
             .ok_or(ProtocolSummaryError::ProcedureMismatch)?;
         if projection.oversized
+            || projection.fragment_refused
             || semantic
                 .key()
                 .recursive_group()
                 .is_some_and(|group| effectful_recursive_groups.contains(&group))
         {
             skipped = true;
+            fragment_refused |= projection.fragment_refused;
+            continue;
+        }
+        let mut receipt = ProtocolMemberReceipt::default();
+        let members = semantic
+            .key()
+            .recursive_group()
+            .and_then(|group| binding_contracts.recursive_manifest(group));
+        let member_keys: Vec<&ProcedureSummaryKey> = match members {
+            Some(members) => members.iter().collect(),
+            None => vec![semantic.key()],
+        };
+        let member_receipts = result.result().member_receipts();
+        let mut complete_receipt = true;
+        for member_key in member_keys {
+            let member = member_receipts.and_then(|receipts| {
+                receipts.iter().find_map(|(handle, receipt)| {
+                    member_key.matches_procedure(handle).then_some(receipt)
+                })
+            });
+            let Some(member) = member else {
+                complete_receipt = false;
+                break;
+            };
+            if !receipt_is_admissible(member) || member.keys.is_empty() {
+                complete_receipt = false;
+                break;
+            }
+            let Ok(converted) = ProtocolMemberReceipt::from_member(member, inventory) else {
+                complete_receipt = false;
+                break;
+            };
+            receipt.keys.extend(converted.keys);
+            receipt.channels.unattributed_reads |= converted.channels.unattributed_reads;
+            receipt.channels.execution_dependences |= converted.channels.execution_dependences;
+            receipt.channels.reuse_refused |= converted.channels.reuse_refused;
+        }
+        if !complete_receipt {
+            receipt_refused = true;
             continue;
         }
         let mut entry_facts = projection.entries.into_iter().collect::<Vec<_>>();
@@ -2108,14 +2575,17 @@ fn project_complete_protocol_summaries(
             entry_facts,
         )?;
         validate_key_inputs(&key, protocol, binding_contract)?;
-        summaries.push(ProtocolSummary::try_new(
-            key,
-            projection.rows,
-            projection.effects,
-        )?);
+        let mut summary = ProtocolSummary::try_new(key, projection.rows, projection.effects)?;
+        summary.receipt = receipt;
+        summaries.push(summary);
     }
     summaries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-    Ok(ProtocolProjectionBatch { summaries, skipped })
+    Ok(ProtocolProjectionBatch {
+        summaries,
+        skipped,
+        fragment_refused,
+        receipt_refused,
+    })
 }
 
 fn publish_protocol_summaries(
@@ -2123,7 +2593,18 @@ fn publish_protocol_summaries(
     summaries: Vec<ProtocolSummary>,
     binding_contracts: &ProtocolBindingContracts,
     projection_skipped: bool,
+    fragment_refused: bool,
+    receipt_refused: bool,
 ) -> Result<(ProtocolSummaryCacheStatus, usize), ProtocolSummarySolveError> {
+    let mut receipt_refused = receipt_refused;
+    let summaries: Vec<_> = summaries
+        .into_iter()
+        .filter(|summary| {
+            let admissible = summary.receipt.is_admissible() && !summary.receipt.keys.is_empty();
+            receipt_refused |= !admissible;
+            admissible
+        })
+        .collect();
     let batches = partition_protocol_summaries(summaries);
 
     let mut published_any = false;
@@ -2180,6 +2661,10 @@ fn publish_protocol_summaries(
         ProtocolSummaryCacheStatus::Conflict
     } else if capacity_exceeded {
         ProtocolSummaryCacheStatus::CapacityExceeded
+    } else if fragment_refused {
+        ProtocolSummaryCacheStatus::FragmentUnavailable
+    } else if receipt_refused {
+        ProtocolSummaryCacheStatus::ReceiptUnavailable
     } else if projection_skipped {
         ProtocolSummaryCacheStatus::ProjectionSkipped
     } else if recursive_batch_required {
@@ -2232,6 +2717,13 @@ fn canonicalize_rows(rows: &mut Vec<ProtocolSummaryRow>) -> Result<(), ProtocolS
             && previous.output == row.output
         {
             previous.evidence.0 |= row.evidence.0;
+            let mut fragments = previous.fragments.to_vec();
+            for fragment in row.fragments.iter() {
+                if !fragments.iter().any(|(quality, _)| *quality == fragment.0) {
+                    fragments.push(fragment.clone());
+                }
+            }
+            previous.fragments = fragments.into_boxed_slice();
         } else {
             joined.push(row);
         }
@@ -2261,6 +2753,13 @@ fn canonicalize_effects(
             && previous.observation == effect.observation
         {
             previous.evidence.0 |= effect.evidence.0;
+            let mut fragments = previous.fragments.to_vec();
+            for fragment in effect.fragments.iter() {
+                if !fragments.iter().any(|(quality, _)| *quality == fragment.0) {
+                    fragments.push(fragment.clone());
+                }
+            }
+            previous.fragments = fragments.into_boxed_slice();
         } else {
             joined.push(effect);
         }
@@ -2349,6 +2848,47 @@ fn protocol_repository_entry_bytes(summary: &ProtocolSummary) -> usize {
                         .saturating_add(protocol_key_heap_bytes(&summary.key))
                 }),
         )
+}
+
+fn protocol_fragment_bytes(
+    fragments: &[(PathQuality, Box<[WitnessStepRow<ProtocolFactKey>]>)],
+) -> usize {
+    fragments
+        .iter()
+        .fold(size_of_val(fragments), |total, (_, steps)| {
+            total
+                .saturating_add(size_of_val(steps.as_ref()))
+                .saturating_add(steps.iter().fold(0usize, |bytes, step| {
+                    bytes
+                        .saturating_add(protocol_fact_heap_bytes(&step.input_fact))
+                        .saturating_add(protocol_fact_heap_bytes(&step.output_fact))
+                        .saturating_add(crate::value_flow::semantic_locator_heap_bytes(
+                            &step.source.locator,
+                        ))
+                        .saturating_add(step.target.as_ref().map_or(0, |point| {
+                            crate::value_flow::semantic_locator_heap_bytes(&point.locator)
+                        }))
+                        .saturating_add(
+                            step.origin
+                                .as_ref()
+                                .map_or(0, crate::value_flow::semantic_locator_heap_bytes),
+                        )
+                        .saturating_add(step.proof.retained_heap_bytes())
+                        .saturating_add(step.completeness.retained_heap_bytes())
+                        .saturating_add(
+                            step.boundary
+                                .as_ref()
+                                .and_then(|boundary| boundary.target_locator())
+                                .map_or(0, crate::value_flow::semantic_locator_heap_bytes),
+                        )
+                        .saturating_add(match &step.typed {
+                            crate::dataflow::WitnessStepState::None => 0,
+                            crate::dataflow::WitnessStepState::ModeledReceiver { operand } => {
+                                crate::value_flow::semantic_locator_heap_bytes(operand)
+                            }
+                        })
+                }))
+        })
 }
 
 fn protocol_key_heap_bytes(key: &ProtocolSummaryKey) -> usize {
@@ -2507,6 +3047,112 @@ fn context_key_heap_bytes(key: &TypestateContextKey) -> usize {
 mod attribution_tests {
     use super::*;
     use crate::analyzer::{ReadKey, capture_query_reads};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn unattributed_member_receipts_are_ineligible_for_publication() {
+        let mut receipt = MemberReadReceipt::default();
+        receipt.channels.unattributed_reads = 1;
+        assert!(!receipt_is_admissible(&receipt));
+        receipt.channels.unattributed_reads = 0;
+        receipt.channels.execution_dependences = 1;
+        assert!(!receipt_is_admissible(&receipt));
+        receipt.channels.execution_dependences = 0;
+        receipt.channels.reuse_refused = true;
+        assert!(!receipt_is_admissible(&receipt));
+    }
+
+    #[test]
+    #[hardwon(
+        "#10187: raw definition index reads could enter protocol receipts without answer certification"
+    )]
+    fn raw_index_member_receipts_are_ineligible_for_publication() {
+        let mut receipt = MemberReadReceipt::default();
+        receipt.keys.insert(ReadKey::index(
+            crate::analyzer::IndexFamily::DefinitionExact,
+            "new_target",
+        ));
+        assert_eq!(
+            ProtocolMemberReceipt::from_member(&receipt, None),
+            Err(UncoveredProtocolIndexReads(vec![ReadKey::index(
+                crate::analyzer::IndexFamily::DefinitionExact,
+                "new_target",
+            )]))
+        );
+    }
+
+    #[test]
+    fn a_certificate_does_not_cover_a_raw_definition_probe() {
+        use crate::analyzer::semantic::read_ledger::CertifiedDefinitionKind;
+        use crate::analyzer::{IndexFamily, LookupKind, LookupQuestion};
+        // No producer certifies a definition probe yet (#10325), so even a
+        // matching certificate beside the raw key must not publish the row.
+        let raw = ReadKey::index(IndexFamily::DefinitionExact, "new_target");
+        let mut receipt = MemberReadReceipt::default();
+        receipt.keys.insert(raw.clone());
+        receipt.keys.insert(ReadKey::lookup(
+            LookupKind::CertifiedDefinitionAnswer,
+            LookupQuestion::certified_definition(
+                CertifiedDefinitionKind::Exact,
+                "new_target",
+                [brokk_bifrost_core::analyzer::model::Language::Go],
+            ),
+            crate::analyzer::semantic::ids::StableDigest::sha256([]),
+        ));
+        assert_eq!(
+            ProtocolMemberReceipt::from_member(&receipt, None),
+            Err(UncoveredProtocolIndexReads(vec![raw]))
+        );
+    }
+
+    #[test]
+    #[hardwon("#10187: a changed definition answer was accepted as a current protocol receipt")]
+    fn changed_definition_certificate_is_stale() {
+        use crate::analyzer::semantic::read_ledger::CertifiedDefinitionKind;
+        use crate::analyzer::{LookupKind, LookupQuestion};
+        let project = crate::inline_project::InlineTestProject::with_language(
+            brokk_bifrost_core::analyzer::model::Language::Go,
+        )
+        .file("main.go", "package main\nfunc helper() {}\n")
+        .file("added.go", "package main\nfunc unrelated() {}\n")
+        .build();
+        let base = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        // Receipts hold certificates only in this verifier test: the conversion
+        // never produces one, but the verifier must stay sound for when it does.
+        let certified = |name: &str| {
+            let question = LookupQuestion::certified_definition(
+                CertifiedDefinitionKind::Identifier,
+                name,
+                base.analyzer().languages(),
+            );
+            let digest = crate::analyzer::read_verification::certified_definition_answer_digest(
+                base.analyzer(),
+                &question,
+            )
+            .unwrap();
+            let mut member = MemberReadReceipt::default();
+            member.keys.insert(ReadKey::lookup(
+                LookupKind::CertifiedDefinitionAnswer,
+                question,
+                digest,
+            ));
+            ProtocolMemberReceipt::from_member(&member, None).unwrap()
+        };
+        let receipt = certified("helper");
+        let negative = certified("later");
+        std::fs::write(
+            project.root().join("added.go"),
+            "package main\nfunc helper() {}\nfunc later() {}\n",
+        )
+        .unwrap();
+        let changed = project.workspace_analyzer(crate::analyzer::AnalyzerConfig::default());
+        let verifier = crate::typestate::production::ProductionProtocolReceiptVerifier {
+            workspace: changed,
+            memo: Default::default(),
+        };
+        assert_eq!(verifier.verify(&receipt), ProtocolReceiptVerdict::Stale);
+        assert_eq!(verifier.verify(&negative), ProtocolReceiptVerdict::Stale);
+    }
 
     fn empty_protocol(state: &str) -> CompiledProtocol {
         use crate::typestate::{
@@ -2545,6 +3191,21 @@ mod attribution_tests {
             &crate::analyzer::WorkspaceAnalyzer,
             &crate::typestate::ProductionTypestateSummaryRepository,
             &dyn Fn() -> super::super::TypestateProductionCacheStatus,
+        ),
+    ) {
+        with_production_result_cache_budgeted(limits, None, |workspace, repository, solve| {
+            let status = || solve().cache_status();
+            check(workspace, repository, &status);
+        });
+    }
+
+    fn with_production_result_cache_budgeted(
+        limits: crate::typestate::TypestateSummaryRepositoryLimits,
+        application_limit: Option<usize>,
+        check: impl FnOnce(
+            &crate::analyzer::WorkspaceAnalyzer,
+            &crate::typestate::ProductionTypestateSummaryRepository,
+            &dyn Fn() -> crate::typestate::ProductionTypestateSolveResult,
         ),
     ) {
         use crate::analyzer::semantic::{CancellationToken, SemanticRequest};
@@ -2592,23 +3253,44 @@ mod attribution_tests {
             limits,
             crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
         );
-        let solve = || {
+        let provider = workspace.icfg_provider();
+        let projection_provider = workspace.icfg_provider();
+        let solve_with = |repository: &ProductionTypestateSummaryRepository,
+                          semantic_budget: &mut SemanticBudget| {
+            let mut solver_limits = SolverBudget::default().limits();
+            if let Some(limit) = application_limit {
+                solver_limits.summary_applications = limit;
+            }
+            let mut solver_budget = SolverBudget::new(solver_limits);
             solve_typestate_with_production_summaries(
-                &repository,
+                repository,
                 &NoSummaryReadObserver,
                 &root,
                 &[],
-                &workspace.icfg_provider(),
-                &workspace.icfg_provider(),
+                &provider,
+                &projection_provider,
+                None,
                 ProductionTypestateExecutionContext::Workspace,
                 &protocol,
                 &bindings,
-                &mut SemanticBudget::default(),
-                &mut DataflowRequest::new(&mut SolverBudget::default(), &cancellation),
+                semantic_budget,
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
             )
             .unwrap()
-            .cache_status()
         };
+        // Keep the real provider-owned dependencies resident, so these read
+        // attribution tests exercise hits that pass cold-admission checks.
+        let mut baseline = SemanticBudget::default();
+        baseline.charge_complete_artifact(&artifact).unwrap();
+        {
+            let priming = ProductionTypestateSummaryRepository::with_limits(
+                limits,
+                crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
+            );
+            drop(solve_with(&priming, &mut baseline));
+        }
+        baseline.release_transient_residency();
+        let solve = || solve_with(&repository, &mut baseline.clone());
         check(&workspace, &repository, &solve);
     }
 
@@ -2629,6 +3311,35 @@ mod attribution_tests {
                 "the fill must have recorded inputs"
             );
         });
+    }
+
+    #[test]
+    fn budget_stopped_production_solve_does_not_publish_certified_results() {
+        use crate::dataflow::SolverBudgetDimension;
+        use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
+        with_production_result_cache_budgeted(
+            Default::default(),
+            Some(0),
+            |_workspace, repository, solve| {
+                for _ in 0..2 {
+                    let result = solve();
+                    assert_eq!(
+                        result
+                            .result()
+                            .result()
+                            .termination()
+                            .budget_exceeded()
+                            .unwrap()
+                            .dimension(),
+                        SolverBudgetDimension::SummaryApplications
+                    );
+                    assert_ne!(result.cache_status(), MissPublished);
+                    assert_ne!(result.cache_status(), Hit);
+                    assert_eq!(result.published_protocol_summaries(), 0);
+                }
+                assert_eq!(repository.retained_result_count(), 0);
+            },
+        );
     }
 
     #[test]
@@ -2676,10 +3387,7 @@ mod attribution_tests {
     }
 
     #[test]
-    #[brokk_bifrost_test_macros::hardwon(
-        "#7884: a typestate production-cache hit recorded no callee-summary reads"
-    )]
-    fn production_cache_hits_replay_callee_summary_reads() {
+    fn production_cache_hits_replay_direct_solve_reads() {
         use crate::analyzer::LookupKind;
         use crate::typestate::TypestateProductionCacheStatus::{Hit, MissPublished};
         with_production_result_cache(Default::default(), |workspace, _repository, solve| {
@@ -2701,14 +3409,13 @@ mod attribution_tests {
                     .collect::<Vec<_>>()
             };
             let expected = summary_reads(&fill.keys());
-            assert!(
-                expected.len() >= 2,
-                "root and callee must both be recorded: {fill:?}"
-            );
+            assert!(expected.is_empty(), "refused summaries have no lookup rows");
+            assert!(!fill.keys().is_empty());
             let (_, hit) = capture_query_reads(workspace.analyzer(), || {
                 assert_eq!(solve(), Hit);
             });
             assert_eq!(summary_reads(&hit.keys()), expected);
+            assert_eq!(hit.keys(), fill.keys());
             assert_eq!(hit.unattributed_reads(), 0);
             assert!(hit.is_bounded());
         });
@@ -2805,7 +3512,12 @@ mod attribution_tests {
                 assert_eq!(
                     present,
                     !semantic_set
-                        .compatible_repository(repository, protocol, &bindings)
+                        .compatible_repository(
+                            &repository.storage,
+                            repository.attribution.clone(),
+                            protocol,
+                            &bindings
+                        )
                         .is_empty()
                 );
             };
@@ -2835,7 +3547,10 @@ mod attribution_tests {
     }
 
     #[test]
-    fn compatible_protocol_rows_consumed_by_a_standalone_solve_remain_unattributed() {
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9642: conflicting effect fragments must refuse a reusable row"
+    )]
+    fn compatible_protocol_rows_consumed_by_a_standalone_solve_replay_receipts() {
         use crate::analyzer::semantic::{CancellationToken, SemanticRequest};
         use crate::dataflow::SolverBudget;
         let project = crate::inline_project::InlineTestProject::with_language(
@@ -2877,7 +3592,25 @@ mod attribution_tests {
             &mut SemanticRequest::new(&mut budget, &cancellation),
         )
         .unwrap();
-        let semantic_set = summaries.protocol_summaries().unwrap();
+        // The standalone repository test supplies complete synthetic summaries.
+        // Production projection itself must refuse reusable completeness.
+        assert!(summaries.protocol_summaries().is_err());
+        let complete = summaries
+            .summaries()
+            .iter()
+            .map(|projected| {
+                crate::dataflow::SemanticProcedureSummary::try_new_with_coverage(
+                    projected.key().clone(),
+                    projected.transfers().to_vec(),
+                    projected.effects().to_vec(),
+                    projected.dependencies().to_vec(),
+                    crate::dataflow::SummaryCompleteness::Complete,
+                    crate::test_support::complete_summary_coverage(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let semantic_set = ProtocolSemanticSummarySet::try_new(complete.iter().collect()).unwrap();
         let protocol = empty_protocol("ready");
         let bindings =
             TypestateBindingPlan::try_new(&protocol, vec![], vec![], vec![], vec![]).unwrap();
@@ -2898,9 +3631,307 @@ mod attribution_tests {
         )
         .unwrap();
         assert!(first.published_summaries() > 0);
+        let fragment_row = repository
+            .storage
+            .entries
+            .values()
+            .find(|summary| {
+                summary.rows.iter().any(|row| !row.fragments.is_empty())
+                    || summary
+                        .effects
+                        .iter()
+                        .any(|effect| !effect.fragments.is_empty())
+            })
+            .expect("published summary has witness fragments")
+            .clone();
+        let mut without_fragments = fragment_row.clone();
+        for row in &mut without_fragments.rows {
+            row.fragments = Box::default();
+        }
+        for effect in &mut without_fragments.effects {
+            effect.fragments = Box::default();
+        }
+        let limit = protocol_repository_entry_bytes(&fragment_row) - 1;
+        assert!(protocol_repository_entry_bytes(&without_fragments) <= limit);
+        let mut limited = CompleteProtocolSummaryRepository::with_limits(
+            ProtocolSummaryRepositoryLimits {
+                max_entries: 1,
+                max_bytes: limit,
+            },
+            crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
+        );
+        assert_eq!(
+            limited.publish(fragment_row),
+            Err(ProtocolSummaryPublicationError::ByteLimitExceeded)
+        );
+        assert_eq!(
+            limited.publish(without_fragments),
+            Ok(ProtocolSummaryPublicationOutcome::Inserted)
+        );
+        assert!(
+            repository
+                .storage
+                .entries
+                .values()
+                .all(|summary| !summary.receipt.keys.is_empty()),
+            "published summaries need member reads: {:#?}",
+            repository.storage.entries
+        );
+        let contracts = semantic_set
+            .compute_binding_contracts(&bindings, || false)
+            .unwrap();
+        let strict_solve = |repository: &CompleteProtocolSummaryRepository,
+                            witness_limit: Option<usize>,
+                            application_limit: Option<usize>,
+                            cancel_before_commit: bool| {
+            #[derive(Debug)]
+            struct CurrentReceipt;
+            impl ProtocolReceiptVerifier for CurrentReceipt {
+                fn verify(&self, _: &ProtocolMemberReceipt) -> ProtocolReceiptVerdict {
+                    ProtocolReceiptVerdict::Current
+                }
+            }
+            let mut oracle = ProtocolSummaryOracle {
+                repository,
+                receipt_verifier: Some(Arc::new(CurrentReceipt)),
+                protocol: &protocol,
+                bindings: &bindings,
+                semantic_summaries: &semantic_set,
+                binding_contracts: &contracts,
+                remap: None,
+                points: HashMap::new(),
+            };
+            let mut limits = SolverBudget::default().limits();
+            if let Some(limit) = witness_limit {
+                limits.witness_relations = limit;
+            }
+            if let Some(limit) = application_limit {
+                limits.summary_applications = limit;
+            }
+            let mut solver_budget = SolverBudget::new(limits);
+            let cancellation = CancellationToken::default();
+            if cancel_before_commit {
+                crate::dataflow::cancel_next_reusable_entry_before_commit();
+            }
+            super::super::client::solve_typestate_with_reusable_provider_with_retention(
+                &root,
+                &[],
+                &workspace.icfg_provider(),
+                &mut oracle,
+                &protocol,
+                &bindings,
+                crate::dataflow::WitnessRetentionLimits::new(1).unwrap(),
+                None,
+                &mut SemanticBudget::default(),
+                &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+            )
+            .unwrap()
+        };
+        let empty = CompleteProtocolSummaryRepository::new(
+            crate::analyzer::workspace_authority::workspace_memo_attribution(&workspace),
+        );
+        let fresh_strict = strict_solve(&empty, None, None, false);
+        let served_strict = strict_solve(&repository, None, None, false);
+        assert!(served_strict.result().metrics().reusable_summary_hits > 0);
+        let fresh_end = fresh_strict.result().end_summaries().first().unwrap();
+        let served_end = served_strict.result().end_summaries().first().unwrap();
+        let quality = fresh_end.path_qualities().iter().next().unwrap();
+        let fresh_witness = fresh_strict
+            .result()
+            .witness_for_end_summary(fresh_end, quality, WitnessReconstructionLimits::default())
+            .unwrap();
+        let served_witness = served_strict
+            .result()
+            .witness_for_end_summary(served_end, quality, WitnessReconstructionLimits::default())
+            .unwrap();
+        assert_eq!(fresh_witness.steps(), served_witness.steps());
+        // Strict replay reserves all of an entry's witness nodes in one charge.
+        // Find the first witness budget that admits the served entry, then
+        // check both sides of that boundary on the same fixture.
+        let full_witness_work = served_strict.result().work().witness_relations;
+        let entry_boundary = (0..=full_witness_work)
+            .find(|&limit| {
+                strict_solve(&repository, Some(limit), None, false)
+                    .result()
+                    .metrics()
+                    .reusable_summary_hits
+                    > 0
+            })
+            .expect("the unbounded served solve admitted an entry");
+        assert!(entry_boundary > 0);
+        let below = strict_solve(&repository, Some(entry_boundary - 1), None, false);
+        let staged_reservation = crate::dataflow::take_last_reusable_entry_reservation()
+            .expect("the served entry reached its installation reservation");
+        let below_result = below.result();
+        let exceeded = below_result
+            .termination()
+            .budget_exceeded()
+            .expect("below the atomic installation reservation must stop on budget");
+        assert_eq!(
+            exceeded.dimension(),
+            crate::dataflow::SolverBudgetDimension::WitnessRelations
+        );
+        assert_eq!(below_result.metrics().reusable_summary_hits, 0);
+        assert!(!below_result.is_complete());
+        assert_eq!(
+            below_result.witness_node_count(),
+            below_result.work().witness_relations
+        );
+        assert!(below_result.work().witness_relations < entry_boundary);
+        // The failed charge reports the prospective total. Subtracting the
+        // committed work measures the entry's staged witness reservation,
+        // independently of the search that found the boundary.
+        let entry_witness_reservation =
+            exceeded.attempted() - below_result.work().witness_relations;
+        assert!(entry_witness_reservation > 0);
+        assert_eq!(
+            staged_reservation.witness_relations,
+            entry_witness_reservation
+        );
+        assert_eq!(exceeded.limit(), entry_boundary - 1);
+        assert_eq!(
+            below_result.work().witness_relations + entry_witness_reservation,
+            entry_boundary,
+            "the whole staged entry is charged once"
+        );
+        assert!(below_result.reached().iter().all(
+            |row| row.entry().procedure() == &root || row.point() == row.entry().entry_point()
+        ));
+        assert!(
+            below_result
+                .end_summaries()
+                .iter()
+                .all(|row| row.entry().procedure() == &root)
+        );
+        for limit in [entry_boundary, entry_boundary + 1] {
+            let admitted = strict_solve(&repository, Some(limit), None, false);
+            assert!(admitted.result().metrics().reusable_summary_hits > 0);
+            assert!(admitted.result().work().witness_relations <= limit);
+            if limit == entry_boundary {
+                assert_eq!(
+                    admitted.result().work().witness_relations,
+                    below_result.work().witness_relations + entry_witness_reservation,
+                    "entry admission charges its staged witnesses exactly once"
+                );
+            }
+        }
+        let rows_before_cancel = repository.storage.entries.clone();
+        let cancelled = strict_solve(&repository, Some(entry_boundary), None, true);
+        let cancelled_result = cancelled.result();
+        assert_eq!(
+            cancelled_result.termination(),
+            crate::dataflow::SolverTermination::Cancelled
+        );
+        assert_eq!(cancelled_result.metrics().reusable_summary_hits, 0);
+        assert!(!cancelled_result.is_complete());
+        assert_eq!(repository.storage.entries, rows_before_cancel);
+        assert_eq!(cancelled_result.facts(), below_result.facts());
+        assert_eq!(cancelled_result.reached(), below_result.reached());
+        assert_eq!(
+            cancelled_result.witness_node_count(),
+            below_result.witness_node_count()
+        );
+        assert_eq!(cancelled_result.work().witness_relations, entry_boundary);
+        assert_eq!(
+            cancelled_result.work().interned_facts,
+            below_result.work().interned_facts + staged_reservation.interned_facts
+        );
+        assert_eq!(
+            cancelled_result.work().reached_states,
+            below_result.work().reached_states + staged_reservation.reached_states
+        );
+        assert_eq!(
+            cancelled_result.work().end_summaries,
+            below_result.work().end_summaries + staged_reservation.end_summaries
+        );
+        assert!(cancelled_result.reached().iter().all(
+            |row| row.entry().procedure() == &root || row.point() == row.entry().entry_point()
+        ));
+        assert!(
+            cancelled_result
+                .end_summaries()
+                .iter()
+                .all(|row| row.entry().procedure() == &root)
+        );
+        // The reserved work stays charged: cancellation ends this solve before
+        // any later application can consume its remaining budget.
+        let application_stopped = strict_solve(&repository, None, Some(0), false);
+        let application_result = application_stopped.result();
+        let exceeded = application_result
+            .termination()
+            .budget_exceeded()
+            .expect("application after entry installation must stop on budget");
+        assert_eq!(
+            exceeded.dimension(),
+            crate::dataflow::SolverBudgetDimension::SummaryApplications
+        );
+        assert!(application_result.metrics().reusable_summary_hits > 0);
+        assert_eq!(application_result.work().summary_applications, 0);
+        assert!(application_result.work().witness_relations < full_witness_work);
+        assert!(!application_result.is_complete());
+        // The public publication path must leave the retained repository
+        // unchanged when normal caller application runs out of budget.
+        let mut budget_stopped_repository = repository.clone();
+        #[derive(Debug)]
+        struct CurrentReceipt;
+        impl ProtocolReceiptVerifier for CurrentReceipt {
+            fn verify(&self, _: &ProtocolMemberReceipt) -> ProtocolReceiptVerdict {
+                ProtocolReceiptVerdict::Current
+            }
+        }
+        budget_stopped_repository.bind_receipt_verifier(Arc::new(CurrentReceipt));
+        let original_rows = budget_stopped_repository.storage.entries.clone();
+        let mut limits = SolverBudget::default().limits();
+        limits.summary_applications = 0;
+        let mut solver_budget = SolverBudget::new(limits);
+        let budget_stopped = solve_typestate_with_reusable_summaries(
+            &root,
+            &[],
+            &workspace.icfg_provider(),
+            &protocol,
+            &bindings,
+            &semantic_set,
+            &mut budget_stopped_repository,
+            &mut SemanticBudget::default(),
+            &mut DataflowRequest::new(&mut solver_budget, &cancellation),
+        )
+        .unwrap();
+        assert!(
+            budget_stopped
+                .result
+                .result()
+                .metrics()
+                .reusable_summary_hits
+                > 0
+        );
+        assert_eq!(
+            budget_stopped
+                .result
+                .result()
+                .termination()
+                .budget_exceeded()
+                .unwrap()
+                .dimension(),
+            crate::dataflow::SolverBudgetDimension::SummaryApplications
+        );
+        assert_eq!(budget_stopped.published_summaries(), 0);
+        assert_eq!(budget_stopped_repository.storage.entries, original_rows);
+        assert!(!budget_stopped.result.is_complete());
         let (_, reads) = capture_query_reads(workspace.analyzer(), || {
-            let mut compatible =
-                semantic_set.compatible_repository(&repository, &protocol, &bindings);
+            let mut compatible = semantic_set.compatible_repository(
+                &repository.storage,
+                repository.attribution.clone(),
+                &protocol,
+                &bindings,
+            );
+            #[derive(Debug)]
+            struct CurrentReceipt;
+            impl ProtocolReceiptVerifier for CurrentReceipt {
+                fn verify(&self, _: &ProtocolMemberReceipt) -> ProtocolReceiptVerdict {
+                    ProtocolReceiptVerdict::Current
+                }
+            }
+            compatible.bind_receipt_verifier(Arc::new(CurrentReceipt));
             assert!(!compatible.is_empty());
             let mut solver_budget = SolverBudget::default();
             let result = solve_typestate_with_reusable_summaries(
@@ -2916,18 +3947,121 @@ mod attribution_tests {
             )
             .unwrap();
             assert!(result.was_reused(), "the solve must consume a retained row");
+            assert!(
+                result
+                    .computed_result()
+                    .result()
+                    .metrics()
+                    .reusable_summary_hits
+                    > 0
+            );
+            assert!(
+                repository
+                    .storage
+                    .entries
+                    .values()
+                    .any(|summary| summary.rows.iter().any(|row| !row.fragments.is_empty()))
+            );
         });
-        assert!(reads.unattributed_reads() > 0);
-        assert!(
-            reads
-                .keys()
-                .iter()
-                .any(|key| matches!(key, ReadKey::Scope { .. }))
+        assert_eq!(reads.unattributed_reads(), 0);
+        assert!(!reads.keys().is_empty());
+        let fragment = repository
+            .storage
+            .entries
+            .values_mut()
+            .flat_map(|summary| summary.rows.iter_mut())
+            .find_map(|row| row.fragments.first_mut())
+            .expect("published row carries a fragment");
+        let leaf = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("leaf")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .unwrap();
+        let remap = ProtocolLiveRemap::try_new(&protocol, &bindings).unwrap();
+        assert!(rebind_protocol_fragments(std::slice::from_ref(fragment), &leaf, &remap).is_some());
+        let rebound = rebind_protocol_fragments(std::slice::from_ref(fragment), &leaf, &remap)
+            .expect("published fragment rebinds");
+        let point = rebound[0]
+            .fragment
+            .steps
+            .last()
+            .expect("fragment has an ending point")
+            .output_point();
+        let site = point.locator().expect("ending point has a locator");
+        assert_eq!(rebound_effect_point(&rebound, site), Some(point.clone()));
+        let mut disagreeing = rebound.to_vec();
+        disagreeing.push(disagreeing[0].clone());
+        let alternative = leaf
+            .point_handle(leaf.semantics().entry_point())
+            .expect("different point");
+        assert_ne!(&alternative, point);
+        disagreeing[1]
+            .fragment
+            .steps
+            .last_mut()
+            .expect("fragment has an ending point")
+            .target = Some(alternative);
+        assert!(rebound_effect_point(&disagreeing, site).is_none());
+        let original_ordinal = fragment.1[0].source.ordinal;
+        fragment.1[0].source.ordinal = usize::MAX;
+        assert!(rebind_protocol_fragments(std::slice::from_ref(fragment), &leaf, &remap).is_none());
+        let missed_strict = strict_solve(&repository, None, None, false);
+        assert_eq!(missed_strict.result().metrics().reusable_summary_hits, 0);
+        let leaf_summary = repository
+            .storage
+            .entries
+            .values_mut()
+            .find(|summary| summary.key.procedure.matches_procedure(&leaf))
+            .expect("leaf summary was published");
+        leaf_summary.rows[0].fragments[0].1[0].source.ordinal = original_ordinal;
+        let row = leaf_summary.rows.first().expect("leaf has a row").clone();
+        let mut fragments = row.fragments.to_vec();
+        let mut changed = fragments[0].clone();
+        changed
+            .1
+            .last_mut()
+            .expect("fragment has a last step")
+            .target = Some(crate::dataflow::WitnessPointRow {
+            locator: leaf
+                .point_handle(leaf.semantics().entry_point())
+                .expect("leaf entry")
+                .locator()
+                .expect("leaf entry locator")
+                .clone(),
+            ordinal: leaf.semantics().entry_point().index(),
+        });
+        fragments.push(changed);
+        leaf_summary.effects = vec![ProtocolObservedEffect {
+            input: row.input,
+            site: site.clone(),
+            observation: row.output,
+            evidence: row.evidence,
+            fragments: fragments.into_boxed_slice(),
+        }]
+        .into_boxed_slice();
+        let disagreement_miss = strict_solve(&repository, None, None, false);
+        assert_eq!(
+            disagreement_miss.result().metrics().reusable_summary_hits,
+            0
+        );
+        assert_eq!(
+            disagreement_miss.result().end_summaries().len(),
+            fresh_strict.result().end_summaries().len(),
+            "a refused row falls back to the fresh body solve"
         );
     }
 
     #[test]
-    fn protocol_direct_and_entry_index_hits_record_inputs_and_refuse_unnamed_reads() {
+    fn protocol_direct_and_entry_index_lookups_do_not_attribute_before_verification() {
         crate::test_support::with_leaf_semantic_summary(|workspace, semantic| {
             let key = ProtocolSummaryKey {
                 procedure: semantic.key().clone(),
@@ -2947,13 +4081,8 @@ mod attribution_tests {
             let (_, reads) = capture_query_reads(workspace.analyzer(), || {
                 assert!(repository.get(&key).is_some());
             });
-            assert!(
-                reads
-                    .keys()
-                    .iter()
-                    .any(|key| matches!(key, ReadKey::Scope { .. }))
-            );
-            assert!(reads.unattributed_reads() > 0);
+            assert!(reads.keys().is_empty());
+            assert_eq!(reads.unattributed_reads(), 0);
             let (_, reads) = capture_query_reads(workspace.analyzer(), || {
                 assert!(
                     repository
@@ -2966,13 +4095,8 @@ mod attribution_tests {
                         .is_some()
                 );
             });
-            assert!(
-                reads
-                    .keys()
-                    .iter()
-                    .any(|key| matches!(key, ReadKey::Scope { .. }))
-            );
-            assert!(reads.unattributed_reads() > 0);
+            assert!(reads.keys().is_empty());
+            assert_eq!(reads.unattributed_reads(), 0);
         });
     }
 }

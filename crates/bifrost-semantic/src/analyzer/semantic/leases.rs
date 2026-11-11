@@ -464,14 +464,15 @@ impl SemanticArtifactLeaseChild {
         .err();
         SemanticArtifactLeaseWindow {
             state: Arc::new(Mutex::new(LeaseWindowState {
-                max_retained_bytes: self.max_retained_bytes,
+                phase: LeaseWindowPhase::Open(OpenWindow {
+                    max_retained_bytes: self.max_retained_bytes,
+                    scope: Arc::clone(&self.scope),
+                    base: Arc::clone(&self.base),
+                    promoted: Arc::clone(&self.additions),
+                    staged: LeaseStorage::default(),
+                    overflow,
+                }),
                 other_live_bytes,
-                scope: Some(Arc::clone(&self.scope)),
-                base: Some(Arc::clone(&self.base)),
-                promoted: Some(Arc::clone(&self.additions)),
-                staged: LeaseStorage::default(),
-                overflow,
-                closed: false,
                 active_live_reservations: 0,
                 active_window: Arc::clone(&self.active_window),
             })),
@@ -557,21 +558,16 @@ impl SemanticArtifactLeaseWindow {
         self.state
             .lock()
             .expect("semantic artifact lease window mutex poisoned")
-            .overflow
+            .overflow()
     }
 
     pub fn retained_bytes(&self) -> usize {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        let base = state
-            .base
-            .as_deref()
-            .map(|state| &state.storage)
-            .into_iter();
-        let promoted = state.promoted.as_deref().into_iter();
-        reported_retained_bytes(base.chain(promoted).chain([&state.staged]))
+        let open = state.open_for_handle();
+        reported_retained_bytes([&open.base.storage, open.promoted.as_ref(), &open.staged])
     }
 
     /// Reserve headroom for caller-owned memory before the caller allocates it.
@@ -584,35 +580,29 @@ impl SemanticArtifactLeaseWindow {
         &self,
         additional_bytes: usize,
     ) -> Result<SemanticArtifactLeaseLiveReservation, SemanticArtifactLeaseError> {
-        let mut state = self
+        let mut guard = self
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        assert!(
-            !state.closed,
-            "cannot reserve caller-owned bytes on a closed semantic lease window"
-        );
-        if let Some(error) = state.overflow {
+        let state = &mut *guard;
+        let other_live_bytes = state.other_live_bytes;
+        let open = state.open_for_handle();
+        if let Some(error) = open.overflow {
             return Err(error);
         }
-        let next_other_live_bytes = match state.other_live_bytes.checked_add(additional_bytes) {
+        let next_other_live_bytes = match other_live_bytes.checked_add(additional_bytes) {
             Some(bytes) => bytes,
             None => {
-                state.overflow = Some(SemanticArtifactLeaseError::RetainedBytesOverflow);
+                open.overflow = Some(SemanticArtifactLeaseError::RetainedBytesOverflow);
                 return Err(SemanticArtifactLeaseError::RetainedBytesOverflow);
             }
         };
-        let base = state.base.as_deref().expect("open lease window has a base");
-        let promoted = state
-            .promoted
-            .as_deref()
-            .expect("open lease window has promoted storage");
         if let Err(error) = check_retained_capacity(
-            [&base.storage, promoted, &state.staged],
+            [&open.base.storage, open.promoted.as_ref(), &open.staged],
             next_other_live_bytes,
-            state.max_retained_bytes,
+            open.max_retained_bytes,
         ) {
-            state.overflow = Some(error);
+            open.overflow = Some(error);
             return Err(error);
         }
         let next_active_live_reservations = state
@@ -621,7 +611,7 @@ impl SemanticArtifactLeaseWindow {
             .expect("semantic lease live-reservation count fits usize");
         state.other_live_bytes = next_other_live_bytes;
         state.active_live_reservations = next_active_live_reservations;
-        drop(state);
+        drop(guard);
         Ok(SemanticArtifactLeaseLiveReservation {
             state: Arc::clone(&self.state),
             reserved_bytes: additional_bytes,
@@ -633,18 +623,13 @@ impl SemanticArtifactLeaseWindow {
     /// window already retain this exact allocation. This is accounting-only:
     /// it never returns or serves the retained Arc.
     pub fn contains_exact(&self, artifact: &Arc<SemanticArtifact>) -> bool {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
+        let open = state.open_for_handle();
         contains_exact_artifact(
-            state
-                .base
-                .as_ref()
-                .map(|base| &base.storage)
-                .into_iter()
-                .chain(state.promoted.as_deref())
-                .chain(std::iter::once(&state.staged)),
+            [&open.base.storage, open.promoted.as_ref(), &open.staged],
             artifact,
         )
     }
@@ -658,35 +643,27 @@ impl SemanticArtifactLeaseWindow {
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        assert!(
-            !state.closed,
-            "semantic artifact lease window already closed"
-        );
         if state.active_live_reservations != 0 {
             drop(state);
             panic!("cannot commit a semantic lease window with unresolved live-byte reservations");
         }
-        if let Some(error) = state.overflow {
+        let other_live_bytes = state.other_live_bytes;
+        let same_child = Arc::ptr_eq(&state.active_window, &child.active_window);
+        let open = state.open_for_handle();
+        if let Some(error) = open.overflow {
             state.close();
             return Err(error);
         }
-        let same_scope = state
-            .scope
-            .as_ref()
-            .is_some_and(|scope| Arc::ptr_eq(scope, &child.scope));
-        let same_base = state
-            .base
-            .as_ref()
-            .is_some_and(|base| Arc::ptr_eq(base, &child.base));
-        let same_child = Arc::ptr_eq(&state.active_window, &child.active_window);
+        let same_scope = Arc::ptr_eq(&open.scope, &child.scope);
+        let same_base = Arc::ptr_eq(&open.base, &child.base);
         if !same_scope || !same_base || !same_child {
             state.close();
             return Err(SemanticArtifactLeaseError::WrongScope);
         }
 
         let attempted = match checked_attempted_retained_bytes(
-            [&child.base.storage, child.additions.as_ref(), &state.staged],
-            state.other_live_bytes,
+            [&child.base.storage, child.additions.as_ref(), &open.staged],
+            other_live_bytes,
         ) {
             Ok(attempted) => attempted,
             Err(error) => {
@@ -703,7 +680,7 @@ impl SemanticArtifactLeaseWindow {
             return Err(SemanticArtifactLeaseError::Capacity(exceeded));
         }
 
-        let staged = std::mem::take(&mut state.staged);
+        let staged = std::mem::take(&mut open.staged);
         state.close();
         drop(state);
         let additions = Arc::get_mut(&mut child.additions)
@@ -727,10 +704,7 @@ impl SemanticArtifactLeaseWindow {
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        assert!(
-            !state.closed,
-            "semantic artifact lease window already closed"
-        );
+        state.open_for_handle();
         state.close();
     }
 }
@@ -757,7 +731,7 @@ impl SemanticArtifactLeaseLiveReservation {
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned");
-        if state.closed {
+        if matches!(state.phase, LeaseWindowPhase::Closed { .. }) {
             drop(state);
             panic!("cannot retain caller-owned bytes after closing their semantic lease window");
         }
@@ -794,46 +768,84 @@ impl Drop for SemanticArtifactLeaseWindow {
             .state
             .lock()
             .expect("semantic artifact lease window mutex poisoned while dropping");
-        if !state.closed {
-            state.close();
-        }
+        state.close();
     }
 }
 
 #[derive(Debug)]
 struct LeaseWindowState {
-    max_retained_bytes: usize,
+    phase: LeaseWindowPhase,
+    /// Caller-owned bytes reserved or retained in this window. Live
+    /// reservations can outlive the window's close, so the count and their
+    /// bytes stay outside the phase.
     other_live_bytes: usize,
-    scope: Option<Arc<SemanticArtifactLeaseScope>>,
-    base: Option<Arc<LeaseState>>,
-    promoted: Option<Arc<LeaseStorage>>,
-    staged: LeaseStorage,
-    overflow: Option<SemanticArtifactLeaseError>,
-    closed: bool,
     active_live_reservations: usize,
     active_window: Arc<AtomicBool>,
 }
 
+/// The lifecycle of one lease window. A refusal does not close the window:
+/// an open window with `overflow` set still accepts `close`, and keeps
+/// refusing new observations and reservations.
+#[derive(Debug)]
+enum LeaseWindowPhase {
+    Open(OpenWindow),
+    /// The window committed or was discarded. Its snapshots are released; the
+    /// first refusal, if any, stays readable by collectors that outlive it.
+    Closed {
+        overflow: Option<SemanticArtifactLeaseError>,
+    },
+}
+
+#[derive(Debug)]
+struct OpenWindow {
+    max_retained_bytes: usize,
+    scope: Arc<SemanticArtifactLeaseScope>,
+    base: Arc<LeaseState>,
+    promoted: Arc<LeaseStorage>,
+    staged: LeaseStorage,
+    overflow: Option<SemanticArtifactLeaseError>,
+}
+
 impl LeaseWindowState {
+    /// The open window behind a live `SemanticArtifactLeaseWindow`. Only
+    /// `commit`, `discard` and the handle's `Drop` close the window, and each
+    /// consumes the handle, so a handle method always finds it open.
+    fn open_for_handle(&mut self) -> &mut OpenWindow {
+        match &mut self.phase {
+            LeaseWindowPhase::Open(open) => open,
+            LeaseWindowPhase::Closed { .. } => {
+                unreachable!("a live semantic lease window handle keeps its window open")
+            }
+        }
+    }
+
+    fn overflow(&self) -> Option<SemanticArtifactLeaseError> {
+        match &self.phase {
+            LeaseWindowPhase::Open(open) => open.overflow,
+            LeaseWindowPhase::Closed { overflow } => *overflow,
+        }
+    }
+
     fn release_live_reservation(&mut self) {
         self.active_live_reservations = self
             .active_live_reservations
             .checked_sub(1)
             .expect("live semantic lease reservation is registered with its window");
-        if self.closed && self.active_live_reservations == 0 {
+        if matches!(self.phase, LeaseWindowPhase::Closed { .. })
+            && self.active_live_reservations == 0
+        {
             self.active_window.store(false, Ordering::Release);
         }
     }
 
     fn close(&mut self) {
-        if self.closed {
+        let LeaseWindowPhase::Open(open) = &self.phase else {
             return;
-        }
-        self.closed = true;
-        self.scope = None;
-        self.base = None;
-        self.promoted = None;
-        self.staged = LeaseStorage::default();
+        };
+        // Dropping the open window releases every window-owned snapshot.
+        self.phase = LeaseWindowPhase::Closed {
+            overflow: open.overflow,
+        };
         // Publish the reusable child only after every window-owned snapshot and
         // live-byte reservation is gone. A concurrent `into_charge` pairs its
         // Acquire load with this Release and may therefore rely on unique
@@ -844,17 +856,24 @@ impl LeaseWindowState {
     }
 
     fn observe_complete(&mut self, file: &ProjectFile, artifact: &Arc<SemanticArtifact>) {
-        if self.closed || self.overflow.is_some() {
+        let other_live_bytes = self.other_live_bytes;
+        let LeaseWindowPhase::Open(open) = &mut self.phase else {
+            return;
+        };
+        if open.overflow.is_some() {
             return;
         }
-        let base = self.base.as_ref().expect("open lease window has base");
-        let promoted = self
-            .promoted
-            .as_ref()
-            .expect("open lease window has promoted storage");
+        let OpenWindow {
+            max_retained_bytes,
+            base,
+            promoted,
+            staged,
+            overflow,
+            ..
+        } = open;
         if base.storage.contains_artifact(artifact)
             || promoted.contains_artifact(artifact)
-            || self.staged.contains_artifact(artifact)
+            || staged.contains_artifact(artifact)
         {
             return;
         }
@@ -862,49 +881,45 @@ impl LeaseWindowState {
         let candidate_bytes = match retained_artifact_bytes(file, artifact) {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.overflow = Some(error);
+                *overflow = Some(error);
                 return;
             }
         };
-        let retained = match checked_retained_bytes([
-            &base.storage,
-            promoted.as_ref(),
-            &self.staged,
-        ])
-        .and_then(|retained| {
-            retained
-                .checked_add(if self.staged.is_empty() {
-                    LEASE_STORAGE_BASE_BYTES
-                } else {
-                    0
-                })
-                .and_then(|retained| retained.checked_add(candidate_bytes))
-                .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)
-        }) {
+        let retained = match checked_retained_bytes([&base.storage, promoted.as_ref(), &*staged])
+            .and_then(|retained| {
+                retained
+                    .checked_add(if staged.is_empty() {
+                        LEASE_STORAGE_BASE_BYTES
+                    } else {
+                        0
+                    })
+                    .and_then(|retained| retained.checked_add(candidate_bytes))
+                    .ok_or(SemanticArtifactLeaseError::RetainedBytesOverflow)
+            }) {
             Ok(retained) => retained,
             Err(error) => {
-                self.overflow = Some(error);
+                *overflow = Some(error);
                 return;
             }
         };
-        let attempted = match retained.checked_add(self.other_live_bytes) {
+        let attempted = match retained.checked_add(other_live_bytes) {
             Some(attempted) => attempted,
             None => {
-                self.overflow = Some(SemanticArtifactLeaseError::RetainedBytesOverflow);
+                *overflow = Some(SemanticArtifactLeaseError::RetainedBytesOverflow);
                 return;
             }
         };
-        if attempted > self.max_retained_bytes {
-            self.overflow = Some(SemanticArtifactLeaseError::Capacity(
+        if attempted > *max_retained_bytes {
+            *overflow = Some(SemanticArtifactLeaseError::Capacity(
                 SemanticArtifactLeaseCapacityExceeded {
-                    limit: self.max_retained_bytes,
+                    limit: *max_retained_bytes,
                     attempted,
                 },
             ));
             return;
         }
         assert_eq!(
-            self.staged.try_insert(SemanticArtifactLease::new(
+            staged.try_insert(SemanticArtifactLease::new(
                 file.clone(),
                 Arc::clone(artifact),
             )),
@@ -1098,12 +1113,10 @@ impl SemanticArtifactCollector {
                     .expect("semantic artifact collector mutex poisoned")
                     .overflow
             }
-            SemanticArtifactCollectorState::Bounded(state) => {
-                state
-                    .lock()
-                    .expect("semantic artifact lease window mutex poisoned")
-                    .overflow
-            }
+            SemanticArtifactCollectorState::Bounded(state) => state
+                .lock()
+                .expect("semantic artifact lease window mutex poisoned")
+                .overflow(),
         }
     }
 
@@ -1145,11 +1158,14 @@ impl SemanticArtifactCollector {
                 .expect("semantic artifact collector mutex poisoned")
                 .storage
                 .len(),
-            SemanticArtifactCollectorState::Bounded(state) => state
+            SemanticArtifactCollectorState::Bounded(state) => match &state
                 .lock()
                 .expect("semantic artifact lease window mutex poisoned")
-                .staged
-                .len(),
+                .phase
+            {
+                LeaseWindowPhase::Open(open) => open.staged.len(),
+                LeaseWindowPhase::Closed { .. } => 0,
+            },
         }
     }
 }

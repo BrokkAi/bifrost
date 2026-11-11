@@ -1,8 +1,8 @@
 //! Request-local native reverse projection shared by usages and selected inverse.
 //!
 //! Inverse queries use all selected Python files with the reverse scan-site and
-//! session budgets. They impose no separate file-count budget; usages admission
-//! applies M1's file/source budgets before consuming its prepared result.
+//! per-caller confirmation budgets. They impose no separate file-count budget;
+//! usages admission applies M1's file/source budgets before consuming its prepared result.
 
 use super::{
     PythonAnalyzer,
@@ -13,6 +13,7 @@ use brokk_bifrost_analysis::analyzer::store::resolution_operation::python_revers
     PythonNativeReverseResult, PythonReverseLimits,
 };
 use brokk_bifrost_analysis::analyzer::store::{Result, StoreError};
+use brokk_bifrost_analysis::analyzer::store_bridge::fact_reference_edges::fact_reference_receiver_channels;
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
     EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason, EdgeSite, ReferenceEdgeRow,
     SelectedInverseIndexOutcome, SelectedInverseReferenceProvider, SelectedReferenceFileProjection,
@@ -23,12 +24,13 @@ use brokk_bifrost_analysis::analyzer::structural::selected_inverse::{
 };
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
-use brokk_bifrost_core::analyzer::structural::edges::{EdgeProvenance, OwnerRelation, SiteClass};
-use brokk_bifrost_core::analyzer::usages::model::{UsageHitKind, UsageProof};
-use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
-use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+use brokk_bifrost_core::analyzer::structural::edges::{EdgeProvenance, SiteClass};
+use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
+#[cfg(test)]
+use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use brokk_bifrost_core::cancellation::CancellationToken;
+use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -86,6 +88,10 @@ pub(super) fn project_reverse(
             .into_iter()
             .map(|range| (target.target.source().clone(), range))
             .collect::<Vec<_>>();
+        let declaration_sites = definition_spans
+            .iter()
+            .map(|(_, range)| (range.start_byte, range.end_byte))
+            .collect::<HashSet<_>>();
         let mut edges = Vec::new();
         for (path, sites) in files {
             let file = ProjectFile::new(python.inner.project().root(), path);
@@ -101,11 +107,33 @@ pub(super) fn project_reverse(
                 )));
             };
             for site in sites {
+                // A receiver assignment's admitted field declaration is the
+                // attribute token itself. Its RHS read has a distinct range.
+                if target.target.is_field()
+                    && file == *target.target.source()
+                    && declaration_sites.contains(&(site.start, site.end))
+                {
+                    continue;
+                }
+                // Query-wide environment assumptions stay in diagnostics; only
+                // obligations attached to this site can block its edge proof.
+                let obligations_outstanding = !site.obligations.is_empty();
+                let (proof, obligations_block_proof) = brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::selected_reverse_proof(
+                    site.certain && !site.potential && !site.undecided,
+                    obligations_outstanding,
+                );
+                if obligations_block_proof
+                    && !reasons
+                        .contains(&EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding)
+                {
+                    reasons.push(EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding);
+                }
                 let range = projected.state.range(site.start, site.end);
                 let owner = python.enclosing_code_unit(&file, &range);
                 let owner_relation =
                     classify_owner_relation(python, owner.as_ref(), &target.target);
                 let mut edge = ReferenceEdgeRow {
+                    dispatch_extensibility: None,
                     site: EdgeSite {
                         file: file.clone(),
                         range,
@@ -113,18 +141,20 @@ pub(super) fn project_reverse(
                         enclosing: owner,
                     },
                     target: target.target.clone(),
-                    reference_kind: classifier.classify_reference_kind(
+                    reference_kind: classifier.classify_reference_facets(
                         site.start,
                         site.end,
                         &target.target,
                     ),
-                    proof: if site.certain && !site.potential && !site.undecided {
-                        UsageProof::Proven
-                    } else {
-                        UsageProof::Unproven
-                    },
+                    proof,
                     ambiguous_candidate: false,
-                    usage_kind: if owner_relation == OwnerRelation::SelfReference {
+                    usage_kind: if classifier
+                        .is_import_binding_reference(&file, site.start, site.end)
+                    {
+                        UsageHitKind::Import
+                    } else if site.receiver_origins.iter().any(|origin| {
+                        fact_reference_receiver_channels(Some(*origin)).includes_self_receiver()
+                    }) {
                         UsageHitKind::SelfReceiver
                     } else {
                         UsageHitKind::Reference
@@ -213,16 +243,13 @@ impl SelectedInverseAdapter for PythonInverseAdapter {
         };
         let files = python.analyzed_files().into_iter().collect();
         let scope = UsageScanScope::with_cancellation(&files, cancellation);
-        let session =
-            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(cancellation));
         let result = request
             .operation
-            .python_reverse_targets(
+            .python_reverse_targets_in_scope(
                 &request.environment,
                 std::slice::from_ref(target),
                 &scope,
                 PythonReverseLimits::default(),
-                &session,
             )
             .map_err(|error| SelectedInverseFailure::StoreError(error.to_string()))?;
         if cancellation.is_cancelled() {
@@ -234,22 +261,16 @@ impl SelectedInverseAdapter for PythonInverseAdapter {
         let projected = project_reverse(python, result)
             .map_err(|error| SelectedInverseFailure::StoreError(error.to_string()))?;
         Ok(projected.targets.into_iter().next().map(|(_, mut answer)| {
-            for kind in [
-                "python_environment_open",
-                "python_unknown_placement",
-                "python_dynamic_receiver_mutation_open",
-            ] {
-                let obligations = projected
-                    .query_obligations
-                    .iter()
-                    .filter(|label| label.starts_with(kind))
-                    .collect::<Vec<_>>();
-                if obligations.is_empty() {
+            for obligation in &projected.query_obligations {
+                let kind = obligation
+                    .split_once(':')
+                    .map_or(obligation.as_str(), |(kind, _)| kind);
+                if super::query_reason_is_scope(kind) {
                     continue;
                 }
                 let reason = EdgeIncompleteReason::UsageAnalysisFailed {
                     reason_kind: kind.into(),
-                    reason: format!("{obligations:?}"),
+                    reason: obligation.clone(),
                 };
                 match &mut answer.completeness {
                     EdgeCompleteness::Complete => {
@@ -286,15 +307,13 @@ mod tests {
     use crate::inline_project::InlineTestProject;
     use brokk_bifrost_analysis::analyzer::Language;
     use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
+    use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#5658: Lane R review found that an undecided candidate demoted a certain site of the same target"
     )]
     fn certain_site_stays_proven_when_another_candidate_is_undecided() {
-        if !super::super::trial_native_python_selected() {
-            return;
-        }
         let fixture = InlineTestProject::with_language(Language::Python)
             .file("model.py", "def pick(): pass\n")
             .file(
@@ -363,9 +382,6 @@ mod tests {
         "#5658: Lane R review found that every unknown-name member operation nominated every target"
     )]
     fn unknown_member_names_do_not_nominate_but_matching_prefixes_do() {
-        if !super::super::trial_native_python_selected() {
-            return;
-        }
         let fixture = InlineTestProject::with_language(Language::Python)
             .file(
                 "sample.py",
@@ -428,10 +444,10 @@ mod tests {
     }
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "b3230a984acc: #5658 reverse budget exhaustion lost its named cause"
+    )]
     fn scan_stop_retains_unprocessed_targets_and_sites() {
-        if !super::super::trial_native_python_selected() {
-            return;
-        }
         let fixture = InlineTestProject::with_language(Language::Python)
             .file("model.py", "class Widget: pass\nclass Other: pass\n")
             .file("a.py", "from model import Widget\nx = Widget()\n")
@@ -458,6 +474,29 @@ mod tests {
         };
         let files = python.analyzed_files().into_iter().collect();
         let scope = UsageScanScope::with_cancellation(&files, &cancellation);
+        let bounded = ResolutionSession::bounded(
+            brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget {
+                max_scope_nodes: 0,
+                ..Default::default()
+            },
+            Some(&cancellation),
+        );
+        let stopped = request
+            .operation
+            .python_reverse_targets(
+                &request.environment,
+                &targets,
+                &scope,
+                PythonReverseLimits::default(),
+                &bounded,
+            )
+            .unwrap();
+        assert!(!stopped.targets[0].complete);
+        assert!(
+            stopped.targets[0].obligations.iter().any(|reason| {
+                reason == "python_reverse_resolution_budget_exceeded:scope_nodes"
+            })
+        );
         let session = ResolutionSession::unbounded();
         let result = request
             .operation

@@ -7,6 +7,7 @@
 //! No selected route, filesystem fact, or resolved target enters the
 //! content-owned result.
 
+use crate::syntax::{RustLiteralType, rust_literal_type};
 use std::collections::{HashMap, HashSet};
 
 use brokk_bifrost_core::analyzer::model::DeclarationKind;
@@ -68,7 +69,10 @@ use crate::graph_support::{rust_path_is_leading_absolute, rust_path_segments};
 use crate::imports::rust_import_projection_with_source_nodes;
 use crate::imports::{RustProjectedImport, RustVisibility};
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
-use crate::structural::{call_function_target, rust_occurrence_role, rust_receiver_operand};
+use crate::structural::{
+    call_function_target, rust_block_last_statement, rust_block_tail_expression,
+    rust_occurrence_role, rust_receiver_operand,
+};
 
 #[cfg(test)]
 pub(super) fn extract_rust_resolution_facts(root: Node<'_>, source: &str) -> FileResolutionFacts {
@@ -185,6 +189,9 @@ enum RuntimeValueDestination {
         inferred: Option<ResolutionTypeSlotId>,
     },
     LocalWrite,
+    Join {
+        slot: ResolutionTypeSlotId,
+    },
 }
 
 /// One lowered ordinary parameter a callable-parameter row can name, with the
@@ -8203,11 +8210,40 @@ impl<'source> RustResolutionBuilder<'source> {
         }
     }
 
-    fn queue_runtime_value(&mut self, value: Node<'_>, mut pending: PendingRuntimeValue) {
-        if let Some((producer, adjustments)) = rust_runtime_value_producer(value, self.source) {
-            pending.adjustments = adjustments
-                .into_iter()
-                .map(|(wrapper, kind)| RuntimeValueAdjustment {
+    fn queue_runtime_value(&mut self, value: Node<'_>, pending: PendingRuntimeValue) {
+        let entries = rust_runtime_value_entries(value, self.source);
+        let mut slots = HashMap::new();
+        // Parent joins are allocated before their inputs are connected.
+        for (index, entry) in entries.iter().enumerate() {
+            if matches!(entry.kind, RuntimeValueEntryKind::Join) {
+                let site = self.add_site(
+                    entry.node,
+                    ResolutionSiteKind::ConditionalExpression,
+                    self.current_scope(),
+                );
+                let slot = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
+                    .expect("Rust resolution type-slot count exceeds u32");
+                self.facts.type_slots.push(ResolutionTypeSlotFact {
+                    id: slot,
+                    site,
+                    role: ResolutionTypeSlotRole::ExpressionValue,
+                });
+                slots.insert(index, slot);
+            }
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let destination = entry.parent.map_or(pending.destination, |parent| {
+                RuntimeValueDestination::Join {
+                    slot: slots[&parent],
+                }
+            });
+            let site = entry.parent.map_or(pending.site, |parent| {
+                self.facts.type_slots[slots[&parent].index()].site
+            });
+            let adjustments = entry
+                .adjustments
+                .iter()
+                .map(|&(wrapper, kind)| RuntimeValueAdjustment {
                     site: self.add_site(
                         wrapper,
                         if wrapper.kind() == "call_expression" {
@@ -8220,18 +8256,27 @@ impl<'source> RustResolutionBuilder<'source> {
                     kind,
                 })
                 .collect();
-            self.pending_runtime_values
-                .entry(producer.id())
-                .or_default()
-                .push(pending);
-        } else {
-            self.connect_runtime_value(value, pending, None);
+            let next = PendingRuntimeValue {
+                site,
+                destination,
+                adjustments,
+            };
+            match entry.kind {
+                RuntimeValueEntryKind::Producer => self
+                    .pending_runtime_values
+                    .entry(entry.node.id())
+                    .or_default()
+                    .push(next),
+                RuntimeValueEntryKind::Unknown => {
+                    self.connect_runtime_value(entry.node, next, None)
+                }
+                RuntimeValueEntryKind::Join => {
+                    self.connect_runtime_value(entry.node, next, Some(slots[&index]))
+                }
+            }
         }
     }
 
-    /// Connect an expression's produced value to every waiting initializer or
-    /// write, preserving the order of borrow and unwrap layers before recording
-    /// the observation.
     fn discharge_pending_runtime_values(
         &mut self,
         node: Node<'_>,
@@ -8321,6 +8366,8 @@ impl<'source> RustResolutionBuilder<'source> {
                         value_transform: ResolutionTypeTransferValueTransform::Preserve,
                     });
                 }
+                // An initializer has one root entry, so its observation slot
+                // is created here exactly once.
                 let output = ResolutionTypeSlotId::try_from_index(self.facts.type_slots.len())
                     .expect("Rust resolution type-slot count exceeds u32");
                 self.facts.type_slots.push(ResolutionTypeSlotFact {
@@ -8341,6 +8388,16 @@ impl<'source> RustResolutionBuilder<'source> {
                 self.facts.local_writes.push(ResolutionLocalWriteFact {
                     target: pending.site,
                     value: input,
+                });
+            }
+            RuntimeValueDestination::Join { slot } => {
+                self.facts.type_transfers.push(ResolutionTypeTransferFact {
+                    input,
+                    output: slot,
+                    kind: ResolutionTypeTransferKind::ValueJoin,
+                    indirection_delta: 0,
+                    reference_indirection_delta: 0,
+                    value_transform: ResolutionTypeTransferValueTransform::Preserve,
                 });
             }
         }
@@ -10197,46 +10254,218 @@ fn rust_borrow_operand(node: Node<'_>) -> Option<Node<'_>> {
         .filter(|operand| !operand.is_missing() && !operand.is_error())
 }
 
-/// The runtime producer beneath a local initializer or assignment RHS, with
-/// borrow and unwrap adjustments in outside-in syntax order. Calls, runtime
-/// identifiers and struct constructions publish runtime slots. Parentheses
-/// are transparent at every wrapper; unsupported leaves retain their gap.
-fn rust_runtime_value_producer<'tree>(
+enum RuntimeValueEntryKind {
+    Producer,
+    Unknown,
+    Join,
+}
+
+struct RuntimeValueEntry<'tree> {
+    node: Node<'tree>,
+    kind: RuntimeValueEntryKind,
+    parent: Option<usize>,
+    adjustments: Vec<(Node<'tree>, RuntimeValueAdjustmentKind)>,
+}
+
+fn rust_runtime_value_entries<'tree>(
     initializer: Node<'tree>,
     source: &str,
-) -> Option<(Node<'tree>, Vec<(Node<'tree>, RuntimeValueAdjustmentKind)>)> {
-    let mut node = rust_receiver_operand(initializer);
-    let mut adjustments = Vec::new();
-    loop {
-        // Recovery can leave a missing identifier under wrappers (`???` is
-        // nested try_expressions). The walk skips missing/error nodes, so no
-        // pending value may be keyed on one.
-        if node.is_missing() || node.is_error() {
-            return None;
+) -> Vec<RuntimeValueEntry<'tree>> {
+    let mut entries = Vec::new();
+    let mut stack = vec![(initializer, None, Vec::new(), false)];
+    while let Some((raw, parent, adjustments, branch)) = stack.pop() {
+        let node = rust_receiver_operand(raw);
+        let mut children = Vec::new();
+        if !node.is_missing() && !node.is_error() {
+            if node.kind() == "reference_expression" {
+                if let Some(operand) = rust_borrow_operand(node) {
+                    let mut adjustments = adjustments;
+                    adjustments.push((node, RuntimeValueAdjustmentKind::Borrow));
+                    stack.push((operand, parent, adjustments, branch));
+                    continue;
+                }
+            } else if let Some(operand) = rust_unwrap_operand(node, source) {
+                let mut adjustments = adjustments;
+                adjustments.push((node, RuntimeValueAdjustmentKind::Unwrap));
+                stack.push((operand, parent, adjustments, branch));
+                continue;
+            }
+            match node.kind() {
+                "block"
+                    if !node
+                        .named_children(&mut node.walk())
+                        .any(|n| n.kind() == "label") =>
+                {
+                    if let Some(tail) = rust_block_tail_expression(node) {
+                        stack.push((tail, parent, adjustments, true));
+                        continue;
+                    }
+                    // No tail: the block's value is unit unless its last
+                    // statement exits the initializer.
+                    if let Some(last) = rust_block_last_statement(node)
+                        && last.kind() == "expression_statement"
+                        && last
+                            .named_children(&mut last.walk())
+                            .find(|child| !child.is_extra())
+                            .is_some_and(|n| rust_branch_exits(n, initializer, source))
+                    {
+                        continue;
+                    }
+                }
+                "if_expression" => {
+                    if let Some(consequence) = node.child_by_field_name("consequence") {
+                        children.push(consequence);
+                    }
+                    if let Some(alternative) = node.child_by_field_name("alternative") {
+                        children.push(if alternative.kind() == "else_clause" {
+                            alternative.named_child(0).unwrap_or(alternative)
+                        } else {
+                            alternative
+                        });
+                    }
+                }
+                "match_expression" => {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        for arm in body
+                            .named_children(&mut body.walk())
+                            .filter(|n| n.kind() == "match_arm")
+                        {
+                            children.push(arm.child_by_field_name("value").unwrap_or(arm));
+                        }
+                    }
+                }
+                "return_expression" if branch => continue,
+                "break_expression" | "continue_expression"
+                    if branch && rust_branch_exits(node, initializer, source) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
         }
-        let (operand, kind) = if node.kind() == "reference_expression" {
-            (
-                rust_borrow_operand(node)?,
-                RuntimeValueAdjustmentKind::Borrow,
-            )
-        } else if let Some(operand) = rust_unwrap_operand(node, source) {
-            (operand, RuntimeValueAdjustmentKind::Unwrap)
+        let kind = if node.is_missing() || node.is_error() {
+            RuntimeValueEntryKind::Unknown
+        } else if !children.is_empty() {
+            RuntimeValueEntryKind::Join
+        } else if matches!(
+            node.kind(),
+            "call_expression" | "identifier" | "struct_expression"
+        ) {
+            RuntimeValueEntryKind::Producer
         } else {
-            break;
+            RuntimeValueEntryKind::Unknown
         };
-        adjustments.push((node, kind));
-        node = rust_receiver_operand(operand);
+        let index = entries.len();
+        entries.push(RuntimeValueEntry {
+            node,
+            kind,
+            parent,
+            adjustments,
+        });
+        for child in children {
+            stack.push((child, Some(index), Vec::new(), true));
+        }
+        if node.kind() == "if_expression" && node.child_by_field_name("alternative").is_none() {
+            entries.push(RuntimeValueEntry {
+                node,
+                kind: RuntimeValueEntryKind::Unknown,
+                parent: Some(index),
+                adjustments: Vec::new(),
+            });
+        }
     }
-    match node.kind() {
-        // A bare identifier initializer (`let inner = outer;`) takes the
-        // referenced binding's declared value type, which the runtime value
-        // reference already publishes as `TargetDeclaredValueType`. Without it
-        // the new binding has no declared value at all, so every later
-        // `inner.member()` reports an unsupported semantic even where the
-        // outer binding's type is known.
-        "call_expression" | "identifier" | "struct_expression" => Some((node, adjustments)),
-        _ => None,
+    // Remove empty and single-input joins bottom-up. A transparent join's wrappers
+    // move to its only child in outside-in order.
+    let mut active = vec![true; entries.len()];
+    for index in (0..entries.len()).rev() {
+        if !matches!(entries[index].kind, RuntimeValueEntryKind::Join) {
+            continue;
+        }
+        let children: Vec<_> = (0..entries.len())
+            .filter(|&n| active[n] && entries[n].parent == Some(index))
+            .collect();
+        if children.len() == 1 {
+            let child = children[0];
+            let mut outer = std::mem::take(&mut entries[index].adjustments);
+            outer.append(&mut entries[child].adjustments);
+            entries[child].adjustments = outer;
+            entries[child].parent = entries[index].parent;
+            active[index] = false;
+        } else if children.is_empty() {
+            active[index] = false;
+        }
     }
+    let mut map = vec![0; entries.len()];
+    for (old, enabled) in active.iter().enumerate() {
+        if *enabled {
+            map[old] = entries[..old]
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| active[*n])
+                .count();
+        }
+    }
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(n, mut entry)| {
+            if !active[n] {
+                return None;
+            }
+            entry.parent = entry.parent.map(|p| map[p]);
+            Some(entry)
+        })
+        .collect()
+}
+
+fn rust_branch_exits(node: Node<'_>, initializer: Node<'_>, source: &str) -> bool {
+    if node.kind() == "return_expression" {
+        return true;
+    }
+    if !matches!(node.kind(), "break_expression" | "continue_expression") {
+        return false;
+    }
+    let label = node
+        .named_children(&mut node.walk())
+        .find(|child| child.kind() == "label")
+        .map(|label| rust_node_text(label, source));
+    let mut ancestor = node.parent();
+    while let Some(target) = ancestor {
+        if matches!(
+            target.kind(),
+            "closure_expression" | "function_item" | "async_block"
+        ) {
+            return false;
+        }
+        let loop_target = matches!(
+            target.kind(),
+            "loop_expression" | "while_expression" | "for_expression"
+        );
+        let block_target = target.kind() == "block"
+            && target
+                .named_children(&mut target.walk())
+                .any(|child| child.kind() == "label");
+        let matches = if let Some(label) = label {
+            (loop_target || block_target)
+                && target.named_children(&mut target.walk()).any(|candidate| {
+                    candidate.kind() == "label" && rust_node_text(candidate, source) == label
+                })
+        } else {
+            loop_target
+        };
+        if matches {
+            let mut parent = initializer.parent();
+            while let Some(root_ancestor) = parent {
+                if root_ancestor.id() == target.id() {
+                    return true;
+                }
+                parent = root_ancestor.parent();
+            }
+            return false;
+        }
+        ancestor = target.parent();
+    }
+    false
 }
 
 /// The operand of one `?`, `.unwrap()` or `.expect(..)` layer.
@@ -10441,6 +10670,11 @@ fn rust_receiver_form(parameters: Node<'_>) -> Option<ResolutionCallableReceiver
     let receiver = parameters
         .named_children(&mut cursor)
         .find(|parameter| parameter.kind() == "self_parameter")?;
+    // A typed receiver has its own adjustment rule, even if its written type
+    // happens to be Box<Self> or &Self. Only the three bare forms are modeled.
+    if receiver.child_by_field_name("type").is_some() {
+        return None;
+    }
     let mut cursor = receiver.walk();
     let tokens = receiver
         .children(&mut cursor)
@@ -10453,69 +10687,6 @@ fn rust_receiver_form(parameters: Node<'_>) -> Option<ResolutionCallableReceiver
             (true, true) => ResolutionCallableReceiverForm::MutableReference,
         },
     )
-}
-
-/// What a literal token fixes about its type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RustLiteralType {
-    /// A primitive, behind this many reference layers (`"x"` is `&str`).
-    Exact {
-        primitive: &'static str,
-        reference_layers: i8,
-    },
-    /// An unsuffixed integer or float: inference picks its type.
-    InferredNumeric,
-    /// A literal kind the model has no type for, such as a byte string.
-    Unsupported,
-}
-
-/// The type a literal's own token fixes, or `None` for a non-literal.
-///
-/// tree-sitter keeps a literal's suffix and prefix inside its one token, so
-/// they are read from the token's spelling against Rust's fixed vocabularies,
-/// as the Java producer reads an integer literal's `L`. A hexadecimal integer
-/// takes no float suffix: `0x1f32` is an unsuffixed integer whose digits end
-/// in `f32`.
-fn rust_literal_type(node: Node<'_>, source: &str) -> Option<RustLiteralType> {
-    const INTEGER_SUFFIXES: [&str; 12] = [
-        "u128", "usize", "u16", "u32", "u64", "u8", "i128", "isize", "i16", "i32", "i64", "i8",
-    ];
-    const FLOAT_SUFFIXES: [&str; 2] = ["f32", "f64"];
-    let token = rust_node_text(node, source);
-    let exact = |primitive, reference_layers| RustLiteralType::Exact {
-        primitive,
-        reference_layers,
-    };
-    let suffixed = |suffixes: &[&'static str]| {
-        suffixes
-            .iter()
-            .copied()
-            .find(|suffix| token.ends_with(suffix))
-            .map_or(RustLiteralType::InferredNumeric, |suffix| exact(suffix, 0))
-    };
-    Some(match node.kind() {
-        "boolean_literal" => exact("bool", 0),
-        "char_literal" if token.starts_with('\'') => exact("char", 0),
-        "string_literal" | "raw_string_literal"
-            if token.starts_with('"') || token.starts_with('r') =>
-        {
-            exact("str", 1)
-        }
-        "char_literal" | "string_literal" | "raw_string_literal" => RustLiteralType::Unsupported,
-        "integer_literal" if token.starts_with("0x") || token.starts_with("0X") => {
-            suffixed(&INTEGER_SUFFIXES)
-        }
-        "integer_literal" => {
-            let suffixes = INTEGER_SUFFIXES
-                .iter()
-                .chain(&FLOAT_SUFFIXES)
-                .copied()
-                .collect::<Vec<_>>();
-            suffixed(&suffixes)
-        }
-        "float_literal" => suffixed(&FLOAT_SUFFIXES),
-        _ => return None,
-    })
 }
 
 /// Whether an argument list carries an attribute, which can remove the
@@ -10780,7 +10951,7 @@ pub(crate) fn rust_item_effective_attributes<'tree>(
 /// Return the effective attributes authored by `attribute_items`, recursively
 /// expanding each `cfg_attr` payload with an explicit worklist. A malformed
 /// attribute shape returns `None`.
-fn rust_effective_attributes<'tree>(
+pub(crate) fn rust_effective_attributes<'tree>(
     attribute_items: impl IntoIterator<Item = Node<'tree>>,
     source: &str,
 ) -> Option<Vec<RustEffectiveItemAttribute<'tree>>> {
@@ -11041,7 +11212,7 @@ fn rust_item_attribute_boundary(node: Node<'_>, source: &str) -> RustItemAttribu
 /// lexical scope prefix can generate a `macro_rules!`. An attribute shape this
 /// function cannot classify is therefore a hazard, not inert. Malformed
 /// attributes are hazards too.
-pub(crate) fn rust_attribute_item_can_expand(attribute_item: Node<'_>, source: &str) -> bool {
+pub fn rust_attribute_item_can_expand(attribute_item: Node<'_>, source: &str) -> bool {
     let Some(attributes) = rust_effective_attributes(std::iter::once(attribute_item), source)
     else {
         return true;
@@ -11057,7 +11228,7 @@ pub(crate) fn rust_attribute_item_can_expand(attribute_item: Node<'_>, source: &
 /// the inert `unsafe(...)` codegen wrapper are safe. Everything else,
 /// including `derive`, `macro_use`, the prelude attribute macros, scoped paths
 /// and unknown names, may expand to code.
-fn rust_effective_attribute_is_inert(
+pub(crate) fn rust_effective_attribute_is_inert(
     attribute: &RustEffectiveItemAttribute<'_>,
     source: &str,
 ) -> bool {
@@ -11460,6 +11631,16 @@ fn written_type_transfer_kind(
 
 #[cfg(test)]
 mod tests {
+    fn parse_rust_tree_for_test(source: &str) -> Option<tree_sitter::Tree> {
+        // Standalone fixtures have no analyzer owner.
+        crate::lexical_scope::parse_rust_tree_with(
+            &crate::lexical_scope::RustLexicalCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            source,
+        )
+    }
+
     use brokk_bifrost_core::analyzer::resolution_facts::ResolutionDeclaredTypeRelationKind;
     use std::collections::BTreeSet;
 
@@ -11492,7 +11673,7 @@ mod tests {
             ("#[cfg_attr(flag, inline, cold)]", false),
         ] {
             let source = format!("{attribute} fn f() {{}}");
-            let tree = crate::lexical_scope::parse_rust_tree(&source).unwrap();
+            let tree = parse_rust_tree_for_test(&source).unwrap();
             assert!(!tree.root_node().has_error());
             let mut pending = vec![tree.root_node()];
             let node = loop {
@@ -11557,7 +11738,7 @@ fn run(input: (Item, Item), optional: Option<Item>, pairs: Vec<(Item, Item)>, na
     let closure = |parameter: Item| parameter;
 }
 "#;
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         assert!(!tree.root_node().has_error());
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         for name in [
@@ -11686,7 +11867,7 @@ fn run(input: (Item, Item), optional: Option<Item>, pairs: Vec<(Item, Item)>, na
     )]
     fn local_write_grammar_keeps_mutability_outside_the_binder() {
         let source = "fn run() { let mut value: Item = make(); value = Item {}; value += make(); }";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         assert!(!tree.root_node().has_error());
         let binding = find_first_node(tree.root_node(), "let_declaration").expect("let");
         let pattern = binding.child_by_field_name("pattern").expect("pattern");
@@ -11737,7 +11918,7 @@ fn run(input: (Item, Item), optional: Option<Item>, pairs: Vec<(Item, Item)>, na
             "    let tried = (&((make())?));\n",
             "}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         assert!(!tree.root_node().has_error());
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         for transfer in facts
@@ -11880,6 +12061,25 @@ fn run(input: (Item, Item), optional: Option<Item>, pairs: Vec<(Item, Item)>, na
             "fn f() { let mut value = &([1u8]); value = &(opaque!()); }",
         ] {
             let facts = parse_and_extract(source);
+            let gap_fed = |mut slot: super::ResolutionTypeSlotId| {
+                loop {
+                    if facts
+                        .gaps
+                        .iter()
+                        .any(|gap| gap.site == facts.type_slots[slot.index()].site)
+                    {
+                        return true;
+                    }
+                    let Some(transfer) = facts
+                        .type_transfers
+                        .iter()
+                        .find(|transfer| transfer.output == slot)
+                    else {
+                        return false;
+                    };
+                    slot = transfer.input;
+                }
+            };
             assert!(facts.gaps.iter().any(|gap| matches!(
                 gap.kind,
                 ResolutionGapKind::MalformedSyntax | ResolutionGapKind::UnsupportedExpression
@@ -11889,12 +12089,10 @@ fn run(input: (Item, Item), optional: Option<Item>, pairs: Vec<(Item, Item)>, na
                 .iter()
                 .filter(|transfer| transfer.kind == ResolutionTypeTransferKind::Assignment)
             {
-                let input = facts.type_slots[transfer.input.index()];
-                assert!(facts.gaps.iter().any(|gap| gap.site == input.site));
+                assert!(gap_fed(transfer.input));
             }
             for write in &facts.local_writes {
-                let input = facts.type_slots[write.value.index()];
-                assert!(facts.gaps.iter().any(|gap| gap.site == input.site));
+                assert!(gap_fed(write.value));
             }
         }
 
@@ -12001,7 +12199,12 @@ fn run(other: u32) {
                 ),
             ]
         );
-        for write in &facts.local_writes[2..] {
+        // A block with a tail now forwards the call's value; the remaining
+        // unsupported writes still own explicit gaps.
+        for write in facts.local_writes[2..].iter().filter(|write| {
+            facts.sites[write.target.index()].start_byte
+                != source.find("actual = { make() };").expect("block-tail RHS")
+        }) {
             let site = facts.type_slots[write.value.index()].site;
             assert!(facts.gaps.iter().any(
                 |gap| gap.site == site && gap.kind == ResolutionGapKind::UnsupportedExpression
@@ -12112,7 +12315,7 @@ fn run(other: u32) {
     )]
     fn inferred_uninitialized_let_owns_an_empty_declaration_value_property() {
         let source = "fn run() { let mut value; value = Item {}; value.summary(); }";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         assert!(!tree.root_node().has_error());
         let binding = find_first_node(tree.root_node(), "let_declaration").expect("let");
         let pattern = binding.child_by_field_name("pattern").expect("pattern");
@@ -12252,7 +12455,7 @@ mod parser {
     fn bench() {}
 }
 "#;
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let start = source.rfind("NUM_ENTRIES").expect("bench argument");
         let argument = reference_sites(&facts, "NUM_ENTRIES", ResolutionNamespace::Value)
@@ -12269,7 +12472,7 @@ mod parser {
     fn definitionless_matches_pattern_keeps_variant_references() {
         let source =
             "enum State { Ready }\nfn run(value: State) { assert!(matches!(value, Ready)); }\n";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let ready_start = source.rfind("Ready").expect("pattern variant");
         assert!(
@@ -12284,7 +12487,7 @@ enum ParseState { Start { id: u8 } }
 use ParseState::*;
 fn run(state: ParseState) { let _ = matches!(state, Start { .. }); }
 "#;
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let pattern_start = source.find("Start { .. }").expect("struct variant pattern");
         let pattern_reference = facts.identifiers.iter().find(|identifier| {
@@ -14881,7 +15084,7 @@ fn caller(value: Item) {}
             "type Outer<U> = Leaf<Vec<U>>;\n",
             "fn consume(_: Outer<Tensor>) {}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let declaration_at = |start: usize| {
             facts
@@ -14990,7 +15193,7 @@ fn caller(value: Item) {}
             "    take(&[1u8]);\n",
             "}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let mut arguments = facts
             .call_arguments
@@ -15106,7 +15309,7 @@ fn caller(value: Item) {}
             "    pub fn boxed(self: Box<Self>) {}\n",
             "}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let mut bindings = facts
             .callable_result_bindings
@@ -15224,6 +15427,44 @@ fn caller(value: Item) {}
         );
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9203: typed self Box<Self> classified as a Value receiver"
+    )]
+    fn typed_self_does_not_publish_a_standard_callable_receiver_form() {
+        let source = concat!(
+            "struct Item; impl Item {\n",
+            "  fn owned(self) {}\n",
+            "  fn shared(&self) {}\n",
+            "  fn mutable(&mut self) {}\n",
+            "  fn boxed(self: Box<Self>) {}\n",
+            "  fn typed_reference(self: &Self) {}\n",
+            "  fn pinned(self: std::pin::Pin<&mut Self>) {}\n",
+            "}\n",
+        );
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
+        let facts = extract_rust_resolution_facts(tree.root_node(), source);
+        let mut forms = facts
+            .callable_receivers
+            .iter()
+            .map(|receiver| {
+                (
+                    source_text(&facts, source, receiver.callable),
+                    receiver.form,
+                )
+            })
+            .collect::<Vec<_>>();
+        forms.sort_unstable_by_key(|(name, _)| *name);
+        assert_eq!(
+            forms,
+            [
+                ("mutable", ResolutionCallableReceiverForm::MutableReference),
+                ("owned", ResolutionCallableReceiverForm::Value),
+                ("shared", ResolutionCallableReceiverForm::Reference),
+            ],
+        );
+    }
+
     /// A literal argument is typed when its token fixes the type: a suffixed
     /// number, a `bool`, a `char`, and a string (`&str`, one reference layer).
     /// An unsuffixed number names the inference its type waits for; a byte or
@@ -15253,7 +15494,7 @@ fn caller(value: Item) {}
             "    take(|value| value);\n",
             "}\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let mut arguments = facts
             .call_arguments
@@ -15343,7 +15584,7 @@ fn caller(value: Item) {}
     )]
     fn unit_structs_mark_their_value_as_their_own_construction() {
         let source = "pub struct Unit;\npub struct Marker<T>;\npub struct Tuple(u8);\npub struct Named { value: u8 }\n";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let mut marked = facts
             .gaps
@@ -15371,7 +15612,7 @@ fn caller(value: Item) {}
             "pub fn lifetime<'a, L: 'a>(value: L) -> L { value }\n",
             "pub struct Holder<H> { value: H }\n",
         );
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         for (name, bounded) in [
             ("T", false),
@@ -16189,7 +16430,7 @@ fn caller(value: Result<i32, i32>) -> i32 {
     )]
     fn transcriber_item_paths_require_invocation_context_except_dollar_crate() {
         let source = "#[macro_export] macro_rules! pick { () => { (self::MARKER, super::MARKER, crate::MARKER, other::MARKER, $crate::MARKER) }; }";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let references = reference_sites(&facts, "MARKER", ResolutionNamespace::Value);
         assert_eq!(
@@ -16249,7 +16490,7 @@ fn caller(value: Result<i32, i32>) -> i32 {
     fn ordinary_transcriber_crate_anchor_respects_export_context() {
         for (attribute, rooted) in [("", true), ("#[macro_export]", false)] {
             let source = format!("{attribute} macro_rules! pick {{ () => {{ crate::MARKER }}; }}");
-            let tree = crate::lexical_scope::parse_rust_tree(&source).expect("fixture parses");
+            let tree = parse_rust_tree_for_test(&source).expect("fixture parses");
             let facts = extract_rust_resolution_facts(tree.root_node(), &source);
             let references = reference_sites(&facts, "MARKER", ResolutionNamespace::Value);
             assert_eq!(references.len(), 1, "{source}: {facts:?}");
@@ -16276,7 +16517,7 @@ fn caller(value: Result<i32, i32>) -> i32 {
     )]
     fn macro_matcher_references_keep_fragment_namespaces_and_exact_ranges() {
         let source = "struct Item; macro_rules! take { ($t:ty, $e:expr) => {}; } fn f() { let value = 1; take!(Item, value); }";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         for (name, namespace) in [
             ("Item", ResolutionNamespace::Type),
@@ -16307,7 +16548,7 @@ impl Layer {
     fn add(self, other: Self) -> Self { add_fields!(self, other; value,) }
 }
 "#;
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let _facts = extract_rust_resolution_facts(tree.root_node(), source);
     }
 
@@ -16317,7 +16558,7 @@ impl Layer {
     )]
     fn emitted_repeated_transcriber_keeps_its_bare_type_reference() {
         let source = "use crate::{Adaptor, TestOutput}; trait Adaptor<T> {} type TestOutput<EC> = EC; macro_rules! gen_tuple { ($($M:ident),*) => { fn generated<$($M,)* EC>() where $(TestOutput<EC>: Adaptor<$M>,)* {} }; } gen_tuple!(Metric);";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let expected = source
             .match_indices("TestOutput")
@@ -16341,7 +16582,7 @@ impl Layer {
             "struct Item; macro_rules! take { (ready $t:ty) => {}; } take!(Item);",
             "struct Item; macro_rules! take { ($name:ident) => { struct $name; }; } take!(Item);",
         ] {
-            let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+            let tree = parse_rust_tree_for_test(source).expect("fixture parses");
             let facts = extract_rust_resolution_facts(tree.root_node(), source);
             assert!(reference_sites(&facts, "Item", ResolutionNamespace::Type).is_empty());
             assert!(reference_sites(&facts, "Item", ResolutionNamespace::Value).is_empty());
@@ -16354,7 +16595,7 @@ impl Layer {
     )]
     fn macro_fragments_keep_qualified_paths_and_expression_local_scopes() {
         let source = "macro_rules! take { ($t:ty, $e:expr) => {}; } fn f() { take!(crate::model::Item, { let value = 1; value }); }";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         let item = reference_sites(&facts, "Item", ResolutionNamespace::Type);
         assert_eq!(item.len(), 1, "{facts:?}");
@@ -16391,7 +16632,7 @@ impl Layer {
     )]
     fn macro_item_fragments_keep_an_explicit_generation_boundary() {
         let source = "macro_rules! take { ($item:item) => { $item }; } take!(fn generated() {});";
-        let tree = crate::lexical_scope::parse_rust_tree(source).expect("fixture parses");
+        let tree = parse_rust_tree_for_test(source).expect("fixture parses");
         let facts = extract_rust_resolution_facts(tree.root_node(), source);
         assert!(
             facts
@@ -16414,7 +16655,7 @@ impl Layer {
         std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
-                let tree = crate::lexical_scope::parse_rust_tree(&source).expect("fixture parses");
+                let tree = parse_rust_tree_for_test(&source).expect("fixture parses");
                 let facts = extract_rust_resolution_facts(tree.root_node(), &source);
                 let sites = reference_sites(&facts, "value", ResolutionNamespace::Value);
                 assert_eq!(sites.len(), 1, "{facts:?}");

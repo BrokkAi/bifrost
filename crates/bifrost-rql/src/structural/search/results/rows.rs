@@ -13,6 +13,8 @@ pub struct DetailedCodeQueryResult {
     pub budgeted_work: CodeQueryBudgetedWork,
     pub evidence: Vec<DetailedCodeQueryEvidence>,
     pub profile: Option<QueryExecutionProfile>,
+    #[doc(hidden)]
+    pub depth_answers: Vec<super::super::units::BoundedCallAnswer>,
     pub(in crate::structural::search) semantic_receipt: Option<CodeQuerySemanticReceipt>,
 }
 
@@ -287,6 +289,11 @@ pub enum CodeQueryEnumDomain {
     /// Every label the producer can write, in the producing vocabulary's own
     /// declaration order.
     Labels(&'static [&'static str]),
+    /// Labels whose source property has not been decided.
+    Undecided {
+        labels: &'static [&'static str],
+        members: &'static [&'static str],
+    },
     /// The producer's vocabulary is genuinely not a finite enumerated set, so
     /// no literal can be rejected. The reason is recorded so the exemption is a
     /// decision rather than an omission.
@@ -298,15 +305,19 @@ impl CodeQueryEnumDomain {
     /// explicitly not enumerable.
     pub const fn labels(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Labels(labels) => Some(labels),
+            Self::Labels(labels) | Self::Undecided { labels, .. } => Some(labels),
             Self::Unenumerable(_) => None,
         }
+    }
+
+    pub fn is_undecided(self, label: &str) -> bool {
+        matches!(self, Self::Undecided { members, .. } if members.contains(&label))
     }
 
     /// Whether `label` is a value this field can actually hold.
     pub fn admits(self, label: &str) -> bool {
         match self {
-            Self::Labels(labels) => labels.contains(&label),
+            Self::Labels(labels) | Self::Undecided { labels, .. } => labels.contains(&label),
             Self::Unenumerable(_) => true,
         }
     }
@@ -561,7 +572,6 @@ mod value_domain {
 
     pub(super) const USAGE_KIND: &[&str] = UsageHitKind::WIRE_LABELS;
     pub(super) const USAGE_PROOF: &[&str] = brokk_bifrost_rql::schema::USAGE_PROOF_LABELS;
-    pub(super) const REFERENCE_KIND: &[&str] = brokk_bifrost_rql::schema::REFERENCE_KIND_LABELS;
     pub(super) const CALL_SYNTAX_KIND: &[&str] = render::CALL_SYNTAX_KIND_LABELS;
     pub(super) const CALL_RECEIVER_KIND: &[&str] = &["implicit", "this", "explicit", "unknown"];
     pub(super) const EXPRESSION_INPUT_KIND: &[&str] = render::EXPRESSION_INPUT_KIND_LABELS;
@@ -603,6 +613,8 @@ mod value_domain {
     pub(super) const TARGET_ORIGIN: &[&str] = &["source", "semantic_model"];
     pub(super) const SELECTOR_PROOF: &[&str] = &["derived", "authored_summary"];
     pub(super) const DISPATCH_BOUNDARY_KIND: &[&str] = DispatchBoundaryKind::LABELS;
+    pub(super) const DISPATCH_BOUNDARY_REASON: &[&str] =
+        crate::analyzer::semantic::DispatchBoundaryPartialCause::LABELS;
 
     pub(super) const MEMBER_FAMILY_OUTCOME: &[&str] = MemberFamilyOutcome::LABELS;
     pub(super) const MEMBER_FAMILY_REASON: &[&str] = MemberFamilyReason::LABELS;
@@ -840,6 +852,7 @@ mod value_domain {
         "artifact_unselected",
         "model_unavailable",
         "model_conflict",
+        "model_input_unavailable",
         "obligation_unavailable",
         "obligation_conflict",
         "native_signature_unknown",
@@ -908,6 +921,7 @@ mod value_domain {
         "self_initializer",
         "failed_swap",
         "overwritten_unread",
+        "dead_write",
     ];
     pub(super) const ASSIGNMENT_STORAGE_KIND: &[&str] = &[
         "ordinary_local",
@@ -925,6 +939,8 @@ mod value_domain {
         "self_initializer",
         "failed_swap",
         "overwritten_unread",
+        "dead",
+        "live",
         "different",
         "excluded",
         "unknown",
@@ -1069,6 +1085,7 @@ mod value_domain {
         "go",
     ];
     pub(super) const STATEMENT_VERDICT: &[&str] = &["reachable", "unreachable", "open"];
+    pub(super) const REGION_FIRST: &[&str] = &["first", "not_first", "open"];
     pub(super) const BRANCH_REASON: &[&str] = &[
         "syntax_recovery",
         "missing_branch_field",
@@ -1164,6 +1181,176 @@ mod value_domain {
     pub(super) const REWRITE_OUTCOME: &[&str] = RewriteOutcomeKind::LABELS;
     pub(super) const REWRITE_PATH_COMPLETENESS: &[&str] =
         crate::structural::search::rewrite_paths::REWRITE_PATH_COMPLETENESS_LABELS;
+    pub const OWNER_RELATION_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: OWNER_RELATION,
+            members: &["unknown"],
+        };
+    pub const EXPORT_DEFINITION_STATUS_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: EXPORT_DEFINITION_STATUS,
+            members: &["unknown"],
+        };
+    pub const DECLARED_VISIBILITY_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: DECLARED_VISIBILITY,
+            members: &["unknown"],
+        };
+    pub const APPLICABILITY_VERDICT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: APPLICABILITY_VERDICT,
+            members: &["unknown"],
+        };
+    pub const CALL_RECEIVER_KIND_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: CALL_RECEIVER_KIND,
+            members: &["unknown"],
+        };
+    pub const JSX_ELEMENT_IDENTITY_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: JSX_ELEMENT_IDENTITY,
+            members: &["unknown"],
+        };
+    pub const RUNTIME_KEY_KIND_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: RUNTIME_KEY_KIND,
+            members: &["unknown"],
+        };
+    pub const PYTHON_METHOD_KIND_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_METHOD_KIND,
+            members: &["unknown"],
+        };
+    pub const EFFECT_TIMING_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: EFFECT_TIMING,
+            members: &["unknown"],
+        };
+    pub const EXECUTION_TIMING_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: EXECUTION_TIMING,
+            members: &["unknown"],
+        };
+    pub const PYTHON_TRI_STATE_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_TRI_STATE,
+            members: &["unknown"],
+        };
+    pub const PYTHON_CALLABLE_EVALUATION_TIME_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_CALLABLE_EVALUATION_TIME,
+            members: &["unknown"],
+        };
+    pub const PYTHON_RETURN_CONTRACT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_RETURN_CONTRACT,
+            members: &["unknown"],
+        };
+    pub const PYTHON_RESULT_USE_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_RESULT_USE,
+            members: &["unknown"],
+        };
+    pub const RESULT_USE_VALIDATION_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: RESULT_USE_VALIDATION,
+            members: &["unknown"],
+        };
+    pub const OPERATION_APPLICABILITY_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: OPERATION_APPLICABILITY,
+            members: &["unknown"],
+        };
+    pub const RESULT_USE_GUARD_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: RESULT_USE_GUARD,
+            members: &["unknown"],
+        };
+    pub const NILNESS_FACT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: NILNESS_FACT,
+            members: &["unknown"],
+        };
+    pub const SWITCH_VERDICT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: SWITCH_VERDICT,
+            members: &["unknown"],
+        };
+    pub const ASSIGNMENT_STORAGE_KIND_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: ASSIGNMENT_STORAGE_KIND,
+            members: &["unknown"],
+        };
+    pub const ASSIGNMENT_VERDICT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: ASSIGNMENT_VERDICT,
+            members: &["unknown"],
+        };
+    pub const OBJECT_CARDINALITY_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: OBJECT_CARDINALITY,
+            members: &["unknown"],
+        };
+    pub const BUILD_FILE_STATUS_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: BUILD_FILE_STATUS,
+            members: &["unknown"],
+        };
+    pub const BUILD_TARGET_SCOPE_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: BUILD_TARGET_SCOPE,
+            members: &["unknown"],
+        };
+    pub const PYTHON_VARIABLE_REACHABILITY_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_VARIABLE_REACHABILITY,
+            members: &["open"],
+        };
+    pub const SWITCH_SELECTOR_DOMAIN_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: SWITCH_SELECTOR_DOMAIN,
+            members: &["open"],
+        };
+    pub const BRANCH_VERDICT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: BRANCH_VERDICT,
+            members: &["open"],
+        };
+    pub const LOOP_VERDICT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: LOOP_VERDICT,
+            members: &["open"],
+        };
+    pub const STATEMENT_VERDICT_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: STATEMENT_VERDICT,
+            members: &["open"],
+        };
+    pub const REGION_FIRST_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: REGION_FIRST,
+            members: &["open"],
+        };
+    pub const RUNTIME_SOURCE_ORIGIN_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: RUNTIME_SOURCE_ORIGIN,
+            members: &["indeterminate"],
+        };
+    pub const PYTHON_SPECIAL_METHOD_STATUS_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_SPECIAL_METHOD_STATUS,
+            members: &["incomplete"],
+        };
+    pub const PYTHON_RULE_OUTCOME_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: PYTHON_RULE_OUTCOME,
+            members: &["unknown", "open"],
+        };
+    pub const RESULT_OBLIGATION_USE_DOMAIN: super::CodeQueryEnumDomain =
+        super::CodeQueryEnumDomain::Undecided {
+            labels: RESULT_OBLIGATION_USE,
+            members: &["open", "unknown"],
+        };
 }
 
 macro_rules! code_query_row_fields {
@@ -1692,6 +1879,7 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("parent_id", Scalar::StableId),
                     CodeQueryRowField::optional("value_id", Scalar::StableId),
                     CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required("directory", Scalar::String),
                     CodeQueryRowField::required_enum("format", value_domain::CONFIGURATION_FORMAT),
                     CodeQueryRowField::required_enum("node_kind", value_domain::CONFIGURATION_NODE_KIND),
                     CodeQueryRowField::optional_enum("role", value_domain::CONFIGURATION_ROLE),
@@ -1704,6 +1892,7 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("index", Scalar::Integer),
                     CodeQueryRowField::required("route", Scalar::String),
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("target_count", Scalar::Integer),
         ],
     },
     CrossDomain => "cross_domain" {
@@ -1748,7 +1937,6 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::required_enum("usage_kind", value_domain::USAGE_KIND),
                     CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
-                    CodeQueryRowField::optional_enum("reference_kind", value_domain::REFERENCE_KIND),
         ],
     },
     CallSite => "call_site" {
@@ -1759,11 +1947,17 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("program_point_id", Scalar::StableId),
                     CodeQueryRowField::optional("caller_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_fq_name", Scalar::String),
+                    CodeQueryRowField::optional_enum("boundary_kind", value_domain::DISPATCH_BOUNDARY_KIND),
+                    CodeQueryRowField::optional("target_reason", Scalar::String),
+                    CodeQueryRowField::required_enum("completeness", value_domain::EVIDENCE_COMPLETENESS),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CANDIDATE_COVERAGE),
                     CodeQueryRowField::required_enum("call_kind", value_domain::CALL_SYNTAX_KIND),
                     CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "receiver_kind",
-                        value_domain::CALL_RECEIVER_KIND
+                        value_domain::CALL_RECEIVER_KIND_DOMAIN
                     ),
                     CodeQueryRowField::optional("argument_identity", Scalar::StableId),
                     CodeQueryRowField::optional("caller_parameter_identity", Scalar::StableId),
@@ -1784,7 +1978,7 @@ detailed_row_domains! {
         fields: [
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("ast_id", Scalar::StableId),
-                    CodeQueryRowField::required_enum("element_identity", value_domain::JSX_ELEMENT_IDENTITY),
+                    CodeQueryRowField::required_constrained_enum("element_identity", value_domain::JSX_ELEMENT_IDENTITY_DOMAIN),
                     CodeQueryRowField::optional("element_name", Scalar::String),
                     CodeQueryRowField::required_enum("attribute_kind", value_domain::JSX_ATTRIBUTE_KIND),
                     CodeQueryRowField::optional("attribute_name", Scalar::String),
@@ -1874,10 +2068,10 @@ detailed_row_domains! {
                     CodeQueryRowField::required("runtime", Scalar::String),
                     CodeQueryRowField::required("global", Scalar::String),
                     CodeQueryRowField::required("container", Scalar::String),
-                    CodeQueryRowField::required_enum("key_kind", value_domain::RUNTIME_KEY_KIND),
+                    CodeQueryRowField::required_constrained_enum("key_kind", value_domain::RUNTIME_KEY_KIND_DOMAIN),
                     CodeQueryRowField::optional("property", Scalar::String),
                     CodeQueryRowField::optional("index", Scalar::Integer),
-                    CodeQueryRowField::required_enum("source_origin", value_domain::RUNTIME_SOURCE_ORIGIN),
+                    CodeQueryRowField::required_constrained_enum("source_origin", value_domain::RUNTIME_SOURCE_ORIGIN_DOMAIN),
                     CodeQueryRowField::required_enum("outcome", value_domain::RUNTIME_READ_OUTCOME),
                     CodeQueryRowField::required_enum("proof", value_domain::RUNTIME_READ_PROOF),
                     CodeQueryRowField::required_enum("completeness", value_domain::RUNTIME_READ_COMPLETENESS),
@@ -1898,9 +2092,9 @@ detailed_row_domains! {
                     CodeQueryRowField::required("site_ast_id", Scalar::StableId),
                     CodeQueryRowField::optional("callee_name", Scalar::String),
                     CodeQueryRowField::optional("resolved_external_callee", Scalar::String),
-                    CodeQueryRowField::required_enum("callee_provenance", &["caller_supplied", "local_closure", "declared", "unknown", "unsupported"]),
+                    CodeQueryRowField::required_constrained_enum("callee_provenance", CodeQueryEnumDomain::Undecided { labels: &["caller_supplied", "local_closure", "declared", "unknown", "unsupported"], members: &["unknown"] }),
                     CodeQueryRowField::optional("callee_supplier", Scalar::String),
-                    CodeQueryRowField::required_enum("callee_type_shape", brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape::LABELS),
+                    CodeQueryRowField::required_constrained_enum("callee_type_shape", CodeQueryEnumDomain::Undecided { labels: brokk_bifrost_core::analyzer::structural::callable::CalleeTypeShape::LABELS, members: &["unknown"] }),
                     CodeQueryRowField::required("callee_bounds", Scalar::StringList),
                     CodeQueryRowField::required_enum("call_kind", value_domain::CALL_KIND),
                     CodeQueryRowField::required_enum("coverage", value_domain::CALL_SHAPE_COVERAGE),
@@ -2065,10 +2259,10 @@ detailed_row_domains! {
                         "classification",
                         value_domain::EFFECT_CLASSIFICATION
                     ),
-                    CodeQueryRowField::optional_enum("timing", value_domain::EFFECT_TIMING),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum("timing", value_domain::EFFECT_TIMING_DOMAIN),
+                    CodeQueryRowField::optional_constrained_enum(
                         "execution_timing",
-                        value_domain::EXECUTION_TIMING
+                        value_domain::EXECUTION_TIMING_DOMAIN
                     ),
                     CodeQueryRowField::optional_enum("certainty", value_domain::EFFECT_CERTAINTY),
                     CodeQueryRowField::optional_enum("proof", value_domain::EFFECT_PROOF),
@@ -2117,9 +2311,9 @@ detailed_row_domains! {
                         "unguarded_result_use_count",
                         Scalar::Integer
                     ),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "use_validation",
-                        value_domain::RESULT_USE_VALIDATION
+                        value_domain::RESULT_USE_VALIDATION_DOMAIN
                     ),
                     CodeQueryRowField::optional_enum(
                         "use_validation_coverage",
@@ -2142,7 +2336,7 @@ detailed_row_domains! {
             CodeQueryRowField::optional_enum("failure_predicate", value_domain::RESULT_CONTRACT_PREDICATE),
             CodeQueryRowField::optional_enum("provenance", value_domain::RESULT_OBLIGATION_PROVENANCE),
             CodeQueryRowField::optional_enum("obligation_basis", value_domain::RESULT_OBLIGATION_BASIS),
-            CodeQueryRowField::required_enum("result_use", value_domain::RESULT_OBLIGATION_USE),
+            CodeQueryRowField::required_constrained_enum("result_use", value_domain::RESULT_OBLIGATION_USE_DOMAIN),
             CodeQueryRowField::optional_enum(
                 "result_use_detail",
                 value_domain::RESULT_OBLIGATION_RESULT_USE_DETAIL,
@@ -2212,13 +2406,13 @@ detailed_row_domains! {
                         "timing",
                         value_domain::RESULT_CONTRACT_USE_TIMING
                     ),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "applicability",
-                        value_domain::OPERATION_APPLICABILITY
+                        value_domain::OPERATION_APPLICABILITY_DOMAIN
                     ),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "guard",
-                        value_domain::RESULT_USE_GUARD
+                        value_domain::RESULT_USE_GUARD_DOMAIN
                     ),
                     CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
                     CodeQueryRowField::optional("member", Scalar::String),
@@ -2279,7 +2473,7 @@ detailed_row_domains! {
                         "use_kind",
                         value_domain::RESULT_CONTRACT_USE_KIND
                     ),
-                    CodeQueryRowField::required_enum("fact", value_domain::NILNESS_FACT),
+                    CodeQueryRowField::required_constrained_enum("fact", value_domain::NILNESS_FACT_DOMAIN),
                     CodeQueryRowField::required_enum("origin", value_domain::NILNESS_ORIGIN),
                     CodeQueryRowField::required_enum("proof", value_domain::NILNESS_PROOF),
                     CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
@@ -2296,15 +2490,15 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("ast_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("kind", value_domain::SWITCH_KIND),
                     CodeQueryRowField::optional("selector_value_id", Scalar::Integer),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "selector_domain",
-                        value_domain::SWITCH_SELECTOR_DOMAIN
+                        value_domain::SWITCH_SELECTOR_DOMAIN_DOMAIN
                     ),
                     CodeQueryRowField::required("case_count", Scalar::Integer),
                     CodeQueryRowField::required("has_true_case", Scalar::Boolean),
                     CodeQueryRowField::required("has_false_case", Scalar::Boolean),
                     CodeQueryRowField::required("default_present", Scalar::Boolean),
-                    CodeQueryRowField::required_enum("verdict", value_domain::SWITCH_VERDICT),
+                    CodeQueryRowField::required_constrained_enum("verdict", value_domain::SWITCH_VERDICT_DOMAIN),
                     CodeQueryRowField::required_enum("proof", value_domain::SWITCH_PROOF),
                     CodeQueryRowField::optional_enum("reason", value_domain::SWITCH_REASON),
         ],
@@ -2320,8 +2514,8 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("rhs_value_id", Scalar::Integer),
                     CodeQueryRowField::optional("ast_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("relation_kind", value_domain::ASSIGNMENT_RELATION_KIND),
-                    CodeQueryRowField::required_enum("storage_kind", value_domain::ASSIGNMENT_STORAGE_KIND),
-                    CodeQueryRowField::required_enum("verdict", value_domain::ASSIGNMENT_VERDICT),
+                    CodeQueryRowField::required_constrained_enum("storage_kind", value_domain::ASSIGNMENT_STORAGE_KIND_DOMAIN),
+                    CodeQueryRowField::required_constrained_enum("verdict", value_domain::ASSIGNMENT_VERDICT_DOMAIN),
                     CodeQueryRowField::required_enum("proof", value_domain::ASSIGNMENT_PROOF),
                     CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
                     CodeQueryRowField::optional("reason", Scalar::String),
@@ -2343,9 +2537,9 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("ordinal", Scalar::Integer),
                     CodeQueryRowField::required("value_id", Scalar::StableId),
                     CodeQueryRowField::optional("object_id", Scalar::String),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "object_cardinality",
-                        value_domain::OBJECT_CARDINALITY
+                        value_domain::OBJECT_CARDINALITY_DOMAIN
                     ),
                     CodeQueryRowField::required_enum(
                         "timing",
@@ -2383,10 +2577,10 @@ detailed_row_domains! {
                         value_domain::EFFECT_CLASSIFICATION
                     ),
                     CodeQueryRowField::optional_enum("certainty", value_domain::EFFECT_CERTAINTY),
-                    CodeQueryRowField::optional_enum("timing", value_domain::EFFECT_TIMING),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum("timing", value_domain::EFFECT_TIMING_DOMAIN),
+                    CodeQueryRowField::optional_constrained_enum(
                         "execution_timing",
-                        value_domain::EXECUTION_TIMING
+                        value_domain::EXECUTION_TIMING_DOMAIN
                     ),
                     CodeQueryRowField::optional("depth", Scalar::Integer),
                     CodeQueryRowField::required_enum("derivation", value_domain::EFFECT_DERIVATION),
@@ -2423,9 +2617,9 @@ detailed_row_domains! {
                         "receiver_contract",
                         value_domain::RECEIVER_CONTRACT
                     ),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "python_method_kind",
-                        value_domain::PYTHON_METHOD_KIND
+                        value_domain::PYTHON_METHOD_KIND_DOMAIN
                     ),
                     CodeQueryRowField::optional("python_owner_is_metaclass", Scalar::Boolean),
                     CodeQueryRowField::optional("python_owner_is_zope_interface", Scalar::Boolean),
@@ -2434,9 +2628,9 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("return_type", Scalar::String),
                     CodeQueryRowField::required("declaration_only", Scalar::Boolean),
                     CodeQueryRowField::required("parameter_count", Scalar::Integer),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "special_method_status",
-                        value_domain::PYTHON_SPECIAL_METHOD_STATUS
+                        value_domain::PYTHON_SPECIAL_METHOD_STATUS_DOMAIN
                     ),
         ],
     },
@@ -2544,7 +2738,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("site_ast_id", Scalar::StableId),
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
-                    CodeQueryRowField::required_enum("verdict", value_domain::APPLICABILITY_VERDICT),
+                    CodeQueryRowField::required_constrained_enum("verdict", value_domain::APPLICABILITY_VERDICT_DOMAIN),
                     CodeQueryRowField::optional_enum("reason", value_domain::CALLABLE_REJECTION_REASON),
                     CodeQueryRowField::optional_enum("phase", value_domain::INVOCATION_PHASE),
                     CodeQueryRowField::optional("failing_argument", Scalar::Integer),
@@ -2607,9 +2801,9 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("program_point_id", Scalar::StableId),
                     CodeQueryRowField::required("candidate_index", Scalar::Integer),
                     CodeQueryRowField::optional("object_id", Scalar::String),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "object_cardinality",
-                        value_domain::OBJECT_CARDINALITY
+                        value_domain::OBJECT_CARDINALITY_DOMAIN
                     ),
                     CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
                     CodeQueryRowField::required_enum(
@@ -2663,13 +2857,15 @@ detailed_row_domains! {
         ],
     },
     DispatchTarget => "dispatch_target" {
-        display_range: |_value| None,
+        display_range: |value| Some(value.range),
         identities: None,
         fields: [
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("root_id", Scalar::StableId),
                     CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
                     CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("target_count", Scalar::Integer),
                     CodeQueryRowField::required("target_id", Scalar::StableId),
                     CodeQueryRowField::optional("target_fq_name", Scalar::String),
                     CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
@@ -2683,6 +2879,10 @@ detailed_row_domains! {
                     CodeQueryRowField::optional_enum(
                         "boundary_kind",
                         value_domain::DISPATCH_BOUNDARY_KIND
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "boundary_reason",
+                        value_domain::DISPATCH_BOUNDARY_REASON
                     ),
         ],
     },
@@ -2809,11 +3009,14 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("ast_id", Scalar::StableId),
                     CodeQueryRowField::optional("reached_from_ast_id", Scalar::StableId),
                     CodeQueryRowField::required("name", Scalar::String),
+                    CodeQueryRowField::optional("immediate_parent_kind", Scalar::String),
+                    CodeQueryRowField::required("whole_let_initializer", Scalar::Boolean),
+                    CodeQueryRowField::required("whole_match_arm_identifier", Scalar::Boolean),
                     CodeQueryRowField::required_enum("kind", value_domain::BINDING_KIND),
                     CodeQueryRowField::required_enum("hoisting", value_domain::HOISTING_CLASS),
                     CodeQueryRowField::required_enum("namespace", value_domain::NAMESPACE),
                     CodeQueryRowField::required("declaring_scope_index", Scalar::Integer),
-                    CodeQueryRowField::required_enum("visibility", value_domain::DECLARED_VISIBILITY),
+                    CodeQueryRowField::required_constrained_enum("visibility", value_domain::DECLARED_VISIBILITY_DOMAIN),
                     CodeQueryRowField::required("shadowed", Scalar::Boolean),
         ],
     },
@@ -2831,7 +3034,7 @@ detailed_row_domains! {
                         value_domain::REJECTION_REASON
                     ),
                     CodeQueryRowField::required_enum("boundary", value_domain::BOUNDARY_STATUS),
-                    CodeQueryRowField::required_enum("visibility", value_domain::DECLARED_VISIBILITY),
+                    CodeQueryRowField::required_constrained_enum("visibility", value_domain::DECLARED_VISIBILITY_DOMAIN),
                     CodeQueryRowField::required_enum(
                         "trace_completeness",
                         value_domain::TRACE_COMPLETENESS
@@ -2845,9 +3048,9 @@ detailed_row_domains! {
                         "dispatch_tier",
                         value_domain::MEMBER_DISPATCH_TIER
                     ),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "applicability",
-                        value_domain::APPLICABILITY_VERDICT
+                        value_domain::APPLICABILITY_VERDICT_DOMAIN
                     ),
         ],
     },
@@ -2890,9 +3093,9 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("form", value_domain::EXPORT_FORM),
                     CodeQueryRowField::required("exported_name", Scalar::String),
                     CodeQueryRowField::optional("target_fq_name", Scalar::String),
-                    CodeQueryRowField::optional_enum(
+                    CodeQueryRowField::optional_constrained_enum(
                         "definition_status",
-                        value_domain::EXPORT_DEFINITION_STATUS
+                        value_domain::EXPORT_DEFINITION_STATUS_DOMAIN
                     ),
                     CodeQueryRowField::optional("definition_binding_name", Scalar::String),
                     CodeQueryRowField::optional_enum(
@@ -2944,11 +3147,10 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
                     CodeQueryRowField::optional("source_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
-                    CodeQueryRowField::optional_enum("reference_kind", value_domain::REFERENCE_KIND),
                     CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
                     CodeQueryRowField::required_enum("usage_kind", value_domain::USAGE_KIND),
                     CodeQueryRowField::required_enum("site_class", value_domain::SITE_CLASS),
-                    CodeQueryRowField::required_enum("owner_relation", value_domain::OWNER_RELATION),
+                    CodeQueryRowField::required_constrained_enum("owner_relation", value_domain::OWNER_RELATION_DOMAIN),
                     CodeQueryRowField::required_enum("edge_provenance", value_domain::EDGE_PROVENANCE),
                     CodeQueryRowField::required("generation", Scalar::Integer),
         ],
@@ -3059,7 +3261,7 @@ detailed_row_domains! {
             CodeQueryRowField::required("id", Scalar::StableId),
             CodeQueryRowField::required("catch_ast_id", Scalar::StableId),
             CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
-            CodeQueryRowField::required_enum("verdict", &["empty", "nonempty", "unknown"]),
+            CodeQueryRowField::required_constrained_enum("verdict", CodeQueryEnumDomain::Undecided { labels: &["empty", "nonempty", "unknown"], members: &["unknown"] }),
             CodeQueryRowField::required_enum("proof", &["exact", "unknown"]),
             CodeQueryRowField::required_enum("coverage", &["exhaustive", "incomplete"]),
             CodeQueryRowField::optional_enum("reason", &[
@@ -3069,15 +3271,15 @@ detailed_row_domains! {
                 "caught_type_hierarchy_unknown", "unproven_activation"
             ]),
             CodeQueryRowField::optional("caught_type", Scalar::DeclarationIdentity),
-            CodeQueryRowField::optional_enum(
+            CodeQueryRowField::optional_constrained_enum(
                 "caught_type_relation",
-                &["system_exception", "not_system_exception", "unknown"],
+                CodeQueryEnumDomain::Undecided { labels: &["system_exception", "not_system_exception", "unknown"], members: &["unknown"] },
             ),
-            CodeQueryRowField::optional_enum("throw_relation", &["caught_variable", "bare", "other", "no_owner", "unknown"]),
+            CodeQueryRowField::optional_constrained_enum("throw_relation", CodeQueryEnumDomain::Undecided { labels: &["caught_variable", "bare", "other", "no_owner", "unknown"], members: &["unknown"] }),
             CodeQueryRowField::optional("has_filter", Scalar::Boolean),
-            CodeQueryRowField::optional_enum(
+            CodeQueryRowField::optional_constrained_enum(
                 "rethrow_kind",
-                &["none", "bare", "caught_variable", "both", "unknown"],
+                CodeQueryEnumDomain::Undecided { labels: &["none", "bare", "caught_variable", "both", "unknown"], members: &["unknown"] },
             ),
         ],
     },
@@ -3089,7 +3291,7 @@ detailed_row_domains! {
             CodeQueryRowField::required("owner_id", Scalar::StableId),
             CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
             CodeQueryRowField::required_enum("relation", value_domain::BRANCH_RELATION),
-            CodeQueryRowField::required_enum("verdict", value_domain::BRANCH_VERDICT),
+            CodeQueryRowField::required_constrained_enum("verdict", value_domain::BRANCH_VERDICT_DOMAIN),
             CodeQueryRowField::optional_enum("reason", value_domain::BRANCH_REASON),
             CodeQueryRowField::optional_enum("orientation", value_domain::BRANCH_ORIENTATION),
             CodeQueryRowField::required("earlier_ordinal", Scalar::Integer),
@@ -3104,7 +3306,7 @@ detailed_row_domains! {
             CodeQueryRowField::required("procedure_id", Scalar::StableId),
             CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
             CodeQueryRowField::required_enum("loop_kind", value_domain::LOOP_KIND),
-            CodeQueryRowField::required_enum("verdict", value_domain::LOOP_VERDICT),
+            CodeQueryRowField::required_constrained_enum("verdict", value_domain::LOOP_VERDICT_DOMAIN),
             CodeQueryRowField::optional("repeat_edge_id", Scalar::StableId),
         ],
     },
@@ -3171,7 +3373,8 @@ detailed_row_domains! {
             CodeQueryRowField::required("procedure_id", Scalar::StableId),
             CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
             CodeQueryRowField::required_enum("statement_kind", value_domain::STATEMENT_KIND),
-            CodeQueryRowField::required_enum("verdict", value_domain::STATEMENT_VERDICT),
+            CodeQueryRowField::required_constrained_enum("verdict", value_domain::STATEMENT_VERDICT_DOMAIN),
+            CodeQueryRowField::optional_constrained_enum("region_first", value_domain::REGION_FIRST_DOMAIN),
             CodeQueryRowField::optional("reason", Scalar::String),
         ],
     },
@@ -3193,9 +3396,9 @@ detailed_row_domains! {
             ),
             CodeQueryRowField::required("source_id", Scalar::StableId),
             CodeQueryRowField::required("target_id", Scalar::StableId),
-            CodeQueryRowField::required_enum(
+            CodeQueryRowField::required_constrained_enum(
                 "verdict",
-                &["overrides", "preserves", "unknown"],
+                CodeQueryEnumDomain::Undecided { labels: &["overrides", "preserves", "unknown"], members: &["unknown"] },
             ),
             CodeQueryRowField::required_enum("proof", &["exact", "unknown"]),
             CodeQueryRowField::required_enum("coverage", &["exhaustive", "incomplete"]),
@@ -3211,7 +3414,7 @@ detailed_row_domains! {
             CodeQueryRowField::optional("owner_id", Scalar::StableId),
             CodeQueryRowField::required("path", Scalar::String),
             CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
-            CodeQueryRowField::required_enum("outcome", value_domain::PYTHON_RULE_OUTCOME),
+            CodeQueryRowField::required_constrained_enum("outcome", value_domain::PYTHON_RULE_OUTCOME_DOMAIN),
             CodeQueryRowField::required_enum("proof", value_domain::PYTHON_RULE_PROOF),
             CodeQueryRowField::required_enum("completeness", value_domain::PYTHON_RULE_COMPLETENESS),
             CodeQueryRowField::optional("reason", Scalar::String),
@@ -3224,29 +3427,29 @@ detailed_row_domains! {
             CodeQueryRowField::optional("return_constant", Scalar::String),
             CodeQueryRowField::optional("is_async", Scalar::Boolean),
             CodeQueryRowField::optional("is_generator", Scalar::Boolean),
-            CodeQueryRowField::optional_enum("test_scope", value_domain::PYTHON_TRI_STATE),
-            CodeQueryRowField::optional_enum(
+            CodeQueryRowField::optional_constrained_enum("test_scope", value_domain::PYTHON_TRI_STATE_DOMAIN),
+            CodeQueryRowField::optional_constrained_enum(
                 "terminal_elif_else",
-                value_domain::PYTHON_TRI_STATE,
+                value_domain::PYTHON_TRI_STATE_DOMAIN,
             ),
             CodeQueryRowField::optional("tuple_return_count", Scalar::Integer),
             CodeQueryRowField::optional("distinct_tuple_arities", Scalar::Integer),
             CodeQueryRowField::optional("tuple_return_arities", Scalar::IntegerList),
             CodeQueryRowField::optional("assignment_target_count", Scalar::Integer),
-            CodeQueryRowField::optional_enum(
+            CodeQueryRowField::optional_constrained_enum(
                 "assignment_arity_match",
-                value_domain::PYTHON_TRI_STATE,
+                value_domain::PYTHON_TRI_STATE_DOMAIN,
             ),
             CodeQueryRowField::optional("mixed_tuple_arities", Scalar::Boolean),
             CodeQueryRowField::optional("annotated", Scalar::Boolean),
-            CodeQueryRowField::optional_enum("return_contract", value_domain::PYTHON_RETURN_CONTRACT),
-            CodeQueryRowField::optional_enum("result_use", value_domain::PYTHON_RESULT_USE),
+            CodeQueryRowField::optional_constrained_enum("return_contract", value_domain::PYTHON_RETURN_CONTRACT_DOMAIN),
+            CodeQueryRowField::optional_constrained_enum("result_use", value_domain::PYTHON_RESULT_USE_DOMAIN),
             CodeQueryRowField::optional("forwarded", Scalar::Boolean),
-            CodeQueryRowField::optional_enum(
+            CodeQueryRowField::optional_constrained_enum(
                 "callable_evaluation_time",
-                value_domain::PYTHON_CALLABLE_EVALUATION_TIME,
+                value_domain::PYTHON_CALLABLE_EVALUATION_TIME_DOMAIN,
             ),
-            CodeQueryRowField::optional_enum("default_equivalent", value_domain::PYTHON_TRI_STATE),
+            CodeQueryRowField::optional_constrained_enum("default_equivalent", value_domain::PYTHON_TRI_STATE_DOMAIN),
             CodeQueryRowField::optional("target_id", Scalar::StableId),
             CodeQueryRowField::optional("returns_receiver", Scalar::Boolean),
             CodeQueryRowField::optional("parameter_count", Scalar::Integer),
@@ -3289,9 +3492,9 @@ detailed_row_domains! {
             CodeQueryRowField::optional("is_abstract", Scalar::Boolean),
             CodeQueryRowField::optional("is_overriding_method", Scalar::Boolean),
             CodeQueryRowField::optional("is_overridden_method", Scalar::Boolean),
-            CodeQueryRowField::optional_enum(
+            CodeQueryRowField::optional_constrained_enum(
                 "reachability",
-                value_domain::PYTHON_VARIABLE_REACHABILITY,
+                value_domain::PYTHON_VARIABLE_REACHABILITY_DOMAIN,
             ),
             CodeQueryRowField::optional_enum(
                 "access_kind",
@@ -3533,19 +3736,19 @@ detailed_row_domains! {
                         "arch_source",
                         value_domain::BUILD_SETTING_SOURCE
                     ),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "file_status",
-                        value_domain::BUILD_FILE_STATUS
+                        value_domain::BUILD_FILE_STATUS_DOMAIN
                     ),
                     CodeQueryRowField::optional("constraint", Scalar::String),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "os_scope",
-                        value_domain::BUILD_TARGET_SCOPE
+                        value_domain::BUILD_TARGET_SCOPE_DOMAIN
                     ),
                     CodeQueryRowField::optional("os_values", Scalar::String),
-                    CodeQueryRowField::required_enum(
+                    CodeQueryRowField::required_constrained_enum(
                         "arch_scope",
-                        value_domain::BUILD_TARGET_SCOPE
+                        value_domain::BUILD_TARGET_SCOPE_DOMAIN
                     ),
                     CodeQueryRowField::optional("arch_values", Scalar::String),
         ],
@@ -4021,9 +4224,6 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ReferenceSite { value }, "proof") => {
             Some(Scalar::ConstrainedEnum(value.proof))
         }
-        (CodeQueryResultValue::ReferenceSite { value }, "reference_kind") => {
-            value.reference_kind.map(Scalar::ConstrainedEnum)
-        }
         (CodeQueryResultValue::CallSite { value }, "caller_id") => {
             value.caller.id.as_deref().map(Scalar::DeclarationIdentity)
         }
@@ -4033,8 +4233,28 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallSite { value }, "program_point_id") => {
             value.program_point_id.as_deref().map(Scalar::StableId)
         }
-        (CodeQueryResultValue::CallSite { value }, "callee_id") => {
-            value.callee.id.as_deref().map(Scalar::DeclarationIdentity)
+        (CodeQueryResultValue::CallSite { value }, "callee_id") => value
+            .callee
+            .as_ref()
+            .and_then(|callee| callee.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallSite { value }, "target_id") => {
+            value.target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallSite { value }, "target_fq_name") => {
+            value.target_fq_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallSite { value }, "boundary_kind") => {
+            value.boundary_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallSite { value }, "target_reason") => {
+            value.target_reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallSite { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
+        (CodeQueryResultValue::CallSite { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
         }
         (CodeQueryResultValue::CallSite { value }, "call_kind") => {
             Some(Scalar::ConstrainedEnum(value.call_kind))
@@ -5484,12 +5704,18 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::DispatchTarget { value }, "site_id") => {
             Some(Scalar::StableId(&value.site_id))
         }
+        (CodeQueryResultValue::DispatchTarget { value }, "root_id") => {
+            Some(Scalar::StableId(&value.root_id))
+        }
         (CodeQueryResultValue::DispatchTarget { value }, "site_ast_id") => {
             value.site_ast_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::DispatchTarget { value }, "ordinal") => {
             Some(Scalar::Integer(value.ordinal as u64))
         }
+        (CodeQueryResultValue::DispatchTarget { value }, "target_count") => value
+            .target_count
+            .map(|count| Scalar::Integer(count as u64)),
         (CodeQueryResultValue::DispatchTarget { value }, "target_id") => {
             Some(Scalar::StableId(&value.target_id))
         }
@@ -5515,6 +5741,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::DispatchTarget { value }, "boundary_kind") => {
             value.boundary_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::DispatchTarget { value }, "boundary_reason") => {
+            value.boundary_reason.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::MemberFamily { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::MemberFamily { value }, "member_id") => {
@@ -5838,6 +6067,15 @@ fn project_code_query_row_field<'a>(
             value.reached_from_ast_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::Binding { value }, "name") => Some(Scalar::String(&value.name)),
+        (CodeQueryResultValue::Binding { value }, "immediate_parent_kind") => {
+            value.immediate_parent_kind.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::Binding { value }, "whole_let_initializer") => {
+            Some(Scalar::Boolean(value.whole_let_initializer))
+        }
+        (CodeQueryResultValue::Binding { value }, "whole_match_arm_identifier") => {
+            Some(Scalar::Boolean(value.whole_match_arm_identifier))
+        }
         (CodeQueryResultValue::Binding { value }, "kind") => {
             Some(Scalar::ConstrainedEnum(value.kind))
         }
@@ -6088,9 +6326,6 @@ fn project_code_query_row_field<'a>(
             .map(Scalar::DeclarationIdentity),
         (CodeQueryResultValue::ReferenceEdge { value }, "target_id") => {
             value.target.id.as_deref().map(Scalar::DeclarationIdentity)
-        }
-        (CodeQueryResultValue::ReferenceEdge { value }, "reference_kind") => {
-            value.reference_kind.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::ReferenceEdge { value }, "proof") => {
             Some(Scalar::ConstrainedEnum(value.proof))
@@ -6453,6 +6688,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::StatementReachability { value }, "verdict") => {
             Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::StatementReachability { value }, "region_first") => {
+            value.region_first.map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::StatementReachability { value }, "reason") => {
             value.reason.as_deref().map(Scalar::String)
@@ -7069,6 +7307,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ConfigurationFact { value }, "path") => {
             Some(Scalar::String(&value.path))
         }
+        (CodeQueryResultValue::ConfigurationFact { value }, "directory") => {
+            Some(Scalar::String(&value.directory))
+        }
         (CodeQueryResultValue::ConfigurationFact { value }, "format") => {
             Some(Scalar::ConstrainedEnum(value.format))
         }
@@ -7277,6 +7518,7 @@ pub enum DetailedCodeQueryKey {
     DispatchTarget {
         id: String,
         site_id: String,
+        root_id: String,
         ordinal: usize,
     },
     MemberFamily {

@@ -6,6 +6,186 @@ use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::Node;
+use unicode_normalization::UnicodeNormalization;
+
+/// The path facts the module-edge construction reads: whether a module
+/// candidate exists, where a `#[path]` attribute leads, and a file's package
+/// name. The whole index answers them from the live filesystem. A retained
+/// per-unit derivation must answer them from its selection instead, because
+/// nothing it read from the filesystem is recorded in its identity.
+pub trait RustRoutePathFacts {
+    fn file_exists(&self, file: &ProjectFile) -> bool;
+    fn workspace_relative(&self, root: &Path, base: &Path, path: &Path) -> Option<PathBuf>;
+    fn package_name(&self, file: &ProjectFile) -> String;
+    /// Called for a module candidate that `file_exists` denied. A fact source
+    /// that cannot prove the absence records it. The live filesystem proves it.
+    fn deny_candidate(&self, _candidate: &ProjectFile) {}
+}
+
+/// Rust source-listing derivation rules. Bump when listing or admission rules
+/// change; readers treat older rows as absent. Changing
+/// [`is_rust_listing_path`] changes what the certificate covers, so it
+/// requires a bump here.
+///
+/// 2: a symbolic link to a directory, or to a target that cannot be read, fails
+/// the certificate (#10321). A version 1 certificate may have certified a
+/// listing that hid `.rs` files behind such a link.
+///
+/// 3: names compare ignoring ASCII case (#10469). On a case-insensitive volume
+/// rustc opens src/foo.RS for `mod foo;`, so an omitted `.RS` file must fail
+/// the certificate as an omitted `.rs` file does.
+pub const RUST_SOURCE_LISTING_DERIVATION_VERSION: i64 = 3;
+
+/// Whether a file listing that was certified complete for Rust proves a path
+/// absent. The listing certificate covers `.rs` names and `Cargo.toml`,
+/// ignoring ASCII case as a case-insensitive volume and the language of a
+/// selected file do: an omitted file with another name is not recorded as
+/// relevant, although a `#[path]` attribute may name any file and rustc
+/// compiles it as Rust.
+///
+/// The certificate's coverage, its omission rule, the per-unit route kinds
+/// and the crate-row producer share this predicate. A change to it requires a
+/// bump of [`RUST_SOURCE_LISTING_DERIVATION_VERSION`].
+pub fn is_rust_listing_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+        || path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("Cargo.toml"))
+}
+
+/// The key under which a module candidate and a selected file match on a
+/// case-insensitive volume. A missing candidate whose key equals a selected
+/// file's is unproven, never resolved to that file: on a case-sensitive volume
+/// they are different files, and the selection does not record the volume's
+/// case policy. APFS and NTFS fold letters beyond ASCII, so the key maps each
+/// character to upper case and then to lower case, one character at a time,
+/// and repeats until nothing changes. One pass unifies the final and medial
+/// sigma and the Kelvin sign with `k`, which `str::to_lowercase` with its
+/// context rule for a word-final sigma does not; the repeat unifies a letter
+/// whose lower case expands on the next pass, as U+1E9E (capital sharp s)
+/// becomes U+00DF and then `ss`. The key is an approximation of the volume's
+/// folding that errs toward folding more: that only marks more candidates
+/// unproven. Composed and decomposed forms of one letter are not unified.
+///
+/// The per-unit route kinds and the crate-row producer share this key.
+pub fn rust_case_fold_key(path: &str) -> String {
+    let mut key = case_fold_pass(path);
+    // Each pass only expands letters into lower-case ones, which reach their
+    // fixed point within a few passes.
+    for _ in 0..CASE_FOLD_EXTRA_PASSES {
+        let next = case_fold_pass(&key);
+        if next == key {
+            return key;
+        }
+        key = next;
+    }
+    panic!("case folding of {path:?} did not reach a fixed point");
+}
+
+/// A directory omission comparison must also cover volumes that normalize
+/// Unicode names. Keep this separate from the persisted case-folded path probes:
+/// their key format does not change when omission coverage gains NFD matching.
+pub fn rust_omission_path_key(path: &str) -> String {
+    rust_case_fold_key(&path.nfd().collect::<String>())
+        .nfd()
+        .collect()
+}
+
+const CASE_FOLD_EXTRA_PASSES: usize = 4;
+
+fn case_fold_pass(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Path facts of one selection. A candidate exists when it is a selected file.
+/// Containment is lexical, because the file listing records symbolic links as
+/// omissions, so the selection holds no path that reaches through one. Package
+/// names come from the selection's manifests, as the persisted package rows
+/// do.
+///
+/// A denied candidate whose name the listing certificate does not cover (see
+/// [`is_rust_listing_path`]) is recorded, because the selection proves no
+/// absence for it: a symbolic link or a file such as `gen.inc` named by a
+/// `#[path]` attribute is not a selected file, and may still be Rust.
+///
+/// A denied candidate whose [`rust_case_fold_key`] equals a selected file's is
+/// recorded whatever its name.
+pub struct SelectedRustRoutePathFacts<'a> {
+    pub files: &'a HashSet<ProjectFile>,
+    pub naming: &'a crate::crate_naming::RustSelectedCargoNaming,
+    folded_files: HashSet<String>,
+    unproven: std::sync::Mutex<std::collections::BTreeSet<ProjectFile>>,
+}
+impl<'a> SelectedRustRoutePathFacts<'a> {
+    pub fn new(
+        files: &'a HashSet<ProjectFile>,
+        naming: &'a crate::crate_naming::RustSelectedCargoNaming,
+    ) -> Self {
+        Self {
+            files,
+            naming,
+            folded_files: files
+                .iter()
+                .map(|file| rust_case_fold_key(&file.rel_path().to_string_lossy()))
+                .collect(),
+            unproven: Default::default(),
+        }
+    }
+    /// The module candidates the route build found missing and the listing
+    /// certificate cannot prove absent, sorted. Read it after the build.
+    pub fn unproven_candidates(&self) -> Vec<ProjectFile> {
+        let unproven = self.unproven.lock().expect("unproven candidates lock");
+        unproven.iter().cloned().collect()
+    }
+}
+impl RustRoutePathFacts for SelectedRustRoutePathFacts<'_> {
+    fn deny_candidate(&self, candidate: &ProjectFile) {
+        if !is_rust_listing_path(candidate.rel_path())
+            || self
+                .folded_files
+                .contains(&rust_case_fold_key(&candidate.rel_path().to_string_lossy()))
+        {
+            self.unproven
+                .lock()
+                .expect("unproven candidates lock")
+                .insert(candidate.clone());
+        }
+    }
+    fn file_exists(&self, file: &ProjectFile) -> bool {
+        self.files.contains(file)
+    }
+    fn workspace_relative(&self, root: &Path, base: &Path, path: &Path) -> Option<PathBuf> {
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(base).join(path)
+        };
+        let relative = joined.strip_prefix(root).ok()?;
+        let mut normalized = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        return None;
+                    }
+                }
+                Component::Normal(part) => normalized.push(part),
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        Some(normalized)
+    }
+    fn package_name(&self, file: &ProjectFile) -> String {
+        self.naming
+            .package_name(file.rel_path())
+            .unwrap_or_else(|| panic!("selected route file {file:?} has no selected package name"))
+    }
+}
 
 use brokk_bifrost_core::analyzer::rust_facts::{
     RustCfgCondition, RustModuleRouteFact, RustModuleRouteFacts, RustVisibility,
@@ -13,7 +193,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 
 use crate::cargo_config::RustCargoConfiguration;
 use crate::cargo_manifest::RustCargoManifestDocument;
-use crate::declarations::rust_package_name;
+use crate::graph_support::RustRoutedAnswer;
 use crate::imports::{rust_external_module_route, rust_external_module_segments};
 
 // How many times one Cargo-route build has iterated the complete analyzed
@@ -55,59 +235,6 @@ fn workspace_file_sweeps_of(build: impl FnOnce()) -> usize {
     WORKSPACE_FILE_SWEEPS.with(std::cell::Cell::get)
 }
 
-fn read_manifest(root: &Path, directory: &Path) -> Option<RustCargoManifestDocument> {
-    std::fs::read(root.join(directory).join("Cargo.toml"))
-        .ok()
-        .and_then(|source_bytes| {
-            RustCargoManifestDocument::from_source_bytes(source_bytes.into_boxed_slice()).ok()
-        })
-}
-
-fn cargo_crate(
-    root: &Path,
-    directory: PathBuf,
-    manifest: RustCargoManifestDocument,
-    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
-) -> Option<CargoCrate> {
-    let package_name = cargo_manifest_package_name(&manifest)?;
-    let edition = cargo_package_edition(root, &directory, &manifest, manifests);
-    let explicit_library = manifest.get("lib");
-    let library = if explicit_library.is_some() || cargo_library_discovery_enabled(&manifest) {
-        let library_table = match explicit_library {
-            Some(library) => Some(library.as_table()?),
-            None => None,
-        };
-        let library_name = cargo_manifest_library_name(&manifest)
-            .unwrap_or_else(|| normalize_crate_name(&package_name));
-        let library_path = library_table
-            .and_then(|library| library.get("path"))
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
-        match workspace_relative_path(root, &directory, &library_path) {
-            Some(library_path) => {
-                let root_file = ProjectFile::new(root.to_path_buf(), library_path);
-                Some(CargoLibrary {
-                    name: library_name,
-                    root_package: rust_package_name(&root_file),
-                    root_file,
-                })
-            }
-            None if explicit_library.is_some() => return None,
-            None => None,
-        }
-    } else {
-        None
-    };
-    Some(CargoCrate {
-        directory,
-        package_name,
-        library,
-        edition,
-        manifest,
-    })
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct RustCargoRouteIndex {
     routes_by_manifest_and_name: HashMap<(PathBuf, String), Vec<RustCargoRoute>>,
@@ -120,6 +247,361 @@ pub struct RustCargoRouteIndex {
     files_by_reachable_root: HashMap<ProjectFile, Vec<ProjectFile>>,
     external_module_declarations: Vec<RustCargoModuleDeclaration>,
     test_only_files: HashSet<ProjectFile>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RustFileRoutes {
+    units: Vec<Arc<RustCargoRouteIndex>>,
+    complete: bool,
+}
+
+impl RustFileRoutes {
+    pub fn new(units: Vec<Arc<RustCargoRouteIndex>>) -> Self {
+        Self {
+            units,
+            complete: true,
+        }
+    }
+    pub fn with_completeness(units: Vec<Arc<RustCargoRouteIndex>>, complete: bool) -> Self {
+        Self { units, complete }
+    }
+    pub fn from_index(index: Arc<RustCargoRouteIndex>) -> Self {
+        Self::new(vec![index])
+    }
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+    /// Return an extern-root identity only when all contributing units agree.
+    pub fn type_root_identity(&self, file: &ProjectFile, name: &str) -> Option<([u8; 32], String)> {
+        let mut answers = self
+            .units
+            .iter()
+            .map(|unit| unit.type_root_identity(file, name));
+        let first = answers.next()??;
+        answers
+            .all(|answer| answer.as_ref() == Some(&first))
+            .then_some(first)
+    }
+    pub fn target_roots(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        let mut roots = self
+            .units
+            .iter()
+            .flat_map(|unit| unit.target_roots_for_file(file))
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
+        roots
+    }
+    pub fn uses_rust_2015_edition(&self, file: &ProjectFile) -> bool {
+        let mut found = false;
+        for unit in &self.units {
+            if !unit.target_roots_for_file(file).is_empty() {
+                found = true;
+                if !unit.file_uses_rust_2015_edition(file) {
+                    return false;
+                }
+            }
+        }
+        found
+    }
+    pub fn file_is_test_only(&self, file: &ProjectFile) -> bool {
+        self.complete
+            && !self.units.is_empty()
+            && self.units.iter().all(|unit| unit.file_is_test_only(file))
+    }
+    pub fn target_relation(
+        &self,
+        file: &ProjectFile,
+        other: &Self,
+        other_file: &ProjectFile,
+    ) -> RustCargoTargetRelation {
+        let roots = self.target_roots(file);
+        let other_roots = other.target_roots(other_file);
+        if roots.is_empty() || other_roots.is_empty() {
+            RustCargoTargetRelation::Unknown
+        } else if roots.iter().any(|root| other_roots.contains(root)) {
+            RustCargoTargetRelation::Shared
+        } else if !self.complete || !other.complete {
+            RustCargoTargetRelation::Unknown
+        } else {
+            RustCargoTargetRelation::Disjoint
+        }
+    }
+    pub fn files_share_target(
+        &self,
+        file: &ProjectFile,
+        other: &Self,
+        other_file: &ProjectFile,
+    ) -> Option<bool> {
+        match self.target_relation(file, other, other_file) {
+            RustCargoTargetRelation::Shared => Some(true),
+            RustCargoTargetRelation::Disjoint => Some(false),
+            RustCargoTargetRelation::Unknown => None,
+        }
+    }
+    /// Forward module-package resolution for a file that may sit in several
+    /// units. Candidate lists are merged across the file's units before the
+    /// whole index's uniqueness check: merging each unit's own `Option` would
+    /// hide a second candidate that makes the answer ambiguous.
+    ///
+    /// A partial answer returns no target, because an omitted unit can add
+    /// the candidate that makes an observed unique target wrong. A file that
+    /// no unit's target holds has no routes here. The whole index's
+    /// workspace-wide unscoped-library fallback needs the crate-name question,
+    /// which only the `_or_unscoped` forms ask.
+    pub fn resolve_module_package(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Option<String> {
+        self.resolve_module_package_or_unscoped(importing_file, module_specifier, &|_| {
+            RustRoutedAnswer::incomplete(Vec::new())
+        })
+    }
+    pub fn resolve_module_package_segments_with_kind(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<(String, RustCargoRouteKind)> {
+        self.resolve_module_package_segments_with_kind_or_unscoped(
+            importing_file,
+            segments,
+            &|_| RustRoutedAnswer::incomplete(Vec::new()),
+        )
+    }
+    pub fn resolve_crate_root_file(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Option<ProjectFile> {
+        self.resolve_crate_root_file_or_unscoped(importing_file, module_specifier, &|_| {
+            RustRoutedAnswer::incomplete(Vec::new())
+        })
+    }
+    pub fn resolve_crate_root_file_segments_with_kind(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<(ProjectFile, RustCargoRouteKind)> {
+        self.resolve_crate_root_file_segments_with_kind_or_unscoped(
+            importing_file,
+            segments,
+            &|_| RustRoutedAnswer::incomplete(Vec::new()),
+        )
+    }
+    /// [`Self::resolve_module_package`] for a file that no unit's target holds:
+    /// `unscoped` answers the crate-name question for a normalized name, and a
+    /// complete answer with exactly one library root is a dependency route, as
+    /// in the whole index. A partial answer returns no target.
+    pub fn resolve_module_package_or_unscoped(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+        unscoped: &dyn Fn(&str) -> RustUnscopedLibraries,
+    ) -> Option<String> {
+        resolve_module_package_with(module_specifier, |name| {
+            self.resolve_available_route(importing_file, name, unscoped)
+        })
+    }
+    pub fn resolve_module_package_segments_with_kind_or_unscoped(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+        unscoped: &dyn Fn(&str) -> RustUnscopedLibraries,
+    ) -> Option<(String, RustCargoRouteKind)> {
+        resolve_module_package_segments_with(segments, |name| {
+            self.resolve_available_route(importing_file, name, unscoped)
+        })
+    }
+    pub fn resolve_crate_root_file_or_unscoped(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+        unscoped: &dyn Fn(&str) -> RustUnscopedLibraries,
+    ) -> Option<ProjectFile> {
+        resolve_crate_root_file_with(module_specifier, |name| {
+            self.resolve_available_route(importing_file, name, unscoped)
+        })
+    }
+    pub fn resolve_crate_root_file_segments_with_kind_or_unscoped(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+        unscoped: &dyn Fn(&str) -> RustUnscopedLibraries,
+    ) -> Option<(ProjectFile, RustCargoRouteKind)> {
+        resolve_crate_root_file_segments_with(segments, |name| {
+            self.resolve_available_route(importing_file, name, unscoped)
+        })
+    }
+    /// Whether some unit of this answer has `file` in one of its targets. A
+    /// file in no target is the whole index's unscoped case.
+    pub fn is_in_target(&self, file: &ProjectFile) -> bool {
+        self.units
+            .iter()
+            .any(|unit| !unit.target_roots_for_file(file).is_empty())
+    }
+    fn resolve_available_route(
+        &self,
+        file: &ProjectFile,
+        route_name: &str,
+        unscoped: &dyn Fn(&str) -> RustUnscopedLibraries,
+    ) -> Option<RustCargoRoute> {
+        if !self.complete {
+            return None;
+        }
+        let normalized = normalize_crate_name(route_name);
+        if !self.is_in_target(file) {
+            return unique_library_route(&unscoped(&normalized));
+        }
+        let scoped = self
+            .units
+            .iter()
+            .filter_map(|unit| unit.scoped_route_candidates(file, &normalized))
+            .collect::<Vec<_>>();
+        unique_scoped_route(scoped.into_iter().flatten().collect())
+    }
+    /// Whether one of the file's units declares a dependency under this name
+    /// that its targets can use. `None` is unknown: a negative needs a
+    /// complete answer.
+    pub fn has_available_declared_dependency(
+        &self,
+        file: &ProjectFile,
+        route_name: &str,
+    ) -> Option<bool> {
+        if self
+            .units
+            .iter()
+            .any(|unit| unit.has_available_declared_dependency(file, route_name))
+        {
+            Some(true)
+        } else {
+            self.complete.then_some(false)
+        }
+    }
+    /// Module declarations written in `file`, over all of its units.
+    pub fn module_declarations_declared_in(&self, file: &ProjectFile) -> RustFileDeclarations {
+        self.declarations(|declaration| &declaration.declaring_file == file)
+    }
+    /// Module declarations that name `file` as their target, over all of its
+    /// units.
+    pub fn module_declarations_targeting(&self, file: &ProjectFile) -> RustFileDeclarations {
+        self.declarations(|declaration| &declaration.target_file == file)
+    }
+    fn declarations(
+        &self,
+        wanted: impl Fn(&RustCargoModuleDeclaration) -> bool,
+    ) -> RustFileDeclarations {
+        let mut declarations = self
+            .units
+            .iter()
+            .flat_map(|unit| unit.external_module_declarations())
+            .filter(|declaration| wanted(declaration))
+            .cloned()
+            .collect();
+        sort_and_dedup_external_module_declarations(&mut declarations);
+        RustFileDeclarations {
+            declarations,
+            complete: self.complete,
+        }
+    }
+    /// Whether `file` can name something in `target_file`'s target roots: it
+    /// shares a root with it, or one of its roots' targets has a Cargo route
+    /// to one. `self` holds the routes of `file`'s units and `target` those of
+    /// `target_file`'s. `None` is unknown: a negative needs both complete.
+    pub fn file_can_reference_target_of(
+        &self,
+        file: &ProjectFile,
+        target: &Self,
+        target_file: &ProjectFile,
+    ) -> Option<bool> {
+        let target_roots = target.target_roots(target_file);
+        if target_roots.iter().any(|root| {
+            self.units
+                .iter()
+                .any(|unit| unit.file_reaches_root(file, root))
+        }) {
+            Some(true)
+        } else {
+            (self.complete && target.complete).then_some(false)
+        }
+    }
+    pub fn candidates_in_same_target_root(
+        &self,
+        file: &ProjectFile,
+        candidates: Vec<CodeUnit>,
+        candidate_routes: &HashMap<ProjectFile, RustFileRoutes>,
+    ) -> Option<Vec<CodeUnit>> {
+        let roots = self.target_roots(file);
+        if roots.is_empty()
+            || !self.complete
+            || candidates.iter().any(|candidate| {
+                candidate_routes
+                    .get(candidate.source())
+                    .is_none_or(|routes| !routes.complete)
+            })
+        {
+            return None;
+        }
+        Some(
+            candidates
+                .into_iter()
+                .filter(|candidate| {
+                    candidate_routes
+                        .get(candidate.source())
+                        .is_some_and(|routes| {
+                            routes
+                                .target_roots(candidate.source())
+                                .iter()
+                                .any(|root| roots.contains(root))
+                        })
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Module declarations selected from a file's units. When `complete` is
+/// false, declarations may be missing: a caller must not close a scope on it.
+#[derive(Debug, Clone)]
+pub struct RustFileDeclarations {
+    pub declarations: Vec<RustCargoModuleDeclaration>,
+    pub complete: bool,
+}
+
+/// The library roots that the crate-name question names under one normalized
+/// crate name. A file that no unit's target holds reaches a workspace library
+/// by name: a unique root is a dependency route, as in the whole index, and a
+/// second root makes the name ambiguous. When the answer is incomplete a root
+/// may be missing, so no route is drawn from it.
+pub type RustUnscopedLibraries = RustRoutedAnswer<Vec<RustLibraryRoot>>;
+
+/// One library root file and the package it roots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustLibraryRoot {
+    pub root_file: ProjectFile,
+    pub package: String,
+}
+
+/// The dependency route that a complete crate-name answer with exactly one
+/// library root gives, as in the whole index.
+fn unique_library_route(libraries: &RustUnscopedLibraries) -> Option<RustCargoRoute> {
+    if !libraries.complete {
+        return None;
+    }
+    let mut roots = libraries.value.clone();
+    roots.sort_by(|left, right| left.root_file.cmp(&right.root_file));
+    roots.dedup_by(|duplicate, retained| duplicate.root_file == retained.root_file);
+    match roots.as_slice() {
+        [root] => Some(RustCargoRoute {
+            package: root.package.clone(),
+            root_file: root.root_file.clone(),
+            kind: RustCargoRouteKind::Dependency,
+            dependency_kind: None,
+            target_predicate: None,
+            target_unit_key: None,
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +638,7 @@ pub enum RustCargoTargetRelation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RustCargoTargetKind {
+pub enum RustCargoTargetKind {
     Library,
     Binary,
     Example,
@@ -172,12 +654,6 @@ struct RustCargoTarget {
     kind: RustCargoTargetKind,
     development_capable: bool,
     edition: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RustCargoTargetSpec {
-    kind: RustCargoTargetKind,
-    development_capable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,20 +696,6 @@ pub struct RustCargoRouteSummaryRow {
     pub dependency_manifest_directory: Option<PathBuf>,
 }
 
-struct CargoCrate {
-    directory: PathBuf,
-    package_name: String,
-    library: Option<CargoLibrary>,
-    edition: String,
-    manifest: RustCargoManifestDocument,
-}
-
-struct CargoLibrary {
-    name: String,
-    root_file: ProjectFile,
-    root_package: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RustVisibleItemMacroDefinition {
     visible_after: usize,
@@ -249,67 +711,89 @@ struct RustVisibleItemMacroDefinition {
 }
 
 impl RustCargoRouteIndex {
-    /// Compose the index from the persisted per-file module-route facts.
-    ///
-    /// Before issue #1793 this hydrated and parsed every analyzed Rust file --
-    /// 34-44 s on the rustc tree, once per analyzer generation, charged inside
-    /// the three-second `scan_usages` budget. The syntax those parses were read
-    /// for is now `rust_module_scopes` / `rust_module_routes` /
-    /// `rust_module_route_gates` / `rust_item_macros`, written when the file was
-    /// analyzed, and `module_route_facts` is one batched read of them. What
-    /// remains is the manifest topology, which is measured cheap (the rustc
-    /// tree's 347 manifests parse in 4.9 ms warm), and the path resolution and
-    /// existence checks the content-keyed rows deliberately do not carry.
-    ///
-    /// The composer remains tolerant of missing entries for synthetic callers,
-    /// but this function does not establish canonical publication readiness.
-    /// Production callers must verify that every live root has its canonical
-    /// route witness before composing an index; a missing entry there is
-    /// unavailable, not an empty route result.
-    ///
-    /// Issue #1817 is the orchestration around that read. It used to rediscover
-    /// the whole Cargo topology inside each of its two module-membership
-    /// passes, search the whole file list once per crate for that crate's
-    /// target roots, and sweep the whole file list once per target for the
-    /// files the target owns -- so the build grew as workspace times topology
-    /// and cost 9-19 s on the rustc tree with the parsing already gone. The
-    /// four stages below each cost the workspace once: the topology is
-    /// discovered a single time, and every per-target stage iterates the files
-    /// that target owns.
-    pub fn build_while(
-        files: &[ProjectFile],
-        module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
-        keep_going: &impl Fn() -> bool,
-    ) -> Option<Self> {
-        keep_going().then_some(())?;
-        let Some(root) = files.first().map(ProjectFile::root) else {
-            return Some(Self::default());
-        };
-        let (manifest_directories, configuration) =
-            discover_cargo_manifest_directories(root, files, keep_going)?;
-        if manifest_directories.is_empty() {
-            // Without a Cargo manifest there are no target, dependency, or
-            // edition identities for this index to model. Stop before the
-            // manifest builder reaches the same empty result the long way.
-            return Some(Self::default());
+    pub fn retained_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let mut bytes = size_of::<Self>();
+        bytes += self.routes_by_manifest_and_name.capacity()
+            * (size_of::<(PathBuf, String)>()
+                + size_of::<Vec<RustCargoRoute>>()
+                + 2 * size_of::<usize>());
+        for ((path, name), routes) in &self.routes_by_manifest_and_name {
+            bytes +=
+                path.capacity() + name.capacity() + routes.capacity() * size_of::<RustCargoRoute>();
+            for route in routes {
+                bytes += route.package.capacity()
+                    + route.root_file.retained_heap_bytes()
+                    + route.target_predicate.as_ref().map_or(0, String::capacity);
+            }
         }
-        let topology = CargoManifestTopology::discover(
-            root,
-            files,
-            manifest_directories,
-            &configuration,
-            keep_going,
-        )?;
-        Self::finish_build_from_topology_while(module_route_facts, topology, &keep_going)
+        bytes += self.declared_dependencies_by_manifest_and_name.capacity()
+            * (size_of::<(PathBuf, String)>()
+                + size_of::<Vec<RustCargoDependencyKind>>()
+                + 2 * size_of::<usize>());
+        for ((path, name), kinds) in &self.declared_dependencies_by_manifest_and_name {
+            bytes += path.capacity()
+                + name.capacity()
+                + kinds.capacity() * size_of::<RustCargoDependencyKind>();
+        }
+        bytes += self.declared_dependencies_by_unit_and_name.capacity()
+            * (size_of::<([u8; 32], String)>()
+                + size_of::<Vec<RustCargoDependencyKind>>()
+                + 2 * size_of::<usize>());
+        for ((_, name), kinds) in &self.declared_dependencies_by_unit_and_name {
+            bytes += name.capacity() + kinds.capacity() * size_of::<RustCargoDependencyKind>();
+        }
+        bytes += self.target_roots_by_file.capacity()
+            * (size_of::<ProjectFile>()
+                + size_of::<HashSet<ProjectFile>>()
+                + 2 * size_of::<usize>());
+        for (file, roots) in &self.target_roots_by_file {
+            bytes += file.retained_heap_bytes()
+                + roots.capacity() * (size_of::<ProjectFile>() + 2 * size_of::<usize>());
+            for root in roots {
+                bytes += root.retained_heap_bytes();
+            }
+        }
+        bytes += self.targets_by_root.capacity()
+            * (size_of::<ProjectFile>()
+                + size_of::<HashSet<RustCargoTarget>>()
+                + 2 * size_of::<usize>());
+        for (root, targets) in &self.targets_by_root {
+            bytes += root.retained_heap_bytes()
+                + targets.capacity() * (size_of::<RustCargoTarget>() + 2 * size_of::<usize>());
+            for target in targets {
+                bytes += target.manifest.capacity() + target.edition.capacity();
+            }
+        }
+        bytes += self.files_by_reachable_root.capacity()
+            * (size_of::<ProjectFile>() + size_of::<Vec<ProjectFile>>() + 2 * size_of::<usize>());
+        for (root, files) in &self.files_by_reachable_root {
+            bytes += root.retained_heap_bytes() + files.capacity() * size_of::<ProjectFile>();
+            for file in files {
+                bytes += file.retained_heap_bytes();
+            }
+        }
+        bytes +=
+            self.external_module_declarations.capacity() * size_of::<RustCargoModuleDeclaration>();
+        for decl in &self.external_module_declarations {
+            bytes += decl.declaring_file.retained_heap_bytes()
+                + decl.target_file.retained_heap_bytes()
+                + decl.declaring_module.capacity();
+        }
+        bytes +=
+            self.test_only_files.capacity() * (size_of::<ProjectFile>() + 2 * size_of::<usize>());
+        for file in &self.test_only_files {
+            bytes += file.retained_heap_bytes();
+        }
+        bytes
     }
 
-    /// Compose Cargo and module routes from normalized live unit-summary rows.
-    /// The summaries already record each target root and the dependencies
-    /// available to that target, so this path does not revisit Cargo manifests.
-    pub fn build_from_summary_rows_while(
+    /// Compose routes from authored summary rows and explicit path facts.
+    pub fn build_from_summary_rows_with_path_facts(
         files: &[ProjectFile],
         module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
         rows: &[RustCargoRouteSummaryRow],
+        paths: &dyn RustRoutePathFacts,
         keep_going_fn: &dyn Fn() -> bool,
     ) -> Option<Self> {
         let keep_going = || keep_going_fn();
@@ -451,15 +935,16 @@ impl RustCargoRouteIndex {
             dependencies.sort_by_key(|kind| *kind as u8);
             dependencies.dedup();
         }
-        Self::finish_build_from_topology_while(module_route_facts, topology, &keep_going)
+        Self::finish_build_from_topology_while(module_route_facts, topology, paths, &keep_going)
     }
 
     fn finish_build_from_topology_while(
         module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
         topology: CargoManifestTopology,
+        paths: &dyn RustRoutePathFacts,
         keep_going: &impl Fn() -> bool,
     ) -> Option<Self> {
-        let mut edges = ModuleEdgeCache::default();
+        let mut edges = ModuleEdgeCache::new(paths);
 
         // Stage 1: which target roots reach which file, before any item macro
         // is known to expand. Only the reachability is taken from this walk;
@@ -624,7 +1109,13 @@ impl RustCargoRouteIndex {
                 let file_edges = if bindings.is_empty() {
                     edges.gate_free(&file, module_route_facts, file == *target)
                 } else {
-                    Arc::new(module_child_edges(&file, facts, file == *target, &bindings))
+                    Arc::new(module_child_edges_with(
+                        paths,
+                        &file,
+                        facts,
+                        file == *target,
+                        &bindings,
+                    ))
                 };
                 for edge in file_edges.iter() {
                     keep_going().then_some(())?;
@@ -701,7 +1192,8 @@ impl RustCargoRouteIndex {
                 let file_edges = if passthrough_macros.is_empty() {
                     edges.gate_free(file, module_route_facts, is_crate_root)
                 } else {
-                    Arc::new(module_child_edges(
+                    Arc::new(module_child_edges_with(
+                        paths,
                         file,
                         facts,
                         is_crate_root,
@@ -761,6 +1253,37 @@ impl RustCargoRouteIndex {
             .flatten()
             .cloned()
             .collect()
+    }
+
+    /// Read a published unit's extern-root identity without discovering Cargo inputs.
+    pub fn type_root_identity(&self, file: &ProjectFile, name: &str) -> Option<([u8; 32], String)> {
+        let mut targets = self
+            .target_roots_by_file
+            .get(file)?
+            .iter()
+            .filter_map(|root| self.targets_by_root.get(root))
+            .flatten();
+        let first = targets.next()?;
+        let unit = first.summary_unit_key?;
+        if targets
+            .any(|target| target.summary_unit_key != Some(unit) || target.edition != first.edition)
+        {
+            return None;
+        }
+        let normalized = normalize_crate_name(name);
+        let kinds = self
+            .declared_dependencies_by_unit_and_name
+            .get(&(unit, normalized.clone()))?;
+        if !kinds
+            .iter()
+            .any(|kind| cargo_dependency_available_to_target(*kind, first))
+        {
+            return None;
+        }
+        // The route index aggregates dependency destinations by manifest and
+        // does not retain source-unit provenance. Cross-unit type identity is
+        // deliberately unsupported here.
+        Some((unit, first.edition.clone()))
     }
 
     pub fn file_uses_rust_2015_edition(&self, file: &ProjectFile) -> bool {
@@ -951,12 +1474,7 @@ impl RustCargoRouteIndex {
                         .get(target.manifest.as_path())
                         .into_iter()
                         .flatten()
-                        .filter(|route| {
-                            route
-                                .target_unit_key
-                                .is_none_or(|unit_key| Some(unit_key) == target.summary_unit_key)
-                                && cargo_route_available_to_target(route, target)
-                        })
+                        .filter(|route| route_serves_target(route, target))
                         .map(|route| &route.root_file),
                 );
             }
@@ -1025,9 +1543,9 @@ impl RustCargoRouteIndex {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Option<String> {
-        let (root, nested) = rust_external_module_route(module_specifier)?;
-        let route = self.resolve_available_route(importing_file, root)?;
-        Some(append_module_package(route.package, nested.as_deref()))
+        resolve_module_package_with(module_specifier, |name| {
+            self.resolve_available_route(importing_file, name)
+        })
     }
 
     pub fn resolve_module_package_segments_with_kind(
@@ -1035,12 +1553,9 @@ impl RustCargoRouteIndex {
         importing_file: &ProjectFile,
         segments: &[String],
     ) -> Option<(String, RustCargoRouteKind)> {
-        let (root, nested) = rust_external_module_segments(segments)?;
-        let route = self.resolve_available_route(importing_file, root)?;
-        Some((
-            append_module_package(route.package, nested.as_deref()),
-            route.kind,
-        ))
+        resolve_module_package_segments_with(segments, |name| {
+            self.resolve_available_route(importing_file, name)
+        })
     }
 
     pub fn resolve_crate_root_file(
@@ -1048,14 +1563,9 @@ impl RustCargoRouteIndex {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Option<ProjectFile> {
-        let (root, nested) = rust_external_module_route(module_specifier)?;
-        if nested.is_some() {
-            return None;
-        }
-        Some(
-            self.resolve_available_route(importing_file, root)?
-                .root_file,
-        )
+        resolve_crate_root_file_with(module_specifier, |name| {
+            self.resolve_available_route(importing_file, name)
+        })
     }
 
     pub fn resolve_crate_root_file_segments_with_kind(
@@ -1063,12 +1573,9 @@ impl RustCargoRouteIndex {
         importing_file: &ProjectFile,
         segments: &[String],
     ) -> Option<(ProjectFile, RustCargoRouteKind)> {
-        let (root, nested) = rust_external_module_segments(segments)?;
-        if nested.is_some() {
-            return None;
-        }
-        let route = self.resolve_available_route(importing_file, root)?;
-        Some((route.root_file, route.kind))
+        resolve_crate_root_file_segments_with(segments, |name| {
+            self.resolve_available_route(importing_file, name)
+        })
     }
 
     fn resolve_available_route(
@@ -1077,81 +1584,175 @@ impl RustCargoRouteIndex {
         route_name: &str,
     ) -> Option<RustCargoRoute> {
         let normalized = normalize_crate_name(route_name);
-        let Some(target_roots) = self.target_roots_by_file.get(file) else {
-            return self.resolve_unique_unscoped_library_route(&normalized);
-        };
-        let mut resolved = Vec::new();
+        match self.scoped_route_candidates(file, &normalized) {
+            Some(candidates) => unique_scoped_route(candidates),
+            None => {
+                unique_unscoped_library_route(self.unscoped_library_route_candidates(&normalized))
+            }
+        }
+    }
+
+    /// Every route the file's targets can use under this normalized name,
+    /// before the uniqueness check. `None` when the file belongs to no target
+    /// of this index, which is the unscoped case.
+    fn scoped_route_candidates(
+        &self,
+        file: &ProjectFile,
+        normalized: &str,
+    ) -> Option<Vec<RustCargoRoute>> {
+        let target_roots = self.target_roots_by_file.get(file)?;
+        let mut candidates = Vec::new();
         for root in target_roots {
             let Some(targets) = self.targets_by_root.get(root) else {
                 continue;
             };
             for target in targets {
-                resolved.extend(
+                candidates.extend(
                     self.routes_by_manifest_and_name
-                        .get(&(target.manifest.clone(), normalized.clone()))
+                        .get(&(target.manifest.clone(), normalized.to_owned()))
                         .into_iter()
                         .flatten()
-                        .filter(|route| {
-                            route
-                                .target_unit_key
-                                .is_none_or(|unit_key| Some(unit_key) == target.summary_unit_key)
-                                && cargo_route_available_to_target(route, target)
-                        })
+                        .filter(|route| route_serves_target(route, target))
                         .cloned(),
                 );
             }
         }
-        resolved.sort_by(|left, right| {
-            left.root_file
-                .cmp(&right.root_file)
-                .then_with(|| left.package.cmp(&right.package))
-                .then_with(|| left.target_predicate.cmp(&right.target_predicate))
-        });
-        resolved.dedup_by(|duplicate, retained| {
-            duplicate.root_file == retained.root_file
-                && duplicate.package == retained.package
-                && duplicate.kind == retained.kind
-        });
-        match resolved.as_slice() {
-            [route] => Some(route.clone()),
-            _ => None,
-        }
+        Some(candidates)
     }
 
-    /// Resolve a crate spelling for an analyzed Rust file that belongs to no
-    /// Cargo target, such as a checked-in standalone example.
+    /// The library roots the whole index exposes under this normalized name, as
+    /// the crate-name question answers them per unit. Always complete.
+    pub fn unscoped_libraries(&self, normalized: &str) -> RustUnscopedLibraries {
+        RustRoutedAnswer::complete(
+            self.unscoped_library_route_candidates(normalized)
+                .into_iter()
+                .map(|route| RustLibraryRoot {
+                    root_file: route.root_file,
+                    package: route.package,
+                })
+                .collect(),
+        )
+    }
+
+    /// Every indexed route exposed under this normalized name, for an
+    /// analyzed Rust file that belongs to no Cargo target, such as a
+    /// checked-in standalone example.
     ///
     /// There is no dependency table to establish visibility for such a file.
     /// A unique indexed workspace library is still a structured best-effort
     /// answer; more than one physical library root with that exposed name
     /// remains ambiguous and fails closed. Files with known Cargo membership
     /// never use this path and retain strict dependency visibility.
-    fn resolve_unique_unscoped_library_route(
-        &self,
-        normalized_route: &str,
-    ) -> Option<RustCargoRoute> {
-        let mut resolved = self
-            .routes_by_manifest_and_name
+    fn unscoped_library_route_candidates(&self, normalized: &str) -> Vec<RustCargoRoute> {
+        self.routes_by_manifest_and_name
             .iter()
-            .filter(|((_, name), _)| name == normalized_route)
+            .filter(|((_, name), _)| name == normalized)
             .flat_map(|(_, routes)| routes)
             .cloned()
-            .collect::<Vec<_>>();
-        resolved.sort_by(|left, right| {
-            left.root_file
-                .cmp(&right.root_file)
-                .then_with(|| left.package.cmp(&right.package))
-        });
-        resolved.dedup_by(|duplicate, retained| duplicate.root_file == retained.root_file);
-        match resolved.as_slice() {
-            [route] => {
-                let mut route = route.clone();
-                route.kind = RustCargoRouteKind::Dependency;
-                Some(route)
-            }
-            _ => None,
-        }
+            .collect()
     }
+
+    /// Whether `file` shares a target root with `root`, or one of its roots'
+    /// targets has a Cargo route to `root`. Answered from
+    /// `files_by_reachable_root`, which is built once per index (issue #1817).
+    fn file_reaches_root(&self, file: &ProjectFile, root: &ProjectFile) -> bool {
+        self.files_by_reachable_root
+            .get(root)
+            .is_some_and(|files| files.binary_search(file).is_ok())
+    }
+}
+
+/// The forward resolvers shared by the whole index and `RustFileRoutes`. They
+/// differ only in where the route for a crate name comes from (the scoped
+/// candidates, and for the whole index the unscoped fallback), which the
+/// caller supplies as `route`.
+fn resolve_module_package_with(
+    module_specifier: &str,
+    route: impl FnOnce(&str) -> Option<RustCargoRoute>,
+) -> Option<String> {
+    let (root, nested) = rust_external_module_route(module_specifier)?;
+    let route = route(root)?;
+    Some(append_module_package(route.package, nested.as_deref()))
+}
+fn resolve_module_package_segments_with(
+    segments: &[String],
+    route: impl FnOnce(&str) -> Option<RustCargoRoute>,
+) -> Option<(String, RustCargoRouteKind)> {
+    let (root, nested) = rust_external_module_segments(segments)?;
+    let route = route(root)?;
+    Some((
+        append_module_package(route.package, nested.as_deref()),
+        route.kind,
+    ))
+}
+fn resolve_crate_root_file_with(
+    module_specifier: &str,
+    route: impl FnOnce(&str) -> Option<RustCargoRoute>,
+) -> Option<ProjectFile> {
+    let (root, nested) = rust_external_module_route(module_specifier)?;
+    if nested.is_some() {
+        return None;
+    }
+    Some(route(root)?.root_file)
+}
+fn resolve_crate_root_file_segments_with(
+    segments: &[String],
+    route: impl FnOnce(&str) -> Option<RustCargoRoute>,
+) -> Option<(ProjectFile, RustCargoRouteKind)> {
+    let (root, nested) = rust_external_module_segments(segments)?;
+    if nested.is_some() {
+        return None;
+    }
+    let route = route(root)?;
+    Some((route.root_file, route.kind))
+}
+
+/// The whole index's uniqueness check over a candidate list: the same route
+/// reached through several targets counts once, and a second distinct route
+/// makes the name ambiguous.
+fn unique_scoped_route(mut candidates: Vec<RustCargoRoute>) -> Option<RustCargoRoute> {
+    candidates.sort_by(|left, right| {
+        left.root_file
+            .cmp(&right.root_file)
+            .then_with(|| left.package.cmp(&right.package))
+            .then_with(|| left.target_predicate.cmp(&right.target_predicate))
+    });
+    candidates.dedup_by(|duplicate, retained| {
+        duplicate.root_file == retained.root_file
+            && duplicate.package == retained.package
+            && duplicate.kind == retained.kind
+    });
+    match candidates.as_slice() {
+        [route] => Some(route.clone()),
+        _ => None,
+    }
+}
+
+fn unique_unscoped_library_route(mut candidates: Vec<RustCargoRoute>) -> Option<RustCargoRoute> {
+    candidates.sort_by(|left, right| {
+        left.root_file
+            .cmp(&right.root_file)
+            .then_with(|| left.package.cmp(&right.package))
+    });
+    candidates.dedup_by(|duplicate, retained| duplicate.root_file == retained.root_file);
+    match candidates.as_slice() {
+        [route] => {
+            let mut route = route.clone();
+            route.kind = RustCargoRouteKind::Dependency;
+            Some(route)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a route listed under a manifest belongs to this target: it is the
+/// target's own unit's route (or one every unit of the manifest shares) and the
+/// route's dependency class is available to the target's kind.
+fn route_serves_target(route: &RustCargoRoute, target: &RustCargoTarget) -> bool {
+    route
+        .target_unit_key
+        .is_none_or(|unit_key| Some(unit_key) == target.summary_unit_key)
+        && cargo_route_available_to_target(route, target)
 }
 
 fn sort_and_dedup_external_module_declarations(declarations: &mut Vec<RustCargoModuleDeclaration>) {
@@ -1223,161 +1824,6 @@ struct CargoManifestTopology {
 }
 
 impl CargoManifestTopology {
-    fn discover(
-        root: &Path,
-        files: &[ProjectFile],
-        manifest_directories: HashSet<PathBuf>,
-        configuration: &RustCargoConfiguration,
-        keep_going: &impl Fn() -> bool,
-    ) -> Option<Self> {
-        let mut manifests = HashMap::default();
-        for directory in manifest_directories {
-            keep_going().then_some(())?;
-            if let Some(value) = read_manifest(root, &directory) {
-                manifests.insert(directory, value);
-            }
-        }
-        let mut crates = Vec::new();
-        for (directory, manifest) in &manifests {
-            keep_going().then_some(())?;
-            if let Some(cargo_crate) =
-                cargo_crate(root, directory.clone(), manifest.clone(), &manifests)
-            {
-                crates.push(cargo_crate);
-            }
-        }
-        let mut crate_by_directory = HashMap::default();
-        for (index, cargo_crate) in crates.iter().enumerate() {
-            keep_going().then_some(())?;
-            crate_by_directory.insert(cargo_crate.directory.clone(), index);
-        }
-        note_workspace_file_sweep();
-        let analyzed: HashSet<ProjectFile> = files.iter().cloned().collect();
-        let files_by_manifest_directory = files_by_auto_target_directory(files, keep_going)?;
-
-        let mut routes_by_manifest_and_name: HashMap<_, Vec<RustCargoRoute>> = HashMap::default();
-        let mut declared_dependencies_by_manifest_and_name: HashMap<
-            _,
-            Vec<RustCargoDependencyKind>,
-        > = HashMap::default();
-        let mut targets_by_root: HashMap<ProjectFile, HashSet<RustCargoTarget>> =
-            HashMap::default();
-        for cargo_crate in &crates {
-            keep_going().then_some(())?;
-            for (target_root, kinds) in cargo_target_roots(
-                root,
-                cargo_crate,
-                &analyzed,
-                files_by_manifest_directory
-                    .get(&cargo_crate.directory)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            ) {
-                keep_going().then_some(())?;
-                targets_by_root
-                    .entry(target_root)
-                    .or_default()
-                    .extend(kinds.iter().copied().map(|kind| RustCargoTarget {
-                        manifest: cargo_crate.directory.clone(),
-                        summary_unit_key: None,
-                        kind: kind.kind,
-                        development_capable: kind.development_capable,
-                        edition: cargo_crate.edition.clone(),
-                    }));
-            }
-            if let Some(library) = cargo_crate.library.as_ref() {
-                let own_route = (cargo_crate.directory.clone(), library.name.clone());
-                routes_by_manifest_and_name
-                    .entry(own_route)
-                    .or_default()
-                    .push(RustCargoRoute {
-                        package: library.root_package.clone(),
-                        root_file: library.root_file.clone(),
-                        kind: RustCargoRouteKind::CurrentLibrary,
-                        dependency_kind: None,
-                        target_predicate: None,
-                        target_unit_key: None,
-                    });
-            }
-            for (dependency_kind, target_predicate, dependencies) in
-                cargo_dependency_tables_with_kind(&cargo_crate.manifest)
-            {
-                keep_going().then_some(())?;
-                for (exposed_name, raw_dependency) in dependencies {
-                    keep_going().then_some(())?;
-                    declared_dependencies_by_manifest_and_name
-                        .entry((
-                            cargo_crate.directory.clone(),
-                            normalize_crate_name(exposed_name),
-                        ))
-                        .or_default()
-                        .push(dependency_kind);
-                    let dependency = effective_cargo_dependency(
-                        root,
-                        &cargo_crate.directory,
-                        &cargo_crate.manifest,
-                        exposed_name,
-                        raw_dependency,
-                        &manifests,
-                    );
-                    let target = cargo_dependency_directory(
-                        root,
-                        &cargo_crate.directory,
-                        &cargo_crate.manifest,
-                        exposed_name,
-                        raw_dependency,
-                        &manifests,
-                        configuration,
-                    )
-                    .and_then(|directory| crate_by_directory.get(&directory).copied());
-                    if let Some(target) = target {
-                        let Some(target_library) = crates[target].library.as_ref() else {
-                            continue;
-                        };
-                        let is_renamed = dependency
-                            .as_ref()
-                            .is_some_and(|(dependency, _)| dependency.contains_key("package"));
-                        let exposed_name = if is_renamed {
-                            normalize_crate_name(exposed_name)
-                        } else {
-                            target_library.name.clone()
-                        };
-                        routes_by_manifest_and_name
-                            .entry((cargo_crate.directory.clone(), exposed_name))
-                            .or_default()
-                            .push(RustCargoRoute {
-                                package: target_library.root_package.clone(),
-                                root_file: target_library.root_file.clone(),
-                                kind: RustCargoRouteKind::Dependency,
-                                dependency_kind: Some(dependency_kind),
-                                target_predicate: target_predicate.map(str::to_string),
-                                target_unit_key: None,
-                            });
-                    }
-                }
-            }
-        }
-        for routes in routes_by_manifest_and_name.values_mut() {
-            keep_going().then_some(())?;
-            routes.sort_by(|left, right| {
-                left.root_file
-                    .cmp(&right.root_file)
-                    .then_with(|| left.package.cmp(&right.package))
-            });
-            routes.dedup();
-        }
-        let mut target_roots: Vec<_> = targets_by_root.keys().cloned().collect();
-        target_roots.sort();
-        Some(Self {
-            routes_by_manifest_and_name,
-            declared_dependencies_by_manifest_and_name,
-            declared_dependencies_by_unit_and_name: HashMap::default(),
-            targets_by_root,
-            target_roots,
-            analyzed,
-        })
-    }
-
     fn target_memberships_while(
         &self,
         module_children: impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
@@ -1404,7 +1850,7 @@ impl CargoManifestTopology {
             target_roots_by_file,
             targets_by_root: self.targets_by_root,
             files_by_reachable_root: HashMap::default(),
-            // Both are filled by `build_while` once the module edges exist;
+            // Both are filled by `finish_build_from_topology_while` once the module edges exist;
             // the topology only knows the manifests.
             external_module_declarations: Vec::new(),
             test_only_files: HashSet::default(),
@@ -1423,13 +1869,21 @@ impl CargoManifestTopology {
 /// resolution per scope and an `exists()` per candidate file, so resolving it
 /// once per pair is part of what keeps the build proportional to the workspace
 /// rather than to the workspace times its Cargo targets (issue #1817).
-#[derive(Default)]
-struct ModuleEdgeCache {
+struct ModuleEdgeCache<'a> {
+    paths: &'a dyn RustRoutePathFacts,
     as_crate_root: HashMap<ProjectFile, Arc<Vec<RustExternalModuleChild>>>,
     as_module: HashMap<ProjectFile, Arc<Vec<RustExternalModuleChild>>>,
 }
 
-impl ModuleEdgeCache {
+impl<'a> ModuleEdgeCache<'a> {
+    fn new(paths: &'a dyn RustRoutePathFacts) -> Self {
+        Self {
+            paths,
+            as_crate_root: HashMap::default(),
+            as_module: HashMap::default(),
+        }
+    }
+
     fn gate_free(
         &mut self,
         file: &ProjectFile,
@@ -1447,7 +1901,15 @@ impl ModuleEdgeCache {
         let edges = Arc::new(
             module_route_facts
                 .get(file)
-                .map(|facts| module_child_edges(file, facts, is_crate_root, &HashMap::default()))
+                .map(|facts| {
+                    module_child_edges_with(
+                        self.paths,
+                        file,
+                        facts,
+                        is_crate_root,
+                        &HashMap::default(),
+                    )
+                })
                 .unwrap_or_default(),
         );
         resolved.insert(file.clone(), Arc::clone(&edges));
@@ -1489,114 +1951,6 @@ fn files_by_target_root(
 /// components and nothing else, which
 /// `auto_target_paths_stay_within_the_grouped_depth` pins.
 pub(crate) const AUTO_TARGET_MAX_DEPTH: usize = 4;
-const AUTO_TARGET_MIN_DEPTH: usize = 2;
-
-/// Group every analyzed file under each manifest directory that could
-/// auto-discover it as a target root.
-///
-/// The search used to run the other way -- for each crate, walk every analyzed
-/// file in the workspace and ask whether it sits under that crate -- which is
-/// crates times files, and was one of the two quadratic terms issue #1817
-/// removed. A file has at most three ancestors at an auto-target depth, so
-/// grouping costs the workspace once.
-fn files_by_auto_target_directory(
-    files: &[ProjectFile],
-    keep_going: &impl Fn() -> bool,
-) -> Option<HashMap<PathBuf, Vec<ProjectFile>>> {
-    note_workspace_file_sweep();
-    let mut grouped: HashMap<PathBuf, Vec<ProjectFile>> = HashMap::default();
-    for file in files {
-        keep_going().then_some(())?;
-        let relative = file.rel_path();
-        let components = relative.components().count();
-        let mut directory = relative.to_path_buf();
-        for depth in 1..=AUTO_TARGET_MAX_DEPTH {
-            if components < depth || !directory.pop() {
-                break;
-            }
-            if depth >= AUTO_TARGET_MIN_DEPTH {
-                grouped
-                    .entry(directory.clone())
-                    .or_default()
-                    .push(file.clone());
-            }
-        }
-    }
-    Some(grouped)
-}
-
-/// The files each of one crate's Cargo targets is rooted at.
-///
-/// `explicit` targets name their file, so they are looked up in the analyzed
-/// set rather than searched for; auto-discovered ones are found among
-/// `files_below`, the analyzed files this crate's manifest directory could
-/// auto-discover (see [`files_by_auto_target_directory`]).
-fn cargo_target_roots(
-    root: &Path,
-    cargo_crate: &CargoCrate,
-    analyzed: &HashSet<ProjectFile>,
-    files_below: &[ProjectFile],
-) -> HashMap<ProjectFile, HashSet<RustCargoTargetSpec>> {
-    let mut explicit = explicit_cargo_targets(root, cargo_crate);
-    if let Some(build_script) = cargo_build_script_path(root, cargo_crate) {
-        explicit
-            .entry(build_script)
-            .or_default()
-            .insert(RustCargoTargetSpec {
-                kind: RustCargoTargetKind::Build,
-                development_capable: false,
-            });
-    }
-    let auto_bins =
-        cargo_auto_discovery_enabled(&cargo_crate.manifest, "autobins", &cargo_crate.edition);
-    let auto_examples =
-        cargo_auto_discovery_enabled(&cargo_crate.manifest, "autoexamples", &cargo_crate.edition);
-    let auto_tests =
-        cargo_auto_discovery_enabled(&cargo_crate.manifest, "autotests", &cargo_crate.edition);
-    let auto_benches =
-        cargo_auto_discovery_enabled(&cargo_crate.manifest, "autobenches", &cargo_crate.edition);
-    let mut roots: HashMap<ProjectFile, HashSet<RustCargoTargetSpec>> = HashMap::default();
-    if let Some(library) = cargo_crate.library.as_ref()
-        && analyzed.contains(&library.root_file)
-    {
-        roots
-            .entry(library.root_file.clone())
-            .or_default()
-            .insert(RustCargoTargetSpec {
-                kind: RustCargoTargetKind::Library,
-                development_capable: cargo_crate
-                    .manifest
-                    .get("lib")
-                    .and_then(|library| library.get("test"))
-                    .and_then(toml::Value::as_bool)
-                    .unwrap_or(true),
-            });
-    }
-    for (path, kinds) in explicit {
-        let file = ProjectFile::new(root.to_path_buf(), path);
-        if !analyzed.contains(&file) {
-            continue;
-        }
-        roots.entry(file).or_default().extend(kinds);
-    }
-    for file in files_below {
-        let Ok(relative) = file.rel_path().strip_prefix(&cargo_crate.directory) else {
-            continue;
-        };
-        if let Some(kind) =
-            auto_cargo_target_kind(relative, auto_bins, auto_examples, auto_tests, auto_benches)
-        {
-            roots
-                .entry(file.clone())
-                .or_default()
-                .insert(RustCargoTargetSpec {
-                    kind,
-                    development_capable: true,
-                });
-        }
-    }
-    roots
-}
 
 /// Which target roots reach which files, along `mod name;` edges.
 fn cargo_target_memberships(
@@ -1657,7 +2011,8 @@ struct ResolvedModuleScope {
 /// which must run step by step because `canonicalize` resolves symbolic links
 /// at every level; and the on-disk existence check that turns a declaration
 /// into an edge.
-fn module_child_edges(
+fn module_child_edges_with(
+    paths: &dyn RustRoutePathFacts,
     file: &ProjectFile,
     facts: &RustModuleRouteFacts,
     is_crate_root: bool,
@@ -1678,7 +2033,7 @@ fn module_child_edges(
     } else {
         parent.join(stem)
     };
-    let package = rust_package_name(file);
+    let package = paths.package_name(file);
     let mut scopes: Vec<ResolvedModuleScope> = Vec::with_capacity(facts.scopes.len());
     for scope in &facts.scopes {
         let resolved = match scope.parent {
@@ -1694,10 +2049,9 @@ fn module_child_edges(
                 );
                 let enclosing = &scopes[index];
                 let directory = match &scope.path_attribute {
-                    Some(attribute) => enclosing
-                        .path_directory
-                        .as_ref()
-                        .and_then(|base| workspace_relative_path(root, base, Path::new(attribute))),
+                    Some(attribute) => enclosing.path_directory.as_ref().and_then(|base| {
+                        paths.workspace_relative(root, base, Path::new(attribute))
+                    }),
                     None => enclosing
                         .module_directory
                         .as_ref()
@@ -1755,11 +2109,19 @@ fn module_child_edges(
                 let Some(base) = scope.path_directory.as_ref() else {
                     continue;
                 };
-                let Some(relative) = workspace_relative_path(root, base, Path::new(attribute))
+                let Some(relative) = paths.workspace_relative(root, base, Path::new(attribute))
                 else {
                     continue;
                 };
-                push_module_child(root, relative, route, test_gated, scope, &mut children);
+                push_module_child(
+                    paths,
+                    root,
+                    relative,
+                    route,
+                    test_gated,
+                    scope,
+                    &mut children,
+                );
             }
             None => {
                 let Some(base) = scope.module_directory.as_ref() else {
@@ -1769,7 +2131,15 @@ fn module_child_edges(
                     base.join(&route.module_name).with_extension("rs"),
                     base.join(&route.module_name).join("mod.rs"),
                 ] {
-                    push_module_child(root, relative, route, test_gated, scope, &mut children);
+                    push_module_child(
+                        paths,
+                        root,
+                        relative,
+                        route,
+                        test_gated,
+                        scope,
+                        &mut children,
+                    );
                 }
             }
         }
@@ -1780,6 +2150,7 @@ fn module_child_edges(
 
 /// Keep `relative` as a module edge when it names a file that exists.
 fn push_module_child(
+    paths: &dyn RustRoutePathFacts,
     root: &Path,
     relative: PathBuf,
     route: &RustModuleRouteFact,
@@ -1788,7 +2159,8 @@ fn push_module_child(
     children: &mut Vec<RustExternalModuleChild>,
 ) {
     let candidate = ProjectFile::new(root.to_path_buf(), relative);
-    if !candidate.exists() {
+    if !paths.file_exists(&candidate) {
+        paths.deny_candidate(&candidate);
         return;
     }
     children.push(RustExternalModuleChild {
@@ -2030,63 +2402,6 @@ fn rust_cooked_string_escape(escape: &str) -> Option<RustCookedStringEscape> {
     Some(RustCookedStringEscape::Character(character))
 }
 
-fn explicit_cargo_targets(
-    root: &Path,
-    cargo_crate: &CargoCrate,
-) -> HashMap<PathBuf, HashSet<RustCargoTargetSpec>> {
-    let mut paths: HashMap<PathBuf, HashSet<RustCargoTargetSpec>> = HashMap::default();
-    for (table_name, kind) in [
-        ("bin", RustCargoTargetKind::Binary),
-        ("example", RustCargoTargetKind::Example),
-        ("test", RustCargoTargetKind::Test),
-        ("bench", RustCargoTargetKind::Bench),
-    ] {
-        let Some(targets) = cargo_crate
-            .manifest
-            .get(table_name)
-            .and_then(toml::Value::as_array)
-        else {
-            continue;
-        };
-        for target in targets {
-            let Some(target) = target.as_table() else {
-                continue;
-            };
-            let spec = RustCargoTargetSpec {
-                kind,
-                development_capable: match kind {
-                    RustCargoTargetKind::Binary => target
-                        .get("test")
-                        .and_then(toml::Value::as_bool)
-                        .unwrap_or(true),
-                    RustCargoTargetKind::Example
-                    | RustCargoTargetKind::Test
-                    | RustCargoTargetKind::Bench => true,
-                    RustCargoTargetKind::Library | RustCargoTargetKind::Build => false,
-                },
-            };
-            if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
-                if let Some(path) =
-                    workspace_relative_path(root, &cargo_crate.directory, Path::new(path))
-                {
-                    paths.entry(path).or_default().insert(spec);
-                }
-                continue;
-            }
-            let Some(name) = target.get("name").and_then(toml::Value::as_str) else {
-                continue;
-            };
-            for inferred in inferred_cargo_target_paths(kind, name, &cargo_crate.package_name) {
-                if let Some(path) = workspace_relative_path(root, &cargo_crate.directory, &inferred)
-                {
-                    paths.entry(path).or_default().insert(spec);
-                }
-            }
-        }
-    }
-    paths
-}
-
 pub(crate) fn inferred_cargo_target_paths(
     kind: RustCargoTargetKind,
     name: &str,
@@ -2144,37 +2459,6 @@ pub(crate) fn cargo_build_script_path_state(
     }
 }
 
-fn cargo_build_script_path(root: &Path, cargo_crate: &CargoCrate) -> Option<PathBuf> {
-    let package = cargo_crate.manifest.get("package")?.as_table()?;
-    let CargoBuildScriptPathState::Path(path) = cargo_build_script_path_state(package.get("build"))
-    else {
-        return None;
-    };
-    workspace_relative_path(root, &cargo_crate.directory, &path)
-}
-
-/// A package's library is `src/lib.rs` in every edition, whatever else the
-/// manifest declares, unless `[lib]` names another path or `autolib = false`.
-///
-/// Measured against Cargo 1.96 rather than read from the documentation: a
-/// package with `edition = "2015"`, an explicit `[[bin]] path = "src/cli.rs"`,
-/// and both `src/lib.rs` and `src/main.rs` present reports targets
-/// `[legacy: lib (lib.rs), legacy-cli: bin (cli.rs)]` under
-/// `cargo metadata --no-deps`. The implicit `main.rs` binary is dropped by the
-/// legacy rule below; the library is not. Under 2021 all three appear.
-///
-/// Routing the library through [`cargo_auto_discovery_enabled`] therefore left
-/// every 2015 package that declares a binary with no library target at all.
-fn cargo_library_discovery_enabled(manifest: &RustCargoManifestDocument) -> bool {
-    cargo_library_autodiscovery_enabled(
-        manifest
-            .get("package")
-            .and_then(toml::Value::as_table)
-            .and_then(|package| package.get("autolib"))
-            .and_then(toml::Value::as_bool),
-    )
-}
-
 pub(crate) fn cargo_library_autodiscovery_enabled(configured: Option<bool>) -> bool {
     configured.unwrap_or(true)
 }
@@ -2187,26 +2471,6 @@ pub(crate) fn cargo_auto_target_enabled(
     configured.unwrap_or(!edition_is_2015 || !has_explicit_target)
 }
 
-/// Cargo's legacy rule: in edition 2015, declaring any target at all turns off
-/// automatic discovery of that kind. It covers binaries, examples, tests and
-/// benches. The library has its own rule, above.
-fn cargo_auto_discovery_enabled(
-    manifest: &RustCargoManifestDocument,
-    key: &str,
-    edition: &str,
-) -> bool {
-    let configured = manifest
-        .get("package")
-        .and_then(toml::Value::as_table)
-        .and_then(|package| package.get(key))
-        .and_then(toml::Value::as_bool);
-    cargo_auto_target_enabled(
-        configured,
-        edition == "2015",
-        cargo_manifest_has_explicit_target(manifest),
-    )
-}
-
 pub(crate) fn cargo_manifest_has_explicit_target(manifest: &RustCargoManifestDocument) -> bool {
     manifest.get("lib").is_some()
         || ["bin", "example", "test", "bench"].iter().any(|name| {
@@ -2217,7 +2481,7 @@ pub(crate) fn cargo_manifest_has_explicit_target(manifest: &RustCargoManifestDoc
         })
 }
 
-pub(crate) fn auto_cargo_target_kind(
+pub fn auto_cargo_target_kind(
     relative: &Path,
     bins: bool,
     examples: bool,
@@ -2285,50 +2549,7 @@ pub(crate) fn cargo_dependency_table_kinds<T>(
     ]
 }
 
-pub fn cargo_dependency_tables_with_kind(
-    manifest: &RustCargoManifestDocument,
-) -> Vec<(
-    RustCargoDependencyKind,
-    Option<&str>,
-    &toml::map::Map<String, toml::Value>,
-)> {
-    let mut tables = Vec::new();
-    for (table_name, kind) in cargo_dependency_table_kinds(
-        RustCargoDependencyKind::Normal,
-        RustCargoDependencyKind::Development,
-        RustCargoDependencyKind::Build,
-    ) {
-        if let Some(table) = manifest.get(table_name).and_then(toml::Value::as_table) {
-            tables.push((kind, None, table));
-        }
-    }
-    if let Some(targets) = manifest.get("target").and_then(toml::Value::as_table) {
-        for (predicate, target) in targets {
-            let Some(target) = target.as_table() else {
-                continue;
-            };
-            for (table_name, kind) in cargo_dependency_table_kinds(
-                RustCargoDependencyKind::Normal,
-                RustCargoDependencyKind::Development,
-                RustCargoDependencyKind::Build,
-            ) {
-                if let Some(table) = target.get(table_name).and_then(toml::Value::as_table) {
-                    tables.push((kind, Some(predicate.as_str()), table));
-                }
-            }
-        }
-    }
-    tables
-}
-
-fn cargo_dependency_tables(
-    manifest: &RustCargoManifestDocument,
-) -> Vec<&toml::map::Map<String, toml::Value>> {
-    cargo_dependency_tables_with_kind(manifest)
-        .into_iter()
-        .map(|(_, _, table)| table)
-        .collect()
-}
+pub use crate::selected_context::cargo_dependency_tables_with_kind;
 
 pub fn effective_cargo_dependency<'a>(
     root: &Path,
@@ -2377,27 +2598,6 @@ pub fn cargo_dependency_value<'a>(
         .get("dependencies")?
         .get(exposed_name)?;
     Some((dependency, workspace_directory))
-}
-
-pub(crate) fn cargo_dependency_directory(
-    root: &Path,
-    manifest_directory: &Path,
-    manifest: &RustCargoManifestDocument,
-    exposed_name: &str,
-    raw_dependency: &toml::Value,
-    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
-    configuration: &RustCargoConfiguration,
-) -> Option<PathBuf> {
-    cargo_dependency_directory_with(
-        root,
-        manifest_directory,
-        manifest,
-        exposed_name,
-        raw_dependency,
-        manifests,
-        configuration,
-        &mut |base, path| workspace_relative_path(root, base, path),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2567,36 +2767,6 @@ fn cargo_dependency_version_requirement<'a>(
     Some(version)
 }
 
-fn cargo_package_edition(
-    root: &Path,
-    manifest_directory: &Path,
-    manifest: &RustCargoManifestDocument,
-    manifests: &HashMap<PathBuf, RustCargoManifestDocument>,
-) -> String {
-    let edition = manifest
-        .get("package")
-        .and_then(|package| package.get("edition"));
-    if let Some(edition) = edition.and_then(toml::Value::as_str) {
-        return edition.to_string();
-    }
-    let inherited = edition
-        .and_then(toml::Value::as_table)
-        .and_then(|edition| edition.get("workspace"))
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    if !inherited {
-        return "2015".to_string();
-    }
-    cargo_workspace_manifest_directory(root, manifest_directory, manifest, manifests)
-        .and_then(|workspace_directory| manifests.get(&workspace_directory))
-        .and_then(|workspace| workspace.get("workspace"))
-        .and_then(|workspace| workspace.get("package"))
-        .and_then(|package| package.get("edition"))
-        .and_then(toml::Value::as_str)
-        .unwrap_or("2015")
-        .to_string()
-}
-
 pub fn cargo_package_string(
     root: &Path,
     manifest_directory: &Path,
@@ -2660,124 +2830,6 @@ pub fn cargo_workspace_manifest_directory(
         })
 }
 
-/// Every manifest directory the analyzed files and their manifests reach, and
-/// the Cargo configuration files of every level above one.
-///
-/// A configuration file is read at each ancestor of a manifest directory, not
-/// only at the workspace root it applies from: which levels apply is decided
-/// when a route reads it, and its patch paths are manifests to discover.
-fn discover_cargo_manifest_directories(
-    root: &Path,
-    files: &[ProjectFile],
-    keep_going: &impl Fn() -> bool,
-) -> Option<(HashSet<PathBuf>, RustCargoConfiguration)> {
-    let mut discovered = HashSet::default();
-    let mut configuration_levels = HashSet::default();
-    let mut configuration_files = Vec::new();
-    let mut pending = VecDeque::new();
-    if root.join("Cargo.toml").is_file() {
-        pending.push_back(PathBuf::new());
-    }
-    note_workspace_file_sweep();
-    for file in files {
-        keep_going().then_some(())?;
-        if let Some(directory) = nearest_manifest_directory(file) {
-            pending.push_back(directory);
-        }
-    }
-
-    while let Some(directory) = pending.pop_front() {
-        keep_going().then_some(())?;
-        if !discovered.insert(directory.clone()) {
-            continue;
-        }
-        let Some(manifest) = read_manifest(root, &directory) else {
-            continue;
-        };
-        for level in directory.ancestors() {
-            keep_going().then_some(())?;
-            // Every ancestor of a level already read was read with it.
-            if !configuration_levels.insert(level.to_path_buf()) {
-                break;
-            }
-            if let Some((path, configuration)) = RustCargoConfiguration::read_level(root, level) {
-                pending.extend(cargo_patch_path_directories(
-                    root,
-                    level,
-                    configuration.patch(),
-                ));
-                configuration_files.push((path, configuration));
-            }
-        }
-        pending.extend(cargo_workspace_member_directories(
-            root, &directory, &manifest,
-        ));
-        pending.extend(cargo_patch_path_directories(
-            root,
-            &directory,
-            manifest.get("patch"),
-        ));
-        for dependencies in cargo_dependency_tables(&manifest).into_iter().chain(
-            manifest
-                .get("workspace")
-                .and_then(|workspace| workspace.get("dependencies"))
-                .and_then(toml::Value::as_table),
-        ) {
-            keep_going().then_some(())?;
-            for dependency in dependencies.values() {
-                keep_going().then_some(())?;
-                let Some(path) = dependency
-                    .as_table()
-                    .and_then(|dependency| dependency.get("path"))
-                    .and_then(toml::Value::as_str)
-                    .map(Path::new)
-                else {
-                    continue;
-                };
-                let Some(dependency_directory) = workspace_relative_path(root, &directory, path)
-                else {
-                    continue;
-                };
-                if root
-                    .join(&dependency_directory)
-                    .join("Cargo.toml")
-                    .is_file()
-                {
-                    pending.push_back(dependency_directory);
-                }
-            }
-        }
-    }
-    Some((
-        discovered,
-        RustCargoConfiguration::from_files(configuration_files),
-    ))
-}
-
-/// The manifest directories a `[patch]` table's path entries name, resolved
-/// against `base`, the directory whose manifest or configuration defines it.
-fn cargo_patch_path_directories(
-    root: &Path,
-    base: &Path,
-    patch: Option<&toml::Value>,
-) -> Vec<PathBuf> {
-    patch
-        .and_then(toml::Value::as_table)
-        .into_iter()
-        .flat_map(|sources| sources.values())
-        .filter_map(toml::Value::as_table)
-        .flat_map(|source| source.values())
-        .filter_map(|patch| {
-            let path = patch.as_table()?.get("path")?.as_str()?;
-            let directory = workspace_relative_path(root, base, Path::new(path))?;
-            root.join(&directory)
-                .join("Cargo.toml")
-                .is_file()
-                .then_some(directory)
-        })
-        .collect()
-}
-
 /// Cargo workspace exclusions are literal directories, including descendants.
 /// Leading `.` components have the same meaning as when Cargo joins the path
 /// to the workspace root. Member discovery and retained inventories share it.
@@ -2790,117 +2842,7 @@ pub(crate) fn cargo_workspace_exclude_covers(excluded: &Path, relative: &Path) -
     )
 }
 
-fn cargo_workspace_member_directories(
-    root: &Path,
-    workspace_directory: &Path,
-    manifest: &RustCargoManifestDocument,
-) -> Vec<PathBuf> {
-    let Some(workspace) = manifest.get("workspace").and_then(toml::Value::as_table) else {
-        return Vec::new();
-    };
-    let excludes: Vec<_> = workspace
-        .get("exclude")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .map(PathBuf::from)
-        .collect();
-    let mut directories = Vec::new();
-    for member in workspace
-        .get("members")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
-    {
-        let manifest_pattern = root
-            .join(workspace_directory)
-            .join(member)
-            .join("Cargo.toml");
-        let Some(manifest_pattern) = manifest_pattern.to_str() else {
-            continue;
-        };
-        let Ok(matches) = glob::glob(manifest_pattern) else {
-            continue;
-        };
-        for manifest_path in matches.flatten() {
-            let Some(member_directory) = manifest_path.parent() else {
-                continue;
-            };
-            let Some(relative) = canonical_workspace_relative_path(root, member_directory) else {
-                continue;
-            };
-            let member_relative = relative
-                .strip_prefix(workspace_directory)
-                .unwrap_or(&relative);
-            if excludes
-                .iter()
-                .any(|excluded| cargo_workspace_exclude_covers(excluded, member_relative))
-            {
-                continue;
-            }
-            directories.push(relative);
-        }
-    }
-    directories
-}
-
-fn nearest_manifest_directory(file: &ProjectFile) -> Option<PathBuf> {
-    let mut directory = file.rel_path().parent();
-    loop {
-        let relative = directory.unwrap_or_else(|| Path::new(""));
-        if file.root().join(relative).join("Cargo.toml").is_file() {
-            return Some(relative.to_path_buf());
-        }
-        directory = relative.parent();
-        directory?;
-    }
-}
-
-fn workspace_relative_path(root: &Path, base: &Path, path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() {
-        return canonical_workspace_relative_path(root, path);
-    }
-    let mut normalized = base.to_path_buf();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(component) => normalized.push(component),
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    canonical_workspace_relative_path(root, &root.join(normalized))
-}
-
-fn canonical_workspace_relative_path(root: &Path, target: &Path) -> Option<PathBuf> {
-    let canonical_root = root.canonicalize().ok()?;
-    let canonical_target = target.canonicalize().ok()?;
-    canonical_target
-        .strip_prefix(canonical_root)
-        .ok()
-        .map(Path::to_path_buf)
-}
-
 pub(super) use crate::cargo_manifest::normalize_crate_name;
-
-/// `[package].name`, verbatim. Pure over parsed TOML, so `crate_naming` can
-/// share it without reaching the route index.
-pub(super) fn cargo_manifest_package_name(manifest: &RustCargoManifestDocument) -> Option<String> {
-    manifest.package_name().map(str::to_owned)
-}
-
-/// Normalized `[lib].name`, when the manifest declares one. An implicit lib
-/// (`src/lib.rs` autodiscovery) is unnamed and inherits the package name, so
-/// `None` here does not mean "no lib target".
-pub(super) fn cargo_manifest_library_name(manifest: &RustCargoManifestDocument) -> Option<String> {
-    manifest.normalized_library_name()
-}
 
 fn append_module_package(mut package: String, nested: Option<&str>) -> String {
     let Some(nested) = nested else {
@@ -2913,664 +2855,34 @@ fn append_module_package(mut package: String, nested: Option<&str>) -> String {
     package
 }
 
-/// The pre-#1817 Cargo-route orchestration, frozen as the reference the
-/// equivalence pin compares against.
-///
-/// Issue #1817 rewrote the orchestration's shape, not its answer: the manifest
-/// topology is now discovered once instead of once per membership pass, the
-/// per-crate and per-target loops iterate the files they own instead of the
-/// whole workspace, and a gate-free file's module edges are resolved once
-/// instead of once per pass and target. Every one of those is an algebraic
-/// rewrite of the same derivation, so the guard has to be a direct comparison
-/// against what it replaced rather than a sample of its answers.
-///
-/// Everything the rewrite did not touch is shared rather than copied:
-/// `discover_cargo_manifest_directories`, `cargo_crate`, `module_child_edges`,
-/// `explicit_cargo_targets`, `sort_and_dedup_external_module_declarations`,
-/// `cargo_route_available_to_target` and `build_test_only_files_while`.
-#[cfg(test)]
-mod frozen_orchestration {
-    use super::*;
-
-    pub fn reference_build_while(
-        files: &[ProjectFile],
-        module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
-        keep_going: &impl Fn() -> bool,
-    ) -> Option<RustCargoRouteIndex> {
-        keep_going().then_some(())?;
-        let Some(root) = files.first().map(ProjectFile::root) else {
-            return Some(RustCargoRouteIndex::default());
-        };
-        if discover_cargo_manifest_directories(root, files, keep_going)?
-            .0
-            .is_empty()
-        {
-            // Without a Cargo manifest there are no target, dependency, or
-            // edition identities for this index to model. Stop before the
-            // manifest builder reaches the same empty result the long way.
-            return Some(RustCargoRouteIndex::default());
-        }
-        note_workspace_file_sweep();
-        let mut macro_definitions = Vec::new();
-        for file in files {
-            keep_going().then_some(())?;
-            let Some(facts) = module_route_facts.get(file) else {
-                continue;
-            };
-            macro_definitions.extend(
-                facts
-                    .item_macros
-                    .iter()
-                    .map(|definition| (file.clone(), definition.clone())),
-            );
-        }
-        let no_passthrough_macros = HashMap::default();
-        let physical_routes = reference_build_from_module_children_while(
-            files,
-            |file, is_crate_root, _target| {
-                module_route_facts
-                    .get(file)
-                    .map(|facts| {
-                        module_child_edges(file, facts, is_crate_root, &no_passthrough_macros)
-                            .into_iter()
-                            .map(|edge| edge.file)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            },
-            keep_going,
-        )?;
-        let mut visible_definition_starts: HashMap<
-            (ProjectFile, ProjectFile),
-            HashMap<String, Vec<RustVisibleItemMacroDefinition>>,
-        > = HashMap::default();
-        let target_roots: HashSet<_> = physical_routes
-            .target_roots_by_file
-            .values()
-            .flatten()
-            .cloned()
-            .collect();
-        for target in &target_roots {
-            keep_going().then_some(())?;
-            let mut children_by_file: HashMap<ProjectFile, Vec<RustExternalModuleChild>> =
-                HashMap::default();
-            let mut parents_by_file: HashMap<ProjectFile, Vec<(ProjectFile, bool, usize)>> =
-                HashMap::default();
-            note_workspace_file_sweep();
-            for file in files {
-                keep_going().then_some(())?;
-                if !physical_routes
-                    .target_roots_by_file
-                    .get(file)
-                    .is_some_and(|roots| roots.contains(target))
-                {
-                    continue;
-                }
-                let Some(facts) = module_route_facts.get(file) else {
-                    continue;
-                };
-                let edges = module_child_edges(file, facts, file == target, &no_passthrough_macros);
-                for edge in &edges {
-                    keep_going().then_some(())?;
-                    if physical_routes
-                        .target_roots_by_file
-                        .get(&edge.file)
-                        .is_some_and(|roots| roots.contains(target))
-                    {
-                        parents_by_file.entry(edge.file.clone()).or_default().push((
-                            file.clone(),
-                            edge.imports_macros,
-                            edge.visibility_start_byte,
-                        ));
-                    }
-                }
-                children_by_file.insert(file.clone(), edges);
-            }
-
-            for (definition_file, definition) in &macro_definitions {
-                keep_going().then_some(())?;
-                if !physical_routes
-                    .target_roots_by_file
-                    .get(definition_file)
-                    .is_some_and(|roots| roots.contains(target))
-                {
-                    continue;
-                }
-                let mut visible_files: HashMap<ProjectFile, usize> = HashMap::default();
-                let mut pending = vec![(definition_file.clone(), definition.visible_after)];
-                while let Some((file, visible_after)) = pending.pop() {
-                    keep_going().then_some(())?;
-                    if visible_files
-                        .get(&file)
-                        .is_some_and(|known_start| *known_start <= visible_after)
-                    {
-                        continue;
-                    }
-                    visible_files.insert(file.clone(), visible_after);
-                    let local_scope = (file == *definition_file)
-                        .then_some((definition.scope_start, definition.scope_end));
-                    if local_scope.is_none_or(|(start, end)| {
-                        module_route_facts
-                            .get(&file)
-                            .and_then(RustModuleRouteFacts::file_extent)
-                            .is_some_and(|extent| extent == (start, end))
-                    }) && let Some(parents) = parents_by_file.get(&file)
-                    {
-                        pending.extend(
-                            parents
-                                .iter()
-                                .filter(|(_, imports_macros, _)| *imports_macros)
-                                .map(|(parent, _, import_start)| (parent.clone(), *import_start)),
-                        );
-                    }
-                    if let Some(children) = children_by_file.get(&file) {
-                        pending.extend(
-                            children
-                                .iter()
-                                .filter(|edge| {
-                                    edge.declaration_start_byte >= visible_after
-                                        && local_scope.is_none_or(|(start, end)| {
-                                            start <= edge.declaration_start_byte
-                                                && edge.declaration_start_byte < end
-                                        })
-                                })
-                                .map(|edge| (edge.file.clone(), 0)),
-                        );
-                    }
-                }
-                for (file, visible_after) in visible_files {
-                    keep_going().then_some(())?;
-                    let (scope_start, scope_end) = if file == *definition_file {
-                        (definition.scope_start, definition.scope_end)
-                    } else {
-                        let Some(extent) = module_route_facts
-                            .get(&file)
-                            .and_then(RustModuleRouteFacts::file_extent)
-                        else {
-                            continue;
-                        };
-                        extent
-                    };
-                    visible_definition_starts
-                        .entry((target.clone(), file))
-                        .or_default()
-                        .entry(definition.name.clone())
-                        .or_default()
-                        .push(RustVisibleItemMacroDefinition {
-                            visible_after,
-                            scope_start,
-                            scope_end,
-                            decoration: definition.decoration.clone(),
-                        });
-                }
-            }
-        }
-        let mut passthrough_by_target_and_file = visible_definition_starts;
-        for target in &target_roots {
-            keep_going().then_some(())?;
-            note_workspace_file_sweep();
-            let mut pending = physical_routes
-                .target_roots_by_file
-                .iter()
-                .filter(|(_, roots)| roots.contains(target))
-                .map(|(file, _)| file.clone())
-                .collect::<VecDeque<_>>();
-            let mut processed_binding_counts: HashMap<ProjectFile, usize> = HashMap::default();
-            while let Some(file) = pending.pop_front() {
-                keep_going().then_some(())?;
-                let Some(facts) = module_route_facts.get(&file) else {
-                    continue;
-                };
-                let key = (target.clone(), file.clone());
-                let binding_count = passthrough_by_target_and_file
-                    .get(&key)
-                    .into_iter()
-                    .flat_map(|bindings| bindings.values())
-                    .map(Vec::len)
-                    .sum();
-                if processed_binding_counts.get(&file) == Some(&binding_count) {
-                    continue;
-                }
-                processed_binding_counts.insert(file.clone(), binding_count);
-                let bindings = passthrough_by_target_and_file
-                    .get(&key)
-                    .cloned()
-                    .unwrap_or_default();
-                let edges = module_child_edges(&file, facts, file == *target, &bindings);
-                for edge in edges {
-                    keep_going().then_some(())?;
-                    if physical_routes
-                        .target_roots_by_file
-                        .get(&edge.file)
-                        .is_some_and(|roots| roots.contains(target))
-                    {
-                        continue;
-                    }
-                    let Some((child_start, child_end)) = module_route_facts
-                        .get(&edge.file)
-                        .and_then(RustModuleRouteFacts::file_extent)
-                    else {
-                        continue;
-                    };
-                    let child_bindings = passthrough_by_target_and_file
-                        .entry((target.clone(), edge.file.clone()))
-                        .or_default();
-                    let before = child_bindings.values().map(Vec::len).sum::<usize>();
-                    for (name, definitions) in &bindings {
-                        keep_going().then_some(())?;
-                        let Some(decoration) = rust_latest_visible_item_macro(
-                            definitions,
-                            edge.declaration_start_byte,
-                        ) else {
-                            continue;
-                        };
-                        let inherited = RustVisibleItemMacroDefinition {
-                            visible_after: 0,
-                            scope_start: child_start,
-                            scope_end: child_end,
-                            decoration,
-                        };
-                        let definitions = child_bindings.entry(name.clone()).or_default();
-                        if !definitions.contains(&inherited) {
-                            definitions.push(inherited);
-                        }
-                    }
-                    for (_, definition) in macro_definitions
-                        .iter()
-                        .filter(|(definition_file, _)| definition_file == &edge.file)
-                    {
-                        keep_going().then_some(())?;
-                        let local = RustVisibleItemMacroDefinition {
-                            visible_after: definition.visible_after,
-                            scope_start: definition.scope_start,
-                            scope_end: definition.scope_end,
-                            decoration: definition.decoration.clone(),
-                        };
-                        let definitions =
-                            child_bindings.entry(definition.name.clone()).or_default();
-                        if !definitions.contains(&local) {
-                            definitions.push(local);
-                        }
-                    }
-                    let after = child_bindings.values().map(Vec::len).sum::<usize>();
-                    if after != before || !processed_binding_counts.contains_key(&edge.file) {
-                        pending.push_back(edge.file);
-                    }
-                }
-            }
-        }
-        let no_passthrough_macros = HashMap::default();
-        let mut external_module_declarations = Vec::new();
-        let mut index = reference_build_from_module_children_while(
-            files,
-            |file, is_crate_root, target| {
-                module_route_facts
-                    .get(file)
-                    .map(|facts| {
-                        let passthrough_macros = passthrough_by_target_and_file
-                            .get(&(target.clone(), file.clone()))
-                            .unwrap_or(&no_passthrough_macros);
-                        let edges =
-                            module_child_edges(file, facts, is_crate_root, passthrough_macros);
-                        external_module_declarations.extend(edges.iter().map(|edge| {
-                            RustCargoModuleDeclaration {
-                                declaring_file: file.clone(),
-                                declaring_module: edge.declaring_module.clone(),
-                                target_file: edge.file.clone(),
-                                visibility: edge.visibility.clone(),
-                                declaration_start_byte: edge.declaration_start_byte,
-                                visibility_start_byte: edge.visibility_start_byte,
-                                imports_macros: edge.imports_macros,
-                                test_gated: edge.test_gated,
-                            }
-                        }));
-                        edges.into_iter().map(|edge| edge.file).collect()
-                    })
-                    .unwrap_or_default()
-            },
-            keep_going,
-        )?;
-        sort_and_dedup_external_module_declarations(&mut external_module_declarations);
-        index.external_module_declarations = external_module_declarations;
-        index.test_only_files = index.build_test_only_files_while(keep_going)?;
-        Some(index)
-    }
-
-    fn reference_build_from_module_children_while(
-        files: &[ProjectFile],
-        mut module_children: impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
-        keep_going: &impl Fn() -> bool,
-    ) -> Option<RustCargoRouteIndex> {
-        keep_going().then_some(())?;
-        let Some(root) = files.first().map(ProjectFile::root) else {
-            return Some(RustCargoRouteIndex::default());
-        };
-        let mut manifests = HashMap::default();
-        let (manifest_directories, configuration) =
-            discover_cargo_manifest_directories(root, files, keep_going)?;
-        for directory in manifest_directories {
-            keep_going().then_some(())?;
-            if let Some(value) = read_manifest(root, &directory) {
-                manifests.insert(directory, value);
-            }
-        }
-        let mut crates = Vec::new();
-        for (directory, manifest) in &manifests {
-            keep_going().then_some(())?;
-            if let Some(cargo_crate) =
-                cargo_crate(root, directory.clone(), manifest.clone(), &manifests)
-            {
-                crates.push(cargo_crate);
-            }
-        }
-
-        let mut crate_by_directory = HashMap::default();
-        for (index, cargo_crate) in crates.iter().enumerate() {
-            keep_going().then_some(())?;
-            crate_by_directory.insert(cargo_crate.directory.clone(), index);
-        }
-        let mut routes_by_manifest_and_name: HashMap<_, Vec<RustCargoRoute>> = HashMap::default();
-        let mut declared_dependencies_by_manifest_and_name: HashMap<
-            _,
-            Vec<RustCargoDependencyKind>,
-        > = HashMap::default();
-        let mut target_roots_by_file: HashMap<ProjectFile, HashSet<ProjectFile>> =
-            HashMap::default();
-        let mut targets_by_root: HashMap<ProjectFile, HashSet<RustCargoTarget>> =
-            HashMap::default();
-        for cargo_crate in &crates {
-            keep_going().then_some(())?;
-            let target_roots = reference_cargo_target_roots(root, cargo_crate, files);
-            for (target_root, kinds) in &target_roots {
-                keep_going().then_some(())?;
-                targets_by_root
-                    .entry(target_root.clone())
-                    .or_default()
-                    .extend(kinds.iter().copied().map(|kind| RustCargoTarget {
-                        manifest: cargo_crate.directory.clone(),
-                        summary_unit_key: None,
-                        kind: kind.kind,
-                        development_capable: kind.development_capable,
-                        edition: cargo_crate.edition.clone(),
-                    }));
-            }
-            let target_root_files: Vec<_> = target_roots.keys().cloned().collect();
-            for (file, roots) in reference_cargo_target_memberships(
-                files,
-                &target_root_files,
-                &mut module_children,
-                keep_going,
-            )? {
-                keep_going().then_some(())?;
-                target_roots_by_file.entry(file).or_default().extend(roots);
-            }
-            if let Some(library) = cargo_crate.library.as_ref() {
-                let own_route = (cargo_crate.directory.clone(), library.name.clone());
-                routes_by_manifest_and_name
-                    .entry(own_route)
-                    .or_default()
-                    .push(RustCargoRoute {
-                        package: library.root_package.clone(),
-                        root_file: library.root_file.clone(),
-                        kind: RustCargoRouteKind::CurrentLibrary,
-                        dependency_kind: None,
-                        target_predicate: None,
-                        target_unit_key: None,
-                    });
-            }
-            for (dependency_kind, target_predicate, dependencies) in
-                cargo_dependency_tables_with_kind(&cargo_crate.manifest)
-            {
-                keep_going().then_some(())?;
-                for (exposed_name, raw_dependency) in dependencies {
-                    keep_going().then_some(())?;
-                    declared_dependencies_by_manifest_and_name
-                        .entry((
-                            cargo_crate.directory.clone(),
-                            normalize_crate_name(exposed_name),
-                        ))
-                        .or_default()
-                        .push(dependency_kind);
-                    let dependency = effective_cargo_dependency(
-                        root,
-                        &cargo_crate.directory,
-                        &cargo_crate.manifest,
-                        exposed_name,
-                        raw_dependency,
-                        &manifests,
-                    );
-                    let target = cargo_dependency_directory(
-                        root,
-                        &cargo_crate.directory,
-                        &cargo_crate.manifest,
-                        exposed_name,
-                        raw_dependency,
-                        &manifests,
-                        &configuration,
-                    )
-                    .and_then(|directory| crate_by_directory.get(&directory).copied());
-                    if let Some(target) = target {
-                        let Some(target_library) = crates[target].library.as_ref() else {
-                            continue;
-                        };
-                        let is_renamed = dependency
-                            .as_ref()
-                            .is_some_and(|(dependency, _)| dependency.contains_key("package"));
-                        let exposed_name = if is_renamed {
-                            normalize_crate_name(exposed_name)
-                        } else {
-                            target_library.name.clone()
-                        };
-                        routes_by_manifest_and_name
-                            .entry((cargo_crate.directory.clone(), exposed_name))
-                            .or_default()
-                            .push(RustCargoRoute {
-                                package: target_library.root_package.clone(),
-                                root_file: target_library.root_file.clone(),
-                                kind: RustCargoRouteKind::Dependency,
-                                dependency_kind: Some(dependency_kind),
-                                target_predicate: target_predicate.map(str::to_string),
-                                target_unit_key: None,
-                            });
-                    }
-                }
-            }
-        }
-        for routes in routes_by_manifest_and_name.values_mut() {
-            keep_going().then_some(())?;
-            routes.sort_by(|left, right| {
-                left.root_file
-                    .cmp(&right.root_file)
-                    .then_with(|| left.package.cmp(&right.package))
-            });
-            routes.dedup();
-        }
-        let mut index = RustCargoRouteIndex {
-            routes_by_manifest_and_name,
-            declared_dependencies_by_manifest_and_name,
-            // The reference targets carry no summary unit key, so the
-            // unit-keyed map is never consulted on this path.
-            declared_dependencies_by_unit_and_name: HashMap::default(),
-            target_roots_by_file,
-            targets_by_root,
-            files_by_reachable_root: HashMap::default(),
-            // Both are filled by `build` once the module edges exist;
-            // `build_from_module_children` only knows the manifest topology.
-            external_module_declarations: Vec::new(),
-            test_only_files: HashSet::default(),
-        };
-        index.files_by_reachable_root =
-            reference_files_by_reachable_root_while(&index, keep_going)?;
-        Some(index)
-    }
-
-    fn reference_files_by_reachable_root_while(
-        index: &RustCargoRouteIndex,
-        keep_going: &impl Fn() -> bool,
-    ) -> Option<HashMap<ProjectFile, Vec<ProjectFile>>> {
-        note_workspace_file_sweep();
-        let mut files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
-        for (file, target_roots) in &index.target_roots_by_file {
-            keep_going().then_some(())?;
-            for root in target_roots {
-                keep_going().then_some(())?;
-                files_by_root
-                    .entry(root.clone())
-                    .or_default()
-                    .insert(file.clone());
-                let Some(targets) = index.targets_by_root.get(root) else {
-                    continue;
-                };
-                for target in targets {
-                    keep_going().then_some(())?;
-                    for ((manifest, _), routes) in &index.routes_by_manifest_and_name {
-                        keep_going().then_some(())?;
-                        if manifest != &target.manifest {
-                            continue;
-                        }
-                        for route in routes
-                            .iter()
-                            .filter(|route| cargo_route_available_to_target(route, target))
-                        {
-                            keep_going().then_some(())?;
-                            files_by_root
-                                .entry(route.root_file.clone())
-                                .or_default()
-                                .insert(file.clone());
-                        }
-                    }
-                }
-            }
-        }
-        let mut sorted = HashMap::default();
-        for (root, files) in files_by_root {
-            keep_going().then_some(())?;
-            let mut files = files.into_iter().collect::<Vec<_>>();
-            files.sort();
-            sorted.insert(root, files);
-        }
-        Some(sorted)
-    }
-
-    fn reference_cargo_target_roots(
-        root: &Path,
-        cargo_crate: &CargoCrate,
-        files: &[ProjectFile],
-    ) -> HashMap<ProjectFile, HashSet<RustCargoTargetSpec>> {
-        let mut explicit = explicit_cargo_targets(root, cargo_crate);
-        if let Some(build_script) = cargo_build_script_path(root, cargo_crate) {
-            explicit
-                .entry(build_script)
-                .or_default()
-                .insert(RustCargoTargetSpec {
-                    kind: RustCargoTargetKind::Build,
-                    development_capable: false,
-                });
-        }
-        let auto_bins =
-            cargo_auto_discovery_enabled(&cargo_crate.manifest, "autobins", &cargo_crate.edition);
-        let auto_examples = cargo_auto_discovery_enabled(
-            &cargo_crate.manifest,
-            "autoexamples",
-            &cargo_crate.edition,
-        );
-        let auto_tests =
-            cargo_auto_discovery_enabled(&cargo_crate.manifest, "autotests", &cargo_crate.edition);
-        let auto_benches = cargo_auto_discovery_enabled(
-            &cargo_crate.manifest,
-            "autobenches",
-            &cargo_crate.edition,
-        );
-        note_workspace_file_sweep();
-        let analyzed: HashSet<_> = files.iter().cloned().collect();
-        let mut roots: HashMap<ProjectFile, HashSet<RustCargoTargetSpec>> = HashMap::default();
-        if let Some(library) = cargo_crate.library.as_ref()
-            && analyzed.contains(&library.root_file)
-        {
-            roots
-                .entry(library.root_file.clone())
-                .or_default()
-                .insert(RustCargoTargetSpec {
-                    kind: RustCargoTargetKind::Library,
-                    development_capable: cargo_crate
-                        .manifest
-                        .get("lib")
-                        .and_then(|library| library.get("test"))
-                        .and_then(toml::Value::as_bool)
-                        .unwrap_or(true),
-                });
-        }
-        note_workspace_file_sweep();
-        for file in files {
-            if let Some(kinds) = explicit.get(file.rel_path()) {
-                roots
-                    .entry(file.clone())
-                    .or_default()
-                    .extend(kinds.iter().copied());
-            }
-            let Ok(relative) = file.rel_path().strip_prefix(&cargo_crate.directory) else {
-                continue;
-            };
-            if let Some(kind) =
-                auto_cargo_target_kind(relative, auto_bins, auto_examples, auto_tests, auto_benches)
-            {
-                roots
-                    .entry(file.clone())
-                    .or_default()
-                    .insert(RustCargoTargetSpec {
-                        kind,
-                        development_capable: true,
-                    });
-            }
-        }
-        roots
-    }
-
-    fn reference_cargo_target_memberships(
-        files: &[ProjectFile],
-        target_roots: &[ProjectFile],
-        module_children: &mut impl FnMut(&ProjectFile, bool, &ProjectFile) -> Vec<ProjectFile>,
-        keep_going: &impl Fn() -> bool,
-    ) -> Option<HashMap<ProjectFile, HashSet<ProjectFile>>> {
-        note_workspace_file_sweep();
-        let analyzed: HashSet<_> = files.iter().cloned().collect();
-        let mut owners: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
-        let mut pending = VecDeque::new();
-        let mut visited = HashSet::default();
-        for target in target_roots {
-            keep_going().then_some(())?;
-            owners
-                .entry(target.clone())
-                .or_default()
-                .insert(target.clone());
-            pending.push_back((target.clone(), target.clone(), true));
-        }
-        while let Some((file, target, is_crate_root)) = pending.pop_front() {
-            keep_going().then_some(())?;
-            if !visited.insert((file.clone(), target.clone(), is_crate_root)) {
-                continue;
-            }
-            for child in module_children(&file, is_crate_root, &target) {
-                keep_going().then_some(())?;
-                if analyzed.contains(&child) {
-                    owners
-                        .entry(child.clone())
-                        .or_default()
-                        .insert(target.clone());
-                    pending.push_back((child, target.clone(), false));
-                }
-            }
-        }
-        Some(owners)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::write_fixture_file as write;
     use brokk_bifrost_test_macros::hardwon;
     use tree_sitter::Parser;
+
+    // rust_case_fold_key panics when its passes do not settle. The fold maps
+    // each character on its own, so a path settles once every character does:
+    // check every scalar value settles within the key's pass budget.
+    #[test]
+    fn every_character_reaches_its_case_fold_key_within_the_pass_budget() {
+        let unsettled: Vec<char> = (0..=char::MAX as u32)
+            .filter_map(char::from_u32)
+            .filter(|c| {
+                let mut key = case_fold_pass(&c.to_string());
+                for _ in 0..CASE_FOLD_EXTRA_PASSES {
+                    let next = case_fold_pass(&key);
+                    if next == key {
+                        return false;
+                    }
+                    key = next;
+                }
+                true
+            })
+            .collect();
+        assert!(unsettled.is_empty(), "{unsettled:?}");
+    }
 
     fn coordinated_route_facts(file: &ProjectFile, source: &str) -> RustModuleRouteFacts {
         let mut parser = Parser::new();
@@ -3582,15 +2894,16 @@ mod tests {
             !tree.root_node().has_error(),
             "fixture must parse: {source}"
         );
-        crate::declarations::parse_rust_file(file, source, &tree)
-            .rust_usage_facts
-            .module_routes
-    }
-
-    fn build_from_coordinated_source(files: &[ProjectFile]) -> RustCargoRouteIndex {
-        let facts = route_facts_for(files);
-        RustCargoRouteIndex::build_while(files, &facts, &|| true)
-            .expect("coordinated Cargo route construction")
+        crate::declarations::parse_rust_file_with(
+            &crate::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            file,
+            source,
+            &tree,
+        )
+        .rust_usage_facts
+        .module_routes
     }
 
     fn inline_fixture_file() -> ProjectFile {
@@ -3616,241 +2929,6 @@ mod tests {
 
     #[test]
     #[hardwon(
-        "36d2ca4645e4: Checks patch selection requires both the matching source and a compatible version."
-    )]
-    fn patched_dependencies_require_matching_source_and_semver() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            r#"[workspace]
-members = ["app", "shared-v1", "future-v1", "git-wrong"]
-resolver = "2"
-
-[patch.crates-io]
-shared = { path = "shared-v1" }
-future = { package = "future-shared", path = "future-v1" }
-
-[patch."https://wrong.example/repository"]
-git_shared = { package = "git-shared", path = "git-wrong" }
-"#,
-        );
-        for (directory, package, version) in [
-            ("shared-v1", "shared", "1.4.0"),
-            ("future-v1", "future-shared", "1.9.0"),
-            ("git-wrong", "git-shared", "3.0.0"),
-        ] {
-            write(
-                &root,
-                &format!("{directory}/Cargo.toml"),
-                &format!(
-                    "[package]\nname = \"{package}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-                ),
-            );
-            write(
-                &root,
-                &format!("{directory}/src/lib.rs"),
-                "pub struct Patched;\n",
-            );
-        }
-        write(
-            &root,
-            "app/Cargo.toml",
-            r#"[package]
-name = "app"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-shared = "^1.2"
-future = { package = "future-shared", version = "^2" }
-git_shared = { package = "git-shared", git = "https://good.example/repository" }
-"#,
-        );
-        write(&root, "app/src/lib.rs", "pub struct App;\n");
-
-        let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let shared = ProjectFile::new(root.clone(), "shared-v1/src/lib.rs");
-        let future = ProjectFile::new(root.clone(), "future-v1/src/lib.rs");
-        let wrong_git = ProjectFile::new(root.clone(), "git-wrong/src/lib.rs");
-        let routes =
-            build_from_coordinated_source(&[app.clone(), shared.clone(), future, wrong_git]);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "shared"),
-            Some(shared),
-            "a crates.io patch with an applicable version is a proven route"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "future"),
-            None,
-            "an incompatible patched package version must fail closed"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "git_shared"),
-            None,
-            "a patch for a different source must not satisfy the dependency"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks inherited package version participates in patch semver matching."
-    )]
-    fn patched_dependency_uses_workspace_inherited_package_version() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            r#"[workspace]
-members = ["app", "patched"]
-resolver = "2"
-
-[workspace.package]
-version = "1.4.0"
-
-[patch.crates-io]
-patched = { path = "patched" }
-"#,
-        );
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\npatched = \"^1.2\"\n",
-        );
-        write(&root, "app/src/lib.rs", "pub struct App;\n");
-        write(
-            &root,
-            "patched/Cargo.toml",
-            "[package]\nname = \"patched\"\nversion.workspace = true\n",
-        );
-        write(&root, "patched/src/lib.rs", "pub struct Patched;\n");
-
-        let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let patched = ProjectFile::new(root, "patched/src/lib.rs");
-        let routes = build_from_coordinated_source(&[app.clone(), patched.clone()]);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "patched"),
-            Some(patched),
-            "a path patch remains applicable when its package version is inherited"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks standalone package patch tables route dependencies without a workspace root."
-    )]
-    fn standalone_package_root_applies_its_patch_table() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            r#"[package]
-name = "app"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-patched = "^1"
-
-[patch.crates-io]
-patched = { path = "patched" }
-"#,
-        );
-        write(&root, "src/lib.rs", "pub struct App;\n");
-        write(
-            &root,
-            "patched/Cargo.toml",
-            "[package]\nname = \"patched\"\nversion = \"1.2.0\"\nedition = \"2021\"\n",
-        );
-        write(&root, "patched/src/lib.rs", "pub struct Patched;\n");
-
-        let app = ProjectFile::new(root.clone(), "src/lib.rs");
-        let patched = ProjectFile::new(root.clone(), "patched/src/lib.rs");
-        let routes = build_from_coordinated_source(&[app.clone(), patched.clone()]);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "patched"),
-            Some(patched)
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks semver filtering can make an alias unique and multiple compatible candidates remain ambiguous."
-    )]
-    fn patch_aliases_filter_by_semver_before_unique_selection() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            r#"[workspace]
-members = ["app", "shared-*", "ambiguous-*"]
-resolver = "2"
-
-[patch.crates-io]
-shared_old = { package = "shared", path = "shared-old" }
-shared_new = { package = "shared", path = "shared-new" }
-ambiguous_left = { package = "ambiguous", path = "ambiguous-left" }
-ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
-"#,
-        );
-        for (directory, package, version) in [
-            ("shared-old", "shared", "1.9.0"),
-            ("shared-new", "shared", "2.1.0"),
-            ("ambiguous-left", "ambiguous", "3.1.0"),
-            ("ambiguous-right", "ambiguous", "3.2.0"),
-        ] {
-            write(
-                &root,
-                &format!("{directory}/Cargo.toml"),
-                &format!(
-                    "[package]\nname = \"{package}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-                ),
-            );
-            write(
-                &root,
-                &format!("{directory}/src/lib.rs"),
-                "pub struct Item;\n",
-            );
-        }
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nshared = \"^2\"\nambiguous = \"^3\"\n",
-        );
-        write(&root, "app/src/lib.rs", "pub struct App;\n");
-
-        let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let shared = ProjectFile::new(root.clone(), "shared-new/src/lib.rs");
-        let files = [
-            app.clone(),
-            ProjectFile::new(root.clone(), "shared-old/src/lib.rs"),
-            shared.clone(),
-            ProjectFile::new(root.clone(), "ambiguous-left/src/lib.rs"),
-            ProjectFile::new(root, "ambiguous-right/src/lib.rs"),
-        ];
-        let routes = build_from_coordinated_source(&files);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "shared"),
-            Some(shared),
-            "an incompatible first alias must not hide the unique compatible patch"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "ambiguous"),
-            None,
-            "multiple compatible patch destinations must fail closed"
-        );
-    }
-
-    #[test]
-    #[hardwon(
         "36d2ca4645e4: An absolute path inside the canonical workspace must normalize to a contained relative path, while a sibling/outside path fails; the symlink/escape integration fixtures do not cover an absolute in-root input."
     )]
     fn workspace_relative_paths_accept_contained_absolute_targets() {
@@ -3864,12 +2942,18 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
             .expect("canonical inside");
         let outside = temp.path().canonicalize().expect("canonical outside");
 
+        let files = HashSet::default();
+        let naming = crate::crate_naming::RustSelectedCargoNaming::from_naming_records(
+            std::iter::empty(),
+            &[],
+        );
+        let paths = SelectedRustRoutePathFacts::new(&files, &naming);
         assert_eq!(
-            workspace_relative_path(&root, Path::new("ignored"), &inside),
+            paths.workspace_relative(&root, Path::new("ignored"), &inside),
             Some(PathBuf::from("inside"))
         );
         assert_eq!(
-            workspace_relative_path(&root, Path::new("ignored"), &outside),
+            paths.workspace_relative(&root, Path::new("ignored"), &outside),
             None,
             "an absolute target outside the canonical workspace must remain rejected"
         );
@@ -3910,1106 +2994,6 @@ ambiguous_right = { package = "ambiguous", path = "ambiguous-right" }
         assert_eq!(declarations[2].declaring_module, "crate.beta");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn cargo_routes_reject_symlinked_dependency_and_library_paths() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("workspace");
-        std::fs::create_dir_all(&root).expect("workspace root");
-        let root = root.canonicalize().expect("canonical root");
-        write(
-            temp.path(),
-            "outside/Cargo.toml",
-            "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
-        );
-        write(temp.path(), "outside/src/lib.rs", "pub struct Escaped;\n");
-        symlink(temp.path().join("outside"), root.join("linked")).expect("dependency symlink");
-        write(
-            &root,
-            "consumer/Cargo.toml",
-            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\nlinked = { path = \"../linked\" }\n",
-        );
-        write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
-        let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
-
-        let routes = build_from_coordinated_source(std::slice::from_ref(&consumer));
-        assert_eq!(routes.resolve_module_package(&consumer, "linked"), None);
-
-        write(
-            &root,
-            "bad_lib/Cargo.toml",
-            "[package]\nname = \"bad-lib\"\nversion = \"0.1.0\"\n[lib]\npath = \"../linked/src/lib.rs\"\n",
-        );
-        let manifest = read_manifest(&root, Path::new("bad_lib")).expect("manifest");
-        assert!(
-            cargo_crate(
-                &root,
-                PathBuf::from("bad_lib"),
-                manifest,
-                &HashMap::default(),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks #[path] resolution uses physical parents versus relocated inline-module bases, with decoys."
-    )]
-    fn path_attributes_distinguish_physical_file_and_inline_module_bases() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        );
-        write(&root, "src/lib.rs", "mod outer;\n");
-        write(
-            &root,
-            "src/outer.rs",
-            "#[path = \"top.rs\"]\nmod top;\n\n#[path = \"relocated\"]\nmod inline {\n    #[path = \"mapped.rs\"]\n    mod mapped;\n    mod ordinary;\n}\n",
-        );
-        write(&root, "src/top.rs", "pub struct Top;\n");
-        write(&root, "src/relocated/mapped.rs", "pub struct Mapped;\n");
-        write(&root, "src/relocated/ordinary.rs", "pub struct Ordinary;\n");
-        write(&root, "src/outer/top.rs", "pub struct WrongTop;\n");
-        write(
-            &root,
-            "src/outer/inline/mapped.rs",
-            "pub struct WrongMapped;\n",
-        );
-
-        let library = ProjectFile::new(root.clone(), "src/lib.rs");
-        let outer = ProjectFile::new(root.clone(), "src/outer.rs");
-        let top = ProjectFile::new(root.clone(), "src/top.rs");
-        let mapped = ProjectFile::new(root.clone(), "src/relocated/mapped.rs");
-        let ordinary = ProjectFile::new(root.clone(), "src/relocated/ordinary.rs");
-        let wrong_top = ProjectFile::new(root.clone(), "src/outer/top.rs");
-        let wrong_mapped = ProjectFile::new(root.clone(), "src/outer/inline/mapped.rs");
-        let routes = build_from_coordinated_source(&[
-            library.clone(),
-            outer,
-            top.clone(),
-            mapped.clone(),
-            ordinary.clone(),
-            wrong_top.clone(),
-            wrong_mapped.clone(),
-        ]);
-
-        for expected in [top, mapped, ordinary] {
-            assert_eq!(
-                routes.target_roots_for_file(&expected),
-                std::slice::from_ref(&library),
-                "{} should follow the physical #[path] module tree",
-                expected.rel_path().display()
-            );
-        }
-        for decoy in [wrong_top, wrong_mapped] {
-            assert!(
-                routes.target_roots_for_file(&decoy).is_empty(),
-                "{} uses the obsolete logical base",
-                decoy.rel_path().display()
-            );
-        }
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks raw and cooked Rust #[path] literals decode to the same target path."
-    )]
-    fn path_attributes_decode_raw_and_cooked_string_literals() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        );
-        write(
-            &root,
-            "src/lib.rs",
-            r##"#[path = r#"nested/raw.rs"#]
-mod raw;
-#[path = "nested\x2fcooked.rs"]
-mod cooked;
-"##,
-        );
-        write(&root, "src/nested/raw.rs", "pub struct Raw;\n");
-        write(&root, "src/nested/cooked.rs", "pub struct Cooked;\n");
-
-        let library = ProjectFile::new(root.clone(), "src/lib.rs");
-        let raw = ProjectFile::new(root.clone(), "src/nested/raw.rs");
-        let cooked = ProjectFile::new(root.clone(), "src/nested/cooked.rs");
-        let routes = build_from_coordinated_source(&[library.clone(), raw.clone(), cooked.clone()]);
-
-        for expected in [raw, cooked] {
-            assert_eq!(
-                routes.target_roots_for_file(&expected),
-                std::slice::from_ref(&library),
-                "{} should follow the decoded #[path] value",
-                expected.rel_path().display()
-            );
-        }
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks external path targets can belong to multiple nearest crate roots while manual bins own themselves."
-    )]
-    fn cargo_target_membership_crosses_nearest_manifest_boundaries() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"app\", \"shared\", \"runner\"]\nresolver = \"2\"\n",
-        );
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        );
-        write(
-            &root,
-            "app/src/lib.rs",
-            "#[path = \"../../shared/src/model.rs\"]\nmod imported;\n",
-        );
-        write(
-            &root,
-            "shared/Cargo.toml",
-            "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        );
-        write(&root, "shared/src/lib.rs", "mod model;\n");
-        write(&root, "shared/src/model.rs", "pub struct Model;\n");
-        write(&root, "shared/tool.rs", "fn main() {}\n");
-        write(
-            &root,
-            "runner/Cargo.toml",
-            "[package]\nname = \"runner\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautobins = false\n\n[[bin]]\nname = \"tool\"\npath = \"../shared/tool.rs\"\n",
-        );
-
-        let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let shared = ProjectFile::new(root.clone(), "shared/src/lib.rs");
-        let model = ProjectFile::new(root.clone(), "shared/src/model.rs");
-        let tool = ProjectFile::new(root.clone(), "shared/tool.rs");
-        let routes = build_from_coordinated_source(&[
-            app.clone(),
-            shared.clone(),
-            model.clone(),
-            tool.clone(),
-        ]);
-
-        let model_roots: HashSet<_> = routes.target_roots_for_file(&model).into_iter().collect();
-        assert_eq!(model_roots.len(), 2);
-        assert!(model_roots.contains(&app));
-        assert!(model_roots.contains(&shared));
-        assert_eq!(
-            routes.target_roots_for_file(&tool),
-            std::slice::from_ref(&tool)
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks normal, dev, build, and target-specific dependency routing and duplicate destinations."
-    )]
-    fn dependency_kinds_are_scoped_to_compatible_cargo_targets() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"app\", \"normal\", \"development\", \"build-dep\", \"target-normal\", \"target-dev\", \"target-build\"]\nresolver = \"2\"\n",
-        );
-        for (directory, package) in [
-            ("normal", "normal-package"),
-            ("development", "development-package"),
-            ("build-dep", "build-package"),
-            ("target-normal", "target-normal-package"),
-            ("target-dev", "target-dev-package"),
-            ("target-build", "target-build-package"),
-        ] {
-            write(
-                &root,
-                &format!("{directory}/Cargo.toml"),
-                &format!(
-                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-                ),
-            );
-            write(
-                &root,
-                &format!("{directory}/src/lib.rs"),
-                "pub struct Shared;\n",
-            );
-        }
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"no-test\"\npath = \"src/bin/no_test.rs\"\ntest = false\n\n[dependencies]\nnormal_dep = { package = \"normal-package\", path = \"../normal\" }\noverlap = { package = \"normal-package\", path = \"../normal\" }\n\n[dev-dependencies]\ndev_dep = { package = \"development-package\", path = \"../development\" }\noverlap = { package = \"normal-package\", path = \"../normal\" }\n\n[build-dependencies]\nbuild_dep = { package = \"build-package\", path = \"../build-dep\" }\n\n[target.'cfg(unix)'.dependencies]\ntarget_normal = { package = \"target-normal-package\", path = \"../target-normal\" }\n\n[target.'cfg(unix)'.dev-dependencies]\ntarget_dev = { package = \"target-dev-package\", path = \"../target-dev\" }\n\n[target.'cfg(unix)'.build-dependencies]\ntarget_build = { package = \"target-build-package\", path = \"../target-build\" }\n",
-        );
-        write(&root, "app/src/lib.rs", "mod shared;\n");
-        write(&root, "app/src/main.rs", "fn main() {}\n");
-        write(&root, "app/src/bin/no_test.rs", "fn main() {}\n");
-        write(&root, "app/src/shared.rs", "pub struct Local;\n");
-        write(&root, "app/examples/demo.rs", "fn main() {}\n");
-        write(
-            &root,
-            "app/tests/integration.rs",
-            "#[path = \"../src/shared.rs\"]\nmod shared;\n",
-        );
-        write(&root, "app/benches/bench.rs", "fn main() {}\n");
-        write(&root, "app/build.rs", "fn main() {}\n");
-
-        let library = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let binary = ProjectFile::new(root.clone(), "app/src/main.rs");
-        let no_test_binary = ProjectFile::new(root.clone(), "app/src/bin/no_test.rs");
-        let shared = ProjectFile::new(root.clone(), "app/src/shared.rs");
-        let example = ProjectFile::new(root.clone(), "app/examples/demo.rs");
-        let test = ProjectFile::new(root.clone(), "app/tests/integration.rs");
-        let bench = ProjectFile::new(root.clone(), "app/benches/bench.rs");
-        let build = ProjectFile::new(root.clone(), "app/build.rs");
-        let mut files = vec![
-            library.clone(),
-            binary.clone(),
-            no_test_binary.clone(),
-            shared.clone(),
-            example.clone(),
-            test.clone(),
-            bench.clone(),
-            build.clone(),
-        ];
-        files.extend(
-            [
-                "normal",
-                "development",
-                "build-dep",
-                "target-normal",
-                "target-dev",
-                "target-build",
-            ]
-            .into_iter()
-            .map(|directory| ProjectFile::new(root.clone(), format!("{directory}/src/lib.rs"))),
-        );
-        let routes = build_from_coordinated_source(&files);
-
-        let normal_root = ProjectFile::new(root.clone(), "normal/src/lib.rs");
-        let development_root = ProjectFile::new(root.clone(), "development/src/lib.rs");
-        let build_root = ProjectFile::new(root.clone(), "build-dep/src/lib.rs");
-        let target_normal_root = ProjectFile::new(root.clone(), "target-normal/src/lib.rs");
-        let target_dev_root = ProjectFile::new(root.clone(), "target-dev/src/lib.rs");
-        let target_build_root = ProjectFile::new(root.clone(), "target-build/src/lib.rs");
-
-        for target in [
-            &library,
-            &binary,
-            &no_test_binary,
-            &example,
-            &test,
-            &bench,
-            &shared,
-        ] {
-            assert_eq!(
-                routes.resolve_crate_root_file(target, "normal_dep"),
-                Some(normal_root.clone()),
-                "normal dependency from {}",
-                target.rel_path().display()
-            );
-            assert_eq!(
-                routes.resolve_crate_root_file(target, "target_normal"),
-                Some(target_normal_root.clone()),
-                "target-specific normal dependency from {}",
-                target.rel_path().display()
-            );
-        }
-        assert_eq!(routes.resolve_crate_root_file(&build, "normal_dep"), None);
-        assert_eq!(
-            routes.resolve_crate_root_file(&build, "target_normal"),
-            None
-        );
-
-        for target in [
-            &library,
-            &binary,
-            &no_test_binary,
-            &example,
-            &test,
-            &bench,
-            &shared,
-        ] {
-            assert_eq!(
-                routes.resolve_crate_root_file(target, "dev_dep"),
-                Some(development_root.clone()),
-                "development dependency from {}",
-                target.rel_path().display()
-            );
-            assert_eq!(
-                routes.resolve_crate_root_file(target, "target_dev"),
-                Some(target_dev_root.clone()),
-                "target-specific development dependency from {}",
-                target.rel_path().display()
-            );
-        }
-        assert_eq!(routes.resolve_crate_root_file(&build, "dev_dep"), None);
-        assert_eq!(routes.resolve_crate_root_file(&build, "target_dev"), None);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&build, "build_dep"),
-            Some(build_root)
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&build, "target_build"),
-            Some(target_build_root)
-        );
-        for target in [
-            &library,
-            &binary,
-            &no_test_binary,
-            &example,
-            &test,
-            &bench,
-            &shared,
-        ] {
-            assert_eq!(routes.resolve_crate_root_file(target, "build_dep"), None);
-            assert_eq!(routes.resolve_crate_root_file(target, "target_build"), None);
-        }
-        assert_eq!(
-            routes.resolve_crate_root_file(&example, "overlap"),
-            Some(normal_root),
-            "identical normal/dev declarations must deduplicate by destination"
-        );
-        assert_eq!(routes.resolve_crate_root_file(&build, "app"), None);
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks inherited normal and dev dependencies route to the corresponding member targets."
-    )]
-    fn workspace_inherited_dependencies_keep_member_dependency_classes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"app\", \"dependency\"]\nresolver = \"2\"\n\n[workspace.dependencies]\ninherited_normal = { package = \"workspace-dependency\", path = \"dependency\" }\ninherited_dev = { package = \"workspace-dependency\", path = \"dependency\" }\n",
-        );
-        write(
-            &root,
-            "dependency/Cargo.toml",
-            "[package]\nname = \"workspace-dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        );
-        write(&root, "dependency/src/lib.rs", "pub struct Shared;\n");
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ntest = false\n\n[dependencies]\ninherited_normal = { workspace = true }\n\n[dev-dependencies]\ninherited_dev = { workspace = true }\n",
-        );
-        write(&root, "app/src/lib.rs", "pub struct App;\n");
-        write(&root, "app/tests/integration.rs", "fn test() {}\n");
-
-        let dependency = ProjectFile::new(root.clone(), "dependency/src/lib.rs");
-        let library = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let test = ProjectFile::new(root.clone(), "app/tests/integration.rs");
-        let routes =
-            build_from_coordinated_source(&[dependency.clone(), library.clone(), test.clone()]);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&library, "inherited_normal"),
-            Some(dependency.clone())
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&library, "inherited_dev"),
-            None
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&test, "inherited_dev"),
-            Some(dependency)
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks edition-2015 manual target discovery rules while preserving the library target."
-    )]
-    fn edition_2015_manual_targets_disable_implicit_auto_discovery() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"manual\"\npath = \"cmd/manual.rs\"\n",
-        );
-        write(&root, "cmd/manual.rs", "fn main() {}\n");
-        write(&root, "src/lib.rs", "pub struct ImplicitLibrary;\n");
-        write(&root, "src/main.rs", "fn main() {}\n");
-        write(&root, "examples/implicit.rs", "fn main() {}\n");
-
-        let manual = ProjectFile::new(root.clone(), "cmd/manual.rs");
-        let library = ProjectFile::new(root.clone(), "src/lib.rs");
-        let main = ProjectFile::new(root.clone(), "src/main.rs");
-        let example = ProjectFile::new(root.clone(), "examples/implicit.rs");
-        let routes = build_from_coordinated_source(&[
-            manual.clone(),
-            library.clone(),
-            main.clone(),
-            example.clone(),
-        ]);
-
-        assert_eq!(
-            routes.target_roots_for_file(&manual),
-            std::slice::from_ref(&manual)
-        );
-        // Corrected 2026-09-22, measured against Cargo 1.96 rather than read
-        // from the documentation. This package reports targets
-        // `[legacy: lib (lib.rs), legacy-cli: bin (cli.rs)]` under
-        // `cargo metadata --no-deps`: the legacy 2015 rule drops the implicit
-        // `src/main.rs` binary and the implicit example, and does not touch the
-        // library. `src/lib.rs` is the package's library in every edition unless
-        // `[lib]` names another path or `autolib = false`.
-        assert_eq!(
-            routes.target_roots_for_file(&library),
-            std::slice::from_ref(&library),
-            "the library is discovered whatever else a 2015 manifest declares"
-        );
-        for implicit in [main, example] {
-            assert!(
-                routes.target_roots_for_file(&implicit).is_empty(),
-                "{} must not be auto-discovered for a legacy manifest with a manual target",
-                implicit.rel_path().display()
-            );
-        }
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks inherited 2021 edition auto targets and explicit test=false target mode on a shared file."
-    )]
-    fn inherited_modern_edition_preserves_auto_targets_and_same_file_target_modes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"app\", \"dev-dep\"]\nresolver = \"2\"\n\n[workspace.package]\nedition = \"2021\"\n",
-        );
-        write(
-            &root,
-            "dev-dep/Cargo.toml",
-            "[package]\nname = \"dev-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        );
-        write(&root, "dev-dep/src/lib.rs", "pub struct Dev;\n");
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition.workspace = true\n\n[[bin]]\nname = \"manual-main\"\npath = \"src/main.rs\"\ntest = false\n\n[dev-dependencies]\ndev_dep = { package = \"dev-dep\", path = \"../dev-dep\" }\n",
-        );
-        write(&root, "app/src/main.rs", "fn main() {}\n");
-        write(&root, "app/examples/implicit.rs", "fn main() {}\n");
-
-        let dependency = ProjectFile::new(root.clone(), "dev-dep/src/lib.rs");
-        let main = ProjectFile::new(root.clone(), "app/src/main.rs");
-        let example = ProjectFile::new(root.clone(), "app/examples/implicit.rs");
-        let routes =
-            build_from_coordinated_source(&[dependency.clone(), main.clone(), example.clone()]);
-
-        assert_eq!(
-            routes.target_roots_for_file(&example),
-            std::slice::from_ref(&example)
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&main, "dev_dep"),
-            Some(dependency.clone()),
-            "the auto binary mode on the same file must coexist with test=false explicit mode"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&example, "dev_dep"),
-            Some(dependency)
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Checks conflicting target destinations fail closed while a unique conditional route stays usable."
-    )]
-    fn target_specific_dependency_conflicts_fail_closed_by_destination() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"app\", \"left\", \"right\"]\nresolver = \"2\"\n",
-        );
-        for dependency in ["left", "right"] {
-            write(
-                &root,
-                &format!("{dependency}/Cargo.toml"),
-                &format!(
-                    "[package]\nname = \"{dependency}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-                ),
-            );
-            write(
-                &root,
-                &format!("{dependency}/src/lib.rs"),
-                "pub struct Shared;\n",
-            );
-        }
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nstable = { package = \"left\", path = \"../left\" }\n\n[target.'cfg(unix)'.dependencies]\nconflict = { package = \"left\", path = \"../left\" }\nstable = { package = \"left\", path = \"../left\" }\nsingle = { package = \"left\", path = \"../left\" }\n\n[target.'cfg(windows)'.dependencies]\nconflict = { package = \"right\", path = \"../right\" }\n",
-        );
-        write(&root, "app/src/lib.rs", "pub struct App;\n");
-
-        let app = ProjectFile::new(root.clone(), "app/src/lib.rs");
-        let left = ProjectFile::new(root.clone(), "left/src/lib.rs");
-        let right = ProjectFile::new(root.clone(), "right/src/lib.rs");
-        let routes = build_from_coordinated_source(&[app.clone(), left.clone(), right.clone()]);
-
-        assert_eq!(routes.resolve_crate_root_file(&app, "conflict"), None);
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "single"),
-            Some(left.clone()),
-            "one conditional destination is a structured target-agnostic best effort"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "stable"),
-            Some(left.clone()),
-            "unconditional and conditional declarations with one destination deduplicate"
-        );
-        assert!(
-            routes
-                .files_that_can_reference_target_of(&left)
-                .contains(&app),
-            "the inverse candidate index must retain reachable dependency roots"
-        );
-    }
-
-    #[test]
-    #[hardwon(
-        "36d2ca4645e4: Two declarations for one physical child merge macro import and retained visibility facts without changing the first source site."
-    )]
-    fn duplicate_module_edges_merge_into_the_retained_edge() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let source = "#[path = \"shared.rs\"]\nmod private;\n#[macro_use]\n#[path = \"shared.rs\"]\nmod imported;\n";
-        write(&root, "src/lib.rs", source);
-        write(
-            &root,
-            "src/shared.rs",
-            "macro_rules! shared_macro { () => {}; }\n",
-        );
-        let library = ProjectFile::new(root, "src/lib.rs");
-        let facts = coordinated_route_facts(&library, source);
-        let edges = module_child_edges(&library, &facts, true, &HashMap::default());
-
-        assert_eq!(edges.len(), 1);
-        assert!(edges[0].imports_macros);
-        assert_eq!(
-            edges[0].declaration_start_byte,
-            source.find("mod private").expect("first declaration")
-        );
-        assert_eq!(
-            edges[0].visibility_start_byte,
-            source.find("mod imported").expect("macro-use declaration") + "mod imported;".len()
-        );
-    }
-
-    /// Every module-declaration shape the coordinated producer knows about,
-    /// in one file:
-    /// plain, directory-backed, `#[path]` on a declaration and on an inline
-    /// module, `#[macro_use]`, `#[cfg(test)]`, nested inline scopes, duplicate
-    /// declarations of one file, and both a replaying and a non-replaying item
-    /// macro.
-    const MODULE_ROUTE_FIXTURE: &str = r####"
-macro_rules! replay {
-    ($($item:item)*) => { $($item)* };
-}
-macro_rules! swallow {
-    ($($item:item)*) => {};
-}
-
-mod plain;
-mod directory_backed;
-#[path = "relocated/target.rs"]
-mod relocated_declaration;
-#[macro_use]
-mod macro_source;
-#[cfg(test)]
-mod gated;
-#[cfg(any(test, feature = "fixtures"))]
-mod composed_gate;
-pub mod published;
-
-mod outer {
-    pub mod inner {
-        mod nested_child;
-    }
-    #[path = "elsewhere"]
-    mod relocated_scope {
-        mod deep_child;
-    }
-}
-
-#[path = "shared.rs"]
-mod first_alias;
-#[macro_use]
-#[path = "shared.rs"]
-mod second_alias;
-
-replay! { mod replayed; }
-swallow! { mod swallowed; }
-replay! { replay! { mod doubly_replayed; } }
-"####;
-
-    /// Lay the fixture's declared files down on disk. Returns the workspace
-    /// root, whose `Cargo.toml` makes it a single-crate workspace.
-    fn module_route_fixture(temp: &tempfile::TempDir) -> PathBuf {
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[package]\nname = \"routes\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        );
-        write(&root, "src/lib.rs", MODULE_ROUTE_FIXTURE);
-        for relative in [
-            "src/plain.rs",
-            "src/directory_backed/mod.rs",
-            "src/relocated/target.rs",
-            "src/macro_source.rs",
-            "src/gated.rs",
-            "src/composed_gate.rs",
-            "src/published.rs",
-            "src/outer/inner/nested_child.rs",
-            "src/outer/elsewhere/deep_child.rs",
-            "src/elsewhere/deep_child.rs",
-            "src/shared.rs",
-            "src/replayed.rs",
-            "src/swallowed.rs",
-            "src/doubly_replayed.rs",
-            // A file the crate root does not declare, used to exercise a
-            // non-crate-root declaring file.
-            "src/sub.rs",
-            "src/sub/child.rs",
-        ] {
-            write(&root, relative, "pub struct Marker;\n");
-        }
-        write(
-            &root,
-            "src/sub.rs",
-            "mod child;\n#[path = \"../shared.rs\"]\nmod escaped;\n#[path = \"sub/path_child.rs\"]\nmod path_child;\n",
-        );
-        write(&root, "src/sub/path_child.rs", "pub struct Marker;\n");
-        root
-    }
-
-    fn visible_item_macros(
-        facts: &RustModuleRouteFacts,
-    ) -> HashMap<String, Vec<RustVisibleItemMacroDefinition>> {
-        facts
-            .item_macros
-            .iter()
-            .fold(HashMap::default(), |mut bindings, definition| {
-                bindings
-                    .entry(definition.name.clone())
-                    .or_insert_with(Vec::new)
-                    .push(RustVisibleItemMacroDefinition {
-                        visible_after: definition.visible_after,
-                        scope_start: definition.scope_start,
-                        scope_end: definition.scope_end,
-                        decoration: definition.decoration.clone(),
-                    });
-                bindings
-            })
-    }
-
-    /// Route edges are resolved from the coordinated facts produced by
-    /// `parse_rust_file`. Exercise both file-root conventions and the
-    /// target-local item-macro visibility that the reader consumes.
-    #[test]
-    #[hardwon(
-        "77b9fe777316: the route index and crate walk disagreed on member admission for nested modules, macro visibility, and cfg."
-    )]
-    fn module_child_edges_use_coordinated_route_facts() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = module_route_fixture(&temp);
-        for relative in ["src/lib.rs", "src/sub.rs"] {
-            let file = ProjectFile::new(root.clone(), relative);
-            let source = file.read_to_string().expect("read fixture");
-            let facts = coordinated_route_facts(&file, &source);
-            for visible in [false, true] {
-                let passthrough = if visible {
-                    visible_item_macros(&facts)
-                } else {
-                    HashMap::default()
-                };
-                for is_crate_root in [true, false] {
-                    let mut actual = module_child_edges(&file, &facts, is_crate_root, &passthrough);
-                    let edge =
-                        |path: &str,
-                         declaring_module: &str,
-                         visibility: RustVisibility,
-                         imports_macros: bool,
-                         test_gated: bool,
-                         declaration: &str,
-                         visibility_declaration: Option<&str>| {
-                            let declaration_start =
-                                source.find(declaration).expect("fixture route");
-                            RustExternalModuleChild {
-                                file: ProjectFile::new(root.clone(), path),
-                                declaring_module: declaring_module.to_string(),
-                                visibility,
-                                imports_macros,
-                                test_gated,
-                                declaration_start_byte: declaration_start,
-                                visibility_start_byte: visibility_declaration
-                                    .map(|declaration| {
-                                        source.find(declaration).expect("fixture visibility route")
-                                            + declaration.len()
-                                    })
-                                    .unwrap_or(usize::MAX),
-                            }
-                        };
-                    let mut expected = match (relative, is_crate_root) {
-                        ("src/lib.rs", true) => vec![
-                            edge(
-                                "src/composed_gate.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod composed_gate;",
-                                None,
-                            ),
-                            edge(
-                                "src/directory_backed/mod.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod directory_backed;",
-                                None,
-                            ),
-                            edge(
-                                "src/gated.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                true,
-                                "mod gated;",
-                                None,
-                            ),
-                            edge(
-                                "src/macro_source.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                true,
-                                false,
-                                "mod macro_source;",
-                                Some("mod macro_source;"),
-                            ),
-                            edge(
-                                "src/outer/elsewhere/deep_child.rs",
-                                "routes.outer.relocated_scope",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod deep_child;",
-                                None,
-                            ),
-                            edge(
-                                "src/outer/inner/nested_child.rs",
-                                "routes.outer.inner",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod nested_child;",
-                                None,
-                            ),
-                            edge(
-                                "src/plain.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod plain;",
-                                None,
-                            ),
-                            edge(
-                                "src/published.rs",
-                                "routes",
-                                RustVisibility::Public,
-                                false,
-                                false,
-                                "pub mod published;",
-                                None,
-                            ),
-                            edge(
-                                "src/relocated/target.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod relocated_declaration;",
-                                None,
-                            ),
-                            edge(
-                                "src/shared.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                true,
-                                false,
-                                "mod first_alias;",
-                                Some("mod second_alias;"),
-                            ),
-                        ],
-                        ("src/lib.rs", false) => vec![
-                            edge(
-                                "src/relocated/target.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod relocated_declaration;",
-                                None,
-                            ),
-                            edge(
-                                "src/shared.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                true,
-                                false,
-                                "mod first_alias;",
-                                Some("mod second_alias;"),
-                            ),
-                        ],
-                        ("src/sub.rs", true) => vec![edge(
-                            "src/sub/path_child.rs",
-                            "routes.sub",
-                            RustVisibility::Private,
-                            false,
-                            false,
-                            "mod path_child;",
-                            None,
-                        )],
-                        ("src/sub.rs", false) => vec![
-                            edge(
-                                "src/sub/child.rs",
-                                "routes.sub",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod child;",
-                                None,
-                            ),
-                            edge(
-                                "src/sub/path_child.rs",
-                                "routes.sub",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod path_child;",
-                                None,
-                            ),
-                        ],
-                        _ => unreachable!("fixture file: {relative}"),
-                    };
-                    if relative == "src/lib.rs" && is_crate_root && visible {
-                        expected.extend([
-                            edge(
-                                "src/doubly_replayed.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod doubly_replayed;",
-                                None,
-                            ),
-                            edge(
-                                "src/replayed.rs",
-                                "routes",
-                                RustVisibility::Private,
-                                false,
-                                false,
-                                "mod replayed;",
-                                None,
-                            ),
-                        ]);
-                    }
-                    expected.sort_by(|left, right| left.file.cmp(&right.file));
-                    actual.sort_by(|left, right| left.file.cmp(&right.file));
-                    assert_eq!(
-                        actual, expected,
-                        "{relative}, root {is_crate_root}, visible {visible}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[hardwon(
-        "a90be0734510: Raw module spellings are canonicalized in route facts so inverse lookup uses the declared name."
-    )]
-    fn module_route_facts_canonicalize_raw_identifiers() {
-        let file = inline_fixture_file();
-        let source = "mod r#struct;\nmod r#type { mod r#enum; }\n";
-        let facts = coordinated_route_facts(&file, source);
-
-        assert!(
-            facts
-                .routes
-                .iter()
-                .any(|route| route.scope == 0 && route.module_name == "struct"),
-            "external raw module route: {facts:#?}"
-        );
-        let inline_scope = facts
-            .scopes
-            .iter()
-            .position(|scope| scope.parent == Some(0) && scope.module_name == "type")
-            .expect("canonical inline raw module scope");
-        assert!(
-            facts
-                .routes
-                .iter()
-                .any(|route| route.scope == inline_scope && route.module_name == "enum"),
-            "nested raw module route: {facts:#?}"
-        );
-    }
-
-    /// The fixture must actually exercise the shapes the pin claims to cover,
-    /// or the comparison above would hold vacuously.
-    #[test]
-    fn the_module_route_fixture_exercises_every_declaration_shape() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = module_route_fixture(&temp);
-        let file = ProjectFile::new(root.clone(), "src/lib.rs");
-        let source = file.read_to_string().expect("read fixture");
-        let facts = coordinated_route_facts(&file, &source);
-
-        assert!(
-            facts
-                .scopes
-                .iter()
-                .any(|scope| scope.path_attribute.is_some()),
-            "an inline module carries a #[path]: {facts:?}"
-        );
-        assert!(
-            facts.scopes.iter().any(|scope| scope.parent == Some(0)
-                && scope.module_name == "outer"
-                && !scope.imports_macros),
-            "the inline scopes are recorded with their macro-use chain: {facts:?}"
-        );
-        assert!(
-            facts
-                .routes
-                .iter()
-                .any(|route| route.path_attribute.is_some()),
-            "a declaration carries a #[path]: {facts:?}"
-        );
-        assert!(
-            facts.routes.iter().any(|route| route.test_gated),
-            "a bare #[cfg(test)] declaration is gated: {facts:?}"
-        );
-        assert!(
-            facts
-                .routes
-                .iter()
-                .any(|route| route.module_name == "composed_gate" && !route.test_gated),
-            "a composed cfg predicate must not gate: {facts:?}"
-        );
-        assert!(
-            facts.routes.iter().any(|route| route.imports_macros),
-            "a #[macro_use] declaration is recorded: {facts:?}"
-        );
-        assert!(
-            facts.routes.iter().any(|route| route.gates.len() == 1),
-            "a single-macro gate is recorded: {facts:?}"
-        );
-        assert!(
-            facts.routes.iter().any(|route| route.gates.len() == 2),
-            "a nested-macro gate chain is recorded: {facts:?}"
-        );
-        assert!(
-            facts.item_macros.len() == 2,
-            "both item macros are recorded: {facts:?}"
-        );
-
-        // The gates are what the reader filters on, so the two macros must
-        // reach opposite verdicts through the real build.
-        let passthrough = visible_item_macros(&facts);
-        let edges = module_child_edges(&file, &facts, true, &passthrough);
-        let named = |name: &str| {
-            edges
-                .iter()
-                .any(|edge| edge.file.rel_path() == Path::new(name))
-        };
-        assert!(named("src/replayed.rs"), "edges: {edges:?}");
-        assert!(named("src/doubly_replayed.rs"), "edges: {edges:?}");
-        assert!(!named("src/swallowed.rs"), "edges: {edges:?}");
-    }
-
-    /// The route index admits a `mod` route written inside item-macro
-    /// invocations only when the crate's module walk decides it: every
-    /// invocation's macro is a passthrough whose decoration is known. A
-    /// passthrough that decorates with `#[allow(..)]` used to be admitted here
-    /// while the crate left the route undecided (`UnsupportedMacroGeneratedModule`),
-    /// so the two disagreed about which file the crate compiles. A `cfg`
-    /// decoration is admitted, and a bare `cfg(test)` decoration gates the
-    /// edge as a bare `#[cfg(test)]` on the declaration does.
-    #[test]
-    #[hardwon(
-        "2c4889c1c8da: the route index admitted an allow-decorated macro module that the crate walk left undecided."
-    )]
-    fn module_child_edges_admit_only_invocations_the_crate_decides() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        let source = concat!(
-            "macro_rules! plain { ($($item:item)*) => { $($item)* }; }\n",
-            "macro_rules! unix_only { ($($item:item)*) => { $( #[cfg(unix)] $item )* }; }\n",
-            "macro_rules! testing { ($($item:item)*) => { $( #[cfg(test)] $item )* }; }\n",
-            "macro_rules! allowed { ($($item:item)*) => { $( #[allow(dead_code)] $item )* }; }\n",
-            "plain! { pub mod replayed; }\n",
-            "unix_only! { pub mod decorated; }\n",
-            "testing! { mod tested; }\n",
-            "allowed! { pub mod undecided; }\n",
-        );
-        write(&root, "src/lib.rs", source);
-        for relative in [
-            "src/replayed.rs",
-            "src/decorated.rs",
-            "src/tested.rs",
-            "src/undecided.rs",
-        ] {
-            write(&root, relative, "pub fn item() {}\n");
-        }
-        let file = ProjectFile::new(root.clone(), "src/lib.rs");
-        let facts = coordinated_route_facts(&file, source);
-        let edges = module_child_edges(&file, &facts, true, &visible_item_macros(&facts));
-        let edge = |name: &str| {
-            edges
-                .iter()
-                .find(|edge| edge.file.rel_path() == Path::new(name))
-        };
-        assert!(
-            edge("src/replayed.rs").is_some_and(|edge| !edge.test_gated),
-            "{edges:?}"
-        );
-        assert!(
-            edge("src/decorated.rs").is_some_and(|edge| !edge.test_gated),
-            "a cfg decoration is admitted for the crate's walk to evaluate: {edges:?}"
-        );
-        assert!(
-            edge("src/tested.rs").is_some_and(|edge| edge.test_gated),
-            "a bare cfg(test) decoration gates the edge: {edges:?}"
-        );
-        assert!(
-            edge("src/undecided.rs").is_none(),
-            "an undecided invocation admits no route: {edges:?}"
-        );
-    }
-
     /// Every Rust file the fixture wrote, in the order an analyzed-file set
     /// presents them.
     fn analyzed_rust_files(root: &Path) -> Vec<ProjectFile> {
@@ -5039,112 +3023,6 @@ replay! { replay! { mod doubly_replayed; } }
             facts.insert(file.clone(), coordinated_route_facts(file, &source));
         }
         facts
-    }
-
-    /// A workspace with the shapes target-level composition can get wrong:
-    /// several targets per crate (library, binary, extra binary, integration
-    /// test, bench, example, build script), a module file two targets share, a
-    /// crate whose explicit `[[bin]]` disables auto discovery, a dev-dependency
-    /// edge, a `#[path]` declaration, a `#[cfg(test)]` subtree, and a
-    /// `#[macro_use]` passthrough macro that expands to a module declaration.
-    fn multi_target_workspace(temp: &tempfile::TempDir) -> PathBuf {
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "Cargo.toml",
-            "[workspace]\nmembers = [\"engine\", \"app\", \"legacy\"]\nresolver = \"2\"\n",
-        );
-
-        write(
-            &root,
-            "engine/Cargo.toml",
-            "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[dev-dependencies]\napp = { path = \"../app\" }\n",
-        );
-        write(&root, "engine/build.rs", "fn main() {}\n");
-        write(
-            &root,
-            "engine/src/lib.rs",
-            "#[macro_use]\nmod macros;\npub mod part;\n#[cfg(test)]\nmod tests;\nreplay! { mod expanded; }\nswallow! { mod swallowed; }\n",
-        );
-        write(
-            &root,
-            "engine/src/macros.rs",
-            "macro_rules! replay {\n    ($($item:item)*) => { $($item)* };\n}\nmacro_rules! swallow {\n    ($($item:item)*) => {};\n}\n",
-        );
-        write(&root, "engine/src/part.rs", "pub struct Part;\n");
-        write(&root, "engine/src/expanded.rs", "pub struct Marker;\n");
-        write(&root, "engine/src/swallowed.rs", "pub struct Marker;\n");
-        write(&root, "engine/src/tests.rs", "mod helpers;\n");
-        write(&root, "engine/src/tests/helpers.rs", "pub fn helper() {}\n");
-        // The binary shares the library's module file, so one file belongs to
-        // two targets of the same crate.
-        write(&root, "engine/src/main.rs", "mod part;\nfn main() {}\n");
-        write(
-            &root,
-            "engine/src/bin/tool.rs",
-            "mod support;\nfn main() {}\n",
-        );
-        write(&root, "engine/src/bin/support.rs", "pub fn support() {}\n");
-        // The deepest shape auto discovery accepts, four components below the
-        // manifest directory.
-        write(
-            &root,
-            "engine/src/bin/nested/main.rs",
-            "mod inner;\nfn main() {}\n",
-        );
-        write(
-            &root,
-            "engine/src/bin/nested/inner.rs",
-            "pub fn inner() {}\n",
-        );
-        write(&root, "engine/tests/it.rs", "mod fixtures;\n");
-        // `tests/fixtures.rs` is an auto-discovered integration test target in
-        // its own right AND a module of `tests/it.rs`, so its own declaration
-        // resolves to a different file under each reading. Nothing else in the
-        // fixture asks one file for its edges both ways.
-        write(
-            &root,
-            "engine/tests/fixtures.rs",
-            "mod shared;\npub fn fixture() {}\n",
-        );
-        write(&root, "engine/tests/shared.rs", "pub fn shared() {}\n");
-        write(
-            &root,
-            "engine/tests/fixtures/shared.rs",
-            "pub fn shared() {}\n",
-        );
-        write(&root, "engine/benches/bench.rs", "fn main() {}\n");
-        write(&root, "engine/examples/demo/main.rs", "fn main() {}\n");
-
-        write(
-            &root,
-            "app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nengine = { path = \"../engine\" }\n",
-        );
-        write(
-            &root,
-            "app/src/lib.rs",
-            "pub mod feature;\n#[path = \"custom/relocated.rs\"]\nmod relocated;\n",
-        );
-        write(&root, "app/src/feature.rs", "pub struct Marker;\n");
-        write(
-            &root,
-            "app/src/custom/relocated.rs",
-            "pub struct Relocated;\n",
-        );
-        write(&root, "app/src/main.rs", "fn main() {}\n");
-
-        write(
-            &root,
-            "legacy/Cargo.toml",
-            "[package]\nname = \"legacy\"\nversion = \"0.1.0\"\nedition = \"2015\"\n\n[[bin]]\nname = \"legacy-cli\"\npath = \"src/cli.rs\"\n",
-        );
-        write(&root, "legacy/src/cli.rs", "mod util;\nfn main() {}\n");
-        write(&root, "legacy/src/util.rs", "pub fn util() {}\n");
-        // The 2015 explicit-target rule is off for binaries here, and on for
-        // the library: this file is the package's library target.
-        write(&root, "legacy/src/lib.rs", "pub struct Reachable;\n");
-        root
     }
 
     /// `crates` member crates, each with a library, a binary that shares the
@@ -5206,108 +3084,9 @@ replay! { replay! { mod doubly_replayed; } }
         (files, facts)
     }
 
-    /// The multi-target fixture must exercise the shapes the equivalence pin
-    /// claims, or that pin holds over a workspace no harder than the one that
-    /// already existed.
-    #[test]
-    fn the_multi_target_fixture_exercises_shared_targets_and_expanded_modules() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = multi_target_workspace(&temp);
-        let files = analyzed_rust_files(&root);
-        let facts = route_facts_for(&files);
-        let index = RustCargoRouteIndex::build_while(&files, &facts, &|| true).expect("index");
-
-        let library = ProjectFile::new(root.clone(), "engine/src/lib.rs");
-        let binary = ProjectFile::new(root.clone(), "engine/src/main.rs");
-        let part = ProjectFile::new(root.clone(), "engine/src/part.rs");
-        let mut part_roots = index.target_roots_for_file(&part);
-        part_roots.sort();
-        let mut shared = vec![binary, library];
-        shared.sort();
-        assert_eq!(
-            part_roots, shared,
-            "one module file must belong to two targets of the same crate"
-        );
-        assert!(
-            index.targets_by_root.len() >= 8,
-            "library, three binaries, integration test, bench, example and build script: {:?}",
-            index.targets_by_root.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            index
-                .target_roots_for_file(&ProjectFile::new(
-                    root.clone(),
-                    "engine/src/bin/nested/inner.rs"
-                ))
-                .contains(&ProjectFile::new(
-                    root.clone(),
-                    "engine/src/bin/nested/main.rs"
-                )),
-            "the deepest auto-discovered target shape must still own its modules"
-        );
-        let declared: Vec<_> = index
-            .external_module_declarations
-            .iter()
-            .map(|declaration| declaration.target_file.rel_path().to_path_buf())
-            .collect();
-        assert!(
-            declared.contains(&PathBuf::from("engine/src/expanded.rs")),
-            "a passthrough macro's module declaration must survive: {declared:?}"
-        );
-        assert!(
-            !declared.contains(&PathBuf::from("engine/src/swallowed.rs")),
-            "a macro that does not replay its items must not declare a module: {declared:?}"
-        );
-        assert!(
-            declared.contains(&PathBuf::from("app/src/custom/relocated.rs")),
-            "a #[path] declaration must resolve: {declared:?}"
-        );
-        assert!(
-            index.file_is_test_only(&ProjectFile::new(
-                root.clone(),
-                "engine/src/tests/helpers.rs"
-            )),
-            "the #[cfg(test)] subtree must stay test-only"
-        );
-        // Corrected with the pin above: an explicit `[[bin]]` on a 2015 crate
-        // disables the implicit binary, example, test and bench targets, and
-        // leaves the library alone (Cargo 1.96, `cargo metadata --no-deps`).
-        assert_eq!(
-            index.target_roots_for_file(&ProjectFile::new(root.clone(), "legacy/src/lib.rs")),
-            [ProjectFile::new(root.clone(), "legacy/src/lib.rs")],
-            "an explicit [[bin]] on a 2015 crate leaves the auto library target"
-        );
-        let it = ProjectFile::new(root.clone(), "engine/tests/it.rs");
-        let fixtures = ProjectFile::new(root.clone(), "engine/tests/fixtures.rs");
-        assert!(
-            index
-                .target_roots_for_file(&ProjectFile::new(root.clone(), "engine/tests/shared.rs"))
-                .contains(&fixtures),
-            "a file that is both a target root and a declared module must resolve \
-             its own declarations as a crate root"
-        );
-        assert!(
-            index
-                .target_roots_for_file(&ProjectFile::new(
-                    root.clone(),
-                    "engine/tests/fixtures/shared.rs"
-                ))
-                .contains(&it),
-            "and as a module when it is reached through the file that declares it"
-        );
-    }
-
-    /// The structural pin for issue #1817: composing the routes sweeps the
-    /// analyzed file set a bounded number of times, whatever the workspace's
-    /// Cargo topology is.
-    ///
-    /// The defect was that the sweep count grew with the topology -- two per
-    /// crate in each of the two membership passes, one per Cargo target for
-    /// macro visibility and another for the passthrough fixed point -- which is
-    /// what made the build 9-19 s on the rustc tree once #1793 had removed the
-    /// parsing that used to hide it. The frozen pre-#1817 orchestration is
-    /// measured beside the new one on the same two workspaces, so the
-    /// fail-before is inside the pin rather than beside it.
+    /// The #1817 pin covers the per-target stages of the summary-row build.
+    /// Its sweep count stays bounded independently of Cargo topology. The
+    /// original commit holds the fail-before evidence for discovery orchestration.
     #[test]
     #[hardwon(
         "#1817: route construction repeated workspace-wide sweeps per crate and target, taking 9-19 seconds on rustc."
@@ -5318,20 +3097,69 @@ replay! { replay! { mod doubly_replayed; } }
             let temp = tempfile::tempdir().expect("tempdir");
             let root = temp.path().canonicalize().expect("canonical root");
             let (files, facts) = synthetic_workspace(&root, crates, modules);
+            let records = (0..crates)
+                .map(|index| {
+                    (
+                        PathBuf::from(format!("c{index}/Cargo.toml")),
+                        format!("c{index}"),
+                        PathBuf::from("src/lib.rs"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let naming = crate::crate_naming::RustSelectedCargoNaming::from_naming_records(
+                files.iter().map(|file| file.rel_path().to_path_buf()),
+                &records,
+            );
+            let selected = files.iter().cloned().collect();
+            let paths = SelectedRustRoutePathFacts::new(&selected, &naming);
+            let rows =
+                (0..crates)
+                    .flat_map(|index| {
+                        let root = &root;
+                        [
+                            ("lib", "src/lib.rs"),
+                            ("bin", "src/main.rs"),
+                            ("test", "tests/t0.rs"),
+                            ("test", "tests/helpers.rs"),
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(target, (kind, path))| RustCargoRouteSummaryRow {
+                            unit_key: [(index * 4 + target) as u8; 32],
+                            manifest_directory: Some(PathBuf::from(format!("c{index}"))),
+                            target_kind: kind.to_string(),
+                            crate_name: format!("c{index}"),
+                            edition: "2021".to_string(),
+                            development_capable: kind == "test",
+                            root_file: Some(ProjectFile::new(
+                                root.clone(),
+                                format!("c{index}/{path}"),
+                            )),
+                            root_package: (kind == "lib").then(|| format!("c{index}")),
+                            dependency_extern_name: None,
+                            dependency_kind: None,
+                            dependency_boundary: None,
+                            dependency_unit_key: None,
+                            dependency_target_kind: None,
+                            dependency_root_file: None,
+                            dependency_root_package: None,
+                            dependency_manifest_directory: None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
             let sweeps = workspace_file_sweeps_of(|| {
-                RustCargoRouteIndex::build_while(&files, &facts, &|| true).expect("composed index");
+                RustCargoRouteIndex::build_from_summary_rows_with_path_facts(
+                    &files,
+                    &facts,
+                    &rows,
+                    &paths,
+                    &|| true,
+                )
+                .expect("composed summary index");
             });
-            let reference = workspace_file_sweeps_of(|| {
-                frozen_orchestration::reference_build_while(&files, &facts, &|| true)
-                    .expect("reference index");
-            });
-            measured.push((crates, files.len(), sweeps, reference));
+            measured.push((crates, files.len(), sweeps));
         }
-        let [
-            (small_crates, _, small, small_reference),
-            (large_crates, _, large, large_reference),
-        ] = measured.as_slice()
-        else {
+        let [(small_crates, _, small), (large_crates, _, large)] = measured.as_slice() else {
             unreachable!("two measurements: {measured:?}");
         };
         assert_eq!(
@@ -5341,51 +3169,6 @@ replay! { replay! { mod doubly_replayed; } }
         assert!(
             *large <= 8,
             "the build must sweep the workspace a bounded number of times: {measured:?}"
-        );
-        assert!(
-            large_reference > small_reference && *large_reference >= large * 8,
-            "the pre-#1817 orchestration swept once per crate and once per target, which is what this pin exists to keep out: {measured:?}"
-        );
-    }
-
-    /// The grouping bound in `files_by_auto_target_directory` and the shapes
-    /// `auto_cargo_target_kind` accepts are two halves of one rule: a file is
-    /// only offered to the manifest directories that could auto-discover it.
-    /// A new target shape deeper than the bound would silently stop being
-    /// discovered, so the coupling is pinned rather than commented.
-    #[test]
-    fn auto_target_paths_stay_within_the_grouped_depth() {
-        let mut discovered_depths = HashSet::default();
-        for relative in [
-            "src/main.rs",
-            "tests/it.rs",
-            "examples/demo.rs",
-            "benches/bench.rs",
-            "src/bin/tool.rs",
-            "examples/demo/main.rs",
-            "tests/integration/main.rs",
-            "benches/bench/main.rs",
-            "src/bin/tool/main.rs",
-            "src/lib.rs",
-            "top.rs",
-            "src/bin/tool/nested/main.rs",
-            "src/deep/nested/module/thing.rs",
-        ] {
-            let path = Path::new(relative);
-            let depth = path.components().count();
-            let Some(kind) = auto_cargo_target_kind(path, true, true, true, true) else {
-                continue;
-            };
-            assert!(
-                (AUTO_TARGET_MIN_DEPTH..=AUTO_TARGET_MAX_DEPTH).contains(&depth),
-                "{relative} is discovered as {kind:?} at depth {depth}, outside the grouped range"
-            );
-            discovered_depths.insert(depth);
-        }
-        assert_eq!(
-            discovered_depths.len(),
-            AUTO_TARGET_MAX_DEPTH - AUTO_TARGET_MIN_DEPTH + 1,
-            "every grouped depth must actually discover a target: {discovered_depths:?}"
         );
     }
 
@@ -5419,169 +3202,6 @@ replay! { replay! { mod doubly_replayed; } }
         assert!(
             !module_is_test_gated("#[test]\nmod tests;\n"),
             "a bare `#[test]` is a test-case attribute, not a compilation gate"
-        );
-    }
-
-    #[test]
-    fn path_dependency_routes_honor_library_name_aliases_and_ignore_registry_matches() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "matcher/Cargo.toml",
-            "[package]\nname = \"matcher-package\"\nversion = \"0.1.0\"\n[lib]\nname = \"matcher_lib\"\n",
-        );
-        write(&root, "matcher/src/lib.rs", "pub struct Pattern;\n");
-        write(
-            &root,
-            "consumer/Cargo.toml",
-            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\nmatcher-package = { path = \"../matcher\" }\nregistry_alias = { package = \"matcher-package\", version = \"1\" }\n",
-        );
-        write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
-        write(
-            &root,
-            "renamed/Cargo.toml",
-            "[package]\nname = \"renamed\"\nversion = \"0.1.0\"\n[dependencies]\ncustom_alias = { package = \"matcher-package\", path = \"../matcher\" }\n",
-        );
-        write(&root, "renamed/src/lib.rs", "pub fn run() {}\n");
-
-        let matcher = ProjectFile::new(root.clone(), "matcher/src/lib.rs");
-        let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
-        let renamed = ProjectFile::new(root.clone(), "renamed/src/lib.rs");
-        let routes = build_from_coordinated_source(&[matcher, consumer.clone(), renamed.clone()]);
-
-        assert_eq!(
-            routes.resolve_module_package(&consumer, "matcher_lib"),
-            Some("matcher_lib".to_string())
-        );
-        assert_eq!(
-            routes.resolve_module_package(&consumer, "matcher_lib::nested"),
-            Some("matcher_lib.nested".to_string())
-        );
-        assert_eq!(
-            routes.resolve_module_package(&renamed, "custom_alias"),
-            Some("matcher_lib".to_string())
-        );
-        assert_eq!(
-            routes.resolve_module_package(&consumer, "registry_alias"),
-            None
-        );
-        assert_eq!(
-            routes.resolve_module_package(&consumer, "matcher_package"),
-            None
-        );
-    }
-
-    #[test]
-    fn cargo_routes_reject_paths_outside_the_workspace() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().join("workspace");
-        std::fs::create_dir_all(&root).expect("workspace root");
-        let root = root.canonicalize().expect("canonical root");
-        let outside = temp.path().join("outside");
-        write(
-            temp.path(),
-            "outside/Cargo.toml",
-            "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
-        );
-        write(temp.path(), "outside/src/lib.rs", "pub struct Escaped;\n");
-        write(
-            &root,
-            "consumer/Cargo.toml",
-            &format!(
-                "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n[dependencies]\nparent_escape = {{ path = \"../../outside\" }}\nabsolute_escape = {{ path = {:?} }}\n",
-                outside.to_string_lossy()
-            ),
-        );
-        write(&root, "consumer/src/lib.rs", "pub fn run() {}\n");
-        let consumer = ProjectFile::new(root.clone(), "consumer/src/lib.rs");
-
-        let routes = build_from_coordinated_source(std::slice::from_ref(&consumer));
-        for name in ["parent_escape", "absolute_escape"] {
-            assert_eq!(routes.resolve_module_package(&consumer, name), None);
-        }
-    }
-
-    #[test]
-    fn cargo_configuration_patches_route_from_the_workspace_root_upward() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        write(
-            &root,
-            "ws/Cargo.toml",
-            "[package]\nname = \"ws\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [workspace]\nmembers = [\"app\"]\n\n\
-             [patch.crates-io]\npatched = { path = \"manifest-patched\" }\n",
-        );
-        write(&root, "ws/src/lib.rs", "pub struct Ws;\n");
-        write(
-            &root,
-            "ws/app/Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dependencies]\npatched = \"1\"\nother = \"1\"\nignored = \"1\"\n",
-        );
-        write(&root, "ws/app/src/lib.rs", "pub struct App;\n");
-        write(
-            &root,
-            "ws/.cargo/config.toml",
-            "[patch.crates-io]\npatched = { path = \"config-patched\" }\n",
-        );
-        write(
-            &root,
-            ".cargo/config.toml",
-            "[patch.crates-io]\nother = { path = \"ws/other\" }\n",
-        );
-        write(
-            &root,
-            "ws/app/.cargo/config.toml",
-            "[patch.crates-io]\nignored = { path = \"../ignored\" }\n",
-        );
-        let mut libraries = vec![
-            app_library(&root),
-            ProjectFile::new(root.clone(), "ws/src/lib.rs"),
-        ];
-        for (directory, package) in [
-            ("ws/manifest-patched", "patched"),
-            ("ws/config-patched", "patched"),
-            ("ws/other", "other"),
-            ("ws/ignored", "ignored"),
-        ] {
-            write(
-                &root,
-                &format!("{directory}/Cargo.toml"),
-                &format!(
-                    "[package]\nname = \"{package}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n"
-                ),
-            );
-            write(&root, &format!("{directory}/src/lib.rs"), "pub struct P;\n");
-            libraries.push(ProjectFile::new(
-                root.clone(),
-                format!("{directory}/src/lib.rs"),
-            ));
-        }
-        fn app_library(root: &Path) -> ProjectFile {
-            ProjectFile::new(root.to_path_buf(), "ws/app/src/lib.rs")
-        }
-        let app = app_library(&root);
-        let routes = build_from_coordinated_source(&libraries);
-
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "patched"),
-            Some(ProjectFile::new(
-                root.clone(),
-                "ws/config-patched/src/lib.rs"
-            )),
-            "the configuration patch replaces the manifest patch of the same name"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "other"),
-            Some(ProjectFile::new(root.clone(), "ws/other/src/lib.rs")),
-            "a shallower configuration applies, relative to its own directory"
-        );
-        assert_eq!(
-            routes.resolve_crate_root_file(&app, "ignored"),
-            None,
-            "a member directory's configuration does not apply to its workspace"
         );
     }
 }

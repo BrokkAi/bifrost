@@ -179,6 +179,7 @@ class Target {
         let (external_start, external_end) =
             token_range(SOURCE, "    External external()", "External");
         let row = |start_byte, end_byte, enclosing, target| ReferenceEdgeRow {
+            dispatch_extensibility: None,
             site: EdgeSite {
                 file: file.clone(),
                 range: Range {
@@ -191,7 +192,9 @@ class Target {
                 enclosing: Some(enclosing),
             },
             target,
-            reference_kind: Some(ReferenceKind::TypeReference),
+            reference_kind: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(
+                Some(ReferenceKind::TypeReference),
+            ),
             proof: UsageProof::Proven,
             ambiguous_candidate: false,
             usage_kind: UsageHitKind::Reference,

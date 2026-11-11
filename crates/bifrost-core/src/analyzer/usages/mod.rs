@@ -11,6 +11,7 @@
 //! file fan-out and declaration indexing) stay in `brokk-bifrost-analysis`,
 //! which re-exports every module here at its historical path.
 
+pub mod accumulator;
 pub mod common;
 pub mod graph_core;
 pub mod inverted_edges;

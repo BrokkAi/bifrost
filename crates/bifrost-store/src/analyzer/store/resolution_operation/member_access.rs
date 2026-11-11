@@ -52,6 +52,7 @@ pub(super) enum MemberBinding {
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct AccessFacts {
+    pub(super) member_owner: Option<crate::analyzer::resolution::fact_resolution::FactMemberOwner>,
     pub(super) ordered_range: Option<AccessOrderedRange>,
     pub(super) alternative: AccessAlternativeId,
     pub(super) group: AccessGroupId,
@@ -144,6 +145,7 @@ pub struct MemberAccessContext<'a> {
 }
 #[derive(Debug)]
 pub(crate) struct MemberAccessEvidence {
+    pub(crate) member_owners: Vec<crate::analyzer::resolution::fact_resolution::FactMemberOwner>,
     pub(super) bindings: Vec<(AccessCandidateId, MemberBinding)>,
     pub(super) certificates: Vec<MemberAccessCertificate>,
     pub(super) range_certificates: Vec<MemberAccessRangeCertificate>,
@@ -154,6 +156,8 @@ pub(crate) struct MemberAccessResult {
     pub targets: Vec<SelectedMemberRouteTarget>,
     pub evidence: MemberAccessEvidence,
     pub completion: ResolutionCompletion,
+    /// Every owner in the complete selected order had a complete empty member inventory.
+    pub(crate) missing_member: bool,
 }
 impl MemberAccessResult {
     /// Typed consumers retain the access proof separately from binding targets.
@@ -715,7 +719,9 @@ pub(super) fn reduce_member_access(
             value: value.finish(rows),
             completion,
         }),
-        Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+        Read::Cancelled(completion) => Ok(Read::Cancelled(
+            completion.combine(&context.selection.completion),
+        )),
         Read::Unavailable { reason, completion } => Ok(Read::Unavailable { reason, completion }),
     }
 }
@@ -726,13 +732,18 @@ struct MemberAccessReduction {
     range_certificates: Vec<MemberAccessRangeCertificate>,
     outcome: AccessOutcome,
     completion: ResolutionCompletion,
+    missing_member: bool,
 }
 impl MemberAccessReduction {
     fn finish(self, rows: Vec<ProjectedAccessRow>) -> MemberAccessResult {
         let mut targets = Vec::new();
         let mut bindings = Vec::new();
+        let mut member_owners = Vec::new();
         for (keep, row) in self.retained.into_iter().zip(rows) {
             if keep {
+                if let Some(owner) = row.facts.member_owner {
+                    member_owners.push(owner);
+                }
                 bindings.push((row.id, row.facts.binding));
                 if let Some(target) = row.target {
                     targets.push(target);
@@ -743,12 +754,14 @@ impl MemberAccessReduction {
             query_obligations: crate::analyzer::resolution::QueryObligations::empty(),
             targets,
             evidence: MemberAccessEvidence {
+                member_owners,
                 bindings,
                 certificates: self.certificates,
                 range_certificates: self.range_certificates,
                 outcome: self.outcome,
             },
             completion: self.completion,
+            missing_member: self.missing_member,
         }
     }
 }
@@ -764,16 +777,40 @@ fn select_member_access(
     for row in rows {
         completion = completion.combine(&row.facts.completion);
     }
+    let raw_completion = completion.clone();
+    let cancelled = |read: ResolutionCompletion| {
+        Read::<MemberAccessReduction>::Cancelled(read.combine(&raw_completion))
+    };
+    // Exact owner/lookup attribution survives intermediate completion boxes.
+    // Defer only those registered presence operands; all other evidence stays.
+    let Some((unconditional, member_presence)) = context
+        .provenance
+        .partition_member_presence_completion(&completion, context.lookup, &mut || {
+            !closer_step(session, cancellation, CloserWork::CandidateClassification)
+        })
+    else {
+        return Ok(cancelled(completion));
+    };
+    completion = unconditional;
+    let Some((observed_unconditional, _)) = context
+        .provenance
+        .partition_member_presence_completion(observed, context.lookup, &mut || {
+            !closer_step(session, cancellation, CloserWork::CandidateClassification)
+        })
+    else {
+        return Ok(cancelled(completion));
+    };
     let mut retained = vec![true; rows.len()];
     let mut certificates = Vec::new();
-    let mut open = context.selection.order.is_none_or(|order| {
-        let status = context.provenance.order_status(order);
-        !status.complete
-            || status.required_base.is_some()
-            || *status.completion != ResolutionCompletion::Complete
-    });
+    let mut open = !context.selection.own_dictionary
+        && context.selection.order.is_none_or(|order| {
+            let status = context.provenance.order_status(order);
+            !status.complete
+                || status.required_base.is_some()
+                || *status.completion != ResolutionCompletion::Complete
+        });
     let mut range_certificates = Vec::new();
-    if observed == &ResolutionCompletion::Complete {
+    if observed_unconditional == ResolutionCompletion::Complete {
         for (slot, row) in rows.iter().enumerate() {
             let Some(range) = row.facts.ordered_range else {
                 continue;
@@ -781,7 +818,7 @@ fn select_member_access(
             let Some(coverage) = required_coverage(rows, row.facts.alternative, &mut || {
                 !closer_step(session, cancellation, CloserWork::CandidateClassification)
             }) else {
-                return Ok(Read::Cancelled(completion));
+                return Ok(cancelled(completion.combine(&context.selection.completion)));
             };
             let certificate = MemberAccessRangeCertificate {
                 range,
@@ -799,7 +836,7 @@ fn select_member_access(
                     retained[slot] = false;
                     range_certificates.push(certificate);
                 }
-                Read::Cancelled(read) => return Ok(Read::Cancelled(completion.combine(&read))),
+                Read::Cancelled(read) => return Ok(cancelled(completion.combine(&read))),
                 _ => {
                     // Being inside the range is ordinary applicability, not an
                     // exclusion failure. Other refusals must keep this row open.
@@ -830,7 +867,7 @@ fn select_member_access(
                             },
                         )?
                     {
-                        return Ok(Read::Cancelled(completion));
+                        return Ok(cancelled(completion.combine(&context.selection.completion)));
                     }
                     open |= !inside;
                 }
@@ -853,7 +890,7 @@ fn select_member_access(
                         continue;
                     }
                     if !closer_step(session, cancellation, CloserWork::CandidateClassification) {
-                        return Ok(Read::Cancelled(completion));
+                        return Ok(cancelled(completion.combine(&context.selection.completion)));
                     }
                     let (lk, rk) = if within {
                         (&left.facts.within_group, &right.facts.within_group)
@@ -887,7 +924,7 @@ fn select_member_access(
                             )
                         })
                     else {
-                        return Ok(Read::Cancelled(completion));
+                        return Ok(cancelled(completion.combine(&context.selection.completion)));
                     };
                     let certificate = MemberAccessCertificate {
                         order,
@@ -917,7 +954,7 @@ fn select_member_access(
                             break;
                         }
                         Read::Cancelled(read) => {
-                            return Ok(Read::Cancelled(completion.combine(&read)));
+                            return Ok(cancelled(completion.combine(&read)));
                         }
                         _ => open = true,
                     }
@@ -933,12 +970,121 @@ fn select_member_access(
             brokk_bifrost_core::analyzer::usages::resolution_session::BoundedResolution::Complete { .. }
         )
     {
-        return Ok(Read::Cancelled(completion));
+        return Ok(cancelled(completion.combine(&context.selection.completion)));
+    }
+    // Presence in a later intrinsic dictionary cannot compete with a closed,
+    // unconditional earlier entry. Retain the exact obligation unless every
+    // occurrence in the selected order has such a winner. Other evidence is
+    // never removed from the completion box.
+    for (owner, obligation) in &member_presence {
+        let mut discharged = false;
+        if completion == ResolutionCompletion::Complete
+            && !open
+            && let Some(order) = context.selection.order
+        {
+            let mut entries = Vec::new();
+            if !context.provenance.visit_order(
+                order,
+                &mut || !closer_step(session, cancellation, CloserWork::CandidateClassification),
+                &mut |entry| {
+                    entries.push((entry.root, entry.owner));
+                    Ok(())
+                },
+            )? {
+                return Ok(cancelled(completion.combine(obligation)));
+            }
+            let mut occurrences = 0;
+            discharged = true;
+            for &(root, current) in &entries {
+                if current != *owner {
+                    continue;
+                }
+                occurrences += 1;
+                let mut winner = false;
+                for (slot, row) in rows.iter().enumerate() {
+                    if !retained[slot]
+                        || row.target.is_none()
+                        || matches!(row.facts.binding, MemberBinding::Unknown)
+                        || row.facts.completion != ResolutionCompletion::Complete
+                    {
+                        continue;
+                    }
+                    let mut earlier = false;
+                    for key in row
+                        .facts
+                        .within_group
+                        .iter()
+                        .chain(row.facts.between_groups.iter())
+                    {
+                        if let AccessKey::Owner {
+                            order: candidate_order,
+                            root: candidate_root,
+                            ..
+                        } = key
+                            && *candidate_order == order
+                            && *candidate_root == root
+                        {
+                            earlier |= compare_keys(
+                                context.provenance,
+                                std::slice::from_ref(key),
+                                &[AccessKey::Owner {
+                                    order,
+                                    root,
+                                    owner: *owner,
+                                }],
+                                &mut || {
+                                    !closer_step(
+                                        session,
+                                        cancellation,
+                                        CloserWork::CandidateClassification,
+                                    )
+                                },
+                            )? == Some(Ordering::Less);
+                        }
+                    }
+                    if !earlier {
+                        continue;
+                    }
+                    let Some(coverage) =
+                        required_coverage(rows, row.facts.alternative, &mut || {
+                            !closer_step(session, cancellation, CloserWork::CandidateClassification)
+                        })
+                    else {
+                        return Ok(cancelled(completion.combine(obligation)));
+                    };
+                    match validate_access_provider_inputs(
+                        context,
+                        rows,
+                        row.facts.alternative,
+                        &coverage,
+                        &[],
+                        cancellation,
+                    )? {
+                        Read::Ready {
+                            completion: ResolutionCompletion::Complete,
+                            ..
+                        } => {
+                            winner = true;
+                            break;
+                        }
+                        Read::Cancelled(read) => {
+                            return Ok(cancelled(completion.combine(obligation).combine(&read)));
+                        }
+                        _ => {}
+                    }
+                }
+                discharged &= winner;
+            }
+            discharged &= occurrences != 0;
+        }
+        if !discharged {
+            completion = completion.combine(obligation);
+        }
     }
     let mut target_keys = HashSet::default();
     for (keep, row) in retained.iter().zip(rows) {
         if !closer_step(session, cancellation, CloserWork::CandidateClassification) {
-            return Ok(Read::Cancelled(completion));
+            return Ok(cancelled(completion.combine(&context.selection.completion)));
         }
         if !keep {
             continue;
@@ -958,13 +1104,24 @@ fn select_member_access(
         }
     };
     if cancellation.is_cancelled() {
-        return Ok(Read::Cancelled(completion));
+        return Ok(cancelled(completion.combine(&context.selection.completion)));
     }
     Ok(Read::ready(MemberAccessReduction {
         retained,
         certificates,
         range_certificates,
         outcome,
+        missing_member: outcome == AccessOutcome::Empty
+            && rows.is_empty()
+            && completion == ResolutionCompletion::Complete
+            && context.selection.completion == ResolutionCompletion::Complete
+            && observed == &ResolutionCompletion::Complete
+            && context.selection.order.is_some_and(|order| {
+                let status = context.provenance.order_status(order);
+                status.complete
+                    && status.required_base.is_none()
+                    && *status.completion == ResolutionCompletion::Complete
+            }),
         completion,
     }))
 }
@@ -1061,15 +1218,20 @@ pub(super) fn poll_member_access<Row>(
 ) -> Result<Read<MemberAccessProgress>> {
     if !rows.order_completion_applied {
         rows.order_completion_applied = true;
-        if site.selection.completion == ResolutionCompletion::Complete
-            && site
-                .selection
-                .order
-                .is_some_and(|order| !site.provenance.order_status(order).complete)
-        {
-            rows.completion = rows.completion.combine(&ResolutionCompletion::incomplete([
-                ResolutionIncompleteReason::UnsupportedSemantic(site.reference),
-            ]));
+        if let Some(order) = site.selection.order {
+            let status = site.provenance.order_status(order);
+            if !status.complete || *status.completion != ResolutionCompletion::Complete {
+                let reason = if *status.completion == ResolutionCompletion::Complete
+                    && site.selection.completion == ResolutionCompletion::Complete
+                {
+                    ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::UnsupportedSemantic(site.reference),
+                    ])
+                } else {
+                    status.completion.clone()
+                };
+                rows.completion = rows.completion.combine(&reason);
+            }
         }
     }
     loop {
@@ -1151,7 +1313,11 @@ pub(super) fn poll_member_access<Row>(
                 value
             }
             Read::Cancelled(completion) => {
-                return Ok(Read::Cancelled(input.combine(&completion)));
+                return Ok(Read::Cancelled(
+                    input
+                        .combine(&completion)
+                        .combine(&site.selection.completion),
+                ));
             }
             Read::Unavailable { reason, completion } => {
                 return Ok(Read::Unavailable {
@@ -1237,6 +1403,8 @@ pub(super) struct QualifiedReferenceInputs {
         crate::analyzer::resolution::CloseContinuationId,
         DemandReferenceKey,
     )>,
+    // Preparation consumes selected identities. Consumers of a value/type
+    // projection still read that frontier's completion from the full reply.
     pub completion: ResolutionCompletion,
     query_obligations: crate::analyzer::resolution::QueryObligations,
 }
@@ -1262,6 +1430,13 @@ impl QualifiedReferenceInputs {
         self.answers
             .iter()
             .map(|(key, answer)| (*key, answer.as_ref()))
+    }
+    fn cancellation_completion(&self) -> ResolutionCompletion {
+        self.answers
+            .iter()
+            .fold(self.completion.clone(), |completion, (_, answer)| {
+                completion.combine(answer.completion())
+            })
     }
     pub fn poll(
         &mut self,
@@ -1291,11 +1466,13 @@ impl QualifiedReferenceInputs {
                 continuation.assert_current(provenance);
                 assert_eq!(self.keys[self.cursor], key);
                 self.query_obligations.union(&answer.query_obligations);
-                self.completion = self.completion.combine(answer.completion());
+                self.completion = self.completion.combine(answer.binding().completion());
                 let Some(answer) = answer.clone_with_poll(&mut || {
                     !closer_step(session, cancellation, CloserWork::CandidateClassification)
                 }) else {
-                    return Ok(CloseProgress::Cancelled(self.completion.clone()));
+                    return Ok(CloseProgress::Cancelled(
+                        self.cancellation_completion().combine(answer.completion()),
+                    ));
                 };
                 self.answers.push((key, Box::new(answer)));
                 self.cursor += 1;
@@ -1306,14 +1483,15 @@ impl QualifiedReferenceInputs {
         }
         if cancellation.is_cancelled() {
             return Ok(CloseProgress::Cancelled(
-                self.completion.combine(&cancelled_completion()),
+                self.cancellation_completion()
+                    .combine(&cancelled_completion()),
             ));
         }
         let Some(&key) = self.keys.get(self.cursor) else {
             return Ok(CloseProgress::Ready(()));
         };
         if !closer_step(session, cancellation, CloserWork::CandidateClassification) {
-            return Ok(CloseProgress::Cancelled(self.completion.clone()));
+            return Ok(CloseProgress::Cancelled(self.cancellation_completion()));
         }
         let continuation = CloseContinuationId::issue(provenance);
         self.outstanding = Some((continuation, key));
@@ -1772,6 +1950,60 @@ mod tests {
     fn id(name: &str) -> SemanticId {
         SemanticId::for_test(name)
     }
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#8704: a capped hierarchy order lost its budget reason in member access"
+    )]
+    fn capped_order_reason_reaches_member_access() {
+        let reason = ResolutionIncompleteReason::ReceiverBudgetExhausted(id("root"));
+        with_test_member_order(
+            Vec::new(),
+            |_| HierarchyOrderOutcome {
+                cursor_scope: None,
+                owners: Vec::new(),
+                complete: false,
+                required_base: None,
+                completion: ResolutionCompletion::incomplete([reason]),
+            },
+            |view, mut selection| {
+                selection.owners.clear();
+                let session = ResolutionSession::unbounded();
+                let site = MemberAccessSite {
+                    session: &session,
+                    selection: &selection,
+                    provenance: view,
+                    input_completion: &ResolutionCompletion::Complete,
+                    reference: id("reference"),
+                    lookup: id("lookup"),
+                    step: 0,
+                    namespace: ResolutionNamespace::Value,
+                };
+                let mut state = MemberAccessState::<u32>::new(&selection);
+                let read = poll_member_access(
+                    &mut state.rows,
+                    &site,
+                    &WaitingRules,
+                    &mut ProviderObservationStore::default(),
+                    &mut ResolutionCompletion::Complete,
+                    &mut ResolutionCompletion::Complete,
+                    &CancellationToken::new(),
+                    |_| unreachable!("capped order has no owners"),
+                    |_| unreachable!("capped order has no rows"),
+                    || Ok(Read::ready(Vec::new())),
+                )
+                .unwrap();
+                let completion = match read {
+                    Read::Ready {
+                        value: MemberAccessProgress::Ready(result),
+                        completion,
+                    } => result.completion.combine(&completion),
+                    Read::Unavailable { completion, .. } => completion,
+                    _ => panic!("member consumer returns a terminal incomplete answer"),
+                };
+                assert!(completion.contains_reason(reason));
+            },
+        );
+    }
     fn provider(owner: SemanticId) -> HierarchyProviderKey {
         HierarchyProviderKey::source(
             owner,
@@ -1853,6 +2085,7 @@ mod tests {
             },
             target: Some(target(slot)),
             facts: AccessFacts {
+                member_owner: None,
                 ordered_range: None,
                 alternative: AccessAlternativeId(id("receiver")),
                 group: AccessGroupId(group),
@@ -3271,6 +3504,7 @@ pub(crate) mod bridge_contract {
             let owner = self.rows[*index].0;
             let provider = self.provider(owner);
             Ok(AccessRowPoll::Ready(Read::ready(Box::new(AccessFacts {
+                member_owner: None,
                 ordered_range: None,
                 alternative: AccessAlternativeId(self.expected_root),
                 group: AccessGroupId(0),

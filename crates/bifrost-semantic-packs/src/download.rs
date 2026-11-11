@@ -900,22 +900,89 @@ struct CompatibilityV2 {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct QualificationV1 {
-    status: String,
+    status: QualificationStatusV1,
     evidence: Vec<String>,
+}
+
+/// A schema 1 release's single qualification axis. Deserialization rejects
+/// any other value, so a release cannot carry a status these rules ignore.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum QualificationStatusV1 {
+    Pending,
+    Unqualified,
+    Qualified,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct QualificationStateV2 {
-    status: String,
+struct QualificationStateV2<S> {
+    status: S,
     evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum IntegrityStatus {
+    Pending,
+    Verified,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BehaviorStatus {
+    Pending,
+    Limited,
+    Qualified,
+    Failed,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct QualificationV2 {
-    integrity: QualificationStateV2,
-    behavior: QualificationStateV2,
+    integrity: QualificationStateV2<IntegrityStatus>,
+    behavior: QualificationStateV2<BehaviorStatus>,
+}
+
+impl IntegrityStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Verified => "verified",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl BehaviorStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Limited => "limited",
+            Self::Qualified => "qualified",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl QualificationV2 {
+    /// Selectable: neither axis failed and integrity is verified. Behavior may
+    /// still be pending or limited; such a release is compatible but not
+    /// fully qualified (see [`Self::fully_qualified`]).
+    fn eligibility(&self) -> QualificationEligibility {
+        match (self.integrity.status, self.behavior.status) {
+            (IntegrityStatus::Failed, _) => QualificationEligibility::IntegrityFailed,
+            (_, BehaviorStatus::Failed) => QualificationEligibility::BehaviorFailed,
+            (IntegrityStatus::Pending, _) => QualificationEligibility::Pending,
+            (IntegrityStatus::Verified, _) => QualificationEligibility::Eligible,
+        }
+    }
+
+    fn fully_qualified(&self) -> bool {
+        self.integrity.status == IntegrityStatus::Verified
+            && self.behavior.status == BehaviorStatus::Qualified
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1478,6 +1545,15 @@ pub fn prepare_open_packs_for_runtime(
         &transport,
         legacy_source.as_ref(),
     )
+}
+
+/// The `semantic_cache_root` that [`prepare_open_packs_for_runtime`] reports
+/// on selection, computed without a network request, so a host can fix the
+/// catalog location before it acquires packs in the background (#11030).
+pub fn open_pack_runtime_semantic_cache_root() -> Result<PathBuf, OpenPackError> {
+    let request = default_pack_request()?;
+    let base = resolve_absolute(default_cache_root()?)?;
+    Ok(request_cache_root(&base, &request)?.join(CACHE_CATALOG_DIRECTORY))
 }
 
 fn validate_token(token: Option<&str>) -> Result<(), OpenPackError> {
@@ -3087,12 +3163,7 @@ fn validate_release_manifest(
         &manifest.qualification_v2,
     ) {
         (1, Some(qualification), None) => {
-            if !["pending", "unqualified", "qualified"].contains(&qualification.status.as_str()) {
-                return Err(OpenPackError::manifest(
-                    "schema 1 release has an unsupported qualification status",
-                ));
-            }
-            if qualification.status == "qualified"
+            if qualification.status == QualificationStatusV1::Qualified
                 && (qualification.evidence.is_empty()
                     || !manifest.artifacts.iter().any(|artifact| {
                         matches!(artifact.role, ArtifactRole::Policy | ArtifactRole::Native)
@@ -3104,25 +3175,23 @@ fn validate_release_manifest(
             }
         }
         (2 | 3, None, Some(qualification)) => {
-            let integrity_status = qualification.integrity.status.as_str();
-            let behavior_status = qualification.behavior.status.as_str();
-            if !["pending", "verified", "failed"].contains(&integrity_status)
-                || !["pending", "limited", "qualified", "failed"].contains(&behavior_status)
-            {
-                return Err(OpenPackError::manifest(
-                    "schema 2 release has an unsupported qualification status",
-                ));
-            }
-            for (axis, state) in [
-                ("integrity", &qualification.integrity),
-                ("behavior", &qualification.behavior),
+            for (axis, pending, status, evidence) in [
+                (
+                    "integrity",
+                    qualification.integrity.status == IntegrityStatus::Pending,
+                    qualification.integrity.status.as_str(),
+                    &qualification.integrity.evidence,
+                ),
+                (
+                    "behavior",
+                    qualification.behavior.status == BehaviorStatus::Pending,
+                    qualification.behavior.status.as_str(),
+                    &qualification.behavior.evidence,
+                ),
             ] {
-                if state.status != "pending"
-                    && !state.evidence.iter().any(|entry| !entry.trim().is_empty())
-                {
+                if !pending && !evidence.iter().any(|entry| !entry.trim().is_empty()) {
                     return Err(OpenPackError::manifest(format!(
-                        "schema 2 {axis} qualification status {} requires nonblank evidence",
-                        state.status
+                        "schema 2 {axis} qualification status {status} requires nonblank evidence"
                     )));
                 }
             }
@@ -3551,25 +3620,17 @@ enum QualificationEligibility {
 
 fn qualification_eligibility(manifest: &PackRelease) -> QualificationEligibility {
     if let Some(qualification) = &manifest.qualification_v1 {
-        return if qualification.status == "qualified" {
+        return if qualification.status == QualificationStatusV1::Qualified {
             QualificationEligibility::Eligible
         } else {
             QualificationEligibility::Pending
         };
     }
-    let qualification = manifest
+    manifest
         .qualification_v2
         .as_ref()
-        .expect("validated schema 2 release has schema 2 qualification");
-    if qualification.integrity.status == "failed" {
-        QualificationEligibility::IntegrityFailed
-    } else if qualification.behavior.status == "failed" {
-        QualificationEligibility::BehaviorFailed
-    } else if qualification.integrity.status == "pending" {
-        QualificationEligibility::Pending
-    } else {
-        QualificationEligibility::Eligible
-    }
+        .expect("validated schema 2 release has schema 2 qualification")
+        .eligibility()
 }
 
 #[derive(Debug)]
@@ -4155,14 +4216,11 @@ fn build_receipt(selection: &SelectionContext<'_>) -> Result<Value, OpenPackErro
     let fully_qualified = selected.iter().all(|index| {
         let manifest = &inventory.releases[*index].manifest;
         match &manifest.qualification_v1 {
-            Some(qualification) => qualification.status == "qualified",
+            Some(qualification) => qualification.status == QualificationStatusV1::Qualified,
             None => manifest
                 .qualification_v2
                 .as_ref()
-                .is_some_and(|qualification| {
-                    qualification.integrity.status == "verified"
-                        && qualification.behavior.status == "qualified"
-                }),
+                .is_some_and(QualificationV2::fully_qualified),
         }
     });
     let profile_value = serde_json::to_value(profile)
@@ -4930,7 +4988,12 @@ fn hash_copy(
             })?;
         }
     }
-    Ok((total, format!("{:x}", hasher.finalize())))
+    Ok((
+        total,
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        ),
+    ))
 }
 
 fn verify_manifest_contents(manifest: &PackRelease, root: &Path) -> Result<(), OpenPackError> {
@@ -5091,11 +5154,17 @@ fn hash_file(path: &Path) -> Result<String, OpenPackError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        ),
+    )
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+        &Sha256::digest(bytes).into(),
+    )
 }
 
 fn write_atomic_noclobber(path: &Path, bytes: &[u8]) -> Result<(), OpenPackError> {
@@ -6260,7 +6329,7 @@ mod tests {
             .qualification_v1
             .as_mut()
             .expect("schema 1 qualification")
-            .status = "pending".to_owned();
+            .status = QualificationStatusV1::Pending;
         assert!(
             qualification_eligibility(&pending_historical) == QualificationEligibility::Pending
         );

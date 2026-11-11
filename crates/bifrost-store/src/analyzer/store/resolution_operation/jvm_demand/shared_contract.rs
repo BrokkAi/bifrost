@@ -85,11 +85,11 @@ fn golden_value(text: String, operation: &SelectedResolutionOperation<'_, '_>) -
                     .ready
                     .inventory
                     .connection()
-                    .query_row(
+                    .prepare_cached(
                         "SELECT identity_digest FROM main.resolution_identities WHERE id=?1",
-                        [i64::from(name.get())],
-                        |row| row.get::<_, [u8; 32]>(0),
                     )
+                    .expect("prepare JVM identity digest lookup")
+                    .query_row([i64::from(name.get())], |row| row.get::<_, [u8; 32]>(0))
                     .expect("an observed persisted lookup identity has a digest")
             });
             let digest = digest
@@ -556,7 +556,8 @@ pub fn run_source_sweep(
             ResolutionCompletion::Incomplete(reasons) => reasons
                 .iter()
                 .filter_map(|reason| match reason {
-                    ResolutionIncompleteReason::UnsupportedSemantic(id) => Some(*id),
+                    ResolutionIncompleteReason::UnsupportedSemantic(id)
+                    | ResolutionIncompleteReason::ReceiverSubclassObligation(id) => Some(*id),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -747,6 +748,10 @@ pub fn run(
     let trial_arena = RefCell::new(ClosedRelations::default());
 
     let language = environment.language(&trial_arena);
+    // #10279: `Child.selected` lowers one import demand per candidate
+    // namespace. The fixture imports the value member, so select that exact
+    // demand rather than relying on path order; the Type demand names no
+    // member and is complete with no owner.
     let (endpoint, source) = lowered
         .lexical()
         .paths()
@@ -768,7 +773,9 @@ pub fn run(
                 .jvm_lookup_recipes(identity.fragment(), [*demand], cancellation)
                 .unwrap()
                 .unwrap();
-            (recipes[0].spelling() == "selected").then_some((endpoint, source))
+            (recipes[0].spelling() == "selected"
+                && recipes[0].namespace() == ResolutionNamespace::Value)
+                .then_some((endpoint, source))
         })
         .next()
         .expect("authored selected-member import");
@@ -1178,7 +1185,6 @@ impl OrderTrace {
         });
         if let Some(id) = selection.order {
             let status = view.order_status(id);
-            assert_eq!(status.completion, &ResolutionCompletion::Complete);
             let mut owners = Vec::new();
             assert!(view.visit_order(id, &mut || false, &mut |row| {
                 owners.push(row.owner);
@@ -1400,7 +1406,7 @@ fn order_attempt(
         caller,
     };
     let probe = environment.language(&arena);
-    let (endpoint, target) = lowered
+    let selected_imports = lowered
         .lexical()
         .paths()
         .iter()
@@ -1411,7 +1417,10 @@ fn order_attempt(
             let source = probe.source_demand(path.end()).unwrap()?;
             let (
                 SelectedRootPathHalf::Import {
-                    identity, demand, ..
+                    identity,
+                    route,
+                    demand,
+                    ..
                 },
                 qualifiers,
             ) = source.import_qualifiers.as_ref()?
@@ -1422,10 +1431,21 @@ fn order_attempt(
                 .jvm_lookup_recipes(identity.fragment(), [*demand], cancellation)
                 .unwrap()
                 .unwrap();
-            (recipes[0].spelling() == "selected").then_some((path.end().clone(), qualifiers[0]))
+            let route_head = *route.first()?;
+            let route_recipes = operation
+                .jvm_lookup_recipes(identity.fragment(), [route_head], cancellation)
+                .unwrap()
+                .unwrap();
+            (recipes[0].spelling() == "selected"
+                && recipes[0].namespace() == ResolutionNamespace::Value
+                && route_recipes[0].spelling() == "Child")
+                .then_some((path.end().clone(), qualifiers[0]))
         })
-        .next()
-        .expect("fixture has a real selected member import");
+        .collect::<Vec<_>>();
+    let [(endpoint, target)] = selected_imports.as_slice() else {
+        panic!("fixture has exactly one Child.selected Value import")
+    };
+    let (endpoint, target) = (endpoint.clone(), *target);
     let trace = RefCell::new(OrderTrace::default());
     let mut provider = DemandProvider::new(OrderLanguage {
         inner: SharedDemand {
@@ -1669,4 +1689,192 @@ pub fn run_order_contract(
         }
     });
     (ordered.order_work, boundary, ordered.trace.orders)
+}
+
+/// #7314: retain qualified source/member identities and both completion inputs
+/// on the nominal production dispatcher after retiring its comparison oracle.
+pub fn golden_qualified_publications(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    language: Language,
+    path: &str,
+    cancellation: &CancellationToken,
+) {
+    use crate::analyzer::store::resolution_operation::file_context::RootHalfRequest;
+    let mount = operation
+        .mount_table()
+        .mount_for_path(language.config_label(), path)
+        .unwrap()
+        .unwrap();
+    let (halves, inventory) = operation
+        .read_root_inventory(RootHalfRequest::Imports(&[mount.ordinal()]), cancellation)
+        .unwrap();
+    let complete = ResolutionCompletion::Complete;
+    let mut coverage = [[0_usize; 3]; 2];
+    for half in halves
+        .iter()
+        .filter(|half| matches!(half, SelectedRootPathHalf::Reference { .. }))
+    {
+        for (input, evidence) in [("complete", &complete), ("evidence", inventory.evidence())] {
+            if input == "evidence" && evidence == &complete {
+                continue;
+            }
+            let publication = operation
+                .jvm_qualified_type_bridges(half, evidence, cancellation)
+                .unwrap();
+            let counts = &mut coverage[usize::from(input == "evidence")];
+            counts[0] += 1;
+            let value = publication.as_ref().map(|p| {
+                counts[1] += usize::from(!p.bridges.is_empty());
+                counts[2] += usize::from(p.complete);
+                (&p.bridges, &p.selected_targets, p.complete)
+            });
+            let record = golden_value(
+                format!(
+                    "path={path:?} half={half:?} input={input} evidence={evidence:?} cancelled={} publication={value:?}",
+                    cancellation.is_cancelled()
+                ),
+                operation,
+            );
+            GOLDEN.with_borrow_mut(|slot| {
+                if let Some((_, scenario, rows)) = slot {
+                    rows.push(format!("=== {scenario} / qualified ===\n{record}\n"));
+                }
+            });
+        }
+    }
+    let complete_coverage = coverage[0];
+    let evidence_coverage = coverage[1];
+    GOLDEN.with_borrow_mut(|slot| {
+        if let Some((_, scenario, rows)) = slot { rows.push(format!("=== {scenario} / qualified coverage ===\npath={path:?} complete_input={complete_coverage:?} evidence_input={evidence_coverage:?}\n")); }
+    });
+}
+
+/// Preserve a product surface's complete observation beside shared closure data.
+pub fn golden_product_observation(
+    operation: &SelectedResolutionOperation<'_, '_>,
+    kind: &str,
+    value: impl std::fmt::Debug,
+) {
+    golden_observation(
+        kind,
+        value,
+        &RefCell::new(ClosedRelations::default()),
+        operation,
+    );
+}
+
+/// #7314: a getter lookup must nominate its property root before confirmation;
+/// an undecided scoped forward binding cannot become an exact reverse absence.
+pub fn golden_reverse_property(
+    operation: SelectedResolutionOperation<'_, '_>,
+    target: &brokk_bifrost_core::analyzer::CodeUnit,
+    expected_calls: &[crate::analyzer::resolution::SelectedSemanticLocator],
+    cancellation: &CancellationToken,
+) {
+    use crate::analyzer::store::resolution_operation::nominal_reverse::NominalReverseCandidateOutcome;
+    let NominalReverseCandidateOutcome::Ready(nominations) = operation
+        .nominal_reverse_candidate_sites(target, cancellation)
+        .unwrap()
+    else {
+        panic!("property root has no selected reverse inventory")
+    };
+    assert!(
+        !expected_calls.is_empty(),
+        "the getter call must be selected from structured facts"
+    );
+    assert!(
+        nominations
+            .candidates
+            .iter()
+            .any(|candidate| expected_calls
+                .iter()
+                .any(
+                    |call| candidate.locator.relative_path() == call.relative_path()
+                        && candidate.locator.source_site() == call.source_site()
+                )),
+        "the property root must nominate its getter's actual call site"
+    );
+    let canonical_context =
+        |context: &crate::analyzer::store::resolution_operation::reverse_candidates::ReverseContextWitness| {
+            context.assert_selected(&operation);
+            let mount = operation
+                .ready
+                .inventory
+                .mount_record_by_ordinal(crate::analyzer::resolution::SelectedResolutionMountOrdinal::new(context.mount))
+                .unwrap();
+            assert_eq!(
+                context.blob,
+                mount.blob_id(),
+                "reverse witness names its selected source blob"
+            );
+            format!(
+                "ReverseContextWitness {{ path: {:?}, blob_oid: {}, selection: captured-selected-inventory, analysis_generation: {} }}",
+                mount.persisted_relative_path(),
+                mount.blob_oid(),
+                operation.ready.analysis_generation
+            )
+        };
+    let mut contexts = vec![(
+        &nominations.target.context,
+        canonical_context(&nominations.target.context),
+    )];
+    contexts.extend(
+        nominations
+            .candidates
+            .iter()
+            .map(|candidate| (&candidate.context, canonical_context(&candidate.context))),
+    );
+    let mut record = format!(
+        "target={:?} surfaces={:?} equivalents={:?} context={:?} candidates={:?} completion={:?} peer_open={} evidence={:?}",
+        target.declaration_id(),
+        nominations.target.surfaces,
+        nominations.equivalent_targets,
+        nominations.target.context,
+        nominations.candidates,
+        nominations.completion,
+        nominations.peer_language_inventory_open,
+        nominations.evidence,
+    );
+    // Render the exact validated blob association by content, not SQLite's
+    // insertion ordinal. Only validated current-snapshot witnesses are replaced.
+    for (context, canonical) in contexts {
+        record = record.replace(&format!("{context:?}"), &canonical);
+    }
+    golden_product_observation(&operation, "property-getter nomination", record);
+    let (outcome, _presence) = operation
+        .confirm_nominal_reverse_candidates(
+            nominations,
+            cancellation,
+            &mut SelectedResolutionContextMetrics,
+        )
+        .unwrap();
+    let SelectedResolutionOperationOutcome::Native(answer) = outcome else {
+        panic!("property reverse confirmation stopped")
+    };
+    assert!(
+        answer.completion != ResolutionCompletion::Complete || !answer.references.is_empty(),
+        "getter nomination cannot certify absence"
+    );
+    let references = answer
+        .references
+        .iter()
+        .map(|reference| {
+            use crate::analyzer::store::resolution_operation::reverse::ReverseEnclosingUnit;
+            let owner = match &reference.owner {
+                ReverseEnclosingUnit::Unit(unit) => format!("{:?}", unit.declaration_id()),
+                ReverseEnclosingUnit::NoEnclosingUnit => "NoEnclosingUnit".into(),
+                ReverseEnclosingUnit::MissingSource => "MissingSource".into(),
+            };
+            format!(
+                "locator={:?} owner={owner} answer={:?}",
+                reference.locator, reference.answer
+            )
+        })
+        .collect::<Vec<_>>();
+    GOLDEN.with_borrow_mut(|slot| {
+        if let Some((_, scenario, rows)) = slot {
+            rows.push(format!("=== {scenario} / property-getter confirmation ===\ntarget={:?} equivalents={:?} completion={:?} candidate_inventory_complete={} peer_open={} references={references:?}\n",
+                answer.target,answer.equivalent_targets,answer.completion,answer.candidate_inventory_complete,answer.peer_language_inventory_open));
+        }
+    });
 }

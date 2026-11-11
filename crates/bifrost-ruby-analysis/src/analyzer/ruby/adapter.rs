@@ -19,6 +19,14 @@ use tree_sitter::Tree;
 pub struct RubyAdapter;
 
 impl LanguageAdapter for RubyAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &["string", "integer", "float", "character"],
+            interpolations: &["interpolation"],
+            composites: &[("array", &["[", "]", ","]), ("unary", &["-", "+"])],
+        }
+    }
+
     /// Relative to `brokk-bifrost-ruby`'s crate root: the `.scm` assets moved
     /// with the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {

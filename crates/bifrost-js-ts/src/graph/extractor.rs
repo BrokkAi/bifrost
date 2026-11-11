@@ -2574,7 +2574,8 @@ fn handle_imported_member_chain(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
                 record_hit(endpoint.property, ctx);
             }
         }
-        ReceiverAnalysisOutcome::Ambiguous(_)
+        ReceiverAnalysisOutcome::Incomplete { .. }
+        | ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. }
         | ReceiverAnalysisOutcome::Precise(_) => {}
@@ -2793,6 +2794,19 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
                 ReceiverMatchStatus::NoMatch
             }
         }
+        ReceiverAnalysisOutcome::Incomplete {
+            candidates: targets,
+        } => {
+            if targets
+                .iter()
+                .any(|target| same_js_ts_target(target, ctx.target))
+            {
+                ReceiverMatchStatus::Unproven
+            } else {
+                synthetic_factory_surface_match_status(node, ctx)
+                    .unwrap_or(ReceiverMatchStatus::Unproven)
+            }
+        }
         ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
@@ -2843,6 +2857,7 @@ fn synthetic_factory_surface_match_status(
         } else {
             ReceiverMatchStatus::NoMatch
         }),
+        ReceiverAnalysisOutcome::Incomplete { .. } => Some(ReceiverMatchStatus::Unproven),
         ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,

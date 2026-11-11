@@ -9,7 +9,7 @@ use brokk_bifrost_flow::taint::compose::{
     ExecutionDispatch, ExecutionDispatchOutcome, ExecutionEndpointStatus, ExecutionEndpoints,
     ExecutionSource, ExecutionTarget, ExternalTargetIdentity, FallbackPorts, Hop, HopQuality,
     InteriorFlows, InteriorObservation, InteriorSeed, InvocationSite, Invocations, Openness,
-    ProcedureEndpoints,
+    OperationalCause, ProcedureEndpoints,
 };
 use brokk_bifrost_flow::value_flow::{AuthoredArmClosure, DurableCallSiteKey, DurableProcedureKey};
 
@@ -173,9 +173,10 @@ impl ExecutionInputs<'_, '_> {
             self.incomplete(EffectReason::ProcedureUnreadable, EffectCoverage::Open);
             return Invocations {
                 sites: Vec::new(),
-                coverage: InventoryCompleteness::Incomplete {
-                    reason: "procedure artifact is unavailable".into(),
-                },
+                coverage: InventoryCompleteness::operational(
+                    OperationalCause::Provider,
+                    "procedure artifact is unavailable",
+                ),
             };
         };
         let input = self.procedures[key].clone();
@@ -191,13 +192,17 @@ impl ExecutionInputs<'_, '_> {
             self.incomplete(EffectReason::DispatchInterrupted, EffectCoverage::Open);
             return Invocations {
                 sites: Vec::new(),
-                coverage: InventoryCompleteness::Incomplete {
-                    reason: "invocation inventory interrupted".into(),
-                },
+                coverage: InventoryCompleteness::operational(
+                    OperationalCause::Budget(compose::BudgetLane::Semantic),
+                    "invocation inventory interrupted",
+                ),
             };
         }
         let mut sites = Vec::new();
         let mut reasons = Vec::new();
+        // Set when a bound or a lowering budget, not the code, left the
+        // inventory incomplete; a larger bound can change the answer.
+        let mut budget_stopped = false;
         if !input.declaration_only {
             for capability in [SemanticCapability::Procedures, SemanticCapability::Calls] {
                 if !procedure.artifact().capabilities().is_available(capability) {
@@ -224,6 +229,7 @@ impl ExecutionInputs<'_, '_> {
                     gap.detail,
                 ));
                 if gap.kind == SemanticGapKind::ExceededBudget {
+                    budget_stopped = true;
                     self.incomplete(
                         EffectReason::ProcedureBudgetExhausted,
                         EffectCoverage::Truncated,
@@ -233,6 +239,7 @@ impl ExecutionInputs<'_, '_> {
         }
         if semantics.call_sites().len() > MAX_CALL_SITES_PER_PROCEDURE {
             reasons.push("procedure call inventory exceeded its bound".to_owned());
+            budget_stopped = true;
             self.incomplete(
                 EffectReason::ProcedureBudgetExhausted,
                 EffectCoverage::Truncated,
@@ -249,6 +256,7 @@ impl ExecutionInputs<'_, '_> {
         {
             if self.calls.len() >= ProcedureEffectBudget::default().max_edges {
                 reasons.push("execution call inventory exceeded its bound".to_owned());
+                budget_stopped = true;
                 self.incomplete(
                     EffectReason::ProcedureBudgetExhausted,
                     EffectCoverage::Truncated,
@@ -293,17 +301,24 @@ impl ExecutionInputs<'_, '_> {
                     .as_ref()
                     .and_then(|unit| self.analyzer.ranges_of(unit).first().copied()),
                 format!("{} invocation inventory: {reasons:?}", input.name),
-                Incompleteness::Content,
+                if budget_stopped {
+                    Incompleteness::Operational(DerivationExecutionCause::Budget)
+                } else {
+                    Incompleteness::Content
+                },
             );
         }
         Invocations {
             sites,
             coverage: if reasons.is_empty() {
                 InventoryCompleteness::Complete
+            } else if budget_stopped {
+                InventoryCompleteness::operational(
+                    OperationalCause::Budget(compose::BudgetLane::Semantic),
+                    format!("{reasons:?}"),
+                )
             } else {
-                InventoryCompleteness::Incomplete {
-                    reason: format!("{reasons:?}").into(),
-                }
+                InventoryCompleteness::content(format!("{reasons:?}"))
             },
         }
     }
@@ -428,6 +443,9 @@ impl ExecutionInputs<'_, '_> {
                 ArmLookup::Conflict => {
                     self.incomplete(EffectReason::ModelConflict, EffectCoverage::Open)
                 }
+                ArmLookup::InputUnavailable => {
+                    self.incomplete(EffectReason::ModelInputUnavailable, EffectCoverage::Open)
+                }
                 ArmLookup::Unkeyable if matches!(target, ExecutionTarget::External(_)) => {
                     self.incomplete(EffectReason::CalleeUnkeyable, EffectCoverage::Open)
                 }
@@ -443,6 +461,11 @@ impl ExecutionInputs<'_, '_> {
                 function: effect.execution_timing,
                 quality: HopQuality::new(effect.proof == EffectProof::Proven, effect.complete),
                 timing: effect.execution_timing,
+                instance: None,
+                context: brokk_bifrost_analysis::analyzer::semantic::DurableCallContext::of(
+                    &brokk_bifrost_analysis::analyzer::semantic::OracleCallContext::empty(),
+                )
+                .expect("an empty oracle context has a durable identity"),
             });
             closed.push(effect.lookup.is_closed_by_summary());
             effects.push(effect);
@@ -565,6 +588,15 @@ impl ExecutionInputs<'_, '_> {
                             ExecutionEndpointStatus::Conflict("active models conflict".into()),
                         )
                     }
+                    Some((ModelAnswer::InputUnavailable, _)) => {
+                        self.incomplete(EffectReason::ModelInputUnavailable, EffectCoverage::Open);
+                        (
+                            Vec::new(),
+                            ExecutionEndpointStatus::Partial(
+                                "active models could not be read in full".into(),
+                            ),
+                        )
+                    }
                     _ if input.declaration_only => {
                         self.incomplete(EffectReason::ProcedureUnreadable, EffectCoverage::Open);
                         (
@@ -584,10 +616,9 @@ impl ExecutionInputs<'_, '_> {
                 // the whole call answer here repeats every sibling arm and
                 // summary once per target.
                 let external = self.answers[&incoming.call].external[incoming.ordinal].clone();
-                let conflict = matches!(
-                    self.answers[&incoming.call].effects[incoming.ordinal].lookup,
-                    ArmLookup::Conflict
-                );
+                let lookup = &self.answers[&incoming.call].effects[incoming.ordinal].lookup;
+                let conflict = matches!(lookup, ArmLookup::Conflict);
+                let input_unavailable = matches!(lookup, ArmLookup::InputUnavailable);
                 match external {
                     Some(external) if external.basis.is_established() => {
                         (external.declared, ExecutionEndpointStatus::Complete)
@@ -598,6 +629,15 @@ impl ExecutionInputs<'_, '_> {
                             external.declared,
                             ExecutionEndpointStatus::Partial(
                                 "external summary is incomplete".into(),
+                            ),
+                        )
+                    }
+                    None if input_unavailable => {
+                        self.incomplete(EffectReason::ModelInputUnavailable, EffectCoverage::Open);
+                        (
+                            Vec::new(),
+                            ExecutionEndpointStatus::Partial(
+                                "active models could not be read in full".into(),
                             ),
                         )
                     }
@@ -633,6 +673,7 @@ impl ExecutionInputs<'_, '_> {
                     identity: ordinal.to_string().into(),
                     provenance: effect.summary_id.clone().into(),
                     fact: effect,
+                    seed_point: None,
                 })
                 .collect(),
             covers_overrides: matches!(status, ExecutionEndpointStatus::Complete),
@@ -657,6 +698,7 @@ impl CompositionProvider for EffectProvider<'_, '_> {
     fn execution_dispatch(
         &self,
         call: &DurableCallSiteKey,
+        _incoming: Option<&ExecutionArmContext>,
         _: &mut SemanticRequest<'_>,
     ) -> Result<ExecutionDispatch<ExecutionTiming>, Infallible> {
         Ok(self.with_inputs(|inputs| {
@@ -721,7 +763,7 @@ impl CompositionProvider for EffectProvider<'_, '_> {
         &self,
         _: &DurableCallSiteKey,
         _: &mut SemanticRequest<'_>,
-    ) -> Result<Dispatch, Infallible> {
+    ) -> Result<(Dispatch, Option<CallModel<ExecutionTiming>>), Infallible> {
         unimplemented!("declared effects has no value-transfer capability")
     }
 
@@ -739,10 +781,6 @@ impl CompositionProvider for EffectProvider<'_, '_> {
         _: &mut SemanticRequest<'_>,
     ) -> Result<Option<DurableProcedureKey>, Infallible> {
         unimplemented!("lexical containment is not an execution edge")
-    }
-
-    fn model(&self, _: &DurableCallSiteKey) -> Option<CallModel<ExecutionTiming>> {
-        unimplemented!("effects declarations do not replace value transfers")
     }
 
     fn unmodeled_call_behavior(&self) -> brokk_bifrost_flow::dataflow::UnmodeledCallBehavior {
@@ -973,7 +1011,15 @@ pub(super) fn report(
         for reach in &outcome.reaches {
             let effect = EffectLabels.apply(
                 outcome.functions.function(reach.function),
-                &outcome.sources[reach.source].fact,
+                &outcome.sources[match reach.target {
+                    brokk_bifrost_flow::taint::compose::ExecutionReachTarget::Source(source) => {
+                        source
+                    }
+                    brokk_bifrost_flow::taint::compose::ExecutionReachTarget::Procedure(_) => {
+                        unreachable!("declared effect reaches carry sources")
+                    }
+                }]
+                .fact,
             );
             let depth = reach.hops.len();
             if depth > bounds.max_depth {

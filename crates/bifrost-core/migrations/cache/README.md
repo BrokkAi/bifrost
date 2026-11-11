@@ -25,6 +25,17 @@ as well, so fresh-store and upgrade validation accept the generated schema.
 
 Keep the generator's baseline and current version constants in sync with
 `cache_db.rs`. Never edit a released migration and never add a down migration.
+
+In `source_structural_facts`, `roles[2]` stores the argument mode (#9773):
+0=plain, 1=spread, 2=ref, 3=out, 4=in. The generated `current-schema.sql`
+cannot carry hand-written comments, so the encoding is recorded here.
+
+Migration `0279-semantic-ir-publication-row-digest.sql` adds a nullable digest
+of the final sealed publication rows. Legacy heads remain NULL until republished;
+the source content digest retains its existing meaning. It also rebuilds both
+general read ledgers with a structured stored-IR publication question. Existing
+read rows and IDs survive the rebuild. The restricted procedure-surface ledger
+is unchanged.
 A comment-only edit to the baseline is the one exception (owner decision,
 2026-09-29): SQLite keeps CREATE text verbatim, so such an edit moves
 `CURRENT_SCHEMA_OBJECTS_SHA256` and nothing else; update the constant in the
@@ -232,6 +243,15 @@ an independently allocated later migration does not invent a placeholder for
 another lane. Register each file in `POST_BASELINE_MIGRATIONS` as usual; the
 cache schema parity tests compare that registry with the generated snapshot.
 
+Migration `0278-semantic-ir-call-control-coverage.sql` stores scoped call/control coverage separately from full-footprint admission.
+
+Migration `0277-semantic-ir-footprint-coverage.sql` stores normalized callee footprint coverage witnesses. It is numbered above the already-landed 0275 so existing stores apply it during upgrade.
+
+Migration `0275-resolution-site-prefix.sql` records a reference's proved root
+prefix on its site row. A local semantic key names the prefix, -1 proves none,
+and NULL means the producer has not published prefix evidence. Existing rows
+remain NULL until the resolution bundle producer epoch rebuilds their interiors.
+
 Migration `0187-rust-crate-public-module-reachability.sql` records the
 canonical target modules exposed by a completed crate topology's fully public,
 unambiguous module paths. The composite primary key deduplicates multiple
@@ -294,3 +314,80 @@ Migration `0231-policy-evaluation-replay-evidence.sql` records nullable
 per-policy and aggregate effective grants and certified source censuses.
 The aggregate also records whether its evidence was complete. Legacy rows
 remain readable but have no replay evidence.
+
+Migration `0256-directional-channel-components.sql` admits append-only channel
+constructor codes 5-7 with one Element component while preserving legacy code 2
+as direction-unknown historical evidence. It rebuilds only the component table,
+copying existing rows and restoring its original keys, foreign keys and index.
+
+Migration `0260-python-import-module-operands.sql` stores structured import
+module operands so Python demand can resolve imports from their selected source
+reference.
+
+Migration `0261-python-module-registry-writes.sql` records source observations
+of module-registry writes for demand-time authority checks.
+
+Migration `0262-python-source-root-spellings.sql` records lookup spellings for
+canonical Python providers without creating new module identities.
+
+Migration `0264-candidate-fq-publication-witness.sql` adds a per-publication
+witness and a database lineage nonce for bounded relational candidate memos.
+The FQ segment seal prevents edits to completed publications. A future
+`blob_meta` rebuild must preserve the witness and sequence.
+
+Migration `0276-configuration-input-presence.sql` distinguishes absent configuration probes from present empty files; legacy empty rows remain unvalidated.
+
+Migration `0283-csharp-compilation-open-reasons.sql` rebuilds populated C#
+compilations to admit four registered open reasons while preserving their
+columns, rows, constraints, and child foreign keys.
+
+Migration `0285-structural-role-name-inventory.sql` stores role and keyword
+columns for exact structural role-name inventory reads in both general ledgers.
+Existing read rows and IDs survive the rebuild.
+
+Migration `0286-g3-guarded-pattern-projections.sql` adds bounded, inert Rust
+pattern candidate rows and ordered tuple/named field steps to semantic IR
+publications. A candidate keeps its Values gap until selected declaration
+authority admits it; the store records no admitted value effect.
+
+Migration `0290-semantic-ir-static-type-classes.sql` adds static value classes and ordered declared result classes. Compatible: additive rows and columns, and versioned store filenames exclude mixed-version writers.
+
+Migration `0291-rust-crate-path-probes.sql` adds `rust_crate_path_probes`, the
+case-folded paths each Rust crate topology's derivation consulted: module-walk
+candidates, naming probes and the target root. A created or deleted path
+reaches exactly the crates that probe it. Compatible: it only adds a table that
+older readers ignore.
+
+Migration `0292-definition-index-inventory.sql` adds full-membership definition
+name indexes and replaces the subsumed declaration and lookup partial indexes.
+File projections own anchored names and nullable completeness evidence; legacy
+and replacement file versions start unknown until publication supplies evidence.
+A file version becomes known only in a transaction that proves its blob complete
+and ready; NULL fences legacy rows. Compatible: the new columns are nullable,
+NULL reads as unknown, and versioned store filenames exclude mixed-version
+writers.
+
+Migration 0292 indexes unknown definition-inventory state only for source file versions; configuration versions retain NULL because that state does not apply to them.
+
+Migration `0299-rust-inventory-name-reads.sql` rebuilds both general read ledgers
+to admit the three Rust inventory families as Rust-only Name questions. Compatible:
+all existing rows, IDs, indexes and foreign keys are retained; no answer meanings
+change, and versioned filenames exclude older writers.
+
+Migration `0299-rust-inventory-name-reads.sql` also admits Rust bound-trait
+impl inventory questions. These store the placed declaration as a blob OID,
+workspace-relative path and a u32 declaration ID in both scalar interval
+columns. The language must be Rust and unrelated question columns must be NULL.
+
+Migration `0299` also admits `rust_traits_implemented_by_inventory` with the
+bound inventory placed-declaration shape and `rust_alias_blob_inventory` with
+the Rust name inventory shape, in both read ledgers.
+
+Migration `0299` also admits `rust_macro_expansion_inventory` as a strict Rust
+Name question in both ledgers. Each requested spelling records its own selected-live,
+sorted distinct (blob OID, via) answer in a versioned domain. Publication readiness
+is required; unknown placement is included and refusal is unavailable evidence.
+
+Migration `0311-rust-unit-summary-context-lookups.sql` adds crate-name and
+module/scope import-route indexes for the summary-backed context readers
+(#11173). Compatible: indexes only, with no row or answer changes.

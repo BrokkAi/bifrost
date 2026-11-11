@@ -19,7 +19,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.15.1"
+brokk-bifrost = "0.15.2"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -299,7 +299,10 @@ rejects it, and every request carries it again.
 | `experimental.semantic.value_dependence` | experimental | partial |
 | `experimental.semantic.typestate` | experimental, added in 1.1 | partial |
 
-Open a workspace with `ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(root))`.
+Open a workspace with `ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(root), &budget)`.
+The `budget` is a `RetentionBudget`, re-exported from the extension module. It caps
+the memory the analyzer keeps between requests: `RetentionBudget::new(bytes)` sets
+a capacity and `RetentionBudget::retain_nothing()` keeps nothing.
 The default store is in memory. Call `.persisted()` on the options to use the
 persisted analyzer cache. The workspace then answers `structural_query`,
 `semantic_relations`, and `typestate_check` requests. Each request names the

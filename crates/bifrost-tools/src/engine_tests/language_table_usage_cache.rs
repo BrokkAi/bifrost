@@ -368,10 +368,10 @@ mod tests {
             .0
         });
         brokk_bifrost_core::test_support::wait_for_nonzero_count(
-            || cache.waiting_count_for_test(),
+            || cache.waiting_count_for_test(&key(1)),
             "same-key request did not enter the single-flight wait",
         );
-        assert_eq!(1, cache.waiting_count_for_test());
+        assert_eq!(1, cache.waiting_count_for_test(&key(1)));
         release_tx.send(()).unwrap();
 
         let leader_graph = leader.join().unwrap();

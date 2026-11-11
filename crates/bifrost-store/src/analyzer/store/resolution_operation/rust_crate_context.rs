@@ -194,7 +194,8 @@ pub(super) const FILE_CRATES: &str = "SELECT units.unit_key
   INDEXED BY resolution_unit_summary_members_blob
  CROSS JOIN selected_rust_unit_summaries AS units
   ON units.summary_id=members.summary_id
- WHERE members.blob_id=?1 AND members.rel_path=?2";
+ WHERE members.blob_id=?1 AND members.rel_path=?2
+ ORDER BY units.unit_key";
 /// Enumerate a crate and its workspace dependency crates from live summaries.
 /// Rust placements supply the module path/scope route; the shared member row
 /// supplies the selected source file. `topology_id` is only the Rust-owned
@@ -224,7 +225,9 @@ CROSS JOIN source_rust_module_scopes AS scopes
   ON scopes.blob_id=members.blob_id AND scopes.ordinal=placement.scope_ordinal
 LEFT JOIN temp.selected_resolution_mounts AS mount
   ON mount.storage_language='rust' AND mount.persisted_relative_path=members.rel_path
-WHERE root.summary_id=?1 AND scopes.resolution_scope IS NOT NULL";
+WHERE root.summary_id=?1 AND scopes.resolution_scope IS NOT NULL
+ORDER BY units.unit_key, placement.module_path, members.rel_path,
+         scopes.resolution_scope, placement.member_ordinal";
 pub(super) const MODULE_PLACEMENTS: &str = "SELECT topology_id, container_path, placement_blob
      FROM selected_rust_container_placements
      WHERE placement_blob=?1 AND container_path=?2";
@@ -443,7 +446,6 @@ pub(super) fn generated_item_surface_boundary(
     ready: &ReadySelectedResolution<'_, '_>,
     targets: &[SemanticId],
 ) -> Result<ResolutionCompletion> {
-    let conn = ready.inventory.connection();
     let identities = &ready.context_identities;
     let origin = crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_code(
         crate::analyzer::resolution::LoweringGapOrigin::Extracted(
@@ -455,12 +457,7 @@ pub(super) fn generated_item_surface_boundary(
         let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key()) else {
             continue;
         };
-        if conn
-            .prepare_cached(REASON_GAP_ORIGIN)?
-            .query_row(rusqlite::params![ordinal, key], |row| row.get::<_, i64>(0))
-            .optional()?
-            != Some(origin)
-        {
+        if persisted_gap_frontier(ready, ordinal, key)?.map(|(origin, _)| origin) != Some(origin) {
             continue;
         }
         // Preserve the internal reason key and multiplicity. Only the
@@ -600,35 +597,36 @@ pub(super) fn generated_surface_prefix_boundary(
 /// the bound name; the persisted import row supplies its already-proved route.
 pub(super) const IMPORT_MODULE_PREFIX_STARTS: &str = concat!(
     "WITH binding(target_crate_key, target_module_path, target_name) AS (",
-    " SELECT imports.target_crate_key, imports.target_module_path, imports.target_name",
-    " FROM rust_crate_imports AS imports",
-    " WHERE ?7=?3 AND imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3",
+    " SELECT imports.target_unit_key, imports.target_module_path, imports.target_name",
+    " FROM selected_rust_unit_summaries AS unit CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=unit.summary_id AND member.blob_id=?3 CROSS JOIN main.rust_resolution_unit_summary_import_routes AS imports ON imports.summary_id=unit.summary_id AND imports.member_ordinal=member.member_ordinal",
+    " WHERE ?7=?3 AND unit.topology_id=?1 AND imports.module_path=?2",
     " AND imports.binder_scope=?4 AND imports.bound_name=?5 AND imports.namespace=?6",
     " UNION ALL",
-    " SELECT imports.target_crate_key, imports.target_module_path, selected.imported_name",
-    " FROM rust_crate_imports AS imports",
+    " SELECT imports.target_unit_key, imports.target_module_path, selected.imported_name",
+    " FROM selected_rust_unit_summaries AS unit CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=unit.summary_id AND member.blob_id=?3 CROSS JOIN main.rust_resolution_unit_summary_import_routes AS imports ON imports.summary_id=unit.summary_id AND imports.member_ordinal=member.member_ordinal",
     " CROSS JOIN source_rust_import_targets AS selected",
-    " ON selected.blob_id=?7 AND selected.ordinal=imports.import_ordinal",
-    " WHERE ?7<>?3 AND imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3",
+    " ON selected.blob_id=?7 AND selected.ordinal=imports.route_ordinal",
+    " WHERE ?7<>?3 AND unit.topology_id=?1 AND imports.module_path=?2",
     " AND imports.binder_scope=?4 AND imports.namespace=?6 AND selected.bound_name=?5",
     ")",
     " SELECT DISTINCT target.topology_id, binding.target_module_path, binding.target_name",
     " FROM binding",
-    " CROSS JOIN selected_rust_crates AS target ON target.crate_key=binding.target_crate_key"
+    " CROSS JOIN selected_rust_unit_summaries AS target ON target.unit_key=binding.target_crate_key"
 );
 
+// This matches nothing on current publications: the detail is wrapped in `evidence` (#11233).
 const MACRO_GATED_IMPORT_ROUTE: &str =
     "WITH binding(target_crate_key, target_module_path, target_name) AS (
- SELECT imports.target_crate_key, imports.target_module_path, imports.target_name
- FROM rust_crate_imports AS imports
- WHERE imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3
+ SELECT imports.target_unit_key, imports.target_module_path, imports.target_name
+ FROM selected_rust_unit_summaries AS unit CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=unit.summary_id AND member.blob_id=?3 CROSS JOIN main.rust_resolution_unit_summary_import_routes AS imports ON imports.summary_id=unit.summary_id AND imports.member_ordinal=member.member_ordinal
+ WHERE unit.topology_id=?1 AND imports.module_path=?2
   AND imports.binder_scope=?4 AND imports.bound_name=?5 AND imports.namespace='type'
  UNION
- SELECT imports.target_crate_key, imports.target_module_path, selected.imported_name
- FROM rust_crate_imports AS imports
+ SELECT imports.target_unit_key, imports.target_module_path, selected.imported_name
+ FROM selected_rust_unit_summaries AS unit CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=unit.summary_id AND member.blob_id=?3 CROSS JOIN main.rust_resolution_unit_summary_import_routes AS imports ON imports.summary_id=unit.summary_id AND imports.member_ordinal=member.member_ordinal
  CROSS JOIN source_rust_import_targets AS selected
-  ON selected.blob_id=?6 AND selected.ordinal=imports.import_ordinal
- WHERE imports.topology_id=?1 AND imports.module_path=?2 AND imports.blob_id=?3
+  ON selected.blob_id=?6 AND selected.ordinal=imports.route_ordinal
+ WHERE unit.topology_id=?1 AND imports.module_path=?2
   AND imports.binder_scope=?4 AND imports.namespace='type' AND selected.bound_name=?5
 )
 SELECT DISTINCT json_object('evidence', json_array(json_object(
@@ -639,8 +637,8 @@ SELECT DISTINCT json_object('evidence', json_array(json_object(
  'replay_covered', json('false'),
  'route_subject', gap.subject)))
 FROM binding
-CROSS JOIN selected_rust_crates AS target ON target.crate_key=binding.target_crate_key
-CROSS JOIN rust_crate_gaps AS gap ON gap.topology_id=target.topology_id
+CROSS JOIN selected_rust_unit_summaries AS target ON target.unit_key=binding.target_crate_key
+CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=target.summary_id
  AND gap.gap_kind='unknown_activation'
  AND gap.subject=binding.target_module_path || '::' || binding.target_name
 CROSS JOIN source_rust_module_routes AS route
@@ -663,32 +661,42 @@ SELECT DISTINCT json_object('evidence', json_array(json_object(
  'replay_covered', json('false'),
  'route_subject', gap.subject)))
 FROM ancestors
-CROSS JOIN rust_crate_container_sources AS parent
-CROSS JOIN selected_rust_crates AS selected ON selected.topology_id=parent.topology_id
-CROSS JOIN source_rust_module_routes AS route ON route.blob_id=parent.blob_id
+CROSS JOIN selected_rust_unit_summaries AS selected
+CROSS JOIN main.rust_unit_summary_placements AS parent ON parent.summary_id=selected.summary_id
+CROSS JOIN main.resolution_unit_summary_members AS member ON member.summary_id=parent.summary_id AND member.member_ordinal=parent.member_ordinal
+CROSS JOIN source_rust_module_routes AS route ON route.blob_id=member.blob_id
 CROSS JOIN source_rust_module_declarations AS declaration
  ON declaration.blob_id=route.blob_id AND declaration.declaration_id=route.declaration_id
-CROSS JOIN rust_crate_gaps AS gap ON gap.topology_id=parent.topology_id
+CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=parent.summary_id
  AND gap.gap_kind='unknown_activation'
- AND gap.subject=parent.container_path || '::' || declaration.module_name
+ AND gap.subject=parent.module_path || '::' || declaration.module_name
 CROSS JOIN source_rust_module_route_gates AS gate
  ON gate.blob_id=route.blob_id AND gate.route_ordinal=route.ordinal
 CROSS JOIN source_rust_macro_invocations AS invocation
  ON invocation.blob_id=gate.blob_id AND invocation.occurrence_id=gate.invocation_occurrence_id
-WHERE ancestors.path=cr_join(cr_parent(parent.rel_path), declaration.module_name)";
+WHERE ancestors.path=cr_join(cr_parent(member.rel_path), declaration.module_name)";
 
+// This matches nothing on current publications: the detail is wrapped in `evidence` (#11233).
 const INACTIVE_CFG_UNMOUNTED_FILE: &str =
     "SELECT DISTINCT json_object('evidence', json_array(json_object(
  'reason', 'InactiveCfgPlacement',
  'rel_path', json_extract(gap.detail, '$.path'),
  'route_subject', gap.subject,
  'activation', json_extract(gap.detail, '$.activation'))))
-FROM rust_crate_gaps AS gap
-CROSS JOIN selected_rust_crates AS selected ON selected.topology_id=gap.topology_id
+FROM selected_rust_unit_summaries AS selected
+CROSS JOIN main.rust_resolution_unit_summary_gaps AS gap ON gap.summary_id=selected.summary_id
 WHERE gap.gap_kind='inactive_placement'
  AND json_extract(gap.detail, '$.path')=?1
  AND json_extract(gap.detail, '$.activation')=0
 ORDER BY gap.subject";
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const MACRO_GATED_UNMOUNTED_FILE_SQL_FOR_TEST: &str = MACRO_GATED_UNMOUNTED_FILE;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub const INACTIVE_CFG_UNMOUNTED_FILE_SQL_FOR_TEST: &str = INACTIVE_CFG_UNMOUNTED_FILE;
 /// Source gap conditions: derive-helper names of module-level declarations and
 /// directly proven inactive macro inputs. A NULL helper is an inactive-input proof.
 /// The derive-helper attribute names of the module-level declarations a
@@ -1026,7 +1034,8 @@ pub(super) const OPEN_ROUTE: &str = "SELECT json(gap.detail)
  WHERE unit.topology_id=?1
   AND gap.gap_kind IN ('unknown_activation','unplaced_module','duplicate_placement')
   AND gap.subject=?2 || '::' || ?3";
-pub(super) const GAP_DETAILS: &str = include_str!("rust_crate_point_gap_details.sql");
+pub(in crate::analyzer::store) const GAP_DETAILS: &str =
+    include_str!("rust_crate_point_gap_details.sql");
 pub(super) const IMPORT_INVENTORY: &str = "SELECT json_array(imports.native_scope, imports.bound_name, imports.imported_name, imports.is_glob, imports.leading_absolute, imports.is_extern_crate, imports.is_macro_use, imports.visibility, imports.cfg_condition, imports.owner_module, imports.local_start IS NOT NULL, json((SELECT json_group_array(segment) FROM (SELECT segment FROM source_rust_import_module_segments WHERE blob_id=imports.blob_id AND import_ordinal=imports.ordinal ORDER BY ordinal)))) FROM source_rust_import_targets AS imports WHERE imports.blob_id=?1 ORDER BY imports.ordinal";
 pub(super) const OVERLAY_IMPORT_TARGETS: &str = r#"SELECT DISTINCT target.topology_id, route.target_module_path, route.namespace,
  owner.topology_id, route.module_path
@@ -1206,6 +1215,9 @@ pub const DETACHED_SCOPE_CRATES: &str = "SELECT COUNT(*) FROM selected_rust_unit
  CROSS JOIN main.rust_resolution_unit_summary_contexts AS context
   ON context.summary_id=unit.summary_id
  WHERE context.target_kind='detached' AND unit.unit_key IN (SELECT unhex(value) FROM json_each(?1))";
+/// Empties the request's scope rows before a closure narrows them.
+pub(super) const CLEAR_SCOPE_MOUNTS: &str = "DELETE FROM temp.selected_resolution_scope_mounts";
+
 /// The mounts of the crates in the transitive dependency closure of the
 /// requested crate keys.
 ///
@@ -1234,7 +1246,7 @@ pub const CLOSURE_SCOPE_MOUNTS: &str =
 /// The mounts no crate row can place, which a crate closure cannot narrow:
 /// another language's files, and a content mount carrying an editor buffer
 /// whose path the crate derivation has never seen.
-const UNPLACEABLE_SCOPE_MOUNTS: &str =
+pub(super) const UNPLACEABLE_SCOPE_MOUNTS: &str =
     "INSERT OR IGNORE INTO temp.selected_resolution_scope_mounts(mount_ordinal)
  SELECT mount_ordinal FROM temp.selected_resolution_mounts
  WHERE storage_language <> 'rust' OR file_version_id IS NULL";
@@ -1407,7 +1419,9 @@ impl SelectedResolutionOperation<'_, '_> {
         if staged.is_empty() {
             return Ok(Some(unstaged_macro_item(
                 &self.ready.context_identities,
-                blob,
+                self.mount_table()
+                    .mount_by_ordinal(mount)?
+                    .persisted_relative_path(),
                 declaration,
                 module,
             )));
@@ -1653,12 +1667,7 @@ impl<'store> ReadySelectedResolution<'store, '_> {
     /// before [`Self::finish`], whose revalidation of the whole selection is
     /// what lets the stage trust a publication it has already checked.
     pub(super) fn crate_stage_memos(&self) -> Result<super::rust_crate_rows::CrateStageMemos<'_>> {
-        super::rust_crate_rows::CrateStageMemos::install(
-            &self.inventory,
-            &self.crate_rows,
-            self.inventory.crate_access_memo(),
-            self.inventory.authority_validations(),
-        )
+        self.rust_forward_build_view().crate_stage_memos()
     }
 
     /// Replace the request scope with the closure of `crate_keys`, or leave it
@@ -1674,39 +1683,8 @@ impl<'store> ReadySelectedResolution<'store, '_> {
         crate_keys: &[[u8; 32]],
         cancellation: &CancellationToken,
     ) -> Result<Option<ForwardCrateScope<'_, 'store>>> {
-        if crate_keys.is_empty() || cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        let keys = serde_json::to_string(
-            &crate_keys
-                .iter()
-                .map(|key| super::super::resolution_lexical::hex_digest(*key))
-                .collect::<Vec<_>>(),
-        )
-        .expect("crate key strings are JSON serializable");
-        let detached: i64 = self
-            .inventory
-            .connection()
-            .prepare_cached(DETACHED_SCOPE_CRATES)?
-            .query_row([&keys], |row| row.get(0))?;
-        if detached > 0 {
-            return Ok(None);
-        }
-        // The scope rows belong to this request, which writes them and puts
-        // them back, so they are accounted to it. An unaccounted temp write
-        // reads as somebody else's, and the selection is discarded with its
-        // retained operation when the inventory drops.
-        self.inventory.with_owned_temp_write(|conn| {
-            conn.execute("DELETE FROM temp.selected_resolution_scope_mounts", [])?;
-            conn.prepare_cached(CLOSURE_SCOPE_MOUNTS)?
-                .execute([&keys])?;
-            conn.execute(UNPLACEABLE_SCOPE_MOUNTS, [])?;
-            Ok(())
-        })?;
-        self.inventory.note_scope_narrowed(crate_keys);
-        Ok(Some(ForwardCrateScope {
-            inventory: &self.inventory,
-        }))
+        self.rust_forward_build_view()
+            .narrow_forward_scope_to_crates(crate_keys, cancellation)
     }
 }
 
@@ -2424,6 +2402,7 @@ impl SelectedResolutionOperation<'_, '_> {
                     targets = (super::rust_crate_rows::RustCrateRows { ready: &self.ready })
                         .anchor_declaration_targets(targets)?;
                 }
+                targets.sort_unstable();
                 route_reached_a_target |= !targets.is_empty();
                 let before = descriptors.len();
                 for (target_topology, path, name) in targets {
@@ -3454,7 +3433,7 @@ pub(super) fn inventory_reason(identities: &SelectedContextIdentities, detail: &
 /// file was not staged.
 pub(super) fn unstaged_macro_item(
     identities: &SelectedContextIdentities,
-    blob: i64,
+    rel_path: &str,
     declaration: i64,
     module: bool,
 ) -> ResolutionCompletion {
@@ -3463,7 +3442,7 @@ pub(super) fn unstaged_macro_item(
             identities,
             &serde_json::json!({
                 "evidence": [{
-                    "member_blob": blob,
+                    "rel_path": rel_path,
                     "declaration": declaration,
                     "reason": if module { "MacroModuleItem" } else { "UnstagedMacroItem" },
                 }]
@@ -3755,12 +3734,6 @@ const BLOCK_LOCAL_TYPE_GAP_FOR_TARGET: &str = "SELECT EXISTS(SELECT 1
   ON properties.blob_id=bridge.blob_id AND properties.declaration_id=bridge.declaration_id
  WHERE mount.mount_ordinal=?1 AND properties.nearest_declaration_boundary=1
   AND properties.declaration_kind IN (0,1,2,3,13))";
-/// The gap-kind origin of a mounted reason, when the reason is a gap's.
-pub(super) const REASON_GAP_ORIGIN: &str = "SELECT reason.origin
- FROM temp.selected_resolution_mounts AS mount
- CROSS JOIN resolution_gap_reasons AS reason ON reason.blob_id=mount.blob_id AND reason.reason=?2
- WHERE mount.mount_ordinal=?1";
-
 /// Whether every target of a resolved route prefix is a generic type
 /// parameter's declaration, as `T` is in `T::one`. Such a prefix is a type
 /// whose members come from the parameter's bounds, which the typed member
@@ -4043,10 +4016,7 @@ pub(super) fn classify_route_prefix(
                 ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
                     unsupported.push(*semantic);
                     if let (Some(ordinal), Some(key)) = (semantic.ordinal(), semantic.local_key())
-                        && let Some(origin) = conn
-                            .prepare_cached(REASON_GAP_ORIGIN)?
-                            .query_row(params![ordinal, key], |row| row.get::<_, i64>(0))
-                            .optional()?
+                        && let Some((origin, _)) = persisted_gap_frontier(ready, ordinal, key)?
                     {
                         prelude_gap |= crate::analyzer::store::resolution_prepare::resolution_rows::gap_origin_from_code(origin)
                             == crate::analyzer::resolution::LoweringGapOrigin::ExternalPreludeBoundary;
@@ -4078,13 +4048,13 @@ pub(super) fn classify_route_prefix(
     if !unsupported.is_empty()
         && let Some(rel_path) = rel_path
     {
-        for detail in conn
-            .prepare_cached(GAP_DETAILS)?
-            .query_map([rel_path], |row| row.get::<_, String>(0))?
-        {
-            if unsupported.contains(&inventory_reason(&ready.context_identities, &detail?)) {
-                return Ok(RoutePrefixClass::OpenInventory);
-            }
+        let details = ready
+            .inventory
+            .rust_point_gap_details(rel_path, cancellation)?;
+        if any_matching_gap_detail(details, cancellation, |detail| {
+            unsupported.contains(&inventory_reason(&ready.context_identities, detail))
+        }) {
+            return Ok(RoutePrefixClass::OpenInventory);
         }
     }
     if has_targets {
@@ -4103,6 +4073,22 @@ pub(super) fn classify_route_prefix(
     } else {
         RoutePrefixClass::Other
     })
+}
+
+fn any_matching_gap_detail(
+    details: impl IntoIterator<Item = String>,
+    cancellation: &CancellationToken,
+    mut matches: impl FnMut(&str) -> bool,
+) -> bool {
+    for detail in details {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        if matches(&detail) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The incompleteness of a route that stopped at its prefix, as one named
@@ -4777,5 +4763,110 @@ impl SelectedResolutionOperation<'_, '_> {
             &self.ready.crate_rows,
             self.ready.inventory.crate_access_memo(),
         )
+    }
+}
+
+impl<'a, 'store> super::RustForwardBuildView<'a, 'store> {
+    pub(super) fn crate_stage_memos(&self) -> Result<super::rust_crate_rows::CrateStageMemos<'a>> {
+        super::rust_crate_rows::CrateStageMemos::install(
+            self.inventory,
+            self.crate_rows,
+            self.inventory.crate_access_memo(),
+            self.inventory.authority_validations(),
+        )
+    }
+
+    pub(super) fn narrow_forward_scope_to_crates(
+        &self,
+        crate_keys: &[[u8; 32]],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ForwardCrateScope<'a, 'store>>> {
+        if crate_keys.is_empty() || cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let keys = serde_json::to_string(
+            &crate_keys
+                .iter()
+                .map(|key| super::super::resolution_lexical::hex_digest(*key))
+                .collect::<Vec<_>>(),
+        )
+        .expect("crate key strings are JSON serializable");
+        let detached: i64 = self
+            .inventory
+            .connection()
+            .prepare_cached(DETACHED_SCOPE_CRATES)?
+            .query_row([&keys], |row| row.get(0))?;
+        if detached > 0 {
+            return Ok(None);
+        }
+        // The scope rows belong to this request, which writes them and puts
+        // them back, so they are accounted to it. An unaccounted temp write
+        // reads as somebody else's, and the selection is discarded with its
+        // retained operation when the inventory drops.
+        self.inventory.with_owned_temp_write(|conn| {
+            conn.prepare_cached(CLEAR_SCOPE_MOUNTS)?.execute([])?;
+            conn.prepare_cached(CLOSURE_SCOPE_MOUNTS)?
+                .execute([&keys])?;
+            conn.prepare_cached(UNPLACEABLE_SCOPE_MOUNTS)?.execute([])?;
+            Ok(())
+        })?;
+        self.inventory.note_scope_narrowed(crate_keys);
+        Ok(Some(ForwardCrateScope {
+            inventory: self.inventory,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod gap_detail_memo_tests {
+    use super::any_matching_gap_detail;
+    use crate::CancellationToken;
+    use crate::analyzer::store::resolution_lexical::{GapDetailsReadKey, SiteRowMemo};
+    use crate::analyzer::store::resolution_selection::SelectedResolutionReadStamp;
+
+    #[test]
+    fn prefix_decision_and_examined_order_match_on_a_memo_hit() {
+        let cancellation = CancellationToken::new();
+        let rows = vec![
+            "first".to_owned(),
+            "matching".to_owned(),
+            "later".to_owned(),
+        ];
+        let mut memo = SiteRowMemo::default();
+        assert!(memo.enter(Some(1)));
+        let key = GapDetailsReadKey {
+            selection: [1; 32],
+            stamp: SelectedResolutionReadStamp {
+                main_data_version: 1,
+                main_schema_version: 1,
+                temp_schema_version: 1,
+                unowned_changes: 0,
+                rolled_back: false,
+            },
+            selected_rows_generation: 0,
+            rel_path: "file.rs".to_owned(),
+        };
+        memo.insert_gap_details(key.clone(), rows.clone());
+        let hit = memo.gap_details(&key).unwrap().clone();
+        let mut republished = key.clone();
+        republished.selection[0] ^= 1;
+        assert!(
+            memo.gap_details(&republished).is_none(),
+            "changed selection fingerprint misses"
+        );
+        let mut miss_examined = Vec::new();
+        let miss_decision = any_matching_gap_detail(rows, &cancellation, |detail| {
+            miss_examined.push(detail.to_owned());
+            detail == "matching"
+        });
+        let mut hit_examined = Vec::new();
+        let hit_decision = any_matching_gap_detail(hit, &cancellation, |detail| {
+            hit_examined.push(detail.to_owned());
+            detail == "matching"
+        });
+        assert!(miss_decision);
+        assert_eq!(hit_decision, miss_decision);
+        assert_eq!(hit_examined, miss_examined);
+        assert_eq!(hit_examined, ["first", "matching"]);
     }
 }

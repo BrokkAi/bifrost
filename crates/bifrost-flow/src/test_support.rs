@@ -39,6 +39,20 @@ pub(crate) fn procedure_budget_error(limit: usize, attempted: usize) -> Semantic
         .expect_err("procedure budget should be exceeded")
 }
 
+/// Coverage claims for a synthetic complete summary: protocol admission reads
+/// the Protocol dimension, and the legacy completeness still comes from
+/// ValueTransfer.
+pub(crate) fn complete_summary_coverage() -> Vec<crate::dataflow::SummaryDimensionClaim> {
+    use crate::dataflow::{SummaryDimension, SummaryDimensionClaim, SummaryDimensionStatus};
+    [SummaryDimension::Protocol, SummaryDimension::ValueTransfer]
+        .into_iter()
+        .map(|dimension| {
+            SummaryDimensionClaim::new(dimension, SummaryDimensionStatus::Complete)
+                .expect("complete coverage claim is valid")
+        })
+        .collect()
+}
+
 /// A real, complete leaf summary for cache/read-ledger boundary tests.
 pub(crate) fn with_leaf_semantic_summary(
     body: impl FnOnce(&crate::analyzer::WorkspaceAnalyzer, crate::dataflow::SemanticProcedureSummary),
@@ -79,7 +93,19 @@ pub(crate) fn with_leaf_semantic_summary(
         &workspace.icfg_provider(),
         &mut SemanticRequest::new(&mut budget, &cancellation),
     )
-    .expect("complete leaf projection");
+    .expect("leaf projection");
     assert_eq!(summaries.summaries().len(), 1);
-    body(&workspace, summaries.summaries()[0].clone());
+    // Protocol repository tests use a synthetic complete artifact. Production
+    // projection deliberately refuses this claim without a value projection.
+    let projected = &summaries.summaries()[0];
+    let semantic = crate::dataflow::SemanticProcedureSummary::try_new_with_coverage(
+        projected.key().clone(),
+        projected.transfers().to_vec(),
+        projected.effects().to_vec(),
+        projected.dependencies().to_vec(),
+        crate::dataflow::SummaryCompleteness::Complete,
+        complete_summary_coverage(),
+    )
+    .expect("synthetic repository fixture");
+    body(&workspace, semantic);
 }

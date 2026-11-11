@@ -1,4 +1,5 @@
 use crate::analyzer::java::selected_reverse::*;
+use brokk_bifrost_test_macros::hardwon;
 
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 
@@ -165,6 +166,105 @@ fn inverse(analyzer: &JavaAnalyzer, target: &CodeUnit) -> EdgeDerivationResult {
 }
 
 #[test]
+fn java_static_import_reverse_sites() {
+    const OWNER: &str = "src/main/java/p/C.java";
+    let (fixture, analyzer) = fixture_with_java_sources(&[
+        (
+            OWNER,
+            "package p; public class C { public static void m() {} void inside() { m(); } }",
+        ),
+        (
+            "src/main/java/q/Single.java",
+            "package q; import static p.C.m; class Single { void call() { m(); } }",
+        ),
+        (
+            "src/main/java/q/Star.java",
+            "package q; import static p.C.*; class Star { void call() { m(); } }",
+        ),
+        (
+            "src/main/java/q/Qualified.java",
+            "package q; class Qualified { void call() { p.C.m(); } }",
+        ),
+        (
+            "src/main/java/q/Shadow.java",
+            "package q; import static p.C.m; class Shadow { void m() {} void call() { m(); } }",
+        ),
+    ]);
+    let method = target(
+        &analyzer,
+        &fixture,
+        OWNER,
+        "m",
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+    );
+    let answer = inverse(&analyzer, &method);
+    let sites = answer
+        .edges
+        .iter()
+        .map(|edge| {
+            let source = edge.site.file.read_to_string().expect("read caller source");
+            format!(
+                "{}:{}..{}: {}",
+                brokk_bifrost_core::path_utils::rel_path_string(&edge.site.file),
+                edge.site.range.start_byte,
+                edge.site.range.end_byte,
+                &source[edge.site.range.start_byte..edge.site.range.end_byte]
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut rendered = sites.into_iter().collect::<Vec<_>>().join("\n");
+    rendered.push_str(&format!("\ncompleteness: {:?}\n", answer.completeness));
+    assert_eq!(
+        rendered,
+        include_str!("../../../../tests/fixtures/java-static-import-reverse/expected.txt"),
+    );
+}
+
+#[test]
+#[hardwon("#8870: qualified nested Java owners could hide incoming references")]
+fn java_nested_owner_reverse_sites() {
+    const OWNER: &str = "src/main/java/p/Outer.java";
+    let (fixture, analyzer) = fixture_with_java_sources(&[
+        (
+            OWNER,
+            "package p; public class Outer { public static class Inner { public static void m() {} } }",
+        ),
+        (
+            "src/main/java/q/Use.java",
+            "package q; class Use { void call() { p.Outer.Inner.m(); } }",
+        ),
+    ]);
+    let method = target(
+        &analyzer,
+        &fixture,
+        OWNER,
+        "m",
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+    );
+    let answer = inverse(&analyzer, &method);
+    let sites = answer
+        .edges
+        .iter()
+        .map(|edge| {
+            let source = edge.site.file.read_to_string().expect("read caller source");
+            format!(
+                "{}:{}..{}: {}",
+                brokk_bifrost_core::path_utils::rel_path_string(&edge.site.file),
+                edge.site.range.start_byte,
+                edge.site.range.end_byte,
+                &source[edge.site.range.start_byte..edge.site.range.end_byte]
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut rendered = sites.into_iter().collect::<Vec<_>>().join("\n");
+    rendered.push_str(&format!("\ncompleteness: {:?}\n", answer.completeness));
+    assert_eq!(
+        rendered,
+        include_str!("../../../../tests/fixtures/java-nested-owner-reverse/expected.txt")
+    );
+}
+
+#[test]
 fn java_native_selected_inverse_candidate_mount_reader_seeks_shared_indexes() {
     let (fixture, analyzer) = fixture();
     let class = target(
@@ -176,7 +276,7 @@ fn java_native_selected_inverse_candidate_mount_reader_seeks_shared_indexes() {
     );
     let answer = inverse(&analyzer, &class);
     assert!(!answer.edges.is_empty(), "{answer:#?}");
-    let plan = brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::last_jvm_reverse_candidate_plan_for_test();
+    let plan = brokk_bifrost_analysis::analyzer::store::resolution_operation::nominal_reverse_rows::last_jvm_reverse_candidate_plan_for_test();
     eprintln!("selected Java reverse candidate EXPLAIN QUERY PLAN: {plan:#?}");
     for required in [
         "resolution_reference_lookup_identities_identity",
@@ -495,10 +595,14 @@ fn java_native_incoming_calls_preserve_overload_identity() {
             expected,
             "the source-level argument selects this overload for {overload:?}"
         );
-        assert!(
-            answer.diagnostics.is_empty(),
-            "the intrinsic overload pair is fully decidable: {answer:#?}"
+        assert_eq!(
+            answer.caller_inventory,
+            brokk_bifrost_analysis::analyzer::usages::call_relations::CallerInventoryCoverage::Incomplete,
+            "instance dispatch is not fully inverted: {answer:#?}"
         );
+        assert!(answer.diagnostics.iter().any(|diagnostic| {
+            diagnostic.reason_kind.as_deref() == Some("native_call_dispatch_unenumerable")
+        }));
     }
 }
 
@@ -780,4 +884,114 @@ fn java_native_usage_sites_match_the_incumbent_on_shared_real_store_families() {
             native_sites.difference(&legacy_sites).collect::<Vec<_>>(),
         );
     }
+}
+
+#[test]
+fn java_native_incoming_golden() {
+    const CASE: &str = "src/analyzer/java/selected_reverse/fixtures/incoming_golden";
+    let (fixture, analyzer) = fixture_with_java_sources(&[(
+        "src/main/java/sample/Calls.java",
+        include_str!("fixtures/incoming_golden/Calls.java"),
+    )]);
+    let file = "src/main/java/sample/Calls.java";
+    let declarations = analyzer.declarations(&fixture.file(file));
+    let limits = brokk_bifrost_analysis::analyzer::usages::call_relations::CallRelationLimits {
+        max_files: 100,
+        max_source_bytes: usize::MAX,
+        max_candidates: 100,
+    };
+    let mut rendered = String::new();
+    for name in [
+        "direct",
+        "Worker",
+        "pick",
+        "virtual",
+        "run",
+        "compareTo",
+        "referenced",
+    ] {
+        let units = declarations
+            .iter()
+            .filter(|unit| {
+                unit.terminal_name() == name
+                    && unit.kind() == brokk_bifrost_core::analyzer::model::CodeUnitType::Function
+            })
+            .collect::<Vec<_>>();
+        assert!(!units.is_empty(), "missing {name}: {declarations:#?}");
+        for unit in units {
+            let native = crate::analyzer::java::native_call_relations::java_native_incoming_calls(
+                &analyzer, unit, limits, None,
+            );
+            let mut native_sites = native
+                .sites
+                .iter()
+                .map(|site| {
+                    let source = fixture
+                        .project()
+                        .read_source(&site.file)
+                        .expect("read golden site");
+                    format!(
+                        "{}:{}",
+                        brokk_bifrost_core::path_utils::rel_path_string(&site.file),
+                        &source[site.range.start_byte..site.range.end_byte]
+                    )
+                })
+                .collect::<Vec<_>>();
+            native_sites.sort();
+            let mut reasons = native
+                .diagnostics
+                .iter()
+                .filter_map(|d| d.reason_kind.as_deref())
+                .collect::<Vec<_>>();
+            reasons.sort();
+            reasons.dedup();
+            rendered.push_str(&format!(
+                "{name} {:?}: {:?}; reasons={reasons:?}\n  native={native_sites:?}\n",
+                unit.signature(),
+                native.caller_inventory
+            ));
+        }
+    }
+    let (broken_fixture, broken_analyzer) = fixture_with_java_sources(&[
+        (
+            "src/main/java/sample/Calls.java",
+            include_str!("fixtures/incoming_golden/Calls.java"),
+        ),
+        (
+            "src/main/java/sample/Broken.java",
+            include_str!("fixtures/incoming_golden/Broken.java"),
+        ),
+    ]);
+    let broken_target = target(
+        &broken_analyzer,
+        &broken_fixture,
+        file,
+        "direct",
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+    );
+    let broken_result = crate::analyzer::java::native_call_relations::java_native_incoming_calls(
+        &broken_analyzer,
+        &broken_target,
+        limits,
+        None,
+    );
+    let mut broken_reasons = broken_result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.reason_kind.as_deref())
+        .collect::<Vec<_>>();
+    broken_reasons.sort();
+    broken_reasons.dedup();
+    rendered.push_str(&format!(
+        "parse-error direct: {:?}; reasons={broken_reasons:?}\n",
+        broken_result.caller_inventory
+    ));
+    let expected_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(CASE)
+        .join("expected.txt");
+    if std::env::var_os("BIFROST_BLESS").is_some() {
+        std::fs::write(&expected_path, &rendered).expect("bless incoming golden");
+    }
+    let expected = std::fs::read_to_string(&expected_path).expect("read incoming golden");
+    assert_eq!(expected, rendered);
 }

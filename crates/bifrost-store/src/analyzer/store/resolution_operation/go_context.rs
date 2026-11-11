@@ -6,6 +6,8 @@
 
 /// Registered native incompleteness label; readers share this value.
 pub const GO_IMPORT_INCOMPLETE: &str = "go-import-incomplete";
+/// A source-less package has no selected declaration provider for this member.
+pub const GO_EXTERNAL_MEMBER_UNPROVIDED: &str = "go-external-member-unprovided";
 
 use super::file_context::RootHalfRequest;
 use super::placement_access::read_placement_rows;
@@ -103,7 +105,7 @@ const TRANSIENT_PLACEMENT: &str =
 
 // A transient Go source without a proven placement leaves only its containing
 // Go package's inventory open. Go package files share a directory.
-const UNPLACED_TRANSIENT_SOURCES: &str = r#"
+pub(crate) const UNPLACED_TRANSIENT_SOURCES: &str = r#"
 SELECT mounted.persisted_relative_path
 FROM temp.selected_resolution_mounts AS mounted
 WHERE mounted.storage_language = 'go' AND mounted.file_version_id IS NULL
@@ -325,7 +327,8 @@ impl SelectedResolutionOperation<'_, '_> {
         self.ready
             .inventory
             .connection()
-            .query_row(DOMAIN_DISCOVERY_FAILURE_SQL, [context_id], |row| {
+            .prepare_cached(DOMAIN_DISCOVERY_FAILURE_SQL)?
+            .query_row([context_id], |row| {
                 Ok(super::graph_stage::GraphDomainDiscoveryFailure {
                     domain_dir: row.get(0)?,
                     gowork_path: row.get(1)?,
@@ -507,11 +510,12 @@ impl SelectedResolutionOperation<'_, '_> {
         let Some(_selection) = self.go_context_selection(context_id, source_role)? else {
             return Ok(GoHierarchySelectionCoverage::Partial);
         };
-        let complete: bool = self.ready.inventory.connection().query_row(
-            GO_HIERARCHY_SELECTION_COVERAGE_SQL,
-            rusqlite::params![context_id],
-            |row| row.get(0),
-        )?;
+        let complete: bool = self
+            .ready
+            .inventory
+            .connection()
+            .prepare_cached(GO_HIERARCHY_SELECTION_COVERAGE_SQL)?
+            .query_row(rusqlite::params![context_id], |row| row.get(0))?;
         Ok(if complete {
             GoHierarchySelectionCoverage::Workspace
         } else {
@@ -613,6 +617,36 @@ impl SelectedResolutionOperation<'_, '_> {
         };
         let identities = self.ready.context_identities.clone();
         let mut reasons = Vec::new();
+        let (source_inventory, caller_rel_path, has_build_directive): (bool, String, bool) =
+            connection
+                .prepare_cached(SOURCE_INVENTORY_CALLER_BUILD_CONSTRAINTS_SQL)?
+                .query_row(
+                    rusqlite::params![context_id, package_id, file_version],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+        if source_inventory
+            && brokk_bifrost_go::packages::source_path_has_build_constraints(
+                std::path::Path::new(&caller_rel_path),
+                has_build_directive,
+            )
+        {
+            // Source inventory places every constrained file because no Go
+            // tool selection exists (discovery failed or is disabled). Whether
+            // the selected configuration compiles this caller is unknown, so
+            // its answers cannot be complete (#9869). Unconstrained callers
+            // are compiled under every selection and keep exact answers.
+            let evidence = format!(
+                "Go file {caller_rel_path:?} has build constraints, but its package has no Go-tool build selection"
+            );
+            let mut hash = CanonicalHasher::new(b"bifrost-go-file-build-selection-unavailable:v1");
+            hash.field("context", &context_id.to_le_bytes());
+            hash.field("evidence", evidence.as_bytes());
+            reasons.push(identities.named_semantic(
+                hash.finish(),
+                "go-file-build-selection-unavailable",
+                &evidence,
+            ));
+        }
         if selection.global_gap_count != 0 {
             let mut hash = CanonicalHasher::new(b"bifrost-go-context-incomplete:v1");
             hash.field("context", &context_id.to_le_bytes());
@@ -751,12 +785,13 @@ impl SelectedResolutionOperation<'_, '_> {
         }
         let connection = self.ready.inventory.connection();
         let (package_complete, package_evidence): (bool, String) = connection
-            .query_row(
+            .prepare_cached(
                 "SELECT complete, json(gaps) FROM main.go_package_instances
                  WHERE context_id=?1 AND package_id=?2",
-                rusqlite::params![context_id, package_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            )?
+            .query_row(rusqlite::params![context_id, package_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()?
             .ok_or_else(|| StoreError::corrupt("selected Go caller package disappeared"))?;
         let caller_directory =
@@ -924,6 +959,21 @@ CROSS JOIN main.go_context_selections selection ON selection.selection_id=public
 CROSS JOIN json_each(provider.gaps) error
 WHERE json_extract(error.value, '$.code')='tool_package_error'
 ORDER BY selection.domain_dir, selection.gowork_path, json_extract(error.value, '$.evidence.error')
+"#;
+
+/// Whether a caller's package came from source inventory, with the caller's
+/// path and whether its source carries a build directive. Filename GOOS/GOARCH
+/// suffixes are read from the path by the caller.
+const SOURCE_INVENTORY_CALLER_BUILD_CONSTRAINTS_SQL: &str = r#"
+SELECT package.provider_provenance='source_inventory', file.rel_path,
+       COALESCE(manifest.has_build_constraints, 0)
+FROM main.go_package_instances AS package
+CROSS JOIN main.workspace_file_versions AS file
+LEFT JOIN main.blobs AS blob
+  ON blob.blob_oid=file.blob_oid AND blob.lang=file.lang AND blob.parse_variant=x''
+ AND blob.generation=file.generation
+LEFT JOIN main.source_go_manifests AS manifest ON manifest.blob_id=blob.id
+WHERE package.context_id=?1 AND package.package_id=?2 AND file.file_version_id=?3
 "#;
 
 pub(crate) const DOMAIN_DISCOVERY_FAILURE_SQL: &str = r#"

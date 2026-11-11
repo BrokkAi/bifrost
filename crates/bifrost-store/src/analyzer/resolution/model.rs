@@ -1712,9 +1712,32 @@ pub enum ResolutionIncompleteReason {
     UnmountedFile {
         fragment: BindingFragmentId,
     },
+    /// A Python value's only incompleteness is that its receiver may be a
+    /// subclass of the nominal owner (`ResolutionValueObligation::ReceiverSubclass`).
+    ///
+    /// Every consumer treats it as `UnsupportedSemantic`: dispatch and member
+    /// lookup stay open. Only the Python type adapter may report a nominal
+    /// type answer as complete when this is the sole reason, because the
+    /// nominal identity of `cls` or `self` is exact even when lookup is not.
+    /// It is appended last so the derived order and hash of the other reasons
+    /// do not move.
+    ReceiverSubclassObligation(SemanticId),
 }
 
 impl ResolutionIncompleteReason {
+    /// Cancelled, CyclicPrefixDependency, ReceiverBudgetExhausted and
+    /// TimeBudgetExceeded are not reusable across reads. This is not every
+    /// operation-local, non-persistable reason: UnmountedFile is another.
+    pub(crate) fn is_execution_stop(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled
+                | Self::CyclicPrefixDependency(_)
+                | Self::ReceiverBudgetExhausted(_)
+                | Self::TimeBudgetExceeded(_)
+        )
+    }
+
     pub const fn kind(self) -> ResolutionCompletionReasonKind {
         match self {
             Self::Cancelled => {
@@ -1737,12 +1760,97 @@ impl ResolutionIncompleteReason {
                 ResolutionCompletionReasonKind::InconsistentPrecedence
             }
             Self::OpenBoundary { .. } => ResolutionCompletionReasonKind::OpenBoundary,
+            // Operation-local reasons must never be persisted. This panic is the guard:
+            // a producer that tries to persist one fails in tests, not silently in production.
+            Self::ReceiverSubclassObligation(_) => {
+                panic!("a query-local receiver-subclass obligation has no persisted kind")
+            }
             Self::UnsupportedSemantic(_) => ResolutionCompletionReasonKind::UnsupportedSemantic,
         }
     }
 }
 
 pub type CompletionReason = ResolutionIncompleteReason;
+
+/// Render completion evidence by caller-supplied, in-memory identity keys.
+/// The Go import caller supplies selected-context content for every reason.
+pub(crate) fn content_ordered_completion_debug(
+    completion: &ResolutionCompletion,
+    mut content: impl FnMut(super::ResolutionIdentityDigestKey) -> [u8; 32],
+) -> String {
+    let ResolutionCompletion::Incomplete(reasons) = completion else {
+        return "Complete".to_owned();
+    };
+    let mut rendered = Vec::with_capacity(reasons.len());
+    for reason in reasons.iter() {
+        let (kind, identity, status) = match reason {
+            ResolutionIncompleteReason::Cancelled => (0_u8, None, ""),
+            ResolutionIncompleteReason::CyclicExpansion(path) => (1, Some((*path).into()), ""),
+            ResolutionIncompleteReason::CyclicPrefixDependency(semantic) => {
+                (2, Some((*semantic).into()), "")
+            }
+            ResolutionIncompleteReason::InconsistentPrecedence(semantic) => {
+                (3, Some((*semantic).into()), "")
+            }
+            ResolutionIncompleteReason::OpenBoundary { semantic, status } => {
+                (4, Some((*semantic).into()), status.label())
+            }
+            ResolutionIncompleteReason::UnsupportedSemantic(semantic) => {
+                (5, Some((*semantic).into()), "")
+            }
+            ResolutionIncompleteReason::ReceiverBudgetExhausted(semantic) => {
+                (6, Some((*semantic).into()), "")
+            }
+            ResolutionIncompleteReason::TimeBudgetExceeded(semantic) => {
+                (7, Some((*semantic).into()), "")
+            }
+            ResolutionIncompleteReason::UnmountedFile { fragment } => {
+                (8, Some((*fragment).into()), "")
+            }
+            ResolutionIncompleteReason::ReceiverSubclassObligation(semantic) => {
+                (9, Some((*semantic).into()), "")
+            }
+        };
+        let digest = identity.map(&mut content).unwrap_or([0; 32]);
+        let label = match kind {
+            0 => "Cancelled",
+            1 => "CyclicExpansion",
+            2 => "CyclicPrefixDependency",
+            3 => "InconsistentPrecedence",
+            4 => "OpenBoundary",
+            5 => "UnsupportedSemantic",
+            6 => "ReceiverBudgetExhausted",
+            7 => "TimeBudgetExceeded",
+            8 => "UnmountedFile",
+            9 => "ReceiverSubclassObligation",
+            _ => unreachable!(),
+        };
+        let mut value = String::new();
+        if identity.is_some() {
+            use std::fmt::Write as _;
+            for byte in digest {
+                write!(value, "{byte:02x}").expect("writing to String cannot fail");
+            }
+            if !status.is_empty() {
+                value.push(':');
+                value.push_str(status);
+            }
+            value = format!("{label}({value})");
+        } else {
+            value.push_str(label);
+        }
+        rendered.push(((kind, digest, status), value));
+    }
+    rendered.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    format!(
+        "Incomplete([{}])",
+        rendered
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
 
 #[derive(Debug, Clone)]
 pub enum ResolutionCompletion {
@@ -2151,6 +2259,18 @@ impl ResolutionTypeRef {
 pub enum ResolutionValueObligation {
     /// The receiver may be a subclass of the nominal owner and change lookup.
     ReceiverSubclass,
+}
+
+impl ResolutionValueObligation {
+    /// The incompleteness a frontier slot carries while one of its values has
+    /// this obligation. A new obligation kind names its reason here; only the
+    /// receiver-subclass obligation has a typed reason, which lets the Python
+    /// type adapter tell it from every other unsupported semantic.
+    const fn incomplete_reason(self, slot: SemanticId) -> ResolutionIncompleteReason {
+        match self {
+            Self::ReceiverSubclass => ResolutionIncompleteReason::ReceiverSubclassObligation(slot),
+        }
+    }
 }
 
 /// One value alternative at the binding/type-flow frontier.
@@ -2581,12 +2701,15 @@ fn value_obligation_completion(
     values: &[ResolutionSlotValue],
     completion: ResolutionCompletion,
 ) -> ResolutionCompletion {
-    if values.iter().any(|value| value.obligation().is_some()) {
-        completion.combine(&ResolutionCompletion::incomplete([
-            ResolutionIncompleteReason::UnsupportedSemantic(slot),
-        ]))
-    } else {
+    let reasons = values
+        .iter()
+        .filter_map(|value| value.obligation())
+        .map(|obligation| obligation.incomplete_reason(slot))
+        .collect::<BTreeSet<_>>();
+    if reasons.is_empty() {
         completion
+    } else {
+        completion.combine(&ResolutionCompletion::incomplete(reasons))
     }
 }
 
@@ -2774,6 +2897,23 @@ impl LookupAlternative {
     }
 }
 
+/// Labels locate surviving paths; equal labels do not merge occurrences.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LexicalChoiceSurvivor {
+    Target(SemanticId),
+    Terminal(EndpointSignature),
+}
+
+type LexicalChoiceEntry = (LexicalChoiceSurvivor, Box<[LexicalChoiceRecord]>);
+
+/// Provenance of lexical alternatives in an answer. Unknown contains only
+/// failure atoms minted by the constructor, never copied provider evidence.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LexicalChoiceCoverage {
+    Known(Box<[LexicalChoiceEntry]>),
+    Unknown(Box<[ResolutionIncompleteReason]>),
+}
+
 /// One point-resolution result. Ambiguity is a complete multi-target answer.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ResolutionAnswer {
@@ -2786,7 +2926,16 @@ pub struct ResolutionAnswer {
     // Query-owned ordered alternatives, strongest first. Transformations that
     // rebuild an answer must re-prove this structure; `new` deliberately omits it.
     lookup_decision: Option<Box<[LookupAlternative]>>,
+    pub(crate) lexical_choice_coverage: LexicalChoiceCoverage,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+type LexicalChoiceTestRecord = (
+    PartialPathId,
+    ResolutionIncompleteReason,
+    u32,
+    Vec<PrecedenceStep>,
+);
 
 impl ResolutionAnswer {
     /// Structural payload bytes, excluding shared completion reasons and
@@ -2797,6 +2946,7 @@ impl ResolutionAnswer {
             witnesses,
             completion: _,
             lookup_decision,
+            lexical_choice_coverage,
         } = self;
         let mut bytes =
             size_of_val(self) + size_of_val(targets.as_ref()) + size_of_val(witnesses.as_ref());
@@ -2830,6 +2980,22 @@ impl ResolutionAnswer {
                 }
             }
         }
+        if let LexicalChoiceCoverage::Known(paths) = lexical_choice_coverage {
+            bytes += size_of_val(paths.as_ref());
+            for (key, records) in paths.iter() {
+                if let LexicalChoiceSurvivor::Terminal(endpoint) = key {
+                    bytes += size_of_val(endpoint.symbols.fixed())
+                        + size_of_val(endpoint.scopes.fixed());
+                }
+                bytes += size_of_val(records.as_ref());
+                for record in records.iter() {
+                    bytes += size_of_val(record.precedence.as_ref());
+                }
+            }
+        }
+        if let LexicalChoiceCoverage::Unknown(reasons) = lexical_choice_coverage {
+            bytes += size_of_val(reasons.as_ref());
+        }
         bytes
     }
 
@@ -2843,12 +3009,49 @@ impl ResolutionAnswer {
             witnesses: witnesses.into(),
             completion,
             lookup_decision: None,
+            lexical_choice_coverage: LexicalChoiceCoverage::Unknown(Box::new([])),
         }
     }
 
     pub(super) fn with_lookup_decision(mut self, decision: Box<[LookupAlternative]>) -> Self {
         self.lookup_decision = Some(decision);
         self
+    }
+
+    pub(crate) fn with_lexical_choice_coverage(mut self, coverage: LexicalChoiceCoverage) -> Self {
+        self.lexical_choice_coverage = coverage;
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn lexical_choices_for_test(&self) -> Option<&[LexicalChoiceEntry]> {
+        match &self.lexical_choice_coverage {
+            LexicalChoiceCoverage::Known(paths) => Some(paths),
+            LexicalChoiceCoverage::Unknown(_) => None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn lexical_choice_sequences_for_test(&self) -> Option<Vec<Vec<LexicalChoiceTestRecord>>> {
+        self.lexical_choices_for_test().map(|paths| {
+            paths
+                .iter()
+                .map(|(_, records)| {
+                    records
+                        .iter()
+                        .map(|record| {
+                            (
+                                record.source_path,
+                                record.reason,
+                                record.segment_position,
+                                record.precedence.to_vec(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect()
+        })
     }
 
     pub(super) fn lookup_decision(&self) -> Option<&[LookupAlternative]> {
@@ -2929,11 +3132,42 @@ impl ResolutionAnswer {
             }
             None => None,
         };
+        let lexical_choice_coverage = match &self.lexical_choice_coverage {
+            LexicalChoiceCoverage::Known(paths) => {
+                let mut cloned = Vec::with_capacity(paths.len());
+                for (key, path) in paths.iter() {
+                    if cancelled() {
+                        return None;
+                    }
+                    let key = match key {
+                        LexicalChoiceSurvivor::Target(target) => {
+                            LexicalChoiceSurvivor::Target(*target)
+                        }
+                        LexicalChoiceSurvivor::Terminal(endpoint) => {
+                            LexicalChoiceSurvivor::Terminal(endpoint.clone_with_poll(cancelled)?)
+                        }
+                    };
+                    let mut records = Vec::with_capacity(path.len());
+                    for record in path.iter() {
+                        if cancelled() {
+                            return None;
+                        }
+                        records.push(record.clone());
+                    }
+                    cloned.push((key, records.into_boxed_slice()));
+                }
+                LexicalChoiceCoverage::Known(cloned.into_boxed_slice())
+            }
+            LexicalChoiceCoverage::Unknown(reasons) => LexicalChoiceCoverage::Unknown(
+                clone_copy_slice_with_poll(reasons, cancelled)?.into_boxed_slice(),
+            ),
+        };
         Some(Self {
             targets: targets.into_boxed_slice(),
             witnesses: witnesses.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
             lookup_decision,
+            lexical_choice_coverage,
         })
     }
 
@@ -3199,6 +3433,17 @@ fn alpha_variable_ordinal(
     *variables.entry(variable).or_insert(next)
 }
 
+/// One unresolved lexical choice contributed by a particular lowered source row.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LexicalChoiceRecord {
+    pub source_fragment: BindingFragmentId,
+    pub source_path: PartialPathId,
+    pub reason: ResolutionIncompleteReason,
+    pub owner: BindingNodeId,
+    pub precedence: Box<[PrecedenceStep]>,
+    pub segment_position: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct PartialPath {
     #[doc(hidden)]
@@ -3211,6 +3456,10 @@ pub struct PartialPath {
     pub witness: Box<[WitnessStep]>,
     #[doc(hidden)]
     pub completion: ResolutionCompletion,
+    lexical_choices: Box<[LexicalChoiceRecord]>,
+    /// Index into `lexical_choices`; identifies one use even when source rows repeat.
+    addressed_lexical_choice: Option<usize>,
+    segment_count: u32,
     /// A root route head whose selected owner resolution continues later.
     owner_continued: bool,
     /// The source position at which a positional root import (Scala) takes
@@ -3250,6 +3499,9 @@ impl PartialEq for PartialPath {
             precedence,
             witness,
             completion,
+            lexical_choices,
+            addressed_lexical_choice,
+            segment_count,
             owner_continued,
             root_import_activation,
             native_import: _,
@@ -3260,6 +3512,9 @@ impl PartialEq for PartialPath {
             && *precedence == other.precedence
             && *witness == other.witness
             && *completion == other.completion
+            && *lexical_choices == other.lexical_choices
+            && *addressed_lexical_choice == other.addressed_lexical_choice
+            && *segment_count == other.segment_count
             && *owner_continued == other.owner_continued
             && *root_import_activation == other.root_import_activation
     }
@@ -3275,6 +3530,9 @@ impl std::hash::Hash for PartialPath {
             precedence,
             witness,
             completion,
+            lexical_choices,
+            addressed_lexical_choice,
+            segment_count,
             owner_continued,
             root_import_activation,
             native_import: _,
@@ -3285,6 +3543,9 @@ impl std::hash::Hash for PartialPath {
         precedence.hash(state);
         witness.hash(state);
         completion.hash(state);
+        lexical_choices.hash(state);
+        addressed_lexical_choice.hash(state);
+        segment_count.hash(state);
         owner_continued.hash(state);
         root_import_activation.hash(state);
     }
@@ -3453,6 +3714,9 @@ impl PartialPath {
             precedence,
             witness,
             completion,
+            lexical_choices: Box::new([]),
+            addressed_lexical_choice: None,
+            segment_count: 1,
             owner_continued: false,
             root_import_activation: None,
             native_import: None,
@@ -3478,6 +3742,89 @@ impl PartialPath {
 
     pub fn completion(&self) -> &ResolutionCompletion {
         &self.completion
+    }
+
+    pub(crate) fn lexical_choices(&self) -> &[LexicalChoiceRecord] {
+        &self.lexical_choices
+    }
+
+    pub(crate) fn addressed_lexical_choice(&self) -> Option<usize> {
+        self.addressed_lexical_choice
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn lexical_choice_metadata_for_test(
+        &self,
+    ) -> (Vec<LexicalChoiceTestRecord>, Option<usize>) {
+        (
+            self.lexical_choices
+                .iter()
+                .map(|record| {
+                    (
+                        record.source_path,
+                        record.reason,
+                        record.segment_position,
+                        record.precedence.to_vec(),
+                    )
+                })
+                .collect(),
+            self.addressed_lexical_choice,
+        )
+    }
+
+    pub(crate) fn segment_count(&self) -> u32 {
+        self.segment_count
+    }
+
+    pub(crate) fn with_lexical_metadata(
+        mut self,
+        records: Box<[LexicalChoiceRecord]>,
+        addressed: Option<usize>,
+        segment_count: u32,
+    ) -> Self {
+        assert!(addressed.is_none_or(|index| index < records.len()));
+        assert!(segment_count > 0);
+        self.lexical_choices = records;
+        self.addressed_lexical_choice = addressed;
+        self.segment_count = segment_count;
+        self
+    }
+
+    pub(crate) fn settle_addressed_lexical_choice(mut self) -> Self {
+        let Some(index) = self.addressed_lexical_choice.take() else {
+            return self;
+        };
+        let mut records = self.lexical_choices.into_vec();
+        records.remove(index);
+        self.lexical_choices = records.into_boxed_slice();
+        self
+    }
+
+    pub(crate) fn carry_lexical_choices_from(mut self, source: &Self) -> Self {
+        self.lexical_choices = source.lexical_choices.clone();
+        self.addressed_lexical_choice = source.addressed_lexical_choice;
+        self.segment_count = source.segment_count;
+        self
+    }
+
+    pub(crate) fn without_addressed_lexical_choice(mut self) -> Self {
+        self.addressed_lexical_choice = None;
+        self
+    }
+
+    pub(crate) fn with_lexical_choice(
+        mut self,
+        record: LexicalChoiceRecord,
+        addressed: bool,
+    ) -> Self {
+        let mut records = self.lexical_choices.into_vec();
+        if addressed {
+            self.addressed_lexical_choice = Some(records.len());
+        }
+        records.push(record);
+        self.lexical_choices = records.into_boxed_slice();
+        self
     }
 
     pub const fn owner_continued(&self) -> bool {
@@ -3581,9 +3928,22 @@ impl PartialPath {
     where
         P: FnMut() -> bool + ?Sized,
     {
+        let mut proven_closed = Vec::with_capacity(reasons.len());
+        for &reason in reasons {
+            if cancelled() {
+                return None;
+            }
+            if !self
+                .lexical_choices
+                .iter()
+                .any(|record| record.reason == reason)
+            {
+                proven_closed.push(reason);
+            }
+        }
         self.completion = self
             .completion
-            .without_reasons_with_poll(reasons, cancelled)?;
+            .without_reasons_with_poll(&proven_closed, cancelled)?;
         Some(self)
     }
 
@@ -3705,6 +4065,9 @@ impl PartialPath {
             precedence: clone_copy_slice_with_poll(&self.precedence, cancelled)?.into_boxed_slice(),
             witness: clone_copy_slice_with_poll(&self.witness, cancelled)?.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
+            lexical_choices: self.clone_lexical_choices_with_poll(cancelled)?,
+            addressed_lexical_choice: self.addressed_lexical_choice,
+            segment_count: self.segment_count,
             owner_continued: self.owner_continued,
             root_import_activation: self.root_import_activation,
             native_import: self.native_import.clone(),
@@ -3750,6 +4113,9 @@ impl PartialPath {
             precedence: clone_copy_slice_with_poll(&self.precedence, cancelled)?.into_boxed_slice(),
             witness: clone_copy_slice_with_poll(&self.witness, cancelled)?.into_boxed_slice(),
             completion: clone_completion_with_poll(&self.completion, cancelled)?,
+            lexical_choices: self.clone_lexical_choices_with_poll(cancelled)?,
+            addressed_lexical_choice: self.addressed_lexical_choice,
+            segment_count: self.segment_count,
             owner_continued: self.owner_continued,
             root_import_activation: self.root_import_activation,
             native_import: self.native_import.clone(),
@@ -3820,6 +4186,22 @@ impl PartialPath {
         extend_copy_slice_with_poll(&mut witness, &next.witness, cancelled)?;
         let completion =
             combine_completion_with_poll(&self.completion, &next.completion, cancelled)?;
+        let mut lexical_choices = self.clone_lexical_choices_with_poll(cancelled)?.into_vec();
+        let address_offset = lexical_choices.len();
+        for record in next.lexical_choices.iter() {
+            if cancelled() {
+                return None;
+            }
+            let mut record = record.clone();
+            record.segment_position = record
+                .segment_position
+                .checked_add(self.segment_count)
+                .expect("a composed path segment position fits u32");
+            lexical_choices.push(record);
+        }
+        let addressed_lexical_choice = next
+            .addressed_lexical_choice
+            .map(|index| address_offset + index);
 
         // Context paths round-trip through query-local SQL without trace
         // annotations. Retain the source import before its root stack is
@@ -3842,6 +4224,12 @@ impl PartialPath {
             precedence: precedence.into_boxed_slice(),
             witness: witness.into_boxed_slice(),
             completion,
+            lexical_choices: lexical_choices.into_boxed_slice(),
+            addressed_lexical_choice,
+            segment_count: self
+                .segment_count
+                .checked_add(next.segment_count)
+                .expect("a composed path segment count fits u32"),
             owner_continued: self.owner_continued || next.owner_continued,
             root_import_activation: None,
             native_import,
@@ -3983,6 +4371,23 @@ impl ResolutionCompletion {
 }
 
 impl PartialPath {
+    fn clone_lexical_choices_with_poll<P>(
+        &self,
+        cancelled: &mut P,
+    ) -> Option<Box<[LexicalChoiceRecord]>>
+    where
+        P: FnMut() -> bool,
+    {
+        let mut records = Vec::with_capacity(self.lexical_choices.len());
+        for record in self.lexical_choices.iter() {
+            if cancelled() {
+                return None;
+            }
+            records.push(record.clone());
+        }
+        Some(records.into_boxed_slice())
+    }
+
     pub(crate) fn charge_retained(
         &self,
         heap: &mut crate::analyzer::store::cache_budget::RetainedHeap,
@@ -3998,6 +4403,10 @@ impl PartialPath {
         }
         heap.slice(&self.precedence);
         heap.slice(&self.witness);
+        heap.slice(&self.lexical_choices);
+        for record in self.lexical_choices.iter() {
+            heap.slice(&record.precedence);
+        }
         self.completion.charge_retained(heap);
         if let Some(native) = &self.native_import {
             heap.add(std::mem::size_of_val(&**native));
@@ -4025,6 +4434,45 @@ mod tests {
 
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#9015: Go completion diagnostics depended on context identity mint order")]
+    fn context_reason_rendering_uses_content_order() {
+        use crate::analyzer::resolution::SelectedContextIdentities;
+        let render = |reverse: bool| {
+            let identities = SelectedContextIdentities::new();
+            // Mint 02 before 01 in one run; neither mint order may set the
+            // diagnostic order.
+            let mut digests = [[2_u8; 32], [1_u8; 32]];
+            if reverse {
+                digests.reverse();
+            }
+            let reasons = digests.map(|digest| {
+                ResolutionIncompleteReason::UnsupportedSemantic(identities.named_semantic(
+                    digest,
+                    "go-import-incomplete",
+                    "provider",
+                ))
+            });
+            let completion = ResolutionCompletion::incomplete(reasons);
+            let rendered: String = content_ordered_completion_debug(&completion, |key| {
+                let number = key
+                    .context_number()
+                    .expect("test reasons are context-local");
+                identities
+                    .content_digest(number)
+                    .expect("test reason has content")
+            });
+            rendered
+        };
+        let expected = format!(
+            "Incomplete([UnsupportedSemantic({}), UnsupportedSemantic({})])",
+            "01".repeat(32),
+            "02".repeat(32),
+        );
+        assert_eq!(render(false), expected);
+        assert_eq!(render(true), expected);
+    }
 
     fn variable(value: &str) -> StackVariableId {
         StackVariableId::for_test(value.as_bytes())

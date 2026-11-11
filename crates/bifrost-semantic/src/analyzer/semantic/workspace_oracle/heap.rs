@@ -5,6 +5,7 @@
 //! identities into runtime singletons.
 
 use crate::analyzer::semantic::MemoryLocationKind;
+use crate::analyzer::semantic::ObservationPhase;
 
 use crate::analyzer::semantic::workspace_oracle::common::Interruption;
 
@@ -180,6 +181,13 @@ pub fn transfer_stops_identity_trace(
     value: crate::analyzer::semantic::ValueId,
 ) -> bool {
     matches!(
+        effect,
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::OwnershipUnknown,
+            source,
+            target,
+        } if *source == value || *target == value
+    ) || matches!(
         effect,
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Transfer(transfer),
@@ -1262,6 +1270,38 @@ pub fn substitute_object_into_callee(
         cardinality,
     )
     .map_err(|error| internal_contract("invalid incoming object substitution", error))
+}
+
+/// Represent an existing object at the exact selected observation. An empty
+/// call context can occur inside a callee, while a substituted object's own
+/// context must match before it can be reused there.
+#[doc(hidden)]
+pub fn rehome_object_at_point(
+    object: AbstractObject,
+    observation: &ValueAtPoint,
+) -> Result<Option<AbstractObject>, SemanticProviderError> {
+    debug_assert_eq!(observation.phase(), ObservationPhase::BeforeEffects);
+    let procedure = observation.point().procedure();
+    let context = observation.context();
+    let mut root = object.identity();
+    while let AccessPathRoot::FieldPath { base, .. } = root {
+        root = base;
+    }
+    let same_procedure = root
+        .scoped_procedure()
+        .is_some_and(|owner| owner.durable_key() == procedure.durable_key());
+    match root {
+        AccessPathRoot::CallSubstitution {
+            context: object_context,
+            ..
+        } if same_procedure => Ok((object_context == context).then_some(object)),
+        AccessPathRoot::CallResult(result) if same_procedure => {
+            Ok((result.caller_context() == context).then_some(object))
+        }
+        _ if same_procedure => Ok(Some(object)),
+        _ if root.scoped_procedure().is_none() && context.calls().is_empty() => Ok(Some(object)),
+        _ => substitute_object_into_callee(object, procedure, context).map(Some),
+    }
 }
 
 #[doc(hidden)]

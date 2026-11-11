@@ -300,9 +300,18 @@ Define one executable static-analysis policy. Top-level document of a policy fil
 | `:description` | optional | bounded human-readable descriptive text | `:description "text"`. Add bounded descriptive text. |
 | `:help-uri` | optional | an absolute HTTP or HTTPS URI | `:help-uri "https://..."`. Link to absolute HTTP(S) remediation help. |
 | `:tags` | optional | policy tags; set (no duplicates) of 0 to 64 items | `:tags [TAG...]`. Attach a duplicate-free set of bounded policy tags. |
+| `:coverage` | optional | `(proven-subset :reason "text")` | Declares that a match or taint policy reports a proven subset. The bounded, non-empty reason appears in the run diagnostic; findings and the run remain non-exhaustive. Other analysis types reject this field. |
 | `:analysis` | required | an analysis record whose fields agree with its explicit type | `:analysis (analysis ...)`. Provide the explicitly typed diagnostic-neutral analysis declaration. |
 | `:classification` | optional | a classification record | `:classification (classification ...)`. Add broad/refined taxonomy and optional CVSS policy. |
 | `:report` | optional | a report record | `:report (report ...)`. Override bounded report retention defaults. |
+
+#### `proven-subset`
+
+```lisp
+(proven-subset :reason "Why coverage is limited")
+```
+
+Use this as a match or taint policy's `:coverage` value. The reason must be a non-empty, single-line string of at most 4096 bytes. The run reports the reason as a `declared_non_exhaustive` diagnostic within the host diagnostic budget and never claims exhaustive completion, including when there are no findings. If the diagnostic budget omits the reason, the run is inconclusive with `ReportRetentionBudget`.
 
 #### `endpoint`
 
@@ -423,6 +432,7 @@ Select and configure exactly one policy analysis kind. Legal in: policy, every a
 | `:call-modeling` | optional | policy, `taint`, `typestate`, or `flow` | a call-modeling record | `:call-modeling (call-modeling :unmodeled paranoid\|optimistic\|require-model)`. Choose fallback behavior for unmodeled calls; omission defaults to paranoid. |
 | `:threat-models` | optional | policy, `taint` | a non-empty set of threat-model values | `:threat-models [remote\|commandargs\|environment\|stdin\|file\|database...]`. Select active source kinds; omission defaults to `[remote]`. |
 | `:on-unknown` | optional | policy, every analysis type | an on-unknown record | `:on-unknown (on-unknown :verdict abstain\|warn-unreliable\|fail-closed\|treat-may-as-finding)`. Choose what a verdict blocked by unknown evidence does; omission defaults to abstain. |
+| `:completion` | optional | policy, `match` | an inconclusive-on record | `:completion (inconclusive-on [depth_bound_reached])`. Treat a reached or undecidable call-depth bound as run incompleteness while retaining findings. |
 | `:languages` | optional | policy, every analysis type | one or more language labels, the aliases `c++` and `c#`, file extensions that one language owns (such as `py` or `tsx`), or the family aliases `jvm` and `js-ts`; list (source order kept) of 1 to 64 items | `:languages [LANGUAGE...]`. Conjoin one shared language scope with every inline RQL and referenced RQL selector in this analysis; `jvm` expands to [java, kotlin, scala] and `js-ts` expands to [javascript, typescript]. A label or extension ignores case, a leading dot, `-`, and `_`; family aliases must be exact. An unknown entry is `invalid-language-label`. |
 | `:where` | optional | policy, every analysis type | one or more workspace-relative path globs; list (source order kept) of 1 to 64 items | `:where ["GLOB"...]`. Conjoin one shared workspace-relative path-glob scope with every inline RQL and referenced RQL selector in this analysis. |
 | `:rql-schema-version` | optional | policy, every analysis type | a supported positive schema version | `:rql-schema-version N`. Pin the RQL schema version for selectors that omit their own; explicit selector pins must agree. This is independent of the RQLP document schema version. |
@@ -464,6 +474,14 @@ Declare what the run does when unknown or incomplete evidence blocked a verdict.
 | Field | Required | Value | Meaning |
 | --- | --- | --- | --- |
 | `:verdict` | required | abstain, warn-unreliable, fail-closed, or treat-may-as-finding | `:verdict abstain\|warn-unreliable\|fail-closed\|treat-may-as-finding`. Abstain and exit unreliable, gate on retained findings alone, fail closed, or publish explicit may evidence as possible findings while preserving coverage obligations. |
+
+#### `inconclusive-on`
+
+```lisp
+(inconclusive-on [depth_bound_reached])
+```
+
+Declare that a reached or undecidable call-depth bound makes a match-policy run inconclusive. The bounded query's completion and proved findings remain unchanged. An existing incomplete or failed cause takes precedence.
 
 ### Selectors
 
@@ -2424,6 +2442,24 @@ retention, is `run`.
 `projection_scenario_membership_budget`,
 `organizational_risk_overlay_budget`, `rule_deadline_exceeded`.
 
+Until causal attribution is implemented for Match and Assertion (#10189),
+Typestate (#10198), and composed Taint and Flow (#10212),
+an active request-local close-match Rust dependency shard marks every retained
+finding in those paths with `read_dependency` for the active pack. When every
+marked finding fits the report's retention budget, the run's completion remains
+unchanged and a complete finding remains complete. The marker never gives way
+to the contributor list: if the list does not fit, it is shortened first, down
+to a count of omitted contributors. If the marker still does not fit at that
+size, the run keeps the longest prefix of marked findings, in finding-ID order,
+that fits. It counts the others in `omitted_findings_lower_bound` and becomes
+`inconclusive` with `report_retention_budget`. The marker means the finding
+**may** depend on that pack, not that a selected record was proven causal.
+Distributed approximate shards are refused at activation.
+This temporary hold also applies to a user-supplied local bundle classified
+as `installed`. Composed taint is the production Rust taint engine when every
+sink is Rust, so premium close-match Rust taint content waits for the causal
+composed receipt.
+
 `deadline_exceeded` means the request's deadline stopped the run, and the
 whole batch stopped with it. `rule_deadline_exceeded` means the caller's
 deadline for this one policy (`run_policy`'s `policy_deadlines_ms`) stopped
@@ -2448,7 +2484,7 @@ makes the exit status 2 unless the policy's `on-unknown` verdict is
 ## Canonical JSON report
 
 `--format json` prints the canonical policy report. MCP `run_policy` returns
-the same document. Its `schema_version` is `6`. The human and SARIF renderers
+the same document. Its `schema_version` is `7`. The human and SARIF renderers
 read the same document, so the three formats agree on finding IDs, hashes,
 locations, severity, certainty, completion, evidence, and classifications.
 
@@ -2459,7 +2495,7 @@ they do not apply.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `schema_version` | integer | Always `6`. |
+| `schema_version` | integer | Always `7`. |
 | `evaluation` | object | The evaluation date and the review file sources. See below. |
 | `execution` | object | Timing and progress metadata. See below. |
 | `rules` | array | One rule descriptor per loaded policy. |
@@ -2528,6 +2564,7 @@ Each `rules[]` entry describes one loaded policy.
 | `policy_id`, `policy_hash`, `analysis_type` | The policy that ran. |
 | `completion` | The completion state. See [Completion states](#completion-states). |
 | `findings` | Retained findings. |
+| `subjects` | When present, bounded typestate subject verdicts. Selector enumeration is `certified` or `uncertified`; selected sites carry finding references, and undecided sites carry reasons; omission counts make truncation explicit. |
 | `diagnostics` | Run diagnostics. Each has `code` (tagged by `type`), `severity`, `impact`, `family`, `message`, `family_count`, `primary`, and `related`. |
 | `diagnostics_truncated` | True when run diagnostics were folded or dropped. |
 | `obligations` | Unmet negative-proof obligations of an assertion policy. Each names the `assertion`, the `kind` (`absence_requires_exhaustive_coverage` or `verdict_requires_witnessed_rows`), the `group`, and the `group_key`. |
@@ -2562,6 +2599,7 @@ Run diagnostic `code.type` values: `code_query` (with a nested CodeQuery
 | `related` | Related locations, each with a `relationship` such as `source`, `sink`, `origin`, `evidence`, `witness_step`, or `declaration`. |
 | `related_truncated`, `omitted_related_locations_lower_bound` | Related-location truncation. |
 | `evidence` | Typed evidence, tagged by `type`: `match`, `taint`, `typestate`, `assertion`, or `flow`. |
+| `model_attribution` | Optional approximation marker, bounded ordered `contributors`, `contributors_complete`, and sound lower bound `omitted_at_least`. Each contributor names its role, pack digest, record ID, built-from X, resolved Y, direction, mismatch kinds, and selection-rule ID/version. Causal roles identify selected source, sink, summary, declaration, or store-end records; store read/write receipts conservatively union across taint classes until #10212. `read_dependency` means a Match, Assertion, Typestate, or composed Taint/Flow finding may depend on an active close-match pack during the temporary family gate. Absent for exact-only findings. |
 | `evidence_refs_truncated`, `omitted_evidence_refs_lower_bound` | Evidence-reference truncation. |
 | `cvss` | CVSS assessments, or null. |
 | `organizational_risk` | Organizational risk assessment, or null. |
@@ -2573,6 +2611,15 @@ Run diagnostic `code.type` values: `code_query` (with a nested CodeQuery
 | `scope` | `null`, or the scope entry that claimed the finding: `{path, reason}`. |
 | `diff` | When present (diff runs): `{disposition, weak_identity}`. `disposition` is `new` or `persisting`. A weak identity is always `new`. |
 | `baseline` | When present (baselined findings): `reason`, optional `accepted_by`, `accepted_at`, and `policy_hash_state`. |
+
+For an admitted Rust tuple-pattern source, the source witness step has the
+exact binder location. Its `provenance` is tagged
+`admitted_pattern_projection` and records the selected declaration's pack
+digest and record ID, the ordered written/import/re-export route, tuple-field
+position and declaration ID, layout arity, exact binder site, and a 32-byte
+admission read-receipt digest. The position must be within the layout arity;
+at most eight route entries are retained. This explains which external field
+was selected without claiming its Copy or Move behavior.
 
 `certainty` `possible` reasons and `completeness` `partial` reasons are typed
 lists. Finding `partial` reasons: `query_provenance_truncated`,
@@ -2737,7 +2784,7 @@ scope decision is in the run's `bifrost.scopeReviews`.
 | --- | --- |
 | `bifrost.execution` | The `execution` object. |
 | `bifrost.incremental` | The `incremental` review; omitted when absent. |
-| `bifrost.policyReportSchemaVersion` | `5`. |
+| `bifrost.policyReportSchemaVersion` | `6`. |
 | `bifrost.policyEvaluation` | The `evaluation` object. |
 | `bifrost.policyRuns` | Per policy: `policy_id`, `policy_hash`, `analysis_type`, `completion`, `diagnostics`, `diagnostics_truncated`, and `work`. |
 | `bifrost.suppressionReviews` | The suppression reviews. |
@@ -2891,6 +2938,27 @@ A file is at most 256 KiB. `policy_id` and `finding_id` are the join key;
 record (`orphan_state: orphaned`, exit 1) from a record whose file the run did
 not analyze. The `--suppressions-file` path is at most 1,024 bytes. The review
 fields are listed in [Review objects](#review-objects).
+
+### Inline directives
+
+    // bifrost: ignore[policy.one, policy.two] -- reason
+    # bifrost: ignore -- reason
+
+| Part | Required | Value | Limit |
+| --- | --- | --- | --- |
+| prefix | yes | `bifrost`, or the word given to `--inline-suppression-prefix` | 1 to 32 ASCII letters, digits, `-`, `_` |
+| `ignore` | yes | the directive word, followed by the end, whitespace or `[` | |
+| `[...]` | no | comma-separated policy IDs; omit for a blanket directive | |
+| `-- reason` | for a blanket directive | one line of text | 4,096 bytes |
+
+A directive alone on its line covers the next line with code. A directive
+after code covers its own line. A finding matches when its primary location
+starts on the covered line. The finding's `inline_suppression` object has
+`line`, `policies` and an optional `reason`. The report's
+`inline_suppressions` object has `prefix`, `entries` (each with `path`,
+`line`, `covered_line`, `policies`, `reason`, `state`, `detail` and
+`matched_findings`), and `omitted_entries` when more than 4,096 directives
+were read. `state` is `applied`, `unused`, `missing_reason` or `malformed`.
 
 ### Scope file
 

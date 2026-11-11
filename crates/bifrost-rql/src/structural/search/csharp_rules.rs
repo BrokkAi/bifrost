@@ -7,8 +7,7 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus,
-    resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::query::CSharpRule;
@@ -18,15 +17,18 @@ use brokk_bifrost_analysis::analyzer::structural::lexical_environment::{
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     csharp_integer_literal_value, declaration_modifier_words, declarator_initializer,
 };
-use brokk_bifrost_core::analyzer::structural::conditional_regions::Activation;
+use brokk_bifrost_core::analyzer::structural::conditional_regions::{Activation, ConditionalRegions};
 use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 use brokk_bifrost_core::analyzer::structural::occurrences::Namespace;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::expression_target_node;
+use brokk_bifrost_csharp::documentation::{Documentation, TagKind, for_declaration};
+use brokk_bifrost_csharp::syntax::csharp_identifier_text;
 use tree_sitter::{Node, Tree};
 
+use super::documentation_tags::{NamedTag, has_unknown_tag, missing_tag};
 use super::field_metadata::{FieldSite, field_sites};
-use super::language_rules::{LanguageRuleMatches, UndecidedSite};
+use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches, UndecidedSite};
 
 /// Return the exact structural spans selected by one closed C# relation.
 pub(super) fn matches_for_file(
@@ -43,19 +45,168 @@ pub(super) fn matches_for_file(
         Err(result) => return result,
     };
     let tree = syntax.tree();
+    if matches!(
+        rule,
+        CSharpRule::MissingXmldocParameter
+            | CSharpRule::UnknownXmldocParameter
+            | CSharpRule::MissingXmldocTypeParameter
+            | CSharpRule::UnknownXmldocTypeParameter
+    ) {
+        let regions = syntax.preprocessor().as_ref()
+            .map(|p| p.conditional_regions(source)).unwrap_or_default();
+        return documentation_parameter_matches(tree, source, rule, file, &regions);
+    }
     let preprocessor = syntax.preprocessor();
     let fields = field_sites(analyzer, file);
     let mut undecided = Vec::new();
     let ranges = match rule {
-        CSharpRule::StaticArray => {
-            static_array_fields(analyzer, file, tree, source, &fields, &mut undecided, &preprocessor.as_ref().map(|p| p.conditional_regions(source)).unwrap_or_default())
-        }
+        CSharpRule::StaticArray => static_array_fields(
+            analyzer,
+            file,
+            tree,
+            source,
+            &fields,
+            &mut undecided,
+            &preprocessor
+                .as_ref()
+                .map(|p| p.conditional_regions(source))
+                .unwrap_or_default(),
+        ),
         CSharpRule::UseNumberConstant => {
             number_constant_uses(tree, source, &fields, &mut undecided)
         }
+        CSharpRule::MissingXmldocParameter
+        | CSharpRule::UnknownXmldocParameter
+        | CSharpRule::MissingXmldocTypeParameter
+        | CSharpRule::UnknownXmldocTypeParameter => unreachable!(),
     };
     LanguageRuleMatches::decided(
         ranges,
+        undecided,
+        Language::CSharp.config_label(),
+        rule.label(),
+        file,
+    )
+}
+
+fn documentation_parameter_matches(
+    tree: &Tree,
+    source: &str,
+    rule: CSharpRule,
+    file: &ProjectFile,
+    regions: &ConditionalRegions,
+) -> LanguageRuleMatches {
+    let mut matches = Vec::new();
+    let mut undecided = Vec::new();
+    for declaration in descendants(tree.root_node()) {
+        let type_rule = matches!(
+            rule,
+            CSharpRule::MissingXmldocTypeParameter | CSharpRule::UnknownXmldocTypeParameter
+        );
+        if !matches!(declaration.kind(), "method_declaration" | "constructor_declaration")
+            && !(type_rule && matches!(declaration.kind(),
+                "class_declaration" | "struct_declaration" | "interface_declaration"
+                | "record_declaration" | "record_struct_declaration" | "delegate_declaration"))
+        {
+            continue;
+        }
+        let type_parameters = declaration.child_by_field_name("type_parameters").or_else(|| {
+            named_children(declaration)
+                .into_iter()
+                .find(|child| child.kind() == "type_parameter_list")
+        });
+        if type_rule && type_parameters.is_none() {
+            continue;
+        }
+        let mut start = declaration.parent().map_or(0, |body| body.start_byte());
+        let mut previous = declaration.prev_named_sibling();
+        while let Some(sibling) = previous {
+            if sibling.kind() != "comment"
+                && sibling.kind() != "attribute_list"
+                && !sibling.kind().starts_with("preproc_")
+            {
+                start = sibling.end_byte();
+                break;
+            }
+            previous = sibling.prev_named_sibling();
+        }
+        let header_end = (if type_rule { type_parameters } else {
+            declaration.child_by_field_name("parameters")
+        }).map_or_else(|| declaration.child_by_field_name("body")
+            .map_or(declaration.end_byte(), |body| body.start_byte()), |list| list.end_byte());
+        if regions.has_uncertain_text(start..header_end) {
+            undecided.push(UndecidedSite::at(
+                node_range(declaration),
+                "documentation or declaration crosses undecided conditional compilation",
+            ));
+            continue;
+        }
+        let tags = match for_declaration(declaration, source) {
+            Documentation::Absent => continue,
+            Documentation::Undecidable(reason) => {
+                undecided.push(UndecidedSite::at(node_range(declaration), reason));
+                continue;
+            }
+            Documentation::Parsed(tags) => tags,
+        };
+        let Some(parameters) = (if type_rule {
+            type_parameters
+        } else {
+            declaration.child_by_field_name("parameters")
+        }) else { continue; };
+        let mut cursor = parameters.walk();
+        let mut parameter_names = parameters
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == if type_rule { "type_parameter" } else { "parameter" })
+            .filter_map(|node| {
+                node.child_by_field_name("name")
+                    .or_else(|| type_rule.then(|| node.named_child(0)).flatten())
+                    .map(|name| (node, name))
+            })
+            .collect::<Vec<_>>();
+        // The grammar inlines _parameter_array, placing its name on the list.
+        if !type_rule && let Some(name) = parameters.child_by_field_name("name") {
+            parameter_names.push((name, name));
+        }
+        let names = parameter_names
+            .iter()
+            .map(|(_, name)| csharp_identifier_text(*name, source).to_owned())
+            .collect::<Vec<_>>();
+        let named_tags = tags
+            .iter()
+            .filter(|tag| tag.kind == if type_rule { TagKind::TypeParam } else { TagKind::Param })
+            .map(|tag| NamedTag {
+                name: tag.name.as_deref(),
+                acceptable: tag.has_body,
+                range: None,
+            })
+            .collect::<Vec<_>>();
+        match rule {
+            CSharpRule::MissingXmldocParameter | CSharpRule::MissingXmldocTypeParameter => {
+                if tags.iter().any(|tag| tag.kind == TagKind::InheritDoc) {
+                    continue;
+                }
+                for ((parameter, _), text) in parameter_names.iter().zip(&names) {
+                    if missing_tag(text, &named_tags) {
+                        let report = node_range(*parameter);
+                        matches.push(LanguageRuleMatch {
+                            select: report,
+                            report,
+                            heuristic: None,
+                        });
+                    }
+                }
+            }
+            CSharpRule::UnknownXmldocParameter | CSharpRule::UnknownXmldocTypeParameter => {
+                if has_unknown_tag(&named_tags, &names) {
+                    matches.push(node_range(declaration).into());
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    LanguageRuleMatches::decided(
+        matches,
         undecided,
         Language::CSharp.config_label(),
         rule.label(),

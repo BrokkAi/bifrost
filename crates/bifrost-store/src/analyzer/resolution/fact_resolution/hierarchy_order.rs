@@ -336,6 +336,7 @@ pub(super) struct HierarchyOrderState {
     cursors: Vec<Cursor>,
     roots: Vec<(usize, SemanticId)>,
     root_index: usize,
+    root_work: Vec<usize>,
     owners: Vec<HierarchyOrderedOwner>,
     emitted: HashSet<(usize, SemanticId)>,
     started: bool,
@@ -356,6 +357,7 @@ impl HierarchyOrderState {
             cursors: Vec::new(),
             roots: Vec::new(),
             root_index: 0,
+            root_work: Vec::new(),
             owners: Vec::new(),
             emitted: HashSet::default(),
             started: request.start_after.is_none(),
@@ -375,6 +377,7 @@ impl HierarchyOrderState {
             emitted: false,
         });
         self.roots.push((root, owner));
+        self.root_work.push(0);
     }
     fn tail_items(&self, mut cursor: usize, pending: &mut Vec<TailItem>) {
         loop {
@@ -618,6 +621,8 @@ impl HierarchyOrderState {
         &mut self,
         arena: &HierarchyOrderArena,
         view: HierarchyProvenanceView<'_>,
+        _budget_owner: SemanticId,
+        limit: usize,
         step: &mut dyn FnMut() -> bool,
         cancelled: &mut dyn FnMut() -> bool,
     ) -> StoreResult<Option<HierarchyOrderOutcome>> {
@@ -627,30 +632,44 @@ impl HierarchyOrderState {
             self.request.policy.identity(),
             "an order cursor retains its policy identity across waits"
         );
-        let mut budget = HierarchyOrderBudget {
-            step,
-            stopped: false,
-        };
         while let Some(&(root, root_owner)) = self.roots.get(self.root_index) {
             if cancelled() {
                 return Ok(None);
             }
-            if !self.head(root, arena, view, &mut budget)? {
+            let mut spent = self.root_work[self.root_index];
+            let mut charge = || {
+                if spent == limit || !step() {
+                    return false;
+                }
+                spent += 1;
+                true
+            };
+            let mut budget = HierarchyOrderBudget {
+                step: &mut charge,
+                stopped: false,
+            };
+            let ready = self.head(root, arena, view, &mut budget)?;
+            self.root_work[self.root_index] = spent;
+            if !ready {
                 if cancelled() {
                     return Ok(None);
                 }
-                // An optional-order cap is not an aggregate resolution stop.
                 // Discard every provisional ordered owner/proof, not a prefix.
                 self.owners.clear();
                 self.complete = false;
                 self.required_base = None;
-                self.completion = ResolutionCompletion::Complete;
+                self.completion = self.completion.combine(&ResolutionCompletion::incomplete([
+                    ResolutionIncompleteReason::ReceiverBudgetExhausted(root_owner),
+                ]));
                 return Ok(Some(HierarchyOrderOutcome {
                     cursor_scope: None,
                     owners: Vec::new(),
                     complete: false,
                     required_base: None,
-                    completion: ResolutionCompletion::Complete,
+                    completion: std::mem::replace(
+                        &mut self.completion,
+                        ResolutionCompletion::Complete,
+                    ),
                 }));
             }
             let Some(head) = self.cursors[root].head.flatten() else {
@@ -680,15 +699,22 @@ impl HierarchyOrderState {
             && let Some(start_after) = self.request.start_after
         {
             let mut roots = Vec::new();
-            for &(_, owner) in &self.roots {
+            for (index, &(_, owner)) in self.roots.iter().enumerate() {
                 if cancelled() {
                     return Ok(None);
                 }
-                if !budget.step() {
+                if self.root_work[index] == limit || !step() {
+                    if cancelled() {
+                        return Ok(None);
+                    }
                     self.owners.clear();
                     self.complete = false;
+                    self.completion = self.completion.combine(&ResolutionCompletion::incomplete([
+                        ResolutionIncompleteReason::ReceiverBudgetExhausted(owner),
+                    ]));
                     break;
                 }
+                self.root_work[index] += 1;
                 roots.push(owner);
             }
             if self.complete {
@@ -799,7 +825,14 @@ mod tests {
         );
         state.root(root, ids[3]);
         let outcome = state
-            .poll(&arena.order, view, &mut || true, &mut || false)
+            .poll(
+                &arena.order,
+                view,
+                ids[3],
+                usize::MAX,
+                &mut || true,
+                &mut || false,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(

@@ -10,7 +10,10 @@ use crate::analyzer::store::resolution_selection::{
 use crate::analyzer::store::{Result, StoreError};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+
+/// Registers one context token; the Rust forward builder classifies it.
+pub(in crate::analyzer::store) const INSERT_CONTEXT_SQL: &str =
+    "INSERT INTO temp.selected_resolution_contexts(context_id) VALUES(?1)";
 
 #[doc(hidden)]
 pub const REUSED_CONTEXT_CELL_COPY: &str = "INSERT INTO temp.selected_resolution_context_paths(context_id,host_ordinal,path,start_node,end_node,start_lead_key,start_lead_shared,end_lead_key,end_lead_shared,body,start_fixed_key,start_open_tail,end_fixed_key,end_open_tail) SELECT ?2,source.host_ordinal,source.path,source.start_node,source.end_node,source.start_lead_key,source.start_lead_shared,source.end_lead_key,source.end_lead_shared,source.body,source.start_fixed_key,source.start_open_tail,source.end_fixed_key,source.end_open_tail FROM json_each(?1) input CROSS JOIN temp.selected_resolution_context_paths source ON source.context_id=input.value->>0 AND source.host_ordinal=input.value->>1 AND source.path=input.value->>2 WHERE NOT EXISTS (SELECT 1 FROM temp.selected_resolution_context_paths target WHERE target.context_id=?2 AND target.host_ordinal=source.host_ordinal AND target.path=source.path)";
@@ -56,16 +59,6 @@ CREATE INDEX IF NOT EXISTS temp.selected_resolution_context_paths_forward_root_p
 CREATE INDEX IF NOT EXISTS temp.selected_resolution_context_paths_reverse_root_prefix
  ON selected_resolution_context_paths(context_id,end_fixed_key COLLATE BINARY,end_open_tail,host_ordinal,path) WHERE end_node={root};
 "#, root=codec::encode_node(crate::analyzer::resolution::BindingNodeId::universal_root())))
-}
-
-fn mint_context_token() -> SelectedContextPathToken {
-    static NEXT: AtomicI64 = AtomicI64::new(1);
-    let value = NEXT
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
-        .expect("selected context token space exhausted");
-    SelectedContextPathToken::new(value)
 }
 
 /// Check a token minted by this inventory's committed context publication.
@@ -272,40 +265,40 @@ impl SelectedResolutionStage<'_, '_> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let context = mint_context_token();
+        let context = self.selection.mint_context_token();
         self.selection.mark_stage_used();
-        let published = self.selection.with_owned_temp_transaction(|connection| {
-            let result =
-                with_resolution_read_progress_handler(connection, cancellation, |connection| {
-                    connection
-                        .prepare_cached(
-                            "INSERT INTO temp.selected_resolution_contexts(context_id) VALUES(?1)",
-                        )?
-                        .execute([context.get()])?;
-                    let mut writer = SelectedContextPathWriter {
-                        connection,
-                        context,
-                        cancellation,
-                        reused: std::collections::HashMap::new(),
-                    };
-                    Ok(
-                        if !publish(&mut writer)?
-                            || !writer.flush_reused()?
-                            || cancellation.is_cancelled()
-                        {
-                            SelectedResolutionTempTransaction::Rollback(None)
-                        } else {
-                            SelectedResolutionTempTransaction::Commit(Some(context))
-                        },
-                    )
-                });
-            match result {
-                Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
-                    Ok(SelectedResolutionTempTransaction::Rollback(None))
+        let published = self
+            .selection
+            .with_context_publication_transaction(|connection| {
+                let result =
+                    with_resolution_read_progress_handler(connection, cancellation, |connection| {
+                        connection
+                            .prepare_cached(INSERT_CONTEXT_SQL)?
+                            .execute([context.get()])?;
+                        let mut writer = SelectedContextPathWriter {
+                            connection,
+                            context,
+                            cancellation,
+                            reused: std::collections::HashMap::new(),
+                        };
+                        Ok(
+                            if !publish(&mut writer)?
+                                || !writer.flush_reused()?
+                                || cancellation.is_cancelled()
+                            {
+                                SelectedResolutionTempTransaction::Rollback(None)
+                            } else {
+                                SelectedResolutionTempTransaction::Commit(Some(context))
+                            },
+                        )
+                    });
+                match result {
+                    Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
+                        Ok(SelectedResolutionTempTransaction::Rollback(None))
+                    }
+                    outcome => outcome,
                 }
-                outcome => outcome,
-            }
-        })?;
+            })?;
         if let Some(context) = published {
             self.selection.record_published_context(context);
         }

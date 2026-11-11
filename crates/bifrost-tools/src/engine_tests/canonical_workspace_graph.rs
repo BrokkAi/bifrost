@@ -51,6 +51,10 @@ mod tests {
 
     use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdgeRow;
 
+    use brokk_bifrost_core::analyzer::usages::model::FacetProof;
+
+    use brokk_bifrost_core::analyzer::usages::model::ReferenceFacets;
+
     use brokk_bifrost_core::analyzer::usages::model::ReferenceKind;
 
     use brokk_bifrost_analysis::analyzer::resolution::batch::ResolutionBatchMetrics;
@@ -170,6 +174,9 @@ mod tests {
         )
     }
 
+    /// A row from an exact classifier: `reference_kind` is proven present and
+    /// every other kind is proven absent (`None` proves no kind at all). An
+    /// undecided facet would keep a complete-graph contract from completing.
     fn canonical_row(
         file: &ProjectFile,
         range: Range,
@@ -179,6 +186,7 @@ mod tests {
         proof: UsageProof,
     ) -> ReferenceEdgeRow {
         ReferenceEdgeRow {
+            dispatch_extensibility: None,
             site: EdgeSite {
                 file: file.clone(),
                 range,
@@ -186,7 +194,13 @@ mod tests {
                 enclosing: Some(enclosing.clone()),
             },
             target: target.clone(),
-            reference_kind,
+            reference_kind: ReferenceFacets::from_proofs(ReferenceKind::ALL.map(|facet| {
+                if reference_kind == Some(facet) {
+                    FacetProof::Present
+                } else {
+                    FacetProof::Absent
+                }
+            })),
             proof,
             ambiguous_candidate: false,
             usage_kind: UsageHitKind::Reference,
@@ -403,6 +417,8 @@ mod tests {
         let mut raw_proven_inbound = vec![0; catalog.catalog.nodes.len()];
         raw_proven_inbound[to] = 1;
         SelectedWorkspaceUsageGraphProjection {
+            relative_import_routes: Vec::new(),
+            scope_obligations: Vec::new(),
             nodes: catalog.catalog.nodes,
             raw_proven_inbound,
             admitted_callers: HashSet::from_iter([caller.source().clone()]),
@@ -471,6 +487,8 @@ mod tests {
             &cancellation,
         ));
         SelectedWorkspaceUsageGraphProjection {
+            relative_import_routes: Vec::new(),
+            scope_obligations: Vec::new(),
             nodes: projection.nodes,
             edges: projection.edges,
             same_owner_edges: projection.same_owner_edges,

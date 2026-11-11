@@ -200,7 +200,10 @@ impl ExtensionWorkspace {
         self.analyzer.analyzer().project().root()
     }
 
-    pub fn open(options: ExtensionWorkspaceOptions) -> Result<Self, ExtensionWorkspaceError> {
+    pub fn open(
+        options: ExtensionWorkspaceOptions,
+        retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
+    ) -> Result<Self, ExtensionWorkspaceError> {
         if options.roots.len() != 1 {
             return Err(ExtensionWorkspaceError::InvalidRoots(
                 "API version 1 requires exactly one workspace root".into(),
@@ -252,6 +255,7 @@ impl ExtensionWorkspace {
                 WorkspaceAnalyzer::build_ephemeral_with_tier_access_footgun(
                     Arc::clone(&project),
                     options.analyzer_config.clone(),
+                    retention_budget,
                 )
                 .map_err(|error| {
                     ExtensionWorkspaceError::Analyzer(error.to_string().into_boxed_str())
@@ -261,6 +265,7 @@ impl ExtensionWorkspace {
                 WorkspaceAnalyzer::build_persisted_with_tier_access(
                     Arc::clone(&project),
                     options.analyzer_config.clone(),
+                    retention_budget,
                 )
                 .map_err(|error| {
                     ExtensionWorkspaceError::Store(error.to_string().into_boxed_str())
@@ -1243,6 +1248,7 @@ impl ExtensionWorkspace {
             &[],
             &icfg,
             &icfg,
+            Some(&self.analyzer),
             ProductionTypestateExecutionContext::Workspace,
             &protocol,
             &bindings,
@@ -1730,6 +1736,9 @@ fn project_typestate_finding(
             steps.push(TypestateWitnessStep {
                 kind: match step.kind() {
                     SummaryWitnessStepKind::Seed => TypestateWitnessStepKind::Seed,
+                    SummaryWitnessStepKind::ModeledReceiver => TypestateWitnessStepKind::Edge {
+                        edge_kind: "modeled_receiver".into(),
+                    },
                     SummaryWitnessStepKind::Edge(kind) => TypestateWitnessStepKind::Edge {
                         edge_kind: kind.label().into(),
                     },
@@ -1970,8 +1979,12 @@ fn value_transfer_detail(
             update_framed(&mut hasher, &span.start_utf8_byte.to_be_bytes());
             update_framed(&mut hasher, &span.end_utf8_byte.to_be_bytes());
             ValueTransferOperation::CallSite {
-                id: StableDigest::parse(format!("{:x}", hasher.finalize()))
-                    .expect("SHA-256 is canonical"),
+                id: StableDigest::parse(
+                    brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                        &hasher.finalize().into(),
+                    ),
+                )
+                .expect("SHA-256 is canonical"),
                 span,
             }
         }
@@ -1993,6 +2006,7 @@ fn value_transfer_detail(
 const fn value_subtype(kind: ValueFlowRelationKind) -> ValueDependenceSubtype {
     match kind {
         ValueFlowRelationKind::Assignment => ValueDependenceSubtype::Assignment,
+        ValueFlowRelationKind::OwnershipUnknown => ValueDependenceSubtype::OwnershipUnknown,
         ValueFlowRelationKind::Parameter => ValueDependenceSubtype::Parameter,
         ValueFlowRelationKind::Receiver => ValueDependenceSubtype::Receiver,
         ValueFlowRelationKind::NormalReturn => ValueDependenceSubtype::NormalReturn,
@@ -2077,12 +2091,20 @@ fn workspace_identities_for(
     }
     Ok(WorkspaceIdentities {
         generation: WorkspaceGeneration::new(
-            StableDigest::parse(format!("{:x}", generation_hasher.finalize()))
-                .expect("SHA-256 is canonical"),
+            StableDigest::parse(
+                brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                    &generation_hasher.finalize().into(),
+                ),
+            )
+            .expect("SHA-256 is canonical"),
         ),
         content_identity: WorkspaceContentIdentity::new(
-            StableDigest::parse(format!("{:x}", content_hasher.finalize()))
-                .expect("SHA-256 is canonical"),
+            StableDigest::parse(
+                brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                    &content_hasher.finalize().into(),
+                ),
+            )
+            .expect("SHA-256 is canonical"),
         ),
     })
 }
@@ -2149,9 +2171,19 @@ fn stable_semantic_id(anchor: &SemanticNodeAnchor<'_>) -> StableDigest {
     field(b"semantic-node-v2");
     field(anchor.path.as_bytes());
     field(anchor.owner.as_bytes());
-    field(format!("{:x}", Sha256::digest(anchor.slice.as_bytes())).as_bytes());
+    field(
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &Sha256::digest(anchor.slice.as_bytes()).into(),
+        )
+        .as_bytes(),
+    );
     field(&anchor.occurrence_ordinal.to_be_bytes());
-    StableDigest::parse(format!("{:x}", hasher.finalize())).expect("SHA-256 is canonical")
+    StableDigest::parse(
+        brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+            &hasher.finalize().into(),
+        ),
+    )
+    .expect("SHA-256 is canonical")
 }
 
 /// The derived anchor parts of one program point, in `points()` order.
@@ -2367,7 +2399,11 @@ mod tests {
         } else {
             options
         };
-        ExtensionWorkspace::open(options).unwrap()
+        ExtensionWorkspace::open(
+            options,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap()
     }
 
     fn provider(workspace: &ExtensionWorkspace) -> &dyn StructuralFactProvider {
@@ -2409,7 +2445,11 @@ mod tests {
         let mut options = ExtensionWorkspaceOptions::new(&second_root);
         options.analyzer_config.dispatch_hierarchy_expansion =
             brokk_bifrost_analysis::analyzer::DispatchHierarchyExpansion::CONCRETE_OVERRIDES;
-        let configuration_changed = ExtensionWorkspace::open(options).unwrap();
+        let configuration_changed = ExtensionWorkspace::open(
+            options,
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+        )
+        .unwrap();
         assert_ne!(
             second.content_identity(),
             configuration_changed.content_identity()

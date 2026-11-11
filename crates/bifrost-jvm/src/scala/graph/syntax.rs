@@ -10,6 +10,12 @@ use brokk_bifrost_core::analyzer::tree_walk::{
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
+
+/// The operator selected by an infix expression's AST field.
+pub fn infix_operator<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
+    node.child_by_field_name("operator")
+        .map(|operator| node_text(operator, source))
+}
 #[cfg(test)]
 use tree_sitter::Parser;
 
@@ -1218,8 +1224,9 @@ pub(crate) fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
 
 /// Scala value types that no application list can consume. Every other named
 /// type stays applicable: it can alias a function type, and `Seq`, `Map`,
-/// `String` and friends carry an `apply` member of their own.
-const NON_APPLICABLE_RESULT_TYPES: [&str; 9] = [
+/// `String` and friends carry an `apply` member of their own. Each name is the
+/// simple spelling of a `scala` package type.
+pub const NON_APPLICABLE_RESULT_TYPES: [&str; 9] = [
     "Unit", "Boolean", "Byte", "Short", "Int", "Long", "Float", "Double", "Char",
 ];
 

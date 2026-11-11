@@ -74,6 +74,7 @@ pub(crate) fn compose_typestate_policy(
             .chain(expectations.manifests),
     )?;
     let automaton = ResolvedTypestateAutomatonSpec {
+        event_set: spec.automaton.event_set.clone(),
         states: spec.automaton.states.clone(),
         initial: spec.automaton.initial.clone(),
         accepting_states: spec.automaton.accepting_states.clone(),
@@ -233,12 +234,15 @@ fn resolve_events(
             }
             None => subjects.to_vec(),
         };
-        resolved.push(ResolvedTypestateEventSpec::new(
-            event.id.clone(),
-            trigger,
-            applies_to_subjects,
-            event.supersedes.clone(),
-        ));
+        resolved.push(
+            ResolvedTypestateEventSpec::new(
+                event.id.clone(),
+                trigger,
+                applies_to_subjects,
+                event.supersedes.clone(),
+            )
+            .with_semantic_effect(event.semantic_effect.clone()),
+        );
     }
     let graph = PrecedenceGraph::try_new(
         resolved.iter().map(|event| event.id.clone()),
@@ -1131,12 +1135,14 @@ mod tests {
                 escape: InconclusivePolicy::Inconclusive,
             },
             automaton: TypestateAutomatonSpec {
+                event_set: None,
                 states: vec![error.clone(), open.clone(), closed.clone()],
                 initial: open.clone(),
                 accepting_states: vec![closed.clone()],
                 error_states: vec![error],
                 events: vec![TypestateEventSpec {
                     id: close_event.clone(),
+                    semantic_effect: None,
                     trigger: TypestateEventTrigger::MatchEndpoints {
                         set: exact("resource-close"),
                         role: EndpointRole::Sink,

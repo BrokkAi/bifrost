@@ -124,7 +124,7 @@ pub fn provenance_with_visits<E>(
             SemanticModelProof::PackFact
         },
         completeness: match shard.manifest.completeness {
-            Completeness::Partial => SemanticModelCompleteness::Partial,
+            Completeness::Partial | Completeness::Fenced => SemanticModelCompleteness::Partial,
             Completeness::Complete => SemanticModelCompleteness::Complete,
         },
         ambiguous,

@@ -46,6 +46,7 @@ pub use brokk_bifrost_core::hash;
 pub use brokk_bifrost_core::panic_report;
 pub use brokk_bifrost_core::path_normalization;
 pub use brokk_bifrost_core::profiling;
+pub use brokk_bifrost_core::retention_budget;
 pub use brokk_bifrost_core::schema_version;
 pub use brokk_bifrost_core::sqlite_template;
 pub use brokk_bifrost_core::text_utils;
@@ -149,6 +150,9 @@ pub use navigation::NavigationOperation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod native_resolution_test_support {
     pub use crate::analyzer::resolution::test_support::fixture_fragment;
+    pub use crate::analyzer::store::resolution_operation::go_demand::{
+        start_go_unprovided_member_probe_for_test, take_go_unprovided_member_probe_for_test,
+    };
     pub use crate::analyzer::store::resolution_operation::native_units::{
         NativeCompletionReasonOwnership, start_native_completion_reason_probe_for_test,
         take_native_completion_reason_probe_for_test,
@@ -313,7 +317,8 @@ pub mod native_resolution_test_support {
         )
     }
 
-    fn with_python_native_operation<T>(
+    /// Lend the selected validation operation without constructing an analyzer.
+    pub fn with_python_native_operation<T>(
         publication: &crate::analyzer::store::python_unit_summaries::PythonEnvironmentPublication,
         project: &dyn crate::analyzer::Project,
         revision: i64,
@@ -323,114 +328,124 @@ pub mod native_resolution_test_support {
             &crate::CancellationToken,
         ) -> crate::analyzer::store::Result<T>,
     ) -> crate::analyzer::store::Result<T> {
-        use crate::analyzer::store::resolution_operation::{
-            SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
-        };
-        use crate::analyzer::store::resolution_publication::{
-            ResolutionContentInput, ResolutionContentPublicationOutcome,
-        };
-        use crate::analyzer::store::resolution_selection::{
-            SelectedResolutionContentMountRequest, SelectedResolutionLanguage,
-            SelectedResolutionOverlayMask,
-        };
-        let summary = publication.selected_summary(revision)?.ok_or_else(|| {
-            crate::analyzer::store::StoreError::new("no selected Python environment summary")
-        })?;
-        let mut snapshot = publication.snapshot.clone();
-        snapshot.revision = revision;
-        let mut snapshots = crate::analyzer::store::WorkspaceSnapshots::default();
-        snapshots.insert("python".into(), snapshot.clone());
-        let languages = [SelectedResolutionLanguage::new("python", Language::Python)];
-        let cancellation = crate::CancellationToken::default();
-        // Select the exact admitted members behind this summary. The explicit
-        // mounts preserve the probes' counterfactual source witnesses even when
-        // ordinary workspace membership selects the same source content.
-        let members = {
-            let connection = publication.store.read_conn()?;
-            let mut statement = connection.prepare(
-                "SELECT members.rel_path,blob.blob_oid
+        let reads = crate::analyzer::tree_sitter_analyzer::ProjectReadRegistry::try_new(project)
+            .ok_or_else(|| {
+                crate::analyzer::store::StoreError::new(
+                    "Python native helper Project cannot install a read recorder",
+                )
+            })?;
+        let (result, _receipt) = reads.capture(|| {
+            use crate::analyzer::store::resolution_operation::{
+                SelectedResolutionOperationInput, SelectedResolutionOperationOpenOutcome,
+            };
+            use crate::analyzer::store::resolution_publication::{
+                ResolutionContentInput, ResolutionContentPublicationOutcome,
+            };
+            use crate::analyzer::store::resolution_selection::{
+                SelectedResolutionContentMountRequest, SelectedResolutionLanguage,
+                SelectedResolutionOverlayMask,
+            };
+            let summary = publication.selected_summary(revision)?.ok_or_else(|| {
+                crate::analyzer::store::StoreError::new("no selected Python environment summary")
+            })?;
+            let mut snapshot = publication.snapshot.clone();
+            snapshot.revision = revision;
+            let mut snapshots = crate::analyzer::store::WorkspaceSnapshots::default();
+            snapshots.insert("python".into(), snapshot.clone());
+            let languages = [SelectedResolutionLanguage::new("python", Language::Python)];
+            let cancellation = crate::CancellationToken::default();
+            // Select the exact admitted members behind this summary. The explicit
+            // mounts preserve the probes' counterfactual source witnesses even when
+            // ordinary workspace membership selects the same source content.
+            let members = {
+                let connection = publication.store.read_conn()?;
+                let mut statement = connection.prepare(
+                    "SELECT members.rel_path,blob.blob_oid
                  FROM resolution_unit_summary_members members
                  JOIN blobs blob ON blob.id=members.blob_id
                  WHERE members.summary_id=?1 ORDER BY members.member_ordinal",
-            )?;
-            statement
-                .query_map([summary], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut mounts = Vec::with_capacity(members.len());
-        let mut masks = Vec::with_capacity(members.len());
-        for (rel_path, oid) in members {
-            let file = project
-                .file_by_rel_path(std::path::Path::new(&rel_path))
-                .ok_or_else(|| {
+                )?;
+                statement
+                    .query_map([summary], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut mounts = Vec::with_capacity(members.len());
+            let mut masks = Vec::with_capacity(members.len());
+            for (rel_path, oid) in members {
+                let file = project
+                    .file_by_rel_path(std::path::Path::new(&rel_path))
+                    .ok_or_else(|| {
+                        crate::analyzer::store::StoreError::new(format!(
+                            "native source is not in the selected Project: {rel_path}"
+                        ))
+                    })?;
+                let source = project.read_source(&file).map_err(|error| {
                     crate::analyzer::store::StoreError::new(format!(
-                        "native source is not in the selected Project: {rel_path}"
+                        "read selected native source {rel_path}: {error}"
                     ))
                 })?;
-            let source = project.read_source(&file).map_err(|error| {
-                crate::analyzer::store::StoreError::new(format!(
-                    "read selected native source {rel_path}: {error}"
-                ))
-            })?;
-            let base_digest =
-                brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(source.as_bytes());
-            masks.push(SelectedResolutionOverlayMask::replacement(
-                "python",
-                rel_path.clone(),
-            ));
-            let oid = git2::Oid::from_str(&oid)?;
-            let content = publication.store.admit_cached_selected_content(
-                &snapshot,
-                &rel_path,
-                &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
-                &ResolutionContentInput::Parsed {
-                    key: brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
-                    semantic_language: Language::Python,
-                },
-                &cancellation,
-            )?;
-            let ResolutionContentPublicationOutcome::Ready(content) = content else {
-                return Err(crate::analyzer::store::StoreError::new(format!(
-                    "Python selected content: {content:?}"
-                )));
-            };
-            mounts.push(
-                SelectedResolutionContentMountRequest::new(
-                    content.into_parts().0,
-                    crate::analyzer::store::WorkspaceFileRow {
-                        decision: None,
-                        rel_path,
-                        blob_oid: oid,
+                let base_digest =
+                    brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(source.as_bytes());
+                masks.push(SelectedResolutionOverlayMask::replacement(
+                    "python",
+                    rel_path.clone(),
+                ));
+                let oid = git2::Oid::from_str(&oid)?;
+                let content = publication.store.admit_cached_selected_content(
+                    &snapshot,
+                    &rel_path,
+                    &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                    &ResolutionContentInput::Parsed {
+                        key: brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "python"),
+                        semantic_language: Language::Python,
                     },
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                )
-                .with_counterfactual_base_content_digest(base_digest),
-            );
-        }
-        let input = SelectedResolutionOperationInput::new(
-            project,
-            &snapshot.workspace_id,
-            &snapshots,
-            &languages,
-            &masks,
-        )
-        .with_content_mounts(mounts);
-        match publication
-            .store
-            .open_selected_resolution_operation(input, &cancellation)?
-        {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => {
-                action(&operation, summary, &cancellation)
+                    &cancellation,
+                )?;
+                let ResolutionContentPublicationOutcome::Ready(content) = content else {
+                    return Err(crate::analyzer::store::StoreError::new(format!(
+                        "Python selected content: {content:?}"
+                    )));
+                };
+                mounts.push(
+                    SelectedResolutionContentMountRequest::new(
+                        content.into_parts().0,
+                        crate::analyzer::store::WorkspaceFileRow {
+                            decision: None,
+                            rel_path,
+                            blob_oid: oid,
+                        },
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .with_counterfactual_base_content_digest(base_digest),
+                );
             }
-            outcome => Err(crate::analyzer::store::StoreError::new(format!(
-                "Python route selection: {outcome:?}"
-            ))),
-        }
+            let input = SelectedResolutionOperationInput::new(
+                project,
+                &snapshot.workspace_id,
+                &snapshots,
+                &languages,
+                &masks,
+            )
+            .with_content_mounts(mounts)
+            .with_read_reuse(&reads);
+            match publication
+                .store
+                .open_selected_resolution_operation(input, &cancellation)?
+            {
+                SelectedResolutionOperationOpenOutcome::Ready(operation) => {
+                    action(&operation, summary, &cancellation)
+                }
+                outcome => Err(crate::analyzer::store::StoreError::new(format!(
+                    "Python route selection: {outcome:?}"
+                ))),
+            }
+        });
+        result
     }
 
     /// One fixture identity per label, for a differential suite that needs
@@ -517,18 +532,11 @@ pub mod native_resolution_test_support {
         let tree = parser.parse(source, None).expect("Python syntax tree");
         let project =
             brokk_bifrost_core::analyzer::project::TestProject::new(file.root(), Language::Python);
-        let production =
+        let parsed =
             brokk_bifrost_python::declarations::parse_python_file(&project, file, source, &tree);
-        assert_eq!(production.resolution_facts, Default::default());
-        let bridges = production
-            .source_facts
-            .as_ref()
-            .expect("production source facts");
-        assert!(bridges.native_site_occurrences.is_empty());
-        assert!(bridges.native_declaration_sources.is_empty());
-        drop(production);
-        let parsed = brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
-            &project, file, source, &tree,
+        assert!(
+            !parsed.resolution_facts.scopes.is_empty(),
+            "production publishes native module scope facts, including empty files"
         );
         let facts = &parsed.resolution_facts;
         assert_eq!(
@@ -625,9 +633,7 @@ pub mod native_resolution_test_support {
         let tree = parser.parse(source, None).expect("Python syntax tree");
         let project =
             brokk_bifrost_core::analyzer::project::TestProject::new(file.root(), Language::Python);
-        brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
-            &project, file, source, &tree,
-        )
+        brokk_bifrost_python::declarations::parse_python_file(&project, file, source, &tree)
     }
 
     /// Probe producer-owned JVM alias coverage through the same bounded
@@ -713,8 +719,15 @@ pub mod native_resolution_test_support {
             source,
             tree_sitter_rust::LANGUAGE.into(),
             |file, source, tree| {
-                brokk_bifrost_rust::declarations::parse_rust_file(file, source, tree)
-                    .resolution_facts
+                brokk_bifrost_rust::declarations::parse_rust_file_with(
+                    &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                    ),
+                    file,
+                    source,
+                    tree,
+                )
+                .resolution_facts
             },
         )
     }

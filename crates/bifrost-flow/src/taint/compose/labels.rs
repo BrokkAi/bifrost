@@ -180,13 +180,14 @@ pub(super) const fn hop_function(hop: &Hop) -> LabelFunctionId {
         | Hop::Interior { function, .. }
         | Hop::Stored { function, .. }
         | Hop::Model { function, .. }
+        | Hop::Caller { function, .. }
+        | Hop::Callee { function, .. }
+        | Hop::CallHandoff { function, .. }
         | Hop::Sanitizer { function, .. }
         | Hop::Transform { function, .. } => *function,
-        Hop::Callee { .. }
-        | Hop::Caller { .. }
-        | Hop::Closure { .. }
-        | Hop::Unmodeled { .. }
-        | Hop::Store { .. } => LabelFunctionId::IDENTITY,
+        Hop::Closure { .. } | Hop::Unmodeled { .. } | Hop::Store { .. } => {
+            LabelFunctionId::IDENTITY
+        }
     }
 }
 

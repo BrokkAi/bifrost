@@ -492,6 +492,7 @@ pub fn prepare_resolution_bundle_with_unit_keys(
         PreparedResolutionBundleRows::default(),
         None,
         None,
+        super::resolution::resolution_bundle_epoch(lowered.lexical().language()),
         cancellation,
     )
 }
@@ -502,6 +503,25 @@ pub fn prepare_resolution_bundle_with_source_facts(
     unit_keys: &HashMap<CodeUnit, i64>,
     source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
     source_text: Option<&str>,
+    cancellation: &CancellationToken,
+) -> super::Result<ResolutionInteriorPreparation> {
+    prepare_resolution_bundle_with_source_facts_and_epoch(
+        lowered,
+        unit_keys,
+        source,
+        source_text,
+        super::resolution::resolution_bundle_epoch(lowered.lexical().language()),
+        cancellation,
+    )
+}
+
+#[doc(hidden)]
+pub fn prepare_resolution_bundle_with_source_facts_and_epoch(
+    lowered: &LoweredResolutionFactsWithIdentityCatalog,
+    unit_keys: &HashMap<CodeUnit, i64>,
+    source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
+    source_text: Option<&str>,
+    producer_epoch: &'static str,
     cancellation: &CancellationToken,
 ) -> super::Result<ResolutionInteriorPreparation> {
     let mut rows = PreparedResolutionBundleRows::default();
@@ -522,6 +542,7 @@ pub fn prepare_resolution_bundle_with_source_facts(
         rows,
         source,
         source_text,
+        producer_epoch,
         cancellation,
     ))
 }
@@ -532,6 +553,7 @@ fn prepare_resolution_bundle_rows(
     mut rows: PreparedResolutionBundleRows,
     source: Option<&brokk_bifrost_core::analyzer::parsed_file::ParsedSourceFacts>,
     source_text: Option<&str>,
+    producer_epoch: &'static str,
     cancellation: &CancellationToken,
 ) -> ResolutionInteriorPreparation {
     if cancellation.is_cancelled() {
@@ -588,8 +610,12 @@ fn prepare_resolution_bundle_rows(
     // every other family, but they are not a bundle family: they are neither
     // counted in the manifest nor hashed into the interior digest, so adding
     // them changes no existing row, column or digest.
-    let path_rows =
-        resolution_rows::prepare_path_rows(&keys, lowered.identities(), lexical.paths());
+    let path_rows = resolution_rows::prepare_path_rows(
+        &keys,
+        lowered.identities(),
+        semantic_language,
+        lexical.paths(),
+    );
     let recipe_rows = resolution_rows::prepare_lookup_recipe_rows(lowered.identities());
     // Port block 2 (lane CM): `resolution_sites`, from the same lowered facts
     // `resolution_semantic_sites` is written from and with the same dense
@@ -606,8 +632,9 @@ fn prepare_resolution_bundle_rows(
     // are: a store this tree writes stays readable by the interiors that read
     // it before.
     let gap_rows = resolution_rows::prepare_gap_rows(&keys, lowered.identities(), lexical.gaps());
-    let Some(bundle) = PreparedResolutionBundle::new(
+    let Some(bundle) = PreparedResolutionBundle::new_with_epoch(
         semantic_language,
+        producer_epoch,
         rows,
         path_rows,
         site_rows,
@@ -638,6 +665,12 @@ fn prepare_common_rows(
     use brokk_bifrost_core::analyzer::resolution_facts::{
         ResolutionRootImportAnchor, ResolutionRootImportDemandTarget, ResolutionRootImportKind,
     };
+    for (site, scope, name) in &common.shared_language.extern_aliases {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        rows.extern_aliases.push(row![*site, *scope, name.clone()]);
+    }
     for fact in &common.shared_language.compilation_imports {
         if cancellation.is_cancelled() {
             return false;
@@ -654,6 +687,7 @@ fn prepare_common_rows(
             match route.fact.anchor {
                 ResolutionRootImportAnchor::Lexical => "lexical",
                 ResolutionRootImportAnchor::Absolute => "absolute",
+                ResolutionRootImportAnchor::AliasQualified => "alias_qualified",
             },
             route.fact.position.map(usize_i64),
             match route.kind {
@@ -708,6 +742,32 @@ fn prepare_common_rows(
             keys.node(fact.root_scope),
             fact.namespace.label(),
             keys.semantic(fact.lookup),
+        ]);
+    }
+    for fact in &common.reference_execution_contexts {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        assert_eq!(lowered.lexical().language(), Language::Java);
+        rows.reference_execution_contexts.push(row![
+            fact.reference.get(),
+            fact.disposition.label(),
+            fact.procedure_kind.map(|kind| kind.label()),
+            fact.initializer_is_static,
+            fact.callable_site.map(|site| site.get()),
+        ]);
+    }
+    for fact in &common.lexical_package_contexts {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        assert_eq!(lowered.lexical().language(), Language::Scala);
+        assert!(fact.prefixes.iter().all(|prefix| {
+            !prefix.is_empty() && prefix.split('.').all(|part| !part.is_empty())
+        }));
+        rows.reference_package_contexts.push(row![
+            fact.reference.get(),
+            serde_json::to_string(&fact.prefixes).expect("package prefixes serialize")
         ]);
     }
     for fact in &common.package_members {
@@ -2143,8 +2203,11 @@ fn prepare_typed_rows(
                     ResolutionTypeSlotRole::CallResult,
                 BindingProjectionKind::TargetDeclaredValueType
                 | BindingProjectionKind::TargetTypeOrDeclaredValueType
-                | BindingProjectionKind::NonInvokingMemberReference =>
-                    ResolutionTypeSlotRole::ExpressionValue,
+                | BindingProjectionKind::NonInvokingMemberReference
+                | BindingProjectionKind::BareTermBinding
+                | BindingProjectionKind::BareTermBindingNoExpectedType => {
+                    ResolutionTypeSlotRole::ExpressionValue
+                }
             }),
             "a projection's output slot carries the role its kind implies: {:?}",
             projection.kind()
@@ -2264,6 +2327,16 @@ fn prepare_typed_rows(
             keys.node(property.scope_head()),
             property.scope_kind_label(),
         ]);
+        // An owner without a claim publishes no row, and readers treat it as
+        // Unknown (#9546).
+        if let Some(coverage) = property.member_types() {
+            rows.member_type_coverage.push(row![
+                keys.semantic(property.definition()),
+                keys.node(property.scope_head()),
+                coverage.label(),
+                coverage.open_reason().map(|reason| reason.label()),
+            ]);
+        }
     }
     for property in typed.member_owners() {
         if cancellation.is_cancelled() {
@@ -3004,6 +3077,11 @@ fn serialized_completion_reason(
         ResolutionIncompleteReason::TimeBudgetExceeded(_) => {
             panic!("an operation-local time budget stop is not persistable evidence")
         }
+        // Operation-local reasons must never be persisted. This panic is the guard:
+        // a producer that tries to persist one fails in tests, not silently in production.
+        ResolutionIncompleteReason::ReceiverSubclassObligation(_) => {
+            panic!("a query-local receiver-subclass obligation is not persistable evidence")
+        }
         ResolutionIncompleteReason::UnmountedFile { fragment } => panic!(
             "an operation-local unmounted-file route is not persistable evidence: {fragment:?}"
         ),
@@ -3321,7 +3399,14 @@ mod tests {
             std::env::temp_dir().join("rust-structural-gap-candidates"),
             "lib.rs",
         );
-        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
         let source_facts = parsed
             .source_facts
             .as_ref()
@@ -3354,7 +3439,14 @@ mod tests {
             std::env::temp_dir().join("rust-simple-call-gap-candidates"),
             "lib.rs",
         );
-        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
         let source_facts = parsed
             .source_facts
             .as_ref()
@@ -3387,7 +3479,14 @@ mod tests {
             std::env::temp_dir().join("rust-visible-macro-gap-candidates"),
             "lib.rs",
         );
-        let parsed = brokk_bifrost_rust::declarations::parse_rust_file(&file, source, &tree);
+        let parsed = brokk_bifrost_rust::declarations::parse_rust_file_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
         let mut source_facts = parsed
             .source_facts
             .clone()

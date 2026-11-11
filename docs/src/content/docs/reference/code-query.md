@@ -98,6 +98,7 @@ with OR. Each axis takes at most 32 entries.
 | `configuration_facts` | `roles` | `:role`, `:roles` | [member roles](#configuration-facts) |
 | `configuration_facts` | `scalar_kinds` | `:scalar-kind`, `:scalar_kind`, `:scalar-kinds`, `:scalar_kinds` | [scalar kinds](#configuration-facts) |
 | `configuration_facts` | `keys` | `:key`, `:keys` | exact keys, each at most 4096 bytes |
+| `configuration_facts` | `value_regex` | `:value/regex` | regex on decoded scalar values; non-scalar facts do not match |
 | `configuration_facts` | `routes` | `:route`, `:routes` | route alternatives; see [routes](#configuration-facts) |
 | `configuration_facts` | `fact_ordinals` | `:fact-ordinal`, `:fact_ordinal`, `:fact-ordinals`, `:fact_ordinals` | zero-based fact occurrence numbers |
 | `configuration_facts` | `provenances` | `:provenance`, `:provenances` | `authored` |
@@ -129,6 +130,7 @@ followed by keyword options and predicate forms:
 | --- | --- | --- | --- | --- |
 | `kind` | kind head | kind head | kind, or array of kinds (at most 32) | Match these kinds and their subtypes. |
 | `not_kind` | `:not-kind`, `:not_kind` | `(not-kind K)`, `(not_kind [K ...])` | kind, or array of kinds | Exclude these kinds and their subtypes. Never used for file pruning. |
+| `modifier` | `:modifier "virtual"` | `(modifier "virtual")` | one of `static`, `abstract`, `final`, `volatile`, `synchronized`, `transient`, `native`, `strictfp`, `default`, `sealed`, `non-sealed`, `public`, `protected`, `private`, `readonly`, `const`, `extern`, `ref`, `async`, `file`, `fixed`, `internal`, `new`, `override`, `partial`, `required`, `unsafe`, `virtual`, `in`, `out`, `params`, `this`, `scoped`, `global` | Match a declaration modifier recorded by the adapter. Applicable to declaration kinds such as classes, methods, constructors, fields, parameters, and imports where the adapter records modifiers. An adapter without recorded modifiers reports incomplete rather than absent. |
 | `async` | `:async true`, `:async false` | `(async true)`, `(async false)` | boolean | Match AST-backed callable asyncness. Valid on callable kinds; an adapter without this fact reports incomplete. |
 | `name` | `:name "x"` | `(name "x")` | exact string, or `{ "regex": "..." }` | Match the normalized name. At most 4096 bytes. |
 | `name` with regex | `:name/regex "re"` | `(name/regex "re")` | regular expression | Match the normalized name with a Rust regular expression. |
@@ -139,10 +141,15 @@ followed by keyword options and predicate forms:
 | `not`, `all`, `any` | none | `(not P)`, `(and P Q ...)`, `(or P Q ...)` | pattern, or two or more patterns | Negate or combine constraints on the same node. |
 | `capture` | `:capture "label"` | `(capture "label")` | string, 1 to 128 bytes | Return this node under the label. A repeated label must bind the same text. Use the `anchor` step to report a captured node's exact source range as the result location. |
 | `arity` | `:arity N` (exact count only) | `(arity N)`, `(arity :min N :max M)` | integer, or `{ "min": N, "max": M }`; bounds 0 to 1024 | Positional argument count of a call, or element count of a collection literal. Bounds are inclusive and either may be omitted, but not both. |
+| `count` | `:count [:parameters (parameter :modifier "ref") :min 3]` | `(count :parameters (parameter :modifier "ref") :min 3)` | `{ "role": "parameters", "pattern": { ... }, "min": 3 }` | Count direct children matching a nested pattern. Use a list role and at least one inclusive bound (`min` or `max`); absent `min` means zero, absent `max` means unbounded. Incomplete role coverage leaves absence dependent bounds undecided. |
+
+Count is a predicate; captures from its counted children are not exported to the enclosing match.
 | `visibility` | `:visibility` | `(visibility public)`, `(visibility [public protected])` | [visibility labels](#patterns-and-calls) | Match a callable by the visibility its adapter recorded. Callable kinds only. |
 | `parameter_type` | `:parameter-type`, `:parameter_type` | `(parameter-type "String")`, `(parameter_type "String")` | exact string, or `{ "regex": "..." }` | Match a callable with a parameter whose recorded type spelling equals the string. Callable kinds only. |
 | `parameter_type` with regex | `:parameter-type/regex`, `:parameter_type/regex` | `(parameter-type/regex "re")`, `(parameter_type/regex "re")` | regular expression | Match the recorded parameter type spelling with a regular expression. |
 | `has` | `:has P` | `(has P)` | pattern | Require a matching descendant. |
+| `each` | `:each P` | `(each P)` | pattern | Match this fact or any descendant against `P`; retain captures from every matching node. A capture label inside an `each` may be repeated within one descendant's match, but may not also be bound outside that `each` or in another `each`. Only labels the child guarantees (every `any` alternative binds them) leave the `each`; other labels are not exported. Each binding is charged its text length plus 64 bytes against a 1 MiB per-row budget before it is copied. Recovered syntax or a fact or capture-byte budget stop makes the answer incomplete. Rendered captures share a 16 MiB response budget, charged by snippet bytes plus 64 bytes per capture. Exhaustion leaves later captures empty without dropping rows. One `rendered_captures_truncated` diagnostic reports affected rows and the budget. |
+| `argument_mode` | `:argument-mode [ref out]` | `(argument-mode ref out)` | nonempty list of `plain`, `spread`, `ref`, `out`, `in` | Match an argument value by the passing mode recorded on its argument role edge. A language declares a mode as recorded only when every argument container in its grammar emits an argument edge carrying that mode. No language declares one today, so a non-match is always incomplete and a positive match still matches. Known gaps: C# target-typed `new(...)` arguments (until #10270 lands) and `: base(...)` / `: this(...)` constructor initializers; Java `this(...)` and `super(...)` explicit constructor invocations; PHP `...$spread` arguments. The other languages have not been audited for argument containers without edges. |
 | `not_has` | `:not-has P`, `:not_has P` | `(not-has P)`, `(not_has P)` | pattern | Reject nodes with a matching descendant. Never used for file pruning. |
 
 Role fields (`callee`, `args`, and the others) are listed under [Roles](#roles).
@@ -217,17 +224,23 @@ A role is a named edge from a matched node to a sub-node. The pattern's kind mus
 one of the role's valid parent kinds. A broad kind such as `declaration` accepts the
 roles of its subtypes only where listed.
 
+C# target-typed `new()` is a `call` with no written name or callee. `:name`,
+`name/regex`, and `:callee` do not match it.
+
 | Role | Value | RQL value | Valid parent kinds | Meaning |
 | --- | --- | --- | --- | --- |
 | `callee` | one pattern | pattern or `"name"` | `call`, `concurrent_spawn` | The call target name or expression. |
 | `receiver` | one pattern | pattern or `"name"` | `call`, `concurrent_spawn` | The receiver or qualifying scope of a call. |
-| `args` | ordered list | `[pattern ...]` | `call`, `concurrent_spawn` | Positional arguments, in order. |
-| `kwargs` | name-to-pattern map | `[(name pattern) ...]` | `call`, `concurrent_spawn` | Named arguments, by argument name. At most 64 names, each at most 128 bytes. |
+| `args` | ordered list | `[pattern ...]` | `call`, `concurrent_spawn`, `decorator` | Positional arguments, in order. |
+| `kwargs` | name-to-pattern map | `[(name pattern) ...]` | `call`, `concurrent_spawn`, `decorator` | Named arguments, by argument name. At most 64 names, each at most 128 bytes. |
 | `left` | one pattern | pattern or `"name"` | `assignment` | The assignment target. |
 | `right` | one pattern | pattern or `"name"` | `assignment` | The assigned value. |
 | `operator` | one pattern | pattern or `"name"` | `assignment` | The assignment operator token, as the grammar records it. |
+| `initializer_of` | one pattern | pattern | `assignment` | C# member-initializer assignment's creating `call`, including target-typed, nested object and index initializers. For example `(assignment :initializer_of (call))`; use `(assignment :not (assignment :initializer_of (call)))` to exclude these assignments. The absence of this edge proves anything only for a language whose adapter certifies the role; C# certifies it. In any other language a pattern that requires the role and finds no edge is not a clean miss, so a negation answers incomplete with an `unsupported_structural_feature` diagnostic. [CodeQL `MemberInitializer` and `ObjectInitializer`](https://github.com/github/codeql/blob/ae741615f3/csharp/ql/lib/semmle/code/csharp/exprs/Creation.qll#L29-L95). |
 | `module` | one pattern | pattern or `"name"` | `import`, `declaration` | The module an import names. |
 | `decorators` | ordered list | `[pattern ...]` | `function`, `method`, `constructor`, `lambda`, `callable`, `class`, `parameter`, `declaration` | Decorators, annotations, or attributes, in order. |
+| `parameters` | ordered list | `[pattern ...]` | `function`, `method`, `constructor`, `lambda`, `callable`, `declaration` | Written formal parameters in source order. C# and Java produce this role in this milestone. |
+| `members` | ordered list | `[pattern ...]` | `class`, `declaration` | Direct declared members in source order. C# and Java produce this role in this milestone. This pattern role differs from the `members` pipeline step. |
 | `object` | one pattern | pattern or `"name"` | `field_access` | The object side of a member access. |
 | `field` | one pattern | pattern or `"name"` | `field_access` | The member name side of a member access. |
 | `iterable` | one pattern | pattern or `"name"` | `for_loop` | The expression a for-each loop iterates. |
@@ -238,9 +251,22 @@ roles of its subtypes only where listed.
 | `value` | one pattern | pattern or `"name"` | `jsx_attribute`, `jsx_spread_attribute`, `object_property`, `computed_property`, `spread_element` | The value expression of an attribute, property, or spread. |
 | `key` | one pattern | pattern or `"name"` | `object_property` | The static key of an object property. |
 
+Decorator arguments come from Python and TypeScript/JavaScript decorators (including a
+parenthesized decorator such as `@(route('/x'))`), Java, Kotlin and Scala annotations,
+C# attributes, PHP attributes, and Rust attributes. C++, Go and Ruby have no `decorator`
+patterns. Comments inside an argument list are not arguments. Rust attribute arguments use
+meta-item tokens: a lone identifier is positional, `name = value` is named, and every other
+segment, such as a path or a nested list like `all(unix, x)`, is positional. Rust segments
+without a single syntax node use their source span as the target, so `:text` and
+`:text/regex` can match their written value.
+
 An ordered-list role needs each listed pattern to match a different edge, in source
 order. The matches need not be adjacent, and the list does not fix the total count.
-Use `arity` for an exact count. Each list holds at most 64 patterns.
+Use `arity` for an exact argument or element count. Each list holds at most 64 patterns.
+For `parameters` and `members`, a failed ordered match is incomplete when the
+owner's list coverage is incomplete or unknown. A successful match remains true;
+negation cannot turn an incomplete miss into a true match. The diagnostic names
+the owner, role, and all recorded coverage gaps.
 
 ## Steps
 
@@ -259,6 +285,7 @@ are in [Step options](#step-options).
 | `filter` | `filter` | any row -> same row | `where` (required) | Keep rows for which every typed predicate holds. |
 | `project` | `project` | any row -> projected row | `columns` (required) | Publish selected fields, optionally renamed, to later `filter` and `project` steps and to relational policy bindings. |
 | `anchor` | `anchor` | `structural_match` -> `structural_match` | `capture` (required) | Emit one row for each distinct node bound to the named positive capture, using that node's source range as the reported location while retaining the structural root for matching and later steps. |
+| `identical_captures` | `identical-captures`, `identical_captures` | `structural_match` -> `structural_match` | `left`, `right` (required) | Compare every left capture node with every right capture node. Keep the row if any pair is structurally identical; drop it only if every pair is distinct; otherwise withhold it with `identical_captures_open`. Leaves, including literals, compare by source token: `0x10` and `16` are Distinct spellings, which does not claim different runtime values. Decoded-value comparison is tracked in #10093. |
 | `statement_facts` | `statement-facts`, `statement_facts` | `structural_match` -> `structural_match` | `statement_fact_kind` (required) | Retain structural matches for one registered CodeQL statement fact. C/C++-only kinds return no matches for other languages; `nested-loops-with-same-variable` is supplied by both C++ and C#. Supported kinds are `alloca-in-loop`, `complex-block`, `complex-condition`, `empty-block`, `long-switch`, `missing-case-in-switch`, `nested-loops-with-same-variable`, and `use-of-goto`. |
 | `cpp_facts` | `cpp-facts`, `cpp_facts` | `structural_match` -> `structural_match` | `kind` (required) | Retain C++ class, special-member, catch, throw, or inheritance matches for one registered CodeQL parity fact. Supported kinds are `assignment-does-not-return-this`, `catch-by-value`, `constructor-delegation`, `constructor-used-as-copy-constructor`, `rule-of-three`, `rule-of-two`, `throwing-pointer`, and `undisciplined-multiple-inheritance`. |
 
@@ -343,7 +370,7 @@ slice, including blank lines between comments.
 
 | JSON `op` | RQL form | Input -> output | Options | Meaning |
 | --- | --- | --- | --- | --- |
-| `references_of` | `references-of` | `declaration` -> `reference_site` | `reference_kinds`, `proof`, `surface` | Resolved source sites that refer to the declaration. |
+| `references_of` | `references-of` | `declaration` -> `reference_site` | `reference_kinds`, `enclosing`, `proof`, `surface` | Resolved source sites that refer to the declaration. |
 | `used_by` | `used-by` | `declaration` -> `declaration` | `reference_kinds`, `proof`, `surface` | Declarations that contain references to the input. |
 | `uses` | `uses` | `declaration` -> `declaration` | `reference_kinds`, `proof`, `surface` | Declarations that the input refers to. |
 | `callers` | `callers` | `declaration` -> `declaration` | `depth`, `proof`, `completeness` | Callers through resolved incoming call edges, direct or up to `depth` hops. |
@@ -356,8 +383,8 @@ slice, including blank lines between comments.
 
 | JSON `op` | RQL form | Input -> output | Options | Meaning |
 | --- | --- | --- | --- | --- |
-| `edges_of` | `edges-of`, `edges_of` | `declaration` -> `reference_edge` | `reference_kinds`, `proof`, `surface`, `usage`, `relation`, `site_class` | Inverse edges: every usage site the usage index lists for the declaration. |
-| `edges_from` | `edges-from`, `edges_from` | `occurrence` -> `reference_edge` | same six options | Forward edges: the targets the resolver chose for that exact token. |
+| `edges_of` | `edges-of`, `edges_of` | `declaration` -> `reference_edge` | `reference_kinds`, `enclosing`, `proof`, `surface`, `usage`, `relation`, `site_class` | Inverse edges: every usage site the usage index lists for the declaration. |
+| `edges_from` | `edges-from`, `edges_from` | `occurrence` -> `reference_edge` | same seven options | Forward edges: the targets the resolver chose for that exact token. |
 | `edge_target` | `edge-target`, `edge_target` | `reference_edge` -> `declaration` | none | The exact indexed target declaration of an edge. |
 
 ### Occurrences, scopes, bindings, and resolution
@@ -400,7 +427,7 @@ slice, including blank lines between comments.
 | --- | --- | --- | --- | --- |
 | `receiver_targets` | `receiver-targets`, `receiver_targets` | `structural_match`, `reference_site`, `call_site`, `expression_site`, or `occurrence` -> `receiver_analysis` | `capture` | Analyze the receiver value of a call or member site, within bounds. |
 | `points_to` | `points-to`, `points_to` | `structural_match`, `reference_site`, `expression_site`, or `occurrence` -> `receiver_analysis` | `capture` | Analyze where an expression's value comes from, within bounds. |
-| `member_targets` | `member-targets`, `member_targets` | `structural_match`, `reference_site`, or `occurrence` -> `member_target_analysis` | `capture` | Resolve the exact static member, with the receiver owner and model provenance. |
+| `member_targets` | `member-targets`, `member_targets` | `structural_match`, `reference_site`, or `occurrence` -> `member_target_analysis` | `capture`, `member_form`, `trivial_property` | Resolve the exact static member, with the receiver owner and model provenance. With `member_form` or `trivial_property`, keep only the rows whose single exact target satisfies every option; a row whose answer is undecided is withheld and reported as `member_form_undecided`. |
 | `receiver_outcome` | `receiver-outcome`, `receiver_outcome` | `structural_match`, `reference_site`, `call_site`, `expression_site`, `occurrence`, `receiver_analysis`, or `member_target_analysis` -> `receiver_outcome` | none | Exactly one terminal outcome row per analyzed site. |
 | `receiver_evidence` | `receiver-evidence`, `receiver_evidence` | `structural_match`, `reference_site`, `call_site`, `expression_site`, `occurrence`, or `receiver_analysis` -> `receiver_evidence` | none | Zero or more parent-linked evidence rows per analyzed site. |
 | `dispatch_outcome` | `dispatch-outcome`, `dispatch_outcome` | `structural_match`, `call_site`, `reference_site`, or `occurrence` -> `dispatch_outcome` | none | Exactly one bounded-dispatch outcome row per site, with coverage and target count. |
@@ -624,6 +651,7 @@ Options are written before the nested query in RQL, for example
 | `depth` | `:depth` | `supertypes`, `subtypes`, `callers`, `callees` | no | positive integer | direct (one hop) |
 | `transitive` | `:transitive` | `supertypes`, `subtypes` | no | `true` only; not with `depth` | direct |
 | `reference_kinds` | `:reference-kinds` | `references_of`, `used_by`, `uses`, `edges_of`, `edges_from` | no | non-empty list of [reference kinds](#references-and-edges) | every kind, including unclassified hits |
+| `enclosing` | `:enclosing` | `references_of`, `edges_of`, `edges_from` | no | structural declaration pattern | every site, including file scope |
 | `proof` | `:proof` | `references_of`, `used_by`, `uses`, `edges_of`, `edges_from`, `callers`, `callees`, `call_sites_to`, `call_sites_from` | no | `proven` or `unproven` | both |
 | `surface` | `:surface` | `references_of`, `used_by`, `uses`, `edges_of`, `edges_from` | no | `external_usages` or `lsp_references` | `external_usages` for the reference steps; no default for the edge steps |
 | `completeness` | `:completeness` | `callers`, `callees` | no | `exhaustive` or `proven_subset`; `proven_subset` only on `callers` with `proof` `proven` | `exhaustive` |
@@ -631,6 +659,9 @@ Options are written before the nested query in RQL, for example
 | `parameter_index` | `:parameter-index` | `call_input` | one selector | zero-based index, excluding receiver-bound parameters | none |
 | `parameter_name` | `:parameter-name` | `call_input` | one selector | declared parameter name, 1 to 128 bytes | none |
 | `capture` | `:capture` | `anchor` (required); `receiver_targets`, `points_to`, `member_targets` (optional) | depends on the step | a declared positive capture name, 1 to 128 bytes; only after a structural match | each distinct captured node's source range for `anchor`; the receiver, member, or value derived from the match for the receiver steps |
+| `member_form` | `:member-form` | `member_targets` | no | non-empty list of `field`, `property`, `method`, `event`, `other` (rules under the row-kind tables) | rows are not filtered by form |
+| `trivial_property` | `:trivial-property` | `member_targets` | no | `true` or `false` (rules under the row-kind tables) | rows are not filtered by triviality |
+| `left`, `right` | `:left`, `:right` | `identical_captures` (both required) | no | declared positive capture names, 1 to 128 bytes | all pairs of captured nodes use existential structural identity |
 | `protocol_ref` | `:protocol-ref` | `typestate` | yes | `namespace:name` | none |
 | `plan_ref` | `:plan-ref`, `:plan_ref` | `value_flow` | yes | `namespace:name` | none |
 | `taint_ref` | `:taint-ref`, `:taint_ref` | `taint` | yes | `namespace:name` | none |
@@ -740,6 +771,20 @@ Rules:
 - Bare RQL labels are checked against the field's published enum labels.
 - A projection has 1 to 32 columns with unique output names. Field names are at most
   256 bytes. Later steps see only the projected names.
+
+A source-property enum domain can declare undecided values, such as
+`owner_relation=unknown` or a branch `verdict=open`. Comparing one with a concrete
+label using `eq`, `ne`, or `in` withholds the row and reports
+`row_predicate_undecided` with Content incompleteness. Explicitly inspecting the
+actual sentinel keeps normal label semantics: `eq unknown` matches an actual
+`unknown`, `ne unknown` does not, and an `in` set containing it matches. Comparing
+an actual `open` with a different sentinel `unknown` remains undecided. A definite
+false conjunct excludes the row without a new predicate diagnostic. Field
+comparisons consult both operands' domains, including through projected names.
+Presence tests still test null, and enum regex remains forbidden. Evidence
+categories such as `proof=unknown` or `coverage=partial` keep exact comparisons;
+a label's spelling alone never determines uncertainty. Diagnostics group the full
+deduplicated withheld-site list by predicate, field, and file.
 
 ## Constrained value labels
 
@@ -912,7 +957,7 @@ shows the variable, definition, use, and same-name peer steps together.
 
 | Axis | Labels |
 | --- | --- |
-| `formats` | `yaml` (alias `yml`), `toml`, `json`, `xml`, `properties` (aliases `props`, `property`), `hocon` (alias `conf`; discovered but not yet read, so each document reports `missing_structural_adapter`) |
+| `formats` | `yaml` (alias `yml`), `toml`, `json`, `xml`, `properties` (aliases `props`, `property`), `hocon` (alias `conf`; a dotted path such as `a.b = 1` is one `object_member` per element, and `include`, `${...}`, `+=` and repeated keys are not applied) |
 | `node_kinds` | `document`, `object`, `section`, `sequence`, `member`, `scalar` |
 | `roles` | `object_member`, `table_entry`, `property`, `xml_attribute`, `xml_element`. Result rows spell these with `-`, such as `object-member`. |
 | `scalar_kinds` | `string`, `boolean`, `integer`, `decimal`, `null`, `url`, `duration`, `opaque` |
@@ -977,8 +1022,8 @@ in the last column is left out of the JSON when it has no value. With
 | `taint_finding` | `evidence`, `id`, `language`, `origins`, `path`, `range`, `reached_labels`, `sink`, `sink_event_id`, `witnesses` | `ambiguous`, `origins_truncated`, `witnesses_truncated` |
 | `file` | `language`, `path` | `package_fq`, `package_syntactic` |
 | `dependency_evidence` | `complete`, `conditions`, `ecosystem`, `end_byte`, `evidence_kind`, `id`, `package`, `path`, `scope`, `source_digest`, `start_byte` | `declared_by`, `exact_version`, `locator`, `range`, `source`, `version_requirement` |
-| `configuration_fact` | `completeness`, `end_byte`, `fact_id`, `fact_provenance`, `format`, `id`, `node_kind`, `ordinal`, `path`, `range`, `route`, `start_byte` | `index`, `key`, `occurrence`, `parent_id`, `role`, `scalar_kind`, `value_id` |
-| `reference_site` | `language`, `path`, `proof`, `range`, `target`, `usage_kind` | `enclosing_declaration`, `reference_kind` |
+| `configuration_fact` | `completeness`, `directory`, `end_byte`, `fact_id`, `fact_provenance`, `format`, `id`, `node_kind`, `ordinal`, `path`, `range`, `route`, `start_byte` | `index`, `key`, `occurrence`, `parent_id`, `role`, `scalar_kind`, `value`, `value_id` |
+| `reference_site` | `language`, `path`, `proof`, `range`, `reference_facets`, `target`, `usage_kind` | `enclosing_declaration` |
 | `call_site` | `call_kind`, `callee`, `callee_range`, `caller`, `language`, `path`, `proof`, `range` | `arguments`, `receiver` |
 | `expression_site` | `call_range`, `callee_fq_name`, `caller_fq_name`, `input_kind`, `language`, `path`, `range`, `text` | `parameter_index`, `parameter_name` |
 | `jsx_attribute_value` | `ast_id`, `attribute_kind`, `coverage`, `element_identity`, `id`, `language`, `path`, `range`, `text` | `attribute_name`, `attribute_target`, `component`, `element_name`, `property_name`, `reason` |
@@ -1018,13 +1063,14 @@ in the last column is left out of the JSON when it has no value. With
 | `python_hierarchy_fact` | `coverage`, `fact_kind`, `id`, `language`, `outcome`, `path`, `range`, `root_id` | `base_branch_definition_count`, `base_resolution`, `base_spelling`, `declaration`, `declaration_id`, `has_non_strict_ordering`, `has_strict_ordering`, `inherited_ne_delegates`, `inherited_ne_present`, `member_name`, `mro_rank`, `ordinal`, `owner`, `owner_id`, `reason`, `root`, `root_declaration_id`, `source_repeated_arity`, `source_required_arity`, `source_signature_coverage`, `source_signature_id`, `source_signature_ordinal`, `source_total_arity`, `target`, `target_id`, `target_non_trivial`, `target_owner`, `target_owner_id`, `target_reads_self`, `target_repeated_arity`, `target_required_arity`, `target_signature_coverage`, `target_signature_id`, `target_signature_ordinal`, `target_total_arity`, `total_ordering_decorator` |
 | `occurrence` | `ast_id`, `class`, `end_byte`, `id`, `language`, `namespace`, `path`, `range`, `raw_spelling`, `role`, `start_byte`, `target` | `decoded_spelling`, `enclosing_symbol` |
 | `lexical_scope` | `end_byte`, `id`, `index`, `language`, `path`, `range`, `start_byte` | `ast_id`, `kind`, `parent_index` |
-| `binding` | `activation_end_byte`, `activation_start_byte`, `declaring_scope_index`, `end_byte`, `hoisting`, `id`, `kind`, `language`, `name`, `namespace`, `path`, `range`, `source_order`, `start_byte`, `visibility` | `ast_id`, `import`, `reached_from_ast_id`, `shadowed` |
+| `binding` | `activation_end_byte`, `activation_start_byte`, `declaring_scope_index`, `end_byte`, `hoisting`, `id`, `kind`, `language`, `name`, `namespace`, `path`, `range`, `source_order`, `start_byte`, `visibility`, `whole_let_initializer`, `whole_match_arm_identifier` | `ast_id`, `immediate_parent_kind`, `import`, `reached_from_ast_id`, `shadowed` |
+
 | `resolution_candidate` | `ast_id`, `boundary`, `candidate`, `end_byte`, `id`, `language`, `ordinal`, `outcome`, `path`, `range`, `start_byte`, `trace_completeness`, `visibility` | `applicability`, `canonical_member_id`, `dispatch_tier`, `external_target`, `hierarchy_depth`, `owner`, `rejection_reason`, `tier` |
 | `candidate_hop` | `ast_id`, `candidate_id`, `end_byte`, `hop`, `id`, `language`, `path`, `range`, `relation`, `start_byte` | `from`, `to` |
 | `generation_site` | `end_byte`, `generated`, `generated_count`, `id`, `input`, `kind`, `language`, `path`, `range`, `start_byte` | `ast_id` |
 | `export` | `end_byte`, `exported_name`, `form`, `id`, `language`, `path`, `range`, `start_byte` | `ast_id`, `target_fq_name` |
 | `declaration_state` | `config_gated`, `declaration_only`, `fq_name`, `id`, `language`, `origin`, `path`, `unit_kind` | `ast_id`, `end_byte`, `range`, `start_byte` |
-| `reference_edge` | `edge_provenance`, `end_byte`, `generation`, `id`, `language`, `owner_relation`, `path`, `proof`, `range`, `site_class`, `start_byte`, `target`, `usage_kind` | `ast_id`, `enclosing_declaration`, `reference_kind` |
+| `reference_edge` | `edge_provenance`, `end_byte`, `generation`, `id`, `language`, `owner_relation`, `path`, `proof`, `range`, `reference_facets`, `site_class`, `start_byte`, `target`, `usage_kind` | `ast_id`, `enclosing_declaration` |
 | `state_event` | `completeness`, `end_byte`, `event_class`, `generation`, `id`, `language`, `path`, `procedure_id`, `program_point`, `program_point_id`, `range`, `start_byte`, `subject`, `subject_value`, `value` | `ast_id`, `member`, `uncovered_axes` |
 | `binding_initializer_call` | `end_byte`, `establishment_event_id`, `id`, `initializer_role`, `language`, `path`, `range`, `site_ast_id`, `start_byte` | none |
 | `flow_relation` | `certainty`, `completeness`, `generation`, `id`, `language`, `path`, `procedure_id`, `range`, `relation`, `source`, `target` | `uncovered_axes` |
@@ -1044,6 +1090,23 @@ in the last column is left out of the JSON when it has no value. With
 | `topology_edge` | `build_file`, `completeness`, `from_id`, `from_name`, `id`, `scope`, `to_name` | `to_id` |
 | `build_configuration` | `arch_scope`, `configuration_id`, `file_status`, `id`, `language`, `os_scope`, `path` | `arch`, `arch_source`, `arch_values`, `constraint`, `os`, `os_source`, `os_values`, `target` |
 | `cross_domain` | `domain`, `id`, `operator`, `path` | `binding`, `code`, `code_id`, `code_path`, `configuration`, `configuration_contributors`, `configuration_id`, `configuration_path`, `dependency_id`, `effective_configuration`, `key`, `mapping_id`, `mitigated`, `owner`, `range`, `relation` |
+
+For a `binding` row, `whole_let_initializer` is always present and true when
+the binder is the entire left side of a `let` with an initializer.
+`whole_match_arm_identifier` is always present and true when the binder is the
+entire match-arm pattern and is a single identifier. `immediate_parent_kind`
+is present when the binder's immediate syntax parent is known.
+
+Per-target `member_form` and `trivial_property` values are computed only when the step requests `:member-form` or `:trivial-property`. Without either option both values are null, and classification consumes no scan budget or emits diagnostics.
+
+Each `member_targets` entry has `member_form` (`field`, `property`, `method`, `event`, or `other`) and `trivial_property` (`true`, `false`, or `null`). These per-target values are display only; the row itself has no `member_form` or `trivial_property` field, because a row filter would treat `null` as a definite non-match and drop the row without a trace. To decide rows by these properties, give the `member_targets` step the options `:member-form [field property ...]` and `:trivial-property true|false`:
+
+- A row is kept when its coverage is `exhaustive` (one precise target, nothing truncated, no unsupported semantics) and the target's known values satisfy every option.
+- A row is dropped when its coverage is `exhaustive` and a requested option has a known value that does not satisfy it. A false answer to one option decides the row even if another option is unknown.
+- Every other row is withheld and the answer is marked incomplete with a `member_form_undecided` diagnostic that names each withheld site and why: an unknown value, coverage that is not `exhaustive` (an ambiguous or open target set), a target that belongs to a semantic pack, or a declaring file the scan budget refused.
+
+The per-target values are `null` when the member has no unique, complete source declaration, belongs to a semantic pack, or belongs to a language without this classification. The step parses each declaring file at most once and charges it once to the query's `max_scanned_files` and `max_scanned_source_bytes` budget, however many rows reach it; a file the budget refuses leaves its targets `null` and adds a `receiver_analysis_partial` diagnostic. A C# member that starts inside a conditional-compilation branch whose selection is undecided has `null` for both values, and a property with undecided conditional text anywhere in its declaration has a `null` `trivial_property`, because the branch the parser dropped could change the form or the accessors. For C# properties, `trivial_property` follows the pinned CodeQL `TrivialProperty` definition: a read/write auto-property, or a getter and setter that access the same field and assign `value`. An `init` accessor is a setter in that definition, so `{ get; init; }` is auto-implemented. C# 14 `field` accessors answer `null` because that pin does not model the contextual backing-field keyword.
+The C# `event` member form is currently unreachable: event declarations do not publish CodeUnits yet.
 
 Member-family summaries publish `ancestor_coverage` and `descendant_coverage`
 (`exhaustive` or `open`), with optional `ancestor_reason` and `descendant_reason`.
@@ -1159,6 +1222,7 @@ The impact column gives the impact that `query_code` uses for each code.
 | `invalid_plan` | `invalid` | The plan cannot run, for example a `resolved_call` with an unresolved qualified locator. |
 | `cancelled` | `incomplete` | The query was cancelled; rows already produced are partial. |
 | `unsupported_structural_feature` | `incomplete` | An adapter does not support a kind, role, or predicate the query uses, or did not record it. |
+| `structural_role_coverage_incomplete` | `incomplete` | An ordered role pattern could not match under incomplete coverage, or a `count` interval remained undecided because of unknown child matches or incomplete coverage. Count diagnostics include the observed interval and requested bounds. |
 | `missing_structural_adapter` | `incomplete` | No structural or configuration adapter exists for some files. |
 | `unsupported_import_analysis` | `incomplete` | A language has no structured import analysis; its files were left out of import steps. |
 | `dynamic_import_target` | `incomplete` | An include/require target depends on runtime state, so its workspace file was left out of import traversal. |
@@ -1173,6 +1237,7 @@ The impact column gives the impact that `query_code` uses for each code.
 | `semantic_budget_exhausted` | `incomplete` | A semantic budget lane ran out. |
 | `semantic_provider_failed` | `incomplete` | The semantic provider failed. |
 | `semantic_pack_acquisition_pending` | `incomplete` | A needed semantic pack is not available yet. |
+| `semantic_pack_activation_failed` | `incomplete` | The session's semantic-pack activation failed, for example because a `.bifrost/semantic-models/` file was rejected. The message gives the reason. A failed activation publishes no models, so results that need any semantic model, including models unrelated to the failure, can be missing or `unknown`. |
 | `workspace_semantic_models_not_loaded` | `advisory` | `.bifrost/semantic-models/` exists, but this session did not load it because `BIFROST_WORKSPACE_SEMANTIC_MODELS` is unset. Results that need those models can be missing or `unknown`. |
 | `unresolved_protocol_reference` | `incomplete` | No typestate protocol is registered under `protocol_ref`. |
 | `typestate_registration_stale` | `incomplete` | The typestate registration belongs to another workspace generation. |
@@ -1210,12 +1275,16 @@ The impact column gives the impact that `query_code` uses for each code.
 | `call_relation_targets_ambiguous` | `advisory` | A call has more than one possible target. |
 | `call_relation_candidate_limit` | `incomplete` | Call traversal reached its candidate limit. |
 | `call_relation_analysis_failed` | `incomplete` | Call analysis failed. |
+| `rendered_captures_truncated` | `incomplete` | Rendered captures exceeded the response byte budget; rows are retained. |
 | `reference_source_bytes_truncated` | `incomplete` | Reference search reached its source-byte limit. |
 | `reference_candidate_files_truncated` | `incomplete` | Reference search reached its candidate-file limit. |
 | `reference_candidates_omitted` | `incomplete` | Reference candidates were left out. |
 | `reference_targets_ambiguous` | `advisory` | A reference has more than one possible target. |
 | `reference_callsite_limit` | `incomplete` | Reference search reached its call-site limit. |
 | `reference_analysis_failed` | `incomplete` | Reference analysis failed. |
+| `reference_kind_undecided` | `incomplete` | A kind filter could not exclude reference sites whose kind is not classified; the answer may miss matches. |
+| `row_predicate_undecided` | `incomplete` | A row filter could not decide a source-property enum comparison; affected rows are withheld and their sites reported per predicate, field, and file. |
+| `member_form_undecided` | `incomplete` | A `member_targets` `member_form` or `trivial_property` option could not decide some rows, so they were withheld; the answer may miss matches. |
 | `uses_parser_unsupported` | `incomplete` | `uses` cannot parse this language. |
 | `uses_candidate_limit` | `incomplete` | `uses` reached its candidate limit. |
 | `uses_targets_ambiguous` | `advisory` | A use has more than one possible target. |
@@ -1279,6 +1348,7 @@ with `--workspace-scaled-limits`, scale some execution limits by source volume.
 | Named arguments (`kwargs`) | 64, names at most 128 bytes |
 | `name`, `text`, and `parameter_type` predicate source | 4096 bytes |
 | `arity` bounds | 0 to 1024 |
+| `count` bounds | 0 to 4294967295 |
 | Capture label | 128 bytes |
 | Steps per plan node | 16 |
 | Set operands per node | 2 to 16 |
@@ -1359,7 +1429,7 @@ limits remain separate.
 ## Static dependency evidence
 
 `dependency_evidence` reads facts acquired from selected Cargo, JS/TS, C#
-(NuGet) and Go manifests and lockfiles before query execution. A files-only checkout can supply
+(NuGet), Go, Ruby (RubyGems), PHP (Composer) and JVM (Maven, Gradle, sbt) manifests and lockfiles before query execution. A files-only checkout can supply
 these facts without installed dependencies, declaration files, a build or a
 semantic-pack artifact. Acquisition does not execute package managers, target
 project scripts, lifecycle hooks or network requests. JS/TS supported formats
@@ -1412,20 +1482,125 @@ workspace build reads is a `declared` `cargo_build_target` row with a
 records on toolchain-file rows. Every row carries the `cargo.member_manifest`
 and `cargo.member_package` of its owner.
 
+For Ruby, each directory with a `Gemfile` (or `gems.rb`) or a `Gemfile.lock`
+(or `gems.locked`) is a bundle, and its rows, and those of a gemspec beside it,
+name the bundle's BuildProject in `declared_by`. Each `Gemfile` `gem` call is a
+`declared` `rubygems` row with its requirements joined by `, `, a
+`bundler.group` condition per group (`default` outside any group), its
+`bundler.platform` conditions, a `git+`, `path:` or registry source, and
+`bundler.conditional` when an `if`, `unless` or `case` encloses it. Gemspec
+`add_dependency`, `add_runtime_dependency` and `add_development_dependency`
+calls are `declared` rows with a `rubygems.dependency_type` condition. Every
+`Gemfile.lock` spec, direct or transitive, is a `locked` row; its exact version
+excludes a platform suffix, which becomes a `bundler.platform` condition
+(`nokogiri (1.16.0-arm64-darwin)` is version `1.16.0`), and
+`bundler.source_kind` says whether it came from `GEM`, `GIT` or `PATH`.
+`bundler.lock_association` says whether `DEPENDENCIES` names it. `CHECKSUMS`
+entries are `checksum` rows. The Ruby runtime uses ecosystem `ruby-toolchain`
+and package `ruby`, tagged by `ruby.runtime_evidence`: the lock's
+`RUBY VERSION` (`gemfile_lock_ruby_version`) and an exact `.ruby-version` or
+`.tool-versions` pin found from the bundle upward (`ruby_version_file`,
+`tool_versions_file`) are `locked`, with any patchlevel as `ruby.patchlevel`
+and another engine as `ruby.engine`; a partial or non-MRI pin is a
+`constraint`. A `Gemfile` `ruby` directive and a gemspec
+`required_ruby_version` are `constraint` rows, so a version range leaves them
+unknown. A bundle with none of these has a `ruby.runtime_evidence=none`
+constraint. None of these rows observes the runtime that executes, which
+`ruby.runtime_override=unobserved` records on every pin. A `Gemfile` without a
+lock, a lock that does not parse or has a section Bundler does not write,
+`eval_gemfile`, and a workspace without any bundle are gaps, so the answer is
+incomplete rather than empty.
+
+For PHP, each directory outside `vendor` with a `composer.json` or a
+`composer.lock` is a Composer project, and its rows name the project's
+BuildProject in `declared_by`. Each `require`, `require-dev`, `replace`,
+`provide` and `conflict` link is a `declared` `composer` row with the authored
+constraint as its requirement (an inline alias such as `dev-main as 1.x-dev`
+is kept, and also recorded as `composer.inline_alias`) and the section as
+`composer.link`; `require-dev` rows have scope `test`. Every `composer.lock`
+`packages` and `packages-dev` entry is a `locked` row whose exact version is
+the one Composer wrote (`v1.2.2`, `dev-main`), with
+`composer.lock_association` saying whether the manifest requires it directly,
+its `source` and `dist` type, reference and shasum as conditions, a root alias
+as `composer.alias` and a branch alias as `composer.branch_alias`. Its source
+is the VCS source (`git+https://...`), else the dist URL, or `path:` for a
+path repository. A locked package's own `replace` and `provide` links are
+`declared` rows with `composer.replaced_by`. The PHP runtime and the other
+platform packages (`ext-*`, `lib-*`, `composer-*-api`) use ecosystem
+`php-toolchain`: a platform requirement is a `constraint`, and an exact
+`config.platform` entry or `.php-version` pin found from the project upward is
+`locked` (a partial pin is a `constraint`), tagged by `php.runtime_evidence`
+and `php.runtime_override=unobserved`. A project with neither has a
+`php.runtime_evidence=none` constraint. A `composer.json` without a lock, a
+lock without a `composer.json`, a file that does not parse, and a workspace
+without any Composer project are gaps. `vendor/composer/installed.json` and
+the lock's `content-hash` are not compared yet.
+
+For Java, Kotlin and Scala, each `pom.xml` is a Maven project whose rows name
+the BuildProject the Maven topology publishes for it in `declared_by`. Each
+`<dependencies>` entry is a `declared` `maven` row for `groupId:artifactId`
+whose requirement is the version after property interpolation (properties of
+the pom and of its parents in the workspace, and `project.*` values), with
+`maven.scope`, `maven.type`, `maven.classifier` and `maven.optional`
+conditions. Maven's nearest-wins mediation always selects a direct
+declaration, so a plain version, or the version a `dependencyManagement`
+entry of the pom or of a workspace parent supplies (`maven.managed_by`), is
+also a `locked` row with `maven.selection=direct`. Each `dependencyManagement`
+entry is a `constraint` (`maven.bom=import` for a BOM import), and a
+`<parent>` is a `declared` row with `maven.parent`. The JDK uses ecosystem
+`jvm-toolchain`, package `java`: `maven.compiler.release`, `source` and
+`target` properties and the `maven-compiler-plugin` options are
+`constraint`s, and the nearest `.java-version`, `.sdkmanrc` (`java=`) or
+`.tool-versions` (`java`) pin from the project upward is `locked` when it
+names three numeric parts and a `constraint` otherwise, with the distribution
+as `java.distribution`. A project with neither has a
+`java.runtime_evidence=none` constraint, and every JDK row carries
+`java.runtime_override=unobserved`. A version range, an undefined property, a
+parent or BOM outside the workspace, a dependency without any version,
+profiles, a pom that does not parse, a Gradle or sbt build file, and a
+workspace without any JVM build are gaps; a row whose version interpolates
+a property a profile redefines is incomplete.
+
+Gradle and sbt rows also use ecosystem `maven`, and name the BuildProject the
+JVM topology publishes for the Gradle project or sbt `project` in
+`declared_by`. Each `dependencies { }` entry of a `build.gradle.kts` is a
+`declared` row with `gradle.configuration` (a string coordinate, `group =
+... name = ... version = ...` arguments, `kotlin("x")`, or a `libs.*`
+accessor resolved through the build's `gradle/libs.versions.toml` and
+recorded as `gradle.catalog_alias`); a `platform(...)` or
+`enforcedPlatform(...)` BOM is a `constraint` with `gradle.platform`. Each
+catalog library is a `constraint`, with `gradle.version_constraint` for a
+`strictly`, `require` or `prefer` version. Each `gradle.lockfile` line is a
+`locked` row with one `gradle.configuration` per configuration. Each
+`build.sbt` `libraryDependencies` entry is a `declared` row; a `%%` artifact
+carries the Scala binary suffix of the build's literal `scalaVersion`
+(`akka-http_2.13`) and `sbt.cross_version=binary`, a configuration such as
+`% Test` is `sbt.configuration`, and `scalaVersion` itself declares
+`org.scala-lang:scala-library`. Each sbt-dependency-lock `build.sbt.lock`
+entry is a `locked` row. Gradle and sbt both select the newest version any
+dependency requests, so a declaration is a floor: a project that declares
+dependencies without its lockfile is a Missing gap. A Gradle
+`jvmToolchain(N)` or `JavaLanguageVersion.of(N)` is a `jvm-toolchain`
+constraint. A Groovy `build.gradle` or `settings.gradle`, a templated
+coordinate, a `%%%` artifact, dependencies declared inside `subprojects { }`
+and similar blocks, and any other expression a build would have to evaluate
+are gaps.
+
 Each axis is an array of exact alternatives; different axes combine with AND.
 JSON axes and their RQL options are:
 
 | JSON | RQL | Meaning |
 | --- | --- | --- |
-| `ecosystems` | `:ecosystem`, `:ecosystems` | Package ecosystem; Cargo uses `cargo`, Rust toolchain and build-target rows use `rust-toolchain`, JS/TS packages use `npm`, JS toolchain constraints use `npm-toolchain`, C# packages and shared frameworks use `nuget`, Go modules use `go-module`, and the Go `go`/`toolchain` directives use `go-toolchain`. |
+| `ecosystems` | `:ecosystem`, `:ecosystems` | Package ecosystem; Cargo uses `cargo`, Rust toolchain and build-target rows use `rust-toolchain`, JS/TS packages use `npm`, JS toolchain constraints use `npm-toolchain`, C# packages and shared frameworks use `nuget`, Go modules use `go-module`, the Go `go`/`toolchain` directives use `go-toolchain`, Ruby gems use `rubygems`, Ruby runtime rows use `ruby-toolchain`, Composer packages use `composer`, PHP runtime and platform-package rows use `php-toolchain`, Maven artifacts use `maven`, and JDK rows use `jvm-toolchain`. |
 | `packages` | `:package`, `:packages` | Actual package names, independent of manifest aliases. |
 | `kinds` | `:kind`, `:kinds` | `declared`, `constraint`, `locked`, `installed`, or `checksum`. Cargo file acquisition emits declared and locked facts. |
 | `exact_versions` | `:exact-version`, `:exact_versions` | Exact recorded version strings. Declarations have requirements, not exact versions. |
-| `version_ranges` | `:version-range`, `:version_ranges` | Version requirements matched against complete exact locked/installed evidence. Requires exactly `ecosystems: ["cargo"]`, `["rust-toolchain"]`, `["npm"]`, `["nuget"]`, `["go-module"]` or `["go-toolchain"]`; each uses its ecosystem semantics, including prerelease rules. npm supports comparator sets, unions, caret/tilde, partial/wildcard and hyphen ranges. NuGet supports interval notation (`[1.0,2.0)`, `[1.2.3]`, `(,1.0]`), a bare inclusive minimum (`1.0`), whitespace-joined comparators (`>=1.2 <1.5.51`) and `\|\|` unions, with NuGet's ordering: up to four numeric parts, a prerelease below its release, and case-insensitive labels. Go supports whitespace-joined comparators and `\|\|` unions; `go-module` bounds are module versions (`v0.17.0` or `0.17.0`, pseudo-versions order as prereleases) and `go-toolchain` bounds are Go release versions in `go/version` order (`1.21` < `1.21rc1` < `1.21.0`, `go1.21.0` accepted). `rust-toolchain` ranges are Cargo semver requirements over the pinned release of a toolchain file. Arbitrary sources and tags remain unresolved. |
+| `version_ranges` | `:version-range`, `:version_ranges` | Version requirements matched against complete exact locked/installed evidence. Requires exactly `ecosystems: ["cargo"]`, `["rust-toolchain"]`, `["npm"]`, `["nuget"]`, `["go-module"]`, `["go-toolchain"]`, `["rubygems"]`, `["ruby-toolchain"]`, `["composer"]`, `["php-toolchain"]`, `["maven"]` or `["jvm-toolchain"]`; each uses its ecosystem semantics, including prerelease rules. npm supports comparator sets, unions, caret/tilde, partial/wildcard and hyphen ranges. NuGet supports interval notation (`[1.0,2.0)`, `[1.2.3]`, `(,1.0]`), a bare inclusive minimum (`1.0`), whitespace-joined comparators (`>=1.2 <1.5.51`) and `\|\|` unions, with NuGet's ordering: up to four numeric parts, a prerelease below its release, and case-insensitive labels. Go supports whitespace-joined comparators and `\|\|` unions; `go-module` bounds are module versions (`v0.17.0` or `0.17.0`, pseudo-versions order as prereleases) and `go-toolchain` bounds are Go release versions in `go/version` order (`1.21` < `1.21rc1` < `1.21.0`, `go1.21.0` accepted). `rust-toolchain` ranges are Cargo semver requirements over the pinned release of a toolchain file. `rubygems` and `ruby-toolchain` ranges use `Gem::Requirement` operators (`=`, `!=`, `>`, `<`, `>=`, `<=`, `~>`) joined by commas or whitespace, with `\|\|` unions, in `Gem::Version` order: a letter segment makes a prerelease that sorts below its release (`8.1.0.beta1` < `8.1.0`), trailing zeros do not count, and `~> 2.2` admits `2.9` but not `3.0.0.beta1`. Gems locked from a `GIT` or `PATH` source stay unknown. `composer` and `php-toolchain` ranges are Composer constraints: `\|\|` (or `\|`) alternatives of comma- or space-joined comparators (`>=`, `<`, `!=`, ...), caret (`^1.2`), tilde (`~1.2.3`), wildcard (`1.2.*`) and hyphen (`1.0 - 2.0`) ranges, in Composer's order: an optional `v` prefix, four numeric parts, then `dev < alpha < beta < RC < stable < patch`. A bound with no stability keeps Composer's `-dev` floor, so `<2.0` excludes `2.0.0-beta1` and `^1.2` admits `1.2.0-RC1`; `@stability` flags are ignored. Branch versions (`dev-main`, `1.x-dev`) and path-repository packages stay unknown. `maven` and `jvm-toolchain` ranges are Maven range syntax, comma-joined unions of intervals (`[1.0,2.0)`, `(,1.0],[1.2,)`, `[1.2.3]`), or whitespace-joined comparators (`>=1.0 <1.11.0`), with `\|\|` unions, in Maven's `ComparableVersion` order: trailing zeros do not count and qualifiers order `alpha < beta < milestone < rc = cr < snapshot < release = ga = final < sp`, so `2.0-rc1` is in `[1.0,2.0)`. A bare version is Maven's soft requirement, not a range, and is rejected. Arbitrary sources and tags remain unresolved. |
 | `sources` | `:source`, `:sources` | Exact source identities. Registry URL and git revision identities remain distinct. |
 | `declared_by` | `:declared-by`, `:declared_by` | Established owning BuildProject IDs from build topology identity. |
 | `scopes` | `:scope`, `:scopes` | Recorded `compile`, `runtime`, `test`, `provided`, `optional`, `feature_gated`, or `unknown` scope. Cargo build requirements use `unknown` and retain their build kind as a condition. |
 | `features` | `:feature`, `:features` | Features the owning manifest requests of the package. Requires exactly `ecosystems: ["cargo"]`. See below. |
+| `lock_associations` | `:lock-association`, `:lock_associations` | How a Cargo row is tied to its member's lock: `exact`, `transitive`, `ambiguous` or `unresolved`. Requires exactly `ecosystems: ["cargo"]`. See below. |
 
 For example, a curated review can select an exact recorded package and source:
 
@@ -1466,6 +1641,26 @@ like this:
   :ecosystem cargo :package lettre :kind declared
   :features ["boring-tls"])
 ```
+
+A Cargo member owns its direct lock instance of a dependency and every copy
+that instance reaches through the lockfile's `dependencies`, so `declared_by`
+alone cannot separate the version the member's own code compiles against from
+an older copy a dependency pulls in. `lock_associations` can. A declaration
+records `exact` when one lock instance matches it, and `ambiguous` or
+`unresolved` otherwise. The member's direct lock row records `exact`, and each
+lock row reached through it records `transitive` and names the direct
+instance's locator in its `cargo.lock_via` condition. A lock instance that no
+member owns records no association and never matches. To gate code on the
+version it binds, select the direct instance:
+
+```lisp
+(dependency-evidence
+  :ecosystem cargo :package widget :kind locked
+  :version-range "<1.0.1" :lock-association exact)
+```
+
+Keep transitive rows when the vulnerable crate is only reached through
+another dependency, as with axum-core through axum.
 
 Each identity filter and version predicate applies to the same stored row.
 Peer constraints and engine requirements do not establish installation or the
@@ -1580,3 +1775,14 @@ Rows retain `dependency_id`, the reviewed `owner`, `mapping_id`, canonical
 and exact `configuration_contributors` citations. Different-owner witnesses
 carry no unrelated configuration pair. The dependency's lock citation anchors
 the row, and CLI, MCP, and policy execution use the same evidence.
+
+`configuration-absence` accepts the same configuration filter fields, including `:value/regex`, as `configuration-facts`. It accepts any configuration fact as its base. `:scope document` (the default) checks all facts in the base document; `:scope subtree` checks the base fact and descendants. Filter routes remain absolute from the document root. A partly recovered document never proves absence.
+
+The RQL call-shape projection is the only place that refines stored
+`callee_provenance` at query time. A stored `unknown` can project as `declared`
+for a Rust method call only when resolution is complete and ungapped and
+selects one declared method on a closed bound receiver. Refinement only fills
+`unknown`; it preserves every stored decided value. A receiver whose type is
+or contains an enclosing function type parameter remains `unknown`, unless
+the syntax-only producer already decided its provenance. Ambiguous, gapped,
+and unresolved targets remain `unknown`.

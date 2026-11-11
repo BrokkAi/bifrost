@@ -123,6 +123,11 @@ fn io_error(
 /// Returns whether this call created the database. It returns `false` when the
 /// database already exists, when another process created it first, and when
 /// there is no template directory.
+///
+/// Publishing the freshly built database as the family's template is best
+/// effort. The database at `db_path` is complete before publication starts, so
+/// a machine cache that cannot accept the template must not fail an otherwise
+/// writable store or catalog open.
 pub fn seed_missing_database<E: From<TemplateIoError>>(
     db_path: &Path,
     template_dir: Option<&Path>,
@@ -151,7 +156,15 @@ pub fn seed_missing_database<E: From<TemplateIoError>>(
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             build(&staged)?;
-            publish_template(&staged, template_dir, &template_path, template.family)?;
+            // The template is a machine-wide optimization. A read-only or
+            // otherwise unwritable template directory must not fail an open
+            // whose own database directory is writable; keep the built
+            // database and report the skipped publication.
+            if let Err(error) =
+                publish_template(&staged, template_dir, &template_path, template.family)
+            {
+                eprintln!("Bifrost template publication skipped: {error}");
+            }
         }
         Err(error) => return Err(io_error("copying", &template_path)(error).into()),
     }

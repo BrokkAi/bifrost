@@ -1,6 +1,6 @@
 //! Revision publication shared by source projections and retained configuration.
 
-pub(super) const OPEN_PARTITION_DECISIONS_SQL: &str = "SELECT files.file_version_id, files.rel_path, files.blob_oid, files.projection_digest,
+pub(super) const OPEN_PARTITION_DECISIONS_SQL: &str = "SELECT files.file_version_id, files.rel_path, files.blob_oid, files.projection_digest, files.file_present,
                     decisions.decision_digest, decisions.assignment_digest
              FROM workspace_file_versions AS files
              LEFT JOIN csharp_file_version_decisions AS decisions ON decisions.file_version_id = files.file_version_id
@@ -24,6 +24,8 @@ pub struct WorkspaceConfigurationInput {
     content_oid: Oid,
     #[doc(hidden)]
     pub source_bytes: Box<[u8]>,
+    #[doc(hidden)]
+    pub file_present: bool,
 }
 
 impl WorkspaceConfigurationInput {
@@ -67,6 +69,60 @@ impl WorkspaceConfigurationInput {
             }
         }
         if language == Language::Rust {
+            let source_directories = metadata_ancestor_directories(files.iter().filter(|file| {
+                file.rel_path()
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
+            }));
+            for directory in source_directories {
+                let manifest = ProjectFile::new(root, directory.join("Cargo.toml"));
+                if manifest.abs_path().try_exists()? {
+                    inputs.insert(manifest);
+                }
+            }
+            let crate_directories = inputs
+                .iter()
+                .filter(|file| {
+                    file.rel_path()
+                        .file_name()
+                        .is_some_and(|name| name == "Cargo.toml")
+                })
+                .map(|file| {
+                    file.rel_path()
+                        .parent()
+                        .expect("manifest parent")
+                        .to_path_buf()
+                })
+                .collect::<Vec<_>>();
+            for directory in crate_directories {
+                for kind in brokk_bifrost_core::analyzer::project::RUST_TARGET_LAYOUT_DIRECTORIES {
+                    let target_directory = root.join(&directory).join(kind);
+                    let entries = match std::fs::read_dir(target_directory) {
+                        Ok(entries) => entries,
+                        // Cargo discovers no targets where the layout directory is
+                        // absent or is an ordinary file.
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    for entry in entries {
+                        let entry = entry?;
+                        let main = ProjectFile::new(
+                            root,
+                            directory.join(kind).join(entry.file_name()).join("main.rs"),
+                        );
+                        if main.abs_path().is_file() {
+                            inputs.insert(main);
+                        }
+                    }
+                }
+            }
             let directories = metadata_ancestor_directories(inputs.iter().filter(|file| {
                 file.rel_path()
                     .file_name()
@@ -175,7 +231,15 @@ impl WorkspaceConfigurationInput {
                 .expect("hashing configuration input"),
             relative_path,
             source_bytes,
+            file_present: true,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn absent(relative_path: String) -> Self {
+        let mut input = Self::new(relative_path, Box::new([]));
+        input.file_present = false;
+        input
     }
 
     #[doc(hidden)]
@@ -197,6 +261,7 @@ impl WorkspaceConfigurationInput {
             content_oid: self.content_oid(),
             projection_digest: None,
             csharp_decision: None,
+            file_present: Some(self.file_present),
         }
     }
 
@@ -241,19 +306,26 @@ pub fn metadata_ancestor_directories<'a>(
 /// ordered by relative path, the order SQL `ORDER BY rel_path` also yields.
 #[doc(hidden)]
 pub fn configuration_digest<'a>(
-    inputs: impl IntoIterator<Item = (&'a str, Oid)>,
+    inputs: impl IntoIterator<Item = (&'a str, Oid, Option<bool>)>,
 ) -> crate::analyzer::semantic::ids::StableDigest {
     let mut digest = crate::analyzer::canonical_hash::CanonicalHasher::new(
         b"bifrost-workspace-configuration:v1",
     );
     let mut previous: Option<&str> = None;
-    for (relative_path, content_oid) in inputs {
+    for (relative_path, content_oid, present) in inputs {
         debug_assert!(
             previous.is_none_or(|previous| previous < relative_path),
             "configuration inputs ordered by unique path: {previous:?} then {relative_path:?}"
         );
         previous = Some(relative_path);
-        digest.field(relative_path, content_oid.as_bytes());
+        digest.field(
+            relative_path,
+            match present {
+                Some(true) => content_oid.as_bytes(),
+                Some(false) => b"absent",
+                None => b"unvalidated",
+            },
+        );
     }
     crate::analyzer::semantic::ids::StableDigest::from_array(digest.finish())
 }
@@ -266,6 +338,24 @@ pub(super) const SELECTED_CONFIGURATION_BYTES_SQL: &str = "SELECT retained.sourc
        AND versions.input_kind = 'configuration'
        AND versions.valid_from <= ?5
        AND (versions.valid_until IS NULL OR ?5 < versions.valid_until)";
+
+pub(super) const SELECTED_CARGO_MANIFESTS_SQL: &str =
+    "SELECT versions.rel_path, retained.source_bytes
+     FROM workspace_file_versions AS versions
+     JOIN workspace_input_sources AS retained ON retained.content_oid = versions.blob_oid
+     WHERE versions.workspace_id = ?1 AND versions.lang = ?2
+       AND versions.generation = ?3 AND versions.input_kind = 'configuration'
+       AND versions.valid_from <= ?4
+       AND (versions.valid_until IS NULL OR ?4 < versions.valid_until)
+       AND (versions.rel_path = 'Cargo.toml' OR versions.rel_path GLOB '*/Cargo.toml')";
+
+// Layout membership is shared with the classifier rather than duplicated in SQL.
+pub(super) const SELECTED_RUST_TARGET_ROOTS_SQL: &str = "SELECT rel_path
+       FROM workspace_file_versions
+       WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+         AND input_kind IN ('source', 'configuration') AND file_present = 1 AND valid_from <= ?4
+         AND (valid_until IS NULL OR ?4 < valid_until)
+         AND rel_path GLOB '*/main.rs'";
 
 #[derive(Debug, Eq, PartialEq)]
 #[doc(hidden)]
@@ -312,6 +402,53 @@ impl super::AnalyzerStore {
         )
         .optional()
         .map_err(StoreError::from)
+    }
+
+    /// Preload target layout before a query holds a store reader.
+    pub fn selected_rust_target_roots(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare_cached(SELECTED_RUST_TARGET_ROOTS_SQL)?;
+        let rows = statement.query_map(
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang,
+                snapshot.generation.get(),
+                snapshot.revision
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.filter(|row| {
+            row.as_ref().map_or(true, |path| {
+                brokk_bifrost_core::analyzer::project::is_rust_target_layout_main(
+                    std::path::Path::new(path),
+                )
+            })
+        })
+        .collect::<rusqlite::Result<_>>()
+        .map_err(StoreError::from)
+    }
+
+    /// Capture naming authority at publication, before any query holds a reader.
+    pub fn selected_cargo_manifests(
+        &self,
+        snapshot: &WorkspaceSnapshotId,
+    ) -> Result<crate::hash::HashMap<String, Vec<u8>>> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare_cached(SELECTED_CARGO_MANIFESTS_SQL)?;
+        let rows = statement.query_map(
+            params![
+                snapshot.workspace_id.as_str(),
+                snapshot.lang,
+                snapshot.generation.get(),
+                snapshot.revision
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        rows.collect::<rusqlite::Result<_>>()
+            .map_err(StoreError::from)
     }
 
     /// Exact configuration bytes, including absence, selected by this revision.
@@ -364,7 +501,42 @@ impl super::AnalyzerStore {
         let Some(overlays) = project.overlay_content() else {
             return Ok(NativeConfigurationOverlayAuthority::Current);
         };
+        if !overlays.entries().iter().any(|(file, _)| {
+            WorkspaceConfigurationInput::is_native_input(language, file.rel_path())
+        }) {
+            return Ok(if cancellation.is_cancelled() {
+                NativeConfigurationOverlayAuthority::Cancelled
+            } else {
+                NativeConfigurationOverlayAuthority::Current
+            });
+        }
         let conn = self.read_conn()?;
+        Self::native_configuration_overlay_mismatch_on_connection(
+            &conn,
+            project,
+            snapshots,
+            storage_language,
+            language,
+            cancellation,
+        )
+    }
+
+    /// Check configuration bytes on the connection held by a selected operation.
+    #[doc(hidden)]
+    pub fn native_configuration_overlay_mismatch_on_connection(
+        conn: &Connection,
+        project: &dyn crate::analyzer::Project,
+        snapshots: &super::WorkspaceSnapshots,
+        storage_language: &str,
+        language: crate::analyzer::Language,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<NativeConfigurationOverlayAuthority> {
+        if cancellation.is_cancelled() {
+            return Ok(NativeConfigurationOverlayAuthority::Cancelled);
+        }
+        let Some(overlays) = project.overlay_content() else {
+            return Ok(NativeConfigurationOverlayAuthority::Current);
+        };
         for (file, digest) in overlays.entries() {
             if cancellation.is_cancelled() {
                 return Ok(NativeConfigurationOverlayAuthority::Cancelled);
@@ -425,6 +597,7 @@ pub(super) struct WorkspaceInputRow<'a> {
     pub content_oid: Oid,
     pub projection_digest: Option<&'a str>,
     pub csharp_decision: Option<super::csharp_compilation::FileVersionDecision>,
+    pub file_present: Option<bool>,
 }
 
 /// A live source that source admission refused. It has no source row; this
@@ -459,9 +632,6 @@ impl WorkspaceSourceRefusalRow {
             } => {
                 let dimension = match dimension {
                     AdmissionDimension::SourceBytes => "source_bytes",
-                    AdmissionDimension::Nodes => "nodes",
-                    AdmissionDimension::Depth => "depth",
-                    AdmissionDimension::SpanBytes => "span_bytes",
                     AdmissionDimension::ExcludedNodes => "excluded_nodes",
                 };
                 json!({"code": "budget", "dimension": dimension, "limit": limit, "observed": observed})
@@ -601,6 +771,65 @@ pub(super) type PublishedWorkspaceInputChanges = (
     HashMap<(WorkspaceInputKind, String), i64>,
 );
 
+/// An open input version as the partition replacement compares it.
+pub(super) struct OpenInput {
+    pub id: i64,
+    pub path: String,
+    oid: Oid,
+    digest: Option<String>,
+    present: Option<bool>,
+    decision: Option<super::csharp_compilation::FileVersionDecision>,
+}
+
+impl OpenInput {
+    /// Whether `incoming` replaces this version with an identical input, so the
+    /// version stays open. The one predicate of both the replacement and the
+    /// pre-publication question of which inputs it will change.
+    pub(super) fn matches(&self, incoming: Option<&WorkspaceInputRow<'_>>) -> bool {
+        incoming.is_some_and(|new| {
+            new.content_oid == self.oid
+                && new.projection_digest == self.digest.as_deref()
+                && new.csharp_decision == self.decision
+                && new.file_present == self.present
+        })
+    }
+}
+
+pub(super) fn open_inputs(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    lang: &str,
+    generation: GenerationId,
+    kind: WorkspaceInputKind,
+) -> Result<Vec<OpenInput>> {
+    let mut statement = conn.prepare_cached(OPEN_PARTITION_DECISIONS_SQL)?;
+    let rows = statement.query_map(
+        params![workspace_id.as_str(), lang, generation.0, kind.label()],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<bool>>(4)?,
+                super::csharp_compilation::decode_file_decision(row, 5)?,
+            ))
+        },
+    )?;
+    rows.map(|row| {
+        let (id, path, oid, digest, present, decision) = row?;
+        Ok(OpenInput {
+            id,
+            path,
+            oid: Oid::from_str(&oid)?,
+            digest,
+            present,
+            decision,
+        })
+    })
+    .collect()
+}
+
 /// Publish all supplied input families at one revision and return new row IDs.
 /// The caller inserts source projection children before committing the same
 /// transaction. Configuration-only changes never replace source rows.
@@ -646,39 +875,14 @@ pub(super) fn replace_workspace_input_partitions(
                 row.relative_path
             );
         }
-        let mut statement = tx.prepare_cached(OPEN_PARTITION_DECISIONS_SQL)?;
-        let rows = statement.query_map(
-            params![
-                workspace_id.as_str(),
-                lang,
-                generation.0,
-                partition.kind.label()
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    super::csharp_compilation::decode_file_decision(row, 4)?,
-                ))
-            },
-        )?;
-        for row in rows {
-            let (id, path, oid, digest, decision) = row?;
-            if partition.foreign_paths.contains(&path) {
+        for open in open_inputs(tx, workspace_id, lang, generation, partition.kind)? {
+            if partition.foreign_paths.contains(&open.path) {
                 continue;
             }
-            let old_oid = Oid::from_str(&oid)?;
-            let unchanged = incoming.get(path.as_str()).is_some_and(|new| {
-                new.content_oid == old_oid
-                    && new.projection_digest == digest.as_deref()
-                    && new.csharp_decision == decision
-            });
-            if unchanged {
-                incoming.remove(path.as_str());
+            if open.matches(incoming.get(open.path.as_str()).copied()) {
+                incoming.remove(open.path.as_str());
             } else {
-                closed_ids.push(id);
+                closed_ids.push(open.id);
             }
         }
         replacements.extend(incoming.into_values().map(|row| (partition.kind, row)));
@@ -693,6 +897,36 @@ pub(super) fn replace_workspace_input_partitions(
         &replacements,
         refusals,
     )
+}
+
+/// Allocate the revision after `head` and make it the generation's head. This
+/// is the one place a workspace revision is allocated. The caller closes and
+/// opens the file versions that revision carries; a file version still open
+/// stays valid across it.
+pub(super) fn open_workspace_revision(
+    tx: &Transaction<'_>,
+    workspace_id: &WorkspaceId,
+    lang: &str,
+    generation: GenerationId,
+    head: Option<i64>,
+) -> Result<i64> {
+    let revision = head
+        .unwrap_or(0)
+        .checked_add(1)
+        .expect("workspace revision fits i64");
+    tx.execute(
+        "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+         VALUES(?1, ?2, ?3, ?4)",
+        params![workspace_id.as_str(), lang, generation.0, revision],
+    )?;
+    tx.execute(
+        "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(workspace_id, lang, generation)
+         DO UPDATE SET revision = excluded.revision",
+        params![workspace_id.as_str(), lang, generation.0, revision],
+    )?;
+    Ok(revision)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -714,15 +948,7 @@ pub(super) fn publish_workspace_input_changes(
             revision
         }
         _ => {
-            let revision = head
-                .unwrap_or(0)
-                .checked_add(1)
-                .expect("workspace revision fits i64");
-            tx.execute(
-                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
-             VALUES(?1, ?2, ?3, ?4)",
-                params![workspace_id.as_str(), lang, generation.0, revision],
-            )?;
+            let revision = open_workspace_revision(tx, workspace_id, lang, generation, head)?;
             {
                 let mut close = tx.prepare_cached(
                     "UPDATE workspace_file_versions SET valid_until = ?2
@@ -740,8 +966,8 @@ pub(super) fn publish_workspace_input_changes(
                 let mut insert = tx.prepare_cached(
                     "INSERT INTO workspace_file_versions(
                    workspace_id, lang, generation, input_kind, rel_path, blob_oid,
-                   projection_digest, valid_from
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   projection_digest, valid_from, file_present
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )?;
                 for (kind, row) in replacements {
                     insert.execute(params![
@@ -753,6 +979,7 @@ pub(super) fn publish_workspace_input_changes(
                         row.content_oid.to_string(),
                         row.projection_digest,
                         revision,
+                        row.file_present,
                     ])?;
                     let file_version_id = tx.last_insert_rowid();
                     if let Some(decision) = row.csharp_decision {
@@ -805,13 +1032,6 @@ pub(super) fn publish_workspace_input_changes(
                     ])?;
                 }
             }
-            tx.execute(
-                "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
-             VALUES(?1, ?2, ?3, ?4)
-             ON CONFLICT(workspace_id, lang, generation)
-             DO UPDATE SET revision = excluded.revision",
-                params![workspace_id.as_str(), lang, generation.0, revision],
-            )?;
             revision
         }
     };
@@ -837,7 +1057,397 @@ pub(super) fn publish_workspace_input_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::store::AnalyzerStore;
+    use crate::analyzer::store::csharp_compilation::FileVersionDecision;
+    use crate::analyzer::store::{AnalyzerStore, WorkspaceFileRow};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10774: the stored target-root filter omitted src/bin directory targets")]
+    fn selected_target_roots_filter_the_listing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspace_file_versions (
+            workspace_id TEXT, lang TEXT, generation INTEGER, input_kind TEXT,
+            valid_from INTEGER, valid_until INTEGER, rel_path TEXT, file_present INTEGER DEFAULT 1
+        );",
+        )
+        .unwrap();
+        for path in [
+            "tests/check/main.rs",
+            "nested/examples/demo/main.rs",
+            "tests/nested/tests/check/main.rs",
+            "benches/perf/main.rs",
+            "src/bin/tool/main.rs",
+            "nested/src/bin/tool/main.rs",
+            "src/main.rs",
+            "tests/check/helper.rs",
+            "tests/check/nested/main.rs",
+            "examples/main.rs",
+        ] {
+            conn.execute(
+                "INSERT INTO workspace_file_versions (workspace_id,lang,generation,input_kind,valid_from,valid_until,rel_path) VALUES ('w','rust',1,'source',1,NULL,?1)",
+                [path],
+            )
+            .unwrap();
+        }
+        conn.execute("INSERT INTO workspace_file_versions (workspace_id,lang,generation,input_kind,valid_from,valid_until,rel_path) VALUES ('w','rust',1,'source',1,2,'tests/deleted/main.rs')", []).unwrap();
+        conn.execute("INSERT INTO workspace_file_versions (workspace_id,lang,generation,input_kind,valid_from,valid_until,rel_path) VALUES ('w','rust',2,'source',1,NULL,'tests/future/main.rs')", []).unwrap();
+        let mut stmt = conn.prepare(SELECTED_RUST_TARGET_ROOTS_SQL).unwrap();
+        let paths = stmt
+            .query_map(params!["w", "rust", 1, 2], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter(|row| {
+                row.as_ref().map_or(true, |path| {
+                    brokk_bifrost_core::analyzer::project::is_rust_target_layout_main(
+                        std::path::Path::new(path),
+                    )
+                })
+            })
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from([
+                "tests/check/main.rs".to_string(),
+                "nested/examples/demo/main.rs".to_string(),
+                "tests/nested/tests/check/main.rs".to_string(),
+                "benches/perf/main.rs".to_string(),
+                "src/bin/tool/main.rs".to_string(),
+                "nested/src/bin/tool/main.rs".to_string()
+            ])
+        );
+    }
+
+    #[hardwon(
+        "#10596: a Cargo.toml left out of the listing was not captured, so crate naming fell back to directory names"
+    )]
+    #[test]
+    fn rust_metadata_captures_an_unlisted_ancestor_manifest() {
+        use crate::analyzer::{Language, ProjectFile};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("crates/app/src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/app/src/lib.rs"), "").unwrap();
+        let project =
+            brokk_bifrost_core::analyzer::project::TestProject::new(root.clone(), Language::Rust);
+        // Ignore rules can drop manifests from the listing while their sources
+        // stay listed; the listing here holds only the source.
+        let files = std::collections::BTreeSet::from([ProjectFile::new(
+            root.clone(),
+            "crates/app/src/lib.rs",
+        )]);
+        let mut inputs = std::collections::BTreeSet::new();
+        WorkspaceConfigurationInput::include_native_metadata_paths(
+            &project,
+            &files,
+            Language::Rust,
+            &mut inputs,
+        )
+        .unwrap();
+        for manifest in ["Cargo.toml", "crates/app/Cargo.toml"] {
+            assert!(
+                inputs.contains(&ProjectFile::new(root.clone(), manifest)),
+                "{manifest} missing from {inputs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_listing_certificate_is_bound_to_revision_and_derivation() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("rust", "listing-test")
+            .unwrap();
+        let workspace = WorkspaceId("a".repeat(64));
+        let publish = |complete| {
+            store
+                .sync_workspace_inputs_with_rust_listing(
+                    &workspace,
+                    "rust",
+                    generation,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    Some((
+                        super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION,
+                        if complete {
+                            vec![]
+                        } else {
+                            vec![("x.rs".to_string(), "test".to_string())]
+                        },
+                    )),
+                )
+                .unwrap()
+        };
+        let snapshot = publish(true);
+        assert!(
+            store
+                .rust_source_listing_complete(
+                    &snapshot,
+                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .rust_source_listing_complete(
+                    &snapshot,
+                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION + 1
+                )
+                .unwrap()
+        );
+        // A different listing opens a new revision; the first keeps its own.
+        let failed = publish(false);
+        assert_eq!(failed.revision, snapshot.revision + 1);
+        assert!(
+            store
+                .rust_source_listing_complete(
+                    &snapshot,
+                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .rust_source_listing_complete(
+                    &failed,
+                    super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION
+                )
+                .unwrap()
+        );
+    }
+
+    #[hardwon("#10321: a listing-only change rewrote the certificate of an existing revision")]
+    #[test]
+    fn republishing_a_certificate_keeps_the_revision_only_when_identical() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("rust", "listing-test")
+            .unwrap();
+        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let snapshot = store
+            .sync_workspace_inputs_with_rust_listing(
+                &WorkspaceId("a".repeat(64)),
+                "rust",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                Some((version, vec![("x.rs".to_string(), "test".to_string())])),
+            )
+            .unwrap();
+        let failures = vec![("x.rs".to_string(), "test".to_string())];
+        assert_eq!(
+            store
+                .publish_rust_source_listing(&snapshot, version, failures.clone())
+                .unwrap(),
+            snapshot,
+            "an identical certificate stays at its revision"
+        );
+        let moved = store
+            .publish_rust_source_listing(&snapshot, version, Vec::new())
+            .unwrap();
+        assert_eq!(moved.revision, snapshot.revision + 1);
+        assert_eq!(
+            store
+                .rust_source_listing_failures(&snapshot, version)
+                .unwrap(),
+            Some(failures),
+            "the earlier revision keeps its certificate"
+        );
+        assert_eq!(
+            store.rust_source_listing_failures(&moved, version).unwrap(),
+            Some(Vec::new())
+        );
+    }
+
+    #[hardwon(
+        "#10321: a revision committed without a certificate gained one later, under readers' bindings"
+    )]
+    #[test]
+    fn certifying_an_observable_revision_opens_a_new_one() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("rust", "listing-test")
+            .unwrap();
+        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let observable = store
+            .sync_workspace_inputs_with_rust_listing(
+                &WorkspaceId("a".repeat(64)),
+                "rust",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .rust_source_listing_failures(&observable, version)
+                .unwrap(),
+            None
+        );
+        let certified = store
+            .publish_rust_source_listing(&observable, version, Vec::new())
+            .unwrap();
+        assert_eq!(certified.revision, observable.revision + 1);
+        assert_eq!(
+            store
+                .rust_source_listing_failures(&observable, version)
+                .unwrap(),
+            None,
+            "the revision readers could select still reads no certificate"
+        );
+        assert_eq!(
+            store
+                .rust_source_listing_failures(&certified, version)
+                .unwrap(),
+            Some(Vec::new())
+        );
+        assert!(
+            store
+                .rust_listing_certificates_differ(&observable, &certified)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is written once")]
+    fn writing_a_different_certificate_at_one_revision_panics() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("rust", "listing-test")
+            .unwrap();
+        let version = super::super::RUST_SOURCE_LISTING_DERIVATION_VERSION;
+        let snapshot = store
+            .sync_workspace_inputs_with_rust_listing(
+                &WorkspaceId("a".repeat(64)),
+                "rust",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                Some((version, Vec::new())),
+            )
+            .unwrap();
+        store
+            .execute_selection_publication(move |conn| {
+                let tx = conn.transaction()?;
+                super::super::write_rust_listing_certificate(
+                    &tx,
+                    &snapshot,
+                    version,
+                    &[("x.rs".to_string(), "test".to_string())],
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9755: selected_workspace_file_versions fills parse_variant from csharp_file_version_decisions, which classification treats as C#-only"
+    )]
+    fn only_csharp_source_file_versions_get_decision_rows() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let workspace = WorkspaceId("a".repeat(64));
+        let oid = |text: &str| Oid::hash_object(git2::ObjectType::Blob, text.as_bytes()).unwrap();
+        for lang in ["rust", "csharp"] {
+            let generation = store
+                .ensure_language_epoch_value(lang, "decision-rows")
+                .unwrap();
+            let files =
+                [("a", "fn a() {}"), ("b", "fn b() {}")].map(|(name, text)| WorkspaceFileRow {
+                    rel_path: format!("src/{name}.{}", if lang == "rust" { "rs" } else { "cs" }),
+                    blob_oid: oid(text),
+                    decision: (lang == "csharp").then_some(FileVersionDecision {
+                        decision_digest: [1; 32],
+                        assignment_digest: [2; 32],
+                    }),
+                });
+            store
+                .sync_workspace_inputs_for_workspace(
+                    &workspace,
+                    lang,
+                    generation,
+                    &files,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+        }
+        let conn = store.conn.lock().unwrap();
+        let count = |lang: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM workspace_file_versions WHERE lang = ?1",
+                [lang],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count("rust"), 2);
+        assert_eq!(count("csharp"), 2);
+        let decisions: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT versions.lang, versions.input_kind
+                 FROM csharp_file_version_decisions AS decisions
+                 JOIN workspace_file_versions AS versions USING(file_version_id)
+                 ORDER BY versions.file_version_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        // The C# rows prove the writer ran; no Rust file version has a row.
+        assert_eq!(
+            decisions,
+            vec![
+                ("csharp".to_owned(), "source".to_owned()),
+                ("csharp".to_owned(), "source".to_owned())
+            ]
+        );
+    }
 
     #[test]
     fn selected_configuration_bytes_use_indexed_revision_path_lookup() {

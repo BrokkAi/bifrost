@@ -13,9 +13,7 @@ use super::index_query::{
 use super::kinds::{NormalizedKind, Role};
 use super::provider::{StructuralFactProvider, StructuralFactsCacheOutcome, StructuralIndexCensus};
 use crate::ProjectFile;
-use crate::analyzer::complete_value_cache::{
-    CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
-};
+use crate::analyzer::complete_value_cache::CompleteValueWait;
 use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::invalidation::{
     ArtifactVerdict, ArtifactVerdictLog, DerivedArtifactId, DerivedArtifactKind,
@@ -25,6 +23,10 @@ use crate::analyzer::semantic::ids::StableDigest;
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, map_with_capacity};
 use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+use brokk_bifrost_core::budgeted_value_cache::{BudgetedValueAcquisition, BudgetedValueCache};
+use brokk_bifrost_core::retention_budget::{
+    AllocationCharge, RetainedBytes, RetentionBudget, SelfCharged, SharedAllocation,
+};
 use rayon::prelude::*;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -119,6 +121,12 @@ struct StructuralIndexKey {
     content_identity: WorkspaceContentIdentity,
 }
 
+impl RetainedBytes for StructuralIndexKey {
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
 impl StructuralIndexKey {
     const ARTIFACT_DOMAIN: &[u8] = b"bifrost-structural-index-key:v1";
 
@@ -152,6 +160,8 @@ pub struct FactAddress {
 #[derive(Debug, Clone)]
 pub struct StructuralIndexFile {
     pub file: ProjectFile,
+    /// Digest of the selected structural facts from the build snapshot.
+    pub selection_digest: StableDigest,
     pub source_bytes: u64,
     /// Normalized node count; node IDs occupy `0..node_count`.
     pub node_count: u32,
@@ -175,6 +185,7 @@ type MutableKindNamePostings = HashMap<Box<str>, Vec<(NormalizedKind, Vec<FactAd
 
 #[derive(Debug)]
 pub struct SnapshotStructuralIndex {
+    charge: AllocationCharge,
     content_identity: WorkspaceContentIdentity,
     files: Box<[StructuralIndexFile]>,
     file_ids: HashMap<ProjectFile, u32>,
@@ -194,7 +205,85 @@ pub struct SnapshotStructuralIndex {
     retained_bytes: u64,
 }
 
+impl SelfCharged for SnapshotStructuralIndex {
+    fn allocation_charge(&self) -> &AllocationCharge {
+        &self.charge
+    }
+}
+
 impl SnapshotStructuralIndex {
+    /// Every path with an exact-name posting, before kind, role or other
+    /// posting intersections. The answer includes the file's selected facts.
+    pub fn exact_name_inventory(&self, name: &str) -> (StableDigest, Vec<ProjectFile>) {
+        let mut hasher = CanonicalHasher::new(b"bifrost-structural-exact-name-inventory:v1");
+        let mut paths = Vec::new();
+        let mut previous = None;
+        if let Some(posting) = self.name_postings.get(name) {
+            for address in posting.iter() {
+                if previous == Some(address.file) {
+                    continue;
+                }
+                previous = Some(address.file);
+                let file = &self.files[address.file as usize];
+                hasher.field(
+                    "path",
+                    brokk_bifrost_core::path_utils::rel_path_string(&file.file).as_bytes(),
+                );
+                hasher.field("facts", file.selection_digest.as_bytes());
+                paths.push(file.file.clone());
+            }
+        }
+        (StableDigest::from_array(hasher.finish()), paths)
+    }
+
+    /// Every path with this role-name posting and its selected facts.
+    pub fn role_name_inventory(
+        &self,
+        role: Role,
+        value: &str,
+        keyword: bool,
+    ) -> (StableDigest, Vec<ProjectFile>) {
+        let mut hasher = CanonicalHasher::new(b"bifrost-structural-role-name-inventory:v1");
+        let mut paths = Vec::new();
+        let mut previous = None;
+        if let Some(posting) = self.role_postings.get(&RolePostingKey {
+            role,
+            value: value.into(),
+            keyword,
+        }) {
+            for address in posting.iter() {
+                if previous == Some(address.file) {
+                    continue;
+                }
+                previous = Some(address.file);
+                let file = &self.files[address.file as usize];
+                hasher.field(
+                    "path",
+                    brokk_bifrost_core::path_utils::rel_path_string(&file.file).as_bytes(),
+                );
+                hasher.field("facts", file.selection_digest.as_bytes());
+                paths.push(file.file.clone());
+            }
+        }
+        (StableDigest::from_array(hasher.finish()), paths)
+    }
+
+    /// Every recovered path, including one with no candidate fact.
+    pub fn recovered_inventory(&self) -> (StableDigest, Vec<ProjectFile>) {
+        let mut hasher = CanonicalHasher::new(b"bifrost-structural-recovered-inventory:v1");
+        let mut paths = Vec::with_capacity(self.recovered_files.len());
+        for id in self.recovered_files.iter() {
+            let file = &self.files[*id as usize];
+            hasher.field(
+                "path",
+                brokk_bifrost_core::path_utils::rel_path_string(&file.file).as_bytes(),
+            );
+            hasher.field("facts", file.selection_digest.as_bytes());
+            paths.push(file.file.clone());
+        }
+        (StableDigest::from_array(hasher.finish()), paths)
+    }
+
     pub const fn content_identity(&self) -> WorkspaceContentIdentity {
         self.content_identity
     }
@@ -710,12 +799,11 @@ pub enum StructuralIndexAcquisition {
 /// also discards the keys that are still exact.
 #[derive(Clone)]
 pub struct SnapshotStructuralIndexCache {
-    complete: CompleteValueCache<StructuralIndexKey, SnapshotStructuralIndex>,
-    /// The whole memo budget every structural provider apportions between
-    /// them. One provider's own budget is derived from it per acquisition,
-    /// because only the provider's census says how much of the workspace's
-    /// source this provider is.
-    memo_budget_bytes: u64,
+    complete: BudgetedValueCache<StructuralIndexKey, SharedAllocation<SnapshotStructuralIndex>>,
+    budget: RetentionBudget,
+    /// The construction limit apportioned between structural providers.
+    /// A provider's census determines its share before a build starts.
+    construction_budget_bytes: u64,
     auto_reuse_content: Arc<Mutex<Option<WorkspaceContentIdentity>>>,
     rejected: Arc<Mutex<Option<StructuralIndexRejection>>>,
     verdicts: Arc<ArtifactVerdictLog>,
@@ -840,21 +928,22 @@ struct StructuralIndexRejection {
 }
 
 impl SnapshotStructuralIndexCache {
-    /// The ready cache holds whatever the per-provider budgets admit, so its
-    /// own capacity is the whole memo budget those budgets are apportioned
-    /// from: a provider's index is never larger than its budget, and the
-    /// budgets are what bounds the total.
-    pub fn new(memo_budget_bytes: u64) -> Self {
+    /// Keep the provider's construction limit while charging retained values
+    /// to the process owner's budget.
+    pub fn new_with_budget(construction_budget_bytes: u64, budget: &RetentionBudget) -> Self {
         Self {
-            complete: CompleteValueCache::<StructuralIndexKey, SnapshotStructuralIndex>::new(
-                memo_budget_bytes,
-                |_, index| index.retained_bytes().clamp(1, u32::MAX as u64) as u32,
-            ),
-            memo_budget_bytes,
+            complete: BudgetedValueCache::new(budget.region("analysis.structural_index", None)),
+            budget: budget.clone(),
+            construction_budget_bytes,
             auto_reuse_content: Arc::new(Mutex::new(None)),
             rejected: Arc::new(Mutex::new(None)),
             verdicts: Arc::new(ArtifactVerdictLog::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(construction_budget_bytes: u64) -> Self {
+        Self::new_with_budget(construction_budget_bytes, &RetentionBudget::for_tests())
     }
 
     pub fn verdicts(&self) -> &ArtifactVerdictLog {
@@ -915,31 +1004,31 @@ impl SnapshotStructuralIndexCache {
         }
         let (acquisition, wait) = self.complete.acquire(&key, cancellation);
         match acquisition {
-            CompleteValueAcquisition::Cached { value } => {
+            BudgetedValueAcquisition::Cached { value } => {
                 self.verdicts.record(ArtifactVerdict::Retained(
                     RetentionReason::InputsUnchanged {
                         artifact: key.artifact(),
                     },
                 ));
                 StructuralIndexAcquisition::Ready {
-                    index: value,
+                    index: Arc::clone(value.arc()),
                     lifecycle: StructuralIndexLifecycle::Hit,
                     wait,
                     build: StructuralIndexBuildMetrics::default(),
                 }
             }
-            CompleteValueAcquisition::Cancelled => StructuralIndexAcquisition::Cancelled {
+            BudgetedValueAcquisition::Cancelled => StructuralIndexAcquisition::Cancelled {
                 wait,
                 build: StructuralIndexBuildMetrics::default(),
             },
-            CompleteValueAcquisition::Rejected => StructuralIndexAcquisition::Unavailable {
+            BudgetedValueAcquisition::Rejected => StructuralIndexAcquisition::Unavailable {
                 reason: self.rejection_for(key).unwrap_or_else(|| {
                     Arc::from("structural index construction rejected by same-key leader")
                 }),
                 wait,
                 build: StructuralIndexBuildMetrics::default(),
             },
-            CompleteValueAcquisition::Leader { permit } => {
+            BudgetedValueAcquisition::Leader { permit } => {
                 if let Some(reason) = self.rejection_for(key) {
                     permit.publish_rejected();
                     return StructuralIndexAcquisition::Unavailable {
@@ -964,7 +1053,7 @@ impl SnapshotStructuralIndexCache {
                 // build measures the finished index (#2879).
                 let max_retained_bytes = match provider.structural_index_census(&files) {
                     Some(census) => {
-                        let budget = provider_index_budget(self.memo_budget_bytes, census);
+                        let budget = provider_index_budget(self.construction_budget_bytes, census);
                         crate::profiling::note_with(|| {
                             format!(
                                 "structural-index preflight language={:?} census={census:?} \
@@ -981,7 +1070,7 @@ impl SnapshotStructuralIndexCache {
                                 census.files,
                                 census.source_bytes,
                                 budget.max_retained_bytes,
-                                self.memo_budget_bytes
+                                self.construction_budget_bytes
                             ));
                             self.record_rejection(key, Arc::clone(&reason));
                             permit.publish_rejected();
@@ -993,7 +1082,7 @@ impl SnapshotStructuralIndexCache {
                         }
                         budget.max_retained_bytes
                     }
-                    None => self.memo_budget_bytes / UNCENSUSED_INDEX_BUDGET_DIVISOR,
+                    None => self.construction_budget_bytes / UNCENSUSED_INDEX_BUDGET_DIVISOR,
                 };
                 match build_index(
                     provider,
@@ -1019,9 +1108,18 @@ impl SnapshotStructuralIndexCache {
                             build,
                         }
                     }
-                    Ok((index, build)) => {
+                    Ok((mut index, build)) => {
+                        index.charge = AllocationCharge::acquire(
+                            &self.budget,
+                            index.retained_bytes.min(usize::MAX as u64) as usize,
+                        );
                         let index = Arc::new(index);
-                        permit.publish_complete(Arc::clone(&index));
+                        let shared = SharedAllocation::new(Arc::clone(&index));
+                        if index.allocation_charge().is_charged() {
+                            permit.publish_complete(shared);
+                        } else {
+                            permit.publish_request_owned(shared);
+                        }
                         StructuralIndexAcquisition::Ready {
                             index,
                             lifecycle: StructuralIndexLifecycle::Built,
@@ -1065,7 +1163,7 @@ impl SnapshotStructuralIndexCache {
                 artifact: StructuralIndexKey::new(content_identity).artifact(),
             }),
         });
-        ready
+        ready.map(|value| Arc::clone(value.arc()))
     }
 
     /// Auto avoids paying a whole-snapshot construction cost for a query that
@@ -1121,7 +1219,7 @@ impl SnapshotStructuralIndexCache {
 
     #[cfg(test)]
     fn len_for_test(&self) -> u64 {
-        self.complete.len_for_test()
+        self.complete.region().stats().entries as u64
     }
 }
 
@@ -1377,6 +1475,7 @@ fn build_index(
             file_ids.insert(file.clone(), file_id);
             indexed_files.push(StructuralIndexFile {
                 file: file.clone(),
+                selection_digest: facts.selection_digest(),
                 source_bytes: source.len() as u64,
                 node_count: u32::try_from(facts.nodes().len())
                     .expect("node count fits the validated node-and-role work count"),
@@ -1628,6 +1727,7 @@ fn build_index(
         .map(|(id, _)| u32::try_from(id).expect("structural index file ids fit in u32"))
         .collect();
     let mut index = SnapshotStructuralIndex {
+        charge: AllocationCharge::default(),
         content_identity,
         files: indexed_files.into_boxed_slice(),
         file_ids,
@@ -1985,11 +2085,37 @@ mod tests {
     use super::*;
     use crate::Language;
     use crate::analyzer::Range;
-    use crate::analyzer::structural::facts::{FileFacts, NormalizedNode};
+    use crate::analyzer::structural::facts::{FileFacts, NormalizedNode, PersistedOccurrenceRole};
     use crate::analyzer::structural::occurrences::OccurrenceRole;
     use crate::analyzer::structural::test_support::content_identity as content;
     use crate::compact_graph::CompactRows;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#9179: occurrence-role rows were absent from the selected-facts certificate")]
+    fn selection_digest_binds_occurrence_roles_without_other_fact_changes() {
+        let provider = provider();
+        let facts = provider.facts.values().next().expect("facts");
+        let mut rows = facts.persisted_rows().expect("persist facts");
+        rows.occurrence_roles.push(PersistedOccurrenceRole {
+            node_id: 0,
+            ordinal: 0,
+            role: OccurrenceRole::DeclarationName as u8,
+        });
+        let changed = FileFacts::from_persisted_rows(facts.source().to_owned(), rows)
+            .expect("hydrate changed occurrence roles");
+        assert_eq!(changed.source(), facts.source());
+        assert_eq!(
+            format!("{:?}", changed.nodes()),
+            format!("{:?}", facts.nodes())
+        );
+        assert_eq!(
+            format!("{:?}", changed.roles(0)),
+            format!("{:?}", facts.roles(0))
+        );
+        assert_eq!(changed.recovered_regions(), facts.recovered_regions());
+        assert_ne!(changed.selection_digest(), facts.selection_digest());
+    }
 
     /// Order the provider's files the way [`SnapshotStructuralIndexCache`]
     /// does before it censuses and builds them.
@@ -2064,6 +2190,120 @@ mod tests {
             census: None,
             gate: None,
         }
+    }
+
+    #[test]
+    #[hardwon("#9179: a same-blob structural selection change kept exact-name paths unchanged")]
+    fn exact_name_inventory_binds_selected_kind_and_role() {
+        let mut provider = provider();
+        let file = provider.files[0].clone();
+        let original = provider.facts[&file].clone();
+        let (base, _) = build_index_for_test(&provider, 1024 * 1024, content(1)).unwrap();
+        let (base_digest, base_paths) = base.exact_name_inventory("App");
+        assert_eq!(base_paths, vec![file.clone()]);
+
+        let mut changed_nodes = original.nodes().to_vec();
+        changed_nodes[0].kind = NormalizedKind::Function;
+        provider.facts.insert(
+            file.clone(),
+            Arc::new(FileFacts::new(
+                original.source().to_owned(),
+                vec![0, 11],
+                changed_nodes,
+                CompactRows::from_parts(vec![0, 0], vec![]),
+                CompactRows::from_parts(vec![0, 0], vec![]),
+                vec![],
+            )),
+        );
+        let (changed, _) = build_index_for_test(&provider, 1024 * 1024, content(2)).unwrap();
+        let (changed_digest, changed_paths) = changed.exact_name_inventory("App");
+        assert_eq!(changed_paths, base_paths);
+        assert_ne!(changed_digest, base_digest);
+
+        let changed_facts = provider.facts[&file].clone();
+        provider.facts.insert(
+            file.clone(),
+            Arc::new(FileFacts::new(
+                changed_facts.source().to_owned(),
+                vec![0, 11],
+                changed_facts.nodes().to_vec(),
+                CompactRows::from_parts(
+                    vec![0, 1],
+                    vec![super::super::facts::RoleTarget {
+                        role: Role::Body,
+                        mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain,
+                        keyword: None,
+                        node: None,
+                        span: super::super::facts::Span {
+                            start_byte: 11,
+                            end_byte: 19,
+                        },
+                        name: None,
+                    }],
+                ),
+                CompactRows::from_parts(vec![0, 0], vec![]),
+                vec![],
+            )),
+        );
+        let (role_changed, _) = build_index_for_test(&provider, 1024 * 1024, content(3)).unwrap();
+        assert_ne!(role_changed.exact_name_inventory("App").0, changed_digest);
+        assert_eq!(role_changed.exact_name_inventory("App").1, base_paths);
+    }
+
+    #[test]
+    #[hardwon("#9179: recovered files with no posting were absent from the seed read set")]
+    fn inventory_tracks_new_removed_renamed_and_zero_result_recovery() {
+        let mut provider = provider();
+        let (base, _) = build_index_for_test(&provider, 1024 * 1024, content(1)).unwrap();
+        let base_name = base.exact_name_inventory("App").0;
+        let base_recovery = base.recovered_inventory().0;
+
+        let root = provider.files[0].root().to_path_buf();
+        let added = ProjectFile::new(root.clone(), "added.py");
+        provider.files.push(added.clone());
+        provider
+            .facts
+            .insert(added.clone(), provider.facts[&provider.files[0]].clone());
+        let (with_added, _) = build_index_for_test(&provider, 1024 * 1024, content(2)).unwrap();
+        assert_ne!(with_added.exact_name_inventory("App").0, base_name);
+        provider.files.retain(|file| file != &added);
+        provider.facts.remove(&added);
+        let (removed, _) = build_index_for_test(&provider, 1024 * 1024, content(3)).unwrap();
+        assert_eq!(removed.exact_name_inventory("App").0, base_name);
+
+        let renamed = ProjectFile::new(root.clone(), "renamed.py");
+        let original = provider.files.remove(0);
+        let facts = provider.facts.remove(&original).unwrap();
+        provider.files.push(renamed.clone());
+        provider.facts.insert(renamed, facts);
+        let (after_rename, _) = build_index_for_test(&provider, 1024 * 1024, content(4)).unwrap();
+        assert_ne!(after_rename.exact_name_inventory("App").0, base_name);
+
+        let recovered = ProjectFile::new(root, "recovered.py");
+        provider.files.push(recovered.clone());
+        provider.facts.insert(
+            recovered.clone(),
+            Arc::new(FileFacts::new(
+                "?".to_owned(),
+                vec![0],
+                vec![],
+                CompactRows::from_parts(vec![0], vec![]),
+                CompactRows::from_parts(vec![0], vec![]),
+                vec![super::super::facts::RecoveredRegion {
+                    range: Range {
+                        start_byte: 0,
+                        end_byte: 1,
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    inside_callable: None,
+                }],
+            )),
+        );
+        let (with_recovery, _) = build_index_for_test(&provider, 1024 * 1024, content(5)).unwrap();
+        assert_eq!(with_recovery.exact_name_inventory("App").1.len(), 1);
+        assert_eq!(with_recovery.recovered_inventory().1, vec![recovered]);
+        assert_ne!(with_recovery.recovered_inventory().0, base_recovery);
     }
 
     #[test]
@@ -2227,7 +2467,7 @@ mod tests {
             };
             let target = RoleTarget {
                 role: Role::Callee,
-                spread: false,
+                mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain,
                 keyword: None,
                 node: None,
                 span,

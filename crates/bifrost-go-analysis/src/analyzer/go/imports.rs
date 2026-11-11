@@ -63,36 +63,45 @@ impl ImportAnalysisProvider for GoAnalyzer {
         Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let entry = self
-            .memo_caches
-            .imported_code_units
-            .read(&memo_attribution(self), |cache, capture| {
-                if let Some(cached) = cache.get(file) {
-                    return Ok::<_, std::convert::Infallible>(cached);
-                }
-                let cache_fill =
-                    brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-                let entry = Arc::new(capture.build_weighted(|| {
-                    let scope = AnalyzerQueryScope::new(self);
-                    let value = Arc::new(go_imported_code_units_of(
-                        &self.inner,
-                        &self.import_tables(),
-                        file,
-                        &self.inner.import_info_of(scope.token(), file),
-                    ));
-                    let bytes = brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set(
-                        file, &value,
-                    ) as usize;
-                    (value, bytes)
-                }));
-                if cache_fill.is_complete() {
-                    cache.insert(file.clone(), Arc::clone(&entry));
-                }
-                Ok(entry)
-            })
-            .unwrap();
-        Arc::clone(&entry)
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let entry = self
+                .memo_caches
+                .imported_code_units
+                .read(&memo_attribution(self), |cache, capture| {
+                    if let Some(cached) = cache.get(file) {
+                        return Ok::<_, std::convert::Infallible>(cached);
+                    }
+                    let cache_fill =
+                        brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                    let entry = Arc::new(capture.build_weighted(|| {
+                        let scope = AnalyzerQueryScope::new(self);
+                        let value =
+                            Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                                go_imported_code_units_of(
+                                    &self.inner,
+                                    &self.import_tables(),
+                                    file,
+                                    &self.inner.import_info_of(scope.token(), file),
+                                ),
+                            ));
+                        let bytes =
+                            brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(
+                                &value,
+                            ) as usize;
+                        (value, bytes)
+                    }));
+                    if cache_fill.is_complete() {
+                        cache.insert(file.clone(), Arc::clone(&entry));
+                    }
+                    Ok(entry)
+                })
+                .unwrap();
+            Arc::clone(&entry)
+        }
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -460,10 +469,7 @@ impl GoAnalyzer {
                         let completion = super::workspace_facts::stable_completion(
                             completion_scope.captured_read_incompleteness(),
                         );
-                        hash.sequence("completion", &completion, |hash, (kind, detail)| {
-                            hash.value(&[*kind]);
-                            hash.value(detail.as_bytes());
-                        });
+                        hash.sequence("completion", &completion, |hash, gap| gap.hash_into(hash));
                         let answer = StableDigest::from_array(hash.finish());
                         Arc::new(GoImportFacts {
                             answer,

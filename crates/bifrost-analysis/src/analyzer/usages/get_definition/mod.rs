@@ -1,5 +1,3 @@
-use super::read_source;
-
 use crate::analyzer::common::IdentifierSeek;
 use crate::analyzer::common::decorated_identifier_seeks;
 use crate::analyzer::common::language_for_file;
@@ -8,7 +6,7 @@ use crate::analyzer::languages::language_support_for_hook;
 
 use crate::analyzer::lexical_definitions::LexicalBindingResolution;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
-use crate::analyzer::lexical_definitions::resolve_lexical_binding;
+use crate::analyzer::lexical_definitions::resolve_lexical_binding_with_visibility;
 
 use crate::analyzer::read_ledger::IndexFamily;
 use crate::analyzer::read_ledger::ReadKey;
@@ -21,6 +19,7 @@ pub(crate) use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 pub(crate) use crate::analyzer::usages::reference_site::SourceLocationRequest;
 pub(crate) use crate::analyzer::usages::reference_site::resolve_reference_site_with_line_starts;
 
+use crate::analyzer::QueryReadIncomplete;
 use crate::analyzer::QueryScope;
 use crate::analyzer::QueryToken;
 
@@ -55,7 +54,11 @@ use crate::path_utils::rel_path_string;
 
 use crate::profiling;
 
-use crate::text_utils::compute_line_starts;
+fn compute_line_starts(source: &str) -> Vec<usize> {
+    #[cfg(any(test, feature = "test-support"))]
+    test_support::count_preparation_work(0, source.len(), 0);
+    crate::text_utils::compute_line_starts(source)
+}
 
 use brokk_bifrost_core::analyzer::weighted_cache::build_weighted_cache;
 use brokk_bifrost_core::analyzer::weighted_cache::weight_source_text;
@@ -618,6 +621,33 @@ impl CallTargetLookupOutcome {
         }
     }
 
+    /// The resolution an outcome came from, for a step that must run on the
+    /// resolution after `from_resolution` copied it, such as a Rust exact
+    /// external-call proof deferred to the consumer. Only an outcome straight
+    /// from `from_resolution` has one: the availability flags a caller sets
+    /// later have no place in a resolution.
+    #[doc(hidden)]
+    pub fn into_resolution(self) -> DefinitionResolution {
+        assert!(
+            !self.structure_unavailable && !self.unproven_link_unit && !self.truncated,
+            "only an outcome straight from a resolution converts back to one"
+        );
+        DefinitionResolution {
+            outcome: self.outcome,
+            evidence: CallEvidence {
+                source_member_evidence: self.source_member_evidence,
+                native_resolution: self.native_resolution,
+                model_member_selection: self.model_member_selection,
+                authority: self.authority,
+                call_application: self.call_application,
+                dispatch_extensibility: self.dispatch_extensibility,
+                exact_external_call: self.exact_external_call,
+                external_callee_identity: self.external_callee_identity,
+            },
+            call_binding_discharge_digests: Vec::new(),
+        }
+    }
+
     /// The one source declaration an incomplete selected-native Java lookup
     /// retained. Consumers may use its source signature for candidate-local
     /// relations, but must keep the lookup's original incomplete completion.
@@ -697,6 +727,8 @@ impl CallTargetLookupOutcome {
     }
 }
 
+pub use crate::analyzer::store::active_models::ExternalCallTypeBindings;
+
 /// One resolver-owned proof for an exact external callable and its applicable
 /// call shape.
 ///
@@ -710,6 +742,11 @@ impl CallTargetLookupOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct ExactExternalCallProof {
+    /// Navigation crossed a receiver call without a complete Identity summary.
+    /// Query-local: flow consumers must treat it as potentially effectful.
+    pub unadmitted_receiver_deref: bool,
+    /// Selected implicit receiver calls, in evaluation order; never persisted.
+    pub receiver_adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
     #[doc(hidden)]
     pub canonical_callee: Box<str>,
     #[doc(hidden)]
@@ -738,6 +775,9 @@ pub struct ExactExternalCallProof {
     #[doc(hidden)]
     pub python_model_manifest_sha256: Option<Box<str>>,
     external_member_identity: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
+    /// Type argument bindings established by this exact call selection. None means
+    /// selection used no bindings; nested result typing consumes this proof fact.
+    pub type_argument_bindings: Option<ExternalCallTypeBindings>,
 }
 
 impl ExactExternalCallProof {
@@ -760,6 +800,8 @@ impl ExactExternalCallProof {
 
     fn package_function(canonical_callee: impl Into<Box<str>>, parameter_count: u32) -> Self {
         Self {
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             canonical_callee: canonical_callee.into(),
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
@@ -769,11 +811,14 @@ impl ExactExternalCallProof {
             python_model_manifest_sha256: None,
             python_formal_slots: None,
             external_member_identity: None,
+            type_argument_bindings: None,
         }
     }
 
     fn bound_receiver(canonical_callee: impl Into<Box<str>>, parameter_count: u32) -> Self {
         Self {
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             canonical_callee: canonical_callee.into(),
             call_application: CallApplicationKind::BoundReceiver,
             dispatch_extensibility: None,
@@ -783,6 +828,7 @@ impl ExactExternalCallProof {
             python_model_manifest_sha256: None,
             python_formal_slots: None,
             external_member_identity: None,
+            type_argument_bindings: None,
         }
     }
 
@@ -820,6 +866,8 @@ impl ExactExternalCallProof {
         parameter_count: u32,
     ) -> Self {
         Self {
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             canonical_callee: canonical_callee.into(),
             call_application: CallApplicationKind::BoundReceiver,
             dispatch_extensibility: Some(DispatchExtensibility::Closed),
@@ -829,6 +877,7 @@ impl ExactExternalCallProof {
             python_model_manifest_sha256: None,
             python_formal_slots: None,
             external_member_identity: None,
+            type_argument_bindings: None,
         }
     }
 
@@ -838,6 +887,8 @@ impl ExactExternalCallProof {
         parameter_count: u32,
     ) -> Self {
         Self {
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             canonical_callee: canonical_callee.into(),
             call_application: CallApplicationKind::BoundReceiver,
             dispatch_extensibility: Some(DispatchExtensibility::Open),
@@ -847,6 +898,7 @@ impl ExactExternalCallProof {
             python_model_manifest_sha256: None,
             python_formal_slots: None,
             external_member_identity: None,
+            type_argument_bindings: None,
         }
     }
 
@@ -877,6 +929,8 @@ impl ExactExternalCallProof {
             "an imported callable must be named"
         );
         Self {
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             canonical_callee: format!("{module_specifier}.{imported_name}").into_boxed_str(),
             call_application: CallApplicationKind::PackageFunction,
             dispatch_extensibility: None,
@@ -886,6 +940,7 @@ impl ExactExternalCallProof {
             python_model_manifest_sha256: None,
             python_formal_slots: None,
             external_member_identity: None,
+            type_argument_bindings: None,
         }
     }
 
@@ -926,6 +981,39 @@ impl ExactExternalCallProof {
         Self::bound_external_member(owner, member, parameter_count)
     }
 
+    /// A PHP `$value->member(...)` call whose receiver type and member an
+    /// activated pack publishes. A PHP subclass can override the method, so
+    /// the proof leaves dispatch extensibility open.
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn php_bound_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
+        Self::bound_external_member(owner, member, parameter_count)
+    }
+
+    /// A PHP `Owner::member(...)` call that names its class and whose static
+    /// member an activated pack publishes. A named scope selects the method
+    /// statically; no written value participates.
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn php_static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
+        Self::static_external_member(owner, member, parameter_count)
+    }
+
+    /// A PHP `new Owner(...)` expression whose constructor an activated pack
+    /// declares. The named class selects its constructor; nothing dispatches
+    /// it dynamically.
+    #[doc(hidden)]
+    pub fn php_external_constructor(owner: &str, member: &str, parameter_count: u32) -> Self {
+        assert!(
+            !owner.is_empty(),
+            "an external constructor owner must be named"
+        );
+        assert!(!member.is_empty(), "an external constructor must be named");
+        let mut proof = Self::package_function(format!("{owner}.{member}"), parameter_count);
+        proof.dispatch_extensibility = Some(DispatchExtensibility::Closed);
+        proof
+    }
+
     #[doc(hidden)]
     /// An instance call whose external declaration proved one applicable
     /// signature for the written value receiver.
@@ -954,6 +1042,25 @@ impl ExactExternalCallProof {
     #[track_caller]
     pub fn csharp_static_external_member(owner: &str, member: &str, parameter_count: u32) -> Self {
         Self::static_external_member(owner, member, parameter_count)
+    }
+
+    /// A C# call in reduced extension form, `v.M(args...)`, whose modeled
+    /// declaration is the static extension method `M(this T v, ...)`.
+    /// `parameter_count` counts the written value as the first argument.
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn csharp_extension_external_member(
+        owner: &str,
+        member: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            parameter_count >= 1,
+            "an extension method declares its receiver parameter"
+        );
+        let mut proof = Self::static_external_member(owner, member, parameter_count);
+        proof.call_application = CallApplicationKind::ExtensionArgument;
+        proof
     }
 
     /// A C# instance call whose external declaration proves the receiver's
@@ -1027,7 +1134,8 @@ impl ExactExternalCallProof {
     }
 
     /// A Rust method call whose receiver's written type, reached through
-    /// built-in reference dereferences only, an activated model declares
+    /// built-in reference dereferences or an admitted query-time chain of
+    /// exact complete Identity summaries, an activated model declares
     /// with one instance member at the written arity (#3757). A concrete Rust
     /// receiver type dispatches statically, so the selected member is closed.
     ///
@@ -1042,6 +1150,8 @@ impl ExactExternalCallProof {
         );
         assert!(!member.is_empty(), "an external member must be named");
         Self {
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             canonical_callee: format!("{owner}::{member}").into_boxed_str(),
             call_application: CallApplicationKind::BoundReceiver,
             dispatch_extensibility: Some(DispatchExtensibility::Closed),
@@ -1051,6 +1161,7 @@ impl ExactExternalCallProof {
             python_model_manifest_sha256: None,
             python_formal_slots: None,
             external_member_identity: None,
+            type_argument_bindings: None,
         }
     }
 
@@ -1197,6 +1308,11 @@ pub enum CallApplicationKind {
     PackageFunction,
     /// `v.M(args...)`: the selected method is bound to the written value.
     BoundReceiver,
+    /// `v.M(args...)` where `M` is a static extension method, such as C#'s
+    /// reduced form of `static M(this T v, ...)`. No receiver participates in
+    /// the callable contract: the written value is the first declared
+    /// argument, and the parameter count includes it.
+    ExtensionArgument,
     /// A receiver selection is present, but resolution did not distinguish a
     /// bound value method from a type method expression.
     ReceiverBindingUnknown,
@@ -1255,10 +1371,39 @@ pub struct SourceMemberCallEvidence {
     pub call_application: CallApplicationKind,
     pub method_owner_is_interface: Option<bool>,
     pub receiver_preparation: Option<crate::analyzer::semantic::MemberReceiverPreparation>,
+    pub receiver_owner_relation: crate::analyzer::semantic::ReceiverOwnerRelation,
     pub field_anchor: Option<crate::analyzer::semantic::SourceAnchor>,
 }
 
 impl CallEvidence {
+    /// One exact external member a resolver selected for a call. The proof
+    /// states the owner, member, receiver application and arity together, and
+    /// the identity names the same member for the common dispatch path, so a
+    /// consumer never rebuilds either from the callee's spelling.
+    #[doc(hidden)]
+    pub fn selected_external_call(
+        language: Language,
+        proof: ExactExternalCallProof,
+        owner: &str,
+        member: &str,
+        authority: DefinitionResolutionAuthority,
+    ) -> Self {
+        Self {
+            source_member_evidence: None,
+            native_resolution: None,
+            model_member_selection: None,
+            call_application: proof.call_application(),
+            dispatch_extensibility: proof.dispatch_extensibility(),
+            exact_external_call: Some(proof),
+            external_callee_identity: Some(ResolverOwnedExternalCalleeIdentity::new(
+                language,
+                owner.to_owned(),
+                member.to_owned(),
+            )),
+            authority,
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn native_java_selected() -> Self {
@@ -1431,7 +1576,7 @@ impl DefinitionLookupStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DefinitionLookupDiagnostic {
     pub kind: String,
     pub message: String,
@@ -1449,7 +1594,7 @@ pub struct DefinitionLookupDiagnostic {
 /// `lint` the message shows); `role` names the kind of unit the subject was
 /// resolved as, which is the search bucket a contradicting in-workspace hit
 /// must come from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UnindexedClaim {
     pub kind: UnindexedClaimKind,
     /// The units the claim is about, exactly as the resolver means them (a
@@ -1461,7 +1606,7 @@ pub struct UnindexedClaim {
 }
 
 /// What a failure claim asserts about indexing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UnindexedClaimKind {
     /// The subject itself is asserted to be outside the indexed workspace
@@ -1481,7 +1626,7 @@ pub enum UnindexedClaimKind {
 /// bucket a contradicting in-workspace hit must come from. `Any` keeps the
 /// caller's prior behavior (a site whose subject could be more than one kind
 /// passes this, so an unsure site changes nothing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimSubjectRole {
     Module,
@@ -1793,7 +1938,17 @@ fn with_definition_batch_context<T>(
 ) -> T {
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-    resolve(analyzer, &mut context)
+    let result = resolve(analyzer, &mut context);
+    // Private per-request captures retain named probes only. Source errors
+    // observed by this empty-context batch must still make its enclosing
+    // read receipt unbounded; cached errors do not prove path absence.
+    let source_errors = context
+        .sources
+        .values()
+        .filter(|source| source.is_err())
+        .count();
+    analyzer.record_unattributed_reads(source_errors);
+    result
 }
 
 #[doc(hidden)]
@@ -1818,7 +1973,7 @@ pub fn resolve_navigation_batch(
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
     cancellation: Option<&CancellationToken>,
-) -> Vec<NavigationLookupOutcome> {
+) -> Vec<(NavigationLookupOutcome, Option<QueryReadIncomplete>)> {
     let _scope = profiling::scope("get_definition::resolve_navigation_batch");
     if profiling::enabled() {
         profiling::note(format!(
@@ -1838,7 +1993,7 @@ fn resolve_navigation_requests<'a>(
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
     cancellation: Option<&CancellationToken>,
-) -> Vec<NavigationLookupOutcome> {
+) -> Vec<(NavigationLookupOutcome, Option<QueryReadIncomplete>)> {
     let languages: Vec<_> = requests
         .iter()
         .map(|request| language_for_file(&request.file))
@@ -1864,24 +2019,91 @@ fn resolve_navigation_requests<'a>(
         .into_iter()
         .zip(reference_files)
         .zip(resolutions)
-        .map(|((language, reference_file), resolution)| {
-            navigation_lookup_outcome(
-                analyzer,
-                token,
-                context,
-                &reference_file,
-                resolution,
-                language,
-                operation,
-            )
-        })
+        .map(
+            |((language, reference_file), (resolution, resolution_read_gap))| {
+                // Converting a resolution into a navigation outcome reads
+                // file-derived facts of its own. Keep those reads with this
+                // lookup rather than with the batch that resolved its
+                // siblings.
+                let outcome_scope = cancellation.map_or_else(
+                    || AnalyzerQueryScope::new(analyzer),
+                    |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+                );
+                let outcome = navigation_lookup_outcome(
+                    analyzer,
+                    token,
+                    context,
+                    &reference_file,
+                    resolution,
+                    language,
+                    operation,
+                );
+                (
+                    outcome,
+                    QueryReadIncomplete::merge_optional(
+                        resolution_read_gap,
+                        outcome_scope.read_completion().err(),
+                    ),
+                )
+            },
+        )
         .collect()
+}
+
+/// Convert a selected bounded point without treating an in-budget open answer as resolved.
+#[doc(hidden)]
+pub fn definition_resolution_from_bounded(
+    result: BoundedResolution<(DefinitionLookupOutcome, CallEvidence)>,
+    language: Language,
+) -> DefinitionResolution {
+    match result {
+        BoundedResolution::Complete {
+            value: (outcome, evidence),
+            ..
+        } => DefinitionResolution {
+            outcome,
+            evidence,
+            call_binding_discharge_digests: Vec::new(),
+        },
+        BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
+            limit,
+            format!(
+                "{language:?} definition resolution exceeded its {} budget",
+                limit.as_str()
+            ),
+        )
+        .into(),
+        BoundedResolution::Unavailable { reason, .. } => diagnostic_outcome(
+            DefinitionLookupStatus::Unavailable,
+            "resolution_input_unavailable",
+            format!("{language:?} definition resolution input unavailable: {reason}"),
+        )
+        .into(),
+        BoundedResolution::Cancelled { .. } => {
+            cancelled(format!("{language:?} definition resolution was cancelled")).into()
+        }
+    }
 }
 
 /// Optional per-batch resolver supplied by the language. Its operation and
 /// factory remain owned by that language for the duration of this query.
 #[doc(hidden)]
 pub trait DefinitionBatchResolver<'a> {
+    fn expand_imported_external_callee(
+        &mut self,
+        analyzer: &'a dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_text: &str,
+        site: Option<&crate::analyzer::languages::ExternalCalleeSite<'_>>,
+    ) -> Result<
+        Option<crate::analyzer::languages::ImportedExternalCallee>,
+        crate::analyzer::read_ledger::DerivationExecutionCause,
+    > {
+        language_support_for_hook(file.language(), "expand_imported_external_callee")
+            .map_or(Ok(None), |support| {
+                support.expand_imported_external_callee(analyzer, file, callee_text, site)
+            })
+    }
     /// Extend this batch's existing operation to its enclosing dispatch file window.
     fn retain_file_operation(&mut self) {}
 
@@ -1943,7 +2165,7 @@ pub fn resolve_definition_requests<'a>(
         &mut Vec::new(),
     )
     .into_iter()
-    .map(|resolution| resolution.outcome)
+    .map(|(resolution, _)| resolution.outcome)
     .collect()
 }
 
@@ -1972,15 +2194,10 @@ pub fn record_definition_batch_probe_reads(
         }
         let source = match context.source(&request.file) {
             Ok(source) => source,
-            // The request's own file is not there to resolve in. That is a
-            // negative answer about one path, and a head that has the path
-            // answers differently, so the reader names the path rather than
-            // staying silent about it.
+            // Missing or generation-mismatched selected bytes do not prove
+            // that the path is absent, so preserve this read as unattributed.
             Err(_) => {
-                analyzer.record_read(ReadKey::path_absent(
-                    language,
-                    rel_path_string(&request.file).as_str(),
-                ));
+                analyzer.record_unattributed_read();
                 continue;
             }
         };
@@ -2136,7 +2353,7 @@ fn resolve_definition_resolutions<'a>(
     operation: Option<NavigationOperation>,
     trace_session: Option<&trace::TraceSession>,
     traces: &mut Vec<(Vec<TraceCandidate>, Option<trace::TraceCompleteness>)>,
-) -> Vec<DefinitionResolution> {
+) -> Vec<(DefinitionResolution, Option<QueryReadIncomplete>)> {
     let _query_scope = cancellation.map_or_else(
         || AnalyzerQueryScope::new(analyzer),
         |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
@@ -2171,11 +2388,20 @@ fn resolve_definition_resolutions<'a>(
                 if let Some(session) = trace_session {
                     traces.push(session.take_request_trace());
                 }
-                return cancelled(
-                    "definition resolution was cancelled before this request completed",
-                )
-                .into();
+                return (
+                    cancelled("definition resolution was cancelled before this request completed")
+                        .into(),
+                    Some(QueryReadIncomplete::Cancelled),
+                );
             }
+            // A batch shares its sources, but a read gap belongs to the
+            // request that observed it. A JS property-reaching gap reported
+            // while resolving one reference says nothing about a sibling that
+            // never read that evidence (#10917).
+            let request_scope = cancellation.map_or_else(
+                || AnalyzerQueryScope::new(analyzer),
+                |cancellation| AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+            );
             let language = language_for_file(&request.file);
             let file = request.file.clone();
             let probes = if crate::analyzer::read_attribution_records_reads(|| {
@@ -2234,7 +2460,7 @@ fn resolve_definition_resolutions<'a>(
             if let Some(session) = trace_session {
                 traces.push(session.take_request_trace());
             }
-            resolution
+            (resolution, request_scope.read_completion().err())
         })
         .collect()
 }
@@ -2244,6 +2470,18 @@ pub fn resolve_definition_batch_with_source(
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
+) -> Vec<DefinitionLookupOutcome> {
+    resolve_definition_batch_with_source_tree(analyzer, requests, file, source, None)
+}
+
+/// Resolve declarations using an already parsed requesting file when available.
+/// The supplied tree must describe `source` exactly.
+pub fn resolve_definition_batch_with_source_tree(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    primary_tree: Option<Tree>,
 ) -> Vec<DefinitionLookupOutcome> {
     // Recorded per analyzer instance through the test-hook counter on
     // `analyzer` itself, rather than a process-wide static: a static here was
@@ -2257,7 +2495,9 @@ pub fn resolve_definition_batch_with_source(
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);
-    let mut context = definition_batch_context_with_source(analyzer, scope.token(), file, source);
+    let mut context =
+        definition_batch_context_with_source(analyzer, scope.token(), file.clone(), source);
+    context.primary_source_tree = primary_tree.map(|tree| (file, tree));
     resolve_definition_requests(analyzer, token, &mut context, requests, None, None)
 }
 
@@ -2502,6 +2742,9 @@ pub fn resolve_navigation_batch_with_source(
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = definition_batch_context_with_source(analyzer, scope.token(), file, source);
     resolve_navigation_requests(analyzer, token, &mut context, requests, operation, None)
+        .into_iter()
+        .map(|(outcome, _)| outcome)
+        .collect()
 }
 
 pub fn navigation_declaration_site_targets(
@@ -2768,6 +3011,25 @@ struct ScalarDefinitionMemo {
 }
 
 impl<'a> ScalarCallTargetSession<'a> {
+    pub(crate) fn expand_imported_external_callee(
+        &mut self,
+        file: &ProjectFile,
+        callee_text: &str,
+        site: Option<&crate::analyzer::languages::ExternalCalleeSite<'_>>,
+    ) -> Result<
+        Option<crate::analyzer::languages::ImportedExternalCallee>,
+        crate::analyzer::read_ledger::DerivationExecutionCause,
+    > {
+        match self.resolver.as_deref_mut() {
+            Some(resolver) => {
+                resolver.expand_imported_external_callee(self.analyzer, file, callee_text, site)
+            }
+            None => language_support_for_hook(file.language(), "expand_imported_external_callee")
+                .map_or(Ok(None), |support| {
+                    support.expand_imported_external_callee(self.analyzer, file, callee_text, site)
+                }),
+        }
+    }
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
             analyzer,
@@ -2920,6 +3182,40 @@ impl Drop for ScalarCallTargetSession<'_> {
     }
 }
 
+/// Pure source preparation. Its exact bytes guard against reuse across edits.
+/// Language definition-tree hooks still decide how to use the primary tree.
+pub struct PreparedDefinitionSource {
+    source: Arc<str>,
+    tree: Tree,
+    line_starts: Arc<Vec<usize>>,
+}
+
+impl PreparedDefinitionSource {
+    pub(crate) fn new(source: Arc<str>, tree: Tree) -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        test_support::count_preparation_work(0, 0, 1);
+        let line_starts = Arc::new(compute_line_starts(&source));
+        Self {
+            source,
+            tree,
+            line_starts,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &Arc<str> {
+        &self.source
+    }
+}
+
+fn assert_prepared_source_matches(prepared: &PreparedDefinitionSource, source: &Arc<str>) {
+    #[cfg(any(test, feature = "test-support"))]
+    test_support::count_source_validation_bytes(0);
+    assert!(
+        Arc::ptr_eq(&prepared.source, source) && prepared.source.len() == source.len(),
+        "definition preparation must match exact source identity"
+    );
+}
+
 pub fn resolve_call_target_batch_with_source(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2952,6 +3248,35 @@ pub(crate) fn resolve_call_target_batch_with_source_tree(
     primary_tree: Option<Tree>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<CallTargetLookupOutcome> {
+    resolve_call_target_batch_with_preparation(
+        analyzer,
+        token,
+        requests,
+        file,
+        source,
+        primary_tree,
+        None,
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_call_target_batch_with_preparation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    primary_tree: Option<Tree>,
+    preparation: Option<&PreparedDefinitionSource>,
+    cancellation: Option<&CancellationToken>,
+) -> Vec<CallTargetLookupOutcome> {
+    if let Some(prepared) = preparation {
+        assert_prepared_source_matches(prepared, &source);
+    }
+    let primary_tree = preparation
+        .map(|prepared| prepared.tree.clone())
+        .or(primary_tree);
     let _scope = profiling::scope("get_definition::resolve_call_target_batch");
     if profiling::enabled() {
         profiling::note(format!("request_count={}", requests.len()));
@@ -2967,6 +3292,7 @@ pub(crate) fn resolve_call_target_batch_with_source_tree(
             file,
             source,
             primary_tree,
+            preparation,
             cancellation,
         ),
         None => resolve_generic_call_target_batch(
@@ -2976,11 +3302,51 @@ pub(crate) fn resolve_call_target_batch_with_source_tree(
             file,
             source,
             primary_tree,
+            preparation,
             cancellation,
         ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_call_target_context(
+    context: &mut DefinitionBatchContext<'_, '_>,
+    requests: &[DefinitionLookupRequest],
+    file: ProjectFile,
+    source: Arc<str>,
+    primary_tree: Option<Tree>,
+    preparation: Option<&PreparedDefinitionSource>,
+    _cancellation: Option<&CancellationToken>,
+) {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        context.native_points =
+            language_support_for_hook(language_for_file(&file), "native_point_batch").and_then(
+                |support| {
+                    support.native_point_batch(
+                        context.analyzer,
+                        file.clone(),
+                        Arc::clone(&source),
+                        _cancellation,
+                    )
+                },
+            );
+    }
+    if let Some(prepared) = preparation {
+        assert_prepared_source_matches(prepared, &source);
+        context
+            .line_starts
+            .insert(file.clone(), Arc::clone(&prepared.line_starts));
+    }
+    context.sources.insert(file.clone(), Ok(source));
+    context.primary_source_tree = primary_tree.map(|tree| (file.clone(), tree));
+    debug_assert!(
+        requests.iter().all(|request| request.file == file),
+        "one call-target source batch must contain requests for that source file"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_generic_call_target_batch(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2988,25 +3354,19 @@ pub(crate) fn resolve_generic_call_target_batch(
     file: ProjectFile,
     source: Arc<str>,
     primary_tree: Option<Tree>,
+    preparation: Option<&PreparedDefinitionSource>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<CallTargetLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        context.native_points = language_support_for_hook(
-            language_for_file(&file),
-            "native_point_batch",
-        )
-        .and_then(|support| {
-            support.native_point_batch(analyzer, file.clone(), Arc::clone(&source), cancellation)
-        });
-    }
-    context.sources.insert(file.clone(), Ok(source));
-    context.primary_source_tree = primary_tree.map(|tree| (file.clone(), tree));
-    debug_assert!(
-        requests.iter().all(|request| request.file == file),
-        "one call-target source batch must contain requests for that source file"
+    prepare_call_target_context(
+        &mut context,
+        &requests,
+        file.clone(),
+        source,
+        primary_tree,
+        preparation,
+        cancellation,
     );
 
     // C/C++ call targets are navigation answers: one call names a declaration
@@ -3023,7 +3383,7 @@ pub(crate) fn resolve_generic_call_target_batch(
             cancellation,
         )
         .into_iter()
-        .map(|navigation| CallTargetLookupOutcome {
+        .map(|(navigation, _)| CallTargetLookupOutcome {
             source_member_evidence: navigation.evidence.source_member_evidence,
             native_resolution: navigation.evidence.native_resolution,
             model_member_selection: navigation.evidence.model_member_selection,
@@ -3087,6 +3447,72 @@ pub(crate) fn resolve_generic_call_target_batch(
     )
 }
 
+/// Query-local setup, candidate-union, and answer rows.
+#[doc(hidden)]
+pub type SplitCallTargetBatch = (
+    Vec<CallTargetLookupOutcome>,
+    crate::analyzer::i_analyzer::QueryReadReceipt,
+    crate::analyzer::i_analyzer::QueryReadReceipt,
+);
+
+/// Opt-in generic batch. Navigation routes require their own receipt split.
+#[doc(hidden)]
+pub fn resolve_generic_call_targets_with_receipts(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<SplitCallTargetBatch> {
+    use crate::analyzer::i_analyzer::QueryReadReceipt;
+    if language_for_file(&file) == Language::Cpp {
+        return None;
+    }
+    let _deadline = cancellation.map(|c| AnalyzerQueryScope::with_cancellation(analyzer, c));
+    let scope = AnalyzerQueryScope::new(analyzer);
+    // The context owns a scope guard. Construct it outside the capture so
+    // scopes close in stack order; its read-producing setup stays captured.
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token());
+    let (mut batch, query_setup) = QueryReadReceipt::capture(analyzer, || {
+        prepare_call_target_context(
+            &mut context,
+            &requests,
+            file.clone(),
+            source,
+            None,
+            None,
+            cancellation,
+        );
+        record_definition_batch_probe_reads(analyzer, &mut context, &requests);
+        (!requests.is_empty())
+            .then(|| {
+                language_support_for_hook(language_for_file(&file), "definition_batch_resolver")
+                    .and_then(|support| support.definition_batch_resolver(analyzer, cancellation))
+            })
+            .flatten()
+    });
+    // Capture the entire request loop as one union: context memo hits cannot
+    // replay independent per-candidate receipts.
+    let answer = {
+        resolve_call_target_requests_with_setup_receipt(
+            analyzer,
+            token,
+            &mut context,
+            requests,
+            cancellation,
+            batch
+                .as_mut()
+                .map(|b| b.as_mut() as &mut dyn DefinitionBatchResolver<'_>),
+        )
+    };
+    let (_, setup) = QueryReadReceipt::capture(analyzer, || {
+        query_setup.replay(analyzer);
+        answer.setup_receipt.replay(analyzer);
+    });
+    Some((answer.outcomes, setup, answer.union_receipt))
+}
+
 #[doc(hidden)]
 pub fn resolve_call_target_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
@@ -3099,6 +3525,68 @@ pub fn resolve_call_target_requests<'a>(
     if let Some(batch) = definition_batch.as_mut() {
         batch.precompute(analyzer, context, &requests, cancellation);
     }
+    resolve_precomputed_call_target_requests(
+        analyzer,
+        token,
+        context,
+        requests,
+        cancellation,
+        definition_batch,
+    )
+}
+
+/// A batched answer and the receipt for shared precompute work. This carrier
+/// exists independently of the rows: even an empty batch can have a setup gap.
+/// Per-request work is deliberately not captured separately in a shared
+/// DefinitionBatchContext; its memo hits cannot replay independent receipts.
+#[doc(hidden)]
+pub struct CallTargetBatchWithSetupReceipt {
+    pub outcomes: Vec<CallTargetLookupOutcome>,
+    pub setup_receipt: crate::analyzer::i_analyzer::QueryReadReceipt,
+    pub union_receipt: crate::analyzer::i_analyzer::QueryReadReceipt,
+}
+
+#[doc(hidden)]
+pub fn resolve_call_target_requests_with_setup_receipt<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
+    context: &mut DefinitionBatchContext<'a, '_>,
+    requests: Vec<DefinitionLookupRequest>,
+    cancellation: Option<&CancellationToken>,
+    mut definition_batch: Option<&mut dyn DefinitionBatchResolver<'a>>,
+) -> CallTargetBatchWithSetupReceipt {
+    let (_, setup_receipt) =
+        crate::analyzer::i_analyzer::QueryReadReceipt::capture(analyzer, || {
+            if let Some(batch) = definition_batch.as_mut() {
+                batch.precompute(analyzer, context, &requests, cancellation);
+            }
+        });
+    let (outcomes, union_receipt) =
+        crate::analyzer::i_analyzer::QueryReadReceipt::capture(analyzer, || {
+            resolve_precomputed_call_target_requests(
+                analyzer,
+                token,
+                context,
+                requests,
+                cancellation,
+                definition_batch,
+            )
+        });
+    CallTargetBatchWithSetupReceipt {
+        outcomes,
+        setup_receipt,
+        union_receipt,
+    }
+}
+
+fn resolve_precomputed_call_target_requests<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
+    context: &mut DefinitionBatchContext<'a, '_>,
+    requests: Vec<DefinitionLookupRequest>,
+    cancellation: Option<&CancellationToken>,
+    mut definition_batch: Option<&mut dyn DefinitionBatchResolver<'a>>,
+) -> Vec<CallTargetLookupOutcome> {
     requests
         .into_iter()
         .map(|request| {
@@ -3241,7 +3729,21 @@ impl<'a: 'token, 'token> DefinitionBatchContext<'a, 'token> {
     pub fn source(&mut self, file: &ProjectFile) -> Result<Arc<str>, String> {
         self.sources
             .entry(file.clone())
-            .or_insert_with(|| read_source(file).map(Arc::<str>::from))
+            .or_insert_with(|| {
+                let Some(source) = self.analyzer.indexed_source(file) else {
+                    return Err(format!(
+                        "selected source is not indexed for `{}`",
+                        rel_path_string(file)
+                    ));
+                };
+                if !self.analyzer.indexed_source_matches(file, &source) {
+                    return Err(format!(
+                        "selected source does not match the indexed generation for `{}`",
+                        rel_path_string(file)
+                    ));
+                }
+                Ok(Arc::<str>::from(source))
+            })
             .clone()
     }
 
@@ -3442,14 +3944,27 @@ pub fn resolve_one_with_evidence<'a>(
         && let Some(tree) = tree.as_ref()
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
-        let lexical_binding = resolve_lexical_binding(
+        let lexical_binding = match resolve_lexical_binding_with_visibility(
             language,
             tree.root_node(),
             &source,
             site.focus_start_byte,
             site.focus_end_byte,
             identifier,
-        )
+        ) {
+            Ok(binding) => binding,
+            Err(_) => {
+                return finish_lookup_outcome(
+                    diagnostic_outcome(
+                        DefinitionLookupStatus::Incomplete,
+                        "lexical_binding_unproven",
+                        "the lexical binding is unavailable from the source syntax",
+                    ),
+                    site,
+                )
+                .into();
+            }
+        }
         .or_else(|| {
             language_support_for_hook(language, "definition_lexical_fallback").and_then(|support| {
                 support.definition_lexical_fallback(
@@ -3511,29 +4026,10 @@ pub fn resolve_one_with_evidence<'a>(
             budget: crate::analyzer::usages::receiver_analysis::INTERACTIVE_TYPE_LOOKUP_BUDGET,
             cancellation,
         };
-        return match crate::analyzer::languages::StructuralReceiverResolver::
-            resolve_definition_bounded(
-                native_points,
-                query,
-            )
-        {
-            BoundedResolution::Complete { value, .. } => DefinitionResolution {
-                outcome: value,
-                evidence: CallEvidence::default(),
-                call_binding_discharge_digests: Vec::new(),
-            },
-            BoundedResolution::Exceeded { limit, .. } => exceeded_budget(
-                limit,
-                format!(
-                    "{language:?} definition resolution exceeded its {} budget",
-                    limit.as_str()
-                ),
-            )
-            .into(),
-            BoundedResolution::Cancelled { .. } => {
-                cancelled(format!("{language:?} definition resolution was cancelled")).into()
-            }
-        };
+        return definition_resolution_from_bounded(
+            crate::analyzer::languages::StructuralReceiverResolver::resolve_definition_with_call_evidence_bounded(native_points, query),
+            language,
+        );
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let support = language_support_for_hook(language, "resolve_definition_dispatch")
@@ -3743,6 +4239,8 @@ pub fn parse_tree_for_language_outcome(
     };
     let mut parser = Parser::new();
     parser.set_language(&grammar).map_err(|_| failed())?;
+    #[cfg(any(test, feature = "test-support"))]
+    test_support::count_preparation_work(1, 0, 0);
     let tree = parser.parse(source, None).ok_or_else(failed)?;
     if language == Language::Cpp
         && let Some(ranges) =
@@ -4401,6 +4899,177 @@ mod tests {
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
 
+    #[test]
+    fn setup_receipt_survives_an_empty_batch_and_replays_all_reasons() {
+        use crate::analyzer::MultiAnalyzer;
+        struct SetupGap;
+        impl<'a> DefinitionBatchResolver<'a> for SetupGap {
+            fn precompute(
+                &mut self,
+                analyzer: &dyn IAnalyzer,
+                _context: &mut DefinitionBatchContext<'_, '_>,
+                requests: &[DefinitionLookupRequest],
+                _cancellation: Option<&CancellationToken>,
+            ) {
+                assert!(requests.is_empty());
+                analyzer.record_query_incomplete(QueryReadIncomplete::ArtifactUnavailable(
+                    "setup jar".into(),
+                ));
+                analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                    "setup index".into(),
+                ));
+            }
+            fn resolve_definition_dispatch(
+                &mut self,
+                _analyzer: &'a dyn IAnalyzer,
+                _token: QueryToken<'_>,
+                _context: &mut DefinitionBatchContext<'a, '_>,
+                _request: &DefinitionLookupRequest,
+                _source: &Arc<str>,
+                _tree: &Option<Tree>,
+                _site: &ResolvedReferenceSite,
+                _operation: Option<NavigationOperation>,
+                _cancellation: Option<&CancellationToken>,
+                _go_session: Option<&ResolutionSession>,
+            ) -> std::ops::ControlFlow<DefinitionResolution, DefinitionResolution> {
+                unreachable!("an empty batch has no per-request dispatch");
+            }
+        }
+        let analyzer = MultiAnalyzer::default();
+        let receipt = {
+            let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+            let mut context = DefinitionBatchContext::new(&analyzer, scope.token());
+            let batch = resolve_call_target_requests_with_setup_receipt(
+                &analyzer,
+                scope.token(),
+                &mut context,
+                Vec::new(),
+                None,
+                Some(&mut SetupGap),
+            );
+            assert!(batch.outcomes.is_empty());
+            assert!(batch.union_receipt.incomplete_reasons().is_empty());
+            assert_eq!(
+                batch.setup_receipt.incomplete_reasons(),
+                scope.captured_read_incompleteness()
+            );
+            assert_eq!(batch.setup_receipt.incomplete_reasons().len(), 2);
+            analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                "candidate only".into(),
+            ));
+            assert_eq!(batch.setup_receipt.incomplete_reasons().len(), 2);
+            batch.setup_receipt
+        };
+        let replay = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        receipt.replay(&analyzer);
+        assert_eq!(
+            replay.captured_read_incompleteness(),
+            receipt.incomplete_reasons()
+        );
+    }
+
+    #[test]
+    fn candidate_source_gap_does_not_enter_setup_receipt() {
+        use std::collections::BTreeSet;
+        struct MissingSource(crate::analyzer::TestProject);
+        impl crate::analyzer::CodeUnitIndex for MissingSource {
+            fn project(&self) -> &dyn crate::analyzer::Project {
+                &self.0
+            }
+            fn languages(&self) -> BTreeSet<Language> {
+                BTreeSet::from([Language::Java])
+            }
+            fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+                Box::new(std::iter::empty())
+            }
+            fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+                BTreeSet::new()
+            }
+            fn enclosing_code_unit(
+                &self,
+                _: &ProjectFile,
+                _: &crate::analyzer::Range,
+            ) -> Option<CodeUnit> {
+                None
+            }
+            fn enclosing_code_unit_for_lines(
+                &self,
+                _: &ProjectFile,
+                _: usize,
+                _: usize,
+            ) -> Option<CodeUnit> {
+                None
+            }
+            fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+                None
+            }
+            fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+                None
+            }
+            fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+                BTreeSet::new()
+            }
+            fn indexed_source(&self, _: &ProjectFile) -> Option<String> {
+                self.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                    "candidate source".into(),
+                ));
+                None
+            }
+        }
+        impl IAnalyzer for MissingSource {
+            fn record_query_incomplete(&self, reason: QueryReadIncomplete) {
+                crate::analyzer::i_analyzer::record_query_incomplete_on_current_contexts(reason);
+            }
+            fn update_with_listing(
+                &self,
+                _: &BTreeSet<ProjectFile>,
+                _: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+            ) -> Self {
+                unimplemented!()
+            }
+            fn update_all(&self) -> Self {
+                unimplemented!()
+            }
+            fn find_nearest_declaration(
+                &self,
+                _: &ProjectFile,
+                _: usize,
+                _: usize,
+                _: &str,
+            ) -> Option<crate::analyzer::DeclarationInfo> {
+                None
+            }
+
+            fn is_access_expression(&self, _: &ProjectFile, _: usize, _: usize) -> bool {
+                false
+            }
+        }
+        let analyzer = MissingSource(crate::analyzer::TestProject::new(
+            std::env::temp_dir(),
+            Language::Java,
+        ));
+        let scope = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let mut context = DefinitionBatchContext::new(&analyzer, scope.token());
+        let file = ProjectFile::new(std::env::temp_dir(), "10985-absent.java");
+        let request = DefinitionLookupRequest {
+            file,
+            line: Some(1),
+            column: Some(0),
+            start_byte: Some(0),
+            end_byte: Some(1),
+        };
+        let answer = resolve_call_target_requests_with_setup_receipt(
+            &analyzer,
+            scope.token(),
+            &mut context,
+            vec![request],
+            None,
+            None,
+        );
+        assert!(answer.setup_receipt.incomplete_reasons().is_empty());
+        assert!(!answer.union_receipt.incomplete_reasons().is_empty());
+    }
+
     #[cfg(test)]
     #[test]
     #[hardwon("#4460: the closed-world guard downgraded structured generated-surface boundaries")]
@@ -4572,6 +5241,8 @@ mod native_point_identity {
     );
     fields!(
         ExactExternalCallProof,
+        unadmitted_receiver_deref,
+        receiver_adjustments,
         canonical_callee,
         call_application,
         dispatch_extensibility,
@@ -4580,8 +5251,17 @@ mod native_point_identity {
         python_runtime_artifact,
         python_formal_slots,
         python_model_manifest_sha256,
-        external_member_identity
+        external_member_identity,
+        type_argument_bindings
     );
+    impl NativePointRegistryIndependent for crate::analyzer::semantic_model::ReceiverAdjustment {
+        fn registry_independent(&self) -> bool {
+            // This sealed key contains owned exact declaration strings and
+            // summary-content identities, no selected-operation SemanticIds.
+            // Its owning crate exhaustively accounts for every field.
+            true
+        }
+    }
     impl NativePointRegistryIndependent for DefinitionLookupStatus {
         fn registry_independent(&self) -> bool {
             match self {
@@ -4611,6 +5291,7 @@ mod native_point_identity {
             match self {
                 Self::PackageFunction
                 | Self::BoundReceiver
+                | Self::ExtensionArgument
                 | Self::ReceiverBindingUnknown
                 | Self::Unknown => true,
             }

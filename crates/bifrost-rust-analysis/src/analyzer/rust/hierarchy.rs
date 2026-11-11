@@ -371,7 +371,8 @@ mod tests {
         files: &[(&str, &str)],
     ) -> (AnalyzerFixture, RustAnalyzer) {
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, files);
-        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(&fixture.project_root());
         (fixture, analyzer)
     }
 

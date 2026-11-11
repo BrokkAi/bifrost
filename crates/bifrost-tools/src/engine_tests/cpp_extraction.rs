@@ -222,8 +222,9 @@ mod cpp_extraction_tests {
                     .is_some()
             );
             file.write(format!(
-                "int data[] = {{{}unknown}};\n",
-                "0x0123456789abcdef,".repeat(1400)
+                "int data[] = {{{}{}}};\n",
+                "0x0123456789abcdef,".repeat(1400),
+                "unknown,".repeat(2100)
             ))
             .unwrap();
             let changed: TreeSitterAnalyzer<CppAdapter> =
@@ -428,9 +429,12 @@ mod cpp_extraction_tests {
                 "[f()]=1",
                 "[](){return 1;}()",
             ] {
+                // #10694 excludes each data node on its own, so a literal inside
+                // an operand is excluded and the rest of the operand is counted.
+                // Enough executable operands still overflow the line.
                 let source = format!(
-                    "int data[] = {{{}{operand}}};\n",
-                    "0x0123456789abcdef,".repeat(1000)
+                    "int data[] = {{{}}};\n",
+                    format!("{operand}, ").repeat(2 * 16_001 / (operand.len() + 2) + 1)
                 );
                 assert!(
                     matches!(
@@ -440,6 +444,15 @@ mod cpp_extraction_tests {
                     "nonliteral control {operand} was admitted"
                 );
             }
+            // One call among the data costs only its own bytes.
+            let source = format!(
+                "int data[] = {{{}f()}};\n",
+                "0x0123456789abcdef,".repeat(1000)
+            );
+            assert!(matches!(
+                parse(&CppAdapter, &source, None),
+                BoundedParse::Complete(_)
+            ));
             let source = format!(
                 "int data[] = {{{}}}; {}\n",
                 "0x0123456789abcdef,".repeat(1000),
@@ -458,47 +471,35 @@ mod cpp_extraction_tests {
             ..
         })
     ));
-            let many_nodes = format!("int data[] = {{{}}};\n", "1,".repeat(33_000));
-            assert!(matches!(
-        parse(&CppAdapter, &many_nodes, None),
-        BoundedParse::Refused(SourceAdmissionRefusal::Budget {
-            dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::Nodes,
-            limit: 65_536,
-            ..
-        })
-    ));
-            let overlapping = format!(
-                "int data[] = {{{}}};\n",
-                "{".repeat(110) + &"0x0123456789abcdef,".repeat(4200) + &"}".repeat(110)
-            );
-            assert!(matches!(
-        parse(&CppAdapter, &overlapping, None),
-        BoundedParse::Refused(SourceAdmissionRefusal::Budget {
-            dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::SpanBytes,
-            limit: 8_388_608,
-            ..
-        })
-    ));
-            let source = format!("int data[] = {{{}}};\n", "1,".repeat(600_000));
-            assert!(matches!(
-        parse(&CppAdapter, &source, None),
-        BoundedParse::Refused(SourceAdmissionRefusal::Budget {
-            dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::SourceBytes,
-            limit: 1_048_576,
-            ..
-        })
-    ));
+            // #10694 bounds only the excluded data: the whole-tree node, span,
+            // source-byte and depth caps are gone, so a data line too large for
+            // the excluded-node bound reports that bound, and a deep but small
+            // data line is admitted like any ordinary file.
+            for source in [
+                format!("int data[] = {{{}}};\n", "1,".repeat(33_000)),
+                format!(
+                    "int data[] = {{{}}};\n",
+                    "{".repeat(110) + &"0x0123456789abcdef,".repeat(4200) + &"}".repeat(110)
+                ),
+                format!("int data[] = {{{}}};\n", "1,".repeat(600_000)),
+            ] {
+                assert!(matches!(
+                    parse(&CppAdapter, &source, None),
+                    BoundedParse::Refused(SourceAdmissionRefusal::Budget {
+                        dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::ExcludedNodes,
+                        limit: 8192,
+                        ..
+                    })
+                ));
+            }
             let source = format!(
                 "int data[] = {{{}}};\n",
                 "{".repeat(130) + "1" + &"}".repeat(130) + &",0x0123456789abcdef".repeat(1000)
             );
             assert!(matches!(
-        parse(&CppAdapter, &source, None),
-        BoundedParse::Refused(SourceAdmissionRefusal::Budget {
-            dimension: brokk_bifrost_analysis::analyzer::semantic::source_admission::AdmissionDimension::Depth,
-            ..
-        })
-    ));
+                parse(&CppAdapter, &source, None),
+                BoundedParse::Complete(_)
+            ));
         }
     }
 
@@ -2212,7 +2213,7 @@ namespace fast = ns::detail;
             );
             store
                 .conn
-                .execute(|conn| {
+                .execute_fixture(|conn| {
                     assert!(
                         conn.execute(
                             "UPDATE source_cpp_declarations SET trailing_qualifiers='broken'",
@@ -2312,7 +2313,7 @@ namespace fast = ns::detail;
             );
             store
                 .conn
-                .execute(|conn| {
+                .execute_fixture(|conn| {
                     conn.execute("DELETE FROM blobs", [])?;
                     let count: i64 =
                         conn.query_row("SELECT COUNT(*) FROM source_cpp_manifests", [], |row| {

@@ -5,6 +5,7 @@ use crate::analyzer::AnalyzerDelegate;
 use crate::analyzer::CodeUnitType;
 use crate::analyzer::JavaAnalyzer;
 use crate::analyzer::JavascriptAnalyzer;
+use crate::analyzer::KotlinAnalyzer;
 use crate::analyzer::MultiAnalyzer;
 use crate::analyzer::OverlayProject;
 use crate::analyzer::RustAnalyzer;
@@ -33,6 +34,7 @@ fn language_analyzer(language: Language, project: TestProject) -> Box<dyn IAnaly
         Language::Go => Box::new(GoAnalyzer::from_project(project)),
         Language::Java => Box::new(JavaAnalyzer::from_project(project)),
         Language::JavaScript => Box::new(JavascriptAnalyzer::from_project(project)),
+        Language::Kotlin => Box::new(KotlinAnalyzer::from_project(project)),
         Language::Php => Box::new(PhpAnalyzer::from_project(project)),
         Language::Python => Box::new(PythonAnalyzer::from_project(project)),
         Language::Ruby => Box::new(RubyAnalyzer::from_project(project)),
@@ -47,6 +49,7 @@ mod assignment_evidence;
 mod branch_evidence;
 mod call_site_correlations;
 mod comments;
+mod conditional_owned_calls;
 mod configuration;
 mod contracts;
 mod decorated_unit_provenance;

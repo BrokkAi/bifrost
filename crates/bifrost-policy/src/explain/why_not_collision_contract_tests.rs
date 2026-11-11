@@ -19,7 +19,7 @@ fn rows() -> brokk_bifrost_rql::structural::search::DetailedCodeQueryResult {
     let (_temp, analyzer) = analyzer("function render() {}\n");
     let query = CodeQuery::from_sexp("(function :name \"render\")").unwrap();
     let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
-    execute_code_query_detailed_eager_index(
+    brokk_bifrost_rql::structural::search::execute_code_query_detailed_eager_index(
         &analyzer,
         &flow_state,
         &query,

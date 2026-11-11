@@ -12,5 +12,8 @@ pub struct ArgumentConversion {
     pub range: Range,
     pub formal: usize,
     pub transfer: Result<Option<ValueTransfer>, ConversionUnknown>,
+    /// Language-owned evidence that this conversion can execute user code.
+    /// Lookup incompleteness is independent of this obligation.
+    pub may_run_user_code: bool,
     pub incomplete_reason: Option<String>,
 }

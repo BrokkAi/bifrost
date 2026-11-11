@@ -146,6 +146,7 @@ fn derived_occurrence_intersect_prefix_is_not_cacheable() {
         None,
         &files,
         prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
     );
     let detailed = cold.detailed.expect("cold continuation");
     assert_eq!(detailed.result.render_text(), whole.result.render_text());
@@ -174,7 +175,7 @@ fn decoded_intersect_execution(
     workspace: &WorkspaceAnalyzer,
     query: &CodeQuery,
 ) -> crate::structural::search::IntersectContinuationResult {
-    let files = seed_files_of(workspace);
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
     let prefixes = files
         .iter()
         .map(|seed| {
@@ -210,6 +211,7 @@ fn decoded_intersect_execution(
         None,
         &files,
         prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
     )
 }
 
@@ -259,6 +261,431 @@ fn seed_files_of(workspace: &WorkspaceAnalyzer) -> Vec<ProjectFile> {
     let mut files = workspace.analyzer().analyzed_files();
     files.sort_by(seed_file_order);
     files
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "853aed79cfec: partition-local frontier witnesses disagreed with the whole bounded answer"
+)]
+fn merged_call_depth_equals_whole_across_partition_seed_roots() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "mod mid; mod leaf;\nfn root() { mid::child(); }\n",
+        )
+        .file("src/mid.rs", "pub fn child() { crate::leaf::leaf(); }\n")
+        .file("src/leaf.rs", "pub fn leaf() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_sexp("(callees :depth 1 (enclosing-decl (language rust (function))))")
+            .unwrap();
+    let whole = whole_execution(&workspace, &query);
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let merged = merged(&workspace, &query, &files);
+    assert_eq!(whole.result.completion(), CodeQueryCompletion::Complete);
+    assert_eq!(
+        whole.result.depth_bound_status,
+        Some(DepthBoundStatus::NotReached)
+    );
+    assert_eq!(merged.depth_bound_status, whole.result.depth_bound_status);
+}
+
+#[test]
+fn depth_members_survive_projection_and_remain_traversal_local() {
+    for colocated in [false, true] {
+        let mut project = InlineTestProject::with_language(Language::Rust);
+        if colocated {
+            project = project
+                .file("src/lib.rs", "mod mid; fn root() { mid::child(); }\n")
+                .file(
+                    "src/mid.rs",
+                    "pub fn child() { leaf(); }\npub fn leaf() {}\n",
+                );
+        } else {
+            project = project
+                .file(
+                    "src/lib.rs",
+                    "mod mid; mod leaf; fn root() { mid::child(); }\n",
+                )
+                .file("src/mid.rs", "pub fn child() { crate::leaf::leaf(); }\n")
+                .file("src/leaf.rs", "pub fn leaf() {}\n");
+        }
+        let project = project.build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let first = "(callees :depth 1 (enclosing-decl (language rust (function :name \"root\"))))";
+        let filtered = format!("(filter :where ((fq_name regex \"^never/\")) {first})");
+        let second =
+            "(callees :depth 1 (enclosing-decl (language rust (function :name \"leaf\"))))";
+        for (source, empty, prefix, expected) in [
+            (filtered.clone(), true, false, DepthBoundStatus::Reached),
+            (
+                format!("(union {first} {second})"),
+                false,
+                false,
+                DepthBoundStatus::Reached,
+            ),
+            (
+                format!("(callees :depth 1 {first})"),
+                false,
+                false,
+                DepthBoundStatus::Reached,
+            ),
+            (
+                "(filter :where ((fq_name regex \"^never/\")) (intersect (callers :depth 1 (enclosing-decl (language rust (function :name \"leaf\")))) (enclosing-decl (language rust (function)))))".to_owned(),
+                true,
+                true,
+                DepthBoundStatus::Reached,
+            ),
+            (
+                "(callees :depth 1 (union (enclosing-decl (language rust (function :name \"root\"))) (enclosing-decl (language rust (function :name \"leaf\")))))".to_owned(),
+                false,
+                false,
+                DepthBoundStatus::NotReached,
+            ),
+        ] {
+            let query = CodeQuery::from_sexp(&source).unwrap();
+            let whole = whole_execution(&workspace, &query);
+            assert_eq!(
+                whole.result.depth_bound_status,
+                Some(expected),
+                "{source}: {whole:?}"
+            );
+            if empty {
+                assert!(whole.result.results.is_empty(), "{source}");
+            }
+            if prefix {
+                let continued = decoded_intersect_execution(&workspace, &query);
+                assert_eq!(
+                    continued.depth_bound_status, whole.result.depth_bound_status,
+                    "prefix: {source}"
+                );
+                continue;
+            }
+            let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+            let products = units(&workspace, &query, &files);
+            let added_bytes = products
+                .iter()
+                .map(|product| {
+                    let mut value = serde_json::to_value(product).unwrap();
+                    let before = serde_json::to_vec(&value).unwrap().len();
+                    value.as_object_mut().unwrap().remove("depth_answers");
+                    before - serde_json::to_vec(&value).unwrap().len()
+                })
+                .sum::<usize>();
+            eprintln!(
+                "depth-product-size colocated={colocated} units={} bytes_added={added_bytes} query={source}",
+                products.len()
+            );
+            for reverse in [false, true] {
+                let mut replayed = products
+                    .iter()
+                    .map(|product| {
+                        serde_json::from_slice::<UnitExecutionResult>(
+                            &serde_json::to_vec(product).unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                if reverse {
+                    replayed.reverse();
+                }
+                let actual = merge_unit_rows(&query, replayed);
+                assert_eq!(
+                    actual.depth_bound_status, whole.result.depth_bound_status,
+                    "{source} reverse={reverse}"
+                );
+                if empty {
+                    assert!(actual.items.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "69e0507ebf4b: middle-empty intersects used depth answers from whole-query skipped operands"
+)]
+fn middle_empty_intersect_discards_skipped_frontier_answers() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn leaf() {}\nfn root() { leaf(); }\nfn beyond() { root(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for target in ["leaf", "root"] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(intersect (enclosing-decl (language rust (function :name \"leaf\"))) (enclosing-decl (language rust (function :name \"missing\"))) (callers :depth 1 (enclosing-decl (language rust (function :name \"{target}\")))))"
+        )).unwrap();
+        let whole = whole_execution(&workspace, &query);
+        assert!(whole.result.results.is_empty());
+        assert_eq!(
+            whole.result.depth_bound_status,
+            Some(DepthBoundStatus::NotReached)
+        );
+        assert_eq!(whole.result.completion(), CodeQueryCompletion::Complete);
+        let continued = decoded_intersect_execution(&workspace, &query);
+        assert_eq!(
+            continued.depth_bound_status, whole.result.depth_bound_status,
+            "{target}"
+        );
+        assert_eq!(continued.completion, whole.result.completion());
+        assert!(continued.detailed.unwrap().result.results.is_empty());
+    }
+}
+
+#[test]
+#[hardwon(
+    "3b2d094964ec: suffix truncation lost negative depth uncertainty during prefix reconciliation"
+)]
+fn truncated_suffix_preserves_whole_depth_uncertainty() {
+    for (beyond_body, expected) in [
+        ("", DepthBoundStatus::Unknown),
+        ("root();", DepthBoundStatus::Reached),
+    ] {
+        let calls = "other();".repeat(40);
+        let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            format!("fn root() {{ leaf(); {calls} }}\nfn leaf() {{}}\nfn other() {{}}\nfn beyond() {{ {beyond_body} }}\n"),
+        )
+        .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_sexp(
+        "(uses (intersect (callers :depth 1 (enclosing-decl (language rust (function :name \"leaf\")))) (enclosing-decl (language rust (function :name \"root\")))))"
+    ).unwrap();
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 16,
+            ..Default::default()
+        };
+        let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+        let files = seed_files_of(&workspace);
+        let whole = execute_code_query_detailed_eager_index(
+            workspace.analyzer(),
+            &flow,
+            &query,
+            limits,
+            None,
+        );
+        assert_eq!(whole.result.depth_bound_status, Some(expected));
+        assert_ne!(whole.result.completion(), CodeQueryCompletion::Complete);
+        let prefixes = files
+            .iter()
+            .map(|seed| {
+                let prefix = crate::structural::search::execute_intersect_prefix(
+                    workspace.analyzer(),
+                    &flow,
+                    Some(&workspace),
+                    &query,
+                    limits,
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files),
+                );
+                assert_eq!(prefix.completion, CodeQueryCompletion::Complete);
+                assert_eq!(
+                    prefix.depth_bound_status,
+                    Some(if expected == DepthBoundStatus::Reached {
+                        expected
+                    } else {
+                        DepthBoundStatus::NotReached
+                    })
+                );
+                prefix
+            })
+            .collect();
+        let continued = crate::structural::search::continue_intersect_prefix(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            limits,
+            None,
+            &files,
+            prefixes,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        assert!(continued.detailed.is_some());
+        assert_eq!(
+            continued.depth_bound_status,
+            whole.result.depth_bound_status
+        );
+        assert_eq!(continued.completion, whole.result.completion());
+        let withheld = crate::structural::search::continue_intersect_prefix(
+            workspace.analyzer(),
+            &flow,
+            Some(&workspace),
+            &query,
+            limits,
+            None,
+            &files,
+            Vec::new(),
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        assert!(withheld.detailed.is_none());
+        assert_eq!(withheld.depth_bound_status, Some(DepthBoundStatus::Unknown));
+    }
+}
+
+#[test]
+fn merged_depth_retains_the_entire_natural_frontier() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "mod mid; mod leaves; fn root() { mid::child(); }\n",
+        )
+        .file(
+            "src/mid.rs",
+            "pub fn child() { crate::leaves::first(); crate::leaves::second(); }\n",
+        )
+        .file("src/leaves.rs", "pub fn first() {}\npub fn second() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "languages": ["rust"], "match": {"kind": "function", "name": {"regex": "^(root|first)$"}},
+        "steps": [{"op":"enclosing_decl"}, {"op":"callees", "depth":1}]
+    }))
+    .unwrap();
+    let whole = whole_execution(&workspace, &query);
+    assert_eq!(
+        whole.result.depth_bound_status,
+        Some(DepthBoundStatus::Reached)
+    );
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let products = units(&workspace, &query, &files);
+    assert!(
+        products
+            .iter()
+            .flat_map(|unit| &unit.depth_answers)
+            .any(|answer| answer.frontier.len() >= 2)
+    );
+    assert_eq!(
+        merge_unit_rows(&query, products).depth_bound_status,
+        whole.result.depth_bound_status
+    );
+}
+
+fn depth_status_rank(status: Option<DepthBoundStatus>) -> u8 {
+    match status {
+        Some(DepthBoundStatus::Reached) => 2,
+        Some(DepthBoundStatus::Unknown) => 1,
+        Some(DepthBoundStatus::NotReached) | None => 0,
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "e0b09002ed4d: empty-operand continuation rejected structural seed order exposed by pgcat"
+)]
+fn repeated_depth_selector_keeps_its_authored_branch_position() {
+    use crate::analyzer::{AnalyzerQueryScope, read_ledger::ReadLedger};
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "mod mid; fn root() { mid::child(); }\n")
+        .file(
+            "src/mid.rs",
+            "pub mod leaf; pub fn child() { leaf::leaf(); }\n",
+        )
+        .file("src/mid/leaf.rs", "pub fn leaf() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let branch = "(callers :depth 1 (enclosing-decl (language rust (function :name \"leaf\"))))";
+    let query = CodeQuery::from_sexp(&format!(
+        "(intersect (filter :where ((fq_name regex \"^never/\")) {branch}) {branch})"
+    ))
+    .unwrap();
+    let whole = whole_execution(&workspace, &query);
+    assert!(whole.result.results.is_empty());
+    assert_eq!(
+        whole.result.depth_bound_status,
+        Some(DepthBoundStatus::Reached)
+    );
+    let CodeQueryPlanSource::Set { branches, .. } = &query.plan.source else {
+        unreachable!()
+    };
+    let operand = CodeQuery {
+        plan: branches[0].clone(),
+        limit: usize::MAX,
+        ..query.clone()
+    };
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    assert!(
+        files.windows(2).any(|pair| pair[0] > pair[1]),
+        "the structural scan order must differ from ProjectFile component order"
+    );
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::default();
+    let probes = files
+        .iter()
+        .map(|file| {
+            let ledger = std::sync::Arc::new(ReadLedger::new());
+            let _capture = AnalyzerQueryScope::with_read_ledger(
+                workspace.analyzer(),
+                std::sync::Arc::clone(&ledger),
+            );
+            let seed_read = workspace
+                .analyzer()
+                .structural_fact_providers()
+                .into_iter()
+                .filter(|provider| provider.structural_language() == file.language())
+                .find_map(|provider| provider.structural_file_read_key(file))
+                .unwrap();
+            workspace.analyzer().record_read(seed_read);
+            let unit = execute_code_query_unit(
+                workspace.analyzer(),
+                &flow,
+                None,
+                &operand,
+                CodeQueryExecutionLimits::default(),
+                None,
+                CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+            );
+            (unit, ledger.keys())
+        })
+        .collect();
+    let continued = crate::structural::search::continue_empty_operand_zero(
+        workspace.analyzer(),
+        &flow,
+        None,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        &files,
+        crate::structural::search::CompleteEmptyFromOperandZero { probes },
+        CodeQueryExecutionScope::whole_workspace(),
+    );
+    assert_eq!(
+        continued.depth_bound_status,
+        whole.result.depth_bound_status
+    );
+    assert!(continued.into_merged_rows(&query).items.is_empty());
+}
+
+#[test]
+fn merged_call_depth_never_loses_a_whole_query_continuation() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "mod mid; mod leaf;\nfn root() { mid::child(); }\n",
+        )
+        .file("src/mid.rs", "pub fn child() { crate::leaf::leaf(); }\n")
+        .file("src/leaf.rs", "pub fn leaf() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(callees :depth 1 (enclosing-decl (language rust (function (name \"root\")))))",
+    )
+    .unwrap();
+    let whole = whole_execution(&workspace, &query);
+    let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+    let merged = merged(&workspace, &query, &files);
+    assert_eq!(
+        whole.result.depth_bound_status,
+        Some(DepthBoundStatus::Reached)
+    );
+    assert!(
+        depth_status_rank(merged.depth_bound_status)
+            >= depth_status_rank(whole.result.depth_bound_status)
+    );
 }
 
 #[test]
@@ -877,7 +1304,7 @@ fn two_file_project() -> BuiltInlineTestProject {
 }
 
 #[test]
-fn intersect_prefix_records_seed_inventory_and_keeps_typed_operands() {
+fn intersect_prefix_records_seed_file_and_keeps_typed_operands() {
     let project = two_file_project();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let files = seed_files_of(&workspace);
@@ -903,13 +1330,14 @@ fn intersect_prefix_records_seed_inventory_and_keeps_typed_operands() {
     assert_eq!(prefix.completion, CodeQueryCompletion::Complete);
     assert_eq!(prefix.operand_row_counts().count(), 2);
     assert!(prefix.reads_closed);
-    assert!(
-        prefix.reads.contains(
-            &workspace
-                .analyzer()
-                .workspace_scope_read_key(&Language::ALL)
-        )
-    );
+    let seed_read = workspace
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == files[0].language())
+        .and_then(|provider| provider.structural_file_read_key(&files[0]))
+        .expect("seed read key");
+    assert!(prefix.reads.contains(&seed_read), "{:?}", prefix.reads);
 }
 
 #[test]
@@ -1111,6 +1539,7 @@ fn rust_call_intersect_decoded_prefix_matches_whole() {
         None,
         &files,
         prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
     );
     let whole = whole_execution(&workspace, &query);
     let detailed = continued.detailed.expect("complete decoded prefix");
@@ -1212,6 +1641,7 @@ class Readers {
         None,
         &files,
         prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
     );
     let whole = whole_execution(&workspace, &query);
     let detailed = continued.detailed.expect("complete XMLReader continuation");
@@ -1338,6 +1768,7 @@ pub fn std_helper() { let _ = std::fs::read("startup-state"); }
         None,
         &files,
         prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
     );
     let whole = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
         &workspace,
@@ -1382,6 +1813,37 @@ pub fn std_helper() { let _ = std::fs::read("startup-state"); }
     );
     assert_eq!(detailed.evidence, whole.evidence);
     assert!(detailed.result.results.is_empty());
+}
+
+#[test]
+#[hardwon("#10500: prefix continuation rejected structural order for mid.rs beside mid/leaf.rs")]
+fn intersect_prefix_accepts_structural_seed_order() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "mod mid;\n")
+        .file("src/mid.rs", "pub mod leaf; pub fn middle() {}\n")
+        .file("src/mid/leaf.rs", "pub fn leaf() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for (left, expected) in [("(function)", 2), ("(function :name \"absent\")", 0)] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(intersect (enclosing-decl (language rust {left}))
+                (enclosing-decl (language rust (function))))"
+        ))
+        .unwrap();
+        let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+        assert!(files.windows(2).any(|pair| pair[0] > pair[1]));
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(whole.result.completion(), CodeQueryCompletion::Complete);
+        let detailed = decoded_intersect_execution(&workspace, &query)
+            .detailed
+            .expect("valid structural prefix continuation");
+        assert_eq!(detailed.result.results.len(), expected);
+        assert_eq!(
+            projected(&detailed.result.results),
+            projected(&whole.result.results)
+        );
+        assert_eq!(detailed.evidence, whole.evidence);
+    }
 }
 
 #[test]
@@ -1434,6 +1896,7 @@ fn intersect_continuation_matches_whole_before_and_after_one_seed_edit() {
             None,
             &files,
             prefixes,
+            CodeQueryExecutionScope::whole_workspace(),
         );
         let whole = whole_execution(workspace, &query);
         let detailed = continued.detailed.expect("complete prefix continuation");
@@ -1471,6 +1934,7 @@ fn intersect_continuation_matches_whole_before_and_after_one_seed_edit() {
         None,
         &files,
         prefixes,
+        CodeQueryExecutionScope::whole_workspace(),
     );
     assert!(withheld.detailed.is_none());
     assert!(matches!(
@@ -2265,7 +2729,63 @@ fn reference_kind_fixture() -> ReferenceSiteValue {
         )),
         usage_kind: UsageHitKind::Reference,
         proof: UsageProof::Proven,
-        reference_kind: None,
+        reference_facets: brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None),
+    }
+}
+
+#[test]
+fn call_site_unit_key_distinguishes_external_target_arms() {
+    let file = ProjectFile::new(std::env::temp_dir(), "target-arms.rs");
+    let range = Range {
+        start_byte: 20,
+        end_byte: 32,
+        start_line: 2,
+        end_line: 2,
+    };
+    let site = CallSite {
+        file: file.clone(),
+        range,
+        callee_range: range,
+        caller: CodeUnit::new(file.clone(), CodeUnitType::Function, "", "root"),
+        callee: CodeUnit::file_scope(file),
+        kind: CallSyntaxKind::Function,
+        proof: UsageProof::Proven,
+        receiver: None,
+        arguments: Vec::new(),
+    };
+    let mut first = CallSiteValue::new(
+        site,
+        CallBindingStatus::Unavailable,
+        None,
+        CallSiteIdentityFacts::default(),
+    );
+    first.6 = Some(CallSiteTargetEvidence {
+        target_id: Some("external-one".to_string()),
+        target_fq_name: Some("std.io.stdout".to_string()),
+        boundary_kind: Some("external"),
+        proof: "proven",
+        completeness: "partial",
+        coverage: "exhaustive",
+        reason: None,
+    });
+    let key = unit_row_key(&PipelineValue::CallSite(first.clone()).key());
+    for changed in [
+        CallSiteTargetEvidence {
+            target_id: Some("external-two".to_string()),
+            ..first.6.clone().unwrap()
+        },
+        CallSiteTargetEvidence {
+            boundary_kind: Some("unresolved"),
+            ..first.6.clone().unwrap()
+        },
+        CallSiteTargetEvidence {
+            coverage: "open",
+            ..first.6.clone().unwrap()
+        },
+    ] {
+        let mut other = first.clone();
+        other.6 = Some(changed);
+        assert_ne!(key, unit_row_key(&PipelineValue::CallSite(other).key()));
     }
 }
 
@@ -2313,7 +2833,7 @@ fn reference_site_intersection_merges_both_declaration_kinds() {
 /// The reference-site unit key is a persisted identity. Kind evidence and the
 /// intersection merge must leave its recipe unchanged: the site, the target
 /// declaration and range, the enclosing declaration by id alone, then usage
-/// kind, proof and reference kind.
+/// kind and proof; facet classification belongs to the row content.
 #[test]
 #[hardwon("#3628: declaration-kind evidence must not change persisted reference-site identity")]
 fn reference_site_unit_key_is_independent_of_kind_evidence() {
@@ -2340,7 +2860,6 @@ fn reference_site_unit_key_is_independent_of_kind_evidence() {
         format!("={}", enclosing.unit.declaration_id().as_str()),
         "reference".to_string(),
         "proven".to_string(),
-        String::new(),
     ];
     for (left, right) in [
         (coarse.clone(), exact.clone()),
@@ -2474,9 +2993,17 @@ fn python_format_diagnostic_sources_survive_persisted_unit_round_trip() {
     let decoded: UnitExecutionResult =
         serde_json::from_value(encoded.clone()).expect("read row product");
     assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
-    let [diagnostic] = decoded.diagnostics.as_slice() else {
-        panic!("only the selected format relation is incomplete: {decoded:#?}");
+    let [diagnostic, predicate] = decoded.diagnostics.as_slice() else {
+        panic!("the selected format relation and its row predicate are incomplete: {decoded:#?}");
     };
+    assert_eq!(
+        predicate.code,
+        CodeQueryDiagnosticCode::RowPredicateUndecided
+    );
+    assert_eq!(
+        predicate.withheld_rows_path.as_deref(),
+        Some("formatting.py")
+    );
     let location = diagnostic.source.as_ref().expect("persisted source span");
     assert_eq!(location.path, "formatting.py");
     assert_eq!((location.start_byte, location.end_byte), (10, 33));
@@ -2840,5 +3367,635 @@ fn warm_negative_postings_record_selected_files_without_hydration() {
                 .iter()
                 .any(|key| matches!(key, crate::analyzer::ReadKey::Scope { .. }))
         );
+    }
+}
+
+#[test]
+fn dispatch_target_rows_keep_root_and_call_site_separate() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/startup.rs",
+            "#[ctor]\n#[dtor]\n#[custom::ctor]\nfn startup() { let _ = std::fs::read(\"a\"); let _ = std::fs::read(\"b\"); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        r#"(result-detail full
+          (filter :where ((target_fq_name regex "^std[.]"))
+            (dispatch-targets
+              (call-sites-from
+                (enclosing-decl
+                  (language rust
+                    (decorator (name/regex "(^|::)(ctor|dtor)$"))))))))"#,
+    )
+    .expect("ctor root query");
+    let detailed = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    let targets = detailed
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::DispatchTarget { value } => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(targets.len(), 6, "{}", detailed.result.render_text());
+    let roots = targets
+        .iter()
+        .map(|row| row.root_id.as_str())
+        .collect::<HashSet<_>>();
+    let sites = targets
+        .iter()
+        .map(|row| row.site_id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(roots.len(), 3);
+    assert_eq!(sites.len(), 2);
+    assert!(targets.iter().all(|row| row.target_count == Some(1)));
+    assert!(
+        targets
+            .iter()
+            .all(|row| row.boundary_reason == Some("external_body_unavailable"))
+    );
+    assert!(targets.iter().all(|row| row.range.start_line == 4));
+    assert!(
+        targets
+            .iter()
+            .all(|row| row.range.start_column != row.range.end_column)
+    );
+}
+
+#[test]
+fn java_parameter_annotation_keeps_lexical_enclosing_method() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "A.java",
+            "class A { void method(@Valid String value) {} }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp("(enclosing-decl (language java (decorator)))")
+        .expect("Java parameter decorator query");
+    let result = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert!(
+        result.result.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::Declaration { value }
+                if value.fq_name.ends_with(".method")
+        )),
+        "{}",
+        result.result.render_text()
+    );
+}
+
+#[test]
+fn rust_callees_depth_is_a_complete_query_bound() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn root() { helper(); }\nfn helper() { leaf(); }\nfn leaf() {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        r#"(callees :depth 1 (enclosing-decl (language rust (function (name "root")))))"#,
+    )
+    .expect("bounded callees query");
+    let result = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert_eq!(result.result.completion(), CodeQueryCompletion::Complete);
+    let names = result
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Declaration { value } => Some(value.fq_name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert_eq!(names[0], "helper");
+}
+
+#[test]
+fn rust_call_sites_from_excludes_unreached_nested_callable() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn root() { let deferred = || std::fs::read(\"later\"); let _ = std::fs::read(\"now\"); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        r#"(call-sites-from (enclosing-decl (language rust (function (name "root")))))"#,
+    )
+    .expect("source call sites query");
+    let result = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert_eq!(
+        result.result.results.len(),
+        1,
+        "{}",
+        result.result.render_text()
+    );
+}
+
+#[test]
+fn rust_call_sites_from_preserves_internal_external_and_unresolved_sites() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn root() { local(); let _ = std::fs::read(\"x\"); missing(); }\nfn local() {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        r#"(call-sites-from (enclosing-decl (language rust (function (name "root")))))"#,
+    )
+    .expect("source call sites query");
+    let result = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    let sites = result
+        .result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::CallSite { value } => Some(value.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sites.len(), 3, "{}", result.result.render_text());
+    assert_eq!(sites.iter().filter(|site| site.callee.is_some()).count(), 1);
+    assert!(
+        sites
+            .iter()
+            .any(|site| site.target_fq_name.as_deref() == Some("std.fs.read"))
+    );
+    assert!(
+        sites
+            .iter()
+            .any(|site| site.boundary_kind == Some("unresolved"))
+    );
+}
+
+#[test]
+fn rust_call_sites_from_marks_opaque_macro_body_incomplete() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "macro_rules! invoke { () => { local(); } }\nfn root() { invoke!(); }\nfn local() {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        r#"(call-sites-from (enclosing-decl (language rust (function (name "root")))))"#,
+    )
+    .expect("macro call site query");
+    let result = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            result.result.completion(),
+            CodeQueryCompletion::Incomplete { .. }
+        ),
+        "{}",
+        result.result.render_text()
+    );
+}
+
+#[test]
+fn opaque_macro_does_not_hide_other_root_dispatch_targets() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "macro_rules! invoke { () => { hidden(); } }\n#[ctor]\nfn first() { invoke!(); }\n#[ctor]\nfn second() { let _ = std::fs::read(\"now\"); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        r#"(dispatch-targets (call-sites-from (enclosing-decl (language rust (decorator (name/regex "(^|::)ctor$"))))))"#,
+    )
+    .expect("ctor dispatch targets");
+    let result = crate::structural::search::execute_code_query_detailed_eager_index_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::default(),
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+    );
+    assert!(
+        result.result.results.iter().any(|item| matches!(
+            &item.value,
+            CodeQueryResultValue::DispatchTarget { value }
+                if value.target_fq_name.as_deref() == Some("std.fs.read")
+        )),
+        "{}",
+        result.result.render_text()
+    );
+    assert!(matches!(
+        result.result.completion(),
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "dc6a9b891853: non-opt-in prefix replay synthesized depth evidence for a skipped operand"
+)]
+fn depth_consumer_absence_survives_encoded_prefix_replay() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub fn target() {} pub fn middle() { target(); } pub fn root() { middle(); }",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    // Empty operand zero exercises exact skipped-traversal reconciliation too.
+    for name in ["middle", "missing"] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(intersect (enclosing-decl (language rust (function :name \"{name}\"))) (callers :depth 1 :proof proven (enclosing-decl (language rust (function :name \"target\")))))"
+        )).unwrap();
+        let files = seed_files_of(&workspace);
+        for opted_in in [false, true] {
+            let scope =
+                CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(opted_in);
+            let whole = execute_code_query_detailed_eager_index_workspace_in_scope(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                scope.clone(),
+            );
+            let prefixes = files.iter().map(|seed| {
+                let prefix = crate::structural::search::execute_intersect_prefix(
+                    workspace.analyzer(), &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    Some(&workspace), &query, CodeQueryExecutionLimits::default(), None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(seed), &files).with_depth_bound_status(opted_in));
+                let json = prefix.encode_product_json(&query.plan).unwrap();
+                assert_eq!(json.get("depth_bound_status").is_some(), opted_in);
+                assert_eq!(json.get("depth_answers").is_some(), opted_in);
+                crate::structural::search::IntersectPrefixProduct::decode_product_json_with_workspace(
+                    workspace.analyzer(), Some(&workspace), &query.plan, seed.clone(), prefix.reads.clone(), json).unwrap()
+            }).collect();
+            let continued = crate::structural::search::continue_intersect_prefix(
+                workspace.analyzer(),
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                Some(&workspace),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                &files,
+                prefixes,
+                scope,
+            );
+            assert_eq!(
+                continued.depth_bound_status,
+                whole.result.depth_bound_status
+            );
+            if !opted_in {
+                assert_eq!(continued.depth_bound_status, None);
+                assert!(continued.detailed.unwrap().depth_answers.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "891ba9efd037: an absent selector language yielded no units and lost depth completion"
+)]
+fn empty_partition_depth_status_equals_whole_in_both_consumer_modes() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn unrelated() {}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let seed = "(enclosing-decl (language typescript (function :name \"missing\")))";
+    for source in [
+        seed.to_owned(),
+        format!("(callers :depth 1 {seed})"),
+        format!("(callees :depth 1 {seed})"),
+        format!("(union {seed} (callers :depth 1 {seed}))"),
+        format!("(except {seed} (callers :depth 1 {seed}))"),
+        format!("(intersect {seed} (callers :depth 1 {seed}))"),
+        format!("(callees :depth 1 (except {seed} (callers :depth 1 {seed})))"),
+    ] {
+        let query = CodeQuery::from_sexp(&source).unwrap();
+        assert!(plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files()).is_empty());
+        for opted_in in [false, true] {
+            let scope =
+                CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(opted_in);
+            let whole = execute_code_query_detailed_eager_index_workspace_in_scope(
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                scope.clone(),
+            );
+            if matches!(
+                crate::query::PlanPartitioning::classify_for_prefix(&query.plan),
+                crate::query::PlanPartitioning::Prefix { .. }
+            ) {
+                let prefix = crate::structural::search::continue_intersect_prefix(
+                    workspace.analyzer(),
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    Some(&workspace),
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    None,
+                    &[],
+                    Vec::new(),
+                    scope.clone(),
+                );
+                assert_eq!(
+                    prefix.depth_bound_status, whole.result.depth_bound_status,
+                    "empty prefix: {source}, opted_in={opted_in}"
+                );
+            }
+            let merged = merge_unit_rows_in_scope(&query, [], scope);
+            assert_eq!(
+                merged.depth_bound_status, whole.result.depth_bound_status,
+                "{source}, opted_in={opted_in}"
+            );
+            if !opted_in {
+                assert_eq!(merged.depth_bound_status, None);
+            }
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "891ba9efd037: a cancelled union leaf lost Unknown when it retained no depth answer rows"
+)]
+fn cancelled_seed_union_preserves_leaf_depth_status_without_answers() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn target() {}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(union (callers :depth 1 (enclosing-decl (language rust (function :name \"target\")))) (callees :depth 1 (enclosing-decl (language rust (function :name \"target\")))))"
+    ).unwrap();
+    assert!(crate::query::PlanPartitioning::classify(&query.plan).is_seed_union());
+    assert!(!crate::query::PlanPartitioning::union_has_post_merge_suffix(&query.plan));
+    let files = workspace.analyzer().analyzed_files();
+    assert_eq!(files.len(), 1);
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    for opted_in in [false, true] {
+        let unit = execute_code_query_unit(
+            workspace.analyzer(),
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            Some(&workspace),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            Some(&cancellation),
+            CodeQueryExecutionScope::for_seed_files(&files, &files)
+                .with_depth_bound_status(opted_in),
+        );
+        assert!(unit.truncated);
+        assert!(unit.depth_answers.is_empty());
+        assert_eq!(
+            unit.depth_bound_status,
+            opted_in.then_some(DepthBoundStatus::Unknown)
+        );
+    }
+}
+
+#[test]
+#[hardwon("6e42bd3c51b4: incomplete upstream seed selection falsely certified a depth witness")]
+fn incomplete_seed_selection_cannot_certify_depth_witness() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "fn target() {} fn middle() { target(); } pub fn root() { middle(); } pub fn extra() { let _unknown = || {}; }")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for incomplete in [false, true] {
+        let seed = if incomplete {
+            "(enclosing-decl (language rust (callable :visibility public)))"
+        } else {
+            "(enclosing-decl (language rust (function :name \"root\")))"
+        };
+        let input = whole_execution(&workspace, &CodeQuery::from_sexp(seed).unwrap());
+        assert!(!input.result.results.is_empty());
+        assert_eq!(
+            input.result.completion() != CodeQueryCompletion::Complete,
+            incomplete
+        );
+        if incomplete {
+            assert!(
+                input
+                    .result
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code
+                        == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+                        && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+            );
+        }
+        let query = CodeQuery::from_sexp(&format!("(callees :depth 1 {seed})")).unwrap();
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(
+            whole.result.depth_bound_status,
+            Some(if incomplete {
+                DepthBoundStatus::Unknown
+            } else {
+                DepthBoundStatus::Reached
+            })
+        );
+        let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+        let merged = merge_unit_rows(&query, units(&workspace, &query, &files));
+        assert_eq!(merged.depth_bound_status, whole.result.depth_bound_status);
+    }
+}
+
+#[test]
+#[hardwon(
+    "73424603f285: seed excepts retained right depth proofs after a merged complete-empty left"
+)]
+fn exact_empty_set_prefix_discards_only_skipped_depth_answers() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub fn leaf() {} pub fn root() { leaf(); } pub fn beyond() { root(); }",
+        )
+        .file("other.rs", "pub fn unrelated() {}")
+        .build();
+    // Persisted wire contract from dc6a9b891853, before the except proof field.
+    #[derive(serde::Serialize)]
+    struct PreviousUnitProduct<'a> {
+        rows: &'a Vec<crate::structural::search::units::UnitRow>,
+        work: CodeQueryExecutionWork,
+        budgeted_work: &'a CodeQueryBudgetedWork,
+        completion: &'a CodeQueryCompletion,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        depth_bound_status: Option<DepthBoundStatus>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        depth_answers: &'a Vec<crate::structural::search::units::BoundedCallAnswer>,
+        diagnostics: &'a Vec<CodeQueryDiagnostic>,
+        truncated: bool,
+    }
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let empty = "(enclosing-decl (language rust (function :name \"missing\")))";
+    let reached = "(callers :depth 1 (enclosing-decl (language rust (function :name \"leaf\"))))";
+    let reached_empty = format!("(filter :where ((fq_name regex \"^never/\")) {reached})");
+    for operator in ["except", "intersect"] {
+        for (left, expected) in [
+            (empty.to_owned(), DepthBoundStatus::NotReached),
+            (reached_empty.clone(), DepthBoundStatus::Reached),
+        ] {
+            let query = CodeQuery::from_sexp(&format!("({operator} {left} {reached})")).unwrap();
+            let files = plan_seed_files(&query.plan, &workspace.analyzer().analyzed_files());
+            assert_eq!(
+                files.len(),
+                2,
+                "a non-empty seed inventory must not be confused with no units"
+            );
+            for file in &files {
+                let product = execute_code_query_unit(
+                    workspace.analyzer(),
+                    &brokk_bifrost_flow::FlowWorkspaceState::default(),
+                    Some(&workspace),
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files)
+                        .with_depth_bound_status(false),
+                );
+                assert_eq!(product.except_left_complete_empty, None);
+                assert_eq!(product.depth_bound_status, None);
+                assert!(product.depth_answers.is_empty());
+                let previous = PreviousUnitProduct {
+                    rows: &product.rows,
+                    work: product.work,
+                    budgeted_work: &product.budgeted_work,
+                    completion: &product.completion,
+                    depth_bound_status: product.depth_bound_status,
+                    depth_answers: &product.depth_answers,
+                    diagnostics: &product.diagnostics,
+                    truncated: product.truncated,
+                };
+                assert_eq!(
+                    serde_json::to_vec(&product).unwrap(),
+                    serde_json::to_vec(&previous).unwrap(),
+                    "opted-out wire bytes changed: {operator}: {left}"
+                );
+            }
+            let whole = whole_execution(&workspace, &query);
+            assert!(whole.result.results.is_empty());
+            assert_eq!(whole.result.completion(), CodeQueryCompletion::Complete);
+            assert_eq!(
+                whole.result.depth_bound_status,
+                Some(expected),
+                "{operator}: {left}"
+            );
+            for _ in 0..2 {
+                let products = units(&workspace, &query, &files);
+                if operator == "except" {
+                    assert!(
+                        products
+                            .iter()
+                            .all(|product| product.except_left_complete_empty == Some(true))
+                    );
+                    let replayed = products
+                        .iter()
+                        .map(|product| {
+                            serde_json::from_value::<UnitExecutionResult>(
+                                serde_json::to_value(product).unwrap(),
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let merged = merge_unit_rows(&query, replayed);
+                    assert_eq!(merged.depth_bound_status, Some(expected));
+                }
+                let continued = decoded_intersect_execution(&workspace, &query);
+                assert_eq!(
+                    continued.depth_bound_status,
+                    Some(expected),
+                    "prefix {operator}: {left}"
+                );
+                assert!(continued.detailed.unwrap().result.results.is_empty());
+            }
+        }
+    }
+    let local = CodeQuery::from_sexp(&format!(
+        "(except {empty} (enclosing-decl (language rust (function))))"
+    ))
+    .unwrap();
+    assert_eq!(
+        crate::query::PlanPartitioning::classify(&local.plan),
+        crate::query::PlanPartitioning::BySeedExcept
+    );
+    let files = plan_seed_files(&local.plan, &workspace.analyzer().analyzed_files());
+    assert!(
+        units(&workspace, &local, &files)
+            .iter()
+            .all(|unit| unit.except_left_complete_empty == Some(true))
+    );
+}
+
+#[test]
+#[hardwon(
+    "7710ee31a0ec: empty union operands incorrectly discarded other operands' depth witnesses"
+)]
+fn union_empty_operand_never_discards_depth_witnesses() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            "pub fn root() { middle(); } fn middle() { target(); } fn target() {}",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let empty = "(callers :depth 1 (enclosing-decl (language rust (function :name \"missing\"))))";
+    let reached = "(callers :depth 1 (enclosing-decl (language rust (function :name \"target\"))))";
+    for source in [
+        format!("(union {empty} {reached})"),
+        format!("(union {reached} {empty})"),
+    ] {
+        let query = CodeQuery::from_sexp(&source).unwrap();
+        let whole = whole_execution(&workspace, &query);
+        assert_eq!(
+            whole.result.depth_bound_status,
+            Some(DepthBoundStatus::Reached)
+        );
+        for _ in 0..2 {
+            let continued = decoded_intersect_execution(&workspace, &query);
+            assert_eq!(
+                continued.depth_bound_status, whole.result.depth_bound_status,
+                "{source}"
+            );
+        }
     }
 }

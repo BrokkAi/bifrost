@@ -16,6 +16,10 @@ pub enum BoundedResolution<T> {
         limit: ReceiverBudgetLimit,
         work: ReceiverAnalysisWork,
     },
+    Unavailable {
+        reason: &'static str,
+        work: ReceiverAnalysisWork,
+    },
     Cancelled {
         work: ReceiverAnalysisWork,
     },
@@ -30,6 +34,7 @@ impl<T> BoundedResolution<T> {
                 work,
             },
             Self::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+            Self::Unavailable { reason, work } => BoundedResolution::Unavailable { reason, work },
             Self::Cancelled { work } => BoundedResolution::Cancelled { work },
         }
     }
@@ -38,6 +43,7 @@ impl<T> BoundedResolution<T> {
         match self {
             Self::Complete { work, .. }
             | Self::Exceeded { work, .. }
+            | Self::Unavailable { work, .. }
             | Self::Cancelled { work } => *work,
         }
     }
@@ -60,6 +66,9 @@ struct ResolutionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolutionOwnerFrontier(u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallCancelled;
+
 impl ResolutionOwnerFrontier {
     pub const fn new(operation_alias: u64) -> Self {
         Self(operation_alias)
@@ -76,16 +85,50 @@ pub struct ResolutionSession {
     budget: Option<ReceiverAnalysisBudget>,
     total_work_limit: Option<usize>,
     cancellation: Option<CancellationToken>,
+    call_cancellation: RefCell<Vec<CancellationToken>>,
     state: RefCell<ResolutionState>,
     expanded_owners: RefCell<HashSet<ResolutionOwnerFrontier>>,
 }
 
 impl ResolutionSession {
+    /// Observe a caller's cancellation only for the duration of this work.
+    pub fn with_call_cancellation<R>(
+        &self,
+        call: &CancellationToken,
+        work: impl FnOnce() -> R,
+    ) -> Result<R, CallCancelled> {
+        struct Restore<'a>(&'a RefCell<Vec<CancellationToken>>);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().pop().expect("call cancellation scope");
+            }
+        }
+        self.call_cancellation.borrow_mut().push(call.clone());
+        let restore = Restore(&self.call_cancellation);
+        let result = work();
+        // Observe all active callers while the scope still holds their tokens.
+        let cancelled = self
+            .call_cancellation
+            .borrow()
+            .iter()
+            .fold(false, |cancelled, token| cancelled | token.is_cancelled());
+        if cancelled {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
+        drop(restore);
+        if cancelled {
+            Err(CallCancelled)
+        } else {
+            Ok(result)
+        }
+    }
+
     pub fn unbounded() -> Self {
         Self {
             budget: None,
             total_work_limit: None,
             cancellation: None,
+            call_cancellation: RefCell::new(Vec::new()),
             state: RefCell::new(ResolutionState::default()),
             expanded_owners: RefCell::default(),
         }
@@ -101,6 +144,7 @@ impl ResolutionSession {
             cancellation: Some(
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
+            call_cancellation: RefCell::new(Vec::new()),
             state: RefCell::new(ResolutionState::default()),
             expanded_owners: RefCell::default(),
         }
@@ -118,6 +162,7 @@ impl ResolutionSession {
             cancellation: Some(
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
+            call_cancellation: RefCell::new(Vec::new()),
             state: RefCell::new(ResolutionState::default()),
             expanded_owners: RefCell::default(),
         }
@@ -136,12 +181,14 @@ impl ResolutionSession {
         assert!(shared_work.scope_nodes <= budget.max_scope_nodes);
         assert!(shared_work.summary_expansions <= budget.max_summary_expansions);
         assert!(shared_work.resolution_rounds <= budget.max_resolution_rounds);
+        assert!(shared_work.hierarchy_order_steps <= budget.max_hierarchy_order_work);
         Self {
             budget: Some(budget),
             total_work_limit: None,
             cancellation: Some(
                 cancellation.map_or_else(CancellationToken::new, |token| token.child()),
             ),
+            call_cancellation: RefCell::new(Vec::new()),
             state: RefCell::new(ResolutionState {
                 work: shared_work,
                 stop: None,
@@ -220,13 +267,58 @@ impl ResolutionSession {
         self.charge(ReceiverBudgetLimit::ScopeNodes)
     }
 
+    pub fn hierarchy_order_step(&self) -> bool {
+        self.charge(ReceiverBudgetLimit::HierarchyOrderSteps)
+    }
+
+    pub fn hierarchy_order_steps(&self, count: usize) -> bool {
+        if self.budget.is_none()
+            && self.cancellation.is_none()
+            && self.call_cancellation.borrow().is_empty()
+        {
+            return true;
+        }
+        (0..count).all(|_| self.hierarchy_order_step())
+    }
+
     /// Charge copied scope operands without walking a no-op unbounded session.
     /// Bounded sessions retain exactly the per-step cancellation cadence.
     pub fn scope_steps(&self, count: usize) -> bool {
-        if self.budget.is_none() && self.cancellation.is_none() {
+        if self.budget.is_none()
+            && self.cancellation.is_none()
+            && self.call_cancellation.borrow().is_empty()
+        {
             return true;
         }
         (0..count).all(|_| self.scope_step())
+    }
+
+    /// Replay finished nested work into this session, stopping at the first refusal.
+    pub fn charge_work(&self, work: &ReceiverAnalysisWork) -> bool {
+        // A replay into a session that is already cancelled or stopped is
+        // refused, even with no work to charge; the first stop stays latched
+        // and this check charges no budget.
+        if !self.observe_cancellation() {
+            return false;
+        }
+        if self.budget.is_none()
+            && self.cancellation.is_none()
+            && self.call_cancellation.borrow().is_empty()
+        {
+            return true;
+        }
+        let ReceiverAnalysisWork {
+            // Setup work is tracked before a resolution session begins.
+            setup_nodes: _,
+            scope_nodes,
+            summary_expansions,
+            resolution_rounds,
+            hierarchy_order_steps,
+        } = *work;
+        self.scope_steps(scope_nodes)
+            && (0..summary_expansions).all(|_| self.summary_step())
+            && (0..resolution_rounds).all(|_| self.round_step())
+            && self.hierarchy_order_steps(hierarchy_order_steps)
     }
 
     pub fn summary_step(&self) -> bool {
@@ -329,7 +421,10 @@ impl ResolutionSession {
     }
 
     pub fn track_rows<T>(&self, rows: Vec<T>) -> Vec<T> {
-        if self.budget.is_none() && self.cancellation.is_none() {
+        if self.budget.is_none()
+            && self.cancellation.is_none()
+            && self.call_cancellation.borrow().is_empty()
+        {
             return rows;
         }
         for _ in &rows {
@@ -341,7 +436,10 @@ impl ResolutionSession {
     }
 
     pub fn observe_cancellation(&self) -> bool {
-        if self.budget.is_none() && self.cancellation.is_none() {
+        if self.budget.is_none()
+            && self.cancellation.is_none()
+            && self.call_cancellation.borrow().is_empty()
+        {
             return true;
         }
         let mut state = self.state.borrow_mut();
@@ -356,7 +454,15 @@ impl ResolutionSession {
         if state.stop.is_some() {
             crate::analyzer::carried_context::mark_execution_dependent();
         }
-        state.stop.is_none()
+        let call_cancelled = self
+            .call_cancellation
+            .borrow()
+            .iter()
+            .any(CancellationToken::is_cancelled);
+        if call_cancelled {
+            crate::analyzer::carried_context::mark_execution_dependent();
+        }
+        state.stop.is_none() && !call_cancelled
     }
 
     pub fn cancellation(&self) -> Option<&CancellationToken> {
@@ -366,58 +472,19 @@ impl ResolutionSession {
     /// The exact remaining allowance for a demand answer memo. A stopped
     /// session still has to pass observe_cancellation before using this value.
     pub fn remaining_budget(&self) -> Option<ReceiverAnalysisBudget> {
-        self.budget.map(|mut budget| {
+        self.budget.map(|budget| {
             let state = self.state.borrow();
-            budget.max_scope_nodes = budget
-                .max_scope_nodes
-                .saturating_sub(state.work.scope_nodes);
-            budget.max_summary_expansions = budget
-                .max_summary_expansions
-                .saturating_sub(state.work.summary_expansions);
+            let mut budget = budget.remaining_after(&state.work);
             if let Some(total_work_limit) = self.total_work_limit {
                 let remaining_total = total_work_limit.saturating_sub(total_work(&state.work));
                 budget.max_scope_nodes = budget.max_scope_nodes.min(remaining_total);
+                budget.max_hierarchy_order_work =
+                    budget.max_hierarchy_order_work.min(remaining_total);
                 budget.max_summary_expansions = budget.max_summary_expansions.min(remaining_total);
-                budget.max_resolution_rounds = budget
-                    .max_resolution_rounds
-                    .saturating_sub(state.work.resolution_rounds)
-                    .min(remaining_total);
+                budget.max_resolution_rounds = budget.max_resolution_rounds.min(remaining_total);
             }
             budget
         })
-    }
-
-    /// Charge work completed by a nested bounded resolver to this request.
-    pub fn charge_work(&self, work: ReceiverAnalysisWork) -> bool {
-        if !self.observe_cancellation() {
-            return false;
-        }
-        let Some(budget) = self.budget else {
-            return true;
-        };
-        let mut state = self.state.borrow_mut();
-        state.work = state.work.saturating_add(work);
-        let limit = if self
-            .total_work_limit
-            .is_some_and(|maximum| total_work(&state.work) > maximum)
-        {
-            Some(ReceiverBudgetLimit::TotalWork)
-        } else if state.work.scope_nodes > budget.max_scope_nodes {
-            Some(ReceiverBudgetLimit::ScopeNodes)
-        } else if state.work.summary_expansions > budget.max_summary_expansions {
-            Some(ReceiverBudgetLimit::SummaryExpansions)
-        } else if state.work.resolution_rounds > budget.max_resolution_rounds {
-            Some(ReceiverBudgetLimit::ResolutionRounds)
-        } else {
-            None
-        };
-        drop(state);
-        if let Some(limit) = limit {
-            self.mark_exceeded(limit);
-            false
-        } else {
-            true
-        }
     }
 
     /// Preserve a nested resolver's terminal budget reason in this request.
@@ -482,7 +549,10 @@ impl ResolutionSession {
     }
 
     fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
-        if self.budget.is_none() && self.cancellation.is_none() {
+        if self.budget.is_none()
+            && self.cancellation.is_none()
+            && self.call_cancellation.borrow().is_empty()
+        {
             return true;
         }
         if !self.observe_cancellation() {
@@ -519,6 +589,10 @@ impl ResolutionSession {
                 &mut state.work.resolution_rounds,
                 budget.max_resolution_rounds,
             ),
+            ReceiverBudgetLimit::HierarchyOrderSteps => (
+                &mut state.work.hierarchy_order_steps,
+                budget.max_hierarchy_order_work,
+            ),
             ReceiverBudgetLimit::TotalWork => unreachable!("aggregate work is checked above"),
         };
         if !crate::analyzer::work_budget::LimitedCounter::from_usage(*used, maximum).allows(1) {
@@ -537,15 +611,225 @@ impl ResolutionSession {
 }
 
 fn total_work(work: &ReceiverAnalysisWork) -> usize {
-    work.scope_nodes
-        .saturating_add(work.summary_expansions)
-        .saturating_add(work.resolution_rounds)
+    work.charged_total()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn call_cancellation_does_not_latch_operation_stop() {
+        let operation = CancellationToken::new();
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&operation));
+        let caller = CancellationToken::new();
+        assert_eq!(
+            session.with_call_cancellation(&caller, || {
+                assert!(session.scope_step());
+                caller.cancel();
+                assert!(!session.scope_step());
+                assert!(!session.charge_work(&ReceiverAnalysisWork::default()));
+                "apparently complete"
+            }),
+            Err(CallCancelled)
+        );
+        let late = CancellationToken::new();
+        assert_eq!(
+            session.with_call_cancellation(&late, || {
+                late.cancel();
+                "apparently complete"
+            }),
+            Err(CallCancelled)
+        );
+        let fresh = CancellationToken::new();
+        assert_eq!(
+            session.with_call_cancellation(&fresh, || {
+                assert!(session.scope_step());
+                "complete"
+            }),
+            Ok("complete")
+        );
+        assert!(
+            matches!(session.finish(()), BoundedResolution::Complete { work, .. } if work.scope_nodes == 2)
+        );
+
+        operation.cancel();
+        assert_eq!(
+            session.with_call_cancellation(&fresh, || assert!(!session.scope_step())),
+            Ok(())
+        );
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Cancelled { .. }
+        ));
+    }
+
+    #[test]
+    fn outer_call_cancellation_stops_nested_work_and_restores_scope() {
+        let operation = CancellationToken::new();
+        let session =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&operation));
+        let outer = CancellationToken::new();
+        let inner = CancellationToken::new();
+        assert_eq!(
+            session.with_call_cancellation(&outer, || {
+                assert!(session.scope_step());
+                assert_eq!(
+                    session.with_call_cancellation(&inner, || {
+                        assert!(session.scope_step());
+                        outer.cancel();
+                        assert!(!session.scope_step());
+                        assert!(!session.observe_cancellation());
+                    }),
+                    Err(CallCancelled)
+                );
+                assert!(!session.scope_step());
+            }),
+            Err(CallCancelled)
+        );
+        assert_eq!(
+            session.with_call_cancellation(&inner, || assert!(session.scope_step())),
+            Ok(())
+        );
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Complete { work, .. } if work.scope_nodes == 3
+        ));
+    }
+
+    #[test]
+    #[hardwon("#5658: a zero-work replay into a cancelled or stopped session was admitted")]
+    fn charge_work_refuses_a_cancelled_or_stopped_session_even_with_no_work() {
+        let none = ReceiverAnalysisWork::default();
+
+        let fresh = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        assert!(fresh.charge_work(&none));
+        assert!(matches!(
+            fresh.finish(()),
+            BoundedResolution::Complete { work, .. } if work == none
+        ));
+
+        let caller = CancellationToken::new();
+        let cancelled =
+            ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&caller));
+        caller.cancel();
+        assert!(!cancelled.charge_work(&none));
+        assert!(matches!(
+            cancelled.finish(()),
+            BoundedResolution::Cancelled { .. }
+        ));
+
+        let token = CancellationToken::new();
+        let token_only = ResolutionSession {
+            cancellation: Some(token.clone()),
+            ..ResolutionSession::unbounded()
+        };
+        assert!(token_only.charge_work(&none));
+        token.cancel();
+        assert!(!token_only.charge_work(&none));
+
+        let stopped = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_scope_nodes: 1,
+                ..ReceiverAnalysisBudget::default()
+            },
+            None,
+        );
+        assert!(stopped.scope_step());
+        assert!(!stopped.scope_step());
+        assert!(!stopped.charge_work(&none));
+        assert!(matches!(
+            stopped.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn charge_work_replays_hierarchy_and_stops_at_allowance() {
+        let unbounded = ResolutionSession::unbounded();
+        assert!(unbounded.charge_work(&ReceiverAnalysisWork {
+            summary_expansions: usize::MAX,
+            resolution_rounds: usize::MAX,
+            ..ReceiverAnalysisWork::default()
+        }));
+        assert_eq!(unbounded.finish(()).work(), ReceiverAnalysisWork::default());
+
+        let session = ResolutionSession::bounded(
+            ReceiverAnalysisBudget {
+                max_hierarchy_order_work: 2,
+                ..ReceiverAnalysisBudget::default()
+            },
+            None,
+        );
+        let work = ReceiverAnalysisWork {
+            hierarchy_order_steps: 3,
+            ..ReceiverAnalysisWork::default()
+        };
+        assert!(!session.charge_work(&work));
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::HierarchyOrderSteps,
+                work: ReceiverAnalysisWork {
+                    hierarchy_order_steps: 2,
+                    ..
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn hierarchy_and_scope_exhaust_independently_and_count_toward_total() {
+        let unbounded = ResolutionSession::unbounded();
+        assert!(unbounded.hierarchy_order_step());
+        assert!(unbounded.hierarchy_order_steps(2));
+        assert_eq!(unbounded.finish(()).work(), ReceiverAnalysisWork::default());
+        let budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 1,
+            max_hierarchy_order_work: 1,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let hierarchy = ResolutionSession::bounded(budget, None);
+        assert!(hierarchy.hierarchy_order_step());
+        assert!(!hierarchy.hierarchy_order_step());
+        assert!(matches!(
+            hierarchy.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::HierarchyOrderSteps,
+                ..
+            }
+        ));
+        let scope = ResolutionSession::bounded(budget, None);
+        assert!(scope.scope_step());
+        assert!(!scope.scope_step());
+        assert!(matches!(
+            scope.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+        let total = ResolutionSession::bounded_with_total_work(budget, 2, None);
+        assert!(total.hierarchy_order_step());
+        assert!(total.scope_step());
+        assert!(!total.summary_step());
+        assert!(matches!(
+            total.finish(()),
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::TotalWork,
+                work: ReceiverAnalysisWork {
+                    hierarchy_order_steps: 1,
+                    scope_nodes: 1,
+                    ..
+                }
+            }
+        ));
+    }
 
     #[test]
     fn distinct_owners_and_resolution_rounds_have_independent_limits() {
@@ -707,6 +991,7 @@ mod tests {
                 scope_nodes: 1,
                 summary_expansions: 1,
                 resolution_rounds: 1,
+                hierarchy_order_steps: 0,
             }
         );
         assert!(!session.scope_step());
@@ -720,6 +1005,7 @@ mod tests {
                     scope_nodes: 1,
                     summary_expansions: 1,
                     resolution_rounds: 1,
+                    hierarchy_order_steps: 0,
                 }
             }
         ));
@@ -749,6 +1035,7 @@ mod tests {
                     scope_nodes: 1,
                     summary_expansions: 1,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 }
             }
         ));
@@ -757,8 +1044,8 @@ mod tests {
         assert!(legacy.round_step());
         assert_eq!(
             legacy.remaining_budget().unwrap().max_resolution_rounds,
-            budget.max_resolution_rounds,
-            "legacy constructors retain their existing round projection"
+            budget.max_resolution_rounds - 1,
+            "every projected axis subtracts work already spent"
         );
         assert_eq!(ReceiverBudgetLimit::TotalWork.as_str(), "total_work");
 
@@ -793,6 +1080,7 @@ mod tests {
                     scope_nodes: 0,
                     summary_expansions: 0,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 }
             }
         ));
@@ -817,6 +1105,7 @@ mod tests {
                     scope_nodes: 0,
                     summary_expansions: 0,
                     resolution_rounds: 0,
+                    hierarchy_order_steps: 0,
                 }
             }
         ));

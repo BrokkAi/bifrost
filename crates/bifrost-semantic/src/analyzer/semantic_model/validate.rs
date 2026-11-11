@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
+pub(crate) fn rust_reexport_target_segment_valid(segment: &str) -> bool {
+    !segment.is_empty() && !segment.contains('.')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
@@ -174,6 +178,90 @@ pub(crate) fn validate_pack_internal(
     )
 }
 
+// Whole-pack check: Declared targets identify types, never member declarations.
+pub(crate) fn validate_alias_target_types(types: &[&TypeFact]) -> Option<Diagnostic> {
+    let type_ids: HashSet<_> = types.iter().map(|fact| fact.id.as_str()).collect();
+    for fact in types {
+        let Some(target) = &fact.alias_target else {
+            continue;
+        };
+        let mut references = HashSet::new();
+        crate::analyzer::semantic_model::artifact::collect_declared_type_refs(
+            target,
+            &mut references,
+        );
+        let mut invalid: Vec<_> = references
+            .into_iter()
+            .filter(|id| !type_ids.contains(id.as_str()))
+            .collect();
+        invalid.sort();
+        if !invalid.is_empty() {
+            return Some(Diagnostic::error(
+                "declaration.alias_target_not_type",
+                format!("$.types[{}].alias_target", fact.id),
+                format!("alias targets must reference type declarations: {invalid:?}"),
+            ));
+        }
+    }
+    None
+}
+
+// Shared by authored validation and whole compiled-pack admission. Per-shard
+// validation cannot see cycles whose edges cross shard boundaries.
+pub(crate) fn validate_alias_cycles(types: &[&TypeFact]) -> Option<Diagnostic> {
+    let aliases: HashSet<_> = types
+        .iter()
+        .filter(|fact| fact.type_kind == TypeKind::TypeAlias)
+        .map(|fact| fact.id.as_str())
+        .collect();
+    let mut edges = HashMap::new();
+    for fact in types {
+        let Some(target) = &fact.alias_target else {
+            continue;
+        };
+        let mut references = HashSet::new();
+        crate::analyzer::semantic_model::artifact::collect_declared_type_refs(
+            target,
+            &mut references,
+        );
+        let mut outgoing: Vec<_> = references
+            .into_iter()
+            .filter(|id| aliases.contains(id.as_str()))
+            .collect();
+        outgoing.sort();
+        edges.insert(fact.id.as_str(), outgoing);
+    }
+    let mut roots: Vec<_> = edges.keys().copied().collect();
+    roots.sort();
+    let mut active = HashSet::new();
+    let mut done = HashSet::new();
+    for root in roots {
+        let mut stack = vec![(root, false)];
+        while let Some((id, exiting)) = stack.pop() {
+            if exiting {
+                active.remove(id);
+                done.insert(id);
+                continue;
+            }
+            if done.contains(id) {
+                continue;
+            }
+            if !active.insert(id) {
+                return Some(Diagnostic::error(
+                    "declaration.alias_target_cycle",
+                    format!("$.types[{id}].alias_target"),
+                    "alias targets must not contain a declaration-reference cycle",
+                ));
+            }
+            stack.push((id, true));
+            if let Some(children) = edges.get(id) {
+                stack.extend(children.iter().rev().map(|child| (child.as_str(), false)));
+            }
+        }
+    }
+    None
+}
+
 struct Validator {
     language: String,
     go_packages_by_type_id: HashMap<String, String>,
@@ -205,7 +293,20 @@ struct Validator {
 }
 
 impl Validator {
+    fn fenced_completeness(&mut self, path: &str, completeness: Completeness) {
+        if completeness == Completeness::Fenced
+            && self.predates_schema(FENCED_COMPLETENESS_MIN_SCHEMA_VERSION)
+        {
+            self.error(
+                "pack.fenced_completeness_schema_version",
+                path,
+                "fenced completeness requires schema version 27",
+            );
+        }
+    }
+
     fn validate(&mut self, pack: &AuthoredSemanticModelPack) {
+        self.fenced_completeness("$.completeness", pack.completeness);
         if !SEMANTIC_MODEL_SUPPORTED_SCHEMA_VERSIONS.contains(&pack.schema_version) {
             self.error(
                 "schema.unsupported_version",
@@ -224,6 +325,10 @@ impl Validator {
                 _ => &[],
             })
             .collect::<Vec<_>>();
+        if self.validate_references {
+            self.diagnostics.extend(validate_alias_target_types(&types));
+        }
+        self.diagnostics.extend(validate_alias_cycles(&types));
         let types_by_name = types
             .iter()
             .map(|fact| (fact.name.as_str(), *fact))
@@ -377,6 +482,68 @@ impl Validator {
         self.text("$.provenance.source", &pack.provenance.source);
         if let Some(revision) = &pack.provenance.revision {
             self.text("$.provenance.revision", revision);
+        }
+        if pack.provenance.rust_artifact_approximation.is_some()
+            && self.predates_schema(RUST_ARTIFACT_APPROXIMATION_MIN_SCHEMA_VERSION)
+        {
+            self.error(
+                "provenance.rust_artifact_approximation_schema_version",
+                "$.provenance.rust_artifact_approximation",
+                "Rust artifact approximation provenance requires schema 28",
+            );
+        }
+        if (!pack.rust_external_reexports.is_empty()
+            || pack.rust_external_reexports_truncated
+            || pack.rust_external_reexports_glob_incomplete)
+            && self.predates_schema(RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION)
+        {
+            self.error(
+                "rust_external_reexports.schema_version",
+                "$.rust_external_reexports",
+                "Rust external reexports require schema 29",
+            );
+        }
+        for (index, route) in pack.rust_external_reexports.iter().enumerate() {
+            let path = format!("$.rust_external_reexports[{index}]");
+            let (facade, target) = match route {
+                RustExternalReexport::ExplicitUse {
+                    facade_path,
+                    target,
+                    ..
+                } => (facade_path, target),
+                RustExternalReexport::GlobUse {
+                    facade_module_path,
+                    target_module,
+                    ..
+                } => (facade_module_path, target_module),
+                RustExternalReexport::InlinedItem {
+                    facade_path,
+                    original,
+                    ..
+                } => (facade_path, original),
+            };
+            self.rust_reexport_path(&format!("{path}.facade_path"), facade);
+            self.rust_reexport_target(&format!("{path}.target"), target);
+            if let RustExternalReexport::GlobUse {
+                explicit_competitors,
+                glob_competitors,
+                ..
+            } = route
+            {
+                for (part, name) in explicit_competitors.iter().enumerate() {
+                    self.text(&format!("{path}.explicit_competitors[{part}]"), name);
+                    if name.contains('.') {
+                        self.error(
+                            "rust_external_reexports.competitor",
+                            format!("{path}.explicit_competitors[{part}]"),
+                            "competitor must be one segment",
+                        );
+                    }
+                }
+                for (part, target) in glob_competitors.iter().enumerate() {
+                    self.rust_reexport_target(&format!("{path}.glob_competitors[{part}]"), target);
+                }
+            }
         }
         self.text("$.license", &pack.license);
         if let Err(error) = spdx::Expression::parse(&pack.license) {
@@ -625,7 +792,19 @@ impl Validator {
             self.cpp_portability(evidence);
         }
 
-        let mut total_records = 0usize;
+        let mut total_records = pack.rust_external_reexports.len();
+        for route in &pack.rust_external_reexports {
+            if let RustExternalReexport::GlobUse {
+                explicit_competitors,
+                glob_competitors,
+                ..
+            } = route
+            {
+                total_records = total_records
+                    .saturating_add(explicit_competitors.len())
+                    .saturating_add(glob_competitors.len());
+            }
+        }
         for (index, shard) in pack.shards.iter().enumerate() {
             let path = format!("$.shards[{index}]");
             self.stable_id(&format!("{path}.id"), &shard.id);
@@ -1662,6 +1841,12 @@ impl Validator {
                         }
                     }
                 }
+                // Layout slots refer to field facts in this declaration shard.
+                // Index once for all types, including adversarial large packs.
+                let local_fields: HashMap<_, _> = members
+                    .iter()
+                    .map(|member| (member.id.as_str(), member))
+                    .collect();
                 for (index, fact) in types.iter().enumerate() {
                     self.go_current_package = self.go_packages_by_type_id.get(&fact.id).cloned();
                     if fact.callable_surface_complete
@@ -1680,6 +1865,98 @@ impl Validator {
                         &format!("{fact_path}.type_parameters"),
                         &fact.type_parameters,
                     );
+                    if let Some(target) = &fact.alias_target {
+                        let target_path = format!("{fact_path}.alias_target");
+                        if self.predates_schema(ALIAS_TARGET_MIN_SCHEMA_VERSION) {
+                            self.error(
+                                "declaration.alias_target_schema_version",
+                                &target_path,
+                                "alias_target requires schema version 32",
+                            );
+                        }
+                        if fact.type_kind != TypeKind::TypeAlias {
+                            self.error(
+                                "declaration.alias_target_owner",
+                                &target_path,
+                                "alias_target requires a type_alias owner",
+                            );
+                        }
+                        self.type_ref(&target_path, target, &fact.type_parameters);
+                    }
+                    if let Some(layout) = &fact.tuple_fields {
+                        let layout_path = format!("{fact_path}.tuple_fields");
+                        // A public slot borrows the identity of a field fact in
+                        // this shard, never defining the ID itself.
+                        if self.predates_schema(TUPLE_FIELD_LAYOUT_MIN_SCHEMA_VERSION) {
+                            self.error(
+                                "declaration.tuple_fields_schema_version",
+                                &layout_path,
+                                format!("tuple_fields requires schema version {TUPLE_FIELD_LAYOUT_MIN_SCHEMA_VERSION}"),
+                            );
+                        }
+                        if self.language != "rust" || fact.type_kind != TypeKind::Struct {
+                            self.error(
+                                "declaration.tuple_fields_owner",
+                                &layout_path,
+                                "tuple_fields requires a Rust struct",
+                            );
+                        }
+                        if layout.arity as usize != layout.fields.len() || layout.fields.len() > 256
+                        {
+                            self.error(
+                                "declaration.tuple_fields_arity",
+                                &layout_path,
+                                "tuple_fields must enumerate at most 256 slots, exactly one per position",
+                            );
+                        }
+                        let mut field_ids = HashSet::new();
+                        for (position, slot) in layout.fields.iter().take(256).enumerate() {
+                            let slot_path = format!("{layout_path}.fields[{position}]");
+                            if slot.ordinal() as usize != position {
+                                self.error(
+                                    "declaration.tuple_field_ordinal",
+                                    &slot_path,
+                                    "tuple field ordinals must be contiguous and ordered",
+                                );
+                            }
+                            if let TupleFieldSlot::Public { id, r#type, .. } = slot {
+                                let id_path = format!("{slot_path}.id");
+                                if let Some(member) = local_fields.get(id.as_str()) {
+                                    self.stable_reference(&id_path, id);
+                                    if member.owner != fact.id
+                                        || member.member_kind != MemberKind::Field
+                                        || member.visibility != Visibility::Public
+                                        || member.name != position.to_string()
+                                    {
+                                        self.error(
+                                            "declaration.tuple_field_member",
+                                            &id_path,
+                                            "public tuple field must reference a public field member of the same struct, named by its decimal position",
+                                        );
+                                    }
+                                } else {
+                                    self.error(
+                                        "declaration.tuple_field_member_missing",
+                                        &id_path,
+                                        "public tuple field must reference a field member in the same shard",
+                                    );
+                                }
+                                if !field_ids.insert(id) {
+                                    self.error(
+                                        "declaration.duplicate_tuple_field_id",
+                                        format!("{slot_path}.id"),
+                                        "tuple fields must have distinct declaration IDs",
+                                    );
+                                }
+                                self.type_ref(
+                                    &format!("{slot_path}.type"),
+                                    r#type,
+                                    &fact.type_parameters,
+                                );
+                            }
+                        }
+                    }
+
                     if let Some(inventory) = fact
                         .jvm_inventory
                         .as_ref()
@@ -1747,6 +2024,7 @@ impl Validator {
                         if value_semantics.copy.is_none()
                             && value_semantics.move_semantics.is_none()
                             && value_semantics.drop_glue.is_none()
+                            && value_semantics.drop_effects.is_none()
                         {
                             self.error(
                                 "declaration.empty_value_semantics",
@@ -1783,6 +2061,7 @@ impl Validator {
                                 );
                             }
                         }
+                        self.drop_claim(&fact_path, fact, value_semantics);
                         if let Some(TypeCopySemantics::ViaMember { member }) = &value_semantics.copy
                         {
                             self.stable_reference(
@@ -2359,6 +2638,9 @@ impl Validator {
         let mut callables = HashSet::new();
         for (index, flow) in payload.flows.iter().enumerate() {
             let current = format!("{path}.flows[{index}]");
+            if let Some(coverage) = flow.coverage {
+                self.fenced_completeness(&format!("{current}.coverage"), coverage);
+            }
             self.stable_reference(&format!("{current}.callable"), &flow.callable);
             if !callables.insert(flow.callable.as_str()) {
                 self.error(
@@ -2389,6 +2671,9 @@ impl Validator {
     fn deferred_yields(&mut self, path: &str, payload: &DeferredYieldsPayload) {
         for (index, fact) in payload.yields.iter().enumerate() {
             let current = format!("{path}.yields[{index}]");
+            if let Some(coverage) = fact.coverage {
+                self.fenced_completeness(&format!("{current}.coverage"), coverage);
+            }
             if fact.payload.factory != fact.factory
                 || fact.payload.resume != fact.resume
                 || fact.payload.handle_type != fact.handle_type
@@ -3087,6 +3372,7 @@ impl Validator {
     }
 
     fn procedure_summary(&mut self, path: &str, summary: &AuthoredProcedureSummary) {
+        self.fenced_completeness(&format!("{path}.completeness"), summary.completeness);
         self.stable_id(&format!("{path}.id"), &summary.id);
         if self
             .pack_id_bytes
@@ -3260,7 +3546,7 @@ impl Validator {
             );
         }
         if matches!(summary.completeness, Completeness::Complete)
-            && matches!(self.pack_completeness, Completeness::Partial)
+            && !matches!(self.pack_completeness, Completeness::Complete)
         {
             self.error(
                 "summary.completeness_exceeds_pack",
@@ -3288,7 +3574,7 @@ impl Validator {
         // target has no overrides to claim in the first place -- there is
         // exactly one callable it could ever name.
         if summary.covers_overrides {
-            if matches!(summary.completeness, Completeness::Partial) {
+            if !matches!(summary.completeness, Completeness::Complete) {
                 self.error(
                     "summary.covers_overrides_on_partial_summary",
                     format!("{path}.covers_overrides"),
@@ -3551,6 +3837,7 @@ impl Validator {
         }
 
         self.declared_effects(path, &summary.declared_effects);
+        self.lifecycle_coverage(path, summary);
         self.operation_preconditions(path, &summary.preconditions, &summary.target);
         if summary.normal_result_count.is_none()
             && (!summary.result_contracts.is_empty()
@@ -4589,6 +4876,272 @@ impl Validator {
         }
     }
 
+    fn lifecycle_coverage(&mut self, path: &str, summary: &AuthoredProcedureSummary) {
+        if summary.subject_effects.is_empty() && summary.lifecycle_coverage.is_empty() {
+            return;
+        }
+        if self.predates_schema(LIFECYCLE_COVERAGE_MIN_SCHEMA_VERSION) {
+            self.error(
+                "summary.lifecycle_schema_version",
+                path,
+                "subject effects and lifecycle coverage require schema 26",
+            );
+        }
+        if summary.completeness != Completeness::Complete {
+            self.error(
+                "summary.lifecycle_incomplete",
+                path,
+                "lifecycle claims require a Complete procedure summary",
+            );
+        }
+        if !summary.target.has_receiver {
+            self.error(
+                "summary.lifecycle_receiver_required",
+                path,
+                "receiver lifecycle claims require a receiver target",
+            );
+        }
+        let mut effects_by_id = HashMap::new();
+        for (index, effect) in summary.subject_effects.iter().enumerate() {
+            let effect_path = format!("{path}.subject_effects[{index}]");
+            self.stable_component(&format!("{effect_path}.id"), &effect.id);
+            self.stable_component(&format!("{effect_path}.effect"), &effect.effect);
+            if !effect.effect.contains('.') {
+                self.error(
+                    "summary.lifecycle_effect_namespace",
+                    format!("{effect_path}.effect"),
+                    "lifecycle effect must have a namespace",
+                );
+            }
+            if effects_by_id.insert(effect.id.as_str(), effect).is_some() {
+                self.error(
+                    "summary.lifecycle_duplicate_witness_id",
+                    format!("{effect_path}.id"),
+                    "duplicate subject-effect id",
+                );
+            }
+        }
+        let mut claims = HashSet::new();
+        let mut claim_ids = HashSet::new();
+        for (index, claim) in summary.lifecycle_coverage.iter().enumerate() {
+            let claim_path = format!("{path}.lifecycle_coverage[{index}]");
+            self.stable_component(&format!("{claim_path}.id"), &claim.id);
+            if !claim_ids.insert(claim.id.as_str()) || effects_by_id.contains_key(claim.id.as_str())
+            {
+                self.error(
+                    "summary.lifecycle_duplicate_id",
+                    format!("{claim_path}.id"),
+                    "duplicate lifecycle claim or witness id",
+                );
+            }
+            self.stable_component(
+                &format!("{claim_path}.event_set.name"),
+                &claim.event_set.name,
+            );
+            if !claim.event_set.name.contains('.')
+                || claim.event_set.version == 0
+                || claim.event_set.effects.is_empty()
+                || claim
+                    .event_set
+                    .effects
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            {
+                self.error("summary.lifecycle_malformed_event_set", format!("{claim_path}.event_set"),
+                    "event set needs a namespaced name, positive version, and nonempty sorted unique effects");
+            }
+            for (effect_index, effect) in claim.event_set.effects.iter().enumerate() {
+                self.stable_component(
+                    &format!("{claim_path}.event_set.effects[{effect_index}]"),
+                    effect,
+                );
+                if !effect.contains('.') {
+                    self.error(
+                        "summary.lifecycle_malformed_event_set",
+                        format!("{claim_path}.event_set.effects[{effect_index}]"),
+                        "event-set effect must have a namespace",
+                    );
+                }
+            }
+            if !claims.insert((
+                claim.event_set.name.as_str(),
+                claim.exit == AuthoredSummaryExitKind::Normal,
+            )) {
+                self.error(
+                    "summary.lifecycle_duplicate_set_exit",
+                    format!("{claim_path}.event_set"),
+                    "at most one claim per event-set name and exit",
+                );
+            }
+            if claim.exit == AuthoredSummaryExitKind::Normal && summary.normal_continuation_absent {
+                self.error(
+                    "summary.lifecycle_absent_normal_exit",
+                    format!("{claim_path}.exit"),
+                    "normal lifecycle claim conflicts with absent normal continuation",
+                );
+            }
+            let mut witness_ids = HashSet::new();
+            let mut witness_effects = HashSet::new();
+            for (witness_index, id) in claim.witnesses.iter().enumerate() {
+                let witness_path = format!("{claim_path}.witnesses[{witness_index}]");
+                if !witness_ids.insert(id.as_str()) {
+                    self.error(
+                        "summary.lifecycle_duplicate_witness",
+                        &witness_path,
+                        "witness id appears twice in one claim",
+                    );
+                }
+                let Some(effect) = effects_by_id.get(id.as_str()) else {
+                    self.error(
+                        "summary.lifecycle_unknown_witness",
+                        &witness_path,
+                        "claim cites an unknown subject-effect id",
+                    );
+                    continue;
+                };
+                if !claim.event_set.effects.contains(&effect.effect) {
+                    self.error(
+                        "summary.lifecycle_witness_outside_set",
+                        &witness_path,
+                        "witness effect is outside the event set",
+                    );
+                }
+                if effect.subject != claim.subject || effect.exit != claim.exit {
+                    self.error(
+                        "summary.lifecycle_witness_port_exit",
+                        &witness_path,
+                        "witness subject or exit differs from claim",
+                    );
+                }
+                if effect.timing != DeclaredEffectTiming::Immediate {
+                    self.error(
+                        "summary.lifecycle_witness_timing",
+                        &witness_path,
+                        "cited witness must be immediate",
+                    );
+                }
+                if !witness_effects.insert(effect.effect.as_str()) {
+                    self.error(
+                        "summary.lifecycle_duplicate_effect",
+                        &witness_path,
+                        "two witnesses in one claim name the same effect",
+                    );
+                }
+            }
+            for (effect_index, effect) in summary.subject_effects.iter().enumerate() {
+                if effect.subject == claim.subject
+                    && effect.exit == claim.exit
+                    && claim.event_set.effects.contains(&effect.effect)
+                    && !witness_ids.contains(effect.id.as_str())
+                {
+                    self.error(
+                        "summary.lifecycle_uncited_subject_effect",
+                        format!("{path}.subject_effects[{effect_index}]"),
+                        "claim omits an in-set subject effect for its subject and exit",
+                    );
+                }
+            }
+        }
+        if !summary.lifecycle_coverage.is_empty() {
+            for (index, effect) in summary.effects.iter().enumerate() {
+                if matches!(
+                    effect,
+                    AuthoredSummaryEffect::Escape {
+                        input: AuthoredSummaryInput::Receiver {},
+                        ..
+                    } | AuthoredSummaryEffect::Call { .. }
+                        | AuthoredSummaryEffect::UnknownCall { .. }
+                        | AuthoredSummaryEffect::UnknownCallBoundary { .. }
+                        | AuthoredSummaryEffect::AmbiguousCall { .. }
+                ) {
+                    self.error(
+                        "summary.lifecycle_receiver_row_conflict",
+                        format!("{path}.effects[{index}]"),
+                        "effect row may touch receiver outside lifecycle witnesses",
+                    );
+                }
+            }
+            for (index, transfer) in summary.transfers.iter().enumerate() {
+                if matches!(transfer.input, AuthoredSummaryInput::Receiver {})
+                    && !matches!(transfer.output, AuthoredSummaryOutput::Receiver {})
+                    && !matches!(
+                        transfer.value_transfer.as_ref().map(|v| &v.kind),
+                        Some(SummaryValueTransferKind::Conversion {
+                            preservation: SummaryValuePreservation::Identity
+                        })
+                    )
+                {
+                    self.error(
+                        "summary.lifecycle_receiver_row_conflict",
+                        format!("{path}.transfers[{index}]"),
+                        "non-identity receiver transfer is outside lifecycle witnesses",
+                    );
+                }
+            }
+            let is_receiver =
+                |input: &AuthoredSummaryInput| matches!(input, AuthoredSummaryInput::Receiver {});
+            let port_is_receiver = |port: &AuthoredSummaryPort| match port {
+                AuthoredSummaryPort::Input { input } => is_receiver(input),
+                AuthoredSummaryPort::Output { output } => {
+                    matches!(output, AuthoredSummaryOutput::Receiver {})
+                }
+            };
+            for (index, effect) in summary.concurrency_effects.iter().enumerate() {
+                let touches_receiver = match effect {
+                    AuthoredConcurrencyEffect::Unsupported { .. } => true,
+                    AuthoredConcurrencyEffect::TaskSpawn {
+                        callable, group, ..
+                    } => is_receiver(callable) || group.as_ref().is_some_and(is_receiver),
+                    AuthoredConcurrencyEffect::OnceDo { once, callable } => {
+                        is_receiver(once) || is_receiver(callable)
+                    }
+                    AuthoredConcurrencyEffect::WaitGroupAdd { group, delta } => {
+                        is_receiver(group) || is_receiver(delta)
+                    }
+                    AuthoredConcurrencyEffect::SyncMap { map, key, .. } => {
+                        is_receiver(map) || key.as_ref().is_some_and(is_receiver)
+                    }
+                    AuthoredConcurrencyEffect::CondBind { condition, lock } => {
+                        matches!(condition, AuthoredSummaryOutput::Receiver {}) || is_receiver(lock)
+                    }
+                    AuthoredConcurrencyEffect::ChannelClose { channel, .. }
+                    | AuthoredConcurrencyEffect::ChannelCloseAsync { channel, .. } => {
+                        port_is_receiver(channel)
+                    }
+                    AuthoredConcurrencyEffect::ChannelClosePropagate { source, target, .. } => {
+                        port_is_receiver(source) || port_is_receiver(target)
+                    }
+                    AuthoredConcurrencyEffect::SubtestRun { callable, group }
+                    | AuthoredConcurrencyEffect::SubtestCleanup { callable, group } => {
+                        is_receiver(callable) || is_receiver(group)
+                    }
+                    AuthoredConcurrencyEffect::TaskJoin { group }
+                    | AuthoredConcurrencyEffect::WaitGroupDone { group }
+                    | AuthoredConcurrencyEffect::WaitGroupWait { group } => is_receiver(group),
+                    AuthoredConcurrencyEffect::LockAcquire { lock, .. }
+                    | AuthoredConcurrencyEffect::LockRelease { lock, .. } => is_receiver(lock),
+                    AuthoredConcurrencyEffect::Atomic { location, .. } => is_receiver(location),
+                    AuthoredConcurrencyEffect::CondWait { condition }
+                    | AuthoredConcurrencyEffect::CondNotify { condition, .. } => {
+                        is_receiver(condition)
+                    }
+                    AuthoredConcurrencyEffect::TimerStop { timer }
+                    | AuthoredConcurrencyEffect::TimerReset { timer } => is_receiver(timer),
+                    AuthoredConcurrencyEffect::SubtestParallel { receiver } => {
+                        is_receiver(receiver)
+                    }
+                };
+                if touches_receiver {
+                    self.error(
+                        "summary.lifecycle_receiver_row_conflict",
+                        format!("{path}.concurrency_effects[{index}]"),
+                        "concurrency effect touches the receiver outside lifecycle witnesses",
+                    );
+                }
+            }
+        }
+    }
+
     fn operation_preconditions(
         &mut self,
         path: &str,
@@ -4796,6 +5349,10 @@ impl Validator {
             let mut seen_members = HashSet::new();
             for (member_index, member) in contract.member_contracts.iter().enumerate() {
                 let member_path = format!("{contract_path}.member_contracts[{member_index}]");
+                self.fenced_completeness(
+                    &format!("{member_path}.completeness"),
+                    member.completeness,
+                );
                 self.language_identifier(&format!("{member_path}.member"), &member.member);
                 if member.parameter_count > MAX_PROCEDURE_SUMMARY_ORDINAL {
                     self.error(
@@ -5517,6 +6074,170 @@ impl Validator {
                     pending.extend(arguments.iter().map(|argument| (argument, depth + 1)));
                 }
             }
+        }
+    }
+
+    fn drop_claim(&mut self, fact_path: &str, fact: &TypeFact, value: &TypeValueSemantics) {
+        let path = format!("{fact_path}.value_semantics");
+        let has_new = value.drop_effects.is_some() || value.drop_review.is_some();
+        if has_new && self.predates_schema(RUST_DROP_EFFECTS_MIN_SCHEMA_VERSION) {
+            self.error(
+                "declaration.drop_effects_schema_version",
+                &path,
+                "drop_effects and drop_review require schema 31",
+            );
+        }
+        if has_new
+            && (self.language != "rust"
+                || !matches!(fact.type_kind, TypeKind::Struct | TypeKind::Enum))
+        {
+            self.error(
+                "declaration.drop_effects_owner",
+                &path,
+                "reviewed destruction requires a Rust struct or enum",
+            );
+        }
+        if value.drop_glue.is_some() && value.drop_effects.is_some() {
+            self.error(
+                "declaration.drop_effects_conflict",
+                &path,
+                "drop_glue and drop_effects are mutually exclusive",
+            );
+        }
+        let claim = value.drop_glue.is_some() || value.drop_effects.is_some();
+        if (has_new || self.schema_version >= RUST_DROP_EFFECTS_MIN_SCHEMA_VERSION)
+            && claim
+            && value.drop_review.is_none()
+        {
+            self.error(
+                "declaration.drop_review_required",
+                &path,
+                "destruction claims require an exact drop_review",
+            );
+        }
+        if value.drop_review.is_some() && !claim {
+            self.error(
+                "declaration.drop_review_without_claim",
+                &path,
+                "drop_review requires a destruction claim",
+            );
+        }
+        if let Some(effects) = &value.drop_effects {
+            for parameter in &fact.type_parameters {
+                if !effects
+                    .payloads
+                    .iter()
+                    .any(|ty| matches!(ty, TypeRef::TypeParameter { name } if name == parameter))
+                {
+                    self.error(
+                        "declaration.drop_payload_missing",
+                        &path,
+                        format!("missing recursive payload for {parameter}"),
+                    );
+                }
+            }
+            for (field, types) in [
+                ("payloads", &effects.payloads),
+                ("field_types", &effects.field_types),
+            ] {
+                let mut seen = HashSet::new();
+                for (index, ty) in types.iter().enumerate() {
+                    let path = format!("{path}.drop_effects.{field}[{index}]");
+                    if !seen.insert(ty) {
+                        self.error(
+                            "declaration.drop_type_duplicate",
+                            &path,
+                            "duplicate destruction obligation",
+                        );
+                    }
+                    // Unknown and unsolved projections are allowed in ordinary signatures,
+                    // but cannot serve as complete destruction evidence.
+                    if ty.contains_unknown() {
+                        self.error(
+                            "declaration.drop_type_unknown",
+                            &path,
+                            "destruction obligation needs an exact type",
+                        );
+                    }
+                    self.type_ref(&path, ty, &fact.type_parameters);
+                }
+            }
+        }
+        if let Some(review) = &value.drop_review {
+            let path = format!("{path}.drop_review");
+            self.text(&format!("{path}.review.source"), &review.review.source);
+            self.text(&format!("{path}.review.revision"), &review.review.revision);
+            if review.review.source_digests.is_empty() {
+                self.error(
+                    "declaration.drop_review_digests",
+                    &path,
+                    "review needs source digests",
+                );
+            }
+            self.drop_sorted_strings(
+                &format!("{path}.review.source_digests"),
+                &review.review.source_digests,
+            );
+            for digest in &review.review.source_digests {
+                if !is_lower_sha256(digest) {
+                    self.error(
+                        "declaration.drop_review_digest",
+                        &path,
+                        "expected a lowercase SHA-256 digest",
+                    );
+                }
+            }
+            let (target, cfgs) = match &review.scope {
+                TypeDropReviewScope::Cargo {
+                    package,
+                    version,
+                    source_sha256,
+                    enabled_features,
+                    target,
+                    cfgs,
+                } => {
+                    self.text(&format!("{path}.scope.package"), package);
+                    self.version(&format!("{path}.scope.version"), version);
+                    self.text(&format!("{path}.scope.source_sha256"), source_sha256);
+                    if !is_lower_sha256(source_sha256) {
+                        self.error(
+                            "declaration.drop_review_digest",
+                            &path,
+                            "expected crate source SHA-256",
+                        );
+                    }
+                    self.drop_sorted_strings(
+                        &format!("{path}.scope.enabled_features"),
+                        enabled_features,
+                    );
+                    (target, cfgs)
+                }
+                TypeDropReviewScope::RustStd {
+                    toolchain,
+                    source_revision,
+                    target,
+                    cfgs,
+                } => {
+                    self.text(&format!("{path}.scope.toolchain"), toolchain);
+                    self.text(&format!("{path}.scope.source_revision"), source_revision);
+                    (target, cfgs)
+                }
+            };
+            self.text(&format!("{path}.scope.target"), target);
+            self.drop_sorted_strings(&format!("{path}.scope.cfgs"), cfgs);
+        }
+    }
+
+    fn drop_sorted_strings(&mut self, path: &str, values: &[String]) {
+        for (index, value) in values.iter().enumerate() {
+            self.text(&format!("{path}[{index}]"), value);
+        }
+        if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+            self.error(
+                "declaration.drop_review_order",
+                path,
+                "sets must be sorted and unique",
+            );
         }
     }
 
@@ -6319,7 +7040,7 @@ impl Validator {
     }
 
     fn stable_id(&mut self, path: &str, value: &str) {
-        if let Err(error) = validate_identifier(value, 256, true) {
+        if let Err(error) = validate_identifier(value, MAX_STABLE_ID_BYTES, true) {
             self.error("identifier.invalid", path, error.to_string());
         }
         if let Some(first_path) = self.stable_ids.insert(value.to_owned(), path.to_owned()) {
@@ -6332,13 +7053,13 @@ impl Validator {
     }
 
     fn stable_component(&mut self, path: &str, value: &str) {
-        if let Err(error) = validate_identifier(value, 256, true) {
+        if let Err(error) = validate_identifier(value, MAX_STABLE_ID_BYTES, true) {
             self.error("identifier.invalid", path, error.to_string());
         }
     }
 
     fn stable_reference(&mut self, path: &str, value: &str) {
-        if let Err(error) = validate_identifier(value, 256, true) {
+        if let Err(error) = validate_identifier(value, MAX_STABLE_ID_BYTES, true) {
             self.error("identifier.invalid_reference", path, error.to_string());
         }
     }
@@ -6427,6 +7148,49 @@ impl Validator {
         }
     }
 
+    fn rust_reexport_path(&mut self, path: &str, value: &str) {
+        self.text(path, value);
+        let segments = value.split('.').collect::<Vec<_>>();
+        if segments.len() > 64 {
+            self.error(
+                "rust_external_reexports.path_segments",
+                path,
+                "path exceeds 64 segments",
+            );
+        }
+        for (index, segment) in segments.iter().enumerate() {
+            self.text(&format!("{path}[{index}]"), segment);
+        }
+    }
+
+    fn rust_reexport_target(&mut self, path: &str, target: &RustExternalReexportTarget) {
+        self.text(path, &target.path.join("."));
+        self.text(
+            &format!("{path}.external_crate_name"),
+            &target.external_crate_name,
+        );
+        if target.path.is_empty()
+            || target.path.len() > 64
+            || target.path.first() != Some(&target.external_crate_name)
+        {
+            self.error(
+                "rust_external_reexports.target_path",
+                path,
+                "invalid external target path",
+            );
+        }
+        for (index, segment) in target.path.iter().enumerate() {
+            self.text(&format!("{path}.path[{index}]"), segment);
+            if !rust_reexport_target_segment_valid(segment) {
+                self.error(
+                    "rust_external_reexports.target_path",
+                    format!("{path}.path[{index}]"),
+                    "target path segment must not contain a dot",
+                );
+            }
+        }
+    }
+
     fn locator_path(&mut self, path: &str, value: &str) {
         self.text(path, value);
         if !is_canonical_relative_path(value) {
@@ -6481,7 +7245,7 @@ fn runtime_active_set_digest(exposure_ids: &[String]) -> String {
         .expect("runtime exposure identifiers are always JSON serializable");
     let mut digest = Sha256::new();
     digest.update(encoded);
-    format!("{:x}", digest.finalize())
+    brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest.finalize().into())
 }
 
 /// Whether one activation selector binds exactly the artifact applicability a
@@ -7394,6 +8158,182 @@ mod native_deferred_bridge_tests {
             }],
         }))
         .expect("valid native test pack")
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: truncation marker needs schema 29 even without routes"
+    )]
+    fn truncated_external_reexports_require_schema_29_without_routes() {
+        let mut pack = native_pack(serde_json::json!([]));
+        pack.rust_external_reexports_truncated = true;
+        let limits = ValidationLimits {
+            max_shards: 100,
+            max_records_per_shard: 1000,
+            max_records_per_pack: 1000,
+            max_text_bytes: 10000,
+            max_depth: 64,
+        };
+        assert!(
+            validate_pack(&pack, limits)
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "rust_external_reexports.schema_version" })
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: oversized Rust reexport paths and competitors obey authored text limits"
+    )]
+    fn rust_reexport_carrier_obeys_text_limits() {
+        let mut pack = native_pack(serde_json::json!([]));
+        pack.schema_version = RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION;
+        let target = RustExternalReexportTarget {
+            namespace: None,
+            external_crate_id: 1,
+            external_crate_name: "core".into(),
+            item_id: 1,
+            path: vec!["core".into(), "query".into()],
+        };
+        pack.rust_external_reexports
+            .push(RustExternalReexport::GlobUse {
+                facade_module_path: "facade".into(),
+                use_item_id: 1,
+                target_module: target,
+                explicit_competitors: vec!["x".repeat(101)],
+                glob_competitors: Vec::new(),
+                unresolved_glob_competitor: false,
+            });
+        let limits = ValidationLimits {
+            max_text_bytes: 100,
+            max_shards: 100,
+            max_records_per_shard: 1000,
+            max_records_per_pack: 1000,
+            max_depth: 64,
+        };
+        let (diagnostics, census) = validate_pack_locally_with_census(&pack, limits);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.text_bytes")
+        );
+        assert_eq!(census.max_text_bytes, 101);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon("#10258: external target segments cannot contain dots")]
+    fn rust_reexport_target_rejects_dotted_segment() {
+        let mut pack = native_pack(serde_json::json!([]));
+        pack.schema_version = RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION;
+        pack.rust_external_reexports
+            .push(RustExternalReexport::ExplicitUse {
+                facade_path: "facade.query".into(),
+                use_item_id: 1,
+                target: RustExternalReexportTarget {
+                    namespace: None,
+                    external_crate_id: 1,
+                    external_crate_name: "core".into(),
+                    item_id: 1,
+                    path: vec!["core".into(), "some.query".into()],
+                },
+            });
+        let limits = ValidationLimits {
+            max_text_bytes: 1000,
+            max_shards: 100,
+            max_records_per_shard: 1000,
+            max_records_per_pack: 1000,
+            max_depth: 64,
+        };
+        assert!(
+            validate_pack(&pack, limits)
+                .iter()
+                .any(|diagnostic| diagnostic.code == "rust_external_reexports.target_path")
+        );
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#10258: manifest decoding rejects an oversized reexport competitor as ordinary oversized text"
+    )]
+    fn decoded_rust_reexport_carrier_obeys_text_limits() {
+        let mut manifest: crate::analyzer::semantic_model::artifact::CompiledPackManifest =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": RUST_EXTERNAL_REEXPORTS_MIN_SCHEMA_VERSION,
+                "pack_id":"test.rust.reexport",
+                "version":"1.0.0",
+                "producer":{"name":"test","version":"1.0.0"},
+                "language":"rust", "ecosystem":"cargo",
+                "compatibility":{"toolchains":[]},
+                "provenance":{"source":"test"},
+                "license":"MIT", "completeness":"complete",
+                "safety":{"generated_code_only":false,"review_required":false},
+                "semantic_sha256":"00".repeat(32),
+                "content_sha256":"00".repeat(32),
+                "shards":[]
+            }))
+            .unwrap();
+        manifest
+            .rust_external_reexports
+            .push(RustExternalReexport::GlobUse {
+                facade_module_path: "facade".into(),
+                use_item_id: 1,
+                target_module: RustExternalReexportTarget {
+                    namespace: None,
+                    external_crate_id: 1,
+                    external_crate_name: "core".into(),
+                    item_id: 1,
+                    path: vec!["core".into(), "query".into()],
+                },
+                explicit_competitors: vec!["query".into()],
+                glob_competitors: Vec::new(),
+                unresolved_glob_competitor: false,
+            });
+        if let RustExternalReexport::GlobUse {
+            explicit_competitors,
+            ..
+        } = &mut manifest.rust_external_reexports[0]
+        {
+            explicit_competitors[0] = "x".repeat(16 * 1024 + 1);
+        }
+        let bytes = crate::analyzer::semantic_model::artifact::canonical_json(&manifest).unwrap();
+        let error = crate::analyzer::semantic_model::artifact::decode_manifest_with_census(
+            &bytes,
+            &crate::analyzer::semantic_model::artifact::DecodeLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::analyzer::semantic_model::artifact::ArtifactError::InvalidDescriptor(_)
+        ));
+        manifest.rust_external_reexports.clear();
+        manifest.version = "x".repeat(16 * 1024 + 1);
+        let ordinary = crate::analyzer::semantic_model::artifact::decode_manifest_with_census(
+            &crate::analyzer::semantic_model::artifact::canonical_json(&manifest).unwrap(),
+            &crate::analyzer::semantic_model::artifact::DecodeLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            crate::analyzer::semantic_model::artifact::ArtifactError::InvalidDescriptor(_)
+        ));
+    }
+
+    #[test]
+    fn nested_fenced_completeness_requires_schema_27() {
+        let mut pack = native_pack(serde_json::json!([]));
+        let fact = &mut pack.shards[0].deferred_yields.as_mut().unwrap().yields[0];
+        fact.coverage = Some(Completeness::Fenced);
+        let limits = ValidationLimits {
+            max_shards: 100,
+            max_records_per_shard: 1000,
+            max_records_per_pack: 1000,
+            max_text_bytes: 10000,
+            max_depth: 64,
+        };
+        assert!(validate_pack(&pack, limits).iter().any(|diagnostic| {
+            diagnostic.code == "pack.fenced_completeness_schema_version"
+                && diagnostic.path.ends_with(".coverage")
+        }));
     }
 
     #[test]

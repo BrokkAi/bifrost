@@ -1453,6 +1453,7 @@ fn single_return_class(
             class_definition(ctx, &values[0])
         }
         ReceiverAnalysisOutcome::Precise(_)
+        | ReceiverAnalysisOutcome::Incomplete { .. }
         | ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. }

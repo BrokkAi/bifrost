@@ -245,8 +245,9 @@ separate in-memory path.
 
 C# membership comes from the MSBuild configuration declared in the workspace,
 including in-tree assignments and SDK defaults. Unacquired package imports
-remain inventory obligations. Build-invocation overrides, such as command-line
-`/p:` changes to SDK-defaulted base paths, are not modeled.
+remain inventory obligations. Build-invocation properties supplied by command-line
+`/p:` overrides or environment variables are not modeled, including values read
+before their first in-tree assignment and changes to SDK-defaulted base paths.
 
 Stack graphs are purely syntactic. They need no build configuration, which
 suits a code host that cannot run each project's build. Bifrost runs inside the
@@ -650,6 +651,254 @@ Each language's store support supplies its precedence rules. Shared lowering
 assembles scope-choice steps; each language classifies its bindings into the
 choices at each scope level.
 
+### Open heads in qualified JVM names
+
+The first segment of a qualified name is its *head*. Java cannot always decide
+what that head names. In an expression, a simple name may name a variable
+before it names a type or package (JLS 6.5.2). In a type context, it may name a
+type before it names a package (JLS 6.5.5.2). For example, a missing superclass
+may declare a field or member type with the head's name. A route that treats
+the head as a package may find a later member, but that result cannot close the
+head's open lexical choice. Every continuation of that head keeps the choice
+open, whether it uses a package, source declaration, generated token or other
+route (#9002).
+
+A *lexical-choice record* identifies one source row that keeps such a choice
+open. JVM lowering creates records only for an authored-parent hierarchy gap,
+an open wildcard-import destination, or a structured import gap. Each record
+names its source row, reason and owner or import site, along with its position
+and precedence. Records belong to path occurrences: composition appends them
+in order, and neither composition nor answer selection merges equal records.
+The records of each surviving path remain separate. They are stored in that
+path's persisted body.
+
+Settlement requires proof for an explicitly addressed occurrence. Java replay
+can settle a hierarchy record when it proves that occurrence's lookup closed
+and empty, or when a transfer moves its gap to at least one selected owner. A
+transfer that only carries the unresolved gap settles nothing. An import record
+settles when a proof for that exact import site or binder closes or indexes its
+destination (#7789). A matching reason ID, name, or disappearing completion
+atom is never proof. Other occurrences, including equal records on sibling
+paths, stay open.
+
+Each answer reports whether its record coverage is *Known* or *Unknown*. Known
+contains one record sequence per surviving path and may be empty only after
+the producer has established that coverage. Completed producers carry Known
+from their actual source answer or path. Unknown carries typed failure atoms;
+it never becomes Known with an empty sequence by default. Only those failure
+atoms are protected when coverage is Unknown.
+
+The producer records each reference's own *prefix* on the reference's site
+row, so a continuation finds its prefix with the seed it already reads. The
+value has three states: a proved prefix (the reference that heads this
+qualified name), proved none, or unpublished. The producer decides it from
+structure:
+
+- The reference's root fact decides when it exists. Each reference has one
+  canonical root fact; two facts are never merged.
+- A reference with no qualifier, whose lexical lookup is not suppressed, has
+  no prefix of its own. It can still be another reference's prefix.
+- A qualified reference whose qualifier reaches it only through a typed slot
+  has no prefix of its own. Examples are the receiver of a call, the receiver
+  of a method reference, a switch label resolved in its selector's type, and a
+  constructed type. This holds only when the reference has no root fact or
+  root path of its own and the slot's answer carries the qualifier's open
+  reasons. A qualifier that is a lexical chain this reference does not own
+  qualifies in the same way: each chain segment is its own reference, and the
+  chain's last segment feeds this reference's slot.
+- In every other case the prefix is unpublished. Unpublished is never read as
+  "no prefix".
+
+Every demanded reference gets a prefix state before any step reads it,
+including on memo replay. The state comes from the reference's own seed: a
+non-JVM reference has no JVM prefix coverage, and a JVM reference takes the
+three-state value. A root that is not a reference, such as a definition
+queried for its type, also has no prefix coverage. Seeds are read once per
+operation and shared by the steps that need them.
+
+A continuation with a proved prefix depends on the prefix's answer. This is a
+read-only dependency, not an import of the prefix's closed scope. If the
+prefix's answer is not yet available, the continuation's publication waits.
+The continuation protects the prefix's lexical reasons, or the prefix's typed
+failure atoms when its coverage is Unknown, in its own completion and
+witnesses. A JVM reference whose own prefix is unpublished is still evaluated
+normally; its answer keeps its targets and is marked Incomplete with a
+protected atom for that reference. A missing seed, a missing dependency, a
+structural cycle, a read error and cancellation keep their existing refusal
+paths, so they fail closed.
+
+Protected reasons cannot be adopted as conditional positives or stripped by an
+obligation lift, and they are re-applied after route and provider discharge.
+Independent pending obligations are still published. The adoption lift runs on
+the same references as before #9002, so this rule does not add
+conditional-positive adoption under #7869. The order of later adoption stages
+is tracked in #9248.
+
+### External JVM owner targets
+
+A Java type reference can name a type declared outside the workspace. Its
+*owner* is one of three kinds: a compiler root (provider `jvm-intrinsic`), an
+indexed declaration (a provider whose type inventory is complete, such as an
+installed JDK pack), or a model-declared type (a semantic pack declares the
+type, and its members come only from the model). All three use one
+binding-target shape, the owner's canonical semantic ID over its provider and
+FQN. One rule decides the kind, for admission and for rendering alike
+(`jvm_external_nominal_authority`) (#8500).
+
+An owner target is identity evidence, not completion evidence. It never makes
+an answer Complete by itself, and it retires only the reasons its own route
+proves. It never retires another owner's obligations. The readers that decide
+retirement, and the type-identity slot path, count an answer whose only
+targets are external owners as targetless. Until they read certified owners,
+provider claims keep feeding them. Moving them is #9965. It needs #9964 first,
+because every one of these readers is also reached by on-demand winners.
+
+An owner is published only for one exact reference, from selected-route
+evidence, during final refinement. There are two routes. A package route
+publishes when its external-owner outcome survived route reduction (#8500).
+An explicit single-type import publishes when it won the reference's
+simple-name decision (#9783). That decision's record carries a per-reference
+proposal. Final refinement compares the proposal with the reference's current
+record, lookup and blob, and validates its certificate. It then removes only
+two kinds of reason: the import's own unsupported-route reason, and the
+unsupported-route reasons of on-demand imports of the same simple name in the
+same compilation unit. A single-type import shadows those (JLS 6.4.1). Each
+reason is matched by its persisted site and origin, never by its ID or by the
+path that carries it. Then the same owner must be admitted, or nothing
+changes. A reference without a proposal keeps its previous answer. Existing
+source or member targets always win. On-demand and implicit `java.lang` winners
+are not published yet (#9964): they also need proof that no provider declares a
+same-package type of that name, which the simple-name decision does not read,
+and the implicit `java.lang` import has no import site whose reason it could
+retire.
+
+Import contexts are assembled lazily, per name, so a selection record can be
+written after its reference already has an answer. The record is therefore a
+typed input of the evaluator: a change wakes the reference, and a round that
+woke a reader is not stable. A record that conflicts with an earlier one
+stays conflicted for the rest of the operation.
+
+Definition lookup renders each owner kind truthfully:
+
+- a canonical language root renders `NoDefinition` with
+  `intrinsic_type_reference`; other compiler-known owners, such as
+  `java.lang.Enum`, keep the intrinsic projection;
+- an indexed owner renders `UnresolvableImportBoundary` with
+  `indexed_external_declaration_no_source`;
+- a model-declared owner renders `UnresolvableImportBoundary` with
+  `model_declared_external_declaration_no_source`, which carries the
+  external-boundary claim. `java_imported_type_external_boundary` appears only
+  when no certified owner exists.
+
+An intrinsic definition is built only for provider `jvm-intrinsic`. Canonical
+root rendering is narrower than the producer's compiler-root authority: it also
+requires the root to be in the reference language's root inventory.
+
+Compiler-origin parents, such as the implicit `Object`, `Any` or `AnyRef`
+superclass and Java's synthetic `Enum`, `Record` and `Annotation` parents, are
+not import winners, so neither route publishes them. The hierarchy maps them to
+their intrinsic owner through a fallback (#8427). The fallback stays until
+certified targets for compiler roots (#8500) give the same owner, route,
+completion and parent mapping in every control (#9966); a producer existing is
+not enough.
+
+Owner targets do not make "find usages of an external type" available. A
+reverse edge is Proven only when its route proof holds and its answer has no
+outstanding query obligations. Go keeps its binder target; a Go owner target
+would need its own admission design.
+
+### Java lookup dependency gaps
+
+Java records external-index gaps on each lookup, rather than when the shared
+index is built. The default retains every gap, including on an empty external
+surface. Only an unshadowed non-static single-type import of a `java.*` JDK-pack
+type, and declaration lookups derived from its proof, may omit gaps attributed
+to dependency artifacts. JDK and unattributed gaps remain. Kotlin and Scala
+retain whole-index replay at read time, regardless of which language built the
+shared index (#10470).
+
+The combined workspace and external ladder follows Java precedence: lexical
+and enclosing member types, single-type imports, same-package types, then
+on-demand imports together with implicit `java.lang`. Expression qualifiers
+first consider variables; dotted names bind their first segment before trying
+a package-qualified reading. A bound import miss or ambiguity cannot fall
+through to a lower tier. Fully qualified, same-package, on-demand, implicit
+`java.lang` and static-import lookups retain all gaps. A missing jar can split
+a non-JDK package and supply a same-package type, even when the eventual hit
+is in `java.lang`; a present dependency jar also cannot prove that an earlier
+missing jar would not supply a different definition.
+
+The reduced rule requires a checked scope and owner witness. `UnshadowedScope`
+checks type parameters, enclosing supertype closures, member types and static
+imports that could obscure the name. `ExplicitImportHit` carries the selected
+import's result; only a qualifying JDK hit produces `UnshadowedJdkOwner`.
+Member and member-type declarations retain that proof. Direct declared JDK
+signature types may derive it, but substituted type arguments and variables
+need their own proof. Canonical model formal and return types use canonical
+declaration lookup, including artifact precedence, rather than the use-site
+ladder: a local same-package type must never capture a model's formal type.
+Only a matching JDK-pack signature hit receives the reduced rule. The safe
+package set is `java.*`, assuming no platform override is visible in the build
+model; modeling unseen overrides remains (#10492).
+
+Declaration proof does not close a virtual dispatch family. Those computations
+retain all gaps and report an independent incomplete boundary when a workspace
+supertype cannot be resolved: it might hide an override through an intermediate
+class. This is the interim rule pending (#10497).
+
+The request owner admits an incomplete dependency selection only when its
+failure list is exactly `[UnresolvedCoordinates]` and the JDK selection is
+complete and certified. Other causes and non-Present membership rows stay
+open. Lookups use the union of the admitted owner's coordinates and the
+retained index's gaps, deduplicated by coordinate; discovery can observe a jar
+removed after index construction. Admitted incomplete selections still refuse
+reuse. The dispatch behavior identity covers the full attributed diagnostic
+set, including coordinates, while `JvmExternalGaps` is a policy-unit read of
+the retained index's gap identity. These protect different reuse paths.
+Request-owner admission landed dormant before the production switch in
+(#9559): step 3d must retain
+this admission rule rather than broaden it to arbitrary discovery failures.
+
+The post-landing EC2 confirmation on 2026-11-09 kept the real-repository
+selector partial because a test-file candidate's `String` lookup traversed
+the same-package tier with jars missing; completeness at answer granularity is
+tracked in (#10985), and lookup-site
+diagnostics in (#10984). Narrowing
+the on-demand tier to record no dependency gaps when every on-demand package is
+in `java.*` would change nothing: that tier is reached only after a same-package
+miss, which has already recorded every gap (#10986, closed).
+
+### Scala source-artifact owners
+
+A Scala source JAR publishes one JVM owner per top-level type name. A class or
+trait and its companion `object` share that owner, and the object's terms are
+the owner's static members, as scalac's static forwarders present them on the
+JVM. An object's inherited terms are its own, so the producer publishes them as
+static forwarders too, keeping the declaring member's signature and locator
+(#9995). It does so only when every base of the object's linearization is a
+declaration of the same artifact, without type parameters, whose terms are
+enumerated; non-API bases such as `private[process] trait ProcessImpl` are read
+for this but not published.
+
+The owner's inventory claims complete terms only when every `def`, `val` and
+constructor of both sides was emitted with a signature (non-API members as
+additional members). Case classes, enums, `var`s, nested objects, implicit
+classes, `export` clauses and nested owners synthesize or hide terms the
+producer does not publish, so they leave the owner open. Supertypes are the
+class side's parents resolved to qualified names, following the artifact's
+parameterless type aliases (`scala.Serializable`), plus `java.lang.Object`.
+Signature types are qualified the same way, through the file's package
+clauses, imports and the implicit `Predef._` and `scala._` imports; a name a
+nested template may shadow keeps its spelling.
+
+Scala `T(args)` on a selected external owner reads that owner as its own
+singleton root, so the owner's static `apply` family and inventory decide the
+call. Applicability compares Scala's intrinsic `String` as the selected
+`java.lang.String`. A formal whose head is exact but whose type arguments are
+not (`Seq[String]` from an external signature) can refute a conversion by its
+head and never prove one. A candidate rejected by arity or refutation does not
+pass its own signature gaps to the call; the call's argument gaps stay.
+
 ### Typed member lookup
 
 Stack graphs handle type-directed lookups, such as a method call on a value, by
@@ -736,6 +985,24 @@ A refused candidate's witness leaves the answer, so the check reads its route
 before the witness is dropped, and the answer keeps its member owner. The
 call's own applicability obligation stays open while the verdicts prove no
 unique winner; it describes the selection, not a missing candidate.
+
+Go method satisfaction and overlapping interface methods compare signatures
+structurally, leaf by leaf. A leaf that names a type from a semantic model, such
+as a model-declared `io.Reader`, is an external owner, and it counts as equal
+only when the query certifies that owner. The certificate is the demand close
+that selected the type for that exact reference and slot. It counts only while
+it belongs to its relation's current close attempt, and only after that attempt
+finished without cancellation or error. A certificate from an earlier attempt
+never counts, because a repeated close can select a different answer. Each
+occurrence of a repeated type is checked at its own slot before identical
+leaves are merged. An uncertified leaf makes the comparison inconclusive, which
+keeps the selection open instead of claiming a proof. Certificates live for one
+query. Two leaves that spell the same unresolved external name are not equal:
+without a selected declaration they ask the same question, but they do not
+show that the member exists, that it is a type, or which provider declared it.
+A semantic model that declares only some members of a package certifies those
+declarations; it never proves that the package has no other member, and an
+inactive pack certifies nothing (#10106).
 
 Rust inherent implementations can share a nominal head while specializing its
 written type arguments, as in typestate APIs. Candidate selection compares
@@ -876,6 +1143,21 @@ lookup in an in-memory hash table, so the engine batches reads across a whole
 frontier and shares work between the references of one file. In return, memory
 stays bounded on large workspaces, and the stored rows serve every process and
 worktree that opens the cache.
+
+A query, or one file window of a step that runs in file windows, owns one
+selected resolution operation, and every proof nested inside it reuses that
+operation. Resolution helpers that a query reaches take the operation as a
+required argument; only entry points, such as the RQL dispatch session, policy
+unit verification and the definition lookup tools, open one. The operation also
+owns memos of point reads, so that the calls of one file do not repeat the same
+read. A memo may keep a read only when its result cannot change for the
+operation's selection: rows keyed by blob identity, and temporary rows the
+operation fills once when it prepares. A read of a temporary stage table that
+the operation keeps writing is memoized only under that table's write epoch, or
+not at all. A hit records the same read receipt, authority and incompleteness as
+a miss, and a failed, cancelled or incomplete read is never stored. Each memo
+has an entry cap; memos with variable-size values also have an estimated byte
+cap. Each memo is dropped with its operation.
 
 ## Comparison with stack graphs
 

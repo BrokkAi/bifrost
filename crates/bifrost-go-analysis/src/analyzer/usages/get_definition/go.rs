@@ -6,7 +6,6 @@ use brokk_bifrost_analysis::analyzer::semantic::ResolverOwnedExternalCalleeIdent
 use brokk_bifrost_analysis::analyzer::usages::get_definition::*;
 use brokk_bifrost_analysis::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_analysis::analyzer::usages::reference_site::ResolvedReferenceSite;
-use brokk_bifrost_analysis::analyzer::usages::reference_site::smallest_named_node_covering;
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerQueryScope, CodeUnit, DeclarationKind, IAnalyzer, ImportAnalysisProvider, ImportInfo,
@@ -21,7 +20,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use crate::analyzer::GoAnalyzer;
-use crate::analyzer::go::type_identity_proof::go_result_type_node;
+use crate::analyzer::go::type_identity_proof::go_result_type_nodes_with_scope;
 
 use brokk_bifrost_go::references::GoSelectorDescriptor;
 
@@ -537,10 +536,16 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
                 },
                 || {},
             );
-        let charged = session.charge_work(answer.work());
+        let charged = session.charge_work(&answer.work());
         let value = match answer {
             BoundedResolution::Complete { value, .. } => value,
             BoundedResolution::Cancelled { .. } => return None,
+            BoundedResolution::Unavailable { reason, .. } => {
+                self.analyzer.record_query_incomplete(
+                    QueryReadIncomplete::SemanticEvidenceUnavailable(reason.into()),
+                );
+                return None;
+            }
             BoundedResolution::Exceeded { limit, .. } => {
                 session.mark_exceeded(limit);
                 if using_nested_session {
@@ -643,7 +648,7 @@ pub(crate) fn parse_go_tree_for_proof(analyzer: &dyn IAnalyzer, source: &str) ->
     tree
 }
 
-/// Recover the type of result `result_ordinal` of a call through a function
+/// Recover the complete result inventory of a call through a function
 /// value whose callee is a plain identifier bound to an explicit function type.
 ///
 /// The call resolver may leave a function-valued binding without dispatch
@@ -652,29 +657,48 @@ pub(crate) fn parse_go_tree_for_proof(analyzer: &dyn IAnalyzer, source: &str) ->
 /// binding declares an anonymous `func(...)` type or names a function type
 /// declaration, and the requested result is the unshadowed predeclared `error`.
 /// Every other callee abstains.
-pub(crate) fn go_function_value_result_type_identity(
+pub(crate) fn go_function_value_result_type_identities(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     range: Range,
-    result_ordinal: usize,
     cancellation: &CancellationToken,
-) -> Option<StructuredTypeIdentity> {
+) -> Option<Vec<Option<StructuredTypeIdentity>>> {
     if file.declaration_language() != Language::Go || range.start_byte >= range.end_byte {
         return None;
     }
+    if !go_application_proof_step(analyzer, cancellation) {
+        return None;
+    }
     let source = analyzer.indexed_source(file)?;
+    if source.len() > 1024 * 1024 {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            "Go application type source exceeds proof bound".into(),
+        ));
+        return None;
+    }
     let tree = parse_go_tree_for_proof(analyzer, &source)?;
     let root = tree.root_node();
-    let mut node = smallest_named_node_covering(root, range.start_byte, range.end_byte)?;
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(cancellation));
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let mut step = || go_application_proof_step(analyzer, cancellation) && support.scope_step();
+    let mut node = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        root, range.start_byte, range.end_byte, &mut step,
+    )?;
     while node.kind() != "call_expression" {
+        if !step() {
+            return None;
+        }
         node = node.parent()?;
     }
-    if node.has_error() {
+    if node.has_error()
+        || node.start_byte() != range.start_byte
+        || node.end_byte() != range.end_byte
+    {
         return None;
     }
     let function = node.child_by_field_name("function")?;
-    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
     if function.kind() == "identifier"
         && let Some(GoLocalBinding::Type(type_node)) = go_nearest_visible_binding_with_evaluation(
             &support,
@@ -685,108 +709,287 @@ pub(crate) fn go_function_value_result_type_identity(
             GoLexicalEvaluation::ordinary(),
         )
     {
-        if type_node.kind() != "function_type" {
-            let declaration = type_node.parent()?;
-            let mut cursor = declaration.walk();
-            let mut names = declaration.named_children(&mut cursor).filter(|child| {
-                child.kind() == "identifier"
-                    && child.end_byte() <= type_node.start_byte()
-                    && go_node_text(*child, &source) == go_node_text(function, &source)
-            });
-            let binding = names.next()?;
-            if names.next().is_some() {
+        let declaration = type_node.parent()?;
+        let mut binding = None;
+        let mut cursor = declaration.walk();
+        for child in declaration.named_children(&mut cursor) {
+            if !support.scope_step() {
                 return None;
             }
-            let selected =
-                match crate::analyzer::go::type_identity_proof::go_explicit_binding_declared_type(
-                    analyzer,
-                    file,
-                    &source,
-                    Range {
-                        start_byte: binding.start_byte(),
-                        end_byte: binding.end_byte(),
-                        start_line: binding.start_position().row,
-                        end_line: binding.end_position().row,
-                    },
-                    cancellation,
-                ) {
-                    BoundedResolution::Complete { value, .. } => value.nominal?,
-                    BoundedResolution::Exceeded { limit, .. } => {
-                        analyzer.record_query_incomplete(
-                            QueryReadIncomplete::SemanticEvidenceUnavailable(
-                                format!(
-                                    "Go explicit binding type resolution budget exceeded: {limit:?}"
-                                )
-                                .into(),
-                            ),
-                        );
-                        return None;
-                    }
-                    BoundedResolution::Cancelled { .. } => {
-                        analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
-                        return None;
-                    }
-                };
-            let unit = &selected;
-            let type_source = analyzer.indexed_source(unit.source())?;
-            let type_tree = parse_go_tree_for_proof(analyzer, &type_source)?;
-            let type_root = type_tree.root_node();
-            let function_type =
-                go_named_function_type_node(type_root, &type_source, unit.terminal_name())?;
-            if function_type.has_error() {
-                return None;
-            }
-            let result_type = go_result_type_node(function_type, result_ordinal)?;
-            if go_node_text(result_type, &type_source).trim() != "error"
-                || go_name_shadowed_at_with_scope(
-                    type_root,
-                    &type_source,
-                    result_type.start_byte(),
-                    "error",
-                    || support.scope_step(),
-                ) != Some(false)
+            if child.kind() == "identifier"
+                && child.end_byte() <= type_node.start_byte()
+                && go_node_text(child, &source) == go_node_text(function, &source)
+                && binding.replace(child).is_some()
             {
                 return None;
             }
-            return brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
-                result_type,
-                &type_source,
-                || support.scope_step(),
-            );
         }
-        let result_type = go_result_type_node(type_node, result_ordinal)?;
-        if go_node_text(result_type, &source).trim() == "error"
-            && go_name_shadowed_at_with_scope(
-                root,
-                &source,
-                result_type.start_byte(),
-                "error",
-                || support.scope_step(),
-            ) == Some(false)
-        {
-            return brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
-                result_type,
-                &source,
-                || support.scope_step(),
-            );
-        }
-        return None;
+        return go_declared_application_result_identities(
+            analyzer,
+            file,
+            &source,
+            root,
+            type_node,
+            binding?,
+            cancellation,
+            &support,
+        );
     }
     None
 }
 
+// Both recipients resolve the written application type from their binding;
+// the selected body is evidence of callable identity, not a type substitute.
+#[allow(clippy::too_many_arguments)]
+fn go_declared_application_result_identities(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    type_node: Node<'_>,
+    binding: Node<'_>,
+    cancellation: &CancellationToken,
+    support: &dyn GoDefinitionProvider,
+) -> Option<Vec<Option<StructuredTypeIdentity>>> {
+    if !go_application_proof_step(analyzer, cancellation) || !support.scope_step() {
+        return None;
+    }
+    if type_node.kind() == "function_type" {
+        return go_application_result_identities(
+            analyzer,
+            file,
+            cancellation,
+            type_node,
+            root,
+            source,
+            support,
+        );
+    }
+    let selected =
+        match crate::analyzer::go::type_identity_proof::go_explicit_binding_application_type(
+            analyzer,
+            file,
+            source,
+            Range {
+                start_byte: binding.start_byte(),
+                end_byte: binding.end_byte(),
+                start_line: binding.start_position().row + 1,
+                end_line: binding.end_position().row + 1,
+            },
+            cancellation,
+        ) {
+            BoundedResolution::Complete { value, .. } => value,
+            BoundedResolution::Exceeded { limit, .. } => {
+                analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                    format!("Go explicit binding type resolution budget exceeded: {limit:?}")
+                        .into(),
+                ));
+                return None;
+            }
+            BoundedResolution::Cancelled { .. } => {
+                analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+                return None;
+            }
+            BoundedResolution::Unavailable { reason, .. } => {
+                analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                    reason.into(),
+                ));
+                return None;
+            }
+        };
+    let nominal = selected.nominal?;
+    let Some(receipt) = selected.application_source else {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            "Go named application type lacks a selected declaration source receipt".into(),
+        ));
+        return None;
+    };
+    let type_source = receipt.source;
+    let type_tree = parse_go_tree_for_proof(analyzer, &type_source)?;
+    let type_root = type_tree.root_node();
+    let mut step = || go_application_proof_step(analyzer, cancellation) && support.scope_step();
+    let function_type = go_named_function_type_node(type_root, receipt.declaration, &mut step)?;
+    if function_type.has_error() {
+        return None;
+    }
+    go_application_result_identities(
+        analyzer,
+        nominal.source(),
+        cancellation,
+        function_type,
+        type_root,
+        &type_source,
+        support,
+    )
+}
+
+fn go_application_proof_step(analyzer: &dyn IAnalyzer, cancellation: &CancellationToken) -> bool {
+    if cancellation.is_cancelled() {
+        analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+        false
+    } else {
+        true
+    }
+}
+
+/// Read the application type from the certified source and lexical declaration.
+/// The declaration range is authoritative; this path never searches for a
+/// replacement binder by spelling.
+pub(crate) fn go_bound_function_value_result_type_identities(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    exact_source: &str,
+    range: Range,
+    binding: &LexicalDefinition,
+    callable_range: Range,
+    cancellation: &CancellationToken,
+) -> Option<Vec<Option<StructuredTypeIdentity>>> {
+    if file.declaration_language() != Language::Go
+        || range.start_byte >= range.end_byte
+        || binding
+            .source_file
+            .as_ref()
+            .is_some_and(|source| source != file)
+        || !go_application_proof_step(analyzer, cancellation)
+    {
+        return None;
+    }
+    let source = analyzer.indexed_source(file)?;
+    if source != exact_source {
+        return None;
+    }
+    if source.len() > 1024 * 1024 {
+        analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+            "Go application type source exceeds proof bound".into(),
+        ));
+        return None;
+    }
+    let tree = parse_go_tree_for_proof(analyzer, &source)?;
+    let root = tree.root_node();
+    let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
+    let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(cancellation));
+    let support =
+        AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
+    let mut step = || go_application_proof_step(analyzer, cancellation) && support.scope_step();
+    let mut call = brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering_with_scope(
+        root, range.start_byte, range.end_byte, &mut step,
+    )?;
+    while call.kind() != "call_expression" {
+        if !step() {
+            return None;
+        }
+        call = call.parent()?;
+    }
+    let function = call.child_by_field_name("function")?;
+    if call.has_error()
+        || call.start_byte() != range.start_byte
+        || call.end_byte() != range.end_byte
+        || function.kind() != "identifier"
+        || go_node_text(function, &source) != binding.identifier
+    {
+        return None;
+    }
+    let declaration = brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range_with_step(
+        root,
+        &binding.declaration_range,
+        &mut step,
+    )?;
+    let binder = brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range_with_step(
+        declaration,
+        &binding.name_range,
+        &mut step,
+    )?;
+    if binder.kind() != "identifier"
+        || go_node_text(binder, &source) != binding.identifier
+        || binder.end_byte() > function.start_byte()
+    {
+        return None;
+    }
+    let initializer = brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range_with_step(
+        declaration,
+        &callable_range,
+        &mut step,
+    )?;
+    if initializer.kind() != "func_literal" {
+        return None;
+    }
+    let mut owner = binder.parent()?;
+    while owner.kind() != "var_spec" {
+        if !step() || owner == declaration {
+            return None;
+        }
+        owner = owner.parent()?;
+    }
+    if owner.start_byte() < declaration.start_byte() || owner.end_byte() > declaration.end_byte() {
+        return None;
+    }
+    let type_node = owner.child_by_field_name("type")?;
+    go_declared_application_result_identities(
+        analyzer,
+        file,
+        &source,
+        root,
+        type_node,
+        binder,
+        cancellation,
+        &support,
+    )
+}
+
+fn go_application_result_identities(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: &CancellationToken,
+    function_type: Node<'_>,
+    root: Node<'_>,
+    source: &str,
+    support: &dyn GoDefinitionProvider,
+) -> Option<Vec<Option<StructuredTypeIdentity>>> {
+    let mut step = || go_application_proof_step(analyzer, cancellation) && support.scope_step();
+    let result_types = go_result_type_nodes_with_scope(function_type, &mut step)?;
+    let mut identities = Vec::with_capacity(result_types.len());
+    for result_type in result_types {
+        if !go_application_proof_step(analyzer, cancellation) || !support.scope_step() {
+            return None;
+        }
+        let identity = if go_node_text(result_type, source).trim() == "error"
+            && crate::analyzer::go::type_identity_proof::go_predeclared_type_name_is_exact_bounded(
+                analyzer,
+                file,
+                source,
+                root,
+                result_type,
+                "error",
+                || go_application_proof_step(analyzer, cancellation) && support.scope_step(),
+            ) == Some(true)
+        {
+            brokk_bifrost_go::declarations::go_structured_type_identity_bounded(
+                result_type,
+                source,
+                || go_application_proof_step(analyzer, cancellation) && support.scope_step(),
+            )
+        } else {
+            None
+        };
+        identities.push(identity);
+    }
+    go_application_proof_step(analyzer, cancellation).then_some(identities)
+}
+
 fn go_named_function_type_node<'tree>(
     root: Node<'tree>,
-    source: &str,
-    name: &str,
+    declaration: Range,
+    scope_step: &mut dyn FnMut() -> bool,
 ) -> Option<Node<'tree>> {
     let mut stack = vec![root];
     let mut found = None;
     while let Some(node) = stack.pop() {
+        if !scope_step() {
+            return None;
+        }
         if node.kind() == "type_spec"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|candidate| go_node_text(candidate, source).trim() == name)
+            && node.start_byte() == declaration.start_byte
+            && node.end_byte() == declaration.end_byte
         {
             let type_node = node.child_by_field_name("type")?;
             if found.replace(type_node).is_some() {
@@ -794,7 +997,12 @@ fn go_named_function_type_node<'tree>(
             }
         }
         let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        for child in node.named_children(&mut cursor) {
+            if !scope_step() {
+                return None;
+            }
+            stack.push(child);
+        }
     }
     found.filter(|type_node| type_node.kind() == "function_type")
 }
@@ -2577,6 +2785,151 @@ pub fn parameter_binds_by_reference_at_span(
         .map(|mode| matches!(mode, GoParameterBindingMode::Reference))
 }
 
+/// Identity of a direct pointer formal whose pointee has one ordinary,
+/// package-scoped declaration in this exact source file. Named pointer types,
+/// aliases, generic parameters and imported pointees have no proof here.
+pub(crate) fn direct_pointer_formal_pointee_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<(usize, usize)> {
+    if language_for_file(file) != Language::Go || start >= end || end > source.len() {
+        return None;
+    }
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let callable = go_callable_at_span(root, start, end)?;
+    if callable.kind() != "function_declaration"
+        || callable.child_by_field_name("type_parameters").is_some()
+    {
+        return None;
+    }
+    let pointer = go_parameter_type_node_at_ordinal(callable, ordinal)?;
+    if pointer.kind() != "pointer_type" || pointer.has_error() {
+        return None;
+    }
+    let pointee = pointer.named_child(0)?;
+    if pointee.kind() != "type_identifier" || pointee.has_error() {
+        return None;
+    }
+    let declaration =
+        go_same_file_named_type_declaration(root, go_node_text(pointee, source), source)?;
+    Some((declaration.start_byte(), declaration.end_byte()))
+}
+
+/// Exact named formal and selected import qualifier for a direct imported
+/// pointer. The native reader resolves the qualifier; syntax only selects it.
+pub(crate) fn direct_imported_pointer_formal_at_span(
+    root: Node<'_>,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<(Range, Range)> {
+    let callable = go_callable_at_span(root, start, end)?;
+    if callable.kind() != "function_declaration"
+        || callable.has_error()
+        || callable.child_by_field_name("type_parameters").is_some()
+    {
+        return None;
+    }
+    let (Some(binding), pointer) =
+        go_parameter_binding_and_type_node_at_ordinal(callable, ordinal)?
+    else {
+        return None;
+    };
+    if pointer.kind() != "pointer_type" || pointer.has_error() {
+        return None;
+    }
+    let pointee = pointer.named_child(0)?;
+    if pointee.kind() != "qualified_type" || pointee.has_error() {
+        return None;
+    }
+    let package = pointee.child_by_field_name("package")?;
+    let _name = pointee.child_by_field_name("name")?;
+    let range = |node: Node<'_>| Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    };
+    Some((range(binding), range(package)))
+}
+
+/// The direct result annotation's exact same-file pointee declaration.
+pub(crate) fn direct_pointer_result_pointee_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+    ordinal: usize,
+) -> Option<(usize, usize)> {
+    if language_for_file(file) != Language::Go || start >= end || end > source.len() {
+        return None;
+    }
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let callable = go_callable_at_span(root, start, end)?;
+    if !matches!(
+        callable.kind(),
+        "function_declaration" | "method_declaration"
+    ) || callable.child_by_field_name("type_parameters").is_some()
+    {
+        return None;
+    }
+    let pointer = go_result_type_node_at_ordinal(callable, ordinal)?;
+    if pointer.kind() != "pointer_type" || pointer.has_error() {
+        return None;
+    }
+    let pointee = pointer.named_child(0)?;
+    if pointee.kind() != "type_identifier" || pointee.has_error() {
+        return None;
+    }
+    let declaration =
+        go_same_file_named_type_declaration(root, go_node_text(pointee, source), source)?;
+    Some((declaration.start_byte(), declaration.end_byte()))
+}
+
+pub(crate) fn direct_pointer_receiver_pointee_at_span(
+    file: &ProjectFile,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if language_for_file(file) != Language::Go || start >= end || end > source.len() {
+        return None;
+    }
+    let tree = parse_tree_for_language(file, Language::Go, source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let callable = go_callable_at_span(root, start, end)?;
+    if callable.kind() != "method_declaration"
+        || callable.child_by_field_name("type_parameters").is_some()
+    {
+        return None;
+    }
+    let pointer = brokk_bifrost_go::declarations::go_method_receiver_type_node(callable)?;
+    if pointer.kind() != "pointer_type" || pointer.has_error() {
+        return None;
+    }
+    let pointee = pointer.named_child(0)?;
+    if pointee.kind() != "type_identifier" || pointee.has_error() {
+        return None;
+    }
+    let declaration =
+        go_same_file_named_type_declaration(root, go_node_text(pointee, source), source)?;
+    Some((declaration.start_byte(), declaration.end_byte()))
+}
+
 /// Whether an exact Go callable parameter copies a descriptor that preserves
 /// backing storage. Inline aggregate copies and pointers use their separate
 /// identity domains; named or unavailable types remain unknown.
@@ -2895,6 +3248,23 @@ fn go_parameter_list_type_node_at_ordinal(
     parameter_list: Node<'_>,
     ordinal: usize,
 ) -> Option<Node<'_>> {
+    go_parameter_list_binding_and_type_node_at_ordinal(parameter_list, ordinal).map(|(_, ty)| ty)
+}
+
+fn go_parameter_binding_and_type_node_at_ordinal(
+    callable: Node<'_>,
+    ordinal: usize,
+) -> Option<(Option<Node<'_>>, Node<'_>)> {
+    go_parameter_list_binding_and_type_node_at_ordinal(
+        callable.child_by_field_name("parameters")?,
+        ordinal,
+    )
+}
+
+fn go_parameter_list_binding_and_type_node_at_ordinal(
+    parameter_list: Node<'_>,
+    ordinal: usize,
+) -> Option<(Option<Node<'_>>, Node<'_>)> {
     if parameter_list.kind() != "parameter_list" {
         return None;
     }
@@ -2918,7 +3288,11 @@ fn go_parameter_list_type_node_at_ordinal(
             if declaration.kind() == "variadic_parameter_declaration" {
                 return None;
             }
-            return Some(type_node);
+            let mut names = declaration.walk();
+            let binding = declaration
+                .children_by_field_name("name", &mut names)
+                .nth(ordinal - next_ordinal);
+            return Some((binding, type_node));
         }
         next_ordinal = end_ordinal;
     }
@@ -4134,6 +4508,13 @@ pub(crate) fn resolve_definition_dispatch<'a>(
             BoundedResolution::Cancelled { .. } => {
                 cancelled("Go definition resolution was cancelled")
             }
+            BoundedResolution::Unavailable { reason, .. } => {
+                brokk_bifrost_analysis::analyzer::native_points::unavailable_definition(
+                    site,
+                    "native_input_unavailable",
+                    reason.into(),
+                )
+            }
         }
     };
     std::ops::ControlFlow::Continue(DefinitionResolution {
@@ -4145,6 +4526,9 @@ pub(crate) fn resolve_definition_dispatch<'a>(
 
 pub(crate) struct GoDefinitionBatchOperation<'a> {
     analyzer: &'a dyn IAnalyzer,
+    selected_snapshot: Option<
+        Option<Arc<brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+    >,
     request: Option<Box<crate::analyzer::go::native_points::GoNativePointRequest<'a>>>,
     file: Option<ProjectFile>,
     open_reads: Option<brokk_bifrost_analysis::analyzer::usages::common::QueryMemoReads>,
@@ -4158,6 +4542,7 @@ pub(crate) fn definition_batch_resolver<'a>(
 ) -> Box<dyn DefinitionBatchResolver<'a> + 'a> {
     Box::new(GoDefinitionBatchOperation {
         analyzer,
+        selected_snapshot: None,
         request: None,
         file: None,
         open_reads: None,
@@ -4173,6 +4558,32 @@ impl<'a> GoDefinitionBatchOperation<'a> {
         query: brokk_bifrost_analysis::analyzer::languages::BoundedReceiverQuery<'_>,
     ) -> Option<BoundedResolution<crate::analyzer::go::native_points::GoNativeDefinitionResolution>>
     {
+        let _model_scope = if let Some(snapshot) = &self.selected_snapshot {
+            AnalyzerQueryScope::with_compatible_selected_model_snapshot(
+                self.analyzer,
+                snapshot.clone(),
+            )
+        } else {
+            let scope = AnalyzerQueryScope::pin_selected_model_snapshot(self.analyzer);
+            if scope.is_ok() {
+                self.selected_snapshot = Some(crate::analyzer::go::selected_go_model_snapshot(
+                    self.analyzer,
+                ));
+            }
+            scope
+        };
+        let _model_scope = match _model_scope {
+            Ok(scope) => scope,
+            Err(_) => {
+                return Some(
+                    crate::analyzer::go::native_points::unavailable_go_definition_open(
+                        query,
+                        "native_model_authority_stale",
+                        "Go batch request conflicts with the outer model selection".into(),
+                    ),
+                );
+            }
+        };
         if self.disabled {
             return None;
         }
@@ -4246,7 +4657,7 @@ impl<'a> GoDefinitionBatchOperation<'a> {
         request.begin_receiver_query(query.file);
         let result = request.resolve_definition_with_evidence(query);
         let release = request.reader_excludes_store_access()
-            || !matches!(&result, BoundedResolution::Complete { value, .. } if !value.outcome.diagnostics.iter().any(|diagnostic| matches!(diagnostic.kind.as_str(), "native_stale" | "native_store_error" | "native_unavailable")));
+            || !matches!(&result, BoundedResolution::Complete { value, .. } if !value.outcome.diagnostics.iter().any(|diagnostic| brokk_bifrost_analysis::analyzer::usages::common::is_native_operation_failure(&diagnostic.kind)));
         if release {
             self.request = None;
             self.open_reads = None;
@@ -4313,6 +4724,13 @@ pub(crate) fn resolve_definition_call_target_batch(
     source: Arc<str>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<CallTargetLookupOutcome> {
+    let _model_scope = match AnalyzerQueryScope::pin_selected_model_snapshot(analyzer) {
+        Ok(scope) => scope,
+        Err(_) => {
+            analyzer.mark_execution_dependent();
+            return Vec::new();
+        }
+    };
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token());
     context.sources.insert(file.clone(), Ok(source));
@@ -4338,8 +4756,8 @@ pub(crate) fn resolve_definition_call_target_batch(
                 Some(&session),
                 Some(definition_batch.as_mut()),
             );
-            let (resolution, truncated) = match session.finish(resolution) {
-                BoundedResolution::Complete { value, .. } => (value, false),
+            let (resolution, truncated) = match session.finish(()) {
+                BoundedResolution::Complete { .. } => (resolution, false),
                 BoundedResolution::Exceeded { limit, .. } => (
                     exceeded_budget(
                         limit,
@@ -4355,6 +4773,16 @@ pub(crate) fn resolve_definition_call_target_batch(
                     cancelled("Go call-target resolution was cancelled").into(),
                     false,
                 ),
+                BoundedResolution::Unavailable { reason, .. } => {
+                    let mut resolution = resolution;
+                    resolution.outcome.status = brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupStatus::Unavailable;
+                    resolution.outcome.diagnostics.push(brokk_bifrost_analysis::analyzer::usages::get_definition::DefinitionLookupDiagnostic {
+                        claim: None,
+                        kind: "native_input_unavailable".into(),
+                        message: reason.into(),
+                    });
+                    (resolution, false)
+                }
             };
             CallTargetLookupOutcome {
                 truncated,
@@ -4424,6 +4852,7 @@ mod bounded_tests {
 
         let mut batch = GoDefinitionBatchOperation {
             analyzer,
+            selected_snapshot: None,
             request: None,
             file: None,
             open_reads: None,
@@ -6151,9 +6580,19 @@ func NewWorker() Worker { return Worker{} }
             let BoundedResolution::Complete { value, .. } = outcome else {
                 panic!("Go selector lookup should complete: {outcome:#?}");
             };
+            // No active pack supplies `sync.Mutex`, so its member stays open
+            // (#10106) instead of proving absence. Either way the receiver
+            // field must not stand in for the unresolved selector.
             assert_eq!(
-                DefinitionLookupStatus::NoDefinition,
+                DefinitionLookupStatus::Incomplete,
                 value.status,
+                "{value:#?}"
+            );
+            assert!(
+                value
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.kind == "go-external-member-unprovided"),
                 "{value:#?}"
             );
             assert!(value.definitions.is_empty(), "{value:#?}");
@@ -6923,6 +7362,7 @@ func use(table *CacheTable) {
                         max_targets: 16,
                         max_summary_expansions: 4_096,
                         max_scope_nodes: 100_000,
+                        max_hierarchy_order_work: 100_000,
                         max_resolution_rounds: ReceiverAnalysisBudget::default()
                             .max_resolution_rounds,
                         max_hierarchy_order_steps: ReceiverAnalysisBudget::default()

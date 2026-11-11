@@ -22,6 +22,9 @@ mod csharp_extraction_tests {
     use brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAdapter;
 
     #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#7314: retained source gaps caused a full compilation scan per publication"
+    )]
     fn csharp_extent_publication_tracks_edits_and_overlay_inventory() {
         use crate::inline_project::InlineTestProject;
         use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, WorkspaceAnalyzer};
@@ -121,12 +124,15 @@ mod csharp_extraction_tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .unwrap();
         let second = snapshots["csharp"].revision;
         // A building publication for the selected new OID contributes no installed count.
         {
             let conn = store.conn.lock().unwrap();
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
             conn.execute(
                 "INSERT OR IGNORE INTO blobs(blob_oid,lang,generation) VALUES(?1,'csharp',?2)",
                 (oid.to_string(), snapshots["csharp"].generation.0),
@@ -156,12 +162,16 @@ mod csharp_extraction_tests {
             "only edited path got another interval"
         );
         let cancellation = CancellationToken::new();
-        let (state, _) =
-            parsed_operation_source_state(fixture.root(), "A/Global.cs", source, &CSharpAdapter);
+        let (state, _) = parsed_operation_source_state(
+            fixture.root(),
+            "A/Global.cs",
+            source,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+        );
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &BlobKey::unvaried(oid, "csharp"),
             snapshots["csharp"].generation,
-            &CSharpAdapter,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
             state,
         )
         .unwrap();
@@ -201,6 +211,7 @@ mod csharp_extraction_tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(snapshots["csharp"].revision, second);
@@ -216,6 +227,7 @@ mod csharp_extraction_tests {
                 &langs,
                 &generations,
                 WorkspaceConfigurationInput::new("A/A.csproj".into(), config2.into_bytes().into()),
+                None,
             )
             .unwrap();
         let third = snapshots["csharp"].revision;
@@ -260,12 +272,12 @@ mod csharp_extraction_tests {
             fixture.root(),
             "A/Global.cs",
             &prepublished,
-            &CSharpAdapter,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
         );
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &BlobKey::unvaried(fresh_oid, "csharp"),
             snapshots["csharp"].generation,
-            &CSharpAdapter,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
             state,
         )
         .unwrap();
@@ -294,6 +306,7 @@ mod csharp_extraction_tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -302,12 +315,16 @@ mod csharp_extraction_tests {
             ),
             snapshots["csharp"].revision
         );
-        let (state, _) =
-            parsed_operation_source_state(fixture.root(), "A/Global.cs", source, &CSharpAdapter);
+        let (state, _) = parsed_operation_source_state(
+            fixture.root(),
+            "A/Global.cs",
+            source,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+        );
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &BlobKey::unvaried(oid, "csharp"),
             snapshots["csharp"].generation,
-            &CSharpAdapter,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
             state,
         )
         .unwrap();
@@ -327,12 +344,16 @@ mod csharp_extraction_tests {
         let overlay = "global using Replacement=N.W; class Overlay {}";
         let overlay_oid =
             git2::Oid::hash_object(git2::ObjectType::Blob, overlay.as_bytes()).unwrap();
-        let (state, _) =
-            parsed_operation_source_state(fixture.root(), "A/Global.cs", overlay, &CSharpAdapter);
+        let (state, _) = parsed_operation_source_state(
+            fixture.root(),
+            "A/Global.cs",
+            overlay,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+        );
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &BlobKey::unvaried(overlay_oid, "csharp"),
             snapshots["csharp"].generation,
-            &CSharpAdapter,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
             state,
         )
         .unwrap();
@@ -362,7 +383,11 @@ mod csharp_extraction_tests {
         .with_live_overlay_content_digest(
             brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(overlay.as_bytes()),
         )];
-        let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+        let languages = [SelectedResolutionLanguage::with_epoch(
+            "csharp",
+            Language::CSharp,
+            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+        )];
         {
             let masks = [SelectedResolutionOverlayMask::replacement(
                 "csharp",
@@ -425,6 +450,107 @@ mod csharp_extraction_tests {
                 panic!("unpublished replacement selection");
             };
             assert_eq!(selection.connection().query_row("SELECT sum(publications_expected-publications_installed) FROM temp.selected_csharp_compilation_using_coverage",[],|r|r.get::<_,i64>(0)).unwrap(),1,"missing replacement remains a publication obligation");
+            // A selected operation refuses an unpublished replacement before it
+            // reaches this reader. Keep the direct reader's coverage answer pinned.
+            use brokk_bifrost_analysis::analyzer::resolution::selected_context::SelectedContextIdentities;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_units::CSharpUnitReader;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let identities = SelectedContextIdentities::new();
+            let certified = brokk_bifrost_analysis::analyzer::store::csharp_compilation::CertifiedCSharpHandle::unchecked_for_test(
+                selection.connection(), &snapshots["csharp"],
+            ).unwrap().expect("selected C# set");
+            let mut reader =
+                CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+                    .unwrap();
+            let compilation_id: i64 = selection.connection().query_row(
+                "SELECT compilation_id FROM csharp_compilations WHERE project_path='A/A.csproj' AND set_id=(SELECT set_id FROM csharp_compilation_selections WHERE workspace_id=?1 AND lang='csharp' AND generation=?2 AND revision=?3)",
+                rusqlite::params![workspace.as_str(), snapshots["csharp"].generation.0, snapshots["csharp"].revision],
+                |row| row.get(0),
+            ).unwrap();
+            let answer = reader
+                .global_usings_for_test(
+                    compilation_id,
+                    Some("A/A.csproj".into()),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                answer.0, 1,
+                "the shared published global route remains visible"
+            );
+            assert!(
+                matches!(
+                    answer.1,
+                    brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion::Incomplete(
+                        _
+                    )
+                ),
+                "{answer:?}"
+            );
+        }
+        {
+            // A coverage row from another derivation version proves nothing. The
+            // same complete-looking row, under a set at the previous version,
+            // must fail closed rather than certify the directive inventory.
+            use brokk_bifrost_analysis::analyzer::resolution::ResolutionCompletion;
+            use brokk_bifrost_analysis::analyzer::resolution::selected_context::SelectedContextIdentities;
+            use brokk_bifrost_analysis::analyzer::store::csharp_compilation::DERIVATION_VERSION;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::csharp_units::CSharpUnitReader;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+                .open_selected_resolution_mount_inventory(
+                    &workspace,
+                    &snapshots,
+                    &languages,
+                    &[],
+                    &cancellation,
+                )
+                .unwrap()
+            else {
+                panic!("unmasked selection");
+            };
+            let identities = SelectedContextIdentities::new();
+            let certified = brokk_bifrost_analysis::analyzer::store::csharp_compilation::CertifiedCSharpHandle::unchecked_for_test(
+                selection.connection(), &snapshots["csharp"],
+            ).unwrap().expect("selected C# set");
+            let mut reader =
+                CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+                    .unwrap();
+            let compilation_id: i64 = selection.connection().query_row(
+                "SELECT compilation_id FROM csharp_compilations WHERE project_path='B/B.csproj' AND set_id=(SELECT set_id FROM csharp_compilation_selections WHERE workspace_id=?1 AND lang='csharp' AND generation=?2 AND revision=?3)",
+                rusqlite::params![workspace.as_str(), snapshots["csharp"].generation.0, snapshots["csharp"].revision],
+                |row| row.get(0),
+            ).unwrap();
+            let answer = |reader: &mut CSharpUnitReader<'_, '_>| {
+                reader
+                    .global_usings_for_test(
+                        compilation_id,
+                        Some("B/B.csproj".into()),
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap()
+                    .unwrap()
+            };
+            let fresh = answer(&mut reader);
+            assert_eq!(fresh.1, ResolutionCompletion::Complete, "{fresh:?}");
+            let set_version = |version: i64| {
+                selection
+                    .connection()
+                    .execute(
+                        "UPDATE csharp_compilation_sets SET derivation_version=?1 WHERE set_id=(SELECT set_id FROM csharp_compilations WHERE compilation_id=?2)",
+                        rusqlite::params![version, compilation_id],
+                    )
+                    .unwrap();
+            };
+            set_version(DERIVATION_VERSION - 1);
+            let stale = answer(&mut reader);
+            set_version(DERIVATION_VERSION);
+            let ResolutionCompletion::Incomplete(_) = stale.1 else {
+                panic!("a coverage row from another derivation version was trusted: {stale:?}");
+            };
         }
         {
             let masks = [SelectedResolutionOverlayMask::removal(
@@ -463,12 +589,16 @@ mod csharp_extraction_tests {
             ("A/F001.cs", "class F1 {}"),
         ] {
             let oid = git2::Oid::hash_object(git2::ObjectType::Blob, text.as_bytes()).unwrap();
-            let (state, _) =
-                parsed_operation_source_state(fixture.root(), path, text, &CSharpAdapter);
+            let (state, _) = parsed_operation_source_state(
+                fixture.root(),
+                path,
+                text,
+                &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+            );
             let prepared = AnalyzerStore::prepare_parsed_blob(
                 &BlobKey::unvaried(oid, "csharp"),
                 snapshots["csharp"].generation,
-                &CSharpAdapter,
+                &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
                 state,
             )
             .unwrap();
@@ -483,12 +613,16 @@ mod csharp_extraction_tests {
         for _ in 0..2 {
             let text = "global using SharedAlias=N.W; class Shared {}";
             let oid = git2::Oid::hash_object(git2::ObjectType::Blob, text.as_bytes()).unwrap();
-            let (state, _) =
-                parsed_operation_source_state(fixture.root(), "Shared.cs", text, &CSharpAdapter);
+            let (state, _) = parsed_operation_source_state(
+                fixture.root(),
+                "Shared.cs",
+                text,
+                &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+            );
             let prepared = AnalyzerStore::prepare_parsed_blob(
                 &BlobKey::unvaried(oid, "csharp"),
                 snapshots["csharp"].generation,
-                &CSharpAdapter,
+                &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
                 state,
             )
             .unwrap();
@@ -510,12 +644,13 @@ mod csharp_extraction_tests {
             // of that exact publication history through the real core collector.
             let scratch = tempfile::tempdir().unwrap();
             let db = scratch.path().join("gc.db");
-            store
-                .conn
-                .lock()
-                .unwrap()
-                .execute("VACUUM main INTO ?1", [db.to_str().unwrap()])
+            let conn = store.conn.lock().unwrap();
+            let _fixture =
+                brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+            conn.execute("VACUUM main INTO ?1", [db.to_str().unwrap()])
                 .unwrap();
+            drop(_fixture);
+            drop(conn);
             // An unrelated unmarked blob must actually be reclaimed by this sweep.
             {
                 let copy = brokk_bifrost_core::cache_db::open_unified_connection(&db).unwrap();
@@ -533,6 +668,98 @@ mod csharp_extraction_tests {
                 "real GC retained accounted publications"
             );
         }
+        // #7314: a retained gap must not turn every subsequent publication into
+        // a full compilation scan. Repair uses the actual parsed-blob publisher.
+        let repair = |path: &str, text: &str, gapped: bool| {
+            let (mut state, _) = parsed_operation_source_state(
+                fixture.root(),
+                path,
+                text,
+                &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+            );
+            if gapped {
+                use brokk_bifrost_core::analyzer::resolution_facts::{
+                    ResolutionGapKind, ResolutionReferenceEnumerationGapFact, ResolutionSiteId,
+                };
+                Arc::get_mut(&mut state)
+                    .unwrap()
+                    .resolution_facts
+                    .reference_enumeration_gaps
+                    .push(ResolutionReferenceEnumerationGapFact {
+                        site: ResolutionSiteId::new(0),
+                        // #10342: only the compilation import enumeration origin
+                        // makes the global-using certificate incomplete.
+                        kind: ResolutionGapKind::CompilationImportsUnenumerated,
+                    });
+            }
+            let oid = git2::Oid::hash_object(git2::ObjectType::Blob, text.as_bytes()).unwrap();
+            let variant = store.conn.lock().unwrap().query_row(
+                "SELECT coalesce(d.decision_digest,x'') FROM workspace_file_versions f LEFT JOIN csharp_file_version_decisions d USING(file_version_id) WHERE f.workspace_id=?1 AND f.rel_path=?2 AND f.valid_until IS NULL",
+                rusqlite::params![workspace.as_str(),path], |r| r.get(0),
+            ).unwrap();
+            let mut prepared = AnalyzerStore::prepare_parsed_blob(
+                &BlobKey::unvaried(oid, "csharp"),
+                snapshots["csharp"].generation,
+                &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+                state,
+            )
+            .unwrap();
+            prepared.key.variant = variant;
+            // These test sources contain only class declarations, hence no
+            // undecided preprocessor chains or referenced condition symbols.
+            prepared = prepared.with_undecided_scan(
+                brokk_bifrost_analysis::analyzer::store::CSharpUndecidedScan {
+                    oid,
+                    variant,
+                    chains: vec![],
+                },
+            );
+            store.repair_prepared_blob(prepared).unwrap();
+            if gapped {
+                let conn = store.conn.lock().unwrap();
+                assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM resolution_gaps g JOIN blobs b ON b.id=g.blob_id WHERE b.blob_oid=?1 AND b.parse_variant=?2 AND g.covers=1)", rusqlite::params![oid.to_string(),variant], |r| r.get::<_,bool>(0)).unwrap(), "fixture must publish an enumeration gap");
+            }
+        };
+        let gap_paths = || {
+            let conn = store.conn.lock().unwrap();
+            brokk_bifrost_analysis::analyzer::store::csharp_compilation::verify_using_counts_for_test(&conn);
+            conn.query_row("SELECT coalesce((SELECT json_extract(j.value,'$.paths') FROM json_each(reasons) j WHERE json_extract(j.value,'$.kind')='source_enumeration'),'[]') FROM csharp_compilation_using_coverage WHERE workspace_id=?1 AND valid_until IS NULL AND compilation_id IN (SELECT compilation_id FROM csharp_compilations WHERE project_path='A/A.csproj')", [workspace.as_str()], |r| r.get::<_,String>(0)).unwrap()
+        };
+        repair("A/F003.cs", "class F3 {}", true);
+        assert_eq!(gap_paths(), r#"["A/F003.cs"]"#);
+        let count = brokk_bifrost_analysis::analyzer::store::csharp_compilation::source_enumeration_recomputes_for_test;
+        let before = count();
+        for i in 10..60 {
+            repair(&format!("A/F{i:03}.cs"), &format!("class F{i} {{}}"), false);
+        }
+        assert_eq!(
+            count() - before,
+            0,
+            "non-gapped publications must not scan members"
+        );
+        repair("A/F002.cs", "class F2 {}", true);
+        assert_eq!(gap_paths(), r#"["A/F002.cs","A/F003.cs"]"#);
+        repair("A/F003.cs", "class F3 {}", false);
+        assert_eq!(gap_paths(), r#"["A/F002.cs"]"#);
+        // Retire the last gapped member through the workspace publication path.
+        store
+            .replace_path_symbol_unit(
+                &workspace,
+                &snapshots,
+                &langs,
+                &generations,
+                "A/F002.cs",
+                None,
+                None,
+                &[],
+                &[],
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(gap_paths(), "[]");
         let loose = WorkspaceId::for_session();
         let loose_snapshot = store
             .sync_workspace_inputs_for_workspace(
@@ -590,7 +817,7 @@ mod csharp_extraction_tests {
             single_connection_store_context_for_test(fixture.project_dyn().as_ref()).unwrap();
         let store = Arc::clone(&context.store);
         let workspace_id = context.workspace_id.clone();
-        let _workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
+        let workspace = WorkspaceAnalyzer::build_with_store_context_for_test(
             fixture.project_dyn(),
             AnalyzerConfig::default(),
             context,
@@ -601,14 +828,18 @@ mod csharp_extraction_tests {
             .unwrap();
         let path = "App/New.cs";
         let source = "class New { X field; }";
-        let (state, _) =
-            parsed_operation_source_state(fixture.root(), path, source, &CSharpAdapter);
+        let (state, _) = parsed_operation_source_state(
+            fixture.root(),
+            path,
+            source,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
+        );
         let oid = git2::Oid::hash_object(git2::ObjectType::Blob, source.as_bytes()).unwrap();
         let cancellation = CancellationToken::new();
         let prepared = AnalyzerStore::prepare_parsed_blob(
             &BlobKey::unvaried(oid, "csharp"),
             snapshots["csharp"].generation,
-            &CSharpAdapter,
+            &CSharpAdapter::from_config(&AnalyzerConfig::default().csharp),
             state,
         )
         .unwrap();
@@ -634,7 +865,11 @@ mod csharp_extraction_tests {
         .with_live_overlay_content_digest(
             brokk_bifrost_core::analyzer::canonical_hash::sha256_bytes(source.as_bytes()),
         )];
-        let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+        let languages = [SelectedResolutionLanguage::with_epoch(
+            "csharp",
+            Language::CSharp,
+            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+        )];
         let masks = [SelectedResolutionOverlayMask::replacement("csharp", path)];
         let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
             .open_selected_resolution_mount_inventory_with_content_mounts(
@@ -656,8 +891,12 @@ mod csharp_extraction_tests {
             .unwrap();
         assert!(mount.file_version_id().is_none(), "transient source ran");
         let identities = SelectedContextIdentities::new();
+        let certified = brokk_bifrost_analysis::analyzer::store::csharp_compilation::CertifiedCSharpHandle::unchecked_for_test(
+            selection.connection(), &snapshots["csharp"],
+        ).unwrap().expect("selected C# set");
         let mut reader =
-            CSharpUnitReader::new(&selection, &snapshots["csharp"], &identities).unwrap();
+            CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+                .unwrap();
         let placements = reader.placements(path).unwrap().unwrap();
         assert_eq!(placements.len(), 1, "{placements:?}");
         assert_eq!(
@@ -674,6 +913,13 @@ mod csharp_extraction_tests {
         use brokk_bifrost_core::analyzer::project::OverlayProject;
         let overlay = OverlayProject::new(fixture.project_dyn());
         assert!(overlay.set(fixture.root().join(path), source.into()));
+        let services =
+            brokk_bifrost_analysis::analyzer::native_points::selected_analyzer_services_for_test(
+                brokk_bifrost_analysis::analyzer::resolve_analyzer::<
+                    brokk_bifrost_csharp_analysis::analyzer::csharp::CSharpAnalyzer,
+                >(workspace.analyzer())
+                .expect("C# analyzer"),
+            );
         let input = SelectedResolutionOperationInput::new(
             &overlay,
             &workspace_id,
@@ -681,7 +927,8 @@ mod csharp_extraction_tests {
             &languages,
             &masks,
         )
-        .with_content_mounts(content_mounts.to_vec());
+        .with_content_mounts(content_mounts.to_vec())
+        .with_analyzer(&services);
         let SelectedResolutionOperationOpenOutcome::Ready(operation) = store
             .open_selected_resolution_operation(input, &cancellation)
             .unwrap()
@@ -753,7 +1000,11 @@ mod csharp_extraction_tests {
             .workspace_snapshots_for_current_languages(&workspace_id, &["csharp".to_owned()])
             .unwrap();
         let cancellation = CancellationToken::new();
-        let languages = [SelectedResolutionLanguage::new("csharp", Language::CSharp)];
+        let languages = [SelectedResolutionLanguage::with_epoch(
+            "csharp",
+            Language::CSharp,
+            brokk_bifrost_analysis::analyzer::store::resolution::csharp_trial_bundle_epoch(),
+        )];
         let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
             .open_selected_resolution_mount_inventory(
                 &workspace_id,
@@ -767,8 +1018,12 @@ mod csharp_extraction_tests {
             panic!("selected C# inventory");
         };
         let identities = SelectedContextIdentities::new();
+        let certified = brokk_bifrost_analysis::analyzer::store::csharp_compilation::CertifiedCSharpHandle::unchecked_for_test(
+            selection.connection(), &snapshots["csharp"],
+        ).unwrap().expect("selected C# set");
         let mut reader =
-            CSharpUnitReader::new(&selection, &snapshots["csharp"], &identities).unwrap();
+            CSharpUnitReader::new(&selection, &snapshots["csharp"], &certified, &identities)
+                .unwrap();
         begin_production_selected_sql_trace_on_connection(selection.connection());
         let linked = reader.placements("Linked.cs").unwrap().unwrap();
         let cost = finish_production_selected_sql_trace_on_connection(selection.connection());

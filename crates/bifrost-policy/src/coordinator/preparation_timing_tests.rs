@@ -31,6 +31,7 @@ fn deadline_report_sums_distinct_preparation_stages() {
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
         &crate::test_support::evaluation_options("2026-07-27"),
         Some(&cancellation),
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("canonical deadline report");
     let before = outcome.report().execution().total_elapsed_ms();

@@ -106,7 +106,10 @@ mod python_extraction_tests {
             );
         let provider = *providers.first().expect("python structural provider");
 
-        let cache = SnapshotStructuralIndexCache::new(64 * 1024 * 1024);
+        let cache = SnapshotStructuralIndexCache::new_with_budget(
+            64 * 1024 * 1024,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        );
         let StructuralIndexAcquisition::Ready { index, .. } =
             cache.acquire(provider, &CancellationToken::default())
         else {

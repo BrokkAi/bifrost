@@ -383,6 +383,28 @@ impl<'a> HierarchyProvenanceView<'a> {
     pub(super) fn new(hierarchy: &'a HierarchyOperationArena) -> Self {
         Self { hierarchy }
     }
+    pub(crate) fn partition_member_presence_completion(
+        &self,
+        completion: &ResolutionCompletion,
+        lookup: SemanticId,
+        cancelled: &mut dyn FnMut() -> bool,
+    ) -> Option<(
+        ResolutionCompletion,
+        Vec<(SemanticId, ResolutionCompletion)>,
+    )> {
+        self.hierarchy
+            .evidence
+            .partition_member_presence_completion(completion, lookup, cancelled)
+    }
+    /// The kind and operand identities of a service reason this operation minted.
+    pub(crate) fn service_reason(&self, reason: SemanticId) -> Option<(String, Vec<SemanticId>)> {
+        self.hierarchy
+            .service_reasons
+            .lock()
+            .expect("service reasons are not poisoned")
+            .get(&reason)
+            .cloned()
+    }
     pub(crate) fn identity(&self) -> HierarchyRequestIdentity {
         // This request-owned authority is tied to the fixed selected operation.
         // The address is only a lease discriminator; it is never a semantic ID.

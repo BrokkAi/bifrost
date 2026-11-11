@@ -21,9 +21,12 @@ fn authored_policy_source_changes_verification_input_without_changing_semantics(
     assert_ne!(first.source_hash(), second.source_hash());
 
     let inputs = WorkspaceUnitInputs {
+        model_read_digest: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            None,
+        ),
         configuration: StableDigest::sha256("configuration"),
         models: StableDigest::sha256(NO_ACTIVE_MODELS),
-        epoch: policy_substrate_epoch(),
+        epoch: policy_substrate_epoch(StableDigest::sha256("test-lowering")),
     };
     assert_eq!(
         inputs.unit_key(first, UnitPartition::Whole),
@@ -47,19 +50,31 @@ fn unit_lookup_separates_configuration_model_and_engine_inputs() {
     );
     let policy = registry.policies().next().expect("policy");
     let original = WorkspaceUnitInputs {
+        model_read_digest: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            None,
+        ),
         configuration: StableDigest::sha256("configuration a"),
         models: StableDigest::sha256("models a"),
-        epoch: policy_substrate_epoch(),
+        epoch: policy_substrate_epoch(StableDigest::sha256("test-lowering")),
     };
     let changed_configuration = WorkspaceUnitInputs {
+        model_read_digest: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            None,
+        ),
         configuration: StableDigest::sha256("configuration b"),
         ..original
     };
     let changed_models = WorkspaceUnitInputs {
+        model_read_digest: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            None,
+        ),
         models: StableDigest::sha256("models b"),
         ..original
     };
     let changed_epoch = WorkspaceUnitInputs {
+        model_read_digest: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            None,
+        ),
         epoch: StableDigest::sha256("next engine epoch"),
         ..original
     };
@@ -84,9 +99,12 @@ fn distinct_binding_partitions_have_distinct_persisted_keys() {
     );
     let policy = registry.policies().next().expect("policy");
     let inputs = WorkspaceUnitInputs {
+        model_read_digest: brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+            None,
+        ),
         configuration: StableDigest::sha256("configuration"),
         models: StableDigest::sha256(NO_ACTIVE_MODELS),
-        epoch: policy_substrate_epoch(),
+        epoch: policy_substrate_epoch(StableDigest::sha256("test-lowering")),
     };
     let blob = Oid::from_str("0000000000000000000000000000000000000000").expect("blob id");
     let partition = |binding: &str| UnitPartition::Binding {

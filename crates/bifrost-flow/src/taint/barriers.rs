@@ -24,6 +24,7 @@ use crate::value_flow::{
     ValueFlowSourceId,
 };
 
+use super::attributed::AttributedTaintFunction;
 use super::client::{TaintFlowProblem, TaintObservationHook};
 use super::compose::{
     ValueTypeBarrierCheck, ValueTypeBarrierFindingNotes, ValueTypeBarrierPairEvidence,
@@ -32,7 +33,7 @@ use super::{
     TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction, TaintFact, TaintFinding,
     TaintFindingCollectionLimits, TaintFindingError, TaintFindingReport,
     TaintOriginFindingEvidence, TaintOriginStatus, TaintSolveError, TaintSummaryResult,
-    collect_taint_findings_with_attribution_budget,
+    collect_taint_findings_with_attribution_budget, collect_taint_findings_with_model_receipts,
 };
 
 /// Classifier failures propagate outside discovery's infallible callbacks.
@@ -77,7 +78,7 @@ pub struct IcfgBarrierSession {
     collection_limits: TaintFindingCollectionLimits,
     max_refinement_bytes: usize,
     witness_limits: crate::dataflow::WitnessReconstructionLimits,
-    recorded: Option<RecordedIdeRelations<TaintFact, TaintEdgeFunction>>,
+    recorded: Option<RecordedIdeRelations<TaintFact, AttributedTaintFunction>>,
 }
 
 impl IcfgBarrierSession {
@@ -94,14 +95,76 @@ impl IcfgBarrierSession {
         collection: TaintFindingCollectionLimits,
         attribution: &mut super::TaintAttributionBudget,
     ) -> Result<Self, IcfgBarrierError> {
+        Self::discover_inner(
+            root,
+            provider,
+            plan,
+            None,
+            retention,
+            semantic,
+            request,
+            max_origins,
+            witnesses,
+            collection,
+            attribution,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn discover_with_model_receipts<Provider: IcfgProvider + ?Sized>(
+        root: &ProcedureHandle,
+        provider: &Provider,
+        plan: &TaintAnalysisPlan,
+        receipts: &crate::model_attribution::TaintModelReceiptInputs,
+        retention: WitnessRetentionLimits,
+        semantic: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+        max_origins: usize,
+        witnesses: crate::dataflow::WitnessReconstructionLimits,
+        collection: TaintFindingCollectionLimits,
+        attribution: &mut super::TaintAttributionBudget,
+    ) -> Result<Self, IcfgBarrierError> {
+        Self::discover_inner(
+            root,
+            provider,
+            plan,
+            Some(receipts),
+            retention,
+            semantic,
+            request,
+            max_origins,
+            witnesses,
+            collection,
+            attribution,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn discover_inner<Provider: IcfgProvider + ?Sized>(
+        root: &ProcedureHandle,
+        provider: &Provider,
+        plan: &TaintAnalysisPlan,
+        receipts: Option<&crate::model_attribution::TaintModelReceiptInputs>,
+        retention: WitnessRetentionLimits,
+        semantic: &mut SemanticBudget,
+        request: &mut DataflowRequest<'_>,
+        max_origins: usize,
+        witnesses: crate::dataflow::WitnessReconstructionLimits,
+        collection: TaintFindingCollectionLimits,
+        attribution: &mut super::TaintAttributionBudget,
+    ) -> Result<Self, IcfgBarrierError> {
         if root != plan.value_flow().root() {
             return Err(IcfgBarrierError::Solve(TaintSolveError::RootMismatch));
         }
         let input = IdeSummarySolveInput::new(root, &[]).with_witness_retention(retention);
+        let mut problem = TaintFlowProblem::new(plan).with_cancellation(request.cancellation);
+        if let Some(receipts) = receipts {
+            problem = problem.with_model_receipts(receipts);
+        }
         let (result, recorded) = solve_ide_with_recorded_relations(
             input,
             provider,
-            &TaintFlowProblem::new(plan).with_cancellation(request.cancellation),
+            &problem,
             &mut NoReusableSummaries,
             plan.value_flow()
                 .has_contextual_bindings()
@@ -111,14 +174,26 @@ impl IcfgBarrierSession {
         )
         .map_err(|e| IcfgBarrierError::Solve(TaintSolveError::from(e)))?;
         let result = TaintSummaryResult::from_result(plan, result);
-        let baseline = collect_taint_findings_with_attribution_budget(
-            plan,
-            result,
-            max_origins,
-            witnesses,
-            collection,
-            attribution,
-        )
+        let baseline = if let Some(receipts) = receipts {
+            collect_taint_findings_with_model_receipts(
+                plan,
+                result,
+                max_origins,
+                witnesses,
+                collection,
+                attribution,
+                receipts,
+            )
+        } else {
+            collect_taint_findings_with_attribution_budget(
+                plan,
+                result,
+                max_origins,
+                witnesses,
+                collection,
+                attribution,
+            )
+        }
         .map_err(IcfgBarrierError::Findings)?;
         Ok(Self {
             predicates: plan.value_type_barriers().into(),
@@ -177,13 +252,13 @@ fn concrete_value(carrier: &ValueFlowCarrier) -> Option<crate::analyzer::semanti
 #[derive(Clone)]
 struct Alternative {
     fact: TaintFact,
-    function: TaintEdgeFunction,
+    function: AttributedTaintFunction,
     checks: PathChecks,
 }
 
-struct CollectTransitions(Vec<(TaintFact, TaintEdgeFunction)>);
-impl DataflowOutput<IdeTransition<TaintFact, TaintEdgeFunction>> for CollectTransitions {
-    fn emit(&mut self, row: IdeTransition<TaintFact, TaintEdgeFunction>) -> bool {
+struct CollectTransitions(Vec<(TaintFact, AttributedTaintFunction)>);
+impl DataflowOutput<IdeTransition<TaintFact, AttributedTaintFunction>> for CollectTransitions {
+    fn emit(&mut self, row: IdeTransition<TaintFact, AttributedTaintFunction>) -> bool {
         self.0.push(row.into_parts());
         true
     }
@@ -199,6 +274,7 @@ fn descriptor(key: &TransferKey<TaintFact>) -> DataflowEdge<'_, TaintFact> {
         &edge.proof,
         &edge.completeness,
     )
+    .with_caller_conversion(key.caller_conversion_may_run_user_code)
     .with_summary_entry_fact(key.entry);
     if let Some(boundary) = &edge.boundary {
         out = out.with_boundary(boundary);
@@ -215,7 +291,7 @@ fn descriptor(key: &TransferKey<TaintFact>) -> DataflowEdge<'_, TaintFact> {
 fn reconstruct<Hook: TaintObservationHook>(
     problem: &TaintFlowProblem<'_, Hook>,
     key: &TransferKey<TaintFact>,
-) -> Vec<(TaintFact, TaintEdgeFunction)> {
+) -> Vec<(TaintFact, AttributedTaintFunction)> {
     let edge = descriptor(key);
     let mut out = CollectTransitions(Vec::new());
     match key.edge.kind {
@@ -387,7 +463,7 @@ impl TaintObservationHook for &ObservationHook<'_> {
     fn emitted(&self, fact: TaintFact, function: &TaintEdgeFunction, checks: &Self::Evidence) {
         self.emitted.borrow_mut().push(Alternative {
             fact,
-            function: function.clone(),
+            function: AttributedTaintFunction::exact(function.clone()),
             checks: checks.clone(),
         });
     }
@@ -432,7 +508,7 @@ struct FrozenSupports {
 impl FrozenSupports {
     fn new(
         session: &IcfgBarrierSession,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Self, IcfgBarrierError> {
         let result = session.baseline.result();
@@ -685,7 +761,7 @@ impl Classification {
     #[allow(clippy::too_many_arguments)]
     fn transfer(
         &mut self,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         record: usize,
         plan: &TaintAnalysisPlan,
         source: ValueFlowSourceId,
@@ -699,7 +775,7 @@ impl Classification {
         let trace = recorded.trace();
         let row = &trace.records[record];
         if cfg!(debug_assertions) && self.verified.insert(record) {
-            let mut reconstructed: HashMap<_, TaintEdgeFunction> = HashMap::default();
+            let mut reconstructed: HashMap<_, AttributedTaintFunction> = HashMap::default();
             for (fact, function) in reconstruct(
                 &TaintFlowProblem::new(plan).with_cancellation(request.cancellation),
                 &row.key,
@@ -715,9 +791,13 @@ impl Classification {
                 "unfiltered replay output membership drifted"
             );
             for output in &row.outputs {
+                // Replay reconstructs the class relation without receipt inputs;
+                // the refined finding inherits receipt evidence from baseline.
                 debug_assert_eq!(
-                    reconstructed.get(&output.fact),
-                    Some(&trace.functions[output.function]),
+                    reconstructed
+                        .get(&output.fact)
+                        .map(|function| &function.base),
+                    Some(&trace.functions[output.function].base),
                     "unfiltered local alternatives must meet to the frozen output function"
                 );
             }
@@ -754,7 +834,7 @@ impl Classification {
         if row.key.input.is_zero() {
             alternatives.push(Alternative {
                 fact: TaintFact::zero(),
-                function: plan.identity().clone(),
+                function: AttributedTaintFunction::exact(plan.identity().clone()),
                 checks: PathChecks::default(),
             });
         }
@@ -772,7 +852,7 @@ impl Classification {
     #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &mut self,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         record: usize,
         plan: &TaintAnalysisPlan,
         source: ValueFlowSourceId,
@@ -1105,7 +1185,7 @@ impl Replay {
 
     fn prefix_qualities(
         &mut self,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         request: &mut DataflowRequest<'_>,
     ) -> Result<(), IcfgBarrierError> {
         self.reserve_bytes(
@@ -1176,7 +1256,7 @@ impl Replay {
         state: usize,
         prefix: usize,
         session: &IcfgBarrierSession,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         limits: &mut TaintFindingCollectionLimits,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<(Arc<SummaryWitness>, PathChecks)>, IcfgBarrierError> {
@@ -1303,7 +1383,7 @@ impl Classification {
     fn solve(
         &mut self,
         session: &IcfgBarrierSession,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         supports: &FrozenSupports,
         plan: &TaintAnalysisPlan,
         source: ValueFlowSourceId,
@@ -1419,7 +1499,7 @@ impl Classification {
                             ..SolverWork::default()
                         },
                     )?;
-                    let output = alternative.function.apply(&input);
+                    let output = alternative.function.base.apply(&input);
                     replay.publish(
                         relation.target,
                         key.entry,
@@ -1461,7 +1541,7 @@ impl Classification {
                     )?;
                     let entry = replay.entry(
                         relation.target,
-                        alternative.function.apply(&input),
+                        alternative.function.base.apply(&input),
                         request,
                     )?;
                     replay.incoming(
@@ -1498,8 +1578,11 @@ impl Classification {
                             ..SolverWork::default()
                         },
                     )?;
-                    let entry =
-                        replay.entry(entry_row, alternative.function.apply(&input), request)?;
+                    let entry = replay.entry(
+                        entry_row,
+                        alternative.function.base.apply(&input),
+                        request,
+                    )?;
                     if replay.waiting_ids.insert((id, state, entry)) {
                         let call = AppliedTransfer::new(relation.call, &alternative);
                         replay.reserve_bytes(
@@ -1572,7 +1655,7 @@ impl Classification {
     fn apply_return(
         &mut self,
         replay: &mut Replay,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         relation: Matched,
         exit: usize,
         waiting: &WaitingReturn,
@@ -1628,7 +1711,7 @@ impl Classification {
             replay.publish(
                 relation.target,
                 entry,
-                alternative.function.apply(&input),
+                alternative.function.base.apply(&input),
                 quality,
                 Derivation::Matched {
                     caller: waiting.caller,
@@ -1663,7 +1746,7 @@ impl IcfgBarrierSession {
         replay: &Replay,
         classification_checks: &[ValueTypeBarrierCheck],
         plan: &TaintAnalysisPlan,
-        recorded: &RecordedIdeRelations<TaintFact, TaintEdgeFunction>,
+        recorded: &RecordedIdeRelations<TaintFact, AttributedTaintFunction>,
         source: &super::TaintSourceBinding,
         source_class: &TaintClassSet,
         limits: &mut TaintFindingCollectionLimits,
@@ -1859,7 +1942,7 @@ impl IcfgBarrierSession {
             .result()
             .termination()
             .is_fixed_point();
-        let finding = TaintFinding::composed(
+        let mut finding = TaintFinding::composed(
             plan,
             pass.sink,
             pass.classes.clone(),
@@ -1870,6 +1953,17 @@ impl IcfgBarrierSession {
             origins,
         )
         .map_err(IcfgBarrierError::Findings)?;
+        // Replay tracks classes and path quality, but not per-class model
+        // receipts. A strict pair can discard an approximate alternative;
+        // retaining its baseline sink receipt is conservative and prevents
+        // the refinement from silently clearing a recorded dependency. A
+        // multi-class baseline finding may mark another class in this pair.
+        for baseline in self.baseline.findings().iter().filter(|baseline| {
+            baseline.sink() == pass.sink
+                && !baseline.classes().intersection(&pass.classes).is_empty()
+        }) {
+            finding.merge_model_receipt(baseline.model_receipt());
+        }
         let authored = (self.baseline.is_proven_by_authored_summaries()
             && !pass.closures.is_empty())
         .then(|| pass.closures.clone());

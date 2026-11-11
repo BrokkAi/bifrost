@@ -1398,6 +1398,950 @@ mod go_extraction_tests_global {
         use brokk_bifrost_analysis :: analyzer :: store :: resolution_operation :: tests :: native_query_plan_tests :: shared_support :: registry ;
 
         #[test]
+        fn go_target_key_acquisition_access_cost() {
+            use brokk_bifrost_analysis::analyzer::store::{AnalyzerStore, PersistBatchTargets};
+            use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
+            use brokk_bifrost_core::analyzer::Language;
+            use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
+            use git2::{ObjectType, Oid};
+            use rusqlite::{StatementStatus, params};
+
+            const IDENTIFIER_QUERY: &str = "SELECT unit_key FROM code_units WHERE lang = ?1 AND identifier = ?2 AND (in_declarations = 1 OR in_definition_lookup = 1) AND in_declarations = 1 AND blob_id = ?3";
+            const BLOB_QUERY: &str = "SELECT unit_key FROM code_units WHERE blob_id = ?1 AND identifier = ?2 AND in_declarations = 1";
+
+            let root = tempfile::tempdir().expect("Go access cost project root");
+            let store = AnalyzerStore::open_ephemeral().expect("Go access cost store");
+            let generation = store
+                .ensure_language_epoch_value("go", "go-access-cost-v1")
+                .expect("Go access cost language epoch");
+            store
+                .ensure_resolution_producer_epoch("go", Language::Go)
+                .expect("Go access cost producer epoch");
+            let adapter = GoAdapter;
+
+            for size in [20, 100, 300] {
+                let mut prepared = Vec::new();
+                for ordinal in (if size == 20 {
+                    0
+                } else if size == 100 {
+                    20
+                } else {
+                    100
+                })..size
+                {
+                    let package = ordinal / 20;
+                    let source = format!(
+                        "package p{package}\ntype Widget{ordinal} struct{{}}\nfunc (Widget{ordinal}) String() string {{ return \"{ordinal}\" }}\nfunc (Widget{ordinal}) Close() error {{ return nil }}\nfunc Helper{ordinal}() {{}}\n"
+                    );
+                    let path = format!("p{package}/file{ordinal}.go");
+                    let (state, _) = parsed_go_state(root.path(), &path, &source);
+                    let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                        .expect("hash Go access cost source");
+                    prepared.push(
+                        AnalyzerStore::prepare_parsed_blob(
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                            generation,
+                            &adapter,
+                            state,
+                        )
+                        .expect("prepare Go access cost blob"),
+                    );
+                }
+                let (outcomes, _) =
+                    store.persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+                assert!(
+                    outcomes.iter().all(|outcome| outcome.error.is_none()),
+                    "{outcomes:#?}"
+                );
+
+                store.conn.execute(move |conn| {
+                    // Production refreshes planner statistics after building a workspace.
+                    conn.execute_batch("PRAGMA analysis_limit = 1000; ANALYZE")
+                        .expect("refresh Go access cost statistics");
+                    let blob_id: i64 = conn.query_row(
+                        "SELECT blob_id FROM code_units WHERE lang = 'go' AND identifier = 'String' AND in_declarations = 1 LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    ).expect("find a Go String declaration");
+                    let mut baseline = None;
+                    for (name, sql) in [("identifier", IDENTIFIER_QUERY), ("blob", BLOB_QUERY)] {
+                        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+                        let mut plan_statement = conn.prepare(&explain).unwrap();
+                        let plan: Vec<String> = if name == "identifier" {
+                            plan_statement.query_map(params!["go", "String", blob_id], |row| row.get::<_, String>(3)).unwrap()
+                                .map(|row| row.unwrap()).collect()
+                        } else {
+                            plan_statement.query_map(params![blob_id, "String"], |row| row.get::<_, String>(3)).unwrap()
+                                .map(|row| row.unwrap()).collect()
+                        };
+                        let mut statement = conn.prepare(sql).unwrap();
+                        let mut rows: Vec<i64> = if name == "identifier" {
+                            statement.query_map(params!["go", "String", blob_id], |row| row.get(0)).unwrap()
+                                .map(|row| row.unwrap()).collect()
+                        } else {
+                            statement.query_map(params![blob_id, "String"], |row| row.get(0)).unwrap()
+                                .map(|row| row.unwrap()).collect()
+                        };
+                        rows.sort();
+                        assert!(!rows.is_empty(), "{size} files: no target units");
+                        if let Some(expected) = &baseline {
+                            assert_eq!(&rows, expected, "{size} files: candidate queries disagree");
+                        } else {
+                            baseline = Some(rows.clone());
+                        }
+                        eprintln!("go_target_key_access size={size} query={name} plan={plan:?} vm_steps={} fullscan_steps={} rows={}", statement.get_status(StatementStatus::VmStep), statement.get_status(StatementStatus::FullscanStep), rows.len());
+                        if name == "identifier" {
+                            let steps = statement.get_status(StatementStatus::VmStep);
+                            // The full (lang, identifier, blob_id) index from cache
+                            // migration 0292 reads the row to check in_declarations,
+                            // which the dropped partial index carried: a constant
+                            // per candidate row, not growth with the workspace.
+                            assert!(steps <= 27, "Query A VM steps grew at {size}: {steps}");
+                        }
+                    }
+                });
+            }
+        }
+
+        #[test]
+        fn go_target_key_selected_query_cost_across_blobs() {
+            use brokk_bifrost_analysis::analyzer::store::{AnalyzerStore, PersistBatchTargets};
+            use brokk_bifrost_analysis::analyzer::store_bridge::AnalyzerStoreEngineExt;
+            use brokk_bifrost_go_analysis::analyzer::go::adapter::GoAdapter;
+            use git2::{ObjectType, Oid};
+            use rusqlite::StatementStatus;
+
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; type Widget struct{}; func (Widget) String() string { return \"x\" }",
+                "package provider; func Other() {}",
+                "package provider",
+            ]);
+            publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let generation = fixture
+                .store
+                .ensure_language_epoch_value("go", "resolution-operation-go-root-test-v1")
+                .unwrap();
+            let adapter = GoAdapter;
+            let mut smallest: Option<[i32; 3]> = None;
+            for (prior, size) in [(3, 20), (20, 100), (100, 300)] {
+                let mut prepared = Vec::new();
+                for ordinal in prior..size {
+                    let source = format!(
+                        "package p; type Widget{ordinal} struct{{}}; func (Widget{ordinal}) String() string {{ return \"x\" }}"
+                    );
+                    let path = format!("extra/file{ordinal}.go");
+                    let (state, _) = parsed_go_state(fixture._project_root.path(), &path, &source);
+                    let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+                    prepared.push(
+                        AnalyzerStore::prepare_parsed_blob(
+                            &brokk_bifrost_core::gitblob::BlobKey::unvaried(oid, "go"),
+                            generation,
+                            &adapter,
+                            state,
+                        )
+                        .unwrap(),
+                    );
+                }
+                let (outcomes, _) = fixture
+                    .store
+                    .persist_prepared_blobs(prepared, PersistBatchTargets::PRODUCTION);
+                assert!(
+                    outcomes.iter().all(|outcome| outcome.error.is_none()),
+                    "{outcomes:#?}"
+                );
+                fixture.store.conn.execute(|conn| {
+                    conn.execute_batch("PRAGMA analysis_limit = 1000; ANALYZE")
+                        .unwrap()
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let conn = operation.ready.inventory.connection();
+                let (ordinal, blob_id): (i64, i64) = conn.query_row(
+                    "SELECT mount_ordinal,blob_id FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1",
+                    [GO_ROOT_CONSUMER_PATH], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).unwrap();
+                let keys: Vec<i64> = conn.prepare("SELECT unit_key FROM main.code_units WHERE blob_id=?1 AND identifier='String' AND in_declarations=1")
+                    .unwrap().query_map([blob_id], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+                assert!(!keys.is_empty());
+                let keys_json = serde_json::to_string(&keys).unwrap();
+                let mut steps = Vec::new();
+                for (name, sql, binds) in [
+                    ("acquisition", brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::go_target_key_acquisition_sql_for_test(), vec![rusqlite::types::Value::Integer(ordinal), rusqlite::types::Value::Text("go".to_owned()), rusqlite::types::Value::Text("String".to_owned())]),
+                    ("unresolved", brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::go_unresolved_route_sql_for_test(), vec![rusqlite::types::Value::Integer(ordinal)]),
+                    ("nomination", brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::go_target_nominated_semantics_sql_for_test(), vec![rusqlite::types::Value::Integer(ordinal), rusqlite::types::Value::Text(keys_json.clone())]),
+                ] {
+                    let plan: Vec<String> = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                        .unwrap().query_map(rusqlite::params_from_iter(binds.iter()), |row| row.get(3))
+                        .unwrap().map(Result::unwrap).collect();
+                    let mut statement = conn.prepare(sql).unwrap();
+                    let rows: Vec<rusqlite::types::Value> = statement.query_map(rusqlite::params_from_iter(binds.iter()), |row| row.get(0))
+                        .unwrap().map(Result::unwrap).collect();
+                    let vm = statement.get_status(StatementStatus::VmStep);
+                    let fullscan = statement.get_status(StatementStatus::FullscanStep);
+                    eprintln!("go_selected_cost size={size} query={name} plan={plan:?} vm_steps={vm} fullscan_steps={fullscan} rows={}", rows.len());
+                    assert_eq!(fullscan, 0, "{name} size={size}: {plan:?}");
+                    if name == "acquisition" {
+                        assert!(plan.iter().any(|line| line.contains("SEARCH units") && line.contains("blob_id=?")), "{name}: {plan:?}");
+                    } else {
+                        assert!(plan.iter().any(|line| line.contains("SEARCH semantic") && line.contains("blob_id=?")), "{name}: {plan:?}");
+                        for alias in ["semantic", "direct", "direct_unit", "bridge", "link", "linked_unit"] {
+                            assert!(plan.iter().filter(|line| line.contains(&format!("SEARCH {alias} "))).all(|line| line.contains("blob_id=?")), "{name} {alias}: {plan:?}");
+                            assert!(!plan.iter().any(|line| line.contains(&format!("SCAN {alias} "))), "{name} {alias}: {plan:?}");
+                        }
+                    }
+                    steps.push(vm);
+                }
+                if let Some(first) = smallest {
+                    assert!(
+                        steps[0] <= first[0],
+                        "acquisition grew from {} to {} at {size}",
+                        first[0],
+                        steps[0]
+                    );
+                    assert!(
+                        steps[1] <= first[1],
+                        "unresolved grew from {} to {} at {size}",
+                        first[1],
+                        steps[1]
+                    );
+                    assert!(
+                        steps[2] <= first[2],
+                        "nomination grew from {} to {} at {size}",
+                        first[2],
+                        steps[2]
+                    );
+                } else {
+                    smallest = Some([steps[0], steps[1], steps[2]]);
+                }
+            }
+        }
+
+        fn anchor_consumer(fixture: &GoRootResolutionOperationFixture) {
+            fixture.store.conn.execute(|connection| {
+                let version: i64 = connection.query_row(
+                    "SELECT file_version_id FROM workspace_file_versions WHERE lang='go' AND rel_path=?1",
+                    [GO_ROOT_CONSUMER_PATH],
+                    |row| row.get(0),
+                ).unwrap();
+                connection.execute(
+                    "INSERT INTO workspace_file_anchor_rows(file_version_id,anchor_kind,anchor_pop,package_name) VALUES(?1,'own_module',0,'example.test/root/consumer')",
+                    [version],
+                ).unwrap();
+            });
+        }
+
+        fn selected_consumer_unit(
+            unit: &brokk_bifrost_core::analyzer::model::CodeUnit,
+        ) -> brokk_bifrost_core::analyzer::model::CodeUnit {
+            let mut fq =
+                brokk_bifrost_go::declarations::go_package_fq("example.test/root/consumer");
+            for segment in unit.fq().segments().iter().skip(1) {
+                fq.push(*segment);
+            }
+            brokk_bifrost_core::analyzer::model::CodeUnit::from_fq(
+                unit.source().clone(),
+                unit.kind(),
+                fq,
+                3,
+                unit.signature().map(str::to_owned),
+                unit.is_synthetic(),
+            )
+        }
+
+        #[test]
+        fn go_target_keys_match_full_units_and_selected_anchor() {
+            use brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoTargetKeys;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+            let source = "package consumer\ntype Left struct{}\ntype Right struct{}\nfunc (Left) Run() {}\nfunc (Right) Run() {}\nfunc Helper() {}\n";
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                source,
+                "package provider; func Missing() {}",
+                "package provider",
+            ]);
+            publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let (state, _) =
+                parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, source);
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let ordinal: u32 = conn.query_row(
+                "SELECT mount_ordinal FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1",
+                [GO_ROOT_CONSUMER_PATH], |row| row.get(0),
+            ).unwrap();
+            let ordinal = SelectedResolutionMountOrdinal::new(ordinal);
+            let sql = brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::go_target_key_acquisition_sql_for_test();
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(
+                    rusqlite::params![i64::from(ordinal.get()), "go", "Run"],
+                    |row| row.get(3),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_code_units_lang_identifier (")
+                        && line.contains("blob_id=?")),
+                "{plan:?}"
+            );
+            let session = ResolutionSession::unbounded();
+            let run_units: Vec<_> = state
+                .declarations
+                .iter()
+                .filter(|unit| unit.identifier() == "Run")
+                .collect();
+            assert_eq!(run_units.len(), 2);
+            for unit in run_units {
+                let target = selected_consumer_unit(unit);
+                assert_eq!(target.identifier(), "Run");
+                let GoTargetKeys::Keys(keys) = operation
+                    .ready
+                    .go_target_keys_for_test(ordinal, &target, &cancellation, &session)
+                    .unwrap()
+                else {
+                    panic!("Run key unavailable")
+                };
+                assert_eq!(keys.len(), 1, "receiver identity must disambiguate Run");
+            }
+            let helper = state
+                .declarations
+                .iter()
+                .find(|unit| unit.identifier() == "Helper")
+                .unwrap();
+            let target = selected_consumer_unit(helper);
+            assert_eq!(target.identifier(), "Helper");
+            assert!(
+                matches!(operation.ready.go_target_keys_for_test(ordinal, &target, &cancellation, &session).unwrap(), GoTargetKeys::Keys(keys) if keys.len() == 1)
+            );
+            let (other, _) = parsed_go_state(
+                fixture._project_root.path(),
+                "other.go",
+                "package consumer; func Missing() {}",
+            );
+            let target = selected_consumer_unit(
+                other
+                    .declarations
+                    .iter()
+                    .find(|unit| unit.identifier() == "Missing")
+                    .unwrap(),
+            );
+            assert!(
+                matches!(operation.ready.go_target_keys_for_test(ordinal, &target, &cancellation, &session).unwrap(), GoTargetKeys::Keys(keys) if keys.is_empty())
+            );
+        }
+
+        #[test]
+        fn go_target_keys_keep_equal_rows_and_refuse_broken_hydration() {
+            use brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoTargetKeys;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::params;
+
+            // "equal" copies the target row under a second key; "corrupt"
+            // deletes its structured identity; "unanchored" leaves the module
+            // anchor unpublished, so the unit cannot be rebuilt.
+            for mode in ["equal", "corrupt", "unanchored"] {
+                let corrupt = mode == "corrupt";
+                let source = "package consumer; func Helper() {}";
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    source,
+                    "package provider",
+                    "package provider",
+                ]);
+                publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+                if mode != "unanchored" {
+                    anchor_consumer(&fixture);
+                }
+                let (state, _) =
+                    parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, source);
+                let target = selected_consumer_unit(
+                    state
+                        .declarations
+                        .iter()
+                        .find(|unit| unit.identifier() == "Helper")
+                        .unwrap(),
+                );
+                // Fixture rows: code_units belongs to the sealed blob-row family.
+                fixture.store.conn.execute_fixture(move |conn| {
+                    conn.execute_batch("PRAGMA foreign_keys = ON; DROP TRIGGER code_unit_fq_segments_no_insert_after_completion; DROP TRIGGER code_unit_fq_segments_no_delete_after_completion").unwrap();
+                    let (blob, key): (i64, i64) = conn.query_row(
+                        "SELECT blob_id,unit_key FROM code_units WHERE identifier='Helper' AND in_declarations=1 LIMIT 1",
+                        [], |row| Ok((row.get(0)?,row.get(1)?)),
+                    ).unwrap();
+                    if corrupt {
+                        conn.execute("DELETE FROM code_unit_fq_segments WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap();
+                    } else if mode == "equal" {
+                        let columns: Vec<String> = conn.prepare("PRAGMA table_info(code_units)").unwrap()
+                            .query_map([], |row| row.get(1)).unwrap().map(Result::unwrap).collect();
+                        let new_key: i64 = conn.query_row("SELECT MAX(unit_key)+1 FROM code_units WHERE blob_id=?1", [blob], |row| row.get(0)).unwrap();
+                        let select = columns.iter().map(|column| if column == "unit_key" { "?3".to_string() } else { format!("\"{column}\"") }).collect::<Vec<_>>().join(",");
+                        let names = columns.iter().map(|column| format!("\"{column}\"")).collect::<Vec<_>>().join(",");
+                        conn.execute(&format!("INSERT INTO code_units ({names}) SELECT {select} FROM code_units WHERE blob_id=?1 AND unit_key=?2"), params![blob,key,new_key]).unwrap();
+                        conn.execute("INSERT INTO code_unit_fq_segments(blob_id,lang,unit_key,seg_ordinal,seg_kind,segment) SELECT blob_id,lang,?3,seg_ordinal,seg_kind,segment FROM code_unit_fq_segments WHERE blob_id=?1 AND unit_key=?2", params![blob,key,new_key]).unwrap();
+                    }
+                    let violations: Vec<String> = conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+                    assert!(violations.is_empty(), "{violations:?}");
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let ordinal: u32 = operation.ready.inventory.connection().query_row(
+                    "SELECT mount_ordinal FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1",
+                    [GO_ROOT_CONSUMER_PATH], |row| row.get(0),
+                ).unwrap();
+                let result = operation.ready.go_target_keys_for_test(
+                    SelectedResolutionMountOrdinal::new(ordinal),
+                    &target,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                );
+                match mode {
+                    "equal" => assert!(
+                        matches!(&result, Ok(GoTargetKeys::Keys(keys)) if keys.len() == 2),
+                        "{result:?}"
+                    ),
+                    "corrupt" => {
+                        let error = result.expect_err("a corrupt identity row is a store error");
+                        assert!(error.to_string().contains("FqName expected"), "{error:?}");
+                    }
+                    _ => assert!(
+                        matches!(&result, Ok(GoTargetKeys::Unavailable)),
+                        "{result:?}"
+                    ),
+                }
+            }
+        }
+
+        #[test]
+        fn go_unresolved_route_boundary_shapes() {
+            use brokk_bifrost_analysis::analyzer::resolution::SelectedResolutionMountOrdinal;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoUnresolvedRoute;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::params;
+
+            for mode in [
+                "clean",
+                "missing_direct",
+                "inactive_direct",
+                "no_route",
+                "root_import",
+                "no_links",
+                "lexical_no_links",
+                "lexical_direct_no_links",
+                "without_unit_no_links",
+                "anonymous_no_links",
+                "inactive_link",
+                "direct_no_links",
+                "other_file",
+                "missing_link_fk",
+            ] {
+                let source = "package consumer; func Helper() {}";
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    source,
+                    "package provider; func Other() {}",
+                    "package provider",
+                ]);
+                publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+                anchor_consumer(&fixture);
+                let (state, _) =
+                    parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, source);
+                let target = selected_consumer_unit(
+                    state
+                        .declarations
+                        .iter()
+                        .find(|unit| unit.identifier() == "Helper")
+                        .unwrap(),
+                );
+                fixture.store.conn.execute_fixture(move |conn| {
+                    conn.execute_batch("PRAGMA foreign_keys=ON; DROP TRIGGER source_declaration_units_no_delete_after_seal; DROP TRIGGER source_declaration_units_no_update_after_seal; DROP TRIGGER source_native_declaration_bridges_no_delete_after_seal; DROP TRIGGER source_declarations_no_update_after_seal; DROP TRIGGER source_go_types_no_insert_after_seal").unwrap();
+                    let identifier = if mode == "other_file" { "Other" } else { "Helper" };
+                    let (blob, key): (i64, i64) = conn.query_row("SELECT blob_id,unit_key FROM code_units WHERE identifier=?1 AND in_declarations=1 LIMIT 1", [identifier], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                    let missing_key: i64 = conn.query_row("SELECT MAX(unit_key)+100 FROM code_units WHERE blob_id=?1", [blob], |row| row.get(0)).unwrap();
+                    if matches!(mode, "missing_direct" | "inactive_direct" | "direct_no_links" | "lexical_direct_no_links") {
+                        let semantic_key: i64 = conn.query_row("SELECT semantic.semantic_key FROM resolution_semantic_sites AS semantic JOIN source_native_declaration_bridges AS bridge ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site JOIN source_declaration_units AS link ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id WHERE semantic.blob_id=?1 AND semantic.semantic_role='definition' AND link.unit_key=?2", params![blob,key], |row| row.get(0)).unwrap();
+                        conn.execute("INSERT INTO resolution_definition_unit_crosswalks(blob_id,definition_semantic_key,unit_key,identity_digest) VALUES(?1,?2,?3,zeroblob(32)) ON CONFLICT(blob_id,definition_semantic_key) DO UPDATE SET unit_key=excluded.unit_key", params![blob,semantic_key,key]).unwrap();
+                    }
+                    match mode {
+                        "missing_direct" => {
+                            conn.execute("UPDATE resolution_definition_unit_crosswalks SET unit_key=?3 WHERE blob_id=?1 AND unit_key=?2", params![blob,key,missing_key]).unwrap();
+                        }
+                        "inactive_direct" => { conn.execute("UPDATE code_units SET in_declarations=0 WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap(); }
+                        "no_route" | "root_import" => {
+                            if mode == "root_import" {
+                                let site: i64 = conn.query_row("SELECT bridge.source_site FROM source_native_declaration_bridges AS bridge JOIN source_declaration_units AS link ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id WHERE link.blob_id=?1 AND link.unit_key=?2", params![blob,key], |row| row.get(0)).unwrap();
+                                conn.execute("INSERT INTO resolution_root_imports(blob_id,import_site,root_scope,anchor,position,kind,bound_name) VALUES(?1,?2,0,'lexical',NULL,'named','Helper')", params![blob,site]).unwrap();
+                            }
+                            conn.execute("DELETE FROM resolution_definition_unit_crosswalks WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap();
+                            conn.execute("DELETE FROM source_native_declaration_bridges WHERE blob_id=?1 AND declaration_id IN (SELECT declaration_id FROM source_declaration_units WHERE blob_id=?1 AND unit_key=?2)", params![blob,key]).unwrap();
+                        }
+                        "no_links" | "anonymous_no_links" | "direct_no_links" | "lexical_no_links" | "lexical_direct_no_links" | "without_unit_no_links" => {
+                            if !matches!(mode, "direct_no_links" | "lexical_direct_no_links") { conn.execute("DELETE FROM resolution_definition_unit_crosswalks WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap(); }
+                            if matches!(mode, "lexical_no_links" | "lexical_direct_no_links" | "without_unit_no_links") {
+                                let declaration_id: i64 = conn.query_row("SELECT declaration_id FROM source_declaration_units WHERE blob_id=?1 AND unit_key=?2", params![blob,key], |row| row.get(0)).unwrap();
+                                if mode == "without_unit_no_links" {
+                                    conn.execute("UPDATE source_declarations SET lexical_kind=NULL, lexical_identifier=NULL WHERE blob_id=?1 AND declaration_id=?2", params![blob,declaration_id]).unwrap();
+                                } else {
+                                    conn.execute("UPDATE source_declarations SET lexical_kind='parameter', lexical_identifier='Helper' WHERE blob_id=?1 AND declaration_id=?2", params![blob,declaration_id]).unwrap();
+                                }
+                            }
+                            if mode == "anonymous_no_links" {
+                                let (declaration_id, occurrence_id): (i64,i64) = conn.query_row("SELECT declaration.declaration_id,declaration.occurrence_id FROM source_declarations AS declaration JOIN source_declaration_units AS link ON link.blob_id=declaration.blob_id AND link.declaration_id=declaration.declaration_id WHERE link.blob_id=?1 AND link.unit_key=?2", params![blob,key], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+                                conn.execute("UPDATE source_declarations SET name_occurrence_id=NULL,name_start_byte=NULL,name_end_byte=NULL,name_start_line=NULL,name_end_line=NULL WHERE blob_id=?1 AND declaration_id=?2", params![blob,declaration_id]).unwrap();
+                                conn.execute("INSERT INTO source_go_types(blob_id,type_id,occurrence_id,kind) VALUES(?1,(SELECT COALESCE(MAX(type_id),-1)+1 FROM source_go_types WHERE blob_id=?1),?2,12)", params![blob,occurrence_id]).unwrap();
+                            }
+                            conn.execute("DELETE FROM source_declaration_units WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap();
+                        }
+                        "inactive_link" => {
+                            conn.execute("DELETE FROM resolution_definition_unit_crosswalks WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap();
+                            conn.execute("UPDATE code_units SET in_declarations=0 WHERE blob_id=?1 AND unit_key=?2", params![blob,key]).unwrap();
+                        }
+                        "missing_link_fk" => {
+                            let result = conn.execute("UPDATE source_declaration_units SET unit_key=?3 WHERE blob_id=?1 AND unit_key=?2", params![blob,key,missing_key]);
+                            assert!(matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.extended_code == 787), "SQLite must reject a link to a missing unit through its foreign key");
+                        }
+                        _ => {}
+                    }
+                    let violations: Vec<String> = conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+                    assert!(violations.is_empty(), "{mode}: {violations:?}");
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let ordinal: u32 = operation.ready.inventory.connection().query_row("SELECT mount_ordinal FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1", [GO_ROOT_CONSUMER_PATH], |row| row.get(0)).unwrap();
+                let result = operation
+                    .ready
+                    .go_unresolved_route_check_for_test(
+                        SelectedResolutionMountOrdinal::new(ordinal),
+                        &target,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                let expected = if matches!(
+                    mode,
+                    "clean"
+                        | "other_file"
+                        | "missing_link_fk"
+                        | "root_import"
+                        | "anonymous_no_links"
+                        | "lexical_no_links"
+                ) {
+                    GoUnresolvedRoute::Clear
+                } else {
+                    GoUnresolvedRoute::Unavailable
+                };
+                assert_eq!(result, expected, "{mode}");
+            }
+        }
+
+        #[test]
+        fn go_unresolved_route_selected_blob_plan() {
+            use rusqlite::StatementStatus;
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; func Helper() {}",
+                "package provider; func Other() {}",
+                "package provider",
+            ]);
+            publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let ordinal: i64 = conn.query_row("SELECT mount_ordinal FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1", [GO_ROOT_CONSUMER_PATH], |row| row.get(0)).unwrap();
+            let sql = brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::go_unresolved_route_sql_for_test();
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([ordinal], |row| row.get(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("SEARCH semantic") && line.contains("blob_id=?")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("SCAN semantic")
+                    || line.contains("SCAN direct_unit")
+                    || line.contains("SCAN linked_unit")),
+                "{plan:?}"
+            );
+            let mut statement = conn.prepare(sql).unwrap();
+            let rows: Vec<i64> = statement
+                .query_map([ordinal], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            eprintln!(
+                "go_unresolved_route_plan plan={plan:?} vm_steps={} fullscan_steps={} rows={}",
+                statement.get_status(StatementStatus::VmStep),
+                statement.get_status(StatementStatus::FullscanStep),
+                rows.len()
+            );
+            assert_eq!(statement.get_status(StatementStatus::FullscanStep), 0);
+        }
+
+        #[test]
+        fn go_target_nomination_uses_keyed_semantic_site_search() {
+            use rusqlite::StatementStatus;
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; func Helper() {}",
+                "package provider; func Other() {}",
+                "package provider",
+            ]);
+            publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let (ordinal, blob_id): (i64, i64) = conn.query_row(
+                "SELECT mount_ordinal,blob_id FROM temp.selected_resolution_mounts WHERE persisted_relative_path=?1",
+                [GO_ROOT_CONSUMER_PATH],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            let unit_key: i64 = conn.query_row(
+                "SELECT unit_key FROM main.code_units WHERE blob_id=?1 AND identifier='Helper' LIMIT 1",
+                [blob_id], |row| row.get(0),
+            ).unwrap();
+            let keys = serde_json::to_string(&[unit_key]).unwrap();
+            let sql = brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::go_target_nominated_semantics_sql_for_test();
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params![ordinal, keys], |row| row.get(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter().any(|line| line.contains("SEARCH semantic")
+                    && (line.contains("semantic_key") || line.contains("source_site"))),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .filter(|line| line.contains("SEARCH semantic"))
+                    .all(|line| line.contains("semantic_key") || line.contains("source_site")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("SCAN semantic")),
+                "{plan:?}"
+            );
+            let mut statement = conn.prepare(sql).unwrap();
+            let rows: Vec<i64> = statement
+                .query_map(rusqlite::params![ordinal, keys], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            eprintln!(
+                "go_target_nomination plan={plan:?} vm_steps={} rows={rows:?}",
+                statement.get_status(StatementStatus::VmStep)
+            );
+            assert!(!rows.is_empty());
+            assert!(statement.get_status(StatementStatus::VmStep) < 2000);
+        }
+
+        #[test]
+        fn go_reverse_target_ignores_unrelated_multi_unit_struct_method() {
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseCandidateOutcome;
+            let source = "package consumer\ntype Outer struct { A, B struct { X int } }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n";
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                source,
+                "package provider",
+                "package provider",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let (state, _) =
+                parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, source);
+            let unit = |name: &str| {
+                state
+                    .declarations
+                    .iter()
+                    .find(|unit| unit.short_name() == name)
+                    .unwrap_or_else(|| panic!("missing {name}"))
+                    .clone()
+            };
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let worker = selected_consumer_unit(&unit("Worker.Run"));
+            let match_result = operation.go_hierarchy_definition_match(&worker, &cancellation, &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::unbounded()).unwrap();
+            assert!(matches!(match_result, brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoHierarchyDefinitionMatch::Found(_)), "{match_result:?}");
+            let result = operation
+                .go_reverse_candidate_sites(&worker, context, true, &[0; 32], &cancellation)
+                .unwrap();
+            assert!(
+                matches!(result, GoReverseCandidateOutcome::Ready(_)),
+                "Worker reverse target must be covered"
+            );
+            let field = selected_consumer_unit(&unit("Outer.A.X"));
+            let result = operation
+                .go_reverse_candidate_sites(&field, context, true, &[0; 32], &cancellation)
+                .unwrap();
+            assert!(
+                matches!(result, GoReverseCandidateOutcome::Unavailable(_)),
+                "multi-unit target stays refused"
+            );
+        }
+
+        #[test]
+        #[hardwon(
+            "#9224: an unrelated malformed definition made every target match in its file Unavailable"
+        )]
+        fn go_target_match_keeps_unrelated_conflicts_out_of_scope() {
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseCandidateOutcome;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoHierarchyDefinitionMatch;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::params;
+
+            const SOURCE: &str =
+                "package consumer\nfunc Target() {}\nfunc Other() {}\nfunc Third() {}\n";
+            for mode in [
+                "clean",
+                "target_conflict",
+                "missing_route",
+                "unrelated_conflict",
+            ] {
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    SOURCE,
+                    "package provider; func Missing() {}",
+                    "package provider",
+                ]);
+                let context =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+                anchor_consumer(&fixture);
+                let (state, _) =
+                    parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, SOURCE);
+                let target = selected_consumer_unit(
+                    state
+                        .declarations
+                        .iter()
+                        .find(|unit| unit.identifier() == "Target")
+                        .unwrap(),
+                );
+                let (absent_state, _) = parsed_go_state(
+                    fixture._project_root.path(),
+                    GO_ROOT_CONSUMER_PATH,
+                    "package consumer; func Absent() {}",
+                );
+                let missing = selected_consumer_unit(
+                    absent_state
+                        .declarations
+                        .iter()
+                        .find(|unit| unit.identifier() == "Absent")
+                        .unwrap(),
+                );
+                fixture.store.conn.execute_fixture(move |conn| {
+                    conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+                    if mode == "clean" {
+                        let (direct, link_only, multi_link): (i64, i64, i64) = conn.query_row(
+                            "SELECT SUM(has_direct), SUM(NOT has_direct AND link_count > 0), SUM(link_count > 1) FROM (SELECT semantic.semantic_key, EXISTS(SELECT 1 FROM resolution_definition_unit_crosswalks direct WHERE direct.blob_id=semantic.blob_id AND direct.definition_semantic_key=semantic.semantic_key) AS has_direct, (SELECT COUNT(*) FROM source_native_declaration_bridges bridge JOIN source_declaration_units link ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id WHERE bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site) AS link_count FROM resolution_semantic_sites semantic WHERE semantic.semantic_role='definition' AND semantic.blob_id=(SELECT blob_id FROM code_units WHERE identifier='Target' AND in_declarations=1 LIMIT 1))",
+                            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        ).unwrap();
+                        eprintln!("go_target_published_shapes direct={direct} link_only={link_only} multi_link={multi_link}");
+                    }
+                    if mode != "clean" {
+                        let (blob, target_key): (i64, i64) = conn.query_row("SELECT blob_id,unit_key FROM code_units WHERE identifier='Target' AND in_declarations=1 LIMIT 1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+                        let other_key: i64 = conn.query_row("SELECT unit_key FROM code_units WHERE blob_id=?1 AND identifier='Other' AND in_declarations=1", [blob], |row| row.get(0)).unwrap();
+                        let third_key: i64 = conn.query_row("SELECT unit_key FROM code_units WHERE blob_id=?1 AND identifier='Third' AND in_declarations=1", [blob], |row| row.get(0)).unwrap();
+                        let (link_key, direct_key) = match mode {
+                            "target_conflict" => (target_key, other_key),
+                            "missing_route" => (other_key, third_key + 1000),
+                            "unrelated_conflict" => (other_key, third_key),
+                            _ => unreachable!(),
+                        };
+                        let semantic_key: i64 = conn.query_row("SELECT semantic.semantic_key FROM resolution_semantic_sites AS semantic JOIN source_native_declaration_bridges AS bridge ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site JOIN source_declaration_units AS link ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id WHERE semantic.blob_id=?1 AND semantic.semantic_role='definition' AND link.unit_key=?2", params![blob, link_key], |row| row.get(0)).unwrap();
+                        conn.execute("INSERT INTO resolution_definition_unit_crosswalks(blob_id,definition_semantic_key,unit_key,identity_digest) VALUES(?1,?2,?3,zeroblob(32)) ON CONFLICT(blob_id,definition_semantic_key) DO UPDATE SET unit_key=excluded.unit_key", params![blob,semantic_key,direct_key]).unwrap();
+                    }
+                    let violations: Vec<String> = conn.prepare("PRAGMA foreign_key_check").unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+                    assert!(violations.is_empty(), "{mode}: {violations:?}");
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let answer = operation
+                    .go_hierarchy_definition_match(
+                        &target,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                match mode {
+                    "clean" | "unrelated_conflict" => assert!(
+                        matches!(answer, GoHierarchyDefinitionMatch::Found(_)),
+                        "{mode}: {answer:?}"
+                    ),
+                    _ => assert_eq!(answer, GoHierarchyDefinitionMatch::Unavailable, "{mode}"),
+                }
+                if mode == "unrelated_conflict" {
+                    // The old full-file projection returned Unavailable for both targets.
+                    let answer = operation
+                        .go_hierarchy_definition_match(
+                            &missing,
+                            &cancellation,
+                            &ResolutionSession::unbounded(),
+                        )
+                        .unwrap();
+                    assert_eq!(answer, GoHierarchyDefinitionMatch::Missing);
+                    let reverse = operation
+                        .go_reverse_candidate_sites(&target, context, true, &[0; 32], &cancellation)
+                        .unwrap();
+                    assert!(
+                        matches!(reverse, GoReverseCandidateOutcome::Ready(_)),
+                        "target sites must survive the unrelated malformed definition"
+                    );
+                    let reverse_absent = operation
+                        .go_reverse_candidate_sites(
+                            &missing,
+                            context,
+                            true,
+                            &[0; 32],
+                            &cancellation,
+                        )
+                        .unwrap();
+                    assert!(
+                        matches!(
+                            reverse_absent,
+                            GoReverseCandidateOutcome::TargetUncovered(_)
+                        ),
+                        "absent target has no selected definition sites"
+                    );
+                }
+                cancellation.cancel();
+                let stopped = operation
+                    .go_hierarchy_definition_match(
+                        &target,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(
+                    matches!(stopped, GoHierarchyDefinitionMatch::Stopped { .. }),
+                    "{stopped:?}"
+                );
+            }
+
+            // The same path selects a new published blob: a target from the first
+            // view must be absent when that definition is removed from the file.
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; func Other() {}",
+                "package provider; func Missing() {}",
+                "package provider",
+            ]);
+            publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let (old_state, _) =
+                parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, SOURCE);
+            let old_target = selected_consumer_unit(
+                old_state
+                    .declarations
+                    .iter()
+                    .find(|unit| unit.identifier() == "Target")
+                    .unwrap(),
+            );
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let answer = operation
+                .go_hierarchy_definition_match(
+                    &old_target,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert_eq!(answer, GoHierarchyDefinitionMatch::Missing);
+        }
+
+        #[test]
+        fn go_import_spec_does_not_refuse_hierarchy_or_reverse_targets() {
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseCandidateOutcome;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoHierarchyDefinitionMatch;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+
+            let mut observed = Vec::new();
+            for import in ["", "import \"example.test/root/provider\"\n"] {
+                let source = format!(
+                    "package consumer\n{import}type Runner interface {{ Run() error }}\ntype Worker struct{{}}\nfunc (Worker) Run() error {{ return nil }}\n"
+                );
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    source.as_str(),
+                    "package provider",
+                    "package provider",
+                ]);
+                let context =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+                anchor_consumer(&fixture);
+                let (state, _) =
+                    parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, &source);
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let mut shape = Vec::new();
+                for name in ["Runner", "Worker.Run"] {
+                    let unit = selected_consumer_unit(
+                        state
+                            .declarations
+                            .iter()
+                            .find(|unit| unit.short_name() == name)
+                            .expect(name),
+                    );
+                    let hierarchy = operation
+                        .go_hierarchy_definition_match(
+                            &unit,
+                            &cancellation,
+                            &ResolutionSession::unbounded(),
+                        )
+                        .unwrap();
+                    let reverse = operation
+                        .go_reverse_candidate_sites(&unit, context, true, &[0; 32], &cancellation)
+                        .unwrap();
+                    shape.push((
+                        matches!(hierarchy, GoHierarchyDefinitionMatch::Found(_)),
+                        matches!(reverse, GoReverseCandidateOutcome::Ready(_)),
+                    ));
+                }
+                observed.push(shape);
+            }
+            assert_eq!(observed[0], observed[1]);
+            assert_eq!(observed[1], vec![(true, true), (true, true)]);
+        }
+
+        #[test]
+        fn go_inline_interface_neighbor_reverse_target_must_cover_worker() {
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_reverse_rows::GoReverseCandidateOutcome;
+            let source = "package consumer\ntype Outer struct { A, B interface { Run() error } }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n";
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                source,
+                "package provider",
+                "package provider",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/consumer");
+            anchor_consumer(&fixture);
+            let (state, _) =
+                parsed_go_state(fixture._project_root.path(), GO_ROOT_CONSUMER_PATH, source);
+            let worker = selected_consumer_unit(
+                state
+                    .declarations
+                    .iter()
+                    .find(|unit| unit.short_name() == "Worker.Run")
+                    .expect("Worker.Run"),
+            );
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let match_result = operation.go_hierarchy_definition_match(&worker, &cancellation, &brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession::unbounded()).unwrap();
+            assert!(matches!(match_result, brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::GoHierarchyDefinitionMatch::Found(_)), "{match_result:?}");
+            let result = operation
+                .go_reverse_candidate_sites(&worker, context, true, &[0; 32], &cancellation)
+                .unwrap();
+            assert!(
+                matches!(result, GoReverseCandidateOutcome::Ready(_)),
+                "Worker reverse target must be covered"
+            );
+        }
+
+        #[test]
         fn go_hierarchy_lookup_blobs_and_selection_coverage() {
             use brokk_bifrost_analysis::analyzer::resolution::fact_source::TypedFactPageVisitor;
             use brokk_bifrost_analysis::analyzer::resolution::model::{SemanticId, SharedNameId};
@@ -1614,6 +2558,190 @@ mod go_extraction_tests_global {
                         .unwrap(),
                     expected
                 );
+            }
+        }
+
+        #[test]
+        #[brokk_bifrost_test_macros::hardwon(
+            "#7509: a bridged Go interface alias (a grouped spec on master) skipped the typed interface proof and stayed Open"
+        )]
+        fn go_alias_type_support_uses_typed_interface_evidence_with_or_without_bridge() {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoTypeSupport;
+            use rusqlite::params;
+
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; type Item struct{}; type Solo = interface { M() }; type ( Group = interface { M() } ); type Concrete = Item; type Empty = interface{}",
+                "package provider; type Other struct{}",
+                "package provider; type Third struct{}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let mut definitions = std::collections::HashMap::new();
+            for name in ["Solo", "Group", "Concrete", "Empty"] {
+                let (ordinal, key): (u32, u32) = conn
+                    .query_row(
+                        "SELECT mount.mount_ordinal, semantic.semantic_key
+                         FROM temp.selected_resolution_mounts mount
+                         JOIN source_go_aliases alias ON alias.blob_id=mount.blob_id
+                         JOIN source_native_declaration_bridges bridge
+                           ON bridge.blob_id=alias.blob_id
+                          AND bridge.declaration_id=alias.declaration_id
+                         JOIN resolution_semantic_sites semantic
+                           ON semantic.blob_id=bridge.blob_id
+                          AND semantic.source_site=bridge.source_site
+                          AND semantic.semantic_role='definition'
+                         WHERE mount.persisted_relative_path=?1 AND alias.name=?2",
+                        params![GO_ROOT_CONSUMER_PATH, name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                definitions.insert(name, SemanticId::local(ordinal, key));
+            }
+            for (name, expected) in [
+                ("Solo", GoTypeSupport::Supported),
+                ("Group", GoTypeSupport::Supported),
+                ("Concrete", GoTypeSupport::Open),
+                ("Empty", GoTypeSupport::Open),
+            ] {
+                assert_eq!(
+                    operation
+                        .go_type_supports(context, "go", definitions[name], &cancellation)
+                        .unwrap(),
+                    expected,
+                    "{name}"
+                );
+            }
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            assert_eq!(
+                operation
+                    .go_type_supports(context, "go", definitions["Solo"], &cancelled)
+                    .unwrap(),
+                GoTypeSupport::Open
+            );
+            drop(operation);
+
+            fixture.store.conn.execute(|conn| {
+                // Model an already-published blob from the old producer, which
+                // emitted this alias without a bridge. This store is isolated.
+                conn.execute_batch(
+                    "DROP TRIGGER source_native_declaration_bridges_no_delete_after_seal",
+                )
+                .unwrap();
+                conn.execute(
+                    "DELETE FROM source_native_declaration_bridges
+                     WHERE (blob_id, declaration_id) IN
+                       (SELECT blob_id, declaration_id FROM source_go_aliases WHERE name='Group')",
+                    [],
+                )
+                .unwrap();
+            });
+            let operation = fixture.open_ready(&cancellation);
+            assert_eq!(
+                operation
+                    .go_type_supports(context, "go", definitions["Group"], &cancellation)
+                    .unwrap(),
+                GoTypeSupport::Supported,
+                "old unbridged alias shape must keep its typed interface proof"
+            );
+        }
+
+        #[test]
+        #[brokk_bifrost_test_macros::hardwon(
+            "#7509: sole-spec Go alias bridge missed its parser Field declaration"
+        )]
+        fn go_alias_bridge_reaches_its_selected_field_unit() {
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer\ntype Target struct{}\ntype Alias = Target\ntype (\n Grouped = Target\n Other = Target\n)\n",
+                "package provider; type Other struct{}",
+                "package provider; type Third struct{}",
+            ]);
+            let _context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let mut statement = conn
+                .prepare(
+                    "SELECT alias.name, declaration.declaration_id,
+                        declaration.occurrence_id, declaration.name_occurrence_id,
+                        (SELECT count(*) FROM source_declaration_units link
+                          WHERE link.blob_id=declaration.blob_id
+                            AND link.declaration_id=declaration.declaration_id),
+                        (SELECT count(*) FROM source_native_declaration_bridges bridge
+                          WHERE bridge.blob_id=declaration.blob_id
+                            AND bridge.declaration_id=declaration.declaration_id)
+                   FROM temp.selected_resolution_mounts mount
+                   JOIN source_go_aliases alias ON alias.blob_id=mount.blob_id
+                   JOIN source_declarations parser ON parser.blob_id=alias.blob_id
+                    AND parser.declaration_id=alias.declaration_id
+                   JOIN source_declarations declaration ON declaration.blob_id=parser.blob_id
+                    AND declaration.name_occurrence_id=parser.name_occurrence_id
+                  WHERE mount.persisted_relative_path=?1
+                    AND alias.name IN ('Alias','Grouped','Other')
+                  ORDER BY alias.name,declaration.declaration_id",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([GO_ROOT_CONSUMER_PATH], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            eprintln!("GO_ALIAS_OWNER_ROWS {rows:?}");
+
+            let selected: Vec<(i64, String)> = conn
+                .prepare(
+                    "SELECT semantic.semantic_key,units.short_name
+                   FROM temp.selected_resolution_mounts mount
+                   JOIN resolution_fragment_interiors interior ON interior.blob_id=mount.blob_id
+                    AND interior.producer_epoch=mount.producer_epoch
+                    AND interior.interior_digest=mount.interior_digest
+                    AND interior.publication_state='complete'
+                   JOIN source_fact_manifests source ON source.blob_id=interior.blob_id
+                    AND source.publication_state='complete'
+                   JOIN source_go_aliases alias ON alias.blob_id=mount.blob_id
+                   JOIN source_native_declaration_bridges bridge ON bridge.blob_id=alias.blob_id
+                    AND bridge.declaration_id=alias.declaration_id
+                   JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id
+                    AND semantic.source_site=bridge.source_site
+                    AND semantic.semantic_role='definition'
+                   JOIN source_declaration_units link ON link.blob_id=bridge.blob_id
+                    AND link.declaration_id=bridge.declaration_id
+                   JOIN code_units units ON units.blob_id=link.blob_id
+                    AND units.unit_key=link.unit_key
+                  WHERE mount.persisted_relative_path=?1 AND alias.name='Alias'
+                    AND units.in_declarations=1",
+                )
+                .unwrap()
+                .query_map([GO_ROOT_CONSUMER_PATH], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            eprintln!("GO_ALIAS_SELECTED_UNITS {selected:?}");
+            assert_eq!(
+                selected.len(),
+                1,
+                "selected alias definition must reach its Field unit: {selected:?}"
+            );
+            assert_eq!(selected[0].1, "_module_.Alias");
+
+            for name in ["Alias", "Grouped", "Other"] {
+                let owned = rows.iter().filter(|row| row.0 == name).collect::<Vec<_>>();
+                assert_eq!(owned.len(), 1, "{name}: {rows:?}");
+                assert_eq!((owned[0].4, owned[0].5), (1, 1), "{name}: {rows:?}");
             }
         }
 
@@ -1988,13 +3116,606 @@ mod go_extraction_tests_global {
                         &ResolutionSession::unbounded(),
                     )
                     .unwrap();
-                assert_eq!(answer.parents.len(), 1, "{answer:?}");
-                assert!(answer.is_complete(), "{answer:?}");
-                assert_eq!(
-                    answer.parents[0].targets,
-                    vec![declaration(GO_ROOT_PROVIDER_PATH, parent)]
+                assert!(
+                    answer.embeddings_complete() && !answer.forward_satisfaction_enumerated,
+                    "{answer:?}"
+                );
+                assert!(
+                    answer.parents.iter().any(
+                        |edge| edge.targets == vec![declaration(GO_ROOT_PROVIDER_PATH, parent)]
+                    ),
+                    "{answer:?}"
                 );
             }
+        }
+
+        #[test]
+        fn go_forward_supertypes_confirm_structural_targets_and_inherited_interfaces() {
+            use brokk_bifrost_analysis::analyzer::resolution::ResolutionTypeRef;
+            use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::go_methods::GoMethodSatisfaction;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; import p \"example.test/root/provider\"; type Use struct{p.T}",
+                "package provider; type T struct{}; func (T) Foo(){}; func (T) F() Missing { panic(0) }; type J interface{Foo()}; type I interface{J}; type K interface{I}; type Cut interface{J; Missing}; type E interface{}; type EU interface{Missing}; type Io interface{F() Missing}; type J2 interface{Foo(); Bar()}; type P struct{}; func (*P) Ptr(){}; type IP interface{Ptr()}; type W struct{E}; func (W) Foo(){}; type S struct{}; func (*S) Promoted(){}; type EmbeddedPointer struct{*S}; type IM interface{Promoted()}",
+                "package provider; type Decoy struct{}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            fixture.store.conn.execute(move |conn| {
+                for table in [
+                    "go_context_publications",
+                    "go_package_instances",
+                    "go_package_imports",
+                ] {
+                    conn.execute(
+                        &format!("UPDATE {table} SET complete=1 WHERE context_id=?1"),
+                        [context],
+                    )
+                    .unwrap();
+                }
+            });
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let declaration =
+                |name: &str| go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, name);
+            let census = operation
+                .go_forward_package_census(
+                    context,
+                    "go",
+                    None,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert_eq!(census, None, "selected source census: {census:?}");
+            let stopped_session = ResolutionSession::bounded_with_total_work(
+                Default::default(),
+                1,
+                Some(&cancellation),
+            );
+            let stopped = operation
+                .go_forward_package_census(context, "go", None, &cancellation, &stopped_session)
+                .unwrap();
+            assert_eq!(stopped, Some("forward census was stopped"));
+            let parents = |name: &str| {
+                operation
+                    .go_direct_supertypes(
+                        context,
+                        "go",
+                        declaration(name),
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap()
+            };
+            let t = parents("T");
+            for name in ["J", "I", "K", "E"] {
+                assert!(
+                    t.parents
+                        .iter()
+                        .any(|parent| parent.targets == vec![declaration(name)]),
+                    "{name}: {t:?}"
+                );
+            }
+            for name in ["Cut", "EU", "Io"] {
+                assert!(
+                    !t.parents
+                        .iter()
+                        .any(|parent| parent.targets == vec![declaration(name)]),
+                    "{name}: {t:?}"
+                );
+            }
+            assert!(!t.forward_open_reasons.is_empty(), "{t:?}");
+            assert!(
+                t.forward_open_reasons
+                    .iter()
+                    .any(|reason| reason.contains("target closure")),
+                "target closure gap must coexist with J, I, K and E: {t:?}"
+            );
+            let j2 = parents("J2");
+            assert!(
+                j2.parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("I")]),
+                "{j2:?}"
+            );
+            let p = parents("P");
+            assert!(
+                !p.parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("IP")]),
+                "{p:?}"
+            );
+            assert!(!p.forward_satisfaction_enumerated, "{p:?}");
+            let p_id = declaration("P");
+            let ip_id = declaration("IP");
+            let value_proof = operation
+                .go_selected_type_satisfaction_for_test(
+                    context,
+                    "go",
+                    ResolutionTypeRef::new(p_id, 0),
+                    ip_id,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap()
+                .unwrap();
+            let pointer_proof = operation
+                .go_selected_type_satisfaction_for_test(
+                    context,
+                    "go",
+                    ResolutionTypeRef::new(p_id, 1),
+                    ip_id,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_ne!(value_proof, GoMethodSatisfaction::Satisfies);
+            assert_eq!(pointer_proof, GoMethodSatisfaction::Satisfies);
+            let inverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    ip_id,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(inverse.is_complete(), "{inverse:?}");
+            assert!(!inverse.edges.contains(&p_id), "{inverse:?}");
+            let embedded_pointer = declaration("EmbeddedPointer");
+            let im = declaration("IM");
+            assert_eq!(
+                operation
+                    .go_selected_type_satisfaction_for_test(
+                        context,
+                        "go",
+                        ResolutionTypeRef::new(embedded_pointer, 0),
+                        im,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap(),
+                Some(GoMethodSatisfaction::Satisfies)
+            );
+            let promoted_parents = parents("EmbeddedPointer");
+            assert!(
+                promoted_parents
+                    .parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![im]),
+                "{promoted_parents:?}"
+            );
+            let promoted_inverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    im,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(
+                promoted_inverse.edges.contains(&embedded_pointer),
+                "{promoted_inverse:?}"
+            );
+            let value_inverse = operation
+                .go_direct_subtypes(
+                    context,
+                    "go",
+                    declaration("J"),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(
+                value_inverse.edges.contains(&declaration("T")),
+                "{value_inverse:?}"
+            );
+            let (ordinal, key): (u32, u32) = conn.query_row(
+                "SELECT mount.mount_ordinal, semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations owner ON owner.blob_id=mount.blob_id JOIN source_go_callables method ON method.blob_id=owner.blob_id AND method.owner_type_id=owner.type_id JOIN source_native_declaration_bridges bridge ON bridge.blob_id=method.blob_id AND bridge.declaration_id=method.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND owner.name='IP' AND method.name='Ptr'",
+                [GO_ROOT_PROVIDER_PATH],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            let family = operation
+                .go_native_method_family(
+                    context,
+                    "go",
+                    brokk_bifrost_analysis::analyzer::resolution::model::SemanticId::local(
+                        ordinal, key,
+                    ),
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            let (pointer_ordinal, pointer_key): (u32, u32) = conn.query_row(
+                "SELECT mount.mount_ordinal, semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_callables method ON method.blob_id=mount.blob_id AND method.receiver_type_id IS NOT NULL JOIN source_native_declaration_bridges bridge ON bridge.blob_id=method.blob_id AND bridge.declaration_id=method.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND method.name='Ptr'",
+                [GO_ROOT_PROVIDER_PATH],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert!(
+                family.implemented_by.methods.contains(
+                    &brokk_bifrost_analysis::analyzer::resolution::model::SemanticId::local(
+                        pointer_ordinal,
+                        pointer_key
+                    )
+                ),
+                "{family:?}"
+            );
+            let mut cut = None;
+            for total_work_limit in [32, 64, 128, 256, 512, 1024, 2048, 4096] {
+                let session = ResolutionSession::bounded_with_total_work(
+                    Default::default(),
+                    total_work_limit,
+                    Some(&cancellation),
+                );
+                let answer = operation
+                    .go_direct_supertypes(context, "go", declaration("W"), &cancellation, &session)
+                    .unwrap();
+                if answer
+                    .parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("E")])
+                    && answer
+                        .forward_open_reasons
+                        .contains(&"forward interface target closure was stopped")
+                {
+                    cut = Some((total_work_limit, answer));
+                    break;
+                }
+            }
+            let (total_work_limit, cut) =
+                cut.expect("a bounded target closure cut after E was proven");
+            assert!(
+                !cut.forward_satisfaction_enumerated,
+                "{total_work_limit}: {cut:?}"
+            );
+            assert!(
+                cut.parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("E")]),
+                "{total_work_limit}: {cut:?}"
+            );
+            assert!(
+                !cut.parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("Cut")]),
+                "{total_work_limit}: {cut:?}"
+            );
+        }
+
+        #[test]
+        fn go_forward_census_refuses_recovered_and_sourceless_peers() {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            for variant in ["recovered", "sourceless"] {
+                let provider = if variant == "recovered" {
+                    "package provider; type T struct{}; func (T) M(){}; type I interface{M()}; func broken("
+                } else {
+                    "package provider; type T struct{}; func (T) M(){}; type I interface{M()}"
+                };
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    "package consumer; import p \"example.test/root/provider\"; type Use struct{p.T}",
+                    provider,
+                    "package provider; type Other struct{}",
+                ]);
+                let context =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+                fixture.store.conn.execute(move |conn| {
+                    conn.execute("UPDATE go_context_publications SET complete=1 WHERE context_id=?1", [context]).unwrap();
+                    conn.execute("UPDATE go_package_instances SET complete=1 WHERE context_id=?1", [context]).unwrap();
+                    match variant {
+                        "recovered" => {
+                            let recovered: i64 = conn.query_row("SELECT count(*) FROM source_structural_recovered_regions", [], |row| row.get(0)).unwrap();
+                            assert!(recovered > 0, "fixture must publish a recovered peer");
+                        }
+                        "sourceless" => { conn.execute("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,provider_kind,unit_key) VALUES(?1,'example.test/root/empty','empty','','',zeroblob(32),1,jsonb('[]'),'workspace',randomblob(32))", [context]).unwrap(); }
+                        _ => unreachable!(),
+                    }
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let census = operation
+                    .go_forward_package_census(
+                        context,
+                        "go",
+                        None,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(census.is_some(), "{variant}: {census:?}");
+                let scan = operation
+                    .go_forward_empty_interface_scan(
+                        context,
+                        "go",
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                let declaration = go_hierarchy_declaration(
+                    operation.ready.inventory.connection(),
+                    GO_ROOT_PROVIDER_PATH,
+                    "T",
+                );
+                let answer = operation
+                    .go_direct_supertypes_with_scan(
+                        context,
+                        "go",
+                        declaration,
+                        &scan,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(
+                    !answer.forward_satisfaction_enumerated
+                        && !answer.forward_open_reasons.is_empty(),
+                    "{variant}: {answer:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn go_forward_satisfaction_closes_clean_named_inventory_but_not_inline_alias() {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            for alias in [0, 1, 2, 3, 4] {
+                let provider = match alias {
+                    0 => {
+                        "package provider; type T struct{}; func (T) M(){}; type I interface{M()}; type E interface{}".to_string()
+                    }
+                    1 => {
+                        "package provider; type T struct{}; func (T) M(){}; type I interface{M()}; type E = interface{}".to_string()
+                    }
+                    2 => {
+                        "package provider; type T struct{}; func (T) M(){}; type I interface{M()}; type E = (interface{})"
+                            .to_string()
+                    }
+                    3 => format!(
+                        "package provider; type T struct{{}}; func (T) M(){{}}; type I interface{{M()}}; type E = {}interface{{}}{}",
+                        "(".repeat(40), ")".repeat(40)
+                    ),
+                    _ => "package provider; type T struct{}; func (T) M(){}; type I interface{M()}; type N = (((int)))".to_string(),
+                };
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    "package consumer; import p \"example.test/root/provider\"; type Use struct{p.T}",
+                    &provider,
+                    "package provider; type Other struct{}",
+                ]);
+                let context =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+                fixture.store.conn.execute(move |conn| {
+                    for table in [
+                        "go_context_publications",
+                        "go_package_instances",
+                        "go_package_imports",
+                    ] {
+                        conn.execute(
+                            &format!("UPDATE {table} SET complete=1 WHERE context_id=?1"),
+                            [context],
+                        )
+                        .unwrap();
+                    }
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                if alias == 3 {
+                    let wrappers: i64 = operation
+                        .ready
+                        .inventory
+                        .connection()
+                        .query_row(
+                            "SELECT count(*) FROM temp.selected_resolution_mounts mount \
+                         JOIN main.source_go_aliases alias ON alias.blob_id=mount.blob_id \
+                         JOIN main.source_go_types ty ON ty.blob_id=alias.blob_id \
+                         WHERE mount.persisted_relative_path=?1 AND alias.name='E' AND ty.kind=8",
+                            [GO_ROOT_PROVIDER_PATH],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(wrappers > 32, "deep alias was not published: {wrappers}");
+                }
+                let root = go_hierarchy_declaration(
+                    operation.ready.inventory.connection(),
+                    GO_ROOT_PROVIDER_PATH,
+                    "T",
+                );
+                let interface = go_hierarchy_declaration(
+                    operation.ready.inventory.connection(),
+                    GO_ROOT_PROVIDER_PATH,
+                    "I",
+                );
+                let answer = operation
+                    .go_direct_supertypes(
+                        context,
+                        "go",
+                        root,
+                        &cancellation,
+                        &ResolutionSession::unbounded(),
+                    )
+                    .unwrap();
+                assert!(
+                    answer
+                        .parents
+                        .iter()
+                        .any(|parent| parent.targets == vec![interface]),
+                    "{alias}: {answer:?}"
+                );
+                if (1..=3).contains(&alias) {
+                    assert!(!answer.forward_satisfaction_enumerated, "{answer:?}");
+                    assert!(
+                        answer
+                            .forward_open_reasons
+                            .iter()
+                            .any(|reason| reason.contains("inline interface alias")),
+                        "{answer:?}"
+                    );
+                } else {
+                    assert!(answer.forward_satisfaction_enumerated, "{answer:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn go_forward_empty_scan_selected_interface_shapes() {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let provider = "package provider; type T struct{}; func (T) M(){}; type E interface{}; type EC interface{/* comment */}; type F interface{E}; type P interface{(E)}; type Q interface{missing.X}; type A = E; type FA interface{A}; type C interface{~int | ~string}; type Comparable interface{comparable}; type U interface{M(); missing.X}; type I interface{M()}";
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; import p \"example.test/root/provider\"; type Use struct{p.T}",
+                provider,
+                "package provider; type Other struct{}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            fixture.store.conn.execute(move |conn| {
+                for table in [
+                    "go_context_publications",
+                    "go_package_instances",
+                    "go_package_imports",
+                ] {
+                    conn.execute(
+                        &format!("UPDATE {table} SET complete=1 WHERE context_id=?1"),
+                        [context],
+                    )
+                    .unwrap();
+                }
+            });
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            for (name, expected) in [
+                ("E", 0),
+                ("EC", 0),
+                ("F", 1),
+                ("P", 1),
+                ("Q", 1),
+                ("FA", 1),
+                ("C", 1),
+                ("Comparable", 1),
+                ("U", 1),
+                ("I", 1),
+            ] {
+                let flag: i64 = conn.query_row(
+                    "SELECT ty.has_named_children FROM temp.selected_resolution_mounts mount JOIN source_go_type_declarations declaration ON declaration.blob_id=mount.blob_id JOIN source_go_types ty ON ty.blob_id=declaration.blob_id AND ty.type_id=declaration.type_id AND ty.kind=13 WHERE mount.persisted_relative_path=?1 AND declaration.name=?2",
+                    rusqlite::params![GO_ROOT_PROVIDER_PATH, name], |row| row.get(0)
+                ).unwrap();
+                assert_eq!(flag, expected, "{name}");
+            }
+            let scan = operation
+                .go_forward_empty_interface_scan(
+                    context,
+                    "go",
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            let declaration = |name| go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, name);
+            let answer = operation
+                .go_direct_supertypes_with_scan(
+                    context,
+                    "go",
+                    declaration("T"),
+                    &scan,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            for name in ["E", "EC", "F"] {
+                assert!(
+                    answer
+                        .parents
+                        .iter()
+                        .any(|parent| parent.targets == vec![declaration(name)]),
+                    "{name}: {answer:?}"
+                );
+            }
+            assert!(
+                !answer
+                    .parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("C")]),
+                "{answer:?}"
+            );
+            assert!(
+                !scan.is_complete(),
+                "unresolved or constraint inventories keep the scan open: {scan:?}"
+            );
+        }
+
+        #[test]
+        fn go_forward_empty_scan_excludes_own_method_with_unresolved_embedding() {
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            let fixture = GoRootResolutionOperationFixture::with_sources([
+                "package consumer; import p \"example.test/root/provider\"; type Use struct{p.T}",
+                "package provider; type R struct{}; type T struct{}; func (T) M(){}; type E interface{}; type U interface{M(); missing.X}",
+                "package provider; type Other struct{}",
+            ]);
+            let context = publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+            fixture.store.conn.execute(move |conn| {
+                for table in [
+                    "go_context_publications",
+                    "go_package_instances",
+                    "go_package_imports",
+                ] {
+                    conn.execute(
+                        &format!("UPDATE {table} SET complete=1 WHERE context_id=?1"),
+                        [context],
+                    )
+                    .unwrap();
+                }
+            });
+            let cancellation = CancellationToken::new();
+            let operation = fixture.open_ready(&cancellation);
+            let conn = operation.ready.inventory.connection();
+            let declaration = |name| go_hierarchy_declaration(conn, GO_ROOT_PROVIDER_PATH, name);
+            let scan = operation
+                .go_forward_empty_interface_scan(
+                    context,
+                    "go",
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(scan.is_complete(), "{scan:?}");
+            let r = operation
+                .go_direct_supertypes_with_scan(
+                    context,
+                    "go",
+                    declaration("R"),
+                    &scan,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(r.forward_satisfaction_enumerated, "{r:?}");
+            assert!(
+                r.parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("E")]),
+                "{r:?}"
+            );
+            let t = operation
+                .go_direct_supertypes_with_scan(
+                    context,
+                    "go",
+                    declaration("T"),
+                    &scan,
+                    &cancellation,
+                    &ResolutionSession::unbounded(),
+                )
+                .unwrap();
+            assert!(!t.forward_satisfaction_enumerated, "{t:?}");
+            assert!(
+                t.forward_open_reasons
+                    .iter()
+                    .any(|reason| reason.contains("inventory")),
+                "{t:?}"
+            );
+            assert!(
+                !t.parents
+                    .iter()
+                    .any(|parent| parent.targets == vec![declaration("U")]),
+                "{t:?}"
+            );
         }
 
         #[test]
@@ -2270,7 +3991,13 @@ mod go_extraction_tests_global {
                     &ResolutionSession::unbounded(),
                 )
                 .unwrap();
-            assert!(family.implements.is_complete(), "{family:?}");
+            assert!(!family.implements.is_complete(), "{family:?}");
+            assert!(
+                family
+                    .implements
+                    .open_reasons
+                    .contains(&"promoted method selection does not certify earlier formal IDs")
+            );
             assert!(
                 !family.implements.methods.contains(&method("Base", "M")),
                 "{family:?}"
@@ -2368,6 +4095,119 @@ mod go_extraction_tests_global {
 
         #[test]
         #[hardwon(
+            "#7509: anonymous interface method family returned a closed empty implementor set"
+        )]
+        fn go_anonymous_interface_method_family_probe() {
+            use brokk_bifrost_analysis::analyzer::resolution::model::SemanticId;
+            use brokk_bifrost_core::analyzer::usages::resolution_session::ResolutionSession;
+            use rusqlite::{OptionalExtension, params};
+            let cases = [
+                (
+                    "parameter",
+                    "package provider; type T struct{}; func (T) M(){}; func f(x interface{ M() }) { x.M() }",
+                    "M",
+                ),
+                (
+                    "field",
+                    "package provider; type T struct{}; func (T) Y(){}; type W struct{ f interface{ Y() } }",
+                    "Y",
+                ),
+                (
+                    "deep_alias",
+                    &format!(
+                        "package provider; type T struct{{}}; func (T) M(){{}}; type E = {}interface{{ M() }}{}",
+                        "(".repeat(40),
+                        ")".repeat(40)
+                    ),
+                    "M",
+                ),
+                (
+                    "named",
+                    "package provider; type T struct{}; func (T) M(){}; type I interface{ M() }",
+                    "M",
+                ),
+            ];
+            let mut false_closed = Vec::new();
+            for (case, source, name) in cases {
+                let fixture = GoRootResolutionOperationFixture::with_sources([
+                    "package consumer",
+                    source,
+                    "package provider; type Other struct{}",
+                ]);
+                let context =
+                    publish_go_root_fixture_context(&fixture, "example.test/root/provider");
+                fixture.store.conn.execute(move |conn| {
+                    for table in [
+                        "go_context_publications",
+                        "go_package_instances",
+                        "go_package_imports",
+                    ] {
+                        conn.execute(
+                            &format!("UPDATE {table} SET complete=1 WHERE context_id=?1"),
+                            [context],
+                        )
+                        .unwrap();
+                    }
+                });
+                let cancellation = CancellationToken::new();
+                let operation = fixture.open_ready(&cancellation);
+                let conn = operation.ready.inventory.connection();
+                let method: Option<(u32, u32)> = conn.query_row(
+                    "SELECT mount.mount_ordinal, semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_callables callable ON callable.blob_id=mount.blob_id JOIN source_go_types owner ON owner.blob_id=callable.blob_id AND owner.type_id=callable.owner_type_id AND owner.kind=13 JOIN source_native_declaration_bridges bridge ON bridge.blob_id=callable.blob_id AND bridge.declaration_id=callable.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND callable.name=?2 AND callable.is_method=1 LIMIT 1",
+                    params![GO_ROOT_PROVIDER_PATH, name], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional().unwrap();
+                eprintln!("{case}: selected interface method = {method:?}");
+                if case == "field" || case == "named" {
+                    assert!(method.is_some(), "{case}: missing selected method");
+                }
+                if let Some((mount, key)) = method {
+                    let family = operation
+                        .go_native_method_family(
+                            context,
+                            "go",
+                            SemanticId::local(mount, key),
+                            &cancellation,
+                            &ResolutionSession::unbounded(),
+                        )
+                        .unwrap();
+                    eprintln!("{case}: native family = {family:?}");
+                    if case == "field" {
+                        assert!(
+                            family
+                                .implemented_by
+                                .open_reasons
+                                .contains(&"interface method has no declaring interface identity"),
+                            "{family:?}"
+                        );
+                        assert!(family.implements.open_reasons.is_empty(), "{family:?}");
+                    }
+                    if case == "named" {
+                        let (receiver_mount, receiver_key): (u32, u32) = conn.query_row(
+                            "SELECT mount.mount_ordinal, semantic.semantic_key FROM temp.selected_resolution_mounts mount JOIN source_go_callables callable ON callable.blob_id=mount.blob_id AND callable.receiver_type_id IS NOT NULL JOIN source_native_declaration_bridges bridge ON bridge.blob_id=callable.blob_id AND bridge.declaration_id=callable.declaration_id JOIN resolution_semantic_sites semantic ON semantic.blob_id=bridge.blob_id AND semantic.source_site=bridge.source_site AND semantic.semantic_role='definition' WHERE mount.persisted_relative_path=?1 AND callable.name='M'",
+                            [GO_ROOT_PROVIDER_PATH], |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).unwrap();
+                        assert!(family.implemented_by.is_complete(), "{family:?}");
+                        assert!(
+                            family
+                                .implemented_by
+                                .methods
+                                .contains(&SemanticId::local(receiver_mount, receiver_key)),
+                            "{family:?}"
+                        );
+                    }
+                    if family.implemented_by.is_complete()
+                        && family.implemented_by.methods.is_empty()
+                        && case != "named"
+                    {
+                        false_closed.push(case);
+                    }
+                }
+            }
+            assert!(false_closed.is_empty(), "false closed: {false_closed:?}");
+        }
+
+        #[test]
+        #[hardwon(
             "#7509: native Go Implements missed promoted receivers and returned a complete negative"
         )]
         fn go_method_family_closes_promoted_receiver_forms() {
@@ -2451,12 +4291,18 @@ type aliasEmbed struct { Alias }
                         &ResolutionSession::unbounded(),
                     )
                     .unwrap();
-                let expected = if owner == "left" || owner == "right" {
+                let expected = if ["m", "left", "right"].contains(&owner) {
                     Vec::new()
                 } else {
                     vec![interface]
                 };
                 assert_eq!(forward.implements.methods, expected, "{owner}: {forward:?}");
+                if owner == "m" {
+                    assert!(!forward.implements.is_complete(), "{owner}: {forward:?}");
+                    assert!(forward.implements.open_reasons.contains(
+                        &"promoted method selection does not certify earlier formal IDs"
+                    ));
+                }
             }
             let inverse = operation
                 .go_native_method_family(
@@ -2602,7 +4448,14 @@ type aliasEmbed struct { Alias }
                     &ResolutionSession::unbounded(),
                 )
                 .unwrap();
-            assert!(direct.is_complete(), "{direct:?}");
+            assert!(direct.embeddings_complete(), "{direct:?}");
+            assert!(
+                !direct.forward_satisfaction_enumerated
+                    && direct
+                        .forward_open_reasons
+                        .contains(&"alias target has no complete selected terminal"),
+                "{direct:?}"
+            );
             assert_eq!(
                 direct.parents[0].targets,
                 vec![declaration(GO_ROOT_PROVIDER_PATH, "Base")]
@@ -2616,7 +4469,10 @@ type aliasEmbed struct { Alias }
                     &ResolutionSession::unbounded(),
                 )
                 .unwrap();
-            assert!(alias.is_complete(), "{alias:?}");
+            assert!(
+                alias.embeddings_complete() && !alias.forward_satisfaction_enumerated,
+                "{alias:?}"
+            );
             assert_eq!(
                 alias.parents[0].targets,
                 vec![declaration(GO_ROOT_PROVIDER_PATH, "Base")]
@@ -2630,7 +4486,10 @@ type aliasEmbed struct { Alias }
                     &ResolutionSession::unbounded(),
                 )
                 .unwrap();
-            assert!(deep.is_complete(), "{deep:?}");
+            assert!(
+                deep.embeddings_complete() && !deep.forward_satisfaction_enumerated,
+                "{deep:?}"
+            );
             assert_eq!(
                 deep.parents[0].targets,
                 vec![declaration(GO_ROOT_PROVIDER_PATH, "Base")]
@@ -2645,7 +4504,10 @@ type aliasEmbed struct { Alias }
                         &ResolutionSession::unbounded(),
                     )
                     .unwrap();
-                assert!(wrapped.is_complete(), "{name}: {wrapped:?}");
+                assert!(
+                    wrapped.embeddings_complete() && !wrapped.forward_satisfaction_enumerated,
+                    "{name}: {wrapped:?}"
+                );
                 assert_eq!(
                     wrapped.parents[0].targets,
                     vec![declaration(GO_ROOT_PROVIDER_PATH, "WrappedBase")],
@@ -3165,6 +5027,847 @@ type aliasEmbed struct { Alias }
                     result_application_lists: vec![],
                 }
             );
+        }
+    }
+
+    mod go_named_alias_terminal_controls {
+        use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_analysis::analyzer::AnalyzerQueryScope;
+        use brokk_bifrost_analysis::analyzer::usages::member_family::{
+            MemberFamilyProvider, member_family_id,
+        };
+        use brokk_bifrost_core::analyzer::capabilities::{HierarchyAnswer, TypeHierarchyProvider};
+        use brokk_bifrost_core::analyzer::model::{CodeUnit, Language};
+        use brokk_bifrost_core::analyzer::structural::resolution::{
+            MemberFamilyOutcome, MethodFamilyRelation,
+        };
+        use brokk_bifrost_go_analysis::analyzer::go::{
+            GoAnalyzer, persist_live_go_sources_for_test,
+        };
+        use brokk_bifrost_test_macros::hardwon;
+
+        fn fixture(alias: &str, package: Option<&str>) -> (BuiltInlineTestProject, GoAnalyzer) {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let source = format!(
+                "package app\n{alias}\n\
+                 type Runner interface {{ Run() error }}\n\
+                 type Worker struct{{}}\nfunc (Worker) Run() error {{ return nil }}\n"
+            );
+            let mut builder = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/alias\n\ngo 1.22\n")
+                .file("dep/types.go", "package dep\ntype Present struct{}\n")
+                .file("app.go", &source);
+            if let Some(package) = package {
+                builder = builder.file("pkg/types.go", package);
+            }
+            let project = builder.build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            (project, go)
+        }
+
+        fn unit(
+            project: &BuiltInlineTestProject,
+            go: &GoAnalyzer,
+            owner: &str,
+            name: &str,
+        ) -> CodeUnit {
+            go.declarations(&project.file("app.go"))
+                .into_iter()
+                .find(|unit| unit.identifier() == name && unit.owner_identifier() == Some(owner))
+                .unwrap_or_else(|| panic!("missing {owner}.{name}"))
+        }
+
+        fn runner(project: &BuiltInlineTestProject, go: &GoAnalyzer) -> CodeUnit {
+            go.declarations(&project.file("app.go"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "Runner")
+                .expect("Runner")
+        }
+
+        fn direct(go: &GoAnalyzer, root: &CodeUnit) -> HierarchyAnswer {
+            let mut answer = None;
+            go.with_hierarchy_query(&mut |query| answer = Some(query.direct_ancestors(root)));
+            answer.expect("hierarchy query ran")
+        }
+
+        #[test]
+        fn go_missing_named_alias_opens_direct_forward() {
+            let (project, go) = fixture(
+                "import \"example.test/alias/dep\"\ntype Alias = dep.Missing",
+                None,
+            );
+            let _scope = AnalyzerQueryScope::new(&go);
+            let root = runner(&project, &go);
+            let answer = direct(&go, &root);
+            assert!(!answer.open.is_empty(), "{answer:?}");
+        }
+
+        #[test]
+        #[hardwon(
+            "#7509: trial differential found the landed family facade (6330e7644b) certified forward absence despite an unresolved selected alias"
+        )]
+        fn go_missing_named_alias_opens_only_family_forward() {
+            let (project, go) = fixture(
+                "import \"example.test/alias/dep\"\ntype Alias = dep.Missing",
+                None,
+            );
+            let _scope = AnalyzerQueryScope::new(&go);
+            let method = unit(&project, &go, "Runner", "Run");
+            let answer = go.member_family(&method, None);
+            assert_eq!(
+                answer.ancestors.outcome,
+                MemberFamilyOutcome::Incomplete,
+                "{answer:?}"
+            );
+            assert_eq!(
+                answer.descendants.outcome,
+                MemberFamilyOutcome::Proven,
+                "{answer:?}"
+            );
+            assert!(
+                answer
+                    .edges
+                    .iter()
+                    .any(|edge| edge.relation == MethodFamilyRelation::ImplementedBy
+                        && edge.target.owner_identifier() == Some("Worker")),
+                "{answer:?}"
+            );
+            assert!(member_family_id(&go, &answer).is_none(), "{answer:?}");
+        }
+
+        #[test]
+        fn go_resolved_named_interface_alias_keeps_forward_closed() {
+            let (project, go) = fixture(
+                "import pkg \"example.test/alias/pkg\"\ntype A = pkg.Iface",
+                Some("package pkg\ntype Iface interface { Run() error }"),
+            );
+            let _scope = AnalyzerQueryScope::new(&go);
+            let direct = direct(&go, &runner(&project, &go));
+            assert!(direct.open.is_empty(), "{direct:?}");
+            let family = go.member_family(&unit(&project, &go, "Runner", "Run"), None);
+            assert_eq!(
+                family.ancestors.outcome,
+                MemberFamilyOutcome::Proven,
+                "{family:?}"
+            );
+            assert_eq!(
+                family.descendants.outcome,
+                MemberFamilyOutcome::Proven,
+                "{family:?}"
+            );
+            drop(_scope);
+            let (plain_project, plain_go) = fixture(
+                "import pkg \"example.test/alias/pkg\"",
+                Some("package pkg\ntype Iface interface { Run() error }"),
+            );
+            let _plain_scope = AnalyzerQueryScope::new(&plain_go);
+            let plain =
+                plain_go.member_family(&unit(&plain_project, &plain_go, "Runner", "Run"), None);
+            let shape = |answer: &brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyAnswer| {
+                let mut edges = answer.edges.iter().map(|edge| {
+                    (edge.target.owner_identifier().unwrap_or("").to_owned(),
+                     edge.target.identifier().to_owned(),
+                     format!("{:?}", edge.relation))
+                }).collect::<Vec<_>>();
+                edges.sort();
+                let mut roots = answer.roots.iter().map(|root| root.identifier().to_owned()).collect::<Vec<_>>();
+                roots.sort();
+                (answer.outcome, answer.reason, answer.ancestors.outcome,
+                 answer.descendants.outcome, edges, roots)
+            };
+            assert_eq!(
+                shape(&family),
+                shape(&plain),
+                "alias: {family:?}; plain: {plain:?}"
+            );
+        }
+
+        #[test]
+        fn go_named_alias_chain_requires_terminal() {
+            for (tail, open) in [("dep.Missing", true), ("Runner", false)] {
+                let import = if open {
+                    "import \"example.test/alias/dep\"\n"
+                } else {
+                    ""
+                };
+                let alias = format!("{import}type A = B\ntype B = {tail}");
+                let (project, go) = fixture(&alias, None);
+                let _scope = AnalyzerQueryScope::new(&go);
+                let answer = direct(&go, &runner(&project, &go));
+                assert_eq!(!answer.open.is_empty(), open, "{tail}: {answer:?}");
+            }
+        }
+
+        #[test]
+        fn go_builtin_named_alias_terminal_is_open_without_selected_declaration() {
+            let (project, go) = fixture("type E = error\ntype Any = any", None);
+            let _scope = AnalyzerQueryScope::new(&go);
+            let answer = direct(&go, &runner(&project, &go));
+            assert!(!answer.open.is_empty(), "{answer:?}");
+        }
+    }
+
+    mod go_forward_scan_receipt_controls {
+        use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, capture_query_reads};
+        use brokk_bifrost_core::analyzer::capabilities::{
+            HierarchyAnswer, HierarchyOpenReason, TypeHierarchyProvider,
+        };
+        use brokk_bifrost_core::analyzer::model::{CodeUnit, Language};
+        use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason;
+        use brokk_bifrost_go_analysis::analyzer::go::{
+            GoAnalyzer, persist_live_go_sources_for_test, stop_next_go_forward_scan_for_test,
+            take_go_forward_scan_probe_for_test,
+        };
+
+        fn fixture() -> (BuiltInlineTestProject, GoAnalyzer) {
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/receipt\n\ngo 1.22\n")
+                .file(
+                    "types.go",
+                    "package receipt\ntype A struct{}\ntype B struct{}\ntype Empty interface{}\n",
+                )
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            (project, go)
+        }
+
+        fn roots(project: &BuiltInlineTestProject, go: &GoAnalyzer) -> [CodeUnit; 2] {
+            let declarations = go.declarations(&project.file("types.go"));
+            let find = |name: &str| {
+                declarations
+                    .iter()
+                    .find(|unit| unit.identifier() == name)
+                    .unwrap_or_else(|| panic!("missing {name} in {declarations:?}"))
+                    .clone()
+            };
+            [find("A"), find("B")]
+        }
+
+        fn render(answer: &HierarchyAnswer) -> String {
+            format!("{answer:?}")
+        }
+
+        #[test]
+        fn go_forward_scan_replays_one_context_receipt_across_roots() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let (project, go) = fixture();
+            let [a, b] = roots(&project, &go);
+            let _scope = AnalyzerQueryScope::new(&go);
+            take_go_forward_scan_probe_for_test();
+            let mut warm = Vec::new();
+            go.with_hierarchy_query(&mut |query| {
+                let (first, first_reads) = capture_query_reads(&go, || query.direct_ancestors(&a));
+                let (second, second_reads) =
+                    capture_query_reads(&go, || query.direct_ancestors(&b));
+                assert!(
+                    first_reads.unattributed_reads() > 0,
+                    "first root must capture census dependencies"
+                );
+                assert!(
+                    second_reads.unattributed_reads() > 0,
+                    "second root must replay the census receipt"
+                );
+                warm.extend([render(&first), render(&second)]);
+            });
+            assert_eq!(
+                take_go_forward_scan_probe_for_test(),
+                (1, 1),
+                "two roots in one walk must share a completed scan"
+            );
+            let mut cold = Vec::new();
+            for root in [&a, &b] {
+                go.with_hierarchy_query(&mut |query| {
+                    cold.push(render(&query.direct_ancestors(root)))
+                });
+            }
+            assert_eq!(
+                take_go_forward_scan_probe_for_test(),
+                (2, 2),
+                "separate walks each need a cold scan"
+            );
+            assert_eq!(warm, cold);
+        }
+
+        #[test]
+        fn go_forward_scan_stop_never_caches_a_complete_negative() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let (project, go) = fixture();
+            let [a, b] = roots(&project, &go);
+            let _scope = AnalyzerQueryScope::new(&go);
+            take_go_forward_scan_probe_for_test();
+            stop_next_go_forward_scan_for_test();
+            go.with_hierarchy_query(&mut |query| {
+                for root in [&a, &b] {
+                    let answer = query.direct_ancestors(root);
+                    assert!(
+                        answer.open.iter().any(|reason| matches!(
+                            reason,
+                            HierarchyOpenReason::MemberFamily(
+                                MemberFamilyReason::HierarchyTruncated
+                            )
+                        )),
+                        "stopped walk root {root:?} returned {answer:?}"
+                    );
+                }
+            });
+            let (scans, inserts) = take_go_forward_scan_probe_for_test();
+            assert_eq!(
+                scans, 1,
+                "first root reaches the stopped scan; later root may stop earlier"
+            );
+            assert_eq!(
+                inserts, 0,
+                "stopped scan must not fill a complete negative cache"
+            );
+        }
+    }
+
+    mod go_forward_proof_stop_controls {
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoForwardProofStopProbe;
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::go_hierarchy::GoHierarchyPreparationStopProbe;
+        use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, capture_query_reads};
+        use brokk_bifrost_core::analyzer::capabilities::{
+            HierarchyOpenReason, TypeHierarchyProvider,
+        };
+        use brokk_bifrost_core::analyzer::model::Language;
+        use brokk_bifrost_core::analyzer::structural::resolution::MemberFamilyReason;
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+        use brokk_bifrost_go_analysis::analyzer::go::{
+            GoAnalyzer, persist_live_go_sources_for_test,
+        };
+
+        #[test]
+        fn go_hierarchy_reused_preparation_observes_latched_stop() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/prepstop\n\ngo 1.22\n")
+                .file("types.go", "package prepstop\ntype A struct{}\nfunc (A) M(){}\ntype B struct{}\nfunc (B) M(){}\ntype I interface{M()}\n")
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let declarations = go.declarations(&project.file("types.go"));
+            let root = |name: &str| {
+                declarations
+                    .iter()
+                    .find(|unit| unit.identifier() == name)
+                    .unwrap()
+                    .clone()
+            };
+            let a = root("A");
+            let b = root("B");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let mut probe = None;
+            let (answer, reads) = capture_query_reads(&go, || {
+                let mut result = None;
+                go.with_hierarchy_query(&mut |query| {
+                    let first = query.direct_ancestors(&a);
+                    assert!(first.open.is_empty(), "{first:?}");
+                    probe = Some(GoHierarchyPreparationStopProbe::arm());
+                    result = Some(query.direct_ancestors(&b));
+                });
+                result.unwrap()
+            });
+            let probe = probe.unwrap();
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert!(reads.execution_dependences() > 0, "stop must enter receipt");
+            assert!(
+                answer.open.iter().any(|reason| matches!(
+                    reason,
+                    HierarchyOpenReason::MemberFamily(MemberFamilyReason::HierarchyTruncated)
+                )),
+                "{answer:?}"
+            );
+        }
+
+        #[test]
+        fn go_forward_proof_budget_stop_is_execution_incomplete() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/forwardproof\n\ngo 1.22\n")
+                .file(
+                    "types.go",
+                    "package forwardproof\ntype A struct{}\ntype Empty interface{}\n",
+                )
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let root = go
+                .declarations(&project.file("types.go"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "A")
+                .expect("A declaration");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let probe = GoForwardProofStopProbe::arm();
+            let (answer, reads) = capture_query_reads(&go, || {
+                let mut result = None;
+                go.with_hierarchy_query(&mut |query| {
+                    result = Some(query.direct_ancestors(&root));
+                });
+                result.expect("public hierarchy walk ran")
+            });
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert!(
+                reads.unattributed_reads() > 0,
+                "the public walk must retain captured census reads"
+            );
+            assert!(
+                answer.open.iter().any(|reason| matches!(
+                    reason,
+                    HierarchyOpenReason::MemberFamily(MemberFamilyReason::HierarchyTruncated)
+                )),
+                "forward proof stop must report truncation: {answer:?}"
+            );
+            assert!(
+                !answer.open.iter().any(|reason| matches!(
+                    reason,
+                    HierarchyOpenReason::ForwardSatisfactionIncomplete
+                )),
+                "a stopped proof must not become content-only incompleteness: {answer:?}"
+            );
+            assert!(
+                reads.execution_dependences() > 0,
+                "typed read capture must retain the budget stop"
+            );
+        }
+
+        #[test]
+        fn go_unstopped_forward_gap_stays_content_incomplete() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/forwardgap\n\ngo 1.22\n")
+                .file("types.go", "package forwardgap\ntype T struct{}\nfunc (T) M(){}\ntype U interface{ M(); missing.X }\n")
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let root = go
+                .declarations(&project.file("types.go"))
+                .into_iter()
+                .find(|unit| unit.identifier() == "T")
+                .expect("T declaration");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let (answer, reads) = capture_query_reads(&go, || {
+                let mut result = None;
+                go.with_hierarchy_query(&mut |query| result = Some(query.direct_ancestors(&root)));
+                result.expect("public hierarchy walk ran")
+            });
+            assert!(
+                answer.open.iter().any(|reason| matches!(
+                    reason,
+                    HierarchyOpenReason::ForwardSatisfactionIncomplete
+                )),
+                "unstopped unresolved interface coverage must stay Open: {answer:?}"
+            );
+            assert!(
+                !answer.open.iter().any(|reason| matches!(
+                    reason,
+                    HierarchyOpenReason::MemberFamily(MemberFamilyReason::HierarchyTruncated)
+                )),
+                "unstopped content gap must not become truncation: {answer:?}"
+            );
+            assert!(
+                reads.unattributed_reads() > 0,
+                "public capture must retain census dependencies"
+            );
+        }
+    }
+
+    mod go_native_family_positive_controls {
+        use crate::inline_project::InlineTestProject;
+        use brokk_bifrost_analysis::CodeUnitIndex;
+        use brokk_bifrost_analysis::TypeHierarchyProvider;
+        use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::dispatch::{
+            ImplementorTargets, virtual_dispatch_implementor_targets,
+        };
+        use brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyAnswer;
+        use brokk_bifrost_analysis::analyzer::usages::member_family::{
+            MemberFamilyProvider, member_family_id,
+        };
+        use brokk_bifrost_analysis::analyzer::{
+            AnalyzerQueryScope, IAnalyzer, capture_query_reads,
+        };
+        use brokk_bifrost_analysis::analyzer::{DeclarationInfo, Project, ProjectFile, Range};
+        use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType, Language};
+        use brokk_bifrost_core::analyzer::structural::resolution::{
+            MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
+        };
+        use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+        use brokk_bifrost_core::cancellation::CancellationToken;
+        use brokk_bifrost_go_analysis::analyzer::go::{
+            GoAnalyzer, GoFamilyPositiveStopProbe, assemble_go_member_family_for_test,
+            persist_live_go_sources_for_test,
+        };
+        use std::collections::BTreeSet;
+
+        struct FamilyDispatchBoundary {
+            go: GoAnalyzer,
+            answer: MemberFamilyAnswer,
+        }
+        impl CodeUnitIndex for FamilyDispatchBoundary {
+            fn project(&self) -> &dyn Project {
+                self.go.project()
+            }
+            fn languages(&self) -> BTreeSet<Language> {
+                BTreeSet::from([Language::Go])
+            }
+            fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+                Box::new(std::iter::empty())
+            }
+            fn ranges(&self, _: &CodeUnit) -> Vec<Range> {
+                unimplemented!()
+            }
+            fn search_definitions(&self, _: &str, _: bool) -> BTreeSet<CodeUnit> {
+                unimplemented!()
+            }
+            fn enclosing_code_unit(&self, _: &ProjectFile, _: &Range) -> Option<CodeUnit> {
+                unimplemented!()
+            }
+            fn enclosing_code_unit_for_lines(
+                &self,
+                _: &ProjectFile,
+                _: usize,
+                _: usize,
+            ) -> Option<CodeUnit> {
+                unimplemented!()
+            }
+            fn get_skeleton(&self, _: &CodeUnit) -> Option<String> {
+                unimplemented!()
+            }
+            fn get_skeleton_header(&self, _: &CodeUnit) -> Option<String> {
+                unimplemented!()
+            }
+            fn get_sources(&self, _: &CodeUnit, _: bool) -> BTreeSet<String> {
+                unimplemented!()
+            }
+        }
+        impl MemberFamilyProvider for FamilyDispatchBoundary {
+            fn member_family_capability(&self, _: &CodeUnit) -> MemberFamilyCapability {
+                MemberFamilyCapability::ParameterTypeSpellings
+            }
+            fn member_family(
+                &self,
+                _: &CodeUnit,
+                _: Option<&CancellationToken>,
+            ) -> MemberFamilyAnswer {
+                self.answer.clone()
+            }
+        }
+        impl IAnalyzer for FamilyDispatchBoundary {
+            fn update(&self, _: &BTreeSet<ProjectFile>) -> Self {
+                unimplemented!()
+            }
+            fn update_with_listing(
+                &self,
+                _: &BTreeSet<ProjectFile>,
+                _listing: Option<
+                    &brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing,
+                >,
+            ) -> Self {
+                unimplemented!()
+            }
+            fn update_all(&self) -> Self {
+                unimplemented!()
+            }
+            fn is_access_expression(&self, _: &ProjectFile, _: usize, _: usize) -> bool {
+                unimplemented!()
+            }
+            fn find_nearest_declaration(
+                &self,
+                _: &ProjectFile,
+                _: usize,
+                _: usize,
+                _: &str,
+            ) -> Option<DeclarationInfo> {
+                unimplemented!()
+            }
+            fn member_family_provider(&self) -> Option<&dyn MemberFamilyProvider> {
+                Some(self)
+            }
+        }
+
+        fn fixture() -> (crate::inline_project::BuiltInlineTestProject, GoAnalyzer) {
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/familypositive\n\ngo 1.22\n")
+                .file("types.go", "package familypositive\ntype I interface{ M() }\ntype Holder struct{ F interface{ M() } }\ntype A struct{}\nfunc (A) M(){}\ntype B struct{}\nfunc (B) M(){}\n")
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            (project, go)
+        }
+
+        fn member(
+            go: &GoAnalyzer,
+            project: &crate::inline_project::BuiltInlineTestProject,
+            owner: &str,
+        ) -> CodeUnit {
+            go.declarations(&project.file("types.go"))
+                .into_iter()
+                .find(|unit| {
+                    unit.is_function()
+                        && unit.identifier() == "M"
+                        && unit.owner_identifier() == Some(owner)
+                })
+                .unwrap_or_else(|| panic!("missing {owner}.M"))
+        }
+
+        #[test]
+        fn go_family_adapter_to_dispatch_boundary_keeps_inverse_positive() {
+            let (project, go) = fixture();
+            // This boundary control uses a language without Go's same-module
+            // dispatch hook, which downcasts the analyzer to GoAnalyzer.
+            let source = ProjectFile::new(project.file("types.go").root(), "types.java");
+            let interface = CodeUnit::new(source.clone(), CodeUnitType::Function, "example", "I.M");
+            let target = CodeUnit::new(source.clone(), CodeUnitType::Function, "example", "A.M");
+            let owner = CodeUnit::new(source, CodeUnitType::Class, "example", "A");
+            // Explicit certified hydration at the adapter assembly boundary.
+            let answer = assemble_go_member_family_for_test(
+                MemberFamilyCapability::ParameterTypeSpellings,
+                &interface,
+                Vec::new(),
+                Some(MemberFamilyReason::CoverageIncomplete),
+                vec![(target.clone(), owner)],
+                None,
+            );
+            assert_eq!(answer.outcome, MemberFamilyOutcome::Incomplete);
+            assert_eq!(answer.descendants.outcome, MemberFamilyOutcome::Proven);
+            assert!(member_family_id(&go, &answer).is_none());
+            let boundary = FamilyDispatchBoundary { go, answer };
+            let dispatch = virtual_dispatch_implementor_targets(
+                &boundary,
+                &interface,
+                &CancellationToken::new(),
+            );
+            assert!(
+                matches!(dispatch, ImplementorTargets::Proven(ref targets) if targets == &vec![target]),
+                "{dispatch:?}"
+            );
+        }
+
+        #[test]
+        fn go_family_inverse_open_keeps_public_dispatch_established_targets() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let (project, go) = fixture();
+            let interface = member(&go, &project, "I");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let family = go.member_family(&interface, None);
+            assert_eq!(
+                family.descendants.outcome,
+                MemberFamilyOutcome::Incomplete,
+                "{family:?}"
+            );
+            assert!(
+                family
+                    .edges
+                    .iter()
+                    .any(|edge| edge.relation == MethodFamilyRelation::ImplementedBy)
+            );
+            assert!(member_family_id(&go, &family).is_none());
+            let dispatch =
+                virtual_dispatch_implementor_targets(&go, &interface, &CancellationToken::new());
+            assert!(
+                matches!(dispatch, ImplementorTargets::Unproven { ref established, .. } if !established.is_empty()),
+                "{dispatch:?}"
+            );
+        }
+
+        #[test]
+        fn go_family_complete_empty_inverse_proves_absence() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.test/familyempty\n\ngo 1.22\n")
+                .file(
+                    "types.go",
+                    "package familyempty\ntype I interface { Z() }\n",
+                )
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let interface = go
+                .declarations(&project.file("types.go"))
+                .into_iter()
+                .find(|unit| unit.is_function() && unit.identifier() == "Z")
+                .expect("I.Z");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let family = go.member_family(&interface, None);
+            assert_eq!(
+                family.descendants.outcome,
+                MemberFamilyOutcome::Proven,
+                "{family:?}"
+            );
+            assert!(
+                !family
+                    .edges
+                    .iter()
+                    .any(|edge| edge.relation == MethodFamilyRelation::ImplementedBy)
+            );
+            let dispatch =
+                virtual_dispatch_implementor_targets(&go, &interface, &CancellationToken::new());
+            assert!(
+                matches!(dispatch, ImplementorTargets::Proven(ref targets) if targets.is_empty()),
+                "{dispatch:?}"
+            );
+        }
+
+        #[test]
+        fn go_family_stop_after_inverse_positive_retains_edge_and_first_cause() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let (project, go) = fixture();
+            let interface = member(&go, &project, "I");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let probe = GoFamilyPositiveStopProbe::arm_inverse();
+            let (family, reads) = capture_query_reads(&go, || go.member_family(&interface, None));
+            assert_eq!(probe.fired_limit(), Some(ReceiverBudgetLimit::ScopeNodes));
+            assert!(
+                reads.execution_dependences() > 0,
+                "stop must enter typed receipt"
+            );
+            assert_eq!(family.reason, Some(MemberFamilyReason::HierarchyTruncated));
+            assert_eq!(family.descendants.outcome, MemberFamilyOutcome::Incomplete);
+            assert!(
+                family
+                    .edges
+                    .iter()
+                    .any(|edge| edge.relation == MethodFamilyRelation::ImplementedBy)
+            );
+            assert!(member_family_id(&go, &family).is_none());
+            drop(probe);
+            let second_probe = GoFamilyPositiveStopProbe::arm_inverse();
+            let dispatch =
+                virtual_dispatch_implementor_targets(&go, &interface, &CancellationToken::new());
+            assert_eq!(
+                second_probe.fired_limit(),
+                Some(ReceiverBudgetLimit::ScopeNodes)
+            );
+            assert!(
+                matches!(dispatch, ImplementorTargets::Unproven { .. }),
+                "{dispatch:?}"
+            );
+        }
+
+        #[test]
+        fn go_inline_field_methods_remain_open_while_top_level_function_has_no_family() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+                .file(
+                    "service.go",
+                    "package app\ntype Outer struct { A, B interface { Run() error } }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\nfunc Top() {}\n",
+                )
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let declarations = go.declarations(&project.file("service.go"));
+            let find = |owner: Option<&str>, name: &str| {
+                declarations
+                    .iter()
+                    .find(|unit| {
+                        unit.is_function()
+                            && unit.identifier() == name
+                            && unit.owner_identifier() == owner
+                    })
+                    .unwrap_or_else(|| panic!("missing {owner:?}.{name}"))
+            };
+            let _scope = AnalyzerQueryScope::new(&go);
+            for field in ["A", "B"] {
+                let family = go.member_family(find(Some(field), "Run"), None);
+                assert_eq!(
+                    family.outcome,
+                    MemberFamilyOutcome::Incomplete,
+                    "{family:?}"
+                );
+                // The current file-wide crosswalk refusal reports ProviderUnavailable.
+                assert_eq!(family.reason, Some(MemberFamilyReason::ProviderUnavailable));
+                assert!(family.edges.is_empty());
+                assert_eq!(family.descendants.outcome, MemberFamilyOutcome::Incomplete);
+                assert!(member_family_id(&go, &family).is_none());
+            }
+            let top_unit = declarations
+                .iter()
+                .find(|unit| {
+                    unit.is_function()
+                        && unit.identifier() == "Top"
+                        && unit.declaration_segment_count() == 1
+                })
+                .expect("top-level Top");
+            let top = go.member_family(top_unit, None);
+            assert_eq!(top.outcome, MemberFamilyOutcome::NoFamily);
+            assert_eq!(top.reason, Some(MemberFamilyReason::NotAMethod));
+        }
+
+        #[test]
+        fn go_multi_unit_struct_neighbor_does_not_poison_worker_family() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+                .file("service.go", "package app\ntype Outer struct { A, B struct { X int } }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n")
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let declarations = go.declarations(&project.file("service.go"));
+            let worker = declarations
+                .iter()
+                .find(|unit| unit.is_function() && unit.short_name() == "Worker.Run")
+                .expect("Worker.Run");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let family = go.member_family(worker, None);
+            assert_eq!(family.outcome, MemberFamilyOutcome::Proven, "{family:?}");
+            assert!(family.edges.is_empty(), "{family:?}");
+            let mut hierarchy = None;
+            go.with_hierarchy_query(&mut |query| hierarchy = Some(query.direct_ancestors(worker)));
+            let hierarchy = hierarchy.expect("direct hierarchy query");
+            assert!(
+                !hierarchy.open.iter().any(|reason| matches!(
+                    reason,
+                    brokk_bifrost_core::analyzer::capabilities::HierarchyOpenReason::MemberFamily(
+                        MemberFamilyReason::ProviderUnavailable
+                    )
+                )),
+                "{hierarchy:?}"
+            );
+        }
+
+        #[test]
+        fn go_inline_interface_neighbor_must_not_poison_worker() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+                .file("service.go", "package app\ntype Outer struct { A, B interface { Run() error } }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n")
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let worker = go
+                .declarations(&project.file("service.go"))
+                .into_iter()
+                .find(|unit| unit.short_name() == "Worker.Run")
+                .expect("Worker.Run");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let family = go.member_family(&worker, None);
+            assert_eq!(family.outcome, MemberFamilyOutcome::Proven, "{family:?}");
+        }
+
+        #[test]
+        fn go_empty_interface_neighbor_must_not_poison_worker() {
+            unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_GO_HIERARCHY", "1") };
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("go.mod", "module example.com/app\n\ngo 1.24\n")
+                .file("service.go", "package app\nvar Empty interface{}\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n")
+                .build();
+            let go = GoAnalyzer::new(project.project_dyn());
+            persist_live_go_sources_for_test(&go);
+            let worker = go
+                .declarations(&project.file("service.go"))
+                .into_iter()
+                .find(|unit| unit.short_name() == "Worker.Run")
+                .expect("Worker.Run");
+            let _scope = AnalyzerQueryScope::new(&go);
+            let family = go.member_family(&worker, None);
+            assert_eq!(family.outcome, MemberFamilyOutcome::Proven, "{family:?}");
         }
     }
 }

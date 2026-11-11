@@ -86,7 +86,7 @@ mod jvm_extraction_tests {
             .0;
             let blob_id = witness.blob_id();
             let raw_oid = witness.blob_oid().to_string();
-            let measurements = store.conn.execute(move |conn| {
+            let measurements = store.conn.execute_fixture(move |conn| {
             let expected = conn.prepare(
                 "SELECT json_extract(parameter.value,'$[0]'), signature.definition
                  FROM resolution_callable_signatures AS signature, json_each(signature.body,'$[1]') AS parameter

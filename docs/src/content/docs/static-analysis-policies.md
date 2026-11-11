@@ -661,20 +661,19 @@ obligation; it is never clean.
 
 | Language | Modeled API and written arity | Model to install |
 | --- | --- | --- |
-| C# | `System.Net.Http.HttpClient.SendAsync`, arity 1 | `semantic-packs/web-network/csharp/bifrost.web-network-csharp.json` |
-| Go | `net/http.Get`, arity 1 | None. The embedded `bifrost.go.stdlib.net-http` pack declares it. |
-| Java, Kotlin, Scala | `java.net.URL.openConnection()`, arity 0 | `semantic-packs/web-network/jvm/bifrost.web-network-jvm.json`, one model for all three |
-| JavaScript | `globalThis.fetch` | `semantic-packs/web-network/javascript/bifrost.web-network-javascript.json` |
-| TypeScript | `globalThis.fetch` | `semantic-packs/web-network/typescript/bifrost.web-network-typescript.json` |
-| PHP | the cURL builtin `curl_exec`, arity 1 | `semantic-packs/web-network/php/bifrost.web-network-php.json` |
-| Python | `urllib.request.urlopen` | `semantic-packs/web-network/python/bifrost.web-network-python.json` |
-| Ruby | `Net::HTTP.get`, arity 1, and `request` on a `Net::HTTP.new` result | `semantic-packs/web-network/ruby/bifrost.web-network-ruby.json` |
-| Rust | `std::net::TcpStream::connect`, arity 1 | `semantic-packs/web-network/rust/bifrost.web-network-rust.json` |
+| C# | `System.Net.Http.HttpClient.SendAsync`, arity 1 | `bifrost.web-network-csharp.json` |
+| Go | `net/http.Get`, arity 1 | The `bifrost.go.stdlib.net-http` pack declares it. |
+| Java, Kotlin, Scala | `java.net.URL.openConnection()`, arity 0 | `bifrost.web-network-jvm.json`, one model for all three |
+| JavaScript | `globalThis.fetch` | `bifrost.web-network-javascript.json` |
+| TypeScript | `globalThis.fetch` | `bifrost.web-network-typescript.json` |
+| PHP | the cURL builtin `curl_exec`, arity 1 | `bifrost.web-network-php.json` |
+| Python | `urllib.request.urlopen` | `bifrost.web-network-python.json` |
+| Ruby | `Net::HTTP.get`, arity 1, and `request` on a `Net::HTTP.new` result | `bifrost.web-network-ruby.json` |
+| Rust | `std::net::TcpStream::connect`, arity 1 | `bifrost.web-network-rust.json` |
 
-The model paths in this table are relative to
-[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs/tree/main/semantic-packs/web-network),
-which owns their authoring and delivery. The engine's retained copies are
-transitional test inputs; do not use the engine tree as an authoring source.
+The models in this table are authored and delivered in
+[Bifrost-packs](https://github.com/BrokkAi/bifrost-packs/tree/main/semantic-packs/web-network).
+The engine tree ships none of them; its test fixtures hold reduced copies.
 
 `(exactly 0)` is an absence claim, so it is conclusive only when the effect
 relation's coverage is exhaustive. A selected declaration that reaches a
@@ -2152,6 +2151,17 @@ evidence; none of these settings turns an unresolved call into proof of safety.
 `:call-modeling` decides which facts cross an unmodeled call, while
 `:on-unknown` decides what the run does once some verdict could not be reached
 at all. See [Declare What An Unknown Result Does](#declare-what-an-unknown-result-does).
+
+A match policy using finite `callers` or `callees :depth N` to approximate an
+unbounded relation can declare
+`:completion (inconclusive-on [depth_bound_reached])` inside its `analysis`.
+The bounded RQL rows remain exact for the one-through-N question. If a
+proof-filtered edge from the depth-N frontier reaches a new declaration, or
+the frontier cannot be decided, the policy retains findings inside the bound
+and reports an `inconclusive` run with reason `depth_bound_reached`. Existing
+query failures and budget limits keep their own reasons. The declaration
+requests the additional frontier certification. Policies that omit it run their
+bounded query without that probe, and the depth bound adds no incomplete reason.
 
 Endpoint categories and display/report text remain outside automaton and
 interprocedural-summary keys; the protocol analysis consumes resolved endpoint
@@ -3838,6 +3848,58 @@ override.
 The CLI uses today's UTC date if `--evaluation-date` is omitted. MCP
 `run_policy` requires `evaluation_date`, and library callers pass the date
 explicitly.
+
+## Accept A Finding Where It Is
+
+A suppression record lives in a JSON file and names a finding by its identity
+hash. When the decision belongs next to the code, write it as a comment on the
+line above the finding, or at the end of the finding's line:
+
+```ts
+// bifrost: ignore[test.danger] -- the input is a constant
+danger("listed");
+
+danger("trailing"); // bifrost: ignore[test.danger]
+
+// bifrost: ignore -- generated code, reviewed upstream
+risky("blanket");
+```
+
+A directive is a comment whose text starts with `bifrost:` and the word
+`ignore`. The comment delimiter does not matter: `//`, `///`, `/* */`, `#` and
+a `*` at the start of a block-comment line all work, in every language whose
+comments Bifrost indexes. After `ignore` comes an optional list of policy IDs in
+square brackets, separated by commas, then an optional reason after `--`.
+
+A directive alone on its line covers the next line that holds code. Blank
+lines and other comments in between are skipped, so several directives can be
+stacked above one line. A directive after code covers its own line. A finding
+is accepted when its primary location starts on the covered line and its
+policy is listed. A directive without a list is a blanket directive and covers
+every policy, but only when it gives a reason: `// bifrost: ignore` alone
+accepts nothing, so the finding stays active and the report asks for a reason.
+
+An accepted finding stays in the canonical report with an
+`inline_suppression` object (the directive's line, its policies and its
+reason), stops counting toward the failure threshold, and appears in SARIF as
+an `inSource` suppression. The report's `inline_suppressions` object lists
+every directive Bifrost read, with its state: `applied`, `unused` (nothing
+starts on the line it covers), `missing_reason` or `malformed`. Human output
+counts the accepted findings and prints every directive that accepted
+nothing. These states do not change the exit status. A directive that accepts
+nothing leaves its finding active, and that finding already gates.
+
+A suppression record that names the finding takes precedence over a
+directive, and a directive takes precedence over a scope entry and the
+baseline. Bifrost reads directives only in files that have a finding, so a
+stale directive in a file with no findings is not reported. A comment such as
+`// bifrost: this module owns the cache` is not a directive, because `ignore`
+does not follow the prefix.
+
+A host that runs Bifrost under its own name can change the word before the
+colon with `--inline-suppression-prefix WORD`. Under
+`--inline-suppression-prefix slopcop`, `// slopcop: ignore[...]` is a
+directive and `// bifrost: ignore[...]` is an ordinary comment.
 
 ## Scope Directories Out Of The Gate
 

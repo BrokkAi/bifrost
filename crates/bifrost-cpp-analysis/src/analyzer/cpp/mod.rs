@@ -70,6 +70,7 @@ use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::common::language_for_file as file_language;
 use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+use brokk_bifrost_core::analyzer::memo_attribution::ReadChannels;
 use brokk_bifrost_core::analyzer::model::CloneSmell;
 use brokk_bifrost_core::analyzer::model::CloneSmellWeights;
 use brokk_bifrost_core::analyzer::model::CodeUnit;
@@ -166,8 +167,7 @@ type CallMacroHazards = Arc<CachedFileRead<HashMap<(usize, usize), bool>>>;
 struct CachedFileRead<T> {
     value: Arc<T>,
     reads: Arc<[ReadKey]>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: ReadChannels,
     incompleteness: Box<[brokk_bifrost_analysis::analyzer::i_analyzer::QueryReadIncomplete]>,
 }
 
@@ -176,8 +176,7 @@ impl<T> CachedFileRead<T> {
         brokk_bifrost_analysis::analyzer::replay_query_read_receipt(
             analyzer,
             self.reads.iter().cloned(),
-            self.unattributed_reads,
-            self.execution_dependences,
+            self.channels,
         );
         for reason in &self.incompleteness {
             analyzer.record_query_incomplete(reason.clone());
@@ -210,7 +209,9 @@ pub struct CppAnalyzer {
         ),
         Arc<brokk_bifrost_cpp::source_facts::CppFileSourceFacts>,
     >,
-    imported_code_units: WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<CodeUnit>>>>,
+    imported_code_units: WorkspaceAuthorityMemo<
+        Cache<ProjectFile, Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>>,
+    >,
     /// Owner-specific fields materialized from object-like macros in the
     /// owner's include closure. This remains an analyzer overlay because the
     /// donor macro and consuming aggregate live in different parsed blobs.
@@ -436,6 +437,11 @@ impl ForwardQueryProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    #[doc(hidden)]
+    pub fn inner(&self) -> &TreeSitterAnalyzer<CppAdapter> {
+        &self.inner
+    }
+
     pub fn read_capability(&self) -> brokk_bifrost_core::analyzer::project_reads::ReadCapability {
         self.inner.read_capability()
     }
@@ -472,8 +478,7 @@ impl CppAnalyzer {
                 Arc::new(CachedFileRead {
                     value: Arc::new(value),
                     reads: reads.keys().into(),
-                    unattributed_reads: reads.unattributed_reads(),
-                    execution_dependences: reads.execution_dependences(),
+                    channels: reads.channels(),
                     incompleteness: scope.captured_read_incompleteness().into_boxed_slice(),
                 })
             })
@@ -970,10 +975,12 @@ impl CppAnalyzer {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         TreeSitterAnalyzer::wrap_with_config(
             config,
@@ -1456,6 +1463,7 @@ impl CppAnalyzer {
             .any(CodeUnit::is_class)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_project<P>(project: P) -> Self
     where
         P: Project + 'static,
@@ -3335,9 +3343,13 @@ impl IAnalyzer for CppAnalyzer {
         fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)>;
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         brokk_bifrost_core::analyzer::project_reads::without_project_reads(|| {
-            self.with_updated_inner(self.inner.update(changed_files))
+            self.with_updated_inner(self.inner.update_with_listing(changed_files, listing))
         })
     }
 
@@ -3653,6 +3665,32 @@ fn cpp_spelled_member_identifier<'a>(
 pub struct CppSupport;
 
 impl LanguageSupport for CppSupport {
+    fn branch_current_object_fields(
+        &self,
+    ) -> Option<
+        brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchCurrentObjectFields,
+    > {
+        Some(brokk_bifrost_analysis::analyzer::structural::branch_relations::BranchCurrentObjectFields {
+            access_kind: "field_expression",
+            receiver_field: "argument",
+            member_field: "field",
+            current_kind: "this",
+            parent_kind: "super",
+            invocation_kind: "call_expression",
+            invocation_target_field: "function",
+            storage_ancestors: &["field_declaration"],
+        })
+    }
+
+    fn policy_lowering_identity(
+        &self,
+        models: Option<
+            &brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot,
+        >,
+    ) -> Option<brokk_bifrost_analysis::analyzer::semantic::service::SemanticAdapterIdentity> {
+        Some(semantic::policy_lowering_identity(models))
+    }
+
     fn workspace_fact_answer(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -4349,8 +4387,9 @@ impl brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer for CppA
     fn update(
         &self,
         changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
     ) -> Box<dyn brokk_bifrost_analysis::analyzer::multi_analyzer::LanguageAnalyzer> {
-        Box::new(IAnalyzer::update(self, changed_files))
+        Box::new(IAnalyzer::update_with_listing(self, changed_files, listing))
     }
 
     fn update_all_with_progress(
@@ -4411,6 +4450,7 @@ mod dependency_packs {
             &self,
             _config: &AnalyzerConfig,
             project: &dyn Project,
+            _digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
             limits: &DependencyPackLimits,
             cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
         ) -> DependencyDiscoveryOutcome {

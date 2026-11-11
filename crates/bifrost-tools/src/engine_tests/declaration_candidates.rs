@@ -12,7 +12,9 @@ use brokk_bifrost_test_macros::hardwon;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-fn java_analyzer(files: &[(&str, &str)]) -> (tempfile::TempDir, TreeSitterAnalyzer<JavaAdapter>) {
+pub(super) fn java_analyzer(
+    files: &[(&str, &str)],
+) -> (tempfile::TempDir, TreeSitterAnalyzer<JavaAdapter>) {
     let temp = tempfile::tempdir().expect("temporary project");
     let root = temp.path().canonicalize().expect("canonical project root");
     for (path, source) in files {
@@ -40,7 +42,7 @@ fn go_analyzer(files: &[(&str, &str)]) -> (tempfile::TempDir, TreeSitterAnalyzer
     (temp, TreeSitterAnalyzer::new(project, GoAdapter))
 }
 
-fn python_analyzer(
+pub(super) fn python_analyzer(
     files: &[(&str, &str)],
 ) -> (tempfile::TempDir, TreeSitterAnalyzer<PythonAdapter>) {
     let temp = tempfile::tempdir().expect("temporary project");
@@ -70,7 +72,10 @@ fn rust_analyzer(files: &[(&str, &str)]) -> (tempfile::TempDir, TreeSitterAnalyz
         file.write(source).expect("write Rust source");
     }
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
-    (temp, TreeSitterAnalyzer::new(project, RustAdapter))
+    (
+        temp,
+        TreeSitterAnalyzer::new(project, RustAdapter::for_tests()),
+    )
 }
 
 fn named(units: &[CodeUnit], kind: CodeUnitType, name: &str) -> Vec<CodeUnit> {

@@ -186,7 +186,7 @@ The JavaScript adapter reports `parameter` as supported for every JavaScript fil
 | `callee` | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 | `receiver` | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 | `args` | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
-| `kwargs` | yes | - | - | - | - | - | yes | yes | yes | - | yes | yes |
+| `kwargs` | yes | yes | - | - | - | - | yes | yes | yes | yes | yes | yes |
 | `left` | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 | `right` | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |
 | `operator` | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes |

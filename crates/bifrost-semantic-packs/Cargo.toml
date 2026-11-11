@@ -2,7 +2,7 @@
 name = "brokk-bifrost-semantic-packs"
 version.workspace = true
 edition.workspace = true
-description = "Optional prebuilt semantic-pack distribution for brokk-bifrost"
+description = "Semantic-pack acquisition, installation, and authoring tooling for brokk-bifrost"
 readme = "README.md"
 license.workspace = true
 repository.workspace = true
@@ -12,7 +12,7 @@ autobins = false
 # The JDK source slices under testdata/summary-sources are GPL-2.0 WITH
 # Classpath-exception-2.0. They are derivation test fixtures and are never
 # distributed with this crate.
-exclude = ["tests/**", "testdata/summary-sources/**"]
+exclude = ["tests/**", "testdata/authored-model/**", "testdata/summary-sources/**"]
 
 [lib]
 name = "brokk_bifrost_semantic_packs"
@@ -28,6 +28,8 @@ release-tooling = [
     "dep:serde_json",
     "dep:serde-saphyr",
     "dep:sha2",
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
     "dep:tempfile",
     "dep:flate2",
     "dep:tar",
@@ -51,28 +53,30 @@ path = "src/bin/bifrost-semantic-pack.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.15.1", optional = true }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.15.1", optional = true }
-brokk-bifrost-jvm-analysis = { path = "../bifrost-jvm-analysis", version = "=0.15.1" }
-brokk-bifrost-rust-analysis = { path = "../bifrost-rust-analysis", version = "=0.15.1" }
-brokk-bifrost-go-analysis = { path = "../bifrost-go-analysis", version = "=0.15.1" }
-brokk-bifrost-php-analysis = { path = "../bifrost-php-analysis", version = "=0.15.1" }
-brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.15.1" }
-brokk-bifrost-ruby-analysis = { path = "../bifrost-ruby-analysis", version = "=0.15.1" }
-brokk-bifrost-csharp-analysis = { path = "../bifrost-csharp-analysis", version = "=0.15.1" }
-brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.15.1" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.1" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.15.1" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.15.2", optional = true }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.15.2", optional = true }
+brokk-bifrost-jvm-analysis = { path = "../bifrost-jvm-analysis", version = "=0.15.2" }
+brokk-bifrost-rust-analysis = { path = "../bifrost-rust-analysis", version = "=0.15.2" }
+brokk-bifrost-go-analysis = { path = "../bifrost-go-analysis", version = "=0.15.2" }
+brokk-bifrost-php-analysis = { path = "../bifrost-php-analysis", version = "=0.15.2" }
+brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.15.2" }
+brokk-bifrost-ruby-analysis = { path = "../bifrost-ruby-analysis", version = "=0.15.2" }
+brokk-bifrost-csharp-analysis = { path = "../bifrost-csharp-analysis", version = "=0.15.2" }
+brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.15.2" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.2" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.15.2" }
 # The bifrost-semantic-pack binary links the complete language table, which
 # only brokk-bifrost-tools defines.
-brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.1", optional = true }
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.2", optional = true }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }
 serde-saphyr = { version = "0.0.29", default-features = false, features = [
     "deserialize",
 ], optional = true }
-sha2 = { version = "0.10.8", optional = true }
+sha2 = { version = "0.11", optional = true }
+tree-sitter = { version = "0.25.10", optional = true }
+tree-sitter-rust = { package = "brokk-tree-sitter-rust", version = "=0.24.7", optional = true }
 tempfile = { version = "3.23.0", optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"], optional = true }
 tar = { version = "0.4.44", default-features = false, optional = true }
@@ -81,14 +85,15 @@ zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2
 workspace-hack.workspace = true
 
 [dev-dependencies]
-brokk-bifrost-jvm-analysis = { path = "../bifrost-jvm-analysis", version = "=0.15.1", features = ["test-support"] }
-brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.15.1", features = ["test-support"] }
-brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-jvm-analysis = { path = "../bifrost-jvm-analysis", version = "=0.15.2", features = ["test-support"] }
+brokk-bifrost-python-analysis = { path = "../bifrost-python-analysis", version = "=0.15.2", features = ["test-support"] }
+brokk-bifrost-js-ts-analysis = { path = "../bifrost-js-ts-analysis", version = "=0.15.2", features = ["test-support"] }
 
-brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.2", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.2", features = ["test-support"] }
 jsonschema = { version = "0.48.0", default-features = false }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 tempfile = "3.23.0"
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2", "deflate-zopfli"] }
 

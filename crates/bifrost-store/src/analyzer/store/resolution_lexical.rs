@@ -72,7 +72,7 @@ use super::resolution_selection::{
 };
 
 use super::resolution_typed::SelectedResolutionTypedSource;
-use super::selected_read_memo::ExactReadMemo;
+use super::selected_read_memo::{ExactReadByteBudget, ExactReadMemo};
 use super::{Result as StoreResult, StoreError};
 
 fn json_array_of_arrays(elements: &[String]) -> String {
@@ -83,7 +83,7 @@ fn json_array_of_arrays(elements: &[String]) -> String {
 // Catalog membership and site payload are one indexed question for the batch.
 pub(super) const REFERENCE_SITES_BY_KEY_SQL: &str = r#"
 SELECT site.site, site.role, site.namespace, site.site_kind, site.start_byte,
-       site.end_byte, site.unqualified, site.owner, site.receiver_origin, site.go_spelling_namespace, site.go_definition_namespaces, site.go_package_qualifier
+       site.end_byte, site.unqualified, site.owner, site.receiver_origin, site.go_spelling_namespace, site.go_definition_namespaces, site.go_package_qualifier, site.prefix
 FROM json_each(?2) requested
 CROSS JOIN resolution_semantic_catalog catalog
  ON catalog.blob_id=?1 AND catalog.local_key=requested.value
@@ -124,7 +124,7 @@ WITH RECURSIVE selected_site AS (
    AND endpoint.kind=1 AND endpoint.semantic_local_key IS NULL
 ), matched_local_bindings AS MATERIALIZED (
  SELECT walk.lookup_local,walk.lookup_identity,walk.depth,
-        endpoint.semantic_local_key
+        endpoint.semantic_local_key,walk.node AS binding_head
  FROM lexical_walk AS walk
  CROSS JOIN main.resolution_paths AS binding INDEXED BY resolution_paths_forward
    ON binding.blob_id=?1 AND binding.start_node=walk.node
@@ -241,7 +241,14 @@ SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
          WHERE package_root.blob_id=?1
            AND package_root.root_scope_key=paths.end_node),
        prefix_definition.semantic_local_key,
-       prefix_scope.node,prefix_scope.spelling,NULL
+       prefix_scope.node,prefix_scope.spelling,NULL,
+       (SELECT walk.node FROM lexical_walk AS walk
+        CROSS JOIN main.resolution_paths AS binding INDEXED BY resolution_paths_forward
+          ON binding.blob_id=?1 AND binding.start_node=walk.node
+         AND binding.end_node=paths.end_node
+         AND binding.start_lead_local IS walk.lookup_local
+         AND binding.start_lead_identity IS walk.lookup_identity
+        ORDER BY walk.depth LIMIT 1)
 FROM selected_site AS site
 LEFT JOIN site_paths AS paths ON TRUE
 LEFT JOIN prefix_shadow_definitions AS prefix_definition
@@ -260,7 +267,7 @@ SELECT site.site,site.role,site.namespace,site.site_kind,site.start_byte,
          WHERE package_root.blob_id=?1
            AND package_root.root_scope_key=walk.node),
        prefix_definition.semantic_local_key,
-       prefix_scope.node,prefix_scope.spelling,walk.node
+       prefix_scope.node,prefix_scope.spelling,walk.node,binding.binding_head
 FROM selected_site AS site
 CROSS JOIN lexical_walk AS walk
 -- CROSS JOIN keeps the walk as the outer loop. With a plain JOIN the planner
@@ -986,6 +993,16 @@ pub(crate) struct ReverseCandidateReadKey {
     pub(crate) arrays: Vec<Vec<String>>,
 }
 
+/// Forward candidate SQL reads only persisted paths. Stage writes change
+/// later admission, not these raw rows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ForwardCandidateReadKey {
+    pub(crate) fragment: BindingFragmentId,
+    pub(crate) blob_id: i64,
+    pub(crate) request_count: usize,
+    pub(crate) arrays: Vec<Vec<String>>,
+}
+
 #[derive(Hash, PartialEq, Eq)]
 struct ContextReadIdentity {
     selection: [u8; 32],
@@ -1226,6 +1243,39 @@ pub struct SelectedResolutionLexicalSource<'selection, 'store> {
 const CANDIDATE_ROW_CANCELLATION_QUANTUM: usize = 32;
 
 impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
+    /// Hydrate the selected file's persisted path rows through the ordinary
+    /// candidate reader. Test-only: this deliberately bypasses answer rebuilding.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn hydrated_file_paths_for_test(
+        &self,
+        language: &str,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Vec<PartialPath>> {
+        let Some(mount) = self.selection.mount_record_for_path(language, path)? else {
+            return Ok(Vec::new());
+        };
+        let fragment = BindingFragmentId::at_ordinal(mount.ordinal().get());
+        let mut statement = self
+            .selection
+            .connection()
+            .prepare_cached("SELECT path FROM resolution_paths WHERE blob_id=?1 ORDER BY path")?;
+        let candidates = statement
+            .query_map([mount.blob_id()], |row| row.get::<_, u32>(0))?
+            .map(|row| {
+                row.map(|key| {
+                    CandidatePathIdentity::new(
+                        fragment,
+                        PartialPathId::local(fragment.ordinal(), key),
+                    )
+                })
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.hydrate_candidate_paths(&candidates, cancellation)
+            .map(|rows| rows.into_iter().map(|(_, path)| path).collect())
+    }
+
     fn canonical_content_digest(
         &self,
         key: crate::analyzer::resolution::ResolutionIdentityDigestKey,
@@ -1935,7 +1985,11 @@ impl<'selection, 'store> SelectedResolutionLexicalSource<'selection, 'store> {
             .node_provenance(node);
         if matches!(
             boundary,
-            Some(SelectedNodeProvenance::UniversalRoot | SelectedNodeProvenance::ContextBoundary)
+            Some(
+                SelectedNodeProvenance::UniversalRoot
+                    | SelectedNodeProvenance::ContextBoundary
+                    | SelectedNodeProvenance::ModelDefinition(_)
+            )
         ) {
             return Ok(Some(boundary));
         }
@@ -3701,12 +3755,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
             .selection
             .shared_name_table()
             .interner(self.selection.connection());
-        let sql = format!(
-            "{} SELECT g.host,g.covers,g.node,g.lookup,g.gap_key,g.reason_key,EXISTS(SELECT 1 FROM temp.selected_resolution_scope_mounts scope WHERE scope.mount_ordinal=g.host) AND (:scope IS NULL OR g.host IN(SELECT value FROM json_each(:scope))) AND ({}) FROM raw_gaps g WHERE {}",
-            ordinary_reverse_gap_projection_sql(),
-            super::resolution_stage::frontier_completion::effective_gap_remains_sql(),
-            super::resolution_stage::frontier_completion::QUALIFIED_GAP_REMAINS_SQL
-        );
+        let sql = ordinary_reverse_gap_rows_sql();
         let mut evidence = Vec::new();
         let live=self.read_statement(cancellation,|connection| {
             let mut statement=connection.prepare_cached(&sql)?;
@@ -4528,27 +4577,37 @@ JOIN temp.selected_resolution_stage_recipes recipe
         if empty {
             return Ok(Some((0..requests).map(|_| Vec::new()).collect::<Vec<_>>()));
         }
-        let memo_key = self
-            .reverse_candidate_read_memo
-            .as_ref()
-            .filter(|_| direction == CandidateDirection::Reverse)
-            .map(|_| ReverseCandidateReadKey {
+        let forward_key = ForwardCandidateReadKey {
+            fragment,
+            blob_id,
+            request_count: requests,
+            arrays: arrays.iter().map(|array| array.to_vec()).collect(),
+        };
+        let reverse_key =
+            (direction == CandidateDirection::Reverse).then(|| ReverseCandidateReadKey {
                 direct_write_epoch: self.selection.staged_read_epoch().1,
                 scope: self.selection.scope_identity(),
                 fragment,
                 blob_id,
                 request_count: requests,
-                arrays: arrays.iter().map(|array| array.to_vec()).collect(),
+                arrays: forward_key.arrays.clone(),
             });
-        if let Some(key) = &memo_key
-            && let Some(rows) = self
-                .reverse_candidate_read_memo
-                .as_ref()
-                .expect("a reverse candidate memo key has a memo")
+        let cached = match direction {
+            CandidateDirection::Forward => self
+                .selection
+                .forward_candidate_rows
                 .borrow()
-                .get(key)
-                .cloned()
-        {
+                .get(&forward_key)
+                .cloned(),
+            CandidateDirection::Reverse => {
+                self.reverse_candidate_read_memo.as_ref().and_then(|memo| {
+                    memo.borrow()
+                        .get(reverse_key.as_ref().expect("reverse key"))
+                        .cloned()
+                })
+            }
+        };
+        if let Some(rows) = cached {
             if let Some(cache) = &self.candidate_cache {
                 cache.offered_hits.set(cache.offered_hits.get() + 1);
                 if cache.graph_stage_read_batch_size.is_some()
@@ -4593,10 +4652,30 @@ JOIN temp.selected_resolution_stage_recipes recipe
             }
             Ok(Some(offered))
         })?;
-        if let (Some(key), Some(rows)) = (memo_key, result.as_ref())
-            && let Some(memo) = &self.reverse_candidate_read_memo
-        {
-            memo.borrow_mut().insert(key, rows.clone());
+        if let Some(rows) = result.as_ref() {
+            match direction {
+                CandidateDirection::Forward => {
+                    let bytes = forward_key
+                        .arrays
+                        .iter()
+                        .flatten()
+                        .map(String::len)
+                        .sum::<usize>()
+                        .saturating_add(
+                            rows.iter().map(Vec::len).sum::<usize>().saturating_mul(512),
+                        );
+                    self.selection
+                        .forward_candidate_rows
+                        .borrow_mut()
+                        .insert_bounded_weighed(forward_key, rows.clone(), bytes);
+                }
+                CandidateDirection::Reverse => {
+                    if let Some(memo) = &self.reverse_candidate_read_memo {
+                        memo.borrow_mut()
+                            .insert(reverse_key.expect("reverse key"), rows.clone());
+                    }
+                }
+            }
         }
         if let (Some(cache), Some(rows)) = (&self.candidate_cache, result.as_ref())
             && cache.graph_stage_read_batch_size.is_some()
@@ -4702,6 +4781,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                         seed.metadata,
                         completion,
                     )
+                    .with_prefix_reference(seed.prefix_reference)
                 })
             })
             .collect::<Vec<_>>();
@@ -4797,6 +4877,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                         metadata,
                         completion,
                     )
+                    .with_prefix_reference(site.prefix_reference(ordinal))
                     .with_language(mount.semantic_language()),
                 );
             }
@@ -4821,6 +4902,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 seed.site_metadata(),
                 completion,
             )
+            .with_prefix_reference(seed.prefix_reference())
             .with_language(language);
         }
         Ok(ReferenceSeedReadOutcome::exhausted(
@@ -4910,26 +4992,40 @@ JOIN temp.selected_resolution_stage_recipes recipe
         let mut keys = keys.collect::<Vec<_>>();
         keys.sort_unstable();
         keys.dedup();
+        let reuse = self
+            .selection
+            .site_row_memo()
+            .borrow_mut()
+            .enter(self.selection.site_row_memo_epoch());
         let mut sites = HashMap::default();
         let mut missing = Vec::new();
+        let mut hit = false;
         {
             let memo = self.selection.site_row_memo().borrow();
             for site in keys {
                 if cancellation.is_cancelled() {
                     return Ok(None);
                 }
-                match memo.get(blob_id, site) {
+                match reuse.then(|| memo.get(blob_id, site)).flatten() {
                     Some(Some(row)) => {
+                        hit = true;
                         sites.insert(site, row);
                     }
-                    Some(None) => {}
+                    Some(None) => hit = true,
                     None => missing.push(site),
                 }
             }
         }
         if missing.is_empty() {
+            if hit {
+                Self::note_cached_main_read(
+                    RESOLUTION_SITES_BY_KEY_SQL,
+                    self.memo_connection_tag(),
+                );
+            }
             return Ok(Some(sites));
         }
+
         let key_array = json_array(missing.iter().copied());
         let Some(fetched) = self.read_site_rows_with_sql(
             RESOLUTION_SITES_BY_KEY_SQL,
@@ -4946,7 +5042,9 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 if cancellation.is_cancelled() {
                     return Ok(None);
                 }
-                memo.insert(blob_id, site, fetched.get(&site).copied());
+                if reuse {
+                    memo.insert(blob_id, site, fetched.get(&site).copied());
+                }
             }
         }
         sites.extend(fetched);
@@ -4968,7 +5066,7 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 if cancellation.is_cancelled() {
                     return Ok(None);
                 }
-                let site = RawSiteRow::from_row(row)?;
+                let site = RawSiteRow::from_site_row(row)?;
                 sites.insert(site.site, site);
             }
             Ok(Some(sites))
@@ -5020,6 +5118,22 @@ JOIN temp.selected_resolution_stage_recipes recipe
         self.read_scope_owner_rows(blob_id, keys, MEMBER_SCOPE_OWNERS_BY_NODE_SQL, cancellation)
     }
 
+    fn note_cached_main_read(
+        sql: &str,
+        connection: brokk_bifrost_core::attribution::ConnectionTag,
+    ) {
+        // A memo hit skips SQLite's statement-start callback, whose attribution
+        // refusal is needed even when the cached answer is absence. The hit
+        // carries the tag of the connection whose answer the memo cached, so
+        // that connection classifies the text when it is released.
+        brokk_bifrost_core::attribution::statement_started(sql, connection);
+    }
+
+    fn memo_connection_tag(&self) -> brokk_bifrost_core::attribution::ConnectionTag {
+        brokk_bifrost_core::cache_db::sql_profile::connection_tag(self.selection.connection())
+            .unwrap_or(brokk_bifrost_core::attribution::ConnectionTag::NONE)
+    }
+
     fn read_scope_owner_rows(
         &self,
         blob_id: i64,
@@ -5028,16 +5142,26 @@ JOIN temp.selected_resolution_stage_recipes recipe
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<HashMap<i64, (i64, String)>>> {
         let keys = keys.collect::<Vec<_>>();
-        let reuse = self.selection.has_go_semantics();
-        // Both callers read immutable main-blob facts. Their filters differ,
-        // so query identity also distinguishes cached rows and cached absence.
-        let missing = {
+        let epoch = self.selection.site_row_memo_epoch();
+        let reuse = self.selection.site_row_memo().borrow_mut().enter(epoch);
+        let (missing, hit) = {
             let memo = self.selection.site_row_memo().borrow();
-            keys.iter()
+            let mut hit = false;
+            let missing = keys
+                .iter()
                 .copied()
-                .filter(|key| !reuse || !memo.scope_owners.contains_key(&(query, blob_id, *key)))
-                .collect::<Vec<_>>()
+                .filter(|key| {
+                    let cached = reuse && memo.scope_owners.contains_key(&(query, blob_id, *key));
+                    hit |= cached;
+                    !cached
+                })
+                .collect::<Vec<_>>();
+            (missing, hit)
         };
+        if hit && missing.is_empty() && !cancellation.is_cancelled() {
+            Self::note_cached_main_read(query, self.memo_connection_tag());
+        }
+        let mut fetched = HashMap::default();
         if !reuse || !missing.is_empty() {
             let key_array = json_array(missing.iter().copied());
             let Some(owners) = self.read_statement(cancellation, |conn| {
@@ -5055,14 +5179,16 @@ JOIN temp.selected_resolution_stage_recipes recipe
             else {
                 return Ok(None);
             };
-            if !reuse {
-                return Ok(Some(owners));
+            if cancellation.is_cancelled() {
+                return Ok(None);
             }
-            let mut memo = self.selection.site_row_memo().borrow_mut();
-            for key in missing {
-                memo.scope_owners
-                    .insert((query, blob_id, key), owners.get(&key).cloned());
+            if reuse {
+                let mut memo = self.selection.site_row_memo().borrow_mut();
+                for key in &missing {
+                    memo.insert_owner((query, blob_id, *key), owners.get(key).cloned());
+                }
             }
+            fetched = owners;
         }
         if cancellation.is_cancelled() {
             return Ok(None);
@@ -5071,10 +5197,15 @@ JOIN temp.selected_resolution_stage_recipes recipe
         Ok(Some(
             keys.into_iter()
                 .filter_map(|key| {
-                    memo.scope_owners
-                        .get(&(query, blob_id, key))
+                    fetched
+                        .get(&key)
                         .cloned()
-                        .flatten()
+                        .or_else(|| {
+                            memo.scope_owners
+                                .get(&(query, blob_id, key))
+                                .cloned()
+                                .flatten()
+                        })
                         .map(|owner| (key, owner))
                 })
                 .collect(),
@@ -5087,21 +5218,31 @@ JOIN temp.selected_resolution_stage_recipes recipe
         members: &[(BindingNodeId, i64)],
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<HashMap<i64, Option<BindingNodeKind>>>> {
+        const SQL: &str = "SELECT node.local_key,node.kind,node.semantic_local_key,node.semantic_shared_identity,node.target_local_key,node.target_boundary_key FROM json_each(?2) input CROSS JOIN main.resolution_node_catalog node ON node.blob_id=?1 AND node.local_key=input.value";
         let ordinal = record.ordinal();
-        let reuse = self.selection.has_go_semantics();
-        let missing = {
+        let epoch = self.selection.site_row_memo_epoch();
+        let reuse = self.selection.site_row_memo().borrow_mut().enter(epoch);
+        let (missing, hit) = {
             let memo = self.selection.site_row_memo().borrow();
-            members
+            let mut hit = false;
+            let missing = members
                 .iter()
                 .map(|(_, key)| *key)
                 .filter(|key| {
-                    !reuse
-                        || !memo
+                    let cached = reuse
+                        && memo
                             .nodes
-                            .contains_key(&(record.blob_id(), ordinal.get(), *key))
+                            .contains_key(&(record.blob_id(), ordinal.get(), *key));
+                    hit |= cached;
+                    !cached
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (missing, hit)
         };
+        if hit && missing.is_empty() && !cancellation.is_cancelled() {
+            Self::note_cached_main_read(SQL, self.memo_connection_tag());
+        }
+        let mut fetched = HashMap::default();
         if !reuse || !missing.is_empty() {
             let keys = json_array(missing.iter().copied());
             let names = self
@@ -5109,31 +5250,42 @@ JOIN temp.selected_resolution_stage_recipes recipe
                 .shared_name_table()
                 .interner(self.selection.connection());
             let Some(ordinary) = self.read_statement(cancellation, |connection| {
-                let mut statement = connection.prepare_cached(
-                    "SELECT node.local_key,node.kind,node.semantic_local_key,node.semantic_shared_identity,node.target_local_key,node.target_boundary_key FROM json_each(?2) input CROSS JOIN main.resolution_node_catalog node ON node.blob_id=?1 AND node.local_key=input.value"
-                )?;
-                let mut rows = statement.query(params![record.blob_id(),keys])?;
+                let mut statement = connection.prepare_cached(SQL)?;
+                let mut rows = statement.query(params![record.blob_id(), keys])?;
                 let mut result = HashMap::default();
                 while let Some(row) = rows.next()? {
-                    if cancellation.is_cancelled() { return Ok(None); }
+                    if cancellation.is_cancelled() {
+                        return Ok(None);
+                    }
                     let payload = super::resolution_stage::lexical::decode_ordinary_node_kind(
-                        ordinal.get(),row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,&names,
+                        ordinal.get(),
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        &names,
                     );
-                    result.insert(row.get::<_,i64>(0)?,payload);
+                    result.insert(row.get::<_, i64>(0)?, payload);
                 }
                 Ok(Some(result))
-            })? else { return Ok(None); };
-
-            if !reuse {
-                return Ok(Some(ordinary));
+            })?
+            else {
+                return Ok(None);
+            };
+            if cancellation.is_cancelled() {
+                return Ok(None);
             }
-            let mut memo = self.selection.site_row_memo().borrow_mut();
-            for key in missing {
-                memo.nodes.insert(
-                    (record.blob_id(), ordinal.get(), key),
-                    ordinary.get(&key).copied(),
-                );
+            if reuse {
+                let mut memo = self.selection.site_row_memo().borrow_mut();
+                for key in &missing {
+                    memo.insert_node(
+                        (record.blob_id(), ordinal.get(), *key),
+                        ordinary.get(key).copied(),
+                    );
+                }
             }
+            fetched = ordinary;
         }
         if cancellation.is_cancelled() {
             return Ok(None);
@@ -5143,10 +5295,15 @@ JOIN temp.selected_resolution_stage_recipes recipe
             members
                 .iter()
                 .filter_map(|(_, key)| {
-                    memo.nodes
-                        .get(&(record.blob_id(), ordinal.get(), *key))
+                    fetched
+                        .get(key)
                         .copied()
-                        .flatten()
+                        .or_else(|| {
+                            memo.nodes
+                                .get(&(record.blob_id(), ordinal.get(), *key))
+                                .copied()
+                                .flatten()
+                        })
                         .map(|payload| (*key, payload))
                 })
                 .collect(),
@@ -5740,6 +5897,7 @@ impl SelectedResolutionLexicalSource<'_, '_> {
 pub(crate) struct RawReferenceLocalPathEvidence {
     metadata: FactReferenceSiteMetadata,
     local_definitions: Vec<SemanticId>,
+    definition_endpoints: Vec<(SemanticId, BindingNodeId)>,
     prefix_local_definitions: Vec<SemanticId>,
     prefix_scope_spellings: Vec<(u32, String)>,
     scope_endpoints: Vec<u32>,
@@ -5764,6 +5922,7 @@ fn read_reference_local_path_rows(
     let mut rows = statement.query(params![blob_id, site])?;
     let mut metadata = None;
     let mut local_definitions = Vec::new();
+    let mut definition_endpoints = Vec::new();
     let mut prefix_local_definitions = Vec::new();
     let mut prefix_scope_spellings = Vec::new();
     let mut scope_endpoints = Vec::new();
@@ -5823,6 +5982,16 @@ fn read_reference_local_path_rows(
                 scope_endpoints.push(u32::try_from(scope).expect("path scope ordinal fits u32"));
             }
             if let Some(local_key) = row.get::<_, Option<i64>>(20)? {
+                let endpoint = row.get::<_, Option<u32>>(26)?;
+                if let Some(endpoint) = endpoint {
+                    definition_endpoints.push((
+                        SemanticId::local(
+                            ordinal.get(),
+                            u32::try_from(local_key).expect("definition key fits u32"),
+                        ),
+                        BindingNodeId::local(ordinal.get(), endpoint),
+                    ));
+                }
                 binding_candidates.push((
                     lookup_local,
                     lookup_identity,
@@ -5840,6 +6009,15 @@ fn read_reference_local_path_rows(
                     ordinal.get(),
                     u32::try_from(local_key).expect("path endpoint semantic key fits u32"),
                 ));
+                if let Some(endpoint) = row.get::<_, Option<u32>>(26)? {
+                    definition_endpoints.push((
+                        SemanticId::local(
+                            ordinal.get(),
+                            u32::try_from(local_key).expect("definition key fits u32"),
+                        ),
+                        BindingNodeId::local(ordinal.get(), endpoint),
+                    ));
+                }
             }
         }
     }
@@ -5849,6 +6027,7 @@ fn read_reference_local_path_rows(
     Ok(Some(RawReferenceLocalPathEvidence {
         metadata,
         local_definitions,
+        definition_endpoints,
         prefix_local_definitions,
         prefix_scope_spellings,
         scope_endpoints,
@@ -5897,6 +6076,7 @@ fn read_reference_local_path_evidence(
     let Some(RawReferenceLocalPathEvidence {
         metadata,
         mut local_definitions,
+        mut definition_endpoints,
         mut prefix_local_definitions,
         mut prefix_scope_spellings,
         mut scope_endpoints,
@@ -5980,6 +6160,10 @@ fn read_reference_local_path_evidence(
     );
     local_definitions.sort_unstable();
     local_definitions.dedup();
+    definition_endpoints
+        .retain(|(definition, _)| local_definitions.binary_search(definition).is_ok());
+    definition_endpoints.sort_unstable();
+    definition_endpoints.dedup();
     prefix_local_definitions.sort_unstable();
     prefix_local_definitions.dedup();
     prefix_scope_spellings.sort_unstable();
@@ -6007,6 +6191,7 @@ fn read_reference_local_path_evidence(
             reaches_package_root_scope,
         )
         .with_local_bindings_certified(local_bindings_certified)
+        .with_definition_endpoints(definition_endpoints)
         .with_lexical_scopes(
             lexical_scopes
                 .into_iter()
@@ -6042,6 +6227,44 @@ fn raw_ordered_checkpoint_ancestry(
 }
 
 impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
+    fn root_reference_token(
+        &self,
+        reference: SemanticId,
+        candidate: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        if reference.ordinal() != candidate.ordinal() {
+            return Ok(false);
+        }
+        let Some(site) = reference.local_key().map(ResolutionSiteId::new) else {
+            return Ok(false);
+        };
+        let Some(provenance) = self.semantic_provenance(candidate, cancellation)? else {
+            return Ok(false);
+        };
+        let identity = match provenance {
+            SelectedSemanticProvenance::FragmentLocal(value) => value.identity(),
+            SelectedSemanticProvenance::Stage(value) => value.identity(),
+            SelectedSemanticProvenance::Shared(_) => return Ok(false),
+        };
+        Ok([
+            ResolutionNamespace::Type,
+            ResolutionNamespace::Value,
+            ResolutionNamespace::Callable,
+            ResolutionNamespace::Constructor,
+            ResolutionNamespace::Constant,
+            ResolutionNamespace::Macro,
+            ResolutionNamespace::Package,
+        ]
+        .into_iter()
+        .any(|namespace| {
+            identity
+                == crate::analyzer::resolution::fact_lowering::root_reference_token_identity(
+                    site, namespace,
+                )
+        }))
+    }
+
     fn jvm_selected_root_presence(
         &self,
         root_fqn: &str,
@@ -6294,6 +6517,18 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
         };
         Ok(crate::analyzer::store::store_language_support(language)
             .is_some_and(|support| support.supports_direct_type_shapes()))
+    }
+
+    fn supports_exact_type_argument_links(
+        &self,
+        reference: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<bool> {
+        let Some(language) = self.semantic_language_of(reference, cancellation)? else {
+            return Ok(false);
+        };
+        Ok(crate::analyzer::store::store_language_support(language)
+            .is_some_and(|support| support.supports_exact_type_argument_links()))
     }
 
     fn supports_go_universe(&self) -> bool {
@@ -6703,6 +6938,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 Some(_) => (None, None),
                 None if catalog_only.contains(&node) => (None, None),
                 None => match self.selection.mount_rebaser().borrow().node_mount(node) {
+                    Some(SelectedNodeMount::ModelDefinition(token)) => (None, Some(token)),
                     Some(SelectedNodeMount::UniversalRoot | SelectedNodeMount::ContextBoundary) => {
                         (None, None)
                     }
@@ -7048,6 +7284,7 @@ impl BatchResolutionFragmentSource for SelectedResolutionLexicalSource<'_, '_> {
                 origins[*position] = *origin;
                 hydrated[*position] = Some(decode_path_row(
                     &context,
+                    mount.semantic_language(),
                     *start_node,
                     *end_node,
                     body,
@@ -7280,11 +7517,20 @@ fn reverse_completion_from_rows(
 
 /// Shared raw ordinary projection. Scope and effective closure are applied by
 /// the answer query, never by the all-host exclusion proof query.
+pub(in crate::analyzer::store) fn ordinary_reverse_gap_rows_sql() -> String {
+    format!(
+        "{} SELECT g.host,g.covers,g.node,g.lookup,g.gap_key,g.reason_key,EXISTS(SELECT 1 FROM temp.selected_resolution_scope_mounts scope WHERE scope.mount_ordinal=g.host) AND (:scope IS NULL OR g.host IN(SELECT value FROM json_each(:scope))) AND ({}) FROM raw_gaps g WHERE {}",
+        ordinary_reverse_gap_projection_sql(),
+        super::resolution_stage::frontier_completion::effective_gap_remains_sql(),
+        super::resolution_stage::frontier_completion::QUALIFIED_GAP_REMAINS_SQL
+    )
+}
+
 fn ordinary_reverse_gap_projection_sql() -> &'static str {
     r#"WITH ordinary(host,covers,node,lookup,gap,reason,blob) AS (
 SELECT mount.mount_ordinal,fact.covers,fact.subject,fact.lookup,fact.gap,fact.reason,mount.blob_id
 FROM temp.selected_resolution_mounts mount
-JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.covers IN(0,3)
+CROSS JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.covers IN(0,3)
 UNION
 SELECT mount.mount_ordinal,fact.covers,fact.subject,fact.lookup,fact.gap,fact.reason,mount.blob_id
 FROM json_each(:nodes) input
@@ -7305,7 +7551,7 @@ CROSS JOIN main.resolution_gaps fact ON fact.blob_id=mount.blob_id AND fact.gap=
 SELECT ordinary.host,ordinary.covers,ordinary.node,ordinary.lookup,
  :local_base+(ordinary.host<<32)+ordinary.gap,
  :local_base+(ordinary.host<<32)+ordinary.reason,reason.origin
-FROM ordinary JOIN main.resolution_gap_reasons reason ON reason.blob_id=ordinary.blob AND reason.reason=ordinary.reason
+FROM ordinary CROSS JOIN main.resolution_gap_reasons reason ON reason.blob_id=ordinary.blob AND reason.reason=ordinary.reason
 )"#
 }
 
@@ -7493,26 +7739,196 @@ const DEFINITION_SITE_ROLE: i64 = 1;
 
 type ScopeOwnerReadMemo = HashMap<(&'static str, i64, i64), Option<(i64, String)>>;
 
-/// Rows from immutable published blobs touched by one selected operation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct GapDetailsReadKey {
+    pub(super) selection: [u8; 32],
+    pub(super) stamp: super::resolution_selection::SelectedResolutionReadStamp,
+    pub(super) selected_rows_generation: u64,
+    pub(super) rel_path: String,
+}
+
+/// One inventory's exact main-blob reads. Admission is shared across all
+/// three maps; a refused entry is returned by its reader but not retained.
 #[derive(Default)]
 pub(super) struct SiteRowMemo {
     rows: HashMap<(i64, i64), Option<RawSiteRow>>,
-    // Immutable blob facts, including absence, touched by this query. Node
-    // payloads are decoded at a mount ordinal, so that coordinate is in the key.
-    // This memo is owned by one inventory (and hence one selected revision),
-    // not its retained selection. Stage overlays are read afresh and merged by
-    // the caller, never memoized, so these main-blob keys need no stage epoch.
     nodes: HashMap<(i64, u32, i64), Option<Option<BindingNodeKind>>>,
     scope_owners: ScopeOwnerReadMemo,
+    rust_point_gap_details: HashMap<GapDetailsReadKey, Vec<String>>,
+    epoch: Option<u64>,
+    budget: ExactReadByteBudget,
 }
 
 impl SiteRowMemo {
+    pub(super) fn enter(&mut self, epoch: Option<u64>) -> bool {
+        if self.epoch != epoch {
+            self.rows.clear();
+            self.nodes.clear();
+            self.scope_owners.clear();
+            self.budget.clear();
+            // GAP_DETAILS reads selection rows and main tables, not the stage
+            // or scope TEMP rows guarded by `epoch`. Retain and reweigh it.
+            for (key, rows) in &self.rust_point_gap_details {
+                assert!(self.budget.admit(Self::gap_details_bytes(key, rows)));
+            }
+            self.epoch = epoch;
+        }
+        epoch.is_some()
+    }
+
     fn get(&self, blob_id: i64, site: i64) -> Option<Option<RawSiteRow>> {
         self.rows.get(&(blob_id, site)).copied()
     }
 
     fn insert(&mut self, blob_id: i64, site: i64, row: Option<RawSiteRow>) {
-        self.rows.insert((blob_id, site), row);
+        let bytes = std::mem::size_of::<((i64, i64), Option<RawSiteRow>)>() + 32;
+        if self.budget.admit(bytes) {
+            self.rows.insert((blob_id, site), row);
+        }
+    }
+
+    fn insert_node(&mut self, key: (i64, u32, i64), value: Option<Option<BindingNodeKind>>) {
+        let bytes = std::mem::size_of::<((i64, u32, i64), Option<Option<BindingNodeKind>>)>() + 32;
+        if self.budget.admit(bytes) {
+            self.nodes.insert(key, value);
+        }
+    }
+
+    fn insert_owner(&mut self, key: (&'static str, i64, i64), value: Option<(i64, String)>) {
+        let bytes = std::mem::size_of::<((&'static str, i64, i64), Option<(i64, String)>)>()
+            + 32
+            + value.as_ref().map_or(0, |(_, kind)| kind.capacity());
+        if self.budget.admit(bytes) {
+            self.scope_owners.insert(key, value);
+        }
+    }
+
+    pub(super) fn gap_details(&self, key: &GapDetailsReadKey) -> Option<&Vec<String>> {
+        self.rust_point_gap_details.get(key)
+    }
+
+    /// A new content witness makes every older GAP_DETAILS answer unreachable.
+    /// Release those bytes from the shared cap before admitting the new read.
+    pub(super) fn retain_gap_details_for(&mut self, current: &GapDetailsReadKey) {
+        let budget = &mut self.budget;
+        self.rust_point_gap_details.retain(|key, rows| {
+            let live = key.selection == current.selection
+                && key.stamp == current.stamp
+                && key.selected_rows_generation == current.selected_rows_generation;
+            if !live {
+                budget.release(Self::gap_details_bytes(key, rows));
+            }
+            live
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_gap_details_for_path(&self, rel_path: &str) -> bool {
+        self.rust_point_gap_details
+            .keys()
+            .any(|key| key.rel_path == rel_path)
+    }
+
+    fn gap_details_bytes(key: &GapDetailsReadKey, rows: &Vec<String>) -> usize {
+        std::mem::size_of::<(GapDetailsReadKey, Vec<String>)>()
+            + 32
+            + key.rel_path.capacity()
+            + rows.capacity() * std::mem::size_of::<String>()
+            + rows.iter().map(String::capacity).sum::<usize>()
+    }
+
+    pub(super) fn insert_gap_details(&mut self, key: GapDetailsReadKey, rows: Vec<String>) {
+        if self.rust_point_gap_details.contains_key(&key) {
+            return;
+        }
+        let bytes = Self::gap_details_bytes(&key, &rows);
+        if self.budget.admit(bytes) {
+            self.rust_point_gap_details.insert(key, rows);
+        }
+    }
+}
+
+#[cfg(test)]
+mod site_row_memo_tests {
+    use super::{GapDetailsReadKey, SiteRowMemo};
+
+    #[test]
+    fn stale_gap_answers_release_the_shared_budget() {
+        use crate::analyzer::store::resolution_selection::SelectedResolutionReadStamp;
+
+        let mut memo = SiteRowMemo::default();
+        for generation in 0..24 {
+            assert!(memo.enter(Some(generation + 1)));
+            let key = GapDetailsReadKey {
+                selection: [1; 32],
+                stamp: SelectedResolutionReadStamp {
+                    main_data_version: generation as i64,
+                    main_schema_version: 1,
+                    temp_schema_version: 1,
+                    unowned_changes: 0,
+                    rolled_back: false,
+                },
+                selected_rows_generation: generation,
+                rel_path: "file.rs".to_owned(),
+            };
+            memo.retain_gap_details_for(&key);
+            memo.insert_gap_details(key, vec!["x".repeat(1024 * 1024)]);
+            assert_eq!(memo.rust_point_gap_details.len(), 1);
+        }
+        memo.insert_node((1, 2, 3), None);
+        assert!(memo.nodes.contains_key(&(1, 2, 3)));
+    }
+
+    #[test]
+    fn cached_absence_replays_unscoped_frame_refusal() {
+        use super::SelectedResolutionLexicalSource;
+        use brokk_bifrost_core::attribution::{AttributionFrame, enter_frame};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(AtomicUsize);
+        impl AttributionFrame for Counter {
+            fn mark_unattributed(
+                &self,
+                _: &str,
+                _: Option<&'static str>,
+                _: brokk_bifrost_core::attribution::ConnectionTag,
+            ) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut memo = SiteRowMemo::default();
+        assert!(memo.enter(Some(1)));
+        const QUERY: &str = "SELECT owner FROM main.resolution_member_scope_properties";
+        memo.insert_owner((QUERY, 2, 3), None);
+        assert!(memo.scope_owners.contains_key(&(QUERY, 2, 3)));
+
+        let frame = Arc::new(Counter(AtomicUsize::new(0)));
+        let _guard = enter_frame(frame.clone());
+        SelectedResolutionLexicalSource::note_cached_main_read(
+            QUERY,
+            brokk_bifrost_core::attribution::ConnectionTag::NONE,
+        );
+        assert_eq!(frame.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn one_cap_and_epoch_fence_cover_all_admissions() {
+        let mut memo = SiteRowMemo::default();
+        assert!(memo.enter(Some(1)));
+        memo.insert_owner(("SELECT owner", 2, 3), Some((4, "type_body".to_owned())));
+        assert!(memo.scope_owners.contains_key(&("SELECT owner", 2, 3)));
+        memo.insert_owner(
+            ("SELECT oversized", 2, 5),
+            Some((4, "x".repeat(16 * 1024 * 1024))),
+        );
+        assert!(!memo.scope_owners.contains_key(&("SELECT oversized", 2, 5)));
+        assert!(memo.enter(Some(2)));
+        assert!(memo.scope_owners.is_empty());
+        memo.insert_node((2, 1, 3), None);
+        assert!(memo.nodes.contains_key(&(2, 1, 3)));
+        assert!(!memo.enter(None));
     }
 }
 
@@ -7531,6 +7947,7 @@ struct RawSiteRow {
     go_spelling_namespace: Option<i64>,
     go_definition_namespaces: Option<u8>,
     go_package_qualifier: bool,
+    prefix: Option<i64>,
 }
 
 impl RawSiteRow {
@@ -7548,6 +7965,29 @@ impl RawSiteRow {
             go_spelling_namespace: row.get(9)?,
             go_definition_namespaces: row.get(10)?,
             go_package_qualifier: row.get(11)?,
+            prefix: None,
+        })
+    }
+
+    fn from_site_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        let mut site = Self::from_row(row)?;
+        site.prefix = row.get(12)?;
+        Ok(site)
+    }
+
+    fn prefix_reference(
+        &self,
+        ordinal: SelectedResolutionMountOrdinal,
+    ) -> Option<Option<SemanticId>> {
+        self.prefix.map(|key| {
+            if key == -1 {
+                None
+            } else {
+                Some(SemanticId::local(
+                    ordinal.get(),
+                    u32::try_from(key).expect("reference prefix local key"),
+                ))
+            }
         })
     }
 
@@ -9994,6 +10434,7 @@ mod root_prefix_tests {
         for state in PlannerStatisticsState::BOTH {
             let store = super::super::AnalyzerStore::open_ephemeral().unwrap();
             let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
             // The fixture isolates path reads; schema seal/FK laws have separate core fixtures.
             conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
             for (path, candidate) in candidates.iter().enumerate() {
@@ -10107,6 +10548,7 @@ mod root_prefix_tests {
         for state in PlannerStatisticsState::BOTH {
             let store = super::super::AnalyzerStore::open_ephemeral().unwrap();
             let conn = store.conn.lock().unwrap();
+            let _fixture = crate::analyzer::store::sealed_families::Fixture::new(&conn);
             conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
             let insert = |path: i64, last: i64| {
                 let mut key = RootKeyBuilder::default();

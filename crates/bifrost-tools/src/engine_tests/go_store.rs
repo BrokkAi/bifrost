@@ -322,7 +322,7 @@ mod tests {
             "src/service.rs",
             "pub struct Client;\n\nimpl Client {\n    pub fn connect(&self) {}\n}\n",
         );
-        let rust_state = Arc::new(parse_state(&RustAdapter, &rust_file));
+        let rust_state = Arc::new(parse_state(&RustAdapter::for_tests(), &rust_file));
         let rust_oid = oid_for(rust_state.source.as_bytes());
         let _ = write_file(root, "go.mod", "module example.com/demo\n");
         let go_file = write_file(
@@ -342,7 +342,7 @@ mod tests {
                 &crate::analyzer::store::test_blob_file(),
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(rust_oid, "rust"),
                 prior_rust_generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 rust_state.as_ref(),
             )
             .unwrap();

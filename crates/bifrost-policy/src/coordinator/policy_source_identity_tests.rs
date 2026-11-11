@@ -23,10 +23,20 @@ fn source_only_policy_edit_invalidates_diff_base_reuse() {
     let path = [PathBuf::from("policies/target.rqlp")];
     let options =
         crate::test_support::evaluation_options("2026-07-27").with_diff_base("HEAD".to_owned());
-    let cold =
-        evaluate_policy_files(project.root(), &path, &options).expect("cold diff evaluation");
-    let warm =
-        evaluate_policy_files(project.root(), &path, &options).expect("warm diff evaluation");
+    let cold = evaluate_policy_files(
+        project.root(),
+        &path,
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .expect("cold diff evaluation");
+    let warm = evaluate_policy_files(
+        project.root(),
+        &path,
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .expect("warm diff evaluation");
     assert_eq!(cold.report().runs()[0].findings().len(), 1);
     assert!(cold.report().runs()[0].completion().is_complete());
     assert_eq!(
@@ -39,8 +49,13 @@ fn source_only_policy_edit_invalidates_diff_base_reuse() {
         source.replace(":name \"Source identity\"", ":name  \"Source identity\""),
     )
     .expect("source-only policy edit");
-    let changed =
-        evaluate_policy_files(project.root(), &path, &options).expect("changed diff evaluation");
+    let changed = evaluate_policy_files(
+        project.root(),
+        &path,
+        &options,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
+    )
+    .expect("changed diff evaluation");
     assert_eq!(
         changed.report().runs()[0].policy_hash(),
         cold.report().runs()[0].policy_hash()

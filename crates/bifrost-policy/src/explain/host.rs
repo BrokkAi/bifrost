@@ -101,6 +101,7 @@ pub fn explain_policy_inputs(
     flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
     limits: &ExplanationLimits,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<PolicyExplanation, ExplainError> {
     with_one_policy(
         root,
@@ -112,6 +113,7 @@ pub fn explain_policy_inputs(
         |policy, context, budget| {
             explain_loaded_policy(policy, context, target, generation, budget, limits)
         },
+        retention_budget,
     )
 }
 
@@ -139,6 +141,7 @@ pub fn rank_policy_near_misses(
     flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
     limits: &ExplanationLimits,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<PolicyNearMissRanking, ExplainError> {
     with_one_policy(
         root,
@@ -153,6 +156,7 @@ pub fn rank_policy_near_misses(
                     .answered_under(ExplanationGeneration::of(context.analyzer)),
             )
         },
+        retention_budget,
     )
 }
 
@@ -161,6 +165,7 @@ pub fn rank_policy_near_misses(
 ///
 /// Shared because every host-facing question needs the same three steps and
 /// the same refusal of an ambiguous selection.
+#[allow(clippy::too_many_arguments)]
 fn with_one_policy<T>(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
@@ -173,6 +178,7 @@ fn with_one_policy<T>(
         &PolicyEvaluationContext<'_>,
         &mut PolicyBudget,
     ) -> Result<T, ExplainError>,
+    retention_budget: &brokk_bifrost_analysis::retention_budget::RetentionBudget,
 ) -> Result<T, ExplainError> {
     let root = root.canonicalize().map_err(|error| {
         unavailable(format!(
@@ -198,14 +204,17 @@ fn with_one_policy<T>(
             // explanation over a live root should read the cache the ordinary
             // run already warmed rather than re-parse the workspace.
             Some(
-                WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default()).map_err(
-                    |error| {
-                        unavailable(format!(
-                            "failed to build the analyzer workspace at {}: {error}",
-                            root.display()
-                        ))
-                    },
-                )?,
+                WorkspaceAnalyzer::build_persisted_with_budget(
+                    project,
+                    AnalyzerConfig::default(),
+                    retention_budget,
+                )
+                .map_err(|error| {
+                    unavailable(format!(
+                        "failed to build the analyzer workspace at {}: {error}",
+                        root.display()
+                    ))
+                })?,
             )
         }
     };
@@ -292,6 +301,9 @@ fn with_one_policy<T>(
         // An explanation re-executes one policy to describe what it did, so
         // it has nothing to reuse and nothing to publish.
         incremental: None,
+        // Reproduce an ordinary pack-driven run's typo table, so a
+        // misspelled-identifier finding remains explainable (#10386).
+        identifier_typos: crate::builtin::catalog_identifier_typos(),
     };
     // The same per-policy budget an ordinary run would use, scaled the same
     // way, so a re-executed prefix is bounded exactly as the original was.

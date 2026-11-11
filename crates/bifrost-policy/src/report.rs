@@ -1123,6 +1123,9 @@ pub enum PolicyReportDiagnosticCode {
     WorkspaceModelInert,
     /// A standard-library pack selected without an exact project toolchain.
     ApproximateStandardLibrary,
+    /// A selected Rust dependency declaration pack uses a recorded nearby
+    /// rustdoc artifact or feature superset.
+    ApproximateDependencyArtifact,
     PolicyLoadFailed,
     PolicyParseFailed,
     PolicyValidationFailed,
@@ -1981,8 +1984,46 @@ impl PolicyDiffReview {
 
 impl RetainedSize for PolicyIncrementalRun {
     fn retained_size(&self) -> usize {
-        size_of::<Self>().saturating_add(self.policy_id.as_str().len())
+        size_of::<Self>()
+            .saturating_add(self.policy_id.as_str().len())
+            .saturating_add(
+                self.output_refusals.len()
+                    * std::mem::size_of::<(crate::units::OutputRefusalCause, u64)>(),
+            )
+            .saturating_add(
+                self.discarded_source_inventory
+                    .as_deref()
+                    .map_or(0, discarded_source_inventory_bytes),
+            )
     }
+}
+
+fn discarded_source_inventory_bytes(inventory: &crate::finding::DiscardedSourceInventory) -> usize {
+    let gap = |gap: &crate::finding::DiscardedSelectorGap| {
+        size_of::<crate::finding::DiscardedSelectorGap>()
+            + gap.selector.capacity()
+            + gap.message.capacity()
+            + gap
+                .original_locator_refusal_code
+                .as_ref()
+                .map_or(0, String::capacity)
+            + gap.attributed_file.as_ref().map_or(0, String::capacity)
+    };
+    size_of::<crate::finding::DiscardedSourceInventory>()
+        + [
+            &inventory.locator_restored,
+            &inventory.lost_attributed,
+            &inventory.lost_unattributed,
+        ]
+        .into_iter()
+        .flatten()
+        .map(gap)
+        .sum::<usize>()
+        + inventory
+            .row_refusals_by_kind
+            .keys()
+            .map(|kind| size_of::<(String, u64)>() + kind.capacity())
+            .sum::<usize>()
 }
 
 impl RetainedSize for PolicyIncrementalReview {
@@ -2286,6 +2327,7 @@ pub(crate) struct PolicyOptionalReviews {
     incremental: Option<PolicyIncrementalReview>,
     packs: Option<PolicyPackActivationReview>,
     baseline: Option<PolicyBaselineReview>,
+    inline_suppressions: Option<super::inline_suppression::PolicyInlineSuppressionReview>,
 }
 
 impl PolicyOptionalReviews {
@@ -2305,6 +2347,12 @@ impl PolicyOptionalReviews {
         self.baseline.as_ref()
     }
 
+    const fn inline_suppressions(
+        &self,
+    ) -> Option<&super::inline_suppression::PolicyInlineSuppressionReview> {
+        self.inline_suppressions.as_ref()
+    }
+
     /// Count of the reviews that are present, for the additive field count
     /// in [`PolicyReportDocument`]'s manual `Serialize` impl.
     fn present_count(&self) -> usize {
@@ -2312,6 +2360,7 @@ impl PolicyOptionalReviews {
             + usize::from(self.incremental.is_some())
             + usize::from(self.packs.is_some())
             + usize::from(self.baseline.is_some())
+            + usize::from(self.inline_suppressions.is_some())
     }
 }
 
@@ -2322,6 +2371,7 @@ impl RetainedSize for PolicyOptionalReviews {
             .saturating_add(retained_extra(&self.incremental))
             .saturating_add(retained_extra(&self.packs))
             .saturating_add(retained_extra(&self.baseline))
+            .saturating_add(retained_extra(&self.inline_suppressions))
     }
 }
 
@@ -2362,7 +2412,7 @@ pub struct PolicyReportDocument {
 mod render_contract_tests;
 
 impl PolicyReportDocument {
-    pub const SCHEMA_VERSION: u32 = 6;
+    pub const SCHEMA_VERSION: u32 = 7;
 
     #[cfg(test)]
     pub(crate) fn try_new(
@@ -2516,6 +2566,14 @@ impl PolicyReportDocument {
         self.reviews.packs()
     }
 
+    /// The audit of inline comment directives, present when a file with a
+    /// finding held at least one directive.
+    pub const fn inline_suppressions(
+        &self,
+    ) -> Option<&super::inline_suppression::PolicyInlineSuppressionReview> {
+        self.reviews.inline_suppressions()
+    }
+
     pub const fn baseline(&self) -> Option<&PolicyBaselineReview> {
         self.reviews.baseline()
     }
@@ -2564,6 +2622,9 @@ impl Serialize for PolicyReportDocument {
         if let Some(baseline) = self.reviews.baseline() {
             state.serialize_field("baseline", baseline)?;
         }
+        if let Some(inline_suppressions) = self.reviews.inline_suppressions() {
+            state.serialize_field("inline_suppressions", inline_suppressions)?;
+        }
         state.serialize_field("diagnostics", &self.diagnostics)?;
         state.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
         state.serialize_field(
@@ -2598,6 +2659,7 @@ impl RetainedSize for PolicyReportDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyReportDocumentError {
+    InvalidSubjectVerdicts(PolicyRunError),
     InconsistentDiagnosticTruncation,
     AmbiguousRuleJoin {
         policy_id: PolicyId,
@@ -2662,6 +2724,7 @@ pub enum PolicyReportDocumentError {
 impl fmt::Display for PolicyReportDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSubjectVerdicts(error) => error.fmt(formatter),
             Self::InconsistentDiagnosticTruncation => formatter.write_str(
                 "report diagnostic truncation, omitted count, and worst severity are inconsistent",
             ),
@@ -2970,6 +3033,33 @@ impl PolicyReportBuilder {
                     && candidate.policy_hash() == run.policy_hash()
             })
             .expect("newly inserted run exists");
+        let next_reserved = self
+            .outstanding_skeleton_allowance
+            .saturating_sub(SKELETON_ALLOWANCE_PER_INPUT);
+        loop {
+            let policy_bytes = rules[policy_index]
+                .retained_size()
+                .saturating_add(runs[run_index].retained_size());
+            let batch_bytes = report_storage_size(
+                &self.evaluation,
+                &rules,
+                &runs,
+                &self.suppressions,
+                &self.scope,
+                &self.diagnostics,
+            )
+            .saturating_add(self.reviews_extra())
+            .saturating_add(next_reserved)
+            .saturating_add(self.emergency_allowance);
+            if (policy_bytes.saturating_add(PER_POLICY_INCOMPLETE_REASON_ALLOWANCE)
+                <= self.budget.per_policy().max_retained_report_bytes()
+                && batch_bytes <= self.budget.max_retained_report_bytes())
+                || !runs[run_index].omit_last_subject()
+            {
+                break;
+            }
+        }
+        run = runs[run_index].clone();
         let policy_bytes = rules[policy_index]
             .retained_size()
             .saturating_add(runs[run_index].retained_size());
@@ -3030,6 +3120,7 @@ impl PolicyReportBuilder {
         if finding.analysis_type() != self.runs[run_index].analysis_type() {
             return Err(PolicyReportBuilderError::FindingRunJoinMismatch);
         }
+        let finding_id = finding.id();
         let weak_identity = finding.identity_stability() == FindingIdentityStability::Weak;
         if weak_identity
             && matches!(
@@ -3050,6 +3141,7 @@ impl PolicyReportBuilder {
             if error.is_budget_limit_exceeded() {
                 self.record_omitted_finding(
                     run_index,
+                    finding_id,
                     PolicyIncompleteReason::ReportRetentionBudget,
                 )?;
                 return Ok(PolicyRetentionOutcome::Omitted {
@@ -3063,7 +3155,11 @@ impl PolicyReportBuilder {
             self.runs[run_index].findings().len() >= self.budget.per_policy().max_findings();
         let batch_cap_reached = self.total_findings() >= self.budget.max_total_findings();
         if per_policy_cap_reached || batch_cap_reached {
-            self.record_omitted_finding(run_index, PolicyIncompleteReason::BatchFindingLimit)?;
+            self.record_omitted_finding(
+                run_index,
+                finding_id,
+                PolicyIncompleteReason::BatchFindingLimit,
+            )?;
             return Ok(PolicyRetentionOutcome::Omitted {
                 reason: PolicyIncompleteReason::BatchFindingLimit,
             });
@@ -3078,7 +3174,11 @@ impl PolicyReportBuilder {
                 .mark_inconclusive(PolicyIncompleteReason::StableAnchorUnavailable);
         }
         if !self.candidate_runs_fit(&mut candidate_runs, run_index) {
-            self.record_omitted_finding(run_index, PolicyIncompleteReason::ReportRetentionBudget)?;
+            self.record_omitted_finding(
+                run_index,
+                finding_id,
+                PolicyIncompleteReason::ReportRetentionBudget,
+            )?;
             return Ok(PolicyRetentionOutcome::Omitted {
                 reason: PolicyIncompleteReason::ReportRetentionBudget,
             });
@@ -3325,6 +3425,18 @@ impl PolicyReportBuilder {
         )
     }
 
+    /// Retain the audit of inline comment directives.
+    pub fn set_inline_suppressions(
+        &mut self,
+        review: super::inline_suppression::PolicyInlineSuppressionReview,
+    ) -> Result<(), PolicyReportBuilderError> {
+        self.set_review(
+            review,
+            |reviews| &mut reviews.inline_suppressions,
+            "inline suppression review is set at most once",
+        )
+    }
+
     /// Record that a baselined finding's result was dropped by the retention
     /// budget. Only counts change, so no budget re-check is needed.
     pub fn mark_baseline_result_omitted(
@@ -3468,11 +3580,16 @@ impl PolicyReportBuilder {
     fn record_omitted_finding(
         &mut self,
         run_index: usize,
+        finding_id: PolicyFindingId,
         reason: PolicyIncompleteReason,
     ) -> Result<(), PolicyReportBuilderError> {
         let mut runs = self.runs.clone();
+        runs[run_index].drop_subject_finding(finding_id);
         runs[run_index].increment_omitted_findings();
         runs[run_index].mark_inconclusive(reason);
+        while !self.candidate_runs_fit(&mut runs, run_index) && runs[run_index].omit_last_subject()
+        {
+        }
         self.refresh_candidate_policy_bytes(&mut runs, run_index);
         self.ensure_emergency_update_fits(&runs, run_index)?;
         self.runs = runs;
@@ -3856,6 +3973,10 @@ fn validate_rule_run_joins(
     rules: &[PolicyRuleDescriptor],
     runs: &[PolicyRun],
 ) -> Result<(), PolicyReportDocumentError> {
+    for run in runs {
+        run.validate_subjects()
+            .map_err(PolicyReportDocumentError::InvalidSubjectVerdicts)?;
+    }
     for pair in rules.windows(2) {
         if pair[0].policy_id() == pair[1].policy_id()
             && pair[0].policy_hash() != pair[1].policy_hash()
@@ -4406,7 +4527,7 @@ mod tests {
         let document = builder.finish().unwrap();
 
         let json = serde_json::to_value(&document).unwrap();
-        assert_eq!(json["schema_version"], 6);
+        assert_eq!(json["schema_version"], 7);
         assert_eq!(json["execution"]["termination"], "deadline_exceeded");
         assert_eq!(json["execution"]["terminal_stage"], "workspace_snapshot");
         assert_eq!(
@@ -4903,7 +5024,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_preflights_skeletons_and_emits_schema_six_document() {
+    fn builder_preflights_skeletons_and_emits_schema_seven_document() {
         let per_policy = super::super::budget::PolicyBudget::builder()
             .with_max_retained_report_bytes(1024)
             .unwrap()
@@ -4925,7 +5046,7 @@ mod tests {
         let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
         builder.register_policy(descriptor, run).unwrap();
         let document = builder.finish().unwrap();
-        assert_eq!(document.schema_version(), 6);
+        assert_eq!(document.schema_version(), 7);
         assert_eq!(document.rules().len(), 1);
         assert_eq!(document.runs().len(), 1);
         assert_eq!(
@@ -4934,7 +5055,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&document).unwrap()["schema_version"],
-            6
+            7
         );
         assert_eq!(
             serde_json::to_value(&document).unwrap()["rules"][0]["analysis_type"],

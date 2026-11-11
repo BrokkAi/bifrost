@@ -2,57 +2,32 @@
 use crate::analyzer::Language;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 use crate::analyzer::source_admission::SourceAdmissionPolicy;
-use std::borrow::Cow;
 use tree_sitter::Language as TsLanguage;
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
-/// The immutable grammar/query base is cached. The source-admission policy of
-/// the languages that admit structural line data (C++, Python, JavaScript and
-/// TypeScript) is folded outside that cache on each call, so a later analyzer
-/// construction observes the current policy. Other languages retain their
-/// existing borrowed epoch.
+/// The immutable grammar/query base is cached. The source-admission policy is
+/// folded outside that cache on each call, for every language, so a later
+/// analyzer construction observes the current policy and a policy change
+/// re-indexes the files it may admit or refuse differently (#10694).
 /// Always pass the canonical parser for `language`.
 #[doc(hidden)]
-pub fn epoch_for(language: Language, ts_language: &TsLanguage) -> Cow<'static, str> {
-    let policy = if has_configured_epoch(language) {
-        SourceAdmissionPolicy::current()
-    } else {
-        SourceAdmissionPolicy::from_setting(None)
-    };
-    epoch_for_policy(language, ts_language, policy)
+pub fn epoch_for(language: Language, ts_language: &TsLanguage) -> String {
+    epoch_for_policy(language, ts_language, SourceAdmissionPolicy::current())
 }
 
 fn epoch_for_policy(
     language: Language,
     ts_language: &TsLanguage,
     policy: SourceAdmissionPolicy,
-) -> Cow<'static, str> {
+) -> String {
     let base = crate::analyzer::store::epoch::base_epoch_for(language, ts_language);
-    if has_configured_epoch(language) {
-        let domain: &[u8] = match language {
-            Language::Cpp => b"bifrost-configured-cpp-analysis-epoch:v1",
-            Language::Python => b"bifrost-configured-python-analysis-epoch:v1",
-            // #4479: JavaScript and TypeScript joined when they began admitting
-            // string line data and grammar-proven NUL payloads.
-            Language::JavaScript => b"bifrost-configured-javascript-analysis-epoch:v1",
-            Language::TypeScript => b"bifrost-configured-typescript-analysis-epoch:v1",
-            _ => unreachable!("only structural-line adapters have configured epochs"),
-        };
-        let mut hasher = CanonicalHasher::new(domain);
-        hasher.field("grammar_query_base", base.as_bytes());
-        policy.hash_identity(&mut hasher);
-        Cow::Owned(lower_hex_string(&hasher.finish()))
-    } else {
-        Cow::Borrowed(base)
-    }
-}
-
-fn has_configured_epoch(language: Language) -> bool {
-    matches!(
-        language,
-        Language::Cpp | Language::Python | Language::JavaScript | Language::TypeScript
-    )
+    // #5408 bound C++ generations to the admission policy; #4479 added
+    // JavaScript and TypeScript, and #10694 every language.
+    let mut hasher = CanonicalHasher::new(b"bifrost-admission-analysis-epoch:v1");
+    hasher.field("grammar_query_base", base.as_bytes());
+    policy.hash_identity(&mut hasher);
+    lower_hex_string(&hasher.finish())
 }
 
 #[cfg(test)]
@@ -84,6 +59,11 @@ fn configured_structural_line_epoch_reuses_base_without_caching_policy() {
             &cpp,
             SourceAdmissionPolicy::from_setting(Some(" 016000 "))
         )
+    );
+    let rust = tree_sitter_rust::LANGUAGE.into();
+    assert_ne!(
+        epoch_for_policy(Language::Rust, &rust, default),
+        epoch_for_policy(Language::Rust, &rust, explicit)
     );
     let python = tree_sitter_python::LANGUAGE.into();
     assert_ne!(

@@ -18,6 +18,11 @@ use crate::analyzer::scala::language;
 
 use brokk_bifrost_jvm::scala::scala_normalize_full_name;
 
+use crate::analyzer::jvm::scala_owner_inventory::{
+    ScalaArtifactAlias, ScalaInventoryInputs, ScalaOwnerSide, ScalaSignatureScope,
+    attach_scala_owner_inventories,
+};
+
 use crate::analyzer::jvm::scala_collection_contracts::{
     ScalaArtifactTypeScope, publishes_collection_receiver, scala_artifact_type_scope,
     scala_standard_collection_contracts,
@@ -98,6 +103,7 @@ use brokk_bifrost_core::analyzer::scala_facts::{
 };
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_jvm::scala::ambient_use::scala_declaration_ambient_use;
+use brokk_bifrost_jvm::scala::declarations::scala_class_parameter_field_keyword;
 use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableRole, ScalaCallableSourceAlternative, ScalaTypeExpressionPath,
 };
@@ -196,6 +202,12 @@ impl ScalaSourceJarPackProducer {
         let mut members = Vec::new();
         let mut extension_surfaces = Vec::new();
         let mut type_scopes = Vec::new();
+        let mut hidden_types = Vec::new();
+        let mut hidden_members = Vec::new();
+        let mut additional_members = Vec::new();
+        let mut owner_sides = Vec::new();
+        let mut aliases = Vec::new();
+        let mut signature_scopes = Vec::new();
         let mut constructor_names_by_owner = HashMap::default();
         let standard_library_artifact = is_scala_standard_library_artifact(request);
         let mut remaining_records = limits.max_records;
@@ -228,14 +240,23 @@ impl ScalaSourceJarPackProducer {
             members.append(&mut entry_facts.members);
             extension_surfaces.append(&mut entry_facts.extension_surfaces);
             type_scopes.append(&mut entry_facts.type_scopes);
+            hidden_types.append(&mut entry_facts.hidden_types);
+            hidden_members.append(&mut entry_facts.hidden_members);
+            additional_members.append(&mut entry_facts.additional_members);
+            owner_sides.append(&mut entry_facts.owner_sides);
+            aliases.append(&mut entry_facts.aliases);
+            signature_scopes.append(&mut entry_facts.signature_scopes);
             for (owner, name) in entry_facts.constructor_names_by_owner {
                 if let Some(previous) = constructor_names_by_owner.insert(owner, name.clone()) {
                     debug_assert_eq!(previous, name);
                 }
             }
         }
+        // A non-API primary constructor is still the class's constructor; the
+        // implicit one is synthesized only for a class that declares none.
         let owners_with_constructors = members
             .iter()
+            .chain(&additional_members)
             .filter(|member| member.member_kind == MemberKind::Constructor)
             .map(|member| member.owner.clone())
             .collect::<brokk_bifrost_core::hash::HashSet<_>>();
@@ -253,6 +274,9 @@ impl ScalaSourceJarPackProducer {
             members.push(empty_constructor_fact(fact, name));
         }
         let mut collection_flows = Vec::new();
+        // Owners whose published members this producer did not read from one
+        // declaration's source, so their inventory stays open.
+        let mut synthesized_owners = brokk_bifrost_core::hash::HashSet::default();
         if standard_library_artifact {
             let products = scala_standard_collection_contracts(
                 &types,
@@ -269,11 +293,54 @@ impl ScalaSourceJarPackProducer {
                 if !take_record(&mut remaining_records, &mut record_limit_hit) {
                     break;
                 }
+                synthesized_owners.insert(member.owner.clone());
                 members.push(member);
             }
             collection_flows = products.flows;
         }
+        // One name declared both inside and outside the API projection (a
+        // public class with a non-API companion) is one owner whose hidden
+        // side is not enumerated.
+        let published_ids = types
+            .iter()
+            .map(|fact| fact.id.as_str())
+            .collect::<brokk_bifrost_core::hash::HashSet<_>>();
+        synthesized_owners.extend(
+            hidden_types
+                .iter()
+                .filter(|fact| published_ids.contains(fact.id.as_str()))
+                .map(|fact| fact.id.clone()),
+        );
+        let mut additional_by_owner = HashMap::<String, Vec<MemberFact>>::default();
+        for member in additional_members {
+            additional_by_owner
+                .entry(member.owner.clone())
+                .or_default()
+                .push(member);
+        }
+        attach_scala_owner_inventories(
+            ScalaInventoryInputs {
+                types: &mut types,
+                members: &mut members,
+                hidden_types: &hidden_types,
+                hidden_members: &hidden_members,
+                additional_members: additional_by_owner,
+                sides: &owner_sides,
+                aliases: &aliases,
+                signature_scopes: &signature_scopes,
+                synthesized_owners: &synthesized_owners,
+            },
+            || take_record(&mut remaining_records, &mut record_limit_hit),
+        );
         if record_limit_hit {
+            for inventory in types
+                .iter_mut()
+                .filter_map(|fact| fact.jvm_inventory.as_mut())
+            {
+                inventory.callables_complete = false;
+                inventory.values_complete = false;
+                inventory.types_complete = false;
+            }
             diagnostics.warning(
                 "limit.records",
                 None,
@@ -340,6 +407,15 @@ struct ParsedScalaEntry {
 struct ScalaEntryFacts {
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
+    /// Declarations outside the API projection, which bind names and supply
+    /// inherited terms to inventories but are not published.
+    hidden_types: Vec<TypeFact>,
+    hidden_members: Vec<MemberFact>,
+    /// Non-API members of published owners.
+    additional_members: Vec<MemberFact>,
+    owner_sides: Vec<ScalaOwnerSide>,
+    aliases: Vec<ScalaArtifactAlias>,
+    signature_scopes: Vec<ScalaSignatureScope>,
     extension_surfaces: Vec<(Vec<String>, String)>,
     type_scopes: Vec<ScalaArtifactTypeScope>,
     constructor_names_by_owner: HashMap<String, String>,
@@ -385,9 +461,17 @@ fn scala_entry_facts(
     let mut type_kinds = HashMap::default();
     let mut type_parameters_by_declaration = HashMap::default();
     let mut constructor_names_by_owner = HashMap::default();
-    // Only the standard library publishes collection contracts, so only it
-    // pays for the name scopes their inheritance proof reads.
+    // Only the standard library publishes collection contracts; every
+    // artifact resolves the names its owner inventories read.
     let mut type_scopes = Vec::new();
+    let mut hidden_types = Vec::<TypeFact>::new();
+    let mut hidden_index_by_name = HashMap::default();
+    let mut published_owners = brokk_bifrost_core::hash::HashSet::default();
+    let mut owner_sides = Vec::<ScalaOwnerSide>::new();
+    let mut side_by_declaration = HashMap::default();
+    let mut aliases = Vec::new();
+    let mut signature_scopes = Vec::new();
+    let mut top_level_scopes = HashMap::<CodeUnit, ScalaArtifactTypeScope>::default();
     let is_top_level = |declaration: &CodeUnit| {
         parent_by_child
             .get(declaration)
@@ -395,9 +479,7 @@ fn scala_entry_facts(
     };
     let same_unit = declarations
         .iter()
-        .filter(|declaration| {
-            standard_library_artifact && declaration.is_class() && is_top_level(declaration)
-        })
+        .filter(|declaration| declaration.is_class() && is_top_level(declaration))
         .map(|declaration| {
             (
                 declaration.identifier().to_owned(),
@@ -405,15 +487,45 @@ fn scala_entry_facts(
             )
         })
         .collect::<HashMap<_, _>>();
+    // Simple names a nested template may bind instead of a unit-level one:
+    // nested types and aliases, every declared type parameter, and the names
+    // nested imports bring in. Signature types spelling one stay as written.
+    let mut shadowed = brokk_bifrost_core::hash::HashSet::default();
+    let mut shadows_all = false;
+    for declaration in &declarations {
+        if (declaration.is_class() || parsed.type_aliases.contains(*declaration))
+            && !is_top_level(declaration)
+        {
+            shadowed.insert(declaration.identifier().to_owned());
+        }
+        if let Some(generic) = source_facts
+            .get(declaration)
+            .and_then(|fact| fact.generic_owner.as_ref())
+        {
+            shadowed.extend(generic.type_parameters.iter().cloned());
+        }
+    }
+    for import in &parsed.imports {
+        if import
+            .path
+            .as_ref()
+            .is_none_or(|path| path.lexical_scopes.is_empty())
+        {
+            continue;
+        }
+        match &import.identifier {
+            Some(bound) if !import.is_wildcard => {
+                shadowed.insert(bound.clone());
+            }
+            _ => shadows_all = true,
+        }
+    }
     for declaration in declarations
         .iter()
         .copied()
         .filter(|declaration| declaration.is_class() || parsed.type_aliases.contains(*declaration))
     {
-        let Some(visibility) = effective_visibility(&source_facts, declaration, &parent_by_child)
-        else {
-            continue;
-        };
+        let effective = effective_visibility(&source_facts, declaration, &parent_by_child);
         let Some(range) = parsed
             .ranges
             .get(declaration)
@@ -430,6 +542,7 @@ fn scala_entry_facts(
         let declaration_source = source_facts
             .get(&declaration)
             .expect("Scala artifact declaration has primary source facts");
+        let visibility = effective.unwrap_or_else(|| declared_visibility(declaration_source));
         let name = scala_normalize_full_name(&declaration.fq_name());
         let type_kind = scala_type_kind(
             declaration_source.kind,
@@ -458,15 +571,13 @@ fn scala_entry_facts(
             .unwrap_or_default();
         type_ids.insert(declaration.clone(), type_id.clone());
         type_kinds.insert(declaration.clone(), type_kind);
-        if matches!(type_kind, TypeKind::Class | TypeKind::Enum) {
+        if effective.is_some() && matches!(type_kind, TypeKind::Class | TypeKind::Enum) {
             constructor_names_by_owner.insert(type_id.clone(), declaration.identifier().to_owned());
         }
         type_parameters_by_declaration.insert(declaration.clone(), type_parameters.clone());
-        if standard_library_artifact
-            && is_top_level(declaration)
-            && !parsed.type_aliases.contains(declaration)
-        {
-            type_scopes.push(scala_artifact_type_scope(
+        let is_alias = parsed.type_aliases.contains(declaration);
+        let scope = is_top_level(declaration).then(|| {
+            scala_artifact_type_scope(
                 name.clone(),
                 declaration,
                 node,
@@ -476,10 +587,89 @@ fn scala_entry_facts(
                 generic_facts
                     .map(|facts| facts.supertypes.clone())
                     .unwrap_or_default(),
+                &declaration_source.lexical_prefixes,
                 &same_unit,
-            ));
+            )
+        });
+        let enclosing_scope = std::iter::successors(Some(declaration), |candidate| {
+            parent_by_child.get(*candidate)
+        })
+        .find(|candidate| is_top_level(candidate))
+        .and_then(|top_level| top_level_scopes.get(top_level))
+        .or(scope.as_ref())
+        .cloned();
+        if let Some(scope) = &enclosing_scope {
+            signature_scopes.push(ScalaSignatureScope {
+                owner_id: type_id.clone(),
+                scope: scope.clone(),
+                shadowed: shadowed.clone(),
+                shadows_all,
+            });
+        }
+        if let Some(scope) = &scope
+            && !is_alias
+        {
+            top_level_scopes.insert(declaration.clone(), scope.clone());
+        }
+        if is_alias {
+            // A nested alias such as `Predef.String` is read in its top-level
+            // template's scope only when it names a qualified path, which a
+            // member of that template cannot shadow by a simple name.
+            let alias_scope = if is_top_level(declaration) {
+                scope
+            } else {
+                enclosing_scope.filter(|_| {
+                    declaration_source
+                        .type_alias_path
+                        .as_ref()
+                        .is_some_and(|target| target.len() > 1)
+                })
+            };
+            if let (Some(scope), Some(target)) = (alias_scope, &declaration_source.type_alias_path)
+            {
+                aliases.push(ScalaArtifactAlias {
+                    name: name.clone(),
+                    target: target.clone(),
+                    scope,
+                });
+            }
+        } else {
+            if standard_library_artifact
+                && effective.is_some()
+                && let Some(scope) = &scope
+            {
+                type_scopes.push(scope.clone());
+            }
+            if let Some(parent) = parent_by_child
+                .get(declaration)
+                .and_then(|parent| side_by_declaration.get(parent))
+            {
+                // A nested type is not enumerated, and an object or a case
+                // class nested in a template is also a term of it.
+                let parent: &mut ScalaOwnerSide = &mut owner_sides[*parent];
+                parent.declares_types = true;
+                parent.terms_open |= type_kind == TypeKind::Module
+                    || declaration_source.is_case_class
+                    || matches!(
+                        scala_declaration_ambient_use(node),
+                        Some(AmbientUseRole::Implicit | AmbientUseRole::Given)
+                    );
+            }
+            side_by_declaration.insert(declaration.clone(), owner_sides.len());
+            owner_sides.push(ScalaOwnerSide {
+                owner_id: type_id.clone(),
+                module: type_kind == TypeKind::Module,
+                terms_open: declaration_source.is_case_class
+                    || declaration_source.is_enum
+                    || type_kind == TypeKind::Enum
+                    || declares_export(node),
+                declares_types: false,
+                scope,
+            });
         }
         let fact = TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -510,8 +700,14 @@ fn scala_entry_facts(
                 symbol: Some(declaration.fq_name()),
             },
         };
-        if let Some(&existing_index) = type_index_by_name.get(&fact.name) {
-            let existing: &mut TypeFact = &mut types[existing_index];
+        let (owners, index_by_name) = if effective.is_some() {
+            published_owners.insert(declaration.clone());
+            (&mut types, &mut type_index_by_name)
+        } else {
+            (&mut hidden_types, &mut hidden_index_by_name)
+        };
+        if let Some(&existing_index) = index_by_name.get(&fact.name) {
+            let existing: &mut TypeFact = &mut owners[existing_index];
             let ambient_use = weaker_ambient_use(existing.ambient_use, fact.ambient_use);
             if existing.type_kind == TypeKind::Module && fact.type_kind != TypeKind::Module {
                 *existing = fact;
@@ -519,14 +715,16 @@ fn scala_entry_facts(
             existing.ambient_use = ambient_use;
             continue;
         }
-        if !take_record(remaining_records, record_limit_hit) {
+        if effective.is_some() && !take_record(remaining_records, record_limit_hit) {
             break;
         }
-        type_index_by_name.insert(fact.name.clone(), types.len());
-        types.push(fact);
+        index_by_name.insert(fact.name.clone(), owners.len());
+        owners.push(fact);
     }
 
     let mut members = Vec::new();
+    let mut hidden_members = Vec::new();
+    let mut additional_members = Vec::new();
     let mut extension_surfaces = Vec::new();
     for declaration in declarations.into_iter().filter(|declaration| {
         (declaration.is_function() || declaration.is_field())
@@ -538,11 +736,15 @@ fn scala_entry_facts(
         let Some(owner_id) = type_ids.get(owner) else {
             continue;
         };
-        let Some(visibility) = effective_visibility(&source_facts, declaration, &parent_by_child)
-        else {
-            continue;
+        let side = side_by_declaration.get(owner).copied();
+        let mut open_side = || {
+            if let Some(side) = side {
+                owner_sides[side].terms_open = true;
+            }
         };
-        if !take_record(remaining_records, record_limit_hit) {
+        let effective = effective_visibility(&source_facts, declaration, &parent_by_child);
+        let owner_published = published_owners.contains(owner);
+        if owner_published && !take_record(remaining_records, record_limit_hit) {
             break;
         }
         let Some(range) = parsed
@@ -550,17 +752,28 @@ fn scala_entry_facts(
             .get(declaration)
             .and_then(|ranges| ranges.first())
         else {
+            open_side();
             continue;
         };
         let Some(node) = tree
             .root_node()
             .descendant_for_byte_range(range.start_byte, range.end_byte)
         else {
+            open_side();
             continue;
         };
         let declaration_source = source_facts
             .get(&declaration)
             .expect("Scala artifact declaration has primary source facts");
+        let visibility = effective.unwrap_or_else(|| declared_visibility(declaration_source));
+        // A `var` also has a setter term, which is not published.
+        if declaration.is_field()
+            && (matches!(node.kind(), "var_definition" | "var_declaration")
+                || (node.kind() == "class_parameter"
+                    && scala_class_parameter_field_keyword(node) == Some("var")))
+        {
+            open_side();
+        }
         let callable = declaration_source.callable.as_ref();
         let member_kind = scala_member_kind(declaration, callable);
         // Exact source formal types still define the declaration identity when
@@ -579,6 +792,9 @@ fn scala_entry_facts(
         });
         let omit_signature = identity_signature.is_some()
             && callable.is_some_and(scala_signature_has_unrepresentable_parameter_lists);
+        if callable.is_some() && (identity_signature.is_none() || omit_signature) {
+            open_side();
+        }
         if omit_signature {
             diagnostics.absorb(vec![ProducerDiagnostic {
                 severity: ProducerDiagnosticSeverity::Warning,
@@ -645,8 +861,9 @@ fn scala_entry_facts(
         } else {
             identity_signature
         };
-        if let Some(receiver) =
-            callable.and_then(|callable| callable.extension_receiver_type_path.as_ref().cloned())
+        if effective.is_some()
+            && let Some(receiver) = callable
+                .and_then(|callable| callable.extension_receiver_type_path.as_ref().cloned())
         {
             extension_surfaces.push((receiver, scala_normalize_full_name(&owner.fq_name())));
         }
@@ -654,7 +871,14 @@ fn scala_entry_facts(
             && publishes_collection_receiver(&owner.fq_name())
             && !is_static
             && matches!(member_kind, MemberKind::Method);
-        members.push(MemberFact {
+        let routed = if effective.is_some() {
+            &mut members
+        } else if owner_published {
+            &mut additional_members
+        } else {
+            &mut hidden_members
+        };
+        routed.push(MemberFact {
             implemented_trait: None,
             self_form: None,
             non_overridable: None,
@@ -690,6 +914,12 @@ fn scala_entry_facts(
     ScalaEntryFacts {
         types,
         members,
+        hidden_types,
+        hidden_members,
+        additional_members,
+        owner_sides,
+        aliases,
+        signature_scopes,
         extension_surfaces,
         type_scopes,
         constructor_names_by_owner,
@@ -777,6 +1007,32 @@ fn effective_visibility(
             })
         });
     restrict_effective_visibility(Visibility::Public, enclosing)
+}
+
+/// The visibility a non-API declaration declares for itself: a qualified
+/// `private[pkg]` is package access, anything narrower is private.
+fn declared_visibility(fact: &ScalaDeclarationSourceFact) -> Visibility {
+    match fact.visibility {
+        ScalaDeclarationVisibility::Public => Visibility::Public,
+        ScalaDeclarationVisibility::Protected => Visibility::Protected,
+        ScalaDeclarationVisibility::NonApi => match fact.access_boundary {
+            Some(
+                brokk_bifrost_core::analyzer::source_facts::DeclarationAccessBoundary::Package(_),
+            ) => Visibility::Package,
+            _ => Visibility::Private,
+        },
+    }
+}
+
+/// Whether a template's body has an `export` clause, whose aliases are terms
+/// of the template that this producer does not publish.
+fn declares_export(node: Node<'_>) -> bool {
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .any(|child| child.kind() == "export_declaration")
 }
 
 fn scala_type_kind(kind: ScalaDeclarationKind, type_alias: bool) -> TypeKind {
@@ -1086,6 +1342,7 @@ object Syntax {
             version,
             Vec::new(),
             Provenance {
+                rust_artifact_approximation: None,
                 source: "fixture source archive".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
             },

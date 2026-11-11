@@ -309,7 +309,10 @@ impl CodeQueryResult {
                             value.call_kind,
                             value.proof,
                             value.caller.fq_name,
-                            value.callee.fq_name
+                            value.callee.as_ref().map_or(
+                                value.target_fq_name.as_deref().unwrap_or("<unresolved>"),
+                                |callee| callee.fq_name.as_str()
+                            )
                         ));
                     }
                     CodeQueryResultValue::ExpressionSite { value } => {
@@ -1151,8 +1154,9 @@ impl CodeQueryResult {
                             value.target.kind,
                         ));
                         out.push_str(&format!(
-                            "  kind {}, site {}, relation {}, generation {}\n",
-                            value.reference_kind.unwrap_or("unclassified"),
+                            "  facets known={:?}, undecided={:?}, site {}, relation {}, generation {}\n",
+                            value.reference_facets.known,
+                            value.reference_facets.undecided,
                             value.site_class,
                             value.owner_relation,
                             value.generation,
@@ -1310,6 +1314,9 @@ impl CodeQueryResult {
                             value.statement_kind,
                             value.verdict,
                         ));
+                        if let Some(region_first) = value.region_first {
+                            out.push_str(&format!("  region_first: {region_first}\n"));
+                        }
                         if let Some(reason) = &value.reason {
                             out.push_str(&format!("  reason: {reason}\n"));
                         }
@@ -1567,6 +1574,11 @@ impl CodeQueryResult {
                 }
             }
         }
+        if let Some(status) = self.depth_bound_status {
+            out.push_str(status.answer_text());
+            out.push('\n');
+        }
+
         for diagnostic in &self.diagnostics {
             out.push_str(&format!(
                 "{}: {}\n",

@@ -18,8 +18,7 @@
 
 use super::extractor::{
     call_result_types, collect_assigned_identifiers, collect_function_scope_facts_from_node,
-    collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
-    slice,
+    collect_scope_facts_from_parsed_source, enclosing_scope_facts, slice,
 };
 use super::resolver::{
     annotation_reference_candidates, resolve_callable_parameter_default_types,
@@ -30,6 +29,7 @@ use crate::bindings::{python_comprehension_binds_name_at, python_type_parameter_
 use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
 use crate::imports::{imported_module_assignment_at, resolve_fqn_candidates};
+use crate::syntax::is_declaration_identifier;
 use crate::syntax::{
     attribute_chain, leftmost_identifier, python_reference_is_deferred_function_body,
 };

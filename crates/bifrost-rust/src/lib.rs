@@ -21,6 +21,7 @@
 //! the arguments.
 
 pub mod adapter;
+pub mod binding_identity;
 pub mod cache;
 pub mod cargo_config;
 pub mod cargo_manifest;
@@ -46,7 +47,7 @@ pub mod prelude;
 pub mod proof;
 pub mod queries;
 mod resolution;
-pub use resolution::rust_unwrap_operand;
+pub use resolution::{rust_attribute_item_can_expand, rust_unwrap_operand};
 #[cfg(any(test, feature = "test-support"))]
 pub mod resolution_spike_fixture;
 pub mod selected_context;

@@ -141,7 +141,7 @@ impl RetainedPythonEnvironment {
         overlay: &SemanticModelOverlay,
         path: &str,
     ) -> Result<Arc<SemanticModelSymbol>, PythonEnvironmentBoundary> {
-        let matched = overlay.symbols_with_id(&python_declaration_id(path));
+        let matched = overlay.symbols_with_id_for(&python_declaration_id(path), "python");
         match matched.disposition {
             SemanticModelOverlayDisposition::Empty => Err(self.missing_evidence(path)),
             SemanticModelOverlayDisposition::Conflict => {
@@ -158,6 +158,11 @@ impl RetainedPythonEnvironment {
                 .first()
                 .expect("a unique overlay match has one record")
                 .clone()),
+            SemanticModelOverlayDisposition::Open(_) => Err(PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: format!("Python `{path}` semantic-model inventory is incomplete"),
+                },
+            )),
         }
     }
 
@@ -191,13 +196,16 @@ impl RetainedPythonEnvironment {
         // A submodule, class, or type alias the module declares is published
         // as its own qualified declaration.
         if !overlay
-            .symbols_with_id(&python_declaration_id(&format!("{module_path}.{member}")))
+            .symbols_with_id_in_family(
+                &python_declaration_id(&format!("{module_path}.{member}")),
+                "python",
+            )
             .records
             .is_empty()
         {
             return PythonEnvironmentBoundary::Indexed;
         }
-        let members = overlay.members_of(&module.id);
+        let members = overlay.members_of_in_family(&module.id, "python");
         if members.records.iter().any(|record| record.name == member) {
             return PythonEnvironmentBoundary::Indexed;
         }
@@ -279,16 +287,16 @@ impl RetainedPythonEnvironment {
             // A nested class or type alias is published as its own qualified
             // declaration rather than as a member of its owner.
             if !overlay
-                .symbols_with_id(&python_declaration_id(&format!(
-                    "{}.{member}",
-                    record.qualified_name
-                )))
+                .symbols_with_id_in_family(
+                    &python_declaration_id(&format!("{}.{member}", record.qualified_name)),
+                    "python",
+                )
                 .records
                 .is_empty()
             {
                 return PythonEnvironmentBoundary::Indexed;
             }
-            for published in overlay.members_of(&record.id).records {
+            for published in overlay.members_of_in_family(&record.id, "python").records {
                 if published.name == member {
                     return PythonEnvironmentBoundary::Indexed;
                 }

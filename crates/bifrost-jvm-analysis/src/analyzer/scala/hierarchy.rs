@@ -4,6 +4,7 @@ use brokk_bifrost_core::analyzer::capabilities::HierarchyAnswer;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 
 use crate::analyzer::jvm::external::JvmExternalDeclarations;
+use crate::analyzer::jvm::external::QueryGapRecorder;
 
 use brokk_bifrost_core::analyzer::type_relations::TypeRelation;
 
@@ -836,7 +837,8 @@ impl ScalaAnalyzer {
         external_root_fqn: &str,
     ) -> ScalaExternalRootLanding {
         let external = self.external_declarations(packs);
-        if external.is_empty() {
+        let recorder = QueryGapRecorder::new(self);
+        if external.empty_surface(&recorder) {
             return ScalaExternalRootLanding::Other;
         }
         let segments = path.segments();
@@ -913,10 +915,11 @@ impl ScalaAnalyzer {
         if namespaces.len() <= 1 {
             return false;
         }
+        let recorder = QueryGapRecorder::new(self);
         namespaces.iter().any(|namespace| {
             format!("{namespace}.{spelling}") == external_root_fqn
                 || external
-                    .resolve_wildcard_import(namespace, spelling, package_name)
+                    .resolve_wildcard_import(&recorder, namespace, spelling, package_name)
                     .is_some()
         })
     }
@@ -1066,11 +1069,28 @@ impl ScalaAnalyzer {
         root: Option<&CodeUnit>,
         run: &mut dyn FnMut(&mut dyn brokk_bifrost_core::analyzer::capabilities::HierarchyQuery),
     ) {
+        use brokk_bifrost_core::analyzer::capabilities::UnreadMemberFamilyAncestor;
+        use brokk_bifrost_jvm::intrinsics::overridable_method_inventory;
         let _scope = AnalyzerQueryScope::new(self);
         crate::analyzer::jvm::native_hierarchy::with_native_query(
             self.tree_sitter_analyzer(),
             root,
             &mut |owner, parents| self.normalize_native_parents(owner, parents),
+            &mut |owner, parents| {
+                self.normalize_native_parents(owner, parents);
+                for parent in parents {
+                    if let Some(root) = &parent.intrinsic_root
+                        && root.owner_fqn.as_ref() == "scala.AnyRef"
+                    {
+                        // The scala package declares `type AnyRef = java.lang.Object`,
+                        // so AnyRef contributes exactly Object's overridable methods.
+                        parent.unread.push(UnreadMemberFamilyAncestor {
+                            name: root.owner_fqn.to_string(),
+                            inventory: overridable_method_inventory("java.lang.Object"),
+                        });
+                    }
+                }
+            },
             run,
         );
     }

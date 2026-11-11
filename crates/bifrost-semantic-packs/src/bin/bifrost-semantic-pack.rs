@@ -92,27 +92,13 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "compile" => compile_command(arguments, format),
         "list" => list_command(arguments, format),
         "workspace-check" => workspace_check_command(arguments, format),
-        "export-embedded-registry" => {
-            let [output] = arguments.as_slice() else {
-                return Err(failure(2, usage(), format));
-            };
-            brokk_bifrost_semantic_packs::prepared_registry::export_embedded_registry(Path::new(
-                output,
-            ))
-            .map_err(|error| {
-                failure(
-                    2,
-                    format!("prepare full semantic registry: {error}"),
-                    format,
-                )
-            })?;
-            Ok(0)
-        }
         "generate" => generate_command(arguments, format),
         "merge" => merge_command(arguments, format),
         "verify" => verify_command(arguments, format),
         "install" => install_command(arguments, format),
         "reindex" => reindex_command(arguments, format),
+        "codeql-rust-audit" => codeql_rust_audit_command(arguments, format),
+        "codeql-rust-summaries" => codeql_rust_summaries_command(arguments, format),
         "codeql-jdk-summaries" => codeql_jdk_summaries_command(arguments, format),
         "codeql-jvm-catalogs" => codeql_jvm_catalogs_command(arguments, format),
         "summary-corpus-join" => summary_corpus_join_command(arguments, format),
@@ -121,6 +107,210 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "golden-summary-pack" => golden_summary_pack_command(arguments, format),
         _ => Err(failure(2, usage(), format)),
     }
+}
+
+fn codeql_rust_audit_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    let [root, report] = arguments.as_slice() else {
+        return Err(failure(
+            2,
+            "usage: bifrost-semantic-pack codeql-rust-audit RUST_QL_LIB REPORT_JSON",
+            format,
+        ));
+    };
+    let files = rust_mad_files(Path::new(root), format)?;
+    let audit =
+        brokk_bifrost_semantic_packs::summary_foundry::codeql::rust::audit_pinned_rust_models(
+            &files,
+        )
+        .map_err(|error| failure(2, error, format))?;
+    let bytes =
+        serde_json::to_vec_pretty(&audit).map_err(|error| failure(2, error.to_string(), format))?;
+    let destination = Path::new(report);
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| failure(2, format!("create report: {error}"), format))?;
+    std::io::Write::write_all(&mut temporary, &bytes)
+        .map_err(|error| failure(2, format!("write report: {error}"), format))?;
+    temporary
+        .persist(destination)
+        .map_err(|error| failure(2, format!("persist report: {error}"), format))?;
+    Ok(0)
+}
+
+fn rust_mad_files(
+    root: &Path,
+    format: OutputFormat,
+) -> Result<Vec<(String, Vec<u8>)>, CommandFailure> {
+    let mut files = Vec::new();
+    for relative in ["codeql/rust/frameworks", "ext/generated"] {
+        let directory = root.join(relative);
+        let input = brokk_bifrost_semantic_packs::summary_foundry::read_codeql_models(&directory)
+            .map_err(|error| failure(2, format!("read {relative}: {error}"), format))?;
+        files.extend(
+            input
+                .into_iter()
+                .map(|(name, bytes)| (format!("{relative}/{name}"), bytes)),
+        );
+    }
+    Ok(files)
+}
+
+fn codeql_rust_summaries_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        ArtifactProducerLimits, ArtifactProductionRequest, ExternalArtifactKind,
+        read_exact_source_set,
+    };
+    use brokk_bifrost_rust_analysis::analyzer::rust::RustdocJsonPackProducer;
+    use brokk_bifrost_semantic_packs::release_bundle::{PinnedPackKind, PinnedPackSpec};
+    use brokk_bifrost_semantic_packs::summary_foundry::codeql::rust::{
+        StdlibDeclarationEvidence, apply_std_summary_output, audit_pinned_rust_models,
+        build_std_taint_summary_pack, preflight_std_free_functions, std_endpoint_catalogs,
+    };
+    use sha2::Digest as _;
+    let [
+        mad_root,
+        spec_path,
+        source_root,
+        pack_path,
+        catalog_dir,
+        report_path,
+    ] = arguments.as_slice()
+    else {
+        return Err(failure(
+            2,
+            "usage: bifrost-semantic-pack codeql-rust-summaries RUST_QL_LIB STDLIB_SPEC STDLIB_SOURCE_SET PACK_JSON CATALOG_DIR REPORT_JSON",
+            format,
+        ));
+    };
+    let files = rust_mad_files(Path::new(mad_root), format)?;
+    let mut audit = audit_pinned_rust_models(&files).map_err(|error| failure(2, error, format))?;
+    let spec_bytes = fs::read(spec_path).map_err(|error| failure(2, error.to_string(), format))?;
+    let spec: PinnedPackSpec = serde_json::from_slice(&spec_bytes)
+        .map_err(|error| failure(2, format!("stdlib spec: {error}"), format))?;
+    let PinnedPackKind::RustdocJsonSet { crates } = &spec.kind else {
+        return Err(failure(
+            2,
+            "expected a rustdoc JSON source-set spec",
+            format,
+        ));
+    };
+    let paths = crates
+        .iter()
+        .map(|item| PathBuf::from(&item.path))
+        .collect::<Vec<_>>();
+    let limits = ArtifactProducerLimits::default();
+    let artifact = read_exact_source_set(Path::new(source_root), &paths, 3, 8, &limits)
+        .map_err(|error| failure(2, format!("stdlib source set: {error:?}"), format))?;
+    if artifact.sha256() != spec.artifact.sha256 {
+        return Err(failure(
+            2,
+            "stdlib source-set digest differs from pinned spec",
+            format,
+        ));
+    }
+    let request = ArtifactProductionRequest {
+        path: PathBuf::from(source_root),
+        artifact_kind: ExternalArtifactKind::RustdocJsonSet,
+        pack_id: spec.pack_id.clone(),
+        pack_version: spec.pack_version.clone(),
+        ecosystem: spec.ecosystem.clone(),
+        compatibility: spec.compatibility.clone(),
+        activation: spec.activation.clone(),
+        provenance: spec.provenance.clone(),
+        license: spec.license.clone(),
+        safety: spec.safety.clone(),
+    };
+    let crate_paths = crates
+        .iter()
+        .map(|item| (item.name.clone(), item.path.clone()))
+        .collect::<Vec<_>>();
+    let production = RustdocJsonPackProducer.produce_loaded_source_set(
+        &request,
+        &limits,
+        None,
+        &artifact,
+        &crate_paths,
+    );
+    let declarations = production.pack.ok_or_else(|| {
+        failure(
+            2,
+            format!("stdlib declarations: {:?}", production.diagnostics),
+            format,
+        )
+    })?;
+    let expected = StdlibDeclarationEvidence {
+        pack_id: &spec.pack_id,
+        version: &spec.pack_version,
+        source_set_digest: &spec.artifact.sha256,
+    };
+    let certified = preflight_std_free_functions(&audit, &declarations, &expected)
+        .map_err(|error| failure(2, error, format))?;
+    let (pack, emitted) = build_std_taint_summary_pack(&audit, &declarations, &expected)
+        .map_err(|error| failure(2, error, format))?;
+    let emitted_transfer_count = pack
+        .shards
+        .iter()
+        .map(|shard| {
+            match &shard.payload {
+            brokk_bifrost_analysis::analyzer::semantic_model::AuthoredPayload::ProcedureSummaries {
+                summaries,
+            } => summaries.iter().map(|summary| summary.transfers.len()).sum::<usize>(),
+            _ => 0,
+        }
+        })
+        .sum();
+    let (catalogs, catalog_rows) = std_endpoint_catalogs(&audit, &certified)
+        .map_err(|error| failure(2, format!("Rust endpoint catalogs: {error}"), format))?;
+    let pack_bytes =
+        serde_json::to_vec_pretty(&pack).map_err(|error| failure(2, error.to_string(), format))?;
+    compile_source(SourceFormat::Json, &pack_bytes, &CompilerOptions::default())
+        .map_err(|errors| failure(2, format!("generated pack is invalid: {errors:?}"), format))?;
+    apply_std_summary_output(
+        &mut audit,
+        &certified,
+        &emitted,
+        &catalog_rows,
+        emitted_transfer_count,
+        &pack_bytes,
+    )
+    .map_err(|error| failure(2, error, format))?;
+    fs::create_dir_all(catalog_dir).map_err(|error| failure(2, error.to_string(), format))?;
+    for (name, catalog) in catalogs {
+        let bytes = serde_json::to_vec_pretty(&catalog)
+            .map_err(|error| failure(2, error.to_string(), format))?;
+        audit.artifact_digests.insert(
+            format!("catalog:{name}"),
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &sha2::Sha256::digest(&bytes).into(),
+            ),
+        );
+        fs::write(Path::new(catalog_dir).join(format!("{name}.json")), bytes)
+            .map_err(|error| failure(2, error.to_string(), format))?;
+    }
+    audit
+        .artifact_digests
+        .insert(spec.pack_id.clone(), spec.artifact.sha256.clone());
+    let report_bytes =
+        serde_json::to_vec_pretty(&audit).map_err(|error| failure(2, error.to_string(), format))?;
+    for (path, bytes) in [
+        (Path::new(pack_path), pack_bytes),
+        (Path::new(report_path), report_bytes),
+    ] {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| failure(2, error.to_string(), format))?;
+        }
+        fs::write(path, bytes).map_err(|error| failure(2, error.to_string(), format))?;
+    }
+    Ok(0)
 }
 
 fn codeql_jdk_summaries_command(
@@ -703,7 +893,11 @@ fn generate_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8
             artifact_path: PathBuf::from(&pair[1]),
         })
         .collect::<Vec<_>>();
-    let bundle = generate_release_bundle(&output_root, &inputs)
+    // A one-shot bundle generation owns its retention budget.
+    let budget = brokk_bifrost_analysis::retention_budget::RetentionBudget::new(
+        brokk_bifrost_analysis::analyzer::AnalyzerConfig::default().retention_budget_bytes(),
+    );
+    let bundle = generate_release_bundle(&output_root, &inputs, &budget)
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     println!(
         "generated {} pinned semantic packs in {}",
@@ -1354,14 +1548,15 @@ fn usage() -> &'static str {
         "  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n",
         "  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n",
         "  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n",
-        "  bifrost-semantic-pack export-embedded-registry OUTPUT\n",
         "  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n",
         "  bifrost-semantic-pack merge OUTPUT INPUT...\n",
         "  bifrost-semantic-pack verify OUTPUT\n",
         "  bifrost-semantic-pack install BUNDLE CATALOG\n",
         "  bifrost-semantic-pack reindex CATALOG [--format human|json]\n",
+        "  bifrost-semantic-pack codeql-rust-audit RUST_QL_LIB REPORT_JSON\n",
         "  bifrost-semantic-pack codeql-jdk-summaries EXT_DIRECTORY CODEQL_COMMIT JAVA_HOME PACK_JSON REPORT_JSON\n",
         "  bifrost-semantic-pack codeql-jvm-catalogs EXT_DIRECTORY CODEQL_COMMIT CATALOG_PREFIX CATALOG_VERSION CATALOG_DIR REPORT_JSON (--java-home DIR | --jar FILE)...\n",
+        "  bifrost-semantic-pack codeql-rust-summaries RUST_QL_LIB STDLIB_SPEC STDLIB_SOURCE_SET PACK_JSON CATALOG_DIR REPORT_JSON\n",
         "  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS ",
         "JOERN_SOURCE REPORT.json [JVM_SOURCES]\n",
         "  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n",

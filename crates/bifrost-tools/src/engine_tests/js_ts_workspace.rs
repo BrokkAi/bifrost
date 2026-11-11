@@ -159,7 +159,7 @@ mod js_ts_extraction_tests {
             BTreeSet::from([Language::Java, Language::TypeScript]),
         ));
         let config = AnalyzerConfig {
-            memo_cache_budget_bytes: Some(1024 * 1024),
+            retention_budget_bytes: Some(4 * (1024 * 1024)),
             ..AnalyzerConfig::default()
         };
         let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), config)
@@ -170,7 +170,7 @@ mod js_ts_extraction_tests {
                 .snapshot_caches()
                 .expect("multi workspace caches")
                 .derived_layers()
-                .max_retained_bytes(),
+                .construction_limit_bytes(),
             128 * 1024
         );
 
@@ -182,7 +182,7 @@ mod js_ts_extraction_tests {
                 .snapshot_caches()
                 .expect("snapshot caches")
                 .derived_layers()
-                .max_retained_bytes(),
+                .construction_limit_bytes(),
             128 * 1024
         );
     }

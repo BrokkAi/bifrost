@@ -17,12 +17,13 @@ use brokk_bifrost_analysis::analyzer::{
     OverwrittenLocalCandidate, OverwrittenLocalSourceKind, PlainAssignmentCandidate,
     PlainAssignmentVerdict, go_overwritten_local_candidates, java_overwritten_local_candidates,
     js_ts_overwritten_local_candidates, plain_assignment_candidates,
-    python_overwritten_local_candidates, single_target_overwritten_local_candidates,
+    python_overwritten_local_candidates, rust_dead_write_macro_sources_by_binding,
+    single_target_overwritten_local_candidates,
 };
 use brokk_bifrost_flow::flow_state::{
-    BindingInitializationAnswer, FlowCertainty, FlowRelation, FlowStateAxis, FlowStateCompleteness,
-    FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, FlowSubject,
-    OverwrittenUnreadAnswer, SameEvaluationAnswer, StateEventClass, StateEventRow,
+    BindingInitializationAnswer, DeadWriteAnswer, FlowCertainty, FlowRelation, FlowStateAxis,
+    FlowStateCompleteness, FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest,
+    FlowSubject, OverwrittenUnreadAnswer, SameEvaluationAnswer, StateEventClass, StateEventRow,
 };
 
 const ASSIGNMENT_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.assignment_relation.v1";
@@ -109,6 +110,16 @@ pub(super) fn assignment_relation_expansions<'a>(
             procedure,
         ));
     }
+    if filter.includes(AssignmentRelationKind::DeadWrite) {
+        expansions.extend(dead_write_expansions(
+            workspace,
+            semantic,
+            flow_state_cache,
+            cancellation,
+            diagnostics,
+            procedure,
+        ));
+    }
     expansions
 }
 
@@ -158,6 +169,22 @@ pub(super) fn supports_relation(
                     | Language::Scala
                     | Language::Php
                     | Language::Ruby
+            ) || cpp_family
+        }
+        AssignmentRelationKind::DeadWrite => {
+            matches!(
+                language,
+                Language::CSharp
+                    | Language::Kotlin
+                    | Language::Rust
+                    | Language::Scala
+                    | Language::Php
+                    | Language::Ruby
+                    | Language::Java
+                    | Language::JavaScript
+                    | Language::TypeScript
+                    | Language::Python
+                    | Language::Go
             ) || cpp_family
         }
     }
@@ -541,6 +568,319 @@ fn ordinary_assignment_relation_expansions<'a>(
         {
             value.related.extend(proof_related.iter().cloned());
         }
+    }
+    report_open_candidates(procedure, &expansions, diagnostics);
+    expansions
+}
+
+fn dead_write_expansions<'a>(
+    workspace: &'a WorkspaceAnalyzer,
+    semantic: &mut semantic::SemanticQueryContext<'_>,
+    flow_state_cache: &mut FlowStateTraversalCache<'a>,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    procedure: &semantic::SemanticProcedureValue,
+) -> Vec<PipelineExpansion> {
+    let infeasible_edges =
+        brokk_bifrost_analysis::analyzer::semantic::rust_infeasible_control_edges(
+            workspace,
+            &procedure.handle,
+            cancellation,
+        );
+    let dialect = procedure.handle.artifact().key().language();
+    let cpp_family = matches!(
+        dialect,
+        crate::analyzer::LanguageDialect::CppC
+            | crate::analyzer::LanguageDialect::Standard(Language::Cpp)
+    );
+    let mut candidates = if cpp_family {
+        cpp_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+    } else {
+        match dialect.language() {
+            Language::Java => {
+                java_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::JavaScript | Language::TypeScript => {
+                js_ts_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::Python => {
+                python_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            Language::Go => {
+                go_overwritten_local_candidates(workspace, &procedure.handle, cancellation)
+            }
+            _ => single_target_overwritten_local_candidates(
+                workspace,
+                &procedure.handle,
+                cancellation,
+            ),
+        }
+    };
+    let derivation = semantic
+        .materialized_outcome(procedure.file())
+        .and_then(|outcome| {
+            flow_state_cache
+                .for_materialized_procedure(
+                    workspace,
+                    procedure.file(),
+                    outcome,
+                    &procedure.handle,
+                    cancellation,
+                )
+                .procedures
+                .iter()
+                .find(|derived| derived.procedure == procedure.handle.id())
+                .cloned()
+        });
+    // Rust state events distinguish binding establishments from partial
+    // memory stores. Formal parameters currently lack an entry establishment
+    // event; see the closure-parameter golden case.
+    if dialect.language() == Language::Rust
+        && let Some(derivation) = &derivation
+    {
+        candidates.rows.clear();
+        let mut candidate_by_write: std::collections::HashMap<
+            (crate::analyzer::Range, crate::analyzer::semantic::ValueId),
+            usize,
+        > = std::collections::HashMap::new();
+        for event in &derivation.events {
+            if event.event_class != StateEventClass::Establish {
+                continue;
+            }
+            let FlowSubject::Binding { value: binding } = event.subject else {
+                continue;
+            };
+            if !matches!(
+                procedure
+                    .handle
+                    .semantics()
+                    .value(binding)
+                    .map(|value| &value.kind),
+                Some(SemanticValueKind::Local | SemanticValueKind::Parameter { .. })
+            ) {
+                continue;
+            }
+            if let Some(&row_index) = candidate_by_write.get(&(event.site.range, binding)) {
+                candidates.rows[row_index].points.push(event.point);
+            } else {
+                candidate_by_write.insert((event.site.range, binding), candidates.rows.len());
+                candidates.rows.push(OverwrittenLocalCandidate {
+                    points: vec![event.point],
+                    target: Some(binding),
+                    rhs_value: Some(event.value),
+                    range: event.site.range,
+                    source_kind: OverwrittenLocalSourceKind::PlainAssignment,
+                    verdict: PlainAssignmentVerdict::Supported,
+                    reason: "qualified",
+                });
+            }
+        }
+    }
+    if !candidates.complete {
+        let mut diagnostic = super::incomplete_diagnostic(
+            CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+            brokk_bifrost_rql::Incompleteness::Content,
+            dialect.language().config_label(),
+            format!(
+                "{} has incomplete dead-write candidate discovery ({})",
+                procedure.wire_id(),
+                candidates.reason.unwrap_or(derivation_reason::UNKNOWN)
+            ),
+            Vec::new(),
+        );
+        diagnostic.source = procedure.diagnostic_source();
+        diagnostic.withheld_rows_path = Some(rel_path_string(procedure.file()));
+        diagnostics.push(diagnostic);
+    }
+    if dialect.language() != Language::Rust {
+        // Existing overwritten-unread collectors intentionally exclude
+        // compound writes. Dead-write must retain them as explicit Open
+        // candidates until each language hook can establish the post-update
+        // value, including the compound LHS read.
+        for candidate in &mut candidates.rows {
+            if candidate.reason == "compound_assignment" {
+                candidate.verdict = PlainAssignmentVerdict::Unknown;
+                candidate.reason = "compound_assignment_write_unenumerated";
+            }
+        }
+    }
+    let formal_sources = procedure
+        .handle
+        .semantics()
+        .values()
+        .iter()
+        .filter(|value| matches!(&value.kind, SemanticValueKind::Parameter { .. }))
+        .map(|value| procedure.mapping_source(value.source))
+        .collect::<Vec<_>>();
+    if !formal_sources.is_empty() {
+        let mut diagnostic = super::incomplete_diagnostic(
+            CodeQueryDiagnosticCode::EffectDerivationIncomplete,
+            brokk_bifrost_rql::Incompleteness::Content,
+            dialect.language().config_label(),
+            format!(
+                "{} dead-write formal parameter candidates are not enumerated: {}",
+                procedure.wire_id(),
+                if dialect.language() == Language::Rust {
+                    "no entry establishment (G6 M2)"
+                } else {
+                    "the current language candidate collector excludes formal writes"
+                }
+            ),
+            Vec::new(),
+        );
+        diagnostic.source = procedure.diagnostic_source();
+        diagnostic.related = formal_sources
+            .into_iter()
+            .map(|source| CodeQueryRelatedSource {
+                source,
+                label: "formal_parameter_write_unenumerated".into(),
+            })
+            .collect();
+        diagnostics.push(diagnostic);
+    }
+    let macro_evidence = if dialect.language() == Language::Rust {
+        rust_dead_write_macro_sources_by_binding(
+            workspace,
+            &procedure.handle,
+            &candidates
+                .rows
+                .iter()
+                .filter_map(|row| row.target)
+                .collect::<Vec<_>>(),
+            cancellation,
+        )
+    } else {
+        std::collections::HashMap::new()
+    };
+    let establishment_index = derivation.as_ref().map(|derivation| {
+        let mut index = std::collections::HashMap::new();
+        for event in &derivation.events {
+            if event.event_class == StateEventClass::Establish
+                && let FlowSubject::Binding { value } = event.subject
+            {
+                index
+                    .entry((event.point, value))
+                    .and_modify(|unique| *unique = None)
+                    .or_insert(Some(event.event));
+            }
+        }
+        index
+    });
+    let uncancelled = CancellationToken::new();
+    let mut request = FlowStateRequest::new(cancellation.unwrap_or(&uncancelled));
+    let mut expansions = Vec::with_capacity(candidates.rows.len());
+    for candidate in candidates.rows {
+        let mut reasons = Vec::new();
+        let mut read_witness = None;
+        let (verdict, proof, coverage, reason) = if !candidates.complete {
+            (
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
+                EffectCoverage::Open,
+                candidates.reason,
+            )
+        } else if candidate.verdict == PlainAssignmentVerdict::Excluded {
+            (
+                "excluded",
+                "exact",
+                EffectCoverage::Exhaustive,
+                Some(candidate.reason),
+            )
+        } else if candidate.verdict == PlainAssignmentVerdict::Unknown {
+            (
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
+                EffectCoverage::Open,
+                Some(candidate.reason),
+            )
+        } else if let (Some(derivation), Some(target)) = (&derivation, candidate.target) {
+            let (macro_sources, safe_macro_sources) = macro_evidence
+                .get(&target)
+                .map(|(all, safe)| (all.as_slice(), safe.as_slice()))
+                .unwrap_or((&[], &[]));
+            let mut live = false;
+            let mut open = false;
+            let mut dead = false;
+            for &point in &candidate.points {
+                let Some(write_event) = establishment_index
+                    .as_ref()
+                    .and_then(|index| index.get(&(point, target)))
+                    .copied()
+                    .flatten()
+                else {
+                    open = true;
+                    continue;
+                };
+                match derivation.dead_write_local_with_feasible_edges(
+                    &procedure.handle,
+                    write_event,
+                    macro_sources,
+                    safe_macro_sources,
+                    &infeasible_edges,
+                    &mut request,
+                ) {
+                    DeadWriteAnswer::Dead => dead = true,
+                    DeadWriteAnswer::Live { read_event } => {
+                        live = true;
+                        if read_witness.is_none() {
+                            read_witness = Some(derivation.event(read_event).clone());
+                        }
+                    }
+                    DeadWriteAnswer::Unreachable => {}
+                    DeadWriteAnswer::Open { reasons: opened } => {
+                        open = true;
+                        reasons.extend(opened);
+                    }
+                }
+            }
+            if open {
+                (
+                    derivation_reason::UNKNOWN,
+                    derivation_reason::UNKNOWN,
+                    EffectCoverage::Open,
+                    Some("write_liveness_open"),
+                )
+            } else if live {
+                ("live", "exact", EffectCoverage::Exhaustive, None)
+            } else if dead {
+                ("dead", "exact", EffectCoverage::Exhaustive, None)
+            } else {
+                (
+                    "excluded",
+                    "exact",
+                    EffectCoverage::Exhaustive,
+                    Some("unreachable_write"),
+                )
+            }
+        } else {
+            (
+                derivation_reason::UNKNOWN,
+                derivation_reason::UNKNOWN,
+                EffectCoverage::Open,
+                Some("flow_state_unavailable"),
+            )
+        };
+        let mut expansion = overwritten_row(
+            procedure,
+            candidate,
+            verdict,
+            proof,
+            coverage,
+            reason,
+            Vec::new(),
+        );
+        let PipelineValue::AssignmentRelation(value) = &mut expansion.value else {
+            unreachable!()
+        };
+        value.relation_kind = "dead_write";
+        if verdict == "live" {
+            value.read_event = read_witness;
+        }
+        let mut digest = LengthDelimitedDigest::new(ASSIGNMENT_RELATION_ID_DOMAIN);
+        digest.push(value.id.as_bytes());
+        digest.push(value.relation_kind.as_bytes());
+        value.id = digest.finish().to_string();
+        expansions.push(with_flow_reasons(expansion, procedure, &reasons));
     }
     report_open_candidates(procedure, &expansions, diagnostics);
     expansions
@@ -2079,6 +2419,7 @@ fn row(
             coverage,
             reason: reason.or((candidate.reason != "qualified").then_some(candidate.reason)),
             replacement_events: Vec::new(),
+            read_event: None,
         },
     )))
 }

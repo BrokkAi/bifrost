@@ -44,24 +44,22 @@ impl AnalyzerStore {
             // fail immediately under contention despite the configured busy timeout.
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             super::require_current_generation(&tx, &snapshot.lang, snapshot.generation)?;
-            let existing = tx.query_row(
-                "SELECT context_id FROM jvm_context_revisions
-                 WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4 AND derivation_version=?5",
+            let existing = tx.prepare_cached("SELECT context_id FROM jvm_context_revisions
+                 WHERE workspace_id=?1 AND lang=?2 AND generation=?3 AND revision=?4 AND derivation_version=?5")?.query_row(
                 params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision, JVM_CONTEXT_DERIVATION_VERSION],
                 |row| row.get(0),
             ).optional()?;
             if let Some(context_id) = existing {
                 return Ok(context_id);
             }
-            tx.execute(
-                "INSERT INTO jvm_context_revisions(workspace_id,lang,generation,revision,derivation_version)
-                 VALUES(?1,?2,?3,?4,?5)",
+            tx.prepare_cached("INSERT INTO jvm_context_revisions(workspace_id,lang,generation,revision,derivation_version)
+                 VALUES(?1,?2,?3,?4,?5)")?.execute(
                 params![snapshot.workspace_id.as_str(), snapshot.lang, snapshot.generation.get(), snapshot.revision, JVM_CONTEXT_DERIVATION_VERSION],
             )?;
             let context_id = tx.last_insert_rowid();
             let mut parsed_project = false;
             {
-                let mut statement = tx.prepare(
+                let mut statement = tx.prepare_cached(
                     "SELECT file_version_id,rel_path,source_bytes FROM jvm_selected_configuration_files
                      WHERE context_id=?1 ORDER BY rel_path",
                 )?;
@@ -98,23 +96,21 @@ impl AnalyzerStore {
             // artifact bytes. Later artifact authority may discharge this gap.
             insert_gap(&tx, context_id, None, None, "jvm_external_inventory_unavailable",
                 "Selected source/configuration facts do not certify JDK or external artifacts")?;
-            tx.execute(
-                "INSERT INTO jvm_context_gaps(context_id,input_file_version_id,code,evidence)
+            tx.prepare_cached("INSERT INTO jvm_context_gaps(context_id,input_file_version_id,code,evidence)
                  SELECT f.context_id,f.file_version_id,'source_root_unowned',f.rel_path
                  FROM jvm_selected_source_files AS f
                  WHERE f.context_id=?1 AND NOT EXISTS(
                    SELECT 1 FROM jvm_source_root_files AS m
-                   WHERE m.context_id=f.context_id AND m.source_file_version_id=f.file_version_id)",
+                   WHERE m.context_id=f.context_id AND m.source_file_version_id=f.file_version_id)")?.execute(
                 [context_id],
             )?;
-            tx.execute(
-                "INSERT INTO jvm_context_gaps(context_id,input_file_version_id,code,evidence)
+            tx.prepare_cached("INSERT INTO jvm_context_gaps(context_id,input_file_version_id,code,evidence)
                  SELECT m.context_id,m.source_file_version_id,'source_root_ambiguous',
                         f.rel_path || ': ' || group_concat(r.root_path, ', ')
                  FROM jvm_source_root_files AS m
                  JOIN jvm_source_roots AS r ON r.context_id=m.context_id AND r.root_id=m.root_id
                  JOIN jvm_selected_source_files AS f ON f.context_id=m.context_id AND f.file_version_id=m.source_file_version_id
-                 WHERE m.context_id=?1 GROUP BY m.context_id,m.source_file_version_id HAVING COUNT(*)>1",
+                 WHERE m.context_id=?1 GROUP BY m.context_id,m.source_file_version_id HAVING COUNT(*)>1")?.execute(
                 [context_id],
             )?;
             tx.commit()?;
@@ -139,17 +135,17 @@ fn insert_gap(
     code: &str,
     evidence: &str,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO jvm_context_gaps(context_id,project_id,input_file_version_id,code,evidence)
          VALUES(?1,?2,?3,?4,?5)",
-        params![
-            context_id,
-            project_id,
-            input_file_version_id,
-            code,
-            evidence
-        ],
-    )?;
+    )?
+    .execute(params![
+        context_id,
+        project_id,
+        input_file_version_id,
+        code,
+        evidence
+    ])?;
     Ok(())
 }
 
@@ -162,9 +158,8 @@ fn publish_project(
 ) -> Result<()> {
     let (version_state, version_value) = value_columns(&facts.version);
     let directory = crate::path_utils::normalize_pattern(&facts.directory.to_string_lossy());
-    tx.execute(
-        "INSERT INTO jvm_projects(context_id,pom_file_version_id,directory,group_id,artifact_id,version_state,version_value)
-         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+    tx.prepare_cached("INSERT INTO jvm_projects(context_id,pom_file_version_id,directory,group_id,artifact_id,version_state,version_value)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)")?.execute(
         params![context_id,file_version_id,directory,facts.group_id,facts.artifact_id,version_state,version_value],
     )?;
     let project_id = tx.last_insert_rowid();
@@ -176,17 +171,19 @@ fn publish_project(
     {
         for (role, root) in facts.default_source_roots() {
             let root = crate::path_utils::normalize_pattern(&root.to_string_lossy());
-            tx.execute(
-            "INSERT INTO jvm_source_roots(context_id,project_id,role,root_path) VALUES(?1,?2,?3,?4)",
+            tx.prepare_cached("INSERT INTO jvm_source_roots(context_id,project_id,role,root_path) VALUES(?1,?2,?3,?4)")?.execute(
             params![context_id,project_id,role,root],
         )?;
             let root_id = tx.last_insert_rowid();
             // Normalized SQL paths use '/'. Its immediate ASCII successor '0'
             // bounds exactly the subtree prefix, without glob metacharacters.
-            tx.execute(
-                JVM_NATIVE_SOURCE_MEMBERSHIP_SQL,
-                params![context_id, root_id, format!("{root}/"), format!("{root}0")],
-            )?;
+            tx.prepare_cached(JVM_NATIVE_SOURCE_MEMBERSHIP_SQL)?
+                .execute(params![
+                    context_id,
+                    root_id,
+                    format!("{root}/"),
+                    format!("{root}0")
+                ])?;
         }
     }
     for limitation in &facts.limitations {
@@ -206,8 +203,7 @@ fn publish_project(
         };
         let selected = if let Some(path) = &selected_path {
             let path = crate::path_utils::normalize_pattern(&path.to_string_lossy());
-            tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM jvm_selected_configuration_files WHERE context_id=?1 AND rel_path=?2)",
+            tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM jvm_selected_configuration_files WHERE context_id=?1 AND rel_path=?2)")?.query_row(
                 params![context_id,path], |row| row.get::<_, bool>(0),
             )?
         } else {
@@ -232,11 +228,10 @@ fn publish_project(
         let classifier = value_columns(&dependency.classifier);
         let scope = value_columns(&dependency.scope);
         let optional = value_columns(&dependency.optional);
-        tx.execute(
-            "INSERT INTO jvm_direct_dependencies(context_id,project_id,ordinal,
+        tx.prepare_cached("INSERT INTO jvm_direct_dependencies(context_id,project_id,ordinal,
                group_id_state,group_id_value,artifact_id_state,artifact_id_value,version_state,version_value,
                artifact_type_state,artifact_type_value,classifier_state,classifier_value,scope_state,scope_value,optional_state,optional_value)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?.execute(
             params![context_id,project_id,dependency.ordinal,group.0,group.1,artifact.0,artifact.1,version.0,version.1,
                 artifact_type.0,artifact_type.1,classifier.0,classifier.1,scope.0,scope.1,optional.0,optional.1],
         )?;

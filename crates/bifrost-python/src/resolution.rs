@@ -1,7 +1,10 @@
 //! File-local lexical identity production. Runtime observation selection remains
 //! separate: a known binding slot is not proof of an initialized value.
 
-use crate::bindings::{PythonLexicalScopeInventory, collect_binding_targets, is_comprehension};
+use crate::bindings::{
+    PythonLexicalScopeInventory, collect_binding_targets, is_comprehension,
+    python_type_parameter_binder_node, python_type_parameters,
+};
 use crate::syntax::{
     python_keyword_argument_label, python_node_is_in_annotation, python_parameter_node,
 };
@@ -22,6 +25,25 @@ mod imports;
 mod temporal;
 mod typed;
 
+fn future_annotations_enabled(nodes: &[Node<'_>], source: &str) -> bool {
+    nodes
+        .iter()
+        .filter(|node| node.kind() == "future_import_statement")
+        .any(|node| {
+            let mut cursor = node.walk();
+            node.children_by_field_name("name", &mut cursor)
+                .any(|name| {
+                    let imported = if name.kind() == "aliased_import" {
+                        name.child_by_field_name("name")
+                            .expect("future import name")
+                    } else {
+                        name
+                    };
+                    &source[imported.byte_range()] == "annotations"
+                })
+        })
+}
+
 struct Scope<'tree> {
     node: Node<'tree>,
     globals: HashSet<String>,
@@ -41,6 +63,32 @@ struct Producer<'source, 'collector> {
 }
 
 impl Producer<'_, '_> {
+    fn scope<'tree>(
+        &mut self,
+        scopes: &mut Vec<Scope<'tree>>,
+        node: Node<'tree>,
+        parent: Option<ResolutionScopeId>,
+        kind: ResolutionScopeKind,
+    ) -> ResolutionScopeId {
+        let id = ResolutionScopeId::new(dense_ordinal(scopes.len(), "Python scopes"));
+        self.facts.scopes.push(ResolutionScopeFact {
+            id,
+            parent,
+            owner: None,
+            kind,
+            inheritance: ResolutionScopeInheritance::Lexical,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        });
+        scopes.push(Scope {
+            node,
+            globals: HashSet::default(),
+            nonlocals: HashSet::default(),
+            bindings: Vec::new(),
+        });
+        id
+    }
+
     fn site(
         &mut self,
         node: Node<'_>,
@@ -68,10 +116,23 @@ impl Producer<'_, '_> {
         namespace: ResolutionNamespace,
     ) -> ResolutionSiteId {
         let site = self.site(node, scope, kind);
+        let name = self.semantic_name(node);
+        self.facts.identifiers.push(PositionedIdentifierFact {
+            site,
+            name,
+            role,
+            namespace,
+            qualifier: None,
+        });
+        site
+    }
+
+    /// An identifier's semantic name: Python's class-private names are
+    /// compiler-mangled (`__x` in class `C` is `_C__x`); the independent source
+    /// occurrence/declaration bridge retains the original public spelling.
+    /// Header expressions execute outside the class body being defined.
+    fn semantic_name(&mut self, node: Node<'_>) -> ResolutionNameId {
         let text = &self.source[node.byte_range()];
-        // The semantic identifier is compiler-mangled; the independent source
-        // occurrence/declaration bridge retains its original public spelling.
-        // Header expressions execute outside the class body being defined.
         let lookup = if text.starts_with("__") && !text.ends_with("__") && !text.contains('.') {
             find_ancestor(node, |class| {
                 class.kind() == "class_definition"
@@ -86,15 +147,7 @@ impl Producer<'_, '_> {
         } else {
             text.to_owned()
         };
-        let name = self.facts.intern_name(&mut self.names, &lookup);
-        self.facts.identifiers.push(PositionedIdentifierFact {
-            site,
-            name,
-            role,
-            namespace,
-            qualifier: None,
-        });
-        site
+        self.facts.intern_name(&mut self.names, &lookup)
     }
 
     fn omitted_reference(&mut self, node: Node<'_>, scope: ResolutionScopeId) {
@@ -122,6 +175,7 @@ pub(super) fn produce<'source, 'unit>(
     source: &'source str,
     collector: &mut PrimarySourceFactCollector<'source>,
     units: impl Iterator<Item = &'unit (SourceDeclarationId, CodeUnit)>,
+    receiver_fields: &HashMap<CodeUnit, (SourceDeclarationId, CodeUnit)>,
 ) -> (
     FileResolutionFacts,
     Vec<SourceOccurrenceId>,
@@ -144,6 +198,11 @@ pub(super) fn produce<'source, 'unit>(
     let mut scope_by_node = HashMap::default();
     let mut node_scopes = HashMap::default();
     let mut parameters = HashMap::default();
+    let mut generic_bindings = Vec::new();
+    let mut generic_annotation_scopes = HashMap::default();
+    let mut generic_runtime_scopes = HashSet::default();
+    let mut binding_tokens = HashSet::default();
+    let mut formal_lists = HashSet::default();
     let mut pending = vec![(root, None, None, None)];
     let mut node_guards = HashMap::default();
     let mut iterable_scopes = HashMap::default();
@@ -154,6 +213,67 @@ pub(super) fn produce<'source, 'unit>(
             continue;
         }
         let evaluating = iterable_scopes.get(&node.id()).copied().or(evaluating);
+        let mut body_parent = containing;
+        let mut body_evaluation = evaluating;
+        // Annotation evaluation can see class locals. Runtime bodies use a
+        // parallel lexical continuation with aliases to the same formals, so
+        // skipping a class never discards its captured generic parameters.
+        if let Some(formals) = python_type_parameters(node) {
+            let annotation = p.scope(&mut scopes, node, evaluating, ResolutionScopeKind::Block);
+            let runtime_parent = find_scope_in_chain(
+                evaluating,
+                |id| p.facts.scopes[id.index()].parent,
+                |id| p.facts.scopes[id.index()].kind != ResolutionScopeKind::TypeBody,
+            );
+            let runtime = p.scope(&mut scopes, node, evaluating, ResolutionScopeKind::Block);
+            generic_annotation_scopes.insert(annotation, runtime);
+            generic_runtime_scopes.insert(runtime);
+            if runtime_parent != evaluating {
+                p.facts
+                    .scope_continuations
+                    .push(ResolutionScopeContinuationFact {
+                        scope: runtime,
+                        parent: runtime_parent,
+                    });
+            }
+            scopes[annotation.index()].node = formals;
+            scopes[runtime.index()].node = formals;
+            formal_lists.insert(formals.id());
+            iterable_scopes.insert(formals.id(), annotation);
+            let mut formal_names = HashSet::default();
+            for formal in named_children_iter(formals).filter(|formal| !formal.is_extra()) {
+                if let Some(token) = python_type_parameter_binder_node(formal) {
+                    binding_tokens.insert(token.id());
+                    if !formal_names.insert(&source[token.byte_range()]) {
+                        p.gap(token, annotation, ResolutionGapKind::MalformedSyntax);
+                        continue;
+                    }
+                    generic_bindings.push((token, annotation, runtime));
+                } else {
+                    p.gap(formal, annotation, ResolutionGapKind::MalformedSyntax);
+                }
+            }
+            if let Some(params) = node.child_by_field_name("parameters") {
+                for param in named_children_iter(params) {
+                    if let Some(annotation_node) = param.child_by_field_name("type") {
+                        iterable_scopes.insert(annotation_node.id(), annotation);
+                    }
+                }
+            }
+            for field in ["return_type", "superclasses", "right"] {
+                if let Some(expression) = node.child_by_field_name(field) {
+                    iterable_scopes.insert(expression.id(), annotation);
+                }
+            }
+            body_parent = Some(runtime);
+            body_evaluation = Some(runtime);
+        } else if node.kind() == "type_alias_statement" {
+            // Even a non-generic alias RHS is an annotation evaluation scope.
+            let annotation = p.scope(&mut scopes, node, evaluating, ResolutionScopeKind::Block);
+            if let Some(rhs) = node.child_by_field_name("right") {
+                iterable_scopes.insert(rhs.id(), annotation);
+            }
+        }
         let creates = containing.is_none()
             || matches!(
                 node.kind(),
@@ -163,7 +283,6 @@ pub(super) fn produce<'source, 'unit>(
         let mut body_scope = evaluating;
         let mut child_containment = containing;
         if creates {
-            let id = ResolutionScopeId::new(dense_ordinal(scopes.len(), "Python scopes"));
             // A recovered file can have an ERROR root rather than a module.
             // File identity determines its module scope, independent of grammar recovery.
             let kind = if containing.is_none() {
@@ -173,21 +292,13 @@ pub(super) fn produce<'source, 'unit>(
             } else {
                 ResolutionScopeKind::Executable
             };
-            p.facts.scopes.push(ResolutionScopeFact {
-                id,
-                parent: containing,
-                owner: None,
-                kind,
-                inheritance: ResolutionScopeInheritance::Lexical,
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
-            });
+            let id = p.scope(&mut scopes, node, body_parent, kind);
             let continuation = find_scope_in_chain(
-                evaluating,
+                body_evaluation,
                 |id| p.facts.scopes[id.index()].parent,
                 |id| p.facts.scopes[id.index()].kind != ResolutionScopeKind::TypeBody,
             );
-            if continuation != containing {
+            if continuation != body_parent {
                 p.facts
                     .scope_continuations
                     .push(ResolutionScopeContinuationFact {
@@ -196,12 +307,6 @@ pub(super) fn produce<'source, 'unit>(
                     });
             }
             scope_by_node.insert(node.id(), id);
-            scopes.push(Scope {
-                node,
-                globals: HashSet::default(),
-                nonlocals: HashSet::default(),
-                bindings: Vec::new(),
-            });
             body_scope = Some(id);
             child_containment = Some(id);
             if let Some(params) = node.child_by_field_name("parameters") {
@@ -255,8 +360,15 @@ pub(super) fn produce<'source, 'unit>(
             pending.push((child, child_containment, scope, child_guard));
         }
     }
+    // A callable's availability guard does not guard its parameter bindings:
+    // they are initialized whenever that callable is entered. Annotation and
+    // default expressions keep their definition-time guards.
+    node_guards.retain(|node, _| !parameters.contains_key(node));
     p.node_guards = node_guards;
-    for scope in &mut scopes {
+    for (index, scope) in scopes.iter_mut().enumerate() {
+        if p.facts.scopes[index].kind == ResolutionScopeKind::Block {
+            continue;
+        }
         let node = scope.node;
         if is_comprehension(node.kind()) {
             for clause in named_children_iter(node).filter(|child| child.kind() == "for_in_clause")
@@ -287,7 +399,6 @@ pub(super) fn produce<'source, 'unit>(
     // Slots are allocated after the entire function/module inventories exist.
     // Nonlocal aliases can therefore target a later enclosing write.
     let mut slots = HashMap::<(ResolutionScopeId, String), ResolutionSiteId>::default();
-    let mut binding_tokens = HashSet::default();
     let mut events = Vec::new();
     let mut deferred = Vec::new();
     for (scope_index, scope_data) in scopes.iter().enumerate() {
@@ -298,14 +409,6 @@ pub(super) fn produce<'source, 'unit>(
             }
             let name = source[token.byte_range()].to_owned();
             let operation = binding_operation(token).1;
-            if operation.kind() == "type_alias_statement" {
-                p.gap(
-                    token,
-                    node_scopes[&token.id()],
-                    ResolutionGapKind::UnsupportedScopeOrBinder,
-                );
-                continue;
-            }
             if operation.kind() == "named_expression" && invalid_walrus(operation, &name, source) {
                 p.gap(
                     token,
@@ -449,7 +552,14 @@ pub(super) fn produce<'source, 'unit>(
                 Some(authored)
             }
             ResolutionBindingEventKind::Delete | ResolutionBindingEventKind::Annotation => None,
-            _ => {
+            ResolutionBindingEventKind::Parameter
+            | ResolutionBindingEventKind::Assign
+            | ResolutionBindingEventKind::Augment
+            | ResolutionBindingEventKind::Import
+            | ResolutionBindingEventKind::Iteration
+            | ResolutionBindingEventKind::With
+            | ResolutionBindingEventKind::Exception
+            | ResolutionBindingEventKind::Pattern => {
                 let authored = p.identifier(
                     token,
                     scope,
@@ -474,11 +584,12 @@ pub(super) fn produce<'source, 'unit>(
                         unit: (*unit).clone(),
                     });
                 } else {
-                    // An authored write is distinct from its binding slot.
-                    p.collector
-                        .mark_lexical(declaration, binding_presentation_kind(token));
-                    p.facts
-                        .add_gap(authored, ResolutionGapKind::UnsupportedScopeOrBinder);
+                    // Supported lexical writes have their own source declaration,
+                    // distinct from the binding slot, without requiring a CodeUnit.
+                    p.collector.mark_lexical(
+                        declaration,
+                        binding_presentation_kind(token, p.facts.scopes[slot_scope.index()].kind),
+                    );
                 }
                 Some(authored)
             }
@@ -510,7 +621,115 @@ pub(super) fn produce<'source, 'unit>(
             temporal::timing(&mut p, ordinal, operation, execution_scope, true);
         }
     }
+    for (token, annotation, runtime) in generic_bindings {
+        let declaration = p.identifier(
+            token,
+            annotation,
+            ResolutionSiteKind::TypeDeclaration,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Type,
+        );
+        let source_declaration = p.collector.declare_node(token, Some(token));
+        p.collector
+            .mark_lexical(source_declaration, DeclarationKind::Parameter);
+        p.declarations.push((declaration, source_declaration));
+        p.facts.binders.push(ResolutionBinderFact::scope_wide(
+            declaration,
+            ResolutionBinderKind::Type,
+            p.facts.scopes[annotation.index()],
+        ));
+        p.facts.additional_definition_namespaces.push(
+            ResolutionAdditionalDefinitionNamespaceFact {
+                declaration,
+                namespace: ResolutionNamespace::Value,
+                hoisting: HoistingClass::ScopeWide,
+            },
+        );
+        // One entry event initializes one cell, as for an ordinary parameter.
+        // Annotation evaluation captures that cell through the existing
+        // nonlocal route; runtime lookup reaches it without entering class locals.
+        let slot = p.identifier(
+            token,
+            runtime,
+            ResolutionSiteKind::BindingSlotDeclaration,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+        );
+        p.declarations.push((slot, source_declaration));
+        p.facts.binding_slots.push(ResolutionBindingSlotFact {
+            declaration: slot,
+            lookup: ResolutionBindingLookup::WholeScope,
+        });
+        p.facts.binders.push(ResolutionBinderFact::scope_wide(
+            slot,
+            ResolutionBinderKind::Parameter,
+            p.facts.scopes[runtime.index()],
+        ));
+        let target = p.identifier(
+            token,
+            annotation,
+            ResolutionSiteKind::ValueReference,
+            ResolutionIdentifierRole::Reference,
+            ResolutionNamespace::Value,
+        );
+        alias(&mut p, token, annotation, slot);
+        p.facts
+            .binding_directives
+            .push(ResolutionBindingDirectiveFact {
+                reference: target,
+                kind: ResolutionBindingDirectiveKind::Nonlocal,
+                target: Some(slot),
+            });
+        let ordinal = dense_ordinal(
+            p.facts.binding_events.len(),
+            "Python generic parameter events",
+        );
+        p.facts.binding_events.push(ResolutionBindingEventFact {
+            ordinal,
+            slot,
+            target,
+            kind: ResolutionBindingEventKind::Parameter,
+            value: None,
+            authored_declaration: Some(declaration),
+            source_reference: None,
+        });
+        let entry = p.facts.scopes[runtime.index()].start_byte;
+        p.facts
+            .binding_event_timings
+            .push(ResolutionBindingEventTimingFact {
+                event: ordinal,
+                execution_scope: runtime,
+                entry_byte: entry,
+                commit_byte: entry,
+                commit_phase: 0,
+            });
+        // The lowerer adds the target's extra Value namespace to this route.
+        let alias = p.identifier(
+            token,
+            runtime,
+            ResolutionSiteKind::AliasBinding,
+            ResolutionIdentifierRole::Alias,
+            ResolutionNamespace::Type,
+        );
+        p.facts.binders.push(ResolutionBinderFact::scope_wide(
+            alias,
+            ResolutionBinderKind::Alias {
+                target: declaration,
+            },
+            p.facts.scopes[runtime.index()],
+        ));
+    }
     exports::produce(&mut p, &nodes, &node_scopes, &event_by_token);
+    // File-local facts use a symbolic package anchor; staging joins only
+    // package markers and supplies their selected directory.
+    p.facts.python_package_path_extensions = crate::package_paths::appended_path_dirs(root, source)
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, directory)| PythonPackagePathExtensionFact {
+            ordinal: u32::try_from(ordinal).expect("package extension ordinal"),
+            directory: brokk_bifrost_core::path_utils::workspace_relative_slash_path(&directory),
+        })
+        .collect();
     for node in nodes.iter().copied() {
         let scope = node_scopes[&node.id()];
         match node.kind() {
@@ -603,6 +822,8 @@ pub(super) fn produce<'source, 'unit>(
                     // unrelated local-variable lookup of their terminal name.
                     continue;
                 }
+                // Typed syntax owns generic arguments and formal bounds. Its
+                // producer emits their references without extra runtime sites.
                 if find_ancestor(node, |ancestor| ancestor.kind() == "type_parameter").is_some() {
                     continue;
                 }
@@ -672,7 +893,7 @@ pub(super) fn produce<'source, 'unit>(
             }
             // Typed annotation production owns quoted references and their slots.
             "string" if python_node_is_in_annotation(node) => {}
-            "type_parameter" | "type_alias_statement" => {
+            "type_parameter" if !formal_lists.contains(&node.id()) => {
                 let site = p.site(node, scope, ResolutionSiteKind::UnsupportedExpression);
                 p.facts
                     .add_gap(site, ResolutionGapKind::UnsupportedScopeOrBinder);
@@ -696,12 +917,21 @@ pub(super) fn produce<'source, 'unit>(
     typed::produce(
         &mut p,
         &nodes,
-        &node_scopes,
+        node_scopes,
         &scope_by_node,
         &event_by_token,
+        &formal_lists,
+        &units,
+        receiver_fields,
     );
     imports::finish(&mut p);
-    temporal::finish(&mut p, &scopes);
+    temporal::finish(
+        &mut p,
+        &scopes,
+        future_annotations_enabled(&nodes, source),
+        &generic_annotation_scopes,
+        &generic_runtime_scopes,
+    );
     p.facts.reference_lookup_requests.extend(
         p.facts
             .identifiers
@@ -722,7 +952,7 @@ pub(super) fn produce<'source, 'unit>(
     (p.facts, p.occurrences, p.declarations)
 }
 
-fn binding_presentation_kind(token: Node<'_>) -> DeclarationKind {
+fn binding_presentation_kind(token: Node<'_>, scope: ResolutionScopeKind) -> DeclarationKind {
     match binding_operation(token) {
         (ResolutionBindingEventKind::Parameter, parameter)
             if parameter.kind() == "lambda_parameters" =>
@@ -730,6 +960,7 @@ fn binding_presentation_kind(token: Node<'_>) -> DeclarationKind {
             DeclarationKind::LambdaParameter
         }
         (ResolutionBindingEventKind::Parameter, _) => DeclarationKind::Parameter,
+        _ if scope == ResolutionScopeKind::CompilationUnit => DeclarationKind::Field,
         _ => DeclarationKind::LocalVariable,
     }
 }
@@ -747,8 +978,10 @@ fn make_slot(
         ResolutionNamespace::Value,
     );
     let declaration = p.collector.declare_node(token, Some(token));
-    p.collector
-        .mark_lexical(declaration, binding_presentation_kind(token));
+    p.collector.mark_lexical(
+        declaration,
+        binding_presentation_kind(token, p.facts.scopes[scope.index()].kind),
+    );
     p.declarations.push((site, declaration));
     let fact = p.facts.scopes[scope.index()];
     let lookup = if fact.kind == ResolutionScopeKind::Executable {
@@ -805,7 +1038,7 @@ fn binding_operation(token: Node<'_>) -> (ResolutionBindingEventKind, Node<'_>) 
             "parameters" | "lambda_parameters" => Some(ResolutionBindingEventKind::Parameter),
             "function_definition" => Some(ResolutionBindingEventKind::Function),
             "class_definition" => Some(ResolutionBindingEventKind::Class),
-            "type_alias_statement" => Some(ResolutionBindingEventKind::Annotation),
+            "type_alias_statement" => Some(ResolutionBindingEventKind::Assign),
             "assignment" if parent.child_by_field_name("right").is_none() => {
                 Some(ResolutionBindingEventKind::Annotation)
             }

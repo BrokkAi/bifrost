@@ -393,6 +393,32 @@ fn validate_wrapper(
             let step_path = step_path.expect("anchor is a query step");
             analysis.path(format!("{step_path}.capture"), args[1].range.clone());
         }
+        RqlForm::IdenticalCaptures => {
+            if args.len() != 5
+                || args[0].as_symbol() != Some(":left")
+                || args[2].as_symbol() != Some(":right")
+            {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    "identical-captures expects :left, a capture name, :right, a capture name, and a query",
+                );
+                return;
+            }
+            for (index, label) in [(0, ":left"), (2, ":right")] {
+                let option = QueryStepOp::IdenticalCaptures
+                    .option_for_rql_label(label)
+                    .expect("identical-captures declares both options");
+                analysis.add_help(
+                    args[index].range.clone(),
+                    option.field().signature(),
+                    option.field().description(),
+                );
+            }
+            let step_path = step_path.expect("identical-captures is a query step");
+            analysis.path(format!("{step_path}.left"), args[1].range.clone());
+            analysis.path(format!("{step_path}.right"), args[3].range.clone());
+        }
         RqlForm::StatementFacts => {
             validate_statement_facts_wrapper(args, query, analysis);
         }
@@ -1116,12 +1142,17 @@ fn validate_wrapper(
         | RqlForm::Not
         | RqlForm::All
         | RqlForm::Any
+        | RqlForm::InstantiatedType
+        | RqlForm::Qualified
         | RqlForm::LocalValue
         | RqlForm::Capture
         | RqlForm::Has
+        | RqlForm::Each
+        | RqlForm::ArgumentMode
         | RqlForm::NotHas
         | RqlForm::NotKind
         | RqlForm::Arity
+        | RqlForm::Count
         | RqlForm::Visibility
         | RqlForm::ParameterType
         | RqlForm::ParameterTypeRegex
@@ -1405,48 +1436,89 @@ fn validate_jsx_attribute_value_wrapper(args: &[Expr], query: &Expr, analysis: &
 }
 
 fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
-    match args {
-        [_query] => {}
-        [key, value, _query] if key.as_symbol() == Some(":capture") => {
-            analysis.add_help(
-                key.range.clone(),
-                ":capture declared-name",
-                QueryStepField::Capture.description(),
-            );
-            let valid = match &value.kind {
-                ExprKind::String(name) | ExprKind::Symbol(name) => {
-                    validate_capture_name(
-                        name,
-                        value.range.clone(),
-                        "wrong-value-shape",
-                        &format!("{} capture", form.label()),
-                        analysis,
-                    );
-                    true
-                }
-                _ => false,
-            };
-            if !valid {
-                analysis.error(
-                    value.range.clone(),
-                    "wrong-value-shape",
-                    format!("{} capture must be a name", form.label()),
-                );
-            }
-        }
-        [key, _, _query] => analysis.error(
-            key.range.clone(),
-            "unknown-property",
-            format!("{} accepts only :capture", form.label()),
-        ),
-        _ => analysis.error(
+    let options = &args[..args.len().saturating_sub(1)];
+    let accepted = if form == RqlForm::MemberTargets {
+        ":capture, :member-form, or :trivial-property"
+    } else {
+        ":capture"
+    };
+    if args.is_empty() || !options.len().is_multiple_of(2) {
+        analysis.error(
             query.range.clone(),
             "wrong-value-shape",
             format!(
-                "{} expects a query, optionally preceded by :capture name",
+                "{} expects a query, optionally preceded by {accepted} option/value pairs",
                 form.label()
             ),
-        ),
+        );
+        return;
+    }
+    let mut seen = HashSet::new();
+    for pair in options.as_chunks::<2>().0 {
+        let (key, value) = (&pair[0], &pair[1]);
+        let label = key.as_symbol().unwrap_or_default();
+        let option = form
+            .query_step_op()
+            .and_then(|op| op.option_for_rql_label(label));
+        let field = if label == ":capture" {
+            QueryStepField::Capture
+        } else if let Some(option) = option {
+            option.field()
+        } else {
+            analysis.error(
+                key.range.clone(),
+                "unknown-property",
+                format!("{} accepts only {accepted}", form.label()),
+            );
+            continue;
+        };
+        if !seen.insert(field) {
+            analysis.error(
+                key.range.clone(),
+                "duplicate-property",
+                format!("duplicate {} option '{label}'", form.label()),
+            );
+            continue;
+        }
+        analysis.add_help(key.range.clone(), field.signature(), field.description());
+        match field {
+            QueryStepField::Capture => {
+                let valid = match &value.kind {
+                    ExprKind::String(name) | ExprKind::Symbol(name) => {
+                        validate_capture_name(
+                            name,
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            &format!("{} capture", form.label()),
+                            analysis,
+                        );
+                        true
+                    }
+                    _ => false,
+                };
+                if !valid {
+                    analysis.error(
+                        value.range.clone(),
+                        "wrong-value-shape",
+                        format!("{} capture must be a name", form.label()),
+                    );
+                }
+            }
+            QueryStepField::MemberForms => {
+                let allowed = constrained_step_option_labels(field);
+                validate_constrained_label_vector(value, field.label(), &allowed, analysis);
+            }
+            QueryStepField::TrivialProperty => {
+                if !matches!(value.as_symbol(), Some("true" | "false")) {
+                    analysis.error(
+                        value.range.clone(),
+                        "wrong-value-shape",
+                        "trivial-property must be true or false",
+                    );
+                }
+            }
+            _ => unreachable!("receiver wrappers accept capture and the member-targets options"),
+        }
     }
 }
 
@@ -2505,6 +2577,9 @@ fn validate_reference_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analys
                 );
                 validate_rql_reference_kinds(value, analysis);
             }
+            "enclosing" if matches!(form, RqlForm::ReferencesOf) => {
+                validate_rql_pattern(value, "enclosing", analysis);
+            }
             "proof" => {
                 analysis.add_help(
                     key.range.clone(),
@@ -2553,6 +2628,7 @@ fn validate_edge_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
                 );
                 validate_rql_reference_kinds(value, analysis);
             }
+            "enclosing" => validate_rql_pattern(value, "enclosing", analysis),
             "proof" => {
                 analysis.add_help(
                     key.range.clone(),
@@ -2930,6 +3006,13 @@ fn validate_predicate_fragment(
     analysis.add_help(head_range.clone(), form.signature(), form.description());
     // Arity is the one predicate whose paren form takes more than a single
     // value: `(arity :min .. :max ..)` carries keyword bounds.
+    if form == RqlForm::Count {
+        if args.len() >= 2 {
+            validate_rql_pattern(&args[1], &format!("{path}.count.pattern"), analysis);
+        }
+        record_duplicate(RqlProperty::Count.label(), head_range, seen, analysis);
+        return;
+    }
     if form == RqlForm::Arity {
         validate_arity_predicate_args(
             args,
@@ -2964,6 +3047,14 @@ fn validate_predicate_fragment(
             seen,
             analysis,
         );
+        return;
+    }
+    if form == RqlForm::ArgumentMode {
+        let property = form
+            .property()
+            .expect("argument-mode is a pattern property");
+        validate_argument_modes(args, head_range.clone(), path, analysis);
+        record_duplicate(property.label(), head_range, seen, analysis);
         return;
     }
     if args.len() != 1 {
@@ -3133,6 +3224,17 @@ fn validate_rql_property(
     let value_is_role_pattern = label == Role::Value.label() && Role::Value.valid_for(kind);
     if !value_is_role_pattern && let Some(property) = RqlProperty::from_label(label) {
         analysis.add_help(range.clone(), property.signature(), property.description());
+        if matches!(
+            property,
+            RqlProperty::InstantiatedIdentity | RqlProperty::InstantiatedArguments
+        ) {
+            analysis.error(
+                range,
+                "invalid-query",
+                "property is only valid inside instantiated-type",
+            );
+            return;
+        }
         reject_callable_signature_property(property, kind, &range, analysis);
         validate_property_value(property, value, path, analysis);
         record_duplicate(property.label(), range, seen, analysis);
@@ -3242,6 +3344,21 @@ fn validate_property_value(
     let child = rql_property_path(path, property);
     analysis.path(&child, value.range.clone());
     match property.value_shape() {
+        super::schema::ValueShape::InstantiatedType => {
+            if let Err(error) = super::super::sexp::instantiated_type_value(value, 0) {
+                analysis.error(error.range, "invalid-query", error.message);
+            }
+            annotate_instantiated_type(value, &child, analysis);
+        }
+        super::schema::ValueShape::InstantiatedTypeList
+        | super::schema::ValueShape::CallIdentityList => {
+            analysis.error(
+                value.range.clone(),
+                "wrong-value-shape",
+                "property is only valid inside instantiated-type",
+            );
+        }
+
         super::schema::ValueShape::String => {
             require_string(value, analysis);
             validate_plain_string(property, value, analysis);
@@ -3301,8 +3418,32 @@ fn validate_property_value(
         super::schema::ValueShape::DeclaredVisibilityList => {
             validate_visibility_value(value, &child, analysis)
         }
+        super::schema::ValueShape::StringList if property == RqlProperty::ArgumentMode => {
+            if let Some(items) = value.as_sequence() {
+                validate_argument_modes(items, value.range.clone(), &child, analysis);
+            } else {
+                analysis.error(
+                    value.range.clone(),
+                    "wrong-value-shape",
+                    "argument-mode requires a nonempty vector",
+                );
+            }
+        }
         super::schema::ValueShape::Arity => {
             validate_arity_scalar(value, analysis);
+        }
+        super::schema::ValueShape::Count => {
+            if let Some(items) = value.as_sequence() {
+                if items.len() >= 2 {
+                    validate_rql_pattern(&items[1], &format!("{child}.pattern"), analysis);
+                }
+            } else {
+                analysis.error(
+                    value.range.clone(),
+                    "wrong-value-shape",
+                    "count requires a vector",
+                );
+            }
         }
         super::schema::ValueShape::NonNegativeInteger => {
             validate_index_scalar(value, analysis);
@@ -3375,6 +3516,7 @@ fn validate_property_value(
         | super::schema::ValueShape::ExportFormList
         | super::schema::ValueShape::ExportNameList
         | super::schema::ValueShape::DeclarationOriginList
+        | super::schema::ValueShape::MemberFormList
         | super::schema::ValueShape::ConfigurationFormatList
         | super::schema::ValueShape::ConfigurationNodeKindList
         | super::schema::ValueShape::ConfigurationRoleList
@@ -3410,8 +3552,69 @@ fn validate_property_value(
     }
 }
 
+fn annotate_instantiated_type(value: &Expr, path: &str, analysis: &mut Analysis) {
+    let mut pending = vec![(value, path.to_owned())];
+    while let Some((value, path)) = pending.pop() {
+        analysis.path(&path, value.range.clone());
+        let Some((head, range, arguments)) = list_head(value) else {
+            continue;
+        };
+        if RqlForm::from_label(head) != Some(RqlForm::InstantiatedType) {
+            continue;
+        }
+        analysis.add_help(
+            range,
+            RqlForm::InstantiatedType.signature(),
+            RqlForm::InstantiatedType.description(),
+        );
+        for pair in arguments.as_chunks::<2>().0 {
+            let Some(property) = pair[0]
+                .as_symbol()
+                .and_then(|value| value.strip_prefix(':'))
+                .and_then(RqlProperty::from_label)
+            else {
+                continue;
+            };
+            analysis.add_help(
+                pair[0].range.clone(),
+                property.signature(),
+                property.description(),
+            );
+            match property {
+                RqlProperty::InstantiatedIdentity => {
+                    analysis.path(format!("{path}.identity"), pair[1].range.clone());
+                    if let Some((head, range, args)) = list_head(&pair[1])
+                        && RqlForm::from_label(head) == Some(RqlForm::Qualified)
+                    {
+                        analysis.add_help(
+                            range,
+                            RqlForm::Qualified.signature(),
+                            RqlForm::Qualified.description(),
+                        );
+                        if let [argument] = args {
+                            analysis
+                                .path(format!("{path}.identity.qualified"), argument.range.clone());
+                        }
+                    }
+                }
+                RqlProperty::InstantiatedArguments => {
+                    if let Some(values) = pair[1].as_sequence() {
+                        for (index, value) in values.iter().enumerate() {
+                            pending.push((value, format!("{path}.arguments[{index}]")));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn rql_property_path(path: &str, property: RqlProperty) -> String {
     let suffix = match property {
+        RqlProperty::QualifyingType => "qualifying_type",
+        RqlProperty::InstantiatedIdentity => "identity",
+        RqlProperty::InstantiatedArguments => "arguments",
         RqlProperty::Name => "name",
         RqlProperty::StringValue => "string_value",
         RqlProperty::NameRegex => "name.regex",
@@ -3443,6 +3646,7 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::Capture => "capture",
         RqlProperty::NotKind => "not_kind",
         RqlProperty::Arity => "arity",
+        RqlProperty::Count => "count",
         RqlProperty::Visibility => "visibility",
         RqlProperty::ParameterType => "parameter_type",
         RqlProperty::ParameterTypeRegex => "parameter_type.regex",
@@ -3450,6 +3654,8 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::BodyState => "body_state",
         RqlProperty::BodyOwner => "body_owner",
         RqlProperty::Has => "has",
+        RqlProperty::Each => "each",
+        RqlProperty::ArgumentMode => "argument_mode",
         RqlProperty::NotHas => "not_has",
         RqlProperty::LocalValue => "local_value",
     };
@@ -3504,9 +3710,15 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
         | RqlProperty::UnsafeContext
         | RqlProperty::NotKind
         | RqlProperty::Arity
+        | RqlProperty::Count
         | RqlProperty::Visibility
         | RqlProperty::Has
+        | RqlProperty::Each
+        | RqlProperty::ArgumentMode
         | RqlProperty::NotHas
+        | RqlProperty::QualifyingType
+        | RqlProperty::InstantiatedIdentity
+        | RqlProperty::InstantiatedArguments
         | RqlProperty::LocalValue => unreachable!("property is not a plain string"),
         RqlProperty::Not | RqlProperty::All | RqlProperty::Any => {
             unreachable!("property is not a plain string")
@@ -3769,6 +3981,46 @@ fn validate_visibility_value(value: &Expr, path: &str, analysis: &mut Analysis) 
             "wrong-value-shape",
             "visibility must be a label or a non-empty vector of labels",
         ),
+    }
+}
+
+fn validate_argument_modes(
+    items: &[Expr],
+    range: Range<usize>,
+    path: &str,
+    analysis: &mut Analysis,
+) {
+    if items.is_empty() || items.len() > 5 {
+        analysis.error(
+            range,
+            "wrong-value-shape",
+            "argument-mode requires one to five modes",
+        );
+    }
+    let mut seen = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        analysis.path(format!("{path}[{index}]"), item.range.clone());
+        let Some(label) = item.as_symbol().or_else(|| item.as_string()) else {
+            analysis.error(
+                item.range.clone(),
+                "wrong-value-shape",
+                "argument mode must be a symbol or string",
+            );
+            continue;
+        };
+        if !matches!(label, "plain" | "spread" | "ref" | "out" | "in") {
+            analysis.error(
+                item.range.clone(),
+                "invalid-query",
+                format!("unknown argument mode '{label}'"),
+            );
+        } else if !seen.insert(label) {
+            analysis.error(
+                item.range.clone(),
+                "invalid-query",
+                format!("duplicate argument mode '{label}'"),
+            );
+        }
     }
 }
 
@@ -4187,6 +4439,23 @@ fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysi
             );
             continue;
         };
+        if form == RqlForm::ConfigurationAbsence && label == ":scope" {
+            if !seen.insert("scope".to_string()) {
+                analysis.error(
+                    pair[0].range.clone(),
+                    "duplicate-property",
+                    "duplicate :scope option",
+                );
+            }
+            if !matches!(pair[1].as_symbol(), Some("document" | "subtree")) {
+                analysis.error(
+                    pair[1].range.clone(),
+                    "wrong-value-shape",
+                    ":scope must be document or subtree",
+                );
+            }
+            continue;
+        }
         let Some(field) = configuration_facts_field_for_rql_label(label) else {
             analysis.error(
                 pair[0].range.clone(),
@@ -4198,7 +4467,7 @@ fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysi
             );
             continue;
         };
-        if !seen.insert(field) {
+        if !seen.insert(field.label().to_string()) {
             analysis.error(
                 pair[0].range.clone(),
                 "duplicate-property",
@@ -4233,6 +4502,17 @@ fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysi
                             format!(
                                 ":key values must contain at most {MAX_CONFIGURATION_KEY_LENGTH} bytes"
                             ),
+                        );
+                    }
+                }
+                ConfigurationFactsFilterField::ValueRegex => {
+                    if let Some(pattern) = value.as_string() {
+                        super::shared::validate_regex(pattern, value.range.clone(), analysis);
+                    } else {
+                        analysis.error(
+                            value.range.clone(),
+                            "wrong-value-shape",
+                            ":value/regex must be a string",
                         );
                     }
                 }
@@ -4322,14 +4602,14 @@ fn validate_configuration_facts_options(form: RqlForm, options: &[Expr], analysi
                 | ConfigurationFactsFilterField::ValueGe => {
                     let valid = value.as_string().is_some_and(|value| {
                         value.len() <= MAX_CONFIGURATION_VALUE_LENGTH
-                            && value.parse::<f64>().is_ok_and(|number| number.is_finite())
+                            && brokk_bifrost_analysis::analyzer::configuration::ConfigurationNumber::parse(value).is_some()
                     });
                     if !valid {
                         analysis.error(
                             value.range.clone(),
                             "wrong-value-shape",
                             format!(
-                                ":{} must be a finite numeric string of at most {MAX_CONFIGURATION_VALUE_LENGTH} bytes",
+                                ":{} must be a decimal numeric bound string whose exponent fits a 64-bit integer of at most {MAX_CONFIGURATION_VALUE_LENGTH} bytes",
                                 field.label()
                             ),
                         );

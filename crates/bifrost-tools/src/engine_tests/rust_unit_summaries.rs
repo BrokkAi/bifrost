@@ -14,6 +14,97 @@ mod tests {
     include!("rust_forwarded_surface_tests.rs");
 
     #[test]
+    fn source_members_cover_mixed_crate_placements() {
+        let fixture = InlineTestProject::new()
+            .file(
+                "Cargo.toml",
+                "[package]\nname = \"placements\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(
+                "src/lib.rs",
+                r#"
+mod ordinary;
+mod inline { pub enum Item { Value } }
+#[path = "mapped.rs"] mod relocated;
+include!("splice.rs");
+macro_rules! replay { ($($item:item)*) => { $($item)* }; }
+replay! { mod replayed; }
+#[cfg(any())] mod inactive;
+"#,
+            )
+            .file("src/main.rs", "mod ordinary; fn main() {}")
+            .file("src/ordinary.rs", "pub struct Ordinary;")
+            .file("src/mapped.rs", "pub struct Mapped;")
+            .file("src/splice.rs", "pub struct Spliced;")
+            .file("src/replayed.rs", "pub struct Replayed;")
+            .file("src/inactive.rs", "pub struct Inactive;")
+            .file("src/detached.rs", "pub struct Detached;")
+            .build();
+        let workspace = fixture.workspace_analyzer(AnalyzerConfig::default());
+        let store = workspace.store().unwrap();
+        store.assert_rust_summary_differential_for_test();
+        let conn = store.conn.lock().unwrap();
+        // Guard against vacuous coverage: both publishers must actually see
+        // each source kind, including one file placed in multiple targets.
+        let kinds = conn.prepare("SELECT DISTINCT source_kind FROM rust_crate_container_sources ORDER BY source_kind")
+            .unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(kinds, ["declared", "include"]);
+        let targets: i64 = conn.query_row("SELECT count(DISTINCT topology_id) FROM rust_crate_container_sources WHERE rel_path = 'src/ordinary.rs'", [], |row| row.get(0)).unwrap();
+        assert!(
+            targets >= 2,
+            "ordinary.rs must be owned by two targets: {targets}"
+        );
+        drop(conn);
+        // Mutate the published member key, leaving placements intact. This
+        // simulates an omitted member without cascading away the evidence.
+        for kind in ["declared", "include"] {
+            let (summary, ordinal, path): (i64, i64, String) = {
+                let conn = store.conn.lock().unwrap();
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+                let member = conn
+                    .query_row(
+                        "SELECT summary_id, member_ordinal, rel_path
+                     FROM resolution_unit_summary_members WHERE source_role = ?1
+                     ORDER BY summary_id, member_ordinal LIMIT 1",
+                        [kind],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                conn.execute(
+                    "UPDATE resolution_unit_summary_members SET rel_path = 'omitted.rs'
+                              WHERE summary_id = ?1 AND member_ordinal = ?2",
+                    rusqlite::params![member.0, member.1],
+                )
+                .unwrap();
+                member
+            };
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                store.assert_rust_summary_differential_for_test();
+            }));
+            {
+                let conn = store.conn.lock().unwrap();
+                let _fixture =
+                    brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(&conn);
+                conn.execute(
+                    "UPDATE resolution_unit_summary_members SET rel_path = ?3
+                     WHERE summary_id = ?1 AND member_ordinal = ?2",
+                    rusqlite::params![summary, ordinal, path],
+                )
+                .unwrap();
+            }
+            let failure = failure.expect_err("omitting a published member key must fail");
+            let message = failure.downcast_ref::<String>().unwrap();
+            assert!(
+                message.contains("sources missing members"),
+                "{kind}: {message}"
+            );
+            store.assert_rust_summary_differential_for_test();
+        }
+    }
+
+    #[test]
     fn unindexed_trait_impl_subject_is_found_by_identity_through_renamed_imports() {
         let mut results = Vec::new();
         for subject in ["W", "Alias"] {

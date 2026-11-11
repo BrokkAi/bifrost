@@ -401,6 +401,7 @@ impl<'operation, 'store, Helpers> GraphStageGuard<'operation, 'store, Helpers> {
 }
 
 struct GraphStageReadMemoGuard<'operation, 'store> {
+    owns_read: bool,
     inventory:
         &'operation super::super::resolution_selection::SelectedResolutionMountInventory<'store>,
     candidate_cache:
@@ -424,12 +425,14 @@ impl<'operation, 'store> GraphStageReadMemoGuard<'operation, 'store> {
             UnconditionalCandidateCache::for_graph_stage(MAX_GRAPH_STAGE_READ_BATCH_SIZE),
         )));
         assert!(previous.is_none(), "graph-stage reader memos do not nest");
-        if let Err(error) = inventory.begin_stage_read() {
+        let owns_read = !inventory.stage_read_active();
+        if owns_read && let Err(error) = inventory.begin_stage_read() {
             inventory.authority_validations().take();
             candidate_cache.take();
             return Err(error);
         }
         Ok(Self {
+            owns_read,
             inventory,
             candidate_cache,
         })
@@ -456,6 +459,9 @@ impl Drop for GraphStageReadMemoGuard<'_, '_> {
     fn drop(&mut self) {
         self.candidate_cache.take();
         self.inventory.authority_validations().take();
+        if !self.owns_read {
+            return;
+        }
         if let Err(error) = self.inventory.end_stage_read() {
             eprintln!("analyzer store could not end a graph stage's read: {error}");
             if let Err(error) = self.inventory.connection().execute_batch("ROLLBACK") {

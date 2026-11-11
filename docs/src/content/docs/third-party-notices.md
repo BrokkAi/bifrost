@@ -13,9 +13,9 @@ files are the source inputs for those artifact-specific reports.
 
 Bifrost-owned semantic packs are Apache-2.0. A pack built from third-party
 material records that material's own license in the pack and identifies it in
-the pack's notice file; `semantic-packs/jvm/temurin-jdk-21.0.8+9.json`, built
-from OpenJDK under GPL-2.0-only with the Classpath exception, is the current
-example.
+the pack's notice file. Bifrost itself ships no semantic packs; packs are
+released from `BrokkAi/bifrost-packs`, where the JDK pack built from OpenJDK
+under GPL-2.0-only with the Classpath exception is the current example.
 
 No Bifrost source, artifact, or dependency is licensed under GPL-3.0 or
 LGPL-3.0. Where a dependency does carry a reciprocal license -- libgit2 under

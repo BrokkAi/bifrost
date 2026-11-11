@@ -6,11 +6,12 @@
 
 use crate::definition::PolicyAnalysisType;
 use crate::finding::{
-    MatchFindingEvidence, PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason,
-    PolicyQueryProvenance, PolicyQueryResultRef, PolicyRun, PolicyRunCompletion,
-    PolicySourceLocation,
+    MatchFindingEvidence, PolicyDiagnosticCode, PolicyFinding, PolicyFindingEvidence,
+    PolicyIncompleteReason, PolicyQueryProvenance, PolicyQueryResultRef, PolicyRun,
+    PolicyRunCompletion, PolicySourceLocation,
 };
 use crate::finding_identity::PolicyFindingId;
+use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
 
 use super::model::{
     ExplainError, ExplanationLimits, ExplanationNodeKind, ExplanationOutcome, ExplanationQuestion,
@@ -126,7 +127,24 @@ pub fn explain_match_finding(
             ExplanationQuestion::Why,
         ));
     };
-    let root = finding_root(finding, evidence, run.completion());
+    let mut root = finding_root(finding, evidence, run.completion());
+    if let Some(diagnostic) = run.diagnostics().iter().find(|diagnostic| {
+        matches!(
+            diagnostic.code(),
+            PolicyDiagnosticCode::CodeQuery {
+                code: CodeQueryDiagnosticCode::PolicyDeclaredProvenSubset,
+            }
+        )
+    }) {
+        root.push_child(
+            RawNode::new(
+                ExplanationNodeKind::CoverageObligation,
+                ExplanationOutcome::Satisfied,
+                "declared_proven_subset",
+            )
+            .with_actual(diagnostic.message()),
+        );
+    }
     build_explanation(
         ExplanationQuestion::Why,
         run.policy_id().clone(),
@@ -353,6 +371,11 @@ pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
             Some(usage_kind) => format!("reference_site {usage_kind} -> {target_fq_name}"),
             None => format!("reference_site -> {target_fq_name}"),
         },
+        PolicyQueryResultRef::ReferenceEdge {
+            id, target_fq_name, ..
+        } => {
+            format!("reference_edge {id} -> {target_fq_name}")
+        }
         PolicyQueryResultRef::CallSite {
             caller_fq_name,
             callee_fq_name,

@@ -13,12 +13,13 @@ exclude = ["src/bin/bifrost-mcp-test-server.rs", "tests/**"]
 name = "brokk_bifrost_mcp"
 
 [dependencies]
-brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.1" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.1" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.15.1" }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.15.1" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.15.1" }
-brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.15.1" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.2" }
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.2" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.2" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.15.2" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.15.2" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.15.2" }
+brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.15.2" }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
 # Includes the Windows queued-completion shutdown fix (notify-rs/notify#958).
@@ -41,7 +42,7 @@ schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 semver = "1.0.28"
-sha2 = "0.10.8"
+sha2 = "0.11"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "io-std", "sync", "time", "macros"] }
 # `RequestContext::ct` is a tokio_util CancellationToken and rmcp does not
 # re-export the type, so awaiting MCP cancellation needs the crate directly.
@@ -66,13 +67,13 @@ default = []
 test-support = []
 
 [dev-dependencies]
-brokk-bifrost-go-analysis = { path = "../bifrost-go-analysis", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-go-analysis = { path = "../bifrost-go-analysis", version = "=0.15.2", features = ["test-support"] }
 # Catalog/evaluator regressions use repository fixtures explicitly. Normal
 # MCP builds and published policy archives contain no product rules.
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.15.2", features = ["test-support"] }
 brokk-bifrost-test-macros = { path = "../bifrost-test-macros" }
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.1", features = ["test-support"] }
-brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.1", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.15.2", features = ["test-support"] }
+brokk-bifrost-tools = { path = "../bifrost-tools", version = "=0.15.2", features = ["test-support"] }
 # Operation-sequence property tests for the watcher's change accumulator.
 proptest = "1.11"
 # Two test suites need a real JSON Schema validator: the contract suite

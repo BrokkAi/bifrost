@@ -129,7 +129,11 @@ impl AnalyzerStoreEngineExt for AnalyzerStore {
             }
         }
         for storage_language in generations.keys() {
-            self.ensure_resolution_producer_epoch(storage_language, adapter.language())?;
+            self.ensure_resolution_producer_epoch_value(
+                storage_language,
+                adapter.language(),
+                adapter.resolution_producer_epoch(),
+            )?;
             if let Some(lowerer) = adapter.parse_time_semantic_lowerer() {
                 self.ensure_semantic_ir_producer_epoch(
                     storage_language,
@@ -250,7 +254,7 @@ fn test_blob_syntax<A: LanguageAdapter>(
 use crate::analyzer::resolution::BindingFragmentId;
 use crate::analyzer::resolution::lower_resolution_facts_with_identity_catalog;
 use crate::analyzer::store::resolution_prepare::ResolutionInteriorPreparation;
-use crate::analyzer::store::resolution_prepare::prepare_resolution_bundle_with_source_facts;
+use crate::analyzer::store::resolution_prepare::prepare_resolution_bundle_with_source_facts_and_epoch;
 use crate::analyzer::store::semantic_ir::PreparedSemanticIr;
 
 use crate::hash::HashSet;
@@ -267,6 +271,11 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
     required_existing_additional_storage_languages: &[String],
     cancellation: &CancellationToken,
 ) -> Result<PreparedParsedBlobPreparation> {
+    assert_eq!(
+        key.variant,
+        syntax.parse_variant(),
+        "storage key must match prepared syntax variant"
+    );
     let oid = key.oid;
     let lang = key.lang.as_str();
     macro_rules! stop_if_cancelled {
@@ -462,11 +471,12 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
         )
     };
     stop_if_cancelled!();
-    let resolution = match prepare_resolution_bundle_with_source_facts(
+    let resolution = match prepare_resolution_bundle_with_source_facts_and_epoch(
         &lowered,
         &unit_keys,
         state.source_facts.as_ref(),
         Some(&state.source),
+        adapter.resolution_producer_epoch(),
         cancellation,
     )? {
         ResolutionInteriorPreparation::Prepared(bundle) => *bundle,
@@ -607,6 +617,9 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             key: stored.key,
             kind: code_unit_kind_to_i64(stored.unit.kind()),
             short_name: stored.unit.short_name().to_string(),
+            // Selected target matching prefilters on this column, because
+            // units that compare equal have equal identifiers. Keep it derived
+            // from the same unit as the stored FQN, in the same row.
             identifier: stored.unit.identifier().to_string(),
             content_qualifier: content_qualifier.clone(),
             exact_fqn,
@@ -984,7 +997,7 @@ pub fn prepare_parsed_blob_at_generations<A: LanguageAdapter>(
             // M4b-B2: attach producer symbols with with_condition_symbols before persistence.
             csharp_condition_symbols: Vec::new(),
             // The language producer attaches variant-specific chains before persistence.
-            csharp_undecided_chains: Vec::new(),
+            csharp_undecided_scan: None,
             key: key.clone(),
             generation,
             state,
@@ -1132,13 +1145,12 @@ impl PythonEnvironmentPublicationEngineExt for PythonEnvironmentPublication {
                 )));
             }
             let tree = parser.parse(&source, None).expect("Python parse tree");
-            let mut parsed =
-                brokk_bifrost_python::declarations::parse_python_file_with_native_facts(
-                    project.as_ref(),
-                    file,
-                    &source,
-                    &tree,
-                );
+            let mut parsed = brokk_bifrost_python::declarations::parse_python_file(
+                project.as_ref(),
+                file,
+                &source,
+                &tree,
+            );
             parsed.add_file_scope(file, &source);
             let state = Arc::new(crate::analyzer::tree_sitter_analyzer::TreeSitterAnalyzer::<A>::file_state_from_parsed(
                 source.clone(), parsed, false, Some(Vec::new()), true,

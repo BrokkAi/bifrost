@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod rust_departing_tests_tests {
+pub(crate) mod rust_departing_tests_tests {
     use brokk_bifrost_analysis::analyzer::QueryScope;
 
     use std::sync::Arc;
@@ -28,7 +28,9 @@ mod rust_departing_tests_tests {
     /// and one receiverless callable of the written arity. It mirrors the
     /// shipped web-network pack, which is what an authored network summary is
     /// keyed by.
-    fn activate_rust_connect_declaration_pack(fixture: &AnalyzerFixture) {
+    pub(crate) fn activate_rust_connect_declaration_pack(
+        analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    ) {
         let pack_id = "fixture.rust-std-connect-declarations";
         let pack_json = serde_json::json!({
             "schema_version": 2,
@@ -107,9 +109,7 @@ mod rust_departing_tests_tests {
             }]
         });
         brokk_bifrost_analysis::test_support::activate_rust_declaration_pack(
-            fixture.analyzer.analyzer(),
-            pack_id,
-            &pack_json,
+            analyzer, pack_id, &pack_json,
         );
     }
 
@@ -128,7 +128,7 @@ mod rust_departing_tests_tests {
                       TcpStream::connect(\"127.0.0.1:9\");\n}\n";
         let call = "TcpStream::connect(\"127.0.0.1:9\")";
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
-        activate_rust_connect_declaration_pack(&fixture);
+        activate_rust_connect_declaration_pack(fixture.analyzer.analyzer());
         let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),

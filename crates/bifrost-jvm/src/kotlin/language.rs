@@ -110,6 +110,37 @@ actual @Deprecated("legacy") public constructor(val value: T)
         assert_clean("newline-separated primary constructor modifiers", source);
     }
 
+    #[hardwon(
+        "#8672: a line comment before an annotated primary constructor split kotlin-stdlib 2.4.10 Duration.kt into ERROR nodes"
+    )]
+    #[test]
+    fn line_comment_before_annotated_primary_constructor_grammar_boundary() {
+        let source = r#"public value class Duration
+// The constructor is internal while the class is public.
+@Deprecated("Use a factory")
+internal constructor(private val rawValue: Long) : Comparable<Duration> {}
+"#;
+        let tree = assert_clean("line comment before annotated primary constructor", source);
+        let class = tree.root_node().named_child(0).expect("class declaration");
+        assert_eq!(class.kind(), "class_declaration");
+        let mut cursor = class.walk();
+        let children = class
+            .named_children(&mut cursor)
+            .map(|child| child.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children,
+            [
+                "modifiers",
+                "type_identifier",
+                "line_comment",
+                "primary_constructor",
+                "delegation_specifier",
+                "class_body"
+            ]
+        );
+    }
+
     #[test]
     fn malformed_source_recovers_trailing_declaration() {
         let source = r#"package sample

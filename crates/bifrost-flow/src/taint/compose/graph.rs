@@ -4,8 +4,8 @@
 
 use crate::analyzer::semantic::partial_flow::PartialFlowPort;
 use crate::analyzer::semantic::{
-    AbstractLocation, CallSiteId, DispatchBoundaryKind, ExactExternalProcedureTarget,
-    UnmaterializedExternalTarget,
+    AbstractLocation, AbstractObject, CallSiteId, DispatchBoundaryKind,
+    ExactExternalProcedureTarget, ProgramPointId, UnmaterializedExternalTarget,
 };
 use crate::value_flow::{
     DurableCallSiteKey, DurableProcedureKey, ValueFlowCarrier, ValueFlowObservationPhase,
@@ -13,7 +13,7 @@ use crate::value_flow::{
 };
 
 use super::labels::LabelFunctionId;
-use super::provider::{CallerLocation, DispatchCandidate};
+use super::provider::{CallerLocation, DispatchCandidate, ExecutionCertificate};
 
 /// A source of one composition: its index in the search's source table,
 /// which holds the plan's bound sources first and then the sources the
@@ -40,6 +40,42 @@ pub enum ExecutionTarget {
     External(Box<ExternalTargetIdentity>),
 }
 
+/// A query-local position of one tracked object. The terminal variants need
+/// no live value at the exit point.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ObjectAnchorSite {
+    ProgramPoint(ProgramPointId),
+    CallSite(CallSiteId),
+    NormalExit,
+    ExceptionalExit,
+}
+
+/// The semantic role in which the same object is observed at an anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectAnchorRole {
+    MatchedValue,
+    AllocationResult,
+    Receiver,
+    Argument,
+    FormalReceiver,
+    FormalArgument(u32),
+    NormalReturn,
+    ExceptionalReturn,
+    FieldBase,
+    FieldValue,
+    FieldLocation,
+    EscapedObject,
+    CurrentObject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectAnchor {
+    pub procedure: DurableProcedureKey,
+    pub site: ObjectAnchorSite,
+    pub role: ObjectAnchorRole,
+    pub object: AbstractObject,
+}
+
 impl ComposedSourceId {
     pub fn index(self) -> usize {
         usize::try_from(self.0).expect("a source index fits usize")
@@ -52,10 +88,21 @@ impl ComposedSourceId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Endpoint {
     Execution(Box<ExecutionTarget>),
+    Object(Box<ObjectAnchor>),
     Source(ComposedSourceId),
     Sink(ValueFlowSinkId),
     StoreWrite(usize),
     Port(PartialFlowPort),
+    /// One object's state at a call's normal or exceptional continuation.
+    /// This is separate from a returned or thrown value and from heap
+    /// writeback, which describe different transports.
+    CallHandoff {
+        call: CallSiteId,
+        candidate: Box<DispatchCandidate>,
+        binding: super::provider::CallHandoffBinding,
+        function: LabelFunctionId,
+        quality: HopQuality,
+    },
     Location(CallerLocation),
     Writeback {
         call: CallSiteId,
@@ -152,11 +199,14 @@ pub enum Hop {
         target: Box<ExecutionTarget>,
         function: LabelFunctionId,
         quality: HopQuality,
+        certificate: ExecutionCertificate,
     },
     /// A selected store write reaches a may-alias read output.
     Store {
         write_call: DurableCallSiteKey,
         read_call: DurableCallSiteKey,
+        write_site: Box<crate::analyzer::semantic::SemanticLocator>,
+        read_site: Box<crate::analyzer::semantic::SemanticLocator>,
         read_origin: crate::taint::SourceEventKey,
         read_phase: ValueFlowObservationPhase,
         read_carrier: ValueFlowCarrier,
@@ -191,6 +241,7 @@ pub enum Hop {
         from: PartialFlowPort,
         to: Endpoint,
         uncertain: bool,
+        function: LabelFunctionId,
     },
     /// Into a callee at a call: a caller-side actual to the callee's formal,
     /// or a location rooted at the actual to the callee's heap input port on
@@ -201,6 +252,19 @@ pub enum Hop {
         actual: PartialFlowPort,
         formal: PartialFlowPort,
         uncertain: bool,
+        function: LabelFunctionId,
+    },
+    /// The same tracked object crosses a call and reaches its continuation.
+    /// `function` is the callee's entry-to-matching-exit state relation.
+    CallHandoff {
+        call: DurableCallSiteKey,
+        callee: DurableProcedureKey,
+        actual: PartialFlowPort,
+        formal: PartialFlowPort,
+        exit: super::provider::CallHandoffExit,
+        continuity: super::provider::CallObjectContinuity,
+        function: LabelFunctionId,
+        quality: HopQuality,
     },
     /// From a parent's capture binding into the closure's capture slot.
     Closure {
@@ -209,14 +273,17 @@ pub enum Hop {
         binding: PartialFlowPort,
         slot: PartialFlowPort,
         uncertain: bool,
+        certificate: Option<ExecutionCertificate>,
     },
-    /// A model transfer that replaces a call to `candidate`, from a call input
-    /// port to the call's result. `function` is what the model's labels do.
+    /// A model transfer from a call input to a result or caller storage output.
+    /// `function` is what the model's labels do.
     /// `quality` is the model's own ([`super::CallModel::quality`]).
     Model {
         call: DurableCallSiteKey,
         actual: PartialFlowPort,
         result: PartialFlowPort,
+        summary: Option<Box<crate::dataflow::ProcedureSummaryKey>>,
+        retains_dispatch: bool,
         function: LabelFunctionId,
         quality: HopQuality,
     },
@@ -248,12 +315,30 @@ pub enum Hop {
 }
 
 impl Hop {
+    /// Label relation retained on this hop. Hops without a relation are
+    /// identity transfers for clients that fold a retained path.
+    pub const fn function(&self) -> Option<LabelFunctionId> {
+        match self {
+            Self::Invocation { function, .. }
+            | Self::Interior { function, .. }
+            | Self::Stored { function, .. }
+            | Self::Callee { function, .. }
+            | Self::Caller { function, .. }
+            | Self::CallHandoff { function, .. }
+            | Self::Model { function, .. }
+            | Self::Sanitizer { function, .. }
+            | Self::Transform { function, .. } => Some(*function),
+            Self::Store { .. } | Self::Closure { .. } | Self::Unmodeled { .. } => None,
+        }
+    }
+
     pub const fn quality(&self) -> HopQuality {
         match self {
             Self::Invocation { quality, .. }
             | Self::Interior { quality, .. }
             | Self::Stored { quality, .. }
             | Self::Model { quality, .. } => *quality,
+            Self::CallHandoff { quality, .. } => *quality,
             Self::Callee { uncertain, .. }
             | Self::Caller { uncertain, .. }
             | Self::Closure { uncertain, .. }

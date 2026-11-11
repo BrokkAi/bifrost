@@ -360,9 +360,9 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 }
 ```
 
-## Excluding closures and unsupported roles
+## Closures and named arguments
 
-`has` can prove that a closure contains a return node. Rust does not model named keyword arguments, so asking for `kwargs` returns a capability diagnostic; the example records that limitation instead of pretending the role exists.
+`has` can prove that a closure contains a return node. Rust calls have no named arguments, so a `call` with `kwargs` matches nothing. The adapter supports the `kwargs` role for attribute arguments, where a `name = value` meta item is named, so the query returns no results and no capability diagnostic.
 
 <!-- code-query-case:closure:rql -->
 ```lisp
@@ -393,34 +393,26 @@ Rust exposes the imported path through `module`, and signed numeric expressions 
 }
 ```
 
-<!-- code-query-case:unsupported-kwargs:rql -->
+<!-- code-query-case:call-kwargs:rql -->
 ```lisp
 (language rust
   (call :kwargs [(shell (boolean_literal))]))
 ```
 
-<!-- code-query-case:unsupported-kwargs:json -->
+<!-- code-query-case:call-kwargs:json -->
 ```json
 {"languages":["rust"],"match":{"kind":"call","kwargs":{"shell":{"kind":"boolean_literal"}}}}
 ```
 
-<!-- code-query-case:unsupported-kwargs:expected -->
+<!-- code-query-case:call-kwargs:expected -->
 ```json
 {
-  "diagnostics": [
-    {
-      "code": "unsupported_structural_feature",
-      "impact": "incomplete",
-      "language": "rust",
-      "message": "structural adapter for rust does not support role(s): kwargs"
-    }
-  ],
   "results": [],
   "truncated": false
 }
 ```
 
-Rust does not expose `kwargs` or a normalized null-literal syntax in this adapter. Queries for those shapes should retain the returned capability diagnostic and be refined to roles Rust can prove, such as `receiver`, `args`, `module`, `decorators`, `left`, and `right`.
+To match a named attribute argument such as `rename = "id"` in `#[serde(rename = "id")]`, put `kwargs` on a `decorator` pattern. Rust does not expose a normalized null-literal syntax in this adapter.
 
 ## Modules And Test-Gated Code
 

@@ -2046,9 +2046,9 @@ fn mutation_targets(
             }
         }
         ReceiverAnalysisOutcome::ExceededBudget { .. } => JsTsMutationTargets::Truncated,
-        ReceiverAnalysisOutcome::Unknown | ReceiverAnalysisOutcome::Unsupported { .. } => {
-            JsTsMutationTargets::Open
-        }
+        ReceiverAnalysisOutcome::Incomplete { .. }
+        | ReceiverAnalysisOutcome::Unknown
+        | ReceiverAnalysisOutcome::Unsupported { .. } => JsTsMutationTargets::Open,
     }
 }
 

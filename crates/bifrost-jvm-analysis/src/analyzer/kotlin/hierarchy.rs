@@ -114,7 +114,7 @@ impl KotlinAnalyzer {
         }
 
         let hierarchy =
-            self.external_root_hierarchy(identity.owner_fqn(), max_visits, cancellation);
+            self.external_root_hierarchy(analyzer, identity.owner_fqn(), max_visits, cancellation);
         let status = match hierarchy.status {
             KotlinExternalRootHierarchyStatus::Complete => None,
             KotlinExternalRootHierarchyStatus::Incomplete(
@@ -127,6 +127,10 @@ impl KotlinAnalyzer {
             ) => Some(ExternalMemberFamilyStatus::Incomplete(
                 ExternalMemberFamilyIncompleteReason::ExternalRootUnresolved,
             )),
+            // The proven descendants still answer; the family stays open below.
+            KotlinExternalRootHierarchyStatus::Incomplete(
+                KotlinExternalRootHierarchyIncompleteReason::UnresolvedSupertype,
+            ) => None,
             KotlinExternalRootHierarchyStatus::Cancelled => {
                 Some(ExternalMemberFamilyStatus::Cancelled)
             }
@@ -137,8 +141,13 @@ impl KotlinAnalyzer {
         if let Some(status) = status {
             return ExternalMemberFamilyAnswer::stopped(status, hierarchy.visited);
         }
-
-        MemberFacts::external_descendant_family(
+        let open = matches!(
+            hierarchy.status,
+            KotlinExternalRootHierarchyStatus::Incomplete(
+                KotlinExternalRootHierarchyIncompleteReason::UnresolvedSupertype
+            )
+        );
+        let mut family = MemberFacts::external_descendant_family(
             analyzer,
             hierarchy.descendants,
             hierarchy.visited,
@@ -146,11 +155,20 @@ impl KotlinAnalyzer {
             identity.arity(),
             max_visits,
             cancellation,
-        )
+        );
+        // A supertype nothing resolves may hide another overrider: keep the
+        // proven candidates as targets, but never claim the family complete.
+        if open && family.status == ExternalMemberFamilyStatus::Complete {
+            family.status = ExternalMemberFamilyStatus::Incomplete(
+                ExternalMemberFamilyIncompleteReason::ExternalRootUnresolved,
+            );
+        }
+        family
     }
 
     fn external_root_hierarchy(
         &self,
+        analyzer: &dyn IAnalyzer,
         external_root_fqn: &str,
         max_visits: usize,
         cancellation: Option<&CancellationToken>,
@@ -169,6 +187,9 @@ impl KotlinAnalyzer {
         };
         let query_scope = AnalyzerQueryScope::new(self);
         let token = query_scope.token();
+        let external = self.external_declarations(analyzer.semantic_model_overlay());
+        let recorder = crate::analyzer::jvm::external::QueryGapRecorder::new(analyzer);
+        let mut closure = brokk_bifrost_jvm::ExternalSupertypeClosure::default();
         build_kotlin_external_root_hierarchy(
             candidates.into_iter().map(JvmHierarchyFact).collect(),
             |batch| {
@@ -181,6 +202,27 @@ impl KotlinAnalyzer {
             external_root_fqn,
             max_visits,
             cancellation,
+            |_descendant, scope, raw, visited| {
+                closure.reaches_root(
+                    raw,
+                    external_root_fqn,
+                    visited,
+                    max_visits,
+                    cancellation,
+                    |raw| {
+                        use brokk_bifrost_jvm::kotlin::types::{
+                            KotlinTypeName, resolve_kotlin_type_name,
+                        };
+                        match resolve_kotlin_type_name(raw, scope, |candidate| {
+                            external.get(&recorder, candidate).is_some()
+                        }) {
+                            KotlinTypeName::Resolved(fqn) => Some(fqn),
+                            _ => None,
+                        }
+                    },
+                    |identity| external.hierarchy_supertypes(&recorder, identity),
+                )
+            },
         )
     }
 
@@ -287,5 +329,78 @@ impl brokk_bifrost_analysis::analyzer::usages::member_family::MemberFamilyProvid
         cancellation: Option<&CancellationToken>,
     ) -> ExternalMemberFamilyAnswer {
         self.resolve_external_member_family(self, identity, max_visits, cancellation)
+    }
+}
+
+#[cfg(test)]
+mod external_closure_tests {
+    use super::*;
+    use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_core::analyzer::config::{
+        AnalyzerConfig, JvmAnalyzerConfig, JvmExternalArtifact, JvmExternalDependencies,
+    };
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#10497: Kotlin dropped unresolved external intermediates from closed families")]
+    fn kotlin_external_intermediate_jar_closure() {
+        for present in [true, false] {
+            let project = InlineTestProject::with_language(Language::Kotlin)
+                .file(
+                    "app/Foo.kt",
+                    "package app\nclass Foo : org.example.Base() { override fun close() {} }",
+                )
+                .build();
+            let dir = tempfile::tempdir().unwrap();
+            let jar = dir.path().join("dependency.jar");
+            if present {
+                write_test_class_jar(
+                    &jar,
+                    &[TestClassFile {
+                        internal_name: "org/example/Base",
+                        super_internal_name: "java/io/InputStream",
+                        methods: &[],
+                        private_nested: false,
+                    }],
+                );
+            }
+            let kotlin = KotlinAnalyzer::new_with_config(
+                project.project_dyn(),
+                AnalyzerConfig {
+                    jvm: JvmAnalyzerConfig {
+                        external_dependencies: JvmExternalDependencies {
+                            artifact_paths: vec![JvmExternalArtifact {
+                                artifact_path: jar,
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let answer =
+                kotlin.external_root_hierarchy(&kotlin, "java.io.InputStream", usize::MAX, None);
+            if present {
+                assert_eq!(answer.status, KotlinExternalRootHierarchyStatus::Complete);
+                assert_eq!(
+                    answer
+                        .descendants
+                        .iter()
+                        .map(CodeUnit::fq_name)
+                        .collect::<Vec<_>>(),
+                    ["app.Foo"]
+                );
+            } else {
+                assert_eq!(
+                    answer.status,
+                    KotlinExternalRootHierarchyStatus::Incomplete(
+                        KotlinExternalRootHierarchyIncompleteReason::UnresolvedSupertype
+                    )
+                );
+            }
+        }
     }
 }

@@ -426,7 +426,7 @@ impl RustSourceContextIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::declarations::parse_rust_file;
+    use crate::declarations::parse_rust_file_with;
     use brokk_bifrost_core::analyzer::ProjectFile;
     #[test]
     fn real_parse_function_alias_sees_forward_enclosing_import_only() {
@@ -441,7 +441,15 @@ mod tests {
             root.path().canonicalize().expect("canonical fixture root"),
             "src/lib.rs",
         );
-        let parsed = parse_rust_file(&file, source, &tree);
+        // This standalone fixture has no analyzer owner; retain nothing across calls.
+        let parsed = parse_rust_file_with(
+            &crate::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &file,
+            source,
+            &tree,
+        );
         let canonical = parsed.source_facts.as_ref().expect("canonical Rust facts");
         assert_eq!(canonical.rust_items.aliases.len(), 1);
         let alias = &canonical.rust_items.aliases[0];

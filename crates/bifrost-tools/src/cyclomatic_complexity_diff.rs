@@ -42,6 +42,8 @@ pub struct CyclomaticComplexityParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct CyclomaticComplexityDiffResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete: Vec<crate::result_incomplete::ToolResultIncomplete>,
     pub endpoints: CyclomaticComplexityEndpoints,
     pub summary: CyclomaticComplexitySummary,
     pub functions: Vec<CyclomaticComplexityChange>,
@@ -126,6 +128,7 @@ pub fn cyclomatic_complexity_at_root(
     params: CyclomaticComplexityParams,
     options: &DiffAnalysisOptions,
     cancellation: &CancellationToken,
+    retention_budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
 ) -> Result<CyclomaticComplexityDiffResult, String> {
     let prepared = PreparedDiff::at_root(
         root,
@@ -135,6 +138,7 @@ pub fn cyclomatic_complexity_at_root(
         },
         options,
         cancellation,
+        retention_budget,
     )?;
     let endpoints = CyclomaticComplexityEndpoints {
         base: prepared.base.label(),
@@ -219,6 +223,7 @@ pub fn cyclomatic_complexity_at_root(
     );
 
     Ok(CyclomaticComplexityDiffResult {
+        incomplete: analyzed.incomplete().to_vec(),
         endpoints,
         summary,
         functions,
@@ -314,6 +319,11 @@ impl RenderText for CyclomaticComplexityDiffResult {
                 self.summary.unchanged
             ),
         ];
+        lines.extend(
+            self.incomplete
+                .iter()
+                .map(|item| format!("- Incomplete: {item}")),
+        );
         if !self.analysis.paths_outside_analysis.is_empty() {
             lines.push(format!(
                 "- Changed paths outside analyzer support: `{:?}`",
@@ -414,6 +424,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .expect("complexity diff");
 
@@ -493,6 +504,7 @@ mod tests {
             },
             &DiffAnalysisOptions::default(),
             &CancellationToken::default(),
+            &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
         )
         .unwrap();
         let added = result

@@ -1,0 +1,330 @@
+{
+  "schema_version": 8,
+  "pack_id": "test.go-model-interface-dispatch-declarations",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-engine-test",
+    "version": "0.1.0"
+  },
+  "language": "go",
+  "ecosystem": "go-stdlib",
+  "compatibility": {
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "Synthetic engine regression fixture for #9053",
+    "revision": "synthetic"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "test.go-model-interface-dispatch.declarations",
+      "activation": [
+        {}
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "test.go-model-interface-dispatch.wire",
+            "name": "example.test/wire",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": [
+              "wire"
+            ],
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.wire.conn",
+            "name": "example.test/wire.Conn",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire.Conn"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.wire.listener",
+            "name": "example.test/wire.Listener",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire.Listener"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.probe",
+            "name": "example.test/probe",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": [
+              "probe"
+            ],
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/probe.go",
+              "symbol": "example.test/probe"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.probe.store",
+            "name": "example.test/probe.Store",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/probe.go",
+              "symbol": "example.test/probe.Store"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "test.go-model-interface-dispatch.wire.dial",
+            "owner": "test.go-model-interface-dispatch.wire",
+            "name": "Dial",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "network",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "address",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "declared",
+                    "id": "test.go-model-interface-dispatch.wire.conn",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire.Dial"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.wire.conn.close",
+            "owner": "test.go-model-interface-dispatch.wire.conn",
+            "name": "Close",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire.Conn.Close"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.wire.listener.accept",
+            "owner": "test.go-model-interface-dispatch.wire.listener",
+            "name": "Accept",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "declared",
+                    "id": "test.go-model-interface-dispatch.wire.conn",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire.Listener.Accept"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.wire.listener.close",
+            "owner": "test.go-model-interface-dispatch.wire.listener",
+            "name": "Close",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/wire.go",
+              "symbol": "example.test/wire.Listener.Close"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.probe.source",
+            "owner": "test.go-model-interface-dispatch.probe",
+            "name": "Source",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "string",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/probe.go",
+              "symbol": "example.test/probe.Source"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.probe.consume",
+            "owner": "test.go-model-interface-dispatch.probe",
+            "name": "Consume",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/probe.go",
+              "symbol": "example.test/probe.Consume"
+            }
+          },
+          {
+            "id": "test.go-model-interface-dispatch.probe.store.put",
+            "owner": "test.go-model-interface-dispatch.probe.store",
+            "name": "Put",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "callable_family_complete": true,
+            "signature": {
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "locator": {
+              "kind": "artifact",
+              "path": "synthetic/probe.go",
+              "symbol": "example.test/probe.Store.Put"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

@@ -1,10 +1,7 @@
 use super::extractor::ScanCtx;
-use crate::graph_hits::{HitRecorder, refresh_usage_limit};
+use crate::graph_hits::HitRecorder;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, Range};
-use brokk_bifrost_core::analyzer::usages::common::{
-    reclassify_import_hit_at, reclassify_override_declaration_hit_at,
-    reclassify_self_receiver_hit_at,
-};
+use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 use brokk_bifrost_core::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
@@ -15,17 +12,12 @@ pub struct EnclosingContext {
 }
 
 pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    *ctx.raw_match_count += 1;
-    if *ctx.limit_exceeded {
-        return;
-    }
+    ctx.usages.note_raw_match();
     let Some(enclosing) = enclosing_context(node, ctx).enclosing else {
         return;
     };
     HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_proven(
-        ctx.hits,
-        ctx.max_usages,
-        ctx.limit_exceeded,
+        ctx.usages,
         node,
         enclosing,
         &crate::JavaKnowledge,
@@ -34,13 +26,22 @@ pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 pub fn push_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_import_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_import,
+    );
 }
 
 pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_override_declaration_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_override_declaration,
+    );
 }
 
 /// Record `node` as a same-owner self/this receiver hit (#1014 facet B): a call
@@ -49,20 +50,20 @@ pub fn push_override_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// same-owner site.
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(node, ctx);
-    reclassify_self_receiver_hit_at(ctx.hits, ctx.file, node.start_byte(), node.end_byte());
-    refresh_usage_limit(ctx.hits, ctx.max_usages, ctx.limit_exceeded);
+    ctx.usages.reclassify_hit_at(
+        ctx.file,
+        node.start_byte(),
+        node.end_byte(),
+        UsageHit::into_self_receiver,
+    );
 }
 
 pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = node.start_byte();
     let end = node.end_byte();
     let enclosing = enclosing_context(node, ctx).enclosing;
-    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target).record_unproven(
-        ctx.unproven_hits,
-        start,
-        end,
-        enclosing,
-    );
+    HitRecorder::new(ctx.file, ctx.source, ctx.line_starts, &ctx.spec.target)
+        .record_unproven(ctx.usages, start, end, enclosing);
 }
 
 pub fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext {

@@ -1860,6 +1860,7 @@ fn transfer_point(
             SemanticEffect::ValueFlow {
                 kind:
                     ValueFlowKind::Local
+                    | ValueFlowKind::OwnershipUnknown
                     | ValueFlowKind::BackingStore { .. }
                     | ValueFlowKind::Parameter
                     | ValueFlowKind::Receiver
@@ -1937,6 +1938,7 @@ fn transfer_point(
             SemanticEffect::ValueFlow {
                 kind:
                     ValueFlowKind::LanguageDefined
+                    | ValueFlowKind::ByValueCapture
                     | ValueFlowKind::ReferenceBoxing
                     | ValueFlowKind::ReferenceUnboxing
                     | ValueFlowKind::BackingStoreAlternative { .. },
@@ -3399,7 +3401,11 @@ func run(flag bool) bool {
     fn java_direct_integral_writes_replace_prior_interval_with_exact_literal() {
         for source in [
             "class C { boolean f(int x) { if (x > 5) { x = 1; if (x < 3) return true; } return false; } }",
-            "class C { boolean f() { int x = 1; if (x < 3) return true; return false; } }",
+            // #10905 folds a comparison over an effectively final
+            // literal-initialized local to ConstantBoolean at lowering.
+            // Writing the local again keeps this declaration literal feeding
+            // an ordered guard, so the interval replacement stays exercised.
+            "class C { boolean f() { int x = 1; if (x < 3) return true; x = 2; return false; } }",
         ] {
             let fixture = Fixture::java(source, "f");
             let semantics = fixture.procedure.semantics();

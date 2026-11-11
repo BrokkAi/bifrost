@@ -1,6 +1,7 @@
 //! Java language knowledge.
 
 pub mod adapter;
+pub mod callable_shape;
 pub mod clones;
 pub mod conversion;
 pub mod declarations;
@@ -15,7 +16,7 @@ pub mod javadoc;
 pub mod primitives;
 mod regex;
 mod regex_syntax;
-mod resolution;
+pub(crate) mod resolution;
 pub mod source_facts;
 pub(crate) mod source_types;
 mod string_literal;

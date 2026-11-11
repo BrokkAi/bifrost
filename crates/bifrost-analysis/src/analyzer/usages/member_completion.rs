@@ -68,7 +68,7 @@ pub fn complete_members(
     source: Arc<String>,
     site: &MemberCompletionSite,
 ) -> MemberCompletionResult {
-    let [outcome] = resolve_type_batch(
+    let [(outcome, read_gap)] = resolve_type_batch(
         analyzer,
         vec![TypeLookupRequest {
             file: file.clone(),
@@ -82,7 +82,9 @@ pub fn complete_members(
     .try_into()
     .expect("one member-completion type request returns one outcome");
 
-    let mut incomplete = outcome.status != TypeLookupStatus::Resolved || outcome.types.len() != 1;
+    let mut incomplete = read_gap.is_some()
+        || outcome.status != TypeLookupStatus::Resolved
+        || outcome.types.len() != 1;
     let go_import_path = (language_for_file(file) == Language::Go)
         .then(|| {
             language_support_for_hook(Language::Go, "imported_package_at_range")?

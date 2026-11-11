@@ -1688,6 +1688,207 @@ pub struct ReverseOwnedReference {
     pub answer: FactResolutionAnswer,
     #[doc(hidden)]
     pub owner: ReverseEnclosingUnit,
+    #[doc(hidden)]
+    pub execution_context: ReverseReferenceExecutionContext,
+}
+
+/// A selected inverse edge is definite only when route proof is unconditional.
+/// Every language's selected reverse projection calls this in production builds.
+pub fn selected_reverse_proof(
+    route_proven: bool,
+    obligations_outstanding: bool,
+) -> (
+    brokk_bifrost_core::analyzer::usages::model::UsageProof,
+    bool,
+) {
+    use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+    if route_proven && !obligations_outstanding {
+        (UsageProof::Proven, false)
+    } else {
+        (
+            UsageProof::Unproven,
+            route_proven && obligations_outstanding,
+        )
+    }
+}
+
+/// The selected publication's context for one reference. This is query-owned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(test, feature = "test-support"))]
+pub enum ReverseReferenceExecutionContext {
+    Present {
+        disposition:
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionDisposition,
+        procedure_kind: Option<brokk_bifrost_core::analyzer::model::ProcedureKind>,
+        initializer_is_static: Option<bool>,
+        callable_site: Option<brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId>,
+    },
+    RowAbsent,
+    CapabilityAbsent,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const REVERSE_REFERENCE_EXECUTION_CONTEXT_SQL: &str = r#"
+SELECT input.key, mount.blob_id, context.disposition, context.procedure_kind,
+       context.initializer_is_static, context.callable_site
+FROM json_each(?1) AS input
+LEFT JOIN temp.selected_resolution_mounts AS mount
+  ON mount.storage_language = json_extract(input.value, '$[0]')
+ AND mount.persisted_relative_path = json_extract(input.value, '$[1]')
+LEFT JOIN main.resolution_reference_execution_contexts AS context
+  ON context.blob_id = mount.blob_id AND context.site = json_extract(input.value, '$[2]')
+"#;
+
+#[cfg(any(test, feature = "test-support"))]
+fn decode_reverse_execution_context(
+    row: &rusqlite::Row<'_>,
+    capability: bool,
+) -> Result<ReverseReferenceExecutionContext> {
+    if !capability {
+        return Ok(ReverseReferenceExecutionContext::CapabilityAbsent);
+    }
+    let Some(label) = row.get::<_, Option<String>>(2)? else {
+        return Ok(ReverseReferenceExecutionContext::RowAbsent);
+    };
+    use brokk_bifrost_core::analyzer::model::ProcedureKind;
+    use brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionDisposition as Disposition;
+    let disposition = match label.as_str() {
+        "callable" => Disposition::Callable,
+        "non_executable" => Disposition::NonExecutable,
+        "unknown" => Disposition::Unknown,
+        _ => {
+            return Err(StoreError::corrupt(format!(
+                "invalid reference execution disposition {label:?}"
+            )));
+        }
+    };
+    let kind: Option<String> = row.get(3)?;
+    let procedure_kind = match kind.as_deref() {
+        None => None,
+        Some("function") => Some(ProcedureKind::Function),
+        Some("method") => Some(ProcedureKind::Method),
+        Some("constructor") => Some(ProcedureKind::Constructor),
+        Some("initializer") => Some(ProcedureKind::Initializer),
+        Some("local_function") => Some(ProcedureKind::LocalFunction),
+        Some("lambda") => Some(ProcedureKind::Lambda),
+        Some("closure") => Some(ProcedureKind::Closure),
+        Some("accessor") => Some(ProcedureKind::Accessor),
+        Some("operator") => Some(ProcedureKind::Operator),
+        _ => {
+            return Err(StoreError::corrupt(format!(
+                "invalid reference procedure kind {kind:?}"
+            )));
+        }
+    };
+    Ok(ReverseReferenceExecutionContext::Present {
+        disposition,
+        procedure_kind,
+        initializer_is_static: row.get(4)?,
+        callable_site: row
+            .get::<_, Option<u32>>(5)?
+            .map(brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new),
+    })
+}
+
+#[cfg(test)]
+mod reference_execution_context_read_tests {
+    use super::{
+        REVERSE_REFERENCE_EXECUTION_CONTEXT_SQL, ReverseReferenceExecutionContext as Context,
+        decode_reverse_execution_context,
+    };
+    use brokk_bifrost_core::analyzer::model::ProcedureKind;
+    use brokk_bifrost_core::analyzer::resolution_facts::{
+        ResolutionReferenceExecutionDisposition as Disposition, ResolutionSiteId,
+    };
+    use rusqlite::Connection;
+
+    #[test]
+    fn selected_java_context_batch_preserves_absence_and_seeks_the_context_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TEMP TABLE selected_resolution_mounts(storage_language TEXT, persisted_relative_path TEXT, blob_id INTEGER, PRIMARY KEY(storage_language,persisted_relative_path));
+            CREATE TABLE resolution_reference_execution_contexts(blob_id INTEGER, site INTEGER, disposition TEXT, procedure_kind TEXT, initializer_is_static INTEGER, callable_site INTEGER, PRIMARY KEY(blob_id,site)) WITHOUT ROWID;
+            INSERT INTO selected_resolution_mounts VALUES('java','A.java',7);
+            INSERT INTO resolution_reference_execution_contexts VALUES(7,1,'callable','method',NULL,10),(7,2,'callable','lambda',NULL,NULL),(7,3,'unknown',NULL,NULL,NULL),(7,4,'non_executable',NULL,NULL,NULL);").unwrap();
+        let input = serde_json::json!([
+            ["java", "A.java", 1],
+            ["java", "A.java", 2],
+            ["java", "A.java", 3],
+            ["java", "A.java", 4],
+            ["java", "A.java", 5],
+            ["kotlin", "A.java", 1],
+        ])
+        .to_string();
+        let mut statement = conn
+            .prepare(REVERSE_REFERENCE_EXECUTION_CONTEXT_SQL)
+            .unwrap();
+        let mut cursor = statement.query([&input]).unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next().unwrap() {
+            let index: usize = row.get(0).unwrap();
+            rows.push((
+                index,
+                decode_reverse_execution_context(row, index != 5).unwrap(),
+            ));
+        }
+        rows.sort_by_key(|row| row.0);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    0,
+                    Context::Present {
+                        disposition: Disposition::Callable,
+                        procedure_kind: Some(ProcedureKind::Method),
+                        initializer_is_static: None,
+                        callable_site: Some(ResolutionSiteId::new(10))
+                    }
+                ),
+                (
+                    1,
+                    Context::Present {
+                        disposition: Disposition::Callable,
+                        procedure_kind: Some(ProcedureKind::Lambda),
+                        initializer_is_static: None,
+                        callable_site: None
+                    }
+                ),
+                (
+                    2,
+                    Context::Present {
+                        disposition: Disposition::Unknown,
+                        procedure_kind: None,
+                        initializer_is_static: None,
+                        callable_site: None
+                    }
+                ),
+                (
+                    3,
+                    Context::Present {
+                        disposition: Disposition::NonExecutable,
+                        procedure_kind: None,
+                        initializer_is_static: None,
+                        callable_site: None
+                    }
+                ),
+                (4, Context::RowAbsent),
+                (5, Context::CapabilityAbsent),
+            ]
+        );
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {REVERSE_REFERENCE_EXECUTION_CONTEXT_SQL}"
+            ))
+            .unwrap()
+            .query_map([input], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("SEARCH context USING PRIMARY KEY")),
+            "{plan:?}"
+        );
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1707,6 +1908,61 @@ pub(crate) fn project_reverse_owners(
     cancellation: &CancellationToken,
 ) -> Result<Option<ReverseOwnerProjection>> {
     let mut references = Vec::with_capacity(answers.len());
+    let context_keys: Vec<_> = answers
+        .iter()
+        .map(|reference| {
+            serde_json::json!([
+                reference.locator.storage_language,
+                reference.locator.relative_path,
+                reference
+                    .answer
+                    .site_metadata()
+                    .map(|site| site.site().get()),
+            ])
+        })
+        .collect();
+    let mut execution_contexts =
+        vec![ReverseReferenceExecutionContext::CapabilityAbsent; answers.len()];
+    // Bound each JSON input and SQLite statement's work for large inverse sets.
+    for (chunk_ordinal, keys) in context_keys.chunks(512).enumerate() {
+        let connection = operation.ready.inventory.connection();
+        let encoded =
+            serde_json::to_string(keys).expect("selected reference keys serialize as JSON");
+        let read = crate::analyzer::store::resolution::with_resolution_read_progress_handler(
+            connection,
+            cancellation,
+            |connection| {
+                let mut statement =
+                    connection.prepare_cached(REVERSE_REFERENCE_EXECUTION_CONTEXT_SQL)?;
+                let mut rows = statement.query([encoded])?;
+                while let Some(row) = rows.next()? {
+                    if cancellation.is_cancelled() {
+                        return Ok(false);
+                    }
+                    let index: usize = chunk_ordinal * 512 + row.get::<_, usize>(0)?;
+                    let reference = &answers[index];
+                    let capability = reference.locator.storage_language == "java";
+                    let blob: Option<i64> = row.get(1)?;
+                    if capability && blob.is_none() {
+                        return Err(StoreError::corrupt(format!(
+                            "selected Java reference has no selected mount: {:?}",
+                            reference.locator
+                        )));
+                    }
+                    execution_contexts[index] = decode_reverse_execution_context(row, capability)?;
+                }
+                Ok(true)
+            },
+        );
+        match read {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            Err(error) if error.is_sqlite_interrupted() && cancellation.is_cancelled() => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let mut definition_semantics = Vec::new();
     for reference in &answers {
         let answer = &reference.answer;
@@ -1745,12 +2001,12 @@ pub(crate) fn project_reverse_owners(
         .into_iter()
         .filter_map(|(semantic, definition)| match definition {
             SelectedNativeDefinition::Unit(unit) => Some((semantic, unit)),
-            SelectedNativeDefinition::Lexical(_) | SelectedNativeDefinition::Intrinsic { .. } => {
-                None
-            }
+            SelectedNativeDefinition::Lexical(_)
+            | SelectedNativeDefinition::Intrinsic { .. }
+            | SelectedNativeDefinition::ExternalOwner { .. } => None,
         })
         .collect::<HashMap<_, _>>();
-    for reference in answers {
+    for (reference, execution_context) in answers.into_iter().zip(execution_contexts) {
         let answer = reference.answer;
         let owner = match answer.reference_owner() {
             Some(None) => ReverseEnclosingUnit::NoEnclosingUnit,
@@ -1777,6 +2033,7 @@ pub(crate) fn project_reverse_owners(
             locator: reference.locator,
             answer,
             owner,
+            execution_context,
         });
     }
     Ok(Some(ReverseOwnerProjection { references }))
@@ -2046,6 +2303,30 @@ mod tests {
     use super::*;
     #[cfg(test)]
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon(
+        "#8500: review found reverse edges labelled Proven while their answer held query obligations"
+    )]
+    fn selected_reverse_proof_requires_unconditional_route() {
+        use brokk_bifrost_core::analyzer::usages::model::UsageProof;
+        assert_eq!(
+            super::selected_reverse_proof(true, false),
+            (UsageProof::Proven, false)
+        );
+        assert_eq!(
+            super::selected_reverse_proof(true, true),
+            (UsageProof::Unproven, true)
+        );
+        assert_eq!(
+            super::selected_reverse_proof(false, false),
+            (UsageProof::Unproven, false)
+        );
+        assert_eq!(
+            super::selected_reverse_proof(false, true),
+            (UsageProof::Unproven, false)
+        );
+    }
 
     fn two_root_file() -> (
         Vec<ReverseContextId<&'static str>>,

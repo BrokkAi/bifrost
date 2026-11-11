@@ -67,14 +67,16 @@ pub fn root_source_horizon(
         // Even a placed unsaved replacement keeps the conservative discovery
         // path. Overlay masks can also remove a source without replacing it.
         let storage_language = record.storage_language();
-        let transient = ready.inventory.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_mounts
+        let transient = ready
+            .inventory
+            .connection()
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM temp.selected_resolution_mounts
                            WHERE storage_language=?1 AND file_version_id IS NULL)
                  OR EXISTS(SELECT 1 FROM temp.selected_resolution_overlay_masks
                            WHERE storage_language=?1)",
-            [storage_language],
-            |row| row.get::<_, bool>(0),
-        )?;
+            )?
+            .query_row([storage_language], |row| row.get::<_, bool>(0))?;
         transient_languages.insert(language, transient);
         transient
     };

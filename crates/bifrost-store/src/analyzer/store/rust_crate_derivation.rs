@@ -853,11 +853,10 @@ pub(super) fn derive_exports(
                     name,
                     key.map(|key| key.to_vec()),
                     key.map(|key| conn
-                        .query_row(
-                            "SELECT topology_id FROM temp.rust_schedule_live WHERE crate_key = ?1",
-                            [key.as_slice()],
-                            |row| row.get::<_, i64>(0)
-                        )
+                        .prepare_cached(
+                            "SELECT topology_id FROM temp.rust_schedule_live WHERE crate_key = ?1"
+                        )?
+                        .query_row([key.as_slice()], |row| row.get::<_, i64>(0))
                         .optional())
                         .transpose()?
                         .flatten()
@@ -985,9 +984,10 @@ pub(super) fn derive_exports(
     // so mapping it through that target's current sources would make the
     // digest depend on derivation history. Foreign targets are hashed by their
     // symbolic endpoint, as foreign glob providers already are.
-    conn.execute("INSERT INTO cr_authority_source_paths
- SELECT identity.crate_key,member.blob_id,MIN(member.rel_path) FROM cr_members member CROSS JOIN cr_identity identity GROUP BY member.blob_id", [])?;
-    conn.execute(binding_authority::BLOCKERS_SQL, [])?;
+    conn.prepare_cached("INSERT INTO cr_authority_source_paths
+ SELECT identity.crate_key,member.blob_id,MIN(member.rel_path) FROM cr_members member CROSS JOIN cr_identity identity GROUP BY member.blob_id")?.execute( [])?;
+    conn.prepare_cached(binding_authority::BLOCKERS_SQL)?
+        .execute([])?;
     let binding_owners = query_values(conn, binding_authority::OWNERS_SQL)?;
     let binding_names = query_values(conn, binding_authority::NAMES_SQL)?;
     let binding_alternatives = query_values(conn, &binding_authority::ALTERNATIVES_SQL)?;
@@ -1312,21 +1312,17 @@ impl ExportRows {
                 // persistent owner id has been allocated by this publication.
                 let owners = &self.binding_owners;
                 for row in owners {
-                    tx.execute(
-                        binding_authority::OWNERS_INSERT_SQL,
-                        rusqlite::params_from_iter(
+                    tx.prepare_cached(binding_authority::OWNERS_INSERT_SQL)?
+                        .execute(rusqlite::params_from_iter(
                             std::iter::once(Value::Integer(topology_id)).chain(row.iter().cloned()),
-                        ),
-                    )?;
+                        ))?;
                 }
                 for row in owners {
-                    tx.execute(
-                        binding_authority::PARENTS_UPDATE_SQL,
-                        rusqlite::params_from_iter(
+                    tx.prepare_cached(binding_authority::PARENTS_UPDATE_SQL)?
+                        .execute(rusqlite::params_from_iter(
                             std::iter::once(Value::Integer(topology_id))
                                 .chain(row.iter().take(9).cloned()),
-                        ),
-                    )?;
+                        ))?;
                 }
             }
             if sql == INSERT_ENUM_SOURCE_SQL {
@@ -1420,13 +1416,17 @@ DELETE FROM temp.cr_trait_impls;
 /// DROP alike. `cr_trait_impls` is the last object the script creates.
 #[doc(hidden)]
 pub fn prepare_tables(conn: &Connection) -> Result<()> {
-    let prepared = conn
-        .prepare_cached(
+    // Schema bookkeeping: whether the tables exist decides only between
+    // creating them empty and emptying them, so no frame attributes the probe.
+    let prepared = {
+        let _classifier = brokk_bifrost_core::attribution::classifier_statements();
+        conn.prepare_cached(
             "SELECT 1 FROM temp.sqlite_schema WHERE type = 'table' AND name = 'cr_trait_impls'",
         )?
         .query_row([], |_| Ok(()))
         .optional()?
-        .is_some();
+        .is_some()
+    };
     if prepared {
         conn.execute_batch(CLEAR_SQL)?;
         return Ok(());
@@ -1723,7 +1723,7 @@ pub  const SQL_CR_MEMBERS_1: &str = "INSERT INTO cr_members
             LEFT JOIN source_rust_module_scopes AS scope ON scope.blob_id = manifest.blob_id AND scope.ordinal = ?3
             LEFT JOIN source_rust_module_declarations AS declaration ON declaration.blob_id = scope.blob_id AND declaration.declaration_id = scope.declaration_id
             WHERE manifest.blob_id = ?2";
-pub(super) const SQL_RUST_CRATE_MEMBER_IDENTITY: &str =
+pub(crate) const SQL_RUST_CRATE_MEMBER_IDENTITY: &str =
     "INSERT OR IGNORE INTO rust_crate_container_members VALUES(?1,?2,?3)";
 #[doc(hidden)]
 pub  const SQL_CR_MEMBERS_2: &str = "UPDATE cr_members AS child SET parent_module_path = (

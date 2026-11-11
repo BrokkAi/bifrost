@@ -22,6 +22,15 @@
 //! admits no member access.
 
 use super::facts::FileFacts;
+use super::identity::{
+    ComparisonContext, IdentifierRole, IdentityBudget, IdentityOpenReason, IdentityProofs,
+    IdentityVerdict, MAX_COMPARISON_TREE_NODES, bounded_non_extra_children, compare_trees,
+    identifier_role, is_nested_callable, ordinary_binding, php_callable_has_by_ref_capture,
+};
+#[cfg(test)]
+use super::identity::{
+    bounded_named_statements, position_dependent, scala_nested_callable_is_exact,
+};
 use super::kinds::NormalizedKind;
 use super::lexical_environment::{BindingOfOutcome, EnvironmentFileResult, binding_of};
 use super::occurrences::{Namespace, OccurrenceRole};
@@ -45,7 +54,7 @@ use brokk_bifrost_core::analyzer::structural::body_relations::{
     BodyState, BodyStateAnswer, empty_if_arm_relation,
 };
 use brokk_bifrost_core::analyzer::structural::conditional_regions::ConditionalRegions;
-use brokk_bifrost_core::analyzer::tree_walk::{has_child_of_kind as has_direct_token, node_range};
+use brokk_bifrost_core::analyzer::tree_walk::node_range;
 use brokk_bifrost_core::analyzer::work_budget::{BudgetLedger, define_work_dimensions};
 use std::collections::HashMap;
 use tree_sitter::Node;
@@ -164,14 +173,14 @@ struct Arm<'tree> {
 /// distinguish unequal targets and grant no condition stability.
 /// A missing entry is never a negative lookup: it leaves this comparison open.
 #[derive(Default)]
-pub struct BranchReferenceProofs {
+pub struct ReferenceProofs {
     pub sites: HashMap<(usize, usize), Result<CodeUnit, BranchOpenReason>>,
     pub collection_gap: Option<BranchOpenReason>,
     /// Physical storage declarations, admitted separately from presentation identity.
-    pub storage_fields: HashMap<(usize, usize), BranchStorageField>,
+    pub storage_fields: HashMap<(usize, usize), StorageField>,
 }
 
-impl BranchReferenceProofs {
+impl ReferenceProofs {
     fn target_at(&self, node: Node<'_>) -> Result<&CodeUnit, BranchOpenReason> {
         self.sites
             .get(&(node.start_byte(), node.end_byte()))
@@ -183,15 +192,15 @@ impl BranchReferenceProofs {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BranchReferenceKind {
+pub enum ReferenceKind {
     Field,
     Method,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BranchReferenceSite {
+pub struct ReferenceSite {
     pub range: (usize, usize),
-    pub kind: BranchReferenceKind,
+    pub kind: ReferenceKind,
 }
 
 /// Grammar facts for field reads on the current object, including its base view.
@@ -209,7 +218,10 @@ pub struct BranchCurrentObjectFields {
 }
 
 impl BranchCurrentObjectFields {
-    pub fn member<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+    pub fn receiver_and_member<'tree>(
+        &self,
+        node: Node<'tree>,
+    ) -> Option<(Node<'tree>, Node<'tree>)> {
         if node.kind() != self.access_kind
             || node.parent().is_some_and(|parent| {
                 parent.kind() == self.invocation_kind
@@ -218,11 +230,28 @@ impl BranchCurrentObjectFields {
         {
             return None;
         }
-        let receiver = node.child_by_field_name(self.receiver_field)?;
-        if receiver.kind() != self.current_kind && receiver.kind() != self.parent_kind {
-            return None;
-        }
-        node.child_by_field_name(self.member_field)
+        let receiver = if self.receiver_field.is_empty() {
+            node.named_child(0)?
+        } else {
+            node.child_by_field_name(self.receiver_field)?
+        };
+        let member = if self.member_field.is_empty() {
+            node.named_child(1)?.named_child(0)
+        } else {
+            node.child_by_field_name(self.member_field)
+        }?;
+        Some((receiver, member))
+    }
+
+    pub fn member<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let (receiver, member) = self.receiver_and_member(node)?;
+        (receiver.kind() == self.current_kind || receiver.kind() == self.parent_kind)
+            .then_some(member)
+    }
+
+    pub fn current_member<'tree>(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        let (receiver, member) = self.receiver_and_member(node)?;
+        (receiver.kind() == self.current_kind).then_some(member)
     }
 
     pub fn is_storage_declaration(&self, name: Node<'_>) -> bool {
@@ -241,7 +270,7 @@ impl BranchCurrentObjectFields {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BranchStorageField {
+pub struct StorageField {
     pub file: ProjectFile,
     /// Exact declaration-name span distinguishes fields in one declaration list.
     pub range: Range,
@@ -249,12 +278,43 @@ pub struct BranchStorageField {
 
 /// Collect bounded reference sites from one exact snapshot. Language hooks
 /// select grammar fields; shared code owns traversal and lexical admission.
+enum ReferenceCoverage<'a> {
+    BranchFile,
+    Subtrees(&'a [Range]),
+}
+
 pub fn reference_sites(
     syntax: &PreparedSyntaxTree,
     language: Language,
     facts: &FileFacts,
     env: &EnvironmentFileResult,
-) -> Result<Vec<BranchReferenceSite>, BranchOpenReason> {
+) -> Result<Vec<ReferenceSite>, BranchOpenReason> {
+    collect_reference_sites(syntax, language, facts, env, ReferenceCoverage::BranchFile)
+}
+
+pub fn reference_sites_in_ranges(
+    syntax: &PreparedSyntaxTree,
+    language: Language,
+    facts: &FileFacts,
+    env: &EnvironmentFileResult,
+    ranges: &[Range],
+) -> Result<Vec<ReferenceSite>, BranchOpenReason> {
+    collect_reference_sites(
+        syntax,
+        language,
+        facts,
+        env,
+        ReferenceCoverage::Subtrees(ranges),
+    )
+}
+
+fn collect_reference_sites(
+    syntax: &PreparedSyntaxTree,
+    language: Language,
+    facts: &FileFacts,
+    env: &EnvironmentFileResult,
+    coverage: ReferenceCoverage<'_>,
+) -> Result<Vec<ReferenceSite>, BranchOpenReason> {
     const MAX_TREE_NODES: usize = 131_072;
     const MAX_REFERENCE_SITES: usize = 256;
     let Some(support) = language_support_for_hook(language, "branch_reference_site") else {
@@ -287,6 +347,25 @@ pub fn reference_sites(
     value_references.sort_unstable();
     value_references.dedup();
 
+    let mut selected_ranges: Vec<(usize, usize)> = match coverage {
+        ReferenceCoverage::BranchFile => Vec::new(),
+        ReferenceCoverage::Subtrees(ranges) => ranges
+            .iter()
+            .map(|range| (range.start_byte, range.end_byte))
+            .collect(),
+    };
+    selected_ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in selected_ranges {
+        if let Some(last) = merged.last_mut()
+            && start < last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Region {
         Outside,
@@ -298,26 +377,44 @@ pub fn reference_sites(
     let mut visited = 0;
     let mut role_budget = BranchWorkBudget::new();
     while let Some((node, region)) = stack.pop() {
+        if matches!(coverage, ReferenceCoverage::Subtrees(_)) && {
+            let prior = merged.partition_point(|(start, _)| *start < node.end_byte());
+            prior == 0 || merged[prior - 1].1 <= node.start_byte()
+        } {
+            continue;
+        }
         visited += 1;
         if visited > MAX_TREE_NODES || node.child_count() > MAX_TREE_NODES {
             return Err(BranchOpenReason::ComparisonBudget);
         }
-        if region != Region::Outside && is_nested_callable(node, language) {
+        let effective_region = match coverage {
+            ReferenceCoverage::BranchFile => region,
+            ReferenceCoverage::Subtrees(_)
+                if region == Region::Outside && {
+                    let prior = merged.partition_point(|(start, _)| *start <= node.start_byte());
+                    prior > 0 && merged[prior - 1].1 >= node.end_byte()
+                } =>
+            {
+                Region::Body
+            }
+            ReferenceCoverage::Subtrees(_) => region,
+        };
+        if effective_region != Region::Outside && is_nested_callable(node, language) {
             continue;
         }
-        let site = match region {
+        let site = match effective_region {
             Region::Body => support.branch_body_reference_site(node, syntax.source()),
             Region::Condition => support.branch_condition_reference_site(node, syntax.source()),
             Region::Outside => None,
         }
         .or_else(|| {
-            if region == Region::Outside {
+            if effective_region == Region::Outside {
                 return None;
             }
             let member = support.branch_current_object_fields()?.member(node)?;
-            Some(BranchReferenceSite {
+            Some(ReferenceSite {
                 range: (member.start_byte(), member.end_byte()),
-                kind: BranchReferenceKind::Field,
+                kind: ReferenceKind::Field,
             })
         });
         if let Some(site) = site {
@@ -375,7 +472,6 @@ pub fn reference_sites(
     Ok(sites)
 }
 
-const MAX_COMPARISON_TREE_NODES: usize = 4096;
 const MAX_CHAIN_COMPARISONS: usize = 4096;
 
 define_work_dimensions! {
@@ -469,7 +565,7 @@ pub fn relations_for_if(
     language: Language,
     range: Range,
     env: &EnvironmentFileResult,
-    members: &BranchReferenceProofs,
+    members: &ReferenceProofs,
     regions: &ConditionalRegions,
 ) -> Vec<BranchRelationRow> {
     let if_kinds: &[&str] = match language {
@@ -572,13 +668,13 @@ pub fn relations_for_if(
             return rows;
         }
     };
-    let chain = Chain {
+    let chain = ComparisonContext {
         language,
-        owner: node_range(node),
+        owner_region: node_range(node),
         source: syntax.source(),
         env,
         members,
-        condition_binders: &condition_binders,
+        enclosing_binders: &condition_binders,
     };
     let mut stability = vec![None; arms.len()];
     let condition_count = arms.iter().filter(|arm| arm.condition.is_some()).count();
@@ -586,7 +682,7 @@ pub fn relations_for_if(
         let later = arms[later_ordinal];
         for earlier_ordinal in 0..later_ordinal {
             let earlier = arms[earlier_ordinal];
-            let body_verdict = compare_trees(earlier.body, later.body, &chain, &mut budget);
+            let body_verdict = compare_trees(earlier.body, later.body, &chain, &mut budget).into();
             if budget.exhausted {
                 rows.extend(
                     open_pair_rows(range, BranchOpenReason::ComparisonBudget).filter(|row| {
@@ -628,7 +724,7 @@ pub fn relations_for_if(
             {
                 BranchRelationVerdict::Open(BranchOpenReason::EffectfulCondition)
             } else {
-                compare_trees(earlier_condition, later_condition, &chain, &mut budget)
+                compare_trees(earlier_condition, later_condition, &chain, &mut budget).into()
             };
             let verdict = if verdict == BranchRelationVerdict::Proven {
                 let mut verdict = BranchRelationVerdict::Proven;
@@ -1072,527 +1168,6 @@ fn kotlin_else_if(body: Node<'_>) -> Option<Node<'_>> {
         .filter(|nested| nested.kind() == "if_expression")
 }
 
-/// What every comparison within one `if` chain shares.
-#[derive(Clone, Copy)]
-struct Chain<'a> {
-    language: Language,
-    /// The `if` whose chain is compared.
-    owner: Range,
-    source: &'a str,
-    env: &'a EnvironmentFileResult,
-    members: &'a BranchReferenceProofs,
-    /// See [`java_pattern_binders`].
-    condition_binders: &'a [&'a str],
-}
-
-/// Compare two subtrees node for node.
-///
-/// A nested callable or local class at matching positions makes an otherwise
-/// equal comparison `DeferredBody`: its shape is still compared, so a
-/// syntactic difference inside it remains `Distinct`, but its names are not,
-/// because its own parameters and locals bind per closure and its captures are
-/// not modeled.
-fn compare_trees(
-    earlier: Node<'_>,
-    later: Node<'_>,
-    chain: &Chain<'_>,
-    budget: &mut BranchWorkBudget,
-) -> BranchRelationVerdict {
-    if let Err(reason) = budget.charge(BranchWork {
-        comparisons: 1,
-        ..BranchWork::default()
-    }) {
-        return BranchRelationVerdict::Open(reason);
-    }
-    let Chain {
-        language,
-        owner,
-        source,
-        env,
-        members,
-        condition_binders,
-    } = *chain;
-    let current_object_fields = language_support_for_hook(language, "branch_current_object_fields")
-        .and_then(|support| support.branch_current_object_fields());
-    // The flag records whether the pair lies inside a nested callable.
-    let mut stack = vec![(earlier, later, false)];
-    let mut renamed = HashMap::<usize, usize>::new();
-    let mut reverse_renamed = HashMap::<usize, usize>::new();
-    // Reads resolve after every arm-local binder is paired, so a read that
-    // precedes its binder in source order, such as a comprehension element,
-    // still sees the pairing.
-    let mut reads = Vec::new();
-    let mut deferred = false;
-    let mut visited = 0;
-    while let Some((left, right, nested)) = stack.pop() {
-        if let Err(reason) = budget.step() {
-            return BranchRelationVerdict::Open(reason);
-        }
-        visited += 1;
-        if visited > MAX_COMPARISON_TREE_NODES {
-            return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
-        }
-        if left.has_error() || right.has_error() || left.is_missing() || right.is_missing() {
-            return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
-        }
-        // A Ruby arm is a `then` or an `else`, each a statement list; only
-        // their statements are compared.
-        let ruby_arm = |node: Node<'_>| matches!(node.kind(), "then" | "else");
-        if language == Language::Ruby && ruby_arm(left) && ruby_arm(right) {
-            if left.child_count() > MAX_COMPARISON_TREE_NODES
-                || right.child_count() > MAX_COMPARISON_TREE_NODES
-                || stack.len() + left.child_count() > MAX_COMPARISON_TREE_NODES
-            {
-                return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
-            }
-            let left_statements = match bounded_named_statements(left, stack.len(), budget) {
-                Ok(children) => children,
-                Err(reason) => return BranchRelationVerdict::Open(reason),
-            };
-            let right_statements = match bounded_named_statements(right, stack.len(), budget) {
-                Ok(children) => children,
-                Err(reason) => return BranchRelationVerdict::Open(reason),
-            };
-            if left_statements.len() != right_statements.len() {
-                return BranchRelationVerdict::Distinct;
-            }
-            stack.extend(
-                left_statements
-                    .into_iter()
-                    .zip(right_statements)
-                    .rev()
-                    .map(|(left, right)| (left, right, nested)),
-            );
-            continue;
-        }
-        if !nested
-            && let Some(spec) = current_object_fields.as_ref()
-            && let (Some(left_member), Some(right_member)) = (spec.member(left), spec.member(right))
-            && let (Some(left_declaration), Some(right_declaration)) = (
-                members
-                    .storage_fields
-                    .get(&(left_member.start_byte(), left_member.end_byte())),
-                members
-                    .storage_fields
-                    .get(&(right_member.start_byte(), right_member.end_byte())),
-            )
-            && left_declaration == right_declaration
-        {
-            // Both receivers denote this object, and both strict targets name
-            // the same physical storage slot. Presentation identity alone does
-            // not justify this equality; properties and methods never enter it.
-            continue;
-        }
-        if left.kind() != right.kind() {
-            // `this.value` and a bare `value` can name one Java field, which
-            // only a field resolution for the bare name could prove. A bare
-            // name bound to a local or parameter is never that field.
-            if language == Language::Java
-                && let Some((access, bare)) =
-                    [(left, right), (right, left)]
-                        .into_iter()
-                        .find(|(access, bare)| {
-                            access.kind() == "field_access"
-                                && bare.kind() == "identifier"
-                                && access
-                                    .child_by_field_name("object")
-                                    .is_some_and(|object| object.kind() == "this")
-                        })
-                && let Some(name) = source.get(bare.byte_range())
-                && access
-                    .child_by_field_name("field")
-                    .and_then(|field| source.get(field.byte_range()))
-                    == Some(name)
-            {
-                return match binding_of(env, name, bare.start_byte(), Some(Namespace::Value)) {
-                    BindingOfOutcome::NoBinding => {
-                        BranchRelationVerdict::Open(BranchOpenReason::MemberResolutionUnavailable)
-                    }
-                    BindingOfOutcome::Incomplete(_) => {
-                        BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable)
-                    }
-                    BindingOfOutcome::Reached(_) | BindingOfOutcome::Shadowed { .. } => {
-                        BranchRelationVerdict::Distinct
-                    }
-                };
-            }
-            return BranchRelationVerdict::Distinct;
-        }
-        let nested_callable = is_nested_callable(left, language);
-        let php_exact_callable =
-            language == Language::Php && php_exact_nested_callable(left, right);
-        let scala_exact_callable = if language == Language::Scala {
-            match scala_nested_callable_is_exact(left, right, env, budget) {
-                Ok(exact) => exact,
-                Err(reason) if budget.exhausted => return BranchRelationVerdict::Open(reason),
-                // A local refusal cannot make a closure exact. Keep comparing
-                // outer syntax so an independent difference can still refute it.
-                Err(_) => false,
-            }
-        } else {
-            false
-        };
-        let nested = nested || (nested_callable && !(php_exact_callable || scala_exact_callable));
-        deferred |= nested;
-        if position_dependent(left, language, source) || position_dependent(right, language, source)
-        {
-            return BranchRelationVerdict::Distinct;
-        }
-        if left.kind() == "field_access" {
-            let (Some(left_field), Some(right_field), Some(left_object), Some(right_object)) = (
-                left.child_by_field_name("field"),
-                right.child_by_field_name("field"),
-                left.child_by_field_name("object"),
-                right.child_by_field_name("object"),
-            ) else {
-                return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
-            };
-            if !same_member(left_field, right_field, source, members) {
-                return BranchRelationVerdict::Distinct;
-            }
-            stack.push((left_object, right_object, nested));
-            continue;
-        }
-        if language == Language::Java && left.kind() == "method_invocation" {
-            if left.child_count() > MAX_COMPARISON_TREE_NODES
-                || right.child_count() > MAX_COMPARISON_TREE_NODES
-                || stack.len() + left.child_count() > MAX_COMPARISON_TREE_NODES
-            {
-                return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
-            }
-            let (Some(left_name), Some(right_name)) = (
-                left.child_by_field_name("name"),
-                right.child_by_field_name("name"),
-            ) else {
-                return BranchRelationVerdict::Open(BranchOpenReason::MissingBranchField);
-            };
-            if !same_member(left_name, right_name, source, members) {
-                return BranchRelationVerdict::Distinct;
-            }
-            let mut left_children = match bounded_non_extra_children(left, stack.len(), budget) {
-                Ok(children) => children,
-                Err(reason) => return BranchRelationVerdict::Open(reason),
-            }
-            .into_iter()
-            .filter(|(field, _)| *field != Some("name"))
-            .collect::<Vec<_>>();
-            let mut right_children = match bounded_non_extra_children(right, stack.len(), budget) {
-                Ok(children) => children,
-                Err(reason) => return BranchRelationVerdict::Open(reason),
-            }
-            .into_iter()
-            .filter(|(field, _)| *field != Some("name"))
-            .collect::<Vec<_>>();
-            // `this.render()` and an implicit-this `render()` are one virtual
-            // call when both resolve to the same method; `super.` is not,
-            // because it bypasses overriding.
-            let left_this = explicit_this_receiver(left);
-            let right_this = explicit_this_receiver(right);
-            let left_implicit = left.child_by_field_name("object").is_none();
-            let right_implicit = right.child_by_field_name("object").is_none();
-            if (left_this && right_implicit) || (right_this && left_implicit) {
-                match (members.target_at(left_name), members.target_at(right_name)) {
-                    (Ok(a), Ok(b)) if a == b => {
-                        for children in [&mut left_children, &mut right_children] {
-                            children.retain(|(field, child)| {
-                                *field != Some("object") && child.kind() != "."
-                            });
-                        }
-                    }
-                    (Ok(_), Ok(_)) => return BranchRelationVerdict::Distinct,
-                    (Err(reason), _) | (_, Err(reason)) => {
-                        return BranchRelationVerdict::Open(reason);
-                    }
-                }
-            }
-            if left_children.len() != right_children.len() {
-                return BranchRelationVerdict::Distinct;
-            }
-            for ((left_field, left_child), (right_field, right_child)) in
-                left_children.into_iter().zip(right_children).rev()
-            {
-                if left_field != right_field {
-                    return BranchRelationVerdict::Distinct;
-                }
-                stack.push((left_child, right_child, nested));
-            }
-            continue;
-        }
-        if left.child_count() > MAX_COMPARISON_TREE_NODES
-            || right.child_count() > MAX_COMPARISON_TREE_NODES
-            || stack.len() + left.child_count() > MAX_COMPARISON_TREE_NODES
-        {
-            return BranchRelationVerdict::Open(BranchOpenReason::ComparisonBudget);
-        }
-        let left_children = match bounded_non_extra_children(left, stack.len(), budget) {
-            Ok(children) => children,
-            Err(reason) => return BranchRelationVerdict::Open(reason),
-        };
-        let right_children = match bounded_non_extra_children(right, stack.len(), budget) {
-            Ok(children) => children,
-            Err(reason) => return BranchRelationVerdict::Open(reason),
-        };
-        if left_children.len() != right_children.len() {
-            return BranchRelationVerdict::Distinct;
-        }
-        if !left_children.is_empty() {
-            for ((left_field, left_child), (right_field, right_child)) in
-                left_children.into_iter().zip(right_children).rev()
-            {
-                if left_field != right_field {
-                    return BranchRelationVerdict::Distinct;
-                }
-                stack.push((left_child, right_child, nested));
-            }
-            continue;
-        }
-        let is_name = matches!(
-            left.kind(),
-            "identifier"
-                | "simple_identifier"
-                | "type_identifier"
-                | "shorthand_property_identifier"
-                | "shorthand_property_identifier_pattern"
-        );
-        // A name inside a nested callable may be one of its own binders, so
-        // it neither proves nor refutes the comparison, which is deferred.
-        if nested && is_name {
-            continue;
-        }
-        let (Some(name), Some(other_name)) = (
-            source.get(left.byte_range()),
-            source.get(right.byte_range()),
-        ) else {
-            return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
-        };
-        if matches!(
-            left.kind(),
-            "identifier" | "simple_identifier" | "shorthand_property_identifier_pattern"
-        ) {
-            // A declaration inside each arm is a pair of distinct bindings
-            // that stand for each other, like a block local in each arm.
-            let binder_at = |node: Node<'_>, spelling: &str, arm: Node<'_>| {
-                env.bindings_named(spelling).iter().copied().find(|index| {
-                    let range = env.bindings[*index].range;
-                    range.start_byte == node.start_byte()
-                        && range.end_byte == node.end_byte()
-                        && (arm_local_binding(env, *index, arm)
-                            || (language == Language::Scala
-                                && scala_callable_binding(env, *index, arm)))
-                })
-            };
-            match (
-                binder_at(left, name, earlier),
-                binder_at(right, other_name, later),
-            ) {
-                (Some(a), Some(b)) => {
-                    if env.bindings[a].kind != env.bindings[b].kind
-                        || env.bindings[a].hoisting != env.bindings[b].hoisting
-                    {
-                        return BranchRelationVerdict::Open(
-                            BranchOpenReason::LexicalBindingUnavailable,
-                        );
-                    }
-                    // A shorthand pattern's spelling is also the property it
-                    // destructures.
-                    if left.kind() == "shorthand_property_identifier_pattern" && name != other_name
-                    {
-                        return BranchRelationVerdict::Distinct;
-                    }
-                    if renamed.insert(a, b).is_some_and(|prior| prior != b)
-                        || reverse_renamed.insert(b, a).is_some_and(|prior| prior != a)
-                    {
-                        return BranchRelationVerdict::Open(
-                            BranchOpenReason::LexicalBindingUnavailable,
-                        );
-                    }
-                    continue;
-                }
-                (Some(_), None) | (None, Some(_)) => {
-                    return BranchRelationVerdict::Open(
-                        BranchOpenReason::LexicalBindingUnavailable,
-                    );
-                }
-                (None, None) => {}
-            }
-        }
-        if matches!(left.kind(), "identifier" | "simple_identifier") {
-            let roles = identifier_role(left, budget).and_then(|left_role| {
-                identifier_role(right, budget).map(|right_role| (left_role, right_role))
-            });
-            let roles = match roles {
-                Ok(roles) => roles,
-                Err(reason) => return BranchRelationVerdict::Open(reason),
-            };
-            match roles {
-                // A declaration the environment does not place inside its arm.
-                (IdentifierRole::Binder, IdentifierRole::Binder) => {
-                    return BranchRelationVerdict::Open(
-                        BranchOpenReason::LexicalBindingUnavailable,
-                    );
-                }
-                (IdentifierRole::Value, IdentifierRole::Value) => reads.push((left, right)),
-                // A property, attribute, label or type name at matching
-                // positions is the same structured name.
-                (IdentifierRole::NonValue, IdentifierRole::NonValue) => {
-                    if name != other_name {
-                        return BranchRelationVerdict::Distinct;
-                    }
-                }
-                (IdentifierRole::NonValue, _) | (_, IdentifierRole::NonValue) => {
-                    return BranchRelationVerdict::Open(BranchOpenReason::NonLocalReference);
-                }
-                _ => return BranchRelationVerdict::Distinct,
-            }
-        } else if left.is_named() && name != other_name {
-            return BranchRelationVerdict::Distinct;
-        }
-    }
-    for (left, right) in reads {
-        if let Err(reason) = budget.step() {
-            return BranchRelationVerdict::Open(reason);
-        }
-        let (Some(name), Some(other_name)) = (
-            source.get(left.byte_range()),
-            source.get(right.byte_range()),
-        ) else {
-            return BranchRelationVerdict::Open(BranchOpenReason::SyntaxRecovery);
-        };
-        // A Ruby assignment target is its own binder: the environment starts
-        // that binding after the assignment, so a lookup at the target would
-        // find an earlier assignment's row or nothing.
-        let resolve = |node: Node<'_>, spelling: &str| {
-            let own = (language == Language::Ruby)
-                .then(|| {
-                    env.bindings_named(spelling).iter().copied().find(|index| {
-                        let range = env.bindings[*index].range;
-                        range.start_byte == node.start_byte() && range.end_byte == node.end_byte()
-                    })
-                })
-                .flatten();
-            match own {
-                Some(index) => BindingOfOutcome::Reached(index),
-                None => binding_of(env, spelling, node.start_byte(), Some(Namespace::Value)),
-            }
-        };
-        let (a, b) = match (resolve(left, name), resolve(right, other_name)) {
-            (BindingOfOutcome::Reached(a), BindingOfOutcome::Reached(b)) => (a, b),
-            (
-                BindingOfOutcome::Shadowed { winner: a, .. },
-                BindingOfOutcome::Shadowed { winner: b, .. },
-            ) => (a, b),
-            (BindingOfOutcome::Reached(a), BindingOfOutcome::Shadowed { winner: b, .. })
-            | (BindingOfOutcome::Shadowed { winner: a, .. }, BindingOfOutcome::Reached(b)) => {
-                (a, b)
-            }
-            // One unbound spelling in both arms is one global or member
-            // lookup from the same scope, unless a chain condition declares
-            // it with a binder the environment does not model.
-            (BindingOfOutcome::NoBinding, BindingOfOutcome::NoBinding) if name == other_name => {
-                if condition_binders.contains(&name) {
-                    return BranchRelationVerdict::Open(
-                        BranchOpenReason::LexicalBindingUnavailable,
-                    );
-                }
-                continue;
-            }
-            (BindingOfOutcome::NoBinding, BindingOfOutcome::NoBinding)
-                if members.collection_gap.is_some()
-                    || members
-                        .sites
-                        .contains_key(&(left.start_byte(), left.end_byte()))
-                    || members
-                        .sites
-                        .contains_key(&(right.start_byte(), right.end_byte())) =>
-            {
-                // Exact resolver targets may distinguish nonlocal operations,
-                // even when constants have equal values. Equal presentation
-                // CodeUnits can hide different canonical declarations, so they
-                // never establish a new equality proof. Distinction grants
-                // no stability privilege, including in conditions.
-                return match (members.target_at(left), members.target_at(right)) {
-                    (Ok(a), Ok(b)) if a != b => BranchRelationVerdict::Distinct,
-                    (Ok(_), Ok(_)) => {
-                        BranchRelationVerdict::Open(BranchOpenReason::NonLocalReference)
-                    }
-                    (Err(reason), _) | (_, Err(reason)) => BranchRelationVerdict::Open(reason),
-                };
-            }
-            (BindingOfOutcome::NoBinding, _) | (_, BindingOfOutcome::NoBinding) => {
-                return BranchRelationVerdict::Open(BranchOpenReason::NonLocalReference);
-            }
-            (BindingOfOutcome::Incomplete(_), _) | (_, BindingOfOutcome::Incomplete(_)) => {
-                return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
-            }
-        };
-        // A pattern binder that a chain condition declares, such as Java's
-        // flow-sensitive pattern variable, is in effect in some arms only and
-        // is not represented by the shared lexical environment. Rust's
-        // `if let` binders are represented with their exact consequence-body
-        // interval by the Rust adapter, so the Rust branch below can compare
-        // the pattern binding with an outer binding precisely.
-        let declared_by_condition = |index: usize| {
-            let range = env.bindings[index].range;
-            let within =
-                |start: usize, end: usize| start <= range.start_byte && range.end_byte <= end;
-            env.bindings[index].kind == BindingKind::PatternBinder
-                && within(owner.start_byte, owner.end_byte)
-                && !within(earlier.start_byte(), earlier.end_byte())
-                && !within(later.start_byte(), later.end_byte())
-        };
-        if language != Language::Rust && (declared_by_condition(a) || declared_by_condition(b)) {
-            return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
-        }
-        // Every assignment to a Ruby local is a binding row of its own, but
-        // all of them in one method are the same variable. In valid Go, two
-        // declarations of one name in one block are a `:=` redeclaration,
-        // which assigns the existing variable.
-        if matches!(language, Language::Ruby | Language::Go)
-            && name == other_name
-            && env.bindings[a].kind == BindingKind::Local
-            && env.bindings[b].kind == BindingKind::Local
-            && env.bindings[a].declaring_scope == env.bindings[b].declaring_scope
-        {
-            continue;
-        }
-        if let Some(mapped) = renamed.get(&a) {
-            if *mapped != b {
-                return BranchRelationVerdict::Distinct;
-            }
-            continue;
-        }
-        if reverse_renamed.contains_key(&b) {
-            return BranchRelationVerdict::Distinct;
-        }
-        if a != b && (arm_local_binding(env, a, earlier) || arm_local_binding(env, b, later)) {
-            return BranchRelationVerdict::Open(BranchOpenReason::LexicalBindingUnavailable);
-        }
-        if language == Language::Rust
-            && (env.bindings[a].kind == BindingKind::PatternBinder
-                || env.bindings[b].kind == BindingKind::PatternBinder)
-        {
-            if a == b && name == other_name {
-                continue;
-            }
-            return BranchRelationVerdict::Distinct;
-        }
-        if !ordinary_binding(env, a) || !ordinary_binding(env, b) {
-            if a == b && name == other_name {
-                continue;
-            }
-            return BranchRelationVerdict::Open(BranchOpenReason::NonLocalReference);
-        }
-        if a != b || name != other_name {
-            return BranchRelationVerdict::Distinct;
-        }
-    }
-    if deferred {
-        BranchRelationVerdict::Open(BranchOpenReason::DeferredBody)
-    } else {
-        BranchRelationVerdict::Proven
-    }
-}
-
 /// Whether a C or C++ binding's declaration makes its value stable between two
 /// condition tests: it is not `volatile`, and in C++ its declared type is a
 /// built-in type, so no overloaded operator can run.
@@ -1764,152 +1339,25 @@ fn rust_declared_boolean(
             .is_some_and(|value| value.kind() == "boolean_literal")
 }
 
-/// Whether `node` evaluates to its own source position, so two spellings of
-/// it at different positions are different values: Rust's `line!()` and
-/// `column!()`, PHP's case-insensitive `__LINE__` and Ruby's `__LINE__`.
-fn position_dependent(node: Node<'_>, language: Language, source: &str) -> bool {
-    match language {
-        Language::Php => {
-            return node.kind() == "name"
-                && source
-                    .get(node.byte_range())
-                    .is_some_and(|name| name.eq_ignore_ascii_case("__LINE__"));
-        }
-        // Ruby uses an identifier in expressions and a `line` token in patterns.
-        Language::Ruby => {
-            return node.kind() == "line"
-                || (node.kind() == "identifier"
-                    && source.get(node.byte_range()) == Some("__LINE__"));
-        }
-        // `__LINE__` and `__COUNTER__` are macros the preprocessor replaces
-        // with the line and a running count.
-        Language::Cpp => {
-            return node.kind() == "identifier"
-                && matches!(
-                    source.get(node.byte_range()),
-                    Some("__LINE__" | "__COUNTER__")
-                );
-        }
-        Language::Rust => {}
-        _ => return false,
-    }
-    if node.kind() != "macro_invocation" {
-        return false;
-    }
-    let Some(mut name) = node.child_by_field_name("macro") else {
-        return false;
-    };
-    if name.kind() == "scoped_identifier"
-        && let Some(last) = name.child_by_field_name("name")
-    {
-        name = last;
-    }
-    matches!(source.get(name.byte_range()), Some("line" | "column"))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum IdentifierRole {
-    Value,
-    Binder,
-    NonValue,
-}
-
-fn identifier_role(
-    node: Node<'_>,
-    budget: &mut BranchWorkBudget,
-) -> Result<IdentifierRole, BranchOpenReason> {
-    let Some(parent) = node.parent() else {
-        return Ok(IdentifierRole::NonValue);
-    };
-    if parent.child_count() > MAX_COMPARISON_TREE_NODES {
-        return Err(BranchOpenReason::ComparisonBudget);
-    }
-    let mut field = None;
-    let mut cursor = parent.walk();
-    if cursor.goto_first_child() {
-        loop {
-            budget.step()?;
-            if cursor.node() == node {
-                field = Some(cursor.field_name());
-                break;
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-    if matches!(
-        parent.kind(),
-        "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
-    ) {
-        return Ok(IdentifierRole::NonValue);
-    }
-    if parent.kind() == "method_invocation" && field.flatten() != Some("object") {
-        return Ok(IdentifierRole::NonValue);
-    }
-    // Kotlin spells no fields: a member follows `.` in a navigation suffix, a
-    // named argument's label precedes its `=`, and a local's name is the
-    // direct child of its variable declaration.
-    match parent.kind() {
-        "navigation_suffix" => return Ok(IdentifierRole::NonValue),
-        "value_argument" if node.next_sibling().is_some_and(|next| next.kind() == "=") => {
-            return Ok(IdentifierRole::NonValue);
-        }
-        "variable_declaration" => return Ok(IdentifierRole::Binder),
-        _ => {}
-    }
-    Ok(match field.flatten() {
-        Some("name") if parent.kind() == "variable_declarator" => IdentifierRole::Binder,
-        Some("name" | "property" | "field" | "attribute" | "key" | "type" | "label") => {
-            IdentifierRole::NonValue
-        }
-        _ => IdentifierRole::Value,
-    })
-}
-
-fn ordinary_binding(env: &EnvironmentFileResult, index: usize) -> bool {
-    matches!(
-        env.bindings[index].kind,
-        BindingKind::Local | BindingKind::Parameter
-    )
-}
-
-/// Whether a binding is declared inside `arm` and is in effect nowhere else:
-/// a block local, a catch or resource variable, a loop variable or a
-/// comprehension target. A Python assignment in an arm binds a function
-/// local, whose activation covers the whole function, so it is not arm-local.
-fn arm_local_binding(env: &EnvironmentFileResult, index: usize, arm: Node<'_>) -> bool {
-    let binding = &env.bindings[index];
-    matches!(
-        binding.kind,
-        BindingKind::Local
-            | BindingKind::PatternBinder
-            | BindingKind::LoopVariable
-            | BindingKind::CatchOrResource
-    ) && arm.start_byte() <= binding.activation.start_byte
-        && binding.activation.end_byte <= arm.end_byte()
-        && arm.start_byte() <= binding.range.start_byte
-        && binding.range.end_byte <= arm.end_byte()
-}
-
-/// Scala callable parameters are separate bindings in each branch, just like
-/// arm-local declarations. Their activation is wholly inside the arm even
-/// though the shared classifier reserves `arm_local_binding` for declarations
-/// introduced by the arm itself.
-fn scala_callable_binding(env: &EnvironmentFileResult, index: usize, arm: Node<'_>) -> bool {
-    let binding = &env.bindings[index];
-    matches!(binding.kind, BindingKind::Local | BindingKind::Parameter)
-        && arm.start_byte() <= binding.activation.start_byte
-        && binding.activation.end_byte <= arm.end_byte()
-        && arm.start_byte() <= binding.range.start_byte
-        && binding.range.end_byte <= arm.end_byte()
-}
-
 fn has_with_ancestor(node: Node<'_>) -> bool {
     brokk_bifrost_core::analyzer::structural::adapter_helpers::nearest_ancestor(node, |kind| {
         kind == "with_statement"
     })
     .is_some()
+}
+
+fn php_unsupported_lexical_ancestor(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "anonymous_class" {
+            return true;
+        }
+        if ancestor.kind() == "anonymous_function" && php_callable_has_by_ref_capture(ancestor) {
+            return true;
+        }
+        current = ancestor.parent();
+    }
+    false
 }
 
 fn stable_binding(env: &EnvironmentFileResult, index: usize) -> bool {
@@ -1935,47 +1383,6 @@ fn stable_binding(env: &EnvironmentFileResult, index: usize) -> bool {
     false
 }
 
-fn bounded_named_statements<'tree>(
-    node: Node<'tree>,
-    pending: usize,
-    budget: &mut BranchWorkBudget,
-) -> Result<Vec<Node<'tree>>, BranchOpenReason> {
-    Ok(bounded_non_extra_children(node, pending, budget)?
-        .into_iter()
-        .map(|(_, child)| child)
-        .filter(Node::is_named)
-        .collect())
-}
-
-/// Admit each inspected child before filtering or retaining it. A bounded
-/// temporary list keeps field names and source order for paired comparisons.
-fn bounded_non_extra_children<'tree>(
-    node: Node<'tree>,
-    pending: usize,
-    budget: &mut BranchWorkBudget,
-) -> Result<Vec<(Option<&'static str>, Node<'tree>)>, BranchOpenReason> {
-    if node.child_count() > MAX_COMPARISON_TREE_NODES
-        || pending + node.child_count() > MAX_COMPARISON_TREE_NODES
-    {
-        return Err(BranchOpenReason::ComparisonBudget);
-    }
-    let mut children = Vec::new();
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            budget.step()?;
-            let child = cursor.node();
-            if !child.is_extra() {
-                children.push((cursor.field_name(), child));
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-    Ok(children)
-}
-
 fn non_extra_children(node: Node<'_>) -> Vec<(Option<&str>, Node<'_>)> {
     (0..node.child_count())
         .filter_map(|index| {
@@ -1983,199 +1390,6 @@ fn non_extra_children(node: Node<'_>) -> Vec<(Option<&str>, Node<'_>)> {
             (!child.is_extra()).then(|| (node.field_name_for_child(index as u32), child))
         })
         .collect()
-}
-
-/// Whether a Java member selector at matching positions names the same member.
-/// Matching trees give the selectors the same receiver and arguments, so an
-/// equal spelling is the same lookup; two resolved targets can still show
-/// that the lookups differ.
-fn same_member(
-    left: Node<'_>,
-    right: Node<'_>,
-    source: &str,
-    members: &BranchReferenceProofs,
-) -> bool {
-    match (members.target_at(left), members.target_at(right)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => source.get(left.byte_range()) == source.get(right.byte_range()),
-    }
-}
-
-fn explicit_this_receiver(invocation: Node<'_>) -> bool {
-    invocation
-        .child_by_field_name("object")
-        .is_some_and(|object| object.kind() == "this")
-}
-
-/// A nested callable or local class creates a new closure or class per arm.
-/// Its captures and class identity are not modeled, so its equivalence stays
-/// open rather than inferred from matching syntax. PHP is the exception for
-/// by-value closures and arrows: its lexical environment gives each parameter,
-/// capture and local an exact binding, so their bodies can be compared.
-/// The kinds cover the Java, JavaScript, TypeScript and Python grammars; a
-/// Python decorated definition is covered by the definition it wraps.
-fn is_nested_callable(node: Node<'_>, language: Language) -> bool {
-    // A Ruby `block` is a closure; elsewhere a `block` is a statement block.
-    if language == Language::Ruby {
-        return node.is_named()
-            && matches!(
-                node.kind(),
-                "method"
-                    | "singleton_method"
-                    | "block"
-                    | "do_block"
-                    | "lambda"
-                    | "class"
-                    | "module"
-                    | "singleton_class"
-            );
-    }
-    node.is_named()
-        && matches!(
-            node.kind(),
-            // Java. `class_body` also covers an anonymous class.
-            "lambda_expression"
-                | "method_declaration"
-                | "constructor_declaration"
-                | "class_declaration"
-                | "record_declaration"
-                | "enum_declaration"
-                | "interface_declaration"
-                | "class_body"
-                // JavaScript and TypeScript.
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function"
-                | "generator_function_declaration"
-                | "arrow_function"
-                | "method_definition"
-                | "class"
-                | "abstract_class_declaration"
-                // Python.
-                | "function_definition"
-                | "lambda"
-                | "class_definition"
-                // Rust. An async block's body runs when it is awaited.
-                | "closure_expression"
-                | "function_item"
-                | "impl_item"
-                | "trait_item"
-                | "mod_item"
-                | "async_block"
-                // Go.
-                | "func_literal"
-                // C and C++, beyond the shared lambda and function kinds.
-                | "class_specifier"
-                | "struct_specifier"
-                | "union_specifier"
-                // C#, beyond the shared lambda and class-like kinds.
-                | "anonymous_method_expression"
-                | "local_function_statement"
-                | "struct_declaration"
-                | "record_struct_declaration"
-                // Kotlin, beyond the shared function, class and
-                // `anonymous_function` (PHP's closure kind too) kinds.
-                | "lambda_literal"
-                | "object_declaration"
-                | "object_literal"
-                | "companion_object"
-                // PHP, beyond the shared function, method, class, interface,
-                // enum and arrow-function kinds.
-                | "anonymous_function"
-                | "anonymous_class"
-                | "trait_declaration"
-                // Scala, beyond the shared `lambda_expression`,
-                // `function_definition` and `class_definition`. `new T { .. }`
-                // is an anonymous class.
-                | "object_definition"
-                | "trait_definition"
-                | "given_definition"
-                | "instance_expression"
-        )
-}
-
-/// Whether a Scala nested callable can be compared through the lexical
-/// environment. Lambdas and local `def`s have environment rows for their
-/// parameters and locals. An anonymous `new T { ... }` is an instance with a
-/// distinct class identity, so it remains deferred even when its body text
-/// matches. Deferred parameter and lazy-value shapes also retain uncertainty.
-fn scala_nested_callable_is_exact(
-    left: Node<'_>,
-    right: Node<'_>,
-    env: &EnvironmentFileResult,
-    budget: &mut BranchWorkBudget,
-) -> Result<bool, BranchOpenReason> {
-    if left.kind() != right.kind()
-        || !matches!(left.kind(), "lambda_expression" | "function_definition")
-        || !env.completeness.is_complete()
-    {
-        return Ok(false);
-    }
-    let mut stack = vec![left, right];
-    let mut visited = 0;
-    while let Some(node) = stack.pop() {
-        budget.visit(node, &mut visited, stack.len())?;
-        if node.has_error() || node.is_missing() {
-            return Ok(false);
-        }
-        if matches!(
-            node.kind(),
-            "by_name_type"
-                | "lazy_parameter_type"
-                | "repeated_parameter_type"
-                | "lazy_modifier"
-                | "lazy"
-        ) {
-            return Ok(false);
-        }
-        stack.extend(
-            bounded_non_extra_children(node, stack.len(), budget)?
-                .into_iter()
-                .map(|(_, child)| child),
-        );
-    }
-    Ok(true)
-}
-
-fn php_exact_nested_callable(left: Node<'_>, right: Node<'_>) -> bool {
-    if left.kind() != right.kind() {
-        return false;
-    }
-    match left.kind() {
-        "arrow_function" => true,
-        "anonymous_function" => {
-            !php_callable_has_by_ref_capture(left) && !php_callable_has_by_ref_capture(right)
-        }
-        _ => false,
-    }
-}
-
-fn php_callable_has_by_ref_capture(node: Node<'_>) -> bool {
-    if node.kind() != "anonymous_function" {
-        return false;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|child| child.kind() == "anonymous_function_use_clause")
-        .any(|use_clause| {
-            has_direct_token(use_clause, "by_ref")
-                || has_direct_token(use_clause, "reference_modifier")
-                || has_direct_token(use_clause, "&")
-        })
-}
-
-fn php_unsupported_lexical_ancestor(node: Node<'_>) -> bool {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if ancestor.kind() == "anonymous_class" {
-            return true;
-        }
-        if ancestor.kind() == "anonymous_function" && php_callable_has_by_ref_capture(ancestor) {
-            return true;
-        }
-        current = ancestor.parent();
-    }
-    false
 }
 
 /// The spellings that Java pattern variables in the chain's conditions
@@ -3262,7 +2476,7 @@ fn basic_condition_stability(
         }
         let children = match bounded_non_extra_children(node, stack.len(), budget) {
             Ok(children) => children,
-            Err(reason) => return BranchRelationVerdict::Open(reason),
+            Err(reason) => return BranchRelationVerdict::Open(reason.into()),
         };
         stack.extend(children.into_iter().map(|(_, child)| child));
     }
@@ -3530,6 +2744,100 @@ fn java_stable_binding(
 #[path = "branch_relations/js_ts_tests_support.rs"]
 pub mod js_ts_tests_support;
 
+impl From<IdentityOpenReason> for BranchOpenReason {
+    fn from(reason: IdentityOpenReason) -> Self {
+        match reason {
+            IdentityOpenReason::SyntaxRecovery => Self::SyntaxRecovery,
+            IdentityOpenReason::MissingField => Self::MissingBranchField,
+            IdentityOpenReason::LexicalBindingUnavailable => Self::LexicalBindingUnavailable,
+            IdentityOpenReason::NonLocalReference => Self::NonLocalReference,
+            IdentityOpenReason::ComparisonBudget => Self::ComparisonBudget,
+            IdentityOpenReason::MemberResolutionUnavailable => Self::MemberResolutionUnavailable,
+            IdentityOpenReason::AmbiguousMember => Self::AmbiguousMember,
+            IdentityOpenReason::DeferredBody => Self::DeferredBody,
+            IdentityOpenReason::UnprovenActivation => Self::UnprovenActivation,
+        }
+    }
+}
+
+impl From<IdentityVerdict> for BranchRelationVerdict {
+    fn from(verdict: IdentityVerdict) -> Self {
+        match verdict {
+            IdentityVerdict::Identical => Self::Proven,
+            IdentityVerdict::Distinct => Self::Distinct,
+            IdentityVerdict::Open(reason) => Self::Open(reason.into()),
+        }
+    }
+}
+
+impl IdentityBudget for BranchWorkBudget {
+    fn step(&mut self) -> Result<(), IdentityOpenReason> {
+        BranchWorkBudget::step(self).map_err(|_| IdentityOpenReason::ComparisonBudget)
+    }
+    fn visit(
+        &mut self,
+        node: Node<'_>,
+        visited: &mut usize,
+        pending: usize,
+    ) -> Result<(), IdentityOpenReason> {
+        BranchWorkBudget::visit(self, node, visited, pending)
+            .map_err(|_| IdentityOpenReason::ComparisonBudget)
+    }
+    fn charge_comparison(&mut self) -> Result<(), IdentityOpenReason> {
+        self.charge(BranchWork {
+            comparisons: 1,
+            ..BranchWork::default()
+        })
+        .map_err(|_| IdentityOpenReason::ComparisonBudget)
+    }
+    fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+}
+
+impl IdentityProofs for ReferenceProofs {
+    fn target_at(&self, node: Node<'_>) -> Result<&CodeUnit, IdentityOpenReason> {
+        ReferenceProofs::target_at(self, node).map_err(|reason| match reason {
+            BranchOpenReason::SyntaxRecovery => IdentityOpenReason::SyntaxRecovery,
+            BranchOpenReason::MissingBranchField => IdentityOpenReason::MissingField,
+            BranchOpenReason::LexicalBindingUnavailable => {
+                IdentityOpenReason::LexicalBindingUnavailable
+            }
+            BranchOpenReason::NonLocalReference => IdentityOpenReason::NonLocalReference,
+            BranchOpenReason::AmbiguousMember => IdentityOpenReason::AmbiguousMember,
+            BranchOpenReason::ComparisonBudget => IdentityOpenReason::ComparisonBudget,
+            BranchOpenReason::MemberResolutionUnavailable => {
+                IdentityOpenReason::MemberResolutionUnavailable
+            }
+            BranchOpenReason::DeferredBody => IdentityOpenReason::DeferredBody,
+            BranchOpenReason::UnprovenActivation => IdentityOpenReason::UnprovenActivation,
+            BranchOpenReason::EffectfulBody
+            | BranchOpenReason::EffectfulCondition
+            | BranchOpenReason::UnsupportedCondition => {
+                unreachable!("effect reason in member proof")
+            }
+        })
+    }
+    fn same_storage_field(&self, left: Node<'_>, right: Node<'_>) -> bool {
+        let key = |node: Node<'_>| (node.start_byte(), node.end_byte());
+        self.storage_fields
+            .get(&key(left))
+            .zip(self.storage_fields.get(&key(right)))
+            .is_some_and(|(a, b)| a == b)
+    }
+    fn has_storage_field(&self, node: Node<'_>) -> bool {
+        self.storage_fields
+            .contains_key(&(node.start_byte(), node.end_byte()))
+    }
+    fn has_collection_gap(&self) -> bool {
+        self.collection_gap.is_some()
+    }
+    fn has_site(&self, node: Node<'_>) -> bool {
+        self.sites
+            .contains_key(&(node.start_byte(), node.end_byte()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3568,6 +2876,9 @@ mod tests {
                     content_identity: identity,
                     node: None,
                     range: node_range(*name),
+                    logical_anchor: None,
+                    logical_index: index,
+                    syntax: None,
                     name: source[name.byte_range()].to_owned(),
                     kind: BindingKind::Local,
                     hoisting: HoistingClass::ScopeWide,
@@ -4050,7 +3361,7 @@ mod tests {
                     if steps < cost || pending + cost > MAX_COMPARISON_TREE_NODES {
                         assert_eq!(
                             answer.unwrap_err(),
-                            BranchOpenReason::ComparisonBudget,
+                            IdentityOpenReason::ComparisonBudget,
                             "{kind}, steps={steps}, pending={pending}"
                         );
                     } else {
@@ -4082,7 +3393,7 @@ mod tests {
         assert_eq!(arm.child_count(), MAX_COMPARISON_TREE_NODES + 1);
         assert_eq!(
             bounded_named_statements(arm, 0, &mut BranchWorkBudget::new()).unwrap_err(),
-            BranchOpenReason::ComparisonBudget
+            IdentityOpenReason::ComparisonBudget
         );
     }
 
@@ -4216,17 +3527,22 @@ mod tests {
             }
             assert_eq!(count, expected);
             let env = environment(&source, root, &[]);
-            let members = BranchReferenceProofs::default();
-            let chain = Chain {
+            let members = ReferenceProofs::default();
+            let chain = ComparisonContext {
                 language: Language::Python,
-                owner: node_range(root),
+                owner_region: node_range(root),
                 source: &source,
                 env: &env,
                 members: &members,
-                condition_binders: &[],
+                enclosing_binders: &[],
             };
             assert_eq!(
-                compare_trees(root, root, &chain, &mut BranchWorkBudget::new()),
+                BranchRelationVerdict::from(compare_trees(
+                    root,
+                    root,
+                    &chain,
+                    &mut BranchWorkBudget::new(),
+                )),
                 if count <= MAX_COMPARISON_TREE_NODES {
                     BranchRelationVerdict::Proven
                 } else {

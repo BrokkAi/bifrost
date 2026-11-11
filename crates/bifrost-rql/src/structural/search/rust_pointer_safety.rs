@@ -97,7 +97,7 @@ fn model_type_ref_owner(overlay: &SemanticModelOverlay, mut reference: &TypeRef)
                 reference = element;
             }
             TypeRef::Declared { id, .. } => {
-                let matched = overlay.symbols_with_id(id);
+                let matched = overlay.symbols_with_id_for(id, "rust");
                 if matched.disposition != SemanticModelOverlayDisposition::Unique {
                     return None;
                 }
@@ -121,7 +121,7 @@ fn unique_rust_nominal_type(
     identity: &str,
 ) -> Option<Arc<SemanticModelSymbol>> {
     let mut matches = overlay
-        .symbols_named(identity)
+        .symbols_named_for(identity, "rust")
         .records
         .into_iter()
         .filter(|symbol| {
@@ -763,7 +763,7 @@ fn stable_origin_id(
     digest.update(b"bifrost.rust.pointer_origin.v1\0");
     digest.update(brokk_bifrost_flow::flow_state::procedure_wire_id(procedure).as_bytes());
     digest.update((origin_index as u64).to_le_bytes());
-    format!("{:x}", digest.finalize())
+    brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest.finalize().into())
 }
 
 fn stable_finding_id(
@@ -784,5 +784,5 @@ fn stable_finding_id(
     if let Some(cause) = cause {
         digest.update(cause.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(&digest.finalize().into())
 }

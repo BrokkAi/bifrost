@@ -152,6 +152,18 @@ pub use crate::forward_relational_definition_batch;
 #[macro_export]
 macro_rules! forward_query_read_ledger {
     () => {
+        fn declaration_candidates_for_question(
+            &self,
+            file: &$crate::analyzer::ProjectFile,
+            question: &$crate::analyzer::read_ledger::LookupQuestion,
+        ) -> Option<Vec<$crate::analyzer::CodeUnit>> {
+            $crate::analyzer::IAnalyzer::declaration_candidates_for_question(
+                &self.inner,
+                file,
+                question,
+            )
+        }
+
         fn project_parse_variant_reader(
             &self,
         ) -> Option<$crate::analyzer::tree_sitter_analyzer::ProjectVariantReader> {
@@ -177,6 +189,10 @@ macro_rules! forward_query_read_ledger {
             $crate::analyzer::IAnalyzer::record_read(&self.inner, key);
         }
 
+        fn record_read_obligation(&self, key: &$crate::analyzer::read_ledger::ReadKey) {
+            $crate::analyzer::IAnalyzer::record_read_obligation(&self.inner, key);
+        }
+
         fn record_read_receipt(&self, keys: &std::sync::Arc<[$crate::analyzer::ReadKey]>) {
             $crate::analyzer::IAnalyzer::record_read_receipt(&self.inner, keys);
         }
@@ -191,12 +207,30 @@ macro_rules! forward_query_read_ledger {
         }
 
         #[track_caller]
+        fn refuse_read_reuse(&self) {
+            $crate::analyzer::IAnalyzer::refuse_read_reuse(&self.inner);
+        }
+
         fn mark_execution_dependent_reads(&self, count: usize) {
             $crate::analyzer::IAnalyzer::mark_execution_dependent_reads(&self.inner, count);
         }
 
+        fn mark_runtime_cache_touched(&self) {
+            $crate::analyzer::IAnalyzer::mark_runtime_cache_touched(&self.inner);
+        }
+
+        fn record_budget_dependences(&self, count: usize) {
+            $crate::analyzer::IAnalyzer::record_budget_dependences(&self.inner, count);
+        }
+
         fn records_query_reads(&self) -> bool {
             $crate::analyzer::IAnalyzer::records_query_reads(&self.inner)
+        }
+
+        fn selected_workspace_snapshots_for_reads(
+            &self,
+        ) -> Option<std::sync::Arc<$crate::analyzer::store::WorkspaceSnapshots>> {
+            $crate::analyzer::IAnalyzer::selected_workspace_snapshots_for_reads(&self.inner)
         }
 
         fn read_ledger_attached(&self) -> bool {
@@ -754,6 +788,33 @@ pub enum QueryReadIncomplete {
 }
 
 impl QueryReadIncomplete {
+    /// Registered reason label shared by query consumers.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::StructureUnavailable(_) => "structure_unavailable",
+            Self::SemanticEvidenceUnavailable(_) => "semantic_evidence_unavailable",
+            Self::ArtifactUnavailable(_) => "artifact_unavailable",
+            Self::SemanticEvidenceGap(_) => "semantic_evidence_gap",
+            Self::StoreFailure(_) => "store_failure",
+        }
+    }
+
+    /// Combine two reasons observed for one lookup. An execution-dependent
+    /// reason (cancellation, a store failure, or a provider failure) is not
+    /// hidden by an earlier stable content gap.
+    pub fn merge_optional(first: Option<Self>, second: Option<Self>) -> Option<Self> {
+        match (first, second) {
+            (Some(first), Some(second))
+                if !first.is_execution_dependent() && second.is_execution_dependent() =>
+            {
+                Some(second)
+            }
+            (Some(first), Some(_)) => Some(first),
+            (first, second) => first.or(second),
+        }
+    }
+
     /// Structural admission refusals and typed semantic gaps are properties of
     /// recorded inputs. Unclassified semantic failures remain conservative;
     /// typed producers use SemanticEvidenceGap only for deterministic gaps.
@@ -798,12 +859,63 @@ pub fn capture_read_execution_cause<T>(
     (value, cause)
 }
 
+/// Evaluate one independently reported answer, refusing its value if any read
+/// was incomplete. Reads remain in the enclosing receipt, while completion is
+/// consumed by this answer's caller. Execution failures still reach enclosing scopes.
+#[must_use = "An independently scoped answer must handle its read completion"]
+pub fn complete_independent_answer<T>(
+    analyzer: &dyn IAnalyzer,
+    run: impl FnOnce() -> T,
+) -> Result<Result<T, Vec<QueryReadIncomplete>>, StoreError> {
+    let scope = AnalyzerQueryScope::capturing_candidate_classification(analyzer);
+    let value = run();
+    if let Some(error) = scope.store_error() {
+        return Err(error);
+    }
+    let reasons = scope.captured_read_incompleteness();
+    Ok(if reasons.is_empty() {
+        Ok(value)
+    } else {
+        Err(reasons)
+    })
+}
+
 /// Owns analyzer caches shared by retained fills in one request.
 #[derive(Debug)]
 pub(crate) struct RequestCacheDomain {
     pub(crate) id: u64,
     registries:
         Mutex<Vec<std::sync::Weak<std::sync::RwLock<super::tree_sitter_analyzer::QueryReadCache>>>>,
+}
+
+#[derive(Default)]
+struct FillLocalMemos(Mutex<HashMap<std::any::TypeId, Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for FillLocalMemos {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FillLocalMemos")
+    }
+}
+
+/// A certificate stored here dies with the cold fill, even when later fills
+/// inherit its request cache domain.
+pub(crate) fn active_retained_fill_memo<T: Default + Send + Sync + 'static>() -> Option<Arc<T>> {
+    let context = current_query_contexts().find(|context| context.fill_local_memos.is_some())?;
+    let mut memos = context
+        .fill_local_memos
+        .as_ref()
+        .expect("retained fill memo exists")
+        .0
+        .lock()
+        .expect("retained fill memo poisoned");
+    let memo = memos
+        .entry(std::any::TypeId::of::<T>())
+        .or_insert_with(|| Arc::new(T::default()));
+    Some(
+        Arc::clone(memo)
+            .downcast::<T>()
+            .expect("fill memo type disagrees"),
+    )
 }
 impl RequestCacheDomain {
     pub(crate) fn register(
@@ -845,6 +957,86 @@ impl Drop for RequestCacheDomain {
     }
 }
 
+pub use brokk_bifrost_core::analyzer::outer_request::OuterRequest;
+
+thread_local! {
+    static PRODUCT_ENTRY_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a synchronous product dispatch on the current thread.
+pub struct ProductEntryGuard;
+
+pub fn enter_product_entry() -> ProductEntryGuard {
+    PRODUCT_ENTRY_DEPTH.with(|depth| {
+        depth.set(
+            depth
+                .get()
+                .checked_add(1)
+                .expect("product entry depth overflow"),
+        )
+    });
+    ProductEntryGuard
+}
+
+impl Drop for ProductEntryGuard {
+    fn drop(&mut self) {
+        PRODUCT_ENTRY_DEPTH.with(|depth| {
+            depth.set(
+                depth
+                    .get()
+                    .checked_sub(1)
+                    .expect("product entry depth underflow"),
+            )
+        });
+    }
+}
+
+/// Returns the scoped outer request; never creates a request.
+pub fn current_outer_request() -> Option<Arc<OuterRequest>> {
+    current_query_context().map(|context| Arc::clone(&context.outer_request))
+}
+
+/// Refuse reuse when a request row read cannot name certified selection inputs.
+/// Its process-local binding must never enter a receipt.
+pub fn refuse_request_row_read_reuse() {
+    let contexts: Vec<_> = current_query_contexts().collect();
+    for_each_unshadowed_active_ledger(&contexts, |ledger| ledger.refuse_read_reuse());
+}
+
+/// Record request-reader cancellation on every enclosing query context.
+pub fn record_request_row_read_cancelled() {
+    record_query_incomplete_on_current_contexts(QueryReadIncomplete::Cancelled);
+}
+
+/// Record a certified request-row selection on every active capture.
+pub fn record_request_row_selection_read(key: crate::analyzer::ReadKey) {
+    let contexts: Vec<_> = current_query_contexts().collect();
+    record_read_on_active_ledgers(&contexts, key);
+}
+
+pub fn current_query_cancellation() -> Option<CancellationToken> {
+    current_query_context_value(|context| context.cancellation().cloned())
+}
+
+/// A direct library read without a scope owns only this temporary request.
+pub fn current_outer_request_or_transient() -> Arc<OuterRequest> {
+    current_query_context()
+        .map(|context| Arc::clone(&context.outer_request))
+        .unwrap_or_else(|| {
+            debug_assert!(
+                PRODUCT_ENTRY_DEPTH.with(|depth| depth.get() == 0),
+                "product read escaped its outer request scope"
+            );
+            OuterRequest::new()
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryCompletionBoundary {
+    AdvisoryRead,
+    CandidateClassification,
+}
+
 /// Failure state and deadline for one top-level analyzer request.
 ///
 /// The analyzer trait intentionally retains best-effort collection-returning APIs, so persisted
@@ -864,6 +1056,7 @@ impl Drop for RequestCacheDomain {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct AnalyzerQueryContext {
+    outer_request: Arc<OuterRequest>,
     /// The scope whose request memos this scope may reuse. Transported with
     /// ReadAttribution, never inferred from the analyzer-wide registry.
     enclosing: Option<Arc<AnalyzerQueryContext>>,
@@ -871,16 +1064,12 @@ pub struct AnalyzerQueryContext {
     // request memos built under their caller's unrelated failures.
     request_cache_domain: Option<Arc<RequestCacheDomain>>,
     retained_fill_domain: Arc<std::sync::OnceLock<Arc<RequestCacheDomain>>>,
-    first_store_error: Mutex<Option<StoreError>>,
-    first_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
-    /// The first execution-dependent reason (cancellation, budget, transient
-    /// store or provider failure). Fills inherit only this class: a stable
-    /// content gap recorded earlier in the query says nothing about a fill's
-    /// own reads, which the fill's capture records itself (#8618).
-    first_execution_dependent_read_incomplete: Mutex<Option<QueryReadIncomplete>>,
-    /// Only file-cache builders capture every reason, so a stable first reason
-    /// cannot conceal a later transient failure when deciding cache admission.
-    captured_read_incompleteness: Option<Mutex<Vec<QueryReadIncomplete>>>,
+    fill_local_memos: Option<FillLocalMemos>,
+    completion: Mutex<QueryCompletion>,
+    completion_boundary: Option<QueryCompletionBoundary>,
+    /// Tripwire for receipt reads made while recomputing a taint Output unit.
+    taint_output_receipt_capture: bool,
+
     cancellation: Option<CancellationToken>,
     identifier_candidate_memo_owner: Option<std::thread::ThreadId>,
     /// A resolver overlay frozen by this scope's owner thread. The outer
@@ -911,6 +1100,66 @@ pub struct AnalyzerQueryContext {
     /// Explicit Broadcast uses this edge to narrow the analyzer-wide registry
     /// without exposing implementation reads to the linked caller.
     shadowed_read_ledger: Option<Arc<crate::analyzer::read_ledger::ReadLedger>>,
+    policy_unit_label: Option<Arc<str>>,
+}
+
+/// The sticky incompleteness of one request. Every slot moves under one lock,
+/// through `record_store_error` and `record`, so the slots cannot be observed
+/// half-updated.
+#[derive(Debug, Default)]
+struct QueryCompletion {
+    /// Kept apart from `first`: `completion` reports a later typed reason in
+    /// preference to an earlier bare store failure, and fills inherit the store
+    /// failure even when `first` holds a stable gap.
+    first_store_error: Option<StoreError>,
+    first: Option<QueryReadIncomplete>,
+    /// The first execution-dependent reason (cancellation, budget, transient
+    /// store or provider failure). Fills inherit only this class: a stable
+    /// content gap recorded earlier in the query says nothing about a fill's
+    /// own reads, which the fill's capture records itself (#8618).
+    first_execution_dependent: Option<QueryReadIncomplete>,
+    /// Only file-cache builders capture every reason, so a stable first reason
+    /// cannot conceal a later transient failure when deciding cache admission.
+    captured: Option<Vec<QueryReadIncomplete>>,
+}
+
+impl QueryCompletion {
+    fn capturing() -> Self {
+        Self {
+            captured: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    fn capture(&mut self, reason: &QueryReadIncomplete) {
+        if let Some(captured) = &mut self.captured
+            && !captured.contains(reason)
+        {
+            captured.push(reason.clone());
+        }
+    }
+
+    fn record_store_error(&mut self, error: StoreError) {
+        self.capture(&QueryReadIncomplete::StoreFailure(error.clone()));
+        self.first_store_error.get_or_insert(error);
+    }
+
+    fn record(&mut self, reason: QueryReadIncomplete) {
+        self.capture(&reason);
+        if reason.is_execution_dependent() {
+            self.first_execution_dependent
+                .get_or_insert_with(|| reason.clone());
+        }
+        self.first.get_or_insert(reason);
+    }
+
+    fn completion(&self) -> Result<(), QueryReadIncomplete> {
+        match (&self.first, &self.first_store_error) {
+            (Some(reason), _) => Err(reason.clone()),
+            (None, Some(error)) => Err(QueryReadIncomplete::StoreFailure(error.clone())),
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 impl AnalyzerQueryContext {
@@ -918,7 +1167,9 @@ impl AnalyzerQueryContext {
     pub fn root() -> Self {
         Self {
             enclosing: None,
+            outer_request: OuterRequest::new(),
             retained_fill_domain: Arc::default(),
+            fill_local_memos: None,
             request_cache_domain: None,
             ..Self::default()
         }
@@ -944,16 +1195,21 @@ impl AnalyzerQueryContext {
 impl Default for AnalyzerQueryContext {
     fn default() -> Self {
         Self {
+            outer_request: current_query_context()
+                .map(|context| Arc::clone(&context.outer_request))
+                .unwrap_or_else(OuterRequest::new),
             request_cache_domain: current_query_context()
                 .and_then(|c| c.request_cache_domain.clone()),
             retained_fill_domain: current_query_context()
                 .map(|context| context.retained_fill_domain.clone())
                 .unwrap_or_default(),
+            fill_local_memos: None,
             enclosing: current_query_context(),
-            first_store_error: Mutex::new(None),
-            first_read_incomplete: Mutex::new(None),
-            first_execution_dependent_read_incomplete: Mutex::new(None),
-            captured_read_incompleteness: None,
+            completion: Mutex::default(),
+            completion_boundary: None,
+            taint_output_receipt_capture: current_query_context()
+                .is_some_and(|context| context.taint_output_receipt_capture),
+
             cancellation: None,
             identifier_candidate_memo_owner: None,
             semantic_model_overlay_override: None,
@@ -961,6 +1217,7 @@ impl Default for AnalyzerQueryContext {
             tier_accesses: Default::default(),
             read_ledger: None,
             shadowed_read_ledger: None,
+            policy_unit_label: None,
         }
     }
 }
@@ -1065,8 +1322,9 @@ fn tier_access_count_from(
 /// crate-private and can evolve without coupling external analyzers to query
 /// execution internals.
 #[doc(hidden)]
-#[derive(Default)]
 pub struct AnalyzerSnapshotCaches {
+    retention_budget: brokk_bifrost_core::retention_budget::RetentionBudget,
+    derivations: Arc<crate::analyzer::derivation_host::AnalyzerDerivations>,
     derived_layers: Arc<crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache>,
     #[doc(hidden)]
     pub usage_graphs:
@@ -1078,24 +1336,50 @@ pub struct AnalyzerSnapshotCaches {
     runtime_syntax: OnceLock<crate::analyzer::semantic::workspace_oracle::RuntimeSyntaxCache>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl Default for AnalyzerSnapshotCaches {
+    fn default() -> Self {
+        Self::new(crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::DEFAULT_CONSTRUCTION_LIMIT_BYTES)
+    }
+}
+
 impl AnalyzerSnapshotCaches {
+    pub(crate) fn retention_budget(
+        &self,
+    ) -> &brokk_bifrost_core::retention_budget::RetentionBudget {
+        &self.retention_budget
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new(derived_layer_budget_bytes: u64) -> Self {
+        let budget = brokk_bifrost_core::retention_budget::RetentionBudget::new(
+            derived_layer_budget_bytes * 8,
+        );
+        Self::new_with_budget(derived_layer_budget_bytes, &budget)
+    }
+
+    pub(crate) fn new_with_budget(
+        derived_layer_budget_bytes: u64,
+        budget: &brokk_bifrost_core::retention_budget::RetentionBudget,
+    ) -> Self {
         Self {
+            retention_budget: budget.clone(),
+            derivations: Arc::new(crate::analyzer::derivation_host::AnalyzerDerivations::new(budget)),
             derived_layers: Arc::new(
                 crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::new(
-                    derived_layer_budget_bytes,
+                    derived_layer_budget_bytes, budget,
                 ),
             ),
             usage_graphs: Arc::new(crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
-                derived_layer_budget_bytes,
+                budget,
             )),
             java_usage_evidence: Arc::new(
                 crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache::new(
-                    derived_layer_budget_bytes,
+                    budget,
                 ),
             ),
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
-                derived_layer_budget_bytes,
+                budget,
             ),
             runtime_syntax: OnceLock::new(),
         }
@@ -1112,11 +1396,13 @@ impl AnalyzerSnapshotCaches {
     /// fresh, exactly as it was before this change.
     pub(crate) fn carry_content_keyed_values_forward(&self) -> Self {
         Self {
+            retention_budget: self.retention_budget.clone(),
+            derivations: Arc::clone(&self.derivations),
             derived_layers: Arc::clone(&self.derived_layers),
             usage_graphs: Arc::clone(&self.usage_graphs),
             java_usage_evidence: Arc::clone(&self.java_usage_evidence),
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
-                self.derived_layers.max_retained_bytes(),
+                &self.retention_budget,
             ),
             runtime_syntax: self.runtime_syntax.clone(),
         }
@@ -1126,6 +1412,10 @@ impl AnalyzerSnapshotCaches {
         &self,
     ) -> &crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache {
         &self.derived_layers
+    }
+
+    pub fn derivations(&self) -> &crate::analyzer::derivation_host::AnalyzerDerivations {
+        &self.derivations
     }
 
     #[doc(hidden)]
@@ -1153,11 +1443,68 @@ impl AnalyzerSnapshotCaches {
         &self.semantic_models
     }
 
+    pub(crate) fn install_carried_dependency_evidence(
+        &self,
+        evidence: Vec<(
+            crate::analyzer::Language,
+            Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>,
+        )>,
+        stale: Vec<crate::analyzer::DependencyPackEcosystem>,
+        old_request: Option<crate::analyzer::semantic_model::ActivationInputs>,
+        activated: Option<Vec<crate::analyzer::DependencyPackEcosystem>>,
+    ) {
+        self.semantic_models.install_carried_dependency_evidence(
+            evidence,
+            stale,
+            old_request,
+            activated,
+        );
+    }
+
+    pub(crate) fn carried_activation_request(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::SemanticModelActivationRequest> {
+        self.semantic_models.carried_activation_request()
+    }
+
+    pub(crate) fn carried_activation_inputs(
+        &self,
+    ) -> Option<crate::analyzer::semantic_model::ActivationInputs> {
+        self.semantic_models.carried_activation_inputs()
+    }
+
+    pub(crate) fn activated_dependency_ecosystems(
+        &self,
+    ) -> Option<Vec<crate::analyzer::DependencyPackEcosystem>> {
+        self.semantic_models.activated_dependency_ecosystems()
+    }
+
+    pub(crate) fn record_activated_dependency_ecosystems(
+        &self,
+        ecosystems: &[crate::analyzer::DependencyPackEcosystem],
+    ) {
+        self.semantic_models
+            .record_activated_dependency_ecosystems(ecosystems);
+    }
+
+    pub(crate) fn requires_whole_dependency_refresh(&self) -> bool {
+        self.semantic_models.requires_whole_dependency_refresh()
+    }
+
+    pub(crate) fn stale_dependency_ecosystems(
+        &self,
+    ) -> Vec<crate::analyzer::DependencyPackEcosystem> {
+        self.semantic_models.stale_dependency_ecosystems()
+    }
+
     pub(crate) fn runtime_syntax(
         &self,
     ) -> &crate::analyzer::semantic::workspace_oracle::RuntimeSyntaxCache {
-        self.runtime_syntax
-            .get_or_init(crate::analyzer::semantic::workspace_oracle::runtime_syntax_cache)
+        self.runtime_syntax.get_or_init(|| {
+            crate::analyzer::semantic::workspace_oracle::runtime_syntax_cache(
+                &self.retention_budget,
+            )
+        })
     }
 
     fn semantic_model_overlay(
@@ -1190,7 +1537,24 @@ impl AnalyzerSnapshotCaches {
             .invalidate_dependency_pack_state(languages)
     }
 
-    fn dependency_discovery_evidence(
+    pub(crate) fn store_captured_dependency_discovery(
+        &self,
+        ecosystem: crate::analyzer::DependencyPackEcosystem,
+        discovery: crate::analyzer::semantic_model::CapturedDependencyDiscovery,
+    ) {
+        self.semantic_models
+            .store_captured_dependency_discovery(ecosystem, discovery);
+    }
+
+    pub(crate) fn take_captured_dependency_discovery(
+        &self,
+        ecosystem: crate::analyzer::DependencyPackEcosystem,
+    ) -> Option<crate::analyzer::semantic_model::CapturedDependencyDiscovery> {
+        self.semantic_models
+            .take_captured_dependency_discovery(ecosystem)
+    }
+
+    pub(crate) fn dependency_discovery_evidence(
         &self,
         language: crate::analyzer::Language,
     ) -> Option<Arc<crate::analyzer::semantic_model::DependencyDiscoveryEvidence>> {
@@ -1432,6 +1796,14 @@ impl AnalyzerQueryContext {
         }
     }
 
+    /// Attributes `count` of the execution dependences marked on this request
+    /// to a refused budget charge.
+    pub fn record_budget_dependences(&self, count: usize) {
+        if let Some(ledger) = &self.read_ledger {
+            ledger.record_budget_dependences(count);
+        }
+    }
+
     /// Records one crossing of `tier`'s storage funnel under this request.
     pub fn record_tier_access(&self, tier: InformationTier) {
         record_tier_access_in(&self.tier_accesses, tier);
@@ -1460,21 +1832,17 @@ impl AnalyzerQueryContext {
             });
             ledger.mark_execution_dependent();
         }
-        self.capture_read_incomplete(QueryReadIncomplete::StoreFailure(error.clone()));
-        let mut slot = self
-            .first_store_error
-            .lock()
-            .expect("analyzer query error mutex poisoned");
-        if slot.is_none() {
-            *slot = Some(error);
-        }
+        self.lock_completion().record_store_error(error);
     }
 
     pub fn store_error(&self) -> Option<StoreError> {
-        self.first_store_error
+        self.lock_completion().first_store_error.clone()
+    }
+
+    fn lock_completion(&self) -> std::sync::MutexGuard<'_, QueryCompletion> {
+        self.completion
             .lock()
-            .expect("analyzer query error mutex poisoned")
-            .clone()
+            .expect("analyzer query completion mutex poisoned")
     }
 
     /// Records the first structured reason this request could not establish a
@@ -1493,48 +1861,13 @@ impl AnalyzerQueryContext {
             });
             ledger.mark_execution_dependent();
         }
-        self.capture_read_incomplete(reason.clone());
-        if reason.is_execution_dependent() {
-            let mut slot = self
-                .first_execution_dependent_read_incomplete
-                .lock()
-                .expect("analyzer query incompleteness mutex poisoned");
-            if slot.is_none() {
-                *slot = Some(reason.clone());
-            }
-        }
-        let mut slot = self
-            .first_read_incomplete
-            .lock()
-            .expect("analyzer query incompleteness mutex poisoned");
-        if slot.is_none() {
-            *slot = Some(reason);
-        }
-    }
-
-    fn capture_read_incomplete(&self, reason: QueryReadIncomplete) {
-        if let Some(captured) = &self.captured_read_incompleteness {
-            let mut reasons = captured.lock().expect("read incompleteness mutex poisoned");
-            if !reasons.contains(&reason) {
-                reasons.push(reason);
-            }
-        }
+        self.lock_completion().record(reason);
     }
 
     /// Returns the first typed read incompleteness, falling back to the first
     /// recorded store failure when no more specific reason was recorded.
     pub fn read_completion(&self) -> Result<(), QueryReadIncomplete> {
-        if let Some(reason) = self
-            .first_read_incomplete
-            .lock()
-            .expect("analyzer query incompleteness mutex poisoned")
-            .clone()
-        {
-            return Err(reason);
-        }
-        self.store_error().map_or(Ok(()), |error| {
-            Err(QueryReadIncomplete::StoreFailure(error))
-        })
+        self.lock_completion().completion()
     }
 }
 
@@ -1563,17 +1896,20 @@ pub(crate) fn inherit_query_incompleteness(context: &AnalyzerQueryContext) {
         // execution-dependent class can make a fill's own reads unreliable.
         // Request-domain memos must retain only complete builds or replay
         // their build's stable reasons on a hit: later fills do not inherit them.
-        let inherited = parent
-            .first_execution_dependent_read_incomplete
-            .lock()
-            .expect("analyzer query incompleteness mutex poisoned")
-            .clone();
+        // A stable first reason must not conceal a later transient store
+        // failure when a nested builder decides whether its value is reusable,
+        // so the store failure is inherited apart from the reason.
+        let (inherited, store_error) = {
+            let parent = parent.lock_completion();
+            (
+                parent.first_execution_dependent.clone(),
+                parent.first_store_error.clone(),
+            )
+        };
         if let Some(reason) = inherited {
             context.record_read_incomplete(reason);
         }
-        // A stable first reason must not conceal a later transient store
-        // failure when a nested builder decides whether its value is reusable.
-        if let Some(error) = parent.store_error() {
+        if let Some(error) = store_error {
             context.record_store_error(error);
         }
     }
@@ -1599,16 +1935,14 @@ fn current_query_contexts() -> impl Iterator<Item = Arc<AnalyzerQueryContext>> {
     std::iter::successors(current_query_context(), |context| context.enclosing.clone())
 }
 
-fn for_each_current_query_context(mut record: impl FnMut(&AnalyzerQueryContext)) {
-    for context in current_query_contexts() {
-        record(&context);
-    }
-}
-
 pub(crate) fn current_query_context_value<T>(
     mut select: impl FnMut(&AnalyzerQueryContext) -> Option<T>,
 ) -> Option<T> {
     current_query_contexts().find_map(|context| select(&context))
+}
+
+pub(crate) fn current_policy_unit_label() -> Option<String> {
+    current_query_context_value(|context| context.policy_unit_label.as_deref().map(str::to_owned))
 }
 
 /// A model override belongs only to analyzers that registered its scope.
@@ -1623,11 +1957,25 @@ pub(crate) fn registered_query_context_value<T>(
 }
 
 pub(crate) fn record_query_incomplete_on_current_contexts(reason: QueryReadIncomplete) {
-    for_each_current_query_context(|context| context.record_read_incomplete(reason.clone()));
+    for context in current_query_contexts() {
+        context.record_read_incomplete(reason.clone());
+        if context.completion_boundary == Some(QueryCompletionBoundary::AdvisoryRead)
+            || (context.completion_boundary
+                == Some(QueryCompletionBoundary::CandidateClassification)
+                && !reason.is_execution_dependent())
+        {
+            break;
+        }
+    }
 }
 
 pub(crate) fn record_store_error_on_current_contexts(error: StoreError) {
-    for_each_current_query_context(|context| context.record_store_error(error.clone()));
+    for context in current_query_contexts() {
+        context.record_store_error(error.clone());
+        if context.completion_boundary == Some(QueryCompletionBoundary::AdvisoryRead) {
+            break;
+        }
+    }
 }
 
 /// A shared failed build belongs only to its actual consumers. Preserve read
@@ -1636,6 +1984,9 @@ pub(crate) fn replay_query_read_receipt_on_current_contexts(
     keys: &Arc<[crate::analyzer::ReadKey]>,
     unattributed_reads: usize,
     execution_dependences: usize,
+    budget_dependences: usize,
+    reuse_refused: bool,
+    persistence_refusals: usize,
 ) {
     let contexts: Vec<_> = current_query_contexts().collect();
     if contexts.is_empty() {
@@ -1645,7 +1996,18 @@ pub(crate) fn replay_query_read_receipt_on_current_contexts(
         ledger.absorb_receipt(keys);
         ledger.record_unattributed_reads(unattributed_reads);
         ledger.mark_execution_dependent_reads(execution_dependences);
+        ledger.record_budget_dependences(budget_dependences);
+        if reuse_refused {
+            ledger.refuse_read_reuse();
+        }
+        ledger.record_persistence_refusals(persistence_refusals);
     });
+}
+
+/// Replay the transient runtime-cache marker retained by a shared query cell.
+pub(crate) fn record_runtime_cache_touch_on_current_contexts() {
+    let contexts: Vec<_> = current_query_contexts().collect();
+    for_each_unshadowed_active_ledger(&contexts, |ledger| ledger.mark_runtime_cache_touched());
 }
 
 /// Enumerate source identities independently of persisted parse-product readiness.
@@ -1685,10 +2047,42 @@ pub fn project_source_file_inventory(
     inventory
 }
 
-fn record_active_model_hash(analyzer: &(impl IAnalyzer + ?Sized), hash: &str) {
-    analyzer.record_read(crate::analyzer::read_ledger::ReadKey::Models(
-        crate::analyzer::semantic::ids::StableDigest::sha256(hash),
-    ));
+pub fn current_model_set_digest(
+    hash: Option<&str>,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    hash.map_or_else(no_active_model_set_digest, active_model_digest)
+}
+
+/// The digest a recorded model-set read can verify against at this head.
+///
+/// A request can pin its model snapshot and its overlay apart, and either one
+/// may carry the model set a compute read observed. The read verifies only
+/// while both name the same set, so an overlay or snapshot pinned without the
+/// other answers `None` and the receipt fails closed.
+pub fn current_model_set_read_digest(
+    analyzer: &dyn IAnalyzer,
+) -> Option<crate::analyzer::semantic::ids::StableDigest> {
+    let overlay = current_model_set_digest(
+        analyzer
+            .semantic_model_overlay()
+            .as_ref()
+            .map(|overlay| overlay.active_model_set_hash()),
+    );
+    let snapshot = current_model_set_digest(
+        analyzer
+            .active_semantic_model_snapshot()
+            .as_ref()
+            .map(|snapshot| snapshot.active_models().active_model_set_hash()),
+    );
+    (overlay == snapshot).then_some(overlay)
+}
+
+pub(crate) fn no_active_model_set_digest() -> crate::analyzer::semantic::ids::StableDigest {
+    crate::analyzer::semantic::ids::StableDigest::sha256(b"no-active-semantic-model-set")
+}
+
+pub(crate) fn active_model_digest(hash: &str) -> crate::analyzer::semantic::ids::StableDigest {
+    crate::analyzer::semantic::ids::StableDigest::sha256(hash)
 }
 
 fn active_query_model_or_snapshot<T>(
@@ -1727,6 +2121,16 @@ pub struct ReferenceNamesInFilesResult {
 }
 
 pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
+    fn certify_selected_configuration(
+        &self,
+        _language: crate::analyzer::Language,
+        _snapshot: &crate::analyzer::store::WorkspaceSnapshotId,
+        _input_identity: &[u8; 32],
+        _connection: &rusqlite::Connection,
+    ) -> crate::analyzer::store::resolution_operation::ConfigurationCertificate {
+        crate::analyzer::store::resolution_operation::ConfigurationCertificate::Uncertified
+    }
+
     #[doc(hidden)]
     fn project_parse_variant_reader(
         &self,
@@ -1784,12 +2188,15 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         workspace: &crate::analyzer::WorkspaceAnalyzer,
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<Arc<crate::analyzer::LoopCandidates>, QueryReadIncomplete> {
-        Ok(Arc::new(crate::analyzer::build_loop_candidates(
-            workspace,
-            procedure,
-            cancellation,
-        )))
+    ) -> Result<
+        Arc<brokk_bifrost_core::retention_budget::Accounted<crate::analyzer::LoopCandidates>>,
+        QueryReadIncomplete,
+    > {
+        Ok(Arc::new(
+            brokk_bifrost_core::retention_budget::Accounted::uncharged(
+                crate::analyzer::build_loop_candidates(workspace, procedure, cancellation),
+            ),
+        ))
     }
 
     /// Build statement assessments for one semantic procedure.
@@ -1798,14 +2205,20 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         workspace: &crate::analyzer::WorkspaceAnalyzer,
         procedure: &crate::analyzer::semantic::ProcedureHandle,
         cancellation: Option<&CancellationToken>,
-    ) -> Arc<crate::analyzer::semantic::StatementAssessments> {
-        Arc::new(
-            crate::analyzer::semantic::statement_entries::build_statement_assessments(
-                workspace,
-                procedure,
-                cancellation,
+    ) -> Arc<
+        brokk_bifrost_core::retention_budget::Accounted<
+            crate::analyzer::semantic::statement_entries::AccountedStatementAssessments,
+        >,
+    > {
+        Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+            crate::analyzer::semantic::statement_entries::AccountedStatementAssessments(
+                crate::analyzer::semantic::statement_entries::build_statement_assessments(
+                    workspace,
+                    procedure,
+                    cancellation,
+                ),
             ),
-        )
+        ))
     }
 
     /// Return query-lifetime, AST-owned C++ expression facts for one file.
@@ -1969,6 +2382,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     #[track_caller]
     fn record_unattributed_reads(&self, _count: usize) {}
 
+    #[track_caller]
+    fn refuse_read_reuse(&self) {}
+
     /// Owned capability for static relational frontier handles. Unsupported
     /// analyzers fail closed if a frontier is read under capture.
     fn relational_frontier_read_recorder(
@@ -1981,11 +2397,27 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// nested-capture attribution used by reads.
     #[track_caller]
     fn mark_execution_dependent(&self) {
+        let _census = brokk_bifrost_core::analyzer::execution_census::mark_scope(
+            std::panic::Location::caller(),
+            "analyzer",
+        );
         self.mark_execution_dependent_reads(1);
     }
 
     #[track_caller]
     fn mark_execution_dependent_reads(&self, _count: usize) {}
+
+    /// Attribute `count` of the execution dependences already marked to a
+    /// refused budget charge, through the same routing as
+    /// [`Self::mark_execution_dependent_reads`].
+    fn record_budget_dependences(&self, _count: usize) {}
+
+    /// Record transient runtime-cache eligibility evidence.
+    fn mark_runtime_cache_touched(&self) {
+        if let Some(ledger) = self.current_thread_read_ledger() {
+            ledger.mark_runtime_cache_touched();
+        }
+    }
 
     /// Whether read recording reaches the active attribution frame. Wrappers
     /// must forward this capability along with the recording operations; a
@@ -1994,6 +2426,15 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// when their recording operations reach the active consumers.
     fn records_query_reads(&self) -> bool {
         false
+    }
+
+    /// The exact selected revision used by a store-backed query-time read.
+    /// An analyzer without a selected relational snapshot cannot certify it.
+    #[doc(hidden)]
+    fn selected_workspace_snapshots_for_reads(
+        &self,
+    ) -> Option<Arc<crate::analyzer::store::WorkspaceSnapshots>> {
+        None
     }
 
     /// Whether any open request boundary carries a read ledger.
@@ -2120,7 +2561,29 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         Ok(())
     }
 
+    /// Complete parser candidates for a declaration-shaped question in one
+    /// selected file. None means the inventory cannot certify even absence.
+    #[doc(hidden)]
+    fn declaration_candidates_for_question(
+        &self,
+        file: &ProjectFile,
+        question: &crate::analyzer::read_ledger::LookupQuestion,
+    ) -> Option<Vec<CodeUnit>> {
+        self.is_analyzed(file).then(|| {
+            self.get_declarations(file)
+                .into_iter()
+                .filter(|unit| {
+                    crate::analyzer::read_ledger::declaration_question_matches(question, unit)
+                })
+                .collect()
+        })
+    }
+
     fn record_query_incomplete(&self, _reason: QueryReadIncomplete) {}
+
+    /// Apply language-specific obligations for a consumed read key, even when
+    /// no read ledger is attached to this request.
+    fn record_read_obligation(&self, _key: &crate::analyzer::ReadKey) {}
 
     /// Build the expensive lazily-initialized per-generation query indexes
     /// ahead of demand (#1442). Idempotent and safe to call from a background
@@ -2231,9 +2694,28 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
+    /// Re-index `changed_files`, certifying whole-workspace facts from
+    /// `listing` when the project keeps no listing cache.
+    ///
+    /// `listing` is the one workspace listing read the enclosing update already
+    /// took; it is never read again here. `None` means the caller took no
+    /// listing, and a project without a listing cache then cannot certify
+    /// whole-workspace facts on this update.
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self
     where
         Self: Sized;
+
+    /// Re-index `changed_files` for a caller that took no workspace listing.
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
+    where
+        Self: Sized,
+    {
+        self.update_with_listing(changed_files, None)
+    }
 
     fn update_all(&self) -> Self
     where
@@ -2523,10 +3005,14 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                 self.snapshot_caches()
                     .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
             });
-        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached())
-            && let Some(overlay) = overlay.as_ref()
-        {
-            record_active_model_hash(self, overlay.active_model_set_hash());
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
+                current_model_set_digest(
+                    overlay
+                        .as_ref()
+                        .map(|overlay| overlay.active_model_set_hash()),
+                ),
+            ));
         }
         overlay
     }
@@ -2541,10 +3027,14 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
                 self.snapshot_caches()
                     .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
             });
-        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached())
-            && let Some(snapshot) = snapshot.as_ref()
-        {
-            record_active_model_hash(self, snapshot.active_models().active_model_set_hash());
+        if crate::analyzer::read_attribution_records_reads(|| self.read_ledger_attached()) {
+            self.record_read(crate::analyzer::read_ledger::ReadKey::Models(
+                current_model_set_digest(
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.active_models().active_model_set_hash()),
+                ),
+            ));
         }
         snapshot
     }
@@ -2582,6 +3072,11 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     #[doc(hidden)]
     fn snapshot_caches(&self) -> Option<&AnalyzerSnapshotCaches> {
         None
+    }
+
+    fn derivations(&self) -> Option<&crate::analyzer::derivation_host::AnalyzerDerivations> {
+        self.snapshot_caches()
+            .map(AnalyzerSnapshotCaches::derivations)
     }
 
     /// The content identity of every language scope this analyzer serves
@@ -2638,6 +3133,20 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// [`crate::analyzer::CodeUnitIndex::languages`] must widen rather than
     /// conclude that the missing language changed nothing.
     #[doc(hidden)]
+    fn external_selection_authorities(
+        &self,
+    ) -> Vec<&dyn brokk_bifrost_core::analyzer::external_selection::ExternalSelectionAuthority>
+    {
+        Vec::new()
+    }
+
+    fn request_row_reader_source(
+        &self,
+        _catalog: &crate::analyzer::semantic_model::catalog::PinnedCatalogSource,
+    ) -> Option<Arc<dyn crate::analyzer::store::model_catalog::RequestRowReaderSource>> {
+        None
+    }
+
     fn workspace_fact_indexes(
         &self,
     ) -> Vec<&dyn crate::analyzer::read_verification::WorkspaceFactIndex> {
@@ -2976,7 +3485,30 @@ pub fn reset_test_hook_counter(counter: &AtomicUsize) {
 /// hook carried on `IAnalyzer`, so an implementor that instruments nothing
 /// inherits [`NoOpAnalyzerTestHooks`] and behaves exactly as before.
 #[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperandProbeTestAction {
+    Cancel,
+    IncompleteEmpty,
+}
+
+#[cfg(any(test, feature = "test-support"))]
 pub trait AnalyzerTestHooks {
+    /// Arm one probe-only fault at the next operand-0 evaluation.
+    #[doc(hidden)]
+    fn arm_operand_probe_action_for_test(&self, _action: OperandProbeTestAction) {}
+
+    #[doc(hidden)]
+    fn take_operand_probe_action_for_test(&self) -> Option<OperandProbeTestAction> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn record_empty_operand_probe_shortcut_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn empty_operand_probe_shortcut_count_for_test(&self) -> usize {
+        0
+    }
     #[doc(hidden)]
     fn reset_definition_candidates_query_count_for_test(&self) {}
 
@@ -3237,6 +3769,15 @@ impl carried_context::ExecutionAttribution for AttributionFrame {
             }
         }
     }
+
+    #[track_caller]
+    fn mark_budget_refusal(&self) {
+        if let Self::Ledgers(ledgers) = self {
+            for (ledger, _) in ledgers {
+                ledger.mark_budget_dependent();
+            }
+        }
+    }
 }
 
 static READ_ATTRIBUTION_FALLBACKS: std::sync::atomic::AtomicU64 =
@@ -3268,6 +3809,17 @@ impl ReadAttribution {
         });
         Self {
             frame,
+            request_state: carried_context::request_state::<AnalyzerRequestState>(),
+        }
+    }
+
+    /// Verify a previously captured receipt against current state without
+    /// recording the verifier's own reads. A Current verdict must replay the
+    /// verified receipt into the enclosing capture; any other verdict must
+    /// recompute the body.
+    pub fn for_receipt_verification() -> Self {
+        Self {
+            frame: AttributionFrame::Ledgers(Vec::new()),
             request_state: carried_context::request_state::<AnalyzerRequestState>(),
         }
     }
@@ -3428,11 +3980,16 @@ pub struct AnalyzerQueryScope<'a> {
     context: Arc<AnalyzerQueryContext>,
     attribution: Option<ReadAttributionGuard>,
     _request_state: Option<carried_context::RequestStateGuard>,
+    owns_outer_request: bool,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct IncompatibleSelectedModelSnapshot;
 
 impl<'a> AnalyzerQueryScope<'a> {
     fn with_context(analyzer: &'a dyn IAnalyzer, context: AnalyzerQueryContext) -> Self {
         let request_state = path_module_request_state();
+        let owns_outer_request = context.enclosing.is_none();
         let context = Arc::new(context);
         let attribution = Some(query_attribution(&context));
         analyzer.begin_query(&context);
@@ -3441,7 +3998,44 @@ impl<'a> AnalyzerQueryScope<'a> {
             context,
             attribution,
             _request_state: request_state,
+            owns_outer_request,
         }
+    }
+
+    /// Start a policy run in its existing selected-model scope with a fresh request.
+    #[doc(hidden)]
+    pub fn with_new_outer_request_and_active_semantic_model_snapshot(
+        analyzer: &'a dyn IAnalyzer,
+        snapshot: Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        let context = AnalyzerQueryContext::with_active_semantic_model_snapshot(snapshot);
+        let mut scope = Self::with_context(
+            analyzer,
+            AnalyzerQueryContext {
+                outer_request: OuterRequest::new(),
+                ..context
+            },
+        );
+        scope.owns_outer_request = true;
+        scope
+    }
+
+    /// Attach a policy worker to the enclosing run's request on this thread.
+    #[doc(hidden)]
+    pub fn with_outer_request(analyzer: &'a dyn IAnalyzer, request: Arc<OuterRequest>) -> Self {
+        let mut scope = Self::with_context(
+            analyzer,
+            AnalyzerQueryContext {
+                outer_request: request,
+                ..Default::default()
+            },
+        );
+        scope.owns_outer_request = false;
+        scope
+    }
+
+    pub fn outer_request(&self) -> Arc<OuterRequest> {
+        Arc::clone(&self.context.outer_request)
     }
 
     /// Retained fills share request memos isolated from the ordinary request domain.
@@ -3449,6 +4043,7 @@ impl<'a> AnalyzerQueryScope<'a> {
     pub fn for_retained_fill(analyzer: &'a dyn IAnalyzer) -> Self {
         static NEXT_DOMAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut context = AnalyzerQueryContext::default();
+        context.fill_local_memos = Some(FillLocalMemos::default());
         context.request_cache_domain = Some(
             context
                 .retained_fill_domain
@@ -3476,22 +4071,83 @@ impl<'a> AnalyzerQueryScope<'a> {
         Self::with_context(
             analyzer,
             AnalyzerQueryContext {
-                captured_read_incompleteness: Some(Mutex::new(Vec::new())),
+                completion: Mutex::new(QueryCompletion::capturing()),
                 ..Default::default()
             },
         )
     }
 
+    /// Internal cross-crate seam for inspecting an optional relation while retaining
+    /// its reads in the enclosing receipt. Do not use for ordinary query work.
+    /// A failed inspection makes the probe undecided, not the enclosing query incomplete.
+    #[doc(hidden)]
+    pub fn for_advisory_read(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext {
+                completion: Mutex::new(QueryCompletion::capturing()),
+                completion_boundary: Some(QueryCompletionBoundary::AdvisoryRead),
+
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Capture completion for one independently reported answer or policy
+    /// selector candidate (#10985, #11089).
+    /// Stable content gaps stop here. Execution failures and store errors still
+    /// reach the selector. This boundary never shadows read-ledger channels:
+    /// reads, unattributed crossings and reuse refusals remain dependencies of
+    /// the enclosing selector. Receipt replay records completion in this active
+    /// candidate, rather than retaining the identity of its original consumer.
+    /// Policy selector classification and independently scoped answers may open
+    /// this boundary; provider products must not be computed under it without
+    /// reviewing their identity.
+    #[doc(hidden)]
+    pub fn capturing_candidate_classification(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext {
+                completion: Mutex::new(QueryCompletion::capturing()),
+                completion_boundary: Some(QueryCompletionBoundary::CandidateClassification),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Mark the read capture for a taint Output unit and its nested queries.
+    #[doc(hidden)]
+    pub fn capturing_taint_output_receipt(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self::with_context(
+            analyzer,
+            AnalyzerQueryContext {
+                completion: Mutex::new(QueryCompletion::capturing()),
+                taint_output_receipt_capture: true,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn is_taint_output_receipt_capture_active() -> bool {
+        current_query_context().is_some_and(|context| context.taint_output_receipt_capture)
+    }
+
     /// Reasons observed by a scope opened with `capturing_read_incompleteness`.
     #[doc(hidden)]
+    pub fn runtime_cache_touched(&self) -> bool {
+        self.context
+            .read_ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.runtime_cache_touched())
+    }
+
     pub fn captured_read_incompleteness(&self) -> Vec<QueryReadIncomplete> {
         self.context
-            .captured_read_incompleteness
-            .as_ref()
-            .expect("only a capturing scope can enumerate read incompleteness")
-            .lock()
-            .expect("read incompleteness mutex poisoned")
+            .lock_completion()
+            .captured
             .clone()
+            .expect("only a capturing scope can enumerate read incompleteness")
     }
 
     /// Open a request boundary that memoizes identifier candidate results
@@ -3544,6 +4200,52 @@ impl<'a> AnalyzerQueryScope<'a> {
         )
     }
 
+    /// Pin a selected point answer to the current publication without recording a read.
+    /// An incompatible outer overlay is a stale request, not permission to replace it.
+    pub fn pin_selected_model_snapshot(
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Result<Option<Self>, IncompatibleSelectedModelSnapshot> {
+        if analyzer.active_query_semantic_model_snapshot().is_some() {
+            return Ok(None);
+        }
+        let snapshot = analyzer
+            .snapshot_caches()
+            .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot);
+        Self::with_compatible_selected_model_snapshot(analyzer, snapshot)
+    }
+
+    pub fn with_compatible_selected_model_snapshot(
+        analyzer: &'a dyn IAnalyzer,
+        snapshot: Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+    ) -> Result<Option<Self>, IncompatibleSelectedModelSnapshot> {
+        if let Some(outer) = analyzer.active_query_semantic_model_snapshot() {
+            let compatible = match (outer.as_ref(), snapshot.as_ref()) {
+                (None, None) => true,
+                (Some(outer), Some(snapshot)) => Arc::ptr_eq(outer, snapshot),
+                _ => false,
+            };
+            return compatible
+                .then_some(None)
+                .ok_or(IncompatibleSelectedModelSnapshot);
+        }
+        if let Some(outer) = analyzer.active_query_semantic_model_overlay() {
+            let selected = snapshot
+                .as_ref()
+                .and_then(|value| value.semantic_model_overlay());
+            let compatible = match (outer.as_ref(), selected) {
+                (None, None) => true,
+                (Some(outer), Some(selected)) => Arc::ptr_eq(outer, selected),
+                _ => false,
+            };
+            if !compatible {
+                return Err(IncompatibleSelectedModelSnapshot);
+            }
+        }
+        Ok(Some(Self::with_active_semantic_model_snapshot(
+            analyzer, snapshot,
+        )))
+    }
+
     /// Open a request boundary that records every input it reads into
     /// `ledger`.
     ///
@@ -3557,6 +4259,17 @@ impl<'a> AnalyzerQueryScope<'a> {
         ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
     ) -> Self {
         Self::with_context(analyzer, AnalyzerQueryContext::with_read_ledger(ledger))
+    }
+
+    /// The policy unit label is diagnostic context for query-local timing notes.
+    pub fn with_policy_unit_read_ledger(
+        analyzer: &'a dyn IAnalyzer,
+        ledger: Arc<crate::analyzer::read_ledger::ReadLedger>,
+        label: String,
+    ) -> Self {
+        let mut context = AnalyzerQueryContext::with_read_ledger(ledger);
+        context.policy_unit_label = Some(label.into());
+        Self::with_context(analyzer, context)
     }
 
     pub(crate) fn with_nested_read_ledger(
@@ -3606,6 +4319,9 @@ impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
         drop(self.attribution.take());
         self.analyzer.end_query(&self.context);
+        if self.owns_outer_request {
+            self.context.outer_request.close();
+        }
     }
 }
 
@@ -3681,9 +4397,20 @@ pub fn capture_nested_reads<T>(
         return (read(), Vec::new());
     };
     let (result, captured) = capture_with_read_ledger_scope(analyzer, Some(&enclosing), read);
-    let _refusal =
-        brokk_bifrost_core::profiling::read_refusal_scope(captured.first_execution_refusal());
+    let _refusal = brokk_bifrost_core::profiling::read_refusal_scope(if captured.reuse_refused() {
+        captured.first_refusal()
+    } else {
+        captured.first_execution_refusal()
+    });
     enclosing.mark_execution_dependent_reads(captured.execution_dependences());
+    enclosing.record_budget_dependences(captured.budget_dependences());
+    if captured.runtime_cache_touched() {
+        enclosing.mark_runtime_cache_touched();
+    }
+    if captured.reuse_refused() {
+        enclosing.refuse_read_reuse();
+    }
+    enclosing.record_persistence_refusals(captured.persistence_refusals());
     (result, captured.unordered_keys())
 }
 
@@ -3698,11 +4425,13 @@ pub(super) fn capture_with_read_ledger_scope<T>(
             // capture_with_read_registration installed this context before
             // invoking us. Do not install its ledger a second time.
             analyzer.begin_query(&context);
+            let owns_outer_request = context.enclosing.is_none();
             AnalyzerQueryScope {
                 analyzer,
                 context,
                 attribution: None,
                 _request_state: path_module_request_state(),
+                owns_outer_request,
             }
         },
         query,
@@ -3737,13 +4466,11 @@ pub fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::Rea
     let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
         reads.first_execution_refusal(),
     );
+    if reads.runtime_cache_touched() {
+        analyzer.mark_runtime_cache_touched();
+    }
     analyzer.record_read_capture(reads);
-    replay_query_read_receipt(
-        analyzer,
-        [],
-        reads.unattributed_reads(),
-        reads.execution_dependences(),
-    );
+    replay_query_read_receipt(analyzer, [], reads.channels());
 }
 
 /// Replay an immutable memo receipt without reinserting its keys per consumer.
@@ -3751,58 +4478,94 @@ pub fn replay_query_reads(analyzer: &dyn IAnalyzer, reads: &crate::analyzer::Rea
 pub fn replay_shared_query_read_receipt(
     analyzer: &dyn IAnalyzer,
     keys: &Arc<[crate::analyzer::ReadKey]>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
 ) {
     analyzer.record_read_receipt(keys);
-    replay_query_read_receipt(analyzer, [], unattributed_reads, execution_dependences);
+    replay_query_read_receipt(analyzer, [], channels);
 }
 
-/// Replay an owned snapshot of a query's named and unattributed reads.
-/// Named keys are sets in each ledger; unattributed crossings are counts and
+/// Replay an owned snapshot of a query's named reads and refusal channels.
+/// Named keys are sets in each ledger; refusal crossings are counts and
 /// must be replayed only for a consumer, never again after its own capture.
 #[doc(hidden)]
 pub fn replay_query_read_keys(
     analyzer: &dyn IAnalyzer,
     keys: impl IntoIterator<Item = crate::analyzer::ReadKey>,
     unattributed_reads: usize,
+    persistence_refusals: usize,
 ) {
-    replay_query_read_receipt(analyzer, keys, unattributed_reads, 0);
+    replay_query_read_receipt(
+        analyzer,
+        keys,
+        brokk_bifrost_core::analyzer::memo_attribution::ReadChannels {
+            unattributed_reads,
+            persistence_refusals,
+            ..Default::default()
+        },
+    );
 }
 
 /// Replay all three dependency channels from an owned receipt.
 pub fn replay_query_read_receipt(
     analyzer: &dyn IAnalyzer,
     keys: impl IntoIterator<Item = crate::analyzer::ReadKey>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
 ) {
     replay_read_channels(
         keys,
-        unattributed_reads,
-        execution_dependences,
+        channels,
         |key| analyzer.record_read(key),
         |count| analyzer.record_unattributed_reads(count),
         |count| analyzer.mark_execution_dependent_reads(count),
+        |count| analyzer.record_budget_dependences(count),
+        || analyzer.refuse_read_reuse(),
+        |count| record_persistence_refusals(analyzer, count),
     );
 }
 
+/// Record a persistence refusal on every unshadowed consumer of this read.
+pub fn record_persistence_refusals(analyzer: &dyn IAnalyzer, count: usize) {
+    if count == 0 || !read_attribution_records_reads(|| analyzer.read_ledger_attached()) {
+        return;
+    }
+    let contexts = if has_read_attribution_ledgers() {
+        Vec::new()
+    } else {
+        analyzer.read_ledger_contexts()
+    };
+    for_each_unshadowed_active_ledger(&contexts, |ledger| {
+        ledger.record_persistence_refusals(count)
+    });
+}
+
+#[allow(clippy::too_many_arguments)] // One sink per read channel; callers pass their own ledger's recorders.
 pub(super) fn replay_read_channels(
     keys: impl IntoIterator<Item = crate::analyzer::ReadKey>,
-    unattributed_reads: usize,
-    execution_dependences: usize,
+    channels: brokk_bifrost_core::analyzer::memo_attribution::ReadChannels,
     mut record: impl FnMut(crate::analyzer::ReadKey),
     mut unattributed: impl FnMut(usize),
     mut execution_dependent: impl FnMut(usize),
+    mut budget_dependent: impl FnMut(usize),
+    mut refuse: impl FnMut(),
+    mut refuse_persistence: impl FnMut(usize),
 ) {
     for key in keys {
         record(key);
     }
-    if unattributed_reads > 0 {
-        unattributed(unattributed_reads);
+    if channels.unattributed_reads > 0 {
+        unattributed(channels.unattributed_reads);
     }
-    if execution_dependences > 0 {
-        execution_dependent(execution_dependences);
+    if channels.execution_dependences > 0 {
+        execution_dependent(channels.execution_dependences);
+    }
+    if channels.budget_dependences > 0 {
+        budget_dependent(channels.budget_dependences);
+    }
+    if channels.reuse_refused {
+        refuse();
+    }
+    if channels.persistence_refusals > 0 {
+        refuse_persistence(channels.persistence_refusals);
     }
 }
 
@@ -3833,6 +4596,18 @@ pub fn capture_query_reads<T>(
     (result, captured)
 }
 
+/// Capture one partition of a larger query without forwarding it into the
+/// immediate enclosing capture. The caller must replay the returned receipt
+/// into the whole-query ledger after its shared capture has closed.
+#[doc(hidden)]
+pub fn capture_query_reads_deferred<T>(
+    analyzer: &dyn IAnalyzer,
+    query: impl FnOnce() -> T,
+) -> (T, Arc<crate::analyzer::read_ledger::ReadLedger>) {
+    let enclosing = analyzer.current_thread_read_ledger();
+    capture_with_read_ledger_scope(analyzer, enclosing.as_ref(), query)
+}
+
 /// Read dependencies and incomplete reasons produced by one query-local read.
 #[doc(hidden)]
 pub struct QueryReadReceipt {
@@ -3851,12 +4626,34 @@ impl QueryReadReceipt {
         (result, Self { reads, incomplete })
     }
 
+    /// Capture one component without publishing its reads or incompleteness.
+    /// The consumer replays only components that decide its answer.
+    pub fn capture_deferred<T>(analyzer: &dyn IAnalyzer, read: impl FnOnce() -> T) -> (T, Self) {
+        let ((result, incomplete), reads) = capture_query_reads_deferred(analyzer, || {
+            let scope = AnalyzerQueryScope::for_advisory_read(analyzer);
+            let result = read();
+            (result, scope.captured_read_incompleteness())
+        });
+        (result, Self { reads, incomplete })
+    }
+
     /// Replay the captured read keys and incomplete reasons into the current query.
     pub fn replay(&self, analyzer: &dyn IAnalyzer) {
         replay_query_reads(analyzer, &self.reads);
         for reason in &self.incomplete {
             analyzer.record_query_incomplete(reason.clone());
         }
+    }
+
+    /// Every captured completion reason, in first-observed order. Setup
+    /// consumers must inspect the whole receipt, including zero-row batches.
+    pub fn incomplete_reasons(&self) -> &[QueryReadIncomplete] {
+        &self.incomplete
+    }
+
+    /// Content identity of the admission inputs, independent of capture order.
+    pub fn digest(&self) -> crate::analyzer::read_ledger::ReadSetDigest {
+        self.reads.digest()
     }
 }
 
@@ -3893,7 +4690,7 @@ pub fn capture_subsumed_query_reads<T>(
     query: impl FnOnce() -> T,
 ) -> (T, usize) {
     let (result, reads) = capture_subsumed_query_read_receipt(analyzer, query);
-    (result, reads.unattributed_reads)
+    (result, reads.channels.unattributed_reads)
 }
 
 /// Retain the unsubsumable channels for an authority that can be read again.
@@ -3907,13 +4704,16 @@ pub fn capture_subsumed_query_read_receipt<T>(
     let enclosing = analyzer.current_thread_read_ledger();
     let (result, captured) = capture_with_read_ledger_scope(analyzer, enclosing.as_ref(), query);
     let reads = brokk_bifrost_core::analyzer::memo_attribution::CapturedMemoReads {
+        runtime_cache_touched: captured.runtime_cache_touched(),
         keys: Arc::from([]),
-        unattributed_reads: captured.unattributed_reads(),
-        execution_dependences: captured.execution_dependences(),
+        channels: captured.channels(),
         first_refusal: captured.first_refusal(),
         first_execution_refusal: captured.first_execution_refusal(),
     };
     if let Some(enclosing) = enclosing {
+        if reads.runtime_cache_touched {
+            enclosing.mark_runtime_cache_touched();
+        }
         let _refusal =
             brokk_bifrost_core::profiling::read_refusal_scope(reads.first_refusal.clone());
         let _execution_refusal = brokk_bifrost_core::profiling::read_execution_refusal_scope(
@@ -3921,11 +4721,13 @@ pub fn capture_subsumed_query_read_receipt<T>(
         );
         replay_read_channels(
             [],
-            reads.unattributed_reads,
-            reads.execution_dependences,
+            reads.channels,
             |key| enclosing.record(key),
             |count| enclosing.record_unattributed_reads(count),
             |count| enclosing.mark_execution_dependent_reads(count),
+            |count| enclosing.record_budget_dependences(count),
+            || enclosing.refuse_read_reuse(),
+            |count| enclosing.record_persistence_refusals(count),
         );
     }
     (result, reads)
@@ -3942,6 +4744,14 @@ pub(crate) fn forward_captured_query_reads(
     enclosing.absorb_capture(captured);
     enclosing.record_unattributed_reads(captured.unattributed_reads());
     enclosing.mark_execution_dependent_reads(captured.execution_dependences());
+    enclosing.record_budget_dependences(captured.budget_dependences());
+    if captured.runtime_cache_touched() {
+        enclosing.mark_runtime_cache_touched();
+    }
+    if captured.reuse_refused() {
+        enclosing.refuse_read_reuse();
+    }
+    enclosing.record_persistence_refusals(captured.persistence_refusals());
 }
 
 /// Record one funnel key through the current attribution frame. Broadcast
@@ -3953,6 +4763,12 @@ pub(crate) fn record_read_on_active_ledgers(
     note_read_attribution_fallback(contexts, 1);
     let mut hash = None;
     for_each_unshadowed_active_ledger(contexts, |ledger| ledger.record_borrowed(&key, &mut hash));
+}
+
+/// Whether a request ledger frame is active on this thread, opened here or
+/// carried from the thread that handed this work over.
+pub(crate) fn attribution_ledger_frame_active() -> bool {
+    with_attribution_frame(|frame| matches!(frame, Some(AttributionFrame::Ledgers(_))))
 }
 
 /// Handle the common request-frame route before consulting analyzer registries.
@@ -4029,7 +4845,7 @@ fn note_read_attribution_fallback(contexts: &[Arc<AnalyzerQueryContext>], count:
     }
 }
 
-fn for_each_unshadowed_active_ledger(
+pub(super) fn for_each_unshadowed_active_ledger(
     contexts: &[Arc<AnalyzerQueryContext>],
     mut record: impl FnMut(&crate::analyzer::read_ledger::ReadLedger),
 ) {
@@ -4093,6 +4909,22 @@ pub(crate) fn record_unattributed_reads(
     record_unattributed_on_active_ledgers(&fallback_contexts(), count);
 }
 
+#[track_caller]
+pub(crate) fn record_reuse_refusal(
+    ledger_attached: impl FnOnce() -> bool,
+    fallback_contexts: impl FnOnce() -> Vec<Arc<AnalyzerQueryContext>>,
+) {
+    if !crate::analyzer::read_attribution_records_reads(ledger_attached) {
+        return;
+    }
+    let contexts = if has_read_attribution_ledgers() {
+        Vec::new()
+    } else {
+        fallback_contexts()
+    };
+    for_each_unshadowed_active_ledger(&contexts, |ledger| ledger.refuse_read_reuse());
+}
+
 /// Acquire owner contexts only when recording needs a fallback registry.
 #[track_caller]
 pub(crate) fn record_execution_dependence(
@@ -4114,6 +4946,44 @@ pub(crate) fn record_execution_dependence(
     record_execution_dependence_on_active_ledgers(&contexts, count);
 }
 
+/// Runtime-cache evidence uses the same capture routing without altering any
+/// persisted read channel or refusing successful product admission.
+pub(crate) fn record_runtime_cache_touch(
+    ledger_attached: impl FnOnce() -> bool,
+    fallback_contexts: impl FnOnce() -> Vec<Arc<AnalyzerQueryContext>>,
+) {
+    if !crate::analyzer::read_attribution_records_reads(ledger_attached) {
+        return;
+    }
+    let contexts = if has_read_attribution_ledgers() {
+        Vec::new()
+    } else {
+        fallback_contexts()
+    };
+    for_each_unshadowed_active_ledger(&contexts, |ledger| ledger.mark_runtime_cache_touched());
+}
+
+/// Attribute execution dependences to a refused budget charge, with the routing
+/// of [`record_execution_dependence`].
+pub(crate) fn record_budget_dependence(
+    count: usize,
+    ledger_attached: impl FnOnce() -> bool,
+    fallback_contexts: impl FnOnce() -> Vec<Arc<AnalyzerQueryContext>>,
+) {
+    if count == 0 {
+        return;
+    }
+    if !crate::analyzer::read_attribution_records_reads(ledger_attached) {
+        return;
+    }
+    let contexts = if has_read_attribution_ledgers() {
+        Vec::new()
+    } else {
+        fallback_contexts()
+    };
+    record_budget_dependence_on_active_ledgers(&contexts, count);
+}
+
 /// Execution dependence follows the same frame routing as input attribution.
 #[track_caller]
 pub(crate) fn record_execution_dependence_on_active_ledgers(
@@ -4133,6 +5003,18 @@ pub(crate) fn record_execution_dependence_on_active_ledgers(
     for_each_unshadowed_active_ledger(contexts, |ledger| {
         ledger.mark_execution_dependent_reads(count)
     });
+}
+
+/// Budget attribution follows the same frame routing as the execution
+/// dependence it qualifies.
+pub(crate) fn record_budget_dependence_on_active_ledgers(
+    contexts: &[Arc<AnalyzerQueryContext>],
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    for_each_unshadowed_active_ledger(contexts, |ledger| ledger.record_budget_dependences(count));
 }
 
 /// Record one usage lookup per overload the caller asked about, each carrying
@@ -4478,6 +5360,163 @@ mod read_ledger_scope_tests {
 
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
+        "f78115f8dd72: discarded deferred component failures leaked into enclosing completion"
+    )]
+    fn deferred_read_receipts_isolate_completion_until_replayed() {
+        use super::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete, QueryReadReceipt};
+        use crate::analyzer::{MultiAnalyzer, store::StoreError};
+        let analyzer = MultiAnalyzer::default();
+        let ledger = Arc::new(ReadLedger::new());
+        let _reads = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
+        let outer = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let discarded = ReadKey::Configuration(StableDigest::sha256(b"discarded component"));
+        let deciding = ReadKey::Configuration(StableDigest::sha256(b"deciding component"));
+        let (_, unused) = QueryReadReceipt::capture_deferred(&analyzer, || {
+            analyzer.record_read(discarded.clone());
+            analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                "unlisted component".into(),
+            ));
+            analyzer.record_query_failure(StoreError::new("discarded component store failure"));
+        });
+        drop(unused);
+        assert_eq!(outer.read_completion(), Ok(()));
+        assert!(outer.store_error().is_none());
+        assert!(ledger.keys().is_empty());
+        let (_, selected) = QueryReadReceipt::capture_deferred(&analyzer, || {
+            let (_, nested) = QueryReadReceipt::capture_deferred(&analyzer, || {
+                analyzer.record_read(deciding.clone());
+                analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                    "selected component".into(),
+                ));
+            });
+            nested.replay(&analyzer);
+            assert_eq!(outer.read_completion(), Ok(()));
+        });
+        assert_eq!(outer.read_completion(), Ok(()));
+        assert!(outer.captured_read_incompleteness().is_empty());
+        assert!(ledger.keys().is_empty());
+        selected.replay(&analyzer);
+        assert_eq!(
+            outer.read_completion(),
+            Err(QueryReadIncomplete::SemanticEvidenceUnavailable(
+                "selected component".into()
+            ))
+        );
+        assert_eq!(ledger.keys(), vec![deciding]);
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "80d3ed76dc51: advisory failures leaked into enclosing query completion"
+    )]
+    fn advisory_read_failure_does_not_relabel_enclosing_query() {
+        use super::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete};
+        use crate::analyzer::{MultiAnalyzer, store::StoreError};
+
+        let analyzer = MultiAnalyzer::default();
+        let ledger = Arc::new(ReadLedger::new());
+        let outer = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
+        let key = ReadKey::Configuration(StableDigest::sha256(b"advisory frontier"));
+        {
+            let advisory = AnalyzerQueryScope::for_advisory_read(&analyzer);
+            analyzer.record_read(key.clone());
+            analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+            analyzer.record_query_failure(StoreError::new("advisory probe failed"));
+            assert_eq!(
+                advisory.read_completion(),
+                Err(QueryReadIncomplete::Cancelled)
+            );
+            assert!(!advisory.captured_read_incompleteness().is_empty());
+        }
+        assert_eq!(outer.read_completion(), Ok(()));
+        assert!(outer.store_error().is_none());
+        assert!(ledger.keys().contains(&key));
+    }
+
+    #[test]
+    fn candidate_capture_rehomes_receipts_and_preserves_global_failures() {
+        use super::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete, QueryReadReceipt};
+        use crate::analyzer::{MultiAnalyzer, store::StoreError};
+
+        let analyzer = MultiAnalyzer::default();
+        let ledger = Arc::new(ReadLedger::new());
+        let outer = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::clone(&ledger));
+        let gap = QueryReadIncomplete::SemanticEvidenceGap("candidate dependency".into());
+        let key = ReadKey::Configuration(StableDigest::sha256(b"candidate receipt"));
+        let receipt = {
+            let candidate = AnalyzerQueryScope::capturing_candidate_classification(&analyzer);
+            let (_, receipt) = QueryReadReceipt::capture(&analyzer, || {
+                analyzer.record_read(key.clone());
+                analyzer.record_unattributed_read();
+                analyzer.refuse_read_reuse();
+                analyzer.record_query_incomplete(gap.clone());
+            });
+            assert_eq!(candidate.captured_read_incompleteness(), vec![gap.clone()]);
+            receipt
+        };
+        assert_eq!(outer.read_completion(), Ok(()));
+        {
+            let candidate = AnalyzerQueryScope::capturing_candidate_classification(&analyzer);
+            receipt.replay(&analyzer);
+            assert_eq!(candidate.captured_read_incompleteness(), vec![gap.clone()]);
+            {
+                let nested = AnalyzerQueryScope::capturing_candidate_classification(&analyzer);
+                analyzer.record_query_incomplete(QueryReadIncomplete::ArtifactUnavailable(
+                    "nested dependency".into(),
+                ));
+                assert_eq!(nested.captured_read_incompleteness().len(), 1);
+            }
+            assert_eq!(candidate.captured_read_incompleteness(), vec![gap]);
+            assert_eq!(outer.read_completion(), Ok(()));
+            analyzer.record_query_incomplete(QueryReadIncomplete::Cancelled);
+            analyzer.record_query_failure(StoreError::new("candidate store failure"));
+            assert!(candidate.store_error().is_some());
+        }
+        assert_eq!(outer.read_completion(), Err(QueryReadIncomplete::Cancelled));
+        assert!(outer.store_error().is_some());
+        assert!(ledger.keys().contains(&key));
+        assert!(ledger.unattributed_reads() > 0);
+        assert!(ledger.reuse_refused());
+    }
+
+    #[test]
+    fn candidate_capture_preserves_reasons_recorded_outside_the_boundary() {
+        use super::{AnalyzerQueryScope, IAnalyzer, QueryReadIncomplete};
+        use crate::analyzer::MultiAnalyzer;
+
+        let analyzer = MultiAnalyzer::default();
+        let outer = AnalyzerQueryScope::capturing_read_incompleteness(&analyzer);
+        let global = QueryReadIncomplete::ArtifactUnavailable("shared enumeration input".into());
+        analyzer.record_query_incomplete(global.clone());
+        {
+            let candidate = AnalyzerQueryScope::capturing_candidate_classification(&analyzer);
+            assert!(candidate.captured_read_incompleteness().is_empty());
+            assert_eq!(
+                analyzer.current_query_read_completion(),
+                Err(global.clone())
+            );
+            analyzer.record_query_incomplete(QueryReadIncomplete::SemanticEvidenceGap(
+                "local dependency".into(),
+            ));
+        }
+        assert_eq!(outer.captured_read_incompleteness(), vec![global]);
+    }
+
+    #[test]
+    fn nested_read_ledger_inherits_outer_cancellation() {
+        use super::{AnalyzerQueryScope, current_query_cancellation};
+        use crate::analyzer::MultiAnalyzer;
+        let analyzer = MultiAnalyzer::default();
+        let token = crate::CancellationToken::new();
+        let _outer = AnalyzerQueryScope::with_cancellation(&analyzer, &token);
+        let _inner = AnalyzerQueryScope::with_read_ledger(&analyzer, Arc::new(ReadLedger::new()));
+        assert!(!current_query_cancellation().unwrap().is_cancelled());
+        token.cancel();
+        assert!(current_query_cancellation().unwrap().is_cancelled());
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
         "#7876: a starting query inherited read incompleteness from an unrelated concurrent request"
     )]
     fn unrelated_concurrent_queries_do_not_share_incompleteness() {
@@ -4550,6 +5589,45 @@ mod read_ledger_scope_tests {
             let fill = AnalyzerQueryScope::new(&analyzer);
             assert_eq!(fill.read_completion(), Err(QueryReadIncomplete::Cancelled));
         }
+    }
+
+    #[test]
+    fn outer_request_lifetime_follows_nested_scopes_and_explicit_worker_attachment() {
+        use super::AnalyzerQueryScope;
+        use crate::analyzer::MultiAnalyzer;
+
+        let analyzer = MultiAnalyzer::default();
+        let (first_id, first_request) = {
+            let run = AnalyzerQueryScope::new(&analyzer);
+            let request = run.outer_request();
+            let nested = AnalyzerQueryScope::new(&analyzer);
+            assert_eq!(nested.outer_request().id(), request.id());
+            drop(nested);
+            assert!(!request.is_closed());
+            let (captured_id, _) = super::capture_query_reads(&analyzer, || {
+                super::current_outer_request_or_transient().id()
+            });
+            assert_eq!(captured_id, request.id());
+            std::thread::scope(|threads| {
+                threads
+                    .spawn(|| {
+                        let worker =
+                            AnalyzerQueryScope::with_outer_request(&analyzer, Arc::clone(&request));
+                        let unit = AnalyzerQueryScope::new(&analyzer);
+                        assert_eq!(worker.outer_request().id(), request.id());
+                        assert_eq!(unit.outer_request().id(), request.id());
+                    })
+                    .join()
+                    .expect("policy worker panicked");
+            });
+            assert!(!request.is_closed());
+            (request.id(), request)
+        };
+        assert!(first_request.is_closed());
+        let second = AnalyzerQueryScope::new(&analyzer);
+        assert_ne!(second.outer_request().id(), first_id);
+        drop(second);
+        assert_ne!(super::current_outer_request_or_transient().id(), first_id);
     }
 
     #[test]
@@ -5185,8 +6263,10 @@ mod memo_handle_tests {
         let java = caches.java_usage_evidence() as *const _;
         let models = caches.semantic_models() as *const _;
         let syntax = caches.runtime_syntax() as *const _;
-        let structural =
-            crate::analyzer::structural::provider::StructuralFactSnapshotCache::new(1024);
+        let structural = crate::analyzer::structural::provider::StructuralFactSnapshotCache::new(
+            1024,
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        );
         let postings = structural.inner() as *const _;
         let (_, reads) = capture_query_reads(&analyzer, || {
             assert_eq!(derived, caches.derived_layers() as *const _);
@@ -5204,7 +6284,7 @@ mod memo_handle_tests {
     fn query_diagnostics_only_retain_reported_failures() {
         let analyzer = MultiAnalyzer::default();
         let context = AnalyzerQueryContext {
-            captured_read_incompleteness: Some(Mutex::default()),
+            completion: Mutex::new(QueryCompletion::capturing()),
             ..Default::default()
         };
         let (_, reads) = capture_query_reads(&analyzer, || {
@@ -5217,13 +6297,7 @@ mod memo_handle_tests {
                 Err(QueryReadIncomplete::Cancelled)
             ));
             assert_eq!(
-                context
-                    .captured_read_incompleteness
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .len(),
+                context.lock_completion().captured.as_ref().unwrap().len(),
                 3
             );
         });
@@ -5317,5 +6391,19 @@ mod memo_handle_tests {
         });
         assert!(reads.execution_dependences() > 0);
         assert!(!reads.is_bounded());
+    }
+}
+
+#[cfg(test)]
+mod model_absence_digest_test {
+    #[test]
+    fn no_active_model_digest_is_pinned() {
+        assert_eq!(
+            super::no_active_model_set_digest().as_bytes(),
+            &[
+                214, 107, 26, 84, 67, 170, 247, 106, 167, 243, 187, 123, 78, 71, 125, 100, 216,
+                203, 244, 165, 107, 17, 196, 233, 76, 18, 52, 194, 136, 162, 194, 102
+            ]
+        );
     }
 }

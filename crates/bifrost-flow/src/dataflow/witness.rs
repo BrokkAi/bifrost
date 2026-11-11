@@ -5,7 +5,7 @@ use std::{mem::size_of, sync::Arc};
 
 use crate::analyzer::semantic::{
     CallSiteHandle, DispatchBoundaryKind, EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile,
-    ProcedureIcfgEdge, ProgramPointHandle, ProofStatus, ReturnTransferKind,
+    ProcedureIcfgEdge, ProgramPointHandle, ProofStatus, ReturnTransferKind, SemanticLocator,
 };
 
 use super::{FactId, PathQuality, PathQualityFrontier, SummaryEdge};
@@ -55,6 +55,7 @@ pub struct WitnessRetentionLimits {
     max_alternatives_per_quality: Option<NonZeroUsize>,
     best_effort_max_relations: Option<NonZeroUsize>,
     best_effort_max_retained_bytes: Option<NonZeroUsize>,
+    complete_reusable_evidence: bool,
 }
 
 impl WitnessRetentionLimits {
@@ -63,6 +64,7 @@ impl WitnessRetentionLimits {
             max_alternatives_per_quality: None,
             best_effort_max_relations: None,
             best_effort_max_retained_bytes: None,
+            complete_reusable_evidence: false,
         }
     }
 
@@ -71,6 +73,7 @@ impl WitnessRetentionLimits {
             max_alternatives_per_quality: Some(limit),
             best_effort_max_relations: None,
             best_effort_max_retained_bytes: None,
+            complete_reusable_evidence: true,
         })
     }
 
@@ -107,7 +110,30 @@ impl WitnessRetentionLimits {
             max_alternatives_per_quality: Some(max_alternatives_per_quality),
             best_effort_max_relations: Some(max_retained_relations),
             best_effort_max_retained_bytes: Some(max_retained_bytes),
+            complete_reusable_evidence: false,
         })
+    }
+
+    /// Bound the witness sidecar while requiring complete evidence for any
+    /// reusable entry admitted before the cap. A capped entry is refused,
+    /// never served. Semantic solving continues with an operationally
+    /// truncated witness sidecar.
+    pub fn bounded_complete(
+        max_alternatives_per_quality: usize,
+        max_retained_relations: usize,
+        max_retained_bytes: usize,
+    ) -> Result<Self, WitnessLimitError> {
+        let mut limits = Self::best_effort(
+            max_alternatives_per_quality,
+            max_retained_relations,
+            max_retained_bytes,
+        )?;
+        limits.complete_reusable_evidence = true;
+        Ok(limits)
+    }
+
+    pub const fn requires_complete_reusable_evidence(self) -> bool {
+        self.complete_reusable_evidence
     }
 
     fn validate_alternatives(
@@ -237,6 +263,8 @@ pub enum SummaryWitnessStepKind {
     Edge(IcfgEdgeKind),
     /// A source-backed return-affecting gap on a profiled callee exit.
     EndSummaryGap(ReturnTransferKind),
+    /// A composed model transfer actually read the call's receiver operand.
+    ModeledReceiver,
 }
 
 /// One source-backed step in a reconstructed summary-dataflow witness.
@@ -251,6 +279,8 @@ pub struct SummaryWitnessStep {
     completeness: EvidenceCompleteness,
     input_fact: FactId,
     output_fact: FactId,
+    receiver_operand: Option<SemanticLocator>,
+    summary: Option<super::ProcedureSummaryKey>,
 }
 
 impl SummaryWitnessStep {
@@ -276,11 +306,32 @@ impl SummaryWitnessStep {
             completeness,
             input_fact,
             output_fact,
+            receiver_operand: None,
+            summary: None,
         }
     }
 
     pub const fn kind(&self) -> SummaryWitnessStepKind {
         self.kind
+    }
+
+    pub fn with_receiver_operand(mut self, operand: SemanticLocator) -> Self {
+        assert_eq!(self.kind, SummaryWitnessStepKind::ModeledReceiver);
+        self.receiver_operand = Some(operand);
+        self
+    }
+
+    pub const fn receiver_operand(&self) -> Option<&SemanticLocator> {
+        self.receiver_operand.as_ref()
+    }
+
+    pub fn with_summary(mut self, summary: super::ProcedureSummaryKey) -> Self {
+        self.summary = Some(summary);
+        self
+    }
+
+    pub const fn summary(&self) -> Option<&super::ProcedureSummaryKey> {
+        self.summary.as_ref()
     }
 
     pub const fn source(&self) -> &ProgramPointHandle {
@@ -318,6 +369,11 @@ impl SummaryWitnessStep {
     fn retained_owned_bytes(&self) -> usize {
         super::retained_evidence_bytes(Some(&self.proof), Some(&self.completeness))
             .saturating_add(dispatch_boundary_heap_bytes(self.boundary.as_ref()))
+            .saturating_add(
+                self.summary
+                    .as_ref()
+                    .map_or(0, super::ProcedureSummaryKey::retained_bytes),
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -342,6 +398,192 @@ impl SummaryWitnessStep {
             && &self.completeness == completeness
             && self.input_fact == input_fact
             && self.output_fact == output_fact
+    }
+}
+
+/// A point identified by a stable semantic site and its local ordinal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WitnessPointRow {
+    pub locator: SemanticLocator,
+    pub ordinal: usize,
+}
+
+/// One callee-relative witness step with live point and call handles whose
+/// facts are still the problem's own fact values.
+///
+/// A reusable summary provider returns these, because a provider cannot know
+/// the solving query's interned fact IDs. The solver validates the steps,
+/// interns their facts, and only then binds them into [`SummaryWitnessStep`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReusableWitnessStep<Fact> {
+    pub kind: SummaryWitnessStepKind,
+    pub source: ProgramPointHandle,
+    pub target: Option<ProgramPointHandle>,
+    pub origin: Option<CallSiteHandle>,
+    pub boundary: Option<DispatchBoundaryKind>,
+    pub proof: ProofStatus,
+    pub completeness: EvidenceCompleteness,
+    pub receiver_operand: Option<SemanticLocator>,
+    pub input_fact: Fact,
+    pub output_fact: Fact,
+}
+
+impl<Fact> ReusableWitnessStep<Fact> {
+    /// The point this step reaches, as a witness node reports it.
+    pub(crate) fn output_point(&self) -> &ProgramPointHandle {
+        self.target.as_ref().unwrap_or(&self.source)
+    }
+
+    pub(crate) fn bind(&self, input_fact: FactId, output_fact: FactId) -> SummaryWitnessStep {
+        let step = SummaryWitnessStep::new(
+            self.kind,
+            self.source.clone(),
+            self.target.clone(),
+            self.origin.clone(),
+            self.boundary.clone(),
+            self.proof.clone(),
+            self.completeness.clone(),
+            input_fact,
+            output_fact,
+        );
+        match &self.receiver_operand {
+            Some(operand) => step.with_receiver_operand(operand.clone()),
+            None => step,
+        }
+    }
+}
+
+/// The typed operand carried only by a modeled-receiver step.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WitnessStepState {
+    None,
+    ModeledReceiver { operand: SemanticLocator },
+}
+
+/// Stable witness evidence with caller-defined canonical fact keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WitnessStepRow<F> {
+    pub kind: SummaryWitnessStepKind,
+    pub typed: WitnessStepState,
+    pub source: WitnessPointRow,
+    pub target: Option<WitnessPointRow>,
+    pub origin: Option<SemanticLocator>,
+    pub boundary: Option<DispatchBoundaryKind>,
+    pub proof: ProofStatus,
+    pub completeness: EvidenceCompleteness,
+    pub input_fact: F,
+    pub output_fact: F,
+}
+
+/// The exact component that could not be encoded or rebound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessStepCodecError {
+    Source,
+    Target,
+    Origin,
+    ReceiverOperand,
+    InputFact,
+    OutputFact,
+    InvalidTypedState,
+}
+
+impl<F> WitnessStepRow<F> {
+    pub fn encode(
+        step: &SummaryWitnessStep,
+        mut canonical_fact: impl FnMut(FactId) -> Option<F>,
+    ) -> Result<Self, WitnessStepCodecError> {
+        let point = |handle: &ProgramPointHandle, error| {
+            handle
+                .locator()
+                .cloned()
+                .map(|locator| WitnessPointRow {
+                    locator,
+                    ordinal: handle.id().index(),
+                })
+                .ok_or(error)
+        };
+        let typed = match step.kind() {
+            SummaryWitnessStepKind::ModeledReceiver => WitnessStepState::ModeledReceiver {
+                operand: step
+                    .receiver_operand()
+                    .cloned()
+                    .ok_or(WitnessStepCodecError::ReceiverOperand)?,
+            },
+            _ if step.receiver_operand().is_none() => WitnessStepState::None,
+            _ => return Err(WitnessStepCodecError::InvalidTypedState),
+        };
+        Ok(Self {
+            kind: step.kind(),
+            typed,
+            source: point(step.source(), WitnessStepCodecError::Source)?,
+            target: step
+                .target()
+                .map(|target| point(target, WitnessStepCodecError::Target))
+                .transpose()?,
+            origin: step
+                .origin()
+                .map(|origin| {
+                    origin
+                        .locator()
+                        .cloned()
+                        .ok_or(WitnessStepCodecError::Origin)
+                })
+                .transpose()?,
+            boundary: step.boundary().cloned(),
+            proof: step.proof().clone(),
+            completeness: step.completeness().clone(),
+            input_fact: canonical_fact(step.input_fact())
+                .ok_or(WitnessStepCodecError::InputFact)?,
+            output_fact: canonical_fact(step.output_fact())
+                .ok_or(WitnessStepCodecError::OutputFact)?,
+        })
+    }
+
+    pub fn rebind<G>(
+        &self,
+        mut point: impl FnMut(&SemanticLocator, usize) -> Option<ProgramPointHandle>,
+        mut call: impl FnMut(&SemanticLocator) -> Option<CallSiteHandle>,
+        mut fact: impl FnMut(&F) -> Option<G>,
+    ) -> Result<ReusableWitnessStep<G>, WitnessStepCodecError> {
+        let source = point(&self.source.locator, self.source.ordinal)
+            .ok_or(WitnessStepCodecError::Source)?;
+        let target = self
+            .target
+            .as_ref()
+            .map(|target| {
+                point(&target.locator, target.ordinal).ok_or(WitnessStepCodecError::Target)
+            })
+            .transpose()?;
+        let origin = self
+            .origin
+            .as_ref()
+            .map(|origin| call(origin).ok_or(WitnessStepCodecError::Origin))
+            .transpose()?;
+        let input_fact = fact(&self.input_fact).ok_or(WitnessStepCodecError::InputFact)?;
+        let output_fact = fact(&self.output_fact).ok_or(WitnessStepCodecError::OutputFact)?;
+        let receiver_operand = match (&self.kind, &self.typed) {
+            (
+                SummaryWitnessStepKind::ModeledReceiver,
+                WitnessStepState::ModeledReceiver { operand },
+            ) => Some(operand.clone()),
+            (SummaryWitnessStepKind::ModeledReceiver, _)
+            | (_, WitnessStepState::ModeledReceiver { .. }) => {
+                return Err(WitnessStepCodecError::InvalidTypedState);
+            }
+            (_, WitnessStepState::None) => None,
+        };
+        Ok(ReusableWitnessStep {
+            kind: self.kind,
+            source,
+            target,
+            origin,
+            boundary: self.boundary.clone(),
+            proof: self.proof.clone(),
+            completeness: self.completeness.clone(),
+            receiver_operand,
+            input_fact,
+            output_fact,
+        })
     }
 }
 
@@ -741,7 +983,7 @@ impl WitnessEvidenceNode {
             .saturating_add(dispatch_boundary_heap_bytes(boundary))
     }
 
-    fn end_summary_quality(
+    pub(crate) fn end_summary_quality(
         predecessor_quality: PathQuality,
         exit: &IcfgExitProfile,
     ) -> PathQuality {
@@ -858,6 +1100,30 @@ impl WitnessEvidenceNode {
 
     pub(crate) fn edge_retained_bytes(edge: &ProcedureIcfgEdge) -> usize {
         Self::edge_retained_bytes_for(&edge.proof, &edge.completeness, edge.boundary.as_ref())
+    }
+
+    /// One step of an admitted reusable fragment, as the same `Step` node a
+    /// body solve would have built: a seed starts proven and complete, and
+    /// each edge degrades its predecessor's quality through its own evidence.
+    pub(crate) fn fragment_step(
+        predecessor: Option<(WitnessEvidenceId, PathQuality)>,
+        step: SummaryWitnessStep,
+    ) -> Self {
+        let quality = predecessor.map_or(PathQuality::PROVEN_COMPLETE, |(_, quality)| {
+            quality.through_evidence(step.proof(), step.completeness())
+        });
+        Self {
+            quality,
+            alternatives_truncated: false,
+            kind: WitnessEvidenceKind::Step {
+                predecessor: predecessor.map(|(id, _)| id),
+                step,
+            },
+        }
+    }
+
+    pub(crate) fn quality(&self) -> PathQuality {
+        self.quality
     }
 
     pub(crate) fn end_summary(
@@ -1070,7 +1336,7 @@ impl WitnessEvidenceNode {
             )
     }
 
-    fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         size_of::<Self>().saturating_add(match &self.kind {
             WitnessEvidenceKind::Step { step, .. } => step.retained_owned_bytes(),
             WitnessEvidenceKind::EndSummary { .. } => 0,
@@ -1328,6 +1594,41 @@ impl WitnessArena {
         Ok(WitnessAdmission::Retained(id))
     }
 
+    /// Stage one interior node of an admitted fragment, stopping at the
+    /// request or arena cap before materializing any further nodes.
+    pub(crate) fn stage_fragment_node(
+        &self,
+        node: WitnessEvidenceNode,
+        remaining_relations: Option<usize>,
+        staging: WitnessStaging<'_>,
+    ) -> Result<Option<WitnessEvidenceId>, usize> {
+        debug_assert!(self.is_enabled());
+        if self.limits.is_best_effort()
+            && (remaining_relations.is_some_and(|remaining| staging.nodes.len() >= remaining)
+                || self
+                    .limits
+                    .best_effort_max_relations()
+                    .is_some_and(|limit| {
+                        self.nodes.len().saturating_add(staging.nodes.len()) >= limit
+                    })
+                || self
+                    .limits
+                    .best_effort_max_retained_bytes()
+                    .is_some_and(|limit| {
+                        self.retained_bytes
+                            .saturating_add(*staging.retained_bytes)
+                            .saturating_add(node.retained_bytes())
+                            > limit
+                    }))
+        {
+            return Ok(None);
+        }
+        let id = self.staged_id(staging.nodes.len())?;
+        *staging.retained_bytes = (*staging.retained_bytes).saturating_add(node.retained_bytes());
+        staging.nodes.push((id, node));
+        Ok(Some(id))
+    }
+
     fn staged_id(&self, additional_index: usize) -> Result<WitnessEvidenceId, usize> {
         let index = self.nodes.len().saturating_add(additional_index);
         WitnessEvidenceId::try_from_index(index).ok_or(index)
@@ -1445,6 +1746,11 @@ impl WitnessTarget<'_> {
 }
 
 impl WitnessStore {
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         size_of::<Self>()
             .saturating_add(
@@ -1901,6 +2207,60 @@ impl WitnessStore {
 
 #[cfg(test)]
 use brokk_bifrost_test_macros::hardwon;
+
+#[test]
+fn stable_witness_step_codec_rebinds_live_handles_and_facts() {
+    use crate::analyzer::semantic::{CancellationToken, SemanticBudget, SemanticRequest};
+
+    let (project, workspace) =
+        crate::inline_project::python_workspace(&[("witness.py", "def run():\n    pass\n")]);
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let artifact = workspace
+        .materialize_program_semantics(
+            &project.file("witness.py"),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap()
+        .available_value()
+        .cloned()
+        .unwrap();
+    let procedure = artifact
+        .procedures()
+        .iter()
+        .find(|procedure| procedure.locator().declaration().last_segment_name() == Some("run"))
+        .unwrap();
+    let handle = artifact.procedure_handle(procedure.id()).unwrap();
+    let entry = handle.point_handle(procedure.entry_point()).unwrap();
+    let fact = FactId::new(0);
+    let step = SummaryWitnessStep::new(
+        SummaryWitnessStepKind::Seed,
+        entry.clone(),
+        None,
+        None,
+        None,
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        fact,
+        fact,
+    );
+    let row = WitnessStepRow::encode(&step, |id| Some(id.index())).unwrap();
+    let rebound = row
+        .rebind(
+            |locator, ordinal| {
+                (entry.locator() == Some(locator) && entry.id().index() == ordinal)
+                    .then(|| entry.clone())
+            },
+            |_| None,
+            |key| FactId::try_from_index(*key).ok(),
+        )
+        .unwrap();
+    assert_eq!(rebound.bind(rebound.input_fact, rebound.output_fact), step);
+    assert_eq!(
+        row.rebind(|_, _| None, |_| None, |_| Some(fact)),
+        Err(WitnessStepCodecError::Source)
+    );
+}
 
 #[test]
 #[hardwon("35242d006da3: cloned dispatch target locators escaped witness byte caps")]

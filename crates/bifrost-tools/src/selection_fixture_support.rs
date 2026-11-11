@@ -54,7 +54,7 @@ pub fn write_fixture_blob(
             )
         }
         Language::Rust => {
-            let state = parsed_fixture_state(&RustAdapter, relative_path, source);
+            let state = parsed_fixture_state(&RustAdapter::for_tests(), relative_path, source);
             store.write_parsed_blob_at_generation(
                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(
@@ -62,7 +62,7 @@ pub fn write_fixture_blob(
                     storage_language,
                 ),
                 generation,
-                &RustAdapter,
+                &RustAdapter::for_tests(),
                 &state,
             )
         }
@@ -206,7 +206,11 @@ impl JvmSelectionFixture {
                             )
                         }
                         Language::Rust => {
-                            let state = parsed_fixture_state(&RustAdapter, "src/Model.rs", source);
+                            let state = parsed_fixture_state(
+                                &RustAdapter::for_tests(),
+                                "src/Model.rs",
+                                source,
+                            );
                             store.write_parsed_blob_at_generation(
                                 &brokk_bifrost_analysis::analyzer::store::test_blob_file(),
                                 &brokk_bifrost_core::gitblob::BlobKey::unvaried(
@@ -214,7 +218,7 @@ impl JvmSelectionFixture {
                                     storage_language,
                                 ),
                                 generation,
-                                &RustAdapter,
+                                &RustAdapter::for_tests(),
                                 &state,
                             )
                         }

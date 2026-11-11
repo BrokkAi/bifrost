@@ -5,15 +5,15 @@
 
 use std::sync::Arc;
 
-use crate::analyzer::semantic::SemanticLocator;
 use crate::analyzer::semantic::partial_flow::{
     CrossedCalls, HeapSelector, PartialFlowPort, ProcedurePartialFlows,
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AccessPathTail, BarrierObservation, CallInvocationMode, CallSiteId,
-    CandidateCoverage, DispatchBoundaryKind, ExecutionTiming, ObservationPhase, ProcedureHandle,
-    ProgramPointHandle, ProgramPointId, SemanticCapability, SemanticGapHandle, SemanticRequest,
-    ValueId, ValueTypeBarrierDecision, ValueTypePredicate,
+    CandidateCoverage, CaptureBinding, DispatchBoundaryKind, DurableCallContext, ExecutionTiming,
+    ObservationPhase, ProcedureHandle, ProgramPointHandle, ProgramPointId, SemanticCapability,
+    SemanticGapHandle, SemanticLocator, SemanticRequest, ValueId, ValueTypeBarrierDecision,
+    ValueTypePredicate,
 };
 use crate::dataflow::{SemanticInputStatus, UnmodeledCallBehavior};
 use crate::taint::{SourceEventKey, TaintClassSet, TaintEdgeFunction};
@@ -22,28 +22,39 @@ use crate::value_flow::{
     ValueFlowObservationPhase,
 };
 
-use super::graph::{ExecutionTarget, HopQuality};
+use super::graph::{Endpoint, ExecutionTarget, HopQuality, ObjectAnchor};
 
-/// Match selectors after a return binding proves the caller and callee refer
-/// to the same returned object. Only the language hook may equate a declared
-/// field with its canonical member; all other selectors keep exact identity.
-pub fn bound_return_selector_matches(
-    actual: &HeapSelector,
-    formal: &HeapSelector,
-    canonical_field: impl FnOnce(&SemanticLocator) -> Option<SemanticLocator>,
-) -> bool {
-    actual == formal
-        || matches!(
-            (actual, formal),
-            (HeapSelector::ExactIndex(_), HeapSelector::AnyIndex)
-        )
-        || match (actual, formal) {
-            (HeapSelector::Field(actual), HeapSelector::Field(formal)) => {
-                canonical_field(formal).as_ref() == Some(actual)
-            }
-            _ => false,
-        }
+/// One query-local predecessor of a tracked object, with the state function
+/// applied while moving forward from that predecessor to the observation.
+#[derive(Debug, Clone)]
+pub struct ObjectPredecessor<Function> {
+    pub from: Endpoint,
+    pub function: Function,
+    pub quality: HopQuality,
 }
+
+#[derive(Debug, Clone)]
+pub struct ObjectRelation<Fact, Function> {
+    pub sources: Vec<ExecutionSource<Fact>>,
+    pub predecessors: Vec<ObjectPredecessor<Function>>,
+    pub complete: bool,
+    /// Whether a tracked object can exist before a call result at this node.
+    /// A result that creates the object ends the backward search here.
+    pub cross_call: bool,
+}
+
+impl<Fact, Function> ObjectRelation<Fact, Function> {
+    pub const fn none() -> Self {
+        Self {
+            sources: Vec::new(),
+            predecessors: Vec::new(),
+            complete: true,
+            cross_call: true,
+        }
+    }
+}
+
+pub use crate::analyzer::semantic::partial_flow::ports::bound_return_selector_matches;
 
 /// Match one member demand after a return pairing proves object identity.
 pub fn bound_return_member_matches(
@@ -87,6 +98,13 @@ pub struct Invocations {
     pub coverage: Completeness,
 }
 
+/// Positively admitted roots and whether the bounded reader covered its inventory.
+#[derive(Debug, Clone)]
+pub struct ExecutionRootInventory {
+    pub roots: Vec<DurableProcedureKey>,
+    pub coverage: Completeness,
+}
+
 #[derive(Debug, Clone)]
 pub struct InvocationSite {
     pub call: DurableCallSiteKey,
@@ -113,10 +131,36 @@ pub struct ExecutionDispatch<Function> {
 
 /// Per-arm proof is carried into the item key, including for shared external targets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutionCallableInstance {
+    pub producer: DurableProcedureKey,
+    pub creation_point: ProgramPointId,
+    pub creation_event_index: usize,
+    pub creation_value: ValueId,
+    pub capture_bindings: Box<[CaptureBinding]>,
+    pub factory_call: Option<DurableCallSiteKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutionCertificateStep {
+    pub call: DurableCallSiteKey,
+    pub ordinal: usize,
+    pub target: ExecutionTarget,
+    pub instance: Option<ExecutionCallableInstance>,
+    pub context: DurableCallContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutionCertificate {
+    pub root: DurableProcedureKey,
+    pub prefix: Box<[ExecutionCertificateStep]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExecutionArmContext {
     pub call: DurableCallSiteKey,
     pub ordinal: usize,
     pub quality: HopQuality,
+    pub certificate: ExecutionCertificate,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +169,8 @@ pub struct ExecutionArm<Function> {
     pub function: Function,
     pub quality: HopQuality,
     pub timing: ExecutionTiming,
+    pub instance: Option<ExecutionCallableInstance>,
+    pub context: DurableCallContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +187,8 @@ pub struct ExecutionSource<Fact> {
     pub identity: Box<str>,
     pub fact: Fact,
     pub provenance: Box<str>,
+    /// Bound origin for a source whose witness needs an explicit seed step.
+    pub seed_point: Option<crate::analyzer::semantic::ProgramPointHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +210,41 @@ pub trait CompositionProvider {
     type Fact: Clone + Eq + std::hash::Hash + std::fmt::Debug;
     type Function: Clone + Eq + std::hash::Hash + std::fmt::Debug;
 
+    /// A request-local execution discovery shared by selected sink searches.
+    fn execution_discovery<E>(
+        &self,
+        _budget: super::CompositionBudget,
+        request: &mut SemanticRequest<'_>,
+        build: impl FnOnce(
+            &mut SemanticRequest<'_>,
+        )
+            -> Result<(Vec<super::ExecutionReach>, Vec<super::Incompleteness>), E>,
+    ) -> Result<(Vec<super::ExecutionReach>, Vec<super::Incompleteness>), E> {
+        build(request)
+    }
+
+    fn object_relation(
+        &self,
+        _procedure: &DurableProcedureKey,
+        _at: &Endpoint,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ObjectRelation<Self::Fact, Self::Function>, Self::Error> {
+        Ok(ObjectRelation::none())
+    }
+
+    /// Positive entry evidence only. An incomplete inventory cannot refute
+    /// a root already admitted by an authored or language entry fact.
+    fn admitted_execution_roots(
+        &self,
+        _max_examined: usize,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ExecutionRootInventory, Self::Error> {
+        Ok(ExecutionRootInventory {
+            roots: Vec::new(),
+            coverage: Completeness::Complete,
+        })
+    }
+
     fn invocations(
         &self,
         _procedure: &DurableProcedureKey,
@@ -173,6 +256,7 @@ pub trait CompositionProvider {
     fn execution_dispatch(
         &self,
         _call: &DurableCallSiteKey,
+        _incoming: Option<&ExecutionArmContext>,
         _request: &mut SemanticRequest<'_>,
     ) -> Result<ExecutionDispatch<Self::Function>, Self::Error> {
         unimplemented!("this client has no execution relation")
@@ -242,6 +326,13 @@ pub trait CompositionProvider {
             .semantics()
             .call_site(call)
             .expect("a call belongs to its procedure");
+        if call
+            .member_selection
+            .as_ref()
+            .is_some_and(|selection| selection.receiver_place.is_some())
+        {
+            return Ok(true);
+        }
         Ok(call
             .receiver
             .into_iter()
@@ -251,6 +342,30 @@ pub trait CompositionProvider {
                     value.kind == crate::analyzer::semantic::SemanticValueKind::Address
                 })
             }))
+    }
+
+    /// Whether a sibling call's inputs can name the exact caller storage
+    /// read by `value`. This is asked before dispatching that sibling.
+    fn call_input_storage_overlap(
+        &self,
+        _procedure: &ProcedureHandle,
+        _value: ValueId,
+        _selectors: &[HeapSelector],
+        _tail: AccessPathTail,
+        _call: CallSiteId,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<crate::analyzer::semantic::CallStorageSharing, Self::Error> {
+        Ok(crate::analyzer::semantic::CallStorageSharing::Unknown)
+    }
+
+    /// Whether an activated model could write receiver or argument storage
+    /// at this call. This prefilter must not dispatch an ordinary sibling.
+    fn may_have_modeled_storage_output(
+        &self,
+        _procedure: &ProcedureHandle,
+        _call: CallSiteId,
+    ) -> bool {
+        false
     }
 
     /// Install the lenient observation filter for this query's candidate
@@ -298,6 +413,60 @@ pub trait CompositionProvider {
         _source: &BoundSource<Self::Fact>,
         _sink: crate::value_flow::ValueFlowSinkId,
     ) {
+    }
+
+    /// A client's query-local label for a local port hop. The default keeps
+    /// existing taint flows as identity. A stateful client may derive a finite
+    /// relation from ordered procedure events, including alternative paths.
+    fn local_function(
+        &self,
+        _procedure: &DurableProcedureKey,
+        _from: &super::graph::Endpoint,
+        _to: &super::graph::Endpoint,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<(Self::Function, HopQuality)>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Caller/callee object transport for one port boundary. The client
+    /// supplies evidence quality with the relation; no proof means an open
+    /// boundary. The default keeps existing taint labels unchanged.
+    fn call_boundary_function(
+        &self,
+        _call: &DurableCallSiteKey,
+        _callee: &DurableProcedureKey,
+        _from: &super::graph::Endpoint,
+        _to: &super::graph::Endpoint,
+    ) -> Option<(Self::Function, HopQuality)> {
+        None
+    }
+
+    /// Caller inputs that retain an object-local normal continuation when
+    /// dispatch or argument conversion has an unresolved effect. The client must establish exact subject
+    /// identity and retain the unresolved effect in its label and quality.
+    fn unproven_object_continuations(
+        &self,
+        _call: &DurableCallSiteKey,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Vec<ObjectPredecessor<Self::Function>>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// State carried by the same object from a call input to one caller
+    /// continuation. A stateful client supplies a callee entry-to-exit
+    /// relation for each selected binding. Value-flow clients have no such
+    /// relation, so their existing call and writeback paths are unchanged.
+    fn call_handoffs(
+        &self,
+        _call: &DurableCallSiteKey,
+        _candidate: &DispatchCandidate,
+        _exit: CallHandoffExit,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<CallHandoffInventory<Self::Function>, Self::Error> {
+        Ok(CallHandoffInventory {
+            handoffs: Vec::new(),
+            complete: false,
+        })
     }
 
     /// Stored or recomputed port-to-port flows of one procedure.
@@ -378,12 +547,15 @@ pub trait CompositionProvider {
     }
 
     /// Dispatch candidates of one call with their bindings and the
-    /// boundary's completeness.
+    /// boundary's completeness, and the model that replaces the call, if any.
+    /// A model wins over every candidate body, and a call it covers is not a
+    /// boundary: its dispatch answer is complete. The model comes back with
+    /// its dispatch so that no provider has to retain one for a later lookup.
     fn dispatch(
         &self,
         call: &DurableCallSiteKey,
         request: &mut SemanticRequest<'_>,
-    ) -> Result<Dispatch, Self::Error>;
+    ) -> Result<DispatchWithModel<Self::Function>, Self::Error>;
 
     /// Incoming calls to one procedure, with completeness.
     fn callers(
@@ -401,10 +573,18 @@ pub trait CompositionProvider {
         request: &mut SemanticRequest<'_>,
     ) -> Result<Option<DurableProcedureKey>, Self::Error>;
 
-    /// The model that replaces the call, if any. Asked after `dispatch` of the
-    /// same call. A model wins over every candidate body, and a call it covers
-    /// is not a boundary: its dispatch answer is complete.
-    fn model(&self, call: &DurableCallSiteKey) -> Option<CallModel<Self::Function>>;
+    /// Certify only the selected normal-result origin of this object root.
+    /// This does not replace the call's dispatch or model other subjects.
+    fn certified_object_origin(
+        &self,
+        _root: &ObjectAnchor,
+        _call: &DurableCallSiteKey,
+        _port: &PartialFlowPort,
+        _gap: &ExternalBodyUnavailableGap,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<()>, Self::Error> {
+        Ok(None)
+    }
 
     /// What the policy does at a call that no model covers and whose
     /// dispatch has no candidate or leaves a boundary beside its candidates:
@@ -481,6 +661,8 @@ pub struct StoreChannelLink {
     pub write: usize,
     pub write_call: DurableCallSiteKey,
     pub read_call: DurableCallSiteKey,
+    pub write_site: SemanticLocator,
+    pub read_site: SemanticLocator,
     pub read_origin: crate::taint::SourceEventKey,
     pub read_phase: ValueFlowObservationPhase,
     pub read_carrier: ValueFlowCarrier,
@@ -590,10 +772,67 @@ pub struct BoundTransform<Function = TaintEdgeFunction> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Completeness {
     Complete,
-    Incomplete { reason: Box<str> },
+    Incomplete {
+        cause: IncompleteCause,
+        reason: Box<str>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum IncompleteCause {
+    Content,
+    Operational(OperationalCause),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum OperationalCause {
+    Budget(super::search::BudgetLane),
+    Cancelled,
+    Provider,
 }
 
 impl Completeness {
+    pub fn content(reason: impl Into<Box<str>>) -> Self {
+        Self::Incomplete {
+            cause: IncompleteCause::Content,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn operational(cause: OperationalCause, reason: impl Into<Box<str>>) -> Self {
+        Self::Incomplete {
+            cause: IncompleteCause::Operational(cause),
+            reason: reason.into(),
+        }
+    }
+
+    /// Keep the latest diagnostic text while retaining an earlier operational stop.
+    pub fn preserving_operational_cause(self, previous: &Self) -> Self {
+        match (previous, self) {
+            (
+                Self::Incomplete {
+                    cause: IncompleteCause::Operational(cause),
+                    ..
+                },
+                Self::Incomplete {
+                    cause: IncompleteCause::Content,
+                    reason,
+                },
+            ) => Self::operational(*cause, reason),
+            (
+                Self::Incomplete {
+                    cause: IncompleteCause::Operational(cause),
+                    ..
+                },
+                Self::Incomplete {
+                    cause: IncompleteCause::Operational(OperationalCause::Provider),
+                    reason,
+                },
+            ) if *cause != OperationalCause::Provider => Self::operational(*cause, reason),
+            (_, next) => next,
+        }
+    }
+
     pub const fn is_complete(&self) -> bool {
         matches!(self, Self::Complete)
     }
@@ -691,6 +930,9 @@ pub struct InteriorFlows {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchCandidate {
     pub procedure: DurableProcedureKey,
+    /// Callee heap ports backed by a real member store. None means the
+    /// callee's store inventory is incomplete, so writeback remains open.
+    pub written_heap_ports: Option<Box<[PartialFlowPort]>>,
     /// Caller-side actual port (`CallReceiver`, `CallArgument`) to callee
     /// formal port (`Receiver`, `Parameter`), implicit arguments included.
     pub arguments: Box<[(PartialFlowPort, PartialFlowPort)]>,
@@ -701,6 +943,53 @@ pub struct DispatchCandidate {
     /// `ExceptionalReturn`) to caller-side result port (`CallResult`,
     /// `CallThrown`).
     pub returns: Box<[(PartialFlowPort, PartialFlowPort)]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallObjectContinuity {
+    Reference,
+    Move,
+    Copy,
+    Unknown,
+}
+
+impl CallObjectContinuity {
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::Reference | Self::Move)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallHandoffExit {
+    Normal,
+    Exceptional,
+}
+
+/// A candidate-specific object handoff. `argument_index` names the shared
+/// actual/formal binding; `quality` proves that binding independently of the
+/// dispatch's target coverage. The client still checks the tracked subject's
+/// object evidence before applying its callee entry-to-exit label function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallHandoffBinding {
+    pub argument_index: usize,
+    pub exit: CallHandoffExit,
+    pub continuity: CallObjectContinuity,
+    pub quality: HopQuality,
+}
+
+/// A selected candidate's object binding and its ordered callee summary.
+/// The binding indexes `DispatchCandidate::arguments`; target coverage is
+/// checked by the search independently of this binding's proof axes.
+#[derive(Debug, Clone)]
+pub struct CallHandoff<Function> {
+    pub binding: CallHandoffBinding,
+    pub function: Function,
+}
+
+/// Completeness of one candidate's handoff exit, including an absent exit.
+pub struct CallHandoffInventory<Function> {
+    pub handoffs: Vec<CallHandoff<Function>>,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -728,10 +1017,31 @@ pub struct WritebackBinding {
 /// with a candidate body or a model replacing it also has the caller's own
 /// proven and complete edge. A value may take any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalBodyUnavailableGap {
+    pub target: crate::analyzer::store::active_models::UnmaterializedExternalTarget,
+    pub raw_coverage: CandidateCoverage,
+}
+
+impl ExternalBodyUnavailableGap {
+    /// A selected Fresh origin discharges only the same exhaustive raw target.
+    pub fn matches_origin_target(
+        &self,
+        target: &crate::analyzer::store::active_models::UnmaterializedExternalTarget,
+    ) -> bool {
+        self.raw_coverage == CandidateCoverage::Exhaustive && &self.target == target
+    }
+}
+
+/// One call's dispatch with the model that replaces the call, if any.
+pub type DispatchWithModel<Function> = (Dispatch, Option<CallModel<Function>>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dispatch {
     pub candidates: Vec<DispatchCandidate>,
     pub completeness: Completeness,
     pub continuation: HopQuality,
+    /// The one typed raw external-body gap, when it is the sole dispatch loss.
+    pub external_body_unavailable: Option<ExternalBodyUnavailableGap>,
 }
 
 /// Incoming calls to one procedure. A truncated enumeration is `Incomplete`
@@ -743,14 +1053,21 @@ pub struct Callers {
 }
 
 /// One model transfer from a caller-side input port of the call (its
-/// `CallReceiver` or a `CallArgument`) to the call's normal result. Labels are
+/// `CallReceiver` or a `CallArgument`) to a caller-side output. Labels are
 /// stable policy label names. `moved` is the set of labels the transfer
 /// carries, `None` for every label; `removed` are the labels a sanitize effect
 /// of the model removes on this transfer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelTransfer<Function = TaintEdgeFunction> {
     pub actual: PartialFlowPort,
+    pub output: PartialFlowPort,
     pub function: Function,
+    /// Proof of this transfer, independent of the model's coverage claim.
+    pub proven: bool,
+    /// An override-family closure covers the member, but does not prove
+    /// which concrete receiver or argument storage receives this output.
+    /// Only a source/sink path through this transfer is left incomplete.
+    pub unresolved_output_storage: bool,
 }
 
 /// A model that replaces one call to one candidate.
@@ -766,6 +1083,17 @@ pub struct ModelTransfer<Function = TaintEdgeFunction> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallModel<Function = TaintEdgeFunction> {
     pub transfers: Vec<ModelTransfer<Function>>,
+    /// Identity of the selected procedure summary, retained as provenance.
+    pub summary: Option<crate::dataflow::ProcedureSummaryKey>,
+    /// Exact dispatch boundary whose selected summary contributed transfers.
+    pub summary_target: Option<crate::analyzer::semantic::DispatchBoundaryKind>,
+    /// Declared transfers supplement the original dispatch and its residual.
+    /// The call's ordinary continuation and obligations remain live.
+    pub retains_dispatch: bool,
+    /// Caller storage reached by modeled receiver or argument outputs.
+    pub writeback: Box<[WritebackBinding]>,
+    /// Caller storage read through modeled receiver inputs.
+    pub receiver_reads: Box<[WritebackBinding]>,
     pub proven: bool,
     pub completeness: Completeness,
     pub authored: Option<Box<[AuthoredArmClosure]>>,
@@ -778,6 +1106,9 @@ impl<Function> CallModel<Function> {
     /// complete when the model is.
     pub fn quality(&self) -> HopQuality {
         let complete = self.completeness.is_complete();
+        if self.retains_dispatch {
+            return HopQuality::new(self.proven, false);
+        }
         match &self.authored {
             None => HopQuality::from_uncertain(!self.proven || !complete),
             Some(closures) => HopQuality::new(self.proven && !closures.is_empty(), complete),
@@ -807,6 +1138,9 @@ pub enum Openness {
     Closed,
     Open {
         residual: Box<[DurableCallSiteKey]>,
+        /// Cause aligned with each residual call.
+        residual_causes: Box<[IncompleteCause]>,
+        cause: IncompleteCause,
         blocked: Option<BlockedGap>,
         status: SemanticInputStatus,
         reason: Box<str>,

@@ -233,17 +233,54 @@ pub struct PythonRuntimeArtifactReport {
     pub suppressed_frontiers: usize,
     pub scans: Vec<PythonRuntimeScanSummary>,
     pub work: PythonRuntimeArtifactWork,
-    /// True only when every configured source and installed root was scanned
+    /// Written only through `degrade`, so a report cannot be both cancelled
+    /// and complete, or complete with an unscanned root.
+    acquisition: PythonRuntimeAcquisition,
+}
+
+/// How far bounded configured-input acquisition got. The variants are ordered
+/// from best to worst and a report only moves down the order.
+///
+/// None of them claims ambient import semantics: this provider never executes
+/// or interrogates an interpreter, so interpreter path order and import hooks
+/// stay outside the explicit source/installed universe even when that
+/// universe is fully scanned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PythonRuntimeAcquisition {
+    /// Every configured root was scanned and all evidence verified within
+    /// bounds. This does not mean any module's import binding was resolved.
+    #[default]
+    Complete,
+    /// Every configured source and installed root was scanned within bounds,
+    /// but some artifact evidence is unverified or a diagnostic was recorded.
+    EvidenceIncomplete,
+    /// Some configured root was not scanned within bounds.
+    ScopeIncomplete,
+    Cancelled,
+}
+
+impl PythonRuntimeArtifactReport {
+    pub fn acquisition(&self) -> PythonRuntimeAcquisition {
+        self.acquisition
+    }
+
+    pub fn complete(&self) -> bool {
+        self.acquisition == PythonRuntimeAcquisition::Complete
+    }
+
+    /// True when every configured source and installed root was scanned
     /// within the configured bounds.
-    pub scope_complete: bool,
-    /// Ambient interpreter path order and hooks are outside the explicit
-    /// source/installed universe, even when that configured universe is fully
-    /// scanned.
-    pub ambient_import_semantics_known: bool,
-    /// True when the bounded configured-input acquisition completed. This
-    /// does not mean any module's import binding was resolved.
-    pub complete: bool,
-    pub cancelled: bool,
+    pub fn scope_complete(&self) -> bool {
+        self.acquisition <= PythonRuntimeAcquisition::EvidenceIncomplete
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.acquisition == PythonRuntimeAcquisition::Cancelled
+    }
+
+    fn degrade(&mut self, observed: PythonRuntimeAcquisition) {
+        self.acquisition = self.acquisition.max(observed);
+    }
 }
 
 #[derive(Debug)]
@@ -299,8 +336,7 @@ fn scan_runtime_tree(
     while let Some((relative_directory, depth)) = pending.pop() {
         if is_cancelled(cancellation) {
             summary.complete = false;
-            report.cancelled = true;
-            report.scope_complete = false;
+            report.degrade(PythonRuntimeAcquisition::Cancelled);
             push_frontier(
                 report,
                 limits,
@@ -322,7 +358,7 @@ fn scan_runtime_tree(
             Ok(entries) => entries,
             Err(error) => {
                 summary.complete = false;
-                report.scope_complete = false;
+                report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                 push_frontier(
                     report,
                     limits,
@@ -342,8 +378,7 @@ fn scan_runtime_tree(
         for entry in entries {
             if is_cancelled(cancellation) {
                 summary.complete = false;
-                report.cancelled = true;
-                report.scope_complete = false;
+                report.degrade(PythonRuntimeAcquisition::Cancelled);
                 push_frontier(
                     report,
                     limits,
@@ -366,7 +401,7 @@ fn scan_runtime_tree(
                 Ok(entry) => entry,
                 Err(error) => {
                     summary.complete = false;
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     push_frontier(
                         report,
                         limits,
@@ -387,7 +422,7 @@ fn scan_runtime_tree(
             report.work.scan_entries_visited += 1;
             if summary.entries_visited > limits.max_source_files_per_artifact {
                 summary.complete = false;
-                report.scope_complete = false;
+                report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                 push_frontier(
                     report,
                     limits,
@@ -412,7 +447,7 @@ fn scan_runtime_tree(
                 Ok(metadata) => metadata,
                 Err(error) => {
                     summary.complete = false;
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     push_frontier(
                         report,
                         limits,
@@ -431,7 +466,7 @@ fn scan_runtime_tree(
             };
             if metadata.file_type().is_symlink() {
                 summary.complete = false;
-                report.scope_complete = false;
+                report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                 push_frontier(
                     report,
                     limits,
@@ -451,7 +486,7 @@ fn scan_runtime_tree(
                 Ok(relative) => relative.to_path_buf(),
                 Err(_) => {
                     summary.complete = false;
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     push_frontier(
                         report,
                         limits,
@@ -473,7 +508,7 @@ fn scan_runtime_tree(
                 let next_depth = depth + 1;
                 if next_depth > limits.max_source_path_depth {
                     summary.complete = false;
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     push_frontier(
                         report,
                         limits,
@@ -557,7 +592,7 @@ fn scan_runtime_tree(
         }
     }
     if !summary.complete {
-        report.scope_complete = false;
+        report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
     }
     scan.complete = summary.complete;
     report.scans.push(summary);
@@ -818,7 +853,6 @@ fn module_components_prefix(prefix: &[String], module: &[String]) -> bool {
 
 /// Select the production summary profile for one configured source environment.
 /// A declared runtime must verify; its failure never selects workspace authority.
-#[cfg(any(test, feature = "test-support"))]
 pub fn python_production_summary_profile(
     project: &dyn brokk_bifrost_core::analyzer::project::Project,
     runtime: Option<&PythonRuntimeEnvironmentConfig>,
@@ -1055,12 +1089,6 @@ pub fn verify_python_runtime_artifacts(
     cancellation: Option<&CancellationToken>,
 ) -> PythonRuntimeArtifactReport {
     let mut report = PythonRuntimeArtifactReport {
-        complete: true,
-        scope_complete: true,
-        // This provider never executes or interrogates an interpreter. A fully
-        // scanned explicit universe is useful evidence, but ambient semantics
-        // remain unknown in every configuration.
-        ambient_import_semantics_known: false,
         declared_environments: vec![None; environments.len().min(limits.max_dependencies)],
         ..PythonRuntimeArtifactReport::default()
     };
@@ -1094,8 +1122,7 @@ pub fn verify_python_runtime_artifacts(
 
     let environment_limit = environments.len().min(limits.max_dependencies);
     if environment_limit < environments.len() {
-        report.complete = false;
-        report.scope_complete = false;
+        report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
         report.work.artifacts_skipped = environments[environment_limit..]
             .iter()
             .fold(0_usize, |total, environment| {
@@ -1120,9 +1147,7 @@ pub fn verify_python_runtime_artifacts(
     {
         report.work.environments_considered += 1;
         if is_cancelled(cancellation) {
-            report.cancelled = true;
-            report.complete = false;
-            report.scope_complete = false;
+            report.degrade(PythonRuntimeAcquisition::Cancelled);
             break;
         }
 
@@ -1134,7 +1159,7 @@ pub fn verify_python_runtime_artifacts(
         ) {
             Ok(path) => Some(path),
             Err(error) => {
-                report.scope_complete = false;
+                report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                 push_diagnostic(
                     &mut report,
                     limits,
@@ -1182,7 +1207,7 @@ pub fn verify_python_runtime_artifacts(
                         standard_library_scans.push((root, scan));
                     }
                     Err(error) => {
-                        report.scope_complete = false;
+                        report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                         push_frontier(
                             &mut report,
                             limits,
@@ -1236,13 +1261,11 @@ pub fn verify_python_runtime_artifacts(
                 let code = match &error {
                     Error::MissingDeclaredEnvironment => None,
                     Error::Cancelled => {
-                        report.cancelled = true;
-                        report.complete = false;
+                        report.degrade(PythonRuntimeAcquisition::Cancelled);
                         Some("python.runtime.declared_environment.cancelled")
                     }
                     Error::LimitExceeded { .. } => {
-                        report.scope_complete = false;
-                        report.complete = false;
+                        report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                         Some("limit.python_runtime_declared_environment")
                     }
                     Error::UnsupportedLaunchSemantics { .. }
@@ -1295,8 +1318,7 @@ pub fn verify_python_runtime_artifacts(
                 if environment.declared_environment.is_some() {
                     // Failed acquisition may have consumed part of the byte budget.
                     // Do not begin another acquisition without exact accounting.
-                    report.complete = false;
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     break;
                 }
             }
@@ -1307,8 +1329,7 @@ pub fn verify_python_runtime_artifacts(
             .len()
             .min(limits.max_artifacts_per_dependency);
         if artifact_limit < environment.artifacts.len() {
-            report.complete = false;
-            report.scope_complete = false;
+            report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
             report.work.artifacts_skipped = report
                 .work
                 .artifacts_skipped
@@ -1334,9 +1355,7 @@ pub fn verify_python_runtime_artifacts(
             .enumerate()
         {
             if is_cancelled(cancellation) {
-                report.cancelled = true;
-                report.complete = false;
-                report.scope_complete = false;
+                report.degrade(PythonRuntimeAcquisition::Cancelled);
                 break;
             }
             report.work.artifacts_considered += 1;
@@ -1360,7 +1379,7 @@ pub fn verify_python_runtime_artifacts(
                     Some(path)
                 }
                 Err(error) => {
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     diagnostic_for_artifact(
                         &mut report,
                         limits,
@@ -1398,7 +1417,7 @@ pub fn verify_python_runtime_artifacts(
                     Some(path)
                 }
                 Err(error) => {
-                    report.scope_complete = false;
+                    report.degrade(PythonRuntimeAcquisition::ScopeIncomplete);
                     diagnostic_for_artifact(
                         &mut report,
                         limits,
@@ -1545,7 +1564,7 @@ pub fn verify_python_runtime_artifacts(
                                 &mut report,
                             );
                         }
-                        if report.cancelled {
+                        if report.cancelled() {
                             artifact.status = PythonRuntimeArtifactStatus::Cancelled;
                         }
                     }
@@ -1576,7 +1595,7 @@ pub fn verify_python_runtime_artifacts(
                         );
                         artifact_incomplete = true;
                         if is_cancelled(cancellation) {
-                            report.cancelled = true;
+                            report.degrade(PythonRuntimeAcquisition::Cancelled);
                         }
                     }
                 }
@@ -1609,17 +1628,16 @@ pub fn verify_python_runtime_artifacts(
                 };
             }
             report.artifacts.push(artifact);
-            if report.cancelled {
+            if report.cancelled() {
                 break;
             }
         }
-        if report.cancelled {
+        if report.cancelled() {
             break;
         }
     }
 
     mark_conflicting_runtime_providers(&mut report, limits);
-    report.complete &= report.scope_complete;
     report
 }
 
@@ -1660,8 +1678,7 @@ fn verify_wheel(
     let mut entries_in_archive = 0_usize;
     for index in 0..archive.len() {
         if is_cancelled(cancellation) {
-            report.cancelled = true;
-            report.complete = false;
+            report.degrade(PythonRuntimeAcquisition::Cancelled);
             complete = false;
             break;
         }
@@ -2018,8 +2035,7 @@ fn verify_wheel(
                 None
             }
             Err(ZipMemberReadError::Cancelled) => {
-                report.cancelled = true;
-                report.complete = false;
+                report.degrade(PythonRuntimeAcquisition::Cancelled);
                 complete = false;
                 None
             }
@@ -2070,8 +2086,7 @@ fn verify_wheel(
     let mut modules = Vec::with_capacity(runtime_entries.len());
     for candidate in runtime_entries {
         if is_cancelled(cancellation) {
-            report.cancelled = true;
-            report.complete = false;
+            report.degrade(PythonRuntimeAcquisition::Cancelled);
             complete = false;
             break;
         }
@@ -2096,8 +2111,7 @@ fn verify_wheel(
                 continue;
             }
             Err(ZipMemberReadError::Cancelled) => {
-                report.cancelled = true;
-                report.complete = false;
+                report.degrade(PythonRuntimeAcquisition::Cancelled);
                 complete = false;
                 modules.push(unresolved_module(candidate));
                 break;
@@ -2195,8 +2209,7 @@ fn verify_wheel(
                     (None, None, None, PythonRuntimeModuleStatus::Unresolved)
                 }
                 Err(InstalledCandidateError::Cancelled) => {
-                    report.cancelled = true;
-                    report.complete = false;
+                    report.degrade(PythonRuntimeAcquisition::Cancelled);
                     complete = false;
                     (None, None, None, PythonRuntimeModuleStatus::Unresolved)
                 }
@@ -2218,7 +2231,7 @@ fn verify_wheel(
             },
             import_status: PythonRuntimeImportStatus::Unresolved,
         });
-        if report.cancelled {
+        if report.cancelled() {
             break;
         }
     }
@@ -2542,7 +2555,7 @@ fn mark_conflicting_runtime_providers(
     report: &mut PythonRuntimeArtifactReport,
     limits: &DependencyPackLimits,
 ) {
-    if report.cancelled {
+    if report.cancelled() {
         return;
     }
     let mut providers: HashMap<(usize, String), Vec<(usize, usize)>> = HashMap::new();
@@ -2631,7 +2644,7 @@ fn push_diagnostic(
     location: Option<PathBuf>,
     mut message: String,
 ) {
-    report.complete = false;
+    report.degrade(PythonRuntimeAcquisition::EvidenceIncomplete);
     if report.diagnostics.len() >= limits.max_diagnostics {
         report.suppressed_diagnostics = report.suppressed_diagnostics.saturating_add(1);
         return;
@@ -2660,7 +2673,7 @@ fn push_frontier(
 ) {
     if report.frontiers.len() >= limits.max_diagnostics {
         report.suppressed_frontiers = report.suppressed_frontiers.saturating_add(1);
-        report.complete = false;
+        report.degrade(PythonRuntimeAcquisition::EvidenceIncomplete);
         return;
     }
     let limit = limits.max_diagnostic_message_bytes;
@@ -2785,9 +2798,8 @@ mod tests {
         let environments = runtime_environment("src", "demo.whl", "site");
 
         let matching = verify(workspace.path(), &environments);
-        assert!(matching.complete);
-        assert!(matching.scope_complete);
-        assert!(!matching.ambient_import_semantics_known);
+        assert!(matching.complete());
+        assert!(matching.scope_complete());
         let matched_artifact = &matching.artifacts[0];
         let original_digest = matched_artifact
             .archive_sha256
@@ -2821,7 +2833,7 @@ mod tests {
             mutated_artifact.modules[0].installed_bytes_match,
             Some(false)
         );
-        assert!(!mutated.complete);
+        assert!(!mutated.complete());
     }
 
     #[test]
@@ -2848,7 +2860,7 @@ mod tests {
         let module = &report.artifacts[0].modules[0];
         assert_eq!(module.status, PythonRuntimeModuleStatus::BytesMatched);
         assert_eq!(module.import_status, PythonRuntimeImportStatus::Conflict);
-        assert!(report.scope_complete);
+        assert!(report.scope_complete());
         assert!(report.frontiers.iter().any(|frontier| {
             frontier.kind == PythonRuntimeFrontierKind::ExtraInstalledCandidate
                 && frontier.path.as_deref() == Some(installed.join("extra.py").as_path())

@@ -17,7 +17,7 @@
 //! selected environment; they never assert that an import executed.
 pub(crate) use crate::analyzer::resolution::temporal_binding::TemporalRank;
 use crate::analyzer::resolution::temporal_binding::{
-    Effect, Event, EventOrdering, Region, TemporalBudget, TemporalSelection,
+    Effect, Event, EventOrdering, Region, Stop, TemporalBudget, TemporalSelection,
 };
 use crate::analyzer::store::python_binding_rows::PythonBindingRows;
 use brokk_bifrost_core::analyzer::resolution_facts::{
@@ -48,6 +48,9 @@ pub(crate) struct PythonBindingProofs {
     /// Selected invocation/module authority proves these external cells have
     /// reached their normal completion point for this observation.
     pub(crate) completed_scopes: Vec<u32>,
+    /// Earliest initialization reference that can lead to this invocation.
+    /// Only module writes committed by this point have settled chronology.
+    pub(crate) initialization_start: Option<usize>,
     /// Complete cell inventory plus current mutation checks prove this name
     /// absent in every observation. This does not claim invocation/completion.
     pub(crate) absent_scopes: Vec<u32>,
@@ -59,6 +62,12 @@ pub(crate) struct PythonBindingProofs {
     pub(crate) route_bindings: Vec<PythonRouteBinding>,
     pub(crate) absent_star_members: Vec<(u32, String)>,
     pub(crate) source_completion: Option<crate::analyzer::resolution::ResolutionCompletion>,
+    /// Alternatives excluded by this successful-read projection, not by source order.
+    pub(crate) removed_writers: Vec<u32>,
+    /// Remaining occurrences proved to have the same selected target.
+    pub(crate) equivalent_writers: Vec<u32>,
+    /// Opaque guard arms whose cell coverage was proved after projection.
+    pub(crate) closed_guards: Vec<u32>,
 }
 #[derive(Debug)]
 struct Observation {
@@ -66,6 +75,7 @@ struct Observation {
     execution_scope: brokk_bifrost_core::analyzer::resolution_facts::ResolutionScopeId,
     point_byte: usize,
     kind: ResolutionBindingObservationKind,
+    pending_event: Option<u32>,
 }
 impl From<ResolutionBindingObservationFact> for Observation {
     fn from(source: ResolutionBindingObservationFact) -> Self {
@@ -74,6 +84,7 @@ impl From<ResolutionBindingObservationFact> for Observation {
             execution_scope: source.execution_scope,
             point_byte: source.point_byte,
             kind: source.kind,
+            pending_event: None,
         }
     }
 }
@@ -94,6 +105,234 @@ impl PythonLexical {
     pub(crate) fn conditional_import_identity(&self, site: u32) -> bool {
         self.proofs.conditional_imports.contains(&site)
     }
+
+    pub(crate) fn selected_import_identity_is_unique(
+        &self,
+        rows: &PythonBindingRows,
+        scope: u32,
+        event: u32,
+    ) -> bool {
+        if !self.selects_only_import(event) {
+            return false;
+        }
+        match fixed_writer_identity(rows, scope, &self.name, &self.proofs, &self.observation) {
+            WriterIdentity::Fixed => true,
+            WriterIdentity::UnverifiedImport(selected) => selected == event,
+            WriterIdentity::BuiltinFallback | WriterIdentity::Open => false,
+        }
+    }
+
+    fn selects_only_import(&self, event: u32) -> bool {
+        self.selection.stopped.is_none()
+            && !self.selection.selected.is_empty()
+            && self
+                .selection
+                .selected
+                .iter()
+                .all(|selected| selected.occurrence == event)
+    }
+
+    /// An import boundary can be known in its executing scope even when a
+    /// later write prevents whole-cell identity proof. In particular the RHS
+    /// of `version = version` still reads the preceding import. This proof
+    /// never admits a runtime/model identity or closes the imported provider.
+    pub(crate) fn selected_import_boundary_is_unique(
+        &self,
+        rows: &PythonBindingRows,
+        scope: u32,
+        event: u32,
+    ) -> bool {
+        if self.selected_import_identity_is_unique(rows, scope, event) {
+            return true;
+        }
+        self.selects_only_import(event)
+            && self.observation.reference.is_some()
+            && !self.proofs.open_scopes.contains(&scope)
+            && self.proofs.source_completion.as_ref().is_none_or(|completion| *completion == crate::analyzer::resolution::ResolutionCompletion::Complete)
+            && !rows.import_positions.iter().any(|(site, owner, _)| *owner == scope && rows.imports.iter().any(|import| import.import_site.get() == *site && import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::Star))
+            && rows.events.iter().find(|writer| writer.event == event).is_some_and(|writer| {
+                writer.kind == ResolutionBindingEventKind::Import
+                    && writer.execution_scope == scope
+                    && writer.execution_scope == self.observation.execution_scope.get()
+                    && writer.commit_byte <= self.observation.point_byte
+                    && guard_chain(rows, writer.target).is_empty()
+            })
+    }
+}
+
+/// Re-evaluate a successful-read projection with one retained target identity.
+/// All source writers remain authoritative: an unselected writer or a hole in
+/// an exception arm prevents the opaque choice from becoming a fixed identity.
+pub(crate) fn project_alternatives(
+    state: &mut PythonLexical,
+    rows: &PythonBindingRows,
+    removed: Vec<u32>,
+    imports: Vec<u32>,
+    budget: &mut impl TemporalBudget,
+) -> Result<bool, Stop> {
+    let surviving = state
+        .selection
+        .selected
+        .iter()
+        .filter(|selected| !removed.contains(&selected.occurrence))
+        .map(|selected| selected.occurrence)
+        .collect::<Vec<_>>();
+    let Some(writer) = surviving
+        .first()
+        .and_then(|event| rows.events.iter().find(|row| row.event == *event))
+    else {
+        return Ok(false);
+    };
+    let slot = writer.slot;
+    if removed.is_empty()
+        || state.selection.selected.iter().any(|selected| {
+            !rows
+                .events
+                .iter()
+                .any(|event| event.event == selected.occurrence && event.slot == slot)
+        })
+    {
+        return Ok(false);
+    }
+    state.proofs.removed_writers = removed;
+    state.proofs.equivalent_writers = surviving;
+    state.proofs.conditional_imports.extend(imports);
+    let mut families = state
+        .proofs
+        .equivalent_writers
+        .iter()
+        .flat_map(|occurrence| {
+            let event = rows
+                .events
+                .iter()
+                .find(|event| event.event == *occurrence)
+                .expect("retained projected writer");
+            guard_chain(rows, event.target)
+                .into_iter()
+                .filter(move |guard| guard.execution_scope.get() == event.execution_scope)
+        })
+        .filter(|guard| {
+            matches!(
+                guard.kind,
+                PythonNativeGuardKind::TryBody | PythonNativeGuardKind::ExceptArm
+            )
+        })
+        .collect::<Vec<_>>();
+    families.sort_unstable_by_key(|guard| std::cmp::Reverse(guard.id));
+    let mut visited = Vec::new();
+    for family in families {
+        budget.step()?;
+        if visited.contains(&family.site) {
+            continue;
+        }
+        visited.push(family.site);
+        let arms = rows
+            .guards
+            .iter()
+            .filter(|guard| {
+                guard.site == family.site
+                    && guard.execution_scope == family.execution_scope
+                    && guard.parent == family.parent
+            })
+            .collect::<Vec<_>>();
+        if arms.iter().any(|arm| {
+            !matches!(
+                arm.kind,
+                PythonNativeGuardKind::TryBody | PythonNativeGuardKind::ExceptArm
+            )
+        }) {
+            continue;
+        }
+        let entry = rows
+            .events
+            .iter()
+            .filter(|event| {
+                event.slot == slot
+                    && event.execution_scope == family.execution_scope.get()
+                    && guard_chain(rows, event.target)
+                        .iter()
+                        .any(|guard| guard.site == family.site)
+            })
+            .map(|event| event.entry_byte)
+            .min()
+            .expect("the surviving writer is in this try family");
+        let mut closed = true;
+        for arm in &arms {
+            let mut coverage = TemporalSelection::new(Region::default());
+            let mut writes = Vec::new();
+            for event in rows.events.iter().filter(|event| event.slot == slot) {
+                budget.step()?;
+                if !(state.proofs.removed_writers.contains(&event.event)
+                    || state.proofs.equivalent_writers.contains(&event.event))
+                    || event.execution_scope != arm.execution_scope.get()
+                    || !guard_chain(rows, event.target)
+                        .iter()
+                        .any(|guard| guard.id == arm.id)
+                        && !(event.commit_byte <= entry
+                            && !guard_chain(rows, event.target)
+                                .iter()
+                                .any(|guard| guard.site == family.site))
+                {
+                    continue;
+                }
+                let (region, open) =
+                    guard_region(rows, event.target, state.profile, &state.proofs, &[*arm]);
+                if let Some(region) = region {
+                    writes.push(Event {
+                        occurrence: event.event,
+                        point: (event.commit_byte, event.phase, event.event),
+                        completion: crate::analyzer::resolution::ResolutionCompletion::Complete,
+                        ordering: EventOrdering::Positioned,
+                        region,
+                        effect: match event.kind {
+                            ResolutionBindingEventKind::Annotation => Effect::NoWrite,
+                            ResolutionBindingEventKind::Delete => Effect::Delete,
+                            _ => Effect::Write,
+                        },
+                        certain: !open,
+                    });
+                }
+            }
+            coverage.scope(writes, false, budget);
+            if let Some(stop) = coverage.stopped {
+                return Err(stop);
+            }
+            closed &= !coverage.open && coverage.residual.is_empty() && coverage.unbound.is_empty();
+        }
+        if closed {
+            state
+                .proofs
+                .closed_guards
+                .extend(arms.iter().map(|guard| guard.id));
+        }
+    }
+    reset_selection(state, rows);
+    Ok(true)
+}
+
+fn reset_selection(state: &mut PythonLexical, rows: &PythonBindingRows) {
+    let reference = state
+        .observation
+        .reference
+        .expect("projected source observation");
+    let proofs = std::mem::take(&mut state.proofs);
+    *state = lexical_selection(rows, reference, &state.name, state.profile, proofs)
+        .expect("the existing projected observation remains reachable");
+}
+
+/// Admission fixes this import's identity conditional on a successful read.
+/// Reuse the temporal selector with that proof; it still checks all writers,
+/// scopes, guards and observation regions.
+pub(crate) fn admit_import(
+    state: &mut PythonLexical,
+    rows: &PythonBindingRows,
+    import_site: u32,
+    budget: &mut impl TemporalBudget,
+    cancellation: &crate::CancellationToken,
+) -> crate::analyzer::store::Result<()> {
+    state.proofs.conditional_imports.push(import_site);
+    reset_selection(state, rows);
+    select_lexical(state, rows, budget, cancellation)
 }
 
 pub(crate) fn unconditional_import(rows: &PythonBindingRows, site: u32) -> bool {
@@ -104,6 +343,10 @@ pub(crate) fn unconditional_import(rows: &PythonBindingRows, site: u32) -> bool 
 enum WriterIdentity {
     Fixed,
     BuiltinFallback,
+    // The writer event is unique, but its imported provider is not admitted.
+    // Temporal reduction still treats it as open; external admission can use
+    // this event proof without claiming that the import executed.
+    UnverifiedImport(u32),
     Open,
 }
 
@@ -140,41 +383,61 @@ fn fixed_writer_identity(
         .filter(|event| {
             slot.is_some_and(|slot| event.slot == slot.slot)
                 && event.kind != ResolutionBindingEventKind::Annotation
+                && Some(event.event) != observation.pending_event
+                && !proofs.removed_writers.contains(&event.event)
         })
         .collect::<Vec<_>>();
     let stars = rows.import_positions.iter().filter(|(site, owner, _)| *owner == scope && rows.imports.iter().any(|import| import.import_site.get() == *site && import.form == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::Star) && !proofs.absent_star_members.iter().any(|(absent,n)| absent == site && n == name)).map(|(site,_,_)| *site).collect::<Vec<_>>();
-    if writers.len() + stars.len() != 1 {
+    let equivalent = !writers.is_empty()
+        && stars.is_empty()
+        && writers
+            .iter()
+            .all(|writer| proofs.equivalent_writers.contains(&writer.event));
+    if writers.len() + stars.len() != 1 && !equivalent {
         return WriterIdentity::Open;
     }
-    if let Some(event) = writers.first() {
-        if event.kind == ResolutionBindingEventKind::Delete
-            || !guard_chain(rows, event.target).is_empty()
-        {
-            return WriterIdentity::Open;
+    if !writers.is_empty() {
+        let entered = observation
+            .reference
+            .map(|site| guard_chain(rows, site))
+            .unwrap_or_default();
+        for event in &writers {
+            if event.kind == ResolutionBindingEventKind::Delete
+                || guard_chain(rows, event.target).iter().any(|guard| {
+                    !proofs.closed_guards.contains(&guard.id)
+                        && !entered.iter().any(|observed| observed.id == guard.id)
+                })
+            {
+                return WriterIdentity::Open;
+            }
+            if event.execution_scope != scope
+                && rows
+                    .scopes
+                    .iter()
+                    .any(|row| row.scope == scope && row.parent.is_none())
+                && brokk_bifrost_python::intrinsics::builtin(name).is_some()
+                && (event.execution_scope != observation.execution_scope.get()
+                    || event.commit_byte > observation.point_byte)
+            {
+                return WriterIdentity::BuiltinFallback;
+            }
+            let fixed = event.kind != ResolutionBindingEventKind::Import
+                || rows.imports.iter().any(|import| {
+                    import.binding_event == Some(event.event)
+                        && proofs
+                            .conditional_imports
+                            .contains(&import.import_site.get())
+                });
+            if !fixed {
+                debug_assert_eq!(event.kind, ResolutionBindingEventKind::Import);
+                return if writers.len() == 1 {
+                    WriterIdentity::UnverifiedImport(event.event)
+                } else {
+                    WriterIdentity::Open
+                };
+            }
         }
-        if event.execution_scope != scope
-            && rows
-                .scopes
-                .iter()
-                .any(|row| row.scope == scope && row.parent.is_none())
-            && brokk_bifrost_python::intrinsics::builtin(name).is_some()
-            && (event.execution_scope != observation.execution_scope.get()
-                || event.commit_byte > observation.point_byte)
-        {
-            return WriterIdentity::BuiltinFallback;
-        }
-        let fixed = event.kind != ResolutionBindingEventKind::Import
-            || rows.imports.iter().any(|import| {
-                import.binding_event == Some(event.event)
-                    && proofs
-                        .conditional_imports
-                        .contains(&import.import_site.get())
-            });
-        return if fixed {
-            WriterIdentity::Fixed
-        } else {
-            WriterIdentity::Open
-        };
+        return WriterIdentity::Fixed;
     }
     let fixed = proofs.route_bindings.iter().any(|route| {
         stars.contains(&route.import_site)
@@ -231,7 +494,13 @@ pub(crate) fn lexical_selection(
         .observations
         .iter()
         .find(|observation| observation.reference.get() == reference_site)?;
-    let (region, _) = guard_region(rows, reference_site, profile, &proofs);
+    let (region, _) = guard_region(
+        rows,
+        reference_site,
+        profile,
+        &proofs,
+        &guard_chain(rows, reference_site),
+    );
     let mut selection = TemporalSelection::new(region?);
     selection.open = guard_chain(rows, reference_site)
         .iter()
@@ -283,6 +552,85 @@ pub(crate) fn module_selection(
     completed_scope_selection(rows, scope, name, profile, proofs)
 }
 
+/// A package importing from itself reads its current dictionary before the
+/// import writes its local alias, including when the import is inside a loop.
+pub(crate) fn module_initialization_event(
+    rows: &PythonBindingRows,
+    import_site: u32,
+) -> Option<&crate::analyzer::store::python_binding_rows::BindingEvent> {
+    let import = rows.imports.iter().find(|import| {
+        import.import_site.get() == import_site
+            && import.form
+                == brokk_bifrost_core::analyzer::resolution_facts::PythonNativeImportForm::From
+    })?;
+    let event = rows
+        .events
+        .iter()
+        .find(|event| Some(event.event) == import.binding_event)?;
+    // Class bodies execute as part of their enclosing invocation; a function
+    // remains a deferred boundary even when it contains another class body.
+    let execution = find_scope_in_chain(
+        Some(ResolutionScopeId::new(event.execution_scope)),
+        |scope| {
+            rows.scopes
+                .iter()
+                .find(|row| row.scope == scope.get())
+                .expect("retained execution scope")
+                .parent
+                .map(ResolutionScopeId::new)
+        },
+        |scope| {
+            !rows
+                .scopes
+                .iter()
+                .find(|row| row.scope == scope.get())
+                .expect("retained execution scope")
+                .class_body
+        },
+    )
+    .expect("execution scope chain reaches the module");
+    rows.scopes
+        .iter()
+        .find(|scope| scope.scope == execution.get())?
+        .parent
+        .is_none()
+        .then_some(event)
+}
+
+pub(crate) fn initializing_module_selection(
+    rows: &PythonBindingRows,
+    import_site: u32,
+    name: &str,
+    profile: PythonBindingProfile,
+    proofs: PythonBindingProofs,
+) -> Option<PythonLexical> {
+    let root = rows.scopes.iter().find(|scope| scope.parent.is_none())?;
+    let event = module_initialization_event(rows, import_site)?;
+    let (region, guard_open) = guard_region(rows, import_site, profile, &proofs, &[]);
+    let open = guard_open || region.is_none() || !guard_chain(rows, import_site).is_empty();
+    let mut selection = TemporalSelection::new(region.unwrap_or_default());
+    selection.open = open;
+    if let Some(completion) = &proofs.source_completion {
+        selection.completion = selection.completion.combine(completion);
+    }
+    Some(PythonLexical {
+        selection,
+        start_scope: root.scope,
+        deferred_module_scope: None,
+        builtin_fallback: false,
+        observation: Observation {
+            reference: Some(import_site),
+            execution_scope: ResolutionScopeId::new(event.execution_scope),
+            point_byte: event.entry_byte,
+            kind: ResolutionBindingObservationKind::Immediate,
+            pending_event: Some(event.event),
+        },
+        name: name.to_owned(),
+        profile,
+        proofs,
+    })
+}
+
 /// A selected authored class's completed body is a dictionary boundary, not an
 /// environment module and not a fabricated positioned name reference.
 pub(crate) fn class_selection(
@@ -318,6 +666,7 @@ fn completed_scope_selection(
         execution_scope: ResolutionScopeId::new(scope),
         point_byte: usize::MAX,
         kind: ResolutionBindingObservationKind::Immediate,
+        pending_event: None,
     };
     let mut selection = TemporalSelection::new(Region::default());
     // A unique writer fixes identity without proving import activation or the
@@ -419,6 +768,9 @@ pub(crate) fn lexical_tier(
         state.selection.residual.clear();
         return;
     }
+    // Namespace uncertainty also applies to postponed annotations whose
+    // retained lexical execution scope is the module itself.
+    state.selection.open |= state.proofs.open_scopes.contains(&scope);
     let slot = lexical_slot(state, rows, scope);
     let whole_scope = slot.is_some_and(|slot| slot.whole_scope);
     let writer_identity =
@@ -434,6 +786,7 @@ pub(crate) fn lexical_tier(
     // Class bodies execute in the enclosing invocation, so skip them when
     // finding the execution boundary of a class nested in a function.
     let deferred_external = (state.observation.kind == ResolutionBindingObservationKind::Deferred
+        || state.proofs.initialization_start.is_some()
         || fixed_writer
         || state.proofs.open_scopes.contains(&scope))
         && find_scope_in_chain(
@@ -459,7 +812,7 @@ pub(crate) fn lexical_tier(
         .expect("execution scope chain reaches the module")
         .get()
             != scope;
-    if deferred_external
+    if (deferred_external || state.observation.kind == ResolutionBindingObservationKind::Deferred)
         && rows
             .scopes
             .iter()
@@ -472,6 +825,29 @@ pub(crate) fn lexical_tier(
         .reference
         .map(|site| guard_chain(rows, site))
         .unwrap_or_default();
+    // The innermost iteration binding of this cell resets it before every
+    // body read. Only loops nested inside that reset can carry older writes.
+    let iteration_reset = observed_guards
+        .iter()
+        .enumerate()
+        .find_map(|(index, guard)| {
+            rows.events
+                .iter()
+                .find(|event| {
+                    slot.is_some_and(|slot| slot.slot == event.slot)
+                        && event.kind == ResolutionBindingEventKind::Iteration
+                        && event.execution_scope == state.observation.execution_scope.get()
+                        && guard.kind == PythonNativeGuardKind::LoopBody
+                        && guard_chain(rows, event.target)
+                            .iter()
+                            .find(|writer| writer.kind == PythonNativeGuardKind::LoopBody)
+                            .is_some_and(|writer| writer.id == guard.id)
+                })
+                .map(|event| (index, event))
+        });
+    let carried_guards = iteration_reset.map_or(observed_guards.as_slice(), |(index, _)| {
+        &observed_guards[..index]
+    });
     // A loop changes a cell's identity only through writes in that loop.
     // A nested def that writes through global is already an other-scope writer
     // in the cell inventory; it needs no special case here.
@@ -480,9 +856,10 @@ pub(crate) fn lexical_tier(
             *execution == state.observation.execution_scope.get()
                 && region.contains(&state.observation.point_byte)
                 && region.contains(&point)
+                && iteration_reset.is_none_or(|(_, reset)| region.start > reset.entry_byte)
         }) || guard_chain(rows, site).iter().any(|writer| {
             writer.kind == PythonNativeGuardKind::LoopBody
-                && observed_guards.iter().any(|observed| {
+                && carried_guards.iter().any(|observed| {
                     matches!(
                         observed.kind,
                         PythonNativeGuardKind::LoopBody | PythonNativeGuardKind::LoopElse
@@ -506,22 +883,53 @@ pub(crate) fn lexical_tier(
                 *site == import.import_site.get() && *owner == scope && loop_carried(*site, *point)
             })
     });
+    // A completed module precedes this invocation even if the function body
+    // occurs earlier in the file. Keep source order within each execution;
+    // writers from unrelated invocations are still Unordered below.
+    let invocation_start = if deferred_external && state.proofs.completed_scopes.contains(&scope) {
+        rows.events
+            .iter()
+            .map(|event| event.commit_byte)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("Python invocation coordinate")
+    } else {
+        state.proofs.initialization_start.unwrap_or(0)
+    };
     let mut events = rows
         .events
         .iter()
-        .filter(|event| slot.is_some_and(|slot| event.slot == slot.slot))
+        .filter(|event| {
+            slot.is_some_and(|slot| event.slot == slot.slot)
+                && Some(event.event) != state.observation.pending_event
+                && !state.proofs.removed_writers.contains(&event.event)
+        })
         .flat_map(|event| {
             let (region, guard_open) = if event.kind == ResolutionBindingEventKind::Parameter {
                 // Invocation entry initializes parameters; creation-time guards
                 // on a conditional def are not conditions on its body bindings.
                 (Some(Region::default()), false)
             } else {
-                guard_region(rows, event.target, state.profile, &state.proofs)
+                guard_region(
+                    rows,
+                    event.target,
+                    state.profile,
+                    &state.proofs,
+                    &observed_guards,
+                )
             };
             let event_guards = guard_chain(rows, event.target);
-            let shared_loop = outermost_shared_loop(&event_guards, &observed_guards);
+            let shared_loop = outermost_shared_loop(&event_guards, carried_guards);
             let iteration_active =
-                event.kind == ResolutionBindingEventKind::Iteration && shared_loop.is_some();
+                iteration_reset.is_some_and(|(_, reset)| reset.event == event.event);
+            let before_reset = iteration_reset.is_some_and(|(index, reset)| {
+                event.event != reset.event
+                    && event.execution_scope == reset.execution_scope
+                    && !event_guards
+                        .iter()
+                        .any(|guard| guard.id == observed_guards[index].id)
+            });
             let committed = event.commit_byte <= state.observation.point_byte || iteration_active;
             let previous_iteration = !committed && shared_loop.is_some();
             let same_execution = event.execution_scope == state.observation.execution_scope.get();
@@ -529,8 +937,14 @@ pub(crate) fn lexical_tier(
             // including writes redirected through global or nonlocal.
             let known_outer_execution = fixed_writer
                 || (event.execution_scope == scope
-                    && (!deferred_external || state.proofs.completed_scopes.contains(&scope)));
-            let effect = if region.is_none()
+                    && (!deferred_external
+                        || state.proofs.completed_scopes.contains(&scope)
+                        || state
+                            .proofs
+                            .initialization_start
+                            .is_some_and(|point| event.commit_byte <= point)));
+            let effect = if before_reset
+                || region.is_none()
                 || ((same_execution
                     || (!deferred_external && !(fixed_writer && event.execution_scope != scope)))
                     && !committed
@@ -560,9 +974,30 @@ pub(crate) fn lexical_tier(
             } else {
                 (region, earlier)
             };
+            // A comprehension spells its target after the body expression.
+            // Put the reset at iteration entry; same-execution writers outside
+            // its body have already been excluded by before_reset.
             let primary = Event {
                 occurrence: event.event,
-                point: (event.commit_byte, event.phase, event.event),
+                point: (
+                    if same_execution {
+                        invocation_start
+                            .checked_add(
+                                if iteration_reset
+                                    .is_some_and(|(_, reset)| reset.event == event.event)
+                                {
+                                    0
+                                } else {
+                                    event.commit_byte
+                                },
+                            )
+                            .expect("Python invocation write coordinate")
+                    } else {
+                        event.commit_byte
+                    },
+                    event.phase,
+                    event.event,
+                ),
                 completion: crate::analyzer::resolution::ResolutionCompletion::Complete,
                 ordering: if previous_iteration || !(same_execution || known_outer_execution) {
                     EventOrdering::Unordered
@@ -572,7 +1007,7 @@ pub(crate) fn lexical_tier(
                 region: region.unwrap_or_default(),
                 effect,
                 certain: activation
-                    && (!guard_open || iteration_active)
+                    && (!guard_open || iteration_active || fixed_writer)
                     && !previous_iteration
                     && (same_execution || known_outer_execution),
             };
@@ -594,7 +1029,15 @@ pub(crate) fn lexical_tier(
             continue;
         }
         let import_guards = guard_chain(rows, import_site);
-        let shared_loop = outermost_shared_loop(&import_guards, &observed_guards);
+        if iteration_reset.is_some_and(|(index, reset)| {
+            import_scope == reset.execution_scope
+                && !import_guards
+                    .iter()
+                    .any(|guard| guard.id == observed_guards[index].id)
+        }) {
+            continue;
+        }
+        let shared_loop = outermost_shared_loop(&import_guards, carried_guards);
         let committed = point <= state.observation.point_byte;
         let previous_iteration = !committed && shared_loop.is_some();
         if !deferred_external && !committed && !previous_iteration {
@@ -627,7 +1070,13 @@ pub(crate) fn lexical_tier(
                     .any(|event| event.event == route.occurrence),
                 "route occurrence aliases source event: {route:?}"
             );
-            let (region, open) = guard_region(rows, import_site, state.profile, &state.proofs);
+            let (region, open) = guard_region(
+                rows,
+                import_site,
+                state.profile,
+                &state.proofs,
+                &observed_guards,
+            );
             let effect = if region.is_some() {
                 Effect::Write
             } else {
@@ -682,6 +1131,13 @@ pub(crate) fn lexical_tier(
     // Different reaching writers are alternatives, even when their inventory
     // is complete. An import's conditional identity cannot close that choice.
     if state.selection.selected.len() > 1
+        && !(fixed_writer
+            && state.selection.selected.iter().all(|selected| {
+                state
+                    .proofs
+                    .equivalent_writers
+                    .contains(&selected.occurrence)
+            }))
         && state.selection.selected.iter().any(|selected| {
             rows.events.iter().any(|event| {
                 event.event == selected.occurrence
@@ -694,6 +1150,24 @@ pub(crate) fn lexical_tier(
         })
     {
         state.selection.open = true;
+    }
+    if lexical_parent(state, rows, scope).is_none()
+        && let Some(reference) = state.observation.reference
+    {
+        let (given, _) = guard_region(
+            rows,
+            reference,
+            state.profile,
+            &state.proofs,
+            &guard_chain(rows, reference),
+        );
+        let given = given.expect("the selected observation's entered region remains reachable");
+        // Keep the uncovered state itself, including an empty conjunction.
+        // Only its already-given decisions are vacuous. Do this after scope
+        // selection so earlier iterations retain their independent choices.
+        for residual in &mut state.selection.residual {
+            residual.0.retain(|decision| !given.0.contains(decision));
+        }
     }
 }
 
@@ -726,10 +1200,19 @@ fn guard_region(
     site: u32,
     profile: PythonBindingProfile,
     proofs: &PythonBindingProofs,
+    entered: &[&PythonNativeGuardFact],
 ) -> (Option<Region>, bool) {
     let mut decisions = Vec::new();
     let mut open = false;
     for row in guard_chain(rows, site) {
+        if proofs.closed_guards.contains(&row.id)
+            || (!matches!(
+                row.kind,
+                PythonNativeGuardKind::IfTrue | PythonNativeGuardKind::IfFalse
+            ) && entered.iter().any(|guard| guard.id == row.id))
+        {
+            continue;
+        }
         match row.kind {
             PythonNativeGuardKind::IfTrue | PythonNativeGuardKind::IfFalse => {
                 let arm = row.kind == PythonNativeGuardKind::IfTrue;
@@ -754,8 +1237,18 @@ fn guard_region(
                         _ => None,
                     });
                 if let Some(truth) = truth {
-                    if truth != arm {
+                    // Identity inside an arm assumes that arm was entered.
+                    // Apply the same assumption to both arms of its predicate,
+                    // so an opposite-arm writer cannot reach this observation.
+                    let assumed = entered
+                        .iter()
+                        .find(|guard| decision_key(guard) == decision_key(row))
+                        .map_or(truth, |guard| guard.kind == PythonNativeGuardKind::IfTrue);
+                    if assumed != arm {
                         return (None, open);
+                    }
+                    if assumed != truth {
+                        decisions.push((decision_key(row), arm));
                     }
                 } else {
                     decisions.push((decision_key(row), arm));
@@ -876,6 +1369,53 @@ pub(crate) fn select_lexical(
         cancellation,
     )?;
     Ok(())
+}
+
+/// An import attaches module attributes when its completed execution dominates
+/// this read. Regions and their subtraction remain the shared selector's work.
+pub(crate) fn import_dominates(
+    rows: &PythonBindingRows,
+    import_site: u32,
+    reference_site: u32,
+    profile: PythonBindingProfile,
+    budget: &mut impl TemporalBudget,
+) -> Result<bool, Stop> {
+    let Some(import) = rows
+        .imports
+        .iter()
+        .find(|row| row.import_site.get() == import_site)
+    else {
+        return Ok(false);
+    };
+    let Some(event) = rows
+        .events
+        .iter()
+        .find(|row| Some(row.event) == import.binding_event)
+    else {
+        return Ok(false);
+    };
+    let Some(observed) = rows
+        .observations
+        .iter()
+        .find(|row| row.reference.get() == reference_site)
+    else {
+        return Ok(false);
+    };
+    if event.commit_byte > observed.point_byte
+        || (event.execution_scope != observed.execution_scope.get() && event.execution_scope != 0)
+    {
+        return Ok(false);
+    }
+    let proofs = PythonBindingProofs::default();
+    let entered = guard_chain(rows, reference_site);
+    let (writer, writer_open) = guard_region(rows, event.target, profile, &proofs, &entered);
+    let (reader, reader_open) = guard_region(rows, reference_site, profile, &proofs, &entered);
+    match (writer, reader) {
+        (Some(writer), Some(reader)) if !writer_open && !reader_open => {
+            Ok(reader.subtract(&writer, budget)?.is_empty())
+        }
+        _ => Ok(false),
+    }
 }
 
 #[cfg(test)]

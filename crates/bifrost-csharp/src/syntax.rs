@@ -218,9 +218,9 @@ pub fn csharp_transparent_expression_parent(current: Node<'_>, parent: Node<'_>)
 }
 
 /// Resolve each direct argument node of a C# generic-name type argument list.
-pub fn map_csharp_type_arguments<T>(
-    arguments: Option<Node<'_>>,
-    resolve: impl FnMut(Node<'_>) -> Option<T>,
+pub fn map_csharp_type_arguments<'tree, T>(
+    arguments: Option<Node<'tree>>,
+    resolve: impl FnMut(Node<'tree>) -> Option<T>,
 ) -> Option<Vec<T>> {
     named_children_iter(arguments?)
         .filter(|child| !child.is_extra())
@@ -1433,6 +1433,25 @@ pub(crate) fn csharp_is_irrefutable_pattern(mut pattern: Node<'_>) -> bool {
                 .child_by_field_name("type")
                 .is_some_and(|ty| ty.kind() == "implicit_type"))
 }
+
+/// ECMA-334 8.2.1 and 8.3.5: predefined keywords alias global System types.
+pub const CSHARP_PREDEFINED_SYSTEM_TYPES: &[(&str, &str)] = &[
+    ("sbyte", "SByte"),
+    ("byte", "Byte"),
+    ("short", "Int16"),
+    ("ushort", "UInt16"),
+    ("int", "Int32"),
+    ("uint", "UInt32"),
+    ("long", "Int64"),
+    ("ulong", "UInt64"),
+    ("char", "Char"),
+    ("float", "Single"),
+    ("double", "Double"),
+    ("bool", "Boolean"),
+    ("decimal", "Decimal"),
+    ("object", "Object"),
+    ("string", "String"),
+];
 
 #[cfg(test)]
 mod tests {

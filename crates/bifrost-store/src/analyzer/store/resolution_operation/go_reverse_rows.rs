@@ -57,16 +57,17 @@ fn classify_go_reverse_path_evidence_miss(
         .source_site()
         .expect("Go reverse candidate has a source-site locator")
         .get();
-    let path_uses_site_key: bool = connection.query_row(
-        "SELECT EXISTS(
+    let path_uses_site_key: bool = connection
+        .prepare_cached(
+            "SELECT EXISTS(
            SELECT 1 FROM main.resolution_paths AS path
            WHERE path.blob_id=?1 AND path.start_node=?2
          )",
-        params![candidate.blob_id, site],
-        |row| row.get(0),
-    )?;
-    let path_uses_mapped_key: bool = connection.query_row(
-        "SELECT EXISTS(
+        )?
+        .query_row(params![candidate.blob_id, site], |row| row.get(0))?;
+    let path_uses_mapped_key: bool = connection
+        .prepare_cached(
+            "SELECT EXISTS(
            SELECT 1
            FROM main.resolution_semantic_sites AS semantic
            JOIN main.resolution_paths AS path
@@ -75,9 +76,8 @@ fn classify_go_reverse_path_evidence_miss(
            WHERE semantic.blob_id=?1 AND semantic.semantic_role='reference'
              AND (semantic.source_site=?2 OR semantic.semantic_key=?2)
          )",
-        params![candidate.blob_id, site],
-        |row| row.get(0),
-    )?;
+        )?
+        .query_row(params![candidate.blob_id, site], |row| row.get(0))?;
     Ok(if path_uses_site_key || path_uses_mapped_key {
         GoReverseCandidateDiagnostic::PathSiteKeyMismatch
     } else {
@@ -227,12 +227,7 @@ WHERE mounted.mount_ordinal=?1 AND mounted.storage_language='go'
   AND declaration.name_occurrence_id IS NOT NULL
 "#;
 
-pub(crate) static GO_TARGET_DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| {
-        format!(
-            r#"
-SELECT DISTINCT semantic.semantic_key,semantic.namespace,semantic.source_site
-FROM temp.selected_resolution_mounts AS mount
+pub(super) const GO_TARGET_SELECTED_VIEW_JOINS: &str = r#"FROM temp.selected_resolution_mounts AS mount
 JOIN main.resolution_fragment_interiors AS interior
   ON interior.blob_id=mount.blob_id AND interior.lang=mount.storage_language
  AND interior.semantic_language=mount.semantic_language
@@ -241,23 +236,52 @@ JOIN main.resolution_fragment_interiors AS interior
  AND interior.publication_state='complete'
 JOIN main.source_fact_manifests AS source
   ON source.blob_id=interior.blob_id AND source.publication_state='complete'
-JOIN main.resolution_semantic_sites AS semantic
-  ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition'
-JOIN main.source_native_declaration_bridges AS bridge
+JOIN main.blobs AS keys ON keys.id=mount.blob_id
+JOIN main.blob_meta AS meta ON meta.blob_id=mount.blob_id"#;
+
+pub(crate) static GO_TARGET_DEFINITION_SEMANTICS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| go_target_definition_semantics_sql("", "", ""));
+
+pub(super) fn go_target_definition_semantics_sql(
+    prefix: &str,
+    nominated_join: &str,
+    semantic_filter: &str,
+) -> String {
+    format!(
+        r#"{prefix}
+SELECT semantic.semantic_key,semantic.namespace,semantic.source_site,
+       direct.unit_key,bridge.declaration_id,link.unit_key,
+       declaration.name_occurrence_id,
+       CASE WHEN anonymous_type.kind IN (12,13) THEN 1 ELSE 0 END,
+       direct_unit.unit_key,
+       EXISTS(SELECT 1 FROM main.resolution_root_imports AS root_import
+              WHERE root_import.blob_id=semantic.blob_id
+                AND root_import.import_site=semantic.source_site)
+{selected_view}
+{nominated_join}
+CROSS JOIN main.resolution_semantic_sites AS semantic
+  ON semantic.blob_id=interior.blob_id AND semantic.semantic_role='definition' {semantic_filter}
+LEFT JOIN main.resolution_definition_unit_crosswalks AS direct
+  ON direct.blob_id=semantic.blob_id AND direct.definition_semantic_key=semantic.semantic_key
+LEFT JOIN main.code_units AS direct_unit
+  ON direct_unit.blob_id=direct.blob_id AND direct_unit.unit_key=direct.unit_key
+LEFT JOIN main.source_native_declaration_bridges AS bridge
   ON bridge.blob_id=semantic.blob_id AND bridge.source_site=semantic.source_site
-JOIN main.source_declaration_units AS link
+LEFT JOIN main.source_declarations AS declaration
+  ON declaration.blob_id=bridge.blob_id AND declaration.declaration_id=bridge.declaration_id
+LEFT JOIN main.source_declaration_units AS link
   ON link.blob_id=bridge.blob_id AND link.declaration_id=bridge.declaration_id
-JOIN main.code_units AS units
-  ON units.blob_id=link.blob_id AND units.unit_key=link.unit_key
-JOIN main.blobs AS keys ON keys.id=units.blob_id
-JOIN main.blob_meta AS meta ON meta.blob_id=units.blob_id
-WHERE mount.mount_ordinal=?1 AND units.in_declarations=1
+LEFT JOIN main.source_go_types AS anonymous_type
+  ON anonymous_type.blob_id=declaration.blob_id
+ AND anonymous_type.occurrence_id=declaration.occurrence_id
+WHERE mount.mount_ordinal=?1
   AND {complete}
-ORDER BY semantic.semantic_key,semantic.namespace
+ORDER BY semantic.semantic_key,semantic.namespace,link.unit_key
 "#,
-            complete = super::super::PARSED_BLOB_COMPLETE_CONDITION,
-        )
-    });
+        complete = super::super::PARSED_BLOB_COMPLETE_CONDITION,
+        selected_view = GO_TARGET_SELECTED_VIEW_JOINS,
+    )
+}
 
 pub(crate) const GO_REVERSE_SUMMARY_EXPORT_ROWS_SQL: &str = r#"
 WITH demanded(identity_id,namespace) AS (
@@ -2147,15 +2171,13 @@ impl SelectedResolutionOperation<'_, '_> {
         else {
             // Placement can be absent for the whole publication, not just this target.
             // Read its published evidence before treating the target as uncovered.
-            let placement_inventory = connection
-                .query_row(
-                    "SELECT json(c.gaps),
+            let placement_inventory = connection.prepare_cached("SELECT json(c.gaps),
                             EXISTS(SELECT 1 FROM main.go_package_instances p
                                    WHERE p.context_id=c.context_id)
                             AND NOT EXISTS(SELECT 1 FROM json_each(c.gaps) gap
                                            WHERE json_extract(gap.value, '$.code') IN
                                                  ('domain_discovery_failed', 'build_selection_unavailable'))
-                     FROM main.go_context_publications c WHERE c.context_id=?1",
+                     FROM main.go_context_publications c WHERE c.context_id=?1")?.query_row(
                     [context_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
                 )
@@ -2177,81 +2199,41 @@ impl SelectedResolutionOperation<'_, '_> {
                 "Go target has no proven selected package placement: {relative_path}"
             )));
         };
-        let mut statement =
-            connection.prepare_cached(GO_TARGET_DEFINITION_SEMANTICS_SQL.as_str())?;
-        let semantics = statement
-            .query_map([i64::from(mount.ordinal().get())], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .map(|row| {
-                row.map(|(key, namespace, source_site)| {
-                    (
-                        SemanticId::local(
-                            mount.ordinal().get(),
-                            u32::try_from(key).expect("Go definition catalog key fits u32"),
-                        ),
-                        namespace,
-                        source_site,
-                    )
-                })
-            })
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        let mut semantic_ids = semantics
-            .iter()
-            .map(|(semantic, _, _)| *semantic)
-            .collect::<Vec<_>>();
-        semantic_ids.sort_unstable();
-        semantic_ids.dedup();
-        let projected = match native_units::project_native_definition_units(
+        let semantics = match native_units::go_selected_target_match(
             &self.ready,
-            &semantic_ids,
+            mount.ordinal(),
+            target,
             cancellation,
             &ResolutionSession::unbounded(),
         )? {
-            SelectedNativeDefinitions::Ready(projected) => projected,
-            SelectedNativeDefinitions::Unavailable => {
+            native_units::GoSelectedTargetMatch::Matched(rows) => rows,
+            native_units::GoSelectedTargetMatch::Unavailable => {
                 return Ok(GoReverseCandidateOutcome::Unavailable(format!(
                     "Go target definitions are not projectable: {relative_path}"
                 )));
             }
-            SelectedNativeDefinitions::Cancelled => {
+            native_units::GoSelectedTargetMatch::Stopped => {
                 return Ok(GoReverseCandidateOutcome::Cancelled);
             }
         };
         let mut target_semantics = Vec::new();
         let mut target_declarations = Vec::new();
         let mut target_surfaces = Vec::new();
-        for (semantic, definition) in projected {
-            if !matches!(definition, SelectedNativeDefinition::Unit(unit) if unit == *target) {
-                continue;
-            }
+        for (semantic, namespace, source_site) in semantics {
             target_semantics.push(semantic);
-            if let Some((_, namespace, source_site)) = semantics
-                .iter()
-                .find(|(candidate, _, _)| *candidate == semantic)
+            let namespace = ResolutionNamespace::from_label(&namespace)
+                .expect("Go definition semantic has a known lookup namespace");
+            if let Some(identity_id) =
+                ResolutionLookupSemanticRecipe::new(Language::Go, namespace, target.identifier())
+                    .semantic(&self.ready.shared_names())
+                    .shared_name_id()
             {
-                let namespace = ResolutionNamespace::from_label(namespace)
-                    .expect("Go definition semantic has a known lookup namespace");
-                if let Some(identity_id) = ResolutionLookupSemanticRecipe::new(
-                    Language::Go,
-                    namespace,
-                    target.identifier(),
-                )
-                .semantic(&self.ready.shared_names())
-                .shared_name_id()
-                {
-                    target_surfaces.push(GoReverseTargetSurface {
-                        identity_id: i64::from(identity_id.get()),
-                        namespace: namespace.label().to_owned(),
-                    });
-                }
-                target_declarations.push((mount.ordinal().get(), *source_site));
+                target_surfaces.push(GoReverseTargetSurface {
+                    identity_id: i64::from(identity_id.get()),
+                    namespace: namespace.label().to_owned(),
+                });
             }
+            target_declarations.push((mount.ordinal().get(), source_site));
         }
         target_semantics.sort_unstable();
         target_semantics.dedup();
@@ -2277,11 +2259,9 @@ impl SelectedResolutionOperation<'_, '_> {
             "a Go target has declaration sites"
         );
 
-        let target_in_standard_package: bool = connection.query_row(
-            GO_INTERVAL_GO_REVERSE_CANDIDATE_SITES_0_SQL,
-            params![context_id, file_version],
-            |row| row.get(0),
-        )?;
+        let target_in_standard_package: bool = connection
+            .prepare_cached(GO_INTERVAL_GO_REVERSE_CANDIDATE_SITES_0_SQL)?
+            .query_row(params![context_id, file_version], |row| row.get(0))?;
         let target_exported = go_identifier_is_exported(target.terminal_name());
         super::super::go_unit_summaries::register_go_summary_sql_functions(connection)?;
         let Some(language) = self
@@ -2295,8 +2275,7 @@ impl SelectedResolutionOperation<'_, '_> {
                 "Go is absent from the selected summary revisions".into(),
             ));
         };
-        let producer_epoch: String = connection.query_row(
-            "SELECT expected_producer_epoch FROM temp.selected_resolution_languages WHERE storage_language='go'",
+        let producer_epoch: String = connection.prepare_cached("SELECT expected_producer_epoch FROM temp.selected_resolution_languages WHERE storage_language='go'")?.query_row(
             [],
             |row| row.get(0),
         )?;
@@ -2867,6 +2846,11 @@ impl SelectedResolutionOperation<'_, '_> {
                             ResolutionIncompleteReason::ReceiverBudgetExhausted(target_semantic),
                         ]));
                     }
+                    BoundedResolution::Unavailable { .. } => {
+                        completion = completion.combine(&ResolutionCompletion::incomplete([
+                            ResolutionIncompleteReason::UnsupportedSemantic(target_semantic),
+                        ]));
+                    }
                     BoundedResolution::Cancelled { .. } => {
                         return Ok(SelectedResolutionOperationOutcome::Cancelled(
                             cancelled_completion(),
@@ -3212,7 +3196,9 @@ impl SelectedResolutionOperation<'_, '_> {
                     }
                     owner_units.insert(semantic, None);
                 }
-                Some(SelectedNativeDefinition::Intrinsic { .. }) | None => {
+                Some(SelectedNativeDefinition::Intrinsic { .. })
+                | Some(SelectedNativeDefinition::ExternalOwner { .. })
+                | None => {
                     completion = completion.combine(&ResolutionCompletion::incomplete([
                         ResolutionIncompleteReason::UnsupportedSemantic(semantic),
                     ]));
@@ -3463,8 +3449,7 @@ pub fn mark_go_context_incomplete_for_test(
     context_id: i64,
 ) -> Result<()> {
     store.conn.execute(move |connection| {
-        connection.execute(
-            "UPDATE go_context_publications SET complete=0,gaps=jsonb('[{\"code\":\"test_incomplete\"}]') WHERE context_id=?1",
+        connection.prepare_cached("UPDATE go_context_publications SET complete=0,gaps=jsonb('[{\"code\":\"test_incomplete\"}]') WHERE context_id=?1")?.execute(
             [context_id],
         )?;
         Ok(())
@@ -3479,11 +3464,12 @@ pub fn mark_go_package_complete_for_test(
     import_path: &'static str,
 ) -> Result<()> {
     store.conn.execute(move |connection| {
-        let changed = connection.execute(
-            "UPDATE go_package_instances SET complete=1,gaps=jsonb('[]')
+        let changed = connection
+            .prepare_cached(
+                "UPDATE go_package_instances SET complete=1,gaps=jsonb('[]')
              WHERE context_id=?1 AND tool_import_path=?2 AND for_test=''",
-            params![context_id, import_path],
-        )?;
+            )?
+            .execute(params![context_id, import_path])?;
         assert_eq!(changed, 1, "one selected Go package row is updated");
         Ok(())
     })
@@ -3497,8 +3483,7 @@ pub fn mark_go_import_incomplete_for_test(
     source_spelling: &'static str,
 ) -> Result<usize> {
     store.conn.execute(move |connection| {
-        Ok(connection.execute(
-            "UPDATE go_package_imports SET complete=0,gaps=jsonb('[{\"code\":\"source_import_provider_unavailable\"}]') WHERE context_id=?1 AND source_spelling=?2",
+        Ok(connection.prepare_cached("UPDATE go_package_imports SET complete=0,gaps=jsonb('[{\"code\":\"source_import_provider_unavailable\"}]') WHERE context_id=?1 AND source_spelling=?2")?.execute(
             params![context_id, source_spelling],
         )?)
     })
@@ -3512,8 +3497,9 @@ pub fn mark_go_unit_summary_unavailable_for_test(
     unit_key: [u8; 32],
 ) -> Result<usize> {
     store.conn.execute(move |connection| {
-        Ok(connection.execute(
-            "DELETE FROM resolution_unit_summary_versions AS versions
+        Ok(connection
+            .prepare_cached(
+                "DELETE FROM resolution_unit_summary_versions AS versions
              WHERE versions.lang='go' AND versions.unit_key=?2 AND versions.valid_until IS NULL
                AND EXISTS(
                  SELECT 1 FROM go_context_publications AS publication
@@ -3523,8 +3509,8 @@ pub fn mark_go_unit_summary_unavailable_for_test(
                    AND selection.generation=versions.generation
                    AND selection.profile_digest=versions.profile_digest
                    AND publication.valid_from>=versions.valid_from)",
-            params![context_id, unit_key.as_slice()],
-        )?)
+            )?
+            .execute(params![context_id, unit_key.as_slice()])?)
     })
 }
 
@@ -3538,21 +3524,18 @@ pub fn seed_go_reverse_plan_decoys_for_test(
 ) -> Result<()> {
     store.conn.execute(move |connection| {
         let tx = connection.transaction()?;
-        let importer_package: i64 = tx.query_row(
-            "SELECT package_id FROM go_context_source_files WHERE context_id=?1 AND rel_path=?2",
+        let importer_package: i64 = tx.prepare_cached("SELECT package_id FROM go_context_source_files WHERE context_id=?1 AND rel_path=?2")?.query_row(
             params![context_id, importer_path],
             |row| row.get(0),
         )?;
         for index in 0..count {
             let import_path = format!("example.test/reverse-decoy{index}");
             let unit_key = crate::analyzer::store::go_unit_summaries::go_unit_key(&import_path, "", "go");
-            tx.execute(
-                "INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(?1,?2,'decoy','','',zeroblob(32),1,jsonb('[]'),?3)",
+            tx.prepare_cached("INSERT INTO go_package_instances(context_id,tool_import_path,package_name,for_test,provider_directory,provider_digest,complete,gaps,unit_key) VALUES(?1,?2,'decoy','','',zeroblob(32),1,jsonb('[]'),?3)")?.execute(
                 params![context_id, import_path, unit_key.as_slice()],
             )?;
             let decoy = tx.last_insert_rowid();
-            tx.execute(
-                "INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps) VALUES(?1,?2,?3,'go',?4,1,jsonb('[]'))",
+            tx.prepare_cached("INSERT INTO go_package_imports(context_id,importer_package_id,source_spelling,import_role,target_package_id,complete,gaps) VALUES(?1,?2,?3,'go',?4,1,jsonb('[]'))")?.execute(
                 params![context_id, importer_package, format!("example.test/reverse-decoy{index}"), decoy],
             )?;
         }

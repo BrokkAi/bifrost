@@ -33,6 +33,7 @@ fn failed_host_activation_makes_an_otherwise_complete_run_unreliable() {
         &crate::test_support::evaluation_options("2026-07-27"),
         PolicyHostActivationContext::new(None, None, &[], Some("activation failed")),
         None,
+        &brokk_bifrost_analysis::retention_budget::RetentionBudget::for_tests(),
     )
     .expect("failed activation has a canonical report");
     assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);

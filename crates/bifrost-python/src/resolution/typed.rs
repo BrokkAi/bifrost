@@ -1,17 +1,19 @@
 //! File-local typed syntax. Candidate roles never prove builtin identity.
 use super::*;
+use crate::structural::python_unwrap_type;
 
 mod member_operations;
 
-struct Typed<'a, 'source, 'collector> {
+struct Typed<'a, 'source, 'collector, 'tree> {
     p: &'a mut Producer<'source, 'collector>,
-    scopes: &'a HashMap<usize, ResolutionScopeId>,
+    scopes: HashMap<usize, ResolutionScopeId>,
+    quoted_roots: HashMap<usize, Node<'tree>>,
     references: HashMap<(usize, usize), ResolutionSiteId>,
     values: HashMap<usize, ResolutionTypeSlotId>,
     type_nodes: HashSet<usize>,
 }
 
-impl Typed<'_, '_, '_> {
+impl Typed<'_, '_, '_, '_> {
     fn slot(&mut self, node: Node<'_>, role: ResolutionTypeSlotRole) -> ResolutionTypeSlotId {
         let site = self.p.site(
             node,
@@ -19,6 +21,29 @@ impl Typed<'_, '_, '_> {
             ResolutionSiteKind::UnsupportedExpression,
         );
         self.p.facts.allocate_type_slot(site, role)
+    }
+
+    // Implicit None has a real return-statement or body anchor, even though
+    // that node does not contain a literal token.
+    fn none_value(&mut self, anchor: Node<'_>) -> ResolutionTypeSlotId {
+        let slot = self.slot(anchor, ResolutionTypeSlotRole::ExpressionValue);
+        self.seed_none_type(slot);
+        slot
+    }
+
+    fn seed_none_type(&mut self, slot: ResolutionTypeSlotId) {
+        let name = self
+            .p
+            .facts
+            .intern_name(&mut self.p.names, "types.NoneType");
+        self.p
+            .facts
+            .intrinsic_type_seeds
+            .push(IntrinsicTypeSeedFact::direct(
+                slot,
+                name,
+                IntrinsicTypeKind::LanguageBuiltin,
+            ));
     }
 
     fn unknown(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
@@ -47,6 +72,27 @@ impl Typed<'_, '_, '_> {
                 indirection_delta: 0,
                 reference_indirection_delta: 0,
                 value_transform,
+            });
+    }
+
+    fn initialize_value(&mut self, owner: ResolutionSiteId, input: ResolutionTypeSlotId) {
+        let value = self
+            .p
+            .facts
+            .allocate_type_slot(owner, ResolutionTypeSlotRole::DeclaredValue);
+        self.transfer(
+            input,
+            value,
+            ResolutionTypeTransferKind::Initialization,
+            ResolutionTypeTransferValueTransform::Preserve,
+        );
+        self.p
+            .facts
+            .declaration_type_slots
+            .push(DeclarationTypeSlotFact {
+                declaration: owner,
+                slot: value,
+                role: DeclarationTypeRole::Value,
             });
     }
 
@@ -84,25 +130,29 @@ impl Typed<'_, '_, '_> {
     // Module imports and local values share Python's Value bindings. The
     // selected temporal binding decides whether an attribute prefix is a module,
     // including attributes used as types rather than runtime values.
-    fn attribute_root(
-        &mut self,
-        mut object: Node<'_>,
-        object_slot: ResolutionTypeSlotId,
-        reference: ResolutionSiteId,
-    ) {
-        while object.kind() == "type" && object.named_child_count() == 1 {
-            object = object.named_child(0).unwrap();
+    fn attribute_root(&mut self, object: Node<'_>, reference: ResolutionSiteId) {
+        let object = python_unwrap_type(object);
+        // Only identifier-rooted attribute chains have a lexical route. Calls,
+        // subscripts and other expressions retain their typed receiver handling.
+        if crate::syntax::python_static_attribute_path(object).is_none() {
+            return;
         }
-        if object.kind() == "identifier" {
-            let prefix_reference = self.p.facts.type_slots[object_slot.index()].site;
-            let name = self
-                .p
-                .facts
-                .identifiers
-                .iter()
-                .find(|identifier| identifier.site == prefix_reference)
-                .expect("a spelled operand has a reference identifier")
-                .name;
+        let token = match object.kind() {
+            "identifier" => Some(object),
+            "attribute" => object.child_by_field_name("attribute"),
+            _ => None,
+        };
+        if let Some(token) = token {
+            let Some(&prefix_reference) =
+                self.references.get(&(token.start_byte(), token.end_byte()))
+            else {
+                // A recovered operand without a structured reference retains
+                // its expression gap; it cannot supply a module continuation.
+                return;
+            };
+            // The route's first segment is the prefix identifier's semantic
+            // name, including Python's class-private name mangling.
+            let name = self.p.semantic_name(token);
             self.p
                 .facts
                 .root_references
@@ -124,6 +174,58 @@ impl Typed<'_, '_, '_> {
         }
     }
 
+    /// The member reference of `object.attribute`, qualified by the object's
+    /// value. The caller decides which projection the reference publishes.
+    fn member_reference(
+        &mut self,
+        node: Node<'_>,
+        object: Node<'_>,
+        attribute: Node<'_>,
+    ) -> ResolutionSiteId {
+        let object_slot = self.values[&object.id()];
+        let receiver = self.slot(node, ResolutionTypeSlotRole::Receiver);
+        self.transfer(
+            object_slot,
+            receiver,
+            ResolutionTypeTransferKind::Receiver,
+            ResolutionTypeTransferValueTransform::Preserve,
+        );
+        let site = self.reference(
+            attribute,
+            ResolutionSiteKind::MemberReference,
+            ResolutionNamespace::Value,
+        );
+        self.p
+            .facts
+            .identifiers
+            .iter_mut()
+            .find(|id| id.site == site)
+            .unwrap()
+            .qualifier = Some(receiver);
+        self.attribute_root(object, site);
+        site
+    }
+
+    /// Lower the callee reference of a call. Its only projection is the call's
+    /// callable result, which call() publishes.
+    fn callee(&mut self, function: Node<'_>) {
+        if function.kind() == "identifier" {
+            self.reference(
+                function,
+                ResolutionSiteKind::CallableReference,
+                ResolutionNamespace::Value,
+            );
+        } else {
+            let object = function
+                .child_by_field_name("object")
+                .expect("callee attribute object");
+            let attribute = function
+                .child_by_field_name("attribute")
+                .expect("callee attribute token");
+            self.member_reference(function, object, attribute);
+        }
+    }
+
     /// Expression dependencies are evaluated iteratively, including call chains.
     fn expression(&mut self, root: Node<'_>) -> ResolutionTypeSlotId {
         let mut pending = vec![(root, false)];
@@ -138,6 +240,7 @@ impl Typed<'_, '_, '_> {
                         .child_by_field_name("object")
                         .into_iter()
                         .collect::<Vec<_>>(),
+                    "subscript" => named_children_iter(node).collect(),
                     "call" => {
                         let mut deps = node
                             .child_by_field_name("function")
@@ -154,6 +257,13 @@ impl Typed<'_, '_, '_> {
                 for dependency in dependencies.into_iter().rev() {
                     pending.push((dependency, false));
                 }
+                continue;
+            }
+            if python_call_callee(node) {
+                // A callee publishes only its call's callable-result
+                // projection (see call()), as Go and Rust do. It has no value
+                // slot of its own for anything to read.
+                self.callee(node);
                 continue;
             }
             let slot = match node.kind() {
@@ -177,44 +287,34 @@ impl Typed<'_, '_, '_> {
                         });
                     slot
                 }
+                "none" => self.none_value(node),
                 "attribute" => {
                     if let (Some(object), Some(attribute)) = (
                         node.child_by_field_name("object"),
                         node.child_by_field_name("attribute"),
                     ) {
-                        let object_slot = self.values[&object.id()];
-                        let receiver = self.slot(node, ResolutionTypeSlotRole::Receiver);
-                        self.transfer(
-                            object_slot,
-                            receiver,
-                            ResolutionTypeTransferKind::Receiver,
-                            ResolutionTypeTransferValueTransform::Preserve,
-                        );
-                        let site = self.reference(
-                            attribute,
-                            ResolutionSiteKind::MemberReference,
-                            ResolutionNamespace::Value,
-                        );
-                        self.p
-                            .facts
-                            .identifiers
-                            .iter_mut()
-                            .find(|id| id.site == site)
-                            .unwrap()
-                            .qualifier = Some(receiver);
-                        self.attribute_root(object, object_slot, site);
+                        let site = self.member_reference(node, object, attribute);
                         let slot = self
                             .p
                             .facts
                             .allocate_type_slot(site, ResolutionTypeSlotRole::ExpressionValue);
-                        self.p.facts.binding_projections.push(
-                            BindingProjectionFact::target_declared_value_type(site, slot),
-                        );
+                        // Attribute and bare-name reads share Python's value
+                        // namespace: a selected class is a type object, while
+                        // fields retain their declared value projection.
+                        self.p
+                            .facts
+                            .binding_projections
+                            .push(BindingProjectionFact {
+                                reference: site,
+                                output: slot,
+                                kind: BindingProjectionKind::TargetTypeOrDeclaredValueType,
+                            });
                         slot
                     } else {
                         self.unknown(node)
                     }
                 }
+                "subscript" => self.subscript(node),
                 "call" => self.call(node),
                 "parenthesized_expression" => named_children_iter(node)
                     .next()
@@ -227,17 +327,113 @@ impl Typed<'_, '_, '_> {
         self.values[&root.id()]
     }
 
+    fn subscript(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
+        let Some(object) = node.child_by_field_name("value") else {
+            return self.unknown(node);
+        };
+        let call = self
+            .p
+            .site(node, self.scopes[&node.id()], ResolutionSiteKind::Call);
+        let receiver = self
+            .p
+            .facts
+            .allocate_type_slot(call, ResolutionTypeSlotRole::Receiver);
+        self.transfer(
+            self.values[&object.id()],
+            receiver,
+            ResolutionTypeTransferKind::Receiver,
+            ResolutionTypeTransferValueTransform::RuntimeOnly,
+        );
+        // Indexing invokes the class's implicit protocol, not an attribute
+        // spelled by the program. Callable marks this protocol demand; normal
+        // Python attributes and calls continue to select the Value namespace.
+        let reference = self.p.site(
+            node,
+            self.scopes[&node.id()],
+            ResolutionSiteKind::MemberReference,
+        );
+        let name = self.p.facts.intern_name(&mut self.p.names, "__getitem__");
+        self.p.facts.identifiers.push(PositionedIdentifierFact {
+            site: reference,
+            name,
+            role: ResolutionIdentifierRole::Reference,
+            namespace: ResolutionNamespace::Callable,
+            qualifier: Some(receiver),
+        });
+        let result = self
+            .p
+            .facts
+            .allocate_type_slot(call, ResolutionTypeSlotRole::CallResult);
+        self.p
+            .facts
+            .add_single_result_call(call, reference, Some(receiver), result, 0);
+        self.p
+            .facts
+            .call_argument_lists
+            .push(ResolutionCallArgumentListFact {
+                call,
+                list_ordinal: 0,
+            });
+        let indices = named_children_iter(node)
+            .filter(|child| child.id() != object.id())
+            .collect::<Vec<_>>();
+        let index = if let [index] = indices.as_slice() {
+            self.values[&index.id()]
+        } else {
+            self.unknown(node)
+        };
+        let argument = self
+            .p
+            .facts
+            .allocate_type_slot(call, ResolutionTypeSlotRole::Argument);
+        self.transfer(
+            index,
+            argument,
+            ResolutionTypeTransferKind::Argument,
+            ResolutionTypeTransferValueTransform::Preserve,
+        );
+        self.p
+            .facts
+            .call_arguments
+            .push(ResolutionCallArgumentFact {
+                call,
+                list_ordinal: 0,
+                ordinal: 0,
+                value: argument,
+                label: None,
+            });
+        self.p
+            .facts
+            .python_call_arguments
+            .push(PythonNativeCallArgumentFact {
+                call,
+                ordinal: 0,
+                kind: PythonNativeArgumentKind::Positional,
+            });
+        self.p
+            .facts
+            .add_gap(reference, ResolutionGapKind::UnsupportedCallApplicability);
+        self.p
+            .facts
+            .binding_projections
+            .push(BindingProjectionFact {
+                reference,
+                output: result,
+                kind: BindingProjectionKind::TargetCallableResultType,
+            });
+        result
+    }
+
     fn call(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
         let Some(function) = node.child_by_field_name("function") else {
             return self.unknown(node);
         };
-        let input = self.values[&function.id()];
-        let callee_node = if function.kind() == "attribute" {
-            function.child_by_field_name("attribute")
-        } else if function.kind() == "identifier" {
-            Some(function)
-        } else {
+        let callee_node = if !python_call_callee(function) {
             None
+        } else if function.kind() == "attribute" {
+            function.child_by_field_name("attribute")
+        } else {
+            Some(function)
         };
         let (callee, qualifier) = if let Some(callee_node) = callee_node {
             let callee = self.reference(
@@ -261,6 +457,7 @@ impl Typed<'_, '_, '_> {
         } else {
             // Preserve indirect call syntax and its argument labels even while
             // callable-value selection remains an explicit frontier.
+            let input = self.values[&function.id()];
             let callee = self.p.site(
                 function,
                 self.scopes[&function.id()],
@@ -273,6 +470,12 @@ impl Typed<'_, '_, '_> {
             self.p
                 .facts
                 .add_gap(callee, ResolutionGapKind::UnsupportedCallApplicability);
+            // The expression value is retained for future callable-value selection.
+            // A call does not turn this value into a type object or an allocation.
+            debug_assert!(matches!(
+                self.p.facts.type_slots[input.index()].role,
+                ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
+            ));
             self.transfer(
                 input,
                 value,
@@ -330,12 +533,6 @@ impl Typed<'_, '_, '_> {
         self.p
             .facts
             .add_gap(callee, ResolutionGapKind::UnsupportedCallApplicability);
-        // The expression value is retained for future callable-value selection.
-        // A call does not turn this value into a type object or an allocation.
-        debug_assert!(matches!(
-            self.p.facts.type_slots[input.index()].role,
-            ResolutionTypeSlotRole::ExpressionValue | ResolutionTypeSlotRole::CallResult
-        ));
         if let Some(args) = node.child_by_field_name("arguments") {
             for (ordinal, arg) in named_children_iter(args).enumerate() {
                 let ordinal = dense_ordinal(ordinal, "Python argument");
@@ -470,7 +667,7 @@ impl Typed<'_, '_, '_> {
                         .find(|id| id.site == site)
                         .unwrap()
                         .qualifier = Some(qualifier);
-                    self.attribute_root(object, qualifier, site);
+                    self.attribute_root(object, site);
                     // The terminal identifier already owns this type projection.
                     slots[&attribute.id()]
                 }
@@ -502,10 +699,92 @@ impl Typed<'_, '_, '_> {
                         .find(|id| id.site == site)
                         .unwrap()
                         .qualifier = Some(qualifier);
-                    self.attribute_root(object, qualifier, site);
+                    self.attribute_root(object, site);
                     slots[&attribute.id()]
                 }
-                "type" if node.named_child_count() == 1 => {
+                "generic_type" | "subscript" => {
+                    let head = python_annotation_application_head(node).expect("generic head");
+                    let application = slots[&head.id()];
+                    let arguments = if node.kind() == "subscript" {
+                        let mut cursor = node.walk();
+                        node.children_by_field_name("subscript", &mut cursor)
+                            .collect::<Vec<_>>()
+                    } else {
+                        named_children_iter(node)
+                            .filter(|child| child.kind() == "type_parameter")
+                            .flat_map(named_children_iter)
+                            .collect::<Vec<_>>()
+                    };
+                    for (ordinal, argument) in arguments.into_iter().enumerate() {
+                        self.p
+                            .facts
+                            .type_arguments
+                            .push(ResolutionTypeArgumentFact {
+                                application,
+                                ordinal: ordinal as u32,
+                                argument: slots[&argument.id()],
+                                indirection_delta: 0,
+                                reference_indirection_delta: 0,
+                            });
+                    }
+                    // An application names its outer class, never an argument.
+                    // A typing form such as `Optional` or `Generator` is an
+                    // external import whose provider stays open, so its
+                    // application stays open too instead of naming a class.
+                    // `type[X]` denotes the class object of X, which a type
+                    // identity cannot express, so it keeps its gap. The name
+                    // test only refuses; a shadowed `type` stays open as well.
+                    let slot = self.slot(node, ResolutionTypeSlotRole::TargetTypeIdentity);
+                    let terminal = match head.kind() {
+                        "attribute" => head.child_by_field_name("attribute"),
+                        _ => Some(head),
+                    };
+                    if terminal
+                        .is_some_and(|terminal| &self.p.source[terminal.byte_range()] == "type")
+                    {
+                        self.p.facts.add_gap(
+                            self.p.facts.type_slots[slot.index()].site,
+                            ResolutionGapKind::UnsupportedExpressionType,
+                        );
+                    } else {
+                        self.transfer(
+                            application,
+                            slot,
+                            ResolutionTypeTransferKind::TypeIdentity,
+                            ResolutionTypeTransferValueTransform::Preserve,
+                        );
+                    }
+                    slot
+                }
+                // PEP 604 `X | Y`: every member is a possible type of the
+                // annotated value, including `None`.
+                "union_type" | "binary_operator"
+                    if node.kind() == "union_type"
+                        || node
+                            .child_by_field_name("operator")
+                            .is_some_and(|operator| operator.kind() == "|") =>
+                {
+                    let slot = self.slot(node, ResolutionTypeSlotRole::TargetTypeIdentity);
+                    for member in named_children_iter(node).collect::<Vec<_>>() {
+                        self.transfer(
+                            slots[&member.id()],
+                            slot,
+                            ResolutionTypeTransferKind::TypeUnion,
+                            ResolutionTypeTransferValueTransform::Preserve,
+                        );
+                    }
+                    slot
+                }
+                // `None` as a union member denotes NoneType. A bare `None`
+                // annotation keeps its existing gap.
+                "none" if python_annotation_union_member(node) => {
+                    let slot = self.slot(node, ResolutionTypeSlotRole::TargetTypeIdentity);
+                    self.seed_none_type(slot);
+                    slot
+                }
+                "type" | "module" | "expression_statement" | "parenthesized_expression"
+                    if node.named_child_count() == 1 =>
+                {
                     slots[&node.named_child(0).unwrap().id()]
                 }
                 _ => {
@@ -524,21 +803,48 @@ impl Typed<'_, '_, '_> {
 
     fn quoted_annotation(&mut self, node: Node<'_>) -> ResolutionTypeSlotId {
         // A direct annotation can wrap its string in a type node. Mark both so
-        // the leftover pass does not publish the same omitted reference twice.
+        // the leftover pass does not publish the same annotation twice.
         self.type_nodes.insert(node.id());
         for child in named_children_iter(node).filter(|child| child.kind() == "string") {
             self.type_nodes.insert(child.id());
         }
         let slot = self.slot(node, ResolutionTypeSlotRole::TargetTypeIdentity);
         let site = self.p.facts.type_slots[slot.index()].site;
-        self.p.facts.add_route_gap(
-            site,
-            ResolutionRouteGap::OmittedReference {
-                scope: self.scopes[&node.id()],
-                terminal: None,
-                namespace: Some(ResolutionNamespace::Type),
-            },
-        );
+        let string = if node.kind() == "string" {
+            Some(node)
+        } else {
+            named_children_iter(node).find(|child| child.kind() == "string")
+        };
+        let root = string.and_then(|string| self.quoted_roots.get(&string.id()).copied());
+        if let Some(root) = root {
+            // Only original-source strings have embedded roots. Strings inside
+            // an embedded tree cannot recursively expand another annotation.
+            let input = self.type_expression(root);
+            self.transfer(
+                input,
+                slot,
+                ResolutionTypeTransferKind::TypeIdentity,
+                ResolutionTypeTransferValueTransform::Preserve,
+            );
+            self.p
+                .facts
+                .python_annotations
+                .push(PythonNativeAnnotationFact {
+                    owner: site,
+                    syntax_site: site,
+                    type_slot: slot,
+                    mode: PythonNativeAnnotationMode::Quoted,
+                });
+        } else {
+            self.p.facts.add_route_gap(
+                site,
+                ResolutionRouteGap::OmittedReference {
+                    scope: self.scopes[&node.id()],
+                    terminal: None,
+                    namespace: Some(ResolutionNamespace::Type),
+                },
+            );
+        }
         slot
     }
 
@@ -548,6 +854,7 @@ impl Typed<'_, '_, '_> {
         node: Node<'_>,
         deferred: bool,
     ) -> Option<ResolutionTypeSlotId> {
+        let annotation_start = self.p.facts.python_annotations.len();
         let quoted = named_children_iter(node).any(|child| child.kind() == "string")
             || node.kind() == "string";
         let slot = if quoted {
@@ -556,23 +863,98 @@ impl Typed<'_, '_, '_> {
             self.type_expression(node)
         };
         let site = self.p.facts.type_slots[slot.index()].site;
-        self.p
-            .facts
-            .python_annotations
-            .push(PythonNativeAnnotationFact {
-                owner,
-                syntax_site: site,
-                type_slot: slot,
-                mode: if quoted {
-                    PythonNativeAnnotationMode::Quoted
-                } else if deferred {
-                    PythonNativeAnnotationMode::Deferred
-                } else {
-                    PythonNativeAnnotationMode::Eager
-                },
-            });
-        (!quoted).then_some(slot)
+        let node = python_unwrap_type(node);
+        let syntax = if node.kind() == "string" {
+            self.quoted_roots.get(&node.id()).copied().unwrap_or(node)
+        } else {
+            node
+        };
+        let syntax_head = python_annotation_application_head(syntax).and_then(|head| {
+            let token = match head.kind() {
+                "attribute" => head.child_by_field_name("attribute")?,
+                "member_type" => {
+                    named_children_iter(head).find(|child| child.kind() == "identifier")?
+                }
+                _ => head,
+            };
+            self.references
+                .get(&(token.start_byte(), token.end_byte()))
+                .copied()
+        });
+
+        let supported = !quoted
+            || self.p.facts.python_annotations[annotation_start..]
+                .iter()
+                .any(|annotation| annotation.syntax_site == site);
+        // Nested quoted operands retain their own postponed observation, even
+        // when the enclosing annotation is eager.
+        for annotation in &mut self.p.facts.python_annotations[annotation_start..] {
+            annotation.owner = owner;
+        }
+        if !self.p.facts.python_annotations[annotation_start..]
+            .iter()
+            .any(|annotation| annotation.syntax_site == site)
+        {
+            self.p
+                .facts
+                .python_annotations
+                .push(PythonNativeAnnotationFact {
+                    owner,
+                    syntax_site: syntax_head.unwrap_or(site),
+                    type_slot: slot,
+                    mode: if quoted {
+                        PythonNativeAnnotationMode::Quoted
+                    } else if deferred {
+                        PythonNativeAnnotationMode::Deferred
+                    } else {
+                        PythonNativeAnnotationMode::Eager
+                    },
+                });
+        }
+        supported.then_some(slot)
     }
+}
+
+/// Whether an annotation node is a member of a PEP 604 union, through any
+/// `type` wrappers the grammar puts around union members.
+fn python_annotation_union_member(node: Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(wrapper) = parent.filter(|parent| parent.kind() == "type") {
+        parent = wrapper.parent();
+    }
+    parent.is_some_and(|parent| {
+        parent.kind() == "union_type"
+            || (parent.kind() == "binary_operator"
+                && parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| operator.kind() == "|"))
+    })
+}
+
+fn python_annotation_application_head(node: Node<'_>) -> Option<Node<'_>> {
+    let node = python_unwrap_type(node);
+    match node.kind() {
+        "generic_type" => named_children_iter(node).find(|child| child.kind() == "identifier"),
+        "subscript" => node.child_by_field_name("value"),
+        _ => None,
+    }
+}
+
+/// A name or attribute that is the `function` of a call. Such a reference
+/// publishes the call's callable-result projection, not a value projection.
+fn python_call_callee(node: Node<'_>) -> bool {
+    let named = match node.kind() {
+        "identifier" => true,
+        "attribute" => {
+            node.child_by_field_name("object").is_some()
+                && node.child_by_field_name("attribute").is_some()
+        }
+        _ => false,
+    };
+    named
+        && node.parent().is_some_and(|parent| {
+            parent.kind() == "call" && parent.child_by_field_name("function") == Some(node)
+        })
 }
 
 fn argument_value(node: Node<'_>) -> Node<'_> {
@@ -583,13 +965,41 @@ fn argument_value(node: Node<'_>) -> Node<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn produce(
     p: &mut Producer<'_, '_>,
     nodes: &[Node<'_>],
-    scopes: &HashMap<usize, ResolutionScopeId>,
+    mut scopes: HashMap<usize, ResolutionScopeId>,
     scope_nodes: &HashMap<usize, ResolutionScopeId>,
     event_by_token: &HashMap<usize, u32>,
+    formal_lists: &HashSet<usize>,
+    units: &HashMap<SourceDeclarationId, &CodeUnit>,
+    receiver_fields: &HashMap<CodeUnit, (SourceDeclarationId, CodeUnit)>,
 ) {
+    // Retain each embedded tree for this file's typed production. Its node IDs
+    // remain live alongside the original tree, so per-node maps cannot alias
+    // nodes from a subsequently parsed quoted annotation.
+    let quoted_trees = nodes
+        .iter()
+        .filter_map(|node| {
+            crate::syntax::python_deferred_annotation_tree(*node, p.source, None)
+                .map(|tree| (node.id(), scopes[&node.id()], tree))
+        })
+        .collect::<Vec<_>>();
+    let mut quoted_roots = HashMap::default();
+    for (string, scope, tree) in &quoted_trees {
+        let guard = p.node_guards.get(string).copied();
+        let root = tree.root_node();
+        quoted_roots.insert(*string, root);
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            assert!(scopes.insert(node.id(), *scope).is_none());
+            if let Some(guard) = guard {
+                assert!(p.node_guards.insert(node.id(), guard).is_none());
+            }
+            pending.extend(named_children_iter(node));
+        }
+    }
     let references = p
         .facts
         .identifiers
@@ -603,10 +1013,30 @@ pub(super) fn produce(
     let mut t = Typed {
         p,
         scopes,
+        quoted_roots,
         references,
         values: HashMap::default(),
         type_nodes: HashSet::default(),
     };
+    for node in nodes.iter().copied() {
+        if formal_lists.contains(&node.id()) {
+            for formal in named_children_iter(node).filter(|formal| !formal.is_extra()) {
+                let formal = python_unwrap_type(formal);
+                if formal.kind() == "constrained_type" {
+                    for bound in named_children_iter(formal)
+                        .filter(|bound| !bound.is_extra())
+                        .skip(1)
+                    {
+                        t.type_expression(bound);
+                    }
+                }
+            }
+        } else if node.kind() == "type_alias_statement"
+            && let Some(rhs) = node.child_by_field_name("right")
+        {
+            t.type_expression(rhs);
+        }
+    }
     let mut declarations = HashMap::default();
     for node in nodes.iter().copied().filter(|node| {
         matches!(
@@ -621,7 +1051,7 @@ pub(super) fn produce(
             assert_eq!(node.kind(), "lambda");
             let site = t.p.site(
                 node,
-                scopes[&node.id()],
+                t.scopes[&node.id()],
                 ResolutionSiteKind::CallableDeclaration,
             );
             let declaration = t.p.collector.declare_node(node, None);
@@ -668,24 +1098,9 @@ pub(super) fn produce(
     let suspended_scopes = nodes
         .iter()
         .filter(|node| node.kind() == "yield")
-        .map(|node| scopes[&node.id()])
+        .map(|node| t.scopes[&node.id()])
         .collect::<HashSet<_>>();
-    let deferred = nodes
-        .iter()
-        .filter(|node| node.kind() == "future_import_statement")
-        .any(|node| {
-            let mut cursor = node.walk();
-            node.children_by_field_name("name", &mut cursor)
-                .any(|name| {
-                    let imported = if name.kind() == "aliased_import" {
-                        name.child_by_field_name("name")
-                            .expect("future import name")
-                    } else {
-                        name
-                    };
-                    &t.p.source[imported.byte_range()] == "annotations"
-                })
-        });
+    let deferred = super::future_annotations_enabled(nodes, t.p.source);
     for node in nodes
         .iter()
         .copied()
@@ -887,13 +1302,14 @@ pub(super) fn produce(
             }
         }
     }
+    let mut return_inputs = HashMap::<ResolutionSiteId, Vec<_>>::default();
     for node in nodes.iter().copied() {
         if node.kind() == "future_import_statement" {
             // Compiler-mode evidence is known, but the runtime _Feature binding
             // is not yet supplied by the native import producer.
             let site = t.p.site(
                 node,
-                scopes[&node.id()],
+                t.scopes[&node.id()],
                 ResolutionSiteKind::UnsupportedExpression,
             );
             t.p.facts
@@ -1000,8 +1416,6 @@ pub(super) fn produce(
                             },
                         });
                     if plain {
-                        t.p.facts
-                            .add_gap(site, ResolutionGapKind::UnsupportedHierarchyTraversal);
                         t.p.facts.supertypes.push(ResolutionSupertypeFact {
                             subtype: class,
                             parent_ordinal: ordinal,
@@ -1056,7 +1470,7 @@ pub(super) fn produce(
             let return_scope = if node.kind() == "lambda" {
                 scope_nodes[&node.id()]
             } else {
-                scopes[&node.id()]
+                t.scopes[&node.id()]
             };
             // A class body is not a return continuation of an enclosing function.
             let callable = find_scope_in_chain(
@@ -1079,11 +1493,16 @@ pub(super) fn produce(
                 let expression = if node.kind() == "lambda" {
                     node.child_by_field_name("body")
                 } else {
-                    named_children_iter(node).next()
+                    named_children_iter(node).find(|child| !child.is_extra())
                 };
-                let input = expression
-                    .map(|expression| t.expression(expression))
-                    .unwrap_or_else(|| t.unknown(node));
+                let expression_input = expression.map(|expression| t.expression(expression));
+                if node.kind() == "return_statement" {
+                    return_inputs
+                        .entry(callable)
+                        .or_default()
+                        .push((node, expression_input));
+                }
+                let input = expression_input.unwrap_or_else(|| t.unknown(node));
                 let return_site = t.p.site(
                     node,
                     return_scope,
@@ -1139,6 +1558,10 @@ pub(super) fn produce(
             ResolutionBindingEventKind::Function | ResolutionBindingEventKind::Class => {
                 t.values.get(&token_id).copied()
             }
+            ResolutionBindingEventKind::Assign if operation.kind() == "type_alias_statement" => {
+                // A TypeAliasType object is not its lazily evaluated RHS value.
+                Some(t.unknown(token))
+            }
             ResolutionBindingEventKind::Assign => Some(
                 operation
                     .child_by_field_name("right")
@@ -1183,6 +1606,7 @@ pub(super) fn produce(
     }
     for node in nodes.iter().copied() {
         if matches!(node.kind(), "call" | "attribute")
+            && !python_call_callee(node)
             && !t.type_nodes.contains(&node.id())
             && !python_node_is_in_annotation(node)
             && find_ancestor(node, |ancestor| ancestor.kind() == "type_parameter").is_none()
@@ -1198,6 +1622,88 @@ pub(super) fn produce(
         .iter()
         .map(|node| ((node.start_byte(), node.end_byte()), *node))
         .collect::<HashMap<_, _>>();
+    // The declaration collector owns admission and deduplication of receiver
+    // fields. Reuse those exact source identities, independently of lexical
+    // binding events: assigning an attribute never binds a local variable.
+    let owner_scopes =
+        t.p.facts
+            .scopes
+            .iter()
+            .filter(|scope| scope.kind == ResolutionScopeKind::TypeBody)
+            .filter_map(|scope| scope.owner.map(|owner| (owner, scope.id)))
+            .collect::<HashMap<_, _>>();
+    let owner_definitions =
+        t.p.facts
+            .definition_units
+            .iter()
+            // Type aliases have public type units but do not own a class body.
+            .filter(|row| row.unit.is_class() && owner_scopes.contains_key(&row.declaration))
+            .map(|row| {
+                (
+                    row.unit.clone(),
+                    (row.declaration, owner_scopes[&row.declaration]),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+    let receiver_initializers =
+        t.p.facts
+            .python_receiver_writes
+            .iter()
+            .map(|write| (write.site, write.value))
+            .collect::<HashMap<_, _>>();
+    // Preserve source order for deterministic definition and crosswalk keys.
+    let mut receiver_fields = receiver_fields.values().collect::<Vec<_>>();
+    receiver_fields.sort_unstable_by_key(|(declaration, _)| declaration.get());
+    for (declaration, owner_unit) in receiver_fields {
+        let Some(unit) = units.get(declaration) else {
+            // Replacing a class can withdraw its public descendants.
+            continue;
+        };
+        let (owner, scope) = owner_definitions[owner_unit];
+        let source = t.p.collector.declaration(*declaration);
+        let range = t.p.collector.occurrence(source.occurrence).range;
+        let token = by_range[&(range.start_byte, range.end_byte)];
+        let member = t.p.identifier(
+            token,
+            scope,
+            ResolutionSiteKind::ValueDeclaration,
+            ResolutionIdentifierRole::Declaration,
+            ResolutionNamespace::Value,
+        );
+        t.p.declarations.push((member, *declaration));
+        // The retained direct write already selected the initializer. Patterns
+        // without an element projection retain an explicit unknown value.
+        let reference = t.references[&(range.start_byte, range.end_byte)];
+        let input = receiver_initializers
+            .get(&reference)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| t.unknown(token));
+        t.initialize_value(member, input);
+
+        t.p.facts
+            .definition_units
+            .push(ResolutionDefinitionUnitFact {
+                declaration: member,
+                unit: (*unit).clone(),
+            });
+        t.p.facts.member_owners.push(ResolutionMemberOwnerFact {
+            member,
+            owner,
+            kind: ResolutionMemberKind::Field,
+            access: ResolutionMemberAccess::Instance,
+            qualifier_compatibility: ResolutionMemberQualifierCompatibility::RuntimeOnly,
+        });
+        t.p.facts
+            .python_member_roles
+            .push(PythonNativeMemberRoleFact {
+                owner,
+                member,
+                kind: PythonNativeMemberRole::OrdinaryValue,
+                callable: None,
+                receiver_parameter: None,
+            });
+    }
     for event in events {
         let scope = t.p.facts.sites[event.slot.index()].scope;
         let Some(owner) = t.p.facts.scopes[scope.index()].owner else {
@@ -1239,8 +1745,18 @@ pub(super) fn produce(
                 ResolutionIdentifierRole::Declaration,
                 ResolutionNamespace::Value,
             );
-            let declaration = t.p.collector.declare_node(token, Some(token));
+            let statement =
+                find_ancestor(token, |node| node.kind() == "expression_statement").unwrap_or(token);
+            let declaration = t.p.collector.declare_node(statement, Some(token));
             t.p.declarations.push((member, declaration));
+            if let Some(unit) = units.get(&declaration) {
+                t.p.facts
+                    .definition_units
+                    .push(ResolutionDefinitionUnitFact {
+                        declaration: member,
+                        unit: (*unit).clone(),
+                    });
+            }
             t.p.facts.binding_events[event.ordinal as usize].authored_declaration = Some(member);
             (member, ResolutionMemberKind::Field)
         };
@@ -1292,28 +1808,17 @@ pub(super) fn produce(
             _ => PythonNativeMemberRole::OrdinaryValue,
         };
         let site = t.p.facts.sites[member.index()];
-        let direct_class_method = by_range[&(site.start_byte, site.end_byte)]
+        let class_method = by_range[&(site.start_byte, site.end_byte)]
             .parent()
             .filter(|node| node.kind() == "function_definition")
-            .and_then(|function| {
-                let statement = function
-                    .parent()
-                    .filter(|parent| parent.kind() == "decorated_definition")
-                    .unwrap_or(function);
-                statement.parent()
-            })
-            .is_some_and(|body| {
-                body.parent().is_some_and(|class| {
-                    class.kind() == "class_definition"
-                        && class.child_by_field_name("body") == Some(body)
-                })
-            });
+            .and_then(crate::syntax::python_method_owner)
+            .is_some();
         let receiver_parameter =
             t.p.facts
                 .python_parameters
                 .iter()
                 .find(|row| {
-                    direct_class_method
+                    class_method
                         && row.callable == member
                         && matches!(
                             row.kind,
@@ -1330,6 +1835,106 @@ pub(super) fn produce(
                 kind: role,
                 callable: (kind == ResolutionMemberKind::Method).then_some(member),
                 receiver_parameter,
+            });
+    }
+    // A total body-return proof is separate from the individual observations.
+    // The shared value join combines alternatives and retains every input gap.
+    let methods =
+        t.p.facts
+            .member_owners
+            .iter()
+            .filter(|row| row.kind == ResolutionMemberKind::Method)
+            .map(|row| row.member)
+            .collect::<HashSet<_>>();
+    let signature_indices =
+        t.p.facts
+            .callable_signatures
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.callable, index))
+            .collect::<HashMap<_, _>>();
+    for function in nodes
+        .iter()
+        .copied()
+        .filter(|node| node.kind() == "function_definition")
+    {
+        let callable = declarations[&function.id()];
+        let mut cursor = function.walk();
+        if function.child_by_field_name("return_type").is_some()
+            || function
+                .children(&mut cursor)
+                .any(|child| child.kind() == "async")
+            || suspended_scopes.contains(&scope_nodes[&function.id()])
+            || function.has_error()
+        {
+            continue;
+        }
+        // Free decorated functions have no callable-preservation proof yet.
+        // Methods use the existing query-time decorator_role admission.
+        if function
+            .parent()
+            .is_some_and(|parent| parent.kind() == "decorated_definition")
+            && !methods.contains(&callable)
+        {
+            continue;
+        }
+        let body = function.child_by_field_name("body").expect("function body");
+        let mut inputs = return_inputs
+            .remove(&callable)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(node, input)| input.unwrap_or_else(|| t.none_value(node)))
+            .collect::<Vec<_>>();
+        if body_end_is_reachable(body) {
+            inputs.push(t.none_value(body));
+        }
+        let result =
+            t.p.facts
+                .allocate_type_slot(callable, ResolutionTypeSlotRole::DeclaredValue);
+        if inputs.is_empty() {
+            // A body that only raises has a complete empty result, not None.
+            let input = t.slot(body, ResolutionTypeSlotRole::TargetTypeIdentity);
+            t.seed_none_type(input);
+            t.transfer(
+                input,
+                result,
+                ResolutionTypeTransferKind::DeclaredType,
+                ResolutionTypeTransferValueTransform::ToNoValue,
+            );
+        } else {
+            let joined = t.slot(body, ResolutionTypeSlotRole::ExpressionValue);
+            for input in inputs {
+                t.transfer(
+                    input,
+                    joined,
+                    ResolutionTypeTransferKind::ValueJoin,
+                    ResolutionTypeTransferValueTransform::Preserve,
+                );
+            }
+            t.transfer(
+                joined,
+                result,
+                ResolutionTypeTransferKind::Initialization,
+                ResolutionTypeTransferValueTransform::Preserve,
+            );
+        }
+        t.p.facts
+            .declaration_type_slots
+            .push(DeclarationTypeSlotFact {
+                declaration: callable,
+                slot: result,
+                role: DeclarationTypeRole::Return,
+            });
+        let signature = &mut t.p.facts.callable_signatures[signature_indices[&callable]];
+        assert!(
+            signature.result_types.is_empty(),
+            "unannotated function has no declared result"
+        );
+        signature
+            .result_types
+            .push(ResolutionCallableResultTypeFact {
+                ordinal: 0,
+                value_type: result,
             });
     }
     // Annotation-only fields acquire their authored member above. All Value
@@ -1388,7 +1993,7 @@ pub(super) fn produce(
         }
     }
     // Computed assignment targets have no name-binder event. Their quoted
-    // annotations still own omitted references, even without an annotation row.
+    // annotations still own structured type references without a binding event.
     // Run after assignment annotations so every owned string is already marked.
     for node in nodes.iter().copied() {
         if node.kind() == "string"
@@ -1423,22 +2028,7 @@ pub(super) fn produce(
         {
             continue;
         }
-        let value =
-            t.p.facts
-                .allocate_type_slot(owner, ResolutionTypeSlotRole::DeclaredValue);
-        t.transfer(
-            input,
-            value,
-            ResolutionTypeTransferKind::Initialization,
-            ResolutionTypeTransferValueTransform::Preserve,
-        );
-        t.p.facts
-            .declaration_type_slots
-            .push(DeclarationTypeSlotFact {
-                declaration: owner,
-                slot: value,
-                role: DeclarationTypeRole::Value,
-            });
+        t.initialize_value(owner, input);
     }
     // Retain every structured call's compiler context, independently of callee
     // spelling. Only ordinary selected resolution may prove the builtin later.
@@ -1497,7 +2087,7 @@ pub(super) fn produce(
                 first_parameter,
             });
     }
-    // A receiver identity is stronger than a receiver type. Only a direct,
+    // A receiver identity is stronger than a receiver type. Only an ordinary,
     // undecorated method's unchanged first positional parameter proves it.
     // Count the whole cell inventory before visiting members: even a later write
     // or a nested nonlocal write withdraws identity from every observation.
@@ -1513,16 +2103,7 @@ pub(super) fn produce(
         .copied()
         .filter(|node| node.kind() == "function_definition")
     {
-        let Some(class) = function
-            .parent()
-            .filter(|body| body.kind() == "block")
-            .and_then(|body| {
-                body.parent().filter(|class| {
-                    class.kind() == "class_definition"
-                        && class.child_by_field_name("body") == Some(body)
-                })
-            })
-        else {
+        let Some(class) = crate::syntax::python_method_owner(function) else {
             continue;
         };
         let method_name = function.child_by_field_name("name").expect("method name");
@@ -1543,7 +2124,15 @@ pub(super) fn produce(
         // A class-body replacement such as helper = staticmethod(helper)
         // changes how the first argument is supplied, even inside the def.
         if t.p.facts.sites[definition.slot.index()].scope != scope_nodes[&class.id()]
-            || writers[&definition.slot].len() != 1
+            || writers[&definition.slot].iter().any(|writer| {
+                writer.kind != ResolutionBindingEventKind::Function
+                    || writer.authored_declaration.is_none_or(|declaration| {
+                        t.p.facts
+                            .python_decorators
+                            .iter()
+                            .any(|decorator| decorator.declaration == declaration)
+                    })
+            })
         {
             continue;
         }
@@ -1564,13 +2153,10 @@ pub(super) fn produce(
         }) else {
             continue;
         };
-        if writers[&event.slot].len() != 1
-            || t.p
-                .facts
-                .python_site_guards
-                .iter()
-                .any(|guard| guard.site == event.target)
-        {
+        // Definition guards control member availability, not the parameter
+        // supplied when this callable runs. Actual parameter writes still veto
+        // receiver identity, including conditional and nonlocal writes.
+        if writers[&event.slot].len() != 1 {
             continue;
         }
         let name =
@@ -1580,6 +2166,12 @@ pub(super) fn produce(
                 .find(|id| id.site == event.target)
                 .expect("a parameter writer has an identifier")
                 .name;
+        // An unchanged first instance parameter has the enclosing nominal class.
+        // Absence of an annotation is not an unsupported expression type.
+        t.p.facts.gaps.retain(|gap| {
+            !(gap.site == parameter.parameter
+                && gap.kind == ResolutionGapKind::UnsupportedExpressionType)
+        });
         receivers.insert(scope_nodes[&function.id()], name);
     }
     for member in nodes
@@ -1596,7 +2188,7 @@ pub(super) fn produce(
         if object.kind() != "identifier" {
             continue;
         }
-        let Some(&receiver_name) = receivers.get(&scopes[&object.id()]) else {
+        let Some(&receiver_name) = receivers.get(&t.scopes[&object.id()]) else {
             // Nested functions, lambdas and comprehension frames never inherit
             // their enclosing method's receiver identity.
             continue;
@@ -1638,7 +2230,7 @@ pub(super) fn produce(
     }
     // Annotation identifiers have structured type references; their qualified
     // owners are value expressions. Retire scope gaps only at these exact
-    // reference ranges. Quoted/PEP695 and implicit class-cell gaps remain intact.
+    // reference ranges. Quoted and implicit class-cell gaps remain intact.
     let type_references =
         t.p.facts
             .identifiers
@@ -1712,4 +2304,52 @@ pub(super) fn produce(
                 owner,
             });
     }
+}
+
+/// Only these structured tails prove that the end of the body is unreachable.
+/// Loops, cleanup constructs and unknown syntax conservatively fall through.
+fn body_end_is_reachable(body: Node<'_>) -> bool {
+    let mut pending = vec![body];
+    while let Some(block) = pending.pop() {
+        let Some(last) = named_children_iter(block)
+            .filter(|node| !node.is_extra())
+            .last()
+        else {
+            return true;
+        };
+        match last.kind() {
+            "return_statement" | "raise_statement" => {}
+            "if_statement" => {
+                let Some(consequence) = last.child_by_field_name("consequence") else {
+                    return true;
+                };
+                pending.push(consequence);
+                let mut has_else = false;
+                for branch in named_children_iter(last) {
+                    match branch.kind() {
+                        "elif_clause" => {
+                            let Some(consequence) = branch.child_by_field_name("consequence")
+                            else {
+                                return true;
+                            };
+                            pending.push(consequence);
+                        }
+                        "else_clause" => {
+                            let Some(body) = branch.child_by_field_name("body") else {
+                                return true;
+                            };
+                            has_else = true;
+                            pending.push(body);
+                        }
+                        _ => {}
+                    }
+                }
+                if !has_else {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+    }
+    false
 }

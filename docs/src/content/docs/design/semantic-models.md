@@ -28,6 +28,13 @@ the source itself.
 Artifact validity, applicability, declaration binding, and behavioral
 completeness are recorded independently.
 
+A partial procedure summary may declare positive transfers without claiming to
+enumerate all effects. Once exactly bound to a call, those transfers coexist
+with the call's ordinary dispatch and unmodeled residual. Their proof comes
+from their own evidence; partial coverage leaves unknown effects and prevents
+clean absence through the call. A partial sanitizer affects only its declared
+transfer edge.
+
 ## Exact binding
 
 A usable procedure summary must bind to a callable identity; display names are
@@ -199,6 +206,48 @@ otherwise stale output could appear valid even though the generator changed.
 Hosts supply or resolve an activation request for semantic packs. The ordinary
 analysis path loads that exact set, and the host retains activation diagnostics.
 
+Selecting the open packs can need a network request. An MCP server answers
+`initialize` and `tools/list` without waiting for it: it acquires the packs in
+the background. The session warm's installed stage never waits on that
+acquisition. While it runs, the installed stage publishes an interim state that
+names it, and a `query_code` answer carries the pending-acquisition diagnostic,
+so the answer reads incomplete rather than pack-free. The expensive stage waits
+for the acquisition, registers the selected packs and activates the whole set.
+Policy catalog loading waits for the acquisition on first use. One-shot
+commands acquire before they run.
+
+Startup verifies the release envelope and the assets it consumes. It does not
+hash unused distribution assets, so damage to one of those assets can remain
+undetected until another operation reads it. Full-bundle verification remains
+available separately. Stored shards are checked again when read; a writer's
+publication marker alone does not certify their bytes for the current reader.
+
+A release install can reuse a stored pack only when its source and manifest,
+shard bytes, extraction accounting, selectors, routing, and published semantic
+rows satisfy the current exact install check. The current shard validation
+certificate and semantic-row publication marker are separate requirements.
+Hydration still reads and hashes stored bytes. Distribution-only index changes,
+such as an artifact URL or path, do not change install identity when the new
+path selects the same verified content. An identical shard row is retained:
+replacing it would cascade-delete its selector, routing, and semantic children.
+A mismatched stored row is an integrity error, and missing derived rows are
+reconciled in place. Bootstrap holds its owned leases until activation returns;
+activation rechecks authority before publication, including after a concurrent
+install or a failed intermediate write.
+
+Release bootstrap covers the selected workspace's conservative demand: every
+language of each kept ecosystem, explicit release-managed evidence pairs, and
+exact eligible generated productions. Unknown or partial discovery uses the
+whole release. Enabling conditions filter candidates and do not add coverage.
+The published activation pins its coverage and the evidence used to compute it.
+A request whose snapshot demands more than that coverage reports `WarmPending`
+until a matching activation publishes; coverage does not certify that every
+model has been acquired. A refresh starts outside `session.write` and coalesces
+to one unfinished warm per session. Query or status settlement starts a
+replacement for a superseded warm. Publication checks the semantic-pack state
+and source snapshot pointers under `session.write`; input changes invalidate
+those pointers, so an older warm cannot publish authority for a newer snapshot.
+
 An unpinned Rust workspace explicitly requests approximate standard-library
 facts. Shared activation chooses the newest available `bifrost.rust-stdlib`
 pack by semantic pack version, retaining engine compatibility and review
@@ -208,10 +257,38 @@ an observed compiler version or artifact digest, or certify a complete exact
 dependency boundary. A declared toolchain pin that
 does not match a pack never falls back to approximate activation.
 
+The selected stdlib also supplies one assumed Rust toolchain version for enabled
+companion packs. This is the unique exact Rust version named by selectors on
+its retained shards, not the stdlib pack's authoring version. Ordinary selector
+matching checks companions against that version. Selected companions record the
+approximation and assumed version in their activation evidence and dependency
+advisory. If the stdlib is missing, its selectors name several Rust versions,
+use a range, or name no Rust version, no shared assumption is available. Other
+toolchain-keyed packs stay inactive with the reason; the stdlib's approximate
+activation and advisory are retained. This assumption is request-scoped and
+never becomes observed workspace evidence.
+
 Source-set producers retain the exact extraction-input digest as production
 identity. That digest does not automatically constrain runtime applicability:
 Rust, Python and JDK source-set producers preserve the caller's activation
 selectors. Individual dependency artifacts can still require exact digests.
+
+A warm process keeps dependency-discovery evidence across a workspace update only when it can show that discovery would give the same answer. While it runs, discovery records every input it reads:
+- project files, by content, explicit absence and candidate membership;
+- external files, by a digest of the bytes it read, or their absence;
+- environment values.
+
+At an update, each ecosystem's evidence is carried onto the new snapshot only when every recorded input still verifies and the configuration is unchanged.
+
+A change to the workspace's file set is allowed only when no added or removed path is a candidate for that ecosystem's discovery. One predicate per resolver decides that, and the discovery's own enumeration uses the same predicate.
+
+An ecosystem that cannot be verified is rediscovered on its own, without touching the evidence or active models of the ecosystems that were carried. Discovery that reads process output or walks an external cache cannot be verified, nor can discovery that reported a diagnostic.
+
+Incompleteness that the recorded inputs determine is carried with its truncated flag, so the warm answer equals the cold one. An approximate standard library chosen because no toolchain is pinned is one example: the recorded absent toolchain files pin it.
+
+When a language's own reconcile has already run discovery for an update, activation consumes that captured result instead of running discovery again.
+
+The provider identity includes one digest of the evidence that consumers read, the declared modules and the truncated flag of each language. So products built from different evidence never replay against each other.
 
 ## CSMI interoperability
 

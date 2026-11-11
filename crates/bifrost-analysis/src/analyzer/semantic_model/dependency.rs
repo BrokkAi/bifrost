@@ -3,7 +3,10 @@ use crate::analyzer::DependencyPackEcosystem;
 use crate::analyzer::semantic_model::{
     CatalogCandidate, CatalogError, CatalogPackSourceKind, Completeness, GeneratedProductionKey,
     PackExtractionAccounting, Producer, SemanticPackCatalog,
-    producer::{read_exact_artifact_while, read_exact_source_set_while},
+    producer::{
+        read_exact_artifact_while, read_exact_source_set_seekable_while,
+        read_exact_source_set_while,
+    },
 };
 use crate::hash::{HashSet, set_with_capacity};
 pub use brokk_bifrost_semantic::analyzer::semantic_model::dependency::*;
@@ -21,6 +24,12 @@ use std::sync::{OnceLock, RwLock};
 /// Implementations live with the ecosystem they know about; the registry that
 /// names them is `DependencyPackEcosystem::resolver`.
 pub trait DependencyResolver: Send + Sync {
+    /// Select paths that this resolver's discovery enumeration could read.
+    /// The enumeration must use this same predicate for candidate selection.
+    fn is_discovery_candidate(&self, _rel_path: &std::path::Path) -> bool {
+        true
+    }
+
     /// The pack adapter that produces semantic packs from what this resolver
     /// resolves. Pairing them here is what removes the chance of activating an
     /// ecosystem's dependencies through another's adapter.
@@ -67,11 +76,15 @@ pub trait DependencyResolver: Send + Sync {
         )
     }
 
-    /// Discover this ecosystem's exact local dependencies.
+    /// Discover this ecosystem's exact local dependencies. `digests` is the
+    /// workspace store's budget-charged content-digest region; an ecosystem
+    /// that binds artifact content during discovery (the JDK) streams its
+    /// digests through it, and the others ignore it.
     fn resolve(
         &self,
         config: &crate::analyzer::AnalyzerConfig,
         project: &dyn crate::analyzer::Project,
+        digests: &brokk_bifrost_core::content_digest::ContentDigestCache,
         limits: &DependencyPackLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyDiscoveryOutcome;
@@ -150,7 +163,78 @@ pub(crate) fn semantic_pack_acquisition_hook() -> Option<SemanticPackAcquisition
         .expect("semantic-pack acquisition hook mutex poisoned")
 }
 
+/// Prepare one ecosystem's discovered dependencies.
+///
+/// A row the adapter marks [`DependencyPackAdapter::installed_packs_only`],
+/// such as an exact lockfile coordinate with no artifact to produce from,
+/// selects only compatible installed or reviewed workspace packs through
+/// [`prepare_compatible_installed_semantic_packs`], as curated Go module
+/// evidence does: such a package without a pack is not a failure, because
+/// most locked packages have no model. So does a producible row the adapter
+/// marks [`DependencyPackAdapter::reviewed_pack_supersedes_production`] when
+/// such a pack exists for its coordinate; a failed lookup routes it there too,
+/// so the installed route reports the failure instead of generating a second
+/// owner of the reviewed symbols. Every other row is produced or acquired.
 pub fn prepare_dependency_semantic_packs(
+    catalog: &SemanticPackCatalog,
+    adapter: &dyn DependencyPackAdapter,
+    dependencies: &[ResolvedDependency],
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyPackPreparationOutcome {
+    let selects_installed = |dependency: &ResolvedDependency| {
+        adapter.installed_packs_only(dependency)
+            || (adapter.reviewed_pack_supersedes_production(dependency)
+                && !matches!(
+                    compatible_curated_installed_pack(catalog, dependency),
+                    Ok(None)
+                ))
+    };
+    let routes = dependencies
+        .iter()
+        .map(selects_installed)
+        .collect::<Vec<_>>();
+    if !routes.contains(&true) {
+        return prepare_produced_dependency_semantic_packs(
+            catalog,
+            adapter,
+            dependencies,
+            limits,
+            cancellation,
+        );
+    }
+    let (mut locked, mut produced) = (Vec::new(), Vec::new());
+    for (dependency, installed) in dependencies.iter().zip(routes) {
+        if installed {
+            locked.push(dependency.clone());
+        } else {
+            produced.push(dependency.clone());
+        }
+    }
+    let mut outcome = prepare_produced_dependency_semantic_packs(
+        catalog,
+        adapter,
+        &produced,
+        limits,
+        cancellation,
+    );
+    if outcome.cancelled {
+        return outcome;
+    }
+    let installed =
+        prepare_compatible_installed_semantic_packs(catalog, &locked, limits, cancellation);
+    outcome.installed_packs.extend(installed.installed_packs);
+    outcome.evidence.extend(installed.evidence);
+    outcome.diagnostics.extend(installed.diagnostics);
+    outcome.suppressed_diagnostics += installed.suppressed_diagnostics;
+    outcome.complete &= installed.complete;
+    outcome.cancelled = installed.cancelled;
+    outcome.profile.dependencies_considered += installed.profile.dependencies_considered;
+    outcome.profile.installed_packs += installed.profile.installed_packs;
+    outcome
+}
+
+fn prepare_produced_dependency_semantic_packs(
     catalog: &SemanticPackCatalog,
     adapter: &dyn DependencyPackAdapter,
     dependencies: &[ResolvedDependency],
@@ -288,6 +372,40 @@ pub fn prepare_dependency_semantic_packs(
             }
         }
 
+        if source_identity.is_none() && adapter.reuses_productions_by_pinned_key() {
+            let reusable = {
+                let _scope = crate::profiling::scope("semantic_pack.lookup_pinned_key");
+                pinned_generated_production_key(adapter, dependency, limits).and_then(|key| {
+                    key.map(|key| {
+                        reusable_generated_pack(catalog, &key, dependency, key.input_digest(), None)
+                    })
+                    .transpose()
+                    .map(Option::flatten)
+                })
+            };
+            match reusable {
+                Ok(Some(prepared)) => {
+                    record_reused_generated_pack(
+                        prepared,
+                        dependency,
+                        &mut diagnostics,
+                        &mut evidence,
+                        &mut packs,
+                        &mut profile,
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => diagnostics.warning(
+                    "catalog.pinned_key",
+                    Some(&dependency.id),
+                    format!(
+                        "could not consult the catalog under the pinned production key, so its artifacts will be read: {error}"
+                    ),
+                ),
+            }
+        }
+
         let artifact_read_scope = crate::profiling::scope("semantic_pack.read_exact_artifacts");
         let mut exact_artifacts = Vec::with_capacity(dependency.artifacts.len());
         for artifact in &dependency.artifacts {
@@ -313,17 +431,6 @@ pub fn prepare_dependency_semantic_packs(
             let mut artifact_limits = limits.producer;
             artifact_limits.max_artifact_bytes = artifact_limits.max_artifact_bytes.min(remaining);
             if artifact.expected_sha256.is_some()
-                && !matches!(&artifact.input, ResolvedDependencyArtifactInput::File(_))
-            {
-                diagnostics.error(
-                    "artifact.digest_binding_unsupported",
-                    Some(&dependency.id),
-                    Some(artifact.path()),
-                    "dependency artifact digest binding requires an exact file input",
-                );
-                break;
-            }
-            if artifact.expected_sha256.is_some()
                 && !artifact
                     .path()
                     .canonicalize()
@@ -340,6 +447,26 @@ pub fn prepare_dependency_semantic_packs(
             let exact = match &artifact.input {
                 ResolvedDependencyArtifactInput::File(path) => {
                     read_exact_artifact_while(path, &artifact_limits, || is_cancelled(cancellation))
+                }
+                ResolvedDependencyArtifactInput::SourceSet {
+                    root,
+                    relative_paths,
+                } if artifact.kind
+                    == crate::analyzer::semantic_model::ExternalArtifactKind::JdkJmodSet =>
+                {
+                    // JMODs can carry large native libraries that still belong
+                    // to exact identity. Capture only this source set on disk;
+                    // ordinary producers materialize bytes under their 256 MiB
+                    // limit, while JMODs use the acquisition-total bound.
+                    read_exact_source_set_seekable_while(
+                        root,
+                        relative_paths,
+                        limits.max_source_files_per_artifact.min(512),
+                        limits.max_source_path_depth,
+                        remaining,
+                        &artifact_limits,
+                        || is_cancelled(cancellation),
+                    )
                 }
                 ResolvedDependencyArtifactInput::SourceSet {
                     root,
@@ -369,9 +496,8 @@ pub fn prepare_dependency_semantic_packs(
                         break;
                     }
                     profile.artifacts_read += 1;
-                    profile.artifact_bytes_read = profile
-                        .artifact_bytes_read
-                        .saturating_add(exact.bytes().len() as u64);
+                    profile.artifact_bytes_read =
+                        profile.artifact_bytes_read.saturating_add(exact.raw_len());
                     exact_artifacts.push(ExactDependencyArtifact {
                         role: artifact.role,
                         kind: artifact.kind,
@@ -675,7 +801,7 @@ pub fn prepare_dependency_semantic_packs(
         for diagnostic in production.diagnostics.iter().cloned() {
             diagnostics.producer(Some(&dependency.id), diagnostic);
         }
-        if production.completeness == Completeness::Partial && !production_has_diagnostics {
+        if production.completeness != Completeness::Complete && !production_has_diagnostics {
             diagnostics.error(
                 "production.partial",
                 Some(&dependency.id),
@@ -749,8 +875,14 @@ pub fn prepare_dependency_semantic_packs(
                 .map(|pack| pack.dependency_id.as_str()),
         )
         .collect();
+    let mut unserved_assumed = 0usize;
     for dependency in dependencies {
-        if !accounted_dependencies.contains(dependency.id.as_str()) {
+        if accounted_dependencies.contains(dependency.id.as_str()) {
+            continue;
+        }
+        if dependency.is_assumed() {
+            unserved_assumed += 1;
+        } else {
             diagnostics.warning(
                 "preparation.unaccounted-dependency",
                 Some(&dependency.id),
@@ -760,7 +892,11 @@ pub fn prepare_dependency_semantic_packs(
     }
     let complete = !cancelled
         && dependencies.len() <= limits.max_dependencies
-        && packs.len().saturating_add(installed_packs.len()) == dependencies.len()
+        && packs
+            .len()
+            .saturating_add(installed_packs.len())
+            .saturating_add(unserved_assumed)
+            == dependencies.len()
         && packs
             .iter()
             .all(|pack| pack.completeness == Completeness::Complete)
@@ -917,6 +1053,8 @@ pub struct PendingDependencyPackAcquisition {
 /// local artifacts; an installed hit still serves the interim answer, but only
 /// under the curated trust rule, so an untrusted local partial cannot decide
 /// an answer the final activation would refuse.
+/// The exception is a row whose adapter lets a reviewed pack supersede
+/// production: the full stage selects that same pack, so the hit is final.
 ///
 /// A dependency no installed pack settles is reported in `pending` rather than
 /// diagnosed: nothing about it has failed, its acquisition simply has not run.
@@ -934,6 +1072,7 @@ pub fn prepare_installed_dependency_packs(
     let mut evidence = Vec::new();
     let mut profile = DependencyPackPreparationProfile::default();
     let mut pending = Vec::new();
+    let mut required_pending = false;
     let mut cancelled = false;
     let mut failed = false;
 
@@ -972,6 +1111,9 @@ pub fn prepare_installed_dependency_packs(
         if producible {
             match compatible_curated_installed_pack(catalog, dependency) {
                 Ok(Some(installed)) => {
+                    // The full stage selects this same pack instead of
+                    // producing when the reviewed pack supersedes production.
+                    settled = adapter.reviewed_pack_supersedes_production(dependency);
                     evidence.push(installed.evidence.clone());
                     installed_packs.push(installed);
                     profile.installed_packs += 1;
@@ -997,7 +1139,10 @@ pub fn prepare_installed_dependency_packs(
                 }
             }
         }
-        if producible || !settled {
+        if !settled {
+            // An assumed dependency still waits for acquisition, but its
+            // absence does not make the preparation incomplete.
+            required_pending |= !dependency.is_assumed();
             pending.push(dependency.id.clone());
         }
     }
@@ -1011,7 +1156,7 @@ pub fn prepare_installed_dependency_packs(
             "dependency semantic-pack preparation was cancelled",
         );
     }
-    let complete = !failed && !cancelled && pending.is_empty();
+    let complete = !failed && !cancelled && !required_pending;
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
     InstalledDependencyPackPreparation {
         outcome: DependencyPackPreparationOutcome {
@@ -1130,6 +1275,21 @@ pub(crate) fn resolve_declared_dependency_pack(
         }
     }
 
+    // An assumed dependency is the engine's guess, not the workspace's
+    // statement, so no pack serving it is no defect to report: the pack is
+    // offered to the acquisition hook and otherwise simply not selected.
+    let assumed = dependency.is_assumed();
+    let unavailable = |diagnostics: &mut BoundedDependencyDiagnostics| {
+        if !assumed {
+            diagnostics.error(
+                "dependency.pack_unavailable",
+                Some(&dependency.id),
+                None,
+                PACK_UNAVAILABLE_MESSAGE,
+            );
+        }
+    };
+
     // No usable pack. Distinguish "a pack exists for another version of this
     // exact coordinate" from "no pack at all": the near miss names the
     // installed and required versions so a version mismatch is attributable,
@@ -1137,12 +1297,7 @@ pub(crate) fn resolve_declared_dependency_pack(
     // release bundle already supplied a pack for this coordinate, and the
     // version the workspace declares is what does not match.
     let Some(query) = installed_pack_query(dependency) else {
-        diagnostics.error(
-            "dependency.pack_unavailable",
-            Some(&dependency.id),
-            None,
-            PACK_UNAVAILABLE_MESSAGE,
-        );
+        unavailable(diagnostics);
         return Ok(None);
     };
     let near_misses = match catalog.version_near_misses(&query) {
@@ -1152,7 +1307,7 @@ pub(crate) fn resolve_declared_dependency_pack(
             return Ok(None);
         }
     };
-    if !near_misses.is_empty() {
+    if !near_misses.is_empty() && !assumed {
         for near_miss in near_misses {
             diagnostics.error(
                 "dependency.pack_version_mismatch",
@@ -1165,12 +1320,7 @@ pub(crate) fn resolve_declared_dependency_pack(
     }
 
     let Some(acquire) = semantic_pack_acquisition_hook() else {
-        diagnostics.error(
-            "dependency.pack_unavailable",
-            Some(&dependency.id),
-            None,
-            PACK_UNAVAILABLE_MESSAGE,
-        );
+        unavailable(diagnostics);
         return Ok(None);
     };
     if is_cancelled(cancellation) {
@@ -1190,12 +1340,7 @@ pub(crate) fn resolve_declared_dependency_pack(
     match compatible_installed_pack(catalog, dependency, diagnostics) {
         Ok(Some(installed)) => Ok(Some(installed)),
         Ok(None) => {
-            diagnostics.error(
-                "dependency.pack_unavailable",
-                Some(&dependency.id),
-                None,
-                PACK_UNAVAILABLE_MESSAGE,
-            );
+            unavailable(diagnostics);
             Ok(None)
         }
         Err(error) => {
@@ -1625,3 +1770,104 @@ pub(crate) mod declared_pack_acquisition_tests {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
+
+/// Whether project enumeration membership is unchanged across an update.
+/// Overlay-set changes belong in `added` and `removed`. M2 may disregard a
+/// changed Inventory or Listing read only when this returns true; every other
+/// recorded read key still needs exact verification.
+pub fn discovery_membership_unchanged(
+    resolver: &dyn DependencyResolver,
+    added: &[std::path::PathBuf],
+    removed: &[std::path::PathBuf],
+    old_ignore_rules: &[u8; 32],
+    new_ignore_rules: &[u8; 32],
+) -> bool {
+    old_ignore_rules == new_ignore_rules
+        && added
+            .iter()
+            .chain(removed)
+            .all(|path| !resolver.is_discovery_candidate(path))
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+    use crate::CancellationToken;
+    use crate::analyzer::semantic_model::{
+        DependencyDiscoveryOutcome, DependencyPackAdapter, DependencyPackLimits,
+        DependencyResolverBounds,
+    };
+
+    struct DefaultCandidateResolver;
+    impl DependencyResolver for DefaultCandidateResolver {
+        fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+            unimplemented!()
+        }
+        fn dependency_inputs(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn bounds(&self, _: &crate::analyzer::AnalyzerConfig) -> DependencyResolverBounds {
+            unimplemented!()
+        }
+        fn resolve(
+            &self,
+            _: &crate::analyzer::AnalyzerConfig,
+            _: &dyn crate::analyzer::Project,
+            _: &brokk_bifrost_core::content_digest::ContentDigestCache,
+            _: &DependencyPackLimits,
+            _: Option<&CancellationToken>,
+        ) -> DependencyDiscoveryOutcome {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn default_candidate_hook_rejects_added_paths() {
+        let digest = [0; 32];
+        assert!(!discovery_membership_unchanged(
+            &DefaultCandidateResolver,
+            &[std::path::PathBuf::from("src/new.rs")],
+            &[],
+            &digest,
+            &digest,
+        ));
+    }
+}
+
+pub struct CapturedDependencyDiscovery {
+    pub outcome: DependencyDiscoveryOutcome,
+    pub(crate) rust_cargo_graph: Option<super::RustSelectedCargoGraph>,
+    pub project_read_keys: std::sync::Arc<[crate::analyzer::read_ledger::ReadKey]>,
+    pub project_read_identity: crate::analyzer::semantic::ids::StableDigest,
+    pub external_reads: crate::analyzer::dependency_support::ExternalDiscoveryReads,
+}
+
+thread_local! {
+    static RUST_CARGO_GRAPH_CAPTURE: std::cell::RefCell<Option<super::RustSelectedCargoGraph>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Called only by the Rust dependency discoverer while discovery is captured.
+pub fn publish_rust_selected_cargo_graph(graph: super::RustSelectedCargoGraph) {
+    RUST_CARGO_GRAPH_CAPTURE.with(|slot| *slot.borrow_mut() = Some(graph));
+}
+
+pub fn capture_dependency_discovery(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    discover: impl FnOnce() -> DependencyDiscoveryOutcome,
+) -> CapturedDependencyDiscovery {
+    RUST_CARGO_GRAPH_CAPTURE.with(|slot| *slot.borrow_mut() = None);
+    let ((outcome, external_reads), project_reads) =
+        brokk_bifrost_core::analyzer::project_reads::with_project_read_suppression(false, || {
+            crate::analyzer::i_analyzer::capture_with_read_ledger_scope(analyzer, None, || {
+                crate::analyzer::dependency_support::capture_external_discovery_reads(discover)
+            })
+        });
+    let rust_cargo_graph = RUST_CARGO_GRAPH_CAPTURE.with(|slot| slot.borrow_mut().take());
+    CapturedDependencyDiscovery {
+        outcome,
+        rust_cargo_graph,
+        project_read_keys: project_reads.canonical_keys(),
+        project_read_identity: project_reads.digest().digest(),
+        external_reads,
+    }
+}

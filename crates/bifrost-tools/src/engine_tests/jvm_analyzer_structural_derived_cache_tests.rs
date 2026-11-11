@@ -42,7 +42,7 @@ mod jvm_extraction_tests {
             DirectImportTopologyLimits {
                 max_files: 100,
                 max_edges: 100,
-                max_retained_bytes: 1,
+                construction_limit_bytes: 1,
             },
         );
 
@@ -81,7 +81,7 @@ mod jvm_extraction_tests {
             DirectImportTopologyLimits {
                 max_files: 100,
                 max_edges: 0,
-                max_retained_bytes: 1024 * 1024,
+                construction_limit_bytes: 1024 * 1024,
             },
         );
 

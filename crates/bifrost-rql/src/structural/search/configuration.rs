@@ -18,14 +18,16 @@ use crate::query::{
     ConfigurationNodeKindFilter, ConfigurationRouteFilter, ConfigurationRouteSegmentFilter,
 };
 use brokk_bifrost_analysis::analyzer::configuration::{
-    ConfigurationIngestionError, ConfigurationIngestionOutcome, decoded_json_scalar_value,
-    decoded_properties_scalar_value, decoded_xml_scalar_value, decoded_yaml_scalar_value,
-    ingest_configuration_document,
+    ConfigurationIngestionError, ConfigurationIngestionOutcome, ConfigurationNumber,
+    ConfigurationNumberToken, decoded_hocon_scalar_value, decoded_json_scalar_value,
+    decoded_properties_scalar_value, decoded_toml_scalar_value, decoded_xml_scalar_value,
+    decoded_yaml_scalar_value, ingest_configuration_document, parsed_scalar_number,
 };
 use brokk_bifrost_analysis::analyzer::workspace_authority::{CaptureScopedMemo, memo_attribution};
 use brokk_bifrost_core::analyzer::configuration::{
     ConfigurationCompleteness, ConfigurationDocumentFacts, ConfigurationFact, ConfigurationFactId,
-    ConfigurationNodeKind, ConfigurationRouteSelector, ConfigurationValueProvenance,
+    ConfigurationFormat, ConfigurationNodeKind, ConfigurationRouteSelector,
+    ConfigurationValueProvenance,
 };
 
 /// One document snapshot travels with every row derived from it, so member
@@ -89,25 +91,64 @@ impl ConfigurationFactValue {
     /// the value of their scalar child; scalar rows expose themselves. Each
     /// format-specific decoder runs only after the configuration grammar has
     /// selected the scalar fact and its exact evidence range.
-    pub(super) fn scalar_value(&self) -> Option<String> {
-        let scalar_id = match self.fact().kind() {
+    pub(super) fn scalar_value(&self) -> ScalarValue {
+        let Some(scalar_id) = self.scalar_id() else {
+            return ScalarValue::Absent;
+        };
+        let decoded = match self.document.format() {
+            ConfigurationFormat::Json => {
+                decoded_json_scalar_value(&self.document, &self.source, scalar_id)
+            }
+            ConfigurationFormat::Yaml => {
+                decoded_yaml_scalar_value(&self.document, &self.source, scalar_id)
+            }
+            ConfigurationFormat::Toml => {
+                decoded_toml_scalar_value(&self.document, &self.source, scalar_id)
+            }
+            ConfigurationFormat::Xml => {
+                decoded_xml_scalar_value(&self.document, &self.source, scalar_id)
+            }
+            ConfigurationFormat::Properties => {
+                decoded_properties_scalar_value(&self.document, &self.source, scalar_id)
+            }
+            ConfigurationFormat::Hocon => {
+                decoded_hocon_scalar_value(&self.document, &self.source, scalar_id)
+            }
+        };
+        decoded.map_or(ScalarValue::Undecodable, ScalarValue::Decoded)
+    }
+
+    /// The scalar fact this row decodes: a scalar row is its own scalar, a
+    /// member row is its value's scalar (or an XML element's text header).
+    fn scalar_id(&self) -> Option<ConfigurationFactId> {
+        match self.fact().kind() {
             ConfigurationNodeKind::Scalar { .. } => ConfigurationFactId::new(self.index),
             ConfigurationNodeKind::Member {
                 value: Some(value), ..
-            } => match self.document.fact(*value)?.kind() {
-                ConfigurationNodeKind::Scalar { .. } => Some(*value),
-                ConfigurationNodeKind::Section {
+            } => match self.document.fact(*value).map(ConfigurationFact::kind) {
+                Some(ConfigurationNodeKind::Scalar { .. }) => Some(*value),
+                Some(ConfigurationNodeKind::Section {
                     header: Some(header),
                     ..
-                } => Some(*header),
+                }) => Some(*header),
                 _ => None,
             },
             _ => None,
-        }?;
-        decoded_json_scalar_value(&self.document, &self.source, scalar_id)
-            .or_else(|| decoded_yaml_scalar_value(&self.document, &self.source, scalar_id))
-            .or_else(|| decoded_xml_scalar_value(&self.document, &self.source, scalar_id))
-            .or_else(|| decoded_properties_scalar_value(&self.document, &self.source, scalar_id))
+        }
+    }
+
+    /// The number this row's scalar denotes, given its decoded text: the
+    /// number the format's parser reports (TOML `0x400` and `1_000`, JSON and
+    /// YAML numbers), else the number a decimal spelling in the text denotes
+    /// (a quoted `"-2"`, XML text).
+    pub(super) fn scalar_number(&self, text: &str) -> ConfigurationNumberToken {
+        let Some(scalar_id) = self.scalar_id() else {
+            return ConfigurationNumberToken::NotDecimal;
+        };
+        match parsed_scalar_number(&self.document, &self.source, scalar_id) {
+            ConfigurationNumberToken::NotDecimal => ConfigurationNumber::read(text),
+            read => read,
+        }
     }
 
     /// The workspace-scoped row id: one file spelling plus the document-scoped
@@ -166,6 +207,21 @@ impl ConfigurationFactValue {
     }
 }
 
+pub(super) enum ScalarValue {
+    Absent,
+    Decoded(String),
+    Undecodable,
+}
+
+impl ScalarValue {
+    pub(super) fn decoded(self) -> Option<String> {
+        match self {
+            Self::Decoded(value) => Some(value),
+            Self::Absent | Self::Undecodable => None,
+        }
+    }
+}
+
 fn display_key_name(name: &str, occurrence: usize) -> String {
     if occurrence > 1 {
         format!("{name}#{occurrence}")
@@ -188,10 +244,13 @@ pub(super) const MAX_CONFIGURATION_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// One ingested document snapshot, memoized per request. `None` means the
 /// document produced no fact arena (unsupported, unreadable, or entirely
-/// unparseable) and its diagnostic already reported.
+/// unparseable). `diagnostics` are the incomplete diagnostics its ingest
+/// reported; every replay reports them again, because a retried branch
+/// replaces the diagnostics of its first attempt.
 #[derive(Clone)]
 pub(super) struct ConfigurationDocumentSnapshot {
     document: Option<(Arc<ConfigurationDocumentFacts>, Arc<str>)>,
+    diagnostics: Arc<[CodeQueryDiagnostic]>,
 }
 
 /// The ingestion state of one document in the current request.
@@ -207,13 +266,24 @@ pub(super) enum ConfigurationDocumentIngestion {
     Complete,
 }
 
-/// Per-request memo of ingested configuration documents plus the incomplete
-/// diagnostics already reported, so one file ingests once per execution and
-/// one gap reports once.
+/// Per-request memo of ingested configuration documents, so one file
+/// ingests once per execution.
 #[derive(Default)]
 pub(super) struct ConfigurationFactsTraversalCache {
     documents: CaptureScopedMemo<HashMap<ProjectFile, ConfigurationDocumentSnapshot>>,
-    reported: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
+}
+
+/// Report each incomplete diagnostic once per seed execution. What was
+/// reported belongs to the attempt, not to the request: a retried branch runs
+/// the seed again with a new set, and its gaps must appear again.
+fn push_once(
+    reported: &mut HashSet<(CodeQueryDiagnosticCode, String)>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    diagnostic: CodeQueryDiagnostic,
+) {
+    if reported.insert((diagnostic.code, diagnostic.message.clone())) {
+        diagnostics.push(diagnostic);
+    }
 }
 
 impl ConfigurationFactsTraversalCache {
@@ -242,13 +312,13 @@ impl ConfigurationFactsTraversalCache {
     }
     /// Ingest (or replay) one workspace configuration document. `None` only on
     /// cancellation; a supported-but-failed document yields `Some` with no
-    /// arena plus its diagnostic.
+    /// arena. The snapshot carries the document's diagnostics, which the
+    /// caller reports on every replay as well as on the first read.
     pub(super) fn document_for(
         &mut self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         cancellation: Option<&CancellationToken>,
-        diagnostics: &mut Vec<CodeQueryDiagnostic>,
     ) -> Option<ConfigurationDocumentSnapshot> {
         if let Some(cached) = self
             .documents
@@ -258,6 +328,7 @@ impl ConfigurationFactsTraversalCache {
         {
             return Some(cached);
         }
+        let mut ingest_diagnostics = Vec::new();
         let project = analyzer.project();
         let snapshot = project.read_source_snapshot_limited(file, MAX_CONFIGURATION_DOCUMENT_BYTES);
         let snapshot = match snapshot {
@@ -271,17 +342,22 @@ impl ConfigurationFactsTraversalCache {
                     )
                 });
                 analyzer.mark_execution_dependent();
-                self.report_file_incomplete(analyzer,
-                    file,
-                    (CodeQueryDiagnosticCode::PipelineBudgetExhausted, Incompleteness::Operational(DerivationExecutionCause::Budget)),
+                ingest_diagnostics.push(Self::file_incomplete(
+                    analyzer,
+                    (
+                        CodeQueryDiagnosticCode::PipelineBudgetExhausted,
+                        Incompleteness::Operational(DerivationExecutionCause::Budget),
+                    ),
                     format!(
                         "configuration document {} exceeds the {}-byte ingestion cap; its facts are not available",
                         rel_path_string(file),
                         MAX_CONFIGURATION_DOCUMENT_BYTES
                     ),
-                    diagnostics,
-                );
-                let snapshot = ConfigurationDocumentSnapshot { document: None };
+                ));
+                let snapshot = ConfigurationDocumentSnapshot {
+                    document: None,
+                    diagnostics: Arc::from(std::mem::take(&mut ingest_diagnostics)),
+                };
                 self.documents
                     .read_mut(&memo_attribution(analyzer), |documents| {
                         documents.insert(file.clone(), snapshot.clone())
@@ -297,9 +373,8 @@ impl ConfigurationFactsTraversalCache {
                     )
                 });
                 analyzer.mark_execution_dependent();
-                self.report_file_incomplete(
+                ingest_diagnostics.push(Self::file_incomplete(
                     analyzer,
-                    file,
                     (
                         CodeQueryDiagnosticCode::PathDerivationIncomplete,
                         Incompleteness::Operational(DerivationExecutionCause::Provider),
@@ -308,9 +383,11 @@ impl ConfigurationFactsTraversalCache {
                         "configuration ingestion could not read {}: {error}",
                         rel_path_string(file)
                     ),
-                    diagnostics,
-                );
-                let snapshot = ConfigurationDocumentSnapshot { document: None };
+                ));
+                let snapshot = ConfigurationDocumentSnapshot {
+                    document: None,
+                    diagnostics: Arc::from(std::mem::take(&mut ingest_diagnostics)),
+                };
                 self.documents
                     .read_mut(&memo_attribution(analyzer), |documents| {
                         documents.insert(file.clone(), snapshot.clone())
@@ -331,16 +408,18 @@ impl ConfigurationFactsTraversalCache {
                 if facts.completeness().is_complete() {
                     Some((Arc::new(*facts), Arc::clone(&source)))
                 } else {
-                    self.report_file_incomplete(analyzer,
-                        file,
-                        (CodeQueryDiagnosticCode::SemanticAnalysisPartial, Incompleteness::Content),
+                    ingest_diagnostics.push(Self::file_incomplete(
+                        analyzer,
+                        (
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            Incompleteness::Content,
+                        ),
                         format!(
                             "configuration ingestion of {} retained facts from a partly recovered document ({}); its rows are not the whole set",
                             rel_path_string(file),
                             recovery_labels(&facts)
                         ),
-                        diagnostics,
-                    );
+                    ));
                     Some((Arc::new(*facts), Arc::clone(&source)))
                 }
             }
@@ -348,35 +427,47 @@ impl ConfigurationFactsTraversalCache {
                 let format = format
                     .map(|format| format.to_string())
                     .unwrap_or_else(|| "unknown configuration".to_string());
-                self.report_file_incomplete(analyzer,
-                    file,
-                    (CodeQueryDiagnosticCode::MissingStructuralAdapter, Incompleteness::Content),
+                ingest_diagnostics.push(Self::file_incomplete(
+                    analyzer,
+                    (
+                        CodeQueryDiagnosticCode::MissingStructuralAdapter,
+                        Incompleteness::Content,
+                    ),
                     format!(
                         "no configuration ingestion adapter for {format}: {} was not read, so the configuration facts are not the whole set",
                         rel_path_string(file)
                     ),
-                    diagnostics,
-                );
+                ));
                 None
             }
             ConfigurationIngestionOutcome::Incomplete { reason } => {
-                self.report_file_incomplete(analyzer,
-                    file,
-                    (CodeQueryDiagnosticCode::SemanticAnalysisPartial, match reason {
-                        ConfigurationIngestionError::ParserUnavailable(_) => Incompleteness::Operational(DerivationExecutionCause::Provider),
-                        ConfigurationIngestionError::InvalidUtf8 | ConfigurationIngestionError::InvalidFactModel(_) => Incompleteness::Content,
-                    }),
+                ingest_diagnostics.push(Self::file_incomplete(
+                    analyzer,
+                    (
+                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                        match reason {
+                            ConfigurationIngestionError::ParserUnavailable(_) => {
+                                Incompleteness::Operational(DerivationExecutionCause::Provider)
+                            }
+                            ConfigurationIngestionError::InvalidUtf8
+                            | ConfigurationIngestionError::InvalidFactModel(_) => {
+                                Incompleteness::Content
+                            }
+                        },
+                    ),
                     format!(
                         "configuration ingestion of {} is incomplete ({}); its rows are not the whole set",
                         rel_path_string(file),
                         ingestion_reason_label(&reason)
                     ),
-                    diagnostics,
-                );
+                ));
                 None
             }
         };
-        let snapshot = ConfigurationDocumentSnapshot { document };
+        let snapshot = ConfigurationDocumentSnapshot {
+            document,
+            diagnostics: Arc::from(ingest_diagnostics),
+        };
         self.documents
             .read_mut(&memo_attribution(analyzer), |documents| {
                 documents.insert(file.clone(), snapshot.clone())
@@ -409,15 +500,12 @@ impl ConfigurationFactsTraversalCache {
             })
     }
 
-    fn report_file_incomplete(
-        &mut self,
+    fn file_incomplete(
         analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
         (code, incompleteness): (CodeQueryDiagnosticCode, Incompleteness),
         message: String,
-        diagnostics: &mut Vec<CodeQueryDiagnostic>,
-    ) {
-        let diagnostic = super::QueryExecutionState::diagnostic(
+    ) -> CodeQueryDiagnostic {
+        super::QueryExecutionState::diagnostic(
             analyzer,
             CodeQueryDiagnostic::new(CodeQueryDiagnostic {
                 incompleteness,
@@ -432,10 +520,7 @@ impl ConfigurationFactsTraversalCache {
                 withheld_rows_path: None,
             }),
             incompleteness.execution_cause(),
-        );
-        if self.reported.insert((file.clone(), code)) {
-            diagnostics.push(diagnostic);
-        }
+        )
     }
 }
 
@@ -479,10 +564,10 @@ fn ingestion_reason_label(reason: &ConfigurationIngestionError) -> String {
 pub(super) fn fact_matches_filter(
     value: &ConfigurationFactValue,
     filter: &ConfigurationFactsFilter,
-) -> bool {
+) -> Result<bool, ()> {
     let fact = value.fact();
     if !filter.formats.is_empty() && !filter.formats.contains(&value.format()) {
-        return false;
+        return Ok(false);
     }
     if !filter.node_kinds.is_empty()
         && !filter
@@ -490,14 +575,14 @@ pub(super) fn fact_matches_filter(
             .iter()
             .any(|kind| kind_matches(fact.kind(), *kind))
     {
-        return false;
+        return Ok(false);
     }
     if !filter.roles.is_empty() {
         let ConfigurationNodeKind::Member { role, .. } = fact.kind() else {
-            return false;
+            return Ok(false);
         };
         if !filter.roles.contains(role) {
-            return false;
+            return Ok(false);
         }
     }
     if !filter.scalar_kinds.is_empty() {
@@ -516,54 +601,16 @@ pub(super) fn fact_matches_filter(
             _ => None,
         };
         if scalar_kind.is_none_or(|scalar_kind| !filter.scalar_kinds.contains(&scalar_kind)) {
-            return false;
+            return Ok(false);
         }
     }
     if !filter.keys.is_empty() {
         let ConfigurationNodeKind::Member { key, .. } = fact.kind() else {
-            return false;
+            return Ok(false);
         };
         if !filter.keys.iter().any(|candidate| candidate == key.text()) {
-            return false;
+            return Ok(false);
         }
-    }
-    let scalar_value = value.scalar_value();
-    if !filter.values.is_empty()
-        && !scalar_value
-            .as_deref()
-            .is_some_and(|actual| filter.values.iter().any(|expected| expected == actual))
-    {
-        return false;
-    }
-    if !filter.values_ignore_case.is_empty()
-        && !scalar_value.as_deref().is_some_and(|actual| {
-            filter
-                .values_ignore_case
-                .iter()
-                .any(|expected| expected.eq_ignore_ascii_case(actual))
-        })
-    {
-        return false;
-    }
-    let numeric_value = scalar_value.as_deref().and_then(parse_configuration_number);
-    if !matches_numeric_bound(
-        numeric_value,
-        filter.value_lt.as_deref(),
-        |actual, bound| actual < bound,
-    ) || !matches_numeric_bound(
-        numeric_value,
-        filter.value_le.as_deref(),
-        |actual, bound| actual <= bound,
-    ) || !matches_numeric_bound(
-        numeric_value,
-        filter.value_gt.as_deref(),
-        |actual, bound| actual > bound,
-    ) || !matches_numeric_bound(
-        numeric_value,
-        filter.value_ge.as_deref(),
-        |actual, bound| actual >= bound,
-    ) {
-        return false;
     }
     if !filter.routes.is_empty()
         && !filter
@@ -571,12 +618,12 @@ pub(super) fn fact_matches_filter(
             .iter()
             .any(|route| route_matches(value, route))
     {
-        return false;
+        return Ok(false);
     }
     if !filter.fact_ordinals.is_empty() {
         let ordinal = u32::try_from(value.index).unwrap_or(u32::MAX);
         if !filter.fact_ordinals.contains(&ordinal) {
-            return false;
+            return Ok(false);
         }
     }
     if !filter.provenances.is_empty() {
@@ -586,26 +633,99 @@ pub(super) fn fact_matches_filter(
             }
         };
         if !filter.provenances.contains(&provenance) {
-            return false;
+            return Ok(false);
         }
     }
     if !filter.completenesses.is_empty() && !filter.completenesses.contains(&value.completeness()) {
-        return false;
+        return Ok(false);
     }
-    matches_xml_relations(value, filter)
-}
-
-fn parse_configuration_number(value: &str) -> Option<f64> {
-    value
-        .parse::<f64>()
-        .ok()
-        .filter(|number| number.is_finite())
+    if !matches_xml_relations(value, filter)? {
+        return Ok(false);
+    }
+    // Decode the value last: an undecodable scalar must not make a query
+    // incomplete when another restriction already excludes its fact.
+    let has_value_filter = !filter.values.is_empty()
+        || !filter.values_ignore_case.is_empty()
+        || filter.value_regex.is_some()
+        || filter.value_lt.is_some()
+        || filter.value_le.is_some()
+        || filter.value_gt.is_some()
+        || filter.value_ge.is_some();
+    let scalar_value = if has_value_filter {
+        match value.scalar_value() {
+            ScalarValue::Decoded(value) => Some(value),
+            ScalarValue::Absent => None,
+            ScalarValue::Undecodable => return Err(()),
+        }
+    } else {
+        None
+    };
+    if !filter.values.is_empty()
+        && !scalar_value
+            .as_deref()
+            .is_some_and(|actual| filter.values.iter().any(|expected| expected == actual))
+    {
+        return Ok(false);
+    }
+    if !filter.values_ignore_case.is_empty()
+        && !scalar_value.as_deref().is_some_and(|actual| {
+            filter
+                .values_ignore_case
+                .iter()
+                .any(|expected| expected.eq_ignore_ascii_case(actual))
+        })
+    {
+        return Ok(false);
+    }
+    if filter.value_regex.as_ref().is_some_and(|regex| {
+        !scalar_value
+            .as_deref()
+            .is_some_and(|actual| regex.0.is_match(actual))
+    }) {
+        return Ok(false);
+    }
+    let has_numeric_bound = filter.value_lt.is_some()
+        || filter.value_le.is_some()
+        || filter.value_gt.is_some()
+        || filter.value_ge.is_some();
+    // The number grammar tells a decimal the comparison cannot represent,
+    // which decides nothing, from a scalar that is not a number, which no
+    // numeric bound matches.
+    let numeric_value = match scalar_value
+        .as_deref()
+        .filter(|_| has_numeric_bound)
+        .map(|text| value.scalar_number(text))
+    {
+        Some(ConfigurationNumberToken::Number(number)) => Some(number),
+        Some(ConfigurationNumberToken::OutOfRange) => return Err(()),
+        Some(ConfigurationNumberToken::NotDecimal) | None => None,
+    };
+    if !matches_numeric_bound(
+        numeric_value.as_ref(),
+        filter.value_lt.as_deref(),
+        std::cmp::Ordering::is_lt,
+    ) || !matches_numeric_bound(
+        numeric_value.as_ref(),
+        filter.value_le.as_deref(),
+        std::cmp::Ordering::is_le,
+    ) || !matches_numeric_bound(
+        numeric_value.as_ref(),
+        filter.value_gt.as_deref(),
+        std::cmp::Ordering::is_gt,
+    ) || !matches_numeric_bound(
+        numeric_value.as_ref(),
+        filter.value_ge.as_deref(),
+        std::cmp::Ordering::is_ge,
+    ) {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn matches_numeric_bound(
-    actual: Option<f64>,
+    actual: Option<&ConfigurationNumber>,
     bound: Option<&str>,
-    predicate: impl FnOnce(f64, f64) -> bool,
+    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
 ) -> bool {
     let Some(bound) = bound else {
         return true;
@@ -613,10 +733,9 @@ fn matches_numeric_bound(
     let Some(actual) = actual else {
         return false;
     };
-    let Some(bound) = parse_configuration_number(bound) else {
-        return false;
-    };
-    predicate(actual, bound)
+    let bound = ConfigurationNumber::parse(bound)
+        .expect("query validation checks numeric bounds with the same grammar");
+    predicate(actual.compare(&bound))
 }
 
 fn kind_matches(kind: &ConfigurationNodeKind, filter: ConfigurationNodeKindFilter) -> bool {
@@ -731,7 +850,7 @@ pub(super) fn execute_configuration_facts_seed(
     let Some(desired_rows) =
         super::seeds::desired_seed_rows(terminal_cap, state, limits, diagnostics)
     else {
-        return super::seeds::empty_truncated_seed_execution();
+        return PlanExecution::truncated(Vec::new());
     };
 
     let files = match configuration_seed_files(state, &seed.filter.formats, &seed.where_globs) {
@@ -761,12 +880,7 @@ pub(super) fn execute_configuration_facts_seed(
                 }),
                 Some(DerivationExecutionCause::Provider),
             ));
-            return PlanExecution {
-                rows: Vec::new(),
-                truncated: true,
-                cancelled: false,
-                pipeline_halted: false,
-            };
+            return PlanExecution::truncated(Vec::new());
         }
     };
     if files.is_empty() && !seed.where_globs.is_empty() {
@@ -788,6 +902,7 @@ pub(super) fn execute_configuration_facts_seed(
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut truncated = false;
     let mut visited_rows = 0;
+    let mut reported = HashSet::default();
     for file in files {
         match super::seeds::scan_seed_file(state, limits, diagnostics) {
             super::seeds::SeedFileScanStatus::Scanned => {}
@@ -795,17 +910,21 @@ pub(super) fn execute_configuration_facts_seed(
                 truncated = true;
                 break;
             }
-            super::seeds::SeedFileScanStatus::Cancelled => return cancelled_plan_execution(),
+            super::seeds::SeedFileScanStatus::Cancelled => {
+                return PlanExecution::cancelled(Vec::new());
+            }
         }
 
-        let Some(snapshot) = state.configuration_cache.document_for(
-            state.analyzer,
-            &file,
-            state.cancellation,
-            diagnostics,
-        ) else {
-            return cancelled_plan_execution();
+        let Some(snapshot) =
+            state
+                .configuration_cache
+                .document_for(state.analyzer, &file, state.cancellation)
+        else {
+            return PlanExecution::cancelled(Vec::new());
         };
+        for diagnostic in snapshot.diagnostics.iter() {
+            push_once(&mut reported, diagnostics, diagnostic.clone());
+        }
         let Some((document, source)) = snapshot.document else {
             continue;
         };
@@ -834,18 +953,20 @@ pub(super) fn execute_configuration_facts_seed(
                 index: 0,
             };
             if let Some(reason) = xml_reference_coverage(&document_value, &seed.filter) {
-                state.configuration_cache.report_file_incomplete(
-                    state.analyzer,
-                    &file,
-                    (
-                        CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                        Incompleteness::Content,
-                    ),
-                    format!(
-                        "XML configuration relation for {} is incomplete: {reason}",
-                        rel_path_string(&file)
-                    ),
+                push_once(
+                    &mut reported,
                     diagnostics,
+                    ConfigurationFactsTraversalCache::file_incomplete(
+                        state.analyzer,
+                        (
+                            CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                            Incompleteness::Content,
+                        ),
+                        format!(
+                            "XML configuration relation for {} is incomplete: {reason}",
+                            rel_path_string(&file)
+                        ),
+                    ),
                 );
             }
         }
@@ -857,8 +978,27 @@ pub(super) fn execute_configuration_facts_seed(
                 source: Arc::clone(&source),
                 index,
             };
-            if !fact_matches_filter(&value, &seed.filter) {
-                continue;
+            match fact_matches_filter(&value, &seed.filter) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(()) => {
+                    push_once(
+                        &mut reported,
+                        diagnostics,
+                        ConfigurationFactsTraversalCache::file_incomplete(
+                            state.analyzer,
+                            (
+                                CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                                Incompleteness::Content,
+                            ),
+                            format!(
+                                "configuration scalar in {} could not be decoded",
+                                rel_path_string(&file)
+                            ),
+                        ),
+                    );
+                    continue;
+                }
             }
             if !super::seeds::record_seed_row(
                 &mut rows,
@@ -891,10 +1031,5 @@ pub(super) fn execute_configuration_facts_seed(
         }
     }
 
-    PlanExecution {
-        rows,
-        truncated,
-        cancelled: false,
-        pipeline_halted: false,
-    }
+    PlanExecution::new(rows, truncated)
 }

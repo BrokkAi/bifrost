@@ -27,6 +27,18 @@
 #   scala-steward-org__scala-steward
 #   tokio-rs__tokio
 #
+# Migration 0292 (#10325) replaced two code_units indexes and added the
+# definition-name-row table and the inventory-unknown index. Captured 2026-11-07
+# for exactly those objects (the four idx_code_units_lang_* full indexes, every
+# workspace_file_definition_name_rows row, and
+# idx_workspace_file_definition_inventory_unknown): the same 14 repositories
+# from the same clone directory, a fresh store each, built by a `bifrost`
+# measure-profile binary from the #10325 branch and left with the statistics the
+# store-build hook writes (`PRAGMA analysis_limit = 1000; ANALYZE`), merged by
+# the same largest-first-count rule. The clones had moved since 2026-09-04, so
+# these counts do not match the code_units table row above exactly. All other
+# rows are unchanged from 2026-09-04.
+#
 # Regenerate with the `dump_pinned_plans_for_store` tool.
 analysis_epochs	analysis_epochs	5 1
 analysis_generation_sequence		1
@@ -45,11 +57,12 @@ code_units	idx_code_units_anchored_normalized_tail	0 0 0 0 0
 code_units	idx_code_units_anchored_package_type	1527 1001 1001 1001 1001 2
 code_units	idx_code_units_anchored_parent_identifier	24057 1001 1001 1001 1001 2
 code_units	idx_code_units_lang_content_qualifier_declarations	106574 1001 1001
-code_units	idx_code_units_lang_exact_fqn_declarations	106574 1001 1001
-code_units	idx_code_units_lang_identifier_lookup	106575 1001 2
+code_units	idx_code_units_lang_exact_fqn	95993 1001 1001 29
+code_units	idx_code_units_lang_identifier	95993 1001 2 2
+code_units	idx_code_units_lang_normalized_fqn	95993 1001 1001 29
 code_units	idx_code_units_lang_normalized_fqn_declarations	106574 1001 1001
 code_units	idx_code_units_lang_package_simple_type_declarations	10080 504 4 1
-code_units	idx_code_units_lang_short_name	106575 1001 2
+code_units	idx_code_units_lang_short_name	95993 1001 2 2
 code_units	idx_code_units_stable_exact_tail	86622 772 2 1 1
 code_units	idx_code_units_stable_normalized_tail	6846 1001 2
 code_units	idx_code_units_stable_package_type	10073 1001 4 1
@@ -90,6 +103,10 @@ unit_supertypes	unit_supertypes	5629 2 1 1
 unit_visibility_containers	unit_visibility_containers	1428 3 1 1
 workspace_file_anchor_rows	idx_workspace_file_anchor_rows_package	1749 1 1 1 1
 workspace_file_anchor_rows	workspace_file_anchor_rows	1749 1 1 1
+workspace_file_definition_name_rows	idx_workspace_file_definition_names_blob	94818 15
+workspace_file_definition_name_rows	idx_workspace_file_definition_names_exact	94818 2 1 1
+workspace_file_definition_name_rows	idx_workspace_file_definition_names_normalized	94818 2 1 1
+workspace_file_definition_name_rows	workspace_file_definition_name_rows	94818 21 21 1
 workspace_file_package_edge_rows	idx_workspace_file_package_edge_rows_child	84542 72 72 1
 workspace_file_package_edge_rows	idx_workspace_file_package_edge_rows_parent	84542 251 134 1
 workspace_file_package_edge_rows	workspace_file_package_edge_rows	84542 8 1 1
@@ -98,6 +115,7 @@ workspace_file_package_rows	workspace_file_package_rows	19343 2 1
 workspace_file_path_symbol_rows	idx_workspace_file_path_symbol_rows_exact	4632 2 1
 workspace_file_path_symbol_rows	idx_workspace_file_path_symbol_rows_normalized	4632 2 1
 workspace_file_path_symbol_rows	workspace_file_path_symbol_rows	4632 1 1 1
+workspace_file_versions	idx_workspace_file_definition_inventory_unknown	5783 1001 1001 1001 1
 workspace_file_versions	idx_workspace_file_versions_open_path	9687 1001 1001 1001 1
 workspace_file_versions	idx_workspace_file_versions_snapshot_blob	9687 1001 1001 1001 1 1 1 1
 workspace_file_versions	idx_workspace_file_versions_snapshot_path	9687 1001 1001 1001 1 1 1 1

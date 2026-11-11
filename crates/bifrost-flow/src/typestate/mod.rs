@@ -5,9 +5,11 @@
 //! the client-side analysis contracts that consume them.
 
 mod binding;
+mod call_map;
 mod client;
 mod finding;
 mod hash;
+pub mod ordered;
 mod planned;
 mod production;
 mod protocol;
@@ -16,16 +18,26 @@ mod summary;
 pub use binding::{
     BINDING_PLAN_SCHEMA_VERSION, BoundTypestateEvent, BoundTypestateInitialSeed,
     BoundTypestateSubject, BoundTypestateSubjectSpec, BoundTypestateTerminal,
-    MAX_TYPESTATE_CALL_NONINTERFERENCE_BINDINGS, MAX_TYPESTATE_CONTEXT_DEPTH,
-    MAX_TYPESTATE_EVENT_BINDINGS, MAX_TYPESTATE_INITIAL_SEEDS, MAX_TYPESTATE_SUBJECT_CLASS_BYTES,
-    MAX_TYPESTATE_SUBJECTS, MAX_TYPESTATE_TERMINAL_BINDINGS, TypestateBindingContext,
-    TypestateBindingMultiplicity, TypestateBindingPlan, TypestateBindingPlanError,
-    TypestateBindingQuality, TypestateCallNonInterferenceSpec, TypestateContextKey,
-    TypestateEventBindingId, TypestateEventBindingSpec, TypestateEventCondition,
+    CoverageCandidateGroup, CoverageCandidateGroupSpec, CoverageCandidatePhase,
+    CoverageCandidateSpec, CoverageDecision, CoverageDecisionKind, CoverageDecisionSpec,
+    CoverageRecordKey, CoverageRefusalReason, MAX_TYPESTATE_CALL_NONINTERFERENCE_BINDINGS,
+    MAX_TYPESTATE_CONTEXT_DEPTH, MAX_TYPESTATE_EVENT_BINDINGS, MAX_TYPESTATE_INITIAL_SEEDS,
+    MAX_TYPESTATE_SUBJECT_CLASS_BYTES, MAX_TYPESTATE_SUBJECTS, MAX_TYPESTATE_TERMINAL_BINDINGS,
+    TypestateBindingContext, TypestateBindingMultiplicity, TypestateBindingPlan,
+    TypestateBindingPlanError, TypestateBindingQuality, TypestateCallNonInterferenceSpec,
+    TypestateContextKey, TypestateCoverageEventSet, TypestateCoverageSpec, TypestateEventBindingId,
+    TypestateEventBindingSpec, TypestateEventBindings, TypestateEventCondition, TypestateEventPort,
     TypestateInitialSeedSpec, TypestateObjectKey, TypestateObjectRole, TypestateObservationSite,
-    TypestateProcedurePortKey, TypestateSubjectClassError, TypestateSubjectClassKey,
-    TypestateSubjectId, TypestateSubjectKey, TypestateTerminalBindingId,
-    TypestateTerminalBindingSpec,
+    TypestateProcedurePortKey, TypestateSelectedOperand, TypestateSubjectClassError,
+    TypestateSubjectClassKey, TypestateSubjectId, TypestateSubjectKey, TypestateTerminalBindingId,
+    TypestateTerminalBindingSpec, UnprovenEventRelation,
+};
+pub use call_map::{CallSubjectMapSelection, CallSubjectMapping, call_subject_map};
+pub use client::compose_labels::{
+    FirstUnprovenEvent, FirstUnprovenRelation, FirstUnprovenRelationKind, TypestateAliasGuard,
+    TypestateComposeFact, TypestateComposeFunction, TypestateComposeLabels, TypestateComposeStep,
+    TypestateEventObservation, TypestateGuardResolution, TypestateHopObservation,
+    TypestateObjectJudgment, fold_object_reach, judge_object_roots,
 };
 pub use client::{
     TypestateBackwardDemand, TypestateBackwardResult, TypestateBackwardSolveError, TypestateFact,
@@ -35,26 +47,30 @@ pub use client::{
     solve_typestate_with_summaries,
 };
 pub use finding::{
-    MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS,
+    ComposedTerminalPath, MAX_TYPESTATE_FINDING_CANDIDATES, MAX_TYPESTATE_FINDING_REACHED_ROWS,
     MAX_TYPESTATE_FINDING_WITNESS_BYTES, MAX_TYPESTATE_FINDING_WITNESS_EXPANSIONS,
     MAX_TYPESTATE_FINDINGS, MAX_TYPESTATE_WITNESS_EXPANSIONS, MAX_TYPESTATE_WITNESS_STEPS,
-    TypestateFinding, TypestateFindingCertainty, TypestateFindingEvidence, TypestateFindingKind,
-    TypestateFindingLimits, TypestateFindingReport, TypestateFindingWitness, TypestateFindingWork,
-    TypestateWitness, TypestateWitnessStep, collect_summary_findings,
-    collect_summary_findings_with_limits,
+    MAX_TYPESTATE_WITNESSES_PER_FINDING, TypestateFinding, TypestateFindingCertainty,
+    TypestateFindingEvidence, TypestateFindingKind, TypestateFindingLimits, TypestateFindingReport,
+    TypestateFindingWitness, TypestateFindingWork, TypestateWitness, TypestateWitnessStep,
+    collect_summary_findings, collect_summary_findings_with_limits, composed_error_finding,
+    composed_terminal_finding,
 };
 pub use hash::{TypestateBindingPlanHash, TypestateBindingSummaryHash, TypestateProtocolHash};
 pub use planned::{
     TypestateCanonicalObservation, TypestatePlannedEvidence, TypestatePlannedResult,
     TypestatePlannedSolveError, solve_typestate_planned,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use production::with_typestate_protocol_serving_for_test;
 pub use production::{DirectScalarSource, direct_scalar_source};
 pub use production::{
     ProductionSemanticSummarySet, ProductionSummaryLifecycleCounters,
     ProductionSummaryProjectionError, ProductionTypestateExecutionContext,
     ProductionTypestateSolveError, ProductionTypestateSolveResult,
-    ProductionTypestateSummaryRepository, TypestateProductionCacheStatus,
-    TypestateSummaryRepositoryLimits, project_production_semantic_summaries,
+    ProductionTypestateSummaryRepository, RootCallClosure, RootCallClosureIncompleteReason,
+    TypestateProductionCacheStatus, TypestateSummaryRepositoryLimits,
+    project_production_semantic_summaries, project_workspace_root_call_closure,
     solve_typestate_with_production_summaries,
 };
 pub use protocol::{
@@ -75,7 +91,8 @@ pub use summary::{
     CompleteProtocolSummaryRepository, DEFAULT_PROTOCOL_SUMMARY_REPOSITORY_BYTES,
     DEFAULT_PROTOCOL_SUMMARY_REPOSITORY_ENTRIES, MAX_PROTOCOL_SUMMARY_EFFECTS,
     MAX_PROTOCOL_SUMMARY_ROWS, PROTOCOL_SUMMARY_SCHEMA_VERSION, ProtocolAppliedEffect,
-    ProtocolEventBindingKey, ProtocolFactKey, ProtocolObservedEffect, ProtocolPathEvidence,
+    ProtocolEventBindingKey, ProtocolFactKey, ProtocolMemberReceipt, ProtocolObservedEffect,
+    ProtocolPathEvidence, ProtocolReceiptVerdict, ProtocolReceiptVerifier,
     ProtocolSemanticSummarySet, ProtocolSummary, ProtocolSummaryApplication,
     ProtocolSummaryCacheStatus, ProtocolSummaryError, ProtocolSummaryKey, ProtocolSummaryOutcome,
     ProtocolSummaryPublicationError, ProtocolSummaryPublicationOutcome,

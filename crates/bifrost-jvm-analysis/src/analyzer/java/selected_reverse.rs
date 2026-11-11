@@ -34,9 +34,10 @@ use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionCompletion;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseCandidateOutcome;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::nominal_reverse::NominalReverseCandidateOutcome;
 
-use brokk_bifrost_analysis::analyzer::store::resolution_operation::jvm_reverse_rows::JvmReverseConfirmed;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::nominal_reverse::NominalReverseConfirmed;
+use brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::ReverseReferenceExecutionContext;
 
 use brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionContextMetrics;
 
@@ -67,8 +68,6 @@ use brokk_bifrost_analysis::analyzer::structural::reference_edges::ReferenceEdge
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::SelectedReferenceFileProjection;
 
 use brokk_bifrost_core::analyzer::usages::model::UsageHitKind;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageProof;
 
 use brokk_bifrost_core::analyzer::model::CodeUnit;
 
@@ -104,6 +103,7 @@ pub(crate) struct JavaSelectedInverseResolution {
     // binding arm count separately so call projection can distinguish a
     // singleton provisional target from a genuinely ambiguous overload.
     binding_target_counts: HashMap<(ProjectFile, usize, usize), Option<usize>>,
+    execution_contexts: HashMap<(ProjectFile, usize, usize), ReverseReferenceExecutionContext>,
 }
 
 impl JavaSelectedInverseResolution {
@@ -116,6 +116,17 @@ impl JavaSelectedInverseResolution {
             ))
             .copied()
             .flatten()
+    }
+
+    pub(crate) fn execution_context(
+        &self,
+        file: &ProjectFile,
+        start: usize,
+        end: usize,
+    ) -> Option<ReverseReferenceExecutionContext> {
+        self.execution_contexts
+            .get(&(file.clone(), start, end))
+            .copied()
     }
 }
 
@@ -228,22 +239,25 @@ fn java_selected_inverse_for_inner<A: LanguageAdapter>(
                 analyzer,
                 handle: Some(operation.root_presence_read_handle()),
             };
-        match operation.jvm_reverse_candidate_sites(target, cancellation)? {
-            JvmReverseCandidateOutcome::Ready(candidates) => candidates,
-            JvmReverseCandidateOutcome::TargetUncovered(reason) => {
+        match operation.nominal_reverse_candidate_sites(target, cancellation)? {
+            NominalReverseCandidateOutcome::Ready(candidates) => candidates,
+            NominalReverseCandidateOutcome::TargetUncovered(reason) => {
                 return Ok(JavaSelectedReverseOutcome::TargetUncovered(reason));
             }
-            JvmReverseCandidateOutcome::Unavailable(reason) => {
+            NominalReverseCandidateOutcome::Unavailable(reason) => {
                 return Ok(JavaSelectedReverseOutcome::Unavailable(reason));
             }
-            JvmReverseCandidateOutcome::Cancelled => {
+            NominalReverseCandidateOutcome::Cancelled => {
                 return Ok(JavaSelectedReverseOutcome::Cancelled);
             }
         }
     };
     let mut context_metrics = SelectedResolutionContextMetrics;
-    let (confirmed, root_reads) =
-        operation.confirm_jvm_reverse_candidates(candidates, cancellation, &mut context_metrics)?;
+    let (confirmed, root_reads) = operation.confirm_nominal_reverse_candidates(
+        candidates,
+        cancellation,
+        &mut context_metrics,
+    )?;
     brokk_bifrost_analysis::analyzer::root_presence::record_root_presence_entries(
         analyzer,
         &root_reads,
@@ -282,7 +296,7 @@ fn project_confirmed_references(
     java: &dyn IAnalyzer,
     target: &CodeUnit,
     generation: u64,
-    confirmed: JvmReverseConfirmed,
+    confirmed: NominalReverseConfirmed,
     cancellation: &CancellationToken,
 ) -> Result<JavaSelectedInverseResolution> {
     let peer_language_inventory_open = confirmed.peer_language_inventory_open;
@@ -303,9 +317,31 @@ fn project_confirmed_references(
     let mut files = HashMap::<ProjectFile, SelectedReferenceFileProjection<'_>>::default();
     let mut edges = Vec::new();
     let mut binding_target_counts = HashMap::default();
+    let mut execution_contexts = HashMap::default();
     for reference in confirmed.references {
         if cancellation.is_cancelled() {
             return Err(StoreError::new("Java selected reverse query was cancelled"));
+        }
+        if matches!(
+            reference.execution_context,
+            ReverseReferenceExecutionContext::RowAbsent
+        ) && reference.locator.storage_language == "java"
+        {
+            return Err(StoreError::corrupt(format!(
+                "selected Java reference has no execution context row: {:?}",
+                reference.locator
+            )));
+        }
+        if matches!(reference.execution_context, ReverseReferenceExecutionContext::Present {
+            disposition: brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionDisposition::NonExecutable,
+            ..
+        }) && reference.answer.site_metadata().is_some_and(|metadata| matches!(
+            metadata.site_kind(), ResolutionSiteKind::Call | ResolutionSiteKind::ConstructorReference
+        )) {
+            return Err(StoreError::corrupt(format!(
+                "selected Java invocation has non-executable context: {:?}",
+                reference.locator
+            )));
         }
         let answer = reference.answer;
         if !answer.binding().targets().iter().any(|semantic| {
@@ -331,10 +367,10 @@ fn project_confirmed_references(
         let projected_file = files
             .get(&file)
             .expect("selected caller source was projected");
-        let owner = selected_reverse_reference_owner(projected_file, reference.owner)?;
+        let owner = selected_reverse_reference_owner(&file, reference.owner)?;
         let projected_file = &projected_file.state;
-        let reference_kind = projected_file.classifier.as_ref().and_then(|classifier| {
-            classifier.classify_reference_kind(metadata.start_byte(), metadata.end_byte(), target)
+        let reference_kind = projected_file.classifier.as_ref().map(|classifier| {
+            classifier.classify_reference_facets(metadata.start_byte(), metadata.end_byte(), target)
         });
         let ast_id = projected_file
             .classifier
@@ -348,6 +384,21 @@ fn project_confirmed_references(
         }
         let range = projected_file.range(metadata.start_byte(), metadata.end_byte());
         let site_key = (file.clone(), range.start_byte, range.end_byte);
+        match execution_contexts.entry(site_key.clone()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(reference.execution_context);
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if *slot.get() != reference.execution_context {
+                    slot.insert(ReverseReferenceExecutionContext::Present {
+                        disposition: brokk_bifrost_core::analyzer::resolution_facts::ResolutionReferenceExecutionDisposition::Unknown,
+                        procedure_kind: None,
+                        initializer_is_static: None,
+                        callable_site: None,
+                    });
+                }
+            }
+        }
         if let Some(existing) = binding_target_counts.get_mut(&site_key) {
             if *existing != Some(binding_target_count) {
                 *existing = None;
@@ -355,7 +406,19 @@ fn project_confirmed_references(
         } else {
             binding_target_counts.insert(site_key, Some(binding_target_count));
         }
+        let (proof, obligations_block_proof) = brokk_bifrost_analysis::analyzer::store::resolution_operation::reverse::selected_reverse_proof(
+            binding_target_count == 1
+                && answer.binding().completion() == &ResolutionCompletion::Complete,
+            !answer.query_obligations.is_empty(),
+        );
+        if obligations_block_proof {
+            push_reason(
+                &mut reasons,
+                EdgeIncompleteReason::InverseIndexQueryObligationsOutstanding,
+            );
+        }
         edges.push(ReferenceEdgeRow {
+            dispatch_extensibility: None,
             site: EdgeSite {
                 file,
                 range,
@@ -363,14 +426,10 @@ fn project_confirmed_references(
                 enclosing: owner,
             },
             target: target.clone(),
-            reference_kind,
-            proof: if answer.binding().targets().len() == 1
-                && answer.binding().completion() == &ResolutionCompletion::Complete
-            {
-                UsageProof::Proven
-            } else {
-                UsageProof::Unproven
-            },
+            reference_kind: reference_kind.unwrap_or_else(|| {
+                brokk_bifrost_core::analyzer::usages::model::facets_from_classified(None)
+            }),
+            proof,
             ambiguous_candidate: false,
             usage_kind: selected_usage_kind(metadata),
             site_class: SiteClass::UseSite,
@@ -391,6 +450,7 @@ fn project_confirmed_references(
             generation,
         },
         binding_target_counts,
+        execution_contexts,
         peer_language_inventory_open,
     })
 }

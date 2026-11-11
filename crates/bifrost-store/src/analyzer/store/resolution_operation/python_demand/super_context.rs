@@ -37,14 +37,13 @@ impl SuperContext {
         let context = if let Some(context) = cached {
             context
         } else {
-            let context: Option<SuperContextRow> = conn.query_row(
-            "SELECT context.call,context.callee,context.callable,context.class_cell,
+            let context: Option<SuperContextRow> = conn.prepare_cached("SELECT context.call,context.callee,context.callable,context.class_cell,
                 context.first_parameter IS NOT NULL,
                 EXISTS(SELECT 1 FROM python_member_member_roles role WHERE role.blob_id=context.blob_id AND role.member=context.callable AND role.receiver_parameter=context.first_parameter)
              FROM resolution_semantic_sites semantic
              JOIN python_member_super_members member ON member.blob_id=semantic.blob_id AND member.member=semantic.source_site
              JOIN python_member_super_contexts context ON context.blob_id=member.blob_id AND context.call=member.call
-             WHERE semantic.blob_id=?1 AND semantic.semantic_key=?2 AND semantic.semantic_role='reference'",
+             WHERE semantic.blob_id=?1 AND semantic.semantic_key=?2 AND semantic.semantic_role='reference'")?.query_row(
             rusqlite::params![mount.blob_id(),reference.local_key()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
             assert!(
                 rules

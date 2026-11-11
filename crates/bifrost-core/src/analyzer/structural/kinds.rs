@@ -305,7 +305,7 @@ impl fmt::Display for NormalizedKind {
 macro_rules! roles {
     ($($variant:ident => $label:literal: $shape:ident, $description:literal,)+) => {
         #[repr(u8)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
         pub enum Role {
             $($variant,)+
         }
@@ -377,6 +377,78 @@ pub enum RoleValueShape {
     PatternMap,
 }
 
+/// Why a certified list cannot prove absence of another member.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RoleCoverageGap {
+    UnrepresentedChild = 0,
+    Recovery = 1,
+    ConditionalRegion = 2,
+    PartialDeclaration = 3,
+    NoWrittenList = 4,
+    UnsupportedOrigin = 5,
+    MissingTarget = 6,
+}
+
+impl RoleCoverageGap {
+    pub fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::UnrepresentedChild,
+            1 => Self::Recovery,
+            2 => Self::ConditionalRegion,
+            3 => Self::PartialDeclaration,
+            4 => Self::NoWrittenList,
+            5 => Self::UnsupportedOrigin,
+            6 => Self::MissingTarget,
+            _ => return None,
+        })
+    }
+
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A non-empty canonical set of coverage gaps, represented by stable bit positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleCoverageGaps(u8);
+
+impl RoleCoverageGaps {
+    pub fn new(gap: RoleCoverageGap) -> Self {
+        Self(1 << gap.code())
+    }
+
+    pub fn insert(&mut self, gap: RoleCoverageGap) {
+        self.0 |= 1 << gap.code();
+    }
+
+    pub fn contains(self, gap: RoleCoverageGap) -> bool {
+        self.0 & (1 << gap.code()) != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = RoleCoverageGap> {
+        (0..7).filter_map(move |code| {
+            let gap = RoleCoverageGap::from_code(code)?;
+            self.contains(gap).then_some(gap)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleCoverage {
+    Complete,
+    Incomplete(RoleCoverageGaps),
+}
+
+impl RoleCoverage {
+    pub fn add_gap(&mut self, gap: RoleCoverageGap) {
+        match self {
+            Self::Complete => *self = Self::Incomplete(RoleCoverageGaps::new(gap)),
+            Self::Incomplete(gaps) => gaps.insert(gap),
+        }
+    }
+}
+
 roles! {
     Callee => "callee": Pattern, "Constrain the call target name or expression.",
     Receiver => "receiver": Pattern, "Constrain the receiver of a method call.",
@@ -409,6 +481,10 @@ roles! {
     Binding => "binding": Pattern, "Constrain the binding of a construct.",
     Indices => "indices": PatternList, "Constrain the indices in source order.",
     Dimensions => "dimensions": PatternList, "Constrain the dimensions in source order.",
+    Parameters => "parameters": PatternList, "Constrain written formal parameters in source order.",
+    Members => "members": PatternList, "Constrain direct members in source order.",
+    // Appended to preserve persisted role codes.
+    InitializerOf => "initializer_of": Pattern, "Constrain the object creation whose initializer owns this assignment.",
 }
 
 pub const SINGLE_TARGET_ROLES: &[Role] = &[
@@ -432,6 +508,7 @@ pub const SINGLE_TARGET_ROLES: &[Role] = &[
     Role::Body,
     Role::Label,
     Role::Binding,
+    Role::InitializerOf,
 ];
 
 pub const LIST_TARGET_ROLES: &[Role] = &[
@@ -444,7 +521,14 @@ pub const LIST_TARGET_ROLES: &[Role] = &[
     Role::Part,
     Role::Indices,
     Role::Dimensions,
+    Role::Parameters,
+    Role::Members,
 ];
+
+/// List roles whose owners carry persisted coverage: a certified owner states
+/// whether its list was enumerated completely (#9613). No other role has a
+/// coverage producer, so a coverage row for one is corrupt.
+pub const COVERAGE_ROLES: &[Role] = &[Role::Parameters, Role::Members];
 
 pub const MAP_TARGET_ROLES: &[Role] = &[Role::Kwarg];
 
@@ -455,6 +539,20 @@ impl Role {
 
     pub fn list_target_roles() -> &'static [Role] {
         LIST_TARGET_ROLES
+    }
+
+    pub fn has_coverage(self) -> bool {
+        COVERAGE_ROLES.contains(&self)
+    }
+
+    /// Whether a fact without an edge for this role proves nothing about the
+    /// role until the adapter certifies it (`StructuralSpec::certified_roles`).
+    /// A negation such as `:not (assignment :initializer_of (call))` reads
+    /// the absence as proof, so it is sound only where the adapter emits the
+    /// role for every construct that has it. Every other role keeps its
+    /// current semantics: an absent edge is a plain non-match.
+    pub fn absence_needs_certification(self) -> bool {
+        matches!(self, Role::InitializerOf)
     }
 
     pub fn map_target_roles() -> &'static [Role] {
@@ -468,9 +566,10 @@ impl Role {
     pub fn valid_for(self, kind: NormalizedKind) -> bool {
         use NormalizedKind::*;
         match self {
-            Role::Callee | Role::Receiver | Role::Arg | Role::Kwarg => {
+            Role::Callee | Role::Receiver => {
                 matches!(kind, Call | ConcurrentSpawn)
             }
+            Role::Arg | Role::Kwarg => matches!(kind, Call | ConcurrentSpawn | Decorator),
             Role::Left | Role::Right | Role::Operator => matches!(
                 kind,
                 Assignment | BinaryExpression | Comparison | ComparisonChain | UnaryExpression
@@ -521,8 +620,14 @@ impl Role {
             Role::Body => matches!(kind, Lock | Switch | Case | Label),
             Role::Label => matches!(kind, Label | Break | Continue),
             Role::Binding => kind == InstanceOf,
+            Role::InitializerOf => kind == Assignment,
             Role::Indices => kind == Subscript,
             Role::Dimensions => kind == ArrayCreation,
+            Role::Parameters => matches!(
+                kind,
+                Function | Method | Constructor | Lambda | Callable | Declaration
+            ),
+            Role::Members => matches!(kind, Class | Declaration),
         }
     }
 }

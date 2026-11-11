@@ -1,10 +1,13 @@
 mod rows;
+use brokk_bifrost_semantic::analyzer::semantic_model::catalog::CatalogError;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::rows::SemanticPayloadFamily;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements;
+#[doc(hidden)]
+pub use rows::shard_record_order_key;
 use rusqlite::named_params;
 
 use crate::CancellationToken;
-use crate::analyzer::canonical_hash::parse_lower_sha256;
+use crate::analyzer::canonical_hash::{CanonicalHasher, parse_lower_sha256};
 
 use crate::analyzer::CallableArity;
 use crate::analyzer::semantic::SemanticLocator;
@@ -34,8 +37,11 @@ use crate::analyzer::semantic_model::RuleTrigger;
 use crate::analyzer::semantic_model::RuntimeValuesPayload;
 use crate::analyzer::semantic_model::TypeFact;
 use crate::analyzer::store::model_catalog::CatalogPackSourceKind;
-use crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader;
+use crate::analyzer::store::model_catalog::{
+    CatalogRowReader, CatalogRuntimeSourceReader, RequestRowReaderSource,
+};
 
+use crate::analyzer::JVM_SEMANTIC_PACK_LANGUAGES;
 use crate::analyzer::Language;
 use crate::analyzer::LanguageDialect;
 use crate::analyzer::semantic_pack_realm;
@@ -329,7 +335,8 @@ impl ActivatedProcedureSummary {
             &self.record.id,
         );
         provenance.completeness = match self.record.completeness {
-            crate::analyzer::semantic_model::Completeness::Partial => {
+            crate::analyzer::semantic_model::Completeness::Partial
+            | crate::analyzer::semantic_model::Completeness::Fenced => {
                 crate::analyzer::semantic_model::SemanticModelCompleteness::Partial
             }
             crate::analyzer::semantic_model::Completeness::Complete => {
@@ -419,7 +426,7 @@ pub struct CatalogShardRowIdentity {
     pub database: CatalogShardDatabase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CatalogShardDatabase {
     Durable,
     Session,
@@ -427,8 +434,12 @@ pub enum CatalogShardDatabase {
 
 #[derive(Debug, Clone)]
 pub struct ActiveSemanticModelShardMetadata {
-    /// The pack was selected without exact toolchain evidence.
+    /// One or more activation inputs are approximate.
     pub approximate: bool,
+    /// This activation used the stdlib's assumed Rust version. The version is
+    /// in matched_evidence.toolchain; an observed pin leaves this false even
+    /// when dependency-artifact provenance is independently approximate.
+    pub assumed_rust_toolchain: bool,
     /// Shared with the catalog's decoded-manifest memo and with every other
     /// shard of the same pack (#3101).
     pub manifest: Arc<CompiledPackManifest>,
@@ -482,6 +493,24 @@ impl std::ops::Deref for ActiveSemanticModelShard {
 }
 
 impl ActiveSemanticModelShard {
+    /// The request owner supplies JVM-family shard rows: a JVM-realm shard
+    /// whose source kind the request's external selection admits. Generator
+    /// rules are a build-time-only payload: overlay construction generates
+    /// their facts at activation, outside any request, so they stay with the
+    /// activation owner whatever their source kind (#9559).
+    pub fn request_owned(&self) -> bool {
+        semantic_pack_realm(&self.manifest.language) == "jvm"
+            && self.descriptor.payload_kind
+                != crate::analyzer::semantic_model::PayloadKind::GeneratorRules
+            && matches!(
+                self.source_kind,
+                CatalogPackSourceKind::Generated
+                    | CatalogPackSourceKind::Installed
+                    | CatalogPackSourceKind::PreShipped
+                    | CatalogPackSourceKind::Embedded
+            )
+    }
+
     /// Payload readers must make their dependency on decoded data explicit.
     pub fn decoded(&self) -> &CompiledShard {
         self.decoded
@@ -532,19 +561,196 @@ impl ActiveSemanticModelShard {
     }
 }
 
-#[derive(Debug)]
+/// The shards an activation evaluated and deliberately left out: an
+/// incompatible selector, a disabled control, review not granted (including
+/// the silent skip of a language-wide pack), or a shadowed duplicate. It is
+/// complete, unlike the report, whose explanations are capped. Failures (an
+/// unavailable load, a conflicting control) are not exclusions: they leave the
+/// activation incomplete, so a pinned shard they cover answers Open.
+#[derive(Debug, Clone)]
+pub struct ActivationExclusions {
+    shards: std::collections::BTreeSet<(String, String)>,
+    digest: [u8; 32],
+}
+
+impl ActivationExclusions {
+    /// Keys are (manifest digest, shard id). The digest is computed once here,
+    /// because the JVM request reader keys its membership check by it.
+    pub fn new(shards: std::collections::BTreeSet<(String, String)>) -> Self {
+        let mut hash = CanonicalHasher::new(b"activation-exclusions-v1");
+        for (manifest, shard) in &shards {
+            hash.field("manifest", manifest.as_bytes());
+            hash.field("shard", shard.as_bytes());
+        }
+        Self {
+            digest: hash.finish(),
+            shards,
+        }
+    }
+
+    /// The key of one excluded shard; `contains` checks the same pair, read
+    /// from the catalog's membership rows.
+    pub fn key(
+        manifest: &CompiledPackManifest,
+        descriptor: &crate::analyzer::semantic_model::CompiledShardDescriptor,
+    ) -> (String, String) {
+        (
+            manifest.content_sha256.clone(),
+            descriptor.shard_id.as_str().to_owned(),
+        )
+    }
+
+    pub fn contains(&self, manifest_digest: &str, shard_id: &str) -> bool {
+        self.shards
+            .contains(&(manifest_digest.to_owned(), shard_id.to_owned()))
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shards.is_empty()
+    }
+
+    pub fn retained_bytes(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|(manifest, shard)| {
+                (std::mem::size_of::<(String, String)>()
+                    + 64
+                    + manifest.capacity()
+                    + shard.capacity()) as u64
+            })
+            .sum()
+    }
+}
+
+impl Default for ActivationExclusions {
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct ResolvedActiveSemanticModels {
+    #[doc(hidden)]
+    pub charge: brokk_bifrost_core::retention_budget::AllocationCharge,
     pub active_model_set_hash: String,
     #[doc(hidden)]
-    pub source_reader: Option<CatalogRuntimeSourceReader>,
+    pub source_reader: Option<Arc<CatalogRuntimeSourceReader>>,
+    #[doc(hidden)]
+    request_source: Option<Arc<dyn RequestRowReaderSource>>,
     pub shards: Vec<Arc<ActiveSemanticModelShard>>,
     pub indexes: MatcherIndexes,
     pub extraction_gaps: Vec<Arc<ActivePackExtractionGap>>,
     pub extraction_gaps_by_declaration: HashMap<String, Vec<usize>>,
+    pub excluded_shards: ActivationExclusions,
     pub report: SemanticModelActivationReport,
 }
 
+pub struct RowOwners {
+    pub readers: Vec<Arc<dyn CatalogRowReader + Send + Sync>>,
+    pub jvm_open: Option<FamilyOpen>,
+    pub jvm_binding: Option<crate::analyzer::store::model_catalog::ReaderBinding>,
+    /// Positions in `readers`; one reader may own both parts.
+    activation_index: Option<usize>,
+    request_index: Option<usize>,
+}
+
+/// [`ResolvedActiveSemanticModels::activation_owned`]: the build-time questions,
+/// answered by [`ResolvedActiveSemanticModels::activation_row_owners`].
+pub struct ActivationOwned<'a>(&'a ResolvedActiveSemanticModels);
+
+impl<'a> ActivationOwned<'a> {
+    pub fn types_with_id(&self, id: &str) -> SemanticModelMatch<TypeFact> {
+        self.0
+            .types_with_id_owned(id, || self.0.activation_row_owners())
+    }
+
+    pub fn members_with_id(&self, id: &str) -> SemanticModelMatch<MemberFact> {
+        self.0
+            .members_with_id_owned(id, || self.0.activation_row_owners())
+    }
+
+    pub fn relations_with_id(&self, id: &str) -> SemanticModelMatch<RelationFact> {
+        self.0
+            .relations_with_id_owned(id, || self.0.activation_row_owners())
+    }
+
+    pub fn all_type_records_with_id(
+        &self,
+        id: &str,
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a> {
+        let active = self.0;
+        active.all_type_records_with_id_owned(id, || active.activation_row_owners())
+    }
+
+    pub fn all_member_records_with_id(
+        &self,
+        id: &str,
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<MemberFact>> + 'a> {
+        let active = self.0;
+        active.all_member_records_with_id_owned(id, || active.activation_row_owners())
+    }
+}
+
+/// Select the owner of a shard independently of reader availability. An open
+/// request part therefore never transfers its shards to the activation.
+pub fn shard_owner_index(
+    shard: &ActiveSemanticModelShard,
+    activation_index: Option<usize>,
+    request_index: Option<usize>,
+) -> Option<usize> {
+    if shard.request_owned() {
+        request_index
+    } else {
+        activation_index
+    }
+}
+
+impl RowOwners {
+    /// Whether the reader at `index` answers for `shard`. Every shard has one
+    /// owner, so a row read through any other reader is dropped. With the JVM
+    /// part open no reader answers for request-owned shards.
+    pub fn owns(&self, index: usize, shard: &ActiveSemanticModelShard) -> bool {
+        shard_owner_index(shard, self.activation_index, self.request_index) == Some(index)
+    }
+}
+
+impl brokk_bifrost_core::retention_budget::SelfCharged for ResolvedActiveSemanticModels {
+    fn allocation_charge(&self) -> &brokk_bifrost_core::retention_budget::AllocationCharge {
+        &self.charge
+    }
+}
+
 impl ResolvedActiveSemanticModels {
+    /// Construct an activation before installing its optional request owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        active_model_set_hash: String,
+        source_reader: Option<Arc<CatalogRuntimeSourceReader>>,
+        shards: Vec<Arc<ActiveSemanticModelShard>>,
+        indexes: MatcherIndexes,
+        extraction_gaps: Vec<Arc<ActivePackExtractionGap>>,
+        extraction_gaps_by_declaration: HashMap<String, Vec<usize>>,
+        excluded_shards: ActivationExclusions,
+        report: SemanticModelActivationReport,
+    ) -> Self {
+        Self {
+            active_model_set_hash,
+            source_reader,
+            shards,
+            indexes,
+            extraction_gaps,
+            extraction_gaps_by_declaration,
+            excluded_shards,
+            report,
+            charge: Default::default(),
+            request_source: None,
+        }
+    }
+
     /// Every defining provider in this activation, including metadata-only shards.
     pub fn model_provider_selection(
         &self,
@@ -557,11 +763,168 @@ impl ResolvedActiveSemanticModels {
         }))
     }
 
-    /// Fixed SQL handles belonging to this activation publication. Source rows
-    /// are read on demand and remain owned by one query.
+    /// Whether the activation owner answers for `shard`: always for an
+    /// activation-owned shard, and for a request-owned one only while the
+    /// request source reads through the activation reader (or there is none).
+    pub fn activation_owns(&self, shard: &ActiveSemanticModelShard) -> bool {
+        let request_index = self
+            .request_source()
+            .is_none_or(|source| source.reads_through_activation())
+            .then_some(0);
+        shard_owner_index(shard, Some(0), request_index) == Some(0)
+    }
+
+    pub fn shard_row_reader(
+        &self,
+        shard: &ActiveSemanticModelShard,
+    ) -> Result<Arc<dyn CatalogRowReader + Send + Sync>, FamilyOpen> {
+        if shard.request_owned()
+            && let Some(source) = self.request_source()
+        {
+            return source.jvm_reader(self).map(|owner| owner.reader);
+        }
+        Ok(self
+            .source_reader
+            .as_ref()
+            .expect("row-backed set has activation reader")
+            .clone())
+    }
+
+    pub fn question_row_owners(&self, realm: Option<&str>) -> RowOwners {
+        let activation_owns_realm = realm != Some("jvm")
+            || self.shards.iter().any(|shard| {
+                semantic_pack_realm(&shard.manifest.language) == "jvm" && !shard.request_owned()
+            });
+        let mut readers: Vec<Arc<dyn CatalogRowReader + Send + Sync>> = Vec::new();
+        let mut activation_index = None;
+        if activation_owns_realm
+            && self.shards.iter().any(|shard| self.activation_owns(shard))
+            && let Some(reader) = &self.source_reader
+        {
+            activation_index = Some(readers.len());
+            readers.push(reader.clone());
+        }
+        let mut jvm_open = None;
+        let mut jvm_binding = None;
+        let mut request_index = None;
+        // The request owner is consulted even when the activation holds no
+        // request-owned shard: its bind is also the check that the request's
+        // JVM selection matches the activation, so a selection the activation
+        // lacks answers Open instead of a complete empty answer.
+        if realm.is_none() || realm == Some("jvm") {
+            let jvm = self
+                .request_source()
+                .map(|source| {
+                    source.jvm_reader(self).map(|owner| {
+                        jvm_binding = Some(owner.binding);
+                        owner.reader
+                    })
+                })
+                .unwrap_or_else(|| {
+                    Ok(self
+                        .source_reader
+                        .as_ref()
+                        .expect("row-backed set has activation reader")
+                        .clone())
+                });
+            match jvm {
+                Ok(reader) => {
+                    request_index = Some(
+                        readers
+                            .iter()
+                            .position(|existing| {
+                                Arc::as_ptr(existing) as *const ()
+                                    == Arc::as_ptr(&reader) as *const ()
+                            })
+                            .unwrap_or_else(|| {
+                                readers.push(reader);
+                                readers.len() - 1
+                            }),
+                    );
+                }
+                Err(open) => jvm_open = Some(open),
+            }
+        }
+        RowOwners {
+            readers,
+            jvm_open,
+            jvm_binding,
+            activation_index,
+            request_index,
+        }
+    }
+
+    /// The owners of a read made outside any request, at activation or overlay
+    /// build: the activation reader alone. It answers for the shards the
+    /// activation owns, which is every shard while the request source reads
+    /// through the activation. With a real request owner the request-owned
+    /// shards are not part of such a read at all, so they are excluded rather
+    /// than Open, and the request owner is never consulted (#9559).
+    pub fn activation_row_owners(&self) -> RowOwners {
+        let reader = self
+            .source_reader
+            .as_ref()
+            .expect("row-backed set has activation reader");
+        let has_owned_shards = self.shards.iter().any(|shard| self.activation_owns(shard));
+        let owns_request_shards = self
+            .request_source()
+            .is_none_or(|source| source.reads_through_activation());
+        RowOwners {
+            readers: if has_owned_shards {
+                vec![reader.clone()]
+            } else {
+                Vec::new()
+            },
+            jvm_open: None,
+            jvm_binding: None,
+            activation_index: has_owned_shards.then_some(0),
+            request_index: (has_owned_shards && owns_request_shards).then_some(0),
+        }
+    }
+
+    /// The questions overlay construction asks, answered on the activation
+    /// owner only.
+    pub fn activation_owned(&self) -> ActivationOwned<'_> {
+        ActivationOwned(self)
+    }
+
+    /// The activation's own reader, for the callable-value and Go source reads
+    /// that are not catalog row questions.
     #[doc(hidden)]
-    pub fn source_reader(&self) -> Option<&CatalogRuntimeSourceReader> {
-        self.source_reader.as_ref()
+    pub fn activation_reader(&self) -> Option<&CatalogRuntimeSourceReader> {
+        self.source_reader.as_deref()
+    }
+
+    #[doc(hidden)]
+    pub fn install_request_source(
+        &mut self,
+        source: Option<Arc<dyn RequestRowReaderSource>>,
+    ) -> Result<(), CatalogError> {
+        let through_activation = source
+            .as_ref()
+            .is_none_or(|source| source.reads_through_activation());
+        let was_distinct = self
+            .request_source
+            .as_ref()
+            .is_some_and(|source| !source.reads_through_activation());
+        if (!through_activation || was_distinct)
+            && let Some(reader) = &self.source_reader
+        {
+            let request_index = through_activation.then_some(0);
+            let keys = self
+                .shards
+                .iter()
+                .filter(|shard| shard_owner_index(shard, Some(0), request_index) == Some(0))
+                .filter_map(|shard| shard.row_store);
+            let replacement = reader.reopen_with_shard_keys(keys)?;
+            self.source_reader = Some(Arc::new(replacement));
+        }
+        self.request_source = source;
+        Ok(())
+    }
+
+    pub fn request_source(&self) -> Option<&Arc<dyn RequestRowReaderSource>> {
+        self.request_source.as_ref()
     }
 
     pub fn active_model_set_hash(&self) -> &str {
@@ -576,17 +939,30 @@ impl ResolvedActiveSemanticModels {
     /// and payload order. Callers deduplicate the projected inventory.
     pub fn result_contract_name_inventory(
         &self,
-    ) -> impl Iterator<Item = (String, String, bool, CallableArity)> + '_ {
-        self.shards.iter().flat_map(|shard| {
-            let rows = (shard.decoded.is_none()
+    ) -> FamilyRows<Vec<(String, String, bool, CallableArity)>> {
+        let mut result = FamilyRows::complete(Vec::new());
+        for shard in &self.shards {
+            let targets = if shard.decoded.is_none()
                 && shard.descriptor.payload_kind
-                    == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries)
-                .then(|| {
-                    self.shard_summary_targets(
-                        shard,
-                        "SUMMARY_CONTRACT_TARGETS_BY_SHARD",
-                        statements::SUMMARY_CONTRACT_TARGETS_BY_SHARD,
-                    )
+                    == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries
+            {
+                match self.shard_summary_targets(
+                    shard,
+                    "SUMMARY_CONTRACT_TARGETS_BY_SHARD",
+                    statements::SUMMARY_CONTRACT_TARGETS_BY_SHARD,
+                ) {
+                    Ok(targets) => Some(targets),
+                    Err(open) => {
+                        let previous = result.jvm_open.get_or_insert(open);
+                        *previous = previous.merge(open);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let rows = targets.map(|targets| {
+                targets
                     .into_iter()
                     .filter_map(|record| {
                         let (_, member) =
@@ -599,8 +975,8 @@ impl ResolvedActiveSemanticModels {
                         ))
                     })
                     .collect()
-                });
-            query_or_posting(
+            });
+            result.rows.extend(query_or_posting(
                 rows,
                 shard
                     .decoded
@@ -623,17 +999,21 @@ impl ResolvedActiveSemanticModels {
                             summary.target.callable_arity(),
                         ))
                     }),
-            )
-        })
+            ));
+        }
+        result
     }
 
     /// Stream the authored-target census one summary-bearing shard at a time,
     /// in activation and canonical payload order. Present-empty summary payloads
-    /// still invoke the visitor; absent payloads do not.
+    /// still invoke the visitor; absent payloads do not. Every shard that
+    /// answers is visited; `Err` means a JVM-family shard's targets were open
+    /// and the census is partial.
     pub fn visit_procedure_summary_targets(
         &self,
         mut visit: impl FnMut(&str, &str, &mut dyn Iterator<Item = (&str, &CompiledProcedureTarget)>),
-    ) {
+    ) -> Result<(), FamilyOpen> {
+        let mut open = None;
         for shard in &self.shards {
             if let Some(decoded) = &shard.decoded {
                 if let Some(summaries) = decoded.payload().procedure_summaries() {
@@ -649,11 +1029,19 @@ impl ResolvedActiveSemanticModels {
             } else if shard.descriptor.payload_kind
                 == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries
             {
-                let records = self.shard_summary_targets(
+                let records = match self.shard_summary_targets(
                     shard,
                     "SUMMARY_TARGETS_BY_SHARD",
                     statements::SUMMARY_TARGETS_BY_SHARD,
-                );
+                ) {
+                    Ok(records) => records,
+                    Err(shard_open) => {
+                        open = Some(open.map_or(shard_open, |previous: FamilyOpen| {
+                            previous.merge(shard_open)
+                        }));
+                        continue;
+                    }
+                };
                 let mut targets = records.iter().map(|record| (record.0.as_str(), &record.1));
                 visit(
                     &shard.manifest.content_sha256,
@@ -662,16 +1050,18 @@ impl ResolvedActiveSemanticModels {
                 );
             }
         }
+        open.map_or(Ok(()), Err)
     }
 
     /// Close selected root IDs over same-shard dependencies in canonical payload order.
     /// Missing IDs stay absent for the consumers' existing diagnostics. M2c's row
-    /// reader answers this query with shard-local ID lookups.
+    /// reader answers this query with shard-local ID lookups. A shard-bound
+    /// read is complete or open as a whole.
     pub fn procedure_summary_family<'a>(
         &self,
         shard: &ActiveSemanticModelShard,
         roots: impl IntoIterator<Item = &'a str>,
-    ) -> Arc<[Arc<CompiledProcedureSummary>]> {
+    ) -> Result<Arc<[Arc<CompiledProcedureSummary>]>, FamilyOpen> {
         if shard.decoded.is_none() {
             let selected = self
                 .shards
@@ -682,9 +1072,7 @@ impl ResolvedActiveSemanticModels {
             return crate::analyzer::store::model_catalog::semantic_catalog_question(
                 "SUMMARY_BY_ID",
                 (&shard.row_store, &roots),
-                self.source_reader
-                    .as_ref()
-                    .expect("row-backed set has its reader")
+                (self.shard_row_reader(shard)?.as_ref() as &dyn CatalogRowReader)
                     .procedure_summary_family(selected, roots.iter().copied()),
             );
         }
@@ -722,38 +1110,81 @@ impl ResolvedActiveSemanticModels {
                 }
             }
         }
-        payload
+        Ok(payload
             .iter()
             .filter(|summary| visited.contains(summary.id.as_str()))
             .cloned()
-            .collect()
+            .collect())
     }
 
     /// Preserve the consumers' legacy whole-shard summary ordering without
-    /// retaining that whole payload in an owned summary family.
+    /// retaining that whole payload in an owned summary family. The order is
+    /// open when any compared shard's read is open.
     #[doc(hidden)]
-    pub fn procedure_summary_shard_order(&self, selected: &ActiveSemanticModelShard) -> usize {
+    pub fn procedure_summary_shard_order(
+        &self,
+        selected: &ActiveSemanticModelShard,
+    ) -> Result<usize, FamilyOpen> {
         if self.has_row_backed_shards() {
             let selected = self
                 .shards
                 .iter()
                 .find(|s| std::ptr::eq(s.as_ref(), selected))
                 .expect("summary shard belongs to this active set");
-            return crate::analyzer::store::model_catalog::semantic_catalog_question(
-                "SUMMARY_SHARD_FIRST/SUMMARY_SHARD_SEQUENCE",
-                selected.row_store,
-                self.source_reader
-                    .as_ref()
-                    .expect("row-backed set has its reader")
-                    .procedure_summary_shard_order(selected, &self.shards),
-            );
+            let read_keys = |shard: &Arc<ActiveSemanticModelShard>, statement: &str| {
+                let identity = shard.row_store.expect("summary shard has catalog identity");
+                let source = match identity.database {
+                    CatalogShardDatabase::Durable => "durable",
+                    CatalogShardDatabase::Session => "session",
+                };
+                let reader = self.shard_row_reader(shard)?;
+                crate::analyzer::store::model_catalog::semantic_catalog_question(
+                    "SUMMARY_SHARD_FIRST/SUMMARY_SHARD_SEQUENCE", identity,
+                    reader.owned_rows(
+                        statement,
+                        named_params! { ":source_db": source, ":shard_key": identity.shard_key },
+                        &CancellationToken::new(),
+                    ).and_then(|rows| rows.iter().map(|row| {
+                        Ok((row.get::<_, String>("model_id").map_err(|error| CatalogError::sqlite("read summary shard order", error))?,
+                            row.get::<_, String>("record_id").map_err(|error| CatalogError::sqlite("read summary shard order", error))?))
+                    }).collect::<Result<Vec<_>, CatalogError>>()),
+                )
+            };
+            let selected_first = read_keys(selected, statements::SUMMARY_SHARD_FIRST)?;
+            let mut selected_sequence = None;
+            let mut rank = 0;
+            for shard in self.shards.iter().filter(|shard| {
+                shard.descriptor.payload_kind
+                    == crate::analyzer::semantic_model::PayloadKind::ProcedureSummaries
+            }) {
+                let order = shard.manifest.language.cmp(&selected.manifest.language);
+                let order = if order.is_eq() {
+                    let first = read_keys(shard, statements::SUMMARY_SHARD_FIRST)?;
+                    let order = first.cmp(&selected_first);
+                    if order.is_eq() {
+                        let full = match &selected_sequence {
+                            Some(full) => full,
+                            None => selected_sequence
+                                .insert(read_keys(selected, statements::SUMMARY_SHARD_SEQUENCE)?),
+                        };
+                        read_keys(shard, statements::SUMMARY_SHARD_SEQUENCE)?.cmp(full)
+                    } else {
+                        order
+                    }
+                } else {
+                    order
+                };
+                rank += usize::from(order.is_lt());
+            }
+            return Ok(rank);
         }
         let selected_payload = selected
             .decoded()
             .payload()
             .procedure_summaries()
             .expect("a selected procedure-summary shard has a summary payload");
-        self.shards
+        Ok(self
+            .shards
             .iter()
             .filter_map(|shard| {
                 shard
@@ -779,7 +1210,7 @@ impl ResolvedActiveSemanticModels {
                     })
                     .is_lt()
             })
-            .count()
+            .count())
     }
 
     /// Runtime-value contracts are carried by the same activated shard as
@@ -787,18 +1218,35 @@ impl ResolvedActiveSemanticModels {
     /// payload so callers retain activation and provenance evidence.
     pub fn runtime_values(
         &self,
-    ) -> impl Iterator<Item = (Arc<RuntimeValuesPayload>, Arc<ActiveSemanticModelShard>)> {
-        self.shards.iter().filter_map(|shard| {
-            let payload = match &shard.decoded {
-                Some(decoded) => decoded.runtime_values().cloned(),
-                None => self.shard_payload::<RuntimeValuesPayload>(
-                    shard,
-                    "RUNTIME_VALUES",
-                    statements::RUNTIME_VALUES,
-                ),
-            };
-            payload.map(|payload| (payload, Arc::clone(shard)))
+    ) -> FamilyRows<Vec<(Arc<RuntimeValuesPayload>, Arc<ActiveSemanticModelShard>)>> {
+        self.shard_payloads(|shard| match &shard.decoded {
+            Some(decoded) => Ok(decoded.runtime_values().cloned()),
+            None => self.shard_payload::<RuntimeValuesPayload>(
+                shard,
+                "RUNTIME_VALUES",
+                statements::RUNTIME_VALUES,
+            ),
         })
+    }
+
+    /// One payload per shard that has one, in activation order. A shard whose
+    /// read is open contributes nothing and makes the result open.
+    fn shard_payloads<P>(
+        &self,
+        payload: impl Fn(&ActiveSemanticModelShard) -> Result<Option<Arc<P>>, FamilyOpen>,
+    ) -> FamilyRows<Vec<(Arc<P>, Arc<ActiveSemanticModelShard>)>> {
+        let mut result = FamilyRows::complete(Vec::new());
+        for shard in &self.shards {
+            match payload(shard) {
+                Ok(Some(payload)) => result.rows.push((payload, Arc::clone(shard))),
+                Ok(None) => {}
+                Err(open) => {
+                    let previous = result.jvm_open.get_or_insert(open);
+                    *previous = previous.merge(open);
+                }
+            }
+        }
+        result
     }
 
     /// Portable records retain their catalog shard and provenance. Catalog
@@ -806,23 +1254,19 @@ impl ResolvedActiveSemanticModels {
     /// consumers must also evaluate the portable activation and producer evidence.
     pub fn runtime_contracts(
         &self,
-    ) -> impl Iterator<
-        Item = (
+    ) -> FamilyRows<
+        Vec<(
             Arc<crate::analyzer::semantic_model::RuntimeContractsPayload>,
             Arc<ActiveSemanticModelShard>,
-        ),
+        )>,
     > {
-        self.shards.iter().filter_map(|shard| {
-            let payload = match &shard.decoded {
-                Some(decoded) => decoded.runtime_contracts().cloned(),
-                None => self
-                    .shard_payload::<crate::analyzer::semantic_model::RuntimeContractsPayload>(
-                        shard,
-                        "RUNTIME_CONTRACTS",
-                        statements::RUNTIME_CONTRACTS,
-                    ),
-            };
-            payload.map(|payload| (payload, Arc::clone(shard)))
+        self.shard_payloads(|shard| match &shard.decoded {
+            Some(decoded) => Ok(decoded.runtime_contracts().cloned()),
+            None => self.shard_payload::<crate::analyzer::semantic_model::RuntimeContractsPayload>(
+                shard,
+                "RUNTIME_CONTRACTS",
+                statements::RUNTIME_CONTRACTS,
+            ),
         })
     }
 
@@ -832,27 +1276,22 @@ impl ResolvedActiveSemanticModels {
     /// callable lookup.
     pub fn collection_flows(
         &self,
-    ) -> impl Iterator<Item = (Arc<CollectionFlowsPayload>, Arc<ActiveSemanticModelShard>)> {
-        self.shards.iter().filter_map(|shard| {
-            let payload = match &shard.decoded {
-                Some(decoded) => decoded.collection_flows().cloned(),
-                None => self
-                    .has_family(shard, SemanticPayloadFamily::CollectionFlows)
-                    .then(|| {
-                        Arc::new(CollectionFlowsPayload {
-                            flows: self
-                                .shard_records(
-                                    shard,
-                                    "COLLECTION_FLOWS_BY_SHARD",
-                                    statements::COLLECTION_FLOWS_BY_SHARD,
-                                )
-                                .into_iter()
-                                .map(Arc::unwrap_or_clone)
-                                .collect(),
-                        })
-                    }),
-            };
-            payload.map(|payload| (payload, Arc::clone(shard)))
+    ) -> FamilyRows<Vec<(Arc<CollectionFlowsPayload>, Arc<ActiveSemanticModelShard>)>> {
+        self.shard_payloads(|shard| match &shard.decoded {
+            Some(decoded) => Ok(decoded.collection_flows().cloned()),
+            None => {
+                if !self.has_family(shard, SemanticPayloadFamily::CollectionFlows)? {
+                    return Ok(None);
+                }
+                let flows = self.shard_records(
+                    shard,
+                    "COLLECTION_FLOWS_BY_SHARD",
+                    statements::COLLECTION_FLOWS_BY_SHARD,
+                )?;
+                Ok(Some(Arc::new(CollectionFlowsPayload {
+                    flows: flows.into_iter().map(Arc::unwrap_or_clone).collect(),
+                })))
+            }
         })
     }
 
@@ -860,35 +1299,31 @@ impl ResolvedActiveSemanticModels {
     /// pair exact endpoint identities with the evidence that activated them.
     pub fn deferred_yields(
         &self,
-    ) -> impl Iterator<Item = (Arc<DeferredYieldsPayload>, Arc<ActiveSemanticModelShard>)> {
-        self.shards.iter().filter_map(|shard| {
-            let payload = match &shard.decoded {
-                Some(decoded) => decoded.deferred_yields().cloned(),
-                None => self
-                    .has_family(shard, SemanticPayloadFamily::DeferredYields)
-                    .then(|| {
-                        Arc::new(DeferredYieldsPayload {
-                            yields: self
-                                .shard_records(
-                                    shard,
-                                    "DEFERRED_YIELDS_BY_SHARD",
-                                    statements::DEFERRED_YIELDS_BY_SHARD,
-                                )
-                                .into_iter()
-                                .map(Arc::unwrap_or_clone)
-                                .collect(),
-                        })
-                    }),
-            };
-            payload.map(|payload| (payload, Arc::clone(shard)))
+    ) -> FamilyRows<Vec<(Arc<DeferredYieldsPayload>, Arc<ActiveSemanticModelShard>)>> {
+        self.shard_payloads(|shard| match &shard.decoded {
+            Some(decoded) => Ok(decoded.deferred_yields().cloned()),
+            None => {
+                if !self.has_family(shard, SemanticPayloadFamily::DeferredYields)? {
+                    return Ok(None);
+                }
+                let yields = self.shard_records(
+                    shard,
+                    "DEFERRED_YIELDS_BY_SHARD",
+                    statements::DEFERRED_YIELDS_BY_SHARD,
+                )?;
+                Ok(Some(Arc::new(DeferredYieldsPayload {
+                    yields: yields.into_iter().map(Arc::unwrap_or_clone).collect(),
+                })))
+            }
         })
     }
 
     /// Rule enumeration is bounded by the active generator rules, not declarations.
-    pub fn generator_rules(
-        &self,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<GeneratorRule>> + '_ {
-        self.shards.iter().flat_map(|shard| {
+    /// Generator-rule shards are activation-owned, so this reads only the
+    /// activation reader and serves overlay construction as well.
+    pub fn generator_rules(&self) -> FamilyRows<Vec<ActivatedSemanticModelRecord<GeneratorRule>>> {
+        let mut result = FamilyRows::complete(Vec::new());
+        for shard in self.shards.iter() {
             let records = match &shard.decoded {
                 Some(decoded) => decoded
                     .payload()
@@ -900,17 +1335,27 @@ impl ResolvedActiveSemanticModels {
                 None if shard.descriptor.payload_kind
                     == crate::analyzer::semantic_model::PayloadKind::GeneratorRules =>
                 {
-                    self.shard_records(shard, "RULES_BY_SHARD", statements::RULES_BY_SHARD)
+                    match self.shard_records(shard, "RULES_BY_SHARD", statements::RULES_BY_SHARD) {
+                        Ok(records) => records,
+                        Err(open) => {
+                            let previous = result.jvm_open.get_or_insert(open);
+                            *previous = previous.merge(open);
+                            continue;
+                        }
+                    }
                 }
                 None => Vec::new(),
             };
-            records
-                .into_iter()
-                .map(|record| ActivatedSemanticModelRecord {
-                    record,
-                    shard: Arc::clone(shard),
-                })
-        })
+            result.rows.extend(
+                records
+                    .into_iter()
+                    .map(|record| ActivatedSemanticModelRecord {
+                        record,
+                        shard: Arc::clone(shard),
+                    }),
+            );
+        }
+        result
     }
 
     pub fn activation_report(&self) -> &SemanticModelActivationReport {
@@ -939,13 +1384,24 @@ impl ResolvedActiveSemanticModels {
     }
 
     pub fn retained_bytes(&self) -> u64 {
-        self.report.retained_bytes
+        self.report
+            .retained_bytes
+            .saturating_add(self.excluded_shards.retained_bytes())
     }
 
     pub fn types_with_id(&self, id: &str) -> SemanticModelMatch<TypeFact> {
+        self.types_with_id_owned(id, || self.question_row_owners(None))
+    }
+
+    fn types_with_id_owned(
+        &self,
+        id: &str,
+        owners: impl FnOnce() -> RowOwners,
+    ) -> SemanticModelMatch<TypeFact> {
         let posting = self.indexes.types_by_id.get(id);
         if self.has_row_backed_shards() {
             return resolve_records(self.type_question(
+                owners(),
                 "TYPES_BY_ID",
                 statements::TYPES_BY_ID,
                 id,
@@ -960,6 +1416,7 @@ impl ResolvedActiveSemanticModels {
         let posting = self.indexes.types_by_name.get(name);
         if self.has_row_backed_shards() {
             let records = self.type_question(
+                self.question_row_owners(None),
                 "TYPES_BY_NAME",
                 statements::TYPES_BY_NAME,
                 name,
@@ -969,7 +1426,7 @@ impl ResolvedActiveSemanticModels {
             // Catalog names also contain terminal spellings. This raw matcher
             // indexes only the canonical name and explicit aliases, including
             // repeated postings when an alias repeats the canonical name.
-            return resolve_records(
+            return resolve_records(records.map(|records| {
                 records
                     .into_iter()
                     .flat_map(|r| {
@@ -985,8 +1442,8 @@ impl ResolvedActiveSemanticModels {
                         };
                         std::iter::repeat_n(r, count)
                     })
-                    .collect(),
-            );
+                    .collect()
+            }));
         }
         self.type_match(posting)
     }
@@ -998,43 +1455,57 @@ impl ResolvedActiveSemanticModels {
     pub fn all_type_records_named<'a>(
         &'a self,
         name: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a> {
         let posting = self.indexes.types_by_name.get(name);
         let rows = self.has_row_backed_shards().then(|| {
-            rows::distinct_addresses(
-                self.type_question(
-                    "TYPES_BY_NAME",
-                    statements::TYPES_BY_NAME,
-                    name,
-                    named_params! { ":name": name },
-                    posting,
-                )
-                .into_iter()
-                .filter(|r| {
-                    r.record.name == name || r.record.aliases.iter().any(|alias| alias == name)
-                })
-                .collect(),
+            self.type_question(
+                self.question_row_owners(None),
+                "TYPES_BY_NAME",
+                statements::TYPES_BY_NAME,
+                name,
+                named_params! { ":name": name },
+                posting,
             )
+            .map(|rows| {
+                rows::distinct_addresses(
+                    rows.into_iter()
+                        .filter(|r| {
+                            r.record.name == name
+                                || r.record.aliases.iter().any(|alias| alias == name)
+                        })
+                        .collect(),
+                )
+            })
         });
-        query_or_posting(rows, self.all_type_records(posting))
+        query_or_posting_rows(rows, self.all_type_records(posting))
     }
 
     #[doc(hidden)]
     pub fn all_type_records_with_id<'a>(
         &'a self,
         id: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a {
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a> {
+        self.all_type_records_with_id_owned(id, || self.question_row_owners(None))
+    }
+
+    fn all_type_records_with_id_owned<'a>(
+        &'a self,
+        id: &str,
+        owners: impl FnOnce() -> RowOwners,
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<TypeFact>> + 'a> {
         let posting = self.indexes.types_by_id.get(id);
         let rows = self.has_row_backed_shards().then(|| {
-            rows::distinct_addresses(self.type_question(
+            self.type_question(
+                owners(),
                 "TYPES_BY_ID",
                 statements::TYPES_BY_ID,
                 id,
                 named_params! { ":id": id },
                 posting,
-            ))
+            )
+            .map(rows::distinct_addresses)
         });
-        query_or_posting(rows, self.all_type_records(posting))
+        query_or_posting_rows(rows, self.all_type_records(posting))
     }
 
     /// Unranked decoded postings for selected composition, including mixed
@@ -1144,18 +1615,28 @@ impl ResolvedActiveSemanticModels {
     pub fn all_member_records_with_id<'a>(
         &'a self,
         id: &str,
-    ) -> impl Iterator<Item = ActivatedSemanticModelRecord<MemberFact>> + 'a {
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<MemberFact>> + 'a> {
+        self.all_member_records_with_id_owned(id, || self.question_row_owners(None))
+    }
+
+    fn all_member_records_with_id_owned<'a>(
+        &'a self,
+        id: &str,
+        owners: impl FnOnce() -> RowOwners,
+    ) -> FamilyRows<impl Iterator<Item = ActivatedSemanticModelRecord<MemberFact>> + 'a> {
         let posting = self.indexes.members_by_id.get(id);
         let rows = self.has_row_backed_shards().then(|| {
-            rows::distinct_addresses(self.member_question(
+            self.member_question(
+                owners(),
                 "MEMBERS_BY_ID",
                 statements::MEMBERS_BY_ID,
                 id,
                 named_params! { ":id": id },
                 posting,
-            ))
+            )
+            .map(rows::distinct_addresses)
         });
-        query_or_posting(
+        query_or_posting_rows(
             rows,
             self.all_records(posting, |shard, index| {
                 &shard
@@ -1175,7 +1656,7 @@ impl ResolvedActiveSemanticModels {
     ) -> impl Iterator<Item = ActivatedSemanticModelRecord<T>> + 'a {
         // Aliases index adjacent copies of one address. Distinct contributors
         // remain distinct even when their values happen to agree.
-        posting
+        let mut addresses = posting
             .into_iter()
             .flat_map(|posting| {
                 posting
@@ -1184,26 +1665,42 @@ impl ResolvedActiveSemanticModels {
                     .filter(move |(index, address)| *index == 0 || **address != posting[*index - 1])
                     .map(|(_, address)| address)
             })
-            .map(move |address| {
-                let shard = &self.shards[address.shard as usize];
-                ActivatedSemanticModelRecord {
-                    record: Arc::clone(record(shard, address.record as usize)),
-                    shard: Arc::clone(shard),
-                }
-            })
+            .collect::<Vec<_>>();
+        addresses.sort_by(|left, right| {
+            rows::shard_record_order_key(&self.shards[left.shard as usize], i64::from(left.record))
+                .cmp(&rows::shard_record_order_key(
+                    &self.shards[right.shard as usize],
+                    i64::from(right.record),
+                ))
+        });
+        addresses.into_iter().map(move |address| {
+            let shard = &self.shards[address.shard as usize];
+            ActivatedSemanticModelRecord {
+                record: Arc::clone(record(shard, address.record as usize)),
+                shard: Arc::clone(shard),
+            }
+        })
     }
 
     /// Whether this raw contributor agrees with the normally selected type
     /// declaration. Lower-ranked runtime claims are not silently discarded;
     /// their owner must still bind to an admitted declaration.
     #[doc(hidden)]
-    pub fn type_declaration_admitted<E>(
+    pub fn type_declaration_admitted<E: From<FamilyOpen>>(
         &self,
-        record: &TypeFact,
+        record: &ActivatedSemanticModelRecord<TypeFact>,
         visit: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<bool, E> {
+        let language = &record.shard.manifest.language;
+        let record = record.record.as_ref();
+        let candidates = self.all_type_records_with_id(&record.id);
+        if let Some(open) = candidates.open_for_language(language) {
+            return Err(open.into());
+        }
         let mut selected = None;
-        for candidate in self.all_type_records_with_id(&record.id) {
+        for candidate in candidates.rows.filter(|candidate| {
+            semantic_pack_realm(&candidate.shard.manifest.language) == semantic_pack_realm(language)
+        }) {
             visit()?;
             let rank = (candidate.shard.evidence_rank, candidate.shard.source_rank);
             if selected.as_ref().is_none_or(|(best, _)| rank > *best) {
@@ -1216,9 +1713,18 @@ impl ResolvedActiveSemanticModels {
     }
 
     pub fn members_with_id(&self, id: &str) -> SemanticModelMatch<MemberFact> {
+        self.members_with_id_owned(id, || self.question_row_owners(None))
+    }
+
+    fn members_with_id_owned(
+        &self,
+        id: &str,
+        owners: impl FnOnce() -> RowOwners,
+    ) -> SemanticModelMatch<MemberFact> {
         let posting = self.indexes.members_by_id.get(id);
         if self.has_row_backed_shards() {
             return resolve_records(self.member_question(
+                owners(),
                 "MEMBERS_BY_ID",
                 statements::MEMBERS_BY_ID,
                 id,
@@ -1237,13 +1743,14 @@ impl ResolvedActiveSemanticModels {
             .and_then(|names| names.get(name));
         if self.has_row_backed_shards() {
             let records = self.member_question(
+                self.question_row_owners(None),
                 "MEMBERS_BY_OWNER_NAME",
                 statements::MEMBERS_BY_OWNER_NAME,
                 (owner, name),
                 named_params! { ":owner": owner, ":name": name },
                 posting,
             );
-            return resolve_records(
+            return resolve_records(records.map(|records| {
                 records
                     .into_iter()
                     .flat_map(|r| {
@@ -1259,16 +1766,25 @@ impl ResolvedActiveSemanticModels {
                         };
                         std::iter::repeat_n(r, count)
                     })
-                    .collect(),
-            );
+                    .collect()
+            }));
         }
         self.member_match(posting)
     }
 
     pub fn relations_with_id(&self, id: &str) -> SemanticModelMatch<RelationFact> {
+        self.relations_with_id_owned(id, || self.question_row_owners(None))
+    }
+
+    fn relations_with_id_owned(
+        &self,
+        id: &str,
+        owners: impl FnOnce() -> RowOwners,
+    ) -> SemanticModelMatch<RelationFact> {
         let posting = self.indexes.relations_by_id.get(id);
         if self.has_row_backed_shards() {
             return self.relation_question(
+                owners(),
                 "RELATIONS_BY_ID",
                 statements::RELATIONS_BY_ID,
                 id,
@@ -1282,6 +1798,7 @@ impl ResolvedActiveSemanticModels {
         let posting = self.indexes.relations_by_from.get(from);
         if self.has_row_backed_shards() {
             return self.relation_question(
+                self.question_row_owners(None),
                 "RELATIONS_FROM",
                 statements::RELATIONS_FROM,
                 from,
@@ -1294,12 +1811,23 @@ impl ResolvedActiveSemanticModels {
     pub fn relations_to(&self, to: &str) -> SemanticModelMatch<RelationFact> {
         let posting = self.indexes.relations_by_to.get(to);
         if self.has_row_backed_shards() {
-            return self.relation_question("RELATIONS_TO", statements::RELATIONS_TO, to, posting);
+            return self.relation_question(
+                self.question_row_owners(None),
+                "RELATIONS_TO",
+                statements::RELATIONS_TO,
+                to,
+                posting,
+            );
         }
         self.relation_match(posting)
     }
 
-    pub fn rules_for(&self, trigger: RuleTriggerKey<'_>) -> SemanticModelMatch<GeneratorRule> {
+    /// Generator triggers apply only to code in the supplied language family.
+    pub fn rules_for(
+        &self,
+        realm: &str,
+        trigger: RuleTriggerKey<'_>,
+    ) -> SemanticModelMatch<GeneratorRule> {
         let posting = match trigger {
             RuleTriggerKey::LanguageConstruct(value) => {
                 self.indexes.rules_by_language_construct.get(value)
@@ -1316,6 +1844,17 @@ impl ResolvedActiveSemanticModels {
                 .get(owner)
                 .and_then(|names| names.get(name)),
         };
+        let scoped_posting = posting.map(|addresses| {
+            addresses
+                .iter()
+                .copied()
+                .filter(|address| {
+                    semantic_pack_realm(&self.shards[address.shard as usize].manifest.language)
+                        == realm
+                })
+                .collect::<Vec<_>>()
+        });
+        let posting = scoped_posting.as_ref();
         if self.has_row_backed_shards() {
             let (family, key) = match trigger {
                 RuleTriggerKey::LanguageConstruct(value) => ("language-construct", value),
@@ -1324,7 +1863,8 @@ impl ResolvedActiveSemanticModels {
                 RuleTriggerKey::GeneratorInvocation(value) => ("generator", value),
                 RuleTriggerKey::ResolvedOwner(value) => ("owner", value),
                 RuleTriggerKey::ResolvedCall { owner, name } => {
-                    return self.rule_question(
+                    return self.rule_question_for_realm(
+                        Some(realm),
                         "RULES_BY_CALL",
                         statements::RULES_BY_CALL,
                         (owner, name),
@@ -1333,7 +1873,8 @@ impl ResolvedActiveSemanticModels {
                     );
                 }
             };
-            return self.rule_question(
+            return self.rule_question_for_realm(
+                Some(realm),
                 "RULES_BY_TRIGGER",
                 statements::RULES_BY_TRIGGER,
                 (family, key),
@@ -1356,6 +1897,34 @@ impl ResolvedActiveSemanticModels {
             );
         }
         self.rule_match(posting)
+    }
+
+    pub fn rules_with_id_for_realm(
+        &self,
+        realm: &str,
+        id: &str,
+    ) -> SemanticModelMatch<GeneratorRule> {
+        let posting = self.indexes.rules_by_id.get(id).map(|addresses| {
+            addresses
+                .iter()
+                .copied()
+                .filter(|address| {
+                    semantic_pack_realm(&self.shards[address.shard as usize].manifest.language)
+                        == realm
+                })
+                .collect::<Vec<_>>()
+        });
+        if self.has_row_backed_shards() {
+            return self.rule_question_for_realm(
+                Some(realm),
+                "RULES_BY_ID",
+                statements::RULES_BY_ID,
+                id,
+                named_params! { ":id": id },
+                posting.as_ref(),
+            );
+        }
+        self.rule_match(posting.as_ref())
     }
 
     pub fn procedure_summaries_for(
@@ -1395,7 +1964,12 @@ impl ResolvedActiveSemanticModels {
         let owners = self.indexes.procedure_summaries_by_member.get(realm)?;
         let direct = owners.get(owner).and_then(|members| members.get(member));
         let mut names = std::collections::HashSet::new();
-        for declaration in self.all_type_records_named(owner) {
+        let declarations = self.all_type_records_named(owner);
+        debug_assert!(
+            declarations.jvm_open.is_none(),
+            "a decoded-only active set has no catalog part to open"
+        );
+        for declaration in declarations.rows {
             if declaration.shard.extraction().is_some()
                 && semantic_pack_realm(&declaration.shard.manifest.language) == realm
             {
@@ -1494,6 +2068,15 @@ impl ResolvedActiveSemanticModels {
         let rejected_artifact = std::cell::Cell::new(false);
         let mut matched =
             self.applicable_member_summaries(key, &parameter_counts, |shard, summary| {
+                // Summary ports address the declared formals, and flow binds
+                // a receiverless target's formal 0 to the call's first written
+                // argument. A reduced-form extension call writes formal 0 as
+                // its receiver, so no summary binds until flow can place it
+                // there; the call stays an open boundary (#11100).
+                if target.receiver_is_first_argument {
+                    incomplete.set(true);
+                    return ProcedureSummaryAcceptance::Reject;
+                }
                 let artifact_applies = python_artifact_applies_to_target(shard, target);
                 let actual_to_formal = procedure_summary_actual_to_formal(shard, summary, target);
                 if python_shard_requires_distribution_artifact(shard, target) && !artifact_applies {
@@ -1607,7 +2190,7 @@ impl ResolvedActiveSemanticModels {
         member: &str,
         has_receiver: bool,
         parameter_count: u32,
-    ) -> bool {
+    ) -> FamilyPresence {
         if self.has_row_backed_shards() {
             return self.refinement_candidate_question(
                 language,
@@ -1616,7 +2199,8 @@ impl ResolvedActiveSemanticModels {
                 parameter_count,
             );
         }
-        self.indexes
+        let present = self
+            .indexes
             .procedure_summaries_by_member
             .get(semantic_pack_realm(language))
             .into_iter()
@@ -1632,7 +2216,12 @@ impl ResolvedActiveSemanticModels {
                 .records
                 .iter()
                 .any(|selected| !selected.normal_return_type_refinements().is_empty())
-            })
+            });
+        if present {
+            FamilyPresence::Present
+        } else {
+            FamilyPresence::Absent
+        }
     }
 
     /// Select an activated summary from an exact external declaration locator
@@ -1677,15 +2266,22 @@ impl ResolvedActiveSemanticModels {
     /// This is a discovery hint only. A consumer must still call
     /// [`Self::proves_normal_continuation_absent`] for the exact owner and
     /// actual arity before changing control flow.
-    pub fn has_normal_continuation_absence_candidates(&self, language: &str) -> bool {
-        if self.has_row_backed_shards() {
-            return self
-                .absence_candidate_question(language)
-                .has_language(language);
+    pub fn has_normal_continuation_absence_candidates(&self, language: &str) -> FamilyPresence {
+        let present = if self.has_row_backed_shards() {
+            match self.absence_candidate_question(language) {
+                Ok(candidates) => candidates.has_language(language),
+                Err(open) => return FamilyPresence::Open(open),
+            }
+        } else {
+            self.indexes
+                .normal_continuation_absence_candidates
+                .has_language(language)
+        };
+        if present {
+            FamilyPresence::Present
+        } else {
+            FamilyPresence::Absent
         }
-        self.indexes
-            .normal_continuation_absence_candidates
-            .has_language(language)
     }
 
     /// Candidate owners for one external member spelling and receiver shape.
@@ -1699,17 +2295,18 @@ impl ResolvedActiveSemanticModels {
         language: &str,
         member: &str,
         has_receiver: bool,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, FamilyOpen> {
         if self.has_row_backed_shards() {
-            return self
-                .absence_candidate_question(language)
+            return Ok(self
+                .absence_candidate_question(language)?
                 .owners(language, member, has_receiver)
-                .to_vec();
+                .to_vec());
         }
-        self.indexes
+        Ok(self
+            .indexes
             .normal_continuation_absence_candidates
             .owners(language, member, has_receiver)
-            .to_vec()
+            .to_vec())
     }
 
     /// Whether exact active-model agreement proves that the external procedure
@@ -1738,27 +2335,35 @@ impl ResolvedActiveSemanticModels {
         language: &str,
         owner: &str,
         member: &str,
-    ) -> bool {
-        if self.has_row_backed_shards() {
-            return !self
-                .summary_member_records(
+    ) -> FamilyPresence {
+        let present =
+            if self.has_row_backed_shards() {
+                let records = self.summary_member_records(
                     ProcedureSummaryMemberKey::new(language, owner, member, false, 0),
                     &[owner.to_owned()],
-                )
-                .is_empty();
+                );
+                // A present record is present even when other rows may be missing.
+                match (records.rows.is_empty(), records.jvm_open) {
+                    (true, Some(open)) => return FamilyPresence::Open(open),
+                    (empty, _) => !empty,
+                }
+            } else {
+                self.indexes
+                    .procedure_summaries_by_member
+                    .get(semantic_pack_realm(language))
+                    .and_then(|owners| owners.get(owner))
+                    .and_then(|members| members.get(member))
+                    .is_some_and(|shapes| {
+                        shapes.fixed.iter().chain(shapes.variadic.iter()).any(
+                            |((has_receiver, _), postings)| !has_receiver && !postings.is_empty(),
+                        )
+                    })
+            };
+        if present {
+            FamilyPresence::Present
+        } else {
+            FamilyPresence::Absent
         }
-        self.indexes
-            .procedure_summaries_by_member
-            .get(semantic_pack_realm(language))
-            .and_then(|owners| owners.get(owner))
-            .and_then(|members| members.get(member))
-            .is_some_and(|shapes| {
-                shapes
-                    .fixed
-                    .iter()
-                    .chain(shapes.variadic.iter())
-                    .any(|((has_receiver, _), postings)| !has_receiver && !postings.is_empty())
-            })
     }
 
     fn type_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<TypeFact> {
@@ -1930,6 +2535,47 @@ pub fn procedure_summary_actual_to_formal(
     }
 }
 
+/// Rows of one catalog question, in publication order, with the state of its
+/// JVM-family part. When `jvm_open` is set, JVM-family rows may be missing and
+/// the rows are only possible candidates; a single reader never sets it.
+#[derive(Debug)]
+pub struct FamilyRows<R> {
+    pub rows: R,
+    pub jvm_open: Option<FamilyOpen>,
+}
+
+impl<R> FamilyRows<R> {
+    /// Rows from decoded postings only, which are never open.
+    pub fn complete(rows: R) -> Self {
+        Self {
+            rows,
+            jvm_open: None,
+        }
+    }
+
+    /// The open part seen by a consumer that keeps only `language`'s rows:
+    /// rows of a non-JVM language are complete either way.
+    pub fn open_for_language(&self, language: &str) -> Option<FamilyOpen> {
+        self.jvm_open
+            .filter(|_| JVM_SEMANTIC_PACK_LANGUAGES.contains(&language))
+    }
+
+    pub fn map<S>(self, rows: impl FnOnce(R) -> S) -> FamilyRows<S> {
+        FamilyRows {
+            rows: rows(self.rows),
+            jvm_open: self.jvm_open,
+        }
+    }
+}
+
+/// A presence question that cannot infer absence from a partial row set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FamilyPresence {
+    Present,
+    Absent,
+    Open(FamilyOpen),
+}
+
 #[derive(Debug)]
 pub struct SemanticModelMatch<T> {
     pub records: Vec<ActivatedSemanticModelRecord<T>>,
@@ -1965,8 +2611,108 @@ pub struct ProcedureSummaryMatch {
     pub fallback_candidates_examined: usize,
 }
 
+/// Identity of the inputs used to build retained matcher postings. The curated
+/// component can be carried by a request without reading through its row handle.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MatcherPostingAdmission {
+    pub all: [u8; 32],
+    pub curated: [u8; 32],
+}
+
+impl MatcherPostingAdmission {
+    pub fn agrees_with(self, admitted: Self) -> bool {
+        self == admitted
+    }
+}
+
+const MATCHER_POSTING_BUILD_VERSION: u32 = 1;
+
+/// Recompute this from the request's admitted selected shards, in build order.
+/// A row key is local to one catalog and is deliberately not an identity here.
+pub fn matcher_posting_admission(
+    active: &[Arc<ActiveSemanticModelShard>],
+) -> MatcherPostingAdmission {
+    fn option(hasher: &mut CanonicalHasher, value: Option<&str>) {
+        hasher.value(&[u8::from(value.is_some())]);
+        if let Some(value) = value {
+            hasher.value(value.as_bytes());
+        }
+    }
+    fn coordinate(
+        hasher: &mut CanonicalHasher,
+        value: Option<&crate::analyzer::semantic_model::CatalogCoordinate>,
+    ) {
+        hasher.value(&[u8::from(value.is_some())]);
+        if let Some(value) = value {
+            hasher.value(value.name.as_bytes());
+            option(
+                hasher,
+                value
+                    .version
+                    .as_ref()
+                    .map(|version| version.to_string())
+                    .as_deref(),
+            );
+        }
+    }
+    fn evidence(hasher: &mut CanonicalHasher, value: &SemanticModelActivationEvidence) {
+        hasher.value(value.language.as_bytes());
+        hasher.value(value.ecosystem.as_bytes());
+        coordinate(hasher, value.package.as_ref());
+        coordinate(hasher, value.module.as_ref());
+        coordinate(hasher, value.toolchain.as_ref());
+        option(hasher, value.target.as_deref());
+        option(hasher, value.configuration.as_deref());
+        option(hasher, value.artifact_sha256.as_deref());
+    }
+    fn digest(active: &[Arc<ActiveSemanticModelShard>], curated_only: bool) -> [u8; 32] {
+        let mut hasher = CanonicalHasher::new(b"bifrost.matcher-posting-admission.v1");
+        hasher.field(
+            "build-version",
+            &MATCHER_POSTING_BUILD_VERSION.to_be_bytes(),
+        );
+        let selected = active
+            .iter()
+            .filter(|shard| {
+                !curated_only
+                    || matches!(
+                        shard.source_kind,
+                        CatalogPackSourceKind::Installed
+                            | CatalogPackSourceKind::PreShipped
+                            | CatalogPackSourceKind::Embedded
+                    )
+            })
+            .collect::<Vec<_>>();
+        hasher.sequence("shards", &selected, |hasher, shard| {
+            hasher.value(shard.manifest.semantic_sha256.as_bytes());
+            hasher.value(shard.descriptor.shard_id.as_bytes());
+            hasher.value(shard.descriptor.semantic_sha256.as_bytes());
+            hasher.value(shard.source_kind.as_str().as_bytes());
+            hasher.value(&[shard.evidence_rank as u8, shard.source_rank]);
+            // `build` skips a shard without a decoded payload, so whether the
+            // shard contributes postings at all is part of the projection.
+            if shard.assumed_rust_toolchain {
+                hasher.value(b"assumed-rust-toolchain");
+            }
+            hasher.value(&[
+                u8::from(shard.approximate),
+                u8::from(shard.extraction_deferred),
+                u8::from(shard.decoded.is_some()),
+            ]);
+            evidence(hasher, &shard.matched_evidence);
+            hasher.sequence("matching-evidence", &shard.matching_evidence, evidence);
+        });
+        hasher.finish()
+    }
+    MatcherPostingAdmission {
+        all: digest(active, false),
+        curated: digest(active, true),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MatcherIndexes {
+    admission: MatcherPostingAdmission,
     types_by_id: HashMap<String, Vec<RecordAddress>>,
     types_by_name: HashMap<String, Vec<RecordAddress>>,
     members_by_id: HashMap<String, Vec<RecordAddress>>,
@@ -1992,6 +2738,10 @@ pub struct MatcherIndexes {
 }
 
 impl MatcherIndexes {
+    pub fn admission(&self) -> MatcherPostingAdmission {
+        self.admission
+    }
+
     pub fn build(
         active: &[Arc<ActiveSemanticModelShard>],
         limits: SemanticModelRuntimeLimits,
@@ -1999,6 +2749,7 @@ impl MatcherIndexes {
         report: &mut SemanticModelActivationReport,
     ) -> Result<Self, String> {
         let mut indexes = Self {
+            admission: matcher_posting_admission(active),
             types_by_id: map_with_capacity(active.len()),
             types_by_name: map_with_capacity(active.len()),
             members_by_id: map_with_capacity(active.len()),
@@ -2722,18 +3473,27 @@ where
     F: FnMut(&ActiveSemanticModelShard, usize) -> Option<&Arc<T>>,
 {
     let posting = posting.map(Vec::as_slice).unwrap_or_default();
-    let best_rank = posting
-        .iter()
-        .map(|address| {
-            let shard = &shards[address.shard as usize];
-            (shard.evidence_rank, shard.source_rank)
-        })
-        .max();
-    let candidates = posting
+    let mut best_ranks = HashMap::default();
+    for address in posting {
+        let shard = &shards[address.shard as usize];
+        let rank = (shard.evidence_rank, shard.source_rank);
+        best_ranks
+            .entry(semantic_pack_realm(&shard.manifest.language).to_owned())
+            .and_modify(|best| *best = std::cmp::max(*best, rank))
+            .or_insert(rank);
+    }
+    let mut ordered = posting.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        rows::shard_record_order_key(&shards[left.shard as usize], i64::from(left.record)).cmp(
+            &rows::shard_record_order_key(&shards[right.shard as usize], i64::from(right.record)),
+        )
+    });
+    let candidates = ordered
         .iter()
         .filter(|address| {
             let shard = &shards[address.shard as usize];
-            Some((shard.evidence_rank, shard.source_rank)) == best_rank
+            best_ranks.get(semantic_pack_realm(&shard.manifest.language))
+                == Some(&(shard.evidence_rank, shard.source_rank))
         })
         .map(|address| {
             let shard = &shards[address.shard as usize];
@@ -2745,7 +3505,7 @@ where
                 shard: Arc::clone(shard),
             }
         });
-    resolve_ranked_records(candidates, best_rank, posting.len())
+    resolve_ranked_records(candidates, &best_ranks, posting.len())
 }
 
 /// Keep decoded-only callers lazy, without allocating a result vector. The row
@@ -2760,6 +3520,18 @@ pub fn query_or_posting<T>(
         Some(rows) => rows.next(),
         None => posting.next(),
     })
+}
+
+/// [`query_or_posting`] for a catalog question that carries its open part.
+fn query_or_posting_rows<T>(
+    rows: Option<FamilyRows<Vec<T>>>,
+    posting: impl Iterator<Item = T>,
+) -> FamilyRows<impl Iterator<Item = T>> {
+    let jvm_open = rows.as_ref().and_then(|rows| rows.jvm_open);
+    FamilyRows {
+        rows: query_or_posting(rows.map(|rows| rows.rows), posting),
+        jvm_open,
+    }
 }
 
 /// Interleave publication-ordered answers from the two backings. Equal keys
@@ -2794,32 +3566,49 @@ pub fn merge_ordered_semantic_results<T>(
 /// Shared evidence selection for decoded postings and query-owned catalog rows.
 #[doc(hidden)]
 pub fn resolve_records<T: Eq>(
-    candidates: Vec<ActivatedSemanticModelRecord<T>>,
+    candidates: FamilyRows<Vec<ActivatedSemanticModelRecord<T>>>,
 ) -> SemanticModelMatch<T> {
-    let best_rank = candidates
-        .iter()
-        .map(|candidate| (candidate.shard.evidence_rank, candidate.shard.source_rank))
-        .max();
+    let FamilyRows {
+        rows: candidates,
+        jvm_open,
+    } = candidates;
+    let mut best_ranks = HashMap::default();
+    for candidate in &candidates {
+        let shard = &candidate.shard;
+        let rank = (shard.evidence_rank, shard.source_rank);
+        best_ranks
+            .entry(semantic_pack_realm(&shard.manifest.language).to_owned())
+            .and_modify(|best| *best = std::cmp::max(*best, rank))
+            .or_insert(rank);
+    }
     let candidates_examined = candidates.len();
-    resolve_ranked_records(candidates, best_rank, candidates_examined)
+    let mut matched = resolve_ranked_records(candidates, &best_ranks, candidates_examined);
+    if let Some(open) = jvm_open {
+        matched.disposition = SemanticModelMatchDisposition::Open(open);
+    }
+    matched
 }
 
 fn resolve_ranked_records<T: Eq>(
     candidates: impl IntoIterator<Item = ActivatedSemanticModelRecord<T>>,
-    best_rank: Option<(EvidenceRank, u8)>,
+    best_ranks: &HashMap<String, (EvidenceRank, u8)>,
     candidates_examined: usize,
 ) -> SemanticModelMatch<T> {
     let mut records = Vec::new();
     for candidate in candidates {
         let shard = &candidate.shard;
-        if Some((shard.evidence_rank, shard.source_rank)) != best_rank {
+        if best_ranks.get(semantic_pack_realm(&shard.manifest.language))
+            != Some(&(shard.evidence_rank, shard.source_rank))
+        {
             continue;
         }
         let record = &candidate.record;
         if !records
             .iter()
             .any(|candidate: &ActivatedSemanticModelRecord<T>| {
-                candidate.record.as_ref() == record.as_ref()
+                semantic_pack_realm(&candidate.shard.manifest.language)
+                    == semantic_pack_realm(&shard.manifest.language)
+                    && candidate.record.as_ref() == record.as_ref()
                     && !(candidate.shard.matched_evidence.ecosystem == "jdk"
                         && shard.matched_evidence.ecosystem == "jdk"
                         && candidate.shard.matched_evidence.artifact_sha256
@@ -2981,28 +3770,38 @@ pub fn resolve_procedure_postings_where<'posting>(
         &CompiledProcedureSummary,
     ) -> ProcedureSummaryAcceptance,
 ) -> ProcedureSummaryMatch {
-    let candidates = postings.into_iter().flat_map(|posting| {
-        posting.iter().map(|address| {
-            let shard = &shards[address.shard as usize];
-            let record = &shard
-                .decoded()
-                .payload()
-                .procedure_summaries()
-                .expect("procedure-summary index address must resolve to its payload kind")
-                [address.record as usize];
-            ActivatedSemanticModelRecord {
-                record: Arc::clone(record),
-                shard: Arc::clone(shard),
-            }
-        })
+    let mut addresses = postings.into_iter().flatten().copied().collect::<Vec<_>>();
+    addresses.sort_by(|left, right| {
+        rows::shard_record_order_key(&shards[left.shard as usize], i64::from(left.record)).cmp(
+            &rows::shard_record_order_key(&shards[right.shard as usize], i64::from(right.record)),
+        )
     });
-    resolve_procedure_records(candidates, claims_agree, accepts_record)
+    let candidates = addresses.into_iter().map(|address| {
+        let shard = &shards[address.shard as usize];
+        let record = &shard
+            .decoded()
+            .payload()
+            .procedure_summaries()
+            .expect("procedure-summary index address must resolve to its payload kind")
+            [address.record as usize];
+        ActivatedSemanticModelRecord {
+            record: Arc::clone(record),
+            shard: Arc::clone(shard),
+        }
+    });
+    resolve_procedure_records(
+        FamilyRows::complete(candidates),
+        claims_agree,
+        accepts_record,
+    )
 }
 
 /// Keep rank, duplicate claims and acceptance order identical for both backings.
 #[doc(hidden)]
 pub fn resolve_procedure_records(
-    candidates: impl IntoIterator<Item = ActivatedSemanticModelRecord<CompiledProcedureSummary>>,
+    candidates: FamilyRows<
+        impl IntoIterator<Item = ActivatedSemanticModelRecord<CompiledProcedureSummary>>,
+    >,
     claims_agree: fn(&CompiledProcedureSummary, &CompiledProcedureSummary) -> bool,
     accepts_record: impl Fn(
         &ActiveSemanticModelShard,
@@ -3012,6 +3811,10 @@ pub fn resolve_procedure_records(
     let mut candidates_examined = 0usize;
     let mut best_rank = None;
     let mut records = Vec::<ActivatedProcedureSummary>::new();
+    let FamilyRows {
+        rows: candidates,
+        jvm_open,
+    } = candidates;
     for candidate in candidates {
         candidates_examined = candidates_examined.saturating_add(1);
         let shard = candidate.shard;
@@ -3050,11 +3853,15 @@ pub fn resolve_procedure_records(
         });
     }
     ProcedureSummaryMatch {
-        applicability: ProcedureSummaryApplicability::Complete,
-        disposition: match records.len() {
-            0 => SemanticModelMatchDisposition::Empty,
-            1 => SemanticModelMatchDisposition::Unique,
-            _ => SemanticModelMatchDisposition::Conflict,
+        applicability: match jvm_open {
+            None => ProcedureSummaryApplicability::Complete,
+            Some(_) => ProcedureSummaryApplicability::Incomplete,
+        },
+        disposition: match (jvm_open, records.len()) {
+            (Some(open), _) => SemanticModelMatchDisposition::Open(open),
+            (None, 0) => SemanticModelMatchDisposition::Empty,
+            (None, 1) => SemanticModelMatchDisposition::Unique,
+            (None, _) => SemanticModelMatchDisposition::Conflict,
         },
         records,
         candidates_examined,
@@ -3064,11 +3871,14 @@ pub fn resolve_procedure_records(
 
 /// Translate a resolver-selected provider row to its published record identity.
 /// Keep the publisher's owner-member order; overlay composition order is unrelated.
+/// `Err` means the owner's rows may be missing, so absence is not proven.
 pub fn selected_external_descriptor(
     active: &ResolvedActiveSemanticModels,
     selected: &crate::analyzer::resolution::ExternalMemberIdentity,
-) -> Option<(String, String)> {
-    for owner in active.all_type_records_named(&selected.owner.owner_fqn) {
+) -> Result<Option<(String, String)>, FamilyOpen> {
+    let owners = active.all_type_records_named(&selected.owner.owner_fqn);
+    let jvm_open = owners.jvm_open;
+    for owner in owners.rows {
         if owner.shard.manifest.semantic_sha256 != selected.owner.provider_id.as_ref() {
             continue;
         }
@@ -3083,7 +3893,7 @@ pub fn selected_external_descriptor(
             };
             let records = crate::analyzer::store::model_catalog::semantic_catalog_question(
                 "SELECTED_EXTERNAL_DESCRIPTOR", selected,
-                active.source_reader().expect("row-backed set has its reader").raw_rows(
+                (active.shard_row_reader(&owner.shard)?.as_ref() as &dyn CatalogRowReader).raw_rows(
                     r#"SELECT source_db,shard_key,record_id FROM (
                       SELECT m.source_db,m.shard_key,m.record_id,0 AS origin,m.record_key AS position
                       FROM active_catalog_declaration_members m
@@ -3100,15 +3910,17 @@ pub fn selected_external_descriptor(
                     named_params! { ":source": source, ":shard": identity.shard_key,
                         ":owner": owner.record.id, ":ordinal": selected.ordinal },
                     &active.shards, |row| row.get::<_, String>("record_id")),
-            );
-            return records.first().map(|record| {
+            )?;
+            return Ok(records.first().map(|record| {
                 (
                     record.shard.manifest.semantic_sha256.clone(),
                     record.record.as_ref().clone(),
                 )
-            });
+            }));
         }
-        let (_, members, _) = owner.shard.decoded().payload().declaration_facts()?;
+        let Some((_, members, _)) = owner.shard.decoded().payload().declaration_facts() else {
+            return Ok(None);
+        };
         let member = members
             .iter()
             .map(AsRef::as_ref)
@@ -3120,14 +3932,19 @@ pub fn selected_external_descriptor(
                     .flat_map(|inventory| &inventory.additional_members),
             )
             .filter(|member| member.owner == owner.record.id && member.guard.is_none())
-            .nth(usize::try_from(selected.ordinal).expect("provider ordinal fits usize"))?;
-        return Some((
-            owner.shard.manifest.semantic_sha256.clone(),
-            member.id.clone(),
-        ));
+            .nth(usize::try_from(selected.ordinal).expect("provider ordinal fits usize"));
+        return Ok(member.map(|member| {
+            (
+                owner.shard.manifest.semantic_sha256.clone(),
+                member.id.clone(),
+            )
+        }));
     }
-    None
+    jvm_open.map_or(Ok(None), Err)
 }
+
+/// Type arguments bound by one exact external call selection, ordered by name.
+pub type ExternalCallTypeBindings = Box<[(Box<str>, crate::analyzer::semantic_model::TypeRef)]>;
 
 /// Canonical identity for a fully-qualified external callee that never
 /// materializes to a workspace or classpath artifact, yet whose name lets an
@@ -3144,12 +3961,20 @@ pub fn selected_external_descriptor(
 /// the documented match identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnmaterializedExternalTarget {
+    pub receiver_adjustment_call: Option<crate::analyzer::semantic::StableDigest>,
+    pub unadmitted_receiver_deref: bool,
+    pub receiver_adjustments: Box<[crate::analyzer::semantic_model::ReceiverAdjustment]>,
     owner_fqn: Box<str>,
     member: Box<str>,
     arity: u32,
     has_receiver: bool,
     #[doc(hidden)]
     pub resolver_owned_call_shape: bool,
+    /// The resolver proved a static extension method called in reduced form,
+    /// `v.M(args...)`: the written receiver value is the first declared
+    /// argument, which `arity` counts, and the call's own arguments follow it.
+    #[doc(hidden)]
+    pub receiver_is_first_argument: bool,
     normalized_static_owner: Option<Box<str>>,
     /// Exact JDK artifact selected for the Java source module and verified
     /// against the selected external declaration. Model and dispatch
@@ -3158,6 +3983,10 @@ pub struct UnmaterializedExternalTarget {
     /// Exact provider inventory row selected by call resolution.
     #[doc(hidden)]
     pub selected_external_descriptor: Option<crate::analyzer::resolution::ExternalMemberIdentity>,
+    /// Type arguments bound by the exact call selection, copied from the
+    /// resolver's proof. Absent when selection used no bindings.
+    #[doc(hidden)]
+    pub type_argument_bindings: Option<ExternalCallTypeBindings>,
     /// Exact PyPI distribution artifact selected for a Python external
     /// declaration by resolver-owned installed-artifact and active-profile
     /// evidence. Model and dispatch applicability still require separate
@@ -3180,6 +4009,32 @@ pub struct UnmaterializedExternalTarget {
     #[doc(hidden)]
     pub locator: SemanticLocator,
     python_formal_locator: Option<SemanticLocator>,
+}
+
+impl UnmaterializedExternalTarget {
+    /// Heap bytes owned by the type-argument bindings, for caches that retain
+    /// this target across requests and charge it against their memory budget.
+    pub fn type_argument_binding_heap_bytes(&self) -> usize {
+        let chain_bytes = std::mem::size_of_val(self.receiver_adjustments.as_ref())
+            + self
+                .receiver_adjustments
+                .iter()
+                .map(|step| step.retained_heap_bytes())
+                .sum::<usize>();
+        let Some(bindings) = &self.type_argument_bindings else {
+            return chain_bytes;
+        };
+        let mut heap = super::cache_budget::RetainedHeap::default();
+        heap.slice(bindings);
+        for (name, _) in bindings.iter() {
+            heap.add(name.len());
+        }
+        super::semantic_composition::charge_type_refs(
+            bindings.iter().map(|(_, ty)| ty).collect(),
+            &mut heap,
+        );
+        heap.total().saturating_add(chain_bytes)
+    }
 }
 
 impl UnmaterializedExternalTarget {
@@ -3265,14 +4120,19 @@ impl UnmaterializedExternalTarget {
                 .is_none_or(|owner| owner == owner_fqn.as_ref())
         );
         Self {
+            receiver_adjustment_call: None,
+            unadmitted_receiver_deref: false,
+            receiver_adjustments: Box::default(),
             owner_fqn,
             member: member.into(),
             arity,
             has_receiver,
             resolver_owned_call_shape: false,
+            receiver_is_first_argument: false,
             normalized_static_owner,
             selected_jdk_artifact: None,
             selected_external_descriptor: None,
+            type_argument_bindings: None,
             selected_python_artifact: None,
             selected_python_model_manifest_sha256: None,
             python_formal_call_shape: None,
@@ -3652,12 +4512,14 @@ impl UnmaterializedExternalTarget {
         // crate functions use this proof; Python and Java also use it for
         // their resolver-owned imported declarations. C# type-qualified calls
         // use the same proof after the declaration overlay establishes that
-        // the selected member is static.
+        // the selected member is static, as do PHP calls through a named
+        // class scope (`Owner::member()`).
         if self.resolver_owned_call_shape
             && matches!(
                 self.language(),
                 SemanticLanguage::Standard(
                     Language::CSharp
+                        | Language::Php
                         | Language::Cpp
                         | Language::Python
                         | Language::Java

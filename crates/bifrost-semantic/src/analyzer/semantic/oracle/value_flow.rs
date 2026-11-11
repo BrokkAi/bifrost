@@ -9,6 +9,8 @@ use crate::analyzer::semantic::ir::AsyncResumeKind;
 
 use crate::analyzer::semantic::ir::BackingStoreOffset;
 
+use crate::analyzer::semantic::ir::CallContinuationKind;
+
 use crate::analyzer::semantic::ir::CaptureSource;
 
 use crate::analyzer::semantic::ir::EvidenceCompleteness;
@@ -78,6 +80,8 @@ use crate::analyzer::semantic::ValueId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowRelationKind {
     Assignment,
+    /// Exact value dependence with unresolved copy/move and storage identity.
+    OwnershipUnknown,
     Parameter,
     Receiver,
     /// A returned value flows to its normal return port. A returned member
@@ -131,6 +135,7 @@ impl ValueFlowRelationKind {
     pub const fn timing(self) -> ExecutionTiming {
         match self {
             Self::Assignment
+            | Self::OwnershipUnknown
             | Self::Allocation
             | Self::MemoryLoad
             | Self::MemoryStore
@@ -276,15 +281,52 @@ pub fn keyed_property_reads_container_element(
 ///
 /// This mirrors `workspace_oracle::value_flow::LoadOrigin`, which the minting
 /// side's access-path resolver walks, and merges a value more than one event
-/// defines differently to `Ambiguous` by the same rule. The two must answer
-/// the same question about the same chain: what the resolver saw is exactly
-/// what decides which relations get minted, so what this layer accepts has to
-/// be derived from the same walk.
+/// defines differently by the same rule: plain copies from different sources
+/// keep every source, as the resolver's definition alternatives do, and any
+/// other conflict is `Ambiguous`. The two must answer the same question about
+/// the same chain: what the resolver saw is exactly what decides which
+/// relations get minted, so what this layer accepts has to be derived from
+/// the same walk.
 #[derive(PartialEq, Eq)]
 enum ValueOrigin {
-    Copy(ValueId),
+    Copies(Vec<ValueId>),
     Load(crate::analyzer::semantic::MemoryLocationId),
     Ambiguous,
+}
+
+/// The `(target, source)` pair of an event that defines `target` as an
+/// unconditional copy of `source`, for the snapshot validator's origin walks.
+///
+/// It is the set of copy steps the minting side's `LoadOrigin` derivation
+/// walks through, so both validator walks must use this one helper: a step the
+/// minting walk crosses and a validator walk stops at makes the validator
+/// reject a relation the provider minted, failing the run (#9988). A Go
+/// assignment conversion is such a step: `var out []string = mk()` defines
+/// `out` from the call result through a `go.assignment_conversion` value.
+fn copy_definition(
+    procedure: &ProcedureHandle,
+    effect: &SemanticEffect,
+) -> Option<(ValueId, ValueId)> {
+    match *effect {
+        SemanticEffect::Assignment { target, value } => Some((target, value)),
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
+            source,
+            target,
+        } => Some((target, source)),
+        SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::LanguageDefined,
+            source,
+            target,
+        } if crate::analyzer::semantic::workspace_oracle::value_flow::is_go_assignment_conversion(
+            procedure.semantics(),
+            target,
+        ) =>
+        {
+            Some((target, source))
+        }
+        _ => None,
+    }
 }
 
 /// The resolved access chain behind each memory location this procedure names,
@@ -302,36 +344,44 @@ impl MemoryAccessChains {
             std::collections::HashMap::new();
         for point in procedure.semantics().points() {
             for event in &point.events {
-                let defined = match event.effect {
-                    SemanticEffect::Assignment { target, value }
-                    | SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
-                        target,
-                        source: value,
-                    } => (target, ValueOrigin::Copy(value)),
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::BackingStoreAlternative { .. },
-                        target,
-                        ..
-                    } => (target, ValueOrigin::Ambiguous),
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Transfer(_),
-                        target,
-                        ..
-                    } => (target, ValueOrigin::Ambiguous),
-                    SemanticEffect::MemoryLoad {
-                        location, result, ..
-                    } => (result, ValueOrigin::Load(location)),
-                    _ => continue,
-                };
-                origins
-                    .entry(defined.0)
-                    .and_modify(|existing| {
-                        if *existing != defined.1 {
+                let defined =
+                    if let Some((target, source)) = copy_definition(procedure, &event.effect) {
+                        (target, ValueOrigin::Copies(vec![source]))
+                    } else {
+                        match event.effect {
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::BackingStoreAlternative { .. },
+                                target,
+                                ..
+                            } => (target, ValueOrigin::Ambiguous),
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Transfer(_) | ValueFlowKind::OwnershipUnknown,
+                                target,
+                                ..
+                            } => (target, ValueOrigin::Ambiguous),
+                            SemanticEffect::MemoryLoad {
+                                location, result, ..
+                            } => (result, ValueOrigin::Load(location)),
+                            _ => continue,
+                        }
+                    };
+                match (origins.get_mut(&defined.0), defined.1) {
+                    (None, origin) => {
+                        origins.insert(defined.0, origin);
+                    }
+                    (Some(ValueOrigin::Copies(sources)), ValueOrigin::Copies(more)) => {
+                        for source in more {
+                            if !sources.contains(&source) {
+                                sources.push(source);
+                            }
+                        }
+                    }
+                    (Some(existing), origin) => {
+                        if *existing != origin {
                             *existing = ValueOrigin::Ambiguous;
                         }
-                    })
-                    .or_insert(defined.1);
+                    }
+                }
             }
         }
         Self { origins }
@@ -369,15 +419,19 @@ impl MemoryAccessChains {
     ) -> bool {
         use crate::analyzer::semantic::MemoryLocationKind;
 
-        let mut current = location;
+        // A base several copies define is walked through every one of them,
+        // because the resolver mints one candidate path per definition and any
+        // of them may be the indexed one.
+        let mut pending_locations = vec![location];
+        let mut pending_values = Vec::new();
         let mut visited_locations = std::collections::HashSet::new();
         let mut visited_values = std::collections::HashSet::new();
-        loop {
+        while let Some(current) = pending_locations.pop() {
             if !visited_locations.insert(current) {
-                return false;
+                continue;
             }
             let Some(row) = procedure.semantics().memory_location(current) else {
-                return false;
+                continue;
             };
             let base = match row.kind {
                 MemoryLocationKind::Index { .. } => return true,
@@ -386,24 +440,23 @@ impl MemoryAccessChains {
                 | MemoryLocationKind::Dereference { address: base } => base,
                 MemoryLocationKind::Static { .. }
                 | MemoryLocationKind::LexicalCell { .. }
-                | MemoryLocationKind::Capture { .. } => return false,
+                | MemoryLocationKind::Capture { .. } => continue,
             };
             // Walk the base back through the unconditional copies that define
             // it, exactly as `walk_value_origin` does, and continue the chain
             // at the location its defining load read.
-            let mut value = base;
-            let loaded = loop {
+            pending_values.push(base);
+            while let Some(value) = pending_values.pop() {
                 match self.origins.get(&value) {
-                    Some(ValueOrigin::Copy(next)) if visited_values.insert(value) => value = *next,
-                    Some(ValueOrigin::Load(location)) => break Some(*location),
-                    Some(ValueOrigin::Copy(_) | ValueOrigin::Ambiguous) | None => break None,
+                    Some(ValueOrigin::Copies(sources)) if visited_values.insert(value) => {
+                        pending_values.extend(sources.iter().copied());
+                    }
+                    Some(ValueOrigin::Load(location)) => pending_locations.push(*location),
+                    Some(ValueOrigin::Copies(_) | ValueOrigin::Ambiguous) | None => {}
                 }
-            };
-            let Some(loaded) = loaded else {
-                return false;
-            };
-            current = loaded;
+            }
         }
+        false
     }
 }
 
@@ -508,15 +561,13 @@ fn structured_value_origin_matches_root(
         }
         for point in procedure.semantics().points() {
             for event in &point.events {
-                match event.effect {
-                    SemanticEffect::Assignment { target, value } if target == current => {
-                        pending.push(value);
+                if let Some((target, source)) = copy_definition(procedure, &event.effect) {
+                    if target == current {
+                        pending.push(source);
                     }
-                    SemanticEffect::ValueFlow {
-                        kind: ValueFlowKind::Local | ValueFlowKind::BackingStore { .. },
-                        source,
-                        target,
-                    } if target == current => pending.push(source),
+                    continue;
+                }
+                match event.effect {
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::BackingStoreAlternative { allocation, .. },
                         source,
@@ -591,6 +642,16 @@ fn relation_matches_event(
                 && runtime_value_endpoint(procedure, &relation.target, *target)
         }
         SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::OwnershipUnknown,
+            source,
+            target,
+        } => {
+            relation.kind == ValueFlowRelationKind::OwnershipUnknown
+                && relation.transfer.is_none()
+                && value_endpoint(&relation.source, *source)
+                && value_endpoint(&relation.target, *target)
+        }
+        SemanticEffect::ValueFlow {
             kind: ValueFlowKind::ReferenceBoxing | ValueFlowKind::ReferenceUnboxing,
             source,
             target,
@@ -644,7 +705,10 @@ fn relation_matches_event(
                 )
         }
         SemanticEffect::ValueFlow {
-            kind: ValueFlowKind::LanguageDefined | ValueFlowKind::IntegerOffset { .. },
+            kind:
+                ValueFlowKind::LanguageDefined
+                | ValueFlowKind::ByValueCapture
+                | ValueFlowKind::IntegerOffset { .. },
             source,
             target,
         } => {
@@ -735,6 +799,21 @@ fn relation_matches_event(
             }
             _ => false,
         },
+        // A call's exceptional continuation relays the callee's exception,
+        // which the call names as its `thrown` value, toward this procedure's
+        // own exceptional-return port (#8804).
+        SemanticEffect::CallContinuation {
+            call_site,
+            kind: CallContinuationKind::Exceptional,
+        } => {
+            relation.kind == ValueFlowRelationKind::ExceptionalReturn
+                && procedure
+                    .semantics()
+                    .call_site(*call_site)
+                    .and_then(|row| row.thrown)
+                    .is_some_and(|thrown| value_endpoint(&relation.source, thrown))
+                && port_endpoint(&relation.target, ProcedurePortKind::ExceptionalReturn)
+        }
         SemanticEffect::AsyncResume {
             suspend,
             kind: AsyncResumeKind::Normal,
@@ -952,6 +1031,7 @@ pub struct ValueFlowRelation {
     /// It does not establish complete capture execution or non-escape.
     pub direct_cell_overwrite: bool,
     // Independent original-row authority survives public payload/id mutation.
+    pub(crate) original_cell: Option<AbstractLocation>,
     memory_seal: Option<StableDigest>,
 }
 
@@ -964,6 +1044,9 @@ impl ValueFlowRelation {
         self.id.retained_artifacts(census);
         self.source.retained_artifacts(census);
         self.target.retained_artifacts(census);
+        if let Some(original) = &self.original_cell {
+            original.path().retained_artifacts(census);
+        }
     }
 
     /// Construct an unsealed row. This grants no memory-operation authority.
@@ -982,6 +1065,7 @@ impl ValueFlowRelation {
             completeness: payload.completeness,
             strong_update: payload.strong_update,
             direct_cell_overwrite: payload.direct_cell_overwrite,
+            original_cell: None,
             memory_seal: None,
         }
     }
@@ -1154,6 +1238,7 @@ impl ValueFlowRelation {
             // Allocation classes are independently seeded at the allocation
             // result, never inherited from the abstract object's contents.
             ValueFlowRelationKind::Allocation
+            | ValueFlowRelationKind::OwnershipUnknown
             | ValueFlowRelationKind::ContainerCollapse
             | ValueFlowRelationKind::LanguageDefined => false,
         }
@@ -1290,6 +1375,12 @@ impl MemberReceiverFlow {
         &self.storage
     }
 
+    /// The entries this flow keeps once it is part of a snapshot: one for each
+    /// storage endpoint and one for the field read, if any.
+    pub fn retained_entries(&self) -> usize {
+        self.storage.len() + usize::from(self.field_read.is_some())
+    }
+
     /// Selecting a value method from a pointer must first read its pointee,
     /// even when the selected body or summary never consumes the receiver.
     pub fn selection_is_complete(&self) -> bool {
@@ -1352,8 +1443,56 @@ pub struct MemberReceiverTransfer {
     pub completeness: EvidenceCompleteness,
 }
 
+/// A call on a closed local container whose complete collection-flow contract
+/// the projection bound to heap cells (#10989).
+///
+/// The container is created in this procedure and every use of it is a call
+/// the contract models, so the contract describes everything the call does
+/// to it. The summary's transfers into and out of the receiver, which
+/// collapse every key and element onto the container object, therefore do not
+/// apply at the call's normal continuation; `transfers` publish the
+/// contract's stores and loads on the container's per-key cells instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CollectionCellBinding {
+    call: crate::analyzer::semantic::CallSiteHandle,
+    transfers: Box<[CollectionCellTransfer]>,
+}
+
+/// One store into, or load from, a container cell, published at the bound
+/// call's normal continuation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CollectionCellTransfer {
+    pub point: ProgramPointHandle,
+    pub event_index: u32,
+    pub source: ValueFlowEndpoint,
+    pub target: ValueFlowEndpoint,
+}
+
+impl CollectionCellBinding {
+    #[doc(hidden)]
+    pub fn new(
+        call: crate::analyzer::semantic::CallSiteHandle,
+        transfers: Vec<CollectionCellTransfer>,
+    ) -> Self {
+        Self {
+            call,
+            transfers: transfers.into_boxed_slice(),
+        }
+    }
+
+    pub fn call(&self) -> &crate::analyzer::semantic::CallSiteHandle {
+        &self.call
+    }
+
+    pub fn transfers(&self) -> &[CollectionCellTransfer] {
+        &self.transfers
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueFlowSnapshot {
+    /// Query-time execution dependence; never persisted with partial flows.
+    execution_dependent: bool,
     procedure: ProcedureHandle,
     context: OracleCallContext,
     relations: Box<[ValueFlowRelation]>,
@@ -1378,7 +1517,14 @@ pub struct ValueFlowSnapshot {
     discharged_gaps: Box<[SemanticGapId]>,
     /// The workspace proof could not discharge a lowered Go builtin assumption.
     unproven_go_builtin_assumptions: bool,
+    /// A stored member of a returned join was not published at the return port
+    /// (#9766). The relation list is then missing a relation although the
+    /// coverage is Open, not Truncated: Open admits more candidates, while this
+    /// flag says a known one was left out.
+    untransported_return_member: bool,
     member_receivers: Box<[MemberReceiverFlow]>,
+    /// Calls whose collection contract replaced their summary (#10989).
+    collection_cells: Box<[CollectionCellBinding]>,
 }
 
 impl ValueFlowSnapshot {
@@ -1415,6 +1561,8 @@ impl ValueFlowSnapshot {
             limits,
             discharged_gaps,
             Vec::new(),
+            Vec::new(),
+            true,
         )
     }
 
@@ -1427,8 +1575,14 @@ impl ValueFlowSnapshot {
         limits: OracleLimits,
         discharged_gaps: Vec<SemanticGapId>,
         receivers: Vec<MemberReceiverFlow>,
+        collection_cells: Vec<CollectionCellBinding>,
+        execution_dependent: bool,
     ) -> Result<Self, OracleContractError> {
+        for binding in &collection_cells {
+            require_same_procedure(binding.call.procedure(), &procedure)?;
+        }
         let metadata = Self {
+            execution_dependent: execution_dependent || coverage == CandidateCoverage::Truncated,
             procedure: procedure.clone(),
             context: context.clone(),
             relations: Box::default(),
@@ -1438,7 +1592,9 @@ impl ValueFlowSnapshot {
                 .artifact()
                 .go_predeclared_builtin_assumptions()
                 .is_empty(),
+            untransported_return_member: false,
             member_receivers: Box::default(),
+            collection_cells: collection_cells.into_boxed_slice(),
         }
         .with_member_receivers(receivers, limits)?;
         let member_calls = metadata
@@ -1491,7 +1647,22 @@ impl ValueFlowSnapshot {
                     }
                     _ => false,
                 };
+            let collection_cell_transfer = relation.kind == ValueFlowRelationKind::LanguageDefined
+                && relation.transfer.is_none()
+                && matches!(event.effect, SemanticEffect::CallContinuation {
+                    call_site,
+                    kind: CallContinuationKind::Normal,
+                } if metadata.collection_cells.iter().any(|binding| {
+                    binding.call.id() == call_site
+                        && binding.transfers.iter().any(|transfer| {
+                            transfer.point == relation.point
+                                && transfer.event_index == relation.event_index
+                                && transfer.source == relation.source
+                                && transfer.target == relation.target
+                        })
+                }));
             if !(member_transfer
+                || collection_cell_transfer
                 || relation_matches_event(&procedure, relation, &event.effect, &mut chains))
                 || !relation.has_valid_memory_authority(&event.effect)
             {
@@ -1553,10 +1724,22 @@ impl ValueFlowSnapshot {
             context,
             relations: relations.into_boxed_slice(),
             coverage: metadata.coverage,
+            execution_dependent: metadata.execution_dependent,
             discharged_gaps: discharged_gaps.into_boxed_slice(),
             unproven_go_builtin_assumptions: metadata.unproven_go_builtin_assumptions,
+            untransported_return_member: metadata.untransported_return_member,
             member_receivers: metadata.member_receivers,
+            collection_cells: metadata.collection_cells,
         })
+    }
+
+    pub fn is_execution_dependent(&self) -> bool {
+        self.execution_dependent
+    }
+
+    /// Execution dependence joins monotonically after construction.
+    pub fn mark_execution_dependent(&mut self) {
+        self.execution_dependent = true;
     }
 
     /// Carry the workspace host's bounded package-declaration proof to the
@@ -1568,6 +1751,23 @@ impl ValueFlowSnapshot {
 
     pub fn has_unproven_go_builtin_assumptions(&self) -> bool {
         self.unproven_go_builtin_assumptions
+    }
+
+    /// Record that the projection left a stored member of a returned join out of
+    /// the relation list (#9766).
+    pub fn with_untransported_return_member(mut self, untransported: bool) -> Self {
+        self.untransported_return_member = untransported;
+        self
+    }
+
+    /// Whether the relation list may lack a relation: a capacity cap cut it
+    /// (Truncated coverage), or the projection left out a stored member of a
+    /// returned join (#9766). Open coverage alone does not say this; it admits
+    /// more candidates and still carries every relation the projection found.
+    /// A consumer that treats the relations as complete must ask this, not
+    /// match the coverage.
+    pub fn relations_may_be_missing(&self) -> bool {
+        self.coverage == CandidateCoverage::Truncated || self.untransported_return_member
     }
 
     pub fn with_member_receivers(
@@ -1604,6 +1804,13 @@ impl ValueFlowSnapshot {
         &self.member_receivers
     }
 
+    /// The calls whose collection contract this snapshot bound to container
+    /// cells (#10989). Their summaries' receiver transfers must not also apply
+    /// at the normal continuation.
+    pub fn collection_cells(&self) -> &[CollectionCellBinding] {
+        &self.collection_cells
+    }
+
     #[doc(hidden)]
     pub fn retained_artifacts(
         &self,
@@ -1613,6 +1820,13 @@ impl ValueFlowSnapshot {
         census.context(&self.context);
         for relation in self.relations() {
             relation.retained_artifacts(census);
+        }
+        for binding in &self.collection_cells {
+            census.procedure(binding.call.procedure());
+            for transfer in &binding.transfers {
+                transfer.source.retained_artifacts(census);
+                transfer.target.retained_artifacts(census);
+            }
         }
         for receiver in &self.member_receivers {
             census.procedure(receiver.call.procedure());

@@ -252,7 +252,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn field_written_then_read_keeps_the_entry_value_under_a_weak_store() {
+    fn field_written_then_read_kills_the_entry_value_through_a_formal() {
         let result = partial_flows(
             "pub struct Holder {\n    field: u32,\n}\n\npub fn rewrite(mut holder: Holder, value: u32) -> u32 {\n    holder.field = value;\n    holder.field\n}\n",
             "rewrite",
@@ -265,16 +265,16 @@ pub(crate) mod tests {
             }),
             "the stored value reaches the return through the load: {result:?}"
         );
-        // The file-local host answers "no strong update", so the store is a weak
-        // update and the caller's value of the field stays live past it. The entry
-        // seed for the loaded location is what carries it to the return.
+        // #9651: `holder` is never rebound and its field store is a direct
+        // cell, so the store overwrites the caller's value of the field and
+        // the entry value no longer reaches the load.
         assert!(
-            flows.iter().any(|(from, to)| {
+            !flows.iter().any(|(from, to)| {
                 matches!(from, PartialFlowPort::Heap { root, .. }
                 if **root == PartialFlowPort::Parameter { ordinal: 0 })
                     && **to == PartialFlowPort::NormalReturn
             }),
-            "a weak store keeps the entry value of the field live to the load: {result:?}"
+            "the formal's field store kills the entry value of the field: {result:?}"
         );
     }
 
@@ -331,7 +331,7 @@ pub(crate) mod tests {
         );
         assert_eq!(result.outcome, PartialFlowOutcome::Complete, "{result:?}");
         assert!(
-            result.open,
+            result.has_undischarged_gap(),
             "an unresolved call leaves the procedure open: {result:?}"
         );
         assert_eq!(
@@ -647,7 +647,7 @@ pub(crate) mod tests {
             stopped.partial.flows.is_empty() && stopped.flows.is_empty(),
             "{stopped:?}"
         );
-        assert!(stopped.partial.open && !stopped.partial.relations_complete);
+        assert!(stopped.partial.has_undischarged_gap() && !stopped.partial.relations_proven());
         let charge = child
             .charge_since(&before)
             .expect("the fork records its work");
@@ -688,7 +688,7 @@ pub(crate) mod tests {
             .iter()
             .position(|part| part.locator.declaration().last_segment_name() == Some("mixed"))
             .expect("mixed procedure");
-        assert!(!stored[index].relations_complete);
+        assert!(!stored[index].relations_proven());
 
         let (procedure, snapshot) = procedure_and_snapshot(source, "mixed");
         let cancellation = CancellationToken::default();
@@ -714,8 +714,8 @@ pub(crate) mod tests {
             &mut request,
         )
         .unwrap();
-        assert!(!recomputed.partial.relations_complete);
-        assert!(!filtered.partial.relations_complete);
+        assert!(!recomputed.partial.relations_proven());
+        assert!(!filtered.partial.relations_proven());
         // The two inline projects have distinct mount IDs in their field
         // locators. Compare the row shape and the coverage bit across them.
         assert_eq!(recomputed.partial.ports.len(), stored[index].ports.len());

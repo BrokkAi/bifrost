@@ -22,9 +22,31 @@ use brokk_bifrost_core::process::read_limited;
 
 use brokk_bifrost_core::process::run_bounded_process;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+/// The workspace inputs dependency discovery reads: the file listing and each manifest's bounded source.
+/// The live implementation reads the project exactly as before; the per-request fill (#9559) supplies a
+/// captured, validated set instead.
+pub(crate) trait DiscoveryInputs {
+    fn files(&self) -> std::io::Result<Arc<BTreeSet<ProjectFile>>>;
+    fn bounded_source(&self, file: &ProjectFile, max_bytes: usize) -> Option<String>;
+}
+
+pub(crate) struct LiveDiscoveryInputs<'a>(pub(crate) &'a dyn Project);
+
+impl DiscoveryInputs for LiveDiscoveryInputs<'_> {
+    fn files(&self) -> std::io::Result<Arc<BTreeSet<ProjectFile>>> {
+        self.0.all_files_shared()
+    }
+
+    fn bounded_source(&self, file: &ProjectFile, max_bytes: usize) -> Option<String> {
+        brokk_bifrost_analysis::analyzer::common::read_bounded_source(self.0, file, max_bytes)
+    }
+}
 
 const MAX_TOOL_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -88,6 +110,11 @@ pub(crate) struct DiscoveredJvmDependencies {
     /// different scopes keeps the widest one, because that is the scope the
     /// build actually resolves it in.
     pub(crate) declarations: HashMap<JvmMavenCoordinate, JvmDependencyDeclaration>,
+    /// Manifests discovery could not read in full: an unreadable, oversized or
+    /// undecodable file, a pom that does not parse, or a dependency whose
+    /// coordinate does not resolve. Their dependencies are missing from the
+    /// result, so a selection built from it is partial.
+    pub(crate) partial_manifests: Vec<ProjectFile>,
 }
 
 impl DiscoveredJvmDependencies {
@@ -145,28 +172,105 @@ fn widest_scope(left: DependencyScope, right: DependencyScope) -> DependencyScop
     }
 }
 
-pub(crate) fn discover_metadata(project: &dyn Project) -> DiscoveredJvmDependencies {
-    let Ok(files) = project.all_files() else {
+pub(crate) fn discover_metadata(inputs: &dyn DiscoveryInputs) -> DiscoveredJvmDependencies {
+    let Ok(files) = inputs.files() else {
         return DiscoveredJvmDependencies::default();
     };
-    let files: Vec<_> = files.into_iter().collect();
     let mut discovered = DiscoveredJvmDependencies::default();
-    for file in files {
-        if is_maven_pom(&file) {
-            discover_maven_pom(project, &file, &mut discovered);
-        } else if is_gradle_lockfile(&file) {
-            discover_gradle_lockfile(project, &file, &mut discovered);
+    for file in files.iter() {
+        if is_maven_pom(file) {
+            discover_maven_pom(inputs, file, &mut discovered);
+        } else if is_gradle_lockfile(file) {
+            discover_gradle_lockfile(inputs, file, &mut discovered);
         }
     }
     deduplicate_discovered(&mut discovered);
     discovered
 }
 
+/// Whether any Maven build file in the workspace configures the compiler with
+/// a platform override: `--patch-module` for any JDK module,
+/// `--upgrade-module-path`, `-Xbootclasspath/p` or `-Xbootclasspath/a`, or an
+/// endorsed-standards directory. Each can put jar classes into a `java.*`
+/// package outside the class-loader rule, so a missing patch jar could change
+/// what `java.nio.file.Files` means.
+///
+/// This reads the `maven-compiler-plugin` configuration of the POM as XML,
+/// where the plugin is declared in `build/plugins` or `build/pluginManagement`,
+/// in its own configuration or in an execution's. Gradle compile options are
+/// not read, and an argument built from a property that does not expand is not
+/// seen: the plan for modeling overrides in general is #10492.
+pub(crate) fn maven_platform_override_visible(inputs: &dyn DiscoveryInputs) -> bool {
+    let Ok(files) = inputs.files() else {
+        return false;
+    };
+    files.iter().filter(|file| is_maven_pom(file)).any(|file| {
+        inputs
+            .bounded_source(file, MAX_BUILD_METADATA_BYTES)
+            .and_then(|source| parse_xml(&source))
+            .filter(|node| node.name == "project")
+            .is_some_and(|project| pom_overrides_platform(&project))
+    })
+}
+
+fn pom_overrides_platform(project: &XmlNode) -> bool {
+    let build = project.child("build");
+    let plugin_lists = build.into_iter().flat_map(|build| {
+        [
+            build.child("plugins"),
+            build
+                .child("pluginManagement")
+                .and_then(|management| management.child("plugins")),
+        ]
+        .into_iter()
+        .flatten()
+    });
+    plugin_lists
+        .flat_map(|plugins| plugins.children_named("plugin"))
+        .filter(|plugin| plugin.child_text("artifactId") == Some("maven-compiler-plugin"))
+        .flat_map(|plugin| {
+            let executions = plugin
+                .child("executions")
+                .into_iter()
+                .flat_map(|executions| executions.children_named("execution"))
+                .filter_map(|execution| execution.child("configuration"));
+            plugin.child("configuration").into_iter().chain(executions)
+        })
+        .any(configuration_overrides_platform)
+}
+
+/// A compiler argument is a value, so substring tests on it are ordinary value
+/// matching once the structure has selected the element.
+fn configuration_overrides_platform(configuration: &XmlNode) -> bool {
+    const OVERRIDES: [&str; 6] = [
+        "--patch-module",
+        "--upgrade-module-path",
+        "-Xbootclasspath/p",
+        "-Xbootclasspath/a",
+        "-endorseddirs",
+        "-Djava.endorsed.dirs",
+    ];
+    let mut arguments = Vec::<&XmlNode>::new();
+    for container in ["compilerArgs", "compilerArguments"] {
+        arguments.extend(
+            configuration
+                .children_named(container)
+                .flat_map(|container| container.children.iter()),
+        );
+    }
+    arguments.extend(configuration.children_named("compilerArgument"));
+    arguments.iter().any(|argument| {
+        OVERRIDES
+            .iter()
+            .any(|flag| argument.text.contains(flag) || argument.name.contains(flag))
+    })
+}
+
 pub(crate) fn discover_build_tools(
-    project: &dyn Project,
+    inputs: &dyn DiscoveryInputs,
     config: &JvmDependencyDiscoveryConfig,
 ) -> DiscoveredJvmDependencies {
-    discover_build_tools_with_executor(project, config, &SystemDependencyCommandExecutor)
+    discover_build_tools_with_executor(inputs, config, &SystemDependencyCommandExecutor)
 }
 
 trait DependencyCommandExecutor {
@@ -268,20 +372,26 @@ fn run_dependency_process(
 }
 
 fn discover_build_tools_with_executor(
-    project: &dyn Project,
+    inputs: &dyn DiscoveryInputs,
     config: &JvmDependencyDiscoveryConfig,
     executor: &dyn DependencyCommandExecutor,
 ) -> DiscoveredJvmDependencies {
-    let Ok(files) = project.all_files() else {
+    let Ok(files) = inputs.files() else {
         return DiscoveredJvmDependencies::default();
     };
-    let files: Vec<_> = files.into_iter().collect();
+    let files: Vec<_> = files.iter().cloned().collect();
     let mut discovered = DiscoveredJvmDependencies::default();
     let maven_executable = config
         .maven_executable
         .clone()
         .unwrap_or_else(|| PathBuf::from("mvn"));
-    for root in maven_build_roots(project, &files) {
+    for root in maven_build_roots(inputs, &files) {
+        brokk_bifrost_analysis::analyzer::dependency_support::report_external_discovery_read(
+            brokk_bifrost_analysis::analyzer::semantic_model::ExternalDiscoveryRead::Unverifiable(
+                brokk_bifrost_analysis::analyzer::semantic_model::UnverifiableDiscoveryRead::ProcessOutput,
+            ),
+        );
+        brokk_bifrost_analysis::analyzer::dependency_support::refuse_external_discovery_reads();
         let Ok(report) = executor.maven_report(&root, &maven_executable, config) else {
             continue;
         };
@@ -293,6 +403,12 @@ fn discover_build_tools_with_executor(
         .clone()
         .unwrap_or_else(|| PathBuf::from("gradle"));
     for root in gradle_build_roots(&files) {
+        brokk_bifrost_analysis::analyzer::dependency_support::report_external_discovery_read(
+            brokk_bifrost_analysis::analyzer::semantic_model::ExternalDiscoveryRead::Unverifiable(
+                brokk_bifrost_analysis::analyzer::semantic_model::UnverifiableDiscoveryRead::ProcessOutput,
+            ),
+        );
+        brokk_bifrost_analysis::analyzer::dependency_support::refuse_external_discovery_reads();
         let Ok(report) = executor.gradle_report(&root, &gradle_executable, config) else {
             continue;
         };
@@ -350,23 +466,18 @@ pub(crate) fn is_jvm_dependency_input_path(path: &Path) -> bool {
 }
 
 fn discover_maven_pom(
-    project: &dyn Project,
+    inputs: &dyn DiscoveryInputs,
     file: &ProjectFile,
     discovered: &mut DiscoveredJvmDependencies,
 ) {
-    let Some(source) = brokk_bifrost_analysis::analyzer::common::read_bounded_source(
-        project,
-        file,
-        MAX_BUILD_METADATA_BYTES,
-    ) else {
+    let Some(project_node) = inputs
+        .bounded_source(file, MAX_BUILD_METADATA_BYTES)
+        .and_then(|source| parse_xml(&source))
+        .filter(|node| node.name == "project")
+    else {
+        discovered.partial_manifests.push(file.clone());
         return;
     };
-    let Some(project_node) = parse_xml(&source) else {
-        return;
-    };
-    if project_node.name != "project" {
-        return;
-    }
 
     let properties = maven_project_properties(&project_node);
     // The pom's own artifact is the topology target that declares everything
@@ -390,30 +501,20 @@ fn discover_maven_pom(
             continue;
         }
 
-        let Some(group_id) = dependency
-            .child_text("groupId")
-            .and_then(|value| expand_maven_value(value, &properties))
-        else {
+        // A version managed elsewhere (a parent or dependencyManagement) or a
+        // property that does not expand leaves this jar dependency unselected.
+        let resolved = ["groupId", "artifactId", "version"].map(|field| {
+            dependency
+                .child_text(field)
+                .and_then(|value| expand_maven_value(value, &properties))
+                .filter(|value| !value.trim().is_empty())
+        });
+        let [Some(group_id), Some(artifact_id), Some(version)] = resolved else {
+            if !discovered.partial_manifests.contains(file) {
+                discovered.partial_manifests.push(file.clone());
+            }
             continue;
         };
-        let Some(artifact_id) = dependency
-            .child_text("artifactId")
-            .and_then(|value| expand_maven_value(value, &properties))
-        else {
-            continue;
-        };
-        let Some(version) = dependency
-            .child_text("version")
-            .and_then(|value| expand_maven_value(value, &properties))
-        else {
-            continue;
-        };
-        if [group_id.as_str(), artifact_id.as_str(), version.as_str()]
-            .iter()
-            .any(|value| value.trim().is_empty())
-        {
-            continue;
-        }
         let coordinate = JvmMavenCoordinate::new(group_id, artifact_id, version);
         discovered.declare(
             coordinate.clone(),
@@ -425,18 +526,19 @@ fn discover_maven_pom(
 }
 
 fn discover_gradle_lockfile(
-    project: &dyn Project,
+    inputs: &dyn DiscoveryInputs,
     file: &ProjectFile,
     discovered: &mut DiscoveredJvmDependencies,
 ) {
-    let Some(source) = brokk_bifrost_analysis::analyzer::common::read_bounded_source(
-        project,
-        file,
-        MAX_BUILD_METADATA_BYTES,
-    ) else {
+    let Some(source) = inputs.bounded_source(file, MAX_BUILD_METADATA_BYTES) else {
+        discovered.partial_manifests.push(file.clone());
         return;
     };
-    for (coordinate, configurations) in parse_gradle_lockfile(&source) {
+    let (records, malformed) = parse_gradle_lockfile(&source);
+    if malformed {
+        discovered.partial_manifests.push(file.clone());
+    }
+    for (coordinate, configurations) in records {
         // A lockfile states the configurations the coordinate resolves in and
         // nothing about which project declared it, so the declaring entity
         // stays unnamed rather than guessed from the lockfile's directory.
@@ -454,32 +556,40 @@ fn discover_gradle_lockfile(
 /// The lockfile line is `group:artifact:version=configuration[,configuration]`,
 /// a format Gradle writes for machines; splitting it is reading a declared
 /// record, not parsing a program.
-fn parse_gradle_lockfile(source: &str) -> Vec<(JvmMavenCoordinate, String)> {
-    source
+/// The second value reports a record line that is not in that format, whose
+/// dependency is therefore missing from the result.
+fn parse_gradle_lockfile(source: &str) -> (Vec<(JvmMavenCoordinate, String)>, bool) {
+    let mut malformed = false;
+    let records = source
         .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with("empty=") {
                 return None;
             }
-            let (coordinate, configurations) = line.split_once('=')?;
-            let mut parts = coordinate.split(':');
-            let group_id = parts.next()?.trim();
-            let artifact_id = parts.next()?.trim();
-            let version = parts.next()?.trim();
-            if parts.next().is_some()
-                || group_id.is_empty()
-                || artifact_id.is_empty()
-                || version.is_empty()
-            {
-                return None;
-            }
-            Some((
-                JvmMavenCoordinate::new(group_id, artifact_id, version),
-                configurations.trim().to_owned(),
-            ))
+            let record = line
+                .split_once('=')
+                .and_then(|(coordinate, configurations)| {
+                    let mut parts = coordinate.split(':');
+                    let group_id = parts.next()?.trim();
+                    let artifact_id = parts.next()?.trim();
+                    let version = parts.next()?.trim();
+                    (parts.next().is_none()
+                        && !group_id.is_empty()
+                        && !artifact_id.is_empty()
+                        && !version.is_empty())
+                    .then(|| {
+                        (
+                            JvmMavenCoordinate::new(group_id, artifact_id, version),
+                            configurations.trim().to_owned(),
+                        )
+                    })
+                });
+            malformed |= record.is_none();
+            record
         })
-        .collect()
+        .collect();
+    (records, malformed)
 }
 
 /// The scope a set of locked Gradle configurations resolves to.
@@ -618,15 +728,11 @@ fn add_tool_records(records: Vec<ToolArtifactRecord>, discovered: &mut Discovere
     }
 }
 
-fn maven_build_roots(project: &dyn Project, files: &[ProjectFile]) -> Vec<PathBuf> {
+fn maven_build_roots(inputs: &dyn DiscoveryInputs, files: &[ProjectFile]) -> Vec<PathBuf> {
     let poms: Vec<_> = files.iter().filter(|file| is_maven_pom(file)).collect();
     let mut module_poms = HashSet::default();
     for pom in &poms {
-        let Some(source) = brokk_bifrost_analysis::analyzer::common::read_bounded_source(
-            project,
-            pom,
-            MAX_BUILD_METADATA_BYTES,
-        ) else {
+        let Some(source) = inputs.bounded_source(pom, MAX_BUILD_METADATA_BYTES) else {
             continue;
         };
         let Some(project_node) = parse_xml(&source) else {
@@ -705,6 +811,12 @@ pub(crate) fn is_maven_pom(file: &ProjectFile) -> bool {
         .is_some_and(|name| name == "pom.xml")
 }
 
+/// The workspace files metadata discovery reads, each through
+/// `DiscoveryInputs::bounded_source` with [`MAX_BUILD_METADATA_BYTES`].
+pub(crate) fn is_discovery_manifest(file: &ProjectFile) -> bool {
+    is_maven_pom(file) || is_gradle_lockfile(file)
+}
+
 fn is_gradle_lockfile(file: &ProjectFile) -> bool {
     let path = file.rel_path();
     if path
@@ -767,6 +879,7 @@ fn deduplicate_dependencies(dependencies: &mut JvmExternalDependencies) {
         artifact_paths: std::mem::take(&mut dependencies.artifact_paths),
         coordinates: std::mem::take(&mut dependencies.coordinates),
         declarations: HashMap::default(),
+        partial_manifests: Vec::new(),
     };
     deduplicate_discovered(&mut discovered);
     dependencies.artifact_paths = discovered.artifact_paths;
@@ -890,7 +1003,7 @@ mod tests {
             </project>
         "#;
         let project = project(&[("pom.xml", pom), ("src/App.java", "class App {}")]);
-        let discovered = discover_metadata(&project);
+        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
         assert_eq!(
             vec![JvmMavenCoordinate::new("org.example", "library", "2.3.4")],
             discovered.coordinates
@@ -903,7 +1016,7 @@ mod tests {
             "pom.xml",
             "<project><dependencies><dependency><groupId>org.example</groupId><artifactId>local</artifactId><version>1</version><scope>system</scope><systemPath>/outside/workspace.jar</systemPath></dependency></dependencies></project>",
         )]);
-        let discovered = discover_metadata(&project);
+        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
         assert!(discovered.coordinates.is_empty());
         assert!(discovered.artifact_paths.is_empty());
     }
@@ -921,13 +1034,23 @@ mod tests {
             ),
             ("src/App.java", "class App {}"),
         ]);
-        let discovered = discover_metadata(&project);
+        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
         assert_eq!(
             vec![
                 JvmMavenCoordinate::new("org.example", "alpha", "1.0"),
                 JvmMavenCoordinate::new("org.example", "beta", "2.0"),
             ],
             discovered.coordinates
+        );
+        // The malformed record's dependency is missing, so its lockfile is
+        // partial; comments and `empty=` lines are not records.
+        assert_eq!(
+            vec![Path::new("gradle/dependency-locks/runtime.lockfile")],
+            discovered
+                .partial_manifests
+                .iter()
+                .map(ProjectFile::rel_path)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -954,7 +1077,7 @@ mod tests {
             ),
             ("src/App.java", "class App {}"),
         ]);
-        let discovered = discover_metadata(&project);
+        let discovered = discover_metadata(&LiveDiscoveryInputs(&project));
 
         let declaration = |group: &str, name: &str, version: &str| {
             discovered
@@ -1096,7 +1219,8 @@ malformed
             ..JvmDependencyDiscoveryConfig::default()
         };
 
-        let discovered = discover_build_tools_with_executor(&project, &config, &executor);
+        let discovered =
+            discover_build_tools_with_executor(&LiveDiscoveryInputs(&project), &config, &executor);
         assert_eq!(
             vec![
                 JvmMavenCoordinate::new("org.example", "gradle", "2.0"),

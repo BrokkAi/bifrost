@@ -7,6 +7,20 @@
 //! https://docs.python.org/3.15/reference/datamodel.html.
 //! Site-installed conveniences and platform-only names are not language rules.
 
+/// Class decorators whose admitted stdlib identity preserves existing members.
+/// This says nothing about members the decorator may add.
+pub const MEMBER_PRESERVING_CLASS_DECORATORS: &[(&str, &str)] = &[
+    ("dataclasses", "dataclass"),
+    ("typing", "final"),
+    ("functools", "total_ordering"),
+    ("enum", "unique"),
+    ("typing", "runtime_checkable"),
+    ("unittest", "skip"),
+    ("unittest", "skipIf"),
+    ("unittest", "skipUnless"),
+    ("unittest", "expectedFailure"),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PythonVersion {
     pub major: u16,
@@ -57,13 +71,19 @@ pub struct Builtin {
     pub qualified_name: &'static str,
     pub kind: BuiltinKind,
     pub versions: VersionRange,
+    /// The allocator may return a proper subclass of this builtin.
+    pub allocator_may_return_subclass: bool,
 }
 macro_rules! builtin {
     ($name:ident, $kind:ident, $minor:literal) => {
+        builtin!($name, $kind, $minor, false)
+    };
+    ($name:ident, $kind:ident, $minor:literal, $subclass:literal) => {
         Builtin {
             name: stringify!($name),
             qualified_name: concat!("builtins.", stringify!($name)),
             kind: BuiltinKind::$kind,
+            allocator_may_return_subclass: $subclass,
             versions: VersionRange {
                 since: PythonVersion::new(3, $minor),
             },
@@ -76,7 +96,7 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!(AssertionError, Type, 0),
     builtin!(AttributeError, Type, 0),
     builtin!(BaseException, Type, 0),
-    builtin!(BaseExceptionGroup, Type, 11),
+    builtin!(BaseExceptionGroup, Type, 11, true),
     builtin!(BlockingIOError, Type, 3),
     builtin!(BrokenPipeError, Type, 3),
     builtin!(BufferError, Type, 0),
@@ -90,7 +110,7 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!(EOFError, Type, 0),
     builtin!(Ellipsis, Value, 0),
     builtin!(EncodingWarning, Type, 10),
-    builtin!(EnvironmentError, Type, 0),
+    builtin!(EnvironmentError, Type, 0, true),
     builtin!(Exception, Type, 0),
     builtin!(ExceptionGroup, Type, 11),
     builtin!(False, Value, 0),
@@ -99,7 +119,7 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!(FloatingPointError, Type, 0),
     builtin!(FutureWarning, Type, 0),
     builtin!(GeneratorExit, Type, 0),
-    builtin!(IOError, Type, 0),
+    builtin!(IOError, Type, 0, true),
     builtin!(ImportCycleError, Type, 15),
     builtin!(ImportError, Type, 0),
     builtin!(ImportWarning, Type, 0),
@@ -117,7 +137,7 @@ pub const BUILTINS: &[Builtin] = &[
     builtin!(NotADirectoryError, Type, 3),
     builtin!(NotImplemented, Value, 0),
     builtin!(NotImplementedError, Type, 0),
-    builtin!(OSError, Type, 0),
+    builtin!(OSError, Type, 0, true),
     builtin!(OverflowError, Type, 0),
     builtin!(PendingDeprecationWarning, Type, 0),
     builtin!(PermissionError, Type, 3),
@@ -306,4 +326,54 @@ pub fn has_fixed_value_class_surface(qualified_name: &str) -> bool {
             | "builtins.frozenset"
             | "builtins.object"
     )
+}
+
+/// None is a singleton with an immutable type. Attribute lookup inherits the
+/// object inventory and adds truth conversion; it cannot acquire new members.
+/// Sources: https://docs.python.org/3/reference/datamodel.html#none and
+/// https://github.com/python/cpython/blob/3.12/Objects/object.c (PyNone_Type).
+pub const NONE_TYPE_MEMBERS: &[ObjectMember] = &[member!("__bool__", 0)];
+
+pub fn none_type_member(name: &str, version: Option<PythonVersion>) -> Availability {
+    match NONE_TYPE_MEMBERS.iter().find(|row| row.name == name) {
+        Some(row) => row.versions.availability(version),
+        None => object_member(name, version),
+    }
+}
+
+#[cfg(test)]
+mod allocator_review_tests {
+    #[test]
+    fn builtin_allocator_result_bounds() {
+        for name in [
+            "BaseExceptionGroup",
+            "OSError",
+            "EnvironmentError",
+            "IOError",
+        ] {
+            assert!(
+                super::builtin(name).unwrap().allocator_may_return_subclass,
+                "{name}"
+            );
+        }
+        for name in [
+            "object",
+            "dict",
+            "list",
+            "set",
+            "tuple",
+            "str",
+            "int",
+            "float",
+            "bytes",
+            "bool",
+            "ExceptionGroup",
+            "FileNotFoundError",
+        ] {
+            assert!(
+                !super::builtin(name).unwrap().allocator_may_return_subclass,
+                "{name}"
+            );
+        }
+    }
 }

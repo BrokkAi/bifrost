@@ -1,25 +1,31 @@
-//! Bounded, source-exact admission of structurally small files with bulk data,
-//! and of files whose raw NUL bytes the grammar proves are payload.
+//! Source-exact admission of files whose over-long lines are data, and of
+//! files whose raw NUL bytes the grammar proves are payload.
 //!
-//! The structural-line bounds apply only to a default-overlong file whose
-//! language opts in. They are not an allocator reservation or a bound on all
-//! language extraction. The NUL proof applies to any NUL-bearing file whose
-//! language names its payload node kinds, within the same source-byte bound.
+//! A line over the default limit is admitted when, after the maximal data
+//! subtrees that intersect it (string, number and character literals and
+//! composites of them, by the language's [`LineDataKinds`]) are excluded, its
+//! remaining bytes fit the limit. Every language declares its tables, so the
+//! rule holds for all of them. Only the excluded data has its own bound; the
+//! rest of the tree gets exactly the limits an ordinary file gets. The NUL
+//! proof applies to any NUL-bearing file whose language names its payload
+//! node kinds, within a source-byte bound.
+//!
+//! [`LineDataKinds`]: brokk_bifrost_core::analyzer::tree_walk::LineDataKinds
 
 use super::tree_sitter_analyzer::LanguageAdapter;
 use crate::CancellationToken;
+use brokk_bifrost_core::analyzer::tree_walk::maximal_data_subtrees;
 use std::ops::ControlFlow;
 use std::time::Instant;
 use tree_sitter::Tree;
 
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
-const MAX_NODES: usize = 65_536;
-const MAX_DEPTH: usize = 128;
-const MAX_SPAN_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EXCLUDED_NODES: usize = 8192;
 const LINE_LIMIT: usize = brokk_bifrost_core::analyzer::common::DEFAULT_MAX_LINE_LENGTH;
 
-/// Version covers the finite envelope as well as the shared accounting rule.
+/// Version covers the bounds as well as the shared accounting rule. Version 2
+/// (#10694) admits data lines in every language and bounds only the excluded
+/// data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[doc(hidden)]
 pub struct SourceAdmissionPolicy {
@@ -36,12 +42,12 @@ impl SourceAdmissionPolicy {
     #[doc(hidden)]
     pub fn from_setting(setting: Option<&str>) -> Self {
         Self {
-            version: 1,
+            version: 2,
             explicit_line_limit: setting.and_then(|value| value.trim().parse().ok()),
         }
     }
 
-    /// Stable scalar identity of the effective rule, including its finite envelope.
+    /// Stable scalar identity of the effective rule, including its bounds.
     /// Default and explicit16000 differ even though their raw line caps match.
     pub(crate) fn hash_identity(&self, hasher: &mut super::canonical_hash::CanonicalHasher) {
         hasher.field("policy_version", &[self.version]);
@@ -68,10 +74,7 @@ impl SourceAdmissionPolicy {
         );
         for (name, limit) in [
             ("default_structural_line_bytes", LINE_LIMIT),
-            ("source_bytes", MAX_SOURCE_BYTES),
-            ("all_ast_nodes", MAX_NODES),
-            ("ast_depth", MAX_DEPTH),
-            ("ast_span_bytes", MAX_SPAN_BYTES),
+            ("nul_payload_source_bytes", MAX_SOURCE_BYTES),
             ("excluded_all_ast_nodes", MAX_EXCLUDED_NODES),
         ] {
             hasher.field(
@@ -114,17 +117,12 @@ impl SourceAdmissionPolicy {
         if longest <= limit {
             return Ok(proof);
         }
-        if self.explicit_line_limit.is_some() || !adapter.supports_structural_line_data() {
+        if self.explicit_line_limit.is_some() {
             return Err(SourceAdmissionRefusal::StructuralLine {
                 limit,
                 observed: longest,
             });
         }
-        check_limit(
-            AdmissionDimension::SourceBytes,
-            source.len(),
-            MAX_SOURCE_BYTES,
-        )?;
         Ok(RequiredProof {
             structural_lines: true,
             ..proof
@@ -204,7 +202,7 @@ pub(crate) fn validate_tree<A: LanguageAdapter + ?Sized>(
         validate_nul_payloads(adapter, source, tree, cancellation, deadline)?;
     }
     if proof.structural_lines {
-        validate_structural_envelope(adapter, source, tree, cancellation, deadline)?;
+        validate_lines(adapter, source, tree, cancellation, deadline)?;
     }
     Ok(())
 }
@@ -245,39 +243,6 @@ fn validate_nul_payloads<A: LanguageAdapter + ?Sized>(
     Ok(())
 }
 
-/// Cursor traversal retains no sibling frontier and counts anonymous nodes too.
-fn validate_structural_envelope<A: LanguageAdapter + ?Sized>(
-    adapter: &A,
-    source: &str,
-    tree: &Tree,
-    cancellation: Option<&CancellationToken>,
-    deadline: Instant,
-) -> Result<(), AdmissionStop> {
-    let mut cursor = tree.walk();
-    let mut depth = 1usize;
-    let mut nodes = 0usize;
-    let mut spans = 0usize;
-    loop {
-        stopped(cancellation, deadline)?;
-        let node = cursor.node();
-        nodes += 1;
-        spans = spans.saturating_add(node.end_byte() - node.start_byte());
-        check_limit(AdmissionDimension::Nodes, nodes, MAX_NODES)?;
-        check_limit(AdmissionDimension::Depth, depth, MAX_DEPTH)?;
-        check_limit(AdmissionDimension::SpanBytes, spans, MAX_SPAN_BYTES)?;
-        if cursor.goto_first_child() {
-            depth += 1;
-            continue;
-        }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                return validate_lines(adapter, source, tree, cancellation, deadline);
-            }
-            depth -= 1;
-        }
-    }
-}
-
 fn validate_lines<A: LanguageAdapter + ?Sized>(
     adapter: &A,
     source: &str,
@@ -299,102 +264,69 @@ fn validate_lines<A: LanguageAdapter + ?Sized>(
         }
         offset += line.len();
     }
-    let mut cursor = tree.walk();
-    let mut bad_ancestors = 0usize;
-    let mut ranges = Vec::new();
-    let mut excluded_nodes = 0usize;
-    loop {
-        stopped(cancellation, deadline)?;
-        let node = cursor.node();
-        let bad = node.is_error() || node.is_missing();
+    let mut should_stop =
+        || cancellation.is_some_and(CancellationToken::is_cancelled) || Instant::now() >= deadline;
+    let intersects_overlong = |node: tree_sitter::Node<'_>| {
         let first_line = overlong_lines.partition_point(|line| line.end <= node.start_byte());
-        let intersects_overlong = overlong_lines
+        overlong_lines
             .get(first_line)
-            .is_some_and(|line| line.start < node.end_byte());
-        let eligible = if intersects_overlong && bad_ancestors == 0 && !bad {
-            let mut should_stop = || {
-                cancellation.is_some_and(CancellationToken::is_cancelled)
-                    || Instant::now() >= deadline
-            };
-            match adapter.is_structural_line_data(node, &mut should_stop) {
-                ControlFlow::Continue(eligible) => eligible,
-                ControlFlow::Break(()) => {
-                    stopped(cancellation, deadline)?;
-                    unreachable!("language admission hook stops only on cancellation/deadline")
-                }
-            }
+            .is_some_and(|line| line.start < node.end_byte())
+    };
+    let subtrees = match maximal_data_subtrees(
+        tree.root_node(),
+        &adapter.line_data_kinds(),
+        intersects_overlong,
+        &mut should_stop,
+    ) {
+        ControlFlow::Continue(subtrees) => subtrees,
+        ControlFlow::Break(()) => {
+            stopped(cancellation, deadline)?;
+            unreachable!("data discovery stops only on cancellation or the deadline")
+        }
+    };
+    check_limit(
+        AdmissionDimension::ExcludedNodes,
+        subtrees.iter().map(|subtree| subtree.nodes).sum(),
+        MAX_EXCLUDED_NODES,
+    )?;
+    // The subtrees are in source order, maximal and disjoint.
+    let mut offset = 0usize;
+    let mut first_range = 0usize;
+    for line in source.split_inclusive('\n') {
+        stopped(cancellation, deadline)?;
+        // Match str::lines: omit LF and an optional preceding CR.
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        let text = if line.ends_with('\n') {
+            text.strip_suffix('\r').unwrap_or(text)
         } else {
-            false
+            text
         };
-        if eligible {
-            // A selected maximal subtree is not visited again by discovery.
-            let mut data = node.walk();
-            loop {
-                stopped(cancellation, deadline)?;
-                excluded_nodes += 1;
-                check_limit(
-                    AdmissionDimension::ExcludedNodes,
-                    excluded_nodes,
-                    MAX_EXCLUDED_NODES,
-                )?;
-                if data.goto_first_child() {
-                    continue;
-                }
-                while !data.goto_next_sibling() {
-                    if !data.goto_parent() {
-                        break;
-                    }
-                }
-                if data.node().id() == node.id() {
-                    break;
-                }
-            }
-            ranges.push(node.byte_range());
-        } else if cursor.goto_first_child() {
-            bad_ancestors += usize::from(bad);
-            continue;
+        let end = offset + text.len();
+        while first_range < subtrees.len() && subtrees[first_range].range.end <= offset {
+            first_range += 1;
         }
-        while !cursor.goto_next_sibling() {
-            if !cursor.goto_parent() {
-                // Discovery is preorder and skips selected subtrees: intervals
-                // are already ordered, maximal and disjoint.
-                let mut offset = 0usize;
-                let mut first_range = 0usize;
-                for line in source.split_inclusive('\n') {
-                    stopped(cancellation, deadline)?;
-                    // Match str::lines: omit LF and an optional preceding CR.
-                    let text = line.strip_suffix('\n').unwrap_or(line);
-                    let text = if line.ends_with('\n') {
-                        text.strip_suffix('\r').unwrap_or(text)
-                    } else {
-                        text
-                    };
-                    let end = offset + text.len();
-                    while first_range < ranges.len() && ranges[first_range].end <= offset {
-                        first_range += 1;
-                    }
-                    let mut excluded = 0usize;
-                    for range in &ranges[first_range..] {
-                        if range.start >= end {
-                            break;
-                        }
-                        excluded += range.end.min(end).saturating_sub(range.start.max(offset));
-                    }
-                    let structural = text.len() - excluded;
-                    if structural > LINE_LIMIT {
-                        return Err(SourceAdmissionRefusal::StructuralLine {
-                            limit: LINE_LIMIT,
-                            observed: structural,
-                        }
-                        .into());
-                    }
-                    offset += line.len();
-                }
-                return Ok(());
+        let mut excluded = 0usize;
+        for subtree in &subtrees[first_range..] {
+            if subtree.range.start >= end {
+                break;
             }
-            bad_ancestors -= usize::from(cursor.node().is_error() || cursor.node().is_missing());
+            excluded += subtree
+                .range
+                .end
+                .min(end)
+                .saturating_sub(subtree.range.start.max(offset));
         }
+        let structural = text.len() - excluded;
+        if structural > LINE_LIMIT {
+            return Err(SourceAdmissionRefusal::StructuralLine {
+                limit: LINE_LIMIT,
+                observed: structural,
+            }
+            .into());
+        }
+        offset += line.len();
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -421,15 +353,12 @@ mod tests {
         fn query_directory(&self) -> &'static str {
             "python"
         }
-        fn supports_structural_line_data(&self) -> bool {
-            true
-        }
-        fn is_structural_line_data(
-            &self,
-            _node: tree_sitter::Node<'_>,
-            _should_stop: &mut dyn FnMut() -> bool,
-        ) -> std::ops::ControlFlow<(), bool> {
-            std::ops::ControlFlow::Continue(true)
+        fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+                literals: &["integer"],
+                interpolations: &[],
+                composites: &[("tuple", &["(", ")", ","])],
+            }
         }
         fn file_extension(&self) -> &'static str {
             "py"
@@ -445,43 +374,6 @@ mod tests {
         ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
             unimplemented!()
         }
-    }
-
-    #[test]
-    fn tree_budget_counts_each_ast_node_once() {
-        let source = "x = 1\n".repeat(9_000);
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_python::LANGUAGE.into())
-            .unwrap();
-        let tree = parser.parse(&source, None).unwrap();
-        let mut cursor = tree.walk();
-        let mut count = 0usize;
-        loop {
-            count += 1;
-            if cursor.goto_first_child() {
-                continue;
-            }
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() {
-                    break;
-                }
-            }
-            if cursor.node().id() == tree.root_node().id() {
-                break;
-            }
-        }
-        assert!(count > MAX_NODES / 2 && count < MAX_NODES, "{count}");
-        assert!(
-            validate_structural_envelope(
-                &PythonAdapter,
-                &source,
-                &tree,
-                None,
-                Instant::now() + std::time::Duration::from_secs(30)
-            )
-            .is_ok()
-        );
     }
 
     #[test]

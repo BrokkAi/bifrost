@@ -17,6 +17,276 @@ use brokk_bifrost_test_macros::hardwon;
 use semver::Version;
 
 #[test]
+#[hardwon(
+    "73e64410abdd: successful set retry retained the discarded attempt's reached depth status"
+)]
+fn set_retry_replaces_discarded_depth_status() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for file in 0..3 {
+        let source = (0..8)
+            .map(|item| format!("pub fn f{file}_{item}() {{}}\n"))
+            .collect::<String>();
+        ProjectFile::new(root.clone(), format!("part{file}.rs"))
+            .write(&source)
+            .unwrap();
+    }
+    ProjectFile::new(root.clone(), "lib.rs")
+        .write("mod part0; mod part1; mod part2; mod part3; fn root() { part3::middle(); }\n")
+        .unwrap();
+    ProjectFile::new(root.clone(), "part3.rs")
+        .write("pub fn middle() { leaf(); }\npub fn leaf() {}\n")
+        .unwrap();
+    ProjectFile::new(root.clone(), "tiny.py")
+        .write("def tiny(): pass\n")
+        .unwrap();
+    let analyzer = two_language_analyzer(&root);
+    let bounded = "(callees :depth 1 (enclosing-decl (language rust (function))))";
+    let query = CodeQuery::from_sexp(bounded).unwrap();
+    let full = scan_only_run(&analyzer, &query, CodeQueryExecutionLimits::default());
+    assert!(!full.result.truncated, "{full:?}");
+    assert_eq!(
+        full.result.depth_bound_status,
+        Some(DepthBoundStatus::NotReached)
+    );
+    let second = CodeQuery::from_sexp("(enclosing-decl (language python (function)))").unwrap();
+    let second_full = scan_only_run(&analyzer, &second, CodeQueryExecutionLimits::default());
+    let union = CodeQuery::from_sexp(&format!(
+        "(union {bounded} (enclosing-decl (language python (function))))"
+    ))
+    .unwrap();
+    // The first grant is below the complete Rust scan cost, but the total
+    // leaves room to retry after the small Python branch returns its share.
+    let scan_limit = usize::try_from(full.work.fact_nodes + second_full.work.fact_nodes)
+        .unwrap()
+        .saturating_mul(3)
+        .div_ceil(2);
+    assert!(scan_limit.div_ceil(2) < usize::try_from(full.work.fact_nodes).unwrap());
+    let limited = scan_only_run(
+        &analyzer,
+        &union,
+        CodeQueryExecutionLimits {
+            max_fact_nodes: scan_limit,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(!limited.result.truncated, "{limited:?}");
+    assert_eq!(
+        limited.result.depth_bound_status,
+        full.result.depth_bound_status
+    );
+    let mut expected = result_identities(&full.result);
+    expected.extend(result_identities(&second_full.result));
+    expected.sort_by_key(ToString::to_string);
+    assert_eq!(result_identities(&limited.result), expected);
+}
+
+#[test]
+fn call_depth_status_uses_minimal_set_depth_without_changing_bounded_rows() {
+    use sha2::Digest as _;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn root() { left(); right(); }\nfn left() { right(); }\nfn right() { leaf(); }\nfn leaf() {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
+    // The bounded BFS row path is unchanged from master; only the post-traversal
+    // status probe is new. Freeze full serialized rows, including provenance.
+    let mut prior_query_key_material = None;
+    for (depth, expected_count, expected_status, expected_row_sha256) in [
+        (
+            1,
+            2,
+            DepthBoundStatus::Reached,
+            "624e1062857e4cc2b2f4a79f06196d3acb6943e7b95b6a403c87e13a9003e3bd",
+        ),
+        (
+            2,
+            3,
+            DepthBoundStatus::NotReached,
+            "91b9ff93c08ea5beb923a9de933187242c3c9e0574ccf7f226802e6e3c944b1f",
+        ),
+        (
+            3,
+            3,
+            DepthBoundStatus::NotReached,
+            "8388a4a97da63cd24908b8410ab2da32c6785c491e6282ba5b148fcd16c2b7a1",
+        ),
+    ] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(callees :depth {depth} (enclosing-decl (language rust (function (name \"root\")))))"
+        ))
+        .expect("bounded call query");
+        let key_material = query.to_canonical_query_plan_json();
+        if let Some(prior) = prior_query_key_material.replace(key_material) {
+            assert_ne!(
+                prior,
+                query.to_canonical_query_plan_json(),
+                "depth must enter prefix identity"
+            );
+        }
+        let result = execute_workspace(&workspace, &flow, &query);
+        let row_bytes = serde_json::to_vec(&result.results).expect("bounded rows serialize");
+        assert_eq!(
+            brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+                &sha2::Sha256::digest(&row_bytes).into(),
+            ),
+            expected_row_sha256,
+            "bounded row bytes at depth {depth} changed"
+        );
+        assert_eq!(
+            result.results.len(),
+            expected_count,
+            "depth {depth}: {result:#?}"
+        );
+        assert_eq!(result.depth_bound_status, Some(expected_status));
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["depth_bound_status"],
+            serde_json::to_value(expected_status).unwrap()
+        );
+        assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+    }
+}
+
+#[test]
+fn call_depth_status_ignores_edge_back_to_seed() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn root() { child(); }\nfn child() { root(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(callees :depth 1 (enclosing-decl (language rust (function (name \"root\")))))",
+    )
+    .expect("bounded call query");
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1);
+    assert_eq!(
+        result.depth_bound_status,
+        Some(DepthBoundStatus::NotReached)
+    );
+    assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+}
+
+#[test]
+fn call_depth_status_uses_all_seed_roots_as_one_bounded_set() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn root() { child(); }\nfn child() { leaf(); }\nfn leaf() {}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_sexp("(callees :depth 1 (enclosing-decl (language rust (function))))")
+            .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+    assert_eq!(
+        result.depth_bound_status,
+        Some(DepthBoundStatus::NotReached)
+    );
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon(
+    "73424603f285: an exact skipped intersect bound falsely made empty answers unknown"
+)]
+fn exact_short_circuit_does_not_reach_skipped_bound() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "fn root() { child(); }\nfn child() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(intersect (enclosing-decl (language rust (function (name \"missing\")))) (callees :depth 1 (enclosing-decl (language rust (function (name \"root\"))))))",
+    )
+    .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty());
+    assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+    assert_eq!(
+        result.depth_bound_status,
+        Some(DepthBoundStatus::NotReached)
+    );
+}
+
+#[test]
+fn empty_bounded_call_query_still_reports_not_reached() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "fn present() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(callers :depth 1 (enclosing-decl (language rust (function (name \"missing\")))))",
+    )
+    .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty());
+    assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+    assert_eq!(
+        result.depth_bound_status,
+        Some(DepthBoundStatus::NotReached)
+    );
+}
+
+#[test]
+fn call_depth_budget_stop_keeps_real_query_incompleteness() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "fn root() { child(); }\nfn child() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(callees :depth 1 (enclosing-decl (language rust (function (name \"root\")))))",
+    )
+    .unwrap();
+    for max_pipeline_rows in 1..=3 {
+        let result = execute_workspace_with_limits(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+            CodeQueryExecutionLimits {
+                max_pipeline_rows,
+                ..CodeQueryExecutionLimits::default()
+            },
+        );
+        if max_pipeline_rows < 3 {
+            assert!(matches!(
+                result.completion(),
+                CodeQueryCompletion::Incomplete { codes }
+                    if codes.contains(&CodeQueryDiagnosticCode::PipelineBudgetExhausted)
+            ));
+            assert_eq!(result.depth_bound_status, Some(DepthBoundStatus::Unknown));
+        } else {
+            assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+            assert_eq!(
+                result.depth_bound_status,
+                Some(DepthBoundStatus::NotReached)
+            );
+        }
+    }
+}
+
+#[test]
 #[brokk_bifrost_test_macros::hardwon(
     "#5113: procedure inventory references attributed class-body calls to the initializer"
 )]
@@ -298,16 +568,15 @@ fn go_function_value_proof_distinguishes_unsupported_content_from_cancellation()
         Some(&cancellation),
         CodeQuerySemanticLimits::default(),
     );
-    let (obligation, cause) = capture_read_execution_cause(workspace.analyzer(), || {
-        brokk_bifrost_go_analysis::analyzer::go_native_error_function_value_obligation(
+    let (obligations, cause) = capture_read_execution_cause(workspace.analyzer(), || {
+        brokk_bifrost_go_analysis::analyzer::go_native_error_function_value_obligations(
             workspace.analyzer(),
             &file,
             range,
-            0,
             semantic.cancellation(),
         )
     });
-    assert!(obligation.is_none());
+    assert!(obligations.is_none());
     assert_eq!(cause, Some(DerivationExecutionCause::Cancelled));
 }
 
@@ -788,6 +1057,783 @@ fn python_binding_uses_joins_local_and_loop_bindings() {
 }
 
 #[test]
+fn rust_binding_access_keeps_macro_and_format_capture_evidence() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/format.rs",
+            "fn f() { let x = 1; println!(\"{x}\"); println!(\"{x:?}\"); }\n",
+        )
+        .file(
+            "src/macro.rs",
+            "fn f() { let x = 1; macro_rules! m { () => { x } } m!(); }\n",
+        )
+        .file("src/proc.rs", "fn f() { let x = 1; paste!(); }\n")
+        .file("src/todo.rs", "fn f(x: i32) { todo!() }\n")
+        .file("src/comment.rs", "fn f(x: i32) { todo /* note */ !() }\n")
+        .file(
+            "src/unimplemented.rs",
+            "fn f(x: i32) { unimplemented!() }\n",
+        )
+        .file(
+            "src/attribute.rs",
+            "#[unknown_attribute] fn f() { let x = 1; }\n",
+        )
+        .file(
+            "src/method.rs",
+            "struct S; impl S { #[unknown_attribute] fn f(&self, x: i32) {} }\n",
+        )
+        .file(
+            "src/enclosing_attribute.rs",
+            "#[unknown_attribute] mod m { fn f(x: i32) {} }\n",
+        )
+        .file(
+            "src/resolved_macro.rs",
+            "macro_rules! use_x { () => { () } } fn f() { let x = 1; use_x!(); }\n",
+        )
+        .file(
+            "src/nested_closure.rs",
+            "macro_rules! use_x { () => { () } } fn f() { let x = 1; let c = || use_x!(); c(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(binding-uses (bindings :name \"x\"))").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let use_paths: Vec<_> = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value } => Some(value.path.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        use_paths
+            .iter()
+            .filter(|&&path| path == "src/format.rs")
+            .count(),
+        2,
+        "{}",
+        result.render_text()
+    );
+    assert_eq!(
+        use_paths
+            .iter()
+            .filter(|&&path| path == "src/macro.rs")
+            .count(),
+        1,
+        "{}",
+        result.render_text()
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{}",
+        result.render_text()
+    );
+    for path in [
+        "src/proc.rs",
+        "src/attribute.rs",
+        "src/todo.rs",
+        "src/comment.rs",
+        "src/unimplemented.rs",
+        "src/method.rs",
+        "src/enclosing_attribute.rs",
+        "src/resolved_macro.rs",
+        "src/nested_closure.rs",
+    ] {
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(path)),
+            "{path}: {}",
+            result.render_text()
+        );
+    }
+}
+
+#[test]
+#[hardwon("#10389: a macro in a const initializer keeps non-callable binding access open")]
+fn rust_const_initializer_macro_keeps_binding_access_open() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "macro_rules! hidden { () => { x } } const C: i32 = { let x = 1; hidden!(); 0 };\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(
+        "(except (bindings :kind local :name \"x\") (binding-of (binding-uses (bindings :kind local :name \"x\"))))",
+    )
+    .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{}",
+        result.render_text()
+    );
+    assert!(result.results.is_empty(), "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#10389: ordinary test-module super glob keeps unused local decidable")]
+fn rust_builtin_test_attribute_with_local_super_glob_keeps_unused_binding() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "mod tests { use super::*; #[test] fn t() { let unused = 1; } }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(except (bindings :kind local :name \"unused\") (binding-of (binding-uses (bindings :kind local :name \"unused\"))))").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#10389: let-else constant head is a reference, while a bare name binds")]
+fn rust_let_else_constant_pattern_has_no_binding() {
+    let source = "const MAX: i32 = 1; fn f(v: Option<i32>) { let Some(MAX) = v else { return }; let _ = MAX; let Some(x) = v else { return }; let _ = x; }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for kind in ["local", "pattern_binder"] {
+        let query =
+            CodeQuery::from_source(&format!("(bindings :kind {kind} :name \"MAX\")")).unwrap();
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(result.results.is_empty(), "{}", result.render_text());
+    }
+    let query = CodeQuery::from_source("(bindings :name \"x\")").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+    let query = CodeQuery::from_source("(occurrences :role pattern_position)").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.iter().any(|item| matches!(&item.value, CodeQueryResultValue::Occurrence { value } if value.start_byte == source.find("let Some(MAX)").unwrap() + 9)), "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#10389: an unknown pattern binder cannot affect a disjoint callable")]
+fn rust_unknown_pattern_binding_interval_is_local() {
+    let prefix = "use external::*;\nstruct P { y: i32 }\n";
+    let suffix = "\nfn g() -> i32 {\n let mut y: i32;\n { let mut y: i32; y = 1; return y; }\n}\n";
+    let query = CodeQuery::from_source("(except (language rust (bindings :kind local :name \"y\")) (binding-of (binding-uses (language rust (bindings :kind local :name \"y\")))))").unwrap();
+    for pattern in ["fn f(p: P) { match p { P { y } => {} } }", "fn f(_p: P) {}"] {
+        let source = format!("{prefix}{pattern}{suffix}");
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/main.rs", &source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            result.results.len(),
+            1,
+            "{pattern}: {}",
+            result.render_text()
+        );
+        let CodeQueryResultValue::Binding { value } = &result.results[0].value else {
+            panic!("expected binding: {}", result.render_text());
+        };
+        assert_eq!(value.start_byte, source.find("let mut y").unwrap() + 8);
+    }
+}
+
+#[test]
+#[hardwon("#10389: an unknown pattern binder keeps references inside its arm open")]
+fn rust_unknown_pattern_binding_interval_keeps_overlapping_reference_open() {
+    let source = "use external::*;\nstruct P { y: i32 }\nfn f(p: P) { match p { P { y } => { let _ = y; } } }\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(
+        "(binding-of (language rust (occurrences :class reference :role value_reference)))",
+    )
+    .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        !result.results.iter().any(|item| {
+            matches!(&item.value, CodeQueryResultValue::Binding { value } if value.name == "y")
+        }),
+        "{}",
+        result.render_text()
+    );
+    assert!(!result.diagnostics.is_empty(), "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#10389: an ambiguous if-let binder token cannot resolve to an imported item")]
+fn rust_ambiguous_if_let_binder_token_is_open() {
+    let source = "use dep::Foo; fn f(value: i32) { let before = Foo; if let Foo = value { let later = Foo; } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let token = execute_workspace(
+        &workspace,
+        &flow,
+        &CodeQuery::from_source(
+            "(binding-of (language rust (occurrences :role pattern_position)))",
+        )
+        .unwrap(),
+    );
+    assert!(token.results.is_empty(), "{}", token.render_text());
+    assert_ne!(token.completion(), CodeQueryCompletion::Complete);
+    let uses = execute_workspace(
+        &workspace,
+        &flow,
+        &CodeQuery::from_source(
+            "(binding-uses (language rust (bindings :kind import_binder :name \"Foo\")))",
+        )
+        .unwrap(),
+    );
+    let positions: Vec<_> = uses
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value } => value.start_byte,
+            other => panic!("expected occurrence, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(positions, [source.find("before = Foo").unwrap() + 9]);
+    assert_ne!(uses.completion(), CodeQueryCompletion::Complete);
+}
+
+#[test]
+#[hardwon("#10389: macro operand patterns cannot invent a binding for an imported value")]
+fn rust_macro_operand_pattern_binding_stays_open() {
+    let source = "use m::C; mod m { pub const C: i32 = 1; } fn f(v: i32) { let s = format!(\"{}\", { let x = 1; let _ = match v { C => 1, _ => 0 }; x }); let _ = s; }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for query_source in [
+        "(bindings :kind local :name \"C\")",
+        "(except (bindings :kind import_binder :name \"C\") (binding-of (binding-uses (bindings :kind import_binder :name \"C\"))))",
+    ] {
+        let query = CodeQuery::from_source(query_source).unwrap();
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(
+            result.results.is_empty(),
+            "{query_source}: {}",
+            result.render_text()
+        );
+    }
+    let query = CodeQuery::from_source("(bindings :kind local :name \"x\")").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#10389: Rust macro scope is scanned once per request")]
+fn rust_macro_scope_presence_is_request_local_and_memoized() {
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn f() { let a = 1; let b = 2; hidden!(); }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let provider = workspace
+        .analyzer()
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == Language::Rust)
+        .unwrap();
+    let file = ProjectFile::new(project.root().to_path_buf(), "src/lib.rs");
+    let facts = provider.structural_facts(&file).unwrap();
+    let callable = facts
+        .nodes()
+        .iter()
+        .position(|node| node.kind == NormalizedKind::Function)
+        .unwrap() as u32;
+    let mut cache = OccurrenceTraversalCache::default();
+    for _ in 0..128 {
+        assert_eq!(
+            cache.rust_scope_has_macro(&file, &facts, Some(callable), None),
+            Some(true)
+        );
+    }
+    assert_eq!(cache.rust_macro_scope_scans, 1);
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon("#10389: inert Rust attributes do not open binding access")]
+fn rust_binding_access_distinguishes_inert_and_rewriting_attributes() {
+    for (source, complete) in [
+        ("#[test] fn f() { let x = 1; }\n", true),
+        (
+            "use custom_macros::test; #[test] fn f() { let x = 1; }\n",
+            false,
+        ),
+        (
+            "use custom_macros::*; #[test] fn f() { let x = 1; }\n",
+            false,
+        ),
+        (
+            "macro_rules! test { () => {} } #[test] fn f() { let x = 1; }\n",
+            false,
+        ),
+        ("#[cfg(test)] mod m { fn f() { let x = 1; } }\n", true),
+        (
+            "#[cfg_attr(test, allow(dead_code))] fn f() { let x = 1; }\n",
+            true,
+        ),
+        (
+            "#[cfg_attr(all(), allow(unused),)] fn f() { let x = 1; }\n",
+            true,
+        ),
+        (
+            "#[cfg_attr(all(), cfg_attr(any(), allow(unused),),)] fn f() { let x = 1; }\n",
+            true,
+        ),
+        (
+            "#[cfg_attr(all(), /* comment */ allow(unused),)] fn f() { let x = 1; }\n",
+            true,
+        ),
+        ("#[unknown_attribute] fn f() { let x = 1; }\n", false),
+        (
+            "#[cfg_attr(test, some_proc_macro)] fn f() { let x = 1; }\n",
+            false,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/main.rs", source)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let query = CodeQuery::from_source(
+            "(except (bindings :kind local :name \"x\") (binding-of (binding-uses (bindings :kind local :name \"x\"))))",
+        )
+        .unwrap();
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{source}: {}",
+            result.render_text()
+        );
+        if complete {
+            assert_eq!(
+                result.results.len(),
+                1,
+                "{source}: {}",
+                result.render_text()
+            );
+        }
+    }
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon("#10389: reference parameters keep binding-of complete")]
+fn rust_reference_parameter_binding_of_remains_complete() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/main.rs",
+            "fn f(&x: &i32, &(a, b): &(i32, i32)) { let _ = (x, a, b); }\nfn g() { let closure = |&y: &i32| y; let _ = closure; }\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(
+        "(binding-of (binding-uses (bindings :kind parameter :name [x a b y])))",
+    )
+    .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{}",
+        result.render_text()
+    );
+    assert_eq!(result.results.len(), 4, "{}", result.render_text());
+}
+
+#[test]
+fn non_rust_binding_access_keeps_conservative_unresolved_scope() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "def f():\n    x = 1\n    missing()\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(binding-uses (bindings :name \"x\"))").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty(), "{}", result.render_text());
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+fn rust_shorthand_and_bare_arm_bindings_have_source_exact_rows() {
+    let source =
+        "struct Point { y: i32 } fn f(point: Point) { match point { Point { y } => (), p => () } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(bindings :name [point y p])").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let rows: Vec<_> = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Binding { value } => Some((
+                value.name.as_str(),
+                value.kind,
+                value.immediate_parent_kind.as_deref(),
+                value.start_byte,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                "point",
+                "parameter",
+                Some("parameter"),
+                source.find("point: Point").unwrap()
+            ),
+            (
+                "y",
+                "pattern_binder",
+                Some("field_pattern"),
+                source.find("{ y }").unwrap() + 2
+            ),
+            (
+                "p",
+                "pattern_binder",
+                Some("match_pattern"),
+                source.find("p =>").unwrap()
+            ),
+        ],
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+fn rust_bare_match_arm_names_respect_value_items_and_open_imports() {
+    let source = "use other::Foo; const C: i32 = 1; struct U; fn f(x: i32) { match x { None => (), Option::None => (), E::V => (), C => (), U => (), Foo => (), p => (), _ => () } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(bindings :kind pattern_binder :name [None V C U Foo p])").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let names: Vec<_> = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Binding { value } => Some(value.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["p"], "{}", result.render_text());
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+fn rust_glob_imported_constant_pattern_stays_open() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "mod other; fn C() {} fn f(n: i32) { use other::*; match n { C => (), _ => () } }",
+        )
+        .file("src/other.rs", "pub const C: i32 = 1;")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(bindings :kind pattern_binder :name \"C\")").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty(), "{}", result.render_text());
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+#[hardwon("#10389: raw Rust pattern spellings share lexical item and import names")]
+fn rust_raw_pattern_names_resolve_const_import_and_keyword_binder() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "const C: i32 = 1; mod m { pub const Foo: i32 = 2; } use m::r#Foo; fn f(x: i32) { match x { r#C => (), Foo => (), r#type => (), _ => () } }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    for name in ["C", "Foo"] {
+        let query =
+            CodeQuery::from_source(&format!("(bindings :kind pattern_binder :name \"{name}\")"))
+                .unwrap();
+        let result = execute_workspace(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        );
+        assert!(
+            result.results.is_empty(),
+            "{name}: {}",
+            result.render_text()
+        );
+    }
+    let query = CodeQuery::from_source("(bindings :kind pattern_binder :name \"type\")").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#10389: pattern-position reference prevents a false unused Rust import")]
+fn rust_pattern_reference_is_counted_as_import_access() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "mod m { pub const C: i32 = 1; } use m::C; fn f(value: Option<i32>) { match value { Some(C) => (), _ => () } }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(except (bindings :kind import_binder :name \"C\") (binding-of (binding-uses (bindings :kind import_binder :name \"C\"))))").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty(), "{}", result.render_text());
+    assert!(
+        matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+#[hardwon("#10389: single glob-ambiguous binder reports neutral identity cause")]
+fn rust_single_glob_binder_diagnostic_does_not_claim_disagreeing_alternatives() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "mod m { pub const C: i32 = 1; } use m::*; fn f(x: i32) { match x { C => (), _ => () } }\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(bindings :kind pattern_binder :name \"C\")").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(
+        result.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("a binder identity could not be proven")),
+        "{}",
+        result.render_text()
+    );
+}
+
+#[test]
+fn rust_warm_import_edit_reuses_binder_syntax_and_binder_edit_is_file_local() {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    let body = "mod items; use items::Foo; fn f(x: i32) { match x { Foo => (), p => () } }\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", body)
+        .file("src/items.rs", "pub fn Foo() {}\n")
+        .build();
+    let binder_file = project.file("src/lib.rs");
+    let imported_file = project.file("src/items.rs");
+    let query = CodeQuery::from_source("(bindings :kind pattern_binder :name [Foo p q])").unwrap();
+    let run = |workspace: &crate::analyzer::WorkspaceAnalyzer| {
+        execute_workspace(
+            workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &query,
+        )
+    };
+    let facts = |workspace: &crate::analyzer::WorkspaceAnalyzer, file| {
+        workspace
+            .analyzer()
+            .structural_fact_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::Rust)
+            .unwrap()
+            .structural_facts(file)
+            .unwrap()
+    };
+    let binding_names = |result: &CodeQueryResult| {
+        result
+            .results
+            .iter()
+            .filter_map(|item| match &item.value {
+                CodeQueryResultValue::Binding { value } => Some(value.name.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let cold = project.workspace_analyzer(AnalyzerConfig::default());
+    let before = run(&cold);
+    assert_eq!(binding_names(&before), ["p"], "{}", before.render_text());
+    let binder_facts = facts(&cold, &binder_file);
+    let imported_facts = facts(&cold, &imported_file);
+
+    imported_file.write("pub const Foo: i32 = 1;\n").unwrap();
+    let imported_edit = cold.update(&BTreeSet::from([imported_file.clone()]));
+    assert!(Arc::ptr_eq(
+        &binder_facts,
+        &facts(&imported_edit, &binder_file)
+    ));
+    assert!(!Arc::ptr_eq(
+        &imported_facts,
+        &facts(&imported_edit, &imported_file)
+    ));
+    let after_import = run(&imported_edit);
+    assert_eq!(
+        binding_names(&after_import),
+        ["p"],
+        "{}",
+        after_import.render_text()
+    );
+    assert!(matches!(
+        after_import.completion(),
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+
+    binder_file
+        .write(
+            "mod items; use items::Foo; fn f(x: i32) { match x { Foo => (), p => (), q => () } }\n",
+        )
+        .unwrap();
+    let binder_edit = imported_edit.update(&BTreeSet::from([binder_file.clone()]));
+    assert!(Arc::ptr_eq(
+        &facts(&imported_edit, &imported_file),
+        &facts(&binder_edit, &imported_file)
+    ));
+    assert!(!Arc::ptr_eq(
+        &binder_facts,
+        &facts(&binder_edit, &binder_file)
+    ));
+    let after_binder = run(&binder_edit);
+    assert_eq!(
+        binding_names(&after_binder),
+        ["p", "q"],
+        "{}",
+        after_binder.render_text()
+    );
+    assert!(matches!(
+        after_binder.completion(),
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+}
+
+#[test]
+fn rust_used_parameter_cannot_be_reported_as_unused() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "mod other; use other::*; fn id(v: i32) -> i32 { v } fn assigned() { let mut x: i32; x = 1; } fn unused() { let a: i32; } fn guard() { if let Some(m) = Some(1) && m > 0 {} } fn ambiguous(n: i32) { match n { Foo => (), p => () } } fn shadow() { let y = 1; { let y = 2; consume(y); } }\n")
+        .file("src/other.rs", "pub fn unrelated() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source(
+        "(except (bindings :name [v x m]) (binding-of (binding-uses (bindings :name [v x m]))))",
+    )
+    .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert!(result.results.is_empty(), "{}", result.render_text());
+    let unused_query = CodeQuery::from_source(
+        "(except (bindings :kind local :name \"a\") (binding-of (binding-uses (bindings :kind local :name \"a\"))))",
+    )
+    .unwrap();
+    let unused = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &unused_query,
+    );
+    assert_eq!(unused.results.len(), 1, "{}", unused.render_text());
+    let shadow_query = CodeQuery::from_source(
+        "(except (bindings :kind local :name \"y\") (binding-of (binding-uses (bindings :kind local :name \"y\"))))",
+    )
+    .unwrap();
+    let shadow = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &shadow_query,
+    );
+    assert_eq!(shadow.results.len(), 1, "{}", shadow.render_text());
+}
+
+#[test]
 fn python_binding_difference_selects_bindings_without_resolved_reads() {
     let source = concat!(
         "def run(parameter_used, parameter_unused, items):\n",
@@ -858,6 +1904,211 @@ fn python_binding_difference_selects_bindings_without_resolved_reads() {
             ),
         ]
     );
+}
+
+#[test]
+fn rust_or_pattern_alternatives_have_one_logical_binding_row() {
+    let source =
+        "enum E { A(i32), B(i32) } fn f(v: E) { match v { E::A(x) | E::B(x) => { let _ = x; } } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(language rust (bindings :name [x]))").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{}",
+        result.render_text()
+    );
+    let rows: Vec<_> = result
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::Binding { value } => (value.id.clone(), value.start_byte),
+            other => panic!("expected binding row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, rows[1].0, "alternatives share logical identity");
+    assert_eq!(rows[0].1, source.find("A(x)").unwrap() + 2);
+    assert_eq!(rows[1].1, source.find("B(x)").unwrap() + 2);
+    let occurrences = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_source("(binding-occurrence (language rust (bindings :name [x])))")
+            .unwrap(),
+    );
+    let occurrence_starts: Vec<_> = occurrences
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value } => value.start_byte,
+            other => panic!("expected binder occurrence, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(occurrence_starts, [rows[0].1, rows[1].1]);
+    let round_trip = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &CodeQuery::from_source(
+            "(binding-occurrence (binding-of (language rust (occurrences :class binding :role binder))))",
+        )
+        .unwrap(),
+    );
+    let selected_starts: Vec<_> = round_trip
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Occurrence { value }
+                if value.start_byte == rows[0].1 || value.start_byte == rows[1].1 =>
+            {
+                Some(value.start_byte)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selected_starts, [rows[0].1, rows[1].1]);
+    let from_use = CodeQuery::from_source(
+        "(binding-of :include-shadowed true (binding-uses (bindings :name \"x\")))",
+    )
+    .unwrap();
+    let reached = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &from_use,
+    );
+    assert_eq!(reached.results.len(), 1, "{}", reached.render_text());
+    let CodeQueryResultValue::Binding { value } = &reached.results[0].value else {
+        panic!(
+            "binding-of returns the canonical binder: {}",
+            reached.render_text()
+        );
+    };
+    assert_eq!(value.id, rows[0].0);
+    assert_eq!(value.start_byte, source.find("A(x)").unwrap() + 2);
+}
+
+#[test]
+fn rust_or_pattern_constants_are_value_items() {
+    let source = "const C: i32 = 1; const D: i32 = 2; enum E { A((i32,i32)), B((i32,i32)) } fn f(v: E) { match v { E::A((x,C)) | E::B((x,D)) => { let _ = x; } } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(language rust (bindings :kind pattern_binder :name [x C D]))")
+            .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let names: Vec<_> = result
+        .results
+        .iter()
+        .filter_map(|item| match &item.value {
+            CodeQueryResultValue::Binding { value } => Some(value.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["x", "x"], "{}", result.render_text());
+}
+
+#[test]
+fn rust_reference_pattern_alternatives_are_binders_not_uses() {
+    let source =
+        "enum E { A(&'static i32), B(i32) } fn f(v: E) { match v { E::A(&x) | E::B(x) => {} } }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let bindings =
+        CodeQuery::from_source("(language rust (bindings :kind pattern_binder :name \"x\"))")
+            .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &bindings,
+    );
+    assert_eq!(result.results.len(), 2, "{}", result.render_text());
+    let CodeQueryResultValue::Binding { value } = &result.results[0].value else {
+        panic!("expected a binding: {}", result.render_text());
+    };
+    assert_eq!(value.start_byte, source.find("&x").unwrap() + 1);
+    let uses =
+        CodeQuery::from_source("(language rust (binding-uses (bindings :name \"x\")))").unwrap();
+    let used = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &uses,
+    );
+    assert!(used.results.is_empty(), "{}", used.render_text());
+}
+
+#[test]
+#[brokk_bifrost_test_macros::hardwon("#10389: reference parameter binder is complete")]
+fn rust_reference_pattern_parameter_is_complete_binding() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", "fn f(&x: &i32) {}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query =
+        CodeQuery::from_source("(language rust (bindings :kind parameter :name \"x\"))").unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 1, "{}", result.render_text());
+    assert_eq!(result.completion(), CodeQueryCompletion::Complete);
+}
+
+#[test]
+fn rust_binding_syntax_exposes_immediate_parent_and_narrow_initializer() {
+    let source = "fn f() { let initialized = 1; let (left, right) = (1, 2); }";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("main.rs", source)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_source("(language rust (bindings :name [initialized left right]))")
+        .unwrap();
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(
+        result.completion(),
+        CodeQueryCompletion::Complete,
+        "{}",
+        result.render_text()
+    );
+    let rows: std::collections::BTreeMap<_, _> = result
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::Binding { value } => (
+                value.name.as_str(),
+                (
+                    value.immediate_parent_kind.as_deref(),
+                    value.whole_let_initializer,
+                ),
+            ),
+            other => panic!("expected binding row, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        rows.get("initialized"),
+        Some(&(Some("let_declaration"), true))
+    );
+    assert_eq!(rows.get("left"), Some(&(Some("tuple_pattern"), false)));
+    assert_eq!(rows.get("right"), Some(&(Some("tuple_pattern"), false)));
 }
 
 #[test]
@@ -1924,9 +3175,13 @@ impl CodeUnitIndex for ImportUnsupportedAnalyzer {
 }
 
 impl IAnalyzer for ImportUnsupportedAnalyzer {
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update_with_listing(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+        listing: Option<&brokk_bifrost_core::analyzer::project::SharedWorkspaceFileListing>,
+    ) -> Self {
         Self {
-            inner: IAnalyzer::update(&self.inner, changed_files),
+            inner: IAnalyzer::update_with_listing(&self.inner, changed_files, listing),
         }
     }
 
@@ -8795,8 +10050,8 @@ fn branch_relation_step_compares_java_members_by_receiver_and_resolved_target() 
         ),
         (
             "class Sample { int value; int f(boolean flag) { if (flag) return this.value; else return value; } }",
-            "open",
-            Some("member_resolution_unavailable"),
+            "proven",
+            None,
         ),
     ] {
         assert_java_branch_relation_case(source, verdict, reason);
@@ -9349,4 +10604,846 @@ fn dispatch_file_operations_in_memory_multi_file_query_completes() {
         &query,
     );
     assert!(!result.results.is_empty(), "{}", result.render_text());
+}
+
+#[test]
+#[hardwon("#9559: cancellation from JVM row reads must reach the RQL diagnostic boundary")]
+fn jvm_reader_cancellation_reaches_query_diagnostics() {
+    use brokk_bifrost_analysis::analyzer::semantic_model::runtime::acquire_eager_semantic_models_with_request_owner_for_test;
+    use brokk_bifrost_analysis::analyzer::store::model_catalog::CatalogRowReader;
+    let root = tempfile::tempdir().unwrap();
+    let analyzer = language_analyzer(
+        Language::Java,
+        TestProject::new(root.path(), Language::Java),
+    );
+    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+    let request = SemanticModelActivationRequest {
+        bifrost_version: Version::new(0, 15, 1),
+        approximate_standard_libraries: Vec::new(),
+        evidence: Vec::new(),
+        controls: Vec::new(),
+        limits: SemanticModelRuntimeLimits::default(),
+    };
+    let SemanticModelRuntimeOutcome::Ready { active, .. } =
+        acquire_eager_semantic_models_with_request_owner_for_test(
+            analyzer.as_ref(),
+            &catalog,
+            &request,
+            &CancellationToken::new(),
+            true,
+        )
+    else {
+        panic!("empty activation is ready")
+    };
+    let scope = AnalyzerQueryScope::capturing_read_incompleteness(analyzer.as_ref());
+    let source = analyzer
+        .request_row_reader_source(&catalog.pinned_catalog_source(
+            &crate::analyzer::store::cache_budget::StoreCacheBudget::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            ),
+        ))
+        .unwrap();
+    let reader = source.jvm_reader(&active).unwrap().reader;
+    let cancellation = CancellationToken::cancel_after_checks_for_test(8);
+    let answer = CatalogRowReader::owned_rows(
+        reader.as_ref(),
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100) SELECT x FROM n",
+        &[],
+        &cancellation,
+    );
+    let open = brokk_bifrost_analysis::analyzer::store::model_catalog::semantic_catalog_question(
+        "cancelled RQL read",
+        (),
+        answer,
+    )
+    .unwrap_err();
+    assert!(open.is_cancellation());
+    let query =
+        CodeQuery::from_json(&serde_json::json!({"match": {"kind": "call", "name": "marker"}}))
+            .unwrap();
+    let detailed = execute_internal_with_analysis(
+        analyzer.as_ref(),
+        scope.token(),
+        Some(&scope),
+        None,
+        None,
+        None,
+        0,
+        &query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        None,
+        false,
+    );
+    assert!(
+        detailed
+            .result
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::Cancelled),
+        "{:?}",
+        detailed.result
+    );
+}
+
+#[test]
+#[hardwon(
+    "dc6a9b891853: a pre-cancelled opted-in traversal had no status and violated the product key invariant"
+)]
+fn cancelled_depth_consumer_preserves_unknown_or_typed_absence() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn target() {}")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_sexp(
+        "(callers :depth 1 (enclosing-decl (language rust (function :name \"target\"))))",
+    )
+    .unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    for opted_in in [false, true] {
+        let result = execute_code_query_detailed_eager_index_workspace_in_scope(
+            &workspace,
+            &brokk_bifrost_flow::FlowWorkspaceState::default(),
+            &query,
+            CodeQueryExecutionLimits::default(),
+            Some(&cancellation),
+            CodeQueryExecutionScope::whole_workspace().with_depth_bound_status(opted_in),
+        );
+        assert!(result.result.truncated);
+        assert_eq!(
+            result.result.depth_bound_status,
+            opted_in.then_some(DepthBoundStatus::Unknown)
+        );
+        assert!(result.depth_answers.is_empty());
+    }
+}
+
+#[test]
+fn qualifying_type_kleene_sites_agree_across_union_strategies() {
+    let unknown =
+        r#"(call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    for (calls, pattern, findings, complete) in [
+        (
+            "Cipher::new();",
+            format!("(union (call) {unknown})"),
+            1,
+            true,
+        ),
+        (
+            "Cipher::new();",
+            format!("(union {unknown} (call))"),
+            1,
+            true,
+        ),
+        (
+            "Cipher::new();",
+            format!("(union (call :callee (name/regex \"^never$\")) {unknown})"),
+            0,
+            false,
+        ),
+        (
+            "Cipher::new();",
+            format!("(call (or (call) {unknown}))"),
+            1,
+            true,
+        ),
+        (
+            "Cipher::new();",
+            format!("(call (or {unknown} (call)))"),
+            1,
+            true,
+        ),
+        (
+            "Cipher::new();",
+            format!("(call (and {unknown} (call :callee (name/regex \"^never$\"))))"),
+            0,
+            true,
+        ),
+        (
+            "Cipher::new();",
+            format!("(call (and (call :callee (name/regex \"^never$\")) {unknown}))"),
+            0,
+            true,
+        ),
+        ("Cipher::new();", format!("(call :not {unknown})"), 0, false),
+        (
+            "Cipher::new(); Missing::new();",
+            format!("(union (call :receiver (identifier :name \"Cipher\")) {unknown})"),
+            1,
+            false,
+        ),
+    ] {
+        let source = format!(
+            "struct Cipher; impl Cipher {{ fn new() -> Self {{ Self }} }} fn run() {{ {calls} }}"
+        );
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let query = CodeQuery::from_sexp(&format!("(language rust {pattern})")).unwrap();
+        for strategy in [
+            UnionExecutionStrategy::Sequential,
+            UnionExecutionStrategy::Parallel,
+        ] {
+            let result = execute_code_query_with_union_strategy(
+                &analyzer,
+                &query,
+                Default::default(),
+                strategy,
+                false,
+            )
+            .result;
+            assert_eq!(result.results.len(), findings, "{pattern}: {result:#?}");
+            assert_eq!(
+                matches!(result.completion(), CodeQueryCompletion::Complete),
+                complete,
+                "{pattern}: {result:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "05e11e22e629: nested qualifying relations lost Unknown or withheld a later proven existential witness"
+)]
+fn qualifying_type_nested_relations_preserve_and_discharge_unknown_per_candidate() {
+    let unknown =
+        r#"(call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    let witness = format!(r#"(call (or (call :callee (name "known")) {unknown}))"#);
+    for (calls, pattern, findings, complete) in [
+        (
+            "Cipher::new();",
+            format!("(function :name \"run\" :has {unknown})"),
+            0,
+            false,
+        ),
+        (
+            "Cipher::new();",
+            format!("(function :name \"run\" :not-has {unknown})"),
+            0,
+            false,
+        ),
+        (
+            "Cipher::new();",
+            format!("(function :name \"run\" :not (function :has {unknown}))"),
+            0,
+            false,
+        ),
+        (
+            "let value = Cipher::new();",
+            format!("(assignment :right {unknown})"),
+            0,
+            false,
+        ),
+        (
+            "Cipher::new(); known();",
+            format!("(function :name \"run\" :has {witness})"),
+            1,
+            true,
+        ),
+        (
+            "known(); Cipher::new();",
+            format!("(function :name \"run\" :has {witness})"),
+            1,
+            true,
+        ),
+        (
+            "Cipher::new(); known();",
+            format!("(function :name \"run\" :not-has {witness})"),
+            0,
+            true,
+        ),
+        (
+            "consume(Cipher::new());",
+            format!("(call :callee (name \"consume\") :args [{unknown}])"),
+            0,
+            false,
+        ),
+        (
+            "consume(Cipher::new(), known());",
+            format!("(call :callee (name \"consume\") :args [{witness}])"),
+            1,
+            true,
+        ),
+    ] {
+        let source = format!(
+            "struct Cipher; impl Cipher {{ fn new() {{}} }} fn known() {{}} fn consume() {{}} fn run() {{ {calls} }}"
+        );
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let query = CodeQuery::from_sexp(&format!("(language rust {pattern})")).unwrap();
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            UnionExecutionStrategy::Sequential,
+            false,
+        )
+        .result;
+        assert_eq!(result.results.len(), findings, "{pattern}: {result:#?}");
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{pattern}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "05e11e22e629: qualifier probes relabeled and discharged unrelated argument-mode incompleteness"
+)]
+fn qualifying_type_union_keeps_unrelated_capability_diagnostics() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "struct Cipher; impl Cipher { fn new(_: u8) {} } fn run(value: u8) { Cipher::new(value); }")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let query = CodeQuery::from_sexp(r#"(language rust (union (call) (call :args [(identifier :argument-mode [out])] :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))))"#).unwrap();
+    for strategy in [
+        UnionExecutionStrategy::Sequential,
+        UnionExecutionStrategy::Parallel,
+    ] {
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            strategy,
+            false,
+        )
+        .result;
+        assert_eq!(result.results.len(), 1);
+        assert!(
+            matches!(result.completion(), CodeQueryCompletion::Incomplete { .. }),
+            "{result:#?}"
+        );
+        assert!(
+            result.diagnostics.iter().any(|diagnostic| diagnostic.code
+                == CodeQueryDiagnosticCode::UnsupportedStructuralFeature),
+            "{result:#?}"
+        );
+        assert!(
+            !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == CodeQueryDiagnosticCode::QualifyingTypeUnresolved),
+            "{result:#?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "fc307ec07e2c: ordered roles discarded an earlier unknown needed to leave a later known argument for the next pattern"
+)]
+fn qualifying_type_ordered_roles_preserve_possible_earlier_positions() {
+    let unknown =
+        r#"(call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    let first = format!(r#"(call :capture "first" (or (call :callee (name "known")) {unknown}))"#);
+    for (arguments, second, findings, complete) in [
+        ("Missing::new(), known()", "known", 0, false),
+        ("Missing::new(), known()", "absent", 0, true),
+        ("known(), Missing::new()", "known", 0, true),
+        ("known(), known()", "known", 1, true),
+        ("Missing::new(), known(), known()", "known", 0, false),
+    ] {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                format!("fn known() {{}} fn consume() {{}} fn run() {{ consume({arguments}); }}"),
+            )
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let query = CodeQuery::from_sexp(&format!(r#"(language rust (call :callee (name "consume") :args [{first} (call :callee (name "{second}") :capture "second")]))"#)).unwrap();
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            UnionExecutionStrategy::Sequential,
+            false,
+        )
+        .result;
+        assert_eq!(result.results.len(), findings, "{arguments}: {result:#?}");
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{arguments}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "fc307ec07e2c: count relabeled qualifying-only child uncertainty as a sticky role-coverage gap"
+)]
+fn qualifying_type_counts_compose_without_fabricating_role_coverage_gaps() {
+    let unknown =
+        r#"(call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    // C# certifies class-member coverage. Its unsupported qualifying-type hook
+    // makes this child unknown without introducing a missing role-coverage fact.
+    let count = format!("(class (count :members (method :has {unknown}) :min 1))");
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("C.cs", "class C { void Probe() { Missing.New(); } }")
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    for (pattern, findings, complete) in [
+        (format!("(class :name \"C\" (or (class) {count}))"), 1, true),
+        (format!("(class :name \"C\" (or {count} (class)))"), 1, true),
+        (
+            format!("(class :name \"C\" (and {count} (class :name \"absent\")))"),
+            0,
+            true,
+        ),
+        (
+            format!("(class :name \"C\" (and (class :name \"absent\") {count}))"),
+            0,
+            true,
+        ),
+        (format!("(class :name \"C\" :not {count})"), 0, false),
+        (
+            format!("(class :name \"C\" (count :members (method :has {unknown}) :min 2))"),
+            0,
+            true,
+        ),
+        (
+            format!("(class :name \"C\" (count :members (method :has {unknown}) :min 0))"),
+            1,
+            true,
+        ),
+        (count, 0, false),
+    ] {
+        let query = CodeQuery::from_sexp(&format!("(language csharp {pattern})")).unwrap();
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            UnionExecutionStrategy::Sequential,
+            false,
+        )
+        .result;
+        assert_eq!(result.results.len(), findings, "{pattern}: {result:#?}");
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{pattern}: {result:#?}"
+        );
+        assert!(
+            !result.diagnostics.iter().any(|diagnostic| diagnostic.code
+                == CodeQueryDiagnosticCode::StructuralRoleCoverageIncomplete),
+            "{pattern}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "bff3b52c6074: language-rule selection failed to exclude qualifying diagnostics from documented methods"
+)]
+fn qualifying_type_unknown_sites_follow_language_relation_selection() {
+    let unknown =
+        r#"(call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    for (body, complete) in [("", true), ("Missing.New();", false)] {
+        let source = format!(
+            r#"class C {{
+/// <summary>Documented.</summary>
+/// <param name="value">Value.</param>
+void Documented(int value) {{ Missing.New(); }}
+/// <summary>Missing parameter documentation.</summary>
+void MissingDocs(int value) {{ {body} }}
+}}"#
+        );
+        let project = InlineTestProject::with_language(Language::CSharp)
+            .file("C.cs", &source)
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+        let query = CodeQuery::from_sexp(&format!(r#"(language csharp (method :language-rule "csharp/missing-xmldoc-parameter" :has {unknown}))"#)).unwrap();
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            UnionExecutionStrategy::Sequential,
+            false,
+        )
+        .result;
+        assert!(result.results.is_empty(), "{result:#?}");
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{result:#?}"
+        );
+        let unknown_sites = result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::QualifyingTypeUnresolved
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(unknown_sites.len(), usize::from(!complete), "{result:#?}");
+        for diagnostic in unknown_sites {
+            let span = diagnostic.source.as_ref().unwrap();
+            assert_eq!(
+                &source[span.start_byte..span.end_byte],
+                "int value",
+                "same report span as the selected language relation"
+            );
+            assert!(span.start_byte > source.find("void MissingDocs").unwrap());
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "bff3b52c6074: body-state filtering left qualifying diagnostics on excluded nonempty blocks"
+)]
+fn qualifying_type_unknown_sites_follow_body_state_selection() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "C.cs",
+            "class C { void Code() { Missing.New(); } void Empty() {} }",
+        )
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    for (state, complete) in [("empty", true), ("code", false)] {
+        let query = CodeQuery::from_sexp(&format!(r#"(language csharp (method :body-state {state} :has (call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))))"#)).unwrap();
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            UnionExecutionStrategy::Sequential,
+            false,
+        )
+        .result;
+        assert!(result.results.is_empty(), "{result:#?}");
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{state}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "bff3b52c6074: a constraint for a nonexistent declared type slot was unknown instead of a nonmatch"
+)]
+fn qualifying_type_nonexistent_type_slots_are_proven_nonmatches() {
+    for (source, name, slots) in [
+        (
+            "struct Cipher; impl Cipher { fn new() {} } fn run() { Cipher::new(); }",
+            "Cipher",
+            1,
+        ),
+        (
+            "struct Pair<T>(T); impl<T> Pair<T> { fn new() {} } fn run() { Pair::<u8>::new(); }",
+            "Pair",
+            2,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", source)
+            .build();
+        let analyzer = RustAnalyzer::from_project(project.project().clone());
+        let owner = analyzer
+            .all_declarations()
+            .find(|unit| unit.terminal_name() == name)
+            .unwrap();
+        let constraint = json!({"kind":"call", "qualifying_type":{"identity":{"workspace_declaration":owner.declaration_id().to_string()},"arguments":vec![json!({"identity":{"stable":"unqueried"}}); slots]}});
+        for negated in [false, true] {
+            let pattern = if negated {
+                json!({"kind":"call","not":constraint})
+            } else {
+                constraint.clone()
+            };
+            let query =
+                CodeQuery::from_json(&json!({"languages":["rust"],"match":pattern})).unwrap();
+            let result = execute_code_query_with_union_strategy(
+                &analyzer,
+                &query,
+                Default::default(),
+                UnionExecutionStrategy::Sequential,
+                false,
+            )
+            .result;
+            assert_eq!(
+                result.results.len(),
+                usize::from(negated),
+                "{name}: {result:#?}"
+            );
+            assert_eq!(
+                result.completion(),
+                CodeQueryCompletion::Complete,
+                "{name}: {result:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "a8fb0b1ba682: an earlier capture-free unknown union branch was discharged by a later captured row"
+)]
+fn qualifying_type_union_preserves_first_branch_capture_uncertainty() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "struct Cipher; impl Cipher { fn new() {} } fn run() { Cipher::new(); }",
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let unknown =
+        r#"(call :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    for (branches, complete) in [
+        (format!(r#"{unknown} (call :capture "chosen")"#), false),
+        (format!(r#"(call :capture "chosen") {unknown}"#), true),
+        (format!("{unknown} (call)"), true),
+    ] {
+        let query = CodeQuery::from_sexp(&format!("(language rust (union {branches}))")).unwrap();
+        for strategy in [
+            UnionExecutionStrategy::Sequential,
+            UnionExecutionStrategy::Parallel,
+        ] {
+            let result = execute_code_query_with_union_strategy(
+                &analyzer,
+                &query,
+                Default::default(),
+                strategy,
+                false,
+            )
+            .result;
+            assert_eq!(result.results.len(), 1, "{branches}: {result:#?}");
+            assert_eq!(
+                matches!(result.completion(), CodeQueryCompletion::Complete),
+                complete,
+                "{branches}: {result:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[hardwon(
+    "668bc6da488b: later known alternatives discarded earlier possible captures, allowing anchor to report complete empty"
+)]
+fn qualifying_type_alternatives_preserve_possible_capture_witnesses() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            "fn known() {} fn consume() {} fn run() { consume(Missing::new(), known(), known()); }",
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let unknown = r#"(call :capture "chosen" :qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher")))"#;
+    let known = r#"(call :callee (name "known"))"#;
+    for (pattern, findings, complete) in [
+        (format!("(call (or {unknown} (call)))"), 0, false),
+        (format!("(call (or (call) {unknown}))"), 0, true),
+        // The later witness binds a different argument. Its tentative binding
+        // must not reject the earlier possible witness in a subsequent role.
+        (
+            format!(
+                r#"(call :callee (name "consume") (or (call :args [{unknown}]) (call :args [(call :callee (name "known") :capture "chosen")])) :args [(call :capture "chosen") {known} {known}])"#
+            ),
+            0,
+            false,
+        ),
+        (
+            format!("(function :name \"run\" :has (call (or {unknown} {known})))"),
+            0,
+            false,
+        ),
+        (
+            format!(
+                "(call :callee (name \"consume\") :args [(call (or {unknown} {known})) {known}])"
+            ),
+            0,
+            false,
+        ),
+    ] {
+        let query = CodeQuery::from_sexp(&format!(
+            "(anchor :capture \"chosen\" (language rust {pattern}))"
+        ))
+        .unwrap();
+        let result = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            Default::default(),
+            UnionExecutionStrategy::Sequential,
+            false,
+        )
+        .result;
+        assert_eq!(result.results.len(), findings, "{pattern}: {result:#?}");
+        assert_eq!(
+            matches!(result.completion(), CodeQueryCompletion::Complete),
+            complete,
+            "{pattern}: {result:#?}"
+        );
+    }
+}
+
+#[test]
+#[hardwon(
+    "b59a30c965b6: policy seed-union units retained 16 qualifying unknowns already decided by written-name branches"
+)]
+fn qualifying_type_seed_union_units_match_whole_rows_and_diagnostics() {
+    use crate::structural::search::units::{
+        CodeQueryExecutionScope, UnitExecutionResult, execute_code_query_unit, merge_unit_rows,
+    };
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "fn run() { Rc4::<_>::new(); Rc4::new(); cbc::Encryptor::<Des>::new(); Aes128::new(); }")
+        .build();
+    let analyzer = RustAnalyzer::from_project(fixture.project().clone());
+    let files = analyzer.analyzed_files();
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let qualifier =
+        r#":qualifying-type (instantiated-type :identity (qualified "unresolved.Cipher"))"#;
+    let unknown = format!(r#"(call :callee (name "new") {qualifier})"#);
+    let unknown_rc4 = format!(r#"(call :callee (name "new") :receiver (name "Rc4") {qualifier})"#);
+    let known = r#"(call :callee (name "new") :receiver (name "Rc4"))"#;
+    let captured = r#"(call :capture "chosen" :callee (name "new") :receiver (name "Rc4"))"#;
+    let written = r#"(call :callee (name "new") :type-arguments [(name "Des")])"#;
+    for (label, branches, row_count, diagnostic_count) in [
+        (
+            "gate shape retains the undecided strong constructor",
+            format!("{written} {known} {unknown}"),
+            3,
+            1,
+        ),
+        (
+            "capture-free unknown before a deciding branch",
+            format!("{unknown_rc4} {known}"),
+            2,
+            0,
+        ),
+        (
+            "later capture-free row cannot replace captured representative",
+            format!("{unknown_rc4} {captured} {known}"),
+            2,
+            2,
+        ),
+        (
+            "earlier captured winner is stable",
+            format!("{captured} {unknown_rc4}"),
+            2,
+            0,
+        ),
+    ] {
+        let query = CodeQuery::from_sexp(&format!("(language rust (union {branches}))")).unwrap();
+        let whole = execute_code_query_unit(
+            &analyzer,
+            &flow,
+            None,
+            &query,
+            Default::default(),
+            None,
+            CodeQueryExecutionScope::whole_workspace(),
+        );
+        let units = files
+            .iter()
+            .map(|file| {
+                let unit = execute_code_query_unit(
+                    &analyzer,
+                    &flow,
+                    None,
+                    &query,
+                    Default::default(),
+                    None,
+                    CodeQueryExecutionScope::for_seed_files(std::slice::from_ref(file), &files),
+                );
+                // A kept unit must compose with the same evidence after reopening.
+                serde_json::from_value::<UnitExecutionResult>(serde_json::to_value(unit).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let whole = merge_unit_rows(&query, [whole]);
+        let partitioned = merge_unit_rows(&query, units);
+        assert_eq!(partitioned.items, whole.items, "{label}");
+        assert_eq!(partitioned.evidence, whole.evidence, "{label}");
+        assert_eq!(
+            serde_json::to_value(&partitioned.diagnostics).unwrap(),
+            serde_json::to_value(&whole.diagnostics).unwrap(),
+            "{label}"
+        );
+        assert_eq!(partitioned.items.len(), row_count, "{label}");
+        assert_eq!(
+            partitioned.diagnostics.len(),
+            diagnostic_count,
+            "{label}: {:?}",
+            partitioned.diagnostics
+        );
+        assert!(!partitioned.truncated, "{label}");
+    }
+}
+
+#[test]
+#[hardwon(
+    "c931785ef074: rendered capture truncation falsely discharged earlier qualifying-type uncertainty in seed units"
+)]
+fn qualifying_type_seed_union_preserves_unknowns_after_capture_render_truncation() {
+    use crate::structural::search::units::{
+        CodeQueryExecutionScope, UnitExecutionResult, UnitRowItemTerminal, execute_code_query_unit,
+        merge_unit_rows,
+    };
+    let fixture = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "fn run() { Rc4::new(); }")
+        .build();
+    let analyzer = RustAnalyzer::from_project(fixture.project().clone());
+    let flow = brokk_bifrost_flow::FlowWorkspaceState::new();
+    let query = CodeQuery::from_sexp(
+        r#"(language rust (union
+            (call :callee (name "new") :qualifying-type
+                (instantiated-type :identity (qualified "unresolved.Cipher")))
+            (call :capture "chosen" :callee (name "new"))))"#,
+    )
+    .unwrap();
+    let unit = execute_code_query_unit(
+        &analyzer,
+        &flow,
+        None,
+        &query,
+        Default::default(),
+        None,
+        CodeQueryExecutionScope::whole_workspace(),
+    );
+    let whole = merge_unit_rows(&query, [unit.clone()]);
+    let mut truncated = unit;
+    assert_eq!(truncated.rows.len(), 1);
+    let Some(UnitRowItemTerminal::StructuralMatch { captures, .. }) =
+        &mut truncated.rows[0].item.terminal
+    else {
+        panic!("expected structural row");
+    };
+    assert!(!captures.is_empty());
+    // Exercise the persisted renderer/consumer boundary: an exhausted renderer
+    // omits all captures and publishes this existing receipt. Reopening that
+    // product must not reinterpret the omitted captures as proved absence.
+    captures.clear();
+    let render_cache = PipelineRenderCache {
+        capture_truncated_rows: 1,
+        ..Default::default()
+    };
+    render_cache.report_capture_truncation(&mut truncated.diagnostics);
+    let reopened =
+        serde_json::from_value::<UnitExecutionResult>(serde_json::to_value(truncated).unwrap())
+            .unwrap();
+    let reopened = merge_unit_rows(&query, [reopened]);
+    let qualifying = |diagnostics: &[CodeQueryDiagnostic]| {
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::QualifyingTypeUnresolved
+            })
+            .map(|diagnostic| serde_json::to_value(diagnostic).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let expected = qualifying(&whole.diagnostics);
+    assert_eq!(expected.len(), 1);
+    assert_eq!(qualifying(&reopened.diagnostics), expected);
+    assert_eq!(reopened.items.len(), whole.items.len());
+    assert!(reopened.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == CodeQueryDiagnosticCode::RenderedCapturesTruncated
+    }));
 }

@@ -1,5 +1,9 @@
 pub mod analyzer {
     pub mod php;
+    pub use php::dependency_evidence::{
+        COMPOSER_ECOSYSTEM, ComposerVersion, ComposerVersionRange, PHP_TOOLCHAIN_ECOSYSTEM,
+        composer_dependency_version_matches, composer_project,
+    };
     pub use php::{
         PhpAnalyzer, PhpCallResultUseIndex, PhpDependencyPackAdapter, php_declared_scalar_types,
         resolve_php_semantic_pack_dependencies,

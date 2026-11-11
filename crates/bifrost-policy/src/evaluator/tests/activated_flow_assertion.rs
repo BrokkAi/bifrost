@@ -198,8 +198,13 @@ fn activated_nonreturn_model_changes_flow_assertion_result() {
         cvss_overlays: &[],
         organizational_risk: &[],
         incremental: None,
+        identifier_typos: None,
     };
     let cold = DefaultPolicyEvaluator::new()
+        .evaluate(policy, &context, &mut PolicyBudget::default())
+        .unwrap();
+    let close_match = DefaultPolicyEvaluator::new()
+        .with_active_semantic_model_snapshot(Some(crate::test_support::close_match_snapshot()))
         .evaluate(policy, &context, &mut PolicyBudget::default())
         .unwrap();
     let active = DefaultPolicyEvaluator::new()
@@ -209,5 +214,16 @@ fn activated_nonreturn_model_changes_flow_assertion_result() {
     assert_eq!(cold.completion(), &PolicyRunCompletion::Complete);
     assert_eq!(active.completion(), &PolicyRunCompletion::Complete);
     assert_eq!(cold.findings().len(), 1, "{cold:#?}");
+    assert_eq!(close_match.findings().len(), cold.findings().len());
+    assert_eq!(close_match.findings()[0].id(), cold.findings()[0].id());
+    assert_eq!(close_match.completion(), cold.completion());
+    assert_eq!(
+        close_match.findings()[0]
+            .model_attribution()
+            .unwrap()
+            .contributors[0]
+            .role,
+        ModelAttributionRole::ReadDependency,
+    );
     assert!(active.findings().is_empty(), "{active:#?}");
 }

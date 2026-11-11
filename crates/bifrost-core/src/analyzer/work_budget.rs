@@ -40,6 +40,14 @@ impl<Dimension: Copy> WorkBudgetExceeded<Dimension> {
     }
 }
 
+/// The refusal count of one logical budget at one moment. See
+/// [`BudgetLedger::refusal_mark`].
+#[derive(Debug, Clone)]
+pub struct RefusalMark {
+    counter: Arc<AtomicUsize>,
+    base: usize,
+}
+
 /// Atomic accounting shared by semantic materialization and data-flow solves.
 #[derive(Debug, Clone)]
 pub struct BudgetLedger<Work> {
@@ -70,6 +78,44 @@ impl<Work> BudgetLedger<Work> {
         self.refusals.load(Ordering::Relaxed)
     }
 
+    /// A mark of the refusals observed so far, for a caller that runs
+    /// independent units on one ledger and must attribute a refusal to the unit
+    /// during which it happened.
+    pub fn refusal_mark(&self) -> RefusalMark {
+        RefusalMark {
+            counter: Arc::clone(&self.refusals),
+            base: self.refusal_count(),
+        }
+    }
+
+    /// Refusals recorded since `mark` was taken. A mark taken from another
+    /// logical budget has no baseline here, so every refusal of this budget
+    /// counts: a child ledger starts a new count, and a mark must never hide
+    /// its refusals.
+    pub fn refusals_since(&self, mark: &RefusalMark) -> usize {
+        let count = self.refusal_count();
+        if Arc::ptr_eq(&self.refusals, &mark.counter) {
+            count.saturating_sub(mark.base)
+        } else {
+            count
+        }
+    }
+
+    /// A copy that owns its refusal counter, starting at this ledger's count.
+    /// Clones share the counter, so a checkpoint kept as a clone would count
+    /// the refusals of every later attempt; a detached copy keeps the value it
+    /// was taken at (#10560).
+    pub fn detached(&self) -> Self
+    where
+        Work: Clone,
+    {
+        Self {
+            limits: self.limits.clone(),
+            used: self.used.clone(),
+            refusals: Arc::new(AtomicUsize::new(self.refusal_count())),
+        }
+    }
+
     /// Replace resident usage while preserving the logical budget's failures.
     pub fn with_used(&self, used: Work) -> Self
     where
@@ -82,9 +128,21 @@ impl<Work> BudgetLedger<Work> {
         }
     }
 
+    /// Replace limits without resetting usage or refusal observations.
+    pub fn with_limits(&self, limits: Work) -> Self
+    where
+        Work: Clone,
+    {
+        Self {
+            limits,
+            used: self.used.clone(),
+            refusals: Arc::clone(&self.refusals),
+        }
+    }
+
     #[track_caller]
     pub fn record_refusal(&self) {
-        super::carried_context::mark_execution_dependent();
+        super::carried_context::mark_budget_refusal();
         let origin = std::panic::Location::caller();
         crate::profiling::note_with(|| {
             format!(
@@ -416,6 +474,50 @@ mod work_budget_properties {
     }
 }
 
+/// How many syntax nodes a bounded traversal may still visit.
+///
+/// A traversal calls [`Self::visit`] once per node and stops when it returns
+/// false. Running out is a property of the tree's size, so it is content, not
+/// execution state, and reports nothing to the read ledger.
+#[derive(Debug)]
+pub struct NodeBudget {
+    remaining: usize,
+    visited: usize,
+    /// A visit was refused. Distinct from `remaining == 0`, which a traversal
+    /// whose last node used the final unit also reaches without losing a node.
+    exhausted: bool,
+}
+
+impl NodeBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            remaining: limit,
+            visited: 0,
+            exhausted: false,
+        }
+    }
+
+    /// Spend one node, or refuse and record that the traversal lost a node.
+    pub fn visit(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= 1;
+        self.visited += 1;
+        true
+    }
+
+    /// Whether some visit was refused, so a traversal skipped part of a tree.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    pub fn visited(&self) -> usize {
+        self.visited
+    }
+}
+
 /// A query-local scalar allowance. Refusal is an execution input even when
 /// the caller catches it and returns a useful fallback.
 #[derive(Debug, Clone, Copy)]
@@ -429,17 +531,19 @@ impl LimitedCounter {
         Self { used, limit }
     }
 
+    #[track_caller]
     pub fn allows(&self, additional: usize) -> bool {
         let fits = self
             .used
             .checked_add(additional)
             .is_some_and(|used| used <= self.limit);
         if !fits {
-            super::carried_context::mark_execution_dependent();
+            super::carried_context::mark_observed("limit");
         }
         fits
     }
 
+    #[track_caller]
     pub fn charge(&mut self, additional: usize) -> bool {
         if !self.allows(additional) {
             return false;

@@ -12,7 +12,7 @@ mod tests {
 
     use crate::analyzer::rust::RustAnalyzer;
 
-    use brokk_bifrost_rust::declarations::rust_package_name;
+    use brokk_bifrost_rust::declarations::rust_package_name_with;
 
     use crate::analyzer::rust::test_support::analyzed_file;
 
@@ -378,10 +378,27 @@ pub mod nested {
         let expected: Vec<_> = rust_module_extents(
             prepared.tree().root_node(),
             prepared.source(),
-            &rust_package_name(&lib),
+            &rust_package_name_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                ),
+                &lib,
+            ),
         )
         .into_iter()
-        .map(|(module, start, end)| (ModuleKey::new(&lib, &module), start, end))
+        .map(|(module, start, end)| {
+            (
+                ModuleKey::new_with(
+                    &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                    ),
+                    &lib,
+                    &module,
+                ),
+                start,
+                end,
+            )
+        })
         .collect();
 
         let actual = RustUsageQueries::new(&analyzer)
@@ -405,7 +422,12 @@ pub mod nested {
     fn module_extents_compose_the_live_package_into_the_stored_relative_names() {
         let (_temp, analyzer, _lib, _worker) = analyzer_with_fixture();
         let leaf = analyzed_file(&analyzer, "leaf.rs");
-        let package = rust_package_name(&leaf);
+        let package = rust_package_name_with(
+            &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+            ),
+            &leaf,
+        );
         assert!(!package.is_empty(), "fixture must have a nested package");
         let scope = AnalyzerQueryScope::new(&analyzer);
         let prepared = analyzer
@@ -414,7 +436,19 @@ pub mod nested {
         let expected: Vec<_> =
             rust_module_extents(prepared.tree().root_node(), prepared.source(), &package)
                 .into_iter()
-                .map(|(module, start, end)| (ModuleKey::new(&leaf, &module), start, end))
+                .map(|(module, start, end)| {
+                    (
+                ModuleKey::new_with(
+                    &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+                    ),
+                    &leaf,
+                    &module,
+                ),
+                start,
+                end,
+            )
+                })
                 .collect();
 
         let actual = RustUsageQueries::new(&analyzer)
@@ -673,16 +707,39 @@ pub mod nested {
             queries
                 .module_at_byte(&lib, nested)
                 .expect("published Rust facts for nested function"),
-            Some(ModuleKey::new(
+            Some(ModuleKey::new_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing()
+                ),
                 &lib,
-                &compose_module(&rust_package_name(&lib), "inner")
+                &compose_module(
+                    &rust_package_name_with(
+                        &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                            &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(
+                            )
+                        ),
+                        &lib
+                    ),
+                    "inner"
+                )
             ))
         );
         assert_eq!(
             queries
                 .module_at_byte(&lib, root_fn)
                 .expect("published Rust facts for root function"),
-            Some(ModuleKey::new(&lib, &rust_package_name(&lib)))
+            Some(ModuleKey::new_with(
+                &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                    &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing()
+                ),
+                &lib,
+                &rust_package_name_with(
+                    &brokk_bifrost_rust::crate_naming::RustCrateNamingCaches::new(
+                        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing()
+                    ),
+                    &lib
+                )
+            ))
         );
     }
 
@@ -722,6 +779,199 @@ pub mod nested {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(queries.import_binding_computations(), 1);
     }
+
+    #[test]
+    #[hardwon("#10202: cfg_if item attributes lacked a retained source guard boundary check")]
+    fn cfg_if_item_guards_survive_persisted_source_facts() {
+        use brokk_bifrost_analysis::analyzer::tree_sitter_analyzer::persistent_store_context_without_automatic_gc;
+        use brokk_bifrost_core::analyzer::config::AnalyzerConfig;
+        use brokk_bifrost_core::analyzer::rust_facts::decode_rust_cfg_condition;
+        use brokk_bifrost_rust::cargo_config::{RustCargoConfigDocument, RustCargoConfiguration};
+        use brokk_bifrost_rust::cfg::crate_activation;
+        use brokk_bifrost_rust::selected_context::RustSelectedActivation::{Active, Inactive};
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+
+        let temp = tempfile::tempdir().expect("fixture project");
+        let root = temp.path().canonicalize().expect("absolute fixture root");
+        ProjectFile::new(root.clone(), "Cargo.toml")
+            .write("[package]\nname = \"cfg-if-guard-boundary\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\ncfg-if = \"1\"\n[features]\ndefault = []\nx = []\n")
+            .expect("Cargo manifest");
+        let cargo_config = "[build]\ntarget = \"x86_64-unknown-linux-gnu\"\n";
+        ProjectFile::new(root.clone(), ".cargo/config.toml")
+            .write(cargo_config)
+            .expect("explicit Linux target");
+        let source = "mod unrelated;\npub fn target() {}\ncfg_if::cfg_if! {\n    if #[cfg(unix)] {\n        #[cfg(feature = \"x\")]\n        pub fn only_x() { target(); }\n        #[cfg(unix)]\n        pub fn enabled_attr() { target(); }\n        pub fn control() { target(); }\n    }\n}\n";
+        let file = ProjectFile::new(root.clone(), "src/lib.rs");
+        file.write(source).expect("Rust source");
+        let unrelated = ProjectFile::new(root.clone(), "src/unrelated.rs");
+        unrelated
+            .write("pub fn only_x() {}\n")
+            .expect("unrelated Rust source");
+        let project = Arc::new(TestProject::new(root, Language::Rust));
+
+        let context = persistent_store_context_without_automatic_gc(project.as_ref())
+            .expect("persistent analyzer store");
+        let analyzer = RustAnalyzer::new_with_config_store_context(
+            project.clone(),
+            AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .expect("Rust analyzer");
+        assert_eq!(analyzer.get_analyzed_files().len(), 2);
+        assert!(
+            analyzer
+                .declarations(&file)
+                .iter()
+                .any(|unit| unit.identifier() == "control")
+        );
+        assert!(
+            analyzer
+                .declarations(&unrelated)
+                .iter()
+                .any(|unit| unit.identifier() == "only_x")
+        );
+        drop(analyzer);
+
+        let context = persistent_store_context_without_automatic_gc(project.as_ref())
+            .expect("reopened persistent analyzer store");
+        let reopened = RustAnalyzer::new_with_config_store_context(
+            project,
+            AnalyzerConfig::default(),
+            context,
+            None,
+        )
+        .expect("reopened Rust analyzer");
+        assert_eq!(reopened.get_analyzed_files().len(), 2);
+        let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
+        let snapshots = reopened.inner.selected_workspace_snapshots();
+        let languages = [brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionLanguage::new(
+            "rust", Language::Rust,
+        )];
+        let brokk_bifrost_analysis::analyzer::store::resolution_publication::SelectedResolutionOverlayInputsOutcome::Ready {
+            masks,
+            content_mounts,
+        } = reopened
+            .inner
+            .selected_rust_resolution_overlay_inputs(snapshots.as_ref(), &cancellation)
+            .expect("selected Rust overlay inputs")
+        else {
+            panic!("selected Rust overlay inputs must be ready");
+        };
+        let input = brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationInput::new(
+            reopened.inner.project(),
+            reopened.inner.workspace_id(),
+            snapshots.as_ref(),
+            &languages,
+            &masks,
+        )
+        .with_content_mounts(content_mounts);
+        let brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(operation) = reopened
+            .analyzer_store()
+            .open_selected_resolution_operation(input, &cancellation)
+            .expect("selected Rust operation")
+        else {
+            panic!("selected Rust operation must be ready");
+        };
+        let selected_blob_id = operation
+            .mount_table()
+            .blob_for_path("rust", "src/lib.rs")
+            .expect("selected fixture source mapping")
+            .and_then(std::num::NonZeroI64::new)
+            .filter(|id| id.get() > 0)
+            .expect("positive selected fixture source blob ID");
+        drop(operation);
+        let connection = reopened
+            .analyzer_store()
+            .active_read_conn()
+            .expect("read retained store");
+        let all_guard_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_rust_declaration_properties",
+                [],
+                |row| row.get(0),
+            )
+            .expect("all retained guard rows");
+        let fixture_guard_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_rust_declaration_properties WHERE blob_id = ?1",
+                [selected_blob_id.get()],
+                |row| row.get(0),
+            )
+            .expect("fixture guard rows");
+        assert!(
+            all_guard_rows > fixture_guard_rows,
+            "another published blob shares this store"
+        );
+        let mut statement = connection
+            .prepare(
+                "SELECT d.name_start_byte, d.name_end_byte, p.cfg_condition
+                 FROM source_declarations AS d
+                 JOIN source_rust_declaration_properties AS p
+                   USING (blob_id, declaration_id)
+                 WHERE d.blob_id = ?1 AND d.name_start_byte IS NOT NULL",
+            )
+            .expect("retained Rust declaration guards");
+        let mut guards = HashMap::new();
+        for row in statement
+            .query_map([selected_blob_id.get()], |row| {
+                Ok((
+                    row.get::<_, usize>(0)?,
+                    row.get::<_, usize>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .expect("read retained guards")
+        {
+            let (start, end, encoded) = row.expect("declaration guard row");
+            let name = source
+                .get(start..end)
+                .expect("declaration name range in source");
+            if ["only_x", "enabled_attr", "control"].contains(&name) {
+                let guard = decode_rust_cfg_condition(&encoded).expect("typed retained cfg guard");
+                assert!(
+                    guards.insert(name, guard).is_none(),
+                    "one declaration for {name}"
+                );
+            }
+        }
+        assert_eq!(
+            guards.len(),
+            3,
+            "all attributed and control declarations retained: {guards:?}"
+        );
+
+        // The concrete target cfg comes from the same Cargo configuration reader,
+        // without selected inventory incompleteness from the external dependency.
+        // #10255 tracks the separate native usage consumer of these facts.
+        let config = RustCargoConfigDocument::from_source_bytes(cargo_config.as_bytes())
+            .expect("parsed explicit Linux target");
+        let mut linux =
+            RustCargoConfiguration::from_files([(PathBuf::from(".cargo/config.toml"), config)])
+                .cfg_atoms(Path::new(""));
+        assert!(linux.contains("unix") && linux.contains("target_os = \"linux\""));
+        linux.insert("feature = \"default\"".to_owned());
+        let mut linux_with_x = linux.clone();
+        linux_with_x.insert("feature = \"x\"".to_owned());
+        for (name, without_x, with_x) in [
+            ("only_x", Inactive, Active),
+            ("enabled_attr", Active, Active),
+            ("control", Active, Active),
+        ] {
+            let guard = &guards[name];
+            assert_eq!(
+                crate_activation(&linux, guard),
+                without_x,
+                "{name} without x"
+            );
+            assert_eq!(
+                crate_activation(&linux_with_x, guard),
+                with_x,
+                "{name} with x"
+            );
+        }
+    }
 }
 #[cfg(test)]
 mod issue_3080_phase_two {
@@ -747,7 +997,13 @@ mod issue_3080_phase_two {
     use brokk_bifrost_test_macros::hardwon;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn fixture() -> (crate::inline_project::BuiltInlineTestProject, RustAnalyzer) {
+    fn fixture() -> (
+        (
+            crate::inline_project::BuiltInlineTestProject,
+            brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+        ),
+        RustAnalyzer,
+    ) {
         let project = InlineTestProject::with_language(Language::Rust)
         .file("Cargo.toml", "[package]\nname = \"unnamed_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
         .file("src/lib.rs", "pub mod model; pub mod barrel; pub mod consumer; pub mod named; pub mod namespace; pub mod glob;\n")
@@ -758,8 +1014,9 @@ mod issue_3080_phase_two {
         .file("src/namespace.rs", "use crate::model as ns;\nfn call(value: ns::Value) { ns::Trait::ping(&value); }\n")
         .file("src/glob.rs", "use crate::model::*;\nfn call(value: Value) { value.ping(); }\n")
         .build();
-        let analyzer = RustAnalyzer::from_project(project.project().clone());
-        (project, analyzer)
+        let (workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(project.root());
+        ((project, workspace), analyzer)
     }
 
     #[test]
@@ -767,7 +1024,7 @@ mod issue_3080_phase_two {
         "#3080: This fix preserves unnamed glob consumers even though they have no ordinary reference name."
     )]
     fn unnamed_glob_consumers_are_candidates_without_reference_names() {
-        let (project, analyzer) = fixture();
+        let ((project, _workspace), analyzer) = fixture();
         let roots = analyzer
             .declarations(&project.file("src/model.rs"))
             .into_iter()
@@ -860,7 +1117,7 @@ mod issue_3080_phase_two {
         "#3080: It prevents Rust occurrence lowering from separating declaration and constructor cfg guards."
     )]
     fn declaration_and_constructor_guards_remain_paired() {
-        let (project, analyzer) = fixture();
+        let ((project, _workspace), analyzer) = fixture();
         let queries = RustUsageQueries::new(&analyzer);
         let facts = queries
             .declaration_facts_of(&project.file("src/model.rs"))
@@ -946,30 +1203,31 @@ items! {
 
     #[test]
     fn cancelled_seed_or_candidate_walk_publishes_no_partial_set() {
-        let (project, analyzer) = fixture();
+        let ((project, _workspace), analyzer) = fixture();
         let roots = analyzer
             .declarations(&project.file("src/model.rs"))
             .into_iter()
             .filter(|unit| unit.identifier() == "Trait")
             .collect();
         let scope = AnalyzerQueryScope::new(&analyzer);
+        // The package view is lazy, so building the walker polls nothing: a
+        // cancelled seed query reports `Ok(None)` or `Err(Cancelled)` from
+        // wherever the walk next polls, and never publishes seeds.
         assert!(matches!(
             usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| false),
-            Err(RustCargoRouteError::Cancelled)
+            Ok(None) | Err(RustCargoRouteError::Cancelled)
         ));
         let calls = AtomicUsize::new(0);
         assert!(matches!(
             usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| calls
                 .fetch_add(1, Ordering::Relaxed)
                 < 8),
-            Err(RustCargoRouteError::Cancelled)
+            Ok(None) | Err(RustCargoRouteError::Cancelled)
         ));
         let seeds = usage_binding_seeds_while(&analyzer, scope.token(), &roots, &|| true)
             .expect("complete seed query after cancellation")
             .expect("complete seeds after cancellation");
-        // The seeds built the routes in this query scope, so the route memo
-        // answers before the keep_going poll and the candidate read itself
-        // is what reports the cancellation.
+        // The candidate read itself reports the cancellation.
         assert!(matches!(
             usage_candidate_files_from_binding_seeds_while(
                 &analyzer,

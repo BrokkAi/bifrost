@@ -7,7 +7,8 @@ use super::*;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use brokk_bifrost_analysis::analyzer::read_ledger::reason as derivation_reason;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    StatementAssessment, StatementCoordinates, StatementVerdict, statement_assessments,
+    RegionFirstVerdict, StatementAssessment, StatementCoordinates, StatementVerdict,
+    statement_assessments,
 };
 
 const STATEMENT_REACHABILITY_ID_DOMAIN: &[u8] = b"bifrost.code_query.statement_reachability.v1";
@@ -60,6 +61,11 @@ fn row(
                 range: public_range(assessment.coordinates),
                 statement_kind: assessment.kind,
                 verdict,
+                region_first: assessment.region_first.map(|value| match value {
+                    RegionFirstVerdict::First => "first",
+                    RegionFirstVerdict::NotFirst => "not_first",
+                    RegionFirstVerdict::Open => "open",
+                }),
                 reason,
             },
         },

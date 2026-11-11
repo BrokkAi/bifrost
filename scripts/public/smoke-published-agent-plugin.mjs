@@ -152,28 +152,10 @@ export function assertPolicyCatalog(response, host) {
   assert.equal(content?.schema_version, 2, `${host} returned the wrong policy catalog schema`);
   const packs = content?.packs;
   assert.ok(Array.isArray(packs), `${host} returned the wrong policy catalog envelope`);
-  const codeSmells = packs.find((pack) => pack.id === "bifrost.code-smells");
-  const security = packs.find((pack) => pack.id === "bifrost.security");
-  assert.ok(codeSmells, `${host} omitted the bifrost.code-smells pack`);
-  assert.ok(security, `${host} omitted the bifrost.security pack`);
-  assert.ok(
-    Array.isArray(codeSmells.policies) && codeSmells.policies.length > 0,
-    `${host} returned no code-smell policies`,
-  );
-  assert.ok(
-    Array.isArray(security.policies) && security.policies.length > 0,
-    `${host} returned no security policies`,
-  );
-  for (const policyId of [
-    "bifrost.security.java.servlet-parameter-to-jdbc",
-    "bifrost.security.java.system-getenv-to-runtime-exec",
-  ]) {
-    assert.ok(
-      security.policies.some((policy) => policy.id === policyId),
-      `${host} omitted shipped policy ${policyId}`,
-    );
-  }
-  return codeSmells;
+  // The engine ships no product rules, so the core catalog is empty for every
+  // release; hosts supply a verified external catalog. Mirrors
+  // smoke-agent-plugin-release.mjs.
+  assert.deepEqual(packs, [], `${host} core MCP implicitly supplied product rules`);
 }
 
 export function validateMarketplaceManifests(codexMarketplace, claudeMarketplace) {
@@ -383,7 +365,8 @@ function usage() {
 
 Downloads the exact published bifrost-agent-v<version>.tar.gz archive, performs
 a fresh checksum-verified launcher install, runs doctor, and calls list_policies
-through both the Codex and Claude MCP adapters.
+through both the Codex and Claude MCP adapters, which must report an empty
+catalog because core ships no product rules.
 
 Options:
   --version <version>       Required exact release version, for example 0.10.1

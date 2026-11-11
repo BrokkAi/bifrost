@@ -19,8 +19,9 @@ use crate::{
     PolicyObligationKind, PolicyOnInconclusive, PolicyPackActivationReview, PolicyReportDiagnostic,
     PolicyReportDiagnosticCode, PolicyReportDocument, PolicyReportEvaluationContext,
     PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicyRunScope, PolicyRunScopeKind,
-    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
-    PolicySuppressionReview, PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
+    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySubjectVerdicts,
+    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicyWorkReport, ProofMetadata,
+    RelatedPolicyLocation, SubjectVerdict,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -392,12 +393,17 @@ impl<'a> SarifResult<'a> {
                 .then(|| SarifPartialFingerprints {
                     finding_id: finding.id(),
                 }),
-            // A finding is claimed by at most one mechanism (suppressions and
-            // scope claim before the baseline), so this array stays one
-            // element.
+            // A finding is claimed by at most one mechanism (suppressions,
+            // inline directives and scope claim before the baseline), so this
+            // array stays one element.
             suppressions: finding
                 .suppression()
                 .map(|suppression| [SarifSuppression::from_suppression(suppression)])
+                .or_else(|| {
+                    finding
+                        .inline_suppression()
+                        .map(|inline| [SarifSuppression::from_inline(inline)])
+                })
                 .or_else(|| {
                     finding
                         .baseline()
@@ -416,6 +422,7 @@ impl<'a> SarifResult<'a> {
                 certainty: finding.certainty(),
                 classification: finding.classification(),
                 evidence: finding.evidence(),
+                model_attribution: finding.model_attribution(),
                 related_locations_truncated: finding.related_truncated(),
                 omitted_related_locations_lower_bound: finding
                     .omitted_related_locations_lower_bound(),
@@ -436,7 +443,8 @@ impl<'a> SarifResult<'a> {
 struct SarifSuppression<'a> {
     kind: &'static str,
     status: &'static str,
-    justification: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    justification: Option<&'a str>,
     properties: SarifSuppressionPropertySet<'a>,
 }
 
@@ -446,7 +454,7 @@ impl<'a> SarifSuppression<'a> {
         Self {
             kind: "external",
             status: "accepted",
-            justification: decision.reason(),
+            justification: Some(decision.reason()),
             properties: SarifSuppressionPropertySet::Suppression(SarifSuppressionProperties {
                 identity_stability: decision.identity_stability(),
                 accepted_by: decision.accepted_by(),
@@ -454,6 +462,21 @@ impl<'a> SarifSuppression<'a> {
                 expires_at: decision.expires_at(),
                 policy_hash_at_acceptance: decision.policy_hash_at_acceptance(),
                 policy_hash_state: suppression.policy_hash_state(),
+            }),
+        }
+    }
+
+    /// A finding an inline comment directive accepted is an `inSource`
+    /// suppression, the SARIF kind for a suppression written in the code.
+    fn from_inline(inline: &'a crate::PolicyFindingInlineSuppression) -> Self {
+        Self {
+            kind: "inSource",
+            status: "accepted",
+            justification: inline.reason(),
+            properties: SarifSuppressionPropertySet::Inline(SarifInlineProperties {
+                decision: "inline",
+                line: inline.line(),
+                policies: inline.policies(),
             }),
         }
     }
@@ -466,7 +489,7 @@ impl<'a> SarifSuppression<'a> {
         Self {
             kind: "external",
             status: "accepted",
-            justification: baseline.reason(),
+            justification: Some(baseline.reason()),
             properties: SarifSuppressionPropertySet::Baseline(SarifBaselineProperties {
                 decision: "baseline",
                 accepted_by: baseline.accepted_by(),
@@ -484,6 +507,17 @@ impl<'a> SarifSuppression<'a> {
 enum SarifSuppressionPropertySet<'a> {
     Suppression(SarifSuppressionProperties<'a>),
     Baseline(SarifBaselineProperties<'a>),
+    Inline(SarifInlineProperties<'a>),
+}
+
+#[derive(Serialize)]
+struct SarifInlineProperties<'a> {
+    #[serde(rename = "bifrost.decision")]
+    decision: &'static str,
+    #[serde(rename = "bifrost.directiveLine")]
+    line: u64,
+    #[serde(rename = "bifrost.policies")]
+    policies: &'a [crate::PolicyId],
 }
 
 #[derive(Serialize)]
@@ -594,6 +628,11 @@ struct SarifResultProperties<'a> {
     classification: &'a crate::FindingClassification,
     #[serde(rename = "bifrost.evidence")]
     evidence: &'a PolicyFindingEvidence,
+    #[serde(
+        rename = "bifrost.modelAttribution",
+        skip_serializing_if = "Option::is_none"
+    )]
+    model_attribution: Option<&'a crate::ModelAttribution>,
     #[serde(rename = "bifrost.relatedLocationsTruncated")]
     related_locations_truncated: bool,
     #[serde(rename = "bifrost.omittedRelatedLocationsLowerBound")]
@@ -889,11 +928,19 @@ impl Serialize for SarifNotifications<'_> {
             .iter()
             .filter(|run| SarifNotification::policy_completion(run).is_some())
             .count();
+        let subject_notifications = report
+            .runs()
+            .iter()
+            .filter_map(PolicyRun::subjects)
+            .flat_map(|subjects| &subjects.entries)
+            .filter(|entry| matches!(entry.verdict, SubjectVerdict::Undecided { .. }))
+            .count();
         let notification_count = report
             .diagnostics()
             .len()
             .checked_add(usize::from(report.diagnostics_truncated()))
             .and_then(|count| count.checked_add(completion_notifications))
+            .and_then(|count| count.checked_add(subject_notifications))
             .ok_or_else(|| S::Error::custom("SARIF notification count overflow"))?;
         let mut sequence = serializer.serialize_seq(Some(notification_count))?;
         for diagnostic in report.diagnostics() {
@@ -907,7 +954,52 @@ impl Serialize for SarifNotifications<'_> {
                 sequence.serialize_element(&notification)?;
             }
         }
+        for run in report.runs() {
+            if let Some(subjects) = run.subjects() {
+                for entry in &subjects.entries {
+                    if let SubjectVerdict::Undecided { reasons, .. } = &entry.verdict {
+                        sequence.serialize_element(&SarifSubjectNotification::new(
+                            &entry.selector,
+                            reasons,
+                            &entry.location,
+                        ))?;
+                    }
+                }
+            }
+        }
         sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SarifSubjectNotification<'a> {
+    descriptor: SarifDescriptorReference,
+    message: SarifMessage<'static>,
+    level: SarifNotificationLevel,
+    locations: [SarifLocation<'a>; 1],
+    properties: SarifSubjectNotificationProperties<'a>,
+}
+
+#[derive(Serialize)]
+struct SarifSubjectNotificationProperties<'a> {
+    selector: &'a str,
+    reasons: &'a [String],
+}
+
+impl<'a> SarifSubjectNotification<'a> {
+    fn new(selector: &'a str, reasons: &'a [String], location: &'a PolicySourceLocation) -> Self {
+        Self {
+            descriptor: SarifDescriptorReference {
+                id: SarifDescriptorId::Static("BIFROST_POLICY_SUBJECT_UNDECIDED"),
+            },
+            message: SarifMessage {
+                text: "Policy subject selection is undecided",
+            },
+            level: SarifNotificationLevel::Warning,
+            locations: [SarifLocation::primary(location)],
+            properties: SarifSubjectNotificationProperties { selector, reasons },
+        }
     }
 }
 
@@ -1134,6 +1226,8 @@ struct SarifRunProperties<'a> {
     evaluation: &'a PolicyReportEvaluationContext,
     #[serde(rename = "bifrost.policyRuns")]
     policy_runs: SarifPolicyRuns<'a>,
+    #[serde(skip_serializing_if = "SarifSubjectBlocks::is_empty")]
+    subjects: SarifSubjectBlocks<'a>,
     #[serde(rename = "bifrost.suppressionReviews")]
     suppressions: &'a [PolicySuppressionReview],
     #[serde(rename = "bifrost.scopeReviews")]
@@ -1171,6 +1265,7 @@ impl<'a> SarifRunProperties<'a> {
             schema_version: report.schema_version(),
             evaluation: report.evaluation(),
             policy_runs: SarifPolicyRuns(report.runs()),
+            subjects: SarifSubjectBlocks(report.runs()),
             suppressions: report.suppressions(),
             scope: report.scope(),
             diff_baseline: report.diff(),
@@ -1181,6 +1276,35 @@ impl<'a> SarifRunProperties<'a> {
             omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),
             worst_omitted_diagnostic_severity: report.worst_omitted_diagnostic_severity(),
         }
+    }
+}
+
+struct SarifSubjectBlocks<'a>(&'a [PolicyRun]);
+
+impl SarifSubjectBlocks<'_> {
+    fn is_empty(&self) -> bool {
+        !self.0.iter().any(|run| run.subjects().is_some())
+    }
+}
+
+impl Serialize for SarifSubjectBlocks<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Block<'a> {
+            policy_id: &'a str,
+            subjects: &'a PolicySubjectVerdicts,
+        }
+        let blocks = self.0.iter().filter_map(|run| {
+            run.subjects().map(|subjects| Block {
+                policy_id: run.policy_id().as_str(),
+                subjects,
+            })
+        });
+        let values = blocks.collect::<Vec<_>>();
+        serialize_sequence(serializer, values.len(), values)
     }
 }
 

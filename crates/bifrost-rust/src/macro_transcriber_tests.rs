@@ -15,7 +15,7 @@ fn deeply_nested_transcriber_emits_on_a_small_stack() {
         "[".repeat(depth),
         "]".repeat(depth)
     );
-    let tree = parse_rust_tree(&source).unwrap();
+    let tree = parse_rust_tree_for_test(&source).unwrap();
     assert!(!tree.root_node().has_error());
     // Parse and drop the tree outside the small stack: this law exercises our
     // Rust traversal, not the parser's own implementation or destructor.
@@ -54,7 +54,7 @@ fn deeply_nested_transcriber_emits_on_a_small_stack() {
 fn transcriber_emission_preserves_tokens_and_metavariable_identity() {
     let source =
         "macro_rules! m { ($name:ident, $other:ident) => { fn $name() { let $other = $name; } }; }";
-    let tree = parse_rust_tree(source).unwrap();
+    let tree = parse_rust_tree_for_test(source).unwrap();
     assert!(!tree.root_node().has_error());
     let mut emitted = String::new();
     let mut saw = false;
@@ -77,7 +77,7 @@ fn transcriber_emission_preserves_tokens_and_metavariable_identity() {
 #[hardwon("510037d56a89: requested metavariable selection matched an unrelated binding")]
 fn transcriber_emission_does_not_mark_other_metavariables_as_requested() {
     let source = "macro_rules! m { ($other:ident) => { struct $other; }; }";
-    let tree = parse_rust_tree(source).unwrap();
+    let tree = parse_rust_tree_for_test(source).unwrap();
     let mut emitted = String::new();
     let mut saw = false;
     emit_transcriber_for_reparse(
@@ -96,7 +96,7 @@ fn transcriber_emission_does_not_mark_other_metavariables_as_requested() {
 #[hardwon("510037d56a89: stack-safe traversal changed the captured repetition projection")]
 fn transcriber_emission_preserves_existing_repetition_projection() {
     let source = "macro_rules! m { ($($name:ident),*) => { $(struct $name;)* }; }";
-    let tree = parse_rust_tree(source).unwrap();
+    let tree = parse_rust_tree_for_test(source).unwrap();
     assert!(!tree.root_node().has_error());
     let mut emitted = String::new();
     let mut saw = false;
@@ -110,4 +110,12 @@ fn transcriber_emission_preserves_existing_repetition_projection() {
     );
     assert!(saw);
     assert_eq!(emitted, "{ ( struct DummyIdent ; ) } ");
+}
+
+fn parse_rust_tree_for_test(source: &str) -> Option<tree_sitter::Tree> {
+    // Standalone fixtures have no analyzer owner; retain nothing across calls.
+    let caches = crate::lexical_scope::RustLexicalCaches::new(
+        &brokk_bifrost_core::retention_budget::RetentionBudget::retain_nothing(),
+    );
+    crate::lexical_scope::parse_rust_tree_with(&caches, source)
 }

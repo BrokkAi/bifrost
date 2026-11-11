@@ -35,84 +35,59 @@ impl<T: IAnalyzer + ?Sized> SemanticModelLocations for T {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SourceRecordIdentity {
-    pack_digest: String,
-    record_kind: String,
-    record_id: String,
-}
+pub struct CarriedSourceLocations;
 
-impl SourceRecordIdentity {
-    fn new(shard: &ActiveSemanticModelShard, record_kind: &str, record_id: &str) -> Self {
-        Self {
-            pack_digest: shard.manifest.semantic_sha256.clone(),
-            record_kind: record_kind.to_owned(),
-            record_id: record_id.to_owned(),
-        }
+impl SemanticModelLocations for CarriedSourceLocations {
+    fn record_location(
+        &self,
+        shard: &ActiveSemanticModelShard,
+        locator: &Locator,
+        fallback_symbol: &str,
+        record_kind: &str,
+        record_id: &str,
+    ) -> SemanticModelLocation {
+        carried_source_anchor(&shard.manifest.carried_sources, locator, fallback_symbol)
+            .map(SemanticModelLocation::Authored)
+            .unwrap_or_else(|| model_location(shard, record_kind, record_id))
     }
 }
 
-/// Workspace-derived kind-1 facts, like generated symbols. Only Source
-/// locators are translated eagerly; artifact packs contribute no entries.
-/// The overlay publication budget bounds these anchors with the generated facts.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct SourceAnchors {
-    anchors: HashMap<SourceRecordIdentity, SemanticModelAuthoredAnchor>,
+pub use crate::analyzer::store::semantic_composition::SourceAnchors;
+
+pub struct SourceAnchorView<'a> {
+    pub activation: &'a SourceAnchors,
+    pub request: Option<crate::retention_budget::BudgetedValue<SourceAnchors>>,
 }
 
-impl SourceAnchors {
-    pub(super) fn retained_bytes_lower_bound(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.anchors.capacity().saturating_mul(std::mem::size_of::<(
-                SourceRecordIdentity,
-                SemanticModelAuthoredAnchor,
-            )>()))
-            .saturating_add(self.anchors.iter().fold(0usize, |bytes, (key, anchor)| {
-                bytes
-                    .saturating_add(key.pack_digest.capacity())
-                    .saturating_add(key.record_kind.capacity())
-                    .saturating_add(key.record_id.capacity())
-                    .saturating_add(anchor.path.capacity())
-                    .saturating_add(anchor.symbol.capacity())
-            }))
-    }
-
-    pub(crate) fn digest(&self) -> String {
-        let mut entries = self.anchors.iter().collect::<Vec<_>>();
-        entries.sort_unstable_by(|(a, _), (b, _)| {
-            (&a.pack_digest, &a.record_kind, &a.record_id).cmp(&(
-                &b.pack_digest,
-                &b.record_kind,
-                &b.record_id,
-            ))
-        });
-        let mut digest =
-            crate::analyzer::semantic::LengthDelimitedDigest::new(b"semantic-source-anchors-v1");
-        for (key, anchor) in entries {
-            digest.push(format!("{key:?}:{anchor:?}").as_bytes());
+impl SourceAnchorView<'_> {
+    pub fn ids_at_path(&self, path: &str) -> Vec<String> {
+        let mut ids = self.activation.ids_at_path(path);
+        if let Some(request) = &self.request {
+            ids.extend(request.ids_at_path(path));
         }
-        digest.finish().to_string()
+        ids
     }
+}
 
-    pub(crate) fn ids_at_path(&self, path: &str) -> Vec<String> {
-        self.anchors
-            .iter()
-            .filter(|(_, anchor)| anchor.path == path)
-            .map(|(key, _)| key.record_id.clone())
-            .collect()
-    }
-
-    pub(crate) fn insert_symbol(&mut self, record_kind: &'static str, symbol: SemanticModelSymbol) {
-        if let SemanticModelLocation::Authored(anchor) = symbol.location {
-            self.anchors.insert(
-                SourceRecordIdentity {
-                    pack_digest: symbol.provenance.pack_digest,
-                    record_kind: record_kind.to_owned(),
-                    record_id: symbol.id,
-                },
-                anchor,
-            );
-        }
+impl SemanticModelLocations for SourceAnchorView<'_> {
+    fn record_location(
+        &self,
+        shard: &ActiveSemanticModelShard,
+        _locator: &Locator,
+        _fallback_symbol: &str,
+        record_kind: &str,
+        record_id: &str,
+    ) -> SemanticModelLocation {
+        self.activation
+            .get(shard, record_kind, record_id)
+            .or_else(|| {
+                self.request
+                    .as_ref()
+                    .and_then(|request| request.get(shard, record_kind, record_id))
+            })
+            .cloned()
+            .map(SemanticModelLocation::Authored)
+            .unwrap_or_else(|| model_location(shard, record_kind, record_id))
     }
 }
 
@@ -125,8 +100,7 @@ impl SemanticModelLocations for SourceAnchors {
         record_kind: &str,
         record_id: &str,
     ) -> SemanticModelLocation {
-        self.anchors
-            .get(&SourceRecordIdentity::new(shard, record_kind, record_id))
+        self.get(shard, record_kind, record_id)
             .cloned()
             .map(SemanticModelLocation::Authored)
             .unwrap_or_else(|| model_location(shard, record_kind, record_id))

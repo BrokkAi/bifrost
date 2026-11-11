@@ -27,7 +27,8 @@ use crate::value_flow::{
 use super::graph::{ComposedSourceId, Endpoint, Hop, HopQuality};
 use super::labels::LabeledPath;
 use super::provider::{
-    BoundSource, CompositionProvider, InteriorObservation, InteriorSeed, InteriorTarget,
+    BoundSource, CallModel, Completeness, CompositionProvider, InteriorObservation, InteriorSeed,
+    InteriorTarget,
 };
 use super::search::{BudgetLane, Incompleteness, SearchOutcome, provider_error};
 use super::{ComposeError, CompositionBudget};
@@ -42,6 +43,8 @@ const ZERO_FACT: usize = 0;
 pub(super) struct StoreWitnessBoundary {
     pub write_call: DurableCallSiteKey,
     pub read_call: DurableCallSiteKey,
+    pub write_site: crate::analyzer::semantic::SemanticLocator,
+    pub read_site: crate::analyzer::semantic::SemanticLocator,
     pub prefix_steps: usize,
 }
 
@@ -53,6 +56,8 @@ pub struct ComposedStoreCrossing {
     pub witness: Arc<SummaryWitness>,
     pub write_call: DurableCallSiteKey,
     pub read_call: DurableCallSiteKey,
+    pub write_site: crate::analyzer::semantic::SemanticLocator,
+    pub read_site: crate::analyzer::semantic::SemanticLocator,
     pub prefix_steps: usize,
 }
 
@@ -96,6 +101,7 @@ pub(super) fn build_report<
         provider,
         functions: &outcome.functions,
         handles: HashMap::default(),
+        gaps: Vec::new(),
     };
     let mut by_sink: Vec<(ValueFlowSinkId, Vec<LabeledPath>)> = Vec::new();
     for path in labeled {
@@ -168,6 +174,8 @@ pub(super) fn build_report<
                                 witness: Arc::clone(&witness),
                                 write_call: boundary.write_call,
                                 read_call: boundary.read_call,
+                                write_site: boundary.write_site,
+                                read_site: boundary.read_site,
                                 prefix_steps: boundary.prefix_steps,
                             });
                         }
@@ -175,7 +183,7 @@ pub(super) fn build_report<
                     }
                     None => witness_unavailable = true,
                 }
-                for closure in path_closures(plan, provider, path)? {
+                for closure in path_closures(plan, provider, &outcome.call_models, path, request)? {
                     if !closures.contains(&closure) {
                         closures.push(closure);
                     }
@@ -227,13 +235,19 @@ pub(super) fn build_report<
         if !finding_complete {
             for path in &paths {
                 for call in path_calls(plan, path)? {
-                    if let Some(model) = provider.model(&call)
+                    if let Some(model) = call_model(provider, &outcome.call_models, &call, request)?
                         && (model.authored.is_some() || !model.quality().complete)
                     {
-                        let cause = Incompleteness::Dispatch {
+                        // Dispatch can be exact while the model's continuation
+                        // remains partial; preserve that cause distinction.
+                        let cause = Incompleteness::Model {
                             call,
                             reason: "reported path crosses an authored or partial external model"
                                 .into(),
+                            cause: match &model.completeness {
+                                Completeness::Incomplete { cause, .. } => *cause,
+                                Completeness::Complete => super::IncompleteCause::Content,
+                            },
                         };
                         if !finding_incompleteness.contains(&cause) {
                             finding_incompleteness.push(cause);
@@ -250,10 +264,16 @@ pub(super) fn build_report<
                 qualities,
                 proven,
                 finding_complete,
-                TaintOriginStatus::composed(evidence, witness_unavailable),
+                TaintOriginStatus::composed_merged(evidence, witness_unavailable)
+                    .map_err(ComposeError::Report)?,
             )
             .map_err(ComposeError::Report)?,
         );
+    }
+    for gap in witnesses.gaps {
+        if !finding_incompleteness.contains(&gap) {
+            finding_incompleteness.push(gap);
+        }
     }
     let result = TaintSummaryResult::composed(
         plan,
@@ -310,17 +330,37 @@ fn path_calls(
 /// takes, of every call its stored and interior flows cross, and of the
 /// sink's own call, as the ICFG engine's `witness_arm_closures` reads them
 /// from a witness's call steps.
+/// The model that replaces `call`. The search's dispatches answer most calls;
+/// a call crossed inside an interior or stored flow, a store hop's write or
+/// read call, or the sink's own call may have been dispatched only inside the
+/// provider, so it is asked again under the live request.
+fn call_model<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>>(
+    provider: &Provider,
+    call_models: &HashMap<DurableCallSiteKey, Option<Arc<CallModel<TaintEdgeFunction>>>>,
+    call: &DurableCallSiteKey,
+    request: &mut SemanticRequest<'_>,
+) -> Result<Option<Arc<CallModel<TaintEdgeFunction>>>, ComposeError> {
+    if let Some(model) = call_models.get(call) {
+        return Ok(model.clone());
+    }
+    let (_, model) = provider.dispatch(call, request).map_err(provider_error)?;
+    Ok(model.map(Arc::new))
+}
+
 fn path_closures<
     Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>,
 >(
     plan: &TaintAnalysisPlan,
     provider: &Provider,
+    call_models: &HashMap<DurableCallSiteKey, Option<Arc<CallModel<TaintEdgeFunction>>>>,
     path: &LabeledPath,
+    request: &mut SemanticRequest<'_>,
 ) -> Result<Vec<AuthoredArmClosure>, ComposeError> {
     let calls = path_calls(plan, path)?;
     let mut closures = Vec::new();
     for call in calls {
-        let authored = provider.model(&call).and_then(|model| model.authored);
+        let authored = call_model(provider, call_models, &call, request)?
+            .and_then(|model| model.authored.clone());
         for closure in authored.into_iter().flatten() {
             if !closures.contains(&closure) {
                 closures.push(closure);
@@ -341,6 +381,9 @@ fn termination(budget: CompositionBudget, incomplete: &[Incompleteness]) -> Solv
         _ => None,
     });
     match exhausted {
+        // The semantic request owns this budget and reports its own refusal.
+        // Do not invent a solver-budget dimension for it.
+        Some(BudgetLane::Semantic) => SolverTermination::FixedPoint,
         Some(BudgetLane::Procedures) => {
             SolverTermination::ExceededBudget(SolverBudgetExceeded::new(
                 SolverBudgetDimension::ProviderMaterializations,
@@ -372,13 +415,16 @@ struct WitnessBuilder<'a, 'u, Provider> {
     functions: &'a super::labels::LabelFunctions<super::labels::TaintLabels<'u>>,
     /// Live handles of procedures a witness run has served.
     handles: HashMap<DurableProcedureKey, ProcedureHandle>,
+    /// Why witness runs that recorded no witness were incomplete. The search
+    /// ran the same interiors without witnesses, so these causes are new.
+    gaps: Vec<Incompleteness>,
 }
 
 impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFunction>>
     WitnessBuilder<'_, '_, Provider>
 {
     /// The witness of one path: the recorded steps of every interior and
-    /// stored hop, and a call or return step at every caller and callee hop.
+    /// stored hop, and a call, return, or modeled receiver step at crossings.
     /// `None` when a hop's steps cannot be recorded.
     fn witness(
         &mut self,
@@ -420,16 +466,28 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
             if let Hop::Store {
                 write_call,
                 read_call,
+                write_site,
+                read_site,
                 ..
             } = hop
             {
                 store_boundaries.push(StoreWitnessBoundary {
                     write_call: write_call.clone(),
                     read_call: read_call.clone(),
+                    write_site: write_site.as_ref().clone(),
+                    read_site: read_site.as_ref().clone(),
                     prefix_steps: steps.len(),
                 });
             }
-            let (Hop::Caller { call, .. } | Hop::Callee { call, .. }) = hop else {
+            // An open partial summary needs its own step to carry provenance.
+            // Closed models retain their established witness step shape.
+            if matches!(hop, Hop::Model { retains_dispatch: false, actual, .. } if !matches!(actual, PartialFlowPort::CallReceiver { .. }))
+            {
+                continue;
+            }
+            let (Hop::Caller { call, .. } | Hop::Callee { call, .. } | Hop::Model { call, .. }) =
+                hop
+            else {
                 continue;
             };
             let Some(handle) = self.handles.get(&call.0) else {
@@ -445,7 +503,7 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
                 return Ok(None);
             };
             let kind = if matches!(hop, Hop::Caller { .. }) {
-                IcfgEdgeKind::Call
+                SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call)
             } else if matches!(
                 hop,
                 Hop::Callee {
@@ -454,16 +512,41 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
                     ..
                 }
             ) {
-                IcfgEdgeKind::ExceptionalReturn
+                SummaryWitnessStepKind::Edge(IcfgEdgeKind::ExceptionalReturn)
+            } else if matches!(
+                hop,
+                Hop::Model {
+                    actual: PartialFlowPort::CallReceiver { .. },
+                    ..
+                }
+            ) {
+                SummaryWitnessStepKind::ModeledReceiver
             } else {
-                IcfgEdgeKind::NormalReturn
+                SummaryWitnessStepKind::Edge(IcfgEdgeKind::NormalReturn)
             };
-            steps.push(step(
-                SummaryWitnessStepKind::Edge(kind),
-                point,
-                Some(call_handle),
-                hop.quality(),
-            ));
+            let mut witness_step = step(kind, point, Some(call_handle), hop.quality());
+            if let Hop::Model {
+                summary: Some(summary),
+                ..
+            } = hop
+            {
+                witness_step = witness_step.with_summary((**summary).clone());
+            }
+            let witness_step = if kind == SummaryWitnessStepKind::ModeledReceiver {
+                let Some(receiver) = site
+                    .receiver
+                    .and_then(|value| handle.semantics().value(value))
+                else {
+                    return Ok(None);
+                };
+                let Some(mapping) = handle.semantics().source_mapping(receiver.source) else {
+                    return Ok(None);
+                };
+                witness_step.with_receiver_operand(mapping.locator.clone())
+            } else {
+                witness_step
+            };
+            steps.push(witness_step);
         }
         // Reconstruction follows the proven derivation when there is one.
         // Completeness supplied only by another alternative does not make
@@ -536,6 +619,19 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
             .find(|flow| flow.seed == 0 && &flow.target == target)
             .and_then(|flow| flow.witness.as_deref())
         else {
+            // A missing witness is answer content only when its run was
+            // complete. Otherwise the run's own cause decides it, so a
+            // provider failure or a budget stop is not kept as content (#9947).
+            if let Completeness::Incomplete { reason, cause } = flows.completeness {
+                let gap = Incompleteness::Interior {
+                    procedure: procedure.clone(),
+                    reason,
+                    cause,
+                };
+                if !self.gaps.contains(&gap) {
+                    self.gaps.push(gap);
+                }
+            }
             return Ok(None);
         };
         let mut steps = Vec::new();
@@ -588,7 +684,11 @@ impl<Provider: CompositionProvider<Fact = TaintClassSet, Function = TaintEdgeFun
                 InteriorTarget::Observation(0),
             ),
             Endpoint::Port(port) => (Vec::new(), InteriorTarget::Port(port.clone())),
-            Endpoint::Source(_) | Endpoint::Execution(_) | Endpoint::Writeback { .. } => {
+            Endpoint::Source(_)
+            | Endpoint::Execution(_)
+            | Endpoint::Object(_)
+            | Endpoint::Writeback { .. }
+            | Endpoint::CallHandoff { .. } => {
                 return Ok(None);
             }
         };
@@ -645,10 +745,12 @@ pub(super) fn interior_seed<Fact>(
                 carrier: source.carrier.clone(),
             })
         }
-        Endpoint::Sink(_)
+        Endpoint::CallHandoff { .. }
+        | Endpoint::Sink(_)
         | Endpoint::StoreWrite(_)
         | Endpoint::Location(_)
         | Endpoint::Execution(_) => None,
+        Endpoint::Object(_) => None,
     }
 }
 
@@ -670,7 +772,7 @@ pub(super) fn interior_observation(
 /// path. A composed path's quality is axis by axis (see [`HopQuality`]), and
 /// a finding reads the frontier's axes separately, so the mapping keeps both
 /// answers.
-fn path_quality(quality: HopQuality) -> PathQuality {
+pub(crate) fn path_quality(quality: HopQuality) -> PathQuality {
     match (quality.proven, quality.complete) {
         (true, true) => PathQuality::PROVEN_COMPLETE,
         (true, false) => PathQuality::PROVEN_PARTIAL,
@@ -679,7 +781,7 @@ fn path_quality(quality: HopQuality) -> PathQuality {
     }
 }
 
-fn step(
+pub(crate) fn step(
     kind: SummaryWitnessStepKind,
     point: crate::analyzer::semantic::ProgramPointHandle,
     origin: Option<crate::analyzer::semantic::CallSiteHandle>,

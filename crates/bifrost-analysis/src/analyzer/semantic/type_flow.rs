@@ -211,14 +211,26 @@ pub fn external_member_lookup(
     member: &str,
 ) -> MemberLookup {
     let matched = overlay.symbols_with_id(owner_id);
+    if matches!(
+        matched.disposition,
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
     let [owner] = matched.records.as_slice() else {
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
     };
     if owner.owner_id.is_some() || owner.kind != SemanticModelSymbolKind::Class {
         return MemberLookup::Unknown(UnknownReason::PackIncomplete);
     }
-    let owners = overlay
-        .symbols_named(&owner.qualified_name)
+    let owners_match = overlay.symbols_named_for(&owner.qualified_name, &owner.language);
+    if matches!(
+        owners_match.disposition,
+        crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return MemberLookup::Unknown(UnknownReason::PackIncomplete);
+    }
+    let owners = owners_match
         .records
         .into_iter()
         .filter(|candidate| {
@@ -236,8 +248,12 @@ pub fn external_member_lookup(
     for candidate in owners {
         complete_surface |=
             candidate.provenance.completeness == SemanticModelCompleteness::Complete;
-        let raw_members = overlay
-            .members_of(&candidate.id)
+        let members_match = overlay.members_of_for(&candidate.id, &candidate.language);
+        coverage_open |= matches!(
+            members_match.disposition,
+            crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+        );
+        let raw_members = members_match
             .records
             .into_iter()
             .filter(|record| {

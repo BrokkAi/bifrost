@@ -516,6 +516,9 @@ schema_version:
                 carried_sources: carried_source_paths(&shards),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards,
             }),
             completeness,
@@ -645,7 +648,79 @@ mod tests {
     use brokk_bifrost_semantic::analyzer::semantic_model::compiler::compile_pack;
 
     use brokk_bifrost_analysis::test_support::write_zip;
+    use brokk_bifrost_test_macros::hardwon;
     use tempfile::tempdir;
+
+    #[test]
+    #[hardwon(
+        "#10690: JDK src.zip members never certified their callable family, so the qualified locator java.io.PrintWriter.println was ambiguous over its overloads"
+    )]
+    fn jdk_source_members_certify_complete_callable_families() {
+        let fixture = tempdir().unwrap();
+        let archive = fixture.path().join("src.zip");
+        write_zip(
+            &archive,
+            &[
+                (
+                    "java.base/module-info.java",
+                    "module java.base { exports java.io; }",
+                ),
+                (
+                    "java.base/java/io/PrintWriter.java",
+                    "package java.io;
+                     import java.util.List;
+                     public class PrintWriter {
+                         public void println() {}
+                         public void println(String x) {}
+                         public void println(int x) {}
+                         private void println(List<List<List<String>>> hidden) {}
+                         public void format(String x) {}
+                         public void format(List<List<List<String>>> deep) {}
+                         public int checkError() { return 0; }
+                     }",
+                ),
+            ],
+        );
+        // A depth of three cannot represent List<List<List<String>>>.
+        let limits = ArtifactProducerLimits {
+            max_signature_depth: 3,
+            ..ArtifactProducerLimits::default()
+        };
+        let production = JdkSourceArchivePackProducer::new(JdkSourceArchiveLayout::ModulePrefixed)
+            .produce_exact_artifact(&request(archive), &limits);
+        let pack = production.pack.expect("JDK pack");
+        let members = pack
+            .shards
+            .iter()
+            .flat_map(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { members, .. } => members.as_slice(),
+                _ => &[],
+            })
+            .collect::<Vec<_>>();
+        let family = |name: &str| {
+            members
+                .iter()
+                .filter(|member| member.name == name)
+                .map(|member| {
+                    (
+                        member.signature.as_ref().unwrap().parameters.len(),
+                        member.callable_family_complete,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // The private overload is outside the public surface and does not
+        // open the family; the unrepresentable public overload of `format`
+        // does.
+        assert_eq!(
+            family("println"),
+            [(0, true), (1, true), (1, true)],
+            "{members:#?}"
+        );
+        assert_eq!(family("format"), [(1, false)], "{members:#?}");
+        assert_eq!(family("checkError"), [(0, true)], "{members:#?}");
+        assert_eq!(family("<init>"), [(0, true)], "{members:#?}");
+    }
 
     #[test]
     fn module_prefixed_jdk_sources_produce_independent_module_shards() {

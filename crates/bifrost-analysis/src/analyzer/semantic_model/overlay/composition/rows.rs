@@ -2,9 +2,11 @@
 
 use super::*;
 use crate::analyzer::store::active_models::resolve_records;
-use crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader;
+use crate::analyzer::store::model_catalog::CatalogRowReader;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::statements as questions;
+use brokk_bifrost_semantic::analyzer::semantic_model::runtime::FamilyOpen;
 use rusqlite::{ToSql, named_params};
+use std::cell::{Cell, OnceCell};
 
 /// Connection-only outside reads; generated symbols belong to this overlay
 /// build, and are included by the group loader and keyed identity checks.
@@ -12,17 +14,32 @@ pub struct RowCompositionReads<'a> {
     pub selection: Option<&'a ModelProviderSelection>,
     pub defining_owner: Option<&'a SemanticModelProvenance>,
     pub active: &'a ResolvedActiveSemanticModels,
-    pub reader: &'a CatalogRuntimeSourceReader,
+    pub activation: Arc<dyn CatalogRowReader + Send + Sync>,
+    jvm: OnceCell<Result<Arc<dyn CatalogRowReader + Send + Sync>, FamilyOpen>>,
     pub generated: &'a [SemanticModelSymbol],
     pub generated_relations: &'a [SemanticModelRelation],
+    activation_only: bool,
     scope: Option<LanguageScope<'a>>,
+    open: Cell<Option<FamilyOpen>>,
     pub(in crate::analyzer::semantic_model::overlay) cancellation:
         Option<&'a crate::CancellationToken>,
 }
 
+type OwnerQualifications = std::cell::RefCell<HashMap<(Option<String>, String), Option<String>>>;
+
 struct LanguageScope<'a> {
-    language: &'a str,
+    language: Option<&'a str>,
+    realm: &'a str,
     shard_keys: String,
+}
+
+impl LanguageScope<'_> {
+    fn accepts(&self, language: &str) -> bool {
+        self.language.map_or_else(
+            || brokk_bifrost_core::analyzer::model::semantic_pack_realm(language) == self.realm,
+            |selected| selected == language,
+        )
+    }
 }
 
 impl<'a> RowCompositionReads<'a> {
@@ -39,7 +56,6 @@ impl<'a> RowCompositionReads<'a> {
 
     pub fn new(
         active: &'a ResolvedActiveSemanticModels,
-        reader: &'a CatalogRuntimeSourceReader,
         generated: &'a [SemanticModelSymbol],
         generated_relations: &'a [SemanticModelRelation],
     ) -> Self {
@@ -47,10 +63,53 @@ impl<'a> RowCompositionReads<'a> {
             selection: None,
             defining_owner: None,
             active,
-            reader,
+            activation: active
+                .source_reader
+                .as_ref()
+                .expect("row-backed set has activation reader")
+                .clone(),
+            jvm: OnceCell::new(),
             generated,
             generated_relations,
+            activation_only: false,
             scope: None,
+            open: Cell::new(None),
+            cancellation: None,
+        }
+    }
+
+    /// Build-time composition reads only activation-owned rows and never opens a request reader.
+    pub fn activation_only(
+        active: &'a ResolvedActiveSemanticModels,
+        generated: &'a [SemanticModelSymbol],
+        generated_relations: &'a [SemanticModelRelation],
+    ) -> Self {
+        let mut reads = Self::new_without_request(active, generated, generated_relations);
+        reads.activation_only = true;
+        reads
+    }
+
+    fn new_without_request(
+        active: &'a ResolvedActiveSemanticModels,
+        generated: &'a [SemanticModelSymbol],
+        generated_relations: &'a [SemanticModelRelation],
+    ) -> Self {
+        let activation = active
+            .source_reader
+            .as_ref()
+            .expect("row-backed set has activation reader")
+            .clone();
+        Self {
+            selection: None,
+            defining_owner: None,
+            active,
+            activation: activation.clone(),
+            jvm: OnceCell::new(),
+            generated,
+            generated_relations,
+            activation_only: true,
+            scope: None,
+            open: Cell::new(None),
             cancellation: None,
         }
     }
@@ -65,21 +124,50 @@ impl<'a> RowCompositionReads<'a> {
     where
         'a: 'b,
     {
+        self.for_scope(
+            Some(language),
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(language),
+        )
+    }
+
+    pub(in crate::analyzer::semantic_model::overlay) fn for_realm<'b>(
+        &self,
+        realm: &'b str,
+    ) -> RowCompositionReads<'b>
+    where
+        'a: 'b,
+    {
+        self.for_scope(None, realm)
+    }
+
+    fn for_scope<'b>(&self, language: Option<&'b str>, realm: &'b str) -> RowCompositionReads<'b>
+    where
+        'a: 'b,
+    {
         use crate::analyzer::store::active_models::CatalogShardDatabase;
         let shards = self
             .active
             .shards
             .iter()
             .filter(|shard| {
+                if self.activation_only && !self.active.activation_owns(shard) {
+                    return false;
+                }
                 let provider = ModelProvider {
                     pack_id: shard.manifest.pack_id.clone(),
                     pack_version: shard.manifest.version.clone(),
                     pack_digest: shard.manifest.semantic_sha256.clone(),
                 };
-                shard.manifest.language == language
-                    && self
-                        .selection
-                        .is_none_or(|selection| selection.contains(&provider))
+                language.map_or_else(
+                    || {
+                        brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                            &shard.manifest.language,
+                        ) == realm
+                    },
+                    |language| shard.manifest.language == language,
+                ) && self
+                    .selection
+                    .is_none_or(|selection| selection.contains(&provider))
                     && super::admits_defining_owner(
                         self.defining_owner,
                         &provider,
@@ -105,15 +193,78 @@ impl<'a> RowCompositionReads<'a> {
             selection: self.selection,
             defining_owner: self.defining_owner,
             active: self.active,
-            reader: self.reader,
+            activation: Arc::clone(&self.activation),
+            jvm: self.jvm.clone(),
             generated: self.generated,
             generated_relations: self.generated_relations,
+            activation_only: self.activation_only,
             cancellation: self.cancellation,
             scope: Some(LanguageScope {
                 language,
+                realm,
                 shard_keys: serde_json::to_string(&shards).expect("shard identities serialize"),
             }),
+            open: Cell::new(None),
         }
+    }
+
+    pub fn open_part(&self) -> Option<FamilyOpen> {
+        self.open.get()
+    }
+
+    /// The JVM owner, bound on the first read that can return JVM rows: an
+    /// unscoped read or one scoped to a JVM-realm language. A read scoped to
+    /// another language never binds it. The bind happens even when the
+    /// activation holds no request-owned shard, because binding is also how
+    /// the request's JVM selection is checked against the activation: a
+    /// request that selects shards the activation lacks answers Open.
+    fn jvm_reader(&self) -> ReadResult<Option<&Arc<dyn CatalogRowReader + Send + Sync>>> {
+        if self.activation_only
+            || self
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.realm != "jvm")
+        {
+            return Ok(None);
+        }
+        match self.jvm.get_or_init(|| {
+            self.active
+                .request_source()
+                .map(|source| source.jvm_reader(self.active).map(|owner| owner.reader))
+                .unwrap_or_else(|| Ok(Arc::clone(&self.activation)))
+        }) {
+            Ok(reader) => Ok(Some(reader)),
+            Err(open) if self.scope.is_none() => {
+                self.open.set(Some(
+                    self.open
+                        .get()
+                        .map_or(*open, |previous| previous.merge(*open)),
+                ));
+                Ok(None)
+            }
+            Err(open) => Err(CatalogError::FamilyOpen(*open)),
+        }
+    }
+
+    /// The distinct JVM owner's part of a statement. For an unscoped read its
+    /// failure is recorded as the open part and the other owners' rows stand,
+    /// exactly as when binding the owner fails (see `jvm_reader`): the open
+    /// part then marks every record a candidate. A read scoped to the JVM
+    /// family fails as a whole.
+    fn jvm_owner_part<T>(&self, result: ReadResult<T>) -> ReadResult<Option<T>> {
+        let open = match result {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if self.scope.is_some() => return Err(error),
+            Err(CatalogError::FamilyOpen(open)) => open,
+            Err(CatalogError::Cancelled) => FamilyOpen::jvm_cancelled(),
+            Err(error) => return Err(error),
+        };
+        self.open.set(Some(
+            self.open
+                .get()
+                .map_or(open, |previous| previous.merge(open)),
+        ));
+        Ok(None)
     }
 
     fn generated_symbols(&self) -> impl Iterator<Item = &SemanticModelSymbol> {
@@ -122,7 +273,7 @@ impl<'a> RowCompositionReads<'a> {
                 && self
                     .scope
                     .as_ref()
-                    .is_none_or(|scope| symbol.language == scope.language)
+                    .is_none_or(|scope| scope.accepts(&symbol.language))
         })
     }
 
@@ -131,36 +282,146 @@ impl<'a> RowCompositionReads<'a> {
             self.admits_provenance(&relation.provenance)
                 && self.scope.as_ref().is_none_or(|scope| {
                     self.active.shards.iter().any(|shard| {
-                        shard.manifest.language == scope.language
+                        scope.accepts(&shard.manifest.language)
                             && shard.manifest.semantic_sha256 == relation.provenance.pack_digest
                     })
                 })
         })
     }
 
+    pub(in crate::analyzer::semantic_model::overlay) fn raw_rows_for_overlay<T>(
+        &self,
+        statement: &str,
+        params: &[(&str, &dyn ToSql)],
+        _shards: &[Arc<crate::analyzer::store::active_models::ActiveSemanticModelShard>],
+        decode: impl Fn(
+            &crate::analyzer::store::model_catalog::OwnedCatalogRow<'_>,
+        ) -> rusqlite::Result<T>,
+    ) -> ReadResult<Vec<crate::analyzer::store::model_catalog::CatalogRawRecord<T>>> {
+        self.raw_rows(statement, params, decode)
+    }
+
+    fn has_activation_shards(&self) -> bool {
+        self.active
+            .shards
+            .iter()
+            .any(|shard| self.active.activation_owns(shard))
+    }
+
+    pub(in crate::analyzer::semantic_model::overlay) fn scalar_question<T>(
+        &self,
+        statement: &str,
+        params: &[(&str, &dyn ToSql)],
+        mut decode: impl FnMut(
+            &crate::analyzer::store::model_catalog::OwnedCatalogRow<'_>,
+        ) -> rusqlite::Result<T>,
+    ) -> ReadResult<Vec<T>> {
+        let mut rows = if self.has_activation_shards() {
+            (self.activation.as_ref() as &dyn CatalogRowReader).scalar_question(
+                statement,
+                params,
+                &mut decode,
+            )?
+        } else {
+            Vec::new()
+        };
+        if let Some(jvm) = self.jvm_reader()?
+            && Arc::as_ptr(jvm) as *const () != Arc::as_ptr(&self.activation) as *const ()
+            && let Some(request_rows) = self.jvm_owner_part(
+                (jvm.as_ref() as &dyn CatalogRowReader).scalar_question(statement, params, decode),
+            )?
+        {
+            rows.extend(request_rows);
+        }
+        Ok(rows)
+    }
+
+    pub(in crate::analyzer::semantic_model::overlay) fn visit_owned_rows(
+        &self,
+        statement: &str,
+        params: &[(&str, &dyn ToSql)],
+        cancellation: Option<&crate::CancellationToken>,
+        mut visit: impl FnMut(
+            &crate::analyzer::store::model_catalog::OwnedCatalogRow<'_>,
+        ) -> rusqlite::Result<bool>,
+    ) -> ReadResult<()> {
+        if self.has_activation_shards() {
+            (self.activation.as_ref() as &dyn CatalogRowReader).visit_owned_rows(
+                statement,
+                params,
+                cancellation,
+                &mut visit,
+            )?;
+        }
+        if let Some(jvm) = self.jvm_reader()?
+            && Arc::as_ptr(jvm) as *const () != Arc::as_ptr(&self.activation) as *const ()
+        {
+            self.jvm_owner_part((jvm.as_ref() as &dyn CatalogRowReader).visit_owned_rows(
+                statement,
+                params,
+                cancellation,
+                visit,
+            ))?;
+        }
+        Ok(())
+    }
+
     fn raw_rows<T>(
         &self,
         statement: &str,
         params: &[(&str, &dyn ToSql)],
-        decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        decode: impl Fn(
+            &crate::analyzer::store::model_catalog::OwnedCatalogRow<'_>,
+        ) -> rusqlite::Result<T>,
     ) -> ReadResult<Vec<crate::analyzer::store::model_catalog::CatalogRawRecord<T>>> {
         check_composition_cancellation(self.cancellation)?;
-        let Some(scope) = &self.scope else {
-            return self
-                .reader
-                .raw_rows(statement, params, &self.active.shards, decode);
+        let scoped_statement = self.scope.as_ref().map(|_| {
+            format!(
+                "SELECT composition_row.* FROM ({}) AS composition_row
+                 JOIN json_each(:composition_shards) AS selected_shard
+                 ON composition_row.source_db=json_extract(selected_shard.value,'$[0]')
+                 AND composition_row.shard_key=json_extract(selected_shard.value,'$[1]')",
+                statement.trim_end().trim_end_matches(';')
+            )
+        });
+        let mut scoped_params = params.to_vec();
+        if let Some(scope) = &self.scope {
+            scoped_params.push((":composition_shards", &scope.shard_keys));
+        }
+        let statement = scoped_statement.as_deref().unwrap_or(statement);
+        let params = scoped_params.as_slice();
+        let jvm = if self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.realm != "jvm")
+        {
+            None
+        } else {
+            self.jvm_reader()?
         };
-        let statement = format!(
-            "SELECT composition_row.* FROM ({}) AS composition_row
-             JOIN json_each(:composition_shards) AS selected_shard
-             ON composition_row.source_db=json_extract(selected_shard.value,'$[0]')
-             AND composition_row.shard_key=json_extract(selected_shard.value,'$[1]')",
-            statement.trim_end().trim_end_matches(';')
-        );
-        let mut params = params.to_vec();
-        params.push((":composition_shards", &scope.shard_keys));
-        self.reader
-            .raw_rows(&statement, params.as_slice(), &self.active.shards, decode)
+        let distinct = jvm.is_some_and(|reader| {
+            Arc::as_ptr(reader) as *const () != Arc::as_ptr(&self.activation) as *const ()
+        });
+        let mut rows = if self.has_activation_shards() {
+            (self.activation.as_ref() as &dyn CatalogRowReader).raw_rows(
+                statement,
+                params,
+                &self.active.shards,
+                &decode,
+            )?
+        } else {
+            Vec::new()
+        };
+        if distinct
+            && let Some(request_rows) =
+                self.jvm_owner_part(
+                    (jvm.expect("distinct reader exists").as_ref() as &dyn CatalogRowReader)
+                        .raw_rows(statement, params, &self.active.shards, decode),
+                )?
+        {
+            rows.extend(request_rows);
+        }
+        Ok(rows)
     }
 
     fn records<T: serde::de::DeserializeOwned>(
@@ -172,9 +433,7 @@ impl<'a> RowCompositionReads<'a> {
             let json: String = row.get("record_json")?;
             serde_json::from_str(&json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    row.as_ref()
-                        .column_index("record_json")
-                        .expect("record JSON column"),
+                    row.column_index("record_json").expect("record JSON column"),
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
@@ -186,7 +445,9 @@ impl<'a> RowCompositionReads<'a> {
         &self,
         statement: &str,
         params: &[(&str, &dyn ToSql)],
-        decode: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        decode: impl Fn(
+            &crate::analyzer::store::model_catalog::OwnedCatalogRow<'_>,
+        ) -> rusqlite::Result<T>,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<T>>> {
         let mut rows = self
             .raw_rows(statement, params, |row| {
@@ -210,8 +471,29 @@ impl<'a> RowCompositionReads<'a> {
                 )
             })
             .collect::<Vec<_>>();
-        rows.sort_by_key(|(shard, record, _)| (*shard, *record));
-        rows.dedup_by_key(|(shard, record, _)| (*shard, *record));
+        rows.sort_by(|left, right| {
+            crate::analyzer::store::active_models::shard_record_order_key(
+                &self.active.shards[left.0],
+                left.1,
+            )
+            .cmp(
+                &crate::analyzer::store::active_models::shard_record_order_key(
+                    &self.active.shards[right.0],
+                    right.1,
+                ),
+            )
+        });
+        rows.dedup_by(|left, right| {
+            let left = crate::analyzer::store::active_models::shard_record_order_key(
+                &self.active.shards[left.0],
+                left.1,
+            );
+            let right = crate::analyzer::store::active_models::shard_record_order_key(
+                &self.active.shards[right.0],
+                right.1,
+            );
+            (left.3, left.4, left.5) == (right.3, right.4, right.5)
+        });
         Ok(rows.into_iter().map(|(_, _, record)| record).collect())
     }
 
@@ -239,31 +521,80 @@ impl<'a> RowCompositionReads<'a> {
             .collect())
     }
 
-    pub(crate) fn source_anchors(
+    /// The activation owner's anchors, converted through the live analyzer:
+    /// workspace declarations first, then the pack's carried sources.
+    pub(crate) fn activation_source_anchors(
         &self,
         analyzer: &dyn IAnalyzer,
     ) -> ReadResult<locations::SourceAnchors> {
+        self.owned_source_anchors(&self.activation, analyzer, |shard| !shard.request_owned())
+    }
+
+    /// The request owner's anchors. An external pack's record anchors only to
+    /// a source the pack carries, never to a workspace declaration that shares
+    /// its entry path and name, so no analyzer is needed.
+    pub(crate) fn request_source_anchors(&self) -> ReadResult<locations::SourceAnchors> {
+        let Some(reader) = self.jvm_reader()? else {
+            if let Some(open) = self.open_part() {
+                return Err(CatalogError::FamilyOpen(open));
+            }
+            return Ok(locations::SourceAnchors::default());
+        };
+        self.owned_source_anchors(reader, &locations::CarriedSourceLocations, |shard| {
+            shard.request_owned()
+        })
+    }
+
+    fn owned_source_anchors(
+        &self,
+        reader: &Arc<dyn CatalogRowReader + Send + Sync>,
+        resolver: &(impl locations::SemanticModelLocations + ?Sized),
+        owns: impl Fn(&crate::analyzer::store::active_models::ActiveSemanticModelShard) -> bool,
+    ) -> ReadResult<locations::SourceAnchors> {
+        // Read only the owning connection. Both may expose the same active
+        // catalog views today, but the request owner will bind its own snapshot.
+        let owner = RowCompositionReads {
+            selection: self.selection,
+            defining_owner: self.defining_owner,
+            active: self.active,
+            activation: Arc::clone(reader),
+            jvm: OnceCell::from(Ok(Arc::clone(reader))),
+            generated: self.generated,
+            generated_relations: self.generated_relations,
+            activation_only: self.activation_only,
+            scope: None,
+            open: Cell::new(None),
+            cancellation: self.cancellation,
+        };
         let mut anchors = locations::SourceAnchors::default();
-        let owners = self
+        let owners = owner
             .types(questions::SOURCE_TYPES, &[])?
             .into_iter()
-            .filter(|r| r.shard.decoded.is_none())
+            .filter(|r| r.shard.decoded.is_none() && owns(&r.shard))
             .map(|r| r.record.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for id in owners {
-            for symbol in self.owner_symbols(analyzer, &id)? {
-                anchors.insert_symbol("type", symbol);
+            for symbol in owner.owner_symbols(resolver, &id)? {
+                if self.active.shards.iter().any(|shard| {
+                    owns(shard) && shard.manifest.semantic_sha256 == symbol.provenance.pack_digest
+                }) {
+                    anchors.insert_symbol("type", symbol);
+                }
             }
         }
-        let members = self
+        let members = owner
             .members(questions::SOURCE_MEMBERS, &[])?
             .into_iter()
-            .filter(|r| r.shard.decoded.is_none())
+            .filter(|r| r.shard.decoded.is_none() && owns(&r.shard))
             .map(|r| r.record.id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for id in members {
-            for symbol in self.member_symbols(analyzer, &id)? {
-                anchors.insert_symbol("member", symbol);
+            for symbol in owner.member_symbols(resolver, &id)? {
+                if self.active.shards.iter().any(|shard| {
+                    owns(shard) && shard.manifest.semantic_sha256 == symbol.provenance.pack_digest
+                }) {
+                    anchors.insert_symbol("member", symbol);
+                }
             }
         }
         Ok(anchors)
@@ -295,8 +626,8 @@ impl<'a> RowCompositionReads<'a> {
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
         self.projection().symbols_with_id(analyzer, id)
     }
-    pub(crate) fn owner_qualification(&self, id: &str) -> ReadResult<Option<String>> {
-        self.projection().owner_qualification(id)
+    pub(crate) fn owner_qualification(&self, realm: &str, id: &str) -> ReadResult<Option<String>> {
+        self.projection().owner_qualification(Some(realm), id)
     }
 
     /// Project only matched raw IDs. The two batch reads also supply every
@@ -307,10 +638,13 @@ impl<'a> RowCompositionReads<'a> {
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
         ids: &[String],
-        owner_names: HashMap<String, Option<String>>,
+        owner_names: HashMap<(String, String), Option<String>>,
     ) -> ReadResult<Vec<SemanticModelSymbol>> {
         let projection = self.projection();
-        *projection.owner_names.borrow_mut() = owner_names;
+        *projection.owner_names.borrow_mut() = owner_names
+            .into_iter()
+            .map(|((realm, id), name)| ((Some(realm), id), name))
+            .collect();
         let ids_json = serde_json::to_string(ids).expect("record IDs serialize");
         let mut types: HashMap<String, TypeRecords> =
             ids.iter().map(|id| (id.clone(), Vec::new())).collect();
@@ -363,9 +697,11 @@ impl<'a> RowCompositionReads<'a> {
     pub(in crate::analyzer::semantic_model::overlay) fn endpoint_representatives(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
+        realm: &str,
         id: &str,
     ) -> ReadResult<(RepresentativeIdentity, OriginRewrites)> {
-        self.projection().endpoint_representatives(analyzer, id)
+        self.projection()
+            .endpoint_representatives(analyzer, realm, id)
     }
     pub fn group_relations(
         &self,
@@ -405,10 +741,10 @@ impl CompositionReads for RowCompositionReads<'_> {
         self.types(questions::TYPES_BY_ID, named_params! { ":id": id })
     }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(resolve_records(self.types(
+        Ok(resolve_records(FamilyRows::complete(self.types(
             questions::TYPES_BY_IDENTITY_NAME,
             named_params! { ":name": name },
-        )?)
+        )?))
         .records)
     }
     fn all_member_records_with_id(
@@ -528,8 +864,7 @@ impl GroupInput for RowCompositionReads<'_> {
                     let relation_kind = serde_json::from_value(serde_json::Value::String(kind))
                         .map_err(|error| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                row.as_ref()
-                                    .column_index("relation_kind")
+                                row.column_index("relation_kind")
                                     .expect("relation kind column"),
                                 rusqlite::types::Type::Text,
                                 Box::new(error),
@@ -562,7 +897,7 @@ pub(in crate::analyzer::semantic_model::overlay) struct GroupProjection<'query> 
     types_by_id: std::cell::RefCell<HashMap<String, TypeRecords>>,
     types_by_name: std::cell::RefCell<HashMap<String, TypeRecords>>,
     members_by_id: std::cell::RefCell<HashMap<String, MemberRecords>>,
-    owner_names: std::cell::RefCell<HashMap<String, Option<String>>>,
+    owner_names: OwnerQualifications,
     group_names: std::cell::RefCell<HashMap<CompositionGroupKey, Vec<String>>>,
     summaries: std::cell::RefCell<HashMap<SummaryQuestion, Vec<Arc<CompiledProcedureSummary>>>>,
 }
@@ -595,17 +930,33 @@ impl<'query> GroupProjection<'query> {
         }
     }
 
-    fn owner_qualification(&self, id: &str) -> ReadResult<Option<String>> {
-        if let Some(name) = self.owner_names.borrow().get(id) {
+    fn owner_qualification(&self, realm: Option<&str>, id: &str) -> ReadResult<Option<String>> {
+        if let Some(name) = self
+            .owner_names
+            .borrow()
+            .get(&(realm.map(str::to_owned), id.to_owned()))
+        {
             return Ok(name.clone());
         }
-        let records = self.all_type_records_with_id(id)?;
-        let matched =
-            with_artifact_declarations(resolve_records(records.clone()), records.into_iter());
+        let records = self
+            .all_type_records_with_id(id)?
+            .into_iter()
+            .filter(|record| {
+                realm.is_none_or(|realm| {
+                    brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                        &record.shard.manifest.language,
+                    ) == realm
+                })
+            })
+            .collect::<Vec<_>>();
+        let matched = with_artifact_declarations(
+            resolve_records(FamilyRows::complete(records.clone())),
+            records.into_iter(),
+        );
         let name = qualified_owner_name(&matched).map(str::to_owned);
         self.owner_names
             .borrow_mut()
-            .insert(id.to_owned(), name.clone());
+            .insert((realm.map(str::to_owned), id.to_owned()), name.clone());
         Ok(name)
     }
 
@@ -636,13 +987,13 @@ impl CompositionReads for GroupProjection<'_> {
     }
     fn types_named(&self, name: &str) -> ReadResult<TypeRecords> {
         if let Some(records) = self.types_by_name.borrow().get(name) {
-            return Ok(resolve_records(records.clone()).records);
+            return Ok(resolve_records(FamilyRows::complete(records.clone())).records);
         }
         let records = self.reads.all_types_named(name)?;
         self.types_by_name
             .borrow_mut()
             .insert(name.to_owned(), records.clone());
-        Ok(resolve_records(records).records)
+        Ok(resolve_records(FamilyRows::complete(records)).records)
     }
     fn all_member_records_with_id(&self, id: &str) -> ReadResult<MemberRecords> {
         if let Some(records) = self.members_by_id.borrow().get(id) {
@@ -686,10 +1037,13 @@ impl GroupProjection<'_> {
         // scope: extracted facets keep curated contribution ranking; authored
         // facets see only their own defining provider.
         if self.reads.provider_selection().is_none() || self.reads.defining_owner().is_some() {
-            return vec![with_artifact_declarations(
-                resolve_records(records.clone()),
+            return matches_by_family(with_artifact_declarations(
+                resolve_records(FamilyRows::complete(records.clone())),
                 records.into_iter(),
-            )];
+            ))
+            .into_iter()
+            .map(|(_, matched)| matched)
+            .collect();
         }
         let mut positions = HashMap::default();
         let mut families: Vec<Vec<ActivatedSemanticModelRecord<T>>> = Vec::new();
@@ -707,8 +1061,13 @@ impl GroupProjection<'_> {
         }
         families
             .into_iter()
-            .map(|records| {
-                with_artifact_declarations(resolve_records(records.clone()), records.into_iter())
+            .flat_map(|records| {
+                matches_by_family(with_artifact_declarations(
+                    resolve_records(FamilyRows::complete(records.clone())),
+                    records.into_iter(),
+                ))
+                .into_iter()
+                .map(|(_, matched)| matched)
             })
             .collect()
     }
@@ -755,7 +1114,12 @@ impl GroupProjection<'_> {
             let ambiguous = declaration_records_conflict(&matched);
             for activated in matched.records {
                 self.poll()?;
-                let owner = self.owner_qualification(&activated.record.owner)?;
+                let owner = self.owner_qualification(
+                    Some(brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                        &activated.shard.manifest.language,
+                    )),
+                    &activated.record.owner,
+                )?;
                 result.push(member_symbol(
                     analyzer,
                     self.reads.active(),
@@ -903,6 +1267,7 @@ impl GroupProjection<'_> {
     fn endpoint_representatives(
         &self,
         analyzer: &(impl SemanticModelLocations + ?Sized),
+        realm: &str,
         id: &str,
     ) -> ReadResult<(RepresentativeIdentity, OriginRewrites)> {
         let mut keys = HashSet::default();
@@ -914,7 +1279,9 @@ impl GroupProjection<'_> {
                 .filter(|s| s.id == id && s.owner_id.is_none())
                 .cloned(),
         );
-        for owner in owners {
+        for owner in owners.into_iter().filter(|owner| {
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(&owner.language) == realm
+        }) {
             self.poll()?;
             let key = CompositionGroupKey {
                 language: owner.language,
@@ -1007,15 +1374,16 @@ impl GroupProjection<'_> {
         }
         for records in by_id.into_values() {
             self.poll()?;
-            let matched = resolve_records(records);
-            let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
-            relations.extend(
-                matched
-                    .records
-                    .iter()
-                    .filter(|r| ids.contains(&r.record.from))
-                    .map(|r| relation(self.reads.active(), &r.shard, &r.record, ambiguous)),
-            );
+            for (_, matched) in matches_by_family(resolve_records(FamilyRows::complete(records))) {
+                let ambiguous = matched.disposition == SemanticModelMatchDisposition::Conflict;
+                relations.extend(
+                    matched
+                        .records
+                        .iter()
+                        .filter(|r| ids.contains(&r.record.from))
+                        .map(|r| relation(self.reads.active(), &r.shard, &r.record, ambiguous)),
+                );
+            }
         }
         relations.extend(
             self.reads
@@ -1052,22 +1420,30 @@ impl GroupProjection<'_> {
         let mut endpoints = symbols
             .iter()
             .filter(|s| s.owner_id.is_none())
-            .map(|s| s.id.clone())
+            .map(|s| {
+                (
+                    brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.language)
+                        .to_owned(),
+                    s.id.clone(),
+                )
+            })
             .collect::<HashSet<_>>();
-        endpoints.extend(
-            relations
-                .iter()
-                .flat_map(|r| [r.from.clone(), r.to.clone()]),
-        );
-        for id in endpoints {
+        endpoints.extend(relations.iter().flat_map(|r| {
+            let family = brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                &r.provenance.activation.matched_evidence.language,
+            )
+            .to_owned();
+            [(family.clone(), r.from.clone()), (family, r.to.clone())]
+        }));
+        for (realm, id) in endpoints {
             self.poll()?;
-            let (representative, origins) = self.endpoint_representatives(analyzer, &id)?;
+            let (representative, origins) = self.endpoint_representatives(analyzer, &realm, &id)?;
             for (pack, ids) in origins {
                 self.poll()?;
                 origin_identities.entry(pack).or_default().extend(ids);
             }
             if representative.composed {
-                composed_owners.insert(id.clone());
+                composed_owners.insert((realm.clone(), id.clone()));
             }
             if let Some((_, replacement)) = representative
                 .replacements
@@ -1075,7 +1451,7 @@ impl GroupProjection<'_> {
                 .rev()
                 .find(|(raw, _)| raw == &id)
             {
-                replacements.insert(id.clone(), replacement);
+                replacements.insert((realm.clone(), id.clone()), replacement);
             }
         }
         compose(

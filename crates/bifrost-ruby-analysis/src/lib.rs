@@ -1,5 +1,9 @@
 pub mod analyzer {
     pub mod ruby;
+    pub use ruby::dependency_evidence::{
+        GemVersion, RUBY_TOOLCHAIN_ECOSYSTEM, RUBYGEMS_ECOSYSTEM, RubyVersionRange,
+        ruby_bundle_project, ruby_dependency_version_matches,
+    };
     pub use ruby::{
         RubyAnalyzer, RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies,
     };

@@ -95,7 +95,7 @@ fn php_members_in_owner_closure<'a>(
 ) -> Vec<Arc<SemanticModelSymbol>> {
     owners
         .into_iter()
-        .flat_map(|owner| overlay.members_of(owner).records)
+        .flat_map(|owner| overlay.members_of_in_family(owner, "php").records)
         .filter(|symbol| symbol.name == member)
         .collect()
 }
@@ -116,7 +116,7 @@ fn php_overlay_symbols_named(
     fqn: &str,
 ) -> Vec<Arc<SemanticModelSymbol>> {
     overlay
-        .symbols_named(fqn)
+        .symbols_named_for(fqn, "php")
         .records
         .into_iter()
         .filter(|symbol| symbol.language == "php" && symbol.qualified_name == fqn)
@@ -244,7 +244,7 @@ impl PhpExternalSurface for AnalyzerPhpExternalSurface {
             };
         };
         let owner = overlay
-            .symbols_with_id(owner_id)
+            .symbols_with_id_in_family(owner_id, "php")
             .records
             .first()
             .cloned()

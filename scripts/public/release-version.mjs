@@ -79,42 +79,6 @@ export const RELEASED_CARGO_MANIFESTS = [
   "crates/bifrost-semantic-packs/Cargo.toml",
 ];
 
-export const THIRD_PARTY_SEMANTIC_PACK_SPECS = [
-  "semantic-packs/jvm/temurin-jdk-21.0.8+9.json",
-  "semantic-packs/jvm/kotlin-stdlib-2.2.20.json",
-  "semantic-packs/jvm/scala-library-2.13.16.json",
-  "semantic-packs/python/typeshed-stdlib-2026.8.31.json",
-  "semantic-packs/typescript/typescript-7.0.2.json",
-  "semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json",
-];
-
-export const BIFROST_OWNED_SEMANTIC_PACK_SPECS = [
-  "semantic-packs/framework-decls/bifrost.jdk-framework-decls.json",
-  "semantic-packs/framework-decls/staged/bifrost.javax.servlet-api-framework-decls.json",
-  "semantic-packs/framework-decls/staged/bifrost.javax.servlet-api-summaries.json",
-  "semantic-packs/framework-decls/staged/bifrost.jdk-framework-summaries.json",
-  "semantic-packs/golden-core/bifrost.jdk-golden-summaries.json",
-  "semantic-packs/golden-core/cpython/bifrost.cpython-golden-summaries.json",
-  "semantic-packs/golden-core/js-ts/javascript/bifrost.javascript-golden-summaries.json",
-  "semantic-packs/golden-core/js-ts/typescript/bifrost.typescript-golden-summaries.json",
-  "semantic-packs/golden-core/rust/bifrost.rust-std-golden-summaries.json",
-  "semantic-packs/sanitizers/bifrost.esapi-sanitizers.json",
-  "semantic-packs/sanitizers/bifrost.java-sanitizers.json",
-  "semantic-packs/sanitizers/staged/bifrost.commons-text-sanitizers.json",
-  "semantic-packs/sanitizers/staged/bifrost.encoder-sanitizers.json",
-  "semantic-packs/sanitizers/staged/bifrost.esapi-sanitizers.json",
-  "semantic-packs/sanitizers/staged/bifrost.guava-sanitizers.json",
-  "semantic-packs/sanitizers/staged/bifrost.spring-web-sanitizers.json",
-];
-
-// Current native producers use schema admission rather than an engine range.
-export const BIFROST_OWNED_SEMANTIC_PACK_REQUIREMENT_SOURCES = [];
-
-export const RELEASE_BUNDLE_SPECS = [
-  ...THIRD_PARTY_SEMANTIC_PACK_SPECS,
-  ...BIFROST_OWNED_SEMANTIC_PACK_SPECS,
-];
-
 export function syncBifrostDependencyVersions(contents, version) {
   return contents.replace(
     /^(\s*brokk-bifrost-[a-z-]+\s*=\s*\{[^\n]*\bversion\s*=\s*")=[^"]+("[^\n]*\}\s*(?:#.*)?)$/gmu,

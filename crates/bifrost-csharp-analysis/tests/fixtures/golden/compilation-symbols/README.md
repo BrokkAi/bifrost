@@ -31,11 +31,35 @@ The comparison probes every implicit-table symbol for the selected framework
 plus every DefineConstants token, so closed-set equality is full-set equality
 over that candidate set. The golden also asserts that every listed symbol is
 in the candidate universe (there is no filtering of unexpected actual symbols).
-Unsupported uses the SDK-supported net10.0-windows form with implicit defines
-disabled, which Bifrost deliberately leaves open as unsupported_framework.
+Unsupported uses net10.0-windows with implicit defines disabled; no framework
+table lookup is needed for that environment. Frameworks and FrameworksDisabled
+are test-only per-instance fixtures with net6.0, net8.0, and net8.0-windows.
+MODERN is conditioned on net8.0. Platform frameworks without a table entry
+open only their own environment when implicit defines are enabled.
 SdkImport contains a local Extras.props decoy and an unresolved custom SDK; it
 has no build oracle because the SDK is intentionally unavailable. UnusedDynamic
 pins conservative openness for a property function even when not referenced.
 The test hides every Directory.Build/Packages file from enumeration. It changes
 an ignored ancestor props file, then adds a nearer one, checking new selected
 set digests and the expected replacement of ANCESTOR_EDIT by NEARER.
+
+Review regressions: Frameworks has an empty TargetFramework and a repeated net8.0
+entry in TargetFrameworks; all three distinct instances remain present.
+FrameworkEnumerationUnknown has no declared framework but retains two restored
+frameworks and an explicit obj/ path: restore metadata must not select its first
+framework when instance enumeration is unavailable. Its environment stays open as dynamic_property.
+
+FrameworkGroupEntry pins a group-entry review regression: Flag starts as yes,
+then changes to no inside its guarded PropertyGroup before FEATURE is appended.
+The inherited guard is evaluated on group entry, so FEATURE stays defined.
+
+FrameworkSingleOrder, FrameworkPluralOne, and FrameworkBoth share an early props
+condition on TargetFramework. Only the plural-only project is a cross-targeting
+inner build, even though it has just one target, so only that case defines EARLY.
+A nonempty singular property wins over the plural and is evaluated in body order.
+FrameworkImportOrder imports a framework-list override after its own assignment;
+both net8.0 and net9.0 must be enumerated at the actual import position.
+
+FrameworkLocalGlobal declares TreatAsLocalProperty for TargetFramework, temporarily
+changes it while assigning LOCAL, and restores it. Inner-build environments stay
+open as treat_as_local_property, matching the membership evaluators' boundary.

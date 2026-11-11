@@ -599,7 +599,7 @@ pub(crate) fn external_boundary_evidence(
         .into_iter()
         .flat_map(|overlay| {
             overlay
-                .symbols_named(name)
+                .symbols_named_for(name, "cpp")
                 .records
                 .into_iter()
                 .filter(|symbol| {
@@ -641,7 +641,7 @@ fn exact_generated_cpp_symbols_in_headers(
     qualified_name: &str,
 ) -> Vec<Arc<SemanticModelSymbol>> {
     let mut records = overlay
-        .symbols_named(qualified_name)
+        .symbols_named_for(qualified_name, "cpp")
         .records
         .into_iter()
         .filter(|symbol| {
@@ -703,7 +703,7 @@ pub(crate) fn external_structured_type_model_resolution(
     let [TypeRef::Declared { id, .. }] = underlying.referenced_types.as_slice() else {
         return CppExternalTypeModelResolution::Incomplete;
     };
-    let target = overlay.symbols_with_id(id);
+    let target = overlay.symbols_with_id_for(id, "cpp");
     let [target] = target.records.as_slice() else {
         return CppExternalTypeModelResolution::Incomplete;
     };
@@ -773,7 +773,7 @@ pub(crate) fn external_member_resolution(
     let mut partial_owner = false;
     if let Some(overlay) = overlay {
         for owner in overlay
-            .symbols_named(owner_name)
+            .symbols_named_for(owner_name, "cpp")
             .records
             .into_iter()
             .filter(|owner| {
@@ -786,7 +786,7 @@ pub(crate) fn external_member_resolution(
             matching_owner = true;
             partial_owner |= owner.provenance.completeness == SemanticModelCompleteness::Partial;
             if overlay
-                .members_of(&owner.id)
+                .members_of_in_family(&owner.id, "cpp")
                 .records
                 .into_iter()
                 .any(|member| {
@@ -842,8 +842,36 @@ fn build_directly_reached_external_headers(
     file: &ProjectFile,
     keep_going: &impl Fn() -> bool,
 ) -> Option<ReachedExternalHeaders> {
+    let reached = walk_directly_reached_external_headers(analyzer, file, keep_going);
+    // Cancellation and the execution-dependent causes depend on this run, not
+    // on the source, so they must not be cached as a permanent answer.
+    match &reached {
+        None => analyzer.mark_execution_dependent(),
+        Some(ReachedExternalHeaders::Unavailable(cause)) => {
+            if let Some(note) = cause.execution_dependent_note() {
+                brokk_bifrost_core::profiling::note_with(|| {
+                    format!(
+                        "policy.units unbounded origin={}:{} cause={note}",
+                        file!(),
+                        line!()
+                    )
+                });
+                analyzer.mark_execution_dependent();
+            }
+        }
+        Some(ReachedExternalHeaders::Complete(_)) => {}
+    }
+    reached
+}
+
+/// The include closure of `file` through declared external roots, or `None`
+/// when `keep_going` stopped the walk.
+fn walk_directly_reached_external_headers(
+    analyzer: &CppAnalyzer,
+    file: &ProjectFile,
+    keep_going: &impl Fn() -> bool,
+) -> Option<ReachedExternalHeaders> {
     if !keep_going() {
-        analyzer.mark_execution_dependent();
         return None;
     }
     analyzer.record_external_header_closure_build();
@@ -851,7 +879,9 @@ fn build_directly_reached_external_headers(
     // caller opened (issue #2414 step 3).
     let scope = AnalyzerQueryScope::new(analyzer);
     let Some(syntax) = analyzer.prepared_syntax(scope.token(), file) else {
-        return Some(ReachedExternalHeaders::Unavailable);
+        return Some(ReachedExternalHeaders::Unavailable(
+            UnavailableCause::UnparsedSource,
+        ));
     };
     const MAX_CLOSURE_HEADERS: usize = 10_000;
     const MAX_CLOSURE_BYTES: usize = 32 * 1024 * 1024;
@@ -864,7 +894,6 @@ fn build_directly_reached_external_headers(
     let mut bytes_read = 0usize;
     while let Some((including_file, include, quoted)) = pending.pop() {
         if !keep_going() {
-            analyzer.mark_execution_dependent();
             return None;
         }
         match analyzer.resolve_external_include(file, &including_file, &include, quoted) {
@@ -873,18 +902,14 @@ fn build_directly_reached_external_headers(
                     continue;
                 }
                 if visited.len() > MAX_CLOSURE_HEADERS {
-                    brokk_bifrost_core::profiling::note_with(|| {
-                        format!(
-                            "policy.units unbounded origin={}:{} cause=budget:external_header_count",
-                            file!(),
-                            line!()
-                        )
-                    });
-                    analyzer.mark_execution_dependent();
-                    return Some(ReachedExternalHeaders::Unavailable);
+                    return Some(ReachedExternalHeaders::Unavailable(
+                        UnavailableCause::HeaderBudget,
+                    ));
                 }
                 let Ok(relative_path) = header.strip_prefix(&root) else {
-                    return Some(ReachedExternalHeaders::Unavailable);
+                    return Some(ReachedExternalHeaders::Unavailable(
+                        UnavailableCause::HeaderOutsideRoot,
+                    ));
                 };
                 resolved_headers.push(ReachedExternalHeader {
                     dependency_name: root_dependency_name(&root),
@@ -893,28 +918,16 @@ fn build_directly_reached_external_headers(
                 let (header_source, raw_bytes) = match read_external_header(&header) {
                     Ok(value) => value,
                     Err(error) => {
-                        brokk_bifrost_core::profiling::note_with(|| {
-                            format!(
-                                "policy.units unbounded origin={}:{} cause=provider:external_header_io detail={error}",
-                                file!(),
-                                line!()
-                            )
-                        });
-                        analyzer.mark_execution_dependent();
-                        return Some(ReachedExternalHeaders::Unavailable);
+                        return Some(ReachedExternalHeaders::Unavailable(UnavailableCause::Io(
+                            error.to_string(),
+                        )));
                     }
                 };
                 bytes_read = bytes_read.saturating_add(raw_bytes);
                 if bytes_read > MAX_CLOSURE_BYTES {
-                    brokk_bifrost_core::profiling::note_with(|| {
-                        format!(
-                            "policy.units unbounded origin={}:{} cause=budget:external_header_bytes",
-                            file!(),
-                            line!()
-                        )
-                    });
-                    analyzer.mark_execution_dependent();
-                    return Some(ReachedExternalHeaders::Unavailable);
+                    return Some(ReachedExternalHeaders::Unavailable(
+                        UnavailableCause::ByteBudget,
+                    ));
                 }
                 analyzer.record_external_header_parse();
                 pending.extend(
@@ -923,9 +936,15 @@ fn build_directly_reached_external_headers(
                         .map(|(include, quoted)| (header.clone(), include, quoted)),
                 );
             }
-            CppExternalIncludeResolution::MissingCompileContext
-            | CppExternalIncludeResolution::Conflicting => {
-                return Some(ReachedExternalHeaders::Unavailable);
+            CppExternalIncludeResolution::MissingCompileContext => {
+                return Some(ReachedExternalHeaders::Unavailable(
+                    UnavailableCause::MissingCompileContext,
+                ));
+            }
+            CppExternalIncludeResolution::Conflicting => {
+                return Some(ReachedExternalHeaders::Unavailable(
+                    UnavailableCause::ConflictingInclude,
+                ));
             }
             CppExternalIncludeResolution::Undeclared => {}
         }
@@ -938,14 +957,49 @@ fn build_directly_reached_external_headers(
 #[derive(Debug)]
 pub(crate) enum ReachedExternalHeaders {
     Complete(Vec<ReachedExternalHeader>),
-    Unavailable,
+    Unavailable(UnavailableCause),
+}
+
+/// Why the include closure has no complete answer.
+#[derive(Debug)]
+pub(crate) enum UnavailableCause {
+    /// The including file has no prepared syntax tree.
+    UnparsedSource,
+    /// A declared include root does not prefix the header it resolved.
+    HeaderOutsideRoot,
+    /// The include resolves differently across compile contexts.
+    ConflictingInclude,
+    /// The file has no compile context to resolve includes with.
+    MissingCompileContext,
+    /// The closure reached more headers than the walk reads.
+    HeaderBudget,
+    /// The closure read more header bytes than the walk allows.
+    ByteBudget,
+    /// A reached header could not be read.
+    Io(String),
+}
+
+impl UnavailableCause {
+    /// The profiling cause of an answer that depends on this execution rather
+    /// than on the source, or `None` when the same inputs always give it.
+    fn execution_dependent_note(&self) -> Option<String> {
+        match self {
+            Self::UnparsedSource
+            | Self::HeaderOutsideRoot
+            | Self::ConflictingInclude
+            | Self::MissingCompileContext => None,
+            Self::HeaderBudget => Some("budget:external_header_count".to_string()),
+            Self::ByteBudget => Some("budget:external_header_bytes".to_string()),
+            Self::Io(error) => Some(format!("provider:external_header_io detail={error}")),
+        }
+    }
 }
 
 impl ReachedExternalHeaders {
     fn headers(&self) -> Option<&[ReachedExternalHeader]> {
         match self {
             Self::Complete(headers) => Some(headers),
-            Self::Unavailable => None,
+            Self::Unavailable(_) => None,
         }
     }
 }
@@ -1001,6 +1055,8 @@ fn header_module_fact(dependency_name: &str, header: &str) -> Option<TypeFact> {
     let name =
         brokk_bifrost_analysis::analyzer::semantic::module_identity_owner(Path::new(header))?;
     Some(TypeFact {
+        alias_target: None,
+        tuple_fields: None,
         implemented_traits_complete: false,
         generic_trait_impls_complete: false,
         jvm_inventory: None,
@@ -1060,7 +1116,7 @@ fn is_header_module(symbol: &SemanticModelSymbol) -> bool {
 fn is_file_scope_declaration(overlay: &SemanticModelOverlay, symbol: &SemanticModelSymbol) -> bool {
     symbol.owner_id.as_deref().is_some_and(|owner_id| {
         overlay
-            .symbols_with_id(owner_id)
+            .symbols_with_id_in_family(owner_id, "cpp")
             .records
             .iter()
             .any(|owner| is_header_module(owner))
@@ -1113,7 +1169,7 @@ pub(crate) fn reached_header_file_scope_function(
     let headers = closure.headers()?;
     let overlay = overlay?;
     let declarations = overlay
-        .symbols_named(name)
+        .symbols_named_for(name, "cpp")
         .records
         .into_iter()
         .filter(|symbol| {
@@ -1131,7 +1187,7 @@ pub(crate) fn reached_header_file_scope_function(
     {
         return None;
     }
-    let owner = overlay.symbols_with_id(declaration.owner_id.as_deref()?);
+    let owner = overlay.symbols_with_id_in_family(declaration.owner_id.as_deref()?, "cpp");
     let [owner] = owner.records.as_slice() else {
         return None;
     };
@@ -1180,7 +1236,7 @@ pub(crate) fn reached_header_namespace_function(
     let overlay = overlay?;
     let namespace = namespace_path.join(".");
     let owners = overlay
-        .symbols_named(&namespace)
+        .symbols_named_for(&namespace, "cpp")
         .records
         .into_iter()
         .filter(|symbol| {
@@ -1199,7 +1255,7 @@ pub(crate) fn reached_header_namespace_function(
         return None;
     };
     let declarations = overlay
-        .members_of(&owner.id)
+        .members_of_for(&owner.id, "cpp")
         .records
         .into_iter()
         .filter(|symbol| {
@@ -1243,6 +1299,11 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         "bifrost-cpp-headers"
     }
 
+    // #9447: header formal roles change produced dependency-pack facts.
+    fn adapter_version(&self) -> &str {
+        concat!(env!("CARGO_PKG_VERSION"), "+9447.formal-roles")
+    }
+
     fn producer(&self) -> Producer {
         Producer {
             name: self.adapter_name().to_owned(),
@@ -1283,6 +1344,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut extracted_types = Vec::new();
         let mut extracted_members = Vec::new();
         let mut syntax_complete_headers = brokk_bifrost_core::hash::HashSet::default();
+        let mut formal_roles_warned_headers = brokk_bifrost_core::hash::HashSet::default();
         let mut partial = false;
         for entry in artifact.source_entries() {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1324,6 +1386,9 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 syntax_complete_headers.insert(PathBuf::from(entry.relative_path()));
             }
             for diagnostic in extracted.diagnostics {
+                if diagnostic.code == "cpp.external.formal_roles_unavailable" {
+                    formal_roles_warned_headers.insert(PathBuf::from(entry.relative_path()));
+                }
                 diagnostics.warning(
                     diagnostic.code,
                     Some(entry.relative_path().to_owned()),
@@ -1347,6 +1412,28 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     ),
                 );
                 break;
+            }
+        }
+
+        // A partial pack alone does not revoke a same-header sibling's
+        // callable-family closure. Revoke that header before any member is
+        // emitted, even when the unavailable declaration comes later.
+        for member in &extracted_members {
+            if member.kind != CppExternalMemberKind::Function || member.parameter_types.is_some() {
+                continue;
+            }
+            partial = true;
+            syntax_complete_headers.remove(&member.source_path);
+            if formal_roles_warned_headers.insert(member.source_path.clone()) {
+                diagnostics.warning(
+                    "cpp.external.formal_roles_unavailable",
+                    Some(stable_path(&member.source_path)),
+                    format!(
+                        "external header `{}` has unavailable formal roles for `{}`",
+                        member.source_path.display(),
+                        member.qualified_name
+                    ),
+                );
             }
         }
 
@@ -1456,6 +1543,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
         let mut types = extracted_types
             .into_iter()
             .map(|record| TypeFact {
+                alias_target: None,
+                tuple_fields: None,
                 implemented_traits_complete: false,
                 generic_trait_impls_complete: false,
                 jvm_inventory: None,
@@ -1566,6 +1655,11 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     (None, owner_id)
                 }
             };
+            // No structured parameter list means there is no canonical
+            // function identity or signature to publish, including arity zero.
+            if record.kind == CppExternalMemberKind::Function && record.parameter_types.is_none() {
+                continue;
+            }
             let parameters = record
                 .parameter_types
                 .unwrap_or_default()
@@ -1718,6 +1812,8 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     copy: copy_member.map(|member| TypeCopySemantics::ViaMember { member }),
                     move_semantics: move_member.then_some(TypeMoveSemantics::Invalidating),
                     drop_glue: None,
+                    drop_effects: None,
+                    drop_review: None,
                 });
             }
         }
@@ -1754,7 +1850,7 @@ schema_version:
                     bifrost: None,
                     toolchains: Vec::new(),
                 },
-                provenance: Provenance {
+                provenance: Provenance { rust_artifact_approximation: None,
                     source: format!("exact local C++ headers sha256:{}", artifact.sha256()),
                     revision: None,
                 },
@@ -1767,6 +1863,9 @@ schema_version:
                 carried_sources: Vec::new(),
                 cpp_portability: None,
                 python_correspondence: None,
+                rust_external_reexports: Vec::new(),
+        rust_external_reexports_truncated: false,
+        rust_external_reexports_glob_incomplete: false,
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: vec![ActivationSelector {
@@ -1803,6 +1902,16 @@ pub fn resolve_cpp_semantic_pack_dependencies(
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
+    use brokk_bifrost_analysis::analyzer::dependency_support::refuse_external_discovery_reads;
+
+    // The fixed database is a project input. The shared loader below still
+    // bypasses the facade, and include resolution probes unreported paths;
+    // those gaps require a refusal until the shared APIs expose the reads.
+    let database = ProjectFile::new(project.root().to_path_buf(), "compile_commands.json");
+    if project.read_source(&database).is_err() {
+        refuse_external_discovery_reads();
+    }
+    refuse_external_discovery_reads();
     let contexts = CppCompileContexts::load(project);
     let mut dependencies = Vec::new();
     let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
@@ -2065,6 +2174,9 @@ fn discover_reachable_header_sets(
 
 fn read_external_header(path: &Path) -> std::io::Result<(String, usize)> {
     let bytes = std::fs::read(path)?;
+    brokk_bifrost_analysis::analyzer::dependency_support::report_external_discovery_read(
+        brokk_bifrost_analysis::analyzer::semantic_model::ExternalDiscoveryRead::file(path, &bytes),
+    );
     let raw_bytes = bytes.len();
     reject_nul_source(&bytes)?;
     decode_source_bytes(bytes).map(|source| (source, raw_bytes))
@@ -3136,6 +3248,8 @@ mod tests {
                 copy: Some(TypeCopySemantics::ViaMember { member }),
                 move_semantics: Some(TypeMoveSemantics::Invalidating),
                 drop_glue: None,
+                drop_effects: None,
+                drop_review: None,
             }) if basic_string_members.iter().any(|candidate| candidate.id == *member)
         ));
         let string_alias = types
@@ -3275,6 +3389,178 @@ mod tests {
             insert_ids.len(),
             "parameter types discriminate two `insert` overloads: {members:#?}"
         );
+    }
+
+    #[test]
+    #[hardwon("#9447: unavailable C++ header formals were published as a zero-arity member")]
+    fn unavailable_header_formals_keep_owner_and_valid_siblings_without_family_closure() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <widget.h>\n#include <only.h>\n")
+            .expect("source");
+        let header = concat!(
+            "namespace ns { struct Widget {}; }\n",
+            "int target(void);\n",
+            "int target(void, ...);\n",
+            "int after(void);\n",
+        );
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write(header)
+            .expect("header");
+        let unavailable_only = "int absent(void, ...);\n";
+        ProjectFile::new(root.clone(), "fake/include/only.h")
+            .write(unavailable_only)
+            .expect("unavailable-only header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+
+        let project = TestProject::new(root, Language::Cpp);
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let [dependency] = discovery.dependencies.as_slice() else {
+            panic!("one header source set: {discovery:#?}");
+        };
+        let ResolvedDependencyArtifactInput::SourceSet {
+            root,
+            relative_paths,
+        } = &dependency.artifacts[0].input
+        else {
+            panic!("C++ dependency uses a source set");
+        };
+        let extracted = extract_external_declarations(
+            root,
+            Path::new("widget.h"),
+            header,
+            CppExternalDeclarationLimits::default(),
+        );
+        assert_eq!(
+            CppExternalDeclarationCompleteness::Partial,
+            extracted.completeness
+        );
+        assert!(!extracted.syntax_complete);
+        assert!(
+            extracted.members.iter().any(|member| {
+                member.name == "target"
+                    && member.kind == CppExternalMemberKind::Function
+                    && member.parameter_types.is_none()
+            }),
+            "parser must retain the unavailable formal declaration: {extracted:#?}"
+        );
+        assert!(
+            extracted.members.iter().any(|member| {
+                member.name == "target" && member.parameter_types.as_deref() == Some(&[])
+            }),
+            "valid void remains affirmative zero: {extracted:#?}"
+        );
+        let only_extracted = extract_external_declarations(
+            root,
+            Path::new("only.h"),
+            unavailable_only,
+            CppExternalDeclarationLimits::default(),
+        );
+        assert!(
+            only_extracted.members.iter().any(|member| {
+                member.name == "absent"
+                    && member.kind == CppExternalMemberKind::Function
+                    && member.parameter_types.is_none()
+            }),
+            "unavailable-only header must retain its refused declaration: {only_extracted:#?}"
+        );
+        let exact = read_exact_source_set(
+            root,
+            relative_paths,
+            DependencyPackLimits::default().max_source_files_per_artifact,
+            DependencyPackLimits::default().max_source_path_depth,
+            &ArtifactProducerLimits::default(),
+        )
+        .expect("exact source set");
+        let production = CppDependencyPackAdapter.produce(
+            dependency,
+            &[ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Declarations,
+                ExternalArtifactKind::CppHeaderSourceSet,
+                None,
+                exact,
+            )],
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "cpp.external.formal_roles_unavailable" }),
+            "missing formal warning: {production:#?}"
+        );
+        let pack = production.pack.expect("partial C++ pack");
+        assert_eq!(Completeness::Partial, pack.completeness);
+        if let Err(diagnostics) = compile_pack(&pack, &CompilerOptions::default()) {
+            panic!("partial pack must validate: {diagnostics:#?}");
+        }
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("declaration facts");
+        };
+        assert!(
+            types.iter().any(|fact| fact.name == "ns.Widget"),
+            "{types:#?}"
+        );
+        let header_module = types
+            .iter()
+            .find(|fact| {
+                fact.id
+                    == header_module_id(
+                        &dependency.evidence.package.as_ref().expect("package").name,
+                        "widget.h",
+                    )
+            })
+            .expect("retained header module");
+        assert!(
+            types.iter().any(|fact| {
+                fact.id
+                    == header_module_id(
+                        &dependency.evidence.package.as_ref().expect("package").name,
+                        "only.h",
+                    )
+            }),
+            "an unavailable-only declaration retains its header owner: {types:#?}"
+        );
+        assert!(
+            members.iter().all(|member| member.name != "absent"),
+            "unavailable-only function cannot become a zero-arity member: {members:#?}"
+        );
+        let target = members
+            .iter()
+            .filter(|member| member.name == "target")
+            .collect::<Vec<_>>();
+        let [target] = target.as_slice() else {
+            panic!("only the valid target survives: {members:#?}");
+        };
+        assert_eq!(header_module.id, target.owner);
+        assert!(
+            target
+                .signature
+                .as_ref()
+                .is_some_and(|signature| signature.parameters.is_empty())
+        );
+        assert!(!target.callable_family_complete);
+        let after = members
+            .iter()
+            .find(|member| member.name == "after")
+            .expect("later valid sibling survives");
+        assert_eq!(header_module.id, after.owner);
+        assert!(
+            after
+                .signature
+                .as_ref()
+                .is_some_and(|signature| signature.parameters.is_empty())
+        );
+        assert!(!after.callable_family_complete);
     }
 
     /// Every discovered header set, flattened to what a caller can observe:
@@ -4578,7 +4864,7 @@ mod tests {
             .semantic_model_overlay()
             .expect("C++ overlay");
         let published = overlay
-            .symbols_named("connect")
+            .symbols_named_for("connect", "cpp")
             .records
             .into_iter()
             .filter(|symbol| symbol.language == "cpp" && symbol_is_in_headers(symbol, headers))
@@ -4592,7 +4878,8 @@ mod tests {
         assert_eq!(SemanticModelSymbolKind::Function, published.kind);
         assert!(!published.has_receiver(), "{published:#?}");
         assert_eq!("sys/socket.connect", published.qualified_name);
-        let owner = overlay.symbols_with_id(published.owner_id.as_deref().expect("owned"));
+        let owner =
+            overlay.symbols_with_id_in_family(published.owner_id.as_deref().expect("owned"), "cpp");
         let [owner] = owner.records.as_slice() else {
             panic!("one header module owns connect: {owner:#?}");
         };

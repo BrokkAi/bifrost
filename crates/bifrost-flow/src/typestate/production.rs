@@ -11,8 +11,10 @@
 //! exact dependency and recursive-group closure. A procedure carries the
 //! provider behavior when projection asks for call transfers, because that
 //! answer can change without changing the procedure's own source. A call-free
-//! procedure uses a provider-independent behavior, so rotating a provider
-//! does not discard an exact reusable leaf summary for an unrelated edit. A
+//! procedure is keyed by the active semantic model set alone, the digest
+//! `ReadKey::Models` records, so an edit to an unrelated file does not discard
+//! an exact reusable leaf summary, while a change of model set (which carries
+//! any close-match approximation claim) recomputes it. A
 //! protocol summary adds the protocol and binding hashes. A whole solved result
 //! adds the entry facts, the full provider execution behavior, and both
 //! remaining budgets.
@@ -20,7 +22,7 @@
 //! This remains generation-independent: a stale entry is simply an entry
 //! nothing asks for again, and the byte and entry limits retire it. The full
 //! workspace behavior conservatively rotates provider-dependent summaries
-//! after an analyzed edit, while provider-independent leaves remain reusable. This
+//! after an analyzed edit, while call-free leaves remain reusable. This
 //! replaces an earlier generation gate that rotated the whole repository on
 //! every workspace update and prevented the policy and search surfaces from
 //! sharing exact retained work.
@@ -32,51 +34,313 @@
 //! better answer it could reach. See [`solve_typestate_with_production_summaries`].
 
 use crate::analyzer::ReadKey;
+use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::workspace_authority::{ReplayingMemo, ReplayingMemoEntry};
 use crate::semantic_summary::{ProcedureDependencyComponentOrder, ProcedureDependencyGraph};
 use brokk_bifrost_core::analyzer::memo_attribution::ReplayedMemoValue;
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, strongly_connected_components,
 };
 use crate::analyzer::semantic::{
     BindingOriginIndex, CallBoundary, CallInvocationMode, CallSiteId, CallableTarget,
-    CallableTargetResolution, CandidateCoverage, EvidenceCompleteness, IcfgProvider,
-    IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemoryLocationKind, ProcedureHandle,
-    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEffect,
-    SemanticExecutionBudget, SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    ValueFlowKind, ValueId,
+    CallableTargetResolution, CandidateCoverage, EvidenceCompleteness, FootprintAdmission,
+    IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest, MemoryLocationKind,
+    ProcedureHandle, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite,
+    SemanticEffect, SemanticExecutionBudget, SemanticExecutionBudgetCharge,
+    SemanticExecutionBudgetSnapshot, SemanticOutcome, SemanticProviderError, SemanticRequest,
+    SemanticValueKind, SemanticWork, ValueFlowKind, ValueId,
 };
 use crate::dataflow::{
     DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
     ProductionSemanticSummaryRepository, SemanticInputStatus, SemanticProcedureSummary, SolverWork,
     SummaryBehaviorKey, SummaryBoundaryKind, SummaryCallSourceWitness, SummaryCompleteness,
-    SummaryContextKey, SummaryDependencyKey, SummaryEffect, SummaryEffectKey, SummaryEventKey,
-    SummaryEvidence, SummaryOrigin, SummaryPort, SummaryPublicationError,
-    SummaryPublicationOutcome, SummaryReadObserver, SummaryRecursiveEdge, SummaryRecursiveGroupKey,
-    SummaryRepositoryLimits, SummarySchemaVersion, SummarySemanticsVersion, SummaryValidationError,
+    SummaryContextKey, SummaryDependencyKey, SummaryDimension, SummaryDimensionClaim,
+    SummaryDimensionState, SummaryDimensionStatus, SummaryEffect, SummaryEffectKey,
+    SummaryEventKey, SummaryEvidence, SummaryIncompleteReason, SummaryOrigin, SummaryPort,
+    SummaryPublicationError, SummaryPublicationOutcome, SummaryReadObserver, SummaryRecursiveEdge,
+    SummaryRecursiveGroupKey, SummaryRepositoryLimits, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryValidationError,
 };
 use crate::hash::{HashMap, HashSet};
 
 use super::{
-    CompiledProtocol, CompleteProtocolSummaryRepository, ProtocolFactKey,
-    ProtocolSemanticSummarySet, ProtocolSummaryCacheStatus, ProtocolSummaryError,
-    ProtocolSummaryRepositoryLimits, ProtocolSummarySolveError, TypestateBindingPlan,
-    TypestateBindingPlanHash, TypestateFact, TypestateProtocolHash, TypestateSummaryResult,
-    solve_typestate_with_reusable_summaries, solve_typestate_with_summaries,
+    CompiledProtocol, CompleteProtocolSummaryRepository, ProtocolFactKey, ProtocolReceiptVerdict,
+    ProtocolReceiptVerifier, ProtocolSemanticSummarySet, ProtocolSummaryCacheStatus,
+    ProtocolSummaryError, ProtocolSummaryRepositoryLimits, ProtocolSummarySolveError,
+    TypestateBindingPlan, TypestateBindingPlanHash, TypestateFact, TypestateProtocolHash,
+    TypestateSummaryResult, solve_typestate_with_reusable_summaries,
+    solve_typestate_with_summaries,
 };
 
-const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v26";
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static TYPESTATE_PROTOCOL_SERVING_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scope protocol serving to one test thread without changing process environment.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_typestate_protocol_serving_for_test<T>(serving: bool, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TYPESTATE_PROTOCOL_SERVING_OVERRIDE.with(|value| value.set(self.0));
+        }
+    }
+    TYPESTATE_PROTOCOL_SERVING_OVERRIDE.with(|value| {
+        let previous = Restore(value.replace(Some(serving)));
+        let result = run();
+        drop(previous);
+        result
+    })
+}
+
+// Serving stays closed by default. It may open only after #10325 (certified
+// definition-probe keys, so protocol receipts hold no raw Index read), the
+// served-against-fresh differential, and #10301 (Rust footprints can omit a
+// read of a static declared in another file, so rows published today would be
+// wrong once served) have landed.
+fn protocol_serving_enabled() -> bool {
+    let serving = match std::env::var("BIFROST_TYPESTATE_PROTOCOL_SERVING") {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Err(std::env::VarError::NotPresent) => false,
+        value => panic!("invalid BIFROST_TYPESTATE_PROTOCOL_SERVING: {value:?}"),
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    let serving = TYPESTATE_PROTOCOL_SERVING_OVERRIDE
+        .with(|override_value| override_value.get().unwrap_or(serving));
+    serving
+}
+
+/// Verifies served protocol rows against the request that serves them. One
+/// verifier is bound per production solve, so its lookup memo answers each
+/// question once against one head, and no answer outlives that workspace.
+pub(super) struct ProductionProtocolReceiptVerifier {
+    pub(super) workspace: WorkspaceAnalyzer,
+    pub(super) memo: std::sync::Mutex<crate::analyzer::LookupMemo>,
+}
+
+impl fmt::Debug for ProductionProtocolReceiptVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionProtocolReceiptVerifier")
+            .finish()
+    }
+}
+
+struct ProductionProtocolInventorySource {
+    workspace: WorkspaceAnalyzer,
+    snapshot: crate::analyzer::read_verification::DefinitionInventorySnapshot,
+    cancellation: crate::cancellation::CancellationToken,
+}
+
+impl fmt::Debug for ProductionProtocolInventorySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionProtocolInventorySource")
+            .field("snapshot", &self.snapshot)
+            .finish()
+    }
+}
+
+impl super::summary::ProtocolInventorySource for ProductionProtocolInventorySource {
+    fn certify(&self, raw: &ReadKey) -> Option<super::summary::DefinitionIndexInventory> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        let ReadKey::Index { family, key } = raw else {
+            return None;
+        };
+        let digest = self
+            .snapshot
+            .digest(self.workspace.analyzer(), *family, key)?;
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        Some(super::summary::DefinitionIndexInventory {
+            raw: raw.clone(),
+            normalization_version: (*family
+                == crate::analyzer::read_ledger::IndexFamily::DefinitionNormalizedTail)
+                .then_some(
+                    crate::analyzer::semantic::read_ledger::DEFINITION_NORMALIZED_TAIL_VERSION,
+                ),
+            delegates: self.snapshot.languages(),
+            digest,
+        })
+    }
+}
+
+impl ProtocolReceiptVerifier for ProductionProtocolReceiptVerifier {
+    fn verify(&self, receipt: &super::summary::ProtocolMemberReceipt) -> ProtocolReceiptVerdict {
+        use crate::analyzer::{ChangedFacts, HeadInputs, LookupReplayLimits, ReadVerdict};
+
+        // The protocol compilation belongs to this request. Raw index reads and
+        // policy, configuration and epoch inputs are unavailable from the
+        // workspace, so a receipt that names one cannot be proved here and
+        // fails closed. The model set is available from the analyzer, and
+        // #9755 records its absence as a read too, so it is verified below
+        // rather than refused.
+        let _verification = crate::analyzer::ReadAttribution::for_receipt_verification().install();
+        let mut keys = Vec::new();
+        for key in receipt.protocol_keys() {
+            match key.certificate() {
+                None => keys.push(key.as_read_key().clone()),
+                Some(certificate) => {
+                    let Some(snapshot) =
+                        crate::analyzer::read_verification::DefinitionInventorySnapshot::capture(
+                            self.workspace.analyzer(),
+                        )
+                    else {
+                        return ProtocolReceiptVerdict::Unverifiable;
+                    };
+                    let ReadKey::Index { family, key } = &certificate.raw else {
+                        return ProtocolReceiptVerdict::Unverifiable;
+                    };
+                    let expected_version = (*family == crate::analyzer::read_ledger::IndexFamily::DefinitionNormalizedTail)
+                        .then_some(crate::analyzer::semantic::read_ledger::DEFINITION_NORMALIZED_TAIL_VERSION);
+                    if snapshot.languages() != certificate.delegates
+                        || certificate.normalization_version != expected_version
+                    {
+                        return ProtocolReceiptVerdict::Unverifiable;
+                    }
+                    let Some(digest) = snapshot.digest(self.workspace.analyzer(), *family, key)
+                    else {
+                        return ProtocolReceiptVerdict::Unverifiable;
+                    };
+                    if digest != certificate.digest {
+                        return ProtocolReceiptVerdict::Stale;
+                    }
+                }
+            }
+        }
+        if keys.iter().any(|key| {
+            matches!(
+                key,
+                ReadKey::Index { .. }
+                    | ReadKey::Policy { .. }
+                    | ReadKey::Configuration(_)
+                    | ReadKey::Epoch(_)
+            )
+        }) {
+            return ProtocolReceiptVerdict::Unverifiable;
+        }
+        // The verifier runs inside the serving request's read capture. Its own
+        // reads must not reach that ledger: a hit replays the verified receipt
+        // into the capture instead, and a lookup replay under an attached
+        // ledger would be an unattributed read that refuses unit reuse. Install
+        // the guard before observing the model set for the same reason.
+        let unused = crate::analyzer::semantic::ids::StableDigest::sha256([]);
+        // A receipt recorded through either model accessor verifies only while
+        // those accessors still agree. When they disagree, no recorded model
+        // read can equal `unused`, so a receipt carrying one is Stale while a
+        // receipt that did not read the model set is unaffected.
+        let models =
+            crate::analyzer::i_analyzer::current_model_set_read_digest(self.workspace.analyzer())
+                .unwrap_or(unused);
+        let inputs = HeadInputs {
+            models,
+            policy_semantic_hash: unused,
+            policy_source: unused,
+            configuration: unused,
+            epoch: unused,
+        };
+        // The keys left after the refusal above (file, path-absence, lookup,
+        // artifact and scope keys) are checked directly against the head, so
+        // no base difference is needed, and building one would enumerate the
+        // whole workspace for every lookup.
+        if matches!(
+            crate::analyzer::verify_read_set(
+                &self.workspace,
+                &ChangedFacts::without_base(),
+                &inputs,
+                &keys,
+                LookupReplayLimits::default(),
+                &crate::analyzer::NoSummaryAnswers,
+                &mut self
+                    .memo
+                    .lock()
+                    .expect("protocol receipt lookup memo poisoned"),
+            ),
+            ReadVerdict::Unchanged
+        ) {
+            ProtocolReceiptVerdict::Current
+        } else {
+            ProtocolReceiptVerdict::Stale
+        }
+    }
+}
+
+const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-semantic-summary-v27";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
 const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
 const PRODUCTION_SUMMARY_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-summary-behavior-v1";
 const PROVIDER_INDEPENDENT_LEAF_BEHAVIOR: &[u8] =
-    b"bifrost-production-provider-independent-leaf/v3";
+    b"bifrost-production-provider-independent-leaf/v5";
 const CALL_EFFECT_DOMAIN: &[u8] = b"bifrost-production-call-effect-v1";
 const WORKSPACE_PROVIDER_CONTEXT: &[u8] = b"bifrost-production-workspace-provider-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProtocolAdmissionDecision {
+    call_control: bool,
+    footprint: bool,
+}
+
+impl ProtocolAdmissionDecision {
+    fn from_coverage(
+        call_control: Option<&FootprintAdmission>,
+        footprint: Option<&FootprintAdmission>,
+    ) -> Self {
+        Self {
+            call_control: matches!(call_control, Some(FootprintAdmission::Admitted { .. })),
+            footprint: matches!(footprint, Some(FootprintAdmission::Admitted { .. })),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExactResultDecision {
+    admissions: Vec<ProtocolAdmissionDecision>,
+    reusable_route: bool,
+}
+
+fn exact_result_decision(
+    summaries: &ProductionSemanticSummarySet,
+    bindings: &TypestateBindingPlan,
+) -> ExactResultDecision {
+    let reusable_route = summaries.summaries().iter().all(|summary| {
+        matches!(
+            summary.coverage().state(SummaryDimension::Protocol),
+            SummaryDimensionState::Complete
+        )
+    }) && bindings.unproven_relations().iter().all(|relation| {
+        summaries
+            .root_call_closure()
+            .excludes(&relation.observation_procedure)
+    });
+    ExactResultDecision {
+        admissions: summaries.protocol_admissions.clone(),
+        reusable_route,
+    }
+}
+
+fn summary_coverage_decision(
+    call_control: Option<&FootprintAdmission>,
+    footprint: Option<&FootprintAdmission>,
+) -> SummaryCompleteness {
+    let admission = ProtocolAdmissionDecision::from_coverage(call_control, footprint);
+    let reason = if !admission.call_control {
+        "call/control producer admission is unavailable or refused"
+    } else if !admission.footprint {
+        "full footprint producer admission is unavailable or refused"
+    } else {
+        return SummaryCompleteness::Complete;
+    };
+    SummaryCompleteness::partial(vec![SummaryIncompleteReason::SemanticGap(reason.into())])
+        .expect("static summary refusal reason is valid")
+}
 
 /// Live provider-execution state whose work must be reproduced on an exact hit.
 #[derive(Debug, Clone, Copy)]
@@ -394,6 +658,20 @@ impl ProductionTypestateSummaryRepository {
         counters.hits = counters.hits.saturating_add(1);
     }
 
+    fn evict_result(&self, key: &ProductionSummaryResultKey) -> bool {
+        let mut state = self.state();
+        let Some(removed) = state.results.remove(key) else {
+            return false;
+        };
+        state.retained_result_bytes = state.retained_result_bytes.saturating_sub(
+            key.retained_bytes()
+                .saturating_add(removed.retained_bytes()),
+        );
+        drop(state);
+        self.add_evictions(1);
+        true
+    }
+
     fn publish_result(
         &self,
         key: ProductionSummaryResultKey,
@@ -466,6 +744,21 @@ impl ProductionTypestateSummaryRepository {
 
     fn protocol_limits(&self) -> ProtocolSummaryRepositoryLimits {
         self.state().protocol.limits()
+    }
+
+    fn compatible_protocol_repository(
+        &self,
+        semantic_summaries: &ProtocolSemanticSummarySet<'_>,
+        protocol: &CompiledProtocol,
+        bindings: &TypestateBindingPlan,
+    ) -> CompleteProtocolSummaryRepository {
+        let state = self.state();
+        semantic_summaries.compatible_repository(
+            &state.protocol,
+            self.attribution.clone(),
+            protocol,
+            bindings,
+        )
     }
 
     fn absorb_protocol(
@@ -586,8 +879,12 @@ impl Drop for ProductionSummaryFlightLeader<'_> {
 
 #[derive(Debug, Clone)]
 struct CachedTypestateSummaryResult {
+    projection_refusal: ProjectionRefusal,
     result: Arc<TypestateSummaryResult>,
+    root_call_closure: RootCallClosure,
+    exact_decision: ExactResultDecision,
     semantic_charge: crate::analyzer::semantic::SemanticBudgetReplay,
+    semantic_admission: crate::analyzer::semantic::SemanticMemoAdmission,
     solver_charge: SolverWork,
     execution_charge: Option<SemanticExecutionBudgetCharge>,
 }
@@ -595,7 +892,14 @@ struct CachedTypestateSummaryResult {
 impl CachedTypestateSummaryResult {
     fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            .saturating_add(
+                self.exact_decision
+                    .admissions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ProtocolAdmissionDecision>()),
+            )
             .saturating_add(self.result.retained_bytes())
+            .saturating_add(self.semantic_admission.retained_bytes())
             .saturating_add(
                 self.execution_charge
                     .as_ref()
@@ -676,7 +980,9 @@ pub enum TypestateProductionCacheStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionTypestateSolveResult {
+    projection_refusal: ProjectionRefusal,
     result: Arc<TypestateSummaryResult>,
+    root_call_closure: RootCallClosure,
     cache_status: TypestateProductionCacheStatus,
     protocol_cache_status: Option<ProtocolSummaryCacheStatus>,
     published_protocol_summaries: usize,
@@ -684,7 +990,20 @@ pub struct ProductionTypestateSolveResult {
     lifecycle: ProductionSummaryLifecycleCounters,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionRefusal {
+    None,
+    CallControl,
+}
+
 impl ProductionTypestateSolveResult {
+    pub const fn projection_refused(&self) -> bool {
+        matches!(self.projection_refusal, ProjectionRefusal::CallControl)
+    }
+
+    pub fn root_call_closure(&self) -> &RootCallClosure {
+        &self.root_call_closure
+    }
     pub fn result(&self) -> &TypestateSummaryResult {
         self.result.as_ref()
     }
@@ -752,6 +1071,7 @@ pub fn solve_typestate_with_production_summaries<Provider, ProjectionProvider>(
     entry_facts: &[TypestateFact],
     provider: &Provider,
     projection_provider: &ProjectionProvider,
+    coverage_source: Option<&WorkspaceAnalyzer>,
     execution_context: ProductionTypestateExecutionContext<'_>,
     protocol: &CompiledProtocol,
     bindings: &TypestateBindingPlan,
@@ -764,15 +1084,7 @@ where
 {
     let mut lifecycle = ProductionSummaryLifecycleCounters::default();
     // A leader may finish without publishing, so followers retry without recursion.
-    let (
-        semantic_work_before,
-        solver_work_before,
-        execution_before,
-        projection_behavior,
-        result_key,
-        _flight_leader,
-    ) = loop {
-        let semantic_work_before = semantic_budget.replay_snapshot();
+    let (solver_work_before, execution_before, projection_behavior, result_key, _flight_leader) = loop {
         let solver_work_before = request.budget.used();
         let execution_before = execution_context.snapshot();
         let provider_behavior = production_icfg_behavior(provider.behavior_identity());
@@ -800,7 +1112,6 @@ where
             None
         };
         break (
-            semantic_work_before,
             solver_work_before,
             execution_before,
             projection_behavior,
@@ -814,16 +1125,55 @@ where
         lifecycle.misses = lifecycle.misses.saturating_add(1);
         lifecycle.rejections = lifecycle.rejections.saturating_add(1);
     } else if let Some(cached) = repository.result(&result_key) {
+        // The binding hash distinguishes marker sets, but coverage can change
+        // while the binding plan stays the same. Recheck the scoped projection
+        // before replaying a result or its closure certificate. A policy
+        // provider must charge this probe to an isolated execution allowance.
+        let mut coverage_budget = semantic_budget.clone();
+        let validation_execution = match execution_context {
+            ProductionTypestateExecutionContext::Workspace => None,
+            ProductionTypestateExecutionContext::Policy(budget) => Some(budget.fork().1),
+        };
+        let mut coverage_request = match validation_execution.as_ref() {
+            Some(execution) => SemanticRequest::with_execution_budget(
+                &mut coverage_budget,
+                request.cancellation,
+                execution,
+            ),
+            None => SemanticRequest::new(&mut coverage_budget, request.cancellation),
+        };
+        let current_projection = project_production_semantic_summaries_with_behavior(
+            std::slice::from_ref(root),
+            projection_provider,
+            coverage_source,
+            projection_behavior,
+            &mut coverage_request,
+        );
+        let coverage_matches = current_projection.is_ok_and(|current| {
+            current.root_call_closure == cached.root_call_closure
+                && exact_result_decision(&current, bindings) == cached.exact_decision
+                && matches!(cached.projection_refusal, ProjectionRefusal::CallControl)
+                    == current.admission_refused
+        });
         let mut replay_semantic_budget = semantic_budget.clone();
         let mut replay_solver_budget = request.budget.clone();
-        let mut replay_charge = cached.semantic_charge;
-        let already_held = replay_semantic_budget.has_replay_holder(&cached.result);
-        if already_held {
-            replay_charge.retained = SemanticWork::default();
-        }
-        let replayed = replay_semantic_budget
-            .replay_continuation(replay_charge)
-            .is_ok()
+        let (replay_charge, already_held) =
+            replay_semantic_budget.replay_for_holder(&cached.result, cached.semantic_charge);
+        // The execution replay charges the LIVE ledger, so a hit that the
+        // coverage check rejects must not reach it; otherwise the fresh solve
+        // pays a second time for work it never reused.
+        let admission_missed = coverage_matches
+            && replay_semantic_budget
+                .admit_memo_hit_with(
+                    &cached.semantic_admission,
+                    projection_provider.memo_dependency_reacquirer(),
+                )
+                .is_err();
+        let replayed = coverage_matches
+            && !admission_missed
+            && replay_semantic_budget
+                .replay_continuation(replay_charge)
+                .is_ok()
             && replay_solver_budget.charge(cached.solver_charge).is_ok()
             && execution_context
                 .replay_charge(execution_before.as_ref(), cached.execution_charge.as_ref());
@@ -837,12 +1187,20 @@ where
             lifecycle.hits = lifecycle.hits.saturating_add(1);
             return Ok(ProductionTypestateSolveResult {
                 result: Arc::clone(&cached.result),
+                projection_refusal: cached.projection_refusal,
+                root_call_closure: cached.root_call_closure.clone(),
                 cache_status: TypestateProductionCacheStatus::Hit,
                 protocol_cache_status: None,
                 published_protocol_summaries: 0,
                 rejected_protocol_reuse: false,
                 lifecycle,
             });
+        }
+        if admission_missed && repository.evict_result(&result_key) {
+            lifecycle.evictions = lifecycle.evictions.saturating_add(1);
+            brokk_bifrost_core::profiling::note(
+                "semantic.memo_admission_eviction.typestate_result",
+            );
         }
         repository.record_miss();
         repository.record_rejection();
@@ -853,6 +1211,9 @@ where
         lifecycle.misses = lifecycle.misses.saturating_add(1);
     }
 
+    // A rejected cache holder has now dropped. Start the cold receipt after
+    // reconciling that eviction, so it is not mistaken for a fill dependency.
+    let semantic_work_before = semantic_budget.replay_snapshot();
     repository.record_recomputation();
     lifecycle.recomputations = lifecycle.recomputations.saturating_add(1);
     let mut computed = None;
@@ -867,6 +1228,7 @@ where
                 entry_facts,
                 provider,
                 projection_provider,
+                coverage_source,
                 projection_behavior,
                 protocol,
                 bindings,
@@ -875,9 +1237,11 @@ where
                 &mut lifecycle,
             )?;
             let mut execution_charge = None;
-            if value.semantic_publication_accepted {
+            let mut semantic_charge = semantic_budget.replay_since(&semantic_work_before);
+            if value.result_cache_eligible {
                 // The result may outlive its cache entry, even on rejection.
-                semantic_budget.bind_replay_holder(&value.result, &semantic_work_before);
+                semantic_charge.retained =
+                    semantic_budget.bind_replay_holder(&value.result, &semantic_work_before);
                 let coverage = value.result.result().coverage();
                 let budget_dependent = matches!(
                     coverage.semantic_status(),
@@ -901,8 +1265,13 @@ where
                 }
             }
             let retained = CachedTypestateSummaryResult {
+                projection_refusal: value.projection_refusal,
                 result: Arc::clone(&value.result),
-                semantic_charge: semantic_budget.replay_since(&semantic_work_before),
+                root_call_closure: value.root_call_closure.clone(),
+                exact_decision: value.exact_decision.clone(),
+                semantic_charge,
+                semantic_admission: semantic_budget
+                    .memo_admission_since(&semantic_work_before, &value.result),
                 solver_charge: request.budget.used().saturating_sub(solver_work_before),
                 execution_charge,
             };
@@ -936,7 +1305,9 @@ where
     })?;
     let computed = computed.expect("cold result entry was built");
     Ok(ProductionTypestateSolveResult {
+        projection_refusal: computed.projection_refusal,
         result: computed.result,
+        root_call_closure: computed.root_call_closure,
         cache_status,
         protocol_cache_status: computed.protocol_cache_status,
         published_protocol_summaries: computed.published_protocol_summaries,
@@ -946,11 +1317,14 @@ where
 }
 
 struct ComputedTypestateSummaryResult {
+    projection_refusal: ProjectionRefusal,
     result: Arc<TypestateSummaryResult>,
+    root_call_closure: RootCallClosure,
+    exact_decision: ExactResultDecision,
     protocol_cache_status: Option<ProtocolSummaryCacheStatus>,
     published_protocol_summaries: usize,
     rejected_protocol_reuse: bool,
-    semantic_publication_accepted: bool,
+    result_cache_eligible: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,7 +1335,8 @@ fn compute_typestate_summary<Provider, ProjectionProvider>(
     entry_facts: &[TypestateFact],
     provider: &Provider,
     projection_provider: &ProjectionProvider,
-    projection_behavior: SummaryBehaviorKey,
+    coverage_source: Option<&WorkspaceAnalyzer>,
+    projection_behavior: ProductionSummaryBehavior,
     protocol: &CompiledProtocol,
     bindings: &TypestateBindingPlan,
     semantic_budget: &mut SemanticBudget,
@@ -975,6 +1350,7 @@ where
     let semantic_summaries = match project_production_semantic_summaries_with_behavior(
         std::slice::from_ref(root),
         projection_provider,
+        coverage_source,
         projection_behavior,
         &mut SemanticRequest::new(semantic_budget, request.cancellation),
     ) {
@@ -986,35 +1362,78 @@ where
             // facts, and both remaining budgets.
             repository.record_rejection();
             lifecycle.rejections = lifecycle.rejections.saturating_add(1);
-            let result = Arc::new(
-                solve_typestate_with_summaries(
-                    root,
-                    entry_facts,
-                    provider,
-                    protocol,
-                    bindings,
-                    semantic_budget,
-                    request,
-                )
-                .map_err(|error| {
-                    ProductionTypestateSolveError::Protocol(ProtocolSummarySolveError::Solve(error))
-                })?,
-            );
+            let result = solve_typestate_with_summaries(
+                root,
+                entry_facts,
+                provider,
+                protocol,
+                bindings,
+                semantic_budget,
+                request,
+            )
+            .map_err(|error| {
+                ProductionTypestateSolveError::Protocol(ProtocolSummarySolveError::Solve(error))
+            })?;
             return Ok(ComputedTypestateSummaryResult {
-                result,
+                projection_refusal: ProjectionRefusal::CallControl,
+                result: Arc::new(result),
+                exact_decision: ExactResultDecision {
+                    admissions: Vec::new(),
+                    reusable_route: false,
+                },
+                root_call_closure: RootCallClosure {
+                    complete: false,
+                    reached: Vec::new(),
+                    incomplete_reasons: vec![
+                        RootCallClosureIncompleteReason::UnavailableProjection,
+                    ],
+                },
                 protocol_cache_status: None,
                 published_protocol_summaries: 0,
                 rejected_protocol_reuse: false,
-                semantic_publication_accepted: true,
+                result_cache_eligible: false,
             });
         }
     };
 
-    let semantic_publication_accepted = match repository.publish_semantic_set(&semantic_summaries) {
-        Ok(_) => true,
+    let exact_decision = exact_result_decision(&semantic_summaries, bindings);
+    if !exact_decision.reusable_route {
+        repository.record_rejection();
+        lifecycle.rejections = lifecycle.rejections.saturating_add(1);
+        let result = solve_typestate_with_summaries(
+            root,
+            entry_facts,
+            provider,
+            protocol,
+            bindings,
+            semantic_budget,
+            request,
+        )
+        .map_err(|error| {
+            ProductionTypestateSolveError::Protocol(ProtocolSummarySolveError::Solve(error))
+        })?;
+        return Ok(ComputedTypestateSummaryResult {
+            projection_refusal: if semantic_summaries.admission_refused {
+                ProjectionRefusal::CallControl
+            } else {
+                ProjectionRefusal::None
+            },
+            result: Arc::new(result),
+            root_call_closure: semantic_summaries.root_call_closure().clone(),
+            exact_decision,
+            protocol_cache_status: None,
+            published_protocol_summaries: 0,
+            rejected_protocol_reuse: false,
+            // Exact result caching retains the projection refusal. It does not
+            // publish or consume a reusable semantic/protocol summary.
+            result_cache_eligible: true,
+        });
+    }
+
+    match repository.publish_semantic_set(&semantic_summaries) {
+        Ok(_) => {}
         Err(ProductionTypestateSolveError::SemanticPublication(_)) => {
             lifecycle.rejections = lifecycle.rejections.saturating_add(1);
-            false
         }
         Err(error) => return Err(error),
     };
@@ -1028,8 +1447,9 @@ where
     let semantic_set = semantic_summaries
         .protocol_summaries()
         .map_err(ProductionTypestateSolveError::ProtocolKey)?;
+    let serving = protocol_serving_enabled();
     let rejections_before_protocol_diagnostic = lifecycle.rejections;
-    if semantic_publication_accepted
+    if !serving
         && repository.has_compatible_protocol_rows_for_diagnostics(
             &semantic_set,
             protocol,
@@ -1043,10 +1463,34 @@ where
     }
     // Preserve the existing diagnostic accessor using the counter delta only.
     let rejected_protocol_reuse = lifecycle.rejections != rejections_before_protocol_diagnostic;
-    let mut compatible = CompleteProtocolSummaryRepository::with_limits(
-        repository.protocol_limits(),
-        repository.attribution.clone(),
-    );
+    let mut compatible = if serving {
+        repository.compatible_protocol_repository(&semantic_set, protocol, bindings)
+    } else {
+        CompleteProtocolSummaryRepository::with_limits(
+            repository.protocol_limits(),
+            repository.attribution.clone(),
+        )
+    };
+    if let Some(workspace) = coverage_source {
+        let _suppression = crate::analyzer::ReadAttribution::for_receipt_verification().install();
+        if let Some(snapshot) =
+            crate::analyzer::read_verification::DefinitionInventorySnapshot::capture(
+                workspace.analyzer(),
+            )
+        {
+            compatible.bind_inventory_source(Arc::new(ProductionProtocolInventorySource {
+                workspace: workspace.clone(),
+                snapshot,
+                cancellation: request.cancellation.clone(),
+            }));
+        }
+    }
+    if serving && let Some(workspace) = coverage_source {
+        compatible.bind_receipt_verifier(Arc::new(ProductionProtocolReceiptVerifier {
+            workspace: workspace.clone(),
+            memo: Default::default(),
+        }));
+    }
     let solved = solve_typestate_with_reusable_summaries(
         root,
         entry_facts,
@@ -1061,24 +1505,24 @@ where
     .map_err(ProductionTypestateSolveError::Protocol)?;
     let protocol_cache_status = solved.cache_status();
     let result = Arc::new(solved.into_computed_result());
-    let published_protocol_summaries = if semantic_publication_accepted {
-        match repository.absorb_protocol(compatible, &semantic_set) {
-            Ok(published) => published,
-            Err(_) => {
-                repository.record_rejection();
-                lifecycle.rejections = lifecycle.rejections.saturating_add(1);
-                0
-            }
+    let published_protocol_summaries = match repository.absorb_protocol(compatible, &semantic_set) {
+        Ok(published) => published,
+        Err(_) => {
+            repository.record_rejection();
+            lifecycle.rejections = lifecycle.rejections.saturating_add(1);
+            0
         }
-    } else {
-        0
     };
     Ok(ComputedTypestateSummaryResult {
+        projection_refusal: ProjectionRefusal::None,
         result,
+        root_call_closure: semantic_summaries.root_call_closure().clone(),
+        exact_decision,
         protocol_cache_status: Some(protocol_cache_status),
         published_protocol_summaries,
         rejected_protocol_reuse,
-        semantic_publication_accepted,
+        // Exact-result retention is independent of semantic row publication.
+        result_cache_eligible: true,
     })
 }
 
@@ -1119,11 +1563,84 @@ fn production_result_key(
 pub struct ProductionSemanticSummarySet {
     summaries: Vec<SemanticProcedureSummary>,
     components: Vec<std::ops::Range<usize>>,
-    behavior: SummaryBehaviorKey,
+    behavior: ProductionSummaryBehavior,
     procedure_semantics_precharged: bool,
+    admission_refused: bool,
+    protocol_admissions: Vec<ProtocolAdmissionDecision>,
+    root_call_closure: RootCallClosure,
 }
 
 impl ProductionSemanticSummarySet {
+    /// Test-only repository fixture. This deliberately certifies projected
+    /// effects that production cannot yet certify; see #9642.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn synthetic_complete_for_repository_tests(mut self) -> Self {
+        self.summaries = self
+            .summaries
+            .into_iter()
+            .map(|projected| {
+                SemanticProcedureSummary::try_new(
+                    projected.key().clone(),
+                    projected.transfers().to_vec(),
+                    projected.effects().to_vec(),
+                    projected.dependencies().to_vec(),
+                    SummaryCompleteness::Complete,
+                )
+                .expect("synthetic repository summary is valid")
+            })
+            .collect();
+        self.admission_refused = false;
+        self
+    }
+}
+
+/// Query-lifetime proof of the represented local call graph. A refused
+/// admission or an open boundary prevents exclusion of any observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootCallClosure {
+    complete: bool,
+    reached: Vec<crate::analyzer::semantic::SemanticLocator>,
+    incomplete_reasons: Vec<RootCallClosureIncompleteReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RootCallClosureIncompleteReason {
+    BudgetStop,
+    CoverageRefused,
+    OpenCall,
+    OpenEffect,
+    ExternalCall,
+    UnprovenCall,
+    OutstandingObligation,
+    UnavailableProjection,
+}
+
+impl RootCallClosure {
+    pub fn excludes(&self, locator: &crate::analyzer::semantic::SemanticLocator) -> bool {
+        self.complete && !self.reached.contains(locator)
+    }
+
+    pub const fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn incomplete_reasons(&self) -> &[RootCallClosureIncompleteReason] {
+        &self.incomplete_reasons
+    }
+
+    /// Scoped call/control coverage justifies the summary dependencies this
+    /// root consumes. External boundaries alone do not invalidate that proof.
+    pub fn summary_completeness_justified(&self) -> bool {
+        !self
+            .incomplete_reasons
+            .contains(&RootCallClosureIncompleteReason::CoverageRefused)
+    }
+}
+
+impl ProductionSemanticSummarySet {
+    pub fn root_call_closure(&self) -> &RootCallClosure {
+        &self.root_call_closure
+    }
     pub fn summaries(&self) -> &[SemanticProcedureSummary] {
         &self.summaries
     }
@@ -1260,6 +1777,340 @@ fn record_direct_call_effect(
     Ok(())
 }
 
+#[cfg(test)]
+mod root_closure_tests {
+    use super::*;
+    use crate::analyzer::{
+        AnalyzerConfig, Language, LookupKind, LookupQuestion, capture_query_reads,
+    };
+    use crate::dataflow::MemberReadReceipt;
+    use crate::inline_project::InlineTestProject;
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn unknown_definition_inventory_refuses_conversion() {
+        // `DefinitionInventorySnapshot::capture` returns None when any analyzed
+        // language lacks a listed snapshot. Standalone analyzers now certify
+        // their enumeration (#11076), so pass the unknown inventory directly.
+        let member = MemberReadReceipt {
+            keys: [ReadKey::index(
+                crate::analyzer::IndexFamily::DefinitionExact,
+                "calls.helper",
+            )]
+            .into_iter()
+            .collect(),
+            channels: Default::default(),
+        };
+        assert!(super::super::summary::ProtocolMemberReceipt::from_member(&member, None).is_err());
+    }
+
+    #[test]
+    fn definition_inventory_receipts_verify_edits_and_conversion_is_suppressed() {
+        use super::super::summary::ProtocolMemberReceipt;
+        use crate::analyzer::IndexFamily;
+        use crate::analyzer::read_verification::DefinitionInventorySnapshot;
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("helper.go", "package calls\nfunc helper() {}\n")
+            .file("other.go", "package calls\nfunc other() {}\n")
+            .build();
+        let build_workspace = || {
+            WorkspaceAnalyzer::build_ephemeral_footgun(
+                Arc::new(crate::analyzer::FilesystemProject::new(project.root()).unwrap()),
+                AnalyzerConfig::default(),
+            )
+            .unwrap()
+        };
+        let base = build_workspace();
+        let snapshot = DefinitionInventorySnapshot::capture(base.analyzer()).unwrap_or_else(|| {
+            panic!(
+                "languages={:?} indexes={:?}",
+                base.analyzer().languages(),
+                base.analyzer()
+                    .workspace_fact_indexes()
+                    .iter()
+                    .map(|index| (
+                        index.fact_index_language(),
+                        index.definition_inventory_snapshots()
+                    ))
+                    .collect::<Vec<_>>()
+            )
+        });
+        let source = ProductionProtocolInventorySource {
+            workspace: base.clone(),
+            snapshot,
+            cancellation: Default::default(),
+        };
+        let missing_member = MemberReadReceipt {
+            keys: [ReadKey::index(IndexFamily::DefinitionExact, "calls.future")]
+                .into_iter()
+                .collect(),
+            channels: Default::default(),
+        };
+        let missing = ProtocolMemberReceipt::from_member(&missing_member, Some(&source)).unwrap();
+        let families = [
+            IndexFamily::DefinitionExact,
+            IndexFamily::DefinitionNormalizedTail,
+            IndexFamily::DefinitionIdentifier,
+        ];
+        let receipts = families.map(|family| {
+            let name = if family == IndexFamily::DefinitionIdentifier {
+                "helper"
+            } else {
+                "calls.helper"
+            };
+            let member = MemberReadReceipt {
+                keys: [ReadKey::index(family, name)].into_iter().collect(),
+                channels: Default::default(),
+            };
+            let (receipt, reads) = capture_query_reads(base.analyzer(), || {
+                ProtocolMemberReceipt::from_member(&member, Some(&source))
+            });
+            assert!(reads.keys().is_empty(), "{reads:?}");
+            assert_eq!(reads.unattributed_reads(), 0, "{reads:?}");
+            receipt.unwrap()
+        });
+        let verify = |workspace: &WorkspaceAnalyzer, expected| {
+            let verifier = ProductionProtocolReceiptVerifier {
+                workspace: workspace.clone(),
+                memo: Default::default(),
+            };
+            for receipt in &receipts {
+                assert_eq!(verifier.verify(receipt), expected, "{receipt:?}");
+            }
+        };
+        verify(&base, ProtocolReceiptVerdict::Current);
+        std::fs::write(
+            project.root().join("other.go"),
+            "package calls\nfunc other() { var x = 1; _ = x }\n",
+        )
+        .unwrap();
+        let unrelated = build_workspace();
+        verify(&unrelated, ProtocolReceiptVerdict::Current);
+        std::fs::write(
+            project.root().join("helper.go"),
+            "package calls\n// shifted\nfunc helper() {}\n",
+        )
+        .unwrap();
+        let shifted = build_workspace();
+        verify(&shifted, ProtocolReceiptVerdict::Current);
+        std::fs::write(
+            project.root().join("other.go"),
+            "package calls\nfunc other() {}\nfunc helper() {}\n",
+        )
+        .unwrap();
+        let added = build_workspace();
+        verify(&added, ProtocolReceiptVerdict::Stale);
+        let raced = ProductionProtocolInventorySource {
+            workspace: added.clone(),
+            snapshot: source.snapshot.clone(),
+            cancellation: Default::default(),
+        };
+        let member = MemberReadReceipt {
+            keys: [ReadKey::index(IndexFamily::DefinitionIdentifier, "helper")]
+                .into_iter()
+                .collect(),
+            channels: Default::default(),
+        };
+        assert!(ProtocolMemberReceipt::from_member(&member, Some(&raced)).is_err());
+        let updated = base.update(&std::collections::BTreeSet::from(
+            [project.file("other.go")],
+        ));
+        let raced_revision = ProductionProtocolInventorySource {
+            workspace: updated,
+            snapshot: source.snapshot.clone(),
+            cancellation: Default::default(),
+        };
+        assert!(ProtocolMemberReceipt::from_member(&member, Some(&raced_revision)).is_err());
+        let cancelled = crate::cancellation::CancellationToken::default();
+        cancelled.cancel();
+        let cancelled_source = ProductionProtocolInventorySource {
+            workspace: base.clone(),
+            snapshot: source.snapshot.clone(),
+            cancellation: cancelled,
+        };
+        assert!(ProtocolMemberReceipt::from_member(&member, Some(&cancelled_source)).is_err());
+        std::fs::write(
+            project.root().join("other.go"),
+            "package calls\nfunc other() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.root().join("helper.go"),
+            "package calls\nfunc helper(value int) { _ = value }\n",
+        )
+        .unwrap();
+        let changed = build_workspace();
+        verify(&changed, ProtocolReceiptVerdict::Stale);
+        let verifier = ProductionProtocolReceiptVerifier {
+            workspace: changed.clone(),
+            memo: Default::default(),
+        };
+        assert_eq!(verifier.verify(&missing), ProtocolReceiptVerdict::Current);
+        std::fs::write(
+            project.root().join("other.go"),
+            "package calls\nfunc future() {}\n",
+        )
+        .unwrap();
+        let future = build_workspace();
+        let verifier = ProductionProtocolReceiptVerifier {
+            workspace: future,
+            memo: Default::default(),
+        };
+        assert_eq!(verifier.verify(&missing), ProtocolReceiptVerdict::Stale);
+    }
+
+    #[test]
+    #[hardwon(
+        "#9642: the production receipt verifier recorded its own reads into the serving request's ledger"
+    )]
+    fn production_receipt_verification_does_not_pollute_serving_read_ledger() {
+        use crate::analyzer::semantic::StableDigest;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("helper.go", "package calls\nfunc helper() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let member = MemberReadReceipt {
+            keys: [ReadKey::Lookup {
+                kind: LookupKind::Definitions,
+                question: LookupQuestion::Name {
+                    language: Some(Language::Go),
+                    name: "calls.helper".into(),
+                },
+                digest: StableDigest::sha256(b"any"),
+            }]
+            .into_iter()
+            .collect(),
+            channels: Default::default(),
+        };
+        let receipt = super::super::summary::ProtocolMemberReceipt::from_member(&member, None)
+            .expect("a receipt without Index keys converts");
+        let verifier = ProductionProtocolReceiptVerifier {
+            workspace: workspace.clone(),
+            memo: Default::default(),
+        };
+        let (_verdict, reads) =
+            capture_query_reads(workspace.analyzer(), || verifier.verify(&receipt));
+        assert!(reads.keys().is_empty(), "verifier reads leaked: {reads:?}");
+        assert_eq!(
+            reads.unattributed_reads(),
+            0,
+            "verification recorded an unattributed read: {reads:?}"
+        );
+        assert!(reads.is_bounded(), "verification refused reuse: {reads:?}");
+    }
+
+    #[test]
+    #[hardwon(
+        "#10686: #9755's absence read made the production receipt verifier refuse every no-model protocol receipt"
+    )]
+    fn production_receipt_verification_verifies_the_recorded_model_absence() {
+        use crate::analyzer::i_analyzer::current_model_set_digest;
+        use crate::analyzer::semantic::ids::StableDigest;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("helper.go", "package calls\nfunc helper() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let receipt = |models| {
+            let member = MemberReadReceipt {
+                keys: [ReadKey::Models(models)].into_iter().collect(),
+                channels: Default::default(),
+            };
+            super::super::summary::ProtocolMemberReceipt::from_member(&member, None)
+                .expect("a model read is a protocol receipt key")
+        };
+        let verifier = ProductionProtocolReceiptVerifier {
+            workspace: workspace.clone(),
+            memo: Default::default(),
+        };
+        let (verdict, reads) = capture_query_reads(workspace.analyzer(), || {
+            verifier.verify(&receipt(current_model_set_digest(None)))
+        });
+        assert_eq!(verdict, ProtocolReceiptVerdict::Current);
+        assert!(reads.keys().is_empty(), "verifier reads leaked: {reads:?}");
+        assert_eq!(
+            reads.unattributed_reads(),
+            0,
+            "verification recorded an unattributed read: {reads:?}"
+        );
+        assert!(reads.is_bounded(), "verification refused reuse: {reads:?}");
+        assert_eq!(
+            verifier.verify(&receipt(StableDigest::sha256(b"another model set"))),
+            ProtocolReceiptVerdict::Stale
+        );
+    }
+
+    #[test]
+    #[hardwon("#9550: a proven call into another local file was classified as an external call")]
+    fn cross_file_local_call_and_unmaterialized_external_call() {
+        for (caller, external) in [
+            ("package calls\nfunc root() { helper() }\n", false),
+            (
+                "package calls\nimport \"fmt\"\nfunc root() { helper(); fmt.Println(1) }\n",
+                true,
+            ),
+        ] {
+            let project = InlineTestProject::with_language(Language::Go)
+                .file("app.go", caller)
+                .file("res.go", "package calls\nfunc helper() {}\n")
+                .build();
+            let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let file = project.file("app.go");
+            let cancellation = crate::analyzer::semantic::CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let outcome = workspace
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("app semantics");
+            let artifact = outcome.available_value().expect("app artifact");
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("root")
+                })
+                .expect("root procedure");
+            let root = artifact
+                .procedure_handle(procedure.id())
+                .expect("root handle");
+            let closure = project_workspace_root_call_closure(
+                &root,
+                &workspace.icfg_provider(),
+                &workspace,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("root closure");
+            assert_eq!(
+                closure
+                    .incomplete_reasons()
+                    .contains(&RootCallClosureIncompleteReason::ExternalCall),
+                external,
+                "{closure:?}"
+            );
+            if external {
+                assert!(!closure.complete(), "{closure:?}");
+            }
+        }
+
+        // External-only incompleteness does not imply a refused summary.
+        let external_only = RootCallClosure {
+            complete: false,
+            reached: Vec::new(),
+            incomplete_reasons: vec![RootCallClosureIncompleteReason::ExternalCall],
+        };
+        assert!(external_only.summary_completeness_justified());
+    }
+}
+
 /// Project the exact production ICFG dependency closure into stable reusable
 /// summaries.
 pub fn project_production_semantic_summaries<Provider>(
@@ -1271,13 +2122,46 @@ where
     Provider: IcfgProvider,
 {
     let behavior = production_summary_behavior(provider.behavior_identity());
-    project_production_semantic_summaries_with_behavior(roots, provider, behavior, request)
+    project_production_semantic_summaries_with_behavior(roots, provider, None, behavior, request)
+}
+
+/// Projects one root with the current workspace's scoped call/control proof.
+/// The returned closure is valid only for this query and these artifacts.
+pub fn project_workspace_root_call_closure<Provider>(
+    root: &ProcedureHandle,
+    provider: &Provider,
+    workspace: &WorkspaceAnalyzer,
+    request: &mut SemanticRequest<'_>,
+) -> Result<RootCallClosure, ProductionSummaryProjectionError>
+where
+    Provider: IcfgProvider,
+{
+    let behavior = production_summary_behavior(provider.behavior_identity());
+    project_production_semantic_summaries_with_behavior(
+        std::slice::from_ref(root),
+        provider,
+        Some(workspace),
+        behavior,
+        request,
+    )
+    .map(|summaries| summaries.root_call_closure)
+    .or_else(|error| match error {
+        ProductionSummaryProjectionError::CallTransferBudgetExceeded { .. }
+        | ProductionSummaryProjectionError::RetainedClosureBudgetExceeded(_)
+        | ProductionSummaryProjectionError::GraphBudgetExceeded => Ok(RootCallClosure {
+            complete: false,
+            reached: Vec::new(),
+            incomplete_reasons: vec![RootCallClosureIncompleteReason::BudgetStop],
+        }),
+        error => Err(error),
+    })
 }
 
 fn project_production_semantic_summaries_with_behavior<Provider>(
     roots: &[ProcedureHandle],
     provider: &Provider,
-    behavior: SummaryBehaviorKey,
+    coverage_source: Option<&WorkspaceAnalyzer>,
+    behavior: ProductionSummaryBehavior,
     request: &mut SemanticRequest<'_>,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError>
 where
@@ -1294,10 +2178,56 @@ where
     let mut direct_dependencies = vec![Vec::<ProcedureHandle>::new(); procedures.len()];
     let mut direct_call_effects = vec![Vec::<DirectCallEffect>::new(); procedures.len()];
     let mut direct_effects = vec![Vec::<SummaryEffect>::new(); procedures.len()];
+    let mut closure_complete = coverage_source.is_some();
+    let mut closure_reasons = Vec::new();
+    if coverage_source.is_none() {
+        closure_reasons.push(RootCallClosureIncompleteReason::UnavailableProjection);
+    }
     let mut cursor = 0usize;
+    let mut coverage = Vec::new();
+    let mut admission_refused = false;
+    let mut protocol_admissions = Vec::new();
 
     while cursor < procedures.len() {
         let procedure = procedures[cursor].clone();
+        let mut outstanding_obligations = HashSet::default();
+        let decision = if let Some(workspace) = coverage_source {
+            // Both admissions must describe the exact artifact being projected.
+            // Keep their decision in one place while the non-call rule is settled.
+            workspace
+                .analyzer()
+                .record_read(ReadKey::semantic_artifact(procedure.artifact().key()));
+            let call_control = workspace.stored_call_control_coverage(&procedure, request)?;
+            match &call_control {
+                FootprintAdmission::Admitted {
+                    call_target_obligations,
+                } => {
+                    outstanding_obligations.extend(
+                        call_target_obligations
+                            .iter()
+                            .map(|obligation| obligation.call),
+                    );
+                }
+                _ => {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::CoverageRefused);
+                }
+            }
+            let footprint = workspace.stored_footprint_coverage(&procedure, request)?;
+            // The direct solver evaluates value and exit effects itself. Only
+            // an unproved call closure can hide a callee from that solve.
+            admission_refused |= !matches!(call_control, FootprintAdmission::Admitted { .. });
+            protocol_admissions.push(ProtocolAdmissionDecision::from_coverage(
+                Some(&call_control),
+                Some(&footprint),
+            ));
+            summary_coverage_decision(Some(&call_control), Some(&footprint))
+        } else {
+            admission_refused = true;
+            protocol_admissions.push(ProtocolAdmissionDecision::from_coverage(None, None));
+            summary_coverage_decision(None, None)
+        };
+        coverage.push(decision);
         let mut dependencies = Vec::new();
         for (call_ordinal, call) in procedure.semantics().call_sites().iter().enumerate() {
             // Detached callees are source dependencies, but never synchronous
@@ -1322,6 +2252,7 @@ where
                         evidence,
                     )?;
                     dependencies.push(target);
+                    outstanding_obligations.remove(&call.id);
                     continue;
                 }
                 let call_handle = procedure
@@ -1360,19 +2291,36 @@ where
                         })
                 });
                 if !dispatch_complete {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::OpenCall);
                     direct_effects[cursor].push(project_open_call_effect(
                         &procedure,
                         call,
                         "detached call dispatch was not complete",
                     )?);
                 }
+                let local_dispatch = dispatch_complete
+                    && dispatch.as_ref().is_some_and(|dispatch| {
+                        dispatch.candidates().iter().all(|candidate| {
+                            candidate.target().artifact().key() == procedure.artifact().key()
+                        })
+                    });
+                if local_dispatch {
+                    outstanding_obligations.remove(&call.id);
+                } else {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::ExternalCall);
+                }
                 if let Some(dispatch) = dispatch {
                     // Exact candidates are stable may-dependencies.
-                    for candidate in dispatch.candidates().iter().filter(|candidate| {
-                        matches!(candidate.proof(), ProofStatus::Proven)
-                            && matches!(candidate.completeness(), EvidenceCompleteness::Complete)
-                    }) {
+                    for candidate in dispatch.candidates().iter() {
                         let target = candidate.target().clone();
+                        dependencies.push(target.clone());
+                        if !matches!(candidate.proof(), ProofStatus::Proven)
+                            || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
+                        {
+                            continue;
+                        }
                         let dependency = summary_identity(&target, behavior);
                         let evidence = SummaryEvidence::from_semantic(
                             candidate.proof(),
@@ -1385,7 +2333,6 @@ where
                             dependency,
                             evidence,
                         )?;
-                        dependencies.push(target);
                     }
                 }
                 continue;
@@ -1395,15 +2342,19 @@ where
                 SemanticOutcome::Complete { value, .. } => {
                     (value, SummaryEvidence::proven_complete())
                 }
-                SemanticOutcome::Ambiguous { .. } => {
+                SemanticOutcome::Ambiguous { candidates, .. } => {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::OpenCall);
                     direct_effects[cursor].push(project_open_call_effect(
                         &procedure,
                         call,
                         "call dispatch was ambiguous",
                     )?);
-                    continue;
+                    (candidates, SummaryEvidence::proven_complete())
                 }
                 SemanticOutcome::Unproven { partial, .. } => {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::UnprovenCall);
                     direct_effects[cursor].push(project_open_call_effect(
                         &procedure,
                         call,
@@ -1415,13 +2366,19 @@ where
                     // aggregate dispatch incompleteness a second time.
                     (partial, SummaryEvidence::proven_complete())
                 }
-                SemanticOutcome::Unknown { .. } | SemanticOutcome::Unsupported { .. } => {
+                SemanticOutcome::Unknown { partial, .. }
+                | SemanticOutcome::Unsupported { partial, .. } => {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::OpenCall);
                     direct_effects[cursor].push(project_open_call_effect(
                         &procedure,
                         call,
                         "call transfer was unavailable",
                     )?);
-                    continue;
+                    let Some(partial) = partial else {
+                        continue;
+                    };
+                    (partial, SummaryEvidence::proven_complete())
                 }
                 SemanticOutcome::ExceededBudget { exceeded, .. } => {
                     return Err(
@@ -1435,7 +2392,25 @@ where
                     return Err(ProductionSummaryProjectionError::Cancelled);
                 }
             };
+            let local_transfer = value.boundaries.is_empty()
+                && !value.transfers.is_empty()
+                && value.transfers.iter().all(|transfer| {
+                    matches!(transfer.proof, ProofStatus::Proven)
+                        && matches!(transfer.completeness, EvidenceCompleteness::Complete)
+                });
+            if local_transfer {
+                outstanding_obligations.remove(&call.id);
+            } else {
+                closure_complete = false;
+                closure_reasons.push(if value.transfers.is_empty() {
+                    RootCallClosureIncompleteReason::ExternalCall
+                } else {
+                    RootCallClosureIncompleteReason::OpenCall
+                });
+            }
             for (boundary_index, boundary) in value.boundaries.iter().enumerate() {
+                closure_complete = false;
+                closure_reasons.push(RootCallClosureIncompleteReason::OpenCall);
                 direct_effects[cursor].push(project_boundary_effect(
                     &procedure,
                     call,
@@ -1445,6 +2420,12 @@ where
                 )?);
             }
             for transfer in value.transfers {
+                if !matches!(transfer.proof, ProofStatus::Proven)
+                    || !matches!(transfer.completeness, EvidenceCompleteness::Complete)
+                {
+                    closure_complete = false;
+                    closure_reasons.push(RootCallClosureIncompleteReason::UnprovenCall);
+                }
                 let dependency = summary_identity(&transfer.callee, behavior);
                 let evidence =
                     SummaryEvidence::from_semantic(&transfer.proof, &transfer.completeness)?
@@ -1459,7 +2440,15 @@ where
                 dependencies.push(transfer.callee);
             }
         }
+        if !outstanding_obligations.is_empty() {
+            closure_complete = false;
+            closure_reasons.push(RootCallClosureIncompleteReason::OutstandingObligation);
+        }
         canonicalize_procedures(&mut dependencies, behavior);
+        if !direct_effects[cursor].is_empty() {
+            closure_complete = false;
+            closure_reasons.push(RootCallClosureIncompleteReason::OpenEffect);
+        }
         for dependency in &dependencies {
             if !index_by_handle.contains_key(dependency) {
                 let index = procedures.len();
@@ -1507,6 +2496,10 @@ where
         .iter()
         .map(|&old| direct_effects[old].clone())
         .collect::<Vec<_>>();
+    let canonical_coverage = canonical_order
+        .iter()
+        .map(|&old| coverage[old].clone())
+        .collect::<Vec<_>>();
     let graph = ProcedureDependencyGraph::new(canonical_edges);
     let mut graph_budget = CfgAlgorithmBudget::default();
     let mut graph_request = CfgAlgorithmRequest::new(&mut graph_budget, request.cancellation);
@@ -1521,7 +2514,7 @@ where
             }
         })?;
 
-    build_summary_set(
+    let mut set = build_summary_set(
         &canonical_procedures,
         DirectSummaryProjection {
             calls: &canonical_call_effects,
@@ -1529,9 +2522,23 @@ where
         },
         &graph,
         &sccs.components,
+        &canonical_coverage,
+        admission_refused,
         behavior,
         request.cancellation,
-    )
+    )?;
+    closure_reasons.sort_unstable();
+    closure_reasons.dedup();
+    set.protocol_admissions = protocol_admissions;
+    set.root_call_closure = RootCallClosure {
+        complete: closure_complete,
+        reached: canonical_procedures
+            .iter()
+            .map(|procedure| procedure.semantics().locator().clone())
+            .collect(),
+        incomplete_reasons: closure_reasons,
+    };
+    Ok(set)
 }
 
 fn direct_summary_port(
@@ -1763,12 +2770,15 @@ struct DirectSummaryProjection<'a> {
     effects: &'a [Vec<SummaryEffect>],
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_summary_set(
     procedures: &[ProcedureHandle],
     direct: DirectSummaryProjection<'_>,
     graph: &ProcedureDependencyGraph,
     components: &[Box<[usize]>],
-    behavior: SummaryBehaviorKey,
+    coverage: &[SummaryCompleteness],
+    admission_refused: bool,
+    behavior: ProductionSummaryBehavior,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError> {
     let DirectSummaryProjection {
@@ -1897,12 +2907,31 @@ fn build_summary_set(
                 })
                 .collect::<Vec<_>>();
             effects.extend_from_slice(&direct_effects[member]);
-            let summary = SemanticProcedureSummary::try_new(
+            let protocol_status = match &coverage[member] {
+                SummaryCompleteness::Complete => SummaryDimensionStatus::Complete,
+                SummaryCompleteness::Partial(reasons) => {
+                    SummaryDimensionStatus::Incomplete(reasons.clone())
+                }
+            };
+            let value_transfer_reasons = vec![SummaryIncompleteReason::SemanticGap(
+                "value transfers are not projected".into(),
+            )];
+            let value_transfer = SummaryCompleteness::partial(value_transfer_reasons.clone())?;
+            let summary = SemanticProcedureSummary::try_new_with_coverage(
                 key.clone(),
                 Vec::new(),
                 effects,
                 dependencies,
-                SummaryCompleteness::Complete,
+                value_transfer,
+                vec![
+                    SummaryDimensionClaim::new(SummaryDimension::Protocol, protocol_status)?,
+                    SummaryDimensionClaim::new(
+                        SummaryDimension::ValueTransfer,
+                        SummaryDimensionStatus::Incomplete(
+                            value_transfer_reasons.into_boxed_slice(),
+                        ),
+                    )?,
+                ],
             )?;
             key_by_node[member] = Some(key);
             summaries.push(summary);
@@ -1919,6 +2948,13 @@ fn build_summary_set(
         components: summary_components,
         behavior,
         procedure_semantics_precharged: true,
+        admission_refused,
+        protocol_admissions: Vec::new(),
+        root_call_closure: RootCallClosure {
+            complete: false,
+            reached: Vec::new(),
+            incomplete_reasons: vec![RootCallClosureIncompleteReason::UnavailableProjection],
+        },
     })
 }
 
@@ -1943,33 +2979,49 @@ fn production_icfg_behavior(provider: IcfgProviderBehaviorIdentity) -> SummaryBe
     SummaryBehaviorKey::from_parts(derive(provider.as_bytes()), derive(provider.read_bytes()))
 }
 
-fn production_summary_behavior(provider: IcfgProviderBehaviorIdentity) -> SummaryBehaviorKey {
+/// The two behaviors a production summary can be keyed by.
+///
+/// A procedure with call sites depends on everything the provider dispatches
+/// through, so it is keyed by the full workspace provider behavior, which
+/// rotates on every analyzed edit. A call-free procedure never asks the
+/// provider anything, so its summary is keyed by the active model set alone.
+/// That digest is known before the summary is computed and carries the
+/// close-match approximation claim, so a leaf that read an approximate model
+/// cannot be reused under an exact model set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionSummaryBehavior {
+    workspace: SummaryBehaviorKey,
+    call_free: SummaryBehaviorKey,
+}
+
+fn production_summary_behavior(
+    provider: IcfgProviderBehaviorIdentity,
+) -> ProductionSummaryBehavior {
     let behavior = production_icfg_behavior(provider);
     let derive = |identity: &[u8; 32]| {
         let mut digest = LengthDelimitedDigest::new(PRODUCTION_SUMMARY_BEHAVIOR_DOMAIN);
         digest.push(identity);
         digest.finish()
     };
-    SummaryBehaviorKey::from_parts(derive(behavior.as_bytes()), derive(behavior.read_bytes()))
-}
-
-fn provider_independent_leaf_behavior() -> SummaryBehaviorKey {
-    static BEHAVIOR: OnceLock<SummaryBehaviorKey> = OnceLock::new();
-    *BEHAVIOR.get_or_init(|| {
-        let digest = LengthDelimitedDigest::new(PROVIDER_INDEPENDENT_LEAF_BEHAVIOR);
-        SummaryBehaviorKey::from_digest(digest.finish())
-    })
+    let mut call_free = LengthDelimitedDigest::new(PROVIDER_INDEPENDENT_LEAF_BEHAVIOR);
+    call_free.push(provider.models_digest().as_bytes());
+    ProductionSummaryBehavior {
+        workspace: SummaryBehaviorKey::from_parts(
+            derive(behavior.as_bytes()),
+            derive(behavior.read_bytes()),
+        ),
+        call_free: SummaryBehaviorKey::from_digest(call_free.finish()),
+    }
 }
 
 fn summary_identity(
     procedure: &ProcedureHandle,
-    provider_behavior: SummaryBehaviorKey,
+    behavior: ProductionSummaryBehavior,
 ) -> ProcedureSummaryIdentity {
-    let uses_provider = !procedure.semantics().call_sites().is_empty();
-    let behavior = if uses_provider {
-        provider_behavior
+    let provider_behavior = if procedure.semantics().call_sites().is_empty() {
+        behavior.call_free
     } else {
-        provider_independent_leaf_behavior()
+        behavior.workspace
     };
     ProcedureSummaryIdentity::new(
         procedure.artifact().key().clone(),
@@ -1977,12 +3029,15 @@ fn summary_identity(
         SummarySchemaVersion::CURRENT,
         SummarySemanticsVersion::hash_bytes(PRODUCTION_SUMMARY_SEMANTICS),
         SummaryContextKey::hash_bytes(EMPTY_CALL_CONTEXT),
-        behavior,
+        provider_behavior,
         SummaryOrigin::Inferred,
     )
 }
 
-fn canonicalize_procedures(procedures: &mut Vec<ProcedureHandle>, behavior: SummaryBehaviorKey) {
+fn canonicalize_procedures(
+    procedures: &mut Vec<ProcedureHandle>,
+    behavior: ProductionSummaryBehavior,
+) {
     procedures.sort_unstable_by_key(|procedure| summary_identity(procedure, behavior));
     procedures.dedup_by(|left, right| {
         summary_identity(left, behavior) == summary_identity(right, behavior)

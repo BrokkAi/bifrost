@@ -42,7 +42,7 @@ pub fn rows(language: Language, path: &str, source: &str) -> Vec<BranchRelationR
         language,
         node_range(node),
         &env,
-        &BranchReferenceProofs::default(),
+        &ReferenceProofs::default(),
         &Default::default(),
     )
 }

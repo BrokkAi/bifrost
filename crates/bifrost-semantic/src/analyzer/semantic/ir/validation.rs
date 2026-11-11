@@ -759,6 +759,23 @@ fn validate_procedure(
     let mut default_argument_ordinals = HashSet::default();
     for value in &procedure.values {
         validate_metadata(id, value.source, value.evidence, procedure, "value")?;
+        if let Some(StaticTypeOrigin::CallResult { call, ordinal }) = &value.static_type_origin {
+            ensure_call_site(id, *call, procedure.call_sites.len(), "static type origin")?;
+            if value.static_type_class != StaticTypeClass::Unknown
+                || procedure.call_sites[call.index()]
+                    .normal_result(*ordinal as usize)
+                    .is_none()
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::CallContract,
+                    format!(
+                        "invalid static type origin {:?} on {:?}",
+                        value.static_type_origin, value.id
+                    ),
+                ));
+            }
+        }
         match &value.kind {
             SemanticValueKind::Parameter {
                 ordinal,
@@ -945,6 +962,7 @@ fn validate_procedure(
         )?;
     }
     validate_receiver_type_facts(procedure)?;
+    validate_guarded_pattern_projections(procedure)?;
 
     validate_blocks(procedure)?;
     validate_statement_entries(procedure)?;
@@ -1141,6 +1159,54 @@ fn validate_dense_rows(procedure: &ProcedureSemanticsParts) -> Result<(), Semant
     Ok(())
 }
 
+fn validate_guarded_pattern_projections(
+    procedure: &ProcedureSemanticsParts,
+) -> Result<(), SemanticIrError> {
+    for (ordinal, candidate) in procedure.guarded_pattern_projections.iter().enumerate() {
+        if candidate.ordinal as usize != ordinal
+            || candidate.point.index() >= procedure.points.len()
+            || candidate.whole_value.index() >= procedure.values.len()
+            || candidate.binder.index() >= procedure.values.len()
+            || candidate.pattern_source.index() >= procedure.source_mappings.len()
+            || candidate.binder_source.index() >= procedure.source_mappings.len()
+            || procedure.source_mappings[candidate.pattern_source.index()].kind
+                != SourceMappingKind::Exact
+            || procedure.source_mappings[candidate.pattern_source.index()]
+                .locator
+                .role()
+                != SemanticRole::ProgramPoint
+            || procedure.source_mappings[candidate.binder_source.index()].kind
+                != SourceMappingKind::Exact
+            || procedure.source_mappings[candidate.binder_source.index()]
+                .locator
+                .role()
+                != SemanticRole::ProgramPoint
+            || candidate.path.is_empty()
+            || candidate.path.len() > 16
+            || candidate.declared_path_len as usize != candidate.path.len()
+            || candidate
+                .path
+                .iter()
+                .any(|step| matches!(step, PatternProjectionStep::Named(name) if name.is_empty()))
+            || candidate.status != PatternProjectionStatus::Unevaluated
+            || procedure.values[candidate.binder.index()].source != candidate.binder_source
+            || !procedure.gaps.iter().any(|gap| {
+                gap.point == candidate.point
+                    && gap.subject == SemanticGapSubject::Value(candidate.binder)
+                    && gap.capability == SemanticCapability::Values
+                    && gap.impacts.contains(SemanticGapImpact::ValueFlow)
+            })
+        {
+            return Err(SemanticIrError::procedure(
+                procedure.id,
+                SemanticIrErrorKind::ValueFlowContract,
+                format!("invalid unevaluated pattern projection {ordinal}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_lifecycle_pointer_rows(
     key: &SemanticArtifactKey,
     procedures: &[ProcedureSemanticsParts],
@@ -1211,6 +1277,13 @@ fn validate_lifecycle_pointer_rows(
                         target,
                     } if *source == fact.source_value && *target == fact.target_value => {
                         Some(*invalidation)
+                    }
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::OwnershipUnknown,
+                        source,
+                        target,
+                    } if *source == fact.source_value && *target == fact.target_value => {
+                        Some(MoveInvalidation::Unknown)
                     }
                     _ => None,
                 });
@@ -2674,20 +2747,34 @@ fn validate_control_edges(
             "control-edge target",
         )?;
         validate_metadata(id, edge.source, edge.evidence, procedure, "control edge")?;
-        if !matches!(
-            procedure.evidence_rows[edge.evidence.index()].proof,
-            ProofStatus::Proven
-        ) {
-            return Err(SemanticIrError::procedure(
-                id,
-                SemanticIrErrorKind::ControlFlowContract,
-                format!(
-                    "{} edge {} -> {} cites unproven evidence; omit the edge and emit an unproven gap instead",
-                    edge.kind.label(),
-                    edge.source_point,
-                    edge.target_point
-                ),
-            ));
+        let evidence = &procedure.evidence_rows[edge.evidence.index()];
+        // Completeness on an edge is inherited point metadata, not route
+        // quality. An unproven route requires its own scoped gap.
+        if let ProofStatus::Unproven(reason) = &evidence.proof {
+            let candidate_gap = procedure.gaps.iter().any(|gap| {
+                gap.point == edge.target_point
+                    && gap.subject == SemanticGapSubject::Point
+                    && gap.capability == control_edge_capability(edge.kind)
+                    && gap.kind == SemanticGapKind::Unproven
+                    && gap.evidence == edge.evidence
+                    && gap.source == edge.source
+                    && gap.detail.as_ref() == reason.as_ref()
+            });
+            if !matches!(&evidence.completeness, EvidenceCompleteness::Partial(partial) if partial.as_ref() == reason.as_ref())
+                || !evidence.sources.contains(&edge.source)
+                || !candidate_gap
+            {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::ControlFlowContract,
+                    format!(
+                        "{} edge {} -> {} requires matching Unproven + Partial evidence and a target-scoped gap",
+                        edge.kind.label(),
+                        edge.source_point,
+                        edge.target_point
+                    ),
+                ));
+            }
         }
         if !edges.insert(edge) {
             return Err(SemanticIrError::procedure(
@@ -2799,6 +2886,7 @@ fn validate_events(
                         ValueFlowKind::BackingStore { .. }
                         | ValueFlowKind::BackingStoreAlternative { .. }
                         | ValueFlowKind::Local
+                        | ValueFlowKind::OwnershipUnknown
                         | ValueFlowKind::Transfer(_)
                         | ValueFlowKind::Parameter
                         | ValueFlowKind::Receiver
@@ -2807,10 +2895,14 @@ fn validate_events(
                         | ValueFlowKind::IntegerOffset { .. }
                         | ValueFlowKind::ReferenceBoxing
                         | ValueFlowKind::ReferenceUnboxing
-                        | ValueFlowKind::LanguageDefined => {}
+                        | ValueFlowKind::LanguageDefined
+                        | ValueFlowKind::ByValueCapture => {}
                     }
                     validate_value_flow_kind(procedure, *kind, *source, *target)?;
-                    if let ValueFlowKind::Transfer(transfer) = kind {
+                    if matches!(
+                        kind,
+                        ValueFlowKind::Transfer(_) | ValueFlowKind::OwnershipUnknown
+                    ) {
                         let has_matching_assignment = event_index
                             .checked_sub(1)
                             .and_then(|assignment_index| point.events.get(assignment_index))
@@ -2828,13 +2920,39 @@ fn validate_events(
                                 id,
                                 SemanticIrErrorKind::ValueFlowContract,
                                 format!(
-                                    "{} transfer {source} -> {target} at point {} must immediately follow its matching assignment",
-                                    transfer.kind.label(),
+                                    "{} flow {source} -> {target} at point {} must immediately follow its matching assignment",
+                                    kind.label(),
                                     point.id
                                 ),
                             ));
                         }
-                        validate_transfer(procedure, *transfer, event.evidence, point.id)?;
+                        if let ValueFlowKind::Transfer(transfer) = kind {
+                            validate_transfer(procedure, *transfer, event.evidence, point.id)?;
+                        }
+                        if matches!(kind, ValueFlowKind::OwnershipUnknown) {
+                            let paired_field_fact = procedure.move_outs.iter().any(|fact| {
+                                fact.point == point.id
+                                    && fact.source_value == *source
+                                    && fact.target_value == *target
+                                    && fact.state_after == MoveOutState::Unknown
+                                    && matches!(
+                                        fact.place,
+                                        SemanticPlace::MemoryLocation(location)
+                                            if procedure.memory_locations.get(location.index()).is_some_and(|row|
+                                                matches!(row.kind, MemoryLocationKind::Field { .. }))
+                                    )
+                            });
+                            if !paired_field_fact {
+                                return Err(SemanticIrError::procedure(
+                                    id,
+                                    SemanticIrErrorKind::LifecycleContract,
+                                    format!(
+                                        "ownership-unknown flow {source} -> {target} at point {} requires an Unknown move-out on its field place",
+                                        point.id
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     if let ValueFlowKind::BackingStoreAlternative { allocation, .. } = kind {
                         ensure_allocation(
@@ -3459,6 +3577,7 @@ fn validate_value_flow_kind(
     let target_kind = &procedure.values[target.index()].kind;
     let valid = match kind {
         ValueFlowKind::Local
+        | ValueFlowKind::OwnershipUnknown
         | ValueFlowKind::Transfer(_)
         | ValueFlowKind::BackingStore { .. }
         | ValueFlowKind::IntegerOffset { .. }
@@ -3477,7 +3596,7 @@ fn validate_value_flow_kind(
             matches!(source_kind, SemanticValueKind::Return)
                 || matches!(target_kind, SemanticValueKind::Return)
         }
-        ValueFlowKind::LanguageDefined => true,
+        ValueFlowKind::LanguageDefined | ValueFlowKind::ByValueCapture => true,
     };
     if !valid {
         return Err(SemanticIrError::procedure(
@@ -4092,6 +4211,7 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
         SemanticEffect::AggregateInitializer { .. } => &[SemanticCapability::Values],
         SemanticEffect::ValueFlow { kind, .. } => match kind {
             ValueFlowKind::Local
+            | ValueFlowKind::OwnershipUnknown
             | ValueFlowKind::Transfer(_)
             | ValueFlowKind::BackingStore { .. }
             | ValueFlowKind::IntegerOffset { .. }
@@ -4110,7 +4230,7 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
             ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. } => {
                 &[SemanticCapability::Values, SemanticCapability::ReturnFlow]
             }
-            ValueFlowKind::LanguageDefined => {
+            ValueFlowKind::LanguageDefined | ValueFlowKind::ByValueCapture => {
                 &[SemanticCapability::Values, SemanticCapability::LocalFlow]
             }
         },
@@ -4199,6 +4319,14 @@ pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWo
         .saturating_add(procedure.pointer_accesses.len())
         .saturating_add(procedure.pointer_invalidations.len())
         .saturating_add(procedure.incomplete_facts.len())
+        .saturating_add(
+            procedure
+                .guarded_pattern_projections
+                .iter()
+                .fold(0usize, |count, candidate| {
+                    count.saturating_add(candidate.path.len().saturating_add(1))
+                }),
+        )
         .saturating_add(procedure.switch_facts.iter().fold(0usize, |total, fact| {
             total.saturating_add(fact.cases.len().saturating_add(1))
         }));
@@ -4211,6 +4339,13 @@ pub fn measure_procedure_work(procedure: &ProcedureSemanticsParts) -> SemanticWo
         .saturating_mul(2)
         .saturating_add(procedure.control_edges.len());
     work.nested_entries = work.nested_entries.saturating_add(adjacency_entries);
+    for candidate in &procedure.guarded_pattern_projections {
+        for step in &candidate.path {
+            if let PatternProjectionStep::Named(name) = step {
+                account_text(name, &mut work);
+            }
+        }
+    }
 
     // The locator is retained once on the procedure and once as the key
     // in the artifact's locator index.

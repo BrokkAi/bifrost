@@ -60,9 +60,12 @@ code_query_labeled_enum! {
     )]
     #[serde(rename_all = "snake_case")]
     CodeQueryDiagnosticCode {
+        PolicyDeclaredProvenSubset => "policy_declared_proven_subset",
         InvalidPlan => "invalid_plan",
         Cancelled => "cancelled",
         UnsupportedStructuralFeature => "unsupported_structural_feature",
+        QualifyingTypeUnresolved => "qualifying_type_unresolved",
+        StructuralRoleCoverageIncomplete => "structural_role_coverage_incomplete",
         MissingStructuralAdapter => "missing_structural_adapter",
         RecoveredSyntaxIncomplete => "recovered_syntax_incomplete",
         UnsupportedImportAnalysis => "unsupported_import_analysis",
@@ -78,6 +81,7 @@ code_query_labeled_enum! {
         SemanticBudgetExhausted => "semantic_budget_exhausted",
         SemanticProviderFailed => "semantic_provider_failed",
         SemanticPackAcquisitionPending => "semantic_pack_acquisition_pending",
+        SemanticPackActivationFailed => "semantic_pack_activation_failed",
         WorkspaceSemanticModelsNotLoaded => "workspace_semantic_models_not_loaded",
         UnresolvedProtocolReference => "unresolved_protocol_reference",
         TypestateRegistrationStale => "typestate_registration_stale",
@@ -115,12 +119,18 @@ code_query_labeled_enum! {
         CallRelationTargetsAmbiguous => "call_relation_targets_ambiguous",
         CallRelationCandidateLimit => "call_relation_candidate_limit",
         CallRelationAnalysisFailed => "call_relation_analysis_failed",
+        RenderedCapturesTruncated => "rendered_captures_truncated",
         ReferenceSourceBytesTruncated => "reference_source_bytes_truncated",
         ReferenceCandidateFilesTruncated => "reference_candidate_files_truncated",
         ReferenceCandidatesOmitted => "reference_candidates_omitted",
         ReferenceTargetsAmbiguous => "reference_targets_ambiguous",
         ReferenceCallsiteLimit => "reference_callsite_limit",
         ReferenceAnalysisFailed => "reference_analysis_failed",
+        ReferenceKindUndecided => "reference_kind_undecided",
+        EnclosingPatternUndecided => "enclosing_pattern_undecided",
+        IdenticalCapturesOpen => "identical_captures_open",
+        RowPredicateUndecided => "row_predicate_undecided",
+        MemberFormUndecided => "member_form_undecided",
         UsesParserUnsupported => "uses_parser_unsupported",
         UsesCandidateLimit => "uses_candidate_limit",
         UsesTargetsAmbiguous => "uses_targets_ambiguous",
@@ -192,6 +202,7 @@ impl CodeQueryDiagnosticCode {
             | Self::TaintFindingTruncated
             | Self::CallRelationBudgetExhausted
             | Self::CallRelationCandidateLimit
+            | Self::RenderedCapturesTruncated
             | Self::ReferenceSourceBytesTruncated
             | Self::ReferenceCandidateFilesTruncated
             | Self::ReferenceCallsiteLimit
@@ -206,6 +217,7 @@ impl CodeQueryDiagnosticCode {
             | Self::ResultLimitReached => Some(DiagnosticExecutionCause::Budget),
             Self::SemanticProviderFailed
             | Self::SemanticPackAcquisitionPending
+            | Self::SemanticPackActivationFailed
             | Self::UnresolvedProtocolReference
             | Self::TypestateProviderFailed
             | Self::UnresolvedValueFlowPlanReference

@@ -6,6 +6,7 @@
 //! contexts are query-scoped views implemented in `bifrost-rust`.
 
 use brokk_bifrost_core::analyzer::usages::model::ExportIndex;
+use brokk_bifrost_core::retention_budget::{Accounted, SharedAllocation};
 
 use brokk_bifrost_core::analyzer::usages::model::ImportBinder;
 
@@ -38,7 +39,10 @@ impl RustAnalyzer {
     /// immutable for the analyzer instance's lifetime, and callers ask for it
     /// once per export name per pending file, so deep-cloning the whole map on
     /// every cache hit was pure waste (#1230 item 5).
-    pub fn export_index_of(&self, file: &ProjectFile) -> ReferenceContextResult<Arc<ExportIndex>> {
+    pub fn export_index_of(
+        &self,
+        file: &ProjectFile,
+    ) -> ReferenceContextResult<Arc<Accounted<ExportIndex>>> {
         self.export_index_of_while(file, &|| true)
     }
 
@@ -46,30 +50,32 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
         progress: &dyn Fn() -> bool,
-    ) -> ReferenceContextResult<Arc<ExportIndex>> {
+    ) -> ReferenceContextResult<Arc<Accounted<ExportIndex>>> {
         let cache_fill = brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
 
         if !progress() {
             return Err(brokk_bifrost_rust::graph_support::ReferenceContextError::Interrupted);
         }
         if let Some(cached) = self.export_indexes.get(file) {
-            return Ok(cached);
+            return Ok(cached.arc().clone());
         }
         let declarations = self.declarations(file);
         let _scope = AnalyzerQueryScope::new(self);
-        let index = Arc::new(
+        let index = Arc::new(Accounted::charged(
+            self.inner.analyzer_store().retention_budget(),
             brokk_bifrost_rust::graph_support::export_index_of_declarations_while(
                 self,
                 file,
                 &declarations,
                 progress,
             )?,
-        );
+        ));
         {
             let cache_key = file.clone();
             let cache_value = index.clone();
             if cache_fill.is_complete() {
-                self.export_indexes.insert(cache_key, cache_value);
+                self.export_indexes
+                    .insert(cache_key, SharedAllocation::new(cache_value));
             }
         };
         Ok(index)
@@ -187,13 +193,10 @@ mod frozen {
 
     use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportKind};
     use brokk_bifrost_core::hash::HashMap;
-    use brokk_bifrost_rust::declarations::rust_package_name;
     use brokk_bifrost_rust::graph_support::{
         canonical_export_fqn_from_files, resolve_module_package,
     };
-    use brokk_bifrost_rust::imports::{
-        resolve_rust_module_path_with_crate, rust_crate_root_package,
-    };
+    use brokk_bifrost_rust::imports::resolve_rust_module_path_with_crate;
 
     #[derive(Debug, Default)]
     pub(in crate::analyzer::rust::graph_support) struct FrozenReferenceContext {
@@ -372,8 +375,14 @@ mod frozen {
             })
             .collect();
         FrozenReferenceContext {
-            package: rust_package_name(file),
-            crate_package: rust_crate_root_package(file),
+            package: brokk_bifrost_rust::declarations::rust_package_name_with(
+                &analyzer.inner.adapter().naming,
+                file,
+            ),
+            crate_package: brokk_bifrost_rust::imports::rust_crate_root_package_with(
+                &analyzer.inner.adapter().naming,
+                file,
+            ),
             named,
             namespace,
             scoped,
@@ -1084,7 +1093,8 @@ pub struct MacroOnly;
             )
             .file("dep-crate/src/lib.rs", "pub fn target() {}\n")
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(fixture.root());
         let file = fixture.file("src/lib.rs");
         let local_module = fixture.file("src/dep.rs");
         let scope = AnalyzerQueryScope::new(&analyzer);
@@ -1126,7 +1136,8 @@ pub struct MacroOnly;
             )
             .file("host/src/lib.rs", "use dep::outer::api;\n")
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(fixture.root());
         assert_eq!(
             analyzer
                 .resolve_module_files(&fixture.file("host/src/lib.rs"), "dep::outer::api")
@@ -1149,7 +1160,8 @@ pub struct MacroOnly;
                 "use root_item::target;\npub fn call() { target(); }\n",
             )
             .build();
-        let analyzer = RustAnalyzer::new(fixture.project_dyn());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(fixture.root());
         let file = fixture.file("src/consumer.rs");
         let root_module = fixture.file("src/root_item.rs");
         let scope = AnalyzerQueryScope::new(&analyzer);
@@ -1399,7 +1411,8 @@ wrap! { pub trait Embedded {} }
                 ),
             ],
         );
-        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let (_workspace, analyzer) =
+            crate::analyzer::rust::test_support::certified_analyzer(&fixture.project_root());
         let file = ProjectFile::new(fixture.project_root(), "src/exports.rs");
 
         let first = analyzer

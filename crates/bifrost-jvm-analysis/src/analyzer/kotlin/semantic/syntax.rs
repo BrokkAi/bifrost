@@ -97,9 +97,7 @@ pub(in crate::analyzer::kotlin::semantic) fn body_contains_free_this(
 }
 
 /// The declaration container a node opens, if any.
-pub(in crate::analyzer::kotlin::semantic) fn declaration_container_kind(
-    node: Node<'_>,
-) -> Option<DeclarationSegmentKind> {
+pub(crate) fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
     match node.kind() {
         "class_declaration" | "object_declaration" | "companion_object" => {
             Some(DeclarationSegmentKind::Type)
@@ -772,8 +770,6 @@ pub(in crate::analyzer::kotlin::semantic) fn missing_slot(
         node.end_byte()
     ))
 }
-
-pub(super) use brokk_bifrost_core::analyzer::tree_walk::node_range;
 
 /// Procedure syntax roles for the Kotlin lowering. Every child of a
 /// `statements` block, and a non-block loop or branch body, is a statement;

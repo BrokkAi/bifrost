@@ -46,7 +46,9 @@ macro_rules! passthrough { ($($item:item)*) => { $($item)* }; }
 passthrough! { macro_rules! EmbeddedMacro { ($name:ident) => {}; } }
 "#;
 
-fn fixture_facts(source: &str) -> Arc<RustHierarchySourceFacts> {
+fn fixture_facts(
+    source: &str,
+) -> Arc<brokk_bifrost_core::retention_budget::Accounted<RustHierarchySourceFacts>> {
     let parsed = crate::test_helpers::parse_rust_fixture(source);
     let canonical = parsed.source_facts.as_ref().expect("canonical Rust facts");
     let module_names = canonical
@@ -57,14 +59,16 @@ fn fixture_facts(source: &str) -> Arc<RustHierarchySourceFacts> {
         .iter()
         .map(|module| (module.declaration, module.name.clone()))
         .collect();
-    Arc::new(RustHierarchySourceFacts {
-        items: canonical.rust_items.clone(),
-        types: canonical.rust_types.clone(),
-        declarations: canonical.occurrences.declarations().to_vec(),
-        declaration_units: parsed.source_declaration_units.clone(),
-        module_names,
-        imports: canonical.imports.clone(),
-    })
+    Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(
+        RustHierarchySourceFacts {
+            items: canonical.rust_items.clone(),
+            types: canonical.rust_types.clone(),
+            declarations: canonical.occurrences.declarations().to_vec(),
+            declaration_units: parsed.source_declaration_units.clone(),
+            module_names,
+            imports: canonical.imports.clone(),
+        },
+    ))
 }
 
 fn declaration_named(facts: &RustHierarchySourceFacts, name: &str) -> SourceDeclarationId {

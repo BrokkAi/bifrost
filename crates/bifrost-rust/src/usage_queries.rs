@@ -32,12 +32,12 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::graph_support::{RustCargoRouteError, RustFactSource};
 
-use crate::declarations::rust_package_name;
+use crate::declarations::rust_package_name_with;
 use crate::imports::{RustImportBindingName, RustVisibility};
 use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
     Domain, ModuleKey, RustImportExtent, RustPathIdentity, RustSymbolIdentity, RustSymbolNamespace,
-    direct_import_scope_for_module, rust_file_is_actual_crate_root,
+    direct_import_scope_for_module_with, rust_file_is_actual_crate_root_with,
 };
 use brokk_bifrost_core::analyzer::rust_facts::{
     RustExportFact, RustImportTargetFact, RustUsageFacts,
@@ -84,6 +84,7 @@ pub struct RustImportBinding {
 /// through [`rust_declaration_facts`]. Cargo placement is not a source fact.
 #[derive(Debug, Default)]
 pub struct RustDeclarationFacts {
+    pub charge: brokk_bifrost_core::retention_budget::AllocationCharge,
     /// Declaration -> the identity it introduces, in declaration order. A
     /// declaration whose visibility does not resolve to a domain still appears
     /// here; it simply contributes no entry to `domains`.
@@ -114,6 +115,12 @@ pub struct RustDeclarationFacts {
     pub domain_cfg_occurrences: Vec<(RustSymbolIdentity, Vec<(Domain, RustCfgCondition)>)>,
 }
 
+impl brokk_bifrost_core::retention_budget::SelfCharged for RustDeclarationFacts {
+    fn allocation_charge(&self) -> &brokk_bifrost_core::retention_budget::AllocationCharge {
+        &self.charge
+    }
+}
+
 /// Derive one file's declaration facts.
 ///
 /// `declarations` is passed in because the caller already holds the file's
@@ -137,21 +144,32 @@ pub fn rust_declaration_facts(
     let mut ordered_domains = Vec::new();
     let mut ordered_cfg_conditions = Vec::new();
     let mut ordered_domain_cfg_occurrences = Vec::new();
-    let is_actual_crate_root = rust_file_is_actual_crate_root(analyzer, file)?;
+    let is_actual_crate_root = rust_file_is_actual_crate_root_with(analyzer, file)?;
     for declaration in declarations {
         if !keep_going() {
             return Ok(None);
         }
         let (owner, declared_module) = if declaration.is_module() {
-            let declared = ModuleKey::new(file, &declaration.fq_name());
-            let owner = declared
-                .parent()
-                .unwrap_or_else(|| ModuleKey::new(file, &rust_package_name(file)));
+            let declared =
+                ModuleKey::new_with(analyzer.crate_naming_caches(), file, &declaration.fq_name());
+            let owner = declared.parent().unwrap_or_else(|| {
+                ModuleKey::new_with(
+                    analyzer.crate_naming_caches(),
+                    file,
+                    &rust_package_name_with(analyzer.crate_naming_caches(), file),
+                )
+            });
             (owner, Some(declared))
         } else {
             let owner = match analyzer.structural_parent_of(declaration) {
-                None => ModuleKey::new(file, &rust_package_name(file)),
-                Some(parent) if parent.is_module() => ModuleKey::new(file, &parent.fq_name()),
+                None => ModuleKey::new_with(
+                    analyzer.crate_naming_caches(),
+                    file,
+                    &rust_package_name_with(analyzer.crate_naming_caches(), file),
+                ),
+                Some(parent) if parent.is_module() => {
+                    ModuleKey::new_with(analyzer.crate_naming_caches(), file, &parent.fq_name())
+                }
                 Some(_) => continue,
             };
             (owner, None)
@@ -182,7 +200,8 @@ pub fn rust_declaration_facts(
             let declaration_domain = if macro_export {
                 Some(Domain::Public)
             } else {
-                direct_import_scope_for_module(
+                direct_import_scope_for_module_with(
+                    analyzer.crate_naming_caches(),
                     file,
                     &owner.package(),
                     property.visibility.clone(),
@@ -208,7 +227,8 @@ pub fn rust_declaration_facts(
                     .chain(constructor.field_visibilities.iter())
                     .chain(constructor.non_exhaustive.then_some(&RustVisibility::Crate))
                     .map(|visibility| {
-                        direct_import_scope_for_module(
+                        direct_import_scope_for_module_with(
+                            analyzer.crate_naming_caches(),
                             file,
                             &owner.package(),
                             visibility.clone(),
@@ -314,7 +334,10 @@ impl<'a> RustUsageQueries<'a> {
         if let Some(cached) = self.path_identities.borrow().get(file).cloned() {
             return cached;
         }
-        let identity = Arc::new(RustPathIdentity::of(file));
+        let identity = Arc::new(RustPathIdentity::of_with(
+            self.analyzer.crate_naming_caches(),
+            file,
+        ));
         self.path_identity_computations
             .set(self.path_identity_computations.get() + 1);
         self.path_identities
@@ -345,7 +368,10 @@ impl<'a> RustUsageQueries<'a> {
     pub fn facts_of(
         &self,
         file: &ProjectFile,
-    ) -> Result<Option<Arc<RustUsageFacts>>, RustCargoRouteError> {
+    ) -> Result<
+        Option<Arc<brokk_bifrost_core::retention_budget::Accounted<RustUsageFacts>>>,
+        RustCargoRouteError,
+    > {
         let Some(oid) = self.oid_of(file) else {
             return Ok(None);
         };

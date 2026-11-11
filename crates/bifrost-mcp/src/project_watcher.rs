@@ -2,6 +2,7 @@ use crate::analyzer::is_language_configuration_input;
 use crate::hash::HashSet;
 use crate::path_normalization::NormalizePath;
 use crate::{BIFROST_IGNORE_FILE_NAME, Project, ProjectFile};
+use brokk_bifrost_core::analyzer::project::AnalyzerOwnedPaths;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{
     Config, Event, EventKind, PathOp, PollWatcher, RecommendedWatcher, Watcher, recommended_watcher,
@@ -134,9 +135,15 @@ fn event_handler(
 ) -> impl FnMut(notify::Result<Event>) + Send + 'static {
     let pending_for_callback = Arc::clone(pending);
     let project_for_callback = Arc::clone(project);
+    let owned_paths = watcher_owned_paths(project.as_ref());
     move |result: notify::Result<Event>| {
         brokk_bifrost_analysis::analyzer::without_project_reads(|| match result {
-            Ok(event) => handle_event(&project_for_callback, &pending_for_callback, event),
+            Ok(event) => handle_event(
+                &project_for_callback,
+                &owned_paths,
+                &pending_for_callback,
+                event,
+            ),
             Err(_) => {
                 project_for_callback.invalidate_cached_file_listing();
                 mark_full_refresh(&pending_for_callback);
@@ -145,7 +152,37 @@ fn event_handler(
     }
 }
 
-fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>, event: Event) {
+/// The generated paths a workspace watcher must ignore.
+///
+/// Besides the analyzer cache, a configured semantic-pack catalog lives in the
+/// workspace and is opened read-write by the session warm. SQLite creates and
+/// writes its WAL, shared-memory and lock files there, and Windows also reports
+/// the catalog directory's own modification. Any non-empty delta is enough to
+/// invalidate the dependency evidence and start a pack refresh, so these
+/// generated writes must not look like workspace edits.
+fn watcher_owned_paths(project: &dyn Project) -> AnalyzerOwnedPaths {
+    let root = project.root();
+    let mut owned = AnalyzerOwnedPaths::new(root);
+    // Activation reports an invalid or unreadable packs document as an
+    // unavailable session state; the watcher then has no configured catalog to
+    // exclude and falls back to the default location activation would use.
+    let catalog = crate::analyzer::packs_document::load_workspace_packs_config_at(root)
+        .ok()
+        .flatten()
+        .and_then(|config| config.catalog().map(Path::to_path_buf))
+        .unwrap_or_else(|| {
+            crate::analyzer::semantic_model::catalog::default_semantic_pack_catalog_root(root)
+        });
+    owned = owned.with_extra_directory(root, root.join(catalog));
+    owned
+}
+
+fn handle_event(
+    project: &Arc<dyn Project>,
+    owned_paths: &AnalyzerOwnedPaths,
+    pending: &Arc<Mutex<PendingChanges>>,
+    event: Event,
+) {
     if matches!(event.kind, EventKind::Access(_)) {
         return;
     }
@@ -200,7 +237,7 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
     let project_paths = paths
         .iter()
         .copied()
-        .filter(|path| !is_internal_state_path(project.as_ref(), path))
+        .filter(|path| !owned_paths.contains(path))
         .collect::<Vec<_>>();
     if listing_may_change(&event, &project_paths)
         && !project_paths.is_empty()
@@ -219,7 +256,7 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
 
     let mut saw_refresh_fallback_path = false;
     for path in &paths {
-        match classify_project_path(project.as_ref(), path) {
+        match classify_project_path(project.as_ref(), owned_paths, path) {
             PathDisposition::ProjectFile(project_file) => {
                 let mut state = pending
                     .lock()
@@ -341,7 +378,11 @@ enum PathDisposition {
     RefreshFallback,
 }
 
-fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition {
+fn classify_project_path(
+    project: &dyn Project,
+    owned_paths: &AnalyzerOwnedPaths,
+    path: &Path,
+) -> PathDisposition {
     let path = path.to_path_buf().normalize();
     let Ok(rel_path) = path.strip_prefix(project.root()) else {
         return PathDisposition::RefreshFallback;
@@ -349,7 +390,7 @@ fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition 
     if rel_path.as_os_str().is_empty() {
         return PathDisposition::RefreshFallback;
     }
-    if is_internal_state_rel_path(rel_path) {
+    if owned_paths.contains(&path) {
         return PathDisposition::IgnoredInternal;
     }
 
@@ -364,42 +405,12 @@ fn classify_project_path(project: &dyn Project, path: &Path) -> PathDisposition 
     PathDisposition::ProjectFile(file)
 }
 
-/// Whether `path` is analyzer-owned state inside the workspace, judged by the
-/// path alone so it can gate listing-cache invalidation before any
-/// classification that itself reads the listing. Paths outside the root are
-/// not internal: they feed the refresh fallback.
-fn is_internal_state_path(project: &dyn Project, path: &Path) -> bool {
-    let path = path.to_path_buf().normalize();
-    path.strip_prefix(project.root())
-        .is_ok_and(is_internal_state_rel_path)
-}
-
 fn is_bifrost_ignore_path(project: &dyn Project, path: &Path) -> bool {
     let path = path.to_path_buf().normalize();
     path.strip_prefix(project.root()).is_ok_and(|rel_path| {
         rel_path
             .file_name()
             .is_some_and(|name| name == BIFROST_IGNORE_FILE_NAME)
-    })
-}
-
-/// Generated SQLite state writes inside the watched workspace. Treating those
-/// writes as source changes would repeatedly invalidate analyzer snapshots and
-/// the cached file listing, but the rest of `.bifrost` is tracked project
-/// input and must remain live.
-fn is_internal_state_rel_path(rel_path: &Path) -> bool {
-    let mut components = rel_path.components();
-    if components
-        .next()
-        .is_none_or(|component| component.as_os_str() != crate::gitblob::PROJECT_DIR_NAME)
-    {
-        return false;
-    }
-    let child = components.next();
-    child.is_some_and(|component| {
-        component.as_os_str() == crate::gitblob::CACHE_SUBDIR_NAME
-            || (components.next().is_none()
-                && crate::cache_db::is_legacy_project_cache_file_name(component.as_os_str()))
     })
 }
 
@@ -524,8 +535,8 @@ fn watch_roots(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIFROST_IGNORE_FILE_NAME, PendingChanges, ProjectChangeWatcher, handle_event,
-        watch_project_paths, watch_roots,
+        AnalyzerOwnedPaths, BIFROST_IGNORE_FILE_NAME, PendingChanges, ProjectChangeWatcher,
+        handle_event, watch_project_paths, watch_roots, watcher_owned_paths,
     };
     use crate::ProjectFile;
     use crate::path_normalization::NormalizePath;
@@ -534,6 +545,7 @@ mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::{Event, EventKind};
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -669,12 +681,80 @@ mod tests {
             EventKind::Remove(RemoveKind::File),
         ] {
             let pending = Arc::new(Mutex::new(PendingChanges::default()));
-            handle_event(&project, &pending, Event::new(kind).add_path(path.clone()));
+            handle_event(
+                &project,
+                &AnalyzerOwnedPaths::new(project.root()),
+                &pending,
+                Event::new(kind).add_path(path.clone()),
+            );
 
             let state = pending.lock().unwrap();
             assert!(state.files.is_empty());
             assert!(state.requires_full_refresh);
         }
+    }
+
+    /// #10698: the session warm opens a configured workspace semantic-pack
+    /// catalog read-write. SQLite's WAL, shared-memory and lock files, and on
+    /// Windows the catalog directory's own modification event, are generated
+    /// analyzer state. Any non-empty delta makes the dependency evidence stale,
+    /// so treating one as an edit invalidated the activation that had just
+    /// published and made the first query report WarmPending.
+    #[test]
+    #[hardwon("#10698: a warm's own semantic-pack catalog writes invalidated its installed stage")]
+    fn configured_semantic_pack_catalog_writes_are_not_workspace_edits() {
+        let (_temp, project) = project_with_files(&[
+            "src/Main.java",
+            ".bifrost/packs.json",
+            ".bifrost/semantic-models/model.rqlp",
+        ]);
+        fs::write(
+            project.root().join(".bifrost/packs.json"),
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .unwrap();
+        let owned = watcher_owned_paths(project.as_ref());
+        let catalog = project.root().join(".bifrost/packs-catalog");
+        fs::create_dir_all(&catalog).unwrap();
+        let wal = catalog.join("catalog.db-wal");
+        fs::write(&wal, "wal").unwrap();
+
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        for event in [
+            Event::new(EventKind::Create(CreateKind::File)).add_path(wal.clone()),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(wal),
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(catalog),
+        ] {
+            handle_event(&project, &owned, &pending, event);
+        }
+        {
+            let state = pending.lock().unwrap();
+            assert!(
+                state.files.is_empty(),
+                "generated catalog events became workspace files: {:?}",
+                state.files
+            );
+            assert!(!state.requires_full_refresh);
+        }
+
+        // The packs document and authored workspace models stay real inputs.
+        handle_event(
+            &project,
+            &owned,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(project.root().join(".bifrost/semantic-models/model.rqlp")),
+        );
+        let state = pending.lock().unwrap();
+        assert_eq!(
+            state
+                .files
+                .iter()
+                .map(|file| file.rel_path().to_path_buf())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from(".bifrost/semantic-models/model.rqlp")]
+        );
+        assert!(!state.requires_full_refresh);
     }
 
     /// Gate 13 defect 3: a content write to a listed file changes the file,
@@ -710,6 +790,7 @@ mod tests {
         ] {
             handle_event(
                 &project,
+                &AnalyzerOwnedPaths::new(project.root()),
                 &pending,
                 Event::new(kind).add_path(main.abs_path()),
             );
@@ -730,6 +811,7 @@ mod tests {
 
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                 .add_path(root.join(".gitignore")),
@@ -778,11 +860,13 @@ mod tests {
         fs::write(temp_file.abs_path(), "fn main() { let saved = 1; }\n").unwrap();
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Create(CreateKind::File)).add_path(temp_file.abs_path()),
         );
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
                 .add_path(temp_file.abs_path()),
@@ -791,6 +875,7 @@ mod tests {
         fs::rename(temp_file.abs_path(), main.abs_path()).unwrap();
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
                 .add_path(temp_file.abs_path())
@@ -804,6 +889,7 @@ mod tests {
         fs::write(log.abs_path(), "log\n").unwrap();
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Create(CreateKind::File)).add_path(log.abs_path()),
         );
@@ -852,7 +938,12 @@ mod tests {
                 EventKind::Remove(RemoveKind::File),
             ] {
                 let pending = Arc::new(Mutex::new(PendingChanges::default()));
-                handle_event(&project, &pending, Event::new(kind).add_path(path.clone()));
+                handle_event(
+                    &project,
+                    &AnalyzerOwnedPaths::new(project.root()),
+                    &pending,
+                    Event::new(kind).add_path(path.clone()),
+                );
 
                 let state = pending.lock().unwrap();
                 assert!(
@@ -891,6 +982,7 @@ mod tests {
             let pending = Arc::new(Mutex::new(PendingChanges::default()));
             handle_event(
                 &project,
+                &AnalyzerOwnedPaths::new(project.root()),
                 &pending,
                 Event::new(EventKind::Modify(ModifyKind::Any))
                     .add_path(project.root().join(relative)),
@@ -920,6 +1012,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(project.root().join("vendor/lib/.git/index.lock")),
@@ -941,6 +1034,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(project.root().join("vendor/lib/.git/HEAD")),
@@ -959,6 +1053,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(workflow.abs_path()),
         );
@@ -988,6 +1083,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Create(CreateKind::File)).add_path(extra.abs_path()),
         );
@@ -1074,6 +1170,7 @@ mod tests {
         let source_pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &source_pending,
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(source.abs_path()),
         );
@@ -1089,6 +1186,7 @@ mod tests {
         let git_pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &git_pending,
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(git_head),
         );
@@ -1189,6 +1287,7 @@ mod tests {
 
             handle_event(
                 &project,
+                &AnalyzerOwnedPaths::new(project.root()),
                 &pending,
                 Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.clone()),
             );
@@ -1256,7 +1355,12 @@ mod tests {
                 EventKind::Remove(RemoveKind::Any),
             ] {
                 let pending = Arc::new(Mutex::new(PendingChanges::default()));
-                handle_event(&project, &pending, Event::new(kind).add_path(path.clone()));
+                handle_event(
+                    &project,
+                    &AnalyzerOwnedPaths::new(project.root()),
+                    &pending,
+                    Event::new(kind).add_path(path.clone()),
+                );
                 let state = pending.lock().unwrap();
                 assert!(state.files.is_empty(), "{path:?} must remain internal");
                 assert!(!state.requires_full_refresh);
@@ -1270,6 +1374,7 @@ mod tests {
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(extra.abs_path()),
         );
@@ -1292,6 +1397,7 @@ mod tests {
 
         handle_event(
             &project,
+            &AnalyzerOwnedPaths::new(project.root()),
             &pending,
             Event::new(EventKind::Modify(ModifyKind::Any))
                 .add_path(source.abs_path())
@@ -1333,7 +1439,10 @@ mod tests {
 #[cfg(test)]
 mod pending_changes_properties {
     use super::tests::project_with_files;
-    use super::{ChangeDelta, PendingChanges, ProjectChangeWatcher, WatcherBackend, handle_event};
+    use super::{
+        AnalyzerOwnedPaths, ChangeDelta, PendingChanges, ProjectChangeWatcher, WatcherBackend,
+        handle_event,
+    };
     use crate::{Project, ProjectFile};
     use notify::event::{AccessKind, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode};
     use notify::{Config, Event, EventKind, PollWatcher};
@@ -1664,9 +1773,11 @@ mod pending_changes_properties {
         watcher: &ProjectChangeWatcher,
         events: &[GeneratedEvent],
     ) {
+        let owned_paths = AnalyzerOwnedPaths::new(project.root());
         for event in events {
             handle_event(
                 project,
+                &owned_paths,
                 &watcher.pending,
                 event.to_notify_event(project.root()),
             );

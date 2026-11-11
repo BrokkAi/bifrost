@@ -5,6 +5,7 @@ use crate::analyzer::usages::csharp_graph::csharp_graph_source;
 use brokk_bifrost_analysis::analyzer::usages::common::analyzed_files_for_language;
 
 use brokk_bifrost_core::analyzer::common::language_for_file;
+use brokk_bifrost_core::analyzer::usages::accumulator::UsageAccumulator;
 
 use brokk_bifrost_analysis::analyzer::usages::inverted_edges::EdgeNodeDomain;
 
@@ -15,8 +16,6 @@ use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdgeWeights;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageEdges;
 
 use brokk_bifrost_core::analyzer::usages::model::FuzzyResult;
-
-use brokk_bifrost_core::analyzer::usages::model::UsageHit;
 
 use brokk_bifrost_core::analyzer::usages::outcome::GraphFailureReason;
 
@@ -47,11 +46,9 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_csharp::graph::extractor::{
-    BatchScanState, PreparedCSharpFile, ScanState, prepare_file, scan_prepared_file,
-    scan_prepared_file_batch,
+    BatchScanState, PreparedCSharpFile, prepare_file, scan_prepared_file, scan_prepared_file_batch,
 };
 use brokk_bifrost_csharp::graph::resolver::TargetSpec;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -114,33 +111,6 @@ fn csharp_target_specs(
         .collect()
 }
 
-fn csharp_usage_outcome(
-    target: &CodeUnit,
-    hits: BTreeSet<UsageHit>,
-    unproven_hits: BTreeSet<UsageHit>,
-    limit_exceeded: bool,
-    max_usages: usize,
-    max_unproven: usize,
-) -> GraphUsageOutcome {
-    let external_callsites =
-        brokk_bifrost_core::analyzer::usages::common::external_usage_hit_count(&hits);
-    if limit_exceeded || external_callsites > max_usages {
-        return GraphUsageOutcome::Resolved(FuzzyResult::TooManyCallsites {
-            short_name: target.short_name().to_string(),
-            total_callsites: external_callsites,
-            limit: max_usages,
-            sample_hits: hits,
-        });
-    }
-
-    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven_limit(
-        target.clone(),
-        hits,
-        unproven_hits,
-        max_unproven,
-    ))
-}
-
 impl<'a> CSharpAuthoritativeUsageBatch<'a> {
     pub fn new(
         analyzer: &'a dyn IAnalyzer,
@@ -187,9 +157,7 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
     ) -> Vec<GraphUsageOutcome> {
         struct SpecResult {
             spec: TargetSpec,
-            hits: BTreeSet<UsageHit>,
-            unproven_hits: BTreeSet<UsageHit>,
-            limit_exceeded: bool,
+            usages: UsageAccumulator,
         }
 
         struct QueryPlan<'a> {
@@ -217,9 +185,7 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
                     .into_iter()
                     .map(|spec| SpecResult {
                         spec,
-                        hits: BTreeSet::new(),
-                        unproven_hits: BTreeSet::new(),
-                        limit_exceeded: false,
+                        usages: UsageAccumulator::bounded(request.max_usages),
                     })
                     .collect(),
                 Err(outcome) => {
@@ -236,7 +202,11 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
             }));
         }
 
-        for (file, prepared) in &self.prepared_files {
+        // Path order, for the same reason as the single-query scan: each
+        // spec stops at its cap, so file order decides the capped sample.
+        let mut prepared_files: Vec<_> = self.prepared_files.iter().collect();
+        prepared_files.sort_unstable_by_key(|(file, _)| *file);
+        for (file, prepared) in prepared_files {
             let mut scans = Vec::new();
             for plan in plans.iter_mut().flatten() {
                 if !plan.candidate_files.contains(file) {
@@ -245,10 +215,7 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
                 for result in &mut plan.specs {
                     scans.push(BatchScanState {
                         spec: &result.spec,
-                        max_usages: plan.max_usages,
-                        hits: &mut result.hits,
-                        unproven_hits: &mut result.unproven_hits,
-                        limit_exceeded: &mut result.limit_exceeded,
+                        usages: &mut result.usages,
                     });
                 }
             }
@@ -270,21 +237,12 @@ impl<'a> CSharpAuthoritativeUsageBatch<'a> {
             let Some(plan) = plan else {
                 continue;
             };
-            let mut hits = BTreeSet::new();
-            let mut unproven_hits = BTreeSet::new();
-            let mut limit_exceeded = false;
+            let mut usages = UsageAccumulator::bounded(plan.max_usages);
             for result in plan.specs {
-                hits.extend(result.hits);
-                unproven_hits.extend(result.unproven_hits);
-                limit_exceeded |= result.limit_exceeded;
+                usages.absorb(result.usages);
             }
-            outcomes[index] = Some(csharp_usage_outcome(
-                &plan.target,
-                hits,
-                unproven_hits,
-                limit_exceeded,
-                plan.max_usages,
-                FuzzyResult::MAX_UNPROVEN_HITS_PER_SYMBOL,
+            outcomes[index] = Some(GraphUsageOutcome::Resolved(
+                usages.finish(&plan.target, FuzzyResult::MAX_UNPROVEN_HITS_PER_SYMBOL),
             ));
         }
 
@@ -349,29 +307,30 @@ impl CSharpQueryResolver<'_> {
             Err(outcome) => return *outcome,
         };
 
+        // The scan stops at the `max_usages` cap, so the files it reached
+        // decide the returned sample and total. Walk them in path order: hash
+        // order depends on the workspace root and on how the candidate set was
+        // built, and the same code on the same inputs must return the same
+        // answer.
         let candidate_files = scan_scope.candidate_files();
-        let mut files: HashSet<ProjectFile> = candidate_files
+        let mut files: Vec<ProjectFile> = candidate_files
             .iter()
             .filter(|file| language_for_file(file) == Language::CSharp)
             .cloned()
+            .chain(
+                overloads
+                    .iter()
+                    .map(CodeUnit::source)
+                    .filter(|source| scan_scope.allows(source))
+                    .cloned(),
+            )
             .collect();
-        for overload in overloads {
-            if scan_scope.allows(overload.source()) {
-                files.insert(overload.source().clone());
-            }
-        }
+        files.sort();
+        files.dedup();
 
-        let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut limit_exceeded = false;
-        let mut state = ScanState {
-            max_usages,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            limit_exceeded: &mut limit_exceeded,
-        };
+        let mut usages = UsageAccumulator::bounded(max_usages);
         for file in files {
-            if scan_scope.is_cancelled() || *state.limit_exceeded {
+            if scan_scope.is_cancelled() || usages.limit_reached() {
                 break;
             }
             let local_prepared = prepared_files
@@ -398,22 +357,15 @@ impl CSharpQueryResolver<'_> {
                     &file,
                     prepared,
                     spec,
-                    &mut state,
+                    &mut usages,
                 );
-                if *state.limit_exceeded {
+                if usages.limit_reached() {
                     break;
                 }
             }
         }
 
-        csharp_usage_outcome(
-            target,
-            hits,
-            unproven_hits,
-            limit_exceeded,
-            max_usages,
-            scan_scope.max_unproven(),
-        )
+        GraphUsageOutcome::Resolved(usages.finish(target, scan_scope.max_unproven()))
     }
 }
 

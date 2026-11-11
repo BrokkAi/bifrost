@@ -128,7 +128,7 @@ pub fn probe_imports(
     let mut result = CSharpImportProbe {
         binders: Vec::new(),
         bindings: Vec::new(),
-        references: ready.inventory.connection().prepare(
+        references: ready.inventory.connection().prepare_cached(
             "SELECT DISTINCT site.start_byte FROM resolution_semantic_sites semantic
              JOIN resolution_sites site ON site.blob_id=semantic.blob_id AND site.site=semantic.source_site
              WHERE semantic.blob_id=?1 AND semantic.semantic_role='reference'"

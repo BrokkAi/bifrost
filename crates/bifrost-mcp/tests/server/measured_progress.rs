@@ -226,7 +226,11 @@ fn measured_tasks_preserve_original_request_and_task_identity() {
         read_response_collecting_progress(&mut reader, &mut stderr, 1);
     assert_eq!(created["result"]["resultType"], "task", "{created}");
     let task_id = created["result"]["taskId"].as_str().unwrap();
-    for id in 10..100 {
+    // This test asserts task identity and progress, not latency. A loaded
+    // host can make the cold build outlast any short fixed poll count.
+    let give_up_at = std::time::Instant::now() + Duration::from_secs(60);
+    let mut id = 10;
+    loop {
         write_line(
             &mut stdin,
             json!({"jsonrpc":"2.0","id":id,"method":"tasks/get","params":{
@@ -239,6 +243,11 @@ fn measured_tasks_preserve_original_request_and_task_identity() {
             break;
         }
         assert_eq!(response["result"]["status"], "working", "{response}");
+        assert!(
+            std::time::Instant::now() < give_up_at,
+            "task did not complete within 60s: {response}"
+        );
+        id += 1;
         thread::sleep(Duration::from_millis(50));
     }
     let measured = observations

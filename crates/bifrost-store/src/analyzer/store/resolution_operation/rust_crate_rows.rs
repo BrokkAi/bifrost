@@ -169,6 +169,7 @@ pub(super) struct CrateRowMemo {
 /// Rust row tables separately under its shared graph-stage guard.
 #[doc(hidden)]
 pub struct CrateStageMemos<'a> {
+    owns_read: bool,
     inventory: &'a super::super::resolution_selection::SelectedResolutionMountInventory<'a>,
     rows: &'a RefCell<Option<CrateRowMemo>>,
     access: &'a RefCell<Option<super::rust_crate_access::CrateAccessMemo>>,
@@ -188,8 +189,12 @@ impl<'a> CrateStageMemos<'a> {
         assert!(previous.is_none(), "crate stages do not nest");
         let previous = authority.replace(Some(Default::default()));
         assert!(previous.is_none(), "crate stages do not nest");
-        inventory.begin_stage_read()?;
+        let owns_read = !inventory.stage_read_active();
+        if owns_read {
+            inventory.begin_stage_read()?;
+        }
         Ok(Self {
+            owns_read,
             inventory,
             rows,
             access,
@@ -205,6 +210,9 @@ impl Drop for CrateStageMemos<'_> {
         self.authority.take();
         // The reader returns to its pool with the request, and it must return
         // outside any transaction. A failed COMMIT is reported and rolled back.
+        if !self.owns_read {
+            return;
+        }
         if let Err(error) = self.inventory.end_stage_read() {
             eprintln!("analyzer store could not end a crate stage's read: {error}");
             if let Err(error) = self.inventory.connection().execute_batch("ROLLBACK") {

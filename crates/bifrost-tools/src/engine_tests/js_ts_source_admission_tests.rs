@@ -49,13 +49,14 @@ mod js_ts_extraction_root {
             parse(&CppAdapter, "int binary;\0", Some("0")),
             BoundedParse::Refused(SourceAdmissionRefusal::Binary)
         ));
+        // Since #10694 every language admits numeric array data.
         assert!(matches!(
             parse(
                 &JavascriptAdapter,
-                &format!("const words = [{}];", "1,".repeat(9000)),
+                &format!("const words = [{}];", "123456789,".repeat(2000)),
                 None
             ),
-            BoundedParse::Refused(SourceAdmissionRefusal::StructuralLine { .. })
+            BoundedParse::Complete(_)
         ));
 
         let signed = format!(

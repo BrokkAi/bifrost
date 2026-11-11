@@ -1,10 +1,12 @@
-//! Stable policy evaluation and schema-version-6 match-evidence report types.
+//! Stable policy evaluation and schema-version-7 match-evidence report types.
 //!
 //! This module deliberately contains no query-to-finding conversion.  The
 //! evaluator must combine a loaded policy, detailed analyzer evidence, and a
 //! budget before constructing these diagnostic/report values.
 
 use brokk_bifrost_analysis::analyzer::usages::python_class_hierarchy::PythonAncestryBasis;
+use brokk_bifrost_flow::model_attribution::BoundedContributors;
+use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
 
@@ -13,7 +15,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_rql::query::{CapabilityEvaluation, QueryInputDomain, UnsupportedReason};
-use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
+use brokk_bifrost_rql::structural::search::UnitRowReferenceFacets;
+use brokk_bifrost_rql::structural::{CodeQueryCompletion, CodeQueryDiagnosticCode};
 
 use super::baseline::PolicyFindingBaseline;
 use super::budget::PolicyBudget;
@@ -755,8 +758,10 @@ pub enum PolicyIncompleteReason {
     NoAnalyzableFiles,
     PartialDiscovery,
     CapabilityIncomplete,
+    DepthBoundReached,
     EndpointDominanceUndecidable,
     StableAnchorUnavailable,
+    WithoutFlowUnknown,
     ReportRetentionBudget,
     CvssVariantBudget,
     ProjectionScenarioMembershipBudget,
@@ -785,8 +790,10 @@ impl PolicyIncompleteReason {
             Self::NoAnalyzableFiles => "no_analyzable_files",
             Self::PartialDiscovery => "partial_discovery",
             Self::CapabilityIncomplete => "capability_incomplete",
+            Self::DepthBoundReached => "depth_bound_reached",
             Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable",
             Self::StableAnchorUnavailable => "stable_anchor_unavailable",
+            Self::WithoutFlowUnknown => "without_flow_unknown",
             Self::ReportRetentionBudget => "report_retention_budget",
             Self::CvssVariantBudget => "cvss_variant_budget",
             Self::ProjectionScenarioMembershipBudget => "projection_scenario_membership_budget",
@@ -992,7 +999,7 @@ impl PolicySourceLocation {
 
 impl RetainedSize for PolicySourceLocation {
     fn retained_size(&self) -> usize {
-        retained_size_with_extras(self, [self.path.capacity()])
+        retained_size_with_extras(self, [self.path.len()])
     }
 }
 
@@ -1776,6 +1783,15 @@ pub enum PolicyQueryResultRef {
         target_fq_name: String,
         target_identity: Option<StableSemanticIdentity>,
         usage_kind: Option<String>,
+        reference_facets: UnitRowReferenceFacets,
+        proof: PolicyQueryProof,
+    },
+    ReferenceEdge {
+        location: PolicySourceLocation,
+        id: String,
+        ast_id: Option<String>,
+        target_fq_name: String,
+        reference_facets: UnitRowReferenceFacets,
         proof: PolicyQueryProof,
     },
     CallSite {
@@ -2213,6 +2229,7 @@ impl PolicyQueryResultRef {
             Self::Declaration { .. } => Some(MatchResultDomain::Declaration),
             Self::File { .. } => Some(MatchResultDomain::File),
             Self::ReferenceSite { .. } => Some(MatchResultDomain::ReferenceSite),
+            Self::ReferenceEdge { .. } => Some(MatchResultDomain::ReferenceEdge),
             Self::CallSite { .. } => Some(MatchResultDomain::CallSite),
             Self::ExpressionSite { .. } => Some(MatchResultDomain::ExpressionSite),
             Self::JsxAttributeValue { .. } => Some(MatchResultDomain::JsxAttributeValue),
@@ -2237,6 +2254,7 @@ impl PolicyQueryResultRef {
             | Self::Occurrence { location, .. }
             | Self::Declaration { location, .. }
             | Self::ReferenceSite { location, .. }
+            | Self::ReferenceEdge { location, .. }
             | Self::CallSite { location, .. }
             | Self::ExpressionSite { location, .. }
             | Self::JsxAttributeValue { location, .. }
@@ -2433,16 +2451,46 @@ impl PolicyQueryResultRef {
                 }
             }
             Self::File { .. } => {}
+            Self::ReferenceEdge {
+                location,
+                id,
+                ast_id,
+                target_fq_name,
+                reference_facets,
+                ..
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(id)?;
+                if let Some(ast_id) = ast_id {
+                    validate_report_identifier(ast_id)?;
+                }
+                validate_report_prose(target_fq_name)?;
+                for label in reference_facets
+                    .known
+                    .iter()
+                    .chain(&reference_facets.undecided)
+                {
+                    validate_report_identifier(label)?;
+                }
+            }
             Self::ReferenceSite {
                 location,
                 target_fq_name,
                 usage_kind,
+                reference_facets,
                 ..
             } => {
                 require_span_bearing(location)?;
                 validate_report_prose(target_fq_name)?;
                 if let Some(usage_kind) = usage_kind {
                     validate_report_identifier(usage_kind)?;
+                }
+                for label in reference_facets
+                    .known
+                    .iter()
+                    .chain(&reference_facets.undecided)
+                {
+                    validate_report_identifier(label)?;
                 }
             }
             Self::CallSite {
@@ -2679,6 +2727,18 @@ impl PolicyQueryResultRef {
                 tighten_string(fq_name);
             }
             Self::File { .. } => {}
+            Self::ReferenceEdge {
+                id,
+                ast_id,
+                target_fq_name,
+                ..
+            } => {
+                tighten_string(id);
+                if let Some(ast_id) = ast_id {
+                    tighten_string(ast_id);
+                }
+                tighten_string(target_fq_name);
+            }
             Self::ReferenceSite {
                 target_fq_name,
                 usage_kind,
@@ -2921,16 +2981,32 @@ impl RetainedSize for PolicyQueryResultRef {
                 .saturating_add(retained_extra(location))
                 .saturating_add(retained_extra(identity)),
             Self::File { path } => retained_extra(path),
+            Self::ReferenceEdge {
+                location,
+                id,
+                ast_id,
+                target_fq_name,
+                reference_facets,
+                ..
+            } => retained_extra(location)
+                .saturating_add(id.capacity())
+                .saturating_add(retained_extra(ast_id))
+                .saturating_add(target_fq_name.capacity())
+                .saturating_add(retained_extra(&reference_facets.known))
+                .saturating_add(retained_extra(&reference_facets.undecided)),
             Self::ReferenceSite {
                 location,
                 target_fq_name,
                 target_identity,
                 usage_kind,
+                reference_facets,
                 ..
             } => retained_extra(location)
                 .saturating_add(target_fq_name.capacity())
                 .saturating_add(retained_extra(target_identity))
-                .saturating_add(retained_extra(usage_kind)),
+                .saturating_add(retained_extra(usage_kind))
+                .saturating_add(retained_extra(&reference_facets.known))
+                .saturating_add(retained_extra(&reference_facets.undecided)),
             Self::CallSite {
                 location,
                 caller_fq_name,
@@ -3534,6 +3610,19 @@ impl WitnessStep {
             read_instance.validate()?;
             read_key.validate()?;
         }
+        if let Some(WitnessStepProvenance::ProcedureSummary { fingerprint }) =
+            self.provenance.as_deref()
+        {
+            validate_report_identifier(fingerprint)?;
+        }
+        if let Some(provenance @ WitnessStepProvenance::AdmittedPatternProjection { binder, .. }) =
+            self.provenance.as_deref()
+            && (self.kind != WitnessStepKind::Source
+                || self.location.as_ref() != Some(binder)
+                || !admitted_pattern_provenance_is_valid(provenance))
+        {
+            return Err(ReportValueError::InvalidPatternProvenance);
+        }
         Ok(())
     }
 
@@ -3551,6 +3640,10 @@ impl WitnessStep {
 
     pub fn evidence_refs(&self) -> &[EvidenceRef] {
         &self.evidence_refs
+    }
+
+    pub fn provenance(&self) -> Option<&WitnessStepProvenance> {
+        self.provenance.as_deref()
     }
 }
 
@@ -3570,7 +3663,30 @@ impl RetainedSize for WitnessStep {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Keep the existing DeclaredStore public fields and serialized shape intact.
+#[allow(clippy::large_enum_variant)]
 pub enum WitnessStepProvenance {
+    /// Exact selected procedure-summary key for a modeled transfer.
+    ProcedureSummary { fingerprint: String },
+    /// Selected external tuple field and the reads that admitted its binder.
+    AdmittedPatternProjection {
+        pack_digest: String,
+        record_id: String,
+        constructor: String,
+        import_chain: Vec<String>,
+        /// A written alias or a long route was shortened to fit the report's
+        /// bounded-evidence limits. It says only that something was shortened.
+        import_chain_truncated: bool,
+        /// Whether the chain shows every hop the resolver followed. A name
+        /// reached through a re-export in another module, a namespace alias or
+        /// a glob is not fully shown, whether or not anything was shortened.
+        import_route_complete: bool,
+        position: u32,
+        layout_arity: u32,
+        field_id: String,
+        binder: PolicySourceLocation,
+        receipt_digest: [u8; 32],
+    },
     DeclaredStore {
         write_model: ResolvedEndpointIdentity,
         read_model: ResolvedEndpointIdentity,
@@ -3607,9 +3723,77 @@ impl StoreDimensionEvidence {
     }
 }
 
+/// Whether an admitted-pattern provenance satisfies the report's evidence
+/// bounds. The record and field IDs take the pack format's stable-ID limit; the
+/// constructor and the declaration entry that ends the route are qualified
+/// names, which the pack bounds as text, so they take that larger limit and
+/// every name a pack accepts is reportable. The written route entries before the
+/// declaration take the report's shorter identifier limit, which
+/// `bound_import_chain` enforces. Anything else is not provenance this report
+/// can carry.
+pub(crate) fn admitted_pattern_provenance_is_valid(provenance: &WitnessStepProvenance) -> bool {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        DEFAULT_MAX_TEXT_BYTES, MAX_STABLE_ID_BYTES,
+    };
+    let WitnessStepProvenance::AdmittedPatternProjection {
+        pack_digest,
+        record_id,
+        constructor,
+        import_chain,
+        position,
+        layout_arity,
+        field_id,
+        binder,
+        receipt_digest,
+        ..
+    } = provenance
+    else {
+        return false;
+    };
+    let id_ok = [record_id, field_id]
+        .into_iter()
+        .all(|value| !value.is_empty() && value.len() <= MAX_STABLE_ID_BYTES);
+    let name_ok = !constructor.is_empty() && constructor.len() <= DEFAULT_MAX_TEXT_BYTES;
+    let declaration_ok = id_ok && name_ok;
+    let route_ok = import_chain.iter().enumerate().all(|(index, value)| {
+        let limit = if index + 1 == import_chain.len() {
+            DEFAULT_MAX_TEXT_BYTES
+        } else {
+            MAX_REPORT_IDENTIFIER_BYTES
+        };
+        !value.is_empty() && value.len() <= limit
+    });
+    binder.byte_span().is_some()
+        && *layout_arity != 0
+        && *position < *layout_arity
+        && (2..=8).contains(&import_chain.len())
+        && import_chain.last() == Some(constructor)
+        && pack_digest.len() == 64
+        && pack_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && *receipt_digest != [0; 32]
+        && declaration_ok
+        && route_ok
+}
+
 impl RetainedSize for WitnessStepProvenance {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
+            Self::ProcedureSummary { fingerprint } => fingerprint.capacity(),
+            Self::AdmittedPatternProjection {
+                pack_digest,
+                record_id,
+                constructor,
+                import_chain,
+                field_id,
+                binder,
+                ..
+            } => pack_digest
+                .capacity()
+                .saturating_add(record_id.capacity())
+                .saturating_add(constructor.capacity())
+                .saturating_add(retained_extra(import_chain))
+                .saturating_add(field_id.capacity())
+                .saturating_add(retained_extra(binder)),
             Self::DeclaredStore {
                 write_model,
                 read_model,
@@ -3988,6 +4172,32 @@ pub struct PolicyWorkReport {
     metrics: Vec<PolicyWorkMetric>,
 }
 
+/// Observations from the preliminary source inventory that composition discarded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DiscardedSourceInventory {
+    pub locator_restored_count: usize,
+    pub lost_attributed_count: usize,
+    pub lost_unattributed_count: usize,
+    pub locator_restored: Vec<DiscardedSelectorGap>,
+    pub lost_attributed: Vec<DiscardedSelectorGap>,
+    pub lost_unattributed: Vec<DiscardedSelectorGap>,
+    pub row_refusals_by_kind: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscardedSelectorGap {
+    pub selector: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_completion: Option<CodeQueryCompletion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_locator_refusal_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributed_file: Option<String>,
+    pub frontier_entered_file: bool,
+    pub file_slice_reported_again: bool,
+}
+
 impl PolicyWorkReport {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
@@ -4220,7 +4430,235 @@ impl PolicyFindingDiff {
 
 impl RetainedSize for PolicyFindingDiff {}
 
-/// One normalized finding in the canonical schema-version-6 report model.
+/// The causal role of a selected approximate Rust model record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAttributionRole {
+    Source,
+    Sink,
+    Summary,
+    Declaration,
+    Store,
+    ReadDependency,
+}
+
+/// One approximation-bearing record considered in a finding derivation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAttributionContributor {
+    pub role: ModelAttributionRole,
+    pub pack_digest: String,
+    pub record_id: String,
+    pub built_from: String,
+    pub resolved: String,
+    pub direction: String,
+    pub mismatch_kinds: Vec<String>,
+    pub selection_rule_id: String,
+    pub selection_rule_version: u32,
+}
+
+pub(crate) const MAX_MODEL_ATTRIBUTION_CONTRIBUTORS: usize = 16;
+
+/// The claim-derived part of one approximate contributor: the artifact
+/// direction, mismatch kinds and selection rule for one resolved version.
+/// Both the causal receipt path and the family backstop build contributors
+/// from this, so their labels cannot drift.
+pub(crate) struct ArtifactSelectionReason {
+    pub(crate) built_from: String,
+    pub(crate) resolved: String,
+    pub(crate) direction: String,
+    pub(crate) mismatch_kinds: Vec<String>,
+    pub(crate) selection_rule_id: String,
+    pub(crate) selection_rule_version: u32,
+}
+
+impl ArtifactSelectionReason {
+    /// Why `claim` activated for `resolved`, or the reason it does not.
+    pub(crate) fn new(
+        claim: &brokk_bifrost_analysis::analyzer::semantic_model::RustArtifactApproximation,
+        resolved: &semver::Version,
+    ) -> Result<Self, String> {
+        use brokk_bifrost_analysis::analyzer::semantic_model::RustArtifactMismatchKind;
+        let built =
+            semver::Version::parse(&claim.built_from_version).map_err(|error| error.to_string())?;
+        claim.activation_reason(resolved)?;
+        let direction = match built.cmp(resolved) {
+            std::cmp::Ordering::Less => "older_artifact",
+            std::cmp::Ordering::Greater => "newer_artifact",
+            std::cmp::Ordering::Equal => "same_version",
+        };
+        let mut mismatch_kinds = claim
+            .mismatch_kinds
+            .iter()
+            .map(|kind| match kind {
+                RustArtifactMismatchKind::VersionNearby => "version_nearby",
+                RustArtifactMismatchKind::FeatureSuperset => "feature_superset",
+                RustArtifactMismatchKind::FormatConverted => "format_converted",
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if built != *resolved {
+            mismatch_kinds.push("version_nearby".to_owned());
+        }
+        mismatch_kinds.sort();
+        mismatch_kinds.dedup();
+        Ok(Self {
+            built_from: claim.built_from_version.clone(),
+            resolved: resolved.to_string(),
+            direction: direction.to_owned(),
+            mismatch_kinds,
+            selection_rule_id: claim.selection_rule_id.clone(),
+            selection_rule_version: claim.selection_rule_version,
+        })
+    }
+}
+
+/// Bounded detail about an approximation whose marker cannot be dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAttribution {
+    pub approximate: bool,
+    pub contributors: Vec<ModelAttributionContributor>,
+    pub contributors_complete: bool,
+    pub omitted_at_least: u32,
+}
+
+impl ModelAttribution {
+    pub fn from_full(contributors: Vec<ModelAttributionContributor>, cap: usize) -> Self {
+        Self::from_bounded(BoundedContributors::from_full(contributors, cap))
+    }
+
+    pub fn from_bounded(bounded: BoundedContributors<ModelAttributionContributor>) -> Self {
+        let contributors_complete = bounded.contributors_complete();
+        let omitted_at_least = bounded.omitted_at_least().try_into().unwrap_or(u32::MAX);
+        Self {
+            approximate: bounded.approximate_contributed,
+            contributors: bounded.contributors,
+            contributors_complete,
+            omitted_at_least,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.approximate || self.contributors.is_empty() && self.omitted_at_least == 0 {
+            return Err("approximate attribution needs a marker and contributor evidence");
+        }
+        if self.contributors_complete == (self.omitted_at_least > 0) {
+            return Err("model-attribution completeness disagrees with omitted lower bound");
+        }
+        if self.contributors.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("approximate contributors must be sorted and distinct");
+        }
+        for pair in self.contributors.windows(2) {
+            if pair[0].role == pair[1].role
+                && pair[0].pack_digest == pair[1].pack_digest
+                && pair[0].record_id == pair[1].record_id
+                && pair[0].built_from == pair[1].built_from
+                && pair[0].resolved == pair[1].resolved
+                && pair[0].direction == pair[1].direction
+            {
+                return Err("one approximate contributor key has conflicting selection reasons");
+            }
+        }
+        for contributor in &self.contributors {
+            if contributor.pack_digest.is_empty() || contributor.record_id.is_empty() {
+                return Err("approximate contributor needs pack and record identity");
+            }
+            let built = semver::Version::parse(&contributor.built_from)
+                .map_err(|_| "invalid built-from version in model attribution")?;
+            let resolved = semver::Version::parse(&contributor.resolved)
+                .map_err(|_| "invalid resolved version in model attribution")?;
+            let expected = match built.cmp(&resolved) {
+                std::cmp::Ordering::Less => "older_artifact",
+                std::cmp::Ordering::Greater => "newer_artifact",
+                std::cmp::Ordering::Equal => "same_version",
+            };
+            if contributor.direction != expected {
+                return Err("model-attribution direction disagrees with artifact versions");
+            }
+            if contributor.selection_rule_id != "cargo-compatible-nearest"
+                || contributor.selection_rule_version != 1
+            {
+                return Err("unsupported model-attribution selection rule");
+            }
+            if built != resolved && contributor.mismatch_kinds.is_empty() {
+                return Err("model-attribution mismatch kinds cannot be empty");
+            }
+            if contributor
+                .mismatch_kinds
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            {
+                return Err("model-attribution mismatch kinds must be sorted and distinct");
+            }
+            if contributor.mismatch_kinds.iter().any(|kind| {
+                !matches!(
+                    kind.as_str(),
+                    "version_nearby" | "feature_superset" | "format_converted"
+                )
+            }) {
+                return Err("unknown model-attribution mismatch kind");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn merge(&self, other: &Self, cap: usize) -> Self {
+        Self::from_bounded(self.as_bounded().merge(&other.as_bounded(), cap))
+    }
+
+    /// The same marker with every contributor shed into `omitted_at_least`.
+    pub(crate) fn without_detail(&self) -> Self {
+        // Build the empty list directly: truncating a merged list would keep
+        // its allocation, which retained-size accounting counts.
+        let total = self.contributors.len() as u64 + u64::from(self.omitted_at_least);
+        Self {
+            approximate: self.approximate,
+            contributors: Vec::new(),
+            contributors_complete: false,
+            omitted_at_least: u32::try_from(total).unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn as_bounded(&self) -> BoundedContributors<ModelAttributionContributor> {
+        BoundedContributors {
+            approximate_contributed: self.approximate,
+            contributors: self.contributors.clone(),
+            total_lower_bound: self
+                .contributors
+                .len()
+                .saturating_add(self.omitted_at_least as usize),
+            truncated: !self.contributors_complete,
+        }
+    }
+}
+
+impl RetainedSize for ModelAttributionContributor {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.pack_digest.capacity())
+            .saturating_add(self.record_id.capacity())
+            .saturating_add(self.built_from.capacity())
+            .saturating_add(self.resolved.capacity())
+            .saturating_add(self.direction.capacity())
+            .saturating_add(self.mismatch_kinds.capacity() * size_of::<String>())
+            .saturating_add(
+                self.mismatch_kinds
+                    .iter()
+                    .map(String::capacity)
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.selection_rule_id.capacity())
+    }
+}
+
+impl RetainedSize for ModelAttribution {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(retained_extra(&self.contributors))
+    }
+}
+
+/// One normalized finding in the canonical schema-version-7 report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
     #[serde(skip_serializing_if = "crate::ValueTypeBarrierNotes::is_empty")]
@@ -4240,6 +4678,8 @@ pub struct PolicyFinding {
     related_truncated: bool,
     omitted_related_locations_lower_bound: u64,
     evidence: PolicyFindingEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_attribution: Option<ModelAttribution>,
     evidence_refs_truncated: bool,
     omitted_evidence_refs_lower_bound: u64,
     cvss: Option<CvssAssessmentSet>,
@@ -4251,6 +4691,8 @@ pub struct PolicyFinding {
     #[serde(skip_serializing_if = "super::display_path::TaintDisplayPathCache::is_empty")]
     display_path: super::display_path::TaintDisplayPathCache,
     suppression: Option<PolicyFindingSuppression>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_suppression: Option<super::inline_suppression::PolicyFindingInlineSuppression>,
     scope: Option<PolicyFindingScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<PolicyFindingDiff>,
@@ -4404,6 +4846,7 @@ impl PolicyFinding {
             related_truncated,
             omitted_related_locations_lower_bound,
             evidence,
+            model_attribution: None,
             evidence_refs_truncated,
             omitted_evidence_refs_lower_bound,
             cvss,
@@ -4414,6 +4857,7 @@ impl PolicyFinding {
             omitted_witnesses_lower_bound,
             display_path: super::display_path::TaintDisplayPathCache::default(),
             suppression: None,
+            inline_suppression: None,
             scope: None,
             diff: None,
             baseline: None,
@@ -4435,6 +4879,43 @@ impl PolicyFinding {
         self.value_type_barrier_notes = notes;
         self.validate_against_budget(budget)?;
         Ok(self)
+    }
+
+    pub(crate) fn with_model_attribution(
+        mut self,
+        attribution: Option<ModelAttribution>,
+        budget: &PolicyBudget,
+    ) -> Result<Self, PolicyFindingError> {
+        if let Some(value) = &attribution {
+            value
+                .validate()
+                .map_err(PolicyFindingError::InvalidModelAttribution)?;
+        }
+        self.model_attribution = attribution;
+        self.validate_against_budget(budget)?;
+        Ok(self)
+    }
+
+    /// Attach attribution, shedding contributor detail before failing. The
+    /// approximate marker is never dropped for want of room.
+    pub(crate) fn with_model_attribution_shedding_detail(
+        self,
+        attribution: Option<ModelAttribution>,
+        budget: &PolicyBudget,
+    ) -> Result<Self, PolicyFindingError> {
+        match self
+            .clone()
+            .with_model_attribution(attribution.clone(), budget)
+        {
+            Err(error) if error.is_budget_limit_exceeded() && attribution.is_some() => {
+                self.with_model_attribution(attribution.map(|value| value.without_detail()), budget)
+            }
+            result => result,
+        }
+    }
+
+    pub const fn model_attribution(&self) -> Option<&ModelAttribution> {
+        self.model_attribution.as_ref()
     }
 
     pub const fn id(&self) -> PolicyFindingId {
@@ -4535,6 +5016,37 @@ impl PolicyFinding {
 
     pub(crate) fn clear_suppression(&mut self) {
         self.suppression = None;
+    }
+
+    /// The inline comment directive that accepted this finding, if any.
+    pub const fn inline_suppression(
+        &self,
+    ) -> Option<&super::inline_suppression::PolicyFindingInlineSuppression> {
+        self.inline_suppression.as_ref()
+    }
+
+    pub(crate) fn attach_inline_suppression(
+        &mut self,
+        inline_suppression: super::inline_suppression::PolicyFindingInlineSuppression,
+    ) {
+        assert!(
+            !self.is_explicitly_accepted(),
+            "an inline directive must not claim an accepted finding"
+        );
+        self.inline_suppression = Some(inline_suppression);
+    }
+
+    /// Whether a suppression record, an inline directive or a scope entry
+    /// accepted this finding. The baseline claims only findings none of these
+    /// claimed.
+    pub fn is_explicitly_accepted(&self) -> bool {
+        self.suppression.is_some() || self.inline_suppression.is_some() || self.scope.is_some()
+    }
+
+    /// Whether any acceptance decision, the baseline included, claims this
+    /// finding, so it no longer counts as active.
+    pub fn is_accepted(&self) -> bool {
+        self.is_explicitly_accepted() || self.baseline.is_some()
     }
 
     pub const fn scope(&self) -> Option<&PolicyFindingScope> {
@@ -4699,6 +5211,11 @@ impl PolicyFinding {
         let evidence_bytes = self
             .evidence
             .retained_size()
+            .saturating_add(
+                self.model_attribution
+                    .as_ref()
+                    .map_or(0, RetainedSize::retained_size),
+            )
             .saturating_add(self.classification.retained_size())
             .saturating_add(self.proof.retained_size())
             .saturating_add(self.cvss.as_ref().map_or(0, RetainedSize::retained_size))
@@ -4727,6 +5244,7 @@ impl RetainedSize for PolicyFinding {
         // not let it change canonical report-retention decisions.
         size_of::<Self>()
             .saturating_sub(size_of::<super::display_path::TaintDisplayPathCache>())
+            .saturating_sub(size_of::<Option<ModelAttribution>>())
             .saturating_add(retained_extra(&self.value_type_barrier_notes))
             .saturating_add(retained_extra(&self.policy_id))
             .saturating_add(self.message.capacity())
@@ -4736,11 +5254,17 @@ impl RetainedSize for PolicyFinding {
             .saturating_add(retained_extra(&self.primary))
             .saturating_add(retained_extra(&self.related))
             .saturating_add(retained_extra(&self.evidence))
+            .saturating_add(
+                self.model_attribution
+                    .as_ref()
+                    .map_or(0, RetainedSize::retained_size),
+            )
             .saturating_add(retained_extra(&self.cvss))
             .saturating_add(retained_extra(&self.organizational_risk))
             .saturating_add(retained_extra(&self.proof))
             .saturating_add(retained_extra(&self.witnesses))
             .saturating_add(retained_extra(&self.suppression))
+            .saturating_add(retained_extra(&self.inline_suppression))
             .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.diff))
             .saturating_add(retained_extra(&self.baseline))
@@ -4751,6 +5275,7 @@ impl RetainedSize for PolicyFinding {
 pub enum PolicyFindingError {
     Value(ReportValueError),
     EmptyMessage,
+    InvalidModelAttribution(&'static str),
     PrimaryEvidencePathMismatch,
     PrimaryLocationDomainMismatch,
     PrimaryTerminalLocationMismatch,
@@ -4789,6 +5314,7 @@ impl fmt::Display for PolicyFindingError {
         match self {
             Self::Value(error) => error.fmt(formatter),
             Self::EmptyMessage => formatter.write_str("finding message must not be empty"),
+            Self::InvalidModelAttribution(reason) => formatter.write_str(reason),
             Self::PrimaryEvidencePathMismatch => {
                 formatter.write_str("finding primary location does not match its semantic anchor")
             }
@@ -5098,6 +5624,293 @@ impl RetainedSize for PolicyRunScope {
     }
 }
 
+/// How a subject selector established its candidate universe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectEnumeration {
+    /// The structural candidate universe is proven complete and every
+    /// candidate classified: with no omissions, a site with no entry was
+    /// ruled out as a subject. Rejected candidates have no report entry.
+    Certified,
+    /// No completeness proof: the selection may be a proven subset of an
+    /// incomplete query, so a site with no entry proves nothing.
+    Uncertified,
+}
+
+impl SubjectEnumeration {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::Uncertified => "uncertified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubjectSelectorEnumeration {
+    pub selector: String,
+    pub enumeration: SubjectEnumeration,
+}
+
+/// Conservative spatial bound for findings that have not been ruled out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingLocationBound {
+    Unbounded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FurtherFindingsAbsent {
+    Complete,
+    Partial { reasons: Vec<String> },
+}
+
+impl FurtherFindingsAbsent {
+    pub fn partial(mut reasons: Vec<String>) -> Self {
+        reasons.sort();
+        reasons.dedup();
+        assert!(!reasons.is_empty() && reasons.iter().all(|reason| !reason.is_empty()));
+        Self::Partial { reasons }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SubjectVerdict {
+    Selected {
+        bindings: u32,
+        findings: Vec<PolicyFindingId>,
+        further_findings_absent: FurtherFindingsAbsent,
+        finding_location_bound: Option<FindingLocationBound>,
+    },
+    Undecided {
+        reasons: Vec<String>,
+        finding_location_bound: FindingLocationBound,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicySubjectVerdict {
+    pub selector: String,
+    pub location: PolicySourceLocation,
+    pub verdict: SubjectVerdict,
+}
+
+impl PolicySubjectVerdict {
+    fn sort_key(&self) -> (bool, &str, Option<PolicyByteSpan>, &str) {
+        (
+            matches!(self.verdict, SubjectVerdict::Selected { .. }),
+            self.location.path(),
+            self.location.byte_span(),
+            &self.selector,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SubjectVerdictOmissions {
+    pub selected: u64,
+    pub undecided: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicySubjectVerdicts {
+    pub selectors: Vec<SubjectSelectorEnumeration>,
+    pub entries: Vec<PolicySubjectVerdict>,
+    pub omitted: SubjectVerdictOmissions,
+}
+
+impl PolicySubjectVerdicts {
+    fn has_uncertainty(&self) -> bool {
+        self.omitted.selected > 0
+            || self.omitted.undecided > 0
+            || self.entries.iter().any(|entry| {
+                matches!(
+                    entry.verdict,
+                    SubjectVerdict::Undecided { .. }
+                        | SubjectVerdict::Selected {
+                            further_findings_absent: FurtherFindingsAbsent::Partial { .. },
+                            ..
+                        }
+                )
+            })
+    }
+
+    pub fn new(
+        selectors: Vec<SubjectSelectorEnumeration>,
+        mut entries: Vec<PolicySubjectVerdict>,
+    ) -> Self {
+        entries.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+        let mut omitted = SubjectVerdictOmissions::default();
+        for entry in entries.drain(entries.len().min(crate::budget::MAX_SUBJECT_VERDICTS)..) {
+            match entry.verdict {
+                SubjectVerdict::Selected { .. } => omitted.selected += 1,
+                SubjectVerdict::Undecided { .. } => omitted.undecided += 1,
+            }
+        }
+        tighten_vec(&mut entries);
+        Self {
+            selectors,
+            entries,
+            omitted,
+        }
+    }
+
+    fn validate(&self, findings: &[PolicyFinding]) -> Result<(), PolicyRunError> {
+        let invalid = || PolicyRunError::InvalidSubjectVerdicts;
+        let selectors = self
+            .selectors
+            .iter()
+            .map(|selector| selector.selector.as_str())
+            .collect::<HashSet<_>>();
+        if selectors.len() != self.selectors.len()
+            || selectors.contains("")
+            || self.entries.len() > crate::budget::MAX_SUBJECT_VERDICTS
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].sort_key() >= pair[1].sort_key())
+        {
+            return Err(invalid());
+        }
+        let ids = findings
+            .iter()
+            .map(PolicyFinding::id)
+            .collect::<HashSet<_>>();
+        let mut referenced = HashSet::new();
+        let mut sites = HashSet::new();
+        for entry in &self.entries {
+            if !selectors.contains(entry.selector.as_str())
+                || entry.location.byte_span().is_none()
+                || !sites.insert((
+                    &entry.selector,
+                    entry.location.path(),
+                    entry.location.byte_span(),
+                ))
+            {
+                return Err(invalid());
+            }
+            match &entry.verdict {
+                SubjectVerdict::Selected {
+                    bindings,
+                    findings,
+                    further_findings_absent,
+                    finding_location_bound,
+                } => {
+                    if *bindings == 0
+                        || matches!(
+                            further_findings_absent,
+                            FurtherFindingsAbsent::Partial { .. }
+                        ) != finding_location_bound.is_some()
+                    {
+                        return Err(invalid());
+                    }
+                    if let FurtherFindingsAbsent::Partial { reasons } = further_findings_absent
+                        && (reasons.is_empty()
+                            || reasons.iter().any(String::is_empty)
+                            || reasons.windows(2).any(|pair| pair[0] >= pair[1]))
+                    {
+                        return Err(invalid());
+                    }
+                    for id in findings {
+                        if !ids.contains(id) || !referenced.insert((&entry.selector, *id)) {
+                            return Err(invalid());
+                        }
+                    }
+                }
+                SubjectVerdict::Undecided { reasons, .. } => {
+                    if reasons.is_empty()
+                        || reasons.iter().any(String::is_empty)
+                        || reasons.windows(2).any(|pair| pair[0] >= pair[1])
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop every referenced finding the run did not retain.
+    pub(crate) fn retain_findings(&mut self, retained: &HashSet<PolicyFindingId>) {
+        let dropped = self
+            .entries
+            .iter()
+            .flat_map(|entry| match &entry.verdict {
+                SubjectVerdict::Selected { findings, .. } => findings.as_slice(),
+                SubjectVerdict::Undecided { .. } => &[],
+            })
+            .filter(|id| !retained.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in dropped {
+            self.drop_finding(id);
+        }
+    }
+
+    pub(crate) fn drop_finding(&mut self, id: PolicyFindingId) {
+        for entry in &mut self.entries {
+            if let SubjectVerdict::Selected {
+                findings,
+                further_findings_absent,
+                finding_location_bound,
+                ..
+            } = &mut entry.verdict
+                && findings.contains(&id)
+            {
+                findings.retain(|finding| *finding != id);
+                let mut reasons = match further_findings_absent {
+                    FurtherFindingsAbsent::Complete => Vec::new(),
+                    FurtherFindingsAbsent::Partial { reasons } => std::mem::take(reasons),
+                };
+                reasons.push("findings_truncated".to_string());
+                *further_findings_absent = FurtherFindingsAbsent::partial(reasons);
+                *finding_location_bound = Some(FindingLocationBound::Unbounded);
+            }
+        }
+    }
+}
+
+impl RetainedSize for SubjectSelectorEnumeration {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(retained_extra(&self.selector))
+    }
+}
+
+impl RetainedSize for PolicyFindingId {}
+
+impl RetainedSize for PolicySubjectVerdict {
+    fn retained_size(&self) -> usize {
+        let extra = match &self.verdict {
+            SubjectVerdict::Selected {
+                findings,
+                further_findings_absent,
+                ..
+            } => {
+                let reasons = match further_findings_absent {
+                    FurtherFindingsAbsent::Complete => 0,
+                    FurtherFindingsAbsent::Partial { reasons } => retained_extra(reasons),
+                };
+                retained_extra(findings).saturating_add(reasons)
+            }
+            SubjectVerdict::Undecided { reasons, .. } => retained_extra(reasons),
+        };
+        size_of::<Self>()
+            .saturating_add(retained_extra(&self.selector))
+            .saturating_add(retained_extra(&self.location))
+            .saturating_add(extra)
+    }
+}
+
+impl RetainedSize for PolicySubjectVerdicts {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(retained_extra(&self.selectors))
+            .saturating_add(retained_extra(&self.entries))
+    }
+}
+
 /// One policy's complete, incomplete, unsupported, or failed evaluation run.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyRun {
@@ -5106,6 +5919,8 @@ pub struct PolicyRun {
     analysis_type: PolicyAnalysisType,
     completion: PolicyRunCompletion,
     findings: Vec<PolicyFinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subjects: Option<PolicySubjectVerdicts>,
     diagnostics: Vec<PolicyDiagnostic>,
     diagnostics_truncated: bool,
     /// The negative-proof obligations this run could not meet, in the
@@ -5173,7 +5988,104 @@ fn validate_finding_for_run(
 }
 
 impl PolicyRun {
-    /// Record the engine that answered this taint run.
+    /// Attach the request-time subject projection after validating its finding joins.
+    pub fn with_subjects(
+        mut self,
+        subjects: PolicySubjectVerdicts,
+        budget: &PolicyBudget,
+    ) -> Result<Self, PolicyRunError> {
+        subjects.validate(&self.findings)?;
+        if subjects.has_uncertainty() {
+            self.completion
+                .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
+        }
+        self.subjects = Some(subjects);
+        self.fit_subjects_to_budget(budget)?;
+        Ok(self)
+    }
+
+    /// Omit subject entries from the end until the run fits its retained-byte
+    /// budget; every omission is counted and makes the run partial.
+    fn fit_subjects_to_budget(&mut self, budget: &PolicyBudget) -> Result<(), PolicyRunError> {
+        self.refresh_retained_bytes();
+        while self.retained_size() > budget.max_retained_report_bytes() {
+            self.completion
+                .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
+            let subjects = self
+                .subjects
+                .as_mut()
+                .expect("subject projection was attached");
+            let Some(entry) = subjects.entries.pop() else {
+                return Err(PolicyRunError::RetainedReportBytesExceeded {
+                    max: budget.max_retained_report_bytes(),
+                });
+            };
+            match entry.verdict {
+                SubjectVerdict::Selected { .. } => subjects.omitted.selected += 1,
+                SubjectVerdict::Undecided { .. } => subjects.omitted.undecided += 1,
+            }
+            tighten_vec(&mut subjects.entries);
+        }
+        if self
+            .subjects
+            .as_ref()
+            .is_some_and(PolicySubjectVerdicts::has_uncertainty)
+        {
+            self.completion
+                .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
+        }
+        self.refresh_retained_bytes();
+        Ok(())
+    }
+
+    pub(crate) fn validate_subjects(&self) -> Result<(), PolicyRunError> {
+        if let Some(subjects) = &self.subjects {
+            subjects.validate(&self.findings)?;
+            if subjects.has_uncertainty()
+                && !completion_has_incomplete_reason(
+                    &self.completion,
+                    PolicyIncompleteReason::PartialDiscovery,
+                )
+            {
+                return Err(PolicyRunError::InvalidSubjectVerdicts);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn omit_last_subject(&mut self) -> bool {
+        let Some(subjects) = &mut self.subjects else {
+            return false;
+        };
+        let Some(entry) = subjects.entries.pop() else {
+            return false;
+        };
+        match entry.verdict {
+            SubjectVerdict::Selected { .. } => subjects.omitted.selected += 1,
+            SubjectVerdict::Undecided { .. } => subjects.omitted.undecided += 1,
+        }
+        tighten_vec(&mut subjects.entries);
+        self.completion
+            .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
+        self.refresh_retained_bytes();
+        true
+    }
+
+    pub fn subjects(&self) -> Option<&PolicySubjectVerdicts> {
+        self.subjects.as_ref()
+    }
+
+    pub fn drop_subject_finding(&mut self, id: PolicyFindingId) {
+        if let Some(subjects) = &mut self.subjects {
+            subjects.drop_finding(id);
+            if subjects.has_uncertainty() {
+                self.completion
+                    .mark_inconclusive(PolicyIncompleteReason::PartialDiscovery);
+            }
+        }
+        self.refresh_retained_bytes();
+    }
+
     pub(crate) fn with_engine(mut self, engine: Option<crate::taint_policy::TaintEngine>) -> Self {
         self.engine = engine;
         self
@@ -5269,6 +6181,7 @@ impl PolicyRun {
             analysis_type,
             completion,
             findings,
+            subjects: None,
             diagnostics,
             diagnostics_truncated,
             obligations: Vec::new(),
@@ -5525,6 +6438,28 @@ impl PolicyRun {
         self.refresh_retained_bytes();
     }
 
+    /// Drop subject-verdict references to findings the run no longer holds,
+    /// leaving those sites partial. Callers that rewrite a run's findings
+    /// after its verdicts were attached call this once they are done; a
+    /// partial list mid-rewrite would drop findings still to be restored.
+    pub(crate) fn reconcile_subject_findings(
+        &mut self,
+        budget: &PolicyBudget,
+    ) -> Result<(), PolicyRunError> {
+        let Some(subjects) = &mut self.subjects else {
+            return Ok(());
+        };
+        let retained = self
+            .findings
+            .iter()
+            .map(PolicyFinding::id)
+            .collect::<HashSet<_>>();
+        subjects.retain_findings(&retained);
+        // The reasons a dropped reference adds can take a run that fit over
+        // its budget again.
+        self.fit_subjects_to_budget(budget)
+    }
+
     pub(crate) fn replace_findings(&mut self, mut findings: Vec<PolicyFinding>) {
         findings.sort_by_key(PolicyFinding::id);
         tighten_vec(&mut findings);
@@ -5534,8 +6469,12 @@ impl PolicyRun {
     }
 
     pub(crate) fn increment_omitted_findings(&mut self) {
+        self.add_omitted_findings(1);
+    }
+
+    pub(crate) fn add_omitted_findings(&mut self, count: u64) {
         self.work.omitted_findings_lower_bound =
-            self.work.omitted_findings_lower_bound.saturating_add(1);
+            self.work.omitted_findings_lower_bound.saturating_add(count);
         self.refresh_retained_bytes();
     }
 
@@ -5565,6 +6504,7 @@ impl PolicyRun {
 impl RetainedSize for PolicyRun {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
+            .saturating_add(self.subjects.as_ref().map_or(0, retained_extra))
             .saturating_add(retained_extra(&self.policy_id))
             .saturating_add(retained_extra(&self.completion))
             .saturating_add(retained_extra(&self.findings))
@@ -5612,19 +6552,38 @@ fn validate_obligation_retention(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyRunError {
+    InvalidSubjectVerdicts,
     InvalidCompletion(CompletionReasonError),
-    TooManyFindings { max: usize },
-    TooManyDiagnostics { max: usize },
+    TooManyFindings {
+        max: usize,
+    },
+    TooManyDiagnostics {
+        max: usize,
+    },
     FindingJoinMismatch,
     DuplicateFindingId,
     CompletionDoesNotReflectDiagnostics,
     WeakFindingRequiresIncompleteRun,
     OmittedFindingsRequireIncompleteRun,
-    TooManyObligations { max: usize },
+    TooManyObligations {
+        max: usize,
+    },
     InconsistentObligationTruncation,
     ObligationsRequireInconclusiveRun,
     FindingBudgetViolation,
-    RetainedReportBytesExceeded { max: usize },
+    ApproximateModelAttributionUnavailable,
+    /// A finding refused an approximate-model marker for a reason other than
+    /// a report budget, so the marker itself is invalid.
+    ModelAttributionRejected(String),
+    RetainedReportBytesExceeded {
+        max: usize,
+    },
+}
+
+impl PolicyRunError {
+    pub(crate) fn model_attribution_rejected(error: &PolicyFindingError) -> Self {
+        Self::ModelAttributionRejected(format!("{error:?}"))
+    }
 }
 
 impl From<CompletionReasonError> for PolicyRunError {
@@ -5636,6 +6595,9 @@ impl From<CompletionReasonError> for PolicyRunError {
 impl fmt::Display for PolicyRunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSubjectVerdicts => {
+                formatter.write_str("invalid subject verdict ordering, shape, or finding join")
+            }
             Self::InvalidCompletion(error) => error.fmt(formatter),
             Self::TooManyFindings { max } => {
                 write!(formatter, "policy run accepts at most {max} findings")
@@ -5668,6 +6630,15 @@ impl fmt::Display for PolicyRunError {
             }
             Self::FindingBudgetViolation => {
                 formatter.write_str("a finding exceeds the original host budget")
+            }
+            Self::ApproximateModelAttributionUnavailable => formatter.write_str(
+                "an active approximate model lacks the provenance required to mark findings",
+            ),
+            Self::ModelAttributionRejected(error) => {
+                write!(
+                    formatter,
+                    "a finding rejected its approximate model marker: {error}"
+                )
             }
             Self::RetainedReportBytesExceeded { max } => {
                 write!(formatter, "policy run retains more than {max} bytes")
@@ -6104,6 +7075,7 @@ pub enum ReportValueError {
         max_bytes: usize,
     },
     InvalidIdentifier,
+    InvalidPatternProvenance,
     ProseTooLong {
         max_bytes: usize,
     },
@@ -6147,6 +7119,9 @@ impl fmt::Display for ReportValueError {
             }
             Self::InvalidIdentifier => formatter.write_str(
                 "report identifier must use lowercase ASCII alphanumerics, `.`, `-`, or `_`",
+            ),
+            Self::InvalidPatternProvenance => formatter.write_str(
+                "admitted pattern witness provenance must identify one bounded field and exact binder",
             ),
             Self::ProseTooLong { max_bytes } => {
                 write!(formatter, "report text must be at most {max_bytes} bytes")
@@ -6945,6 +7920,8 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
             related_truncated: bool,
             omitted_related_locations_lower_bound: u64,
             evidence: PolicyFindingEvidence,
+            #[serde(default)]
+            model_attribution: Option<ModelAttribution>,
             evidence_refs_truncated: bool,
             omitted_evidence_refs_lower_bound: u64,
             cvss: Option<de::IgnoredAny>,
@@ -7007,6 +7984,8 @@ impl<'de> de::DeserializeSeed<'de> for PolicyFindingSeed<'_> {
         )
         .map_err(de::Error::custom)?
         .with_value_type_barrier_notes(wire.value_type_barrier_notes, self.budget)
+        .map_err(de::Error::custom)?
+        .with_model_attribution(wire.model_attribution, self.budget)
         .map_err(de::Error::custom)?;
 
         // The identity, the analysis type and the identity stability are
@@ -7745,6 +8724,7 @@ mod tests {
             target_fq_name: "crate::Target::run".to_string(),
             target_identity: Some(cross_file_identity),
             usage_kind: Some("call".to_string()),
+            reference_facets: UnitRowReferenceFacets::default(),
             proof: PolicyQueryProof::Resolved,
         };
         assert!(reference.validate().is_ok());
@@ -8054,6 +9034,95 @@ mod tests {
         assert_eq!(round_trip(&finding, &budget), finding);
     }
 
+    #[test]
+    fn optional_model_attribution_replays_without_changing_finding_identity() {
+        let budget = PolicyBudget::default();
+        let loaded = loaded_match_policy();
+        let exact = finding_with(&loaded, match_evidence(), Vec::new(), None, &budget).unwrap();
+        let exact_bytes = serde_json::to_string(&exact).unwrap();
+        assert!(!exact_bytes.contains("model_attribution"));
+        let contributor = ModelAttributionContributor {
+            role: ModelAttributionRole::Summary,
+            pack_digest: "a".repeat(64),
+            record_id: "summary-1".into(),
+            built_from: "0.4.23".into(),
+            resolved: "0.4.25".into(),
+            direction: "older_artifact".into(),
+            mismatch_kinds: vec!["version_nearby".into()],
+            selection_rule_id: "cargo-compatible-nearest".into(),
+            selection_rule_version: 1,
+        };
+        let attributed = exact
+            .clone()
+            .with_model_attribution(
+                Some(ModelAttribution::from_full(vec![contributor], 4)),
+                &budget,
+            )
+            .unwrap();
+        assert_eq!(exact.id(), attributed.id());
+        assert_eq!(exact.completeness(), attributed.completeness());
+        assert_eq!(serde_json::to_string(&exact).unwrap(), exact_bytes);
+        assert_eq!(round_trip(&attributed, &budget), attributed);
+        assert!(
+            serde_json::to_string(&attributed)
+                .unwrap()
+                .contains("model_attribution")
+        );
+    }
+
+    #[test]
+    fn one_contributor_key_cannot_have_two_selection_reasons() {
+        let first = ModelAttributionContributor {
+            role: ModelAttributionRole::Declaration,
+            pack_digest: "a".repeat(64),
+            record_id: "decl-1".into(),
+            built_from: "0.8.1".into(),
+            resolved: "0.8.2".into(),
+            direction: "older_artifact".into(),
+            mismatch_kinds: vec!["version_nearby".into()],
+            selection_rule_id: "cargo-compatible-nearest".into(),
+            selection_rule_version: 1,
+        };
+        let mut conflicting = first.clone();
+        conflicting.mismatch_kinds.push("format_converted".into());
+        conflicting.mismatch_kinds.sort();
+        let attribution = ModelAttribution::from_full(vec![first, conflicting], 16);
+        assert_eq!(
+            attribution.validate(),
+            Err("one approximate contributor key has conflicting selection reasons")
+        );
+    }
+
+    #[test]
+    fn approximation_attribution_requires_a_registered_mismatch_kind() {
+        let attribution = ModelAttribution::from_full(
+            vec![ModelAttributionContributor {
+                role: ModelAttributionRole::Declaration,
+                pack_digest: "a".repeat(64),
+                record_id: "decl-1".into(),
+                built_from: "0.8.1".into(),
+                resolved: "0.8.2".into(),
+                direction: "older_artifact".into(),
+                mismatch_kinds: Vec::new(),
+                selection_rule_id: "cargo-compatible-nearest".into(),
+                selection_rule_version: 1,
+            }],
+            16,
+        );
+        assert_eq!(
+            attribution.validate(),
+            Err("model-attribution mismatch kinds cannot be empty")
+        );
+        let mut same_version = attribution.contributors[0].clone();
+        same_version.resolved = same_version.built_from.clone();
+        same_version.direction = "same_version".into();
+        assert!(
+            ModelAttribution::from_full(vec![same_version], 16)
+                .validate()
+                .is_ok()
+        );
+    }
+
     mod identity_contract_tests;
     mod wire_and_byte_admission_tests;
 
@@ -8257,6 +9326,7 @@ mod tests {
                 target_fq_name: "x".repeat(MAX_REPORT_PROSE_BYTES),
                 target_identity: None,
                 usage_kind: None,
+                reference_facets: UnitRowReferenceFacets::default(),
                 proof: PolicyQueryProof::NameBased,
             },
             Vec::new(),

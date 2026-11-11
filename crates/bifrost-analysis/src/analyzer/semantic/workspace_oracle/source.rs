@@ -920,6 +920,25 @@ pub fn procedure_dispatch_boundary_digest(boundary: &DispatchBoundary) -> Stable
         }
         None => digest.push(b"no-unmaterialized-external-target"),
     }
+    // The call-scoped routing key is not answer content (it contains the
+    // caller's artifact revision). The ordered selected summaries are: they
+    // change the receiver semantics even when the final method is unchanged.
+    let adjustments = boundary
+        .exact_external_target()
+        .map(|target| target.receiver_adjustments())
+        .or_else(|| {
+            boundary
+                .unmaterialized_external_target()
+                .map(|target| target.receiver_adjustments.as_ref())
+        })
+        .unwrap_or(&[]);
+    if !adjustments.is_empty() {
+        digest.push(b"receiver-adjustments");
+        digest.push(&(adjustments.len() as u64).to_le_bytes());
+        for step in adjustments {
+            digest.push(step.fingerprint().as_bytes());
+        }
+    }
     push_proof_status(&mut digest, &boundary.proof);
     push_evidence_completeness(&mut digest, &boundary.completeness);
     digest.finish()

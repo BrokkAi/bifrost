@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use brokk_bifrost_core::analyzer::configuration::{
-    ConfigurationDocumentFacts, ConfigurationNodeKind, ConfigurationRouteSelector,
-    ConfigurationSourceRange,
+    ConfigurationDocumentFacts, ConfigurationSourceRange,
 };
 use brokk_bifrost_js_ts::workspace_packages::decode_package_manifest;
 use serde_json::Value;
@@ -23,6 +22,8 @@ use brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string;
 use brokk_bifrost_analysis::analyzer::configuration::ConfigurationIngestionOutcome;
 
 use brokk_bifrost_analysis::analyzer::configuration::ingest_configuration_document;
+
+use brokk_bifrost_analysis::analyzer::configuration::DocumentSpans;
 
 use brokk_bifrost_analysis::analyzer::semantic::topology::DependencyScope;
 
@@ -282,7 +283,7 @@ struct Document {
     value: Value,
     facts: ConfigurationDocumentFacts,
     digest: String,
-    ranges: BTreeMap<Vec<String>, ConfigurationSourceRange>,
+    ranges: DocumentSpans,
 }
 
 impl Document {
@@ -293,9 +294,8 @@ impl Document {
                 .expect("validated document")
                 .evidence()
         } else {
-            *self
-                .ranges
-                .get(&keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>())
+            self.ranges
+                .member(keys)
                 .expect("decoded member must have exact parser evidence")
         };
         JsTsBuildEvidence {
@@ -345,34 +345,7 @@ fn decode_document(
             ));
         }
     };
-    let mut routes = BTreeSet::new();
-    let mut ranges = BTreeMap::new();
-    for fact in facts.facts() {
-        if matches!(fact.kind(), ConfigurationNodeKind::Member { .. }) {
-            if fact.route().segments().iter().any(|part| matches!(part.selector(), ConfigurationRouteSelector::Key { occurrence, .. } if *occurrence > 1)) { return Err("duplicate mapping key".to_owned()); }
-            let route: Vec<_> = fact
-                .route()
-                .segments()
-                .iter()
-                .map(|part| part.selector().clone())
-                .collect();
-            if !routes.insert(route) {
-                return Err("duplicate mapping key".to_owned());
-            }
-            let keys: Option<Vec<_>> = fact
-                .route()
-                .segments()
-                .iter()
-                .map(|part| match part.selector() {
-                    ConfigurationRouteSelector::Key { name, .. } => Some(name.clone()),
-                    ConfigurationRouteSelector::Index(_) => None,
-                })
-                .collect();
-            if let Some(keys) = keys {
-                ranges.insert(keys, fact.evidence());
-            }
-        }
-    }
+    let ranges = DocumentSpans::from_facts(&facts)?;
     let value = if parser_path
         .extension()
         .is_some_and(|extension| extension == "yaml")
@@ -386,7 +359,9 @@ fn decode_document(
         path: input.path.to_path_buf(),
         value,
         facts,
-        digest: format!("{:x}", sha2::Sha256::digest(input.bytes)),
+        digest: brokk_bifrost_core::analyzer::canonical_hash::lower_hex_string(
+            &sha2::Sha256::digest(input.bytes).into(),
+        ),
         ranges,
     })
 }

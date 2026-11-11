@@ -41,6 +41,7 @@ use crate::analyzer::usages::get_type::{
 
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::path_utils::rel_path_string;
+use brokk_bifrost_core::analyzer::model::DeclarationKind;
 use brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind;
 use brokk_bifrost_core::analyzer::resolution_facts::ResolutionNamespace;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
@@ -500,6 +501,14 @@ native_point_canonical_leaves!(
 );
 
 #[cfg(any(test, feature = "test-support"))]
+impl<A: NativePointRegistryIndependent, B: NativePointRegistryIndependent>
+    NativePointRegistryIndependent for (A, B)
+{
+    fn registry_independent(&self) -> bool {
+        self.0.registry_independent() && self.1.registry_independent()
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
 impl<T: NativePointRegistryIndependent> NativePointRegistryIndependent for Option<T> {
     fn registry_independent(&self) -> bool {
         self.as_ref().is_none_or(T::registry_independent)
@@ -636,6 +645,14 @@ impl NativePointRegistryIndependent for TypeLookupStatus {
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn selected_analyzer_services_for_test(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+) -> impl crate::analyzer::store::resolution_operation::SelectedAnalyzerServices + '_ {
+    crate::analyzer::selected_services::AnalyzerSelectedServices(analyzer)
+}
+
+/// Borrow the same engine service dispatch used by native point queries.
+#[doc(hidden)]
+pub fn selected_analyzer_services(
     analyzer: &dyn crate::analyzer::IAnalyzer,
 ) -> impl crate::analyzer::store::resolution_operation::SelectedAnalyzerServices + '_ {
     crate::analyzer::selected_services::AnalyzerSelectedServices(analyzer)
@@ -796,9 +813,10 @@ pub fn native_point_operation_inputs<A: LanguageAdapter>(
         Ok((snapshots, languages))
     } else {
         let snapshots = inner.selected_workspace_snapshots();
-        let languages = vec![SelectedResolutionLanguage::new(
+        let languages = vec![SelectedResolutionLanguage::with_epoch(
             language.config_label(),
             language,
+            inner.adapter().resolution_producer_epoch(),
         )];
         Ok((snapshots, languages))
     }
@@ -825,6 +843,28 @@ pub fn native_point_operation_open_count_for_test() -> usize {
 pub fn open_native_point_operation<'a, A: LanguageAdapter>(
     inner: &'a TreeSitterAnalyzer<A>,
     cancellation: &CancellationToken,
+) -> crate::analyzer::store::Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
+    open_native_point_operation_with_input(inner, cancellation, |input| input)
+}
+
+#[doc(hidden)]
+pub fn open_native_point_operation_with_services<'a, A: LanguageAdapter>(
+    inner: &'a TreeSitterAnalyzer<A>,
+    services: &'a dyn crate::analyzer::store::resolution_operation::SelectedAnalyzerServices,
+    cancellation: &CancellationToken,
+) -> crate::analyzer::store::Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
+    open_native_point_operation_with_input(inner, cancellation, |input| {
+        input.with_analyzer(services)
+    })
+}
+
+#[doc(hidden)]
+pub fn open_native_point_operation_with_input<'a, A: LanguageAdapter>(
+    inner: &'a TreeSitterAnalyzer<A>,
+    cancellation: &CancellationToken,
+    prepare_input: impl for<'selection> FnOnce(
+        SelectedResolutionOperationInput<'a, 'selection>,
+    ) -> SelectedResolutionOperationInput<'a, 'selection>,
 ) -> crate::analyzer::store::Result<SelectedResolutionOperationOpenOutcome<'a, 'a>> {
     #[cfg(any(test, feature = "test-support"))]
     NATIVE_POINT_OPERATION_OPEN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
@@ -866,7 +906,7 @@ pub fn open_native_point_operation<'a, A: LanguageAdapter>(
     .with_content_mounts(content_mounts);
     inner
         .analyzer_store()
-        .open_selected_resolution_operation(input, cancellation)
+        .open_selected_resolution_operation(prepare_input(input), cancellation)
 }
 
 #[doc(hidden)]
@@ -881,15 +921,10 @@ pub fn resolve_native_definition_bounded<A: LanguageAdapter>(
     ) -> crate::analyzer::store::Result<NativePointContext>,
     after_open: impl FnOnce(),
 ) -> BoundedResolution<DefinitionLookupOutcome> {
-    match resolve_native_definition_reference(
+    match resolve_native_definition_answer_bounded(
         inner,
-        NativePointReference {
-            #[cfg(any(test, feature = "test-support"))]
-            batch: None,
-            query,
-            namespace: reference_namespace,
-            call_argument_ordinal: None,
-        },
+        query,
+        reference_namespace,
         prepare_context,
         after_open,
         |_| (),
@@ -901,9 +936,43 @@ pub fn resolve_native_definition_bounded<A: LanguageAdapter>(
             value: outcome,
             work,
         },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
     }
+}
+
+/// Resolve a definition and project the selected native answer it came from
+/// before the selected operation ends. The projection observes the answer
+/// only; navigation renders the same outcome either way.
+#[doc(hidden)]
+pub fn resolve_native_definition_answer_bounded<A: LanguageAdapter, T>(
+    inner: &TreeSitterAnalyzer<A>,
+    query: BoundedReceiverQuery<'_>,
+    reference_namespace: Option<ResolutionNamespace>,
+    prepare_context: impl FnOnce(
+        &SelectedResolutionOperation<'_, '_>,
+        &str,
+        &CancellationToken,
+    ) -> crate::analyzer::store::Result<NativePointContext>,
+    after_open: impl FnOnce(),
+    project: impl FnOnce(&SelectedNativeReferenceUnits) -> T,
+) -> BoundedResolution<(DefinitionLookupOutcome, Option<T>)> {
+    resolve_native_definition_reference(
+        inner,
+        NativePointReference {
+            #[cfg(any(test, feature = "test-support"))]
+            batch: None,
+            query,
+            namespace: reference_namespace,
+            call_argument_ordinal: None,
+        },
+        prepare_context,
+        after_open,
+        project,
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -939,6 +1008,9 @@ pub fn resolve_native_definition_bounded_in_batch<A: LanguageAdapter>(
             value: outcome,
             work,
         },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
     }
@@ -1009,6 +1081,7 @@ fn resolve_native_definition_reference<A: LanguageAdapter, T>(
                 let obligations = answer.query_obligations.clone();
                 let owners = answer.absent_member_owners.clone();
                 let mut value = adapt_definition_answer_impl(
+                    query.analyzer,
                     query.site,
                     inner.adapter().language(),
                     answer,
@@ -1265,6 +1338,9 @@ fn resolve_native_point_bounded<A: LanguageAdapter, T, O>(
             BoundedResolution::Exceeded { limit, work } => {
                 BoundedResolution::Exceeded { limit, work }
             }
+            BoundedResolution::Unavailable { reason, work } => {
+                BoundedResolution::Unavailable { reason, work }
+            }
             BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
             BoundedResolution::Complete { value, work } => {
                 let outcome = match value {
@@ -1333,12 +1409,13 @@ pub fn is_precedence_ambiguity(completion: &ResolutionCompletion) -> bool {
 
 #[doc(hidden)]
 pub fn adapt_definition_answer(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     site: &ResolvedReferenceSite,
     language: Language,
     answer: SelectedNativeReferenceUnits,
 ) -> DefinitionLookupOutcome {
     let obligations = answer.query_obligations.clone();
-    let mut outcome = adapt_definition_answer_impl(site, language, answer, None);
+    let mut outcome = adapt_definition_answer_impl(analyzer, site, language, answer, None);
     append_query_obligation_diagnostics(&mut outcome, &obligations);
     outcome
 }
@@ -1359,6 +1436,7 @@ fn append_query_obligation_diagnostics(
 }
 
 fn adapt_definition_answer_impl(
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     site: &ResolvedReferenceSite,
     language: Language,
     answer: SelectedNativeReferenceUnits,
@@ -1375,7 +1453,7 @@ fn adapt_definition_answer_impl(
             metadata.site_kind()
                 == brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::CompositeLiteralKeyReference
         });
-    if answer.predeclared_go_symbol {
+    if answer.predeclared_symbol {
         return DefinitionLookupOutcome {
             modeled_definitions: Vec::new(),
             status: DefinitionLookupStatus::NoDefinition,
@@ -1385,27 +1463,32 @@ fn adapt_definition_answer_impl(
             diagnostics: vec![DefinitionLookupDiagnostic {
                 claim: None,
                 kind: PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND.into(),
-                message: format!("`{}` is a predeclared Go symbol", site.text),
+                message: format!("`{}` is a predeclared {language:?} symbol", site.text),
             }],
         };
     }
     if let Some(named_argument) = answer.named_argument {
         let (status, definitions, lexical_definition, diagnostics) = match named_argument {
-            SelectedNativeNamedArgument::Resolved(SelectedNativeDefinition::Unit(unit)) => (
+            SelectedNativeNamedArgument::Resolved(_, SelectedNativeDefinition::Unit(unit)) => (
                 DefinitionLookupStatus::Resolved,
                 vec![unit],
                 None,
                 Vec::new(),
             ),
-            SelectedNativeNamedArgument::Resolved(SelectedNativeDefinition::Lexical(lexical)) => (
+            SelectedNativeNamedArgument::Resolved(
+                _,
+                SelectedNativeDefinition::Lexical(lexical),
+            ) => (
                 DefinitionLookupStatus::Resolved,
                 Vec::new(),
                 Some(lexical),
                 Vec::new(),
             ),
-            SelectedNativeNamedArgument::Resolved(SelectedNativeDefinition::Intrinsic {
-                ..
-            }) => {
+            SelectedNativeNamedArgument::Resolved(
+                _,
+                SelectedNativeDefinition::Intrinsic { .. }
+                | SelectedNativeDefinition::ExternalOwner { .. },
+            ) => {
                 unreachable!("a named argument selects a parameter, not an intrinsic type")
             }
             SelectedNativeNamedArgument::Incomplete(message) => (
@@ -1418,6 +1501,16 @@ fn adapt_definition_answer_impl(
                     message,
                 }],
             ),
+            SelectedNativeNamedArgument::Absent(message) => (
+                DefinitionLookupStatus::NoDefinition,
+                Vec::new(),
+                None,
+                vec![DefinitionLookupDiagnostic {
+                    claim: None,
+                    kind: "python_named_argument_absent".into(),
+                    message,
+                }],
+            ),
         };
         let outcome = DefinitionLookupOutcome {
             modeled_definitions: Vec::new(),
@@ -1427,7 +1520,7 @@ fn adapt_definition_answer_impl(
             lexical_definition,
             diagnostics,
         };
-        record_native_member_contexts(language, member_contexts);
+        record_native_member_contexts(language, analyzer, member_contexts);
         trace::record_selected_units(&outcome);
         trace::record_native_declared_visibilities(&declared_visibilities);
         return outcome;
@@ -1442,6 +1535,9 @@ fn adapt_definition_answer_impl(
     let mut definitions_by_identity = std::collections::HashMap::new();
     let mut lexical_definitions = Vec::new();
     let mut intrinsic_definitions = Vec::new();
+    let mut canonical_language_roots = Vec::new();
+    let mut indexed_external_owners = Vec::new();
+    let mut model_declared_owners = Vec::new();
     for (identity, definition) in units {
         match definition {
             SelectedNativeDefinition::Unit(unit) => {
@@ -1451,10 +1547,26 @@ fn adapt_definition_answer_impl(
             SelectedNativeDefinition::Intrinsic { canonical_name, .. } => {
                 intrinsic_definitions.push(canonical_name);
             }
+            SelectedNativeDefinition::ExternalOwner { owner, authority } => match authority {
+                crate::analyzer::store::resolution_operation::ExternalOwnerDefinitionAuthority::IndexedDeclaration => {
+                    indexed_external_owners.push(owner);
+                }
+                crate::analyzer::store::resolution_operation::ExternalOwnerDefinitionAuthority::ModelDeclared => {
+                    model_declared_owners.push(owner);
+                }
+                crate::analyzer::store::resolution_operation::ExternalOwnerDefinitionAuthority::CanonicalLanguageRoot => {
+                    canonical_language_roots.push(owner.owner_fqn.to_string());
+                }
+                crate::analyzer::store::resolution_operation::ExternalOwnerDefinitionAuthority::OtherIntrinsicOwner => {
+                    unreachable!("other external owners use their existing projection path")
+                }
+            },
         }
     }
     if !intrinsic_definitions.is_empty()
         && !crate::analyzer::resolution::projects_intrinsic_definitions(language)
+        && indexed_external_owners.is_empty()
+        && model_declared_owners.is_empty()
     {
         return unavailable_definition(
             site,
@@ -1467,6 +1579,7 @@ fn adapt_definition_answer_impl(
     }
     record_native_callable_applicability(
         language,
+        analyzer,
         &answer.answer,
         &definitions_by_identity,
         &member_contexts,
@@ -1510,11 +1623,7 @@ fn adapt_definition_answer_impl(
     let mut diagnostics = answer
         .named_reasons
         .into_iter()
-        .map(|(kind, message)| DefinitionLookupDiagnostic {
-            claim: None,
-            kind: kind.into(),
-            message,
-        })
+        .map(|(kind, message)| project_named_definition_reason(kind, message))
         .collect::<Vec<_>>();
     if !intrinsic_definitions.is_empty() {
         diagnostics.push(DefinitionLookupDiagnostic {
@@ -1524,6 +1633,30 @@ fn adapt_definition_answer_impl(
                 "intrinsic type bindings have no source location: {intrinsic_definitions:?}"
             ),
         });
+    }
+    if !canonical_language_roots.is_empty() {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "intrinsic_type_reference".into(),
+            message: format!(
+                "intrinsic type bindings have no source location: {canonical_language_roots:?}"
+            ),
+        });
+    }
+    if !indexed_external_owners.is_empty() {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            claim: None,
+            kind: "indexed_external_declaration_no_source".into(),
+            message: format!(
+                "indexed external declaration has no available source projection: {indexed_external_owners:?}"
+            ),
+        });
+    }
+    for owner in &model_declared_owners {
+        diagnostics.push(model_declared_owner_diagnostic(
+            owner,
+            &model_declared_owners,
+        ));
     }
     if lexical_definitions.len() > 1 {
         diagnostics.push(DefinitionLookupDiagnostic {
@@ -1537,6 +1670,25 @@ fn adapt_definition_answer_impl(
     let lexical_definition =
         (lexical_definitions.len() == 1).then(|| lexical_definitions.remove(0));
     let target_count = answer.answer.binding().targets().len();
+    // In a language where reassignments are one declaration, native
+    // alternatives may be different writers of one public declaration, and
+    // definition ambiguity concerns the public declarations; value and flow
+    // consumers retain the original alternatives. Elsewhere, two declarations
+    // that share a display identity (duplicate Java methods) stay ambiguous.
+    // A missing projection cannot establish that two alternatives coincide.
+    let definition_target_count = if crate::analyzer::languages::language_knowledge(language)
+        .is_some_and(|support| support.reassignments_are_one_declaration())
+        && answer
+            .answer
+            .binding()
+            .targets()
+            .iter()
+            .all(|identity| definitions_by_identity.contains_key(identity))
+    {
+        definitions.len()
+    } else {
+        target_count
+    };
     // Both frontends publish equal-precedence conflicts explicitly. Keep the
     // ambiguity even when one canonical endpoint has no display projection.
     let inconsistent_precedence = matches!(language, Language::Go | Language::Rust)
@@ -1557,7 +1709,8 @@ fn adapt_definition_answer_impl(
             .callable_candidate_applicability()
             .iter()
             .any(|candidate| candidate.verdict() == ApplicabilityVerdict::Unknown);
-    let ambiguous = (target_count > 1 || inconsistent_precedence) && !unproven_term_family;
+    let ambiguous =
+        (definition_target_count > 1 || inconsistent_precedence) && !unproven_term_family;
     if ambiguous {
         // An ambiguous binding has status `Ambiguous`, so its ambiguity is the
         // primary diagnostic. Open evidence that also limits completeness,
@@ -1651,20 +1804,25 @@ fn adapt_definition_answer_impl(
             ),
         });
     }
-    let status = if unindexed_family.is_some()
+    let status = if ambiguous {
+        DefinitionLookupStatus::Ambiguous
+    } else if unindexed_family.is_some()
         || (external_family.is_some() && !ambiguous && !is_incomplete)
+        // A model-declared owner is the type-level counterpart of an
+        // unindexed provider: its boundary status wins over Incomplete.
+        || !model_declared_owners.is_empty()
     {
         DefinitionLookupStatus::UnresolvableImportBoundary
-    } else if ambiguous {
-        // Exact Go selector ties and multiple semantic targets establish
-        // ambiguity even when another open inventory limits completeness.
-        DefinitionLookupStatus::Ambiguous
     } else if is_incomplete {
         DefinitionLookupStatus::Incomplete
+    } else if !indexed_external_owners.is_empty() {
+        DefinitionLookupStatus::UnresolvableImportBoundary
     } else {
-        match target_count {
+        match definition_target_count {
             0 => DefinitionLookupStatus::NoDefinition,
-            1 if !intrinsic_definitions.is_empty() => DefinitionLookupStatus::NoDefinition,
+            1 if !intrinsic_definitions.is_empty() || !canonical_language_roots.is_empty() => {
+                DefinitionLookupStatus::NoDefinition
+            }
             1 => DefinitionLookupStatus::Resolved,
             _ => unreachable!("multiple native targets are ambiguous"),
         }
@@ -1675,10 +1833,17 @@ fn adapt_definition_answer_impl(
         && crate::analyzer::languages::language_knowledge(language)
             .is_some_and(|support| support.native_local_binding_diagnostic())
     {
+        let kind = if matches!(
+            local.kind,
+            DeclarationKind::TypeParameter | DeclarationKind::BlockLocalType
+        ) {
+            "local_type_binding"
+        } else {
+            crate::analyzer::usages::get_definition::LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
+        };
         diagnostics.push(DefinitionLookupDiagnostic {
             claim: None,
-            kind: crate::analyzer::usages::get_definition::LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
-                .into(),
+            kind: kind.into(),
             message: format!("selected native binding identifies a local declaration: {local:?}"),
         });
     }
@@ -1768,6 +1933,8 @@ fn adapt_definition_answer_impl(
             let mut reference = site.clone();
             if let [canonical_name] = intrinsic_definitions.as_slice() {
                 reference.text.clone_from(canonical_name);
+            } else if let [canonical_name] = canonical_language_roots.as_slice() {
+                reference.text.clone_from(canonical_name);
             } else if let Some((path, _, member)) = unindexed_family {
                 reference.text = format!("{path}.{member}");
             } else if let Some(member) = external_family {
@@ -1783,7 +1950,7 @@ fn adapt_definition_answer_impl(
     if absent_literal_member {
         state_absent_member(&mut outcome, &site.text, &answer.absent_member_owners);
     }
-    record_native_member_contexts(language, member_contexts);
+    record_native_member_contexts(language, analyzer, member_contexts);
     trace::record_selected_units(&outcome);
     trace::record_native_provenance(
         &outcome,
@@ -1811,6 +1978,24 @@ fn adapt_definition_answer_impl(
     outcome
 }
 
+fn model_declared_owner_diagnostic(
+    owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
+    owners: &[crate::analyzer::resolution::ExternalOwnerIdentity],
+) -> DefinitionLookupDiagnostic {
+    DefinitionLookupDiagnostic {
+        claim: Some(
+            crate::analyzer::usages::get_definition::UnindexedClaim::external_boundary(
+                owner.owner_fqn.to_string(),
+                crate::analyzer::usages::get_definition::ClaimSubjectRole::Type,
+            ),
+        ),
+        kind: "model_declared_external_declaration_no_source".into(),
+        message: format!(
+            "model-declared external declaration has no available source projection: {owners:?}"
+        ),
+    }
+}
+
 fn native_scala_type_ambiguity(answer: &FactResolutionAnswer) -> bool {
     answer.projections().iter().any(|projection| {
         if !matches!(
@@ -1834,7 +2019,11 @@ fn native_scala_type_ambiguity(answer: &FactResolutionAnswer) -> bool {
     })
 }
 
-fn record_native_member_contexts(language: Language, contexts: Vec<ProjectedNativeMemberContext>) {
+fn record_native_member_contexts(
+    language: Language,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
+    contexts: Vec<ProjectedNativeMemberContext>,
+) {
     if !trace::recording() {
         return;
     }
@@ -1848,7 +2037,8 @@ fn record_native_member_contexts(language: Language, contexts: Vec<ProjectedNati
             crate::analyzer::structural::CandidateOutcome::Selected,
             crate::analyzer::structural::CandidateOutcome::Rejected,
         );
-        let Some((tier, enrichment)) = native_member_attribution(language, &context, outcome)
+        let Some((tier, enrichment)) =
+            native_member_attribution(language, analyzer, &context, outcome)
         else {
             continue;
         };
@@ -1880,6 +2070,7 @@ fn record_native_member_contexts(language: Language, contexts: Vec<ProjectedNati
 
 fn native_member_attribution(
     language: Language,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     context: &ProjectedNativeMemberContext,
     outcome: crate::analyzer::structural::CandidateOutcome,
 ) -> Option<(
@@ -1897,13 +2088,14 @@ fn native_member_attribution(
     let depth = context.owner_path.len() - 1;
     let crate::analyzer::languages::NativeMemberAttribution {
         dispatch_tier,
-        relation,
+        relations,
         precedence_tier,
     } = crate::analyzer::languages::language_support_for_hook(
         language,
         "native_member_attribution",
     )?
-    .native_member_attribution(context, outcome)?;
+    .native_member_attribution(analyzer, context, outcome)?;
+    assert_eq!(relations.len(), depth, "one relation per route hop");
     let enrichment = trace::MemberEnrichment {
         owner: owner.clone(),
         hierarchy_depth: depth,
@@ -1912,8 +2104,9 @@ fn native_member_attribution(
         route: context
             .owner_path
             .windows(2)
+            .zip(relations)
             .enumerate()
-            .map(|(hop, pair)| trace::HierarchyHopRecord {
+            .map(|(hop, (pair, relation))| trace::HierarchyHopRecord {
                 hop,
                 from: pair[0].clone(),
                 to: pair[1].clone(),
@@ -1926,6 +2119,7 @@ fn native_member_attribution(
 
 fn record_native_callable_applicability(
     language: Language,
+    analyzer: &dyn crate::analyzer::IAnalyzer,
     answer: &crate::analyzer::resolution::FactResolutionAnswer,
     definitions: &std::collections::HashMap<
         crate::analyzer::resolution::SemanticId,
@@ -1962,6 +2156,7 @@ fn record_native_callable_applicability(
                 .and_then(|context| {
                     native_member_attribution(
                         language,
+                        analyzer,
                         context,
                         crate::analyzer::structural::CandidateOutcome::Rejected(
                             RejectionReason::CallableApplicabilityDeferred,
@@ -2446,6 +2641,9 @@ pub fn adapt_type_answer(
         } else if language == Language::Go {
             Some(format!("{}{spelling}", "*".repeat(depth as usize)))
         } else {
+            // Python's own producers emit no indirection, but a pack or model
+            // type fact is external data that may carry one. Python has no
+            // spelling for it, so it is reported like any other language's.
             diagnostics.push(TypeLookupDiagnostic {
                 kind: "unsupported_type_indirection".into(),
                 message: format!(
@@ -2456,6 +2654,26 @@ pub fn adapt_type_answer(
             None
         }
     })
+}
+
+/// Whether a completion leaves a nominal type answer open. A Python value
+/// whose only incompleteness is the receiver-subclass obligation (`cls`,
+/// `self`) still has an exact nominal identity: the obligation says a subclass
+/// may change member lookup, and dispatch keeps that obligation.
+fn nominal_type_complete(language: Language, completion: &ResolutionCompletion) -> bool {
+    match completion {
+        ResolutionCompletion::Complete => true,
+        ResolutionCompletion::Incomplete(reasons) => {
+            language == Language::Python
+                && reasons.iter().count() > 0
+                && reasons.iter().all(|reason| {
+                    matches!(
+                        reason,
+                        ResolutionIncompleteReason::ReceiverSubclassObligation(_)
+                    )
+                })
+        }
+    }
 }
 
 fn adapt_type_answer_with_spelling(
@@ -2563,17 +2781,47 @@ fn adapt_type_answer_with_spelling(
             target_kind = TypeLookupTargetKind::TypeReference;
         }
     }
+    // A Python expression whose values are all class objects (`cls`) names the
+    // class, not an instance of it.
+    if language == Language::Python && observed.is_none() {
+        let frontiers = resolution
+            .projections()
+            .iter()
+            .filter(|projection| Some(projection.kind()) == selected)
+            .map(|projection| projection.output_slot())
+            .chain(answer.query_result_slot)
+            .map(|slot| {
+                resolution
+                    .projected_frontiers()
+                    .iter()
+                    .find(|frontier| frontier.slot() == slot)
+            })
+            .collect::<Vec<_>>();
+        if !frontiers.is_empty()
+            && frontiers.iter().all(|frontier| {
+                frontier.is_some_and(|frontier| {
+                    !frontier.possible_values().is_empty()
+                        && frontier
+                            .possible_values()
+                            .iter()
+                            .all(|value| matches!(value, ResolutionSlotValue::TypeObject(_, _)))
+                })
+            })
+        {
+            target_kind = TypeLookupTargetKind::TypeReference;
+        }
+    }
     let shapes = resolution
         .projected_type_shapes()
         .iter()
         .map(|shape| (shape.output_slot(), shape))
         .collect::<std::collections::HashMap<_, _>>();
-    let mut complete = resolution.binding().completion() == &ResolutionCompletion::Complete;
+    let mut complete = nominal_type_complete(language, resolution.binding().completion());
     for frontier in resolution.projected_frontiers() {
         if let Some(shape) = shapes.get(&frontier.slot()) {
-            complete &= shape.supported() && shape.completion() == &ResolutionCompletion::Complete;
+            complete &= shape.supported() && nominal_type_complete(language, shape.completion());
         } else {
-            complete &= frontier.completion() == &ResolutionCompletion::Complete;
+            complete &= nominal_type_complete(language, frontier.completion());
         }
     }
     if !complete {
@@ -2636,7 +2884,7 @@ fn adapt_type_answer_with_spelling(
             // it does not invalidate nominal alternatives already proved by
             // the frontier. Keep those alternatives with incomplete status.
         }
-        complete &= frontier.completion() == &ResolutionCompletion::Complete;
+        complete &= nominal_type_complete(language, frontier.completion());
         for value in frontier.possible_values() {
             let identity = value.ty().identity();
             let depth = value.ty().indirection();
@@ -2655,6 +2903,9 @@ fn adapt_type_answer_with_spelling(
                         }
                         SelectedNativeDefinition::Intrinsic { canonical_name, .. } => {
                             Some((canonical_name.clone(), Vec::new()))
+                        }
+                        SelectedNativeDefinition::ExternalOwner { owner, .. } => {
+                            Some((owner.owner_fqn.to_string(), Vec::new()))
                         }
                         SelectedNativeDefinition::Lexical(_) => None,
                     })
@@ -2695,6 +2946,12 @@ fn adapt_type_answer_with_spelling(
             kind: "unprojected_type_frontier".into(),
             message: "selected native reference has no examined type frontier".into(),
         });
+    }
+    // The reported type list of a Python answer leaves out `types.NoneType`
+    // beside another type, so `Result | None` reports `Result`. The value set
+    // and completion keep it; an answer naming only NoneType still reports it.
+    if language == Language::Python && canonical.values().any(|ty| ty.fqn != "types.NoneType") {
+        canonical.retain(|_, ty| ty.fqn != "types.NoneType");
     }
     if kinds.len() > 1 {
         diagnostics.push(TypeLookupDiagnostic {
@@ -2786,7 +3043,9 @@ fn render_projected_type_shape(
                 FactProjectedTypeNodeForm::Applied(arguments) => {
                     pending.extend(arguments.iter().rev().map(|argument| (*argument, false)));
                 }
-                FactProjectedTypeNodeForm::Leaf | FactProjectedTypeNodeForm::Unsupported => {}
+                FactProjectedTypeNodeForm::Leaf
+                | FactProjectedTypeNodeForm::Channel { .. }
+                | FactProjectedTypeNodeForm::Unsupported => {}
             }
             continue;
         }
@@ -2816,6 +3075,9 @@ fn render_projected_type_shape(
                 SelectedNativeDefinition::Intrinsic { canonical_name, .. } => {
                     Some(canonical_name.clone())
                 }
+                SelectedNativeDefinition::ExternalOwner { owner, .. } => {
+                    Some(owner.owner_fqn.to_string())
+                }
                 SelectedNativeDefinition::Lexical(_) => None,
             }
         };
@@ -2827,7 +3089,9 @@ fn render_projected_type_shape(
                 format!("[]{}", rendered.get(element)?)
             }
             FactProjectedTypeNodeForm::Array(element) => format!("{}[]", rendered.get(element)?),
-            FactProjectedTypeNodeForm::Unsupported => return None,
+            FactProjectedTypeNodeForm::Channel { .. } | FactProjectedTypeNodeForm::Unsupported => {
+                return None;
+            }
             FactProjectedTypeNodeForm::Map { key, value } => {
                 format!("map[{}]{}", rendered.get(key)?, rendered.get(value)?)
             }
@@ -2945,6 +3209,9 @@ pub fn map_bounded<T, U>(
             work,
         },
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
     }
 }
@@ -3169,10 +3436,54 @@ pub fn probe_native_type(
             },
             work,
         },
+        BoundedResolution::Unavailable { reason, work } => {
+            BoundedResolution::Unavailable { reason, work }
+        }
         BoundedResolution::Cancelled { work } => BoundedResolution::Cancelled { work },
         BoundedResolution::Exceeded { limit, work } => BoundedResolution::Exceeded { limit, work },
     })
 }
 
+/// Render a named native reason at the product projection boundary. Typed
+/// language authority contexts stay intact until this final rendering step.
+#[doc(hidden)]
+pub fn project_named_definition_reason(
+    kind: &str,
+    reason: impl std::fmt::Display,
+) -> DefinitionLookupDiagnostic {
+    DefinitionLookupDiagnostic {
+        claim: None,
+        kind: kind.into(),
+        message: reason.to_string(),
+    }
+}
+
 #[cfg(test)]
-mod assignment_value_tests {}
+mod assignment_value_tests {
+    use super::*;
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9783: model-declared owner lost the Java external-boundary claim"
+    )]
+    fn model_declared_owner_keeps_external_boundary_claim() {
+        let owner = crate::analyzer::resolution::ExternalOwnerIdentity {
+            provider_id: std::sync::Arc::from("pack"),
+            owner_fqn: std::sync::Arc::from("java.nio.file.Path"),
+        };
+        let diagnostic = model_declared_owner_diagnostic(&owner, std::slice::from_ref(&owner));
+        assert_eq!(
+            diagnostic.kind,
+            "model_declared_external_declaration_no_source"
+        );
+        assert_eq!(
+            diagnostic.claim,
+            Some(
+                crate::analyzer::usages::get_definition::UnindexedClaim::external_boundary(
+                    "java.nio.file.Path",
+                    crate::analyzer::usages::get_definition::ClaimSubjectRole::Type,
+                )
+            )
+        );
+    }
+}

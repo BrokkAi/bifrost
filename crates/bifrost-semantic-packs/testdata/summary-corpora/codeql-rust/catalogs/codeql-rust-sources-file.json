@@ -1,0 +1,244 @@
+{
+  "categories": [
+    "file"
+  ],
+  "external_models": [],
+  "name": "codeql-rust-sources-file",
+  "sanitizers": [],
+  "schema_version": 1,
+  "sinks": [],
+  "sources": [
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "file"
+      ],
+      "display_name": "std.fs.copy",
+      "evidence": null,
+      "id": "codeql-059fe03e06c6ebfedf3671d85c35cc3f65289712db05ab49f18a60c58d5c46d8",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "copy"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.e310c6ab56a197f9ebae043119b030aa3d71c950baacd992f8df8b7f59e6e6be"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "file"
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "file"
+      ],
+      "display_name": "std.fs.read_to_string",
+      "evidence": null,
+      "id": "codeql-063aff681201c9a65e3b5a619c1bfdbaaded061828678c4369eab76835bc9642",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "read_to_string"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.7f3c52d05f99b583cbd0d54dedeb206b73145f86d18d131259065e458f2bebed"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "file"
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "file"
+      ],
+      "display_name": "std.fs.read",
+      "evidence": null,
+      "id": "codeql-38c68962b885428eff1669bd77cd8a7e723fafa78eee44aa4e7cb786edc5776e",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "read"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.373b2c4b209cf66135265441111d108b5ec8a5133066bce3664724043860ed3c"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "file"
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "file"
+      ],
+      "display_name": "std.fs.remove_dir_all",
+      "evidence": null,
+      "id": "codeql-7c86dc3cfa68414e7f17dd5fe4ad0e1eb67b31a37d54e4406dda7dbfb86cb2e7",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "remove_dir_all"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.3ec9f4fa2954a3bc71fddd7326fb3bb10ff87906102ebbf8aeb6267473297ec5"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "file"
+    },
+    {
+      "bind": {
+        "type": "return_value"
+      },
+      "categories": [
+        "file"
+      ],
+      "display_name": "std.fs.write",
+      "evidence": null,
+      "id": "codeql-a02be76f09dcaed2d9fdb80919236b625f3d901eb5df8ba162c25ab4e6f71313",
+      "labels": [
+        "attacker-controlled"
+      ],
+      "selector": {
+        "query": {
+          "languages": [
+            "rust"
+          ],
+          "match": {
+            "callee": {
+              "name": "write"
+            },
+            "kind": "call"
+          },
+          "schema_version": 1,
+          "steps": [
+            {
+              "op": "call_shape"
+            },
+            {
+              "op": "call_bindings"
+            },
+            {
+              "call_proof": "declared",
+              "op": "resolved_call",
+              "resolves_to": {
+                "stable": "member.368dce68034ede421916b0955f9e9ac44f93044489dc9593c0979e97aa1b9d4f"
+              }
+            }
+          ]
+        },
+        "schema_version": 1,
+        "type": "inline"
+      },
+      "threat_model": "file"
+    }
+  ],
+  "transforms": [],
+  "version": 1
+}

@@ -67,6 +67,7 @@ CREATE TABLE resolution_sites (
   -- foreign key, so the foreign-key variant leaves this column unconstrained.
   owner           INTEGER,
   receiver_origin INTEGER,            -- NULL unless a callable reference
+  prefix          INTEGER,            -- reference prefix, -1 none, NULL unpublished
   PRIMARY KEY(blob_id, site)
 --+fk   , FOREIGN KEY(blob_id, semantic) REFERENCES resolution_semantics(blob_id, semantic_key) DEFERRABLE INITIALLY DEFERRED
 --+fk   , FOREIGN KEY(blob_id, node) REFERENCES resolution_nodes(blob_id, node_key) DEFERRABLE INITIALLY DEFERRED

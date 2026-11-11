@@ -11,15 +11,17 @@ use crate::analyzer::semantic::partial_flow::{
     HeapSelector, PartialFlow, PartialFlowOutcome, PartialFlowPort, PortId, ProcedurePartialFlows,
 };
 use crate::analyzer::semantic::{
-    AccessPathTail, CallSiteId, EvidenceCompleteness, MemoryLocationId, OracleCallContext,
-    ProcedureHandle, ProofStatus, SemanticBudget, SemanticCallSite, SemanticRequest,
-    ValueFlowOracle, ValueFlowRelation, ValueFlowSnapshot,
+    AbstractObject, AbstractObjectIdentity, AccessPathTail, CallSiteId, CandidateCoverage,
+    EvidenceCompleteness, MemoryLocationId, ObjectCardinality, OracleCallContext, ProcedureHandle,
+    ProofStatus, SemanticBudget, SemanticCallSite, SemanticRequest, ValueFlowOracle,
+    ValueFlowRelation, ValueFlowSnapshot,
 };
 use crate::analyzer::{AnalyzerConfig, Language};
 use crate::cancellation::CancellationToken;
 use crate::dataflow::{SemanticInputStatus, SolverTermination, UnmodeledCallBehavior};
 use crate::hash::HashMap;
 use crate::inline_project::InlineTestProject;
+use crate::taint::output_product::{OutputProductError, OutputReportRow};
 use crate::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintClassSet, TaintEdgeFunction,
     TaintFindingReport, TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintUniverse,
@@ -328,7 +330,21 @@ struct FakeGraph {
     store_links: HashMap<(DurableProcedureKey, PartialFlowPort), StoreChannelLinks>,
 
     interior: HashMap<DurableProcedureKey, Vec<(InteriorSeed, FakeTarget)>>,
+    interior_completeness: HashMap<DurableProcedureKey, Completeness>,
+    /// Interiors whose witness runs fail with this completeness, while the
+    /// search's runs without witnesses still answer.
+    witness_run_failures: HashMap<DurableProcedureKey, Completeness>,
+    /// When set, witness runs after the first `n` fail with this completeness,
+    /// so a later report pass fails where the main one answered.
+    witness_runs_before_failure: Option<(usize, Completeness)>,
+    witness_runs_made: std::cell::Cell<usize>,
+    openness: HashMap<DurableProcedureKey, Openness>,
+    uncertain_interior: bool,
     dispatches: HashMap<DurableCallSiteKey, Dispatch>,
+    object_predecessors: Vec<(ObjectAnchorSite, PartialFlowPort, TaintEdgeFunction)>,
+    certified_object_port: Option<PartialFlowPort>,
+    selected_origin_target: Option<crate::analyzer::semantic::UnmaterializedExternalTarget>,
+    handoffs: HashMap<DurableCallSiteKey, Vec<CallHandoff<TaintEdgeFunction>>>,
     callers: HashMap<DurableProcedureKey, Callers>,
     parents: HashMap<DurableProcedureKey, DurableProcedureKey>,
     models: HashMap<DurableCallSiteKey, CallModel>,
@@ -345,11 +361,11 @@ struct FakeGraph {
 }
 
 fn partial_flows(ports: &[PartialFlowPort], flows: &[(usize, usize)]) -> ProcedurePartialFlows {
-    ProcedurePartialFlows {
-        outcome: PartialFlowOutcome::Complete,
-        detail: None,
-        ports: ports.to_vec(),
-        flows: flows
+    ProcedurePartialFlows::new(
+        PartialFlowOutcome::Complete,
+        None,
+        ports.to_vec(),
+        flows
             .iter()
             .map(|&(from, to)| PartialFlow {
                 from: PortId::try_from_index(from).expect("port id"),
@@ -358,10 +374,10 @@ fn partial_flows(ports: &[PartialFlowPort], flows: &[(usize, usize)]) -> Procedu
                 crossed: vec![Box::default()].into_boxed_slice(),
             })
             .collect(),
-        open: false,
-        relations_complete: true,
-        discharged_gaps: Vec::new(),
-    }
+        false,
+        true,
+        Vec::new(),
+    )
 }
 
 impl FakeGraph {
@@ -409,6 +425,7 @@ impl FakeGraph {
                 candidates,
                 completeness,
                 continuation: HopQuality::CERTAIN,
+                external_body_unavailable: None,
             },
         );
     }
@@ -418,6 +435,68 @@ impl CompositionProvider for FakeGraph {
     type Error = String;
     type Fact = TaintClassSet;
     type Function = TaintEdgeFunction;
+
+    fn object_relation(
+        &self,
+        _procedure: &DurableProcedureKey,
+        at: &Endpoint,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<ObjectRelation<Self::Fact, Self::Function>, Self::Error> {
+        let Endpoint::Object(anchor) = at else {
+            return Ok(ObjectRelation::none());
+        };
+        Ok(ObjectRelation {
+            sources: Vec::new(),
+            predecessors: self
+                .object_predecessors
+                .iter()
+                .filter(|(site, _, _)| site == &anchor.site)
+                .map(|(_, port, function)| ObjectPredecessor {
+                    from: Endpoint::Port(port.clone()),
+                    function: function.clone(),
+                    quality: HopQuality::CERTAIN,
+                })
+                .collect(),
+            complete: true,
+            cross_call: true,
+        })
+    }
+
+    fn certified_object_origin(
+        &self,
+        _root: &ObjectAnchor,
+        _call: &DurableCallSiteKey,
+        port: &PartialFlowPort,
+        gap: &ExternalBodyUnavailableGap,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<Option<()>, Self::Error> {
+        Ok((self.certified_object_port.as_ref() == Some(port)
+            && self
+                .selected_origin_target
+                .as_ref()
+                .is_some_and(|target| gap.matches_origin_target(target)))
+        .then_some(()))
+    }
+
+    fn call_handoffs(
+        &self,
+        call: &DurableCallSiteKey,
+        _candidate: &DispatchCandidate,
+        exit: CallHandoffExit,
+        _request: &mut SemanticRequest<'_>,
+    ) -> Result<CallHandoffInventory<Self::Function>, Self::Error> {
+        Ok(CallHandoffInventory {
+            handoffs: self
+                .handoffs
+                .get(call)
+                .into_iter()
+                .flatten()
+                .filter(|handoff| handoff.binding.exit == exit)
+                .cloned()
+                .collect(),
+            complete: false,
+        })
+    }
 
     fn store_writes(&self) -> Vec<StoreWriteObservation> {
         self.store_writes.clone()
@@ -525,6 +604,24 @@ impl CompositionProvider for FakeGraph {
         _request: &mut SemanticRequest<'_>,
     ) -> Result<InteriorFlows, Self::Error> {
         let handle = self.handles[procedure].clone();
+        if witnesses && let Some(failure) = self.witness_run_failures.get(procedure) {
+            return Ok(InteriorFlows {
+                procedure: handle,
+                flows: Vec::new(),
+                completeness: failure.clone(),
+            });
+        }
+        if witnesses && let Some((answered, failure)) = &self.witness_runs_before_failure {
+            let made = self.witness_runs_made.get();
+            self.witness_runs_made.set(made + 1);
+            if made >= *answered {
+                return Ok(InteriorFlows {
+                    procedure: handle,
+                    flows: Vec::new(),
+                    completeness: failure.clone(),
+                });
+            }
+        }
         let entry = handle.semantics().entry_point();
         let mut flows = Vec::new();
         for (seed, target) in self.interior.get(procedure).into_iter().flatten() {
@@ -555,7 +652,7 @@ impl CompositionProvider for FakeGraph {
             flows.push(InteriorFlow {
                 seed,
                 target,
-                uncertain: false,
+                uncertain: self.uncertain_interior,
                 crossed: vec![if self.filtering.get() {
                     self.filtered_crossed
                         .get(procedure)
@@ -586,7 +683,11 @@ impl CompositionProvider for FakeGraph {
         Ok(InteriorFlows {
             procedure: handle,
             flows,
-            completeness: Completeness::Complete,
+            completeness: self
+                .interior_completeness
+                .get(procedure)
+                .cloned()
+                .unwrap_or(Completeness::Complete),
         })
     }
 
@@ -594,13 +695,15 @@ impl CompositionProvider for FakeGraph {
         &self,
         call: &DurableCallSiteKey,
         _request: &mut SemanticRequest<'_>,
-    ) -> Result<Dispatch, Self::Error> {
+    ) -> Result<(Dispatch, Option<CallModel>), Self::Error> {
         self.proof_reads.borrow_mut().push(call.clone());
-        Ok(self.dispatches.get(call).cloned().unwrap_or(Dispatch {
+        let dispatch = self.dispatches.get(call).cloned().unwrap_or(Dispatch {
             candidates: Vec::new(),
             completeness: Completeness::Complete,
             continuation: HopQuality::CERTAIN,
-        }))
+            external_body_unavailable: None,
+        });
+        Ok((dispatch, self.models.get(call).cloned()))
     }
 
     fn callers(
@@ -620,10 +723,6 @@ impl CompositionProvider for FakeGraph {
         _request: &mut SemanticRequest<'_>,
     ) -> Result<Option<DurableProcedureKey>, Self::Error> {
         Ok(self.parents.get(procedure).cloned())
-    }
-
-    fn model(&self, call: &DurableCallSiteKey) -> Option<CallModel> {
-        self.models.get(call).cloned()
     }
 
     fn authored_models(&self) -> Vec<Box<[AuthoredArmClosure]>> {
@@ -650,10 +749,14 @@ impl CompositionProvider for FakeGraph {
 
     fn openness(
         &self,
-        _procedure: &DurableProcedureKey,
+        procedure: &DurableProcedureKey,
         _request: &mut SemanticRequest<'_>,
     ) -> Result<Openness, Self::Error> {
-        Ok(Openness::Closed)
+        Ok(self
+            .openness
+            .get(procedure)
+            .cloned()
+            .unwrap_or(Openness::Closed))
     }
 
     fn endpoints(
@@ -724,6 +827,7 @@ fn parameter(ordinal: u32) -> PartialFlowPort {
 fn plain_candidate(procedure: &ProcedureHandle, call: CallSiteId) -> DispatchCandidate {
     DispatchCandidate {
         procedure: procedure.durable_key(),
+        written_heap_ports: None,
         arguments: vec![(argument(call, 0), parameter(0))].into_boxed_slice(),
         writeback: Box::default(),
         returns: vec![(PartialFlowPort::NormalReturn, result(call))].into_boxed_slice(),
@@ -736,6 +840,186 @@ fn assert_single_alpha_finding(plan: &TaintAnalysisPlan, report: &TaintFindingRe
     let finding = &report.findings()[0];
     assert_eq!(finding.classes(), &classes(plan, &["alpha"]));
     assert_eq!(finding.origins().origins().len(), 1);
+}
+
+#[test]
+#[hardwon("#8896: older Output rows could bypass the typed modeled-receiver payload contract")]
+fn output_product_round_trips_two_origins_and_a_witness() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin", "target"], &["target"], None);
+    let target = &fixture.procedures["target"];
+    let mut graph = callee_return_graph(&fixture, &plan, Completeness::Complete);
+    graph.interior(
+        target,
+        seed_of_source(&plan, target),
+        sink_in(&plan, target),
+    );
+    let report = compose(&plan, &graph, BUDGET).report;
+    assert_eq!(report.findings().len(), 1, "{report:#?}");
+    let finding = &report.findings()[0];
+    assert_eq!(finding.origins().evidence().len(), 2, "{finding:#?}");
+    assert!(
+        finding
+            .origins()
+            .evidence()
+            .iter()
+            .flat_map(|origin| origin.witnesses())
+            .any(|witness| !witness.steps().is_empty())
+    );
+    let encoded = OutputReportRow::encode(&plan, finding.key().sink().site(), &report)
+        .expect("encode complete composed report");
+    let decoded = OutputReportRow::decode_for_plan(&plan, encoded.clone())
+        .expect("decode output product for its compile");
+    assert!(
+        !decoded.report_evidence_complete(),
+        "missing witness evidence stays open"
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    assert_eq!(encoded["version"], 8);
+    let mut empty = encoded.clone();
+    empty["findings"] = serde_json::json!([]);
+    empty["witnesses"] = serde_json::json!([]);
+    empty["retained_witnesses"] = 0.into();
+    empty["retained_witness_steps"] = 0.into();
+    assert!(OutputReportRow::decode(empty.clone()).is_ok());
+    // The version is an exact fence: the previous version 6 is rejected too.
+    for old_version in [1, 2, 3, 4, 5, 6] {
+        let mut old = encoded.clone();
+        old["version"] = old_version.into();
+        assert_eq!(
+            OutputReportRow::decode(old).unwrap_err(),
+            OutputProductError::Corrupt
+        );
+
+        let mut old_empty = empty.clone();
+        old_empty["version"] = old_version.into();
+        assert_eq!(
+            OutputReportRow::decode(old_empty).unwrap_err(),
+            OutputProductError::Corrupt
+        );
+    }
+
+    assert!(encoded["findings"][0].get("model_receipt").is_none());
+    let receipt = crate::model_attribution::model_receipt_from_full(
+        vec![crate::model_attribution::ModelContributor {
+            role: crate::model_attribution::ModelContributorRole::Summary,
+            pack_digest: "a".repeat(64),
+            record_id: "selected-summary".into(),
+            built_from: "0.4.23".into(),
+            resolved: "0.4.25".into(),
+            direction: "older_artifact".into(),
+            mismatch_kinds: vec!["version_nearby".into()],
+            selection_rule_id: "cargo-compatible-nearest".into(),
+            selection_rule_version: 1,
+        }],
+        crate::model_attribution::SUMMARY_RECEIPT_CAP,
+    );
+    let mut attributed = encoded.clone();
+    attributed["findings"][0]["model_receipt"] = serde_json::to_value(&receipt).unwrap();
+    let replayed = OutputReportRow::decode_for_plan(&plan, attributed.clone())
+        .expect("persisted attributed output row replays");
+    assert_eq!(replayed.findings[0].model_receipt.as_ref(), Some(&receipt));
+    assert_eq!(serde_json::to_value(replayed).unwrap(), attributed);
+    for (built, resolved, direction) in [
+        ("invalid", "0.4.25", "older_artifact"),
+        ("0.4.23", "invalid", "older_artifact"),
+        ("0.4.23", "0.4.25", "newer_artifact"),
+        ("0.4.25", "0.4.23", "older_artifact"),
+        ("0.4.23", "0.4.23", "older_artifact"),
+    ] {
+        let mut malformed = attributed.clone();
+        let contributor = &mut malformed["findings"][0]["model_receipt"]["contributors"][0];
+        contributor["built_from"] = built.into();
+        contributor["resolved"] = resolved.into();
+        contributor["direction"] = direction.into();
+        assert_eq!(
+            OutputReportRow::decode(malformed).unwrap_err(),
+            OutputProductError::Corrupt
+        );
+    }
+
+    let mut modeled = encoded.clone();
+    let call = modeled["anchor"].clone();
+    let mut operand = call.clone();
+    let start = operand["anchor"]["start"]["byte_offset"].as_u64().unwrap();
+    let column = operand["anchor"]["start"]["byte_column"].as_u64().unwrap();
+    operand["anchor"]["start"]["byte_offset"] = (start + 1).into();
+    operand["anchor"]["start"]["byte_column"] = (column + 1).into();
+    let step = &mut modeled["witnesses"][0]["steps"][0];
+    step["kind"] = "edge:modeled_receiver".into();
+    step["origin"] = call.clone();
+    step["typed"] = serde_json::json!({"ModeledReceiver": {"operand": operand}});
+    let modeled_row = OutputReportRow::decode(modeled.clone()).expect("modeled receiver codec");
+    let modeled_again = serde_json::to_value(modeled_row).unwrap();
+    assert_eq!(modeled_again["witnesses"][0]["steps"][0]["origin"], call);
+    assert_eq!(
+        modeled_again["witnesses"][0]["steps"][0]["typed"]["ModeledReceiver"]["operand"],
+        operand
+    );
+    let mut missing_typed = modeled.clone();
+    missing_typed["witnesses"][0]["steps"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("typed");
+    assert_eq!(
+        OutputReportRow::decode(missing_typed).unwrap_err(),
+        OutputProductError::Corrupt
+    );
+    let mut mismatched = modeled.clone();
+    mismatched["witnesses"][0]["steps"][0]["typed"] = "None".into();
+    assert_eq!(
+        OutputReportRow::decode(mismatched).unwrap_err(),
+        OutputProductError::Corrupt
+    );
+    let mut wrong_call = modeled;
+    wrong_call["witnesses"][0]["steps"][0]["origin"] = serde_json::Value::Null;
+    assert_eq!(
+        OutputReportRow::decode(wrong_call).unwrap_err(),
+        OutputProductError::Corrupt
+    );
+
+    let mut remounted = encoded.clone();
+    let stored_mount = serde_json::to_value(crate::analyzer::semantic::StableDigest::sha256(
+        b"stored output report mount",
+    ))
+    .unwrap();
+    let mut pending = vec![&mut remounted];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(mount) = fields.get_mut("mount") {
+                    *mount = stored_mount.clone();
+                }
+                pending.extend(fields.values_mut());
+            }
+            serde_json::Value::Array(values) => pending.extend(values.iter_mut()),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        OutputReportRow::decode_for_plan(&plan, remounted).unwrap(),
+        OutputReportRow::decode(encoded.clone()).unwrap()
+    );
+    let mut corrupt = encoded.clone();
+    let origins = corrupt["findings"][0]["origins"].as_array_mut().unwrap();
+    let witness = origins
+        .iter_mut()
+        .find(|origin| !origin["witness_paths"].as_array().unwrap().is_empty())
+        .expect("at least one retained witness");
+    witness["witness_paths"][0] = serde_json::json!(usize::MAX);
+    assert!(OutputReportRow::decode(corrupt).is_err());
+    let (_, source) = plan.value_flow().sources().next().expect("a bound source");
+    let key = source
+        .carrier()
+        .stable_key()
+        .expect("stable source carrier");
+    let row = super::super::output_product::OutputCarrierRow::encode(&key);
+    assert_eq!(row.decode_key().expect("decode stable carrier"), key);
+    let source_event = super::super::output_product::OutputEventRow::encode(source.key());
+    assert_eq!(
+        source_event.decode_key().expect("decode stable event"),
+        source.key().clone()
+    );
 }
 
 /// `origin`'s source returns into `target`'s sink through call 40.
@@ -769,6 +1053,31 @@ fn callee_return_graph(
 }
 
 #[test]
+fn later_content_gap_keeps_an_earlier_operational_stop() {
+    let stopped = Completeness::operational(
+        OperationalCause::Budget(BudgetLane::Semantic),
+        "semantic budget stopped",
+    );
+    let combined =
+        Completeness::content("later content gap").preserving_operational_cause(&stopped);
+    assert_eq!(
+        combined,
+        Completeness::operational(
+            OperationalCause::Budget(BudgetLane::Semantic),
+            "later content gap",
+        )
+    );
+    assert_eq!(
+        Completeness::operational(OperationalCause::Provider, "later unknown gap")
+            .preserving_operational_cause(&stopped),
+        Completeness::operational(
+            OperationalCause::Budget(BudgetLane::Semantic),
+            "later unknown gap",
+        )
+    );
+}
+
+#[test]
 fn a_source_reaches_a_sink_in_the_same_procedure() {
     let fixture = fixture();
     let plan = fixture.plan(&["target"], &["target"], None);
@@ -787,9 +1096,7 @@ fn a_source_reaches_a_sink_in_the_same_procedure() {
         target,
         unrelated,
         vec![plain_candidate(&fixture.procedures["other"], unrelated)],
-        Completeness::Incomplete {
-            reason: "open dispatch".into(),
-        },
+        Completeness::content("open dispatch"),
     );
     let ComposeOutcome {
         report,
@@ -802,6 +1109,169 @@ fn a_source_reaches_a_sink_in_the_same_procedure() {
     assert!(finding.is_proven() && finding.is_complete() && report.is_complete());
     assert_eq!(finding.origins().evidence()[0].witnesses().len(), 1);
     assert!(finding.origins().is_complete());
+}
+
+#[test]
+#[hardwon("#9947: a witness run's provider failure was typed as answer content")]
+fn a_failed_witness_run_reports_its_cause() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["target"], &["target"], None);
+    let target = &fixture.procedures["target"];
+    let mut graph = FakeGraph::new(&fixture);
+    graph.interior(
+        target,
+        seed_of_source(&plan, target),
+        sink_in(&plan, target),
+    );
+    let failure = Completeness::operational(
+        OperationalCause::Provider,
+        "the procedure's value-flow snapshot is unavailable",
+    );
+    graph
+        .witness_run_failures
+        .insert(target.durable_key(), failure);
+    let ComposeOutcome {
+        report,
+        incompleteness,
+        finding_incompleteness,
+        ..
+    } = compose(&plan, &graph, BUDGET);
+    assert!(incompleteness.is_empty(), "{incompleteness:#?}");
+    assert_single_alpha_finding(&plan, &report);
+    assert!(report.findings()[0].origins().witness_unavailable());
+    assert_eq!(
+        finding_incompleteness,
+        vec![Incompleteness::Interior {
+            procedure: target.durable_key(),
+            reason: "the procedure's value-flow snapshot is unavailable".into(),
+            cause: IncompleteCause::Operational(OperationalCause::Provider),
+        }]
+    );
+}
+
+#[test]
+#[hardwon("#9947: a budget-exceeded snapshot loss was typed Provider and skipped the cold loop")]
+fn a_lost_snapshot_keeps_its_budget_or_cancellation_cause() {
+    // The slice fallback takes the full cold loop only on a Budget cause.
+    let fixture = fixture();
+    let target = &fixture.procedures["target"];
+    let cause = |status| match crate::composition::unavailable_snapshot_interior(
+        target.clone(),
+        status,
+        "lost",
+    )
+    .completeness
+    {
+        Completeness::Incomplete { cause, .. } => cause,
+        Completeness::Complete => panic!("a lost snapshot leaves its interior incomplete"),
+    };
+    assert_eq!(
+        cause(SemanticInputStatus::ExceededBudget {
+            exceeded: crate::test_support::procedure_budget_error(2, 3),
+        }),
+        IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic))
+    );
+    assert_eq!(
+        cause(SemanticInputStatus::Cancelled),
+        IncompleteCause::Operational(OperationalCause::Cancelled)
+    );
+    assert_eq!(
+        cause(SemanticInputStatus::Unknown),
+        IncompleteCause::Operational(OperationalCause::Provider)
+    );
+}
+
+#[test]
+fn report_dispatches_a_sink_call_not_seen_by_search() {
+    let fixture = fixture();
+    let caller = &fixture.procedures["caller"];
+    let call = fixture.helper_call();
+    let source = &fixture.first_relation["caller"];
+    let source_spec = ValueFlowSourceSpec::new(
+        ValueFlowEventKey::at_point(source.point(), 0, ValueFlowEventKind::Source)
+            .expect("source key"),
+        source.point().clone(),
+        ValueFlowObservationPhase::BeforeEffects,
+        ValueFlowCarrier::from(&source.source),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let sink_point = caller.point_handle(call.point).expect("call point");
+    let sink_carrier = ValueFlowCarrier::Value(
+        caller
+            .value_handle(call.result.expect("call result"))
+            .expect("result value"),
+    );
+    let sink_spec = ValueFlowSinkSpec::new(
+        ValueFlowEventKey::at_point(&sink_point, 0, ValueFlowEventKind::Sink).expect("sink key"),
+        sink_point,
+        ValueFlowObservationPhase::AfterEffects,
+        sink_carrier,
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+    );
+    let value_flow = ValueFlowPlan::try_new(
+        caller.clone(),
+        fixture.inputs.clone(),
+        Vec::new(),
+        vec![source_spec],
+        vec![sink_spec],
+    )
+    .expect("plan");
+    let universe = TaintUniverse::new(vec![class("alpha")]).expect("universe");
+    let alpha = universe.class_set([&class("alpha")]).expect("class");
+    let source_id = value_flow.sources().next().expect("source").0;
+    let source_key = value_flow
+        .source(source_id)
+        .expect("source spec")
+        .key()
+        .clone();
+    let sink_id = value_flow.sinks().next().expect("sink").0;
+    let plan = TaintAnalysisPlan::new(
+        value_flow,
+        universe,
+        vec![TaintSourceBinding::new(
+            source_id,
+            alpha.clone(),
+            SourceEventKey::new(source_key),
+        )],
+        vec![TaintSinkBinding::new(sink_id, alpha)],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("taint plan");
+    let mut graph = FakeGraph::new(&fixture);
+    graph.uncertain_interior = true;
+    graph.interior(
+        caller,
+        seed_of_source(&plan, caller),
+        sink_in(&plan, caller),
+    );
+    graph.models.insert(
+        (caller.durable_key(), call.id),
+        CallModel {
+            summary: None,
+            summary_target: None,
+            transfers: Vec::new(),
+            writeback: Box::default(),
+            receiver_reads: Box::default(),
+            proven: true,
+            completeness: Completeness::Complete,
+            retains_dispatch: false,
+            authored: Some(Box::default()),
+        },
+    );
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert_single_alpha_finding(&plan, &outcome.report);
+    assert_eq!(
+        graph.proof_reads.borrow().as_slice(),
+        &[(caller.durable_key(), call.id)],
+        "the report must dispatch the sink call that search did not encounter"
+    );
+    assert!(matches!(
+        outcome.finding_incompleteness.as_slice(),
+        [Incompleteness::Model { call: modeled, .. }] if modeled == &(caller.durable_key(), call.id)
+    ));
 }
 
 #[test]
@@ -833,6 +1303,8 @@ fn a_store_read_wakes_only_after_a_source_reaches_a_linked_write() {
                 write: 0,
                 write_call: (origin.durable_key(), CallSiteId::new(77)),
                 read_call: (caller.durable_key(), call),
+                write_site: plan.sources()[0].origin().value_flow_key().site().clone(),
+                read_site: plan.sources()[0].origin().value_flow_key().site().clone(),
                 read_origin: plan.sources()[0].origin().clone(),
                 read_phase: ValueFlowObservationPhase::AfterEffects,
                 read_carrier: ValueFlowCarrier::from(&relation.target),
@@ -930,6 +1402,76 @@ fn a_source_in_a_caller_is_passed_as_an_argument() {
     } = compose(&plan, &graph, BUDGET);
     assert!(incompleteness.is_empty(), "{incompleteness:#?}");
     assert_single_alpha_finding(&plan, &report);
+}
+
+#[test]
+fn object_handoff_requires_exact_continuity_and_unique_dispatch() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["caller"], &["caller"], None);
+    let caller = &fixture.procedures["caller"];
+    let helper = &fixture.procedures["helper"];
+    let call = fixture.helper_call().id;
+    let call_key = (caller.durable_key(), call);
+    let mut graph = FakeGraph::new(&fixture);
+    graph.stored(caller, &[argument(call, 0), result(call)], &[]);
+    graph.interior(
+        caller,
+        seed_of_source(&plan, caller),
+        FakeTarget::Port(argument(call, 0)),
+    );
+    graph.interior(
+        caller,
+        InteriorSeed::Port(result(call)),
+        sink_in(&plan, caller),
+    );
+    let mut candidate = plain_candidate(helper, call);
+    candidate.returns = Box::default();
+    graph.route(caller, call, vec![candidate], Completeness::Complete);
+    graph.handoffs.insert(
+        call_key,
+        vec![CallHandoff {
+            binding: CallHandoffBinding {
+                argument_index: 0,
+                exit: CallHandoffExit::Normal,
+                continuity: CallObjectContinuity::Reference,
+                quality: HopQuality::CERTAIN,
+            },
+            function: TaintEdgeFunction::identity(plan.universe()),
+        }],
+    );
+
+    let run = |graph: &FakeGraph| {
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        search::search_pairs(
+            taint_query(&plan),
+            graph,
+            BUDGET,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("object handoff search")
+    };
+    let certain = run(&graph);
+    let [pair] = certain.pairs.as_slice() else {
+        panic!("expected one object path: {:#?}", certain.pairs);
+    };
+    assert!(pair.paths.iter().any(|(hops, quality)| {
+        quality.is_certain()
+            && hops
+                .iter()
+                .any(|hop| matches!(hop, Hop::CallHandoff { .. }))
+    }));
+
+    graph.handoffs.values_mut().next().expect("one call")[0]
+        .binding
+        .continuity = CallObjectContinuity::Unknown;
+    let uncertain = run(&graph);
+    assert!(
+        uncertain.pairs[0]
+            .paths
+            .iter()
+            .all(|(_, quality)| !quality.is_certain())
+    );
 }
 
 /// A value passed to a helper by one caller does not return from that
@@ -1149,6 +1691,7 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
         call,
         vec![DispatchCandidate {
             procedure: modeled.durable_key(),
+            written_heap_ports: None,
             arguments: vec![(receiver.clone(), PartialFlowPort::Receiver)].into_boxed_slice(),
             writeback: Box::default(),
             returns: vec![(PartialFlowPort::NormalReturn, result(call))].into_boxed_slice(),
@@ -1159,12 +1702,20 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
     graph.models.insert(
         (target.durable_key(), call),
         CallModel {
+            summary: None,
+            summary_target: None,
             transfers: vec![ModelTransfer {
                 actual: receiver.clone(),
+                output: result(call),
                 function: TaintEdgeFunction::identity(plan.universe()),
+                proven: true,
+                unresolved_output_storage: false,
             }],
+            writeback: Box::default(),
+            receiver_reads: Box::default(),
             proven: true,
             completeness: Completeness::Complete,
+            retains_dispatch: false,
             authored: None,
         },
     );
@@ -1187,8 +1738,7 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
     assert!(outcome.incompleteness.is_empty());
     assert!(outcome.report.is_proven_by_authored_summaries());
     assert!(!outcome.report.findings()[0].is_complete());
-    let [Incompleteness::Dispatch { call: retained, .. }] =
-        outcome.finding_incompleteness.as_slice()
+    let [Incompleteness::Model { call: retained, .. }] = outcome.finding_incompleteness.as_slice()
     else {
         panic!(
             "one external finding cause: {:?}",
@@ -1196,6 +1746,28 @@ fn a_model_replaces_the_callee_with_a_receiver_to_result_transfer() {
         );
     };
     assert_eq!(retained, &(target.durable_key(), call));
+    for cause in [
+        IncompleteCause::Content,
+        IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+    ] {
+        let model = graph.models.get_mut(&(target.durable_key(), call)).unwrap();
+        model.authored = None;
+        model.completeness = match cause {
+            IncompleteCause::Content => Completeness::content("model open"),
+            IncompleteCause::Operational(operational) => {
+                Completeness::operational(operational, "model open")
+            }
+        };
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert!(
+            outcome.incompleteness.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::Model { cause: actual, .. } if *actual == cause
+            )),
+            "{:#?}",
+            outcome.incompleteness
+        );
+    }
 }
 
 /// Two findings in one batch. The sink in `target` is reached through a call
@@ -1237,9 +1809,7 @@ fn each_finding_is_complete_only_when_its_own_path_is() {
         other,
         open_call,
         vec![plain_candidate(origin, open_call)],
-        Completeness::Incomplete {
-            reason: "open dispatch".into(),
-        },
+        Completeness::content("open dispatch"),
     );
     graph.interior(
         origin,
@@ -1281,13 +1851,7 @@ fn each_finding_is_complete_only_when_its_own_path_is() {
 fn an_uncertain_dispatch_marks_the_finding_incomplete() {
     let fixture = fixture();
     let plan = fixture.plan(&["origin"], &["target"], None);
-    let graph = callee_return_graph(
-        &fixture,
-        &plan,
-        Completeness::Incomplete {
-            reason: "open dispatch".into(),
-        },
-    );
+    let graph = callee_return_graph(&fixture, &plan, Completeness::content("open dispatch"));
     let ComposeOutcome {
         report,
         incompleteness,
@@ -1296,7 +1860,8 @@ fn an_uncertain_dispatch_marks_the_finding_incomplete() {
     assert!(
         matches!(
             incompleteness.as_slice(),
-            [Incompleteness::Dispatch { reason, .. }] if reason.as_ref() == "open dispatch"
+            [Incompleteness::Dispatch { reason, cause, ..}]
+                if reason.as_ref() == "open dispatch" && *cause == IncompleteCause::Content
         ),
         "{incompleteness:#?}"
     );
@@ -1307,7 +1872,361 @@ fn an_uncertain_dispatch_marks_the_finding_incomplete() {
 }
 
 #[test]
-fn a_closure_capture_carries_the_parent_source() {
+fn endpoint_inventory_retains_content_and_operational_causes() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["target"], &["target"], None);
+    let target = &fixture.procedures["target"];
+    for cause in [
+        IncompleteCause::Content,
+        IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+    ] {
+        let mut graph = FakeGraph::new(&fixture);
+        graph.interior(
+            target,
+            seed_of_source(&plan, target),
+            sink_in(&plan, target),
+        );
+        let mut endpoints = ProcedureEndpoints::none();
+        endpoints.completeness = match cause {
+            IncompleteCause::Content => Completeness::content("endpoint inventory open"),
+            IncompleteCause::Operational(operational) => {
+                Completeness::operational(operational, "endpoint inventory open")
+            }
+        };
+        graph.endpoints.insert(target.durable_key(), endpoints);
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert!(
+            outcome.incompleteness.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::Endpoints { cause: actual, .. } if *actual == cause
+            )),
+            "{:#?}",
+            outcome.incompleteness
+        );
+    }
+}
+
+#[test]
+fn caller_inventory_retains_content_and_operational_causes() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["target"], None);
+    let target = &fixture.procedures["target"];
+    let origin = &fixture.procedures["origin"];
+    let call = CallSiteId::new(41);
+    for cause in [
+        IncompleteCause::Content,
+        IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::CallersPerProcedure)),
+    ] {
+        let mut graph = FakeGraph::new(&fixture);
+        graph.stored(target, &[parameter(0)], &[]);
+        graph.interior(
+            target,
+            InteriorSeed::Port(parameter(0)),
+            sink_in(&plan, target),
+        );
+        graph.callers.insert(
+            target.durable_key(),
+            Callers {
+                calls: vec![(origin.durable_key(), call)],
+                completeness: match cause {
+                    IncompleteCause::Content => Completeness::content("caller inventory open"),
+                    IncompleteCause::Operational(operational) => {
+                        Completeness::operational(operational, "caller inventory open")
+                    }
+                },
+            },
+        );
+        graph.route(
+            origin,
+            call,
+            vec![plain_candidate(target, call)],
+            Completeness::Complete,
+        );
+        graph.interior(
+            origin,
+            seed_of_source(&plan, origin),
+            FakeTarget::Port(argument(call, 0)),
+        );
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert!(
+            outcome.incompleteness.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::Callers { cause: actual, .. } if *actual == cause
+            )),
+            "{:#?}",
+            outcome.incompleteness
+        );
+    }
+}
+
+#[test]
+fn interior_run_retains_content_and_operational_causes() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["target"], &["target"], None);
+    let target = &fixture.procedures["target"];
+    for cause in [
+        IncompleteCause::Content,
+        IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+    ] {
+        let mut graph = FakeGraph::new(&fixture);
+        graph.interior(
+            target,
+            seed_of_source(&plan, target),
+            sink_in(&plan, target),
+        );
+        graph.interior_completeness.insert(
+            target.durable_key(),
+            match cause {
+                IncompleteCause::Content => Completeness::content("interior open"),
+                IncompleteCause::Operational(operational) => {
+                    Completeness::operational(operational, "interior open")
+                }
+            },
+        );
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert!(
+            outcome.incompleteness.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::Interior { cause: actual, .. } if *actual == cause
+            )),
+            "{:#?}",
+            outcome.incompleteness
+        );
+    }
+}
+
+#[test]
+fn openness_retains_each_residual_cause() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["target"], &["target"], None);
+    let target = &fixture.procedures["target"];
+    let residual = (target.durable_key(), CallSiteId::new(40));
+    for cause in [
+        IncompleteCause::Content,
+        IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+    ] {
+        let mut graph = FakeGraph::new(&fixture);
+        graph.interior(
+            target,
+            seed_of_source(&plan, target),
+            sink_in(&plan, target),
+        );
+        graph.openness.insert(
+            target.durable_key(),
+            Openness::Open {
+                residual: vec![residual.clone()].into_boxed_slice(),
+                residual_causes: vec![cause].into_boxed_slice(),
+                cause,
+                blocked: None,
+                status: SemanticInputStatus::Complete,
+                reason: "residual call open".into(),
+            },
+        );
+        let outcome = compose(&plan, &graph, BUDGET);
+        assert!(
+            outcome.incompleteness.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::Open { cause: actual, residual_causes, .. }
+                    if *actual == cause && residual_causes.as_ref() == [cause]
+            )),
+            "{:#?}",
+            outcome.incompleteness
+        );
+    }
+}
+
+#[test]
+fn budget_limited_dispatch_retains_operational_cause() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["target"], None);
+    let graph = callee_return_graph(
+        &fixture,
+        &plan,
+        Completeness::operational(
+            OperationalCause::Budget(BudgetLane::Semantic),
+            "open dispatch",
+        ),
+    );
+    let outcome = compose(&plan, &graph, BUDGET);
+    assert_eq!(outcome.effective_budget, BUDGET);
+    assert!(
+        matches!(
+            outcome.incompleteness.as_slice(),
+            [Incompleteness::Dispatch {
+                cause: IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+                ..
+            }]
+        ),
+        "{:#?}",
+        outcome.incompleteness
+    );
+}
+
+#[test]
+fn a_certified_object_requires_the_same_s1_target_and_does_not_suppress_other_cached_uses() {
+    use crate::analyzer::semantic::{
+        CandidateCoverage, SemanticLanguage, UnmaterializedExternalTarget,
+    };
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["target"], None);
+    let caller = fixture.procedures["caller"].clone();
+    let call = fixture.helper_call().id;
+    let call_key = (caller.durable_key(), call);
+    let value = caller
+        .value_handle(caller.semantics().values()[0].id)
+        .expect("fixture value");
+    let object = AbstractObject::new(
+        AbstractObjectIdentity::Value(value),
+        ObjectCardinality::Unknown,
+    )
+    .expect("object root");
+    let root = |site| ObjectAnchor {
+        procedure: caller.durable_key(),
+        site,
+        role: ObjectAnchorRole::CurrentObject,
+        object: object.clone(),
+    };
+    for (sites, selected_owner, expected_dispatch) in [
+        (vec![ObjectAnchorSite::NormalExit], "toy.External", false),
+        (vec![ObjectAnchorSite::NormalExit], "toy.Other", true),
+        (
+            vec![
+                ObjectAnchorSite::NormalExit,
+                ObjectAnchorSite::ExceptionalExit,
+            ],
+            "toy.External",
+            true,
+        ),
+        (
+            vec![
+                ObjectAnchorSite::ExceptionalExit,
+                ObjectAnchorSite::NormalExit,
+            ],
+            "toy.External",
+            true,
+        ),
+    ] {
+        let mut graph = FakeGraph::new(&fixture);
+        graph.dispatches.insert(
+            call_key.clone(),
+            Dispatch {
+                candidates: Vec::new(),
+                completeness: Completeness::content("external body unavailable"),
+                continuation: HopQuality::UNCERTAIN,
+                external_body_unavailable: Some(ExternalBodyUnavailableGap {
+                    target: UnmaterializedExternalTarget::new_modeled(
+                        "toy.External",
+                        "open",
+                        SemanticLanguage::Standard(Language::Rust),
+                        0,
+                        false,
+                    )
+                    .expect("typed external target"),
+                    raw_coverage: CandidateCoverage::Exhaustive,
+                }),
+            },
+        );
+        let normal_port = result(call);
+        graph.object_predecessors = vec![
+            (
+                ObjectAnchorSite::NormalExit,
+                normal_port.clone(),
+                TaintEdgeFunction::identity(plan.universe()),
+            ),
+            (
+                ObjectAnchorSite::ExceptionalExit,
+                PartialFlowPort::CallThrown { call },
+                TaintEdgeFunction::identity(plan.universe()),
+            ),
+        ];
+        graph.certified_object_port = Some(normal_port);
+        // This stands for the selected S1 Fresh origin. The second case
+        // deliberately disagrees with the one typed dispatch boundary.
+        graph.selected_origin_target = Some(
+            UnmaterializedExternalTarget::new_modeled(
+                selected_owner,
+                "open",
+                SemanticLanguage::Standard(Language::Rust),
+                0,
+                false,
+            )
+            .expect("selected origin target"),
+        );
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let outcome = search_object_roots(
+            sites.iter().cloned().map(root).collect(),
+            super::labels::TaintLabels::new(plan.universe()),
+            &graph,
+            BUDGET,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("object search");
+        let has_dispatch_reason = outcome.incomplete.iter().any(|reason| {
+            matches!(reason, Incompleteness::Dispatch { call, reason, ..}
+                if call == &call_key && reason.as_ref() == "external body unavailable")
+        });
+        assert_eq!(
+            has_dispatch_reason, expected_dispatch,
+            "{sites:?}, {selected_owner}: {:?}",
+            outcome.incomplete
+        );
+        assert_eq!(
+            graph
+                .proof_reads
+                .borrow()
+                .iter()
+                .filter(|read| *read == &call_key)
+                .count(),
+            1,
+            "both items must consume one cached dispatch"
+        );
+        if selected_owner == "toy.Other" {
+            assert!(
+                outcome.incomplete.iter().any(|reason| matches!(
+                    reason,
+                    Incompleteness::Object {
+                        cause: IncompleteCause::Content,
+                        ..
+                    }
+                )),
+                "a mismatched selected origin must retain Object uncertainty: {:?}",
+                outcome.incomplete
+            );
+            graph.dispatches.get_mut(&call_key).unwrap().completeness = Completeness::operational(
+                OperationalCause::Budget(BudgetLane::Semantic),
+                "external body unavailable",
+            );
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            let stopped = search_object_roots(
+                sites.iter().cloned().map(root).collect(),
+                super::labels::TaintLabels::new(plan.universe()),
+                &graph,
+                BUDGET,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("object search with budgeted dispatch");
+            assert!(
+                stopped.incomplete.iter().any(|reason| matches!(
+                    reason,
+                    Incompleteness::Object {
+                        cause: IncompleteCause::Operational(OperationalCause::Budget(
+                            BudgetLane::Semantic
+                        )),
+                        ..
+                    }
+                )),
+                "{:?}",
+                stopped.incomplete
+            );
+        }
+    }
+}
+
+#[test]
+#[hardwon("#9196: lexical capture without an admitted invocation was reported complete")]
+fn a_closure_capture_without_invocation_is_uncertain() {
     let fixture = fixture();
     let plan = fixture.plan(&["origin"], &["target"], None);
     // `target` plays the closure and `origin` its lexical parent.
@@ -1340,8 +2259,15 @@ fn a_closure_capture_carries_the_parent_source() {
         incompleteness,
         ..
     } = compose(&plan, &graph, BUDGET);
-    assert!(incompleteness.is_empty(), "{incompleteness:#?}");
+    assert!(
+        incompleteness
+            .iter()
+            .any(|gap| matches!(gap, Incompleteness::Execution { .. })),
+        "{incompleteness:#?}"
+    );
     assert_single_alpha_finding(&plan, &report);
+    assert!(!report.findings()[0].is_complete());
+    assert!(!report.is_complete());
 }
 
 #[test]
@@ -1370,6 +2296,39 @@ fn an_exhausted_hop_budget_reports_an_incomplete_batch() {
         report.result().termination(),
         SolverTermination::ExceededBudget(_)
     ));
+}
+
+#[test]
+#[hardwon("#8386: a stopped ownership proof could be reported as Failed or Complete")]
+fn a_refused_semantic_proof_stops_composition_without_poisoning_the_next_query() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["origin"], &["target"], None);
+    let graph = callee_return_graph(&fixture, &plan, Completeness::Complete);
+    let cancellation = CancellationToken::default();
+    let mut semantic_budget = SemanticBudget::default();
+    let mut over_limit = semantic_budget.limits();
+    over_limit.events = over_limit.events.saturating_add(1);
+    assert!(semantic_budget.check_admission(over_limit).is_err());
+    let stopped = compose_taint_batch(
+        &plan,
+        &graph,
+        BUDGET,
+        &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+    )
+    .expect("budget refusal is a normal incomplete result");
+    assert!(!stopped.report.is_complete());
+    assert!(
+        stopped
+            .incompleteness
+            .contains(&Incompleteness::Budget(BudgetLane::Semantic))
+    );
+    let fresh = compose(&plan, &graph, BUDGET);
+    assert!(
+        fresh.incompleteness.is_empty(),
+        "{:#?}",
+        fresh.incompleteness
+    );
+    assert!(fresh.report.is_complete());
 }
 
 /// `show` logs a field of its parameter; `pair` lends a cell whose field
@@ -1477,9 +2436,7 @@ fn unmodeled_call_outcome(behavior: UnmodeledCallBehavior) -> (TaintAnalysisPlan
         target,
         call,
         Vec::new(),
-        Completeness::Incomplete {
-            reason: "open dispatch".into(),
-        },
+        Completeness::content("open dispatch"),
     );
     graph.fallbacks.insert(
         (target.durable_key(), call),
@@ -1493,7 +2450,7 @@ fn unmodeled_call_outcome(behavior: UnmodeledCallBehavior) -> (TaintAnalysisPlan
     assert!(
         matches!(
             outcome.incompleteness.as_slice(),
-            [Incompleteness::Dispatch { reason, .. }] if reason.as_ref() == "open dispatch"
+            [Incompleteness::Dispatch { reason, ..}] if reason.as_ref() == "open dispatch"
         ),
         "the open dispatch is the only reason under {behavior}: {:#?}",
         outcome.incompleteness
@@ -1656,7 +2613,8 @@ fn a_frontier_source_with_unknown_evidence_is_judged_when_it_reaches_a_sink() {
     assert_eq!(
         incompleteness,
         [Incompleteness::SourceEvidence {
-            point: source.point.clone()
+            point: source.point.clone(),
+            cause: IncompleteCause::Operational(OperationalCause::Provider),
         }]
     );
     let finding = &report.findings()[0];
@@ -1776,9 +2734,7 @@ fn barriers_refresh_a_surviving_edges_crossed_calls_and_drop_its_quality() {
         target,
         crossed,
         Vec::new(),
-        Completeness::Incomplete {
-            reason: "D is open".into(),
-        },
+        Completeness::content("D is open"),
     );
     graph
         .dispatches
@@ -1841,6 +2797,56 @@ fn barriers_note_only_undecided_witnesses_without_a_strict_alternative() {
         "projection receives strict alternatives for both concrete pairs"
     );
     assert!(!graph.strict_witnesses.borrow().is_empty());
+}
+
+#[test]
+#[hardwon("#9947: a lenient barrier witness run's failure was dropped from the finding causes")]
+fn a_failed_lenient_barrier_witness_run_reports_its_cause() {
+    let fixture = fixture();
+    let plan = fixture.plan(&["target", "other"], &["target", "other"], None);
+    let mut graph = FakeGraph::new(&fixture);
+    graph.barriers = true;
+    // No undecided check, so no strict witness run: the lenient pass is the
+    // only later pass over the main report's paths.
+    for name in ["target", "other"] {
+        let procedure = &fixture.procedures[name];
+        graph.interior(
+            procedure,
+            seed_of_source(&plan, procedure),
+            sink_in(&plan, procedure),
+        );
+    }
+    // The main report makes two witness runs per finding here, and the
+    // lenient pass runs after it; the assertion below checks the split.
+    graph.witness_runs_before_failure = Some((
+        4,
+        Completeness::operational(OperationalCause::Provider, "lenient run failed"),
+    ));
+    let ComposeOutcome {
+        report,
+        finding_incompleteness,
+        barrier_pairs,
+        ..
+    } = compose(&plan, &graph, BUDGET);
+    assert_eq!(report.findings().len(), 2);
+    assert!(
+        report
+            .findings()
+            .iter()
+            .all(|finding| !finding.origins().witness_unavailable()),
+        "the main report's witnesses answered"
+    );
+    assert!(!barrier_pairs.is_empty(), "the lenient pass ran");
+    assert!(
+        finding_incompleteness.iter().any(|reason| matches!(
+            reason,
+            Incompleteness::Interior {
+                cause: IncompleteCause::Operational(OperationalCause::Provider),
+                ..
+            }
+        )),
+        "{finding_incompleteness:#?}"
+    );
 }
 
 #[test]
@@ -1931,6 +2937,11 @@ impl ToyGraph {
             function,
             quality,
             timing,
+            instance: None,
+            context: crate::analyzer::semantic::DurableCallContext::of(
+                &crate::analyzer::semantic::OracleCallContext::empty(),
+            )
+            .expect("an empty oracle context has a durable identity"),
         }
     }
 
@@ -1954,6 +2965,7 @@ impl ToyGraph {
                     identity: "declared-effect".into(),
                     fact: true,
                     provenance: "toy".into(),
+                    seed_point: None,
                 }],
                 status,
                 covers_overrides: true,
@@ -1992,6 +3004,7 @@ impl CompositionProvider for ToyGraph {
     fn execution_dispatch(
         &self,
         call: &DurableCallSiteKey,
+        _incoming: Option<&super::ExecutionArmContext>,
         _request: &mut SemanticRequest<'_>,
     ) -> Result<ExecutionDispatch<ToyTiming>, String> {
         Ok(self
@@ -2041,7 +3054,7 @@ impl CompositionProvider for ToyGraph {
         &self,
         _: &DurableCallSiteKey,
         _: &mut SemanticRequest<'_>,
-    ) -> Result<Dispatch, String> {
+    ) -> Result<(Dispatch, Option<CallModel<ToyTiming>>), String> {
         unimplemented!("execution has no value dispatch")
     }
     fn callers(
@@ -2057,9 +3070,6 @@ impl CompositionProvider for ToyGraph {
         _: &mut SemanticRequest<'_>,
     ) -> Result<Option<DurableProcedureKey>, String> {
         unimplemented!("execution has no capture binding")
-    }
-    fn model(&self, _: &DurableCallSiteKey) -> Option<CallModel<ToyTiming>> {
-        unimplemented!("execution has no value model")
     }
     fn unmodeled_call_behavior(&self) -> UnmodeledCallBehavior {
         unimplemented!("execution has no value fallback")
@@ -2111,6 +3121,32 @@ fn toy_execution(root: DurableProcedureKey, graph: &ToyGraph) -> ExecutionOutcom
 }
 
 #[test]
+#[hardwon("#9947: replayed Output diagnostic text embedded the workspace mount")]
+fn execution_dispatch_reason_omits_durable_artifact_identity() {
+    let fixture = fixture();
+    let caller = fixture.procedures["caller"].durable_key();
+    let call = fixture.helper_call().id;
+    let mut graph = ToyGraph::default();
+    graph.invoke(&caller, call);
+    graph.set_dispatch((caller.clone(), call), Vec::new());
+    let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
+    dispatch.outcome = ExecutionDispatchOutcome::Cancelled("interrupted".into());
+    let answer = toy_execution(caller, &graph);
+    assert!(
+        answer.incomplete.iter().any(|incomplete| matches!(
+            incomplete,
+            Incompleteness::Execution { reason, .. }
+                if reason.contains("execution dispatch ")
+                    && !reason.contains("SemanticArtifactKey")
+                    && !reason.contains("WorkspaceMountId")
+        )),
+        "{:#?}",
+        answer.incomplete
+    );
+}
+
+#[test]
+#[hardwon("#9196: repeated execution instance and context stayed silently closed")]
 fn execution_relation_interns_cycles_and_keeps_timing_paths() {
     use crate::analyzer::semantic::ExecutionTiming;
     let fixture = fixture();
@@ -2120,16 +3156,24 @@ fn execution_relation_interns_cycles_and_keeps_timing_paths() {
     let mut graph = ToyGraph::default();
     graph.declare(target.clone(), ExecutionEndpointStatus::Complete);
     graph.invoke(&caller, call);
-    graph.set_dispatch(
-        (caller.clone(), call),
-        vec![ToyGraph::arm(
-            target,
-            ExecutionTiming::SameInvocation,
-            HopQuality::CERTAIN,
-        )],
-    );
+    let mut arm = ToyGraph::arm(target, ExecutionTiming::SameInvocation, HopQuality::CERTAIN);
+    let procedure = &fixture.procedures["caller"];
+    arm.instance = Some(ExecutionCallableInstance {
+        producer: caller.clone(),
+        creation_point: procedure.semantics().points()[0].id,
+        creation_event_index: 0,
+        creation_value: procedure.semantics().values()[0].id,
+        capture_bindings: Box::new([]),
+        factory_call: None,
+    });
+    graph.set_dispatch((caller.clone(), call), vec![arm]);
     let answer = toy_execution(caller.clone(), &graph);
-    assert!(answer.incomplete.is_empty(), "{:?}", answer.incomplete);
+    assert!(
+        matches!(answer.incomplete.as_slice(), [Incompleteness::Execution { reason, .. }]
+            if reason.contains("repeated instance and context")),
+        "{:?}",
+        answer.incomplete
+    );
     assert!(answer.reaches.iter().any(|reach| reach.root == caller));
     assert!(
         answer
@@ -2288,6 +3332,13 @@ fn execution_relation_external_closure_and_interruption_are_per_arm() {
         answer.reaches.is_empty() && !answer.incomplete.is_empty(),
         "interruption with zero residuals is open"
     );
+    assert!(answer.incomplete.iter().any(|reason| matches!(
+        reason,
+        Incompleteness::Execution {
+            cause: IncompleteCause::Operational(OperationalCause::Cancelled),
+            ..
+        }
+    )));
     let dispatch = graph.dispatches.get_mut(&(caller.clone(), call)).unwrap();
     dispatch.outcome = ExecutionDispatchOutcome::Complete;
     let answer = toy_execution(caller.clone(), &graph);
@@ -2295,6 +3346,13 @@ fn execution_relation_external_closure_and_interruption_are_per_arm() {
         answer.reaches.is_empty() && !answer.incomplete.is_empty(),
         "complete exhaustive armless dispatch is open"
     );
+    assert!(answer.incomplete.iter().any(|reason| matches!(
+        reason,
+        Incompleteness::Execution {
+            cause: IncompleteCause::Content,
+            ..
+        }
+    )));
 
     graph.set_dispatch(
         (caller.clone(), call),
@@ -2319,6 +3377,7 @@ fn execution_relation_external_closure_and_interruption_are_per_arm() {
                 identity: "partial-arm".into(),
                 fact: true,
                 provenance: "toy".into(),
+                seed_point: None,
             }],
             status: ExecutionEndpointStatus::Partial("partial arm".into()),
             covers_overrides: false,
@@ -2378,6 +3437,88 @@ fn execution_relation_external_closure_and_interruption_are_per_arm() {
         !toy_execution(caller, &graph).incomplete.is_empty(),
         "an armless dispatch cannot be discharged"
     );
+}
+
+#[test]
+#[hardwon("#9947: truncated execution dispatch was classified as content incomplete")]
+fn truncated_execution_dispatch_is_operational() {
+    use crate::analyzer::semantic::ExecutionTiming;
+    let fixture = fixture();
+    let caller = fixture.procedures["caller"].durable_key();
+    let target = fixture.procedures["target"].durable_key();
+    let call = fixture.helper_call().id;
+    let mut graph = ToyGraph::default();
+    graph.declare(
+        ExecutionTarget::Procedure(Box::new(caller.clone())),
+        ExecutionEndpointStatus::Complete,
+    );
+    graph.declare(
+        ExecutionTarget::Procedure(Box::new(target.clone())),
+        ExecutionEndpointStatus::Complete,
+    );
+    graph.invoke(&caller, call);
+    graph.set_dispatch(
+        (caller.clone(), call),
+        vec![ToyGraph::arm(
+            ExecutionTarget::Procedure(Box::new(target)),
+            ExecutionTiming::SameInvocation,
+            HopQuality::CERTAIN,
+        )],
+    );
+    for (coverage, expected) in [
+        (
+            CandidateCoverage::Truncated,
+            IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+        ),
+        (CandidateCoverage::Open, IncompleteCause::Content),
+    ] {
+        graph
+            .dispatches
+            .get_mut(&(caller.clone(), call))
+            .unwrap()
+            .coverage = coverage;
+        let answer = toy_execution(caller.clone(), &graph);
+        assert!(
+            answer.incomplete.iter().any(|reason| matches!(
+                reason,
+                Incompleteness::Execution { cause, .. } if *cause == expected
+            )),
+            "{coverage:?}: {:?}",
+            answer.incomplete
+        );
+    }
+}
+
+#[test]
+#[hardwon("#9947: truncated semantic dispatch coverage was classified as content incomplete")]
+fn truncated_semantic_dispatch_is_operational() {
+    use crate::analyzer::semantic::{DispatchResult, OracleLimits, SemanticOutcome, SemanticWork};
+    let fixture = fixture();
+    let procedure = &fixture.procedures["caller"];
+    let call = procedure
+        .call_site_handle(fixture.helper_call().id)
+        .unwrap();
+    for (coverage, expected) in [
+        (
+            CandidateCoverage::Truncated,
+            IncompleteCause::Operational(OperationalCause::Budget(BudgetLane::Semantic)),
+        ),
+        (CandidateCoverage::Open, IncompleteCause::Content),
+    ] {
+        let result =
+            DispatchResult::new(&call, vec![], vec![], coverage, OracleLimits::default()).unwrap();
+        let answer = SemanticOutcome::Complete {
+            value: result.clone(),
+            work: SemanticWork::default(),
+        };
+        assert!(
+            matches!(
+                crate::composition::dispatch_completeness(&answer, &result),
+                Completeness::Incomplete { cause, .. } if cause == expected
+            ),
+            "{coverage:?}"
+        );
+    }
 }
 
 #[test]

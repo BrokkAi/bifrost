@@ -610,7 +610,7 @@ func next(a S) S { return a }
                     facts
                         .load_origins
                         .get(&target)
-                        .copied()
+                        .cloned()
                         .unwrap_or_else(|| panic!("a transfer target has an origin"))
                 })
                 .collect()
@@ -766,7 +766,7 @@ func shifted(dynamic int) int {
                 location.id,
                 ValueOriginFacts {
                     load_origins: &facts.load_origins,
-                    copied_reference_members: &facts.copied_reference_members,
+                    prefix_stores: &facts.prefix_stores,
                     binding_origins: None,
                 },
                 8,
@@ -784,27 +784,24 @@ func shifted(dynamic int) int {
             let AccessPathResolution::Resolved(draft) = resolution else {
                 panic!("unbudgeted access-path resolution completes")
             };
-            let [
-                AccessSelectorDraft::Index {
-                    constant: Some(index),
-                    ..
-                },
-            ] = draft.selectors.as_slice()
-            else {
+            let [AccessSelectorDraft::Index { constant, .. }] = draft.selectors.as_slice() else {
                 continue;
             };
             if draft.tail == AccessPathTail::Exact {
-                translated.push(*index);
+                translated.push(constant.expect("an exact index path names its index"));
             } else {
-                open.push(*index);
+                open.push(*constant);
             }
         }
         translated.sort_unstable();
         assert_eq!(translated, [1, 1], "{:#?}", procedure.semantics());
+        // An unknown start cannot translate the index, so the store through
+        // `values[dynamic:]` keeps its backing root with an "any" index; keeping
+        // the untranslated 0 could miss a store at another index.
         assert_eq!(
             open,
-            [0],
-            "an unknown start preserves the backing root but leaves index overlap open: {:#?}",
+            [None],
+            "an unknown start preserves the backing root but widens the index: {:#?}",
             procedure.semantics()
         );
     }

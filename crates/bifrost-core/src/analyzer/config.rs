@@ -7,8 +7,7 @@ use super::model::ProjectFile;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
-    pub memo_cache_budget_bytes: Option<u64>,
-    pub store_cache_budget_bytes: Option<u64>,
+    pub retention_budget_bytes: Option<u64>,
     /// Which class-hierarchy expansions call dispatch may add beyond the
     /// callee the static types already name.
     pub dispatch_hierarchy_expansion: DispatchHierarchyExpansion,
@@ -452,6 +451,25 @@ pub struct RustPackageApiArtifact {
     pub rustdoc_json_path: PathBuf,
     pub rustdoc_toolchain: String,
     pub rustdoc_format_version: u32,
+    /// Exact cfgs used for the final rustdoc invocation. `docsrs` is never
+    /// inferred from the artifact's URL or from a MaD callable spelling.
+    pub rustdoc_cfgs: Vec<String>,
+    /// Required when the artifact's version or features differ from Cargo's
+    /// resolved tuple. The resolved side is verified from Cargo evidence.
+    pub approximation: Option<RustArtifactApproximationClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustArtifactApproximationClaim {
+    pub artifact_version: String,
+    pub artifact_features: Vec<String>,
+    pub artifact_cfgs: Vec<String>,
+    pub docsrs_build: bool,
+    pub artifact_sha256: String,
+    /// Offline-generated disjoint version interval for this artifact shard.
+    pub activation_version_requirement: String,
+    pub selection_rule_id: String,
+    pub selection_rule_version: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -513,10 +531,48 @@ impl Default for GoDependencyDiscoveryConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CSharpNativeTrial(bool);
+
+impl CSharpNativeTrial {
+    #[allow(non_upper_case_globals)]
+    pub const Off: Self = Self(false);
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(non_upper_case_globals)]
+    pub const On: Self = Self(true);
+
+    pub const fn is_on(self) -> bool {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CSharpAnalyzerConfig {
     /// Extra assemblies to index in addition to already-restored project assets.
     pub assembly_paths: Vec<PathBuf>,
+    pub native_trial: CSharpNativeTrial,
+}
+
+impl Default for CSharpAnalyzerConfig {
+    fn default() -> Self {
+        Self {
+            assembly_paths: Vec::new(),
+            native_trial: {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    if std::env::var_os("BIFROST_TRIAL_NATIVE_CSHARP").is_some() {
+                        CSharpNativeTrial::On
+                    } else {
+                        CSharpNativeTrial::Off
+                    }
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    CSharpNativeTrial::Off
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -828,8 +884,7 @@ impl Default for AnalyzerConfig {
     fn default() -> Self {
         Self {
             parallelism: Some(default_parallelism()),
-            memo_cache_budget_bytes: Some(256 * 1024 * 1024),
-            store_cache_budget_bytes: Some(256 * 1024 * 1024),
+            retention_budget_bytes: Some(1024 * 1024 * 1024),
             dispatch_hierarchy_expansion: DispatchHierarchyExpansion::from_environment(),
             rust: RustAnalyzerConfig::default(),
             jvm: JvmAnalyzerConfig::default(),
@@ -848,11 +903,54 @@ impl AnalyzerConfig {
         self.parallelism.unwrap_or_else(default_parallelism)
     }
 
-    pub fn store_cache_budget_bytes(&self) -> u64 {
-        self.store_cache_budget_bytes.unwrap_or(256 * 1024 * 1024)
+    pub fn retention_budget_bytes(&self) -> u64 {
+        self.retention_budget_bytes.unwrap_or(1024 * 1024 * 1024)
     }
 
+    // #9737 M1 part 2b: legacy cache constructors still size their local caps here.
+    pub fn store_cache_budget_bytes(&self) -> u64 {
+        self.retention_budget_bytes() / 4
+    }
+
+    // #9737 M1 part 2b: legacy cache constructors still size their local caps here.
     pub fn memo_cache_budget_bytes(&self) -> u64 {
-        self.memo_cache_budget_bytes.unwrap_or(256 * 1024 * 1024)
+        self.retention_budget_bytes() / 4
+    }
+}
+
+#[cfg(test)]
+mod csharp_trial_config_tests {
+    use super::{CSharpAnalyzerConfig, CSharpNativeTrial};
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    #[hardwon("#7314: per-call environment reads changed the C# trial route after construction")]
+    fn native_trial_default_is_frozen_at_construction() {
+        const CHILD: &str = "BIFROST_7314_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "analyzer::config::csharp_trial_config_tests::native_trial_default_is_frozen_at_construction",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("BIFROST_TRIAL_NATIVE_CSHARP")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+        let off = CSharpAnalyzerConfig::default();
+        assert_eq!(off.native_trial, CSharpNativeTrial::Off);
+        // The child owns its environment and runs this test alone.
+        unsafe { std::env::set_var("BIFROST_TRIAL_NATIVE_CSHARP", "") };
+        let on = CSharpAnalyzerConfig::default();
+        assert_eq!(on.native_trial, CSharpNativeTrial::On);
+        assert_eq!(off.native_trial, CSharpNativeTrial::Off);
+        unsafe { std::env::remove_var("BIFROST_TRIAL_NATIVE_CSHARP") };
+        assert_eq!(on.native_trial, CSharpNativeTrial::On);
+        assert_ne!(format!("{off:?}"), format!("{on:?}"));
     }
 }

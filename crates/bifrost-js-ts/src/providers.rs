@@ -373,8 +373,13 @@ mod tests {
         }
     }
     impl ImportAnalysisProvider for ImportHost {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-            unimplemented!()
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+            brokk_bifrost_core::analyzer::capabilities::uncharged_imported_code_units(
+                || -> HashSet<CodeUnit> { unimplemented!() },
+            )
         }
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
             unimplemented!()

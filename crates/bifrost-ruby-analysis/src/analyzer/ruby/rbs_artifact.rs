@@ -468,6 +468,8 @@ fn project_constant(
     };
     if owner_name == "Object" && !types.iter().any(|fact| fact.id == owner_id) {
         types.push(TypeFact {
+            alias_target: None,
+            tuple_fields: None,
             implemented_traits_complete: false,
             generic_trait_impls_complete: false,
             jvm_inventory: None,
@@ -828,6 +830,8 @@ fn project_type(
         }
     }
     types.push(TypeFact {
+        alias_target: None,
+        tuple_fields: None,
         implemented_traits_complete: false,
         generic_trait_impls_complete: false,
         jvm_inventory: None,

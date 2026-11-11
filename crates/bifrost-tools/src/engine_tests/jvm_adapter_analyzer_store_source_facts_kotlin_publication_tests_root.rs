@@ -70,7 +70,7 @@ mod jvm_extraction_tests {
             )
             .unwrap();
         let expected_metadata_links = state.source_declaration_metadata.len() as i64;
-        store.conn.execute(move |conn| {
+        store.conn.execute_fixture(move |conn| {
         let (expected, actual): (i64, i64) = conn.query_row(
             "SELECT metadata_bridge_count, (SELECT COUNT(*) FROM source_declaration_metadata_bridges)
              FROM source_fact_manifests", [], |row| Ok((row.get(0)?, row.get(1)?)),
@@ -252,7 +252,8 @@ mod jvm_extraction_tests {
         let mut facts = state.source_facts.clone().expect("canonical Kotlin source");
         // The real facts store: both constructors carry the class name.
         facts.assert_storable();
-        let (mut nodes, roles, occurrence_roles, recovered_regions) = facts.structural.into_parts();
+        let (mut nodes, roles, occurrence_roles, coverage, recovered_regions) =
+            facts.structural.into_parts();
         let method_name = nodes
             .iter()
             .find(|node| node.kind == NormalizedKind::Method)
@@ -264,7 +265,8 @@ mod jvm_extraction_tests {
             .expect("constructor")
             .name = Some(method_name);
         facts.structural =
-            StructuralFactRows::new(nodes, roles, occurrence_roles, recovered_regions);
+            StructuralFactRows::new(nodes, roles, occurrence_roles, recovered_regions)
+                .with_coverage(coverage);
         facts.assert_storable();
     }
     /// Recovered regions publish as rows, and hydration answers in SQL whether a

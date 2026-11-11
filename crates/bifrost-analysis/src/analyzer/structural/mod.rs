@@ -38,6 +38,7 @@ pub mod derived_cache;
 pub mod extract;
 pub mod facts;
 pub mod failure_handlers;
+pub mod identity;
 pub mod identity_routes;
 pub mod index;
 pub mod index_query;

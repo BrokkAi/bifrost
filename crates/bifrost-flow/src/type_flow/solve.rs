@@ -27,6 +27,9 @@ use brokk_bifrost_core::profiling;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, GenKillFacts, dominators, reaching_definitions,
 };
+use crate::analyzer::semantic::statement_entries::{
+    control_edge_proves_route, proven_control_reachable_points,
+};
 use crate::analyzer::semantic::type_flow::DispatchHintProof;
 use crate::analyzer::semantic::{
     CancellationToken, CandidateCoverage, ClassAtom, ClassIdentity, ClassSeed,
@@ -60,8 +63,8 @@ use super::plan::{
 };
 use super::refinement_sources::DefinitionSources;
 use super::summary::{
-    ClassSetAcquisitionCuts, PreparedClassSetSummaries, TypeFlowSummaryProfile,
-    TypeFlowSummaryState,
+    ClassSetAcquisitionCuts, PreparedClassSetSummaries, SummaryMaintenanceMetrics,
+    TypeFlowSummaryProfile, TypeFlowSummaryState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,24 +208,30 @@ pub enum TypeFlowRootPersistenceRejection {
     FeedbackFallback,
 }
 
-impl TypeFlowRootPersistenceStatus {
-    fn from_solve(
-        complete: bool,
-        semantic_budget_exhausted: bool,
-        provider_failure_observed: bool,
-    ) -> Self {
-        if semantic_budget_exhausted {
-            Self::Ineligible(TypeFlowRootPersistenceRejection::SemanticBudget)
-        } else if !complete {
-            Self::Ineligible(TypeFlowRootPersistenceRejection::SolverIncomplete)
-        } else if provider_failure_observed {
-            Self::Ineligible(TypeFlowRootPersistenceRejection::ProviderFailure)
-        } else {
-            Self::Eligible
+/// A request-level fact that bars a root from durable publication although
+/// its own solve stopped on no lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootTransactionBar {
+    /// Some plan attempt in this request observed a transient provider
+    /// failure, which a later uncached lookup could hide.
+    ProviderFailure,
+    /// The result is an earlier feedback iteration's, returned because a
+    /// later iteration stopped short.
+    FeedbackFallback,
+}
+
+impl From<RootTransactionBar> for TypeFlowRootPersistenceRejection {
+    fn from(bar: RootTransactionBar) -> Self {
+        match bar {
+            RootTransactionBar::ProviderFailure => Self::ProviderFailure,
+            RootTransactionBar::FeedbackFallback => Self::FeedbackFallback,
         }
     }
 }
 
+/// Publication eligibility is a property of the whole feedback/retry
+/// transaction, not only the final plan: a transient provider failure stays
+/// observed for the rest of the request.
 #[derive(Debug, Default)]
 struct TypeFlowRootPersistenceTracker {
     provider_failure_observed: bool,
@@ -233,20 +242,30 @@ impl TypeFlowRootPersistenceTracker {
         self.provider_failure_observed |= observed;
     }
 
-    fn status(
-        &self,
-        complete: bool,
-        semantic_budget_exhausted: bool,
-    ) -> TypeFlowRootPersistenceStatus {
-        TypeFlowRootPersistenceStatus::from_solve(
-            complete,
-            semantic_budget_exhausted,
-            self.provider_failure_observed,
-        )
+    fn bar(&self) -> Option<RootTransactionBar> {
+        self.provider_failure_observed
+            .then_some(RootTransactionBar::ProviderFailure)
     }
 }
 
 impl TypeFlowRootResult {
+    /// See [`RootIncompleteEvidence::complete`].
+    pub fn complete(&self) -> bool {
+        self.incomplete_evidence.complete()
+    }
+
+    /// See [`RootIncompleteEvidence::semantic_budget_exhausted`].
+    pub fn semantic_budget_exhausted(&self) -> bool {
+        self.incomplete_evidence.semantic_budget_exhausted()
+    }
+
+    /// Engine-owned durable-publication gate; see
+    /// [`RootIncompleteEvidence::persistence_status`].
+    pub fn persistence_status(&self) -> TypeFlowRootPersistenceStatus {
+        self.incomplete_evidence
+            .persistence_status(self.transaction_bar)
+    }
+
     /// The first typed semantic charge this root could not pay, when any lane
     /// named one.
     fn semantic_exhaustion(&self) -> Option<SemanticBudgetExceeded> {
@@ -260,13 +279,12 @@ impl TypeFlowRootResult {
     }
 
     fn mark_feedback_fallback(&mut self) {
-        self.persistence_status = Self::feedback_fallback_status();
-    }
-
-    const fn feedback_fallback_status() -> TypeFlowRootPersistenceStatus {
-        TypeFlowRootPersistenceStatus::Ineligible(
-            TypeFlowRootPersistenceRejection::FeedbackFallback,
-        )
+        debug_assert!(
+            self.incomplete_evidence.lanes.is_empty(),
+            "only a complete iteration is kept as a feedback fallback: {:?}",
+            self.incomplete_evidence
+        );
+        self.transaction_bar = Some(RootTransactionBar::FeedbackFallback);
     }
 }
 
@@ -349,6 +367,56 @@ pub struct RootIncompleteEvidence {
     pub feedback_iteration: usize,
 }
 
+impl RootIncompleteEvidence {
+    /// The completeness contract later consumers (#2943, #2945, #2949) build
+    /// on: the root is complete exactly when its solve reached a fixed point
+    /// and no plan refinement stopped short. A provider failure on the root
+    /// never reaches interpretation (the plan build fails first), and
+    /// cancellation and solver-budget exhaustion both terminate the solver
+    /// before a fixed point. Boundary-only incompleteness -- an open dispatch
+    /// arm, a callee the closure never mounted, the closure procedure cap --
+    /// still terminates at a fixed point and is expressed per sink through
+    /// the Unknown reasons, never through this predicate.
+    pub fn complete(&self) -> bool {
+        !self.lanes.iter().any(|lane| match lane {
+            RootExhaustedLane::Solver(_) | RootExhaustedLane::Cancelled => true,
+            RootExhaustedLane::Semantic { stage, .. } => {
+                *stage == SemanticExhaustionStage::PlanRefinement
+            }
+        })
+    }
+
+    /// The semantic-work budget was exhausted while this root was discovered
+    /// or solved. Executors surface this as their `semantic_budget_exhausted`
+    /// diagnostic.
+    pub fn semantic_budget_exhausted(&self) -> bool {
+        self.lanes
+            .iter()
+            .any(|lane| matches!(lane, RootExhaustedLane::Semantic { .. }))
+    }
+
+    /// Whether a root with this evidence may be persisted. Stable typed open
+    /// boundaries remain eligible; resource exhaustion, incomplete solves,
+    /// transient provider failures, and feedback fallback do not. The lanes
+    /// rank first, semantic exhaustion above solver incompleteness; a
+    /// request-level `bar` decides only a root whose lanes are clean.
+    fn persistence_status(&self, bar: Option<RootTransactionBar>) -> TypeFlowRootPersistenceStatus {
+        if self.semantic_budget_exhausted() {
+            TypeFlowRootPersistenceStatus::Ineligible(
+                TypeFlowRootPersistenceRejection::SemanticBudget,
+            )
+        } else if !self.complete() {
+            TypeFlowRootPersistenceStatus::Ineligible(
+                TypeFlowRootPersistenceRejection::SolverIncomplete,
+            )
+        } else if let Some(bar) = bar {
+            TypeFlowRootPersistenceStatus::Ineligible(bar.into())
+        } else {
+            TypeFlowRootPersistenceStatus::Eligible
+        }
+    }
+}
+
 /// Work and termination detail for one independently bounded solver run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeFlowSolveAttempt {
@@ -363,33 +431,16 @@ pub struct TypeFlowRootResult {
     pub root: crate::analyzer::semantic::SemanticProcedureReference,
     pub class_sets: Vec<ReceiverClassSet>,
     pub findings: Vec<AbsentMemberFinding>,
-    /// The completeness contract later consumers (#2943, #2945, #2949) build
-    /// on: the root is complete exactly when its solve saw no cancellation,
-    /// no provider failure on the root, and no solver-budget exhaustion. A
-    /// provider failure on the root never reaches interpretation (the plan
-    /// build fails first), and cancellation and solver-budget exhaustion both
-    /// terminate the solver before a fixed point, so this is
-    /// `termination().is_fixed_point()`. Boundary-only incompleteness -- an
-    /// open dispatch arm, a callee the closure never mounted, the closure
-    /// procedure cap -- still terminates at a fixed point and is expressed
-    /// per sink through the Unknown reasons, never through this flag.
-    pub complete: bool,
     /// Complete ordered collection of independently bounded solver runs made
     /// while producing this root result.
     pub solver_attempts: Vec<TypeFlowSolveAttempt>,
-    /// The semantic-work budget was exhausted while this root was discovered
-    /// or solved: a typed `ExceededBudget` rode the solve's semantic-input
-    /// boundaries. Executors surface this as their
-    /// `semantic_budget_exhausted` diagnostic.
-    pub semantic_budget_exhausted: bool,
-    /// Engine-owned durable-publication gate. Stable typed open boundaries
-    /// remain eligible; transient provider failures, resource exhaustion,
-    /// incomplete solves, and feedback fallback do not.
-    pub persistence_status: TypeFlowRootPersistenceStatus,
     /// The lanes that stopped this root, empty when it answered completely.
-    /// `complete` and `semantic_budget_exhausted` are this evidence reduced
-    /// to the two booleans their consumers already branch on.
+    /// [`Self::complete`], [`Self::semantic_budget_exhausted`] and
+    /// [`Self::persistence_status`] derive from it.
     pub incomplete_evidence: RootIncompleteEvidence,
+    /// The request-level fact, when any, that bars this root from durable
+    /// publication although its lanes are clean.
+    transaction_bar: Option<RootTransactionBar>,
     /// Cross-root procedure-summary lookups served by a reusable class-set
     /// relation while computing this result.
     pub reusable_summary_hits: usize,
@@ -557,6 +608,42 @@ pub fn solve_type_flow_for_root_with_refinements(
         budget: SolverBudget,
         attempt_index: usize,
     }
+    /// Which plan one attempt of a feedback iteration builds. An iteration
+    /// starts with summary cuts and moves to the full plan at most once, when
+    /// source refinement or a finding needs bodies a cut plan omits.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PlanAttempt {
+        WithSummaryCuts,
+        Full,
+    }
+    /// What one feedback iteration's surviving plan attempt produced.
+    struct IterationOutcome {
+        plan: TypeFlowPlan,
+        interpreted: TypeFlowRootResult,
+        /// The iteration's staged semantic charges, committed to the root's
+        /// ledger only if the iteration's answer is kept or its writes are.
+        staged_budget: SemanticBudget,
+        maintenance: SummaryMaintenanceMetrics,
+        /// Whether the solve published cache state later queries can observe.
+        retained_publication_writes: bool,
+    }
+    impl IterationOutcome {
+        /// An attempt that stopped on refinement evidence before summary
+        /// preparation: it ran no maintenance and published nothing.
+        fn before_summaries(
+            plan: TypeFlowPlan,
+            interpreted: TypeFlowRootResult,
+            staged_budget: SemanticBudget,
+        ) -> Self {
+            Self {
+                plan,
+                interpreted,
+                staged_budget,
+                maintenance: SummaryMaintenanceMetrics::default(),
+                retained_publication_writes: false,
+            }
+        }
+    }
     let mut summary_profile = TypeFlowSummaryProfile::default();
     // Publication eligibility is a property of the whole feedback/retry
     // transaction, not only the final plan. A transient provider error can
@@ -596,7 +683,7 @@ pub fn solve_type_flow_for_root_with_refinements(
             field_slots,
             HashSet::<DurableProcedureKey>::default(),
         );
-        let mut require_full_plan = false;
+        let mut attempt = PlanAttempt::WithSummaryCuts;
         // The plan this iteration actually solves, before source refinement
         // mutates it. It is the whole input to everything the iteration does
         // next, so it is what the next iteration compares against. A plan
@@ -606,10 +693,16 @@ pub fn solve_type_flow_for_root_with_refinements(
         // abandoned attempt's plan would report a difference the solve never
         // observed and re-solve an iteration whose plan is unchanged.
         let mut solved_plan: Option<TypeFlowPlan> = None;
-        let (plan, mut interpreted, iteration_budget, maintenance, publication_writes) = 'plan_attempt: loop {
+        let IterationOutcome {
+            plan,
+            mut interpreted,
+            staged_budget: iteration_budget,
+            maintenance,
+            retained_publication_writes: publication_writes,
+        } = 'plan_attempt: loop {
             let mut iteration_budget = semantic_budget.clone();
-            let plan_result = if !require_full_plan {
-                TypeFlowPlan::build_with_summary_cuts(
+            let plan_result = match attempt {
+                PlanAttempt::WithSummaryCuts => TypeFlowPlan::build_with_summary_cuts(
                     workspace,
                     adapter,
                     field_slots,
@@ -620,9 +713,8 @@ pub fn solve_type_flow_for_root_with_refinements(
                     request.cancellation,
                     refinements,
                     &mut acquisition_cuts,
-                )
-            } else {
-                TypeFlowPlan::build(
+                ),
+                PlanAttempt::Full => TypeFlowPlan::build(
                     workspace,
                     adapter,
                     field_slots,
@@ -632,7 +724,7 @@ pub fn solve_type_flow_for_root_with_refinements(
                     &mut iteration_budget,
                     request.cancellation,
                     refinements,
-                )
+                ),
             };
             let plan_cache_writes = discovery_provider.take_retained_writes();
             let mut plan = match plan_result {
@@ -650,7 +742,7 @@ pub fn solve_type_flow_for_root_with_refinements(
             if iteration + 1 < feedback_limits.max_iterations() {
                 solved_plan = Some(plan.clone());
             }
-            if !require_full_plan
+            if attempt == PlanAttempt::WithSummaryCuts
                 && previous
                     .as_ref()
                     .is_some_and(|completed| completed.plan.feedback_fixpoint_matches(&plan))
@@ -677,7 +769,7 @@ pub fn solve_type_flow_for_root_with_refinements(
             if plan.needs_source_refinement() && !plan.refinement_budget_exhausted() {
                 if plan.has_summary_cuts() {
                     *semantic_budget = iteration_budget;
-                    require_full_plan = true;
+                    attempt = PlanAttempt::Full;
                     continue 'plan_attempt;
                 }
                 let mut refinement_solve_phase = TypeFlowSolvePhase::ExploratoryRefinement;
@@ -713,9 +805,10 @@ pub fn solve_type_flow_for_root_with_refinements(
                         &preliminary,
                         &solver_attempts,
                     );
-                    if !preliminary_status.complete || preliminary_status.semantic_budget_exhausted
+                    if !preliminary_status.complete()
+                        || preliminary_status.semantic_budget_exhausted()
                     {
-                        if preliminary_status.semantic_budget_exhausted {
+                        if preliminary_status.semantic_budget_exhausted() {
                             plan.mark_refinement_budget_exhausted(
                                 preliminary_status.semantic_exhaustion(),
                             );
@@ -729,12 +822,10 @@ pub fn solve_type_flow_for_root_with_refinements(
                             &preliminary,
                             &solver_attempts,
                         );
-                        break 'plan_attempt (
+                        break 'plan_attempt IterationOutcome::before_summaries(
                             plan,
                             interpreted,
                             iteration_budget,
-                            Default::default(),
-                            false,
                         );
                     }
                     let refinement = DefinitionSources::new(
@@ -806,19 +897,16 @@ pub fn solve_type_flow_for_root_with_refinements(
                     &result,
                     &solver_attempts,
                 );
-                break 'plan_attempt (
+                break 'plan_attempt IterationOutcome::before_summaries(
                     plan,
                     interpreted,
                     iteration_budget,
-                    Default::default(),
-                    false,
                 );
             }
             persistence.observe_provider_failure(plan.provider_failure_observed());
-            let cut_manifest = if require_full_plan {
-                Default::default()
-            } else {
-                acquisition_cuts.take_manifest()
+            let cut_manifest = match attempt {
+                PlanAttempt::WithSummaryCuts => acquisition_cuts.take_manifest(),
+                PlanAttempt::Full => Default::default(),
             };
             let mut summaries = PreparedClassSetSummaries::new_with_cuts(
                 summary_state.clone(),
@@ -1002,7 +1090,7 @@ pub fn solve_type_flow_for_root_with_refinements(
                         // The witnessless trial can warm shared semantic cache
                         // entries before a finding requires a fresh full plan.
                         *semantic_budget = trial_semantic_budget;
-                        require_full_plan = true;
+                        attempt = PlanAttempt::Full;
                         summary_profile = summary_profile.saturating_add(summaries.profile());
                         root_summary_observation_rejections = root_summary_observation_rejections
                             .saturating_add(summaries.root_observation_rejections());
@@ -1063,16 +1151,15 @@ pub fn solve_type_flow_for_root_with_refinements(
                 .saturating_add(summaries.root_observation_rejections());
             interpreted.reusable_root_summary_observation_rejections =
                 root_summary_observation_rejections;
-            interpreted.persistence_status =
-                persistence.status(interpreted.complete, interpreted.semantic_budget_exhausted);
-            let publication_writes = summaries.take_retained_publication_writes();
-            break (
+            interpreted.transaction_bar = persistence.bar();
+            let retained_publication_writes = summaries.take_retained_publication_writes();
+            break IterationOutcome {
                 plan,
                 interpreted,
-                iteration_budget,
+                staged_budget: iteration_budget,
                 maintenance,
-                publication_writes,
-            );
+                retained_publication_writes,
+            };
         };
         interpreted.reusable_summary_hits = interpreted
             .reusable_summary_hits
@@ -1086,7 +1173,7 @@ pub fn solve_type_flow_for_root_with_refinements(
         interpreted.summary_profile = summary_profile;
         interpreted.incomplete_evidence.feedback_iteration = iteration;
         interpreted.solver_attempts = solver_attempts.clone();
-        if interpreted.semantic_budget_exhausted || !interpreted.complete {
+        if interpreted.semantic_budget_exhausted() || !interpreted.complete() {
             if let Some(completed) = previous {
                 let mut previous = completed.result;
                 if publication_writes {
@@ -1225,13 +1312,10 @@ fn interpret(
     // carries a reason affects every class, so `member_store_evidence` answers
     // `Unknown` wherever it could apply. It is not a property of this root and
     // must not decide completion.
-    let complete = termination.is_fixed_point() && !plan.refinement_budget_exhausted();
     let value_flow_exhaustion = plan
         .value_flow()
         .public_semantic_status(result.result())
         .budget_exceeded();
-    let semantic_budget_exhausted =
-        plan.field_slot_semantic_budget_exhausted() || value_flow_exhaustion.is_some();
     // The lanes that stopped this root, kept typed so a consumer can name the
     // exact charge instead of re-running the solve under instrumentation.
     let mut lanes = Vec::new();
@@ -1260,15 +1344,22 @@ fn interpret(
             exceeded: Some(exceeded),
         });
     }
-    debug_assert_eq!(
-        lanes.is_empty(),
-        complete && !semantic_budget_exhausted,
-        "an incomplete or exhausted root must name at least one lane: {lanes:?}"
-    );
+    let incomplete_evidence = RootIncompleteEvidence {
+        lanes,
+        feedback_iteration: 0,
+    };
+    let complete = incomplete_evidence.complete();
+    let semantic_budget_exhausted = incomplete_evidence.semantic_budget_exhausted();
     let mut class_sets = Vec::new();
     let mut findings = Vec::new();
+    let mut proven_control_points: HashMap<ProcedureHandle, HashSet<ProgramPointId>> =
+        HashMap::default();
     for (sink_id, _) in plan.value_flow().sinks() {
         let site = plan.sink(sink_id).clone();
+        let proven_control = proven_control_points
+            .entry(site.procedure.clone())
+            .or_insert_with(|| proven_control_reachable_points(site.procedure.semantics()))
+            .contains(&site.point.id());
         let mut set = match result.sink_outcome(sink_id) {
             ValueFlowSinkOutcome::Reached(meetings) => reached_class_set(
                 workspace,
@@ -1278,6 +1369,7 @@ fn interpret(
                 plan,
                 result,
                 &meetings,
+                proven_control,
                 root,
                 &mut findings,
             ),
@@ -1340,18 +1432,11 @@ fn interpret(
         root: crate::analyzer::semantic::SemanticProcedureReference::of(root),
         class_sets,
         findings: distinct_findings,
-        complete,
         solver_attempts: solver_attempts.to_vec(),
-        semantic_budget_exhausted,
-        persistence_status: TypeFlowRootPersistenceStatus::from_solve(
-            complete,
-            semantic_budget_exhausted,
-            plan.provider_failure_observed(),
-        ),
-        incomplete_evidence: RootIncompleteEvidence {
-            lanes,
-            feedback_iteration: 0,
-        },
+        incomplete_evidence,
+        transaction_bar: plan
+            .provider_failure_observed()
+            .then_some(RootTransactionBar::ProviderFailure),
         reusable_summary_hits: 0,
         reusable_summary_misses: 0,
         reusable_root_summary_hits: 0,
@@ -1648,6 +1733,7 @@ fn reached_class_set(
     plan: &TypeFlowPlan,
     result: &ValueFlowSummaryResult,
     meetings: &[&ValueFlowMeeting],
+    proven_control: bool,
     root: &ProcedureHandle,
     findings: &mut Vec<AbsentMemberFinding>,
 ) -> ReceiverClassSet {
@@ -1760,6 +1846,10 @@ fn reached_class_set(
                 push_reason(&mut flow_unknown, reason.clone());
             }
         }
+    }
+    if !proven_control {
+        push_reason(&mut unknown, UnknownReason::UncertainFlow);
+        push_reason(&mut flow_unknown, UnknownReason::UncertainFlow);
     }
     let mut ordered_classes = classes.into_iter().zip(class_meetings).collect::<Vec<_>>();
     ordered_classes
@@ -2307,6 +2397,7 @@ fn reaches_any(
     procedure: &ProcedureHandle,
     starts: impl IntoIterator<Item = ProgramPointId>,
     target: ProgramPointId,
+    accept_edge: impl Fn(&crate::analyzer::semantic::ControlEdge) -> bool,
 ) -> bool {
     let semantics = procedure.semantics();
     let mut reached = vec![false; semantics.points().len()];
@@ -2322,6 +2413,9 @@ fn reaches_any(
             return true;
         }
         for (_, edge) in semantics.successor_edges(point) {
+            if !accept_edge(edge) {
+                continue;
+            }
             if !reached[edge.target_point.index()] {
                 reached[edge.target_point.index()] = true;
                 pending.push_back(edge.target_point);
@@ -2355,12 +2449,23 @@ fn normal_completion_dominates(first: &MemberAccessSite, later: &MemberAccessSit
             ControlEdgeKind::Exceptional
             | ControlEdgeKind::AsyncExceptional
             | ControlEdgeKind::Cleanup => exceptional_successors.push(edge.target_point),
-            _ => normal_successors.push(edge.target_point),
+            _ => {
+                if control_edge_proves_route(semantics, edge.evidence) {
+                    normal_successors.push(edge.target_point);
+                }
+            }
         }
     }
     !normal_successors.is_empty()
-        && reaches_any(&first.procedure, normal_successors, later_point)
-        && !reaches_any(&first.procedure, exceptional_successors, later_point)
+        && reaches_any(&first.procedure, normal_successors, later_point, |edge| {
+            control_edge_proves_route(semantics, edge.evidence)
+        })
+        && !reaches_any(
+            &first.procedure,
+            exceptional_successors,
+            later_point,
+            |_| true,
+        )
 }
 
 fn findings_can_collapse(first: &AbsentMemberFinding, later: &AbsentMemberFinding) -> bool {
@@ -2533,8 +2638,8 @@ pub(super) fn prefer_retained_finding(
 #[cfg(test)]
 mod retry_tests {
     use super::{
-        ClassSetStatus, TypeFlowRootPersistenceRejection, TypeFlowRootPersistenceStatus,
-        TypeFlowRootPersistenceTracker, dispatch_hints_exhaustive,
+        ClassSetStatus, RootIncompleteEvidence, TypeFlowRootPersistenceRejection,
+        TypeFlowRootPersistenceStatus, TypeFlowRootPersistenceTracker, dispatch_hints_exhaustive,
     };
     use crate::analyzer::semantic::{
         CandidateCoverage, ClassIdentity, ExternalMemberDeclaration, MemberDeclaration,
@@ -2616,9 +2721,10 @@ mod retry_tests {
 
     #[test]
     fn provider_persistence_rejection_is_sticky_across_feedback_and_retries() {
+        let clean = RootIncompleteEvidence::default();
         let mut persistence = TypeFlowRootPersistenceTracker::default();
         assert_eq!(
-            persistence.status(true, false),
+            clean.persistence_status(persistence.bar()),
             TypeFlowRootPersistenceStatus::Eligible
         );
 
@@ -2626,7 +2732,7 @@ mod retry_tests {
         persistence.observe_provider_failure(false);
 
         assert_eq!(
-            persistence.status(true, false),
+            clean.persistence_status(persistence.bar()),
             TypeFlowRootPersistenceStatus::Ineligible(
                 TypeFlowRootPersistenceRejection::ProviderFailure
             ),
@@ -2637,29 +2743,47 @@ mod retry_tests {
 
 #[test]
 fn persistence_status_preserves_stable_opens_and_rejects_transient_work() {
+    let clean = RootIncompleteEvidence::default();
+    let lanes = |lanes: Vec<RootExhaustedLane>| RootIncompleteEvidence {
+        lanes,
+        feedback_iteration: 0,
+    };
+    let refinement = RootExhaustedLane::Semantic {
+        stage: SemanticExhaustionStage::PlanRefinement,
+        exceeded: None,
+    };
+    let field_slots = RootExhaustedLane::Semantic {
+        stage: SemanticExhaustionStage::FieldSlotIndex,
+        exceeded: None,
+    };
     assert_eq!(
-        TypeFlowRootPersistenceStatus::from_solve(true, false, false),
+        clean.persistence_status(None),
         TypeFlowRootPersistenceStatus::Eligible,
         "a fixed point may retain stable open boundaries in its rows"
     );
     assert_eq!(
-        TypeFlowRootPersistenceStatus::from_solve(true, false, true),
+        clean.persistence_status(Some(RootTransactionBar::ProviderFailure)),
         TypeFlowRootPersistenceStatus::Ineligible(
             TypeFlowRootPersistenceRejection::ProviderFailure
         )
     );
     assert_eq!(
-        TypeFlowRootPersistenceStatus::from_solve(true, true, false),
+        lanes(vec![field_slots]).persistence_status(Some(RootTransactionBar::ProviderFailure)),
         TypeFlowRootPersistenceStatus::Ineligible(TypeFlowRootPersistenceRejection::SemanticBudget)
     );
     assert_eq!(
-        TypeFlowRootPersistenceStatus::from_solve(false, false, false),
+        lanes(vec![RootExhaustedLane::Cancelled, refinement]).persistence_status(None),
+        TypeFlowRootPersistenceStatus::Ineligible(TypeFlowRootPersistenceRejection::SemanticBudget),
+        "semantic exhaustion outranks solver incompleteness"
+    );
+    assert_eq!(
+        lanes(vec![RootExhaustedLane::Cancelled]).persistence_status(None),
         TypeFlowRootPersistenceStatus::Ineligible(
             TypeFlowRootPersistenceRejection::SolverIncomplete
         )
     );
     assert_eq!(
-        TypeFlowRootResult::feedback_fallback_status(),
+        clean.persistence_status(Some(RootTransactionBar::FeedbackFallback)),
         TypeFlowRootPersistenceStatus::Ineligible(
             TypeFlowRootPersistenceRejection::FeedbackFallback
         )

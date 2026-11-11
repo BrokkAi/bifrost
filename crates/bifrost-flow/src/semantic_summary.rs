@@ -40,9 +40,9 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledLockMode, CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryEffect,
     CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocationKind,
     CompiledSummaryOutput, CompiledSummaryPort, CompiledSummaryTransfer, CompiledSyncMapOperation,
-    CompiledTaskSpawnCondition, Completeness, PROCEDURE_SUMMARY_CONTRACT_VERSION,
-    ProcedureSummaryMatch, ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
-    compiled_flow_claims_agree,
+    CompiledTaskSpawnCondition, Completeness, PROCEDURE_SUMMARY_SUPPORTED_CONTRACT_VERSIONS,
+    ProcedureSummaryApplicability, ProcedureSummaryMatch, ResolvedActiveSemanticModels,
+    SemanticModelMatchDisposition, compiled_flow_claims_agree,
 };
 
 const LOCATION_KEY_DOMAIN: &[u8] = b"bifrost.semantic-model.procedure-summary.location.v1";
@@ -297,6 +297,49 @@ struct SelectedUnmaterializedSummaryFamily {
 /// summary's authored dependency graph, verifies every actual call-shape alias
 /// through the runtime's opaque binding, and then delegates lowering to the
 /// same pure binder used by policy analysis.
+/// Bind one selected implicit receiver call through the ordinary summary
+/// compiler. The location comes from the exact declaration id, not a display
+/// owner/member spelling. This creates no IR call site or persisted artifact.
+pub fn bind_compiled_receiver_adjustment_summary(
+    adjustment: &brokk_bifrost_analysis::analyzer::semantic_model::ReceiverAdjustment,
+    summary: &Arc<CompiledProcedureSummary>,
+    root_artifact: &SemanticArtifactKey,
+    compatibility: ExternalSummaryCompatibilityKey,
+) -> Result<SemanticProcedureSummary, ProcedureSummaryBindingError> {
+    if !adjustment.matches_summary(summary) {
+        return Err(ProcedureSummaryBindingError::TargetMismatch {
+            summary_id: summary.id.clone(),
+        });
+    }
+    let locator = adjustment.summary_locator();
+    let artifact = SemanticArtifactKey::new(
+        locator.mount(),
+        locator.path().clone(),
+        locator.language(),
+        root_artifact.revision(),
+        root_artifact.adapter().clone(),
+        root_artifact.ir_version(),
+        root_artifact.configuration(),
+        root_artifact.dependencies(),
+    );
+    let binding = ExactProcedureSummaryTargetBinding::new(
+        summary.id.clone(),
+        summary.target.clone(),
+        artifact,
+        locator,
+        ExactProcedureSummaryBoundary::new(Some(ExactProcedureSummaryReceiver), Vec::new()),
+    );
+    let bound =
+        bind_compiled_procedure_summaries(&[Arc::clone(summary)], vec![binding], compatibility)?;
+    bound
+        .entries()
+        .next()
+        .map(|(_, summary)| summary.clone())
+        .ok_or_else(|| ProcedureSummaryBindingError::MissingBinding {
+            summary_id: summary.id.clone(),
+        })
+}
+
 pub fn bind_active_unmaterialized_procedure_summaries(
     active: &ResolvedActiveSemanticModels,
     targets: &[UnmaterializedExternalTarget],
@@ -309,14 +352,22 @@ pub fn bind_active_unmaterialized_procedure_summaries(
         let Some(selected) = select_unmaterialized_flow_summary(&matched)? else {
             continue;
         };
-        let family = families
-            .entry(Arc::as_ptr(&selected.shard) as usize)
-            .or_insert_with(|| SelectedUnmaterializedSummaryFamily {
-                order: active.procedure_summary_shard_order(&selected.shard),
-                shard: Arc::clone(&selected.shard),
-                language: selected.shard.manifest.language.clone(),
-                root_ids: HashSet::default(),
-            });
+        let family = match families.entry(Arc::as_ptr(&selected.shard) as usize) {
+            std::collections::hash_map::Entry::Occupied(family) => family.into_mut(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                // An open shard order cannot place the family. Its targets
+                // keep their call boundaries, as an incomplete selection does.
+                let Ok(order) = active.procedure_summary_shard_order(&selected.shard) else {
+                    continue;
+                };
+                slot.insert(SelectedUnmaterializedSummaryFamily {
+                    order,
+                    shard: Arc::clone(&selected.shard),
+                    language: selected.shard.manifest.language.clone(),
+                    root_ids: HashSet::default(),
+                })
+            }
+        };
         family.root_ids.insert(selected.record.id.clone());
     }
 
@@ -324,8 +375,12 @@ pub fn bind_active_unmaterialized_procedure_summaries(
     families.sort_unstable_by_key(|family| family.order);
     let mut aliases = Vec::new();
     for family in families {
-        let payload = active
-            .procedure_summary_family(&family.shard, family.root_ids.iter().map(String::as_str));
+        // An open family read leaves this family's targets unbound.
+        let Ok(payload) = active
+            .procedure_summary_family(&family.shard, family.root_ids.iter().map(String::as_str))
+        else {
+            continue;
+        };
         let by_id = payload
             .iter()
             .map(|summary| (summary.id.as_str(), summary))
@@ -369,7 +424,7 @@ pub fn bind_active_unmaterialized_procedure_summaries(
             Vec<brokk_bifrost_analysis::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding>,
         >::new();
         for summary in &summaries {
-            let Some((owner, member)) =
+            let Some((_owner, member)) =
                 authored_procedure_target_identity(&summary.target.path, &summary.target.symbol)
             else {
                 return Err(ProcedureSummaryBindingError::TargetMismatch {
@@ -377,10 +432,12 @@ pub fn bind_active_unmaterialized_procedure_summaries(
                 });
             };
             let mut applicable = Vec::new();
+            // No owner prefilter: the active matcher also selects a summary
+            // authored under a declaration alias of the resolved owner
+            // (#9903). The re-match and the call-shape binding prove the owner.
             for target in targets.iter().filter(|target| {
                 target.language().semantic_pack_label() == family.language
                     && target.has_receiver() == summary.target.has_receiver
-                    && owner == target.owner_fqn()
                     && member == target.member()
             }) {
                 let matched = active.procedure_summaries_for_external_target(target);
@@ -466,14 +523,52 @@ pub fn bind_active_unmaterialized_procedure_summaries(
         }
     }
 
-    if aliases.is_empty() {
+    let chains = targets
+        .iter()
+        .filter_map(|target| {
+            target
+                .receiver_adjustment_call
+                .map(|call| (call, target.receiver_adjustments.clone()))
+        })
+        .collect::<Vec<_>>();
+    let mut adjustments = chains
+        .iter()
+        .flat_map(|(_, steps)| steps.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    adjustments.sort_unstable();
+    adjustments.dedup();
+    let mut implicit = Vec::new();
+    for adjustment in adjustments {
+        let matched = active.procedure_summaries_for(adjustment.summary_target());
+        let [selected] = matched.records.as_slice() else {
+            return Err(ProcedureSummaryBindingError::ActiveModelSelection {
+                detail: "receiver adjustment lost its selected exact summary".to_owned(),
+            });
+        };
+        if matched.disposition != SemanticModelMatchDisposition::Unique
+            || matched.applicability != ProcedureSummaryApplicability::Complete
+        {
+            return Err(ProcedureSummaryBindingError::ActiveModelSelection {
+                detail: "receiver adjustment summary selection is incomplete".to_owned(),
+            });
+        }
+        implicit.push(bind_compiled_receiver_adjustment_summary(
+            &adjustment,
+            &selected.record,
+            root_artifact,
+            compatibility,
+        )?);
+    }
+    if aliases.is_empty() && implicit.is_empty() {
         return Ok(None);
     }
     ExternalSemanticSummarySet::try_new_with_unmaterialized_call_shape_bindings(
-        Vec::new(),
+        implicit,
         aliases,
         compatibility,
     )
+    .and_then(|set| set.with_receiver_adjustments(chains))
     .map(Some)
     .map_err(|source| ProcedureSummaryBindingError::InvalidSummarySet { source })
 }
@@ -492,6 +587,8 @@ fn select_unmaterialized_flow_summary(
         return Ok(None);
     }
     match matched.disposition {
+        // Open always comes with Incomplete applicability, handled above.
+        SemanticModelMatchDisposition::Open(_) => Ok(None),
         SemanticModelMatchDisposition::Empty if matched.records.is_empty() => Ok(None),
         SemanticModelMatchDisposition::Empty => {
             Err(ProcedureSummaryBindingError::ActiveModelSelection {
@@ -695,7 +792,7 @@ fn verify_target(
     // contract. `compatibility.schema()` identifies the lowered reusable
     // carrier and can advance independently when its internal representation
     // changes without changing authored pack bytes or meaning.
-    if summary.contract_version != PROCEDURE_SUMMARY_CONTRACT_VERSION
+    if !PROCEDURE_SUMMARY_SUPPORTED_CONTRACT_VERSIONS.contains(&summary.contract_version)
         || binding.artifact.dependencies() != compatibility.dependencies()
     {
         return Err(ProcedureSummaryBindingError::IncompatibleCompatibilityKey {
@@ -920,7 +1017,7 @@ fn build_summary_set(
             );
             let completeness = match summary.completeness {
                 Completeness::Complete => SummaryCompleteness::Complete,
-                Completeness::Partial => SummaryCompleteness::partial(vec![
+                Completeness::Partial | Completeness::Fenced => SummaryCompleteness::partial(vec![
                     SummaryIncompleteReason::ExternalModelIncomplete(origins[member].content()),
                 ])
                 .map_err(|source| invalid_summary(summary, source))?,
@@ -1035,7 +1132,7 @@ fn model_evidence(
 ) -> Result<SummaryEvidence, ProcedureSummaryBindingError> {
     let incomplete = match summary.completeness {
         Completeness::Complete => Vec::new(),
-        Completeness::Partial => vec![MODEL_INCOMPLETE_REASON.to_owned()],
+        Completeness::Partial | Completeness::Fenced => vec![MODEL_INCOMPLETE_REASON.to_owned()],
     };
     SummaryEvidence::try_new(vec![MODEL_UNPROVEN_REASON.to_owned()], incomplete)
         .map_err(|source| invalid_summary(summary, source))
@@ -1569,6 +1666,8 @@ mod external_flow_selection_tests {
             concurrency_effects: Vec::new(),
             returned_callables: Vec::new(),
             declared_effects: Vec::new(),
+            subject_effects: Vec::new(),
+            lifecycle_coverage: Vec::new(),
             preconditions: None,
             result_contracts: Vec::new(),
             result_use_obligations: Vec::new(),

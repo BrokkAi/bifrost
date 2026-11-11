@@ -26,6 +26,10 @@ use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::StateMap;
 
 use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::TypeInCallPosition;
 
+use brokk_bifrost_analysis::analyzer::resolution::fact_resolution::call_applicability::ReferenceConversion;
+
+use brokk_bifrost_analysis::analyzer::resolution::model::ResolutionTypeRef;
+
 use brokk_bifrost_analysis::analyzer::store::Result;
 use brokk_bifrost_core::analyzer::resolution_facts::{IntrinsicTypeKind, ResolutionEngineRuleKind};
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
@@ -36,6 +40,10 @@ pub(crate) static SCALA_CALL_APPLICABILITY_ADAPTER: ScalaCallApplicabilityAdapte
 pub(crate) struct ScalaCallApplicabilityAdapter;
 
 impl CallApplicabilityAdapter for ScalaCallApplicabilityAdapter {
+    fn bare_nonapplication_specificity(&self) -> bool {
+        true
+    }
+
     fn has_scoped_receiver_extensions(&self) -> bool {
         true
     }
@@ -116,6 +124,13 @@ impl CallApplicabilityAdapter for ScalaCallApplicabilityAdapter {
         &["apply"]
     }
 
+    fn intrinsic_type_rejects_application(&self, kind: IntrinsicTypeKind, spelling: &str) -> bool {
+        kind == IntrinsicTypeKind::LanguageBuiltin
+            && spelling.strip_prefix("scala.").is_some_and(|name| {
+                brokk_bifrost_jvm::scala::graph::syntax::NON_APPLICABLE_RESULT_TYPES.contains(&name)
+            })
+    }
+
     fn map_arguments(
         &self,
         call: &LoweredCallApplicabilityObligation,
@@ -190,5 +205,16 @@ impl CallApplicabilityAdapter for ScalaCallApplicabilityAdapter {
             previous_states,
             completion,
         )
+    }
+
+    fn reference_conversion(
+        &self,
+        evaluation: &mut FactEvaluation<'_, '_>,
+        _operand_slots: [SemanticId; 2],
+        source: ResolutionTypeRef,
+        target: ResolutionTypeRef,
+        states: &StateMap,
+    ) -> Result<Option<ReferenceConversion>> {
+        evaluation.scala_reference_conversion(source, target, states)
     }
 }

@@ -16,10 +16,11 @@ publish = true
 name = "brokk_bifrost_csharp"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.1" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.15.2" }
 regex = "1.12.2"
+quick-xml = "0.40"
 tree-sitter = "0.25.10"
-tree-sitter-c-sharp = { package = "brokk-tree-sitter-c-sharp", version = "=0.23.8" }
+tree-sitter-c-sharp = { package = "brokk-tree-sitter-c-sharp", version = "=0.23.9" }
 workspace-hack.workspace = true
 
 [dev-dependencies]

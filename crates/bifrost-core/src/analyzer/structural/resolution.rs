@@ -305,6 +305,9 @@ labelled_enum! {
         AncestorExternalUnindexed => "ancestor_external_unindexed",
         HierarchyTruncated => "hierarchy_truncated",
         HierarchyAmbiguous => "hierarchy_ambiguous",
+        /// Known owner, but selected content or inventory does not close the family.
+        CoverageIncomplete => "coverage_incomplete",
+        ProviderUnavailable => "provider_unavailable",
         FamilyRootNotCanonical => "family_root_not_canonical",
     }
 }
@@ -433,6 +436,9 @@ labelled_enum! {
     /// Every authored reference below the expression was lowered; only its resulting
     /// type or value remains unknown.
         UnsupportedExpressionType => "unsupported_expression_type",
+    /// Structured C# compilation-unit evidence of an unevaluated file program.
+        FileProgramEvidence => "file_program_evidence",
+        CompilationImportsUnenumerated => "compilation_imports_unenumerated",
     }
 }
 

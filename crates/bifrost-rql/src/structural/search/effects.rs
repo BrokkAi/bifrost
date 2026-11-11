@@ -28,7 +28,7 @@
 
 mod compose;
 
-use super::dispatch::DispatchBoundaryClass;
+use super::dispatch::{DispatchBoundaryClass, DispatchCompleteness, DispatchProof};
 use super::*;
 use crate::analyzer::semantic_model::overlay::{
     ModelMembersState, ModelOwnerAnswer, ModelProvider, ModelProviderSelection, ModelSymbolRef,
@@ -251,6 +251,7 @@ pub(super) struct AssignmentRelationValue {
     pub(super) coverage: EffectCoverage,
     pub(super) reason: Option<&'static str>,
     pub(super) replacement_events: Vec<brokk_bifrost_flow::flow_state::StateEventRow>,
+    pub(super) read_event: Option<brokk_bifrost_flow::flow_state::StateEventRow>,
     pub(super) related: Vec<CodeQueryRelatedSource>,
 }
 
@@ -645,6 +646,10 @@ enum ModelAnswer {
         preconditions: Option<Vec<CompiledOperationPrecondition>>,
     },
     Conflict,
+    /// The activated models could not be read in full for the identity (their
+    /// JVM-family part was open). It fails closed like `Conflict`, with its own
+    /// reason, and is never an absence.
+    InputUnavailable,
     Empty,
 }
 
@@ -1733,6 +1738,15 @@ fn go_assignment_conversion_types_exact(
                     );
                     (None, work)
                 }
+                BoundedResolution::Unavailable { reason, work } => {
+                    binding_stopped = true;
+                    proof.analyzer.record_query_incomplete(
+                        brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                            format!("Go explicit binding type resolution input unavailable: {reason}").into(),
+                        ),
+                    );
+                    (None, work)
+                }
                 BoundedResolution::Cancelled { work } => {
                     binding_stopped = true;
                     proof.analyzer.record_query_incomplete(
@@ -1770,15 +1784,20 @@ fn go_assignment_conversion_types_exact(
             );
         }
         stopped |= cancelled;
-        let exact = !cancelled && result_type.is_some() && result_type == binding_type && {
-            let charged = semantic.charge_consumer_traversal(
-                proof.file,
-                0,
-                "Go result assignment type proof",
-            );
-            stopped |= !charged;
-            charged
-        };
+        let exact = !cancelled
+            && brokk_bifrost_go_analysis::go_assignment_conversion_types_identical(
+                result_type,
+                binding_type,
+            )
+            && {
+                let charged = semantic.charge_consumer_traversal(
+                    proof.file,
+                    0,
+                    "Go result assignment type proof",
+                );
+                stopped |= !charged;
+                charged
+            };
         if !stopped && result_types_present {
             proof
                 .proofs
@@ -2476,7 +2495,9 @@ impl EffectTraversalCache {
         if EFFECT_DISPATCH_PROVIDER_FAILURE.get() {
             return (
                 Arc::new(super::dispatch::DispatchSiteAnswer::interrupted(
-                    "unknown", None, None,
+                    super::dispatch::DispatchStatus::Unknown,
+                    None,
+                    None,
                 )),
                 Incompleteness::Operational(DerivationExecutionCause::Provider),
             );
@@ -2806,9 +2827,24 @@ impl EffectTraversalCache {
             if result_contract_names.is_none() {
                 let mut inventory = ResultContractNameInventory::default();
                 if let Some(models) = models {
-                    for (language, member, has_receiver, arity) in
-                        models.result_contract_name_inventory()
-                    {
+                    let names = models.result_contract_name_inventory();
+                    // A partial inventory can only miss candidates, and the
+                    // query that saw it reports itself incomplete.
+                    if let Some(open) = names.jvm_open {
+                        analyzer.record_query_incomplete(
+                            if open.is_cancellation() {
+                                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::Cancelled
+                            } else {
+                                brokk_bifrost_analysis::analyzer::QueryReadIncomplete::SemanticEvidenceUnavailable(
+                                    format!("result-contract name inventory: {}", open.reason).into(),
+                                )
+                            },
+                        );
+                    }
+                    if names.jvm_open.is_some_and(|open| open.is_cancellation()) {
+                        return Arc::new(inventory);
+                    }
+                    for (language, member, has_receiver, arity) in names.rows {
                         inventory
                             .members
                             .entry((language, member, has_receiver))
@@ -3165,6 +3201,7 @@ fn lookup_declared_effects(
     match matched.disposition {
         SemanticModelMatchDisposition::Empty => ModelAnswer::Empty,
         SemanticModelMatchDisposition::Conflict => ModelAnswer::Conflict,
+        SemanticModelMatchDisposition::Open(_) => ModelAnswer::InputUnavailable,
         SemanticModelMatchDisposition::Unique => {
             let Some(selected) = matched.records.first() else {
                 return ModelAnswer::Empty;
@@ -3372,7 +3409,7 @@ pub(super) fn result_contract_call_expansions(
             ModelAnswer::Modeled {
                 result_contracts, ..
             } if !result_contracts.is_empty() => result_contracts,
-            ModelAnswer::Conflict => {
+            ModelAnswer::Conflict | ModelAnswer::InputUnavailable => {
                 record_result_contract_dispatch_coverage(
                     analyzer,
                     cache,
@@ -3684,13 +3721,14 @@ pub(super) fn call_result_contract_expansions<'a>(
     let arm_count = answer.arms.len();
     let mut modeled_arm_count = 0usize;
     let mut model_conflict = false;
+    let mut model_input_unavailable = false;
     let mut every_arm_closed = !answer.arms.is_empty();
     let mut every_arm_proven = !answer.arms.is_empty();
     let mut common_contracts: Option<Vec<BoundResultContract>> = None;
     let mut keys = Vec::with_capacity(arm_count);
 
     for arm in &answer.arms {
-        every_arm_proven &= arm.proof == "proven";
+        every_arm_proven &= arm.proof == DispatchProof::Proven;
         let key = match &arm.target_unit {
             Some(unit) => cache.key_for(analyzer, unit),
             None => arm.unmaterialized_target.as_ref().map(external_modeled_key),
@@ -3714,6 +3752,10 @@ pub(super) fn call_result_contract_expansions<'a>(
             }
             ModelAnswer::Conflict => {
                 model_conflict = true;
+                (Vec::new(), false)
+            }
+            ModelAnswer::InputUnavailable => {
+                model_input_unavailable = true;
                 (Vec::new(), false)
             }
             // An exact canonical arm with no active authored summary is a
@@ -3762,6 +3804,9 @@ pub(super) fn call_result_contract_expansions<'a>(
     if model_conflict {
         coverage = coverage.meet(EffectCoverage::Open);
         reason = Some(EffectReason::ModelConflict);
+    } else if model_input_unavailable {
+        coverage = coverage.meet(EffectCoverage::Open);
+        reason = Some(EffectReason::ModelInputUnavailable);
     } else if coverage == EffectCoverage::Truncated {
         reason = Some(EffectReason::DispatchTruncated);
     } else if coverage == EffectCoverage::Open && reason.is_none() {
@@ -4304,6 +4349,9 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                         row.reason = Some("model_unavailable");
                         break;
                     }
+                    SemanticModelMatchDisposition::Open(open) => {
+                        unreachable!("a reviewed libc question has no JVM-family part: {open:?}")
+                    }
                 };
                 if summary.shard.manifest.pack_id != REVIEWED_LIBC_RESULT_USE_PACK_ID
                     || summary.shard.manifest.language != "cpp"
@@ -4364,6 +4412,9 @@ fn reviewed_cpp_libc_call_result_obligation_expansions(
                     SemanticModelMatchDisposition::Empty => {
                         row.reason = Some("model_unavailable");
                         break;
+                    }
+                    SemanticModelMatchDisposition::Open(open) => {
+                        unreachable!("a reviewed libc question has no JVM-family part: {open:?}")
                     }
                 };
                 if summary.shard.manifest.pack_id != REVIEWED_LIBC_RESULT_USE_PACK_ID
@@ -4838,6 +4889,7 @@ fn native_go_call_result_obligation_expansions(
     analyzer: &dyn IAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
+    bindings: &mut crate::analyzer::usages::call_relations::CallBindingCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
@@ -4845,6 +4897,40 @@ fn native_go_call_result_obligation_expansions(
     let classification = cache.native_result_use_for_shape(analyzer, shape);
     let (answer, mut dispatch_incompleteness) =
         cache.dispatch_at_source_with_cause(semantic, &outcome.file, outcome.range);
+    let selected_source = (answer.arms.len() == 1 && shape.report.outcome.receiver_range.is_none())
+        .then(|| {
+            super::call_binding::selected_source_callable_evidence(
+                analyzer, bindings, semantic, shape, &answer,
+            )
+        })
+        .flatten()
+        .filter(|proof| proof.is_direct_go_application());
+    let selected_source_arm = selected_source.is_some();
+    // The inventory belongs to the application expression, not the selected
+    // closure body. A missing inventory or port cannot prove absence.
+    let function_value_ports = if selected_source_arm || answer.arms.is_empty() {
+        let (ports, cause) =
+            brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause(
+                analyzer,
+                || {
+                    if let Some(proof) = selected_source.as_ref() {
+                        brokk_bifrost_go_analysis::analyzer::go_native_error_bound_function_value_obligations(
+                            analyzer, &outcome.file, proof.source(), outcome.range,
+                            proof.binding(), proof.callable_range(), semantic.cancellation(),
+                        )
+                    } else {
+                        brokk_bifrost_go_analysis::analyzer::go_native_error_function_value_obligations(
+                            analyzer, &outcome.file, outcome.range, semantic.cancellation(),
+                        )
+                    }
+                },
+            );
+        dispatch_incompleteness = dispatch_incompleteness
+            .combine(cause.map_or(Incompleteness::Content, Incompleteness::Operational));
+        if cause.is_none() { ports } else { None }
+    } else {
+        None
+    };
     let dispatch_coverage = coverage_for(answer.coverage);
     let mut arm_targets = Vec::with_capacity(answer.arms.len());
     let mut arm_result_counts = Vec::with_capacity(answer.arms.len());
@@ -4925,6 +5011,14 @@ fn native_go_call_result_obligation_expansions(
     if let Ok(site) = &classification {
         ordinals.extend(site.overrides().iter().map(|fact| fact.result_ordinal));
     }
+    if (selected_source_arm || answer.arms.is_empty())
+        && let Some(ports) = &function_value_ports
+    {
+        ordinals.extend(
+            (0..ports.len())
+                .map(|ordinal| u32::try_from(ordinal).expect("Go result ordinal fits u32")),
+        );
+    }
     for result_count in arm_result_counts.iter().flatten() {
         ordinals.extend(
             (0..*result_count)
@@ -4984,6 +5078,17 @@ fn native_go_call_result_obligation_expansions(
         let mut reason = use_reason;
         if let Some(excluded) = excluded_reason {
             reason = Some(excluded);
+        } else if selected_source_arm {
+            if let Some(Some(obligation)) = function_value_ports.as_ref().and_then(|ports| {
+                usize::try_from(result_ordinal)
+                    .ok()
+                    .and_then(|ordinal| ports.get(ordinal))
+            }) {
+                native_obligation = Some(*obligation);
+                modeled_arm_count = 1;
+            } else {
+                reason = Some("native_signature_unknown");
+            }
         } else if native_dispatch_can_close {
             let mut common = None;
             let mut all_obligations_agree = true;
@@ -5040,23 +5145,12 @@ fn native_go_call_result_obligation_expansions(
                 reason = Some("native_signature_unknown");
             }
         } else if answer.arms.is_empty() {
-            let (obligation, cause) =
-                brokk_bifrost_analysis::analyzer::i_analyzer::capture_read_execution_cause(
-                    analyzer,
-                    || {
-                        brokk_bifrost_go_analysis::analyzer::go_native_error_function_value_obligation(
-                    analyzer,
-                    &outcome.file,
-                    outcome.range,
-                    result_ordinal,
-                    semantic.cancellation(),
-                )
-                    },
-                );
-            dispatch_incompleteness = dispatch_incompleteness
-                .combine(cause.map_or(Incompleteness::Content, Incompleteness::Operational));
-            if let Some(obligation) = obligation {
-                native_obligation = Some(obligation);
+            if let Some(Some(obligation)) = function_value_ports.as_ref().and_then(|ports| {
+                usize::try_from(result_ordinal)
+                    .ok()
+                    .and_then(|ordinal| ports.get(ordinal))
+            }) {
+                native_obligation = Some(*obligation);
             } else {
                 reason = Some("dispatch_unresolved");
             }
@@ -7177,6 +7271,7 @@ pub(super) fn call_result_obligation_expansions(
     analyzer: &dyn IAnalyzer,
     semantic: &mut SemanticQueryContext<'_>,
     cache: &mut EffectTraversalCache,
+    bindings: &mut crate::analyzer::usages::call_relations::CallBindingCache,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     shape: &CallShapeValue,
 ) -> Vec<PipelineExpansion> {
@@ -7187,6 +7282,7 @@ pub(super) fn call_result_obligation_expansions(
             analyzer,
             semantic,
             cache,
+            bindings,
             diagnostics,
             shape,
         );
@@ -7323,6 +7419,10 @@ pub(super) fn call_result_obligation_expansions(
                             (SemanticModelMatchDisposition::Unique, [summary]) => summary,
                             (SemanticModelMatchDisposition::Conflict, _) => {
                                 row.reason = Some("model_conflict");
+                                break;
+                            }
+                            (SemanticModelMatchDisposition::Open(_), _) => {
+                                row.reason = Some("model_input_unavailable");
                                 break;
                             }
                             _ => {
@@ -10511,7 +10611,10 @@ fn classify_call_argument_operation(
                 preconditions: Some(preconditions),
                 ..
             } => preconditions,
-            ModelAnswer::Modeled { .. } | ModelAnswer::Conflict | ModelAnswer::Empty => {
+            ModelAnswer::Modeled { .. }
+            | ModelAnswer::Conflict
+            | ModelAnswer::InputUnavailable
+            | ModelAnswer::Empty => {
                 return unknown;
             }
         };
@@ -11299,9 +11402,10 @@ fn direct_conditional_summary(
         } if covers_overrides || !key.has_receiver => {
             ConditionalProcedureSummaryAnswer::Complete(conditional_result_refinements)
         }
-        ModelAnswer::Modeled { .. } | ModelAnswer::Conflict | ModelAnswer::Empty => {
-            ConditionalProcedureSummaryAnswer::Open
-        }
+        ModelAnswer::Modeled { .. }
+        | ModelAnswer::Conflict
+        | ModelAnswer::InputUnavailable
+        | ModelAnswer::Empty => ConditionalProcedureSummaryAnswer::Open,
     }
 }
 
@@ -11721,12 +11825,12 @@ fn conditional_summary_for_call(
     let mut common = None::<Vec<CompiledConditionalResultRefinement>>;
     let mut every_arm_closes_residual = true;
     for arm in &answer.arms {
-        if arm.proof != "proven" {
+        if arm.proof != DispatchProof::Proven {
             return ConditionalProcedureSummaryAnswer::Open;
         }
         let (arm_answer, closes_residual) = match &arm.target_unit {
             Some(unit) => {
-                if arm.completeness != "complete" {
+                if arm.completeness != DispatchCompleteness::Complete {
                     return ConditionalProcedureSummaryAnswer::Open;
                 }
                 (
@@ -11746,9 +11850,11 @@ fn conditional_summary_for_call(
                                 analyzer, semantic, cache, unit, depth,
                             )
                         }
-                        Some(ModelAnswer::Modeled { .. } | ModelAnswer::Conflict) => {
-                            ConditionalProcedureSummaryAnswer::Open
-                        }
+                        Some(
+                            ModelAnswer::Modeled { .. }
+                            | ModelAnswer::Conflict
+                            | ModelAnswer::InputUnavailable,
+                        ) => ConditionalProcedureSummaryAnswer::Open,
                     },
                     false,
                 )
@@ -13885,7 +13991,10 @@ fn normal_return_refinement_calls(
                     normal_return_refinements,
                     complete && (covers_overrides || !key.has_receiver),
                 ),
-                ModelAnswer::Modeled { .. } | ModelAnswer::Conflict | ModelAnswer::Empty => {
+                ModelAnswer::Modeled { .. }
+                | ModelAnswer::Conflict
+                | ModelAnswer::InputUnavailable
+                | ModelAnswer::Empty => {
                     common = Some(Vec::new());
                     break;
                 }
@@ -14296,6 +14405,7 @@ fn external_arm_lookup(
             ..
         } => (complete, covers_overrides, effects),
         ModelAnswer::Conflict => return (ArmLookup::Conflict, None),
+        ModelAnswer::InputUnavailable => return (ArmLookup::InputUnavailable, None),
         ModelAnswer::Empty => return (ArmLookup::Unmodeled { analyzable: false }, None),
     };
     let closes =
@@ -14332,12 +14442,12 @@ fn classify_dispatch_arms(
     for (dispatch_index, arm) in answer.arms.iter().enumerate() {
         let callee = arm.target_unit.clone();
         let mut external_callee = None;
-        let proof = if arm.proof == "proven" {
+        let proof = if arm.proof == DispatchProof::Proven {
             EffectProof::Proven
         } else {
             EffectProof::Unproven
         };
-        let complete = arm.completeness == "complete";
+        let complete = arm.completeness == DispatchCompleteness::Complete;
         let (key, lookup, declaration_id) = match &arm.target_unit {
             Some(unit) => {
                 let declaration_id = Some(declaration_identity(unit));
@@ -14348,6 +14458,7 @@ fn classify_dispatch_arms(
                                 ArmLookup::Declared(effects)
                             }
                             ModelAnswer::Conflict => ArmLookup::Conflict,
+                            ModelAnswer::InputUnavailable => ArmLookup::InputUnavailable,
                             // The target is a workspace declaration with a
                             // readable body, so its own effects are reachable
                             // through propagation rather than missing. A
@@ -14474,6 +14585,7 @@ fn dispatch_arms(
         let reason = match &arm.effect.lookup {
             ArmLookup::Unkeyable => Some("CalleeUnkeyable"),
             ArmLookup::Conflict => Some("ModelConflict"),
+            ArmLookup::InputUnavailable => Some("ModelInputUnavailable"),
             ArmLookup::Unmodeled { analyzable: false } => Some("CalleeUnmodeled"),
             ArmLookup::Declared(_) if arm.external_callee.is_some() => Some("IncompleteSummary"),
             _ => None,
@@ -14889,7 +15001,7 @@ fn discover_effect_graph(
                     };
                     (effects, basis)
                 }
-                ModelAnswer::Conflict | ModelAnswer::Empty => {
+                ModelAnswer::Conflict | ModelAnswer::InputUnavailable | ModelAnswer::Empty => {
                     (Vec::new(), EffectNodeBasis::Unestablished)
                 }
             },
@@ -15144,6 +15256,11 @@ fn discover_effect_graph(
                             .local_gaps
                             .push(EffectReason::ModelConflict);
                     }
+                    ArmLookup::InputUnavailable => {
+                        graph.procedures[node]
+                            .local_gaps
+                            .push(EffectReason::ModelInputUnavailable);
+                    }
                     ArmLookup::Unmodeled { analyzable: false } => {
                         graph.procedures[node]
                             .local_gaps
@@ -15271,6 +15388,7 @@ fn discover_effect_graph(
                             | EffectReason::DispatchUnsupported
                             | EffectReason::CalleeUnkeyable
                             | EffectReason::ModelConflict
+                            | EffectReason::ModelInputUnavailable
                             | EffectReason::CalleeUnmodeled => Incompleteness::Content,
                         })
                     }),

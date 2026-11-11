@@ -1192,7 +1192,7 @@ fn export_semantic_document<'a>(
     completeness_statements.extend(callable_values_completeness);
     let declaration_status = match pack_completeness {
         Completeness::Complete => CsmiCoverageStatus::Complete,
-        Completeness::Partial => CsmiCoverageStatus::Partial,
+        Completeness::Partial | Completeness::Fenced => CsmiCoverageStatus::Partial,
     };
     completeness_statements.push(CsmiCompletenessStatement {
         vocabulary: None,
@@ -1798,7 +1798,7 @@ fn export_collection_flows(
         }));
         let (status, limitations) = match flow.coverage {
             Some(Completeness::Complete) => (CsmiCoverageStatus::Complete, Vec::new()),
-            Some(Completeness::Partial) | None => (
+            Some(Completeness::Partial | Completeness::Fenced) | None => (
                 CsmiCoverageStatus::Partial,
                 vec![CsmiLimitation {
                     kind: "coverage-limited".to_owned(),
@@ -1981,7 +1981,7 @@ fn export_deferred_yields(
         }));
         let (status, limitations) = match deferred_yield.coverage {
             Some(Completeness::Complete) => (CsmiCoverageStatus::Complete, Vec::new()),
-            Some(Completeness::Partial) | None => (
+            Some(Completeness::Partial | Completeness::Fenced) | None => (
                 CsmiCoverageStatus::Partial,
                 vec![CsmiLimitation {
                     kind: "coverage-limited".to_owned(),

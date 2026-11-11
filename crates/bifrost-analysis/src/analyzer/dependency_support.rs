@@ -1,13 +1,98 @@
+use std::cell::RefCell;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use crate::CancellationToken;
+use crate::analyzer::semantic_model::ExternalDiscoveryRead;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, BoundedProducerDiagnostics, DependencyPackDiagnostic,
     DependencyPackDiagnosticSeverity, DependencyPackLimits, DependencyPackProduction,
     DependencyProvenance, ExactArtifact, Locator, ProducerDiagnostic, ProducerDiagnosticSeverity,
     SuppressedDiagnostics, read_exact_artifact_while,
 };
+
+#[derive(Default)]
+pub struct ExternalDiscoveryReads {
+    pub keys: Vec<ExternalDiscoveryRead>,
+    pub complete: bool,
+    refused: bool,
+}
+
+thread_local! {
+    static EXTERNAL_DISCOVERY_READS: RefCell<Option<ExternalDiscoveryReads>> = const { RefCell::new(None) };
+}
+
+pub fn capture_external_discovery_reads<T>(f: impl FnOnce() -> T) -> (T, ExternalDiscoveryReads) {
+    EXTERNAL_DISCOVERY_READS.with(|slot| {
+        assert!(slot.borrow().is_none(), "nested external discovery capture");
+        *slot.borrow_mut() = Some(ExternalDiscoveryReads::default());
+    });
+    let result = f();
+    let reads = EXTERNAL_DISCOVERY_READS.with(|slot| slot.borrow_mut().take().unwrap());
+    (result, reads)
+}
+
+pub fn report_external_discovery_read(read: ExternalDiscoveryRead) {
+    EXTERNAL_DISCOVERY_READS.with(|slot| {
+        if let Some(reads) = slot.borrow_mut().as_mut() {
+            reads.keys.push(read);
+        }
+    });
+}
+
+pub fn declare_external_discovery_reads_complete() {
+    EXTERNAL_DISCOVERY_READS.with(|slot| {
+        if let Some(reads) = slot.borrow_mut().as_mut() {
+            reads.complete = !reads.refused;
+        }
+    });
+}
+
+pub fn refuse_external_discovery_reads() {
+    EXTERNAL_DISCOVERY_READS.with(|slot| {
+        if let Some(reads) = slot.borrow_mut().as_mut() {
+            reads.refused = true;
+            reads.complete = false;
+        }
+    });
+}
+
+/// Read an external file under the existing artifact budget and record its bytes.
+pub fn read_external_evidence_file_with_budget(
+    ecosystem: &str,
+    path: &Path,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ExactArtifact, DependencyPackDiagnostic> {
+    let result =
+        read_evidence_file_with_budget(ecosystem, path, limits, evidence_bytes_read, cancellation);
+    match &result {
+        Ok(artifact) => {
+            report_external_discovery_read(ExternalDiscoveryRead::file(path, artifact.bytes()))
+        }
+        Err(diagnostic)
+            if diagnostic.code == "limit.artifact_bytes"
+                || diagnostic.code == "limit.total_artifact_bytes" =>
+        {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                report_external_discovery_read(ExternalDiscoveryRead::OverBudgetFile {
+                    absolute_path: path.to_path_buf(),
+                    size: metadata.len(),
+                });
+            } else {
+                refuse_external_discovery_reads();
+            }
+        }
+        Err(diagnostic) if diagnostic.code == "artifact.metadata" && !path.exists() => {
+            report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                absolute_path: path.to_path_buf(),
+            });
+        }
+        Err(_) => refuse_external_discovery_reads(),
+    }
+    result
+}
 
 #[derive(Debug)]
 #[doc(hidden)]
@@ -214,6 +299,93 @@ pub fn read_bounded_declaration_file(
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|error| format!("could not read declaration file: {error}"))
+}
+
+/// Read the project files a files-only dependency producer interprets.
+///
+/// Every file for which `is_input` holds is read as one immutable snapshot,
+/// within the pack limits' file count and byte budget. A listing or read
+/// failure, a breached limit and cancellation are pushed onto `diagnostics`
+/// under `code_prefix` (`rust`, `ruby`) and the shared `limit.*` codes, with
+/// `ecosystem` naming the build tool in each message. Returns the snapshots,
+/// the bytes they hold, and whether acquisition was cancelled.
+#[doc(hidden)]
+pub fn select_dependency_input_snapshots(
+    project: &dyn crate::analyzer::Project,
+    ecosystem: &str,
+    code_prefix: &str,
+    is_input: impl Fn(&Path) -> bool,
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut crate::analyzer::semantic_model::BoundedDependencyDiagnostics,
+) -> (
+    Vec<(
+        brokk_bifrost_core::analyzer::model::ProjectFile,
+        brokk_bifrost_core::analyzer::project::ProjectSourceSnapshot,
+    )>,
+    u64,
+    bool,
+) {
+    let mut selected = Vec::new();
+    let mut bytes = 0_u64;
+    let files = match project.all_files_shared() {
+        Ok(files) => files,
+        Err(error) => {
+            diagnostics.push(dependency_diagnostic(
+                &format!("{code_prefix}.files.list"),
+                None,
+                error.to_string(),
+            ));
+            return (selected, bytes, false);
+        }
+    };
+    for file in files.iter().filter(|file| is_input(file.rel_path())) {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            diagnostics.push(dependency_diagnostic(
+                &format!("{code_prefix}.evidence.cancelled"),
+                None,
+                format!("{ecosystem} file acquisition cancelled"),
+            ));
+            return (selected, bytes, true);
+        }
+        if selected.len() >= limits.max_source_files_per_artifact {
+            diagnostics.push(dependency_diagnostic(
+                "limit.dependency_input_files",
+                None,
+                format!("{ecosystem} file count exceeds the dependency evidence limit"),
+            ));
+            break;
+        }
+        let remaining = limits.max_total_artifact_bytes.saturating_sub(bytes);
+        let cap = remaining
+            .min(limits.producer.max_artifact_bytes)
+            .min(usize::MAX as u64) as usize;
+        if cap == 0 {
+            diagnostics.push(dependency_diagnostic(
+                "limit.total_artifact_bytes",
+                Some(file.rel_path()),
+                format!("{ecosystem} evidence byte budget exhausted"),
+            ));
+            break;
+        }
+        match project.read_source_snapshot_limited(file, cap) {
+            Ok(Some(snapshot)) => {
+                bytes += snapshot.source().len() as u64;
+                selected.push((file.clone(), snapshot));
+            }
+            Ok(None) => diagnostics.push(dependency_diagnostic(
+                "limit.artifact_bytes",
+                Some(file.rel_path()),
+                format!("selected {ecosystem} snapshot exceeds its byte limit"),
+            )),
+            Err(error) => diagnostics.push(dependency_diagnostic(
+                &format!("{code_prefix}.files.read"),
+                Some(file.rel_path()),
+                error.to_string(),
+            )),
+        }
+    }
+    (selected, bytes, false)
 }
 
 #[cfg(test)]

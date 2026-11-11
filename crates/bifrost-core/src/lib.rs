@@ -17,15 +17,19 @@
 //! path.
 
 pub mod analyzer;
+pub mod attribution;
 #[doc(hidden)]
 pub mod benchmark_provenance;
 pub mod bounded_output;
+pub mod budgeted_value_cache;
 pub mod cache_db;
 pub mod cache_gc;
 pub mod cancellation;
 pub mod clones;
 pub mod compact_graph;
 pub mod complete_value_cache;
+pub mod content_digest;
+pub mod definition_inventory;
 pub mod git_file;
 pub mod gitblob;
 pub mod hash;
@@ -34,6 +38,7 @@ pub mod path_normalization;
 pub mod path_utils;
 pub mod process;
 pub mod profiling;
+pub mod retention_budget;
 pub mod schema_version;
 pub mod sqlite_template;
 #[cfg(any(test, feature = "test-support"))]

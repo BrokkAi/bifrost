@@ -8,7 +8,6 @@
 //! the cache over it, and the reverse index built from it.
 
 use brokk_bifrost_analysis::analyzer::workspace_authority::memo_attribution;
-use brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set;
 use std::sync::Arc;
 
 use crate::analyzer::php::PhpAnalyzer;
@@ -169,49 +168,55 @@ impl ImportAnalysisProvider for PhpAnalyzer {
         Some(imported)
     }
 
-    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        let value = self
-            .imported_code_units
-            .read(&memo_attribution(self), |cache, capture| {
-                Ok::<_, std::convert::Infallible>(cache.get(file).unwrap_or_else(|| {
-                    let cache_fill =
-                        brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
-                    let entry = Arc::new(capture.build_weighted(|| {
-                        let value = {
-                            let names: Vec<String> = self
-                                .inner
-                                .type_identifiers_of(file)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .collect();
-                            // One batched read for the whole file rather than one store round trip
-                            // per imported name (#1748's shape).
-                            let scope = AnalyzerQueryScope::new(self);
-                            let _token = scope.token();
-                            self.inner.prefetch_definitions(&names);
+    fn imported_code_units_of(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>> {
+        {
+            let value = self
+                    .imported_code_units
+                    .read(&memo_attribution(self), |cache, capture| {
+                        Ok::<_, std::convert::Infallible>(cache.get(file).unwrap_or_else(|| {
+                            let cache_fill =
+                                brokk_bifrost_analysis::analyzer::common::QueryCacheFill::new(self);
+                            let entry = Arc::new(capture.build_weighted(|| {
+                                let value = {
+                                    let names: Vec<String> = self
+                                        .inner
+                                        .type_identifiers_of(file)
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .collect();
+                                    // One batched read for the whole file rather than one store round trip
+                                    // per imported name (#1748's shape).
+                                    let scope = AnalyzerQueryScope::new(self);
+                                    let _token = scope.token();
+                                    self.inner.prefetch_definitions(&names);
 
-                            let mut imported: HashSet<CodeUnit> = HashSet::default();
-                            for name in &names {
-                                // A file's own declarations are not imports: PHP reaches them
-                                // because they are declared here, not because a name was bound.
-                                imported.extend(
-                                    self.definitions(name).filter(|unit| unit.source() != file),
-                                );
+                                    let mut imported: HashSet<CodeUnit> = HashSet::default();
+                                    for name in &names {
+                                        // A file's own declarations are not imports: PHP reaches them
+                                        // because they are declared here, not because a name was bound.
+                                        imported.extend(
+                                            self.definitions(name)
+                                                .filter(|unit| unit.source() != file),
+                                        );
+                                    }
+
+                                    Arc::new(brokk_bifrost_core::retention_budget::Accounted::uncharged(imported))
+                                };
+                                let bytes = brokk_bifrost_core::analyzer::weighted_cache::weight_code_unit_set_ref(&value) as usize;
+                                (value, bytes)
+                            }));
+                            if cache_fill.is_complete() {
+                                cache.insert(file.clone(), Arc::clone(&entry));
                             }
-
-                            Arc::new(imported)
-                        };
-                        let bytes = weight_code_unit_set(file, &value) as usize;
-                        (value, bytes)
-                    }));
-                    if cache_fill.is_complete() {
-                        cache.insert(file.clone(), Arc::clone(&entry));
-                    }
-                    entry
-                }))
-            })
-            .expect("import memo build is infallible");
-        Arc::clone(&value)
+                            entry
+                        }))
+                    })
+                    .expect("import memo build is infallible");
+            Arc::clone(&value)
+        }
     }
 
     /// The `use` declarations the parser recorded for this file, one row per

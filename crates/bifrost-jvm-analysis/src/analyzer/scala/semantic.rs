@@ -21,7 +21,7 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::tree_walk::root_node as compilation_unit_root;
 use brokk_bifrost_jvm::scala::graph::syntax::{
-    is_scala_named_argument_assignment, scala_literal_type_name,
+    infix_operator, is_scala_named_argument_assignment, scala_literal_type_name,
 };
 use brokk_bifrost_jvm::scala::structural::named_argument_parts;
 use brokk_bifrost_semantic::analyzer::semantic::lowering::schedule_short_circuit_condition;
@@ -39,7 +39,7 @@ use crate::analyzer::scala::scalar::scala_scalar_type_for_type;
 
 use brokk_bifrost_analysis::analyzer::declared_scalar::DeclaredScalarType;
 
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use brokk_bifrost_analysis::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
@@ -119,7 +119,11 @@ use crate::analyzer::scala::semantic_adaptation::type_identity as scala_type_ide
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
 // change; the code-query tutorial pages elide such ids (#5016).
 // #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v26";
+// #9438: decorator argument roles reach on-demand semantic lowering.
+// #9447: structured formal roles and refusal change semantic payloads.
+// #9479: parameterless member selections lower as bound-method call sites.
+// #10445: parameter activation changes Scala term-binding visibility in semantic adaptation.
+const ADAPTER_VERSION: &[u8] = b"scala-value-semantics-v30";
 
 /// Procedure syntax roles used by source-backed assignment relations. The
 /// Scala lowering already publishes exact assignment effects; these roles
@@ -241,14 +245,31 @@ impl ScalaSemanticLowerer {
     }
 }
 
+pub(super) fn policy_lowering_identity(
+    models: Option<&brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+) -> SemanticAdapterIdentity {
+    policy_lowering_identity_for_dependencies(
+        brokk_bifrost_analysis::analyzer::semantic::lowering::semantic_model_dependency_fingerprint(
+            models,
+            b"scala-semantic-model-set-v1\0",
+        ),
+    )
+}
+
+fn policy_lowering_identity_for_dependencies(
+    dependencies: DependencyFingerprint,
+) -> SemanticAdapterIdentity {
+    SemanticAdapterIdentity::for_adapter(
+        "scala",
+        ADAPTER_VERSION,
+        b"scala-intrafile-execution-defaults-v1",
+        dependencies,
+    )
+}
+
 impl ProgramSemanticsLowerer for ScalaSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity::for_adapter(
-            "scala",
-            ADAPTER_VERSION,
-            b"scala-intrafile-execution-defaults-v1",
-            self.dependencies,
-        )
+        policy_lowering_identity_for_dependencies(self.dependencies)
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -1187,22 +1208,48 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
         callable: Node<'tree>,
         procedure_kind: ProcedureKind,
     ) -> Result<(), ScalaLoweringError> {
-        let layout =
-            formal_parameter_slots_for_owner(Language::Scala, callable, self.prepared.source())
-                .unwrap_or_default();
+        if self.session.cancellation().is_cancelled() {
+            return Err(ScalaLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let layout = formal_parameter_slots_for_owner_with_nodes(
+            Language::Scala,
+            callable,
+            self.prepared.source(),
+        );
+        if self.session.cancellation().is_cancelled() {
+            return Err(ScalaLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let slots = match layout {
+            Some(slots) => slots,
+            None if matches!(callable.kind(), "object_definition" | "trait_definition")
+                || callable.kind() == "given_definition"
+                    && procedure_kind == ProcedureKind::Initializer =>
+            {
+                Vec::new()
+            }
+            None => {
+                self.session.record_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Procedure,
+                    SemanticCapability::ParameterFlow,
+                    SemanticGapKind::Unknown,
+                    "Scala callable formal parameter layout is unavailable",
+                )?;
+                Vec::new()
+            }
+        };
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
+        for (slot, node) in slots {
             if self.session.cancellation().is_cancelled() {
                 return Err(ScalaLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            let node = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
             let metadata = self.session.add_value_mapping(builder, node)?;
             let parameter_name = slot.unique_name().map(Box::<str>::from);
             let passing_mode = slot.passing_mode;
@@ -1210,7 +1257,10 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: false },
+                    SemanticValueKind::Receiver {
+                        dispatch: false,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(value);
                 value
@@ -1279,7 +1329,10 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?);
         }
         if let Some(receiver) = self.receiver {
@@ -3469,12 +3522,13 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
     /// runtime value at all, so it mints neither a memory location nor an
     /// undischargeable `FieldMemory` gap -- the #2363 rule Java applies to
     /// `field_access` type qualifiers. `asInstanceOf` and `isInstanceOf` are
-    /// the language's own type operations rather than members. Everything
-    /// else is a member read: a located field load, with the identity gap and
-    /// the parameterless-method gaps raised only when this compilation unit
-    /// does not settle which declaration the member names. A member that does
-    /// resolve to a `val` or `var` declaration is a stored field, and Scala's
-    /// uniform access does not make reading one a call.
+    /// the language's own type operations rather than members. A member that
+    /// this compilation unit resolves to a `val` or `var` declaration is a
+    /// stored field: a located field load. Any other member selection that no
+    /// enclosing call or assignment consumes is a parameterless application,
+    /// lowered as a bound-method call whose dispatch decides the member (#9479).
+    /// What remains (a selection whose member leaf is not a name) keeps the
+    /// unresolved field load with its identity and parameterless-method gaps.
     #[allow(clippy::too_many_arguments)]
     fn field_expression(
         &mut self,
@@ -3523,16 +3577,47 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
             });
             return Ok(());
         }
+        let unwraps_value_class = member_name.is_some_and(|field_name| {
+            self.expression_type_identity(object)
+                .is_some_and(|wrapper_type| {
+                    self.adaptations
+                        .value_class_unwrap(
+                            self.prepared.source(),
+                            &wrapper_type,
+                            field_name,
+                            object,
+                        )
+                        .is_some()
+                })
+        });
+        let (member, resolved) = self.memory_member_locator(field, object)?;
+        if !resolved
+            && !unwraps_value_class
+            && brokk_bifrost_jvm::scala::structural::scala_selection_application_member(node)
+                .is_some()
+        {
+            // Uniform access: selecting a member this compilation unit does
+            // not settle as a stored `val`/`var` applies it, as `entry.getName`
+            // calls `getName()`. The call site's dispatch resolves the member;
+            // a Java field read resolves to no callable and stays open there,
+            // which is what the unknown-identity field load reported.
+            return self.call_like_expression(
+                builder,
+                node,
+                entry,
+                next,
+                scope,
+                node,
+                CallableReferenceKind::BoundMethod,
+                &[],
+                &[object],
+                stack,
+            );
+        }
         let access = self.session.add_node_point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         let base = self.expression_value(builder, object, expression_value_kind(object))?;
-        if let Some(field_name) = member_name
-            && let Some(wrapper_type) = self.expression_type_identity(object)
-            && self
-                .adaptations
-                .value_class_unwrap(self.prepared.source(), &wrapper_type, field_name, object)
-                .is_some()
-        {
+        if unwraps_value_class {
             self.emit_value_class_unwrap(builder, access, base, result)?;
             self.session.add_target_edge(builder, access, next)?;
             stack.push(Work::Expression {
@@ -3543,7 +3628,6 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
             });
             return Ok(());
         }
-        let (member, resolved) = self.memory_member_locator(field, object)?;
         let location = self.session.add_memory_location(
             builder,
             access,
@@ -4558,6 +4642,14 @@ impl<'tree, 'targets, 'catalog> LoweringContext<'tree, 'targets, 'catalog> {
             return None;
         };
         let classes = overlay.symbols_with_id(id);
+        if matches!(
+            classes.disposition,
+            brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(
+                _
+            )
+        ) {
+            return None;
+        }
         let [class] = classes.records.as_slice() else {
             return None;
         };
@@ -6453,11 +6545,6 @@ fn required_runtime_field<'tree>(
         .into_iter()
         .find(|child| child.is_named() && is_runtime_node(child.kind()))
         .ok_or_else(|| missing_field(node, field))
-}
-
-fn infix_operator<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
-    node.child_by_field_name("operator")
-        .and_then(|operator| node_text(source, operator))
 }
 
 fn scala_condition_anchor<'tree>(mut node: Node<'tree>) -> Node<'tree> {

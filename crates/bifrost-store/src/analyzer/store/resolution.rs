@@ -32,7 +32,6 @@ use rusqlite::params;
 use rusqlite::params_from_iter;
 
 use brokk_bifrost_core::analyzer::Language;
-use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 
 use crate::CancellationToken;
 
@@ -102,20 +101,21 @@ impl ToSql for PreparedResolutionValue {
 }
 
 impl PreparedResolutionValue {
-    fn canonical_hash(&self, hasher: &mut CanonicalHasher) {
+    /// The tagged compact encoding: header rows mix value kinds per column.
+    fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Self::Null => hasher.field("value", b"null"),
+            Self::Null => out.push(0),
             Self::Integer(value) => {
-                hasher.field("value_kind", b"integer");
-                hasher.field("value", &value.to_be_bytes());
+                out.push(1);
+                out.extend_from_slice(&value.to_be_bytes());
             }
             Self::Text(value) => {
-                hasher.field("value_kind", b"text");
-                hasher.field("value", value.as_bytes());
+                out.push(2);
+                resolution_manifest::compact::put_bytes(out, value.as_bytes());
             }
             Self::Digest(value) => {
-                hasher.field("value_kind", b"digest");
-                hasher.field("value", value);
+                out.push(3);
+                out.extend_from_slice(value);
             }
         }
     }
@@ -183,21 +183,11 @@ impl PreparedResolutionRow {
         }
     }
 
-    fn canonical_digest(&self, cancellation: &CancellationToken) -> Option<[u8; 32]> {
-        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-persisted-row:v1");
-        hasher.field(
-            "field_count",
-            &u64::try_from(self.values.len())
-                .expect("usize fits u64 on supported targets")
-                .to_be_bytes(),
-        );
+    pub(super) fn encode(&self, out: &mut Vec<u8>) {
+        resolution_manifest::compact::put_len(out, self.values.len());
         for value in &self.values {
-            if cancellation.is_cancelled() {
-                return None;
-            }
-            value.canonical_hash(&mut hasher);
+            value.encode(out);
         }
-        Some(hasher.finish())
     }
 
     fn payload_bytes(&self, cancellation: &CancellationToken) -> Option<usize> {
@@ -375,7 +365,11 @@ macro_rules! resolution_bundle_families {
             package_routes => ("package_routes", "resolution_package_routes", "expected_package_route_count", "package_scope_node_key, declaration_site, placement_gap_site", 3, 1),
             package_route_segments => ("package_route_segments", "resolution_package_route_segments", "expected_package_route_segment_count", "package_scope_node_key, ordinal, spelling", 3, 2),
             singleton_relations => ("singleton_relations", "resolution_singleton_relations", "expected_singleton_relation_count", "declaration_site, enclosing_type_site, kind", 3, 1),
+            extern_aliases => ("extern_aliases", "resolution_extern_aliases", "expected_extern_alias_count", "site, scope, name", 3, 1),
             compilation_imports => ("compilation_imports", "resolution_compilation_imports", "expected_compilation_import_count", "import_site", 1, 1),
+            reference_package_contexts => ("reference_package_contexts", "resolution_reference_package_contexts", "expected_reference_package_context_count", "reference_site, prefixes", 2, 1),
+            member_type_coverage => ("member_type_coverage", "resolution_member_type_coverage", "expected_member_type_coverage_count", "definition_semantic_key, scope_head_node_key, coverage, open_reason", 4, 1),
+            reference_execution_contexts => ("reference_execution_contexts", "resolution_reference_execution_contexts", "expected_reference_execution_context_count", "site, disposition, procedure_kind, initializer_is_static, callable_site", 5, 1),
         }
     };
 }
@@ -417,15 +411,18 @@ macro_rules! define_manifest_counts {
     ($($field:ident => ($name:literal, $table:literal, $count_column:literal, $columns:literal, $arity:literal, $key_arity:literal),)*) => {
         #[doc(hidden)]
         pub const RESOLUTION_MANIFEST_COUNT_COLUMNS: &[&str] = &{
-            let header_count = ResolutionManifestFamilyIndex::FamilyCount as usize;
+            let header_count = ResolutionManifestFamilyIndex::FamilyCount as usize - 1;
             let mut columns = [""; ResolutionManifestFamilyIndex::FamilyCount as usize
                 + resolution_manifest::BODY_MANIFEST_COLUMNS.len()];
-            $(columns[ResolutionManifestFamilyIndex::$field as usize] = $count_column;)*
+            $(if (ResolutionManifestFamilyIndex::$field as usize) < header_count {
+                columns[ResolutionManifestFamilyIndex::$field as usize] = $count_column;
+            })*
             let mut index = 0;
             while index < resolution_manifest::BODY_MANIFEST_COLUMNS.len() {
                 columns[header_count + index] = resolution_manifest::BODY_MANIFEST_COLUMNS[index];
                 index += 1;
             }
+            columns[columns.len() - 1] = "expected_reference_execution_context_count";
             columns
         };
 
@@ -465,6 +462,33 @@ macro_rules! define_manifest_counts {
 }
 
 resolution_bundle_families!(define_manifest_counts);
+
+/// A single applicability rule for canonical family and count encodings.
+pub(crate) fn resolution_family_applies(language: Language, family: &str) -> bool {
+    match family {
+        "reference_package_contexts" => language == Language::Scala,
+        // #9546: only the JVM producers claim member-type coverage, so other
+        // languages keep their earlier bundle and count encodings.
+        "member_type_coverage" => matches!(
+            language,
+            Language::Java | Language::Kotlin | Language::Scala
+        ),
+        "reference_execution_contexts" => language == Language::Java,
+        _ => true,
+    }
+}
+
+pub(crate) fn resolution_count_applies(language: Language, index: usize) -> bool {
+    if index == RESOLUTION_MANIFEST_COUNT_COLUMNS.len() - 1 {
+        return language == Language::Java;
+    }
+    if index >= ResolutionManifestFamilyIndex::FamilyCount as usize - 1 {
+        return true;
+    }
+    PreparedResolutionBundleRows::family_specs()
+        .get(index)
+        .is_none_or(|family| resolution_family_applies(language, family.name))
+}
 
 // Expose the count questions selected readers actually ask; family order is
 // owned solely by the descriptor above, not by this reader API inventory.
@@ -522,7 +546,12 @@ impl PreparedResolutionBundleRows {
     fn counts(&self) -> [usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()] {
         let mut counts = [0; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()];
         for (index, rows) in self.families().into_iter().enumerate() {
-            counts[index] = rows.len();
+            let position = if index == Self::family_specs().len() - 1 {
+                counts.len() - 1
+            } else {
+                index
+            };
+            counts[position] = rows.len();
         }
         counts
     }
@@ -534,33 +563,35 @@ impl PreparedResolutionBundleRows {
         family_counts: &[usize; RESOLUTION_MANIFEST_COUNT_COLUMNS.len()],
         cancellation: &CancellationToken,
     ) -> Option<[u8; 32]> {
-        let mut hasher = CanonicalHasher::new(b"bifrost-resolution-persisted-bundle:v1");
-        hasher.field(
-            "semantic_language",
-            semantic_language.config_label().as_bytes(),
-        );
-        hasher.field("producer_epoch", producer_epoch.as_bytes());
-        for ((spec, rows), row_count) in Self::family_specs()
+        use resolution_manifest::compact::{StreamHasher, put_bytes, put_len};
+        let mut hasher = StreamHasher::new(b"bifrost-resolution-persisted-bundle:v2");
+        put_bytes(hasher.buffer(), semantic_language.config_label().as_bytes());
+        put_bytes(hasher.buffer(), producer_epoch.as_bytes());
+        for (index, (spec, rows)) in Self::family_specs()
             .into_iter()
             .zip(self.families())
-            .zip(family_counts)
+            .enumerate()
         {
+            if !resolution_family_applies(semantic_language, spec.name) {
+                assert!(rows.is_empty(), "inapplicable resolution family has rows");
+                continue;
+            }
             if cancellation.is_cancelled() {
                 return None;
             }
-            debug_assert_eq!(*row_count, rows.len());
-            hasher.field("family_name", spec.name.as_bytes());
-            hasher.field(
-                "family_row_count",
-                &u64::try_from(*row_count)
-                    .expect("usize fits u64 on supported targets")
-                    .to_be_bytes(),
-            );
+            let row_count = family_counts[if index == Self::family_specs().len() - 1 {
+                family_counts.len() - 1
+            } else {
+                index
+            }];
+            debug_assert_eq!(row_count, rows.len());
+            put_bytes(hasher.buffer(), spec.name.as_bytes());
+            put_len(hasher.buffer(), row_count);
             for row in rows {
                 if cancellation.is_cancelled() {
                     return None;
                 }
-                hasher.field("row", &row.canonical_digest(cancellation)?);
+                row.encode(hasher.buffer());
             }
         }
         Some(hasher.finish())
@@ -713,6 +744,9 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_generic_formal_defaults",
     "resolution_go_package_imports",
     "resolution_identities",
+    // The one-row counter that advances on every resolution_identities insert
+    // and recipe fill.
+    "resolution_identity_recipe_generation",
     "resolution_import_selectors",
     "resolution_intrinsic_seed_identities",
     "resolution_intrinsic_seeds",
@@ -721,6 +755,7 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_jvm_alias_owner_segments",
     "resolution_member_owner_properties",
     "resolution_member_scope_properties",
+    "resolution_member_type_coverage",
     "resolution_named_argument_labels",
     "resolution_node_catalog",
     "resolution_package_members",
@@ -738,9 +773,12 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_paths",
     "resolution_producer_epochs",
     "resolution_qualified_routes",
+    "resolution_reference_execution_contexts",
     "resolution_reference_lookup_identities",
+    "resolution_reference_package_contexts",
     "resolution_root_route_segments",
     "resolution_root_imports",
+    "resolution_extern_aliases",
     "resolution_compilation_imports",
     "resolution_root_import_segments",
     "resolution_root_import_demands",
@@ -780,12 +818,119 @@ pub const PERSISTED_RESOLUTION_TABLES: &[&str] = &[
     "resolution_unit_summary_versions",
 ];
 
+/// Append-only records tying JVM bundle identity to its classified grammar and golden.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberTypeCoverageHistoryEntry {
+    pub language: Language,
+    pub bundle_epoch: &'static str,
+    pub census_digest: &'static str,
+    pub golden_digest: &'static str,
+}
+
+pub const MEMBER_TYPE_COVERAGE_HISTORY: &[MemberTypeCoverageHistoryEntry] = &[
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v65-member-type-coverage-9546-reference-execution-context-8870-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Kotlin,
+        bundle_epoch: "resolution-bundle-kotlin-v71-member-type-coverage-9546-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10",
+        census_digest: "5ab89965b3b3ca528f0f9a568bceb8d863386ff9cbda3eb1ed8450391e7709e0",
+        golden_digest: "75b9d0721528c4fcaf343e7ec48411a8c40d2d007fa61446f0aaa8924f09e66e",
+    },
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Scala,
+        bundle_epoch: "resolution-bundle-scala-v102-member-type-coverage-9546-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10",
+        census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
+        golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
+    },
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v66-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Kotlin,
+        bundle_epoch: "resolution-bundle-kotlin-v72-member-type-coverage-9546-root-prefix-sites-9002-v68-lexical-head-blockers-9002-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10",
+        census_digest: "5ab89965b3b3ca528f0f9a568bceb8d863386ff9cbda3eb1ed8450391e7709e0",
+        golden_digest: "75b9d0721528c4fcaf343e7ec48411a8c40d2d007fa61446f0aaa8924f09e66e",
+    },
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Scala,
+        bundle_epoch: "resolution-bundle-scala-v103-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10",
+        census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
+        golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
+    },
+    // #9628 changed digest encodings only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Java,
+        bundle_epoch: "resolution-bundle-java-v67-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10",
+        census_digest: "7a60699d0fda92431adc4ab34d454fb70efffd6fc7a941126e356a85a2dcbb08",
+        golden_digest: "d82c9620cb3de5ee8981574a8418f8ce14a481b4d3888409857439443e793617",
+    },
+    // #9628 changed digest encodings only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Kotlin,
+        bundle_epoch: "resolution-bundle-kotlin-v73-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-v68-lexical-head-blockers-9002-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10",
+        census_digest: "5ab89965b3b3ca528f0f9a568bceb8d863386ff9cbda3eb1ed8450391e7709e0",
+        golden_digest: "75b9d0721528c4fcaf343e7ec48411a8c40d2d007fa61446f0aaa8924f09e66e",
+    },
+    // #9628 changed digest encodings only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Scala,
+        bundle_epoch: "resolution-bundle-scala-v104-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10",
+        census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
+        golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
+    },
+    // #10445 changes parameter activation only; member-type coverage is unchanged.
+    MemberTypeCoverageHistoryEntry {
+        language: Language::Scala,
+        bundle_epoch: "resolution-bundle-scala-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10",
+        census_digest: "0e40f56ce6d48fbd37976fdf944f0f054bb85fb9016e6608bee10f81de6cd76c",
+        golden_digest: "506545827e2ddccb2e81261a36646c6e4adf72e2c27e47eea31267e11b29388b",
+    },
+];
+
+/// Whether the resolution producer publishes complete positioned reference
+/// execution contexts for this language.
+#[doc(hidden)]
+pub const fn reference_execution_context_capability(language: Language) -> bool {
+    matches!(language, Language::Java)
+}
+
 /// One sole producer-identity bump point for the complete persisted bundle.
 /// Changes to shared lowering invalidate every language, including producers
 /// whose source facts are unchanged.
+// v42 retires v41 and pre-hold trial rows. The trial identity is this
+// plain literal plus "-trial" (#7314).
+macro_rules! csharp_bundle_epoch {
+    // #7314 M6a1: v51 publishes declared type slots and global predefined aliases (plain and trial).
+    // #7314 AD3d: v44, because per-file parse variants follow the ordered membership.
+    // #9402: v50, because indexers are declared as their `Item` members.
+    // #7314 M10a0 part 2: v51 adds named-open symbol compilation identity.
+    // #9402: indexers are declared as their `Item` members.
+    // #8430 step 2: v53, because extern alias facts change C# resolution answers.
+    // #10342: v54, because global using enumeration evidence changes C# resolution bundles.
+    // #7314 M6a1: v56 publishes declared type slots and global predefined aliases (plain and trial).
+    // Promotion merge of master v56 (#7314 M6a1) with this batch's v55 (M10a0): max + 1 is v57.
+    // #7314 M10a0 per-framework symbols: v60; v58/v59 are held by sibling lanes.
+    () => { "resolution-bundle-csharp-v60-10342-global-using-enumeration-evidence-indexer-item-declarations-9402-extern-alias-facts-8430-derived-sdk-default-compile-10356-msbuild-condition-short-circuit-7314-ad3d-r5-csharp-grammar-0-23-9-8430-10357-file-program-evidence-ordered-msbuild-properties-7314-ad3d-compact-identity-digests-9628-multi-target-razor-paths-8845-target-property-scope-8831-nuget-build-asset-folders-8830-get-path-of-file-above-7314-ad3b-unseen-branches-8147-m4c-parent-relative-open-items-8632-parse-variants-8147-m4b-per-file-membership-7314-c1-4e-ad2-qualified-heads-7314-c1-4d1-preprocessor-decisions-8147-m4a-bare-lexical-roots-7314-c1-4b2p-2026-10-7314-frozen-native-trial-separation-7314-m6a1-csharp-declared-types-global-predefined-aliases-7314-m10a0-named-open-symbols" };
+}
+
+#[doc(hidden)]
+pub const fn csharp_trial_bundle_epoch() -> &'static str {
+    concat!(csharp_bundle_epoch!(), "-trial")
+}
+
 #[doc(hidden)]
 pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
     match language {
+        // #9628: every language moved one version together. Bundle and
+        // fragment-local identity digests use a compact encoding, so stored
+        // interiors and catalog digests from older producers must relower.
         // Reconciled above both parents: shared observed-value properties and
         // local write joins compose with the current producer and gap facts.
         // Super receivers and anonymous construction add Java producer facts
@@ -801,8 +946,16 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // above master v57 and the earlier v55 revert.
         // v60 (#7804): Java emits root rows for every level of a pure field-access
         // chain, so bundles from v58 lack those rows (v59 is reserved for #8675).
+        // #9002: publish ordered JVM lexical choice records in path bodies.
+        // #9002: continuation prefixes are now published on site rows.
+        // v64 (#8870): regenerate Java bundles for positioned reference execution frames.
+        // #9546 M2a v65: Java bundles publish member-type coverage claims for
+        // source type owners; older same-OID interiors carry no claim rows.
+        // Member-type coverage changes append to MEMBER_TYPE_COVERAGE_HISTORY.
+        // v65: #9002's v63 and #8870's v64 merged; the literal keeps both tokens.
+        // v66: master's #9546 v65 and #9002's v65 merged; the literal keeps both tokens.
         Language::Java => {
-            "resolution-bundle-java-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
+            "resolution-bundle-java-v67-compact-identity-digests-9628-member-type-coverage-9546-reference-execution-context-8870-v63-root-prefix-sites-9002-v61-lexical-head-blockers-9002-v60-fqn-expression-roots-7804-v58-implicit-roots-reland-7027-8387-ranked-synthetic-names-revert-8261-producer-rules-port-6291-2026-10-23-ranked-import-destination-gaps-5969-complete-provider-inventory-absence-above-v49-classified-route-gaps-5658-root-import-publication-suppressed-anonymous-allocation-identity-5701-2026-10"
         }
         // v71: v70 (#7509) and v70 (#7391) landed together.
         // v70 (#7509): persist SpreadArgument type frontiers (role ordinal 8).
@@ -813,21 +966,23 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // #8387: regenerate bundles containing ranked synthetic identities.
         // v74 (#8762): publish anonymous interface Identity slots for alias method-owner projection.
         // v73 (#7509): publish alias target terminal lookup rows.
+        // v75 (#7509): sole-spec alias definition bridges use the parser-owned declaration.
+        // v76 (#7509): directional channel component constructors replace legacy code 2.
         Language::Go => {
-            "resolution-bundle-go-v74-8762-anonymous-interface-identity-slot-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap"
+            "resolution-bundle-go-v77-compact-identity-digests-9628-8762-anonymous-interface-identity-slot-7509-alias-target-lookup-8387-ranked-synthetic-names-type-assertion-results-7391-classified-route-gaps-5658-root-import-publication-receiver-applicability-binding-result-separation-index-slice-component-projections-stable-transfer-codes-qualified-call-conversions-2026-10-7509-clause-guard-initializer-gap-7509-sole-alias-owner-7509-channel-direction"
         }
         // #8387: regenerate bundles containing ranked synthetic identities.
         Language::Cpp => {
-            "resolution-bundle-cpp-v27-8387-ranked-synthetic-names-opaque-guard-implication-6902-2026-10"
+            "resolution-bundle-cpp-v28-compact-identity-digests-9628-8387-ranked-synthetic-names-opaque-guard-implication-6902-2026-10"
         }
         Language::JavaScript => {
-            "resolution-bundle-javascript-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+            "resolution-bundle-javascript-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::TypeScript => {
-            "resolution-bundle-typescript-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+            "resolution-bundle-typescript-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         Language::Python => {
-            "resolution-bundle-python-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+            "resolution-bundle-python-v26-compact-identity-digests-9628-native-production-switch-5658-positioned-expression-gaps-5375-local-write-joins-5015-2026-10-5658-annotation-application-heads-5658-callee-callable-result-only"
         }
         // Definitionless item macros preserve existing bindings and keep
         // argument uncertainty on guessed reference sites. Only unenumerable input
@@ -839,11 +994,23 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // paths publish Macro-namespace reference sites (#6912).
         // v124: wrapper projection is a selected ConditionalPayload transfer
         // decided by resolved identity, not producer spelling (#6844).
+        // v125: typed self does not publish a Value receiver form (#9203).
+        // v127: master's v126 and #9628's compact identity digests merged.
+        // #10774+#10830: retire stored Rust resolution output with old manifest-gap completion.
+        // #10953: retire stored Rust resolution output resolved against crate routes
+        // without target-specific dependencies and destination library names.
+        // #10987: retire per-file products resolved against workspace-wide symlink omissions.
+        // v130 must remain above master at the final merge.
         Language::Rust => {
-            "resolution-bundle-rust-v124-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912-wrapper-identity-conditional-payload-6844"
+            // c2 changes route answers: retire stored per-file Rust resolution output
+            // computed under the whole route index (#10774 closure rule).
+            // Merge of master's v130-9737-route-completeness and this branch's v130-10987-scoped-symlink-omissions: max of both sides + 1 gives v131 with both tokens.
+            // #11060: a declared module without a source blob keeps its topology partial, so stored Rust resolution output computed against a broad-complete topology is retired; above master v131: v132.
+            // #11111: certified-absent modules preserve broad completeness; retire v132 answers.
+            "resolution-bundle-rust-v133-11111-certified-absent-module-topology-11060-unplaced-module-topology-9737-route-completeness-10987-scoped-symlink-omissions-10953-target-dependencies-and-lib-names-10774-manifests-only-cargo-toml-compact-identity-digests-9628-duplicate-export-uncertainty-replay-call-roles-6861-inherent-impl-subjects-6394-cfg-import-precedence-6242-classified-route-gaps-5658-root-import-publication-cfg-if-conditional-macro-frontiers-5172-unique-macro-reference-gaps-5133-local-write-joins-5015-2026-10-generic-default-reference-6950-cfg-if-self-frontier-6949-macro-item-attributes-derive-sites-6912-wrapper-identity-conditional-payload-6844"
         }
         Language::Php => {
-            "resolution-bundle-php-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+            "resolution-bundle-php-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         // Self-type edges and aliases extend Scala's explicit-instantiation
         // bundle; case-class and enum companions publish binders and singleton
@@ -867,18 +1034,43 @@ pub const fn resolution_bundle_epoch(language: Language) -> &'static str {
         // v91: Scala imports bind at the enclosing body's choice (#8279),
         // changing precedence steps in resolution_paths.body.
         // v92 re-lands implicit Scala AnyRef roots above master v91.
+        // #6792 v97: bare Scala terms publish evaluated method values, exclude
+        // write targets, rank only structurally certified no-expected-type
+        // references (including infix associativity), and replay Callable
+        // ancestry. One bundle key covers all these changed binding answers.
+        // v93 adds Package demands to renamed Scala imports, so older bundles
+        // cannot prove the selected package alias route.
+        // #9195 v99 publishes exact AST package prefixes at reference sites;
+        // prior same-OID interiors have no affirmative context outside source
+        // declaration and import ranges and must be regenerated.
+        // #9546 M2a v102: Scala bundles publish member-type coverage claims for
+        // source type owners; older same-OID interiors carry no claim rows.
+        // Member-type coverage changes append to MEMBER_TYPE_COVERAGE_HISTORY.
+        // #9002 v101: path bodies carry ordered JVM lexical-choice records, and
+        // each reference's own root prefix is published on its site row, so
+        // older interiors (including pre-column #9002 ones) must be relowered.
+        // v103: master's #9546 v102 and #9002's v101 merged; the literal keeps both tokens.
+        // #10445 v105: a Scala value parameter activates after its own clause,
+        // so binder activation rows and resolution answers change for unchanged
+        // source; older bundles must be relowered.
         Language::Scala => {
-            "resolution-bundle-scala-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
+            "resolution-bundle-scala-v105-parameter-clause-activation-10445-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-lexical-head-blockers-9002-v99-reference-package-contexts-9195-bare-term-bindings-6792-package-alias-demand-9195-v92-implicit-roots-reland-7027-imports-bind-enclosing-scope-8279-8387-ranked-synthetic-names-revert-8261-incomplete-function-type-8200-parent-paths-enclosing-scope-5104-producer-rules-port-6291-2026-10-23-complete-provider-inventory-and-lexical-companion-jvm-aliases-5177-classified-route-gaps-5658-scala-as-instance-of-types-7577-2026-10"
         }
         Language::CSharp => {
-            "resolution-bundle-csharp-v41-multi-target-razor-paths-8845-target-property-scope-8831-nuget-build-asset-folders-8830-get-path-of-file-above-7314-ad3b-unseen-branches-8147-m4c-parent-relative-open-items-8632-parse-variants-8147-m4b-per-file-membership-7314-c1-4e-ad2-qualified-heads-7314-c1-4d1-preprocessor-decisions-8147-m4a-bare-lexical-roots-7314-c1-4b2p-2026-10"
+            csharp_bundle_epoch!()
         }
         Language::Ruby => {
-            "resolution-bundle-ruby-v24-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
+            "resolution-bundle-ruby-v25-compact-identity-digests-9628-positioned-expression-gaps-5375-local-write-joins-5015-2026-10"
         }
         // #8387: regenerate bundles containing ranked synthetic identities.
+        // #9546 M2a v71: Kotlin bundles publish member-type coverage claims for
+        // source type owners; older same-OID interiors carry no claim rows.
+        // Member-type coverage changes append to MEMBER_TYPE_COVERAGE_HISTORY.
+        // #9002: publish ordered JVM lexical choice records in path bodies.
+        // #9002: continuation prefixes are now published on site rows.
+        // v72: master's #9546 v71 and #9002's v70 merged; the literal keeps both tokens.
         Language::Kotlin => {
-            "resolution-bundle-kotlin-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
+            "resolution-bundle-kotlin-v73-compact-identity-digests-9628-member-type-coverage-9546-root-prefix-sites-9002-v68-lexical-head-blockers-9002-v67-8792-explicit-lambda-parameter-binders-8387-ranked-synthetic-names-incomplete-function-type-8200-producer-rules-port-6291-2026-10-23-narrow-nullable-function-invoke-property-shadowing-above-v59-local-constructor-initialization-above-v58-absolute-class-literal-reflection-above-v57-anonymous-dispatch-this-above-v56-dispatch-this-argument-value-above-v55-intrinsic-root-hierarchy-above-v54-above-v53-native-point-default-implicit-receiver-frames-complete-provider-inventory-absence-above-v52-class-literal-smart-cast-conversion-union-initialization-scope-header-aliases-above-v50-classified-route-gaps-2026-10"
         }
         Language::None => panic!("a resolution bundle needs an analyzable language"),
     }
@@ -916,8 +1108,18 @@ impl PreparedResolutionBundle {
         references: usize,
         presentation_payload_bytes: usize,
     ) {
-        let count = self.family_counts.len();
-        self.family_counts[count - 3..].copy_from_slice(&[1, declarations, references]);
+        // The capsule counts close the body columns; the Java-only reference
+        // execution context count follows them and stays untouched.
+        let body_end = self.family_counts.len() - 1;
+        debug_assert_eq!(
+            RESOLUTION_MANIFEST_COUNT_COLUMNS[body_end - 3..body_end],
+            [
+                "expected_capsule_input_count",
+                "expected_capsule_declaration_count",
+                "expected_capsule_reference_context_count",
+            ]
+        );
+        self.family_counts[body_end - 3..body_end].copy_from_slice(&[1, declarations, references]);
         self.logical_rows = self.family_counts.iter().copied().sum::<usize>() + 1;
         self.interior_digest = digest;
         self.payload_bytes = self
@@ -928,6 +1130,33 @@ impl PreparedResolutionBundle {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         semantic_language: Language,
+        rows: PreparedResolutionBundleRows,
+        path_rows: resolution_rows::PreparedPathRows,
+        site_rows: Vec<resolution_rows::PreparedSiteRow>,
+        typed_fact_rows: typed_rows::PreparedTypedRows,
+        recipe_rows: Vec<resolution_rows::PreparedLookupRecipeRow>,
+        gap_rows: resolution_rows::PreparedGapRows,
+        shared_name_digests: Vec<[u8; 32]>,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        Self::new_with_epoch(
+            semantic_language,
+            resolution_bundle_epoch(semantic_language),
+            rows,
+            path_rows,
+            site_rows,
+            typed_fact_rows,
+            recipe_rows,
+            gap_rows,
+            shared_name_digests,
+            cancellation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_epoch(
+        semantic_language: Language,
+        producer_epoch: &'static str,
         mut rows: PreparedResolutionBundleRows,
         path_rows: resolution_rows::PreparedPathRows,
         site_rows: Vec<resolution_rows::PreparedSiteRow>,
@@ -946,7 +1175,14 @@ impl PreparedResolutionBundle {
                 return None;
             }
         }
-        let producer_epoch = resolution_bundle_epoch(semantic_language);
+        assert!(semantic_language == Language::Scala || rows.reference_package_contexts.is_empty());
+        assert!(
+            resolution_family_applies(semantic_language, "member_type_coverage")
+                || rows.member_type_coverage.is_empty()
+        );
+        assert!(
+            semantic_language == Language::Java || rows.reference_execution_contexts.is_empty()
+        );
         let mut family_counts = rows.counts();
         let headers_digest = {
             let _headers_timing = crate::profiling::scope_with(|| {
@@ -962,7 +1198,9 @@ impl PreparedResolutionBundle {
         let _body_timing = crate::profiling::scope_with(|| {
             format!("store.resolution_bundle.body_digest[{semantic_language:?}]")
         });
-        let interior_digest = resolution_manifest::complete_body_digest(
+        let interior_digest = resolution_manifest::complete_body_digest_with_context(
+            semantic_language,
+            &rows.reference_execution_contexts,
             headers_digest,
             &path_rows,
             &site_rows,
@@ -973,9 +1211,14 @@ impl PreparedResolutionBundle {
             cancellation,
         )?;
         drop(_body_timing);
-        family_counts[ResolutionManifestFamilyIndex::FamilyCount as usize..].copy_from_slice(
-            &resolution_manifest::body_counts(&path_rows, &site_rows, &typed_fact_rows, &gap_rows),
-        );
+        let last_count = family_counts.len() - 1;
+        family_counts[ResolutionManifestFamilyIndex::FamilyCount as usize - 1..last_count]
+            .copy_from_slice(&resolution_manifest::body_counts(
+                &path_rows,
+                &site_rows,
+                &typed_fact_rows,
+                &gap_rows,
+            ));
         let logical_rows = family_counts
             .into_iter()
             .fold(1usize, usize::saturating_add);
@@ -1080,9 +1323,28 @@ impl AnalyzerStore {
         storage_language: &str,
         semantic_language: Language,
     ) -> Result<bool> {
+        self.ensure_resolution_producer_epoch_value(
+            storage_language,
+            semantic_language,
+            resolution_bundle_epoch(semantic_language),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn ensure_resolution_producer_epoch_value(
+        &self,
+        storage_language: &str,
+        semantic_language: Language,
+        producer_epoch: &'static str,
+    ) -> Result<bool> {
+        assert!(
+            producer_epoch == resolution_bundle_epoch(semantic_language)
+                || (semantic_language == Language::CSharp
+                    && producer_epoch == csharp_trial_bundle_epoch()),
+            "resolution producer epoch is code-owned"
+        );
         assert!(!storage_language.is_empty());
         let storage_language = storage_language.to_owned();
-        let producer_epoch = resolution_bundle_epoch(semantic_language);
         self.execute_selection_publication(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let previous = tx
@@ -1099,6 +1361,7 @@ impl AnalyzerStore {
             // Every summary of this language was derived from bundles of the old
             // epoch; withdraw them so no reader finds one before the next
             // reconcile derives the units again.
+            let _cascade = super::sealed_families::CascadeDelete::new(&tx);
             if tx.execute(
                 super::unit_summaries::DELETE_LANGUAGE_VERSIONS_SQL,
                 [&storage_language],
@@ -1106,6 +1369,8 @@ impl AnalyzerStore {
             {
                 tx.execute(super::unit_summaries::DELETE_UNBOUND_SUMMARIES_SQL, [])?;
             }
+            #[cfg(any(test, debug_assertions, feature = "test-support"))]
+            drop(_cascade);
             tx.execute(
                 "INSERT INTO resolution_producer_epochs(lang, producer_epoch)
                  VALUES(?1, ?2)
@@ -1447,6 +1712,43 @@ pub(super) fn require_active_resolution_epoch(
     Ok(())
 }
 
+fn validate_reference_execution_contexts(conn: &Connection, blob_id: i64) -> Result<()> {
+    // Anonymous containment is deferred until a consumer needs it.
+    let invalid: bool = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM resolution_sites AS site
+               LEFT JOIN resolution_reference_execution_contexts AS context
+                 ON context.blob_id = site.blob_id AND context.site = site.site
+               WHERE site.blob_id = ?1 AND site.role = 0 AND site.start_byte IS NOT NULL
+                 AND context.site IS NULL
+             ) OR EXISTS(
+               SELECT 1 FROM resolution_reference_execution_contexts AS context
+               LEFT JOIN resolution_sites AS site
+                 ON site.blob_id = context.blob_id AND site.site = context.site
+               WHERE context.blob_id = ?1 AND
+                 (site.role IS NOT 0 OR site.start_byte IS NULL
+                  OR (context.procedure_kind IN ('method', 'constructor') AND
+                      (context.callable_site IS NULL OR context.callable_site IS NOT site.owner))
+                  OR (context.procedure_kind IN ('lambda', 'initializer') AND
+                      context.callable_site IS NOT NULL)
+                  OR (context.disposition = 'non_executable' AND
+                      site.site_kind IN (?2, ?3)))
+             )",
+            params![
+                blob_id,
+                resolution_rows::site_kind_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::Call),
+                resolution_rows::site_kind_code(brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind::ConstructorReference),
+            ],
+            |row| row.get(0),
+        )?;
+    if invalid {
+        return Err(StoreError::corrupt(format!(
+            "Java reference execution contexts fail coverage, frame, or invocation seal for blob {blob_id}"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn insert_prepared_bundle_tx(
     tx: &Transaction<'_>,
     blob_id: i64,
@@ -1454,6 +1756,7 @@ pub(super) fn insert_prepared_bundle_tx(
     bundle: &PreparedResolutionBundle,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
+    let _owner = super::sealed_families::Scope::new(tx, super::sealed_families::Owner::Resolution);
     if cancellation.is_cancelled() {
         return Ok(false);
     }
@@ -1539,6 +1842,9 @@ pub(super) fn insert_prepared_bundle_tx(
     )? {
         return Ok(false);
     }
+    if reference_execution_context_capability(bundle.semantic_language) {
+        validate_reference_execution_contexts(tx, blob_id)?;
+    }
     if crate::cache_db::seal_validates(blob_id) {
         tx.prepare_cached(resolution_manifest::COMPLETE_PUBLICATION_COUNTS_SQL)?
             .query_row([blob_id], |row| {
@@ -1560,21 +1866,7 @@ pub(super) fn insert_prepared_bundle_tx(
         "UPDATE resolution_fragment_interiors SET payload_bytes = ?2 WHERE blob_id = ?1",
         params![blob_id, payload_bytes],
     )?;
-    #[cfg(debug_assertions)]
-    {
-        let publication_state: String = tx.query_row(
-            "SELECT publication_state FROM resolution_fragment_interiors WHERE blob_id = ?1",
-            [blob_id],
-            |row| row.get(0),
-        )?;
-        debug_assert_eq!(publication_state, "building");
-    }
-    let sealed = tx.execute(
-        "UPDATE resolution_fragment_interiors
-         SET publication_state = 'complete' WHERE blob_id = ?1",
-        [blob_id],
-    )?;
-    debug_assert_eq!(sealed, 1);
+    super::publication::seal(tx, "resolution_fragment_interiors", "blob_id", blob_id, &[])?;
     Ok(true)
 }
 
@@ -1651,7 +1943,7 @@ fn insert_row_families(
         tx,
         "INSERT INTO resolution_sites(
            blob_id, site, role, namespace, site_kind, start_byte, end_byte,
-           unqualified, owner, receiver_origin, go_spelling_namespace, go_definition_namespaces, go_package_qualifier
+           unqualified, owner, receiver_origin, go_spelling_namespace, go_definition_namespaces, go_package_qualifier, prefix
          ) SELECT json_extract(value, '$[0]'),
                 json_extract(value, '$[1]'),
                 json_extract(value, '$[2]'),
@@ -1664,7 +1956,8 @@ fn insert_row_families(
                 json_extract(value, '$[9]'),
                 json_extract(value, '$[10]'),
                 json_extract(value, '$[11]'),
-                json_extract(value, '$[12]')
+                json_extract(value, '$[12]'),
+                json_extract(value, '$[13]')
          FROM json_each(?1)",
         bundle.site_rows.iter().map(|row| (
             blob_id,
@@ -1680,6 +1973,7 @@ fn insert_row_families(
             row.go_spelling_namespace,
             row.go_definition_namespaces,
             row.go_package_qualifier,
+            row.prefix,
         )),
         cancellation,
     )? {
@@ -1914,397 +2208,428 @@ fn insert_typed_fact_rows(
     )? {
         return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_type_transfers(
-           blob_id, source_slot, rule, target_slot, kind, indirection_delta,
-           reference_indirection_delta, value_transform, completion
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, jsonb(?9))",
-        )?;
-        for row in &rows.type_transfers {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.source_slot,
-                row.rule,
-                row.target_slot,
-                row.kind,
-                row.indirection_delta,
-                row.reference_indirection_delta,
-                row.value_transform,
-                optional_body(&row.completion),
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_type_transfers(blob_id, source_slot, rule, target_slot, kind, indirection_delta, reference_indirection_delta, value_transform, completion) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, jsonb(?))",
+        &rows
+            .type_transfers
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.source_slot,
+                    row.rule,
+                    row.target_slot,
+                    row.kind,
+                    row.indirection_delta,
+                    row.reference_indirection_delta,
+                    row.value_transform,
+                    optional_body(&row.completion),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached("INSERT INTO resolution_type_productions(blob_id, output_slot, constructor, length_token, element_slot) VALUES(?1, ?2, ?3, ?4, ?5)")?;
-        for row in &rows.type_productions {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.output_slot,
-                row.constructor,
-                row.length_token,
-                row.element_slot
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_type_productions(blob_id, output_slot, constructor, length_token, element_slot) VALUES",
+        "(?, ?, ?, ?, ?)",
+        &rows
+            .type_productions
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.output_slot,
+                    row.constructor,
+                    &row.length_token,
+                    row.element_slot,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_type_components(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_type_components(
            blob_id, container_slot, constructor, kind, component_slot
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for row in &rows.type_components {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.container_slot,
-                row.constructor,
-                row.kind,
-                row.component_slot,
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?, ?)",
+        &rows
+            .type_components
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.container_slot,
+                    row.constructor,
+                    row.kind,
+                    row.component_slot,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_type_arguments(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_type_arguments(
            blob_id, application_slot, ordinal, argument_slot, indirection_delta,
            reference_indirection_delta
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for row in &rows.type_arguments {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.application_slot,
-                row.ordinal,
-                row.argument_slot,
-                row.indirection_delta,
-                row.reference_indirection_delta,
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?)",
+        &rows
+            .type_arguments
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.application_slot,
+                    row.ordinal,
+                    row.argument_slot,
+                    row.indirection_delta,
+                    row.reference_indirection_delta,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_declared_type_arguments(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_declared_type_arguments(
            blob_id, owner_slot, ordinal, argument_slot
-         ) VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.declared_type_arguments {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.owner_slot,
-                row.ordinal,
-                row.argument_slot,
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &rows
+            .declared_type_arguments
+            .iter()
+            .map(|row| (blob_id, row.owner_slot, row.ordinal, row.argument_slot))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_underlying_types(blob_id, definition, slot)
-         VALUES(?1, ?2, ?3)",
-        )?;
-        for row in &rows.underlying_types {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![blob_id, row.definition, row.slot])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_underlying_types(blob_id, definition, slot) VALUES",
+        "(?, ?, ?)",
+        &rows
+            .underlying_types
+            .iter()
+            .map(|row| (blob_id, row.definition, row.slot))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_generic_type_alias_parameters(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_generic_type_alias_parameters(
            blob_id, alias_definition, ordinal, parameter_definition, target_slot,
            indirection_delta, reference_indirection_delta
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        for row in &rows.generic_type_alias_parameters {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.alias_definition,
-                row.ordinal,
-                row.parameter_definition,
-                row.target_slot,
-                row.indirection_delta,
-                row.reference_indirection_delta,
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?)",
+        &rows
+            .generic_type_alias_parameters
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.alias_definition,
+                    row.ordinal,
+                    row.parameter_definition,
+                    row.target_slot,
+                    row.indirection_delta,
+                    row.reference_indirection_delta,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_generic_formal_defaults(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_generic_formal_defaults(
            blob_id, owner_definition, ordinal, default_slot
-         ) VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.generic_formal_defaults {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.owner_definition,
-                row.ordinal,
-                row.default_slot,
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &rows
+            .generic_formal_defaults
+            .iter()
+            .map(|row| (blob_id, row.owner_definition, row.ordinal, row.default_slot))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
 
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_generic_formals(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_generic_formals(
            blob_id, owner_definition, ordinal, parameter_definition
-         ) VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.generic_formals {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.owner_definition,
-                row.ordinal,
-                row.parameter_definition,
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &rows
+            .generic_formals
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.owner_definition,
+                    row.ordinal,
+                    row.parameter_definition,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_intrinsic_seeds(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_intrinsic_seeds(
            blob_id, slot, kind, spelling, possible_values, completion
-         ) VALUES(?1, ?2, ?3, ?4, jsonb(?5), jsonb(?6))",
-        )?;
-        for row in &rows.intrinsic_seeds {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.slot,
-                row.kind,
-                row.spelling,
-                body(&row.possible_values),
-                optional_body(&row.completion),
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?, jsonb(?), jsonb(?))",
+        &rows
+            .intrinsic_seeds
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.slot,
+                    row.kind,
+                    &row.spelling,
+                    body(&row.possible_values),
+                    optional_body(&row.completion),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_intrinsic_seed_identities(blob_id, identity_id, slot)
-         VALUES(?1, ?2, ?3)",
-        )?;
-        for row in &rows.intrinsic_seed_identities {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                shared_id(row.identity),
-                row.slot
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_intrinsic_seed_identities(blob_id, identity_id, slot) VALUES",
+        "(?, ?, ?)",
+        &rows
+            .intrinsic_seed_identities
+            .iter()
+            .map(|row| (blob_id, shared_id(row.identity), row.slot))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_binding_projections(blob_id, reference, output_slot, kind)
-         VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.binding_projections {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.reference,
-                row.output_slot,
-                row.kind
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_binding_projections(blob_id, reference, output_slot, kind) VALUES",
+        "(?, ?, ?, ?)",
+        &rows
+            .binding_projections
+            .iter()
+            .map(|row| (blob_id, row.reference, row.output_slot, row.kind))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_qualified_routes(
-           blob_id, reference, precedence_ordinal, qualifier_slot, lookup,
-           source_lookup, namespace, projection_output_slot, projection_kind,
-           coarse_gap_reason, open_member_surface
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )?;
-        for row in &rows.qualified_routes {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.reference,
-                row.precedence_ordinal,
-                row.qualifier_slot,
-                shared_id(row.lookup),
-                shared_id(row.source_lookup),
-                row.namespace,
-                row.projection_output_slot,
-                row.projection_kind,
-                row.coarse_gap_reason,
-                row.open_member_surface,
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_qualified_routes(blob_id, reference, precedence_ordinal, qualifier_slot, lookup, source_lookup, namespace, projection_output_slot, projection_kind, coarse_gap_reason, open_member_surface) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &rows
+            .qualified_routes
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.reference,
+                    row.precedence_ordinal,
+                    row.qualifier_slot,
+                    shared_id(row.lookup),
+                    shared_id(row.source_lookup),
+                    row.namespace,
+                    row.projection_output_slot,
+                    row.projection_kind,
+                    row.coarse_gap_reason,
+                    row.open_member_surface,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_declaration_types(blob_id, definition, role, slot)
-         VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.declaration_types {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.definition,
-                row.role,
-                row.slot
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_declaration_types(blob_id, definition, role, slot) VALUES",
+        "(?, ?, ?, ?)",
+        &rows
+            .declaration_types
+            .iter()
+            .map(|row| (blob_id, row.definition, row.role, row.slot))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_deferred_member_owners(blob_id, definition, seq, lookup, body)
-         VALUES(?1, ?2, ?3, ?4, jsonb(?5))",
-        )?;
-        for row in &rows.deferred_member_owners {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.definition,
-                row.seq,
-                shared_id(row.lookup),
-                body(&row.body),
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_deferred_member_owners(blob_id, definition, seq, lookup, body) VALUES",
+        "(?, ?, ?, ?, jsonb(?))",
+        &rows
+            .deferred_member_owners
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.definition,
+                    row.seq,
+                    shared_id(row.lookup),
+                    body(&row.body),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_construction_requirements(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_construction_requirements(
            blob_id, definition, required_owner_definition, kind
-         ) VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in &rows.construction_requirements {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.definition,
-                row.required_owner_definition,
-                row.kind
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?)",
+        &rows
+            .construction_requirements
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.definition,
+                    row.required_owner_definition,
+                    row.kind,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached("INSERT INTO resolution_supertypes(blob_id, definition, reference, frontier, kind, parent_ordinal)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)")?;
-        for row in &rows.supertypes {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.definition,
-                row.reference,
-                row.frontier,
-                row.kind,
-                row.parent_ordinal
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_supertypes(blob_id, definition, reference, frontier, kind, parent_ordinal) VALUES",
+        "(?, ?, ?, ?, ?, ?)",
+        &rows
+            .supertypes
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.definition,
+                    row.reference,
+                    row.frontier,
+                    row.kind,
+                    row.parent_ordinal,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_definition_property_gaps(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_definition_property_gaps(
            blob_id, definition, seq, kind, frontier, reason, site
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        )?;
-        for row in &rows.definition_property_gaps {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.definition,
-                row.seq,
-                row.kind,
-                row.frontier,
-                row.reason,
-                row.site
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?)",
+        &rows
+            .definition_property_gaps
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.definition,
+                    row.seq,
+                    row.kind,
+                    row.frontier,
+                    row.reason,
+                    row.site,
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_call_obligations(
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_call_obligations(
            blob_id, callee_reference, call, receiver_slot, result_slot,
            explicit_type_argument_count, applicability_reason, argument_slots,
            type_argument_slots, eligible_rules, completion
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, jsonb(?8), jsonb(?9), jsonb(?10), jsonb(?11))",
-        )?;
-        for row in &rows.call_obligations {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.callee_reference,
-                row.call,
-                row.receiver_slot,
-                row.result_slot,
-                row.explicit_type_argument_count,
-                row.applicability_reason,
-                body(&row.argument_slots),
-                body(&row.type_argument_slots),
-                body(&row.eligible_rules),
-                optional_body(&row.completion),
-            ])?;
-        }
+         ) VALUES",
+        "(?, ?, ?, ?, ?, ?, ?, jsonb(?), jsonb(?), jsonb(?), jsonb(?))",
+        &rows
+            .call_obligations
+            .iter()
+            .map(|row| {
+                (
+                    blob_id,
+                    row.callee_reference,
+                    row.call,
+                    row.receiver_slot,
+                    row.result_slot,
+                    row.explicit_type_argument_count,
+                    row.applicability_reason,
+                    body(&row.argument_slots),
+                    body(&row.type_argument_slots),
+                    body(&row.eligible_rules),
+                    optional_body(&row.completion),
+                )
+            })
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached("INSERT INTO resolution_callable_parameter_owners(blob_id, parameter_definition, signature_definition)
-         VALUES(?1, ?2, ?3)")?;
-        for row in &rows.callable_parameter_owners {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![
-                blob_id,
-                row.parameter_definition,
-                row.signature_definition
-            ])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_callable_parameter_owners(blob_id, parameter_definition, signature_definition) VALUES",
+        "(?, ?, ?)",
+        &rows
+            .callable_parameter_owners
+            .iter()
+            .map(|row| (blob_id, row.parameter_definition, row.signature_definition))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
-    {
-        let mut statement = tx.prepare_cached(
-            "INSERT INTO resolution_callable_signatures(blob_id, definition, body)
-         VALUES(?1, ?2, jsonb(?3))",
-        )?;
-        for row in &rows.callable_signatures {
-            if cancellation.is_cancelled() {
-                return Ok(false);
-            }
-            statement.execute(rusqlite::params![blob_id, row.definition, body(&row.body)])?;
-        }
+    if !super::row_batch::insert_typed_rows(
+        tx,
+        "INSERT INTO resolution_callable_signatures(blob_id, definition, body) VALUES",
+        "(?, ?, jsonb(?))",
+        &rows
+            .callable_signatures
+            .iter()
+            .map(|row| (blob_id, row.definition, body(&row.body)))
+            .collect::<Vec<_>>(),
+        cancellation,
+    )? {
+        return Ok(false);
     }
     Ok(!cancellation.is_cancelled())
 }
@@ -2441,7 +2766,9 @@ fn insert_resolution_family(
             .map(|position| {
                 if matches!(
                     (spec.name, position),
-                    ("rust_reference_contexts", 7) | ("rust_declaration_authorities", 5 | 8)
+                    ("rust_reference_contexts", 7)
+                        | ("rust_declaration_authorities", 5 | 8)
+                        | ("reference_package_contexts", 3)
                 ) {
                     "jsonb(?)"
                 } else {
@@ -2471,6 +2798,46 @@ fn insert_resolution_family(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recipe_generation_reader_refuses_missing_or_corrupt_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE resolution_identity_recipe_generation(id INTEGER, generation);",
+            )
+            .unwrap();
+        assert!(super::resolution_identity_recipe_generation(&connection).is_err());
+        connection
+            .execute(
+                "INSERT INTO resolution_identity_recipe_generation VALUES(1, 3)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            super::resolution_identity_recipe_generation(&connection).unwrap(),
+            3
+        );
+        connection
+            .execute(
+                "INSERT INTO resolution_identity_recipe_generation VALUES(2, 4)",
+                [],
+            )
+            .unwrap();
+        assert!(super::resolution_identity_recipe_generation(&connection).is_err());
+        connection
+            .execute(
+                "DELETE FROM resolution_identity_recipe_generation WHERE id=2",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE resolution_identity_recipe_generation SET generation='bad'",
+                [],
+            )
+            .unwrap();
+        assert!(super::resolution_identity_recipe_generation(&connection).is_err());
+    }
     use super::super::resolution_prepare::ResolutionInteriorPreparation;
 
     use crate::analyzer::resolution::BindingFragmentId;
@@ -2479,6 +2846,78 @@ mod tests {
     use brokk_bifrost_test_macros::hardwon;
 
     use super::*;
+    use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
+
+    #[test]
+    fn member_type_coverage_epoch_history_is_current_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in MEMBER_TYPE_COVERAGE_HISTORY {
+            assert!(
+                seen.insert((entry.language, entry.bundle_epoch)),
+                "duplicate member-type coverage history entry for {:?} {}",
+                entry.language,
+                entry.bundle_epoch
+            );
+        }
+        for language in [Language::Java, Language::Kotlin, Language::Scala] {
+            let latest = MEMBER_TYPE_COVERAGE_HISTORY
+                .iter()
+                .rfind(|entry| entry.language == language)
+                .expect("every JVM language has member-type coverage history");
+            let census =
+                brokk_bifrost_jvm::member_type_coverage::member_type_census_digest(language);
+            let digest = census
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(
+                (latest.bundle_epoch, latest.census_digest),
+                (resolution_bundle_epoch(language), digest.as_str()),
+                "rotate {language:?}'s resolution bundle epoch and append a member-type coverage history entry"
+            );
+        }
+    }
+
+    #[test]
+    fn java_context_seal_rejects_coverage_shape_and_invocation_defects() {
+        use brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteKind;
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE resolution_sites(blob_id INTEGER, site INTEGER, role INTEGER, start_byte INTEGER, owner INTEGER, site_kind INTEGER);
+            CREATE TABLE resolution_reference_execution_contexts(blob_id INTEGER, site INTEGER, disposition TEXT, procedure_kind TEXT, callable_site INTEGER, PRIMARY KEY(blob_id, site));").unwrap();
+        let call = resolution_rows::site_kind_code(ResolutionSiteKind::Call);
+        conn.execute(
+            "INSERT INTO resolution_sites VALUES(1, 1, 0, 10, 3, ?1)",
+            [call],
+        )
+        .unwrap();
+        assert!(
+            validate_reference_execution_contexts(&conn, 1).is_err(),
+            "missing row"
+        );
+        conn.execute("INSERT INTO resolution_reference_execution_contexts VALUES(1, 1, 'callable', 'method', 2)", []).unwrap();
+        assert!(
+            validate_reference_execution_contexts(&conn, 1).is_err(),
+            "wrong callable owner"
+        );
+        conn.execute(
+            "UPDATE resolution_reference_execution_contexts SET callable_site=3",
+            [],
+        )
+        .unwrap();
+        validate_reference_execution_contexts(&conn, 1).unwrap();
+        conn.execute("UPDATE resolution_reference_execution_contexts SET disposition='non_executable', procedure_kind=NULL, callable_site=NULL", []).unwrap();
+        assert!(
+            validate_reference_execution_contexts(&conn, 1).is_err(),
+            "non-executable invocation"
+        );
+        conn.execute("DELETE FROM resolution_reference_execution_contexts", [])
+            .unwrap();
+        conn.execute("INSERT INTO resolution_reference_execution_contexts VALUES(1, 4, 'unknown', NULL, NULL)", []).unwrap();
+        assert!(
+            validate_reference_execution_contexts(&conn, 1).is_err(),
+            "extra definition row"
+        );
+    }
 
     #[test]
     fn store_tests_validate_every_seal() {
@@ -2562,7 +3001,9 @@ mod tests {
     fn shared_name_admission_preserves_first_ids_in_either_receipt_order() {
         for reversed in [false, true] {
             let mut connection = shared_name_connection();
-            let cache = SharedNameCache::default();
+            let cache = SharedNameCache::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            );
             let table = SharedNameTable::new(cache.clone());
             let synthetic = table.interner(&connection).intern([99; 32]);
             let first = table.interner(&connection).intern([1; 32]);
@@ -2644,7 +3085,9 @@ mod tests {
     fn shared_name_admission_cancellation_keeps_both_directions_atomic() {
         let mut connection = shared_name_connection();
         for checks in 1..=4 {
-            let table = SharedNameTable::new(SharedNameCache::default());
+            let table = SharedNameTable::new(SharedNameCache::new(
+                &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+            ));
             let digests = [
                 [checks as u8; 32],
                 [checks as u8 + 10; 32],
@@ -2669,7 +3112,9 @@ mod tests {
                 );
             }
         }
-        let table = SharedNameTable::new(SharedNameCache::default());
+        let table = SharedNameTable::new(SharedNameCache::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        ));
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(!table.admit_persisted_names(&[], &cancelled));
@@ -2679,7 +3124,9 @@ mod tests {
     #[test]
     fn shared_name_admission_rejects_conflicts_before_installing_aliases() {
         let mut connection = shared_name_connection();
-        let table = SharedNameTable::new(SharedNameCache::default());
+        let table = SharedNameTable::new(SharedNameCache::new(
+            &brokk_bifrost_core::retention_budget::RetentionBudget::for_tests(),
+        ));
         for digest in [[1; 32], [2; 32], [3; 32]] {
             table.interner(&connection).intern(digest);
         }
@@ -2734,6 +3181,125 @@ mod tests {
             &CancellationToken::default(),
         )
         .expect("uncancelled bundle construction")
+    }
+
+    #[test]
+    fn bundle_and_mount_count_encodings_omit_inapplicable_families() {
+        // A family that does not apply to a language leaves that language's
+        // bundle digest and count codecs byte-identical (#9195, #8870, #9546).
+        for language in [
+            Language::Go,
+            Language::Rust,
+            Language::Python,
+            Language::Kotlin,
+        ] {
+            assert_bundle_and_mount_count_encodings_omit_inapplicable_families(language);
+        }
+    }
+
+    #[test]
+    fn java_execution_context_rows_change_bundle_identity_and_append_count() {
+        let empty = bundle(Language::Java, PreparedResolutionBundleRows::default());
+        let mut rows = PreparedResolutionBundleRows::default();
+        rows.reference_execution_contexts
+            .push(PreparedResolutionRow::new(vec![
+                1_u32.into(),
+                "callable".into(),
+                "method".into(),
+                PreparedResolutionValue::Null,
+                2_u32.into(),
+            ]));
+        let with_context = bundle(Language::Java, rows);
+        assert_ne!(empty.interior_digest(), with_context.interior_digest());
+        assert_eq!(with_context.family_counts().last().copied(), Some(1));
+        assert_eq!(empty.family_counts().last().copied(), Some(0));
+        assert_eq!(
+            RESOLUTION_MANIFEST_COUNT_COLUMNS.last().copied(),
+            Some("expected_reference_execution_context_count")
+        );
+    }
+
+    #[test]
+    #[hardwon(
+        "#9745: set_capsule_manifest wrote capsule counts one slot late after the Java-only count was appended"
+    )]
+    fn capsule_manifest_counts_land_on_their_named_columns() {
+        let mut capsule = bundle(Language::Rust, PreparedResolutionBundleRows::default());
+        capsule.set_capsule_manifest([7; 32], 2, 3, 0);
+        let counts = capsule.family_counts();
+        let count_of = |column: &str| {
+            counts[RESOLUTION_MANIFEST_COUNT_COLUMNS
+                .iter()
+                .position(|name| *name == column)
+                .expect("manifest column")]
+        };
+        assert_eq!(count_of("expected_capsule_input_count"), 1);
+        assert_eq!(count_of("expected_capsule_declaration_count"), 2);
+        assert_eq!(count_of("expected_capsule_reference_context_count"), 3);
+        assert_eq!(count_of("expected_reference_execution_context_count"), 0);
+    }
+
+    fn assert_bundle_and_mount_count_encodings_omit_inapplicable_families(language: Language) {
+        let prepared = bundle(language, sample_rows(true));
+        let counts = prepared.family_counts();
+        let old_counts = counts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| {
+                resolution_count_applies(language, index).then_some(*count)
+            })
+            .collect::<Vec<_>>();
+        let inapplicable = PreparedResolutionBundleRows::family_specs()
+            .iter()
+            .filter(|family| !resolution_family_applies(language, family.name))
+            .count();
+        assert_eq!(old_counts.len() + inapplicable, counts.len());
+
+        use resolution_manifest::compact::{StreamHasher, put_bytes, put_len};
+        let mut old_header = StreamHasher::new(b"bifrost-resolution-persisted-bundle:v2");
+        put_bytes(old_header.buffer(), language.config_label().as_bytes());
+        put_bytes(old_header.buffer(), prepared.producer_epoch().as_bytes());
+        for (spec, rows) in PreparedResolutionBundleRows::family_specs()
+            .into_iter()
+            .zip(prepared.rows.families())
+        {
+            if !resolution_family_applies(language, spec.name) {
+                continue;
+            }
+            put_bytes(old_header.buffer(), spec.name.as_bytes());
+            put_len(old_header.buffer(), rows.len());
+            for row in rows {
+                row.encode(old_header.buffer());
+            }
+        }
+        let previous_digest = resolution_manifest::complete_body_digest(
+            old_header.finish(),
+            &prepared.path_rows,
+            &prepared.site_rows,
+            &prepared.typed_fact_rows,
+            &prepared.gap_rows,
+            &prepared.recipe_rows,
+            &prepared.shared_name_digests,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(prepared.interior_digest(), previous_digest);
+
+        // The two selected identity codecs keep their old scalar sequence.
+        // Each appends these fields after unrelated mount/publication fields.
+        for label in ["count", "manifest_count"] {
+            let mut old = CanonicalHasher::new(b"9195-old-selected-counts");
+            for count in &old_counts {
+                old.field(label, &(*count as u64).to_be_bytes());
+            }
+            let mut current = CanonicalHasher::new(b"9195-old-selected-counts");
+            for (index, count) in counts.iter().enumerate() {
+                if resolution_count_applies(language, index) {
+                    current.field(label, &(*count as u64).to_be_bytes());
+                }
+            }
+            assert_eq!(old.finish(), current.finish(), "{label} codec changed");
+        }
     }
 
     #[test]
@@ -2811,9 +3377,19 @@ mod tests {
                     .map(|_| PreparedResolutionValue::Integer(0))
                     .collect::<Vec<_>>(),
             ));
-            let changed_family = bundle(Language::Java, rows);
+            let language = if spec.name == "reference_package_contexts" {
+                Language::Scala
+            } else {
+                Language::Java
+            };
+            let changed_family = bundle(language, rows);
+            let empty_family = if language == Language::Scala {
+                bundle(Language::Scala, PreparedResolutionBundleRows::default())
+            } else {
+                empty.clone()
+            };
             assert_ne!(
-                changed_family.interior_digest, empty.interior_digest,
+                changed_family.interior_digest, empty_family.interior_digest,
                 "{} must participate in the bundle digest",
                 spec.name
             );
@@ -3011,6 +3587,24 @@ impl MintedSharedNames {
         self.names.capacity() * std::mem::size_of::<(u32, [u8; 32])>()
             + self.aliases.capacity() * std::mem::size_of::<(SharedNameId, SharedNameId)>()
     }
+}
+
+/// Read the recipe publication witness on the same held snapshot as selection.
+pub(crate) fn resolution_identity_recipe_generation(connection: &Connection) -> Result<i64> {
+    let mut statement = connection.prepare_cached(
+        "SELECT id, generation, typeof(generation) FROM resolution_identity_recipe_generation",
+    )?;
+    let mut rows = statement.query([])?;
+    let Some(row) = rows.next()? else {
+        return Err(StoreError::corrupt("missing resolution recipe generation"));
+    };
+    let id: i64 = row.get(0)?;
+    let generation: i64 = row.get(1)?;
+    let value_type: String = row.get(2)?;
+    if id != 1 || generation < 0 || value_type != "integer" || rows.next()?.is_some() {
+        return Err(StoreError::corrupt("invalid resolution recipe generation"));
+    }
+    Ok(generation)
 }
 
 /// The highest `resolution_identities.id`. Interned ids are never reused, so

@@ -12,8 +12,9 @@ pub(super) mod go_members;
 mod go_model;
 pub(super) mod java_access;
 pub(super) mod java_inheritance;
+mod model_declarations;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use std::rc::Rc;
 
@@ -213,6 +214,55 @@ const TYPED_FACT_LOOKUP_FAMILY: &str = "resolution_typed_fact_lookups";
 
 const PAGE_ROWS: usize = MAX_TYPED_FACT_ROWS_PER_PAGE;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExternalProviderFamily {
+    Jvm,
+    Other(Language),
+    Unknown,
+}
+
+impl ExternalProviderFamily {
+    pub(super) fn from_language(language: Language) -> Self {
+        match language {
+            Language::Java | Language::Kotlin | Language::Scala => Self::Jvm,
+            _ => Self::Other(language),
+        }
+    }
+}
+
+// An ID shared by different families has no safe inventory adapter.
+pub(super) fn insert_external_provider_family(
+    families: &mut HashMap<String, Option<ExternalProviderFamily>>,
+    provider: String,
+    family: ExternalProviderFamily,
+) {
+    families
+        .entry(provider)
+        .and_modify(|old| {
+            if *old != Some(family) {
+                *old = None;
+            }
+        })
+        .or_insert(Some(family));
+}
+
+#[cfg(test)]
+#[test]
+fn conflicting_external_provider_families_refuse_inventory() {
+    let mut families = HashMap::new();
+    insert_external_provider_family(
+        &mut families,
+        "shared".to_owned(),
+        ExternalProviderFamily::Jvm,
+    );
+    insert_external_provider_family(
+        &mut families,
+        "shared".to_owned(),
+        ExternalProviderFamily::Other(Language::Python),
+    );
+    assert_eq!(families.get("shared"), Some(&None));
+}
+
 #[doc(hidden)]
 pub const FRONTIER_SOURCE_READY_SQL: &str =
     "SELECT 1 FROM main.source_fact_readiness WHERE blob_id=?1 AND available=1";
@@ -228,15 +278,46 @@ pub(super) trait GoDefinitionContextBinder {
     ) -> StoreResult<Option<super::GoContextIdentity>>;
 }
 
+/// Borrowed operation authority for implicit inputs. The memo checks the
+/// authority on every read, including hits, before returning derived inputs.
+#[doc(hidden)]
+pub trait SelectedImplicitInputProvider {
+    fn environment(&self) -> i64;
+    fn declared_version(&self) -> Option<(u16, u16)>;
+    fn validate_current_use(
+        &self,
+        language: Language,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<()>;
+
+    fn read_inputs(
+        &self,
+        language: Language,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<crate::analyzer::resolution::ImplicitBaseInputs>>;
+}
+
 /// Operation-local typed reader over one retained selected inventory.
 #[doc(hidden)]
 pub struct SelectedResolutionTypedSource<'selection, 'store> {
     selection: &'selection SelectedResolutionMountInventory<'store>,
     implicit_environment: Option<i64>,
     implicit_language_version: Option<(u16, u16)>,
+    // Memo authority: keyed by class owner only. Lifetime is this typed source,
+    // which with_python_forward_inputs builds once per invocation; the source
+    // fixes selection, environment, version, context identities, external
+    // models and providers, and model authority (each builder asserts the memo
+    // is empty). Authority is the implicit-base-inputs read through this
+    // selection. Never persisted; None results and results carrying an
+    // execution stop are not retained. Do not move this onto
+    // ReadySelectedResolution.
+    implicit_inputs: ImplicitInputsMemo,
+    implicit_input_provider: Option<&'selection dyn SelectedImplicitInputProvider>,
     authority: Rc<SelectedResolutionAuthority<'selection>>,
     context_identities: crate::analyzer::resolution::SelectedContextIdentities,
     external_providers: Vec<String>,
+    external_provider_families: HashMap<String, ExternalProviderFamily>,
     model_authority: Option<
         std::sync::Arc<dyn super::resolution_operation::SelectedModelAuthority + Send + Sync>,
     >,
@@ -254,6 +335,258 @@ pub struct SelectedResolutionTypedSource<'selection, 'store> {
         String,
         Box<dyn super::language_support::NamespaceDefinitionClassifier>,
     )>,
+}
+
+#[derive(Default)]
+struct ImplicitInputsMemo(
+    std::cell::RefCell<
+        std::collections::HashMap<SemanticId, crate::analyzer::resolution::ImplicitBaseInputs>,
+    >,
+);
+
+impl ImplicitInputsMemo {
+    fn read(
+        &self,
+        owner: SemanticId,
+        cancellation: &CancellationToken,
+        cold: impl FnOnce() -> StoreResult<Option<crate::analyzer::resolution::ImplicitBaseInputs>>,
+    ) -> StoreResult<Option<crate::analyzer::resolution::ImplicitBaseInputs>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(inputs) = self.0.borrow().get(&owner) {
+            return Ok(Some(inputs.clone()));
+        }
+        let result = cold()?;
+        if let Some(inputs) = &result {
+            let stopped = match &inputs.completion {
+                crate::analyzer::resolution::ResolutionCompletion::Complete => false,
+                crate::analyzer::resolution::ResolutionCompletion::Incomplete(reasons) => {
+                    reasons.iter().any(|reason| reason.is_execution_stop())
+                }
+            };
+            if !stopped && !cancellation.is_cancelled() {
+                self.0.borrow_mut().insert(owner, inputs.clone());
+            }
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod implicit_inputs_memo_tests {
+    use super::*;
+    use crate::analyzer::resolution::{
+        ClassCreationKind, ImplicitBaseAuthority, ImplicitBaseInputs, ResolutionCompletion,
+        ResolutionIncompleteReason,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9575: implicit input memo hits bypassed selected mutation authority"
+    )]
+    fn implicit_input_hits_validate_the_selected_provider() {
+        use crate::analyzer::store::AnalyzerStore;
+        use crate::analyzer::store::resolution_selection::{
+            SelectedResolutionLanguage, SelectedResolutionMountInventoryOutcome,
+            tests::qualifier_completion_gap_fixture_in_language,
+        };
+        use std::cell::Cell;
+
+        struct Provider {
+            reads: Cell<usize>,
+            validations: Cell<usize>,
+            stale: Cell<bool>,
+        }
+        impl SelectedImplicitInputProvider for Provider {
+            fn environment(&self) -> i64 {
+                9575
+            }
+            fn declared_version(&self) -> Option<(u16, u16)> {
+                None
+            }
+            fn validate_current_use(
+                &self,
+                _: Language,
+                cancellation: &CancellationToken,
+            ) -> StoreResult<()> {
+                self.validations.set(self.validations.get() + 1);
+                if cancellation.is_cancelled() {
+                    return Err(StoreError::cancelled("cancelled implicit provider"));
+                }
+                if self.stale.get() {
+                    return Err(StoreError::stale_resolution("changed implicit provider"));
+                }
+                Ok(())
+            }
+            fn read_inputs(
+                &self,
+                _: Language,
+                owner: SemanticId,
+                _: &CancellationToken,
+            ) -> StoreResult<Option<ImplicitBaseInputs>> {
+                self.reads.set(self.reads.get() + 1);
+                Ok(Some(ImplicitBaseInputs {
+                    written_inventory_complete: true,
+                    written_base_count: 0,
+                    creation: ClassCreationKind::Ordinary,
+                    root_object: None,
+                    authority: ImplicitBaseAuthority::Intrinsic { descriptor: owner },
+                    completion: ResolutionCompletion::Complete,
+                }))
+            }
+        }
+        let (store, workspace, snapshots) = qualifier_completion_gap_fixture_in_language(
+            AnalyzerStore::open_ephemeral().unwrap(),
+            Language::Python,
+        );
+        let cancellation = CancellationToken::new();
+        let languages = [SelectedResolutionLanguage::new("python", Language::Python)];
+        let SelectedResolutionMountInventoryOutcome::Ready(selection) = store
+            .open_selected_resolution_mount_inventory(
+                &workspace,
+                &snapshots,
+                &languages,
+                &[],
+                &cancellation,
+            )
+            .unwrap()
+        else {
+            panic!("published Python fixture must select");
+        };
+        let ordinal = selection.connection().query_row("SELECT mount_ordinal FROM temp.selected_resolution_mounts WHERE storage_language='python'", [], |row| row.get::<_,u32>(0)).unwrap();
+        let mount = super::super::resolution_operation::SelectedMountTable::new(&selection)
+            .mount_by_ordinal(SelectedResolutionMountOrdinal::new(ordinal))
+            .unwrap();
+        let owner = crate::analyzer::resolution::mounted_site_semantic(
+            mount.fragment(),
+            brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(0),
+        );
+        let provider = Provider {
+            reads: Cell::new(0),
+            validations: Cell::new(0),
+            stale: Cell::new(false),
+        };
+        let typed = SelectedResolutionTypedSource::new_on_demand(&selection)
+            .with_implicit_environment(9575, None)
+            .with_implicit_input_provider(&provider);
+        let first = typed.implicit_base_inputs(owner, &cancellation).unwrap();
+        assert!(
+            first.is_some(),
+            "selected owner must reach the actual implicit memo"
+        );
+        let validated = provider.validations.get();
+        assert_eq!(
+            typed.implicit_base_inputs(owner, &cancellation).unwrap(),
+            first
+        );
+        assert_eq!(provider.reads.get(), 1, "warm path must use the memo");
+        assert!(
+            provider.validations.get() > validated,
+            "warm path must still validate authority"
+        );
+        provider.stale.set(true);
+        assert!(
+            typed
+                .implicit_base_inputs(owner, &cancellation)
+                .unwrap_err()
+                .is_stale_resolution()
+        );
+        assert_eq!(provider.reads.get(), 1);
+        let missing = SelectedResolutionTypedSource::new_on_demand(&selection)
+            .with_implicit_environment(9575, None);
+        assert!(missing.implicit_base_inputs(owner, &cancellation).is_err());
+    }
+
+    #[test]
+    fn one_hook_read_per_owner_replays_content_and_retries_stops() {
+        let memo = ImplicitInputsMemo::default();
+        let cancellation = CancellationToken::new();
+        let reads = AtomicUsize::new(0);
+        let owners = [
+            SemanticId::for_test("implicit-a"),
+            SemanticId::for_test("implicit-b"),
+            SemanticId::for_test("implicit-c"),
+        ];
+        for (index, owner) in owners.into_iter().enumerate() {
+            let completion = if index == 1 {
+                ResolutionCompletion::incomplete([ResolutionIncompleteReason::UnsupportedSemantic(
+                    SemanticId::for_test("python_class_decorator_unproven"),
+                )])
+            } else {
+                ResolutionCompletion::Complete
+            };
+            let expected = ImplicitBaseInputs {
+                written_inventory_complete: true,
+                written_base_count: 0,
+                creation: ClassCreationKind::Ordinary,
+                root_object: None,
+                authority: ImplicitBaseAuthority::Intrinsic { descriptor: owner },
+                completion,
+            };
+            let cold = memo
+                .read(owner, &cancellation, || {
+                    reads.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(expected.clone()))
+                })
+                .unwrap();
+            let warm = memo
+                .read(owner, &cancellation, || {
+                    panic!("memo hit must not call the hook")
+                })
+                .unwrap();
+            assert_eq!(cold, warm);
+            assert_eq!(warm, Some(expected));
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+
+        let stopped_owner = SemanticId::for_test("implicit-stopped");
+        let stopped = ImplicitBaseInputs {
+            written_inventory_complete: false,
+            written_base_count: 0,
+            creation: ClassCreationKind::Unknown,
+            root_object: None,
+            authority: ImplicitBaseAuthority::Intrinsic {
+                descriptor: stopped_owner,
+            },
+            completion: ResolutionCompletion::incomplete([
+                ResolutionIncompleteReason::TimeBudgetExceeded(stopped_owner),
+            ]),
+        };
+        memo.read(stopped_owner, &cancellation, || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(stopped.clone()))
+        })
+        .unwrap();
+        memo.read(stopped_owner, &cancellation, || {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(stopped))
+        })
+        .unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), 5);
+
+        let missing_owner = SemanticId::for_test("implicit-stopped-none");
+        for _ in 0..2 {
+            assert_eq!(
+                memo.read(missing_owner, &cancellation, || {
+                    reads.fetch_add(1, Ordering::Relaxed);
+                    Ok(None)
+                })
+                .unwrap(),
+                None
+            );
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 7);
+        cancellation.cancel();
+        assert_eq!(
+            memo.read(owners[0], &cancellation, || panic!(
+                "cancelled hit must not read"
+            ))
+            .unwrap(),
+            None
+        );
+    }
 }
 
 /// A name-index nomination. The owning site is intentionally absent: the
@@ -294,9 +627,15 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             selection,
             implicit_environment: None,
             implicit_language_version: None,
+            implicit_inputs: Default::default(),
+            implicit_input_provider: None,
             authority,
             context_identities: crate::analyzer::resolution::SelectedContextIdentities::new(),
             external_providers: Vec::new(),
+            external_provider_families: HashMap::from([(
+                "jvm-intrinsic".to_owned(),
+                ExternalProviderFamily::Jvm,
+            )]),
             model_authority: None,
             external_models: None,
             go_context_binder: None,
@@ -312,14 +651,36 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     }
 
     /// A dormant caller supplies its exact selected environment publication.
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn with_implicit_environment(
         mut self,
         environment: i64,
         declared_version: Option<(u16, u16)>,
     ) -> Self {
+        assert!(
+            self.implicit_inputs.0.borrow().is_empty(),
+            "implicit inputs cannot outlive an environment change"
+        );
+        assert!(
+            self.implicit_input_provider.is_none(),
+            "implicit input authority is fixed"
+        );
         self.implicit_environment = Some(environment);
         self.implicit_language_version = declared_version;
+        self
+    }
+
+    pub(super) fn with_implicit_input_provider(
+        mut self,
+        provider: &'selection dyn SelectedImplicitInputProvider,
+    ) -> Self {
+        assert!(self.implicit_inputs.0.borrow().is_empty());
+        assert!(
+            self.implicit_input_provider.is_none(),
+            "implicit input authority cannot be replaced"
+        );
+        assert_eq!(self.implicit_environment, Some(provider.environment()));
+        assert_eq!(self.implicit_language_version, provider.declared_version());
+        self.implicit_input_provider = Some(provider);
         self
     }
 
@@ -340,6 +701,10 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             std::sync::Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>,
         >,
     ) -> Self {
+        assert!(
+            self.implicit_inputs.0.borrow().is_empty(),
+            "implicit inputs cannot outlive an external-model change"
+        );
         self.external_models = models;
         self
     }
@@ -350,6 +715,10 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
             std::sync::Arc<dyn super::resolution_operation::SelectedModelAuthority + Send + Sync>,
         >,
     ) -> Self {
+        assert!(
+            self.implicit_inputs.0.borrow().is_empty(),
+            "implicit inputs cannot outlive a model-authority change"
+        );
         self.model_authority = authority;
         self
     }
@@ -375,8 +744,28 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
     }
 
     pub(super) fn with_external_providers(mut self, providers: Vec<String>) -> Self {
+        assert!(
+            self.implicit_inputs.0.borrow().is_empty(),
+            "implicit inputs cannot outlive an external-provider change"
+        );
         self.external_providers = providers;
+        for provider in &self.external_providers {
+            self.external_provider_families
+                .insert(provider.clone(), ExternalProviderFamily::Jvm);
+        }
         self
+    }
+
+    pub(super) fn with_external_provider_families(
+        mut self,
+        families: HashMap<String, ExternalProviderFamily>,
+    ) -> Self {
+        self.external_provider_families = families;
+        self
+    }
+
+    pub(in crate::analyzer::store) fn is_jvm_external_provider(&self, provider: &str) -> bool {
+        self.external_provider_families.get(provider) == Some(&ExternalProviderFamily::Jvm)
     }
 
     pub(super) fn with_go_context_binder(
@@ -391,6 +780,10 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
         mut self,
         identities: crate::analyzer::resolution::SelectedContextIdentities,
     ) -> Self {
+        assert!(
+            self.implicit_inputs.0.borrow().is_empty(),
+            "implicit inputs cannot outlive a context-identity change"
+        );
         self.context_identities = identities;
         self
     }
@@ -1101,7 +1494,9 @@ impl<'selection, 'store> SelectedResolutionTypedSource<'selection, 'store> {
                         local.local_key().get(),
                     ))
                 }
-                Some(SelectedNodeProvenance::Stage(_)) => {}
+                Some(
+                    SelectedNodeProvenance::Stage(_) | SelectedNodeProvenance::ModelDefinition(_),
+                ) => {}
                 Some(SelectedNodeProvenance::UniversalRoot) => {
                     return Err(invalid_fact(
                         "universal root is not a persisted typed node request",
@@ -1385,6 +1780,104 @@ impl SelectedResolutionTypedSource<'_, '_> {
 }
 
 impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
+    fn selected_blob_for_fragment(
+        &self,
+        fragment: BindingFragmentId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<i64>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let ordinal = SelectedResolutionMountOrdinal::new(fragment.ordinal());
+        if self.selection.persisted_mount_record(ordinal)?.is_none() {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some(self.mount(ordinal)?.blob_id())))
+    }
+    fn selected_blob_gap_reason_provenance(
+        &self,
+        blob: i64,
+        fragment: BindingFragmentId,
+        reasons: &[SemanticId],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Vec<SelectedGapReasonProvenance>>> {
+        if !self.validate_selected_interiors(cancellation)? {
+            return Ok(None);
+        }
+        let ordinal = SelectedResolutionMountOrdinal::new(fragment.ordinal());
+        if self.mount(ordinal)?.blob_id() != blob {
+            return Ok(Some(Vec::new()));
+        }
+        let mut keys = Vec::new();
+        for &reason in reasons {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            if reason.shared_name_id().is_some() {
+                continue;
+            }
+            if let Some((reason_mount, key)) = self.authority.ordinary_gap_reason(reason)?
+                && reason_mount == ordinal
+            {
+                keys.push(i64::from(key));
+            }
+        }
+        if keys.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let key_array = json_array(keys);
+        self.read_statement(cancellation, |conn| {
+            let mut statement = conn.prepare_cached(typed_rows::GAP_REASON_PROVENANCE_SQL)?;
+            let rows = statement.query_map(rusqlite::params![blob, key_array], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (key, site, origin) = row?;
+                result.push(SelectedGapReasonProvenance::new(
+                    fragment,
+                    SemanticId::local(fragment.ordinal(), key),
+                    brokk_bifrost_core::analyzer::resolution_facts::ResolutionSiteId::new(site),
+                    super::resolution_prepare::resolution_rows::gap_origin_from_code(origin),
+                ));
+            }
+            Ok(Some(result))
+        })
+    }
+    fn jvm_external_owner_is_indexed(
+        &self,
+        owner: &crate::analyzer::resolution::ExternalOwnerIdentity,
+    ) -> StoreResult<bool> {
+        self.external_owner_type_is_indexed(owner)
+    }
+    fn selected_model_language(
+        &self,
+        token: SemanticId,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Language>> {
+        Ok(self
+            .model_declaration(token, cancellation)?
+            .and_then(|owner| (owner.declaration.language == "python").then_some(Language::Python)))
+    }
+    fn selected_model_projection(
+        &self,
+        token: SemanticId,
+        kind: brokk_bifrost_core::analyzer::resolution_facts::BindingProjectionKind,
+        receivers: &[crate::analyzer::resolution::ResolutionSlotValue],
+        cancellation: &CancellationToken,
+    ) -> StoreResult<
+        Option<(
+            Vec<crate::analyzer::resolution::ResolutionSlotValue>,
+            ResolutionCompletion,
+        )>,
+    > {
+        self.project_model_value(token, kind, receivers, cancellation)
+    }
+
     fn supports_conditional_type_seeds(&self) -> bool {
         self.selection.has_conditional_type_seeds()
     }
@@ -1439,7 +1932,10 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         owner: SemanticId,
         cancellation: &CancellationToken,
     ) -> StoreResult<Option<crate::analyzer::resolution::ImplicitBaseInputs>> {
-        let Some(environment) = self.implicit_environment else {
+        if let Some(inputs) = self.model_implicit_inputs(owner, cancellation)? {
+            return Ok(Some(inputs));
+        }
+        let Some(_environment) = self.implicit_environment else {
             return Ok(None);
         };
         if !self.validate_selected_interiors(cancellation)? {
@@ -1453,16 +1949,15 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         } else {
             return Ok(None);
         };
-        let Some(support) = super::store_language_support(language) else {
-            return Ok(None);
-        };
-        support.selected_implicit_base_inputs(
-            self.selection,
-            environment,
-            self.implicit_language_version,
-            owner,
-            cancellation,
-        )
+        let provider = self
+            .implicit_input_provider
+            .ok_or_else(|| StoreError::new("implicit input read authority is unavailable"))?;
+        provider.validate_current_use(language, cancellation)?;
+        let answer = self.implicit_inputs.read(owner, cancellation, || {
+            provider.read_inputs(language, owner, cancellation)
+        });
+        provider.validate_current_use(language, cancellation)?;
+        answer
     }
 
     fn intrinsic_member_inventory(
@@ -1517,6 +2012,28 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
             Ok(Some(unshadowed && unindexed))
         })?;
         Ok(unshadowed.unwrap_or(false))
+    }
+
+    fn selected_jvm_declaration_owner(
+        &self,
+        owner_fqn: &str,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<Option<Option<crate::analyzer::resolution::ExternalOwnerIdentity>>> {
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        Ok(self
+            .read_statement(cancellation, |connection| {
+                super::resolution_operation::selected_jvm_declaration_owner(
+                    super::resolution_operation::nominal_rules::jvm_external_owner_relations(),
+                    connection,
+                    self.model_authority.as_deref(),
+                    &self.external_providers,
+                    owner_fqn,
+                )
+                .map(Some)
+            })?
+            .flatten())
     }
 
     fn generated_items_cannot_shadow_bindings(
@@ -4032,6 +4549,10 @@ impl SelectedTypedFactSource for SelectedResolutionTypedSource<'_, '_> {
         if !source.is_exhausted() {
             return Ok(source);
         }
+        let model = self.visit_model_supertypes(definitions.as_slice(), cancellation, visitor)?;
+        if !model.is_exhausted() {
+            return Ok(model);
+        }
         let external =
             self.visit_external_supertypes(definitions.as_slice(), cancellation, visitor)?;
         let completion = source.evidence().combine(external.evidence());
@@ -4611,9 +5132,12 @@ fn decode_member_scope(
     context: TypedRowContext,
     row: &Row<'_>,
 ) -> StoreResult<SelectedTypedRow<LoweredMemberScopeProperty>> {
+    let definition = context.semantic(row.get(0)?);
+    let member_types = typed_rows::decode_member_types(definition, row.get(2)?, row.get(3)?)?;
     Ok(SelectedTypedRow::new(
         context.fragment,
-        LoweredMemberScopeProperty::new(context.semantic(row.get(0)?), context.node(row.get(1)?)),
+        LoweredMemberScopeProperty::new(definition, context.node(row.get(1)?))
+            .with_member_types(member_types),
     ))
 }
 

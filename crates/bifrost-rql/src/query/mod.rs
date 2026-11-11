@@ -30,7 +30,8 @@ fn index_path(path: &str, index: usize) -> String {
     format!("{path}[{index}]")
 }
 
-pub(crate) use json::configuration_facts_seed_to_json;
+pub use ir::plan_code_languages;
+pub(crate) use json::{configuration_facts_seed_to_json, plan_to_json};
 use source::EnvironmentOptionKind;
 
 pub use brokk_bifrost_core::analyzer::configuration::{
@@ -42,20 +43,20 @@ pub use ir::{
     BindingFilter, BindingOfOptions, BindingSeed, BranchRelationFilter, BranchRelationKind,
     CSharpRule, CallArgumentSelector, CallIdentity, CallInputSelector, CallSiteTraversalFilter,
     CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, ConfigurationCodeMatch,
-    ConfigurationCodeRelation, ConfigurationCompletenessFilter, ConfigurationFactsFilter,
-    ConfigurationFactsSeed, ConfigurationKeyRelation, ConfigurationNodeKindFilter,
-    ConfigurationRouteFilter, ConfigurationRouteSegmentFilter, ControlRelationFilter,
-    CppProvenanceFilter, CppRule, CrossDomainCorrelation, CrossDomainRelation,
-    CrossDomainRequirement, DEFAULT_LIMIT, DeclarationModifier, DeclarationStateFilter,
-    DecoratorBindingFilter, DependencyConfigurationRelation, DependencyEvidenceFilter,
-    DependencyEvidenceSeed, EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer,
-    FailureUseProvenance, FieldWriteValueTraversal, FlowRelationFilter, GenerationSiteFilter,
-    GenerationSiteSeed, HierarchyTraversal, JavaRule, JsRule, JsxAttributeValueTraversal,
-    JsxElementIdentity, KeyedReadKeySelector, KeyedReadValueTraversal, LanguageRule,
-    LanguageScopeConflict, MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH,
-    MAX_CONFIGURATION_FILTER_ENTRIES, MAX_CONFIGURATION_KEY_LENGTH,
-    MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_CORRELATION_DOCUMENTS,
+    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, ConfigurationAbsenceScope,
+    ConfigurationCodeMatch, ConfigurationCodeRelation, ConfigurationCompletenessFilter,
+    ConfigurationFactsFilter, ConfigurationFactsSeed, ConfigurationKeyRelation,
+    ConfigurationNodeKindFilter, ConfigurationRouteFilter, ConfigurationRouteSegmentFilter,
+    ControlRelationFilter, CppProvenanceFilter, CppRule, CrossDomainCorrelation,
+    CrossDomainRelation, CrossDomainRequirement, DEFAULT_LIMIT, DeclarationModifier,
+    DeclarationStateFilter, DecoratorBindingFilter, DependencyConfigurationRelation,
+    DependencyEvidenceFilter, DependencyEvidenceSeed, EdgeFilter, EnclosingPattern, ExportFilter,
+    ExportSeed, FailureUseConsumer, FailureUseProvenance, FieldWriteValueTraversal,
+    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    InstantiatedType, JavaRule, JsRule, JsxAttributeValueTraversal, JsxElementIdentity,
+    KeyedReadKeySelector, KeyedReadValueTraversal, LanguageRule, LanguageScopeConflict, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_CONFIGURATION_FILTER_ENTRIES,
+    MAX_CONFIGURATION_KEY_LENGTH, MAX_CONFIGURATION_ROUTE_SEGMENTS, MAX_CORRELATION_DOCUMENTS,
     MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
@@ -66,10 +67,10 @@ pub use ir::{
     QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter,
     ResolvedCallFilter, ResolvedCallIdentity, ResolvedCallIdentityKind, ResolvedCallProof,
     ResolvedCallReceiverType, ResolvedValueFilter, ResultContractFailureUseFilter,
-    RewritePathFilter, SCHEMA_VERSION, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator,
-    StateEventFilter, StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
-    ValueFlowTraversal, WitnessTraversal, compile_path_glob, exact_path_globs,
-    intersect_language_scopes,
+    RewritePathFilter, RustRule, SCHEMA_VERSION, ScopeFilter, ScopeSeed, SegmentsOfOptions,
+    SetOperator, StateEventFilter, StringPredicate, TaintTraversal, TypestateTraversal,
+    UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal, compile_path_glob,
+    exact_path_globs, intersect_language_scopes,
 };
 pub use partition::{IntersectCut, PlanPartitioning, PlanWidenDetail};
 pub use schema::{

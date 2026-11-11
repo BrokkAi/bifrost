@@ -214,16 +214,21 @@ pub use reusable_summary::{
 };
 pub(crate) use reusable_summary::{
     SemanticSummaryArtifactIndex, SemanticSummarySetValidationError,
-    canonical_semantic_summaries_by_artifact, declaration_locator_heap_bytes,
-    validate_recursive_summary_batch,
+    canonical_protocol_summaries_by_artifact, canonical_semantic_summaries_by_artifact,
+    declaration_locator_heap_bytes, validate_recursive_summary_batch,
 };
 pub(crate) use snapshot_replay::SnapshotReplayProvider;
 pub(crate) use summary::NoReusableSummaries;
+#[cfg(test)]
+pub(crate) use summary::cancel_next_reusable_entry_before_commit;
+#[cfg(test)]
+pub(crate) use summary::take_last_reusable_entry_reservation;
 pub use summary::{
-    ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryError,
-    ReusableSummaryProvider, SummaryCallCycle, SummaryCalledProcedures, SummaryPointSeed,
-    SummarySolveInput, solve_with_reusable_end_summaries,
-    solve_with_reusable_root_and_end_summaries, solve_with_summaries,
+    MemberReadReceipt, QualityEvidence, ReusableEndSummary, ReusableProcedureSummary,
+    ReusableReachedFact, ReusableSummaryError, ReusableSummaryProvider, SummaryCallCycle,
+    SummaryCalledProcedures, SummaryPointSeed, SummarySolveInput, WitnessFragment,
+    solve_with_reusable_end_summaries, solve_with_reusable_root_and_end_summaries,
+    solve_with_summaries,
 };
 pub use summary_result::{
     SummaryBoundary, SummaryBoundaryKind, SummaryCoverage, SummaryDataflowError,
@@ -233,9 +238,10 @@ pub use summary_result::{
 pub use tabulation::{solve, solve_backward, solve_backward_on_snapshot, solve_on_snapshot};
 pub(crate) use witness::WitnessArena;
 pub use witness::{
-    MAX_WITNESS_ALTERNATIVES_PER_QUALITY, SummaryWitness, SummaryWitnessError, SummaryWitnessStep,
-    SummaryWitnessStepKind, WitnessLimitError, WitnessReconstructionLimits,
-    WitnessReconstructionWork, WitnessRetentionLimits, WitnessTruncationCause,
+    MAX_WITNESS_ALTERNATIVES_PER_QUALITY, ReusableWitnessStep, SummaryWitness, SummaryWitnessError,
+    SummaryWitnessStep, SummaryWitnessStepKind, WitnessLimitError, WitnessPointRow,
+    WitnessReconstructionLimits, WitnessReconstructionWork, WitnessRetentionLimits,
+    WitnessStepCodecError, WitnessStepRow, WitnessStepState, WitnessTruncationCause,
 };
 
 pub(crate) use reusable_summary::ProductionSemanticSummaryStorage;

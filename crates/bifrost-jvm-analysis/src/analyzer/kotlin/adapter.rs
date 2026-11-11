@@ -24,6 +24,26 @@ use tree_sitter::Tree;
 pub struct KotlinAdapter;
 
 impl LanguageAdapter for KotlinAdapter {
+    fn line_data_kinds(&self) -> brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+        brokk_bifrost_core::analyzer::tree_walk::LineDataKinds {
+            literals: &[
+                "string_literal",
+                "character_literal",
+                "integer_literal",
+                "hex_literal",
+                "bin_literal",
+                "real_literal",
+                "long_literal",
+                "unsigned_literal",
+            ],
+            interpolations: &["interpolated_expression", "interpolated_identifier"],
+            composites: &[
+                ("collection_literal", &["[", "]", ","]),
+                ("prefix_expression", &["-", "+"]),
+            ],
+        }
+    }
+
     /// Relative to `brokk-bifrost-jvm`'s crate root: the `.scm` assets moved
     /// with the vendored grammars and are embedded there.
     fn query_directory(&self) -> &'static str {

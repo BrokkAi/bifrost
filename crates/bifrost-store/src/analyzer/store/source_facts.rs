@@ -788,6 +788,7 @@ struct StructuralFactJson {
     nodes: String,
     roles: String,
     occurrence_roles: String,
+    role_coverage: String,
 }
 
 fn push_json_optional<T: std::fmt::Display>(out: &mut String, value: Option<T>) {
@@ -949,7 +950,7 @@ fn encode_structural_facts(
                 role_json,
                 "[{source_node_id},{},{},",
                 role.role.code(),
-                u8::from(role.spread)
+                role.mode as u8
             )
             .expect("writing to a String cannot fail");
             push_json_optional(&mut role_json, role.node);
@@ -984,10 +985,34 @@ fn encode_structural_facts(
     }
     occurrence_role_json.push(']');
 
+    let mut coverage_json = String::from("[");
+    for (index, &(owner, role, coverage)) in facts.structural.coverage().iter().enumerate() {
+        if index != 0 {
+            coverage_json.push(',');
+        }
+        use brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage;
+        match coverage {
+            RoleCoverage::Complete => {
+                write!(coverage_json, "[{owner},{},0,null]", role.code()).expect("String write");
+            }
+            RoleCoverage::Incomplete(gaps) => {
+                write!(coverage_json, "[{owner},{},1,[", role.code()).expect("String write");
+                for (index, gap) in gaps.iter().enumerate() {
+                    if index != 0 {
+                        coverage_json.push(',');
+                    }
+                    write!(coverage_json, "{}", gap.code()).expect("String write");
+                }
+                coverage_json.push_str("]]");
+            }
+        };
+    }
+    coverage_json.push(']');
     Ok(StructuralFactJson {
         nodes: node_json,
         roles: role_json,
         occurrence_roles: occurrence_role_json,
+        role_coverage: coverage_json,
     })
 }
 
@@ -1437,14 +1462,15 @@ pub(super) fn insert_source_facts_tx(
 
     let structural = encode_structural_facts(facts, &span_of, cancellation)?;
     tx.prepare_cached(
-        "INSERT INTO source_structural_facts(blob_id, nodes, roles, occurrence_roles)
-         VALUES(?1, jsonb(?2), jsonb(?3), jsonb(?4))",
+        "INSERT INTO source_structural_facts(blob_id, nodes, roles, occurrence_roles, role_coverage)
+         VALUES(?1, jsonb(?2), jsonb(?3), jsonb(?4), jsonb(?5))",
     )?
     .execute(params![
         blob_id,
         structural.nodes,
         structural.roles,
         structural.occurrence_roles,
+        structural.role_coverage,
     ])?;
     {
         let mut insert = tx.prepare_cached(
@@ -1463,12 +1489,7 @@ pub(super) fn insert_source_facts_tx(
     }
 
     check_cancelled(cancellation)?;
-    tx.execute(
-        "UPDATE source_fact_manifests
-         SET publication_state = 'complete'
-         WHERE blob_id = ?1",
-        params![blob_id],
-    )?;
+    super::publication::seal(tx, "source_fact_manifests", "blob_id", blob_id, &[])?;
     check_cancelled(cancellation)?;
     Ok(())
 }
@@ -1616,6 +1637,8 @@ mod roundtrip_properties {
             .map(|index| NormalizedNode {
                 kind: if index == 3 {
                     NormalizedKind::Call
+                } else if index == 2 {
+                    NormalizedKind::Class
                 } else {
                     NormalizedKind::StringLiteral
                 },
@@ -1641,17 +1664,23 @@ mod roundtrip_properties {
                 call_site: (index == 3).then(|| CallSiteFacts::unrefined().continuing()),
             })
             .collect();
-        let roles = [false, true]
-            .into_iter()
-            .map(|spread| RoleTarget {
-                role: Role::Kwarg,
-                spread,
-                keyword: Some(id(2)),
-                node: None,
-                occurrence: id(0),
-                name: Some(id(1)),
-            })
-            .collect();
+        let roles = [
+            brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain,
+            brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Spread,
+            brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Ref,
+            brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Out,
+            brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::In,
+        ]
+        .into_iter()
+        .map(|mode| RoleTarget {
+            role: Role::Kwarg,
+            mode,
+            keyword: Some(id(2)),
+            node: None,
+            occurrence: id(0),
+            name: Some(id(1)),
+        })
+        .collect();
         let facts = ParsedSourceFacts {
             js_ts: None,
             php: None,
@@ -1665,10 +1694,15 @@ mod roundtrip_properties {
             occurrences,
             structural: StructuralFactRows::new(
                 nodes,
-                CompactRows::from_parts(vec![0, 2, 2, 2, 2], roles),
+                CompactRows::from_parts(vec![0, 5, 5, 5, 5], roles),
                 CompactRows::from_parts(vec![0, 0, 0, 0, 0], vec![]),
                 vec![],
-            ),
+            )
+            .with_coverage(vec![(
+                2,
+                Role::Members,
+                brokk_bifrost_core::analyzer::structural::kinds::RoleCoverage::Complete,
+            )]),
             native_site_occurrences: vec![],
             native_declaration_sources: vec![],
             declaration_visibilities: None,
@@ -1784,13 +1818,14 @@ mod roundtrip_properties {
             "SELECT name_start_byte, name_end_byte, name_start_line, name_end_line FROM source_declarations WHERE blob_id=?1",
             [blob_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
         assert_eq!(name_range, (10, 40, 2, 4));
-        let (nodes, roles): (String, String) = tx
+        let (nodes, roles, coverage): (String, String, String) = tx
             .query_row(
-                "SELECT json(nodes), json(roles) FROM source_structural_facts WHERE blob_id=?1",
+                "SELECT json(nodes), json(roles), json(role_coverage) FROM source_structural_facts WHERE blob_id=?1",
                 [blob_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
+        assert_eq!(coverage, format!("[[2,{},0,null]]", Role::Members.code()));
         let storage: (String, bool, String) = tx
             .query_row(
                 "SELECT typeof(nodes), json_valid(nodes, 8), json_type(nodes)
@@ -1821,10 +1856,19 @@ mod roundtrip_properties {
             vec![Some(true), Some(false), None, None]
         );
         assert!(nodes[3].call_site.as_ref().unwrap().continues_callee_groups);
+        let mut corrupt_roles: serde_json::Value = serde_json::from_str(&roles).unwrap();
+        corrupt_roles[0][2] = serde_json::json!(9);
+        assert!(decode_structural_roles(&corrupt_roles.to_string()).is_err());
         let roles = decode_structural_roles(&roles).unwrap();
         assert_eq!(
-            roles.iter().map(|role| role.spread).collect::<Vec<_>>(),
-            vec![false, true]
+            roles.iter().map(|role| role.mode).collect::<Vec<_>>(),
+            vec![
+                brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Plain,
+                brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Spread,
+                brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Ref,
+                brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::Out,
+                brokk_bifrost_core::analyzer::structural::facts::ArgumentMode::In
+            ]
         );
         for role in roles {
             let keyword = role.keyword.unwrap();
@@ -1832,5 +1876,76 @@ mod roundtrip_properties {
             assert_eq!((keyword.start, keyword.end), (20, 30));
             assert_eq!((name.start, name.end), (10, 40));
         }
+        drop(statement);
+        tx.commit().unwrap();
+        drop(conn);
+        let key = super::super::BlobKey::unvaried(
+            git2::Oid::from_str("1111111111111111111111111111111111111111").unwrap(),
+            "fixture",
+        );
+        let read = || {
+            store.load_structural_facts_rows(
+                &key,
+                super::super::GenerationId::BOOTSTRAP,
+                SOURCE_FACTS_VERSION,
+            )
+        };
+        assert_eq!(
+            read().unwrap().unwrap().role_coverage,
+            vec![(2, Role::Members.code(), 0, None)]
+        );
+        let member = Role::Members.code();
+        let arg = Role::Arg.code();
+        let callee = Role::Callee.code();
+        for malformed in [
+            format!("[[99,{member},0,null]]"),
+            format!("[[3,{member},0,null]]"),
+            format!("[[2,{callee},0,null]]"),
+            format!("[[3,{arg},0,null]]"),
+            format!("[[2,{member},0,null],[2,{member},0,null]]"),
+            format!("[[3,{arg},0,null],[2,{member},0,null]]"),
+            format!("[[2,{member},0,[0]]]"),
+            format!("[[2,{member},1,[]]]"),
+            format!("[[2,{member},1,[1,0]]]"),
+            format!("[[2,{member},1,[7]]]"),
+        ] {
+            let label = malformed.clone();
+            store.conn.execute(move |conn| {
+                conn.execute(
+                    "UPDATE source_structural_facts SET role_coverage=jsonb(?1) WHERE blob_id=?2",
+                    params![malformed, blob_id],
+                )
+                .unwrap();
+            });
+            assert_eq!(
+                read().unwrap_err().kind(),
+                super::super::StoreErrorKind::Corrupt,
+                "{label}"
+            );
+        }
+        store.conn.execute(move |conn| {
+            conn.execute(
+                "UPDATE source_structural_facts SET role_coverage=jsonb(?1), roles=jsonb_set(roles, '$[0][2]', 9) WHERE blob_id=?2",
+                params![format!("[[2,{member},0,null]]"), blob_id],
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            read().unwrap_err().kind(),
+            super::super::StoreErrorKind::Corrupt
+        );
+        // Restore a valid mode so this case fails only on the contradictory
+        // role owner and kind, not on the corrupt mode above.
+        store.conn.execute(move |conn| {
+            conn.execute(
+                "UPDATE source_structural_facts SET role_coverage=jsonb(?1), roles=jsonb_set(roles, '$[0][0]', 2, '$[0][1]', ?2, '$[0][2]', 0) WHERE blob_id=?3",
+                params![format!("[[2,{member},0,null]]"), member, blob_id],
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            read().unwrap_err().kind(),
+            super::super::StoreErrorKind::Corrupt
+        );
     }
 }

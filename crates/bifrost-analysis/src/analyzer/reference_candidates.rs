@@ -22,8 +22,8 @@ use brokk_bifrost_jvm::scala::graph::syntax::named_argument_label_owner as scala
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
 use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
-use brokk_bifrost_python::graph::extractor::is_declaration_identifier as python_declaration_identifier;
 use brokk_bifrost_python::syntax::{
+    is_declaration_identifier as python_declaration_identifier,
     python_deferred_annotation_identifier_ranges,
     python_keyword_argument_label as python_keyword_label,
 };

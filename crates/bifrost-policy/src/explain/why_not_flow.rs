@@ -402,26 +402,20 @@ fn binding_stage(
         .with_location(Some(PolicySourceLocation::artifact(
             position.path().clone(),
         ))),
-        CandidateBinding::Unbound => {
-            let mut node = RawNode::new(
-                ExplanationNodeKind::SelectorStage,
-                ExplanationOutcome::Unknown,
-                label,
-            )
-            .with_expected(expected)
-            .with_actual(format!(
-                "no {role} endpoint binds a site covering this position, but the \
+        CandidateBinding::Unbound => RawNode::new(
+            ExplanationNodeKind::SelectorStage,
+            ExplanationOutcome::Unknown,
+            label,
+        )
+        .with_expected(expected)
+        .with_actual(format!(
+            "no {role} endpoint binds a site covering this position, but the \
                          endpoint selection was not exhaustive"
-            ))
-            .with_location(Some(PolicySourceLocation::artifact(
-                position.path().clone(),
-            )))
-            .with_reasons(boundary_reasons(gaps));
-            for gap in gaps {
-                node.push_child(boundary_node(gap));
-            }
-            node
-        }
+        ))
+        .with_location(Some(PolicySourceLocation::artifact(
+            position.path().clone(),
+        )))
+        .with_reasons(boundary_reasons(gaps)),
     };
     Some(node)
 }
@@ -429,6 +423,18 @@ fn binding_stage(
 /// Whether a compiled analysis region binds both sites, which is where a flow
 /// between them can exist at all.
 fn region_stage(pass: &CandidatePass) -> RawNode {
+    if pass.store_channel_search {
+        return RawNode::new(
+            ExplanationNodeKind::Derivation,
+            ExplanationOutcome::Satisfied,
+            "analysis_region",
+        )
+        .with_expected("compiled regions can connect through a declared store")
+        .with_actual(format!(
+            "{} of {} compiled analysis region(s) were solved, including remote store writers",
+            pass.candidate_regions, pass.compiled_regions
+        ));
+    }
     let expected = "a compiled analysis region contains both endpoint sites";
     if pass.candidate_regions > 0 {
         return RawNode::new(
@@ -455,7 +461,7 @@ fn region_stage(pass: &CandidatePass) -> RawNode {
             pass.compiled_regions
         ));
     }
-    let mut node = RawNode::new(
+    RawNode::new(
         ExplanationNodeKind::Derivation,
         ExplanationOutcome::Unknown,
         "analysis_region",
@@ -466,11 +472,7 @@ fn region_stage(pass: &CandidatePass) -> RawNode {
          not exhaustive",
         pass.compiled_regions
     ))
-    .with_reasons(boundary_reasons(&pass.selection_gaps));
-    for gap in &pass.selection_gaps {
-        node.push_child(boundary_node(gap));
-    }
-    node
+    .with_reasons(boundary_reasons(&pass.selection_gaps))
 }
 
 /// What the solve of the candidate regions established, and whether the
@@ -537,21 +539,14 @@ fn propagation_stage(
                     "the solver reaches the declared store write from the {}; the write is the selected observation",
                     vocabulary.source
                 ));
-                for (index, witness) in solve.witnesses.iter().enumerate() {
-                    if let Some(projected) = project_candidate_witness(
-                        context
-                            .workspace
-                            .expect("candidate evaluation has a workspace"),
-                        solve,
-                        witness,
-                        index,
-                        budget,
-                    )
-                    .map_err(|message| ExplainError::PolicyUnavailable { message })?
-                    {
-                        node.push_child(witness_node(&projected));
-                    }
-                }
+                push_candidate_paths(
+                    &mut node,
+                    context
+                        .workspace
+                        .expect("candidate evaluation has a workspace"),
+                    solve,
+                    budget,
+                )?;
                 return Ok(node);
             }
             let complete = matches!(run.completion(), PolicyRunCompletion::Complete);
@@ -605,8 +600,22 @@ fn propagation_stage(
             .with_actual(format!("finding {}: {}", finding.id(), finding.message()))
             .with_location(Some(finding.primary().clone())),
         );
-        for witness in finding.witnesses() {
-            node.push_child(witness_node(witness));
+        if pass.store_channel_search {
+            // The projected finding groups all source sites of one endpoint.
+            // A candidate must render only the witness paths retained for its
+            // concrete source site, with that site's store crossing.
+            push_candidate_paths(
+                &mut node,
+                context
+                    .workspace
+                    .expect("candidate evaluation has a workspace"),
+                solve,
+                budget,
+            )?;
+        } else {
+            for witness in finding.witnesses() {
+                node.push_child(witness_node(witness));
+            }
         }
         node.push_child(certainty_node(finding));
         node.push_child(proof_node(finding.proof()));
@@ -668,6 +677,48 @@ fn propagation_stage(
         node.push_child(boundary_node(boundary));
     }
     Ok(node)
+}
+
+fn push_candidate_paths(
+    node: &mut RawNode,
+    workspace: &WorkspaceAnalyzer,
+    solve: &CandidateSolve,
+    budget: &PolicyBudget,
+) -> Result<(), ExplainError> {
+    let mut omitted = solve
+        .witnesses
+        .len()
+        .saturating_sub(budget.max_witnesses_per_finding());
+    let mut shown = Vec::new();
+    for (index, witness) in solve
+        .witnesses
+        .iter()
+        .take(budget.max_witnesses_per_finding())
+        .enumerate()
+    {
+        match project_candidate_witness(workspace, solve, witness, index, budget)
+            .map_err(|message| ExplainError::PolicyUnavailable { message })?
+        {
+            Some(projected) => shown.push(witness_node(&projected)),
+            // The step or byte bounds left nothing to show, so the path is
+            // omitted just as one past the count bound is.
+            None => omitted += 1,
+        }
+    }
+    // The ordinary finding's omission count belongs to its own projection.
+    // Candidate paths can overlap those witnesses, so keep their bound and
+    // omission count on a separate node instead of adding the counts.
+    let mut paths = RawNode::new(
+        ExplanationNodeKind::Derivation,
+        ExplanationOutcome::Satisfied,
+        "candidate_paths",
+    )
+    .with_source_truncation(omitted > 0, u64::try_from(omitted).unwrap_or(u64::MAX));
+    for child in shown {
+        paths.push_child(child);
+    }
+    node.push_child(paths);
+    Ok(())
 }
 
 /// The origin endpoint a projected flow or taint finding reports.

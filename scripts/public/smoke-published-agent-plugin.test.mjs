@@ -66,53 +66,24 @@ test("rejects a Codex adapter that silently falls back to the package cwd", asyn
   }
 });
 
-test("requires the policy pack and at least one policy from a successful MCP call", () => {
-  const response = {
-    result: {
-      isError: false,
-      structuredContent: {
-        schema_version: 2,
-        packs: [
-          {
-            id: "bifrost.code-smells",
-            policies: [{ id: "bifrost.correctness.dynamic-evaluation" }],
-          },
-          {
-            id: "bifrost.correctness",
-            policies: [{ id: "bifrost.correctness.resource-lifecycle" }],
-          },
-          {
-            id: "bifrost.security",
-            policies: [
-              { id: "bifrost.security.java.servlet-parameter-to-jdbc" },
-              { id: "bifrost.security.java.system-getenv-to-runtime-exec" },
-            ],
-          },
-          {
-            id: "bifrost.effects",
-            policies: [{ id: "bifrost.effects.transitive-network-boundary" }],
-          },
-        ],
-      },
-    },
-  };
-  assert.equal(assertPolicyCatalog(response, "Codex").id, "bifrost.code-smells");
+test("requires an empty policy catalog from a successful MCP call", () => {
+  const response = (structuredContent) => ({ result: { isError: false, structuredContent } });
+  assertPolicyCatalog(response({ schema_version: 2, packs: [] }), "Codex");
   assert.throws(
     () => assertPolicyCatalog({ result: { isError: true } }, "Claude"),
     /MCP error/u,
   );
   assert.throws(
+    () => assertPolicyCatalog(response({ schema_version: 2, packs: {} }), "Claude"),
+    /wrong policy catalog envelope/u,
+  );
+  assert.throws(
     () =>
       assertPolicyCatalog(
-        {
-          result: {
-            isError: false,
-            structuredContent: { schema_version: 2, packs: [{ id: "bifrost.code-smells", policies: [] }] },
-          },
-        },
+        response({ schema_version: 2, packs: [{ id: "bifrost.code-smells", policies: [] }] }),
         "Claude",
       ),
-    /omitted the bifrost.security pack/u,
+    /implicitly supplied product rules/u,
   );
 });
 

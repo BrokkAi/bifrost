@@ -75,6 +75,147 @@ pub enum DependencyArtifactRole {
     Runtime,
 }
 
+#[cfg(test)]
+mod external_discovery_read_tests {
+    use brokk_bifrost_core::analyzer::Language;
+
+    use super::dependency_discovery_output_digest;
+    use super::{
+        DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, ExternalDiscoveryRead,
+        UnverifiableDiscoveryRead,
+    };
+
+    #[test]
+    fn output_digest_ignores_discovery_inputs_and_informational_evidence() {
+        let base = DependencyDiscoveryEvidence::from_outcome(
+            &DependencyDiscoveryOutcome::complete(Vec::new()),
+        );
+        let mut changed = base.clone();
+        changed.informational_evidence.push(
+            super::DependencyDiscoveryInformationalEvidence::CppMissingWorkspaceSources {
+                count: 1,
+                sample: vec!["missing.cc".into()],
+            },
+        );
+        changed.project_read_identity =
+            crate::analyzer::semantic::ids::StableDigest::sha256(b"other");
+        changed.external_read_identity =
+            crate::analyzer::semantic::ids::StableDigest::sha256(b"external");
+        let digest = |value: &DependencyDiscoveryEvidence| {
+            dependency_discovery_output_digest(|language| {
+                (language == Language::Rust).then_some(value)
+            })
+        };
+        assert_eq!(digest(&base), digest(&changed));
+    }
+
+    #[test]
+    fn output_digest_tracks_modules_truncation_and_absence() {
+        let base = DependencyDiscoveryEvidence::from_outcome(
+            &DependencyDiscoveryOutcome::complete(Vec::new()),
+        );
+        let digest = |value: &DependencyDiscoveryEvidence| {
+            dependency_discovery_output_digest(|language| {
+                (language == Language::Rust).then_some(value)
+            })
+        };
+        let mut module = base.clone();
+        module.declared_modules.insert("example".into());
+        let mut truncated = base.clone();
+        truncated.truncated = true;
+        assert_ne!(digest(&base), digest(&module));
+        assert_ne!(digest(&base), digest(&truncated));
+        assert_ne!(digest(&base), dependency_discovery_output_digest(|_| None));
+    }
+
+    #[test]
+    fn external_file_content_controls_carry_and_process_output_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("configured.json");
+        std::fs::write(&path, b"one").unwrap();
+        let file = ExternalDiscoveryRead::file(&path, b"one");
+        let mut evidence = DependencyDiscoveryEvidence::from_outcome(
+            &DependencyDiscoveryOutcome::complete(Vec::new()),
+        );
+        assert!(evidence.carry_eligible_external_reads().is_none());
+        evidence.external_reads_complete = true;
+        evidence.external_reads.push(file.clone());
+        assert!(evidence.carry_eligible_external_reads().is_some());
+        assert!(file.still_matches());
+        std::fs::write(&path, b"two").unwrap();
+        assert!(!file.still_matches());
+        evidence
+            .external_reads
+            .push(ExternalDiscoveryRead::Unverifiable(
+                UnverifiableDiscoveryRead::ProcessOutput,
+            ));
+        assert!(evidence.carry_eligible_external_reads().is_none());
+    }
+
+    #[test]
+    fn external_read_identity_frames_variant_and_path() {
+        let outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+        let base = DependencyDiscoveryEvidence::from_outcome(&outcome);
+        let first = base.clone().with_external_reads(
+            vec![ExternalDiscoveryRead::AbsentFile {
+                absolute_path: "/tmp/one".into(),
+            }],
+            true,
+        );
+        let other_path = base.clone().with_external_reads(
+            vec![ExternalDiscoveryRead::AbsentFile {
+                absolute_path: "/tmp/two".into(),
+            }],
+            true,
+        );
+        let other_variant = base.with_external_reads(
+            vec![ExternalDiscoveryRead::OverBudgetFile {
+                absolute_path: "/tmp/one".into(),
+                size: 0,
+            }],
+            true,
+        );
+        assert_ne!(
+            first.external_read_identity,
+            other_path.external_read_identity
+        );
+        assert_ne!(
+            first.external_read_identity,
+            other_variant.external_read_identity
+        );
+        assert!(
+            DependencyDiscoveryEvidence::from_outcome(&outcome)
+                .with_external_reads(Vec::new(), true)
+                .carry_eligible_external_reads()
+                .is_some()
+        );
+        // Incompleteness the recorded reads determine, such as an approximate
+        // standard library, is carried together with its truncated bit.
+        let mut incomplete = DependencyDiscoveryOutcome::complete(Vec::new());
+        incomplete.complete = false;
+        let carried = DependencyDiscoveryEvidence::from_outcome(&incomplete)
+            .with_external_reads(Vec::new(), true);
+        assert!(carried.carry_eligible_external_reads().is_some());
+        assert!(carried.truncated());
+        // A diagnostic can stand for a failed read that left no key behind.
+        incomplete
+            .diagnostics
+            .push(super::DependencyPackDiagnostic {
+                severity: super::DependencyPackDiagnosticSeverity::Warning,
+                code: "test.read_failed".to_owned(),
+                dependency_id: None,
+                location: None,
+                message: "read failed".to_owned(),
+            });
+        assert!(
+            DependencyDiscoveryEvidence::from_outcome(&incomplete)
+                .with_external_reads(Vec::new(), true)
+                .carry_eligible_external_reads()
+                .is_none()
+        );
+    }
+}
+
 impl DependencyArtifactRole {
     fn as_str(self) -> &'static str {
         match self {
@@ -92,6 +233,9 @@ impl DependencyArtifactRole {
 pub struct ResolvedDependencyArtifact {
     pub role: DependencyArtifactRole,
     pub kind: ExternalArtifactKind,
+    /// Checked Rust declaration approximation carried to pack production.
+    pub rust_artifact_approximation:
+        Option<crate::analyzer::semantic_model::RustArtifactApproximation>,
     /// Ecosystem-specific import identity for this artifact when production
     /// depends on more than its bytes. Python uses this for qualified module
     /// names, so nested packages cannot collapse to their terminal filename.
@@ -172,6 +316,7 @@ impl ResolvedDependencyArtifact {
         Self {
             role,
             kind,
+            rust_artifact_approximation: None,
             module: None,
             input: ResolvedDependencyArtifactInput::File(path),
             expected_sha256: None,
@@ -210,6 +355,7 @@ impl ResolvedDependencyArtifact {
         Self {
             role,
             kind,
+            rust_artifact_approximation: None,
             module: None,
             input: ResolvedDependencyArtifactInput::SourceSet {
                 root,
@@ -317,6 +463,14 @@ impl ResolvedDependency {
             && self.artifacts.iter().any(|artifact| artifact.kind == kind)
     }
 
+    /// Whether discovery assumed this dependency instead of reading it from
+    /// the workspace (see [`ASSUMED_DEPENDENCY_PROVENANCE_KEY`]).
+    pub fn is_assumed(&self) -> bool {
+        self.provenance
+            .iter()
+            .any(|entry| entry.key == ASSUMED_DEPENDENCY_PROVENANCE_KEY)
+    }
+
     /// A dependency whose build scope and declaring entity are not established
     /// by the evidence the resolver read.
     ///
@@ -340,6 +494,15 @@ impl ResolvedDependency {
         }
     }
 }
+
+/// The provenance key a resolver sets on a dependency it assumed because the
+/// workspace states nothing, such as the CPython version of a Python
+/// workspace that declares none (#10496). Its value says what was assumed.
+///
+/// An assumed dependency selects the same packs a declared one would, but no
+/// installed pack for it is not a defect of the workspace: preparation
+/// records no error for it and does not count it against completeness.
+pub const ASSUMED_DEPENDENCY_PROVENANCE_KEY: &str = "dependency.assumed";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyProvenance {
@@ -640,9 +803,42 @@ pub trait DependencyPackAdapter {
         env!("CARGO_PKG_VERSION")
     }
     fn producer(&self) -> Producer;
+    /// The schema minted for this dependency's generated pack. The default
+    /// preserves every existing adapter's production key and output contract.
+    fn production_schema_version(&self, _dependency: &ResolvedDependency) -> u32 {
+        SEMANTIC_MODEL_SCHEMA_VERSION
+    }
 
     fn can_produce(&self, _dependency: &ResolvedDependency) -> bool {
         true
+    }
+
+    /// Whether this adapter's `expected_sha256` pins are content digests it
+    /// computed from the opened artifact files through a trusted cache. Then a
+    /// production already in the catalog under the pinned key was produced from
+    /// bytes with those digests, and preparation reuses it without capturing the
+    /// artifacts again. A pin a resolver took from one plain read at discovery
+    /// does not qualify: preparation must read such an artifact again, because
+    /// that read is what detects a replacement after discovery.
+    fn reuses_productions_by_pinned_key(&self) -> bool {
+        false
+    }
+
+    /// Whether `dependency` selects only compatible installed or reviewed
+    /// workspace packs: an exact lockfile coordinate carries no artifact to
+    /// produce from and names nothing to acquire.
+    fn installed_packs_only(&self, _dependency: &ResolvedDependency) -> bool {
+        false
+    }
+
+    /// Whether a compatible installed or reviewed pack for `dependency`'s
+    /// coordinate replaces the declarations this adapter would generate from
+    /// its artifacts. An ecosystem whose reviewed packs declare the same
+    /// symbols as its generated ones opts in, because activating both would
+    /// give one symbol two owners; the generated pack then serves only
+    /// coordinates no reviewed pack covers.
+    fn reviewed_pack_supersedes_production(&self, _dependency: &ResolvedDependency) -> bool {
+        false
     }
 
     fn produce(
@@ -672,8 +868,51 @@ pub fn generated_production_key(
         input_digest,
         producer.name,
         producer.version,
-        SEMANTIC_MODEL_SCHEMA_VERSION,
+        adapter.production_schema_version(dependency),
     )
+}
+
+/// Derive the production key from selection's exact artifact pins.
+pub fn pinned_generated_production_key(
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+    limits: &DependencyPackLimits,
+) -> Result<Option<GeneratedProductionKey>, CatalogError> {
+    if !adapter.can_produce(dependency)
+        || dependency
+            .artifacts
+            .iter()
+            .any(|a| a.expected_sha256.is_none())
+    {
+        return Ok(None);
+    }
+    let mut hasher = CanonicalHasher::new(DEPENDENCY_INPUT_DOMAIN);
+    hash_dependency_frame(&mut hasher, adapter, dependency);
+    hasher.sequence("artifacts", &dependency.artifacts, |hasher, artifact| {
+        hash_artifact_slot(
+            hasher,
+            artifact.role,
+            artifact.kind,
+            artifact.module.as_deref(),
+        );
+        hasher.field(
+            "sha256",
+            artifact
+                .expected_sha256
+                .as_ref()
+                .expect("pins checked")
+                .as_bytes(),
+        );
+    });
+    hash_production_profile(&mut hasher, limits);
+    let producer = adapter.producer();
+    GeneratedProductionKey::new(
+        lower_hex_string(&hasher.finish()),
+        producer.name,
+        producer.version,
+        adapter.production_schema_version(dependency),
+    )
+    .map(Some)
 }
 
 /// Produce and compile one exact dependency semantic pack.
@@ -727,11 +966,20 @@ pub fn compile_exact_dependency_production(
     if production_has_errors {
         pack.completeness = Completeness::Partial;
     }
-    // Exactly the version this build mints, not the reader's supported set: the
-    // generated-production cache key is minted from that constant before the
-    // adapter runs, so a pack at any other version would be stored under a key
-    // that does not describe it.
-    if pack.producer != producer || pack.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
+    // The key is minted before production. A producer writes the smallest
+    // schema its content needs; dependency production may raise that label to
+    // its exact key schema. Compilation below validates the raised pack before
+    // any compiled output can be returned.
+    if pack.schema_version > key.schema_version() {
+        return Err(DependencyProductionFailure::InvalidOutput {
+            code: "production.identity_mismatch".to_owned(),
+            message: "adapter output schema exceeds its production key schema".to_owned(),
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    }
+    pack.schema_version = key.schema_version();
+    if pack.producer != producer || pack.schema_version != key.schema_version() {
         return Err(DependencyProductionFailure::InvalidOutput {
             code: "production.identity_mismatch".to_owned(),
             message: "adapter output does not match its declared producer or schema identity"
@@ -972,8 +1220,9 @@ pub struct StandardLibraryPackExpectation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StandardLibraryPackSelection {
     /// Discovery resolved these artifact-less dependencies from a workspace
-    /// declaration. Preparation and the runtime decide whether the pack
-    /// activates.
+    /// declaration, or assumed them where the workspace declares nothing
+    /// ([`ResolvedDependency::is_assumed`]). Preparation and the runtime
+    /// decide whether the pack activates.
     Declared { dependency_ids: Vec<String> },
     /// No toolchain pin supplies exact dependency coordinates.
     Unpinned,
@@ -1041,7 +1290,7 @@ impl StandardLibraryPackExpectation {
             );
         };
         format!(
-            "{} declares it, but no installed pack serves it. Pack acquisition is a bootstrap step and does not run during analysis; \
+            "{} selects it, but no installed pack serves it. Pack acquisition is a bootstrap step and does not run during analysis; \
              install a Bifrost-packs release with `bifrost install-semantic-packs` or \
              BIFROST_OPEN_SEMANTIC_PACK_BUNDLE",
             dependency_ids.join(", ")
@@ -1165,10 +1414,178 @@ impl std::ops::Deref for DependencyDiscoveryOutcome {
 pub struct DependencyDiscoveryEvidence {
     declared_modules: brokk_bifrost_core::hash::HashSet<String>,
     truncated: bool,
+    /// Discovery reported a diagnostic. A diagnostic can stand for a failed or
+    /// transient read that left no recorded key, so this evidence is never
+    /// carried across an update. An approximate standard-library expectation
+    /// sets `truncated` without a diagnostic; its recorded absent toolchain
+    /// probes pin it, so that evidence can be carried with its `truncated` bit.
+    reported_diagnostics: bool,
     informational_evidence: Vec<DependencyDiscoveryInformationalEvidence>,
+    /// Exact project inputs observed while discovering this ecosystem.
+    pub project_read_keys: std::sync::Arc<[crate::analyzer::semantic::read_ledger::ReadKey]>,
+    pub project_read_identity: crate::analyzer::semantic::ids::StableDigest,
+    /// External inputs observed by discovery. An empty list is not a certificate
+    /// until the resolver has been instrumented for every external read.
+    pub external_reads: Vec<ExternalDiscoveryRead>,
+    /// Only a fully instrumented resolver may set this to true.
+    pub external_reads_complete: bool,
+    pub external_read_identity: crate::analyzer::semantic::ids::StableDigest,
+}
+
+/// A discovery input outside the workspace project-read boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalDiscoveryRead {
+    AbsentFile {
+        absolute_path: std::path::PathBuf,
+    },
+    File {
+        absolute_path: std::path::PathBuf,
+        content: crate::analyzer::semantic::ids::StableDigest,
+        size: u64,
+    },
+    OverBudgetFile {
+        absolute_path: std::path::PathBuf,
+        size: u64,
+    },
+    Environment {
+        name: Box<str>,
+        value: Option<std::ffi::OsString>,
+    },
+    Unverifiable(UnverifiableDiscoveryRead),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnverifiableDiscoveryRead {
+    ProcessOutput,
+    ExternalCacheWalk,
+}
+
+impl ExternalDiscoveryRead {
+    pub fn file(path: &std::path::Path, bytes: &[u8]) -> Self {
+        assert!(
+            path.is_absolute(),
+            "discovery file key needs an absolute path"
+        );
+        Self::File {
+            absolute_path: path.to_path_buf(),
+            content: crate::analyzer::semantic::ids::StableDigest::sha256(bytes),
+            size: bytes.len() as u64,
+        }
+    }
+
+    /// Check a file key without reading beyond the original byte budget.
+    pub fn still_matches(&self) -> bool {
+        match self {
+            Self::AbsentFile { absolute_path } => !absolute_path.exists(),
+            Self::File {
+                absolute_path,
+                content,
+                size,
+            } => {
+                use std::io::Read;
+                let Ok(file) = std::fs::File::open(absolute_path) else {
+                    return false;
+                };
+                let mut bytes = Vec::new();
+                if file
+                    .take(size.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .is_err()
+                {
+                    return false;
+                }
+                bytes.len() as u64 == *size
+                    && crate::analyzer::semantic::ids::StableDigest::sha256(&bytes) == *content
+            }
+            Self::Environment { name, value } => std::env::var_os(name.as_ref()) == *value,
+            Self::OverBudgetFile { .. } | Self::Unverifiable(_) => false,
+        }
+    }
 }
 
 impl DependencyDiscoveryEvidence {
+    /// Returns the external keys M2 can verify, or refuses carry when a read
+    /// cannot be reproduced from a fixed input.
+    pub fn carry_eligible_external_reads(&self) -> Option<&[ExternalDiscoveryRead]> {
+        // Cancelled discovery never publishes evidence: activation stops
+        // before it pushes the ecosystem's evidence.
+        (!self.reported_diagnostics
+            && self.external_reads_complete
+            && self.external_reads.iter().all(|read| {
+                matches!(
+                    read,
+                    ExternalDiscoveryRead::File { .. }
+                        | ExternalDiscoveryRead::AbsentFile { .. }
+                        | ExternalDiscoveryRead::Environment { .. }
+                )
+            }))
+        .then_some(&self.external_reads)
+    }
+    pub fn with_project_reads(
+        mut self,
+        keys: std::sync::Arc<[crate::analyzer::semantic::read_ledger::ReadKey]>,
+        identity: crate::analyzer::semantic::ids::StableDigest,
+    ) -> Self {
+        self.project_read_keys = keys;
+        self.project_read_identity = identity;
+        self
+    }
+
+    pub fn with_external_reads(mut self, keys: Vec<ExternalDiscoveryRead>, complete: bool) -> Self {
+        let mut hash = CanonicalHasher::new(b"bifrost.external-discovery-reads.v1");
+        hash.sequence("reads", &keys, |hash, key| {
+            let path =
+                |path: &Path| brokk_bifrost_core::path_utils::workspace_relative_slash_path(path);
+            match key {
+                ExternalDiscoveryRead::AbsentFile { absolute_path } => {
+                    hash.field("kind", b"absent-file");
+                    hash.field("path", path(absolute_path).as_bytes());
+                }
+                ExternalDiscoveryRead::File {
+                    absolute_path,
+                    content,
+                    size,
+                } => {
+                    hash.field("kind", b"file");
+                    hash.field("path", path(absolute_path).as_bytes());
+                    hash.field("content", content.as_bytes());
+                    hash.field("size", &size.to_be_bytes());
+                }
+                ExternalDiscoveryRead::OverBudgetFile {
+                    absolute_path,
+                    size,
+                } => {
+                    hash.field("kind", b"over-budget-file");
+                    hash.field("path", path(absolute_path).as_bytes());
+                    hash.field("size", &size.to_be_bytes());
+                }
+                ExternalDiscoveryRead::Environment { name, value } => {
+                    hash.field("kind", b"environment");
+                    hash.field("name", name.as_bytes());
+                    hash.field("present", &[value.is_some() as u8]);
+                    if let Some(value) = value {
+                        hash.field("value", value.to_string_lossy().as_bytes());
+                    }
+                }
+                ExternalDiscoveryRead::Unverifiable(reason) => {
+                    hash.field("kind", b"unverifiable");
+                    hash.field(
+                        "reason",
+                        match reason {
+                            UnverifiableDiscoveryRead::ProcessOutput => b"process-output",
+                            UnverifiableDiscoveryRead::ExternalCacheWalk => b"external-cache-walk",
+                        },
+                    );
+                }
+            }
+        });
+        self.external_read_identity =
+            crate::analyzer::semantic::ids::StableDigest::from_array(hash.finish());
+        self.external_reads = keys;
+        self.external_reads_complete = complete;
+        self
+    }
+
     pub fn from_outcome(outcome: &DependencyDiscoveryOutcome) -> Self {
         let mut declared_modules = brokk_bifrost_core::hash::HashSet::default();
         for dependency in &outcome.dependencies {
@@ -1187,7 +1604,13 @@ impl DependencyDiscoveryEvidence {
         Self {
             declared_modules,
             truncated: !outcome.complete,
+            reported_diagnostics: !outcome.diagnostics.is_empty(),
             informational_evidence: outcome.profile.informational_evidence.clone(),
+            project_read_keys: std::sync::Arc::from([]),
+            project_read_identity: crate::analyzer::semantic::ids::StableDigest::sha256([]),
+            external_reads: Vec::new(),
+            external_reads_complete: false,
+            external_read_identity: crate::analyzer::semantic::ids::StableDigest::sha256([]),
         }
     }
 
@@ -1268,6 +1691,34 @@ impl DependencyDiscoveryEvidence {
         }
         false
     }
+}
+
+/// Identity of the dependency facts consumed by query-time boundary refinement.
+/// Every language has an entry, including languages with no published evidence.
+pub fn dependency_discovery_output_digest<'a>(
+    mut evidence: impl FnMut(
+        brokk_bifrost_core::analyzer::Language,
+    ) -> Option<&'a DependencyDiscoveryEvidence>,
+) -> crate::analyzer::semantic::ids::StableDigest {
+    use brokk_bifrost_core::analyzer::Language;
+
+    let mut hash = CanonicalHasher::new(b"bifrost.dependency-discovery-output.v1");
+    for language in Language::ALL {
+        hash.field("language", language.config_label().as_bytes());
+        match evidence(language) {
+            None => hash.field("state", b"absent"),
+            Some(value) => {
+                hash.field("state", b"present");
+                let mut modules: Vec<_> = value.declared_modules.iter().collect();
+                modules.sort_unstable();
+                hash.sequence("declared-modules", &modules, |hash, module| {
+                    hash.value(module.as_bytes());
+                });
+                hash.field("truncated", &[u8::from(value.truncated)]);
+            }
+        }
+    }
+    crate::analyzer::semantic::ids::StableDigest::from_array(hash.finish())
 }
 
 /// What retained discovery evidence says about one module path when nothing
@@ -1396,7 +1847,7 @@ pub fn record_reused_generated_pack(
     packs: &mut Vec<PreparedDependencyPack>,
     profile: &mut DependencyPackPreparationProfile,
 ) {
-    if prepared.completeness == Completeness::Partial {
+    if prepared.completeness != Completeness::Complete {
         diagnostics.error(
             "production.partial",
             Some(&dependency.id),

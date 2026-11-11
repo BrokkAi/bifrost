@@ -924,13 +924,9 @@ pub(super) fn survey_references(
                 write.site, write.procedure
             )
         });
-        open_or_bound(
-            workspace,
-            adapter,
-            &mut effects[*index],
-            structural_receiver_bounds[*index].as_ref(),
-            UnknownReason::UnmodeledLoad,
-        );
+        // The lost callers may pass explicit actuals outside the lexical
+        // receiver class. A lexical bound cannot replace their inventory.
+        open_global(&mut effects[*index], UnknownReason::UnmodeledLoad);
     }
     let caller_unbounded_count = caller_unbounded.len();
     let candidate_seconds = candidate_started.elapsed().as_secs_f64();
@@ -1389,13 +1385,9 @@ pub(super) fn survey_references(
                 )
                 && (effect.classes.is_empty() || caller_dependent[index])
             {
-                open_or_bound(
-                    workspace,
-                    adapter,
-                    effect,
-                    structural_receiver_bounds[index].as_ref(),
-                    reason.clone(),
-                );
+                // Failed caller-dependent surveys cannot establish an
+                // exhaustive receiver bound. Keep observed actuals and openness.
+                open_global(effect, reason.clone());
             }
         }
     }

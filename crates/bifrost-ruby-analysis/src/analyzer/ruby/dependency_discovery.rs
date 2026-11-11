@@ -2,8 +2,6 @@ use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 
-use semver::Version;
-
 use brokk_bifrost_core::cancellation::CancellationToken;
 
 use brokk_bifrost_core::analyzer::canonical_hash::is_lower_sha256;
@@ -14,11 +12,20 @@ use brokk_bifrost_analysis::analyzer::dependency_support::dependency_diagnostic 
 
 use brokk_bifrost_analysis::analyzer::dependency_support::dependency_provenance_entry as provenance_entry;
 
-use brokk_bifrost_analysis::analyzer::dependency_support::read_evidence_file_with_budget;
+use brokk_bifrost_analysis::analyzer::dependency_support::{
+    declare_external_discovery_reads_complete, read_external_evidence_file_with_budget,
+    refuse_external_discovery_reads, report_external_discovery_read,
+};
+
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    ExternalDiscoveryRead, UnverifiableDiscoveryRead,
+};
 
 use brokk_bifrost_analysis::analyzer::dependency_support::require_non_empty_evidence_field;
 
 use brokk_bifrost_analysis::analyzer::dependency_support::resolve_dependency_path as resolve_path;
+
+use brokk_bifrost_core::path_normalization::is_canonical_spelling;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::dependency::BoundedDependencyDiagnostics;
 
@@ -53,6 +60,19 @@ use brokk_bifrost_core::analyzer::config::RubyDependencyApiEvidence;
 use brokk_bifrost_core::analyzer::config::RubyGemApiArtifact;
 
 use brokk_bifrost_core::hash::HashSet;
+
+use std::collections::BTreeMap;
+
+use brokk_bifrost_analysis::analyzer::dependency_support::select_dependency_input_snapshots;
+
+use brokk_bifrost_analysis::analyzer::semantic_model::{
+    DependencyEvidence, DependencyEvidenceGapKind, DependencyEvidenceKind,
+    DependencyFileEvidenceLimits,
+};
+
+use crate::analyzer::ruby::dependency_evidence::{
+    GemVersion, RUBYGEMS_ECOSYSTEM, collect_ruby_dependency_evidence,
+};
 
 pub fn resolve_ruby_semantic_pack_dependencies(
     config: &RubyAnalyzerConfig,
@@ -99,6 +119,27 @@ pub fn resolve_ruby_semantic_pack_dependencies(
         }
     }
 
+    if !cancelled {
+        // A host's configured archive already generates its gem's
+        // declarations, so a vendored copy must not add a second owner.
+        let configured_archives = dependencies
+            .iter()
+            .filter_map(|dependency| dependency.evidence.package.as_ref())
+            .map(|package| package.name.clone())
+            .collect::<HashSet<_>>();
+        let (mut locked, lock_cancelled) = bundler_lock_activation_rows(
+            project,
+            &configured_archives,
+            limits,
+            &mut evidence_bytes_read,
+            cancellation,
+            &mut diagnostics,
+        );
+        metadata_inputs_considered = metadata_inputs_considered.saturating_add(locked.len());
+        dependencies.append(&mut locked);
+        cancelled = lock_cancelled;
+    }
+
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     let before_dedup = dependencies.len();
     dependencies.dedup_by(|left, right| left.id == right.id);
@@ -110,6 +151,7 @@ pub fn resolve_ruby_semantic_pack_dependencies(
         ));
     }
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    declare_external_discovery_reads_complete();
     DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered,
@@ -122,6 +164,379 @@ pub fn resolve_ruby_semantic_pack_dependencies(
         suppressed_diagnostics,
         cancelled,
     }
+}
+
+/// The only gem server whose coordinates name a published RubyGems release.
+const RUBYGEMS_ORG: &str = "https://rubygems.org";
+
+/// Package activation rows for the exact gems the workspace's bundles lock.
+///
+/// Each `Gemfile.lock` (or `gems.locked`) spec from the rubygems.org `GEM`
+/// source becomes one artifact-less `rubygems` row naming the gem and its
+/// exact version, owned by the bundle that locks it. Such a row reads no gem
+/// archive and produces nothing: it selects only a compatible installed or
+/// reviewed workspace pack, so a host activates a gem pack from the lockfile
+/// alone (#9319). Fail-closed cases activate nothing:
+/// - `GIT` and `PATH` specs, other gem servers, and incomplete lock rows;
+/// - a gem that bundles lock at more than one version, because activation is
+///   workspace-wide and one version's models would apply to code that loads
+///   another. That ambiguity is reported as `ruby.lockfile.ambiguous_activation`.
+///
+/// A bundle that vendors the gem's `.gem` archive ([`vendored_gem_archive`])
+/// gets an artifact row instead, which generates the gem's declarations unless
+/// a compatible reviewed pack supersedes them or a host already configured an
+/// archive for that gem (#10011). The coordinate version
+/// is [`GemVersion::coordinate_version`], so a four-segment `7.0.8.1` matches a
+/// pack that requires `=7.0.8`. Acquisition failures and limits are reported,
+/// and a vendored archive that cannot be used leaves the bundle's lock row.
+///
+/// Returns the rows and whether acquisition was cancelled.
+fn bundler_lock_activation_rows(
+    project: &dyn Project,
+    configured_archives: &HashSet<String>,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+) -> (Vec<ResolvedDependency>, bool) {
+    let (selected, _, cancelled) = select_dependency_input_snapshots(
+        project,
+        "Bundler",
+        "ruby",
+        |path| {
+            brokk_bifrost_analysis::analyzer::semantic_model::DependencyResolver::is_discovery_candidate(
+                &crate::analyzer::ruby::dependency_packs::RubyDependencyResolver,
+                path,
+            )
+        },
+        limits,
+        cancellation,
+        diagnostics,
+    );
+    if cancelled {
+        return (Vec::new(), true);
+    }
+    let evidence =
+        collect_ruby_dependency_evidence(&selected, &DependencyFileEvidenceLimits::default());
+    for gap in &evidence.gaps {
+        // A row limit may have omitted lock rows; other gaps are interpretation
+        // limits of rows that then activate nothing, and stay on the files-only
+        // dependency-evidence surface.
+        if gap.kind == DependencyEvidenceGapKind::Limit {
+            diagnostics.push(diagnostic(
+                "limit.ruby_lock_rows",
+                Some(&gap.build_file),
+                gap.message.clone(),
+            ));
+        }
+    }
+    let mut by_gem = BTreeMap::<&str, BTreeMap<&str, Vec<&DependencyEvidence>>>::new();
+    for row in &evidence.rows {
+        let condition = |kind: &str| {
+            row.conditions
+                .iter()
+                .find(|condition| condition.kind == kind)
+                .map(|condition| condition.value.as_str())
+        };
+        if row.ecosystem != RUBYGEMS_ECOSYSTEM
+            || row.kind != DependencyEvidenceKind::Locked
+            || !row.complete
+            || condition("bundler.source_kind") != Some("gem")
+            || row
+                .source
+                .as_deref()
+                .map(|source| source.trim_end_matches('/'))
+                != Some(RUBYGEMS_ORG)
+        {
+            continue;
+        }
+        let version = row
+            .exact_version
+            .as_deref()
+            .expect("a complete locked row has an exact version");
+        by_gem
+            .entry(row.package.as_str())
+            .or_default()
+            .entry(version)
+            .or_default()
+            .push(row);
+    }
+    let checksums = evidence
+        .rows
+        .iter()
+        .filter(|row| {
+            row.ecosystem == RUBYGEMS_ECOSYSTEM && row.kind == DependencyEvidenceKind::Checksum
+        })
+        .filter_map(|row| {
+            let condition = |kind: &str| {
+                row.conditions
+                    .iter()
+                    .find(|condition| condition.kind == kind)
+                    .map(|condition| condition.value.as_str())
+            };
+            Some((
+                (
+                    row.declared_by.as_deref()?,
+                    row.package.as_str(),
+                    row.exact_version.as_deref()?,
+                    condition("bundler.platform"),
+                ),
+                condition("bundler.checksum")?,
+            ))
+        })
+        .collect::<LockChecksums<'_>>();
+    let mut rows = Vec::new();
+    for (gem, versions) in by_gem {
+        if versions.len() > 1 {
+            diagnostics.push(diagnostic(
+                "ruby.lockfile.ambiguous_activation",
+                None,
+                format!(
+                    "bundles lock gem {gem} at versions {:?}; no version activates package-scoped semantic models",
+                    versions.keys().collect::<Vec<_>>()
+                ),
+            ));
+            continue;
+        }
+        let (version, locks) = versions
+            .into_iter()
+            .next()
+            .expect("a grouped gem has a version");
+        let mut owners = BTreeMap::<&str, Vec<&DependencyEvidence>>::new();
+        for lock in locks {
+            // Platform variants of one spec are one coordinate per bundle.
+            owners
+                .entry(
+                    lock.declared_by
+                        .as_deref()
+                        .expect("lock rows name their bundle"),
+                )
+                .or_default()
+                .push(lock);
+        }
+        let coordinate = CatalogCoordinate {
+            name: gem.to_owned(),
+            version: Some(
+                GemVersion::parse(version)
+                    .expect("a complete locked row has a RubyGems version")
+                    .coordinate_version(),
+            ),
+        };
+        // Activation is workspace-wide, so one vendored archive per gem
+        // generates its declarations; other bundles keep their lock rows.
+        let mut vendored_row = configured_archives.contains(gem);
+        for (owner, variants) in owners {
+            // A vendored row's provenance enters its production key, so it
+            // names the gem and archive but not the lockfile's path or bytes.
+            let mut provenance = vec![
+                provenance_entry("rubygems.name", gem),
+                provenance_entry("rubygems.source", RUBYGEMS_ORG),
+                provenance_entry("rubygems.version", version),
+            ];
+            let vendored = if vendored_row {
+                None
+            } else {
+                match vendored_gem_archive(
+                    project.root(),
+                    owner,
+                    gem,
+                    version,
+                    &variants,
+                    &checksums,
+                    limits,
+                    evidence_bytes_read,
+                    cancellation,
+                ) {
+                    Ok(archive) => archive,
+                    Err(error)
+                        if error.code == "artifact.cancelled"
+                            || error.code == "ruby.evidence.cancelled" =>
+                    {
+                        diagnostics.push(error);
+                        return (Vec::new(), true);
+                    }
+                    Err(error) => {
+                        diagnostics.push(error);
+                        None
+                    }
+                }
+            };
+            let (id, artifacts) = match vendored {
+                Some((layout, artifact)) => {
+                    vendored_row = true;
+                    provenance.push(provenance_entry("bundler.activation", layout));
+                    provenance.push(provenance_entry(
+                        "rubygems.archive_sha256",
+                        artifact.expected_sha256.as_deref().expect("exact archive"),
+                    ));
+                    (
+                        format!("rubygems:vendored:{owner}:{gem}@{version}"),
+                        vec![artifact],
+                    )
+                }
+                None => {
+                    provenance.extend([
+                        provenance_entry("bundler.activation", "exact_lock_row"),
+                        provenance_entry("bundler.lockfile", variants[0].build_file.display()),
+                        provenance_entry("bundler.lockfile_digest", &variants[0].source_digest),
+                    ]);
+                    (format!("rubygems:lock:{owner}:{gem}@{version}"), Vec::new())
+                }
+            };
+            provenance.sort_by(|left, right| left.key.cmp(&right.key));
+            rows.push(ResolvedDependency {
+                id,
+                evidence: SemanticModelActivationEvidence {
+                    language: "ruby".to_owned(),
+                    ecosystem: RUBYGEMS_ECOSYSTEM.to_owned(),
+                    package: Some(coordinate.clone()),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                },
+                provenance,
+                artifacts,
+                scope: DependencyScope::Unknown,
+                declared_by: Some(owner.to_owned()),
+            });
+        }
+    }
+    (rows, false)
+}
+
+/// Bundler `CHECKSUMS` entries by bundle, gem, version and platform.
+type LockChecksums<'a> = BTreeMap<(&'a str, &'a str, &'a str, Option<&'a str>), &'a str>;
+
+/// The `.gem` archive a bundle vendors for one locked gem, as an exact
+/// declaration artifact, with the layout that held it (#10011).
+///
+/// `bundle cache` writes `vendor/cache/<gem>-<version>[-<platform>].gem`, and
+/// `bundle install --path vendor/bundle` keeps the installed gem's archive in
+/// `vendor/bundle/ruby/<abi>/cache/`. Those are probed in that order, the
+/// platform-independent file name first, and the first present archive wins.
+/// A `CHECKSUMS` entry for that spec must match the archive's digest. Every
+/// probe is a discovery read, so vendoring or removing an archive invalidates
+/// retained discovery; listing the installed tree's ABI directories is a walk
+/// no key reproduces, so a bundle with one is rediscovered each time.
+#[allow(clippy::too_many_arguments)]
+fn vendored_gem_archive(
+    root: &Path,
+    owner: &str,
+    gem: &str,
+    version: &str,
+    variants: &[&DependencyEvidence],
+    checksums: &LockChecksums<'_>,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<(&'static str, ResolvedDependencyArtifact)>, DependencyPackDiagnostic> {
+    let bundle = root.join(
+        variants[0]
+            .build_file
+            .parent()
+            .expect("a lockfile path has a parent"),
+    );
+    let mut names = variants
+        .iter()
+        .map(|lock| {
+            let platform = lock
+                .conditions
+                .iter()
+                .find(|condition| condition.kind == "bundler.platform")
+                .map(|condition| condition.value.as_str());
+            let name = match platform {
+                Some(platform) => format!("{gem}-{version}-{platform}.gem"),
+                None => format!("{gem}-{version}.gem"),
+            };
+            (name, platform)
+        })
+        .collect::<Vec<_>>();
+    names.sort_by_key(|(_, platform)| platform.is_some());
+    let mut directories = vec![("vendor_cache_archive", bundle.join("vendor/cache"))];
+    let installed = bundle.join("vendor/bundle/ruby");
+    match std::fs::read_dir(&installed) {
+        Ok(entries) => {
+            report_external_discovery_read(ExternalDiscoveryRead::Unverifiable(
+                UnverifiableDiscoveryRead::ExternalCacheWalk,
+            ));
+            let mut abis = entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    diagnostic(
+                        "ruby.vendored.installed_tree",
+                        Some(&installed),
+                        format!("could not list the installed gem tree: {error}"),
+                    )
+                })?;
+            abis.sort();
+            directories.extend(
+                abis.into_iter()
+                    .map(|abi| ("vendor_bundle_archive", abi.join("cache"))),
+            );
+        }
+        Err(_) if !installed.exists() => {
+            report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                absolute_path: installed,
+            });
+        }
+        Err(error) => {
+            return Err(diagnostic(
+                "ruby.vendored.installed_tree",
+                Some(&installed),
+                format!("could not list the installed gem tree: {error}"),
+            ));
+        }
+    }
+    for (layout, directory) in directories {
+        for (name, platform) in &names {
+            let path = directory.join(name);
+            if !path.exists() {
+                report_external_discovery_read(ExternalDiscoveryRead::AbsentFile {
+                    absolute_path: path,
+                });
+                continue;
+            }
+            let archive = read_external_evidence_file_with_budget(
+                "Ruby",
+                &path,
+                limits,
+                evidence_bytes_read,
+                cancellation,
+            )?;
+            if let Some(checksum) = checksums.get(&(owner, gem, version, *platform))
+                && archive.sha256() != *checksum
+            {
+                return Err(diagnostic(
+                    "ruby.vendored.checksum_mismatch",
+                    Some(&path),
+                    format!(
+                        "vendored gem archive digest {} does not match the Gemfile.lock checksum {checksum}",
+                        archive.sha256()
+                    ),
+                ));
+            }
+            let canonical = path.canonicalize().map_err(|error| {
+                diagnostic(
+                    "ruby.vendored.archive",
+                    Some(&path),
+                    format!("could not canonicalize the vendored gem archive: {error}"),
+                )
+            })?;
+            return Ok(Some((
+                layout,
+                ResolvedDependencyArtifact::exact_file(
+                    DependencyArtifactRole::Declarations,
+                    ExternalArtifactKind::RubyGemArchive,
+                    canonical,
+                    archive.sha256().to_owned(),
+                ),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 fn resolve_evidence(
@@ -147,7 +562,7 @@ fn resolve_evidence(
         ));
     }
 
-    let lockfile = read_evidence_file_with_budget(
+    let lockfile = read_external_evidence_file_with_budget(
         "Ruby",
         &evidence.lockfile_path,
         limits,
@@ -217,6 +632,13 @@ fn resolve_evidence(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if approved_roots
+        .iter()
+        .zip(&evidence.approved_archive_roots)
+        .any(|(canonical, configured)| !is_canonical_spelling(configured, canonical))
+    {
+        refuse_external_discovery_reads();
+    }
     if approved_roots.iter().any(|root| !root.is_dir()) {
         return Err(diagnostic(
             "ruby.evidence.archive_root_not_directory",
@@ -257,6 +679,9 @@ fn resolve_evidence(
                 format!("could not canonicalize exact gem archive: {error}"),
             )
         })?;
+        if !is_canonical_spelling(&gem.gem_archive_path, &canonical_archive) {
+            refuse_external_discovery_reads();
+        }
         if !canonical_archive.is_file() {
             return Err(diagnostic(
                 "ruby.evidence.gem_archive_not_file",
@@ -275,7 +700,7 @@ fn resolve_evidence(
             ));
         }
 
-        let archive = read_evidence_file_with_budget(
+        let archive = read_external_evidence_file_with_budget(
             "Ruby",
             &canonical_archive,
             limits,
@@ -296,7 +721,9 @@ fn resolve_evidence(
             ));
         }
 
-        let parsed_version = Version::parse(&gem.version).ok();
+        let parsed_version = GemVersion::parse(&gem.version)
+            .ok()
+            .map(|version| version.coordinate_version());
         let mut provenance = Vec::with_capacity(8);
         if let Some(checksum) = &gem.checksum {
             provenance.push(provenance_entry("bundler.checksum", checksum));
@@ -457,6 +884,8 @@ fn cancelled_diagnostic(path: Option<&Path>) -> DependencyPackDiagnostic {
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_analysis::analyzer::dependency_support::capture_external_discovery_reads;
+    use brokk_bifrost_test_macros::hardwon;
     use std::fs;
 
     use tempfile::TempDir;
@@ -472,6 +901,29 @@ mod tests {
     const LOCKFILE: &[u8] = b"GEM\n  remote: https://rubygems.org/\n  specs:\n    widget (1.2.3.pre)\n\nPLATFORMS\n  arm64-darwin\n\nDEPENDENCIES\n  widget\n\nRUBY VERSION\n   ruby 3.4.1p0\n";
 
     #[test]
+    #[hardwon(
+        "#10377: on Windows a verbatim canonical path never equaled the configured one, refusing every Ruby discovery carry"
+    )]
+    fn external_archive_change_invalidates_ruby_discovery_reads() {
+        let fixture = EvidenceFixture::new();
+        let discover = || {
+            resolve_ruby_semantic_pack_dependencies(
+                &fixture.config,
+                &fixture.project,
+                &DependencyPackLimits::default(),
+                None,
+            )
+        };
+        let (outcome, reads) = capture_external_discovery_reads(discover);
+        assert!(outcome.complete, "{:?}", outcome.diagnostics);
+        assert!(reads.complete);
+        assert_eq!(reads.keys.len(), 2);
+        assert!(reads.keys.iter().all(|key| key.still_matches()));
+        fs::write(&fixture.archive, b"changed gem bytes").unwrap();
+        assert!(reads.keys.iter().any(|key| !key.still_matches()));
+    }
+
+    #[test]
     fn exact_evidence_binds_lockfile_coordinate_platform_and_archive() {
         let fixture = EvidenceFixture::new();
         let outcome = resolve_ruby_semantic_pack_dependencies(
@@ -482,8 +934,21 @@ mod tests {
         );
 
         assert!(outcome.complete, "{:?}", outcome.diagnostics);
-        assert_eq!(outcome.dependencies.len(), 1);
-        let dependency = &outcome.dependencies[0];
+        assert_eq!(outcome.dependencies.len(), 2);
+        let dependency = outcome
+            .dependencies
+            .iter()
+            .find(|dependency| !dependency.artifacts.is_empty())
+            .expect("the configured archive-backed gem remains present");
+        assert_eq!(
+            outcome
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.artifacts.is_empty())
+                .count(),
+            1,
+            "the exact Gemfile.lock spec contributes its activation row"
+        );
         assert_eq!(dependency.evidence.language, "ruby");
         assert_eq!(dependency.evidence.ecosystem, "rubygems");
         assert_eq!(dependency.evidence.target.as_deref(), Some("arm64-darwin"));
@@ -507,7 +972,11 @@ mod tests {
                 .iter()
                 .any(|entry| { entry.key == "rubygems.version" && entry.value == "1.2.3.pre" })
         );
-        assert_eq!(dependency.evidence.package.as_ref().unwrap().version, None);
+        assert_eq!(
+            dependency.evidence.package.as_ref().unwrap().version,
+            Some(semver::Version::parse("1.2.3-pre").unwrap()),
+            "a RubyGems prerelease maps to the semver coordinate (#10011)"
+        );
     }
 
     #[test]
@@ -583,7 +1052,9 @@ mod tests {
     impl EvidenceFixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let root = temp.path().join("project");
+            // The reader refuses evidence keyed by a non-canonical path; on
+            // macOS the temp root is `/var/...`, a symlink to `/private/var/...`.
+            let root = temp.path().canonicalize().unwrap().join("project");
             let archives = root.join("vendor/cache");
             fs::create_dir_all(&archives).unwrap();
             fs::write(root.join("Gemfile.lock"), LOCKFILE).unwrap();

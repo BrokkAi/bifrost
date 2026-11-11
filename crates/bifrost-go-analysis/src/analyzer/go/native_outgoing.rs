@@ -128,6 +128,7 @@ impl CallRelationProvider for GoNativeCallRelationProvider {
             );
         };
         outgoing(
+            analyzer,
             go,
             caller,
             limits,
@@ -167,26 +168,62 @@ struct GoCallShape {
 /// same case; keep that completeness behavior aligned until the owner changes
 /// the shared contract.
 pub(crate) fn outgoing(
+    analyzer: &dyn IAnalyzer,
     go: &GoAnalyzer,
     caller: &CodeUnit,
     limits: CallRelationLimits,
     budget: ReceiverAnalysisBudget,
     cancellation: &CancellationToken,
 ) -> CallRelationResult {
-    // Every result of this function, including cancellation and failures,
-    // comes from the native engine (#6829).
-    CallRelationResult {
-        proof_authority: UsageProofAuthority::Native,
-        ..resolve_outgoing(go, caller, limits, budget, cancellation)
-    }
+    outgoing_after_open(analyzer, go, caller, limits, budget, cancellation, || {})
 }
 
-fn resolve_outgoing(
+fn outgoing_after_open(
+    analyzer: &dyn IAnalyzer,
     go: &GoAnalyzer,
     caller: &CodeUnit,
     limits: CallRelationLimits,
     budget: ReceiverAnalysisBudget,
     cancellation: &CancellationToken,
+    after_open: impl FnOnce(),
+) -> CallRelationResult {
+    let _model_scope =
+        match brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::pin_selected_model_snapshot(
+            analyzer,
+        ) {
+            Ok(scope) => scope,
+            Err(_) => {
+                return failed(
+                    "native_model_authority_stale",
+                    "Go model snapshot conflicts with the outer overlay",
+                    caller,
+                );
+            }
+        };
+    // Every result of this function, including cancellation and failures,
+    // comes from the native engine (#6829).
+    CallRelationResult {
+        proof_authority: UsageProofAuthority::Native,
+        ..resolve_outgoing(
+            analyzer,
+            go,
+            caller,
+            limits,
+            budget,
+            cancellation,
+            after_open,
+        )
+    }
+}
+
+fn resolve_outgoing(
+    analyzer: &dyn IAnalyzer,
+    go: &GoAnalyzer,
+    caller: &CodeUnit,
+    limits: CallRelationLimits,
+    budget: ReceiverAnalysisBudget,
+    cancellation: &CancellationToken,
+    after_open: impl FnOnce(),
 ) -> CallRelationResult {
     if cancellation.is_cancelled() {
         return CallRelationResult {
@@ -312,15 +349,14 @@ fn resolve_outgoing(
             &languages,
             &masks,
         )
-        .with_content_mounts(content_mounts);
+        .with_content_mounts(content_mounts)
+        .with_model_authority(super::selected_go_model_overlay(analyzer).map(|overlay| overlay as std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>));
         let mut operation = match go
             .inner
             .analyzer_store()
             .open_selected_resolution_operation(input, cancellation)?
         {
-            SelectedResolutionOperationOpenOutcome::Ready(operation) => (*operation).with_go_model_authority(
-                go.inner.semantic_model_overlay().map(|overlay| overlay as std::sync::Arc<dyn brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedModelAuthority + Send + Sync>)
-            ),
+            SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
             SelectedResolutionOperationOpenOutcome::Unavailable(reason) => {
                 return Ok(SelectedResolutionOperationOutcome::Unavailable(reason));
             }
@@ -333,6 +369,7 @@ fn resolve_outgoing(
                 ));
             }
         };
+        after_open();
         operation.initialize_go_base_profile(
             &go.native_context_base_profile()
                 .expect("outgoing query selected an active Go context"),
@@ -344,7 +381,7 @@ fn resolve_outgoing(
             &caller_path,
             cancellation,
         )?;
-        let semantic_model_overlay = go.inner.semantic_model_overlay();
+        let semantic_model_overlay = analyzer.semantic_model_overlay();
         let unresolved_imports = operation.go_selected_unresolved_imports(
             context.context_id,
             &caller_path,
@@ -494,6 +531,10 @@ fn resolve_outgoing(
                             continue;
                         }
                         let binding = answer.answer().binding();
+                        // Native diagnostics retain Debug's typed IDs. This
+                        // does not establish ordering equivalence between
+                        // fresh and incremental stores or across stores;
+                        // #9261 owns those remaining identity cases.
                         let completion = answer.answer().call_target_completion();
                         work.examined_candidates = work
                             .examined_candidates
@@ -531,7 +572,7 @@ fn resolve_outgoing(
                         callees.dedup();
                         if callees.is_empty() {
                             if let Some(site) = workspace_unqualified_call_site(
-                                go,
+                                analyzer,
                                 caller,
                                 &source,
                                 &tree,
@@ -545,7 +586,7 @@ fn resolve_outgoing(
                             }
                             let model_selection = answer.answer().model_member_selection().and_then(|selection| brokk_bifrost_analysis::analyzer::store::resolution_operation::native_units::project_native_model_member_selection(selection, cancellation));
                             let exact_external = exact_external_call(
-                                go,
+                                analyzer, go,
                                 caller,
                                 &source,
                                 &tree,
@@ -716,19 +757,21 @@ fn resolve_outgoing(
                     if let brokk_bifrost_analysis::analyzer::store::resolution_operation::go_named::GoPreparedImportContextOutcome::Ready(prepared) = &prepared {
                         let answer = super::native_points::declared_external_receiver_call(
                             &mut operation, (**prepared).clone(), BoundedReceiverQuery {
-                                analyzer: go, file: caller.source(), source: &source, tree: Some(&tree),
+                                analyzer, file: caller.source(), source: &source, tree: Some(&tree),
                                 site: &site, budget: session.remaining_budget().expect("bounded outgoing session"), cancellation: Some(cancellation),
                             },
                         )?;
                         // Each queued call consumes the outgoing request's remaining
                         // allowance; do not reset the budget for the next call.
                         let hook_work = answer.work();
-                        session.scope_steps(hook_work.scope_nodes);
-                        for _ in 0..hook_work.summary_expansions { if !session.summary_step() { break; } }
-                        for _ in 0..hook_work.resolution_rounds { if !session.round_step() { break; } }
+                        session.charge_work(&hook_work);
                         match answer {
                             BoundedResolution::Complete { value, .. } => value,
                             BoundedResolution::Exceeded { .. } => {
+                                result.truncated = true;
+                                None
+                            }
+                            BoundedResolution::Unavailable { .. } => {
                                 result.truncated = true;
                                 None
                             }
@@ -761,6 +804,7 @@ fn resolve_outgoing(
                 && !selected_call_indices.contains(&index)
             {
                 if exact_external_call(
+                    analyzer,
                     go,
                     caller,
                     &source,
@@ -777,7 +821,7 @@ fn resolve_outgoing(
                     continue;
                 }
                 if let Some(site) = workspace_unqualified_call_site(
-                    go,
+                    analyzer,
                     caller,
                     &source,
                     &tree,
@@ -842,6 +886,11 @@ fn resolve_outgoing(
             result.diagnostics[0].code = CallRelationDiagnosticCode::BudgetExhausted;
             result
         }
+        BoundedResolution::Unavailable { reason, .. } => {
+            let mut result = failed("native_input_unavailable", reason, caller);
+            result.truncated = true;
+            result
+        }
         BoundedResolution::Complete {
             value: Err(error), ..
         } => failed("native_store_error", error.to_string(), caller),
@@ -871,6 +920,7 @@ fn resolve_outgoing(
 
 #[allow(clippy::too_many_arguments)]
 fn exact_external_call(
+    analyzer: &dyn IAnalyzer,
     go: &GoAnalyzer,
     caller: &CodeUnit,
     source: &str,
@@ -894,7 +944,7 @@ fn exact_external_call(
         focus_end_byte: range.end_byte,
     };
     let query = BoundedReceiverQuery {
-        analyzer: go,
+        analyzer,
         file: caller.source(),
         source,
         tree: Some(tree),
@@ -912,7 +962,7 @@ fn exact_external_call(
                     query,
                     go,
                     session,
-                    go.inner.semantic_model_overlay(),
+                    analyzer.semantic_model_overlay(),
                     selected,
                 )
             {
@@ -941,7 +991,7 @@ fn exact_external_call(
 
 #[allow(clippy::too_many_arguments)]
 fn workspace_unqualified_call_site(
-    go: &GoAnalyzer,
+    analyzer: &dyn IAnalyzer,
     caller: &CodeUnit,
     source: &str,
     tree: &tree_sitter::Tree,
@@ -962,7 +1012,7 @@ fn workspace_unqualified_call_site(
     let resolution =
         crate::analyzer::usages::get_definition::go::go_native_workspace_unqualified_call_resolution(
             BoundedReceiverQuery {
-                analyzer: go,
+                analyzer,
                 file: caller.source(),
                 source,
                 tree: Some(tree),
@@ -1041,6 +1091,108 @@ mod tests {
         (fixture, go, caller)
     }
 
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#9163: Go outgoing republish after selected open mixed the operation and projection models"
+    )]
+    fn outgoing_answer_keeps_model_snapshot_after_republish() {
+        use brokk_bifrost_analysis::analyzer::workspace::DependencyPackEcosystem;
+        use std::sync::Arc;
+        let source = "package client\nimport (\"sync\"; \"os\")\ntype Local struct { once sync.Once }\nfunc (l *Local) Method() {}\nfunc Caller(l *Local) { l.Method(); l.once.Do(func() {}); os.Open(\"x\") }\n";
+        let fixture = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.test/calls\n\ngo 1.22\n")
+            .file("client/use.go", source)
+            .build();
+        let workspace = fixture
+            .workspace_analyzer(brokk_bifrost_core::analyzer::config::AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go delegate");
+        crate::analyzer::go::persist_live_go_sources_for_test(go);
+        let _catalog =
+            crate::analyzer::go::native_points::activate_receiver_models_for_test(analyzer);
+        let selected = analyzer
+            .active_semantic_model_snapshot()
+            .expect("activated models");
+        let overlay = analyzer
+            .semantic_model_overlay()
+            .expect("activated overlay");
+        let expected_key = brokk_bifrost_analysis::analyzer::ReadKey::Models(
+            brokk_bifrost_analysis::analyzer::semantic::StableDigest::sha256(
+                selected.active_models().active_model_set_hash(),
+            ),
+        );
+        let caller = go
+            .declarations(&fixture.file("client/use.go"))
+            .into_iter()
+            .find(|unit| unit.identifier() == "Caller")
+            .unwrap();
+        let limits = CallRelationLimits {
+            max_files: 1,
+            max_source_bytes: 32_768,
+            max_candidates: 16,
+        };
+        let cancellation = CancellationToken::new();
+        let baseline = outgoing(
+            analyzer,
+            go,
+            &caller,
+            limits,
+            ReceiverAnalysisBudget::default(),
+            &cancellation,
+        );
+        assert!(
+            baseline
+                .sites
+                .iter()
+                .any(|site| site.callee.identifier() == "Method"),
+            "workspace receiver method must survive model-backed outgoing selection: {:?}",
+            baseline.sites
+        );
+        let ledger = Arc::new(brokk_bifrost_analysis::analyzer::read_ledger::ReadLedger::new());
+        let _ledger_scope = brokk_bifrost_analysis::analyzer::AnalyzerQueryScope::with_read_ledger(
+            analyzer,
+            Arc::clone(&ledger),
+        );
+        let republished = outgoing_after_open(
+            analyzer,
+            go,
+            &caller,
+            limits,
+            ReceiverAnalysisBudget::default(),
+            &cancellation,
+            || {
+                assert!(workspace.invalidate_dependency_pack_state(&[DependencyPackEcosystem::Go]));
+                assert!(Arc::ptr_eq(
+                    analyzer
+                        .active_query_semantic_model_snapshot()
+                        .expect("pinned selection")
+                        .expect("active model snapshot")
+                        .semantic_model_overlay()
+                        .expect("pinned overlay"),
+                    &overlay
+                ));
+            },
+        );
+        assert_eq!(
+            format!("{:?}", republished.sites),
+            format!("{:?}", baseline.sites)
+        );
+        assert_eq!(
+            format!("{:?}", republished.diagnostics),
+            format!("{:?}", baseline.diagnostics)
+        );
+        assert_eq!(republished.caller_inventory, baseline.caller_inventory);
+        assert_eq!(republished.truncated, baseline.truncated);
+        assert_eq!(republished.cancelled, baseline.cancelled);
+        assert_eq!(republished.proof_authority, baseline.proof_authority);
+        let model_keys: Vec<_> = ledger
+            .keys()
+            .into_iter()
+            .filter(|key| matches!(key, brokk_bifrost_analysis::analyzer::ReadKey::Models(_)))
+            .collect();
+        assert_eq!(model_keys, [expected_key]);
+        assert!(analyzer.semantic_model_overlay().is_none());
+    }
     #[test]
     #[brokk_bifrost_test_macros::hardwon(
         "#6811: Go reverse search and outgoing calls read participation without a base profile"
@@ -1223,6 +1375,7 @@ mod tests {
             panic!("native selected model receiver")
         };
         let exact_proof = exact_external_call(
+            &go,
             &go,
             &caller,
             &source,

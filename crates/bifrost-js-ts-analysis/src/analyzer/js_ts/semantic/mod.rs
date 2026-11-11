@@ -63,7 +63,9 @@ use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 // #7960: a call's thrown value binds the catch parameter that handles it.
 // #8025: namespace import reads are static loads rooted at the import binder.
 // #8836: revert #7960; calls no longer bind the catch parameter. v37 is held by #8827.
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v38";
+// #7960: re-land; a call's thrown value binds the catch parameter again.
+// #9447: structured formal roles and refusal change semantic payloads.
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v40";
 // Bumping this rotates every public wire id hashed from the adapter
 // fingerprint (`SemanticArtifactKey::push_environment_identity`). A checked-in
 // golden that embeds one must be re-blessed with `BIFROST_BLESS=1` in the same
@@ -73,7 +75,9 @@ const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v38";
 // #7960: a call's thrown value binds the catch parameter that handles it.
 // #8025: namespace import reads are static loads rooted at the import binder.
 // #8836: revert #7960; calls no longer bind the catch parameter. v42 is held by #8827.
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v43";
+// #7960: re-land; a call's thrown value binds the catch parameter again.
+// #9447: structured formal roles and refusal change semantic payloads.
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v45";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -189,6 +193,12 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 }
                 ProcedureEnumeration::Cancelled { work } => {
                     return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Unknown { work } => {
+                    return Ok(SemanticOutcome::Unknown {
                         partial: None,
                         work,
                     });

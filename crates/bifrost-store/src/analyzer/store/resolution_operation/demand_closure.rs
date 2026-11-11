@@ -218,6 +218,8 @@ pub struct RouteStarts {
 #[doc(hidden)]
 pub struct RouteEdgeTier {
     pub edges: Vec<RouteLocation>,
+    /// Continue the pending lookup in another container without consuming it.
+    pub lookup_continuations: Vec<RouteLocation>,
     pub coverage: ResolutionCompletion,
     pub blockers: ResolutionCompletion,
     /// Independent alternatives continue to the next tier even when they bind.
@@ -228,6 +230,7 @@ impl Default for RouteEdgeTier {
     fn default() -> Self {
         Self {
             edges: Vec::new(),
+            lookup_continuations: Vec::new(),
             coverage: ResolutionCompletion::Complete,
             blockers: ResolutionCompletion::Complete,
             independent: false,
@@ -307,6 +310,7 @@ pub(super) struct ResidualRouteState<T> {
     frontier: std::vec::IntoIter<WalkCursor<T>>,
     next: Vec<WalkCursor<T>>,
     reached: Vec<WalkCursor<T>>,
+    // Non-consuming lookup continuations can cross several frontier rounds.
     seen: HashSet<(RouteLocation, usize, usize, T, ResolutionNamespace)>,
     awaiting: Option<WalkCursor<T>>,
 }
@@ -385,7 +389,6 @@ pub(super) fn poll_residual_route<T: Clone + Eq + std::hash::Hash>(
             let mut frontier = std::mem::take(&mut state.next);
             frontier.sort_by(|left, right| left.location.cmp(&right.location));
             state.frontier = frontier.into_iter();
-            state.seen = HashSet::default();
             continue;
         };
         if cancellation.is_cancelled() {
@@ -433,7 +436,13 @@ pub(super) fn poll_residual_route<T: Clone + Eq + std::hash::Hash>(
             if completion.contains_reason(ResolutionIncompleteReason::Cancelled) {
                 return Ok(Read::Cancelled(completion.clone()));
             }
-            let binding = !tier.edges.is_empty();
+            let binding = !tier.edges.is_empty() || !tier.lookup_continuations.is_empty();
+            for location in tier.lookup_continuations {
+                state.retain_next(WalkCursor {
+                    location,
+                    ..cursor.clone()
+                });
+            }
             for location in tier.edges {
                 state.retain_next(WalkCursor {
                     location,
@@ -464,11 +473,46 @@ pub(super) fn walk_residual_route<T: Clone + Eq + std::hash::Hash>(
     cancellation: &CancellationToken,
 ) -> Result<Vec<WalkCursor<T>>> {
     let mut state = ResidualRouteState::new(rules, start, completion)?;
-    match poll_residual_route(rules, &mut state, route, completion, cancellation)? {
+    match finish_lookup_route(rules, &mut state, route, completion, cancellation)? {
+        Read::Ready { value, .. } => Ok(value),
+        // Legacy synchronous callers retain their existing cancellation ledger.
+        Read::Cancelled(_) => Ok(Vec::new()),
+        Read::Unavailable { .. } => panic!("a suspending route requires the source scheduler"),
+    }
+}
+
+pub(super) fn walk_lookup_route<T: Clone + Eq + std::hash::Hash>(
+    rules: &impl RouteRules<T>,
+    start: WalkCursor<T>,
+    route: &[ResolutionLookupSemanticRecipe],
+    completion: &mut ResolutionCompletion,
+    cancellation: &CancellationToken,
+) -> Result<Read<Vec<WalkCursor<T>>>> {
+    let mut state = ResidualRouteState {
+        frontier: vec![start].into_iter(),
+        next: Vec::new(),
+        reached: Vec::new(),
+        seen: HashSet::default(),
+        awaiting: None,
+    };
+    finish_lookup_route(rules, &mut state, route, completion, cancellation)
+}
+
+fn finish_lookup_route<T: Clone + Eq + std::hash::Hash>(
+    rules: &impl RouteRules<T>,
+    state: &mut ResidualRouteState<T>,
+    route: &[ResolutionLookupSemanticRecipe],
+    completion: &mut ResolutionCompletion,
+    cancellation: &CancellationToken,
+) -> Result<Read<Vec<WalkCursor<T>>>> {
+    match poll_residual_route(rules, state, route, completion, cancellation)? {
         Read::Ready {
             value: ResidualRouteProgress::Ready(reached),
-            ..
-        } => Ok(reached),
+            completion,
+        } => Ok(Read::Ready {
+            value: reached,
+            completion,
+        }),
         Read::Ready {
             value: ResidualRouteProgress::Members { .. },
             ..
@@ -476,8 +520,8 @@ pub(super) fn walk_residual_route<T: Clone + Eq + std::hash::Hash>(
         // Synchronous callers keep failing closed: either their token is
         // cancelled, or poll_residual_route has already written the Cancelled
         // reason into their completion ledger before returning.
-        Read::Cancelled(_) => Ok(Vec::new()),
-        Read::Unavailable { .. } => panic!("a suspending route requires the source scheduler"),
+        Read::Cancelled(completion) => Ok(Read::Cancelled(completion)),
+        Read::Unavailable { reason, completion } => Ok(Read::Unavailable { reason, completion }),
     }
 }
 
@@ -1449,6 +1493,9 @@ pub struct HalfClosureFacts {
     pub placements: Box<[PlacementObservation]>,
     pub completion: ResolutionCompletion,
     pub selected_targets: BTreeSet<SemanticId>,
+    pub(crate) selected_external_owners: BTreeSet<
+        crate::analyzer::resolution::fact_resolution::demand_scheduler::SelectedExternalOwner,
+    >,
     pub prefix_has_targets: bool,
     pub deferred_member_selection: bool,
     pub half: HalfId,
@@ -1792,6 +1839,18 @@ pub struct QualifiedMembers<'a>(
 
 #[doc(hidden)]
 pub trait DemandRules {
+    fn begin_close_attempt(&mut self, _relation: &DemandRelationKey, _epoch: u64) {}
+    #[allow(private_interfaces)]
+    fn certify_external_owner(
+        &self,
+        _reference: SemanticId,
+        _slot: SemanticId,
+        _semantic: SemanticId,
+        _kind: Option<crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind>,
+        _retained: &dyn super::demand::RetainedFrame,
+    ) -> Option<crate::analyzer::resolution::selected_context::ValidatedOwner> {
+        None
+    }
     fn source_prefix_namespace(
         &self,
         _half: &SelectedRootPathHalf,
@@ -2247,6 +2306,7 @@ impl SelectedResolutionOperation<'_, '_> {
         blueprint: &SelectedFactOperationBlueprint,
         lexical: &dyn BatchResolutionFragmentSource,
         typed: &dyn SelectedTypedFactSource,
+        finalizer: &dyn crate::analyzer::resolution::fact_resolution::LexicalAnswerFinalizer,
         projection_memo: Option<&super::file_context::ContextBlueprintMemo>,
         cancellation: &CancellationToken,
         session: &ResolutionSession,
@@ -2268,6 +2328,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         paths,
                         lexical,
                         typed,
+                        finalizer,
                         provider,
                         cancellation,
                         session,
@@ -2280,6 +2341,7 @@ impl SelectedResolutionOperation<'_, '_> {
                         paths,
                         lexical,
                         typed,
+                        finalizer,
                         provider,
                         cancellation,
                         session,
@@ -2322,6 +2384,23 @@ impl<R> DemandLanguage for SharedDemand<'_, '_, '_, R>
 where
     R: DemandRules,
 {
+    fn root_frame<'a>(&self, question: &'a Self::RootQuestion) -> Option<&'a RootFrame> {
+        Some(question)
+    }
+    fn certify_external_owner(
+        &self,
+        reference: SemanticId,
+        slot: SemanticId,
+        semantic: SemanticId,
+        kind: Option<crate::analyzer::semantic_model::overlay::SemanticModelSymbolKind>,
+        retained: &dyn super::demand::RetainedFrame,
+    ) -> Option<crate::analyzer::resolution::selected_context::ValidatedOwner> {
+        self.rules
+            .certify_external_owner(reference, slot, semantic, kind, retained)
+    }
+    fn begin_close_attempt(&mut self, relation: &DemandRelationKey, epoch: u64) {
+        self.rules.begin_close_attempt(relation, epoch);
+    }
     fn finalize_closure(
         &mut self,
         endpoint: &EndpointSignature,
@@ -4057,20 +4136,31 @@ fn canonical_export_bridge(
 }
 
 fn proven_member_bridge(
+    ready: &ReadySelectedResolution<'_, '_>,
     half: &SelectedRootPathHalf,
     route: &[ResolutionLookupSemanticRecipe],
     demand: &ResolutionLookupSemanticRecipe,
     member: &SelectedMemberTarget,
     material: &BridgeMaterial,
 ) -> SelectedRootBridgeDescriptor {
-    assert_eq!(member.definition.ordinal(), Some(member.fragment.ordinal()));
-    assert_eq!(member.token.ordinal(), Some(member.fragment.ordinal()));
+    if ready
+        .context_identities
+        .model_member_identity(member.token)
+        .is_some()
+    {
+        // Model coordinates belong to this operation, not to a mounted file.
+        assert_eq!(member.definition.ordinal(), None);
+        assert_eq!(member.token.ordinal(), None);
+    } else {
+        assert_eq!(member.definition.ordinal(), Some(member.fragment.ordinal()));
+        assert_eq!(member.token.ordinal(), Some(member.fragment.ordinal()));
+    }
     assert!(
         material
             .target_definition
             .is_none_or(|target| target == member.definition)
     );
-    bridge_from_material(
+    let bridge = bridge_from_material(
         half,
         route,
         demand,
@@ -4079,8 +4169,16 @@ fn proven_member_bridge(
         &member.lookup,
         &member.completion,
         material,
-    )
-    .with_selected_member_definition(member.definition)
+    );
+    if ready
+        .context_identities
+        .model_member_identity(member.token)
+        .is_some()
+    {
+        bridge.with_selected_model_member_definition(member.definition)
+    } else {
+        bridge.with_selected_member_definition(member.definition)
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -4584,22 +4682,25 @@ pub struct RouteAlternativePosition {
 
 #[derive(Clone)]
 #[doc(hidden)]
-pub enum PositionedRouteOutcome {
+pub(crate) enum PositionedRouteOutcome {
     Supported(PositiveRouteSupport),
     Closed,
     OpenEmpty(RouteOpenOutcome),
 }
 
 /// Positive package classifications are support markers, not candidate proofs.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 #[doc(hidden)]
-pub enum PositiveRouteSupport {
+pub(crate) enum PositiveRouteSupport {
     Exports {
         complete: bool,
     },
     ExternalOwner {
         complete: bool,
         authority: OwnerAuthority,
+        certificate: Option<
+            crate::analyzer::resolution::fact_resolution::demand_scheduler::SelectedExternalOwner,
+        >,
     },
     Intrinsic,
 }
@@ -4625,7 +4726,7 @@ pub struct RouteOpenOutcome {
 pub struct PositionedRouteAlternative {
     pub position: RouteAlternativePosition,
     pub tier: usize,
-    pub outcome: PositionedRouteOutcome,
+    pub(crate) outcome: PositionedRouteOutcome,
 }
 
 // #7869: an unacquired provider is an obligation when this route keeps a
@@ -4665,7 +4766,7 @@ pub(in crate::analyzer) fn route_keeps_complete_terminal(
                 && alternative.position.namespace == frame.namespace
                 && alternative.position.name == frame.name
                 && matches!(
-                    alternative.outcome,
+                    &alternative.outcome,
                     PositionedRouteOutcome::Supported(
                         PositiveRouteSupport::Intrinsic
                             | PositiveRouteSupport::Exports { complete: true }
@@ -4694,7 +4795,7 @@ pub(in crate::analyzer) fn route_keeps_complete_terminal(
                     && alternative.position.namespace == terminal.namespace()
                     && alternative.position.name == terminal.spelling()
                     && matches!(
-                        alternative.outcome,
+                        &alternative.outcome,
                         PositionedRouteOutcome::Supported(
                             PositiveRouteSupport::Intrinsic
                                 | PositiveRouteSupport::Exports { complete: true }
@@ -4721,7 +4822,7 @@ pub(in crate::analyzer) fn reduce_positioned_alternatives(
 ) {
     let mut supported: HashMap<RouteAlternativePosition, usize> = HashMap::default();
     for alternative in &alternatives {
-        if matches!(alternative.outcome, PositionedRouteOutcome::Supported(_)) {
+        if matches!(&alternative.outcome, PositionedRouteOutcome::Supported(_)) {
             supported
                 .entry(alternative.position.clone())
                 .and_modify(|tier| *tier = (*tier).min(alternative.tier))
@@ -4730,7 +4831,7 @@ pub(in crate::analyzer) fn reduce_positioned_alternatives(
     }
     for alternative in alternatives {
         if matches!(
-            alternative.outcome,
+            &alternative.outcome,
             PositionedRouteOutcome::Supported(PositiveRouteSupport::Intrinsic)
         ) {
             // A language-owned intrinsic answers on another route. It supplies
@@ -5651,8 +5752,18 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
             support: keeps_terminal,
             ..Default::default()
         };
+    let mut selected_external_owners = BTreeSet::new();
     for alternative in terminal_support {
-        match alternative.outcome {
+        if keeps_terminal
+            && let PositionedRouteOutcome::Supported(PositiveRouteSupport::ExternalOwner {
+                complete: true,
+                certificate: Some(certificate),
+                ..
+            }) = &alternative.outcome
+        {
+            selected_external_owners.insert(certificate.clone());
+        }
+        match &alternative.outcome {
             PositionedRouteOutcome::Supported(PositiveRouteSupport::Intrinsic)
             | PositionedRouteOutcome::Supported(PositiveRouteSupport::ExternalOwner {
                 complete: true,
@@ -5742,6 +5853,7 @@ fn finish_source_half<'a, R: DemandRules + 'a>(
         accepted,
         completion: observation.completion,
         selected_targets,
+        selected_external_owners,
         prefix_has_targets,
         deferred_member_selection,
     });
@@ -6341,6 +6453,7 @@ pub(super) fn close_provider_rows<R: DemandRules>(
             placements: placement_observations.finish(),
             completion: completion.clone(),
             selected_targets: targets,
+            selected_external_owners: BTreeSet::new(),
             prefix_has_targets: witness,
             deferred_member_selection: false,
             half: half_id,
@@ -6425,6 +6538,7 @@ fn retain_proven_target<R: DemandRules>(
     }
     let material = material()?;
     bridges.push(proven_member_bridge(
+        shared.ready,
         half,
         &source.route,
         &source.demand,
@@ -6528,6 +6642,7 @@ fn close_member_rows<R: DemandRules>(
             placements: Box::new([]),
             completion: route.completion.clone(),
             selected_targets: targets,
+            selected_external_owners: BTreeSet::new(),
             prefix_has_targets: !selection.owners.is_empty(),
             deferred_member_selection: true,
             half: half_id,

@@ -223,6 +223,8 @@ payload_tags! {
     ValueFlowKindTag for ValueFlowKind {
         Local, Transfer, BackingStore, IntegerOffset, BackingStoreAlternative, Parameter,
         Receiver, Return, IndexedReturn, ReferenceBoxing, ReferenceUnboxing, LanguageDefined,
+        // #9794 remains the existing code; #9925 appends after it.
+        ByValueCapture, OwnershipUnknown,
     }
     TransferKindTag for TransferKind {
         Copy, AggregateCopy, Move, Conversion, Boxing, Unboxing,
@@ -365,6 +367,37 @@ mod tests {
         assert_codes::<IncompleteSubjectTag>(Some(3));
         assert_codes::<IncompleteReasonTag>(Some(1));
         assert_codes::<OutcomeTag>(Some(5));
+    }
+
+    /// Stored value-flow kind codes are append-only: a new kind goes after the
+    /// last one, so no stored code changes meaning. Two branches that add a
+    /// kind concurrently (#9794, #9925) must both extend this list in landing
+    /// order.
+    #[test]
+    fn value_flow_kind_codes_are_append_only() {
+        let names = ValueFlowKindTag::VARIANTS
+            .iter()
+            .map(|tag| format!("{tag:?}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Local",
+                "Transfer",
+                "BackingStore",
+                "IntegerOffset",
+                "BackingStoreAlternative",
+                "Parameter",
+                "Receiver",
+                "Return",
+                "IndexedReturn",
+                "ReferenceBoxing",
+                "ReferenceUnboxing",
+                "LanguageDefined",
+                "ByValueCapture",
+                "OwnershipUnknown",
+            ]
+        );
     }
 
     /// A tag's order cannot be checked against its declaration by the

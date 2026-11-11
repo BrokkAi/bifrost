@@ -35,6 +35,50 @@ pub enum Language {
     Kotlin,
 }
 
+/// The language-neutral shape of an executable body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcedureKind {
+    Function,
+    Method,
+    Constructor,
+    Initializer,
+    LocalFunction,
+    Lambda,
+    Closure,
+    Accessor,
+    Operator,
+}
+
+impl ProcedureKind {
+    /// The value domain the `procedure.procedure_kind` row field publishes
+    /// (issue #2515).
+    pub const LABELS: &'static [&'static str] = &[
+        "function",
+        "method",
+        "constructor",
+        "initializer",
+        "local_function",
+        "lambda",
+        "closure",
+        "accessor",
+        "operator",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Initializer => "initializer",
+            Self::LocalFunction => "local_function",
+            Self::Lambda => "lambda",
+            Self::Closure => "closure",
+            Self::Accessor => "accessor",
+            Self::Operator => "operator",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RubyMethodDispatchMode {
     Instance,
@@ -164,8 +208,20 @@ impl Language {
             Language::Php => &["php"],
             Language::Scala => &["scala"],
             Language::CSharp => &["cs"],
-            Language::Ruby => &["rb"],
+            // `ru` is Rack's `config.ru`, `rake` a Rake task file and
+            // `gemspec` a gem specification: all three are plain Ruby (#9320).
+            Language::Ruby => &["rb", "ru", "rake", "gemspec"],
             Language::Kotlin => &["kt", "kts"],
+        }
+    }
+
+    /// Exact file names a language owns whatever their extension, for the
+    /// conventional build files that carry no source extension. Matched
+    /// case-sensitively against the final path component.
+    pub fn file_names(self) -> &'static [&'static str] {
+        match self {
+            Language::Ruby => &["Gemfile", "Rakefile", "rakefile", "Guardfile"],
+            _ => &[],
         }
     }
 
@@ -197,12 +253,35 @@ impl Language {
         Language::None
     }
 
-    /// Resolve an analyzable language from a path's extension.
+    /// Resolve an analyzable language from a path: an exact file name from
+    /// [`Self::file_names`] first, then the extension.
     pub fn from_path(path: &Path) -> Self {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(Self::from_extension)
+        Self::from_file_name(path)
+            .or_else(|| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(Self::from_extension)
+            })
             .unwrap_or(Self::None)
+    }
+
+    fn from_file_name(path: &Path) -> Option<Self> {
+        let name = path.file_name()?.to_str()?;
+        Self::ANALYZABLE
+            .into_iter()
+            .find(|language| language.file_names().contains(&name))
+    }
+
+    /// Whether no analyzable language claims `path`, by file name, by source
+    /// extension or by reference-only sibling extension. A file with no
+    /// extension and no claimed name qualifies: nothing can name it. This is
+    /// the eligibility rule for include-driven language inference (#1837).
+    pub fn path_is_unclaimed(path: &Path) -> bool {
+        Self::from_file_name(path).is_none()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_none_or(|extension| !Self::is_source_extension(extension))
     }
 
     pub fn from_config_label(input: &str) -> Option<Self> {
@@ -466,6 +545,21 @@ impl fmt::Display for LanguageDialect {
 mod language_dialect_tests {
     use super::*;
     use brokk_bifrost_test_macros::hardwon;
+
+    #[test]
+    fn accepted_pack_languages_share_realm() {
+        for dialect in LanguageDialect::ALL {
+            for manifest in LanguageDialect::ALL {
+                let label = manifest.semantic_pack_label();
+                if dialect.accepts_semantic_pack_language(label) {
+                    assert_eq!(
+                        super::semantic_pack_realm(dialect.semantic_pack_label()),
+                        super::semantic_pack_realm(label)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[hardwon("#3322: .jsx files selected ordinary JavaScript and failed on JSX attributes")]
@@ -3216,10 +3310,8 @@ impl ProjectFile {
 
     fn from_interned_root(root: Arc<Path>, rel_path: PathBuf) -> Self {
         let path_hash = project_file_path_hash(&root, &rel_path);
-        let extension = rel_path.extension().and_then(|ext| ext.to_str());
-        let language = extension.map_or(Language::None, Language::from_extension);
-        // A file with no extension qualifies: no extension list can name it.
-        let unclaimed_extension = crate::analyzer::common::unclaimed_extension(extension);
+        let language = Language::from_path(&rel_path);
+        let unclaimed_extension = Language::path_is_unclaimed(&rel_path);
         Self(Arc::new(ProjectFileInner {
             root,
             rel_path,
@@ -3284,6 +3376,14 @@ impl ProjectFile {
             .saturating_add(self.0.rel_path.capacity())
             .saturating_add(ARC_HEADER_BYTES)
             .saturating_add(self.0.root.as_os_str().len())
+    }
+
+    /// The allocations behind this handle that its container holds inline:
+    /// both `Arc` payloads and the path buffers. The handle itself is counted
+    /// by the container that holds it.
+    pub fn retained_heap_bytes(&self) -> usize {
+        self.retained_bytes()
+            .saturating_sub(std::mem::size_of::<Self>())
     }
 
     pub fn abs_path(&self) -> PathBuf {
@@ -3527,12 +3627,7 @@ impl CodeUnit {
         std::mem::size_of::<Self>()
             .saturating_add(2 * std::mem::size_of::<usize>())
             .saturating_add(std::mem::size_of::<CodeUnitInner>())
-            .saturating_add(
-                self.0
-                    .source
-                    .retained_bytes()
-                    .saturating_sub(std::mem::size_of::<ProjectFile>()),
-            )
+            .saturating_add(self.0.source.retained_heap_bytes())
             .saturating_add(self.0.signature.as_ref().map_or(0, String::capacity))
             .saturating_add(self.0.fq.retained_heap_bytes())
             .saturating_add(self.0.rendered_name.display.capacity())
@@ -4934,6 +5029,7 @@ mod value_domain_tests {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeclarationKind {
     Parameter,
+    TypeParameter,
     ReceiverParameter,
     ImportAlias,
     StatementLabel,
@@ -4953,12 +5049,15 @@ pub enum DeclarationKind {
     /// canonical source declarations gives navigation a located, honest,
     /// non-navigable target instead of an unavailable operation.
     BlockLocalItem,
+    /// A block-local type declaration with no parser CodeUnit.
+    BlockLocalType,
 }
 
 impl DeclarationKind {
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "parameter" => Some(Self::Parameter),
+            "type_parameter" => Some(Self::TypeParameter),
             "receiver_parameter" => Some(Self::ReceiverParameter),
             "import_alias" => Some(Self::ImportAlias),
             "statement_label" => Some(Self::StatementLabel),
@@ -4970,6 +5069,7 @@ impl DeclarationKind {
             "resource_variable" => Some(Self::ResourceVariable),
             "field" => Some(Self::Field),
             "block_local_item" => Some(Self::BlockLocalItem),
+            "block_local_type" => Some(Self::BlockLocalType),
             _ => None,
         }
     }
@@ -4978,6 +5078,7 @@ impl DeclarationKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Parameter => "parameter",
+            Self::TypeParameter => "type_parameter",
             Self::ReceiverParameter => "receiver_parameter",
             Self::ImportAlias => "import_alias",
             Self::StatementLabel => "statement_label",
@@ -4989,6 +5090,7 @@ impl DeclarationKind {
             Self::ResourceVariable => "resource_variable",
             Self::Field => "field",
             Self::BlockLocalItem => "block_local_item",
+            Self::BlockLocalType => "block_local_type",
         }
     }
 }
@@ -6051,8 +6153,9 @@ mod language_extension_contract_tests {
     #[test]
     #[hardwon("#3836: retired plugin registration cannot be the engine extension-coverage oracle")]
     fn every_declared_source_extension_has_its_expected_engine_dialect() {
-        // Preserve the complete 25-extension coverage formerly pinned by the
-        // Claude registration, while exercising the current engine interface.
+        // Preserve the complete extension coverage formerly pinned by the Claude
+        // registration, plus Ruby's conventional build-file extensions (#9320),
+        // while exercising the current engine interface.
         // Headers use the engine's conservative C++ dialect; only .c selects C.
         let expected = [
             ("java", LanguageDialect::Standard(Language::Java)),
@@ -6078,6 +6181,9 @@ mod language_extension_contract_tests {
             ("scala", LanguageDialect::Standard(Language::Scala)),
             ("cs", LanguageDialect::Standard(Language::CSharp)),
             ("rb", LanguageDialect::Standard(Language::Ruby)),
+            ("ru", LanguageDialect::Standard(Language::Ruby)),
+            ("rake", LanguageDialect::Standard(Language::Ruby)),
+            ("gemspec", LanguageDialect::Standard(Language::Ruby)),
             ("kt", LanguageDialect::Standard(Language::Kotlin)),
             ("kts", LanguageDialect::Standard(Language::Kotlin)),
         ];
@@ -6103,6 +6209,17 @@ mod language_extension_contract_tests {
                 "{filename}"
             );
         }
+        // Conventional extensionless build files are claimed by exact name,
+        // so include inference no longer adopts them (#9320).
+        for filename in ["Gemfile", "Rakefile", "rakefile", "Guardfile"] {
+            let path = Path::new("app").join(filename);
+            assert_eq!(Language::from_path(&path), Language::Ruby, "{filename}");
+            assert!(!Language::path_is_unclaimed(&path), "{filename}");
+        }
+        assert_eq!(
+            Language::from_path(Path::new("Gemfile.lock")),
+            Language::None
+        );
     }
 }
 

@@ -345,7 +345,9 @@ pub(in crate::analyzer) trait NominalLanguageRules: Sync + 'static {
     fn lexical_package_languages(&self) -> &'static [Language];
     /// Required: reverse target policy; algorithms stay shared.
     #[cfg(any(test, feature = "test-support"))]
-    fn reverse_target_rules(&self) -> &'static dyn super::jvm_reverse_rows::JvmReverseTargetRules;
+    fn reverse_target_rules(
+        &self,
+    ) -> &'static dyn super::nominal_reverse::NominalReverseTargetRules;
     /// Feature entry: selected ownership supplies access endpoints; absent by default.
     fn has_declaration_access_endpoints(&self) -> bool {
         false
@@ -576,7 +578,7 @@ struct JvmLanguageRules {
     package_access_anchor: PackageAccessAnchor,
     lexical_package_languages: &'static [Language],
     #[cfg(any(test, feature = "test-support"))]
-    reverse_target: &'static dyn super::jvm_reverse_rows::JvmReverseTargetRules,
+    reverse_target: &'static dyn super::nominal_reverse::NominalReverseTargetRules,
     access_endpoints: bool,
     lexical_access: bool,
     implicit_project_access: bool,
@@ -757,7 +759,9 @@ impl NominalLanguageRules for JvmLanguageRules {
         self.lexical_package_languages
     }
     #[cfg(any(test, feature = "test-support"))]
-    fn reverse_target_rules(&self) -> &'static dyn super::jvm_reverse_rows::JvmReverseTargetRules {
+    fn reverse_target_rules(
+        &self,
+    ) -> &'static dyn super::nominal_reverse::NominalReverseTargetRules {
         self.reverse_target
     }
     fn has_declaration_access_endpoints(&self) -> bool {
@@ -1132,13 +1136,6 @@ fn selected_java_import_context(
     lookup: Option<&str>,
     cancellation: &CancellationToken,
 ) -> Result<JvmImportContext> {
-    // #7314 6b: operation-owned oracle selection; no production override.
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(selection) = operation.java_oracle_selection {
-        return operation
-            .java_oracle_context_for_test(selection, path, lookup, cancellation)
-            .map(JvmImportContext::with_open_inventory_gap);
-    }
     operation
         .assemble_jvm_import_context(Language::Java, path, lookup, cancellation)
         .map(JvmImportContext::with_open_inventory_gap)
@@ -1149,11 +1146,6 @@ fn reverse_java_import_context(
     path: &str,
     cancellation: &CancellationToken,
 ) -> Result<JvmImportContext> {
-    // #7314 6b: reverse keeps its own inventory policy on both oracle paths.
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(selection) = operation.java_oracle_selection {
-        return operation.java_oracle_context_for_test(selection, path, None, cancellation);
-    }
     operation.assemble_jvm_import_context(Language::Java, path, None, cancellation)
 }
 
@@ -1215,7 +1207,7 @@ fn selected_package_export_members(
 
 const JVM_EXTERNAL_SUPERTYPES: &str = "SELECT edge.ordinal,edge.supertype_fqn,COALESCE((SELECT provider_id FROM jvm_external_owners WHERE owner_fqn=edge.supertype_fqn AND provider_id=?1),(SELECT CASE WHEN count(*)=1 THEN min(provider_id) END FROM jvm_external_owners WHERE owner_fqn=edge.supertype_fqn AND provider_id IN (SELECT value FROM json_each(?5))),?1) FROM jvm_external_owner_supertypes edge JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE edge.provider_id=?1 AND edge.owner_fqn=?2 AND edge.ordinal>?3 AND edge.provider_id IN (SELECT value FROM json_each(?5)) ORDER BY edge.ordinal LIMIT ?4";
 
-const JVM_EXTERNAL_MEMBERS: &str = "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal>?3 AND member.provider_id IN (SELECT value FROM json_each(?5)) ORDER BY member.ordinal LIMIT ?4";
+const JVM_EXTERNAL_MEMBERS: &str = "SELECT member.ordinal,member.member_name,member.member_kind,member.visibility,member.is_static,CASE WHEN member.member_kind IN ('method','function') AND member.is_static=0 AND member.signature_present=1 AND json_array_length(member.parameters_jsonb)=0 AND member.return_type_jsonb IS NOT NULL AND NOT (json_extract(member.return_type_jsonb,'$.kind')='named' AND json_extract(member.return_type_jsonb,'$.name')='void') THEN 1 ELSE 0 END FROM jvm_external_owner_members member JOIN jvm_external_owners inventory USING(provider_id,owner_fqn) WHERE member.provider_id=?1 AND member.owner_fqn=?2 AND member.ordinal>?3 AND member.provider_id IN (SELECT value FROM json_each(?5)) ORDER BY member.ordinal LIMIT ?4";
 
 const JVM_EXTERNAL_OWNER_SCOPES: &str = "SELECT 0,callables_complete,values_complete,types_complete,supertypes_complete FROM jvm_external_owners WHERE provider_id=?1 AND owner_fqn=?2 AND 0>?3 AND provider_id IN (SELECT value FROM json_each(?5)) LIMIT ?4";
 

@@ -5,7 +5,7 @@
 //! decoder panics and names the table, the blob, the row's key and the
 //! column.
 
-use rusqlite::Transaction;
+use rusqlite::Connection;
 
 use super::codes::{
     AllocationKindTag, ArgumentDomainTag, BackingStoreOffsetTag, CallableReferenceKindTag,
@@ -17,7 +17,10 @@ use super::codes::{
     ScopeEndAtTag, SynchronizationPayloadCopyTag, SynchronizationPayloadTag, TargetResolutionTag,
     TransferKindTag, TransferOperationTag, ValueFlowKindTag, ValueKindTag,
 };
-use super::{SemanticIrMountScope, SemanticIrPublicationOutcome, Table};
+use super::{
+    SemanticIrMountScope, SemanticIrPublicationOutcome, StoredFootprintCoverage,
+    StoredFootprintRefusal, Table,
+};
 use crate::analyzer::semantic::partial_flow::fixpoint::{
     PartialFlow, PartialFlowOutcome, ProcedurePartialFlows,
 };
@@ -30,11 +33,12 @@ use crate::analyzer::semantic::{
     ControlContinuation, ControlEdge, DeclarationLocator, DeclarationSegment,
     DeferredMemberSelection, DropBehavior, DropFact, Evidence, EvidenceCompleteness, EvidenceId,
     FormalMultiplicity, GoPredeclaredBuiltin, GuardArm, GuardConditionDigest, GuardFactParts,
-    GuardId, GuardPredicate, LoopSite, MemoryLocation, MemoryLocationId, MemoryLocationKind,
-    MemoryValueCopy, MoveOutFact, PointerAccess, PointerAccessWidth, PointerAlias,
-    PointerByteOffset, PointerInvalidation, PointerInvalidationTarget, PointerOrigin,
-    PointerOriginId, PointerOriginKind, ProcedureId, ProcedureProperties, ProcedureSemanticsParts,
-    ProgramPoint, ProgramPointId, ProofStatus, ScopeEndAt, ScopeEndFact, SemanticBudgetExceeded,
+    GuardId, GuardPredicate, GuardedPatternProjection, LoopSite, MemoryLocation, MemoryLocationId,
+    MemoryLocationKind, MemoryValueCopy, MoveOutFact, PatternProjectionStatus,
+    PatternProjectionStep, PointerAccess, PointerAccessWidth, PointerAlias, PointerByteOffset,
+    PointerInvalidation, PointerInvalidationTarget, PointerOrigin, PointerOriginId,
+    PointerOriginKind, ProcedureId, ProcedureProperties, ProcedureSemanticsParts, ProgramPoint,
+    ProgramPointId, ProofStatus, ScopeEndAt, ScopeEndFact, SemanticBudgetExceeded,
     SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
     SemanticGap, SemanticGapId, SemanticGapImpact, SemanticGapImpacts, SemanticGapSubject,
     SemanticIncompleteFact, SemanticIncompleteReason, SemanticIncompleteSubject, SemanticLocator,
@@ -44,8 +48,13 @@ use crate::analyzer::semantic::{
     SynchronizationPayload, SynchronizationPayloadCopy, TransferKind, TransferOperation,
     ValueFlowKind, ValueId, ValueTransfer, WorkspaceRelativePath,
 };
+use crate::analyzer::semantic::{
+    CallTargetObligation, ContentIdentity, FOOTPRINT_COVERAGE_CONTRACT_VERSION, FootprintClass,
+    FootprintDisposition,
+};
 use crate::analyzer::store::Result;
 use crate::hash::HashMap;
+use brokk_bifrost_core::gitblob::BlobKey;
 
 /// The procedure-local id types a row column can hold.
 trait LocalId: Copy {
@@ -276,7 +285,7 @@ impl Cells<'_, '_> {
 }
 
 fn each_row(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     table: Table,
     decode: impl FnMut(&mut Cells<'_, '_>),
@@ -293,7 +302,7 @@ fn each_row(
 
 /// The rows of one procedure, for a table with a `procedure` column.
 fn each_procedure_row(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     procedure: u32,
     table: Table,
@@ -309,8 +318,21 @@ fn each_procedure_row(
     )
 }
 
+fn each_scoped_row(
+    tx: &Connection,
+    blob_id: i64,
+    procedure: Option<u32>,
+    table: Table,
+    decode: impl FnMut(&mut Cells<'_, '_>),
+) -> Result<()> {
+    match procedure {
+        Some(procedure) => each_procedure_row(tx, blob_id, procedure, table, decode),
+        None => each_row(tx, blob_id, table, decode),
+    }
+}
+
 fn each_selected_row(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     table: Table,
     sql: &str,
@@ -357,6 +379,7 @@ type EventKey = (u32, u32, u32);
 struct Decoder<'a> {
     blob_id: i64,
     scope: &'a SemanticIrMountScope,
+    selected_procedure: Option<u32>,
     texts: Vec<String>,
     declarations: Vec<Vec<DeclarationSegment>>,
     locators: Vec<SemanticLocator>,
@@ -379,6 +402,7 @@ impl<'a> Decoder<'a> {
         Self {
             blob_id,
             scope,
+            selected_procedure: None,
             texts: Vec::new(),
             declarations: Vec::new(),
             locators: Vec::new(),
@@ -407,7 +431,7 @@ struct OffsetRow {
 /// Read and decode every row of one blob inside `tx`, or `None` when the
 /// blob has no head.
 pub(super) fn read_and_decode(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     scope: &SemanticIrMountScope,
 ) -> Result<Option<Vec<ProcedureSemanticsParts>>> {
@@ -467,6 +491,106 @@ pub(super) fn read_and_decode(
     Ok(Some(parts))
 }
 
+/// Read one procedure's child rows. Shared identity rows and procedure headers
+/// remain blob-wide because the on-disk IDs are dense and shared across procedures.
+/// The caller records the same blob read key as the full reader; read-key
+/// narrowing belongs to Milestone 5.
+pub(super) fn read_one_procedure(
+    tx: &Connection,
+    blob_id: i64,
+    scope: &SemanticIrMountScope,
+    procedure: u32,
+) -> Result<Option<ProcedureSemanticsParts>> {
+    use rusqlite::OptionalExtension;
+    let head = tx
+        .prepare_cached(
+            "SELECT outcome, publication_state, procedure_count, json(go_predeclared_builtins), content_digest
+         FROM semantic_ir_publications WHERE blob_id = ?1",
+        )?
+        .query_row([blob_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .optional()?;
+    let Some((outcome, state, count, builtins, digest)) = head else {
+        return Ok(None);
+    };
+    assert!(
+        outcome == 0 && state == "complete",
+        "semantic IR blob {blob_id} is not complete"
+    );
+    assert_eq!(
+        digest.as_slice(),
+        scope.content.as_bytes(),
+        "semantic IR blob {blob_id} has different content"
+    );
+    assert!(
+        i64::from(procedure) < count,
+        "procedure {procedure} exceeds blob {blob_id} count {count}"
+    );
+    if std::env::var_os("BIFROST_TIMING").is_some() {
+        for &table in Table::ALL {
+            if matches!(table, Table::PartialPorts | Table::PartialFlows) {
+                continue;
+            }
+            let spec = table.spec();
+            let rows: i64 = if spec.columns.first() == Some(&"procedure") {
+                tx.query_row(
+                    &format!(
+                        "SELECT count(*) FROM {} WHERE blob_id = ?1 AND procedure = ?2",
+                        spec.name
+                    ),
+                    rusqlite::params![blob_id, procedure],
+                    |row| row.get(0),
+                )?
+            } else if matches!(
+                table,
+                Table::Texts | Table::DeclarationSegments | Table::Locators
+            ) {
+                tx.query_row(
+                    &format!("SELECT count(*) FROM {} WHERE blob_id = ?1", spec.name),
+                    [blob_id],
+                    |row| row.get(0),
+                )?
+            } else {
+                continue;
+            };
+            eprintln!(
+                "NOTE semantic_ir procedure={procedure} table={} rows={rows}",
+                spec.name
+            );
+        }
+    }
+    let mut decoder = Decoder::new(blob_id, scope);
+    decoder.selected_procedure = Some(procedure);
+    decoder.read(tx)?;
+    let mut parts = decoder.finish();
+    assert_eq!(
+        parts.len(),
+        usize::try_from(count).expect("procedure count fits usize")
+    );
+    let mut selected = parts.remove(procedure as usize);
+    if procedure == 0 {
+        let builtins: Vec<String> = serde_json::from_str(&builtins).unwrap_or_else(|error| {
+            panic!("semantic_ir_publications blob {blob_id}: go_predeclared_builtins: {error}")
+        });
+        selected.go_predeclared_builtin_assumptions = builtins
+            .iter()
+            .map(|name| {
+                GoPredeclaredBuiltin::from_name(name).unwrap_or_else(|| {
+                    panic!("semantic IR blob {blob_id} stores unknown Go builtin {name:?}")
+                })
+            })
+            .collect();
+    }
+    Ok(Some(selected))
+}
+
 /// Decode one head's outcome columns.
 /// One procedure's partial flows, or `None` when the procedure has no head
 /// row. The locators and texts the ports name are rebuilt under `scope`.
@@ -487,8 +611,290 @@ fn partial_flow_head(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<
     ))
 }
 
+pub(super) fn read_footprint_coverage(
+    tx: &Connection,
+    key: &BlobKey,
+    content: ContentIdentity,
+    procedure: ProcedureId,
+) -> Result<StoredFootprintCoverage> {
+    use StoredFootprintCoverage::{Admitted, Refused};
+    use StoredFootprintRefusal as Reason;
+    use rusqlite::{OptionalExtension, params};
+
+    type FootprintHead = (i64, Option<i64>, Option<i64>, Option<i64>);
+    let head: Option<FootprintHead> = tx
+        .prepare_cached(
+            "SELECT p.blob_id, c.contract_version, c.boundary_disposition, c.boundary_reason
+             FROM blobs AS b
+             JOIN semantic_ir_publications AS p ON p.blob_id = b.id
+             JOIN semantic_ir_producer_epochs AS e ON e.lang = p.lang
+             LEFT JOIN semantic_ir_footprint_coverage AS c
+               ON c.blob_id = p.blob_id AND c.procedure = ?5
+             WHERE b.blob_oid = ?1 AND b.lang = ?2 AND b.parse_variant = ?3
+               AND p.publication_state = 'complete' AND p.producer_epoch = e.producer_epoch
+               AND p.outcome = 0 AND p.content_digest = ?4",
+        )?
+        .query_row(
+            params![
+                key.oid.to_string(),
+                key.lang,
+                key.variant,
+                content.as_bytes().as_slice(),
+                procedure.get()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((blob_id, Some(contract), Some(boundary), boundary_reason)) = head else {
+        return Ok(Refused(Reason::CoverageUnavailable));
+    };
+    if contract != i64::from(FOOTPRINT_COVERAGE_CONTRACT_VERSION) {
+        return Ok(Refused(Reason::OldContract));
+    }
+    if boundary != 1 || boundary_reason.is_some() {
+        return Ok(Refused(Reason::RefusedCoverage));
+    }
+
+    let class_rows = tx
+        .prepare_cached(
+            "SELECT class, disposition, reason
+             FROM semantic_ir_footprint_coverage_classes
+             WHERE blob_id = ?1 AND procedure = ?2 ORDER BY class",
+        )?
+        .query_map(params![blob_id, procedure.get()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = [false; 15];
+    let mut call_target_excluded = false;
+    for (class_code, disposition_code, reason_code) in class_rows {
+        let Some(class) = FootprintClass::from_code(class_code) else {
+            return Ok(Refused(Reason::UnknownCode));
+        };
+        let slot = (class.code() - 1) as usize;
+        if seen[slot] {
+            return Ok(Refused(Reason::DuplicateClass));
+        }
+        seen[slot] = true;
+        match FootprintDisposition::from_code(disposition_code, reason_code) {
+            Some(FootprintDisposition::Represented) => {}
+            Some(FootprintDisposition::Excluded(_)) => {
+                if class == FootprintClass::CallTarget {
+                    call_target_excluded = true;
+                }
+            }
+            Some(FootprintDisposition::Refused(_)) => return Ok(Refused(Reason::RefusedCoverage)),
+            None => return Ok(Refused(Reason::UnknownCode)),
+        }
+    }
+    if seen.iter().any(|present| !present) {
+        return Ok(Refused(Reason::MissingClass));
+    }
+
+    let obligations = tx
+        .prepare_cached(
+            "SELECT o.call_site, o.gap, o.impacts, g.impacts, g.subject, g.subject_a
+             FROM semantic_ir_footprint_call_target_obligations AS o
+             JOIN semantic_ir_gaps AS g ON g.blob_id = o.blob_id
+                AND g.procedure = o.procedure AND g.gap = o.gap
+             WHERE o.blob_id = ?1 AND o.procedure = ?2
+             ORDER BY o.call_site, o.gap",
+        )?
+        .query_map(params![blob_id, procedure.get()], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if call_target_excluded && !obligations.is_empty() {
+        return Ok(Refused(Reason::RefusedCoverage));
+    }
+    let mut call_target_obligations = Vec::with_capacity(obligations.len());
+    for (call, gap, bits, gap_bits, subject, subject_call) in obligations {
+        if bits != gap_bits || subject != 5 || subject_call != Some(call) {
+            return Ok(Refused(Reason::RefusedCoverage));
+        }
+        let mut impacts = SemanticGapImpacts::NONE;
+        for impact in SemanticGapImpact::ALL {
+            if bits & (1_i64 << (impact as u8)) != 0 {
+                impacts = impacts.with(impact);
+            }
+        }
+        call_target_obligations.push(CallTargetObligation {
+            call: CallSiteId::new(call),
+            gap: SemanticGapId::new(gap),
+            impacts,
+        });
+    }
+    Ok(Admitted {
+        call_target_obligations,
+    })
+}
+
+pub(super) fn read_call_control_coverage(
+    tx: &Connection,
+    key: &BlobKey,
+    content: ContentIdentity,
+    procedure: ProcedureId,
+) -> Result<StoredFootprintCoverage> {
+    use StoredFootprintCoverage::{Admitted, Refused};
+    use StoredFootprintRefusal as Reason;
+    use rusqlite::{OptionalExtension, params};
+    type ScopedHead = (
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let head: Option<ScopedHead> = tx
+        .prepare_cached(
+            "SELECT p.blob_id, c.contract_version, c.source_boundary, c.source_reason,
+                c.admission, c.admission_reason, c.obligation_count
+         FROM blobs AS b
+         JOIN semantic_ir_publications AS p ON p.blob_id = b.id
+         JOIN semantic_ir_producer_epochs AS e ON e.lang = p.lang
+         LEFT JOIN semantic_ir_call_control_coverage AS c
+           ON c.blob_id = p.blob_id AND c.procedure = ?5
+         WHERE b.blob_oid = ?1 AND b.lang = ?2 AND b.parse_variant = ?3
+           AND p.publication_state = 'complete' AND p.producer_epoch = e.producer_epoch
+           AND p.outcome = 0 AND p.content_digest = ?4",
+        )?
+        .query_row(
+            params![
+                key.oid.to_string(),
+                key.lang,
+                key.variant,
+                content.as_bytes().as_slice(),
+                procedure.get()
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        blob_id,
+        Some(contract),
+        Some(boundary),
+        boundary_reason,
+        Some(admission),
+        admission_reason,
+        Some(obligation_count),
+    )) = head
+    else {
+        return Ok(Refused(Reason::CoverageUnavailable));
+    };
+    if contract != 1 {
+        return Ok(Refused(Reason::OldContract));
+    }
+    if boundary != 1 || boundary_reason.is_some() || admission != 1 || admission_reason.is_some() {
+        return Ok(Refused(Reason::RefusedCoverage));
+    }
+    let classes = tx
+        .prepare_cached(
+            "SELECT class, disposition, reason FROM semantic_ir_call_control_classes
+         WHERE blob_id = ?1 AND procedure = ?2 ORDER BY class",
+        )?
+        .query_map(params![blob_id, procedure.get()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seen = [false; 8];
+    for (class, disposition, reason) in classes {
+        if !(1..=8).contains(&class) {
+            return Ok(Refused(Reason::UnknownCode));
+        }
+        let slot = (class - 1) as usize;
+        if seen[slot] {
+            return Ok(Refused(Reason::DuplicateClass));
+        }
+        seen[slot] = true;
+        match (disposition, reason) {
+            (1, None) | (2, Some(1..=3)) => {}
+            (3, Some(1..=5)) => return Ok(Refused(Reason::RefusedCoverage)),
+            _ => return Ok(Refused(Reason::UnknownCode)),
+        }
+    }
+    if seen.iter().any(|present| !present) {
+        return Ok(Refused(Reason::MissingClass));
+    }
+    let obligations = tx
+        .prepare_cached(
+            "SELECT o.call_site, o.gap, o.impacts, g.impacts, g.subject, g.subject_a, c.call_site
+         FROM semantic_ir_call_control_obligations AS o
+         LEFT JOIN semantic_ir_gaps AS g ON g.blob_id = o.blob_id
+           AND g.procedure = o.procedure AND g.gap = o.gap
+         LEFT JOIN semantic_ir_call_sites AS c ON c.blob_id = o.blob_id
+           AND c.procedure = o.procedure AND c.call_site = o.call_site
+         WHERE o.blob_id = ?1 AND o.procedure = ?2 ORDER BY o.call_site, o.gap",
+        )?
+        .query_map(params![blob_id, procedure.get()], |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut call_target_obligations = Vec::with_capacity(obligations.len());
+    for (call, gap, bits, gap_bits, subject, subject_call, stored_call) in obligations {
+        if Some(bits) != gap_bits
+            || subject != Some(5)
+            || subject_call != Some(call)
+            || stored_call != Some(call)
+        {
+            return Ok(Refused(Reason::RefusedCoverage));
+        }
+        let mut impacts = SemanticGapImpacts::NONE;
+        for impact in SemanticGapImpact::ALL {
+            if bits & (1_i64 << (impact as u8)) != 0 {
+                impacts = impacts.with(impact);
+            }
+        }
+        call_target_obligations.push(CallTargetObligation {
+            call: CallSiteId::new(call),
+            gap: SemanticGapId::new(gap),
+            impacts,
+        });
+    }
+    if call_target_obligations.len() as i64 != obligation_count {
+        return Ok(Refused(Reason::RefusedCoverage));
+    }
+    Ok(Admitted {
+        call_target_obligations,
+    })
+}
+
 pub(super) fn read_partial_flows(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     scope: &SemanticIrMountScope,
     procedure: u32,
@@ -515,7 +921,7 @@ pub(super) fn read_partial_flows(
 /// Every procedure's partial flows in procedure order. The blob's identities
 /// are decoded once, not once per procedure as [`read_partial_flows`] must.
 pub(super) fn read_blob_partial_flows(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     blob_id: i64,
     scope: &SemanticIrMountScope,
 ) -> Result<Vec<(u32, ProcedurePartialFlows)>> {
@@ -543,7 +949,7 @@ pub(super) fn read_blob_partial_flows(
 }
 
 fn decode_partial_flows(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     decoder: &Decoder<'_>,
     procedure: u32,
     head: PartialFlowHead,
@@ -711,15 +1117,15 @@ fn decode_partial_flows(
     let gaps: Vec<u32> = serde_json::from_str(&gaps).unwrap_or_else(|error| {
         panic!("semantic IR partial-flow head of blob {blob_id}: discharged_gaps: {error}")
     });
-    Ok(ProcedurePartialFlows {
+    Ok(ProcedurePartialFlows::new(
         outcome,
         detail,
         ports,
         flows,
         open,
         relations_complete,
-        discharged_gaps: gaps.into_iter().map(SemanticGapId::new).collect(),
-    })
+        gaps.into_iter().map(SemanticGapId::new).collect(),
+    ))
 }
 
 fn required_u32(cells: &Cells<'_, '_>, value: Option<i64>, name: &str) -> u32 {
@@ -932,14 +1338,14 @@ impl Decoder<'_> {
         }
     }
 
-    fn read(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read(&mut self, tx: &Connection) -> Result<()> {
         self.read_identities(tx)?;
         self.read_procedures(tx)
     }
 
     /// The texts, declarations and locators the rows name. A partial-flow
     /// read needs only these, so they are a unit of their own.
-    fn read_identities(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_identities(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
         each_row(tx, blob_id, Table::Texts, |cells| {
             let id = cells.key();
@@ -1014,8 +1420,9 @@ impl Decoder<'_> {
         Ok(())
     }
 
-    fn read_procedures(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_procedures(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
+        let selected_procedure = self.selected_procedure;
         each_row(tx, blob_id, Table::Procedures, |cells| {
             let id = cells.key_u32();
             dense(cells, id as usize, self.parts.len());
@@ -1040,62 +1447,177 @@ impl Decoder<'_> {
                 ProcedureSemanticsParts::new(ProcedureId::new(id), locator, kind, source, evidence);
             parts.lexical_parent = lexical_parent;
             parts.properties = properties;
+            parts.declared_result_classes = cells.flag().then(|| Box::new([]) as Box<[_]>);
             self.parts.push(parts);
             self.groups.push(Vec::new());
             self.arguments.push(Vec::new());
             self.events.push(Vec::new());
         })?;
-        each_row(tx, blob_id, Table::CallableTargets, |cells| {
-            let procedure = cells.key_u32();
-            let group = cells.key() as usize;
-            let ordinal = cells.key() as usize;
-            self.procedure(cells, procedure);
-            let kind: CallableTargetTag = cells.code();
-            let local = cells.opt_id::<ProcedureId>();
-            let locator = cells.opt();
-            let artifact = cells.opt_text();
-            let target = match kind {
-                CallableTargetTag::Local => {
-                    CallableTarget::Local(cells.need(local, "local_procedure"))
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::CallableTargets,
+            |cells| {
+                let procedure = cells.key_u32();
+                let group = cells.key() as usize;
+                let ordinal = cells.key() as usize;
+                self.procedure(cells, procedure);
+                let kind: CallableTargetTag = cells.code();
+                let local = cells.opt_id::<ProcedureId>();
+                let locator = cells.opt();
+                let artifact = cells.opt_text();
+                let target = match kind {
+                    CallableTargetTag::Local => {
+                        CallableTarget::Local(cells.need(local, "local_procedure"))
+                    }
+                    CallableTargetTag::Unmaterialized => CallableTarget::Unmaterialized(
+                        self.locator(cells, cells.need(locator, "locator")),
+                    ),
+                    CallableTargetTag::External => CallableTarget::External(
+                        self.locator(cells, cells.need(locator, "locator")),
+                    ),
+                    CallableTargetTag::Artifact => {
+                        let json = cells.need(artifact, "artifact_identity");
+                        CallableTarget::Artifact(ArtifactCallableTarget::from_bound_identity(
+                            serde_json::from_str(&json).unwrap_or_else(|error| {
+                                cells.fail_at("artifact_identity", &error.to_string())
+                            }),
+                        ))
+                    }
+                };
+                let groups = &mut self.groups[procedure as usize];
+                if ordinal == 0 {
+                    dense(cells, group, groups.len());
+                    groups.push(Vec::new());
+                } else if group + 1 != groups.len() {
+                    cells.fail_at("targets", "continues a group that is not the current one");
                 }
-                CallableTargetTag::Unmaterialized => CallableTarget::Unmaterialized(
-                    self.locator(cells, cells.need(locator, "locator")),
-                ),
-                CallableTargetTag::External => {
-                    CallableTarget::External(self.locator(cells, cells.need(locator, "locator")))
-                }
-                CallableTargetTag::Artifact => {
-                    let json = cells.need(artifact, "artifact_identity");
-                    CallableTarget::Artifact(ArtifactCallableTarget::from_bound_identity(
-                        serde_json::from_str(&json).unwrap_or_else(|error| {
-                            cells.fail_at("artifact_identity", &error.to_string())
-                        }),
-                    ))
-                }
-            };
-            let groups = &mut self.groups[procedure as usize];
-            if ordinal == 0 {
-                dense(cells, group, groups.len());
-                groups.push(Vec::new());
-            } else if group + 1 != groups.len() {
-                cells.fail_at("targets", "continues a group that is not the current one");
-            }
-            let candidates = groups.last_mut().expect("group started");
-            dense(cells, ordinal, candidates.len());
-            candidates.push(target);
-        })?;
+                let candidates = groups.last_mut().expect("group started");
+                dense(cells, ordinal, candidates.len());
+                candidates.push(target);
+            },
+        )?;
         self.read_values_and_memory(tx)?;
         self.read_calls(tx)?;
         self.read_mappings_and_evidence(tx)?;
         self.read_points(tx)?;
         self.read_edges_and_decisions(tx)?;
         self.read_lifecycle_and_pointers(tx)?;
+        self.read_guarded_pattern_projections(tx)?;
         Ok(())
     }
 
-    fn read_values_and_memory(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_guarded_pattern_projections(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
-        each_row(tx, blob_id, Table::Values, |cells| {
+        let selected_procedure = self.selected_procedure;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::GuardedPatternProjections,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key_u32();
+                let expected = self
+                    .procedure(cells, procedure)
+                    .guarded_pattern_projections
+                    .len();
+                dense(cells, ordinal as usize, expected);
+                let point = cells.id();
+                let whole_value = cells.id();
+                let binder = cells.id();
+                let pattern_source = cells.id();
+                let binder_source = cells.id();
+                let declared_path_len = cells.u32();
+                if !(1..=16).contains(&declared_path_len) {
+                    cells.fail_at("path_len", "is outside the bounded candidate path");
+                }
+                if cells.int() != 0 {
+                    cells.fail_at("status", "is not unevaluated");
+                }
+                self.parts[procedure as usize]
+                    .guarded_pattern_projections
+                    .push(GuardedPatternProjection {
+                        ordinal,
+                        point,
+                        whole_value,
+                        binder,
+                        pattern_source,
+                        binder_source,
+                        declared_path_len: declared_path_len as u8,
+                        path: Box::default(),
+                        status: PatternProjectionStatus::Unevaluated,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::GuardedPatternSteps,
+            |cells| {
+                let procedure = cells.key_u32();
+                let candidate_index = cells.key_u32();
+                let step_index = cells.key_u32();
+                let kind = cells.int();
+                let tuple_ordinal = cells.opt_u32();
+                let named_text = cells.opt();
+                let step = match (kind, tuple_ordinal, named_text) {
+                    (0, Some(ordinal), None) => PatternProjectionStep::Tuple(ordinal),
+                    (1, None, Some(text)) => {
+                        PatternProjectionStep::Named(self.boxed_text(cells, text))
+                    }
+                    _ => cells.fail_row("has inconsistent pattern step columns"),
+                };
+                let candidates = &mut self.procedure(cells, procedure).guarded_pattern_projections;
+                let candidate = candidates
+                    .get_mut(candidate_index as usize)
+                    .unwrap_or_else(|| cells.fail_row("names a missing guarded candidate"));
+                dense(cells, step_index as usize, candidate.path.len());
+                let mut path = std::mem::take(&mut candidate.path).into_vec();
+                path.push(step);
+                candidate.path = path.into_boxed_slice();
+            },
+        )?;
+        for procedure in &self.parts {
+            for candidate in &procedure.guarded_pattern_projections {
+                assert_eq!(
+                    candidate.path.len(),
+                    candidate.declared_path_len as usize,
+                    "semantic_ir_guarded_pattern_steps blob {blob_id} procedure {} candidate {} is incomplete",
+                    procedure.id,
+                    candidate.ordinal
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn read_values_and_memory(&mut self, tx: &Connection) -> Result<()> {
+        let blob_id = self.blob_id;
+        let selected_procedure = self.selected_procedure;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::ResultTypeClasses,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key_u32();
+                let class = static_type_class(cells);
+                let parts = self.procedure(cells, procedure);
+                let classes = parts
+                    .declared_result_classes
+                    .as_mut()
+                    .unwrap_or_else(|| cells.fail_at("class", "signature unavailable"));
+                dense(cells, ordinal as usize, classes.len());
+                let mut results = classes.to_vec();
+                results.push(class);
+                *classes = results.into_boxed_slice();
+            },
+        )?;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Values, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).values.len();
@@ -1113,6 +1635,16 @@ impl Decoder<'_> {
             let text = cells.opt();
             let source = cells.id();
             let evidence = cells.id();
+            let static_type_class = static_type_class(cells);
+            let origin_call = cells.opt_id();
+            let origin_ordinal = cells.opt_u32();
+            let static_type_origin = match (origin_call, origin_ordinal) {
+                (None, None) => None,
+                (Some(call), Some(ordinal)) => {
+                    Some(crate::analyzer::semantic::StaticTypeOrigin::CallResult { call, ordinal })
+                }
+                _ => cells.fail_at("static_origin_call", "incomplete static origin"),
+            };
             let kind = match tag {
                 ValueKindTag::Local => SemanticValueKind::Local,
                 ValueKindTag::Parameter => SemanticValueKind::Parameter {
@@ -1134,6 +1666,13 @@ impl Decoder<'_> {
                 },
                 ValueKindTag::Receiver => SemanticValueKind::Receiver {
                     dispatch: cells.need(value_flag, "flag"),
+                    mode: match cells.need(ordinal, "receiver mode") {
+                        0 => crate::analyzer::semantic::ReceiverMode::Unknown,
+                        1 => crate::analyzer::semantic::ReceiverMode::SharedBorrow,
+                        2 => crate::analyzer::semantic::ReceiverMode::MutableBorrow,
+                        3 => crate::analyzer::semantic::ReceiverMode::Owned,
+                        _ => cells.fail_at("ordinal", "invalid receiver mode"),
+                    },
                 },
                 ValueKindTag::Return => SemanticValueKind::Return,
                 ValueKindTag::Temporary => SemanticValueKind::Temporary,
@@ -1167,113 +1706,127 @@ impl Decoder<'_> {
                 ),
             };
             self.parts[procedure as usize].values.push(SemanticValue {
+                static_type_origin,
+                static_type_class,
                 id: ValueId::new(id),
                 kind,
                 source,
                 evidence,
             });
         })?;
-        each_row(tx, blob_id, Table::Allocations, |cells| {
-            let procedure = cells.key_u32();
-            let id = cells.key_u32();
-            let expected = self.procedure(cells, procedure).allocations.len();
-            dense(cells, id as usize, expected);
-            let point = cells.id();
-            let result = cells.id();
-            let tag: AllocationKindTag = cells.code();
-            let kind_text = cells.opt();
-            let source = cells.id();
-            let evidence = cells.id();
-            let kind = match tag {
-                AllocationKindTag::Object => AllocationKind::Object,
-                AllocationKindTag::Array => AllocationKind::Array,
-                AllocationKindTag::Slice => AllocationKind::Slice,
-                AllocationKindTag::Callable => AllocationKind::Callable,
-                AllocationKindTag::ClosureEnvironment => AllocationKind::ClosureEnvironment,
-                AllocationKindTag::SharedCell => AllocationKind::SharedCell,
-                AllocationKindTag::LanguageDefined => AllocationKind::LanguageDefined(
-                    self.boxed_text(cells, cells.need(kind_text, "kind_text")),
-                ),
-            };
-            self.parts[procedure as usize]
-                .allocations
-                .push(AllocationSite {
-                    id: AllocationId::new(id),
-                    point,
-                    result,
-                    kind,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::MemoryLocations, |cells| {
-            let procedure = cells.key_u32();
-            let id = cells.key_u32();
-            let expected = self.procedure(cells, procedure).memory_locations.len();
-            dense(cells, id as usize, expected);
-            let tag: MemoryLocationKindTag = cells.code();
-            let base = cells.opt_id::<ValueId>();
-            let member = cells.opt();
-            let property_key = cells.opt();
-            let index_value = cells.opt_id();
-            let constant_index = cells.opt_u128();
-            let index_identity = cells.opt_code();
-            let lexical_parent = cells.opt_id();
-            let binding = cells.opt_id();
-            let copy_tag: MemoryValueCopyTag = cells.code();
-            let copy_identity = cells.opt_code();
-            let source = cells.id();
-            let evidence = cells.id();
-            let kind = match tag {
-                MemoryLocationKindTag::Field => MemoryLocationKind::Field {
-                    base: cells.need(base, "base"),
-                    member: self.locator(cells, cells.need(member, "member")),
-                },
-                MemoryLocationKindTag::Property => MemoryLocationKind::Property {
-                    base: cells.need(base, "base"),
-                    key: self
-                        .text(cells, cells.need(property_key, "property_key"))
-                        .to_owned(),
-                },
-                MemoryLocationKindTag::Static => MemoryLocationKind::Static {
-                    member: self.locator(cells, cells.need(member, "member")),
-                },
-                MemoryLocationKindTag::Index => MemoryLocationKind::Index {
-                    base: cells.need(base, "base"),
-                    index: index_value,
-                    constant_index,
-                    identity: cells.need(index_identity, "index_identity"),
-                },
-                MemoryLocationKindTag::Dereference => MemoryLocationKind::Dereference {
-                    address: cells.need(base, "base"),
-                },
-                MemoryLocationKindTag::LexicalCell => MemoryLocationKind::LexicalCell {
-                    binding: cells.need(binding, "binding"),
-                },
-                MemoryLocationKindTag::Capture => MemoryLocationKind::Capture {
-                    lexical_parent: cells.need(lexical_parent, "lexical_parent"),
-                    binding,
-                },
-            };
-            let value_copy = match copy_tag {
-                MemoryValueCopyTag::Unknown => MemoryValueCopy::Unknown,
-                MemoryValueCopyTag::Value => MemoryValueCopy::Value,
-                MemoryValueCopyTag::Reference => MemoryValueCopy::Reference,
-                MemoryValueCopyTag::BackingStore => MemoryValueCopy::BackingStore {
-                    identity: cells.need(copy_identity, "value_copy_identity"),
-                },
-            };
-            self.parts[procedure as usize]
-                .memory_locations
-                .push(MemoryLocation {
-                    id: MemoryLocationId::new(id),
-                    kind,
-                    value_copy,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::Captures, |cells| {
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::Allocations,
+            |cells| {
+                let procedure = cells.key_u32();
+                let id = cells.key_u32();
+                let expected = self.procedure(cells, procedure).allocations.len();
+                dense(cells, id as usize, expected);
+                let point = cells.id();
+                let result = cells.id();
+                let tag: AllocationKindTag = cells.code();
+                let kind_text = cells.opt();
+                let source = cells.id();
+                let evidence = cells.id();
+                let kind = match tag {
+                    AllocationKindTag::Object => AllocationKind::Object,
+                    AllocationKindTag::Array => AllocationKind::Array,
+                    AllocationKindTag::Slice => AllocationKind::Slice,
+                    AllocationKindTag::Callable => AllocationKind::Callable,
+                    AllocationKindTag::ClosureEnvironment => AllocationKind::ClosureEnvironment,
+                    AllocationKindTag::SharedCell => AllocationKind::SharedCell,
+                    AllocationKindTag::LanguageDefined => AllocationKind::LanguageDefined(
+                        self.boxed_text(cells, cells.need(kind_text, "kind_text")),
+                    ),
+                };
+                self.parts[procedure as usize]
+                    .allocations
+                    .push(AllocationSite {
+                        id: AllocationId::new(id),
+                        point,
+                        result,
+                        kind,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::MemoryLocations,
+            |cells| {
+                let procedure = cells.key_u32();
+                let id = cells.key_u32();
+                let expected = self.procedure(cells, procedure).memory_locations.len();
+                dense(cells, id as usize, expected);
+                let tag: MemoryLocationKindTag = cells.code();
+                let base = cells.opt_id::<ValueId>();
+                let member = cells.opt();
+                let property_key = cells.opt();
+                let index_value = cells.opt_id();
+                let constant_index = cells.opt_u128();
+                let index_identity = cells.opt_code();
+                let lexical_parent = cells.opt_id();
+                let binding = cells.opt_id();
+                let copy_tag: MemoryValueCopyTag = cells.code();
+                let copy_identity = cells.opt_code();
+                let source = cells.id();
+                let evidence = cells.id();
+                let kind = match tag {
+                    MemoryLocationKindTag::Field => MemoryLocationKind::Field {
+                        base: cells.need(base, "base"),
+                        member: self.locator(cells, cells.need(member, "member")),
+                    },
+                    MemoryLocationKindTag::Property => MemoryLocationKind::Property {
+                        base: cells.need(base, "base"),
+                        key: self
+                            .text(cells, cells.need(property_key, "property_key"))
+                            .to_owned(),
+                    },
+                    MemoryLocationKindTag::Static => MemoryLocationKind::Static {
+                        member: self.locator(cells, cells.need(member, "member")),
+                    },
+                    MemoryLocationKindTag::Index => MemoryLocationKind::Index {
+                        base: cells.need(base, "base"),
+                        index: index_value,
+                        constant_index,
+                        identity: cells.need(index_identity, "index_identity"),
+                    },
+                    MemoryLocationKindTag::Dereference => MemoryLocationKind::Dereference {
+                        address: cells.need(base, "base"),
+                    },
+                    MemoryLocationKindTag::LexicalCell => MemoryLocationKind::LexicalCell {
+                        binding: cells.need(binding, "binding"),
+                    },
+                    MemoryLocationKindTag::Capture => MemoryLocationKind::Capture {
+                        lexical_parent: cells.need(lexical_parent, "lexical_parent"),
+                        binding,
+                    },
+                };
+                let value_copy = match copy_tag {
+                    MemoryValueCopyTag::Unknown => MemoryValueCopy::Unknown,
+                    MemoryValueCopyTag::Value => MemoryValueCopy::Value,
+                    MemoryValueCopyTag::Reference => MemoryValueCopy::Reference,
+                    MemoryValueCopyTag::BackingStore => MemoryValueCopy::BackingStore {
+                        identity: cells.need(copy_identity, "value_copy_identity"),
+                    },
+                };
+                self.parts[procedure as usize]
+                    .memory_locations
+                    .push(MemoryLocation {
+                        id: MemoryLocationId::new(id),
+                        kind,
+                        value_copy,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Captures, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).captures.len();
@@ -1324,9 +1877,10 @@ impl Decoder<'_> {
         Ok(())
     }
 
-    fn read_calls(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_calls(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
-        each_row(tx, blob_id, Table::CallSites, |cells| {
+        let selected_procedure = self.selected_procedure;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::CallSites, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).call_sites.len();
@@ -1395,79 +1949,99 @@ impl Decoder<'_> {
                 });
             self.arguments[procedure as usize].push(Vec::new());
         })?;
-        each_row(tx, blob_id, Table::CallArguments, |cells| {
-            let procedure = cells.key_u32();
-            let call_site = cells.key() as usize;
-            let ordinal = cells.key() as usize;
-            self.procedure(cells, procedure);
-            let value = cells.id();
-            let expansion: ExpansionTag = cells.code();
-            let domain = cells.opt_code();
-            let domain_text = cells.opt();
-            let keyword = cells.opt();
-            let expansion = match expansion {
-                ExpansionTag::Unclassified => CallArgumentExpansion::Unclassified,
-                ExpansionTag::Direct => CallArgumentExpansion::Direct(self.argument_domain(
-                    cells,
-                    cells.need(domain, "domain"),
-                    domain_text,
-                    "domain_text",
-                )),
-                ExpansionTag::Spread => CallArgumentExpansion::Spread(self.argument_domain(
-                    cells,
-                    cells.need(domain, "domain"),
-                    domain_text,
-                    "domain_text",
-                )),
-            };
-            let keyword = keyword.map(|keyword| self.boxed_text(cells, keyword));
-            let arguments = self.arguments[procedure as usize]
-                .get_mut(call_site)
-                .unwrap_or_else(|| cells.fail_at("call_site", "names a missing call site"));
-            dense(cells, ordinal, arguments.len());
-            arguments.push(SemanticCallArgument {
-                value,
-                expansion,
-                keyword,
-            });
-        })?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::CallArguments,
+            |cells| {
+                let procedure = cells.key_u32();
+                let call_site = cells.key() as usize;
+                let ordinal = cells.key() as usize;
+                self.procedure(cells, procedure);
+                let value = cells.id();
+                let expansion: ExpansionTag = cells.code();
+                let domain = cells.opt_code();
+                let domain_text = cells.opt();
+                let keyword = cells.opt();
+                let expansion = match expansion {
+                    ExpansionTag::Unclassified => CallArgumentExpansion::Unclassified,
+                    ExpansionTag::Direct => CallArgumentExpansion::Direct(self.argument_domain(
+                        cells,
+                        cells.need(domain, "domain"),
+                        domain_text,
+                        "domain_text",
+                    )),
+                    ExpansionTag::Spread => CallArgumentExpansion::Spread(self.argument_domain(
+                        cells,
+                        cells.need(domain, "domain"),
+                        domain_text,
+                        "domain_text",
+                    )),
+                };
+                let keyword = keyword.map(|keyword| self.boxed_text(cells, keyword));
+                let arguments = self.arguments[procedure as usize]
+                    .get_mut(call_site)
+                    .unwrap_or_else(|| cells.fail_at("call_site", "names a missing call site"));
+                dense(cells, ordinal, arguments.len());
+                arguments.push(SemanticCallArgument {
+                    value,
+                    expansion,
+                    keyword,
+                });
+            },
+        )?;
         Ok(())
     }
 
-    fn read_mappings_and_evidence(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_mappings_and_evidence(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
+        let selected_procedure = self.selected_procedure;
         let content = self.scope.content;
-        each_row(tx, blob_id, Table::SourceMappings, |cells| {
-            let procedure = cells.key_u32();
-            let id = cells.key_u32();
-            let expected = self.procedure(cells, procedure).source_mappings.len();
-            dense(cells, id as usize, expected);
-            let locator = cells.int();
-            let locator = self.locator(cells, locator);
-            let kind = cells.code();
-            let ast_node = cells.opt_u32();
-            self.parts[procedure as usize]
-                .source_mappings
-                .push(SourceMapping {
-                    id: SourceMappingId::new(id),
-                    locator,
-                    kind,
-                    ast_identity: ast_node.map(|node| StructuralNodeIdentity::new(content, node)),
-                });
-        })?;
-        each_row(tx, blob_id, Table::StatementEntries, |cells| {
-            let procedure = cells.key_u32();
-            let ordinal = cells.key() as usize;
-            let expected = self.procedure(cells, procedure).statement_entries.len();
-            dense(cells, ordinal, expected);
-            let entry = StatementEntrySite {
-                source: cells.id(),
-                evidence: cells.id(),
-                point: cells.id(),
-            };
-            self.parts[procedure as usize].statement_entries.push(entry);
-        })?;
-        each_row(tx, blob_id, Table::LoopSites, |cells| {
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::SourceMappings,
+            |cells| {
+                let procedure = cells.key_u32();
+                let id = cells.key_u32();
+                let expected = self.procedure(cells, procedure).source_mappings.len();
+                dense(cells, id as usize, expected);
+                let locator = cells.int();
+                let locator = self.locator(cells, locator);
+                let kind = cells.code();
+                let ast_node = cells.opt_u32();
+                self.parts[procedure as usize]
+                    .source_mappings
+                    .push(SourceMapping {
+                        id: SourceMappingId::new(id),
+                        locator,
+                        kind,
+                        ast_identity: ast_node
+                            .map(|node| StructuralNodeIdentity::new(content, node)),
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::StatementEntries,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key() as usize;
+                let expected = self.procedure(cells, procedure).statement_entries.len();
+                dense(cells, ordinal, expected);
+                let entry = StatementEntrySite {
+                    source: cells.id(),
+                    evidence: cells.id(),
+                    point: cells.id(),
+                };
+                self.parts[procedure as usize].statement_entries.push(entry);
+            },
+        )?;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::LoopSites, |cells| {
             let procedure = cells.key_u32();
             let ordinal = cells.key() as usize;
             let expected = self.procedure(cells, procedure).loop_sites.len();
@@ -1480,7 +2054,7 @@ impl Decoder<'_> {
             };
             self.parts[procedure as usize].loop_sites.push(site);
         })?;
-        each_row(tx, blob_id, Table::Evidence, |cells| {
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Evidence, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).evidence_rows.len();
@@ -1510,7 +2084,7 @@ impl Decoder<'_> {
                 sources: sources.into(),
             });
         })?;
-        each_row(tx, blob_id, Table::Gaps, |cells| {
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Gaps, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).gaps.len();
@@ -1593,9 +2167,10 @@ impl Decoder<'_> {
         Ok(())
     }
 
-    fn read_points(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_points(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
-        each_row(tx, blob_id, Table::Blocks, |cells| {
+        let selected_procedure = self.selected_procedure;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Blocks, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).blocks.len();
@@ -1610,7 +2185,7 @@ impl Decoder<'_> {
                 evidence,
             });
         })?;
-        each_row(tx, blob_id, Table::Points, |cells| {
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Points, |cells| {
             let procedure = cells.key_u32();
             let id = cells.key_u32();
             let expected = self.procedure(cells, procedure).points.len();
@@ -1627,112 +2202,142 @@ impl Decoder<'_> {
             });
             self.events[procedure as usize].push(Vec::new());
         })?;
-        each_row(tx, blob_id, Table::EventTransfers, |cells| {
-            let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
-            let kind: TransferKindTag = cells.code();
-            let detail = cells.opt();
-            let operation: TransferOperationTag = cells.code();
-            let call_site = cells.opt_id();
-            let digest = cells.opt_digest();
-            let detail = |cells: &Cells<'_, '_>| cells.need(detail, "transfer_detail");
-            let kind = match kind {
-                TransferKindTag::Copy => TransferKind::Copy,
-                TransferKindTag::AggregateCopy => TransferKind::AggregateCopy,
-                TransferKindTag::Move => TransferKind::Move {
-                    invalidation: RowCode::try_from_code(detail(cells)).unwrap_or_else(|| {
-                        cells.fail_at("transfer_detail", "is not a move invalidation")
-                    }),
-                },
-                TransferKindTag::Conversion => TransferKind::Conversion {
-                    preservation: RowCode::try_from_code(detail(cells)).unwrap_or_else(|| {
-                        cells.fail_at("transfer_detail", "is not a value preservation")
-                    }),
-                },
-                TransferKindTag::Boxing => TransferKind::Boxing,
-                TransferKindTag::Unboxing => TransferKind::Unboxing,
-            };
-            let operation = match operation {
-                TransferOperationTag::None => TransferOperation::None,
-                TransferOperationTag::CallSite => {
-                    TransferOperation::CallSite(cells.need(call_site, "call_site"))
-                }
-                TransferOperationTag::CallArgumentConversion => {
-                    TransferOperation::CallArgumentConversion(cells.need(digest, "digest"))
-                }
-                TransferOperationTag::ValueCarrierAdaptation => {
-                    TransferOperation::ValueCarrierAdaptation(cells.need(digest, "digest"))
-                }
-                TransferOperationTag::Unknown => TransferOperation::Unknown,
-            };
-            self.transfers
-                .insert(key, ValueTransfer { kind, operation });
-        })?;
-        each_row(tx, blob_id, Table::EventOffsets, |cells| {
-            let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
-            let row = OffsetRow {
-                kind: cells.opt_code(),
-                magnitude: cells.opt_u128(),
-                value: cells.opt_id(),
-                negative: cells.opt_flag(),
-                allocation: cells.opt_id(),
-                return_ordinal: cells.opt_u32(),
-            };
-            self.offsets.insert(key, row);
-        })?;
-        each_row(tx, blob_id, Table::EventCallables, |cells| {
-            let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
-            self.procedure(cells, key.0);
-            let tag = cells.code();
-            let group = cells.opt();
-            let evidence = cells.id();
-            let candidates = self.group(cells, key.0, group);
-            self.callables
-                .insert(key, (resolution(cells, tag, candidates), evidence));
-        })?;
-        each_row(tx, blob_id, Table::EventSynchronizations, |cells| {
-            let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
-            let kind: SynchronizationPayloadTag = cells.code();
-            let value = cells.id();
-            let copy_kind: Option<SynchronizationPayloadCopyTag> = cells.opt_code();
-            let copy_identity = cells.opt_code();
-            let payload = match kind {
-                SynchronizationPayloadTag::Send => SynchronizationPayload::Send {
-                    value,
-                    copy: match cells.need(copy_kind, "copy_kind") {
-                        SynchronizationPayloadCopyTag::Unknown => {
-                            SynchronizationPayloadCopy::Unknown
-                        }
-                        SynchronizationPayloadCopyTag::Reference => {
-                            SynchronizationPayloadCopy::Reference
-                        }
-                        SynchronizationPayloadCopyTag::BackingStore => {
-                            SynchronizationPayloadCopy::BackingStore {
-                                identity: cells.need(copy_identity, "copy_identity"),
-                            }
-                        }
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::EventTransfers,
+            |cells| {
+                let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
+                let kind: TransferKindTag = cells.code();
+                let detail = cells.opt();
+                let operation: TransferOperationTag = cells.code();
+                let call_site = cells.opt_id();
+                let digest = cells.opt_digest();
+                let detail = |cells: &Cells<'_, '_>| cells.need(detail, "transfer_detail");
+                let kind = match kind {
+                    TransferKindTag::Copy => TransferKind::Copy,
+                    TransferKindTag::AggregateCopy => TransferKind::AggregateCopy,
+                    TransferKindTag::Move => TransferKind::Move {
+                        invalidation: RowCode::try_from_code(detail(cells)).unwrap_or_else(|| {
+                            cells.fail_at("transfer_detail", "is not a move invalidation")
+                        }),
                     },
-                },
-                SynchronizationPayloadTag::Receive => {
-                    SynchronizationPayload::Receive { result: value }
-                }
-            };
-            self.synchronizations.insert(key, payload);
-        })?;
-        each_row(tx, blob_id, Table::EventAsyncSuspends, |cells| {
-            let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
-            let normal = cells.code();
-            let normal_target = cells.opt_id();
-            let exceptional = cells.code();
-            let exceptional_target = cells.opt_id();
-            self.suspends.insert(
-                key,
-                (
-                    continuation(cells, normal, normal_target, "normal_target"),
-                    continuation(cells, exceptional, exceptional_target, "exceptional_target"),
-                ),
-            );
-        })?;
-        each_row(tx, blob_id, Table::Events, |cells| {
+                    TransferKindTag::Conversion => TransferKind::Conversion {
+                        preservation: RowCode::try_from_code(detail(cells)).unwrap_or_else(|| {
+                            cells.fail_at("transfer_detail", "is not a value preservation")
+                        }),
+                    },
+                    TransferKindTag::Boxing => TransferKind::Boxing,
+                    TransferKindTag::Unboxing => TransferKind::Unboxing,
+                };
+                let operation = match operation {
+                    TransferOperationTag::None => TransferOperation::None,
+                    TransferOperationTag::CallSite => {
+                        TransferOperation::CallSite(cells.need(call_site, "call_site"))
+                    }
+                    TransferOperationTag::CallArgumentConversion => {
+                        TransferOperation::CallArgumentConversion(cells.need(digest, "digest"))
+                    }
+                    TransferOperationTag::ValueCarrierAdaptation => {
+                        TransferOperation::ValueCarrierAdaptation(cells.need(digest, "digest"))
+                    }
+                    TransferOperationTag::Unknown => TransferOperation::Unknown,
+                };
+                self.transfers
+                    .insert(key, ValueTransfer { kind, operation });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::EventOffsets,
+            |cells| {
+                let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
+                let row = OffsetRow {
+                    kind: cells.opt_code(),
+                    magnitude: cells.opt_u128(),
+                    value: cells.opt_id(),
+                    negative: cells.opt_flag(),
+                    allocation: cells.opt_id(),
+                    return_ordinal: cells.opt_u32(),
+                };
+                self.offsets.insert(key, row);
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::EventCallables,
+            |cells| {
+                let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
+                self.procedure(cells, key.0);
+                let tag = cells.code();
+                let group = cells.opt();
+                let evidence = cells.id();
+                let candidates = self.group(cells, key.0, group);
+                self.callables
+                    .insert(key, (resolution(cells, tag, candidates), evidence));
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::EventSynchronizations,
+            |cells| {
+                let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
+                let kind: SynchronizationPayloadTag = cells.code();
+                let value = cells.id();
+                let copy_kind: Option<SynchronizationPayloadCopyTag> = cells.opt_code();
+                let copy_identity = cells.opt_code();
+                let payload = match kind {
+                    SynchronizationPayloadTag::Send => SynchronizationPayload::Send {
+                        value,
+                        copy: match cells.need(copy_kind, "copy_kind") {
+                            SynchronizationPayloadCopyTag::Unknown => {
+                                SynchronizationPayloadCopy::Unknown
+                            }
+                            SynchronizationPayloadCopyTag::Reference => {
+                                SynchronizationPayloadCopy::Reference
+                            }
+                            SynchronizationPayloadCopyTag::BackingStore => {
+                                SynchronizationPayloadCopy::BackingStore {
+                                    identity: cells.need(copy_identity, "copy_identity"),
+                                }
+                            }
+                        },
+                    },
+                    SynchronizationPayloadTag::Receive => {
+                        SynchronizationPayload::Receive { result: value }
+                    }
+                };
+                self.synchronizations.insert(key, payload);
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::EventAsyncSuspends,
+            |cells| {
+                let key = (cells.key_u32(), cells.key_u32(), cells.key_u32());
+                let normal = cells.code();
+                let normal_target = cells.opt_id();
+                let exceptional = cells.code();
+                let exceptional_target = cells.opt_id();
+                self.suspends.insert(
+                    key,
+                    (
+                        continuation(cells, normal, normal_target, "normal_target"),
+                        continuation(cells, exceptional, exceptional_target, "exceptional_target"),
+                    ),
+                );
+            },
+        )?;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Events, |cells| {
             let procedure = cells.key_u32();
             let point = cells.key_u32();
             let ordinal = cells.key_u32();
@@ -1925,6 +2530,7 @@ impl Decoder<'_> {
         };
         match tag {
             ValueFlowKindTag::Local => ValueFlowKind::Local,
+            ValueFlowKindTag::OwnershipUnknown => ValueFlowKind::OwnershipUnknown,
             ValueFlowKindTag::Transfer => ValueFlowKind::Transfer(
                 self.transfers
                     .remove(&key)
@@ -1964,178 +2570,205 @@ impl Decoder<'_> {
             ValueFlowKindTag::ReferenceBoxing => ValueFlowKind::ReferenceBoxing,
             ValueFlowKindTag::ReferenceUnboxing => ValueFlowKind::ReferenceUnboxing,
             ValueFlowKindTag::LanguageDefined => ValueFlowKind::LanguageDefined,
+            ValueFlowKindTag::ByValueCapture => ValueFlowKind::ByValueCapture,
         }
     }
 
-    fn read_edges_and_decisions(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_edges_and_decisions(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
-        each_row(tx, blob_id, Table::ControlEdges, |cells| {
-            let procedure = cells.key_u32();
-            let ordinal = cells.key() as usize;
-            let expected = self.procedure(cells, procedure).control_edges.len();
-            dense(cells, ordinal, expected);
-            let edge = ControlEdge {
-                source_point: cells.id(),
-                target_point: cells.id(),
-                kind: cells.code(),
-                source: cells.id(),
-                evidence: cells.id(),
-            };
-            self.parts[procedure as usize].control_edges.push(edge);
-        })?;
-        each_row(tx, blob_id, Table::GuardFacts, |cells| {
-            let procedure = cells.key_u32();
-            let id = cells.key_u32();
-            let expected = self.procedure(cells, procedure).guard_facts.len();
-            dense(cells, id as usize, expected);
-            let point = cells.id();
-            let subject = cells.opt_id();
-            let predicate: GuardPredicateTag = cells.code();
-            let guard_flag = cells.opt_flag();
-            let relation = cells.opt_code();
-            let constant = cells.opt_id::<ValueId>();
-            let operand_a = cells.opt_id::<ValueId>();
-            let operand_b = cells.opt_id::<ValueId>();
-            let digest = cells.opt();
-            let true_target = cells.opt_id();
-            let true_kind = cells.opt_code();
-            let false_target = cells.opt_id();
-            let false_kind = cells.opt_code();
-            let source = cells.id();
-            let evidence = cells.id();
-            let flag = |cells: &Cells<'_, '_>| cells.need(guard_flag, "flag");
-            let predicate = match predicate {
-                GuardPredicateTag::ConstantBoolean => {
-                    GuardPredicate::ConstantBoolean { value: flag(cells) }
-                }
-                GuardPredicateTag::NullComparison => GuardPredicate::NullComparison {
-                    null_on_true: flag(cells),
-                },
-                GuardPredicateTag::ConstantEquality => GuardPredicate::ConstantEquality {
-                    negated: flag(cells),
-                    constant: cells.need(constant, "constant"),
-                },
-                GuardPredicateTag::OrderedIntegerComparison => {
-                    GuardPredicate::OrderedIntegerComparison {
-                        relation: cells.need(relation, "relation"),
-                        constant: cells.need(constant, "constant"),
+        let selected_procedure = self.selected_procedure;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::ControlEdges,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key() as usize;
+                let expected = self.procedure(cells, procedure).control_edges.len();
+                dense(cells, ordinal, expected);
+                let edge = ControlEdge {
+                    source_point: cells.id(),
+                    target_point: cells.id(),
+                    kind: cells.code(),
+                    source: cells.id(),
+                    evidence: cells.id(),
+                };
+                self.parts[procedure as usize].control_edges.push(edge);
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::GuardFacts,
+            |cells| {
+                let procedure = cells.key_u32();
+                let id = cells.key_u32();
+                let expected = self.procedure(cells, procedure).guard_facts.len();
+                dense(cells, id as usize, expected);
+                let point = cells.id();
+                let subject = cells.opt_id();
+                let predicate: GuardPredicateTag = cells.code();
+                let guard_flag = cells.opt_flag();
+                let relation = cells.opt_code();
+                let constant = cells.opt_id::<ValueId>();
+                let operand_a = cells.opt_id::<ValueId>();
+                let operand_b = cells.opt_id::<ValueId>();
+                let digest = cells.opt();
+                let true_target = cells.opt_id();
+                let true_kind = cells.opt_code();
+                let false_target = cells.opt_id();
+                let false_kind = cells.opt_code();
+                let source = cells.id();
+                let evidence = cells.id();
+                let flag = |cells: &Cells<'_, '_>| cells.need(guard_flag, "flag");
+                let predicate = match predicate {
+                    GuardPredicateTag::ConstantBoolean => {
+                        GuardPredicate::ConstantBoolean { value: flag(cells) }
                     }
-                }
-                GuardPredicateTag::OrderedFloatComparison => {
-                    GuardPredicate::OrderedFloatComparison {
-                        relation: cells.need(relation, "relation"),
+                    GuardPredicateTag::NullComparison => GuardPredicate::NullComparison {
+                        null_on_true: flag(cells),
+                    },
+                    GuardPredicateTag::ConstantEquality => GuardPredicate::ConstantEquality {
+                        negated: flag(cells),
                         constant: cells.need(constant, "constant"),
+                    },
+                    GuardPredicateTag::OrderedIntegerComparison => {
+                        GuardPredicate::OrderedIntegerComparison {
+                            relation: cells.need(relation, "relation"),
+                            constant: cells.need(constant, "constant"),
+                        }
                     }
-                }
-                GuardPredicateTag::NanComparison => GuardPredicate::NanComparison {
-                    nan_on_true: flag(cells),
-                },
-                GuardPredicateTag::InstanceOf => GuardPredicate::InstanceOf {
-                    value: cells.need(operand_a, "operand_a"),
-                    classes: cells.need(operand_b, "operand_b"),
-                },
-                GuardPredicateTag::ExactClass => GuardPredicate::ExactClass {
-                    value: cells.need(operand_a, "operand_a"),
-                    classes: cells.need(operand_b, "operand_b"),
-                    exact_on_true: flag(cells),
-                },
-                GuardPredicateTag::HasMember => GuardPredicate::HasMember {
-                    value: cells.need(operand_a, "operand_a"),
-                    member: cells.need(operand_b, "operand_b"),
-                },
-                GuardPredicateTag::Truthy => GuardPredicate::Truthy {
-                    value: cells.need(operand_a, "operand_a"),
-                },
-                GuardPredicateTag::Opaque => GuardPredicate::Opaque {
-                    digest: GuardConditionDigest::from_bits(u64::from_ne_bytes(
-                        cells.need(digest, "digest").to_ne_bytes(),
-                    )),
-                },
-            };
-            let arm = |target: Option<ProgramPointId>, kind| match (target, kind) {
-                (Some(target_point), Some(kind)) => Some(GuardArm { target_point, kind }),
-                (None, None) => None,
-                _ => cells.fail_at("true_target", "holds half of a guard arm"),
-            };
-            let guard = GuardFactParts {
-                id: GuardId::new(id),
-                point,
-                subject,
-                predicate,
-                true_arm: arm(true_target, true_kind),
-                false_arm: arm(false_target, false_kind),
-                source,
-                evidence,
-            };
-            self.parts[procedure as usize].guard_facts.push(guard);
-        })?;
-        each_row(tx, blob_id, Table::SwitchFacts, |cells| {
-            let procedure = cells.key_u32();
-            let id = cells.key_u32();
-            let expected = self.procedure(cells, procedure).switch_facts.len();
-            dense(cells, id as usize, expected);
-            let kind = cells.code();
-            let point = cells.id();
-            let selector = cells.opt_id();
-            let selector_domain = cells.code();
-            let default_present = cells.flag();
-            let default_source = cells.opt_id();
-            let default_target = cells.opt_id();
-            let default_kind = cells.opt_code();
-            let source = cells.id();
-            let evidence = cells.id();
-            let default_edge = match (default_source, default_target, default_kind) {
-                (Some(source_point), Some(target_point), Some(kind)) => Some(SwitchEdgeParts {
-                    source_point,
-                    arm: GuardArm { target_point, kind },
-                }),
-                (None, None, None) => None,
-                _ => cells.fail_at("default_source_point", "holds part of a default edge"),
-            };
-            self.parts[procedure as usize]
-                .switch_facts
-                .push(SwitchFactParts {
-                    id: SwitchFactId::new(id),
-                    kind,
+                    GuardPredicateTag::OrderedFloatComparison => {
+                        GuardPredicate::OrderedFloatComparison {
+                            relation: cells.need(relation, "relation"),
+                            constant: cells.need(constant, "constant"),
+                        }
+                    }
+                    GuardPredicateTag::NanComparison => GuardPredicate::NanComparison {
+                        nan_on_true: flag(cells),
+                    },
+                    GuardPredicateTag::InstanceOf => GuardPredicate::InstanceOf {
+                        value: cells.need(operand_a, "operand_a"),
+                        classes: cells.need(operand_b, "operand_b"),
+                    },
+                    GuardPredicateTag::ExactClass => GuardPredicate::ExactClass {
+                        value: cells.need(operand_a, "operand_a"),
+                        classes: cells.need(operand_b, "operand_b"),
+                        exact_on_true: flag(cells),
+                    },
+                    GuardPredicateTag::HasMember => GuardPredicate::HasMember {
+                        value: cells.need(operand_a, "operand_a"),
+                        member: cells.need(operand_b, "operand_b"),
+                    },
+                    GuardPredicateTag::Truthy => GuardPredicate::Truthy {
+                        value: cells.need(operand_a, "operand_a"),
+                    },
+                    GuardPredicateTag::Opaque => GuardPredicate::Opaque {
+                        digest: GuardConditionDigest::from_bits(u64::from_ne_bytes(
+                            cells.need(digest, "digest").to_ne_bytes(),
+                        )),
+                    },
+                };
+                let arm = |target: Option<ProgramPointId>, kind| match (target, kind) {
+                    (Some(target_point), Some(kind)) => Some(GuardArm { target_point, kind }),
+                    (None, None) => None,
+                    _ => cells.fail_at("true_target", "holds half of a guard arm"),
+                };
+                let guard = GuardFactParts {
+                    id: GuardId::new(id),
                     point,
-                    selector,
-                    selector_domain,
-                    cases: Vec::new(),
-                    default_edge,
-                    default_present,
+                    subject,
+                    predicate,
+                    true_arm: arm(true_target, true_kind),
+                    false_arm: arm(false_target, false_kind),
                     source,
                     evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::SwitchCases, |cells| {
-            let procedure = cells.key_u32();
-            let switch = cells.key() as usize;
-            let ordinal = cells.key() as usize;
-            self.procedure(cells, procedure);
-            let case = SwitchCaseFactParts {
-                value: cells.id(),
-                edge: SwitchEdgeParts {
-                    source_point: cells.id(),
-                    arm: GuardArm {
-                        target_point: cells.id(),
-                        kind: cells.code(),
+                };
+                self.parts[procedure as usize].guard_facts.push(guard);
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::SwitchFacts,
+            |cells| {
+                let procedure = cells.key_u32();
+                let id = cells.key_u32();
+                let expected = self.procedure(cells, procedure).switch_facts.len();
+                dense(cells, id as usize, expected);
+                let kind = cells.code();
+                let point = cells.id();
+                let selector = cells.opt_id();
+                let selector_domain = cells.code();
+                let default_present = cells.flag();
+                let default_source = cells.opt_id();
+                let default_target = cells.opt_id();
+                let default_kind = cells.opt_code();
+                let source = cells.id();
+                let evidence = cells.id();
+                let default_edge = match (default_source, default_target, default_kind) {
+                    (Some(source_point), Some(target_point), Some(kind)) => Some(SwitchEdgeParts {
+                        source_point,
+                        arm: GuardArm { target_point, kind },
+                    }),
+                    (None, None, None) => None,
+                    _ => cells.fail_at("default_source_point", "holds part of a default edge"),
+                };
+                self.parts[procedure as usize]
+                    .switch_facts
+                    .push(SwitchFactParts {
+                        id: SwitchFactId::new(id),
+                        kind,
+                        point,
+                        selector,
+                        selector_domain,
+                        cases: Vec::new(),
+                        default_edge,
+                        default_present,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::SwitchCases,
+            |cells| {
+                let procedure = cells.key_u32();
+                let switch = cells.key() as usize;
+                let ordinal = cells.key() as usize;
+                self.procedure(cells, procedure);
+                let case = SwitchCaseFactParts {
+                    value: cells.id(),
+                    edge: SwitchEdgeParts {
+                        source_point: cells.id(),
+                        arm: GuardArm {
+                            target_point: cells.id(),
+                            kind: cells.code(),
+                        },
                     },
-                },
-            };
-            let cases = &mut self.parts[procedure as usize]
-                .switch_facts
-                .get_mut(switch)
-                .unwrap_or_else(|| cells.fail_at("switch", "names a missing switch"))
-                .cases;
-            dense(cells, ordinal, cases.len());
-            cases.push(case);
-        })?;
+                };
+                let cases = &mut self.parts[procedure as usize]
+                    .switch_facts
+                    .get_mut(switch)
+                    .unwrap_or_else(|| cells.fail_at("switch", "names a missing switch"))
+                    .cases;
+                dense(cells, ordinal, cases.len());
+                cases.push(case);
+            },
+        )?;
         Ok(())
     }
 
-    fn read_lifecycle_and_pointers(&mut self, tx: &Transaction<'_>) -> Result<()> {
+    fn read_lifecycle_and_pointers(&mut self, tx: &Connection) -> Result<()> {
         let blob_id = self.blob_id;
-        each_row(tx, blob_id, Table::Drops, |cells| {
+        let selected_procedure = self.selected_procedure;
+        each_scoped_row(tx, blob_id, selected_procedure, Table::Drops, |cells| {
             let procedure = cells.key_u32();
             let ordinal = cells.key() as usize;
             let expected = self.procedure(cells, procedure).drops.len();
@@ -2169,7 +2802,7 @@ impl Decoder<'_> {
                 evidence,
             });
         })?;
-        each_row(tx, blob_id, Table::MoveOuts, |cells| {
+        each_scoped_row(tx, blob_id, selected_procedure, Table::MoveOuts, |cells| {
             let procedure = cells.key_u32();
             let ordinal = cells.key() as usize;
             let expected = self.procedure(cells, procedure).move_outs.len();
@@ -2188,7 +2821,7 @@ impl Decoder<'_> {
             };
             self.parts[procedure as usize].move_outs.push(fact);
         })?;
-        each_row(tx, blob_id, Table::ScopeEnds, |cells| {
+        each_scoped_row(tx, blob_id, selected_procedure, Table::ScopeEnds, |cells| {
             let procedure = cells.key_u32();
             let ordinal = cells.key() as usize;
             let expected = self.procedure(cells, procedure).scope_ends.len();
@@ -2219,219 +2852,254 @@ impl Decoder<'_> {
             };
             self.parts[procedure as usize].scope_ends.push(fact);
         })?;
-        each_row(tx, blob_id, Table::PointerOrigins, |cells| {
-            let procedure = cells.key_u32();
-            let id = cells.key_u32();
-            let expected = self.procedure(cells, procedure).pointer_origins.len();
-            dense(cells, id as usize, expected);
-            let point = cells.id();
-            let kind: PointerOriginKindTag = cells.code();
-            let place_kind = cells.opt_code();
-            let place_locator = cells.opt();
-            let place_location = cells.opt_id();
-            let allocation = cells.opt_id();
-            let byte_extent = cells.opt_u128();
-            let source = cells.id();
-            let evidence = cells.id();
-            let kind = match kind {
-                PointerOriginKindTag::StackPlace => PointerOriginKind::StackPlace {
-                    place: self.place(cells, place_kind, place_locator, place_location),
-                },
-                PointerOriginKindTag::Allocation => PointerOriginKind::Allocation {
-                    allocation: cells.need(allocation, "allocation"),
-                },
-            };
-            self.parts[procedure as usize]
-                .pointer_origins
-                .push(PointerOrigin {
-                    id: PointerOriginId::new(id),
-                    point,
-                    kind,
-                    byte_extent,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::PointerAliases, |cells| {
-            let procedure = cells.key_u32();
-            let ordinal = cells.key() as usize;
-            let expected = self.procedure(cells, procedure).pointer_aliases.len();
-            dense(cells, ordinal, expected);
-            let point = cells.id();
-            let pointer = cells.id();
-            let origin = cells.id();
-            let offset_kind: PointerByteOffsetTag = cells.code();
-            let exact = cells.opt_i128();
-            let value = cells.opt_id();
-            let minimum = cells.opt_i128();
-            let maximum = cells.opt_i128();
-            let strength = cells.code();
-            let source = cells.id();
-            let evidence = cells.id();
-            let byte_offset = match offset_kind {
-                PointerByteOffsetTag::Exact => {
-                    PointerByteOffset::Exact(cells.need(exact, "offset_exact"))
-                }
-                PointerByteOffsetTag::Value => {
-                    PointerByteOffset::Value(cells.need(value, "offset_value"))
-                }
-                PointerByteOffsetTag::Range => PointerByteOffset::Range {
-                    minimum: cells.need(minimum, "offset_min"),
-                    maximum: cells.need(maximum, "offset_max"),
-                },
-                PointerByteOffsetTag::Unknown => PointerByteOffset::Unknown,
-            };
-            self.parts[procedure as usize]
-                .pointer_aliases
-                .push(PointerAlias {
-                    point,
-                    pointer,
-                    origin,
-                    byte_offset,
-                    strength,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::PointerAccesses, |cells| {
-            let procedure = cells.key_u32();
-            let ordinal = cells.key() as usize;
-            let expected = self.procedure(cells, procedure).pointer_accesses.len();
-            dense(cells, ordinal, expected);
-            let point = cells.id();
-            let pointer = cells.id();
-            let kind = cells.code();
-            let width_kind: PointerAccessWidthTag = cells.code();
-            let exact = cells.opt_u128();
-            let value = cells.opt_id();
-            let multiplier = cells.opt_u128();
-            let source = cells.id();
-            let evidence = cells.id();
-            let width = match width_kind {
-                PointerAccessWidthTag::Exact => {
-                    PointerAccessWidth::Exact(cells.need(exact, "width_exact"))
-                }
-                PointerAccessWidthTag::ValueTimes => PointerAccessWidth::ValueTimes {
-                    value: cells.need(value, "width_value"),
-                    multiplier: cells.need(multiplier, "width_multiplier"),
-                },
-                PointerAccessWidthTag::Unknown => PointerAccessWidth::Unknown,
-            };
-            self.parts[procedure as usize]
-                .pointer_accesses
-                .push(PointerAccess {
-                    point,
-                    pointer,
-                    kind,
-                    width,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::PointerInvalidations, |cells| {
-            let procedure = cells.key_u32();
-            let ordinal = cells.key() as usize;
-            let expected = self.procedure(cells, procedure).pointer_invalidations.len();
-            dense(cells, ordinal, expected);
-            let point = cells.id();
-            let target_kind: PointerInvalidationTargetTag = cells.code();
-            let target_value = cells.opt_id();
-            let target_origin = cells.opt_id();
-            let cause = cells.code();
-            let strength = cells.code();
-            let source = cells.id();
-            let evidence = cells.id();
-            let target = match target_kind {
-                PointerInvalidationTargetTag::Pointer => {
-                    PointerInvalidationTarget::Pointer(cells.need(target_value, "target_value"))
-                }
-                PointerInvalidationTargetTag::Origin => {
-                    PointerInvalidationTarget::Origin(cells.need(target_origin, "target_origin"))
-                }
-            };
-            self.parts[procedure as usize]
-                .pointer_invalidations
-                .push(PointerInvalidation {
-                    point,
-                    target,
-                    cause,
-                    strength,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::IncompleteFacts, |cells| {
-            let procedure = cells.key_u32();
-            let ordinal = cells.key() as usize;
-            let expected = self.procedure(cells, procedure).incomplete_facts.len();
-            dense(cells, ordinal, expected);
-            let point = cells.id();
-            let subject: IncompleteSubjectTag = cells.code();
-            let place_kind = cells.opt_code();
-            let place_locator = cells.opt();
-            let place_location = cells.opt_id();
-            let value = cells.opt_id();
-            let origin = cells.opt_id();
-            let reason_domain: IncompleteReasonTag = cells.code();
-            let reason = cells.int();
-            let source = cells.id();
-            let evidence = cells.id();
-            let subject = match subject {
-                IncompleteSubjectTag::Procedure => SemanticIncompleteSubject::Procedure,
-                IncompleteSubjectTag::Place => SemanticIncompleteSubject::Place(self.place(
-                    cells,
-                    place_kind,
-                    place_locator,
-                    place_location,
-                )),
-                IncompleteSubjectTag::Value => {
-                    SemanticIncompleteSubject::Value(cells.need(value, "value"))
-                }
-                IncompleteSubjectTag::PointerOrigin => {
-                    SemanticIncompleteSubject::PointerOrigin(cells.need(origin, "origin"))
-                }
-            };
-            let reason = match reason_domain {
-                IncompleteReasonTag::Lifecycle => SemanticIncompleteReason::Lifecycle(
-                    RowCode::try_from_code(reason)
-                        .unwrap_or_else(|| cells.fail_at("reason", "is not a lifecycle reason")),
-                ),
-                IncompleteReasonTag::Pointer => SemanticIncompleteReason::Pointer(
-                    RowCode::try_from_code(reason)
-                        .unwrap_or_else(|| cells.fail_at("reason", "is not a pointer reason")),
-                ),
-            };
-            self.parts[procedure as usize]
-                .incomplete_facts
-                .push(SemanticIncompleteFact {
-                    point,
-                    subject,
-                    reason,
-                    source,
-                    evidence,
-                });
-        })?;
-        each_row(tx, blob_id, Table::ReceiverTypeFacts, |cells| {
-            let procedure = cells.key_u32();
-            let call_site = cells.key_u32();
-            self.procedure(cells, procedure);
-            let member = cells.int();
-            let column = cells.next;
-            let segments = cells
-                .opt_json_ids()
-                .unwrap_or_else(|| cells.fail(column, "is NULL"));
-            let fact = CallReceiverTypeFact {
-                call_site: CallSiteId::new(call_site),
-                receiver_type: segments
-                    .into_iter()
-                    .map(|segment| self.boxed_text(cells, segment))
-                    .collect(),
-                member: self.boxed_text(cells, member),
-            };
-            self.parts[procedure as usize]
-                .receiver_type_facts
-                .push(fact);
-        })?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::PointerOrigins,
+            |cells| {
+                let procedure = cells.key_u32();
+                let id = cells.key_u32();
+                let expected = self.procedure(cells, procedure).pointer_origins.len();
+                dense(cells, id as usize, expected);
+                let point = cells.id();
+                let kind: PointerOriginKindTag = cells.code();
+                let place_kind = cells.opt_code();
+                let place_locator = cells.opt();
+                let place_location = cells.opt_id();
+                let allocation = cells.opt_id();
+                let byte_extent = cells.opt_u128();
+                let source = cells.id();
+                let evidence = cells.id();
+                let kind = match kind {
+                    PointerOriginKindTag::StackPlace => PointerOriginKind::StackPlace {
+                        place: self.place(cells, place_kind, place_locator, place_location),
+                    },
+                    PointerOriginKindTag::Allocation => PointerOriginKind::Allocation {
+                        allocation: cells.need(allocation, "allocation"),
+                    },
+                };
+                self.parts[procedure as usize]
+                    .pointer_origins
+                    .push(PointerOrigin {
+                        id: PointerOriginId::new(id),
+                        point,
+                        kind,
+                        byte_extent,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::PointerAliases,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key() as usize;
+                let expected = self.procedure(cells, procedure).pointer_aliases.len();
+                dense(cells, ordinal, expected);
+                let point = cells.id();
+                let pointer = cells.id();
+                let origin = cells.id();
+                let offset_kind: PointerByteOffsetTag = cells.code();
+                let exact = cells.opt_i128();
+                let value = cells.opt_id();
+                let minimum = cells.opt_i128();
+                let maximum = cells.opt_i128();
+                let strength = cells.code();
+                let source = cells.id();
+                let evidence = cells.id();
+                let byte_offset = match offset_kind {
+                    PointerByteOffsetTag::Exact => {
+                        PointerByteOffset::Exact(cells.need(exact, "offset_exact"))
+                    }
+                    PointerByteOffsetTag::Value => {
+                        PointerByteOffset::Value(cells.need(value, "offset_value"))
+                    }
+                    PointerByteOffsetTag::Range => PointerByteOffset::Range {
+                        minimum: cells.need(minimum, "offset_min"),
+                        maximum: cells.need(maximum, "offset_max"),
+                    },
+                    PointerByteOffsetTag::Unknown => PointerByteOffset::Unknown,
+                };
+                self.parts[procedure as usize]
+                    .pointer_aliases
+                    .push(PointerAlias {
+                        point,
+                        pointer,
+                        origin,
+                        byte_offset,
+                        strength,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::PointerAccesses,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key() as usize;
+                let expected = self.procedure(cells, procedure).pointer_accesses.len();
+                dense(cells, ordinal, expected);
+                let point = cells.id();
+                let pointer = cells.id();
+                let kind = cells.code();
+                let width_kind: PointerAccessWidthTag = cells.code();
+                let exact = cells.opt_u128();
+                let value = cells.opt_id();
+                let multiplier = cells.opt_u128();
+                let source = cells.id();
+                let evidence = cells.id();
+                let width = match width_kind {
+                    PointerAccessWidthTag::Exact => {
+                        PointerAccessWidth::Exact(cells.need(exact, "width_exact"))
+                    }
+                    PointerAccessWidthTag::ValueTimes => PointerAccessWidth::ValueTimes {
+                        value: cells.need(value, "width_value"),
+                        multiplier: cells.need(multiplier, "width_multiplier"),
+                    },
+                    PointerAccessWidthTag::Unknown => PointerAccessWidth::Unknown,
+                };
+                self.parts[procedure as usize]
+                    .pointer_accesses
+                    .push(PointerAccess {
+                        point,
+                        pointer,
+                        kind,
+                        width,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::PointerInvalidations,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key() as usize;
+                let expected = self.procedure(cells, procedure).pointer_invalidations.len();
+                dense(cells, ordinal, expected);
+                let point = cells.id();
+                let target_kind: PointerInvalidationTargetTag = cells.code();
+                let target_value = cells.opt_id();
+                let target_origin = cells.opt_id();
+                let cause = cells.code();
+                let strength = cells.code();
+                let source = cells.id();
+                let evidence = cells.id();
+                let target = match target_kind {
+                    PointerInvalidationTargetTag::Pointer => {
+                        PointerInvalidationTarget::Pointer(cells.need(target_value, "target_value"))
+                    }
+                    PointerInvalidationTargetTag::Origin => PointerInvalidationTarget::Origin(
+                        cells.need(target_origin, "target_origin"),
+                    ),
+                };
+                self.parts[procedure as usize]
+                    .pointer_invalidations
+                    .push(PointerInvalidation {
+                        point,
+                        target,
+                        cause,
+                        strength,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::IncompleteFacts,
+            |cells| {
+                let procedure = cells.key_u32();
+                let ordinal = cells.key() as usize;
+                let expected = self.procedure(cells, procedure).incomplete_facts.len();
+                dense(cells, ordinal, expected);
+                let point = cells.id();
+                let subject: IncompleteSubjectTag = cells.code();
+                let place_kind = cells.opt_code();
+                let place_locator = cells.opt();
+                let place_location = cells.opt_id();
+                let value = cells.opt_id();
+                let origin = cells.opt_id();
+                let reason_domain: IncompleteReasonTag = cells.code();
+                let reason = cells.int();
+                let source = cells.id();
+                let evidence = cells.id();
+                let subject =
+                    match subject {
+                        IncompleteSubjectTag::Procedure => SemanticIncompleteSubject::Procedure,
+                        IncompleteSubjectTag::Place => SemanticIncompleteSubject::Place(
+                            self.place(cells, place_kind, place_locator, place_location),
+                        ),
+                        IncompleteSubjectTag::Value => {
+                            SemanticIncompleteSubject::Value(cells.need(value, "value"))
+                        }
+                        IncompleteSubjectTag::PointerOrigin => {
+                            SemanticIncompleteSubject::PointerOrigin(cells.need(origin, "origin"))
+                        }
+                    };
+                let reason = match reason_domain {
+                    IncompleteReasonTag::Lifecycle => SemanticIncompleteReason::Lifecycle(
+                        RowCode::try_from_code(reason).unwrap_or_else(|| {
+                            cells.fail_at("reason", "is not a lifecycle reason")
+                        }),
+                    ),
+                    IncompleteReasonTag::Pointer => SemanticIncompleteReason::Pointer(
+                        RowCode::try_from_code(reason)
+                            .unwrap_or_else(|| cells.fail_at("reason", "is not a pointer reason")),
+                    ),
+                };
+                self.parts[procedure as usize]
+                    .incomplete_facts
+                    .push(SemanticIncompleteFact {
+                        point,
+                        subject,
+                        reason,
+                        source,
+                        evidence,
+                    });
+            },
+        )?;
+        each_scoped_row(
+            tx,
+            blob_id,
+            selected_procedure,
+            Table::ReceiverTypeFacts,
+            |cells| {
+                let procedure = cells.key_u32();
+                let call_site = cells.key_u32();
+                self.procedure(cells, procedure);
+                let member = cells.int();
+                let column = cells.next;
+                let segments = cells
+                    .opt_json_ids()
+                    .unwrap_or_else(|| cells.fail(column, "is NULL"));
+                let fact = CallReceiverTypeFact {
+                    call_site: CallSiteId::new(call_site),
+                    receiver_type: segments
+                        .into_iter()
+                        .map(|segment| self.boxed_text(cells, segment))
+                        .collect(),
+                    member: self.boxed_text(cells, member),
+                };
+                self.parts[procedure as usize]
+                    .receiver_type_facts
+                    .push(fact);
+            },
+        )?;
         Ok(())
     }
 
@@ -2461,5 +3129,17 @@ impl Decoder<'_> {
             }
         }
         parts
+    }
+}
+
+fn static_type_class(cells: &mut Cells<'_, '_>) -> crate::analyzer::semantic::StaticTypeClass {
+    use crate::analyzer::semantic::StaticTypeClass;
+    match cells.int() {
+        0 => StaticTypeClass::Unknown,
+        1 => StaticTypeClass::Interface,
+        2 => StaticTypeClass::Pointer,
+        3 => StaticTypeClass::Reference,
+        4 => StaticTypeClass::Value,
+        _ => cells.fail_at("static_type_class", "invalid static type class"),
     }
 }

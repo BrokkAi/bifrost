@@ -35,6 +35,12 @@
 //! constructor facts. Anything else leaves the proof open and the gap stands;
 //! nothing here is inferred from spelling alone.
 //!
+//! Existing standard owned-memory admission shares the documented environment
+//! assumption in
+//! [`crate::analyzer::semantic_model::GLOBAL_ALLOCATOR_RELEASE_ASSUMPTION`].
+//! The consumer-relative release proof must preserve that assumption in its
+//! provenance; a complete allocator census will tighten both paths (#10969).
+//!
 //! Expression classes and modeled call shapes are memoized only while one
 //! query proves one prepared source. Those memos and every answer are dropped
 //! with the query; all other facts come from the prepared trees and point
@@ -43,10 +49,12 @@
 use brokk_bifrost_analysis::analyzer::read_ledger::DerivationExecutionCause;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use brokk_bifrost_core::cancellation::CancellationToken;
-use std::ops::Range as ByteRange;
-use std::sync::{Arc, OnceLock};
 #[cfg(test)]
-use std::{cell::Cell, time::Instant};
+use std::cell::Cell;
+use std::ops::Range as ByteRange;
+use std::sync::Arc;
+#[cfg(all(test, debug_assertions))]
+use std::time::Instant;
 use std::{cell::RefCell, collections::HashMap};
 
 use brokk_bifrost_rust::graph_support::rust_path_segments;
@@ -81,7 +89,9 @@ use crate::analyzer::semantic_model::{
     GenericParameterDefault, SemanticModelCallApplication, SemanticModelCallableKey,
     SemanticModelSymbol, TypeDropGlue, TypeFact, TypeRef,
 };
-use brokk_bifrost_analysis::analyzer::lexical_definitions::resolve_lexical_binding;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::{
+    resolve_lexical_binding, resolve_lexical_binding_with_visibility,
+};
 
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 
@@ -314,6 +324,9 @@ pub(crate) fn observe_proof_resolution(resolution: &BoundedResolution<Definition
         BoundedResolution::Exceeded { .. } => {
             operational_proof_stop("exceeded", DerivationExecutionCause::Budget)
         }
+        BoundedResolution::Unavailable { .. } => {
+            operational_proof_stop("input unavailable", DerivationExecutionCause::Provider)
+        }
         BoundedResolution::Cancelled { .. } => {
             operational_proof_stop("cancelled", DerivationExecutionCause::Cancelled)
         }
@@ -456,6 +469,25 @@ pub(crate) struct RustTypeProof<'a, R: RustTypeProofResolver = FactoryRustTypePr
 }
 
 pub(crate) trait RustTypeProofResolver {
+    fn nominal_type_owner<'tree>(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        ty: Node<'tree>,
+    ) -> Option<(String, Vec<Node<'tree>>)>;
+    fn modeled_receiver_type(&self, file: &ProjectFile, expression: Node<'_>) -> Option<TypeRef>;
+    #[allow(clippy::too_many_arguments)]
+    fn select_member(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        site: &ResolvedReferenceSite,
+        owner: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+        receiver_application: Option<&TypeRef>,
+    ) -> Option<super::modeled_members::SelectedMember>;
     fn import_infos(
         &self,
         file: &ProjectFile,
@@ -483,31 +515,143 @@ pub(crate) trait RustTypeProofResolver {
     }
 }
 
+impl<T: RustTypeProofResolver + ?Sized> RustTypeProofResolver for &T {
+    fn nominal_type_owner<'tree>(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        ty: Node<'tree>,
+    ) -> Option<(String, Vec<Node<'tree>>)> {
+        (**self).nominal_type_owner(file, source, ty)
+    }
+
+    fn modeled_receiver_type(&self, file: &ProjectFile, expression: Node<'_>) -> Option<TypeRef> {
+        (**self).modeled_receiver_type(file, expression)
+    }
+
+    fn select_member(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        site: &ResolvedReferenceSite,
+        owner: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+        receiver_application: Option<&TypeRef>,
+    ) -> Option<super::modeled_members::SelectedMember> {
+        (**self).select_member(
+            analyzer,
+            file,
+            source,
+            site,
+            owner,
+            has_receiver,
+            parameter_count,
+            receiver_application,
+        )
+    }
+
+    fn import_infos(
+        &self,
+        file: &ProjectFile,
+        token: brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    ) -> Option<Vec<brokk_bifrost_core::analyzer::model::ImportInfo>> {
+        (**self).import_infos(file, token)
+    }
+
+    fn resolve(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        (**self).resolve(query)
+    }
+
+    fn external_call_identity(&self, file: &ProjectFile, source: &str, tree: &Tree, site: &ResolvedReferenceSite, callee_start_byte: usize) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
+        (**self).external_call_identity(file, source, tree, site, callee_start_byte)
+    }
+
+    fn cancellation(&self) -> Option<&brokk_bifrost_core::cancellation::CancellationToken> {
+        (**self).cancellation()
+    }
+
+    fn budget(&self) -> ReceiverAnalysisBudget {
+        (**self).budget()
+    }
+}
+
 pub(crate) struct FactoryRustTypeProofResolver<'a> {
     analyzer: &'a dyn IAnalyzer,
     definition_operation_factory:
-        OnceLock<Option<crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a>>>,
+        crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a>,
+    operation: RefCell<
+        brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
+            'a,
+            'a,
+        >,
+    >,
     budget: ReceiverAnalysisBudget,
     cancellation: Option<CancellationToken>,
 }
 
 impl<'a> FactoryRustTypeProofResolver<'a> {
-    fn factory(
-        &self,
-    ) -> Option<&crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a>> {
-        self.definition_operation_factory
-            .get_or_init(|| {
-                let cancellation = brokk_bifrost_core::cancellation::CancellationToken::default();
-                crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
-                    self.analyzer,
-                    self.cancellation.as_ref().unwrap_or(&cancellation),
-                )
-            })
-            .as_ref()
+    fn factory(&self) -> &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'a> {
+        &self.definition_operation_factory
     }
 }
 
 impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
+    fn nominal_type_owner<'tree>(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        ty: Node<'tree>,
+    ) -> Option<(String, Vec<Node<'tree>>)> {
+        rust_nominal_receiver_application_with_operation(
+            self.analyzer,
+            file,
+            source,
+            ty,
+            self.factory(),
+            &mut self.operation.borrow_mut(),
+            self.cancellation(),
+        )
+    }
+
+    fn modeled_receiver_type(&self, file: &ProjectFile, expression: Node<'_>) -> Option<TypeRef> {
+        let proof = RustTypeProof {
+            analyzer: self.analyzer,
+            rust: resolve_analyzer::<RustAnalyzer>(self.analyzer)?,
+            resolver: self,
+        };
+        proof.modeled_receiver_type(file, expression)
+    }
+    fn select_member(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        site: &ResolvedReferenceSite,
+        owner: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+        receiver_application: Option<&TypeRef>,
+    ) -> Option<super::modeled_members::SelectedMember> {
+        super::modeled_members::select(
+            self.analyzer,
+            file,
+            source,
+            site,
+            owner,
+            has_receiver,
+            parameter_count,
+            self.factory(),
+            &mut self.operation.borrow_mut(),
+            None,
+            receiver_application,
+            self.cancellation.as_ref(),
+        )
+    }
     fn import_infos(
         &self,
         file: &ProjectFile,
@@ -525,10 +669,8 @@ impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
-        match self.factory() {
-            Some(factory) => factory.resolve_bounded(query),
-            None => crate::analyzer::rust::native_points::resolve_rust_definition_bounded(query),
-        }
+        self.factory()
+            .resolve(&mut self.operation.borrow_mut(), query)
     }
 
     fn external_call_identity(
@@ -547,7 +689,7 @@ impl RustTypeProofResolver for FactoryRustTypeProofResolver<'_> {
             site,
             callee_start_byte,
             self.factory(),
-            None,
+            &mut self.operation.borrow_mut(),
             None,
         )
     }
@@ -574,6 +716,61 @@ struct SelectedRustTypeProofResolver<'analyzer, 'factory, 'selection, 'operation
 }
 
 impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_, '_> {
+    fn nominal_type_owner<'tree>(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        ty: Node<'tree>,
+    ) -> Option<(String, Vec<Node<'tree>>)> {
+        let mut operation = self.operation.borrow_mut();
+        rust_nominal_receiver_application_with_operation(
+            self.analyzer,
+            file,
+            source,
+            ty,
+            self.factory,
+            &mut operation,
+            self.cancellation,
+        )
+    }
+
+    fn modeled_receiver_type(&self, file: &ProjectFile, expression: Node<'_>) -> Option<TypeRef> {
+        let mut operation = self.operation.borrow_mut();
+        rust_modeled_receiver_type_with_operation(
+            self.analyzer,
+            file,
+            expression,
+            self.factory,
+            &mut operation,
+        )
+    }
+    fn select_member(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        site: &ResolvedReferenceSite,
+        owner: &str,
+        has_receiver: bool,
+        parameter_count: u32,
+        receiver_application: Option<&TypeRef>,
+    ) -> Option<super::modeled_members::SelectedMember> {
+        let mut operation = self.operation.borrow_mut();
+        super::modeled_members::select(
+            self.analyzer,
+            file,
+            source,
+            site,
+            owner,
+            has_receiver,
+            parameter_count,
+            self.factory,
+            &mut operation,
+            None,
+            receiver_application,
+            self.cancellation,
+        )
+    }
     fn import_infos(
         &self,
         file: &ProjectFile,
@@ -607,8 +804,8 @@ impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_, '_>
             tree,
             site,
             callee_start_byte,
-            Some(self.factory),
-            Some(&mut **operation),
+            self.factory,
+            &mut operation,
             self.cancellation,
         )
     }
@@ -616,6 +813,26 @@ impl RustTypeProofResolver for SelectedRustTypeProofResolver<'_, '_, '_, '_, '_>
     fn cancellation(&self) -> Option<&brokk_bifrost_core::cancellation::CancellationToken> {
         self.cancellation
     }
+}
+
+pub(crate) fn model_proof_resolver<
+    'analyzer: 'operation,
+    'factory: 'operation,
+    'selection,
+    'operation,
+>(
+    analyzer: &'analyzer dyn IAnalyzer,
+    factory: &'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<
+        'analyzer,
+    >,
+    operation: &'operation mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
+) -> Option<Box<dyn RustTypeProofResolver + 'operation>> {
+    Some(Box::new(SelectedRustTypeProofResolver {
+        analyzer,
+        factory,
+        operation: RefCell::new(operation),
+        cancellation: None,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -626,13 +843,8 @@ fn resolve_external_call_identity<'analyzer, 'factory, 'selection>(
     tree: &Tree,
     site: &ResolvedReferenceSite,
     callee_start_byte: usize,
-    factory: Option<&'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>>,
-    mut operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            'selection,
-        >,
-    >,
+    factory: &'factory crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, 'selection>,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity>{
     let scope = AnalyzerQueryScope::new(analyzer);
@@ -647,7 +859,7 @@ fn resolve_external_call_identity<'analyzer, 'factory, 'selection>(
         || None,
         cancellation,
         factory,
-        operation.as_deref_mut(),
+        &mut *operation,
     )
     .map(|(_, identity)| identity)
     .or_else(|| {
@@ -700,52 +912,77 @@ enum RustNativeReturnKind {
 /// qualified constructors require the owner type to resolve to the standard
 /// `Result` prelude item. A workspace declaration, import route, lexical
 /// shadow, or unresolved lookup therefore stays open.
-pub(crate) fn rust_standard_result_variant(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    constructor: ByteRange<usize>,
-) -> Option<RustResultVariant> {
-    let proof = RustTypeProof::new(analyzer)?;
-    let rust_source = proof.source(file)?;
-    if rust_source.text() != source {
-        // Within one snapshot the caller's text equals the prepared text, so a
-        // mismatch means one side is stale: an operational state, not content.
-        operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
-        return None;
+/// Proves which standard `Result` variant the pattern constructors of one
+/// file name.
+///
+/// One selected resolution operation answers every constructor of the file.
+/// The operation owns its derive-helper decisions, macro frontiers and typed
+/// root memo, so opening one operation per constructor repeated that setup at
+/// every site; on a 9,000-line file that cost hundreds of milliseconds per
+/// constructor (#8853).
+pub(crate) struct RustResultVariantProver<'a> {
+    proof: RustTypeProof<'a>,
+    source: RustSource,
+}
+
+impl<'a> RustResultVariantProver<'a> {
+    /// `None` when no proof can run against `file`; a stale or unavailable
+    /// source also stops the active proof attempt.
+    pub(crate) fn new(
+        analyzer: &'a dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<Self> {
+        let proof = RustTypeProof::new(analyzer)?;
+        let rust_source = proof.source(file)?;
+        if rust_source.text() != source {
+            // Within one snapshot the caller's text equals the prepared text, so a
+            // mismatch means one side is stale: an operational state, not content.
+            operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+            return None;
+        }
+        Some(Self {
+            proof,
+            source: rust_source,
+        })
     }
-    let node = rust_source
-        .tree()
-        .root_node()
-        .named_descendant_for_byte_range(constructor.start, constructor.end)
-        .filter(|node| node.byte_range() == constructor)?;
-    let variant_name = match node.kind() {
-        "identifier" | "type_identifier" => {
-            let name = rust_source.node_text(node)?;
-            let fact = rust_std_constructor_fact(name)?;
-            if fact.constructs != "Result" || fact.arity != 1 {
-                return None;
+
+    /// The standard `Result` variant the constructor at `constructor` names.
+    pub(crate) fn variant(&self, constructor: ByteRange<usize>) -> Option<RustResultVariant> {
+        let rust_source = &self.source;
+        let node = rust_source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(constructor.start, constructor.end)
+            .filter(|node| node.byte_range() == constructor)?;
+        let variant_name = match node.kind() {
+            "identifier" | "type_identifier" => {
+                let name = rust_source.node_text(node)?;
+                let fact = rust_std_constructor_fact(name)?;
+                if fact.constructs != "Result" || fact.arity != 1 {
+                    return None;
+                }
+                standard_result_prelude_name(&self.proof, rust_source, node, "value", name)?;
+                Some(name)
             }
-            standard_result_prelude_name(&proof, &rust_source, node, "value", name)?;
-            Some(name)
-        }
-        "scoped_identifier" | "scoped_type_identifier" => {
-            let name = node.child_by_field_name("name")?;
-            let owner_path = node.child_by_field_name("path")?;
-            let name = rust_source.node_text(name)?;
-            let fact = rust_std_constructor_fact(name)?;
-            if fact.constructs != "Result" || fact.arity != 1 {
-                return None;
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let name = node.child_by_field_name("name")?;
+                let owner_path = node.child_by_field_name("path")?;
+                let name = rust_source.node_text(name)?;
+                let fact = rust_std_constructor_fact(name)?;
+                if fact.constructs != "Result" || fact.arity != 1 {
+                    return None;
+                }
+                standard_result_type_path(&self.proof, rust_source, owner_path)?;
+                Some(name)
             }
-            standard_result_type_path(&proof, &rust_source, owner_path)?;
-            Some(name)
+            _ => None,
+        }?;
+        match variant_name {
+            "Ok" => Some(RustResultVariant::Ok),
+            "Err" => Some(RustResultVariant::Err),
+            _ => None,
         }
-        _ => None,
-    }?;
-    match variant_name {
-        "Ok" => Some(RustResultVariant::Ok),
-        "Err" => Some(RustResultVariant::Err),
-        _ => None,
     }
 }
 
@@ -816,12 +1053,22 @@ fn standard_result_type_path<R: RustTypeProofResolver>(
 impl<'a> RustTypeProof<'a, FactoryRustTypeProofResolver<'a>> {
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+        let cancellation = CancellationToken::default();
+        let factory = crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
+            analyzer,
+            &cancellation,
+        )?;
+        let operation = match factory.open(&cancellation).ok()? {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            _ => return None,
+        };
         Some(Self {
             analyzer,
             rust,
             resolver: FactoryRustTypeProofResolver {
                 analyzer,
-                definition_operation_factory: OnceLock::new(),
+                definition_operation_factory: factory,
+                operation: RefCell::new(operation),
                 budget: INTERACTIVE_TYPE_LOOKUP_BUDGET,
                 cancellation: None,
             },
@@ -883,7 +1130,9 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         observe_proof_resolution(&resolution);
         match resolution {
             BoundedResolution::Complete { value, .. } => Some(value),
-            BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => None,
+            BoundedResolution::Exceeded { .. }
+            | BoundedResolution::Unavailable { .. }
+            | BoundedResolution::Cancelled { .. } => None,
         }
     }
 
@@ -1276,7 +1525,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         let Some(declaration) = self
             .analyzer
             .semantic_model_overlay()
-            .and_then(|overlay| overlay.symbols_named(&owner).unique())
+            .and_then(|overlay| overlay.symbols_named_in_family(&owner, "rust").unique())
             .and_then(|symbol| self.modeled_inert_drop_glue_owner(&symbol))
         else {
             return RustValueClass::Unknown;
@@ -1315,11 +1564,16 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             &active, symbol,
         )
         .filter(|declaration| {
-            declaration
-                .value_semantics
-                .as_ref()
-                .and_then(|semantics| semantics.drop_glue)
-                == Some(TypeDropGlue::Inert)
+            let Some(semantics) = declaration.value_semantics.as_ref() else {
+                return false;
+            };
+            if semantics.drop_review.is_some() {
+                // Scope selection is integrated in checkpoint 1 slice B. The
+                // legacy reader must never ignore a new review's restrictions.
+                incomplete_proof("drop_review_scope_admission_pending");
+                return false;
+            }
+            semantics.drop_glue == Some(TypeDropGlue::Inert)
         })
     }
 
@@ -1496,21 +1750,25 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         let Some(identifier) = source.node_text(name) else {
             return RustValueClass::Unknown;
         };
-        let Some(binding) = resolve_lexical_binding(
+        let binding = match resolve_lexical_binding_with_visibility(
             Language::Rust,
             source.tree().root_node(),
             source.text(),
             name.start_byte(),
             name.end_byte(),
             identifier,
-        ) else {
-            // A path to a unit struct is a value too.
-            return match self.workspace_definition(source, name) {
-                Some(unit) if self.workspace_type_is_inert(&unit, depth - 1) => {
-                    RustValueClass::Inert
-                }
-                _ => RustValueClass::Unknown,
-            };
+        ) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => {
+                // A path to a unit struct is a value too.
+                return match self.workspace_definition(source, name) {
+                    Some(unit) if self.workspace_type_is_inert(&unit, depth - 1) => {
+                        RustValueClass::Inert
+                    }
+                    _ => RustValueClass::Unknown,
+                };
+            }
+            Err(_) => return RustValueClass::Unknown,
         };
         let (LexicalBindingResolution::Parameter(definition)
         | LexicalBindingResolution::OtherLocal(definition)) = binding;
@@ -1740,90 +1998,165 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
         }
         let function = call.child_by_field_name("function")?;
         let arity = named_children(call.child_by_field_name("arguments")?).len();
-        let (owner, member, has_receiver) =
-            match function.kind() {
-                "field_expression" => {
-                    let receiver = function.child_by_field_name("value")?;
-                    let owner = self.receiver_owner_bounded(source, receiver, depth - 1)?;
-                    let name = function.child_by_field_name("field")?;
-                    let member = source.node_text(name)?;
-                    let overlay = self.analyzer.semantic_model_overlay()?;
-                    let active = self.analyzer.active_semantic_models()?;
-                    let mut applicability = super::trait_applicability::ModelApplicability::new(
-                        self.analyzer,
-                        self.rust,
-                        &overlay,
-                        &active,
-                    );
-                    let application = super::semantic::RustReceiverTypeFacts::from_tree(
-                        source.text(),
-                        source.tree(),
-                    )
-                    .declared_receiver_type(source.text(), source.tree(), receiver)
-                    .and_then(|ty| {
-                        applicability.receiver_type(self.analyzer, &source.file, source.text(), ty)
-                    })
-                    .or_else(|| self.modeled_receiver_type_bounded(source, receiver, depth - 1))
-                    .or_else(|| {
-                        overlay
-                            .symbols_named(&owner.key())
-                            .unique()
-                            .as_ref()
-                            .map(|owner| applicability.abstract_receiver(owner))
-                    })?;
-                    let site = ResolvedReferenceSite {
-                        path: member.to_owned(),
-                        text: member.to_owned(),
-                        range: node_range(name),
-                        focus_start_byte: name.start_byte(),
-                        focus_end_byte: name.end_byte(),
-                    };
-                    let owner = super::modeled_members::select(
-                        self.analyzer,
-                        &source.file,
-                        source.text(),
-                        &site,
-                        &owner.key(),
-                        true,
-                        u32::try_from(arity).ok()?,
-                        None,
-                        None,
-                        None,
-                        Some(&application),
-                    )?;
-                    (owner.owner, member.to_owned(), true)
-                }
-                "scoped_identifier" | "generic_function" => {
-                    let callee = if function.kind() == "generic_function" {
-                        function.child_by_field_name("function")?
-                    } else {
-                        function
-                    };
-                    let name = callee.child_by_field_name("name")?;
-                    let text = source.node_text(name)?.to_owned();
-                    let site = ResolvedReferenceSite {
-                        path: text.clone(),
-                        text,
-                        range: node_range(name),
-                        focus_start_byte: name.start_byte(),
-                        focus_end_byte: name.end_byte(),
-                    };
-                    let identity = self.resolver.external_call_identity(
-                        &source.file,
-                        source.text(),
-                        source.tree(),
-                        &site,
-                        call.start_byte(),
-                    )?;
-                    (
-                        identity.owner_fqn().to_owned(),
-                        identity.member().to_owned(),
-                        false,
-                    )
-                }
-                _ => return None,
-            };
+        let (owner, member, has_receiver) = match function.kind() {
+            "field_expression" => {
+                let receiver = function.child_by_field_name("value")?;
+                let owner = self.receiver_owner_bounded(source, receiver, depth - 1)?;
+                let name = function.child_by_field_name("field")?;
+                let member = source.node_text(name)?;
+                let overlay = self.analyzer.semantic_model_overlay()?;
+                let active = self.analyzer.active_semantic_models()?;
+                let mut applicability = super::trait_applicability::ModelApplicability::new(
+                    self.analyzer,
+                    self.rust,
+                    &overlay,
+                    &active,
+                    &self.resolver,
+                );
+                let application =
+                    super::semantic::RustReceiverTypeFacts::from_tree(source.text(), source.tree())
+                        .declared_receiver_type(source.text(), source.tree(), receiver)
+                        .and_then(|ty| applicability.receiver_type(&source.file, source.text(), ty))
+                        .or_else(|| self.modeled_receiver_type_bounded(source, receiver, depth - 1))
+                        .or_else(|| {
+                            overlay
+                                .symbols_named_in_family(&owner.key(), "rust")
+                                .unique()
+                                .as_ref()
+                                .map(|owner| applicability.abstract_receiver(owner))
+                        })?;
+                let site = ResolvedReferenceSite {
+                    path: member.to_owned(),
+                    text: member.to_owned(),
+                    range: node_range(name),
+                    focus_start_byte: name.start_byte(),
+                    focus_end_byte: name.end_byte(),
+                };
+                let owner = self.resolver.select_member(
+                    self.analyzer,
+                    &source.file,
+                    source.text(),
+                    &site,
+                    &owner.key(),
+                    true,
+                    u32::try_from(arity).ok()?,
+                    Some(&application),
+                )?;
+                (owner.owner, member.to_owned(), true)
+            }
+            "scoped_identifier" | "generic_function" => {
+                let callee = if function.kind() == "generic_function" {
+                    function.child_by_field_name("function")?
+                } else {
+                    function
+                };
+                let name = callee.child_by_field_name("name")?;
+                let text = source.node_text(name)?.to_owned();
+                let site = ResolvedReferenceSite {
+                    path: text.clone(),
+                    text,
+                    range: node_range(name),
+                    focus_start_byte: name.start_byte(),
+                    focus_end_byte: name.end_byte(),
+                };
+                let identity = self.resolver.external_call_identity(
+                    &source.file,
+                    source.text(),
+                    source.tree(),
+                    &site,
+                    call.start_byte(),
+                )?;
+                (
+                    identity.owner_fqn().to_owned(),
+                    identity.member().to_owned(),
+                    false,
+                )
+            }
+            _ => return None,
+        };
         Some((owner, member, has_receiver, arity))
+    }
+
+    pub(crate) fn modeled_clone_result(
+        &self,
+        file: &ProjectFile,
+        range: ByteRange<usize>,
+        depth: usize,
+    ) -> Option<TypeRef> {
+        let source = self.source(file)?;
+        let call = source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(range.start, range.end)?;
+        if call.byte_range() != range {
+            return None;
+        }
+        let (owner, member, receiver, arity) = self.modeled_call_shape(&source, call, depth)?;
+        if member != "clone" || !receiver || arity != 0 {
+            return None;
+        }
+        let snapshot = self.analyzer.active_semantic_model_snapshot()?;
+        let overlay = snapshot.semantic_model_overlay()?;
+        let selected = overlay.symbols_named_in_family(&owner, "rust").unique()?;
+        let clone_trait = crate::analyzer::RustOverlayCrates::new(Some(overlay))
+            .referenceable_symbol("std.clone.Clone")?;
+        if selected.id != clone_trait.id {
+            return None;
+        }
+        self.modeled_call_return_type(&source, call, depth)
+    }
+
+    pub(crate) fn modeled_operator_result(
+        &self,
+        left: &brokk_bifrost_analysis::analyzer::usages::call_conversion::RustConversionType,
+        right: &brokk_bifrost_analysis::analyzer::usages::call_conversion::RustConversionType,
+        trait_name: &str,
+    ) -> Option<TypeRef> {
+        use brokk_bifrost_analysis::analyzer::usages::call_conversion::RustConversionType;
+        let RustConversionType::Model { symbol, .. } = left else {
+            return None;
+        };
+        let snapshot = self.analyzer.active_semantic_model_snapshot()?;
+        let overlay = snapshot.semantic_model_overlay()?;
+        let active = snapshot.active_models();
+        let receiver = overlay.symbols_with_id_in_family(symbol, "rust").unique()?;
+        let declaration =
+            brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                active, &receiver,
+            )?;
+        let trait_ = overlay
+            .symbols_named_in_family(&format!("std.ops.{trait_name}"), "rust")
+            .unique()
+            .or_else(|| {
+                overlay
+                    .symbols_named_in_family(&format!("core.ops.{trait_name}"), "rust")
+                    .unique()
+            })?;
+        let applicability = super::trait_applicability::ModelApplicability::new(
+            self.analyzer,
+            self.rust,
+            overlay,
+            active,
+            &self.resolver,
+        );
+        applicability.operator_output(&receiver, &trait_, left, right, &declaration)
+    }
+
+    pub(crate) fn modeled_result(
+        &self,
+        file: &ProjectFile,
+        range: ByteRange<usize>,
+        depth: usize,
+    ) -> Option<TypeRef> {
+        let source = self.source(file)?;
+        let call = source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(range.start, range.end)?;
+        if call.byte_range() != range {
+            return None;
+        }
+        self.modeled_call_return_type(&source, call, depth)
     }
 
     fn modeled_call_return_type(
@@ -1848,11 +2181,13 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             )
             .unique()?;
         let returned = callable.structured_signature.as_ref()?.returns.clone()?;
-        let owner_symbol = overlay.symbols_named(&owner).unique()?;
+        let owner_symbol = overlay.symbols_named_in_family(&owner, "rust").unique()?;
         // The producer projects an impl's Self return onto its declared owner.
         // Retain the call's explicit generic application, rather than treating
         // Vec::<u8>::new() as an untyped Vec when probing its result (#6542).
-        if matches!(&returned, TypeRef::Declared { id, .. } if id == &owner_symbol.id)
+        let depends_on_type_parameters = type_ref_mentions_type_parameter(&returned);
+        if depends_on_type_parameters
+            || matches!(&returned, TypeRef::Declared { id, .. } if id == &owner_symbol.id)
             || matches!(&returned, TypeRef::TypeParameter { name } if name == "Self")
         {
             let active = self.analyzer.active_semantic_models()?;
@@ -1861,6 +2196,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 self.rust,
                 &overlay,
                 &active,
+                &self.resolver,
             );
             let function = call.child_by_field_name("function")?;
             let function = if function.kind() == "generic_function" {
@@ -1877,9 +2213,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 function.child_by_field_name("path")
             };
             let mut actual = ty
-                .and_then(|ty| {
-                    applicability.receiver_type(self.analyzer, &source.file, source.text(), ty)
-                })
+                .and_then(|ty| applicability.receiver_type(&source.file, source.text(), ty))
                 .unwrap_or_else(|| applicability.abstract_receiver(&owner_symbol));
             while let TypeRef::ByRef { element, .. } = actual {
                 actual = *element;
@@ -1889,22 +2223,48 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     &active,
                     &owner_symbol,
                 )?;
-            let arguments = match &actual {
-                TypeRef::Declared { arguments, .. } | TypeRef::Named { arguments, .. } => arguments,
-                _ => return None,
-            };
-            let mut bindings = declaration
-                .type_parameters
-                .iter()
-                .cloned()
-                .zip(arguments.iter().cloned())
-                .collect::<HashMap<_, _>>();
+            // The owner's type parameters bind from the receiver's arguments
+            // only when the owner IS the receiver's declaration. A trait
+            // method selected on another type takes its trait arguments from
+            // the selected impl (impl Get<i32> for Wrapper<String>), not from
+            // the receiver, so only Self binds there, and a return that still
+            // names a parameter is Unknown.
+            let receiver_is_owner =
+                matches!(&actual, TypeRef::Declared { id, .. } if id == &owner_symbol.id);
+            let mut bindings = HashMap::new();
+            if receiver_is_owner {
+                let TypeRef::Declared { arguments, .. } = &mut actual else {
+                    unreachable!("checked above");
+                };
+                super::trait_applicability::complete_type_arguments(&declaration, arguments)?;
+                if arguments.len() != declaration.type_parameters.len() {
+                    return None;
+                }
+                bindings.extend(
+                    declaration
+                        .type_parameters
+                        .iter()
+                        .cloned()
+                        .zip(arguments.iter().cloned()),
+                );
+            }
             bindings.insert("Self".into(), actual);
             let mut returned = super::trait_applicability::substitute(&returned, &bindings, 16)?;
-            if let TypeRef::Declared { arguments, .. } = &mut returned {
-                // An impl target can omit defaulted owner arguments too:
-                // Vec<T>'s Self is Vec<T, Global>, not a one-argument Vec.
-                super::trait_applicability::complete_type_arguments(&declaration, arguments)?;
+            if type_ref_mentions_type_parameter(&returned) {
+                return None;
+            }
+            if let TypeRef::Declared { id, arguments, .. } = &mut returned {
+                // Complete the returned declaration, which can differ from
+                // the receiver (for example Result<String, E>::unwrap).
+                let symbol = overlay.symbols_with_id_in_family(id, "rust").unique()?;
+                let returned_declaration =
+                    brokk_bifrost_analysis::analyzer::semantic_model::overlay::owner_declaration(
+                        &active, &symbol,
+                    )?;
+                super::trait_applicability::complete_type_arguments(
+                    &returned_declaration,
+                    arguments,
+                )?;
             }
             return Some(returned);
         }
@@ -1924,7 +2284,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             TypeRef::Named { name, .. } => Some(RustReceiverOwner::Path(name)),
             TypeRef::Declared { id, .. } => {
                 let overlay = self.analyzer.semantic_model_overlay()?;
-                let symbol = overlay.symbols_with_id(&id).unique()?;
+                let symbol = overlay.symbols_with_id_in_family(&id, "rust").unique()?;
                 Some(RustReceiverOwner::Path(symbol.qualified_name.clone()))
             }
             _ => None,
@@ -1970,7 +2330,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                         let overlay = self.analyzer.semantic_model_overlay()?;
                         (
                             overlay
-                                .symbols_with_id(&id)
+                                .symbols_with_id_in_family(&id, "rust")
                                 .unique()?
                                 .qualified_name
                                 .clone(),
@@ -1997,11 +2357,9 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                             self.rust,
                             &overlay,
                             &active,
+                            &self.resolver,
                         );
-                        let typed =
-                            applicability.receiver_type_with(source.text(), ty, &mut |head| {
-                                self.nominal_type_owner(source, head)
-                            });
+                        let typed = applicability.receiver_type(&source.file, source.text(), ty);
                         return if proof_stopped() { None } else { typed };
                     }
                     expression = self.binding_initializer(source, expression)?;
@@ -2083,7 +2441,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                             let symbol = self
                                 .analyzer
                                 .semantic_model_overlay()?
-                                .symbols_named(name)
+                                .symbols_named_in_family(name, "rust")
                                 .unique()?;
                             self.modeled_type_ref_class(&symbol, &[], depth)
                         })
@@ -2096,7 +2454,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 let symbol = self
                     .analyzer
                     .semantic_model_overlay()?
-                    .symbols_named(name)
+                    .symbols_named_in_family(name, "rust")
                     .unique()?;
                 self.modeled_type_ref_class(&symbol, arguments, depth)
             }
@@ -2104,7 +2462,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 let symbol = self
                     .analyzer
                     .semantic_model_overlay()?
-                    .symbols_with_id(id)
+                    .symbols_with_id_in_family(id, "rust")
                     .unique()?;
                 self.modeled_type_ref_class(&symbol, arguments, depth)
             }
@@ -2254,6 +2612,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                     source: source.text(),
                     tree: source.tree(),
                     call_span: &span,
+                    member_selection: None,
                     cancellation: self.resolver.cancellation(),
                     work: Default::default(),
                 },
@@ -2290,6 +2649,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
             self.rust,
             &overlay,
             &active,
+            &self.resolver,
         );
         let bounds = super::trait_applicability::lexical_receiver_traits(
             self.analyzer,
@@ -2316,7 +2676,7 @@ impl<'a, R: RustTypeProofResolver> RustTypeProof<'a, R> {
                 let overlay = self.analyzer.semantic_model_overlay()?;
                 Some(RustReceiverOwner::Path(
                     overlay
-                        .symbols_with_id(&id)
+                        .symbols_with_id_in_family(&id, "rust")
                         .unique()?
                         .qualified_name
                         .clone(),
@@ -2681,6 +3041,7 @@ impl RustReceiverOwner {
 /// The owner of the receiver type of the Rust method call whose method name
 /// spans `method` in `source`, with the call's written argument count. See
 /// [`RustTypeProof::receiver_owner`].
+#[cfg(test)]
 pub(crate) fn rust_method_receiver_owner(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -2697,33 +3058,48 @@ pub(crate) fn rust_method_receiver_owner(
     .into_value()
 }
 
-/// The owner of the type the Rust value expression spanning `expression`
-/// evaluates to. See [`RustTypeProof::receiver_owner`].
-pub(crate) fn rust_expression_receiver_owner(
-    analyzer: &dyn IAnalyzer,
+pub(crate) fn rust_expression_receiver_owner_with_operation<'analyzer>(
+    analyzer: &'analyzer dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     expression: ByteRange<usize>,
+    factory: &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<RustReceiverOwner> {
     completed_proof(cancellation, || {
-        let Some(proof) = RustTypeProof::new(analyzer) else {
-            incomplete_proof("analyzer_unavailable");
-            return None;
+        let proof = RustTypeProof {
+            analyzer,
+            rust: resolve_analyzer::<RustAnalyzer>(analyzer)?,
+            resolver: SelectedRustTypeProofResolver {
+                analyzer,
+                factory,
+                operation: RefCell::new(operation),
+                cancellation,
+            },
         };
-        let rust_source = proof.source(file)?;
-        if rust_source.text() != source {
-            operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
-            return None;
-        }
-        let receiver = rust_source
-            .tree()
-            .root_node()
-            .named_descendant_for_byte_range(expression.start, expression.end)
-            .filter(|node| node.byte_range() == expression)?;
-        proof.receiver_owner(&rust_source, receiver)
+        rust_expression_receiver_owner_with_proof(&proof, file, source, expression)
     })
     .into_value()
+}
+
+fn rust_expression_receiver_owner_with_proof<R: RustTypeProofResolver>(
+    proof: &RustTypeProof<'_, R>,
+    file: &ProjectFile,
+    source: &str,
+    expression: ByteRange<usize>,
+) -> Option<RustReceiverOwner> {
+    let rust_source = proof.source(file)?;
+    if rust_source.text() != source {
+        operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
+        return None;
+    }
+    let receiver = rust_source
+        .tree()
+        .root_node()
+        .named_descendant_for_byte_range(expression.start, expression.end)
+        .filter(|node| node.byte_range() == expression)?;
+    proof.receiver_owner(&rust_source, receiver)
 }
 
 pub(crate) fn rust_method_receiver_owner_with_operation<'analyzer, 'factory, 'selection>(
@@ -2785,6 +3161,27 @@ pub(crate) fn rust_method_receiver_owner_attempt_with_operation<'analyzer, 'fact
     })
 }
 
+pub(crate) fn rust_modeled_receiver_type_with_operation<'analyzer>(
+    analyzer: &'analyzer dyn IAnalyzer,
+    file: &ProjectFile,
+    expression: Node<'_>,
+    factory: &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
+) -> Option<TypeRef> {
+    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+    let proof = RustTypeProof {
+        analyzer,
+        rust,
+        resolver: SelectedRustTypeProofResolver {
+            analyzer,
+            factory,
+            operation: RefCell::new(operation),
+            cancellation: None,
+        },
+    };
+    proof.modeled_receiver_type(file, expression)
+}
+
 /// Resolve a declared type reached by the receiver-facts traversal with the
 /// same nominal proof used by the direct receiver route.
 #[allow(clippy::too_many_arguments)]
@@ -2793,15 +3190,8 @@ pub(crate) fn rust_nominal_receiver_owner_with_operation<'analyzer>(
     file: &ProjectFile,
     source: &str,
     ty: Node<'_>,
-    factory: Option<
-        &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
-    >,
-    operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            '_,
-        >,
-    >,
+    factory: &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<String> {
     rust_nominal_receiver_application_with_operation(
@@ -2823,15 +3213,8 @@ pub(crate) fn rust_nominal_receiver_application_with_operation<'analyzer, 'tree>
     file: &ProjectFile,
     source: &str,
     ty: Node<'tree>,
-    factory: Option<
-        &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
-    >,
-    operation: Option<
-        &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<
-            'analyzer,
-            '_,
-        >,
-    >,
+    factory: &crate::analyzer::rust::native_points::RustDefinitionOperationFactory<'analyzer>,
+    operation: &mut brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperation<'analyzer, '_>,
     cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
 ) -> Option<(String, Vec<Node<'tree>>)> {
     completed_proof(cancellation, || {
@@ -2843,31 +3226,17 @@ pub(crate) fn rust_nominal_receiver_application_with_operation<'analyzer, 'tree>
             }
             proof.nominal_type_owner(&rust_source, ty)
         };
-        match operation {
-            Some(operation) => {
-                let proof = RustTypeProof {
-                    analyzer,
-                    rust: resolve_analyzer::<RustAnalyzer>(analyzer)?,
-                    resolver: SelectedRustTypeProofResolver {
-                        analyzer,
-                        factory: factory.expect("a selected Rust operation has its factory"),
-                        operation: RefCell::new(operation),
-                        cancellation,
-                    },
-                };
-                prove(&proof)
-            }
-            None => {
-                let proof = RustTypeProof::new(analyzer)?;
-                // The factory resolver owns its operation when no selection is supplied.
-                let rust_source = proof.source(file)?;
-                if rust_source.text() != source {
-                    operational_proof_stop("source_mismatch", DerivationExecutionCause::Provider);
-                    return None;
-                }
-                proof.nominal_type_owner(&rust_source, ty)
-            }
-        }
+        let proof = RustTypeProof {
+            analyzer,
+            rust: resolve_analyzer::<RustAnalyzer>(analyzer)?,
+            resolver: SelectedRustTypeProofResolver {
+                analyzer,
+                factory,
+                operation: RefCell::new(operation),
+                cancellation,
+            },
+        };
+        prove(&proof)
     })
     .into_value()
 }
@@ -3130,6 +3499,71 @@ pub(crate) fn rust_std_builtin_call(
     proof.builtin_call(&rust_source, node)
 }
 
+/// Direct receiver proof for the conversion-effect exception. Inferred values,
+/// including intermediate calls, remain open until #10976 supplies exact types.
+/// The existing classifier remains unchanged for its other consumers.
+pub(crate) fn rust_std_direct_string_receiver(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &Arc<str>,
+    call: ByteRange<usize>,
+) -> bool {
+    let prove = || -> Option<bool> {
+        let proof = RustTypeProof::new(analyzer)?;
+        let rust_source = proof.source(file)?;
+        if rust_source.text() != source.as_ref() {
+            return None;
+        }
+        let node = rust_source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(call.start, call.end)
+            .filter(|node| node.byte_range() == call && node.kind() == "call_expression")?;
+        let function = node.child_by_field_name("function")?;
+        if function.kind() != "field_expression" {
+            return None;
+        }
+        let receiver = function.child_by_field_name("value")?;
+        if receiver.kind() != "identifier" {
+            return None;
+        }
+        let binding = resolve_lexical_binding_with_visibility(
+            Language::Rust,
+            rust_source.tree().root_node(),
+            rust_source.text(),
+            receiver.start_byte(),
+            receiver.end_byte(),
+            rust_source.node_text(receiver)?,
+        )
+        .ok()??;
+        let (LexicalBindingResolution::Parameter(definition)
+        | LexicalBindingResolution::OtherLocal(definition)) = binding;
+        let mut current = Some(
+            rust_source
+                .tree()
+                .root_node()
+                .named_descendant_for_byte_range(
+                    definition.declaration_range.start_byte,
+                    definition.declaration_range.end_byte,
+                )?,
+        );
+        while let Some(declaration) = current {
+            match declaration.kind() {
+                "parameter" | "let_declaration" => {
+                    let ty = declaration.child_by_field_name("type")?;
+                    return Some(
+                        proof.type_class(&rust_source, ty, PROOF_DEPTH) == RustValueClass::String,
+                    );
+                }
+                kind if is_procedure_boundary(kind) => return None,
+                _ => current = declaration.parent(),
+            }
+        }
+        None
+    };
+    prove().unwrap_or(false)
+}
+
 /// Identity conversions proven from structured declared error types.
 /// Boxing needs source-side trait bounds and is not discharged here.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3141,94 +3575,136 @@ enum RustResidualError {
 }
 
 impl<R: RustTypeProofResolver> RustTypeProof<'_, R> {
-    // This proof recursion has a fixed depth cap, shared with other std proofs.
-    fn residual_error_type(
+    /// Expand a written type's head through the shared selected-type alias
+    /// expansion (#10770). Supplied arguments keep their caller context;
+    /// defaults use the alias's declaration context and earlier bindings.
+    /// An unsupported or unresolvable alias stays unproven.
+    fn expand_written_type(
         &self,
         source: &RustSource,
         ty: Node<'_>,
-        depth: usize,
-    ) -> Option<RustResidualError> {
-        if depth == 0 {
+    ) -> Option<crate::analyzer::rust::call_conversion::selected_type::AliasTypeExpr> {
+        use crate::analyzer::rust::call_conversion::selected_type::{
+            AliasTypeExpr, alias_type_expr, expand_alias_head,
+        };
+        let mut remaining = 256;
+        let written = alias_type_expr(
+            ty,
+            &source.file,
+            &Arc::<str>::from(source.text()),
+            &mut remaining,
+        )?;
+        match written {
+            AliasTypeExpr::Constructor { ref site, .. } if site.kind != "primitive_type" => {
+                expand_alias_head(
+                    self.analyzer,
+                    written,
+                    &CancellationToken::default(),
+                    0,
+                    false,
+                )
+                .ok()
+            }
+            other => Some(other),
+        }
+    }
+
+    /// The head node an expanded constructor names, in its own file.
+    fn constructor_head<'s>(
+        &self,
+        site: &crate::analyzer::rust::call_conversion::selected_type::TypeSite,
+        site_source: &'s RustSource,
+    ) -> Option<Node<'s>> {
+        if site_source.text() != site.source.as_ref() {
             return None;
         }
-        match ty.kind() {
-            "unit_type" => Some(RustResidualError::Unit),
-            "primitive_type" => Some(RustResidualError::Primitive(
-                source.node_text(ty)?.to_owned(),
-            )),
-            "reference_type" => {
-                let referent = ty.child_by_field_name("type")?;
-                (referent.kind() == "primitive_type" && source.node_text(referent) == Some("str"))
-                    .then(|| {
-                        RustResidualError::ReferenceStr(
-                            named_children(ty)
-                                .iter()
-                                .any(|child| child.kind() == "mutable_specifier"),
-                        )
-                    })
+        crate::analyzer::rust::call_conversion::selected_type::exact_node(
+            site_source.tree().root_node(),
+            &site.kind,
+            site.start,
+            site.end,
+        )
+        .ok()
+        .flatten()
+    }
+
+    fn residual_error(
+        &self,
+        expression: crate::analyzer::rust::call_conversion::selected_type::AliasTypeExpr,
+    ) -> Option<RustResidualError> {
+        use crate::analyzer::rust::call_conversion::selected_type::{
+            AliasTypeExpr, expand_alias_head,
+        };
+        let expression = match expression {
+            AliasTypeExpr::Constructor { ref site, .. } if site.kind != "primitive_type" => {
+                expand_alias_head(
+                    self.analyzer,
+                    expression,
+                    &CancellationToken::default(),
+                    0,
+                    false,
+                )
+                .ok()?
             }
-            "type_identifier" | "scoped_type_identifier" | "generic_type" => {
-                let name = if ty.kind() == "generic_type" {
-                    ty.child_by_field_name("type")?
-                } else {
-                    ty
-                };
-                let unit = self.workspace_definition(source, name)?;
-                let alias_source = self.source(unit.source())?;
-                let declaration = self.declaration(&alias_source, &unit)?;
-                if declaration.kind() == "type_item" {
-                    self.residual_error_type(
-                        &alias_source,
-                        declaration.child_by_field_name("type")?,
-                        depth - 1,
-                    )
-                } else if matches!(declaration.kind(), "struct_item" | "enum_item")
-                    && declaration.child_by_field_name("type_parameters").is_none()
+            other => other,
+        };
+        match expression {
+            AliasTypeExpr::Shape { site, arguments }
+                if site.kind == "unit_type" && arguments.is_empty() =>
+            {
+                Some(RustResidualError::Unit)
+            }
+            AliasTypeExpr::Reference { mutable, referent } => match *referent {
+                AliasTypeExpr::Constructor { site, arguments }
+                    if arguments.is_empty()
+                        && site.kind == "primitive_type"
+                        && site.source.get(site.start..site.end) == Some("str") =>
                 {
-                    Some(RustResidualError::Declaration(unit))
-                } else {
-                    None
+                    Some(RustResidualError::ReferenceStr(mutable))
                 }
+                _ => None,
+            },
+            AliasTypeExpr::Constructor { site, arguments } if site.kind == "primitive_type" => {
+                arguments.is_empty().then_some(())?;
+                Some(RustResidualError::Primitive(
+                    site.source.get(site.start..site.end)?.to_owned(),
+                ))
+            }
+            AliasTypeExpr::Constructor { site, arguments } if arguments.is_empty() => {
+                let site_source = self.source(&site.file)?;
+                let head = self.constructor_head(&site, &site_source)?;
+                let unit = self.workspace_definition(&site_source, head)?;
+                let declaration_source = self.source(unit.source())?;
+                let declaration = self.declaration(&declaration_source, &unit)?;
+                (matches!(declaration.kind(), "struct_item" | "enum_item")
+                    && declaration.child_by_field_name("type_parameters").is_none())
+                .then_some(RustResidualError::Declaration(unit))
             }
             _ => None,
         }
     }
 
-    fn result_error_type(
-        &self,
-        source: &RustSource,
-        ty: Node<'_>,
-        depth: usize,
-    ) -> Option<RustResidualError> {
-        if depth == 0
-            || !matches!(
-                ty.kind(),
-                "generic_type" | "type_identifier" | "scoped_type_identifier"
-            )
-        {
+    /// The error type of a written `Result` type, after the shared alias
+    /// expansion: `core::result::Result<T, E>`'s second type argument.
+    fn result_error_type(&self, source: &RustSource, ty: Node<'_>) -> Option<RustResidualError> {
+        use crate::analyzer::rust::call_conversion::selected_type::AliasTypeExpr;
+        let AliasTypeExpr::Constructor { site, arguments } =
+            self.expand_written_type(source, ty)?
+        else {
+            return None;
+        };
+        let site_source = self.source(&site.file)?;
+        let head = self.constructor_head(&site, &site_source)?;
+        if !self.standard_result_type(&site_source, head) {
             return None;
         }
-        let name = if ty.kind() == "generic_type" {
-            ty.child_by_field_name("type")?
-        } else {
-            ty
+        let mut types = arguments
+            .into_iter()
+            .filter(|argument| !matches!(argument, AliasTypeExpr::Lifetime));
+        let (Some(_), Some(error), None) = (types.next(), types.next(), types.next()) else {
+            return None;
         };
-        if self.standard_result_type(source, name) {
-            let arguments = named_children(ty.child_by_field_name("type_arguments")?);
-            let [_, error] = arguments.as_slice() else {
-                return None;
-            };
-            return self.residual_error_type(source, *error, depth - 1);
-        }
-        let unit = self.workspace_definition(source, name)?;
-        let alias_source = self.source(unit.source())?;
-        let declaration = self.declaration(&alias_source, &unit)?;
-        (declaration.kind() == "type_item").then_some(())?;
-        self.result_error_type(
-            &alias_source,
-            declaration.child_by_field_name("type")?,
-            depth - 1,
-        )
+        self.residual_error(error)
     }
 
     fn operand_error_type(
@@ -3243,7 +3719,7 @@ impl<R: RustTypeProofResolver> RustTypeProof<'_, R> {
         match operand.kind() {
             "identifier" => {
                 if let Some(ty) = self.declared_binding_type(source, operand) {
-                    self.result_error_type(source, ty, depth - 1)
+                    self.result_error_type(source, ty)
                 } else {
                     self.operand_error_type(
                         source,
@@ -3267,23 +3743,64 @@ impl<R: RustTypeProofResolver> RustTypeProof<'_, R> {
                     return (argument.kind() == "unit_expression")
                         .then_some(RustResidualError::Unit);
                 }
-                let function = call_function_target(function);
-                let name = match function.kind() {
-                    "field_expression" => function.child_by_field_name("field")?,
-                    "identifier" | "scoped_identifier" => function,
-                    _ => return None,
-                };
-                let unit = self.workspace_definition(source, name)?;
+                let unit = self.callee_definition(source, operand)?;
                 let callee_source = self.source(unit.source())?;
                 let declaration = self.declaration(&callee_source, &unit)?;
+                // Calling an `async fn` yields a future, not its written return.
+                if super::semantic::function_is_async(declaration) {
+                    return None;
+                }
                 self.result_error_type(
                     &callee_source,
                     declaration.child_by_field_name("return_type")?,
-                    depth - 1,
+                )
+            }
+            // `path().await` on a direct path call to one selected `async fn`
+            // item with a written return type yields that return type. This
+            // is the only place an await is typed: replace this arm if the
+            // shared selected-type resolver gains await typing. It says nothing
+            // about the async body or cancellation. Method calls, closures,
+            // async blocks, fn pointers, awaited bindings and a non-async fn
+            // returning a future stay open, and so does a callee that, or whose enclosing
+            // module, impl, trait or function, carries an outer attribute, since an
+            // attribute macro can rewrite the signature.
+            "await_expression" => {
+                let call = *named_children(operand).first()?;
+                if call.kind() != "call_expression"
+                    || !matches!(
+                        call_function_target(call.child_by_field_name("function")?).kind(),
+                        "identifier" | "scoped_identifier"
+                    )
+                {
+                    return None;
+                }
+                let unit = self.callee_definition(source, call)?;
+                let callee_source = self.source(unit.source())?;
+                let declaration = self.declaration(&callee_source, &unit)?;
+                if declaration.kind() != "function_item"
+                    || !super::semantic::function_is_async(declaration)
+                    || item_or_enclosing_item_attributed(declaration)
+                {
+                    return None;
+                }
+                self.result_error_type(
+                    &callee_source,
+                    declaration.child_by_field_name("return_type")?,
                 )
             }
             _ => None,
         }
+    }
+
+    /// The workspace function a call's written callee selects.
+    fn callee_definition(&self, source: &RustSource, call: Node<'_>) -> Option<CodeUnit> {
+        let function = call_function_target(call.child_by_field_name("function")?);
+        let name = match function.kind() {
+            "field_expression" => function.child_by_field_name("field")?,
+            "identifier" | "scoped_identifier" => function,
+            _ => return None,
+        };
+        self.workspace_definition(source, name)
     }
 }
 
@@ -3321,13 +3838,32 @@ pub(crate) fn residual_conversion_runs_no_user_code(
     else {
         return false;
     };
-    let Some(error) = proof.result_error_type(&source, return_type, PROOF_DEPTH) else {
+    let Some(error) = proof.result_error_type(&source, return_type) else {
         return false;
     };
     named_children(node)
         .first()
         .and_then(|operand| proof.operand_error_type(&source, *operand, PROOF_DEPTH))
         .is_some_and(|operand_error| operand_error == error)
+}
+
+/// Whether `item` or any item enclosing it carries an outer attribute. An
+/// attribute macro on an enclosing module, impl, trait or function can rewrite
+/// the signatures of the items inside it. Custom inner attributes are unstable,
+/// so outer attributes are the macro entry points to refuse.
+fn item_or_enclosing_item_attributed(item: Node<'_>) -> bool {
+    let mut current = Some(item);
+    while let Some(node) = current {
+        if matches!(
+            node.kind(),
+            "function_item" | "mod_item" | "impl_item" | "trait_item"
+        ) && outer_attributes(node).next().is_some()
+        {
+            return true;
+        }
+        current = node.parent();
+    }
+    false
 }
 
 /// A callable whose body is a separate procedure.
@@ -3376,10 +3912,162 @@ fn node_range(node: Node<'_>) -> Range {
     }
 }
 
+/// Whether `ty` still names a type parameter anywhere inside it.
+fn type_ref_mentions_type_parameter(ty: &TypeRef) -> bool {
+    let mut pending = vec![ty];
+    while let Some(ty) = pending.pop() {
+        match ty {
+            TypeRef::TypeParameter { .. } => return true,
+            TypeRef::Named { arguments, .. } | TypeRef::Declared { arguments, .. } => {
+                pending.extend(arguments);
+            }
+            TypeRef::Projection {
+                owner,
+                trait_type,
+                arguments,
+                ..
+            } => {
+                pending.push(owner);
+                pending.extend(trait_type.as_deref());
+                pending.extend(arguments);
+            }
+            TypeRef::Array { element }
+            | TypeRef::ByRef { element, .. }
+            | TypeRef::Pointer { element }
+            | TypeRef::Slice { element }
+            | TypeRef::FixedArray { element, .. }
+            | TypeRef::Channel { element, .. } => pending.push(element),
+            TypeRef::Map { key, value } => pending.extend([key.as_ref(), value.as_ref()]),
+            TypeRef::Wildcard { bound, .. } => pending.extend(bound.as_deref()),
+            TypeRef::Tuple { elements } => pending.extend(elements),
+            TypeRef::Function { parameters, result } => {
+                pending.extend(parameters.iter().map(|parameter| &parameter.r#type));
+                pending.extend(result.as_deref());
+            }
+            TypeRef::Unknown => {}
+        }
+    }
+    false
+}
+
+/// A query-time guard for provenance refinement; absent type proof stays unknown.
+pub(super) fn receiver_type_parameter_dependency(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    receiver: brokk_bifrost_core::analyzer::model::Range,
+) -> brokk_bifrost_analysis::analyzer::languages::ReceiverTypeParameterDependency {
+    use brokk_bifrost_analysis::analyzer::languages::ReceiverTypeParameterDependency;
+    let dependency = completed_proof(None, || {
+        let proof = RustTypeProof::new(analyzer)?;
+        let source = proof.source(file)?;
+        let expression = source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(receiver.start_byte, receiver.end_byte)?;
+        // Source struct literals need no model result-type inference. Keep this
+        // extension local to provenance so resolver answers do not change.
+        let ty = proof.modeled_receiver_type(file, expression).or_else(|| {
+            let mut expression = expression;
+            for _ in 0..PROOF_DEPTH {
+                if expression.kind() == "struct_expression" {
+                    let ty = expression.child_by_field_name("name")?;
+                    let (name, arguments) = if ty.kind() == "generic_type" {
+                        (
+                            ty.child_by_field_name("type")?,
+                            named_children(ty.child_by_field_name("type_arguments")?),
+                        )
+                    } else {
+                        (ty, Vec::new())
+                    };
+                    let unit = proof.workspace_definition(&source, name)?;
+                    let declaration_source = proof.source(unit.source())?;
+                    let declaration = proof.declaration(&declaration_source, &unit)?;
+                    if !matches!(declaration.kind(), "struct_item" | "enum_item") {
+                        return None;
+                    }
+                    let parameters = declaration
+                        .child_by_field_name("type_parameters")
+                        .map(named_children)
+                        .unwrap_or_default();
+                    if parameters.len() != arguments.len() {
+                        return None;
+                    }
+                    let arguments = arguments
+                        .into_iter()
+                        .map(|argument| {
+                            let overlay = analyzer.semantic_model_overlay()?;
+                            let active = analyzer.active_semantic_models()?;
+                            let mut applicability =
+                                super::trait_applicability::ModelApplicability::new(
+                                    analyzer,
+                                    proof.rust,
+                                    &overlay,
+                                    &active,
+                                    &proof.resolver,
+                                );
+                            applicability.receiver_type(file, source.text(), argument)
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    return Some(TypeRef::Named {
+                        name: unit.fq_name(),
+                        arguments,
+                        nullable: false,
+                    });
+                }
+                expression = proof.binding_initializer(&source, expression)?;
+            }
+            None
+        })?;
+        if ty.contains_unknown() {
+            return None;
+        }
+        Some(type_ref_mentions_type_parameter(&ty))
+    })
+    .into_value();
+    match dependency {
+        Some(true) => ReceiverTypeParameterDependency::Yes,
+        Some(false) => ReceiverTypeParameterDependency::No,
+        None => ReceiverTypeParameterDependency::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use crate::analyzer::rust::std_types::*;
+    use brokk_bifrost_analysis::analyzer::semantic::oracle::dispatch::ResolverOwnedExternalCalleeIdentity;
+    use brokk_bifrost_analysis::analyzer::usages::get_definition::ExactExternalCallProof;
+
+    fn selected_external_call(
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        site: &ResolvedReferenceSite,
+    ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+        let cancellation = CancellationToken::default();
+        let factory = crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
+            analyzer,
+            &cancellation,
+        )?;
+        let mut operation = match factory.open(&cancellation).ok()? {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(operation) => *operation,
+            _ => return None,
+        };
+        let scope = AnalyzerQueryScope::new(analyzer);
+        crate::analyzer::rust::external_calls::resolve_exact_rust_external_call_with_operation(
+            analyzer,
+            scope.token(),
+            file,
+            source,
+            tree,
+            site,
+            || None,
+            Some(&cancellation),
+            &factory,
+            &mut operation,
+        )
+    }
 
     #[test]
     #[hardwon(
@@ -3620,7 +4308,7 @@ mod tests {
 
     #[hardwon("#4626: same-file type-proof leaves reused query-local macro frontier state")]
     #[test]
-    fn type_proof_reuses_overlay_inputs_but_opens_fresh_operations_per_leaf() {
+    fn type_proof_shares_one_selected_operation_across_leaves() {
         let source = r#"
 macro_rules! checkpointed {
     ($(($name:ident, $value:path),)*) => { $(fn $name() -> Known { $value })* };
@@ -3636,6 +4324,8 @@ pub fn run() { let first = Item; let second = Item; }
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
         let analyzer = fixture.analyzer.analyzer();
         let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        crate::analyzer::rust::native_points::reset_rust_definition_operation_open_count_for_test();
+        crate::analyzer::rust::native_points::reset_rust_definition_overlay_preparation_count_for_test();
         let proof = RustTypeProof::new(analyzer).expect("Rust type proof");
         let rust_source = proof.source(&file).expect("prepared Rust source");
         let mut pending = vec![rust_source.tree().root_node()];
@@ -3654,8 +4344,6 @@ pub fn run() { let first = Item; let second = Item; }
         references.reverse();
         assert_eq!(references.len(), 2);
 
-        crate::analyzer::rust::native_points::reset_rust_definition_operation_open_count_for_test();
-        crate::analyzer::rust::native_points::reset_rust_definition_overlay_preparation_count_for_test();
         let proof_outcomes = references
             .iter()
             .copied()
@@ -3672,8 +4360,8 @@ pub fn run() { let first = Item; let second = Item; }
         );
         assert_eq!(
             crate::analyzer::rust::native_points::rust_definition_operation_open_count_for_test(),
-            2,
-            "each independent type-proof leaf gets its own selected operation"
+            1,
+            "one type proof owns one selected operation across its leaf lookups"
         );
 
         crate::analyzer::rust::native_points::reset_rust_definition_operation_open_count_for_test();
@@ -3705,7 +4393,9 @@ pub fn run() { let first = Item; let second = Item; }
                     },
                 ) {
                     BoundedResolution::Complete { value, .. } => value,
-                    BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
+                    BoundedResolution::Exceeded { .. }
+                    | BoundedResolution::Unavailable { .. }
+                    | BoundedResolution::Cancelled { .. } => {
                         panic!("direct definition lookup did not complete")
                     }
                 }
@@ -3738,6 +4428,461 @@ pub fn run() { let first = Item; let second = Item; }
         }
     }
 
+    mod deref_models {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/deref_models.rs"
+        ));
+    }
+
+    fn activate_deref_fixture(fixture: &AnalyzerFixture, summary: Option<bool>, certified: bool) {
+        deref_models::activate(fixture.analyzer.analyzer(), summary, certified);
+    }
+
+    fn deref_fixture_call(
+        fixture: &AnalyzerFixture,
+        source: &str,
+        method: &str,
+    ) -> Option<(ExactExternalCallProof, ResolverOwnedExternalCalleeIdentity)> {
+        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
+        let proof = RustTypeProof::new(fixture.analyzer.analyzer()).unwrap();
+        let rust_source = proof.source(&file).unwrap();
+        let start = source.find(method).unwrap();
+        let site = ResolvedReferenceSite {
+            path: method.into(),
+            text: method.into(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + method.len(),
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + method.len(),
+        };
+        selected_external_call(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            rust_source.tree(),
+            &site,
+        )
+    }
+
+    #[test]
+    #[brokk_bifrost_test_macros::hardwon(
+        "#11114: unpinned stdlib activation rejected its toolchain-keyed Deref companion"
+    )]
+    fn unpinned_stdlib_shares_one_toolchain_with_deref_companions() {
+        use brokk_bifrost_analysis::analyzer::semantic_model::*;
+        use brokk_bifrost_analysis::analyzer::store::AnalyzerStore;
+        const VERSION: &str = "1.100.0-nightly";
+        let source = r#"fn f(s: std::string::String) { let _ = s.contains(".."); }"#;
+        // The stdlib authoring version deliberately differs from Rust's version.
+        for (
+            case,
+            requirements,
+            companion_requirement,
+            pinned,
+            include_stdlib,
+            expected,
+            diagnostic,
+        ) in [
+            (
+                "shared",
+                vec!["=1.100.0-nightly"],
+                "=1.100.0-nightly",
+                false,
+                true,
+                true,
+                "",
+            ),
+            (
+                "versionless",
+                vec!["=1.100.0-nightly"],
+                "=1.100.0-nightly",
+                false,
+                true,
+                true,
+                "",
+            ),
+            (
+                "excluded",
+                vec!["=1.100.0-nightly"],
+                "=1.99.0",
+                false,
+                true,
+                false,
+                "assumed Rust toolchain 1.100.0-nightly",
+            ),
+            (
+                "missing",
+                vec!["=1.100.0-nightly"],
+                "=1.100.0-nightly",
+                false,
+                false,
+                false,
+                "no assumed Rust toolchain",
+            ),
+            (
+                "pinned",
+                vec!["=1.100.0-nightly"],
+                "=1.100.0-nightly",
+                true,
+                true,
+                true,
+                "",
+            ),
+            (
+                "several",
+                vec!["=1.100.0-nightly", "=1.99.0"],
+                "=1.100.0-nightly",
+                false,
+                true,
+                false,
+                "several Rust toolchain versions",
+            ),
+            (
+                "range",
+                vec![">=1.99.0"],
+                "=1.100.0-nightly",
+                false,
+                true,
+                false,
+                "non-exact Rust selector range",
+            ),
+            (
+                "unconstrained-alternative",
+                vec!["=1.100.0-nightly", "unconstrained"],
+                "=1.100.0-nightly",
+                false,
+                true,
+                false,
+                "names no exact Rust toolchain version",
+            ),
+            (
+                "no-version",
+                vec![""],
+                "=1.100.0-nightly",
+                false,
+                true,
+                false,
+                "names no exact Rust toolchain version",
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+            let catalog = SemanticPackCatalog::open(
+                &fixture.project_root().join("test-catalog"),
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            )
+            .unwrap();
+            let store =
+                AnalyzerStore::open_persistent(&fixture.project_root().join("activation.sqlite"))
+                    .unwrap();
+            let mut companion_digest = String::new();
+            for mut model in deref_models::models(Some(true), true) {
+                let stdlib = model["pack_id"] == "bifrost.rust-stdlib";
+                if stdlib && !include_stdlib {
+                    continue;
+                }
+                model["version"] = "9.8.7".into();
+                model["compatibility"]["toolchains"] = serde_json::json!([{
+                    "name":"rust", "requirement": if stdlib { "=1.100.0-nightly" } else { companion_requirement }
+                }]);
+                let selectors = if stdlib {
+                    requirements.clone()
+                } else {
+                    vec![companion_requirement]
+                };
+                model["shards"][0]["activation"] = serde_json::Value::Array(selectors.into_iter().map(|requirement| {
+                    if requirement == "unconstrained" { serde_json::json!({}) }
+                    else if requirement.is_empty() { serde_json::json!({"toolchain":{"name":"rust"}}) }
+                    else { serde_json::json!({"toolchain":{"name":"rust","version":requirement}}) }
+                }).collect());
+                let mut authored: AuthoredSemanticModelPack =
+                    serde_json::from_value(model).unwrap();
+                if stdlib {
+                    authored.extraction = Some(ArtifactExtraction::source_set(
+                        ArtifactExtractionKind::RustdocJsonSet,
+                        &"a".repeat(64),
+                    ));
+                }
+                let pack = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+                if !stdlib {
+                    companion_digest = pack.manifest.content_sha256.clone();
+                }
+                catalog
+                    .install(
+                        &pack,
+                        &DurablePackSource {
+                            kind: DurablePackSourceKind::Installed,
+                            source_id: authored.pack_id.clone(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let request = SemanticModelActivationRequest {
+                bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                approximate_standard_libraries: if pinned {
+                    vec![]
+                } else {
+                    vec![ApproximateSemanticModelExpectation {
+                        language: "rust".into(),
+                        ecosystem: "cargo".into(),
+                        pack_id: "bifrost.rust-stdlib".into(),
+                        toolchain: Some("rust".into()),
+                    }]
+                },
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "rust".into(),
+                    ecosystem: "cargo".into(),
+                    package: None,
+                    module: None,
+                    toolchain: (pinned || case == "versionless").then(|| CatalogCoordinate {
+                        name: "rust".into(),
+                        version: pinned.then(|| semver::Version::parse(VERSION).unwrap()),
+                    }),
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some("a".repeat(64)),
+                }],
+                controls: ["bifrost.rust-stdlib", "test.std-deref-companion"]
+                    .into_iter()
+                    .map(|pack_id| SemanticModelActivationControl {
+                        scope: SemanticModelControlScope::Workspace,
+                        action: SemanticModelControlAction::Enable,
+                        selector: SemanticModelPackSelector {
+                            pack_id: pack_id.into(),
+                            version: None,
+                            manifest_digest: None,
+                        },
+                    })
+                    .collect(),
+                limits: SemanticModelRuntimeLimits::default(),
+            };
+            let outcome = acquire_active_semantic_models(
+                fixture.analyzer.analyzer(),
+                &catalog,
+                Some(SemanticModelActivationPersistence {
+                    scope_id: "shared-toolchain",
+                    store: &store,
+                }),
+                &request,
+                &CancellationToken::default(),
+            );
+            let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome else {
+                panic!("{case}: {outcome:#?}")
+            };
+            let shards = active.shards();
+            let companion = shards
+                .iter()
+                .find(|shard| shard.manifest.pack_id == "test.std-deref-companion");
+            assert_eq!(companion.is_some(), expected, "{case}: {active:#?}");
+            let stdlib = shards
+                .iter()
+                .find(|shard| shard.manifest.pack_id == "bifrost.rust-stdlib");
+            assert_eq!(stdlib.is_some(), include_stdlib, "{case}");
+            if let Some(stdlib) = stdlib {
+                assert_eq!(stdlib.approximate, !pinned, "{case}");
+            }
+            if let Some(companion) = companion {
+                assert_eq!(companion.approximate, !pinned, "{case}");
+                assert_eq!(
+                    companion
+                        .matched_evidence
+                        .toolchain
+                        .as_ref()
+                        .unwrap()
+                        .version
+                        .as_ref()
+                        .unwrap()
+                        .to_string(),
+                    VERSION
+                );
+                if !pinned {
+                    assert!(stdlib.unwrap().selectors.iter().all(|selector| {
+                        selector.toolchain.as_ref().unwrap().version.as_deref()
+                            == Some("=1.100.0-nightly")
+                    }));
+                }
+            }
+            if !diagnostic.is_empty() {
+                assert!(
+                    active
+                        .activation_report()
+                        .explanations
+                        .iter()
+                        .any(|explanation| explanation.pack_id.as_deref()
+                            == Some("test.std-deref-companion")
+                            && explanation.status == SemanticModelActivationStatus::Incompatible
+                            && explanation.reason.contains(diagnostic)
+                            && (!include_stdlib
+                                || case == "excluded"
+                                || explanation.reason.contains("9.8.7"))),
+                    "{case}: {:?}",
+                    active.activation_report()
+                );
+            }
+            let persisted = store.semantic_pack_active_set().unwrap().unwrap();
+            assert_eq!(
+                persisted
+                    .members
+                    .iter()
+                    .any(|member| member.manifest_digest == companion_digest),
+                expected,
+                "{case}: {persisted:?}"
+            );
+            let result = deref_fixture_call(&fixture, source, "contains");
+            assert_eq!(
+                result
+                    .as_ref()
+                    .is_some_and(|(proof, _)| !proof.unadmitted_receiver_deref
+                        && proof.receiver_adjustments.len() == 1),
+                expected,
+                "{case}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn std_deref_requires_the_exact_complete_companion_and_certified_family() {
+        let source = r#"fn f(s: std::string::String, p: std::path::PathBuf) { let _ = s.contains(".."); let _ = p.starts_with("/srv/public"); }"#;
+        for (summary, certified, expected) in [
+            (Some(true), true, true),
+            (None, true, false),
+            (Some(false), true, false),
+            (Some(true), false, false),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+            activate_deref_fixture(&fixture, summary, certified);
+            let result = deref_fixture_call(&fixture, source, "contains");
+            assert_eq!(
+                result
+                    .as_ref()
+                    .is_some_and(|(proof, _)| !proof.unadmitted_receiver_deref),
+                expected,
+                "summary={summary:?}, certified={certified}"
+            );
+            if let Some((proof, target)) = result {
+                assert_eq!(target.owner_fqn(), "core.primitive.str");
+                assert_eq!(proof.receiver_adjustments.len(), usize::from(expected));
+            }
+            let path = deref_fixture_call(&fixture, source, "starts_with");
+            assert_eq!(
+                path.as_ref()
+                    .is_some_and(|(proof, _)| !proof.unadmitted_receiver_deref),
+                summary == Some(true),
+                "PathBuf has its own certified family"
+            );
+            if let Some((proof, target)) = path {
+                assert_eq!(target.owner_fqn(), "std.path.Path");
+                assert_eq!(
+                    proof.receiver_adjustments.len(),
+                    usize::from(summary == Some(true))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn std_deref_pack_swap_on_unchanged_source_declines_missing_and_partial_summaries() {
+        let source = r#"fn f(s: std::string::String) { let _ = s.contains(".."); }"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        use brokk_bifrost_analysis::analyzer::read_ledger::{ReadKey, ReadLedger};
+        use brokk_bifrost_analysis::analyzer::{
+            ChangedFacts, LookupMemo, LookupReplayLimits, NoSummaryAnswers, ReadVerdict,
+            verify_read_set,
+        };
+        let mut identities = Vec::new();
+        let mut original_model_reads = None;
+
+        for summary in [Some(true), None, Some(false), Some(true)] {
+            activate_deref_fixture(&fixture, summary, true);
+            identities.push(
+                fixture
+                    .analyzer
+                    .analyzer()
+                    .active_semantic_models()
+                    .unwrap()
+                    .active_model_set_hash
+                    .clone(),
+            );
+            let ledger = Arc::new(ReadLedger::new());
+            let selected = {
+                let _scope = AnalyzerQueryScope::with_read_ledger(
+                    fixture.analyzer.analyzer(),
+                    Arc::clone(&ledger),
+                );
+                deref_fixture_call(&fixture, source, "contains")
+            };
+            assert_eq!(
+                selected
+                    .as_ref()
+                    .is_some_and(|(proof, _)| !proof.unadmitted_receiver_deref),
+                summary == Some(true)
+            );
+            let model_reads = ledger
+                .keys()
+                .into_iter()
+                .filter(|key| matches!(key, ReadKey::Models(_)))
+                .collect::<Vec<_>>();
+            assert!(
+                !model_reads.is_empty(),
+                "Deref selection must record model reads"
+            );
+            let original = original_model_reads.get_or_insert(model_reads);
+            let mut inputs = brokk_bifrost_analysis::test_support::read_ledger_test_inputs();
+            inputs.models = brokk_bifrost_analysis::analyzer::i_analyzer::current_model_set_digest(
+                Some(identities.last().unwrap()),
+            );
+            let verdict = verify_read_set(
+                &fixture.analyzer,
+                &ChangedFacts::between(&fixture.analyzer, &fixture.analyzer),
+                &inputs,
+                original,
+                LookupReplayLimits::default(),
+                &NoSummaryAnswers,
+                &mut LookupMemo::new(),
+            );
+            if summary == Some(true) {
+                assert_eq!(verdict, ReadVerdict::Unchanged);
+            } else {
+                assert!(
+                    verdict.changed().is_some(),
+                    "a pack swap must miss read-receipt reuse, never hit: {verdict:?}"
+                );
+            }
+        }
+        assert_ne!(identities[0], identities[1]);
+        assert_ne!(identities[0], identities[2]);
+        assert_eq!(identities[0], identities[3]);
+    }
+
+    #[test]
+    fn shared_std_deref_summary_does_not_authorize_a_mutable_target() {
+        let source = "fn f(mut s: std::string::String) { s.mutate(); }";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        activate_deref_fixture(&fixture, Some(true), true);
+        assert!(
+            deref_fixture_call(&fixture, source, "mutate")
+                .is_some_and(|(proof, _)| proof.unadmitted_receiver_deref
+                    && proof.receiver_adjustments.is_empty()),
+            "DerefMut needs its own complete summary"
+        );
+    }
+
+    #[test]
+    fn user_deref_target_is_not_a_trusted_std_receiver_adjustment() {
+        let source = r#"struct W(std::string::String); impl std::ops::Deref for W { type Target = str; fn deref(&self) -> &str { &self.0 } } fn f(w: W) { let _ = w.contains(".."); }"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
+        activate_deref_fixture(&fixture, Some(true), true);
+        assert!(
+            deref_fixture_call(&fixture, source, "contains").is_none(),
+            "a source impl has no admitted implicit call summary"
+        );
+    }
+
     #[test]
     fn imported_external_constructor_proves_modeled_receiver_owner() {
         let source = "use std::process::Command;\n\nfn chained() {\n    Command::new(\"sh\").arg(\"-c\");\n}\n\nfn bound() {\n    let mut command = Command::new(\"sh\");\n    command.arg(\"-c\");\n}\n\nfn typed() {\n    let mut command: Command = Command::new(\"sh\");\n    command.arg(\"-c\");\n}\n\nfn direct() {\n    Command::new(\"sh\");\n}\n";
@@ -3762,21 +4907,14 @@ pub fn run() { let first = Item; let second = Item; }
             focus_start_byte: constructor_start,
             focus_end_byte: constructor_start + 3,
         };
-        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let (_, identity) =
-            crate::analyzer::rust::external_calls::resolve_exact_rust_external_call_with_operation(
-                fixture.analyzer.analyzer(),
-                scope.token(),
-                &file,
-                rust_source.text(),
-                rust_source.tree(),
-                &site,
-                || None,
-                None,
-                None,
-                None,
-            )
-            .expect("imported constructor resolves through the activated model");
+        let (_, identity) = selected_external_call(
+            fixture.analyzer.analyzer(),
+            &file,
+            rust_source.text(),
+            rust_source.tree(),
+            &site,
+        )
+        .expect("imported constructor resolves through the activated model");
         assert_eq!(identity.owner_fqn(), "std.process.Command");
         assert_eq!(identity.member(), "new");
 
@@ -3814,6 +4952,7 @@ pub fn run() { let first = Item; let second = Item; }
                 end_byte: Some(method_start + 3),
             })
             .collect();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
         let outcomes = resolve_call_target_batch_with_source(
             fixture.analyzer.analyzer(),
             scope.token(),
@@ -3863,18 +5002,12 @@ pub fn run() { let first = Item; let second = Item; }
                     focus_start_byte: start,
                     focus_end_byte: start + "with_capacity".len(),
                 };
-                let scope = AnalyzerQueryScope::new(analyzer);
-                crate::analyzer::rust::external_calls::resolve_exact_rust_external_call_with_operation(
+                selected_external_call(
                     analyzer,
-                    scope.token(),
                     &file,
                     rust_source.text(),
                     rust_source.tree(),
                     &site,
-                    || None,
-                    None,
-                    None,
-                    None,
                 )
                 .map(|(_, identity)| {
                     (
@@ -4019,6 +5152,49 @@ pub fn run() { let first = Item; let second = Item; }
     }
 
     #[test]
+    fn reviewed_inert_fact_is_refused_until_scope_admission_is_integrated() {
+        let source = Arc::<str>::from("fn run() {}\n");
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", &source)]);
+        let mut widget = rust_type("widget.Widget", "struct");
+        widget["value_semantics"] = serde_json::json!({
+            "drop_glue":"inert",
+            "drop_review": {
+                "scope": {"kind":"cargo", "package":"widget", "version":"1.0.0", "source_sha256":"a".repeat(64), "enabled_features":[], "target":"x86_64-unknown-linux-gnu", "cfgs":[]},
+                "review": {"source":"test-only scope fixture", "revision":"fixture-v1", "source_digests":["a".repeat(64)]}
+            }
+        });
+        let pack = serde_json::json!({
+            "schema_version":31, "pack_id":"fixture.reviewed-inert", "version":"1.0.0",
+            "producer":{"name":"test", "version":"1.0.0"}, "language":"rust", "ecosystem":"cargo",
+            "compatibility":{"toolchains":[]}, "provenance":{"source":"test-only review scope"},
+            "license":"NOASSERTION", "completeness":"complete",
+            "safety":{"generated_code_only":false,"review_required":false},
+            "shards":[{"id":"fixture.declarations", "activation":[{}], "payload":{"kind":"declaration_facts", "types":[rust_type("widget","module"),widget], "members":[], "relations":[]}}]
+        });
+        activate_model_pack(&fixture, pack, "fixture.reviewed-inert", "widget");
+        let analyzer = fixture.analyzer.analyzer();
+        let symbol = analyzer
+            .semantic_model_overlay()
+            .unwrap()
+            .symbols_named_in_family("widget.Widget", "rust")
+            .unique()
+            .unwrap();
+        let proof = RustTypeProof::new(analyzer).unwrap();
+        let attempt = completed_proof(None, || proof.modeled_inert_drop_glue_owner(&symbol));
+        assert!(
+            matches!(
+                attempt,
+                RustProofAttempt::Incomplete {
+                    value: None,
+                    reason: "drop_review_scope_admission_pending",
+                    ..
+                }
+            ),
+            "review restrictions must not be ignored: {attempt:?}"
+        );
+    }
+
+    #[test]
     fn modeled_path_return_proves_local_drop_glue_is_inert() {
         let source = Arc::<str>::from(
             "use std::path::Path;\n\nfn run(value: &str) {\n    let joined = Path::new(\"/srv\").join(value);\n    std::fs::read(joined);\n}\n",
@@ -4063,18 +5239,62 @@ pub fn run() { let first = Item; let second = Item; }
         ));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
+    #[hardwon("#8893: a nested Rust receiver proof opened a fresh selected operation per resolve")]
     fn modeled_builder_chain_proof_growth() {
+        use brokk_bifrost_analysis::analyzer::store::resolution_operation::take_nested_rust_selected_operation_opens_for_test;
+
         let length = PROOF_DEPTH + 4;
         let source = format!(
-            "use std::path::Path;\nfn chain_{length}() {{ let _ = Path::new(\"root\"){}; }}\n",
+            "use std::path::Path;\nfn resolved() {{ let _ = Path::new(\"root\").join(\"part\"); }}\nfn chain_{length}() {{ let _ = Path::new(\"root\"){}; }}\n",
             ".join(\"part\")".repeat(length)
         );
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", &source)]);
         activate_path_chain_model(&fixture);
         let file = ProjectFile::new(fixture.project_root(), "lib.rs");
-        let proof = RustTypeProof::new(fixture.analyzer.analyzer()).expect("Rust type proof");
+        let analyzer = fixture.analyzer.analyzer();
+        let cancellation = CancellationToken::new();
+        let factory = crate::analyzer::rust::native_points::RustDefinitionOperationFactory::new(
+            analyzer,
+            &cancellation,
+        )
+        .expect("Rust definition factory");
+        let mut operation = match factory.open(&cancellation).expect("selected Rust opening") {
+            brokk_bifrost_analysis::analyzer::store::resolution_operation::SelectedResolutionOperationOpenOutcome::Ready(operation) => operation,
+            _ => panic!("selected Rust operation unavailable"),
+        };
+        let proof = RustTypeProof {
+            analyzer,
+            rust: resolve_analyzer::<RustAnalyzer>(analyzer).expect("Rust analyzer"),
+            resolver: SelectedRustTypeProofResolver {
+                analyzer,
+                factory: &factory,
+                operation: RefCell::new(&mut operation),
+                cancellation: Some(&cancellation),
+            },
+        };
         let rust_source = proof.source(&file).expect("prepared Rust source");
+        let resolved_text = "Path::new(\"root\").join(\"part\")";
+        let resolved_call = rust_source
+            .tree()
+            .root_node()
+            .named_descendant_for_byte_range(
+                source.find(resolved_text).expect("resolved call"),
+                source.find(resolved_text).expect("resolved call") + resolved_text.len(),
+            )
+            .expect("resolved call node");
+        assert_eq!(resolved_call.kind(), "call_expression");
+        take_nested_rust_selected_operation_opens_for_test();
+        let resolved_owner =
+            proof.modeled_call_result_owner(&rust_source, resolved_call, PROOF_DEPTH);
+        let resolved_opens = take_nested_rust_selected_operation_opens_for_test();
+        eprintln!("resolved_nested_opens={resolved_opens}");
+        assert_eq!(resolved_opens, 0);
+        assert_eq!(
+            resolved_owner,
+            Some(RustReceiverOwner::Path("std.path.PathBuf".into()))
+        );
         let mut pending = vec![rust_source.tree().root_node()];
         let mut functions = Vec::new();
         while let Some(node) = pending.pop() {
@@ -4114,6 +5334,7 @@ pub fn run() { let first = Item; let second = Item; }
             .expect("modeled method has a receiver");
         let before = rust_source.expression_class_evaluations.get();
         let shapes_before = rust_source.modeled_call_shape_evaluations.get();
+        take_nested_rust_selected_operation_opens_for_test();
         let operation_limit = length * 8;
         rust_source
             .expression_class_evaluation_limit
@@ -4123,6 +5344,9 @@ pub fn run() { let first = Item; let second = Item; }
             .set(Some(shapes_before + operation_limit));
         let started = Instant::now();
         let owner = proof.receiver_owner(&rust_source, receiver);
+        let chain_opens = take_nested_rust_selected_operation_opens_for_test();
+        eprintln!("chain_nested_opens={chain_opens}");
+        assert_eq!(chain_opens, 0);
         let elapsed = started.elapsed();
         let evaluations = rust_source.expression_class_evaluations.get() - before;
         let shape_evaluations = rust_source.modeled_call_shape_evaluations.get() - shapes_before;
@@ -4137,67 +5361,6 @@ pub fn run() { let first = Item; let second = Item; }
         assert!(
             shape_evaluations <= operation_limit,
             "chain of {length} modeled calls evaluated {shape_evaluations} uncached call shapes"
-        );
-    }
-
-    #[test]
-    fn imported_external_constructor_proves_grouped_cookie_pack_owner() {
-        let source = "use cookie::{Cookie, CookieBuilder};\n\nfn run() {\n    Cookie::build((\"session\", \"value\"));\n    CookieBuilder::new((\"session\", \"value\"));\n}\n";
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", source)]);
-        let pack: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../../semantic-packs/rust-codeql-parity/bifrost.rust-cookie.json"
-        ))
-        .expect("cookie model parses");
-        activate_model_pack(&fixture, pack, "bifrost.rust-cookie", "cookie");
-        let analyzer = fixture.analyzer.analyzer();
-        let file = ProjectFile::new(fixture.project_root(), "lib.rs");
-        let identities = ["build(", "new("]
-            .into_iter()
-            .map(|needle| {
-                let start = source.find(needle).expect("fixture contains constructor");
-                let rust_source = RustTypeProof::new(analyzer)
-                    .expect("Rust type proof")
-                    .source(&file)
-                    .expect("prepared Rust source");
-                let site = ResolvedReferenceSite {
-                    path: needle[..needle.len() - 1].to_owned(),
-                    text: needle[..needle.len() - 1].to_owned(),
-                    range: Range {
-                        start_byte: start,
-                        end_byte: start + needle.len() - 1,
-                        start_line: 0,
-                        end_line: 0,
-                    },
-                    focus_start_byte: start,
-                    focus_end_byte: start + needle.len() - 1,
-                };
-                let scope = AnalyzerQueryScope::new(analyzer);
-                crate::analyzer::rust::external_calls::resolve_exact_rust_external_call_with_operation(
-                    analyzer,
-                    scope.token(),
-                    &file,
-                    rust_source.text(),
-                    rust_source.tree(),
-                    &site,
-                    || None,
-                    None,
-                    None,
-                    None,
-                )
-                .map(|(_, identity)| {
-                    (
-                        identity.owner_fqn().to_owned(),
-                        identity.member().to_owned(),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            identities,
-            vec![
-                Some(("cookie.Cookie".to_owned(), "build".to_owned())),
-                Some(("cookie.CookieBuilder".to_owned(), "new".to_owned())),
-            ]
         );
     }
 
@@ -4370,6 +5533,7 @@ pub fn run() { let first = Item; let second = Item; }
         })
     }
 
+    #[cfg(debug_assertions)]
     fn rust_pathbuf_method() -> serde_json::Value {
         serde_json::json!({
             "id": "member.fixture.std-path-pathbuf-join",
@@ -4394,6 +5558,7 @@ pub fn run() { let first = Item; let second = Item; }
         })
     }
 
+    #[cfg(debug_assertions)]
     fn activate_path_chain_model(fixture: &AnalyzerFixture) {
         let pack = serde_json::json!({
             "schema_version": 2,

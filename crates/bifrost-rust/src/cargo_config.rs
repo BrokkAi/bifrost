@@ -159,22 +159,6 @@ impl RustCargoConfiguration {
         }
     }
 
-    /// Read the configuration file of `directory` from disk, if it has one
-    /// that parses.
-    pub(crate) fn read_level(
-        root: &Path,
-        directory: &Path,
-    ) -> Option<(PathBuf, RustCargoConfigDocument)> {
-        ["config", "config.toml"].into_iter().find_map(|name| {
-            let path = directory.join(".cargo").join(name);
-            let source = std::fs::read(root.join(&path)).ok()?;
-            Some((
-                path,
-                RustCargoConfigDocument::from_source_bytes(&source).ok()?,
-            ))
-        })
-    }
-
     /// The files Cargo reads for a build started in `directory`, shallowest
     /// first, so that merging in order lets a deeper file win.
     fn levels<'a>(&'a self, directory: &'a Path) -> Vec<(&'a Path, &'a RustCargoConfigDocument)> {
@@ -184,6 +168,31 @@ impl RustCargoConfiguration {
             .collect::<Vec<_>>();
         levels.reverse();
         levels
+    }
+
+    /// Whether every selected configuration layer preserves a registry package's
+    /// identity. A paths override has no package identity until its manifest is
+    /// selected, so its presence cannot certify an external package.
+    pub fn preserves_registry_package(&self, directory: &Path, package: &str) -> bool {
+        self.levels(directory).iter().all(|(_, document)| {
+            let patched = document
+                .patch()
+                .and_then(toml::Value::as_table)
+                .is_some_and(|sources| {
+                    sources.values().any(|entries| {
+                        entries.as_table().is_some_and(|entries| {
+                            entries.iter().any(|(name, entry)| {
+                                name == package
+                                    || entry.get("package").and_then(toml::Value::as_str)
+                                        == Some(package)
+                            })
+                        })
+                    })
+                });
+            let paths = document.value.get("paths");
+            // Source replacement alone preserves package identities and checksums.
+            !patched && paths.is_none_or(|paths| paths.as_array().is_some_and(Vec::is_empty))
+        })
     }
 
     /// The cfg set Cargo compiles a build started in `directory` with: the

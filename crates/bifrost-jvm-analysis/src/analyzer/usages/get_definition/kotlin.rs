@@ -134,7 +134,14 @@ pub(crate) fn kotlin_import_model_outcome(
     candidate: &str,
 ) -> Option<DefinitionLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
-    let records = overlay.symbols_named(candidate).records;
+    let matched = overlay.symbols_named(candidate);
+    if matches!(
+        matched.disposition,
+        brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelOverlayDisposition::Open(_)
+    ) {
+        return None;
+    }
+    let records = matched.records;
     if records.iter().any(|symbol| {
         symbol.language == "kotlin"
             && symbol.kind == SemanticModelSymbolKind::Module

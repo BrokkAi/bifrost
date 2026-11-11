@@ -50,6 +50,97 @@ mod jvm_extraction_tests {
 
     use brokk_bifrost_analysis::analyzer::resolution::model::TypedFrontierState;
 
+    use brokk_bifrost_test_macros::hardwon;
+
+    #[hardwon("#7509: the selected-stage encoder omitted type_components rows")]
+    #[test]
+    fn selected_stage_type_components_match_prepared_java_rows() {
+        use brokk_bifrost_analysis::analyzer::resolution::lower_resolution_facts_for_selection;
+        use brokk_bifrost_analysis::analyzer::store::resolution_selection::SelectedResolutionTempTransaction;
+        use brokk_bifrost_core::analyzer::resolution_facts::{
+            ResolutionTypeComponentKind, ResolutionTypeConstructorKind,
+        };
+        use brokk_bifrost_jvm_analysis::analyzer::java::adapter::JavaAdapter;
+
+        let java = "class Cell { void ping() {} } class App { void run(Cell[] cells) { cells[0].ping(); } }";
+        let state = brokk_bifrost_analysis::analyzer::store::resolution_selection::selection_test_support::parsed_fixture_state(
+            &JavaAdapter,
+            "src/Model.java",
+            java,
+        );
+        let prepared_fixture =
+            crate::selection_fixture_support::JvmSelectionFixture::custom_source(1, java);
+        let prepared = prepared_fixture.open_ready(&[]);
+        let stage_fixture =
+            crate::selection_fixture_support::JvmSelectionFixture::custom_source(1, "");
+        let stage = stage_fixture.open_ready(&[]);
+        let host = 0;
+        let names = stage.shared_name_table().interner(stage.connection());
+        let lowered = lower_resolution_facts_for_selection(
+            BindingFragmentId::at_ordinal(host),
+            &names,
+            Language::Java,
+            &state.resolution_facts,
+        );
+        assert!(lowered.typed().type_components().iter().any(|row| {
+            row.constructor() == ResolutionTypeConstructorKind::Sequence
+                && row.kind() == ResolutionTypeComponentKind::Element
+        }));
+        let containers = lowered
+            .typed()
+            .type_components()
+            .iter()
+            .map(|row| row.container())
+            .collect::<Vec<_>>();
+        let read = |selection| {
+            let source = SelectedResolutionTypedSource::new_on_demand(selection);
+            let mut rows = BTreeSet::new();
+            assert!(
+                source
+                    .visit_type_component_pages_for_containers(
+                        TypedFactRequest::new(&containers),
+                        &CancellationToken::new(),
+                        &mut TypedFactPageVisitor::new(&mut |page| {
+                            rows.extend(page.iter().map(|selected| {
+                                let row = selected.row();
+                                (
+                                    row.container(),
+                                    row.constructor(),
+                                    row.kind(),
+                                    row.component(),
+                                )
+                            }));
+                            Ok(true)
+                        }),
+                    )
+                    .unwrap()
+                    .is_exhausted()
+            );
+            rows
+        };
+        let prepared_rows = read(&prepared);
+        assert!(
+            !prepared_rows.is_empty(),
+            "prepared Java components must be readable"
+        );
+
+        // Admission is manual: no production path admits Java to the selected stage.
+        stage.with_owned_temp_transaction(|connection| {
+            connection.execute("INSERT INTO temp.selected_resolution_stage_producers(producer_id,host_ordinal,bridge_identity,content_digest) VALUES(1,?1,zeroblob(32),zeroblob(32))", [host])?;
+            assert!(brokk_bifrost_analysis::analyzer::store::resolution_stage::typed::insert_typed_fragment(
+                connection, 1, SelectedResolutionMountOrdinal::new(host), lowered.typed(), &CancellationToken::new(),
+            )?);
+            Ok(SelectedResolutionTempTransaction::Commit(()))
+        }).unwrap();
+        stage.note_stage_content_commit();
+        let staged_rows = read(&stage);
+        assert!(
+            !staged_rows.is_empty(),
+            "selected-stage type components were not emitted"
+        );
+        assert_eq!(prepared_rows, staged_rows);
+    }
+
     #[test]
     fn selected_hierarchy_terminals_preserve_mounts_and_cancellation() {
         use brokk_bifrost_analysis::analyzer::resolution::fact_lowering::LoweringGapOrigin;
@@ -148,13 +239,14 @@ mod jvm_extraction_tests {
                     // Sealed source requirements cannot be edited independently.
                     // Parsed-blob withdrawal lawfully cascades both publication
                     // authorities; this is not isolated readiness corruption.
+                    let writer = fixture.store.conn.lock().unwrap();
+                    let _fixture =
+                        brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(
+                            &writer,
+                        );
                     assert_eq!(
-                        fixture
-                            .store
-                            .conn
-                            .lock()
-                            .unwrap()
-                            .execute("DELETE FROM blobs WHERE id=?1", [blob],)
+                        writer
+                            .execute("DELETE FROM blobs WHERE id=?1", [blob])
                             .unwrap(),
                         1
                     );
@@ -178,6 +270,10 @@ mod jvm_extraction_tests {
                         blob
                     };
                     let writer = fixture.store.conn.lock().unwrap();
+                    let _fixture =
+                        brokk_bifrost_analysis::analyzer::store::sealed_families::Fixture::new(
+                            &writer,
+                        );
                     let sql = if damage == "missing" {
                         "DELETE FROM resolution_fragment_interiors WHERE blob_id=?1"
                     } else {

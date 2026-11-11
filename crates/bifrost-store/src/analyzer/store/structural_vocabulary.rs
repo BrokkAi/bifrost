@@ -109,8 +109,11 @@ use brokk_bifrost_core::analyzer::structural::facts::IntegerLiteralValue;
 /// trailing structural node-array positions 24 and 25, and adds general
 /// expression/statement facts (#4365).
 /// Version 51 adds the Rust assignment-operator role (#9050).
+/// Version 52 stores a C# object-initializer label as a field access whose
+/// object is the creation expression (#8305).
+/// Version 53 stores per-owner coverage for certified structural list roles (#9613).
 #[doc(hidden)]
-pub const STRUCTURAL_FACTS_VERSION: i64 = 51;
+pub const STRUCTURAL_FACTS_VERSION: i64 = 53;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
@@ -160,7 +163,7 @@ pub struct PersistedStructuralRole {
     pub ordinal: u32,
     /// `Role::code()`, decoded in `from_persisted_rows`.
     pub role: u8,
-    pub spread: bool,
+    pub mode: brokk_bifrost_core::analyzer::structural::facts::ArgumentMode,
     pub keyword: Option<PersistedSpan>,
     pub node: Option<u32>,
     pub span: PersistedSpan,
@@ -192,6 +195,7 @@ pub struct PersistedStructuralFacts {
     pub nodes: Vec<PersistedStructuralNode>,
     pub roles: Vec<PersistedStructuralRole>,
     pub occurrence_roles: Vec<PersistedOccurrenceRole>,
+    pub role_coverage: Vec<(u32, u8, u8, Option<Vec<u8>>)>,
     #[doc(hidden)]
     pub recovered_regions: Vec<PersistedRecoveredRegion>,
 }

@@ -1,4 +1,4 @@
-use brokk_bifrost_analysis::analyzer::common::QueryCacheCell;
+use brokk_bifrost_analysis::analyzer::common::{QueryCacheCell, ReplayableQueryCacheValue};
 use brokk_bifrost_analysis::analyzer::read_ledger::ReadKey;
 use brokk_bifrost_analysis::analyzer::read_ledger::WorkspaceFactFamily;
 use brokk_bifrost_analysis::analyzer::workspace_authority::WorkspaceAuthorityMemo;
@@ -148,6 +148,9 @@ type StatementFactsEntry = Arc<
     >,
 >;
 
+type ReplayableWorkspaceMemo<T> =
+    WorkspaceAuthorityMemo<QueryCacheCell<ReplayableQueryCacheValue<Arc<T>>>>;
+
 pub(crate) struct CSharpMemoCaches {
     budget_bytes: u64,
     /// Source-local rows, capped at memo budget / 16 bytes (16 MiB by default),
@@ -196,10 +199,13 @@ pub(crate) struct CSharpMemoCaches {
     pub(crate) namespace_exists_build_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) persisted_fqn_candidate_build_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) global_using_build_counts: [AtomicUsize; 3],
     pub(crate) using_aliases:
         WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashMap<String, String>>>>,
-    pub(crate) imported_code_units:
-        WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<CodeUnit>>>>,
+    pub(crate) imported_code_units: WorkspaceAuthorityMemo<
+        Cache<ProjectFile, Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>>,
+    >,
     pub(crate) referencing_files:
         WorkspaceAuthorityMemo<Cache<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(crate) direct_ancestors: ReplayingMemo<Cache<CodeUnit, AncestorMemoEntry>>,
@@ -226,24 +232,19 @@ pub(crate) struct CSharpMemoCaches {
     pub(crate) hierarchy_test_files: WorkspaceAuthorityMemo<PoolSafeMemo<HashSet<ProjectFile>>>,
     /// One fixed-size digest of the generation's build configuration, for
     /// snapshot cache identity. Published only when the identity is known.
-    pub(crate) compilation_config_digest: WorkspaceAuthorityMemo<PoolSafeMemo<StableDigest>>,
+    pub(crate) compilation_config_digest:
+        WorkspaceAuthorityMemo<PoolSafeMemo<(StableDigest, StableDigest)>>,
     /// Real source files that declare at least one `global using` directive.
     /// The coarse graph factors workspace-global visibility through these
     /// configuration files instead of expanding every directive in every file.
-    pub(crate) global_using_namespaces:
-        WorkspaceAuthorityMemo<QueryCacheCell<Arc<HashSet<String>>>>,
+    pub(crate) global_using_namespaces: ReplayableWorkspaceMemo<HashSet<String>>,
     /// [`Self::global_using_namespaces`] sorted once for the visible-type
     /// search's deterministic candidate order (#2679).
-    pub(crate) sorted_global_using_namespaces:
-        WorkspaceAuthorityMemo<QueryCacheCell<Arc<Vec<String>>>>,
-    pub(crate) global_using_aliases:
-        WorkspaceAuthorityMemo<QueryCacheCell<Arc<HashMap<String, String>>>>,
-    pub(crate) global_static_using_type_names:
-        WorkspaceAuthorityMemo<QueryCacheCell<Arc<Vec<String>>>>,
-    pub(crate) global_static_using_types:
-        WorkspaceAuthorityMemo<QueryCacheCell<Arc<Vec<CodeUnit>>>>,
-    pub(crate) usage_global_static_using_types:
-        WorkspaceAuthorityMemo<QueryCacheCell<Arc<Vec<CodeUnit>>>>,
+    pub(crate) sorted_global_using_namespaces: ReplayableWorkspaceMemo<Vec<String>>,
+    pub(crate) global_using_aliases: ReplayableWorkspaceMemo<HashMap<String, String>>,
+    pub(crate) global_static_using_type_names: ReplayableWorkspaceMemo<Vec<String>>,
+    pub(crate) global_static_using_types: ReplayableWorkspaceMemo<Vec<CodeUnit>>,
+    pub(crate) usage_global_static_using_types: ReplayableWorkspaceMemo<Vec<CodeUnit>>,
     /// Complete dead-code inbound graphs, keyed by the requested target FQNs.
     /// This cache is owned by the generation's memo bundle and therefore
     /// cannot outlive a C# update or project overlay.
@@ -315,6 +316,8 @@ impl CSharpMemoCaches {
             namespace_exists_build_count: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             persisted_fqn_candidate_build_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            global_using_build_counts: std::array::from_fn(|_| AtomicUsize::new(0)),
             using_aliases: WorkspaceAuthorityMemo::new(
                 WorkspaceFactFamily::CSharpUsingAliases,
                 build_weighted_cache(budget_bytes / 8, weight_string_map),
@@ -434,7 +437,10 @@ fn weight_string_payload(container_size: usize, payload_bytes: u64) -> u32 {
     weight_bytes(container_size as u64 + payload_bytes)
 }
 
-fn weight_project_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
+fn weight_project_code_unit_set(
+    _key: &ProjectFile,
+    value: &Arc<brokk_bifrost_core::retention_budget::Accounted<HashSet<CodeUnit>>>,
+) -> u32 {
     weight_bytes(estimate_code_unit_set(value.as_ref()))
 }
 

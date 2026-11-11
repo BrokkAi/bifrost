@@ -11,6 +11,14 @@ use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 pub struct PhpKnowledge;
 
 impl LanguageKnowledge for PhpKnowledge {
+    // Unknown stores may contain copy-on-write arrays. Only stores explicitly
+    // marked Reference by lowering can safely retain object identity.
+    fn unmarked_member_stores(
+        &self,
+    ) -> brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores {
+        brokk_bifrost_core::analyzer::language_knowledge::UnmarkedMemberStores::Unindexed
+    }
+
     fn declared_type_is_referent_immutable(&self, _canonical_type: &str) -> bool {
         false
     }

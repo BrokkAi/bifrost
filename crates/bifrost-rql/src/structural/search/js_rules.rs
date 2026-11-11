@@ -16,12 +16,12 @@ use crate::analyzer::{
 };
 use crate::query::JsRule;
 use crate::structural::identifier_dictionary::IdentifierDictionary;
+use crate::structural::identifier_typos::IdentifierTypoTable;
 use brokk_bifrost_js_ts::syntax::{
-    js_ts_string_literal_code_units, object_literal_property_key_node,
-    object_literal_property_key_value,
+    is_jsx_intrinsic_element_name, js_ts_string_literal_code_units,
+    object_literal_property_key_node, object_literal_property_key_value,
 };
-use std::collections::{HashMap, HashSet};
-use strsim::damerau_levenshtein;
+use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
 
 use super::language_rules::{LanguageRuleMatch, LanguageRuleMatches};
@@ -50,11 +50,29 @@ pub(super) fn matches_for_file(
     source: &str,
     rule: JsRule,
     dictionary: &IdentifierDictionary,
+    typos: Option<&IdentifierTypoTable>,
 ) -> LanguageRuleMatches {
     let language = language_for_file(file);
     if !matches!(language, Language::JavaScript | Language::TypeScript) {
         return LanguageRuleMatches::default();
     }
+    // Only a known misspelling is reported, and the list of them is pack data.
+    // Without one the relation cannot decide any part, so it says so instead
+    // of returning a clean empty answer or guessing by edit distance (#10386).
+    let typos = match (rule, typos) {
+        (JsRule::MisspelledIdentifier, None) => {
+            return LanguageRuleMatches::incomplete(
+                Vec::<Range>::new(),
+                language.config_label(),
+                format!(
+                    "{} misspelled-identifier is incomplete for {}: no identifier typo table is active; a rules pack supplies one",
+                    language.config_label(),
+                    file.rel_path().display(),
+                ),
+            );
+        }
+        (_, typos) => typos,
+    };
     let Some(tree) = parse_tree_for_language(file, language, source) else {
         return LanguageRuleMatches::default();
     };
@@ -74,7 +92,12 @@ pub(super) fn matches_for_file(
         JsRule::OverwrittenProperty => {
             overwritten_properties(&tree, source, &mut unknown_property_keys)
         }
-        JsRule::MisspelledIdentifier => misspelled_identifiers(&tree, source, dictionary),
+        JsRule::MisspelledIdentifier => misspelled_identifiers(
+            &tree,
+            source,
+            dictionary,
+            typos.expect("an absent typo table returned above"),
+        ),
     };
     ranges.sort_unstable();
     ranges.dedup();
@@ -83,7 +106,10 @@ pub(super) fn matches_for_file(
             .into_iter()
             .map(|range| LanguageRuleMatch::heuristic(range, reason))
             .collect(),
-        None => ranges.into_iter().map(LanguageRuleMatch::from).collect::<Vec<_>>(),
+        None => ranges
+            .into_iter()
+            .map(LanguageRuleMatch::from)
+            .collect::<Vec<_>>(),
     };
     if !unknown_property_keys.is_empty() {
         return LanguageRuleMatches::incomplete(
@@ -119,12 +145,12 @@ pub(super) fn matches_for_file(
 
 /// Why a rule's matches are guesses rather than structural facts. The other
 /// rules decide their relation from scopes, bindings and class members, so
-/// what they select holds; this one ranks likely typos by edit distance and
-/// frequency, and a close, rarer spelling can be a different word.
+/// what they select holds; a listed misspelling can still be a name chosen on
+/// purpose, which is why upstream rates its query `@precision low`.
 fn heuristic_reason(rule: JsRule) -> Option<&'static str> {
     match rule {
         JsRule::MisspelledIdentifier => Some(
-            "edit-distance guess: one typing slip from a more frequent identifier part in the same file",
+            "known misspelling: the identifier part is listed in the active identifier typo table",
         ),
         JsRule::FunctionDeclarationConflict
         | JsRule::VariableRedeclaration
@@ -769,11 +795,7 @@ struct ObjectProperty<'tree> {
     order: usize,
 }
 
-fn overwritten_properties(
-    tree: &Tree,
-    source: &str,
-    unknown_keys: &mut Vec<Range>,
-) -> Vec<Range> {
+fn overwritten_properties(tree: &Tree, source: &str, unknown_keys: &mut Vec<Range>) -> Vec<Range> {
     let mut ranges = Vec::new();
     for object in descendants(tree.root_node()) {
         if object.kind() != "object" {
@@ -894,80 +916,33 @@ fn misspelled_identifiers(
     tree: &Tree,
     source: &str,
     dictionary: &IdentifierDictionary,
+    typos: &IdentifierTypoTable,
 ) -> Vec<Range> {
-    // The generated CodeQL typo database is not an engine asset. This closed
-    // relation keeps the same normalized-part/co-occurrence shape with a
-    // bounded one-edit Damerau candidate relation.
-    let identifiers = descendants(tree.root_node())
-        .into_iter()
-        .filter(|node| is_identifier_node(*node))
-        .flat_map(|node| {
-            identifier_parts(node, source)
-                .into_iter()
-                .map(move |part| (node, part))
-        })
-        .collect::<Vec<_>>();
-    let mut counts = Vec::<(String, usize)>::new();
-    for (_, part) in &identifiers {
-        increment_count(&mut counts, &part.normalized);
-    }
-    let names = descendants(tree.root_node())
-        .into_iter()
-        .filter(|node| is_identifier_node(*node))
-        .filter_map(|node| class_node_text(node, source).map(str::to_ascii_lowercase))
-        .collect::<HashSet<_>>();
-
     let mut ranges = Vec::new();
-    for (node, wrong) in &identifiers {
-        // A part the project's dictionary accepts is a word it uses on
-        // purpose, however close it is to a more frequent one.
-        if wrong.normalized.chars().count() <= 3 || dictionary.accepts(&wrong.normalized) {
+    for node in descendants(tree.root_node()) {
+        // An intrinsic JSX tag (`<span>`, `<main>`) names a host element, not
+        // a binding, so it is not a slip (#10384).
+        if !is_identifier_node(node) || is_jsx_intrinsic_element_name(node, source) {
             continue;
         }
         // ASCII lower-casing keeps the parts' byte offsets valid in the name.
-        let Some(name) = class_node_text(*node, source).map(str::to_ascii_lowercase) else {
+        let Some(name) = class_node_text(node, source).map(str::to_ascii_lowercase) else {
             continue;
         };
-        let wrong_count = count_for(&counts, &wrong.normalized);
-        // A slip one letter-swap from a commoner part is often another word
-        // (`from`/`form`, `trial`/`trail`). It is reported only when the
-        // corrected whole name is also in the file, the binding or API the
-        // slip may wrongly stand for: `fromLink` needs a `formLink` (#7800).
-        let has_correction = identifiers.iter().any(|(_, right)| {
-            right.normalized != wrong.normalized
-                && count_for(&counts, &right.normalized) > wrong_count
-                && likely_typo(&wrong.normalized, &right.normalized)
-                && names.contains(&format!(
-                    "{}{}{}",
-                    &name[..wrong.start_offset],
-                    right.normalized,
-                    &name[wrong.end_offset..]
-                ))
-        });
-        if !has_correction {
-            continue;
+        for part in identifier_parts(node, source) {
+            // Very short parts are often deliberate abbreviations, as upstream
+            // also assumes; a part the project's dictionary accepts is a word
+            // it uses on purpose.
+            if part.normalized.chars().count() <= 3
+                || dictionary.accepts(&part.normalized)
+                || !typos.known_misspelling(&name, part.start_offset, part.end_offset)
+            {
+                continue;
+            }
+            ranges.push(part_range(part.node, part.start_offset, part.end_offset));
         }
-        ranges.push(part_range(wrong.node, wrong.start_offset, wrong.end_offset));
     }
     ranges
-}
-
-/// One slip of a typist: two adjacent letters swapped anywhere (`lenght`), or
-/// a letter substituted, inserted or dropped inside the word (`lenngth`,
-/// `lenth`). The same edit at either end usually spells another word, not a
-/// typo: a plural or tense (`item`/`items`, `change`/`changed`), a prefix
-/// (`ref`/`href`) or a different initial (`node`/`mode`) (#7800).
-fn likely_typo(wrong: &str, right: &str) -> bool {
-    if damerau_levenshtein(wrong, right) != 1 {
-        return false;
-    }
-    let same_ends = wrong.chars().next() == right.chars().next()
-        && wrong.chars().last() == right.chars().last();
-    // At one Damerau edit, equal lengths with two differing positions can
-    // only be an adjacent transposition.
-    let transposed = wrong.chars().count() == right.chars().count()
-        && wrong.chars().zip(right.chars()).filter(|(w, r)| w != r).count() == 2;
-    same_ends || transposed
 }
 
 fn identifier_parts<'tree>(node: Node<'tree>, source: &str) -> Vec<IdentifierPartRef<'tree>> {
@@ -1060,21 +1035,6 @@ fn is_identifier_node(node: Node<'_>) -> bool {
             | "type_identifier"
             | "nested_identifier"
     )
-}
-
-fn increment_count(counts: &mut Vec<(String, usize)>, name: &str) {
-    if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| candidate == name) {
-        *count = count.saturating_add(1);
-    } else {
-        counts.push((name.to_string(), 1));
-    }
-}
-
-fn count_for(counts: &[(String, usize)], name: &str) -> usize {
-    counts
-        .iter()
-        .find(|(candidate, _)| candidate == name)
-        .map_or(0, |(_, count)| *count)
 }
 
 fn method_has_binding(method: Node<'_>, name: &str, source: &str) -> bool {

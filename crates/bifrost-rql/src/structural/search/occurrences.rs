@@ -77,6 +77,11 @@ pub(super) struct OccurrenceTraversalCache {
     selected_ast_ids: Option<Arc<std::collections::HashSet<String>>>,
     reported: HashSet<(Language, OccurrenceRole, CodeQueryDiagnosticCode)>,
     reported_files: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
+    /// One macro-presence scan per Rust callable (or non-callable file scope)
+    /// in this request. A cancellation never enters the cache.
+    rust_macro_scopes: HashMap<(ProjectFile, u32), bool>,
+    #[cfg(test)]
+    pub(super) rust_macro_scope_scans: usize,
     /// What this execution asked occurrence derivation for. One choice per
     /// execution, so a memoized file is never replayed to a consumer that
     /// needed more of it than the first consumer asked for.
@@ -84,6 +89,38 @@ pub(super) struct OccurrenceTraversalCache {
 }
 
 impl OccurrenceTraversalCache {
+    pub(super) fn rust_scope_has_macro(
+        &mut self,
+        file: &ProjectFile,
+        facts: &crate::analyzer::structural::FileFacts,
+        scope: Option<u32>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<bool> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        let key = (file.clone(), scope.unwrap_or(u32::MAX));
+        if let Some(&found) = self.rust_macro_scopes.get(&key) {
+            return Some(found);
+        }
+        let (start, end) = scope.map_or((0, facts.nodes().len()), |index| {
+            (index as usize + 1, facts.node(index).subtree_end as usize)
+        });
+        let mut found = false;
+        for node in &facts.nodes()[start..end] {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return None;
+            }
+            found |= node.construct.as_deref() == Some("rust_macro_invocation");
+        }
+        #[cfg(test)]
+        {
+            self.rust_macro_scope_scans += 1;
+        }
+        self.rust_macro_scopes.insert(key, found);
+        Some(found)
+    }
+
     pub(super) fn with_options(options: OccurrenceDerivationOptions) -> Self {
         Self {
             options,
@@ -295,8 +332,7 @@ impl OccurrenceTraversalCache {
                             brokk_bifrost_analysis::analyzer::replay_query_read_receipt(
                                 analyzer,
                                 reads.keys(),
-                                reads.unattributed_reads(),
-                                reads.execution_dependences(),
+                                reads.channels(),
                             );
                             Ok::<_, std::convert::Infallible>(row.target)
                         },

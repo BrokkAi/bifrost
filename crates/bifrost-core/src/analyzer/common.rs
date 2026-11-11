@@ -81,6 +81,7 @@ pub(crate) fn estimated_string_vec_bytes(values: &[String], capacity: usize) -> 
 pub fn workspace_language_for_file(file: &ProjectFile) -> Language {
     match file.rel_path().file_name().and_then(|name| name.to_str()) {
         Some("Cargo.toml" | "Cargo.lock") => Language::Rust,
+        Some("go.mod") => Language::Go,
         Some(
             "package.json"
             | "package-lock.json"
@@ -132,9 +133,10 @@ pub fn declaration_language_for_file(file: &ProjectFile) -> Language {
 /// reach it through the same `declaration_language_of` rule, so the owner is
 /// one function rather than one per entry point.
 pub fn declaration_language_for_rel_path(rel_path: &Path) -> Language {
-    let extension = rel_path.extension().and_then(|ext| ext.to_str());
-    let language = extension.map_or(Language::None, Language::from_extension);
-    declaration_language_of(language, unclaimed_extension(extension))
+    declaration_language_of(
+        Language::from_path(rel_path),
+        Language::path_is_unclaimed(rel_path),
+    )
 }
 
 /// The declaration-naming rule over the two facts a path decides:
@@ -147,12 +149,6 @@ pub(crate) fn declaration_language_of(language: Language, unclaimed_extension: b
         Language::None if unclaimed_extension => INCLUDE_CLAIMING_LANGUAGE,
         language => language,
     }
-}
-
-/// The extension-list half of [`ProjectFile::has_unclaimed_extension`], for a
-/// caller that has the extension rather than a file.
-pub(crate) fn unclaimed_extension(extension: Option<&str>) -> bool {
-    extension.is_none_or(|extension| !Language::is_source_extension(extension))
 }
 
 /// Whether an analyzer covering `languages` could have indexed `file`, judged

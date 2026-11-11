@@ -25,6 +25,7 @@ use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::canonical_hash::is_lower_sha256;
 use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
+use brokk_bifrost_rql::structural::identifier_typos::IdentifierTypoTable;
 use serde::{Deserialize, Serialize};
 
 use super::locator::is_qualified_locator_code;
@@ -58,6 +59,56 @@ pub fn policy_pack_roots_from_env() -> Result<Option<std::ffi::OsString>, BuiltI
         }
         (current, deprecated) => Ok(current.or(deprecated)),
     }
+}
+
+/// Policy roots a host acquired for this process, used only where the
+/// environment names none. A host that acquires them in the background
+/// answers once acquisition finishes, so the first policy load waits for the
+/// packs rather than loading an empty catalog (#11030).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostPolicyRoots {
+    pub pack_root: Option<PathBuf>,
+    pub bundle_root: Option<PathBuf>,
+}
+
+pub type HostPolicyRootsProvider = fn() -> Result<HostPolicyRoots, String>;
+
+static HOST_POLICY_ROOTS: OnceLock<HostPolicyRootsProvider> = OnceLock::new();
+
+/// Configure the host policy-root provider once for this process.
+pub fn install_host_policy_roots_provider(
+    provider: HostPolicyRootsProvider,
+) -> Result<(), &'static str> {
+    HOST_POLICY_ROOTS
+        .set(provider)
+        .map_err(|_| "host policy-root provider is already configured")
+}
+
+fn host_policy_roots() -> Result<HostPolicyRoots, BuiltInPolicyError> {
+    match HOST_POLICY_ROOTS.get() {
+        Some(provider) => provider().map_err(BuiltInPolicyError::new),
+        None => Ok(HostPolicyRoots::default()),
+    }
+}
+
+/// The policy pack roots this process loads: the environment's, else the
+/// host's.
+fn configured_policy_pack_roots() -> Result<Option<std::ffi::OsString>, BuiltInPolicyError> {
+    if let Some(roots) = policy_pack_roots_from_env()? {
+        return Ok(Some(roots));
+    }
+    Ok(host_policy_roots()?.pack_root.map(PathBuf::into_os_string))
+}
+
+/// The policy bundle roots this process loads: the environment's, else the
+/// host's.
+fn configured_policy_bundle_roots() -> Result<Option<std::ffi::OsString>, BuiltInPolicyError> {
+    if let Some(roots) = std::env::var_os(POLICY_BUNDLE_ROOT_ENV) {
+        return Ok(Some(roots));
+    }
+    Ok(host_policy_roots()?
+        .bundle_root
+        .map(PathBuf::into_os_string))
 }
 
 // Retained authoring fixtures support evaluator regressions. Production builds
@@ -487,6 +538,22 @@ pub struct BuiltInPolicyPackManifest {
     pub policies: Vec<BuiltInPolicyManifestEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub catalogs: Vec<PolicyCatalogFile>,
+    /// Known identifier misspellings this pack supplies to the run, for
+    /// `js/misspelled-identifier` (#10386).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_typos: Option<PolicyDataFile>,
+}
+
+/// A data document a pack ships beside its policies, pinned by the canonical
+/// content digest of its parsed form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyDataFile {
+    /// A portable `data/*.txt` path inside the pack.
+    pub path: String,
+    /// Lower-case hex of the parsed document's content digest, such as
+    /// [`IdentifierTypoTable::content_hash_hex`].
+    pub content_hash: String,
 }
 
 /// A catalog document with its canonical typed semantic content pin.
@@ -619,6 +686,7 @@ impl RetainedSize for BuiltInPolicySelectionRecord {
 pub struct EmbeddedPolicyPack {
     manifest: String,
     sources: Vec<(String, String)>,
+    identifier_typos: Option<String>,
 }
 
 impl EmbeddedPolicyPack {
@@ -626,7 +694,14 @@ impl EmbeddedPolicyPack {
         Self {
             manifest: manifest.into(),
             sources: Vec::new(),
+            identifier_typos: None,
         }
+    }
+
+    /// The document the manifest's `identifier_typos` entry names.
+    pub fn with_identifier_typos(mut self, document: impl Into<String>) -> Self {
+        self.identifier_typos = Some(document.into());
+        self
     }
 
     pub fn with_source(mut self, path: impl Into<String>, source: impl Into<String>) -> Self {
@@ -795,6 +870,8 @@ pub struct BuiltInPolicyCatalog {
     document: BuiltInPolicyCatalogManifest,
     source_by_policy_id: HashMap<String, String>,
     digest: String,
+    /// The union of every pack's identifier typo table.
+    identifier_typos: Option<Arc<IdentifierTypoTable>>,
 }
 
 impl BuiltInPolicyCatalog {
@@ -805,7 +882,7 @@ impl BuiltInPolicyCatalog {
     /// host can activate catalog releases it acquired separately as one
     /// catalog. Pack and policy ids stay unique across roots.
     fn load() -> Result<Self, BuiltInPolicyError> {
-        if let Some(roots) = policy_pack_roots_from_env()? {
+        if let Some(roots) = configured_policy_pack_roots()? {
             let roots = std::env::split_paths(&roots).collect::<Vec<_>>();
             if roots.iter().any(|root| root.as_os_str().is_empty()) {
                 return Err(BuiltInPolicyError::new(format!(
@@ -905,6 +982,7 @@ impl BuiltInPolicyCatalog {
     pub fn from_embedded_packs(packs: Vec<EmbeddedPolicyPack>) -> Result<Self, BuiltInPolicyError> {
         let mut parsed = Vec::with_capacity(packs.len());
         let mut pack_ids = HashSet::new();
+        let mut identifier_typos = None::<IdentifierTypoTable>;
         for pack in packs {
             let manifest = serde_json::from_str::<BuiltInPolicyPackManifest>(pack.manifest())
                 .map_err(|error| {
@@ -933,6 +1011,16 @@ impl BuiltInPolicyCatalog {
                     manifest.id
                 )));
             }
+            let pack_typos = pack_identifier_typos(&manifest, &pack)?;
+            identifier_typos = match (identifier_typos, pack_typos) {
+                (Some(left), Some(right)) => Some(left.merged(&right).map_err(|error| {
+                    BuiltInPolicyError::new(format!(
+                        "built-in manifest `{}` identifier typos cannot be merged: {error}",
+                        manifest.id
+                    ))
+                })?),
+                (left, right) => left.or(right),
+            };
             parsed.push((manifest, pack));
         }
         let document = BuiltInPolicyCatalogManifest {
@@ -1016,11 +1104,18 @@ impl BuiltInPolicyCatalog {
             document,
             source_by_policy_id,
             digest,
+            identifier_typos: identifier_typos.map(Arc::new),
         })
     }
 
     pub fn document(&self) -> &BuiltInPolicyCatalogManifest {
         &self.document
+    }
+
+    /// The known identifier misspellings the loaded packs supply, which a
+    /// host activates with `PolicyEvaluationOptions::with_identifier_typos`.
+    pub fn identifier_typos(&self) -> Option<&Arc<IdentifierTypoTable>> {
+        self.identifier_typos.as_ref()
     }
 
     /// A stable identity for the shipped catalog: the SHA-256 of the
@@ -1182,6 +1277,39 @@ impl BuiltInPolicyCatalog {
 const MAX_EXTERNAL_POLICY_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_EXTERNAL_POLICY_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Parse the identifier typo table a pack ships and check it against the
+/// digest its manifest pins. A pack that names a table must supply it, and a
+/// pack that supplies one must name it.
+fn pack_identifier_typos(
+    manifest: &BuiltInPolicyPackManifest,
+    pack: &EmbeddedPolicyPack,
+) -> Result<Option<IdentifierTypoTable>, BuiltInPolicyError> {
+    let (file, document) = match (&manifest.identifier_typos, &pack.identifier_typos) {
+        (None, None) => return Ok(None),
+        (Some(file), Some(document)) => (file, document),
+        _ => {
+            return Err(BuiltInPolicyError::new(format!(
+                "built-in manifest `{}` identifier_typos does not match the supplied typo table",
+                manifest.id
+            )));
+        }
+    };
+    let table = IdentifierTypoTable::parse(document).map_err(|error| {
+        BuiltInPolicyError::new(format!(
+            "built-in manifest `{}` identifier typos `{}`: {error}",
+            manifest.id, file.path
+        ))
+    })?;
+    let content_hash = table.content_hash_hex();
+    if content_hash != file.content_hash {
+        return Err(BuiltInPolicyError::new(format!(
+            "built-in manifest `{}` identifier typos `{}` have content hash `{content_hash}` but the manifest records `{}`",
+            manifest.id, file.path, file.content_hash
+        )));
+    }
+    Ok(Some(table))
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn load_external_policy_catalog(root: &Path) -> Result<BuiltInPolicyCatalog, BuiltInPolicyError> {
     BuiltInPolicyCatalog::from_embedded_packs(load_external_policy_packs(root)?)
@@ -1198,6 +1326,14 @@ fn load_external_policy_packs(root: &Path) -> Result<Vec<EmbeddedPolicyPack>, Bu
             let policy_source =
                 read_external_policy_document(&workspace_root, &source_path, "rqlp")?;
             pack = pack.with_source(policy.path.clone(), policy_source);
+        }
+        if let Some(typos) = &manifest.identifier_typos {
+            let source_path = PathBuf::from(&manifest.id).join(&typos.path);
+            pack = pack.with_identifier_typos(read_external_policy_document(
+                &workspace_root,
+                &source_path,
+                "txt",
+            )?);
         }
         packs.push(pack);
     }
@@ -1617,6 +1753,16 @@ fn validate_manifest_shape(manifest: &BuiltInPolicyPackManifest) -> Result<(), B
         }
         validate_sha256_field(&catalog.path, "semantic_hash", &catalog.semantic_hash)?;
     }
+    if let Some(typos) = &manifest.identifier_typos {
+        validate_policy_bundle_path(&typos.path)?;
+        if !typos.path.starts_with("data/") || !typos.path.ends_with(".txt") {
+            return Err(BuiltInPolicyError::new(format!(
+                "identifier typos path `{}` must be a data/*.txt path",
+                typos.path
+            )));
+        }
+        validate_sha256_field(&typos.path, "content_hash", &typos.content_hash)?;
+    }
     let mut paths = HashSet::new();
     let mut ids = HashSet::new();
     for entry in &manifest.policies {
@@ -1682,6 +1828,16 @@ pub fn built_in_policy_catalog() -> Result<&'static BuiltInPolicyCatalog, BuiltI
     }
     let catalog = BuiltInPolicyCatalog::load()?;
     Ok(BUILT_IN_CATALOG.get_or_init(|| catalog))
+}
+
+/// The identifier typo table supplied by the active built-in pack catalog.
+///
+/// A catalog that fails to load fails every built-in selection on its own; a
+/// run of workspace policies or an explanation only goes without a table.
+pub(crate) fn catalog_identifier_typos() -> Option<&'static Arc<IdentifierTypoTable>> {
+    built_in_policy_catalog()
+        .ok()
+        .and_then(BuiltInPolicyCatalog::identifier_typos)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1774,7 +1930,7 @@ pub struct PolicyBundles {
 
 impl PolicyBundles {
     fn load() -> Result<Self, BuiltInPolicyError> {
-        let Some(roots) = std::env::var_os(POLICY_BUNDLE_ROOT_ENV) else {
+        let Some(roots) = configured_policy_bundle_roots()? else {
             return Ok(Self::default());
         };
         let roots = std::env::split_paths(&roots).collect::<Vec<_>>();
@@ -1908,7 +2064,9 @@ fn read_verified_policy_bundle(
         let source = read_external_policy_document(&workspace_root, path, extension)?;
         let digest = {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(source.as_bytes()))
+            brokk_bifrost_analysis::analyzer::canonical_hash::lower_hex_string(
+                &Sha256::digest(source.as_bytes()).into(),
+            )
         };
         if digest != file.sha256 || source.len() as u64 != file.size {
             return Err(BuiltInPolicyError::new(format!(
@@ -1931,7 +2089,7 @@ fn read_verified_policy_bundle(
 pub(crate) fn register_run_catalogs(
     registry: &mut TaintCatalogRegistry,
 ) -> Result<(), BuiltInPolicyError> {
-    if let Some(roots) = policy_pack_roots_from_env()? {
+    if let Some(roots) = configured_policy_pack_roots()? {
         for root in std::env::split_paths(&roots) {
             let (capability, manifests) = load_external_policy_manifests(&root)?;
             for (_, manifest) in manifests {
@@ -1955,7 +2113,7 @@ pub(crate) fn register_run_catalogs(
             }
         }
     }
-    if let Some(roots) = std::env::var_os(POLICY_BUNDLE_ROOT_ENV) {
+    if let Some(roots) = configured_policy_bundle_roots()? {
         for root in std::env::split_paths(&roots) {
             let (index, verified) = read_verified_policy_bundle(&root)?;
             for catalog in &index.catalogs {
@@ -2495,6 +2653,50 @@ mod external_policy_runtime_tests {
         assert_eq!(catalog.document().packs.len(), 1);
         assert_eq!(catalog.document().packs[0].id, PACK_ID);
         assert_eq!(catalog.document().packs[0].policies.len(), 1);
+    }
+
+    #[test]
+    fn external_rules_root_loads_the_identifier_typo_table_its_manifest_pins() {
+        let (root, pack_root) = external_fixture();
+        let manifest_path = pack_root.join("manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse embedded manifest");
+        let document = "# test-only table\nlenght length\nrecieve receive\n";
+        let pinned = IdentifierTypoTable::parse(document)
+            .expect("typo table parses")
+            .content_hash_hex();
+        fs::create_dir_all(pack_root.join("data")).expect("create data directory");
+        fs::write(pack_root.join("data/identifier-typos.txt"), document).expect("write table");
+        let write_manifest = |content_hash: &str| {
+            let mut manifest = manifest.clone();
+            manifest["identifier_typos"] = serde_json::json!({
+                "path": "data/identifier-typos.txt",
+                "content_hash": content_hash,
+            });
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&manifest).expect("serialize manifest"),
+            )
+            .expect("write manifest");
+        };
+
+        write_manifest(&pinned);
+        let catalog = load_external_policy_catalog(root.path()).expect("pinned table loads");
+        let typos = catalog
+            .identifier_typos()
+            .expect("the pack supplies a table");
+        assert_eq!(typos.len(), 2);
+        assert!(typos.known_misspelling("lenght", 0, 6));
+
+        write_manifest(&"0".repeat(64));
+        let error = load_external_policy_catalog(root.path()).expect_err("a wrong pin fails");
+        assert!(error.to_string().contains("content hash"), "{error}");
+
+        fs::remove_file(pack_root.join("data/identifier-typos.txt")).expect("remove table");
+        write_manifest(&pinned);
+        let error = load_external_policy_catalog(root.path()).expect_err("a missing table fails");
+        assert!(error.to_string().contains("does not exist"), "{error}");
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub use crate::analyzer::store::semantic_composition::{
 };
 mod decoded;
 mod rows;
+use crate::analyzer::store::active_models::FamilyRows;
 use brokk_bifrost_semantic::analyzer::semantic_model::catalog::CatalogError;
 pub(super) use decoded::SelectedDecodedReads;
 pub use rows::RowCompositionReads;
@@ -45,10 +46,12 @@ pub trait CompositionReads {
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>>;
     fn types_with_id(&self, id: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>> {
-        Ok(crate::analyzer::store::active_models::resolve_records(
-            self.all_type_records_with_id(id)?,
+        Ok(
+            crate::analyzer::store::active_models::resolve_records(FamilyRows::complete(
+                self.all_type_records_with_id(id)?,
+            ))
+            .records,
         )
-        .records)
     }
     fn types_named(&self, name: &str) -> ReadResult<Vec<ActivatedSemanticModelRecord<TypeFact>>>;
     fn all_member_records_with_id(
@@ -59,10 +62,12 @@ pub trait CompositionReads {
         &self,
         id: &str,
     ) -> ReadResult<Vec<ActivatedSemanticModelRecord<MemberFact>>> {
-        Ok(crate::analyzer::store::active_models::resolve_records(
-            self.all_member_records_with_id(id)?,
+        Ok(
+            crate::analyzer::store::active_models::resolve_records(FamilyRows::complete(
+                self.all_member_records_with_id(id)?,
+            ))
+            .records,
         )
-        .records)
     }
     fn procedure_summaries_for_member(
         &self,
@@ -96,9 +101,10 @@ fn mixed_composition_rows(
     active: &ResolvedActiveSemanticModels,
 ) -> Option<RowCompositionReads<'_>> {
     active
-        .source_reader()
+        .source_reader
+        .as_ref()
         .filter(|_| active.shards.iter().any(|shard| shard.decoded.is_none()))
-        .map(|reader| RowCompositionReads::new(active, reader, &[], &[]))
+        .map(|_| RowCompositionReads::activation_only(active, &[], &[]))
 }
 impl CompositionReads for DecodedCompositionReads<'_> {
     fn all_type_records_with_id(
@@ -108,9 +114,12 @@ impl CompositionReads for DecodedCompositionReads<'_> {
         if let Some(rows) = &self.rows {
             return rows.all_type_records_with_id(id);
         }
-        Ok(self
-            .active
-            .all_type_records_with_id(id)
+        let records = self.active.all_type_records_with_id(id);
+        if let Some(open) = records.open_for_language(self.language) {
+            return Err(CatalogError::FamilyOpen(open));
+        }
+        Ok(records
+            .rows
             .filter(|r| r.shard.manifest.language == self.language)
             .collect())
     }
@@ -118,13 +127,19 @@ impl CompositionReads for DecodedCompositionReads<'_> {
         if let Some(rows) = &self.rows {
             return rows.types_named(name);
         }
-        Ok(crate::analyzer::store::active_models::resolve_records(
-            self.active
-                .all_type_records_named(name)
-                .filter(|r| r.shard.manifest.language == self.language)
-                .collect(),
+        let records = self.active.all_type_records_named(name);
+        if let Some(open) = records.open_for_language(self.language) {
+            return Err(CatalogError::FamilyOpen(open));
+        }
+        Ok(
+            crate::analyzer::store::active_models::resolve_records(FamilyRows::complete(
+                records
+                    .rows
+                    .filter(|r| r.shard.manifest.language == self.language)
+                    .collect(),
+            ))
+            .records,
         )
-        .records)
     }
     fn all_member_records_with_id(
         &self,
@@ -133,9 +148,12 @@ impl CompositionReads for DecodedCompositionReads<'_> {
         if let Some(rows) = &self.rows {
             return rows.all_member_records_with_id(id);
         }
-        Ok(self
-            .active
-            .all_member_records_with_id(id)
+        let records = self.active.all_member_records_with_id(id);
+        if let Some(open) = records.open_for_language(self.language) {
+            return Err(CatalogError::FamilyOpen(open));
+        }
+        Ok(records
+            .rows
             .filter(|r| r.shard.manifest.language == self.language)
             .collect())
     }
@@ -218,7 +236,7 @@ fn select_procedure_summaries(
     }
     candidates.sort_by_key(|(order, _)| *order);
     Ok(resolve_procedure_records(
-        candidates.into_iter().map(|(_, r)| r),
+        FamilyRows::complete(candidates.into_iter().map(|(_, r)| r)),
         procedure_claims_agree,
         |_, _| ProcedureSummaryAcceptance::Accept(None),
     )
@@ -359,8 +377,8 @@ pub(super) fn compose(
     mut symbols: Vec<SemanticModelSymbol>,
     relations: Vec<(usize, SemanticModelRelation)>,
     active: &(impl CompositionReads + ?Sized),
-    representatives: &HashMap<String, String>,
-    composed_owners: &HashSet<String>,
+    representatives: &HashMap<(String, String), String>,
+    composed_owners: &HashSet<(String, String)>,
     origin_identities: &OriginRewrites,
 ) -> ReadResult<ComposedGroup> {
     let group = symbols
@@ -483,6 +501,12 @@ pub(super) fn compose(
                         && curated_owner.hierarchy != artifact_owner.hierarchy,
                 ),
                 (
+                    "python_runtime_bases",
+                    curated_owner.runtime_bases.is_some()
+                        && artifact_owner.runtime_bases.is_some()
+                        && curated_owner.runtime_bases != artifact_owner.runtime_bases,
+                ),
+                (
                     "implemented_traits",
                     !curated_owner.implemented_traits.is_empty()
                         && curated_owner.implemented_traits != artifact_owner.implemented_traits,
@@ -528,6 +552,10 @@ pub(super) fn compose(
         .collect::<Vec<_>>();
     members.sort_unstable();
     members.dedup();
+    let original_member_owner_ids = symbols
+        .iter()
+        .map(|symbol| symbol.owner_id.clone())
+        .collect::<Vec<_>>();
     // Static form is the shared callable receiver form. Free functions
     // have no receiver regardless of a producer's redundant is_static bit.
     // A curated static method can describe an extracted module function:
@@ -595,10 +623,48 @@ pub(super) fn compose(
             );
             continue;
         }
+        let original_owner = original_member_owner_ids[index]
+            .as_deref()
+            .and_then(|id| group.iter().find(|&&owner| symbols[owner].id == id))
+            .map(|&owner| &symbols[owner]);
+        let preserve_authored_family = curated.language == "rust"
+            && curated.kind == SemanticModelSymbolKind::Function
+            && !curated.has_receiver()
+            && curated.callable_family_complete
+            && curated.structured_signature.is_some()
+            && corresponding.len() == candidates.len()
+            && corresponding.len() == 1
+            && original_owner.is_some_and(|owner| {
+                owner
+                    .pre_composition_qualified_name
+                    .as_deref()
+                    .unwrap_or(&owner.qualified_name)
+                    == symbols[selected]
+                        .pre_composition_qualified_name
+                        .as_deref()
+                        .unwrap_or(&symbols[selected].qualified_name)
+            })
+            && corresponding.iter().all(|&candidate| {
+                let generated = &symbols[candidate];
+                generated.structured_signature.is_some()
+                    && curated
+                        .pre_composition_qualified_name
+                        .as_deref()
+                        .unwrap_or(&curated.qualified_name)
+                        == generated
+                            .pre_composition_qualified_name
+                            .as_deref()
+                            .unwrap_or(&generated.qualified_name)
+            });
+        // member_corresponds above establishes normalized signature identity.
+        // Original structured owner/member paths exclude aliases and reexports.
         for &artifact_index in &corresponding {
             let artifact = &mut symbols[artifact_index];
             structural_diagnostics(&curated, artifact, active, &mut diagnostics)?;
             fill_semantics(artifact, &curated);
+            if preserve_authored_family {
+                artifact.callable_family_complete = true;
+            }
             artifact
                 .semantic_contributors
                 .push(curated.provenance.clone());
@@ -633,8 +699,8 @@ pub(super) fn compose(
 
 pub(super) fn rewrite_relations(
     mut relations: Vec<(usize, SemanticModelRelation)>,
-    representatives: &HashMap<String, String>,
-    composed_owners: &HashSet<String>,
+    representatives: &HashMap<(String, String), String>,
+    composed_owners: &HashSet<(String, String)>,
     origin_identities: &OriginRewrites,
 ) -> Vec<(usize, SemanticModelRelation)> {
     let origin = |relation: &SemanticModelRelation| {
@@ -644,7 +710,13 @@ pub(super) fn rewrite_relations(
     };
     let from_replacement = |relation: &SemanticModelRelation| match origin(relation) {
         Some(origin) => origin.replacement.as_ref(),
-        None => representatives.get(&relation.from),
+        None => representatives.get(&(
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                &relation.provenance.activation.matched_evidence.language,
+            )
+            .to_owned(),
+            relation.from.clone(),
+        )),
     };
     // Curated hierarchy never overrides the authoritative owner's hierarchy.
     relations.retain(|(_, relation)| {
@@ -663,7 +735,15 @@ pub(super) fn rewrite_relations(
     for (_, relation) in &mut relations {
         if relation.provenance.extraction.is_some()
             && origin(relation).map_or_else(
-                || composed_owners.contains(&relation.from),
+                || {
+                    composed_owners.contains(&(
+                        brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                            &relation.provenance.activation.matched_evidence.language,
+                        )
+                        .to_owned(),
+                        relation.from.clone(),
+                    ))
+                },
                 |origin| origin.composed,
             )
             && matches!(
@@ -681,7 +761,13 @@ pub(super) fn rewrite_relations(
         if let Some(replacement) = from_replacement(relation) {
             relation.from.clone_from(replacement);
         }
-        if let Some(replacement) = representatives.get(&relation.to) {
+        if let Some(replacement) = representatives.get(&(
+            brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                &relation.provenance.activation.matched_evidence.language,
+            )
+            .to_owned(),
+            relation.to.clone(),
+        )) {
             relation.to.clone_from(replacement);
         }
     }
@@ -998,6 +1084,11 @@ fn fill_semantics(artifact: &mut SemanticModelSymbol, curated: &SemanticModelSym
             .exact_return_classes
             .clone_from(&curated.exact_return_classes);
     }
+    if curated.python_runtime_bases.is_some() {
+        artifact
+            .python_runtime_bases
+            .clone_from(&curated.python_runtime_bases);
+    }
     if curated.implicit_operation.is_some() {
         artifact
             .implicit_operation
@@ -1174,10 +1265,32 @@ pub(super) fn compose_eager(
         let representative = representative_identity(&owners, reads)
             .expect("decoded composition reads are infallible");
         if representative.composed {
-            composed_owners.extend(owners.iter().map(|s| s.id.clone()));
+            composed_owners.extend(owners.iter().map(|s| {
+                (
+                    brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.language)
+                        .to_owned(),
+                    s.id.clone(),
+                )
+            }));
         }
         record_origin_identities(&mut origin_identities, &owners, &representative);
-        replacements.extend(representative.replacements);
+        replacements.extend(
+            representative
+                .replacements
+                .into_iter()
+                .map(|(id, replacement)| {
+                    (
+                        (
+                            brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                                &owners[0].language,
+                            )
+                            .to_owned(),
+                            id,
+                        ),
+                        replacement,
+                    )
+                }),
+        );
         for owner in owners {
             symbol_groups
                 .entry((owner.provenance.pack_digest.clone(), owner.id.clone()))
@@ -1329,7 +1442,7 @@ fn debug_assert_group_backing(
 pub(super) fn assert_group_parity(
     analyzer: &dyn IAnalyzer,
     active: &ResolvedActiveSemanticModels,
-    reader: &crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader,
+    _reader: &crate::analyzer::store::model_catalog::CatalogRuntimeSourceReader,
     symbols: &[SemanticModelSymbol],
     relations: &[SemanticModelRelation],
     generated: &[SemanticModelSymbol],
@@ -1353,7 +1466,7 @@ pub(super) fn assert_group_parity(
             )
         })
         .collect::<HashMap<_, _>>();
-    let rows = RowCompositionReads::new(active, reader, generated, generated_relations);
+    let rows = RowCompositionReads::new(active, generated, generated_relations);
     let mut replacements = HashMap::default();
     let mut composed_owners = HashSet::default();
     let mut origin_identities = OriginRewrites::default();
@@ -1362,10 +1475,32 @@ pub(super) fn assert_group_parity(
         let decoded = &reads_by_language[owners[0].language.as_str()];
         let representative = representative_identity(&owners, decoded).unwrap();
         if representative.composed {
-            composed_owners.extend(owners.iter().map(|s| s.id.clone()));
+            composed_owners.extend(owners.iter().map(|s| {
+                (
+                    brokk_bifrost_core::analyzer::model::semantic_pack_realm(&s.language)
+                        .to_owned(),
+                    s.id.clone(),
+                )
+            }));
         }
         record_origin_identities(&mut origin_identities, &owners, &representative);
-        replacements.extend(representative.replacements);
+        replacements.extend(
+            representative
+                .replacements
+                .into_iter()
+                .map(|(id, replacement)| {
+                    (
+                        (
+                            brokk_bifrost_core::analyzer::model::semantic_pack_realm(
+                                &owners[0].language,
+                            )
+                            .to_owned(),
+                            id,
+                        ),
+                        replacement,
+                    )
+                }),
+        );
     }
     let mut generated_groups = 0;
     for group in &groups {

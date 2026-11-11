@@ -67,6 +67,11 @@ pub enum ProcedureInventoryOutcome<T> {
         /// All identity and traversal work observed before cancellation.
         work: SemanticWork,
     },
+    Unknown {
+        /// Source syntax could not establish the inventory. This is distinct
+        /// from an empty inventory, budget exhaustion, or cancellation.
+        work: SemanticWork,
+    },
 }
 
 #[doc(hidden)]
@@ -103,6 +108,10 @@ impl<T> ProcedureInventoryOutcome<T> {
                     work,
                 })
             }
+            Self::Unknown { work } => ProcedureLoweringInput::Stopped(SemanticOutcome::Unknown {
+                partial: None,
+                work,
+            }),
         }
     }
 }

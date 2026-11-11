@@ -17,7 +17,7 @@
 //! lexical facts let the engine decide which route applies.
 
 use brokk_bifrost_core::analyzer::go_facts::{
-    GoSourceFacts, GoSourceTypeId, GoSourceTypeShape, GoTypeCompoundKind,
+    GoChannelDirection, GoSourceFacts, GoSourceTypeId, GoSourceTypeShape, GoTypeCompoundKind,
 };
 use brokk_bifrost_core::analyzer::model::DeclarationKind;
 #[cfg(test)]
@@ -61,7 +61,9 @@ use crate::declarations::{
     GoImportSpecSyntax, children_by_field, go_embedded_field_name_node, go_identifier_is_exported,
     go_node_text, go_type_argument_nodes, named_children, sole_spec_declaration_node,
 };
-use crate::source_properties::{GoSourcePropertyCollector, callable_parameters, result_parameters};
+use crate::source_properties::{
+    GoSourcePropertyCollector, callable_parameters, channel_direction, result_parameters,
+};
 
 #[cfg(test)]
 use crate::declarations::parse_go_import_syntaxes;
@@ -1770,8 +1772,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             return None;
         }
         let binding_scope = self.declaration_scope();
+        let owner = sole_spec_declaration_node(node, "type_alias", "type_declaration");
         let declaration = self.add_declaration_identifier_site(
-            node,
+            owner,
             name,
             ResolutionSiteKind::TypeAliasDeclaration,
             binding_scope,
@@ -4007,11 +4010,14 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
                     (ResolutionTypeComponentKind::Value, "value"),
                 ],
             ),
-            ("channel_type", _) => self.lower_structural_type(
-                current,
-                ResolutionTypeConstructorKind::Channel,
-                [(ResolutionTypeComponentKind::Element, "value")],
-            ),
+            ("channel_type", _) => match go_channel_constructor(current) {
+                Some(constructor) => self.lower_structural_type(
+                    current,
+                    constructor,
+                    [(ResolutionTypeComponentKind::Element, "value")],
+                ),
+                None => self.lower_gap_type(current, ResolutionGapKind::MalformedSyntax),
+            },
             ("generic_type", _) => self.lower_generic_type(current),
             ("function_type", _) => self.lower_function_type(current),
             ("struct_type", _) => self.lower_anonymous_struct_type(current),
@@ -4096,6 +4102,9 @@ impl<'source, 'tree> GoResolutionBuilder<'source, 'tree> {
             return *syntax;
         }
         let (declaration, output, _) = self.lower_anonymous_type_identity(node);
+        let source_declaration = self.declare_node(node, None);
+        self.declaration_sources
+            .push((declaration, source_declaration));
         self.add_gap(declaration, ResolutionGapKind::UnsupportedExpressionType);
         self.lower_interface_type_elements(
             declaration,
@@ -6763,6 +6772,14 @@ fn is_go_type_argument_node(node: Node<'_>) -> bool {
     matches!(node.kind(), "type_identifier" | "generic_type") || is_go_conversion_type_node(node)
 }
 
+fn go_channel_constructor(node: Node<'_>) -> Option<ResolutionTypeConstructorKind> {
+    Some(match channel_direction(node)? {
+        GoChannelDirection::Both => ResolutionTypeConstructorKind::ChannelBoth,
+        GoChannelDirection::Send => ResolutionTypeConstructorKind::ChannelSend,
+        GoChannelDirection::Receive => ResolutionTypeConstructorKind::ChannelReceive,
+    })
+}
+
 fn go_literal_type_constructor(mut syntax: Node<'_>) -> Option<ResolutionTypeConstructorKind> {
     while syntax.kind() == "parenthesized_type" {
         syntax = first_named_child(syntax)?;
@@ -6771,7 +6788,7 @@ fn go_literal_type_constructor(mut syntax: Node<'_>) -> Option<ResolutionTypeCon
         "map_type" => Some(ResolutionTypeConstructorKind::Map),
         "array_type" | "implicit_length_array_type" => Some(ResolutionTypeConstructorKind::Array),
         "slice_type" => Some(ResolutionTypeConstructorKind::Slice),
-        "channel_type" => Some(ResolutionTypeConstructorKind::Channel),
+        "channel_type" => go_channel_constructor(syntax),
         _ => None,
     }
 }
@@ -7332,6 +7349,37 @@ mod tests {
     fn facts(source: &str) -> FileResolutionFacts {
         let tree = crate::parse::parse_go(source).expect("Go tree");
         extract_go_resolution_facts(tree.root_node(), source)
+    }
+
+    #[test]
+    fn channel_components_publish_direction_without_legacy_constructor() {
+        let facts = facts(
+            "package p\ntype T int\nvar both chan T\nvar send chan<- T\nvar receive <-chan T\nvar nested chan<- <-chan *T\n",
+        );
+        let mut kinds = facts
+            .type_components
+            .iter()
+            .map(|component| {
+                assert_eq!(component.kind, ResolutionTypeComponentKind::Element);
+                component.constructor
+            })
+            .collect::<Vec<_>>();
+        kinds.sort_by_key(|kind| {
+            brokk_bifrost_core::analyzer::resolution_facts::ALL_RESOLUTION_TYPE_CONSTRUCTOR_KINDS
+                .iter()
+                .position(|candidate| candidate == kind)
+                .unwrap()
+        });
+        assert_eq!(
+            kinds,
+            [
+                ResolutionTypeConstructorKind::ChannelBoth,
+                ResolutionTypeConstructorKind::ChannelSend,
+                ResolutionTypeConstructorKind::ChannelSend,
+                ResolutionTypeConstructorKind::ChannelReceive,
+                ResolutionTypeConstructorKind::ChannelReceive,
+            ]
+        );
     }
 
     #[derive(Debug, Clone, Copy)]

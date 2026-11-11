@@ -54,7 +54,7 @@ use crate::analyzer::cpp::external::external_namespace_model_resolution;
 
 use crate::analyzer::cpp::external::external_structured_type_model_resolution;
 
-use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 
 use brokk_bifrost_analysis::analyzer::semantic::cfg::CompletionKind;
 
@@ -212,7 +212,8 @@ use std::sync::Arc;
 // resolved calls change for unchanged bytes. Also covers #7074, which changed
 // the same checks without a bump.
 // #8387: invalidate artifacts embedding ranked synthetic declaration identities.
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v56";
+// #9447: structured formal roles and refusal change semantic payloads.
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v58";
 
 /// Procedure-local source roles for both C and C++. The two dialects share
 /// tree-sitter syntax for the control constructs covered by B2 and B3; their
@@ -340,14 +341,29 @@ impl<'a> CppSemanticLowerer<'a> {
     }
 }
 
+pub(super) fn policy_lowering_identity(
+    models: Option<&brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot>,
+) -> SemanticAdapterIdentity {
+    policy_lowering_identity_for_dependencies(semantic_model_dependency_fingerprint(
+        models,
+        b"cpp-semantic-model-set-v1\0",
+    ))
+}
+
+fn policy_lowering_identity_for_dependencies(
+    dependencies: DependencyFingerprint,
+) -> SemanticAdapterIdentity {
+    SemanticAdapterIdentity::for_adapter(
+        "cpp",
+        ADAPTER_VERSION,
+        b"cpp-intrafile-execution-defaults-v1",
+        dependencies,
+    )
+}
+
 impl ProgramSemanticsLowerer for CppSemanticLowerer<'_> {
     fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity::for_adapter(
-            "cpp",
-            ADAPTER_VERSION,
-            b"cpp-intrafile-execution-defaults-v1",
-            self.dependencies,
-        )
+        policy_lowering_identity_for_dependencies(self.dependencies)
     }
 
     fn capabilities(&self) -> SemanticCapabilities {
@@ -604,7 +620,9 @@ fn resolve_cpp_call_target(
         Some(macro_names),
     ) {
         BoundedResolution::Complete { value, .. } => Some(value),
-        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => None,
+        BoundedResolution::Exceeded { .. }
+        | BoundedResolution::Unavailable { .. }
+        | BoundedResolution::Cancelled { .. } => None,
     }
 }
 
@@ -2867,12 +2885,14 @@ fn lower_procedure<'tree, 'targets>(
     )
     .and_then(|identity| context.resolved_model_owner(&identity));
 
-    context.emit_procedure_inputs(
-        &mut builder,
-        entry,
-        spec.callable,
-        spec.has_implicit_object_context,
-    )?;
+    if !spec.properties.is_synthetic {
+        context.emit_procedure_inputs(
+            &mut builder,
+            entry,
+            spec.callable,
+            spec.has_implicit_object_context,
+        )?;
+    }
     if !spec.properties.is_synthetic {
         context.emit_local_bindings(&mut builder, spec.body)?;
         context.derive_stable_function_pointer_targets(spec.body)?;
@@ -3140,21 +3160,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         callable: Node<'tree>,
         has_implicit_object_context: bool,
     ) -> Result<(), CppLoweringError> {
-        let layout = formal_parameter_slots_for_owner(Language::Cpp, callable, self.source)
-            .unwrap_or_default();
-        let mut ordinal = 0_u32;
-        for slot in layout.slots {
+        if self.session.cancellation().is_cancelled() {
+            return Err(CppLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let Some(slots) =
+            formal_parameter_slots_for_owner_with_nodes(Language::Cpp, callable, self.source)
+        else {
             if self.session.cancellation().is_cancelled() {
                 return Err(CppLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
             }
-            let declaration = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Procedure,
+                SemanticCapability::ParameterFlow,
+                SemanticGapKind::Unknown,
+                "C/C++ callable parameter layout is unavailable from source syntax",
+            )?;
+            return Ok(());
+        };
+        if self.session.cancellation().is_cancelled() {
+            return Err(CppLoweringError::Cancelled(Box::new(
+                builder.prospective_work(),
+            )));
+        }
+        let mut ordinal = 0_u32;
+        for (slot, declaration) in slots {
+            if self.session.cancellation().is_cancelled() {
+                return Err(CppLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
             let mapping_node =
                 cpp_formal_name_node(declaration, self.source, &slot.names).unwrap_or(declaration);
             let metadata = self.session.add_value_mapping(builder, mapping_node)?;
@@ -3164,7 +3204,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver { dispatch: true },
+                    SemanticValueKind::Receiver {
+                        dispatch: true,
+                        mode: Default::default(),
+                    },
                 )?;
                 self.receiver = Some(value);
                 self.identity_bindings.insert(value);
@@ -3290,7 +3333,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let receiver = self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver { dispatch: true },
+                SemanticValueKind::Receiver {
+                    dispatch: true,
+                    mode: Default::default(),
+                },
             )?;
             self.receiver = Some(receiver);
             self.identity_bindings.insert(receiver);
@@ -4223,7 +4269,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Some(self.session.cancellation()),
         ) {
             BoundedResolution::Complete { value, .. } => value,
-            BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
+            BoundedResolution::Exceeded { .. }
+            | BoundedResolution::Unavailable { .. }
+            | BoundedResolution::Cancelled { .. } => {
                 return None;
             }
         };
@@ -4281,7 +4329,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Option<ExactModeledTransfer> {
         let overlay = self.analyzer.semantic_model_overlay()?;
         if operation.is_move() {
-            let owners = overlay.symbols_with_id(owner_id);
+            let owners = overlay.symbols_with_id_in_family(owner_id, "cpp");
             let [owner] = owners.records.as_slice() else {
                 return None;
             };

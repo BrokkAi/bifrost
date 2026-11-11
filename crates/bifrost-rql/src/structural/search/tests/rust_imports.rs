@@ -109,7 +109,7 @@ fn assert_incremental_matches_fresh(
         true,
     )
     .expect("incremental persisted import graph query");
-    let fresh_workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let fresh_workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
     let fresh = execute_code_query_detailed_eager_index(
         fresh_workspace.analyzer(),
         &brokk_bifrost_flow::FlowWorkspaceState::default(),
@@ -247,7 +247,7 @@ fn importer_query_at(name: &str, path: &str) -> CodeQuery {
 #[hardwon("a0211e4871b7: body-only Rust edits reuse persisted import edges without refresh work")]
 fn persistent_rust_import_graph_reuses_edges_and_invalidates_reexport_routes() {
     let project = reexport_workspace();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
     let original_query = importer_query_at("exported_target", "source/src/inner.rs");
     let limits = CodeQueryExecutionLimits::default();
     let first = execute_code_query_with_access_mode(
@@ -380,7 +380,7 @@ fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
     let query = importer_query_at("exported_target", "source/src/inner.rs");
     let limits = CodeQueryExecutionLimits::default();
     let first_workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-        project.project_dyn(),
+        project.certified_project_dyn(),
         AnalyzerConfig::default(),
     )
     .expect("open first persisted workspace");
@@ -399,7 +399,7 @@ fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
     // MCP may rebuild its WorkspaceAnalyzer between requests. The durable
     // SQLite rows must still serve the next Auto query without graph work.
     let reopened_workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-        project.project_dyn(),
+        project.certified_project_dyn(),
         AnalyzerConfig::default(),
     )
     .expect("reopen persisted workspace for the next request");
@@ -426,7 +426,7 @@ fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
         .write("pub use source::other::alternate_target as exported_target;\n")
         .expect("edit re-export source");
     let edited_workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
-        project.project_dyn(),
+        project.certified_project_dyn(),
         AnalyzerConfig::default(),
     )
     .expect("refresh persisted workspace after edit");
@@ -452,7 +452,7 @@ fn auto_import_queries_reuse_persisted_sql_graph_across_workspace_builds() {
 )]
 fn rust_candidate_dependencies_cover_add_edit_reexport_and_glob_changes() {
     let project = candidate_dependency_workspace();
-    let mut workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
     let baseline = execute_code_query_with_access_mode(
         workspace.analyzer(),
         &importer_query_at("existing", "source/src/api.rs"),
@@ -586,7 +586,7 @@ fn rust_candidate_dependencies_cover_add_edit_reexport_and_glob_changes() {
 #[hardwon("#3829+#4955: follow Rust module and named re-exports back to the defining file")]
 fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates() {
     let project = reexport_workspace();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
 
     let target = execute_code_query_detailed_eager_index(
         workspace.analyzer(),
@@ -671,7 +671,7 @@ fn rust_importers_follow_named_chained_glob_and_module_reexports_across_crates()
 #[test]
 fn rust_import_graph_includes_block_local_importers() {
     let project = local_import_workspace();
-    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
     let query = importer_query("target", 2);
 
     let persisted = execute_code_query_with_access_mode(
@@ -736,7 +736,7 @@ mod import_graph_properties {
                     "use source::first::stable;\nuse source::dynamic::arriving;\npub fn call() { stable(); arriving(); }\n",
                 )
                 .build();
-            let mut workspace = project.workspace_analyzer(AnalyzerConfig::default());
+            let mut workspace = project.certified_workspace_analyzer(AnalyzerConfig::default());
             let baseline = execute_code_query_with_access_mode(
                 workspace.analyzer(),
                 &importer_query_at("stable", "source/src/first.rs"),

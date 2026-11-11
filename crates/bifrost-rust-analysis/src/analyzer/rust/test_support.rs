@@ -53,6 +53,69 @@ pub(crate) fn inline_source_project(
     (fixture, analyzer)
 }
 
+/// A Rust analyzer over the directory `root` whose source listing is certified.
+///
+/// Uses the production filesystem project's listing and snapshot build path.
+#[track_caller]
+pub(crate) fn certified_analyzer(
+    root: &std::path::Path,
+) -> (
+    brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    RustAnalyzer,
+) {
+    certified_analyzer_with_config(
+        root,
+        brokk_bifrost_core::analyzer::config::AnalyzerConfig::default(),
+    )
+}
+
+#[track_caller]
+pub(crate) fn certified_analyzer_with_config(
+    root: &std::path::Path,
+    config: brokk_bifrost_core::analyzer::config::AnalyzerConfig,
+) -> (
+    brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+    RustAnalyzer,
+) {
+    let workspace =
+        brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer::build_ephemeral_footgun(
+            crate::inline_project::certified_project_at(root),
+            config,
+        )
+        .expect("certified fixture workspace builds");
+    let analyzer =
+        brokk_bifrost_analysis::analyzer::multi_analyzer::resolve_analyzer::<RustAnalyzer>(
+            workspace.analyzer(),
+        )
+        .expect("workspace contains the Rust analyzer")
+        .clone();
+    (workspace, analyzer)
+}
+
+/// A temporary directory of fixture files and the workspace that certified its
+/// listing. The analyzer cloned from the workspace is valid while this lives.
+pub(crate) struct CertifiedFixture {
+    _temp: tempfile::TempDir,
+    _workspace: brokk_bifrost_analysis::analyzer::workspace::WorkspaceAnalyzer,
+}
+
+/// [`project`] with a certified listing, so route answers are complete.
+#[track_caller]
+pub(crate) fn certified_project<R: AsRef<str>, C: AsRef<str>>(
+    files: &[(R, C)],
+) -> (CertifiedFixture, RustAnalyzer) {
+    let (temp, _uncertified) = lazy_project(files);
+    let (workspace, analyzer) = certified_analyzer(temp.path());
+    let _ = analyzer.get_analyzed_files();
+    (
+        CertifiedFixture {
+            _temp: temp,
+            _workspace: workspace,
+        },
+        analyzer,
+    )
+}
+
 pub(crate) fn analyzed_file(analyzer: &RustAnalyzer, suffix: &str) -> ProjectFile {
     analyzer
         .get_analyzed_files()
